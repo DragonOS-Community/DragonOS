@@ -28,9 +28,8 @@ Label_Start:
     mov ax, 0x1301 ;设置显示字符串，显示后，光标移到字符串末端
     mov bx, 0x000f ;设置黑色背景，白色字体，高亮度，不闪烁
     mov dx, 0x0000 ;设置游标行列号均为0
-    mov cx, 10 ;设置字符串长度为10
+    mov cx, 20 ;设置字符串长度为20
 
-            ;为什么这里不能直接把ds赋值给es？
     push ax
     mov ax, ds
     mov es, ax
@@ -45,7 +44,7 @@ Label_Start:
 
     jmp $
 
-StartBootMessage:   db  "Start Boot"
+StartBootMessage:   db  "[DragonOS]Start Boot"
 
 ;填满整个扇区的512字节
     times 510 - ( $ - $$ ) db 0

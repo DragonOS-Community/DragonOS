@@ -5,5 +5,6 @@ set(CMAKE_ASM_NASM_LINK_EXECUTABLE "nasm <OBJECTS> -o <TARGET> <LINK_LIBRARIES>"
 enable_language(ASM_NASM)
 
 #修改输出的路径
-set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
+set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin/bootloader)
 add_executable(boot.bin boot.asm)
+add_executable(loader.bin loader.asm)

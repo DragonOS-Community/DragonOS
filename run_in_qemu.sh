@@ -1,3 +1,11 @@
+# ======检查是否以sudo运行=================
+uid=`id -u`
+if [ ! $uid == "0" ];then
+  echo "请以sudo权限运行"
+  exit
+fi
+
+
 # ==============检查文件是否齐全================
 if [ ! -x "bin/bootloader/boot.bin" ]; then
   echo "bin/bootloader/boot.bin 不存在！"
@@ -14,27 +22,31 @@ fi
 # ===============文件检查完毕===================
 
 
-# 将引导程序写入boot.img
+# =========将引导程序写入boot.img=============
 dd if=bin/bootloader/boot.bin of=bin/boot.img bs=512 count=1 conv=notrunc
 
+# =========创建临时文件夹==================
 # 判断临时文件夹是否存在，若不存在则创建新的
 if [ ! -d "tmp/" ]; then
   mkdir tmp/
   echo "创建了tmp文件夹"
 fi
 
-# 挂载boot.img到tmp/boot
+# ==============挂载boot.img=============
   mkdir tmp/boot
-  sudo mount bin/boot.img tmp/boot -t vfat -o loop
+  mount bin/boot.img tmp/boot -t vfat -o loop
 
   # 检查是否挂载成功
   if  mountpoint -q tmp/boot
    then
       echo "成功挂载 boot.img 到 tmp/boot"
-      # 把loader.bin复制到boot.img
-      sudo cp bin/bootloader/loader.bin tmp/boot
+      # ========把loader.bin复制到boot.img==========
+      cp bin/bootloader/loader.bin tmp/boot
+      # ========把内核程序复制到boot.img======
+      cp bin/bootloader/kernel.bin tmp/boot
       sync
-      sudo umount tmp/boot
+      # 卸载磁盘
+      umount tmp/boot
   else
     echo "挂载 boot.img 失败！"
   fi
@@ -42,7 +54,7 @@ fi
 
 
 # 运行结束后删除tmp文件夹
-sudo rm -rf tmp
+rm -rf tmp
 
 # 进行启动前检查
 flag_can_run=0

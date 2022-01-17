@@ -114,8 +114,8 @@ Label_Go_On:
     jmp Label_Cmp_FileName
 
 Label_Different:
-    and di, 0ffe0h ;将di恢复到当前目录项的第0字节
-    add di, 20h     ;将di跳转到下一目录项的第0字节
+    and di, 0xffe0 ;将di恢复到当前目录项的第0字节
+    add di, 0x20     ;将di跳转到下一目录项的第0字节
     mov si, LoaderFileName
     jmp Label_Search_For_LoaderBin  ;继续搜索下一目录项
 

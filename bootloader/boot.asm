@@ -48,7 +48,7 @@ Label_Start:
     mov bx, 0x0700  ;设置白色字体，不闪烁，字体正常亮度，黑色背景
     mov cx, 0
     mov dx, 0184fh
-    int 10h
+    int 0x10
 
     ;设置屏幕光标位置为左上角(0,0)的位置
     mov ax, 0x0200
@@ -60,7 +60,7 @@ Label_Start:
     mov ax, 0x1301 ;设置显示字符串，显示后，光标移到字符串末端
     mov bx, 0x000a ;设置黑色背景，白色字体，高亮度，不闪烁
     mov dx, 0x0000 ;设置游标行列号均为0
-    mov cx, 24 ;设置字符串长度为20
+    mov cx, 24 ;设置字符串长度为24
 
     push ax
     mov ax, ds
@@ -186,7 +186,9 @@ Label_Go_On_Loading_File:
     jmp Label_Go_On_Loading_File
 
 Label_File_Loaded:
-    jmp $
+    ; 跳转到loader
+    ; 这个指令结束后，目标段会复制到CS寄存器中
+    jmp BaseOfLoader:OffsetOfLoader
 
 
 ; 从软盘读取一个扇区

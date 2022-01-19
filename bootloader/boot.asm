@@ -297,5 +297,3 @@ LoaderFileName:		db	"LOADER  BIN",0 ;最后这个0是为了填满12字节的宽�
     times 510 - ( $ - $$ ) db 0
     dw 0xaa55 ;===确保以0x55 0xaa为结尾
 
-
-

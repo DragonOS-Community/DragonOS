@@ -5,6 +5,12 @@ if [ ! $uid == "0" ];then
   exit
 fi
 
+# 第一个参数如果是--notbuild 那就不构建，直接运行
+if [ ! "$1" == "--notbuild" ]; then
+    echo "开始构建..."
+    make all
+    make clean
+fi
 
 # ==============检查文件是否齐全================
 if [ ! -x "bin/bootloader/boot.bin" ]; then

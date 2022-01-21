@@ -619,7 +619,7 @@ GO_TO_TMP_Protect:
     mov cr3, eax
 
     ; ==== 启用长模式 ===
-    ; 参见英特尔开发手册合集p4360 volume4, chapter2  2-60 Vol. 4
+    ; 参见英特尔开发手册合集p4360 volume4, chapter2  页码2-60 Vol. 4
     ; IA32_EFER寄存器的第8位是LME标志位，能启用IA-32e模式
     mov ecx, 0xC0000080
     rdmsr

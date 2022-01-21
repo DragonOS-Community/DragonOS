@@ -1,0 +1,142 @@
+// 这是内核执行头程序
+// Created by longjin.
+// 2022/01/20
+
+.section .text
+
+.global _start
+
+_start:
+    // 初始化寄存器
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %ss
+
+    mov $0x7e00, %esp
+
+// === 加载GDTR ====
+    lgdt GDT_POINTER(%rip) //这里我没搞明白rip相对寻址, 看了文档，大概是用来实现PIC的（position independent code）
+// === 加载IDTR ====
+    lidt IDT_POINTER(%rip)
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %ss
+    mov %ax, %gs
+
+    movq $0x7e00, %rsp
+
+// ==== 加载CR3寄存器
+    movq $0x101000, %rax //设置页目录基地址
+    movq %rax, %cr3
+    movq switch_seg(%rip), %rax
+
+    // 由于ljmp和lcall在GAS中不受支持，因此我们需要先伪造函数调用现场，通过lret的方式，给它跳转过去。才能更新cs寄存器
+    // 实在是太妙了！Amazing！
+    pushq $0x08 //段选择子
+    pushq %rax
+    lretq
+
+// 64位模式的代码
+switch_seg:
+    .quad entry64
+
+entry64:
+    movq $0x10, %rax
+    movq %rax, %ds
+    movq %rax, %es
+    movq %rax, %gs
+    movq %rax, %ss
+
+    movq $0xffff800000007e00, %rsp //rsp的地址
+
+    // 切换到内核主程序
+    movq go_to_kernel(%rip), %rax
+    pushq $0x08
+    pushq %rax
+    lretq
+
+go_to_kernel:
+    .quad Start_Kernel
+
+
+
+// 初始化页表
+.align 8 //设置为8byte对齐
+.org 0x1000 //设置页表位置为内核执行头程序的0x1000处
+
+__PML4E:
+    .quad 0x102007 // 系统访问，可读写，已存在， 地址在31~12位
+    .fill	255,8,0
+	.quad	0x102007
+	.fill	255,8,0
+
+.org	0x2000
+
+__PDPTE:
+
+	.quad	0x103003 // 用户访问，可读写，已存在
+	.fill	511,8,0
+
+.org	0x3000
+
+__PDE:
+
+	.quad	0x000083    // 用户访问，可读写，已存在
+	.quad	0x200083
+	.quad	0x400083
+	.quad	0x600083
+	.quad	0x800083
+	.quad	0xe0000083		/*0x a00000*/
+	.quad	0xe0200083
+	.quad	0xe0400083
+	.quad	0xe0600083		/*0x1000000*/
+	.quad	0xe0800083
+	.quad	0xe0a00083
+	.quad	0xe0c00083
+	.quad	0xe0e00083
+	.fill	499,8,0
+
+// GDT表
+.section .data
+.global GDT_Table // 使得GDT可以被外部程序引用或者访问
+
+GDT_Table:
+    .quad 0x0000000000000000 // 0 空描述符 00
+    .quad 0x0020980000000000 // 1 内核64位代码段描述符 08
+    .quad 0x0000920000000000 // 2 内核64位数据段描述符 10
+    .quad 0x0020f80000000000 // 3 用户64位代码段描述符 18
+    .quad 0x0000f20000000000 // 4 用户64位数据段描述符 20
+    .quad 0x00cf9a000000ffff // 5 内核32位代码段描述符 28
+    .quad 0x00cf92000000ffff // 6 内核32位数据段描述符 30
+    .fill 10, 8, 0           // 8~9 TSS(跳过了第七段)  重复十次填充8字节的空间，赋值为0
+GDT_END:
+
+GDT_POINTER:
+GDT_LIMIT: .word GDT_END - GDT_Table - 1 // GDT的大小
+GDT_BASE: .quad GDT_Table
+
+// IDT 表
+.global IDT_Table
+
+IDT_Table:
+    .fill 512, 8, 0 // 设置512*8字节的IDT表的空间
+IDT_END:
+
+IDT_POINTER:
+IDT_LIMIT: .word IDT_END - IDT_Table - 1
+IDT_BASE: .quad IDT_Table
+
+// 64位的TSS表
+.global TSS64_Table
+
+TSS64_Table:
+    .fill 13, 8, 0
+TSS64_END:
+
+TSS64_POINTER:
+TSS64_LIMIT: .word TSS64_END - TSS64_Table - 1
+TSS64_BASE: .quad TSS64_Table

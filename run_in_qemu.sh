@@ -43,7 +43,7 @@ fi
       # ========把loader.bin复制到boot.img==========
       cp bin/bootloader/loader.bin tmp/boot
       # ========把内核程序复制到boot.img======
-      cp bin/bootloader/kernel.bin tmp/boot
+      cp bin/kernel/kernel.bin tmp/boot
       sync
       # 卸载磁盘
       umount tmp/boot

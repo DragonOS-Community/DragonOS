@@ -73,7 +73,7 @@ else
 fi
 
 if [ $flag_can_run -eq 1 ]; then
-  qemu-system-x86_64 -s -S -m 2048 -fda bin/boot.img  
+  bochs -f ./bochsrc -q
 else
   echo "不满足运行条件"
 fi

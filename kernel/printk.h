@@ -32,3 +32,13 @@ struct screen_info
 extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小）
 
 char buf[4096]; //vsprintf()的缓冲区
+
+
+/**
+     * 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
+     * @param buf 结果缓冲区
+     * @param fmt 格式化字符串
+     * @param args 内容
+     * @return 最终字符串的长度
+     */
+int vsprintf(char *buf, const char *fmt, va_list args);

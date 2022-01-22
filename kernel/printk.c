@@ -114,6 +114,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             field_width = skip_and_atoi(&fmt);
 
         //获取小数精度
+        precision = -1;
         if (*fmt == '.')
         {
             ++fmt;
@@ -162,6 +163,46 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 ++str;
             }
 
+            break;
+        //显示一个字符串
+        case 's':
+            s = va_arg(args, char *);
+            if (!s)
+                s = '\0';
+            len = strlen(s);
+            if (precision < 0)
+            {
+                //未指定精度
+                precision = len;
+            }
+
+            else if (len > precision)
+            {
+                len = precision;
+            }
+
+            //靠右对齐
+            if (!(flags & LEFT))
+                while (len < field_width--)
+                {
+                    *str = ' ';
+                    ++str;
+                }
+            
+            for (int i = 0; i < len; i++)
+            {
+                *str = *s;
+                ++s;
+                ++str;
+            }
+
+            while (len<field_width--)
+            {
+                *str = ' ';
+                ++str;
+            }
+            
+            
             break;
 
         default:

@@ -5,6 +5,9 @@
 
 #pragma once
 
+//引入对bool类型的支持
+#include<stdbool.h>
+
 #define NULL 0
 
 #define sti() __asm__ __volatile__("sti\n\t" :: \

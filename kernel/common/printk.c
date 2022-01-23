@@ -3,7 +3,66 @@
 //
 #include "printk.h"
 #include <math.h>
+//#include "linkage.h"
 
+struct screen_info pos;
+
+void show_color_band(int width, int height, char a, char b, char c, char d)
+{
+    /** 向帧缓冲区写入像素值
+     * @param address: 帧缓存区的地址
+     * @param val:像素值
+     */
+
+    for (int i = 0; i < width * height; ++i)
+    {
+
+        *((char *)pos.FB_address + 0) = d;
+        *((char *)pos.FB_address + 1) = c;
+        *((char *)pos.FB_address + 2) = b;
+        *((char *)pos.FB_address + 3) = a;
+        ++pos.FB_address;
+    }
+}
+
+int calculate_max_charNum(int len, int size)
+{
+    /**
+     * @brief 计算屏幕上能有多少行
+     * @param len 屏幕长/宽
+     * @param size 字符长/宽
+     */
+    return len / size;
+}
+
+int init_printk(const int width, const int height, unsigned int *FB_address, const int FB_length, const int char_size_x, const int char_size_y)
+{
+
+    pos.width = width;
+    pos.height = height;
+    pos.char_size_x = char_size_x;
+    pos.char_size_y = char_size_y;
+    pos.max_x = calculate_max_charNum(width, char_size_x);
+    pos.max_y = calculate_max_charNum(height, char_size_y);
+
+    pos.FB_address = FB_address;
+    pos.FB_length = FB_length;
+
+    pos.x = 0;
+    pos.y = 0;
+
+    return 0;
+}
+
+static int set_printk_pos(const int x, const int y)
+{
+    // 指定的坐标不在屏幕范围内
+    if (!((x >= 0 && x <= pos.max_x) && (y >= 0 && y <= pos.max_y)))
+        return EPOS_OVERFLOW;
+    pos.x = x;
+    pos.y = y;
+    return 0;
+}
 int skip_and_atoi(const char **s)
 {
     /**
@@ -18,6 +77,22 @@ int skip_and_atoi(const char **s)
     }
     return ans;
 }
+
+void auto_newline()
+{
+    /**
+     * @brief 超过每行最大字符数，自动换行
+     * 
+     */
+    if (pos.x > pos.max_x)
+    {
+        pos.x = 0;
+        ++pos.y;
+    }
+    if (pos.y > pos.max_y)
+        pos.y = 0;
+}
+
 static int vsprintf(char *buf, const char *fmt, va_list args)
 {
     /**
@@ -53,11 +128,11 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
 
         //清空标志位和field宽度
         field_width = flags = 0;
-        ++fmt;
 
         bool flag_tmp = true;
         bool flag_break = false;
 
+        ++fmt;
         while (flag_tmp)
         {
             switch (*fmt)
@@ -67,13 +142,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
                 flag_break = true;
                 flag_tmp = false;
                 break;
-            case '%':
-                //输出 %
-                *str = '%';
-                ++str;
-                ++fmt;
-                flag_break = true;
-                break;
+
             case '-':
                 // 左对齐
                 flags |= LEFT;
@@ -107,13 +176,21 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
             break;
 
         //获取区域宽度
+        field_width = -1;
         if (*fmt == '*')
         {
             field_width = va_arg(args, int);
             ++fmt;
         }
         else if (is_digit(*fmt))
+        {
             field_width = skip_and_atoi(&fmt);
+            if (field_width < 0)
+            {
+                field_width = -field_width;
+                flags |= LEFT;
+            }
+        }
 
         //获取小数精度
         precision = -1;
@@ -137,29 +214,34 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
             qualifier = *fmt;
             ++fmt;
         }
+        //为了支持lld
+        if (qualifier == 'l' && *fmt == 'l', *(fmt + 1) == 'd')
+            ++fmt;
 
         //转化成字符串
-
+        long long *ip;
         switch (*fmt)
         {
+        //输出 %
+        case '%':
+            *str++ = '%';
+
+            break;
         // 显示一个字符
         case 'c':
             //靠右对齐
             if (!(flags & LEFT))
             {
-                while (--field_width)
+                while (--field_width > 0)
                 {
                     *str = ' ';
                     ++str;
                 }
             }
-            else //靠左对齐
-            {
-                *str = (char)va_arg(args, int);
-                ++str;
-                --field_width;
-            }
-            while (--field_width)
+
+            *str++ = (unsigned char)va_arg(args, int);
+
+            while (--field_width > 0)
             {
                 *str = ' ';
                 ++str;
@@ -208,10 +290,13 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
             break;
         //以八进制显示字符串
         case 'o':
+            flags |= SMALL;
+        case 'O':
+            flags |= SPECIAL;
             if (qualifier == 'l')
-                write_num(str, va_arg(args, long long), 8, field_width, precision, flags);
+                str = write_num(str, va_arg(args, long long), 8, field_width, precision, flags);
             else
-                write_num(str, va_arg(args, int), 8, field_width, precision, flags);
+                str = write_num(str, va_arg(args, int), 8, field_width, precision, flags);
             break;
 
         //打印指针指向的地址
@@ -222,7 +307,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
                 flags |= PAD_ZERO;
             }
 
-            write_num(str, (unsigned long)va_arg(args, void *), 16, field_width, precision, flags);
+            str = write_num(str, (unsigned long)va_arg(args, void *), 16, field_width, precision, flags);
 
             break;
 
@@ -230,34 +315,35 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
         case 'x':
             flags |= SMALL;
         case 'X':
+            flags |= SPECIAL;
             if (qualifier == 'l')
-                write_num(str, va_arg(args, long long), 16, field_width, precision, flags);
+                str = write_num(str, va_arg(args, long long), 16, field_width, precision, flags);
             else
-                write_num(str, va_arg(args, int), 16, field_width, precision, flags);
+                str = write_num(str, va_arg(args, int), 16, field_width, precision, flags);
             break;
 
         //打印十进制有符号整数
         case 'i':
         case 'd':
-        case 'ld':
+
             flags |= SIGN;
             if (qualifier == 'l')
-                write_num(str, va_arg(args, long long), 10, field_width, precision, flags);
+                str = write_num(str, va_arg(args, long long), 10, field_width, precision, flags);
             else
-                write_num(str, va_arg(args, int), 10, field_width, precision, flags);
+                str = write_num(str, va_arg(args, int), 10, field_width, precision, flags);
             break;
 
         //打印十进制无符号整数
         case 'u':
             if (qualifier == 'l')
-                write_num(str, va_arg(args, unsigned long long), 10, field_width, precision, flags);
+                str = write_num(str, va_arg(args, unsigned long long), 10, field_width, precision, flags);
             else
-                write_num(str, va_arg(args, unsigned int), 10, field_width, precision, flags);
+                str = write_num(str, va_arg(args, unsigned int), 10, field_width, precision, flags);
             break;
 
         //输出有效字符数量到*ip对应的变量
         case 'n':
-            long long *ip;
+
             if (qualifier == 'l')
                 ip = va_arg(args, long long *);
             else
@@ -269,18 +355,20 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
         //对于不识别的控制符，直接输出
         default:
             *str++ = '%';
-            if(*fmt)
+            if (*fmt)
                 *str++ = *fmt;
-            else --fmt;
+            else
+                --fmt;
             break;
         }
     }
     *str = '\0';
+
     //返回缓冲区已有字符串的长度。
-    return str-buf;
+    return str - buf;
 }
 
-static void write_num(char *str, long long num, int base, int field_width, int precision, int flags)
+static char *write_num(char *str, long long num, int base, int field_width, int precision, int flags)
 {
     /**
      * @brief 将数字按照指定的要求转换成对应的字符串
@@ -296,7 +384,6 @@ static void write_num(char *str, long long num, int base, int field_width, int p
     // 首先判断是否支持该进制
     if (base < 2 || base > 36)
         return 0;
-
     char pad, sign, tmp_num[100];
 
     const char *digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -335,11 +422,11 @@ static void write_num(char *str, long long num, int base, int field_width, int p
         tmp_num[js_num++] = '0';
     else
     {
-        num = abs(num);
+        num = ABS(num);
         //进制转换
-        while (num)
+        while (num > 0)
         {
-            tmp_num[js_num++] = num % base; // 注意这里，输出的数字，是小端对齐的。低位存低位
+            tmp_num[js_num++] = digits[num % base]; // 注意这里，输出的数字，是小端对齐的。低位存低位
             num /= base;
         }
     }
@@ -351,7 +438,7 @@ static void write_num(char *str, long long num, int base, int field_width, int p
 
     // 靠右对齐
     if (!(flags & LEFT))
-        while (field_width--)
+        while (field_width-- > 0)
             *str++ = pad;
 
     if (sign)
@@ -371,11 +458,119 @@ static void write_num(char *str, long long num, int base, int field_width, int p
         *str++ = '0';
     }
 
-    while (js_num--)
+    while (js_num-- > 0)
         *str++ = tmp_num[js_num];
+    
 
-    while (field_width--)
+    while (field_width-- > 0)
         *str++ = ' ';
 
     return str;
+}
+
+static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font)
+{
+    /**
+     * @brief 在屏幕上指定位置打印字符
+     * 
+     * @param fb 帧缓存线性地址
+     * @param Xsize 行分辨率
+     * @param x 左上角列像素点位置
+     * @param y 左上角行像素点位置
+     * @param FRcolor 字体颜色
+     * @param BKcolor 背景颜色
+     * @param font 字符的bitmap
+     */
+
+    unsigned char *font_ptr = font_ascii[font];
+    unsigned int *addr;
+
+    int testbit; // 用来测试某位是背景还是字体本身
+
+    for (int i = 0; i < pos.char_size_y; ++i)
+    {
+        // 计算出帧缓冲区的地址
+        addr = fb + Xsize * (y + i) + x;
+        testbit = (1 << (pos.char_size_x + 1));
+        for (int j = 0; j < pos.char_size_x; ++j)
+        {
+            //从左往右逐个测试相应位
+            testbit >>= 1;
+            if (*font_ptr & testbit)
+                *addr = FRcolor; // 字，显示前景色
+            else
+                *addr = BKcolor; // 背景色
+
+            ++addr;
+        }
+        ++font_ptr;
+    }
+}
+
+int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...)
+{
+    /**
+     * @brief 格式化打印字符串
+     * 
+     * @param FRcolor 前景色
+     * @param BKcolor 背景色
+     * @param ... 格式化字符串
+     */
+
+    va_list args;
+    va_start(args, fmt);
+
+    int len = vsprintf(buf, fmt, args);
+
+    va_end(args);
+    unsigned char current;
+
+    int i; // 总共输出的字符数
+    for (i = 0; i < len; ++i)
+    {
+        current = *(buf + i);
+        //输出换行
+        if (current == '\n')
+        {
+            pos.x = 0;
+            ++pos.y;
+        }
+        else if (current == '\t') // 输出制表符
+        {
+            int space_to_print = 8 - pos.x % 8;
+
+            while (space_to_print--)
+            {
+                putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, BLACK, BLACK, ' ');
+                ++pos.x;
+
+                auto_newline();
+            }
+        }
+        else if (current == '\b') // 退格
+        {
+            --pos.x;
+            if (pos.x < 0)
+            {
+                --pos.y;
+                if (pos.y <= 0)
+                    pos.x = pos.y = 0;
+                else
+                    pos.x = pos.max_x;
+            }
+
+            putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, FRcolor, BKcolor, ' ');
+            ++pos.x;
+
+            auto_newline();
+        }
+        else
+        {
+            putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, FRcolor, BKcolor, current);
+            ++pos.x;
+            auto_newline();
+        }
+    }
+
+    return i;
 }

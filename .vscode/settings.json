@@ -2,6 +2,8 @@
     "files.associations": {
         "stdlib.h": "c",
         "stdbool.h": "c",
-        "printk.h": "c"
+        "printk.h": "c",
+        "stdarg.h": "c",
+        "font.h": "c"
     }
 }

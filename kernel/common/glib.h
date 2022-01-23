@@ -4,9 +4,11 @@
 //
 
 #pragma once
+#ifndef GLIB_H
+#define GLIB_H
 
 //引入对bool类型的支持
-#include<stdbool.h>
+#include <stdbool.h>
 
 #define NULL 0
 
@@ -23,6 +25,8 @@
                                              : "memory") // 在sfence指令前的写操作当必须在sfence指令后的写操作前完成
 #define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
                                              : "memory") // 在lfence指令前的读操作当必须在lfence指令后的读操作前完成。
+
+#define ABS(x) ((x) > 0 ? (x) : -(x))   // 绝对值
 
 //链表数据结构
 struct List
@@ -74,20 +78,21 @@ static inline void list_del(struct List *entry)
     entry->next = entry->prev;
 }
 
-static inline bool list_empty(struct List* entry)
+static inline bool list_empty(struct List *entry)
 {
     /**
      * @brief 判断循环链表是否为空
      * @param entry 入口
      */
 
-    if(entry->prev == entry->next)
+    if (entry->prev == entry->next)
         return true;
-    else return false;
+    else
+        return false;
 }
 
 //计算字符串的长度（经过测试，该版本比采用repne/scasb汇编的运行速度快16.8%左右）
-static inline int strlen(char* s)
+static inline int strlen(char *s)
 {
     register int __res = 0;
     while (s[__res] != '\0')
@@ -96,3 +101,5 @@ static inline int strlen(char* s)
     }
     return __res;
 }
+
+#endif

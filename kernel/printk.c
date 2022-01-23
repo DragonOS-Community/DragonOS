@@ -2,6 +2,7 @@
 // Created by longjin on 2022/1/22.
 //
 #include "printk.h"
+#include <math.h>
 
 int skip_and_atoi(const char **s)
 {
@@ -17,7 +18,7 @@ int skip_and_atoi(const char **s)
     }
     return ans;
 }
-int vsprintf(char *buf, const char *fmt, va_list args)
+static int vsprintf(char *buf, const char *fmt, va_list args)
 {
     /**
      * 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
@@ -45,6 +46,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
         {
             *str = *fmt;
             ++str;
+            continue;
         }
 
         //开始格式化字符串
@@ -164,6 +166,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             }
 
             break;
+
         //显示一个字符串
         case 's':
             s = va_arg(args, char *);
@@ -188,7 +191,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                     *str = ' ';
                     ++str;
                 }
-            
+
             for (int i = 0; i < len; i++)
             {
                 *str = *s;
@@ -196,17 +199,183 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 ++str;
             }
 
-            while (len<field_width--)
+            while (len < field_width--)
             {
                 *str = ' ';
                 ++str;
             }
-            
-            
+
+            break;
+        //以八进制显示字符串
+        case 'o':
+            if (qualifier == 'l')
+                write_num(str, va_arg(args, long long), 8, field_width, precision, flags);
+            else
+                write_num(str, va_arg(args, int), 8, field_width, precision, flags);
             break;
 
+        //打印指针指向的地址
+        case 'p':
+            if (field_width == 0)
+            {
+                field_width = 2 * sizeof(void *);
+                flags |= PAD_ZERO;
+            }
+
+            write_num(str, (unsigned long)va_arg(args, void *), 16, field_width, precision, flags);
+
+            break;
+
+        //打印十六进制
+        case 'x':
+            flags |= SMALL;
+        case 'X':
+            if (qualifier == 'l')
+                write_num(str, va_arg(args, long long), 16, field_width, precision, flags);
+            else
+                write_num(str, va_arg(args, int), 16, field_width, precision, flags);
+            break;
+
+        //打印十进制有符号整数
+        case 'i':
+        case 'd':
+        case 'ld':
+            flags |= SIGN;
+            if (qualifier == 'l')
+                write_num(str, va_arg(args, long long), 10, field_width, precision, flags);
+            else
+                write_num(str, va_arg(args, int), 10, field_width, precision, flags);
+            break;
+
+        //打印十进制无符号整数
+        case 'u':
+            if (qualifier == 'l')
+                write_num(str, va_arg(args, unsigned long long), 10, field_width, precision, flags);
+            else
+                write_num(str, va_arg(args, unsigned int), 10, field_width, precision, flags);
+            break;
+
+        //输出有效字符数量到*ip对应的变量
+        case 'n':
+            long long *ip;
+            if (qualifier == 'l')
+                ip = va_arg(args, long long *);
+            else
+                ip = va_arg(args, int *);
+
+            *ip = str - buf;
+            break;
+
+        //对于不识别的控制符，直接输出
         default:
+            *str++ = '%';
+            if(*fmt)
+                *str++ = *fmt;
+            else --fmt;
             break;
         }
     }
+    *str = '\0';
+    //返回缓冲区已有字符串的长度。
+    return str-buf;
+}
+
+static void write_num(char *str, long long num, int base, int field_width, int precision, int flags)
+{
+    /**
+     * @brief 将数字按照指定的要求转换成对应的字符串
+     * 
+     * @param str 要返回的字符串
+     * @param num 要打印的数值
+     * @param base 基数
+     * @param field_width 区域宽度 
+     * @param precision 精度
+     * @param flags 标志位
+     */
+
+    // 首先判断是否支持该进制
+    if (base < 2 || base > 36)
+        return 0;
+
+    char pad, sign, tmp_num[100];
+
+    const char *digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    // 显示小写字母
+    if (flags & SMALL)
+        digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+    // 设置填充元素
+    pad = (flags & PAD_ZERO) ? '0' : ' ';
+
+    sign = 0;
+    if (flags & SIGN && num < 0)
+    {
+        sign = '-';
+        num = -num;
+    }
+    else
+    {
+        // 设置符号
+        sign = (flags & PLUS) ? '+' : ((flags & SPACE) ? ' ' : 0);
+    }
+
+    // sign占用了一个宽度
+    if (sign)
+        --field_width;
+
+    if (flags & SPECIAL)
+        if (base == 16) // 0x占用2个位置
+            field_width -= 2;
+        else if (base == 8) // O占用一个位置
+            --field_width;
+
+    int js_num = 0; // 临时数字字符串tmp_num的长度
+
+    if (num == 0)
+        tmp_num[js_num++] = '0';
+    else
+    {
+        num = abs(num);
+        //进制转换
+        while (num)
+        {
+            tmp_num[js_num++] = num % base; // 注意这里，输出的数字，是小端对齐的。低位存低位
+            num /= base;
+        }
+    }
+
+    if (js_num > precision)
+        precision = js_num;
+
+    field_width -= precision;
+
+    // 靠右对齐
+    if (!(flags & LEFT))
+        while (field_width--)
+            *str++ = pad;
+
+    if (sign)
+        *str++ = sign;
+    if (flags & SPECIAL)
+        if (base == 16)
+        {
+            *str++ = '0';
+            *str++ = digits[33];
+        }
+        else if (base == 8)
+            *str++ = digits[24]; //注意这里是英文字母O或者o
+
+    while (js_num < precision)
+    {
+        --precision;
+        *str++ = '0';
+    }
+
+    while (js_num--)
+        *str++ = tmp_num[js_num];
+
+    while (field_width--)
+        *str++ = ' ';
+
+    return str;
 }

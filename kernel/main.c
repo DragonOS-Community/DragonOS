@@ -47,7 +47,6 @@ void test_printk()
     printk("2022-01-01\tDavid\t99\n");
     printk("2022-01-01\tJohn\t95\n");
 
-
     //测试输出八进制
     printk("\nTest base 8 : %d --> %o\n", 255, 255);
 
@@ -62,9 +61,19 @@ void Start_Kernel(void)
     init_printk(1440, 900, FR_address, 1440 * 900 * 4, 8, 16);
 
     show_welcome();
-    test_printk();
+    //test_printk();
     
+    int t = 1 / 0;  // 测试异常处理模块ignore_int能否正常工作
 
+    while (1)
+        ;
+}
+
+void ignore_int()
+{
+    printk("[");
+    printk_color(YELLOW, BLACK, "WARN");
+    printk("] Unknown interrupt or fault at RIP.\n");
     while (1)
         ;
 }

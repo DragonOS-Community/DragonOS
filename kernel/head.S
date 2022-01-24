@@ -53,6 +53,70 @@ entry64:
 
     movq $0xffff800000007e00, %rsp //rsp的地址
 
+setup_IDT:
+    leaq m_ignore_int(%rip),  %rdx // 将ignore_int的地址暂时存到中段描述符的高8B
+    movq $(0x08 << 16), %rax  // 设置段选择子。由IDT结构和段选择子结构可知，本行设置段基地址为0x100000，TI=0,RPL=0
+    movw %dx, %ax
+
+    movq $ (0x8e00 << 32), %rcx // 设置Type=1110 P=1 DPL=00 0=0
+    addq %rcx, %rax
+
+    // 把ignore_int的地址填写到正确位置, rax存低8B， rdx存高8B
+    movl %edx, %ecx
+    shrl $16, %ecx // 去除低16位
+    shlq $48, %rcx
+    addq %rcx, %rax // 填写段内偏移31:16
+
+    shrq $32, %rdx // （已经填写了32位，故右移32）
+
+    leaq IDT_Table(%rip), %rdi // 获取中断描述符表的首地址，存储到rdi
+    mov $256, %rcx  // 初始化每个中断描述符
+
+repeat_set_idt:
+    // ====== 循环，初始化总共256个中断描述符 ===
+    movq %rax, (%rdi)   // 保存低8B
+    movq %rdx, 8(%rdi)  // 保存高8B
+
+    addq $0x10, %rdi // 转到下一个IDT表项
+    dec %rcx
+    jne repeat_set_idt
+
+SetUp_TSS64:
+    // == 设置64位的任务状态段表 ===
+    //rdx保存高8B， rax保存低8B
+    leaq TSS64_Table(%rip), %rdx
+    xorq %rax, %rax
+    xorq %rcx, %rcx
+
+    // 设置TSS描述符的47：40位为1000 1001
+    movq $0x89, %rax
+    shlq $40, %rax
+
+    // 设置段基地址31:24
+    movl %edx, %ecx
+    shrl $24, %ecx
+    shlq $56, %rcx
+    addq %rcx, %rax
+
+    xorq %rcx, %rcx
+
+    // 设置段基地址23:00
+    movl %edx, %ecx
+    andl $0xffffff, %ecx // 清空ecx的中有效值的高8位（也就是上面已经赋值了的）
+    shlq $16, %rcx
+    addq %rcx, %rax
+
+    addq $103, %rax // 设置段长度
+
+    leaq GDT_Table(%rip), %rdi
+    movq %rax, 64(%rdi) // 把低八B存储到GDT第8项
+    shrq $32, %rdx
+    movq %rdx, 72(%rdi) // 高8B存到GDT低9项
+
+    // 装载任务状态段寄存器
+    mov $0x40, %ax // 设置起始地址为64
+    ltr %ax
+
     // 切换到内核主程序
     movq go_to_kernel(%rip), %rax
     pushq $0x08
@@ -62,7 +126,17 @@ entry64:
 go_to_kernel:
     .quad Start_Kernel
 
+// ==== 异常/中断处理模块 ignore int： 忽略中断
+m_ignore_int:
+// 切换到c语言的ignore_int
+    movq go_to_ignore_int(%rip), %rax
+    pushq $0x08
+    pushq %rax
+    lretq
 
+
+go_to_ignore_int:
+    .quad ignore_int
 
 // 初始化页表
 .align 8 //设置为8byte对齐

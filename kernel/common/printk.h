@@ -72,7 +72,7 @@ int init_printk(const int width, const int height, unsigned int *FB_address, con
  * @param x 列坐标
  * @param y 行坐标
  */
-static int set_printk_pos(const int x, const int y);
+int set_printk_pos(const int x, const int y);
 /**
  * @brief 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
  * 

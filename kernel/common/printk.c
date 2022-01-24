@@ -54,7 +54,7 @@ int init_printk(const int width, const int height, unsigned int *FB_address, con
     return 0;
 }
 
-static int set_printk_pos(const int x, const int y)
+int set_printk_pos(const int x, const int y)
 {
     // 指定的坐标不在屏幕范围内
     if (!((x >= 0 && x <= pos.max_x) && (y >= 0 && y <= pos.max_y)))

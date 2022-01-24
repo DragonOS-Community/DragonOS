@@ -1,6 +1,5 @@
 
-#ifndef __FONT_H__
-#define __FONT_H__
+#pragma once
 
 unsigned char font_ascii[256][16]=
 {
@@ -316,5 +315,4 @@ unsigned char font_ascii[256][16]=
 
 };
 
-#endif
 

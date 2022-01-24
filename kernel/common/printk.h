@@ -2,8 +2,7 @@
 // Created by longjin on 2022/1/21.
 //
 #pragma once
-#ifndef PRINTK_H
-#define PRINTK_H
+
 
 #define PAD_ZERO 1 // 0填充
 #define LEFT 2     // 靠左对齐
@@ -121,4 +120,3 @@ static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRco
 
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char*fmt, ...);
 
-#endif

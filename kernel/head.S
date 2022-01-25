@@ -113,9 +113,9 @@ SetUp_TSS64:
     shrq $32, %rdx
     movq %rdx, 72(%rdi) // 高8B存到GDT低9项
 
-    // 装载任务状态段寄存器
-    mov $0x40, %ax // 设置起始地址为64
-    ltr %ax
+    // 装载任务状态段寄存器(已改为在main.c中使用load_TR宏进行装载)
+    // mov $0x40, %ax // 设置起始地址为64
+    // ltr %ax
 
     // 切换到内核主程序
     movq go_to_kernel(%rip), %rax
@@ -132,6 +132,8 @@ m_ignore_int:
     movq go_to_ignore_int(%rip), %rax
     pushq $0x08
     pushq %rax
+    lretq
+
     lretq
 
 

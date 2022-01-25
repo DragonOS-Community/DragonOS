@@ -4,6 +4,8 @@
 
 #include "common/glib.h"
 #include "common/printk.h"
+#include "exception/gate.h"
+#include "exception/trap.h"
 
 int *FR_address = (int *)0xffff800000a00000; //帧缓存区的地址
 
@@ -23,7 +25,7 @@ void show_welcome()
     printk_color(BLACK, 0x00e0ebeb, "      Welcome to DragonOS !     \n");
     for (int i = 0; i < 74; ++i)
         printk(" ");
-    printk_color(0x00e0ebeb, 0x00e0ebeb, "                                \n");
+    printk_color(0x00e0ebeb, 0x00e0ebeb, "                                \n\n");
 }
 
 void test_printk()
@@ -54,16 +56,37 @@ void test_printk()
     printk("\nTest base 16 : %d --> %x\n", 255, 255);
     printk("\nTest base 16 : %d --> %X\n", 255, 255);
 }
-//操作系统内核从这里开始执行
-void Start_Kernel(void)
+
+void init()
 {
     // 初始化printk
     init_printk(1440, 900, FR_address, 1440 * 900 * 4, 8, 16);
 
-    show_welcome();
-    //test_printk();
+    load_TR(8); // 加载TR寄存器
+
+    // 初始化任务状态段表
+    ul tss_item_addr = 0xffff800000007c00;
+    set_TSS64(tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr,
+     tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
+
+    // 初始化中断描述符表
+    init_sys_vector();
     
-    int t = 1 / 0;  // 测试异常处理模块ignore_int能否正常工作
+}
+//操作系统内核从这里开始执行
+void Start_Kernel(void)
+{
+
+    init();
+    show_welcome();
+
+
+
+    //test_printk();
+
+    //int t = 1 / 0; // 测试异常处理模块能否正常工作 触发除法错误
+    int t = *(int*) 0xffff80000aa00000; // 触发页故障
+
 
     while (1)
         ;
@@ -74,6 +97,5 @@ void ignore_int()
     printk("[");
     printk_color(YELLOW, BLACK, "WARN");
     printk("] Unknown interrupt or fault at RIP.\n");
-    while (1)
-        ;
+    return;
 }

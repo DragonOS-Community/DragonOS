@@ -26,6 +26,11 @@
 
 #define ABS(x) ((x) > 0 ? (x) : -(x))   // 绝对值
 
+// 定义类型的缩写
+typedef unsigned long ul;
+typedef unsigned long long ull;
+typedef long long ll;
+
 //链表数据结构
 struct List
 {

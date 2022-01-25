@@ -4,6 +4,8 @@
         "stdbool.h": "c",
         "printk.h": "c",
         "stdarg.h": "c",
-        "font.h": "c"
+        "font.h": "c",
+        "trap.h": "c",
+        "gate.h": "c"
     }
 }

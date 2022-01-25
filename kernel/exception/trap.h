@@ -8,8 +8,9 @@
 
 #pragma once
 
-#include <common/printk.h>
-#include <common/glib.h>
+#include "../common/printk.h"
+#include "../common/glib.h"
+#include "../common/asm.h"
 
 /**
  * @brief 初始化系统中断表
@@ -36,7 +37,7 @@ void dev_not_available();
 void double_fault();
 void coprocessor_segment_overrun();
 void invalid_TSS();
-void segment_not_present();
+void segment_not_exists();
 void stack_segment_fault();
 void general_protection();
 // 缺页异常

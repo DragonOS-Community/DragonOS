@@ -13,18 +13,17 @@ if [ ! "$1" == "--nobuild" ]; then
 fi
 
 # ==============检查文件是否齐全================
-if [ ! -x "bin/bootloader/boot.bin" ]; then
-  echo "bin/bootloader/boot.bin 不存在！"
+bins[0]=bin/bootloader/boot.bin
+bins[1]=bin/bootloader/loader.bin
+bins[2]=bin/boot.img
+bins[3]=bin/kernel/kernel.bin
+
+for file in ${bins[*]};do
+if [ ! -x $file ]; then
+  echo "$file 不存在！"
   exit
-fi
-if [ ! -x "bin/bootloader/loader.bin" ]; then
-  echo "bin/bootloader/loader.bin 不存在！"
-  exit
-fi
-if [ ! -x "bin/boot.img" ]; then
-  echo "bin/boot.img 不存在！"
-  exit
-fi
+  fi
+done
 # ===============文件检查完毕===================
 
 

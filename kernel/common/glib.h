@@ -4,8 +4,6 @@
 //
 
 #pragma once
-#ifndef GLIB_H
-#define GLIB_H
 
 //引入对bool类型的支持
 #include <stdbool.h>
@@ -102,4 +100,3 @@ static inline int strlen(char *s)
     return __res;
 }
 
-#endif

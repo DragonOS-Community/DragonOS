@@ -35,7 +35,7 @@ void do_divide_error(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_divide_error(0),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -47,7 +47,7 @@ void do_debug(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR / TRAP");
-    printk(" ] do_debug(1),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -59,7 +59,7 @@ void do_nmi(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(BLUE, BLACK, "INT");
-    printk(" ] do_nmi(2),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_nmi(2),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -71,7 +71,7 @@ void do_int3(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(YELLOW, BLACK, "TRAP");
-    printk(" ] do_int3(3),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_int3(3),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -83,7 +83,7 @@ void do_overflow(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(YELLOW, BLACK, "TRAP");
-    printk(" ] do_overflow(4),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_overflow(4),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -95,7 +95,7 @@ void do_bounds(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_bounds(5),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_bounds(5),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -107,7 +107,7 @@ void do_undefined_opcode(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_undefined_opcode(6),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -119,7 +119,7 @@ void do_dev_not_avaliable(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_dev_not_avaliable(7),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -131,7 +131,7 @@ void do_double_fault(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "Terminate");
-    printk(" ] do_double_fault(8),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_double_fault(8),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -143,7 +143,7 @@ void do_coprocessor_segment_overrun(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_coprocessor_segment_overrun(9),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_coprocessor_segment_overrun(9),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -155,7 +155,7 @@ void do_invalid_TSS(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[");
     printk_color(RED, BLACK, "ERROR");
-    printk("] do_invalid_TSS(10),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk("] do_invalid_TSS(10),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     printk_color(YELLOW, BLACK, "Information:\n");
     // 解析错误码
@@ -186,7 +186,7 @@ void do_segment_not_exists(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_segment_not_exists(11),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_segment_not_exists(11),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -198,7 +198,7 @@ void do_stack_segment_fault(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_stack_segment_fault(12),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_stack_segment_fault(12),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -210,7 +210,7 @@ void do_general_protection(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_general_protection(13),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -228,7 +228,7 @@ void do_page_fault(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_page_fault(14),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\tCR2:%18lx\n", error_code, rsp, *rip, cr2);
+    printk(" ] do_page_fault(14),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\tCR2:%#18lx\n", error_code, rsp, *rip, cr2);
 
     printk_color(YELLOW, BLACK, "Information:\n");
     if (!(error_code & 0x01))
@@ -262,7 +262,7 @@ void do_x87_FPU_error(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_x87_FPU_error(16),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_x87_FPU_error(16),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -274,7 +274,7 @@ void do_alignment_check(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_alignment_check(17),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_alignment_check(17),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -286,7 +286,7 @@ void do_machine_check(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_machine_check(18),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_machine_check(18),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -298,7 +298,7 @@ void do_SIMD_exception(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_SIMD_exception(19),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_SIMD_exception(19),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;
@@ -310,7 +310,7 @@ void do_virtualization_exception(unsigned long rsp, unsigned long error_code)
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk(" ] do_virtualization_exception(20),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\n", error_code, rsp, *rip);
+    printk(" ] do_virtualization_exception(20),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
 
     while (1)
         ;

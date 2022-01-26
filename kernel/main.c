@@ -50,11 +50,11 @@ void test_printk()
     printk("2022-01-01\tJohn\t95\n");
 
     //测试输出八进制
-    printk("\nTest base 8 : %d --> %o\n", 255, 255);
+    printk("\nTest base 8 : %d --> %#o\n", 255, 255);
 
     //测试输出十六进制
-    printk("\nTest base 16 : %d --> %x\n", 255, 255);
-    printk("\nTest base 16 : %d --> %X\n", 255, 255);
+    printk("\nTest base 16 : %d --> %#x\n", 255, 255);
+    printk("\nTest base 16 : %d --> %#X\n", 255, 255);
 }
 
 void init()

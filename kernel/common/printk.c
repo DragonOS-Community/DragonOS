@@ -315,7 +315,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
         case 'x':
             flags |= SMALL;
         case 'X':
-            flags |= SPECIAL;
+            //flags |= SPECIAL;
             if (qualifier == 'l')
                 str = write_num(str, va_arg(args, long long), 16, field_width, precision, flags);
             else

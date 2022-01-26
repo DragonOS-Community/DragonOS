@@ -226,9 +226,9 @@ void do_page_fault(unsigned long rsp, unsigned long error_code)
                          : "=r"(cr2)::"memory");
 
     unsigned long *rip = (unsigned long *)(rsp + 0x98);
-    printk("[");
+    printk("[ ");
     printk_color(RED, BLACK, "ERROR");
-    printk("] do_page_fault(14),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\tCR2:%18lx\n", error_code, rsp, *rip, cr2);
+    printk(" ] do_page_fault(14),\tError Code:%18lx,\tRSP:%18lx,\tRIP:%18lx\tCR2:%18lx\n", error_code, rsp, *rip, cr2);
 
     printk_color(YELLOW, BLACK, "Information:\n");
     if (!(error_code & 0x01))

@@ -24,73 +24,46 @@ extern struct desc_struct GDT_Table[]; //GDT_Table是head.S中的GDT_Table
 extern struct gate_struct IDT_Table[]; //IDT_Table是head.S中的IDT_Table
 extern unsigned int TSS64_Table[26];
 
+
 /**
  * @brief 初始化中段描述符表内的门描述符（每个16B）
  * @param gate_selector_addr IDT表项的地址
  * @param attr P、DPL、TYPE的属性
  * @param ist 中断栈表号
- * @param code_addr 中断服务程序的地址
+ * @param code_addr 指向中断服务程序的指针的地址
  */
-// todo:在系统异常处理主功能完成后，将这段代码用C来写一遍。这段汇编实在是太晦涩难懂了，我看了半个钟才看明白。
+void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
+{
+    ul __d0=0, __d1=0;
+    ul tmp_code_addr = *code_addr;
+    __d0 = attr << 40; //设置P、DPL、Type
 
-/*
-#define _set_gate(gate_selector_addr, attr, ist, code_addr) \
-do{                                                         \
-    unsigned long __d0, __d1;                               \
-    __asm__ __volatile__ (  "movw   %%dx,   %%ax    \n\t"   \
-                            "andq   $0x7,   %%rcx   \n\t"   // 清空rcx中除了2:0以外的所有位 此前ist的值已经被赋给了rcx \   
-                            "addq   %4,     %%rcx   \n\t"   // 将P,DPL, Type的值加到rcx中 \   
-                            "shlq   $32,    %%rcx   \n\t"   \ 
-                            "addq   %%rcx,  %%rax   \n\t"   // 设置ist \   
-                            "xorq   %%rcx,  %%rcx   \n\t"   // 清空rcx \   
-                            "movl   %%edx,  %%ecx   \n\t"   \ 
-                            "shrq   $16,    %%ecx   \n\t"   \
-                            "shlq   $48,    %%rcx   \n\t"   // 左移到低8B中表示段内偏移的[31:16]处 \   
-                            "addq   %%rcx,  %%rax   \n\t"  // 设置段内偏移[31:16] \   
-                            "movq   %%rax,  %0      \n\t"   // 输出到门选择子的低8B \   
-                            "shrq   $32,    %%rdx   \n\t"   \
-                            "movq   %%rdx,  %1      \n\t"   // 输出到门选择子的高8B \   
-                            :"=m"(*((unsigned long *)(gate_selector_addr)))	,					                \
-					            "=m"(*(1 + (unsigned long *)(gate_selector_addr))),"=&a"(__d0),"=&d"(__d1)		\
-					        :"i"(attr << 8),									                                \
-					            "3"((unsigned long *)(code_addr)),"2"(0x8 << 16),"c"(ist)				        \
-					        :"memory"		                                                                    \
-    );                                                                                                          \
-}while(0)
-*/
-//由于带上注释就编译不过，因此复制一份到这里
-#define _set_gate(gate_selector_addr, attr, ist, code_addr)                                                 \
-    do                                                                                                      \
-    {                                                                                                       \
-        unsigned long __d0, __d1;                                                                           \
-        __asm__ __volatile__("movw	%%dx,	%%ax	\n\t"                                                         \
-                             "andq	$0x7,	%%rcx	\n\t"                                                        \
-                             "addq	%4,	%%rcx	\n\t"                                                          \
-                             "shlq	$32,	%%rcx	\n\t"                                                         \
-                             "addq	%%rcx,	%%rax	\n\t"                                                       \
-                             "xorq	%%rcx,	%%rcx	\n\t"                                                       \
-                             "movl	%%edx,	%%ecx	\n\t"                                                       \
-                             "shrq	$16,	%%rcx	\n\t"                                                         \
-                             "shlq	$48,	%%rcx	\n\t"                                                         \
-                             "addq	%%rcx,	%%rax	\n\t"                                                       \
-                             "movq	%%rax,	%0	\n\t"                                                          \
-                             "shrq	$32,	%%rdx	\n\t"                                                         \
-                             "movq	%%rdx,	%1	\n\t"                                                          \
-                             : "=m"(*((unsigned long *)(gate_selector_addr))),                              \
-                               "=m"(*(1 + (unsigned long *)(gate_selector_addr))), "=&a"(__d0), "=&d"(__d1) \
-                             : "i"(attr << 8),                                                              \
-                               "3"((unsigned long *)(code_addr)), "2"(0x8 << 16), "c"(ist)                  \
-                             : "memory");                                                                   \
-    } while (0)
+    __d0 |= ((ul)(ist) << 32); // 设置ist
+
+    __d0 |= 8 << 16; //设置段选择子为0x1000
+
+    __d0 |= (0xffff & tmp_code_addr); //设置段内偏移的[15:00]
+
+    tmp_code_addr >>= 16;
+    __d0 |= (0xffff & tmp_code_addr) << 48; // 设置段内偏移[31:16]
+
+    tmp_code_addr >>= 16;
+
+    __d1 = (0xffffffff & tmp_code_addr); //设置段内偏移[63:32]
+
+
+    *gate_selector_addr = __d0;
+    *(gate_selector_addr + 1) = __d1;
+}
 
 /**
  * @brief 加载任务状态段寄存器
  * @param n TSS基地址在GDT中的第几项
  * 左移3位的原因是GDT每项占8字节
  */
-#define load_TR(n)                                     \
-    do                                                 \
-    {                                                  \
+#define load_TR(n)                                      \
+    do                                                  \
+    {                                                   \
         __asm__ __volatile__("ltr %%ax" ::"a"(n << 3)); \
     } while (0)
 
@@ -103,7 +76,7 @@ do{                                                         \
  */
 void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    _set_gate(IDT_Table + n, 0x8E, ist, addr); // p=1，DPL=0, type=E
+    set_gate(IDT_Table + n, 0x8E, ist, &addr); // p=1，DPL=0, type=E
 }
 
 /**
@@ -115,7 +88,7 @@ void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
  */
 void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    _set_gate(IDT_Table + n, 0x8F, ist, addr); // p=1，DPL=0, type=F
+    set_gate(IDT_Table + n, 0x8F, ist, &addr); // p=1，DPL=0, type=F
 }
 
 /**
@@ -127,7 +100,7 @@ void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
  */
 void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    _set_gate(IDT_Table + n, 0xEF, ist, addr); // p=1，DPL=3, type=F
+    set_gate(IDT_Table + n, 0xEF, ist, &addr); // p=1，DPL=3, type=F
 }
 
 /**

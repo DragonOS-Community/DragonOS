@@ -211,7 +211,7 @@ void do_general_protection(unsigned long rsp, unsigned long error_code)
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
     printk(" ] do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, rsp, *rip);
-
+    return;
     while (1)
         ;
 }

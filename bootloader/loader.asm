@@ -545,6 +545,7 @@ Label_Set_SVGA_Mode:
 
     mov eax, cr0
     or eax, 1 ; 启用保护模式
+    or eax, 0x22 ; 启用x87浮点运算单元
     mov cr0, eax
 
     ; 跳转到保护模式下的第一个程序
@@ -631,6 +632,15 @@ GO_TO_TMP_Protect:
     bts eax, 0 ; 再次开启保护模式
     bts eax, 31 ; 开启分页管理机制
     mov cr0, eax
+
+    ;now enable SSE and the like
+    mov eax, cr0
+    and ax, 0xFFFB		;clear coprocessor emulation CR0.EM
+    or ax, 0x2			;set coprocessor monitoring  CR0.MP
+    mov cr0, eax
+    mov eax, cr4
+    or ax, 3 << 9		;set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
+    mov cr4, eax
 
 
     ; === 通过此条远跳转指令，处理器跳转到内核文件进行执行，正式进入IA-32e模式

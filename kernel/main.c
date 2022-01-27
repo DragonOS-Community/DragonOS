@@ -6,8 +6,10 @@
 #include "common/printk.h"
 #include "exception/gate.h"
 #include "exception/trap.h"
+#include "mm/mm.h"
 
 int *FR_address = (int *)0xffff800000a00000; //帧缓存区的地址
+char fxsave_region[512] __attribute__((aligned(16)));
 
 void show_welcome()
 {
@@ -67,11 +69,16 @@ void init()
     // 初始化任务状态段表
     ul tss_item_addr = 0xffff800000007c00;
     set_TSS64(tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr,
-     tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
+              tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
 
     // 初始化中断描述符表
     init_sys_vector();
+
     
+    asm volatile(" fxsave %0 " ::"m"(fxsave_region));
+    // 初始化内存管理单元
+    printk("[ DragonOS ] Initializing memory manage unit...\n");
+    mm_init();
 }
 //操作系统内核从这里开始执行
 void Start_Kernel(void)
@@ -80,13 +87,10 @@ void Start_Kernel(void)
     init();
     show_welcome();
 
-
-
     //test_printk();
 
     //int t = 1 / 0; // 测试异常处理模块能否正常工作 触发除法错误
-    int t = *(int*) 0xffff80000aa00000; // 触发页故障
-
+    // int t = *(int *)0xffff80000aa00000; // 触发页故障
 
     while (1)
         ;

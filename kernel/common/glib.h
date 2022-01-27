@@ -24,12 +24,19 @@
 #define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
                                              : "memory") // 在lfence指令前的读操作当必须在lfence指令后的读操作前完成。
 
-#define ABS(x) ((x) > 0 ? (x) : -(x))   // 绝对值
-
 // 定义类型的缩写
 typedef unsigned long ul;
 typedef unsigned long long ull;
 typedef long long ll;
+
+#define ABS(x) ((x) > 0 ? (x) : -(x))   // 绝对值
+
+// 四舍五入成整数
+ul round(double x)
+{
+    return (ul)(x+0.5);
+}
+
 
 //链表数据结构
 struct List

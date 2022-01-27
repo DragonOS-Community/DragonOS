@@ -94,6 +94,9 @@ static int vsprintf(char *buf, const char *fmt, va_list args);
  */
 static char* write_num(char *str, long long num, int base, int field_width, int precision, int flags);
 
+
+static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
+
 /**
  * @brief 在屏幕上指定位置打印字符
  * 

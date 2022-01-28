@@ -67,7 +67,6 @@ void mm_init()
     memory_management_struct.bits_size = max_addr >> PAGE_2M_SHIFT;                                                                                         // 物理地址空间的最大页面数
     memory_management_struct.bmp_len = ((unsigned long)((max_addr >> PAGE_2M_SHIFT) + sizeof(unsigned long) * 8 - 1) / 8) & (~(sizeof(unsigned long) - 1)); // bmp由多少个unsigned long变量组成
 
-
     // 初始化bitmap， 先将整个bmp空间全部置位。稍后再将可用物理内存页复位。
     memset(memory_management_struct.bmp, 0xff, memory_management_struct.bmp_len);
 
@@ -179,23 +178,22 @@ void mm_init()
 
     for (ul j = 0; j <= mms_max_page; ++j)
     {
-        page_init(memory_management_struct.pages_struct+j, PAGE_PGT_MAPPED|PAGE_KERNEL|PAGE_KERNEL_INIT|PAGE_ACTIVE);
+        page_init(memory_management_struct.pages_struct + j, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT | PAGE_ACTIVE);
     }
 
-    ul* cr3 = get_CR3();
+    ul *cr3 = get_CR3();
 
     printk_color(INDIGO, BLACK, "cr3:\t%#018lx\n", cr3);
-    printk_color(INDIGO, BLACK, "*cr3:\t%#018lx\n", *(phys_2_virt(cr3))&(~0xff));
-    printk_color(INDIGO, BLACK, "**cr3:\t%#018lx\n", *phys_2_virt(*(phys_2_virt(cr3))&(~0xff))&(~0xff));
+    printk_color(INDIGO, BLACK, "*cr3:\t%#018lx\n", *(phys_2_virt(cr3)) & (~0xff));
+    printk_color(INDIGO, BLACK, "**cr3:\t%#018lx\n", *phys_2_virt(*(phys_2_virt(cr3)) & (~0xff)) & (~0xff));
 
     // 消除一致性页表映射，将页目录（PML4E）的前10项清空
-    for(int i=0;i<10;++i)
-        *(phys_2_virt(cr3)+i) = 0UL;
-    
+    for (int i = 0; i < 10; ++i)
+        *(phys_2_virt(cr3) + i) = 0UL;
+
     flush_tlb();
 
     printk("[ INFO ] Memory management unit initialized.\n");
-
 }
 
 /**
@@ -235,4 +233,81 @@ unsigned long page_init(struct Page *page, ul flags)
         page->attr |= flags;
     }
     return 0;
+}
+
+/**
+ * @brief 从已初始化的页结构中搜索符合申请条件的、连续num个struct page
+ * 
+ * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt, unmapped in pgt
+ * @param num 需要申请的连续内存页的数量 num<=64
+ * @param flags 将页面属性设置成flag
+ * @return struct Page* 
+ */
+struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
+{
+    ul zone_start = 0, zone_end = 0;
+    switch (zone_select)
+    {
+    case ZONE_DMA:
+        // DMA区域
+        zone_start = 0;
+        zone_end = ZONE_DMA_INDEX;
+        break;
+    case ZONE_NORMAL:
+        zone_start = ZONE_DMA_INDEX;
+        zone_end = ZONE_NORMAL_INDEX;
+        break;
+    case ZONE_UNMAPPED_IN_PGT:
+        zone_start = ZONE_NORMAL_INDEX;
+        zone_end = ZONE_UNMAPED_INDEX;
+        break;
+
+    default:
+        printk("[ ");
+        printk_color(YELLOW, BLACK, "WARN");
+        printk(" ] In alloc_pages: param: zone_select incorrect.\n");
+        // 返回空
+        return NULL;
+        break;
+    }
+
+    for (int i = zone_start; i <= zone_end; ++i)
+    {
+        if ((memory_management_struct.zones_struct + i)->count_pages_free < num)
+            continue;
+
+        struct Zone *z = memory_management_struct.zones_struct + i;
+
+        // 区域对应的起止页号以及区域拥有的页面数
+        ul page_start = (z->zone_addr_start >> PAGE_2M_SHIFT);
+        ul page_end = (z->zone_addr_end >> PAGE_2M_SHIFT);
+        ul page_num = (z->zone_length >> PAGE_2M_SHIFT);
+
+        ul tmp = 64 - page_start % 64;
+        for (ul j = page_start; j <= page_end; j += ((j % 64) ? tmp : 64))
+        {
+            // 按照bmp中的每一个元素进行查找
+            // 先将p定位到bmp的起始元素
+            ul *p = memory_management_struct.bmp + (j >> 6);
+
+            ul shift = j % 64;
+
+            for (int k = shift; k < 64 - shift; ++k)
+            {
+                // 寻找连续num个空页
+                if (!(((*p >> k) | (*(p + 1) << (64 - k))) & (num == 64 ? 0xffffffffffffffffUL : ((1 << num) - 1))))
+                {
+                    ul start_page_num = j + k - shift; // 计算得到要开始获取的内存页的页号（书上的公式有问题，这个是改过之后的版本）
+                    for(int l=0;l<num;++l)
+                    {
+                        struct Page* x = memory_management_struct.pages_struct+start_page_num+l;
+                        
+                        page_init(x, flags);
+                    }
+                    // 成功分配了页面，返回第一个页面的指针
+                    return (struct Page*)(memory_management_struct.pages_struct+start_page_num);
+                }
+            }
+        }
+    }
 }

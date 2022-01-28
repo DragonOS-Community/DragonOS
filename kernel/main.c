@@ -7,6 +7,7 @@
 #include "exception/gate.h"
 #include "exception/trap.h"
 #include "mm/mm.h"
+#include "common/kprint.h"
 
 int *FR_address = (int *)0xffff800000a00000; //帧缓存区的地址
 //char fxsave_region[512] __attribute__((aligned(16)));
@@ -61,6 +62,23 @@ void test_printk()
     printk("\nTest base 16 : %d --> %#X\n", 255, 255);
 }
 
+// 测试内存管理单元
+void test_mm()
+{
+    kinfo("Testing memory management unit...");
+    printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *memory_management_struct.bmp + 1);
+    kinfo("Try to allocate 64 memory pages.");
+    struct Page *page = alloc_pages(ZONE_NORMAL, 64, PAGE_PGT_MAPPED | PAGE_ACTIVE | PAGE_KERNEL);
+    for (int i = 0; i <= 65; ++i)
+    {
+        printk("page%d\tattr:%#018lx\tphys_addr:%#018lx\t", i, page->attr, page->addr_phys);
+        ++page;
+        if (((i + 1) % 2) == 0)
+            printk("\n");
+    }
+    printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *memory_management_struct.bmp + 1);
+}
+
 void init()
 {
     // 初始化printk
@@ -76,7 +94,6 @@ void init()
     // 初始化中断描述符表
     init_sys_vector();
 
-    
     //asm volatile(" fxsave %0 " ::"m"(fxsave_region));
     // 初始化内存管理单元
     printk("[ DragonOS ] Initializing memory manage unit...\n");
@@ -87,7 +104,8 @@ void Start_Kernel(void)
 {
 
     init();
-    show_welcome();
+    //show_welcome();
+    test_mm();
 
     //test_printk();
 

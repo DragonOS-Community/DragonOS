@@ -30,6 +30,14 @@
 #define virt_2_phys(addr) ((unsigned long)(addr)-KERNEL_BASE_ADDR)
 #define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + KERNEL_BASE_ADDR))
 
+// ===== 内存区域属性 =====
+// DMA区域
+#define ZONE_DMA (1<<0)
+// 已在页表中映射的区域
+#define ZONE_NORMAL (1<<1)
+// 未在页表中映射的区域
+#define ZONE_UNMAPPED_IN_PGT (1<<2)
+
 // ===== 页面属性 =====
 // 页面在页表中已被映射
 #define PAGE_PGT_MAPPED (1 << 0)
@@ -51,6 +59,23 @@
 #define PAGE_K_SHARE_TO_U (1 << 8)
 // slab内存分配器的页
 #define PAGE_SLAB (1 << 9)
+
+
+/**
+ * @brief 刷新TLB的宏定义
+ * 由于任何写入cr3的操作都会刷新TLB，因此这个宏定义可以刷新TLB
+ */
+#define flush_tlb()                \
+    do                             \
+    {                              \
+        ul tmp;                    \
+        __asm__ __volatile__(      \
+            "movq %%cr3, %0\n\t"   \
+            "movq %0, %%cr3\n\t"   \
+            : "=r"(tmp)::"memory"); \
+                                   \
+    } while (0);
+
 
 // Address Range Descriptor Structure 地址范围描述符
 struct ARDS
@@ -168,16 +193,11 @@ unsigned long *get_CR3()
 }
 
 /**
- * @brief 刷新TLB的宏定义
- * 由于任何写入cr3的操作都会刷新TLB，因此这个宏定义可以刷新TLB
+ * @brief 从已初始化的页结构中搜索符合申请条件的、连续num个struct page
+ * 
+ * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt, unmapped in pgt
+ * @param num 需要申请的内存页的数量 num<=64
+ * @param flags 将页面属性设置成flag
+ * @return struct Page* 
  */
-#define flush_tlb()                \
-    do                             \
-    {                              \
-        ul tmp;                    \
-        __asm__ __volatile__(      \
-            "movq %%cr3, %0\n\t"   \
-            "movq %0, %%cr3\n\t"   \
-            : "=r"(tmp)::"memory"); \
-                                   \
-    } while (0);
+struct Page* alloc_pages(unsigned int zone_select, int num, ul flags);

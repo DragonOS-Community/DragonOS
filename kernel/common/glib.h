@@ -26,17 +26,16 @@
 
 // 定义类型的缩写
 typedef unsigned long ul;
-typedef unsigned long long ull;
-typedef long long ll;
+typedef unsigned long long int ull;
+typedef long long int ll;
 
-#define ABS(x) ((x) > 0 ? (x) : -(x))   // 绝对值
+#define ABS(x) ((x) > 0 ? (x) : -(x)) // 绝对值
 
 // 四舍五入成整数
 ul round(double x)
 {
-    return (ul)(x+0.5);
+    return (ul)(x + 0.5);
 }
-
 
 //链表数据结构
 struct List
@@ -112,11 +111,9 @@ static inline int strlen(char *s)
     return __res;
 }
 
-
-
 void *memset(void *dst, unsigned char C, ul Count)
 {
-   
+
     int d0, d1;
     unsigned long tmp = C * 0x0101010101010101UL;
     __asm__ __volatile__("cld	\n\t"
@@ -140,7 +137,7 @@ void *memset(void *dst, unsigned char C, ul Count)
 void *memset_c(void *dst, unsigned char c, ul n)
 {
     unsigned char *s = (unsigned char *)dst;
-    for(int i=0;i<n;++i)
+    for (int i = 0; i < n; ++i)
         s[i] = c;
     return dst;
 }

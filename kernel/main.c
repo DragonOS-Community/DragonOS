@@ -66,7 +66,7 @@ void test_printk()
 void test_mm()
 {
     kinfo("Testing memory management unit...");
-    printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *memory_management_struct.bmp + 1);
+    //printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1));
     kinfo("Try to allocate 64 memory pages.");
     struct Page *page = alloc_pages(ZONE_NORMAL, 64, PAGE_PGT_MAPPED | PAGE_ACTIVE | PAGE_KERNEL);
     for (int i = 0; i <= 65; ++i)
@@ -76,7 +76,8 @@ void test_mm()
         if (((i + 1) % 2) == 0)
             printk("\n");
     }
-    printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *memory_management_struct.bmp + 1);
+    
+   //printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *(memory_management_struct.bmp), *(memory_management_struct.bmp + 1));
 }
 
 void init()
@@ -96,7 +97,7 @@ void init()
 
     //asm volatile(" fxsave %0 " ::"m"(fxsave_region));
     // 初始化内存管理单元
-    printk("[ DragonOS ] Initializing memory manage unit...\n");
+    
     mm_init();
 }
 //操作系统内核从这里开始执行

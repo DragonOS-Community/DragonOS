@@ -1,20 +1,18 @@
 #include "mm.h"
 #include "../common/printk.h"
+#include "../common/kprint.h"
 
 ul Total_Memory = 0;
 ul total_2M_pages = 0;
 
 void mm_init()
 {
-    printk("[ INFO ] Initializing memory management unit...\n");
+    kinfo("Initializing memory management unit...");
     // 实模式下获取到的信息的起始地址，转换为ARDS指针
     struct ARDS *ards_ptr = (struct ARDS *)0xffff800000007e00;
 
     for (int i = 0; i < 32; ++i)
     {
-        //printk("Addr = %#18lx\tLength = %#18lx\tType = %#10lx\n",
-        //     ards_ptr->BaseAddr, ards_ptr->Length, ards_ptr->type);
-
         //可用的内存
         if (ards_ptr->type == 1)
             Total_Memory += ards_ptr->Length;
@@ -51,7 +49,7 @@ void mm_init()
 
         total_2M_pages += ((addr_end - addr_start) >> PAGE_2M_SHIFT);
     }
-    printk("[ INFO ] Total amounts of 2M pages : %ld.\n", total_2M_pages);
+    kinfo("Total amounts of 2M pages : %ld.", total_2M_pages);
 
     // 设置内核程序不同部分的起止地址
     memory_management_struct.kernel_code_start = (ul)&_text;
@@ -147,20 +145,21 @@ void mm_init()
     // 计算zone结构体的总长度（按照64位对齐）
     memory_management_struct.zones_struct_len = (memory_management_struct.count_zones * sizeof(struct Zone) + sizeof(ul) - 1) & (~(sizeof(ul) - 1));
 
+    /*
     printk_color(ORANGE, BLACK, "bmp:%#18lx, bmp_len:%#18lx, bits_size:%#18lx\n", memory_management_struct.bmp, memory_management_struct.bmp_len, memory_management_struct.bits_size);
 
     printk_color(ORANGE, BLACK, "pages_struct:%#18lx, count_pages:%#18lx, pages_struct_len:%#18lx\n", memory_management_struct.pages_struct, memory_management_struct.count_pages, memory_management_struct.pages_struct_len);
 
     printk_color(ORANGE, BLACK, "zones_struct:%#18lx, count_zones:%#18lx, zones_struct_len:%#18lx\n", memory_management_struct.zones_struct, memory_management_struct.count_zones, memory_management_struct.zones_struct_len);
-
+    */
     ZONE_DMA_INDEX = 0;    //need rewrite in the future
     ZONE_NORMAL_INDEX = 0; //need rewrite in the future
 
     for (int i = 0; i < memory_management_struct.count_zones; ++i) //need rewrite in the future
     {
         struct Zone *z = memory_management_struct.zones_struct + i;
-        printk_color(ORANGE, BLACK, "zone_addr_start:%#18lx, zone_addr_end:%#18lx, zone_length:%#18lx, pages_group:%#18lx, count_pages:%#18lx\n",
-                     z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
+        //printk_color(ORANGE, BLACK, "zone_addr_start:%#18lx, zone_addr_end:%#18lx, zone_length:%#18lx, pages_group:%#18lx, count_pages:%#18lx\n",
+         //            z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
 
         // 1GB以上的内存空间不做映射
         if (z->zone_addr_start == 0x100000000)
@@ -169,8 +168,8 @@ void mm_init()
     // 设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
-    printk_color(ORANGE, BLACK, "code_start:%#18lx, code_end:%#18lx, data_end:%#18lx, kernel_end:%#18lx, end_of_struct:%#18lx\n",
-                 memory_management_struct.kernel_code_start, memory_management_struct.kernel_code_end, memory_management_struct.kernel_data_end, memory_management_struct.kernel_end, memory_management_struct.end_of_struct);
+    //printk_color(ORANGE, BLACK, "code_start:%#18lx, code_end:%#18lx, data_end:%#18lx, kernel_end:%#18lx, end_of_struct:%#18lx\n",
+    //             memory_management_struct.kernel_code_start, memory_management_struct.kernel_code_end, memory_management_struct.kernel_data_end, memory_management_struct.kernel_end, memory_management_struct.end_of_struct);
 
     // 初始化内存管理单元结构所占的物理页的结构体
 
@@ -183,9 +182,11 @@ void mm_init()
 
     ul *cr3 = get_CR3();
 
+    /*
     printk_color(INDIGO, BLACK, "cr3:\t%#018lx\n", cr3);
     printk_color(INDIGO, BLACK, "*cr3:\t%#018lx\n", *(phys_2_virt(cr3)) & (~0xff));
     printk_color(INDIGO, BLACK, "**cr3:\t%#018lx\n", *phys_2_virt(*(phys_2_virt(cr3)) & (~0xff)) & (~0xff));
+    */
 
     // 消除一致性页表映射，将页目录（PML4E）的前10项清空
     for (int i = 0; i < 10; ++i)
@@ -193,7 +194,7 @@ void mm_init()
 
     flush_tlb();
 
-    printk("[ INFO ] Memory management unit initialized.\n");
+    kinfo("Memory management unit initialize complete!");
 }
 
 /**
@@ -211,8 +212,8 @@ unsigned long page_init(struct Page *page, ul flags)
     if (!page->attr)
     {
         // 将bmp对应的标志位置位
-        *(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= (1UL << ((page->addr_phys >> PAGE_2M_SHIFT) % 64));
 
+        *(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= 1UL << (page->addr_phys >> PAGE_2M_SHIFT) % 64;
         page->attr = flags;
         ++(page->ref_counts);
         ++(page->zone->count_pages_using);
@@ -229,7 +230,9 @@ unsigned long page_init(struct Page *page, ul flags)
     else
     {
         // 将bmp对应的标志位置位
-        *(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= (1UL << ((page->addr_phys >> PAGE_2M_SHIFT) % 64));
+        //*(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= (1UL << ((page->addr_phys >> PAGE_2M_SHIFT) % 64));
+        *(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= 1UL << (page->addr_phys >> PAGE_2M_SHIFT) % 64;
+
         page->attr |= flags;
     }
     return 0;
@@ -263,9 +266,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
         break;
 
     default:
-        printk("[ ");
-        printk_color(YELLOW, BLACK, "WARN");
-        printk(" ] In alloc_pages: param: zone_select incorrect.\n");
+        kwarn("In alloc_pages: param: zone_select incorrect.");
         // 返回空
         return NULL;
         break;
@@ -292,20 +293,19 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
 
             ul shift = j % 64;
 
-            for (int k = shift; k < 64 - shift; ++k)
+            for (ul k = shift; k < 64 - shift; ++k)
             {
                 // 寻找连续num个空页
-                if (!(((*p >> k) | (*(p + 1) << (64 - k))) & (num == 64 ? 0xffffffffffffffffUL : ((1 << num) - 1))))
+                if (!(((*p >> k) | (*(p + 1) << (64 - k))) & (num == 64 ? 0xffffffffffffffffUL : ((1UL << num) - 1))))
                 {
-                    ul start_page_num = j + k - shift; // 计算得到要开始获取的内存页的页号（书上的公式有问题，这个是改过之后的版本）
-                    for(int l=0;l<num;++l)
+                    ul start_page_num = j + k - 1; // 计算得到要开始获取的内存页的页号（书上的公式有问题，这个是改过之后的版本）
+                    for (ul l = 0; l < num; ++l)
                     {
-                        struct Page* x = memory_management_struct.pages_struct+start_page_num+l;
-                        
+                        struct Page *x = memory_management_struct.pages_struct + start_page_num + l;
                         page_init(x, flags);
                     }
                     // 成功分配了页面，返回第一个页面的指针
-                    return (struct Page*)(memory_management_struct.pages_struct+start_page_num);
+                    return (struct Page *)(memory_management_struct.pages_struct + start_page_num);
                 }
             }
         }

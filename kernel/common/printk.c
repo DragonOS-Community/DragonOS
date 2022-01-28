@@ -316,7 +316,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
         case 'X':
             //flags |= SPECIAL;
             if (qualifier == 'l')
-                str = write_num(str, va_arg(args, long long), 16, field_width, precision, flags);
+                str = write_num(str, va_arg(args, ull), 16, field_width, precision, flags);
             else
                 str = write_num(str, va_arg(args, int), 16, field_width, precision, flags);
             break;
@@ -379,7 +379,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
     return str - buf;
 }
 
-static char *write_num(char *str, long long num, int base, int field_width, int precision, int flags)
+static char *write_num(char *str, ull num, int base, int field_width, int precision, int flags)
 {
     /**
      * @brief 将数字按照指定的要求转换成对应的字符串

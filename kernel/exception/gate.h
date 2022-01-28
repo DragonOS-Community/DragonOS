@@ -76,7 +76,7 @@ void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
  */
 void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate(IDT_Table + n, 0x8E, ist, &addr); // p=1，DPL=0, type=E
+    set_gate((ul*)(IDT_Table + n), 0x8E, ist, (ul*)(&addr)); // p=1，DPL=0, type=E
 }
 
 /**
@@ -88,7 +88,7 @@ void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
  */
 void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate(IDT_Table + n, 0x8F, ist, &addr); // p=1，DPL=0, type=F
+    set_gate((ul*)(IDT_Table + n), 0x8F, ist, (ul*)(&addr)); // p=1，DPL=0, type=F
 }
 
 /**
@@ -100,7 +100,7 @@ void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
  */
 void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate(IDT_Table + n, 0xEF, ist, &addr); // p=1，DPL=3, type=F
+    set_gate((ul*)(IDT_Table + n), 0xEF, ist, (ul*)(&addr)); // p=1，DPL=3, type=F
 }
 
 /**

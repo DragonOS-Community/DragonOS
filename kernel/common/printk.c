@@ -346,7 +346,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
             if (qualifier == 'l')
                 ip = va_arg(args, long long *);
             else
-                ip = va_arg(args, int *);
+                ip = (ll*)va_arg(args, int *);
 
             *ip = str - buf;
             break;

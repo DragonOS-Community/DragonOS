@@ -122,4 +122,3 @@ static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRco
 #define printk(...) printk_color( WHITE, BLACK, __VA_ARGS__ )
 
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char*fmt, ...);
-

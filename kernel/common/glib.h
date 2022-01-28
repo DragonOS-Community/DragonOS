@@ -114,8 +114,9 @@ static inline int strlen(char *s)
 
 
 
-inline void *memset(void *dst, unsigned char C, ul Count)
+void *memset(void *dst, unsigned char C, ul Count)
 {
+   
     int d0, d1;
     unsigned long tmp = C * 0x0101010101010101UL;
     __asm__ __volatile__("cld	\n\t"
@@ -134,5 +135,12 @@ inline void *memset(void *dst, unsigned char C, ul Count)
                          : "=&c"(d0), "=&D"(d1)
                          : "a"(tmp), "q"(Count), "0"(Count / 8), "1"(dst)
                          : "memory");
+    return dst;
+}
+void *memset_c(void *dst, unsigned char c, ul n)
+{
+    unsigned char *s = (unsigned char *)dst;
+    for(int i=0;i<n;++i)
+        s[i] = c;
     return dst;
 }

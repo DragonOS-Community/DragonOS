@@ -9,7 +9,9 @@
 #include "mm/mm.h"
 
 int *FR_address = (int *)0xffff800000a00000; //帧缓存区的地址
-char fxsave_region[512] __attribute__((aligned(16)));
+//char fxsave_region[512] __attribute__((aligned(16)));
+
+struct memory_desc memory_management_struct = {{0}, 0};
 
 void show_welcome()
 {
@@ -75,7 +77,7 @@ void init()
     init_sys_vector();
 
     
-    asm volatile(" fxsave %0 " ::"m"(fxsave_region));
+    //asm volatile(" fxsave %0 " ::"m"(fxsave_region));
     // 初始化内存管理单元
     printk("[ DragonOS ] Initializing memory manage unit...\n");
     mm_init();

@@ -8,7 +8,7 @@ fi
 # 第一个参数如果是--notbuild 那就不构建，直接运行
 if [ ! "$1" == "--nobuild" ]; then
     echo "开始构建..."
-    make all
+    make all -j 16
     make clean
 fi
 

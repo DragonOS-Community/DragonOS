@@ -402,8 +402,11 @@ static char *write_num(char *str, long long num, int base, int field_width, int 
     if (flags & SMALL)
         digits = "0123456789abcdefghijklmnopqrstuvwxyz";
 
+    if(flags&LEFT)
+        flags &= ~PAD_ZERO;
     // 设置填充元素
     pad = (flags & PAD_ZERO) ? '0' : ' ';
+
 
     sign = 0;
     if (flags & SIGN && num < 0)
@@ -448,9 +451,9 @@ static char *write_num(char *str, long long num, int base, int field_width, int 
     field_width -= precision;
 
     // 靠右对齐
-    if (!(flags & LEFT))
+    if (!(flags & (LEFT+PAD_ZERO)))
         while (field_width-- > 0)
-            *str++ = pad;
+            *str++ = ' ';
 
     if (sign)
         *str++ = sign;
@@ -462,7 +465,9 @@ static char *write_num(char *str, long long num, int base, int field_width, int 
         }
         else if (base == 8)
             *str++ = digits[24]; //注意这里是英文字母O或者o
-
+    if(!(flags&LEFT))
+        while(field_width-->0)
+            *str++ = pad;
     while (js_num < precision)
     {
         --precision;

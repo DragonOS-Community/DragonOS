@@ -346,21 +346,20 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
             if (qualifier == 'l')
                 ip = va_arg(args, long long *);
             else
-                ip = (ll*)va_arg(args, int *);
+                ip = (ll *)va_arg(args, int *);
 
             *ip = str - buf;
             break;
         case 'f':
             // 默认精度为3
-                //printk("1111\n");
-                //va_arg(args, double);
-                //printk("222\n");
-                
+            //printk("1111\n");
+            //va_arg(args, double);
+            //printk("222\n");
+
             if (precision < 0)
                 precision = 3;
-                str = write_float_point_num(str, va_arg(args, double), field_width, precision, flags);
-               
-            
+            str = write_float_point_num(str, va_arg(args, double), field_width, precision, flags);
+
             break;
 
         //对于不识别的控制符，直接输出
@@ -402,11 +401,10 @@ static char *write_num(char *str, ull num, int base, int field_width, int precis
     if (flags & SMALL)
         digits = "0123456789abcdefghijklmnopqrstuvwxyz";
 
-    if(flags&LEFT)
+    if (flags & LEFT)
         flags &= ~PAD_ZERO;
     // 设置填充元素
     pad = (flags & PAD_ZERO) ? '0' : ' ';
-
 
     sign = 0;
     if (flags & SIGN && num < 0)
@@ -451,7 +449,7 @@ static char *write_num(char *str, ull num, int base, int field_width, int precis
     field_width -= precision;
 
     // 靠右对齐
-    if (!(flags & (LEFT+PAD_ZERO)))
+    if (!(flags & (LEFT + PAD_ZERO)))
         while (field_width-- > 0)
             *str++ = ' ';
 
@@ -465,8 +463,8 @@ static char *write_num(char *str, ull num, int base, int field_width, int precis
         }
         else if (base == 8)
             *str++ = digits[24]; //注意这里是英文字母O或者o
-    if(!(flags&LEFT))
-        while(field_width-->0)
+    if (!(flags & LEFT))
+        while (field_width-- > 0)
             *str++ = pad;
     while (js_num < precision)
     {

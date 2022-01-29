@@ -126,6 +126,20 @@ void init_irq()
  */
 void do_IRQ(ul rsp, ul number)
 {
+    unsigned char x;
+    switch (number)
+    {
+    case 0x20:  // 时钟中断信号
+        
+        break;
+    case 0x21:  // 键盘中断
+        
+        x = io_in8(0x60);
+        printk_color(ORANGE, BLACK, "Received key irq, key code:%#018lx\n", x);
+        break;
+    default:
+        break;
+    }
     if(number!=0x20)
     printk_color(ORANGE, BLACK, "Received irq:%#018x\n", number);
 

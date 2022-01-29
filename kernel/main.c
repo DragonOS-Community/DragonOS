@@ -116,7 +116,6 @@ void Start_Kernel(void)
     test_mm();
 
     //test_printk();
-
     //int t = 1 / 0; // 测试异常处理模块能否正常工作 触发除法错误
     // int t = *(int *)0xffff80000aa00000; // 触发页故障
 

@@ -6,6 +6,7 @@
 #include "common/printk.h"
 #include "exception/gate.h"
 #include "exception/trap.h"
+#include "exception/irq.h"
 #include "mm/mm.h"
 #include "common/kprint.h"
 
@@ -69,6 +70,7 @@ void test_mm()
     //printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1));
     kinfo("Try to allocate 64 memory pages.");
     struct Page *page = alloc_pages(ZONE_NORMAL, 64, PAGE_PGT_MAPPED | PAGE_ACTIVE | PAGE_KERNEL);
+    /*
     for (int i = 0; i <= 65; ++i)
     {
         printk("page%d\tattr:%#018lx\tphys_addr:%#018lx\t", i, page->attr, page->addr_phys);
@@ -76,6 +78,7 @@ void test_mm()
         if (((i + 1) % 2) == 0)
             printk("\n");
     }
+    */
     
    //printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *(memory_management_struct.bmp), *(memory_management_struct.bmp + 1));
 }
@@ -97,8 +100,12 @@ void init()
 
     //asm volatile(" fxsave %0 " ::"m"(fxsave_region));
     // 初始化内存管理单元
-    
     mm_init();
+
+    // 初始化中断模块
+    init_irq();
+
+
 }
 //操作系统内核从这里开始执行
 void Start_Kernel(void)

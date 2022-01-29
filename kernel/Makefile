@@ -10,8 +10,8 @@ all: kernel
 	objcopy -I elf64-x86-64 -S -R  ".eh_frame" -R ".comment" -O binary kernel ../bin/kernel/kernel.bin
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o mm/mm.o  -T link.lds
+kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o exception/8259A.o mm/mm.o  -T link.lds
 
 head.o: head.S
 	gcc -E head.S > head.s # 预处理
@@ -20,6 +20,8 @@ head.o: head.S
 entry.o: exception/entry.S
 	gcc -E exception/entry.S > exception/entry.s
 	as --64 -o exception/entry.o exception/entry.s
+
+
 
 main.o: main.c 
 # -fno-builtin: 不使用C语言内建函数
@@ -32,6 +34,12 @@ printk.o: common/printk.c
 
 trap.o:	exception/trap.c
 	gcc -mcmodel=large -fno-builtin -m64 -c exception/trap.c -o exception/trap.o
+
+irq.o: exception/irq.c
+	gcc -mcmodel=large -fno-builtin -m64 -c exception/irq.c -o exception/irq.o
+
+8259A.o: exception/8259A.c
+	gcc -mcmodel=large -fno-builtin -m64 -c exception/8259A.c -o exception/8259A.o
 
 mm.o: mm/mm.c
 	gcc -mcmodel=large -fno-builtin -m64 -c mm/mm.c -o mm/mm.o

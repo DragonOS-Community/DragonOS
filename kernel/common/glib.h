@@ -18,11 +18,11 @@
 
 //内存屏障
 #define io_mfence() __asm__ __volatile__("mfence\n\t" :: \
-                                             : "memory") // 在mfence指令前的读写操作当必须在mfence指令后的读写操作前完成。
+                                             : "memory") // 在mfence指令前的读写操作必须在mfence指令后的读写操作前完成。
 #define io_sfence() __asm__ __volatile__("sfence\n\t" :: \
-                                             : "memory") // 在sfence指令前的写操作当必须在sfence指令后的写操作前完成
+                                             : "memory") // 在sfence指令前的写操作必须在sfence指令后的写操作前完成
 #define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
-                                             : "memory") // 在lfence指令前的读操作当必须在lfence指令后的读操作前完成。
+                                             : "memory") // 在lfence指令前的读操作必须在lfence指令后的读操作前完成。
 
 // 定义类型的缩写
 typedef unsigned long ul;
@@ -140,4 +140,48 @@ void *memset_c(void *dst, unsigned char c, ul n)
     for (int i = 0; i < n; ++i)
         s[i] = c;
     return dst;
+}
+
+// 从io口读入8个bit
+unsigned char io_in8(unsigned short port)
+{
+	unsigned char ret = 0;
+	__asm__ __volatile__(	"inb	%%dx,	%0	\n\t"
+				"mfence			\n\t"
+				:"=a"(ret)
+				:"d"(port)
+				:"memory");
+	return ret;
+}
+
+// 从io口读入32个bit
+unsigned int io_in32(unsigned short port)
+{
+	unsigned int ret = 0;
+	__asm__ __volatile__(	"inl	%%dx,	%0	\n\t"
+				"mfence			\n\t"
+				:"=a"(ret)
+				:"d"(port)
+				:"memory");
+	return ret;
+}
+
+// 输出8个bit到输出端口
+void io_out8(unsigned short port,unsigned char value)
+{
+	__asm__ __volatile__(	"outb	%0,	%%dx	\n\t"
+				"mfence			\n\t"
+				:
+				:"a"(value),"d"(port)
+				:"memory");
+}
+
+// 输出32个bit到输出端口
+void io_out32(unsigned short port,unsigned int value)
+{
+	__asm__ __volatile__(	"outl	%0,	%%dx	\n\t"
+				"mfence			\n\t"
+				:
+				:"a"(value),"d"(port)
+				:"memory");
 }

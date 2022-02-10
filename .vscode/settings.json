@@ -6,6 +6,7 @@
         "stdarg.h": "c",
         "font.h": "c",
         "trap.h": "c",
-        "gate.h": "c"
+        "gate.h": "c",
+        "process.h": "c"
     }
 }

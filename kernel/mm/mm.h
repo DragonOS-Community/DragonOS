@@ -7,7 +7,7 @@
 #define PTRS_PER_PGT 512
 
 // 内核层的起始地址
-#define KERNEL_BASE_ADDR 0xffff800000000000
+#define KERNEL_BASE_ADDR ((unsigned long)0xffff800000000000)
 
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21
@@ -29,14 +29,18 @@
 // 虚拟地址与物理地址转换
 #define virt_2_phys(addr) ((unsigned long)(addr)-KERNEL_BASE_ADDR)
 #define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + KERNEL_BASE_ADDR))
+#define Phy_To_Virt(addr) ((unsigned long *)((unsigned long)(addr) + KERNEL_BASE_ADDR))
+
+#define Virt_To_2M_Page(kaddr) (memory_management_struct.pages_struct + (virt_2_phys(kaddr) >> PAGE_2M_SHIFT))
+#define Phy_to_2M_Page(kaddr) (memory_management_struct.pages_struct + ((unsigned long)(kaddr) >> PAGE_2M_SHIFT))
 
 // ===== 内存区域属性 =====
 // DMA区域
-#define ZONE_DMA (1<<0)
+#define ZONE_DMA (1 << 0)
 // 已在页表中映射的区域
-#define ZONE_NORMAL (1<<1)
+#define ZONE_NORMAL (1 << 1)
 // 未在页表中映射的区域
-#define ZONE_UNMAPPED_IN_PGT (1<<2)
+#define ZONE_UNMAPPED_IN_PGT (1 << 2)
 
 // ===== 页面属性 =====
 // 页面在页表中已被映射
@@ -60,22 +64,20 @@
 // slab内存分配器的页
 #define PAGE_SLAB (1 << 9)
 
-
 /**
  * @brief 刷新TLB的宏定义
  * 由于任何写入cr3的操作都会刷新TLB，因此这个宏定义可以刷新TLB
  */
-#define flush_tlb()                \
-    do                             \
-    {                              \
-        ul tmp;                    \
-        __asm__ __volatile__(      \
-            "movq %%cr3, %0\n\t"   \
-            "movq %0, %%cr3\n\t"   \
+#define flush_tlb()                 \
+    do                              \
+    {                               \
+        ul tmp;                     \
+        __asm__ __volatile__(       \
+            "movq %%cr3, %0\n\t"    \
+            "movq %0, %%cr3\n\t"    \
             : "=r"(tmp)::"memory"); \
-                                   \
+                                    \
     } while (0);
-
 
 // Address Range Descriptor Structure 地址范围描述符
 struct ARDS
@@ -155,32 +157,39 @@ extern struct memory_desc memory_management_struct;
 // 导出内核程序的几个段的起止地址
 extern char _text;
 extern char _etext;
+extern char _data;
 extern char _edata;
+extern char _rodata;
+extern char _erodata;
+extern char _bss;
+extern char _ebss;
 extern char _end;
 
 // 每个区域的索引
 
 int ZONE_DMA_INDEX = 0;
-int ZONE_NORMAL_INDEX = 0;  //low 1GB RAM ,was mapped in pagetable
-int ZONE_UNMAPED_INDEX = 0; //above 1GB RAM,unmapped in pagetable
+int ZONE_NORMAL_INDEX = 0;  // low 1GB RAM ,was mapped in pagetable
+int ZONE_UNMAPED_INDEX = 0; // above 1GB RAM,unmapped in pagetable
+
+ul *global_CR3 = NULL;
 
 // 初始化内存管理单元
 void mm_init();
 
 /**
  * @brief 初始化内存页
- * 
+ *
  * @param page 内存页结构体
  * @param flags 标志位
  * 对于新页面： 初始化struct page
  * 对于当前页面属性/flags中含有引用属性或共享属性时，则只增加struct page和struct zone的被引用计数。否则就只是添加页表属性，并置位bmp的相应位。
- * @return unsigned long 
+ * @return unsigned long
  */
 unsigned long page_init(struct Page *page, ul flags);
 
 /**
  * @brief 读取CR3寄存器的值（存储了页目录的基地址）
- * 
+ *
  * @return unsigned*  cr3的值的指针
  */
 unsigned long *get_CR3()
@@ -194,10 +203,27 @@ unsigned long *get_CR3()
 
 /**
  * @brief 从已初始化的页结构中搜索符合申请条件的、连续num个struct page
- * 
- * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt, unmapped in pgt
+ *
+ * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt(normal), unmapped in pgt
  * @param num 需要申请的内存页的数量 num<=64
  * @param flags 将页面属性设置成flag
- * @return struct Page* 
+ * @return struct Page*
  */
-struct Page* alloc_pages(unsigned int zone_select, int num, ul flags);
+struct Page *alloc_pages(unsigned int zone_select, int num, ul flags);
+
+/**
+ * @brief 释放内存页
+ *
+ * @param page 内存页结构体
+ * @return unsigned long
+ */
+unsigned long page_clean(struct Page *page);
+
+/**
+ * @brief 内存页表结构体
+ *
+ */
+typedef struct
+{
+    unsigned long pml4t;
+} pml4t_t;

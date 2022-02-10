@@ -21,6 +21,15 @@ SECTIONS
 		
 		_edata = .;
 	}
+	.rodata : 
+	{
+		_rodata = .;	
+		*(.rodata)
+		_erodata = .;
+	}
+
+	. = ALIGN(32768);
+	.data.init_proc : { *(.data.init_proc) }
 	.bss :
 	{
 		_bss = .;

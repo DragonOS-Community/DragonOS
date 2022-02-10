@@ -159,7 +159,7 @@ void mm_init()
     {
         struct Zone *z = memory_management_struct.zones_struct + i;
         //printk_color(ORANGE, BLACK, "zone_addr_start:%#18lx, zone_addr_end:%#18lx, zone_length:%#18lx, pages_group:%#18lx, count_pages:%#18lx\n",
-         //            z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
+        //            z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
 
         // 1GB以上的内存空间不做映射
         if (z->zone_addr_start == 0x100000000)
@@ -180,7 +180,7 @@ void mm_init()
         page_init(memory_management_struct.pages_struct + j, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT | PAGE_ACTIVE);
     }
 
-    ul *cr3 = get_CR3();
+    global_CR3 = get_CR3();
 
     /*
     printk_color(INDIGO, BLACK, "cr3:\t%#018lx\n", cr3);
@@ -188,9 +188,11 @@ void mm_init()
     printk_color(INDIGO, BLACK, "**cr3:\t%#018lx\n", *phys_2_virt(*(phys_2_virt(cr3)) & (~0xff)) & (~0xff));
     */
 
+   /*
     // 消除一致性页表映射，将页目录（PML4E）的前10项清空
     for (int i = 0; i < 10; ++i)
-        *(phys_2_virt(cr3) + i) = 0UL;
+        *(phys_2_virt(global_CR3) + i) = 0UL;
+        */
 
     flush_tlb();
 
@@ -241,7 +243,7 @@ unsigned long page_init(struct Page *page, ul flags)
 /**
  * @brief 从已初始化的页结构中搜索符合申请条件的、连续num个struct page
  * 
- * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt, unmapped in pgt
+ * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt(normal), unmapped in pgt
  * @param num 需要申请的连续内存页的数量 num<=64
  * @param flags 将页面属性设置成flag
  * @return struct Page* 
@@ -309,5 +311,37 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
                 }
             }
         }
+    }
+    return NULL;
+}
+
+unsigned long page_clean(struct Page *p)
+{
+    if (!p->attr)
+        p->attr = 0;
+    else if ((p->attr & PAGE_REFERENCED) || (p->attr & PAGE_K_SHARE_TO_U))
+    {
+        // 被引用的页或内核共享给用户态的页
+        --p->ref_counts;
+        --p->zone->total_pages_link;
+
+        // 当引用为0时
+        if (!p->ref_counts)
+        {
+            p->attr = 0;
+            --p->zone->count_pages_using;
+            ++p->zone->count_pages_free;
+        }
+    }
+    else
+    {
+        // 将bmp复位
+        *(memory_management_struct.bmp + ((p->addr_phys >> PAGE_2M_SHIFT) >> 6)) &= ~(1UL << ((p->addr_phys >> PAGE_2M_SHIFT) % 64));
+
+        p->attr = 0;
+        p->ref_counts = 0;
+        --p->zone->count_pages_using;
+        ++p->zone->count_pages_free;
+        --p->zone->total_pages_link;
     }
 }

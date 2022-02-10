@@ -2,6 +2,8 @@
 // Created by longjin.
 // 2022/01/20
 
+#include "common/asm.h"
+
 .section .text
 
 .global _start
@@ -139,6 +141,11 @@ m_ignore_int:
 
 go_to_ignore_int:
     .quad ignore_int
+
+
+ENTRY(_stack_start)
+    .quad initial_proc_union + 32768
+
 
 // 初始化页表
 .align 8 //设置为8byte对齐

@@ -1,0 +1,30 @@
+#pragma once
+#include "../common/glib.h"
+// 进程执行现场的寄存器状态
+struct pt_regs
+{
+    ul r15;
+    ul r14;
+    ul r13;
+    ul r12;
+    ul r11;
+    ul r10;
+    ul r9;
+    ul r8;
+    ul rbx;
+    ul rcx;
+    ul rdx;
+    ul rsi;
+    ul rdi;
+    ul rbp;
+    ul ds;
+    ul es;
+    ul rax;
+    ul func;
+    ul err_code;
+    ul rip;
+    ul cs;
+    ul rflags;
+    ul rsp;
+    ul ss;
+};

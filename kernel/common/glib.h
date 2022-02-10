@@ -23,6 +23,19 @@
                                              : "memory") // 在sfence指令前的写操作必须在sfence指令后的写操作前完成
 #define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
                                              : "memory") // 在lfence指令前的读操作必须在lfence指令后的读操作前完成。
+/**
+ * @brief 根据结构体变量内某个成员变量member的基地址，计算出该结构体变量的基地址
+ * @param ptr 指向结构体变量内的成员变量member的指针
+ * @param type 成员变量所在的结构体
+ * @param member 成员变量名
+ * 
+ * 方法：使用ptr减去结构体内的偏移，得到结构体变量的基地址
+ */
+#define container_of(ptr, type, member)                                     \
+    ({                                                                      \
+        typeof(((type *)0)->member) *p = (ptr);                             \
+        (type *)((unsigned long)p - (unsigned long)&(((type *)0)->member)); \
+    })
 
 // 定义类型的缩写
 typedef unsigned long ul;
@@ -100,6 +113,32 @@ static inline bool list_empty(struct List *entry)
         return false;
 }
 
+/**
+ * @brief 获取链表的上一个元素
+ * 
+ * @param entry 
+ * @return 链表的上一个元素
+ */
+static inline struct List* list_prev(struct List *entry)
+{
+    if(entry->prev!=NULL)
+        return entry->prev;
+    else return NULL;
+}
+
+/**
+ * @brief 获取链表的下一个元素
+ * 
+ * @param entry 
+ * @return 链表的下一个元素
+ */
+static inline struct List* list_next(struct List *entry)
+{
+    if(entry->next!=NULL)
+        return entry->next;
+    else return NULL;
+}
+
 //计算字符串的长度（经过测试，该版本比采用repne/scasb汇编的运行速度快16.8%左右）
 static inline int strlen(char *s)
 {
@@ -137,33 +176,32 @@ void *memset(void *dst, unsigned char C, ul Count)
 
 /**
  * @brief 内存拷贝函数
- * 
+ *
  * @param dst 目标数组
  * @param src 源数组
  * @param Num 字节数
- * @return void* 
+ * @return void*
  */
-void * memcpy(void *dst,void * src,long Num)
+void *memcpy(void *dst, void *src, long Num)
 {
-	int d0,d1,d2;
-	__asm__ __volatile__	(	"cld	\n\t"
-					"rep	\n\t"
-					"movsq	\n\t"
-					"testb	$4,%b4	\n\t"
-					"je	1f	\n\t"
-					"movsl	\n\t"
-					"1:\ttestb	$2,%b4	\n\t"
-					"je	2f	\n\t"
-					"movsw	\n\t"
-					"2:\ttestb	$1,%b4	\n\t"
-					"je	3f	\n\t"
-					"movsb	\n\t"
-					"3:	\n\t"
-					:"=&c"(d0),"=&D"(d1),"=&S"(d2)
-					:"0"(Num/8),"q"(Num),"1"(src),"2"(dst)
-					:"memory"
-				);
-	return dst;
+    int d0, d1, d2;
+    __asm__ __volatile__("cld	\n\t"
+                         "rep	\n\t"
+                         "movsq	\n\t"
+                         "testb	$4,%b4	\n\t"
+                         "je	1f	\n\t"
+                         "movsl	\n\t"
+                         "1:\ttestb	$2,%b4	\n\t"
+                         "je	2f	\n\t"
+                         "movsw	\n\t"
+                         "2:\ttestb	$1,%b4	\n\t"
+                         "je	3f	\n\t"
+                         "movsb	\n\t"
+                         "3:	\n\t"
+                         : "=&c"(d0), "=&D"(d1), "=&S"(d2)
+                         : "0"(Num / 8), "q"(Num), "1"(src), "2"(dst)
+                         : "memory");
+    return dst;
 }
 void *memset_c(void *dst, unsigned char c, ul n)
 {
@@ -176,44 +214,43 @@ void *memset_c(void *dst, unsigned char c, ul n)
 // 从io口读入8个bit
 unsigned char io_in8(unsigned short port)
 {
-	unsigned char ret = 0;
-	__asm__ __volatile__(	"inb	%%dx,	%0	\n\t"
-				"mfence			\n\t"
-				:"=a"(ret)
-				:"d"(port)
-				:"memory");
-	return ret;
+    unsigned char ret = 0;
+    __asm__ __volatile__("inb	%%dx,	%0	\n\t"
+                         "mfence			\n\t"
+                         : "=a"(ret)
+                         : "d"(port)
+                         : "memory");
+    return ret;
 }
 
 // 从io口读入32个bit
 unsigned int io_in32(unsigned short port)
 {
-	unsigned int ret = 0;
-	__asm__ __volatile__(	"inl	%%dx,	%0	\n\t"
-				"mfence			\n\t"
-				:"=a"(ret)
-				:"d"(port)
-				:"memory");
-	return ret;
+    unsigned int ret = 0;
+    __asm__ __volatile__("inl	%%dx,	%0	\n\t"
+                         "mfence			\n\t"
+                         : "=a"(ret)
+                         : "d"(port)
+                         : "memory");
+    return ret;
 }
 
 // 输出8个bit到输出端口
-void io_out8(unsigned short port,unsigned char value)
+void io_out8(unsigned short port, unsigned char value)
 {
-	__asm__ __volatile__(	"outb	%0,	%%dx	\n\t"
-				"mfence			\n\t"
-				:
-				:"a"(value),"d"(port)
-				:"memory");
+    __asm__ __volatile__("outb	%0,	%%dx	\n\t"
+                         "mfence			\n\t"
+                         :
+                         : "a"(value), "d"(port)
+                         : "memory");
 }
 
 // 输出32个bit到输出端口
-void io_out32(unsigned short port,unsigned int value)
+void io_out32(unsigned short port, unsigned int value)
 {
-	__asm__ __volatile__(	"outl	%0,	%%dx	\n\t"
-				"mfence			\n\t"
-				:
-				:"a"(value),"d"(port)
-				:"memory");
+    __asm__ __volatile__("outl	%0,	%%dx	\n\t"
+                         "mfence			\n\t"
+                         :
+                         : "a"(value), "d"(port)
+                         : "memory");
 }
-

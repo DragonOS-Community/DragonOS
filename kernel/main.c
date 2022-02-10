@@ -4,11 +4,12 @@
 
 #include "common/glib.h"
 #include "common/printk.h"
+#include "common/kprint.h"
 #include "exception/gate.h"
 #include "exception/trap.h"
 #include "exception/irq.h"
 #include "mm/mm.h"
-#include "common/kprint.h"
+#include "process/process.h"
 
 int *FR_address = (int *)0xffff800000a00000; //帧缓存区的地址
 //char fxsave_region[512] __attribute__((aligned(16)));
@@ -64,7 +65,7 @@ void test_printk()
 }
 
 // 测试内存管理单元
-void test_mm()
+void test_mmm()
 {
     kinfo("Testing memory management unit...");
     //printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1));
@@ -80,7 +81,7 @@ void test_mm()
     }
     */
     
-   //printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *(memory_management_struct.bmp), *(memory_management_struct.bmp + 1));
+   printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *(memory_management_struct.bmp), *(memory_management_struct.bmp + 1));
 }
 
 void init()
@@ -104,6 +105,7 @@ void init()
 
     // 初始化中断模块
     init_irq();
+    process_init();
 
 
 }
@@ -113,7 +115,8 @@ void Start_Kernel(void)
 
     init();
     //show_welcome();
-    test_mm();
+    //test_mm();
+    
 
     //test_printk();
     //int t = 1 / 0; // 测试异常处理模块能否正常工作 触发除法错误

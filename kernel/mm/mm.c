@@ -300,7 +300,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
                 // 寻找连续num个空页
                 if (!(((*p >> k) | (*(p + 1) << (64 - k))) & (num == 64 ? 0xffffffffffffffffUL : ((1UL << num) - 1))))
                 {
-                    ul start_page_num = j + k - 1; // 计算得到要开始获取的内存页的页号（书上的公式有问题，这个是改过之后的版本）
+                    ul start_page_num = j + k - shift; // 计算得到要开始获取的内存页的页号（书上的公式有问题，这个是改过之后的版本）
                     for (ul l = 0; l < num; ++l)
                     {
                         struct Page *x = memory_management_struct.pages_struct + start_page_num + l;

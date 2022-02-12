@@ -160,7 +160,7 @@ ENTRY(undefined_opcode)
     jmp Err_Code
 
 // 7 #NM 设备异常（FPU不存在）
-ENTRY(dev_not_available)
+ENTRY(dev_not_avaliable)
     pushq $0
     pushq %rax
     leaq do_dev_not_avaliable(%rip), %rax    // 获取中断服务程序的地址

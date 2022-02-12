@@ -32,6 +32,7 @@ extern unsigned int TSS64_Table[26];
  * @param ist 中断栈表号
  * @param code_addr 指向中断服务程序的指针的地址
  */
+
 void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
 {
     ul __d0=0, __d1=0;
@@ -55,6 +56,10 @@ void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
     *gate_selector_addr = __d0;
     *(gate_selector_addr + 1) = __d1;
 }
+
+
+
+
 
 /**
  * @brief 加载任务状态段寄存器

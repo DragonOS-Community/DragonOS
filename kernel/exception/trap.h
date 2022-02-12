@@ -33,7 +33,7 @@ void bounds();
 // 未定义的操作数
 void undefined_opcode();
 // 设备不可用
-void dev_not_available();
+void dev_not_avaliable();
 void double_fault();
 void coprocessor_segment_overrun();
 void invalid_TSS();

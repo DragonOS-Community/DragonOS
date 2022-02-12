@@ -358,6 +358,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
 
             if (precision < 0)
                 precision = 3;
+            
             str = write_float_point_num(str, va_arg(args, double), field_width, precision, flags);
 
             break;

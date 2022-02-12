@@ -29,7 +29,6 @@
 // 虚拟地址与物理地址转换
 #define virt_2_phys(addr) ((unsigned long)(addr)-KERNEL_BASE_ADDR)
 #define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + KERNEL_BASE_ADDR))
-#define Phy_To_Virt(addr) ((unsigned long *)((unsigned long)(addr) + KERNEL_BASE_ADDR))
 
 #define Virt_To_2M_Page(kaddr) (memory_management_struct.pages_struct + (virt_2_phys(kaddr) >> PAGE_2M_SHIFT))
 #define Phy_to_2M_Page(kaddr) (memory_management_struct.pages_struct + ((unsigned long)(kaddr) >> PAGE_2M_SHIFT))
@@ -219,6 +218,8 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags);
  */
 unsigned long page_clean(struct Page *page);
 
+
+
 /**
  * @brief 内存页表结构体
  *
@@ -227,3 +228,26 @@ typedef struct
 {
     unsigned long pml4t;
 } pml4t_t;
+#define mk_pml4t(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
+#define set_pml4t(mpl4tptr, mpl4tval) (*(mpl4tptr) = (mpl4tval))
+
+typedef struct
+{
+    unsigned long pdpt;
+} pdpt_t;
+#define mk_pdpt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
+#define set_pdpt(pdptptr, pdptval) (*(pdptptr) = (pdptval))
+
+typedef struct
+{
+    unsigned long pdt;
+} pdt_t;
+#define mk_pdt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
+#define set_pdt(pdtptr, pdtval) (*(pdtptr) = (pdtval))
+
+typedef struct
+{
+    unsigned long pt;
+} pt_t;
+#define mk_pt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
+#define set_pt(ptptr, ptval) (*(ptptr) = (ptval))

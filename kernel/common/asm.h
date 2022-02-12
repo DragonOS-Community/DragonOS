@@ -4,12 +4,9 @@
 #define __ASM__
 
 
-#define ENTRY(name)\
-    .global name;    \
-    name:
 
 
-#endif
+
 
 // 符号名
 #define SYMBOL_NAME(X)	X
@@ -23,3 +20,9 @@
 #define asmlinkage __attribute__((regparm(0)))	
 
 #define ____cacheline_aligned __attribute__((__aligned__(L1_CACHE_BYTES)))
+
+#define ENTRY(name)		\
+.global	SYMBOL_NAME(name);	\
+SYMBOL_NAME_LABEL(name)
+
+#endif

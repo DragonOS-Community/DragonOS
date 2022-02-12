@@ -53,7 +53,7 @@ entry64:
     movq %rax, %gs
     movq %rax, %ss
 
-    movq $0xffff800000007e00, %rsp //rsp的地址
+    movq _stack_start(%rip), %rsp //rsp的地址
 
 setup_IDT:
     leaq m_ignore_int(%rip),  %rdx // 将ignore_int的地址暂时存到中段描述符的高8B

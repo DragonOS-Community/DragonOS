@@ -7,6 +7,12 @@
         "font.h": "c",
         "trap.h": "c",
         "gate.h": "c",
-        "process.h": "c"
+        "process.h": "c",
+        "cpu.h": "c",
+        "mm.h": "c",
+        "glib.h": "c",
+        "asm.h": "c",
+        "memory.h": "c",
+        "irq.h": "c"
     }
 }

@@ -28,7 +28,7 @@
  * @param ptr 指向结构体变量内的成员变量member的指针
  * @param type 成员变量所在的结构体
  * @param member 成员变量名
- * 
+ *
  * 方法：使用ptr减去结构体内的偏移，得到结构体变量的基地址
  */
 #define container_of(ptr, type, member)                                     \
@@ -63,17 +63,18 @@ static inline void list_init(struct List *list)
     list->prev = list;
 }
 
+/**
+ * @brief
+
+ * @param entry 给定的节点
+ * @param node 待插入的节点
+ **/
 static inline void list_add(struct List *entry, struct List *node)
 {
-    /**
-     * @brief 将node插入到entry后面
-     * @param entry 给定的节点
-     * @param node 待插入的节点
-     */
 
     node->next = entry->next;
-    node->next->prev = node;
     node->prev = entry;
+    node->next->prev = node;
     entry->next = node;
 }
 
@@ -87,6 +88,22 @@ static inline void list_append(struct List *entry, struct List *node)
 
     struct List *tail = entry->prev;
     list_add(tail, node);
+}
+
+  void list_add_to_behind(struct List * entry,struct List * new)	////add to entry behind
+{
+	new->next = entry->next;
+	new->prev = entry;
+	new->next->prev = new;
+	entry->next = new;
+}
+
+  void list_add_to_before(struct List * entry,struct List * new)	////add to entry behind
+{
+	new->next = entry;
+	entry->prev->next = new;
+	new->prev = entry->prev;
+	entry->prev = new;
 }
 
 static inline void list_del(struct List *entry)
@@ -115,28 +132,30 @@ static inline bool list_empty(struct List *entry)
 
 /**
  * @brief 获取链表的上一个元素
- * 
- * @param entry 
+ *
+ * @param entry
  * @return 链表的上一个元素
  */
-static inline struct List* list_prev(struct List *entry)
+static inline struct List *list_prev(struct List *entry)
 {
-    if(entry->prev!=NULL)
+    if (entry->prev != NULL)
         return entry->prev;
-    else return NULL;
+    else
+        return NULL;
 }
 
 /**
  * @brief 获取链表的下一个元素
- * 
- * @param entry 
+ *
+ * @param entry
  * @return 链表的下一个元素
  */
-static inline struct List* list_next(struct List *entry)
+static inline struct List *list_next(struct List *entry)
 {
-    if(entry->next!=NULL)
+    if (entry->next != NULL)
         return entry->next;
-    else return NULL;
+    else
+        return NULL;
 }
 
 //计算字符串的长度（经过测试，该版本比采用repne/scasb汇编的运行速度快16.8%左右）
@@ -199,7 +218,7 @@ void *memcpy(void *dst, void *src, long Num)
                          "movsb	\n\t"
                          "3:	\n\t"
                          : "=&c"(d0), "=&D"(d1), "=&S"(d2)
-                         : "0"(Num / 8), "q"(Num), "1"(src), "2"(dst)
+                         : "0"(Num / 8), "q"(Num), "1"(dst), "2"(src)
                          : "memory");
     return dst;
 }
@@ -253,4 +272,74 @@ void io_out32(unsigned short port, unsigned int value)
                          :
                          : "a"(value), "d"(port)
                          : "memory");
+}
+
+
+/**
+ * @brief 读取rsp寄存器的值（存储了页目录的基地址）
+ *
+ * @return unsigned*  rsp的值的指针
+ */
+unsigned long *get_rsp()
+{
+    ul *tmp;
+    __asm__ __volatile__(
+        "movq %%rsp, %0\n\t"
+        : "=r"(tmp)::"memory");
+    return tmp;
+}
+
+/**
+ * @brief 读取rbp寄存器的值（存储了页目录的基地址）
+ *
+ * @return unsigned*  rbp的值的指针
+ */
+unsigned long *get_rbp()
+{
+    ul *tmp;
+    __asm__ __volatile__(
+        "movq %%rbp, %0\n\t"
+        : "=r"(tmp)::"memory");
+    return tmp;
+}
+
+/**
+ * @brief 读取ds寄存器的值（存储了页目录的基地址）
+ *
+ * @return unsigned*  ds的值的指针
+ */
+unsigned long *get_ds()
+{
+    ul *tmp;
+    __asm__ __volatile__(
+        "movq %%ds, %0\n\t"
+        : "=r"(tmp)::"memory");
+    return tmp;
+}
+
+/**
+ * @brief 读取rax寄存器的值（存储了页目录的基地址）
+ *
+ * @return unsigned*  rax的值的指针
+ */
+unsigned long *get_rax()
+{
+    ul *tmp;
+    __asm__ __volatile__(
+        "movq %%rax, %0\n\t"
+        : "=r"(tmp)::"memory");
+    return tmp;
+}
+/**
+ * @brief 读取rbx寄存器的值（存储了页目录的基地址）
+ *
+ * @return unsigned*  rbx的值的指针
+ */
+unsigned long *get_rbx()
+{
+    ul *tmp;
+    __asm__ __volatile__(
+        "movq %%rbx, %0\n\t"
+        : "=r"(tmp)::"memory");
+    return tmp;
 }

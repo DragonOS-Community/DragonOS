@@ -29,7 +29,7 @@ SECTIONS
 	}
 
 	. = ALIGN(32768);
-	.data.init_proc : { *(.data.init_proc) }
+	.data.init_proc_union : { *(.data.init_proc_union) }
 	.bss :
 	{
 		_bss = .;

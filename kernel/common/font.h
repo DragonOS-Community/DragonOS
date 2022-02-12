@@ -1,4 +1,3 @@
-
 #pragma once
 
 unsigned char font_ascii[256][16]=
@@ -314,5 +313,4 @@ unsigned char font_ascii[256][16]=
 
 
 };
-
 

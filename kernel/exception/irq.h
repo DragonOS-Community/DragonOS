@@ -13,6 +13,7 @@
 
 #include "../common/glib.h"
 
+#include "../process/ptrace.h"
 
 /**
  * @brief 初始化中断模块
@@ -26,4 +27,4 @@ void init_irq();
  * @param rsp 中断栈指针
  * @param number 中断号
  */
-void do_IRQ(ul rsp, ul number);
+void do_IRQ(struct pt_regs* rsp, ul number);

@@ -8,6 +8,12 @@ ul total_2M_pages = 0;
 void mm_init()
 {
     kinfo("Initializing memory management unit...");
+     // 设置内核程序不同部分的起止地址
+    memory_management_struct.kernel_code_start = (ul)&_text;
+    memory_management_struct.kernel_code_end = (ul)&_etext;
+    memory_management_struct.kernel_data_end = (ul)&_edata;
+    memory_management_struct.kernel_end = (ul)&_end;
+
     // 实模式下获取到的信息的起始地址，转换为ARDS指针
     struct ARDS *ards_ptr = (struct ARDS *)0xffff800000007e00;
 
@@ -51,11 +57,7 @@ void mm_init()
     }
     kinfo("Total amounts of 2M pages : %ld.", total_2M_pages);
 
-    // 设置内核程序不同部分的起止地址
-    memory_management_struct.kernel_code_start = (ul)&_text;
-    memory_management_struct.kernel_code_end = (ul)&_etext;
-    memory_management_struct.kernel_data_end = (ul)&_edata;
-    memory_management_struct.kernel_end = (ul)&_end;
+   
 
     // 物理地址空间的最大地址（包含了物理内存、内存空洞、ROM等）
     ul max_addr = memory_management_struct.e820[memory_management_struct.len_e820].BaseAddr + memory_management_struct.e820[memory_management_struct.len_e820].Length;
@@ -63,7 +65,7 @@ void mm_init()
     // bmp的指针指向截止位置的4k对齐的上边界（防止修改了别的数据）
     memory_management_struct.bmp = (unsigned long *)((memory_management_struct.kernel_end + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
     memory_management_struct.bits_size = max_addr >> PAGE_2M_SHIFT;                                                                                         // 物理地址空间的最大页面数
-    memory_management_struct.bmp_len = ((unsigned long)((max_addr >> PAGE_2M_SHIFT) + sizeof(unsigned long) * 8 - 1) / 8) & (~(sizeof(unsigned long) - 1)); // bmp由多少个unsigned long变量组成
+    memory_management_struct.bmp_len = (((unsigned long)(max_addr >> PAGE_2M_SHIFT) + sizeof(unsigned long) * 8 - 1) / 8) & (~(sizeof(unsigned long) - 1)); // bmp由多少个unsigned long变量组成
 
     // 初始化bitmap， 先将整个bmp空间全部置位。稍后再将可用物理内存页复位。
     memset(memory_management_struct.bmp, 0xff, memory_management_struct.bmp_len);
@@ -188,11 +190,11 @@ void mm_init()
     printk_color(INDIGO, BLACK, "**cr3:\t%#018lx\n", *phys_2_virt(*(phys_2_virt(cr3)) & (~0xff)) & (~0xff));
     */
 
-   /*
+   
     // 消除一致性页表映射，将页目录（PML4E）的前10项清空
     for (int i = 0; i < 10; ++i)
         *(phys_2_virt(global_CR3) + i) = 0UL;
-        */
+        
 
     flush_tlb();
 
@@ -307,6 +309,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
                         page_init(x, flags);
                     }
                     // 成功分配了页面，返回第一个页面的指针
+                    //printk("start page num=%d\n",start_page_num);
                     return (struct Page *)(memory_management_struct.pages_struct + start_page_num);
                 }
             }

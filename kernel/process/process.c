@@ -35,7 +35,7 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
  * @param arg
  * @return ul 参数
  */
-ul init(ul arg)
+ul initial_kernel_thread(ul arg)
 {
     kinfo("initial proc running...\targ:%#018lx", arg);
     return 1;
@@ -156,7 +156,7 @@ void process_init()
     list_init(&initial_proc_union.pcb.list);
 
 
-    kernel_thread(init, 10, CLONE_FS | CLONE_FILES | CLONE_SIGNAL); // 初始化内核进程
+    kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_FILES | CLONE_SIGNAL); // 初始化内核进程
     initial_proc_union.pcb.state = PROC_RUNNING;
 
     // 获取新的进程的pcb

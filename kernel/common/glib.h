@@ -90,22 +90,6 @@ static inline void list_append(struct List *entry, struct List *node)
     list_add(tail, node);
 }
 
-  void list_add_to_behind(struct List * entry,struct List * new)	////add to entry behind
-{
-	new->next = entry->next;
-	new->prev = entry;
-	new->next->prev = new;
-	entry->next = new;
-}
-
-  void list_add_to_before(struct List * entry,struct List * new)	////add to entry behind
-{
-	new->next = entry;
-	entry->prev->next = new;
-	new->prev = entry->prev;
-	entry->prev = new;
-}
-
 static inline void list_del(struct List *entry)
 {
     /**
@@ -274,7 +258,6 @@ void io_out32(unsigned short port, unsigned int value)
                          : "memory");
 }
 
-
 /**
  * @brief 读取rsp寄存器的值（存储了页目录的基地址）
  *
@@ -342,4 +325,33 @@ unsigned long *get_rbx()
         "movq %%rbx, %0\n\t"
         : "=r"(tmp)::"memory");
     return tmp;
+}
+
+// ========= MSR寄存器组操作 =============
+/**
+ * @brief 向msr寄存器组的address处的寄存器写入值value
+ *
+ * @param address 地址
+ * @param value 要写入的值
+ */
+void wrmsr(ul address, ul value)
+{
+    __asm__ __volatile__("wrmsr    \n\t" ::"d"(value >> 32), "a"(value & 0xffffffff), "c"(address)
+                         : "memory");
+}
+
+/**
+ * @brief 从msr寄存器组的address地址处读取值
+ *
+ * @param address 地址
+ * @return ul address处的寄存器的值
+ */
+ul rdmsr(ul address)
+{
+    unsigned int tmp0, tmp1;
+    __asm__ __volatile__("rdmsr \n\t"
+                         : "=d"(tmp0), "=a"(tmp1)
+                         : "c"(address)
+                         : "memory");
+    return ((ul)tmp0 << 32) | tmp1;
 }

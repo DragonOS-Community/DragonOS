@@ -26,7 +26,38 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
+}
 
+/**
+ * @brief 这是一个用户态的程序
+ *
+ */
+void user_level_function()
+{
+    kinfo("Program (user_level_function) is runing...");
+    
+    while(1);
+}
+/**
+ * @brief 使当前进程去执行新的代码
+ *
+ * @param regs 当前进程的寄存器
+ * @return ul 错误码
+ */
+ul do_execve(struct pt_regs *regs)
+{
+    // 选择这两个寄存器是对应了sysexit指令的需要
+    regs->rdx = 0x800000; // rip 应用层程序的入口地址   这里的地址选择没有特殊要求，只要是未使用的内存区域即可。
+    regs->rcx = 0xa00000; // rsp 应用层程序的栈顶地址
+
+    regs->rax = 1;
+    regs->ds = 0;
+    regs->es = 0;
+
+    kdebug("do_execve is running...");
+    // 将程序代码拷贝到对应的内存中
+    memcpy((void *)0x800000, user_level_function, 1024);
+    return 0;
 }
 
 /**
@@ -38,6 +69,21 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
 ul initial_kernel_thread(ul arg)
 {
     kinfo("initial proc running...\targ:%#018lx", arg);
+    
+    struct pt_regs *regs;
+
+    current_pcb->thread->rip = (ul)ret_from_system_call;
+    current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
+
+    regs = (struct pt_regs *)current_pcb->thread->rsp;
+
+    // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
+    __asm__ __volatile__("movq %1, %%rsp   \n\t"
+                         "pushq %2    \n\t"
+                         "jmp do_execve  \n\t" ::"D"(regs),
+                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip)
+                         : "memory");
+
     return 1;
 }
 
@@ -62,35 +108,33 @@ ul do_exit(ul code)
  */
 
 extern void kernel_thread_func(void);
-__asm__ (
-"kernel_thread_func:	\n\t"
-"	popq	%r15	\n\t"
-"	popq	%r14	\n\t"	
-"	popq	%r13	\n\t"	
-"	popq	%r12	\n\t"	
-"	popq	%r11	\n\t"	
-"	popq	%r10	\n\t"	
-"	popq	%r9	\n\t"	
-"	popq	%r8	\n\t"	
-"	popq	%rbx	\n\t"	
-"	popq	%rcx	\n\t"	
-"	popq	%rdx	\n\t"	
-"	popq	%rsi	\n\t"	
-"	popq	%rdi	\n\t"	
-"	popq	%rbp	\n\t"	
-"	popq	%rax	\n\t"	
-"	movq	%rax,	%ds	\n\t"
-"	popq	%rax		\n\t"
-"	movq	%rax,	%es	\n\t"
-"	popq	%rax		\n\t"
-"	addq	$0x38,	%rsp	\n\t"
-/////////////////////////////////
-"	movq	%rdx,	%rdi	\n\t"
-"	callq	*%rbx		\n\t"
-"	movq	%rax,	%rdi	\n\t"
-"	callq	do_exit		\n\t"
-);
-
+__asm__(
+    "kernel_thread_func:	\n\t"
+    "	popq	%r15	\n\t"
+    "	popq	%r14	\n\t"
+    "	popq	%r13	\n\t"
+    "	popq	%r12	\n\t"
+    "	popq	%r11	\n\t"
+    "	popq	%r10	\n\t"
+    "	popq	%r9	\n\t"
+    "	popq	%r8	\n\t"
+    "	popq	%rbx	\n\t"
+    "	popq	%rcx	\n\t"
+    "	popq	%rdx	\n\t"
+    "	popq	%rsi	\n\t"
+    "	popq	%rdi	\n\t"
+    "	popq	%rbp	\n\t"
+    "	popq	%rax	\n\t"
+    "	movq	%rax,	%ds	\n\t"
+    "	popq	%rax		\n\t"
+    "	movq	%rax,	%es	\n\t"
+    "	popq	%rax		\n\t"
+    "	addq	$0x38,	%rsp	\n\t"
+    /////////////////////////////////
+    "	movq	%rdx,	%rdi	\n\t"
+    "	callq	*%rbx		\n\t"
+    "	movq	%rax,	%rdi	\n\t"
+    "	callq	do_exit		\n\t");
 
 /**
  * @brief 初始化内核进程
@@ -116,7 +160,6 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
     regs.cs = KERNEL_CS;
     regs.ss = KERNEL_DS;
 
-
     // 置位中断使能标志位
     regs.rflags = (1 << 9);
 
@@ -128,7 +171,6 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 
 void process_init()
 {
-
 
     initial_mm.pgd = (pml4t_t *)global_CR3;
 
@@ -146,15 +188,16 @@ void process_init()
 
     initial_mm.stack_start = _stack_start;
 
+    // 向MSR寄存器组中的 IA32_SYSENTER_CS寄存器写入内核的代码段的地址
+    wrmsr(0x174, KERNEL_CS);
+
     // 初始化进程和tss
     set_TSS64(initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     initial_tss[0].rsp0 = initial_thread.rbp;
-   
 
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
-
 
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_FILES | CLONE_SIGNAL); // 初始化内核进程
     initial_proc_union.pcb.state = PROC_RUNNING;
@@ -162,7 +205,7 @@ void process_init()
     // 获取新的进程的pcb
     struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
 
-	// 切换到新的内核线程
+    // 切换到新的内核线程
     switch_proc(current_pcb, p);
 }
 
@@ -180,13 +223,10 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 {
     struct process_control_block *tsk = NULL;
 
-
     // 获取一个物理页并在这个物理页内初始化pcb
     struct Page *pp = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED | PAGE_ACTIVE | PAGE_KERNEL);
 
-
     tsk = (struct process_control_block *)phys_2_virt(pp->addr_phys);
-
 
     memset(tsk, 0, sizeof(*tsk));
 
@@ -197,7 +237,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     list_init(&tsk->list);
 
     list_add(&initial_proc_union.pcb.list, &tsk->list);
-
 
     ++(tsk->pid);
     tsk->state = PROC_UNINTERRUPTIBLE;
@@ -214,9 +253,9 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     thd->rip = regs->rip;
     thd->rsp = (ul)tsk + STACK_SIZE - sizeof(struct pt_regs);
 
-    // 若进程不是内核层的进程，则跳转到ret from intr
+    // 若进程不是内核层的进程，则跳转到ret from system call
     if (!(tsk->flags & PF_KTHREAD))
-        thd->rip = regs->rip = (ul)ret_from_intr;
+        thd->rip = regs->rip = (ul)ret_from_system_call;
 
     tsk->state = PROC_RUNNING;
 

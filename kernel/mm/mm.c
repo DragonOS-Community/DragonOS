@@ -191,10 +191,11 @@ void mm_init()
     */
 
    
+    /*
     // 消除一致性页表映射，将页目录（PML4E）的前10项清空
     for (int i = 0; i < 10; ++i)
         *(phys_2_virt(global_CR3) + i) = 0UL;
-        
+    */  
 
     flush_tlb();
 

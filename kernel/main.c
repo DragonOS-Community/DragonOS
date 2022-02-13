@@ -65,7 +65,7 @@ void system_initialize()
 // 初始化printk
     init_printk(1440, 900, FR_address, 1440 * 900 * 4, 8, 16);
 
-    load_TR(8); // 加载TR寄存器
+    load_TR(10); // 加载TR寄存器
 
     // 初始化任务状态段表
     ul tss_item_addr = 0xffff800000007c00;

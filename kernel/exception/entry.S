@@ -99,6 +99,38 @@ Err_Code:
 
     jmp ret_from_exception
 
+// 从系统调用中返回
+ENTRY(ret_from_system_call)
+    movq %rax, 0x80(%rsp)   // 将当前rax的值先存到栈中rax的位置
+
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbx
+    popq %rcx
+    popq %rdx
+    popq %rsi
+    popq %rdi
+    popq %rbp
+
+    popq %rax   //  不允许直接pop到ds
+    movq %rax, %ds
+
+    popq %rax
+    movq %rax, %es
+
+    popq %rax
+
+    addq $0x38, %rsp
+
+    .byte 0x48
+    sysexit
+
 
 // 0 #DE 除法错误
 ENTRY(divide_error)

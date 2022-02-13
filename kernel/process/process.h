@@ -16,7 +16,8 @@
 #include "ptrace.h"
 
 extern unsigned long _stack_start; // 导出内核层栈基地址（定义在head.S）
-extern void ret_from_intr();	   // 导出从中断返回的函数（定义在entry.S）
+extern void ret_from_intr(void);	   // 导出从中断返回的函数（定义在entry.S）
+extern void ret_from_system_call(void);	   // 导出从中断返回的函数（定义在entry.S）
 
 // 进程的内核栈大小 32K
 #define STACK_SIZE 32768

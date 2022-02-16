@@ -99,6 +99,46 @@ Err_Code:
 
     jmp ret_from_exception
 
+// 系统调用入口
+// 保存寄存器
+ENTRY(system_call)
+    // 由于sysenter指令会禁用中断，因此要在这里手动开启中断
+    sti;
+    
+    subq $0x38, %rsp
+    
+    cld;
+
+    pushq %rax
+    movq %es, %rax
+    pushq %rax
+    movq %ds, %rax
+    pushq %rax
+    pushq %rbp
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %rcx
+    pushq %rbx
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+
+    movq $0x10, %rdx
+    movq %rdx, %ds
+    movq %rdx, %es
+    // 将rsp作为参数传递给system_call_function
+    movq %rsp, %rdi
+
+    callq system_call_function
+
+
+
 // 从系统调用中返回
 ENTRY(ret_from_system_call)
     movq %rax, 0x80(%rsp)   // 将当前rax的值先存到栈中rax的位置

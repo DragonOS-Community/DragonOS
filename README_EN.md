@@ -56,7 +56,7 @@ bximage
 
 - [ ] IPC
 
-- [ ] First system call function
+- [x] First system call function
 
 - [ ] Start dragonos on the physical platform
 

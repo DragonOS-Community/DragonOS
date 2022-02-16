@@ -10,6 +10,7 @@
 #include "exception/irq.h"
 #include "mm/mm.h"
 #include "process/process.h"
+#include "syscall/syscall.h"
 
 unsigned int *FR_address = (unsigned int *)0xffff800000a00000; //帧缓存区的地址
 // char fxsave_region[512] __attribute__((aligned(16)));
@@ -84,6 +85,9 @@ void system_initialize()
     // 初始化中断模块
     init_irq();
 
+    // 先初始化系统调用模块
+    syscall_init();
+    // 再初始化进程模块。顺序不能调转
     process_init();
 }
 

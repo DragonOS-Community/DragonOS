@@ -212,7 +212,21 @@ void do_general_protection(struct pt_regs * regs, unsigned long error_code)
     printk("[ ");
     printk_color(RED, BLACK, "ERROR");
     printk(" ] do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
-    return;
+    if(error_code & 0x01)
+		printk_color(RED,BLACK,"The exception occurred during delivery of an event external to the program,such as an interrupt or an earlier exception.\n");
+
+	if(error_code & 0x02)
+		printk_color(RED,BLACK,"Refers to a gate descriptor in the IDT;\n");
+	else
+		printk_color(RED,BLACK,"Refers to a descriptor in the GDT or the current LDT;\n");
+
+	if((error_code & 0x02) == 0)
+		if(error_code & 0x04)
+			printk_color(RED,BLACK,"Refers to a segment or gate descriptor in the LDT;\n");
+		else
+			printk_color(RED,BLACK,"Refers to a descriptor in the current GDT;\n");
+
+	printk_color(RED,BLACK,"Segment Selector Index:%#010x\n",error_code & 0xfff8);
     while (1)
         ;
 }

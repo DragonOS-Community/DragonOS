@@ -3,6 +3,8 @@
 #include "../exception/gate.h"
 #include "../common/printk.h"
 #include "../common/kprint.h"
+#include "../syscall/syscall.h"
+#include "../syscall/syscall_num.h"
 
 /**
  * @brief 切换进程
@@ -28,6 +30,7 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
 }
 
+
 /**
  * @brief 这是一个用户态的程序
  *
@@ -35,7 +38,13 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
 void user_level_function()
 {
     kinfo("Program (user_level_function) is runing...");
+    kinfo("Try to enter syscall id 15...");
+    enter_syscall(15,0,0,0,0,0,0,0,0);
+
+    enter_syscall(SYS_PRINTF, (ul)"test_sys_printf\n", 0,0,0,0,0,0,0);
+    kinfo("Return from syscall id 15...");
     
+
     while(1);
 }
 /**
@@ -169,6 +178,10 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
     return do_fork(&regs, flags, 0, 0);
 }
 
+/**
+ * @brief 初始化进程模块
+ * ☆前置条件：已完成系统调用模块的初始化
+ */
 void process_init()
 {
 
@@ -188,8 +201,7 @@ void process_init()
 
     initial_mm.stack_start = _stack_start;
 
-    // 向MSR寄存器组中的 IA32_SYSENTER_CS寄存器写入内核的代码段的地址
-    wrmsr(0x174, KERNEL_CS);
+    
 
     // 初始化进程和tss
     set_TSS64(initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);

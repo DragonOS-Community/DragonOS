@@ -47,7 +47,7 @@ long enter_syscall(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, u
                          "sysexit_return_address:    \n\t"
                          : "=a"(err_code)
                          : "0"(syscall_id), "m"(arg0), "m"(arg1), "m"(arg2), "m"(arg3), "m"(arg4), "m"(arg5), "m"(arg6), "m"(arg7)
-                         : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15");
+                         : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
     return err_code;
 }
 

@@ -64,7 +64,7 @@ Label_Start:
     mov ax, 0x1301
     mov bx, 0x000f
     mov dx, 0x0100  ;在第2行显示
-    mov cx, 23 ;设置消息长度
+    mov cx, 26 ;设置消息长度
     push ax
 
     mov ax, ds
@@ -189,17 +189,17 @@ Label_FileName_Found:
     mov ax, cx
 
 Label_Go_On_Loading_File:
-    push ax
-    push bx
+    ;push ax
+    ;push bx
 
     ; 显示字符.
-    mov ah, 0x0e
-    mov al, "."
-    mov bl, 0x0f
-    int 0x10
+    ;mov ah, 0x0e
+    ;mov al, "."
+    ;mov bl, 0x0f
+    ;int 0x10
 
-    pop bx
-    pop ax
+    ;pop bx
+    ;pop ax
 
 
     ; 读取一个扇区
@@ -829,7 +829,7 @@ OffsetOfKernelFileCount	dd	Offset_Of_Kernel_File
 DisplayPosition dd 0
 
 ; 要显示的消息文本
-Message_Start_Loader: db "[DragonOS] Start Loader"
+Message_Start_Loader: db "[DragonOS] Start Loader..."
 Message_No_Loader: db "[ERROR] No Kernel Found."
 Message_Kernel_Loaded: db "[INFO] Kernel loaded"
 Message_Start_Get_Mem_Struct: db "[INFO] Try to get memory struct..."

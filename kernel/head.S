@@ -453,7 +453,15 @@ SetUp_TSS64:
     // 装载任务状态段寄存器(已改为在main.c中使用load_TR宏进行装载)
     // mov $0x50, %ax // 设置起始地址为80
     // ltr %ax
-
+    
+    //now enable SSE and the like
+    movq %cr0, %rax
+    and $0xFFFB, %ax		//clear coprocessor emulation CR0.EM
+    or $0x2, %ax			//set coprocessor monitoring  CR0.MP
+    movq %rax, %cr0
+    movq %cr4, %rax
+    or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
+    movq %rax, %cr4
 
     call Start_Kernel
 

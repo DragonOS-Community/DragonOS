@@ -51,10 +51,11 @@ int init_printk(const int char_size_x, const int char_size_y)
     
     // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
     pos.FB_address = 0xa00000;  
-    pos.FB_length = info.framebuffer_pitch - info.framebuffer_addr;
+    pos.FB_length = pos.width*pos.height*4;
 
     pos.x = 0;
     pos.y = 0;
+
     return 0;
 }
 

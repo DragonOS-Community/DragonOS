@@ -93,7 +93,7 @@ if [ $flag_can_run -eq 1 ]; then
         bochs -q -f ${bochsrc} -rc ./tools/bochsinit
     else
         qemu-system-x86_64 -cdrom ${iso} -m 128M \
-        -monitor telnet::2333,server,nowait -serial stdio
+        -monitor telnet::2333,server,nowait -serial stdio -s
     fi
 else
   echo "不满足运行条件"

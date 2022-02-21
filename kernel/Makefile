@@ -7,11 +7,13 @@ DIR_LIB=lib
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 all: kernel
-	objcopy -I elf64-x86-64 -S -R  ".eh_frame" -R ".comment" -O binary kernel ../bin/kernel/kernel.bin
+#objcopy -I elf64-x86-64 -S -R ".comment" -O elf64-x86-64 kernel ../bin/kernel/kernel.elf
+	cp kernel ../bin/kernel/kernel.elf
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o syscall.o
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o exception/8259A.o mm/mm.o process/process.o syscall/syscall.o -T link.lds
+kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o syscall.o multiboot2.o
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o exception/8259A.o mm/mm.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
+	-T link.lds
 
 head.o: head.S
 	gcc -E head.S > head.s # 预处理
@@ -48,6 +50,9 @@ process.o: process/process.c
 	gcc -mcmodel=large -fno-builtin -m64 -c process/process.c -o process/process.o
 syscall.o: syscall/syscall.c
 	gcc -mcmodel=large -fno-builtin -m64 -c syscall/syscall.c -o syscall/syscall.o
+
+multiboot2.o: driver/multiboot2/multiboot2.c 
+	gcc -mcmodel=large -fno-builtin -m64 -c driver/multiboot2/multiboot2.c  -o driver/multiboot2/multiboot2.o
 
 clean: 
 	rm -rf $(GARBAGE)

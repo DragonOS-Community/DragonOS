@@ -5,10 +5,14 @@ ENTRY(_start)
 SECTIONS
 {
 
-	. = 0xffff800000000000 + 0x100000;
+	. = 0;
+
+
+	. = 1M;
 	.text :
 	{
 		_text = .;
+		*(.multiboot_header)
 		*(.text)
 
 		_etext = .;
@@ -19,6 +23,7 @@ SECTIONS
 		_data = .;
 		*(.data)
 		
+        *(.eh_frame)
 		_edata = .;
 	}
 	.rodata : 

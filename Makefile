@@ -1,7 +1,8 @@
-SUBDIRS = bootloader kernel
+SUBDIRS = kernel
 
 .PHONY: all
 all:
+	mkdir -p bin/kernel/
 	@list='$(SUBDIRS)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\

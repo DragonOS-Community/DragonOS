@@ -264,6 +264,8 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     thd->rbp = (ul)tsk + STACK_SIZE;
     thd->rip = regs->rip;
     thd->rsp = (ul)tsk + STACK_SIZE - sizeof(struct pt_regs);
+    thd->fs = KERNEL_DS;
+	thd->gs = KERNEL_DS;
 
     // 若进程不是内核层的进程，则跳转到ret from system call
     if (!(tsk->flags & PF_KTHREAD))

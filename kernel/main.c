@@ -13,10 +13,10 @@
 #include "syscall/syscall.h"
 
 unsigned int *FR_address = (unsigned int *)0xffff800000a00000; //帧缓存区的地址
-// char fxsave_region[512] __attribute__((aligned(16)));
+                                                               // char fxsave_region[512] __attribute__((aligned(16)));
 
- struct memory_desc memory_management_struct = {{0}, 0};
-//struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
+struct memory_desc memory_management_struct = {{0}, 0};
+// struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
 
 void show_welcome()
 {
@@ -36,7 +36,6 @@ void show_welcome()
         printk(" ");
     printk_color(0x00e0ebeb, 0x00e0ebeb, "                                \n\n");
 }
-
 
 // 测试内存管理单元
 /*
@@ -63,18 +62,16 @@ void test_mm()
 // 初始化系统各模块
 void system_initialize()
 {
-// 初始化printk
-    init_printk(1440, 900, FR_address, 1440 * 900 * 4, 8, 16);
-
+    // 初始化printk
+    init_printk(1024, 768, FR_address, 1024 * 768 * 4, 8, 16);
+    printk("11111\n");
     load_TR(10); // 加载TR寄存器
-
+    while(1);
     // 初始化任务状态段表
     ul tss_item_addr = 0xffff800000007c00;
-    
+
     set_TSS64(_stack_start, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
               tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
-              
-    
 
     // 初始化中断描述符表
     init_sys_vector();
@@ -96,11 +93,9 @@ void Start_Kernel(void)
 {
 
     system_initialize();
-    
+
     // show_welcome();
     // test_mm();
-
-   
 
     while (1)
         ;

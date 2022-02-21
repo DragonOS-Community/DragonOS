@@ -72,6 +72,74 @@
 #define MULTIBOOT_CONSOLE_FLAGS_EGA_TEXT_SUPPORTED 2
 
 
+// 以下是来自 multiboot2 规范的定义
+//  How many bytes from the start of the file we search for the header.
+#define MULTIBOOT_SEARCH 32768
+#define MULTIBOOT_HEADER_ALIGN 8
+
+//  The magic field should contain this.
+#define MULTIBOOT2_HEADER_MAGIC 0xe85250d6
+
+//  This should be in %eax.
+#define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
+
+//  Alignment of multiboot modules.
+#define MULTIBOOT_MOD_ALIGN 0x00001000
+
+//  Alignment of the multiboot info structure.
+#define MULTIBOOT_INFO_ALIGN 0x00000008
+
+//  Flags set in the 'flags' member of the multiboot header.
+
+#define MULTIBOOT_TAG_ALIGN 8
+#define MULTIBOOT_TAG_TYPE_END 0
+#define MULTIBOOT_TAG_TYPE_CMDLINE 1
+#define MULTIBOOT_TAG_TYPE_BOOT_LOADER_NAME 2
+#define MULTIBOOT_TAG_TYPE_MODULE 3
+#define MULTIBOOT_TAG_TYPE_BASIC_MEMINFO 4
+#define MULTIBOOT_TAG_TYPE_BOOTDEV 5
+#define MULTIBOOT_TAG_TYPE_MMAP 6
+#define MULTIBOOT_TAG_TYPE_VBE 7
+#define MULTIBOOT_TAG_TYPE_FRAMEBUFFER 8
+#define MULTIBOOT_TAG_TYPE_ELF_SECTIONS 9
+#define MULTIBOOT_TAG_TYPE_APM 10
+#define MULTIBOOT_TAG_TYPE_EFI32 11
+#define MULTIBOOT_TAG_TYPE_EFI64 12
+#define MULTIBOOT_TAG_TYPE_SMBIOS 13
+#define MULTIBOOT_TAG_TYPE_ACPI_OLD 14
+#define MULTIBOOT_TAG_TYPE_ACPI_NEW 15
+#define MULTIBOOT_TAG_TYPE_NETWORK 16
+#define MULTIBOOT_TAG_TYPE_EFI_MMAP 17
+#define MULTIBOOT_TAG_TYPE_EFI_BS 18
+#define MULTIBOOT_TAG_TYPE_EFI32_IH 19
+#define MULTIBOOT_TAG_TYPE_EFI64_IH 20
+#define MULTIBOOT_TAG_TYPE_LOAD_BASE_ADDR 21
+
+#define MULTIBOOT_HEADER_TAG_END 0
+#define MULTIBOOT_HEADER_TAG_INFORMATION_REQUEST 1
+#define MULTIBOOT_HEADER_TAG_ADDRESS 2
+#define MULTIBOOT_HEADER_TAG_ENTRY_ADDRESS 3
+#define MULTIBOOT_HEADER_TAG_CONSOLE_FLAGS 4
+#define MULTIBOOT_HEADER_TAG_FRAMEBUFFER 5
+#define MULTIBOOT_HEADER_TAG_MODULE_ALIGN 6
+#define MULTIBOOT_HEADER_TAG_EFI_BS 7
+#define MULTIBOOT_HEADER_TAG_ENTRY_ADDRESS_EFI32 8
+#define MULTIBOOT_HEADER_TAG_ENTRY_ADDRESS_EFI64 9
+#define MULTIBOOT_HEADER_TAG_RELOCATABLE 10
+
+#define MULTIBOOT_ARCHITECTURE_I386 0
+#define MULTIBOOT_ARCHITECTURE_MIPS32 4
+#define MULTIBOOT_HEADER_TAG_OPTIONAL 1
+
+#define MULTIBOOT_LOAD_PREFERENCE_NONE 0
+#define MULTIBOOT_LOAD_PREFERENCE_LOW 1
+#define MULTIBOOT_LOAD_PREFERENCE_HIGH 2
+
+#define MULTIBOOT_CONSOLE_FLAGS_CONSOLE_REQUIRED 1
+#define MULTIBOOT_CONSOLE_FLAGS_EGA_TEXT_SUPPORTED 2
+
+
+
 // 直接用 -m64 编译出来的是 64 位代码，
 // 但是启动后的机器是 32 位的，相当于在 32 位机器上跑 64 位程序。
 // 得加一层跳转到 64 位的 -m32 代码，开启 long 模式后再跳转到以 -m64 编译的代码中
@@ -103,11 +171,24 @@ multiboot_header:
     // 校验和
     .long CHECKSUM
     // 添加其它内容在此，详细信息见 Multiboot2 Specification version 2.0.pdf
+
+// 设置帧缓冲区
+.align 8
+framebuffer_tag_start:
+    .short MULTIBOOT_HEADER_TAG_FRAMEBUFFER
+    .short MULTIBOOT_HEADER_TAG_OPTIONAL
+    .long framebuffer_tag_end - framebuffer_tag_start
+    .long 1440
+    .long 900
+    .long 32
+framebuffer_tag_end:
+.align 8
 	.short MULTIBOOT_HEADER_TAG_END
     // 结束标记
     .short 0
     .long 8
 multiboot_header_end:
+
 
 // 临时页表 4KB/页
 .section .data
@@ -172,13 +253,14 @@ gdt64_pointer64:
 # 在 multiboot2.cpp 中定义
 .extern boot_info_addr
 .extern multiboot2_magic
+.extern _start64
 _start:
     // 关中断
     cli
     // multiboot2_info 结构体指针
-    //mov %ebx, boot_info_addr
+    mov %ebx, boot_info_addr
     // 魔数
-    //mov %eax, multiboot2_magic
+    mov %eax, multiboot2_magic
     / 从保护模式跳转到长模式
     // 1. 允许 PAE
     mov %cr4, %eax
@@ -238,6 +320,7 @@ _start:
     hlt
     ret
 
+
 .section .text
 
 .code64
@@ -279,6 +362,8 @@ ENTRY(_start64)
     mov $__PDE, %ebx
     or $0x7, %ebx
     mov %ebx, 0(%eax)
+
+
 // ==== 加载CR3寄存器
     movq $__PML4E, %rax //设置页目录基地址
     movq %rax, %cr3
@@ -421,7 +506,7 @@ __PDE:
 	.quad	0x400087
 	.quad	0x600087
 	.quad	0x800087
-	.quad	0xe0000087		/*0x a00000*/
+	.quad	0xe0000087		/*虚拟地址0x a00000 帧缓冲区映射到这里*/ 
 	.quad	0xe0200087
 	.quad	0xe0400087
 	.quad	0xe0600087		/*0x1000000*/

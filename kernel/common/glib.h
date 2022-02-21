@@ -23,6 +23,7 @@
                                              : "memory") // 在sfence指令前的写操作必须在sfence指令后的写操作前完成
 #define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
                                              : "memory") // 在lfence指令前的读操作必须在lfence指令后的读操作前完成。
+
 /**
  * @brief 根据结构体变量内某个成员变量member的基地址，计算出该结构体变量的基地址
  * @param ptr 指向结构体变量内的成员变量member的指针
@@ -48,6 +49,18 @@ typedef long long int ll;
 ul round(double x)
 {
     return (ul)(x + 0.5);
+}
+
+/**
+ * @brief 地址按照align进行对齐
+ * 
+ * @param addr 
+ * @param _align 
+ * @return ul 对齐后的地址
+ */
+ul ALIGN(const ul addr, const ul _align)
+{
+    return (ul)((addr+_align-1)&(~(_align-1)));
 }
 
 //链表数据结构

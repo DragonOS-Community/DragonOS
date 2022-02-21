@@ -7,8 +7,8 @@ DIR_LIB=lib
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 all: kernel
-#objcopy -I elf64-x86-64 -S -R ".comment" -O elf64-x86-64 kernel ../bin/kernel/kernel.elf
-	cp kernel ../bin/kernel/kernel.elf
+	objcopy -I elf64-x86-64 -S -R ".comment" -O elf64-x86-64 kernel ../bin/kernel/kernel.elf
+# cp kernel ../bin/kernel/kernel.elf
 
 
 kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o syscall.o multiboot2.o
@@ -18,6 +18,7 @@ kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o sysca
 head.o: head.S
 	gcc -E head.S > head.s # 预处理
 	as --64 -o head.o head.s
+#gcc -mcmodel=large -fno-builtin -m64 -c head.S -o head.o
 
 entry.o: exception/entry.S
 	gcc -E exception/entry.S > exception/entry.s

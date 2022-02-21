@@ -1,3 +1,100 @@
+#include "multiboot2.h"
+#include "assert.h"
 
-int *boot_info_addr;
-int *multiboot2_magic;
+#include "../../common/glib.h"
+
+uintptr_t boot_info_addr;
+unsigned int multiboot2_magic;
+unsigned int boot_info_size;
+
+bool multiboot2_init(void)
+{
+    uintptr_t *addr = (uintptr_t*)boot_info_addr;
+    if(multiboot2_magic != MULTIBOOT2_BOOTLOADER_MAGIC);
+        return false;
+    // addr+0 处保存了大小
+    boot_info_size = *(unsigned int *)addr;
+    return true;
+}
+
+void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, int *),
+                     void *data, int *count)
+{
+    uintptr_t addr = boot_info_addr;
+    // 下一字节开始为 tag 信息
+    struct iter_data_t *tag = (struct iter_data_t *)(addr + 8);
+    for (; tag->type != MULTIBOOT_TAG_TYPE_END;
+         tag = (struct iter_data_t *)((uint8_t *)tag + ALIGN(tag->size, 8)))
+    {
+        if (_fun(tag, data, count) == true)
+        {
+            return;
+        }
+    }
+    return;
+}
+
+// 读取 grub2 传递的物理内存信息，保存到 e820map_t 结构体中
+// 一般而言是这样的
+// 地址(长度) 类型
+// 0x00(0x9F000) 0x1
+// 0x9F000(0x1000) 0x2
+// 0xE8000(0x18000) 0x2
+// 0x100000(0x7EF0000) 0x1
+// 0x7FF0000(0x10000) 0x3
+// 0xFFFC0000(0x40000) 0x2
+/**
+ * @brief 获取multiboot2协议提供的内存区域信息
+ *
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data 返回信息的结构体指针
+ * @param count 返回数组的长度
+ * @return true
+ * @return false
+ */
+bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *data, int *count)
+{
+    if (_iter_data->type != MULTIBOOT_TAG_TYPE_MMAP)
+        return false;
+
+    struct multiboot_mmap_entry_t *resource = (struct multiboot_mmap_entry_t *)data;
+    struct multiboot_mmap_entry_t *mmap = ((struct multiboot_tag_mmap_t *)_iter_data)->entries;
+    *count = (uint8_t *)_iter_data + _iter_data->size;
+    for (; (uint8_t *)mmap < (uint8_t *)_iter_data + _iter_data->size;
+         mmap = (struct multiboot_mmap_entry_t *)((uint8_t *)mmap + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size))
+    {
+        *resource = *mmap;
+        // 将指针进行增加
+        resource = (struct multiboot_mmap_entry_t *)((uint8_t *)resource + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size);
+    }
+    return true;
+}
+
+/**
+ * @brief 获取VBE信息
+ * 
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data 返回信息的结构体指针
+ */
+bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, int *reserved)
+{
+    
+    if (_iter_data->type != MULTIBOOT_TAG_TYPE_VBE)
+        return false;
+    *(struct multiboot_tag_vbe_t *)data = *(struct multiboot_tag_vbe_t *)_iter_data;
+    return true;
+}
+
+/**
+ * @brief 获取帧缓冲区信息
+ * 
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data 返回信息的结构体指针
+ */
+bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *data, int *reserved)
+{
+    if(_iter_data->type !=MULTIBOOT_TAG_TYPE_FRAMEBUFFER)
+        return false;
+    *(struct multiboot_tag_framebuffer_info_t *)data = *(struct multiboot_tag_framebuffer_info_t*)_iter_data;
+    return true;
+}

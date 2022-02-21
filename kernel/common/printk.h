@@ -57,14 +57,10 @@ char buf[4096]; //vsprintf()的缓冲区
 /**
  * @brief 初始化printk的屏幕信息
  * 
- * @param width 屏幕宽度
- * @param height 屏幕高度
- * @param FB_address 帧缓冲区地址
- * @param FB_length 帧缓冲区长度
  * @param char_size_x 字符的列坐标
  * @param char_size_y 字符的行坐标
  */
-int init_printk(const int width, const int height, unsigned int *FB_address, const int FB_length, const int char_size_x, const int char_size_y);
+int init_printk(const int char_size_x, const int char_size_y);
 /**
  * @brief Set the printk pos object
  * 

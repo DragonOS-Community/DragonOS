@@ -2,6 +2,8 @@
 // Created by longjin on 2022/1/22.
 //
 #include "printk.h"
+#include "../driver/multiboot2/multiboot2.h"
+#include "../mm/mm.h"
 //#include "linkage.h"
 
 struct screen_info pos;
@@ -34,22 +36,25 @@ int calculate_max_charNum(int len, int size)
     return len / size;
 }
 
-int init_printk(const int width, const int height, unsigned int *FB_address, const int FB_length, const int char_size_x, const int char_size_y)
+int init_printk(const int char_size_x, const int char_size_y)
 {
-
-    pos.width = width;
-    pos.height = height;
+    struct multiboot_tag_framebuffer_info_t info;
+    int reserved;
+    multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
+    
+    pos.width = info.framebuffer_width;
+    pos.height = info.framebuffer_height;
     pos.char_size_x = char_size_x;
     pos.char_size_y = char_size_y;
-    pos.max_x = calculate_max_charNum(width, char_size_x);
-    pos.max_y = calculate_max_charNum(height, char_size_y);
-
-    pos.FB_address = FB_address;
-    pos.FB_length = FB_length;
+    pos.max_x = calculate_max_charNum(pos.width, char_size_x);
+    pos.max_y = calculate_max_charNum(pos.height, char_size_y);
+    
+    // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
+    pos.FB_address = 0xa00000;  
+    pos.FB_length = info.framebuffer_pitch - info.framebuffer_addr;
 
     pos.x = 0;
     pos.y = 0;
-
     return 0;
 }
 
@@ -81,7 +86,7 @@ void auto_newline()
 {
     /**
      * @brief 超过每行最大字符数，自动换行
-     * 
+     *
      */
     if (pos.x > pos.max_x)
     {
@@ -314,7 +319,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
         case 'x':
             flags |= SMALL;
         case 'X':
-            //flags |= SPECIAL;
+            // flags |= SPECIAL;
             if (qualifier == 'l')
                 str = write_num(str, va_arg(args, ull), 16, field_width, precision, flags);
             else
@@ -352,13 +357,13 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
             break;
         case 'f':
             // 默认精度为3
-            //printk("1111\n");
-            //va_arg(args, double);
-            //printk("222\n");
+            // printk("1111\n");
+            // va_arg(args, double);
+            // printk("222\n");
 
             if (precision < 0)
                 precision = 3;
-            
+
             str = write_float_point_num(str, va_arg(args, double), field_width, precision, flags);
 
             break;
@@ -383,11 +388,11 @@ static char *write_num(char *str, ull num, int base, int field_width, int precis
 {
     /**
      * @brief 将数字按照指定的要求转换成对应的字符串
-     * 
+     *
      * @param str 要返回的字符串
      * @param num 要打印的数值
      * @param base 基数
-     * @param field_width 区域宽度 
+     * @param field_width 区域宽度
      * @param precision 精度
      * @param flags 标志位
      */
@@ -486,10 +491,10 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
 {
     /**
      * @brief 将浮点数按照指定的要求转换成对应的字符串
-     * 
+     *
      * @param str 要返回的字符串
      * @param num 要打印的数值
-     * @param field_width 区域宽度 
+     * @param field_width 区域宽度
      * @param precision 精度
      * @param flags 标志位
      */
@@ -578,7 +583,7 @@ static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRco
 {
     /**
      * @brief 在屏幕上指定位置打印字符
-     * 
+     *
      * @param fb 帧缓存线性地址
      * @param Xsize 行分辨率
      * @param x 左上角列像素点位置
@@ -617,7 +622,7 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
 {
     /**
      * @brief 格式化打印字符串
-     * 
+     *
      * @param FRcolor 前景色
      * @param BKcolor 背景色
      * @param ... 格式化字符串

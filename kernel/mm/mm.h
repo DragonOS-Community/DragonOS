@@ -7,7 +7,8 @@
 #define PTRS_PER_PGT 512
 
 // 内核层的起始地址
-#define KERNEL_BASE_ADDR ((unsigned long)0x100000)
+#define PAGE_OFFSET ((unsigned long)0x000000)
+#define KERNEL_BASE_PHYS_ADDR ((unsigned long)0x100000)
 
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21
@@ -27,8 +28,8 @@
 #define PAGE_2M_ALIGN(addr) (((unsigned long)(addr) + PAGE_2M_SIZE - 1) & PAGE_2M_MASK)
 
 // 虚拟地址与物理地址转换
-#define virt_2_phys(addr) ((unsigned long)(addr)-KERNEL_BASE_ADDR)
-#define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + KERNEL_BASE_ADDR))
+#define virt_2_phys(addr) ((unsigned long)(addr)-PAGE_OFFSET)
+#define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + PAGE_OFFSET))
 
 #define Virt_To_2M_Page(kaddr) (memory_management_struct.pages_struct + (virt_2_phys(kaddr) >> PAGE_2M_SHIFT))
 #define Phy_to_2M_Page(kaddr) (memory_management_struct.pages_struct + ((unsigned long)(kaddr) >> PAGE_2M_SHIFT))

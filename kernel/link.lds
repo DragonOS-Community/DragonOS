@@ -41,10 +41,6 @@ SECTIONS
 		_ebss = .;
 	}
 
-	.eh_frame :
-	{
-		*(.eh_frame)
-	}
 
 	_end = .;
 }

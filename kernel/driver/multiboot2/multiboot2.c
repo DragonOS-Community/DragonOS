@@ -17,8 +17,8 @@ bool multiboot2_init(void)
     return true;
 }
 
-void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, int *),
-                     void *data, int *count)
+void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned int *),
+                     void *data, unsigned int *count)
 {
     uintptr_t addr = boot_info_addr;
     // 下一字节开始为 tag 信息
@@ -52,20 +52,21 @@ void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, int *),
  * @return true
  * @return false
  */
-bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *data, int *count)
+bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *data, unsigned int *count)
 {
     if (_iter_data->type != MULTIBOOT_TAG_TYPE_MMAP)
         return false;
 
     struct multiboot_mmap_entry_t *resource = (struct multiboot_mmap_entry_t *)data;
     struct multiboot_mmap_entry_t *mmap = ((struct multiboot_tag_mmap_t *)_iter_data)->entries;
-    *count = (uint8_t *)_iter_data + _iter_data->size;
+    *count = 0;
     for (; (uint8_t *)mmap < (uint8_t *)_iter_data + _iter_data->size;
          mmap = (struct multiboot_mmap_entry_t *)((uint8_t *)mmap + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size))
     {
         *resource = *mmap;
         // 将指针进行增加
         resource = (struct multiboot_mmap_entry_t *)((uint8_t *)resource + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size);
+        ++(*count);
     }
     return true;
 }
@@ -76,7 +77,7 @@ bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *data, int
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data 返回信息的结构体指针
  */
-bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, int *reserved)
+bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
     
     if (_iter_data->type != MULTIBOOT_TAG_TYPE_VBE)
@@ -91,7 +92,7 @@ bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, i
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data 返回信息的结构体指针
  */
-bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *data, int *reserved)
+bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
     if(_iter_data->type !=MULTIBOOT_TAG_TYPE_FRAMEBUFFER)
         return false;

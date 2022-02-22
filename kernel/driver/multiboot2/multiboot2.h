@@ -419,8 +419,8 @@ static bool multiboot2_init(void);
  * @param  _fun            迭代操作
  * @param  _data           数据
  */
-void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, int *),
-                            void *_data, int *count);
+void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned int *),
+                            void *_data, unsigned int *count);
 
 /**
  * @brief 获取multiboot2协议提供的内存区域信息
@@ -431,7 +431,7 @@ void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, int *),
  * @return true
  * @return false
  */
-bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *_data, int *count);
+bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *_data, unsigned int *count);
 
 /**
  * @brief 获取VBE信息
@@ -439,7 +439,7 @@ bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *_data, in
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data 返回信息的结构体指针
  */
-bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *_data, int *reserved);
+bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *_data, unsigned int *reserved);
 
 /**
  * @brief 获取帧缓冲区信息
@@ -447,4 +447,4 @@ bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *_data, 
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data 返回信息的结构体指针
  */
-bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *_data, int *reserved);
+bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *_data, unsigned int *reserved);

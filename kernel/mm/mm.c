@@ -1,6 +1,7 @@
 #include "mm.h"
 #include "../common/printk.h"
 #include "../common/kprint.h"
+#include "../driver/multiboot2/multiboot2.h"
 
 ul Total_Memory = 0;
 ul total_2M_pages = 0;
@@ -8,31 +9,32 @@ ul total_2M_pages = 0;
 void mm_init()
 {
     kinfo("Initializing memory management unit...");
-     // 设置内核程序不同部分的起止地址
+    // 设置内核程序不同部分的起止地址
     memory_management_struct.kernel_code_start = (ul)&_text;
     memory_management_struct.kernel_code_end = (ul)&_etext;
     memory_management_struct.kernel_data_end = (ul)&_edata;
     memory_management_struct.kernel_end = (ul)&_end;
 
-    // 实模式下获取到的信息的起始地址，转换为ARDS指针
-    struct ARDS *ards_ptr = (struct ARDS *)0xffff800000007e00;
-
-    for (int i = 0; i < 32; ++i)
+    struct multiboot_mmap_entry_t *mb2_mem_info;
+    int count;
+    multiboot2_iter(multiboot2_get_memory, mb2_mem_info, &count);
+    
+    for (int i = 0; i < count; ++i)
     {
         //可用的内存
-        if (ards_ptr->type == 1)
-            Total_Memory += ards_ptr->Length;
+        if (mb2_mem_info->type == 1)
+            Total_Memory += mb2_mem_info->len;
 
         // 保存信息到mms
-        memory_management_struct.e820[i].BaseAddr = ards_ptr->BaseAddr;
-        memory_management_struct.e820[i].Length = ards_ptr->Length;
-        memory_management_struct.e820[i].type = ards_ptr->type;
+        memory_management_struct.e820[i].BaseAddr = mb2_mem_info->addr;
+        memory_management_struct.e820[i].Length = mb2_mem_info->len;
+        memory_management_struct.e820[i].type = mb2_mem_info->type;
         memory_management_struct.len_e820 = i;
 
-        ++ards_ptr;
+        ++mb2_mem_info;
 
         // 脏数据
-        if (ards_ptr->type > 4 || ards_ptr->Length == 0 || ards_ptr->type < 1)
+        if (mb2_mem_info->type > 4 || mb2_mem_info->len == 0 || mb2_mem_info->type < 1)
             break;
     }
     printk("[ INFO ] Total amounts of RAM : %ld bytes\n", Total_Memory);
@@ -57,8 +59,6 @@ void mm_init()
     }
     kinfo("Total amounts of 2M pages : %ld.", total_2M_pages);
 
-   
-
     // 物理地址空间的最大地址（包含了物理内存、内存空洞、ROM等）
     ul max_addr = memory_management_struct.e820[memory_management_struct.len_e820].BaseAddr + memory_management_struct.e820[memory_management_struct.len_e820].Length;
     // 初始化mms的bitmap
@@ -78,7 +78,7 @@ void mm_init()
     memory_management_struct.count_pages = max_addr >> PAGE_2M_SHIFT;
     memory_management_struct.pages_struct_len = ((max_addr >> PAGE_2M_SHIFT) * sizeof(struct Page) + sizeof(long) - 1) & (~(sizeof(long) - 1));
     // 将pages_struct全部清空，以备后续初始化
-    memset(memory_management_struct.pages_struct, 0x00, memory_management_struct.pages_struct_len); //init pages memory
+    memset(memory_management_struct.pages_struct, 0x00, memory_management_struct.pages_struct_len); // init pages memory
 
     // 初始化内存区域
     memory_management_struct.zones_struct = (struct Zone *)(((ul)memory_management_struct.pages_struct + memory_management_struct.pages_struct_len + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
@@ -154,14 +154,14 @@ void mm_init()
 
     printk_color(ORANGE, BLACK, "zones_struct:%#18lx, count_zones:%#18lx, zones_struct_len:%#18lx\n", memory_management_struct.zones_struct, memory_management_struct.count_zones, memory_management_struct.zones_struct_len);
     */
-    ZONE_DMA_INDEX = 0;    //need rewrite in the future
-    ZONE_NORMAL_INDEX = 0; //need rewrite in the future
+    ZONE_DMA_INDEX = 0;    // need rewrite in the future
+    ZONE_NORMAL_INDEX = 0; // need rewrite in the future
 
-    for (int i = 0; i < memory_management_struct.count_zones; ++i) //need rewrite in the future
+    for (int i = 0; i < memory_management_struct.count_zones; ++i) // need rewrite in the future
     {
         struct Zone *z = memory_management_struct.zones_struct + i;
-        //printk_color(ORANGE, BLACK, "zone_addr_start:%#18lx, zone_addr_end:%#18lx, zone_length:%#18lx, pages_group:%#18lx, count_pages:%#18lx\n",
-        //            z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
+        // printk_color(ORANGE, BLACK, "zone_addr_start:%#18lx, zone_addr_end:%#18lx, zone_length:%#18lx, pages_group:%#18lx, count_pages:%#18lx\n",
+        //             z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
 
         // 1GB以上的内存空间不做映射
         if (z->zone_addr_start == 0x100000000)
@@ -170,8 +170,8 @@ void mm_init()
     // 设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
-    //printk_color(ORANGE, BLACK, "code_start:%#18lx, code_end:%#18lx, data_end:%#18lx, kernel_end:%#18lx, end_of_struct:%#18lx\n",
-    //             memory_management_struct.kernel_code_start, memory_management_struct.kernel_code_end, memory_management_struct.kernel_data_end, memory_management_struct.kernel_end, memory_management_struct.end_of_struct);
+    // printk_color(ORANGE, BLACK, "code_start:%#18lx, code_end:%#18lx, data_end:%#18lx, kernel_end:%#18lx, end_of_struct:%#18lx\n",
+    //              memory_management_struct.kernel_code_start, memory_management_struct.kernel_code_end, memory_management_struct.kernel_data_end, memory_management_struct.kernel_end, memory_management_struct.end_of_struct);
 
     // 初始化内存管理单元结构所占的物理页的结构体
 
@@ -190,12 +190,11 @@ void mm_init()
     printk_color(INDIGO, BLACK, "**cr3:\t%#018lx\n", *phys_2_virt(*(phys_2_virt(cr3)) & (~0xff)) & (~0xff));
     */
 
-   
     /*
     // 消除一致性页表映射，将页目录（PML4E）的前10项清空
     for (int i = 0; i < 10; ++i)
         *(phys_2_virt(global_CR3) + i) = 0UL;
-    */  
+    */
 
     flush_tlb();
 
@@ -204,12 +203,12 @@ void mm_init()
 
 /**
  * @brief 初始化内存页
- * 
+ *
  * @param page 内存页结构体
  * @param flags 标志位
  * 对于新页面： 初始化struct page
  * 对于当前页面属性/flags中含有引用属性或共享属性时，则只增加struct page和struct zone的被引用计数。否则就只是添加页表属性，并置位bmp的相应位。
- * @return unsigned long 
+ * @return unsigned long
  */
 unsigned long page_init(struct Page *page, ul flags)
 {
@@ -245,11 +244,11 @@ unsigned long page_init(struct Page *page, ul flags)
 
 /**
  * @brief 从已初始化的页结构中搜索符合申请条件的、连续num个struct page
- * 
+ *
  * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt(normal), unmapped in pgt
  * @param num 需要申请的连续内存页的数量 num<=64
  * @param flags 将页面属性设置成flag
- * @return struct Page* 
+ * @return struct Page*
  */
 struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
 {
@@ -310,7 +309,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
                         page_init(x, flags);
                     }
                     // 成功分配了页面，返回第一个页面的指针
-                    //printk("start page num=%d\n",start_page_num);
+                    // printk("start page num=%d\n",start_page_num);
                     return (struct Page *)(memory_management_struct.pages_struct + start_page_num);
                 }
             }

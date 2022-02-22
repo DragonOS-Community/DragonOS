@@ -39,6 +39,7 @@
     })
 
 // 定义类型的缩写
+typedef unsigned int uint;
 typedef unsigned long ul;
 typedef unsigned long long int ull;
 typedef long long int ll;

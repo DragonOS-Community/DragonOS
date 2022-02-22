@@ -16,7 +16,7 @@
  * @brief 初始化系统中断表
  * 
  */
-void init_sys_vector();
+void sys_vector_init();
 
 //除法错误
 void divide_error();

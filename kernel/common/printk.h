@@ -61,7 +61,7 @@ char buf[4096]; //vsprintf()的缓冲区
  * @param char_size_x 字符的列坐标
  * @param char_size_y 字符的行坐标
  */
-int init_printk(const int char_size_x, const int char_size_y);
+int printk_init(const int char_size_x, const int char_size_y);
 /**
  * @brief Set the printk pos object
  * 

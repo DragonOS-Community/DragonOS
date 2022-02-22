@@ -19,7 +19,7 @@ int calculate_max_charNum(int len, int size)
     return len / size - 1;
 }
 
-int init_printk(const int char_size_x, const int char_size_y)
+int printk_init(const int char_size_x, const int char_size_y)
 {
     struct multiboot_tag_framebuffer_info_t info;
     int reserved;

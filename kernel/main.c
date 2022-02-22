@@ -65,7 +65,7 @@ void system_initialize()
 
     // 初始化printk
 
-    init_printk(8, 16);
+    printk_init(8, 16);
 
     load_TR(10); // 加载TR寄存器
     ul tss_item_addr = 0x7c00;
@@ -74,13 +74,13 @@ void system_initialize()
               tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
 
     // 初始化中断描述符表
-    init_sys_vector();
+    sys_vector_init();
 
     //  初始化内存管理单元
     mm_init();
 
     // 初始化中断模块
-    init_irq();
+    irq_init();
 
     // 先初始化系统调用模块
     syscall_init();

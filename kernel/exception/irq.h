@@ -18,7 +18,7 @@
 /**
  * @brief 初始化中断模块
  */
-void init_irq();
+void irq_init();
 
 
 /**

@@ -2,29 +2,12 @@
 // Created by longjin on 2022/1/22.
 //
 #include "printk.h"
+#include "kprint.h"
 #include "../driver/multiboot2/multiboot2.h"
 #include "../mm/mm.h"
 //#include "linkage.h"
 
 struct screen_info pos;
-
-void show_color_band(int width, int height, char a, char b, char c, char d)
-{
-    /** 向帧缓冲区写入像素值
-     * @param address: 帧缓存区的地址
-     * @param val:像素值
-     */
-
-    for (int i = 0; i < width * height; ++i)
-    {
-
-        *((char *)pos.FB_address + 0) = d;
-        *((char *)pos.FB_address + 1) = c;
-        *((char *)pos.FB_address + 2) = b;
-        *((char *)pos.FB_address + 3) = a;
-        ++pos.FB_address;
-    }
-}
 
 int calculate_max_charNum(int len, int size)
 {
@@ -33,7 +16,7 @@ int calculate_max_charNum(int len, int size)
      * @param len 屏幕长/宽
      * @param size 字符长/宽
      */
-    return len / size;
+    return len / size - 1;
 }
 
 int init_printk(const int char_size_x, const int char_size_y)
@@ -41,20 +24,21 @@ int init_printk(const int char_size_x, const int char_size_y)
     struct multiboot_tag_framebuffer_info_t info;
     int reserved;
     multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
-    
+
     pos.width = info.framebuffer_width;
     pos.height = info.framebuffer_height;
     pos.char_size_x = char_size_x;
     pos.char_size_y = char_size_y;
     pos.max_x = calculate_max_charNum(pos.width, char_size_x);
     pos.max_y = calculate_max_charNum(pos.height, char_size_y);
-    
+
     // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
-    pos.FB_address = 0xa00000;  
-    pos.FB_length = pos.width*pos.height*4;
+    pos.FB_address = 0xa00000;
+    pos.FB_length = pos.width * pos.height;
 
     pos.x = 0;
     pos.y = 0;
+    cls();
 
     return 0;
 }
@@ -95,7 +79,12 @@ void auto_newline()
         ++pos.y;
     }
     if (pos.y > pos.max_y)
-        pos.y = 0;
+    {
+        pos.y = pos.max_y;
+        int lines_to_scroll=2;
+        scroll(true, lines_to_scroll*pos.char_size_y, false);
+        pos.y-=lines_to_scroll;
+    }
 }
 
 static int vsprintf(char *buf, const char *fmt, va_list args)
@@ -646,6 +635,7 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
         {
             pos.x = 0;
             ++pos.y;
+            auto_newline();
         }
         else if (current == '\t') // 输出制表符
         {
@@ -685,4 +675,111 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
     }
 
     return i;
+}
+
+int do_scroll(bool direction, int pixels)
+{
+    if (direction == true) // 向上滚动
+    {
+        pixels = pixels;
+        if (pixels > pos.height)
+            return EPOS_OVERFLOW;
+        // 无需滚动
+        if (pixels == 0)
+            return 0;
+        unsigned int src = pixels * pos.width;
+        unsigned int count = pos.FB_length - src;
+
+        memcpy(pos.FB_address, (pos.FB_address + src), sizeof(unsigned int)*(pos.FB_length - src));
+        memset(pos.FB_address+(pos.FB_length-src), 0, sizeof(unsigned int)*(src));
+        return 0;
+    }
+    else
+        return EUNSUPPORTED;
+    return 0;
+}
+/**
+ * @brief 滚动窗口（尚不支持向下滚动）
+ *
+ * @param direction  方向，向上滑动为true,否则为false
+ * @param pixels 要滑动的像素数量
+ * @param animation 是否包含滑动动画
+ */
+int scroll(bool direction, int pixels, bool animation)
+{
+    // 暂时不支持反方向滚动
+    if (direction == false)
+        return EUNSUPPORTED;
+    // 为了保证打印字符正确，需要对pixel按照字体高度对齐
+    int md = pixels % pos.char_size_y;
+    if (md)
+        pixels = pixels + pos.char_size_y - md;
+
+    if (animation == false)
+        return do_scroll(direction, pixels);
+    else
+    {
+        int steps;
+        if (pixels > 10)
+            steps = 5;
+        else
+            steps = pixels % 5;
+        int half_steps = steps / 2;
+
+        // 计算加速度
+        double accelerate = 0.5 * pixels / (half_steps * half_steps);
+        int current_pixels = 0;
+        double delta_x;
+
+        int trace[13] = {0};
+        int js_trace = 0;
+        // 加速阶段
+        for (int i = 1; i <= half_steps; ++i)
+        {
+            trace[js_trace] = (int)(accelerate * i + 0.5);
+            current_pixels += trace[js_trace];
+            do_scroll(direction, trace[js_trace]);
+            
+            ++js_trace;
+        }
+
+        
+        // 强制使得位置位于1/2*pixels
+        if (current_pixels < pixels / 2)
+        {
+            delta_x = pixels / 2 - current_pixels;
+            do_scroll(direction, delta_x);
+        }
+        
+        // 减速阶段，是加速阶段的重放
+        for (int i = js_trace - 1; i >= 0; --i)
+        {
+            current_pixels += trace[i];
+            do_scroll(direction, trace[i]);
+        }
+
+        if (current_pixels > pixels)
+            kerror("During scrolling: scrolled pixels over bound!");
+        
+        // 强制使得位置位于pixels
+        if (current_pixels < pixels)
+        {
+            delta_x = pixels - current_pixels;
+            do_scroll(direction, delta_x);
+        }
+    }
+   
+    return 0;
+}
+
+/**
+ * @brief 清屏
+ *
+ */
+int cls()
+{
+    memset(pos.FB_address, BLACK, pos.FB_length * sizeof(unsigned int));
+    pos.x = 0;
+    pos.y = 0;
+    return 0;
 }

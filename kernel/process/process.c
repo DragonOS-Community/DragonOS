@@ -30,7 +30,6 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
 }
 
-
 /**
  * @brief 这是一个用户态的程序
  *
@@ -39,13 +38,13 @@ void user_level_function()
 {
     kinfo("Program (user_level_function) is runing...");
     kinfo("Try to enter syscall id 15...");
-    enter_syscall(15,0,0,0,0,0,0,0,0);
+    enter_syscall(15, 0, 0, 0, 0, 0, 0, 0, 0);
+    enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
 
-    enter_syscall(SYS_PRINTF, (ul)"test_sys_printf\n", 0,0,0,0,0,0,0);
     kinfo("Return from syscall id 15...");
-    
 
-    while(1);
+    while (1)
+        ;
 }
 /**
  * @brief 使当前进程去执行新的代码
@@ -78,7 +77,7 @@ ul do_execve(struct pt_regs *regs)
 ul initial_kernel_thread(ul arg)
 {
     kinfo("initial proc running...\targ:%#018lx", arg);
-    
+
     struct pt_regs *regs;
 
     current_pcb->thread->rip = (ul)ret_from_system_call;
@@ -201,8 +200,6 @@ void process_init()
 
     initial_mm.stack_start = _stack_start;
 
-    
-
     // 初始化进程和tss
     set_TSS64(initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
@@ -265,7 +262,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     thd->rip = regs->rip;
     thd->rsp = (ul)tsk + STACK_SIZE - sizeof(struct pt_regs);
     thd->fs = KERNEL_DS;
-	thd->gs = KERNEL_DS;
+    thd->gs = KERNEL_DS;
 
     // 若进程不是内核层的进程，则跳转到ret from system call
     if (!(tsk->flags & PF_KTHREAD))

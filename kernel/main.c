@@ -13,7 +13,7 @@
 #include "syscall/syscall.h"
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
-                                                               // char fxsave_region[512] __attribute__((aligned(16)));
+                                                    // char fxsave_region[512] __attribute__((aligned(16)));
 
 struct memory_desc memory_management_struct = {{0}, 0};
 // struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
@@ -62,17 +62,17 @@ void test_mm()
 // 初始化系统各模块
 void system_initialize()
 {
-    
+
     // 初始化printk
-    
+
     init_printk(8, 16);
-    
+
     load_TR(10); // 加载TR寄存器
     ul tss_item_addr = 0x7c00;
 
     set_TSS64(_stack_start, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
               tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
-    
+
     // 初始化中断描述符表
     init_sys_vector();
 
@@ -85,6 +85,8 @@ void system_initialize()
     // 先初始化系统调用模块
     syscall_init();
 
+    
+
     // 再初始化进程模块。顺序不能调转
     process_init();
 }
@@ -94,7 +96,7 @@ void Start_Kernel(void)
 {
 
     system_initialize();
-    
+
     // show_welcome();
     // test_mm();
 

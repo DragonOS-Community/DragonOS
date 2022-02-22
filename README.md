@@ -20,15 +20,11 @@ bximage
 
 1. clone本项目
 
-2. 在根目录下创建bin文件夹
-
-3. 将boot(empty).img复制到bin/，并重命名为boot.img
-
-4. 使用sudo权限运行run_in_bochs.sh
+2. 运行命令 bash run.sh
 
 ## To do list:
 
-- [x] bootloader
+- [x] multiboot2
 
 - [x] printk
 

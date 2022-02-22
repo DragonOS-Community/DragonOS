@@ -44,6 +44,9 @@ typedef unsigned long long int ull;
 typedef long long int ll;
 
 #define ABS(x) ((x) > 0 ? (x) : -(x)) // 绝对值
+// 最大最小值
+#define max(x, y) ((x > y) ? (x) : (y))
+#define min(x, y) ((x < y) ? (x) : (y))
 
 // 四舍五入成整数
 ul round(double x)
@@ -53,14 +56,14 @@ ul round(double x)
 
 /**
  * @brief 地址按照align进行对齐
- * 
- * @param addr 
- * @param _align 
+ *
+ * @param addr
+ * @param _align
  * @return ul 对齐后的地址
  */
 ul ALIGN(const ul addr, const ul _align)
 {
-    return (ul)((addr+_align-1)&(~(_align-1)));
+    return (ul)((addr + _align - 1) & (~(_align - 1)));
 }
 
 //链表数据结构
@@ -166,7 +169,7 @@ static inline int strlen(char *s)
     return __res;
 }
 
-void *memset(void *dst, unsigned char C, ul Count)
+void *memset(void *dst, unsigned char C, ul size)
 {
 
     int d0, d1;
@@ -185,7 +188,7 @@ void *memset(void *dst, unsigned char C, ul Count)
                          "stosb	\n\t"
                          "3:	\n\t"
                          : "=&c"(d0), "=&D"(d1)
-                         : "a"(tmp), "q"(Count), "0"(Count / 8), "1"(dst)
+                         : "a"(tmp), "q"(size), "0"(size / 8), "1"(dst)
                          : "memory");
     return dst;
 }

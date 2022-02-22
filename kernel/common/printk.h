@@ -29,6 +29,7 @@
 // 异常的宏定义
 #define EPOS_OVERFLOW 1 // 坐标溢出
 #define EFB_MISMATCH 2  // 帧缓冲区与指定的屏幕大小不匹配
+#define EUNSUPPORTED 3  // 当前操作暂不被支持
 
 #include "font.h"
 #include "glib.h"
@@ -118,3 +119,18 @@ static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRco
 #define printk(...) printk_color( WHITE, BLACK, __VA_ARGS__ )
 
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char*fmt, ...);
+
+/**
+ * @brief 滚动窗口（尚不支持向下滚动)
+ * 
+ * @param direction  方向，向上滑动为true,否则为false
+ * @param pixels 要滑动的像素数量
+ * @param animation 是否包含滑动动画
+ */
+int scroll(bool direction, int pixels, bool animation);
+
+/**
+ * @brief 清屏
+ * 
+ */
+int cls();

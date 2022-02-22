@@ -20,15 +20,11 @@ bximage
 
 1. clone the project
 
-2. Create the bin folder under the project's root directory
-
-3. Copy the boot(empty).img to bin/，and, rename it to boot.img
-
-4. Run the <u>run_in_bochs.sh</u> with sudo privilege.
+2. Run the <u>run.sh</u> 
 
 ## To do list:
 
-- [x] bootloader
+- [x] multiboot2
 
 - [x] printk
 

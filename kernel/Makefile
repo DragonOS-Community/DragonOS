@@ -15,8 +15,9 @@ all: kernel
 # cp kernel ../bin/kernel/kernel.elf
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o syscall.o multiboot2.o
+kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o syscall.o multiboot2.o cpu.o
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o exception/8259A.o mm/mm.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
+	common/cpu.o	\
 	-T link.lds
 
 head.o: head.S
@@ -58,6 +59,9 @@ syscall.o: syscall/syscall.c
 
 multiboot2.o: driver/multiboot2/multiboot2.c 
 	gcc $(CFLAGS) -c driver/multiboot2/multiboot2.c  -o driver/multiboot2/multiboot2.o
+
+cpu.o: common/cpu.c 
+	gcc $(CFLAGS) -c common/cpu.c -o common/cpu.o
 
 clean: 
 	rm -rf $(GARBAGE)

@@ -85,7 +85,7 @@ void system_initialize()
     // 先初始化系统调用模块
     syscall_init();
 
-    
+    while(1);
 
     // 再初始化进程模块。顺序不能调转
     process_init();
@@ -106,8 +106,6 @@ void Start_Kernel(void)
 
 void ignore_int()
 {
-    printk("[");
-    printk_color(YELLOW, BLACK, "WARN");
-    printk("] Unknown interrupt or fault at RIP.\n");
+    kwarn("Unknown interrupt or fault at RIP.\n");
     return;
 }

@@ -705,6 +705,9 @@ int do_scroll(bool direction, int pixels)
  * @param pixels 要滑动的像素数量
  * @param animation 是否包含滑动动画
  */
+
+// @todo: 修复用户态触发键盘中断时产生#UD错误
+// @todo：采用双缓冲区，防止画面撕裂
 int scroll(bool direction, int pixels, bool animation)
 {
     // 暂时不支持反方向滚动

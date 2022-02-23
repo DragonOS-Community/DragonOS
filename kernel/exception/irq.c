@@ -1,5 +1,5 @@
 #include "irq.h"
-#include "8259A.h"
+#include "../driver/interrupt/8259A/8259A.h"
 #include "../common/asm.h"
 #include"../common/printk.h"
 #include "gate.h"
@@ -80,7 +80,7 @@ Build_IRQ(0x36)
 Build_IRQ(0x37)
 
 // 初始化中断数组
-void (*interrupt[24])(void)=
+void (*interrupt_table[24])(void)=
 {
     IRQ0x20interrupt,
     IRQ0x21interrupt,

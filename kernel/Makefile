@@ -16,8 +16,9 @@ all: kernel
 
 
 kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o syscall.o multiboot2.o cpu.o
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o exception/8259A.o mm/mm.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o	\
+	driver/interrupt/8259A/8259A.o	\
 	-T link.lds
 
 head.o: head.S
@@ -46,8 +47,7 @@ trap.o:	exception/trap.c
 irq.o: exception/irq.c
 	gcc $(CFLAGS) -c exception/irq.c -o exception/irq.o
 
-8259A.o: exception/8259A.c
-	gcc $(CFLAGS) -c exception/8259A.c -o exception/8259A.o
+
 
 mm.o: mm/mm.c
 	gcc $(CFLAGS) -c mm/mm.c -o mm/mm.o
@@ -63,5 +63,9 @@ multiboot2.o: driver/multiboot2/multiboot2.c
 cpu.o: common/cpu.c 
 	gcc $(CFLAGS) -c common/cpu.c -o common/cpu.o
 
+
+# 驱动程序
+8259A.o: driver/interrupt/8259A/8259A.c
+	gcc $(CFLAGS) -c driver/interrupt/8259A/8259A.c -o driver/interrupt/8259A/8259A.o
 clean: 
 	rm -rf $(GARBAGE)

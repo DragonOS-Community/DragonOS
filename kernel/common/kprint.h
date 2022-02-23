@@ -57,3 +57,12 @@
         printk("\n");                      \
     } while (0);
 
+#define kBUG(...)                        \
+    do                                     \
+    {                                      \
+        printk("[ ");                      \
+        printk_color(RED, BLACK, "BUG"); \
+        printk(" ] ");                     \
+        printk(__VA_ARGS__);               \
+        printk("\n");                      \
+    } while (0);

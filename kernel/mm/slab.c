@@ -221,21 +221,22 @@ void *slab_malloc(struct slab *slab_pool, ul arg)
             {
                 // 置位bmp
                 *(slab_obj_ptr->bmp + (i >> 6)) |= (1UL << tmp_md);
-                
+
                 // 更新当前slab对象的计数器
                 ++(slab_obj_ptr->count_using);
                 --(slab_obj_ptr->count_free);
                 // 更新slab内存池的计数器
                 ++(slab_pool->count_total_using);
                 --(slab_pool->count_total_free);
-                
-                if(slab_pool->constructor!=NULL)
-                {   
+
+                if (slab_pool->constructor != NULL)
+                {
                     // 返回内存对象指针（要求构造函数返回内存对象指针）
-                    return slab_pool->constructor((char* )slab_obj_ptr->vaddr +slab_pool->size*i, arg);
+                    return slab_pool->constructor((char *)slab_obj_ptr->vaddr + slab_pool->size * i, arg);
                 }
                 // 返回内存对象指针
-                else return (void*)((char*)slab_obj_ptr->vaddr+slab_pool->size*i);
+                else
+                    return (void *)((char *)slab_obj_ptr->vaddr + slab_pool->size * i);
             }
         }
 
@@ -246,12 +247,12 @@ void *slab_malloc(struct slab *slab_pool, ul arg)
     kBUG("slab_malloc() ERROR: can't malloc");
 
     // 释放内存
-    if(tmp_slab_obj!=NULL)
+    if (tmp_slab_obj != NULL)
     {
         list_del(&tmp_slab_obj->list);
         kfree(tmp_slab_obj->bmp);
         page_clean(tmp_slab_obj->page);
-        free_pages(tmp_slab_obj->page,1);
+        free_pages(tmp_slab_obj->page, 1);
         kfree(tmp_slab_obj);
     }
     return NULL;
@@ -259,15 +260,63 @@ void *slab_malloc(struct slab *slab_pool, ul arg)
 
 /**
  * @brief 回收slab内存池中的对象
- * 
+ *
  * @param slab_pool 对应的内存池
  * @param addr 内存对象的虚拟地址
  * @param arg 传递给虚构函数的参数
- * @return ul 
+ * @return ul
  */
-ul slab_free(struct slab* slab_pool, void* addr, ul arg)
+ul slab_free(struct slab *slab_pool, void *addr, ul arg)
 {
-    
+    struct slab_obj *slab_obj_ptr = slab_pool->cache_pool;
+
+    do
+    {
+        // 虚拟地址不在当前内存池对象的管理范围内
+        if (!(slab_obj_ptr->vaddr <= addr && addr <= (slab_obj_ptr->vaddr + PAGE_2M_SIZE)))
+        {
+            slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
+            continue;
+        }
+
+        // 计算出给定内存对象是第几个
+        int index = (addr - slab_obj_ptr->vaddr) / slab_pool->size;
+
+        // 复位位图中对应的位
+        *(slab_obj_ptr->bmp + (index >> 6)) ^= (1UL << index % 64);
+
+        ++(slab_obj_ptr->count_free);
+        --(slab_obj_ptr->count_using);
+
+        ++(slab_pool->count_total_free);
+        --(slab_pool->count_total_using);
+
+        // 有对应的析构函数，调用析构函数
+        if (slab_pool->destructor != NULL)
+            slab_pool->destructor((char *)slab_obj_ptr->vaddr + slab_pool->size * index, arg);
+        
+        // 当前内存对象池的正在使用的内存对象为0，且内存池的空闲对象大于当前对象池的2倍，则销毁当前对象池，以减轻系统内存压力
+        if((slab_obj_ptr->count_using==0)&&((slab_pool->count_total_free>>1)>=slab_obj_ptr->count_free))
+        {
+            // 防止删除了slab_pool的cache_pool入口
+            if(slab_pool->cache_pool==slab_obj_ptr)
+                slab_pool->cache_pool = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
+            
+            list_del(&slab_obj_ptr->list);
+            slab_pool->count_total_free -= slab_obj_ptr->count_free;
+            
+            kfree(slab_obj_ptr->bmp);
+            page_clean(slab_obj_ptr->page);
+            free_pages(slab_obj_ptr->page,1);
+            kfree(slab_obj_ptr);
+            
+        }
+
+        return 0;
+    } while (slab_obj_ptr != slab_pool->cache_pool);
+
+    kwarn("slab_free(): address not in current slab");
+    return ENOT_IN_SLAB;
 }
 
 /**

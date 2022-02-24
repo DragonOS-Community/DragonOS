@@ -10,6 +10,7 @@
 
 // SLAB存储池count_using不为空
 #define ESLAB_NOTNULL 101
+#define ENOT_IN_SLAB 102
 
 
 struct slab_obj

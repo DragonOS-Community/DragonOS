@@ -68,7 +68,7 @@ void mm_init()
     memory_management_struct.bmp_len = (((unsigned long)(max_addr >> PAGE_2M_SHIFT) + sizeof(unsigned long) * 8 - 1) / 8) & (~(sizeof(unsigned long) - 1)); // bmp由多少个unsigned long变量组成
 
     // 初始化bitmap， 先将整个bmp空间全部置位。稍后再将可用物理内存页复位。
-    memset(memory_management_struct.bmp, 0xffffffffffffffff, memory_management_struct.bmp_len);
+    memset(memory_management_struct.bmp, 0xff, memory_management_struct.bmp_len);
 
     // 初始化内存页结构
     // 将页结构映射于bmp之后

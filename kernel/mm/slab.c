@@ -348,19 +348,13 @@ ul slab_init()
         // bmp后方预留4个unsigned long的空间防止内存越界,且按照8byte进行对齐
         memory_management_struct.end_of_struct += kmalloc_cache_group[i].cache_pool->bmp_len + ((sizeof(ul) << 2) & (~sizeof(ul) - 1));
 
-        memset(kmalloc_cache_group[i].cache_pool->bmp, 0, kmalloc_cache_group[i].cache_pool->bmp_len);
+        // @todo：此处可优化，直接把所有位设置为0，然后再对部分不存在对应的内存对象的位设置为1
+        memset(kmalloc_cache_group[i].cache_pool->bmp, 0xff, kmalloc_cache_group[i].cache_pool->bmp_len);
+        for (int j = 0; j < kmalloc_cache_group[i].cache_pool->bmp_count; ++j)
+            *(kmalloc_cache_group[i].cache_pool->bmp + (j >> 6)) ^= 1UL << (j % 64);
 
         kmalloc_cache_group[i].count_total_using = 0;
         kmalloc_cache_group[i].count_total_free = kmalloc_cache_group[i].cache_pool->count_free;
-        /*
-        memset(kmalloc_cache_size[i].cache_pool->color_map,0xff,kmalloc_cache_size[i].cache_pool->color_length);
-
-        for(j = 0;j < kmalloc_cache_size[i].cache_pool->color_count;j++)
-            *(kmalloc_cache_size[i].cache_pool->color_map + (j >> 6)) ^= 1UL << j % 64;
-
-        kmalloc_cache_size[i].total_free = kmalloc_cache_size[i].cache_pool->color_count;
-        kmalloc_cache_size[i].total_using = 0;
-        */
     }
 
     struct Page *page = NULL;
@@ -388,10 +382,10 @@ ul slab_init()
     for (int i = 0; i < 16; ++i)
     {
         // 获取一个新的空页并添加到空页表，然后返回其虚拟地址
-        virt = (ul*)(PAGE_2M_ALIGN(memory_management_struct.end_of_struct+PAGE_2M_SIZE*i));
+        virt = (ul *)(PAGE_2M_ALIGN(memory_management_struct.end_of_struct + PAGE_2M_SIZE * i));
         page = Virt_To_2M_Page(virt);
 
-        page_init(page, PAGE_PGT_MAPPED|PAGE_KERNEL|PAGE_KERNEL_INIT);
+        page_init(page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
 
         kmalloc_cache_group[i].cache_pool->page = page;
         kmalloc_cache_group[i].cache_pool->vaddr = virt;
@@ -402,15 +396,186 @@ ul slab_init()
 }
 
 /**
+ * @brief 在kmalloc中创建slab_obj的函数（与slab_malloc()中的类似)
+ *
+ * @param size
+ * @return struct slab_obj* 创建好的slab_obj
+ */
+
+struct slab_obj *kmalloc_create_slab_obj(ul size)
+{
+    struct Page *page = alloc_pages(ZONE_NORMAL, 1, 0);
+
+    // BUG
+    if (page == NULL)
+    {
+        kBUG("kmalloc_create()->alloc_pages()=>page == NULL");
+        return NULL;
+    }
+
+    page_init(page, PAGE_KERNEL);
+
+    ul *vaddr = NULL;
+    ul struct_size = 0;
+    struct slab_obj *slab_obj_ptr;
+
+    // 根据size大小，选择不同的分支来处理
+    // 之所以选择512byte为分界点，是因为，此时bmp大小刚好为512byte。显而易见，选择过小的话会导致kmalloc函数与当前函数反复互相调用，最终导致栈溢出
+    switch (size)
+    {
+    // ============ 对于size<=512byte的内存池对象，将slab_obj结构体和bmp放置在物理页的内部 ========
+    // 由于这些对象的特征是，bmp占的空间大，而内存块的空间小，这样做的目的是避免再去申请一块内存来存储bmp，减少浪费。
+    case 32:
+    case 64:
+    case 128:
+    case 256:
+    case 512:
+        vaddr = phys_2_virt(page->addr_phys);
+        // slab_obj结构体的大小 （本身的大小+bmp的大小）
+        struct_size = sizeof(struct slab_obj) + PAGE_2M_SIZE / size / 8;
+        // 将slab_obj放置到物理页的末尾
+        slab_obj_ptr = (struct slab_obj *)((unsigned char *)vaddr + PAGE_2M_SIZE - struct_size);
+        slab_obj_ptr->bmp = (ul *)slab_obj_ptr + sizeof(struct slab_obj);
+
+        slab_obj_ptr->count_free = (PAGE_2M_SIZE - struct_size) / size;
+        slab_obj_ptr->count_using = 0;
+        slab_obj_ptr->bmp_count = slab_obj_ptr->count_free;
+        slab_obj_ptr->vaddr = vaddr;
+        slab_obj_ptr->page = page;
+
+        list_init(&slab_obj_ptr->list);
+
+        slab_obj_ptr->bmp_len = ((slab_obj_ptr->bmp_count + sizeof(ul) * 8 - 1) >> 6) << 3;
+
+        // @todo：此处可优化，直接把所有位设置为0，然后再对部分不存在对应的内存对象的位设置为1
+        memset(slab_obj_ptr->bmp, 0xff, slab_obj_ptr->bmp_len);
+
+        for (int i = 0; i < slab_obj_ptr->bmp_count; ++i)
+            *(slab_obj_ptr->bmp + (i >> 6)) ^= 1UL << (i % 64);
+
+        break;
+    // ================= 较大的size时，slab_obj和bmp不再放置于当前物理页内部 ============
+    // 因为在这种情况下，bmp很短，继续放置在当前物理页内部则会造成可分配的对象少，加剧了内存空间的浪费
+    case 1024: // 1KB
+    case 2048:
+    case 4096: // 4KB
+    case 8192:
+    case 16384:
+    case 32768:
+    case 65536:
+    case 131072: // 128KB
+    case 262144:
+    case 524288:
+    case 1048576: // 1MB
+        slab_obj_ptr = (struct Slab *)kmalloc(sizeof(struct slab_obj), 0);
+
+        slab_obj_ptr->count_free = PAGE_2M_SIZE / size;
+        slab_obj_ptr->count_using = 0;
+        slab_obj_ptr->bmp_count = slab_obj_ptr->count_free;
+
+        slab_obj_ptr->bmp_len = ((slab_obj_ptr->bmp_count + sizeof(ul) * 8 - 1) >> 6) << 3;
+
+        slab_obj_ptr->bmp = (ul *)kmalloc(slab_obj_ptr->bmp_len, 0);
+
+        // @todo：此处可优化，直接把所有位设置为0，然后再对部分不存在对应的内存对象的位设置为1
+        memset(slab_obj_ptr->bmp, 0xff, slab_obj_ptr->bmp_len);
+        for (int i = 0; i < slab_obj_ptr->bmp_count; ++i)
+            *(slab_obj_ptr->bmp + (i >> 6)) ^= 1UL << (i % 64);
+
+        slab_obj_ptr->vaddr = phys_2_virt(page->addr_phys);
+        slab_obj_ptr->page = page;
+        list_init(&slab_obj_ptr->list);
+        break;
+    // size 错误
+    default:
+        kerror("kamlloc_create(): Wrong size%d\n", size);
+        free_pages(page, 1);
+        return NULL;
+        break;
+    }
+
+    return slab_obj_ptr;
+}
+
+/**
  * @brief 通用内存分配函数
  *
  * @param size 要分配的内存大小
  * @param flags 内存的flag
- * @return void*
+ * @return void* 内核内存虚拟地址
  */
 void *kmalloc(unsigned long size, unsigned long flags)
 {
-    // @todo: 内存分配函数
+    if (size > 1048576)
+    {
+        kwarn("kmalloc(): Can't alloc such memory: %ld bytes, because it is too large.", size);
+        return NULL;
+    }
+    int index;
+    for (int i = 0; i < 16; ++i)
+        if (kmalloc_cache_group[i].size >= size)
+        {
+            index = i;
+            break;
+        }
+
+    struct slab_obj *slab_obj_ptr = kmalloc_cache_group[index].cache_pool;
+
+    // 内存池没有可用的内存对象，需要进行扩容
+    if (kmalloc_cache_group[index].count_total_free == 0)
+    {
+        // 创建slab_obj
+        slab_obj_ptr = kmalloc_create_slab_obj(kmalloc_cache_group[index].size);
+
+        // BUG
+        if (slab_obj_ptr == NULL)
+        {
+            kBUG("kmalloc()->kmalloc_create_slab_obj()=>slab == NULL");
+            return NULL;
+        }
+
+        kmalloc_cache_group[index].count_total_free += slab_obj_ptr->count_free;
+        list_add(&kmalloc_cache_group[index].cache_pool->list, &slab_obj_ptr->list);
+    }
+    else // 内存对象充足
+    {
+        do
+        {
+            // 跳转到下一个内存池对象
+            if (slab_obj_ptr->count_free == 0)
+                slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
+            else
+                break;
+        } while (slab_obj_ptr != kmalloc_cache_group[index].cache_pool);
+    }
+
+    // 寻找一块可用的内存对象
+    int md;
+    for (int i = 0; i < slab_obj_ptr->count_free; ++i)
+    {
+        // 当前bmp全部被使用
+        if (*slab_obj_ptr->bmp + (i >> 6) == 0xffffffffffffffffUL)
+        {
+            i += 63;
+            continue;
+        }
+        md = i % 64;
+        // 找到相应的内存对象
+        if (*(slab_obj_ptr->bmp + (i >> 6)) & (1UL << md) == 0)
+        {
+            *(slab_obj_ptr->bmp + (i >> 6)) |= (1UL << md);
+            ++(slab_obj_ptr->count_using);
+            --(slab_obj_ptr->count_free);
+
+            --kmalloc_cache_group[index].count_total_free;
+            ++kmalloc_cache_group[index].count_total_using;
+
+            return (void*)((char*)slab_obj_ptr->vaddr+kmalloc_cache_group[index].size*i);
+        }
+    }
+
+    kerror("kmalloc(): Cannot alloc more memory: %d bytes", size);
+    return NULL;
 }
 
 /**

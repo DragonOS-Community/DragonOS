@@ -103,6 +103,15 @@ void *slab_malloc(struct slab *slab_pool, ul arg);
 ul slab_free(struct slab *slab_pool, void *addr, ul arg);
 
 /**
+ * @brief 在kmalloc中创建slab_obj的函数（与slab_malloc()类似)
+ * 
+ * @param size 
+ * @return struct slab_obj* 创建好的slab_obj
+ */
+struct slab_obj * kmalloc_create_slab_obj(ul size);
+
+
+/**
  * @brief 初始化内存池组
  * 在初始化通用内存管理单元期间，尚无内存空间分配函数，需要我们手动为SLAB内存池指定存储空间
  * @return ul

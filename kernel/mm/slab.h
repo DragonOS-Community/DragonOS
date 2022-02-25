@@ -12,7 +12,6 @@
 #define ESLAB_NOTNULL 101
 #define ENOT_IN_SLAB 102
 
-
 struct slab_obj
 {
     struct List *list;
@@ -26,15 +25,15 @@ struct slab_obj
     void *vaddr;
 
     // 位图
-    ul bmp_len; // 位图的长度（字节）
-    ul bmp_count;   // 位图的有效位数
+    ul bmp_len;   // 位图的长度（字节）
+    ul bmp_count; // 位图的有效位数
     ul *bmp;
 };
 
 // slab内存池
 struct slab
 {
-    ul size;
+    ul size; // 单位：byte
     ul count_total_using;
     ul count_total_free;
     // 内存池对象
@@ -58,11 +57,11 @@ void *kmalloc(unsigned long size, unsigned long flags);
 
 /**
  * @brief 通用内存释放函数
- * 
+ *
  * @param address 要释放的内存地址
- * @return unsigned long 
+ * @return unsigned long
  */
-unsigned long kfree(void * address);
+unsigned long kfree(void *address);
 
 /**
  * @brief 创建一个内存池
@@ -79,26 +78,53 @@ struct slab *slab_create(ul size, void *(*constructor)(void *vaddr, ul arg), voi
  * @brief 销毁内存池对象
  * 只有当slab对象是空的时候才能销毁
  * @param slab_pool 要销毁的内存池对象
- * @return ul 
- * 
+ * @return ul
+ *
  */
-ul slab_destroy(struct slab * slab_pool);
+ul slab_destroy(struct slab *slab_pool);
 
 /**
  * @brief 分配SLAB内存池中的内存对象
- * 
+ *
  * @param slab_pool slab内存池
  * @param arg 传递给内存对象构造函数的参数
  * @return void* 内存空间的虚拟地址
  */
-void* slab_malloc(struct slab *slab_pool, ul arg);
+void *slab_malloc(struct slab *slab_pool, ul arg);
 
 /**
  * @brief 回收slab内存池中的对象
- * 
+ *
  * @param slab_pool 对应的内存池
  * @param addr 内存对象的虚拟地址
  * @param arg 传递给虚构函数的参数
- * @return ul 
+ * @return ul
  */
-ul slab_free(struct slab* slab_pool, void* addr, ul arg);
+ul slab_free(struct slab *slab_pool, void *addr, ul arg);
+
+/**
+ * @brief 初始化内存池组
+ * 在初始化通用内存管理单元期间，尚无内存空间分配函数，需要我们手动为SLAB内存池指定存储空间
+ * @return ul
+ */
+ul slab_init();
+
+struct slab kmalloc_cache_group[16] =
+    {
+        {32, 0, 0, NULL, NULL, NULL, NULL},
+        {64, 0, 0, NULL, NULL, NULL, NULL},
+        {128, 0, 0, NULL, NULL, NULL, NULL},
+        {256, 0, 0, NULL, NULL, NULL, NULL},
+        {512, 0, 0, NULL, NULL, NULL, NULL},
+        {1024, 0, 0, NULL, NULL, NULL, NULL}, // 1KB
+        {2048, 0, 0, NULL, NULL, NULL, NULL},
+        {4096, 0, 0, NULL, NULL, NULL, NULL}, // 4KB
+        {8192, 0, 0, NULL, NULL, NULL, NULL},
+        {16384, 0, 0, NULL, NULL, NULL, NULL},
+        {32768, 0, 0, NULL, NULL, NULL, NULL},
+        {65536, 0, 0, NULL, NULL, NULL, NULL},
+        {131072, 0, 0, NULL, NULL, NULL, NULL}, // 128KB
+        {262144, 0, 0, NULL, NULL, NULL, NULL},
+        {524288, 0, 0, NULL, NULL, NULL, NULL},
+        {1048576, 0, 0, NULL, NULL, NULL, NULL}, // 1MB
+};

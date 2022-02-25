@@ -30,7 +30,7 @@
 // 虚拟地址与物理地址转换
 #define virt_2_phys(addr) ((unsigned long)(addr)-PAGE_OFFSET)
 #define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + PAGE_OFFSET))
-
+// 获取对应的页结构体
 #define Virt_To_2M_Page(kaddr) (memory_management_struct.pages_struct + (virt_2_phys(kaddr) >> PAGE_2M_SHIFT))
 #define Phy_to_2M_Page(kaddr) (memory_management_struct.pages_struct + ((unsigned long)(kaddr) >> PAGE_2M_SHIFT))
 
@@ -219,7 +219,13 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags);
  */
 unsigned long page_clean(struct Page *page);
 
-
+/**
+ * @brief 释放连续number个内存页
+ *
+ * @param page 第一个要被释放的页面的结构体
+ * @param number 要释放的内存页数量 number<64
+ */
+void free_pages(struct Page *page, int number);
 
 /**
  * @brief 内存页表结构体

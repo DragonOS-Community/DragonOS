@@ -18,7 +18,7 @@ void mm_init()
     struct multiboot_mmap_entry_t *mb2_mem_info;
     int count;
     multiboot2_iter(multiboot2_get_memory, mb2_mem_info, &count);
-    
+
     for (int i = 0; i < count; ++i)
     {
         //可用的内存
@@ -68,7 +68,7 @@ void mm_init()
     memory_management_struct.bmp_len = (((unsigned long)(max_addr >> PAGE_2M_SHIFT) + sizeof(unsigned long) * 8 - 1) / 8) & (~(sizeof(unsigned long) - 1)); // bmp由多少个unsigned long变量组成
 
     // 初始化bitmap， 先将整个bmp空间全部置位。稍后再将可用物理内存页复位。
-    memset(memory_management_struct.bmp, 0xff, memory_management_struct.bmp_len);
+    memset(memory_management_struct.bmp, 0xffffffffffffffff, memory_management_struct.bmp_len);
 
     // 初始化内存页结构
     // 将页结构映射于bmp之后
@@ -183,18 +183,6 @@ void mm_init()
     }
 
     global_CR3 = get_CR3();
-
-    /*
-    printk_color(INDIGO, BLACK, "cr3:\t%#018lx\n", cr3);
-    printk_color(INDIGO, BLACK, "*cr3:\t%#018lx\n", *(phys_2_virt(cr3)) & (~0xff));
-    printk_color(INDIGO, BLACK, "**cr3:\t%#018lx\n", *phys_2_virt(*(phys_2_virt(cr3)) & (~0xff)) & (~0xff));
-    */
-
-    /*
-    // 消除一致性页表映射，将页目录（PML4E）的前10项清空
-    for (int i = 0; i < 10; ++i)
-        *(phys_2_virt(global_CR3) + i) = 0UL;
-    */
 
     flush_tlb();
 
@@ -347,4 +335,15 @@ unsigned long page_clean(struct Page *p)
         ++p->zone->count_pages_free;
         --p->zone->total_pages_link;
     }
+}
+
+/**
+ * @brief 释放连续number个内存页
+ *
+ * @param page 第一个要被释放的页面的结构体
+ * @param number 要释放的内存页数量 number<64
+ */
+void free_pages(struct Page *page, int number)
+{
+    // @todo: 释放连续number个内存页
 }

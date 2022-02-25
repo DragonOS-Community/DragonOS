@@ -294,22 +294,21 @@ ul slab_free(struct slab *slab_pool, void *addr, ul arg)
         // 有对应的析构函数，调用析构函数
         if (slab_pool->destructor != NULL)
             slab_pool->destructor((char *)slab_obj_ptr->vaddr + slab_pool->size * index, arg);
-        
+
         // 当前内存对象池的正在使用的内存对象为0，且内存池的空闲对象大于当前对象池的2倍，则销毁当前对象池，以减轻系统内存压力
-        if((slab_obj_ptr->count_using==0)&&((slab_pool->count_total_free>>1)>=slab_obj_ptr->count_free))
+        if ((slab_obj_ptr->count_using == 0) && ((slab_pool->count_total_free >> 1) >= slab_obj_ptr->count_free))
         {
             // 防止删除了slab_pool的cache_pool入口
-            if(slab_pool->cache_pool==slab_obj_ptr)
+            if (slab_pool->cache_pool == slab_obj_ptr)
                 slab_pool->cache_pool = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
-            
+
             list_del(&slab_obj_ptr->list);
             slab_pool->count_total_free -= slab_obj_ptr->count_free;
-            
+
             kfree(slab_obj_ptr->bmp);
             page_clean(slab_obj_ptr->page);
-            free_pages(slab_obj_ptr->page,1);
+            free_pages(slab_obj_ptr->page, 1);
             kfree(slab_obj_ptr);
-            
         }
 
         return 0;
@@ -317,6 +316,89 @@ ul slab_free(struct slab *slab_pool, void *addr, ul arg)
 
     kwarn("slab_free(): address not in current slab");
     return ENOT_IN_SLAB;
+}
+
+/**
+ * @brief 初始化内存池组
+ * 在初始化通用内存管理单元期间，尚无内存空间分配函数，需要我们手动为SLAB内存池指定存储空间
+ * @return ul
+ */
+ul slab_init()
+{
+    // 将slab的内存池空间放置在mms的后方
+    ul tmp_addr = memory_management_struct.end_of_struct;
+
+    for (int i = 0; i < 16; ++i)
+    {
+        // 将slab内存池对象的空间放置在mms的后面，并且预留4个unsigned long 的空间以防止内存越界
+        kmalloc_cache_group[i].cache_pool = (struct slab_obj *)memory_management_struct.end_of_struct;
+        memory_management_struct.end_of_struct += sizeof(struct slab_obj) + (sizeof(ul) << 2);
+
+        list_init(&(kmalloc_cache_group[i].cache_pool->list));
+
+        // 初始化内存池对象
+        kmalloc_cache_group[i].cache_pool->count_using = 0;
+        kmalloc_cache_group[i].cache_pool->count_free = PAGE_2M_SIZE / kmalloc_cache_group[i].size;
+        kmalloc_cache_group[i].cache_pool->bmp_len = (((kmalloc_cache_group[i].cache_pool->count_free + sizeof(ul) * 8 - 1) >> 6) << 3);
+        kmalloc_cache_group[i].cache_pool->bmp_count = kmalloc_cache_group[i].cache_pool->count_free;
+
+        // 在slab对象后方放置bmp
+        kmalloc_cache_group[i].cache_pool->bmp = (ul *)memory_management_struct.end_of_struct;
+
+        // bmp后方预留4个unsigned long的空间防止内存越界,且按照8byte进行对齐
+        memory_management_struct.end_of_struct += kmalloc_cache_group[i].cache_pool->bmp_len + ((sizeof(ul) << 2) & (~sizeof(ul) - 1));
+
+        memset(kmalloc_cache_group[i].cache_pool->bmp, 0, kmalloc_cache_group[i].cache_pool->bmp_len);
+
+        kmalloc_cache_group[i].count_total_using = 0;
+        kmalloc_cache_group[i].count_total_free = kmalloc_cache_group[i].cache_pool->count_free;
+        /*
+        memset(kmalloc_cache_size[i].cache_pool->color_map,0xff,kmalloc_cache_size[i].cache_pool->color_length);
+
+        for(j = 0;j < kmalloc_cache_size[i].cache_pool->color_count;j++)
+            *(kmalloc_cache_size[i].cache_pool->color_map + (j >> 6)) ^= 1UL << j % 64;
+
+        kmalloc_cache_size[i].total_free = kmalloc_cache_size[i].cache_pool->color_count;
+        kmalloc_cache_size[i].total_using = 0;
+        */
+    }
+
+    struct Page *page = NULL;
+
+    // 将上面初始化内存池组时，所占用的内存页进行初始化
+    ul tmp_page_mms_end = virt_2_phys(memory_management_struct.end_of_struct >> PAGE_2M_SHIFT);
+    for (int i = PAGE_2M_ALIGN(virt_2_phys(tmp_addr)); i < tmp_page_mms_end; ++i)
+    {
+        page = memory_management_struct.pages_struct + i;
+
+        // 下面注释掉的这部分工作貌似在page_init()里面已经做了
+        // 在mms的bmp中，置位对应的位
+        //*(memory_management_struct.bmp + ((page->addr_phys>>PAGE_2M_SHIFT)>>6)) |= 1UL<<((page->addr_phys >> PAGE_2M_SHIFT)%64);
+
+        //++(page->zone->count_pages_using);
+        //--(page->zone->count_pages_free);
+
+        page_init(page, PAGE_KERNEL_INIT | PAGE_KERNEL | PAGE_PGT_MAPPED);
+    }
+
+    printk_color(ORANGE, BLACK, "2.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+
+    // 为slab内存池对象分配内存空间
+    ul *virt = NULL;
+    for (int i = 0; i < 16; ++i)
+    {
+        // 获取一个新的空页并添加到空页表，然后返回其虚拟地址
+        virt = (ul*)(PAGE_2M_ALIGN(memory_management_struct.end_of_struct+PAGE_2M_SIZE*i));
+        page = Virt_To_2M_Page(virt);
+
+        page_init(page, PAGE_PGT_MAPPED|PAGE_KERNEL|PAGE_KERNEL_INIT);
+
+        kmalloc_cache_group[i].cache_pool->page = page;
+        kmalloc_cache_group[i].cache_pool->vaddr = virt;
+    }
+    printk_color(ORANGE, BLACK, "3.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+
+    return 0;
 }
 
 /**

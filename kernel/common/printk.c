@@ -33,7 +33,7 @@ int printk_init(const int char_size_x, const int char_size_y)
     pos.max_y = calculate_max_charNum(pos.height, char_size_y);
 
     // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
-    pos.FB_address = (unsigned int*)0xa00000;
+    pos.FB_address = (unsigned int*)0x3000000;
     pos.FB_length = pos.width * pos.height;
 
     pos.x = 0;

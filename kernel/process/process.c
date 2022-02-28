@@ -233,7 +233,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     struct process_control_block *tsk = NULL;
 
     // 获取一个物理页并在这个物理页内初始化pcb
-    struct Page *pp = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED | PAGE_ACTIVE | PAGE_KERNEL);
+    struct Page *pp = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED | PAGE_KERNEL);
 
     tsk = (struct process_control_block *)phys_2_virt(pp->addr_phys);
 

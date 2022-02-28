@@ -14,7 +14,6 @@
 #include "syscall/syscall.h"
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
-                                                    // char fxsave_region[512] __attribute__((aligned(16)));
 
 struct memory_desc memory_management_struct = {{0}, 0};
 // struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
@@ -39,26 +38,52 @@ void show_welcome()
 }
 
 // 测试内存管理单元
-/*
+
 void test_mm()
 {
     kinfo("Testing memory management unit...");
-    //printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1));
-    kinfo("Try to allocate 64 memory pages.");
-    struct Page *page = alloc_pages(ZONE_NORMAL, 64, PAGE_PGT_MAPPED | PAGE_ACTIVE | PAGE_KERNEL);
+    struct Page *page = NULL;
+    page = alloc_pages(ZONE_NORMAL, 63, 0);
+    page = alloc_pages(ZONE_NORMAL, 63, 0);
 
-    for (int i = 0; i <= 65; ++i)
+    printk_color(ORANGE, BLACK, "4.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tmemory_management_struct.bmp+2:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1), *(memory_management_struct.bmp + 2), memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+
+    for (int i = 80; i <= 85; ++i)
     {
-        printk("page%d\tattr:%#018lx\tphys_addr:%#018lx\t", i, page->attr, page->addr_phys);
-        ++page;
-        if (((i + 1) % 2) == 0)
-            printk("\n");
+        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\t", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
+        i++;
+        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\n", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
     }
 
+    for (int i = 140; i <= 145; i++)
+    {
+        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\t", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
+        i++;
+        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\n", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
+    }
 
-   printk("bmp[0]:%#018x\tbmp[1]%#018lx\n", *(memory_management_struct.bmp), *(memory_management_struct.bmp + 1));
+    free_pages(page, 1);
+
+    printk_color(ORANGE, BLACK, "5.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tmemory_management_struct.bmp+2:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1), *(memory_management_struct.bmp + 2), memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+
+    for (int i = 75; i <= 85; i++)
+    {
+        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\t", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
+        i++;
+        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\n", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
+    }
+
+    page = alloc_pages(ZONE_UNMAPPED_IN_PGT, 63, 0);
+
+    printk_color(ORANGE, BLACK, "6.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *(memory_management_struct.bmp + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), *(memory_management_struct.bmp + 1 + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_using, (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_free);
+
+    free_pages(page, 1);
+
+    printk_color(ORANGE, BLACK, "7.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *(memory_management_struct.bmp + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), *(memory_management_struct.bmp + 1 + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_using, (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_free);
+    
+    test_slab();
+    kinfo("Memory management module test completed!");
 }
-*/
 
 void test_slab()
 {
@@ -84,24 +109,22 @@ void test_slab()
     }
 
     // 测试自动扩容
-    kmalloc(kmalloc_cache_group[15].size, 0);
-    kmalloc(kmalloc_cache_group[15].size, 0);
-    kmalloc(kmalloc_cache_group[15].size, 0);
-    kmalloc(kmalloc_cache_group[15].size, 0);
-    kmalloc(kmalloc_cache_group[15].size, 0);
-    kmalloc(kmalloc_cache_group[15].size, 0);
-    kmalloc(kmalloc_cache_group[15].size, 0);
-
+    void *ptrs[7];
+    for (int i = 0; i < 7; ++i)
+        ptrs[i] = kmalloc(kmalloc_cache_group[15].size, 0);
 
     struct slab_obj *slab_obj_ptr = kmalloc_cache_group[15].cache_pool_entry;
-    int count=0;
+    int count = 0;
     do
     {
         kdebug("bmp(%d): addr=%#018lx\t value=%#018lx", count, slab_obj_ptr->bmp, *slab_obj_ptr->bmp);
-        
+
         slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
         ++count;
     } while (slab_obj_ptr != kmalloc_cache_group[15].cache_pool_entry);
+
+    for (int i = 0; i < 7; ++i)
+        kfree(ptrs[i]);
 
     kinfo("SLAB test completed!");
 }
@@ -133,9 +156,10 @@ void system_initialize()
 
     cpu_init();
 
-    test_slab();
-    // 再初始化进程模块。顺序不能调转
-    // process_init();
+    // test_slab();
+    test_mm();
+    //  再初始化进程模块。顺序不能调转
+    //  process_init();
 }
 
 //操作系统内核从这里开始执行

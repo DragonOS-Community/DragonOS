@@ -43,26 +43,26 @@
 #define ZONE_UNMAPPED_IN_PGT (1 << 2)
 
 // ===== 页面属性 =====
-// 页面在页表中已被映射
+// 页面在页表中已被映射 mapped=1 unmapped=0
 #define PAGE_PGT_MAPPED (1 << 0)
-// 内核初始化程序的页
+
+// 内核初始化程序的页 init-code=1 normal-code/data=0
 #define PAGE_KERNEL_INIT (1 << 1)
-// 引用的页
-#define PAGE_REFERENCED (1 << 2)
-// 脏页
-#define PAGE_DIRTY (1 << 3)
-// 使用中的页
-#define PAGE_ACTIVE (1 << 4)
-// 过时的页
-#define PAGE_UP_TO_DATE (1 << 5)
-// 设备对应的页
-#define PAGE_DEVICE (1 << 6)
-// 内核层页
-#define PAGE_KERNEL (1 << 7)
-// 内核共享给用户态程序的页面
-#define PAGE_K_SHARE_TO_U (1 << 8)
-// slab内存分配器的页
-#define PAGE_SLAB (1 << 9)
+
+// 1=设备寄存器映射的内存 0=物理内存
+#define PAGE_DEVICE (1 << 2)
+
+// 内核层页 kernel=1 memory=0
+#define PAGE_KERNEL (1 << 3)
+
+// 共享的页 shared=1 single-use=0
+#define PAGE_SHARED (1<<4)
+
+
+
+// ===== 错误码定义 ====
+// 物理页结构体为空
+#define EPAGE_NULL 1
 
 /**
  * @brief 刷新TLB的宏定义
@@ -169,7 +169,7 @@ extern char _end;
 
 int ZONE_DMA_INDEX = 0;
 int ZONE_NORMAL_INDEX = 0;  // low 1GB RAM ,was mapped in pagetable
-int ZONE_UNMAPED_INDEX = 0; // above 1GB RAM,unmapped in pagetable
+int ZONE_UNMAPPED_INDEX = 0; // above 1GB RAM,unmapped in pagetable
 
 ul *global_CR3 = NULL;
 
@@ -181,8 +181,8 @@ void mm_init();
  *
  * @param page 内存页结构体
  * @param flags 标志位
- * 对于新页面： 初始化struct page
- * 对于当前页面属性/flags中含有引用属性或共享属性时，则只增加struct page和struct zone的被引用计数。否则就只是添加页表属性，并置位bmp的相应位。
+ * 本函数只负责初始化内存页，允许对同一页面进行多次初始化
+ * 而维护计数器及置位bmp标志位的功能，应当在分配页面的时候手动完成
  * @return unsigned long
  */
 unsigned long page_init(struct Page *page, ul flags);
@@ -205,17 +205,17 @@ unsigned long *get_CR3()
  * @brief 从已初始化的页结构中搜索符合申请条件的、连续num个struct page
  *
  * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt(normal), unmapped in pgt
- * @param num 需要申请的内存页的数量 num<=64
+ * @param num 需要申请的内存页的数量 num<64
  * @param flags 将页面属性设置成flag
  * @return struct Page*
  */
 struct Page *alloc_pages(unsigned int zone_select, int num, ul flags);
 
 /**
- * @brief 释放内存页
- *
- * @param page 内存页结构体
- * @return unsigned long
+ * @brief 清除页面的引用计数， 计数为0时清空除页表已映射以外的所有属性
+ * 
+ * @param p 物理页结构体
+ * @return unsigned long 
  */
 unsigned long page_clean(struct Page *page);
 
@@ -226,6 +226,23 @@ unsigned long page_clean(struct Page *page);
  * @param number 要释放的内存页数量 number<64
  */
 void free_pages(struct Page *page, int number);
+
+/**
+ * @brief Get the page's attr
+ * 
+ * @param page 内存页结构体
+ * @return ul 属性
+ */
+ul get_page_attr(struct Page* page);
+
+/**
+ * @brief Set the page's attr
+ * 
+ * @param page 内存页结构体
+ * @param flags  属性
+ * @return ul 错误码
+ */
+ul set_page_attr(struct Page* page, ul flags);
 
 /**
  * @brief 内存页表结构体

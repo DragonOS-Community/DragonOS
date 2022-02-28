@@ -141,33 +141,30 @@ void mm_init()
 
     memory_management_struct.pages_struct->zone = memory_management_struct.zones_struct;
     memory_management_struct.pages_struct->addr_phys = 0UL;
-    memory_management_struct.pages_struct->attr = 0;
-    memory_management_struct.pages_struct->ref_counts = 0;
+    set_page_attr(memory_management_struct.pages_struct, PAGE_PGT_MAPPED | PAGE_KERNEL_INIT | PAGE_KERNEL);
+    memory_management_struct.pages_struct->ref_counts = 1;
     memory_management_struct.pages_struct->age = 0;
+    // 将第0页的标志位给置上
+    //*(memory_management_struct.bmp) |= 1UL;
 
     // 计算zone结构体的总长度（按照64位对齐）
     memory_management_struct.zones_struct_len = (memory_management_struct.count_zones * sizeof(struct Zone) + sizeof(ul) - 1) & (~(sizeof(ul) - 1));
 
-    /*
-    printk_color(ORANGE, BLACK, "bmp:%#18lx, bmp_len:%#18lx, bits_size:%#18lx\n", memory_management_struct.bmp, memory_management_struct.bmp_len, memory_management_struct.bits_size);
+    ZONE_DMA_INDEX = 0;
+    ZONE_NORMAL_INDEX = 0;
+    ZONE_UNMAPPED_INDEX = 0;
 
-    printk_color(ORANGE, BLACK, "pages_struct:%#18lx, count_pages:%#18lx, pages_struct_len:%#18lx\n", memory_management_struct.pages_struct, memory_management_struct.count_pages, memory_management_struct.pages_struct_len);
-
-    printk_color(ORANGE, BLACK, "zones_struct:%#18lx, count_zones:%#18lx, zones_struct_len:%#18lx\n", memory_management_struct.zones_struct, memory_management_struct.count_zones, memory_management_struct.zones_struct_len);
-    */
-    ZONE_DMA_INDEX = 0;    // need rewrite in the future
-    ZONE_NORMAL_INDEX = 0; // need rewrite in the future
-
-    for (int i = 0; i < memory_management_struct.count_zones; ++i) // need rewrite in the future
+    for (int i = 0; i < memory_management_struct.count_zones; ++i)
     {
         struct Zone *z = memory_management_struct.zones_struct + i;
         // printk_color(ORANGE, BLACK, "zone_addr_start:%#18lx, zone_addr_end:%#18lx, zone_length:%#18lx, pages_group:%#18lx, count_pages:%#18lx\n",
         //             z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
 
         // 1GB以上的内存空间不做映射
-        if (z->zone_addr_start == 0x100000000)
-            ZONE_UNMAPED_INDEX = i;
+        if (z->zone_addr_start >= 0x100000000 && (!ZONE_UNMAPPED_INDEX))
+            ZONE_UNMAPPED_INDEX = i;
     }
+    kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
     // 设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
@@ -177,15 +174,30 @@ void mm_init()
     // 初始化内存管理单元结构所占的物理页的结构体
 
     ul mms_max_page = (virt_2_phys(memory_management_struct.end_of_struct) >> PAGE_2M_SHIFT); // 内存管理单元所占据的序号最大的物理页
-    printk("mms_max_page=%ld\n", mms_max_page);
-    for (ul j = 0; j <= mms_max_page; ++j)
+    kdebug("mms_max_page=%ld", mms_max_page);
+
+    struct Page *tmp_page = NULL;
+    ul page_num;
+    // 第0个page已经在上方配置
+    for (ul j = 1; j <= mms_max_page; ++j)
     {
-        page_init(memory_management_struct.pages_struct + j, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT | PAGE_ACTIVE);
+        tmp_page = memory_management_struct.pages_struct + j;
+        page_init(tmp_page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
+        page_num = tmp_page->addr_phys >> PAGE_2M_SHIFT;
+        *(memory_management_struct.bmp + (page_num >> 6)) |= (1UL << (page_num % 64));
+        ++tmp_page->zone->count_pages_using;
+        --tmp_page->zone->count_pages_free;
     }
 
     global_CR3 = get_CR3();
 
     flush_tlb();
+
+    kdebug("global_CR3\t:%#018lx", global_CR3);
+    kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
+    kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
+
+    kdebug("1.memory_management_struct.bmp:%#018lx\tzone->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
 
     kinfo("Memory management unit initialize complete!");
 
@@ -198,12 +210,21 @@ void mm_init()
  *
  * @param page 内存页结构体
  * @param flags 标志位
- * 对于新页面： 初始化struct page
- * 对于当前页面属性/flags中含有引用属性或共享属性时，则只增加struct page和struct zone的被引用计数。否则就只是添加页表属性，并置位bmp的相应位。
+ * 本函数只负责初始化内存页，允许对同一页面进行多次初始化
+ * 而维护计数器及置位bmp标志位的功能，应当在分配页面的时候手动完成
  * @return unsigned long
  */
 unsigned long page_init(struct Page *page, ul flags)
 {
+    page->attr |= flags;
+    // 若页面的引用计数为0或是共享页，增加引用计数
+    if ((!page->ref_counts) || (page->attr & PAGE_SHARED))
+    {
+        ++page->ref_counts;
+        ++page->zone->total_pages_link;
+    }
+    return 0;
+    /*
     // 全新的页面
     if (!page->attr)
     {
@@ -231,37 +252,48 @@ unsigned long page_init(struct Page *page, ul flags)
         page->attr |= flags;
     }
     return 0;
+    */
 }
 
 /**
  * @brief 从已初始化的页结构中搜索符合申请条件的、连续num个struct page
  *
  * @param zone_select 选择内存区域, 可选项：dma, mapped in pgt(normal), unmapped in pgt
- * @param num 需要申请的连续内存页的数量 num<=64
+ * @param num 需要申请的连续内存页的数量 num<64
  * @param flags 将页面属性设置成flag
  * @return struct Page*
  */
 struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
 {
     ul zone_start = 0, zone_end = 0;
+    if (num >= 64 && num <= 0)
+    {
+        kerror("alloc_pages(): num is invalid.");
+        return NULL;
+    }
+
+    ul attr = flags;
     switch (zone_select)
     {
     case ZONE_DMA:
         // DMA区域
         zone_start = 0;
         zone_end = ZONE_DMA_INDEX;
+        attr |= PAGE_PGT_MAPPED;
         break;
     case ZONE_NORMAL:
         zone_start = ZONE_DMA_INDEX;
         zone_end = ZONE_NORMAL_INDEX;
+        attr |= PAGE_PGT_MAPPED;
         break;
     case ZONE_UNMAPPED_IN_PGT:
         zone_start = ZONE_NORMAL_INDEX;
-        zone_end = ZONE_UNMAPED_INDEX;
+        zone_end = ZONE_UNMAPPED_INDEX;
+        attr = 0;
         break;
 
     default:
-        kwarn("In alloc_pages: param: zone_select incorrect.");
+        kerror("In alloc_pages: param: zone_select incorrect.");
         // 返回空
         return NULL;
         break;
@@ -274,30 +306,36 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
 
         struct Zone *z = memory_management_struct.zones_struct + i;
 
-        // 区域对应的起止页号以及区域拥有的页面数
+        // 区域对应的起止页号
         ul page_start = (z->zone_addr_start >> PAGE_2M_SHIFT);
         ul page_end = (z->zone_addr_end >> PAGE_2M_SHIFT);
-        ul page_num = (z->zone_length >> PAGE_2M_SHIFT);
 
         ul tmp = 64 - page_start % 64;
-        for (ul j = page_start; j <= page_end; j += ((j % 64) ? tmp : 64))
+        for (ul j = page_start; j < page_end; j += ((j % 64) ? tmp : 64))
         {
             // 按照bmp中的每一个元素进行查找
             // 先将p定位到bmp的起始元素
             ul *p = memory_management_struct.bmp + (j >> 6);
 
             ul shift = j % 64;
-
-            for (ul k = shift; k < 64 - shift; ++k)
+            ul tmp_num = ((1UL << num) - 1);
+            for (ul k = shift; k < 64; ++k)
             {
                 // 寻找连续num个空页
-                if (!(((*p >> k) | (*(p + 1) << (64 - k))) & (num == 64 ? 0xffffffffffffffffUL : ((1UL << num) - 1))))
+                if (!((k ? ((*p >> k) | (*(p + 1) << (64 - k))) : *p) & tmp_num))
+
                 {
-                    ul start_page_num = j + k - shift; // 计算得到要开始获取的内存页的页号（书上的公式有问题，这个是改过之后的版本）
+                    ul start_page_num = j + k - shift; // 计算得到要开始获取的内存页的页号
                     for (ul l = 0; l < num; ++l)
                     {
                         struct Page *x = memory_management_struct.pages_struct + start_page_num + l;
-                        page_init(x, flags);
+
+                        // 分配页面，手动配置属性及计数器
+                        // 置位bmp
+                        *(memory_management_struct.bmp + ((x->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= (1UL << (x->addr_phys >> PAGE_2M_SHIFT) % 64);
+                        ++z->count_pages_using;
+                        --z->count_pages_free;
+                        x->attr = attr;
                     }
                     // 成功分配了页面，返回第一个页面的指针
                     // printk("start page num=%d\n",start_page_num);
@@ -309,44 +347,94 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
     return NULL;
 }
 
+/**
+ * @brief 清除页面的引用计数， 计数为0时清空除页表已映射以外的所有属性
+ *
+ * @param p 物理页结构体
+ * @return unsigned long
+ */
 unsigned long page_clean(struct Page *p)
 {
-    if (!p->attr)
-        p->attr = 0;
-    else if ((p->attr & PAGE_REFERENCED) || (p->attr & PAGE_K_SHARE_TO_U))
-    {
-        // 被引用的页或内核共享给用户态的页
-        --p->ref_counts;
-        --p->zone->total_pages_link;
+    --p->ref_counts;
+    --p->zone->total_pages_link;
 
-        // 当引用为0时
-        if (!p->ref_counts)
-        {
-            p->attr = 0;
-            --p->zone->count_pages_using;
-            ++p->zone->count_pages_free;
-        }
+    // 若引用计数为空，则清空除PAGE_PGT_MAPPED以外的所有属性
+    if (!p->ref_counts)
+    {
+        p->attr &= PAGE_PGT_MAPPED;
+    }
+    return 0;
+}
+
+/**
+ * @brief Get the page's attr
+ *
+ * @param page 内存页结构体
+ * @return ul 属性
+ */
+ul get_page_attr(struct Page *page)
+{
+    if (page == NULL)
+    {
+        kBUG("get_page_attr(): page == NULL");
+        return EPAGE_NULL;
+    }
+    else
+        return page->attr;
+}
+
+/**
+ * @brief Set the page's attr
+ *
+ * @param page 内存页结构体
+ * @param flags  属性
+ * @return ul 错误码
+ */
+ul set_page_attr(struct Page *page, ul flags)
+{
+    if (page == NULL)
+    {
+        kBUG("get_page_attr(): page == NULL");
+        return EPAGE_NULL;
     }
     else
     {
-        // 将bmp复位
-        *(memory_management_struct.bmp + ((p->addr_phys >> PAGE_2M_SHIFT) >> 6)) &= ~(1UL << ((p->addr_phys >> PAGE_2M_SHIFT) % 64));
-
-        p->attr = 0;
-        p->ref_counts = 0;
-        --p->zone->count_pages_using;
-        ++p->zone->count_pages_free;
-        --p->zone->total_pages_link;
+        page->attr = flags;
+        return 0;
     }
 }
-
 /**
  * @brief 释放连续number个内存页
  *
  * @param page 第一个要被释放的页面的结构体
  * @param number 要释放的内存页数量 number<64
  */
+
 void free_pages(struct Page *page, int number)
 {
-    // @todo: 释放连续number个内存页
+    if (page == NULL)
+    {
+        kerror("free_pages() page is invalid.");
+        return;
+    }
+
+    if (number >= 64 || number <= 0)
+    {
+        kerror("free_pages(): number %d is invalid.", number);
+        return;
+    }
+
+    ul page_num;
+    for (int i = 0; i < number; ++i, ++page)
+    {
+        page_num = page->addr_phys >> PAGE_2M_SHIFT;
+        // 复位bmp
+        *(memory_management_struct.bmp + (page_num >> 6)) &= ~(1UL << (page_num % 64));
+        // 更新计数器
+        --page->zone->count_pages_using;
+        ++page->zone->count_pages_free;
+        page->attr = 0;
+    }
+
+    return;
 }

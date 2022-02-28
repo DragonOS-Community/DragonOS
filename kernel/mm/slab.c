@@ -25,81 +25,81 @@ struct slab *slab_create(ul size, void *(*constructor)(void *vaddr, ul arg), voi
     slab_pool->size = SIZEOF_LONG_ALIGN(size);
     slab_pool->count_total_using = 0;
     slab_pool->count_total_free = 0;
-    // 直接分配cache_pool结构体，避免每次访问都要检测是否为NULL，提升效率
-    slab_pool->cache_pool = (struct slab_obj *)kmalloc(sizeof(struct slab_obj), 0);
+    // 直接分配cache_pool_entry结构体，避免每次访问都要检测是否为NULL，提升效率
+    slab_pool->cache_pool_entry = (struct slab_obj *)kmalloc(sizeof(struct slab_obj), 0);
 
     // BUG
-    if (slab_pool->cache_pool == NULL)
+    if (slab_pool->cache_pool_entry == NULL)
     {
-        kBUG("slab_create()->kmalloc()->slab->cache_pool == NULL");
+        kBUG("slab_create()->kmalloc()->slab->cache_pool_entry == NULL");
         kfree(slab_pool);
         return NULL;
     }
-    memset(slab_pool->cache_pool, 0, sizeof(struct slab_obj));
+    memset(slab_pool->cache_pool_entry, 0, sizeof(struct slab_obj));
 
     // dma内存池设置为空
-    slab_pool->cache_dma_pool = NULL;
+    slab_pool->cache_dma_pool_entry = NULL;
 
     // 设置构造及析构函数
     slab_pool->constructor = constructor;
     slab_pool->destructor = destructor;
 
-    list_init(&slab_pool->cache_pool->list);
+    list_init(&slab_pool->cache_pool_entry->list);
 
     // 分配属于内存池的内存页
-    slab_pool->cache_pool->page = alloc_pages(ZONE_NORMAL, 1, PAGE_KERNEL);
+    slab_pool->cache_pool_entry->page = alloc_pages(ZONE_NORMAL, 1, PAGE_KERNEL);
 
     // BUG
-    if (slab_pool->cache_pool->page == NULL)
+    if (slab_pool->cache_pool_entry->page == NULL)
     {
-        kBUG("slab_create()->kmalloc()->slab->cache_pool == NULL");
-        kfree(slab_pool->cache_pool);
+        kBUG("slab_create()->kmalloc()->slab->cache_pool_entry == NULL");
+        kfree(slab_pool->cache_pool_entry);
         kfree(slab_pool);
         return NULL;
     }
 
-    // page_init(slab_pool->cache_pool->page, PAGE_KERNEL);
+    // page_init(slab_pool->cache_pool_entry->page, PAGE_KERNEL);
 
-    slab_pool->cache_pool->count_using = 0;
-    slab_pool->cache_pool->count_free = PAGE_2M_SIZE / slab_pool->size;
+    slab_pool->cache_pool_entry->count_using = 0;
+    slab_pool->cache_pool_entry->count_free = PAGE_2M_SIZE / slab_pool->size;
 
-    slab_pool->count_total_free = slab_pool->cache_pool->count_free;
+    slab_pool->count_total_free = slab_pool->cache_pool_entry->count_free;
 
-    slab_pool->cache_pool->vaddr = phys_2_virt(slab_pool->cache_pool->page->addr_phys);
+    slab_pool->cache_pool_entry->vaddr = phys_2_virt(slab_pool->cache_pool_entry->page->addr_phys);
 
     // bitmap有多少有效位
-    slab_pool->cache_pool->bmp_count = slab_pool->cache_pool->count_free;
+    slab_pool->cache_pool_entry->bmp_count = slab_pool->cache_pool_entry->count_free;
 
     // 计算位图所占的空间 占用多少byte（按unsigned long大小的上边缘对齐）
-    slab_pool->cache_pool->bmp_len = ((slab_pool->cache_pool->bmp_count + sizeof(ul) * 8 - 1) >> 6) << 3;
+    slab_pool->cache_pool_entry->bmp_len = ((slab_pool->cache_pool_entry->bmp_count + sizeof(ul) * 8 - 1) >> 6) << 3;
     // 初始化位图
-    slab_pool->cache_pool->bmp = (ul *)kmalloc(slab_pool->cache_pool->bmp_len, 0);
+    slab_pool->cache_pool_entry->bmp = (ul *)kmalloc(slab_pool->cache_pool_entry->bmp_len, 0);
 
     // BUG
-    if (slab_pool->cache_pool->bmp == NULL)
+    if (slab_pool->cache_pool_entry->bmp == NULL)
     {
-        kBUG("slab_create()->kmalloc()->slab->cache_pool == NULL");
-        free_pages(slab_pool->cache_pool->page, 1);
-        kfree(slab_pool->cache_pool);
+        kBUG("slab_create()->kmalloc()->slab->cache_pool_entry == NULL");
+        free_pages(slab_pool->cache_pool_entry->page, 1);
+        kfree(slab_pool->cache_pool_entry);
         kfree(slab_pool);
         return NULL;
     }
     // 将位图清空
-    memset(slab_pool->cache_pool->bmp, 0, slab_pool->cache_pool->bmp_len);
+    memset(slab_pool->cache_pool_entry->bmp, 0, slab_pool->cache_pool_entry->bmp_len);
 
     return slab_pool;
 }
 
 /**
- * @brief 销毁内存池对象
- * 只有当slab对象是空的时候才能销毁
- * @param slab_pool 要销毁的内存池对象
+ * @brief 销毁内存池
+ * 只有当slab是空的时候才能销毁
+ * @param slab_pool 要销毁的内存池
  * @return ul
  *
  */
 ul slab_destroy(struct slab *slab_pool)
 {
-    struct slab_obj *slab_obj_ptr = slab_pool->cache_pool;
+    struct slab_obj *slab_obj_ptr = slab_pool->cache_pool_entry;
     if (slab_pool->count_total_using)
     {
         kBUG("slab_cache->count_total_using != 0");
@@ -129,7 +129,6 @@ ul slab_destroy(struct slab *slab_pool)
     free_pages(slab_obj_ptr->page, 1);
     kfree(slab_obj_ptr);
     kfree(slab_pool);
-
     return 0;
 }
 
@@ -142,7 +141,7 @@ ul slab_destroy(struct slab *slab_pool)
  */
 void *slab_malloc(struct slab *slab_pool, ul arg)
 {
-    struct slab_obj *slab_obj_ptr = slab_pool->cache_pool;
+    struct slab_obj *slab_obj_ptr = slab_pool->cache_pool_entry;
     struct slab_obj *tmp_slab_obj = NULL;
 
     // slab内存池中已经没有空闲的内存对象，进行扩容
@@ -189,7 +188,7 @@ void *slab_malloc(struct slab *slab_pool, ul arg)
 
         memset(tmp_slab_obj->bmp, 0, tmp_slab_obj->bmp_len);
 
-        list_add(&slab_pool->cache_pool->list, tmp_slab_obj);
+        list_add(&slab_pool->cache_pool_entry->list, tmp_slab_obj);
 
         slab_pool->count_total_free += tmp_slab_obj->count_free;
 
@@ -240,7 +239,7 @@ void *slab_malloc(struct slab *slab_pool, ul arg)
             }
         }
 
-    } while (slab_obj_ptr != slab_pool->cache_pool);
+    } while (slab_obj_ptr != slab_pool->cache_pool_entry);
 
     // should not be here
 
@@ -268,7 +267,7 @@ void *slab_malloc(struct slab *slab_pool, ul arg)
  */
 ul slab_free(struct slab *slab_pool, void *addr, ul arg)
 {
-    struct slab_obj *slab_obj_ptr = slab_pool->cache_pool;
+    struct slab_obj *slab_obj_ptr = slab_pool->cache_pool_entry;
 
     do
     {
@@ -276,43 +275,43 @@ ul slab_free(struct slab *slab_pool, void *addr, ul arg)
         if (!(slab_obj_ptr->vaddr <= addr && addr <= (slab_obj_ptr->vaddr + PAGE_2M_SIZE)))
         {
             slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
-            continue;
         }
-
-        // 计算出给定内存对象是第几个
-        int index = (addr - slab_obj_ptr->vaddr) / slab_pool->size;
-
-        // 复位位图中对应的位
-        *(slab_obj_ptr->bmp + (index >> 6)) ^= (1UL << index % 64);
-
-        ++(slab_obj_ptr->count_free);
-        --(slab_obj_ptr->count_using);
-
-        ++(slab_pool->count_total_free);
-        --(slab_pool->count_total_using);
-
-        // 有对应的析构函数，调用析构函数
-        if (slab_pool->destructor != NULL)
-            slab_pool->destructor((char *)slab_obj_ptr->vaddr + slab_pool->size * index, arg);
-
-        // 当前内存对象池的正在使用的内存对象为0，且内存池的空闲对象大于当前对象池的2倍，则销毁当前对象池，以减轻系统内存压力
-        if ((slab_obj_ptr->count_using == 0) && ((slab_pool->count_total_free >> 1) >= slab_obj_ptr->count_free))
+        else
         {
-            // 防止删除了slab_pool的cache_pool入口
-            if (slab_pool->cache_pool == slab_obj_ptr)
-                slab_pool->cache_pool = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
 
-            list_del(&slab_obj_ptr->list);
-            slab_pool->count_total_free -= slab_obj_ptr->count_free;
+            // 计算出给定内存对象是第几个
+            int index = (addr - slab_obj_ptr->vaddr) / slab_pool->size;
 
-            kfree(slab_obj_ptr->bmp);
-            page_clean(slab_obj_ptr->page);
-            free_pages(slab_obj_ptr->page, 1);
-            kfree(slab_obj_ptr);
+            // 复位位图中对应的位
+            *(slab_obj_ptr->bmp + (index >> 6)) ^= (1UL << index % 64);
+
+            ++(slab_obj_ptr->count_free);
+            --(slab_obj_ptr->count_using);
+
+            ++(slab_pool->count_total_free);
+            --(slab_pool->count_total_using);
+
+            // 有对应的析构函数，调用析构函数
+            if (slab_pool->destructor != NULL)
+                slab_pool->destructor((char *)slab_obj_ptr->vaddr + slab_pool->size * index, arg);
+
+            // 当前内存对象池的正在使用的内存对象为0，且内存池的空闲对象大于当前对象池的2倍，则销毁当前对象池，以减轻系统内存压力
+            if ((slab_obj_ptr->count_using == 0) && ((slab_pool->count_total_free >> 1) >= slab_obj_ptr->count_free) && (slab_obj_ptr != slab_pool->cache_pool_entry))
+            {
+
+                list_del(&slab_obj_ptr->list);
+                slab_pool->count_total_free -= slab_obj_ptr->count_free;
+
+                kfree(slab_obj_ptr->bmp);
+                page_clean(slab_obj_ptr->page);
+                free_pages(slab_obj_ptr->page, 1);
+
+                kfree(slab_obj_ptr);
+            }
         }
 
         return 0;
-    } while (slab_obj_ptr != slab_pool->cache_pool);
+    } while (slab_obj_ptr != slab_pool->cache_pool_entry);
 
     kwarn("slab_free(): address not in current slab");
     return ENOT_IN_SLAB;
@@ -332,30 +331,30 @@ ul slab_init()
     for (int i = 0; i < 16; ++i)
     {
         // 将slab内存池对象的空间放置在mms的后面，并且预留4个unsigned long 的空间以防止内存越界
-        kmalloc_cache_group[i].cache_pool = (struct slab_obj *)memory_management_struct.end_of_struct;
+        kmalloc_cache_group[i].cache_pool_entry = (struct slab_obj *)memory_management_struct.end_of_struct;
         memory_management_struct.end_of_struct += sizeof(struct slab_obj) + (sizeof(ul) << 2);
 
-        list_init(&kmalloc_cache_group[i].cache_pool->list);
+        list_init(&kmalloc_cache_group[i].cache_pool_entry->list);
 
         // 初始化内存池对象
-        kmalloc_cache_group[i].cache_pool->count_using = 0;
-        kmalloc_cache_group[i].cache_pool->count_free = PAGE_2M_SIZE / kmalloc_cache_group[i].size;
-        kmalloc_cache_group[i].cache_pool->bmp_len = (((kmalloc_cache_group[i].cache_pool->count_free + sizeof(ul) * 8 - 1) >> 6) << 3);
-        kmalloc_cache_group[i].cache_pool->bmp_count = kmalloc_cache_group[i].cache_pool->count_free;
+        kmalloc_cache_group[i].cache_pool_entry->count_using = 0;
+        kmalloc_cache_group[i].cache_pool_entry->count_free = PAGE_2M_SIZE / kmalloc_cache_group[i].size;
+        kmalloc_cache_group[i].cache_pool_entry->bmp_len = (((kmalloc_cache_group[i].cache_pool_entry->count_free + sizeof(ul) * 8 - 1) >> 6) << 3);
+        kmalloc_cache_group[i].cache_pool_entry->bmp_count = kmalloc_cache_group[i].cache_pool_entry->count_free;
 
         // 在slab对象后方放置bmp
-        kmalloc_cache_group[i].cache_pool->bmp = (ul *)memory_management_struct.end_of_struct;
+        kmalloc_cache_group[i].cache_pool_entry->bmp = (ul *)memory_management_struct.end_of_struct;
 
         // bmp后方预留4个unsigned long的空间防止内存越界,且按照8byte进行对齐
-        memory_management_struct.end_of_struct = (ul)(memory_management_struct.end_of_struct + kmalloc_cache_group[i].cache_pool->bmp_len + (sizeof(ul) << 2)) & (~(sizeof(ul) - 1));
+        memory_management_struct.end_of_struct = (ul)(memory_management_struct.end_of_struct + kmalloc_cache_group[i].cache_pool_entry->bmp_len + (sizeof(ul) << 2)) & (~(sizeof(ul) - 1));
 
         // @todo：此处可优化，直接把所有位设置为0，然后再对部分不存在对应的内存对象的位设置为1
-        memset(kmalloc_cache_group[i].cache_pool->bmp, 0xff, kmalloc_cache_group[i].cache_pool->bmp_len);
-        for (int j = 0; j < kmalloc_cache_group[i].cache_pool->bmp_count; ++j)
-            *(kmalloc_cache_group[i].cache_pool->bmp + (j >> 6)) ^= 1UL << (j % 64);
+        memset(kmalloc_cache_group[i].cache_pool_entry->bmp, 0xff, kmalloc_cache_group[i].cache_pool_entry->bmp_len);
+        for (int j = 0; j < kmalloc_cache_group[i].cache_pool_entry->bmp_count; ++j)
+            *(kmalloc_cache_group[i].cache_pool_entry->bmp + (j >> 6)) ^= 1UL << (j % 64);
 
         kmalloc_cache_group[i].count_total_using = 0;
-        kmalloc_cache_group[i].count_total_free = kmalloc_cache_group[i].cache_pool->count_free;
+        kmalloc_cache_group[i].count_total_free = kmalloc_cache_group[i].cache_pool_entry->count_free;
     }
 
     struct Page *page = NULL;
@@ -383,18 +382,15 @@ ul slab_init()
 
         page_init(page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
 
-
         // 这里很神奇，给page赋值之后，list_next就会改变，我找不到原因，于是就直接重新初始化这个list好了
         // @todo: 找到这个bug的原因
-        kmalloc_cache_group[i].cache_pool->page = page;
-        list_init(&kmalloc_cache_group[i].cache_pool->list);
+        kmalloc_cache_group[i].cache_pool_entry->page = page;
+        list_init(&kmalloc_cache_group[i].cache_pool_entry->list);
 
-        kmalloc_cache_group[i].cache_pool->vaddr = virt;
+        kmalloc_cache_group[i].cache_pool_entry->vaddr = virt;
     }
     printk_color(ORANGE, BLACK, "3.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
 
-
-    
     kinfo("SLAB initialized successfully!");
 
     return 0;
@@ -524,9 +520,9 @@ void *kmalloc(unsigned long size, unsigned long flags)
             break;
         }
 
-    struct slab_obj *slab_obj_ptr = kmalloc_cache_group[index].cache_pool;
-    
-    kdebug("count_total_free=%d",kmalloc_cache_group[index].count_total_free);
+    struct slab_obj *slab_obj_ptr = kmalloc_cache_group[index].cache_pool_entry;
+
+    kdebug("count_total_free=%d", kmalloc_cache_group[index].count_total_free);
 
     // 内存池没有可用的内存对象，需要进行扩容
     if (kmalloc_cache_group[index].count_total_free == 0)
@@ -542,7 +538,7 @@ void *kmalloc(unsigned long size, unsigned long flags)
         }
 
         kmalloc_cache_group[index].count_total_free += slab_obj_ptr->count_free;
-        list_add(&kmalloc_cache_group[index].cache_pool->list, &slab_obj_ptr->list);
+        list_add(&kmalloc_cache_group[index].cache_pool_entry->list, &slab_obj_ptr->list);
     }
     else // 内存对象充足
     {
@@ -553,7 +549,7 @@ void *kmalloc(unsigned long size, unsigned long flags)
                 slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
             else
                 break;
-        } while (slab_obj_ptr != kmalloc_cache_group[index].cache_pool);
+        } while (slab_obj_ptr != kmalloc_cache_group[index].cache_pool_entry);
     }
     // 寻找一块可用的内存对象
     int md;
@@ -598,12 +594,12 @@ unsigned long kfree(void *address)
 
     // 将线性地址按照2M物理页对齐, 获得所在物理页的起始线性地址
     void *page_base_addr = (void *)((ul)address & PAGE_2M_MASK);
- 
+
     int index;
 
     for (int i = 0; i < 16; ++i)
     {
-        slab_obj_ptr = kmalloc_cache_group[i].cache_pool;
+        slab_obj_ptr = kmalloc_cache_group[i].cache_pool_entry;
 
         do
         {
@@ -618,7 +614,6 @@ unsigned long kfree(void *address)
                 // 计算地址属于哪一个内存对象
                 index = (address - slab_obj_ptr->vaddr) / kmalloc_cache_group[i].size;
 
-
                 // 复位bmp
                 *(slab_obj_ptr->bmp + (index >> 6)) ^= 1UL << (index % 64);
 
@@ -629,7 +624,7 @@ unsigned long kfree(void *address)
 
                 // 回收空闲的slab_obj
                 // 条件：当前slab_obj_ptr的使用为0、总空闲内存对象>=当前slab_obj的总对象的2倍 且当前slab_pool不为起始slab_obj
-                if ((slab_obj_ptr->count_using == 0) && (kmalloc_cache_group[i].count_total_free >= ((slab_obj_ptr->bmp_count) << 1)) && (kmalloc_cache_group[i].cache_pool != slab_obj_ptr))
+                if ((slab_obj_ptr->count_using == 0) && (kmalloc_cache_group[i].count_total_free >= ((slab_obj_ptr->bmp_count) << 1)) && (kmalloc_cache_group[i].cache_pool_entry != slab_obj_ptr))
                 {
                     switch (kmalloc_cache_group[i].size)
                     {
@@ -663,7 +658,7 @@ unsigned long kfree(void *address)
                 return 0;
             }
 
-        } while (slab_obj_ptr != kmalloc_cache_group[i].cache_pool);
+        } while (slab_obj_ptr != kmalloc_cache_group[i].cache_pool_entry);
     }
     kBUG("kfree(): Can't free memory.");
     return ECANNOT_FREE_MEM;

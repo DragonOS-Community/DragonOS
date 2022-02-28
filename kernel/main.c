@@ -68,7 +68,7 @@ void test_slab()
     for (int i = 1; i < 16; ++i)
     {
         printk_color(ORANGE, BLACK, "mem_obj_size: %ldbytes\t", kmalloc_cache_group[i].size);
-        printk_color(ORANGE, BLACK, "bmp(before): %#018lx\t", *kmalloc_cache_group[i].cache_pool->bmp);
+        printk_color(ORANGE, BLACK, "bmp(before): %#018lx\t", *kmalloc_cache_group[i].cache_pool_entry->bmp);
 
         ul *tmp = kmalloc(kmalloc_cache_group[i].size, 0);
         if (tmp == NULL)
@@ -76,11 +76,11 @@ void test_slab()
             kBUG("Cannot kmalloc such a memory: %ld bytes", kmalloc_cache_group[i].size);
         }
 
-        printk_color(ORANGE, BLACK, "bmp(middle): %#018lx\t", *kmalloc_cache_group[i].cache_pool->bmp);
+        printk_color(ORANGE, BLACK, "bmp(middle): %#018lx\t", *kmalloc_cache_group[i].cache_pool_entry->bmp);
 
         kfree(tmp);
 
-        printk_color(ORANGE, BLACK, "bmp(after): %#018lx\n", *kmalloc_cache_group[i].cache_pool->bmp);
+        printk_color(ORANGE, BLACK, "bmp(after): %#018lx\n", *kmalloc_cache_group[i].cache_pool_entry->bmp);
     }
 
     // 测试自动扩容
@@ -93,7 +93,7 @@ void test_slab()
     kmalloc(kmalloc_cache_group[15].size, 0);
 
 
-    struct slab_obj *slab_obj_ptr = kmalloc_cache_group[15].cache_pool;
+    struct slab_obj *slab_obj_ptr = kmalloc_cache_group[15].cache_pool_entry;
     int count=0;
     do
     {
@@ -101,7 +101,7 @@ void test_slab()
         
         slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
         ++count;
-    } while (slab_obj_ptr != kmalloc_cache_group[15].cache_pool);
+    } while (slab_obj_ptr != kmalloc_cache_group[15].cache_pool_entry);
 
     kinfo("SLAB test completed!");
 }

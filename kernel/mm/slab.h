@@ -38,9 +38,9 @@ struct slab
     ul count_total_using;
     ul count_total_free;
     // 内存池对象
-    struct slab_obj *cache_pool;
+    struct slab_obj *cache_pool_entry;
     // dma内存池对象
-    struct slab_obj *cache_dma_pool;
+    struct slab_obj *cache_dma_pool_entry;
 
     // 内存池的构造函数和析构函数
     void *(*constructor)(void *vaddr, ul arg);

@@ -331,9 +331,9 @@ ul slab_init()
 
     for (int i = 0; i < 16; ++i)
     {
-        // 将slab内存池对象的空间放置在mms的后面，并且预留8个unsigned long 的空间以防止内存越界
+        // 将slab内存池对象的空间放置在mms的后面，并且预留4个unsigned long 的空间以防止内存越界
         kmalloc_cache_group[i].cache_pool = (struct slab_obj *)memory_management_struct.end_of_struct;
-        memory_management_struct.end_of_struct += sizeof(struct slab_obj) + (sizeof(ul) << 3);
+        memory_management_struct.end_of_struct += sizeof(struct slab_obj) + (sizeof(ul) << 2);
 
         list_init(&kmalloc_cache_group[i].cache_pool->list);
 
@@ -346,8 +346,8 @@ ul slab_init()
         // 在slab对象后方放置bmp
         kmalloc_cache_group[i].cache_pool->bmp = (ul *)memory_management_struct.end_of_struct;
 
-        // bmp后方预留8个unsigned long的空间防止内存越界,且按照8byte进行对齐
-        memory_management_struct.end_of_struct = (ul)(memory_management_struct.end_of_struct + kmalloc_cache_group[i].cache_pool->bmp_len + (sizeof(ul) << 3)) & (~(sizeof(ul) - 1));
+        // bmp后方预留4个unsigned long的空间防止内存越界,且按照8byte进行对齐
+        memory_management_struct.end_of_struct = (ul)(memory_management_struct.end_of_struct + kmalloc_cache_group[i].cache_pool->bmp_len + (sizeof(ul) << 2)) & (~(sizeof(ul) - 1));
 
         // @todo：此处可优化，直接把所有位设置为0，然后再对部分不存在对应的内存对象的位设置为1
         memset(kmalloc_cache_group[i].cache_pool->bmp, 0xff, kmalloc_cache_group[i].cache_pool->bmp_len);

@@ -10,7 +10,8 @@
 
 // SLAB存储池count_using不为空
 #define ESLAB_NOTNULL 101
-#define ENOT_IN_SLAB 102
+#define ENOT_IN_SLAB 102    // 地址不在当前slab内存池中
+#define ECANNOT_FREE_MEM 103    // 无法释放内存
 
 struct slab_obj
 {

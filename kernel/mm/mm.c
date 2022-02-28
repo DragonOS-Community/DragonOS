@@ -1,4 +1,5 @@
 #include "mm.h"
+#include "slab.h"
 #include "../common/printk.h"
 #include "../common/kprint.h"
 #include "../driver/multiboot2/multiboot2.h"
@@ -176,7 +177,7 @@ void mm_init()
     // 初始化内存管理单元结构所占的物理页的结构体
 
     ul mms_max_page = (virt_2_phys(memory_management_struct.end_of_struct) >> PAGE_2M_SHIFT); // 内存管理单元所占据的序号最大的物理页
-
+    printk("mms_max_page=%ld\n", mms_max_page);
     for (ul j = 0; j <= mms_max_page; ++j)
     {
         page_init(memory_management_struct.pages_struct + j, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT | PAGE_ACTIVE);
@@ -187,6 +188,9 @@ void mm_init()
     flush_tlb();
 
     kinfo("Memory management unit initialize complete!");
+
+    // 初始化slab内存池
+    slab_init();
 }
 
 /**
@@ -204,7 +208,6 @@ unsigned long page_init(struct Page *page, ul flags)
     if (!page->attr)
     {
         // 将bmp对应的标志位置位
-
         *(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= 1UL << (page->addr_phys >> PAGE_2M_SHIFT) % 64;
         page->attr = flags;
         ++(page->ref_counts);

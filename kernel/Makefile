@@ -15,8 +15,8 @@ all: kernel
 # cp kernel ../bin/kernel/kernel.elf
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o irq.o 8259A.o process.o syscall.o multiboot2.o cpu.o
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o 8259A.o process.o syscall.o multiboot2.o cpu.o
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o	\
 	driver/interrupt/8259A/8259A.o	\
 	-T link.lds
@@ -51,6 +51,9 @@ irq.o: exception/irq.c
 
 mm.o: mm/mm.c
 	gcc $(CFLAGS) -c mm/mm.c -o mm/mm.o
+
+slab.o: mm/slab.c
+	gcc $(CFLAGS) -c mm/slab.c -o mm/slab.o
 
 process.o: process/process.c
 	gcc $(CFLAGS) -c process/process.c -o process/process.o

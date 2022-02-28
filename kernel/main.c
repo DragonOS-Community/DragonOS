@@ -9,6 +9,7 @@
 #include "exception/trap.h"
 #include "exception/irq.h"
 #include "mm/mm.h"
+#include "mm/slab.h"
 #include "process/process.h"
 #include "syscall/syscall.h"
 
@@ -59,6 +60,51 @@ void test_mm()
 }
 */
 
+void test_slab()
+{
+    kinfo("Testing SLAB...");
+    kinfo("Testing kmalloc()...");
+
+    for (int i = 1; i < 16; ++i)
+    {
+        printk_color(ORANGE, BLACK, "mem_obj_size: %ldbytes\t", kmalloc_cache_group[i].size);
+        printk_color(ORANGE, BLACK, "bmp(before): %#018lx\t", *kmalloc_cache_group[i].cache_pool->bmp);
+
+        ul *tmp = kmalloc(kmalloc_cache_group[i].size, 0);
+        if (tmp == NULL)
+        {
+            kBUG("Cannot kmalloc such a memory: %ld bytes", kmalloc_cache_group[i].size);
+        }
+
+        printk_color(ORANGE, BLACK, "bmp(middle): %#018lx\t", *kmalloc_cache_group[i].cache_pool->bmp);
+
+        kfree(tmp);
+
+        printk_color(ORANGE, BLACK, "bmp(after): %#018lx\n", *kmalloc_cache_group[i].cache_pool->bmp);
+    }
+
+    // 测试自动扩容
+    kmalloc(kmalloc_cache_group[15].size, 0);
+    kmalloc(kmalloc_cache_group[15].size, 0);
+    kmalloc(kmalloc_cache_group[15].size, 0);
+    kmalloc(kmalloc_cache_group[15].size, 0);
+    kmalloc(kmalloc_cache_group[15].size, 0);
+    kmalloc(kmalloc_cache_group[15].size, 0);
+    kmalloc(kmalloc_cache_group[15].size, 0);
+
+
+    struct slab_obj *slab_obj_ptr = kmalloc_cache_group[15].cache_pool;
+    int count=0;
+    do
+    {
+        kdebug("bmp(%d): addr=%#018lx\t value=%#018lx", count, slab_obj_ptr->bmp, *slab_obj_ptr->bmp);
+        
+        slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
+        ++count;
+    } while (slab_obj_ptr != kmalloc_cache_group[15].cache_pool);
+
+    kinfo("SLAB test completed!");
+}
 // 初始化系统各模块
 void system_initialize()
 {
@@ -87,8 +133,9 @@ void system_initialize()
 
     cpu_init();
 
+    test_slab();
     // 再初始化进程模块。顺序不能调转
-    process_init();
+    // process_init();
 }
 
 //操作系统内核从这里开始执行

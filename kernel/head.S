@@ -489,20 +489,20 @@ ENTRY(_stack_start)
 
 // 初始化页表
 
-.align 0x1000 //设置为8byte对齐
+.align 0x1000 //设置为4k对齐
 .org 0x1000 //设置页表位置为内核执行头程序的0x1000处
 
 __PML4E:
-    .quad 0x102007 // 用户访问，可读写，已存在， 地址在31~12位
+    .quad 0x103007 // 用户访问，可读写，已存在， 地址在31~12位
     .fill	255,8,0
-	.quad 0x102007
+	.quad 0x103007
 	.fill	255,8,0
 
 .org	0x2000
 
 __PDPTE:
 
-	.quad	0x103007 // 用户访问，可读写，已存在
+	.quad	0x104007 // 用户访问，可读写，已存在
 	.fill	511,8,0
 
 .org	0x3000
@@ -543,7 +543,7 @@ __PDE:
 	.quad	0xe0a00087
 	.quad	0xe0c00087
 	.quad	0xe0e00087
-	.fill	499,8,0
+	.fill	480,8,0
 
 // GDT表
 .section .data

@@ -34,7 +34,7 @@ bximage
 
 - [x] Primary memory management unit
 
-- [ ] SLAB memory pool
+- [x] SLAB memory pool
 
 - [ ] Keyboard and mouse driver
 

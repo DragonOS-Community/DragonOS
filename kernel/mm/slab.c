@@ -188,7 +188,7 @@ void *slab_malloc(struct slab *slab_pool, ul arg)
 
         memset(tmp_slab_obj->bmp, 0, tmp_slab_obj->bmp_len);
 
-        list_add(&slab_pool->cache_pool_entry->list, tmp_slab_obj);
+        list_add(&slab_pool->cache_pool_entry->list, &tmp_slab_obj->list);
 
         slab_pool->count_total_free += tmp_slab_obj->count_free;
 
@@ -382,10 +382,8 @@ ul slab_init()
 
         page_init(page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
 
-        // 这里很神奇，给page赋值之后，list_next就会改变，我找不到原因，于是就直接重新初始化这个list好了
-        // @todo: 找到这个bug的原因
+
         kmalloc_cache_group[i].cache_pool_entry->page = page;
-        list_init(&kmalloc_cache_group[i].cache_pool_entry->list);
 
         kmalloc_cache_group[i].cache_pool_entry->vaddr = virt;
     }
@@ -468,7 +466,7 @@ struct slab_obj *kmalloc_create_slab_obj(ul size)
     case 262144:
     case 524288:
     case 1048576: // 1MB
-        slab_obj_ptr = (struct Slab *)kmalloc(sizeof(struct slab_obj), 0);
+        slab_obj_ptr = (struct slab_obj *)kmalloc(sizeof(struct slab_obj), 0);
 
         slab_obj_ptr->count_free = PAGE_2M_SIZE / size;
         slab_obj_ptr->count_using = 0;

@@ -15,7 +15,7 @@
 
 struct slab_obj
 {
-    struct List *list;
+    struct List list;
     // 当前slab对象所使用的内存页
     struct Page *page;
 

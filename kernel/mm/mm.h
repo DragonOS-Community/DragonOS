@@ -13,6 +13,7 @@
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21
 #define PAGE_1G_SHIFT 30
+#define PAGE_GDT_SHIFT	39
 
 // 不同大小的页的容量
 #define PAGE_4K_SIZE (1UL << PAGE_4K_SHIFT)
@@ -58,6 +59,55 @@
 // 共享的页 shared=1 single-use=0
 #define PAGE_SHARED (1<<4)
 
+// =========== 页表项权限 ========
+
+//	bit 63	Execution Disable:
+#define PAGE_XD		(1UL << 63)
+
+//	bit 12	Page Attribute Table
+#define	PAGE_PAT	(1UL << 12)
+
+//	bit 8	Global Page:1,global;0,part
+#define	PAGE_GLOBAL	(1UL << 8)
+
+//	bit 7	Page Size:1,big page;0,small page;
+#define	PAGE_PS		(1UL << 7)
+
+//	bit 6	Dirty:1,dirty;0,clean;
+#define	PAGE_DIRTY	(1UL << 6)
+
+//	bit 5	Accessed:1,visited;0,unvisited;
+#define	PAGE_ACCESSED	(1UL << 5)
+
+//	bit 4	Page Level Cache Disable
+#define PAGE_PCD	(1UL << 4)
+
+//	bit 3	Page Level Write Through
+#define PAGE_PWT	(1UL << 3)
+
+//	bit 2	User Supervisor:1,user and supervisor;0,supervisor;
+#define	PAGE_U_S	(1UL << 2)
+
+//	bit 1	Read Write:1,read and write;0,read;
+#define	PAGE_R_W	(1UL << 1)
+
+//	bit 0	Present:1,present;0,no present;
+#define	PAGE_PRESENT	(1UL << 0)
+
+//1,0
+#define PAGE_KERNEL_PGT		(PAGE_R_W | PAGE_PRESENT)
+
+//1,0	
+#define PAGE_KERNEL_DIR		(PAGE_R_W | PAGE_PRESENT)
+
+//7,1,0
+#define	PAGE_KERNEL_PAGE	(PAGE_PS  | PAGE_R_W | PAGE_PRESENT)
+
+//2,1,0
+#define PAGE_USER_DIR		(PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
+
+//7,2,1,0
+#define	PAGE_USER_PAGE		(PAGE_PS  | PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
 
 // ===== 错误码定义 ====
@@ -253,7 +303,12 @@ typedef struct
     unsigned long pml4t;
 } pml4t_t;
 #define mk_pml4t(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
-#define set_pml4t(mpl4tptr, mpl4tval) (*(mpl4tptr) = (mpl4tval))
+/**
+ * @brief 设置pml4页表的页表项
+ * @param pml4tptr pml4页表项的地址
+ * @param pml4val pml4页表项的值
+ */
+#define set_pml4t(pml4tptr, pml4tval) (*(pml4tptr) = (pml4tval))
 
 typedef struct
 {
@@ -275,3 +330,15 @@ typedef struct
 } pt_t;
 #define mk_pt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
 #define set_pt(ptptr, ptval) (*(ptptr) = (ptval))
+
+/**
+ * @brief 重新初始化页表的函数
+ * 将0~4GB的物理页映射到线性地址空间
+ */
+void page_table_init();
+
+/**
+ * @brief VBE帧缓存区的地址重新映射
+ * 将帧缓存区映射到地址0xffff800003000000处
+ */
+void init_frame_buffer();

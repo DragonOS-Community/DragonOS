@@ -3,7 +3,6 @@
 //
 #pragma once
 
-
 #define PAD_ZERO 1 // 0填充
 #define LEFT 2     // 靠左对齐
 #define RIGHT 4    // 靠右对齐
@@ -47,31 +46,31 @@ struct screen_info
     int char_size_x, char_size_y;
 
     unsigned int *FB_address; //帧缓冲区首地址
-    unsigned long FB_length;  // 帧缓冲区长度
-};
 
+    unsigned long FB_length; // 帧缓冲区长度
+};
 
 extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中
 
-char buf[4096]; //vsprintf()的缓冲区
+char buf[4096]; // vsprintf()的缓冲区
 
 /**
  * @brief 初始化printk的屏幕信息
- * 
+ *
  * @param char_size_x 字符的列坐标
  * @param char_size_y 字符的行坐标
  */
 int printk_init(const int char_size_x, const int char_size_y);
 /**
  * @brief Set the printk pos object
- * 
+ *
  * @param x 列坐标
  * @param y 行坐标
  */
 int set_printk_pos(const int x, const int y);
 /**
  * @brief 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
- * 
+ *
  * @param buf 结果缓冲区
  * @param fmt 格式化字符串
  * @param args 内容
@@ -81,22 +80,21 @@ static int vsprintf(char *buf, const char *fmt, va_list args);
 
 /**
  * @brief 将数字按照指定的要求转换成对应的字符串（2~36进制）
- * 
+ *
  * @param str 要返回的字符串
  * @param num 要打印的数值
  * @param base 基数
- * @param field_width 区域宽度 
+ * @param field_width 区域宽度
  * @param precision 精度
  * @param flags 标志位
  */
-static char* write_num(char *str, ull num, int base, int field_width, int precision, int flags);
-
+static char *write_num(char *str, ull num, int base, int field_width, int precision, int flags);
 
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
 
 /**
  * @brief 在屏幕上指定位置打印字符
- * 
+ *
  * @param fb 帧缓存线性地址
  * @param Xsize 行分辨率
  * @param x 左上角列像素点位置
@@ -109,20 +107,19 @@ static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRco
 
 /**
  * @brief 格式化打印字符串
- * 
+ *
  * @param FRcolor 前景色
  * @param BKcolor 背景色
  * @param ... 格式化字符串
  */
 
+#define printk(...) printk_color(WHITE, BLACK, __VA_ARGS__)
 
-#define printk(...) printk_color( WHITE, BLACK, __VA_ARGS__ )
-
-int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char*fmt, ...);
+int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...);
 
 /**
  * @brief 滚动窗口（尚不支持向下滚动)
- * 
+ *
  * @param direction  方向，向上滑动为true,否则为false
  * @param pixels 要滑动的像素数量
  * @param animation 是否包含滑动动画
@@ -131,6 +128,24 @@ int scroll(bool direction, int pixels, bool animation);
 
 /**
  * @brief 清屏
- * 
+ *
  */
 int cls();
+
+/**
+ * @brief 获取VBE帧缓存区的物理地址
+ * 
+ */
+ul get_VBE_FB_phys_addr();
+
+/**
+ * @brief 获取VBE帧缓冲区长度
+
+ */
+ul get_VBE_FB_length();
+
+/**
+ * @brief 设置pos变量中的VBE帧缓存区的线性地址
+ * @param virt_addr VBE帧缓存区线性地址
+ */
+void set_pos_VBE_FB_addr(ul virt_addr);

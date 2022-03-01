@@ -8,6 +8,7 @@
 //#include "linkage.h"
 
 struct screen_info pos;
+ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
 
 int calculate_max_charNum(int len, int size)
 {
@@ -33,7 +34,8 @@ int printk_init(const int char_size_x, const int char_size_y)
     pos.max_y = calculate_max_charNum(pos.height, char_size_y);
 
     // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
-    pos.FB_address = (unsigned int*)0x3000000;
+    VBE_FB_phys_addr = (ul *)info.framebuffer_addr;
+    pos.FB_address = (unsigned int *)0x0000000003000000;
     pos.FB_length = pos.width * pos.height;
 
     pos.x = 0;
@@ -81,9 +83,9 @@ void auto_newline()
     if (pos.y > pos.max_y)
     {
         pos.y = pos.max_y;
-        int lines_to_scroll=2;
-        scroll(true, lines_to_scroll*pos.char_size_y, false);
-        pos.y-=lines_to_scroll;
+        int lines_to_scroll = 2;
+        scroll(true, lines_to_scroll * pos.char_size_y, false);
+        pos.y -= lines_to_scroll;
     }
 }
 
@@ -690,8 +692,8 @@ int do_scroll(bool direction, int pixels)
         unsigned int src = pixels * pos.width;
         unsigned int count = pos.FB_length - src;
 
-        memcpy(pos.FB_address, (pos.FB_address + src), sizeof(unsigned int)*(pos.FB_length - src));
-        memset(pos.FB_address+(pos.FB_length-src), 0, sizeof(unsigned int)*(src));
+        memcpy(pos.FB_address, (pos.FB_address + src), sizeof(unsigned int) * (pos.FB_length - src));
+        memset(pos.FB_address + (pos.FB_length - src), 0, sizeof(unsigned int) * (src));
         return 0;
     }
     else
@@ -742,18 +744,17 @@ int scroll(bool direction, int pixels, bool animation)
             trace[js_trace] = (int)(accelerate * i + 0.5);
             current_pixels += trace[js_trace];
             do_scroll(direction, trace[js_trace]);
-            
+
             ++js_trace;
         }
 
-        
         // 强制使得位置位于1/2*pixels
         if (current_pixels < pixels / 2)
         {
             delta_x = pixels / 2 - current_pixels;
             do_scroll(direction, delta_x);
         }
-        
+
         // 减速阶段，是加速阶段的重放
         for (int i = js_trace - 1; i >= 0; --i)
         {
@@ -763,7 +764,7 @@ int scroll(bool direction, int pixels, bool animation)
 
         if (current_pixels > pixels)
             kerror("During scrolling: scrolled pixels over bound!");
-        
+
         // 强制使得位置位于pixels
         if (current_pixels < pixels)
         {
@@ -771,7 +772,7 @@ int scroll(bool direction, int pixels, bool animation)
             do_scroll(direction, delta_x);
         }
     }
-   
+
     return 0;
 }
 
@@ -785,4 +786,30 @@ int cls()
     pos.x = 0;
     pos.y = 0;
     return 0;
+}
+
+/**
+ * @brief 获取VBE帧缓存区的物理地址
+ *
+ */
+ul get_VBE_FB_phys_addr()
+{
+    return VBE_FB_phys_addr;
+}
+
+/**
+ * @brief 获取VBE帧缓冲区长度
+ */
+ul get_VBE_FB_length()
+{
+    return pos.FB_length;
+}
+
+/**
+ * @brief 设置pos变量中的VBE帧缓存区的线性地址
+ * @param virt_addr VBE帧缓存区线性地址
+ */
+void set_pos_VBE_FB_addr(ul virt_addr)
+{
+    pos.FB_address = virt_addr;
 }

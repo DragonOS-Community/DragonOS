@@ -17,7 +17,7 @@ unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
 struct memory_desc memory_management_struct = {{0}, 0};
 // struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
-
+void test_slab();
 void show_welcome()
 {
     /**
@@ -157,9 +157,9 @@ void system_initialize()
     cpu_init();
 
     // test_slab();
-    test_mm();
+    //test_mm();
     //  再初始化进程模块。顺序不能调转
-    //  process_init();
+    //process_init();
 }
 
 //操作系统内核从这里开始执行

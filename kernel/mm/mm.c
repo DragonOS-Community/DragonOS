@@ -191,8 +191,6 @@ void mm_init()
 
     global_CR3 = get_CR3();
 
-    flush_tlb();
-
     kdebug("global_CR3\t:%#018lx", global_CR3);
     kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
     kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
@@ -201,8 +199,18 @@ void mm_init()
 
     kinfo("Memory management unit initialize complete!");
 
+    /*
+    kinfo("Cleaning page table remapping at 0x0000");
+    for (int i = 0; i < 10; ++i)
+        *(phys_2_virt(global_CR3) + i) = 0UL;
+    kinfo("Successfully cleaned page table remapping!\n");
+    */
+
+    flush_tlb();
     // 初始化slab内存池
     slab_init();
+    init_frame_buffer();
+    page_table_init();
 }
 
 /**
@@ -224,35 +232,6 @@ unsigned long page_init(struct Page *page, ul flags)
         ++page->zone->total_pages_link;
     }
     return 0;
-    /*
-    // 全新的页面
-    if (!page->attr)
-    {
-        // 将bmp对应的标志位置位
-        *(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= 1UL << (page->addr_phys >> PAGE_2M_SHIFT) % 64;
-        page->attr = flags;
-        ++(page->ref_counts);
-        ++(page->zone->count_pages_using);
-        --(page->zone->count_pages_free);
-        ++(page->zone->total_pages_link);
-    }
-    // 不是全新的页面，而是含有引用属性/共享属性
-    else if ((page->attr & PAGE_REFERENCED) || (page->attr & PAGE_K_SHARE_TO_U) || (flags & PAGE_REFERENCED) || (flags & PAGE_K_SHARE_TO_U))
-    {
-        page->attr |= flags;
-        ++(page->ref_counts);
-        ++(page->zone->total_pages_link);
-    }
-    else
-    {
-        // 将bmp对应的标志位置位
-        //*(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= (1UL << ((page->addr_phys >> PAGE_2M_SHIFT) % 64));
-        *(memory_management_struct.bmp + ((page->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= 1UL << (page->addr_phys >> PAGE_2M_SHIFT) % 64;
-
-        page->attr |= flags;
-    }
-    return 0;
-    */
 }
 
 /**
@@ -437,4 +416,114 @@ void free_pages(struct Page *page, int number)
     }
 
     return;
+}
+
+/**
+ * @brief 重新初始化页表的函数
+ * 将0~4GB的物理页映射到线性地址空间
+ */
+void page_table_init()
+{
+    kinfo("Initializing page table...");
+    global_CR3 = get_CR3();
+    // 由于CR3寄存器的[11..0]位是PCID标志位，因此将低12位置0后，就是PML4页表的基地址
+    ul *pml4_addr = (ul *)((ul)phys_2_virt((ul)global_CR3 & (~0xfffUL)));
+    kdebug("PML4 addr=%#018lx *pml4=%#018lx", pml4_addr, *pml4_addr);
+
+    ul *pdpt_addr = phys_2_virt(*pml4_addr & (~0xfffUL));
+    kdebug("pdpt addr=%#018lx *pdpt=%#018lx", pdpt_addr, *pdpt_addr);
+
+    ul *pd_addr = phys_2_virt(*pdpt_addr & (~0xfffUL));
+    kdebug("pd addr=%#018lx *pd=%#018lx", pd_addr, *pd_addr);
+
+    ul *tmp_addr;
+    for (int i = 0; i < memory_management_struct.count_zones; ++i)
+    {
+        struct Zone *z = memory_management_struct.zones_struct + i;
+        struct Page *p = z->pages_group;
+
+        if (i == ZONE_UNMAPPED_INDEX)
+            break;
+
+        for (int j = 0; j < z->count_pages; ++j)
+        {
+            // 计算出PML4页表中的页表项的地址
+            tmp_addr = (ul *)((ul)pml4_addr + ((((ul)phys_2_virt(p->addr_phys)) >> PAGE_GDT_SHIFT) & 0x1ff) * 8);
+
+            // 说明该页还没有分配pdpt页表，使用kmalloc分配一个
+            if (*tmp_addr = 0)
+            {
+                ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+                set_pml4t(tmp_addr, mk_pml4t(virt_2_phys(virt_addr), PAGE_KERNEL_PGT));
+            }
+
+            // 计算出pdpt页表的页表项的地址
+            tmp_addr = (ul *)((ul)(phys_2_virt(*tmp_addr & (~0xfffUL))) + ((((ul)phys_2_virt(p->addr_phys)) >> PAGE_1G_SHIFT) & 0x1ff) * 8);
+
+            // 说明该页还没有分配pd页表，使用kmalloc分配一个
+            if (*tmp_addr = 0)
+            {
+                ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+                set_pdpt(tmp_addr, mk_pdpt(virt_2_phys(virt_addr), PAGE_KERNEL_DIR));
+            }
+
+            // 计算出pd页表的页表项的地址
+            tmp_addr = (ul *)((ul)(phys_2_virt(*tmp_addr & (~0xfffUL))) + ((((ul)phys_2_virt(p->addr_phys)) >> PAGE_2M_SHIFT) & 0x1ff) * 8);
+
+            // 填入pd页表的页表项，映射2MB物理页
+            set_pdt(tmp_addr, mk_pdt(virt_2_phys(p->addr_phys), PAGE_KERNEL_PAGE));
+
+            // 测试
+            if (j % 50 == 0)
+                kdebug("pd_addr=%#018lx, *pd_addr=%#018lx", tmp_addr, *tmp_addr);
+        }
+    }
+
+    flush_tlb();
+
+    kinfo("Page table Initialized.");
+}
+
+/**
+ * @brief VBE帧缓存区的地址重新映射
+ * 将帧缓存区映射到地址0xffff800003000000处
+ */
+void init_frame_buffer()
+{
+    kinfo("Re-mapping VBE frame buffer...");
+    global_CR3 = get_CR3();
+    ul fb_virt_addr = 0xffff800003000000;
+    ul fb_phys_addr = get_VBE_FB_phys_addr();
+
+    // 计算帧缓冲区的线性地址对应的pml4页表项的地址
+    ul *tmp = phys_2_virt((ul *)((ul)global_CR3 & (~0xfffUL)) + ((fb_virt_addr >> PAGE_GDT_SHIFT) & 0x1ff));
+    if (*tmp == 0)
+    {
+        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), PAGE_KERNEL_PGT));
+    }
+
+    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((fb_virt_addr >> PAGE_1G_SHIFT) & 0x1ff));
+
+    if (*tmp == 0)
+    {
+        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), PAGE_KERNEL_DIR));
+    }
+
+    ul vbe_fb_length = get_VBE_FB_length();
+    ul *tmp1;
+    // 初始化2M物理页
+    for (ul i = 0; i < vbe_fb_length; i += PAGE_2M_SIZE)
+    {
+        // 计算当前2M物理页对应的pdt的页表项的物理地址
+        tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));
+
+        // 页面写穿，禁止缓存
+        set_pdt(tmp1, mk_pdt((ul)fb_phys_addr+i, PAGE_KERNEL_PAGE| PAGE_PWT| PAGE_PCD));
+    }
+
+    set_pos_VBE_FB_addr(fb_virt_addr);
+    flush_tlb();
+    kinfo("VBE frame buffer successfully Re-mapped!");
 }

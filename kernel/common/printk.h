@@ -47,7 +47,7 @@ struct screen_info
 
     uint *FB_address; //帧缓冲区首地址
 
-    unsigned long FB_length; // 帧缓冲区长度
+    unsigned long FB_length; // 帧缓冲区长度（乘以4才是字节数）
 };
 
 extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中

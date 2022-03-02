@@ -54,7 +54,7 @@ bximage
 
 - [x] First system call function
 
-- [ ] Start dragonos on the physical platform
+- [x] Start dragonos on the physical platform (There is a bug which can make the computer automatically reboot on AMD processor)
 
 - [ ] Multi core boot
 

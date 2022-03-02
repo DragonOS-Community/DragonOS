@@ -35,12 +35,41 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
     VBE_FB_phys_addr = (ul *)info.framebuffer_addr;
-    pos.FB_address = (unsigned int *)0x0000000003000000;
-    pos.FB_length = pos.width * pos.height;
+    pos.FB_address = (uint *)0x0000000003000000;
+    pos.FB_length = pos.width * pos.height*2;
+
+    // ======== 临时的将物理地址填写到0x0000000003000000处 之后会在mm内将帧缓存区重新映射=====
+
+    global_CR3 = get_CR3();
+    ul fb_virt_addr = pos.FB_address;
+    ul fb_phys_addr = VBE_FB_phys_addr;
+
+    // 计算帧缓冲区的线性地址对应的pml4页表项的地址
+    ul *tmp = phys_2_virt((ul *)((ul)global_CR3 & (~0xfffUL)) + ((fb_virt_addr >> PAGE_GDT_SHIFT) & 0x1ff));
+
+    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((fb_virt_addr >> PAGE_1G_SHIFT) & 0x1ff));
+
+    ul *tmp1;
+    // 初始化2M物理页
+    for (ul i = 0; i < (PAGE_2M_SIZE<<3); i += PAGE_2M_SIZE)
+    {
+        // 计算当前2M物理页对应的pdt的页表项的物理地址
+        tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));
+
+        // 页面写穿，禁止缓存
+        set_pdt(tmp1, mk_pdt((ul)fb_phys_addr + i, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD));
+    }
+
+    flush_tlb();
 
     pos.x = 0;
     pos.y = 0;
+
     cls();
+
+    kdebug("width=%d\theight=%d", pos.width, pos.height);
+
+    while(1)
 
     return 0;
 }
@@ -571,7 +600,7 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
     return str;
 }
 
-static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font)
+static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font)
 {
     /**
      * @brief 在屏幕上指定位置打印字符
@@ -809,7 +838,12 @@ ul get_VBE_FB_length()
  * @brief 设置pos变量中的VBE帧缓存区的线性地址
  * @param virt_addr VBE帧缓存区线性地址
  */
-void set_pos_VBE_FB_addr(ul virt_addr)
+void set_pos_VBE_FB_addr(uint *virt_addr)
 {
-    pos.FB_address = virt_addr;
+    pos.FB_address = (uint *)virt_addr;
+}
+
+uint* get_pos_VBE_FB_addr()
+{
+    return pos.FB_address;
 }

@@ -533,6 +533,10 @@ __PDE:
 	.quad	0x2a00083
 	.quad	0x2c00083
 	.quad	0x2e00083
+	.quad	0x3000083
+	.quad	0x3200083
+	.quad	0x3400083
+	.quad	0x3600083
 
 
 	.quad	0xe0000083		/*虚拟地址0x 3000000 初始情况下，帧缓冲区映射到这里*/ 
@@ -543,7 +547,15 @@ __PDE:
 	.quad	0xe0a00083
 	.quad	0xe0c00083
 	.quad	0xe0e00083
-	.fill	480,8,0
+    .quad	0xe1000083
+    .quad	0xe1200083
+    .quad	0xe1400083
+    .quad	0xe1600083
+    .quad	0xe1800083
+    .quad	0xe1a00083
+    .quad	0xe1c00083
+    .quad	0xe1e00083
+	.fill	468,8,0
 
 // GDT表
 .section .data

@@ -12,7 +12,7 @@ if [ ! "$1" == "--nobuild" ]; then
     make clean
 fi
 
-IA32_USE_QEMU=0
+IA32_USE_QEMU=1
 bochsrc="./bochsrc"
 ARCH="x86_64"
 
@@ -92,7 +92,7 @@ if [ $flag_can_run -eq 1 ]; then
   if [ ${IA32_USE_QEMU} == 0 ]; then
         bochs -q -f ${bochsrc} -rc ./tools/bochsinit
     else
-        qemu-system-x86_64 -cdrom ${iso} -m 128M \
+        qemu-system-x86_64 -cdrom ${iso} -m 512M \
         -monitor telnet::2333,server,nowait -serial stdio -s
     fi
 else

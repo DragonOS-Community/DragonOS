@@ -45,7 +45,7 @@ struct screen_info
 
     int char_size_x, char_size_y;
 
-    unsigned int *FB_address; //帧缓冲区首地址
+    uint *FB_address; //帧缓冲区首地址
 
     unsigned long FB_length; // 帧缓冲区长度
 };
@@ -103,7 +103,7 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
  * @param BKcolor 背景颜色
  * @param font 字符的bitmap
  */
-static void putchar(unsigned int *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font);
+static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font);
 
 /**
  * @brief 格式化打印字符串
@@ -134,7 +134,7 @@ int cls();
 
 /**
  * @brief 获取VBE帧缓存区的物理地址
- * 
+ *
  */
 ul get_VBE_FB_phys_addr();
 
@@ -148,4 +148,6 @@ ul get_VBE_FB_length();
  * @brief 设置pos变量中的VBE帧缓存区的线性地址
  * @param virt_addr VBE帧缓存区线性地址
  */
-void set_pos_VBE_FB_addr(ul virt_addr);
+void set_pos_VBE_FB_addr(uint* virt_addr);
+
+uint* get_pos_VBE_FB_addr();

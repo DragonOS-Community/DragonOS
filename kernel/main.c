@@ -80,7 +80,7 @@ void test_mm()
     free_pages(page, 1);
 
     printk_color(ORANGE, BLACK, "7.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *(memory_management_struct.bmp + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), *(memory_management_struct.bmp + 1 + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_using, (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_free);
-    
+
     test_slab();
     kinfo("Memory management module test completed!");
 }
@@ -133,8 +133,9 @@ void system_initialize()
 {
 
     // 初始化printk
-
     printk_init(8, 16);
+
+    kinfo("Kernel Starting...");
 
     load_TR(10); // 加载TR寄存器
     ul tss_item_addr = 0x7c00;
@@ -157,9 +158,9 @@ void system_initialize()
     cpu_init();
 
     // test_slab();
-    //test_mm();
+    // test_mm();
     //  再初始化进程模块。顺序不能调转
-    //process_init();
+    // process_init();
 }
 
 //操作系统内核从这里开始执行

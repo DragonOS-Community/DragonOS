@@ -332,6 +332,7 @@ ul slab_init()
     {
         // 将slab内存池对象的空间放置在mms的后面，并且预留4个unsigned long 的空间以防止内存越界
         kmalloc_cache_group[i].cache_pool_entry = (struct slab_obj *)memory_management_struct.end_of_struct;
+
         memory_management_struct.end_of_struct += sizeof(struct slab_obj) + (sizeof(ul) << 2);
 
         list_init(&kmalloc_cache_group[i].cache_pool_entry->list);
@@ -362,14 +363,18 @@ ul slab_init()
     // 将上面初始化内存池组时，所占用的内存页进行初始化
     ul tmp_page_mms_end = virt_2_phys(memory_management_struct.end_of_struct) >> PAGE_2M_SHIFT;
 
+    ul page_num = 0;
     for (int i = PAGE_2M_ALIGN(virt_2_phys(tmp_addr)) >> PAGE_2M_SHIFT; i <= tmp_page_mms_end; ++i)
     {
         page = memory_management_struct.pages_struct + i;
-
+        page_num = page->addr_phys >> PAGE_2M_SHIFT;
+        *(memory_management_struct.bmp + (page_num >> 6)) |= (1UL << (page_num % 64));
+        ++page->zone->count_pages_using;
+        --page->zone->count_pages_free;
         page_init(page, PAGE_KERNEL_INIT | PAGE_KERNEL | PAGE_PGT_MAPPED);
     }
 
-    printk_color(ORANGE, BLACK, "2.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+    kdebug("2.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
 
     // 为slab内存池对象分配内存空间
     ul *virt = NULL;
@@ -380,14 +385,17 @@ ul slab_init()
 
         page = Virt_To_2M_Page(virt);
 
+        page_num = page->addr_phys >> PAGE_2M_SHIFT;
+        *(memory_management_struct.bmp + (page_num >> 6)) |= (1UL << (page_num % 64));
+        ++page->zone->count_pages_using;
+        --page->zone->count_pages_free;
         page_init(page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
-
 
         kmalloc_cache_group[i].cache_pool_entry->page = page;
 
         kmalloc_cache_group[i].cache_pool_entry->vaddr = virt;
     }
-    printk_color(ORANGE, BLACK, "3.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+    kdebug("3.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
 
     kinfo("SLAB initialized successfully!");
 
@@ -487,7 +495,7 @@ struct slab_obj *kmalloc_create_slab_obj(ul size)
         break;
     // size 错误
     default:
-        kerror("kamlloc_create(): Wrong size%d\n", size);
+        kerror("kamlloc_create(): Wrong size%d", size);
         free_pages(page, 1);
         return NULL;
         break;
@@ -520,7 +528,7 @@ void *kmalloc(unsigned long size, unsigned long flags)
 
     struct slab_obj *slab_obj_ptr = kmalloc_cache_group[index].cache_pool_entry;
 
-    kdebug("count_total_free=%d", kmalloc_cache_group[index].count_total_free);
+    //kdebug("count_total_free=%d", kmalloc_cache_group[index].count_total_free);
 
     // 内存池没有可用的内存对象，需要进行扩容
     if (kmalloc_cache_group[index].count_total_free == 0)
@@ -551,17 +559,16 @@ void *kmalloc(unsigned long size, unsigned long flags)
     }
     // 寻找一块可用的内存对象
     int md;
-    kdebug("slab_obj_ptr->count_free=%d", slab_obj_ptr->count_free);
     for (int i = 0; i < slab_obj_ptr->bmp_count; ++i)
     {
+
         // 当前bmp全部被使用
-        if (*slab_obj_ptr->bmp + (i >> 6) == 0xffffffffffffffffUL)
+        if (*(slab_obj_ptr->bmp + (i >> 6)) == 0xffffffffffffffffUL)
         {
             i += 63;
             continue;
         }
         md = i % 64;
-
         // 找到相应的内存对象
         if ((*(slab_obj_ptr->bmp + (i >> 6)) & (1UL << md)) == 0)
         {

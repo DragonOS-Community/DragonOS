@@ -492,7 +492,7 @@ void init_frame_buffer()
 {
     kinfo("Re-mapping VBE frame buffer...");
     global_CR3 = get_CR3();
-    ul fb_virt_addr = 0xffff800003000000;
+    ul fb_virt_addr = 0xffff800008000000;
     ul fb_phys_addr = get_VBE_FB_phys_addr();
 
     // 计算帧缓冲区的线性地址对应的pml4页表项的地址
@@ -514,16 +514,16 @@ void init_frame_buffer()
     ul vbe_fb_length = get_VBE_FB_length();
     ul *tmp1;
     // 初始化2M物理页
-    for (ul i = 0; i < vbe_fb_length; i += PAGE_2M_SIZE)
+    for (ul i = 0; i < (PAGE_2M_SIZE<<3); i += PAGE_2M_SIZE)
     {
         // 计算当前2M物理页对应的pdt的页表项的物理地址
-        tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));
+        tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((ul)(fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));
 
         // 页面写穿，禁止缓存
         set_pdt(tmp1, mk_pdt((ul)fb_phys_addr+i, PAGE_KERNEL_PAGE| PAGE_PWT| PAGE_PCD));
     }
 
-    set_pos_VBE_FB_addr(fb_virt_addr);
+    set_pos_VBE_FB_addr((uint*)fb_virt_addr);
     flush_tlb();
     kinfo("VBE frame buffer successfully Re-mapped!");
 }

@@ -514,7 +514,7 @@ void init_frame_buffer()
     ul vbe_fb_length = get_VBE_FB_length();
     ul *tmp1;
     // 初始化2M物理页
-    for (ul i = 0; i < (PAGE_2M_SIZE<<3); i += PAGE_2M_SIZE)
+    for (ul i = 0; i < (vbe_fb_length<<2); i += PAGE_2M_SIZE)
     {
         // 计算当前2M物理页对应的pdt的页表项的物理地址
         tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((ul)(fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));

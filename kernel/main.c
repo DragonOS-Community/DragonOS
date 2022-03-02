@@ -158,7 +158,7 @@ void system_initialize()
     cpu_init();
 
     // test_slab();
-    // test_mm();
+    test_mm();
     //  再初始化进程模块。顺序不能调转
     // process_init();
 }

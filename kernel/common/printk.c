@@ -36,7 +36,7 @@ int printk_init(const int char_size_x, const int char_size_y)
     // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
     VBE_FB_phys_addr = (ul *)info.framebuffer_addr;
     pos.FB_address = (uint *)0x0000000003000000;
-    pos.FB_length = pos.width * pos.height*2;
+    pos.FB_length = pos.width * pos.height;
 
     // ======== 临时的将物理地址填写到0x0000000003000000处 之后会在mm内将帧缓存区重新映射=====
 
@@ -51,7 +51,7 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     ul *tmp1;
     // 初始化2M物理页
-    for (ul i = 0; i < (PAGE_2M_SIZE<<3); i += PAGE_2M_SIZE)
+    for (ul i = 0; i < (pos.FB_length<<2); i += PAGE_2M_SIZE)
     {
         // 计算当前2M物理页对应的pdt的页表项的物理地址
         tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));
@@ -811,7 +811,7 @@ int scroll(bool direction, int pixels, bool animation)
  */
 int cls()
 {
-    memset(pos.FB_address, BLACK, pos.FB_length * sizeof(unsigned int));
+    memset(pos.FB_address, BLACK, pos.FB_length*sizeof(unsigned int));
     pos.x = 0;
     pos.y = 0;
     return 0;

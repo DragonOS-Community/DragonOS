@@ -16,6 +16,8 @@
         "irq.h": "c",
         "multiboot2.h": "c",
         "kprint.h": "c",
-        "8259a.h": "c"
-    }
+        "8259a.h": "c",
+        "ptrace.h": "c"
+    },
+    "C_Cpp.errorSquiggles": "Enabled"
 }

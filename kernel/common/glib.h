@@ -359,7 +359,7 @@ void wrmsr(ul address, ul value)
 
 /**
  * @brief 从msr寄存器组的address地址处读取值
- *
+ * rdmsr返回高32bits在edx，低32bits在eax
  * @param address 地址
  * @return ul address处的寄存器的值
  */

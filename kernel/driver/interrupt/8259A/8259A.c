@@ -1,7 +1,9 @@
 #include "8259A.h"
 #include "../../../common/printk.h"
 #include "../../../common/kprint.h"
+#include "../../../exception/gate.h"
 
+// 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
 
 void init_8259A()
@@ -34,3 +36,31 @@ void init_8259A()
 
 }
 
+/**
+ * @brief 中断服务程序
+ * 
+ * @param rsp 中断栈指针
+ * @param number 中断号
+ */
+void do_IRQ(struct pt_regs *regs, ul number)
+{
+    unsigned char x;
+    switch (number)
+    {
+    case 0x20:  // 时钟中断信号
+        
+        break;
+    case 0x21:  // 键盘中断
+        
+        x = io_in8(0x60);
+        printk_color(ORANGE, BLACK, "Received key irq, key code:%#018lx\n", x);
+        break;
+    default:
+        break;
+    }
+    if(number!=0x20)
+    printk_color(ORANGE, BLACK, "Received irq:%#018x\n", number);
+
+    // 向主芯片发送中断结束信号
+    io_out8(PIC_master, PIC_EOI);
+}

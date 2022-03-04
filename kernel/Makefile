@@ -8,6 +8,11 @@ lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
 CFLAGS := -mcmodel=large -fno-builtin -m64
+
+# 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
+PIC := _INTR_APIC_
+CFLAGS += -D $(PIC)
+
 ASFLAGS := --64
 
 all: kernel
@@ -15,10 +20,10 @@ all: kernel
 # cp kernel ../bin/kernel/kernel.elf
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o 8259A.o process.o syscall.o multiboot2.o cpu.o
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o	\
-	driver/interrupt/8259A/8259A.o	\
+	driver/interrupt/pic.o	\
 	-T link.lds
 
 head.o: head.S
@@ -60,15 +65,23 @@ process.o: process/process.c
 syscall.o: syscall/syscall.c
 	gcc $(CFLAGS) -c syscall/syscall.c -o syscall/syscall.o
 
-multiboot2.o: driver/multiboot2/multiboot2.c 
-	gcc $(CFLAGS) -c driver/multiboot2/multiboot2.c  -o driver/multiboot2/multiboot2.o
+
 
 cpu.o: common/cpu.c 
 	gcc $(CFLAGS) -c common/cpu.c -o common/cpu.o
 
-
 # 驱动程序
-8259A.o: driver/interrupt/8259A/8259A.c
-	gcc $(CFLAGS) -c driver/interrupt/8259A/8259A.c -o driver/interrupt/8259A/8259A.o
+# 中断处理芯片的驱动程序
+ifeq ($(PIC), _INTR_8259A_))
+pic.o: driver/interrupt/8259A/8259A.c
+	gcc $(CFLAGS) -c driver/interrupt/8259A/8259A.c -o driver/interrupt/pic.o
+else ifeq($(PIC), _INTR_APIC_)
+pic.o: driver/interrupt/apic/apic.c
+	gcc $(CFLAGS) -c driver/interrupt/apic/apic.c -o driver/interrupt/pic.o
+endif
+
+multiboot2.o: driver/multiboot2/multiboot2.c 
+	gcc $(CFLAGS) -c driver/multiboot2/multiboot2.c  -o driver/multiboot2/multiboot2.o
+
 clean: 
 	rm -rf $(GARBAGE)

@@ -2,16 +2,17 @@
 #include "assert.h"
 
 #include "../../common/glib.h"
-
+#include"../../common/kprint.h"
 uintptr_t boot_info_addr;
 unsigned int multiboot2_magic;
 unsigned int boot_info_size;
 
 bool multiboot2_init(void)
 {
-    uintptr_t *addr = (uintptr_t*)boot_info_addr;
-    if(multiboot2_magic != MULTIBOOT2_BOOTLOADER_MAGIC);
-        return false;
+    uintptr_t *addr = (uintptr_t *)boot_info_addr;
+    if (multiboot2_magic != MULTIBOOT2_BOOTLOADER_MAGIC)
+        ;
+    return false;
     // addr+0 处保存了大小
     boot_info_size = *(unsigned int *)addr;
     return true;
@@ -20,12 +21,14 @@ bool multiboot2_init(void)
 void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned int *),
                      void *data, unsigned int *count)
 {
+
     uintptr_t addr = boot_info_addr;
     // 下一字节开始为 tag 信息
     struct iter_data_t *tag = (struct iter_data_t *)(addr + 8);
     for (; tag->type != MULTIBOOT_TAG_TYPE_END;
          tag = (struct iter_data_t *)((uint8_t *)tag + ALIGN(tag->size, 8)))
     {
+
         if (_fun(tag, data, count) == true)
         {
             return;
@@ -73,13 +76,13 @@ bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *data, uns
 
 /**
  * @brief 获取VBE信息
- * 
+ *
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data 返回信息的结构体指针
  */
 bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
-    
+
     if (_iter_data->type != MULTIBOOT_TAG_TYPE_VBE)
         return false;
     *(struct multiboot_tag_vbe_t *)data = *(struct multiboot_tag_vbe_t *)_iter_data;
@@ -88,14 +91,47 @@ bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, u
 
 /**
  * @brief 获取帧缓冲区信息
- * 
+ *
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data 返回信息的结构体指针
  */
 bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
-    if(_iter_data->type !=MULTIBOOT_TAG_TYPE_FRAMEBUFFER)
+    if (_iter_data->type != MULTIBOOT_TAG_TYPE_FRAMEBUFFER)
         return false;
-    *(struct multiboot_tag_framebuffer_info_t *)data = *(struct multiboot_tag_framebuffer_info_t*)_iter_data;
+    *(struct multiboot_tag_framebuffer_info_t *)data = *(struct multiboot_tag_framebuffer_info_t *)_iter_data;
+    return true;
+}
+
+/**
+ * @brief 获取acpi旧版RSDP
+ *
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data old RSDP的结构体指针
+ * @param reserved
+ * @return uint8_t*  struct multiboot_tag_old_acpi_t
+ */
+bool multiboot2_get_acpi_old_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
+{
+    if (_iter_data->type != MULTIBOOT_TAG_TYPE_ACPI_OLD)
+        return false;
+    kdebug("xxx=%#018lx",((struct multiboot_tag_old_acpi_t *)_iter_data)->rsdp);
+    *(struct multiboot_tag_old_acpi_t *)data = *(struct multiboot_tag_old_acpi_t *)_iter_data;
+    return true;
+}
+
+/**
+ * @brief 获取acpi新版RSDP
+ *
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data old RSDP的结构体指针
+ * @param reserved
+ * @return uint8_t*  struct multiboot_tag_old_acpi_t
+ */
+bool multiboot2_get_acpi_new_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
+{
+    if (_iter_data->type != MULTIBOOT_TAG_TYPE_ACPI_NEW)
+        return false;
+    *(struct multiboot_tag_new_acpi_t *)data = *(struct multiboot_tag_new_acpi_t *)_iter_data;
     return true;
 }

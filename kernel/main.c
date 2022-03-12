@@ -13,6 +13,9 @@
 #include "process/process.h"
 #include "syscall/syscall.h"
 
+#include "driver/multiboot2/multiboot2.h"
+#include "driver/acpi/acpi.h"
+
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
 struct memory_desc memory_management_struct = {{0}, 0};
@@ -156,9 +159,11 @@ void system_initialize()
     syscall_init();
 
     cpu_init();
-
+    
+    acpi_init();
     // test_slab();
-    test_mm();
+    // test_mm();
+
     //  再初始化进程模块。顺序不能调转
     // process_init();
 }

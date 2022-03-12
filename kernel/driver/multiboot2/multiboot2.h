@@ -448,3 +448,23 @@ bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *_data, 
  * @param _data 返回信息的结构体指针
  */
 bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *_data, unsigned int *reserved);
+
+/**
+ * @brief 获取acpi旧版RSDP
+ * 
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data old RSDP的结构体指针
+ * @param reserved 
+ * @return uint8_t* 
+ */
+bool multiboot2_get_acpi_old_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved);
+
+/**
+ * @brief 获取acpi新版RSDP
+ * 
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data old RSDP的结构体指针
+ * @param reserved 
+ * @return uint8_t*  struct multiboot_tag_old_acpi_t
+ */
+bool multiboot2_get_acpi_new_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved);

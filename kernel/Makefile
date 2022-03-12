@@ -20,10 +20,10 @@ all: kernel
 # cp kernel ../bin/kernel/kernel.elf
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o	\
-	driver/interrupt/pic.o	\
+	driver/acpi/acpi.o driver/interrupt/pic.o 	\
 	-T link.lds
 
 head.o: head.S
@@ -72,16 +72,19 @@ cpu.o: common/cpu.c
 
 # 驱动程序
 # 中断处理芯片的驱动程序
-ifeq ($(PIC), _INTR_8259A_))
+ifeq ($(PIC), _INTR_8259A_)
 pic.o: driver/interrupt/8259A/8259A.c
 	gcc $(CFLAGS) -c driver/interrupt/8259A/8259A.c -o driver/interrupt/pic.o
-else ifeq($(PIC), _INTR_APIC_)
+else
 pic.o: driver/interrupt/apic/apic.c
 	gcc $(CFLAGS) -c driver/interrupt/apic/apic.c -o driver/interrupt/pic.o
 endif
 
 multiboot2.o: driver/multiboot2/multiboot2.c 
 	gcc $(CFLAGS) -c driver/multiboot2/multiboot2.c  -o driver/multiboot2/multiboot2.o
+
+acpi.o: driver/acpi/acpi.c 
+	gcc $(CFLAGS) -c driver/acpi/acpi.c  -o driver/acpi/acpi.o
 
 clean: 
 	rm -rf $(GARBAGE)

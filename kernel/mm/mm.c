@@ -557,7 +557,6 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
 
     ul *tmp1;
     // 初始化2M物理页
-    int js = 0;
     for (ul i = 0; i < (length); i += PAGE_2M_SIZE)
     {
         // 计算当前2M物理页对应的pdt的页表项的物理地址
@@ -565,9 +564,7 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
 
         // 页面写穿，禁止缓存
         set_pdt(tmp1, mk_pdt((ul)phys_addr_start + i, flags));
-        ++js;
     }
-    kdebug("js=%d", js);
 
     flush_tlb();
 }

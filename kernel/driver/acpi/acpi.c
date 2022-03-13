@@ -47,7 +47,7 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
  * @brief 获取MADT信息 Multiple APIC Description Table
  *
  * @param _iter_data 要被迭代的信息的结构体
- * @param _data 返回信息的结构体指针
+ * @param _data 返回的MADT的虚拟地址
  * @param count 返回数组的长度
  * @return true
  * @return false
@@ -57,26 +57,9 @@ bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_da
     if (!(_iter_data->Signature[0] == 'A' && _iter_data->Signature[1] == 'P' && _iter_data->Signature[2] == 'I' && _iter_data->Signature[3] == 'C'))
         return false;
     //*(struct acpi_Multiple_APIC_Description_Table_t *)_data = *(struct acpi_Multiple_APIC_Description_Table_t *)_iter_data;
+    // 返回MADT的虚拟地址
     *(ul*)_data = _iter_data;
-    kdebug("_iter_data = %#018lx", (ul)_iter_data);
-    kdebug("_data = %#018lx", (ul)_data);
-    //_data = _iter_data;
-    /*
-    void *ent = (void *)(_iter_data) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
-    struct apic_Interrupt_Controller_Structure_header_t *header;
-    for (int i = 0; i < 17; ++i)
-    {
-        header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
-        kdebug("[ %d ] type=%d, length=%d", i, header->type, header->length);
-        if (header->type == 1)
-        {
-            struct acpi_IO_APIC_Structure_t *t = (struct acpi_IO_APIC_Structure_t *)ent;
-            kdebug("IO apic addr = %#018lx", t->IO_APIC_Address);
-        }
-
-        ent += header->length;
-    }
-    */
+    
     return true;
 }
 

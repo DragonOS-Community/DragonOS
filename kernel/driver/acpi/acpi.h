@@ -151,7 +151,7 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
  * @brief 获取MADT信息 Multiple APIC Description Table
  *
  * @param _iter_data 要被迭代的信息的结构体
- * @param _data 返回信息的结构体指针
+ * @param _data 返回的MADT的虚拟地址
  * @param count 返回数组的长度
  * @return true
  * @return false

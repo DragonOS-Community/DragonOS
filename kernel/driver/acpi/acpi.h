@@ -26,6 +26,9 @@
 // 0x80-0xff Reserved for OEM use
 
 #define ACPI_RSDT_VIRT_ADDR_BASE 0xffff80000a000000UL
+#define ACPI_DESCRIPTION_HEDERS_BASE ACPI_RSDT_VIRT_ADDR_BASE + PAGE_2M_SIZE
+
+
 
 struct acpi_RSDP_t
 {
@@ -123,7 +126,7 @@ struct acpi_RSDT_Structure_t
     struct acpi_system_description_table_header_t header;
 
     // 一个包含了n个32bit物理地址的数组，指向了其他的description headers
-    uint *Entry;
+    uint Entry;
 };
 
 // =========== XSDT 结构 =============
@@ -149,7 +152,7 @@ struct acpi_iter_SDT_header_t
  * @param  _data           数据
  */
 void acpi_iter_SDT(bool (*_fun)(const struct acpi_iter_SDT_header_t *, void *),
-                            void *_data);
+                   void *_data);
 
 /**
  * @brief 获取MADT信息

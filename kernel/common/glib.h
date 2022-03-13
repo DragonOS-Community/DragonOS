@@ -49,6 +49,9 @@ typedef long long int ll;
 #define max(x, y) ((x > y) ? (x) : (y))
 #define min(x, y) ((x < y) ? (x) : (y))
 
+// 遮罩高32bit
+#define MASK_HIGH_32bit(x) (x & (0x00000000ffffffffUL))
+
 // 四舍五入成整数
 ul round(double x)
 {

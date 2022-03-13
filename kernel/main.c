@@ -152,6 +152,7 @@ void system_initialize()
     //  初始化内存管理单元
     mm_init();
 
+    acpi_init();
     // 初始化中断模块
     irq_init();
 
@@ -160,7 +161,6 @@ void system_initialize()
 
     cpu_init();
     
-    acpi_init();
     // test_slab();
     // test_mm();
 

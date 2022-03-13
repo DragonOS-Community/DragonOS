@@ -25,6 +25,8 @@
 // 0x10-0x7f Reserved. OSPM skips structures of the reserved type.
 // 0x80-0xff Reserved for OEM use
 
+#define ACPI_RSDT_VIRT_ADDR_BASE 0xffff80000a000000UL
+
 struct acpi_RSDP_t
 {
     unsigned char Signature[8];

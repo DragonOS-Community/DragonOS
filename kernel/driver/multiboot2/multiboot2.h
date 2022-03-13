@@ -8,6 +8,7 @@
 #include "stdint.h"
 #include "stdbool.h"
 #include "../../common/boot_info.h"
+#include "../acpi/acpi.h"
 
 /// @see Multiboot2 Specification version 2.0.pdf
 // 启动后，在 32 位内核进入点，机器状态如下：
@@ -358,13 +359,15 @@ struct multiboot_tag_smbios_t
 struct multiboot_tag_old_acpi_t
 {
     struct multiboot_tag_t tag_t;
-    uint8_t rsdp[0];
+    //uint8_t rsdp[0];
+    struct acpi_RSDP_t rsdp;
 };
 
 struct multiboot_tag_new_acpi_t
 {
     struct multiboot_tag_t tag_t;
-    uint8_t rsdp[0];
+    //uint8_t rsdp[0];
+    struct acpi_RSDP_2_t rsdp;
 };
 
 struct multiboot_tag_network_t
@@ -420,7 +423,7 @@ static bool multiboot2_init(void);
  * @param  _data           数据
  */
 void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned int *),
-                            void *_data, unsigned int *count);
+                     void *_data, unsigned int *count);
 
 /**
  * @brief 获取multiboot2协议提供的内存区域信息
@@ -451,20 +454,20 @@ bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void 
 
 /**
  * @brief 获取acpi旧版RSDP
- * 
+ *
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data old RSDP的结构体指针
- * @param reserved 
- * @return uint8_t* 
+ * @param reserved
+ * @return uint8_t*
  */
 bool multiboot2_get_acpi_old_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved);
 
 /**
  * @brief 获取acpi新版RSDP
- * 
+ *
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data old RSDP的结构体指针
- * @param reserved 
+ * @param reserved
  * @return uint8_t*  struct multiboot_tag_old_acpi_t
  */
 bool multiboot2_get_acpi_new_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved);

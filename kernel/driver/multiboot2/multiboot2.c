@@ -2,7 +2,7 @@
 #include "assert.h"
 
 #include "../../common/glib.h"
-#include"../../common/kprint.h"
+#include "../../common/kprint.h"
 uintptr_t boot_info_addr;
 unsigned int multiboot2_magic;
 unsigned int boot_info_size;
@@ -115,8 +115,9 @@ bool multiboot2_get_acpi_old_RSDP(const struct iter_data_t *_iter_data, void *da
 {
     if (_iter_data->type != MULTIBOOT_TAG_TYPE_ACPI_OLD)
         return false;
-    kdebug("xxx=%#018lx",((struct multiboot_tag_old_acpi_t *)_iter_data)->rsdp);
+
     *(struct multiboot_tag_old_acpi_t *)data = *(struct multiboot_tag_old_acpi_t *)_iter_data;
+
     return true;
 }
 

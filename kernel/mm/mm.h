@@ -339,6 +339,15 @@ void page_table_init();
 
 /**
  * @brief VBE帧缓存区的地址重新映射
- * 将帧缓存区映射到地址0xffff800003000000处
+ * 将帧缓存区映射到地址0xffff800008000000处
  */
 void init_frame_buffer();
+
+/**
+ * @brief 将物理地址映射到页表的函数
+ * 
+ * @param virt_addr_start 要映射到的虚拟地址的起始位置
+ * @param phys_addr_start 物理地址的起始位置
+ * @param length 要映射的区域的长度（字节）
+ */
+void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);

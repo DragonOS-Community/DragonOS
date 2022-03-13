@@ -527,3 +527,49 @@ void init_frame_buffer()
     flush_tlb();
     kinfo("VBE frame buffer successfully Re-mapped!");
 }
+
+
+/**
+ * @brief 将物理地址映射到页表的函数
+ * 
+ * @param virt_addr_start 要映射到的虚拟地址的起始位置
+ * @param phys_addr_start 物理地址的起始位置
+ * @param length 要映射的区域的长度（字节）
+ */
+void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags)
+{
+    global_CR3 = get_CR3();
+
+    // 计算帧缓冲区的线性地址对应的pml4页表项的地址
+    ul *tmp = phys_2_virt((ul *)((ul)global_CR3 & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff));
+    if (*tmp == 0)
+    {
+        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), PAGE_KERNEL_PGT));
+    }
+
+    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));
+
+    if (*tmp == 0)
+    {
+        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), PAGE_KERNEL_DIR));
+    }
+
+    ul *tmp1;
+    // 初始化2M物理页
+    int js = 0;
+    for (ul i = 0; i < (length); i += PAGE_2M_SIZE)
+    {
+        // 计算当前2M物理页对应的pdt的页表项的物理地址
+        tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff));
+
+        // 页面写穿，禁止缓存
+        set_pdt(tmp1, mk_pdt((ul)phys_addr_start+i, flags));
+        ++js;
+    }
+    kdebug("js=%d", js);
+
+
+    flush_tlb();
+}

@@ -159,7 +159,7 @@ void system_initialize()
     // 先初始化系统调用模块
     syscall_init();
 
-    cpu_init();
+    //cpu_init();
     
     // test_slab();
     // test_mm();

@@ -35,6 +35,11 @@
 #define Virt_To_2M_Page(kaddr) (memory_management_struct.pages_struct + (virt_2_phys(kaddr) >> PAGE_2M_SHIFT))
 #define Phy_to_2M_Page(kaddr) (memory_management_struct.pages_struct + ((unsigned long)(kaddr) >> PAGE_2M_SHIFT))
 
+// 在这个地址以上的虚拟空间，用来进行特殊的映射
+#define SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE 0xffff800000000000UL
+#define FRAME_BUFFER_MAPPING_OFFSET 0x3000000UL
+#define ACPI_RSDT_MAPPING_OFFSET 0x7000000UL
+#define IO_APIC_MAPPING_OFFSET 0x8000000UL
 // ===== 内存区域属性 =====
 // DMA区域
 #define ZONE_DMA (1 << 0)

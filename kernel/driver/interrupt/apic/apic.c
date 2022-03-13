@@ -4,6 +4,7 @@
 #include "../../../common/cpu.h"
 #include "../../../common/glib.h"
 #include "../../../exception/gate.h"
+#include "../../acpi/acpi.h"
 
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
@@ -12,6 +13,8 @@ bool flag_support_apic = false;
 bool flag_support_x2apic = false;
 uint local_apic_version;
 uint local_apic_max_LVT_entries;
+
+static struct acpi_Multiple_APIC_Description_Table_t *madt;
 
 /**
  * @brief 初始化io_apic
@@ -27,7 +30,28 @@ void apic_io_apic_init()
     io_out8(0x21, 0xff);
     io_out8(0xa1, 0xff);
     kdebug("8259A Masked.");
+    ul madt_addr;
+    kdebug("madt_addr = %#018lx", (ul)madt_addr);
+    acpi_iter_SDT(acpi_get_MADT, &madt_addr);
+    madt = (struct acpi_Multiple_APIC_Description_Table_t *)madt_addr;
 
+    kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
+    kdebug("MADT->length= %d bytes", madt->header.Length);
+
+    void *ent = (void *)(madt_addr) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
+    struct apic_Interrupt_Controller_Structure_header_t *header;
+    for (int i = 0; i < 17; ++i)
+    {
+        header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
+        kdebug("[ %d ] type=%d, length=%d", i, header->type, header->length);
+        if (header->type == 1)
+        {
+            struct acpi_IO_APIC_Structure_t *t = (struct acpi_IO_APIC_Structure_t *)ent;
+            kdebug("IO apic addr = %#018lx", t->IO_APIC_Address);
+        }
+
+        ent += header->length;
+    }
     apic_local_apic_init();
     sti();
 }

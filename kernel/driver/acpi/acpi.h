@@ -5,6 +5,7 @@
 #pragma once
 
 #include "../../common/glib.h"
+#include "../../mm/mm.h"
 
 #define ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC 0
 #define ACPI_ICS_TYPE_IO_APIC 1
@@ -25,10 +26,8 @@
 // 0x10-0x7f Reserved. OSPM skips structures of the reserved type.
 // 0x80-0xff Reserved for OEM use
 
-#define ACPI_RSDT_VIRT_ADDR_BASE 0xffff80000a000000UL
+#define ACPI_RSDT_VIRT_ADDR_BASE SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + ACPI_RSDT_MAPPING_OFFSET
 #define ACPI_DESCRIPTION_HEDERS_BASE ACPI_RSDT_VIRT_ADDR_BASE + PAGE_2M_SIZE
-
-
 
 struct acpi_RSDP_t
 {
@@ -85,7 +84,7 @@ struct acpi_Multiple_APIC_Description_Table_t
     // Multiple APIC flags, 详见 ACPI Specification Version 6.3, Table 5-44
     uint flags;
 
-    void *Interrupt_Controller_Structure;
+    // 接下来的(length-44)字节是Interrupt Controller Structure
 };
 
 struct apic_Interrupt_Controller_Structure_header_t
@@ -105,7 +104,7 @@ struct acpi_Processor_Local_APIC_Structure_t
     uint flags;
 };
 
-struct acpi_Processor_IO_APIC_Structure_t
+struct acpi_IO_APIC_Structure_t
 {
     // type=1
     struct apic_Interrupt_Controller_Structure_header_t header;
@@ -140,22 +139,16 @@ struct acpi_XSDT_Structure_t
     ul *Entry;
 };
 
-// 要被迭代的系统描述表的开头的sign
-struct acpi_iter_SDT_header_t
-{
-    unsigned char Signature[8];
-};
-
 /**
  * @brief 迭代器，用于迭代描述符头（位于ACPI标准文件的Table 5-29）
  * @param  _fun            迭代操作调用的函数
  * @param  _data           数据
  */
-void acpi_iter_SDT(bool (*_fun)(const struct acpi_iter_SDT_header_t *, void *),
+void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_header_t *, void *),
                    void *_data);
 
 /**
- * @brief 获取MADT信息
+ * @brief 获取MADT信息 Multiple APIC Description Table
  *
  * @param _iter_data 要被迭代的信息的结构体
  * @param _data 返回信息的结构体指针
@@ -163,7 +156,18 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_iter_SDT_header_t *, void *),
  * @return true
  * @return false
  */
-bool acpi_get_MADT(const struct acpi_iter_SDT_header_t *_iter_data, void *_data);
+bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_data, void *_data);
+
+
+/**
+ * @brief 迭代器，用于迭代中断控制器结构(Interrupt Controller Structure)（位于ACPI标准文件的Table 5-45）
+ * @param  _fun            迭代操作调用的函数
+ * @param  _data           数据
+ */
+void acpi_iter_Interrupt_Controller_Structure(bool (*_fun)(const struct apic_Interrupt_Controller_Structure_header_t *, void *),
+                   void *_data);
+
+
 
 // 初始化acpi模块
 void acpi_init();

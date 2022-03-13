@@ -4,6 +4,18 @@
 #include"../../../process/ptrace.h"
 #include"../../../exception/irq.h"
 
+struct apic_IO_APIC_map
+{
+    // 间接访问寄存器的物理基地址
+    uint addr_phys;
+    // 索引寄存器虚拟地址
+    unsigned char* virtual_index_addr;
+    // 数据寄存器虚拟地址
+    uint* virtual_data_addr;
+    // EOI寄存器虚拟地址
+    uint* virtual_EOI_addr;
+}apic_ioapic_map;
+
 /**
  * @brief 中断服务程序
  * 

@@ -30,7 +30,7 @@ bximage
 
 - [x] Simple exception capture and interrupt handling
 
-- [ ] APIC
+- [x] APIC
 
 - [x] Primary memory management unit
 
@@ -99,3 +99,10 @@ If you like, click the link below and buy me a cup of coffee ~ please leave your
 ## Sponsors
 
 Not yet
+
+## Open source statement
+
+This project adopts GPLv2 LICENSE for open source. You are welcome to use the code of this project on the basis of abiding by the open source license!
+**What we support:** using this project to create greater value and contribute code to this project under the condition of abiding by the agreement.
+**What we resist**: any non-compliance with the open source license. Including but not limited to: plagiarizing the code of the project as your graduation project and other academic misconduct, as well as commercial closed source use without payment.
+If you find any violation of the open source license, we welcome you to send email feedback! Let's build an honest open source community together!

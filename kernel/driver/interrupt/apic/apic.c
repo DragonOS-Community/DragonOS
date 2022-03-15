@@ -74,7 +74,7 @@ void apic_io_apic_init()
     // 初始化RTE表项，将所有RTE表项屏蔽
     for (int i = 0x10; i < 0x40; i += 2)
     {
-        // 以0x20位起始中断向量号，初始化RTE
+        // 以0x20为起始中断向量号，初始化RTE
         apic_ioapic_write_rte(i, 0x10020 + ((i - 0x10) >> 1));
     }
 
@@ -285,12 +285,23 @@ void apic_init()
  * @brief 中断服务程序
  *
  * @param rsp 中断栈指针
- * @param number 中断号
+ * @param number 中断向量号
  */
 void do_IRQ(struct pt_regs *rsp, ul number)
 {
+
     unsigned char x = io_in8(0x60);
     printk_color(BLUE, WHITE, "(IRQ:%#04x)\tkey code:%#04x\n", number, x);
+
+    irq_desc_t *irq = &interrupt_desc[number - 32];
+
+    // 执行中断上半部处理程序
+    if (irq->handler != NULL)
+        irq->handler(number, irq->parameter, rsp);
+
+    // 向中断控制器发送应答消息
+    if (irq->controller != NULL && irq->controller->ack != NULL)
+        irq->controller->ack(number);
 
     // 向EOI寄存器写入0x00表示结束中断
     io_mfence();
@@ -347,4 +358,50 @@ void apic_ioapic_write_rte(unsigned char index, ul value)
     io_mfence();
     *apic_ioapic_map.virtual_data_addr = value & 0xffffffff;
     io_mfence();
+}
+
+// =========== 中断控制操作接口 ============
+void apic_ioapic_enable(ul irq_num)
+{
+    ul index = 0x10 + ((irq_num - 32) << 1);
+    ul value = apic_ioapic_read_rte(index);
+    value &= (~0x10000UL);
+    apic_ioapic_write_rte(index, value);
+}
+
+void apic_ioapic_disable(ul irq_num)
+{
+    ul index = 0x10 + ((irq_num - 32) << 1);
+    ul value = apic_ioapic_read_rte(index);
+    value |= (0x10000UL);
+    apic_ioapic_write_rte(index, value);
+}
+
+ul apic_ioapic_install(ul irq_num, void *arg)
+{
+    struct apic_IO_APIC_RTE_entry *entry = (struct apic_IO_APIC_RTE_entry *)arg;
+    // RTE表项值写入对应的RTE寄存器
+    apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), *(ul *)entry);
+    return 0;
+}
+
+void apic_ioapic_uninstall(ul irq_num)
+{
+    // 将对应的RTE表项设置为屏蔽状态
+    apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), 0x10000UL);
+}
+
+void apic_ioapic_level_ack(ul irq_num) // 电平触发
+{
+    // 向EOI寄存器写入0x00表示结束中断
+    uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
+    *eoi = 0x00;
+    *apic_ioapic_map.virtual_EOI_addr = irq_num;
+}
+
+void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
+{
+    // 向EOI寄存器写入0x00表示结束中断
+    uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
+    *eoi = 0x00;
 }

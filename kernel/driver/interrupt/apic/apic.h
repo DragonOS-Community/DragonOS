@@ -70,9 +70,163 @@
 // 分频配置寄存器（定时器专用）
 #define LOCAL_APIC_OFFSET_Local_APIC_CLKDIV 0x3e0
 
+/*
 
+1:	LVT	CMCI
+2:	LVT	Timer
+3:	LVT	Thermal Monitor
+4:	LVT	Performace Counter
+5:	LVT	LINT0
+6:	LVT	LINT1
+7:	LVT	Error
 
+*/
+/**
+ * LVT表项
+ * */
+struct apic_LVT
+{
+    uint vector : 8,         // 0-7位全部置为1
+        delivery_mode : 3,   // 第[10:8]位置为100, 表示NMI
+        reserved_1 : 1,      // 第11位保留
+        delivery_status : 1, // 第12位，投递状态 -> 发送挂起
+        polarity : 1,        // 第13位，电平触发极性 存在于LINT0,LINT1
+        remote_IRR : 1,      // 第14位，远程IRR标志位（只读） 存在于LINT0,LINT1
+        trigger_mode : 1,    // 第15位，触发模式（0位边沿触发，1为电平触发） 存在于LINT0,LINT1
+        mask : 1,            // 第16位，屏蔽标志位，（0为未屏蔽， 1为已屏蔽）
+        timer_mode : 2,      // 第[18:17]位，定时模式。（00：一次性定时，   01：周期性定时，  10：指定TSC值计数）， 存在于定时器寄存器
+        reserved_2 : 13;     // [31:19]位保留
 
+} __attribute((packed)); // 取消结构体的align
+
+/*
+    ICR
+*/
+
+struct INT_CMD_REG
+{
+    unsigned int vector : 8, // 0~7
+        deliver_mode : 3,    // 8~10
+        dest_mode : 1,       // 11
+        deliver_status : 1,  // 12
+        res_1 : 1,           // 13
+        level : 1,           // 14
+        trigger : 1,         // 15
+        res_2 : 2,           // 16~17
+        dest_shorthand : 2,  // 18~19
+        res_3 : 12;          // 20~31
+
+    union
+    {
+        struct
+        {
+            unsigned int res_4 : 24, // 32~55
+                dest_field : 8;      // 56~63
+        } apic_destination;
+
+        unsigned int x2apic_destination; // 32~63
+    } destination;
+
+} __attribute__((packed));
+
+/**
+ * @brief I/O APIC 的中断定向寄存器的结构体
+ *
+ */
+struct apic_IO_APIC_RTE_entry
+{
+    unsigned int vector : 8, // 0~7
+        deliver_mode : 3,    // [10:8] 投递模式默认为NMI
+        dest_mode : 1,       // 11 目标模式(0位物理模式，1为逻辑模式)
+        deliver_status : 1,  // 12 投递状态
+        polarity : 1,        // 13 电平触发极性
+        remote_IRR : 1,      // 14 远程IRR标志位（只读）
+        trigger_mode : 1,    // 15 触发模式（0位边沿触发，1为电平触发）
+        mask : 1,            // 16 屏蔽标志位，（0为未屏蔽， 1为已屏蔽）
+        reserved : 19;       // [31:17]位保留
+
+    union
+    {
+        // 物理模式
+        struct
+        {
+            unsigned int reserved1 : 24, // [55:32] 保留
+                phy_dest : 4,            // [59:56] APIC ID
+                reserved2 : 4;           // [63:60] 保留
+        } physical;
+
+        // 逻辑模式
+        struct
+        {
+            unsigned int reserved1 : 24, // [55:32] 保留
+                logical_dest : 8;        // [63:56] 自定义APIC ID
+        } logical;
+    } destination;
+} __attribute__((packed));
+
+// ========== APIC的寄存器的参数定义 ==============
+// 投递模式
+#define LOCAL_APIC_FIXED 0
+#define IO_APIC_FIXED 0
+#define ICR_APIC_FIXED 0
+
+#define IO_APIC_Lowest_Priority 1
+#define ICR_Lowest_Priority 1
+
+#define LOCAL_APIC_SMI 2
+#define APIC_SMI 2
+#define ICR_SMI 2
+
+#define LOCAL_APIC_NMI 4
+#define APIC_NMI 4
+#define ICR_NMI 4
+
+#define LOCAL_APIC_INIT 5
+#define APIC_INIT 5
+#define ICR_INIT 5
+
+#define ICR_Start_up 6
+
+#define IO_APIC_ExtINT 7
+
+// 时钟模式
+#define APIC_LVT_Timer_One_Shot 0
+#define APIC_LVT_Timer_Periodic 1
+#define APIC_LVT_Timer_TSC_Deadline 2
+
+// 屏蔽
+#define UNMASKED 0
+#define MASKED 1
+
+// 触发模式
+#define EDGE_TRIGGER 0  // 边沿触发
+#define Level_TRIGGER 1 // 电平触发
+
+// 投递模式
+#define IDLE 0         // 挂起
+#define SEND_PENDING 1 // 发送等待
+
+// destination shorthand
+#define ICR_No_Shorthand 0
+#define ICR_Self 1
+#define ICR_ALL_INCLUDE_Self 2
+#define ICR_ALL_EXCLUDE_Self 3
+
+// 目标模式
+#define DEST_PHYSICAL 0 // 物理模式
+#define DEST_LOGIC 1    // 逻辑模式
+
+// level
+#define ICR_LEVEL_DE_ASSERT 0
+#define ICR_LEVEL_ASSERT 1
+
+// 远程IRR
+#define IRR_RESET 0
+#define IRR_ACCEPT 1
+
+// 电平触发极性
+#define POLARITY_HIGH 0
+#define POLARITY_LOW 1
 
 struct apic_IO_APIC_map
 {
@@ -90,7 +244,7 @@ struct apic_IO_APIC_map
  * @brief 中断服务程序
  *
  * @param rsp 中断栈指针
- * @param number 中断号
+ * @param number 中断向量号
  */
 void do_IRQ(struct pt_regs *rsp, ul number);
 
@@ -115,3 +269,11 @@ void apic_ioapic_write_rte(unsigned char index, ul value);
  *
  */
 void apic_init();
+
+// =========== 中断控制操作接口 ============
+void apic_ioapic_enable(ul irq_num);
+void apic_ioapic_disable(ul irq_num);
+ul apic_ioapic_install(ul irq_num, void *arg);
+void apic_ioapic_uninstall(ul irq_num);
+void apic_ioapic_level_ack(ul irq_num); // 电平触发
+void apic_ioapic_edge_ack(ul irq_num);  // 边沿触发

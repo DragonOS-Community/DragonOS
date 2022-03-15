@@ -112,6 +112,55 @@ void (*interrupt_table[24])(void) =
 };
 
 /**
+ * @brief 中断注册函数
+ *
+ * @param irq_num 中断向量号
+ * @param arg 传递给中断安装接口的参数
+ * @param handler 中断处理函数
+ * @param paramater 中断处理函数的参数
+ * @param controller 中断控制器结构
+ * @param irq_name 中断名
+ * @return int
+ */
+int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter, struct pt_regs *regs), ul paramater, hardware_int_controller *controller, char *irq_name)
+{
+    // 由于为I/O APIC分配的中断向量号是从32开始的，因此要减去32才是对应的interrupt_desc的元素
+    irq_desc_t *p = &interrupt_desc[irq_num - 32];
+
+    p->controller = controller;
+    p->irq_name = irq_name;
+    p->parameter = paramater;
+    p->flags = 0;
+    p->handler = handler;
+
+    p->controller->install(irq_num, arg);
+    p->controller->enable(irq_num);
+
+    return 0;
+}
+
+/**
+ * @brief 中断注销函数
+ *
+ * @param irq_num 中断向量号
+ * @return int
+ */
+int irq_unregister(ul irq_num)
+{
+    irq_desc_t *p = &interrupt_desc[irq_num - 32];
+    p->controller->disable(irq_num);
+    p->controller->uninstall(irq_num);
+
+    p->controller = NULL;
+    p->irq_name = NULL;
+    p->parameter = NULL;
+    p->flags = 0;
+    p->handler = NULL;
+    
+    return 0;
+}
+
+/**
  * @brief 初始化中断模块
  */
 void irq_init()
@@ -119,6 +168,8 @@ void irq_init()
 #if _INTR_8259A_
     init_8259A();
 #else
+    memset(interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
+
     apic_init();
 #endif
 }

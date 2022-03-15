@@ -112,4 +112,5 @@ void acpi_init()
     kdebug("acpi_RSDT_entry_phys_base=%#018lx", acpi_RSDT_entry_phys_base);
     // 映射RSDT ENTRY的物理地址
     mm_map_phys_addr(ACPI_DESCRIPTION_HEDERS_BASE, acpi_RSDT_entry_phys_base, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+    kinfo("ACPI module initialized!")
 }

@@ -113,8 +113,8 @@ void auto_newline()
     {
         pos.y = pos.max_y;
         int lines_to_scroll = 2;
-        scroll(true, lines_to_scroll * pos.char_size_y, false);
-        pos.y -= (lines_to_scroll-1);
+        scroll(true, lines_to_scroll * pos.char_size_y, true);
+        pos.y -= (lines_to_scroll - 1);
     }
 }
 
@@ -723,9 +723,7 @@ int do_scroll(bool direction, int pixels)
 
         memcpy(pos.FB_address, (pos.FB_address + src), sizeof(unsigned int) * (pos.FB_length - src));
         memset(pos.FB_address + (pos.FB_length - src), 0, sizeof(unsigned int) * (src));
-        for (int i = 0; i < 1000; ++i)
-            for (int j = 0; j < 1000; ++j)
-                ;
+
         return 0;
     }
     else
@@ -741,7 +739,7 @@ int do_scroll(bool direction, int pixels)
  */
 
 // @todo: 修复用户态触发键盘中断时产生#UD错误
-// @todo：采用双缓冲区，防止画面撕裂
+// @todo：采用双缓冲区
 int scroll(bool direction, int pixels, bool animation)
 {
     // 暂时不支持反方向滚动
@@ -756,6 +754,7 @@ int scroll(bool direction, int pixels, bool animation)
         return do_scroll(direction, pixels);
     else
     {
+        int count_pixels = 0;
         int steps;
         if (pixels > 10)
             steps = 5;
@@ -776,6 +775,7 @@ int scroll(bool direction, int pixels, bool animation)
             trace[js_trace] = (int)(accelerate * i + 0.5);
             current_pixels += trace[js_trace];
             do_scroll(direction, trace[js_trace]);
+            count_pixels += trace[js_trace];
 
             ++js_trace;
         }
@@ -784,6 +784,8 @@ int scroll(bool direction, int pixels, bool animation)
         if (current_pixels < pixels / 2)
         {
             delta_x = pixels / 2 - current_pixels;
+            current_pixels += delta_x;
+            count_pixels += delta_x;
             do_scroll(direction, delta_x);
         }
 
@@ -792,6 +794,7 @@ int scroll(bool direction, int pixels, bool animation)
         {
             current_pixels += trace[i];
             do_scroll(direction, trace[i]);
+            count_pixels += trace[i];
         }
 
         if (current_pixels > pixels)
@@ -801,7 +804,15 @@ int scroll(bool direction, int pixels, bool animation)
         if (current_pixels < pixels)
         {
             delta_x = pixels - current_pixels;
+            count_pixels += delta_x;
+            current_pixels += delta_x;
             do_scroll(direction, delta_x);
+        }
+        if (count_pixels != pixels)
+        {
+            kBUG("In printk: count_pixels(%d) != pixels(%d) current_pixels = %d", count_pixels, pixels, current_pixels);
+            while (1)
+                ;
         }
     }
 

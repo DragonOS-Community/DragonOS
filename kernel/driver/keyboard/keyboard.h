@@ -70,8 +70,8 @@ uint keycode_map_normal[NUM_SCAN_CODES*MAP_COLS] =
 /*0x0b*/	'0',		')',
 /*0x0c*/	'-',		'_',
 /*0x0d*/	'=',		'+',
-/*0x0e*/	0,		0,		//BACKSPACE	
-/*0x0f*/	0,		0,		//TAB
+/*0x0e*/	'\b',		'\b',		//BACKSPACE	
+/*0x0f*/	'\t',		'\t',		//TAB
 
 /*0x10*/	'q',		'Q',
 /*0x11*/	'w',		'W',
@@ -85,7 +85,7 @@ uint keycode_map_normal[NUM_SCAN_CODES*MAP_COLS] =
 /*0x19*/	'p',		'P',
 /*0x1a*/	'[',		'{',
 /*0x1b*/	']',		'}',
-/*0x1c*/	0,		0,		//ENTER
+/*0x1c*/	'\n',		'\n',		//ENTER
 /*0x1d*/	0x1d,		0x1d,		//CTRL Left
 /*0x1e*/	'a',		'A',
 /*0x1f*/	's',		'S',

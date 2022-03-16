@@ -693,7 +693,6 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
             }
 
             putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, FRcolor, BKcolor, ' ');
-            ++pos.x;
 
             auto_newline();
         }
@@ -754,7 +753,7 @@ int scroll(bool direction, int pixels, bool animation)
         return do_scroll(direction, pixels);
     else
     {
-        int count_pixels = 0;
+
         int steps;
         if (pixels > 10)
             steps = 5;
@@ -775,7 +774,6 @@ int scroll(bool direction, int pixels, bool animation)
             trace[js_trace] = (int)(accelerate * i + 0.5);
             current_pixels += trace[js_trace];
             do_scroll(direction, trace[js_trace]);
-            count_pixels += trace[js_trace];
 
             ++js_trace;
         }
@@ -785,7 +783,6 @@ int scroll(bool direction, int pixels, bool animation)
         {
             delta_x = pixels / 2 - current_pixels;
             current_pixels += delta_x;
-            count_pixels += delta_x;
             do_scroll(direction, delta_x);
         }
 
@@ -794,7 +791,6 @@ int scroll(bool direction, int pixels, bool animation)
         {
             current_pixels += trace[i];
             do_scroll(direction, trace[i]);
-            count_pixels += trace[i];
         }
 
         if (current_pixels > pixels)
@@ -804,15 +800,8 @@ int scroll(bool direction, int pixels, bool animation)
         if (current_pixels < pixels)
         {
             delta_x = pixels - current_pixels;
-            count_pixels += delta_x;
             current_pixels += delta_x;
             do_scroll(direction, delta_x);
-        }
-        if (count_pixels != pixels)
-        {
-            kBUG("In printk: count_pixels(%d) != pixels(%d) current_pixels = %d", count_pixels, pixels, current_pixels);
-            while (1)
-                ;
         }
     }
 

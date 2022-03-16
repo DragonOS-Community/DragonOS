@@ -345,7 +345,7 @@ void keyboard_analyze_keycode()
             break;
         }
         if (key)
-            printk_color(ORANGE, WHITE, "(key:%c)\t", key);
+            printk_color(ORANGE, BLACK, "%c", key);
     }
 }
 

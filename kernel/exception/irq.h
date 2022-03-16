@@ -88,7 +88,7 @@ extern void do_IRQ(struct pt_regs *regs, ul number);
 
 */
 
-typedef struct hardware_int_type
+typedef struct hardware_intr_type
 {
     // 使能中断操作接口
     void (*enable)(ul irq_num);
@@ -101,12 +101,12 @@ typedef struct hardware_int_type
     void (*uninstall)(ul irq_num);
     // 应答中断操作接口
     void (*ack)(ul irq_num);
-} hardware_int_controller;
+} hardware_intr_controller;
 
 // 中断描述结构体
 typedef struct
 {
-    hardware_int_controller *controller;
+    hardware_intr_controller *controller;
     // 中断名
     char *irq_name;
     // 中断处理函数的参数
@@ -132,7 +132,7 @@ irq_desc_t interrupt_desc[IRQ_NUM] = {0};
  * @param irq_name 中断名
  * @return int 
  */
-int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter, struct pt_regs *regs), ul paramater, hardware_int_controller *controller, char *irq_name);
+int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter, struct pt_regs *regs), ul paramater, hardware_intr_controller *controller, char *irq_name);
 
 /**
  * @brief 中断注销函数

@@ -212,7 +212,7 @@ struct apic_IO_APIC_RTE_entry
 #define ICR_ALL_INCLUDE_Self 2
 #define ICR_ALL_EXCLUDE_Self 3
 
-// 目标模式
+// 投递目标模式
 #define DEST_PHYSICAL 0 // 物理模式
 #define DEST_LOGIC 1    // 逻辑模式
 
@@ -220,7 +220,7 @@ struct apic_IO_APIC_RTE_entry
 #define ICR_LEVEL_DE_ASSERT 0
 #define ICR_LEVEL_ASSERT 1
 
-// 远程IRR
+// 远程IRR标志位, 在处理Local APIC标志位时置位，在收到处理器发来的EOI命令时复位
 #define IRR_RESET 0
 #define IRR_ACCEPT 1
 

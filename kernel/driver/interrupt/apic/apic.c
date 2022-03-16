@@ -291,13 +291,14 @@ void do_IRQ(struct pt_regs *rsp, ul number)
 {
 
     unsigned char x = io_in8(0x60);
-    printk_color(BLUE, WHITE, "(IRQ:%#04x)\tkey code:%#04x\n", number, x);
 
     irq_desc_t *irq = &interrupt_desc[number - 32];
 
     // 执行中断上半部处理程序
     if (irq->handler != NULL)
         irq->handler(number, irq->parameter, rsp);
+    else
+        kwarn("Intr vector [%d] does not have a handler!");
 
     // 向中断控制器发送应答消息
     if (irq->controller != NULL && irq->controller->ack != NULL)
@@ -316,7 +317,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
  * @param index 索引值
  * @return ul
  */
-ul apic_read_ioapic_rte(unsigned char index)
+ul apic_ioapic_read_rte(unsigned char index)
 {
     // 由于处理器的乱序执行的问题，需要加入内存屏障以保证结果的正确性。
     ul ret;

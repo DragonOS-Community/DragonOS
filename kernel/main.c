@@ -15,6 +15,7 @@
 
 #include "driver/multiboot2/multiboot2.h"
 #include "driver/acpi/acpi.h"
+#include "driver/keyboard/keyboard.h"
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
@@ -159,8 +160,8 @@ void system_initialize()
     // 先初始化系统调用模块
     syscall_init();
 
-    //cpu_init();
-    
+    cpu_init();
+    keyboard_init();
     // test_slab();
     // test_mm();
 

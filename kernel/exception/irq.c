@@ -122,7 +122,7 @@ void (*interrupt_table[24])(void) =
  * @param irq_name 中断名
  * @return int
  */
-int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter, struct pt_regs *regs), ul paramater, hardware_int_controller *controller, char *irq_name)
+int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter, struct pt_regs *regs), ul paramater, hardware_intr_controller *controller, char *irq_name)
 {
     // 由于为I/O APIC分配的中断向量号是从32开始的，因此要减去32才是对应的interrupt_desc的元素
     irq_desc_t *p = &interrupt_desc[irq_num - 32];

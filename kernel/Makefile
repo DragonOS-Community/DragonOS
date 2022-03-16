@@ -20,10 +20,10 @@ all: kernel
 # cp kernel ../bin/kernel/kernel.elf
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o keyboard.o
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o	\
-	driver/acpi/acpi.o driver/interrupt/pic.o 	\
+	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/keyboard.o \
 	-T link.lds
 
 head.o: head.S
@@ -85,6 +85,9 @@ multiboot2.o: driver/multiboot2/multiboot2.c
 
 acpi.o: driver/acpi/acpi.c 
 	gcc $(CFLAGS) -c driver/acpi/acpi.c  -o driver/acpi/acpi.o
+
+keyboard.o: driver/keyboard/keyboard.c
+	gcc $(CFLAGS) -c driver/keyboard/keyboard.c  -o driver/keyboard/keyboard.o
 
 clean: 
 	rm -rf $(GARBAGE)

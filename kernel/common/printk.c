@@ -51,7 +51,7 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     ul *tmp1;
     // 初始化2M物理页
-    for (ul i = 0; i < (pos.FB_length<<2); i += PAGE_2M_SIZE)
+    for (ul i = 0; i < (pos.FB_length << 2); i += PAGE_2M_SIZE)
     {
         // 计算当前2M物理页对应的pdt的页表项的物理地址
         tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));
@@ -69,9 +69,9 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     kdebug("width=%d\theight=%d", pos.width, pos.height);
 
-    while(1)
+    while (1)
 
-    return 0;
+        return 0;
 }
 
 int set_printk_pos(const int x, const int y)
@@ -114,7 +114,7 @@ void auto_newline()
         pos.y = pos.max_y;
         int lines_to_scroll = 2;
         scroll(true, lines_to_scroll * pos.char_size_y, false);
-        pos.y -= lines_to_scroll;
+        pos.y -= (lines_to_scroll-1);
     }
 }
 
@@ -674,7 +674,7 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
 
             while (space_to_print--)
             {
-                putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, BLACK, BLACK, ' ');
+                putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, FRcolor, BKcolor, ' ');
                 ++pos.x;
 
                 auto_newline();
@@ -723,6 +723,9 @@ int do_scroll(bool direction, int pixels)
 
         memcpy(pos.FB_address, (pos.FB_address + src), sizeof(unsigned int) * (pos.FB_length - src));
         memset(pos.FB_address + (pos.FB_length - src), 0, sizeof(unsigned int) * (src));
+        for (int i = 0; i < 1000; ++i)
+            for (int j = 0; j < 1000; ++j)
+                ;
         return 0;
     }
     else
@@ -811,7 +814,7 @@ int scroll(bool direction, int pixels, bool animation)
  */
 int cls()
 {
-    memset(pos.FB_address, BLACK, pos.FB_length*sizeof(unsigned int));
+    memset(pos.FB_address, BLACK, pos.FB_length * sizeof(unsigned int));
     pos.x = 0;
     pos.y = 0;
     return 0;
@@ -843,7 +846,7 @@ void set_pos_VBE_FB_addr(uint *virt_addr)
     pos.FB_address = (uint *)virt_addr;
 }
 
-uint* get_pos_VBE_FB_addr()
+uint *get_pos_VBE_FB_addr()
 {
     return pos.FB_address;
 }

@@ -179,7 +179,7 @@ void Start_Kernel(void)
     // test_mm();
 
     while (1)
-        ;
+        keyboard_analyze_keycode();
 }
 
 void ignore_int()

@@ -58,7 +58,7 @@ bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_da
         return false;
     //*(struct acpi_Multiple_APIC_Description_Table_t *)_data = *(struct acpi_Multiple_APIC_Description_Table_t *)_iter_data;
     // 返回MADT的虚拟地址
-    *(ul*)_data = _iter_data;
+    *(ul*)_data = (ul)_iter_data;
     
     return true;
 }

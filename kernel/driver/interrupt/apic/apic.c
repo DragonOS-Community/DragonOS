@@ -55,7 +55,7 @@ void apic_io_apic_init()
     apic_ioapic_map.virtual_EOI_addr = (uint *)(APIC_IO_APIC_VIRT_BASE_ADDR + 0x40);
 
     // 填写页表，完成地址映射
-    mm_map_phys_addr(apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+    mm_map_phys_addr((ul)apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
 
     // 设置IO APIC ID 为0x0f000000
     *apic_ioapic_map.virtual_index_addr = 0x00;

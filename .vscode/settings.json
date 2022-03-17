@@ -17,7 +17,8 @@
         "multiboot2.h": "c",
         "kprint.h": "c",
         "8259a.h": "c",
-        "ptrace.h": "c"
+        "ptrace.h": "c",
+        "mouse.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled"
 }

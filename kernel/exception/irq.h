@@ -59,7 +59,7 @@ extern void do_IRQ(struct pt_regs *regs, ul number);
 	41	Generic
 	42	Generic
 	43	HPET timer 2
-	44	HPET timer 3
+	44	HPET timer 3	/ mouse
 	45	FERR#
 	46	SATA primary
 	47	SATA secondary

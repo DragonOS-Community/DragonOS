@@ -2,6 +2,8 @@
 
 #include "../../common/glib.h"
 
+#define KEYBOARD_INTR_VECTOR 0x21   // 键盘的中断向量号
+
 // 定义键盘循环队列缓冲区大小为100bytes
 #define keyboard_buffer_size 100
 
@@ -25,7 +27,7 @@ struct keyboard_input_buffer
 #define KEYBOARD_COMMAND_READ 0x20  // 读取键盘的配置值
 #define KEYBOARD_PARAM_INIT 0x47    // 初始化键盘控制器的配置值
 
-// ========= 检测键盘输入/输出缓冲区是否已满
+// ========= 检测键盘控制器输入/输出缓冲区是否已满
 #define KEYBOARD_FLAG_OUTBUF_FULL 0x01 // 键盘的输出缓冲区已满标志位
 #define KEYBOARD_FLAG_INBUF_FULL 0x02  // 键盘的输入缓冲区已满标志位
 

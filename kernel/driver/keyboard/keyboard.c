@@ -33,7 +33,7 @@ hardware_intr_controller keyboard_intr_controller =
 void keyboard_handler(ul irq_num, ul param, struct pt_regs *regs)
 {
     // 读取键盘输入的信息
-    unsigned x = io_in8(0x60);
+    unsigned char x = io_in8(PORT_KEYBOARD_DATA);
     // printk_color(ORANGE, BLACK, "key_pressed:%02x\n", x);
 
     // 当头指针越过界时，恢复指向数组头部
@@ -69,7 +69,7 @@ void keyboard_init()
 
     // ======== 初始化中断RTE entry ==========
 
-    entry.vector = 0x21;                // 设置中断向量号
+    entry.vector = KEYBOARD_INTR_VECTOR;                // 设置中断向量号
     entry.deliver_mode = IO_APIC_FIXED; // 投递模式：混合
     entry.dest_mode = DEST_PHYSICAL;    // 物理模式投递中断
     entry.deliver_status = IDLE;
@@ -102,7 +102,7 @@ void keyboard_init()
     alt_r = false;
 
     // 注册中断处理程序
-    irq_register(0x21, &entry, &keyboard_handler, (ul)kb_buf_ptr, &keyboard_intr_controller, "ps/2 keyboard");
+    irq_register(KEYBOARD_INTR_VECTOR, &entry, &keyboard_handler, (ul)kb_buf_ptr, &keyboard_intr_controller, "ps/2 keyboard");
 }
 
 /**
@@ -111,7 +111,7 @@ void keyboard_init()
  */
 void keyboard_exit()
 {
-    irq_unregister(0x21);
+    irq_unregister(KEYBOARD_INTR_VECTOR);
     kfree((ul *)kb_buf_ptr);
 }
 

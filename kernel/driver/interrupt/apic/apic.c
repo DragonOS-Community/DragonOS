@@ -63,7 +63,7 @@ void apic_io_apic_init()
     *apic_ioapic_map.virtual_data_addr = 0x0f000000;
     io_mfence();
 
-    kdebug("IOAPIC Version:%#010x", ((*apic_ioapic_map.virtual_data_addr) >> 24) & 0xf);
+    kdebug("I/O APIC ID:%#010x", ((*apic_ioapic_map.virtual_data_addr) >> 24) & 0xff);
     io_mfence();
 
     // 获取IO APIC Version

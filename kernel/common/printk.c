@@ -405,7 +405,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
     return str - buf;
 }
 
-static char *write_num(char *str, ull num, int base, int field_width, int precision, int flags)
+static char *write_num(char *str, ll num, int base, int field_width, int precision, int flags)
 {
     /**
      * @brief 将数字按照指定的要求转换成对应的字符串

@@ -9,7 +9,8 @@ static struct mouse_input_buffer *mouse_buf_ptr = NULL;
 static int c = 0;
 struct apic_IO_APIC_RTE_entry mouse_entry;
 static unsigned char mouse_id = 0;
-
+struct mouse_packet_3bytes pak;
+static mouse_count = 0;
 /**
  * @brief 清空缓冲区
  *
@@ -63,14 +64,14 @@ void mouse_handler(ul irq_num, ul param, struct pt_regs *regs)
 
     if (mouse_buf_ptr->count >= mouse_buffer_size)
     {
-        // kwarn("mouse input buffer is full.");
-        // return;
+        kwarn("mouse input buffer is full.");
+        return;
     }
 
     *mouse_buf_ptr->ptr_head = x;
     ++(mouse_buf_ptr->count);
     ++(mouse_buf_ptr->ptr_head);
-    //printk("c=%d\tval = %d\n", ++c, x);
+    printk("c=%d\tval = %d\n", ++c, x);
 }
 
 hardware_intr_controller mouse_intr_controller =
@@ -241,8 +242,10 @@ void mouse_init()
         for (int j = 0; j < 1000; j++)
             nop();
     wait_keyboard_write();
-    mouse_enable_5keys();
-    mouse_get_mouse_ID();
+    // mouse_enable_5keys();
+    //mouse_get_mouse_ID();
+    //mouse_set_sample_rate(100);
+    mouse_clear_buf();
     kdebug("mouse ID:%d", mouse_id);
     c = 0;
 }
@@ -265,13 +268,13 @@ void mouse_exit()
  */
 int mouse_get_packet(void *packet)
 {
-    if (mouse_buf_ptr->count != 0)
-        kdebug("at  get packet: count=%d", mouse_buf_ptr->count);
+    // if (mouse_buf_ptr->count != 0)
+    //     kdebug("at  get packet: count=%d", mouse_buf_ptr->count);
     int code = 0;
     switch (mouse_id)
     {
     case 0: // 3bytes 数据包
-        if (mouse_buf_ptr->count < 3)
+        if (mouse_buf_ptr->count < 4)
             return EFAIL;
         do
         {
@@ -296,7 +299,7 @@ int mouse_get_packet(void *packet)
 
     case 3: // 4bytes数据包
     case 4:
-        if (mouse_buf_ptr->count < 4)
+        if (mouse_buf_ptr->count < 5)
             return EFAIL;
         do
         {
@@ -331,4 +334,39 @@ int mouse_get_packet(void *packet)
         break;
     }
     return SUCCESS;
+}
+
+void analyze_mousecode()
+{
+    if(!mouse_buf_ptr->count)
+        return;
+    else printk_color(ORANGE, BLACK, "COUNT=%d\n", mouse_buf_ptr->count);
+    unsigned char x = mouse_get_scancode();
+
+    switch (mouse_count)
+    {
+    case 0:
+        mouse_count++;
+        break;
+
+    case 1:
+        pak.byte0 = x;
+        mouse_count++;
+        break;
+
+    case 2:
+        pak.movement_x = (char)x;
+        mouse_count++;
+        break;
+
+    case 3:
+        pak.movement_y = (char)x;
+        mouse_count = 1;
+        
+        printk_color(RED, GREEN, "(M:%02x,X:%3d,Y:%3d)\tcount=%d\n", pak.byte0, pak.movement_x, pak.movement_y, mouse_buf_ptr->count);
+        break;
+
+    default:
+        break;
+    }
 }

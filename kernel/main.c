@@ -180,23 +180,29 @@ void Start_Kernel(void)
     // show_welcome();
     // test_mm();
 
-/*
+    /*
+        while (1)
+        {
+            keyboard_analyze_keycode();
+            struct mouse_packet_3bytes packet = {0};
+            //struct mouse_packet_4bytes packet = {0};
+            int errcode = 0;
+            errcode = mouse_get_packet(&packet);
+            if(errcode == 0)
+            {
+                printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y);
+                //printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d, byte3:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y, (unsigned char)packet.byte3);
+            }
+        }
+        */
+
     while (1)
     {
-        keyboard_analyze_keycode();
-        struct mouse_packet_3bytes packet = {0};
-        //struct mouse_packet_4bytes packet = {0};
-        int errcode = 0;
-        errcode = mouse_get_packet(&packet);
-        if(errcode == 0)
-        {
-            printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y);
-            //printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d, byte3:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y, (unsigned char)packet.byte3);
-        }
+        analyze_mousecode();
     }
-    */
-   while(1);
-    
+
+    while (1)
+        ;
 }
 
 void ignore_int()

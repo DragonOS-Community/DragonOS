@@ -105,3 +105,4 @@ int mouse_set_sample_rate(unsigned int hz);
  * @return int 错误码
  */
 int mouse_get_packet(void *packet);
+void analyze_mousecode();

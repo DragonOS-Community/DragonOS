@@ -24,8 +24,8 @@ void apic_io_apic_init()
 {
 
     ul madt_addr;
-    kdebug("madt_addr = %#018lx", (ul)madt_addr);
     acpi_iter_SDT(acpi_get_MADT, &madt_addr);
+    kdebug("madt_addr = %#018lx", (ul)madt_addr);
     madt = (struct acpi_Multiple_APIC_Description_Table_t *)madt_addr;
 
     kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);

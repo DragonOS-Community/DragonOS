@@ -5,7 +5,7 @@
 #include "../../mm/mm.h"
 
 // 获取RSDT entry的虚拟地址
-#define acpi_get_RSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + MASK_HIGH_32bit(phys_addr) - acpi_RSDT_entry_phys_base)
+#define acpi_get_RSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_RSDT_entry_phys_base)
 
 static struct acpi_RSDP_t *rsdpv1;
 static struct acpi_RSDP_2_t *rsdpv2;
@@ -35,6 +35,9 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
     {
 
         sdt_header = (struct acpi_system_description_table_header_t *)(acpi_get_RSDT_entry_vaddr((ul)(*(ent + i))));
+        kwarn("vvv=%#018lx", (ul)(*(ent + i)));
+        kwarn("vaddr=%#018lx", (ul)acpi_get_RSDT_entry_vaddr((ul)(*(ent + i))));
+        printk_color(ORANGE, BLACK,"kkl=%s\n", sdt_header->Signature);
 
         if (_fun(sdt_header, _data) == true)
             return;
@@ -58,8 +61,10 @@ bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_da
         return false;
     //*(struct acpi_Multiple_APIC_Description_Table_t *)_data = *(struct acpi_Multiple_APIC_Description_Table_t *)_iter_data;
     // 返回MADT的虚拟地址
-    *(ul*)_data = (ul)_iter_data;
     
+    *(ul *)_data = (ul)_iter_data;
+    printk_color(ORANGE, BLACK,"xxx=%#018lx\n", (ul)_iter_data);
+
     return true;
 }
 
@@ -67,6 +72,7 @@ bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_da
  * @brief 初始化acpi模块
  *
  */
+// todo: 修复bug：当物理机上提供了rsdpv2之后，rsdpv1是不提供的（物理地址为0），因此需要手动判断rsdp的版本信息，然后做对应的解析。
 void acpi_init()
 {
     kinfo("Initializing ACPI...");
@@ -103,6 +109,7 @@ void acpi_init()
     printk_color(ORANGE, BLACK, "RSDT Length=%dbytes.\n", rsdt->header.Length);
     printk_color(ORANGE, BLACK, "RSDT Entry num=%d\n", acpi_RSDT_Entry_num);
 
+    mm_map_phys_addr(ACPI_RSDT_VIRT_ADDR_BASE, rsdt_phys_base, rsdt->header.Length + PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
     // 映射所有的Entry的物理地址
     acpi_RSDT_entry_phys_base = ((ul)(rsdt->Entry)) & PAGE_2M_MASK;
     // 由于地址只是32bit的，并且存在脏数据，这里需要手动清除高32bit，否则会触发#GP

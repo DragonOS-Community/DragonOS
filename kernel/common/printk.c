@@ -342,7 +342,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
         case 'X':
             // flags |= SPECIAL;
             if (qualifier == 'l')
-                str = write_num(str, va_arg(args, ull), 16, field_width, precision, flags);
+                str = write_num(str, va_arg(args, ll), 16, field_width, precision, flags);
             else
                 str = write_num(str, va_arg(args, int), 16, field_width, precision, flags);
             break;

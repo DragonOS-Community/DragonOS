@@ -7,7 +7,7 @@
 
 static struct mouse_input_buffer *mouse_buf_ptr = NULL;
 static int c = 0;
-struct apic_IO_APIC_RTE_entry entry;
+struct apic_IO_APIC_RTE_entry mouse_entry;
 static unsigned char mouse_id = 0;
 
 /**
@@ -70,7 +70,7 @@ void mouse_handler(ul irq_num, ul param, struct pt_regs *regs)
     *mouse_buf_ptr->ptr_head = x;
     ++(mouse_buf_ptr->count);
     ++(mouse_buf_ptr->ptr_head);
-    printk("c=%d\n", ++c);
+    //printk("c=%d\tval = %d\n", ++c, x);
 }
 
 hardware_intr_controller mouse_intr_controller =
@@ -96,6 +96,9 @@ static unsigned char mouse_get_mouse_ID()
     io_out8(PORT_KEYBOARD_DATA, MOUSE_GET_ID);
     wait_keyboard_write();
     mouse_id = io_in8(PORT_KEYBOARD_DATA);
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
     return mouse_id;
 }
 
@@ -120,10 +123,17 @@ int mouse_set_sample_rate(unsigned int hz)
         wait_keyboard_write();
         io_out8(PORT_KEYBOARD_DATA, MOUSE_SET_SAMPLING_RATE);
         wait_keyboard_write();
+        for (int i = 0; i < 1000; i++)
+            for (int j = 0; j < 1000; j++)
+                nop();
         io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_SEND_TO_MOUSE);
         wait_keyboard_write();
         io_out8(PORT_KEYBOARD_DATA, hz);
+        for (int i = 0; i < 1000; i++)
+            for (int j = 0; j < 1000; j++)
+                nop();
         wait_keyboard_write();
+
         break;
 
     default:
@@ -192,37 +202,46 @@ void mouse_init()
 
     // ======== 初始化中断RTE entry ==========
 
-    entry.vector = MOUSE_INTR_VECTOR;   // 设置中断向量号
-    entry.deliver_mode = IO_APIC_FIXED; // 投递模式：混合
-    entry.dest_mode = DEST_PHYSICAL;    // 物理模式投递中断
-    entry.deliver_status = IDLE;
-    entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
-    entry.polarity = POLARITY_HIGH;    // 高电平触发
-    entry.remote_IRR = IRR_RESET;
-    entry.mask = MASKED;
-    entry.reserved = 0;
+    mouse_entry.vector = MOUSE_INTR_VECTOR;   // 设置中断向量号
+    mouse_entry.deliver_mode = IO_APIC_FIXED; // 投递模式：混合
+    mouse_entry.dest_mode = DEST_PHYSICAL;    // 物理模式投递中断
+    mouse_entry.deliver_status = IDLE;
+    mouse_entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
+    mouse_entry.polarity = POLARITY_HIGH;    // 高电平触发
+    mouse_entry.remote_IRR = IRR_RESET;
+    mouse_entry.mask = MASKED;
+    mouse_entry.reserved = 0;
 
-    entry.destination.physical.reserved1 = 0;
-    entry.destination.physical.reserved2 = 0;
-    entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
+    mouse_entry.destination.physical.reserved1 = 0;
+    mouse_entry.destination.physical.reserved2 = 0;
+    mouse_entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
 
     // 注册中断处理程序
-    irq_register(MOUSE_INTR_VECTOR, &entry, &mouse_handler, (ul)mouse_buf_ptr, &mouse_intr_controller, "ps/2 mouse");
+    irq_register(MOUSE_INTR_VECTOR, &mouse_entry, &mouse_handler, (ul)mouse_buf_ptr, &mouse_intr_controller, "ps/2 mouse");
 
     wait_keyboard_write();
     io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_ENABLE_MOUSE_PORT); // 开启鼠标端口
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
     wait_keyboard_write();
 
     io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_SEND_TO_MOUSE);
     wait_keyboard_write();
     io_out8(PORT_KEYBOARD_DATA, MOUSE_ENABLE); // 允许鼠标设备发送数据包
-    wait_keyboard_write();
 
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
+    wait_keyboard_write();
     io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_WRITE);
     wait_keyboard_write();
     io_out8(PORT_KEYBOARD_DATA, KEYBOARD_PARAM_INIT); // 设置键盘控制器
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
     wait_keyboard_write();
-    //mouse_enable_5keys();
+    mouse_enable_5keys();
     mouse_get_mouse_ID();
     kdebug("mouse ID:%d", mouse_id);
     c = 0;

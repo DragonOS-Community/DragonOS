@@ -18,7 +18,9 @@
         "kprint.h": "c",
         "8259a.h": "c",
         "ptrace.h": "c",
-        "mouse.h": "c"
+        "mouse.h": "c",
+        "keyboard.h": "c",
+        "apic.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled"
 }

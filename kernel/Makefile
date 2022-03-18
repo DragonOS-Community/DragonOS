@@ -19,10 +19,10 @@ all: kernel
 	objcopy -I elf64-x86-64 -S -R ".comment" -R ".eh_frame" -O elf64-x86-64 kernel ../bin/kernel/kernel.elf
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o keyboard.o mouse.o
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o	\
-	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/keyboard.o driver/mouse/mouse.o \
+	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o \
 	-T link.lds
 
 head.o: head.S
@@ -85,11 +85,11 @@ multiboot2.o: driver/multiboot2/multiboot2.c
 acpi.o: driver/acpi/acpi.c 
 	gcc $(CFLAGS) -c driver/acpi/acpi.c  -o driver/acpi/acpi.o
 
-keyboard.o: driver/keyboard/keyboard.c
-	gcc $(CFLAGS) -c driver/keyboard/keyboard.c  -o driver/keyboard/keyboard.o
+ps2_keyboard.o: driver/keyboard/ps2_keyboard.c
+	gcc $(CFLAGS) -c driver/keyboard/ps2_keyboard.c  -o driver/keyboard/ps2_keyboard.o
 
-mouse.o: driver/mouse/mouse.c
-	gcc $(CFLAGS) -c driver/mouse/mouse.c -o driver/mouse/mouse.o
+ps2_mouse.o: driver/mouse/ps2_mouse.c
+	gcc $(CFLAGS) -c driver/mouse/ps2_mouse.c -o driver/mouse/ps2_mouse.o
 
 
 clean: 

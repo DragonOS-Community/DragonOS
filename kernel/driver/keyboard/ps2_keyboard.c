@@ -1,10 +1,10 @@
-#include "keyboard.h"
+#include "ps2_keyboard.h"
 #include "../interrupt/apic/apic.h"
 #include "../../mm/mm.h"
 #include "../../mm/slab.h"
 #include "../../common/printk.h"
 
-static struct keyboard_input_buffer *kb_buf_ptr = NULL;
+static struct ps2_keyboard_input_buffer *kb_buf_ptr = NULL;
 
 // 功能键标志变量
 static bool shift_l, shift_r, ctrl_l, ctrl_r, alt_l, alt_r;
@@ -13,7 +13,7 @@ static bool kp_forward_slash, kp_en;
 
 struct apic_IO_APIC_RTE_entry entry;
 
-hardware_intr_controller keyboard_intr_controller =
+hardware_intr_controller ps2_keyboard_intr_controller =
     {
         .enable = apic_ioapic_enable,
         .disable = apic_ioapic_disable,
@@ -30,19 +30,19 @@ hardware_intr_controller keyboard_intr_controller =
  * @param param 参数
  * @param regs 寄存器信息
  */
-void keyboard_handler(ul irq_num, ul param, struct pt_regs *regs)
+void ps2_keyboard_handler(ul irq_num, ul param, struct pt_regs *regs)
 {
     // 读取键盘输入的信息
-    unsigned char x = io_in8(PORT_KEYBOARD_DATA);
+    unsigned char x = io_in8(PORT_PS2_KEYBOARD_DATA);
     // printk_color(ORANGE, BLACK, "key_pressed:%02x\n", x);
 
     // 当头指针越过界时，恢复指向数组头部
-    if (kb_buf_ptr->ptr_head == kb_buf_ptr->buffer + keyboard_buffer_size)
+    if (kb_buf_ptr->ptr_head == kb_buf_ptr->buffer + ps2_keyboard_buffer_size)
         kb_buf_ptr->ptr_head = kb_buf_ptr->buffer;
 
-    if (kb_buf_ptr->count >= keyboard_buffer_size)
+    if (kb_buf_ptr->count >= ps2_keyboard_buffer_size)
     {
-        kwarn("Keyboard input buffer is full.");
+        kwarn("ps2_keyboard input buffer is full.");
         return;
     }
 
@@ -54,24 +54,26 @@ void keyboard_handler(ul irq_num, ul param, struct pt_regs *regs)
  * @brief 初始化键盘驱动程序的函数
  *
  */
-void keyboard_init()
+void ps2_keyboard_init()
 {
+    // 开启键盘中断，中断向量号为0x21，物理模式，投递至BSP处理器
+    apic_ioapic_write_rte(0x12, 0x21);
     // ======= 初始化键盘循环队列缓冲区 ===========
 
     // 申请键盘循环队列缓冲区的内存
-    kb_buf_ptr = (struct keyboard_input_buffer *)kmalloc(sizeof(struct keyboard_input_buffer), 0);
+    kb_buf_ptr = (struct ps2_keyboard_input_buffer *)kmalloc(sizeof(struct ps2_keyboard_input_buffer), 0);
 
     kb_buf_ptr->ptr_head = kb_buf_ptr->buffer;
     kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer;
     kb_buf_ptr->count = 0;
 
-    memset(kb_buf_ptr->buffer, 0, keyboard_buffer_size);
+    memset(kb_buf_ptr->buffer, 0, ps2_keyboard_buffer_size);
 
     // ======== 初始化中断RTE entry ==========
 
-    entry.vector = KEYBOARD_INTR_VECTOR;                // 设置中断向量号
-    entry.deliver_mode = IO_APIC_FIXED; // 投递模式：混合
-    entry.dest_mode = DEST_PHYSICAL;    // 物理模式投递中断
+    entry.vector = PS2_KEYBOARD_INTR_VECTOR; // 设置中断向量号
+    entry.deliver_mode = IO_APIC_FIXED;      // 投递模式：混合
+    entry.dest_mode = DEST_PHYSICAL;         // 物理模式投递中断
     entry.deliver_status = IDLE;
     entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
     entry.polarity = POLARITY_HIGH;    // 高电平触发
@@ -84,11 +86,11 @@ void keyboard_init()
     entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
 
     // ======== 初始化键盘控制器，写入配置值 =========
-    wait_keyboard_write();
-    io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_WRITE);
-    wait_keyboard_write();
-    io_out8(PORT_KEYBOARD_DATA, KEYBOARD_PARAM_INIT);
-    wait_keyboard_write();
+    wait_ps2_keyboard_write();
+    io_out8(PORT_PS2_KEYBOARD_CONTROL, PS2_KEYBOARD_COMMAND_WRITE);
+    wait_ps2_keyboard_write();
+    io_out8(PORT_PS2_KEYBOARD_DATA, PS2_KEYBOARD_PARAM_INIT);
+    wait_ps2_keyboard_write();
 
     // 执行一百万次nop，等待键盘控制器把命令执行完毕
     for (int i = 0; i < 1000; ++i)
@@ -102,16 +104,17 @@ void keyboard_init()
     alt_r = false;
 
     // 注册中断处理程序
-    irq_register(KEYBOARD_INTR_VECTOR, &entry, &keyboard_handler, (ul)kb_buf_ptr, &keyboard_intr_controller, "ps/2 keyboard");
+    irq_register(PS2_KEYBOARD_INTR_VECTOR, &entry, &ps2_keyboard_handler, (ul)kb_buf_ptr, &ps2_keyboard_intr_controller, "ps/2 keyboard");
+    kdebug("kb registered.");
 }
 
 /**
  * @brief 键盘驱动卸载函数
  *
  */
-void keyboard_exit()
+void ps2_keyboard_exit()
 {
-    irq_unregister(KEYBOARD_INTR_VECTOR);
+    irq_unregister(PS2_KEYBOARD_INTR_VECTOR);
     kfree((ul *)kb_buf_ptr);
 }
 
@@ -119,11 +122,11 @@ void keyboard_exit()
  * @brief 解析键盘扫描码
  *
  */
-void keyboard_analyze_keycode()
+void ps2_keyboard_analyze_keycode()
 {
     bool flag_make = false;
 
-    int c = keyboard_get_scancode();
+    int c = ps2_keyboard_get_scancode();
     // 循环队列为空
     if (c == -1)
         return;
@@ -136,7 +139,7 @@ void keyboard_analyze_keycode()
         key = PAUSE_BREAK;
         // 清除缓冲区中剩下的扫描码
         for (int i = 1; i < 6; ++i)
-            if (keyboard_get_scancode() != pause_break_scan_code[i])
+            if (ps2_keyboard_get_scancode() != pause_break_scan_code[i])
             {
                 key = 0;
                 break;
@@ -145,20 +148,20 @@ void keyboard_analyze_keycode()
     else if (scancode == 0xE0) // 功能键, 有多个扫描码
     {
         // 获取下一个扫描码
-        scancode = keyboard_get_scancode();
+        scancode = ps2_keyboard_get_scancode();
         switch (scancode)
         {
         case 0x2a: // print screen 按键被按下
-            if (keyboard_get_scancode() == 0xe0)
-                if (keyboard_get_scancode() == 0x37)
+            if (ps2_keyboard_get_scancode() == 0xe0)
+                if (ps2_keyboard_get_scancode() == 0x37)
                 {
                     key = PRINT_SCREEN;
                     flag_make = true;
                 }
             break;
         case 0xb7: // print screen 按键被松开
-            if (keyboard_get_scancode() == 0xe0)
-                if (keyboard_get_scancode() == 0xaa)
+            if (ps2_keyboard_get_scancode() == 0xe0)
+                if (ps2_keyboard_get_scancode() == 0xaa)
                 {
                     key = PRINT_SCREEN;
                     flag_make = false;
@@ -353,13 +356,13 @@ void keyboard_analyze_keycode()
  * @brief 从缓冲队列中获取键盘扫描码
  *
  */
-int keyboard_get_scancode()
+int ps2_keyboard_get_scancode()
 {
     // 缓冲队列为空
     if (kb_buf_ptr->count == 0)
         return -1;
 
-    if (kb_buf_ptr->ptr_tail == kb_buf_ptr->buffer + keyboard_buffer_size)
+    if (kb_buf_ptr->ptr_tail == kb_buf_ptr->buffer + ps2_keyboard_buffer_size)
         kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer;
 
     int ret = (int)(*(kb_buf_ptr->ptr_tail));

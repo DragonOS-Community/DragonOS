@@ -20,7 +20,8 @@
         "ptrace.h": "c",
         "mouse.h": "c",
         "keyboard.h": "c",
-        "apic.h": "c"
+        "apic.h": "c",
+        "ps2_keyboard.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled"
 }

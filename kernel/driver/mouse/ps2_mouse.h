@@ -2,21 +2,21 @@
 
 #include "../../common/glib.h"
 
-#define MOUSE_INTR_VECTOR 0x2c // 鼠标的中断向量号
+#define PS2_MOUSE_INTR_VECTOR 0x2c // 鼠标的中断向量号
 
-#define KEYBOARD_COMMAND_SEND_TO_MOUSE 0xd4 // 键盘控制器向鼠标设备发送数据的命令
+#define KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE 0xd4 // 键盘控制器向鼠标设备发送数据的命令
 
-#define MOUSE_GET_ID 0xf2                    // 获取鼠标的ID
-#define MOUSE_SET_SAMPLING_RATE 0xf3         // 设置鼠标的采样率
-#define MOUSE_ENABLE 0xf4                    // 允许鼠标设备发送数据包
-#define MOUSE_DISABLE 0xf5                   // 禁止鼠标设备发送数据包
-#define MOUSE_SET_DEFAULT_SAMPLING_RATE 0xf6 // 设置使用默认采样率100hz，分辨率4px/mm
-#define MOUSE_RESEND_LAST_PACKET 0xfe        // 重新发送上一条数据包
-#define MOUSE_RESET 0xff                     // 重启鼠标
+#define PS2_MOUSE_GET_ID 0xf2                    // 获取鼠标的ID
+#define PS2_MOUSE_SET_SAMPLING_RATE 0xf3         // 设置鼠标的采样率
+#define PS2_MOUSE_ENABLE 0xf4                    // 允许鼠标设备发送数据包
+#define PS2_MOUSE_DISABLE 0xf5                   // 禁止鼠标设备发送数据包
+#define PS2_MOUSE_SET_DEFAULT_SAMPLING_RATE 0xf6 // 设置使用默认采样率100hz，分辨率4px/mm
+#define PS2_MOUSE_RESEND_LAST_PACKET 0xfe        // 重新发送上一条数据包
+#define PS2_MOUSE_RESET 0xff                     // 重启鼠标
 
-#define KEYBOARD_COMMAND_ENABLE_MOUSE_PORT 0xa8 // 通过键盘控制器开启鼠标端口的命令
+#define KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT 0xa8 // 通过键盘控制器开启鼠标端口的命令
 
-#define mouse_buffer_size 120
+#define ps2_mouse_buffer_size 360
 
 #define PORT_KEYBOARD_DATA 0x60
 #define PORT_KEYBOARD_STATUS 0x64
@@ -42,7 +42,7 @@
 // =========== 定义鼠标数据包 ==============
 // 其中，x、y方向的移动值用9位二进制补码表示（算上byte0中的符号位）
 // 目前只用到8位，（精度要求没那么高）
-struct mouse_packet_3bytes
+struct ps2_mouse_packet_3bytes
 {
 
     unsigned char byte0; // 第0字节
@@ -53,7 +53,7 @@ struct mouse_packet_3bytes
 };
 
 // ID = 3 或 ID = 4时，采用4bytes数据包
-struct mouse_packet_4bytes
+struct ps2_mouse_packet_4bytes
 {
     unsigned char byte0; // 第0字节
                          // [y溢出，x溢出，y符号位， x符号位， 1， 鼠标中键， 鼠标右键，鼠标左键]
@@ -71,32 +71,32 @@ struct mouse_packet_4bytes
  * @brief 键盘循环队列缓冲区结构体
  *
  */
-struct mouse_input_buffer
+struct ps2_mouse_input_buffer
 {
     unsigned char *ptr_head;
     unsigned char *ptr_tail;
     int count;
-    unsigned char buffer[mouse_buffer_size];
+    unsigned char buffer[ps2_mouse_buffer_size];
 };
 
 /**
  * @brief 初始化鼠标驱动程序
  *
  */
-void mouse_init();
+void ps2_mouse_init();
 
 /**
  * @brief 卸载鼠标驱动程序
  *
  */
-void mouse_exit();
+void ps2_mouse_exit();
 
 /**
  * @brief 设置鼠标采样率
  *
  * @param hz 采样率
  */
-int mouse_set_sample_rate(unsigned int hz);
+int ps2_mouse_set_sample_rate(unsigned int hz);
 
 /**
  * @brief 获取鼠标数据包
@@ -104,5 +104,5 @@ int mouse_set_sample_rate(unsigned int hz);
  * @param packet 数据包的返回值
  * @return int 错误码
  */
-int mouse_get_packet(void *packet);
+int ps2_mouse_get_packet(void *packet);
 void analyze_mousecode();

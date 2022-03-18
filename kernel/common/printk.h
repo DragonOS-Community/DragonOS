@@ -88,7 +88,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args);
  * @param precision 精度
  * @param flags 标志位
  */
-static char *write_num(char *str, ll num, int base, int field_width, int precision, int flags);
+static char *write_num(char *str,ul num, int base, int field_width, int precision, int flags);
 
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
 

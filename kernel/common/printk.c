@@ -112,9 +112,9 @@ void auto_newline()
     if (pos.y > pos.max_y)
     {
         pos.y = pos.max_y;
-        int lines_to_scroll = 2;
-        scroll(true, lines_to_scroll * pos.char_size_y, true);
-        pos.y -= (lines_to_scroll - 1);
+        int lines_to_scroll = 1;
+        scroll(true, lines_to_scroll * pos.char_size_y, false);
+        pos.y -= (lines_to_scroll-1);
     }
 }
 
@@ -405,7 +405,7 @@ static int vsprintf(char *buf, const char *fmt, va_list args)
     return str - buf;
 }
 
-static char *write_num(char *str, ll num, int base, int field_width, int precision, int flags)
+static char *write_num(char *str, ul num, int base, int field_width, int precision, int flags)
 {
     /**
      * @brief 将数字按照指定的要求转换成对应的字符串

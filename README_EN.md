@@ -36,7 +36,9 @@ bximage
 
 - [x] SLAB memory pool
 
-- [ ] Keyboard and mouse driver
+- [x] Keyboard and mouse driver
+
+- [ ] USB Driver
 
 - [ ] Hard disk driver
 
@@ -66,7 +68,7 @@ bximage
 
 - [ ] Parsing ELF file format
 
-- [ ] Floating point support
+- [x] Floating point support
 
 - [ ] Implementation of system call library based on POSIX
 
@@ -104,5 +106,23 @@ Not yet
 
 This project adopts GPLv2 LICENSE for open source. You are welcome to use the code of this project on the basis of abiding by the open source license!
 **What we support:** using this project to create greater value and contribute code to this project under the condition of abiding by the agreement.
-**What we resist**: any non-compliance with the open source license. Including but not limited to: plagiarizing the code of the project as your graduation project and other academic misconduct, as well as commercial closed source use without payment.
+**What we condemn**: any non-compliance with the open source license. Including but not limited to: plagiarizing the code of the project as your graduation project and other academic misconduct, as well as commercial closed source use without payment.
 If you find any violation of the open source license, we welcome you to send email feedback! Let's build an honest open source community together!
+
+## References
+
+This project refers to the following materials. I sincerely give my thanks to the authors of these projects, books and documents!
+
+- Implementation of a 64 bit operating system, Tian Yu (POSTS&TELECOM  PRESS)
+
+- Principle and implementation of modern operating system, Chen Haibo, Xia Yubin (China Machine Press)
+
+- [SimpleKernel](https://github.com/Simple-XX/SimpleKernel)
+
+- [osdev.org](https://wiki.osdev.org/Main_Page)
+
+- Multiboot2 Specification version 2.0
+
+- ACPI_6_3_final_Jan30
+
+- the GNU GRUB manual

@@ -24,8 +24,8 @@ void apic_io_apic_init()
 {
 
     ul madt_addr;
-    acpi_iter_SDT(acpi_get_MADT, &madt_addr);
     kdebug("madt_addr = %#018lx", (ul)madt_addr);
+    acpi_iter_SDT(acpi_get_MADT, &madt_addr);
     madt = (struct acpi_Multiple_APIC_Description_Table_t *)madt_addr;
 
     kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
@@ -78,8 +78,7 @@ void apic_io_apic_init()
         apic_ioapic_write_rte(i, 0x10020 + ((i - 0x10) >> 1));
     }
 
-    // 开启键盘中断，中断向量号为0x21，物理模式，投递至BSP处理器
-    apic_ioapic_write_rte(0x12, 0x21);
+
     // 不需要手动启动IO APIC，只要初始化了RTE寄存器之后，io apic就会自动启用了。
     // 而且不是每台电脑都有RCBA寄存器，因此不需要手动启用IO APIC
     /*
@@ -94,7 +93,7 @@ void apic_io_apic_init()
            // get OIC address
            if (x > 0xfec00000 && x < 0xfee00000)
            {
-               p = (unsigned int *)(x + 0x31feUL+SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE);
+               p = (unsigned int *)(x + 0x31feUL-apic_ioapic_map.addr_phys+apic_ioapic_map.virtual_index_addr);
            }
 
            // enable IOAPIC
@@ -111,6 +110,8 @@ void apic_io_apic_init()
  */
 void apic_local_apic_init()
 {
+    // 映射Local APIC 寄存器地址
+    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, 0xfee00000, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
     uint a, b, c, d;
 
     cpu_cpuid(1, 0, &a, &b, &c, &d);
@@ -158,14 +159,25 @@ void apic_local_apic_init()
     // 检测是否成功启用xAPIC和x2APIC
     if (eax & 0xc00)
         kinfo("xAPIC & x2APIC enabled!");
-
+    /*
+        io_mfence();
+        uint *svr = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
+        uint tmp_svr = *svr;
+        tmp_svr &= (~(1 << 12));
+        tmp_svr |= (1 << 8);
+        kdebug("tmp_svr = %#018lx", tmp_svr);
+        io_mfence();
+        *svr = tmp_svr;
+        io_mfence();
+        kdebug("svr = %#018lx", *svr);
+    */
     // 设置SVR寄存器，开启local APIC、禁止EOI广播
 
-    __asm__ __volatile__("movq 0x80f, %%rcx    \n\t"
+    __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
                          "rdmsr  \n\t"
                          "bts $8, %%rax  \n\t"
                          "bts $12, %%rax \n\t"
-                         "movq 0x80f, %%rcx    \n\t"
+                         "movq $0x80f, %%rcx    \n\t"
                          "wrmsr  \n\t"
                          "movq $0x80f , %%rcx   \n\t"
                          "rdmsr \n\t"
@@ -200,6 +212,7 @@ void apic_local_apic_init()
                          : "=a"(eax), "=d"(edx)::"memory");
 
     kdebug("get Local APIC ID: edx=%#010x, eax=%#010x", edx, eax);
+    kdebug("local_apic_id=%#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_ID));
 
     // 获取Local APIC Version
     // 0x803处是 Local APIC Version register
@@ -221,9 +234,9 @@ void apic_local_apic_init()
 
     // 由于尚未配置LVT对应的处理程序，因此先屏蔽所有的LVT
 
-    __asm__ __volatile__(
-        "movq 	$0x82f,	%%rcx	\n\t" // CMCI
-        "wrmsr	\n\t"
+    // mask all LVT
+    __asm__ __volatile__(             //"movq 	$0x82f,	%%rcx	\n\t"	//CMCI
+                                      //"wrmsr	\n\t"
         "movq 	$0x832,	%%rcx	\n\t" // Timer
         "wrmsr	\n\t"
         "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
@@ -239,6 +252,25 @@ void apic_local_apic_init()
         :
         : "a"(0x10000), "d"(0x00)
         : "memory");
+
+    /*
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI) = 0x1000000;
+    io_mfence();
+    kdebug("cmci = %#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI));
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_PERFORMANCE_MONITOR) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_ERROR) = 0x1000000;
+    io_mfence();
+    */
     kdebug("All LVT Masked");
 
     // 获取TPR寄存器的值
@@ -252,9 +284,6 @@ void apic_local_apic_init()
                          "rdmsr  \n\t"
                          : "=a"(eax), "=d"(edx)::"memory");
     kdebug("LVT_PPR=%#010x", eax);
-
-    // 映射Local APIC 寄存器地址
-    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, 0xfee00000, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
 }
 
 /**
@@ -289,7 +318,6 @@ void apic_init()
  */
 void do_IRQ(struct pt_regs *rsp, ul number)
 {
-
     unsigned char x = io_in8(0x60);
 
     irq_desc_t *irq = &interrupt_desc[number - 32];
@@ -303,12 +331,16 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     // 向中断控制器发送应答消息
     if (irq->controller != NULL && irq->controller->ack != NULL)
         irq->controller->ack(number);
+    else
+    {
 
-    // 向EOI寄存器写入0x00表示结束中断
-    io_mfence();
-    uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
-    *eoi = 0x00;
-    io_mfence();
+        // 向EOI寄存器写入0x00表示结束中断
+        __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
+                             "movq	$0x00,	%%rax	\n\t"
+                             "movq 	$0x80b,	%%rcx	\n\t"
+                             "wrmsr	\n\t" ::
+                                 : "memory");
+    }
 }
 
 /**
@@ -395,14 +427,31 @@ void apic_ioapic_uninstall(ul irq_num)
 void apic_ioapic_level_ack(ul irq_num) // 电平触发
 {
     // 向EOI寄存器写入0x00表示结束中断
+    /*io_mfence();
     uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
     *eoi = 0x00;
+    io_mfence(); */
+
+    __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
+                         "movq	$0x00,	%%rax	\n\t"
+                         "movq 	$0x80b,	%%rcx	\n\t"
+                         "wrmsr	\n\t" ::
+                             : "memory");
     *apic_ioapic_map.virtual_EOI_addr = irq_num;
 }
 
 void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
 {
+
     // 向EOI寄存器写入0x00表示结束中断
-    uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
-    *eoi = 0x00;
+    /*
+        uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
+        *eoi = 0x00;
+
+        */
+    __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
+                         "movq	$0x00,	%%rax	\n\t"
+                         "movq 	$0x80b,	%%rcx	\n\t"
+                         "wrmsr	\n\t" ::
+                             : "memory");
 }

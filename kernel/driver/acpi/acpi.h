@@ -27,8 +27,11 @@
 // 0x80-0xff Reserved for OEM use
 
 #define ACPI_RSDT_VIRT_ADDR_BASE SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + ACPI_RSDT_MAPPING_OFFSET
+#define ACPI_XSDT_VIRT_ADDR_BASE SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + ACPI_XSDT_MAPPING_OFFSET
 #define ACPI_DESCRIPTION_HEDERS_BASE ACPI_RSDT_VIRT_ADDR_BASE + (PAGE_2M_SIZE)
+#define ACPI_XSDT_DESCRIPTION_HEDERS_BASE ACPI_XSDT_VIRT_ADDR_BASE + (PAGE_2M_SIZE)
 
+bool acpi_use_xsdt = false;
 struct acpi_RSDP_t
 {
     unsigned char Signature[8];
@@ -132,11 +135,11 @@ struct acpi_RSDT_Structure_t
 struct acpi_XSDT_Structure_t
 {
     // 通过RSDT的header->Length可以计算出entry的数量n
-    // n = (length - 32)/8
+    // n = (length - 36)/8
     struct acpi_system_description_table_header_t header;
 
     // 一个包含了n个64bit物理地址的数组，指向了其他的description headers
-    ul *Entry;
+    ul Entry;
 };
 
 /**

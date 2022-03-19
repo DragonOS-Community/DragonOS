@@ -127,3 +127,5 @@ fslongjin
 - ACPI_6_3_final_Jan30
 
 - the GNU GRUB manual
+
+- Intel® 64 and IA-32 Architectures Software Developer’s Manual

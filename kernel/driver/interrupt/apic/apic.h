@@ -143,7 +143,7 @@ struct apic_IO_APIC_RTE_entry
         remote_IRR : 1,      // 14 远程IRR标志位（只读）
         trigger_mode : 1,    // 15 触发模式（0位边沿触发，1为电平触发）
         mask : 1,            // 16 屏蔽标志位，（0为未屏蔽， 1为已屏蔽）
-        reserved : 19;       // [31:17]位保留
+        reserved : 15;       // [31:17]位保留
 
     union
     {

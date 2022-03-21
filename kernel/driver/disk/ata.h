@@ -9,7 +9,7 @@
 #define PORT_DISK0_LBA_7_0 0x1f3                  // 扇区号 / LBA[7:0]
 #define PORT_DISK0_LBA_15_8 0x1f4                 // 柱面号[7:0] / LBA[15:8]
 #define PORT_DISK0_LBA_23_16 0x1f5                // 柱面号[15:8] / LBA[23:16]
-#define PORT_DISK0_LBA_DEVICE_CONFIGURE_REG 0x1f6 // 设备配置寄存器
+#define PORT_DISK0_DEVICE_CONFIGURE_REG 0x1f6 // 设备配置寄存器
 #define PORT_DISK0_CONTROLLER_STATUS_CMD 0x1f7    // 控制器状态端口 / 控制器命令端口
 #define PORT_DISK0_STATUS_CTRL_REG 0x3f6          // 状态寄存器 / 控制寄存器
 
@@ -32,7 +32,7 @@
 
 /**
  * @brief 执行0xec指令返回的512bytes的硬件设备识别信息
- * 位于ATA8-ACS中
+ * 位于ATA8-ACS中 Table-22
  */
 struct ata_identify_device_data
 {

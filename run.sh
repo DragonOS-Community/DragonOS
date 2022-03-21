@@ -93,7 +93,10 @@ if [ $flag_can_run -eq 1 ]; then
         bochs -q -f ${bochsrc} -rc ./tools/bochsinit
     else
         qemu-system-x86_64 -cdrom ${iso} -m 512M \
-        -monitor telnet::2333,server,nowait -serial stdio -s -cpu IvyBridge --enable-kvm
+        -monitor telnet::2333,server,nowait -serial stdio -s -cpu IvyBridge --enable-kvm \
+        #-drive id=disk,file=bin/disk.img,if=none  -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0
+        -hda bin/disk.img
+
     fi
 else
   echo "不满足运行条件"

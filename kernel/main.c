@@ -17,6 +17,7 @@
 #include "driver/acpi/acpi.h"
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
+#include "driver/disk/ata.h"
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
@@ -162,8 +163,9 @@ void system_initialize()
     syscall_init();
 
     cpu_init();
-    ps2_keyboard_init();
-    ps2_mouse_init();
+    //ps2_keyboard_init();
+    //ps2_mouse_init();
+    ata_init();
     // test_slab();
     // test_mm();
 
@@ -180,6 +182,7 @@ void Start_Kernel(void)
     // show_welcome();
     // test_mm();
 
+/*
     while (1)
     {
         ps2_keyboard_analyze_keycode();
@@ -193,7 +196,7 @@ void Start_Kernel(void)
             // printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d, byte3:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y, (unsigned char)packet.byte3);
         }
     }
-
+*/
     /*
         while (1)
         {

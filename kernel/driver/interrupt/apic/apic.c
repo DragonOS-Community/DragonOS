@@ -78,7 +78,6 @@ void apic_io_apic_init()
         apic_ioapic_write_rte(i, 0x10020 + ((i - 0x10) >> 1));
     }
 
-
     // 不需要手动启动IO APIC，只要初始化了RTE寄存器之后，io apic就会自动启用了。
     // 而且不是每台电脑都有RCBA寄存器，因此不需要手动启用IO APIC
     /*

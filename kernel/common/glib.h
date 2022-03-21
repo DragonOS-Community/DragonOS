@@ -280,6 +280,20 @@ void io_out32(unsigned short port, unsigned int value)
 }
 
 /**
+ * @brief 从端口读入n个word到buffer
+ * 
+ */
+#define io_insw(port,buffer,nr)	\
+__asm__ __volatile__("cld;rep;insw;mfence;"::"d"(port),"D"(buffer),"c"(nr):"memory")
+
+/**
+ * @brief 从输出buffer中的n个word到端口
+ * 
+ */
+#define io_outsw(port,buffer,nr)	\
+__asm__ __volatile__("cld;rep;outsw;mfence;"::"d"(port),"S"(buffer),"c"(nr):"memory")
+
+/**
  * @brief 读取rsp寄存器的值（存储了页目录的基地址）
  *
  * @return unsigned*  rsp的值的指针

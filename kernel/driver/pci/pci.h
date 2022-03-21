@@ -6,6 +6,9 @@
 #define PORT_PCI_CONFIG_ADDRESS 0xcf8
 #define PORT_PCI_CONFIG_DATA 0xcfc
 
+#define E_DEVICE_INVALID -1
+#define E_WRONG_HEADER_TYPE -2
+
 /**
  * @brief 初始化pci驱动
  *
@@ -163,3 +166,14 @@ struct pci_device_structure_pci_to_cardbus_bridge_t
  * @return uint 寄存器值
  */
 uint pci_read_config(uchar bus, uchar slot, uchar func, uchar offset);
+
+/**
+ * @brief 读取pci设备标头
+ *
+ * @param type 标头类型
+ * @param bus 总线号
+ * @param slot 插槽号
+ * @param func 功能号
+ * @return 返回的header的指针
+ */
+void* pci_read_header(int *type, uchar bus, uchar slot, uchar func);

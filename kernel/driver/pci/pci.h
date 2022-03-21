@@ -9,6 +9,9 @@
 #define E_DEVICE_INVALID -1
 #define E_WRONG_HEADER_TYPE -2
 
+// pci设备结构信息的链表
+struct List * pci_device_structure_list = NULL;
+
 /**
  * @brief 初始化pci驱动
  *
@@ -18,6 +21,7 @@ void pci_init();
 // pci设备结构的通用标题字段
 struct pci_device_structure_header_t
 {
+    struct List list;
     uint16_t Vendor_ID; // 供应商ID 0xffff是一个无效值，在读取访问不存在的设备的配置空间寄存器时返回
     uint16_t Device_ID; // 设备ID，标志特定设备
 
@@ -45,7 +49,7 @@ struct pci_device_structure_header_t
  */
 struct pci_device_structure_general_device_t
 {
-    struct pci_device_structure_header_t header;
+    struct pci_device_structure_header_t *header;
     uint32_t BAR0;
     uint32_t BAR1;
     uint32_t BAR2;
@@ -77,7 +81,7 @@ struct pci_device_structure_general_device_t
  */
 struct pci_device_structure_pci_to_pci_bridge_t
 {
-    struct pci_device_structure_header_t header;
+    struct pci_device_structure_header_t *header;
 
     uint32_t BAR0;
     uint32_t BAR1;
@@ -122,7 +126,7 @@ struct pci_device_structure_pci_to_pci_bridge_t
  */
 struct pci_device_structure_pci_to_cardbus_bridge_t
 {
-    struct pci_device_structure_header_t header;
+    struct pci_device_structure_header_t *header;
 
     uint32_t CardBus_Socket_ExCa_base_address;
 
@@ -176,4 +180,10 @@ uint pci_read_config(uchar bus, uchar slot, uchar func, uchar offset);
  * @param func 功能号
  * @return 返回的header的指针
  */
-void* pci_read_header(int *type, uchar bus, uchar slot, uchar func);
+void* pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_list);
+
+/**
+ * @brief 扫描所有pci总线上的所有设备
+ * 
+ */
+void pci_checkAllBuses();

@@ -49,7 +49,7 @@ struct pci_device_structure_header_t
  */
 struct pci_device_structure_general_device_t
 {
-    struct pci_device_structure_header_t *header;
+    struct pci_device_structure_header_t header;
     uint32_t BAR0;
     uint32_t BAR1;
     uint32_t BAR2;
@@ -81,7 +81,7 @@ struct pci_device_structure_general_device_t
  */
 struct pci_device_structure_pci_to_pci_bridge_t
 {
-    struct pci_device_structure_header_t *header;
+    struct pci_device_structure_header_t header;
 
     uint32_t BAR0;
     uint32_t BAR1;
@@ -126,7 +126,7 @@ struct pci_device_structure_pci_to_pci_bridge_t
  */
 struct pci_device_structure_pci_to_cardbus_bridge_t
 {
-    struct pci_device_structure_header_t *header;
+    struct pci_device_structure_header_t header;
 
     uint32_t CardBus_Socket_ExCa_base_address;
 

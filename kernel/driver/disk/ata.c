@@ -23,20 +23,12 @@ void ata_disk_handler(ul irq_num, ul param, struct pt_regs *regs)
     unsigned char buf[64];
     int js=0;
     //printk("%d", info.Serial_Number);
-    printk("sizeof short=%d\n", sizeof(ushort));
     
     for(int i = 0;i<10;i++)
     {
-        printk("[%d] %d \n",js, ((info.Serial_Number[i])));
-        printk("[%d] %d shift 8\n",js, ((info.Serial_Number[i]) >> 8));
-        printk("[%d] %d  and 0xff\n",js, ((info.Serial_Number[i]) >> 8)&0xff);
-		buf[js++]=((info.Serial_Number[i]) >> 8) & 0xff;
         buf[js++]=(info.Serial_Number[i] & 0xff);
     }
     buf[js] = '\0';
-    printk("xxx");
-    printk("buf[0]=%d", buf[0]);
-    printk("buf[0]=%c", buf[0]);
     printk("%s", buf);
 	printk("\n");
 

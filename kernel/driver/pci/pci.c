@@ -3,25 +3,26 @@
 #include "../../mm/slab.h"
 
 static uint count_device_list = 0;
+static void pci_checkBus(uint8_t bus);
 
 /**
  * @brief 将设备信息结构体加到链表里面
  *
  */
-#define ADD_DEVICE_STRUCT_TO_LIST(ret)                               \
-    do                                                               \
-    {                                                                \
-        if (count_device_list > 0)                                   \
-        {                                                            \
-            ++count_device_list;                                     \
-            list_add(pci_device_structure_list, &ret->header->list); \
-        }                                                            \
-        else                                                         \
-        {                                                            \
-            ++count_device_list;                                     \
-            list_init(&ret->header->list);                           \
-            pci_device_structure_list = &ret->header->list;          \
-        }                                                            \
+#define ADD_DEVICE_STRUCT_TO_LIST(ret)                                \
+    do                                                                \
+    {                                                                 \
+        if (count_device_list > 0)                                    \
+        {                                                             \
+            ++count_device_list;                                      \
+            list_add(pci_device_structure_list, &(ret->header.list)); \
+        }                                                             \
+        else                                                          \
+        {                                                             \
+            ++count_device_list;                                      \
+            list_init(&(ret->header.list));                           \
+            pci_device_structure_list = &(ret->header.list);          \
+        }                                                             \
     } while (0)
 
 /**
@@ -43,7 +44,10 @@ uint pci_read_config(uchar bus, uchar slot, uchar func, uchar offset)
     uint address = (uint)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((uint)0x80000000));
     io_out32(PORT_PCI_CONFIG_ADDRESS, address);
     // 读取返回的数据
-    return (uint)(io_in32(PORT_PCI_CONFIG_DATA));
+    uint32_t ret = (uint)(io_in32(PORT_PCI_CONFIG_DATA));
+    // kdebug("data=%#010lx", ret);
+
+    return ret;
 }
 
 /**
@@ -198,7 +202,7 @@ static void pci_read_pci_to_cardbus_bridge_header(struct pci_device_structure_pc
  */
 void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_list)
 {
-    struct pci_device_structure_header_t *common_header = (struct pci_device_structure_header_t *)kmalloc(sizeof(struct pci_device_structure_header_t), 0);
+    struct pci_device_structure_header_t *common_header = (struct pci_device_structure_header_t *)kmalloc(100, 0);
 
     uint32_t tmp32;
     // 先读取公共header
@@ -222,48 +226,50 @@ void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_
     common_header->HeaderType = (tmp32 >> 16) & 0xff;
     common_header->BIST = (tmp32 >> 24) & 0xff;
 
-    // 根据公共头部，判断该结构所属的类型
-    switch (common_header->Vendor_ID)
+    void *ret;
+    if (common_header->Vendor_ID == 0xffff)
     {
-    case 0xFFFF: // 设备不可用
         *type = E_DEVICE_INVALID;
         kfree(common_header);
         return NULL;
-        break;
-    case 0x0: // general device
-        struct pci_device_structure_general_device_t *ret = (struct pci_device_structure_general_device_t *)kmalloc(sizeof(struct pci_device_structure_general_device_t), 0);
+    }
 
-        ret->header = common_header;
-        pci_read_general_device_header(ret, bus, slot, func);
+    // 根据公共头部，判断该结构所属的类型
+    switch (common_header->HeaderType)
+    {
+    case 0x0: // general device
+        ret = common_header;
+
+        pci_read_general_device_header((struct pci_device_structure_general_device_t *)ret, bus, slot, func);
         if (add_to_list)
-            ADD_DEVICE_STRUCT_TO_LIST(ret);
+            ADD_DEVICE_STRUCT_TO_LIST(((struct pci_device_structure_general_device_t *)ret));
 
         *type = 0x0;
         return ret;
         break;
     case 0x1:
-        struct pci_device_structure_pci_to_pci_bridge_t *ret = (struct pci_device_structure_pci_to_pci_bridge_t *)kmalloc(sizeof(struct pci_device_structure_pci_to_pci_bridge_t), 0);
-        ret->header = common_header;
-        pci_read_pci_to_pci_bridge_header(ret, bus, slot, func);
+        ret = common_header;
+        pci_read_pci_to_pci_bridge_header((struct pci_device_structure_pci_to_pci_bridge_t *)ret, bus, slot, func);
         if (add_to_list)
-            ADD_DEVICE_STRUCT_TO_LIST(ret);
+            ADD_DEVICE_STRUCT_TO_LIST(((struct pci_device_structure_pci_to_pci_bridge_t *)ret));
 
         *type = 0x1;
         return ret;
         break;
     case 0x2:
-        struct pci_device_structure_pci_to_cardbus_bridge_t *ret = (struct pci_device_structure_pci_to_cardbus_bridge_t *)kmalloc(sizeof(struct pci_device_structure_pci_to_cardbus_bridge_t), 0);
-        ret->header = common_header;
-        pci_read_pci_to_cardbus_bridge_header(ret, bus, slot, func);
+        ret = common_header;
+        pci_read_pci_to_cardbus_bridge_header((struct pci_device_structure_pci_to_cardbus_bridge_t *)ret, bus, slot, func);
         if (add_to_list)
-            ADD_DEVICE_STRUCT_TO_LIST(ret);
+            ADD_DEVICE_STRUCT_TO_LIST(((struct pci_device_structure_pci_to_cardbus_bridge_t *)ret));
 
         *type = 0x2;
         return ret;
         break;
     default: // 错误的头类型 这里不应该被执行
-        kBUG("PCI->pci_read_header(): Invalid header type.");
+        //kerror("PCI->pci_read_header(): Invalid header type.");
         *type = E_WRONG_HEADER_TYPE;
+        //kerror("vendor id=%#010lx", common_header->Vendor_ID);
+        //kerror("header type = %d", common_header->HeaderType);
         kfree(common_header);
         return NULL;
         break;
@@ -272,77 +278,76 @@ void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_
 static void pci_checkFunction(uint8_t bus, uint8_t device, uint8_t function)
 {
     int header_type;
-    struct pci_device_structure_header_t *header;
-    void *raw_header = pci_read_header(&header_type, 0, 0, 0, true);
+    struct pci_device_structure_header_t *header = pci_read_header(&header_type, bus, device, function, true);
 
     if (header_type == E_WRONG_HEADER_TYPE)
     {
-        kBUG("pci_checkFunction(): wrong header type!");
-        // 此处内存已经在read header函数里面释放，不用重复释放
+        // kerror("pci_checkFunction(): wrong header type!");
+        //  此处内存已经在read header函数里面释放，不用重复释放
         return;
     }
-    header = ((struct pci_device_structure_general_device_t *)raw_header)->header;
+    // header = ((struct pci_device_structure_general_device_t *)raw_header)->header;
 
     if ((header->Class_code == 0x6) && (header->SubClass == 0x4))
     {
-        uint8_t SecondaryBus = ((struct pci_device_structure_pci_to_pci_bridge_t *)raw_header)->Secondary_Bus_Number;
+        uint8_t SecondaryBus = ((struct pci_device_structure_pci_to_pci_bridge_t *)header)->Secondary_Bus_Number;
         pci_checkBus(SecondaryBus);
     }
-
-    kfree(header);
-    kfree(raw_header);
 }
 
-static void pci_checkDevice(uint8_t bus, uint8_t device)
+static int pci_checkDevice(uint8_t bus, uint8_t device)
 {
     int header_type;
-    void *raw_header;
-    struct pci_device_structure_header_t *header;
-    raw_header = pci_read_header(&header_type, bus, device, 0, false);
+
+    struct pci_device_structure_header_t *header = pci_read_header(&header_type, bus, device, 0, false);
     if (header_type == E_WRONG_HEADER_TYPE)
     {
         // 此处内存已经在read header函数里面释放，不用重复释放
-        kBUG("pci_checkDevice(): wrong header type!");
-        return;
+        return E_WRONG_HEADER_TYPE;
     }
-    header = ((struct pci_device_structure_general_device_t *)raw_header)->header;
+    if (header_type == E_DEVICE_INVALID)
+    {
+        // kerror("DEVICE INVALID");
+        return E_DEVICE_INVALID;
+    }
+
     uint16_t vendorID = header->Vendor_ID;
 
     if (vendorID == 0xffff) // 设备不存在
     {
         kfree(header);
-        kfree(raw_header);
-        return;
+        return E_DEVICE_INVALID;
     }
     pci_checkFunction(bus, device, 0);
 
     header_type = header->HeaderType;
     if ((header_type & 0x80) != 0)
     {
+        kdebug("Multi func device");
         // 这是一个多function的设备，因此查询剩余的function
         for (uint8_t func = 1; func < 8; ++func)
         {
             struct pci_device_structure_header_t *tmp_header;
-            void *tmp_raw_header;
-            tmp_raw_header = pci_read_header(&header_type, bus, device, func, false);
-            tmp_header = ((struct pci_device_structure_general_device_t *)tmp_raw_header)->header;
+            tmp_header = (struct pci_device_structure_header_t *)pci_read_header(&header_type, bus, device, func, false);
 
-            pci_checkFunction(bus, device, func);
+            if (tmp_header->Vendor_ID != 0xffff)
+                pci_checkFunction(bus, device, func);
 
             // 释放内存
             kfree(tmp_header);
-            kfree(tmp_raw_header);
         }
     }
 
     kfree(header);
-    kfree(raw_header);
+    return 0;
 }
 
 static void pci_checkBus(uint8_t bus)
 {
     for (uint8_t device = 0; device < 32; ++device)
+    {
         pci_checkDevice(bus, device);
+    }
 }
 
 /**
@@ -351,10 +356,9 @@ static void pci_checkBus(uint8_t bus)
  */
 void pci_checkAllBuses()
 {
+    kinfo("Checking all devices in PCI bus...");
     int header_type;
-    void *raw_header;
-    struct pci_device_structure_header_t *header;
-    raw_header = pci_read_header(&header_type, 0, 0, 0, false);
+    struct pci_device_structure_header_t *header = pci_read_header(&header_type, 0, 0, 0, false);
 
     if (header_type == E_WRONG_HEADER_TYPE)
     {
@@ -362,7 +366,6 @@ void pci_checkAllBuses()
         // 此处内存已经在read header函数里面释放，不用重复释放
         return;
     }
-    header = ((struct pci_device_structure_general_device_t *)raw_header)->header;
 
     header_type = header->HeaderType;
 
@@ -374,29 +377,37 @@ void pci_checkAllBuses()
     {
         // Multiple PCI host controller
         // 那么总线0，设备0，功能1则是总线1的pci主机控制器，以此类推
-        void *tmp_raw_header;
         struct pci_device_structure_header_t *tmp_header;
         for (uint8_t func = 0; func < 8; ++func)
         {
-            tmp_raw_header = pci_read_header(&header_type, 0, 0, func, false);
-            tmp_header = ((struct pci_device_structure_general_device_t *)tmp_raw_header)->header;
-            if (header->Vendor_ID != 0xffff)    // @todo 这里的判断条件可能有点问题
+            tmp_header = (struct pci_device_structure_header_t *)pci_read_header(&header_type, 0, 0, func, false);
+
+            if (header->Vendor_ID != 0xffff) // @todo 这里的判断条件可能有点问题
             {
                 kfree(tmp_header);
-                kfree(tmp_raw_header);
                 break;
             }
 
             pci_checkBus(func);
 
             kfree(tmp_header);
-            kfree(tmp_raw_header);
         }
     }
     kfree(header);
-    kfree(raw_header);
 }
 
 void pci_init()
 {
+    kinfo("Initializing PCI bus!");
+    pci_checkAllBuses();
+    kinfo("Total pci device and function num = %d", count_device_list);
+
+    struct pci_device_structure_header_t *ptr = container_of(pci_device_structure_list, struct pci_device_structure_header_t, list);
+    for (int i = 0; i < count_device_list; ++i)
+    {
+        kinfo("[ pci device %d ] class code = %d\tsubclass=%d", i, ptr->Class_code, ptr->SubClass);
+
+        ptr = container_of(list_next(&(ptr->list)), struct pci_device_structure_header_t, list);
+    }
+    kinfo("PCI bus initialized.")
 }

@@ -18,6 +18,7 @@
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/disk/ata.h"
+#include "driver/pci/pci.h"
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
@@ -166,6 +167,7 @@ void system_initialize()
     //ps2_keyboard_init();
     //ps2_mouse_init();
     ata_init();
+    pci_init();
     // test_slab();
     // test_mm();
 

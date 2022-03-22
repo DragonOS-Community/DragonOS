@@ -10,11 +10,9 @@ This project is a operating system running on computer which is in X86_ 64 Archi
 
 GCC>=8.0
 
-bochs==2.7
+qemu==6.2
 
-bximage
-
-<u>Sorry, DragonOS can't run properly on QEMU virtual machine at present.</u>
+grub==2.06
 
 ## How to run?
 
@@ -36,15 +34,19 @@ bximage
 
 - [x] SLAB memory pool
 
-- [x] Keyboard and mouse driver
+- [x] PS/2 Keyboard and mouse driver
+
+- [x] PCI bus driver
 
 - [ ] USB Driver
 
-- [ ] Hard disk driver
+- [ ] SATA Hard disk driver
 
 - [ ] Driver Framework
 
 - [ ] Network card driver
+
+- [ ] Internet protocol stack
 
 - [ ] Graphics driver
 

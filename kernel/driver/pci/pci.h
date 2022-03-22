@@ -8,6 +8,7 @@
 
 #define E_DEVICE_INVALID -1
 #define E_WRONG_HEADER_TYPE -2
+#define E_NOT_SUPPORT_MSI -3    // 设备不支持msi
 
 // pci设备结构信息的链表
 struct List * pci_device_structure_list = NULL;
@@ -22,6 +23,11 @@ void pci_init();
 struct pci_device_structure_header_t
 {
     struct List list;
+    // ==== 以下三个变量表示该结构体所处的位置
+    uint8_t bus;
+    uint8_t device;
+    uint8_t func;
+
     uint16_t Vendor_ID; // 供应商ID 0xffff是一个无效值，在读取访问不存在的设备的配置空间寄存器时返回
     uint16_t Device_ID; // 设备ID，标志特定设备
 
@@ -166,10 +172,21 @@ struct pci_device_structure_pci_to_cardbus_bridge_t
  * @param bus 总线号
  * @param slot 插槽号
  * @param func 功能号
- * @param offset 寄存器偏移量
+ * @param offset 字节偏移量
  * @return uint 寄存器值
  */
-uint pci_read_config(uchar bus, uchar slot, uchar func, uchar offset);
+uint32_t pci_read_config(uchar bus, uchar slot, uchar func, uchar offset);
+
+/**
+ * @brief 向pci配置空间写入信息
+ *
+ * @param bus 总线号
+ * @param slot 设备号
+ * @param func 功能号
+ * @param offset 字节偏移量
+ * @return uint 寄存器值
+ */
+uint pci_write_config(uchar bus, uchar slot, uchar func, uchar offset, uint32_t data);
 
 /**
  * @brief 读取pci设备标头
@@ -187,3 +204,16 @@ void* pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_
  * 
  */
 void pci_checkAllBuses();
+
+/**
+ * @brief 启用 Message Signaled Interrupts
+ * 
+ * @param header 设备header
+ * @param vector 中断向量号
+ * @param processor 要投递到的处理器
+ * @param edge_trigger 是否边缘触发
+ * @param assert 是否高电平触发
+ * 
+ * @return 返回码
+ */
+int pci_enable_msi(void * header, uint8_t vector, uint32_t processor, uint8_t edge_trigger, uint8_t assert);

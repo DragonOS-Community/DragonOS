@@ -26,15 +26,27 @@ static void pci_checkBus(uint8_t bus);
     } while (0)
 
 /**
+ * @brief 生成架构相关的msi的message address
+ *
+ */
+#define pci_get_arch_msi_message_address(processor) ((uint64_t)(0xfee00000UL | (processor << 12)))
+
+/**
+ * @brief 生成架构相关的message data
+ *
+ */
+#define pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert) ((uint32_t)((vector & 0xff) | (edge_trigger == 1 ? 0 : (1 << 15)) | (assert == 0 ? 0 : (1 << 14))))
+
+/**
  * @brief 从pci配置空间读取信息
  *
  * @param bus 总线号
  * @param slot 设备号
  * @param func 功能号
- * @param offset 寄存器偏移量
+ * @param offset 字节偏移量
  * @return uint 寄存器值
  */
-uint pci_read_config(uchar bus, uchar slot, uchar func, uchar offset)
+uint32_t pci_read_config(uchar bus, uchar slot, uchar func, uchar offset)
 {
     uint lbus = (uint)bus;
     uint lslot = (uint)slot;
@@ -45,9 +57,32 @@ uint pci_read_config(uchar bus, uchar slot, uchar func, uchar offset)
     io_out32(PORT_PCI_CONFIG_ADDRESS, address);
     // 读取返回的数据
     uint32_t ret = (uint)(io_in32(PORT_PCI_CONFIG_DATA));
-    // kdebug("data=%#010lx", ret);
 
     return ret;
+}
+
+/**
+ * @brief 向pci配置空间写入信息
+ *
+ * @param bus 总线号
+ * @param slot 设备号
+ * @param func 功能号
+ * @param offset 字节偏移量
+ * @return uint 返回码
+ */
+uint pci_write_config(uchar bus, uchar slot, uchar func, uchar offset, uint32_t data)
+{
+    uint lbus = (uint)bus;
+    uint lslot = (uint)slot;
+    uint lfunc = ((uint)func) & 7;
+
+    // 构造pci配置空间地址
+    uint address = (uint)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((uint)0x80000000));
+    io_out32(PORT_PCI_CONFIG_ADDRESS, address);
+    // 写入数据
+    io_out32(PORT_PCI_CONFIG_DATA, data);
+
+    return 0;
 }
 
 /**
@@ -202,7 +237,10 @@ static void pci_read_pci_to_cardbus_bridge_header(struct pci_device_structure_pc
  */
 void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_list)
 {
-    struct pci_device_structure_header_t *common_header = (struct pci_device_structure_header_t *)kmalloc(100, 0);
+    struct pci_device_structure_header_t *common_header = (struct pci_device_structure_header_t *)kmalloc(127, 0);
+    common_header->bus = bus;
+    common_header->device = slot;
+    common_header->func = func;
 
     uint32_t tmp32;
     // 先读取公共header
@@ -266,10 +304,10 @@ void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_
         return ret;
         break;
     default: // 错误的头类型 这里不应该被执行
-        //kerror("PCI->pci_read_header(): Invalid header type.");
+        // kerror("PCI->pci_read_header(): Invalid header type.");
         *type = E_WRONG_HEADER_TYPE;
-        //kerror("vendor id=%#010lx", common_header->Vendor_ID);
-        //kerror("header type = %d", common_header->HeaderType);
+        // kerror("vendor id=%#010lx", common_header->Vendor_ID);
+        // kerror("header type = %d", common_header->HeaderType);
         kfree(common_header);
         return NULL;
         break;
@@ -405,9 +443,135 @@ void pci_init()
     struct pci_device_structure_header_t *ptr = container_of(pci_device_structure_list, struct pci_device_structure_header_t, list);
     for (int i = 0; i < count_device_list; ++i)
     {
-        kinfo("[ pci device %d ] class code = %d\tsubclass=%d", i, ptr->Class_code, ptr->SubClass);
+        if (ptr->HeaderType == 0x0)
+        {
+            if (ptr->Status & 0x10)
+            {
+                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\tcap_pointer=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->Status, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer);
+                uint32_t tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer);
+                kdebug("cap+0x0 = %#010lx", tmp);
+            }
+            else
+            {
+
+                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\t", i, ptr->Class_code, ptr->SubClass, ptr->Status);
+            }
+        }
+        else if (ptr->HeaderType == 0x1)
+        {
+            if (ptr->Status & 0x10)
+            {
+                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\tcap_pointer=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->Status, ((struct pci_device_structure_pci_to_pci_bridge_t *)ptr)->Capability_Pointer);
+            }
+            else
+            {
+
+                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\t", i, ptr->Class_code, ptr->SubClass, ptr->Status);
+            }
+        }
+        else if (ptr->HeaderType == 0x2)
+        {
+            kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\t", i, ptr->Class_code, ptr->SubClass, ptr->Status);
+        }
 
         ptr = container_of(list_next(&(ptr->list)), struct pci_device_structure_header_t, list);
     }
     kinfo("PCI bus initialized.")
+}
+
+/**
+ * @brief 启用 Message Signaled Interrupts
+ *
+ * @param header 设备header
+ * @param vector 中断向量号
+ * @param processor 要投递到的处理器
+ * @param edge_trigger 是否边缘触发
+ * @param assert 是否高电平触发
+ *
+ * @return 返回码
+ */
+int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edge_trigger, uint8_t assert)
+{
+    struct pci_device_structure_header_t *ptr = (struct pci_device_structure_header_t *)header;
+    uint32_t cap_ptr;
+    uint32_t tmp;
+    uint16_t message_control;
+    uint64_t message_addr;
+    switch (ptr->HeaderType)
+    {
+    case 0x00: // general device
+        if (!(ptr->Status & 0x10))
+            return E_NOT_SUPPORT_MSI;
+        cap_ptr = ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer;
+
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+
+        message_control = (tmp >> 16) & 0xffff;
+
+        if (tmp & 0xff != 0x5)
+            return E_NOT_SUPPORT_MSI;
+
+        // 写入message address
+        message_addr = pci_get_arch_msi_message_address(processor); // 获取message address
+        pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x4, (uint32_t)(message_addr & 0xffffffff));
+
+        if (message_control & (1 << 7)) // 64位
+            pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x8, (uint32_t)((message_addr >> 32) & 0xffffffff));
+
+        // 写入message data
+        tmp = pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert);
+        if (message_control & (1 << 7)) // 64位
+            pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0xc, tmp);
+        else
+            pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x8, tmp);
+
+        // 使能msi
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+        tmp |= (1 << 16);
+        pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr, tmp);
+
+        break;
+        
+    case 0x01: // pci to pci bridge
+        if (!(ptr->Status & 0x10))
+            return E_NOT_SUPPORT_MSI;
+        cap_ptr = ((struct pci_device_structure_pci_to_pci_bridge_t *)ptr)->Capability_Pointer;
+
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+
+        message_control = (tmp >> 16) & 0xffff;
+
+        if (tmp & 0xff != 0x5)
+            return E_NOT_SUPPORT_MSI;
+
+        // 写入message address
+        message_addr = pci_get_arch_msi_message_address(processor); // 获取message address
+        pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x4, (uint32_t)(message_addr & 0xffffffff));
+
+        if (message_control & (1 << 7)) // 64位
+            pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x8, (uint32_t)((message_addr >> 32) & 0xffffffff));
+
+        // 写入message data
+        tmp = pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert);
+        if (message_control & (1 << 7)) // 64位
+            pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0xc, tmp);
+        else
+            pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x8, tmp);
+
+        // 使能msi
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+        tmp |= (1 << 16);
+        pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr, tmp);
+
+        break;
+    case 0x02: // pci to card bus bridge
+        return E_NOT_SUPPORT_MSI;
+        break;
+
+    default: // 不应该到达这里
+        return E_WRONG_HEADER_TYPE;
+        break;
+    }
+
+    return 0;
 }

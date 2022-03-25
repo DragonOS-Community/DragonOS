@@ -56,8 +56,7 @@ void ps2_keyboard_handler(ul irq_num, ul param, struct pt_regs *regs)
  */
 void ps2_keyboard_init()
 {
-    // 开启键盘中断，中断向量号为0x21，物理模式，投递至BSP处理器
-    apic_ioapic_write_rte(0x12, 0x21);
+    
     // ======= 初始化键盘循环队列缓冲区 ===========
 
     // 申请键盘循环队列缓冲区的内存

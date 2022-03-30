@@ -436,7 +436,7 @@ void pci_checkAllBuses()
 
 void pci_init()
 {
-    kinfo("Initializing PCI bus!");
+    kinfo("Initializing PCI bus...");
     pci_checkAllBuses();
     kinfo("Total pci device and function num = %d", count_device_list);
 
@@ -531,7 +531,7 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
         pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr, tmp);
 
         break;
-        
+
     case 0x01: // pci to pci bridge
         if (!(ptr->Status & 0x10))
             return E_NOT_SUPPORT_MSI;
@@ -574,4 +574,32 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
     }
 
     return 0;
+}
+
+/**
+ * @brief 获取 device structure
+ *
+ * @param class_code
+ * @param sub_class
+ * @param res 返回的结果数组
+ */
+void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_device_structure_header_t *res[], uint32_t *count_res)
+{
+
+    struct pci_device_structure_header_t *ptr_begin = container_of(pci_device_structure_list, struct pci_device_structure_header_t, list);
+    struct pci_device_structure_header_t *ptr = container_of(pci_device_structure_list, struct pci_device_structure_header_t, list);
+    *count_res = 0;
+    
+    for (int i = 0; i < count_device_list; ++i)
+    {
+        if ((ptr->Class_code == 1) && (ptr->SubClass == 6))
+        {
+            kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d", i, ptr->Class_code, ptr->SubClass, ptr->ProgIF);
+
+            res[*count_res] = ptr;
+            ++(*count_res);
+        }
+        ptr = container_of(list_next(&(ptr->list)), struct pci_device_structure_header_t, list);
+    }
+    
 }

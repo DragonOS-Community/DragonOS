@@ -19,6 +19,7 @@
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/disk/ata.h"
 #include "driver/pci/pci.h"
+#include "driver/disk/ahci/ahci.h"
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
@@ -168,6 +169,7 @@ void system_initialize()
     //ps2_mouse_init();
     ata_init();
     pci_init();
+    ahci_init();
     // test_slab();
     // test_mm();
 

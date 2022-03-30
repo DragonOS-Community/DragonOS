@@ -217,3 +217,12 @@ void pci_checkAllBuses();
  * @return 返回码
  */
 int pci_enable_msi(void * header, uint8_t vector, uint32_t processor, uint8_t edge_trigger, uint8_t assert);
+
+/**
+ * @brief 获取 device structure
+ * 
+ * @param class_code 
+ * @param sub_class 
+ * @param res 返回的结果数组
+ */
+void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_device_structure_header_t* res[], uint32_t* count_res);

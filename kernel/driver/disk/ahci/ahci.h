@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../block_device.h"
+#include "../../pci/pci.h"
 
 /**
  * @brief 在SATA3.0规范中定义的Frame Information Structure类型
@@ -177,6 +178,28 @@ typedef struct tagFIS_DMA_SETUP
 
 } FIS_DMA_SETUP;
 
+typedef volatile struct tagHBA_PORT
+{
+	uint32_t clb;		// 0x00, command list base address, 1K-byte aligned
+	uint32_t clbu;		// 0x04, command list base address upper 32 bits
+	uint32_t fb;		// 0x08, FIS base address, 256-byte aligned
+	uint32_t fbu;		// 0x0C, FIS base address upper 32 bits
+	uint32_t is;		// 0x10, interrupt status
+	uint32_t ie;		// 0x14, interrupt enable
+	uint32_t cmd;		// 0x18, command and status
+	uint32_t rsv0;		// 0x1C, Reserved
+	uint32_t tfd;		// 0x20, task file data
+	uint32_t sig;		// 0x24, signature
+	uint32_t ssts;		// 0x28, SATA status (SCR0:SStatus)
+	uint32_t sctl;		// 0x2C, SATA control (SCR2:SControl)
+	uint32_t serr;		// 0x30, SATA error (SCR1:SError)
+	uint32_t sact;		// 0x34, SATA active (SCR3:SActive)
+	uint32_t ci;		// 0x38, command issue
+	uint32_t sntf;		// 0x3C, SATA notification (SCR4:SNotification)
+	uint32_t fbs;		// 0x40, FIS-based switch control
+	uint32_t rsv1[11];	// 0x44 ~ 0x6F, Reserved
+	uint32_t vendor[4];	// 0x70 ~ 0x7F, vendor specific
+} HBA_PORT;
 typedef volatile struct tagHBA_MEM
 {
 	// 0x00 - 0x2B, Generic Host Control
@@ -202,28 +225,6 @@ typedef volatile struct tagHBA_MEM
 	HBA_PORT	ports[1];	// 1 ~ 32
 } HBA_MEM;
  
-typedef volatile struct tagHBA_PORT
-{
-	uint32_t clb;		// 0x00, command list base address, 1K-byte aligned
-	uint32_t clbu;		// 0x04, command list base address upper 32 bits
-	uint32_t fb;		// 0x08, FIS base address, 256-byte aligned
-	uint32_t fbu;		// 0x0C, FIS base address upper 32 bits
-	uint32_t is;		// 0x10, interrupt status
-	uint32_t ie;		// 0x14, interrupt enable
-	uint32_t cmd;		// 0x18, command and status
-	uint32_t rsv0;		// 0x1C, Reserved
-	uint32_t tfd;		// 0x20, task file data
-	uint32_t sig;		// 0x24, signature
-	uint32_t ssts;		// 0x28, SATA status (SCR0:SStatus)
-	uint32_t sctl;		// 0x2C, SATA control (SCR2:SControl)
-	uint32_t serr;		// 0x30, SATA error (SCR1:SError)
-	uint32_t sact;		// 0x34, SATA active (SCR3:SActive)
-	uint32_t ci;		// 0x38, command issue
-	uint32_t sntf;		// 0x3C, SATA notification (SCR4:SNotification)
-	uint32_t fbs;		// 0x40, FIS-based switch control
-	uint32_t rsv1[11];	// 0x44 ~ 0x6F, Reserved
-	uint32_t vendor[4];	// 0x70 ~ 0x7F, vendor specific
-} HBA_PORT;
 
 // There are four kinds of FIS which may be sent to the host by the device as indicated in the following structure declaration.
 // 
@@ -279,6 +280,19 @@ typedef struct tagHBA_CMD_HEADER
 	uint32_t rsv1[4];	// Reserved
 } HBA_CMD_HEADER;
 
+typedef struct tagHBA_PRDT_ENTRY
+{
+	uint32_t dba;		// Data base address
+	uint32_t dbau;		// Data base address upper 32 bits
+	uint32_t rsv0;		// Reserved
+ 
+	// DW3
+	uint32_t dbc:22;		// Byte count, 4M max
+	uint32_t rsv1:9;		// Reserved
+	uint32_t i:1;		// Interrupt on completion
+} HBA_PRDT_ENTRY;
+
+
 typedef struct tagHBA_CMD_TBL
 {
 	// 0x00
@@ -294,20 +308,27 @@ typedef struct tagHBA_CMD_TBL
 	HBA_PRDT_ENTRY	prdt_entry[1];	// Physical region descriptor table entries, 0 ~ 65535
 } HBA_CMD_TBL;
  
-typedef struct tagHBA_PRDT_ENTRY
-{
-	uint32_t dba;		// Data base address
-	uint32_t dbau;		// Data base address upper 32 bits
-	uint32_t rsv0;		// Reserved
+
+
+#define	SATA_SIG_ATA	0x00000101	// SATA drive
+#define	SATA_SIG_ATAPI	0xEB140101	// SATAPI drive
+#define	SATA_SIG_SEMB	0xC33C0101	// Enclosure management bridge
+#define	SATA_SIG_PM	0x96690101	// Port multiplier
  
-	// DW3
-	uint32_t dbc:22;		// Byte count, 4M max
-	uint32_t rsv1:9;		// Reserved
-	uint32_t i:1;		// Interrupt on completion
-} HBA_PRDT_ENTRY;
+#define AHCI_DEV_NULL 0
+#define AHCI_DEV_SATA 1
+#define AHCI_DEV_SEMB 2
+#define AHCI_DEV_PM 3
+#define AHCI_DEV_SATAPI 4
+ 
+#define HBA_PORT_IPM_ACTIVE 1
+#define HBA_PORT_DET_PRESENT 3
+
+
 
 struct block_device_request_queue ahci_req_queue;
 
+/*
 struct block_device_operation ahci_operation =
     {
         .open = ahci_open,
@@ -315,3 +336,10 @@ struct block_device_operation ahci_operation =
         .ioctl = ahci_ioctl,
         .transfer = ahci_transfer,
 };
+*/
+
+/**
+ * @brief 初始化ahci模块
+ * 
+ */
+void ahci_init();

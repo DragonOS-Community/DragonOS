@@ -2,6 +2,24 @@
 
 #include "../block_device.h"
 #include "../../pci/pci.h"
+#include "../../../mm/mm.h"
+
+#define AHCI_MAPPING_BASE SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE+AHCI_MAPPING_OFFSET
+
+#define MAX_AHCI_DEVICES 100
+
+#define HBA_PxCMD_ST    0x0001
+#define HBA_PxCMD_FRE   0x0010
+#define HBA_PxCMD_FR    0x4000
+#define HBA_PxCMD_CR    0x8000
+
+#define ATA_DEV_BUSY 0x80
+#define ATA_DEV_DRQ 0x08
+
+#define ATA_CMD_READ_DMA_EXT 0x25
+#define ATA_CMD_WRITE_DMA_EXT 0x30
+
+#define HBA_PxIS_TFES   (1 << 30)       /* TFES - Task File Error Status */
 
 /**
  * @brief 在SATA3.0规范中定义的Frame Information Structure类型
@@ -180,10 +198,8 @@ typedef struct tagFIS_DMA_SETUP
 
 typedef volatile struct tagHBA_PORT
 {
-	uint32_t clb;		// 0x00, command list base address, 1K-byte aligned
-	uint32_t clbu;		// 0x04, command list base address upper 32 bits
-	uint32_t fb;		// 0x08, FIS base address, 256-byte aligned
-	uint32_t fbu;		// 0x0C, FIS base address upper 32 bits
+	uint64_t clb;		// 0x00, command list base address, 1K-byte aligned
+	uint64_t fb;		// 0x08, FIS base address, 256-byte aligned
 	uint32_t is;		// 0x10, interrupt status
 	uint32_t ie;		// 0x14, interrupt enable
 	uint32_t cmd;		// 0x18, command and status
@@ -222,7 +238,7 @@ typedef volatile struct tagHBA_MEM
 	uint8_t  vendor[0x100-0xA0];
  
 	// 0x100 - 0x10FF, Port control registers
-	HBA_PORT	ports[1];	// 1 ~ 32
+	HBA_PORT	ports[32];	// 1 ~ 32
 } HBA_MEM;
  
 
@@ -273,8 +289,7 @@ typedef struct tagHBA_CMD_HEADER
 	uint32_t prdbc;		// Physical region descriptor byte count transferred
  
 	// DW2, 3
-	uint32_t ctba;		// Command table descriptor base address
-	uint32_t ctbau;		// Command table descriptor base address upper 32 bits
+	uint64_t ctba;		// Command table descriptor base address
  
 	// DW4 - 7
 	uint32_t rsv1[4];	// Reserved
@@ -282,8 +297,7 @@ typedef struct tagHBA_CMD_HEADER
 
 typedef struct tagHBA_PRDT_ENTRY
 {
-	uint32_t dba;		// Data base address
-	uint32_t dbau;		// Data base address upper 32 bits
+	uint64_t dba;		// Data base address
 	uint32_t rsv0;		// Reserved
  
 	// DW3
@@ -307,7 +321,13 @@ typedef struct tagHBA_CMD_TBL
 	// 0x80
 	HBA_PRDT_ENTRY	prdt_entry[1];	// Physical region descriptor table entries, 0 ~ 65535
 } HBA_CMD_TBL;
- 
+
+struct ahci_device_t
+{
+    uint32_t type;  // 设备类型
+    struct pci_device_structure_header_t * dev_struct;
+    HBA_MEM * hba_mem;
+}ahci_devices[MAX_AHCI_DEVICES];
 
 
 #define	SATA_SIG_ATA	0x00000101	// SATA drive
@@ -343,3 +363,23 @@ struct block_device_operation ahci_operation =
  * 
  */
 void ahci_init();
+
+/**
+ * @brief 检测端口连接的设备的类型
+ * 
+ * @param device_num ahci设备号
+ */
+void ahci_probe_port(const uint32_t device_num);
+
+/**
+ * @brief read data from SATA device using 48bit LBA address
+ *
+ * @param port HBA PORT
+ * @param startl low 32bits of start addr
+ * @param starth high 32bits of start addr
+ * @param count total sectors to read
+ * @param buf buffer
+ * @return true done
+ * @return false failed
+ */
+bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf);

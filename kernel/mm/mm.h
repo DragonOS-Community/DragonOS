@@ -42,6 +42,8 @@
 #define ACPI_XSDT_MAPPING_OFFSET 0x9000000UL
 #define IO_APIC_MAPPING_OFFSET 0xfec00000UL
 #define LOCAL_APIC_MAPPING_OFFSET 0xfee00000UL
+#define AHCI_MAPPING_OFFSET 0xff200000UL    // AHCI 映射偏移量,之后使用了4M的地址
+
 // ===== 内存区域属性 =====
 // DMA区域
 #define ZONE_DMA (1 << 0)

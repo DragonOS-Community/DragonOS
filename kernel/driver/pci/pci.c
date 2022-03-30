@@ -586,7 +586,6 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
 void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_device_structure_header_t *res[], uint32_t *count_res)
 {
 
-    struct pci_device_structure_header_t *ptr_begin = container_of(pci_device_structure_list, struct pci_device_structure_header_t, list);
     struct pci_device_structure_header_t *ptr = container_of(pci_device_structure_list, struct pci_device_structure_header_t, list);
     *count_res = 0;
     

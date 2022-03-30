@@ -102,7 +102,7 @@ If you like, click the link below and buy me a cup of coffee ~ please leave your
 
 ## Sponsors
 
-Not yet
+- 悟
 
 ## Open source statement
 

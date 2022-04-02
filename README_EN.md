@@ -40,7 +40,7 @@ grub==2.06
 
 - [ ] USB Driver
 
-- [ ] SATA Hard disk driver
+- [x] SATA Hard disk driver(AHCI)
 
 - [ ] Driver Framework
 

@@ -4,6 +4,10 @@
 #include "../../pci/pci.h"
 #include "../../../mm/mm.h"
 
+/**
+ * @todo 加入io调度器（当操作系统实现了多进程之后要加入这个）
+ * 
+ */
 #define AHCI_MAPPING_BASE SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE+AHCI_MAPPING_OFFSET
 
 #define MAX_AHCI_DEVICES 100
@@ -20,6 +24,14 @@
 #define ATA_CMD_WRITE_DMA_EXT 0x30
 
 #define HBA_PxIS_TFES   (1 << 30)       /* TFES - Task File Error Status */
+
+#define AHCI_SUCCESS 0  // 请求成功
+#define E_NOEMPTYSLOT 1 // 没有空闲的slot
+#define E_PORT_HUNG 2   // 端口被挂起
+#define E_TASK_FILE_ERROR 3 // 任务文件错误
+#define E_UNSUPPORTED_CMD 4 // 不支持的命令
+
+extern struct block_device_operation ahci_operation;
 
 /**
  * @brief 在SATA3.0规范中定义的Frame Information Structure类型
@@ -348,15 +360,9 @@ struct ahci_device_t
 
 struct block_device_request_queue ahci_req_queue;
 
-/*
-struct block_device_operation ahci_operation =
-    {
-        .open = ahci_open,
-        .close = ahci_close,
-        .ioctl = ahci_ioctl,
-        .transfer = ahci_transfer,
-};
-*/
+
+
+
 
 /**
  * @brief 初始化ahci模块
@@ -369,7 +375,7 @@ void ahci_init();
  * 
  * @param device_num ahci设备号
  */
-void ahci_probe_port(const uint32_t device_num);
+static void ahci_probe_port(const uint32_t device_num);
 
 /**
  * @brief read data from SATA device using 48bit LBA address
@@ -382,7 +388,7 @@ void ahci_probe_port(const uint32_t device_num);
  * @return true done
  * @return false failed
  */
-bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf);
+static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf);
 
 /**
  * @brief write data to SATA device using 48bit LBA address
@@ -395,5 +401,5 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
  * @return true done
  * @return false failed
  */
-bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
+static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
                uint64_t buf);

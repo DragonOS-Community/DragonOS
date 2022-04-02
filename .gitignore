@@ -2,3 +2,6 @@
 /bin/
 DragonOS.iso
 .idea/
+
+*.o
+*.s

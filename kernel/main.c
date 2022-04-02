@@ -167,7 +167,7 @@ void system_initialize()
     cpu_init();
     //ps2_keyboard_init();
     //ps2_mouse_init();
-    ata_init();
+    //ata_init();
     pci_init();
     ahci_init();
     // test_slab();
@@ -182,7 +182,18 @@ void Start_Kernel(void)
 {
 
     system_initialize();
+    
 
+    /*
+    uint64_t buf[100];
+    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
+    kdebug("buf[0]=%#010lx",(uint32_t)buf[0]);
+    buf[0] = 0xffd3;
+    ahci_operation.transfer(ATA_CMD_WRITE_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
+
+    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
+    kdebug("buf[0]=%#010lx",(uint32_t)buf[0]);
+    */
     // show_welcome();
     // test_mm();
 

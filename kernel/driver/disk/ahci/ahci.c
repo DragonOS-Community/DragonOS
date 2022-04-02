@@ -11,6 +11,7 @@ uint64_t ahci_port_base_vaddr; // 端口映射base addr
 static void start_cmd(HBA_PORT *port);
 static void stop_cmd(HBA_PORT *port);
 static void port_rebase(HBA_PORT *port, int portno);
+static long ahci_query_disk();
 
 // Find a free command list slot
 static int ahci_find_cmdslot(HBA_PORT *port);
@@ -25,7 +26,6 @@ void ahci_init()
 {
     pci_get_device_structure(0x1, 0x6, ahci_devs, &count_ahci_devices);
 
-    kdebug("phys addr=%#018lx", (ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5));
     // 映射ABAR
     mm_map_phys_addr(AHCI_MAPPING_BASE, ((ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
     kdebug("ABAR mapped!");
@@ -40,15 +40,11 @@ void ahci_init()
     ahci_port_base_vaddr = (uint64_t)kmalloc(1048576, 0);
     ahci_probe_port(0);
     port_rebase(&ahci_devices[0].hba_mem->ports[0], 0);
-    uint64_t buf[100];
-    bool res = ahci_read(&(ahci_devices[0].hba_mem->ports[0]), 0, 0, 1, (uint64_t)&buf);
-    kdebug("res=%d, buf[0]=%#010lx", (uint)res, (uint32_t)buf[0]);
 
-    buf[0] = 0xa0;
-    res = ahci_write(&(ahci_devices[0].hba_mem->ports[0]), 0, 0, 1, (uint64_t)&buf);
-
-    res = ahci_read(&(ahci_devices[0].hba_mem->ports[0]), 0, 0, 1, (uint64_t)&buf);
-    kdebug("res=%d, buf[0]=%#010lx", (uint)res, (uint32_t)buf[0]);
+    // 初始化请求队列
+    ahci_req_queue.in_service = NULL;
+    list_init(&(ahci_req_queue.queue_list));
+    ahci_req_queue.request_count = 0;
 }
 
 // Check device type
@@ -80,9 +76,9 @@ static int check_type(HBA_PORT *port)
 /**
  * @brief 检测端口连接的设备的类型
  *
- * @param device_num ahci设备号
+ * @param device_num ahci控制器号
  */
-void ahci_probe_port(const uint32_t device_num)
+static void ahci_probe_port(const uint32_t device_num)
 {
     HBA_MEM *abar = ahci_devices[device_num].hba_mem;
     uint32_t pi = abar->pi;
@@ -111,7 +107,7 @@ void ahci_probe_port(const uint32_t device_num)
             }
             else
             {
-                kdebug("No drive found at port %d", i);
+                // kdebug("No drive found at port %d", i);
             }
         }
     }
@@ -200,14 +196,14 @@ static void port_rebase(HBA_PORT *port, int portno)
  * @return true done
  * @return false failed
  */
-bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf)
+static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf)
 {
     port->is = (uint32_t)-1; // Clear pending interrupt bits
     int spin = 0;            // Spin lock timeout counter
     int slot = ahci_find_cmdslot(port);
 
     if (slot == -1)
-        return false;
+        return E_NOEMPTYSLOT;
 
     HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER *)port->clb;
     cmdheader += slot;
@@ -261,7 +257,7 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
     if (spin == 1000000)
     {
         kerror("Port is hung");
-        return false;
+        return E_PORT_HUNG;
     }
 
     kdebug("slot=%d", slot);
@@ -277,7 +273,7 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
         if (port->is & HBA_PxIS_TFES) // Task file error
         {
             kerror("Read disk error");
-            return false;
+            return E_TASK_FILE_ERROR;
         }
     }
 
@@ -285,20 +281,19 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
     if (port->is & HBA_PxIS_TFES)
     {
         kerror("Read disk error");
-        return false;
+        return E_TASK_FILE_ERROR;
     }
 
-    return true;
+    return AHCI_SUCCESS;
 }
 
-bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
-                uint64_t buf)
+static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
+                       uint64_t buf)
 {
-    printk("Inside writeport \n ");
     port->is = 0xffff; // Clear pending interrupt bits
     int slot = ahci_find_cmdslot(port);
     if (slot == -1)
-        return false;
+        return E_NOEMPTYSLOT;
 
     HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER *)port->clb;
 
@@ -313,7 +308,7 @@ bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count
     memset(cmdtbl, 0, sizeof(HBA_CMD_TBL) + (cmdheader->prdtl - 1) * sizeof(HBA_PRDT_ENTRY));
 
     int i = 0;
-    for (i = 0; i < cmdheader->prdtl - 1; i++)
+    for (i = 0; i < cmdheader->prdtl - 1; ++i)
     {
         cmdtbl->prdt_entry[i].dba = buf;
         cmdtbl->prdt_entry[i].dbc = 8 * 1024 - 1; // 8K bytes
@@ -351,16 +346,16 @@ bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count
         if (port->is & HBA_PxIS_TFES)
         { // Task file error
             kerror("Write disk error");
-            return false;
+            return E_TASK_FILE_ERROR;
         }
     }
     if (port->is & HBA_PxIS_TFES)
     {
         kerror("Write disk error");
-        return false;
+        return E_TASK_FILE_ERROR;
     }
 
-    return true;
+    return AHCI_SUCCESS;
 }
 
 // Find a free command list slot
@@ -378,3 +373,154 @@ static int ahci_find_cmdslot(HBA_PORT *port)
     kerror("Cannot find free command list entry");
     return -1;
 }
+
+long ahci_open()
+{
+    return 0;
+}
+
+long ahci_close()
+{
+    return 0;
+}
+
+/**
+ * @brief 创建ahci磁盘请求包
+ *
+ * @param cmd 控制命令
+ * @param base_addr 48位LBA地址
+ * @param count total sectors to read
+ * @param buf 缓冲区线性地址
+ * @param ahci_ctrl_num ahci控制器号
+ * @param port_num ahci控制器端口号
+ * @return struct block_device_request_packet*
+ */
+static struct block_device_request_packet *ahci_make_request(long cmd, uint64_t base_addr, uint64_t count, uint64_t buffer, uint8_t ahci_ctrl_num, uint8_t port_num)
+{
+    struct block_device_request_packet *pack = (struct block_device_request_packet *)kmalloc(sizeof(struct block_device_request_packet), 0);
+
+    list_init(&pack->list);
+
+    // 由于ahci不需要中断即可读取磁盘，因此end handler为空
+    switch (cmd)
+    {
+    case ATA_CMD_READ_DMA_EXT:
+        pack->end_handler = NULL;
+        pack->cmd = ATA_CMD_READ_DMA_EXT;
+        break;
+    case ATA_CMD_WRITE_DMA_EXT:
+        pack->end_handler = NULL;
+        pack->cmd = ATA_CMD_WRITE_DMA_EXT;
+        break;
+    default:
+        pack->end_handler = NULL;
+        pack->cmd = cmd;
+        break;
+    }
+
+    pack->LBA_start = base_addr;
+    pack->count = count;
+    pack->buffer_vaddr = buffer;
+
+    pack->ahci_ctrl_num = ahci_ctrl_num;
+    pack->port_num = port_num;
+    return pack;
+}
+
+/**
+ * @brief 结束磁盘请求
+ *
+ */
+static void ahci_end_request()
+{
+    kfree((uint64_t *)ahci_req_queue.in_service);
+    ahci_req_queue.in_service = NULL;
+
+    // 进行下一轮的磁盘请求 （由于未实现单独的io调度器，这里会造成长时间的io等待）
+    if (ahci_req_queue.request_count>0)
+        ahci_query_disk();
+}
+
+static long ahci_query_disk()
+{
+    struct block_device_request_packet *pack = container_of(list_next(&ahci_req_queue.queue_list), struct block_device_request_packet, list);
+    ahci_req_queue.in_service = pack;
+    list_del(&(ahci_req_queue.in_service->list));
+    --ahci_req_queue.request_count;
+
+    long ret_val;
+
+    switch (pack->cmd)
+    {
+    case ATA_CMD_READ_DMA_EXT:
+        ret_val = ahci_read(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->LBA_start & 0xFFFFFFFF, ((pack->LBA_start) >> 32) & 0xFFFFFFFF, pack->count, pack->buffer_vaddr);
+        break;
+    case ATA_CMD_WRITE_DMA_EXT:
+        ret_val = ahci_write(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->LBA_start & 0xFFFFFFFF, ((pack->LBA_start) >> 32) & 0xFFFFFFFF, pack->count, pack->buffer_vaddr);
+        break;
+    default:
+        kerror("Unsupport ahci command: %#05lx", pack->cmd);
+        ret_val = E_UNSUPPORTED_CMD;
+        break;
+    }
+    ahci_end_request();
+    return ret_val;
+}
+
+/**
+ * @brief 将请求包提交到io队列
+ *
+ * @param pack
+ */
+static void ahci_submit(struct block_device_request_packet *pack)
+{
+    list_append(&(ahci_req_queue.queue_list), &(pack->list));
+    ++ahci_req_queue.request_count;
+
+    if (ahci_req_queue.in_service == NULL) // 当前没有正在请求的io包，立即执行磁盘请求
+        ahci_query_disk();
+}
+
+/**
+ * @brief ahci驱动程序的传输函数
+ *
+ * @param cmd 控制命令
+ * @param base_addr 48位LBA地址
+ * @param count total sectors to read
+ * @param buf 缓冲区线性地址
+ * @param ahci_ctrl_num ahci控制器号
+ * @param port_num ahci控制器端口号
+ * @return long
+ */
+static long ahci_transfer(long cmd, uint64_t base_addr, uint64_t count, uint64_t buf, uint8_t ahci_ctrl_num, uint8_t port_num)
+{
+    struct block_device_request_packet *pack = NULL;
+
+    if (cmd == ATA_CMD_READ_DMA_EXT || cmd == ATA_CMD_WRITE_DMA_EXT)
+    {
+        pack = ahci_make_request(cmd, base_addr, count, buf, ahci_ctrl_num, port_num);
+        ahci_submit(pack);
+    }
+    else
+        return E_UNSUPPORTED_CMD;
+
+    return AHCI_SUCCESS;
+}
+
+/**
+ * @brief todo: io控制器函数
+ *
+ * @param cmd 命令
+ * @param arg 参数
+ * @return long
+ */
+static long ahci_ioctl(long cmd, long arg)
+{
+}
+struct block_device_operation ahci_operation =
+    {
+        .open = ahci_open,
+        .close = ahci_close,
+        .ioctl = ahci_ioctl,
+        .transfer = ahci_transfer,
+};

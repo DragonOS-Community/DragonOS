@@ -14,6 +14,7 @@ struct apic_IO_APIC_RTE_entry entry;
 void ata_disk_handler(ul irq_num, ul param, struct pt_regs *regs)
 {
     struct ata_identify_device_data info;
+    
     kdebug("irq_num=%ld", irq_num);
 
     // 从端口读入磁盘配置信息

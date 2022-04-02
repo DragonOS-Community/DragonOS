@@ -119,8 +119,8 @@ static inline void list_del(struct List *entry)
      * @param entry 待删除的节点
      */
 
-    entry->prev->next = entry->next;
-    entry->next = entry->prev;
+    entry->next->prev = entry->prev;
+	entry->prev->next = entry->next;
 }
 
 static inline bool list_empty(struct List *entry)

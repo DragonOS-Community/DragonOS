@@ -43,7 +43,12 @@ void ahci_init()
     uint64_t buf[100];
     bool res = ahci_read(&(ahci_devices[0].hba_mem->ports[0]), 0, 0, 1, (uint64_t)&buf);
     kdebug("res=%d, buf[0]=%#010lx", (uint)res, (uint32_t)buf[0]);
-    
+
+    buf[0] = 0xa0;
+    res = ahci_write(&(ahci_devices[0].hba_mem->ports[0]), 0, 0, 1, (uint64_t)&buf);
+
+    res = ahci_read(&(ahci_devices[0].hba_mem->ports[0]), 0, 0, 1, (uint64_t)&buf);
+    kdebug("res=%d, buf[0]=%#010lx", (uint)res, (uint32_t)buf[0]);
 }
 
 // Check device type
@@ -200,10 +205,10 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
     port->is = (uint32_t)-1; // Clear pending interrupt bits
     int spin = 0;            // Spin lock timeout counter
     int slot = ahci_find_cmdslot(port);
-    
+
     if (slot == -1)
         return false;
-    
+
     HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER *)port->clb;
     cmdheader += slot;
     cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t); // Command FIS size
@@ -213,7 +218,6 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
     HBA_CMD_TBL *cmdtbl = (HBA_CMD_TBL *)(cmdheader->ctba);
     memset(cmdtbl, 0, sizeof(HBA_CMD_TBL) + (cmdheader->prdtl - 1) * sizeof(HBA_PRDT_ENTRY));
 
-
     // 8K bytes (16 sectors) per PRDT
     int i;
     for (i = 0; i < cmdheader->prdtl - 1; ++i)
@@ -221,7 +225,7 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
         cmdtbl->prdt_entry[i].dba = buf;
         cmdtbl->prdt_entry[i].dbc = 8 * 1024 - 1; // 8K bytes (this value should always be set to 1 less than the actual value)
         cmdtbl->prdt_entry[i].i = 1;
-        buf += 4 * 1024; // 4K words
+        buf += 4 * 1024; // 4K uint16_ts
         count -= 16;     // 16 sectors
     }
 
@@ -287,12 +291,84 @@ bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
     return true;
 }
 
+bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
+                uint64_t buf)
+{
+    printk("Inside writeport \n ");
+    port->is = 0xffff; // Clear pending interrupt bits
+    int slot = ahci_find_cmdslot(port);
+    if (slot == -1)
+        return false;
+
+    HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER *)port->clb;
+
+    cmdheader += slot;
+    cmdheader->cfl = sizeof(FIS_REG_H2D) / sizeof(uint32_t); // Command FIS size
+    cmdheader->w = 1;
+    cmdheader->c = 1;
+    cmdheader->p = 1;
+    cmdheader->prdtl = (uint16_t)((count - 1) >> 4) + 1; // PRDT entries count
+
+    HBA_CMD_TBL *cmdtbl = (HBA_CMD_TBL *)(cmdheader->ctba);
+    memset(cmdtbl, 0, sizeof(HBA_CMD_TBL) + (cmdheader->prdtl - 1) * sizeof(HBA_PRDT_ENTRY));
+
+    int i = 0;
+    for (i = 0; i < cmdheader->prdtl - 1; i++)
+    {
+        cmdtbl->prdt_entry[i].dba = buf;
+        cmdtbl->prdt_entry[i].dbc = 8 * 1024 - 1; // 8K bytes
+        cmdtbl->prdt_entry[i].i = 0;
+        buf += 4 * 1024; // 4K words
+        count -= 16;     // 16 sectors
+    }
+    cmdtbl->prdt_entry[i].dba = buf;
+
+    cmdtbl->prdt_entry[i].dbc = count << 9; // 512 bytes per sector
+    cmdtbl->prdt_entry[i].i = 0;
+    FIS_REG_H2D *cmdfis = (FIS_REG_H2D *)(&cmdtbl->cfis);
+    cmdfis->fis_type = FIS_TYPE_REG_H2D;
+    cmdfis->c = 1; // Command
+    cmdfis->command = ATA_CMD_WRITE_DMA_EXT;
+    cmdfis->lba0 = (uint8_t)startl;
+    cmdfis->lba1 = (uint8_t)(startl >> 8);
+    cmdfis->lba2 = (uint8_t)(startl >> 16);
+    cmdfis->lba3 = (uint8_t)(startl >> 24);
+    cmdfis->lba4 = (uint8_t)starth;
+    cmdfis->lba5 = (uint8_t)(starth >> 8);
+
+    cmdfis->device = 1 << 6; // LBA mode
+
+    cmdfis->countl = count & 0xff;
+    cmdfis->counth = count >> 8;
+    //    printk("[slot]{%d}", slot);
+    port->ci = 1; // Issue command
+    while (1)
+    {
+        // In some longer duration reads, it may be helpful to spin on the DPS bit
+        // in the PxIS port field as well (1 << 5)
+        if ((port->ci & (1 << slot)) == 0)
+            break;
+        if (port->is & HBA_PxIS_TFES)
+        { // Task file error
+            kerror("Write disk error");
+            return false;
+        }
+    }
+    if (port->is & HBA_PxIS_TFES)
+    {
+        kerror("Write disk error");
+        return false;
+    }
+
+    return true;
+}
+
 // Find a free command list slot
 static int ahci_find_cmdslot(HBA_PORT *port)
 {
     // If not set in SACT and CI, the slot is free
     uint32_t slots = (port->sact | port->ci);
-    int num_of_cmd_clots = (ahci_devices[0].hba_mem->cap&0x0f00)>>8;    // bit 12-8
+    int num_of_cmd_clots = (ahci_devices[0].hba_mem->cap & 0x0f00) >> 8; // bit 12-8
     for (int i = 0; i < num_of_cmd_clots; i++)
     {
         if ((slots & 1) == 0)

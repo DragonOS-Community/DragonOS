@@ -283,7 +283,7 @@ void apic_init();
  * @param total 返回数组的元素总个数
  * @return uint 
  */
-uint apic_get_ics(const uint type, ul *ret_vaddr[], uint * total);
+uint apic_get_ics(const uint type, ul ret_vaddr[], uint * total);
 
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num);

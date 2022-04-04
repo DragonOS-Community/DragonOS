@@ -114,7 +114,7 @@ void apic_local_apic_init()
 
     cpu_cpuid(1, 0, &a, &b, &c, &d);
 
-    kdebug("CPUID 0x01, eax:%#010lx, ebx:%#010lx, ecx:%#010lx, edx:%#010lx", a, b, c, d);
+    //kdebug("CPUID 0x01, eax:%#010lx, ebx:%#010lx, ecx:%#010lx, edx:%#010lx", a, b, c, d);
 
     // 判断是否支持APIC和xAPIC
     if ((1 << 9) & d)
@@ -152,7 +152,7 @@ void apic_local_apic_init()
                          "rdmsr  \n\t"
                          : "=a"(eax), "=d"(edx)::"memory");
 
-    kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
+    //kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
 
     // 检测是否成功启用xAPIC和x2APIC
     if (eax & 0xc00)
@@ -194,7 +194,7 @@ void apic_local_apic_init()
                 :
                 :"memory");
                 */
-    kdebug("After setting SVR: edx=%#010x, eax=%#010x", edx, eax);
+    //kdebug("After setting SVR: edx=%#010x, eax=%#010x", edx, eax);
 
     if (eax & 0x100)
         kinfo("APIC Software Enabled.");
@@ -209,8 +209,8 @@ void apic_local_apic_init()
                          "rdmsr  \n\t"
                          : "=a"(eax), "=d"(edx)::"memory");
 
-    kdebug("get Local APIC ID: edx=%#010x, eax=%#010x", edx, eax);
-    kdebug("local_apic_id=%#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_ID));
+    //kdebug("get Local APIC ID: edx=%#010x, eax=%#010x", edx, eax);
+    //kdebug("local_apic_id=%#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_ID));
 
     // 获取Local APIC Version
     // 0x803处是 Local APIC Version register
@@ -462,7 +462,7 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
  * @param total 返回数组的元素总个数
  * @return uint
  */
-uint apic_get_ics(const uint type, ul *ret_vaddr[], uint *total)
+uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total)
 {
     void *ent = (void *)(madt) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
     struct apic_Interrupt_Controller_Structure_header_t *header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
@@ -475,7 +475,7 @@ uint apic_get_ics(const uint type, ul *ret_vaddr[], uint *total)
         header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
         if (header->type == type)
         {
-            *(ret_vaddr[cnt++]) = (ul)ent;
+            ret_vaddr[cnt++] = (ul)ent;
             flag = true;
         }
         ent += header->length;

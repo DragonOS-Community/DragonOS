@@ -60,7 +60,7 @@ grub==2.06
 
 - [x] Start dragonos on the physical platform (There is a bug which can make the computer automatically reboot on AMD processor)
 
-- [ ] Multi core boot
+- [x] Multi core boot
 
 - [ ] Multi core scheduling and load balancing
 

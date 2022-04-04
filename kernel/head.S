@@ -193,6 +193,7 @@ multiboot_header_end:
 // 临时页表 4KB/页
 .section .data
 .align 0x1000
+.global pml4
 pml4:
     .skip 0x1000
 pdpt:

@@ -11,6 +11,16 @@
 #pragma once
 #include "printk.h"
 
+#define ksuccess(...)                           \
+    do                                       \
+    {                                        \
+        printk("[ ");                        \
+        printk_color(GREEN, BLACK, "SUCCESS"); \
+        printk(" ] ");                       \
+        printk(__VA_ARGS__);                 \
+        printk("\n");                        \
+    } while (0);
+
 #define kinfo(...)           \
     do                       \
     {                        \

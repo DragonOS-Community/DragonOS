@@ -381,6 +381,7 @@ switch_seg:
 
     .quad entry64
 
+.global entry64
 entry64:
 
     movq $0x10, %rax
@@ -390,6 +391,12 @@ entry64:
     movq %rax, %ss
 
     movq _stack_start(%rip), %rsp //rsp的地址
+
+    // 分支，判断是否为apu
+    movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
+	rdmsr
+	bt	$8,	%rax
+	jnc	start_smp
 
 setup_IDT:
     leaq m_ignore_int(%rip),  %rdx // 将ignore_int的地址暂时存到中段描述符的高8B
@@ -468,6 +475,16 @@ SetUp_TSS64:
 
 go_to_kernel:
     .quad Start_Kernel
+
+start_smp:
+	movq	go_to_smp_kernel(%rip),	%rax		/* movq address */
+	pushq	$0x08
+	pushq	%rax
+	lretq
+
+go_to_smp_kernel:
+
+	.quad	smp_ap_start
 
 // ==== 异常/中断处理模块 ignore int： 忽略中断
 m_ignore_int:
@@ -597,7 +614,3 @@ IDT_BASE: .quad IDT_Table
 TSS64_Table:
     .fill 13, 8, 0
 TSS64_END:
-
-TSS64_POINTER:
-TSS64_LIMIT: .word TSS64_END - TSS64_Table - 1
-TSS64_BASE: .quad TSS64_Table

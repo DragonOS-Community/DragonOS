@@ -1,5 +1,9 @@
 #include "smp.h"
 #include "../common/kprint.h"
+#include "../driver/interrupt/apic/apic.h"
+
+extern void apic_local_apic_init();
+
 static struct acpi_Processor_Local_APIC_Structure_t *proc_local_apic_structs[MAX_SUPPORTED_PROCESSOR_NUM];
 static uint32_t total_processor_num = 0;
 
@@ -28,4 +32,16 @@ void smp_init()
     wrmsr(0x830, 0xc4500);  // init IPI
     wrmsr(0x830, 0xc4620);  // start-up IPI
     wrmsr(0x830, 0xc4620);  // start-up IPI
+}
+
+/**
+ * @brief AP处理器启动后执行的第一个函数
+ * 
+ */
+void smp_ap_start()
+{
+    ksuccess("AP core successfully started!");
+    kinfo("Initializing AP's local apic...");
+    apic_local_apic_init();
+    while(1);
 }

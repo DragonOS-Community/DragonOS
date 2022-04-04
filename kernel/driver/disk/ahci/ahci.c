@@ -28,11 +28,11 @@ void ahci_init()
 
     // 映射ABAR
     mm_map_phys_addr(AHCI_MAPPING_BASE, ((ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
-    kdebug("ABAR mapped!");
+    //kdebug("ABAR mapped!");
 
     for (int i = 0; i < count_ahci_devices; ++i)
     {
-        kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, ABAR=%#010lx", i, ahci_devs[i]->Class_code, ahci_devs[i]->SubClass, ahci_devs[i]->ProgIF, ((struct pci_device_structure_general_device_t *)(ahci_devs[i]))->BAR5);
+        //kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, ABAR=%#010lx", i, ahci_devs[i]->Class_code, ahci_devs[i]->SubClass, ahci_devs[i]->ProgIF, ((struct pci_device_structure_general_device_t *)(ahci_devs[i]))->BAR5);
         // 赋值HBA_MEM结构体
         ahci_devices[i].dev_struct = ahci_devs[i];
         ahci_devices[i].hba_mem = (HBA_MEM *)(cal_HBA_MEM_VIRT_ADDR(i));

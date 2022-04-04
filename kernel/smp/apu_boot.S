@@ -112,6 +112,10 @@ _apu_code64:
     or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
     movq %rax, %cr4
 
+    // 跳转到地址1MB处执行
+    movq	$_start64,	%rax
+	jmpq	*%rax
+
     hlt
 
 

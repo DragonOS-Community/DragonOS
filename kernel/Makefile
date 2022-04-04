@@ -7,7 +7,7 @@ DIR_LIB=lib
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
-CFLAGS := -mcmodel=large -fno-builtin -m64
+CFLAGS := -mcmodel=large -fno-builtin -m64 -g
 
 # 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
 PIC := _INTR_APIC_
@@ -16,8 +16,8 @@ CFLAGS += -D $(PIC)
 ASFLAGS := --64
 
 all: kernel
-	objcopy -I elf64-x86-64 -S -R ".comment" -R ".eh_frame" -O elf64-x86-64 kernel ../bin/kernel/kernel.elf
-
+	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
+#
 
 kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \

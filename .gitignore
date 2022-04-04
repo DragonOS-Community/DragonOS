@@ -2,6 +2,7 @@
 /bin/
 DragonOS.iso
 .idea/
+kernel/kernel
 
 *.o
 *.s

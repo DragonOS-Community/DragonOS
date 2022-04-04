@@ -17,3 +17,6 @@ clean:
 		cd $$subdir && make clean;\
 		cd .. ;\
 	done
+
+gdb:
+	gdb -n -x tools/.gdbinit

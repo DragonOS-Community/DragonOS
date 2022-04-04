@@ -449,7 +449,6 @@ void pci_init()
             {
                 kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\tcap_pointer=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->Status, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer);
                 uint32_t tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer);
-                kdebug("cap+0x0 = %#010lx", tmp);
             }
             else
             {

@@ -271,6 +271,7 @@ void apic_local_apic_init()
     */
     kdebug("All LVT Masked");
 
+    /*
     // 获取TPR寄存器的值
     __asm__ __volatile__("movq $0x808, %%rcx    \n\t"
                          "rdmsr  \n\t"
@@ -282,6 +283,7 @@ void apic_local_apic_init()
                          "rdmsr  \n\t"
                          : "=a"(eax), "=d"(edx)::"memory");
     kdebug("LVT_PPR=%#010x", eax);
+    */
 }
 
 /**

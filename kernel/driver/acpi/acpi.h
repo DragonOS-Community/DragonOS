@@ -162,15 +162,6 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
 bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_data, void *_data);
 
 
-/**
- * @brief 迭代器，用于迭代中断控制器结构(Interrupt Controller Structure)（位于ACPI标准文件的Table 5-45）
- * @param  _fun            迭代操作调用的函数
- * @param  _data           数据
- */
-void acpi_iter_Interrupt_Controller_Structure(bool (*_fun)(const struct apic_Interrupt_Controller_Structure_header_t *, void *),
-                   void *_data);
-
-
 
 // 初始化acpi模块
 void acpi_init();

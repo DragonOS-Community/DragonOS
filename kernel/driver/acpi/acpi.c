@@ -22,6 +22,8 @@ static uint acpi_XSDT_Entry_num = 0;
 
 static ul acpi_RSDT_entry_phys_base = 0; // RSDT中的第一个entry所在物理页的基地址
 
+static uint64_t acpi_madt_vaddr = 0;    // MADT的虚拟地址
+
 // static ul acpi_XSDT_entry_phys_base = 0; // XSDT中的第一个entry所在物理页的基地址
 
 /**
@@ -53,7 +55,6 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
         {
 
             sdt_header = (struct acpi_system_description_table_header_t *)(acpi_get_RSDT_entry_vaddr((ul)(*(ent + i))));
-          
 
             if (_fun(sdt_header, _data) == true)
                 return;
@@ -79,9 +80,10 @@ bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_da
     //*(struct acpi_Multiple_APIC_Description_Table_t *)_data = *(struct acpi_Multiple_APIC_Description_Table_t *)_iter_data;
     // 返回MADT的虚拟地址
     *(ul *)_data = (ul)_iter_data;
-
+    acpi_madt_vaddr = _iter_data;
     return true;
 }
+
 
 /**
  * @brief 初始化acpi模块
@@ -138,7 +140,7 @@ void acpi_init()
             mm_map_phys_addr(ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * j, (*(ent + j)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
         }
         */
-       // 由于解析XSDT出现问题。暂时只使用Rsdpv2的rsdt，但是这是不符合ACPI规范的！！！
+        // 由于解析XSDT出现问题。暂时只使用Rsdpv2的rsdt，但是这是不符合ACPI规范的！！！
         ul rsdt_phys_base = rsdpv2->rsdp1.RsdtAddress & PAGE_2M_MASK;
         acpi_RSDT_offset = rsdpv2->rsdp1.RsdtAddress - rsdt_phys_base;
         mm_map_phys_addr(ACPI_RSDT_VIRT_ADDR_BASE, rsdt_phys_base, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);

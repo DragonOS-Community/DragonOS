@@ -1,0 +1,12 @@
+#include "../common/glib.h"
+
+#include "../common/asm.h"
+#include "../driver/acpi/acpi.h"
+#include "../driver/interrupt/apic/apic.h"
+
+#define MAX_SUPPORTED_PROCESSOR_NUM 1024    // 操作系统支持的最大处理器数量
+/**
+ * @brief 初始化对称多核处理器
+ *
+ */
+void smp_init();

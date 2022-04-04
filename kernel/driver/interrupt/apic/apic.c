@@ -24,7 +24,6 @@ void apic_io_apic_init()
 {
 
     ul madt_addr;
-    kdebug("madt_addr = %#018lx", (ul)madt_addr);
     acpi_iter_SDT(acpi_get_MADT, &madt_addr);
     madt = (struct acpi_Multiple_APIC_Description_Table_t *)madt_addr;
 
@@ -453,4 +452,38 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
                          "movq 	$0x80b,	%%rcx	\n\t"
                          "wrmsr	\n\t" ::
                              : "memory");
+}
+
+/**
+ * @brief 读取指定类型的 Interrupt Control Structure
+ *
+ * @param type ics的类型
+ * @param ret_vaddr 对应的ICS的虚拟地址数组
+ * @param total 返回数组的元素总个数
+ * @return uint
+ */
+uint apic_get_ics(const uint type, ul *ret_vaddr[], uint *total)
+{
+    void *ent = (void *)(madt) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
+    struct apic_Interrupt_Controller_Structure_header_t *header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
+    bool flag = false;
+
+    uint cnt = 0;
+
+    while (header->length > 2)
+    {
+        header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
+        if (header->type == type)
+        {
+            *(ret_vaddr[cnt++]) = (ul)ent;
+            flag = true;
+        }
+        ent += header->length;
+    }
+
+    *total = cnt;
+    if (!flag)
+        return APIC_E_NOTFOUND;
+    else
+        return APIC_SUCCESS;
 }

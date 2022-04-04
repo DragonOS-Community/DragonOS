@@ -5,6 +5,9 @@
 #include "../../../exception/irq.h"
 #include "../../../mm/mm.h"
 
+#define APIC_SUCCESS 0
+#define APIC_E_NOTFOUND 1
+
 #define APIC_IO_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + IO_APIC_MAPPING_OFFSET
 #define APIC_LOCAL_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + LOCAL_APIC_MAPPING_OFFSET
 
@@ -69,6 +72,8 @@
 // 0x3A0~0x3D0 Reserved.
 // 分频配置寄存器（定时器专用）
 #define LOCAL_APIC_OFFSET_Local_APIC_CLKDIV 0x3e0
+
+
 
 /*
 
@@ -269,6 +274,16 @@ void apic_ioapic_write_rte(unsigned char index, ul value);
  *
  */
 void apic_init();
+
+/**
+ * @brief 读取指定类型的 Interrupt Control Structure
+ * 
+ * @param type ics的类型
+ * @param ret_vaddr 对应的ICS的虚拟地址数组
+ * @param total 返回数组的元素总个数
+ * @return uint 
+ */
+uint apic_get_ics(const uint type, ul *ret_vaddr[], uint * total);
 
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num);

@@ -19,9 +19,9 @@ all: kernel
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
 #
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
-	common/cpu.o	\
+	common/cpu.o smp/smp.o 	\
 	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o \
 	-T link.lds
 
@@ -64,7 +64,8 @@ process.o: process/process.c
 syscall.o: syscall/syscall.c
 	gcc $(CFLAGS) -c syscall/syscall.c -o syscall/syscall.o
 
-
+smp.o: smp/smp.c 
+	gcc $(CFLAGS) -c smp/smp.c  -o smp/smp.o 
 
 cpu.o: common/cpu.c 
 	gcc $(CFLAGS) -c common/cpu.c -o common/cpu.o

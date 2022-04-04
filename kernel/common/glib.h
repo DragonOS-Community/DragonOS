@@ -7,6 +7,7 @@
 
 //引入对bool类型的支持
 #include <stdbool.h>
+#include <stdint.h>
 
 #define NULL 0
 

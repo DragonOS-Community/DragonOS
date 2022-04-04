@@ -165,11 +165,13 @@ void system_initialize()
     syscall_init();
 
     cpu_init();
-    //ps2_keyboard_init();
-    //ps2_mouse_init();
-    //ata_init();
+    // ps2_keyboard_init();
+    // ps2_mouse_init();
+    // ata_init();
     pci_init();
     ahci_init();
+
+    smp_init();
     // test_slab();
     // test_mm();
 
@@ -180,9 +182,7 @@ void system_initialize()
 //操作系统内核从这里开始执行
 void Start_Kernel(void)
 {
-
     system_initialize();
-    
 
     /*
     uint64_t buf[100];
@@ -197,21 +197,21 @@ void Start_Kernel(void)
     // show_welcome();
     // test_mm();
 
-/*
-    while (1)
-    {
-        ps2_keyboard_analyze_keycode();
-        struct ps2_mouse_packet_3bytes packet = {0};
-        // struct ps2_mouse_packet_4bytes packet = {0};
-        int errcode = 0;
-        errcode = ps2_mouse_get_packet(&packet);
-        if (errcode == 0)
+    /*
+        while (1)
         {
-            printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y);
-            // printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d, byte3:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y, (unsigned char)packet.byte3);
+            ps2_keyboard_analyze_keycode();
+            struct ps2_mouse_packet_3bytes packet = {0};
+            // struct ps2_mouse_packet_4bytes packet = {0};
+            int errcode = 0;
+            errcode = ps2_mouse_get_packet(&packet);
+            if (errcode == 0)
+            {
+                printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y);
+                // printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d, byte3:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y, (unsigned char)packet.byte3);
+            }
         }
-    }
-*/
+    */
     /*
         while (1)
         {

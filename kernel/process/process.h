@@ -154,7 +154,7 @@ struct thread_struct initial_thread;
 // 初始化 初始进程的union ，并将其链接到.data.init_proc段内
 union proc_union initial_proc_union __attribute__((__section__(".data.init_proc_union"))) = {INITIAL_PROC(initial_proc_union.pcb)};
 
-struct process_control_block *initial_proc[CPU_NUM] = {&initial_proc_union.pcb, 0};
+struct process_control_block *initial_proc[MAX_CPU_NUM] = {&initial_proc_union.pcb, 0};
 
 struct mm_struct initial_mm = {0};
 struct thread_struct initial_thread =
@@ -211,7 +211,7 @@ struct tss_struct
 		.io_map_base_addr = 0                                             \
 	}
 // 为每个核心初始化初始进程的tss
-struct tss_struct initial_tss[CPU_NUM] = {[0 ... CPU_NUM - 1] = INITIAL_TSS};
+struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_TSS};
 
 // 获取当前的pcb
 struct process_control_block *get_current_pcb()

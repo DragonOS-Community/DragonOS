@@ -2,7 +2,7 @@
 
 #include "glib.h"
 
-#define CPU_NUM 8 
+#define MAX_CPU_NUM 32 // 操作系统支持的最大处理器数量
 
 // cpu支持的最大cpuid指令的基础主功能号
 uint Cpu_cpuid_max_Basic_mop;
@@ -53,3 +53,9 @@ void cpu_cpuid(uint mop, uint sop, uint *eax, uint*ebx, uint*ecx, uint*edx)
  * 
  */
 void cpu_init(void);
+
+struct cpu_core_info
+{
+    uint64_t stack_start;   // 栈基地址
+    uint64_t tss_vaddr; // tss地址
+}cpu_core_info[MAX_CPU_NUM];

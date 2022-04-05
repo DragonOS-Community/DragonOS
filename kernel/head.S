@@ -381,7 +381,7 @@ switch_seg:
 
     .quad entry64
 
-.global entry64
+
 entry64:
 
     movq $0x10, %rax
@@ -590,7 +590,7 @@ GDT_Table:
     .quad 0x0000f20000000000 // 6 用户64位数据段描述符 0x30
     .quad 0x00cf9a000000ffff // 7 内核32位代码段描述符 0x38
     .quad 0x00cf92000000ffff // 8 内核32位数据段描述符 0x40
-    .fill 10, 8, 0           // 10-11 TSS(跳过了第9段)  重复十次填充8字节的空间，赋值为0
+    .fill 100, 8, 0           // 10-11 TSS(跳过了第9段)  重复十次填充8字节的空间，赋值为0   长模式下，每个TSS长度为128bit
 GDT_END:
 
 GDT_POINTER:

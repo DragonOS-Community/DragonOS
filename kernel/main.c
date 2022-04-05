@@ -12,6 +12,7 @@
 #include "mm/slab.h"
 #include "process/process.h"
 #include "syscall/syscall.h"
+#include "smp/smp.h"
 
 #include "driver/multiboot2/multiboot2.h"
 #include "driver/acpi/acpi.h"
@@ -148,8 +149,11 @@ void system_initialize()
     load_TR(10); // 加载TR寄存器
     ul tss_item_addr = 0x7c00;
 
-    set_TSS64(_stack_start, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
+    set_TSS64((ul)TSS64_Table, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
               tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
+
+    cpu_core_info[0].stack_start = _stack_start;
+    cpu_core_info[0].tss_vaddr = (ul)TSS64_Table;
 
     // 初始化中断描述符表
     sys_vector_init();
@@ -161,6 +165,9 @@ void system_initialize()
     // 初始化中断模块
     irq_init();
 
+    smp_init();
+
+    hlt();
     // 先初始化系统调用模块
     syscall_init();
 
@@ -170,13 +177,13 @@ void system_initialize()
     // ata_init();
     pci_init();
     ahci_init();
-
-    smp_init();
+    
     // test_slab();
     // test_mm();
 
     //  再初始化进程模块。顺序不能调转
     // process_init();
+    
 }
 
 //操作系统内核从这里开始执行

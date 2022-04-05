@@ -103,6 +103,46 @@ void apic_io_apic_init()
 }
 
 /**
+ * @brief 初始化AP处理器的Local apic
+ *
+ */
+void apic_init_ap_core_local_apic()
+{
+    kinfo("Initializing AP-core's local apic...");
+    uint eax, edx;
+    // 启用xAPIC 和x2APIC
+    __asm__ __volatile__("movq  $0x1b, %%rcx   \n\t" // 读取IA32_APIC_BASE寄存器
+                         "rdmsr  \n\t"
+                         "bts $10,   %%rax  \n\t"
+                         "bts $11,   %%rax   \n\t"
+                         "wrmsr  \n\t"
+                         "movq $0x1b,    %%rcx   \n\t"
+                         "rdmsr  \n\t"
+                         : "=a"(eax), "=d"(edx)::"memory");
+
+    // kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
+
+    // 检测是否成功启用xAPIC和x2APIC
+    if (eax & 0xc00)
+        kinfo("xAPIC & x2APIC enabled!");
+    // 设置SVR寄存器，开启local APIC、禁止EOI广播
+
+    __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
+                         "rdmsr  \n\t"
+                         "bts $8, %%rax  \n\t"
+                         "bts $12, %%rax \n\t"
+                         "movq $0x80f, %%rcx    \n\t"
+                         "wrmsr  \n\t"
+                         "movq $0x80f , %%rcx   \n\t"
+                         "rdmsr \n\t"
+                         : "=a"(eax), "=d"(edx)::"memory", "rcx");
+
+    if (eax & 0x100)
+        kinfo("APIC Software Enabled.");
+    if (eax & 0x1000)
+        kinfo("EOI-Broadcast Suppression Enabled.");
+}
+/**
  * @brief 初始化local apic
  *
  */
@@ -114,7 +154,7 @@ void apic_local_apic_init()
 
     cpu_cpuid(1, 0, &a, &b, &c, &d);
 
-    //kdebug("CPUID 0x01, eax:%#010lx, ebx:%#010lx, ecx:%#010lx, edx:%#010lx", a, b, c, d);
+    // kdebug("CPUID 0x01, eax:%#010lx, ebx:%#010lx, ecx:%#010lx, edx:%#010lx", a, b, c, d);
 
     // 判断是否支持APIC和xAPIC
     if ((1 << 9) & d)
@@ -152,7 +192,7 @@ void apic_local_apic_init()
                          "rdmsr  \n\t"
                          : "=a"(eax), "=d"(edx)::"memory");
 
-    //kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
+    // kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
 
     // 检测是否成功启用xAPIC和x2APIC
     if (eax & 0xc00)
@@ -174,7 +214,7 @@ void apic_local_apic_init()
     __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
                          "rdmsr  \n\t"
                          "bts $8, %%rax  \n\t"
-                         "bts $12, %%rax \n\t"
+                         //                         "bts $12, %%rax \n\t"
                          "movq $0x80f, %%rcx    \n\t"
                          "wrmsr  \n\t"
                          "movq $0x80f , %%rcx   \n\t"
@@ -194,7 +234,7 @@ void apic_local_apic_init()
                 :
                 :"memory");
                 */
-    //kdebug("After setting SVR: edx=%#010x, eax=%#010x", edx, eax);
+    // kdebug("After setting SVR: edx=%#010x, eax=%#010x", edx, eax);
 
     if (eax & 0x100)
         kinfo("APIC Software Enabled.");
@@ -205,12 +245,13 @@ void apic_local_apic_init()
     //                          Table 10-6. Local APIC Register Address Map Supported by x2APIC
     // 获取 Local APIC ID
     // 0x802处是x2APIC ID 位宽32bits 的 Local APIC ID register
+    /*
     __asm__ __volatile__("movq $0x802, %%rcx    \n\t"
                          "rdmsr  \n\t"
                          : "=a"(eax), "=d"(edx)::"memory");
-
-    //kdebug("get Local APIC ID: edx=%#010x, eax=%#010x", edx, eax);
-    //kdebug("local_apic_id=%#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_ID));
+    */
+    // kdebug("get Local APIC ID: edx=%#010x, eax=%#010x", edx, eax);
+    // kdebug("local_apic_id=%#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_ID));
 
     // 获取Local APIC Version
     // 0x803处是 Local APIC Version register

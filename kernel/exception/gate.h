@@ -3,7 +3,7 @@
  * @author longjin
  * @brief 门定义
  * @date 2022-01-24
- * 
+ *
  */
 
 #pragma once
@@ -20,10 +20,9 @@ struct gate_struct
     unsigned char x[16];
 };
 
-extern struct desc_struct GDT_Table[]; //GDT_Table是head.S中的GDT_Table
-extern struct gate_struct IDT_Table[]; //IDT_Table是head.S中的IDT_Table
+extern struct desc_struct GDT_Table[]; // GDT_Table是head.S中的GDT_Table
+extern struct gate_struct IDT_Table[]; // IDT_Table是head.S中的IDT_Table
 extern unsigned int TSS64_Table[26];
-
 
 /**
  * @brief 初始化中段描述符表内的门描述符（每个16B）
@@ -35,7 +34,7 @@ extern unsigned int TSS64_Table[26];
 
 void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
 {
-    ul __d0=0, __d1=0;
+    ul __d0 = 0, __d1 = 0;
     ul tmp_code_addr = *code_addr;
     __d0 = attr << 40; //设置P、DPL、Type
 
@@ -52,14 +51,16 @@ void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
 
     __d1 = (0xffffffff & tmp_code_addr); //设置段内偏移[63:32]
 
-
     *gate_selector_addr = __d0;
     *(gate_selector_addr + 1) = __d1;
 }
 
+void set_tss_descriptor(unsigned int n, void *addr)
+{
 
-
-
+    *(unsigned long *)(GDT_Table + n) = (103UL & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | (((unsigned long)addr >> 16 & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((103UL >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
+    *(unsigned long *)(GDT_Table + n + 1) = ((unsigned long)addr >> 32 & 0xffffffff) | 0;
+}
 
 /**
  * @brief 加载任务状态段寄存器
@@ -69,48 +70,48 @@ void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
 #define load_TR(n)                                      \
     do                                                  \
     {                                                   \
-        __asm__ __volatile__("ltr %%ax" ::"a"(n << 3)); \
+        __asm__ __volatile__("ltr %%ax" ::"a"((n)<< 3)); \
     } while (0)
 
 /**
  * @brief 设置中断门
- * 
+ *
  * @param n 中断号
  * @param ist ist
  * @param addr 服务程序的地址
  */
 void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate((ul*)(IDT_Table + n), 0x8E, ist, (ul*)(&addr)); // p=1，DPL=0, type=E
+    set_gate((ul *)(IDT_Table + n), 0x8E, ist, (ul *)(&addr)); // p=1，DPL=0, type=E
 }
 
 /**
  * @brief 设置64位，DPL=0的陷阱门
- * 
+ *
  * @param n 中断号
  * @param ist ist
  * @param addr 服务程序的地址
  */
 void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate((ul*)(IDT_Table + n), 0x8F, ist, (ul*)(&addr)); // p=1，DPL=0, type=F
+    set_gate((ul *)(IDT_Table + n), 0x8F, ist, (ul *)(&addr)); // p=1，DPL=0, type=F
 }
 
 /**
  * @brief 设置64位，DPL=3的陷阱门
- * 
+ *
  * @param n 中断号
  * @param ist ist
  * @param addr 服务程序的地址
  */
 void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate((ul*)(IDT_Table + n), 0xEF, ist, (ul*)(&addr)); // p=1，DPL=3, type=F
+    set_gate((ul *)(IDT_Table + n), 0xEF, ist, (ul *)(&addr)); // p=1，DPL=3, type=F
 }
 
 /**
  * @brief 初始化TSS表的内容
- * 
+ *
  */
 void set_TSS64(ul rsp0, ul rsp1, ul rsp2, ul ist1, ul ist2, ul ist3, ul ist4, ul ist5, ul ist6, ul ist7)
 {

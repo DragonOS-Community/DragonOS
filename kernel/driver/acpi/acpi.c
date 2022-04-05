@@ -80,7 +80,7 @@ bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_da
     //*(struct acpi_Multiple_APIC_Description_Table_t *)_data = *(struct acpi_Multiple_APIC_Description_Table_t *)_iter_data;
     // 返回MADT的虚拟地址
     *(ul *)_data = (ul)_iter_data;
-    acpi_madt_vaddr = _iter_data;
+    acpi_madt_vaddr = (ul)_iter_data;
     return true;
 }
 

@@ -16,6 +16,7 @@
 #define cli() __asm__ __volatile__("cli\n\t" :: \
                                        : "memory") //关闭外部中断
 #define nop() __asm__ __volatile__("nop\n\t")
+#define hlt() __asm__ __volatile__("hlt\n\t")
 
 //内存屏障
 #define io_mfence() __asm__ __volatile__("mfence\n\t" :: \

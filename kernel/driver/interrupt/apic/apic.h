@@ -269,6 +269,13 @@ ul apic_ioapic_read_rte(unsigned char index);
  */
 void apic_ioapic_write_rte(unsigned char index, ul value);
 
+
+/**
+ * @brief 初始化AP处理器的Local apic
+ * 
+ */
+void apic_init_ap_core_local_apic();
+
 /**
  * @brief 初始化apic控制器
  *

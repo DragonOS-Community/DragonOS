@@ -49,12 +49,13 @@
 #define Build_IRQ(number)                                                     \
     void IRQ_NAME(number);                                                    \
     __asm__(SYMBOL_NAME_STR(IRQ) #number "interrupt:   \n\t"                  \
-                                         "pushq $0x00 \n\t" SAVE_ALL_REGS     \
-                                         "movq %rsp, %rdi\n\t"                \
-                                         "leaq ret_from_intr(%rip), %rax\n\t" \
+                                         "pushq $0x00 \n\t" \
+                                         SAVE_ALL_REGS     \
+                                         "movq %rsp, %rdi   \n\t"                \
+                                         "leaq ret_from_intr(%rip), %rax    \n\t" \
                                          "pushq %rax \n\t"                    \
-                                         "movq	$" #number ",	%rsi			\n\t"    \
-                                         "jmp do_IRQ\n\t");
+                                         "movq	$"#number",	%rsi			\n\t"    \
+                                         "jmp do_IRQ    \n\t");
 
 // 构造中断入口
 Build_IRQ(0x20);
@@ -168,8 +169,8 @@ void irq_init()
 #if _INTR_8259A_
     init_8259A();
 #else
-    memset(interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
 
     apic_init();
+    memset(interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
 #endif
 }

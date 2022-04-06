@@ -1,7 +1,7 @@
 #include "../common/asm.h"
 
 
-.balign 0x1000  // 按照4k对齐
+.align 0x1000  // 按照4k对齐
 
 .text
 .code16
@@ -53,7 +53,7 @@ _apu_boot_base = .
 
 
 .code32
-.balign 4
+.align 0x1000 
 _apu_code32:
     # 转到长模式
 
@@ -63,11 +63,22 @@ _apu_code32:
     mov %ax, %ss
     mov %ax, %fs
     mov %ax, %gs
+    
+    // 1. 允许 PAE
+    mov %cr4, %eax
+    or $(1<<5), %eax
+    mov %eax, %cr4
 
+    movl $enter_head_from_ap_boot, %eax
+    jmpl	*%eax
+    hlt
     // 设置栈指针
     leal (_apu_boot_tmp_stack_end - _apu_boot_base)(%esi), %eax
     movl %eax, %esp
 
+    
+
+   
     // open PAE
     movl %cr4, %eax
     bts $5, %eax
@@ -77,16 +88,17 @@ _apu_code32:
 
     movl $pml4, %eax    // 复用bsp处理器初始化时的32位页表
     movl %eax, %cr3
+    
+    movl	$0xC0000080,	%ecx
+	rdmsr
 
-    mov $0xC0000080, %ecx
-    rdmsr
-    or $(1<<8), %eax
-    wrmsr
+	bts	$8,	%eax
+	wrmsr
 
-    // enable PE and paging 这里有问题
-
+    // enable PE and paging
     mov %cr0, %eax
     or $(1<<31), %eax
+    or $(1<<0), %eax
     mov %eax, %cr0
 
     // 跳转到64位代码
@@ -94,7 +106,7 @@ _apu_code32:
 
 
 .code64
-.balign 4
+.align 0x1000 
 _apu_code64:
     movq $0x20, %rax
     movq %rax, %ds
@@ -119,12 +131,12 @@ _apu_code64:
     hlt
 
 
-.balign 4
+.align 0x1000 
 _apu_tmp_idt:
 	.word	0
 	.word	0,0
 
-.balign 4
+.align 0x1000 
 _apu_tmp_gdt:
     .short _apu_tmp_gdt_end - _apu_tmp_gdt -1
     .long _apu_tmp_gdt - _apu_boot_base
@@ -135,19 +147,19 @@ _apu_tmp_gdt:
 	.quad	0x0000920000000000
 _apu_tmp_gdt_end:
 
-.balign 4
+.align 0x1000 
 _apu_code32_vector:
 	.long	_apu_code32 - _apu_boot_base
 	.word	0x08,0	
 
-.balign 4
+.align 0x1000 
 _apu_code64_vector:
 	.long	_apu_code64 - _apu_boot_base
 	.word	0x18,0	
 
-.balign 4
+.align 0x1000 
 _apu_boot_tmp_stack_start:
-	.org	0x400
+//	.org	0x400
 _apu_boot_tmp_stack_end:
 
 ENTRY(_apu_boot_end)

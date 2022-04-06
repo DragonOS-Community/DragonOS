@@ -390,18 +390,17 @@ void apic_local_apic_init()
 void apic_init()
 {
 
-    
-        // 初始化主芯片
-        io_out8(0x20, 0x11);    // 初始化主芯片的icw1
-        io_out8(0x21, 0x20);    // 设置主芯片的中断向量号为0x20(0x20-0x27)
-        io_out8(0x21, 0x04);    // 设置int2端口级联从芯片
-        io_out8(0x21, 0x01);    // 设置为AEOI模式、FNM、无缓冲
+    // 初始化主芯片
+    io_out8(0x20, 0x11); // 初始化主芯片的icw1
+    io_out8(0x21, 0x20); // 设置主芯片的中断向量号为0x20(0x20-0x27)
+    io_out8(0x21, 0x04); // 设置int2端口级联从芯片
+    io_out8(0x21, 0x01); // 设置为AEOI模式、FNM、无缓冲
 
-        // 初始化从芯片
-        io_out8(0xa0, 0x11);
-        io_out8(0xa1, 0x28);    // 设置从芯片的中断向量号为0x28(0x28-0x2f)
-        io_out8(0xa1, 0x02);    // 设置从芯片连接到主芯片的int2
-        io_out8(0xa1, 0x01);
+    // 初始化从芯片
+    io_out8(0xa0, 0x11);
+    io_out8(0xa1, 0x28); // 设置从芯片的中断向量号为0x28(0x28-0x2f)
+    io_out8(0xa1, 0x02); // 设置从芯片连接到主芯片的int2
+    io_out8(0xa1, 0x01);
     // 屏蔽类8259A芯片
     io_mfence();
     io_out8(0xa1, 0xff);

@@ -149,7 +149,7 @@ void system_initialize()
     load_TR(10); // 加载TR寄存器
     ul tss_item_addr = 0x7c00;
 
-    set_TSS64((ul)TSS64_Table, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
+    set_TSS64((ul)&TSS64_Table, _stack_start, _stack_start, _stack_start, tss_item_addr,
               tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
 
     cpu_core_info[0].stack_start = _stack_start;
@@ -165,8 +165,10 @@ void system_initialize()
     // 初始化中断模块
     irq_init();
 
+    kdebug("23232");
     smp_init();
-
+    kdebug("12121221212");
+    //smp_ap_start();
     hlt();
     // 先初始化系统调用模块
     syscall_init();

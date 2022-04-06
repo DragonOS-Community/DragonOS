@@ -297,6 +297,8 @@ _start:
     add $8, %eax
     loop .fill_pt
 
+.global enter_head_from_ap_boot
+enter_head_from_ap_boot:
     // 填写 CR3
     mov $pml4, %eax
     mov %eax, %cr3
@@ -349,8 +351,14 @@ ENTRY(_start64)
     mov %ax, %ss
     mov %ax, %gs
     
-    movq $0x7e00, %rsp
-    
+    movq _stack_start(%rip), %rsp
+
+    // 分支，判断是否为apu
+    movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
+	rdmsr
+	bt	$8,	%rax
+	jnc	load_cr3
+
     // 2. 设置临时页表
     // 最高级
     mov $__PML4E, %eax
@@ -366,6 +374,7 @@ ENTRY(_start64)
 
 
 // ==== 加载CR3寄存器
+load_cr3:
     movq $__PML4E, %rax //设置页目录基地址
     movq %rax, %cr3
 

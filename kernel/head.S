@@ -342,8 +342,10 @@ ENTRY(_start64)
 
 // === 加载GDTR ====
     lgdt GDT_POINTER(%rip) //这里我没搞明白rip相对寻址, 看了文档，大概是用来实现PIC的（position independent code）
+    //lgdt $GDT_POINTER
 // === 加载IDTR ====
     lidt IDT_POINTER(%rip)
+    //lidt $IDT_POINTER
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
@@ -602,6 +604,7 @@ GDT_Table:
     .fill 100, 8, 0           // 10-11 TSS(跳过了第9段)  重复十次填充8字节的空间，赋值为0   长模式下，每个TSS长度为128bit
 GDT_END:
 
+.global GDT_POINTER
 GDT_POINTER:
 GDT_LIMIT: .word GDT_END - GDT_Table - 1 // GDT的大小
 GDT_BASE: .quad GDT_Table
@@ -613,6 +616,7 @@ IDT_Table:
     .fill 512, 8, 0 // 设置512*8字节的IDT表的空间
 IDT_END:
 
+.global IDT_POINTER
 IDT_POINTER:
 IDT_LIMIT: .word IDT_END - IDT_Table - 1
 IDT_BASE: .quad IDT_Table

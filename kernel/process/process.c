@@ -18,7 +18,7 @@
 void __switch_to(struct process_control_block *prev, struct process_control_block *next)
 {
     initial_tss[0].rsp0 = next->thread->rbp;
-    set_TSS64(initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
+    set_tss64(TSS64_Table, initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
               initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     __asm__ __volatile__("movq	%%fs,	%0 \n\t"
@@ -201,7 +201,7 @@ void process_init()
     initial_mm.stack_start = _stack_start;
 
     // 初始化进程和tss
-    set_TSS64(initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
+    set_tss64(TSS64_Table, initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     initial_tss[0].rsp0 = initial_thread.rbp;
 

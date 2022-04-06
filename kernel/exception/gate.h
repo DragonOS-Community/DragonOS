@@ -148,19 +148,20 @@ void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
  * @brief 初始化TSS表的内容
  *
  */
-void set_TSS64(ul rsp0, ul rsp1, ul rsp2, ul ist1, ul ist2, ul ist3, ul ist4, ul ist5, ul ist6, ul ist7)
+
+void set_tss64(unsigned int * Table,unsigned long rsp0,unsigned long rsp1,unsigned long rsp2,unsigned long ist1,unsigned long ist2,unsigned long ist3,
+unsigned long ist4,unsigned long ist5,unsigned long ist6,unsigned long ist7)
 {
-    *(ul *)(TSS64_Table + 1) = rsp0;
-    *(ul *)(TSS64_Table + 3) = rsp1;
-    *(ul *)(TSS64_Table + 5) = rsp2;
+	*(unsigned long *)(Table+1) = rsp0;
+	*(unsigned long *)(Table+3) = rsp1;
+	*(unsigned long *)(Table+5) = rsp2;
 
-    *(ul *)(TSS64_Table + 9) = ist1;
-    *(ul *)(TSS64_Table + 11) = ist2;
-    *(ul *)(TSS64_Table + 13) = ist3;
-    *(ul *)(TSS64_Table + 15) = ist4;
-    *(ul *)(TSS64_Table + 17) = ist5;
-    *(ul *)(TSS64_Table + 19) = ist6;
-    *(ul *)(TSS64_Table + 21) = ist7;
+	*(unsigned long *)(Table+9) = ist1;
+	*(unsigned long *)(Table+11) = ist2;
+	*(unsigned long *)(Table+13) = ist3;
+	*(unsigned long *)(Table+15) = ist4;
+	*(unsigned long *)(Table+17) = ist5;
+	*(unsigned long *)(Table+19) = ist6;
+	*(unsigned long *)(Table+21) = ist7;	
 }
-
 #endif

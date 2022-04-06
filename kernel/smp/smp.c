@@ -34,7 +34,7 @@ void smp_init()
     icr_entry.res_2 = 0;
     icr_entry.res_3 = 0;
 
-    for (int i = 1; i < total_processor_num; ++i) // i从1开始，不初始化bsp
+    for (int i = 1; i < 2; ++i) // i从1开始，不初始化bsp
     {
         current_starting_cpu = i;
 
@@ -47,11 +47,15 @@ void smp_init()
 
         kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->ACPI_ID, proc_local_apic_structs[i]->flags);
         // 为每个AP处理器分配栈空间、tss空间
-        cpu_core_info[i].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+        cpu_core_info[i].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0);
+        kdebug("cpu_core_info[i].stack_start =%#018lx", (uint64_t)kmalloc(STACK_SIZE, 0));
+        cpu_core_info[i].stack_start += STACK_SIZE;
+        kdebug("cpu_core_info[i].stack_base =%#018lx", (uint64_t)kmalloc(STACK_SIZE, 0));
+
         cpu_core_info[i].tss_vaddr = (uint64_t)kmalloc(128, 0);
 
         set_tss_descriptor(10 + (i * 2), (void *)(cpu_core_info[i].tss_vaddr));
-        set_TSS64(cpu_core_info[i].tss_vaddr, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start);
+        set_tss64((uint*)cpu_core_info[i].tss_vaddr, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start,cpu_core_info[i].stack_start);
         kdebug("GDT Table %#018lx, \t %#018lx", GDT_Table[10 + i * 2], GDT_Table[10 + i * 2 + 1]);
         kdebug("(cpu_core_info[i].tss_vaddr)=%#018lx", (cpu_core_info[i].tss_vaddr));
         kdebug("(cpu_core_info[i].stack_start)=%#018lx", (cpu_core_info[i].stack_start));
@@ -66,10 +70,8 @@ void smp_init()
 
         wrmsr(0x830, *(ul *)&icr_entry); // start-up IPI
         wrmsr(0x830, *(ul *)&icr_entry); // start-up IPI
-
-        
     }
-    hlt();
+    
 }
 
 /**
@@ -79,62 +81,22 @@ void smp_init()
 void smp_ap_start()
 {
     // 切换栈基地址
-    // uint64_t stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+    //uint64_t stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+
+    
     __asm__ __volatile__("movq %0, %%rbp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
                          : "memory");
     __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
                          : "memory");
+/*
+    __asm__ __volatile__("movq %0, %%rbp \n\t" ::"m"(stack_start)
+                         : "memory");
+    __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(stack_start)
+                         : "memory");*/
     ksuccess("AP core successfully started!");
     kdebug("current=%d", current_starting_cpu);
     apic_init_ap_core_local_apic();
 
-    // apic_init_ap_core_local_apic();
-    /*
-        kinfo("Initializing AP-core's local apic...");
-        uint eax, edx;
-        // 启用xAPIC 和x2APIC
-        __asm__ __volatile__("movq  $0x1b, %%rcx   \n\t" // 读取IA32_APIC_BASE寄存器
-                             "rdmsr  \n\t"
-                             "bts $10,   %%rax  \n\t"
-                             "bts $11,   %%rax   \n\t"
-                             "wrmsr  \n\t"
-                             "movq $0x1b,    %%rcx   \n\t"
-                             "rdmsr  \n\t"
-                             : "=a"(eax), "=d"(edx)::"memory");
-
-        // kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
-
-        // 检测是否成功启用xAPIC和x2APIC
-        if (eax & 0xc00)
-            kinfo("xAPIC & x2APIC enabled!");
-        // 设置SVR寄存器，开启local APIC、禁止EOI广播
-
-        // enable SVR[8]
-        __asm__ __volatile__("movq 	$0x80f,	%%rcx	\n\t"
-                             "rdmsr	\n\t"
-                             "bts	$8,	%%rax	\n\t"
-                             //				"bts	$12,	%%rax\n\t"
-                             "wrmsr	\n\t"
-                             "movq 	$0x80f,	%%rcx	\n\t"
-                             "rdmsr	\n\t"
-                             : "=a"(eax), "=d"(edx)
-                             :
-                             : "memory");
-
-        if (eax & 0x100)
-            printk_color(RED, YELLOW, "SVR[8] enabled\n");
-        if (edx & 0x1000)
-            printk_color(RED, YELLOW, "SVR[12] enabled\n");
-
-        // get local APIC ID
-        __asm__ __volatile__("movq $0x802,	%%rcx	\n\t"
-                             "rdmsr	\n\t"
-                             : "=a"(eax), "=d"(edx)
-                             :
-                             : "memory");
-
-        printk_color(RED, YELLOW, "x2APIC ID:%#010x\n", eax);
-        */
     load_TR(10 + current_starting_cpu * 2);
     sti();
     kdebug("IDT_addr = %#018lx", &IDT_Table);

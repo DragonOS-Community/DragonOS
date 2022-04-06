@@ -63,32 +63,28 @@ _apu_code32:
     mov %ax, %ss
     mov %ax, %fs
     mov %ax, %gs
-    
+
+// 设置栈指针
+    leal (_apu_boot_tmp_stack_end - _apu_boot_base)(%esi), %eax
+    movl %eax, %esp
+
     // 1. 允许 PAE
     mov %cr4, %eax
     or $(1<<5), %eax
     mov %eax, %cr4
-
+/*
     movl $enter_head_from_ap_boot, %eax
     jmpl	*%eax
     hlt
-    // 设置栈指针
-    leal (_apu_boot_tmp_stack_end - _apu_boot_base)(%esi), %eax
-    movl %eax, %esp
-
+*/
     
-
-   
-    // open PAE
-    movl %cr4, %eax
-    bts $5, %eax
-    movl %eax, %cr4
 
     // 设置页表
 
     movl $pml4, %eax    // 复用bsp处理器初始化时的32位页表
     movl %eax, %cr3
     
+    // enable long mode
     movl	$0xC0000080,	%ecx
 	rdmsr
 
@@ -97,8 +93,8 @@ _apu_code32:
 
     // enable PE and paging
     mov %cr0, %eax
-    or $(1<<31), %eax
-    or $(1<<0), %eax
+    bts	$0,	%eax
+	bts	$31,	%eax
     mov %eax, %cr0
 
     // 跳转到64位代码
@@ -114,6 +110,7 @@ _apu_code64:
     movq %rax, %ss
     movq %rax, %fs
     movq %rax, %gs
+
 
     //now enable SSE and the like
     movq %cr0, %rax

@@ -58,8 +58,9 @@ void sys_vector_init()
 // 0 #DE 除法错误
 void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
-
-    kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    
+    kerror("do_divide_error(0)");
+    //kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
 
     while (1)
         ;

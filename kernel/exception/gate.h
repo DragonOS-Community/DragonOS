@@ -6,7 +6,10 @@
  *
  */
 
-#pragma once
+#ifndef __GATE_H__
+#define __GATE_H__
+
+#include "../common/kprint.h"
 
 //描述符表的结构体
 struct desc_struct
@@ -55,11 +58,36 @@ void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
     *(gate_selector_addr + 1) = __d1;
 }
 
+#define _set_gate(gate_selector_addr, attr, ist, code_addr)                                                 \
+    do                                                                                                      \
+    {                                                                                                       \
+        unsigned long __d0, __d1;                                                                           \
+        __asm__ __volatile__("movw	%%dx,	%%ax	\n\t"                                                         \
+                             "andq	$0x7,	%%rcx	\n\t"                                                        \
+                             "addq	%4,	%%rcx	\n\t"                                                          \
+                             "shlq	$32,	%%rcx	\n\t"                                                         \
+                             "addq	%%rcx,	%%rax	\n\t"                                                       \
+                             "xorq	%%rcx,	%%rcx	\n\t"                                                       \
+                             "movl	%%edx,	%%ecx	\n\t"                                                       \
+                             "shrq	$16,	%%rcx	\n\t"                                                         \
+                             "shlq	$48,	%%rcx	\n\t"                                                         \
+                             "addq	%%rcx,	%%rax	\n\t"                                                       \
+                             "movq	%%rax,	%0	\n\t"                                                          \
+                             "shrq	$32,	%%rdx	\n\t"                                                         \
+                             "movq	%%rdx,	%1	\n\t"                                                          \
+                             : "=m"(*((unsigned long *)(gate_selector_addr))),                              \
+                               "=m"(*(1 + (unsigned long *)(gate_selector_addr))), "=&a"(__d0), "=&d"(__d1) \
+                             : "i"(attr << 8),                                                              \
+                               "3"((unsigned long *)(code_addr)), "2"(0x8 << 16), "c"(ist)                  \
+                             : "memory");                                                                   \
+    } while (0)
+
 void set_tss_descriptor(unsigned int n, void *addr)
 {
 
-    *(unsigned long *)(GDT_Table + n) = (103UL & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | (((unsigned long)addr >> 16 & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((103UL >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
-    *(unsigned long *)(GDT_Table + n + 1) = ((unsigned long)addr >> 32 & 0xffffffff) | 0;
+    unsigned long limit = 103;
+    *(unsigned long *)(&GDT_Table[n]) = (limit & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | ((((unsigned long)addr >> 16) & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((limit >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
+    *(unsigned long *)(&GDT_Table[n + 1]) = (((unsigned long)addr >> 32) & 0xffffffff) | 0;
 }
 
 /**
@@ -67,10 +95,10 @@ void set_tss_descriptor(unsigned int n, void *addr)
  * @param n TSS基地址在GDT中的第几项
  * 左移3位的原因是GDT每项占8字节
  */
-#define load_TR(n)                                      \
-    do                                                  \
-    {                                                   \
-        __asm__ __volatile__("ltr %%ax" ::"a"((n)<< 3)); \
+#define load_TR(n)                                        \
+    do                                                    \
+    {                                                     \
+        __asm__ __volatile__("ltr %%ax" ::"a"((n) << 3)); \
     } while (0)
 
 /**
@@ -82,7 +110,8 @@ void set_tss_descriptor(unsigned int n, void *addr)
  */
 void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate((ul *)(IDT_Table + n), 0x8E, ist, (ul *)(&addr)); // p=1，DPL=0, type=E
+    _set_gate((IDT_Table + n), 0x8E, ist, addr); // p=1，DPL=0, type=E
+    // set_gate((ul *)(IDT_Table + n), 0x8E, ist, (ul *)(addr)); // p=1，DPL=0, type=E
 }
 
 /**
@@ -94,7 +123,10 @@ void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
  */
 void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate((ul *)(IDT_Table + n), 0x8F, ist, (ul *)(&addr)); // p=1，DPL=0, type=F
+    // kdebug("addr=%#018lx", (ul)(addr));
+
+    // set_gate((ul *)(IDT_Table + n), 0x8F, ist, (ul *)(addr)); // p=1，DPL=0, type=F
+    _set_gate((IDT_Table + n), 0x8F, ist, addr); // p=1，DPL=0, type=F
 }
 
 /**
@@ -106,7 +138,10 @@ void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
  */
 void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    set_gate((ul *)(IDT_Table + n), 0xEF, ist, (ul *)(&addr)); // p=1，DPL=3, type=F
+    // kdebug("addr=%#018lx", (ul)(addr));
+
+    // set_gate((ul *)(IDT_Table + n), 0xEF, ist, (ul *)(addr)); // p=1，DPL=3, type=F
+    _set_gate((IDT_Table + n), 0xEF, ist, addr); // p=1，DPL=3, type=F
 }
 
 /**
@@ -127,3 +162,5 @@ void set_TSS64(ul rsp0, ul rsp1, ul rsp2, ul ist1, ul ist2, ul ist3, ul ist4, ul
     *(ul *)(TSS64_Table + 19) = ist6;
     *(ul *)(TSS64_Table + 21) = ist7;
 }
+
+#endif

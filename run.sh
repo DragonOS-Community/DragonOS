@@ -12,7 +12,7 @@ if [ ! "$1" == "--nobuild" ]; then
     make clean
 fi
 
-IA32_USE_QEMU=1
+IA32_USE_QEMU=0
 bochsrc="./bochsrc"
 ARCH="x86_64"
 
@@ -93,7 +93,7 @@ if [ $flag_can_run -eq 1 ]; then
         bochs -q -f ${bochsrc} -rc ./tools/bochsinit
     else
         qemu-system-x86_64 -cdrom ${iso} -m 512M -smp 2,cores=2,threads=1,sockets=1 \
-        -monitor stdio -d cpu_reset,guest_errors -s -S -cpu IvyBridge --enable-kvm \
+        -monitor stdio -d cpu_reset,guest_errors,trace:check_exception,exec,cpu,out_asm,in_asm -s -S -cpu IvyBridge --enable-kvm \
         -drive id=disk,file=bin/disk.img,if=none \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0    \

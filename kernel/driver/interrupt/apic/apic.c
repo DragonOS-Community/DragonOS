@@ -29,7 +29,6 @@ void apic_io_apic_init()
 
     kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
     kdebug("MADT->length= %d bytes", madt->header.Length);
-
     // 寻找io apic的ICS
     void *ent = (void *)(madt_addr) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
     struct apic_Interrupt_Controller_Structure_header_t *header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
@@ -53,6 +52,7 @@ void apic_io_apic_init()
     apic_ioapic_map.virtual_data_addr = (uint *)(APIC_IO_APIC_VIRT_BASE_ADDR + 0x10);
     apic_ioapic_map.virtual_EOI_addr = (uint *)(APIC_IO_APIC_VIRT_BASE_ADDR + 0x40);
 
+    kdebug("(ul)apic_ioapic_map.virtual_index_addr=%#018lx", (ul)apic_ioapic_map.virtual_index_addr);
     // 填写页表，完成地址映射
     mm_map_phys_addr((ul)apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
 
@@ -127,20 +127,74 @@ void apic_init_ap_core_local_apic()
         kinfo("xAPIC & x2APIC enabled!");
     // 设置SVR寄存器，开启local APIC、禁止EOI广播
 
-    __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
-                         "rdmsr  \n\t"
-                         "bts $8, %%rax  \n\t"
-                         "bts $12, %%rax \n\t"
-                         "movq $0x80f, %%rcx    \n\t"
-                         "wrmsr  \n\t"
-                         "movq $0x80f , %%rcx   \n\t"
-                         "rdmsr \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory", "rcx");
+    // enable SVR[8]
+    __asm__ __volatile__("movq 	$0x80f,	%%rcx	\n\t"
+                         "rdmsr	\n\t"
+                         "bts	$8,	%%rax	\n\t"
+                         //				"bts	$12,	%%rax\n\t"
+                         "wrmsr	\n\t"
+                         "movq 	$0x80f,	%%rcx	\n\t"
+                         "rdmsr	\n\t"
+                         : "=a"(eax), "=d"(edx)
+                         :
+                         : "memory");
 
     if (eax & 0x100)
-        kinfo("APIC Software Enabled.");
-    if (eax & 0x1000)
-        kinfo("EOI-Broadcast Suppression Enabled.");
+        printk_color(RED, YELLOW, "SVR[8] enabled\n");
+    if (edx & 0x1000)
+        printk_color(RED, YELLOW, "SVR[12] enabled\n");
+
+    // get local APIC ID
+    __asm__ __volatile__("movq $0x802,	%%rcx	\n\t"
+                         "rdmsr	\n\t"
+                         : "=a"(eax), "=d"(edx)
+                         :
+                         : "memory");
+
+    printk_color(RED, YELLOW, "x2APIC ID:%#010x\n", eax);
+
+    // 由于尚未配置LVT对应的处理程序，因此先屏蔽所有的LVT
+
+    // mask all LVT
+    __asm__ __volatile__(             //"movq 	$0x82f,	%%rcx	\n\t"	//CMCI
+                                      //"wrmsr	\n\t"
+        "movq 	$0x832,	%%rcx	\n\t" // Timer
+        "wrmsr	\n\t"
+        "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
+        "wrmsr	\n\t"
+        "movq 	$0x834,	%%rcx	\n\t" // Performance Counter
+        "wrmsr	\n\t"
+        "movq 	$0x835,	%%rcx	\n\t" // LINT0
+        "wrmsr	\n\t"
+        "movq 	$0x836,	%%rcx	\n\t" // LINT1
+        "wrmsr	\n\t"
+        "movq 	$0x837,	%%rcx	\n\t" // Error
+        "wrmsr	\n\t"
+        :
+        : "a"(0x10000), "d"(0x00)
+        : "memory");
+
+    /*
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI) = 0x1000000;
+    io_mfence();
+    kdebug("cmci = %#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI));
+    */
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x10000;
+    io_mfence();
+    /*
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_PERFORMANCE_MONITOR) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1) = 0x1000000;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_ERROR) = 0x1000000;
+    io_mfence();
+    */
+    kdebug("All LVT Masked");
 }
 /**
  * @brief 初始化local apic
@@ -219,7 +273,7 @@ void apic_local_apic_init()
                          "wrmsr  \n\t"
                          "movq $0x80f , %%rcx   \n\t"
                          "rdmsr \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory", "rcx");
+                         : "=a"(eax), "=d"(edx)::"memory");
 
     /*
    //enable SVR[8]
@@ -297,8 +351,10 @@ void apic_local_apic_init()
     *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI) = 0x1000000;
     io_mfence();
     kdebug("cmci = %#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI));
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x1000000;
+    */
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x10000;
     io_mfence();
+    /*
     *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = 0x1000000;
     io_mfence();
     *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_PERFORMANCE_MONITOR) = 0x1000000;
@@ -333,14 +389,30 @@ void apic_local_apic_init()
  */
 void apic_init()
 {
+
+    
+        // 初始化主芯片
+        io_out8(0x20, 0x11);    // 初始化主芯片的icw1
+        io_out8(0x21, 0x20);    // 设置主芯片的中断向量号为0x20(0x20-0x27)
+        io_out8(0x21, 0x04);    // 设置int2端口级联从芯片
+        io_out8(0x21, 0x01);    // 设置为AEOI模式、FNM、无缓冲
+
+        // 初始化从芯片
+        io_out8(0xa0, 0x11);
+        io_out8(0xa1, 0x28);    // 设置从芯片的中断向量号为0x28(0x28-0x2f)
+        io_out8(0xa1, 0x02);    // 设置从芯片连接到主芯片的int2
+        io_out8(0xa1, 0x01);
+    // 屏蔽类8259A芯片
+    io_mfence();
+    io_out8(0xa1, 0xff);
+    io_mfence();
+    io_out8(0x21, 0xff);
+    io_mfence();
+
+    kdebug("8259A Masked.");
     // 初始化中断门， 中断使用第二个ist
     for (int i = 32; i <= 55; ++i)
         set_intr_gate(i, 2, interrupt_table[i - 32]);
-
-    // 屏蔽类8259A芯片
-    io_out8(0x21, 0xff);
-    io_out8(0xa1, 0xff);
-    kdebug("8259A Masked.");
 
     // enable IMCR
     io_out8(0x22, 0x70);
@@ -349,7 +421,10 @@ void apic_init()
     apic_local_apic_init();
 
     apic_io_apic_init();
+    kdebug("vvvvv");
+
     sti();
+    kdebug("qqqqq");
 }
 /**
  * @brief 中断服务程序

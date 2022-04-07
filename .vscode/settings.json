@@ -87,5 +87,6 @@
         "cstdbool": "c",
         "typeinfo": "c"
     },
-    "C_Cpp.errorSquiggles": "Enabled"
+    "C_Cpp.errorSquiggles": "Enabled",
+    "esbonio.sphinx.confDir": ""
 }

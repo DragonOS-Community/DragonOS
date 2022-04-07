@@ -5,10 +5,13 @@
 #include "kprint.h"
 #include "../driver/multiboot2/multiboot2.h"
 #include "../mm/mm.h"
+#include "../process/spinlock.h"
+
 //#include "linkage.h"
 
 struct screen_info pos;
 ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
+static spinlock_t printk_lock;
 
 int calculate_max_charNum(int len, int size)
 {
@@ -33,10 +36,13 @@ int printk_init(const int char_size_x, const int char_size_y)
     pos.max_x = calculate_max_charNum(pos.width, char_size_x);
     pos.max_y = calculate_max_charNum(pos.height, char_size_y);
 
-    // @todo:将来需要将帧缓冲区物理地址填写到这个地址的页表项中
+    
     VBE_FB_phys_addr = (ul)info.framebuffer_addr;
     pos.FB_address = (uint *)0x0000000003000000;
     pos.FB_length = 1UL*pos.width * pos.height;
+
+    // 初始化自旋锁
+    spin_init(&printk_lock);
 
     // ======== 临时的将物理地址填写到0x0000000003000000处 之后会在mm内将帧缓存区重新映射=====
 
@@ -649,6 +655,8 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
      * @param ... 格式化字符串
      */
 
+    spin_lock(&printk_lock);
+
     va_list args;
     va_start(args, fmt);
 
@@ -704,6 +712,8 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
         }
     }
 
+    for(int j=0;j<1e5;++j);
+    spin_unlock(&printk_lock);
     return i;
 }
 

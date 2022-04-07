@@ -442,7 +442,7 @@ struct slab_obj *kmalloc_create_slab_obj(ul size)
         struct_size = sizeof(struct slab_obj) + PAGE_2M_SIZE / size / 8;
         // 将slab_obj放置到物理页的末尾
         slab_obj_ptr = (struct slab_obj *)((unsigned char *)vaddr + PAGE_2M_SIZE - struct_size);
-        slab_obj_ptr->bmp = (ul *)slab_obj_ptr + sizeof(struct slab_obj);
+        slab_obj_ptr->bmp = (void *)slab_obj_ptr + sizeof(struct slab_obj);
 
         slab_obj_ptr->count_free = (PAGE_2M_SIZE - struct_size) / size;
         slab_obj_ptr->count_using = 0;

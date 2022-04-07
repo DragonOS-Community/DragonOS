@@ -389,7 +389,9 @@ void apic_local_apic_init()
  */
 void apic_init()
 {
-
+    // 初始化中断门， 中断使用第二个ist
+    for (int i = 32; i <= 55; ++i)
+        set_intr_gate(i, 2, interrupt_table[i - 32]);
     // 初始化主芯片
     io_out8(0x20, 0x11); // 初始化主芯片的icw1
     io_out8(0x21, 0x20); // 设置主芯片的中断向量号为0x20(0x20-0x27)
@@ -401,17 +403,15 @@ void apic_init()
     io_out8(0xa1, 0x28); // 设置从芯片的中断向量号为0x28(0x28-0x2f)
     io_out8(0xa1, 0x02); // 设置从芯片连接到主芯片的int2
     io_out8(0xa1, 0x01);
-    // 屏蔽类8259A芯片
-    io_mfence();
-    io_out8(0xa1, 0xff);
+
+    //  屏蔽类8259A芯片
     io_mfence();
     io_out8(0x21, 0xff);
     io_mfence();
+    io_out8(0xa1, 0xff);
+    io_mfence();
 
     kdebug("8259A Masked.");
-    // 初始化中断门， 中断使用第二个ist
-    for (int i = 32; i <= 55; ++i)
-        set_intr_gate(i, 2, interrupt_table[i - 32]);
 
     // enable IMCR
     io_out8(0x22, 0x70);
@@ -420,10 +420,8 @@ void apic_init()
     apic_local_apic_init();
 
     apic_io_apic_init();
-    kdebug("vvvvv");
 
     sti();
-    kdebug("qqqqq");
 }
 /**
  * @brief 中断服务程序
@@ -433,28 +431,40 @@ void apic_init()
  */
 void do_IRQ(struct pt_regs *rsp, ul number)
 {
-    unsigned char x = io_in8(0x60);
-
-    irq_desc_t *irq = &interrupt_desc[number - 32];
-
-    // 执行中断上半部处理程序
-    if (irq->handler != NULL)
-        irq->handler(number, irq->parameter, rsp);
-    else
-        kwarn("Intr vector [%d] does not have a handler!");
-
-    // 向中断控制器发送应答消息
-    if (irq->controller != NULL && irq->controller->ack != NULL)
-        irq->controller->ack(number);
-    else
+    switch (number & 0x80) // 以0x80为界限，低于0x80的是外部中断控制器，高于0x80的是Local APIC
     {
+    case 0x00: // 外部中断控制器
+        /* code */
+        {
+            irq_desc_t *irq = &interrupt_desc[number - 32];
 
-        // 向EOI寄存器写入0x00表示结束中断
-        __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
-                             "movq	$0x00,	%%rax	\n\t"
-                             "movq 	$0x80b,	%%rcx	\n\t"
-                             "wrmsr	\n\t" ::
-                                 : "memory");
+            // 执行中断上半部处理程序
+            if (irq->handler != NULL)
+                irq->handler(number, irq->parameter, rsp);
+            else
+                kwarn("Intr vector [%d] does not have a handler!");
+
+            // 向中断控制器发送应答消息
+            if (irq->controller != NULL && irq->controller->ack != NULL)
+                irq->controller->ack(number);
+            else
+            {
+
+                // 向EOI寄存器写入0x00表示结束中断
+                __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
+                                     "movq	$0x00,	%%rax	\n\t"
+                                     "movq 	$0x80b,	%%rcx	\n\t"
+                                     "wrmsr	\n\t" ::
+                                         : "memory");
+            }
+        }
+        break;
+    case 0x80:
+        printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
+        apic_local_apic_edge_ack(number);
+    default:
+        kwarn("do IRQ receive: %d", number);
+        break;
     }
 }
 
@@ -564,6 +574,21 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
         *eoi = 0x00;
 
         */
+    __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
+                         "movq	$0x00,	%%rax	\n\t"
+                         "movq 	$0x80b,	%%rcx	\n\t"
+                         "wrmsr	\n\t" ::
+                             : "memory");
+}
+
+/**
+ * @brief local apic 边沿触发应答
+ *
+ * @param irq_num
+ */
+void apic_local_apic_edge_ack(ul irq_num)
+{
+    // 向EOI寄存器写入0x00表示结束中断
     __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
                          "movq	$0x00,	%%rax	\n\t"
                          "movq 	$0x80b,	%%rcx	\n\t"

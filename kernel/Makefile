@@ -7,23 +7,18 @@ DIR_LIB=lib
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
-CFLAGS := -mcmodel=large -fno-builtin -m64 -g -O0
-
+CFLAGS := -mcmodel=large -fno-builtin -m64 -g -O0 -I .
+ARCH=x86_64
 # 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
 PIC := _INTR_APIC_
-CFLAGS += -D $(PIC)
+CFLAGS += -D $(PIC) -D $(ARCH)
 
 ASFLAGS := --64
 
-all: kernel
-	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
-#
+LD_LIST := head.o
+OBJ_LIST := head.o
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
-	common/cpu.o smp/smp.o smp/apu_boot.o	\
-	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o \
-	-T link.lds
+
 
 head.o: head.S
 	gcc -E head.S > head.s # 预处理
@@ -74,6 +69,15 @@ apu_boot.o: smp/apu_boot.S
 cpu.o: common/cpu.c 
 	gcc $(CFLAGS) -c common/cpu.c -o common/cpu.o
 
+# IPI的代码
+ifeq ($(ARCH), x86_64)
+OBJ_LIST += ipi.o
+LD_LIST += arch/x86_64/x86_64_ipi.o
+ipi.o: arch/x86_64/x86_64_ipi.c
+	gcc $(CFLAGS) -c arch/x86_64/x86_64_ipi.c -o arch/x86_64/x86_64_ipi.o
+	
+endif
+
 # 驱动程序
 # 中断处理芯片的驱动程序
 ifeq ($(PIC), _INTR_8259A_)
@@ -104,6 +108,19 @@ pci.o: driver/pci/pci.c
 
 ahci.o: driver/disk/ahci/ahci.c
 	gcc $(CFLAGS) -c driver/disk/ahci/ahci.c -o driver/disk/ahci/ahci.o
+
+
+
+all: kernel
+	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
+#
+
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o $(OBJ_LIST)
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
+	common/cpu.o smp/smp.o smp/apu_boot.o	\
+	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o \
+	$(LD_LIST)	\
+	-T link.lds
 
 
 clean: 

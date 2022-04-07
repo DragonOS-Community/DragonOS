@@ -85,7 +85,8 @@
         "thread": "c",
         "cinttypes": "c",
         "cstdbool": "c",
-        "typeinfo": "c"
+        "typeinfo": "c",
+        "x86_64_ipi.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

@@ -15,8 +15,12 @@
 
 #include "../process/ptrace.h"
 
+#define SMP_IRQ_NUM 10
 extern void (*interrupt_table[24])(void);
 extern void do_IRQ(struct pt_regs *regs, ul number);
+
+
+extern void (*SMP_interrupt_table[SMP_IRQ_NUM])(void);
 
 /* ========= 中断向量分配表 ==========
 
@@ -120,6 +124,9 @@ typedef struct
 
 #define IRQ_NUM 24
 irq_desc_t interrupt_desc[IRQ_NUM] = {0};
+
+
+irq_desc_t SMP_IPI_desc[SMP_IRQ_NUM];
 
 /**
  * @brief 中断注册函数

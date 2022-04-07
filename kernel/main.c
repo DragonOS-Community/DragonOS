@@ -13,6 +13,7 @@
 #include "process/process.h"
 #include "syscall/syscall.h"
 #include "smp/smp.h"
+#include <smp/ipi.h>
 
 #include "driver/multiboot2/multiboot2.h"
 #include "driver/acpi/acpi.h"
@@ -166,7 +167,7 @@ void system_initialize()
     irq_init();
 
     smp_init();
-    
+
     // 先初始化系统调用模块
     syscall_init();
 
@@ -224,7 +225,10 @@ void Start_Kernel(void)
             analyze_mousecode();
         }
     */
-   hlt();
+
+    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8, ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);  // 测试ipi
+    while (1)
+        hlt();
 }
 
 void ignore_int()

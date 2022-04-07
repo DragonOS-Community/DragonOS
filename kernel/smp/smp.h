@@ -1,3 +1,4 @@
+#pragma once
 #include "../common/glib.h"
 
 #include "../common/asm.h"

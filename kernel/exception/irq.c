@@ -112,6 +112,38 @@ void (*interrupt_table[24])(void) =
         IRQ0x37interrupt,
 };
 
+
+/**
+ * @brief 声明10个IPI消息处理程序，向量号从200(0xc8)开始
+ * 
+ */
+
+Build_IRQ(0xc8)
+Build_IRQ(0xc9)
+Build_IRQ(0xca)
+Build_IRQ(0xcb)
+Build_IRQ(0xcc)
+Build_IRQ(0xcd)
+Build_IRQ(0xce)
+Build_IRQ(0xcf)
+Build_IRQ(0xd0)
+Build_IRQ(0xd1)
+
+// 初始化IPI中断服务程序数组
+void (*SMP_interrupt_table[SMP_IRQ_NUM])(void) =
+    {
+        IRQ0xc8interrupt,
+        IRQ0xc9interrupt,
+        IRQ0xcainterrupt,
+        IRQ0xcbinterrupt,
+        IRQ0xccinterrupt,
+        IRQ0xcdinterrupt,
+        IRQ0xceinterrupt,
+        IRQ0xcfinterrupt,
+        IRQ0xd0interrupt,
+        IRQ0xd1interrupt,
+};
+
 /**
  * @brief 中断注册函数
  *

@@ -297,5 +297,8 @@ void apic_ioapic_enable(ul irq_num);
 void apic_ioapic_disable(ul irq_num);
 ul apic_ioapic_install(ul irq_num, void *arg);
 void apic_ioapic_uninstall(ul irq_num);
-void apic_ioapic_level_ack(ul irq_num); // 电平触发
-void apic_ioapic_edge_ack(ul irq_num);  // 边沿触发
+void apic_ioapic_level_ack(ul irq_num); // ioapic电平触发 应答
+void apic_ioapic_edge_ack(ul irq_num);  // ioapic边沿触发 应答
+
+// void apic_local_apic_level_ack(ul irq_num);// local apic电平触发 应答
+void apic_local_apic_edge_ack(ul irq_num);// local apic边沿触发 应答

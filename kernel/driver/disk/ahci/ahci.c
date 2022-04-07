@@ -37,6 +37,7 @@ void ahci_init()
         ahci_devices[i].dev_struct = ahci_devs[i];
         ahci_devices[i].hba_mem = (HBA_MEM *)(cal_HBA_MEM_VIRT_ADDR(i));
     }
+    // todo: 支持多个ahci控制器。
     ahci_port_base_vaddr = (uint64_t)kmalloc(1048576, 0);
     ahci_probe_port(0);
     port_rebase(&ahci_devices[0].hba_mem->ports[0], 0);

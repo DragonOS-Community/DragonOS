@@ -34,8 +34,10 @@ void smp_init()
     icr_entry.res_2 = 0;
     icr_entry.res_3 = 0;
 
-    for (int i = 1; i < 2; ++i) // i从1开始，不初始化bsp
+    for (int i = 1; i < total_processor_num; ++i) // i从1开始，不初始化bsp
     {
+        if(proc_local_apic_structs[i]->ACPI_ID==0)
+            continue;
         current_starting_cpu = i;
 
         icr_entry.vector = 0x00;

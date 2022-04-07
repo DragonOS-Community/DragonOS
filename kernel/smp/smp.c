@@ -45,18 +45,15 @@ void smp_init()
 
         kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->ACPI_ID, proc_local_apic_structs[i]->flags);
         // 为每个AP处理器分配栈空间、tss空间
-        cpu_core_info[i].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0);
-        kdebug("cpu_core_info[i].stack_start =%#018lx", (uint64_t)kmalloc(STACK_SIZE, 0));
-        cpu_core_info[i].stack_start += STACK_SIZE;
-        kdebug("cpu_core_info[i].stack_base =%#018lx", (uint64_t)kmalloc(STACK_SIZE, 0));
+        cpu_core_info[i].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
 
         cpu_core_info[i].tss_vaddr = (uint64_t)kmalloc(128, 0);
 
         set_tss_descriptor(10 + (i * 2), (void *)(cpu_core_info[i].tss_vaddr));
         set_tss64((uint *)cpu_core_info[i].tss_vaddr, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start);
         kdebug("GDT Table %#018lx, \t %#018lx", GDT_Table[10 + i * 2], GDT_Table[10 + i * 2 + 1]);
-        kdebug("(cpu_core_info[i].tss_vaddr)=%#018lx", (cpu_core_info[i].tss_vaddr));
-        kdebug("(cpu_core_info[i].stack_start)=%#018lx", (cpu_core_info[i].stack_start));
+        // kdebug("(cpu_core_info[i].tss_vaddr)=%#018lx", (cpu_core_info[i].tss_vaddr));
+        // kdebug("(cpu_core_info[i].stack_start)=%#018lx", (cpu_core_info[i].stack_start));
         // 连续发送两次start-up IPI
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->ACPI_ID);
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->ACPI_ID);
@@ -81,15 +78,12 @@ void smp_ap_start()
         __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(stack_start)
                              : "memory");*/
     ksuccess("AP core successfully started!");
-    kdebug("current=%d", current_starting_cpu);
+    kdebug("current cpu = %d", current_starting_cpu);
     apic_init_ap_core_local_apic();
 
     load_TR(10 + current_starting_cpu * 2);
     spin_unlock(&multi_core_starting_lock);
     sti();
-    kdebug("IDT_addr = %#018lx", &IDT_Table);
-    // sti();
-    //  int a = 1 / 0; // 在这儿会出现异常，cs fs gs ss寄存器会被改变
     kdebug("IDT_addr = %#018lx", &IDT_Table);
     
     

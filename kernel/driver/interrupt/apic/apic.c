@@ -27,8 +27,8 @@ void apic_io_apic_init()
     acpi_iter_SDT(acpi_get_MADT, &madt_addr);
     madt = (struct acpi_Multiple_APIC_Description_Table_t *)madt_addr;
 
-    kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
-    kdebug("MADT->length= %d bytes", madt->header.Length);
+    //kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
+    //kdebug("MADT->length= %d bytes", madt->header.Length);
     // 寻找io apic的ICS
     void *ent = (void *)(madt_addr) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
     struct apic_Interrupt_Controller_Structure_header_t *header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
@@ -38,21 +38,21 @@ void apic_io_apic_init()
         if (header->type == 1)
         {
             struct acpi_IO_APIC_Structure_t *t = (struct acpi_IO_APIC_Structure_t *)ent;
-            kdebug("IO apic addr = %#018lx", t->IO_APIC_Address);
+            // kdebug("IO apic addr = %#018lx", t->IO_APIC_Address);
             io_apic_ICS = t;
             break;
         }
 
         ent += header->length;
     }
-    kdebug("Global_System_Interrupt_Base=%d", io_apic_ICS->Global_System_Interrupt_Base);
+    // kdebug("Global_System_Interrupt_Base=%d", io_apic_ICS->Global_System_Interrupt_Base);
 
     apic_ioapic_map.addr_phys = io_apic_ICS->IO_APIC_Address;
     apic_ioapic_map.virtual_index_addr = (unsigned char *)APIC_IO_APIC_VIRT_BASE_ADDR;
     apic_ioapic_map.virtual_data_addr = (uint *)(APIC_IO_APIC_VIRT_BASE_ADDR + 0x10);
     apic_ioapic_map.virtual_EOI_addr = (uint *)(APIC_IO_APIC_VIRT_BASE_ADDR + 0x40);
 
-    kdebug("(ul)apic_ioapic_map.virtual_index_addr=%#018lx", (ul)apic_ioapic_map.virtual_index_addr);
+    // kdebug("(ul)apic_ioapic_map.virtual_index_addr=%#018lx", (ul)apic_ioapic_map.virtual_index_addr);
     // 填写页表，完成地址映射
     mm_map_phys_addr((ul)apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
 
@@ -62,7 +62,7 @@ void apic_io_apic_init()
     *apic_ioapic_map.virtual_data_addr = 0x0f000000;
     io_mfence();
 
-    kdebug("I/O APIC ID:%#010x", ((*apic_ioapic_map.virtual_data_addr) >> 24) & 0xff);
+    // kdebug("I/O APIC ID:%#010x", ((*apic_ioapic_map.virtual_data_addr) >> 24) & 0xff);
     io_mfence();
 
     // 获取IO APIC Version
@@ -180,8 +180,8 @@ void apic_init_ap_core_local_apic()
     io_mfence();
     kdebug("cmci = %#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI));
     */
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x10000;
-    io_mfence();
+    //*(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x10000;
+    //io_mfence();
     /*
     *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = 0x1000000;
     io_mfence();

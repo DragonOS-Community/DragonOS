@@ -22,6 +22,7 @@
 #include "driver/disk/ata.h"
 #include "driver/pci/pci.h"
 #include "driver/disk/ahci/ahci.h"
+#include <driver/timers/rtc/rtc.h>
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
@@ -165,7 +166,8 @@ void system_initialize()
     acpi_init();
     // 初始化中断模块
     irq_init();
-
+    
+    
     smp_init();
 
     // 先初始化系统调用模块
@@ -226,7 +228,11 @@ void Start_Kernel(void)
         }
     */
 
-    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8, ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);  // 测试ipi
+    // ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8, ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);  // 测试ipi
+    struct time tt;
+    rtc_get_cmos_time(&tt);
+    kinfo("Current Time: %04d/%02d/%02d %02d:%02d:%02d", tt.year, tt.month, tt.day, tt.hour, tt.minute, tt.second);
+
     while (1)
         hlt();
 }

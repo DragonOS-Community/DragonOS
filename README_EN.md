@@ -130,3 +130,5 @@ This project refers to the following materials. I sincerely give my thanks to th
 - the GNU GRUB manual
 
 - Intel® 64 and IA-32 Architectures Software Developer’s Manual
+
+- IA-PC HPET (High Precision Event Timers) Specification

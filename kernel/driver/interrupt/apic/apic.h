@@ -73,8 +73,6 @@
 // 分频配置寄存器（定时器专用）
 #define LOCAL_APIC_OFFSET_Local_APIC_CLKDIV 0x3e0
 
-
-
 /*
 
 1:	LVT	CMCI
@@ -269,10 +267,9 @@ ul apic_ioapic_read_rte(unsigned char index);
  */
 void apic_ioapic_write_rte(unsigned char index, ul value);
 
-
 /**
  * @brief 初始化AP处理器的Local apic
- * 
+ *
  */
 void apic_init_ap_core_local_apic();
 
@@ -284,13 +281,13 @@ void apic_init();
 
 /**
  * @brief 读取指定类型的 Interrupt Control Structure
- * 
+ *
  * @param type ics的类型
  * @param ret_vaddr 对应的ICS的虚拟地址数组
  * @param total 返回数组的元素总个数
- * @return uint 
+ * @return uint
  */
-uint apic_get_ics(const uint type, ul ret_vaddr[], uint * total);
+uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total);
 
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num);
@@ -301,4 +298,21 @@ void apic_ioapic_level_ack(ul irq_num); // ioapic电平触发 应答
 void apic_ioapic_edge_ack(ul irq_num);  // ioapic边沿触发 应答
 
 // void apic_local_apic_level_ack(ul irq_num);// local apic电平触发 应答
-void apic_local_apic_edge_ack(ul irq_num);// local apic边沿触发 应答
+void apic_local_apic_edge_ack(ul irq_num); // local apic边沿触发 应答
+
+/**
+ * @brief 构造RTE Entry结构体
+ *
+ * @param entry 返回的结构体
+ * @param vector 中断向量
+ * @param deliver_mode 投递模式
+ * @param dest_mode 目标模式
+ * @param deliver_status 投递状态
+ * @param polarity 电平触发极性
+ * @param irr 远程IRR标志位（只读）
+ * @param trigger 触发模式
+ * @param mask 屏蔽标志位，（0为未屏蔽， 1为已屏蔽）
+ * @param dest_apicID 目标apicID
+ */
+void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, uint8_t deliver_mode, uint8_t dest_mode,
+                         uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID);

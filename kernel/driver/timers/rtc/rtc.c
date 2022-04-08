@@ -2,12 +2,12 @@
 #include <common/kprint.h>
 
 /*置位0x70的第7位，禁止不可屏蔽中断*/
-/*
+
 #define read_cmos(addr) ({                                                          \
     io_out8(0x70, 0x80 | addr);  \
     io_in8(0x71);                                                                   \
 })
-*/
+
 enum CMOSTimeSelector
 {
     T_SECOND = 0x0,
@@ -18,14 +18,8 @@ enum CMOSTimeSelector
     T_YEAR = 0x9,
 };
 
-int read_cmos(uint8_t addr)
-{
-    io_out8(0x70, 0x80 | addr);
-    io_mfence();
-    return (uint8_t)(io_in8(0x71) & 0xff);
-}
 
-int rtc_get_cmos_time(struct time *t)
+int rtc_get_cmos_time(struct rtc_time_t *t)
 {
     // 为防止中断请求打断该过程，需要先关中断
     cli();

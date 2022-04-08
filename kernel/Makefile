@@ -112,16 +112,19 @@ ahci.o: driver/disk/ahci/ahci.c
 rtc.o: driver/timers/rtc/rtc.c
 	gcc $(CFLAGS) -c driver/timers/rtc/rtc.c -o driver/timers/rtc/rtc.o
 
+HPET.o: driver/timers/HPET/HPET.c
+	gcc $(CFLAGS) -c driver/timers/HPET/HPET.c -o driver/timers/HPET/HPET.o
+
 
 
 all: kernel
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
 #
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o $(OBJ_LIST)
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o $(OBJ_LIST)
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o smp/smp.o smp/apu_boot.o	\
-	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o driver/timers/rtc/rtc.o \
+	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o driver/timers/rtc/rtc.o driver/timers/HPET/HPET.o \
 	$(LD_LIST)	\
 	-T link.lds
 

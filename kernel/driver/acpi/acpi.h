@@ -42,7 +42,7 @@ struct acpi_RSDP_t
 
     // 32bit physical address of the RSDT
     uint RsdtAddress;
-};
+} __attribute__((packed));
 
 struct acpi_RSDP_2_t
 {
@@ -56,7 +56,7 @@ struct acpi_RSDP_2_t
     unsigned char ExtendedChecksum; // 整个表的checksum，包括了之前的checksum区域
 
     unsigned char Reserved[3];
-};
+} __attribute__((packed));
 
 struct acpi_system_description_table_header_t
 {
@@ -74,7 +74,32 @@ struct acpi_system_description_table_header_t
     uint OEMRevision;
     uint CreatorID;
     uint CreatorRevision;
-};
+} __attribute__((packed));
+
+// HPET描述符结构体，sign为HPET
+struct acpi_HPET_description_table_t
+{
+    struct acpi_system_description_table_header_t header;
+
+    uint8_t hardware_rev_id;
+    uint8_t comparator_count : 5; // Number of Comparators in 1st Timer Block
+    uint8_t counter_size : 1;     // COUNT_SIZE_CAP counter size
+    uint8_t reserved0 : 1;
+    uint8_t legacy_replacement : 1; //  LegacyReplacement IRQ Routing Capable
+    uint16_t pci_vendor_id;         // PCI Vendor ID of 1st Timer Block
+
+    uint8_t address_space_id; // 0 - system memory, 1 - system I/O
+    uint8_t register_bit_width;
+    uint8_t register_bit_offset;
+    uint8_t reserved1;
+    uint64_t address;
+
+    uint8_t hpet_number;
+    uint16_t minimum_tick; // The minimum clock ticks can be set without lost interrupts while the counter is programmed to operate in periodic mode
+
+    uint8_t page_protection;
+
+} __attribute__((packed));
 
 // =========== MADT结构，其中Signature为APIC ============
 struct acpi_Multiple_APIC_Description_Table_t
@@ -161,7 +186,15 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
  */
 bool acpi_get_MADT(const struct acpi_system_description_table_header_t *_iter_data, void *_data);
 
-
+/**
+ * @brief 获取HPET HPET_description_table
+ *
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data 返回的HPET表的虚拟地址
+ * @return true
+ * @return false
+ */
+bool acpi_get_HPET(const struct acpi_system_description_table_header_t *_iter_data, void *_data);
 
 // 初始化acpi模块
 void acpi_init();

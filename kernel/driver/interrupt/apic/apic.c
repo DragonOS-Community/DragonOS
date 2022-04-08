@@ -27,9 +27,9 @@ void apic_io_apic_init()
     acpi_iter_SDT(acpi_get_MADT, &madt_addr);
     madt = (struct acpi_Multiple_APIC_Description_Table_t *)madt_addr;
 
-    //kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
-    //kdebug("MADT->length= %d bytes", madt->header.Length);
-    // 寻找io apic的ICS
+    // kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
+    // kdebug("MADT->length= %d bytes", madt->header.Length);
+    //  寻找io apic的ICS
     void *ent = (void *)(madt_addr) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
     struct apic_Interrupt_Controller_Structure_header_t *header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
     while (header->length > 2)
@@ -181,7 +181,7 @@ void apic_init_ap_core_local_apic()
     kdebug("cmci = %#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI));
     */
     //*(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x10000;
-    //io_mfence();
+    // io_mfence();
     /*
     *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = 0x1000000;
     io_mfence();
@@ -628,4 +628,46 @@ uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total)
         return APIC_E_NOTFOUND;
     else
         return APIC_SUCCESS;
+}
+
+/**
+ * @brief 构造RTE Entry结构体
+ *
+ * @param entry 返回的结构体
+ * @param vector 中断向量
+ * @param deliver_mode 投递模式
+ * @param dest_mode 目标模式
+ * @param deliver_status 投递状态
+ * @param polarity 电平触发极性
+ * @param irr 远程IRR标志位（只读）
+ * @param trigger 触发模式
+ * @param mask 屏蔽标志位，（0为未屏蔽， 1为已屏蔽）
+ * @param dest_apicID 目标apicID
+ */
+void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, uint8_t deliver_mode, uint8_t dest_mode,
+                         uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID)
+{
+
+    entry->vector = vector;
+    entry->deliver_mode = deliver_mode;
+    entry->dest_mode = dest_mode;
+    entry->deliver_status = deliver_status;
+    entry->polarity = polarity;
+    entry->remote_IRR = irr;
+    entry->trigger_mode = trigger;
+    entry->mask = mask;
+
+    entry->reserved = 0;
+
+    if (dest_mode == DEST_PHYSICAL)
+    {
+        entry->destination.physical.phy_dest = dest_apicID;
+        entry->destination.physical.reserved1 = 0;
+        entry->destination.physical.reserved2 = 0;
+    }
+    else
+    {
+        entry->destination.logical.logical_dest = dest_apicID;
+        entry->destination.logical.reserved1 = 0;
+    }
 }

@@ -167,6 +167,9 @@ void system_initialize()
     mm_init();
 
     acpi_init();
+
+    for (int i = 0; i < 1e7; ++i)
+        ;
     // 初始化中断模块
     irq_init();
     softirq_init();

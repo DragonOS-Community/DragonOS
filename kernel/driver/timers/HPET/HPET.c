@@ -52,7 +52,8 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
     {
     case 0: // 定时器0中断
         ++timer_jiffies;
-        set_softirq_status(TIMER_SIRQ);
+        if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)    // 若当前时间比定时任务的时间间隔大，则进入中断下半部
+            set_softirq_status(TIMER_SIRQ);
         break;
 
     default:

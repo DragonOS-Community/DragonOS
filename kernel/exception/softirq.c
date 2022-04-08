@@ -37,21 +37,20 @@ void unregister_softirq(uint32_t irq_num)
 
 /**
  * @brief 软中断处理程序
- * 
+ *
  */
 void do_softirq()
 {
-    
+
     sti();
-    for(uint32_t i=0;i<MAX_SOFTIRQ_NUM&&softirq_status;++i)
+    for (uint32_t i = 0; i < MAX_SOFTIRQ_NUM && softirq_status; ++i)
     {
-        if(softirq_status&(1<<i))
+        if (softirq_status & (1 << i))
         {
             softirq_vector[i].action(softirq_vector[i].data);
-            softirq_status &= (~(1<<i));
+            softirq_status &= (~(1 << i));
         }
     }
-    
 
     cli();
 }
@@ -61,5 +60,3 @@ void softirq_init()
     softirq_status = 0;
     memset(softirq_vector, 0, sizeof(struct softirq_t) * MAX_SOFTIRQ_NUM);
 }
-
-

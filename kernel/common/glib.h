@@ -132,7 +132,7 @@ static inline bool list_empty(struct List *entry)
      * @param entry 入口
      */
 
-    if (entry->prev == entry->next)
+    if(entry == entry->next && entry->prev == entry)
         return true;
     else
         return false;

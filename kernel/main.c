@@ -8,6 +8,7 @@
 #include "exception/gate.h"
 #include "exception/trap.h"
 #include "exception/irq.h"
+#include <exception/softirq.h>
 #include "mm/mm.h"
 #include "mm/slab.h"
 #include "process/process.h"
@@ -24,6 +25,7 @@
 #include "driver/disk/ahci/ahci.h"
 #include <driver/timers/rtc/rtc.h>
 #include <driver/timers/HPET/HPET.h>
+#include <driver/timers/timer.h>
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 
@@ -167,9 +169,9 @@ void system_initialize()
     acpi_init();
     // 初始化中断模块
     irq_init();
-
+    softirq_init();
+    timer_init();
     HPET_init();
-
     smp_init();
 
     // 先初始化系统调用模块
@@ -181,7 +183,6 @@ void system_initialize()
     // ata_init();
     pci_init();
     ahci_init();
-
     // test_slab();
     // test_mm();
 
@@ -233,6 +234,7 @@ void Start_Kernel(void)
     // ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8, ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);  // 测试ipi
 
     int last_sec = rtc_now.second;
+    /*
     while (1)
     {
         if (last_sec != rtc_now.second)
@@ -241,6 +243,7 @@ void Start_Kernel(void)
             kinfo("Current Time: %04d/%02d/%02d %02d:%02d:%02d", rtc_now.year, rtc_now.month, rtc_now.day, rtc_now.hour, rtc_now.minute, rtc_now.second);
         }
     }
+    */
     while (1)
         hlt();
 }

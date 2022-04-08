@@ -50,7 +50,6 @@ Restore_all:
 
     popq %rax
     addq $0x10, %rsp // 弹出变量FUNC和errcode
-
     iretq
 
 ret_from_exception:
@@ -58,6 +57,7 @@ ret_from_exception:
 ENTRY(ret_from_intr)
     jmp Restore_all
 
+    
 Err_Code:
     // ===== 有错误码的情况下，保存寄存器并跳转服务程序
 

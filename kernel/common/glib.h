@@ -393,3 +393,14 @@ ul rdmsr(ul address)
                          : "memory");
     return ((ul)tmp0 << 32) | tmp1;
 }
+
+
+uint64_t get_rflags()
+{
+	unsigned long tmp = 0;
+	__asm__ __volatile__	("pushfq	\n\t"
+				 "movq	(%%rsp), %0	\n\t"
+				 "popfq	\n\t"
+				:"=r"(tmp)::"memory");
+	return tmp;
+}

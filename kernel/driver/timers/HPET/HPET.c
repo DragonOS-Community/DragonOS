@@ -2,6 +2,8 @@
 #include <common/kprint.h>
 #include <mm/mm.h>
 #include <driver/interrupt/apic/apic.h>
+#include <exception/softirq.h>
+#include <driver/timers/timer.h>
 
 static struct acpi_HPET_description_table_t *hpet_table;
 static uint64_t HPET_REG_BASE = 0;
@@ -46,14 +48,15 @@ hardware_intr_controller HPET_intr_controller =
 
 void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
-    //printk_color(ORANGE, BLACK, "(HPET)");
     switch (param)
     {
-    case 0:
-        rtc_get_cmos_time(&rtc_now);
+    case 0: // 定时器0中断
+        ++timer_jiffies;
+        set_softirq_status(TIMER_SIRQ);
         break;
 
     default:
+        kwarn("Unsupported HPET irq: %d.", number);
         break;
     }
 }
@@ -97,6 +100,4 @@ int HPET_init()
     rtc_get_cmos_time(&rtc_now);
     *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
     io_mfence();
-
-    
 }

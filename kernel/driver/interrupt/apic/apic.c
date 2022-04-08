@@ -6,6 +6,8 @@
 #include "../../../exception/gate.h"
 #include "../../acpi/acpi.h"
 
+#include <exception/softirq.h>
+
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
 
@@ -389,9 +391,9 @@ void apic_local_apic_init()
  */
 void apic_init()
 {
-    // 初始化中断门， 中断使用第二个ist
+    // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
     for (int i = 32; i <= 55; ++i)
-        set_intr_gate(i, 2, interrupt_table[i - 32]);
+        set_intr_gate(i, 0, interrupt_table[i - 32]);
     // 初始化主芯片
     io_out8(0x20, 0x11); // 初始化主芯片的icw1
     io_out8(0x21, 0x20); // 设置主芯片的中断向量号为0x20(0x20-0x27)
@@ -466,6 +468,10 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         kwarn("do IRQ receive: %d", number);
         break;
     }
+
+    // 检测是否有未处理的软中断
+    if (softirq_status != 0)
+        do_softirq();
 }
 
 /**

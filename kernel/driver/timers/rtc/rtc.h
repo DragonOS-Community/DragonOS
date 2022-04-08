@@ -17,3 +17,5 @@ struct rtc_time_t
  * @return int 成功则为0
  */
 int rtc_get_cmos_time(struct rtc_time_t*t);
+
+void rtc_init();

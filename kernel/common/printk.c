@@ -36,10 +36,9 @@ int printk_init(const int char_size_x, const int char_size_y)
     pos.max_x = calculate_max_charNum(pos.width, char_size_x);
     pos.max_y = calculate_max_charNum(pos.height, char_size_y);
 
-    
     VBE_FB_phys_addr = (ul)info.framebuffer_addr;
     pos.FB_address = (uint *)0x0000000003000000;
-    pos.FB_length = 1UL*pos.width * pos.height;
+    pos.FB_length = 1UL * pos.width * pos.height;
 
     // 初始化自旋锁
     spin_init(&printk_lock);
@@ -75,9 +74,7 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     kdebug("width=%d\theight=%d", pos.width, pos.height);
 
-    while (1)
-
-        return 0;
+    return 0;
 }
 
 int set_printk_pos(const int x, const int y)
@@ -120,7 +117,7 @@ void auto_newline()
         pos.y = pos.max_y;
         int lines_to_scroll = 1;
         scroll(true, lines_to_scroll * pos.char_size_y, false);
-        pos.y -= (lines_to_scroll-1);
+        pos.y -= (lines_to_scroll - 1);
     }
 }
 
@@ -654,8 +651,11 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
      * @param BKcolor 背景色
      * @param ... 格式化字符串
      */
-
-    spin_lock(&printk_lock);
+    
+    /*
+    if (get_rflags() & 0x200UL)
+        spin_lock(&printk_lock); // 不是中断处理程序调用printk，加锁
+        */
 
     va_list args;
     va_start(args, fmt);
@@ -712,8 +712,10 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
         }
     }
 
-    for(int j=0;j<1e5;++j);
-    spin_unlock(&printk_lock);
+    /*
+    if (get_rflags() & 0x200UL)
+        spin_unlock(&printk_lock);
+        */
     return i;
 }
 

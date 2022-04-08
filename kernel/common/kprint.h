@@ -32,7 +32,7 @@
 #define kdebug(...)           \
     do                        \
     {                         \
-        printk("[ DEBUG ] "); \
+        printk("[ DEBUG ] (%s:%d)\t", __FILE__, __LINE__); \
         printk(__VA_ARGS__);  \
         printk("\n");         \
     } while (0);

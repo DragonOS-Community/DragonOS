@@ -315,13 +315,13 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     int i = 0;
     for (i = 0; i < cmdheader->prdtl - 1; ++i)
     {
-        cmdtbl->prdt_entry[i].dba = buf;
+        cmdtbl->prdt_entry[i].dba = virt_2_phys(buf);
         cmdtbl->prdt_entry[i].dbc = 8 * 1024 - 1; // 8K bytes
         cmdtbl->prdt_entry[i].i = 0;
         buf += 4 * 1024; // 4K words
         count -= 16;     // 16 sectors
     }
-    cmdtbl->prdt_entry[i].dba = buf;
+    cmdtbl->prdt_entry[i].dba = virt_2_phys(buf);
 
     cmdtbl->prdt_entry[i].dbc = count << 9; // 512 bytes per sector
     cmdtbl->prdt_entry[i].i = 0;

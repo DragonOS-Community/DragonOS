@@ -28,16 +28,19 @@ int printk_init(const int char_size_x, const int char_size_y)
     struct multiboot_tag_framebuffer_info_t info;
     int reserved;
     multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
-
+    
+    
     pos.width = info.framebuffer_width;
     pos.height = info.framebuffer_height;
+
     pos.char_size_x = char_size_x;
     pos.char_size_y = char_size_y;
     pos.max_x = calculate_max_charNum(pos.width, char_size_x);
     pos.max_y = calculate_max_charNum(pos.height, char_size_y);
-
+    
     VBE_FB_phys_addr = (ul)info.framebuffer_addr;
-    pos.FB_address = (uint *)0x0000000003000000;
+
+    pos.FB_address = (uint *)0xffff800003000000;
     pos.FB_length = 1UL * pos.width * pos.height;
 
     // 初始化自旋锁
@@ -69,11 +72,11 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     pos.x = 0;
     pos.y = 0;
-
+    
     cls();
 
     kdebug("width=%d\theight=%d", pos.width, pos.height);
-
+    
     return 0;
 }
 
@@ -532,7 +535,6 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
 
     // 设置填充元素
     pad = (flags & PAD_ZERO) ? '0' : ' ';
-
     sign = 0;
     if (flags & SIGN && num < 0)
     {

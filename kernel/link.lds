@@ -5,27 +5,37 @@ ENTRY(_start)
 
 SECTIONS
 {
+	KERNEL_VMA = 0xffff800000000000;
+	//KERNEL_VMA = 0;
 	. = 0;
 	. = 0x100000;
 	
-	.text :
+	.boot.text :
 	{
-		
+		KEEP(*(.multiboot_header))
+		head.o(.bootstrap)
+		head.o(.bootstrap.code64)
+		head.o(.bootstrap.data)
+		. = ALIGN(4096);
+	}
+	
+	. += KERNEL_VMA;
+	.text : AT(ADDR(.text) - KERNEL_VMA)
+	{
 		_text = .;
-		*(.multiboot_header)
+		
 		*(.text)
-
 		_etext = .;
 	}
 	. = ALIGN(8);
-	.data :
+	.data : AT(ADDR(.data) - KERNEL_VMA)
 	{
 		_data = .;
 		*(.data)
 		
 		_edata = .;
 	}
-	.rodata :
+	.rodata : AT(ADDR(.rodata) - KERNEL_VMA)
 	{
 		_rodata = .;	
 		*(.rodata)
@@ -33,14 +43,14 @@ SECTIONS
 	}
 
 	. = ALIGN(32768);
-	.data.init_proc_union : { *(.data.init_proc_union) }
-	.bss :
+	.data.init_proc_union : AT(ADDR(.data.init_proc_union) - KERNEL_VMA)
+	 { *(.data.init_proc_union) }
+	.bss : AT(ADDR(.bss) - KERNEL_VMA)
 	{
 		_bss = .;
 		*(.bss)
 		_ebss = .;
 	}
-
 
 	_end = .;
 }

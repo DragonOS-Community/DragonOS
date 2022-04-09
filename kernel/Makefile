@@ -11,7 +11,7 @@ CFLAGS := -mcmodel=large -fno-builtin -m64 -g -O0 -I .
 ARCH=x86_64
 # 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
 PIC := _INTR_APIC_
-CFLAGS += -D $(PIC) -D $(ARCH)
+CFLAGS += -D $(PIC) -D $(ARCH) 
 
 ASFLAGS := --64
 
@@ -56,6 +56,10 @@ slab.o: mm/slab.c
 
 process.o: process/process.c
 	gcc $(CFLAGS) -c process/process.c -o process/process.o
+
+sched.o: sched/sched.c
+	gcc $(CFLAGS) -c sched/sched.c -o sched/sched.o
+
 syscall.o: syscall/syscall.c
 	gcc $(CFLAGS) -c syscall/syscall.c -o syscall/syscall.o
 
@@ -127,9 +131,9 @@ all: kernel
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
 #
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o $(OBJ_LIST)
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o $(OBJ_LIST)
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
-	common/cpu.o smp/smp.o smp/apu_boot.o exception/softirq.o	\
+	common/cpu.o smp/smp.o smp/apu_boot.o exception/softirq.o sched/sched.o	\
 	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o driver/timers/rtc/rtc.o driver/timers/HPET/HPET.o driver/timers/timer.o \
 	$(LD_LIST)	\
 	-T link.lds

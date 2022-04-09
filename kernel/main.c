@@ -15,6 +15,7 @@
 #include "syscall/syscall.h"
 #include "smp/smp.h"
 #include <smp/ipi.h>
+#include <sched/sched.h>
 
 #include "driver/multiboot2/multiboot2.h"
 #include "driver/acpi/acpi.h"
@@ -147,8 +148,8 @@ void system_initialize()
 {
 
     // 初始化printk
+    
     printk_init(8, 16);
-
     kinfo("Kernel Starting...");
 
     load_TR(10); // 加载TR寄存器
@@ -190,12 +191,24 @@ void system_initialize()
     // test_mm();
 
     //  再初始化进程模块。顺序不能调转
+    // sched_init();
     // process_init();
 }
 
 //操作系统内核从这里开始执行
 void Start_Kernel(void)
 {
+
+    // 获取multiboot2的信息
+    uint64_t mb2_info, mb2_magic;
+    __asm__ __volatile__("movq %%r15, %0    \n\t"
+                         "movq %%r14, %1  \n\t"
+                         : "=r"(mb2_info), "=r"(mb2_magic)::"memory");
+    mb2_info &= 0xffffffff;
+    mb2_magic &= 0xffffffff;
+
+    multiboot2_magic = mb2_magic;
+    multiboot2_boot_info_addr = mb2_info+PAGE_OFFSET;
     system_initialize();
 
     /*

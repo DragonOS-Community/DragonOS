@@ -158,9 +158,10 @@
 // 计算校验和
 .SET CHECKSUM, -(MULTIBOOT2_HEADER_MAGIC + MULTIBOOT_ARCHITECTURE_I386 + HEADER_LENGTH)
 // 8 字节对齐
+.section .multiboot_header
 .align MULTIBOOT_HEADER_ALIGN
 // 声明所属段
-.section .multiboot_header
+
 multiboot_header:
     // 魔数
     .long MULTIBOOT2_HEADER_MAGIC
@@ -189,79 +190,25 @@ framebuffer_tag_end:
     .long 8
 multiboot_header_end:
 
+.section .bootstrap
 
-// 临时页表 4KB/页
-.section .data
-.align 0x1000
-.global pml4
-pml4:
-    .skip 0x1000
-pdpt:
-    .skip 0x1000
-pd:
-    .skip 0x1000
-pt:
-    .skip 0x1000
-
-// 临时 GDT
-.align 16
-gdt64:
-null_desc:
-    .short 0xFFFF
-    .short 0
-    .byte 0
-    .byte 0
-    .byte 0
-    .byte 0
-code_desc:
-    .short 0
-    .short 0
-    .byte 0
-    .byte 0x9A
-    .byte 0x20
-    .byte 0
-data_desc:
-    .short 0
-    .short 0
-    .byte 0
-    .byte 0x92
-    .byte 0
-    .byte 0
-user_code_desc:
-    .short 0
-    .short 0
-    .byte 0
-    .byte 0xFA
-    .byte 0x20
-    .byte 0
-user_data_desc:
-    .short 0
-    .short 0
-    .byte 0
-    .byte 0xF2
-    .byte 0
-    .byte 0
-gdt64_pointer:
-    .short gdt64_pointer-gdt64-1
-    .quad gdt64
-gdt64_pointer64:
-    .short gdt64_pointer-gdt64-1
-    .quad gdt64
-
-.section .text
 .global _start
 .type _start, @function
 # 在 multiboot2.cpp 中定义
+
+.extern _start64
 .extern boot_info_addr
 .extern multiboot2_magic
-.extern _start64
-_start:
+ENTRY(_start)
     // 关中断
     cli
     // multiboot2_info 结构体指针
-    mov %ebx, boot_info_addr
+    mov %ebx, mb2_info
+    //mov %ebx, %e8
     // 魔数
-    mov %eax, multiboot2_magic
+    mov %eax, mb2_magic
+
+    //mov %eax, %e9
     / 从保护模式跳转到长模式
     // 1. 允许 PAE
     mov %cr4, %eax
@@ -318,13 +265,22 @@ enter_head_from_ap_boot:
     mov $gdt64_pointer, %eax
     lgdt 0(%eax)
 
-    // 6. 跳转到 64 位代码执行
-    jmp $0x8, $_start64
+    jmp $0x8, $ready_to_start_64
     hlt
     ret
+.code64
+ready_to_start_64:
+
+    //6. 跳转到start64
+    movq switch_to_start64(%rip), %rax
+    pushq $0x08 //段选择子
+    pushq %rax
+    lretq
+
+switch_to_start64:
+    .quad _start64
 
 
-.section .text
 
 .code64
 .global _start64
@@ -367,6 +323,7 @@ ENTRY(_start64)
     mov $__PDPTE, %ebx
     or $0x3, %ebx
     mov %ebx, 0(%eax)
+    mov %ebx, 256(%eax)
 
     // 次级
     mov $__PDPTE, %eax
@@ -402,6 +359,7 @@ entry64:
     movq %rax, %ss
 
     movq _stack_start(%rip), %rsp //rsp的地址
+    
 
     // 分支，判断是否为apu
     movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
@@ -482,7 +440,15 @@ SetUp_TSS64:
     or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
     movq %rax, %cr4
 
-    call Start_Kernel
+    //call Start_Kernel
+    movq	go_to_kernel(%rip),	%rax		/* movq address */
+	pushq	$0x08
+	pushq	%rax
+
+    movq mb2_info, %r15
+
+    movq mb2_magic, %r14
+	lretq
 
 go_to_kernel:
     .quad Start_Kernel
@@ -517,7 +483,6 @@ ENTRY(_stack_start)
 
 
 // 初始化页表
-
 .align 0x1000 //设置为4k对齐
 .org 0x1000 //设置页表位置为内核执行头程序的0x1000处
 
@@ -586,8 +551,9 @@ __PDE:
     .quad	0xe1e00083
 	.fill	468,8,0
 
+
 // GDT表
-.section .data
+
 .align 16
 .global GDT_Table // 使得GDT可以被外部程序引用或者访问
 
@@ -627,3 +593,66 @@ IDT_BASE: .quad IDT_Table
 TSS64_Table:
     .fill 13, 8, 0
 TSS64_END:
+
+.section .bootstrap.data
+mb2_magic: .quad 0
+mb2_info: .quad 0
+
+.code32
+// 临时页表 4KB/页
+.align 0x1000
+.global pml4
+pml4:
+    .skip 0x1000
+pdpt:
+    .skip 0x1000
+pd:
+    .skip 0x1000
+pt:
+    .skip 0x1000
+
+// 临时 GDT
+.align 16
+gdt64:
+null_desc:
+    .short 0xFFFF
+    .short 0
+    .byte 0
+    .byte 0
+    .byte 0
+    .byte 0
+code_desc:
+    .short 0
+    .short 0
+    .byte 0
+    .byte 0x9A
+    .byte 0x20
+    .byte 0
+data_desc:
+    .short 0
+    .short 0
+    .byte 0
+    .byte 0x92
+    .byte 0
+    .byte 0
+user_code_desc:
+    .short 0
+    .short 0
+    .byte 0
+    .byte 0xFA
+    .byte 0x20
+    .byte 0
+user_data_desc:
+    .short 0
+    .short 0
+    .byte 0
+    .byte 0xF2
+    .byte 0
+    .byte 0
+gdt64_pointer:
+    .short gdt64_pointer-gdt64-1
+    .quad gdt64
+gdt64_pointer64:
+    .short gdt64_pointer-gdt64-1
+    .quad gdt64
+

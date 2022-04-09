@@ -7,6 +7,8 @@
 #include "../../acpi/acpi.h"
 
 #include <exception/softirq.h>
+#include <process/process.h>
+#include <sched/sched.h>
 
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
@@ -472,6 +474,11 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     // 检测是否有未处理的软中断
     if (softirq_status != 0)
         do_softirq();
+
+    // 检测当前进程是否可被调度
+    struct process_control_block *current_proc = get_current_pcb();
+    if (current_proc->flags & PROC_NEED_SCHED)
+        sched_cfs();
 }
 
 /**

@@ -6,7 +6,7 @@
 
 ul Total_Memory = 0;
 ul total_2M_pages = 0;
-
+static ul root_page_table_phys_addr=0;  // 内核层根页表的物理地址
 void mm_init()
 {
     kinfo("Initializing memory management unit...");
@@ -190,7 +190,7 @@ void mm_init()
     }
 
     global_CR3 = get_CR3();
-
+    //root_page_table_phys_addr = global_CR3;
     kdebug("global_CR3\t:%#018lx", global_CR3);
     kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
     kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
@@ -539,7 +539,7 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
 {
     global_CR3 = get_CR3();
 
-    // 计算帧缓冲区的线性地址对应的pml4页表项的地址
+    // 计算线性地址对应的pml4页表项的地址
     ul *tmp = phys_2_virt((ul *)((ul)global_CR3 & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff));
     if (*tmp == 0)
     {
@@ -564,6 +564,48 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
 
         // 页面写穿，禁止缓存
         set_pdt(tmp1, mk_pdt((ul)phys_addr_start + i, flags));
+    }
+
+    flush_tlb();
+}
+
+/**
+ * @brief 将将物理地址填写到进程的页表的函数
+ *
+ * @param proc_page_table_addr 进程的页表的虚拟基地址
+ * @param virt_addr_start 要映射到的虚拟地址的起始位置
+ * @param phys_addr_start 物理地址的起始位置
+ * @param length 要映射的区域的长度（字节）
+ * @param user 用户态是否可访问
+ */
+void mm_map_proc_page_table(ul *proc_page_table_addr, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user)
+{
+
+    // 计算线性地址对应的pml4页表项的地址
+    ul *tmp = (ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff);
+    if (*tmp == 0)
+    {
+        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), (user ? PAGE_USER_PGT : PAGE_KERNEL_PGT)));
+    }
+
+    tmp = (ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff);
+
+    if (*tmp == 0)
+    {
+        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), (user ? PAGE_USER_DIR : PAGE_KERNEL_DIR)));
+    }
+
+    ul *tmp1;
+    // 初始化2M物理页
+    for (ul i = 0; i < (length); i += PAGE_2M_SIZE)
+    {
+        // 计算当前2M物理页对应的pdt的页表项的物理地址
+        tmp1 = ((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff));
+
+        // 页面写穿，禁止缓存
+        set_pdt(tmp1, mk_pdt((ul)phys_addr_start + i, flags | (user ? PAGE_USER_PAGE : PAGE_KERNEL_PAGE)));
     }
 
     flush_tlb();

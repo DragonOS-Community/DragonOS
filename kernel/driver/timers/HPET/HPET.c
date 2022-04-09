@@ -4,6 +4,8 @@
 #include <driver/interrupt/apic/apic.h>
 #include <exception/softirq.h>
 #include <driver/timers/timer.h>
+#include <process/process.h>
+#include <sched/sched.h>
 
 static struct acpi_HPET_description_table_t *hpet_table;
 static uint64_t HPET_REG_BASE = 0;
@@ -52,8 +54,27 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
     {
     case 0: // 定时器0中断
         ++timer_jiffies;
-        if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)    // 若当前时间比定时任务的时间间隔大，则进入中断下半部
+        // 若当前时间比定时任务的时间间隔大，则进入中断下半部
+        if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
             set_softirq_status(TIMER_SIRQ);
+/*
+        switch (current_pcb->priority)
+        {
+        case 0:
+        case 1:
+            --sched_cfs_ready_queue.cpu_exec_proc_jiffies;
+            ++current_pcb->virtual_runtime;
+            break;
+        case 2:
+        default:
+            sched_cfs_ready_queue.cpu_exec_proc_jiffies -= 2;
+            current_pcb->virtual_runtime += 2;
+            break;
+        }
+
+        if (sched_cfs_ready_queue.cpu_exec_proc_jiffies <= 0)
+            current_pcb->flags |= PROC_NEED_SCHED;
+*/
         break;
 
     default:
@@ -75,15 +96,16 @@ int HPET_init()
     hpet_table = (struct acpi_HPET_description_table_t *)hpet_table_addr;
     // 由于这段内存与io/apic的映射在同一物理页内，因此不需要重复映射
     HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + hpet_table->address;
-
     // 读取计时精度并计算频率
     uint64_t tmp;
     tmp = *(uint64_t *)(HPET_REG_BASE + GCAP_ID);
     HPET_COUNTER_CLK_PERIOD = (tmp >> 32) & 0xffffffff;
     HPET_freq = 1.0 * 1e15 / HPET_COUNTER_CLK_PERIOD;
     HPET_NUM_TIM_CAP = (tmp >> 8) & 0x1f; // 读取计时器数量
-
-    kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, HPET_freq);
+    double x = 1*2;
+    x = 1.0*3.65;
+    //kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, (double)HPET_freq);
+    
     struct apic_IO_APIC_RTE_entry entry;
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
     apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);

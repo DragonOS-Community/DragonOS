@@ -27,6 +27,7 @@
  */
 
 extern unsigned int multiboot2_magic;
+extern uintptr_t multiboot2_boot_info_addr;
 
 /*  How many bytes from the start of the file we search for the header. */
 static const unsigned int MULTIBOOT_SEARCH = 32768;

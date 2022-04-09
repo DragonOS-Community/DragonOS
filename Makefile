@@ -6,7 +6,7 @@ all:
 	@list='$(SUBDIRS)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
-    		make all;\
+    		 $(MAKE) all;\
     		cd ..;\
     done
 
@@ -14,7 +14,7 @@ all:
 clean:
 	@list='$(SUBDIRS)'; for subdir in $$list; do \
 		echo "Clean in dir: $$subdir";\
-		cd $$subdir && make clean;\
+		cd $$subdir && $(MAKE) clean;\
 		cd .. ;\
 	done
 

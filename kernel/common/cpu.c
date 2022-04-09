@@ -7,7 +7,7 @@ void cpu_init(void)
     // 获取处理器制造商信息
     uint tmp_info[4] = {0};
     cpu_cpuid(0, 0, &tmp_info[0], &tmp_info[1], &tmp_info[2], &tmp_info[3]);
-    
+
     // 保存CPU支持的最大cpuid指令主功能号
     Cpu_cpuid_max_Basic_mop = tmp_info[0];
     // 保存制造商名称
@@ -37,28 +37,28 @@ void cpu_init(void)
 
     // EAX中包含 Version Informatin Type,Family,Model,and Stepping ID
     Cpu_Stepping_ID = tmp_info[0] & 0xf;
-    Cpu_Model_ID = (tmp_info[0]>>4) & 0xf;
-    Cpu_Family_ID = (tmp_info[0]>>8) & 0xf;
-    Cpu_Processor_Type = (tmp_info[0]>>12)& 0x3;
+    Cpu_Model_ID = (tmp_info[0] >> 4) & 0xf;
+    Cpu_Family_ID = (tmp_info[0] >> 8) & 0xf;
+    Cpu_Processor_Type = (tmp_info[0] >> 12) & 0x3;
     // 14-15位保留
-    Cpu_Extended_Model_ID = (tmp_info[0]>>16)&0xf;
-    Cpu_Extended_Family_ID = (tmp_info[0]>>20)&0xff;
-    //31-25位保留
-    kinfo("Family ID=%#03lx\t Extended Family ID=%#03lx\t Processor Type=%#03lx\t",Cpu_Family_ID, Cpu_Extended_Family_ID, Cpu_Processor_Type);
-    kinfo("Model ID=%#03lx\t Extended Model ID=%#03lx\tStepping ID=%#03lx\t",Cpu_Model_ID, Cpu_Extended_Model_ID,Cpu_Stepping_ID);
+    Cpu_Extended_Model_ID = (tmp_info[0] >> 16) & 0xf;
+    Cpu_Extended_Family_ID = (tmp_info[0] >> 20) & 0xff;
+    // 31-25位保留
+    kinfo("Family ID=%#03lx\t Extended Family ID=%#03lx\t Processor Type=%#03lx\t", Cpu_Family_ID, Cpu_Extended_Family_ID, Cpu_Processor_Type);
+    kinfo("Model ID=%#03lx\t Extended Model ID=%#03lx\tStepping ID=%#03lx\t", Cpu_Model_ID, Cpu_Extended_Model_ID, Cpu_Stepping_ID);
 
     // 使用0x80000008主功能号，查询处理器支持的最大可寻址地址线宽度
     cpu_cpuid(0x80000008, 0, &tmp_info[0], &tmp_info[1], &tmp_info[2], &tmp_info[3]);
-    Cpu_max_phys_addrline_size = tmp_info[0]&0xff;
-    Cpu_max_linear_addrline_size = (tmp_info[0]>>8)&0xff;
+    Cpu_max_phys_addrline_size = tmp_info[0] & 0xff;
+    Cpu_max_linear_addrline_size = (tmp_info[0] >> 8) & 0xff;
 
     kinfo("Cpu_max_phys_addrline_size = %d", Cpu_max_phys_addrline_size);
     kinfo("Cpu_max_linear_addrline_size = %d", Cpu_max_linear_addrline_size);
-    
+
     cpu_cpuid(0x80000000, 0, &tmp_info[0], &tmp_info[1], &tmp_info[2], &tmp_info[3]);
     Cpu_cpuid_max_Extended_mop = tmp_info[0];
 
-    kinfo("Max basic mop=%#05lx",Cpu_cpuid_max_Basic_mop);
-    kinfo("Max extended mop=%#05lx",Cpu_cpuid_max_Extended_mop);
+    kinfo("Max basic mop=%#05lx", Cpu_cpuid_max_Basic_mop);
+    kinfo("Max extended mop=%#05lx", Cpu_cpuid_max_Extended_mop);
     return;
 }

@@ -7,13 +7,13 @@
 #define PTRS_PER_PGT 512
 
 // 内核层的起始地址
-#define PAGE_OFFSET ((unsigned long)0x000000)
-#define KERNEL_BASE_PHYS_ADDR ((unsigned long)0x100000)
+#define PAGE_OFFSET ((unsigned long)0xffff800000000000)
+#define KERNEL_BASE_PHYS_ADDR ((unsigned long)0xffff800000000000)
 
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21
 #define PAGE_1G_SHIFT 30
-#define PAGE_GDT_SHIFT	39
+#define PAGE_GDT_SHIFT 39
 
 // 不同大小的页的容量
 #define PAGE_4K_SIZE (1UL << PAGE_4K_SHIFT)
@@ -36,13 +36,13 @@
 #define Phy_to_2M_Page(kaddr) (memory_management_struct.pages_struct + ((unsigned long)(kaddr) >> PAGE_2M_SHIFT))
 
 // 在这个地址以上的虚拟空间，用来进行特殊的映射
-#define SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE 0xffff800000000000UL
+#define SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE 0xffffa00000000000UL
 #define FRAME_BUFFER_MAPPING_OFFSET 0x3000000UL
 #define ACPI_RSDT_MAPPING_OFFSET 0x7000000UL
 #define ACPI_XSDT_MAPPING_OFFSET 0x9000000UL
 #define IO_APIC_MAPPING_OFFSET 0xfec00000UL
 #define LOCAL_APIC_MAPPING_OFFSET 0xfee00000UL
-#define AHCI_MAPPING_OFFSET 0xff200000UL    // AHCI 映射偏移量,之后使用了4M的地址
+#define AHCI_MAPPING_OFFSET 0xff200000UL // AHCI 映射偏移量,之后使用了4M的地址
 
 // ===== 内存区域属性 =====
 // DMA区域
@@ -66,58 +66,59 @@
 #define PAGE_KERNEL (1 << 3)
 
 // 共享的页 shared=1 single-use=0
-#define PAGE_SHARED (1<<4)
+#define PAGE_SHARED (1 << 4)
 
 // =========== 页表项权限 ========
 
 //	bit 63	Execution Disable:
-#define PAGE_XD		(1UL << 63)
+#define PAGE_XD (1UL << 63)
 
 //	bit 12	Page Attribute Table
-#define	PAGE_PAT	(1UL << 12)
+#define PAGE_PAT (1UL << 12)
 
 //	bit 8	Global Page:1,global;0,part
-#define	PAGE_GLOBAL	(1UL << 8)
+#define PAGE_GLOBAL (1UL << 8)
 
 //	bit 7	Page Size:1,big page;0,small page;
-#define	PAGE_PS		(1UL << 7)
+#define PAGE_PS (1UL << 7)
 
 //	bit 6	Dirty:1,dirty;0,clean;
-#define	PAGE_DIRTY	(1UL << 6)
+#define PAGE_DIRTY (1UL << 6)
 
 //	bit 5	Accessed:1,visited;0,unvisited;
-#define	PAGE_ACCESSED	(1UL << 5)
+#define PAGE_ACCESSED (1UL << 5)
 
 //	bit 4	Page Level Cache Disable
-#define PAGE_PCD	(1UL << 4)
+#define PAGE_PCD (1UL << 4)
 
 //	bit 3	Page Level Write Through
-#define PAGE_PWT	(1UL << 3)
+#define PAGE_PWT (1UL << 3)
 
 //	bit 2	User Supervisor:1,user and supervisor;0,supervisor;
-#define	PAGE_U_S	(1UL << 2)
+#define PAGE_U_S (1UL << 2)
 
 //	bit 1	Read Write:1,read and write;0,read;
-#define	PAGE_R_W	(1UL << 1)
+#define PAGE_R_W (1UL << 1)
 
 //	bit 0	Present:1,present;0,no present;
-#define	PAGE_PRESENT	(1UL << 0)
+#define PAGE_PRESENT (1UL << 0)
 
-//1,0
-#define PAGE_KERNEL_PGT		(PAGE_R_W | PAGE_PRESENT)
+// 1,0
+#define PAGE_KERNEL_PGT (PAGE_R_W | PAGE_PRESENT)
 
-//1,0	
-#define PAGE_KERNEL_DIR		(PAGE_R_W | PAGE_PRESENT)
+// 1,0
+#define PAGE_KERNEL_DIR (PAGE_R_W | PAGE_PRESENT)
 
-//7,1,0
-#define	PAGE_KERNEL_PAGE	(PAGE_PS  | PAGE_R_W | PAGE_PRESENT)
+// 7,1,0
+#define PAGE_KERNEL_PAGE (PAGE_PS | PAGE_R_W | PAGE_PRESENT)
 
-//2,1,0
-#define PAGE_USER_DIR		(PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
+#define PAGE_USER_PGT (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
-//7,2,1,0
-#define	PAGE_USER_PAGE		(PAGE_PS  | PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
+// 2,1,0
+#define PAGE_USER_DIR (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
+// 7,2,1,0
+#define PAGE_USER_PAGE (PAGE_PS | PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
 // ===== 错误码定义 ====
 // 物理页结构体为空
@@ -227,7 +228,7 @@ extern char _end;
 // 每个区域的索引
 
 int ZONE_DMA_INDEX = 0;
-int ZONE_NORMAL_INDEX = 0;  // low 1GB RAM ,was mapped in pagetable
+int ZONE_NORMAL_INDEX = 0;   // low 1GB RAM ,was mapped in pagetable
 int ZONE_UNMAPPED_INDEX = 0; // above 1GB RAM,unmapped in pagetable
 
 ul *global_CR3 = NULL;
@@ -272,9 +273,9 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags);
 
 /**
  * @brief 清除页面的引用计数， 计数为0时清空除页表已映射以外的所有属性
- * 
+ *
  * @param p 物理页结构体
- * @return unsigned long 
+ * @return unsigned long
  */
 unsigned long page_clean(struct Page *page);
 
@@ -288,20 +289,20 @@ void free_pages(struct Page *page, int number);
 
 /**
  * @brief Get the page's attr
- * 
+ *
  * @param page 内存页结构体
  * @return ul 属性
  */
-ul get_page_attr(struct Page* page);
+ul get_page_attr(struct Page *page);
 
 /**
  * @brief Set the page's attr
- * 
+ *
  * @param page 内存页结构体
  * @param flags  属性
  * @return ul 错误码
  */
-ul set_page_attr(struct Page* page, ul flags);
+ul set_page_attr(struct Page *page, ul flags);
 
 /**
  * @brief 内存页表结构体
@@ -354,9 +355,20 @@ void init_frame_buffer();
 
 /**
  * @brief 将物理地址映射到页表的函数
- * 
+ *
  * @param virt_addr_start 要映射到的虚拟地址的起始位置
  * @param phys_addr_start 物理地址的起始位置
  * @param length 要映射的区域的长度（字节）
  */
 void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);
+
+/**
+ * @brief 将将物理地址填写到进程的页表的函数
+ *
+ * @param proc_page_table_addr 进程的页表的虚拟基地址
+ * @param virt_addr_start 要映射到的虚拟地址的起始位置
+ * @param phys_addr_start 物理地址的起始位置
+ * @param length 要映射的区域的长度（字节）
+ * @param user 用户态是否可访问
+ */
+void mm_map_proc_page_table(ul *proc_page_table_addr, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user);

@@ -107,6 +107,6 @@ void sched_init()
     memset(&sched_cfs_ready_queue, 0, sizeof(struct sched_queue_t));
     list_init(&sched_cfs_ready_queue.proc_queue.list);
     sched_cfs_ready_queue.count = 1; // 因为存在IDLE进程，因此为1
-    sched_cfs_ready_queue.cpu_exec_proc_jiffies = 4;
+    sched_cfs_ready_queue.cpu_exec_proc_jiffies = 10;
     sched_cfs_ready_queue.proc_queue.virtual_runtime = 0x7fffffffffffffff;
 }

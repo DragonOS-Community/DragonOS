@@ -31,7 +31,7 @@ void smp_init()
     //*(uchar *)0x20000 = 0xf4; // 在内存的0x20000处写入HLT指令(AP处理器会执行物理地址0x20000的代码)
     // 将引导程序复制到物理地址0x20000处
     memcpy((unsigned char *)phys_2_virt(0x20000), _apu_boot_start, (unsigned long)&_apu_boot_end - (unsigned long)&_apu_boot_start);
-    
+
     // 设置多核IPI中断门
     for (int i = 200; i < 210; ++i)
         set_intr_gate(i, 2, SMP_interrupt_table[i - 200]);
@@ -73,7 +73,7 @@ void smp_init()
     
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
     //todo: 取消低0-2M的地址映射
-    for (int i = 1; i < 128; ++i)
+    for (int i = 0; i < 128; ++i)
     {
 
         *(ul *)(phys_2_virt(global_CR3) + i) = 0UL;
@@ -112,7 +112,7 @@ void smp_ap_start()
 
     sti();
     kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
-
+    memset(current_pcb, 0, sizeof(struct process_control_block));
     spin_unlock(&multi_core_starting_lock);
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();

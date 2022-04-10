@@ -106,7 +106,7 @@ Err_Code:
 ENTRY(system_call)
     // 由于sysenter指令会禁用中断，因此要在这里手动开启中断
     sti;
-    
+    hlt
     subq $0x38, %rsp
     
     cld;

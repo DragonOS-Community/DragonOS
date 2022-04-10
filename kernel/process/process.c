@@ -51,10 +51,18 @@ void user_level_function()
     // kinfo("Program (user_level_function) is runing...");
     // kinfo("Try to enter syscall id 15...");
     // enter_syscall(15, 0, 0, 0, 0, 0, 0, 0, 0);
-    hlt();
-    enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
+    
+    //enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
+long ret = 0;
+//	color_printk(RED,BLACK,"user_level_function task is running\n");
+	char string[]="Hello World!\n";
 
-    kinfo("Return from syscall id 15...");
+	__asm__	__volatile__	(	"leaq	sysexit_return_address(%%rip),	%%rdx	\n\t"
+					"movq	%%rsp,	%%rcx		\n\t"
+					"sysenter			\n\t"
+					"sysexit_return_address:	\n\t"
+					:"=a"(ret):"0"(1),"D"(string):"memory");
+    //kinfo("Return from syscall id 15...");
 
     while (1)
         ;
@@ -83,7 +91,7 @@ ul do_execve(struct pt_regs *regs)
     uint64_t addr = 0x800000UL;
     
     unsigned long * tmp = phys_2_virt((unsigned long *)((unsigned long)get_CR3() & (~0xfffUL)) + (( addr>> PAGE_GDT_SHIFT) & 0x1ff));
-
+    
     unsigned long * virtual = kmalloc(PAGE_4K_SIZE, 0);
     set_pml4t(tmp, mk_pml4t(virt_2_phys(virtual), PAGE_USER_PGT));
 

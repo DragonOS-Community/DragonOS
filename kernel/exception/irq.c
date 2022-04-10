@@ -46,15 +46,14 @@
 // 构造中断entry
 // 为了复用返回函数的代码，需要压入一个错误码0
 
-#define Build_IRQ(number)                                                     \
-    void IRQ_NAME(number);                                                    \
-    __asm__(SYMBOL_NAME_STR(IRQ) #number "interrupt:   \n\t"                  \
-                                         "pushq $0x00 \n\t" \
-                                         SAVE_ALL_REGS     \
-                                         "movq %rsp, %rdi   \n\t"                \
+#define Build_IRQ(number)                                                         \
+    void IRQ_NAME(number);                                                        \
+    __asm__(SYMBOL_NAME_STR(IRQ) #number "interrupt:   \n\t"                      \
+                                         "pushq $0x00 \n\t" SAVE_ALL_REGS         \
+                                         "movq %rsp, %rdi   \n\t"                 \
                                          "leaq ret_from_intr(%rip), %rax    \n\t" \
-                                         "pushq %rax \n\t"                    \
-                                         "movq	$"#number",	%rsi			\n\t"    \
+                                         "pushq %rax \n\t"                        \
+                                         "movq	$" #number ",	%rsi			\n\t"        \
                                          "jmp do_IRQ    \n\t");
 
 // 构造中断入口
@@ -112,22 +111,23 @@ void (*interrupt_table[24])(void) =
         IRQ0x37interrupt,
 };
 
-
 /**
  * @brief 声明10个IPI消息处理程序，向量号从200(0xc8)开始
- * 
+ *
  */
 
-Build_IRQ(0xc8)
-Build_IRQ(0xc9)
-Build_IRQ(0xca)
-Build_IRQ(0xcb)
-Build_IRQ(0xcc)
-Build_IRQ(0xcd)
-Build_IRQ(0xce)
-Build_IRQ(0xcf)
-Build_IRQ(0xd0)
-Build_IRQ(0xd1)
+/*
+ */
+Build_IRQ(0xc8);
+Build_IRQ(0xc9);
+Build_IRQ(0xca);
+Build_IRQ(0xcb);
+Build_IRQ(0xcc);
+Build_IRQ(0xcd);
+Build_IRQ(0xce);
+Build_IRQ(0xcf);
+Build_IRQ(0xd0);
+Build_IRQ(0xd1);
 
 // 初始化IPI中断服务程序数组
 void (*SMP_interrupt_table[SMP_IRQ_NUM])(void) =
@@ -189,7 +189,7 @@ int irq_unregister(ul irq_num)
     p->parameter = NULL;
     p->flags = 0;
     p->handler = NULL;
-    
+
     return 0;
 }
 
@@ -203,10 +203,8 @@ void irq_init()
 #else
 
     apic_init();
-    kdebug("interrupt_desc=%#018lx",(void*)interrupt_desc);
-    kdebug("irq_init()=%#018lx",(void*)irq_init);
-    
-    memset((void*)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
-    
+
+    memset((void *)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
+
 #endif
 }

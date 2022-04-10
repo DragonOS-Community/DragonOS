@@ -3,63 +3,13 @@
 #include "../process/ptrace.h"
 #include "../common/kprint.h"
 
-void sys_vector_init()
-{
-    set_trap_gate(0, 1, &divide_error);
-    set_trap_gate(1, 1, &debug);
-    set_intr_gate(2, 1, &nmi);
-    set_system_trap_gate(3, 1, &int3);
-    set_system_trap_gate(4, 1, &overflow);
-    set_system_trap_gate(5, 1, &bounds);
-    set_trap_gate(6, 1, &undefined_opcode);
-    set_trap_gate(7, 1, &dev_not_avaliable);
-    set_trap_gate(8, 1, &double_fault);
-    set_trap_gate(9, 1, &coprocessor_segment_overrun);
-    set_trap_gate(10, 1, &invalid_TSS);
-    set_trap_gate(11, 1, &segment_not_exists);
-    set_trap_gate(12, 1, &stack_segment_fault);
-    set_trap_gate(13, 1, &general_protection);
-    set_trap_gate(14, 1, &page_fault);
-    // 中断号15由Intel保留，不能使用
-    set_trap_gate(16, 1, &x87_FPU_error);
-    set_trap_gate(17, 1, &alignment_check);
-    set_trap_gate(18, 1, &machine_check);
-    set_trap_gate(19, 1, &SIMD_exception);
-    set_trap_gate(20, 1, &virtualization_exception);
-    // 中断号21-31由Intel保留，不能使用
 
-    // 32-255为用户自定义中断内部
-
-    /*
-    set_trap_gate(0, 1, divide_error);
-    set_trap_gate(1, 1, debug);
-    set_intr_gate(2, 1, nmi);
-    set_system_trap_gate(3, 1, int3);
-    set_system_trap_gate(4, 1, overflow);
-    set_system_trap_gate(5, 1, bounds);
-    set_trap_gate(6, 1, undefined_opcode);
-    set_trap_gate(7, 1, dev_not_avaliable);
-    set_trap_gate(8, 1, double_fault);
-    set_trap_gate(9, 1, coprocessor_segment_overrun);
-    set_trap_gate(10, 1, invalid_TSS);
-    set_trap_gate(11, 1, segment_not_exists);
-    set_trap_gate(12, 1, stack_segment_fault);
-    set_trap_gate(13, 1, general_protection);
-    set_trap_gate(14, 1, page_fault);
-    // 中断号15由Intel保留，不能使用
-    set_trap_gate(16, 1, x87_FPU_error);
-    set_trap_gate(17, 1, alignment_check);
-    set_trap_gate(18, 1, machine_check);
-    set_trap_gate(19, 1, SIMD_exception);
-    set_trap_gate(20, 1, virtualization_exception);
-    */
-}
 
 // 0 #DE 除法错误
 void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
-    kerror("do_divide_error(0)");
-    //kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    //kerror("do_divide_error(0)");
+    kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
 
     while (1)
         ;
@@ -329,3 +279,59 @@ void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
 }
 
 // 21-21 Intel保留，请勿使用
+
+
+
+void sys_vector_init()
+{
+    kdebug("do_divide_error=%#018lx", do_divide_error);
+    kdebug("&do_divide_error=%#018lx", &do_divide_error);
+    set_trap_gate(0, 1, divide_error);
+    set_trap_gate(1, 1, debug);
+    set_intr_gate(2, 1, nmi);
+    set_system_trap_gate(3, 1, int3);
+    set_system_trap_gate(4, 1, overflow);
+    set_system_trap_gate(5, 1, bounds);
+    set_trap_gate(6, 1, undefined_opcode);
+    set_trap_gate(7, 1, dev_not_avaliable);
+    set_trap_gate(8, 1, double_fault);
+    set_trap_gate(9, 1, coprocessor_segment_overrun);
+    set_trap_gate(10, 1, invalid_TSS);
+    set_trap_gate(11, 1, segment_not_exists);
+    set_trap_gate(12, 1, stack_segment_fault);
+    set_trap_gate(13, 1, general_protection);
+    set_trap_gate(14, 1, page_fault);
+    // 中断号15由Intel保留，不能使用
+    set_trap_gate(16, 1, x87_FPU_error);
+    set_trap_gate(17, 1, alignment_check);
+    set_trap_gate(18, 1, machine_check);
+    set_trap_gate(19, 1, SIMD_exception);
+    set_trap_gate(20, 1, virtualization_exception);
+    // 中断号21-31由Intel保留，不能使用
+
+    // 32-255为用户自定义中断内部
+
+    /*
+    set_trap_gate(0, 1, divide_error);
+    set_trap_gate(1, 1, debug);
+    set_intr_gate(2, 1, nmi);
+    set_system_trap_gate(3, 1, int3);
+    set_system_trap_gate(4, 1, overflow);
+    set_system_trap_gate(5, 1, bounds);
+    set_trap_gate(6, 1, undefined_opcode);
+    set_trap_gate(7, 1, dev_not_avaliable);
+    set_trap_gate(8, 1, double_fault);
+    set_trap_gate(9, 1, coprocessor_segment_overrun);
+    set_trap_gate(10, 1, invalid_TSS);
+    set_trap_gate(11, 1, segment_not_exists);
+    set_trap_gate(12, 1, stack_segment_fault);
+    set_trap_gate(13, 1, general_protection);
+    set_trap_gate(14, 1, page_fault);
+    // 中断号15由Intel保留，不能使用
+    set_trap_gate(16, 1, x87_FPU_error);
+    set_trap_gate(17, 1, alignment_check);
+    set_trap_gate(18, 1, machine_check);
+    set_trap_gate(19, 1, SIMD_exception);
+    set_trap_gate(20, 1, virtualization_exception);
+    */
+}

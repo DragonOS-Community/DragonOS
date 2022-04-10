@@ -1,6 +1,6 @@
 #include"../common/asm.h"
 .code64
-.section .text
+//.section .text
 
 R15 =   0x00
 R14 =   0x08
@@ -56,7 +56,7 @@ Restore_all:
 
 ret_from_exception:
     // === 从中断中返回 ===
-    .code64
+
 ENTRY(ret_from_intr)
     jmp Restore_all
 
@@ -64,28 +64,27 @@ ENTRY(ret_from_intr)
 Err_Code:
     // ===== 有错误码的情况下，保存寄存器并跳转服务程序
 
-    pushq %rax
-    movq %es, %rax
-    pushq %rax
-    movq %ds, %rax
-    pushq %rax
+    pushq	%rax
+	movq	%es,	%rax
+	pushq	%rax
+	movq	%ds,	%rax
+	pushq	%rax
+	xorq	%rax,	%rax
 
-    xorq %rax, %rax
-
-    pushq	%rbp
-    pushq	%rdi
-    pushq	%rsi
-    pushq	%rdx
-    pushq	%rcx
-    pushq	%rbx
-    pushq	%r8
-    pushq	%r9
-    pushq	%r10
-    pushq	%r11
-    pushq	%r12
-    pushq	%r13
-    pushq	%r14
-    pushq	%r15
+	pushq	%rbp
+	pushq	%rdi
+	pushq	%rsi
+	pushq	%rdx
+	pushq	%rcx
+	pushq	%rbx
+	pushq	%r8
+	pushq	%r9
+	pushq	%r10
+	pushq	%r11
+	pushq	%r12
+	pushq	%r13
+	pushq	%r14
+	pushq	%r15
 
     cld
     
@@ -99,7 +98,7 @@ Err_Code:
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
     
-    callq %rdx //调用服务程序 带*号表示调用的是绝对地址
+    callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
     jmp ret_from_exception
 
 // 系统调用入口
@@ -181,6 +180,7 @@ ENTRY(divide_error)
     pushq $0    //由于#DE不会产生错误码，但是为了保持弹出结构的一致性，故也压入一个错误码0
     pushq %rax  // 先将rax入栈
     leaq do_divide_error(%rip), %rax    // 获取中断服务程序的地址
+    
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 

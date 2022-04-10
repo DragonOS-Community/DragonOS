@@ -16,7 +16,7 @@
  * @brief 初始化系统中断表
  * 
  */
-void sys_vector_init();
+
 
 //除法错误
 void divide_error();
@@ -47,3 +47,5 @@ void alignment_check();
 void machine_check();
 void SIMD_exception();
 void virtualization_exception();
+
+void sys_vector_init();

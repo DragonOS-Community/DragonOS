@@ -179,7 +179,7 @@ void system_initialize()
     printk_init(8, 16);
     kinfo("Kernel Starting...");
     // 重新加载gdt和idt
-
+    
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
     kdebug("TSS64_Table=%#018lx", (void *)TSS64_Table);
     kdebug("&TSS64_Table=%#018lx", (void *)&TSS64_Table);
@@ -207,7 +207,7 @@ void system_initialize()
     irq_init();
 
     softirq_init();
-
+    
     // 先初始化系统调用模块
     syscall_init();
     //  再初始化进程模块。顺序不能调转

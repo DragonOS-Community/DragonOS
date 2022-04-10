@@ -100,9 +100,8 @@ void set_tss_descriptor(unsigned int n, void *addr)
 
     unsigned long limit = 103;
     
-    *(unsigned long *)(phys_2_virt(GDT_Table) + n) = (limit & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | ((((unsigned long)addr >> 16) & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((limit >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
-    kdebug("1212");
-    *(unsigned long *)(phys_2_virt(GDT_Table) + n + 1) = (((unsigned long)addr >> 32) & 0xffffffff) | 0;
+    *(unsigned long *)(phys_2_virt(GDT_Table + n)) = (limit & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | ((((unsigned long)addr >> 16) & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((limit >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
+    *(unsigned long *)(phys_2_virt(GDT_Table + n + 1)) = (((unsigned long)addr >> 32) & 0xffffffff) | 0;
 }
 
 /**
@@ -160,6 +159,11 @@ void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
     _set_gate(phys_2_virt(IDT_Table + n), 0xEF, ist, addr); // p=1，DPL=3, type=F
 }
 
+
+static inline void set_system_intr_gate(unsigned int n,unsigned char ist,void * addr)	//int3
+{
+	_set_gate(phys_2_virt(IDT_Table + n) , 0xEE , ist , addr);	//P,DPL=3,TYPE=E
+}
 /**
  * @brief 初始化TSS表的内容
  *

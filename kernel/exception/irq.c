@@ -203,6 +203,10 @@ void irq_init()
 #else
 
     apic_init();
-    memset(interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
+    kdebug("interrupt_desc=%#018lx",(void*)interrupt_desc);
+    kdebug("irq_init()=%#018lx",(void*)irq_init);
+    
+    memset((void*)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
+    
 #endif
 }

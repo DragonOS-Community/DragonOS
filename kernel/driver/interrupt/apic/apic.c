@@ -425,6 +425,19 @@ void apic_init()
 
     apic_io_apic_init();
 
+    // get RCBA address
+    io_out32(0xcf8, 0x8000f8f0);
+    uint32_t RCBA_phys = io_in32(0xcfc);
+
+    // 获取RCBA寄存器的地址
+    if (RCBA_phys > 0xfec00000 && RCBA_phys < 0xfee00000)
+        RCBA_vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + RCBA_phys;
+    else
+    {
+        RCBA_vaddr = 0;
+        kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
+        
+    }
     sti();
 }
 /**

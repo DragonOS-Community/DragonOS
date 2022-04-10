@@ -58,7 +58,6 @@ void sys_vector_init()
 // 0 #DE 除法错误
 void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
-    
     kerror("do_divide_error(0)");
     //kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
 
@@ -243,33 +242,35 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 // 14 #PF 页故障
 void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 {
+    hlt();
     unsigned long cr2 = 0;
-    // 先保存cr2寄存器的值，避免由于再次触发页故障而丢失值
-    // cr2存储着触发异常的线性地址
-    __asm__ __volatile__("movq %%cr2, %0"
-                         : "=r"(cr2)::"memory");
 
-    kerror("do_page_fault(14),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\tCR2:%#18lx\n", error_code, regs->rsp, regs->rip, cr2);
+	__asm__	__volatile__("movq	%%cr2,	%0":"=r"(cr2)::"memory");
+   
+	kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx,RIP:%#018lx\n",error_code , regs->rsp , regs->rip);
 
-    printk_color(YELLOW, BLACK, "Information:\n");
-    if (!(error_code & 0x01))
-        printk("Page does not exist.\n");
+	if(!(error_code & 0x01))
+		printk_color(RED,BLACK,"Page Not-Present,\t");
 
-    if (error_code & 0x02)
-        printk("Fault occurred during operation: writing\n");
-    else
-        printk("Fault occurred during operation: reading\n");
+	if(error_code & 0x02)
+		printk_color(RED,BLACK,"Write Cause Fault,\t");
+	else
+		printk_color(RED,BLACK,"Read Cause Fault,\t");
 
-    if (error_code & 0x04)
-        printk("Fault in user level(3).\n");
-    else
-        printk("Fault in supervisor level(0,1,2).\n");
+	if(error_code & 0x04)
+		printk_color(RED,BLACK,"Fault in user(3)\t");
+	else
+		printk_color(RED,BLACK,"Fault in supervisor(0,1,2)\t");
 
-    if (error_code & 0x08)
-        printk("Reserved bit caused the fault.\n");
+	if(error_code & 0x08)
+		printk_color(RED,BLACK,",Reserved Bit Cause Fault\t");
 
-    if (error_code & 0x10)
-        printk("Fault occurred during fetching instruction.\n");
+	if(error_code & 0x10)
+		printk_color(RED,BLACK,",Instruction fetch Cause Fault");
+
+	printk_color(RED,BLACK,"\n");
+
+	printk_color(RED,BLACK,"CR2:%#018lx\n",cr2);
 
     while (1)
         ;

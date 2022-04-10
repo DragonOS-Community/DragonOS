@@ -20,7 +20,8 @@ SECTIONS
 	}
 	
 	. += KERNEL_VMA;
-	.text : AT(ADDR(.text) - KERNEL_VMA)
+	text_start_pa = .;
+	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
 	{
 		_text = .;
 		
@@ -28,14 +29,16 @@ SECTIONS
 		_etext = .;
 	}
 	. = ALIGN(8);
-	.data : AT(ADDR(.data) - KERNEL_VMA)
+	data_start_pa = .;
+	.data (data_start_pa): AT(data_start_pa - KERNEL_VMA)
 	{
 		_data = .;
 		*(.data)
 		
 		_edata = .;
 	}
-	.rodata : AT(ADDR(.rodata) - KERNEL_VMA)
+	rodata_start_pa = .;
+	.rodata (rodata_start_pa): AT(rodata_start_pa - KERNEL_VMA)
 	{
 		_rodata = .;	
 		*(.rodata)
@@ -43,9 +46,13 @@ SECTIONS
 	}
 
 	. = ALIGN(32768);
-	.data.init_proc_union : AT(ADDR(.data.init_proc_union) - KERNEL_VMA)
+
+	init_proc_union_start_pa = .;
+	.data.init_proc_union (init_proc_union_start_pa): AT(init_proc_union_start_pa - KERNEL_VMA)
 	 { *(.data.init_proc_union) }
-	.bss : AT(ADDR(.bss) - KERNEL_VMA)
+
+	 bss_start_pa = .;
+	.bss (bss_start_pa): AT(bss_start_pa - KERNEL_VMA)
 	{
 		_bss = .;
 		*(.bss)

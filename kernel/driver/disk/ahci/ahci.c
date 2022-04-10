@@ -6,8 +6,8 @@ struct pci_device_structure_header_t *ahci_devs[MAX_AHCI_DEVICES];
 
 uint32_t count_ahci_devices = 0;
 
-uint64_t ahci_port_base_vaddr; // 端口映射base addr
-uint64_t ahci_port_base_phys_addr;  // 端口映射的物理基地址（ahci控制器的参数的地址都是物理地址）
+uint64_t ahci_port_base_vaddr;     // 端口映射base addr
+uint64_t ahci_port_base_phys_addr; // 端口映射的物理基地址（ahci控制器的参数的地址都是物理地址）
 
 static void start_cmd(HBA_PORT *port);
 static void stop_cmd(HBA_PORT *port);
@@ -27,12 +27,20 @@ void ahci_init()
 {
     kinfo("Initializing AHCI...");
     pci_get_device_structure(0x1, 0x6, ahci_devs, &count_ahci_devices);
-
+    
+    if (count_ahci_devices == 0)
+    {
+        kwarn("There is no AHCI device found on this computer!");
+        return;
+    }
     // 映射ABAR
-    mm_map_phys_addr(AHCI_MAPPING_BASE, ((ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
-    // kdebug("ABAR mapped!");
+    kdebug("phys_2_virt(ahci_devs[0])= %#018lx",(ahci_devs[0]));
+    kdebug("((struct pci_device_structure_general_device_t *)phys_2_virt(ahci_devs[0])))->BAR5= %#018lx",((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5);
+    uint32_t bar5 = ((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5;
 
-    for (int i = 0; i < count_ahci_devices; ++i)
+    mm_map_phys_addr(AHCI_MAPPING_BASE, (ul)(bar5) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+    kdebug("ABAR mapped!");
+     for (int i = 0; i < count_ahci_devices; ++i)
     {
         // kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, ABAR=%#010lx", i, ahci_devs[i]->Class_code, ahci_devs[i]->SubClass, ahci_devs[i]->ProgIF, ((struct pci_device_structure_general_device_t *)(ahci_devs[i]))->BAR5);
         //  赋值HBA_MEM结构体
@@ -40,16 +48,18 @@ void ahci_init()
         ahci_devices[i].hba_mem = (HBA_MEM *)(cal_HBA_MEM_VIRT_ADDR(i));
         kdebug("ahci_devices[i].hba_mem = %#018lx", (ul)ahci_devices[i].hba_mem);
     }
+
     // todo: 支持多个ahci控制器。
     ahci_port_base_vaddr = (uint64_t)kmalloc(1048576, 0);
     kdebug("ahci_port_base_vaddr=%#018lx", ahci_port_base_vaddr);
     ahci_probe_port(0);
     port_rebase(&ahci_devices[0].hba_mem->ports[0], 0);
-
+    
     // 初始化请求队列
     ahci_req_queue.in_service = NULL;
     list_init(&(ahci_req_queue.queue_list));
     ahci_req_queue.request_count = 0;
+    kinfo("AHCI initialized.");
 }
 
 // Check device type
@@ -186,7 +196,7 @@ static void port_rebase(HBA_PORT *port, int portno)
 
         memset((void *)phys_2_virt(cmdheader[i].ctba), 0, 256);
     }
-    
+
     start_cmd(port); // Start command engine
 }
 

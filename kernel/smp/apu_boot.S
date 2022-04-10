@@ -3,7 +3,7 @@
 
 .align 0x1000  // 按照4k对齐
 
-.text
+.section .text
 .code16
 
 ENTRY(_apu_boot_start)
@@ -72,58 +72,16 @@ _apu_code32:
     mov %cr4, %eax
     or $(1<<5), %eax
     mov %eax, %cr4
-/*
+
     movl $enter_head_from_ap_boot, %eax
     jmpl	*%eax
     hlt
-*/
+
     
-
-    // 设置页表
-
-    movl $pml4, %eax    // 复用bsp处理器初始化时的32位页表
-    movl %eax, %cr3
-    
-    // enable long mode
-    movl	$0xC0000080,	%ecx
-	rdmsr
-
-	bts	$8,	%eax
-	wrmsr
-
-    // enable PE and paging
-    mov %cr0, %eax
-    bts	$0,	%eax
-	bts	$31,	%eax
-    mov %eax, %cr0
-
-    // 跳转到64位代码
-    ljmp *(_apu_code64_vector - _apu_boot_base)(%esi)
-
 
 .code64
 .align 0x1000 
 _apu_code64:
-    movq $0x20, %rax
-    movq %rax, %ds
-    movq %rax, %es
-    movq %rax, %ss
-    movq %rax, %fs
-    movq %rax, %gs
-
-
-    //now enable SSE and the like
-    movq %cr0, %rax
-    and $0xFFFB, %ax		//clear coprocessor emulation CR0.EM
-    or $0x2, %ax			//set coprocessor monitoring  CR0.MP
-    movq %rax, %cr0
-    movq %cr4, %rax
-    or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
-    movq %rax, %cr4
-
-    // 跳转到地址1MB处执行
-    movq	$_start64,	%rax
-	jmpq	*%rax
 
     hlt
 

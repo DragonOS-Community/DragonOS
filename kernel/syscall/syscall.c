@@ -21,6 +21,7 @@ ul system_call_function(struct pt_regs *regs)
  */
 void syscall_init()
 {
+    kinfo("Initializing syscall...");
     // 向MSR寄存器组中的 IA32_SYSENTER_CS寄存器写入内核的代码段的地址
     wrmsr(0x174, KERNEL_CS);
     // 向MSR寄存器组中的 IA32_SYSENTER_ESP寄存器写入内核进程的rbp（在syscall入口中会将rsp减去相应的数值）

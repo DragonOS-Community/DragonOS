@@ -73,6 +73,8 @@
 // 分频配置寄存器（定时器专用）
 #define LOCAL_APIC_OFFSET_Local_APIC_CLKDIV 0x3e0
 
+uint32_t RCBA_vaddr = 0;// RCBA寄存器的虚拟地址
+
 /*
 
 1:	LVT	CMCI

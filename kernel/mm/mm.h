@@ -8,7 +8,7 @@
 
 // 内核层的起始地址
 #define PAGE_OFFSET ((unsigned long)0xffff800000000000)
-#define KERNEL_BASE_PHYS_ADDR ((unsigned long)0xffff800000000000)
+#define KERNEL_BASE_LINEAR_ADDR ((unsigned long)0xffff800000000000)
 
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21
@@ -365,10 +365,14 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
 /**
  * @brief 将将物理地址填写到进程的页表的函数
  *
- * @param proc_page_table_addr 进程的页表的虚拟基地址
+ * @param proc_page_table_addr 页表的基地址
+ * @param is_phys 页表的基地址是否为物理地址
  * @param virt_addr_start 要映射到的虚拟地址的起始位置
  * @param phys_addr_start 物理地址的起始位置
  * @param length 要映射的区域的长度（字节）
  * @param user 用户态是否可访问
  */
-void mm_map_proc_page_table(ul *proc_page_table_addr, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user);
+void mm_map_proc_page_table(ul *proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user);
+
+
+void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);

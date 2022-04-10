@@ -17,8 +17,7 @@
 #include "ptrace.h"
 
 extern unsigned long _stack_start; // 导出内核层栈基地址（定义在head.S）
-extern void ret_from_intr(void);	   // 导出从中断返回的函数（定义在entry.S）
-
+extern void ret_from_intr(void);   // 导出从中断返回的函数（定义在entry.S）
 
 // 进程的内核栈大小 32K
 #define STACK_SIZE 32768
@@ -86,45 +85,38 @@ struct thread_struct
 	ul err_code;
 };
 
+// ========= pcb->flags =========
 // 进程标志位
-#define PF_KTHREAD (1 << 0)
-
+#define PF_KTHREAD (1UL << 0)
+#define PROC_NEED_SCHED (1UL << 1) // 进程需要被调度
 /**
  * @brief 进程控制块
  *
  */
 struct process_control_block
 {
-	// 连接各个pcb的双向链表
-	struct List list;
-
 	// 进程的状态
 	volatile long state;
 	// 进程标志：进程、线程、内核线程
 	unsigned long flags;
-
+	long signal;
 	// 内存空间分布结构体， 记录内存页表和程序段信息
 	struct mm_struct *mm;
 
 	// 进程切换时保存的状态信息
 	struct thread_struct *thread;
 
+	// 连接各个pcb的双向链表
+	struct List list;
+
 	// 地址空间范围
 	// 用户空间： 0x0000 0000 0000 0000 ~ 0x0000 7fff ffff ffff
 	// 内核空间： 0xffff 8000 0000 0000 ~ 0xffff ffff ffff ffff
-	ul addr_limit;
+	uint64_t addr_limit;
 
-	// 进程id
 	long pid;
-
-	// 可用时间片
-	long counter;
-
-	// 信号
-	long signal;
-
-	// 优先级
-	long priority;
+	long priority;		  // 优先级
+	long virtual_runtime; // 虚拟运行时间
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐
@@ -146,9 +138,9 @@ struct thread_struct initial_thread;
 		.thread = &initial_thread,        \
 		.addr_limit = 0xffff800000000000, \
 		.pid = 0,                         \
-		.counter = 1,                     \
+		.virtual_runtime = 0,             \
 		.signal = 0,                      \
-		.priority = 0                     \
+		.priority = 2                     \
 	}
 
 // 初始化 初始进程的union ，并将其链接到.data.init_proc段内
@@ -224,18 +216,17 @@ struct process_control_block *get_current_pcb()
 	return current;
 };
 
-
 #define current_pcb get_current_pcb()
 
 #define GET_CURRENT_PCB    \
 	"movq %rsp, %rbx \n\t" \
 	"andq $-32768, %rbx\n\t"
 
-/**
- * @brief 切换进程上下文
- * 先把rbp和rax保存到栈中，然后将rsp和rip保存到prev的thread结构体中
- * 然后调用__switch_to切换栈，配置其他信息，最后恢复下一个进程的rax rbp。
- */
+	/**
+	 * @brief 切换进程上下文
+	 * 先把rbp和rax保存到栈中，然后将rsp和rip保存到prev的thread结构体中
+	 * 然后调用__switch_to切换栈，配置其他信息，最后恢复下一个进程的rax rbp。
+	 */
 
 #define switch_proc(prev, next)                                                                     \
 	do                                                                                              \

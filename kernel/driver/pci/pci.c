@@ -447,7 +447,7 @@ void pci_init()
         {
             if (ptr->Status & 0x10)
             {
-                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\tcap_pointer=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->Status, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer);
+                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\tcap_pointer=%#010lx\tbar5=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->Status, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer, ((struct pci_device_structure_general_device_t *)ptr)->BAR5);
                 uint32_t tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer);
             }
             else
@@ -592,8 +592,8 @@ void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_
     {
         if ((ptr->Class_code == 1) && (ptr->SubClass == 6))
         {
-            kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d", i, ptr->Class_code, ptr->SubClass, ptr->ProgIF);
-
+            kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, bar5=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->ProgIF,((struct pci_device_structure_general_device_t *)ptr)->BAR5);
+            
             res[*count_res] = ptr;
             ++(*count_res);
         }

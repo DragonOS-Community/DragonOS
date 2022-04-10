@@ -57,7 +57,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         // 若当前时间比定时任务的时间间隔大，则进入中断下半部
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
             set_softirq_status(TIMER_SIRQ);
-/*
+
         switch (current_pcb->priority)
         {
         case 0:
@@ -74,7 +74,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 
         if (sched_cfs_ready_queue.cpu_exec_proc_jiffies <= 0)
             current_pcb->flags |= PROC_NEED_SCHED;
-*/
+
         break;
 
     default:
@@ -85,32 +85,72 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 
 int HPET_init()
 {
+    kinfo("Initializing HPET...");
     // 从acpi获取hpet结构体
     ul hpet_table_addr = 0;
     acpi_iter_SDT(acpi_get_HPET, &hpet_table_addr);
+
+    // ACPI表没有HPET，尝试读HPTC
     if (hpet_table_addr == 0)
     {
-        kerror("HPET Not Found On This Computer!");
-        return E_HPET_INIT_FAILED;
+        kwarn("ACPI: HPET Table Not Found On This Computer!");
+
+        if (RCBA_vaddr != 0)
+        {
+            kerror("NO HPET found on this computer!");
+            uint32_t *hptc = (uint32_t *)(RCBA_vaddr + 0x3404UL);
+            // enable HPET
+            io_mfence();
+            // 读取HPET配置寄存器地址
+            switch ((*hptc) & 0x3)
+            {
+            case 0:
+                HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + 0xfed00000;
+                break;
+            case 1:
+                HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + 0xfed01000;
+                break;
+            case 2:
+                HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + 0xfed02000;
+                break;
+            case 3:
+                HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + 0xfed03000;
+                break;
+            default:
+                break;
+            }
+            // enable HPET
+            *hptc = 0x80;
+            io_mfence();
+        }
+        else
+        {
+            // 没有RCBA寄存器，采用默认值
+            HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + 0xfed00000;
+            kwarn("There is no RCBA register on this computer, and HPET regs base use default value.");
+        }
     }
-    hpet_table = (struct acpi_HPET_description_table_t *)hpet_table_addr;
-    // 由于这段内存与io/apic的映射在同一物理页内，因此不需要重复映射
-    HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + hpet_table->address;
+    else // ACPI表中有HPET表
+    {
+        hpet_table = (struct acpi_HPET_description_table_t *)hpet_table_addr;
+        kdebug("hpet_table_addr=%#018lx", hpet_table_addr);
+
+        // 由于这段内存与io/apic的映射在同一物理页内，因此不需要重复映射
+        HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + hpet_table->address;
+    }
+    
     // 读取计时精度并计算频率
     uint64_t tmp;
     tmp = *(uint64_t *)(HPET_REG_BASE + GCAP_ID);
     HPET_COUNTER_CLK_PERIOD = (tmp >> 32) & 0xffffffff;
     HPET_freq = 1.0 * 1e15 / HPET_COUNTER_CLK_PERIOD;
     HPET_NUM_TIM_CAP = (tmp >> 8) & 0x1f; // 读取计时器数量
-    double x = 1*2;
-    x = 1.0*3.65;
-    //kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, (double)HPET_freq);
-    
+
+    // kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, (double)HPET_freq);
+
     struct apic_IO_APIC_RTE_entry entry;
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
     apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
-    // 注册中断
-    irq_register(34, &entry, &HPET_handler, 0, &HPET_intr_controller, "HPET0");
 
     *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位
     io_mfence();
@@ -123,4 +163,7 @@ int HPET_init()
     rtc_get_cmos_time(&rtc_now);
     *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
     io_mfence();
+    // 注册中断
+    irq_register(34, &entry, &HPET_handler, 0, &HPET_intr_controller, "HPET0");
+    kinfo("HPET Initialized.");
 }

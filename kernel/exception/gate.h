@@ -10,6 +10,7 @@
 #define __GATE_H__
 
 #include "../common/kprint.h"
+#include <mm/mm.h>
 
 //描述符表的结构体
 struct desc_struct
@@ -26,6 +27,18 @@ struct gate_struct
 extern struct desc_struct GDT_Table[]; // GDT_Table是head.S中的GDT_Table
 extern struct gate_struct IDT_Table[]; // IDT_Table是head.S中的IDT_Table
 extern unsigned int TSS64_Table[26];
+
+struct gdtr
+{
+    uint16_t size;
+    uint64_t gdt_vaddr;
+}__attribute__((packed));
+
+struct idtr
+{
+    uint16_t size;
+    uint64_t idt_vaddr;
+}__attribute__((packed));
 
 /**
  * @brief 初始化中段描述符表内的门描述符（每个16B）
@@ -86,8 +99,10 @@ void set_tss_descriptor(unsigned int n, void *addr)
 {
 
     unsigned long limit = 103;
-    *(unsigned long *)(&GDT_Table[n]) = (limit & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | ((((unsigned long)addr >> 16) & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((limit >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
-    *(unsigned long *)(&GDT_Table[n + 1]) = (((unsigned long)addr >> 32) & 0xffffffff) | 0;
+    
+    *(unsigned long *)(phys_2_virt(GDT_Table) + n) = (limit & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | ((((unsigned long)addr >> 16) & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((limit >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
+    kdebug("1212");
+    *(unsigned long *)(phys_2_virt(GDT_Table) + n + 1) = (((unsigned long)addr >> 32) & 0xffffffff) | 0;
 }
 
 /**
@@ -110,8 +125,9 @@ void set_tss_descriptor(unsigned int n, void *addr)
  */
 void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
 {
-    _set_gate((IDT_Table + n), 0x8E, ist, addr); // p=1，DPL=0, type=E
-    // set_gate((ul *)(IDT_Table + n), 0x8E, ist, (ul *)(addr)); // p=1，DPL=0, type=E
+    _set_gate(phys_2_virt(IDT_Table + n), 0x8E, ist, addr); // p=1，DPL=0, type=E
+    
+    //set_gate((ul *)phys_2_virt(IDT_Table + n), 0x8E, ist, (ul *)(addr)); // p=1，DPL=0, type=E
 }
 
 /**
@@ -125,8 +141,8 @@ void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
     // kdebug("addr=%#018lx", (ul)(addr));
 
-    // set_gate((ul *)(IDT_Table + n), 0x8F, ist, (ul *)(addr)); // p=1，DPL=0, type=F
-    _set_gate((IDT_Table + n), 0x8F, ist, addr); // p=1，DPL=0, type=F
+    //set_gate((ul *)phys_2_virt(IDT_Table + n), 0x8F, ist, (ul *)(addr)); // p=1，DPL=0, type=F
+    _set_gate(phys_2_virt(IDT_Table + n), 0x8F, ist, addr); // p=1，DPL=0, type=F
 }
 
 /**
@@ -140,8 +156,8 @@ void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
     // kdebug("addr=%#018lx", (ul)(addr));
 
-    // set_gate((ul *)(IDT_Table + n), 0xEF, ist, (ul *)(addr)); // p=1，DPL=3, type=F
-    _set_gate((IDT_Table + n), 0xEF, ist, addr); // p=1，DPL=3, type=F
+    //set_gate((ul *)phys_2_virt(IDT_Table + n), 0xEF, ist, (ul *)(addr)); // p=1，DPL=3, type=F
+    _set_gate(phys_2_virt(IDT_Table + n), 0xEF, ist, addr); // p=1，DPL=3, type=F
 }
 
 /**
@@ -149,19 +165,19 @@ void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
  *
  */
 
-void set_tss64(unsigned int * Table,unsigned long rsp0,unsigned long rsp1,unsigned long rsp2,unsigned long ist1,unsigned long ist2,unsigned long ist3,
-unsigned long ist4,unsigned long ist5,unsigned long ist6,unsigned long ist7)
+void set_tss64(unsigned int *Table, unsigned long rsp0, unsigned long rsp1, unsigned long rsp2, unsigned long ist1, unsigned long ist2, unsigned long ist3,
+               unsigned long ist4, unsigned long ist5, unsigned long ist6, unsigned long ist7)
 {
-	*(unsigned long *)(Table+1) = rsp0;
-	*(unsigned long *)(Table+3) = rsp1;
-	*(unsigned long *)(Table+5) = rsp2;
+    *(unsigned long *)(Table + 1) = rsp0;
+    *(unsigned long *)(Table + 3) = rsp1;
+    *(unsigned long *)(Table + 5) = rsp2;
 
-	*(unsigned long *)(Table+9) = ist1;
-	*(unsigned long *)(Table+11) = ist2;
-	*(unsigned long *)(Table+13) = ist3;
-	*(unsigned long *)(Table+15) = ist4;
-	*(unsigned long *)(Table+17) = ist5;
-	*(unsigned long *)(Table+19) = ist6;
-	*(unsigned long *)(Table+21) = ist7;	
+    *(unsigned long *)(Table + 9) = ist1;
+    *(unsigned long *)(Table + 11) = ist2;
+    *(unsigned long *)(Table + 13) = ist3;
+    *(unsigned long *)(Table + 15) = ist4;
+    *(unsigned long *)(Table + 17) = ist5;
+    *(unsigned long *)(Table + 19) = ist6;
+    *(unsigned long *)(Table + 21) = ist7;
 }
 #endif

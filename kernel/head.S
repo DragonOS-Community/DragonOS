@@ -269,8 +269,17 @@ enter_head_from_ap_boot:
     hlt
     ret
 .code64
+.global ready_to_start_64
 ready_to_start_64:
 
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %ss
+    mov $0x7e00, %esp
+
+    
     //6. 跳转到start64
     movq switch_to_start64(%rip), %rax
     pushq $0x08 //段选择子
@@ -281,19 +290,23 @@ switch_to_start64:
     .quad _start64
 
 
-
 .code64
+is_from_ap:
+    
+    hlt
+
 .global _start64
 .type _start64, @function
 .extern Start_Kernel
 ENTRY(_start64)
+
+
     // 初始化寄存器
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
     mov %ax, %fs
     mov %ax, %ss
-
     mov $0x7e00, %esp
 
 // === 加载GDTR ====
@@ -302,13 +315,7 @@ ENTRY(_start64)
 // === 加载IDTR ====
     lidt IDT_POINTER(%rip)
     //lidt $IDT_POINTER
-    mov $0x10, %ax
-    mov %ax, %ds
-    mov %ax, %es
-    mov %ax, %fs
-    mov %ax, %ss
-    mov %ax, %gs
-    
+    movq GDT_POINTER(%rip), %r12
     movq _stack_start(%rip), %rsp
 
     // 分支，判断是否为apu
@@ -333,10 +340,13 @@ ENTRY(_start64)
 
 
 // ==== 加载CR3寄存器
-load_cr3:
-    movq $__PML4E, %rax //设置页目录基地址
-    movq %rax, %cr3
 
+load_cr3:
+ // 分支，判断是否为apu
+    movq $__PML4E, %rax //设置页目录基地址
+    
+    movq %rax, %cr3
+    
     movq switch_seg(%rip), %rax
     // 由于ljmp和lcall在GAS中不受支持，因此我们需要先伪造函数调用现场，通过lret的方式，给它跳转过去。才能更新cs寄存器
     // 实在是太妙了！Amazing！
@@ -360,6 +370,21 @@ entry64:
 
     movq _stack_start(%rip), %rsp //rsp的地址
     
+    // 重新加载GDT和IDT，加载到高地址
+    leaq GDT_Table(%rip), %r8
+    leaq GDT_END(%rip), %r9
+
+    subq %r8, %r9
+    movq %r9, %r13    // GDT size
+
+    leaq IDT_Table(%rip), %r8
+    leaq IDT_END(%rip), %r9
+
+    subq %r8, %r9
+    movq %r9, %r12    // IDT size
+
+    lgdt GDT_POINTER64(%rip)
+    lidt IDT_POINTER64(%rip)
 
     // 分支，判断是否为apu
     movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
@@ -399,6 +424,10 @@ SetUp_TSS64:
     // == 设置64位的任务状态段表 ===
     //rdx保存高8B， rax保存低8B
     leaq TSS64_Table(%rip), %rdx
+
+    movq $0xffff800000000000, %r8
+    addq %r8, %rdx
+
     xorq %rax, %rax
     xorq %rcx, %rcx
 
@@ -440,23 +469,57 @@ SetUp_TSS64:
     or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
     movq %rax, %cr4
 
-    //call Start_Kernel
+    
+
     movq	go_to_kernel(%rip),	%rax		/* movq address */
 	pushq	$0x08
 	pushq	%rax
 
-    movq mb2_info, %r15
+    
 
+    movq mb2_info, %r15
     movq mb2_magic, %r14
+
+    
 	lretq
 
 go_to_kernel:
     .quad Start_Kernel
 
 start_smp:
+
+
+    //now enable SSE and the like
+    movq %cr0, %rax
+    and $0xFFFB, %ax		//clear coprocessor emulation CR0.EM
+    or $0x2, %ax			//set coprocessor monitoring  CR0.MP
+    movq %rax, %cr0
+    movq %cr4, %rax
+    or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
+    movq %rax, %cr4
+
+
 	movq	go_to_smp_kernel(%rip),	%rax		/* movq address */
 	pushq	$0x08
 	pushq	%rax
+
+/*
+    // 重新加载GDT和IDT，加载到高地址
+    leaq GDT_Table(%rip), %r8
+    leaq GDT_END(%rip), %r9
+
+    subq %r8, %r9
+    movq %r9, %r13    // GDT size
+
+    leaq IDT_Table(%rip), %r8
+    leaq IDT_END(%rip), %r9
+
+    subq %r8, %r9
+    movq %r9, %r12    // IDT size
+
+    lgdt GDT_POINTER64(%rip)
+    lidt IDT_POINTER64(%rip)
+*/
 	lretq
 
 go_to_smp_kernel:
@@ -484,10 +547,10 @@ ENTRY(_stack_start)
 
 // 初始化页表
 .align 0x1000 //设置为4k对齐
-.org 0x1000 //设置页表位置为内核执行头程序的0x1000处
+//.org 0x1000 //设置页表位置为内核执行头程序的0x1000处
 
 __PML4E:
-    .quad 0x103003 // 用户访问，可读写，已存在， 地址在31~12位
+    .quad 0x103007 // 用户访问，可读写，已存在， 地址在31~12位
     .fill	255,8,0
 	.quad 0x103003
 	.fill	255,8,0
@@ -575,6 +638,11 @@ GDT_POINTER:
 GDT_LIMIT: .word GDT_END - GDT_Table - 1 // GDT的大小
 GDT_BASE: .quad GDT_Table
 
+.global GDT_POINTER64
+GDT_POINTER64:
+GDT_LIMIT64: .word GDT_END - GDT_Table - 1 // GDT的大小
+GDT_BASE64: .quad GDT_Table + 0xffff800000000000
+
 // IDT 表
 .global IDT_Table
 
@@ -586,6 +654,11 @@ IDT_END:
 IDT_POINTER:
 IDT_LIMIT: .word IDT_END - IDT_Table - 1
 IDT_BASE: .quad IDT_Table
+
+.global IDT_POINTER64
+IDT_POINTER64:
+IDT_LIMIT64: .word IDT_END - IDT_Table - 1
+IDT_BASE64: .quad IDT_Table + 0xffff800000000000
 
 // 64位的TSS表
 .global TSS64_Table

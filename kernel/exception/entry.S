@@ -1,4 +1,6 @@
 #include"../common/asm.h"
+.code64
+.section .text
 
 R15 =   0x00
 R14 =   0x08
@@ -54,6 +56,7 @@ Restore_all:
 
 ret_from_exception:
     // === 从中断中返回 ===
+    .code64
 ENTRY(ret_from_intr)
     jmp Restore_all
 
@@ -85,18 +88,18 @@ Err_Code:
     pushq	%r15
 
     cld
-
+    
     movq ERRCODE(%rsp), %rsi    // 把错误码装进rsi，作为函数的第二个参数
     movq FUNC(%rsp), %rdx
-
+    
     movq $0x10, %rdi    // 加载内核段的地址
     movq %rdi, %ds
     movq %rdi, %es
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
-    callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
-
+    
+    callq %rdx //调用服务程序 带*号表示调用的是绝对地址
     jmp ret_from_exception
 
 // 系统调用入口
@@ -174,6 +177,7 @@ ENTRY(ret_from_system_call)
 
 // 0 #DE 除法错误
 ENTRY(divide_error)
+    
     pushq $0    //由于#DE不会产生错误码，但是为了保持弹出结构的一致性，故也压入一个错误码0
     pushq %rax  // 先将rax入栈
     leaq do_divide_error(%rip), %rax    // 获取中断服务程序的地址
@@ -333,3 +337,7 @@ ENTRY(virtualization_exception)
     leaq do_virtualization_exception(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
+
+
+ENTRY(_stack_start)
+    .quad initial_proc_union + 32768

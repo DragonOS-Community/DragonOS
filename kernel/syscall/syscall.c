@@ -26,9 +26,11 @@ void syscall_init()
     wrmsr(0x174, KERNEL_CS);
     // 向MSR寄存器组中的 IA32_SYSENTER_ESP寄存器写入内核进程的rbp（在syscall入口中会将rsp减去相应的数值）
     wrmsr(0x175, current_pcb->thread->rbp);
+    
 
     // 向MSR寄存器组中的 IA32_SYSENTER_EIP寄存器写入系统调用入口的地址。
     wrmsr(0x176, (ul)system_call);
+    
 }
 
 long enter_syscall(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5, ul arg6, ul arg7)
@@ -65,10 +67,11 @@ long enter_syscall(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, u
  */
 ul sys_printf(struct pt_regs *regs)
 {
-    while(1);
-    if(regs->r9 == 0 &&regs->r10 == 0)
-        printk((char*)regs->r8);
-    else printk_color(regs->r9, regs->r10, (char*)regs->r8);
+    
+    //if(regs->r9 == 0 &&regs->r10 == 0)
+    //    printk((char*)regs->r8);
+    //else printk_color(regs->r9, regs->r10, (char*)regs->r8);
+    printk_color(BLACK,WHITE,(char *)regs->rdi);
 
     return 0;
 }

@@ -12,7 +12,7 @@ if [ ! "$1" == "--nobuild" ]; then
     make clean
 fi
 
-IA32_USE_QEMU=0
+IA32_USE_QEMU=1
 bochsrc="./bochsrc"
 ARCH="x86_64"
 

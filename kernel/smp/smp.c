@@ -24,7 +24,7 @@ void smp_init()
 
     apic_get_ics(ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC, tmp_vaddr, &total_processor_num);
 
-    kdebug("processor num=%d", total_processor_num);
+    //kdebug("processor num=%d", total_processor_num);
     for (int i = 0; i < total_processor_num; ++i)
         proc_local_apic_structs[i] = (struct acpi_Processor_Local_APIC_Structure_t *)(tmp_vaddr[i]);
 
@@ -56,10 +56,10 @@ void smp_init()
         set_tss_descriptor(10 + (i * 2), (void *)virt_2_phys(cpu_core_info[i].tss_vaddr));
 
         set_tss64((uint *)cpu_core_info[i].tss_vaddr, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start);
-        kdebug("phys_2_virt(GDT_Table)=%#018lx",phys_2_virt(GDT_Table));
-        kdebug("GDT Table %#018lx, \t %#018lx", *(ul *)(phys_2_virt(GDT_Table) + 10 + i * 2), *(ul *)(phys_2_virt(GDT_Table) + 10 + i * 2 + 1));
+        //kdebug("phys_2_virt(GDT_Table)=%#018lx",phys_2_virt(GDT_Table));
+        //kdebug("GDT Table %#018lx, \t %#018lx", *(ul *)(phys_2_virt(GDT_Table) + 10 + i * 2), *(ul *)(phys_2_virt(GDT_Table) + 10 + i * 2 + 1));
         // kdebug("(cpu_core_info[i].tss_vaddr)=%#018lx", (cpu_core_info[i].tss_vaddr));
-        kdebug("(cpu_core_info[i].stack_start)=%#018lx", (cpu_core_info[i].stack_start));
+        //kdebug("(cpu_core_info[i].stack_start)=%#018lx", (cpu_core_info[i].stack_start));
         // 连续发送两次start-up IPI
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->ACPI_ID);
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->ACPI_ID);
@@ -111,7 +111,7 @@ void smp_ap_start()
     load_TR(10 + current_starting_cpu * 2);
 
     sti();
-    kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
+    //kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
     memset(current_pcb, 0, sizeof(struct process_control_block));
     spin_unlock(&multi_core_starting_lock);
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt

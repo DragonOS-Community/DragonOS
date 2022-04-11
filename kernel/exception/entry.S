@@ -104,13 +104,15 @@ Err_Code:
 // 系统调用入口
 // 保存寄存器
 ENTRY(system_call)
+    
     // 由于sysenter指令会禁用中断，因此要在这里手动开启中断
     sti;
-    hlt
+
+    
     subq $0x38, %rsp
     
     cld;
-
+    
     pushq %rax
     movq %es, %rax
     pushq %rax
@@ -137,6 +139,7 @@ ENTRY(system_call)
     // 将rsp作为参数传递给system_call_function
     movq %rsp, %rdi
 
+    
     callq system_call_function
 
 
@@ -145,33 +148,29 @@ ENTRY(system_call)
 ENTRY(ret_from_system_call)
     movq %rax, 0x80(%rsp)   // 将当前rax的值先存到栈中rax的位置
 
-    popq %r15
-    popq %r14
-    popq %r13
-    popq %r12
-    popq %r11
-    popq %r10
-    popq %r9
-    popq %r8
-    popq %rbx
-    popq %rcx
-    popq %rdx
-    popq %rsi
-    popq %rdi
-    popq %rbp
-
-    popq %rax   //  不允许直接pop到ds
-    movq %rax, %ds
-
-    popq %rax
-    movq %rax, %es
-
-    popq %rax
-
-    addq $0x38, %rsp
-
-    .byte 0x48
-    sysexit
+	 
+	popq	%r15				 
+	popq	%r14				 	
+	popq	%r13				 	
+	popq	%r12				 	
+	popq	%r11				 	
+	popq	%r10	
+	popq	%r9				 	
+	popq	%r8				 	
+	popq	%rbx				 	
+	popq	%rcx				 	
+	popq	%rdx				 	
+	popq	%rsi				 	
+	popq	%rdi				 	
+	popq	%rbp				 	
+	popq	%rax				 	
+	movq	%rax,	%ds			 
+	popq	%rax				 
+	movq	%rax,	%es			 
+	popq	%rax				 
+	addq	$0x38,	%rsp	
+	.byte	0x48		 
+	sysexit		
 
 
 // 0 #DE 除法错误

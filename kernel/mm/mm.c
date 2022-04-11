@@ -164,7 +164,7 @@ void mm_init()
         if (z->zone_addr_start >= 0x100000000 && (!ZONE_UNMAPPED_INDEX))
             ZONE_UNMAPPED_INDEX = i;
     }
-    kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
+    //kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
     // 设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
@@ -174,7 +174,7 @@ void mm_init()
     // 初始化内存管理单元结构所占的物理页的结构体
 
     ul mms_max_page = (virt_2_phys(memory_management_struct.end_of_struct) >> PAGE_2M_SHIFT); // 内存管理单元所占据的序号最大的物理页
-    kdebug("mms_max_page=%ld", mms_max_page);
+    //kdebug("mms_max_page=%ld", mms_max_page);
 
     struct Page *tmp_page = NULL;
     ul page_num;
@@ -191,11 +191,11 @@ void mm_init()
 
     global_CR3 = get_CR3();
     // root_page_table_phys_addr = global_CR3;
-    kdebug("global_CR3\t:%#018lx", global_CR3);
-    kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
-    kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
+    //kdebug("global_CR3\t:%#018lx", global_CR3);
+    //kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
+    //kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
 
-    kdebug("1.memory_management_struct.bmp:%#018lx\tzone->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+    //kdebug("1.memory_management_struct.bmp:%#018lx\tzone->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
     //kinfo("Cleaning page table remapping at 0x0000");
 
     kinfo("Memory management unit initialize complete!");

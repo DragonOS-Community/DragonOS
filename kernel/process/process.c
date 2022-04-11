@@ -25,18 +25,19 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
               initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     __asm__ __volatile__("movq	%%fs,	%0 \n\t"
-                         : "=a"(prev->thread->fs)::"memory");
+                         : "=a"(prev->thread->fs));
     __asm__ __volatile__("movq	%%gs,	%0 \n\t"
-                         : "=a"(prev->thread->gs)::"memory");
+                         : "=a"(prev->thread->gs));
 
-    __asm__ __volatile__("movq	%0, %%fs \n\t" ::"a"(next->thread->fs)
-                         : "memory");
-
-    __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs)
-                         : "memory");
+    __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
+    __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
     wrmsr(0x175, next->thread->rbp);
+    
+    kdebug("next=%#018lx", next);
+    kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
     kdebug("prev->thread->rsp0:%#018lx\n", prev->thread->rbp);
     kdebug("next->thread->rsp0:%#018lx\n", next->thread->rbp);
+    kdebug("next->thread->rip:%#018lx\n", next->thread->rip);
 }
 
 /**
@@ -50,9 +51,10 @@ void user_level_function()
     // enter_syscall(15, 0, 0, 0, 0, 0, 0, 0, 0);
 
     // enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
+    
     long ret = 0;
     //	color_printk(RED,BLACK,"user_level_function task is running\n");
-
+    while(1);
     char string[] = "Hello World!\n";
 
     __asm__ __volatile__("leaq	sysexit_return_address(%%rip),	%%rdx	\n\t"
@@ -134,6 +136,7 @@ ul initial_kernel_thread(ul arg)
     // memset((void*)current_pcb->mm->pgd, 0, PAGE_4K_SIZE);
 
     regs = (struct pt_regs *)current_pcb->thread->rsp;
+    kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
@@ -223,6 +226,8 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 
     // rip寄存器指向内核线程的引导程序
     regs.rip = (ul)kernel_thread_func;
+    kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
+    kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
 
     return do_fork(&regs, flags, 0, 0);
 }
@@ -268,7 +273,6 @@ void process_init()
 */
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
-    current_pcb->flags=0;
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_FILES | CLONE_SIGNAL); // 初始化内核进程
     initial_proc_union.pcb.state = PROC_RUNNING;
 
@@ -329,6 +333,8 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     thd->fs = KERNEL_DS;
     thd->gs = KERNEL_DS;
 
+
+    kdebug("do_fork() thd->rsp=%#018lx", thd->rsp);
     // 若进程不是内核层的进程，则跳转到ret from system call
     if (!(tsk->flags & PF_KTHREAD))
         thd->rip = regs->rip = (ul)ret_from_system_call;

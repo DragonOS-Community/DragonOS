@@ -231,18 +231,17 @@ struct process_control_block *get_current_pcb()
 #define switch_proc(prev, next)                                                                     \
 	do                                                                                              \
 	{                                                                                               \
-                                                                                                    \
-		__asm__ __volatile__("pushq %%rbp  \n\t"                                                    \
-							 "pushq %%rax    \n\t"                                                  \
-							 "movq %%rsp, %0 \n\t"                                                  \
-							 "movq %2, %%rsp \n\t"                                                  \
-							 "leaq 1f(%%rip), %%rax \n\t"                                           \
-							 "movq %%rax, %1 \n\t"                                                  \
-							 "pushq %3 \n\t"                                                        \
-							 "jmp __switch_to    \n\t"                                              \
-							 "1:     \n\t"                                                          \
-							 "popq %%rax     \n\t"                                                  \
-							 "popq %%rbp \n\t"                                                      \
+		__asm__ __volatile__("pushq	%%rbp	\n\t"                                                     \
+							 "pushq	%%rax	\n\t"                                                     \
+							 "movq	%%rsp,	%0	\n\t"                                                  \
+							 "movq	%2,	%%rsp	\n\t"                                                  \
+							 "leaq	1f(%%rip),	%%rax	\n\t"                                           \
+							 "movq	%%rax,	%1	\n\t"                                                  \
+							 "pushq	%3		\n\t"                                                       \
+							 "jmp	__switch_to	\n\t"                                                 \
+							 "1:	\n\t"                                                              \
+							 "popq	%%rax	\n\t"                                                      \
+							 "popq	%%rbp	\n\t"                                                      \
 							 : "=m"(prev->thread->rsp), "=m"(prev->thread->rip)                     \
 							 : "m"(next->thread->rsp), "m"(next->thread->rip), "D"(prev), "S"(next) \
 							 : "memory");                                                           \

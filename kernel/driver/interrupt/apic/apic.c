@@ -475,18 +475,16 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         }
     }
 
-    else if (number >= 0x80 && number != 250)
+    else if (number == 0x80) // 系统调用
+    {
+        do_syscall_int(rsp, 0);
+    }
+    else if (number > 0x80)
 
     {
         printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
         apic_local_apic_edge_ack(number);
     }
-    else if (number == 250) // 系统调用
-    {
-        kdebug("receive syscall");
-        kdebug("rflags=%#010lx", rsp->rflags);
-    }
-
     else
     {
 

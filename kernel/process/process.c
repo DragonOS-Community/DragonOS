@@ -9,6 +9,7 @@
 #include <sched/sched.h>
 
 extern void system_call(void);
+
 /**
  * @brief 切换进程
  *
@@ -31,7 +32,7 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
-    wrmsr(0x175, next->thread->rbp);
+    //wrmsr(0x175, next->thread->rbp);
 
     // kdebug("next=%#018lx", next);
     // kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
@@ -56,7 +57,6 @@ void user_level_function()
     //	color_printk(RED,BLACK,"user_level_function task is running\n");
 
     char string[] = "Hello World!\n";
-
     /*
     __asm__ __volatile__("leaq	sysexit_return_address(%%rip),	%%rdx	\n\t"
                          "movq	%%rsp,	%%rcx		\n\t"
@@ -67,13 +67,13 @@ void user_level_function()
                          : "memory");
                          */
 
-    for (int i = 0; i < 10; ++i)
+    for (int i = 0;; ++i)
     {
         long err_code;
         ul addr = (ul)string;
         __asm__ __volatile__(
             "movq %2, %%r8 \n\t"
-            "int $250   \n\t"
+            "int $0x80   \n\t"
             : "=a"(err_code)
             : "a"(SYS_PRINTF), "m"(addr)
             : "memory", "r8");
@@ -93,11 +93,13 @@ void user_level_function()
 ul do_execve(struct pt_regs *regs)
 {
     // 选择这两个寄存器是对应了sysexit指令的需要
-    regs->rdx = 0x800000; // rip 应用层程序的入口地址   这里的地址选择没有特殊要求，只要是未使用的内存区域即可。
-    regs->rcx = 0xa00000; // rsp 应用层程序的栈顶地址
-
+    regs->rip = 0x800000; // rip 应用层程序的入口地址   这里的地址选择没有特殊要求，只要是未使用的内存区域即可。
+    regs->rsp = 0xa00000; // rsp 应用层程序的栈顶地址
+    regs->cs = USER_CS|3;
+    regs->ds = USER_DS|3;
+    regs->ss = USER_DS |0x3;
+    regs->rflags = 0x200246;
     regs->rax = 1;
-    regs->ds = 0;
     regs->es = 0;
 
     // kdebug("do_execve is running...");
@@ -359,7 +361,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
         kdebug("is kernel proc.");
 
     kdebug("ret_from_system_call=%#018lx", (ul)ret_from_system_call);
-
+    
     tsk->state = PROC_RUNNING;
 
     sched_cfs_enqueue(tsk);

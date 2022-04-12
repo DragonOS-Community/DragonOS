@@ -50,7 +50,7 @@ hardware_intr_controller HPET_intr_controller =
 
 void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
-    printk("(HPET)");
+    //printk("(HPET)");
     switch (param)
     {
     case 0: // 定时器0中断
@@ -76,7 +76,6 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         if (sched_cfs_ready_queue.cpu_exec_proc_jiffies <= 0)
         {
             current_pcb->flags |= PROC_NEED_SCHED;
-            kdebug("need_sched. proc_jiffies=%ld", sched_cfs_ready_queue.cpu_exec_proc_jiffies);
         }
 
         break;

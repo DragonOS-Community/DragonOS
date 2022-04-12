@@ -18,7 +18,6 @@ struct process_control_block *sched_cfs_dequeue()
 
     list_del(&proc->list);
     --sched_cfs_ready_queue.count;
-    kdebug("dequeued");
     return proc;
 }
 
@@ -41,7 +40,6 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
     }
     list_append(&proc->list, &pcb->list);
     ++sched_cfs_ready_queue.count;
-    kdebug("enqueued");
 }
 
 /**
@@ -111,6 +109,6 @@ void sched_init()
     memset(&sched_cfs_ready_queue, 0, sizeof(struct sched_queue_t));
     list_init(&sched_cfs_ready_queue.proc_queue.list);
     sched_cfs_ready_queue.count = 1; // 因为存在IDLE进程，因此为1
-    sched_cfs_ready_queue.cpu_exec_proc_jiffies = 15;
+    sched_cfs_ready_queue.cpu_exec_proc_jiffies = 8;
     sched_cfs_ready_queue.proc_queue.virtual_runtime = 0x7fffffffffffffff;
 }

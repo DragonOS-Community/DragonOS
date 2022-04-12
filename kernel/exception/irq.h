@@ -22,6 +22,8 @@ extern void do_IRQ(struct pt_regs *regs, ul number);
 
 extern void (*SMP_interrupt_table[SMP_IRQ_NUM])(void);
 
+extern void (*syscall_intr_table[1])(void);
+
 /* ========= 中断向量分配表 ==========
 
 0~255 IDT

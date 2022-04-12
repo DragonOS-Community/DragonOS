@@ -50,6 +50,7 @@ hardware_intr_controller HPET_intr_controller =
 
 void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
+    printk("(HPET)");
     switch (param)
     {
     case 0: // 定时器0中断
@@ -73,7 +74,10 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         }
 
         if (sched_cfs_ready_queue.cpu_exec_proc_jiffies <= 0)
+        {
             current_pcb->flags |= PROC_NEED_SCHED;
+            kdebug("need_sched. proc_jiffies=%ld", sched_cfs_ready_queue.cpu_exec_proc_jiffies);
+        }
 
         break;
 
@@ -138,7 +142,7 @@ int HPET_init()
         // 由于这段内存与io/apic的映射在同一物理页内，因此不需要重复映射
         HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + hpet_table->address;
     }
-    
+
     // 读取计时精度并计算频率
     uint64_t tmp;
     tmp = *(uint64_t *)(HPET_REG_BASE + GCAP_ID);
@@ -152,18 +156,22 @@ int HPET_init()
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
     apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
 
-    *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位
-    io_mfence();
+    
 
+    *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
+    io_mfence();
     *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，投递到IO APIC的2号引脚（这里有点绕，写的是8259的引脚号，但是因为禁用了8259，因此会被路由到IO APIC的2号引脚）
     io_mfence();
     *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = HPET_freq; // 1s触发一次中断
     io_mfence();
 
     rtc_get_cmos_time(&rtc_now);
-    *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
+
+    
+
+    kinfo("HPET Initialized.");
+    *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位
     io_mfence();
     // 注册中断
     irq_register(34, &entry, &HPET_handler, 0, &HPET_intr_controller, "HPET0");
-    kinfo("HPET Initialized.");
 }

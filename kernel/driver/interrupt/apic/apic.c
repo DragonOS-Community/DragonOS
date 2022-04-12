@@ -436,7 +436,6 @@ void apic_init()
     {
         RCBA_vaddr = 0;
         kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
-        
     }
     sti();
 }
@@ -448,50 +447,60 @@ void apic_init()
  */
 void do_IRQ(struct pt_regs *rsp, ul number)
 {
-    switch (number & 0x80) // 以0x80为界限，低于0x80的是外部中断控制器，高于0x80的是Local APIC
+
+    if (number < 0x80) // 以0x80为界限，低于0x80的是外部中断控制器，高于0x80的是Local APIC
+
+    // 外部中断控制器
     {
-    case 0x00: // 外部中断控制器
-        /* code */
+        irq_desc_t *irq = &interrupt_desc[number - 32];
+
+        // 执行中断上半部处理程序
+        if (irq->handler != NULL)
+            irq->handler(number, irq->parameter, rsp);
+        else
+            kwarn("Intr vector [%d] does not have a handler!");
+
+        // 向中断控制器发送应答消息
+        if (irq->controller != NULL && irq->controller->ack != NULL)
+            irq->controller->ack(number);
+        else
         {
-            irq_desc_t *irq = &interrupt_desc[number - 32];
 
-            // 执行中断上半部处理程序
-            if (irq->handler != NULL)
-                irq->handler(number, irq->parameter, rsp);
-            else
-                kwarn("Intr vector [%d] does not have a handler!");
-
-            // 向中断控制器发送应答消息
-            if (irq->controller != NULL && irq->controller->ack != NULL)
-                irq->controller->ack(number);
-            else
-            {
-
-                // 向EOI寄存器写入0x00表示结束中断
-                __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
-                                     "movq	$0x00,	%%rax	\n\t"
-                                     "movq 	$0x80b,	%%rcx	\n\t"
-                                     "wrmsr	\n\t" ::
-                                         : "memory");
-            }
+            // 向EOI寄存器写入0x00表示结束中断
+            __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
+                                 "movq	$0x00,	%%rax	\n\t"
+                                 "movq 	$0x80b,	%%rcx	\n\t"
+                                 "wrmsr	\n\t" ::
+                                     : "memory");
         }
-        break;
-    case 0x80:
+    }
+
+    else if (number >= 0x80 && number != 250)
+
+    {
         printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
         apic_local_apic_edge_ack(number);
-    default:
+    }
+    else if (number == 250) // 系统调用
+    {
+        kdebug("receive syscall");
+        kdebug("rflags=%#010lx", rsp->rflags);
+    }
+
+    else
+    {
+
         kwarn("do IRQ receive: %d", number);
-        break;
     }
 
     // 检测是否有未处理的软中断
     if (softirq_status != 0)
         do_softirq();
-
     // 检测当前进程是否可被调度
-    struct process_control_block *current_proc = get_current_pcb();
-    if (current_proc->flags & PROC_NEED_SCHED)
+    if (current_pcb->flags & PROC_NEED_SCHED)
+    {
         sched_cfs();
+    }
 }
 
 /**

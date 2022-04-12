@@ -28,8 +28,7 @@ int printk_init(const int char_size_x, const int char_size_y)
     struct multiboot_tag_framebuffer_info_t info;
     int reserved;
     multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
-    
-    
+
     pos.width = info.framebuffer_width;
     pos.height = info.framebuffer_height;
 
@@ -37,7 +36,7 @@ int printk_init(const int char_size_x, const int char_size_y)
     pos.char_size_y = char_size_y;
     pos.max_x = calculate_max_charNum(pos.width, char_size_x);
     pos.max_y = calculate_max_charNum(pos.height, char_size_y);
-    
+
     VBE_FB_phys_addr = (ul)info.framebuffer_addr;
 
     pos.FB_address = (uint *)0xffff800003000000;
@@ -72,11 +71,11 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     pos.x = 0;
     pos.y = 0;
-    
+
     cls();
 
     kdebug("width=%d\theight=%d", pos.width, pos.height);
-    
+
     return 0;
 }
 
@@ -440,10 +439,17 @@ static char *write_num(char *str, ul num, int base, int field_width, int precisi
     pad = (flags & PAD_ZERO) ? '0' : ' ';
 
     sign = 0;
-    if (flags & SIGN && num < 0)
+
+    if (flags & SIGN)
     {
-        sign = '-';
-        num = -num;
+        int64_t signed_num = (int64_t)num;
+        if (signed_num < 0)
+        {
+            sign = '-';
+            num = -signed_num;
+        }
+        else
+            num = signed_num;
     }
     else
     {
@@ -653,7 +659,7 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
      * @param BKcolor 背景色
      * @param ... 格式化字符串
      */
-    
+
     /*
     if (get_rflags() & 0x200UL)
         spin_lock(&printk_lock); // 不是中断处理程序调用printk，加锁

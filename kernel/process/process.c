@@ -32,12 +32,12 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
     wrmsr(0x175, next->thread->rbp);
-    
-    kdebug("next=%#018lx", next);
-    kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
-    kdebug("prev->thread->rsp0:%#018lx\n", prev->thread->rbp);
-    kdebug("next->thread->rsp0:%#018lx\n", next->thread->rbp);
-    kdebug("next->thread->rip:%#018lx\n", next->thread->rip);
+
+    // kdebug("next=%#018lx", next);
+    // kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
+    // kdebug("prev->thread->rsp0:%#018lx\n", prev->thread->rbp);
+    // kdebug("next->thread->rsp0:%#018lx\n", next->thread->rbp);
+    // kdebug("next->thread->rip:%#018lx\n", next->thread->rip);
 }
 
 /**
@@ -51,20 +51,35 @@ void user_level_function()
     // enter_syscall(15, 0, 0, 0, 0, 0, 0, 0, 0);
 
     // enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
-    
+    //while(1);
     long ret = 0;
     //	color_printk(RED,BLACK,"user_level_function task is running\n");
-    while(1);
+
     char string[] = "Hello World!\n";
 
+    /*
     __asm__ __volatile__("leaq	sysexit_return_address(%%rip),	%%rdx	\n\t"
                          "movq	%%rsp,	%%rcx		\n\t"
                          "sysenter			\n\t"
                          "sysexit_return_address:	\n\t"
                          : "=a"(ret)
                          : "0"(1), "D"(string)
-                         : "memory", "rcx", "rdx", "r14");
-    // kinfo("Return from syscall id 15...");
+                         : "memory");
+                         */
+
+    for (int i = 0; i < 10; ++i)
+    {
+        long err_code;
+        ul addr = (ul)string;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "int $250   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_PRINTF), "m"(addr)
+            : "memory", "r8");
+    }
+    // enter_syscall_int(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
+    //  kinfo("Return from syscall id 15...");
 
     while (1)
         ;
@@ -85,7 +100,7 @@ ul do_execve(struct pt_regs *regs)
     regs->ds = 0;
     regs->es = 0;
 
-    kdebug("do_execve is running...");
+    // kdebug("do_execve is running...");
 
     // 映射起始页面
     // mm_map_proc_page_table(get_CR3(), true, 0x800000, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
@@ -114,7 +129,9 @@ ul do_execve(struct pt_regs *regs)
         current_pcb->addr_limit = KERNEL_BASE_LINEAR_ADDR;
     // 将程序代码拷贝到对应的内存中
     memcpy((void *)0x800000, user_level_function, 1024);
-    kdebug("program copied!");
+
+    
+    // kdebug("program copied!");
     return 0;
 }
 
@@ -126,7 +143,7 @@ ul do_execve(struct pt_regs *regs)
  */
 ul initial_kernel_thread(ul arg)
 {
-    kinfo("initial proc running...\targ:%#018lx", arg);
+    // kinfo("initial proc running...\targ:%#018lx", arg);
 
     struct pt_regs *regs;
 
@@ -136,7 +153,7 @@ ul initial_kernel_thread(ul arg)
     // memset((void*)current_pcb->mm->pgd, 0, PAGE_4K_SIZE);
 
     regs = (struct pt_regs *)current_pcb->thread->rsp;
-    kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
+    // kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
@@ -226,8 +243,8 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 
     // rip寄存器指向内核线程的引导程序
     regs.rip = (ul)kernel_thread_func;
-    kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
-    kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
+    // kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
+    // kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
 
     return do_fork(&regs, flags, 0, 0);
 }
@@ -277,7 +294,7 @@ void process_init()
     initial_proc_union.pcb.state = PROC_RUNNING;
 
     // 获取新的进程的pcb
-    // struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
+    struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
 
     kdebug("Ready to switch...");
     // 切换到新的内核线程
@@ -317,12 +334,13 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     tsk->priority = 2;
     ++(tsk->pid);
     tsk->state = PROC_UNINTERRUPTIBLE;
+    list_init(&tsk->list);
+    list_add(&initial_proc_union.pcb.list, &tsk->list);
 
     // 将线程结构体放置在pcb的后面
     struct thread_struct *thd = (struct thread_struct *)(tsk + 1);
     memset(thd, 0, sizeof(struct thread_struct));
     tsk->thread = thd;
-
     // 将寄存器信息存储到进程的内核栈空间的顶部
     memcpy((void *)((ul)tsk + STACK_SIZE - sizeof(struct pt_regs)), regs, sizeof(struct pt_regs));
 
@@ -332,7 +350,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     thd->rsp = (ul)tsk + STACK_SIZE - sizeof(struct pt_regs);
     thd->fs = KERNEL_DS;
     thd->gs = KERNEL_DS;
-
 
     kdebug("do_fork() thd->rsp=%#018lx", thd->rsp);
     // 若进程不是内核层的进程，则跳转到ret from system call

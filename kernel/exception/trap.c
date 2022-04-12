@@ -196,7 +196,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
     unsigned long cr2 = 0;
 
 	__asm__	__volatile__("movq	%%cr2,	%0":"=r"(cr2)::"memory");
-   
+    hlt();
 	kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx,RIP:%#018lx\n",error_code , regs->rsp , regs->rip);
 
 	if(!(error_code & 0x01))
@@ -284,8 +284,6 @@ void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
 
 void sys_vector_init()
 {
-    kdebug("do_divide_error=%#018lx", do_divide_error);
-    kdebug("&do_divide_error=%#018lx", &do_divide_error);
     set_trap_gate(0, 1, divide_error);
     set_trap_gate(1, 1, debug);
     set_intr_gate(2, 1, nmi);
@@ -308,6 +306,8 @@ void sys_vector_init()
     set_trap_gate(19, 1, SIMD_exception);
     set_trap_gate(20, 1, virtualization_exception);
     // 中断号21-31由Intel保留，不能使用
+    
+    
 
     // 32-255为用户自定义中断内部
 

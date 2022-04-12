@@ -52,6 +52,7 @@ Restore_all:
 
     popq %rax
     addq $0x10, %rsp // 弹出变量FUNC和errcode
+    
     iretq
 
 ret_from_exception:
@@ -106,9 +107,6 @@ Err_Code:
 ENTRY(system_call)
     
     // 由于sysenter指令会禁用中断，因此要在这里手动开启中断
-    sti;
-
-    
     subq $0x38, %rsp
     
     cld;
@@ -146,6 +144,7 @@ ENTRY(system_call)
 
 // 从系统调用中返回
 ENTRY(ret_from_system_call)
+
     movq %rax, 0x80(%rsp)   // 将当前rax的值先存到栈中rax的位置
 
 	 
@@ -168,9 +167,10 @@ ENTRY(ret_from_system_call)
 	popq	%rax				 
 	movq	%rax,	%es			 
 	popq	%rax				 
-	addq	$0x38,	%rsp	
-	.byte	0x48		 
+	addq	$0x38,	%rsp
+	.byte	0x48
 	sysexit		
+    
 
 
 // 0 #DE 除法错误
@@ -337,6 +337,15 @@ ENTRY(virtualization_exception)
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
+/*
+// 0x80 系统调用门
+ENTRY(syscall_int)
+    pushq $0
+    pushq %rax
+    leaq do_syscall_int(%rip), %rax    // 获取系统调用服务程序的地址
+    xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
+    jmp Err_Code
+*/
 
 ENTRY(_stack_start)
     .quad initial_proc_union + 32768

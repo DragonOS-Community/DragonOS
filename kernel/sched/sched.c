@@ -10,6 +10,7 @@ struct process_control_block *sched_cfs_dequeue()
 {
     if (list_empty(&sched_cfs_ready_queue.proc_queue.list))
     {
+        kdebug("list empty");
         return &initial_proc_union.pcb;
     }
 
@@ -17,6 +18,7 @@ struct process_control_block *sched_cfs_dequeue()
 
     list_del(&proc->list);
     --sched_cfs_ready_queue.count;
+    kdebug("dequeued");
     return proc;
 }
 
@@ -30,7 +32,7 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
     struct process_control_block *proc = container_of(list_next(&sched_cfs_ready_queue.proc_queue.list), struct process_control_block, list);
     if (proc == &initial_proc_union.pcb)
         return;
-    if (!(list_empty(&sched_cfs_ready_queue.proc_queue.list)))
+    if ((list_empty(&sched_cfs_ready_queue.proc_queue.list)) == 0)
     {
         while (proc->virtual_runtime < pcb->virtual_runtime)
         {
@@ -39,6 +41,7 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
     }
     list_append(&proc->list, &pcb->list);
     ++sched_cfs_ready_queue.count;
+    kdebug("enqueued");
 }
 
 /**
@@ -57,7 +60,7 @@ void sched_cfs()
         if (current_pcb->state = PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             sched_cfs_enqueue(current_pcb);
 
-        if (!sched_cfs_ready_queue.cpu_exec_proc_jiffies)
+        if (sched_cfs_ready_queue.cpu_exec_proc_jiffies <= 0)
         {
             switch (proc->priority)
             {
@@ -67,7 +70,6 @@ void sched_cfs()
                 break;
             case 2:
             default:
-
                 sched_cfs_ready_queue.cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue.count) << 2;
                 break;
             }
@@ -77,24 +79,26 @@ void sched_cfs()
     }
     else // 不进行切换
     {
-        kdebug("not switch.");
-        sched_cfs_enqueue(current_pcb);
+        // kdebug("not switch.");
+        sched_cfs_enqueue(proc);
 
-        if (!sched_cfs_ready_queue.cpu_exec_proc_jiffies)
+        if (sched_cfs_ready_queue.cpu_exec_proc_jiffies <= 0)
         {
             switch (proc->priority)
             {
             case 0:
             case 1:
-                sched_cfs_ready_queue.cpu_exec_proc_jiffies = 4 / sched_cfs_ready_queue.cpu_exec_proc_jiffies;
+                sched_cfs_ready_queue.cpu_exec_proc_jiffies = 4 / sched_cfs_ready_queue.count;
+                //sched_cfs_ready_queue.cpu_exec_proc_jiffies = 5;
                 break;
             case 2:
             default:
-                sched_cfs_ready_queue.cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue.cpu_exec_proc_jiffies) << 2;
+                //sched_cfs_ready_queue.cpu_exec_proc_jiffies = 5;
+
+                sched_cfs_ready_queue.cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue.count) << 2;
                 break;
             }
         }
-        kdebug("hhhh");
     }
 }
 
@@ -107,6 +111,6 @@ void sched_init()
     memset(&sched_cfs_ready_queue, 0, sizeof(struct sched_queue_t));
     list_init(&sched_cfs_ready_queue.proc_queue.list);
     sched_cfs_ready_queue.count = 1; // 因为存在IDLE进程，因此为1
-    sched_cfs_ready_queue.cpu_exec_proc_jiffies = 10;
+    sched_cfs_ready_queue.cpu_exec_proc_jiffies = 15;
     sched_cfs_ready_queue.proc_queue.virtual_runtime = 0x7fffffffffffffff;
 }

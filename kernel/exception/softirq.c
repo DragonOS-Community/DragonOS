@@ -52,7 +52,7 @@ void do_softirq()
         }
     }
 
-    cli();
+    
 }
 
 void softirq_init()

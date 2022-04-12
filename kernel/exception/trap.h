@@ -48,4 +48,5 @@ void machine_check();
 void SIMD_exception();
 void virtualization_exception();
 
+void syscall_int(); // 系统调用门
 void sys_vector_init();

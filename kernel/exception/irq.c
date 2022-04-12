@@ -129,6 +129,8 @@ Build_IRQ(0xcf);
 Build_IRQ(0xd0);
 Build_IRQ(0xd1);
 
+Build_IRQ(0xfa); // 系统调用入口
+void (*syscall_intr_table[1])(void) = {IRQ0xfainterrupt};
 // 初始化IPI中断服务程序数组
 void (*SMP_interrupt_table[SMP_IRQ_NUM])(void) =
     {

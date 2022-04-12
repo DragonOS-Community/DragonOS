@@ -212,6 +212,7 @@ void system_initialize()
     syscall_init();
     //  再初始化进程模块。顺序不能调转
     sched_init();
+    kdebug("sched_cfs_ready_queue.cpu_exec_proc_jiffies=%ld", sched_cfs_ready_queue.cpu_exec_proc_jiffies);
     timer_init();
 
     smp_init();
@@ -223,10 +224,14 @@ void system_initialize()
     ahci_init();
     // test_slab();
     // test_mm();
+    
+
     process_init();
-    cli();
+
     HPET_init();
-    sti();
+
+    
+    while(1);
 }
 
 //操作系统内核从这里开始执行

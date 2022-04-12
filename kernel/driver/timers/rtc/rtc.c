@@ -22,7 +22,7 @@ enum CMOSTimeSelector
 int rtc_get_cmos_time(struct rtc_time_t *t)
 {
     // 为防止中断请求打断该过程，需要先关中断
-    //cli();
+    cli();
 
     uint8_t status_register_B = read_cmos(0x0B);                  // 读取状态寄存器B
     bool is_24h = ((status_register_B & 0x02) ? true : false);    // 判断是否启用24小时模式
@@ -53,6 +53,6 @@ int rtc_get_cmos_time(struct rtc_time_t *t)
 
     if ((!is_24h) && t->hour & 0x80) // 将十二小时制转为24小时
         t->hour = ((t->hour & 0x7f) + 12) % 24;
-    //sti();
+    sti();
     return 0;
 }

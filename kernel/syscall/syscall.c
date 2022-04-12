@@ -77,10 +77,10 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
 ul sys_printf(struct pt_regs *regs)
 {
 
-    // if(regs->r9 == 0 &&regs->r10 == 0)
-    //     printk((char*)regs->r8);
-    // else printk_color(regs->r9, regs->r10, (char*)regs->r8);
-    printk_color(BLACK, WHITE, (char *)regs->r8);
+    if(regs->r9 == 0 &&regs->r10 == 0)
+         printk((char*)regs->r8);
+     else printk_color(regs->r9, regs->r10, (char*)regs->r8);
+    // printk_color(BLACK, WHITE, (char *)regs->r8);
 
     return 0;
 }

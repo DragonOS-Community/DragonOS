@@ -10,6 +10,25 @@
 
 extern void system_call(void);
 
+struct mm_struct initial_mm = {0};
+struct thread_struct initial_thread =
+	{
+		.rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+		.rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+		.fs = KERNEL_DS,
+		.gs = KERNEL_DS,
+		.cr2 = 0,
+		.trap_num = 0,
+		.err_code = 0};
+
+// 初始化 初始进程的union ，并将其链接到.data.init_proc段内
+union proc_union initial_proc_union __attribute__((__section__(".data.init_proc_union"))) = {INITIAL_PROC(initial_proc_union.pcb)};
+
+struct process_control_block *initial_proc[MAX_CPU_NUM] = {&initial_proc_union.pcb, 0};
+
+// 为每个核心初始化初始进程的tss
+struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_TSS};
+
 /**
  * @brief 切换进程
  *
@@ -56,7 +75,7 @@ void user_level_function()
     long ret = 0;
     //	color_printk(RED,BLACK,"user_level_function task is running\n");
 
-    char string[] = "Hello World!\n";
+    char string[] = "User level process.\n";
     /*
     __asm__ __volatile__("leaq	sysexit_return_address(%%rip),	%%rdx	\n\t"
                          "movq	%%rsp,	%%rcx		\n\t"
@@ -274,6 +293,7 @@ void process_init()
 
     initial_mm.stack_start = *(ul *)phys_2_virt(&_stack_start);
 
+    /*
     // 向MSR寄存器组中的 IA32_SYSENTER_CS寄存器写入内核的代码段的地址
     wrmsr(0x174, KERNEL_CS);
     // 向MSR寄存器组中的 IA32_SYSENTER_ESP寄存器写入内核进程的rbp（在syscall入口中会将rsp减去相应的数值）
@@ -281,6 +301,7 @@ void process_init()
 
     // 向MSR寄存器组中的 IA32_SYSENTER_EIP寄存器写入系统调用入口的地址。
     wrmsr(0x176, (ul)system_call);
+    */
     // 初始化进程和tss
     set_tss64((uint *)phys_2_virt(TSS64_Table), initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
@@ -294,11 +315,11 @@ void process_init()
     list_init(&initial_proc_union.pcb.list);
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_FILES | CLONE_SIGNAL); // 初始化内核进程
     initial_proc_union.pcb.state = PROC_RUNNING;
-
+    initial_proc_union.pcb.preempt_count = 0;
     // 获取新的进程的pcb
-    struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
+    //struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
 
-    kdebug("Ready to switch...");
+    //kdebug("Ready to switch...");
     // 切换到新的内核线程
     // switch_proc(current_pcb, p);
 }
@@ -327,13 +348,14 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 将当前进程的pcb复制到新的pcb内
     *tsk = *current_pcb;
 
-    kdebug("current_pcb->flags=%#010lx", current_pcb->flags);
+    //kdebug("current_pcb->flags=%#010lx", current_pcb->flags);
 
     // 将进程加入循环链表
     list_init(&tsk->list);
 
     // list_add(&initial_proc_union.pcb.list, &tsk->list);
     tsk->priority = 2;
+    tsk->preempt_count = 0;
     ++(tsk->pid);
     tsk->state = PROC_UNINTERRUPTIBLE;
     list_init(&tsk->list);
@@ -353,7 +375,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     thd->fs = KERNEL_DS;
     thd->gs = KERNEL_DS;
 
-    kdebug("do_fork() thd->rsp=%#018lx", thd->rsp);
+    //kdebug("do_fork() thd->rsp=%#018lx", thd->rsp);
     // 若进程不是内核层的进程，则跳转到ret from system call
     if (!(tsk->flags & PF_KTHREAD))
         thd->rip = regs->rip = (ul)ret_from_system_call;

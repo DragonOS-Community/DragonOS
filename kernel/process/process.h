@@ -16,8 +16,7 @@
 #include "../syscall/syscall.h"
 #include "ptrace.h"
 
-extern unsigned long _stack_start; // 导出内核层栈基地址（定义在head.S）
-extern void ret_from_intr(void);   // 导出从中断返回的函数（定义在entry.S）
+
 
 // 进程的内核栈大小 32K
 #define STACK_SIZE 32768
@@ -99,6 +98,7 @@ struct process_control_block
 	volatile long state;
 	// 进程标志：进程、线程、内核线程
 	unsigned long flags;
+	int64_t preempt_count; // 持有的自旋锁的数量
 	long signal;
 	// 内存空间分布结构体， 记录内存页表和程序段信息
 	struct mm_struct *mm;
@@ -126,8 +126,6 @@ union proc_union
 	ul stack[STACK_SIZE / sizeof(ul)];
 } __attribute__((aligned(8)));
 
-struct mm_struct initial_mm;
-struct thread_struct initial_thread;
 
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                \
@@ -140,24 +138,13 @@ struct thread_struct initial_thread;
 		.pid = 0,                         \
 		.virtual_runtime = 0,             \
 		.signal = 0,                      \
-		.priority = 2                     \
+		.priority = 2,                    \
+		.preempt_count = 0,               \
 	}
 
-// 初始化 初始进程的union ，并将其链接到.data.init_proc段内
-union proc_union initial_proc_union __attribute__((__section__(".data.init_proc_union"))) = {INITIAL_PROC(initial_proc_union.pcb)};
 
-struct process_control_block *initial_proc[MAX_CPU_NUM] = {&initial_proc_union.pcb, 0};
 
-struct mm_struct initial_mm = {0};
-struct thread_struct initial_thread =
-	{
-		.rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
-		.rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
-		.fs = KERNEL_DS,
-		.gs = KERNEL_DS,
-		.cr2 = 0,
-		.trap_num = 0,
-		.err_code = 0};
+
 
 /**
  * @brief 任务状态段结构体
@@ -202,8 +189,7 @@ struct tss_struct
 		.reserved3 = 0,                                                   \
 		.io_map_base_addr = 0                                             \
 	}
-// 为每个核心初始化初始进程的tss
-struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_TSS};
+
 
 // 获取当前的pcb
 struct process_control_block *get_current_pcb()
@@ -263,3 +249,12 @@ void process_init();
  * @return unsigned long
  */
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size);
+
+extern unsigned long _stack_start; // 导出内核层栈基地址（定义在head.S）
+extern void ret_from_intr(void);   // 导出从中断返回的函数（定义在entry.S）
+
+extern struct tss_struct initial_tss[MAX_CPU_NUM];
+extern struct mm_struct initial_mm;
+extern struct thread_struct initial_thread;
+extern union proc_union initial_proc_union;
+extern struct process_control_block *initial_proc[MAX_CPU_NUM];

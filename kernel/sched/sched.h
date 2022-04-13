@@ -3,6 +3,7 @@
 #include <common/glib.h>
 #include <process/process.h>
 
+// @todo: 用红黑树重写cfs的队列
 struct sched_queue_t
 {
     long count; // 当前队列中的数量
@@ -10,8 +11,8 @@ struct sched_queue_t
     struct process_control_block proc_queue;
 };
 
-// @todo: 用红黑树重写cfs的队列
-struct sched_queue_t sched_cfs_ready_queue; // 就绪队列
+
+extern struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
 
 /**
  * @brief 调度函数

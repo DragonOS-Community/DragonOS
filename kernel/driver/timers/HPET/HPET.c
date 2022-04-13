@@ -6,6 +6,7 @@
 #include <driver/timers/timer.h>
 #include <process/process.h>
 #include <sched/sched.h>
+#include <smp/ipi.h>
 
 static struct acpi_HPET_description_table_t *hpet_table;
 static uint64_t HPET_REG_BASE = 0;
@@ -50,11 +51,16 @@ hardware_intr_controller HPET_intr_controller =
 
 void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
-    //printk("(HPET)");
+    // printk("(HPET)");
     switch (param)
     {
     case 0: // 定时器0中断
         ++timer_jiffies;
+
+        // 将HEPT中断消息转发到ap:1处理器
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8,
+                     ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);
+
         // 若当前时间比定时任务的时间间隔大，则进入中断下半部
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
             set_softirq_status(TIMER_SIRQ);
@@ -63,20 +69,22 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         {
         case 0:
         case 1:
-            --sched_cfs_ready_queue.cpu_exec_proc_jiffies;
+            --sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies;
             ++current_pcb->virtual_runtime;
             break;
         case 2:
         default:
-            sched_cfs_ready_queue.cpu_exec_proc_jiffies -= 2;
+            sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies -= 2;
             current_pcb->virtual_runtime += 2;
             break;
         }
 
-        if (sched_cfs_ready_queue.cpu_exec_proc_jiffies <= 0)
+        /* 由于目前只有BSP处理器会收到HPET中断，因此这里只会标记BSP处理器的进程需要调度
+        if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
         {
             current_pcb->flags |= PROC_NEED_SCHED;
         }
+        */
 
         break;
 
@@ -155,8 +163,6 @@ int HPET_init()
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
     apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
 
-    
-
     *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
     io_mfence();
     *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，投递到IO APIC的2号引脚（这里有点绕，写的是8259的引脚号，但是因为禁用了8259，因此会被路由到IO APIC的2号引脚）
@@ -165,8 +171,6 @@ int HPET_init()
     io_mfence();
 
     rtc_get_cmos_time(&rtc_now);
-
-    
 
     kinfo("HPET Initialized.");
     *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位

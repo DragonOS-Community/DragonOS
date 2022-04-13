@@ -349,7 +349,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 将当前进程的pcb复制到新的pcb内
     *tsk = *current_pcb;
-
+    
     //kdebug("current_pcb->flags=%#010lx", current_pcb->flags);
 
     // 将进程加入循环链表
@@ -385,7 +385,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     else
         kdebug("is kernel proc.");
 
-    kdebug("ret_from_system_call=%#018lx", (ul)ret_from_system_call);
+    
     
     tsk->state = PROC_RUNNING;
 

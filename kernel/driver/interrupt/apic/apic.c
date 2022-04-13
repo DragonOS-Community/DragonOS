@@ -482,8 +482,18 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     else if (number > 0x80)
 
     {
-        printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
+        //printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
         apic_local_apic_edge_ack(number);
+        if (number == 0xc8) // 来自BSP的HPET中断消息
+        {
+            sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies -= 2;
+            ++(current_pcb->virtual_runtime);
+
+            if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
+                current_pcb->flags |= PROC_NEED_SCHED;
+
+            //printk_color(RED, BLACK, "CPU_exec_task_jiffies:%d current_pcb = %#018lx\t current_pcb->thread=%#018lx\n", sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies, (ul)current_pcb, (ul)current_pcb->thread);
+        }
     }
     else
     {
@@ -501,7 +511,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         kBUG("current_pcb->preempt_count<0! pid=%d", current_pcb->pid); // should not be here
 
     // 检测当前进程是否可被调度
-    if (current_pcb->flags & PROC_NEED_SCHED)
+    if (current_pcb->flags & PROC_NEED_SCHED && proc_current_cpu_id == 1)
     {
         sched_cfs();
     }

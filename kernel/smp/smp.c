@@ -34,7 +34,7 @@ void smp_init()
 
     // 设置多核IPI中断门
     for (int i = 200; i < 210; ++i)
-        set_intr_gate(i, 2, SMP_interrupt_table[i - 200]);
+        set_intr_gate(i, 0, SMP_interrupt_table[i - 200]);
 
     memset((void *)SMP_IPI_desc, 0, sizeof(irq_desc_t) * SMP_IRQ_NUM);
 
@@ -117,14 +117,41 @@ void smp_ap_start()
     kdebug("current cpu = %d", current_starting_cpu);
 
     apic_init_ap_core_local_apic();
+
+    // ============ 为ap处理器初始化IDLE进程 =============
+    memset(current_pcb, 0, sizeof(struct process_control_block));
+
+    current_pcb->state = PROC_RUNNING;
+    current_pcb->flags = PF_KTHREAD;
+    current_pcb->mm = &initial_mm;
+
+    list_init(&current_pcb->list);
+    current_pcb->addr_limit = KERNEL_BASE_LINEAR_ADDR;
+    current_pcb->priority = 2;
+    current_pcb->virtual_runtime = 0;
+
+    current_pcb->thread = (struct thread_struct *)(current_pcb + 1);    // 将线程结构体放置在pcb后方
+    current_pcb->thread->rbp = _stack_start;
+    current_pcb->thread->rsp = _stack_start;
+    current_pcb->thread->fs = KERNEL_DS;
+    current_pcb->thread->gs = KERNEL_DS;
+    current_pcb->cpu_id = current_starting_cpu;
+    
+    initial_proc[proc_current_cpu_id] = current_pcb;
+
     load_TR(10 + current_starting_cpu * 2);
 
-    sti();
     // kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
-    memset(current_pcb, 0, sizeof(struct process_control_block));
     spin_unlock(&multi_core_starting_lock);
-
-    int a = 1 / 0;
+    current_pcb->preempt_count = 0;
+    sti();
+    
+    if(proc_current_cpu_id == 1)
+        process_init();
+    while(1)
+    {
+        printk_color(BLACK, WHITE, "CPU:%d IDLE process.\n", proc_current_cpu_id);
+    }
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();
 }

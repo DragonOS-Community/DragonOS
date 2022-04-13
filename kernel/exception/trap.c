@@ -198,7 +198,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 
 	__asm__	__volatile__("movq	%%cr2,	%0":"=r"(cr2)::"memory");
     
-	kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx,RIP:%#018lx\n",error_code , regs->rsp , regs->rip);
+	kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx,RIP:%#018lx CPU:%d\n",error_code , regs->rsp , regs->rip, proc_current_cpu_id);
 
 	if(!(error_code & 0x01))
 		printk_color(RED,BLACK,"Page Not-Present,\t");

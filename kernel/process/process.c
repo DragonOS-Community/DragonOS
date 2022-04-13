@@ -8,8 +8,9 @@
 #include <mm/slab.h>
 #include <sched/sched.h>
 
-extern void system_call(void);
 
+extern void system_call(void);
+ul _stack_start;    // initial proc的栈基地址（虚拟地址）
 struct mm_struct initial_mm = {0};
 struct thread_struct initial_thread =
 	{
@@ -40,9 +41,9 @@ struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_
 
 void __switch_to(struct process_control_block *prev, struct process_control_block *next)
 {
-    initial_tss[0].rsp0 = next->thread->rbp;
-    set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
-              initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
+    initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
+    //set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
+     //         initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     __asm__ __volatile__("movq	%%fs,	%0 \n\t"
                          : "=a"(prev->thread->fs));
@@ -52,12 +53,13 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
     //wrmsr(0x175, next->thread->rbp);
+    uint color;
+    if(proc_current_cpu_id == 0)
+		color = WHITE;
+	else
+		color = YELLOW;
 
-    // kdebug("next=%#018lx", next);
-    // kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
-    // kdebug("prev->thread->rsp0:%#018lx\n", prev->thread->rbp);
-    // kdebug("next->thread->rsp0:%#018lx\n", next->thread->rbp);
-    // kdebug("next->thread->rip:%#018lx\n", next->thread->rip);
+	
 }
 
 /**
@@ -73,7 +75,7 @@ void user_level_function()
     // enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
     //while(1);
     long ret = 0;
-    //	color_printk(RED,BLACK,"user_level_function task is running\n");
+    //	printk_color(RED,BLACK,"user_level_function task is running\n");
 
     char string[] = "User level process.\n";
     /*
@@ -291,8 +293,8 @@ void process_init()
     initial_mm.brk_start = 0;
     initial_mm.brk_end = memory_management_struct.kernel_end;
 
-    initial_mm.stack_start = *(ul *)phys_2_virt(&_stack_start);
-
+    initial_mm.stack_start = _stack_start;
+    
     /*
     // 向MSR寄存器组中的 IA32_SYSENTER_CS寄存器写入内核的代码段的地址
     wrmsr(0x174, KERNEL_CS);
@@ -303,9 +305,9 @@ void process_init()
     wrmsr(0x176, (ul)system_call);
     */
     // 初始化进程和tss
-    set_tss64((uint *)phys_2_virt(TSS64_Table), initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
+    //set_tss64((uint *)phys_2_virt(TSS64_Table), initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
-    initial_tss[0].rsp0 = initial_thread.rbp;
+    initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
     /*
     kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
     kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
@@ -357,6 +359,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     tsk->priority = 2;
     tsk->preempt_count = 0;
     ++(tsk->pid);
+    tsk->cpu_id = proc_current_cpu_id;
     tsk->state = PROC_UNINTERRUPTIBLE;
     list_init(&tsk->list);
     list_add(&initial_proc_union.pcb.list, &tsk->list);

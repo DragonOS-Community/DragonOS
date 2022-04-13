@@ -72,7 +72,6 @@ void sched_cfs()
                 break;
             }
         }
-
         switch_proc(current_pcb, proc);
     }
     else // 不进行切换

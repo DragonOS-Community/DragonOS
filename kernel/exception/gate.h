@@ -26,7 +26,7 @@ struct gate_struct
 
 extern struct desc_struct GDT_Table[]; // GDT_Table是head.S中的GDT_Table
 extern struct gate_struct IDT_Table[]; // IDT_Table是head.S中的IDT_Table
-extern unsigned int TSS64_Table[26];
+//extern unsigned int TSS64_Table[26];
 
 struct gdtr
 {

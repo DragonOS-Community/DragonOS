@@ -2,14 +2,14 @@
 #include "gate.h"
 #include "../process/ptrace.h"
 #include "../common/kprint.h"
-
+#include <process/process.h>
 
 
 // 0 #DE 除法错误
 void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
     //kerror("do_divide_error(0)");
-    kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -20,7 +20,7 @@ void do_debug(struct pt_regs *regs, unsigned long error_code)
 {
     printk("[ ");
     printk_color(RED, BLACK, "ERROR / TRAP");
-    printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -32,7 +32,7 @@ void do_nmi(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(BLUE, BLACK, "INT");
-    printk(" ] do_nmi(2),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    printk(" ] do_nmi(2),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -44,7 +44,7 @@ void do_int3(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(YELLOW, BLACK, "TRAP");
-    printk(" ] do_int3(3),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    printk(" ] do_int3(3),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -56,7 +56,7 @@ void do_overflow(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(YELLOW, BLACK, "TRAP");
-    printk(" ] do_overflow(4),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    printk(" ] do_overflow(4),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -66,7 +66,7 @@ void do_overflow(struct pt_regs *regs, unsigned long error_code)
 void do_bounds(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_bounds(5),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_bounds(5),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -76,7 +76,7 @@ void do_bounds(struct pt_regs *regs, unsigned long error_code)
 void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx", error_code, regs->rsp, regs->rip);
+    kerror("do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -86,7 +86,7 @@ void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
 void do_dev_not_avaliable(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -98,7 +98,7 @@ void do_double_fault(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(RED, BLACK, "Terminate");
-    printk(" ] do_double_fault(8),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    printk(" ] do_double_fault(8),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -108,7 +108,7 @@ void do_double_fault(struct pt_regs *regs, unsigned long error_code)
 void do_coprocessor_segment_overrun(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_coprocessor_segment_overrun(9),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_coprocessor_segment_overrun(9),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -120,7 +120,7 @@ void do_invalid_TSS(struct pt_regs *regs, unsigned long error_code)
 
     printk("[");
     printk_color(RED, BLACK, "ERROR");
-    printk("] do_invalid_TSS(10),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    printk("] do_invalid_TSS(10),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     printk_color(YELLOW, BLACK, "Information:\n");
     // 解析错误码
@@ -149,7 +149,7 @@ void do_invalid_TSS(struct pt_regs *regs, unsigned long error_code)
 void do_segment_not_exists(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_segment_not_exists(11),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_segment_not_exists(11),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -159,7 +159,7 @@ void do_segment_not_exists(struct pt_regs *regs, unsigned long error_code)
 void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_stack_segment_fault(12),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_stack_segment_fault(12),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -170,7 +170,7 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 {
     
     
-    kerror("do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
     if (error_code & 0x01)
         printk_color(RED, BLACK, "The exception occurred during delivery of an event external to the program,such as an interrupt or an earlier exception.\n");
 
@@ -233,7 +233,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 void do_x87_FPU_error(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_x87_FPU_error(16),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_x87_FPU_error(16),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -243,7 +243,7 @@ void do_x87_FPU_error(struct pt_regs *regs, unsigned long error_code)
 void do_alignment_check(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_alignment_check(17),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_alignment_check(17),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -253,7 +253,7 @@ void do_alignment_check(struct pt_regs *regs, unsigned long error_code)
 void do_machine_check(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_machine_check(18),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_machine_check(18),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -263,7 +263,7 @@ void do_machine_check(struct pt_regs *regs, unsigned long error_code)
 void do_SIMD_exception(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_SIMD_exception(19),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_SIMD_exception(19),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;
@@ -273,7 +273,7 @@ void do_SIMD_exception(struct pt_regs *regs, unsigned long error_code)
 void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_virtualization_exception(20),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
+    kerror("do_virtualization_exception(20),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
         ;

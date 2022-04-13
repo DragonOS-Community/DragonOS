@@ -7,6 +7,8 @@
 
 #define MAX_SUPPORTED_PROCESSOR_NUM 1024    
 
+
+
 extern uchar _apu_boot_start[];
 extern uchar _apu_boot_end[];
 /**

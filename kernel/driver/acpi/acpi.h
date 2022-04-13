@@ -127,7 +127,7 @@ struct acpi_Processor_Local_APIC_Structure_t
     struct apic_Interrupt_Controller_Structure_header_t header;
     unsigned char ACPI_Processor_UID;
     // 处理器的local apic id
-    unsigned char ACPI_ID;
+    unsigned char local_apic_id;
     //详见 ACPI Specification Version 6.3, Table 5-47
     uint flags;
 };

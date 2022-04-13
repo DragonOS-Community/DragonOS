@@ -57,5 +57,6 @@ void cpu_init(void);
 struct cpu_core_info
 {
     uint64_t stack_start;   // 栈基地址
+    uint64_t ist_stack_start;   // IST栈基地址
     uint64_t tss_vaddr; // tss地址
 }cpu_core_info[MAX_CPU_NUM];

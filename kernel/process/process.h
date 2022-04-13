@@ -16,8 +16,6 @@
 #include "../syscall/syscall.h"
 #include "ptrace.h"
 
-
-
 // 进程的内核栈大小 32K
 #define STACK_SIZE 32768
 
@@ -100,6 +98,7 @@ struct process_control_block
 	unsigned long flags;
 	int64_t preempt_count; // 持有的自旋锁的数量
 	long signal;
+	long cpu_id; // 当前进程在哪个CPU核心上运行
 	// 内存空间分布结构体， 记录内存页表和程序段信息
 	struct mm_struct *mm;
 
@@ -126,7 +125,6 @@ union proc_union
 	ul stack[STACK_SIZE / sizeof(ul)];
 } __attribute__((aligned(8)));
 
-
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                \
 	{                                     \
@@ -140,11 +138,8 @@ union proc_union
 		.signal = 0,                      \
 		.priority = 2,                    \
 		.preempt_count = 0,               \
+		.cpu_id = 0                       \
 	}
-
-
-
-
 
 /**
  * @brief 任务状态段结构体
@@ -189,7 +184,6 @@ struct tss_struct
 		.reserved3 = 0,                                                   \
 		.io_map_base_addr = 0                                             \
 	}
-
 
 // 获取当前的pcb
 struct process_control_block *get_current_pcb()
@@ -250,7 +244,11 @@ void process_init();
  */
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size);
 
-extern unsigned long _stack_start; // 导出内核层栈基地址（定义在head.S）
+// 获取当前cpu id
+#define proc_current_cpu_id (current_pcb->cpu_id)
+
+extern unsigned long head_stack_start; // 导出内核层栈基地址（定义在head.S）
+extern ul _stack_start;
 extern void ret_from_intr(void);   // 导出从中断返回的函数（定义在entry.S）
 
 extern struct tss_struct initial_tss[MAX_CPU_NUM];

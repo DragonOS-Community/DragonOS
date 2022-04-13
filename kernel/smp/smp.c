@@ -24,7 +24,7 @@ void smp_init()
 
     apic_get_ics(ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC, tmp_vaddr, &total_processor_num);
 
-    //kdebug("processor num=%d", total_processor_num);
+    // kdebug("processor num=%d", total_processor_num);
     for (int i = 0; i < total_processor_num; ++i)
         proc_local_apic_structs[i] = (struct acpi_Processor_Local_APIC_Structure_t *)(tmp_vaddr[i]);
 
@@ -44,25 +44,36 @@ void smp_init()
     {
         if (proc_local_apic_structs[i]->ACPI_Processor_UID == 0)
             --total_processor_num;
+        if (proc_local_apic_structs[i]->local_apic_id > total_processor_num)
+            continue;
+
         spin_lock(&multi_core_starting_lock);
-        current_starting_cpu = i;
+        current_starting_cpu = proc_local_apic_structs[i]->local_apic_id;
 
-        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->ACPI_ID, proc_local_apic_structs[i]->flags);
-        // 为每个AP处理器分配栈空间、tss空间
-        cpu_core_info[i].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id, proc_local_apic_structs[i]->flags);
 
-        cpu_core_info[i].tss_vaddr = (uint64_t)kmalloc(128, 0);
+        // 为每个AP处理器分配栈空间
+        cpu_core_info[current_starting_cpu].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+        cpu_core_info[current_starting_cpu].ist_stack_start = (uint64_t)(kmalloc(STACK_SIZE, 0)) + STACK_SIZE;
+        memset((void *)cpu_core_info[current_starting_cpu].stack_start - STACK_SIZE, 0, STACK_SIZE);
+        memset((void *)cpu_core_info[current_starting_cpu].ist_stack_start - STACK_SIZE, 0, STACK_SIZE);
 
-        set_tss_descriptor(10 + (i * 2), (void *)virt_2_phys(cpu_core_info[i].tss_vaddr));
+        // 设置ap处理器的中断栈及内核栈中的cpu_id
+        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].stack_start - STACK_SIZE))->cpu_id = proc_local_apic_structs[i]->local_apic_id;
+        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].ist_stack_start - STACK_SIZE))->cpu_id = proc_local_apic_structs[i]->local_apic_id;
 
-        set_tss64((uint *)cpu_core_info[i].tss_vaddr, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start, cpu_core_info[i].stack_start);
-        //kdebug("phys_2_virt(GDT_Table)=%#018lx",phys_2_virt(GDT_Table));
-        //kdebug("GDT Table %#018lx, \t %#018lx", *(ul *)(phys_2_virt(GDT_Table) + 10 + i * 2), *(ul *)(phys_2_virt(GDT_Table) + 10 + i * 2 + 1));
-        // kdebug("(cpu_core_info[i].tss_vaddr)=%#018lx", (cpu_core_info[i].tss_vaddr));
-        //kdebug("(cpu_core_info[i].stack_start)=%#018lx", (cpu_core_info[i].stack_start));
+        cpu_core_info[current_starting_cpu].tss_vaddr = (uint64_t)&initial_tss[current_starting_cpu];
+
+        memset(&initial_tss[current_starting_cpu], 0, sizeof(struct tss_struct));
+
+        set_tss_descriptor(10 + (current_starting_cpu * 2), (void *)(cpu_core_info[current_starting_cpu].tss_vaddr));
+
+        set_tss64((uint *)cpu_core_info[current_starting_cpu].tss_vaddr, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start,
+                  cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start);
+
         // 连续发送两次start-up IPI
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->ACPI_ID);
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->ACPI_ID);
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->local_apic_id);
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->local_apic_id);
     }
 
     while (num_cpu_started != total_processor_num)
@@ -70,9 +81,8 @@ void smp_init()
                                  : "memory");
 
     kinfo("Cleaning page table remapping...\n");
-    
+
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
-    //todo: 取消低0-2M的地址映射
     for (int i = 0; i < 128; ++i)
     {
 
@@ -80,7 +90,6 @@ void smp_init()
     }
 
     kinfo("Successfully cleaned page table remapping!\n");
-   
 }
 
 /**
@@ -111,9 +120,11 @@ void smp_ap_start()
     load_TR(10 + current_starting_cpu * 2);
 
     sti();
-    //kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
+    // kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
     memset(current_pcb, 0, sizeof(struct process_control_block));
     spin_unlock(&multi_core_starting_lock);
+
+    int a = 1 / 0;
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();
 }

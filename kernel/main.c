@@ -88,15 +88,15 @@ void system_initialize()
     // 重新加载gdt和idt
     
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
-    kdebug("TSS64_Table=%#018lx", (void *)TSS64_Table);
-    kdebug("&TSS64_Table=%#018lx", (void *)&TSS64_Table);
+    _stack_start = head_stack_start;    // 保存init proc的栈基地址（由于之后取消了地址重映射，因此必须在这里重新保存）
     kdebug("_stack_start=%#018lx", _stack_start);
+
     load_TR(10); // 加载TR寄存器
-    set_tss64((uint *)phys_2_virt(TSS64_Table), _stack_start, _stack_start, _stack_start, tss_item_addr,
+    set_tss64((uint *)&initial_tss[0], _stack_start, _stack_start, _stack_start, tss_item_addr,
               tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
 
     cpu_core_info[0].stack_start = _stack_start;
-    cpu_core_info[0].tss_vaddr = (uint64_t)phys_2_virt((uint64_t)TSS64_Table);
+    cpu_core_info[0].tss_vaddr = (uint64_t)&initial_tss[0];
     kdebug("cpu_core_info[0].tss_vaddr=%#018lx", cpu_core_info[0].tss_vaddr);
     kdebug("cpu_core_info[0].stack_start%#018lx", cpu_core_info[0].stack_start);
     
@@ -106,6 +106,19 @@ void system_initialize()
 
     //  初始化内存管理单元
     mm_init();
+
+    // =========== 重新设置initial_tss[0]的ist
+    uchar *ptr  = (uchar*)kmalloc(STACK_SIZE, 0)+STACK_SIZE;
+    ((struct process_control_block*)(ptr-STACK_SIZE))->cpu_id = 0;
+
+    initial_tss[0].ist1 = (ul)ptr;
+    initial_tss[0].ist2 = (ul)ptr;
+    initial_tss[0].ist3 = (ul)ptr;
+    initial_tss[0].ist4 = (ul)ptr;
+    initial_tss[0].ist5 = (ul)ptr;
+    initial_tss[0].ist6 = (ul)ptr;
+    initial_tss[0].ist7 = (ul)ptr;
+    // ===========================
     
     acpi_init();
 
@@ -137,10 +150,10 @@ void system_initialize()
 
     HPET_init();
 
-    show_welcome();
+
     while(1)
     {
-        printk_color(ORANGE, BLACK, "Initial_proc\n");
+       printk_color(ORANGE, BLACK, "i\n");
     }
 }
 
@@ -158,6 +171,8 @@ void Start_Kernel(void)
     reload_gdt();
     reload_idt();
     
+    // 重新设置TSS描述符
+    set_tss_descriptor(10, (void *)(&initial_tss[0]));
 
     mb2_info &= 0xffffffff;
     mb2_magic &= 0xffffffff;

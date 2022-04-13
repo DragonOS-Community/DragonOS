@@ -316,7 +316,7 @@ ENTRY(_start64)
     lidt IDT_POINTER(%rip)
     //lidt $IDT_POINTER
     movq GDT_POINTER(%rip), %r12
-    movq _stack_start(%rip), %rsp
+    movq head_stack_start(%rip), %rsp
 
     // 分支，判断是否为apu
     movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
@@ -368,7 +368,7 @@ entry64:
     movq %rax, %gs
     movq %rax, %ss
 
-    movq _stack_start(%rip), %rsp //rsp的地址
+    movq head_stack_start(%rip), %rsp //rsp的地址
     
     // 重新加载GDT和IDT，加载到高地址
     leaq GDT_Table(%rip), %r8
@@ -423,7 +423,7 @@ repeat_set_idt:
 SetUp_TSS64:
     // == 设置64位的任务状态段表 ===
     //rdx保存高8B， rax保存低8B
-    leaq TSS64_Table(%rip), %rdx
+    leaq TSS64_Table(%rip), %rdx    // 获取定义在process.c中的initial_tss[0]的地址
 
     movq $0xffff800000000000, %r8
     addq %r8, %rdx
@@ -541,7 +541,7 @@ go_to_ignore_int:
     .quad ignore_int
 
 
-ENTRY(_stack_start)
+ENTRY(head_stack_start)
     .quad initial_proc_union + 32768
 
 

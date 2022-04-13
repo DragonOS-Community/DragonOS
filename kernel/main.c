@@ -53,97 +53,6 @@ void show_welcome()
     printk_color(0x00e0ebeb, 0x00e0ebeb, "                                \n\n");
 }
 
-// 测试内存管理单元
-
-void test_mm()
-{
-    kinfo("Testing memory management unit...");
-    struct Page *page = NULL;
-    page = alloc_pages(ZONE_NORMAL, 63, 0);
-    page = alloc_pages(ZONE_NORMAL, 63, 0);
-
-    printk_color(ORANGE, BLACK, "4.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tmemory_management_struct.bmp+2:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1), *(memory_management_struct.bmp + 2), memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
-
-    for (int i = 80; i <= 85; ++i)
-    {
-        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\t", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
-        i++;
-        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\n", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
-    }
-
-    for (int i = 140; i <= 145; i++)
-    {
-        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\t", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
-        i++;
-        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\n", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
-    }
-
-    free_pages(page, 1);
-
-    printk_color(ORANGE, BLACK, "5.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tmemory_management_struct.bmp+2:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *memory_management_struct.bmp, *(memory_management_struct.bmp + 1), *(memory_management_struct.bmp + 2), memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
-
-    for (int i = 75; i <= 85; i++)
-    {
-        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\t", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
-        i++;
-        printk_color(INDIGO, BLACK, "page%03d attr:%#018lx address:%#018lx\n", i, (memory_management_struct.pages_struct + i)->attr, (memory_management_struct.pages_struct + i)->addr_phys);
-    }
-
-    page = alloc_pages(ZONE_UNMAPPED_IN_PGT, 63, 0);
-
-    printk_color(ORANGE, BLACK, "6.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *(memory_management_struct.bmp + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), *(memory_management_struct.bmp + 1 + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_using, (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_free);
-
-    free_pages(page, 1);
-
-    printk_color(ORANGE, BLACK, "7.memory_management_struct.bmp:%#018lx\tmemory_management_struct.bmp+1:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d\n", *(memory_management_struct.bmp + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), *(memory_management_struct.bmp + 1 + (page->addr_phys >> PAGE_2M_SHIFT >> 6)), (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_using, (memory_management_struct.zones_struct + ZONE_UNMAPPED_INDEX)->count_pages_free);
-
-    test_slab();
-    kinfo("Memory management module test completed!");
-}
-
-void test_slab()
-{
-    kinfo("Testing SLAB...");
-    kinfo("Testing kmalloc()...");
-
-    for (int i = 1; i < 16; ++i)
-    {
-        printk_color(ORANGE, BLACK, "mem_obj_size: %ldbytes\t", kmalloc_cache_group[i].size);
-        printk_color(ORANGE, BLACK, "bmp(before): %#018lx\t", *kmalloc_cache_group[i].cache_pool_entry->bmp);
-
-        ul *tmp = kmalloc(kmalloc_cache_group[i].size, 0);
-        if (tmp == NULL)
-        {
-            kBUG("Cannot kmalloc such a memory: %ld bytes", kmalloc_cache_group[i].size);
-        }
-
-        printk_color(ORANGE, BLACK, "bmp(middle): %#018lx\t", *kmalloc_cache_group[i].cache_pool_entry->bmp);
-
-        kfree(tmp);
-
-        printk_color(ORANGE, BLACK, "bmp(after): %#018lx\n", *kmalloc_cache_group[i].cache_pool_entry->bmp);
-    }
-
-    // 测试自动扩容
-    void *ptrs[7];
-    for (int i = 0; i < 7; ++i)
-        ptrs[i] = kmalloc(kmalloc_cache_group[15].size, 0);
-
-    struct slab_obj *slab_obj_ptr = kmalloc_cache_group[15].cache_pool_entry;
-    int count = 0;
-    do
-    {
-        kdebug("bmp(%d): addr=%#018lx\t value=%#018lx", count, slab_obj_ptr->bmp, *slab_obj_ptr->bmp);
-
-        slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
-        ++count;
-    } while (slab_obj_ptr != kmalloc_cache_group[15].cache_pool_entry);
-
-    for (int i = 0; i < 7; ++i)
-        kfree(ptrs[i]);
-
-    kinfo("SLAB test completed!");
-}
 struct gdtr gdtp;
 struct idtr idtp;
 void reload_gdt()
@@ -151,8 +60,6 @@ void reload_gdt()
     
     gdtp.size = bsp_gdt_size-1;
     gdtp.gdt_vaddr = (ul)phys_2_virt((ul)&GDT_Table);
-    //kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
-    //kdebug("gdt size=%d", p.size);
 
     asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp)
                  : "memory");
@@ -230,8 +137,11 @@ void system_initialize()
 
     HPET_init();
 
-    
-    while(1);
+    show_welcome();
+    while(1)
+    {
+        printk_color(ORANGE, BLACK, "Initial_proc\n");
+    }
 }
 
 //操作系统内核从这里开始执行

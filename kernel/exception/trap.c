@@ -169,7 +169,7 @@ void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
 void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 {
     
-    hlt();
+    
     kerror("do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\n", error_code, regs->rsp, regs->rip);
     if (error_code & 0x01)
         printk_color(RED, BLACK, "The exception occurred during delivery of an event external to the program,such as an interrupt or an earlier exception.\n");
@@ -197,7 +197,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
     unsigned long cr2 = 0;
 
 	__asm__	__volatile__("movq	%%cr2,	%0":"=r"(cr2)::"memory");
-    hlt();
+    
 	kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx,RIP:%#018lx\n",error_code , regs->rsp , regs->rip);
 
 	if(!(error_code & 0x01))

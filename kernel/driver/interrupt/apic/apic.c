@@ -494,6 +494,12 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     // 检测是否有未处理的软中断
     if (softirq_status != 0)
         do_softirq();
+    // 检测当前进程是否持有自旋锁，若持有自旋锁，则不进行抢占式的进程调度
+    if (current_pcb->preempt_count > 0)
+        return;
+    else if (current_pcb->preempt_count < 0)
+        kBUG("current_pcb->preempt_count<0! pid=%d", current_pcb->pid); // should not be here
+
     // 检测当前进程是否可被调度
     if (current_pcb->flags & PROC_NEED_SCHED)
     {

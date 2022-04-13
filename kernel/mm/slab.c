@@ -1,5 +1,27 @@
 #include "slab.h"
 
+
+
+struct slab kmalloc_cache_group[16] =
+    {
+        {32, 0, 0, NULL, NULL, NULL, NULL},
+        {64, 0, 0, NULL, NULL, NULL, NULL},
+        {128, 0, 0, NULL, NULL, NULL, NULL},
+        {256, 0, 0, NULL, NULL, NULL, NULL},
+        {512, 0, 0, NULL, NULL, NULL, NULL},
+        {1024, 0, 0, NULL, NULL, NULL, NULL}, // 1KB
+        {2048, 0, 0, NULL, NULL, NULL, NULL},
+        {4096, 0, 0, NULL, NULL, NULL, NULL}, // 4KB
+        {8192, 0, 0, NULL, NULL, NULL, NULL},
+        {16384, 0, 0, NULL, NULL, NULL, NULL},
+        {32768, 0, 0, NULL, NULL, NULL, NULL},
+        {65536, 0, 0, NULL, NULL, NULL, NULL},
+        {131072, 0, 0, NULL, NULL, NULL, NULL}, // 128KB
+        {262144, 0, 0, NULL, NULL, NULL, NULL},
+        {524288, 0, 0, NULL, NULL, NULL, NULL},
+        {1048576, 0, 0, NULL, NULL, NULL, NULL}, // 1MB
+};
+
 /**
  * @brief 创建一个内存池
  *

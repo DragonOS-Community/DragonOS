@@ -72,7 +72,7 @@
     {                                      \
         printk("[ ");                      \
         printk_color(RED, BLACK, "BUG"); \
-        printk(" ] ");                     \
+        printk(" ] (%s:%d)\t", __FILE__, __LINE__);                     \
         printk(__VA_ARGS__);               \
         printk("\n");                      \
     } while (0);

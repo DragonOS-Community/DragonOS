@@ -8,19 +8,18 @@
 #include <mm/slab.h>
 #include <sched/sched.h>
 
-
 extern void system_call(void);
-ul _stack_start;    // initial proc的栈基地址（虚拟地址）
+ul _stack_start; // initial proc的栈基地址（虚拟地址）
 struct mm_struct initial_mm = {0};
 struct thread_struct initial_thread =
-	{
-		.rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
-		.rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
-		.fs = KERNEL_DS,
-		.gs = KERNEL_DS,
-		.cr2 = 0,
-		.trap_num = 0,
-		.err_code = 0};
+    {
+        .rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+        .rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+        .fs = KERNEL_DS,
+        .gs = KERNEL_DS,
+        .cr2 = 0,
+        .trap_num = 0,
+        .err_code = 0};
 
 // 初始化 初始进程的union ，并将其链接到.data.init_proc段内
 union proc_union initial_proc_union __attribute__((__section__(".data.init_proc_union"))) = {INITIAL_PROC(initial_proc_union.pcb)};
@@ -42,8 +41,8 @@ struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_
 void __switch_to(struct process_control_block *prev, struct process_control_block *next)
 {
     initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
-    //set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
-     //         initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
+    // set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
+    //          initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     __asm__ __volatile__("movq	%%fs,	%0 \n\t"
                          : "=a"(prev->thread->fs));
@@ -52,14 +51,12 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
-    //wrmsr(0x175, next->thread->rbp);
+    // wrmsr(0x175, next->thread->rbp);
     uint color;
-    if(proc_current_cpu_id == 0)
-		color = WHITE;
-	else
-		color = YELLOW;
-
-	
+    if (proc_current_cpu_id == 0)
+        color = WHITE;
+    else
+        color = YELLOW;
 }
 
 /**
@@ -73,7 +70,7 @@ void user_level_function()
     // enter_syscall(15, 0, 0, 0, 0, 0, 0, 0, 0);
 
     // enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
-    //while(1);
+    // while(1);
     long ret = 0;
     //	printk_color(RED,BLACK,"user_level_function task is running\n");
 
@@ -116,9 +113,9 @@ ul do_execve(struct pt_regs *regs)
     // 选择这两个寄存器是对应了sysexit指令的需要
     regs->rip = 0x800000; // rip 应用层程序的入口地址   这里的地址选择没有特殊要求，只要是未使用的内存区域即可。
     regs->rsp = 0xa00000; // rsp 应用层程序的栈顶地址
-    regs->cs = USER_CS|3;
-    regs->ds = USER_DS|3;
-    regs->ss = USER_DS |0x3;
+    regs->cs = USER_CS | 3;
+    regs->ds = USER_DS | 3;
+    regs->ss = USER_DS | 0x3;
     regs->rflags = 0x200246;
     regs->rax = 1;
     regs->es = 0;
@@ -129,31 +126,30 @@ ul do_execve(struct pt_regs *regs)
     // mm_map_proc_page_table(get_CR3(), true, 0x800000, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
 
     uint64_t addr = 0x800000UL;
-
-    unsigned long *tmp = phys_2_virt((unsigned long *)((unsigned long)get_CR3() & (~0xfffUL)) + ((addr >> PAGE_GDT_SHIFT) & 0x1ff));
-
-    unsigned long *virtual = kmalloc(PAGE_4K_SIZE, 0);
-    set_pml4t(tmp, mk_pml4t(virt_2_phys(virtual), PAGE_USER_PGT));
-
-    tmp = phys_2_virt((unsigned long *)(*tmp & (~0xfffUL)) + ((addr >> PAGE_1G_SHIFT) & 0x1ff));
-    virtual = kmalloc(PAGE_4K_SIZE, 0);
-    set_pdpt(tmp, mk_pdpt(virt_2_phys(virtual), PAGE_USER_DIR));
-
-    tmp = phys_2_virt((unsigned long *)(*tmp & (~0xfffUL)) + ((addr >> PAGE_2M_SHIFT) & 0x1ff));
-    struct Page *p = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
-    set_pdt(tmp, mk_pdt(p->addr_phys, PAGE_USER_PAGE));
-
-    flush_tlb();
-
     /*
-        mm_map_phys_addr_user(addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE);
-     */
+        unsigned long *tmp = phys_2_virt((unsigned long *)((unsigned long)get_CR3() & (~0xfffUL)) + ((addr >> PAGE_GDT_SHIFT) & 0x1ff));
+
+        unsigned long *virtual = kmalloc(PAGE_4K_SIZE, 0);
+        set_pml4t(tmp, mk_pml4t(virt_2_phys(virtual), PAGE_USER_PGT));
+
+        tmp = phys_2_virt((unsigned long *)(*tmp & (~0xfffUL)) + ((addr >> PAGE_1G_SHIFT) & 0x1ff));
+        virtual = kmalloc(PAGE_4K_SIZE, 0);
+        set_pdpt(tmp, mk_pdpt(virt_2_phys(virtual), PAGE_USER_DIR));
+
+        tmp = phys_2_virt((unsigned long *)(*tmp & (~0xfffUL)) + ((addr >> PAGE_2M_SHIFT) & 0x1ff));
+        struct Page *p = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
+        set_pdt(tmp, mk_pdt(p->addr_phys, PAGE_USER_PAGE));
+
+        flush_tlb();
+    */
+
+    mm_map_phys_addr_user(addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE);
+
     if (!(current_pcb->flags & PF_KTHREAD))
         current_pcb->addr_limit = KERNEL_BASE_LINEAR_ADDR;
     // 将程序代码拷贝到对应的内存中
     memcpy((void *)0x800000, user_level_function, 1024);
 
-    
     // kdebug("program copied!");
     return 0;
 }
@@ -294,7 +290,7 @@ void process_init()
     initial_mm.brk_end = memory_management_struct.kernel_end;
 
     initial_mm.stack_start = _stack_start;
-    
+
     /*
     // 向MSR寄存器组中的 IA32_SYSENTER_CS寄存器写入内核的代码段的地址
     wrmsr(0x174, KERNEL_CS);
@@ -305,7 +301,7 @@ void process_init()
     wrmsr(0x176, (ul)system_call);
     */
     // 初始化进程和tss
-    //set_tss64((uint *)phys_2_virt(TSS64_Table), initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
+    // set_tss64((uint *)phys_2_virt(TSS64_Table), initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
     /*
@@ -319,11 +315,11 @@ void process_init()
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;
     // 获取新的进程的pcb
-    //struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
+    // struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
 
-    //kdebug("Ready to switch...");
-    // 切换到新的内核线程
-    // switch_proc(current_pcb, p);
+    // kdebug("Ready to switch...");
+    //  切换到新的内核线程
+    //  switch_proc(current_pcb, p);
 }
 
 /**
@@ -349,8 +345,8 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 将当前进程的pcb复制到新的pcb内
     *tsk = *current_pcb;
-    
-    //kdebug("current_pcb->flags=%#010lx", current_pcb->flags);
+
+    // kdebug("current_pcb->flags=%#010lx", current_pcb->flags);
 
     // 将进程加入循环链表
     list_init(&tsk->list);
@@ -378,15 +374,13 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     thd->fs = KERNEL_DS;
     thd->gs = KERNEL_DS;
 
-    //kdebug("do_fork() thd->rsp=%#018lx", thd->rsp);
-    // 若进程不是内核层的进程，则跳转到ret from system call
+    // kdebug("do_fork() thd->rsp=%#018lx", thd->rsp);
+    //  若进程不是内核层的进程，则跳转到ret from system call
     if (!(tsk->flags & PF_KTHREAD))
         thd->rip = regs->rip = (ul)ret_from_system_call;
     else
         kdebug("is kernel proc.");
 
-    
-    
     tsk->state = PROC_RUNNING;
 
     sched_cfs_enqueue(tsk);

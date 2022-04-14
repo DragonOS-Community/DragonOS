@@ -599,7 +599,6 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
 
         // 页面写穿，禁止缓存
         set_pdt(tmp1, mk_pdt((ul)phys_addr_start + i, flags | PAGE_USER_PAGE));
-        kdebug("mk_pdt((ul)phys_addr_start + i, flags | PAGE_USER_PAGE) = %#018lx",mk_pdt((ul)phys_addr_start + i, flags | PAGE_USER_PAGE));
     }
 
     flush_tlb();

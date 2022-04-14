@@ -147,7 +147,8 @@ void system_initialize()
     
 
     //process_init();
-
+    current_pcb->cpu_id = 0;
+    current_pcb->preempt_count = 0;
     HPET_init();
 
 

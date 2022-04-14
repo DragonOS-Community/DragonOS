@@ -50,7 +50,7 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
  */
 void sched_cfs()
 {
-
+    
     current_pcb->flags &= ~PROC_NEED_SCHED;
     struct process_control_block *proc = sched_cfs_dequeue();
 
@@ -107,6 +107,8 @@ void sched_cfs()
  */
 void sched_update_jiffies()
 {
+    if(current_pcb->cpu_id == 0)
+        return;
     switch (current_pcb->priority)
     {
     case 0:

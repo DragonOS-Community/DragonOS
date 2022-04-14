@@ -211,7 +211,8 @@ struct process_control_block *get_current_pcb()
 #define switch_proc(prev, next)                                                                     \
 	do                                                                                              \
 	{                                                                                               \
-		__asm__ __volatile__("pushq	%%rbp	\n\t"                                                     \
+		__asm__ __volatile__("cli	\n\t"                                                             \
+							 "pushq	%%rbp	\n\t"                                                     \
 							 "pushq	%%rax	\n\t"                                                     \
 							 "movq	%%rsp,	%0	\n\t"                                                  \
 							 "movq	%2,	%%rsp	\n\t"                                                  \
@@ -222,6 +223,7 @@ struct process_control_block *get_current_pcb()
 							 "1:	\n\t"                                                              \
 							 "popq	%%rax	\n\t"                                                      \
 							 "popq	%%rbp	\n\t"                                                      \
+							 "sti	\n\t"                                                             \
 							 : "=m"(prev->thread->rsp), "=m"(prev->thread->rip)                     \
 							 : "m"(next->thread->rsp), "m"(next->thread->rip), "D"(prev), "S"(next) \
 							 : "memory");                                                           \
@@ -249,7 +251,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
 extern unsigned long head_stack_start; // 导出内核层栈基地址（定义在head.S）
 extern ul _stack_start;
-extern void ret_from_intr(void);   // 导出从中断返回的函数（定义在entry.S）
+extern void ret_from_intr(void); // 导出从中断返回的函数（定义在entry.S）
 
 extern struct tss_struct initial_tss[MAX_CPU_NUM];
 extern struct mm_struct initial_mm;

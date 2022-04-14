@@ -59,7 +59,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 
         // 将HEPT中断消息转发到ap:1处理器
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8,
-                     ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);
+                     ICR_APIC_FIXED, ICR_ALL_EXCLUDE_Self, true, 0);
 
         // 若当前时间比定时任务的时间间隔大，则进入中断下半部
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)

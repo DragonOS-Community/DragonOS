@@ -164,8 +164,8 @@ void mm_init()
         if (z->zone_addr_start >= 0x100000000 && (!ZONE_UNMAPPED_INDEX))
             ZONE_UNMAPPED_INDEX = i;
     }
-    //kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
-    // 设置内存页管理结构的地址，预留了一段空间，防止内存越界。
+    // kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
+    //  设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
     // printk_color(ORANGE, BLACK, "code_start:%#18lx, code_end:%#18lx, data_end:%#18lx, kernel_end:%#18lx, end_of_struct:%#18lx\n",
@@ -174,7 +174,7 @@ void mm_init()
     // 初始化内存管理单元结构所占的物理页的结构体
 
     ul mms_max_page = (virt_2_phys(memory_management_struct.end_of_struct) >> PAGE_2M_SHIFT); // 内存管理单元所占据的序号最大的物理页
-    //kdebug("mms_max_page=%ld", mms_max_page);
+    // kdebug("mms_max_page=%ld", mms_max_page);
 
     struct Page *tmp_page = NULL;
     ul page_num;
@@ -191,20 +191,20 @@ void mm_init()
 
     global_CR3 = get_CR3();
     // root_page_table_phys_addr = global_CR3;
-    //kdebug("global_CR3\t:%#018lx", global_CR3);
-    //kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
-    //kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
+    // kdebug("global_CR3\t:%#018lx", global_CR3);
+    // kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
+    // kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
 
-    //kdebug("1.memory_management_struct.bmp:%#018lx\tzone->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
-    //kinfo("Cleaning page table remapping at 0x0000");
+    // kdebug("1.memory_management_struct.bmp:%#018lx\tzone->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+    // kinfo("Cleaning page table remapping at 0x0000");
 
     kinfo("Memory management unit initialize complete!");
 
     flush_tlb();
     // 初始化slab内存池
     slab_init();
-    init_frame_buffer();
     page_table_init();
+    init_frame_buffer();
 }
 
 /**
@@ -497,6 +497,7 @@ void init_frame_buffer()
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), PAGE_KERNEL_PGT));
     }
 
@@ -505,6 +506,7 @@ void init_frame_buffer()
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), PAGE_KERNEL_DIR));
     }
 
@@ -541,6 +543,7 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), PAGE_KERNEL_PGT));
     }
 
@@ -549,6 +552,7 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), PAGE_KERNEL_DIR));
     }
 
@@ -575,20 +579,22 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), PAGE_USER_PGT));
     }
     else
-        kdebug("*tmp != 0!!!    \t tmp = %#018lx\t *tmp = %#018lx",tmp, *tmp);
+        kdebug("*tmp != 0!!!    \t tmp = %#018lx\t *tmp = %#018lx", tmp, *tmp);
 
     tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));
 
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), PAGE_USER_DIR));
     }
     else
-        kdebug("*tmp != 0!!!    \t tmp = %#018lx\t *tmp = %#018lx",tmp, *tmp);
+        kdebug("*tmp != 0!!!    \t tmp = %#018lx\t *tmp = %#018lx", tmp, *tmp);
 
     ul *tmp1;
     // 初始化2M物理页

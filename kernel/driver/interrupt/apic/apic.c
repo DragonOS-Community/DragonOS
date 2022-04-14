@@ -482,17 +482,13 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     else if (number > 0x80)
 
     {
-        //printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
+        // printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
         apic_local_apic_edge_ack(number);
-        if (number == 0xc8) // 来自BSP的HPET中断消息
+        
         {
-            sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies -= 2;
-            ++(current_pcb->virtual_runtime);
-
-            if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
-                current_pcb->flags |= PROC_NEED_SCHED;
-
-            //printk_color(RED, BLACK, "CPU_exec_task_jiffies:%d current_pcb = %#018lx\t current_pcb->thread=%#018lx\n", sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies, (ul)current_pcb, (ul)current_pcb->thread);
+            irq_desc_t * irq = &SMP_IPI_desc[number-200];
+            if(irq->handler!=NULL)
+                irq->handler(number, irq->parameter, rsp);
         }
     }
     else

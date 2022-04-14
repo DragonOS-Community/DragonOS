@@ -65,26 +65,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
             set_softirq_status(TIMER_SIRQ);
 
-        switch (current_pcb->priority)
-        {
-        case 0:
-        case 1:
-            --sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies;
-            ++current_pcb->virtual_runtime;
-            break;
-        case 2:
-        default:
-            sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies -= 2;
-            current_pcb->virtual_runtime += 2;
-            break;
-        }
-
-        /* 由于目前只有BSP处理器会收到HPET中断，因此这里只会标记BSP处理器的进程需要调度
-        if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
-        {
-            current_pcb->flags |= PROC_NEED_SCHED;
-        }
-        */
+        sched_update_jiffies();
 
         break;
 

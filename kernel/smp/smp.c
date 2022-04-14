@@ -7,7 +7,11 @@
 #include "../process/process.h"
 #include "../process/spinlock.h"
 
+#include <sched/sched.h>
+
 #include "ipi.h"
+
+void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs); // 由BSP转发的HPET中断处理函数
 
 static spinlock_t multi_core_starting_lock; // 多核启动锁
 
@@ -37,6 +41,9 @@ void smp_init()
         set_intr_gate(i, 0, SMP_interrupt_table[i - 200]);
 
     memset((void *)SMP_IPI_desc, 0, sizeof(irq_desc_t) * SMP_IRQ_NUM);
+    
+    // 注册接收bsp处理器的hpet中断转发的处理函数
+    ipi_regiserIPI(0xc8, NULL, &ipi_0xc8_handler, NULL, NULL, "IPI 0xc8");
 
     ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, true, 0x00);
 
@@ -130,13 +137,13 @@ void smp_ap_start()
     current_pcb->priority = 2;
     current_pcb->virtual_runtime = 0;
 
-    current_pcb->thread = (struct thread_struct *)(current_pcb + 1);    // 将线程结构体放置在pcb后方
+    current_pcb->thread = (struct thread_struct *)(current_pcb + 1); // 将线程结构体放置在pcb后方
     current_pcb->thread->rbp = _stack_start;
     current_pcb->thread->rsp = _stack_start;
     current_pcb->thread->fs = KERNEL_DS;
     current_pcb->thread->gs = KERNEL_DS;
     current_pcb->cpu_id = current_starting_cpu;
-    
+
     initial_proc[proc_current_cpu_id] = current_pcb;
 
     load_TR(10 + current_starting_cpu * 2);
@@ -145,13 +152,19 @@ void smp_ap_start()
     spin_unlock(&multi_core_starting_lock);
     current_pcb->preempt_count = 0;
     sti();
-    
-    if(proc_current_cpu_id == 1)
+
+    if (proc_current_cpu_id == 1)
         process_init();
-    while(1)
+    while (1)
     {
         printk_color(BLACK, WHITE, "CPU:%d IDLE process.\n", proc_current_cpu_id);
     }
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();
+}
+
+// 由BSP转发的HPET中断处理函数
+void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs)
+{
+    sched_update_jiffies();
 }

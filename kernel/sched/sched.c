@@ -102,6 +102,30 @@ void sched_cfs()
 }
 
 /**
+ * @brief 当时钟中断到达时，更新时间片
+ *
+ */
+void sched_update_jiffies()
+{
+    switch (current_pcb->priority)
+    {
+    case 0:
+    case 1:
+        --sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies;
+        ++current_pcb->virtual_runtime;
+        break;
+    case 2:
+    default:
+        sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies -= 2;
+        current_pcb->virtual_runtime += 2;
+        break;
+    }
+    // 时间片耗尽，标记可调度
+    if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
+        current_pcb->flags |= PROC_NEED_SCHED;
+}
+
+/**
  * @brief 初始化进程调度器
  *
  */

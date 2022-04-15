@@ -153,7 +153,7 @@ void smp_ap_start()
     current_pcb->preempt_count = 0;
     sti();
 
-    if (proc_current_cpu_id == 2)
+    if (proc_current_cpu_id == 1)
         process_init();
     while (1)
     {

@@ -34,7 +34,7 @@ SECTIONS
 	{
 		_data = .;
 		*(.data)
-		
+
 		_edata = .;
 	}
 	rodata_start_pa = .;
@@ -60,4 +60,9 @@ SECTIONS
 	}
 
 	_end = .;
+
+	/DISCARD/ : {
+		*(.eh_frame)
+		
+	}
 }

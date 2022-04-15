@@ -350,5 +350,3 @@ ENTRY(syscall_int)
     jmp Err_Code
 */
 
-ENTRY(_stack_start)
-    .quad initial_proc_union + 32768

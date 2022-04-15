@@ -27,6 +27,7 @@ int printk_init(const int char_size_x, const int char_size_y)
 {
     struct multiboot_tag_framebuffer_info_t info;
     int reserved;
+    
     multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
 
     pos.width = info.framebuffer_width;

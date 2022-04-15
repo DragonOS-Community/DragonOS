@@ -82,12 +82,12 @@ void system_initialize()
 {
 
     // 初始化printk
-
     printk_init(8, 16);
     kinfo("Kernel Starting...");
     // 重新加载gdt和idt
     
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
+    
     _stack_start = head_stack_start;    // 保存init proc的栈基地址（由于之后取消了地址重映射，因此必须在这里重新保存）
     kdebug("_stack_start=%#018lx", _stack_start);
 
@@ -158,7 +158,7 @@ void system_initialize()
 //操作系统内核从这里开始执行
 void Start_Kernel(void)
 {
-
+    
     // 获取multiboot2的信息
     uint64_t mb2_info, mb2_magic;
     __asm__ __volatile__("movq %%r15, %0    \n\t"
@@ -174,8 +174,7 @@ void Start_Kernel(void)
 
     mb2_info &= 0xffffffff;
     mb2_magic &= 0xffffffff;
-
-    multiboot2_magic = mb2_magic;
+    multiboot2_magic = (uint)mb2_magic;
     multiboot2_boot_info_addr = mb2_info + PAGE_OFFSET;
 
     

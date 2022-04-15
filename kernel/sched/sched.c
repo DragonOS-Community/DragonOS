@@ -12,7 +12,7 @@ struct process_control_block *sched_cfs_dequeue()
 {
     if (list_empty(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list))
     {
-        kdebug("list empty");
+        kdebug("list empty, count=%d", sched_cfs_ready_queue[proc_current_cpu_id].count);
         return &initial_proc_union.pcb;
     }
 

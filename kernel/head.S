@@ -202,6 +202,7 @@ multiboot_header_end:
 ENTRY(_start)
     // 关中断
     cli
+    
     // multiboot2_info 结构体指针
     mov %ebx, mb2_info
     //mov %ebx, %e8
@@ -308,7 +309,7 @@ ENTRY(_start64)
     mov %ax, %fs
     mov %ax, %ss
     mov $0x7e00, %esp
-
+    
 // === 加载GDTR ====
     lgdt GDT_POINTER(%rip) //这里我没搞明白rip相对寻址, 看了文档，大概是用来实现PIC的（position independent code）
     //lgdt $GDT_POINTER

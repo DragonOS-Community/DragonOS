@@ -7,7 +7,13 @@ DIR_LIB=lib
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
-CFLAGS := -mcmodel=large -fno-builtin -m64 -g -O0 -I . -fno-stack-protector
+DEBUG=1
+CFLAGS := -mcmodel=large -fno-builtin -m64  -O0 -I . -fno-stack-protector
+
+ifeq ($(DEBUG), 1)
+CFLAGS += -g
+endif
+
 ARCH=x86_64
 # 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
 PIC := _INTR_APIC_

@@ -27,6 +27,7 @@
 #include <driver/timers/rtc/rtc.h>
 #include <driver/timers/HPET/HPET.h>
 #include <driver/timers/timer.h>
+#include <driver/uart/uart.h>
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 ul bsp_idt_size, bsp_gdt_size;
@@ -57,8 +58,8 @@ struct gdtr gdtp;
 struct idtr idtp;
 void reload_gdt()
 {
-    
-    gdtp.size = bsp_gdt_size-1;
+
+    gdtp.size = bsp_gdt_size - 1;
     gdtp.gdt_vaddr = (ul)phys_2_virt((ul)&GDT_Table);
 
     asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp)
@@ -67,11 +68,11 @@ void reload_gdt()
 
 void reload_idt()
 {
-    
-    idtp.size = bsp_idt_size-1;
+
+    idtp.size = bsp_idt_size - 1;
     idtp.idt_vaddr = (ul)phys_2_virt((ul)&IDT_Table);
-    //kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
-    //kdebug("gdt size=%d", p.size);
+    // kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
+    // kdebug("gdt size=%d", p.size);
 
     asm volatile("lidt (%0)   \n\t" ::"r"(&idtp)
                  : "memory");
@@ -83,12 +84,13 @@ void system_initialize()
 
     // 初始化printk
     printk_init(8, 16);
+    uart_init(COM1, 115200);
     kinfo("Kernel Starting...");
     // 重新加载gdt和idt
-    
+
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
-    
-    _stack_start = head_stack_start;    // 保存init proc的栈基地址（由于之后取消了地址重映射，因此必须在这里重新保存）
+
+    _stack_start = head_stack_start; // 保存init proc的栈基地址（由于之后取消了地址重映射，因此必须在这里重新保存）
     kdebug("_stack_start=%#018lx", _stack_start);
 
     load_TR(10); // 加载TR寄存器
@@ -99,8 +101,7 @@ void system_initialize()
     cpu_core_info[0].tss_vaddr = (uint64_t)&initial_tss[0];
     kdebug("cpu_core_info[0].tss_vaddr=%#018lx", cpu_core_info[0].tss_vaddr);
     kdebug("cpu_core_info[0].stack_start%#018lx", cpu_core_info[0].stack_start);
-    
-    
+
     // 初始化中断描述符表
     sys_vector_init();
 
@@ -108,8 +109,8 @@ void system_initialize()
     mm_init();
 
     // =========== 重新设置initial_tss[0]的ist
-    uchar *ptr  = (uchar*)kmalloc(STACK_SIZE, 0)+STACK_SIZE;
-    ((struct process_control_block*)(ptr-STACK_SIZE))->cpu_id = 0;
+    uchar *ptr = (uchar *)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+    ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
 
     initial_tss[0].ist1 = (ul)ptr;
     initial_tss[0].ist2 = (ul)ptr;
@@ -119,7 +120,7 @@ void system_initialize()
     initial_tss[0].ist6 = (ul)ptr;
     initial_tss[0].ist7 = (ul)ptr;
     // ===========================
-    
+
     acpi_init();
 
     // 初始化中断模块
@@ -127,12 +128,12 @@ void system_initialize()
     irq_init();
 
     softirq_init();
-    
+
     // 先初始化系统调用模块
     syscall_init();
     //  再初始化进程模块。顺序不能调转
     sched_init();
-    
+
     timer_init();
 
     smp_init();
@@ -144,21 +145,17 @@ void system_initialize()
     ahci_init();
     // test_slab();
     // test_mm();
-    
 
-    //process_init();
+    // process_init();
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
     HPET_init();
-
-
-    
 }
 
 //操作系统内核从这里开始执行
 void Start_Kernel(void)
 {
-    
+
     // 获取multiboot2的信息
     uint64_t mb2_info, mb2_magic;
     __asm__ __volatile__("movq %%r15, %0    \n\t"
@@ -168,7 +165,7 @@ void Start_Kernel(void)
                          : "=r"(mb2_info), "=r"(mb2_magic), "=r"(bsp_gdt_size), "=r"(bsp_idt_size)::"memory");
     reload_gdt();
     reload_idt();
-    
+
     // 重新设置TSS描述符
     set_tss_descriptor(10, (void *)(&initial_tss[0]));
 
@@ -177,7 +174,6 @@ void Start_Kernel(void)
     multiboot2_magic = (uint)mb2_magic;
     multiboot2_boot_info_addr = mb2_info + PAGE_OFFSET;
 
-    
     system_initialize();
 
     /*

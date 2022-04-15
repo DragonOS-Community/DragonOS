@@ -125,6 +125,11 @@ HPET.o: driver/timers/HPET/HPET.c
 timer.o: driver/timers/timer.c
 	gcc $(CFLAGS) -c driver/timers/timer.c -o driver/timers/timer.o
 
+OBJ_LIST += uart.o
+LD_LIST += driver/uart/uart.o
+uart.o: driver/uart/uart.c
+	gcc $(CFLAGS) -c driver/uart/uart.c -o driver/uart/uart.o
+
 
 
 all: kernel

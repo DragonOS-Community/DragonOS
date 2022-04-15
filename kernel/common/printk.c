@@ -7,6 +7,8 @@
 #include "../mm/mm.h"
 #include "../process/spinlock.h"
 
+#include <driver/uart/uart.h>
+
 //#include "linkage.h"
 
 struct screen_info pos;
@@ -110,13 +112,16 @@ void auto_newline()
      * @brief 超过每行最大字符数，自动换行
      *
      */
+     
     if (pos.x > pos.max_x)
     {
+        uart_send(COM1, '\n'); 
         pos.x = 0;
         ++pos.y;
     }
     if (pos.y > pos.max_y)
     {
+        uart_send(COM1, '\n');
         pos.y = pos.max_y;
         int lines_to_scroll = 1;
         scroll(true, lines_to_scroll * pos.char_size_y, false);
@@ -625,6 +630,8 @@ static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, uns
      * @param BKcolor 背景颜色
      * @param font 字符的bitmap
      */
+    // 输出到串口
+    uart_send(COM1, font);
 
     unsigned char *font_ptr = font_ascii[font];
     unsigned int *addr;

@@ -17,6 +17,7 @@
                                        : "memory") //关闭外部中断
 #define nop() __asm__ __volatile__("nop\n\t")
 #define hlt() __asm__ __volatile__("hlt\n\t")
+#define pause() asm volatile ("pause\n\t"); // 处理器等待一段时间
 
 //内存屏障
 #define io_mfence() __asm__ __volatile__("mfence\n\t" :: \

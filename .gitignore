@@ -6,3 +6,4 @@ kernel/kernel
 
 *.o
 *.s
+serial_opt.txt

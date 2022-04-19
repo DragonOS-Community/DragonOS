@@ -153,8 +153,13 @@ void smp_ap_start()
     current_pcb->preempt_count = 0;
     sti();
 
+    while(1)
+        hlt();
+
+/*
     if (proc_current_cpu_id == 1)
         process_init();
+        */
     while (1)
     {
         printk_color(BLACK, WHITE, "CPU:%d IDLE process.\n", proc_current_cpu_id);

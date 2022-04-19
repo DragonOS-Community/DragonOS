@@ -12,7 +12,7 @@ void do_divide_error(struct pt_regs *regs, unsigned long error_code)
     kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 1 #DB 调试异常
@@ -23,7 +23,7 @@ void do_debug(struct pt_regs *regs, unsigned long error_code)
     printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 2 不可屏蔽中断
@@ -35,7 +35,7 @@ void do_nmi(struct pt_regs *regs, unsigned long error_code)
     printk(" ] do_nmi(2),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 3 #BP 断点异常
@@ -47,7 +47,7 @@ void do_int3(struct pt_regs *regs, unsigned long error_code)
     printk(" ] do_int3(3),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 4 #OF 溢出异常
@@ -59,7 +59,7 @@ void do_overflow(struct pt_regs *regs, unsigned long error_code)
     printk(" ] do_overflow(4),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 5 #BR 越界异常
@@ -69,7 +69,7 @@ void do_bounds(struct pt_regs *regs, unsigned long error_code)
     kerror("do_bounds(5),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 6 #UD 无效/未定义的机器码
@@ -79,7 +79,7 @@ void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
     kerror("do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 7 #NM 设备异常（FPU不存在）
@@ -89,7 +89,7 @@ void do_dev_not_avaliable(struct pt_regs *regs, unsigned long error_code)
     kerror("do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 8 #DF 双重错误
@@ -101,7 +101,7 @@ void do_double_fault(struct pt_regs *regs, unsigned long error_code)
     printk(" ] do_double_fault(8),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 9 协处理器越界（保留）
@@ -111,7 +111,7 @@ void do_coprocessor_segment_overrun(struct pt_regs *regs, unsigned long error_co
     kerror("do_coprocessor_segment_overrun(9),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 10 #TS 无效的TSS段
@@ -142,7 +142,7 @@ void do_invalid_TSS(struct pt_regs *regs, unsigned long error_code)
     printk("\n");
 
     while (1)
-        ;
+        hlt();
 }
 
 // 11 #NP 段不存在
@@ -152,7 +152,7 @@ void do_segment_not_exists(struct pt_regs *regs, unsigned long error_code)
     kerror("do_segment_not_exists(11),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 12 #SS SS段错误
@@ -162,7 +162,7 @@ void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
     kerror("do_stack_segment_fault(12),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 13 #GP 通用保护性异常
@@ -187,7 +187,7 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 
     printk_color(RED, BLACK, "Segment Selector Index:%#010x\n", error_code & 0xfff8);
     while (1)
-        ;
+        hlt();
 }
 
 // 14 #PF 页故障
@@ -224,7 +224,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	printk_color(RED,BLACK,"CR2:%#018lx\n",cr2);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 15 Intel保留，请勿使用
@@ -236,7 +236,7 @@ void do_x87_FPU_error(struct pt_regs *regs, unsigned long error_code)
     kerror("do_x87_FPU_error(16),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 17 #AC 对齐检测
@@ -246,7 +246,7 @@ void do_alignment_check(struct pt_regs *regs, unsigned long error_code)
     kerror("do_alignment_check(17),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 18 #MC 机器检测
@@ -256,7 +256,7 @@ void do_machine_check(struct pt_regs *regs, unsigned long error_code)
     kerror("do_machine_check(18),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 19 #XM SIMD浮点异常
@@ -266,7 +266,7 @@ void do_SIMD_exception(struct pt_regs *regs, unsigned long error_code)
     kerror("do_SIMD_exception(19),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 20 #VE 虚拟化异常
@@ -276,7 +276,7 @@ void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
     kerror("do_virtualization_exception(20),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
 
     while (1)
-        ;
+        hlt();
 }
 
 // 21-21 Intel保留，请勿使用

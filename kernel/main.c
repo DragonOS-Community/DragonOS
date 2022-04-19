@@ -151,7 +151,9 @@ void system_initialize()
     // process_init();
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
+    process_init();
     HPET_init();
+
 }
 
 //操作系统内核从这里开始执行
@@ -178,7 +180,7 @@ void Start_Kernel(void)
 
     system_initialize();
 
-    /*
+    
     uint64_t buf[100];
     ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
     kdebug("buf[0]=%#010lx",(uint32_t)buf[0]);
@@ -187,7 +189,7 @@ void Start_Kernel(void)
 
     ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
     kdebug("buf[0]=%#010lx",(uint32_t)buf[0]);
-    */
+    
     // show_welcome();
     // test_mm();
 
@@ -216,7 +218,7 @@ void Start_Kernel(void)
 
     // ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8, ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);  // 测试ipi
 
-    int last_sec = rtc_now.second;
+    //int last_sec = rtc_now.second;
     /*
     while (1)
     {

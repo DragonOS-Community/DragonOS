@@ -50,11 +50,11 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
  */
 void sched_cfs()
 {
-    
+
     current_pcb->flags &= ~PROC_NEED_SCHED;
     struct process_control_block *proc = sched_cfs_dequeue();
 
-    if (current_pcb->virtual_runtime >= proc->virtual_runtime) // 当前进程运行时间大于了下一进程的运行时间，进行切换
+    if (current_pcb->virtual_runtime >= proc->virtual_runtime || current_pcb->state != PROC_RUNNING) // 当前进程运行时间大于了下一进程的运行时间，进行切换
     {
 
         if (current_pcb->state = PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
@@ -107,8 +107,8 @@ void sched_cfs()
  */
 void sched_update_jiffies()
 {
-    if(current_pcb->cpu_id == 0)
-        return;
+    //if (current_pcb->cpu_id == 0)
+    //    return;
     switch (current_pcb->priority)
     {
     case 0:

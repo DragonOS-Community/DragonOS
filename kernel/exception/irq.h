@@ -80,6 +80,7 @@ extern void (*syscall_intr_table[1])(void);
 	
 	
 0x80		system call
+0x81		system interrupt 系统中断
 
 150 ~   200	Local APIC
 	150	CMCI

@@ -2,6 +2,7 @@
 #include "../process/process.h"
 #include <exception/gate.h>
 #include <exception/irq.h>
+#include<driver/disk/ahci/ahci.h>
 
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
@@ -82,6 +83,12 @@ ul sys_printf(struct pt_regs *regs)
      else printk_color(regs->r9, regs->r10, (char*)regs->r8);
     // printk_color(BLACK, WHITE, (char *)regs->r8);
 
+    return 0;
+}
+
+ul sys_ahci_end_req(struct pt_regs *regs)
+{
+    ahci_end_request();
     return 0;
 }
 

@@ -5,7 +5,7 @@
 #include "../process/ptrace.h"
 
 // 定义最大系统调用数量
-#define MAX_SYSTEM_CALL_NUM 128
+#define MAX_SYSTEM_CALL_NUM 256
 
 #define ESYSCALL_NOT_EXISTS 1
 
@@ -53,6 +53,8 @@ ul system_call_not_exists(struct pt_regs *regs)
  */
 ul sys_printf(struct pt_regs *regs);
 
+ul sys_ahci_end_req(struct pt_regs *regs);
+
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code);
 
@@ -60,4 +62,5 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
     {
         [0] = system_call_not_exists,
         [1] = sys_printf,
-        [2 ... MAX_SYSTEM_CALL_NUM - 1] = system_call_not_exists};
+        [2 ... 254] = system_call_not_exists,
+        [255] = sys_ahci_end_req};

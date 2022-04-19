@@ -2,7 +2,9 @@
 
 #include "../../common/glib.h"
 #include "stdint.h"
+#include <process/semaphore.h>
 
+#define BLK_TYPE_AHCI 0
 struct block_device_operation
 {
     long (*open)();
@@ -22,11 +24,10 @@ struct block_device_request_packet
     uint32_t count;
     uint64_t buffer_vaddr;
 
-    uint8_t ahci_ctrl_num;  // ahci控制器号， 默认应为0
-    uint8_t port_num;   // ahci的设备端口号
+    uint8_t device_type;    // 0: ahci
     void (*end_handler)(ul num, ul arg);
 
-    struct List list;
+   wait_queue_node_t wait_queue;
 };
 
 /**
@@ -35,7 +36,7 @@ struct block_device_request_packet
  */
 struct block_device_request_queue
 {
-    struct List queue_list;
+    wait_queue_node_t wait_queue_list;
     struct block_device_request_packet * in_service;    // 正在请求的结点
     ul request_count;
 };

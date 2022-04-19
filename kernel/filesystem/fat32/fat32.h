@@ -1,0 +1,77 @@
+/**
+ * @file fat32.h
+ * @author fslongjin (longjin@RinGoTek.cn)
+ * @brief fat32文件系统
+ * @version 0.1
+ * @date 2022-04-19
+ *
+ * @copyright Copyright (c) 2022
+ *
+ */
+
+#pragma once
+
+#include <filesystem/MBR.h>
+
+/**
+ * @brief fat32文件系统引导扇区结构体
+ *
+ */
+struct fat32_BootSector_t
+{
+    uint8_t BS_jmpBoot[3];    // 跳转指令
+    uint8_t BS_OEMName[8];    // 生产厂商名
+    uint16_t BPB_BytesPerSec; // 每扇区字节数
+    uint8_t BPB_SecPerClus;   // 每簇扇区数
+    uint16_t BPB_RsvdSecCnt;  // 保留扇区数
+    uint8_t BPB_NumFATs;      // FAT表数量
+    uint16_t BPB_RootEntCnt;  // 根目录文件数最大值
+    uint16_t BPB_TotSec16;    // 16位扇区总数
+    uint8_t BPB_Media;        // 介质描述符
+    uint16_t BPB_FATSz16;     // FAT12/16每FAT扇区数
+    uint16_t BPB_SecPerTrk;   // 每磁道扇区数
+    uint16_t BPB_NumHeads;    // 磁头数
+    uint32_t BPB_HiddSec;     // 隐藏扇区数
+    uint32_t BPB_TotSec32;    // 32位扇区总数
+
+    uint32_t BPB_FATSz32;   // FAT32每FAT扇区数
+    uint16_t BPB_ExtFlags;  // 扩展标志
+    uint16_t BPB_FSVer;     // 文件系统版本号
+    uint32_t BPB_RootClus;  // 根目录起始簇号
+    uint16_t BPB_FSInfo;    // FS info结构体的扇区号
+    uint16_t BPB_BkBootSec; // 引导扇区的备份扇区号
+    uint8_t BPB_Reserved0[12];
+
+    uint8_t BS_DrvNum; // int0x13的驱动器号
+    uint8_t BS_Reserved1;
+    uint8_t BS_BootSig;       // 扩展引导标记
+    uint32_t BS_VolID;        // 卷序列号
+    uint8_t BS_VolLab[11];    // 卷标
+    uint8_t BS_FilSysType[8]; // 文件系统类型
+
+    uint8_t BootCode[420]; // 引导代码、数据
+
+    uint16_t BS_TrailSig; // 结束标志0xAA55
+} __attribute__((packed));
+
+/**
+ * @brief fat32文件系统的FSInfo扇区结构体
+ * 
+ */
+struct fat32_FSInfo_t
+{
+    uint32_t FSI_LeadSig;         // FS info扇区标志符 数值为0x41615252
+    uint8_t FSI_Reserved1[480]; // 保留使用，全部置为0
+    uint32_t FSI_StrucSig;        // 另一个标志符，数值为0x61417272
+    uint32_t FSI_Free_Count;      // 上一次记录的空闲簇数量，这是一个参考值
+    uint32_t FSI_Nxt_Free;        // 空闲簇的起始搜索位置，这是为驱动程序提供的参考值
+    uint8_t FSI_Reserved2[12];  // 保留使用，全部置为0
+    uint32_t FSI_TrailSig;        // 结束标志，数值为0xaa550000
+} __attribute__((packed));
+
+/**
+ * @brief 读取指定磁盘上的第0个分区的fat32文件系统
+ * 
+ * @param disk_num 
+ */
+void fat32_FS_init(int disk_num);

@@ -84,23 +84,20 @@ void user_level_function()
                          : "0"(1), "D"(string)
                          : "memory");
                          */
+    long err_code;
+    ul addr = (ul)string;
+    __asm__ __volatile__(
+        "movq %2, %%r8 \n\t"
+        "int $0x80   \n\t"
+        : "=a"(err_code)
+        : "a"(SYS_PRINTF), "m"(addr)
+        : "memory", "r8");
 
-    for (int i = 0;; ++i)
-    {
-        long err_code;
-        ul addr = (ul)string;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_PRINTF), "m"(addr)
-            : "memory", "r8");
-    }
     // enter_syscall_int(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
     //  kinfo("Return from syscall id 15...");
 
     while (1)
-        ;
+        pause();
 }
 /**
  * @brief 使当前进程去执行新的代码

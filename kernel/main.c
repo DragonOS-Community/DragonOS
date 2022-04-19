@@ -17,6 +17,8 @@
 #include <smp/ipi.h>
 #include <sched/sched.h>
 
+#include <filesystem/fat32/fat32.h>
+
 #include "driver/multiboot2/multiboot2.h"
 #include "driver/acpi/acpi.h"
 #include "driver/keyboard/ps2_keyboard.h"
@@ -181,14 +183,9 @@ void Start_Kernel(void)
     system_initialize();
 
     
-    uint64_t buf[100];
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
-    kdebug("buf[0]=%#010lx",(uint32_t)buf[0]);
-    buf[0] = 0xffd3;
-    ahci_operation.transfer(ATA_CMD_WRITE_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
+    fat32_FS_init(0);
 
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, 0, 0);
-    kdebug("buf[0]=%#010lx",(uint32_t)buf[0]);
+
     
     // show_welcome();
     // test_mm();

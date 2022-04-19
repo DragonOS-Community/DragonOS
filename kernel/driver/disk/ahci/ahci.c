@@ -279,7 +279,6 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
         return E_PORT_HUNG;
     }
 
-    kdebug("slot=%d", slot);
     port->ci = 1 << slot; // Issue command
 
     sched_cfs();

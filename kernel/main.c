@@ -147,6 +147,7 @@ void system_initialize()
     // ata_init();
     pci_init();
     ahci_init();
+    fat32_init();
     // test_slab();
     // test_mm();
 
@@ -155,7 +156,6 @@ void system_initialize()
     current_pcb->preempt_count = 0;
     process_init();
     HPET_init();
-
 }
 
 //操作系统内核从这里开始执行
@@ -182,11 +182,19 @@ void Start_Kernel(void)
 
     system_initialize();
 
+    int part_id = fat32_register_partition(0, 0, 0);
+    struct fat32_Directory_t *dentry = fat32_path_walk(part_id, "a.txt", 0);
+    if (dentry != NULL)
+        printk_color(BLUE, BLACK, "Find a.txt\nDIR_FstClusHI:%#018lx\tDIR_FstClusLO:%#018lx\tDIR_FileSize:%#018lx\n", dentry->DIR_FstClusHI, dentry->DIR_FstClusLO, dentry->DIR_FileSize);
+    else
+        printk_color(BLUE, BLACK, "Can`t find file\n");
     
-    fat32_FS_init(0);
+    dentry = fat32_path_walk(part_id, "xx/12.png", 0);
+    if (dentry != NULL)
+        printk_color(BLUE, BLACK, "Find xx/12.png\nDIR_FstClusHI:%#018lx\tDIR_FstClusLO:%#018lx\tDIR_FileSize:%#018lx\n", dentry->DIR_FstClusHI, dentry->DIR_FstClusLO, dentry->DIR_FileSize);
+    else
+        printk_color(BLUE, BLACK, "Can`t find file\n");
 
-
-    
     // show_welcome();
     // test_mm();
 
@@ -215,7 +223,7 @@ void Start_Kernel(void)
 
     // ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8, ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);  // 测试ipi
 
-    //int last_sec = rtc_now.second;
+    // int last_sec = rtc_now.second;
     /*
     while (1)
     {

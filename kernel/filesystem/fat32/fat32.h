@@ -13,6 +13,8 @@
 
 #include <filesystem/MBR.h>
 
+#define FAT32_MAX_PARTITION_NUM 128 // 系统支持的最大的fat32分区数量
+
 /**
  * @brief fat32文件系统引导扇区结构体
  *
@@ -56,22 +58,101 @@ struct fat32_BootSector_t
 
 /**
  * @brief fat32文件系统的FSInfo扇区结构体
- * 
+ *
  */
 struct fat32_FSInfo_t
 {
-    uint32_t FSI_LeadSig;         // FS info扇区标志符 数值为0x41615252
+    uint32_t FSI_LeadSig;       // FS info扇区标志符 数值为0x41615252
     uint8_t FSI_Reserved1[480]; // 保留使用，全部置为0
-    uint32_t FSI_StrucSig;        // 另一个标志符，数值为0x61417272
-    uint32_t FSI_Free_Count;      // 上一次记录的空闲簇数量，这是一个参考值
-    uint32_t FSI_Nxt_Free;        // 空闲簇的起始搜索位置，这是为驱动程序提供的参考值
+    uint32_t FSI_StrucSig;      // 另一个标志符，数值为0x61417272
+    uint32_t FSI_Free_Count;    // 上一次记录的空闲簇数量，这是一个参考值
+    uint32_t FSI_Nxt_Free;      // 空闲簇的起始搜索位置，这是为驱动程序提供的参考值
     uint8_t FSI_Reserved2[12];  // 保留使用，全部置为0
-    uint32_t FSI_TrailSig;        // 结束标志，数值为0xaa550000
+    uint32_t FSI_TrailSig;      // 结束标志，数值为0xaa550000
 } __attribute__((packed));
 
+#define ATTR_READ_ONLY (1 << 0)
+#define ATTR_HIDDEN (1 << 1)
+#define ATTR_SYSTEM (1 << 2)
+#define ATTR_VOLUME_ID (1 << 3)
+#define ATTR_DIRECTORY (1 << 4)
+#define ATTR_ARCHIVE (1 << 5)
+#define ATTR_LONG_NAME (ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID)
+
 /**
- * @brief 读取指定磁盘上的第0个分区的fat32文件系统
- * 
- * @param disk_num 
+ * @brief fat32文件系统短目录项,大小为32bytes
+ *
  */
-void fat32_FS_init(int disk_num);
+struct fat32_Directory_t
+{
+    unsigned char DIR_Name[11];
+    unsigned char DIR_Attr;         // 文件属性
+    unsigned char DIR_NTRes;        // EXT|BASE => 8(BASE).3(EXT)
+                                    // BASE:LowerCase(8),UpperCase(0)
+                                    // EXT:LowerCase(16),UpperCase(0)
+    unsigned char DIR_CrtTimeTenth; // 文件创建的毫秒级时间戳
+    unsigned short DIR_CrtTime;     // 文件创建时间
+    unsigned short DIR_CrtDate;     // 文件创建日期
+    unsigned short DIR_LastAccDate; // 文件的最后访问日期
+    unsigned short DIR_FstClusHI;   // 起始簇号（高16bit）
+    unsigned short DIR_WrtTime;     // 最后写入时间
+    unsigned short DIR_WrtDate;     // 最后写入日期
+    unsigned short DIR_FstClusLO;   // 起始簇号（低16bit）
+    unsigned int DIR_FileSize;      // 文件大小
+} __attribute__((packed));
+
+#define LOWERCASE_BASE (8)
+#define LOWERCASE_EXT (16)
+
+/**
+ * @brief fat32文件系统长目录项,大小为32bytes
+ *
+ */
+struct fat32_LongDirectory_t
+{
+    unsigned char LDIR_Ord;        // 长目录项的序号
+    unsigned short LDIR_Name1[5];  // 长文件名的第1-5个字符，每个字符占2bytes
+    unsigned char LDIR_Attr;       // 目录项属性必须为ATTR_LONG_NAME
+    unsigned char LDIR_Type;       // 如果为0，则说明这是长目录项的子项
+    unsigned char LDIR_Chksum;     // 短文件名的校验和
+    unsigned short LDIR_Name2[6];  // 长文件名的第6-11个字符，每个字符占2bytes
+    unsigned short LDIR_FstClusLO; // 必须为0
+    unsigned short LDIR_Name3[2];  // 长文件名的12-13个字符，每个字符占2bytes
+} __attribute__((packed));
+
+struct fat32_partition_info_t
+{
+    uint16_t partition_id; // 全局fat32分区id
+    uint8_t ahci_ctrl_num;
+    uint8_t ahci_port_num;
+    uint8_t part_num; // 硬盘中的分区号
+
+    struct fat32_BootSector_t bootsector;
+    struct fat32_FSInfo_t fsinfo;
+
+    uint64_t first_data_sector; // 数据区起始扇区号
+    uint64_t bytes_per_clus;    // 每簇字节数
+    uint64_t FAT1_base_sector;  // FAT1表的起始簇号
+    uint64_t FAT2_base_sector;  // FAT2表的起始簇号
+};
+
+/**
+ * @brief 注册指定磁盘上的指定分区的fat32文件系统
+ *
+ * @param ahci_ctrl_num ahci控制器编号
+ * @param ahci_port_num ahci控制器端口编号
+ * @param part_num 磁盘分区编号
+ */
+int fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t ahci_port_num, uint8_t part_num);
+
+/**
+ * @brief 按照路径查找文件
+ *
+ * @param part_id fat32分区id
+ * @param path
+ * @param flags
+ * @return struct fat32_Directory_t*
+ */
+struct fat32_Directory_t *fat32_path_walk(uint32_t part_id, char *path, uint64_t flags);
+
+void fat32_init();

@@ -52,7 +52,7 @@ grub==2.06
 
 - [x] 第一个进程
 
-- [ ] 进程管理
+- [x] 进程管理
 
 - [ ] IPC进程间通信
 
@@ -103,6 +103,7 @@ fslongjin
 ## 赞赏者列表
 
 - 悟
+- [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 
 ## 开放源代码声明
 

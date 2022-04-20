@@ -52,7 +52,7 @@ grub==2.06
 
 - [x] First process
 
-- [ ] Process management
+- [x] Process management
 
 - [ ] IPC
 
@@ -103,6 +103,7 @@ If you like, click the link below and buy me a cup of coffee ~ please leave your
 ## Sponsors
 
 - 悟
+- [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 
 ## Open source statement
 

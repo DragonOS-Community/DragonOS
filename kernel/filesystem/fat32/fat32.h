@@ -129,12 +129,38 @@ struct fat32_partition_info_t
 
     struct fat32_BootSector_t bootsector;
     struct fat32_FSInfo_t fsinfo;
+    uint64_t fsinfo_sector_addr_infat;
+    uint64_t bootsector_bak_sector_addr_infat;
+
+    uint64_t starting_sector;
+    uint64_t sector_count;
+
+    uint64_t sec_per_clus;   // 每簇扇区数
+    uint64_t bytes_per_sec;  // 每扇区字节数
+    uint64_t bytes_per_clus; // 每簇字节数
 
     uint64_t first_data_sector; // 数据区起始扇区号
-    uint64_t bytes_per_clus;    // 每簇字节数
     uint64_t FAT1_base_sector;  // FAT1表的起始簇号
     uint64_t FAT2_base_sector;  // FAT2表的起始簇号
+    uint64_t sec_per_FAT;       // 每FAT表扇区数
+    uint64_t NumFATs;           // FAT表数
 };
+
+typedef struct fat32_partition_info_t fat32_sb_info_t;
+
+struct fat32_inode_info_t
+{
+    uint64_t first_clus;
+    uint64_t dEntry_location_clus;        // dEntry struct in cluster (0 is root, 1 is invalid)
+    uint64_t dEntry_location_clus_offset; // dEntry struct offset in cluster
+
+    uint16_t create_date;
+    uint16_t create_time;
+    uint16_t write_time;
+    uint16_t write_date;
+};
+
+typedef struct fat32_inode_info_t fat32_inode_info_t;
 
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统

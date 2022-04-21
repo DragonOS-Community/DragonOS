@@ -88,6 +88,9 @@ fat32.o: filesystem/fat32/fat32.c
 MBR.o: filesystem/MBR.c
 	gcc $(CFLAGS) -c filesystem/MBR.c -o filesystem/MBR.o
 
+VFS.o: filesystem/VFS/VFS.c
+	gcc $(CFLAGS) -c filesystem/VFS/VFS.c -o filesystem/VFS/VFS.o
+
 # IPI的代码
 ifeq ($(ARCH), x86_64)
 OBJ_LIST += ipi.o
@@ -148,9 +151,9 @@ all: kernel
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
 #
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o $(OBJ_LIST)
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
-	common/cpu.o smp/smp.o smp/apu_boot.o exception/softirq.o sched/sched.o	filesystem/fat32/fat32.o filesystem/MBR.o \
+	common/cpu.o smp/smp.o smp/apu_boot.o exception/softirq.o sched/sched.o	filesystem/fat32/fat32.o filesystem/MBR.o filesystem/VFS/VFS.o \
 	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o driver/timers/rtc/rtc.o driver/timers/HPET/HPET.o driver/timers/timer.o \
 	$(LD_LIST)	\
 	-T link.lds

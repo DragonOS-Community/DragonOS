@@ -17,7 +17,7 @@
                                        : "memory") //关闭外部中断
 #define nop() __asm__ __volatile__("nop\n\t")
 #define hlt() __asm__ __volatile__("hlt\n\t")
-#define pause() asm volatile ("pause\n\t"); // 处理器等待一段时间
+#define pause() asm volatile("pause\n\t"); // 处理器等待一段时间
 
 //内存屏障
 #define io_mfence() __asm__ __volatile__("mfence\n\t" :: \
@@ -123,7 +123,7 @@ static inline void list_del(struct List *entry)
      */
 
     entry->next->prev = entry->prev;
-	entry->prev->next = entry->next;
+    entry->prev->next = entry->next;
 }
 
 static inline bool list_empty(struct List *entry)
@@ -133,7 +133,7 @@ static inline bool list_empty(struct List *entry)
      * @param entry 入口
      */
 
-    if(entry == entry->next && entry->prev == entry)
+    if (entry == entry->next && entry->prev == entry)
         return true;
     else
         return false;
@@ -210,7 +210,7 @@ void *memset(void *dst, unsigned char C, ul size)
  * @param Num 字节数
  * @return void*
  */
-void *memcpy(void *dst, void *src, long Num)
+static inline void *memcpy(void *dst, void *src, long Num)
 {
     int d0, d1, d2;
     __asm__ __volatile__("cld	\n\t"
@@ -233,34 +233,33 @@ void *memcpy(void *dst, void *src, long Num)
 }
 
 /*
-		比较字符串 FirstPart and SecondPart
-		FirstPart = SecondPart =>  0
-		FirstPart > SecondPart =>  1
-		FirstPart < SecondPart => -1
+        比较字符串 FirstPart and SecondPart
+        FirstPart = SecondPart =>  0
+        FirstPart > SecondPart =>  1
+        FirstPart < SecondPart => -1
 */
 
-int strcmp(char * FirstPart,char * SecondPart)
+int strcmp(char *FirstPart, char *SecondPart)
 {
-	register int __res;
-	__asm__	__volatile__	(	"cld	\n\t"
-					"1:	\n\t"
-					"lodsb	\n\t"
-					"scasb	\n\t"
-					"jne	2f	\n\t"
-					"testb	%%al,	%%al	\n\t"
-					"jne	1b	\n\t"
-					"xorl	%%eax,	%%eax	\n\t"
-					"jmp	3f	\n\t"
-					"2:	\n\t"
-					"movl	$1,	%%eax	\n\t"
-					"jl	3f	\n\t"
-					"negl	%%eax	\n\t"
-					"3:	\n\t"
-					:"=a"(__res)
-					:"D"(FirstPart),"S"(SecondPart)
-					:					
-				);
-	return __res;
+    register int __res;
+    __asm__ __volatile__("cld	\n\t"
+                         "1:	\n\t"
+                         "lodsb	\n\t"
+                         "scasb	\n\t"
+                         "jne	2f	\n\t"
+                         "testb	%%al,	%%al	\n\t"
+                         "jne	1b	\n\t"
+                         "xorl	%%eax,	%%eax	\n\t"
+                         "jmp	3f	\n\t"
+                         "2:	\n\t"
+                         "movl	$1,	%%eax	\n\t"
+                         "jl	3f	\n\t"
+                         "negl	%%eax	\n\t"
+                         "3:	\n\t"
+                         : "=a"(__res)
+                         : "D"(FirstPart), "S"(SecondPart)
+                         :);
+    return __res;
 }
 
 void *memset_c(void *dst, unsigned char c, ul n)
@@ -317,17 +316,19 @@ void io_out32(unsigned short port, unsigned int value)
 
 /**
  * @brief 从端口读入n个word到buffer
- * 
+ *
  */
-#define io_insw(port,buffer,nr)	\
-__asm__ __volatile__("cld;rep;insw;mfence;"::"d"(port),"D"(buffer),"c"(nr):"memory")
+#define io_insw(port, buffer, nr)                                                 \
+    __asm__ __volatile__("cld;rep;insw;mfence;" ::"d"(port), "D"(buffer), "c"(nr) \
+                         : "memory")
 
 /**
  * @brief 从输出buffer中的n个word到端口
- * 
+ *
  */
-#define io_outsw(port,buffer,nr)	\
-__asm__ __volatile__("cld;rep;outsw;mfence;"::"d"(port),"S"(buffer),"c"(nr):"memory")
+#define io_outsw(port, buffer, nr)                                                 \
+    __asm__ __volatile__("cld;rep;outsw;mfence;" ::"d"(port), "S"(buffer), "c"(nr) \
+                         : "memory")
 
 /**
  * @brief 读取rsp寄存器的值（存储了页目录的基地址）
@@ -427,13 +428,84 @@ ul rdmsr(ul address)
     return ((ul)tmp0 << 32) | tmp1;
 }
 
-
 uint64_t get_rflags()
 {
-	unsigned long tmp = 0;
-	__asm__ __volatile__	("pushfq	\n\t"
-				 "movq	(%%rsp), %0	\n\t"
-				 "popfq	\n\t"
-				:"=r"(tmp)::"memory");
-	return tmp;
+    unsigned long tmp = 0;
+    __asm__ __volatile__("pushfq	\n\t"
+                         "movq	(%%rsp), %0	\n\t"
+                         "popfq	\n\t"
+                         : "=r"(tmp)::"memory");
+    return tmp;
+}
+
+/**
+ * @brief 验证地址空间是否为用户地址空间
+ *
+ * @param addr_start 地址起始值
+ * @param length 地址长度
+ * @return true
+ * @return false
+ */
+bool verify_area(uint64_t addr_start, uint64_t length)
+{
+    if ((addr_start + length) <= 0x00007fffffffffffUL) // 用户程序可用的的地址空间应<= 0x00007fffffffffffUL
+        return true;
+    else
+        return false;
+}
+
+/**
+ * @brief 从用户空间搬运数据到内核空间
+ * 
+ * @param dst 目的地址
+ * @param src 源地址
+ * @param size 搬运的大小
+ * @return uint64_t 
+ */
+static inline uint64_t copy_from_user(void *dst, void *src, uint64_t size)
+{
+    uint64_t tmp0, tmp1;
+    if (!verify_area((uint64_t)src, size))
+        return 0;
+
+    /**
+     * @brief 先每次搬运8 bytes，剩余就直接一个个byte搬运
+     * 
+     */
+    asm volatile("rep   \n\t"
+                 "movsq  \n\t"
+                 "movq %3, %0   \n\t"
+                 "rep   \n\t"
+                 "movsb \n\t"
+                 : "=&c"(size), "=&D"(tmp0), "=&S"(tmp1)
+                 : "r"(size & 7), "0"(size >> 3), "1"(dst), "2"(src));
+    return size;
+}
+
+/**
+ * @brief 从内核空间搬运数据到用户空间
+ * 
+ * @param dst 目的地址
+ * @param src 源地址
+ * @param size 搬运的大小
+ * @return uint64_t 
+ */
+static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
+{
+    uint64_t tmp0, tmp1;
+    if (verify_area((uint64_t)src, size))
+        return 0;
+
+    /**
+     * @brief 先每次搬运8 bytes，剩余就直接一个个byte搬运
+     * 
+     */
+    asm volatile("rep   \n\t"
+                 "movsq  \n\t"
+                 "movq %3, %0   \n\t"
+                 "rep   \n\t"
+                 "movsb \n\t"
+                 : "=&c"(size), "=&D"(tmp0), "=&S"(tmp1)
+                 : "r"(size & 7), "0"(size >> 3), "1"(dst), "2"(src));
+    return size;
 }

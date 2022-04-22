@@ -477,6 +477,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
 
     else if (number == 0x80) // 系统调用
     {
+        // ps: 当前已经将系统调用直接使用系统调用门实现，不走这里。。
         do_syscall_int(rsp, 0);
     }
     else if (number > 0x80)

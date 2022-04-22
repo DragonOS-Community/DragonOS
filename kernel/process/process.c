@@ -84,15 +84,25 @@ void user_level_function()
                          : "0"(1), "D"(string)
                          : "memory");
                          */
-    long err_code;
+    long err_code=1;
     ul addr = (ul)string;
     __asm__ __volatile__(
         "movq %2, %%r8 \n\t"
         "int $0x80   \n\t"
         : "=a"(err_code)
-        : "a"(SYS_PRINTF), "m"(addr)
+        : "a"(SYS_PUT_STRING), "m"(addr)
         : "memory", "r8");
-
+    if(err_code ==0)
+    {
+        char str[] ="errno is 0";
+        addr = (ul)str;
+         __asm__ __volatile__(
+        "movq %2, %%r8 \n\t"
+        "int $0x80   \n\t"
+        : "=a"(err_code)
+        : "a"(SYS_PUT_STRING), "m"(addr)
+        : "memory", "r8");
+    }
     // enter_syscall_int(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
     //  kinfo("Return from syscall id 15...");
 

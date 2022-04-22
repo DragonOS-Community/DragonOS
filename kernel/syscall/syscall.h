@@ -3,7 +3,7 @@
 #include "../common/glib.h"
 #include "../common/kprint.h"
 #include "../process/ptrace.h"
-
+#include <common/unistd.h>
 // 定义最大系统调用数量
 #define MAX_SYSTEM_CALL_NUM 256
 
@@ -12,6 +12,8 @@
 typedef unsigned long (*system_call_t)(struct pt_regs *regs);
 
 extern void ret_from_system_call(void); // 导出从系统调用返回的函数（定义在entry.S）
+
+extern system_call_t system_call_table[MAX_SYSTEM_CALL_NUM];
 
 /**
  * @brief 初始化系统调用模块
@@ -57,10 +59,3 @@ ul sys_ahci_end_req(struct pt_regs *regs);
 
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code);
-
-system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
-    {
-        [0] = system_call_not_exists,
-        [1] = sys_printf,
-        [2 ... 254] = system_call_not_exists,
-        [255] = sys_ahci_end_req};

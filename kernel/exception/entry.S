@@ -342,7 +342,7 @@ ENTRY(virtualization_exception)
 
 
 
-/*
+
 // 0x80 系统调用门
 ENTRY(syscall_int)
     pushq $0
@@ -350,5 +350,5 @@ ENTRY(syscall_int)
     leaq do_syscall_int(%rip), %rax    // 获取系统调用服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
-*/
+
 

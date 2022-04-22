@@ -2,11 +2,28 @@
 #include "../process/process.h"
 #include <exception/gate.h>
 #include <exception/irq.h>
-#include<driver/disk/ahci/ahci.h>
+#include <driver/disk/ahci/ahci.h>
 
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
 extern void syscall_int(void);
+
+/**
+ * @brief 导出系统调用处理函数的符号
+ * 
+ */
+#define SYSCALL_COMMON(syscall_num, symbol) extern unsigned long symbol(struct pt_regs *regs);
+SYSCALL_COMMON(0, system_call_not_exists);  // 导出system_call_not_exists函数
+#undef SYSCALL_COMMON   // 取消前述宏定义
+
+/**
+ * @brief 重新定义为：把系统调用函数加入系统调用表
+ * @param syscall_num 系统调用号
+ * @param symbol 系统调用处理函数
+ */
+#define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
+
+
 
 /**
  * @brief sysenter的系统调用函数，从entry.S中跳转到这里
@@ -27,7 +44,7 @@ void syscall_init()
 {
     kinfo("Initializing syscall...");
 
-    set_system_trap_gate(0x80, 0, syscall_intr_table[0]); // 系统调用门
+    set_system_trap_gate(0x80, 0, syscall_int); // 系统调用门
 }
 
 /**
@@ -78,9 +95,10 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
 ul sys_printf(struct pt_regs *regs)
 {
 
-    if(regs->r9 == 0 &&regs->r10 == 0)
-         printk((char*)regs->r8);
-     else printk_color(regs->r9, regs->r10, (char*)regs->r8);
+    if (regs->r9 == 0 && regs->r10 == 0)
+        printk((char *)regs->r8);
+    else
+        printk_color(regs->r9, regs->r10, (char *)regs->r8);
     // printk_color(BLACK, WHITE, (char *)regs->r8);
 
     return 0;
@@ -99,3 +117,11 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }
+
+
+system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
+    {
+        [0] = system_call_not_exists,
+        [1] = sys_printf,
+        [2 ... 254] = system_call_not_exists,
+        [255] = sys_ahci_end_req};

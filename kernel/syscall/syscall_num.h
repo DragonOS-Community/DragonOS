@@ -10,6 +10,6 @@
  */
 
 #define SYS_NOT_EXISTS 0
-#define SYS_PRINTF 1
+#define SYS_PUT_STRING 1
 
-#define SYS_AHCI_END_REQ 255
+#define SYS_AHCI_END_REQ 255    // AHCI DMA请求结束end_request的系统调用

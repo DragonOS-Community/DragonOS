@@ -132,7 +132,8 @@ void system_initialize()
     irq_init();
 
     softirq_init();
-
+    current_pcb->cpu_id = 0;
+    current_pcb->preempt_count = 0;
     // 先初始化系统调用模块
     syscall_init();
     //  再初始化进程模块。顺序不能调转
@@ -147,15 +148,16 @@ void system_initialize()
     // ata_init();
     pci_init();
     ahci_init();
-    fat32_init();
+
     // test_slab();
     // test_mm();
 
     // process_init();
-    current_pcb->cpu_id = 0;
-    current_pcb->preempt_count = 0;
+
     process_init();
     HPET_init();
+    fat32_init();
+
 }
 
 //操作系统内核从这里开始执行
@@ -182,18 +184,18 @@ void Start_Kernel(void)
 
     system_initialize();
 
-    int part_id = fat32_register_partition(0, 0, 0);
-    struct fat32_Directory_t *dentry = fat32_path_walk(part_id, "a.txt", 0);
+    // int part_id = fat32_register_partition(0, 0, 0);
+    struct vfs_dir_entry_t *dentry = fat32_path_walk("a.txt", 0);
     if (dentry != NULL)
-        printk_color(BLUE, BLACK, "Find a.txt\nDIR_FstClusHI:%#018lx\tDIR_FstClusLO:%#018lx\tDIR_FileSize:%#018lx\n", dentry->DIR_FstClusHI, dentry->DIR_FstClusLO, dentry->DIR_FileSize);
+        printk_color(ORANGE, BLACK, "Find a.txt\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
     else
-        printk_color(BLUE, BLACK, "Can`t find file\n");
-    
-    dentry = fat32_path_walk(part_id, "xx/12.png", 0);
+        printk_color(ORANGE, BLACK, "Can`t find file\n");
+
+    dentry = fat32_path_walk("xx/12.png", 0);
     if (dentry != NULL)
-        printk_color(BLUE, BLACK, "Find xx/12.png\nDIR_FstClusHI:%#018lx\tDIR_FstClusLO:%#018lx\tDIR_FileSize:%#018lx\n", dentry->DIR_FstClusHI, dentry->DIR_FstClusLO, dentry->DIR_FileSize);
+        printk_color(ORANGE, BLACK, "Find a.txt\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
     else
-        printk_color(BLUE, BLACK, "Can`t find file\n");
+        printk_color(ORANGE, BLACK, "Can`t find file\n");
 
     // show_welcome();
     // test_mm();

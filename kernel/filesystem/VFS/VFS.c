@@ -11,10 +11,10 @@ static struct vfs_filesystem_type_t vfs_fs = {"filesystem", 0};
  * @param name 文件系统名
  * @param DPTE 分区表entry
  * @param DPT_type 分区表类型
- * @param buf 缓存去
+ * @param buf 文件系统的引导扇区
  * @return struct vfs_superblock_t*
  */
-struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, void *buf)
+struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num)
 {
 
     struct vfs_filesystem_type_t *p = NULL;
@@ -22,7 +22,7 @@ struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, 
     {
         if (!strcmp(p->name, name)) // 存在符合的文件系统
         {
-            return p->read_superblock(DPTE, DPT_type, buf);
+            return p->read_superblock(DPTE, DPT_type, buf, ahci_ctrl_num, ahci_port_num, part_num);
         }
     }
     kdebug("unsupported fs: %s", name);

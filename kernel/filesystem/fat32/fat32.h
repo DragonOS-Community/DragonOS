@@ -12,6 +12,7 @@
 #pragma once
 
 #include <filesystem/MBR.h>
+#include <filesystem/VFS/VFS.h>
 
 #define FAT32_MAX_PARTITION_NUM 128 // 系统支持的最大的fat32分区数量
 
@@ -120,6 +121,10 @@ struct fat32_LongDirectory_t
     unsigned short LDIR_Name3[2];  // 长文件名的12-13个字符，每个字符占2bytes
 } __attribute__((packed));
 
+/**
+ * @brief fat32文件系统的超级块信息结构体
+ *
+ */
 struct fat32_partition_info_t
 {
     uint16_t partition_id; // 全局fat32分区id
@@ -167,18 +172,30 @@ typedef struct fat32_inode_info_t fat32_inode_info_t;
  *
  * @param ahci_ctrl_num ahci控制器编号
  * @param ahci_port_num ahci控制器端口编号
- * @param part_num 磁盘分区编号
+ * @return struct vfs_super_block_t * 文件系统的超级块
  */
-int fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t ahci_port_num, uint8_t part_num);
+struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t ahci_port_num, uint8_t part_num);
 
 /**
  * @brief 按照路径查找文件
  *
  * @param part_id fat32分区id
  * @param path
- * @param flags
- * @return struct fat32_Directory_t*
+ * @param flags 1：返回父目录项， 0：返回结果目录项
+ * @return struct vfs_dir_entry_t* 目录项
  */
-struct fat32_Directory_t *fat32_path_walk(uint32_t part_id, char *path, uint64_t flags);
+struct vfs_dir_entry_t *fat32_path_walk(char *path, uint64_t flags);
+
+/**
+ * @brief 创建fat32文件系统的超级块
+ *
+ * @param DPTE 磁盘分区表entry
+ * @param DPT_type 磁盘分区表类型
+ * @param buf fat32文件系统的引导扇区
+ * @return struct vfs_superblock_t* 创建好的超级块
+ */
+struct vfs_superblock_t *fat32_read_superblock(void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num);
+
+long fat32_create(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dentry, int mode);
 
 void fat32_init();

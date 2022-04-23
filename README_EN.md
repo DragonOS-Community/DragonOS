@@ -64,9 +64,9 @@ grub==2.06
 
 - [ ] Multi core scheduling and load balancing
 
-- [ ] FAT32 file system
+- [x] FAT32 file system
 
-- [ ] virtual file system
+- [x] virtual file system
 
 - [ ] Parsing ELF file format
 

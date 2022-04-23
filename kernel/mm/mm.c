@@ -634,6 +634,7 @@ void mm_map_proc_page_table(ul *proc_page_table_addr, bool is_phys, ul virt_addr
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), (user ? PAGE_USER_PGT : PAGE_KERNEL_PGT)));
     }
     kdebug("*tmp = %#018lx", *tmp);
@@ -646,6 +647,7 @@ void mm_map_proc_page_table(ul *proc_page_table_addr, bool is_phys, ul virt_addr
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+        memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), (user ? PAGE_USER_DIR : PAGE_KERNEL_DIR)));
     }
 

@@ -126,10 +126,10 @@ typedef struct
 } irq_desc_t;
 
 #define IRQ_NUM 24
+// 这两个表一定要放在这里，否则在HPET初始化后收到中断，会产生page fault
 irq_desc_t interrupt_desc[IRQ_NUM] = {0};
 
-
-irq_desc_t SMP_IPI_desc[SMP_IRQ_NUM];
+irq_desc_t SMP_IPI_desc[SMP_IRQ_NUM] = {0};
 
 /**
  * @brief 中断注册函数

@@ -16,10 +16,11 @@ void mm_init()
     memory_management_struct.kernel_data_end = (ul)&_edata;
     memory_management_struct.kernel_end = (ul)&_end;
 
-    struct multiboot_mmap_entry_t *mb2_mem_info;
+    struct multiboot_mmap_entry_t mb2_mem_info[512];
     int count;
-    multiboot2_iter(multiboot2_get_memory, mb2_mem_info, &count);
 
+    multiboot2_iter(multiboot2_get_memory, mb2_mem_info, &count);
+    
     for (int i = 0; i < count; ++i)
     {
         //可用的内存
@@ -27,15 +28,15 @@ void mm_init()
             Total_Memory += mb2_mem_info->len;
 
         // 保存信息到mms
-        memory_management_struct.e820[i].BaseAddr = mb2_mem_info->addr;
-        memory_management_struct.e820[i].Length = mb2_mem_info->len;
-        memory_management_struct.e820[i].type = mb2_mem_info->type;
+        memory_management_struct.e820[i].BaseAddr = mb2_mem_info[i].addr;
+        memory_management_struct.e820[i].Length = mb2_mem_info[i].len;
+        memory_management_struct.e820[i].type = mb2_mem_info[i].type;
         memory_management_struct.len_e820 = i;
 
-        ++mb2_mem_info;
+        
 
         // 脏数据
-        if (mb2_mem_info->type > 4 || mb2_mem_info->len == 0 || mb2_mem_info->type < 1)
+        if (mb2_mem_info[i].type > 4 || mb2_mem_info[i].len == 0 || mb2_mem_info[i].type < 1)
             break;
     }
     printk("[ INFO ] Total amounts of RAM : %ld bytes\n", Total_Memory);
@@ -200,6 +201,7 @@ void mm_init()
 
     kinfo("Memory management unit initialize complete!");
 
+    
     flush_tlb();
     // 初始化slab内存池
     slab_init();

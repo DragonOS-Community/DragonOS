@@ -41,6 +41,7 @@ struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_
 void __switch_to(struct process_control_block *prev, struct process_control_block *next)
 {
     initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
+    kdebug("next_rsp = %#018lx   ", next->thread->rsp);
     // set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
     //          initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
@@ -52,7 +53,6 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
     // wrmsr(0x175, next->thread->rbp);
-
 }
 
 /**
@@ -80,7 +80,7 @@ void user_level_function()
                          : "0"(1), "D"(string)
                          : "memory");
                          */
-    long err_code=1;
+    long err_code = 1;
     ul addr = (ul)string;
     __asm__ __volatile__(
         "movq %2, %%r8 \n\t"
@@ -88,16 +88,16 @@ void user_level_function()
         : "=a"(err_code)
         : "a"(SYS_PUT_STRING), "m"(addr)
         : "memory", "r8");
-    if(err_code ==0)
+    if (err_code == 0)
     {
-        char str[] ="errno is 0";
+        char str[] = "errno is 0";
         addr = (ul)str;
-         __asm__ __volatile__(
-        "movq %2, %%r8 \n\t"
-        "int $0x80   \n\t"
-        : "=a"(err_code)
-        : "a"(SYS_PUT_STRING), "m"(addr)
-        : "memory", "r8");
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_PUT_STRING), "m"(addr)
+            : "memory", "r8");
     }
     // enter_syscall_int(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
     //  kinfo("Return from syscall id 15...");
@@ -166,7 +166,7 @@ ul do_execve(struct pt_regs *regs)
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
-
+    kdebug("6666");
     struct pt_regs *regs;
 
     current_pcb->thread->rip = (ul)ret_from_system_call;
@@ -180,7 +180,7 @@ ul initial_kernel_thread(ul arg)
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
-                         "jmp do_execve  \n\t" ::"D"(regs),
+                         "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
                          "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip)
                          : "memory");
 
@@ -206,8 +206,42 @@ ul process_thread_do_exit(ul code)
  * 执行到这里时，rsp位于栈顶，然后弹出寄存器值
  * 弹出之后还要向上移动7个unsigned long的大小，从而弹出额外的信息（详见pt_regs）
  */
+/*
+void kernel_thread_func(void)
+{
+    __asm__ volatile(
+    //"kernel_thread_func:	\n\t"
+    "	popq	%r15	\n\t"
+    "	popq	%r14	\n\t"
+    "	popq	%r13	\n\t"
+    "	popq	%r12	\n\t"
+    "	popq	%r11	\n\t"
+    "	popq	%r10	\n\t"
+    "	popq	%r9	\n\t"
+    "	popq	%r8	\n\t"
+    "	popq	%rbx	\n\t"
+    "	popq	%rcx	\n\t"
+    "	popq	%rdx	\n\t"
+    "	popq	%rsi	\n\t"
+    "	popq	%rdi	\n\t"
+    "	popq	%rbp	\n\t"
+    "	popq	%rax	\n\t"
+    "	movq	%rax,	%ds	\n\t"
+    "	popq	%rax		\n\t"
+    "	movq	%rax,	%es	\n\t"
+    "	popq	%rax		\n\t"
+    "	addq	$0x38,	%rsp	\n\t"
+    /////////////////////////////////
+    "	movq	%rdx,	%rdi	\n\t"
+    "	callq	*%rbx		\n\t"
+    "	movq	%rax,	%rdi	\n\t"
+    "	callq	process_thread_do_exit		\n\t");
+}
+
+*/
 
 extern void kernel_thread_func(void);
+/*
 __asm__(
     "kernel_thread_func:	\n\t"
     "	popq	%r15	\n\t"
@@ -235,7 +269,7 @@ __asm__(
     "	callq	*%rbx		\n\t"
     "	movq	%rax,	%rdi	\n\t"
     "	callq	process_thread_do_exit		\n\t");
-
+*/
 /**
  * @brief 初始化内核进程
  *
@@ -265,9 +299,9 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 
     // rip寄存器指向内核线程的引导程序
     regs.rip = (ul)kernel_thread_func;
-    // kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
-    // kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
-
+    kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
+    kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
+    kdebug("1111\tregs.rip = %#018lx", regs.rip);
     return do_fork(&regs, flags, 0, 0);
 }
 
@@ -338,7 +372,7 @@ void process_init()
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size)
 {
     struct process_control_block *tsk = NULL;
-
+    kdebug("222\tregs.rip = %#018lx", regs->rip);
     // 获取一个物理页并在这个物理页内初始化pcb
     struct Page *pp = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED | PAGE_KERNEL);
 
@@ -367,9 +401,11 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     struct thread_struct *thd = (struct thread_struct *)(tsk + 1);
     memset(thd, 0, sizeof(struct thread_struct));
     tsk->thread = thd;
+    kdebug("333\tregs.rip = %#018lx", regs->rip);
     // 将寄存器信息存储到进程的内核栈空间的顶部
     memcpy((void *)((ul)tsk + STACK_SIZE - sizeof(struct pt_regs)), regs, sizeof(struct pt_regs));
 
+    kdebug("regs.rip = %#018lx", regs->rip);
     // 设置进程的内核栈
     thd->rbp = (ul)tsk + STACK_SIZE;
     thd->rip = regs->rip;

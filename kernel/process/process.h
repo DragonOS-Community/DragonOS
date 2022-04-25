@@ -216,11 +216,11 @@ struct process_control_block *get_current_pcb()
 							 "pushq	%%rax	\n\t"                                                     \
 							 "movq	%%rsp,	%0	\n\t"                                                  \
 							 "movq	%2,	%%rsp	\n\t"                                                  \
-							 "leaq	1f(%%rip),	%%rax	\n\t"                                           \
+							 "leaq	switch_proc_ret_addr(%%rip),	%%rax	\n\t"                                           \
 							 "movq	%%rax,	%1	\n\t"                                                  \
 							 "pushq	%3		\n\t"                                                       \
 							 "jmp	__switch_to	\n\t"                                                 \
-							 "1:	\n\t"                                                              \
+							 "switch_proc_ret_addr:	\n\t"                                                              \
 							 "popq	%%rax	\n\t"                                                      \
 							 "popq	%%rbp	\n\t"                                                      \
 							 "sti	\n\t"                                                             \

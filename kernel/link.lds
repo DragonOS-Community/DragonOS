@@ -37,6 +37,7 @@ SECTIONS
 
 		_edata = .;
 	}
+	. = ALIGN(4096);
 	rodata_start_pa = .;
 	.rodata (rodata_start_pa): AT(rodata_start_pa - KERNEL_VMA)
 	{

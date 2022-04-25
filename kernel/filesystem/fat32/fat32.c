@@ -699,6 +699,7 @@ struct vfs_filesystem_type_t fat32_fs_type =
 };
 void fat32_init()
 {
+    kinfo("Initializing FAT32...");
     // 在VFS中注册fat32文件系统
     vfs_register_filesystem(&fat32_fs_type);
 

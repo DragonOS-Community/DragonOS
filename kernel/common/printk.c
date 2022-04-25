@@ -635,9 +635,9 @@ static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, uns
      * @param font 字符的bitmap
      */
 
-#ifdef DEBUG
+//#if DEBUG
     uart_send(COM1, font);
-#endif
+//#endif
 
     unsigned char *font_ptr = font_ascii[font];
     unsigned int *addr;

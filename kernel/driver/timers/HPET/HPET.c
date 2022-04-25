@@ -51,7 +51,7 @@ hardware_intr_controller HPET_intr_controller =
 
 void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
-    // printk("(HPET)");
+     printk("(HPET)");
     switch (param)
     {
     case 0: // 定时器0中断

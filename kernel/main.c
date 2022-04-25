@@ -86,9 +86,9 @@ void system_initialize()
 
     // 初始化printk
     printk_init(8, 16);
-#ifdef DEBUG
+//#ifdef DEBUG
     uart_init(COM1, 115200);
-#endif
+//#endif
     kinfo("Kernel Starting...");
     // 重新加载gdt和idt
 
@@ -156,7 +156,8 @@ void system_initialize()
 
     process_init();
     HPET_init();
-    fat32_init();
+    //fat32_init();
+    
 
 }
 

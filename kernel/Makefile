@@ -7,10 +7,10 @@ DIR_LIB=lib
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
-DEBUG=1
+DEBUG=DEBUG
 CFLAGS := -mcmodel=large -fno-builtin -m64  -O0 -I . -fno-stack-protector
 
-ifeq ($(DEBUG), 1)
+ifeq ($(DEBUG), DEBUG)
 CFLAGS += -g
 endif
 
@@ -34,6 +34,10 @@ head.o: head.S
 entry.o: exception/entry.S
 	gcc -E exception/entry.S > exception/entry.s
 	as $(ASFLAGS) -o exception/entry.o exception/entry.s
+
+procs.o: process/proc.S
+	gcc -E process/proc.S > process/proc.s
+	as $(ASFLAGS) -o process/procs.o process/proc.s
 
 
 
@@ -151,8 +155,8 @@ all: kernel
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
 #
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
+kernel: head.o entry.o procs.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o process/procs.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
 	common/cpu.o smp/smp.o smp/apu_boot.o exception/softirq.o sched/sched.o	filesystem/fat32/fat32.o filesystem/MBR.o filesystem/VFS/VFS.o \
 	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o driver/timers/rtc/rtc.o driver/timers/HPET/HPET.o driver/timers/timer.o \
 	$(LD_LIST)	\

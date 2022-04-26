@@ -690,21 +690,22 @@ struct vfs_inode_operations_t fat32_inode_ops =
 
 };
 
-struct vfs_filesystem_type_t fat32_fs_type = 
-{
-    .name = "FAT32",
-    .fs_flags = 0,
-    .read_superblock = fat32_read_superblock,
-    .next = NULL,
+struct vfs_filesystem_type_t fat32_fs_type =
+    {
+        .name = "FAT32",
+        .fs_flags = 0,
+        .read_superblock = fat32_read_superblock,
+        .next = NULL,
 };
 void fat32_init()
 {
 
-   // kinfo("Initializing FAT32...");
+    kinfo("Initializing FAT32...");
 
     // 在VFS中注册fat32文件系统
     vfs_register_filesystem(&fat32_fs_type);
 
     // 挂载根文件系统
     vfs_root_sb = fat32_register_partition(0, 0, 0);
+    kinfo("FAT32 initialized.");
 }

@@ -74,7 +74,7 @@ void sched_cfs()
                 break;
             }
         }
-        kdebug("before switch, next.rip = %#018lx\tnext->gs=%#018lx", proc->thread->rip, proc->thread->gs);
+        // kdebug("before switch, next.rip = %#018lx\tnext->gs=%#018lx", proc->thread->rip, proc->thread->gs);
         switch_proc(current_pcb, proc);
     }
     else // 不进行切换
@@ -108,8 +108,8 @@ void sched_cfs()
  */
 void sched_update_jiffies()
 {
-    //if (current_pcb->cpu_id == 0)
-    //    return;
+    // if (current_pcb->cpu_id == 0)
+    //     return;
     switch (current_pcb->priority)
     {
     case 0:

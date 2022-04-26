@@ -9,6 +9,8 @@
 #include <sched/sched.h>
 
 extern void system_call(void);
+extern void kernel_thread_func(void);
+
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 struct mm_struct initial_mm = {0};
 struct thread_struct initial_thread =
@@ -41,9 +43,9 @@ struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_
 void __switch_to(struct process_control_block *prev, struct process_control_block *next)
 {
     initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
-    kdebug("next_rsp = %#018lx   ", next->thread->rsp);
-    // set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
-    //          initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
+    // kdebug("next_rsp = %#018lx   ", next->thread->rsp);
+    //  set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
+    //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
     __asm__ __volatile__("movq	%%fs,	%0 \n\t"
                          : "=a"(prev->thread->fs));
@@ -90,7 +92,7 @@ void user_level_function()
         : "memory", "r8");
     if (err_code == 0)
     {
-        char str[] = "errno is 0";
+        char str[] = "errno is 0\n";
         addr = (ul)str;
         __asm__ __volatile__(
             "movq %2, %%r8 \n\t"
@@ -166,7 +168,7 @@ ul do_execve(struct pt_regs *regs)
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
-    kdebug("6666");
+
     struct pt_regs *regs;
 
     current_pcb->thread->rip = (ul)ret_from_system_call;
@@ -240,36 +242,6 @@ void kernel_thread_func(void)
 
 */
 
-extern void kernel_thread_func(void);
-/*
-__asm__(
-    "kernel_thread_func:	\n\t"
-    "	popq	%r15	\n\t"
-    "	popq	%r14	\n\t"
-    "	popq	%r13	\n\t"
-    "	popq	%r12	\n\t"
-    "	popq	%r11	\n\t"
-    "	popq	%r10	\n\t"
-    "	popq	%r9	\n\t"
-    "	popq	%r8	\n\t"
-    "	popq	%rbx	\n\t"
-    "	popq	%rcx	\n\t"
-    "	popq	%rdx	\n\t"
-    "	popq	%rsi	\n\t"
-    "	popq	%rdi	\n\t"
-    "	popq	%rbp	\n\t"
-    "	popq	%rax	\n\t"
-    "	movq	%rax,	%ds	\n\t"
-    "	popq	%rax		\n\t"
-    "	movq	%rax,	%es	\n\t"
-    "	popq	%rax		\n\t"
-    "	addq	$0x38,	%rsp	\n\t"
-    /////////////////////////////////
-    "	movq	%rdx,	%rdi	\n\t"
-    "	callq	*%rbx		\n\t"
-    "	movq	%rax,	%rdi	\n\t"
-    "	callq	process_thread_do_exit		\n\t");
-*/
 /**
  * @brief 初始化内核进程
  *
@@ -299,9 +271,9 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 
     // rip寄存器指向内核线程的引导程序
     regs.rip = (ul)kernel_thread_func;
-    kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
-    kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
-    kdebug("1111\tregs.rip = %#018lx", regs.rip);
+    // kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
+    // kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
+    // kdebug("1111\tregs.rip = %#018lx", regs.rip);
     return do_fork(&regs, flags, 0, 0);
 }
 
@@ -372,8 +344,8 @@ void process_init()
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size)
 {
     struct process_control_block *tsk = NULL;
-    kdebug("222\tregs.rip = %#018lx", regs->rip);
-    // 获取一个物理页并在这个物理页内初始化pcb
+    // kdebug("222\tregs.rip = %#018lx", regs->rip);
+    //  获取一个物理页并在这个物理页内初始化pcb
     struct Page *pp = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED | PAGE_KERNEL);
 
     tsk = (struct process_control_block *)phys_2_virt(pp->addr_phys);
@@ -401,8 +373,8 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     struct thread_struct *thd = (struct thread_struct *)(tsk + 1);
     memset(thd, 0, sizeof(struct thread_struct));
     tsk->thread = thd;
-    kdebug("333\tregs.rip = %#018lx", regs->rip);
-    // 将寄存器信息存储到进程的内核栈空间的顶部
+    // kdebug("333\tregs.rip = %#018lx", regs->rip);
+    //  将寄存器信息存储到进程的内核栈空间的顶部
     memcpy((void *)((ul)tsk + STACK_SIZE - sizeof(struct pt_regs)), regs, sizeof(struct pt_regs));
 
     kdebug("regs.rip = %#018lx", regs->rip);

@@ -51,7 +51,7 @@ hardware_intr_controller HPET_intr_controller =
 
 void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
-     printk("(HPET)");
+    // printk("(HPET)");
     switch (param)
     {
     case 0: // 定时器0中断
@@ -127,7 +127,7 @@ int HPET_init()
     else // ACPI表中有HPET表
     {
         hpet_table = (struct acpi_HPET_description_table_t *)hpet_table_addr;
-        kdebug("hpet_table_addr=%#018lx", hpet_table_addr);
+        // kdebug("hpet_table_addr=%#018lx", hpet_table_addr);
 
         // 由于这段内存与io/apic的映射在同一物理页内，因此不需要重复映射
         HPET_REG_BASE = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + hpet_table->address;

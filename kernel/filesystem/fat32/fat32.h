@@ -176,15 +176,6 @@ typedef struct fat32_inode_info_t fat32_inode_info_t;
  */
 struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t ahci_port_num, uint8_t part_num);
 
-/**
- * @brief 按照路径查找文件
- *
- * @param part_id fat32分区id
- * @param path
- * @param flags 1：返回父目录项， 0：返回结果目录项
- * @return struct vfs_dir_entry_t* 目录项
- */
-struct vfs_dir_entry_t *fat32_path_walk(char *path, uint64_t flags);
 
 /**
  * @brief 创建fat32文件系统的超级块

@@ -344,76 +344,6 @@ find_lookup_success:; // 找到目标dentry
     return dest_dentry;
 }
 
-/**
- * @brief 按照路径查找文件
- *
- * @param part_id fat32分区id
- * @param path
- * @param flags 1：返回父目录项， 0：返回结果目录项
- * @return struct vfs_dir_entry_t* 目录项
- */
-struct vfs_dir_entry_t *fat32_path_walk(char *path, uint64_t flags)
-{
-
-    struct vfs_dir_entry_t *parent = vfs_root_sb->root;
-    // 去除路径前的斜杠
-    while (*path == '/')
-        ++path;
-
-    if ((!*path) || (*path == '\0'))
-        return parent;
-
-    struct vfs_dir_entry_t *dentry;
-
-    while (true)
-    {
-        // 提取出下一级待搜索的目录名或文件名，并保存在dEntry_name中
-        char *tmp_path = path;
-        while ((*path && *path != '\0') && (*path != '/'))
-            ++path;
-        int tmp_path_len = path - tmp_path;
-
-        dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
-        memset(dentry, 0, sizeof(struct vfs_dir_entry_t));
-        // 为目录项的名称分配内存
-        dentry->name = (char *)kmalloc(tmp_path_len + 1, 0);
-        // 貌似这里不需要memset，因为空间会被覆盖
-        // memset(dentry->name, 0, tmp_path_len+1);
-
-        memcpy(dentry->name, tmp_path, tmp_path_len);
-        dentry->name[tmp_path_len] = '\0';
-        dentry->name_length = tmp_path_len;
-
-        if (parent->dir_inode->inode_ops->lookup(parent->dir_inode, dentry) == NULL)
-        {
-            // 搜索失败
-            kerror("cannot find the file/dir : %s", dentry->name);
-            kfree(dentry->name);
-            kfree(dentry);
-            return NULL;
-        }
-        // 找到子目录项
-        // 初始化子目录项的entry
-        list_init(&dentry->child_node_list);
-        list_init(&dentry->subdirs_list);
-        dentry->parent = parent;
-
-        while (*path == '/')
-            ++path;
-
-        if ((!*path) || (*path == '\0')) //  已经到达末尾
-        {
-            if (flags & 1) // 返回父目录
-            {
-                return parent;
-            }
-
-            return dentry;
-        }
-
-        parent = dentry;
-    }
-}
 
 /**
  * @brief 创建fat32文件系统的超级块
@@ -610,6 +540,7 @@ struct vfs_dir_entry_operations_t fat32_dEntry_ops =
 // todo: open
 long fat32_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
 {
+    return VFS_SUCCESS;
 }
 
 // todo: close

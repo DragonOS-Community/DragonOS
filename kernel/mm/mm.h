@@ -7,8 +7,9 @@
 #define PTRS_PER_PGT 512
 
 // 内核层的起始地址
-#define PAGE_OFFSET ((unsigned long)0xffff800000000000)
-#define KERNEL_BASE_LINEAR_ADDR ((unsigned long)0xffff800000000000)
+#define PAGE_OFFSET (0xffff800000000000UL)
+#define KERNEL_BASE_LINEAR_ADDR (0xffff800000000000UL)
+#define USER_MAX_LINEAR_ADDR 0x00007fffffffffffUL;
 
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21

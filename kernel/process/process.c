@@ -7,6 +7,7 @@
 #include "../syscall/syscall_num.h"
 #include <mm/slab.h>
 #include <sched/sched.h>
+#include <filesystem/fat32/fat32.h>
 
 extern void system_call(void);
 extern void kernel_thread_func(void);
@@ -72,16 +73,9 @@ void user_level_function()
     long ret = 0;
     //	printk_color(RED,BLACK,"user_level_function task is running\n");
 
-    char string[] = "User level process.\n";
     /*
-    __asm__ __volatile__("leaq	sysexit_return_address(%%rip),	%%rdx	\n\t"
-                         "movq	%%rsp,	%%rcx		\n\t"
-                         "sysenter			\n\t"
-                         "sysexit_return_address:	\n\t"
-                         : "=a"(ret)
-                         : "0"(1), "D"(string)
-                         : "memory");
-                         */
+    // 测试sys put string
+    char string[] = "User level process.\n";
     long err_code = 1;
     ul addr = (ul)string;
     __asm__ __volatile__(
@@ -90,19 +84,26 @@ void user_level_function()
         : "=a"(err_code)
         : "a"(SYS_PUT_STRING), "m"(addr)
         : "memory", "r8");
-    if (err_code == 0)
-    {
-        char str[] = "errno is 0\n";
-        addr = (ul)str;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_PUT_STRING), "m"(addr)
-            : "memory", "r8");
-    }
-    // enter_syscall_int(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
-    //  kinfo("Return from syscall id 15...");
+    */
+
+    // 测试sys_open
+    char string[] = "/xx/12.png";
+    long err_code = 1;
+    int zero = 0;
+    uint64_t addr = (ul)string;
+    __asm__ __volatile__(
+        "movq %2, %%r8 \n\t"
+        "movq %3, %%r9 \n\t"
+        "movq %4, %%r10 \n\t"
+        "movq %5, %%r11 \n\t"
+        "movq %6, %%r12 \n\t"
+        "movq %7, %%r13 \n\t"
+        "movq %8, %%r14 \n\t"
+        "movq %9, %%r15 \n\t"
+        "int $0x80   \n\t"
+        : "=a"(err_code)
+        : "a"(SYS_OPEN), "m"(addr), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+        : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
 
     while (1)
         pause();
@@ -151,7 +152,7 @@ ul do_execve(struct pt_regs *regs)
     mm_map_phys_addr_user(addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE);
 
     if (!(current_pcb->flags & PF_KTHREAD))
-        current_pcb->addr_limit = KERNEL_BASE_LINEAR_ADDR;
+        current_pcb->addr_limit = USER_MAX_LINEAR_ADDR;
     // 将程序代码拷贝到对应的内存中
     memcpy((void *)0x800000, user_level_function, 1024);
 
@@ -168,6 +169,7 @@ ul do_execve(struct pt_regs *regs)
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
+    fat32_init();
 
     struct pt_regs *regs;
 
@@ -377,7 +379,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     //  将寄存器信息存储到进程的内核栈空间的顶部
     memcpy((void *)((ul)tsk + STACK_SIZE - sizeof(struct pt_regs)), regs, sizeof(struct pt_regs));
 
-    kdebug("regs.rip = %#018lx", regs->rip);
+    // kdebug("regs.rip = %#018lx", regs->rip);
     // 设置进程的内核栈
     thd->rbp = (ul)tsk + STACK_SIZE;
     thd->rip = regs->rip;

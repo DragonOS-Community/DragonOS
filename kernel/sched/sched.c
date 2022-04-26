@@ -50,7 +50,7 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
  */
 void sched_cfs()
 {
-
+    cli();
     current_pcb->flags &= ~PROC_NEED_SCHED;
     struct process_control_block *proc = sched_cfs_dequeue();
 
@@ -100,6 +100,8 @@ void sched_cfs()
             }
         }
     }
+
+    sti();
 }
 
 /**

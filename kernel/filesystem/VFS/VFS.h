@@ -71,13 +71,17 @@ struct vfs_index_node_t
     void *private_inode_info;
 };
 
+/**
+ * @brief 文件描述符
+ * 
+ */
 struct vfs_file_t
 {
     long position;
     uint64_t mode;
 
     struct vfs_dir_entry_t *dEntry;
-    struct vfs_file_opeartions_t *file_ops;
+    struct vfs_file_operations_t *file_ops;
     void *private_data;
 };
 
@@ -148,3 +152,13 @@ uint64_t vfs_unregister_filesystem(struct vfs_filesystem_type_t *fs);
  * @return struct vfs_superblock_t*
  */
 struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num);
+
+
+/**
+ * @brief 按照路径查找文件
+ *
+ * @param path 路径
+ * @param flags 1：返回父目录项， 0：返回结果目录项
+ * @return struct vfs_dir_entry_t* 目录项
+ */
+struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags);

@@ -156,8 +156,8 @@ void system_initialize()
 
     process_init();
     HPET_init();
-    fat32_init();
-    
+    // fat32_init();
+    // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 
 }
 
@@ -185,19 +185,20 @@ void Start_Kernel(void)
 
     system_initialize();
 
+    /*
     // int part_id = fat32_register_partition(0, 0, 0);
-    struct vfs_dir_entry_t *dentry = fat32_path_walk("a.txt", 0);
+    struct vfs_dir_entry_t *dentry = vfs_path_walk("a.txt", 0);
     if (dentry != NULL)
         printk_color(ORANGE, BLACK, "Found a.txt\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
     else
         printk_color(ORANGE, BLACK, "Can`t find file\n");
 
-    dentry = fat32_path_walk("xx/12.png", 0);
+    dentry = vfs_path_walk("xx/12.png", 0);
     if (dentry != NULL)
         printk_color(ORANGE, BLACK, "Found xx/12.png\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
     else
         printk_color(ORANGE, BLACK, "Can`t find file\n");
-
+    */
     // show_welcome();
     // test_mm();
 

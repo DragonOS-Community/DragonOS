@@ -16,6 +16,11 @@
 #include "../syscall/syscall.h"
 #include "ptrace.h"
 
+#include <filesystem/VFS/VFS.h>
+
+// 进程最大可拥有的文件描述符数量
+#define PROC_MAX_FD_NUM 16
+
 // 进程的内核栈大小 32K
 #define STACK_SIZE 32768
 
@@ -116,6 +121,10 @@ struct process_control_block
 	long pid;
 	long priority;		  // 优先级
 	long virtual_runtime; // 虚拟运行时间
+
+	// 进程拥有的文件描述符的指针数组
+	// todo: 改用动态指针数组
+	struct vfs_file_t *fds[PROC_MAX_FD_NUM];
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐
@@ -138,7 +147,8 @@ union proc_union
 		.signal = 0,                      \
 		.priority = 2,                    \
 		.preempt_count = 0,               \
-		.cpu_id = 0                       \
+		.cpu_id = 0,                      \
+		.fds = { 0 }                      \
 	}
 
 /**
@@ -211,19 +221,17 @@ struct process_control_block *get_current_pcb()
 #define switch_proc(prev, next)                                                                     \
 	do                                                                                              \
 	{                                                                                               \
-		__asm__ __volatile__("cli	\n\t"                                                             \
-							 "pushq	%%rbp	\n\t"                                                     \
+		__asm__ __volatile__("pushq	%%rbp	\n\t"                                                     \
 							 "pushq	%%rax	\n\t"                                                     \
 							 "movq	%%rsp,	%0	\n\t"                                                  \
 							 "movq	%2,	%%rsp	\n\t"                                                  \
-							 "leaq	switch_proc_ret_addr(%%rip),	%%rax	\n\t"                                           \
+							 "leaq	switch_proc_ret_addr(%%rip),	%%rax	\n\t"                         \
 							 "movq	%%rax,	%1	\n\t"                                                  \
 							 "pushq	%3		\n\t"                                                       \
 							 "jmp	__switch_to	\n\t"                                                 \
-							 "switch_proc_ret_addr:	\n\t"                                                              \
+							 "switch_proc_ret_addr:	\n\t"                                           \
 							 "popq	%%rax	\n\t"                                                      \
 							 "popq	%%rbp	\n\t"                                                      \
-							 "sti	\n\t"                                                             \
 							 : "=m"(prev->thread->rsp), "=m"(prev->thread->rip)                     \
 							 : "m"(next->thread->rsp), "m"(next->thread->rip), "D"(prev), "S"(next) \
 							 : "memory");                                                           \

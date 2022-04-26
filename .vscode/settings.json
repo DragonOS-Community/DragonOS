@@ -86,7 +86,9 @@
         "cinttypes": "c",
         "cstdbool": "c",
         "typeinfo": "c",
-        "x86_64_ipi.h": "c"
+        "x86_64_ipi.h": "c",
+        "unistd.h": "c",
+        "syscall_num.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

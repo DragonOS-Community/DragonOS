@@ -456,11 +456,11 @@ bool verify_area(uint64_t addr_start, uint64_t length)
 
 /**
  * @brief 从用户空间搬运数据到内核空间
- * 
+ *
  * @param dst 目的地址
  * @param src 源地址
  * @param size 搬运的大小
- * @return uint64_t 
+ * @return uint64_t
  */
 static inline uint64_t copy_from_user(void *dst, void *src, uint64_t size)
 {
@@ -470,7 +470,7 @@ static inline uint64_t copy_from_user(void *dst, void *src, uint64_t size)
 
     /**
      * @brief 先每次搬运8 bytes，剩余就直接一个个byte搬运
-     * 
+     *
      */
     asm volatile("rep   \n\t"
                  "movsq  \n\t"
@@ -484,11 +484,11 @@ static inline uint64_t copy_from_user(void *dst, void *src, uint64_t size)
 
 /**
  * @brief 从内核空间搬运数据到用户空间
- * 
+ *
  * @param dst 目的地址
  * @param src 源地址
  * @param size 搬运的大小
- * @return uint64_t 
+ * @return uint64_t
  */
 static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
 {
@@ -498,7 +498,7 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
 
     /**
      * @brief 先每次搬运8 bytes，剩余就直接一个个byte搬运
-     * 
+     *
      */
     asm volatile("rep   \n\t"
                  "movsq  \n\t"
@@ -507,5 +507,51 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
                  "movsb \n\t"
                  : "=&c"(size), "=&D"(tmp0), "=&S"(tmp1)
                  : "r"(size & 7), "0"(size >> 3), "1"(dst), "2"(src));
+    return size;
+}
+
+/**
+ * @brief 测量来自用户空间的字符串的长度，会检验地址空间是否属于用户空间
+ * @param src
+ * @param maxlen
+ * @return long
+ */
+long strnlen_user(void *src, unsigned long maxlen)
+{
+
+    unsigned long size = strlen(src);
+
+    // 地址不合法
+    if (!verify_area((uint64_t)src, size))
+        return 0;
+    
+    return size <= maxlen ? size : maxlen;
+}
+
+char *strncpy(char *Dest, char *Src, long Count)
+{
+    __asm__ __volatile__("cld	\n\t"
+                         "1:	\n\t"
+                         "decq	%2	\n\t"
+                         "js	2f	\n\t"
+                         "lodsb	\n\t"
+                         "stosb	\n\t"
+                         "testb	%%al,	%%al	\n\t"
+                         "jne	1b	\n\t"
+                         "rep	\n\t"
+                         "stosb	\n\t"
+                         "2:	\n\t"
+                         :
+                         : "S"(Src), "D"(Dest), "c"(Count)
+                         : "ax", "memory");
+    return Dest;
+}
+
+long strncpy_from_user(void *dst, void *src, unsigned long size)
+{
+    if (!verify_area((uint64_t)src, size))
+        return 0;
+
+    strncpy(dst, src, size);
     return size;
 }

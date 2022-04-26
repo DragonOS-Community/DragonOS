@@ -3,6 +3,10 @@
 #include <exception/gate.h>
 #include <exception/irq.h>
 #include <driver/disk/ahci/ahci.h>
+#include <mm/slab.h>
+#include <common/errno.h>
+#include <common/fcntl.h>
+#include <filesystem/fat32/fat32.h>
 
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
@@ -10,11 +14,11 @@ extern void syscall_int(void);
 
 /**
  * @brief 导出系统调用处理函数的符号
- * 
+ *
  */
 #define SYSCALL_COMMON(syscall_num, symbol) extern unsigned long symbol(struct pt_regs *regs);
-SYSCALL_COMMON(0, system_call_not_exists);  // 导出system_call_not_exists函数
-#undef SYSCALL_COMMON   // 取消前述宏定义
+SYSCALL_COMMON(0, system_call_not_exists); // 导出system_call_not_exists函数
+#undef SYSCALL_COMMON                      // 取消前述宏定义
 
 /**
  * @brief 重新定义为：把系统调用函数加入系统调用表
@@ -22,8 +26,6 @@ SYSCALL_COMMON(0, system_call_not_exists);  // 导出system_call_not_exists函�
  * @param symbol 系统调用处理函数
  */
 #define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
-
-
 
 /**
  * @brief sysenter的系统调用函数，从entry.S中跳转到这里
@@ -44,7 +46,7 @@ void syscall_init()
 {
     kinfo("Initializing syscall...");
 
-    set_system_trap_gate(0x80, 0, syscall_int); // 系统调用门
+    set_system_intr_gate(0x80, 0, syscall_int); // 系统调用门
 }
 
 /**
@@ -92,7 +94,7 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
  * @param arg2 背景色
  * @return ul 返回值
  */
-ul sys_printf(struct pt_regs *regs)
+ul sys_put_string(struct pt_regs *regs)
 {
 
     if (regs->r9 == 0 && regs->r10 == 0)
@@ -102,6 +104,102 @@ ul sys_printf(struct pt_regs *regs)
     // printk_color(BLACK, WHITE, (char *)regs->r8);
 
     return 0;
+}
+
+uint64_t sys_open(struct pt_regs *regs)
+{
+
+    char *filename = (char *)(regs->r8);
+    int flags = (int)(regs->r9);
+
+    long path_len = strnlen_user(filename, PAGE_4K_SIZE);
+
+    if (path_len <= 0) // 地址空间错误
+    {
+        return -EFAULT;
+    }
+    else if (path_len >= PAGE_4K_SIZE) // 名称过长
+    {
+        return -ENAMETOOLONG;
+    }
+
+    // 为待拷贝文件路径字符串分配内存空间
+    char *path = (char *)kmalloc(path_len, 0);
+    if (path == NULL)
+        return -ENOMEM;
+    memset(path, 0, path_len);
+
+    strncpy_from_user(path, filename, path_len);
+
+    // 寻找文件
+    struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
+    kfree(path);
+
+    if (dentry != NULL)
+        printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
+    else
+        printk_color(ORANGE, BLACK, "Can`t find file\n");
+
+    if (dentry == NULL)
+        return -ENOENT;
+
+    // 暂时认为目标是目录是一种错误
+    if (dentry->dir_inode->attribute == VFS_ATTR_DIR)
+        return -EISDIR;
+
+    // 创建文件描述符
+    struct vfs_file_t *file_ptr = (struct vfs_f2ile_t *)kmalloc(sizeof(struct vfs_file_t), 0);
+    memset(file_ptr, 0, sizeof(struct vfs_file_t));
+
+    int errcode = -1;
+
+    file_ptr->dEntry = dentry;
+    file_ptr->mode = flags;
+    file_ptr->file_ops = dentry->dir_inode->file_ops;
+
+    // 如果文件系统实现了打开文件的函数
+    if (file_ptr->file_ops && file_ptr->file_ops->open)
+        errcode = file_ptr->file_ops->open(dentry->dir_inode, file_ptr);
+
+    if (errcode != VFS_SUCCESS)
+    {
+        kfree(file_ptr);
+        return -EFAULT;
+    }
+
+    if (file_ptr->mode & O_TRUNC) // 清空文件
+        file_ptr->dEntry->dir_inode->file_size = 0;
+
+    if (file_ptr->mode & O_APPEND)
+        file_ptr->position = file_ptr->dEntry->dir_inode->file_size;
+    else
+        file_ptr->position = 0;
+
+    struct vfs_file_t **f = current_pcb->fds;
+
+    int fd_num = -1;
+
+    // 在指针数组中寻找空位
+    // todo: 当pcb中的指针数组改为动态指针数组之后，需要更改这里（目前还是静态指针数组）
+    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+    {
+        if (f[i] == NULL) // 找到指针数组中的空位
+        {
+            fd_num = i;
+            break;
+        }
+    }
+
+    // 指针数组没有空位了
+    if (fd_num == -1)
+    {
+        kfree(file_ptr);
+        return -EMFILE;
+    }
+    // 保存文件描述符
+    f[fd_num] = file_ptr;
+
+    return fd_num;
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)
@@ -118,10 +216,10 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
     regs->rax = ret; // 返回码
 }
 
-
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
     {
         [0] = system_call_not_exists,
-        [1] = sys_printf,
-        [2 ... 254] = system_call_not_exists,
+        [1] = sys_put_string,
+        [2] = sys_open,
+        [3 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

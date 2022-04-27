@@ -218,7 +218,9 @@ uint64_t sys_close(struct pt_regs *regs)
     // 校验文件描述符范围
     if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
         return -EBADF;
-
+    // 文件描述符不存在
+    if (current_pcb->fds[fd_num] == NULL)
+        return -EBADF;
     struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
     uint64_t ret;
     // If there is a valid close function
@@ -232,23 +234,27 @@ uint64_t sys_close(struct pt_regs *regs)
 
 /**
  * @brief 从文件中读取数据
- * 
+ *
  * @param fd_num regs->r8 文件描述符号
  * @param buf regs->r9 输出缓冲区
  * @param count regs->r10 要读取的字节数
- * 
- * @return uint64_t 
+ *
+ * @return uint64_t
  */
 uint64_t sys_read(struct pt_regs *regs)
 {
     int fd_num = (int)regs->r8;
-    void *buf = (void*)regs->r9;
+    void *buf = (void *)regs->r9;
     int64_t count = (int64_t)regs->r10;
 
     // kdebug("sys read: fd=%d", fd_num);
 
     // 校验文件描述符范围
     if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
+        return -EBADF;
+
+    // 文件描述符不存在
+    if (current_pcb->fds[fd_num] == NULL)
         return -EBADF;
 
     if (count < 0)

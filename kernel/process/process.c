@@ -85,26 +85,74 @@ void user_level_function()
         : "a"(SYS_PUT_STRING), "m"(addr)
         : "memory", "r8");
     */
+    while (1)
+    {
+        // 测试sys_open
+        char string[] = "a.txt";
+        long err_code = 1;
+        int zero = 0;
+        uint64_t addr = (ul)string;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "movq %3, %%r9 \n\t"
+            "movq %4, %%r10 \n\t"
+            "movq %5, %%r11 \n\t"
+            "movq %6, %%r12 \n\t"
+            "movq %7, %%r13 \n\t"
+            "movq %8, %%r14 \n\t"
+            "movq %9, %%r15 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_OPEN), "m"(addr), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
 
-    // 测试sys_open
-    char string[] = "/xx/12.png";
-    long err_code = 1;
-    int zero = 0;
-    uint64_t addr = (ul)string;
-    __asm__ __volatile__(
-        "movq %2, %%r8 \n\t"
-        "movq %3, %%r9 \n\t"
-        "movq %4, %%r10 \n\t"
-        "movq %5, %%r11 \n\t"
-        "movq %6, %%r12 \n\t"
-        "movq %7, %%r13 \n\t"
-        "movq %8, %%r14 \n\t"
-        "movq %9, %%r15 \n\t"
-        "int $0x80   \n\t"
-        : "=a"(err_code)
-        : "a"(SYS_OPEN), "m"(addr), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-        : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+        int fd_num = err_code;
 
+        int count = 16;
+        while (count)
+        {
+            uchar buf[128] = {0};
+            // Test sys_read
+            addr = (uint64_t)&buf;
+            __asm__ __volatile__(
+                "movq %2, %%r8 \n\t"
+                "movq %3, %%r9 \n\t"
+                "movq %4, %%r10 \n\t"
+                "movq %5, %%r11 \n\t"
+                "movq %6, %%r12 \n\t"
+                "movq %7, %%r13 \n\t"
+                "movq %8, %%r14 \n\t"
+                "movq %9, %%r15 \n\t"
+                "int $0x80   \n\t"
+                : "=a"(err_code)
+                : "a"(SYS_READ), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+                : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+            count = err_code;
+            // 将读取到的数据打印出来
+            addr = (ul)buf;
+            __asm__ __volatile__(
+                "movq %2, %%r8 \n\t"
+                "int $0x80   \n\t"
+                : "=a"(err_code)
+                : "a"(SYS_PUT_STRING), "m"(addr)
+                : "memory", "r8");
+        }
+
+        // Test sys_close
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "movq %3, %%r9 \n\t"
+            "movq %4, %%r10 \n\t"
+            "movq %5, %%r11 \n\t"
+            "movq %6, %%r12 \n\t"
+            "movq %7, %%r13 \n\t"
+            "movq %8, %%r14 \n\t"
+            "movq %9, %%r15 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_CLOSE), "m"(fd_num), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+    }
     while (1)
         pause();
 }
@@ -205,46 +253,6 @@ ul process_thread_do_exit(ul code)
 }
 
 /**
- * @brief 导出内核线程的执行引导程序
- *  目的是还原执行现场(在kernel_thread中伪造的)
- * 执行到这里时，rsp位于栈顶，然后弹出寄存器值
- * 弹出之后还要向上移动7个unsigned long的大小，从而弹出额外的信息（详见pt_regs）
- */
-/*
-void kernel_thread_func(void)
-{
-    __asm__ volatile(
-    //"kernel_thread_func:	\n\t"
-    "	popq	%r15	\n\t"
-    "	popq	%r14	\n\t"
-    "	popq	%r13	\n\t"
-    "	popq	%r12	\n\t"
-    "	popq	%r11	\n\t"
-    "	popq	%r10	\n\t"
-    "	popq	%r9	\n\t"
-    "	popq	%r8	\n\t"
-    "	popq	%rbx	\n\t"
-    "	popq	%rcx	\n\t"
-    "	popq	%rdx	\n\t"
-    "	popq	%rsi	\n\t"
-    "	popq	%rdi	\n\t"
-    "	popq	%rbp	\n\t"
-    "	popq	%rax	\n\t"
-    "	movq	%rax,	%ds	\n\t"
-    "	popq	%rax		\n\t"
-    "	movq	%rax,	%es	\n\t"
-    "	popq	%rax		\n\t"
-    "	addq	$0x38,	%rsp	\n\t"
-    /////////////////////////////////
-    "	movq	%rdx,	%rdi	\n\t"
-    "	callq	*%rbx		\n\t"
-    "	movq	%rax,	%rdi	\n\t"
-    "	callq	process_thread_do_exit		\n\t");
-}
-
-*/
-
-/**
  * @brief 初始化内核进程
  *
  * @param fn 目标程序的地址
@@ -302,15 +310,6 @@ void process_init()
 
     initial_mm.stack_start = _stack_start;
 
-    /*
-    // 向MSR寄存器组中的 IA32_SYSENTER_CS寄存器写入内核的代码段的地址
-    wrmsr(0x174, KERNEL_CS);
-    // 向MSR寄存器组中的 IA32_SYSENTER_ESP寄存器写入内核进程的rbp（在syscall入口中会将rsp减去相应的数值）
-    wrmsr(0x175, current_pcb->thread->rbp);
-
-    // 向MSR寄存器组中的 IA32_SYSENTER_EIP寄存器写入系统调用入口的地址。
-    wrmsr(0x176, (ul)system_call);
-    */
     // 初始化进程和tss
     // set_tss64((uint *)phys_2_virt(TSS64_Table), initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 

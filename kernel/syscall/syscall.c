@@ -148,7 +148,7 @@ uint64_t sys_open(struct pt_regs *regs)
         return -EISDIR;
 
     // 创建文件描述符
-    struct vfs_file_t *file_ptr = (struct vfs_f2ile_t *)kmalloc(sizeof(struct vfs_file_t), 0);
+    struct vfs_file_t *file_ptr = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
     memset(file_ptr, 0, sizeof(struct vfs_file_t));
 
     int errcode = -1;
@@ -202,6 +202,66 @@ uint64_t sys_open(struct pt_regs *regs)
     return fd_num;
 }
 
+/**
+ * @brief 关闭文件系统调用
+ *
+ * @param fd_num 文件描述符号
+ *
+ * @param regs
+ * @return uint64_t
+ */
+uint64_t sys_close(struct pt_regs *regs)
+{
+    int fd_num = (int)regs->r8;
+
+    kdebug("sys close: fd=%d", fd_num);
+    // 校验文件描述符范围
+    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
+        return -EBADF;
+
+    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
+    uint64_t ret;
+    // If there is a valid close function
+    if (file_ptr->file_ops && file_ptr->file_ops->close)
+        ret = file_ptr->file_ops->close(file_ptr->dEntry->dir_inode, file_ptr);
+
+    kfree(file_ptr);
+    current_pcb->fds[fd_num] = NULL;
+    return 0;
+}
+
+/**
+ * @brief 从文件中读取数据
+ * 
+ * @param fd_num regs->r8 文件描述符号
+ * @param buf regs->r9 输出缓冲区
+ * @param count regs->r10 要读取的字节数
+ * 
+ * @return uint64_t 
+ */
+uint64_t sys_read(struct pt_regs *regs)
+{
+    int fd_num = (int)regs->r8;
+    void *buf = (void*)regs->r9;
+    int64_t count = (int64_t)regs->r10;
+
+    // kdebug("sys read: fd=%d", fd_num);
+
+    // 校验文件描述符范围
+    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
+        return -EBADF;
+
+    if (count < 0)
+        return -EINVAL;
+
+    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
+    uint64_t ret;
+    if (file_ptr->file_ops && file_ptr->file_ops->read)
+        ret = file_ptr->file_ops->read(file_ptr, (char *)buf, count, &(file_ptr->position));
+
+    return ret;
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();
@@ -221,5 +281,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [0] = system_call_not_exists,
         [1] = sys_put_string,
         [2] = sys_open,
-        [3 ... 254] = system_call_not_exists,
+        [3] = sys_close,
+        [4] = sys_read,
+        [5 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

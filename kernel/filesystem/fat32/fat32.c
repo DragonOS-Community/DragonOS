@@ -4,6 +4,7 @@
 #include <filesystem/MBR.h>
 #include <process/spinlock.h>
 #include <mm/slab.h>
+#include <common/errno.h>
 
 struct vfs_super_block_operations_t fat32_sb_ops;
 struct vfs_dir_entry_operations_t fat32_dEntry_ops;
@@ -30,7 +31,7 @@ struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t
     uint8_t buf[512] = {0};
 
     // 读取文件系统的boot扇区
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, DPT->DPTE[part_num].starting_LBA, 1, (uint64_t)&buf, ahci_ctrl_num, ahci_port_num);
+    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, DPT->DPTE[part_num].starting_LBA, 1, (uint64_t)&buf, ahci_ctrl_num, ahci_port_num);
 
     // 挂载文件系统到vfs
     return vfs_mount_fs("FAT32", (void *)(&DPT->DPTE[part_num]), VFS_DPT_MBR, buf, ahci_ctrl_num, ahci_port_num, part_num);
@@ -47,17 +48,17 @@ uint32_t fat32_read_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster)
 {
     // 计算每个扇区内含有的FAT表项数
     // FAT每项4bytes
-    uint32_t fat_ent_per_sec = (fsbi->bootsector.BPB_BytesPerSec >> 2); // 该值应为2的n次幂
+    uint32_t fat_ent_per_sec = (fsbi->bytes_per_sec >> 2); // 该值应为2的n次幂
+    
     uint32_t buf[256];
-    memset(buf, 0, fsbi->bootsector.BPB_BytesPerSec);
+    memset(buf, 0, fsbi->bytes_per_sec);
 
     // 读取一个sector的数据，
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
+    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
                             (uint64_t)&buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
     // 返回下一个fat表项的值（也就是下一个cluster）
     return buf[cluster & (fat_ent_per_sec - 1)] & 0x0fffffff;
-    ;
 }
 
 /**
@@ -76,14 +77,14 @@ uint32_t fat32_write_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t
     uint32_t buf[256];
     memset(buf, 0, fsbi->bootsector.BPB_BytesPerSec);
 
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
+    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
                             (uint64_t)&buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
     buf[cluster & (fat_ent_per_sec - 1)] = (buf[cluster & (fat_ent_per_sec - 1)] & 0xf0000000) | (value & 0x0fffffff);
     // 向FAT1和FAT2写入数据
-    ahci_operation.transfer(ATA_CMD_WRITE_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
+    ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
                             (uint64_t)&buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
-    ahci_operation.transfer(ATA_CMD_WRITE_DMA_EXT, fsbi->FAT2_base_sector + (cluster / fat_ent_per_sec), 1,
+    ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT2_base_sector + (cluster / fat_ent_per_sec), 1,
                             (uint64_t)&buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
     return 0;
@@ -120,8 +121,8 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
         // kdebug("sector=%d",sector);
 
         // 读取父目录项的起始簇数据
-        ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
-        // ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, sector, fat32_part_info[part_id].bootsector.BPB_SecPerClus, (uint64_t)buf, fat32_part_info[part_id].ahci_ctrl_num, fat32_part_info[part_id].ahci_port_num);
+        ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+        // ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, sector, fat32_part_info[part_id].bootsector.BPB_SecPerClus, (uint64_t)buf, fat32_part_info[part_id].ahci_ctrl_num, fat32_part_info[part_id].ahci_port_num);
 
         tmp_dEntry = (struct fat32_Directory_t *)buf;
 
@@ -344,7 +345,6 @@ find_lookup_success:; // 找到目标dentry
     return dest_dentry;
 }
 
-
 /**
  * @brief 创建fat32文件系统的超级块
  *
@@ -396,7 +396,7 @@ struct vfs_superblock_t *fat32_read_superblock(void *DPTE, uint8_t DPT_type, voi
 
     // fsinfo扇区的信息
     memset(&fsbi->fsinfo, 0, sizeof(struct fat32_FSInfo_t));
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, MBR_DPTE->starting_LBA + fbs->BPB_FSInfo, 1, (uint64_t)&fsbi->fsinfo, ahci_ctrl_num, ahci_port_num);
+    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, MBR_DPTE->starting_LBA + fbs->BPB_FSInfo, 1, (uint64_t)&fsbi->fsinfo, ahci_ctrl_num, ahci_port_num);
     printk_color(BLUE, BLACK, "FAT32 FSInfo\n\tFSI_LeadSig:%#018lx\n\tFSI_StrucSig:%#018lx\n\tFSI_Free_Count:%#018lx\n", fsbi->fsinfo.FSI_LeadSig, fsbi->fsinfo.FSI_StrucSig, fsbi->fsinfo.FSI_Free_Count);
 
     // 初始化超级块的dir entry
@@ -485,7 +485,7 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
 
     uint8_t *buf = (uint8_t *)kmalloc(fsbi->bytes_per_clus, 0);
     memset(buf, 0, sizeof(fsbi->bytes_per_clus));
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
     // 计算目标dEntry所在的位置
     struct fat32_Directory_t *fdEntry = (struct fat32_Directory_t *)((uint64_t)buf + finode->dEntry_location_clus_offset);
@@ -496,7 +496,7 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
     fdEntry->DIR_FstClusHI = (finode->first_clus >> 16) | (fdEntry->DIR_FstClusHI & 0xf000);
 
     // 将dir entry写回磁盘
-    ahci_operation.transfer(ATA_CMD_WRITE_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+    ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
     kfree(buf);
 }
@@ -546,14 +546,95 @@ long fat32_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
 // todo: close
 long fat32_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
 {
+    return VFS_SUCCESS;
 }
 
-// todo: read
-long fat32_read(struct vfs_file_t *file_ptr, char *buf, uint64_t buf_size, long *position)
+/**
+ * @brief 从fat32文件系统读取数据
+ * 
+ * @param file_ptr 文件描述符
+ * @param buf 输出缓冲区
+ * @param count 要读取的字节数
+ * @param position 文件指针位置
+ * @return long 执行成功：传输的字节数量    执行失败：错误码（小于0）
+ */
+long fat32_read(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *position)
 {
+
+    struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)(file_ptr->dEntry->dir_inode->private_inode_info);
+    fat32_sb_info_t *fsbi = (fat32_sb_info_t *)(file_ptr->dEntry->dir_inode->sb->private_sb_info);
+
+    // First cluster num of the file
+    uint64_t cluster = finode->first_clus;
+
+    // kdebug("fsbi->bytes_per_clus=%d", fsbi->bytes_per_clus);
+
+    // clus offset in file
+    uint64_t total_clus_of_file = (*position) / fsbi->bytes_per_clus;
+    // bytes offset in clus
+    uint64_t bytes_offset = (*position) % fsbi->bytes_per_clus;
+
+    if (!cluster)
+        return -EFAULT;
+
+    // find the actual cluster on disk of the specified position
+    for (int i = 0; i < total_clus_of_file; ++i)
+        cluster = fat32_read_FAT_entry(fsbi, cluster);
+
+    // 如果需要读取的数据边界大于文件大小
+    if (*position + count > file_ptr->dEntry->dir_inode->file_size)
+        count = file_ptr->dEntry->dir_inode->file_size - *position;
+
+    // 剩余还需要传输的字节数量
+    uint64_t bytes_remain = count;
+
+    // alloc buffer memory space for ahci transfer
+    void *tmp_buffer = kmalloc(fsbi->bytes_per_clus, 0);
+
+    int64_t retval = 0;
+    do
+    {
+
+        memset(tmp_buffer, 0, fsbi->bytes_per_clus);
+        uint64_t sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
+        // 读取一个簇的数据
+        int errno = ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buffer, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+        if (errno != AHCI_SUCCESS)
+        {
+            kerror("FAT32 FS(read) error!");
+            retval = -EIO;
+            break;
+        }
+
+        int64_t step_trans_len = 0; // 当前循环传输的字节数
+        if (bytes_remain > (fsbi->bytes_per_clus - bytes_offset))
+            step_trans_len = (fsbi->bytes_per_clus - bytes_offset);
+        else
+            step_trans_len = bytes_remain;
+
+        if (((uint64_t)buf) < USER_MAX_LINEAR_ADDR)
+            copy_to_user(buf, tmp_buffer + bytes_offset, step_trans_len);
+        else
+            memcpy(buf, tmp_buffer, step_trans_len);
+
+        bytes_remain -= step_trans_len;
+        buf += step_trans_len;
+        bytes_offset -= bytes_offset;
+
+        *position += step_trans_len; // 更新文件指针
+
+        cluster = fat32_read_FAT_entry(fsbi, cluster);
+    } while (bytes_remain && (cluster < 0x0ffffff8) && cluster != 0);
+
+    kfree(tmp_buffer);
+
+    if(!bytes_remain)
+        retval = count;
+
+    return retval;
 }
 // todo: write
-long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t buf_size, long *position)
+long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *position)
 {
 }
 // todo: lseek

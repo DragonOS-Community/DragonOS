@@ -254,7 +254,7 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
 
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
     cmdfis->c = 1; // Command
-    cmdfis->command = ATA_CMD_READ_DMA_EXT;
+    cmdfis->command = AHCI_CMD_READ_DMA_EXT;
 
     cmdfis->lba0 = (uint8_t)startl;
     cmdfis->lba1 = (uint8_t)(startl >> 8);
@@ -269,7 +269,7 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
     cmdfis->counth = (count >> 8) & 0xFF;
 
     // The below loop waits until the port is no longer busy before issuing a new command
-    while ((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin < 1000000)
+    while ((port->tfd & (AHCI_DEV_BUSY | AHCI_DEV_DRQ)) && spin < 1000000)
     {
         spin++;
     }
@@ -281,6 +281,7 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
 
     port->ci = 1 << slot; // Issue command
 
+    current_pcb->flags |= PROC_NEED_SCHED;
     sched_cfs();
     int retval = AHCI_SUCCESS;
     // Wait for completion
@@ -344,7 +345,7 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     FIS_REG_H2D *cmdfis = (FIS_REG_H2D *)(&cmdtbl->cfis);
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
     cmdfis->c = 1; // Command
-    cmdfis->command = ATA_CMD_WRITE_DMA_EXT;
+    cmdfis->command = AHCI_CMD_WRITE_DMA_EXT;
     cmdfis->lba0 = (uint8_t)startl;
     cmdfis->lba1 = (uint8_t)(startl >> 8);
     cmdfis->lba2 = (uint8_t)(startl >> 16);
@@ -358,7 +359,8 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     cmdfis->counth = count >> 8;
     //    printk("[slot]{%d}", slot);
     port->ci = 1; // Issue command
-
+    
+    current_pcb->flags |= PROC_NEED_SCHED;
     sched_cfs();
     int retval = AHCI_SUCCESS;
 
@@ -432,13 +434,13 @@ static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_a
     // 由于ahci不需要中断即可读取磁盘，因此end handler为空
     switch (cmd)
     {
-    case ATA_CMD_READ_DMA_EXT:
+    case AHCI_CMD_READ_DMA_EXT:
         pack->blk_pak.end_handler = NULL;
-        pack->blk_pak.cmd = ATA_CMD_READ_DMA_EXT;
+        pack->blk_pak.cmd = AHCI_CMD_READ_DMA_EXT;
         break;
-    case ATA_CMD_WRITE_DMA_EXT:
+    case AHCI_CMD_WRITE_DMA_EXT:
         pack->blk_pak.end_handler = NULL;
-        pack->blk_pak.cmd = ATA_CMD_WRITE_DMA_EXT;
+        pack->blk_pak.cmd = AHCI_CMD_WRITE_DMA_EXT;
         break;
     default:
         pack->blk_pak.end_handler = NULL;
@@ -485,10 +487,10 @@ static long ahci_query_disk()
     
     switch (pack->blk_pak.cmd)
     {
-    case ATA_CMD_READ_DMA_EXT:
+    case AHCI_CMD_READ_DMA_EXT:
         ret_val = ahci_read(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->blk_pak.LBA_start & 0xFFFFFFFF, ((pack->blk_pak.LBA_start) >> 32) & 0xFFFFFFFF, pack->blk_pak.count, pack->blk_pak.buffer_vaddr);
         break;
-    case ATA_CMD_WRITE_DMA_EXT:
+    case AHCI_CMD_WRITE_DMA_EXT:
         ret_val = ahci_write(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->blk_pak.LBA_start & 0xFFFFFFFF, ((pack->blk_pak.LBA_start) >> 32) & 0xFFFFFFFF, pack->blk_pak.count, pack->blk_pak.buffer_vaddr);
         break;
     default:
@@ -530,7 +532,7 @@ static long ahci_transfer(long cmd, uint64_t base_addr, uint64_t count, uint64_t
 {
     struct ahci_request_packet_t *pack = NULL;
 
-    if (cmd == ATA_CMD_READ_DMA_EXT || cmd == ATA_CMD_WRITE_DMA_EXT)
+    if (cmd == AHCI_CMD_READ_DMA_EXT || cmd == AHCI_CMD_WRITE_DMA_EXT)
     {
         pack = ahci_make_request(cmd, base_addr, count, buf, ahci_ctrl_num, port_num);
         ahci_submit(pack);

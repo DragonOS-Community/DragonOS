@@ -17,11 +17,11 @@
 #define HBA_PxCMD_FR 0x4000
 #define HBA_PxCMD_CR 0x8000
 
-#define ATA_DEV_BUSY 0x80
-#define ATA_DEV_DRQ 0x08
+#define AHCI_DEV_BUSY 0x80
+#define AHCI_DEV_DRQ 0x08
 
-#define ATA_CMD_READ_DMA_EXT 0x25
-#define ATA_CMD_WRITE_DMA_EXT 0x30
+#define AHCI_CMD_READ_DMA_EXT 0x25
+#define AHCI_CMD_WRITE_DMA_EXT 0x30
 
 #define HBA_PxIS_TFES (1 << 30) /* TFES - Task File Error Status */
 

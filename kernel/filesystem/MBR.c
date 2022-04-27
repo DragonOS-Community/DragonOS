@@ -14,7 +14,7 @@ struct MBR_disk_partition_table_t *MBR_read_partition_table(uint8_t ahci_ctrl_nu
 {
     unsigned char buf[512];
     memset(buf, 0, 512);
-    ahci_operation.transfer(ATA_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, ahci_ctrl_num, ahci_port_num);
+    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, 0, 1, (uint64_t)&buf, ahci_ctrl_num, ahci_port_num);
     MBR_partition_tables[ahci_ctrl_num][ahci_port_num] = *(struct MBR_disk_partition_table_t *)buf;
     return &MBR_partition_tables[ahci_ctrl_num][ahci_port_num];
 }

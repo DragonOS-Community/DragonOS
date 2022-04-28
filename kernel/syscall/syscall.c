@@ -268,6 +268,43 @@ uint64_t sys_read(struct pt_regs *regs)
     return ret;
 }
 
+
+/**
+ * @brief 向文件写入数据
+ *
+ * @param fd_num regs->r8 文件描述符号
+ * @param buf regs->r9 输入缓冲区
+ * @param count regs->r10 要写入的字节数
+ *
+ * @return uint64_t
+ */
+uint64_t sys_write(struct pt_regs *regs)
+{
+    int fd_num = (int)regs->r8;
+    void *buf = (void *)regs->r9;
+    int64_t count = (int64_t)regs->r10;
+
+    // kdebug("sys read: fd=%d", fd_num);
+
+    // 校验文件描述符范围
+    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
+        return -EBADF;
+
+    // 文件描述符不存在
+    if (current_pcb->fds[fd_num] == NULL)
+        return -EBADF;
+
+    if (count < 0)
+        return -EINVAL;
+
+    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
+    uint64_t ret;
+    if (file_ptr->file_ops && file_ptr->file_ops->write)
+        ret = file_ptr->file_ops->write(file_ptr, (char *)buf, count, &(file_ptr->position));
+
+    return ret;
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();

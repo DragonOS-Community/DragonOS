@@ -109,34 +109,79 @@ void user_level_function()
         int fd_num = err_code;
 
         int count = 16;
-        while (count)
-        {
-            uchar buf[128] = {0};
-            // Test sys_read
-            addr = (uint64_t)&buf;
-            __asm__ __volatile__(
-                "movq %2, %%r8 \n\t"
-                "movq %3, %%r9 \n\t"
-                "movq %4, %%r10 \n\t"
-                "movq %5, %%r11 \n\t"
-                "movq %6, %%r12 \n\t"
-                "movq %7, %%r13 \n\t"
-                "movq %8, %%r14 \n\t"
-                "movq %9, %%r15 \n\t"
-                "int $0x80   \n\t"
-                : "=a"(err_code)
-                : "a"(SYS_READ), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-                : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-            count = err_code;
-            // 将读取到的数据打印出来
-            addr = (ul)buf;
-            __asm__ __volatile__(
-                "movq %2, %%r8 \n\t"
-                "int $0x80   \n\t"
-                : "=a"(err_code)
-                : "a"(SYS_PUT_STRING), "m"(addr)
-                : "memory", "r8");
-        }
+        // while (count)
+        //{
+        uchar buf[128] = {0};
+        // Test sys_read
+        addr = (uint64_t)&buf;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "movq %3, %%r9 \n\t"
+            "movq %4, %%r10 \n\t"
+            "movq %5, %%r11 \n\t"
+            "movq %6, %%r12 \n\t"
+            "movq %7, %%r13 \n\t"
+            "movq %8, %%r14 \n\t"
+            "movq %9, %%r15 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_READ), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+        count = err_code;
+        // 将读取到的数据打印出来
+        addr = (ul)buf;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_PUT_STRING), "m"(addr)
+            : "memory", "r8");
+        // SYS_WRITE
+        char test1[] = "Test11111111jdjdjdjdjdjd\n";
+
+        addr = (uint64_t)&test1;
+        count = 26;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "movq %3, %%r9 \n\t"
+            "movq %4, %%r10 \n\t"
+            "movq %5, %%r11 \n\t"
+            "movq %6, %%r12 \n\t"
+            "movq %7, %%r13 \n\t"
+            "movq %8, %%r14 \n\t"
+            "movq %9, %%r15 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_WRITE), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+
+        // Test sys_read
+        addr = (uint64_t)&buf;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "movq %3, %%r9 \n\t"
+            "movq %4, %%r10 \n\t"
+            "movq %5, %%r11 \n\t"
+            "movq %6, %%r12 \n\t"
+            "movq %7, %%r13 \n\t"
+            "movq %8, %%r14 \n\t"
+            "movq %9, %%r15 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_READ), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+        count = err_code;
+        // 将读取到的数据打印出来
+        addr = (ul)buf+20;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_PUT_STRING), "m"(addr)
+            : "memory", "r8");
+
+        // Test Sys
+        //}
 
         // Test sys_close
         __asm__ __volatile__(
@@ -152,6 +197,9 @@ void user_level_function()
             : "=a"(err_code)
             : "a"(SYS_CLOSE), "m"(fd_num), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
             : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+
+        while (1)
+            pause();
     }
     while (1)
         pause();

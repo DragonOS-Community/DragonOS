@@ -46,7 +46,7 @@ void syscall_init()
 {
     kinfo("Initializing syscall...");
 
-    set_system_intr_gate(0x80, 0, syscall_int); // 系统调用门
+    set_system_trap_gate(0x80, 0, syscall_int); // 系统调用门
 }
 
 /**
@@ -284,7 +284,7 @@ uint64_t sys_write(struct pt_regs *regs)
     void *buf = (void *)regs->r9;
     int64_t count = (int64_t)regs->r10;
 
-    // kdebug("sys read: fd=%d", fd_num);
+    kdebug("sys write: fd=%d", fd_num);
 
     // 校验文件描述符范围
     if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
@@ -326,5 +326,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [2] = sys_open,
         [3] = sys_close,
         [4] = sys_read,
-        [5 ... 254] = system_call_not_exists,
+        [5] = sys_write,
+        [6 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

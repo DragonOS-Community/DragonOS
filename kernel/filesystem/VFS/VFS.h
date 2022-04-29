@@ -24,7 +24,7 @@ struct vfs_superblock_t *vfs_root_sb = NULL;
 
 /**
  * @brief 目录项的属性
- * 
+ *
  */
 #define VFS_ATTR_FILE (1UL << 0)
 #define VFS_ATTR_DIR (1UL << 1)
@@ -73,7 +73,7 @@ struct vfs_index_node_t
 
 /**
  * @brief 文件描述符
- * 
+ *
  */
 struct vfs_file_t
 {
@@ -95,9 +95,9 @@ struct vfs_filesystem_type_t
 
 struct vfs_super_block_operations_t
 {
-    void (*write_superblock)(struct vfs_superblock_t *sb);
+    void (*write_superblock)(struct vfs_superblock_t *sb); // 将超级块信息写入磁盘
     void (*put_superblock)(struct vfs_superblock_t *sb);
-    void (*write_inode)(struct vfs_index_node_t *inode);
+    void (*write_inode)(struct vfs_index_node_t *inode); // 将inode信息写入磁盘
 };
 
 /**
@@ -152,7 +152,6 @@ uint64_t vfs_unregister_filesystem(struct vfs_filesystem_type_t *fs);
  * @return struct vfs_superblock_t*
  */
 struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num);
-
 
 /**
  * @brief 按照路径查找文件

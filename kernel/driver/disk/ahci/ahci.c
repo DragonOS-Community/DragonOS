@@ -312,6 +312,7 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
 static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
                        uint64_t buf)
 {
+    kdebug("ahci write");
     port->is = 0xffff; // Clear pending interrupt bits
     int slot = ahci_find_cmdslot(port);
     if (slot == -1)
@@ -361,7 +362,7 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     port->ci = 1; // Issue command
     
     current_pcb->flags |= PROC_NEED_SCHED;
-    sched_cfs();
+    //sched_cfs();
     int retval = AHCI_SUCCESS;
 
     while (1)
@@ -382,7 +383,7 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
         kerror("Write disk error");
         retval = E_TASK_FILE_ERROR;
     }
-    
+    kdebug("ahci write retval=%d", retval);
     enter_syscall_int(SYS_AHCI_END_REQ, 0, 0, 0, 0, 0, 0, 0, 0);
     return retval;
 }

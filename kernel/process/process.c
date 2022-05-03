@@ -88,9 +88,10 @@ void user_level_function()
     while (1)
     {
         // 测试sys_open
-        char string[] = "a.txt";
+        char string[] = "333.txt";
         long err_code = 1;
         int zero = 0;
+
         uint64_t addr = (ul)string;
         __asm__ __volatile__(
             "movq %2, %%r8 \n\t"
@@ -108,7 +109,7 @@ void user_level_function()
 
         int fd_num = err_code;
 
-        int count = 16;
+        int count = 128;
         // while (count)
         //{
         uchar buf[128] = {0};
@@ -137,10 +138,10 @@ void user_level_function()
             : "a"(SYS_PUT_STRING), "m"(addr)
             : "memory", "r8");
         // SYS_WRITE
-        char test1[] = "Test11111111jdjdjdjdjdjd\n";
+        char test1[] = "GGGGHHHHHHHHh112343";
 
         addr = (uint64_t)&test1;
-        count = 26;
+        count = 19;
         __asm__ __volatile__(
             "movq %2, %%r8 \n\t"
             "movq %3, %%r9 \n\t"
@@ -154,7 +155,37 @@ void user_level_function()
             : "=a"(err_code)
             : "a"(SYS_WRITE), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
             : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+        // Test sys_close
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "movq %3, %%r9 \n\t"
+            "movq %4, %%r10 \n\t"
+            "movq %5, %%r11 \n\t"
+            "movq %6, %%r12 \n\t"
+            "movq %7, %%r13 \n\t"
+            "movq %8, %%r14 \n\t"
+            "movq %9, %%r15 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_CLOSE), "m"(fd_num), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
 
+        addr = (ul)string;
+        __asm__ __volatile__(
+            "movq %2, %%r8 \n\t"
+            "movq %3, %%r9 \n\t"
+            "movq %4, %%r10 \n\t"
+            "movq %5, %%r11 \n\t"
+            "movq %6, %%r12 \n\t"
+            "movq %7, %%r13 \n\t"
+            "movq %8, %%r14 \n\t"
+            "movq %9, %%r15 \n\t"
+            "int $0x80   \n\t"
+            : "=a"(err_code)
+            : "a"(SYS_OPEN), "m"(addr), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
+            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+        fd_num = err_code;
+        count = 128;
         // Test sys_read
         addr = (uint64_t)&buf;
         __asm__ __volatile__(
@@ -172,7 +203,7 @@ void user_level_function()
             : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
         count = err_code;
         // 将读取到的数据打印出来
-        addr = (ul)buf+20;
+        addr = (ul)buf;
         __asm__ __volatile__(
             "movq %2, %%r8 \n\t"
             "int $0x80   \n\t"
@@ -182,21 +213,6 @@ void user_level_function()
 
         // Test Sys
         //}
-
-        // Test sys_close
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_CLOSE), "m"(fd_num), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
 
         while (1)
             pause();

@@ -127,8 +127,8 @@ struct vfs_file_operations_t
 {
     long (*open)(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr);
     long (*close)(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr);
-    long (*read)(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *position);
-    long (*write)(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *position);
+    long (*read)(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position);
+    long (*write)(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position);
     long (*lseek)(struct vfs_file_t *file_ptr, long offset, long origin);
     long (*ioctl)(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg);
 };

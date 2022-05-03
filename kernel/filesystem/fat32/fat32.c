@@ -73,9 +73,9 @@ uint32_t fat32_write_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t
 {
     // 计算每个扇区内含有的FAT表项数
     // FAT每项4bytes
-    uint32_t fat_ent_per_sec = (fsbi->bootsector.BPB_BytesPerSec >> 2); // 该值应为2的n次幂
+    uint32_t fat_ent_per_sec = (fsbi->bytes_per_sec >> 2); // 该值应为2的n次幂
     uint32_t buf[256];
-    memset(buf, 0, fsbi->bootsector.BPB_BytesPerSec);
+    memset(buf, 0, fsbi->bytes_per_sec);
 
     ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
                             (uint64_t)&buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
@@ -335,6 +335,8 @@ find_lookup_success:; // 找到目标dentry
     finode->first_clus = ((tmp_dEntry->DIR_FstClusHI << 16) | tmp_dEntry->DIR_FstClusLO) & 0x0fffffff;
     finode->dEntry_location_clus = cluster;
     finode->dEntry_location_clus_offset = tmp_dEntry - (struct fat32_Directory_t *)buf; //计算dentry的偏移量
+    kdebug("finode->dEntry_location_clus=%#018lx", finode->dEntry_location_clus);
+    kdebug("finode->dEntry_location_clus_offset=%#018lx", finode->dEntry_location_clus_offset);
     finode->create_date = tmp_dEntry->DIR_CrtDate;
     finode->create_time = tmp_dEntry->DIR_CrtTime;
     finode->write_date = tmp_dEntry->DIR_WrtDate;
@@ -482,19 +484,24 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
 
     // 计算目标inode对应数据区的LBA地址
     uint64_t fLBA = fsbi->first_data_sector + (finode->dEntry_location_clus - 2) * fsbi->sec_per_clus;
+    kdebug("fLBA=%d", fLBA);
+    kdebug("fsbi->first_data_sector=%d", fsbi->first_data_sector);
 
-    uint8_t *buf = (uint8_t *)kmalloc(fsbi->bytes_per_clus, 0);
-    memset(buf, 0, sizeof(fsbi->bytes_per_clus));
+    struct fat32_Directory_t *buf = (struct fat32_Directory_t *)kmalloc(fsbi->bytes_per_clus, 0);
+    memset(buf, 0, fsbi->bytes_per_clus);
     ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
     // 计算目标dEntry所在的位置
-    struct fat32_Directory_t *fdEntry = (struct fat32_Directory_t *)((uint64_t)buf + finode->dEntry_location_clus_offset);
+    struct fat32_Directory_t *fdEntry = buf + finode->dEntry_location_clus_offset;
 
     // 写入fat32文件系统的dir_entry
+    kdebug("inode->file_size=%#018lx", inode->file_size);
+    kdebug("before   fdEntry->DIR_FileSize=%d", fdEntry->DIR_FileSize);
     fdEntry->DIR_FileSize = inode->file_size;
     fdEntry->DIR_FstClusLO = finode->first_clus & 0xffff;
     fdEntry->DIR_FstClusHI = (finode->first_clus >> 16) | (fdEntry->DIR_FstClusHI & 0xf000);
 
+    kdebug("middle   fdEntry->DIR_FileSize=%d", fdEntry->DIR_FileSize);
     // 将dir entry写回磁盘
     ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
@@ -558,7 +565,7 @@ long fat32_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
  * @param position 文件指针位置
  * @return long 执行成功：传输的字节数量    执行失败：错误码（小于0）
  */
-long fat32_read(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *position)
+long fat32_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position)
 {
 
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)(file_ptr->dEntry->dir_inode->private_inode_info);
@@ -566,6 +573,7 @@ long fat32_read(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *po
 
     // First cluster num of the file
     uint64_t cluster = finode->first_clus;
+    // kdebug("fsbi->bytes_per_clus=%d fsbi->sec_per_clus=%d finode->first_clus=%d cluster=%d", fsbi->bytes_per_clus, fsbi->sec_per_clus, finode->first_clus, cluster);
 
     // kdebug("fsbi->bytes_per_clus=%d", fsbi->bytes_per_clus);
 
@@ -586,7 +594,7 @@ long fat32_read(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *po
         count = file_ptr->dEntry->dir_inode->file_size - *position;
 
     // 剩余还需要传输的字节数量
-    uint64_t bytes_remain = count;
+    int64_t bytes_remain = count;
 
     // alloc buffer memory space for ahci transfer
     void *tmp_buffer = kmalloc(fsbi->bytes_per_clus, 0);
@@ -597,6 +605,7 @@ long fat32_read(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *po
 
         memset(tmp_buffer, 0, fsbi->bytes_per_clus);
         uint64_t sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
+
         // 读取一个簇的数据
         int errno = ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buffer, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
         if (errno != AHCI_SUCCESS)
@@ -671,7 +680,7 @@ uint64_t fat32_find_available_cluster(fat32_sb_info_t *fsbi)
  * @param position 文件指针位置
  * @return long 执行成功：传输的字节数量    执行失败：错误码（小于0）
  */
-long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *position)
+long fat32_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position)
 {
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)file_ptr->dEntry->dir_inode->private_inode_info;
     fat32_sb_info_t *fsbi = (fat32_sb_info_t *)(file_ptr->dEntry->dir_inode->sb->private_sb_info);
@@ -680,7 +689,8 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *p
     uint64_t cluster = finode->first_clus;
     int64_t flags = 0;
 
-    kdebug("fsbi->bytes_per_clus=%d", fsbi->bytes_per_clus);
+    // kdebug("fsbi->bytes_per_clus=%d fsbi->sec_per_clus=%d finode->first_clus=%d *position=%d", fsbi->bytes_per_clus, fsbi->sec_per_clus, finode->first_clus, *position);
+    // kdebug("buf=%s", buf);
     // clus offset in file
     uint64_t clus_offset_in_file = (*position) / fsbi->bytes_per_clus;
     // bytes offset in clus
@@ -698,37 +708,41 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *p
         for (uint64_t i = 0; i < clus_offset_in_file; ++i)
             cluster = fat32_read_FAT_entry(fsbi, cluster);
     }
-    kdebug("hhhhhhhh");
-    // 没有可用的磁盘空间
+    // kdebug("cluster(start)=%d", cluster);
+    //  没有可用的磁盘空间
     if (!cluster)
         return -ENOSPC;
 
     if (flags) // 空文件
     {
+        // kdebug("empty file");
         finode->first_clus = cluster;
         // 写入目录项
         file_ptr->dEntry->dir_inode->sb->sb_ops->write_inode(file_ptr->dEntry->dir_inode);
-        fat32_write_FAT_entry(fsbi, cluster, 0x0fffffff8); // 写入fat表项
+        fat32_write_FAT_entry(fsbi, cluster, 0x0ffffff8); // 写入fat表项
     }
 
-    uint64_t bytes_remain = count;
+    int64_t bytes_remain = count;
+
+    if (count < 0) // 要写入的字节数小于0
+        return -EINVAL;
+
     uint64_t sector;
     int64_t retval = 0;
 
     void *tmp_buffer = kmalloc(fsbi->bytes_per_clus, 0);
-    kdebug("ggggg");
     do
     {
         memset(tmp_buffer, 0, fsbi->bytes_per_clus);
         sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus; // 计算对应的扇区
-        
         if (!flags)                                                            // 当前簇已分配
         {
-            // 读取一个簇的数据
+            // kdebug("read existed sec=%ld", sector);
+            //  读取一个簇的数据
             int errno = ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buffer, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
             if (errno != AHCI_SUCCESS)
             {
-                kerror("FAT32 FS(write)  read disk error!");
+                // kerror("FAT32 FS(write)  read disk error!");
                 retval = -EIO;
                 break;
             }
@@ -740,6 +754,7 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *p
         else
             step_trans_len = bytes_remain;
 
+        // kdebug("step_trans_len=%d, bytes_offset=%d", step_trans_len, bytes_offset);
         if (((uint64_t)buf) < USER_MAX_LINEAR_ADDR)
             copy_from_user(tmp_buffer + bytes_offset, buf, step_trans_len);
         else
@@ -749,7 +764,7 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *p
         int errno = ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buffer, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
         if (errno != AHCI_SUCCESS)
         {
-            kerror("FAT32 FS(write)  read disk error!");
+            kerror("FAT32 FS(write)  write disk error!");
             retval = -EIO;
             break;
         }
@@ -759,7 +774,7 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *p
         bytes_offset -= bytes_offset;
 
         *position += step_trans_len; // 更新文件指针
-        kdebug("step_trans_len=%d", step_trans_len);
+        // kdebug("step_trans_len=%d", step_trans_len);
 
         int next_clus = 0;
         if (bytes_remain)
@@ -794,7 +809,7 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, uint64_t count, long *p
     kfree(tmp_buffer);
     if (!bytes_remain)
         retval = count;
-    kdebug("retval=%lld", retval);
+    // kdebug("retval=%lld", retval);
     return retval;
 }
 // todo: lseek

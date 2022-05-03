@@ -268,7 +268,6 @@ uint64_t sys_read(struct pt_regs *regs)
     return ret;
 }
 
-
 /**
  * @brief 向文件写入数据
  *
@@ -305,6 +304,38 @@ uint64_t sys_write(struct pt_regs *regs)
     return ret;
 }
 
+/**
+ * @brief 调整文件的访问位置
+ *
+ * @param fd_num 文件描述符号
+ * @param offset 偏移量
+ * @param whence 调整模式
+ * @return uint64_t
+ */
+uint64_t sys_lseek(struct pt_regs *regs)
+{
+    int fd_num = (int)regs->r8;
+    long offset = (long)regs->r9;
+    int whence = (int)regs->r10;
+
+    kdebug("sys_lseek: fd=%d", fd_num);
+    uint64_t retval = 0;
+
+    // 校验文件描述符范围
+    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
+        return -EBADF;
+
+    // 文件描述符不存在
+    if (current_pcb->fds[fd_num] == NULL)
+        return -EBADF;
+
+    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
+    if (file_ptr->file_ops && file_ptr->file_ops->lseek)
+        retval = file_ptr->file_ops->lseek(file_ptr, offset, whence);
+
+    return retval;
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();
@@ -327,5 +358,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [3] = sys_close,
         [4] = sys_read,
         [5] = sys_write,
-        [6 ... 254] = system_call_not_exists,
+        [6] = sys_lseek,
+        [7 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

@@ -312,7 +312,7 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
 static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
                        uint64_t buf)
 {
-    kdebug("ahci write");
+    // kdebug("ahci write");
     port->is = 0xffff; // Clear pending interrupt bits
     int slot = ahci_find_cmdslot(port);
     if (slot == -1)

@@ -5,6 +5,7 @@
 #include <process/spinlock.h>
 #include <mm/slab.h>
 #include <common/errno.h>
+#include <common/stdio.h>
 
 struct vfs_super_block_operations_t fat32_sb_ops;
 struct vfs_dir_entry_operations_t fat32_dEntry_ops;
@@ -484,8 +485,7 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
 
     // 计算目标inode对应数据区的LBA地址
     uint64_t fLBA = fsbi->first_data_sector + (finode->dEntry_location_clus - 2) * fsbi->sec_per_clus;
-    kdebug("fLBA=%d", fLBA);
-    kdebug("fsbi->first_data_sector=%d", fsbi->first_data_sector);
+
 
     struct fat32_Directory_t *buf = (struct fat32_Directory_t *)kmalloc(fsbi->bytes_per_clus, 0);
     memset(buf, 0, fsbi->bytes_per_clus);
@@ -495,13 +495,11 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
     struct fat32_Directory_t *fdEntry = buf + finode->dEntry_location_clus_offset;
 
     // 写入fat32文件系统的dir_entry
-    kdebug("inode->file_size=%#018lx", inode->file_size);
-    kdebug("before   fdEntry->DIR_FileSize=%d", fdEntry->DIR_FileSize);
     fdEntry->DIR_FileSize = inode->file_size;
     fdEntry->DIR_FstClusLO = finode->first_clus & 0xffff;
     fdEntry->DIR_FstClusHI = (finode->first_clus >> 16) | (fdEntry->DIR_FstClusHI & 0xf000);
 
-    kdebug("middle   fdEntry->DIR_FileSize=%d", fdEntry->DIR_FileSize);
+
     // 将dir entry写回磁盘
     ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
 
@@ -812,9 +810,43 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *po
     // kdebug("retval=%lld", retval);
     return retval;
 }
-// todo: lseek
-long fat32_lseek(struct vfs_file_t *file_ptr, long offset, long origin)
+
+/**
+ * @brief 调整文件的当前访问位置
+ *
+ * @param file_ptr vfs文件指针
+ * @param offset 调整的偏移量
+ * @param whence 调整方法
+ * @return long 更新后的指针位置
+ */
+long fat32_lseek(struct vfs_file_t *file_ptr, long offset, long whence)
 {
+    struct vfs_index_node_t *inode = file_ptr->dEntry->dir_inode;
+
+    long pos = 0;
+    switch (whence)
+    {
+    case SEEK_SET: // 相对于文件头
+        pos = offset;
+        break;
+    case SEEK_CUR: // 相对于当前位置
+        pos = file_ptr->position + offset;
+        break;
+    case SEEK_END: // 相对于文件末尾
+        pos = file_ptr->dEntry->dir_inode->file_size + offset;
+        break;
+
+    default:
+        return -EINVAL;
+        break;
+    }
+
+    if(pos<0||pos>file_ptr->dEntry->dir_inode->file_size)
+        return -EOVERFLOW;
+    file_ptr->position = pos;
+    
+    kdebug("fat32 lseek -> position=%d", file_ptr->position);
+    return pos;
 }
 // todo: ioctl
 long fat32_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg)

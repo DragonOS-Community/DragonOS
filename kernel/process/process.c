@@ -9,9 +9,20 @@
 #include <sched/sched.h>
 #include <filesystem/fat32/fat32.h>
 #include <common/stdio.h>
+#include <process/spinlock.h>
+
+spinlock_t process_global_pid_write_lock; // 增加pid的写锁
+long process_global_pid = 0;              // 系统中最大的pid
 
 extern void system_call(void);
 extern void kernel_thread_func(void);
+
+/**
+ * @brief 将进程加入到调度器的就绪队列中
+ *
+ * @param pcb 进程的pcb
+ */
+static inline void process_wakeup(struct process_control_block *pcb);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 struct mm_struct initial_mm = {0};
@@ -386,7 +397,7 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
     // kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
     // kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
     // kdebug("1111\tregs.rip = %#018lx", regs.rip);
-    return do_fork(&regs, flags, 0, 0);
+    return do_fork(&regs, flags | CLONE_VM, 0, 0);
 }
 
 /**
@@ -406,26 +417,47 @@ void process_init()
 
     initial_mm.rodata_addr_start = (ul)&_rodata;
     initial_mm.rodata_addr_end = (ul)&_erodata;
+    initial_mm.bss_start = (uint64_t)&_bss;
+    initial_mm.bss_end = (uint64_t)&_ebss;
 
     initial_mm.brk_start = 0;
     initial_mm.brk_end = memory_management_struct.kernel_end;
 
     initial_mm.stack_start = _stack_start;
 
-    // 初始化进程和tss
-    // set_tss64((uint *)phys_2_virt(TSS64_Table), initial_thread.rbp, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1, initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
-
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
+
+    // ========= 在IDLE进程的顶层页表中添加对内核地址空间的映射 =====================
+
+    // 由于IDLE进程的顶层页表的高地址部分会被后续进程所复制，为了使所有进程能够共享相同的内核空间，
+    //  因此需要先在IDLE进程的顶层页表内映射二级页表
+
+    uint64_t *idle_pml4t_vaddr = (uint64_t *)phys_2_virt((uint64_t)get_CR3() & (~0xfffUL));
+
+    for (int i = 256; i < 512; ++i)
+    {
+        uint64_t *tmp = idle_pml4t_vaddr + i;
+        if(*tmp==0)
+        {
+            void* pdpt = kmalloc(PAGE_4K_SIZE,0);
+            memset(pdpt, 0, PAGE_4K_SIZE);
+            set_pml4t(tmp, mk_pml4t(virt_2_phys(pdpt), PAGE_KERNEL_PGT));
+        }
+    }
     /*
     kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
     kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
     kdebug("initial_tss[0].ist1=%#018lx", initial_tss[0].ist1);
 */
+    // 初始化pid的写锁
+    spin_init(&process_global_pid_write_lock);
+
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
-    kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_FILES | CLONE_SIGNAL); // 初始化内核进程
+    kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核进程
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;
+    initial_proc_union.pcb.cpu_id = 0;
     // 获取新的进程的pcb
     // struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
 
@@ -446,17 +478,23 @@ void process_init()
 
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size)
 {
+    int retval = 0;
     struct process_control_block *tsk = NULL;
     // kdebug("222\tregs.rip = %#018lx", regs->rip);
-    //  获取一个物理页并在这个物理页内初始化pcb
-    struct Page *pp = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED | PAGE_KERNEL);
 
-    tsk = (struct process_control_block *)phys_2_virt(pp->addr_phys);
+    // 为新的进程分配栈空间，并将pcb放置在底部
+    tsk = (struct process_control_block *)kmalloc(STACK_SIZE, 0);
+    kdebug("struct process_control_block ADDRESS=%#018lx", (uint64_t)tsk);
+
+    if (tsk == NULL)
+    {
+        retval = -ENOMEM;
+        return retval;
+    }
 
     memset(tsk, 0, sizeof(struct process_control_block));
-
     // 将当前进程的pcb复制到新的pcb内
-    *tsk = *current_pcb;
+    memcpy(tsk, current_pcb, sizeof(struct process_control_block));
 
     // kdebug("current_pcb->flags=%#010lx", current_pcb->flags);
 
@@ -466,12 +504,62 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // list_add(&initial_proc_union.pcb.list, &tsk->list);
     tsk->priority = 2;
     tsk->preempt_count = 0;
-    ++(tsk->pid);
+
+    // 增加全局的pid并赋值给新进程的pid
+    spin_lock(&process_global_pid_write_lock);
+    tsk->pid = process_global_pid++;
+
+    // 加入到进程链表中
+    tsk->next_pcb = initial_proc_union.pcb.next_pcb;
+    initial_proc_union.pcb.next_pcb = tsk;
+    tsk->parent_pcb = current_pcb;
+
+    spin_unlock(&process_global_pid_write_lock);
+
     tsk->cpu_id = proc_current_cpu_id;
     tsk->state = PROC_UNINTERRUPTIBLE;
     list_init(&tsk->list);
-    list_add(&initial_proc_union.pcb.list, &tsk->list);
+    // list_add(&initial_proc_union.pcb.list, &tsk->list);
 
+    retval = -ENOMEM;
+
+    // 拷贝标志位
+    if (process_copy_flags(clone_flags, tsk))
+        goto copy_flags_failed;
+
+    // 拷贝内存空间分布结构体
+    if (process_copy_mm(clone_flags, tsk))
+        goto copy_mm_failed;
+
+    // 拷贝文件
+    if (process_copy_files(clone_flags, tsk))
+        goto copy_files_failed;
+
+    // 拷贝线程结构体
+    if (process_copy_thread(clone_flags, tsk, stack_start, stack_size, regs))
+        goto copy_thread_failed;
+
+    // 拷贝成功
+    retval = tsk->pid;
+    // 唤醒进程
+    process_wakeup(tsk);
+
+    return retval;
+
+copy_thread_failed:;
+    // 回收线程
+    process_exit_thread(tsk);
+copy_files_failed:;
+    // 回收文件
+    process_exit_files(tsk);
+copy_mm_failed:;
+    // 回收内存空间分布结构体
+    process_exit_mm(tsk);
+copy_flags_failed:;
+    kfree(tsk);
+    return retval;
+
+    /*
     // 将线程结构体放置在pcb的后面
     struct thread_struct *thd = (struct thread_struct *)(tsk + 1);
     memset(thd, 0, sizeof(struct thread_struct));
@@ -498,6 +586,277 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     tsk->state = PROC_RUNNING;
 
     sched_cfs_enqueue(tsk);
+    */
 
+    return 0;
+}
+
+/**
+ * @brief 根据pid获取进程的pcb
+ *
+ * @param pid
+ * @return struct process_control_block*
+ */
+struct process_control_block *process_get_pcb(long pid)
+{
+    struct process_control_block *pcb = initial_proc_union.pcb.next_pcb;
+
+    // 使用蛮力法搜索指定pid的pcb
+    // todo: 使用哈希表来管理pcb
+    for (; pcb != &initial_proc_union.pcb; pcb = pcb->next_pcb)
+    {
+        if (pcb->pid == pid)
+            return pcb;
+    }
+    return NULL;
+}
+/**
+ * @brief 将进程加入到调度器的就绪队列中
+ *
+ * @param pcb 进程的pcb
+ */
+static inline void process_wakeup(struct process_control_block *pcb)
+{
+    pcb->state = PROC_RUNNING;
+    sched_cfs_enqueue(pcb);
+}
+
+/**
+ * @brief 拷贝当前进程的标志位
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb)
+{
+    if (clone_flags & CLONE_VM)
+        pcb->flags |= PF_VFORK;
+    return 0;
+}
+
+/**
+ * @brief 拷贝当前进程的文件描述符等信息
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_files(uint64_t clone_flags, struct process_control_block *pcb)
+{
+    int retval = 0;
+    // 如果CLONE_FS被置位，那么子进程与父进程共享文件描述符
+    // 文件描述符已经在复制pcb时被拷贝
+    if (clone_flags & CLONE_FS)
+        return retval;
+
+    // 为新进程拷贝新的文件描述符
+    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+    {
+        if (current_pcb->fds[i] == NULL)
+            continue;
+
+        pcb->fds[i] = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
+        memcpy(pcb->fds[i], current_pcb->fds[i], sizeof(struct vfs_file_t));
+    }
+
+    return retval;
+}
+
+/**
+ * @brief 回收进程的所有文件描述符
+ *
+ * @param pcb 要被回收的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_exit_files(struct process_control_block *pcb)
+{
+    // 与父进程共享文件描述符
+    if (pcb->flags & PF_VFORK)
+        return 0;
+
+    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+    {
+        if (pcb->fds[i] == NULL)
+            continue;
+        kfree(pcb->fds[i]);
+    }
+    memset(pcb->fds, 0, sizeof(struct vfs_file_t *) * PROC_MAX_FD_NUM);
+}
+
+/**
+ * @brief 拷贝当前进程的内存空间分布结构体信息
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb)
+{
+    int retval = 0;
+    // 与父进程共享内存空间
+    if (clone_flags & CLONE_VM)
+    {
+        pcb->mm = current_pcb->mm;
+        return retval;
+    }
+
+    // 分配新的内存空间分布结构体
+    struct mm_struct *new_mms = (struct mm_struct *)kmalloc(sizeof(struct mm_struct), 0);
+    memset(new_mms, 0, sizeof(struct mm_struct));
+
+    memcpy(new_mms, current_pcb->mm, sizeof(struct mm_struct));
+
+    pcb->mm = new_mms;
+
+    // 分配顶层页表, 并设置顶层页表的物理地址
+    new_mms->pgd = (pml4t_t *)virt_2_phys(kmalloc(PAGE_4K_SIZE, 0));
+
+    // 拷贝内核空间的页表指针
+    memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]) + 256, PAGE_4K_SIZE / 2);
+
+    pml4t_t *current_pgd = (pml4t_t *)phys_2_virt(current_pcb->mm->pgd);
+
+    // 迭代地拷贝用户空间
+    for (int i = 0; i <= 255; ++i)
+    {
+        // 当前页表项为空
+        if ((current_pgd + i)->pml4t == 0)
+            continue;
+
+        // 分配新的二级页表
+        pdpt_t *new_pdpt = (pdpt_t *)kmalloc(PAGE_4K_SIZE, 0);
+        memset(new_pdpt, 0, PAGE_4K_SIZE);
+        // 在新的一级页表中设置新的二级页表表项
+        set_pml4t((uint64_t *)(current_pgd + i), mk_pml4t(virt_2_phys(new_pdpt), ((current_pgd + i)->pml4t) & 0xfffUL));
+
+        pdpt_t *current_pdpt = (pdpt_t *)phys_2_virt((current_pgd + i)->pml4t & (~0xfffUL));
+        // 设置二级页表
+        for (int j = 0; j < 512; ++j)
+        {
+            if ((current_pdpt + j)->pdpt == 0)
+                continue;
+            // 分配新的三级页表
+            pdt_t *new_pdt = (pdt_t *)kmalloc(PAGE_4K_SIZE, 0);
+            memset(new_pdt, 0, PAGE_4K_SIZE);
+
+            // 在新的二级页表中设置三级页表的表项
+            set_pdpt((uint64_t *)new_pdpt, mk_pdpt(virt_2_phys(new_pdt), (current_pdpt + j)->pdpt & 0xfffUL));
+
+            pdt_t *current_pdt = (pdt_t *)phys_2_virt((current_pdpt + j)->pdpt & (~0xfffUL));
+
+            // 拷贝内存页
+            for (int k = 0; k < 512; ++k)
+            {
+                if ((current_pdt + k)->pdt == 0)
+                    continue;
+                // 获取一个新页
+                struct Page *pg = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
+                set_pdt((uint64_t *)(current_pdt + k), mk_pdt(pg->addr_phys, (current_pdt + k)->pdt & 0x1fffUL));
+
+                // 拷贝数据
+                memcpy(phys_2_virt(pg->addr_phys), phys_2_virt((current_pdt + k)->pdt & (~0x1fffUL)), PAGE_2M_SIZE);
+            }
+        }
+    }
+
+    return retval;
+}
+
+/**
+ * @brief 释放进程的页表
+ *
+ * @param pcb 要被释放页表的进程
+ * @return uint64_t
+ */
+uint64_t process_exit_mm(struct process_control_block *pcb)
+{
+    if (pcb->flags & CLONE_VM)
+        return 0;
+    if (pcb->mm == NULL)
+    {
+        kdebug("pcb->mm==NULL");
+        return 0;
+    }
+    if (pcb->mm->pgd == NULL)
+    {
+        kdebug("pcb->mm->pgd==NULL");
+        return 0;
+    }
+    // 获取顶层页表
+    pml4t_t *current_pgd = (pml4t_t *)phys_2_virt(pcb->mm->pgd);
+
+    // 迭代地释放用户空间
+    for (int i = 0; i <= 255; ++i)
+    {
+        // 当前页表项为空
+        if ((current_pgd + i)->pml4t == 0)
+            continue;
+
+        // 二级页表entry
+        pdpt_t *current_pdpt = (pdpt_t *)phys_2_virt((current_pgd + i)->pml4t & (~0xfffUL));
+        // 遍历二级页表
+        for (int j = 0; j < 512; ++j)
+        {
+            if ((current_pdpt + j)->pdpt == 0)
+                continue;
+
+            // 三级页表的entry
+            pdt_t *current_pdt = (pdt_t *)phys_2_virt((current_pdpt + j)->pdpt & (~0xfffUL));
+
+            // 释放三级页表的内存页
+            for (int k = 0; k < 512; ++k)
+            {
+                if ((current_pdt + k)->pdt == 0)
+                    continue;
+                // 释放内存页
+                free_pages(Phy_to_2M_Page((current_pdt + k)->pdt & (~0x1fffUL)), 1);
+            }
+            // 释放三级页表
+            kfree(current_pdt);
+        }
+        // 释放二级页表
+        kfree(current_pdpt);
+    }
+    // 释放顶层页表
+    kfree(current_pgd);
+
+    // 释放内存空间分布结构体
+    kfree(pcb->mm);
+
+    return 0;
+}
+/**
+ * @brief 拷贝当前进程的线程结构体
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start, uint64_t stack_size, struct pt_regs *current_regs)
+{
+    // 将线程结构体放置在pcb后方
+    struct thread_struct *thd = (struct thread_struct *)(pcb + 1);
+    memset(thd, 0, sizeof(struct thread_struct));
+    pcb->thread = thd;
+
+    // 拷贝栈空间
+    struct pt_regs *child_regs = (struct pt_regs *)((uint64_t)pcb + STACK_SIZE - sizeof(struct pt_regs));
+    memcpy(child_regs, current_regs, sizeof(struct pt_regs));
+
+    child_regs->rax = 0;
+    child_regs->rsp = stack_start;
+
+    thd->rbp = (uint64_t)pcb + STACK_SIZE;
+    thd->rsp = (uint64_t)child_regs;
+    thd->fs = current_pcb->thread->fs;
+    thd->gs = current_pcb->thread->gs;
+
+    // 根据是否为内核线程，设置进程的开始执行的地址
+    if (pcb->flags & PF_KTHREAD)
+        thd->rip = (uint64_t)kernel_thread_func;
+    else
+        thd->rip = (uint64_t)ret_from_system_call;
+    kdebug("new proc's ret addr = %#018lx\tchild_regs->rsp = %#018lx", child_regs->rbx, child_regs->rsp);
     return 0;
 }

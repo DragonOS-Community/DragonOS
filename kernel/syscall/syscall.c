@@ -336,6 +336,17 @@ uint64_t sys_lseek(struct pt_regs *regs)
     return retval;
 }
 
+uint64_t sys_fork(struct pt_regs *regs)
+{
+    kdebug("sys_fork");
+    return do_fork(regs, 0, regs->rsp, 0);
+}
+uint64_t sys_vfork(struct pt_regs *regs)
+{
+    kdebug("sys vfork");
+    return do_fork(regs, CLONE_VM | CLONE_FS | CLONE_SIGNAL, regs->rsp, 0);
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();

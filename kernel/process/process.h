@@ -15,7 +15,7 @@
 #include "../mm/mm.h"
 #include "../syscall/syscall.h"
 #include "ptrace.h"
-
+#include <common/errno.h>
 #include <filesystem/VFS/VFS.h>
 
 // 进程最大可拥有的文件描述符数量
@@ -46,9 +46,9 @@
 #define USER_DS (0x30)
 
 // 进程初始化时的数据拷贝标志位
-#define CLONE_FS (1 << 0)
-#define CLONE_FILES (1 << 1)
-#define CLONE_SIGNAL (1 << 2)
+#define CLONE_FS (1 << 0) // 在进程间共享打开的文件
+#define CLONE_SIGNAL (1 << 1)
+#define CLONE_VM (1 << 2) // 在进程间共享虚拟内存空间
 
 /**
  * @brief 内存空间分布结构体
@@ -63,6 +63,8 @@ struct mm_struct
 	ul data_addr_start, data_addr_end;
 	// 只读数据段空间
 	ul rodata_addr_start, rodata_addr_end;
+	// BSS段的空间
+	uint64_t bss_start, bss_end;
 	// 动态内存分配区（堆区域）
 	ul brk_start, brk_end;
 	// 应用层栈基地址
@@ -89,8 +91,10 @@ struct thread_struct
 
 // ========= pcb->flags =========
 // 进程标志位
-#define PF_KTHREAD (1UL << 0)
-#define PROC_NEED_SCHED (1UL << 1) // 进程需要被调度
+#define PF_KTHREAD (1UL << 0)	 // 内核线程
+#define PF_NEED_SCHED (1UL << 1) // 进程需要被调度
+#define PF_VFORK (1UL << 2)		 // 标志进程是否由于vfork而存在资源共享
+
 /**
  * @brief 进程控制块
  *
@@ -110,7 +114,7 @@ struct process_control_block
 	// 进程切换时保存的状态信息
 	struct thread_struct *thread;
 
-	// 连接各个pcb的双向链表
+	// 连接各个pcb的双向链表（todo：删除这个变量）
 	struct List list;
 
 	// 地址空间范围
@@ -125,6 +129,11 @@ struct process_control_block
 	// 进程拥有的文件描述符的指针数组
 	// todo: 改用动态指针数组
 	struct vfs_file_t *fds[PROC_MAX_FD_NUM];
+
+	// 链表中的下一个pcb
+	struct process_control_block *next_pcb;
+	// 父进程的pcb
+	struct process_control_block *parent_pcb;
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐
@@ -148,7 +157,9 @@ union proc_union
 		.priority = 2,                    \
 		.preempt_count = 0,               \
 		.cpu_id = 0,                      \
-		.fds = { 0 }                      \
+		.fds = {0},                       \
+		.next_pcb = &proc,                \
+		.parent_pcb = &proc               \
 	}
 
 /**
@@ -253,6 +264,27 @@ void process_init();
  * @return unsigned long
  */
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size);
+
+/**
+ * @brief 根据pid获取进程的pcb
+ *
+ * @param pid
+ * @return struct process_control_block*
+ */
+struct process_control_block *process_get_pcb(long pid);
+
+/**
+ * @brief 切换页表
+ * @param prev 前一个进程的pcb
+ * @param next 下一个进程的pcb
+ *
+ */
+#define process_switch_mm(prev, next)                              \
+	do                                                             \
+	{                                                              \
+		asm volatile("movq %0, %%cr3	\n\t" ::"r"(next->mm->pgd) \
+					 : "memory");                                  \
+	} while (0)
 
 // 获取当前cpu id
 #define proc_current_cpu_id (current_pcb->cpu_id)

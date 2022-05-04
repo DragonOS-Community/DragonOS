@@ -51,13 +51,13 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
 void sched_cfs()
 {
     cli();
-    current_pcb->flags &= ~PROC_NEED_SCHED;
+    current_pcb->flags &= ~PF_NEED_SCHED;
     struct process_control_block *proc = sched_cfs_dequeue();
 
     if (current_pcb->virtual_runtime >= proc->virtual_runtime || current_pcb->state != PROC_RUNNING) // 当前进程运行时间大于了下一进程的运行时间，进行切换
     {
 
-        if (current_pcb->state = PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
+        if (current_pcb->state == PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             sched_cfs_enqueue(current_pcb);
 
         if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
@@ -75,6 +75,7 @@ void sched_cfs()
             }
         }
         // kdebug("before switch, next.rip = %#018lx\tnext->gs=%#018lx", proc->thread->rip, proc->thread->gs);
+        process_switch_mm(current_pcb, proc);
         switch_proc(current_pcb, proc);
     }
     else // 不进行切换
@@ -127,7 +128,7 @@ void sched_update_jiffies()
     }
     // 时间片耗尽，标记可调度
     if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
-        current_pcb->flags |= PROC_NEED_SCHED;
+        current_pcb->flags |= PF_NEED_SCHED;
 }
 
 /**

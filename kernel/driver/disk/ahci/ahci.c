@@ -281,7 +281,7 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
 
     port->ci = 1 << slot; // Issue command
 
-    current_pcb->flags |= PROC_NEED_SCHED;
+    current_pcb->flags |= PF_NEED_SCHED;
     sched_cfs();
     int retval = AHCI_SUCCESS;
     // Wait for completion
@@ -361,7 +361,7 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     //    printk("[slot]{%d}", slot);
     port->ci = 1; // Issue command
     
-    current_pcb->flags |= PROC_NEED_SCHED;
+    current_pcb->flags |= PF_NEED_SCHED;
     //sched_cfs();
     int retval = AHCI_SUCCESS;
 
@@ -465,7 +465,7 @@ static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_a
 void ahci_end_request()
 {
     ahci_req_queue.in_service->wait_queue.pcb->state = PROC_RUNNING;
-    ahci_req_queue.in_service->wait_queue.pcb->flags |= PROC_NEED_SCHED;
+    ahci_req_queue.in_service->wait_queue.pcb->flags |= PF_NEED_SCHED;
     kfree((uint64_t *)ahci_req_queue.in_service);
     ahci_req_queue.in_service = NULL;
 

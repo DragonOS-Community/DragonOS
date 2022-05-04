@@ -509,7 +509,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         kBUG("current_pcb->preempt_count<0! pid=%d", current_pcb->pid); // should not be here
 
     // 检测当前进程是否可被调度
-    if (current_pcb->flags & PROC_NEED_SCHED)
+    if (current_pcb->flags & PF_NEED_SCHED)
     {
         // kdebug("to sched");
         sched_cfs();

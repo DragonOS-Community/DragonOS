@@ -45,6 +45,59 @@ struct process_control_block *initial_proc[MAX_CPU_NUM] = {&initial_proc_union.p
 struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_TSS};
 
 /**
+ * @brief 拷贝当前进程的标志位
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
+
+/**
+ * @brief 拷贝当前进程的文件描述符等信息
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
+
+/**
+ * @brief 回收进程的所有文件描述符
+ *
+ * @param pcb 要被回收的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_exit_files(struct process_control_block *pcb);
+
+/**
+ * @brief 拷贝当前进程的内存空间分布结构体信息
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb);
+
+/**
+ * @brief 释放进程的页表
+ *
+ * @param pcb 要被释放页表的进程
+ * @return uint64_t
+ */
+uint64_t process_exit_mm(struct process_control_block *pcb);
+
+/**
+ * @brief 拷贝当前进程的线程结构体
+ *
+ * @param clone_flags 克隆标志位
+ * @param pcb 新的进程的pcb
+ * @return uint64_t
+ */
+uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start, uint64_t stack_size, struct pt_regs *current_regs);
+
+void process_exit_thread(struct process_control_block *pcb);
+/**
  * @brief 切换进程
  *
  * @param prev 上一个进程的pcb
@@ -273,9 +326,10 @@ void user_level_function()
  * @brief 使当前进程去执行新的代码
  *
  * @param regs 当前进程的寄存器
+ * @param path 可执行程序的路径
  * @return ul 错误码
  */
-ul do_execve(struct pt_regs *regs)
+ul do_execve(struct pt_regs *regs, char *path)
 {
     // 选择这两个寄存器是对应了sysexit指令的需要
     regs->rip = 0x800000; // rip 应用层程序的入口地址   这里的地址选择没有特殊要求，只要是未使用的内存区域即可。
@@ -287,35 +341,75 @@ ul do_execve(struct pt_regs *regs)
     regs->rax = 1;
     regs->es = 0;
 
-    // kdebug("do_execve is running...");
+    kdebug("do_execve is running...");
 
-    // 映射起始页面
-    // mm_map_proc_page_table(get_CR3(), true, 0x800000, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+    // 当前进程正在与父进程共享地址空间，需要创建
+    // 独立的地址空间才能使新程序正常运行
+    if (current_pcb->flags & PF_VFORK)
+    {
+        kdebug("proc:%d  creating new mem space", current_pcb->pid);
+        // 分配新的内存空间分布结构体
+        struct mm_struct *new_mms = (struct mm_struct *)kmalloc(sizeof(struct mm_struct), 0);
+        memset(new_mms, 0, sizeof(struct mm_struct));
+        current_pcb->mm = new_mms;
 
-    uint64_t addr = 0x800000UL;
-    /*
-        unsigned long *tmp = phys_2_virt((unsigned long *)((unsigned long)get_CR3() & (~0xfffUL)) + ((addr >> PAGE_GDT_SHIFT) & 0x1ff));
+        // 分配顶层页表, 并设置顶层页表的物理地址
+        new_mms->pgd = (pml4t_t *)virt_2_phys(kmalloc(PAGE_4K_SIZE, 0));
 
-        unsigned long *virtual = kmalloc(PAGE_4K_SIZE, 0);
-        set_pml4t(tmp, mk_pml4t(virt_2_phys(virtual), PAGE_USER_PGT));
+        // 由于高2K部分为内核空间，在接下来需要覆盖其数据，因此不用清零
+        memset(phys_2_virt(new_mms->pgd), 0, PAGE_4K_SIZE / 2);
 
-        tmp = phys_2_virt((unsigned long *)(*tmp & (~0xfffUL)) + ((addr >> PAGE_1G_SHIFT) & 0x1ff));
-        virtual = kmalloc(PAGE_4K_SIZE, 0);
-        set_pdpt(tmp, mk_pdpt(virt_2_phys(virtual), PAGE_USER_DIR));
+        // 拷贝内核空间的页表指针
+        memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]) + 256, PAGE_4K_SIZE / 2);
+    }
 
-        tmp = phys_2_virt((unsigned long *)(*tmp & (~0xfffUL)) + ((addr >> PAGE_2M_SHIFT) & 0x1ff));
-        struct Page *p = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
-        set_pdt(tmp, mk_pdt(p->addr_phys, PAGE_USER_PAGE));
+    /**
+     * @todo: 加载elf文件并映射对应的页
+     *
+     */
+    // 映射1个2MB的物理页
+    unsigned long code_start_addr = 0x800000;
+    unsigned long stack_start_addr = 0xa00000;
 
-        flush_tlb();
-    */
+    // mm_map_phys_addr_user(code_start_addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE);
+    mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, code_start_addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
 
-    mm_map_phys_addr_user(addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE);
+    process_switch_mm(current_pcb);
 
+    // 为用户态程序设置地址边界
     if (!(current_pcb->flags & PF_KTHREAD))
         current_pcb->addr_limit = USER_MAX_LINEAR_ADDR;
+
+    current_pcb->mm->code_addr_start = code_start_addr;
+    current_pcb->mm->code_addr_end = 0;
+    current_pcb->mm->data_addr_start = 0;
+    current_pcb->mm->data_addr_end = 0;
+    current_pcb->mm->rodata_addr_start = 0;
+    current_pcb->mm->rodata_addr_end = 0;
+    current_pcb->mm->bss_start = 0;
+    current_pcb->mm->bss_end = 0;
+    current_pcb->mm->brk_start = 0;
+    current_pcb->mm->brk_end = 0;
+    current_pcb->mm->stack_start = stack_start_addr;
+
+    // 关闭之前的文件描述符
+    process_exit_files(current_pcb);
+    // 清除进程的vfork标志位
+    current_pcb->flags &= ~PF_VFORK;
+
+    int fd_num = enter_syscall_int(SYS_OPEN, path, ATTR_READ_ONLY, 0, 0, 0, 0, 0, 0);
+    if (fd_num < 0)
+        return fd_num;
+    memset((void *)code_start_addr, 0, PAGE_2M_SIZE);
+
     // 将程序代码拷贝到对应的内存中
-    memcpy((void *)0x800000, user_level_function, 1024);
+    int retval = enter_syscall_int(SYS_READ, fd_num, code_start_addr, PAGE_2M_SIZE, 0, 0, 0, 0, 0);
+    if (retval)
+    {
+        enter_syscall_int(SYS_CLOSE, fd_num, 0, 0, 0, 0, 0, 0, 0);
+        return retval;
+    }
+    retval = enter_syscall_int(SYS_CLOSE, fd_num, 0, 0, 0, 0, 0, 0, 0);
 
     // kdebug("program copied!");
     return 0;
@@ -336,6 +430,13 @@ ul initial_kernel_thread(ul arg)
 
     current_pcb->thread->rip = (ul)ret_from_system_call;
     current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
+    current_pcb->thread->fs = USER_DS|0x3;
+    current_pcb->thread->gs = USER_DS|0x3;
+
+    // 主动放弃内核线程身份
+    current_pcb->flags &= (~PF_KTHREAD);
+
+
     // current_pcb->mm->pgd = kmalloc(PAGE_4K_SIZE, 0);
     // memset((void*)current_pcb->mm->pgd, 0, PAGE_4K_SIZE);
 
@@ -343,9 +444,11 @@ ul initial_kernel_thread(ul arg)
     // kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
+    // 加载用户态程序：init.bin
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
                          "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
+                         "S"("/init.bin"),
                          "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip)
                          : "memory");
 
@@ -437,9 +540,9 @@ void process_init()
     for (int i = 256; i < 512; ++i)
     {
         uint64_t *tmp = idle_pml4t_vaddr + i;
-        if(*tmp==0)
+        if (*tmp == 0)
         {
-            void* pdpt = kmalloc(PAGE_4K_SIZE,0);
+            void *pdpt = kmalloc(PAGE_4K_SIZE, 0);
             memset(pdpt, 0, PAGE_4K_SIZE);
             set_pml4t(tmp, mk_pml4t(virt_2_phys(pdpt), PAGE_KERNEL_PGT));
         }
@@ -671,16 +774,18 @@ uint64_t process_copy_files(uint64_t clone_flags, struct process_control_block *
  */
 uint64_t process_exit_files(struct process_control_block *pcb)
 {
-    // 与父进程共享文件描述符
-    if (pcb->flags & PF_VFORK)
-        return 0;
-
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+    // 不与父进程共享文件描述符
+    if (!(pcb->flags & PF_VFORK))
     {
-        if (pcb->fds[i] == NULL)
-            continue;
-        kfree(pcb->fds[i]);
+
+        for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+        {
+            if (pcb->fds[i] == NULL)
+                continue;
+            kfree(pcb->fds[i]);
+        }
     }
+    // 清空当前进程的文件描述符列表
     memset(pcb->fds, 0, sizeof(struct vfs_file_t *) * PROC_MAX_FD_NUM);
 }
 
@@ -697,7 +802,9 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
     // 与父进程共享内存空间
     if (clone_flags & CLONE_VM)
     {
+        kdebug("copy_vm\t\t current_pcb->mm->pgd=%#018lx", current_pcb->mm->pgd);
         pcb->mm = current_pcb->mm;
+
         return retval;
     }
 
@@ -711,6 +818,8 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
 
     // 分配顶层页表, 并设置顶层页表的物理地址
     new_mms->pgd = (pml4t_t *)virt_2_phys(kmalloc(PAGE_4K_SIZE, 0));
+    // 由于高2K部分为内核空间，在接下来需要覆盖其数据，因此不用清零
+    memset(phys_2_virt(new_mms->pgd), 0, PAGE_4K_SIZE / 2);
 
     // 拷贝内核空间的页表指针
     memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]) + 256, PAGE_4K_SIZE / 2);
@@ -859,4 +968,13 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
         thd->rip = (uint64_t)ret_from_system_call;
     kdebug("new proc's ret addr = %#018lx\tchild_regs->rsp = %#018lx", child_regs->rbx, child_regs->rsp);
     return 0;
+}
+
+/**
+ * @brief todo: 回收线程结构体
+ *
+ * @param pcb
+ */
+void process_exit_thread(struct process_control_block *pcb)
+{
 }

@@ -279,11 +279,12 @@ struct process_control_block *process_get_pcb(long pid);
  * @param next 下一个进程的pcb
  *
  */
-#define process_switch_mm(prev, next)                              \
-	do                                                             \
-	{                                                              \
-		asm volatile("movq %0, %%cr3	\n\t" ::"r"(next->mm->pgd) \
-					 : "memory");                                  \
+#define process_switch_mm(next_pcb)                                    \
+	do                                                                 \
+	{                                                                  \
+		asm volatile("movq %0, %%cr3	\n\t" ::"r"(next_pcb->mm->pgd) \
+					 : "memory");                                      \
+		flush_tlb();                                                   \
 	} while (0)
 
 // 获取当前cpu id

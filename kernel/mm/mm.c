@@ -622,9 +622,9 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
  * @param length 要映射的区域的长度（字节）
  * @param user 用户态是否可访问
  */
-void mm_map_proc_page_table(ul *proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user)
+void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user)
 {
-
+    // kdebug("proc_page_table_addr=%#018lx",proc_page_table_addr);
     // 计算线性地址对应的pml4页表项的地址
     ul *tmp;
     if (is_phys)
@@ -632,14 +632,14 @@ void mm_map_proc_page_table(ul *proc_page_table_addr, bool is_phys, ul virt_addr
     else
         tmp = (ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff);
 
-    kdebug("tmp = %#018lx", tmp);
+    // kdebug("tmp = %#018lx", tmp);
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
         memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), (user ? PAGE_USER_PGT : PAGE_KERNEL_PGT)));
     }
-    kdebug("*tmp = %#018lx", *tmp);
+    // kdebug("*tmp = %#018lx", *tmp);
 
     if (is_phys)
         tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));

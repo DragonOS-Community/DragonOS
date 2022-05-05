@@ -624,7 +624,7 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
  */
 void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user)
 {
-    // kdebug("proc_page_table_addr=%#018lx",proc_page_table_addr);
+    kdebug("proc_page_table_addr=%#018lx",proc_page_table_addr);
     // 计算线性地址对应的pml4页表项的地址
     ul *tmp;
     if (is_phys)

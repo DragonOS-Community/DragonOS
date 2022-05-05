@@ -97,10 +97,7 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
 ul sys_put_string(struct pt_regs *regs)
 {
 
-    if (regs->r9 == 0 && regs->r10 == 0)
-        printk((char *)regs->r8);
-    else
-        printk_color(regs->r9, regs->r10, (char *)regs->r8);
+    printk_color(regs->r9, regs->r10, (char *)regs->r8);
     // printk_color(BLACK, WHITE, (char *)regs->r8);
 
     return 0;
@@ -310,7 +307,7 @@ uint64_t sys_write(struct pt_regs *regs)
  * @param fd_num 文件描述符号
  * @param offset 偏移量
  * @param whence 调整模式
- * @return uint64_t
+ * @return uint64_t 调整结束后的文件访问位置
  */
 uint64_t sys_lseek(struct pt_regs *regs)
 {
@@ -370,5 +367,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [4] = sys_read,
         [5] = sys_write,
         [6] = sys_lseek,
-        [7 ... 254] = system_call_not_exists,
+        [7] = sys_fork,
+        [8] = sys_vfork,
+        [9 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

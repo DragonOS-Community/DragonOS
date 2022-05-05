@@ -322,6 +322,37 @@ void user_level_function()
     while (1)
         pause();
 }
+
+/**
+ * @brief 打开要执行的程序文件
+ *
+ * @param path
+ * @return struct vfs_file_t*
+ */
+struct vfs_file_t *process_open_exec_file(char *path)
+{
+    struct vfs_dir_entry_t *dentry = NULL;
+    struct vfs_file_t *filp = NULL;
+
+    dentry = vfs_path_walk(path, 0);
+
+    if (dentry == NULL)
+        return (void *)-ENOENT;
+    if (dentry->dir_inode->attribute == VFS_ATTR_DIR)
+        return (void *)-ENOTDIR;
+
+    filp = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
+    if (filp == NULL)
+        return (void *)-ENOMEM;
+
+    filp->position = 0;
+    filp->mode = 0;
+    filp->dEntry = dentry;
+    filp->mode = ATTR_READ_ONLY;
+    filp->file_ops = dentry->dir_inode->file_ops;
+
+    return filp;
+}
 /**
  * @brief 使当前进程去执行新的代码
  *
@@ -340,7 +371,7 @@ ul do_execve(struct pt_regs *regs, char *path)
     regs->rflags = 0x200246;
     regs->rax = 1;
     regs->es = 0;
-
+    
     kdebug("do_execve is running...");
 
     // 当前进程正在与父进程共享地址空间，需要创建
@@ -362,7 +393,6 @@ ul do_execve(struct pt_regs *regs, char *path)
         // 拷贝内核空间的页表指针
         memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]) + 256, PAGE_4K_SIZE / 2);
     }
-
     /**
      * @todo: 加载elf文件并映射对应的页
      *
@@ -371,7 +401,6 @@ ul do_execve(struct pt_regs *regs, char *path)
     unsigned long code_start_addr = 0x800000;
     unsigned long stack_start_addr = 0xa00000;
 
-    // mm_map_phys_addr_user(code_start_addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE);
     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, code_start_addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
 
     process_switch_mm(current_pcb);
@@ -394,24 +423,21 @@ ul do_execve(struct pt_regs *regs, char *path)
 
     // 关闭之前的文件描述符
     process_exit_files(current_pcb);
+
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
-    int fd_num = enter_syscall_int(SYS_OPEN, path, ATTR_READ_ONLY, 0, 0, 0, 0, 0, 0);
-    if (fd_num < 0)
-        return fd_num;
+
+
+    struct vfs_file_t* filp = process_open_exec_file(path);
+    if((unsigned long)filp <= 0 )
+		return (unsigned long)filp;
+    
     memset((void *)code_start_addr, 0, PAGE_2M_SIZE);
+    uint64_t pos = 0;
+    int retval = filp->file_ops->read(filp, code_start_addr, PAGE_2M_SIZE, &pos);
+    kdebug("execve ok");
 
-    // 将程序代码拷贝到对应的内存中
-    int retval = enter_syscall_int(SYS_READ, fd_num, code_start_addr, PAGE_2M_SIZE, 0, 0, 0, 0, 0);
-    if (retval)
-    {
-        enter_syscall_int(SYS_CLOSE, fd_num, 0, 0, 0, 0, 0, 0, 0);
-        return retval;
-    }
-    retval = enter_syscall_int(SYS_CLOSE, fd_num, 0, 0, 0, 0, 0, 0, 0);
-
-    // kdebug("program copied!");
     return 0;
 }
 
@@ -430,12 +456,11 @@ ul initial_kernel_thread(ul arg)
 
     current_pcb->thread->rip = (ul)ret_from_system_call;
     current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
-    current_pcb->thread->fs = USER_DS|0x3;
-    current_pcb->thread->gs = USER_DS|0x3;
+    current_pcb->thread->fs = USER_DS | 0x3;
+    current_pcb->thread->gs = USER_DS | 0x3;
 
     // 主动放弃内核线程身份
     current_pcb->flags &= (~PF_KTHREAD);
-
 
     // current_pcb->mm->pgd = kmalloc(PAGE_4K_SIZE, 0);
     // memset((void*)current_pcb->mm->pgd, 0, PAGE_4K_SIZE);
@@ -445,11 +470,12 @@ ul initial_kernel_thread(ul arg)
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
     // 加载用户态程序：init.bin
+    char init_path[] = "/init.bin";
+    uint64_t addr = (uint64_t)&init_path;
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
                          "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
-                         "S"("/init.bin"),
-                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip)
+                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/init.bin")
                          : "memory");
 
     return 1;
@@ -661,35 +687,6 @@ copy_mm_failed:;
 copy_flags_failed:;
     kfree(tsk);
     return retval;
-
-    /*
-    // 将线程结构体放置在pcb的后面
-    struct thread_struct *thd = (struct thread_struct *)(tsk + 1);
-    memset(thd, 0, sizeof(struct thread_struct));
-    tsk->thread = thd;
-    // kdebug("333\tregs.rip = %#018lx", regs->rip);
-    //  将寄存器信息存储到进程的内核栈空间的顶部
-    memcpy((void *)((ul)tsk + STACK_SIZE - sizeof(struct pt_regs)), regs, sizeof(struct pt_regs));
-
-    // kdebug("regs.rip = %#018lx", regs->rip);
-    // 设置进程的内核栈
-    thd->rbp = (ul)tsk + STACK_SIZE;
-    thd->rip = regs->rip;
-    thd->rsp = (ul)tsk + STACK_SIZE - sizeof(struct pt_regs);
-    thd->fs = KERNEL_DS;
-    thd->gs = KERNEL_DS;
-
-    // kdebug("do_fork() thd->rsp=%#018lx", thd->rsp);
-    //  若进程不是内核层的进程，则跳转到ret from system call
-    if (!(tsk->flags & PF_KTHREAD))
-        thd->rip = regs->rip = (ul)ret_from_system_call;
-    else
-        kdebug("is kernel proc.");
-
-    tsk->state = PROC_RUNNING;
-
-    sched_cfs_enqueue(tsk);
-    */
 
     return 0;
 }
@@ -953,6 +950,7 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
     struct pt_regs *child_regs = (struct pt_regs *)((uint64_t)pcb + STACK_SIZE - sizeof(struct pt_regs));
     memcpy(child_regs, current_regs, sizeof(struct pt_regs));
 
+    // 设置子进程的返回值为0
     child_regs->rax = 0;
     child_regs->rsp = stack_start;
 

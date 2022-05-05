@@ -22,7 +22,7 @@ iso_boot_grub='./iso/boot/grub'
 iso_boot='./iso/boot/'
 iso='./DragonOS.iso'
 iso_folder='./iso/'
-
+root_folder="$(pwd)"
 
 # toolchain
 OS=`uname -s`
@@ -87,6 +87,14 @@ if [ -d "${iso_folder}" ]; then
 else
   flag_can_run=1
 fi
+
+# 拷贝init文件到硬盘
+cd tools
+bash m*
+sudo cp ${root_folder}/bin/user/init.bin ${root_folder}/bin/disk_mount
+sync
+bash u*
+cd ..
 
 if [ $flag_can_run -eq 1 ]; then
   if [ ${IA32_USE_QEMU} == 0 ]; then

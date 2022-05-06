@@ -150,7 +150,7 @@ union proc_union
 		.flags = PF_KTHREAD,              \
 		.mm = &initial_mm,                \
 		.thread = &initial_thread,        \
-		.addr_limit = 0xffff800000000000, \
+		.addr_limit = 0xffffffffffffffff, \
 		.pid = 0,                         \
 		.virtual_runtime = 0,             \
 		.signal = 0,                      \

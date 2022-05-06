@@ -170,7 +170,8 @@ struct memory_desc
     ul zones_struct_len; // zones_struct列表的长度
 
     ul kernel_code_start, kernel_code_end; // 内核程序代码段起始地址、结束地址
-    ul kernel_data_end, kernel_end;        // 内核程序数据段结束地址、 内核程序结束地址
+    ul kernel_data_end, rodata_end;        // 内核程序数据段结束地址、 内核程序只读段结束地址
+    uint64_t start_brk; // 堆地址的起始位置
 
     ul end_of_struct; // 内存页管理结构的结束地址
 };
@@ -377,3 +378,13 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
 
 
 void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);
+
+/**
+ * @brief 调整堆区域的大小（暂时只能增加堆区域）
+ * 
+ * @todo 缩小堆区域
+ * @param old_brk_end_addr 原本的堆内存区域的结束地址
+ * @param offset 新的地址相对于原地址的偏移量
+ * @return uint64_t 
+ */
+uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset);

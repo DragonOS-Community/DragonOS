@@ -400,6 +400,7 @@ ul do_execve(struct pt_regs *regs, char *path)
     // 映射1个2MB的物理页
     unsigned long code_start_addr = 0x800000;
     unsigned long stack_start_addr = 0xa00000;
+    uint64_t brk_start_addr = 0xc00000;
 
     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, code_start_addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
 
@@ -417,8 +418,8 @@ ul do_execve(struct pt_regs *regs, char *path)
     current_pcb->mm->rodata_addr_end = 0;
     current_pcb->mm->bss_start = 0;
     current_pcb->mm->bss_end = 0;
-    current_pcb->mm->brk_start = 0;
-    current_pcb->mm->brk_end = 0;
+    current_pcb->mm->brk_start = brk_start_addr;
+    current_pcb->mm->brk_end = brk_start_addr;
     current_pcb->mm->stack_start = stack_start_addr;
 
     // 关闭之前的文件描述符
@@ -547,8 +548,8 @@ void process_init()
     initial_mm.bss_start = (uint64_t)&_bss;
     initial_mm.bss_end = (uint64_t)&_ebss;
 
-    initial_mm.brk_start = 0;
-    initial_mm.brk_end = memory_management_struct.kernel_end;
+    initial_mm.brk_start = memory_management_struct.start_brk;
+    initial_mm.brk_end = current_pcb->addr_limit;
 
     initial_mm.stack_start = _stack_start;
 

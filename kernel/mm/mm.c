@@ -3,6 +3,7 @@
 #include "../common/printk.h"
 #include "../common/kprint.h"
 #include "../driver/multiboot2/multiboot2.h"
+#include <process/process.h>
 
 ul Total_Memory = 0;
 ul total_2M_pages = 0;
@@ -14,7 +15,8 @@ void mm_init()
     memory_management_struct.kernel_code_start = (ul)&_text;
     memory_management_struct.kernel_code_end = (ul)&_etext;
     memory_management_struct.kernel_data_end = (ul)&_edata;
-    memory_management_struct.kernel_end = (ul)&_end;
+    memory_management_struct.rodata_end = (ul)&_erodata;
+    memory_management_struct.start_brk = (ul)&_end;
 
     struct multiboot_mmap_entry_t mb2_mem_info[512];
     int count;
@@ -63,7 +65,7 @@ void mm_init()
     ul max_addr = memory_management_struct.e820[memory_management_struct.len_e820].BaseAddr + memory_management_struct.e820[memory_management_struct.len_e820].Length;
     // 初始化mms的bitmap
     // bmp的指针指向截止位置的4k对齐的上边界（防止修改了别的数据）
-    memory_management_struct.bmp = (unsigned long *)((memory_management_struct.kernel_end + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
+    memory_management_struct.bmp = (unsigned long *)((memory_management_struct.start_brk + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
     memory_management_struct.bits_size = max_addr >> PAGE_2M_SHIFT;                                                                                         // 物理地址空间的最大页面数
     memory_management_struct.bmp_len = (((unsigned long)(max_addr >> PAGE_2M_SHIFT) + sizeof(unsigned long) * 8 - 1) / 8) & (~(sizeof(unsigned long) - 1)); // bmp由多少个unsigned long变量组成
 
@@ -665,4 +667,26 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
     }
 
     flush_tlb();
+}
+
+/**
+ * @brief 调整堆区域的大小（暂时只能增加堆区域）
+ *
+ * @todo 缩小堆区域
+ * @param old_brk_end_addr 原本的堆内存区域的结束地址
+ * @param offset 新的地址相对于原地址的偏移量
+ * @return uint64_t
+ */
+uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
+{
+    // 暂不支持缩小堆内存
+    if(offset <0)
+        return old_brk_end_addr;
+
+    uint64_t end_addr = old_brk_end_addr + offset;
+    for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
+        mm_map_proc_page_table(current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED), PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+    
+    current_pcb->mm->brk_end = end_addr;
+    return end_addr;
 }

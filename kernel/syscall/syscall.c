@@ -344,6 +344,33 @@ uint64_t sys_vfork(struct pt_regs *regs)
     return do_fork(regs, CLONE_VM | CLONE_FS | CLONE_SIGNAL, regs->rsp, 0);
 }
 
+/**
+ * @brief 堆内存调整
+ *
+ * @param arg0 新的堆区域的结束地址
+ * @return uint64_t 调整后的堆区域的结束地址
+ */
+uint64_t sys_brk(struct pt_regs *regs)
+{
+    uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
+
+    kdebug("sys_brk input= %#010lx bytes,  new_brk= %#010lx bytes current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_end);
+
+    if (new_brk == 0)
+        return current_pcb->mm->brk_start;
+    
+    if(new_brk > current_pcb->addr_limit)   // 堆地址空间超过限制
+        return  -EADDRNOTAVAIL;
+        
+    if (new_brk < current_pcb->mm->brk_end) // todo: 释放堆内存空间
+        return 0;
+
+    new_brk = mm_do_brk(current_pcb->mm->brk_end, new_brk - current_pcb->mm->brk_end); // 扩展堆内存空间
+
+    current_pcb->mm->brk_end = new_brk;
+    return new_brk;
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();

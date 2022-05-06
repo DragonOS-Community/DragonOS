@@ -20,7 +20,7 @@ void mm_init()
     int count;
 
     multiboot2_iter(multiboot2_get_memory, mb2_mem_info, &count);
-    
+
     for (int i = 0; i < count; ++i)
     {
         //可用的内存
@@ -32,8 +32,6 @@ void mm_init()
         memory_management_struct.e820[i].Length = mb2_mem_info[i].len;
         memory_management_struct.e820[i].type = mb2_mem_info[i].type;
         memory_management_struct.len_e820 = i;
-
-        
 
         // 脏数据
         if (mb2_mem_info[i].type > 4 || mb2_mem_info[i].len == 0 || mb2_mem_info[i].type < 1)
@@ -201,7 +199,6 @@ void mm_init()
 
     kinfo("Memory management unit initialize complete!");
 
-    
     flush_tlb();
     // 初始化slab内存池
     slab_init();
@@ -624,7 +621,7 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
  */
 void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user)
 {
-    kdebug("proc_page_table_addr=%#018lx",proc_page_table_addr);
+    // kdebug("proc_page_table_addr=%#018lx", proc_page_table_addr);
     // 计算线性地址对应的pml4页表项的地址
     ul *tmp;
     if (is_phys)

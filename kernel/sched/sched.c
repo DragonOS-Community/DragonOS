@@ -12,7 +12,7 @@ struct process_control_block *sched_cfs_dequeue()
 {
     if (list_empty(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list))
     {
-        kdebug("list empty, count=%d", sched_cfs_ready_queue[proc_current_cpu_id].count);
+        // kdebug("list empty, count=%d", sched_cfs_ready_queue[proc_current_cpu_id].count);
         return &initial_proc_union.pcb;
     }
 
@@ -30,9 +30,9 @@ struct process_control_block *sched_cfs_dequeue()
  */
 void sched_cfs_enqueue(struct process_control_block *pcb)
 {
-    struct process_control_block *proc = container_of(list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
-    if (proc == &initial_proc_union.pcb)
+    if (pcb == initial_proc[proc_current_cpu_id])
         return;
+    struct process_control_block *proc = container_of(list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
     if ((list_empty(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list)) == 0)
     {
         while (proc->virtual_runtime < pcb->virtual_runtime)
@@ -59,7 +59,7 @@ void sched_cfs()
 
         if (current_pcb->state == PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             sched_cfs_enqueue(current_pcb);
-
+        // kdebug("proc->pid=%d, count=%d", proc->pid, sched_cfs_ready_queue[proc_current_cpu_id].count);
         if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
         {
             switch (proc->priority)

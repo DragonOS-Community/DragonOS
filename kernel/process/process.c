@@ -12,7 +12,7 @@
 #include <process/spinlock.h>
 
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
-long process_global_pid = 0;              // 系统中最大的pid
+long process_global_pid = 1;              // 系统中最大的pid
 
 extern void system_call(void);
 extern void kernel_thread_func(void);
@@ -371,7 +371,7 @@ ul do_execve(struct pt_regs *regs, char *path)
     regs->rflags = 0x200246;
     regs->rax = 1;
     regs->es = 0;
-    
+
     kdebug("do_execve is running...");
 
     // 当前进程正在与父进程共享地址空间，需要创建
@@ -427,15 +427,13 @@ ul do_execve(struct pt_regs *regs, char *path)
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
+    struct vfs_file_t *filp = process_open_exec_file(path);
+    if ((unsigned long)filp <= 0)
+        return (unsigned long)filp;
 
-
-    struct vfs_file_t* filp = process_open_exec_file(path);
-    if((unsigned long)filp <= 0 )
-		return (unsigned long)filp;
-    
     memset((void *)code_start_addr, 0, PAGE_2M_SIZE);
     uint64_t pos = 0;
-    int retval = filp->file_ops->read(filp, code_start_addr, PAGE_2M_SIZE, &pos);
+    int retval = filp->file_ops->read(filp, (char *)code_start_addr, PAGE_2M_SIZE, &pos);
     kdebug("execve ok");
 
     return 0;
@@ -587,12 +585,6 @@ void process_init()
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;
     initial_proc_union.pcb.cpu_id = 0;
-    // 获取新的进程的pcb
-    // struct process_control_block *p = container_of(list_next(&current_pcb->list), struct process_control_block, list);
-
-    // kdebug("Ready to switch...");
-    //  切换到新的内核线程
-    //  switch_proc(current_pcb, p);
 }
 
 /**
@@ -613,7 +605,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 为新的进程分配栈空间，并将pcb放置在底部
     tsk = (struct process_control_block *)kmalloc(STACK_SIZE, 0);
-    kdebug("struct process_control_block ADDRESS=%#018lx", (uint64_t)tsk);
+    // kdebug("struct process_control_block ADDRESS=%#018lx", (uint64_t)tsk);
 
     if (tsk == NULL)
     {
@@ -799,7 +791,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
     // 与父进程共享内存空间
     if (clone_flags & CLONE_VM)
     {
-        kdebug("copy_vm\t\t current_pcb->mm->pgd=%#018lx", current_pcb->mm->pgd);
+        // kdebug("copy_vm\t current_pcb->mm->pgd=%#018lx", current_pcb->mm->pgd);
         pcb->mm = current_pcb->mm;
 
         return retval;
@@ -819,46 +811,52 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
     memset(phys_2_virt(new_mms->pgd), 0, PAGE_4K_SIZE / 2);
 
     // 拷贝内核空间的页表指针
-    memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]) + 256, PAGE_4K_SIZE / 2);
+    memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]->mm->pgd) + 256, PAGE_4K_SIZE / 2);
 
-    pml4t_t *current_pgd = (pml4t_t *)phys_2_virt(current_pcb->mm->pgd);
+    uint64_t *current_pgd = (uint64_t *)phys_2_virt(current_pcb->mm->pgd);
 
+    uint64_t *new_pml4t = (uint64_t *)phys_2_virt(new_mms->pgd);
     // 迭代地拷贝用户空间
     for (int i = 0; i <= 255; ++i)
     {
         // 当前页表项为空
-        if ((current_pgd + i)->pml4t == 0)
+        if ((*(uint64_t *)(current_pgd + i)) == 0)
             continue;
 
         // 分配新的二级页表
         pdpt_t *new_pdpt = (pdpt_t *)kmalloc(PAGE_4K_SIZE, 0);
         memset(new_pdpt, 0, PAGE_4K_SIZE);
-        // 在新的一级页表中设置新的二级页表表项
-        set_pml4t((uint64_t *)(current_pgd + i), mk_pml4t(virt_2_phys(new_pdpt), ((current_pgd + i)->pml4t) & 0xfffUL));
 
-        pdpt_t *current_pdpt = (pdpt_t *)phys_2_virt((current_pgd + i)->pml4t & (~0xfffUL));
-        // 设置二级页表
+        // 在新的一级页表中设置新的二级页表表项
+        set_pml4t(new_pml4t + i, mk_pml4t(virt_2_phys(new_pdpt), (*(current_pgd + i)) & 0xfffUL));
+
+        pdpt_t *current_pdpt = (pdpt_t *)phys_2_virt(*(uint64_t *)(current_pgd + i) & (~0xfffUL));
+
+        // kdebug("current pdpt=%#018lx \t (current_pgd + i)->pml4t=%#018lx", current_pdpt, *(uint64_t *)(current_pgd+i));
+        //  设置二级页表
         for (int j = 0; j < 512; ++j)
         {
-            if ((current_pdpt + j)->pdpt == 0)
+            if (*(uint64_t *)(current_pdpt + j) == 0)
                 continue;
+
             // 分配新的三级页表
             pdt_t *new_pdt = (pdt_t *)kmalloc(PAGE_4K_SIZE, 0);
             memset(new_pdt, 0, PAGE_4K_SIZE);
 
             // 在新的二级页表中设置三级页表的表项
-            set_pdpt((uint64_t *)new_pdpt, mk_pdpt(virt_2_phys(new_pdt), (current_pdpt + j)->pdpt & 0xfffUL));
+            set_pdpt((uint64_t *)(new_pdpt + j), mk_pdpt(virt_2_phys(new_pdt), (*(uint64_t *)(current_pdpt + j)) & 0xfffUL));
 
-            pdt_t *current_pdt = (pdt_t *)phys_2_virt((current_pdpt + j)->pdpt & (~0xfffUL));
+            pdt_t *current_pdt = (pdt_t *)phys_2_virt((*(uint64_t *)(current_pdpt + j)) & (~0xfffUL));
 
             // 拷贝内存页
             for (int k = 0; k < 512; ++k)
             {
                 if ((current_pdt + k)->pdt == 0)
                     continue;
+
                 // 获取一个新页
                 struct Page *pg = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
-                set_pdt((uint64_t *)(current_pdt + k), mk_pdt(pg->addr_phys, (current_pdt + k)->pdt & 0x1fffUL));
+                set_pdt((uint64_t *)(new_pdt + k), mk_pdt(pg->addr_phys, (current_pdt + k)->pdt & 0x1fffUL));
 
                 // 拷贝数据
                 memcpy(phys_2_virt(pg->addr_phys), phys_2_virt((current_pdt + k)->pdt & (~0x1fffUL)), PAGE_2M_SIZE);

@@ -25,6 +25,11 @@ int main()
     read(fd, buf, 128);
     put_string(buf, COLOR_YELLOW, COLOR_BLACK);
     close(fd);
+    
+    pid_t p = fork();
+    if(p == 0)
+        put_string("subproc\n", COLOR_PURPLE, COLOR_BLACK);
+    else put_string("parent proc\n", COLOR_ORANGE, COLOR_BLACK);
 
     while (1)
         ;

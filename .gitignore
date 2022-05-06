@@ -7,3 +7,4 @@ kernel/kernel
 *.o
 *.s
 serial_opt.txt
+user/sys_api_lib

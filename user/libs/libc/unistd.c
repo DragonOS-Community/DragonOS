@@ -1,18 +1,17 @@
 #include <libc/unistd.h>
 #include <libsystem/syscall.h>
 
-
 /**
  * @brief 往屏幕上输出字符串
- * 
+ *
  * @param str 字符串指针
  * @param front_color 前景色
  * @param bg_color 背景色
- * @return int64_t 
+ * @return int64_t
  */
-int64_t put_string(char* str, uint64_t front_color, uint64_t bg_color)
+int64_t put_string(char *str, uint64_t front_color, uint64_t bg_color)
 {
-    return syscall_invoke(SYS_PUT_STRING, str, front_color, bg_color,0,0,0,0,0);
+    return syscall_invoke(SYS_PUT_STRING, (uint64_t)str, front_color, bg_color, 0, 0, 0, 0, 0);
 }
 /**
  * @brief 关闭文件接口
@@ -35,7 +34,7 @@ int close(int fd)
  */
 ssize_t read(int fd, void *buf, size_t count)
 {
-    return (ssize_t)syscall_invoke(SYS_READ, fd, buf, count,0,0,0,0,0);
+    return (ssize_t)syscall_invoke(SYS_READ, fd, (uint64_t)buf, count, 0, 0, 0, 0, 0);
 }
 
 /**
@@ -48,7 +47,7 @@ ssize_t read(int fd, void *buf, size_t count)
  */
 ssize_t write(int fd, void const *buf, size_t count)
 {
-    return (ssize_t)syscall_invoke(SYS_WRITE, fd, buf, count,0,0,0,0,0);
+    return (ssize_t)syscall_invoke(SYS_WRITE, fd, (uint64_t)buf, count, 0, 0, 0, 0, 0);
 }
 
 /**
@@ -61,5 +60,25 @@ ssize_t write(int fd, void const *buf, size_t count)
  */
 off_t lseek(int fd, off_t offset, int whence)
 {
-    return (off_t)syscall_invoke(SYS_LSEEK, fd, offset, whence, 0,0,0,0,0);
+    return (off_t)syscall_invoke(SYS_LSEEK, fd, offset, whence, 0, 0, 0, 0, 0);
+}
+
+/**
+ * @brief fork当前进程
+ *
+ * @return pid_t
+ */
+pid_t fork(void)
+{
+    return (pid_t)syscall_invoke(SYS_FORK, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * @brief fork当前进程，但是与父进程共享VM、flags、fd
+ *
+ * @return pid_t
+ */
+pid_t vfork(void)
+{
+    return (pid_t)syscall_invoke(SYS_VFORK, 0, 0, 0, 0, 0, 0, 0, 0);
 }

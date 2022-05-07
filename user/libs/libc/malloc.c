@@ -62,7 +62,7 @@ static malloc_mem_chunk_t *malloc_query_free_chunk_bf(uint64_t size)
     malloc_mem_chunk_t *ptr = malloc_free_list;
     malloc_mem_chunk_t *best = NULL;
     printf("query size=%d", size);
-    while (ptr)
+    while (ptr != NULL)
     {
         printf("ptr->length=%#010lx\n", ptr->length);
         if (ptr->length == size)
@@ -73,14 +73,18 @@ static malloc_mem_chunk_t *malloc_query_free_chunk_bf(uint64_t size)
 
         if (ptr->length > size)
         {
+            printf("676767\n");
             if (best == NULL)
                 best = ptr;
             else if (best->length > ptr->length)
                 best = ptr;
+            printf("6rdf\n");
         }
+        printf("ptr->next=%#018lx\n", ptr->next);
         ptr = ptr->next;
     }
 
+    printf("return best=%#018lx\n", (uint64_t)best);
     return best;
 }
 
@@ -126,11 +130,11 @@ static int malloc_enlarge(int32_t size)
     int64_t tmp = brk_managed_addr + size - brk_max_addr;
     if (tmp > 0) // 现有堆空间不足
     {
-        if (sbrk(tmp) != (-1))
-            brk_max_addr = brk((-1));
+        if (sbrk(tmp) != (void *)(-1))
+            brk_max_addr = brk((-2));
         else
         {
-            put_string("malloc_enlarge(): no_mem", COLOR_YELLOW, COLOR_BLACK);
+            put_string("malloc_enlarge(): no_mem\n", COLOR_YELLOW, COLOR_BLACK);
             return -ENOMEM;
         }
     }
@@ -263,6 +267,7 @@ static void *malloc_no_enlarge(ssize_t size)
             return -ENOMEM; // 内存不足
     }
 found:;
+
     // 分配空闲块
     // 从空闲链表取出
     if (ck->prev == NULL) // 当前是链表的第一个块
@@ -278,7 +283,8 @@ found:;
     // 当前块剩余的空间还能容纳多一个结点的空间，则分裂当前块
     if (ck->length - size > sizeof(malloc_mem_chunk_t))
     {
-        malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + ck->length;
+        printf("new_ck = %#018lx\n", ((uint64_t)ck) + size);
+        malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + size;
         new_ck->length = ck->length - size;
         new_ck->start_addr = (uint64_t)new_ck;
         new_ck->prev = new_ck->next = NULL;
@@ -286,7 +292,7 @@ found:;
         ck->length = size;
         malloc_insert_free_list(new_ck);
     }
-
+    printf("12121212\n");
     // 插入到已分配链表
     // 直接插入到链表头，符合LIFO
     ck->prev = NULL;
@@ -337,6 +343,8 @@ void *malloc(ssize_t size)
         ck = malloc_query_free_chunk_bf(size);
     }
 found:;
+
+    printf("ck = %#018lx\n", (uint64_t)ck);
     if (ck == NULL)
         return -ENOMEM;
     // 分配空闲块
@@ -354,11 +362,11 @@ found:;
     // 当前块剩余的空间还能容纳多一个结点的空间，则分裂当前块
     if (ck->length - size > sizeof(malloc_mem_chunk_t))
     {
-        malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + ck->length;
+        malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + size;
         new_ck->length = ck->length - size;
         new_ck->start_addr = (uint64_t)new_ck;
         new_ck->prev = new_ck->next = NULL;
-
+        printf("new_ck=%#018lx, new_ck->length=%#010lx\n", (uint64_t)new_ck, new_ck->length);
         ck->length = size;
         malloc_insert_free_list(new_ck);
     }

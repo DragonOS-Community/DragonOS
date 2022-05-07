@@ -12,27 +12,29 @@ int main()
     put_string(tips_str, COLOR_GREEN, COLOR_BLACK);
 
     printf("test printf: %s size: %d\n", string, sizeof(string));
+    /*
     int fd = open(string, 0);
     printf("fd=%d\n", fd);
-    /*
+
     read(fd, buf, 128);
-    
+
     put_string(buf, COLOR_ORANGE, COLOR_BLACK);
 
     lseek(fd, 0, SEEK_SET);
     write(fd, tips_str, sizeof(tips_str)-1);
     lseek(fd, 0, SEEK_SET);
-    
+
     // 由于暂时没有实现用户态的memset，因此先手动清零
     for(int i=0;i<128;++i)
         buf[i] = 0;
-    
+
     read(fd, buf, 128);
     put_string(buf, COLOR_YELLOW, COLOR_BLACK);
     close(fd);
     */
-    char* p = malloc(100);
-    printf("p=%lld\n", (uint64_t)p);
+    char *p = malloc(100);
+    *p = 'a';
+    printf("p=%lld\t*p=%c\n", (uint64_t)p, *p);
     // *p = 'a';
     /*
     pid_t p = fork();

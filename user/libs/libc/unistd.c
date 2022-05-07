@@ -1,18 +1,8 @@
 #include <libc/unistd.h>
 #include <libsystem/syscall.h>
+#include <libc/errno.h>
+#include <libc/stdio.h>
 
-/**
- * @brief 往屏幕上输出字符串
- *
- * @param str 字符串指针
- * @param front_color 前景色
- * @param bg_color 背景色
- * @return int64_t
- */
-int64_t put_string(char *str, uint64_t front_color, uint64_t bg_color)
-{
-    return syscall_invoke(SYS_PUT_STRING, (uint64_t)str, front_color, bg_color, 0, 0, 0, 0, 0);
-}
 /**
  * @brief 关闭文件接口
  *
@@ -81,4 +71,38 @@ pid_t fork(void)
 pid_t vfork(void)
 {
     return (pid_t)syscall_invoke(SYS_VFORK, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * @brief 将堆内存调整为end_brk
+ *
+ * @param end_brk 新的堆区域的结束地址
+ * end_brk=-1  ===> 返回堆区域的起始地址
+ * end_brk=-2  ===> 返回堆区域的结束地址
+ * @return uint64_t 错误码
+ *
+ */
+uint64_t brk(uint64_t end_brk)
+{
+    uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0, 0, 0);
+    printf("brk():  end_brk=%#018lx x=%#018lx", (uint64_t)end_brk, x);
+    return x;
+}
+
+/**
+ * @brief 将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
+ *
+ * @param increment offset偏移量
+ * @return uint64_t the previous program break
+ */
+void *sbrk(int64_t increment)
+{
+    void *retval = (void *)syscall_invoke(SYS_SBRK, (uint64_t)increment, 0, 0, 0, 0, 0, 0, 0);
+    if (retval == (void *)-ENOMEM)
+        return (void *)(-1);
+    else
+    {
+        errno = 0;
+        return (void *)retval;
+    }
 }

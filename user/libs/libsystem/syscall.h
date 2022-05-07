@@ -12,6 +12,8 @@
 #define SYS_LSEEK 6
 #define SYS_FORK 7
 #define SYS_VFORK 8
+#define SYS_BRK 9
+#define SYS_SBRK 10
 
 /**
  * @brief 用户态系统调用函数

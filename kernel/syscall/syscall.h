@@ -55,6 +55,25 @@ ul system_call_not_exists(struct pt_regs *regs)
  */
 ul sys_printf(struct pt_regs *regs);
 
+/**
+ * @brief 将堆内存调整为arg0
+ *
+ * @param arg0 新的堆区域的结束地址
+ * arg0=0  ===> 返回堆区域的起始地址
+ * arg0=-1  ===> 返回堆区域的结束地址
+ * @return uint64_t 错误码
+ * 
+ */
+uint64_t sys_brk(struct pt_regs *regs);
+
+/**
+ * @brief 将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
+ *
+ * @param arg0 offset偏移量
+ * @return uint64_t the previous program break
+ */
+uint64_t sys_sbrk(struct pt_regs *regs);
+
 ul sys_ahci_end_req(struct pt_regs *regs);
 
 // 系统调用的内核入口程序

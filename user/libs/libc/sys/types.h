@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef unsigned char u_char;
 typedef unsigned short u_short;

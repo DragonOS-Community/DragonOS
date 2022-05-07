@@ -345,30 +345,58 @@ uint64_t sys_vfork(struct pt_regs *regs)
 }
 
 /**
- * @brief 堆内存调整
+ * @brief 将堆内存调整为arg0
  *
  * @param arg0 新的堆区域的结束地址
- * @return uint64_t 调整后的堆区域的结束地址
+ * arg0=-1  ===> 返回堆区域的起始地址
+ * arg0=-2  ===> 返回堆区域的结束地址
+ * @return uint64_t 错误码
+ *
  */
 uint64_t sys_brk(struct pt_regs *regs)
 {
     uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
 
-    kdebug("sys_brk input= %#010lx bytes,  new_brk= %#010lx bytes current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_end);
+    kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
 
-    if (new_brk == 0)
+    if ((int64_t)regs->r8 == -1)
+    {
+        kdebug("get brk_start=%#018lx", current_pcb->mm->brk_start);
+        return 0;
         return current_pcb->mm->brk_start;
-    
-    if(new_brk > current_pcb->addr_limit)   // 堆地址空间超过限制
-        return  -EADDRNOTAVAIL;
-        
+    }
+    if ((int64_t)regs->r8 == -2)
+    {
+        kdebug("get brk_end=%#018lx", current_pcb->mm->brk_end);
+        return current_pcb->mm->brk_end;
+    }
+    if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
+        return -ENOMEM;
+
     if (new_brk < current_pcb->mm->brk_end) // todo: 释放堆内存空间
         return 0;
 
     new_brk = mm_do_brk(current_pcb->mm->brk_end, new_brk - current_pcb->mm->brk_end); // 扩展堆内存空间
 
     current_pcb->mm->brk_end = new_brk;
-    return new_brk;
+    return 0;
+}
+
+/**
+ * @brief 将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
+ *
+ * @param arg0 offset偏移量
+ * @return uint64_t the previous program break
+ */
+uint64_t sys_sbrk(struct pt_regs *regs)
+{
+    uint64_t retval = current_pcb->mm->brk_end;
+    regs->r8 = (int64_t)current_pcb->mm->brk_end + (int64_t)regs->r8;
+
+    if (sys_brk(regs) == 0)
+        return retval;
+    else
+        return -ENOMEM;
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)
@@ -380,8 +408,15 @@ ul sys_ahci_end_req(struct pt_regs *regs)
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 {
-
+    if(regs->rax == SYS_BRK)
+    {
+        kdebug("is sysbrk");
+        regs->rax = 0xc00000UL;
+        return;
+    }
     ul ret = system_call_table[regs->rax](regs);
+    if(regs->rax == SYS_BRK)
+        kdebug("brk ret=%#018lx", ret);
     regs->rax = ret; // 返回码
 }
 
@@ -396,5 +431,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [6] = sys_lseek,
         [7] = sys_fork,
         [8] = sys_vfork,
-        [9 ... 254] = system_call_not_exists,
+        [9] = sys_brk,
+        [10] = sys_sbrk,
+        [11 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

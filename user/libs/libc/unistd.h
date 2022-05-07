@@ -2,27 +2,9 @@
 #include <stdint.h>
 #include <libc/sys/types.h>
 
-// 字体颜色的宏定义
-#define COLOR_WHITE 0x00ffffff  //白
-#define COLOR_BLACK 0x00000000  //黑
-#define COLOR_RED 0x00ff0000    //红
-#define COLOR_ORANGE 0x00ff8000 //橙
-#define COLOR_YELLOW 0x00ffff00 //黄
-#define COLOR_GREEN 0x0000ff00  //绿
-#define COLOR_BLUE 0x000000ff   //蓝
-#define COLOR_INDIGO 0x0000ffff //靛
-#define COLOR_PURPLE 0x008000ff //紫
 
 
-/**
- * @brief 往屏幕上输出字符串
- * 
- * @param str 字符串指针
- * @param front_color 前景色
- * @param bg_color 背景色
- * @return int64_t 
- */
-int64_t put_string(char* str, uint64_t front_color, uint64_t bg_color);
+
 
 
 /**
@@ -77,3 +59,21 @@ pid_t fork(void);
  */
 pid_t vfork(void);
 
+/**
+ * @brief 将堆内存调整为end_brk
+ *
+ * @param end_brk 新的堆区域的结束地址
+ * end_brk=0  ===> 返回堆区域的起始地址
+ * end_brk=-1  ===> 返回堆区域的结束地址
+ * @return uint64_t 错误码
+ * 
+ */
+uint64_t brk(uint64_t end_brk);
+
+/**
+ * @brief 将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
+ * 
+ * @param increment offset偏移量
+ * @return uint64_t the previous program break
+ */
+void * sbrk(int64_t increment);

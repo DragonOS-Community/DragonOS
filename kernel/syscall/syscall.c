@@ -362,7 +362,6 @@ uint64_t sys_brk(struct pt_regs *regs)
     if ((int64_t)regs->r8 == -1)
     {
         kdebug("get brk_start=%#018lx", current_pcb->mm->brk_start);
-        return 0;
         return current_pcb->mm->brk_start;
     }
     if ((int64_t)regs->r8 == -2)
@@ -408,12 +407,7 @@ ul sys_ahci_end_req(struct pt_regs *regs)
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 {
-    if(regs->rax == SYS_BRK)
-    {
-        kdebug("is sysbrk");
-        regs->rax = 0xc00000UL;
-        return;
-    }
+    
     ul ret = system_call_table[regs->rax](regs);
     if(regs->rax == SYS_BRK)
         kdebug("brk ret=%#018lx", ret);

@@ -9,6 +9,22 @@
 static char *write_num(char *str, uint64_t num, int base, int field_width, int precision, int flags);
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
 
+
+static int skip_and_atoi(const char **s)
+{
+    /**
+     * @brief 获取连续的一段字符对应整数的值
+     * @param:**s 指向 指向字符串的指针 的指针
+     */
+    int ans = 0;
+    while (is_digit(**s))
+    {
+        ans = ans * 10 + (**s) - '0';
+        ++(*s);
+    }
+    return ans;
+}
+
 /**
  * @brief 往屏幕上输出字符串
  *
@@ -138,7 +154,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
         }
         else if (is_digit(*fmt))
         {
-            field_width = atoi(&fmt);
+            field_width = skip_and_atoi(&fmt);
             if (field_width < 0)
             {
                 field_width = -field_width;
@@ -158,7 +174,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             }
             else if is_digit (*fmt)
             {
-                precision = atoi(&fmt);
+                precision = skip_and_atoi(&fmt);
             }
         }
 

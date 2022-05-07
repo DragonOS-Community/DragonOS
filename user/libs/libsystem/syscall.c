@@ -14,15 +14,11 @@ long syscall_invoke(uint64_t syscall_id, uint64_t arg0, uint64_t arg1, uint64_t 
         "movq %8, %%r14 \n\t"
         "movq %9, %%r15 \n\t"
         "int $0x80   \n\t"
-        "movq %%rax, %0 \n\t"
-        : "=m"(err_code)
+        // "movq %%rax, %0 \n\t"
+        : "=a"(err_code)
         : "a"(syscall_id), "m"(arg0), "m"(arg1), "m"(arg2), "m"(arg3), "m"(arg4), "m"(arg5), "m"(arg6), "m"(arg7)
         : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
     errno = err_code;
-    if (syscall_id == SYS_BRK || syscall_id == SYS_OPEN)
-    {
-        printf("retval = %#018lx\n", (uint64_t)err_code);
-        printf("errcode = %d\n", err_code);
-    }
+    
     return err_code;
 }

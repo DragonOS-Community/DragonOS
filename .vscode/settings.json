@@ -92,7 +92,9 @@
         "stdint.h": "c",
         "syscall.h": "c",
         "fcntl.h": "c",
-        "types.h": "c"
+        "types.h": "c",
+        "string.h": "c",
+        "math.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

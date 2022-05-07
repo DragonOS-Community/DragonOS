@@ -1,5 +1,6 @@
 #include <libc/unistd.h>
 #include <libc/stdlib.h>
+#include <libc/ctype.h>
 
 int abs(int i)
 {

@@ -133,3 +133,7 @@ This project refers to the following materials. I sincerely give my thanks to th
 - Intel® 64 and IA-32 Architectures Software Developer’s Manual
 
 - IA-PC HPET (High Precision Event Timers) Specification
+
+- [skiftOS]([GitHub - skiftOS/skift: 🥑 A hobby operating system built from scratch in modern C++. Featuring a reactive UI library and a strong emphasis on user experience.](https://github.com/skiftOS/skift))
+
+- [GuideOS](https://github.com/Codetector1374/GuideOS)

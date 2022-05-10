@@ -24,7 +24,6 @@ static uint64_t brk_managed_addr = 0; // 堆区域已经被管理的地址
 //  按start_addr升序排序
 static malloc_mem_chunk_t *malloc_free_list = NULL;
 
-
 /**
  * @brief 获取一块堆内存（不尝试扩大堆内存）
  *
@@ -236,71 +235,21 @@ static void malloc_insert_free_list(malloc_mem_chunk_t *ck)
 }
 
 /**
- * @brief 获取一块堆内存（不尝试扩大堆内存）
- *
- * @param size
- * @return void* 内存的地址指针，获取失败时返回-ENOMEM
- */
-static void *malloc_no_enlarge(ssize_t size)
-{
-    // 加上header的大小
-    size += sizeof(malloc_mem_chunk_t);
-
-    // 采用best fit
-    malloc_mem_chunk_t *ck = malloc_query_free_chunk_bf(size);
-
-    if (ck == NULL) // 没有空闲块
-    {
-        // 尝试合并空闲块
-
-        malloc_merge_free_chunk();
-        ck = malloc_query_free_chunk_bf(size);
-
-        // 找到了合适的块
-        if (ck)
-            goto found;
-        else
-            return -ENOMEM; // 内存不足
-    }
-found:;
-
-    // 分配空闲块
-    // 从空闲链表取出
-    if (ck->prev == NULL) // 当前是链表的第一个块
-    {
-        malloc_free_list = ck->next;
-    }
-    else
-        ck->prev->next = ck->next;
-
-    if (ck->next != NULL) // 当前不是最后一个块
-        ck->next->prev = ck->prev;
-
-    // 当前块剩余的空间还能容纳多一个结点的空间，则分裂当前块
-    if (ck->length - size > sizeof(malloc_mem_chunk_t))
-    {
-        printf("new_ck = %#018lx\n", ((uint64_t)ck) + size);
-        malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + size;
-        new_ck->length = ck->length - size;
-        new_ck->prev = new_ck->next = NULL;
-
-        ck->length = size;
-        malloc_insert_free_list(new_ck);
-    }
-    printf("12121212\n");
-
-    return (void *)((uint64_t)ck+ sizeof(malloc_mem_chunk_t));
-}
-/**
  * @brief 获取一块堆内存
  *
  * @param size 内存大小
  * @return void* 内存空间的指针
+ *
+ * 分配内存的时候，结点的prev next指针所占用的空间被当做空闲空间分配出去
  */
 void *malloc(ssize_t size)
 {
-    // 加上header的大小
-    size += sizeof(malloc_mem_chunk_t);
+
+    // 计算需要分配的块的大小
+    if (size + sizeof(uint64_t) <= sizeof(malloc_mem_chunk_t))
+        size = sizeof(malloc_mem_chunk_t);
+    else
+        size += sizeof(uint64_t);
 
     // 采用best fit
     malloc_mem_chunk_t *ck = malloc_query_free_chunk_bf(size);
@@ -319,7 +268,7 @@ void *malloc(ssize_t size)
         // 找不到合适的块，扩容堆区域
         printf("enlarge\n");
         if (malloc_enlarge(size) == -ENOMEM)
-            return -ENOMEM; // 内存不足
+            return (void *)-ENOMEM; // 内存不足
         // 扩容后再次尝试获取
         printf("query\n");
         ck = malloc_query_free_chunk_bf(size);
@@ -328,7 +277,7 @@ found:;
 
     printf("ck = %#018lx\n", (uint64_t)ck);
     if (ck == NULL)
-        return -ENOMEM;
+        return (void *)-ENOMEM;
     // 分配空闲块
     // 从空闲链表取出
     if (ck->prev == NULL) // 当前是链表的第一个块
@@ -344,7 +293,7 @@ found:;
     // 当前块剩余的空间还能容纳多一个结点的空间，则分裂当前块
     if (ck->length - size > sizeof(malloc_mem_chunk_t))
     {
-        malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + size;
+        malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)(((uint64_t)ck) + size);
         new_ck->length = ck->length - size;
         new_ck->prev = new_ck->next = NULL;
         printf("new_ck=%#018lx, new_ck->length=%#010lx\n", (uint64_t)new_ck, new_ck->length);
@@ -352,9 +301,9 @@ found:;
         malloc_insert_free_list(new_ck);
     }
 
-    
     printf("ck=%lld\n", (uint64_t)ck);
-    return (void *)((uint64_t)ck + sizeof(malloc_mem_chunk_t));
+    // 此时链表结点的指针的空间被分配出去
+    return (void *)((uint64_t)ck + sizeof(uint64_t));
 }
 
 /**

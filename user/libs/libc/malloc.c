@@ -11,7 +11,6 @@
  */
 typedef struct malloc_mem_chunk_t
 {
-    uint64_t start_addr;             // 整个块所在内存区域的起始地址（包括header）
     uint64_t length;                 // 整个块所占用的内存区域的大小
     struct malloc_mem_chunk_t *prev; // 上一个结点的指针
     struct malloc_mem_chunk_t *next; // 下一个结点的指针
@@ -24,9 +23,7 @@ static uint64_t brk_managed_addr = 0; // 堆区域已经被管理的地址
 // 空闲链表
 //  按start_addr升序排序
 static malloc_mem_chunk_t *malloc_free_list = NULL;
-// 已分配链表
-//  使用LIFO策略。基于假设：程序运行早期分配的内存会被最晚释放
-static malloc_mem_chunk_t *malloc_allocated_list = NULL;
+
 
 /**
  * @brief 获取一块堆内存（不尝试扩大堆内存）
@@ -142,9 +139,8 @@ static int malloc_enlarge(int32_t size)
     // 扩展管理的堆空间
     // 在新分配的内存的底部放置header
     malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)brk_managed_addr;
-    new_ck->start_addr = (uint64_t)new_ck;
     new_ck->length = brk_max_addr - brk_managed_addr;
-    printf("new_ck->start_addr=%#018lx\tbrk_max_addr=%#018lx\tbrk_managed_addr=%#018lx\n", new_ck->start_addr, brk_max_addr, brk_managed_addr);
+    printf("new_ck->start_addr=%#018lx\tbrk_max_addr=%#018lx\tbrk_managed_addr=%#018lx\n", (uint64_t)new_ck, brk_max_addr, brk_managed_addr);
     new_ck->prev = new_ck->next = NULL;
     brk_managed_addr = brk_max_addr;
 
@@ -165,7 +161,7 @@ static void malloc_merge_free_chunk()
     while (ptr)
     {
         // 内存块连续
-        if (ptr->prev->start_addr + ptr->prev->length == ptr->start_addr)
+        if (((uint64_t)(ptr->prev) + ptr->prev->length == (uint64_t)ptr))
         {
             // 将ptr与前面的空闲块合并
             ptr->prev->length += ptr->length;
@@ -192,11 +188,11 @@ static void malloc_insert_free_list(malloc_mem_chunk_t *ck)
     }
     else
     {
-        uint64_t ck_end = ck->start_addr + ck->length;
+        uint64_t ck_end = (uint64_t)ck + ck->length;
         malloc_mem_chunk_t *ptr = malloc_free_list;
         while (ptr)
         {
-            if (ptr->start_addr < ck->start_addr)
+            if ((uint64_t)ptr < (uint64_t)ck)
             {
                 if (ptr->next == NULL) // 当前是最后一个项
                 {
@@ -205,7 +201,7 @@ static void malloc_insert_free_list(malloc_mem_chunk_t *ck)
                     ck->prev = ptr;
                     break;
                 }
-                else if (ptr->next->start_addr > ck->start_addr)
+                else if ((uint64_t)(ptr->next) > (uint64_t)ck)
                 {
                     ck->prev = ptr;
                     ck->next = ptr->next;
@@ -286,28 +282,14 @@ found:;
         printf("new_ck = %#018lx\n", ((uint64_t)ck) + size);
         malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + size;
         new_ck->length = ck->length - size;
-        new_ck->start_addr = (uint64_t)new_ck;
         new_ck->prev = new_ck->next = NULL;
 
         ck->length = size;
         malloc_insert_free_list(new_ck);
     }
     printf("12121212\n");
-    // 插入到已分配链表
-    // 直接插入到链表头，符合LIFO
-    ck->prev = NULL;
-    if (malloc_allocated_list) // 已分配链表不为空
-    {
-        malloc_allocated_list->prev = ck;
-        ck->next = malloc_allocated_list;
-        malloc_allocated_list = ck;
-    }
-    else // 已分配链表为空
-    {
-        malloc_allocated_list = ck;
-        ck->next = NULL;
-    }
-    return (void *)(ck->start_addr + sizeof(malloc_mem_chunk_t));
+
+    return (void *)((uint64_t)ck+ sizeof(malloc_mem_chunk_t));
 }
 /**
  * @brief 获取一块堆内存
@@ -364,30 +346,15 @@ found:;
     {
         malloc_mem_chunk_t *new_ck = ((uint64_t)ck) + size;
         new_ck->length = ck->length - size;
-        new_ck->start_addr = (uint64_t)new_ck;
         new_ck->prev = new_ck->next = NULL;
         printf("new_ck=%#018lx, new_ck->length=%#010lx\n", (uint64_t)new_ck, new_ck->length);
         ck->length = size;
         malloc_insert_free_list(new_ck);
     }
 
-    // 插入到已分配链表
-    // 直接插入到链表头，符合LIFO
-    ck->prev = NULL;
-    if (malloc_allocated_list) // 已分配链表不为空
-    {
-        malloc_allocated_list->prev = ck;
-        ck->next = malloc_allocated_list;
-        malloc_allocated_list = ck;
-    }
-    else // 已分配链表为空
-    {
-        malloc_allocated_list = ck;
-        ck->next = NULL;
-    }
+    
     printf("ck=%lld\n", (uint64_t)ck);
-    printf("ck->start_addr=%lld\n", ck->start_addr);
-    return (void *)(ck->start_addr + sizeof(malloc_mem_chunk_t));
+    return (void *)((uint64_t)ck + sizeof(malloc_mem_chunk_t));
 }
 
 /**

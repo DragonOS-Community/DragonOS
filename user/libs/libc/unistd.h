@@ -63,10 +63,10 @@ pid_t vfork(void);
  * @brief 将堆内存调整为end_brk
  *
  * @param end_brk 新的堆区域的结束地址
- * end_brk=0  ===> 返回堆区域的起始地址
- * end_brk=-1  ===> 返回堆区域的结束地址
+ * end_brk=-1  ===> 返回堆区域的起始地址
+ * end_brk=-2  ===> 返回堆区域的结束地址
  * @return uint64_t 错误码
- * 
+ *
  */
 uint64_t brk(uint64_t end_brk);
 

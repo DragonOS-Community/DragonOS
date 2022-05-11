@@ -357,7 +357,7 @@ uint64_t sys_brk(struct pt_regs *regs)
 {
     uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
 
-    kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
+    // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
 
     if ((int64_t)regs->r8 == -1)
     {
@@ -372,10 +372,20 @@ uint64_t sys_brk(struct pt_regs *regs)
     if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
         return -ENOMEM;
 
-    if (new_brk < current_pcb->mm->brk_end) // todo: 释放堆内存空间
-        return 0;
+    int64_t offset;
+    if (new_brk >= current_pcb->mm->brk_end)
+        offset = (int64_t)(new_brk - current_pcb->mm->brk_end);
+    else
+        offset = -(int64_t)(current_pcb->mm->brk_end - new_brk);
 
-    new_brk = mm_do_brk(current_pcb->mm->brk_end, new_brk - current_pcb->mm->brk_end); // 扩展堆内存空间
+    /*
+    if (offset < 0)
+    {
+        kdebug("decrease brk, offset = %#010lx", (uint64_t)(-offset));
+    }
+    */
+
+    new_brk = mm_do_brk(current_pcb->mm->brk_end, offset); // 扩展堆内存空间
 
     current_pcb->mm->brk_end = new_brk;
     return 0;
@@ -390,12 +400,25 @@ uint64_t sys_brk(struct pt_regs *regs)
 uint64_t sys_sbrk(struct pt_regs *regs)
 {
     uint64_t retval = current_pcb->mm->brk_end;
-    regs->r8 = (int64_t)current_pcb->mm->brk_end + (int64_t)regs->r8;
+    if ((int64_t)regs->r8 > 0)
+    {
 
-    if (sys_brk(regs) == 0)
-        return retval;
+        uint64_t new_brk = PAGE_2M_ALIGN(retval + regs->r8);
+        if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
+        {
+            kdebug("exceed mem limit, new_brk = %#018lx", new_brk);
+            return -ENOMEM;
+        }
+    }
     else
-        return -ENOMEM;
+    {
+        if ((__int128_t)current_pcb->mm->brk_end + (__int128_t)regs->r8 < current_pcb->mm->brk_start)
+            return retval;
+    }
+    uint64_t new_brk = mm_do_brk(current_pcb->mm->brk_end, (int64_t)regs->r8); // 调整堆内存空间
+
+    current_pcb->mm->brk_end = new_brk;
+    return retval;
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)
@@ -407,7 +430,7 @@ ul sys_ahci_end_req(struct pt_regs *regs)
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 {
-    
+
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }

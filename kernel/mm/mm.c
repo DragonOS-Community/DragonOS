@@ -8,6 +8,18 @@
 ul Total_Memory = 0;
 ul total_2M_pages = 0;
 static ul root_page_table_phys_addr = 0; // 内核层根页表的物理地址
+
+/**
+ * @brief 从页表中获取pdt页表项的内容
+ *
+ * @param proc_page_table_addr 页表的地址
+ * @param is_phys 页表地址是否为物理地址
+ * @param virt_addr_start 要清除的虚拟地址的起始地址
+ * @param length 要清除的区域的长度
+ * @param clear 是否清除标志位
+ */
+uint64_t mm_get_PDE(ul proc_page_table_addr, bool is_phys, ul virt_addr, bool clear);
+
 void mm_init()
 {
     kinfo("Initializing memory management unit...");
@@ -444,36 +456,6 @@ void page_table_init()
         for (int j = 0; j < z->count_pages; ++j)
         {
             mm_map_phys_addr((ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
-            /*
-            // 计算出PML4页表中的页表项的地址
-            tmp_addr = (ul *)((ul)pml4_addr + ((((ul)phys_2_virt(p->addr_phys)) >> PAGE_GDT_SHIFT) & 0x1ff) * 8);
-
-            // 说明该页还没有分配pdpt页表，使用kmalloc分配一个
-            if (*tmp_addr = 0)
-            {
-                ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
-                set_pml4t(tmp_addr, mk_pml4t(virt_2_phys(virt_addr), PAGE_KERNEL_PGT));
-            }
-
-            // 计算出pdpt页表的页表项的地址
-            tmp_addr = (ul *)((ul)(phys_2_virt(*tmp_addr & (~0xfffUL))) + ((((ul)phys_2_virt(p->addr_phys)) >> PAGE_1G_SHIFT) & 0x1ff) * 8);
-
-            // 说明该页还没有分配pd页表，使用kmalloc分配一个
-            if (*tmp_addr = 0)
-            {
-                ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
-                set_pdpt(tmp_addr, mk_pdpt(virt_2_phys(virt_addr), PAGE_KERNEL_DIR));
-            }
-
-            // 计算出pd页表的页表项的地址
-            tmp_addr = (ul *)((ul)(phys_2_virt(*tmp_addr & (~0xfffUL))) + ((((ul)phys_2_virt(p->addr_phys)) >> PAGE_2M_SHIFT) & 0x1ff) * 8);
-
-            // 填入pd页表的页表项，映射2MB物理页
-            set_pdt(tmp_addr, mk_pdt(virt_2_phys(p->addr_phys), PAGE_KERNEL_PAGE));
-            */
-            // 测试
-            if (j % 50 == 0)
-                kdebug("pd_addr=%#018lx, *pd_addr=%#018lx", tmp_addr, *tmp_addr);
         }
     }
 
@@ -631,19 +613,14 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
     else
         tmp = (ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff);
 
-    // kdebug("tmp = %#018lx", tmp);
     if (*tmp == 0)
     {
         ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
         memset(virt_addr, 0, PAGE_4K_SIZE);
         set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), (user ? PAGE_USER_PGT : PAGE_KERNEL_PGT)));
     }
-    // kdebug("*tmp = %#018lx", *tmp);
 
-    if (is_phys)
-        tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));
-    else
-        tmp = (ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff);
+    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));
 
     if (*tmp == 0)
     {
@@ -657,16 +634,156 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
     for (ul i = 0; i < (length); i += PAGE_2M_SIZE)
     {
         // 计算当前2M物理页对应的pdt的页表项的物理地址
-        if (is_phys)
-            tmp1 = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff)));
-        else
-            tmp1 = ((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff));
+
+        tmp1 = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff)));
 
         // 页面写穿，禁止缓存
         set_pdt(tmp1, mk_pdt((ul)phys_addr_start + i, flags | (user ? PAGE_USER_PAGE : PAGE_KERNEL_PAGE)));
     }
 
     flush_tlb();
+}
+
+/**
+ * @brief 从页表中获取pdt页表项的内容
+ *
+ * @param proc_page_table_addr 页表的地址
+ * @param is_phys 页表地址是否为物理地址
+ * @param virt_addr_start 要清除的虚拟地址的起始地址
+ * @param length 要清除的区域的长度
+ * @param clear 是否清除标志位
+ */
+uint64_t mm_get_PDE(ul proc_page_table_addr, bool is_phys, ul virt_addr, bool clear)
+{
+    ul *tmp;
+    if (is_phys)
+        tmp = phys_2_virt((ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr >> PAGE_GDT_SHIFT) & 0x1ff));
+    else
+        tmp = (ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr >> PAGE_GDT_SHIFT) & 0x1ff);
+
+    // pml4页表项为0
+    if (*tmp == 0)
+        return 0;
+
+    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr >> PAGE_1G_SHIFT) & 0x1ff));
+
+    // pdpt页表项为0
+    if (*tmp == 0)
+        return 0;
+
+    // 读取pdt页表项
+    tmp = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr) >> PAGE_2M_SHIFT) & 0x1ff)));
+
+    if (clear) // 清除页表项的标志位
+        return *tmp & (~0x1fff);
+    else
+        return *tmp;
+}
+
+/**
+ * @brief 从页表中清除虚拟地址的映射
+ *
+ * @param proc_page_table_addr 页表的地址
+ * @param is_phys 页表地址是否为物理地址
+ * @param virt_addr_start 要清除的虚拟地址的起始地址
+ * @param length 要清除的区域的长度
+ */
+void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul length)
+{
+    ul *tmp;
+    if (is_phys)
+        tmp = phys_2_virt((ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff));
+    else
+        tmp = (ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff);
+
+    // pml4页表项为0
+    if (*tmp == 0)
+        return;
+
+    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));
+
+    // pdpt页表项为0
+    if (*tmp == 0)
+        return;
+
+    ul *tmp1;
+
+    for (ul i = 0; i < (length); i += PAGE_2M_SIZE)
+    {
+        // 计算当前2M物理页对应的pdt的页表项的物理地址
+        tmp1 = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff)));
+        // 清除映射
+        *tmp1 = 0;
+    }
+
+    flush_tlb();
+}
+
+/**
+ * @brief 从mms中寻找Page结构体
+ *
+ * @param phys_addr
+ * @return struct Page*
+ */
+static struct Page *mm_find_page(uint64_t phys_addr, uint32_t zone_select)
+{
+    uint32_t zone_start, zone_end;
+    switch (zone_select)
+    {
+    case ZONE_DMA:
+        // DMA区域
+        zone_start = 0;
+        zone_end = ZONE_DMA_INDEX;
+        break;
+    case ZONE_NORMAL:
+        zone_start = ZONE_DMA_INDEX;
+        zone_end = ZONE_NORMAL_INDEX;
+        break;
+    case ZONE_UNMAPPED_IN_PGT:
+        zone_start = ZONE_NORMAL_INDEX;
+        zone_end = ZONE_UNMAPPED_INDEX;
+        break;
+
+    default:
+        kerror("In mm_find_page: param: zone_select incorrect.");
+        // 返回空
+        return NULL;
+        break;
+    }
+
+    for (int i = zone_start; i <= zone_end; ++i)
+    {
+        if ((memory_management_struct.zones_struct + i)->count_pages_using == 0)
+            continue;
+
+        struct Zone *z = memory_management_struct.zones_struct + i;
+
+        // 区域对应的起止页号
+        ul page_start = (z->zone_addr_start >> PAGE_2M_SHIFT);
+        ul page_end = (z->zone_addr_end >> PAGE_2M_SHIFT);
+
+        ul tmp = 64 - page_start % 64;
+        for (ul j = page_start; j < page_end; j += ((j % 64) ? tmp : 64))
+        {
+            // 按照bmp中的每一个元素进行查找
+            // 先将p定位到bmp的起始元素
+            ul *p = memory_management_struct.bmp + (j >> 6);
+
+            ul shift = j % 64;
+            for (ul k = shift; k < 64; ++k)
+            {
+                if ((*p >> k) & 1) // 若当前页已分配
+                {
+                    uint64_t page_num = j + k - shift;
+                    struct Page *x = memory_management_struct.pages_struct + page_num;
+
+                    if (x->addr_phys == phys_addr) // 找到对应的页
+                        return x;
+                }
+            }
+        }
+    }
+    return NULL;
 }
 
 /**
@@ -679,16 +796,38 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
  */
 uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
 {
-    // 暂不支持缩小堆内存
-    if (offset < 0)
-        return old_brk_end_addr;
 
-    uint64_t end_addr = old_brk_end_addr + offset;
-    for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
+    uint64_t end_addr = PAGE_2M_ALIGN(old_brk_end_addr + offset);
+    if (offset >= 0)
     {
-        kdebug("map [%d]", i);
-        mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+        for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
+        {
+            kdebug("map [%#018lx]", i);
+            mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+        }
+        current_pcb->mm->brk_end = end_addr;
     }
-    current_pcb->mm->brk_end = end_addr;
+    else
+    {
+
+        // 释放堆内存
+        for (uint64_t i = end_addr; i < old_brk_end_addr; i += PAGE_2M_SIZE)
+        {
+            uint64_t phys = mm_get_PDE((uint64_t)phys_2_virt((uint64_t)current_pcb->mm->pgd), false, i, true);
+
+            // 找到对应的页
+            struct Page *p = mm_find_page(phys, ZONE_NORMAL);
+            if (p == NULL)
+            {
+                kerror("cannot find page addr=%#018lx", phys);
+                return end_addr;
+            }
+
+            free_pages(p, 1);
+        }
+
+        mm_unmap_proc_table((uint64_t)phys_2_virt((uint64_t)current_pcb->mm->pgd), false, end_addr, PAGE_2M_ALIGN(ABS(offset)));
+        // 在页表中取消映射
+    }
     return end_addr;
 }

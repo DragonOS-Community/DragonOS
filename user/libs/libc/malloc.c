@@ -5,6 +5,24 @@
 #include <libc/errno.h>
 #include <libc/stdio.h>
 
+#define PAGE_4K_SHIFT 12
+#define PAGE_2M_SHIFT 21
+#define PAGE_1G_SHIFT 30
+#define PAGE_GDT_SHIFT 39
+
+// 不同大小的页的容量
+#define PAGE_4K_SIZE (1UL << PAGE_4K_SHIFT)
+#define PAGE_2M_SIZE (1UL << PAGE_2M_SHIFT)
+#define PAGE_1G_SIZE (1UL << PAGE_1G_SHIFT)
+
+// 屏蔽低于x的数值
+#define PAGE_4K_MASK (~(PAGE_4K_SIZE - 1))
+#define PAGE_2M_MASK (~(PAGE_2M_SIZE - 1))
+
+// 将addr按照x的上边界对齐
+#define PAGE_4K_ALIGN(addr) (((unsigned long)(addr) + PAGE_4K_SIZE - 1) & PAGE_4K_MASK)
+#define PAGE_2M_ALIGN(addr) (((unsigned long)(addr) + PAGE_2M_SIZE - 1) & PAGE_2M_MASK)
+
 /**
  * @brief 显式链表的结点
  *
@@ -23,14 +41,9 @@ static uint64_t brk_managed_addr = 0; // 堆区域已经被管理的地址
 // 空闲链表
 //  按start_addr升序排序
 static malloc_mem_chunk_t *malloc_free_list = NULL;
+static malloc_mem_chunk_t *malloc_free_list_end = NULL; // 空闲链表的末尾结点
 
-/**
- * @brief 获取一块堆内存（不尝试扩大堆内存）
- *
- * @param size
- * @return void* 内存的地址指针，获取失败时返回-ENOMEM
- */
-static void *malloc_no_enlarge(ssize_t size);
+static uint64_t count_last_free_size = 0; // 统计距离上一次回收内存，已经free了多少内存
 
 /**
  * @brief 将块插入空闲链表
@@ -38,6 +51,12 @@ static void *malloc_no_enlarge(ssize_t size);
  * @param ck 待插入的块
  */
 static void malloc_insert_free_list(malloc_mem_chunk_t *ck);
+
+/**
+ * @brief 当堆顶空闲空间大于2个页的空间的时候，释放1个页
+ *
+ */
+static void release_brk();
 
 /**
  * @brief 在链表中检索符合要求的空闲块（best fit）
@@ -52,7 +71,6 @@ static malloc_mem_chunk_t *malloc_query_free_chunk_bf(uint64_t size)
 
     if (malloc_free_list == NULL)
     {
-        printf("free list is none.\n");
         return NULL;
     }
     malloc_mem_chunk_t *ptr = malloc_free_list;
@@ -114,15 +132,16 @@ static int malloc_enlarge(int32_t size)
     if (brk_base_addr == 0) // 第一次调用，需要初始化
     {
         brk_base_addr = brk(-1);
-        printf("brk_base_addr=%#018lx\n", brk_base_addr);
+        // printf("brk_base_addr=%#018lx\n", brk_base_addr);
         brk_managed_addr = brk_base_addr;
         brk_max_addr = brk(-2);
     }
 
-    int64_t tmp = brk_managed_addr + size - brk_max_addr;
-    if (tmp > 0) // 现有堆空间不足
+    int64_t free_space = brk_max_addr - brk_managed_addr;
+
+    if (free_space < size) // 现有堆空间不足
     {
-        if (sbrk(tmp) != (void *)(-1))
+        if (sbrk(size - free_space) != (void *)(-1))
             brk_max_addr = brk((-2));
         else
         {
@@ -133,10 +152,12 @@ static int malloc_enlarge(int32_t size)
 
     // 扩展管理的堆空间
     // 在新分配的内存的底部放置header
+    // printf("managed addr = %#018lx\n", brk_managed_addr);
     malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)brk_managed_addr;
     new_ck->length = brk_max_addr - brk_managed_addr;
-    printf("new_ck->start_addr=%#018lx\tbrk_max_addr=%#018lx\tbrk_managed_addr=%#018lx\n", (uint64_t)new_ck, brk_max_addr, brk_managed_addr);
-    new_ck->prev = new_ck->next = NULL;
+    // printf("new_ck->start_addr=%#018lx\tbrk_max_addr=%#018lx\tbrk_managed_addr=%#018lx\n", (uint64_t)new_ck, brk_max_addr, brk_managed_addr);
+    new_ck->prev = NULL;
+    new_ck->next = NULL;
     brk_managed_addr = brk_max_addr;
 
     malloc_insert_free_list(new_ck);
@@ -153,14 +174,19 @@ static void malloc_merge_free_chunk()
     if (malloc_free_list == NULL)
         return;
     malloc_mem_chunk_t *ptr = malloc_free_list->next;
-    while (ptr)
+    while (ptr != NULL)
     {
         // 内存块连续
         if (((uint64_t)(ptr->prev) + ptr->prev->length == (uint64_t)ptr))
         {
+            // printf("merged %#018lx  and %#018lx\n", (uint64_t)ptr, (uint64_t)(ptr->prev));
             // 将ptr与前面的空闲块合并
             ptr->prev->length += ptr->length;
             ptr->prev->next = ptr->next;
+            if (ptr->next == NULL)
+                malloc_free_list_end = ptr->prev;
+            else
+                ptr->next->prev = ptr->prev;
             // 由于内存组成结构的原因，不需要free掉header
             ptr = ptr->prev;
         }
@@ -178,14 +204,15 @@ static void malloc_insert_free_list(malloc_mem_chunk_t *ck)
     if (malloc_free_list == NULL) // 空闲链表为空
     {
         malloc_free_list = ck;
+        malloc_free_list_end = ck;
         ck->prev = ck->next = NULL;
         return;
     }
     else
     {
-        uint64_t ck_end = (uint64_t)ck + ck->length;
+
         malloc_mem_chunk_t *ptr = malloc_free_list;
-        while (ptr)
+        while (ptr != NULL)
         {
             if ((uint64_t)ptr < (uint64_t)ck)
             {
@@ -194,13 +221,14 @@ static void malloc_insert_free_list(malloc_mem_chunk_t *ck)
                     ptr->next = ck;
                     ck->next = NULL;
                     ck->prev = ptr;
+                    malloc_free_list_end = ck;
                     break;
                 }
                 else if ((uint64_t)(ptr->next) > (uint64_t)ck)
                 {
                     ck->prev = ptr;
                     ck->next = ptr->next;
-                    ck->prev->next = ck;
+                    ptr->next = ck;
                     ck->next->prev = ck;
                     break;
                 }
@@ -254,7 +282,6 @@ void *malloc(ssize_t size)
     {
 
         // 尝试合并空闲块
-        printf("merge\n");
         malloc_merge_free_chunk();
         ck = malloc_query_free_chunk_bf(size);
 
@@ -262,11 +289,11 @@ void *malloc(ssize_t size)
         if (ck)
             goto found;
         // 找不到合适的块，扩容堆区域
-        printf("enlarge\n");
+
         if (malloc_enlarge(size) == -ENOMEM)
             return (void *)-ENOMEM; // 内存不足
         // 扩容后再次尝试获取
-        printf("query\n");
+
         ck = malloc_query_free_chunk_bf(size);
     }
 found:;
@@ -285,9 +312,11 @@ found:;
 
     if (ck->next != NULL) // 当前不是最后一个块
         ck->next->prev = ck->prev;
+    else
+        malloc_free_list_end = ck->prev;
 
     // 当前块剩余的空间还能容纳多一个结点的空间，则分裂当前块
-    if (ck->length - size > sizeof(malloc_mem_chunk_t))
+    if ((int64_t)(ck->length) - size > sizeof(malloc_mem_chunk_t))
     {
         malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)(((uint64_t)ck) + size);
         new_ck->length = ck->length - size;
@@ -297,11 +326,34 @@ found:;
         malloc_insert_free_list(new_ck);
     }
 
-    // printf("ck=%lld\n", (uint64_t)ck);
+
     // 此时链表结点的指针的空间被分配出去
     return (void *)((uint64_t)ck + sizeof(uint64_t));
 }
 
+/**
+ * @brief 当堆顶空闲空间大于2个页的空间的时候，释放1个页
+ *
+ */
+static void release_brk()
+{
+    // 先检测最顶上的块
+    // 由于块按照开始地址排列，因此找最后一个块
+    if (malloc_free_list_end == NULL)
+        return;
+    if ((uint64_t)malloc_free_list_end + malloc_free_list_end->length == brk_max_addr && (uint64_t)malloc_free_list_end <= brk_max_addr - (PAGE_2M_SIZE << 1))
+    {
+        int64_t delta = (brk_max_addr - (uint64_t)malloc_free_list_end) & PAGE_2M_MASK - PAGE_2M_SIZE;
+
+        if (delta <= 0) // 不用释放内存
+            return;
+        sbrk(-delta);
+        brk_max_addr = brk(-2);
+        brk_managed_addr = brk_max_addr;
+
+        malloc_free_list_end->length = brk_max_addr - (uint64_t)malloc_free_list_end;
+    }
+}
 /**
  * @brief 释放一块堆内存
  *
@@ -310,7 +362,15 @@ found:;
 void free(void *ptr)
 {
     // 找到结点（此时prev和next都处于未初始化的状态）
-    malloc_mem_chunk_t * ck = (malloc_mem_chunk_t *)((uint64_t)ptr-sizeof(uint64_t));
+    malloc_mem_chunk_t *ck = (malloc_mem_chunk_t *)((uint64_t)ptr - sizeof(uint64_t));
     // printf("free(): addr = %#018lx\t len=%#018lx\n", (uint64_t)ck, ck->length);
+    count_last_free_size += ck->length;
     malloc_insert_free_list(ck);
+
+    if (count_last_free_size > PAGE_2M_SIZE)
+    {
+        count_last_free_size = 0;
+        malloc_merge_free_chunk();
+        release_brk();
+    }
 }

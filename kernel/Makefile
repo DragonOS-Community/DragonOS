@@ -89,7 +89,7 @@ VFS.o: filesystem/VFS/VFS.c
 	gcc $(CFLAGS) -c filesystem/VFS/VFS.c -o filesystem/VFS/VFS.o
 
 # IPI的代码
-ifeq ($(ARCH), x86_64)
+ifeq ($(ARCH), __x86_64__)
 OBJ_LIST += ipi.o
 LD_LIST += arch/x86_64/x86_64_ipi.o
 ipi.o: arch/x86_64/x86_64_ipi.c

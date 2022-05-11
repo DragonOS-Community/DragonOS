@@ -6,7 +6,7 @@
                 "${workspaceFolder}/**"
             ],
             "defines": [
-                "x86_64",
+                "__x86_64__",
                 "DEBUG"
             ],
             "compilerPath": "/usr/bin/gcc",

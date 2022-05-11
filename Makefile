@@ -3,7 +3,7 @@ SUBDIRS = kernel user
 
 
 
-export ARCH=x86_64
+export ARCH=__x86_64__
 export ROOT_PATH=$(shell pwd)
 
 export DEBUG=DEBUG

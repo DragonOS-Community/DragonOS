@@ -8,8 +8,10 @@
 //引入对bool类型的支持
 #include <stdbool.h>
 #include <stdint.h>
+#include <common/miniLibc/stddef.h>
+#include <arch/arch.h>
 
-#define NULL 0
+
 
 #define sti() __asm__ __volatile__("sti\n\t" :: \
                                        : "memory") //开启外部中断

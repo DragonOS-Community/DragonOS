@@ -361,12 +361,12 @@ uint64_t sys_brk(struct pt_regs *regs)
 
     if ((int64_t)regs->r8 == -1)
     {
-        kdebug("get brk_start=%#018lx", current_pcb->mm->brk_start);
+        // kdebug("get brk_start=%#018lx", current_pcb->mm->brk_start);
         return current_pcb->mm->brk_start;
     }
     if ((int64_t)regs->r8 == -2)
     {
-        kdebug("get brk_end=%#018lx", current_pcb->mm->brk_end);
+        // kdebug("get brk_end=%#018lx", current_pcb->mm->brk_end);
         return current_pcb->mm->brk_end;
     }
     if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
@@ -409,8 +409,6 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 {
     
     ul ret = system_call_table[regs->rax](regs);
-    if(regs->rax == SYS_BRK)
-        kdebug("brk ret=%#018lx", ret);
     regs->rax = ret; // 返回码
 }
 

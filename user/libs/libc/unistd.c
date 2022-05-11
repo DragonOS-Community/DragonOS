@@ -85,7 +85,7 @@ pid_t vfork(void)
 uint64_t brk(uint64_t end_brk)
 {
     uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0, 0, 0);
-    printf("brk():  end_brk=%#018lx x=%#018lx", (uint64_t)end_brk, x);
+    // printf("brk():  end_brk=%#018lx x=%#018lx", (uint64_t)end_brk, x);
     return x;
 }
 

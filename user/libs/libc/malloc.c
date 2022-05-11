@@ -57,10 +57,10 @@ static malloc_mem_chunk_t *malloc_query_free_chunk_bf(uint64_t size)
     }
     malloc_mem_chunk_t *ptr = malloc_free_list;
     malloc_mem_chunk_t *best = NULL;
-    printf("query size=%d", size);
+    // printf("query size=%d", size);
     while (ptr != NULL)
     {
-        printf("ptr->length=%#010lx\n", ptr->length);
+        // printf("ptr->length=%#010lx\n", ptr->length);
         if (ptr->length == size)
         {
             best = ptr;
@@ -69,18 +69,14 @@ static malloc_mem_chunk_t *malloc_query_free_chunk_bf(uint64_t size)
 
         if (ptr->length > size)
         {
-            printf("676767\n");
             if (best == NULL)
                 best = ptr;
             else if (best->length > ptr->length)
                 best = ptr;
-            printf("6rdf\n");
         }
-        printf("ptr->next=%#018lx\n", ptr->next);
         ptr = ptr->next;
     }
 
-    printf("return best=%#018lx\n", (uint64_t)best);
     return best;
 }
 
@@ -275,7 +271,7 @@ void *malloc(ssize_t size)
     }
 found:;
 
-    printf("ck = %#018lx\n", (uint64_t)ck);
+    // printf("ck = %#018lx\n", (uint64_t)ck);
     if (ck == NULL)
         return (void *)-ENOMEM;
     // 分配空闲块
@@ -296,12 +292,12 @@ found:;
         malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)(((uint64_t)ck) + size);
         new_ck->length = ck->length - size;
         new_ck->prev = new_ck->next = NULL;
-        printf("new_ck=%#018lx, new_ck->length=%#010lx\n", (uint64_t)new_ck, new_ck->length);
+        // printf("new_ck=%#018lx, new_ck->length=%#010lx\n", (uint64_t)new_ck, new_ck->length);
         ck->length = size;
         malloc_insert_free_list(new_ck);
     }
 
-    printf("ck=%lld\n", (uint64_t)ck);
+    // printf("ck=%lld\n", (uint64_t)ck);
     // 此时链表结点的指针的空间被分配出去
     return (void *)((uint64_t)ck + sizeof(uint64_t));
 }
@@ -313,4 +309,8 @@ found:;
  */
 void free(void *ptr)
 {
+    // 找到结点（此时prev和next都处于未初始化的状态）
+    malloc_mem_chunk_t * ck = (malloc_mem_chunk_t *)((uint64_t)ptr-sizeof(uint64_t));
+    // printf("free(): addr = %#018lx\t len=%#018lx\n", (uint64_t)ck, ck->length);
+    malloc_insert_free_list(ck);
 }

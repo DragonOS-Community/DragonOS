@@ -635,9 +635,9 @@ static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, uns
      * @param font 字符的bitmap
      */
 
-//#if DEBUG
+    //#if DEBUG
     uart_send(COM1, font);
-//#endif
+    //#endif
 
     unsigned char *font_ptr = font_ascii[font];
     unsigned int *addr;
@@ -664,24 +664,23 @@ static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, uns
     }
 }
 
+/**
+ * @brief 格式化打印字符串
+ *
+ * @param FRcolor 前景色
+ * @param BKcolor 背景色
+ * @param ... 格式化字符串
+ */
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...)
 {
-    /**
-     * @brief 格式化打印字符串
-     *
-     * @param FRcolor 前景色
-     * @param BKcolor 背景色
-     * @param ... 格式化字符串
-     */
 
-    /*
-    if (get_rflags() & 0x200UL)
-        spin_lock(&printk_lock); // 不是中断处理程序调用printk，加锁
-        */
+    
+    uint64_t rflags = 0;    // 加锁后rflags存储到这里
+    spin_lock_irqsave(&printk_lock, rflags);
 
     va_list args;
     va_start(args, fmt);
-
+    char buf[4096]; // vsprintf()的缓冲区
     int len = vsprintf(buf, fmt, args);
 
     va_end(args);
@@ -734,10 +733,7 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
         }
     }
 
-    /*
-    if (get_rflags() & 0x200UL)
-        spin_unlock(&printk_lock);
-        */
+    spin_unlock_irqrestore(&printk_lock, rflags);
     return i;
 }
 
@@ -838,7 +834,7 @@ int scroll(bool direction, int pixels, bool animation)
             do_scroll(direction, delta_x);
         }
     }
-
+    
     return 0;
 }
 

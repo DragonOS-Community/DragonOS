@@ -77,3 +77,56 @@ long spin_trylock(spinlock_t *lock)
         preempt_enable();
     return tmp_val;
 }
+
+// 保存当前rflags的值到变量x内并关闭中断
+#define local_irq_save(x) __asm__ __volatile__("pushfq ; popq %0 ; cli" \
+                                               : "=g"(x)::"memory")
+// 恢复先前保存的rflags的值x
+#define local_irq_restore(x) __asm__ __volatile__("pushq %0 ; popfq" ::"g"(x) \
+                                                  : "memory")
+#define local_irq_disable() cli();
+#define local_irq_enable() sti();
+
+/**
+ * @brief 保存中断状态，关闭中断，并自旋锁加锁
+ * 
+ */
+#define spin_lock_irqsave(lock, flags) \
+    do                                 \
+    {                                  \
+        local_irq_save(flags);         \
+        spin_lock(lock);               \
+    } while (0)
+
+/**
+ * @brief 恢复rflags以及中断状态并解锁自旋锁
+ * 
+ */
+#define spin_unlock_irqrestore(lock, flags) \
+    do                                      \
+    {                                       \
+        spin_unlock(lock);                  \
+        local_irq_restore(flags);           \
+    } while (0)
+
+/**
+ * @brief 关闭中断并加锁
+ * 
+ */
+#define spin_lock_irq(lock)  \
+    do                       \
+    {                        \
+        local_irq_disable(); \
+        spin_lock(lock);     \
+    } while (0)
+
+/**
+ * @brief 解锁并开启中断
+ * 
+ */
+#define spin_unlock_irq(lock) \
+    do                        \
+    {                         \
+        spin_unlock(lock);    \
+        local_irq_enable();   \
+    } while (0)

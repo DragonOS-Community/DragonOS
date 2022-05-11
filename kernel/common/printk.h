@@ -52,7 +52,7 @@ struct screen_info
 
 extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中
 
-char buf[4096]; // vsprintf()的缓冲区
+
 
 /**
  * @brief 初始化printk的屏幕信息

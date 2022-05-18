@@ -845,7 +845,7 @@ long fat32_lseek(struct vfs_file_t *file_ptr, long offset, long whence)
         return -EOVERFLOW;
     file_ptr->position = pos;
     
-    kdebug("fat32 lseek -> position=%d", file_ptr->position);
+    // kdebug("fat32 lseek -> position=%d", file_ptr->position);
     return pos;
 }
 // todo: ioctl

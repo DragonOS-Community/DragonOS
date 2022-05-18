@@ -1,4 +1,4 @@
-SUBDIR_ROOTS := . common
+SUBDIR_ROOTS := .
 DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
 GARBAGE_PATTERNS := *.o *.s~ *.s *.S~ *.c~ *.h~ kernel
 GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
@@ -10,12 +10,17 @@ LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
 # 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
 PIC := _INTR_APIC_
-CFLAGS = $(GLOBAL_CFLAGS) -D $(PIC) -I .
+CFLAGS = $(GLOBAL_CFLAGS) -D $(PIC) -I $(shell pwd)
 
 ASFLAGS := --64
 
 LD_LIST := head.o
 OBJ_LIST := head.o
+
+
+kernel_subdirs := common/libELF
+	
+
 
 
 
@@ -143,17 +148,21 @@ uart.o: driver/uart/uart.c
 	gcc $(CFLAGS) -c driver/uart/uart.c -o driver/uart/uart.o
 
 
-
 all: kernel
+
+	ld -b elf64-x86-64 -z muldefs -o kernel  head.o main.o $(shell find . -name "*.o") -T link.lds
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
-#
 
 kernel: head.o entry.o procs.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o exception/entry.o process/procs.o main.o common/printk.o exception/trap.o exception/irq.o mm/mm.o mm/slab.o process/process.o syscall/syscall.o driver/multiboot2/multiboot2.o \
-	common/cpu.o smp/smp.o smp/apu_boot.o exception/softirq.o sched/sched.o	filesystem/fat32/fat32.o filesystem/MBR.o filesystem/VFS/VFS.o \
-	driver/acpi/acpi.o driver/interrupt/pic.o driver/keyboard/ps2_keyboard.o driver/mouse/ps2_mouse.o driver/disk/ata.o driver/pci/pci.o driver/disk/ahci/ahci.o driver/timers/rtc/rtc.o driver/timers/HPET/HPET.o driver/timers/timer.o \
-	$(LD_LIST)	\
-	-T link.lds
+	
+	@list='$(kernel_subdirs)'; for subdir in $$list; do \
+    		echo "make all in $$subdir";\
+    		cd $$subdir;\
+    		 $(MAKE) all CFLAGS="$(CFLAGS)";\
+    		cd ..;\
+	done
+
+	
 
 
 clean: 

@@ -20,12 +20,14 @@ all:
 	$(MAKE) init.o
 	$(MAKE) sys_api_lib
 	
-	objcopy -I elf64-x86-64 -S -R ".eh_frame" -R ".comment" -O binary sys_api_lib $(ROOT_PATH)/bin/user/init.bin
+# objcopy -I elf64-x86-64 -S -R ".eh_frame" -R ".comment" -O binary sys_api_lib $(ROOT_PATH)/bin/user/init.bin
+	objcopy -I elf64-x86-64 -S -R ".eh_frame" -R ".comment" -O elf64-x86-64 sys_api_lib $(ROOT_PATH)/bin/user/init.bin
 
 sys_api_lib: init.o
 	
 
-	ld -b elf64-x86-64 -z muldefs -o sys_api_lib init.o $(shell find . -name "*.o") -T init.lds
+	ld -b elf64-x86-64 -z muldefs -o sys_api_lib init.o  $(shell find . -name "*.o")
+#ld -b elf64-x86-64 -z muldefs -o sys_api_lib init.o $(shell find . -name "*.o") -T init.lds
 
 init.o: init.c 
 	gcc $(current_CFLAGS) -c init.c -o init.o

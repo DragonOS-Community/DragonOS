@@ -380,6 +380,15 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
 void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);
 
 /**
+ * @brief 检测指定地址是否已经被映射
+ * 
+ * @param page_table_phys_addr 页表的物理地址
+ * @param virt_addr 要检测的地址
+ * @return true 已经被映射
+ * @return false 
+ */
+bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr);
+/**
  * @brief 调整堆区域的大小（暂时只能增加堆区域）
  * 
  * @todo 缩小堆区域

@@ -10,6 +10,34 @@ ul total_2M_pages = 0;
 static ul root_page_table_phys_addr = 0; // 内核层根页表的物理地址
 
 /**
+ * @brief 虚拟地址长度所需要的entry数量
+ *
+ */
+typedef struct
+{
+    uint64_t num_PML4E;
+    uint64_t *num_PDPTE;
+    uint64_t *num_PDE;
+    uint64_t num_PTE;
+} mm_pgt_entry_num_t;
+
+/**
+ * @brief 计算虚拟地址长度对应的页表entry数量
+ *
+ * @param length 长度
+ * @param ent 返回的entry数量结构体
+ */
+static void mm_calculate_entry_num(uint64_t length, mm_pgt_entry_num_t *ent)
+{
+    if (ent == NULL)
+        return;
+    ent->num_PML4E = (length + (1UL << PAGE_GDT_SHIFT) - 1) >> PAGE_GDT_SHIFT;
+    ent->num_PDPTE = (length + PAGE_1G_SIZE - 1) >> PAGE_1G_SHIFT;
+    ent->num_PDE = (length + PAGE_2M_SIZE - 1) >> PAGE_2M_SHIFT;
+    ent->num_PTE = (length + PAGE_4K_SIZE - 1) >> PAGE_4K_SHIFT;
+}
+
+/**
  * @brief 从页表中获取pdt页表项的内容
  *
  * @param proc_page_table_addr 页表的地址
@@ -605,40 +633,50 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
  */
 void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user)
 {
+
     // kdebug("proc_page_table_addr=%#018lx", proc_page_table_addr);
     // 计算线性地址对应的pml4页表项的地址
-    ul *tmp;
-    if (is_phys)
-        tmp = phys_2_virt((ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff));
-    else
-        tmp = (ul *)((ul)proc_page_table_addr & (~0xfffUL)) + ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff);
+    mm_pgt_entry_num_t pgt_num;
+    mm_calculate_entry_num(length, &pgt_num);
+    kdebug("ent1=%d ent2=%d ent3=%d, ent4=%d", pgt_num.num_PML4E, pgt_num.num_PDPTE, pgt_num.num_PDE, pgt_num.num_PTE);
 
-    if (*tmp == 0)
+    uint64_t pml4e_id = ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff);
+    // 循环填写顶层页表
+    for (int num_pml4e = 0; num_pml4e < pgt_num.num_PML4E && pml4e_id < 512; ++num_pml4e, ++pml4e_id)
     {
-        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
-        memset(virt_addr, 0, PAGE_4K_SIZE);
-        set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), (user ? PAGE_USER_PGT : PAGE_KERNEL_PGT)));
-    }
+        ul *tmp;
+        if (is_phys)
+            tmp = phys_2_virt((ul *)((ul)proc_page_table_addr & (~0xfffUL)) + pml4e_id);
+        else
+            tmp = (ul *)((ul)proc_page_table_addr & (~0xfffUL) + pml4e_id);
 
-    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));
+        if (*tmp == 0)
+        {
+            ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+            memset(virt_addr, 0, PAGE_4K_SIZE);
+            set_pml4t(tmp, mk_pml4t(virt_2_phys(virt_addr), (user ? PAGE_USER_PGT : PAGE_KERNEL_PGT)));
+        }
 
-    if (*tmp == 0)
-    {
-        ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
-        memset(virt_addr, 0, PAGE_4K_SIZE);
-        set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), (user ? PAGE_USER_DIR : PAGE_KERNEL_DIR)));
-    }
+        tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr_start >> PAGE_1G_SHIFT) & 0x1ff));
 
-    ul *tmp1;
-    // 初始化2M物理页
-    for (ul i = 0; i < (length); i += PAGE_2M_SIZE)
-    {
-        // 计算当前2M物理页对应的pdt的页表项的物理地址
+        if (*tmp == 0)
+        {
+            ul *virt_addr = kmalloc(PAGE_4K_SIZE, 0);
+            memset(virt_addr, 0, PAGE_4K_SIZE);
+            set_pdpt(tmp, mk_pdpt(virt_2_phys(virt_addr), (user ? PAGE_USER_DIR : PAGE_KERNEL_DIR)));
+        }
 
-        tmp1 = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff)));
+        ul *tmp1;
+        // 初始化2M物理页
+        for (ul i = 0; i < (length); i += PAGE_2M_SIZE)
+        {
+            // 计算当前2M物理页对应的pdt的页表项的物理地址
 
-        // 页面写穿，禁止缓存
-        set_pdt(tmp1, mk_pdt((ul)phys_addr_start + i, flags | (user ? PAGE_USER_PAGE : PAGE_KERNEL_PAGE)));
+            tmp1 = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr_start + i) >> PAGE_2M_SHIFT) & 0x1ff)));
+
+            // 页面写穿，禁止缓存
+            set_pdt(tmp1, mk_pdt((ul)phys_addr_start + i, flags | (user ? PAGE_USER_PAGE : PAGE_KERNEL_PAGE)));
+        }
     }
 
     flush_tlb();
@@ -830,4 +868,38 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
         // 在页表中取消映射
     }
     return end_addr;
+}
+
+/**
+ * @brief 检测指定地址是否已经被映射
+ *
+ * @param page_table_phys_addr 页表的物理地址
+ * @param virt_addr 要检测的地址
+ * @return true 已经被映射
+ * @return false
+ */
+bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr)
+{
+    ul *tmp;
+
+    tmp = phys_2_virt((ul *)((ul)page_table_phys_addr & (~0xfffUL)) + ((virt_addr >> PAGE_GDT_SHIFT) & 0x1ff));
+
+    // pml4页表项为0
+    if (*tmp == 0)
+        return 0;
+
+    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr >> PAGE_1G_SHIFT) & 0x1ff));
+
+    // pdpt页表项为0
+    if (*tmp == 0)
+        return 0;
+
+    // 读取pdt页表项
+    tmp = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr) >> PAGE_2M_SHIFT) & 0x1ff)));
+
+    // todo: 增加对使用了4K页的页表的检测
+    if (*tmp != 0)
+        return true;
+    else
+        return false;
 }

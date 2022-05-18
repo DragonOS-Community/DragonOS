@@ -10,6 +10,7 @@
 #include <filesystem/fat32/fat32.h>
 #include <common/stdio.h>
 #include <process/spinlock.h>
+#include <common/libELF/elf.h>
 
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
@@ -353,6 +354,126 @@ struct vfs_file_t *process_open_exec_file(char *path)
 
     return filp;
 }
+
+/**
+ * @brief 加载elf格式的程序文件到内存中，并设置regs
+ *
+ * @param regs 寄存器
+ * @param path 文件路径
+ * @return int
+ */
+static int process_load_elf_file(struct pt_regs *regs, char *path)
+{
+    int retval = 0;
+    struct vfs_file_t *filp = process_open_exec_file(path);
+    if ((unsigned long)filp <= 0)
+    {
+        kdebug("(unsigned long)filp=%d", (long)filp);
+        return (unsigned long)filp;
+    }
+
+    void *buf = kmalloc(sizeof(PAGE_4K_SIZE), 0);
+    uint64_t pos = 0;
+    pos = filp->file_ops->lseek(filp, 0, SEEK_SET);
+    retval = filp->file_ops->read(filp, (char *)buf, sizeof(Elf64_Ehdr), &pos);
+    retval = 0;
+    if (!elf_check(buf))
+    {
+        kerror("Not an ELF file: %s", path);
+        retval = -ENOTSUP;
+        goto load_elf_failed;
+    }
+
+#if ARCH(X86_64)
+    // 暂时只支持64位的文件
+    if (((Elf32_Ehdr *)buf)->e_ident[EI_CLASS] != ELFCLASS64)
+    {
+        kdebug("((Elf32_Ehdr *)buf)->e_ident[EI_CLASS]=%d", ((Elf32_Ehdr *)buf)->e_ident[EI_CLASS]);
+        retval = -EUNSUPPORTED;
+        goto load_elf_failed;
+    }
+    Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
+    // 暂时只支持AMD64架构
+    if (ehdr.e_machine != EM_AMD64)
+    {
+        kerror("e_machine=%d", ehdr.e_machine);
+        retval = -EUNSUPPORTED;
+        goto load_elf_failed;
+    }
+#else
+#error Unsupported architecture!
+#endif
+    if (ehdr.e_type != ET_EXEC)
+    {
+        kdebug("ehdr->e_type=%d", ehdr.e_type);
+        retval = -EUNSUPPORTED;
+        goto load_elf_failed;
+    }
+    kdebug("e_entry=%#018lx", ehdr.e_entry);
+    regs->rip = ehdr.e_entry;
+    current_pcb->mm->code_addr_start = ehdr.e_entry;
+
+    // kdebug("ehdr.e_phoff=%#018lx\t ehdr.e_phentsize=%d, ehdr.e_phnum=%d", ehdr.e_phoff, ehdr.e_phentsize, ehdr.e_phnum);
+    // 将指针移动到program header处
+    pos = ehdr.e_phoff;
+    // 读取所有的phdr
+    pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
+    filp->file_ops->read(filp, (char *)buf, ehdr.e_phentsize * ehdr.e_phnum, &pos);
+    if ((unsigned long)filp <= 0)
+    {
+        kdebug("(unsigned long)filp=%d", (long)filp);
+        return (unsigned long)filp;
+    }
+    Elf64_Phdr *phdr = buf;
+
+    for (int i = 0; i < ehdr.e_phnum; ++i, ++phdr)
+    {
+        // kdebug("phdr[%d] phdr->p_offset=%#018lx phdr->p_vaddr=%#018lx phdr->p_memsz=%ld phdr->p_filesz=%ld  phdr->p_type=%d", i, phdr->p_offset, phdr->p_vaddr, phdr->p_memsz, phdr->p_filesz, phdr->p_type);
+
+        // 不是可加载的段
+        if (phdr->p_type != PT_LOAD)
+            continue;
+
+        int64_t remain_mem_size = phdr->p_memsz;
+        int64_t remain_file_size = phdr->p_filesz;
+        pos = phdr->p_offset;
+
+        uint64_t virt_base = phdr->p_vaddr;
+        while (remain_mem_size > 0)
+        {
+
+            // todo: 改用slab分配4K大小内存块并映射到4K页
+            if (!mm_check_mapped((uint64_t)current_pcb->mm->pgd, virt_base)) // 未映射，则新增物理页
+            {
+                mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+            }
+            pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
+            int64_t val = 0;
+            if (remain_file_size != 0)
+            {
+                int64_t to_trans = (remain_file_size > PAGE_2M_SIZE) ? PAGE_2M_SIZE : remain_file_size;
+                val = filp->file_ops->read(filp, (char*)virt_base, to_trans, &pos);
+            }
+
+            if (val < 0)
+                goto load_elf_failed;
+
+            remain_mem_size -= PAGE_2M_SIZE;
+            remain_file_size -= val;
+            virt_base += PAGE_2M_SIZE;
+        }
+    }
+
+    // 分配2MB的栈内存空间
+    regs->rsp = current_pcb->mm->stack_start;
+    regs->rbp = current_pcb->mm->stack_start;
+    mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+
+load_elf_failed:;
+    if (buf != NULL)
+        kfree(buf);
+    return retval;
+}
 /**
  * @brief 使当前进程去执行新的代码
  *
@@ -398,11 +519,9 @@ ul do_execve(struct pt_regs *regs, char *path)
      *
      */
     // 映射1个2MB的物理页
-    unsigned long code_start_addr = 0x800000;
-    unsigned long stack_start_addr = 0xa00000;
-    uint64_t brk_start_addr = 0xc00000;
 
-    mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, code_start_addr, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+    unsigned long stack_start_addr = 0x6fffffc00000;
+    uint64_t brk_start_addr = 0x6fffffc00000;
 
     process_switch_mm(current_pcb);
 
@@ -410,7 +529,6 @@ ul do_execve(struct pt_regs *regs, char *path)
     if (!(current_pcb->flags & PF_KTHREAD))
         current_pcb->addr_limit = USER_MAX_LINEAR_ADDR;
 
-    current_pcb->mm->code_addr_start = code_start_addr;
     current_pcb->mm->code_addr_end = 0;
     current_pcb->mm->data_addr_start = 0;
     current_pcb->mm->data_addr_end = 0;
@@ -428,13 +546,7 @@ ul do_execve(struct pt_regs *regs, char *path)
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
-    struct vfs_file_t *filp = process_open_exec_file(path);
-    if ((unsigned long)filp <= 0)
-        return (unsigned long)filp;
-
-    memset((void *)code_start_addr, 0, PAGE_2M_SIZE);
-    uint64_t pos = 0;
-    int retval = filp->file_ops->read(filp, (char *)code_start_addr, PAGE_2M_SIZE, &pos);
+    process_load_elf_file(regs, path);
     kdebug("execve ok");
 
     return 0;

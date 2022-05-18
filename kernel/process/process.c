@@ -647,7 +647,7 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 void process_init()
 {
     kinfo("Initializing process...");
-    initial_mm.pgd = (pml4t_t *)global_CR3;
+    initial_mm.pgd = (pml4t_t *)get_CR3();
 
     initial_mm.code_addr_start = memory_management_struct.kernel_code_start;
     initial_mm.code_addr_end = memory_management_struct.kernel_code_end;

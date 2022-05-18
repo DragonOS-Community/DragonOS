@@ -68,7 +68,7 @@ grub==2.06
 
 - [x] virtual file system
 
-- [ ] Parsing ELF file format
+- [x] Parsing ELF file format
 
 - [x] Floating point support
 

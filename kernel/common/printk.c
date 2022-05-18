@@ -50,7 +50,7 @@ int printk_init(const int char_size_x, const int char_size_y)
 
     // ======== 临时的将物理地址填写到0x0000000003000000处 之后会在mm内将帧缓存区重新映射=====
 
-    global_CR3 = get_CR3();
+    ul global_CR3 = (ul)get_CR3();
     ul fb_virt_addr = (ul)pos.FB_address;
     ul fb_phys_addr = VBE_FB_phys_addr;
 

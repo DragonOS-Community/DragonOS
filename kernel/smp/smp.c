@@ -41,7 +41,7 @@ void smp_init()
         set_intr_gate(i, 0, SMP_interrupt_table[i - 200]);
 
     memset((void *)SMP_IPI_desc, 0, sizeof(irq_desc_t) * SMP_IRQ_NUM);
-    
+
     // 注册接收bsp处理器的hpet中断转发的处理函数
     ipi_regiserIPI(0xc8, NULL, &ipi_0xc8_handler, NULL, NULL, "IPI 0xc8");
 
@@ -90,6 +90,7 @@ void smp_init()
     kinfo("Cleaning page table remapping...\n");
 
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
+    uint64_t *global_CR3 = get_CR3();
     for (int i = 0; i < 128; ++i)
     {
 
@@ -153,13 +154,13 @@ void smp_ap_start()
     current_pcb->preempt_count = 0;
     sti();
 
-    while(1)
+    while (1)
         hlt();
 
-/*
-    if (proc_current_cpu_id == 1)
-        process_init();
-        */
+    /*
+        if (proc_current_cpu_id == 1)
+            process_init();
+            */
     while (1)
     {
         printk_color(BLACK, WHITE, "CPU:%d IDLE process.\n", proc_current_cpu_id);

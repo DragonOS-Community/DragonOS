@@ -233,7 +233,6 @@ int ZONE_DMA_INDEX = 0;
 int ZONE_NORMAL_INDEX = 0;   // low 1GB RAM ,was mapped in pagetable
 int ZONE_UNMAPPED_INDEX = 0; // above 1GB RAM,unmapped in pagetable
 
-ul *global_CR3 = NULL;
 
 // 初始化内存管理单元
 void mm_init();

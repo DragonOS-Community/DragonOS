@@ -230,14 +230,7 @@ void mm_init()
         --tmp_page->zone->count_pages_free;
     }
 
-    // root_page_table_phys_addr = global_CR3;
-    // kdebug("global_CR3\t:%#018lx", global_CR3);
-    // kdebug("*global_CR3\t:%#018lx", *phys_2_virt(global_CR3) & (~0xff));
-    // kdebug("**global_CR3\t:%#018lx", *phys_2_virt(*phys_2_virt(global_CR3) & (~0xff)) & (~0xff));
-
-    // kdebug("1.memory_management_struct.bmp:%#018lx\tzone->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
-    // kinfo("Cleaning page table remapping at 0x0000");
-
+  
     kinfo("Memory management unit initialize complete!");
 
     flush_tlb();

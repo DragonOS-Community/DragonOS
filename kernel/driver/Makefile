@@ -1,10 +1,10 @@
 
 CFLAGS += -I .
 
-kernel_common_subdirs:=libELF
+kernel_driver_subdirs:=video
 
 all: 
-	@list='$(kernel_common_subdirs)'; for subdir in $$list; do \
+	@list='$(kernel_driver_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
     		$(MAKE) all CFLAGS="$(CFLAGS)";\

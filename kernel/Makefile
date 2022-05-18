@@ -18,7 +18,7 @@ LD_LIST := head.o
 OBJ_LIST := head.o
 
 
-kernel_subdirs := common/libELF
+kernel_subdirs := common driver
 	
 
 

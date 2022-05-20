@@ -18,12 +18,7 @@ long process_global_pid = 1;              // 系统中最大的pid
 extern void system_call(void);
 extern void kernel_thread_func(void);
 
-/**
- * @brief 将进程加入到调度器的就绪队列中
- *
- * @param pcb 进程的pcb
- */
-static inline void process_wakeup(struct process_control_block *pcb);
+
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 struct mm_struct initial_mm = {0};
@@ -820,10 +815,12 @@ struct process_control_block *process_get_pcb(long pid)
  *
  * @param pcb 进程的pcb
  */
-static inline void process_wakeup(struct process_control_block *pcb)
+void process_wakeup(struct process_control_block *pcb)
 {
     pcb->state = PROC_RUNNING;
     sched_cfs_enqueue(pcb);
+    // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
+    current_pcb->flags |= PF_NEED_SCHED;
 }
 
 /**

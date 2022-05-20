@@ -11,8 +11,6 @@
 #include <common/miniLibc/stddef.h>
 #include <arch/arch.h>
 
-
-
 #define sti() __asm__ __volatile__("sti\n\t" :: \
                                        : "memory") //开启外部中断
 #define cli() __asm__ __volatile__("cli\n\t" :: \
@@ -105,24 +103,24 @@ static inline void list_add(struct List *entry, struct List *node)
     entry->next = node;
 }
 
+/**
+ * @brief 将node添加到给定的list的结尾(也就是当前节点的前面)
+ * @param entry 列表的入口
+ * @param node 待添加的节点
+ */
 static inline void list_append(struct List *entry, struct List *node)
 {
-    /**
-     * @brief 将node添加到给定的list的结尾(也就是当前节点的前面)
-     * @param entry 列表的入口
-     * @param node 待添加的节点
-     */
 
     struct List *tail = entry->prev;
     list_add(tail, node);
 }
 
+/**
+ * @brief 从列表中删除节点
+ * @param entry 待删除的节点
+ */
 static inline void list_del(struct List *entry)
 {
-    /**
-     * @brief 从列表中删除节点
-     * @param entry 待删除的节点
-     */
 
     entry->next->prev = entry->prev;
     entry->prev->next = entry->next;

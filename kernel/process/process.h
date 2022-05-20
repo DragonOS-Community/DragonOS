@@ -274,6 +274,13 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 struct process_control_block *process_get_pcb(long pid);
 
 /**
+ * @brief 将进程加入到调度器的就绪队列中
+ *
+ * @param pcb 进程的pcb
+ */
+void process_wakeup(struct process_control_block *pcb);
+
+/**
  * @brief 切换页表
  * @param prev 前一个进程的pcb
  * @param next 下一个进程的pcb

@@ -87,7 +87,7 @@ int video_init(bool level)
     if (level)
     {
         // 启用双缓冲后，使能printk滚动动画
-        printk_enable_animation();
+        // printk_enable_animation();
         // 初始化第一个屏幕刷新任务
         struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
         timer_func_init(tmp, &video_refresh_framebuffer, NULL, REFRESH_INTERVAL);

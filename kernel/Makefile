@@ -18,7 +18,7 @@ LD_LIST := head.o
 OBJ_LIST := head.o
 
 
-kernel_subdirs := common driver
+kernel_subdirs := common driver process
 	
 
 
@@ -33,9 +33,7 @@ entry.o: exception/entry.S
 	gcc -E exception/entry.S > exception/entry.s
 	as $(ASFLAGS) -o exception/entry.o exception/entry.s
 
-procs.o: process/proc.S
-	gcc -E process/proc.S > process/proc.s
-	as $(ASFLAGS) -o process/procs.o process/proc.s
+
 
 
 
@@ -62,8 +60,6 @@ mm.o: mm/mm.c
 slab.o: mm/slab.c
 	gcc $(CFLAGS) -c mm/slab.c -o mm/slab.o
 
-process.o: process/process.c
-	gcc $(CFLAGS) -c process/process.c -o process/process.o
 
 sched.o: sched/sched.c
 	gcc $(CFLAGS) -c sched/sched.c -o sched/sched.o
@@ -150,15 +146,15 @@ uart.o: driver/uart/uart.c
 
 all: kernel
 
-	ld -b elf64-x86-64 -z muldefs -o kernel  head.o main.o $(shell find . -name "*.o") -T link.lds
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") -T link.lds
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
 
-kernel: head.o entry.o procs.o main.o printk.o trap.o mm.o slab.o irq.o pic.o process.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
 	
 	@list='$(kernel_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
-    		 $(MAKE) all CFLAGS="$(CFLAGS)";\
+    		$(MAKE) all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)";\
     		cd ..;\
 	done
 

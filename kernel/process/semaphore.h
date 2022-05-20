@@ -14,28 +14,8 @@
 
 #include <process/process.h>
 #include <sched/sched.h>
+#include "wait_queue.h"
 
-/**
- * @brief 信号量的等待队列
- *
- */
-typedef struct
-{
-    struct List wait_list;
-    struct process_control_block *pcb;
-} wait_queue_node_t;
-
-/**
- * @brief 初始化信号量的等待队列
- *
- * @param wait_queue 等待队列
- * @param pcb pcb
- */
-void wait_queue_init(wait_queue_node_t *wait_queue, struct process_control_block *pcb)
-{
-    list_init(&wait_queue->wait_list);
-    wait_queue->pcb = pcb;
-}
 
 /**
  * @brief 信号量的结构体
@@ -97,5 +77,7 @@ void semaphore_up(semaphore_t *sema)
 
         wq->pcb->state = PROC_RUNNING;
         sched_cfs_enqueue(wq->pcb);
+        // 当前进程缺少需要的资源，立即标为需要被调度
+        current_pcb->flags |= PF_NEED_SCHED;
     }
 }

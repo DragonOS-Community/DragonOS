@@ -7,6 +7,8 @@
 // 定义键盘循环队列缓冲区大小为100bytes
 #define ps2_keyboard_buffer_size 100
 
+#define KEYBOARD_CMD_RESET_BUFFER 1
+
 /**
  * @brief 键盘循环队列缓冲区结构体
  *

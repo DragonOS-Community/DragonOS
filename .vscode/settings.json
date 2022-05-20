@@ -98,7 +98,8 @@
         "ipi.h": "c",
         "arch.h": "c",
         "elf.h": "c",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "wait_queue.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

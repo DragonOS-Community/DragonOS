@@ -36,16 +36,16 @@ int main()
     void *ptr[256] = {0};
     for (int k = 0; k < 2; ++k)
     {
-        printf("try to malloc 256*16K=4MB\n");
+        printf("try to malloc 256*1M=256MB\n");
         uint64_t js = 0;
         for (int i = 0; i < 256; ++i)
         {
-            ptr[i] = malloc(4096 * 4);
+            ptr[i] = malloc(1024 * 1024);
             js += *(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t));
-            if (*(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t)) > 0x4008)
-                printf("[%d] start_addr = %#018lx, len = %#010lx\n", (uint64_t)(ptr[i]) - 8, *(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t)));
+            // if (*(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t)) > 0x4008)
+            //     printf("[%ld] start_addr = %#018lx, len = %#010lx\n", i, (uint64_t)(ptr[i]) - 8, *(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t)));
         }
-       
+
         // printf("ptr[0]->len=%lld\n", *(uint64_t *)((uint64_t)ptr[0] - sizeof(uint64_t)));
         // printf("ptr[1]->len=%lld\n", *(uint64_t *)((uint64_t)ptr[1] - sizeof(uint64_t)));
         //  printf("ptr[24]->len=%lld\n", *(uint64_t*)((uint64_t)ptr[24] - sizeof(uint64_t)));

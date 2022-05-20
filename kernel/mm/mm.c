@@ -177,6 +177,7 @@ void mm_init()
         }
     }
 
+
     // 初始化0~2MB的物理页
     // 由于这个区间的内存由多个内存段组成，因此不会被以上代码初始化，需要我们手动配置page[0]。
 
@@ -195,6 +196,7 @@ void mm_init()
     ZONE_NORMAL_INDEX = 0;
     ZONE_UNMAPPED_INDEX = 0;
 
+    /*
     for (int i = 0; i < memory_management_struct.count_zones; ++i)
     {
         struct Zone *z = memory_management_struct.zones_struct + i;
@@ -202,9 +204,10 @@ void mm_init()
         //             z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
 
         // 1GB以上的内存空间不做映射
-        if (z->zone_addr_start >= 0x100000000 && (!ZONE_UNMAPPED_INDEX))
-            ZONE_UNMAPPED_INDEX = i;
+        // if (z->zone_addr_start >= 0x100000000 && (!ZONE_UNMAPPED_INDEX))
+        //    ZONE_UNMAPPED_INDEX = i;
     }
+    */
     // kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
     //  设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
@@ -230,7 +233,6 @@ void mm_init()
         --tmp_page->zone->count_pages_free;
     }
 
-  
     kinfo("Memory management unit initialize complete!");
 
     flush_tlb();
@@ -311,7 +313,6 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
             continue;
 
         struct Zone *z = memory_management_struct.zones_struct + i;
-
         // 区域对应的起止页号
         ul page_start = (z->zone_addr_start >> PAGE_2M_SHIFT);
         ul page_end = (z->zone_addr_end >> PAGE_2M_SHIFT);
@@ -350,6 +351,8 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
             }
         }
     }
+    kBUG("Cannot alloc page, ZONE=%d\tnums=%d, total_2M_pages=%d", zone_select, num, total_2M_pages);
+    while(1);
     return NULL;
 }
 
@@ -470,7 +473,7 @@ void page_table_init()
         struct Zone *z = memory_management_struct.zones_struct + i;
         struct Page *p = z->pages_group;
 
-        if (i == ZONE_UNMAPPED_INDEX)
+        if (i == ZONE_UNMAPPED_INDEX && ZONE_UNMAPPED_INDEX != 0)
             break;
 
         for (int j = 0; j < z->count_pages; ++j)
@@ -483,8 +486,6 @@ void page_table_init()
 
     kinfo("Page table Initialized.");
 }
-
-
 
 /**
  * @brief 将物理地址映射到页表的函数

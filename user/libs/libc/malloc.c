@@ -127,7 +127,7 @@ static malloc_mem_chunk_t *malloc_query_free_chunk_ff(uint64_t size)
  *
  * @param size 扩大的内存大小
  */
-static int malloc_enlarge(int32_t size)
+static int malloc_enlarge(int64_t size)
 {
     if (brk_base_addr == 0) // 第一次调用，需要初始化
     {
@@ -292,6 +292,9 @@ void *malloc(ssize_t size)
 
         if (malloc_enlarge(size) == -ENOMEM)
             return (void *)-ENOMEM; // 内存不足
+
+        malloc_merge_free_chunk(); // 扩容后运行合并，否则会导致碎片
+
         // 扩容后再次尝试获取
 
         ck = malloc_query_free_chunk_bf(size);
@@ -326,7 +329,6 @@ found:;
         malloc_insert_free_list(new_ck);
     }
 
-
     // 此时链表结点的指针的空间被分配出去
     return (void *)((uint64_t)ck + sizeof(uint64_t));
 }
@@ -340,11 +342,17 @@ static void release_brk()
     // 先检测最顶上的块
     // 由于块按照开始地址排列，因此找最后一个块
     if (malloc_free_list_end == NULL)
+    {
+        printf("release(): free list end is null. \n");
         return;
+    }
     if ((uint64_t)malloc_free_list_end + malloc_free_list_end->length == brk_max_addr && (uint64_t)malloc_free_list_end <= brk_max_addr - (PAGE_2M_SIZE << 1))
     {
-        int64_t delta = (brk_max_addr - (uint64_t)malloc_free_list_end) & PAGE_2M_MASK - PAGE_2M_SIZE;
-
+        int64_t delta = ((brk_max_addr - (uint64_t)malloc_free_list_end) & PAGE_2M_MASK) - PAGE_2M_SIZE;
+        // printf("(brk_max_addr - (uint64_t)malloc_free_list_end) & PAGE_2M_MASK=%#018lx\n ", (brk_max_addr - (uint64_t)malloc_free_list_end) & PAGE_2M_MASK);
+        // printf("PAGE_2M_SIZE=%#018lx\n", PAGE_2M_SIZE);
+        // printf("tdfghgbdfggkmfn=%#018lx\n ", (brk_max_addr - (uint64_t)malloc_free_list_end) & PAGE_2M_MASK - PAGE_2M_SIZE);
+        // printf("delta=%#018lx\n ", delta);
         if (delta <= 0) // 不用释放内存
             return;
         sbrk(-delta);

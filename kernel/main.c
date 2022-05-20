@@ -30,6 +30,7 @@
 #include <driver/timers/HPET/HPET.h>
 #include <driver/timers/timer.h>
 #include <driver/uart/uart.h>
+#include <driver/video/video.h>
 
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 ul bsp_idt_size, bsp_gdt_size;
@@ -112,6 +113,10 @@ void system_initialize()
     //  初始化内存管理单元
     mm_init();
 
+    // 对显示模块进行低级初始化，不启用double buffer
+    video_init(false);
+
+
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
@@ -155,6 +160,8 @@ void system_initialize()
     // process_init();
 
     process_init();
+    // 对显示模块进行高级初始化，启用double buffer
+    video_init(true);
     HPET_init();
     // fat32_init();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行

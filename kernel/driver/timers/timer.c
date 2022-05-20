@@ -2,6 +2,7 @@
 #include <common/kprint.h>
 #include <exception/softirq.h>
 #include <mm/slab.h>
+#include <driver/timers/HPET/HPET.h>
 
 void test_timer()
 {
@@ -25,7 +26,7 @@ void do_timer_softirq(void *data)
 {
 
     struct timer_func_list_t *tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
-    
+
     while ((!list_empty(&timer_func_head.list)) && (tmp->expire_jiffies <= timer_jiffies))
     {
         timer_func_del(tmp);
@@ -34,7 +35,7 @@ void do_timer_softirq(void *data)
         tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
     }
 
-    printk_color(ORANGE, BLACK, "(HPET%ld)", timer_jiffies);
+    // printk_color(ORANGE, BLACK, "(HPET%ld)", timer_jiffies);
 }
 
 /**
@@ -42,14 +43,15 @@ void do_timer_softirq(void *data)
  *
  * @param timer_func 队列结构体
  * @param func 定时功能处理函数
- * @param expire_jiffies 定时时长
+ * @param data 传输的数据
+ * @param expire_ms 定时时长(单位：ms)
  */
-void timer_func_init(struct timer_func_list_t *timer_func, void (*func)(void *data), void *data, uint64_t expire_jiffies)
+void timer_func_init(struct timer_func_list_t *timer_func, void (*func)(void *data), void *data, uint64_t expire_ms)
 {
     list_init(&timer_func->list);
     timer_func->func = func;
     timer_func->data = data,
-    timer_func->expire_jiffies = timer_jiffies + expire_jiffies;
+    timer_func->expire_jiffies = timer_jiffies + expire_ms / 5 + expire_ms % HPET0_INTERVAL ? 1 : 0;    // 设置过期的时间片
 }
 
 /**
@@ -66,8 +68,6 @@ void timer_func_add(struct timer_func_list_t *timer_func)
             tmp = container_of(list_next(&tmp->list), struct timer_func_list_t, list);
 
     list_add(&tmp->list, &(timer_func->list));
-
-
 }
 
 /**

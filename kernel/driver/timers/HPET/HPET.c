@@ -146,11 +146,21 @@ int HPET_init()
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
     apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
 
+    // 计算HPET0间隔多少个时钟周期触发一次中断
+    uint64_t clks_to_intr = 0.001 * HPET0_INTERVAL * HPET_freq;
+    if (clks_to_intr <= 0 || clks_to_intr > (HPET_freq * 8))
+    {
+        kBUG("HPET0: Numof clocks to generate interrupt is INVALID! value=%lld", clks_to_intr);
+        while (1)
+            hlt();
+    }
+
     *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
     io_mfence();
     *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，投递到IO APIC的2号引脚（这里有点绕，写的是8259的引脚号，但是因为禁用了8259，因此会被路由到IO APIC的2号引脚）
     io_mfence();
-    *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = HPET_freq; // 1s触发一次中断
+    *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = clks_to_intr; // 5ms触发一次中断
+    //*(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = HPET_freq; // 1s触发一次中断
     io_mfence();
 
     rtc_get_cmos_time(&rtc_now);

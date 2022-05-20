@@ -35,7 +35,7 @@
 //#include "linkage.h"
 #include <stdarg.h>
 
-struct screen_info
+struct printk_screen_info
 {
     int width, height; //屏幕大小
 
@@ -132,11 +132,6 @@ int scroll(bool direction, int pixels, bool animation);
  */
 int cls();
 
-/**
- * @brief 获取VBE帧缓存区的物理地址
- *
- */
-ul get_VBE_FB_phys_addr();
 
 /**
  * @brief 获取VBE帧缓冲区长度
@@ -151,3 +146,14 @@ ul get_VBE_FB_length();
 void set_pos_VBE_FB_addr(uint* virt_addr);
 
 uint* get_pos_VBE_FB_addr();
+
+/**
+ * @brief 使能滚动动画
+ * 
+ */
+void printk_enable_animation();
+/**
+ * @brief 禁用滚动动画
+ * 
+ */
+void printk_disable_animation();

@@ -8,12 +8,14 @@
 #include "../process/spinlock.h"
 
 #include <driver/uart/uart.h>
+#include <driver/video/video.h>
 
 //#include "linkage.h"
 
-struct screen_info pos;
-ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
+struct printk_screen_info pos;
+extern ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
 static spinlock_t printk_lock;
+static bool sw_show_scroll_animation = false; // 显示换行动画的开关
 
 int calculate_max_charNum(int len, int size)
 {
@@ -78,7 +80,8 @@ int printk_init(const int char_size_x, const int char_size_y)
     cls();
 
     kdebug("width=%d\theight=%d", pos.width, pos.height);
-
+    // 由于此时系统并未启用双缓冲，因此关闭滚动动画
+    printk_disable_animation();
     return 0;
 }
 
@@ -128,7 +131,7 @@ void auto_newline()
 #endif
         pos.y = pos.max_y;
         int lines_to_scroll = 1;
-        scroll(true, lines_to_scroll * pos.char_size_y, false);
+        scroll(true, lines_to_scroll * pos.char_size_y, sw_show_scroll_animation);
         pos.y -= (lines_to_scroll - 1);
     }
 }
@@ -674,8 +677,7 @@ static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, uns
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...)
 {
 
-    
-    uint64_t rflags = 0;    // 加锁后rflags存储到这里
+    uint64_t rflags = 0; // 加锁后rflags存储到这里
     spin_lock_irqsave(&printk_lock, rflags);
 
     va_list args;
@@ -768,7 +770,6 @@ int do_scroll(bool direction, int pixels)
  */
 
 // @todo: 修复用户态触发键盘中断时产生#UD错误
-// @todo：采用双缓冲区
 int scroll(bool direction, int pixels, bool animation)
 {
     // 暂时不支持反方向滚动
@@ -788,7 +789,7 @@ int scroll(bool direction, int pixels, bool animation)
         if (pixels > 10)
             steps = 5;
         else
-            steps = pixels % 5;
+            steps = pixels % 10;
         int half_steps = steps / 2;
 
         // 计算加速度
@@ -834,7 +835,7 @@ int scroll(bool direction, int pixels, bool animation)
             do_scroll(direction, delta_x);
         }
     }
-    
+
     return 0;
 }
 
@@ -848,15 +849,6 @@ int cls()
     pos.x = 0;
     pos.y = 0;
     return 0;
-}
-
-/**
- * @brief 获取VBE帧缓存区的物理地址
- *
- */
-ul get_VBE_FB_phys_addr()
-{
-    return VBE_FB_phys_addr;
 }
 
 /**
@@ -879,4 +871,21 @@ void set_pos_VBE_FB_addr(uint *virt_addr)
 uint *get_pos_VBE_FB_addr()
 {
     return pos.FB_address;
+}
+
+/**
+ * @brief 使能滚动动画
+ *
+ */
+void printk_enable_animation()
+{
+    sw_show_scroll_animation = true;
+}
+/**
+ * @brief 禁用滚动动画
+ *
+ */
+void printk_disable_animation()
+{
+    sw_show_scroll_animation = false;
 }

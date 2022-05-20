@@ -237,7 +237,7 @@ void mm_init()
     // 初始化slab内存池
     slab_init();
     page_table_init();
-    init_frame_buffer();
+    // init_frame_buffer();
 }
 
 /**
@@ -484,23 +484,7 @@ void page_table_init()
     kinfo("Page table Initialized.");
 }
 
-/**
- * @brief VBE帧缓存区的地址重新映射
- * 将帧缓存区映射到地址0xffff800003000000处
- */
-void init_frame_buffer()
-{
-    kinfo("Re-mapping VBE frame buffer...");
-    uint64_t global_CR3 = (uint64_t)get_CR3();
-    ul fb_virt_addr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
-    ul fb_phys_addr = get_VBE_FB_phys_addr();
-    // mm_map_phys_addr(fb_virt_addr, fb_phys_addr, get_VBE_FB_length(), PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
-    mm_map_proc_page_table(global_CR3, true, fb_virt_addr, fb_phys_addr, get_VBE_FB_length() << 2, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
 
-    set_pos_VBE_FB_addr((uint *)fb_virt_addr);
-    flush_tlb();
-    kinfo("VBE frame buffer successfully Re-mapped!");
-}
 
 /**
  * @brief 将物理地址映射到页表的函数

@@ -28,6 +28,7 @@ struct vfs_superblock_t *vfs_root_sb = NULL;
  */
 #define VFS_ATTR_FILE (1UL << 0)
 #define VFS_ATTR_DIR (1UL << 1)
+#define VFS_ATTR_DEVICE (1UL << 2)
 
 struct vfs_super_block_operations_t;
 struct vfs_inode_operations_t;

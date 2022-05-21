@@ -24,9 +24,8 @@ all:
 	objcopy -I elf64-x86-64 -S -R ".eh_frame" -R ".comment" -O elf64-x86-64 sys_api_lib $(ROOT_PATH)/bin/user/init.bin
 
 sys_api_lib: init.o
-	
 
-	ld -b elf64-x86-64 -z muldefs -o sys_api_lib init.o  $(shell find . -name "*.o")
+	ld -b elf64-x86-64 -z muldefs -o sys_api_lib $(shell find . -name "*.o")
 #ld -b elf64-x86-64 -z muldefs -o sys_api_lib init.o $(shell find . -name "*.o") -T init.lds
 
 init.o: init.c 

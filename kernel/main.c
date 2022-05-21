@@ -148,7 +148,7 @@ void system_initialize()
 
     smp_init();
     cpu_init();
-    // ps2_keyboard_init();
+    ps2_keyboard_init();
     // ps2_mouse_init();
     // ata_init();
     pci_init();

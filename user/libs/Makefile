@@ -1,5 +1,5 @@
 
-user_libs_sub_dirs=libc libsystem
+user_libs_sub_dirs=libc libsystem libKeyboard
 
 
 all:

@@ -7,6 +7,8 @@
 #include <common/errno.h>
 #include <common/fcntl.h>
 #include <filesystem/fat32/fat32.h>
+#include <filesystem/VFS/VFS.h>
+#include <driver/keyboard/ps2_keyboard.h>
 
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
@@ -108,8 +110,9 @@ uint64_t sys_open(struct pt_regs *regs)
 
     char *filename = (char *)(regs->r8);
     int flags = (int)(regs->r9);
+    kdebug("filename=%s", filename);
 
-    long path_len = strnlen_user(filename, PAGE_4K_SIZE);
+    long path_len = strnlen_user(filename, PAGE_4K_SIZE) + 1;
 
     if (path_len <= 0) // 地址空间错误
     {
@@ -130,19 +133,29 @@ uint64_t sys_open(struct pt_regs *regs)
 
     // 寻找文件
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-    kfree(path);
 
     if (dentry != NULL)
         printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
     else
         printk_color(ORANGE, BLACK, "Can`t find file\n");
 
-    if (dentry == NULL)
+    kfree(path);
+    if (dentry == NULL) 
         return -ENOENT;
 
     // 暂时认为目标是目录是一种错误
     if (dentry->dir_inode->attribute == VFS_ATTR_DIR)
         return -EISDIR;
+
+    // todo: 引入devfs后删除这段代码
+    // 暂时遇到设备文件的话，就将其first clus设置为特定值
+    if (path_len >= 5 && filename[0] == '/' && filename[1] == 'd' && filename[2] == 'e' && filename[3] == 'v' && filename[4] == '/')
+    {
+        // 对于fat32文件系统上面的设备文件，设置其起始扇区
+        ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus |= 0xf0000000;
+        dentry->dir_inode->sb->sb_ops->write_inode(dentry->dir_inode);
+        dentry->dir_inode->attribute |= VFS_ATTR_DEVICE;
+    }
 
     // 创建文件描述符
     struct vfs_file_t *file_ptr = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
@@ -152,7 +165,15 @@ uint64_t sys_open(struct pt_regs *regs)
 
     file_ptr->dEntry = dentry;
     file_ptr->mode = flags;
-    file_ptr->file_ops = dentry->dir_inode->file_ops;
+
+    // todo: 接入devfs
+    // 特判一下是否为键盘文件
+    if (dentry->dir_inode->attribute & VFS_ATTR_DEVICE)
+    {
+        file_ptr->file_ops = &ps2_keyboard_fops; // 如果是设备文件，暂时认为它是键盘文件
+    }
+    else
+        file_ptr->file_ops = dentry->dir_inode->file_ops;
 
     // 如果文件系统实现了打开文件的函数
     if (file_ptr->file_ops && file_ptr->file_ops->open)

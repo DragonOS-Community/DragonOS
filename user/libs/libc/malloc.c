@@ -367,12 +367,13 @@ static void release_brk()
  *
  * @param ptr 堆内存的指针
  */
-void free(void *ptr)
+void free(void *ptr)    
 {
     // 找到结点（此时prev和next都处于未初始化的状态）
     malloc_mem_chunk_t *ck = (malloc_mem_chunk_t *)((uint64_t)ptr - sizeof(uint64_t));
     // printf("free(): addr = %#018lx\t len=%#018lx\n", (uint64_t)ck, ck->length);
     count_last_free_size += ck->length;
+    
     malloc_insert_free_list(ck);
 
     if (count_last_free_size > PAGE_2M_SIZE)

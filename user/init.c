@@ -2,16 +2,28 @@
 #include <libc/stdio.h>
 #include <libc/fcntl.h>
 #include <libc/stdlib.h>
-
+#include <libKeyboard/keyboard.h>
 int main()
 {
 
-    char string[] = "333.txt";
+    char string[] = "/333.txt";
     uint8_t buf[128] = {0};
     char tips_str[] = "The first application 'init.bin' started successfully!\n";
     put_string(tips_str, COLOR_GREEN, COLOR_BLACK);
 
     printf("test printf: %s size: %d\n", string, sizeof(string));
+
+    char kb_file_path[] = "/dev/keyboard.dev";
+    int kb_fd = open(kb_file_path, 0);
+    printf("keyboard fd = %d\n", kb_fd);
+    while (true)
+    {
+        int key = keyboard_analyze_keycode(kb_fd);
+        if(key)
+            printf("%c", (char)key);
+    }
+    
+    
     /*
     int fd = open(string, 0);
     printf("fd=%d\n", fd);
@@ -31,7 +43,7 @@ int main()
     read(fd, buf, 128);
     put_string(buf, COLOR_YELLOW, COLOR_BLACK);
     close(fd);
-    */
+    
 
     void *ptr[256] = {0};
     for (int k = 0; k < 2; ++k)
@@ -57,6 +69,8 @@ int main()
         }
         printf("free done!\n");
     }
+    */
+    
 
     // *p = 'a';
     /*

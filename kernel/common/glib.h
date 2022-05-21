@@ -522,7 +522,6 @@ long strnlen_user(void *src, unsigned long maxlen)
 {
 
     unsigned long size = strlen(src);
-
     // 地址不合法
     if (!verify_area((uint64_t)src, size))
         return 0;

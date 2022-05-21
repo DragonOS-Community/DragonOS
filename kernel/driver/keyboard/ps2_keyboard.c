@@ -5,16 +5,15 @@
 #include "../../common/printk.h"
 #include <filesystem/VFS/VFS.h>
 #include <process/wait_queue.h>
+#include <process/spinlock.h>
 
 // 键盘输入缓冲区
 static struct ps2_keyboard_input_buffer *kb_buf_ptr = NULL;
 // 缓冲区等待队列
 static wait_queue_node_t ps2_keyboard_wait_queue;
 
-// 功能键标志变量
-static bool shift_l, shift_r, ctrl_l, ctrl_r, alt_l, alt_r;
-static bool gui_l, gui_r, apps, insert, home, pgup, del, end, pgdn, arrow_u, arrow_l, arrow_d, arrow_r;
-static bool kp_forward_slash, kp_en;
+// 缓冲区读写锁
+static spinlock_t ps2_kb_buf_rw_lock;
 
 /**
  * @brief 重置ps2键盘输入缓冲区
@@ -110,19 +109,25 @@ long ps2_keyboard_read(struct vfs_file_t *filp, char *buf, int64_t count, long *
     long counter = kb_buf_ptr->count >= count ? count : kb_buf_ptr->count;
 
     uint8_t *tail = kb_buf_ptr->ptr_tail;
+    int64_t tmp = (kb_buf_ptr->buffer + ps2_keyboard_buffer_size - tail);
 
     // 要读取的部分没有越过缓冲区末尾
-    if (counter <= (kb_buf_ptr->buffer + ps2_keyboard_buffer_size - tail))
+    if (counter <= tmp)
     {
         copy_to_user(buf, tail, counter);
         kb_buf_ptr->ptr_tail += counter;
+        // tail越界，则将其重新放置到起始位置
+        if (kb_buf_ptr->ptr_tail == kb_buf_ptr->buffer + ps2_keyboard_buffer_size)
+            kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer;
     }
     else // 要读取的部分越过了缓冲区的末尾，进行循环
     {
-        uint64_t tmp = (kb_buf_ptr->buffer + ps2_keyboard_buffer_size - tail);
-        copy_to_user(buf, tail, tmp);
-        copy_to_user(buf, kb_buf_ptr->ptr_head, counter - tmp);
-        kb_buf_ptr->ptr_tail = kb_buf_ptr->ptr_head + (counter - tmp);
+
+        if (tmp > 0)
+            copy_to_user(buf, tail, tmp);
+        if (counter - tmp > 0)
+            copy_to_user(buf, kb_buf_ptr->buffer, counter - tmp);
+        kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer + (counter - tmp);
     }
 
     kb_buf_ptr->count -= counter;
@@ -164,7 +169,6 @@ struct vfs_file_operations_t ps2_keyboard_fops =
  */
 void ps2_keyboard_handler(ul irq_num, ul param, struct pt_regs *regs)
 {
-    // 读取键盘输入的信息
     unsigned char x = io_in8(PORT_PS2_KEYBOARD_DATA);
     // printk_color(ORANGE, BLACK, "key_pressed:%02x\n", x);
 
@@ -229,15 +233,11 @@ void ps2_keyboard_init()
     for (int i = 0; i < 1000; ++i)
         for (int j = 0; j < 1000; ++j)
             nop();
-    shift_l = false;
-    shift_r = false;
-    ctrl_l = false;
-    ctrl_r = false;
-    alt_l = false;
-    alt_r = false;
 
     wait_queue_init(&ps2_keyboard_wait_queue, NULL);
-    
+    // 初始化键盘缓冲区的读写锁
+    spin_init(&ps2_kb_buf_rw_lock);
+
     // 注册中断处理程序
     irq_register(PS2_KEYBOARD_INTR_VECTOR, &entry, &ps2_keyboard_handler, (ul)kb_buf_ptr, &ps2_keyboard_intr_controller, "ps/2 keyboard");
     kdebug("kb registered.");
@@ -251,257 +251,4 @@ void ps2_keyboard_exit()
 {
     irq_unregister(PS2_KEYBOARD_INTR_VECTOR);
     kfree((ul *)kb_buf_ptr);
-}
-
-/**
- * @brief 解析键盘扫描码
- *
- */
-void ps2_keyboard_analyze_keycode()
-{
-    bool flag_make = false;
-
-    int c = ps2_keyboard_get_scancode();
-    // 循环队列为空
-    if (c == -1)
-        return;
-
-    unsigned char scancode = (unsigned char)c;
-
-    int key = 0;
-    if (scancode == 0xE1) // Pause Break
-    {
-        key = PAUSE_BREAK;
-        // 清除缓冲区中剩下的扫描码
-        for (int i = 1; i < 6; ++i)
-            if (ps2_keyboard_get_scancode() != pause_break_scan_code[i])
-            {
-                key = 0;
-                break;
-            }
-    }
-    else if (scancode == 0xE0) // 功能键, 有多个扫描码
-    {
-        // 获取下一个扫描码
-        scancode = ps2_keyboard_get_scancode();
-        switch (scancode)
-        {
-        case 0x2a: // print screen 按键被按下
-            if (ps2_keyboard_get_scancode() == 0xe0)
-                if (ps2_keyboard_get_scancode() == 0x37)
-                {
-                    key = PRINT_SCREEN;
-                    flag_make = true;
-                }
-            break;
-        case 0xb7: // print screen 按键被松开
-            if (ps2_keyboard_get_scancode() == 0xe0)
-                if (ps2_keyboard_get_scancode() == 0xaa)
-                {
-                    key = PRINT_SCREEN;
-                    flag_make = false;
-                }
-            break;
-        case 0x1d: // 按下右边的ctrl
-            ctrl_r = true;
-            key = OTHER_KEY;
-            break;
-        case 0x9d: // 松开右边的ctrl
-            ctrl_r = false;
-            key = OTHER_KEY;
-            break;
-        case 0x38: // 按下右边的alt
-            alt_r = true;
-            key = OTHER_KEY;
-            break;
-        case 0xb8: // 松开右边的alt
-            alt_r = false;
-            key = OTHER_KEY;
-            break;
-        case 0x5b:
-            gui_l = true;
-            key = OTHER_KEY;
-            break;
-        case 0xdb:
-            gui_l = false;
-            key = OTHER_KEY;
-            break;
-        case 0x5c:
-            gui_r = true;
-            key = OTHER_KEY;
-            break;
-        case 0xdc:
-            gui_r = false;
-            key = OTHER_KEY;
-            break;
-        case 0x5d:
-            apps = true;
-            key = OTHER_KEY;
-            break;
-        case 0xdd:
-            apps = false;
-            key = OTHER_KEY;
-            break;
-        case 0x52:
-            insert = true;
-            key = OTHER_KEY;
-            break;
-        case 0xd2:
-            insert = false;
-            key = OTHER_KEY;
-            break;
-        case 0x47:
-            home = true;
-            key = OTHER_KEY;
-            break;
-        case 0xc7:
-            home = false;
-            key = OTHER_KEY;
-            break;
-        case 0x49:
-            pgup = true;
-            key = OTHER_KEY;
-            break;
-        case 0xc9:
-            pgup = false;
-            key = OTHER_KEY;
-            break;
-        case 0x53:
-            del = true;
-            key = OTHER_KEY;
-            break;
-        case 0xd3:
-            del = false;
-            key = OTHER_KEY;
-            break;
-        case 0x4f:
-            end = true;
-            key = OTHER_KEY;
-            break;
-        case 0xcf:
-            end = false;
-            key = OTHER_KEY;
-            break;
-        case 0x51:
-            pgdn = true;
-            key = OTHER_KEY;
-            break;
-        case 0xd1:
-            pgdn = false;
-            key = OTHER_KEY;
-            break;
-        case 0x48:
-            arrow_u = true;
-            key = OTHER_KEY;
-            break;
-        case 0xc8:
-            arrow_u = false;
-            key = OTHER_KEY;
-            break;
-        case 0x4b:
-            arrow_l = true;
-            key = OTHER_KEY;
-            break;
-        case 0xcb:
-            arrow_l = false;
-            key = OTHER_KEY;
-            break;
-        case 0x50:
-            arrow_d = true;
-            key = OTHER_KEY;
-            break;
-        case 0xd0:
-            arrow_d = false;
-            key = OTHER_KEY;
-            break;
-        case 0x4d:
-            arrow_r = true;
-            key = OTHER_KEY;
-            break;
-        case 0xcd:
-            arrow_r = false;
-            key = OTHER_KEY;
-            break;
-
-        case 0x35: // 数字小键盘的 / 符号
-            kp_forward_slash = true;
-            key = OTHER_KEY;
-            break;
-        case 0xb5:
-            kp_forward_slash = false;
-            key = OTHER_KEY;
-            break;
-        case 0x1c:
-            kp_en = true;
-            key = OTHER_KEY;
-            break;
-        case 0x9c:
-            kp_en = false;
-            key = OTHER_KEY;
-            break;
-
-        default:
-            key = OTHER_KEY;
-            break;
-        }
-    }
-
-    if (key == 0) // 属于第三类扫描码
-    {
-        // 判断按键是被按下还是抬起
-        flag_make = ((scancode & FLAG_BREAK) ? 0 : 1);
-
-        // 计算扫描码位于码表的第几行
-        uint *key_row = &keycode_map_normal[(scancode & 0x7f) * MAP_COLS];
-        unsigned char col = 0;
-        // shift被按下
-        if (shift_l || shift_r)
-            col = 1;
-        key = key_row[col];
-
-        switch (scancode & 0x7f)
-        {
-        case 0x2a:
-            shift_l = flag_make;
-            key = 0;
-            break;
-        case 0x36:
-            shift_r = flag_make;
-            key = 0;
-            break;
-        case 0x1d:
-            ctrl_l = flag_make;
-            key = 0;
-            break;
-        case 0x38:
-            ctrl_r = flag_make;
-            key = 0;
-            break;
-        default:
-            if (!flag_make)
-                key = 0;
-            break;
-        }
-        if (key)
-            printk_color(ORANGE, BLACK, "%c", key);
-    }
-}
-
-/**
- * @brief 从缓冲队列中获取键盘扫描码
- *
- */
-int ps2_keyboard_get_scancode()
-{
-    // 缓冲队列为空
-    if (kb_buf_ptr->count == 0)
-        return -1;
-
-    if (kb_buf_ptr->ptr_tail == kb_buf_ptr->buffer + ps2_keyboard_buffer_size)
-        kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer;
-
-    int ret = (int)(*(kb_buf_ptr->ptr_tail));
-    --(kb_buf_ptr->count);
-    ++(kb_buf_ptr->ptr_tail);
-    return ret;
 }

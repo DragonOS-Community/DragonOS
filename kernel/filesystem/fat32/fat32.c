@@ -343,6 +343,11 @@ find_lookup_success:; // 找到目标dentry
     finode->write_date = tmp_dEntry->DIR_WrtDate;
     finode->write_time = tmp_dEntry->DIR_WrtTime;
 
+    // 暂时使用fat32的高4bit来标志设备文件
+    // todo: 引入devfs后删除这段代码
+    if ((tmp_dEntry->DIR_FstClusHI >> 12) && (p->attribute & VFS_ATTR_FILE))
+        p->attribute |= VFS_ATTR_DEVICE;
+    
     dest_dentry->dir_inode = p;
     kfree(buf);
     return dest_dentry;
@@ -486,7 +491,6 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
     // 计算目标inode对应数据区的LBA地址
     uint64_t fLBA = fsbi->first_data_sector + (finode->dEntry_location_clus - 2) * fsbi->sec_per_clus;
 
-
     struct fat32_Directory_t *buf = (struct fat32_Directory_t *)kmalloc(fsbi->bytes_per_clus, 0);
     memset(buf, 0, fsbi->bytes_per_clus);
     ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
@@ -498,7 +502,6 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
     fdEntry->DIR_FileSize = inode->file_size;
     fdEntry->DIR_FstClusLO = finode->first_clus & 0xffff;
     fdEntry->DIR_FstClusHI = (finode->first_clus >> 16) | (fdEntry->DIR_FstClusHI & 0xf000);
-
 
     // 将dir entry写回磁盘
     ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
@@ -841,10 +844,10 @@ long fat32_lseek(struct vfs_file_t *file_ptr, long offset, long whence)
         break;
     }
 
-    if(pos<0||pos>file_ptr->dEntry->dir_inode->file_size)
+    if (pos < 0 || pos > file_ptr->dEntry->dir_inode->file_size)
         return -EOVERFLOW;
     file_ptr->position = pos;
-    
+
     // kdebug("fat32 lseek -> position=%d", file_ptr->position);
     return pos;
 }

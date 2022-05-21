@@ -18,8 +18,6 @@ long process_global_pid = 1;              // 系统中最大的pid
 extern void system_call(void);
 extern void kernel_thread_func(void);
 
-
-
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 struct mm_struct initial_mm = {0};
 struct thread_struct initial_thread =
@@ -400,11 +398,11 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 #endif
     if (ehdr.e_type != ET_EXEC)
     {
-        kdebug("ehdr->e_type=%d", ehdr.e_type);
+        kerror("Not executable file! filename=%s\tehdr->e_type=%d", path, ehdr.e_type);
         retval = -EUNSUPPORTED;
         goto load_elf_failed;
     }
-    kdebug("e_entry=%#018lx", ehdr.e_entry);
+    kdebug("filename=%s:\te_entry=%#018lx", path, ehdr.e_entry);
     regs->rip = ehdr.e_entry;
     current_pcb->mm->code_addr_start = ehdr.e_entry;
 
@@ -413,7 +411,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     pos = ehdr.e_phoff;
     // 读取所有的phdr
     pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
-    filp->file_ops->read(filp, (char *)buf, ehdr.e_phentsize * ehdr.e_phnum, &pos);
+    filp->file_ops->read(filp, (char *)buf, (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum, &pos);
     if ((unsigned long)filp <= 0)
     {
         kdebug("(unsigned long)filp=%d", (long)filp);
@@ -447,7 +445,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
             if (remain_file_size != 0)
             {
                 int64_t to_trans = (remain_file_size > PAGE_2M_SIZE) ? PAGE_2M_SIZE : remain_file_size;
-                val = filp->file_ops->read(filp, (char*)virt_base, to_trans, &pos);
+                val = filp->file_ops->read(filp, (char *)virt_base, to_trans, &pos);
             }
 
             if (val < 0)

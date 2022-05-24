@@ -573,13 +573,13 @@ ul initial_kernel_thread(ul arg)
     // kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
-    // 加载用户态程序：init.bin
-    char init_path[] = "/init.bin";
+    // 加载用户态程序：shell.elf
+    char init_path[] = "/shell.elf";
     uint64_t addr = (uint64_t)&init_path;
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
                          "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
-                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/init.bin")
+                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/shell.elf")
                          : "memory");
 
     return 1;

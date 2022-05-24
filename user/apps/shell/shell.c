@@ -5,7 +5,6 @@
 #include <libKeyboard/keyboard.h>
 int main()
 {
-
     char string[] = "/333.txt";
     uint8_t buf[128] = {0};
     char tips_str[] = "The first application 'init.bin' started successfully!\n";

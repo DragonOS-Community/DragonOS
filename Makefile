@@ -17,6 +17,7 @@ endif
 all:
 	mkdir -p bin/kernel/
 	mkdir -p bin/user/
+	mkdir -p bin/tmp/
 	@list='$(SUBDIRS)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\

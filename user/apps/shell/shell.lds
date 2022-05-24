@@ -13,7 +13,7 @@ SECTIONS
 	{
 		_text = .;
 		
-		init.o(.text)
+		*(.text)
 		
 		_etext = .;
 	}

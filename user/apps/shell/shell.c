@@ -3,81 +3,159 @@
 #include <libc/fcntl.h>
 #include <libc/stdlib.h>
 #include <libKeyboard/keyboard.h>
-int main()
+#include <libc/string.h>
+#include <libc/stddef.h>
+
+#include "cmd.h"
+
+#define pause_cpu() asm volatile("pause\n\t");
+
+/**
+ * @brief 循环读取每一行
+ *
+ * @param fd 键盘文件描述符
+ * @param buf 输入缓冲区
+ * @return 读取的字符数
+ */
+#define INPUT_BUFFER_SIZE 512
+int shell_readline(int fd, char *buf);
+
+extern char *shell_current_path;
+
+/**
+ * @brief 解析shell命令
+ *
+ * @param buf 输入缓冲区
+ * @param argc 返回值：参数数量
+ * @param argv 返回值：参数列表
+ * @return int
+ */
+int parse_command(char *buf, int *argc, char ***argv);
+
+/**
+ * @brief shell主循环
+ *
+ * @param kb_fd 键盘文件描述符
+ */
+static void main_loop(int kb_fd)
 {
-    char string[] = "/333.txt";
-    uint8_t buf[128] = {0};
-    char tips_str[] = "The first application 'init.bin' started successfully!\n";
-    put_string(tips_str, COLOR_GREEN, COLOR_BLACK);
+    unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
-    printf("test printf: %s size: %d\n", string, sizeof(string));
+    // 初始化当前工作目录的路径
+    shell_current_path = (char *)malloc(256);
+    memset(shell_current_path, 0, 256);
+    shell_current_path = "/";
 
-    char kb_file_path[] = "/dev/keyboard.dev";
-    int kb_fd = open(kb_file_path, 0);
-    printf("keyboard fd = %d\n", kb_fd);
+    // shell命令行的主循环
     while (true)
     {
-        int key = keyboard_analyze_keycode(kb_fd);
-        if(key)
-            printf("%c", (char)key);
+        int argc = 0;
+        char **argv;
+
+        printf("[DragonOS] # ");
+        memset(input_buffer, 0, INPUT_BUFFER_SIZE);
+
+        // 循环读取每一行到buffer
+        shell_readline(kb_fd, input_buffer);
+
+        int cmd_num = parse_command(input_buffer, &argc, &argv);
+        printf("\n");
+        if (cmd_num >= 0)
+            shell_run_built_in_command(cmd_num, argc, argv);
+        
     }
-    
-    
-    /*
-    int fd = open(string, 0);
-    printf("fd=%d\n", fd);
+}
 
-    read(fd, buf, 128);
+int main()
+{
+    // 打开键盘文件
+    char kb_file_path[] = "/dev/keyboard.dev";
+    int kb_fd = open(kb_file_path, 0);
+    // printf("keyboard fd = %d\n", kb_fd);
 
-    put_string(buf, COLOR_ORANGE, COLOR_BLACK);
-
-    lseek(fd, 0, SEEK_SET);
-    write(fd, tips_str, sizeof(tips_str)-1);
-    lseek(fd, 0, SEEK_SET);
-
-    // 由于暂时没有实现用户态的memset，因此先手动清零
-    for(int i=0;i<128;++i)
-        buf[i] = 0;
-
-    read(fd, buf, 128);
-    put_string(buf, COLOR_YELLOW, COLOR_BLACK);
-    close(fd);
-    
-
-    void *ptr[256] = {0};
-    for (int k = 0; k < 2; ++k)
-    {
-        printf("try to malloc 256*1M=256MB\n");
-        uint64_t js = 0;
-        for (int i = 0; i < 256; ++i)
-        {
-            ptr[i] = malloc(1024 * 1024);
-            js += *(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t));
-            // if (*(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t)) > 0x4008)
-            //     printf("[%ld] start_addr = %#018lx, len = %#010lx\n", i, (uint64_t)(ptr[i]) - 8, *(uint64_t *)((uint64_t)(ptr[i]) - sizeof(uint64_t)));
-        }
-
-        // printf("ptr[0]->len=%lld\n", *(uint64_t *)((uint64_t)ptr[0] - sizeof(uint64_t)));
-        // printf("ptr[1]->len=%lld\n", *(uint64_t *)((uint64_t)ptr[1] - sizeof(uint64_t)));
-        //  printf("ptr[24]->len=%lld\n", *(uint64_t*)((uint64_t)ptr[24] - sizeof(uint64_t)));
-        printf("alloc done. total used: %lld bytes\n", js);
-        printf("try to free...\n");
-        for (int i = 0; i < 256; ++i)
-        {
-            free(ptr[i]);
-        }
-        printf("free done!\n");
-    }
-    */
-    
-
-    // *p = 'a';
-    /*
-    pid_t p = fork();
-    if(p == 0)
-        put_string("subproc\n", COLOR_PURPLE, COLOR_BLACK);
-    else put_string("parent proc\n", COLOR_ORANGE, COLOR_BLACK);
-*/
+    main_loop(kb_fd);
     while (1)
         ;
+}
+
+/**
+ * @brief 循环读取每一行
+ *
+ * @param fd 键盘文件描述符
+ * @param buf 输入缓冲区
+ * @return 读取的字符数
+ */
+int shell_readline(int fd, char *buf)
+{
+    int key = 0;
+    int count = 0;
+
+    while (1)
+    {
+        key = keyboard_analyze_keycode(fd);
+        if (key == '\n')
+            return count;
+
+        if (key)
+        {
+            buf[count++] = key;
+            printf("%c", key);
+        }
+
+        // 输入缓冲区满了之后，直接返回
+        if (count >= INPUT_BUFFER_SIZE - 1)
+            return count;
+
+        pause_cpu();
+    }
+}
+
+/**
+ * @brief 解析shell命令
+ *
+ * @param buf 输入缓冲区
+ * @param argc 返回值：参数数量
+ * @param argv 返回值：参数列表
+ * @return int 主命令的编号
+ */
+int parse_command(char *buf, int *argc, char ***argv)
+{
+    int index = 0; // 当前访问的是buf的第几位
+    // 去除命令前导的空格
+    while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
+        ++index;
+
+    // 计算参数数量
+    for (int i = index; i < INPUT_BUFFER_SIZE - 1; ++i)
+    {
+        // 到达了字符串末尾
+        if (!buf[i])
+            break;
+        if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
+            ++(*argc);
+    }
+
+    // printf("\nargc=%d\n", *argc);
+
+    // 为指向每个指令的指针分配空间
+    *argv = (char **)malloc(sizeof(char **) * (*argc));
+    memset(*argv, 0, sizeof(char **) * (*argc));
+
+    // 将每个命令都单独提取出来
+    for (int i = 0; i < *argc && index < INPUT_BUFFER_SIZE; ++i)
+    {
+        // 提取出命令，以空格作为分割
+        *((*argv) + i) = &buf[index];
+        while (index < INPUT_BUFFER_SIZE - 1 && buf[index] && buf[index] != ' ')
+            ++index;
+        buf[index++] = '\0';
+
+        // 删除命令间多余的空格
+        while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
+            ++index;
+
+        // printf("%s\n", (*argv)[i]);
+    }
+    // 以第一个命令作为主命令，查找其在命令表中的编号
+    return shell_find_cmd(**argv);
 }

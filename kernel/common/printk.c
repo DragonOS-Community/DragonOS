@@ -119,6 +119,7 @@ void auto_newline()
     if (pos.x > pos.max_x)
     {
 #ifdef DEBUG
+        uart_send(COM1, '\r');
         uart_send(COM1, '\n');
 #endif
         pos.x = 0;
@@ -127,6 +128,7 @@ void auto_newline()
     if (pos.y > pos.max_y)
     {
 #ifdef DEBUG
+        uart_send(COM1, '\r');
         uart_send(COM1, '\n');
 #endif
         pos.y = pos.max_y;

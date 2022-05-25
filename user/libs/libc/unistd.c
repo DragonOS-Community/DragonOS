@@ -2,6 +2,7 @@
 #include <libsystem/syscall.h>
 #include <libc/errno.h>
 #include <libc/stdio.h>
+#include <libc/stddef.h>
 
 /**
  * @brief 关闭文件接口
@@ -104,5 +105,34 @@ void *sbrk(int64_t increment)
     {
         errno = 0;
         return (void *)retval;
+    }
+}
+
+/**
+ * @brief 切换当前工作目录
+ *
+ * @param dest_path 目标目录
+ * @return int64_t 成功：0,失败：负值（错误码）
+ */
+int64_t chdir(char *dest_path)
+{
+    if (dest_path == NULL)
+    {
+        errno = -EFAULT;
+        return -1;
+    }
+    else
+    {
+        int retval = syscall_invoke(SYS_CHDIR, (uint64_t)dest_path, 0,0,0,0,0,0,0);
+        if(retval == 0)
+        {
+            errno = 0;
+            return 0;
+        }
+        else
+        {
+            errno = retval;
+            return -1;
+        }
     }
 }

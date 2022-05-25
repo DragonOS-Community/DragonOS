@@ -3,6 +3,12 @@
 #include <libc/stdio.h>
 #include <libc/stddef.h>
 #include <libsystem/syscall.h>
+#include <libc/string.h>
+#include <libc/errno.h>
+#include <libc/unistd.h>
+#include <libc/stdlib.h>
+
+#include "cmd_help.h"
 
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
@@ -22,6 +28,7 @@ struct built_in_cmd_t shell_cmds[] =
         {"rmdir", shell_cmd_rmdir},
         {"reboot", shell_cmd_reboot},
         {"touch", shell_cmd_touch},
+        {"help", shell_help},
 
 };
 // 总共的内建命令数量
@@ -69,8 +76,112 @@ void shell_run_built_in_command(int index, int argc, char **argv)
  * @param argv
  * @return int
  */
-// todo:
-int shell_cmd_cd(int argc, char **argv) {}
+
+int shell_cmd_cd(int argc, char **argv)
+{
+
+    int current_dir_len = strlen(shell_current_path);
+    if (argc < 2)
+    {
+        shell_help_cd();
+        goto done;
+    }
+    // 进入当前文件夹
+    if (!strcmp(".", argv[1]))
+        goto done;
+
+    // 进入父目录
+    if (!strcmp("..", argv[1]))
+    {
+
+        // 当前已经是根目录
+        if (!strcmp("/", shell_current_path))
+            goto done;
+
+        // 返回到父目录
+        int index = current_dir_len - 1;
+        for (; index > 1; --index)
+        {
+            if (shell_current_path[index] == '/')
+                break;
+        }
+        shell_current_path[index] = '\0';
+
+        // printf("switch to \" %s \"\n", shell_current_path);
+        goto done;
+    }
+
+    int dest_len = strlen(argv[1]);
+    // 路径过长
+    if (dest_len >= SHELL_CWD_MAX_SIZE - 1)
+    {
+        printf("ERROR: Path too long!\n");
+        goto fail;
+    }
+
+    if (argv[1][0] == '/')
+    {
+        // ======进入绝对路径=====
+        int ec = chdir(argv[1]);
+        if (ec == -1)
+            ec = errno;
+        if (ec == 0)
+        {
+            // 获取新的路径字符串
+            char *new_path = (char *)malloc(dest_len + 2);
+            memset(new_path, 0, dest_len + 2);
+            strncpy(new_path, argv[1], dest_len);
+
+            // 释放原有的路径字符串的内存空间
+            free(shell_current_path);
+
+            shell_current_path = new_path;
+
+            shell_current_path[dest_len] = '\0';
+            return 0;
+        }
+        else
+            goto fail;; // 出错则直接忽略
+    }
+    else
+    {
+        int new_len = current_dir_len + dest_len;
+        // ======进入相对路径=====
+        if (new_len >= SHELL_CWD_MAX_SIZE - 1)
+        {
+            printf("ERROR: Path too long!\n");
+            goto fail;
+        }
+
+        // 拼接出新的字符串
+        char *new_path = (char *)malloc(new_len + 2);
+        memset(new_path, 0, sizeof(new_path));
+        strncpy(new_path, shell_current_path, current_dir_len);
+
+        if (current_dir_len > 1)
+            new_path[current_dir_len] = '/';
+        strcat(new_path, argv[1]);
+
+        if (chdir(new_path) == 0) // 成功切换目录
+        {
+            free(shell_current_path);
+            new_path[new_len] = '\0';
+            shell_current_path = new_path;
+            goto done;
+        }
+        else
+        {
+            printf("ERROR: Cannot switch to directory: %s\n", new_path);
+            goto fail;
+        }
+    }
+
+fail:;
+done:;
+    // 释放参数所占的内存
+    free(argv);
+    return 0;
+}
 
 /**
  * @brief 查看文件夹下的文件列表
@@ -80,7 +191,10 @@ int shell_cmd_cd(int argc, char **argv) {}
  * @return int
  */
 // todo:
-int shell_cmd_ls(int argc, char **argv) {}
+int shell_cmd_ls(int argc, char **argv)
+{
+    return 0;
+}
 
 /**
  * @brief 显示当前工作目录的命令
@@ -93,6 +207,8 @@ int shell_cmd_pwd(int argc, char **argv)
 {
     if (shell_current_path)
         printf("%s\n", shell_current_path);
+
+    free(argv);
 }
 
 /**

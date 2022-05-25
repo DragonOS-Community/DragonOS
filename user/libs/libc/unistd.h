@@ -2,11 +2,6 @@
 #include <stdint.h>
 #include <libc/sys/types.h>
 
-
-
-
-
-
 /**
  * @brief 关闭文件接口
  *
@@ -47,15 +42,15 @@ off_t lseek(int fd, off_t offset, int whence);
 
 /**
  * @brief fork当前进程
- * 
- * @return pid_t 
+ *
+ * @return pid_t
  */
 pid_t fork(void);
 
 /**
  * @brief fork当前进程，但是与父进程共享VM、flags、fd
- * 
- * @return pid_t 
+ *
+ * @return pid_t
  */
 pid_t vfork(void);
 
@@ -72,8 +67,16 @@ uint64_t brk(uint64_t end_brk);
 
 /**
  * @brief 将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
- * 
+ *
  * @param increment offset偏移量
  * @return uint64_t the previous program break
  */
-void * sbrk(int64_t increment);
+void *sbrk(int64_t increment);
+
+/**
+ * @brief 切换当前工作目录
+ *
+ * @param dest_path 目标目录
+ * @return int64_t 成功：0,失败：负值（错误码）
+ */
+int64_t chdir(char *dest_path);

@@ -1,5 +1,8 @@
 #pragma once
 
+// cwd字符串的最大大小
+#define SHELL_CWD_MAX_SIZE  256
+
 /**
  * @brief shell内建命令结构体
  * 

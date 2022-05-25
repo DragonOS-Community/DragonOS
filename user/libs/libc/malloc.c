@@ -268,7 +268,7 @@ static void malloc_insert_free_list(malloc_mem_chunk_t *ck)
  */
 void *malloc(ssize_t size)
 {
-
+    // printf("malloc\n");
     // 计算需要分配的块的大小
     if (size + sizeof(uint64_t) <= sizeof(malloc_mem_chunk_t))
         size = sizeof(malloc_mem_chunk_t);
@@ -281,6 +281,7 @@ void *malloc(ssize_t size)
     if (ck == NULL) // 没有空闲块
     {
 
+        // printf("no free blocks\n");
         // 尝试合并空闲块
         malloc_merge_free_chunk();
         ck = malloc_query_free_chunk_bf(size);
@@ -288,10 +289,12 @@ void *malloc(ssize_t size)
         // 找到了合适的块
         if (ck)
             goto found;
+        
+        // printf("before enlarge\n");
         // 找不到合适的块，扩容堆区域
-
         if (malloc_enlarge(size) == -ENOMEM)
             return (void *)-ENOMEM; // 内存不足
+        
 
         malloc_merge_free_chunk(); // 扩容后运行合并，否则会导致碎片
 
@@ -304,6 +307,7 @@ found:;
     // printf("ck = %#018lx\n", (uint64_t)ck);
     if (ck == NULL)
         return (void *)-ENOMEM;
+    // printf("ck->prev=%#018lx ck->next=%#018lx\n", ck->prev, ck->next);
     // 分配空闲块
     // 从空闲链表取出
     if (ck->prev == NULL) // 当前是链表的第一个块
@@ -321,6 +325,7 @@ found:;
     // 当前块剩余的空间还能容纳多一个结点的空间，则分裂当前块
     if ((int64_t)(ck->length) - size > sizeof(malloc_mem_chunk_t))
     {
+        // printf("seperate\n");
         malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)(((uint64_t)ck) + size);
         new_ck->length = ck->length - size;
         new_ck->prev = new_ck->next = NULL;
@@ -328,7 +333,7 @@ found:;
         ck->length = size;
         malloc_insert_free_list(new_ck);
     }
-
+    // printf("malloc done: %#018lx, length=%#018lx\n", ((uint64_t)ck + sizeof(uint64_t)), ck->length);
     // 此时链表结点的指针的空间被分配出去
     return (void *)((uint64_t)ck + sizeof(uint64_t));
 }
@@ -367,13 +372,13 @@ static void release_brk()
  *
  * @param ptr 堆内存的指针
  */
-void free(void *ptr)    
+void free(void *ptr)
 {
     // 找到结点（此时prev和next都处于未初始化的状态）
     malloc_mem_chunk_t *ck = (malloc_mem_chunk_t *)((uint64_t)ptr - sizeof(uint64_t));
     // printf("free(): addr = %#018lx\t len=%#018lx\n", (uint64_t)ck, ck->length);
     count_last_free_size += ck->length;
-    
+
     malloc_insert_free_list(ck);
 
     if (count_last_free_size > PAGE_2M_SIZE)

@@ -5,7 +5,7 @@ CFLAGS += -I .
 libc_sub_dirs=math
 
 
-libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o
+libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o string.o
 	@list='$(libc_sub_dirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
@@ -33,3 +33,6 @@ stdlib.o: stdlib.c
 	
 ctype.o: ctype.c
 	gcc $(CFLAGS) -c ctype.c -o ctype.o
+
+string.o: string.c
+	gcc $(CFLAGS) -c string.c -o string.o

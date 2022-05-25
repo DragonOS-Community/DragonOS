@@ -42,9 +42,10 @@ static void main_loop(int kb_fd)
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
     // 初始化当前工作目录的路径
-    shell_current_path = (char *)malloc(256);
-    memset(shell_current_path, 0, 256);
-    shell_current_path = "/";
+    shell_current_path = (char *)malloc(3);
+    memset(shell_current_path, 0, 3);
+    shell_current_path[0] = '/';
+    shell_current_path[1] = '\0';
 
     // shell命令行的主循环
     while (true)
@@ -52,17 +53,22 @@ static void main_loop(int kb_fd)
         int argc = 0;
         char **argv;
 
-        printf("[DragonOS] # ");
+        printf("[DragonOS] %s # ", shell_current_path);
         memset(input_buffer, 0, INPUT_BUFFER_SIZE);
 
         // 循环读取每一行到buffer
-        shell_readline(kb_fd, input_buffer);
+        int count = shell_readline(kb_fd, input_buffer);
 
-        int cmd_num = parse_command(input_buffer, &argc, &argv);
-        printf("\n");
-        if (cmd_num >= 0)
-            shell_run_built_in_command(cmd_num, argc, argv);
-        
+        if (count)
+        {
+            int cmd_num = parse_command(input_buffer, &argc, &argv);
+            printf("\n");
+            if (cmd_num >= 0)
+                shell_run_built_in_command(cmd_num, argc, argv);
+
+        }
+        else
+            printf("\n");
     }
 }
 
@@ -120,13 +126,14 @@ int shell_readline(int fd, char *buf)
  */
 int parse_command(char *buf, int *argc, char ***argv)
 {
+    // printf("parse command\n");
     int index = 0; // 当前访问的是buf的第几位
     // 去除命令前导的空格
     while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
         ++index;
 
     // 计算参数数量
-    for (int i = index; i < INPUT_BUFFER_SIZE - 1; ++i)
+    for (int i = index; i < (INPUT_BUFFER_SIZE - 1); ++i)
     {
         // 到达了字符串末尾
         if (!buf[i])
@@ -140,13 +147,12 @@ int parse_command(char *buf, int *argc, char ***argv)
     // 为指向每个指令的指针分配空间
     *argv = (char **)malloc(sizeof(char **) * (*argc));
     memset(*argv, 0, sizeof(char **) * (*argc));
-
     // 将每个命令都单独提取出来
     for (int i = 0; i < *argc && index < INPUT_BUFFER_SIZE; ++i)
     {
         // 提取出命令，以空格作为分割
         *((*argv) + i) = &buf[index];
-        while (index < INPUT_BUFFER_SIZE - 1 && buf[index] && buf[index] != ' ')
+        while (index < (INPUT_BUFFER_SIZE - 1) && buf[index] && buf[index] != ' ')
             ++index;
         buf[index++] = '\0';
 

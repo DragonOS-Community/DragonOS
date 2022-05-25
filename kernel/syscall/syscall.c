@@ -140,7 +140,7 @@ uint64_t sys_open(struct pt_regs *regs)
         printk_color(ORANGE, BLACK, "Can`t find file\n");
 
     kfree(path);
-    if (dentry == NULL) 
+    if (dentry == NULL)
         return -ENOENT;
 
     // 暂时认为目标是目录是一种错误
@@ -445,12 +445,75 @@ uint64_t sys_sbrk(struct pt_regs *regs)
 /**
  * @brief 重启计算机
  *
- * @return 
+ * @return
  */
 uint64_t sys_reboot(struct pt_regs *regs)
 {
     // 重启计算机
     io_out8(0x64, 0xfe);
+
+    return 0;
+}
+
+/**
+ * @brief 切换工作目录
+ *
+ * @param dest_path 目标路径
+ * @return
++--------------+------------------------+
+|    返回码    |          描述          |
++--------------+------------------------+
+|      0       |          成功          |
+|   EACCESS    |        权限不足        |
+|    ELOOP     | 解析path时遇到路径循环 |
+| ENAMETOOLONG |       路径名过长       |
+|    ENOENT    |  目标文件或目录不存在  |
+|    ENODIR    |  检索期间发现非目录项  |
+|    ENOMEM    |      系统内存不足      |
+|    EFAULT    |       错误的地址       |
+| ENAMETOOLONG |        路径过长        |
++--------------+------------------------+
+ */
+uint64_t sys_chdir(struct pt_regs *regs)
+{
+    char *dest_path = (char *)regs->r8;
+    // kdebug("dest_path=%s", dest_path);
+    // 检查目标路径是否为NULL
+    if (dest_path == NULL)
+        return -EFAULT;
+
+    // 计算输入的路径长度
+    int dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
+
+
+    // 长度小于等于0
+    if (dest_path_len <= 0)
+        return -EFAULT;
+    else if (dest_path_len >= PAGE_4K_SIZE)
+        return -ENAMETOOLONG;
+
+    // 为路径字符串申请空间
+    char *path = kmalloc(dest_path_len + 1, 0);
+    // 系统内存不足
+    if (path == NULL)
+        return -ENOMEM;
+
+    memset(path, 0, dest_path_len + 1);
+
+    // 将字符串从用户空间拷贝进来, +1是为了拷贝结尾的\0
+    strncpy_from_user(path, dest_path, dest_path_len + 1);
+
+
+    struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
+
+    kfree(path);
+
+    if (dentry == NULL)
+        return -ENOENT;
+
+    // 目标不是目录
+    if (dentry->dir_inode->attribute != VFS_ATTR_DIR)
+        return -ENOTDIR;
 
     return 0;
 }
@@ -483,5 +546,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [9] = sys_brk,
         [10] = sys_sbrk,
         [11] = sys_reboot,
-        [12 ... 254] = system_call_not_exists,
+        [12] = sys_chdir,
+        [13 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

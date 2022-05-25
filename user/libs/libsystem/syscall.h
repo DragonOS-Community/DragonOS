@@ -15,6 +15,7 @@
 #define SYS_BRK 9
 #define SYS_SBRK 10
 #define SYS_REBOOT 11
+#define SYS_CHDIR 12    // 切换工作目录
 
 /**
  * @brief 用户态系统调用函数

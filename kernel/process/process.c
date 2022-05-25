@@ -365,7 +365,8 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         return (unsigned long)filp;
     }
 
-    void *buf = kmalloc(sizeof(PAGE_4K_SIZE), 0);
+    void *buf = kmalloc(PAGE_4K_SIZE, 0);
+    memset(buf, 0, PAGE_4K_SIZE);
     uint64_t pos = 0;
     pos = filp->file_ops->lseek(filp, 0, SEEK_SET);
     retval = filp->file_ops->read(filp, (char *)buf, sizeof(Elf64_Ehdr), &pos);
@@ -419,6 +420,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     }
     Elf64_Phdr *phdr = buf;
 
+    // 将程序加载到内存中
     for (int i = 0; i < ehdr.e_phnum; ++i, ++phdr)
     {
         // kdebug("phdr[%d] phdr->p_offset=%#018lx phdr->p_vaddr=%#018lx phdr->p_memsz=%ld phdr->p_filesz=%ld  phdr->p_type=%d", i, phdr->p_offset, phdr->p_vaddr, phdr->p_memsz, phdr->p_filesz, phdr->p_type);
@@ -439,6 +441,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
             if (!mm_check_mapped((uint64_t)current_pcb->mm->pgd, virt_base)) // 未映射，则新增物理页
             {
                 mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+                memset((void*)virt_base, 0, PAGE_2M_SIZE);
             }
             pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
             int64_t val = 0;
@@ -461,6 +464,8 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     regs->rsp = current_pcb->mm->stack_start;
     regs->rbp = current_pcb->mm->stack_start;
     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+    // 清空栈空间
+    memset((void*)(current_pcb->mm->stack_start - PAGE_2M_SIZE), 0, PAGE_2M_SIZE);
 
 load_elf_failed:;
     if (buf != NULL)

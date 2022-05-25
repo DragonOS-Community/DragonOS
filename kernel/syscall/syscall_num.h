@@ -20,5 +20,6 @@
 #define SYS_VFORK 8
 #define SYS_BRK 9
 #define SYS_SBRK 10
+#define SYS_REBOOT 11   // 重启
 
 #define SYS_AHCI_END_REQ 255    // AHCI DMA请求结束end_request的系统调用

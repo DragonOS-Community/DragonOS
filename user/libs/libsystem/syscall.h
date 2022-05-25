@@ -14,6 +14,7 @@
 #define SYS_VFORK 8
 #define SYS_BRK 9
 #define SYS_SBRK 10
+#define SYS_REBOOT 11
 
 /**
  * @brief 用户态系统调用函数

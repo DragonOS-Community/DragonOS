@@ -2,6 +2,7 @@
 #include <libc/string.h>
 #include <libc/stdio.h>
 #include <libc/stddef.h>
+#include <libsystem/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
@@ -163,4 +164,7 @@ int shell_cmd_exec(int argc, char **argv) {}
  * @return int
  */
 // todo:
-int shell_cmd_reboot(int argc, char **argv) {}
+int shell_cmd_reboot(int argc, char **argv)
+{
+    return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0, 0, 0);
+}

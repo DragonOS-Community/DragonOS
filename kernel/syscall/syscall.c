@@ -442,6 +442,19 @@ uint64_t sys_sbrk(struct pt_regs *regs)
     return retval;
 }
 
+/**
+ * @brief 重启计算机
+ *
+ * @return 
+ */
+uint64_t sys_reboot(struct pt_regs *regs)
+{
+    // 重启计算机
+    io_out8(0x64, 0xfe);
+
+    return 0;
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();
@@ -469,5 +482,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [8] = sys_vfork,
         [9] = sys_brk,
         [10] = sys_sbrk,
-        [11 ... 254] = system_call_not_exists,
+        [11] = sys_reboot,
+        [12 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

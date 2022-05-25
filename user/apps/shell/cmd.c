@@ -141,11 +141,19 @@ int shell_cmd_cd(int argc, char **argv)
             return 0;
         }
         else
-            goto fail;; // 出错则直接忽略
+            goto fail;
+        ; // 出错则直接忽略
     }
     else
     {
-        int new_len = current_dir_len + dest_len;
+        int dest_offset = 0;
+        if (dest_len > 2)
+        {
+            if (argv[1][0] == '.' && argv[1][1] == '/') // 相对路径
+                dest_offset = 2;
+        }
+        
+        int new_len = current_dir_len + dest_len - dest_offset;
         // ======进入相对路径=====
         if (new_len >= SHELL_CWD_MAX_SIZE - 1)
         {
@@ -160,7 +168,7 @@ int shell_cmd_cd(int argc, char **argv)
 
         if (current_dir_len > 1)
             new_path[current_dir_len] = '/';
-        strcat(new_path, argv[1]);
+        strcat(new_path, argv[1] + dest_offset);
 
         if (chdir(new_path) == 0) // 成功切换目录
         {

@@ -65,7 +65,6 @@ static void main_loop(int kb_fd)
             printf("\n");
             if (cmd_num >= 0)
                 shell_run_built_in_command(cmd_num, argc, argv);
-
         }
         else
             printf("\n");
@@ -104,8 +103,20 @@ int shell_readline(int fd, char *buf)
 
         if (key)
         {
-            buf[count++] = key;
-            printf("%c", key);
+            if (key == '\b')
+            {
+                if (count > 0)
+                {
+                    buf[--count] = 0;
+                    printf("%c", '\b');
+                }
+            }
+            else
+            {
+                buf[count++] = key;
+
+                printf("%c", key);
+            }
         }
 
         // 输入缓冲区满了之后，直接返回

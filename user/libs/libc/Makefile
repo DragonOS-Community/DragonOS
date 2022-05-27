@@ -36,3 +36,6 @@ ctype.o: ctype.c
 
 string.o: string.c
 	gcc $(CFLAGS) -c string.c -o string.o
+
+dirent.o: dirent.c
+	gcc $(CFLAGS) -c dirent.c -o dirent.o

@@ -143,8 +143,12 @@ uint64_t sys_open(struct pt_regs *regs)
     if (dentry == NULL)
         return -ENOENT;
 
-    // 暂时认为目标是目录是一种错误
-    if (dentry->dir_inode->attribute == VFS_ATTR_DIR)
+    // 要求打开文件夹而目标不是文件夹
+    if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_ATTR_DIR))
+        return -ENOTDIR;
+
+    // 要找的目标是文件夹
+    if ((flags & O_DIRECTORY) && dentry->dir_inode->attribute == VFS_ATTR_DIR)
         return -EISDIR;
 
     // todo: 引入devfs后删除这段代码
@@ -485,7 +489,6 @@ uint64_t sys_chdir(struct pt_regs *regs)
     // 计算输入的路径长度
     int dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
 
-
     // 长度小于等于0
     if (dest_path_len <= 0)
         return -EFAULT;
@@ -503,7 +506,6 @@ uint64_t sys_chdir(struct pt_regs *regs)
     // 将字符串从用户空间拷贝进来, +1是为了拷贝结尾的\0
     strncpy_from_user(path, dest_path, dest_path_len + 1);
 
-
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
 
     kfree(path);
@@ -516,6 +518,35 @@ uint64_t sys_chdir(struct pt_regs *regs)
         return -ENOTDIR;
 
     return 0;
+}
+
+/**
+ * @brief 获取目录中的数据
+ *
+ * @param fd 文件描述符号
+ * @return uint64_t
+ */
+uint64_t sys_getdents(struct pt_regs *regs)
+{
+    int fd = (int)regs->r8;
+    void *dirent = (void *)regs->r9;
+    long count = (long)regs->r10;
+
+    if (fd < 0 || fd > PROC_MAX_FD_NUM)
+        return -EBADF;
+
+    if (count < 0)
+        return -EINVAL;
+
+    struct vfs_file_t *filp = current_pcb->fds[fd];
+    if (filp == NULL)
+        return -EBADF;
+
+    uint64_t retval = 0;
+    if (filp->file_ops && filp->file_ops->readdir)
+        retval = filp->file_ops->readdir(filp, dirent, &vfs_fill_dentry);
+
+    return retval;
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)
@@ -547,5 +578,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [10] = sys_sbrk,
         [11] = sys_reboot,
         [12] = sys_chdir,
-        [13 ... 254] = system_call_not_exists,
+        [13] = sys_getdents,
+        [14 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

@@ -124,6 +124,12 @@ struct vfs_dir_entry_operations_t
     long (*iput)(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode);
 };
 
+/**
+ * @brief 填充dirent的函数指针的类型定义
+ *
+ */
+typedef int (*vfs_filldir_t)(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset);
+
 struct vfs_file_operations_t
 {
     long (*open)(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr);
@@ -132,6 +138,8 @@ struct vfs_file_operations_t
     long (*write)(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position);
     long (*lseek)(struct vfs_file_t *file_ptr, long offset, long origin);
     long (*ioctl)(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg);
+
+    long (*readdir)(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler); // 读取文件夹
 };
 
 /**
@@ -162,3 +170,9 @@ struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, 
  * @return struct vfs_dir_entry_t* 目录项
  */
 struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags);
+
+/**
+ * @brief 填充dentry
+ * 
+ */
+int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset);

@@ -155,9 +155,9 @@ typedef struct fat32_partition_info_t fat32_sb_info_t;
 
 struct fat32_inode_info_t
 {
-    uint64_t first_clus;
-    uint64_t dEntry_location_clus;        // dEntry struct in cluster (0 is root, 1 is invalid)
-    uint64_t dEntry_location_clus_offset; // dEntry struct offset in cluster
+    uint64_t first_clus;    // 文件的起始簇号
+    uint64_t dEntry_location_clus;        // fat entry的起始簇号 dEntry struct in cluster (0 is root, 1 is invalid)
+    uint64_t dEntry_location_clus_offset; // fat entry在起始簇中的偏移量(是第几个entry) dEntry struct offset in cluster
 
     uint16_t create_date;
     uint16_t create_time;
@@ -190,3 +190,13 @@ struct vfs_superblock_t *fat32_read_superblock(void *DPTE, uint8_t DPT_type, voi
 long fat32_create(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dentry, int mode);
 
 void fat32_init();
+
+/**
+ * @brief 读取文件夹(在指定目录中找出有效目录项)
+ *
+ * @param file_ptr 文件结构体指针
+ * @param dirent 返回的dirent
+ * @param filler 填充dirent的函数
+ * @return int64_t
+ */
+int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler);

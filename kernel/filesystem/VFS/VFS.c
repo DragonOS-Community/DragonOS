@@ -135,3 +135,12 @@ struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags)
         parent = dentry;
     }
 }
+
+/**
+ * @brief 填充dentry
+ * 
+ */
+int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset)
+{
+    
+}

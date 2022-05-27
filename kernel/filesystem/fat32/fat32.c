@@ -347,7 +347,7 @@ find_lookup_success:; // 找到目标dentry
     // todo: 引入devfs后删除这段代码
     if ((tmp_dEntry->DIR_FstClusHI >> 12) && (p->attribute & VFS_ATTR_FILE))
         p->attribute |= VFS_ATTR_DEVICE;
-    
+
     dest_dentry->dir_inode = p;
     kfree(buf);
     return dest_dentry;
@@ -868,6 +868,7 @@ struct vfs_file_operations_t fat32_file_ops =
         .write = fat32_write,
         .lseek = fat32_lseek,
         .ioctl = fat32_ioctl,
+        .readdir = fat32_readdir,
 };
 
 // todo: create
@@ -898,6 +899,180 @@ int64_t fat32_getAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr)
 // todo: setAttr
 int64_t fat32_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr)
 {
+}
+/**
+ * @brief 读取文件夹(在指定目录中找出有效目录项)
+ *
+ * @param file_ptr 文件结构体指针
+ * @param dirent 返回的dirent
+ * @param filler 填充dirent的函数
+ * @return int64_t
+ */
+int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler)
+{
+    struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)file_ptr->dEntry->dir_inode->private_inode_info;
+    fat32_sb_info_t *fsbi = (fat32_sb_info_t *)file_ptr->dEntry->dir_inode->sb->private_sb_info;
+
+    unsigned char *buf = (unsigned char *)kmalloc(fsbi->bytes_per_clus, 0);
+    uint32_t cluster = finode->first_clus;
+
+    // 当前文件指针所在位置的簇号（文件内偏移量）
+    int clus_num = file_ptr->position / fsbi->bytes_per_clus;
+
+    // 循环读取fat entry，直到读取到文件当前位置的所在簇号
+    for (int i = 0; i < clus_num; ++i)
+    {
+        cluster = fat32_read_FAT_entry(fsbi, cluster);
+        if (cluster > 0x0ffffff7) // 文件结尾
+        {
+            kerror("file position out of range! (cluster not exists)");
+            return NULL;
+        }
+    }
+
+    char *dir_name = NULL;
+    int name_len = 0;
+    // ==== 此时已经将文件夹的目录项起始簇的簇号读取到cluster变量中 ===
+    while (cluster <= 0x0ffffff7) // cluster在循环末尾更新（如果当前簇已经没有短目录项的话）
+    {
+        // 计算文件夹当前位置所在簇的起始扇区号
+        uint64_t sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
+        // 读取文件夹目录项当前位置起始扇区的数据
+        if (AHCI_SUCCESS != ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num))
+        {
+            // 读取失败
+            kerror("Failed to read the file's first sector.");
+            kfree(buf);
+            return NULL;
+        }
+
+        struct fat32_Directory_t *dentry = NULL;
+        struct fat32_LongDirectory_t *long_dentry = NULL;
+
+        // 找到当前短目录项
+        dentry = (struct fat32_Directory_t *)(buf + file_ptr->position % fsbi->bytes_per_clus);
+
+        name_len = 0;
+        // 逐个查找短目录项
+        for (int i = file_ptr->position % fsbi->bytes_per_clus; i < fsbi->bytes_per_clus; i += 32, file_ptr->position += 32, ++dentry)
+        {
+            // 若是长目录项则跳过
+            if (dentry->DIR_Attr == ATTR_LONG_NAME)
+                continue;
+            // 跳过无效表项、空闲表项
+            if (dentry->DIR_Name[0] == 0xe5 || dentry->DIR_Name[0] == 0x00 || dentry->DIR_Name[0] == 0x05)
+                continue;
+
+            // 找到短目录项
+            // 该短目录项对应的第一个长目录项
+            long_dentry = (struct fat32_LongDirectory_t *)(dentry - 1);
+
+            // 如果长目录项有效，则读取长目录项
+            if (long_dentry->LDIR_Attr == ATTR_LONG_NAME && long_dentry->LDIR_Ord != 0xe5 && long_dentry->LDIR_Ord != 0x00 && long_dentry->LDIR_Ord != 0x05)
+            {
+                int count_long_dentry = 0;
+                // 统计长目录项的个数
+                while (long_dentry->LDIR_Attr == ATTR_LONG_NAME && long_dentry->LDIR_Ord != 0xe5 && long_dentry->LDIR_Ord != 0x00 && long_dentry->LDIR_Ord != 0x05)
+                {
+                    ++count_long_dentry;
+                    if (long_dentry->LDIR_Ord & 0x40) // 最后一个长目录项
+                        break;
+                    --long_dentry;
+                }
+                // 为目录名分配空间
+                dir_name = (char *)kmalloc(count_long_dentry * 26 + 1, 0);
+                memset(dir_name, 0, count_long_dentry * 26 + 1);
+
+                // 重新将长目录项指针指向第一个长目录项
+                long_dentry = (struct fat32_LongDirectory_t *)(dentry - 1);
+                name_len = 0;
+                // 逐个存储文件名
+                for (int j = 0; j < count_long_dentry; ++j, --long_dentry)
+                {
+                    // 存储name1
+                    for (int k = 0; k < 5; ++k)
+                    {
+                        if (long_dentry->LDIR_Name1[k] != 0xffff && long_dentry->LDIR_Name1[k] != 0x0000)
+                            dir_name[name_len++] = (char)long_dentry->LDIR_Name1[k];
+                    }
+
+                    // 存储name2
+                    for (int k = 0; k < 6; ++k)
+                    {
+                        if (long_dentry->LDIR_Name2[k] != 0xffff && long_dentry->LDIR_Name2[k] != 0x0000)
+                            dir_name[name_len++] = (char)long_dentry->LDIR_Name2[k];
+                    }
+
+                    // 存储name3
+                    for (int k = 0; k < 2; ++k)
+                    {
+                        if (long_dentry->LDIR_Name3[k] != 0xffff && long_dentry->LDIR_Name3[k] != 0x0000)
+                            dir_name[name_len++] = (char)long_dentry->LDIR_Name3[k];
+                    }
+                }
+
+                // 读取目录项成功，返回
+                goto find_dir_success;
+            }
+            else // 不存在长目录项
+            {
+                dir_name = (char *)kmalloc(15, 0);
+                memset(dir_name, 0, 15);
+
+                name_len = 0;
+                int total_len = 0;
+                // 读取基础名
+                for (int j = 0; j < 8; ++j, ++total_len)
+                {
+                    if (dentry->DIR_Name[j] == ' ')
+                        break;
+
+                    if (dentry->DIR_NTRes & LOWERCASE_BASE) // 如果标记了文件名小写，则转换为小写字符
+                        dir_name[name_len++] = dentry->DIR_Name[j] + 32;
+                    else
+                        dir_name[name_len++] = dentry->DIR_Name[j];
+                }
+
+                // 如果当前短目录项为文件夹，则直接返回，不需要读取扩展名
+                if (dentry->DIR_Attr & ATTR_DIRECTORY)
+                    goto find_dir_success;
+
+                // 是文件，增加  .
+                dir_name[name_len++] = '.';
+
+                // 读取扩展名
+                // 读取基础名
+                for (int j = 0; j < 3; ++j, ++total_len)
+                {
+                    if (dentry->DIR_Name[j] == ' ')
+                        break;
+
+                    if (dentry->DIR_NTRes & LOWERCASE_BASE) // 如果标记了文件名小写，则转换为小写字符
+                        dir_name[name_len++] = dentry->DIR_Name[j] + 32;
+                    else
+                        dir_name[name_len++] = dentry->DIR_Name[j];
+                }
+
+                if (total_len == 8) // 没有扩展名
+                    dir_name[--name_len] = '\0';
+
+                goto find_dir_success;
+            }
+        }
+
+        // 当前簇不存在目录项
+        cluster = fat32_read_FAT_entry(fsbi, cluster);
+    }
+
+    kfree(buf);
+    // 在上面的循环中读取到目录项结尾了，仍没有找到
+    return NULL;
+
+find_dir_success:;
+    // 将文件夹位置坐标加32（即指向下一个目录项）
+    file_ptr->position += 32;
+    // todo: 计算ino_t
+    return filler(dirent, 0, dir_name, name_len, 0, 0);
 }
 
 struct vfs_inode_operations_t fat32_inode_ops =

@@ -22,5 +22,6 @@
 #define SYS_SBRK 10
 #define SYS_REBOOT 11   // 重启
 #define SYS_CHDIR 12    // 切换工作目录
+#define SYS_GET_DENTS 13 // 获取目录中的数据
 
 #define SYS_AHCI_END_REQ 255    // AHCI DMA请求结束end_request的系统调用

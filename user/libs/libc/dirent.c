@@ -17,10 +17,15 @@ struct DIR *opendir(const char *path)
 {
     int fd = open(path, O_DIRECTORY);
     if (fd < 0) // 目录打开失败
+    {
+        printf("Failed to open dir\n");
         return NULL;
+    }
+    // printf("open dir: %s\n", path);
 
     // 分配DIR结构体
     struct DIR *dirp = (struct DIR *)malloc(sizeof(struct DIR));
+    // printf("dirp = %#018lx", dirp);
     memset(dirp, 0, sizeof(struct DIR));
     dirp->fd = fd;
     dirp->buf_len = DIR_BUF_SIZE;
@@ -59,11 +64,13 @@ int64_t getdents(int fd, struct dirent *dirent, long count)
  * @param dir
  * @return struct dirent*
  */
-struct dirent *reaaddir(struct DIR *dir)
+struct dirent *readdir(struct DIR *dir)
 {
-    memset(dir, 0, DIR_BUF_SIZE);
+    // printf("dir->buf = %#018lx\n", (dir->buf));
+    memset((dir->buf), 0, DIR_BUF_SIZE);
+    // printf("memeset_ok\n");
     int len = getdents(dir->fd, (struct dirent *)dir->buf, DIR_BUF_SIZE);
-
+    // printf("len=%d\n", len);
     if (len > 0)
         return (struct dirent *)dir->buf;
     else

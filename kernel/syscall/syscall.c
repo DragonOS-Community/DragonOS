@@ -110,7 +110,7 @@ uint64_t sys_open(struct pt_regs *regs)
 
     char *filename = (char *)(regs->r8);
     int flags = (int)(regs->r9);
-    kdebug("filename=%s", filename);
+    // kdebug("filename=%s", filename);
 
     long path_len = strnlen_user(filename, PAGE_4K_SIZE) + 1;
 
@@ -134,10 +134,10 @@ uint64_t sys_open(struct pt_regs *regs)
     // 寻找文件
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
 
-    if (dentry != NULL)
-        printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
-    else
-        printk_color(ORANGE, BLACK, "Can`t find file\n");
+    // if (dentry != NULL)
+    //     printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
+    // else
+    //     printk_color(ORANGE, BLACK, "Can`t find file\n");
 
     kfree(path);
     if (dentry == NULL)
@@ -236,7 +236,7 @@ uint64_t sys_close(struct pt_regs *regs)
 {
     int fd_num = (int)regs->r8;
 
-    kdebug("sys close: fd=%d", fd_num);
+    // kdebug("sys close: fd=%d", fd_num);
     // 校验文件描述符范围
     if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
         return -EBADF;

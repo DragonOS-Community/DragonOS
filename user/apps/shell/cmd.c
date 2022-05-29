@@ -8,6 +8,8 @@
 #include <libc/unistd.h>
 #include <libc/stdlib.h>
 
+#include <libc/dirent.h>
+
 #include "cmd_help.h"
 
 // 当前工作目录（在main_loop中初始化）
@@ -152,7 +154,7 @@ int shell_cmd_cd(int argc, char **argv)
             if (argv[1][0] == '.' && argv[1][1] == '/') // 相对路径
                 dest_offset = 2;
         }
-        
+
         int new_len = current_dir_len + dest_len - dest_offset;
         // ======进入相对路径=====
         if (new_len >= SHELL_CWD_MAX_SIZE - 1)
@@ -201,6 +203,34 @@ done:;
 // todo:
 int shell_cmd_ls(int argc, char **argv)
 {
+    struct DIR *dir = opendir(shell_current_path);
+    
+    if (dir == NULL)
+        return -1;
+
+    struct dirent *buf = NULL;
+    // printf("dir=%#018lx\n", dir);
+
+    while (1)
+    {
+        buf = readdir(dir);
+        if(buf == NULL)
+            break;
+        
+        int color = COLOR_WHITE;
+        if(buf->d_type & VFS_ATTR_DIR)
+            color = COLOR_YELLOW;
+        else if(buf->d_type & VFS_ATTR_FILE)
+            color = COLOR_INDIGO;
+        
+        char output_buf[256] = {0};
+
+        sprintf(output_buf, "%s   ", buf->d_name);
+        put_string(output_buf, color, COLOR_BLACK);
+        
+    }
+    printf("\n");
+    closedir(dir);
     return 0;
 }
 

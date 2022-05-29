@@ -1,5 +1,8 @@
 #include "VFS.h"
 #include <common/kprint.h>
+#include <common/dirent.h>
+#include <common/errno.h>
+#include <mm/mm.h>
 #include <mm/slab.h>
 
 // 为filesystem_type_t结构体实例化一个链表头
@@ -138,9 +141,27 @@ struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags)
 
 /**
  * @brief 填充dentry
- * 
+ *
  */
 int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset)
 {
-    
+    struct dirent *dent = (struct dirent *)buf;
+
+    // 如果尝试访问内核空间，则返回错误
+    if (!(verify_area((uint64_t)buf, sizeof(struct dirent) + namelen)))
+        return -EFAULT;
+
+    // ====== 填充dirent结构体 =====
+    memset(buf, 0, sizeof(struct dirent) + namelen);
+
+    memcpy(dent->d_name, name, namelen);
+    dent->d_name[namelen] = '\0';
+    // 暂时不显示目录下的记录数
+    dent->d_reclen = 0;
+    dent->d_ino = d_ino;
+    dent->d_off = offset;
+    dent->d_type = type;
+
+    // 返回dirent的总大小
+    return sizeof(struct dirent) + namelen;
 }

@@ -930,6 +930,8 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
         }
     }
 
+    uint64_t dentry_type = 0; // 传递给filler的dentry类型数据
+
     char *dir_name = NULL;
     int name_len = 0;
     // ==== 此时已经将文件夹的目录项起始簇的簇号读取到cluster变量中 ===
@@ -1012,6 +1014,7 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
                 }
 
                 // 读取目录项成功，返回
+                dentry_type = dentry->DIR_Attr;
                 goto find_dir_success;
             }
             else // 不存在长目录项
@@ -1035,7 +1038,10 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
 
                 // 如果当前短目录项为文件夹，则直接返回，不需要读取扩展名
                 if (dentry->DIR_Attr & ATTR_DIRECTORY)
+                {
+                    dentry_type = dentry->DIR_Attr;
                     goto find_dir_success;
+                }
 
                 // 是文件，增加  .
                 dir_name[name_len++] = '.';
@@ -1056,6 +1062,7 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
                 if (total_len == 8) // 没有扩展名
                     dir_name[--name_len] = '\0';
 
+                dentry_type = dentry->DIR_Attr;
                 goto find_dir_success;
             }
         }
@@ -1072,7 +1079,12 @@ find_dir_success:;
     // 将文件夹位置坐标加32（即指向下一个目录项）
     file_ptr->position += 32;
     // todo: 计算ino_t
-    return filler(dirent, 0, dir_name, name_len, 0, 0);
+    if(dentry_type & ATTR_DIRECTORY)
+        dentry_type = VFS_ATTR_DIR;
+    else
+        dentry_type = VFS_ATTR_FILE;
+    
+    return filler(dirent, 0, dir_name, name_len, dentry_type, 0);
 }
 
 struct vfs_inode_operations_t fat32_inode_ops =

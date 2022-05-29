@@ -1,6 +1,15 @@
 #pragma once
 #include <libc/sys/types.h>
 
+
+/**
+ * @brief 目录项的属性（copy from vfs.h）
+ *
+ */
+#define VFS_ATTR_FILE (1UL << 0)
+#define VFS_ATTR_DIR (1UL << 1)
+#define VFS_ATTR_DEVICE (1UL << 2)
+
 #define DIR_BUF_SIZE 256
 /**
  * @brief 文件夹结构体
@@ -22,7 +31,7 @@ struct dirent
     off_t d_off;    // dir偏移量
     unsigned short d_reclen;    // 目录下的记录数
     unsigned char d_type;   // entry的类型
-    char d_name[256];   // 文件entry的名字
+    char d_name[];   // 文件entry的名字(是一个零长数组)
 };
 
 /**
@@ -54,4 +63,4 @@ int closedir(struct DIR *dirp);
  * @param dir 
  * @return struct dirent* 
  */
-struct dirent* reaaddir(struct DIR* dir);
+struct dirent* readdir(struct DIR* dir);

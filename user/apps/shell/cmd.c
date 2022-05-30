@@ -7,7 +7,7 @@
 #include <libc/errno.h>
 #include <libc/unistd.h>
 #include <libc/stdlib.h>
-
+#include <libc/fcntl.h>
 #include <libc/dirent.h>
 
 #include "cmd_help.h"
@@ -200,11 +200,10 @@ done:;
  * @param argv
  * @return int
  */
-// todo:
 int shell_cmd_ls(int argc, char **argv)
 {
     struct DIR *dir = opendir(shell_current_path);
-    
+
     if (dir == NULL)
         return -1;
 
@@ -214,23 +213,26 @@ int shell_cmd_ls(int argc, char **argv)
     while (1)
     {
         buf = readdir(dir);
-        if(buf == NULL)
+        if (buf == NULL)
             break;
-        
+
         int color = COLOR_WHITE;
-        if(buf->d_type & VFS_ATTR_DIR)
+        if (buf->d_type & VFS_ATTR_DIR)
             color = COLOR_YELLOW;
-        else if(buf->d_type & VFS_ATTR_FILE)
+        else if (buf->d_type & VFS_ATTR_FILE)
             color = COLOR_INDIGO;
-        
+
         char output_buf[256] = {0};
 
         sprintf(output_buf, "%s   ", buf->d_name);
         put_string(output_buf, color, COLOR_BLACK);
-        
     }
     printf("\n");
     closedir(dir);
+
+    if (argc > 1)
+        free(argv);
+
     return 0;
 }
 
@@ -245,8 +247,8 @@ int shell_cmd_pwd(int argc, char **argv)
 {
     if (shell_current_path)
         printf("%s\n", shell_current_path);
-
-    free(argv);
+    if (argc > 1)
+        free(argv);
 }
 
 /**
@@ -256,8 +258,47 @@ int shell_cmd_pwd(int argc, char **argv)
  * @param argv
  * @return int
  */
-// todo:
-int shell_cmd_cat(int argc, char **argv) {}
+int shell_cmd_cat(int argc, char **argv)
+{
+    int cwd_len = strlen(shell_current_path);
+
+    // 计算文件完整路径的长度
+    int file_path_len = cwd_len + strlen(argv[1]);
+
+    char *file_path = (char *)malloc(file_path_len + 2);
+
+    memset(file_path, 0, file_path_len + 2);
+
+    strcpy(file_path, shell_current_path);
+
+    // 在文件路径中加入斜杠
+    if (cwd_len > 1)
+        file_path[cwd_len] = '/';
+
+    // 拼接完整路径
+    strcat(file_path, argv[1]);
+
+    // 打开文件
+    int fd = open(file_path, 0);
+    // 获取文件总大小
+    int file_size = lseek(fd, 0, SEEK_END);
+    // 将文件指针切换回文件起始位置
+    lseek(fd, 0, SEEK_SET);
+
+    char *buf = (char *)malloc(512);
+    memset(buf, 0, 512);
+    while (file_size > 0)
+    {
+        int l = read(fd, buf, 511);
+        buf[l] = '\0';
+
+        file_size -= l;
+        printf("%s", buf);
+    }
+
+    close(fd);
+    free(buf);
+}
 
 /**
  * @brief 创建空文件的命令

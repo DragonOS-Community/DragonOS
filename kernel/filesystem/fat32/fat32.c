@@ -336,8 +336,8 @@ find_lookup_success:; // 找到目标dentry
     finode->first_clus = ((tmp_dEntry->DIR_FstClusHI << 16) | tmp_dEntry->DIR_FstClusLO) & 0x0fffffff;
     finode->dEntry_location_clus = cluster;
     finode->dEntry_location_clus_offset = tmp_dEntry - (struct fat32_Directory_t *)buf; //计算dentry的偏移量
-    kdebug("finode->dEntry_location_clus=%#018lx", finode->dEntry_location_clus);
-    kdebug("finode->dEntry_location_clus_offset=%#018lx", finode->dEntry_location_clus_offset);
+    // kdebug("finode->dEntry_location_clus=%#018lx", finode->dEntry_location_clus);
+    // kdebug("finode->dEntry_location_clus_offset=%#018lx", finode->dEntry_location_clus_offset);
     finode->create_date = tmp_dEntry->DIR_CrtDate;
     finode->create_time = tmp_dEntry->DIR_CrtTime;
     finode->write_date = tmp_dEntry->DIR_WrtDate;
@@ -1079,11 +1079,11 @@ find_dir_success:;
     // 将文件夹位置坐标加32（即指向下一个目录项）
     file_ptr->position += 32;
     // todo: 计算ino_t
-    if(dentry_type & ATTR_DIRECTORY)
+    if (dentry_type & ATTR_DIRECTORY)
         dentry_type = VFS_ATTR_DIR;
     else
         dentry_type = VFS_ATTR_FILE;
-    
+
     return filler(dirent, 0, dir_name, name_len, dentry_type, 0);
 }
 

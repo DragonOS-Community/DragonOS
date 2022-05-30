@@ -1,5 +1,6 @@
 #include "cmd_help.h"
 #include <libc/stdio.h>
+#include <libc/stdlib.h>
 struct help_table_item_t
 {
     void (*func)();
@@ -10,11 +11,14 @@ struct help_table_item_t help_table[] = {
 
 static const int help_table_num = sizeof(help_table) / sizeof(struct help_table_item_t);
 
-void shell_help()
+int shell_help(int argc, char **argv)
 {
     printf("Help:\n");
     for (int i = 0; i < help_table_num; ++i)
         help_table[i].func();
+    
+    if(argc > 1)
+        free(argv);
 }
 
 void shell_help_cd()

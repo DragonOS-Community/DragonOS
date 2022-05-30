@@ -28,7 +28,16 @@ int strcmp(const char *FirstPart, const char *SecondPart);
  * @param Count 字节数
  * @return char*
  */
-char *strncpy(char *dst, char *src, long Count);
+char *strncpy(char *dst, const char *src, size_t Count);
+
+/**
+ * @brief 拷贝整个字符串
+ * 
+ * @param dst 目标地址
+ * @param src 源地址
+ * @return char* 目标字符串
+ */
+char* strcpy(char* dst, const char* src);
 
 /**
  * @brief 拼接两个字符串（将src接到dest末尾）

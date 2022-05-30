@@ -59,13 +59,13 @@ void *memset(void *dst, unsigned char C, uint64_t size)
 
 /**
  * @brief 拷贝指定字节数的字符串
- * 
+ *
  * @param dst 目标地址
  * @param src 源字符串
  * @param Count 字节数
- * @return char* 
+ * @return char*
  */
-char *strncpy(char *dst, char *src, long Count)
+char *strncpy(char *dst, const char *src, size_t Count)
 {
     __asm__ __volatile__("cld	\n\t"
                          "1:	\n\t"
@@ -86,24 +86,31 @@ char *strncpy(char *dst, char *src, long Count)
 
 /**
  * @brief 拼接两个字符串（将src接到dest末尾）
- * 
+ *
  * @param dest 目标串
  * @param src 源串
- * @return char* 
+ * @return char*
  */
 char *strcat(char *dest, const char *src)
 {
-    unsigned int dest_size = strlen(dest);
-    unsigned int src_size = strlen(src);
-
-    char *d = dest;
-
-    for (size_t i = 0; i < src_size; i++)
-    {
-        d[dest_size + i] = src[i];
-    }
-
-    d[dest_size + src_size] = '\0';
-
+    strcpy(dest + strlen(dest), src);
     return dest;
+}
+
+/**
+ * @brief 拷贝整个字符串
+ *
+ * @param dst 目标地址
+ * @param src 源地址
+ * @return char* 目标字符串
+ */
+char *strcpy(char *dst, const char *src)
+{
+    while (*src)
+    {
+        *(dst++) = *(src++);
+    }
+    *dst = 0;
+
+    return dst;
 }

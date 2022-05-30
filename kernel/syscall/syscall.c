@@ -340,7 +340,7 @@ uint64_t sys_lseek(struct pt_regs *regs)
     long offset = (long)regs->r9;
     int whence = (int)regs->r10;
 
-    kdebug("sys_lseek: fd=%d", fd_num);
+    // kdebug("sys_lseek: fd=%d", fd_num);
     uint64_t retval = 0;
 
     // 校验文件描述符范围

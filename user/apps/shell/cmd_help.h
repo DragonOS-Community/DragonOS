@@ -1,7 +1,7 @@
 #pragma once
 
 #include "cmd.h"
-void shell_help();
+int shell_help(int argc, char **argv);
 
 /**
  * @brief cd命令的帮助信息

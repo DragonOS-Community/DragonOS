@@ -448,14 +448,15 @@ void apic_init()
 void do_IRQ(struct pt_regs *rsp, ul number)
 {
 
-    if (number < 0x80) // 以0x80为界限，低于0x80的是外部中断控制器，高于0x80的是Local APIC
+    if (number < 0x80 && number >= 32) // 以0x80为界限，低于0x80的是外部中断控制器，高于0x80的是Local APIC
 
     // 外部中断控制器
     {
+
         irq_desc_t *irq = &interrupt_desc[number - 32];
 
         // 执行中断上半部处理程序
-        if (irq->handler != NULL)
+        if (irq != NULL && irq->handler != NULL)
             irq->handler(number, irq->parameter, rsp);
         else
             kwarn("Intr vector [%d] does not have a handler!");

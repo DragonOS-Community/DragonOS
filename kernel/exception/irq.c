@@ -207,9 +207,9 @@ void irq_init()
     init_8259A();
 #else
 
+    memset((void *)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
     apic_init();
 
-    memset((void *)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
 
 #endif
 }

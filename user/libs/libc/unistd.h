@@ -80,3 +80,12 @@ void *sbrk(int64_t increment);
  * @return int64_t 成功：0,失败：负值（错误码）
  */
 int64_t chdir(char *dest_path);
+
+/**
+ * @brief 执行新的程序
+ * 
+ * @param path 文件路径
+ * @param argv 参数列表
+ * @return int 
+ */
+int execv(const char* path, char * const argv[]);

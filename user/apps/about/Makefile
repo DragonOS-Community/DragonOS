@@ -1,0 +1,7 @@
+all: about.o
+
+	ld -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/about  $(shell find . -name "*.o") $(shell find $(sys_libs_dir) -name "*.o") -T shell.lds
+
+	objcopy -I elf64-x86-64 -S -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/about $(output_dir)/about.elf
+about.o: about.c
+	gcc $(CFLAGS) -c about.c  -o about.o

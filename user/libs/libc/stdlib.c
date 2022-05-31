@@ -1,6 +1,7 @@
 #include <libc/unistd.h>
 #include <libc/stdlib.h>
 #include <libc/ctype.h>
+#include <libsystem/syscall.h>
 
 int abs(int i)
 {
@@ -43,4 +44,14 @@ int atoi(const char *str)
     }
 
     return neg ? n : -n;
+}
+
+/**
+ * @brief 退出进程
+ *
+ * @param status
+ */
+void exit(int status)
+{
+    syscall_invoke(SYS_EXIT, status, 0, 0, 0, 0, 0, 0, 0);
 }

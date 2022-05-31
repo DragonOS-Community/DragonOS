@@ -9,6 +9,7 @@
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/VFS/VFS.h>
 #include <driver/keyboard/ps2_keyboard.h>
+#include <process/process.h>
 
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
@@ -440,8 +441,9 @@ uint64_t sys_sbrk(struct pt_regs *regs)
         if ((__int128_t)current_pcb->mm->brk_end + (__int128_t)regs->r8 < current_pcb->mm->brk_start)
             return retval;
     }
+    // kdebug("do brk");
     uint64_t new_brk = mm_do_brk(current_pcb->mm->brk_end, (int64_t)regs->r8); // 调整堆内存空间
-
+    // kdebug("do brk done, new_brk = %#018lx", new_brk);
     current_pcb->mm->brk_end = new_brk;
     return retval;
 }
@@ -549,6 +551,110 @@ uint64_t sys_getdents(struct pt_regs *regs)
     return retval;
 }
 
+/**
+ * @brief 执行新的程序
+ *
+ * @param user_path(r8寄存器) 文件路径
+ * @param argv(r9寄存器) 参数列表
+ * @return uint64_t
+ */
+uint64_t sys_execve(struct pt_regs *regs)
+{
+    kdebug("sys_execve");
+    char *user_path = (char *)regs->r8;
+    char **argv = (char **)regs->r9;
+
+    int path_len = strnlen_user(user_path, PAGE_4K_SIZE);
+
+    kdebug("path_len=%d", path_len);
+    if (path_len >= PAGE_4K_SIZE)
+        return -ENAMETOOLONG;
+    else if (path_len <= 0)
+        return -EFAULT;
+
+    char *path = (char *)kmalloc(path_len + 1, 0);
+    if (path == NULL)
+        return -ENOMEM;
+
+    memset(path, 0, path_len + 1);
+
+    kdebug("before copy file path from user");
+    // 拷贝文件路径
+    strncpy_from_user(path, user_path, path_len);
+    path[path_len] = '\0';
+
+    kdebug("before do_execve, path = %s", path);
+    // 执行新的程序
+    uint64_t retval = do_execve(regs, path, argv, NULL);
+
+    kfree(path);
+    return retval;
+}
+
+/**
+ * @brief 等待进程退出
+ *
+ * @param pid 目标进程id
+ * @param status 返回的状态信息
+ * @param options 等待选项
+ * @param rusage
+ * @return uint64_t
+ */
+uint64_t sys_wait4(struct pt_regs *regs)
+{
+    uint64_t pid = regs->r8;
+    int *status = (int *)regs->r9;
+    int options = regs->r10;
+    void *rusage = regs->r11;
+
+    struct process_control_block *proc = NULL;
+    struct process_control_block *child_proc = NULL;
+
+    // 查找pid为指定值的进程
+    // ps: 这里判断子进程的方法没有按照posix 2008来写。
+    // todo: 根据进程树判断是否为当前进程的子进程
+    for (proc = &initial_proc_union.pcb; proc->next_pcb != &initial_proc_union.pcb; proc = proc->next_pcb)
+    {
+        if (proc->next_pcb->pid == pid)
+        {
+            child_proc = proc->next_pcb;
+            break;
+        }
+    }
+
+    if (child_proc == NULL)
+        return -ECHILD;
+
+    // 暂时不支持options选项，该值目前必须为0
+    if (options != 0)
+        return -EINVAL;
+
+    // 如果子进程没有退出，则等待其退出
+    while (child_proc->state != PROC_ZOMBIE)
+        wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
+
+    // 拷贝子进程的返回码
+    copy_to_user(status, child_proc->exit_code, sizeof(int));
+    proc->next_pcb = child_proc->next_pcb;
+
+    // 释放子进程的页表
+    process_exit_mm(child_proc);
+    // 释放子进程的pcb
+    kfree(child_proc);
+    return 0;
+}
+
+/**
+ * @brief 进程退出
+ * 
+ * @param exit_code 退出返回码
+ * @return uint64_t 
+ */
+uint64_t sys_exit(struct pt_regs * regs)
+{
+    return process_do_exit(regs->r8);
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();
@@ -579,5 +685,8 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [11] = sys_reboot,
         [12] = sys_chdir,
         [13] = sys_getdents,
-        [14 ... 254] = system_call_not_exists,
+        [14] = sys_execve,
+        [15] = sys_wait4,
+        [16] = sys_exit,
+        [17 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

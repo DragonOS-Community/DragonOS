@@ -9,6 +9,7 @@
 #include <libc/stdlib.h>
 #include <libc/fcntl.h>
 #include <libc/dirent.h>
+#include <libc/sys/wait.h>
 
 #include "cmd_help.h"
 
@@ -35,6 +36,36 @@ struct built_in_cmd_t shell_cmds[] =
 };
 // 总共的内建命令数量
 const static int total_built_in_cmd_num = sizeof(shell_cmds) / sizeof(struct built_in_cmd_t);
+
+/**
+ * @brief 将cwd与文件名进行拼接，得到最终的文件绝对路径
+ *
+ * @param filename 文件名
+ * @param result_path_len 结果字符串的大小
+ * @return char* 结果字符串
+ */
+static char *get_target_filepath(const char *filename, int *result_path_len)
+{
+    int cwd_len = strlen(shell_current_path);
+
+    // 计算文件完整路径的长度
+    *result_path_len = cwd_len + strlen(filename);
+
+    char *file_path = (char *)malloc(*result_path_len + 2);
+
+    memset(file_path, 0, *result_path_len + 2);
+
+    strcpy(file_path, shell_current_path);
+
+    // 在文件路径中加入斜杠
+    if (cwd_len > 1)
+        file_path[cwd_len] = '/';
+
+    // 拼接完整路径
+    strcat(file_path, filename);
+
+    return file_path;
+}
 
 /**
  * @brief 寻找对应的主命令编号
@@ -230,7 +261,7 @@ int shell_cmd_ls(int argc, char **argv)
     printf("\n");
     closedir(dir);
 
-    if (argc > 1)
+    if (argv != NULL)
         free(argv);
 
     return 0;
@@ -247,7 +278,7 @@ int shell_cmd_pwd(int argc, char **argv)
 {
     if (shell_current_path)
         printf("%s\n", shell_current_path);
-    if (argc > 1)
+    if (argv != NULL)
         free(argv);
 }
 
@@ -260,23 +291,8 @@ int shell_cmd_pwd(int argc, char **argv)
  */
 int shell_cmd_cat(int argc, char **argv)
 {
-    int cwd_len = strlen(shell_current_path);
-
-    // 计算文件完整路径的长度
-    int file_path_len = cwd_len + strlen(argv[1]);
-
-    char *file_path = (char *)malloc(file_path_len + 2);
-
-    memset(file_path, 0, file_path_len + 2);
-
-    strcpy(file_path, shell_current_path);
-
-    // 在文件路径中加入斜杠
-    if (cwd_len > 1)
-        file_path[cwd_len] = '/';
-
-    // 拼接完整路径
-    strcat(file_path, argv[1]);
+    int path_len = 0;
+    char *file_path = get_target_filepath(argv[1], &path_len);
 
     // 打开文件
     int fd = open(file_path, 0);
@@ -298,6 +314,8 @@ int shell_cmd_cat(int argc, char **argv)
 
     close(fd);
     free(buf);
+    if (argv != NULL)
+        free(argv);
 }
 
 /**
@@ -347,9 +365,36 @@ int shell_cmd_rmdir(int argc, char **argv) {}
  * @param argv
  * @return int
  */
+int shell_cmd_exec(int argc, char **argv)
+{
+    pid_t pid = fork();
+    int retval = 0;
+    printf("  pid=%d  \n",pid);
 
-// todo:
-int shell_cmd_exec(int argc, char **argv) {}
+    while(1);
+    if (pid == 0)
+    {
+        printf("child proc\n");
+        // 子进程
+        int path_len = 0;
+        char *file_path = get_target_filepath(argv[1], &path_len);
+        printf("before execv, path=%s\n", file_path);
+        execv(file_path, argv);
+        free(argv);
+        while(1);
+        exit(0);
+    }
+    else
+    {
+        printf("parent process wait for pid:[ %d ]\n", pid);
+        while(1);
+        waitpid(pid, &retval, 0);
+        printf("parent process wait pid [ %d ], exit code=%d\n", pid, retval);
+        free(argv);
+    }
+
+    while(1);
+}
 
 /**
  * @brief 重启命令

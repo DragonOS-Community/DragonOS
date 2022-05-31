@@ -33,3 +33,10 @@ long long llabs(long long i);
  * @return int 
  */
 int atoi(const char * str);
+
+/**
+ * @brief 退出进程
+ * 
+ * @param status 
+ */
+void exit(int status);

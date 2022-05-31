@@ -123,16 +123,26 @@ int64_t chdir(char *dest_path)
     }
     else
     {
-        int retval = syscall_invoke(SYS_CHDIR, (uint64_t)dest_path, 0,0,0,0,0,0,0);
-        if(retval == 0)
-        {
-            errno = 0;
-            return 0;
-        }
-        else
-        {
-            errno = retval;
-            return -1;
-        }
+        return syscall_invoke(SYS_CHDIR, (uint64_t)dest_path, 0, 0, 0, 0, 0, 0, 0);
     }
+}
+
+/**
+ * @brief 执行新的程序
+ *
+ * @param path 文件路径
+ * @param argv 参数列表
+ * @return int
+ */
+int execv(const char *path, char *const argv[])
+{
+    if (path == NULL)
+    {
+        errno = -ENOENT;
+        return -1;
+    }
+    int retval = syscall_invoke(SYS_EXECVE, (uint64_t)path, (uint64_t)argv, 0, 0, 0, 0, 0, 0);
+    if(retval != 0)
+        return -1;
+    else return 0;
 }

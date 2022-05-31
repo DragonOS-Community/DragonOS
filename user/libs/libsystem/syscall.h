@@ -14,9 +14,13 @@
 #define SYS_VFORK 8
 #define SYS_BRK 9
 #define SYS_SBRK 10
-#define SYS_REBOOT 11
+
+#define SYS_REBOOT 11   // 重启
 #define SYS_CHDIR 12    // 切换工作目录
 #define SYS_GET_DENTS 13 // 获取目录中的数据
+#define SYS_EXECVE 14 // 执行新的应用程序
+#define SYS_WAIT4 15 // 等待进程退出
+#define SYS_EXIT 16 // 进程退出
 
 /**
  * @brief 用户态系统调用函数

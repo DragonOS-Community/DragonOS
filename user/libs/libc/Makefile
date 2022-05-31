@@ -2,7 +2,7 @@ all: libc
 
 CFLAGS += -I .
 
-libc_sub_dirs=math
+libc_sub_dirs=math sys
 
 
 libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o string.o dirent.o

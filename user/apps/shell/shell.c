@@ -37,13 +37,22 @@ int parse_command(char *buf, int *argc, char ***argv);
  *
  * @param kb_fd 键盘文件描述符
  */
-static void main_loop(int kb_fd)
+void main_loop(int kb_fd)
 {
+
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
+    sbrk(24);
+    pid_t pid = fork();
+    int retval = 0;
+    
+
+    while (1)
+        printf("  @pid=%d  ", pid);
     // 初始化当前工作目录的路径
     shell_current_path = (char *)malloc(3);
-    memset(shell_current_path, 0, 3);
+
+        memset(shell_current_path, 0, 3);
     shell_current_path[0] = '/';
     shell_current_path[1] = '\0';
 
@@ -54,6 +63,7 @@ static void main_loop(int kb_fd)
         char **argv;
 
         printf("[DragonOS] %s # ", shell_current_path);
+
         memset(input_buffer, 0, INPUT_BUFFER_SIZE);
 
         // 循环读取每一行到buffer

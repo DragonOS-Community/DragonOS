@@ -17,6 +17,7 @@
 #include "ptrace.h"
 #include <common/errno.h>
 #include <filesystem/VFS/VFS.h>
+#include <process/wait_queue.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -134,6 +135,9 @@ struct process_control_block
 	struct process_control_block *next_pcb;
 	// 父进程的pcb
 	struct process_control_block *parent_pcb;
+
+	int32_t exit_code;						// 进程退出时的返回码
+	wait_queue_node_t wait_child_proc_exit; // 子进程退出等待队列
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐
@@ -159,7 +163,9 @@ union proc_union
 		.cpu_id = 0,                      \
 		.fds = {0},                       \
 		.next_pcb = &proc,                \
-		.parent_pcb = &proc               \
+		.parent_pcb = &proc,              \
+		.exit_code = 0,                   \
+		.wait_child_proc_exit = 0         \
 	}
 
 /**
@@ -279,6 +285,39 @@ struct process_control_block *process_get_pcb(long pid);
  * @param pcb 进程的pcb
  */
 void process_wakeup(struct process_control_block *pcb);
+
+/**
+ * @brief 使当前进程去执行新的代码
+ *
+ * @param regs 当前进程的寄存器
+ * @param path 可执行程序的路径
+ * @param argv 参数列表
+ * @param envp 环境变量
+ * @return ul 错误码
+ */
+ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[]);
+
+/**
+ * @brief 释放进程的页表
+ *
+ * @param pcb 要被释放页表的进程
+ * @return uint64_t
+ */
+uint64_t process_exit_mm(struct process_control_block *pcb);
+
+/**
+ * @brief 进程退出时执行的函数
+ *
+ * @param code 返回码
+ * @return ul
+ */
+ul process_do_exit(ul code);
+
+/**
+ * @brief 当子进程退出后向父进程发送通知
+ *
+ */
+void process_exit_notify();
 
 /**
  * @brief 切换页表

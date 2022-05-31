@@ -31,4 +31,4 @@ ENTRY(kernel_thread_func)
     movq	%rdx,	%rdi	   
     callq	*%rbx		   
     movq	%rax,	%rdi	   
-    callq	process_thread_do_exit		  
+    callq	process_do_exit		  

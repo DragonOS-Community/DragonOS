@@ -25,6 +25,17 @@ all:
     		cd ..;\
     done
 
+.PHONY: user
+user:
+	mkdir -p bin/user/
+	mkdir -p bin/tmp/
+	@list='./user'; for subdir in $$list; do \
+    		echo "make all in $$subdir";\
+    		cd $$subdir;\
+    		 $(MAKE) all;\
+    		cd ..;\
+	done
+
 .PHONY: clean
 clean:
 	@list='$(SUBDIRS)'; for subdir in $$list; do \

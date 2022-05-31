@@ -138,7 +138,7 @@ static int malloc_enlarge(int64_t size)
     }
 
     int64_t free_space = brk_max_addr - brk_managed_addr;
-
+    // printf("size=%ld\tfree_space=%ld\n", size, free_space);
     if (free_space < size) // 现有堆空间不足
     {
         if (sbrk(size - free_space) != (void *)(-1))
@@ -148,6 +148,8 @@ static int malloc_enlarge(int64_t size)
             put_string("malloc_enlarge(): no_mem\n", COLOR_YELLOW, COLOR_BLACK);
             return -ENOMEM;
         }
+
+        // printf("brk max addr = %#018lx\n", brk_max_addr);
     }
 
     // 扩展管理的堆空间

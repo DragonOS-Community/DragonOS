@@ -200,11 +200,8 @@ void ps2_keyboard_init()
     // 申请键盘循环队列缓冲区的内存
     kb_buf_ptr = (struct ps2_keyboard_input_buffer *)kmalloc(sizeof(struct ps2_keyboard_input_buffer), 0);
 
-    kb_buf_ptr->ptr_head = kb_buf_ptr->buffer;
-    kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer;
-    kb_buf_ptr->count = 0;
-
-    memset(kb_buf_ptr->buffer, 0, ps2_keyboard_buffer_size);
+    ps2_keyboard_reset_buffer(kb_buf_ptr);
+    
 
     // ======== 初始化中断RTE entry ==========
 
@@ -240,7 +237,10 @@ void ps2_keyboard_init()
 
     // 注册中断处理程序
     irq_register(PS2_KEYBOARD_INTR_VECTOR, &entry, &ps2_keyboard_handler, (ul)kb_buf_ptr, &ps2_keyboard_intr_controller, "ps/2 keyboard");
-    kdebug("kb registered.");
+
+    // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
+    io_in8(PORT_PS2_KEYBOARD_DATA);
+    kinfo("ps/2 keyboard registered.");
 }
 
 /**

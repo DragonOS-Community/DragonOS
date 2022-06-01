@@ -75,6 +75,7 @@ void sched_cfs()
             }
         }
         // kdebug("before switch, next.rip = %#018lx\tnext->gs=%#018lx", proc->thread->rip, proc->thread->gs);
+        // kdebug("currentpcb=%#018lx", (uint64_t)current_pcb);
         process_switch_mm(proc);
         switch_proc(current_pcb, proc);
     }

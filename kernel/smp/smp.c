@@ -91,9 +91,8 @@ void smp_init()
 
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
     uint64_t *global_CR3 = get_CR3();
-    for (int i = 0; i < 128; ++i)
+    for (int i = 0; i < 256; ++i)
     {
-
         *(ul *)(phys_2_virt(global_CR3) + i) = 0UL;
     }
 

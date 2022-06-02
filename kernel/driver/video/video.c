@@ -20,7 +20,7 @@ struct screen_info_t
 
 /**
  * @brief VBE帧缓存区的地址重新映射
- * 将帧缓存区映射到地址0xffff800003000000处
+ * 将帧缓存区映射到地址SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE处
  */
 void init_frame_buffer(bool level)
 {
@@ -42,7 +42,7 @@ void init_frame_buffer(bool level)
         sc_info.height = info.framebuffer_height;
 
         sc_info.length = 1UL * sc_info.width * sc_info.height;
-        mm_map_proc_page_table(global_CR3, true, sc_info.fb_vaddr, sc_info.fb_paddr, get_VBE_FB_length() << 2, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        mm_map_proc_page_table(global_CR3, true, sc_info.fb_vaddr, sc_info.fb_paddr, get_VBE_FB_length() << 2, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true);
         set_pos_VBE_FB_addr((uint *)sc_info.fb_vaddr);
     }
     else // 高级初始化，增加双缓冲区的支持
@@ -50,7 +50,7 @@ void init_frame_buffer(bool level)
         // 申请双重缓冲区
         struct Page *p = alloc_pages(ZONE_NORMAL, PAGE_2M_ALIGN(sc_info.length << 2) / PAGE_2M_SIZE, 0);
         sc_info.double_fb_vaddr = (uint64_t)phys_2_virt(p->addr_phys);
-        mm_map_proc_page_table(global_CR3, true, sc_info.double_fb_vaddr, p->addr_phys, PAGE_2M_ALIGN(sc_info.length << 2), PAGE_KERNEL_PAGE, false);
+        mm_map_proc_page_table(global_CR3, true, sc_info.double_fb_vaddr, p->addr_phys, PAGE_2M_ALIGN(sc_info.length << 2), PAGE_KERNEL_PAGE, false, true);
 
         // 将原有的数据拷贝到double buffer里面
         memcpy((void *)sc_info.double_fb_vaddr, (void *)sc_info.fb_vaddr, sc_info.length << 2);

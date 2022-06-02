@@ -270,7 +270,7 @@ uint64_t sys_read(struct pt_regs *regs)
     void *buf = (void *)regs->r9;
     int64_t count = (int64_t)regs->r10;
 
-    // kdebug("sys read: fd=%d", fd_num);
+   // kdebug("sys read: fd=%d", fd_num);
 
     // 校验文件描述符范围
     if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
@@ -605,7 +605,7 @@ uint64_t sys_wait4(struct pt_regs *regs)
     uint64_t pid = regs->r8;
     int *status = (int *)regs->r9;
     int options = regs->r10;
-    void *rusage = regs->r11;
+    void *rusage = (void*)regs->r11;
 
     struct process_control_block *proc = NULL;
     struct process_control_block *child_proc = NULL;
@@ -634,7 +634,7 @@ uint64_t sys_wait4(struct pt_regs *regs)
         wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
 
     // 拷贝子进程的返回码
-    copy_to_user(status, child_proc->exit_code, sizeof(int));
+    copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
     proc->next_pcb = child_proc->next_pcb;
 
     // 释放子进程的页表

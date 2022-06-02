@@ -330,8 +330,8 @@ void process_exit_notify();
 	{                                                                  \
 		asm volatile("movq %0, %%cr3	\n\t" ::"r"(next_pcb->mm->pgd) \
 					 : "memory");                                      \
-		flush_tlb();                                                   \
 	} while (0)
+// flush_tlb();                                                   \
 
 // 获取当前cpu id
 #define proc_current_cpu_id (current_pcb->cpu_id)

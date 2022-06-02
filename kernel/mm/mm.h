@@ -366,8 +366,9 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
  * @param phys_addr_start 物理地址的起始位置
  * @param length 要映射的区域的长度（字节）
  * @param user 用户态是否可访问
+ * @param flush 是否刷新tlb
  */
-void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user);
+void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user, bool flush);
 
 
 void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);

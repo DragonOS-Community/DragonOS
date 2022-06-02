@@ -76,7 +76,15 @@ void sched_cfs()
         }
         // kdebug("before switch, next.rip = %#018lx\tnext->gs=%#018lx", proc->thread->rip, proc->thread->gs);
         // kdebug("currentpcb=%#018lx", (uint64_t)current_pcb);
+        
+        // if(proc->pid == 1 && pid_one_map_count < 2)
+        // {
+        //     mm_map_proc_page_table(proc->mm->pgd, true, pid_one_map_offset, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+        //     pid_one_map_count++;
+        //     pid_one_map_offset += PAGE_2M_SIZE;
+        // }
         process_switch_mm(proc);
+        
         switch_proc(current_pcb, proc);
     }
     else // 不进行切换

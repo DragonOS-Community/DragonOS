@@ -202,6 +202,16 @@ void *memset(void *dst, unsigned char C, ul size)
     return dst;
 }
 
+void *memset_c(void* dst, uint8_t c, size_t count)
+{
+    uint8_t* xs = (uint8_t*)dst;
+ 
+     while (count--)
+          *xs++ = c;
+  
+     return dst;
+}
+
 /**
  * @brief 内存拷贝函数
  *
@@ -210,7 +220,7 @@ void *memset(void *dst, unsigned char C, ul size)
  * @param Num 字节数
  * @return void*
  */
-static inline void *memcpy(void *dst, void *src, long Num)
+static void *memcpy(void *dst, void *src, long Num)
 {
     int d0, d1, d2;
     __asm__ __volatile__("cld	\n\t"
@@ -262,13 +272,13 @@ int strcmp(char *FirstPart, char *SecondPart)
     return __res;
 }
 
-void *memset_c(void *dst, unsigned char c, ul n)
-{
-    unsigned char *s = (unsigned char *)dst;
-    for (int i = 0; i < n; ++i)
-        s[i] = c;
-    return dst;
-}
+// void *memset_c(void *dst, unsigned char c, ul n)
+// {
+//     unsigned char *s = (unsigned char *)dst;
+//     for (int i = 0; i < n; ++i)
+//         s[i] = c;
+//     return dst;
+// }
 
 // 从io口读入8个bit
 unsigned char io_in8(unsigned short port)

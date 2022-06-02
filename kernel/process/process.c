@@ -15,6 +15,9 @@
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
 
+uint64_t pid_one_map_offset = 0x0000020000000000;
+int pid_one_map_count = 0;
+
 extern void system_call(void);
 extern void kernel_thread_func(void);
 
@@ -123,206 +126,6 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
     // wrmsr(0x175, next->thread->rbp);
-}
-
-/**
- * @brief 这是一个用户态的程序
- *
- */
-void user_level_function()
-{
-    // kinfo("Program (user_level_function) is runing...");
-    // kinfo("Try to enter syscall id 15...");
-    // enter_syscall(15, 0, 0, 0, 0, 0, 0, 0, 0);
-
-    // enter_syscall(SYS_PRINTF, (ul) "test_sys_printf\n", 0, 0, 0, 0, 0, 0, 0);
-    // while(1);
-    long ret = 0;
-    //	printk_color(RED,BLACK,"user_level_function task is running\n");
-
-    /*
-    // 测试sys put string
-    char string[] = "User level process.\n";
-    long err_code = 1;
-    ul addr = (ul)string;
-    __asm__ __volatile__(
-        "movq %2, %%r8 \n\t"
-        "int $0x80   \n\t"
-        : "=a"(err_code)
-        : "a"(SYS_PUT_STRING), "m"(addr)
-        : "memory", "r8");
-    */
-    while (1)
-    {
-        // 测试sys_open
-        char string[] = "333.txt";
-        long err_code = 1;
-        int zero = 0;
-
-        uint64_t addr = (ul)string;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_OPEN), "m"(addr), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-
-        int fd_num = err_code;
-
-        int count = 128;
-        // while (count)
-        //{
-        uchar buf[128] = {0};
-        // Test sys_read
-        addr = (uint64_t)&buf;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_READ), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-        count = err_code;
-        // 将读取到的数据打印出来
-        addr = (ul)buf;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_PUT_STRING), "m"(addr)
-            : "memory", "r8");
-        // SYS_WRITE
-        char test1[] = "GGGGHHHHHHHHh112343";
-
-        addr = (uint64_t)&test1;
-        count = 19;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_WRITE), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-
-        addr = 1;
-        count = SEEK_SET;
-        fd_num = 0;
-        // Test lseek
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_LSEEK), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-
-        // SYS_WRITE
-        char test2[] = "K123456789K";
-
-        addr = (uint64_t)&test2;
-        count = 11;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_WRITE), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-        // Test sys_close
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_CLOSE), "m"(fd_num), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-
-        addr = (ul)string;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_OPEN), "m"(addr), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-        fd_num = err_code;
-        count = 128;
-        // Test sys_read
-        addr = (uint64_t)&buf;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "movq %3, %%r9 \n\t"
-            "movq %4, %%r10 \n\t"
-            "movq %5, %%r11 \n\t"
-            "movq %6, %%r12 \n\t"
-            "movq %7, %%r13 \n\t"
-            "movq %8, %%r14 \n\t"
-            "movq %9, %%r15 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_READ), "m"(fd_num), "m"(addr), "m"(count), "m"(zero), "m"(zero), "m"(zero), "m"(zero), "m"(zero)
-            : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
-        count = err_code;
-        // 将读取到的数据打印出来
-        addr = (ul)buf;
-        __asm__ __volatile__(
-            "movq %2, %%r8 \n\t"
-            "int $0x80   \n\t"
-            : "=a"(err_code)
-            : "a"(SYS_PUT_STRING), "m"(addr)
-            : "memory", "r8");
-
-        // Test Sys
-        //}
-
-        while (1)
-            pause();
-    }
-    while (1)
-        pause();
 }
 
 /**
@@ -443,13 +246,16 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         pos = phdr->p_offset;
 
         uint64_t virt_base = phdr->p_vaddr;
+        kdebug("virt_base = %#018lx, &memory_management_struct=%#018lx", virt_base, &memory_management_struct);
+
         while (remain_mem_size > 0)
         {
 
             // todo: 改用slab分配4K大小内存块并映射到4K页
             if (!mm_check_mapped((uint64_t)current_pcb->mm->pgd, virt_base)) // 未映射，则新增物理页
             {
-                mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+                mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 10, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+
                 memset((void *)virt_base, 0, PAGE_2M_SIZE);
             }
             pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
@@ -472,9 +278,34 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     // 分配2MB的栈内存空间
     regs->rsp = current_pcb->mm->stack_start;
     regs->rbp = current_pcb->mm->stack_start;
-    mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+
+    uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
+    // pa+= PAGE_2M_SIZE;
+    kdebug("pa1=%#018lx", pa);
+    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
+    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+    // pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
+    // kdebug("pa2=%#018lx", pa);
+    // // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+
+    // pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
+    // kdebug("pa3=%#018lx", pa);
+    mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, 1 * PAGE_2M_SIZE, PAGE_USER_PAGE, true);
     // 清空栈空间
     memset((void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), 0, PAGE_2M_SIZE);
+
+    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE * 2, alloc_pages(ZONE_NORMAL, 2, PAGE_PGT_MAPPED)->addr_phys, 2 * PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+    // // 清空栈空间
+    // memset((void *)(current_pcb->mm->stack_start - 2 * PAGE_2M_SIZE), 0, 2 * PAGE_2M_SIZE);
+
+    // if (current_pcb->pid == 1 && pid_one_map_count < 2)
+    // {
+    //     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, pid_one_map_offset, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+    //     memset(pid_one_map_offset, 0, PAGE_2M_SIZE);
+    //     pid_one_map_count++;
+    //     pid_one_map_offset += PAGE_2M_SIZE;
+    // }
 
 load_elf_failed:;
     if (buf != NULL)
@@ -516,8 +347,8 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     }
 
     // 设置用户栈和用户堆的基地址
-    unsigned long stack_start_addr = 0x6fffffc00000;
-    const uint64_t brk_start_addr = 0x6fffffc00000;
+    unsigned long stack_start_addr = 0x6ffff0a00000UL;
+    const uint64_t brk_start_addr = 0x700000000000UL;
 
     process_switch_mm(current_pcb);
 
@@ -655,7 +486,7 @@ ul process_do_exit(ul code)
     // todo: 可否在这里释放内存结构体？（在判断共享页引用问题之后）
 
     pcb->state = PROC_ZOMBIE;
-    pcb->exit_code = pcb;
+    pcb->exit_code = code;
     sti();
 
     process_exit_notify();
@@ -841,6 +672,10 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     retval = tsk->pid;
 
     kdebug("fork done: tsk->pid=%d", tsk->pid);
+
+    // kdebug("current_pcb->mm->brk_end=%#018lx", current_pcb->mm->brk_end);
+    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, 0x0000500000000000, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+
     // 唤醒进程
     process_wakeup(tsk);
 
@@ -1003,51 +838,120 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
         // 当前页表项为空
         if ((*(uint64_t *)(current_pgd + i)) == 0)
             continue;
-
+        kdebug("user page [%d]", i);
         // 分配新的二级页表
-        pdpt_t *new_pdpt = (pdpt_t *)kmalloc(PAGE_4K_SIZE, 0);
+        uint64_t *new_pdpt = (uint64_t *)kmalloc(PAGE_4K_SIZE, 0);
         memset(new_pdpt, 0, PAGE_4K_SIZE);
 
         // 在新的一级页表中设置新的二级页表表项
         set_pml4t(new_pml4t + i, mk_pml4t(virt_2_phys(new_pdpt), (*(current_pgd + i)) & 0xfffUL));
 
-        pdpt_t *current_pdpt = (pdpt_t *)phys_2_virt(*(uint64_t *)(current_pgd + i) & (~0xfffUL));
-
-        kdebug("i=%d, current pdpt=%#018lx \t (current_pgd + i)->pml4t=%#018lx", i, current_pdpt, *(uint64_t *)(current_pgd + i));
-        //  设置二级页表
+        uint64_t *current_pdpt = (uint64_t *)phys_2_virt((*(uint64_t *)(current_pgd + i)) & (~0xfffUL));
+        kdebug("current_pdpt=%#018lx, current_pid=%d", current_pdpt, current_pcb->pid);
         for (int j = 0; j < 512; ++j)
         {
-            if (*(uint64_t *)(current_pdpt + j) == 0)
+            if (*(current_pdpt + j) == 0)
                 continue;
 
-            kdebug("j=%d *(uint64_t *)(current_pdpt + j)=%#018lx", j, *(uint64_t *)(current_pdpt + j));
-
             // 分配新的三级页表
-            pdt_t *new_pdt = (pdt_t *)kmalloc(PAGE_4K_SIZE, 0);
+            uint64_t *new_pdt = (uint64_t *)kmalloc(PAGE_4K_SIZE, 0);
             memset(new_pdt, 0, PAGE_4K_SIZE);
-
+            // 在二级页表中填写新的三级页表
             // 在新的二级页表中设置三级页表的表项
-            set_pdpt((uint64_t *)(new_pdpt + j), mk_pdpt(virt_2_phys(new_pdt), (*(uint64_t *)(current_pdpt + j)) & 0xfffUL));
+            set_pdpt((uint64_t *)(new_pdpt + j), mk_pdpt(virt_2_phys(new_pdt), (*(current_pdpt + j)) & 0xfffUL));
 
-            pdt_t *current_pdt = (pdt_t *)phys_2_virt((*(uint64_t *)(current_pdpt + j)) & (~0xfffUL));
-
-            // 拷贝内存页
+            uint64_t *current_pdt = (uint64_t *)phys_2_virt((*(current_pdpt + j)) & (~0xfffUL));
+            kdebug("current_pdt=%#018lx", current_pdt);
+            // 循环拷贝三级页表
             for (int k = 0; k < 512; ++k)
             {
-                if ((current_pdt + k)->pdt == 0)
-                    continue;
-                
-                kdebug("k=%d, (current_pdt + k)->pdt=%#018lx", k, (current_pdt + k)->pdt);
-                // 获取一个新页
-                struct Page *pg = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
-                set_pdt((uint64_t *)(new_pdt + k), mk_pdt(pg->addr_phys, (current_pdt + k)->pdt & 0x1ffUL));
 
-                kdebug("k=%d, cpy dest=%#018lx, src=%#018lx", k, phys_2_virt(pg->addr_phys), phys_2_virt((current_pdt + k)->pdt & (~0x1ffUL)));
-                // 拷贝数据
-                memcpy(phys_2_virt(pg->addr_phys), phys_2_virt((current_pdt + k)->pdt & (~0x1ffUL)), PAGE_2M_SIZE);
+                // 获取新的物理页
+                if (*(current_pdt + k) == 0)
+                    continue;
+
+                // 跳过栈空间
+                if (i == 223 && j == 511 && k == 388)
+                    continue;
+                // if (i > 10)
+                //     continue;
+                uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
+                kdebug("before memset     phys_2_virt(pa)=%#018lx", phys_2_virt(pa));
+
+                memset((void*)phys_2_virt(pa), 0, PAGE_2M_SIZE);
+
+                kdebug("[i=%d][j=%d][k=%d] pg->addr_phys=%#018lx", i, j, k, pa);
+
+                // 计算当前虚拟地址
+                uint64_t current_vaddr = 0;
+                current_vaddr = ((1UL * i) << PAGE_GDT_SHIFT) | ((1UL * j) << PAGE_1G_SHIFT) | ((1UL * k) << PAGE_2M_SHIFT);
+                kdebug("current_vaddr = %#018lx, pa=%#018lx", current_vaddr, pa);
+
+                mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_vaddr, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
+                kdebug("before memcpy");
+                memcpy((void*)phys_2_virt(pa), (void *)current_vaddr, PAGE_2M_SIZE);
+
+                kdebug("current_pcb->mm->stack_start=%#018lx", current_pcb->mm->stack_start);
+                // kdebug("*(current_pdt+k)=%#018lx", *(current_pdt + k));
+                // set_pdt((new_pdt + k), mk_pdt(pa, PAGE_USER_PAGE));
+                // // set_pdt((new_pdt + k), mk_pdt(pg->addr_phys, (*(current_pdt + k)) & 0xfffUL));
+
+                // // memcpy((void *)phys_2_virt(pg->addr_phys), (void *)phys_2_virt((*(current_pdt + k)) & (~0xfffUL)), PAGE_2M_SIZE);
+
+                // kdebug("phys_2_virt((*(current_pdt + k)) & (~0x1ffUL))=%#018lx",phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)));
+                // memcpy((void *)phys_2_virt(pa), (void *)phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)), PAGE_2M_SIZE);
+                // set_pdt((new_pdt + k), mk_pdt(pg->addr_phys, PAGE_USER_PAGE));
+
+                // *(new_pdt + k) = (pg->addr_phys | (*(current_pdt + k)) & (0xfffUL));
             }
         }
+        // kdebug("current_pcb->mm->stack_start - PAGE_2M_SIZE * 2=%#018lx",current_pcb->mm->stack_start - PAGE_2M_SIZE * 2);
+
+        // kdebug("i=%d, current pdpt=%#018lx \t (current_pgd + i)->pml4t=%#018lx", i, current_pdpt, *(uint64_t *)(current_pgd + i));
+        // //  设置二级页表
+        // for (int j = 0; j < 512; ++j)
+        // {
+        //     if (*(uint64_t *)(current_pdpt + j) == 0)
+        //         continue;
+
+        //     kdebug("j=%d *(uint64_t *)(current_pdpt + j)=%#018lx", j, *(uint64_t *)(current_pdpt + j));
+
+        //     // 分配新的三级页表
+        //     uint64_t *new_pdt = (uint64_t *)kmalloc(PAGE_4K_SIZE, 0);
+        //     memset(new_pdt, 0, PAGE_4K_SIZE);
+
+        //     // 在新的二级页表中设置三级页表的表项
+        //     set_pdpt((uint64_t *)(new_pdpt + j), mk_pdpt(virt_2_phys(new_pdt), (*(uint64_t *)(current_pdpt + j)) & 0xfffUL));
+
+        //     uint64_t *current_pdt = (uint64_t *)phys_2_virt((*(uint64_t *)(current_pdpt + j)) & (~0xfffUL));
+
+        //     // 拷贝内存页
+        //     for (int k = 0; k < 512; ++k)
+        //     {
+        //         if (*(current_pdt + k) == 0)
+        //             continue;
+
+        //         kdebug("k=%d, *(current_pdt + k)=%#018lx", k, *(current_pdt + k));
+        //         // 获取一个新页
+        //         struct Page *pg = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
+        //         set_pdt((uint64_t *)(new_pdt + k), mk_pdt(pg->addr_phys, *(current_pdt + k) & 0x1ffUL));
+
+        //         kdebug("k=%d, cpy dest=%#018lx, src=%#018lx", k, phys_2_virt(pg->addr_phys), phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)));
+        //         // 拷贝数据
+        //         memcpy(phys_2_virt(pg->addr_phys), phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)), PAGE_2M_SIZE);
+        //     }
+        // }
     }
+
+    kdebug("mapppping stack mem!!!, pid=%d", pcb->pid);
+    uint64_t pha = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
+    mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE * 1, pha, 1 * PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
+    // mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE * 1, pha, 1 * PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
+    // 清空栈空间
+    memset(phys_2_virt(pha), 0, PAGE_2M_SIZE);
+    kdebug("(current_pcb->mm->stack_start - PAGE_2M_SIZE)=%#018lx", (current_pcb->mm->stack_start - PAGE_2M_SIZE));
+    memcpy(phys_2_virt(pha), (void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), PAGE_2M_SIZE);
+    kdebug("mapppped stack mem!!!");
 
     return retval;
 }
@@ -1148,7 +1052,7 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
         thd->rip = (uint64_t)kernel_thread_func;
     else
         thd->rip = (uint64_t)ret_from_system_call;
-    kdebug("new proc's ret addr = %#018lx\tthd->rip=%#018lx   stack_start=%#018lx  child_regs->rsp = %#018lx, new_rip=%#018lx)", child_regs->rbx, thd->rip,stack_start,child_regs->rsp, child_regs->rip);
+    kdebug("new proc's ret addr = %#018lx\tthd->rip=%#018lx   stack_start=%#018lx  child_regs->rsp = %#018lx, new_rip=%#018lx)", child_regs->rbx, thd->rip, stack_start, child_regs->rsp, child_regs->rip);
     return 0;
 }
 

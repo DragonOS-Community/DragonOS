@@ -4,11 +4,10 @@
 #include "../common/kprint.h"
 #include <process/process.h>
 
-
 // 0 #DE 除法错误
 void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
-    //kerror("do_divide_error(0)");
+    // kerror("do_divide_error(0)");
     kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\t pid=%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
     current_pcb->state = PROC_STOPPED;
     while (1)
@@ -168,8 +167,7 @@ void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
 // 13 #GP 通用保护性异常
 void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 {
-    
-    
+
     kerror("do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
     if (error_code & 0x01)
         printk_color(RED, BLACK, "The exception occurred during delivery of an event external to the program,such as an interrupt or an earlier exception.\n");
@@ -193,36 +191,38 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 // 14 #PF 页故障
 void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 {
-   
+
     unsigned long cr2 = 0;
 
-	__asm__	__volatile__("movq	%%cr2,	%0":"=r"(cr2)::"memory");
-    
-	kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx,RIP:%#018lx CPU:%d, pid=%d\n",error_code , regs->rsp , regs->rip, proc_current_cpu_id, current_pcb->pid);
+    __asm__ __volatile__("movq	%%cr2,	%0"
+                         : "=r"(cr2)::"memory");
 
-	if(!(error_code & 0x01))
-		printk_color(RED,BLACK,"Page Not-Present,\t");
+    kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx, RBP=%#018lx, RIP:%#018lx CPU:%d, pid=%d\n", error_code, regs->rsp, regs->rbp, regs->rip, proc_current_cpu_id, current_pcb->pid);
+    kerror("regs->rax = %#018lx\n", regs->rax);
+    if (!(error_code & 0x01))
+        printk_color(RED, BLACK, "Page Not-Present,\t");
 
-	if(error_code & 0x02)
-		printk_color(RED,BLACK,"Write Cause Fault,\t");
-	else
-		printk_color(RED,BLACK,"Read Cause Fault,\t");
+    if (error_code & 0x02)
+        printk_color(RED, BLACK, "Write Cause Fault,\t");
+    else
+        printk_color(RED, BLACK, "Read Cause Fault,\t");
 
-	if(error_code & 0x04)
-		printk_color(RED,BLACK,"Fault in user(3)\t");
-	else
-		printk_color(RED,BLACK,"Fault in supervisor(0,1,2)\t");
+    if (error_code & 0x04)
+        printk_color(RED, BLACK, "Fault in user(3)\t");
+    else
+        printk_color(RED, BLACK, "Fault in supervisor(0,1,2)\t");
 
-	if(error_code & 0x08)
-		printk_color(RED,BLACK,",Reserved Bit Cause Fault\t");
+    if (error_code & 0x08)
+        printk_color(RED, BLACK, ",Reserved Bit Cause Fault\t");
 
-	if(error_code & 0x10)
-		printk_color(RED,BLACK,",Instruction fetch Cause Fault");
+    if (error_code & 0x10)
+        printk_color(RED, BLACK, ",Instruction fetch Cause Fault");
 
-	printk_color(RED,BLACK,"\n");
+    printk_color(RED, BLACK, "\n");
 
-	printk_color(RED,BLACK,"CR2:%#018lx\n",cr2);
+    printk_color(RED, BLACK, "CR2:%#018lx\n", cr2);
 
+    current_pcb->state = PROC_STOPPED;
     while (1)
         hlt();
 }
@@ -281,8 +281,6 @@ void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
 
 // 21-21 Intel保留，请勿使用
 
-
-
 void sys_vector_init()
 {
     set_trap_gate(0, 0, divide_error);
@@ -307,9 +305,6 @@ void sys_vector_init()
     set_trap_gate(19, 0, SIMD_exception);
     set_trap_gate(20, 0, virtualization_exception);
     // 中断号21-31由Intel保留，不能使用
-    
-    
 
     // 32-255为用户自定义中断内部
-
 }

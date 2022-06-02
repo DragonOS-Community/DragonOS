@@ -177,7 +177,6 @@ void mm_init()
         }
     }
 
-
     // 初始化0~2MB的物理页
     // 由于这个区间的内存由多个内存段组成，因此不会被以上代码初始化，需要我们手动配置page[0]。
 
@@ -340,19 +339,20 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
                         // 分配页面，手动配置属性及计数器
                         // 置位bmp
                         *(memory_management_struct.bmp + ((x->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= (1UL << (x->addr_phys >> PAGE_2M_SHIFT) % 64);
-                        ++z->count_pages_using;
-                        --z->count_pages_free;
+                        ++(z->count_pages_using);
+                        --(z->count_pages_free);
                         x->attr = attr;
                     }
                     // 成功分配了页面，返回第一个页面的指针
-                    // printk("start page num=%d\n",start_page_num);
+                    kwarn("start page num=%d\n", start_page_num);
                     return (struct Page *)(memory_management_struct.pages_struct + start_page_num);
                 }
             }
         }
     }
     kBUG("Cannot alloc page, ZONE=%d\tnums=%d, total_2M_pages=%d", zone_select, num, total_2M_pages);
-    while(1);
+    while (1)
+        ;
     return NULL;
 }
 
@@ -467,6 +467,7 @@ void page_table_init()
     ul *pd_addr = phys_2_virt(*pdpt_addr & (~0xfffUL));
     kdebug("pd addr=%#018lx *pd=%#018lx", pd_addr, *pd_addr);
 */
+    int js = 0;
     ul *tmp_addr;
     for (int i = 0; i < memory_management_struct.count_zones; ++i)
     {
@@ -478,13 +479,26 @@ void page_table_init()
 
         for (int j = 0; j < z->count_pages; ++j)
         {
-            mm_map_phys_addr((ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
+            if (j == 0)
+                kdebug("(ul)phys_2_virt(p->addr_phys)=%#018lx",(ul)phys_2_virt(p->addr_phys));
+                //mm_map_phys_addr((ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
+            mm_map_proc_page_table((uint64_t)get_CR3(), true, (ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE, false, true);
+            ++js;
         }
     }
 
     flush_tlb();
 
-    kinfo("Page table Initialized.");
+    kinfo("Page table Initialized. Affects:%d", js);
+    // for(int i=0;i<100;++i)
+    // {
+    //     struct Page * p=alloc_pages(ZONE_NORMAL, 1, 0);
+    //     kdebug("Testing [%d]: addr_phys=%#018lx", i,p->addr_phys);
+    //     memset((void*)(phys_2_virt(p->addr_phys)), 0, PAGE_2M_SIZE);
+
+    // }
+    // while(1)
+    //     pause();
 }
 
 /**
@@ -498,13 +512,13 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
 {
     uint64_t global_CR3 = (uint64_t)get_CR3();
 
-    mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, false);
+    mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, false, true);
 }
 
 void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags)
 {
     uint64_t global_CR3 = (uint64_t)get_CR3();
-    mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, true);
+    mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, true, true);
 }
 
 /**
@@ -516,8 +530,9 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
  * @param phys_addr_start 物理地址的起始位置
  * @param length 要映射的区域的长度（字节）
  * @param user 用户态是否可访问
+ * @param flush 是否刷新tlb
  */
-void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user)
+void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user, bool flush)
 {
 
     // 计算线性地址对应的pml4页表项的地址
@@ -580,14 +595,19 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
                 --pgt_num.num_PDE;
                 // 计算当前2M物理页对应的pdt的页表项的物理地址
                 ul *pde_ptr = pd_ptr + pde_id;
-
+                if (*pde_ptr != 0 && user)
+                {
+                    kwarn("page already mapped!");
+                    continue;
+                }
                 // 页面写穿，禁止缓存
                 set_pdt(pde_ptr, mk_pdt((ul)phys_addr_start + length_mapped, flags | (user ? PAGE_USER_PAGE : PAGE_KERNEL_PAGE)));
                 length_mapped += PAGE_2M_SIZE;
             }
         }
     }
-    flush_tlb();
+    if (flush)
+        flush_tlb();
 }
 
 /**
@@ -786,8 +806,8 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
     {
         for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
         {
-            // kdebug("map [%#018lx]", i);
-            mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+            kdebug("map [%#018lx]", i);
+            mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
         }
         current_pcb->mm->brk_end = end_addr;
     }

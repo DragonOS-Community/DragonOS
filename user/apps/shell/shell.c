@@ -42,7 +42,7 @@ void main_loop(int kb_fd)
 
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
-    // sbrk(24);
+    sbrk(24);
     // brk(0x700000000000 + (1<<21));
     pid_t pid = fork();
     int retval = 0;

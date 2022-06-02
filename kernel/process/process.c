@@ -866,92 +866,32 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
             for (int k = 0; k < 512; ++k)
             {
 
-                // 获取新的物理页
                 if (*(current_pdt + k) == 0)
                     continue;
 
-                // 跳过栈空间
-                if (i == 223 && j == 511 && k == 388)
-                    continue;
-                // if (i > 10)
-                //     continue;
+                // 获取新的物理页
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-                kdebug("before memset     phys_2_virt(pa)=%#018lx", phys_2_virt(pa));
 
-                memset((void*)phys_2_virt(pa), 0, PAGE_2M_SIZE);
+                memset((void *)phys_2_virt(pa), 0, PAGE_2M_SIZE);
 
-                kdebug("[i=%d][j=%d][k=%d] pg->addr_phys=%#018lx", i, j, k, pa);
+                set_pdt((uint64_t *)(new_pdt + k), mk_pdt(pa, *(current_pdt + k) & 0x1ffUL));
+
+                // 拷贝数据
+                memcpy(phys_2_virt(pa), phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)), PAGE_2M_SIZE);
 
                 // 计算当前虚拟地址
-                uint64_t current_vaddr = 0;
-                current_vaddr = ((1UL * i) << PAGE_GDT_SHIFT) | ((1UL * j) << PAGE_1G_SHIFT) | ((1UL * k) << PAGE_2M_SHIFT);
-                kdebug("current_vaddr = %#018lx, pa=%#018lx", current_vaddr, pa);
+                // uint64_t current_vaddr = 0;
+                // current_vaddr = ((1UL * i) << PAGE_GDT_SHIFT) | ((1UL * j) << PAGE_1G_SHIFT) | ((1UL * k) << PAGE_2M_SHIFT);
 
-                mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_vaddr, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
-                kdebug("before memcpy");
-                memcpy((void*)phys_2_virt(pa), (void *)current_vaddr, PAGE_2M_SIZE);
+                // mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_vaddr, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
 
-                kdebug("current_pcb->mm->stack_start=%#018lx", current_pcb->mm->stack_start);
-                // kdebug("*(current_pdt+k)=%#018lx", *(current_pdt + k));
-                // set_pdt((new_pdt + k), mk_pdt(pa, PAGE_USER_PAGE));
-                // // set_pdt((new_pdt + k), mk_pdt(pg->addr_phys, (*(current_pdt + k)) & 0xfffUL));
-
-                // // memcpy((void *)phys_2_virt(pg->addr_phys), (void *)phys_2_virt((*(current_pdt + k)) & (~0xfffUL)), PAGE_2M_SIZE);
-
-                // kdebug("phys_2_virt((*(current_pdt + k)) & (~0x1ffUL))=%#018lx",phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)));
-                // memcpy((void *)phys_2_virt(pa), (void *)phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)), PAGE_2M_SIZE);
-                // set_pdt((new_pdt + k), mk_pdt(pg->addr_phys, PAGE_USER_PAGE));
-
-                // *(new_pdt + k) = (pg->addr_phys | (*(current_pdt + k)) & (0xfffUL));
+                // memcpy((void *)phys_2_virt(pa), (void *)current_vaddr, PAGE_2M_SIZE);
             }
         }
-        // kdebug("current_pcb->mm->stack_start - PAGE_2M_SIZE * 2=%#018lx",current_pcb->mm->stack_start - PAGE_2M_SIZE * 2);
-
-        // kdebug("i=%d, current pdpt=%#018lx \t (current_pgd + i)->pml4t=%#018lx", i, current_pdpt, *(uint64_t *)(current_pgd + i));
-        // //  设置二级页表
-        // for (int j = 0; j < 512; ++j)
-        // {
-        //     if (*(uint64_t *)(current_pdpt + j) == 0)
-        //         continue;
-
-        //     kdebug("j=%d *(uint64_t *)(current_pdpt + j)=%#018lx", j, *(uint64_t *)(current_pdpt + j));
-
-        //     // 分配新的三级页表
-        //     uint64_t *new_pdt = (uint64_t *)kmalloc(PAGE_4K_SIZE, 0);
-        //     memset(new_pdt, 0, PAGE_4K_SIZE);
-
-        //     // 在新的二级页表中设置三级页表的表项
-        //     set_pdpt((uint64_t *)(new_pdpt + j), mk_pdpt(virt_2_phys(new_pdt), (*(uint64_t *)(current_pdpt + j)) & 0xfffUL));
-
-        //     uint64_t *current_pdt = (uint64_t *)phys_2_virt((*(uint64_t *)(current_pdpt + j)) & (~0xfffUL));
-
-        //     // 拷贝内存页
-        //     for (int k = 0; k < 512; ++k)
-        //     {
-        //         if (*(current_pdt + k) == 0)
-        //             continue;
-
-        //         kdebug("k=%d, *(current_pdt + k)=%#018lx", k, *(current_pdt + k));
-        //         // 获取一个新页
-        //         struct Page *pg = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED);
-        //         set_pdt((uint64_t *)(new_pdt + k), mk_pdt(pg->addr_phys, *(current_pdt + k) & 0x1ffUL));
-
-        //         kdebug("k=%d, cpy dest=%#018lx, src=%#018lx", k, phys_2_virt(pg->addr_phys), phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)));
-        //         // 拷贝数据
-        //         memcpy(phys_2_virt(pg->addr_phys), phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)), PAGE_2M_SIZE);
-        //     }
-        // }
+        
     }
 
-    kdebug("mapppping stack mem!!!, pid=%d", pcb->pid);
-    uint64_t pha = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-    mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE * 1, pha, 1 * PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
-    // mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE * 1, pha, 1 * PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
-    // 清空栈空间
-    memset(phys_2_virt(pha), 0, PAGE_2M_SIZE);
-    kdebug("(current_pcb->mm->stack_start - PAGE_2M_SIZE)=%#018lx", (current_pcb->mm->stack_start - PAGE_2M_SIZE));
-    memcpy(phys_2_virt(pha), (void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), PAGE_2M_SIZE);
-    kdebug("mapppped stack mem!!!");
+   
 
     return retval;
 }

@@ -53,7 +53,7 @@ Restore_all:
     popq %rax
     addq $0x10, %rsp // 弹出变量FUNC和errcode
     
-    // sti
+    sti
     iretq
 
 ret_from_exception:

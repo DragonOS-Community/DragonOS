@@ -68,7 +68,8 @@ void mm_init()
         //可用的内存
         if (mb2_mem_info->type == 1)
             Total_Memory += mb2_mem_info->len;
-
+        
+        kdebug("[i=%d] mb2_mem_info[i].type=%d, mb2_mem_info[i].addr=%#018lx", i, mb2_mem_info[i].type, mb2_mem_info[i].addr);
         // 保存信息到mms
         memory_management_struct.e820[i].BaseAddr = mb2_mem_info[i].addr;
         memory_management_struct.e820[i].Length = mb2_mem_info[i].len;
@@ -127,7 +128,7 @@ void mm_init()
     // 由于暂时无法计算zone结构体的数量，因此先将其设为0
     memory_management_struct.count_zones = 0;
     // zones-struct 成员变量暂时按照5个来计算
-    memory_management_struct.zones_struct_len = (5 * sizeof(struct Zone) + sizeof(ul) - 1) & (~(sizeof(ul) - 1));
+    memory_management_struct.zones_struct_len = (10 * sizeof(struct Zone) + sizeof(ul) - 1) & (~(sizeof(ul) - 1));
     memset(memory_management_struct.zones_struct, 0x00, memory_management_struct.zones_struct_len);
 
     // ==== 遍历e820数组，完成成员变量初始化工作 ===
@@ -456,17 +457,7 @@ void page_table_init()
 {
     kinfo("Re-Initializing page table...");
     ul *global_CR3 = get_CR3();
-    /*
-    // 由于CR3寄存器的[11..0]位是PCID标志位，因此将低12位置0后，就是PML4页表的基地址
-    ul *pml4_addr = (ul *)((ul)phys_2_virt((ul)global_CR3 & (~0xfffUL)));
-    kdebug("PML4 addr=%#018lx *pml4=%#018lx", pml4_addr, *pml4_addr);
-
-    ul *pdpt_addr = phys_2_virt(*pml4_addr & (~0xfffUL));
-    kdebug("pdpt addr=%#018lx *pdpt=%#018lx", pdpt_addr, *pdpt_addr);
-
-    ul *pd_addr = phys_2_virt(*pdpt_addr & (~0xfffUL));
-    kdebug("pd addr=%#018lx *pd=%#018lx", pd_addr, *pd_addr);
-*/
+    
     int js = 0;
     ul *tmp_addr;
     for (int i = 0; i < memory_management_struct.count_zones; ++i)
@@ -479,10 +470,12 @@ void page_table_init()
 
         for (int j = 0; j < z->count_pages; ++j)
         {
-            if (j == 0)
-                kdebug("(ul)phys_2_virt(p->addr_phys)=%#018lx",(ul)phys_2_virt(p->addr_phys));
+            // if (p->addr_phys)
+            //     kdebug("(ul)phys_2_virt(p->addr_phys)=%#018lx",(ul)phys_2_virt(p->addr_phys));
                 //mm_map_phys_addr((ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
             mm_map_proc_page_table((uint64_t)get_CR3(), true, (ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE, false, true);
+            
+            ++p;
             ++js;
         }
     }
@@ -490,15 +483,7 @@ void page_table_init()
     flush_tlb();
 
     kinfo("Page table Initialized. Affects:%d", js);
-    // for(int i=0;i<100;++i)
-    // {
-    //     struct Page * p=alloc_pages(ZONE_NORMAL, 1, 0);
-    //     kdebug("Testing [%d]: addr_phys=%#018lx", i,p->addr_phys);
-    //     memset((void*)(phys_2_virt(p->addr_phys)), 0, PAGE_2M_SIZE);
 
-    // }
-    // while(1)
-    //     pause();
 }
 
 /**

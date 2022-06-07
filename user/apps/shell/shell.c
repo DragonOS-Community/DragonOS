@@ -17,20 +17,12 @@
  * @param buf 输入缓冲区
  * @return 读取的字符数
  */
-#define INPUT_BUFFER_SIZE 512
+
 int shell_readline(int fd, char *buf);
 
 extern char *shell_current_path;
 
-/**
- * @brief 解析shell命令
- *
- * @param buf 输入缓冲区
- * @param argc 返回值：参数数量
- * @param argv 返回值：参数列表
- * @return int
- */
-int parse_command(char *buf, int *argc, char ***argv);
+
 
 /**
  * @brief shell主循环
@@ -130,52 +122,3 @@ int shell_readline(int fd, char *buf)
     }
 }
 
-/**
- * @brief 解析shell命令
- *
- * @param buf 输入缓冲区
- * @param argc 返回值：参数数量
- * @param argv 返回值：参数列表
- * @return int 主命令的编号
- */
-int parse_command(char *buf, int *argc, char ***argv)
-{
-    // printf("parse command\n");
-    int index = 0; // 当前访问的是buf的第几位
-    // 去除命令前导的空格
-    while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
-        ++index;
-
-    // 计算参数数量
-    for (int i = index; i < (INPUT_BUFFER_SIZE - 1); ++i)
-    {
-        // 到达了字符串末尾
-        if (!buf[i])
-            break;
-        if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
-            ++(*argc);
-    }
-
-    // printf("\nargc=%d\n", *argc);
-
-    // 为指向每个指令的指针分配空间
-    *argv = (char **)malloc(sizeof(char **) * (*argc));
-    memset(*argv, 0, sizeof(char **) * (*argc));
-    // 将每个命令都单独提取出来
-    for (int i = 0; i < *argc && index < INPUT_BUFFER_SIZE; ++i)
-    {
-        // 提取出命令，以空格作为分割
-        *((*argv) + i) = &buf[index];
-        while (index < (INPUT_BUFFER_SIZE - 1) && buf[index] && buf[index] != ' ')
-            ++index;
-        buf[index++] = '\0';
-
-        // 删除命令间多余的空格
-        while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
-            ++index;
-
-        // printf("%s\n", (*argv)[i]);
-    }
-    // 以第一个命令作为主命令，查找其在命令表中的编号
-    return shell_find_cmd(**argv);
-}

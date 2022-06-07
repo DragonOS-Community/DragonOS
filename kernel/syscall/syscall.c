@@ -634,7 +634,8 @@ uint64_t sys_wait4(struct pt_regs *regs)
         wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
 
     // 拷贝子进程的返回码
-    copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
+    *status = child_proc->exit_code;
+    // copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
     proc->next_pcb = child_proc->next_pcb;
 
     // 释放子进程的页表

@@ -2,6 +2,7 @@
 
 // cwd字符串的最大大小
 #define SHELL_CWD_MAX_SIZE  256
+#define INPUT_BUFFER_SIZE 512
 
 /**
  * @brief shell内建命令结构体
@@ -121,3 +122,22 @@ int shell_cmd_exec(int argc, char **argv);
  * @return int
  */
 int shell_cmd_reboot(int argc, char **argv);
+
+/**
+ * @brief 关于软件
+ * 
+ * @param argc 
+ * @param argv 
+ * @return int 
+ */
+int shell_cmd_about(int argc, char **argv);
+
+/**
+ * @brief 解析shell命令
+ *
+ * @param buf 输入缓冲区
+ * @param argc 返回值：参数数量
+ * @param argv 返回值：参数列表
+ * @return int
+ */
+int parse_command(char *buf, int *argc, char ***argv);

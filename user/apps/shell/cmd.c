@@ -31,6 +31,7 @@ struct built_in_cmd_t shell_cmds[] =
         {"rmdir", shell_cmd_rmdir},
         {"reboot", shell_cmd_reboot},
         {"touch", shell_cmd_touch},
+        {"about", shell_cmd_about},
         {"help", shell_help},
 
 };
@@ -62,7 +63,10 @@ static char *get_target_filepath(const char *filename, int *result_path_len)
         file_path[cwd_len] = '/';
 
     // 拼接完整路径
-    strcat(file_path, filename);
+    if (filename[0] == '/')
+        strcat(file_path, filename + 1);
+    else
+        strcat(file_path, filename);
 
     return file_path;
 }
@@ -377,21 +381,37 @@ int shell_cmd_exec(int argc, char **argv)
         // 子进程
         int path_len = 0;
         char *file_path = get_target_filepath(argv[1], &path_len);
-        // printf("before execv, path=%s, argc=%d\n", file_path, argc);
+        printf("before execv, path=%s, argc=%d\n", file_path, argc);
         execv(file_path, argv);
         free(argv);
-        while(1);
+        while (1)
+            ;
         exit(0);
     }
     else
     {
         printf("parent process wait for pid:[ %d ]\n", pid);
- 
+
         waitpid(pid, &retval, 0);
         printf("parent process wait pid [ %d ], exit code=%d\n", pid, retval);
         free(argv);
     }
+}
 
+int shell_cmd_about(int argc, char **argv)
+{
+    if (argv != NULL)
+        free(argv);
+    int aac = 0;
+    char **aav;
+
+    unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
+    
+    strcpy(input_buffer, "exec /about.elf\0");
+
+    parse_command(input_buffer, &aac, &aav);
+
+    shell_cmd_exec(aac, aav);
 
 }
 
@@ -406,4 +426,54 @@ int shell_cmd_exec(int argc, char **argv)
 int shell_cmd_reboot(int argc, char **argv)
 {
     return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * @brief 解析shell命令
+ *
+ * @param buf 输入缓冲区
+ * @param argc 返回值：参数数量
+ * @param argv 返回值：参数列表
+ * @return int 主命令的编号
+ */
+int parse_command(char *buf, int *argc, char ***argv)
+{
+    // printf("parse command\n");
+    int index = 0; // 当前访问的是buf的第几位
+    // 去除命令前导的空格
+    while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
+        ++index;
+
+    // 计算参数数量
+    for (int i = index; i < (INPUT_BUFFER_SIZE - 1); ++i)
+    {
+        // 到达了字符串末尾
+        if (!buf[i])
+            break;
+        if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
+            ++(*argc);
+    }
+
+    // printf("\nargc=%d\n", *argc);
+
+    // 为指向每个指令的指针分配空间
+    *argv = (char **)malloc(sizeof(char **) * (*argc));
+    memset(*argv, 0, sizeof(char **) * (*argc));
+    // 将每个命令都单独提取出来
+    for (int i = 0; i < *argc && index < INPUT_BUFFER_SIZE; ++i)
+    {
+        // 提取出命令，以空格作为分割
+        *((*argv) + i) = &buf[index];
+        while (index < (INPUT_BUFFER_SIZE - 1) && buf[index] && buf[index] != ' ')
+            ++index;
+        buf[index++] = '\0';
+
+        // 删除命令间多余的空格
+        while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
+            ++index;
+
+        // printf("%s\n", (*argv)[i]);
+    }
+    // 以第一个命令作为主命令，查找其在命令表中的编号
+    return shell_find_cmd(**argv);
 }

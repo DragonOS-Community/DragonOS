@@ -6,6 +6,9 @@
 #include <common/kprint.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
+#include <process/spinlock.h>
+// 每个时刻只能有1个进程新增定时任务
+spinlock_t video_timer_func_add_lock;
 
 #define REFRESH_INTERVAL 15 // 启动刷新帧缓冲区任务的时间间隔
 
@@ -67,11 +70,15 @@ void init_frame_buffer(bool level)
  */
 static void video_refresh_framebuffer()
 {
+    if(current_pcb->pid==3)
+        kdebug("pid3 flush fb");
     memcpy((void *)sc_info.fb_vaddr, (void *)sc_info.double_fb_vaddr, (sc_info.length << 2));
     // 新增下一个刷新定时任务
     struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
+    spin_lock(&video_timer_func_add_lock);
     timer_func_init(tmp, &video_refresh_framebuffer, NULL, REFRESH_INTERVAL);
     timer_func_add(tmp);
+    spin_unlock(&video_timer_func_add_lock);
 }
 
 /**
@@ -86,6 +93,7 @@ int video_init(bool level)
     init_frame_buffer(level);
     if (level)
     {
+        spin_init(&video_timer_func_add_lock);
         // 启用双缓冲后，使能printk滚动动画
         // printk_enable_animation();
         // 初始化第一个屏幕刷新任务

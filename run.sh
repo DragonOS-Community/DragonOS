@@ -88,10 +88,11 @@ else
   flag_can_run=1
 fi
 
-# 拷贝shell到硬盘
+# 拷贝应用程序到硬盘
 cd tools
 bash m*
 sudo cp ${root_folder}/bin/user/shell.elf ${root_folder}/bin/disk_mount
+sudo cp ${root_folder}/bin/user/about.elf ${root_folder}/bin/disk_mount
 sync
 bash u*
 cd ..

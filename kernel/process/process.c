@@ -110,14 +110,6 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //  set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
 
-    if (next->pid == 2)
-    {
-
-        struct pt_regs *child_regs = (struct pt_regs *)next->thread->rsp;
-        kdebug("next->thd->rip=%#018lx", next->thread->rip);
-        kdebug("next proc's ret addr = %#018lx\t next child_regs->rsp = %#018lx, next new_rip=%#018lx)", child_regs->rip, child_regs->rsp, child_regs->rip);
-    }
-
     __asm__ __volatile__("movq	%%fs,	%0 \n\t"
                          : "=a"(prev->thread->fs));
     __asm__ __volatile__("movq	%%gs,	%0 \n\t"
@@ -214,7 +206,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         retval = -EUNSUPPORTED;
         goto load_elf_failed;
     }
-    kdebug("filename=%s:\te_entry=%#018lx", path, ehdr.e_entry);
+    // kdebug("filename=%s:\te_entry=%#018lx", path, ehdr.e_entry);
     regs->rip = ehdr.e_entry;
     current_pcb->mm->code_addr_start = ehdr.e_entry;
 
@@ -246,7 +238,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         pos = phdr->p_offset;
 
         uint64_t virt_base = phdr->p_vaddr;
-        kdebug("virt_base = %#018lx, &memory_management_struct=%#018lx", virt_base, &memory_management_struct);
+        // kdebug("virt_base = %#018lx, &memory_management_struct=%#018lx", virt_base, &memory_management_struct);
 
         while (remain_mem_size > 0)
         {
@@ -254,7 +246,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
             // todo: 改用slab分配4K大小内存块并映射到4K页
             if (!mm_check_mapped((uint64_t)current_pcb->mm->pgd, virt_base)) // 未映射，则新增物理页
             {
-                mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 10, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+                mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
 
                 memset((void *)virt_base, 0, PAGE_2M_SIZE);
             }
@@ -280,16 +272,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     regs->rbp = current_pcb->mm->stack_start;
 
     uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-    // pa+= PAGE_2M_SIZE;
-    kdebug("pa1=%#018lx", pa);
-    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
-    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
-    // pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-    // kdebug("pa2=%#018lx", pa);
-    // // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
 
-    // pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-    // kdebug("pa3=%#018lx", pa);
     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
     // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, 1 * PAGE_2M_SIZE, PAGE_USER_PAGE, true);
     // 清空栈空间
@@ -324,7 +307,7 @@ load_elf_failed:;
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
 
-    kdebug("do_execve is running...");
+    // kdebug("do_execve is running...");
 
     // 当前进程正在与父进程共享地址空间，需要创建
     // 独立的地址空间才能使新程序正常运行
@@ -389,6 +372,10 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 
         for (argc = 0; argc < 8 && argv[argc] != NULL; ++argc)
         {
+
+            if (*argv[argc] == NULL)
+                break;
+
             // 测量参数的长度（最大1023）
             int argv_len = strnlen_user(argv[argc], 1023) + 1;
             strncpy((char *)(str_addr - argv_len), argv[argc], argv_len - 1);
@@ -407,7 +394,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         regs->rdi = argc;
         regs->rsi = (uint64_t)dst_argv;
     }
-    kdebug("execve ok");
+    // kdebug("execve ok");
 
     regs->cs = USER_CS | 3;
     regs->ds = USER_DS | 3;
@@ -671,7 +658,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 拷贝成功
     retval = tsk->pid;
 
-    kdebug("fork done: tsk->pid=%d", tsk->pid);
+    // kdebug("fork done: tsk->pid=%d", tsk->pid);
 
     // kdebug("current_pcb->mm->brk_end=%#018lx", current_pcb->mm->brk_end);
     // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, 0x0000500000000000, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
@@ -838,7 +825,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
         // 当前页表项为空
         if ((*(uint64_t *)(current_pgd + i)) == 0)
             continue;
-        kdebug("user page [%d]", i);
+
         // 分配新的二级页表
         uint64_t *new_pdpt = (uint64_t *)kmalloc(PAGE_4K_SIZE, 0);
         memset(new_pdpt, 0, PAGE_4K_SIZE);
@@ -847,7 +834,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
         set_pml4t(new_pml4t + i, mk_pml4t(virt_2_phys(new_pdpt), (*(current_pgd + i)) & 0xfffUL));
 
         uint64_t *current_pdpt = (uint64_t *)phys_2_virt((*(uint64_t *)(current_pgd + i)) & (~0xfffUL));
-        kdebug("current_pdpt=%#018lx, current_pid=%d", current_pdpt, current_pcb->pid);
+        // kdebug("current_pdpt=%#018lx, current_pid=%d", current_pdpt, current_pcb->pid);
         for (int j = 0; j < 512; ++j)
         {
             if (*(current_pdpt + j) == 0)
@@ -861,7 +848,8 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
             set_pdpt((uint64_t *)(new_pdpt + j), mk_pdpt(virt_2_phys(new_pdt), (*(current_pdpt + j)) & 0xfffUL));
 
             uint64_t *current_pdt = (uint64_t *)phys_2_virt((*(current_pdpt + j)) & (~0xfffUL));
-            kdebug("current_pdt=%#018lx", current_pdt);
+            // kdebug("current_pdt=%#018lx", current_pdt);
+
             // 循环拷贝三级页表
             for (int k = 0; k < 512; ++k)
             {
@@ -878,20 +866,9 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
 
                 // 拷贝数据
                 memcpy(phys_2_virt(pa), phys_2_virt((*(current_pdt + k)) & (~0x1ffUL)), PAGE_2M_SIZE);
-
-                // 计算当前虚拟地址
-                // uint64_t current_vaddr = 0;
-                // current_vaddr = ((1UL * i) << PAGE_GDT_SHIFT) | ((1UL * j) << PAGE_1G_SHIFT) | ((1UL * k) << PAGE_2M_SHIFT);
-
-                // mm_map_proc_page_table((uint64_t)pcb->mm->pgd, true, current_vaddr, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, false);
-
-                // memcpy((void *)phys_2_virt(pa), (void *)current_vaddr, PAGE_2M_SIZE);
             }
         }
-        
     }
-
-   
 
     return retval;
 }
@@ -986,13 +963,13 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
     thd->fs = current_pcb->thread->fs;
     thd->gs = current_pcb->thread->gs;
 
-    kdebug("pcb->flags=%ld", pcb->flags);
+    // kdebug("pcb->flags=%ld", pcb->flags);
     // 根据是否为内核线程，设置进程的开始执行的地址
     if (pcb->flags & PF_KTHREAD)
         thd->rip = (uint64_t)kernel_thread_func;
     else
         thd->rip = (uint64_t)ret_from_system_call;
-    kdebug("new proc's ret addr = %#018lx\tthd->rip=%#018lx   stack_start=%#018lx  child_regs->rsp = %#018lx, new_rip=%#018lx)", child_regs->rbx, thd->rip, stack_start, child_regs->rsp, child_regs->rip);
+    // kdebug("new proc's ret addr = %#018lx\tthd->rip=%#018lx   stack_start=%#018lx  child_regs->rsp = %#018lx, new_rip=%#018lx)", child_regs->rbx, thd->rip, stack_start, child_regs->rsp, child_regs->rip);
     return 0;
 }
 

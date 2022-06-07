@@ -369,16 +369,15 @@ int shell_cmd_exec(int argc, char **argv)
 {
     pid_t pid = fork();
     int retval = 0;
-    printf("  pid=%d  \n",pid);
+    // printf("  pid=%d  \n",pid);
 
-    while(1);
     if (pid == 0)
     {
-        printf("child proc\n");
+        // printf("child proc\n");
         // 子进程
         int path_len = 0;
         char *file_path = get_target_filepath(argv[1], &path_len);
-        printf("before execv, path=%s\n", file_path);
+        // printf("before execv, path=%s, argc=%d\n", file_path, argc);
         execv(file_path, argv);
         free(argv);
         while(1);
@@ -387,13 +386,13 @@ int shell_cmd_exec(int argc, char **argv)
     else
     {
         printf("parent process wait for pid:[ %d ]\n", pid);
-        while(1);
+ 
         waitpid(pid, &retval, 0);
         printf("parent process wait pid [ %d ], exit code=%d\n", pid, retval);
         free(argv);
     }
 
-    while(1);
+
 }
 
 /**

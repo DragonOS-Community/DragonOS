@@ -68,7 +68,7 @@ void mm_init()
         //可用的内存
         if (mb2_mem_info->type == 1)
             Total_Memory += mb2_mem_info->len;
-        
+
         kdebug("[i=%d] mb2_mem_info[i].type=%d, mb2_mem_info[i].addr=%#018lx", i, mb2_mem_info[i].type, mb2_mem_info[i].addr);
         // 保存信息到mms
         memory_management_struct.e820[i].BaseAddr = mb2_mem_info[i].addr;
@@ -345,7 +345,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
                         x->attr = attr;
                     }
                     // 成功分配了页面，返回第一个页面的指针
-                    kwarn("start page num=%d\n", start_page_num);
+                    // kwarn("start page num=%d\n", start_page_num);
                     return (struct Page *)(memory_management_struct.pages_struct + start_page_num);
                 }
             }
@@ -457,7 +457,7 @@ void page_table_init()
 {
     kinfo("Re-Initializing page table...");
     ul *global_CR3 = get_CR3();
-    
+
     int js = 0;
     ul *tmp_addr;
     for (int i = 0; i < memory_management_struct.count_zones; ++i)
@@ -472,9 +472,9 @@ void page_table_init()
         {
             // if (p->addr_phys)
             //     kdebug("(ul)phys_2_virt(p->addr_phys)=%#018lx",(ul)phys_2_virt(p->addr_phys));
-                //mm_map_phys_addr((ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
+            // mm_map_phys_addr((ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
             mm_map_proc_page_table((uint64_t)get_CR3(), true, (ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE, false, true);
-            
+
             ++p;
             ++js;
         }
@@ -483,7 +483,6 @@ void page_table_init()
     flush_tlb();
 
     kinfo("Page table Initialized. Affects:%d", js);
-
 }
 
 /**
@@ -582,7 +581,10 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
                 ul *pde_ptr = pd_ptr + pde_id;
                 if (*pde_ptr != 0 && user)
                 {
-                    kwarn("page already mapped!");
+                    // kwarn("page already mapped!");
+                    // 如果是用户态可访问的页，则释放当前新获取的物理页
+                    free_pages(Phy_to_2M_Page((ul)phys_addr_start + length_mapped), 1);
+                    length_mapped += PAGE_2M_SIZE;
                     continue;
                 }
                 // 页面写穿，禁止缓存

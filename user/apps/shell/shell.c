@@ -42,23 +42,10 @@ void main_loop(int kb_fd)
 
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
-    sbrk(24);
-    // brk(0x700000000000 + (1<<21));
-    pid_t pid = fork();
-    int retval = 0;
-    
-
-    for(int i=0;i<10;++i)
-        printf("  @pid=%d  ", pid);
-    
-    if(pid == 0)
-    {
-        int a = 1/0;
-    }
     // 初始化当前工作目录的路径
     shell_current_path = (char *)malloc(3);
 
-        memset(shell_current_path, 0, 3);
+    memset(shell_current_path, 0, 3);
     shell_current_path[0] = '/';
     shell_current_path[1] = '\0';
 

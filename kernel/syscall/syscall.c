@@ -361,7 +361,7 @@ uint64_t sys_lseek(struct pt_regs *regs)
 
 uint64_t sys_fork(struct pt_regs *regs)
 {
-    kdebug("sys_fork");
+    // kdebug("sys_fork");
     return do_fork(regs, 0, regs->rsp, 0);
 }
 uint64_t sys_vfork(struct pt_regs *regs)
@@ -560,13 +560,13 @@ uint64_t sys_getdents(struct pt_regs *regs)
  */
 uint64_t sys_execve(struct pt_regs *regs)
 {
-    kdebug("sys_execve");
+    // kdebug("sys_execve");
     char *user_path = (char *)regs->r8;
     char **argv = (char **)regs->r9;
 
     int path_len = strnlen_user(user_path, PAGE_4K_SIZE);
 
-    kdebug("path_len=%d", path_len);
+    // kdebug("path_len=%d", path_len);
     if (path_len >= PAGE_4K_SIZE)
         return -ENAMETOOLONG;
     else if (path_len <= 0)
@@ -578,12 +578,12 @@ uint64_t sys_execve(struct pt_regs *regs)
 
     memset(path, 0, path_len + 1);
 
-    kdebug("before copy file path from user");
+    // kdebug("before copy file path from user");
     // 拷贝文件路径
     strncpy_from_user(path, user_path, path_len);
     path[path_len] = '\0';
 
-    kdebug("before do_execve, path = %s", path);
+    // kdebug("before do_execve, path = %s", path);
     // 执行新的程序
     uint64_t retval = do_execve(regs, path, argv, NULL);
 

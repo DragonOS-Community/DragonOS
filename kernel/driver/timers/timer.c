@@ -3,6 +3,7 @@
 #include <exception/softirq.h>
 #include <mm/slab.h>
 #include <driver/timers/HPET/HPET.h>
+#include <process/process.h>
 
 void test_timer()
 {
@@ -24,11 +25,14 @@ void timer_init()
 
 void do_timer_softirq(void *data)
 {
-
+    // if(current_pcb->pid==3)
+    //     kdebug("pid3 timer irq");
     struct timer_func_list_t *tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
-
+    
     while ((!list_empty(&timer_func_head.list)) && (tmp->expire_jiffies <= timer_jiffies))
     {
+        if(current_pcb->pid==3)
+        kdebug("pid3 timer do");
         timer_func_del(tmp);
         tmp->func(tmp->data);
         kfree(tmp);

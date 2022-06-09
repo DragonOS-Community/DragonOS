@@ -1,6 +1,7 @@
 #pragma once
 #include <common/glib.h>
 #include <stdbool.h>
+
 /**
  * @brief 初始化显示模块，需先低级初始化才能高级初始化
  * @param level 初始化等级

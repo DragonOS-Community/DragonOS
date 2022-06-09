@@ -38,7 +38,6 @@ void spin_init(spinlock_t *lock)
  */
 void spin_lock(spinlock_t *lock)
 {
-    preempt_disable();
     __asm__ __volatile__("1:    \n\t"
                          "lock decq %0   \n\t" // 尝试-1
                          "jns 3f    \n\t"      // 加锁成功，跳转到步骤3
@@ -49,13 +48,14 @@ void spin_lock(spinlock_t *lock)
                          "jmp 1b    \n\t" // 尝试加锁
                          "3:"
                          : "=m"(lock->lock)::"memory");
+    preempt_disable();
 }
 
 void spin_unlock(spinlock_t *lock)
 {
+    preempt_enable();
     __asm__ __volatile__("movq $1, %0   \n\t"
                          : "=m"(lock->lock)::"memory");
-    preempt_enable();
 }
 
 /**

@@ -7,6 +7,7 @@
 #include <process/process.h>
 #include <sched/sched.h>
 #include <smp/ipi.h>
+#include <driver/video/video.h>
 
 static struct acpi_HPET_description_table_t *hpet_table;
 static uint64_t HPET_REG_BASE = 0;
@@ -65,7 +66,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 
         // 若当前时间比定时任务的时间间隔大，则进入中断下半部
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
-            set_softirq_status(TIMER_SIRQ);
+            set_softirq_status((1 << TIMER_SIRQ));
 
         sched_update_jiffies();
 

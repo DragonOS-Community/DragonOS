@@ -224,7 +224,7 @@ void *memset_c(void* dst, uint8_t c, size_t count)
  */
 static void *memcpy(void *dst, void *src, long Num)
 {
-    int d0, d1, d2;
+    int d0=0, d1=0, d2=0;
     __asm__ __volatile__("cld	\n\t"
                          "rep	\n\t"
                          "movsq	\n\t"

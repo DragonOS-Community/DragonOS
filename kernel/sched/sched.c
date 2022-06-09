@@ -1,5 +1,7 @@
 #include "sched.h"
 #include <common/kprint.h>
+#include <driver/video/video.h>
+#include <process/spinlock.h>
 
 struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
 
@@ -50,7 +52,9 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
  */
 void sched_cfs()
 {
+
     cli();
+
     current_pcb->flags &= ~PF_NEED_SCHED;
     struct process_control_block *proc = sched_cfs_dequeue();
     // kdebug("sched_cfs_ready_queue[proc_current_cpu_id].count = %d", sched_cfs_ready_queue[proc_current_cpu_id].count);
@@ -74,17 +78,9 @@ void sched_cfs()
                 break;
             }
         }
-        // kdebug("before switch, next.rip = %#018lx\tnext->gs=%#018lx", proc->thread->rip, proc->thread->gs);
-        // kdebug("currentpcb=%#018lx", (uint64_t)current_pcb);
         
-        // if(proc->pid == 1 && pid_one_map_count < 2)
-        // {
-        //     mm_map_proc_page_table(proc->mm->pgd, true, pid_one_map_offset, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
-        //     pid_one_map_count++;
-        //     pid_one_map_offset += PAGE_2M_SIZE;
-        // }
         process_switch_mm(proc);
-        
+
         switch_proc(current_pcb, proc);
     }
     else // 不进行切换

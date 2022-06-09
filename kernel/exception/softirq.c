@@ -1,6 +1,7 @@
 #include "softirq.h"
 #include <common/kprint.h>
-
+#include <process/process.h>
+uint64_t softirq_status = 0;
 void set_softirq_status(uint64_t status)
 {
     softirq_status |= status;
@@ -45,10 +46,9 @@ void do_softirq()
     sti();
     for (uint32_t i = 0; i < MAX_SOFTIRQ_NUM && softirq_status; ++i)
     {
-        if (softirq_status & (1 << i))
-        {
+        if (softirq_status & (1 << i) && softirq_vector[i].action != NULL)
+        {            
             softirq_vector[i].action(softirq_vector[i].data);
-            softirq_status &= (~(1 << i));
         }
     }
 

@@ -1,5 +1,5 @@
 #include <libc/stdio.h>
-
+#include<libc/stdlib.h>
 void print_ascii_logo()
 {
     printf(" ____                                      ___   ____ \n");
@@ -25,7 +25,7 @@ int main()
     // printf("Hello World!\n");
     print_ascii_logo();
     print_copyright();
-    exit(1);
+    exit(0);
     while (1)
         ;
 }

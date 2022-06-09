@@ -70,13 +70,15 @@ void init_frame_buffer(bool level)
  */
 static void video_refresh_framebuffer()
 {
-    if(current_pcb->pid==3)
-        kdebug("pid3 flush fb");
+
+    // kdebug("pid%d flush fb", current_pcb->pid);
+
     memcpy((void *)sc_info.fb_vaddr, (void *)sc_info.double_fb_vaddr, (sc_info.length << 2));
+
     // 新增下一个刷新定时任务
     struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
     spin_lock(&video_timer_func_add_lock);
-    timer_func_init(tmp, &video_refresh_framebuffer, NULL, REFRESH_INTERVAL);
+    timer_func_init(tmp, &video_refresh_framebuffer, NULL, 10 * REFRESH_INTERVAL);
     timer_func_add(tmp);
     spin_unlock(&video_timer_func_add_lock);
 }
@@ -100,6 +102,5 @@ int video_init(bool level)
         struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
         timer_func_init(tmp, &video_refresh_framebuffer, NULL, REFRESH_INTERVAL);
         timer_func_add(tmp);
-
     }
 }

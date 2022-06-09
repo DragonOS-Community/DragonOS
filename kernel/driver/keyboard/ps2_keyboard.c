@@ -201,7 +201,6 @@ void ps2_keyboard_init()
     kb_buf_ptr = (struct ps2_keyboard_input_buffer *)kmalloc(sizeof(struct ps2_keyboard_input_buffer), 0);
 
     ps2_keyboard_reset_buffer(kb_buf_ptr);
-    
 
     // ======== 初始化中断RTE entry ==========
 

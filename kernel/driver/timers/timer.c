@@ -5,6 +5,8 @@
 #include <driver/timers/HPET/HPET.h>
 #include <process/process.h>
 
+struct timer_func_list_t timer_func_head;
+
 void test_timer()
 {
     printk_color(ORANGE, BLACK, "(test_timer)");
@@ -14,7 +16,7 @@ void timer_init()
 {
     timer_jiffies = 0;
     timer_func_init(&timer_func_head, NULL, NULL, -1UL);
-    register_softirq(0, &do_timer_softirq, NULL);
+    register_softirq(TIMER_SIRQ, &do_timer_softirq, NULL);
 
     struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
     timer_func_init(tmp, &test_timer, NULL, 5);
@@ -28,17 +30,18 @@ void do_timer_softirq(void *data)
     // if(current_pcb->pid==3)
     //     kdebug("pid3 timer irq");
     struct timer_func_list_t *tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
-    
+
     while ((!list_empty(&timer_func_head.list)) && (tmp->expire_jiffies <= timer_jiffies))
     {
-        if(current_pcb->pid==3)
-        kdebug("pid3 timer do");
+        if (current_pcb->pid == 2)
+            kdebug("pid2 timer do");
         timer_func_del(tmp);
         tmp->func(tmp->data);
         kfree(tmp);
         tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
     }
 
+    softirq_ack(TIMER_SIRQ);
     // printk_color(ORANGE, BLACK, "(HPET%ld)", timer_jiffies);
 }
 
@@ -55,7 +58,8 @@ void timer_func_init(struct timer_func_list_t *timer_func, void (*func)(void *da
     list_init(&timer_func->list);
     timer_func->func = func;
     timer_func->data = data,
-    timer_func->expire_jiffies = timer_jiffies + expire_ms / 5 + expire_ms % HPET0_INTERVAL ? 1 : 0;    // 设置过期的时间片
+    // timer_func->expire_jiffies = timer_jiffies + expire_ms / 5 + expire_ms % HPET0_INTERVAL ? 1 : 0; // 设置过期的时间片
+    timer_func->expire_jiffies = cal_next_n_ms_jiffies(expire_ms); // 设置过期的时间片
 }
 
 /**

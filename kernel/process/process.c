@@ -11,12 +11,11 @@
 #include <common/stdio.h>
 #include <process/spinlock.h>
 #include <common/libELF/elf.h>
+#include <driver/video/video.h>
 
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
 
-uint64_t pid_one_map_offset = 0x0000020000000000;
-int pid_one_map_count = 0;
 
 extern void system_call(void);
 extern void kernel_thread_func(void);
@@ -133,8 +132,10 @@ struct vfs_file_t *process_open_exec_file(char *path)
 
     dentry = vfs_path_walk(path, 0);
 
+
     if (dentry == NULL)
         return (void *)-ENOENT;
+
     if (dentry->dir_inode->attribute == VFS_ATTR_DIR)
         return (void *)-ENOTDIR;
 
@@ -162,9 +163,10 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 {
     int retval = 0;
     struct vfs_file_t *filp = process_open_exec_file(path);
-    if ((unsigned long)filp <= 0)
+
+    if ((long)filp <= 0 && (long)filp >=-255)
     {
-        kdebug("(unsigned long)filp=%d", (long)filp);
+        // kdebug("(long)filp=%ld", (long)filp);
         return (unsigned long)filp;
     }
 
@@ -274,21 +276,11 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
 
     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
-    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, 1 * PAGE_2M_SIZE, PAGE_USER_PAGE, true);
+    
     // 清空栈空间
     memset((void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), 0, PAGE_2M_SIZE);
 
-    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE * 2, alloc_pages(ZONE_NORMAL, 2, PAGE_PGT_MAPPED)->addr_phys, 2 * PAGE_2M_SIZE, PAGE_USER_PAGE, true);
-    // // 清空栈空间
-    // memset((void *)(current_pcb->mm->stack_start - 2 * PAGE_2M_SIZE), 0, 2 * PAGE_2M_SIZE);
-
-    // if (current_pcb->pid == 1 && pid_one_map_count < 2)
-    // {
-    //     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, pid_one_map_offset, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
-    //     memset(pid_one_map_offset, 0, PAGE_2M_SIZE);
-    //     pid_one_map_count++;
-    //     pid_one_map_offset += PAGE_2M_SIZE;
-    // }
+    
 
 load_elf_failed:;
     if (buf != NULL)
@@ -359,7 +351,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     // 加载elf格式的可执行文件
     int tmp = process_load_elf_file(regs, path);
     if (tmp < 0)
-        return tmp;
+        goto exec_failed;
 
     // 拷贝参数列表
     if (argv != NULL)
@@ -394,7 +386,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         regs->rdi = argc;
         regs->rsi = (uint64_t)dst_argv;
     }
-    // kdebug("execve ok");
+    kdebug("execve ok");
 
     regs->cs = USER_CS | 3;
     regs->ds = USER_DS | 3;
@@ -404,6 +396,9 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     regs->es = 0;
 
     return 0;
+
+exec_failed:;
+    process_do_exit(tmp);
 }
 
 /**
@@ -415,6 +410,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
+
     fat32_init();
 
     struct pt_regs *regs;
@@ -463,7 +459,7 @@ void process_exit_notify()
  */
 ul process_do_exit(ul code)
 {
-    kinfo("process exiting..., code is %#018lx.", code);
+    // kinfo("process exiting..., code is %ld.", (long)code);
     cli();
     struct process_control_block *pcb = current_pcb;
 

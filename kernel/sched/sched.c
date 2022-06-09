@@ -78,6 +78,13 @@ void sched_cfs()
                 break;
             }
         }
+
+        // if (proc->pid == 0)
+        // {
+        //     kdebug("switch to pid0, current pid%ld, vrt=%ld      pid0 vrt=%ld", current_pcb->pid, current_pcb->virtual_runtime, proc->virtual_runtime);
+        //     if(current_pcb->state != PROC_RUNNING)
+        //         kdebug("current_pcb->state!=PROC_RUNNING");
+        // }
         
         process_switch_mm(proc);
 

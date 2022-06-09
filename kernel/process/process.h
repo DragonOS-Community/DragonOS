@@ -125,7 +125,7 @@ struct process_control_block
 
 	long pid;
 	long priority;		  // 优先级
-	long virtual_runtime; // 虚拟运行时间
+	int64_t virtual_runtime; // 虚拟运行时间
 
 	// 进程拥有的文件描述符的指针数组
 	// todo: 改用动态指针数组

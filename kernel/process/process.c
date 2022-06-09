@@ -16,7 +16,6 @@
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
 
-
 extern void system_call(void);
 extern void kernel_thread_func(void);
 
@@ -132,7 +131,6 @@ struct vfs_file_t *process_open_exec_file(char *path)
 
     dentry = vfs_path_walk(path, 0);
 
-
     if (dentry == NULL)
         return (void *)-ENOENT;
 
@@ -164,7 +162,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     int retval = 0;
     struct vfs_file_t *filp = process_open_exec_file(path);
 
-    if ((long)filp <= 0 && (long)filp >=-255)
+    if ((long)filp <= 0 && (long)filp >= -255)
     {
         // kdebug("(long)filp=%ld", (long)filp);
         return (unsigned long)filp;
@@ -276,11 +274,9 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
 
     mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
-    
+
     // 清空栈空间
     memset((void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), 0, PAGE_2M_SIZE);
-
-    
 
 load_elf_failed:;
     if (buf != NULL)
@@ -565,13 +561,14 @@ void process_init()
 */
     // 初始化pid的写锁
     spin_init(&process_global_pid_write_lock);
-
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核进程
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;
     initial_proc_union.pcb.cpu_id = 0;
+    initial_proc_union.pcb.virtual_runtime = (1UL << 60);
+    current_pcb->virtual_runtime = (1UL << 60);
 }
 
 /**
@@ -625,7 +622,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     spin_unlock(&process_global_pid_write_lock);
 
     tsk->cpu_id = proc_current_cpu_id;
-    tsk->state = PROC_UNINTERRUPTIBLE;
+    tsk->state = PROC_RUNNING;
 
     tsk->parent_pcb = current_pcb;
     wait_queue_init(&tsk->wait_child_proc_exit, NULL);

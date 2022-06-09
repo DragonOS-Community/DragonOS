@@ -7,10 +7,15 @@
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <process/spinlock.h>
+#include <exception/softirq.h>
+
 // 每个时刻只能有1个进程新增定时任务
 spinlock_t video_timer_func_add_lock;
 
-#define REFRESH_INTERVAL 15 // 启动刷新帧缓冲区任务的时间间隔
+uint64_t video_refresh_expire_jiffies = 0;
+uint64_t video_last_refresh_pid = -1;
+
+#define REFRESH_INTERVAL 15UL // 启动刷新帧缓冲区任务的时间间隔
 
 ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
 struct screen_info_t
@@ -68,19 +73,15 @@ void init_frame_buffer(bool level)
  * @brief 刷新帧缓冲区
  *
  */
-static void video_refresh_framebuffer()
+void video_refresh_framebuffer(void *data)
 {
-
-    // kdebug("pid%d flush fb", current_pcb->pid);
+    // 暂时设置一个很大的值作为屏障，防止二次进入该区域（造成#GP）
+    video_refresh_expire_jiffies = timer_jiffies + 100000;
+    video_last_refresh_pid = current_pcb->pid;
+    softirq_ack(VIDEO_REFRESH_SIRQ);
 
     memcpy((void *)sc_info.fb_vaddr, (void *)sc_info.double_fb_vaddr, (sc_info.length << 2));
-
-    // 新增下一个刷新定时任务
-    struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
-    spin_lock(&video_timer_func_add_lock);
-    timer_func_init(tmp, &video_refresh_framebuffer, NULL, 10 * REFRESH_INTERVAL);
-    timer_func_add(tmp);
-    spin_unlock(&video_timer_func_add_lock);
+    video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL);
 }
 
 /**
@@ -99,8 +100,15 @@ int video_init(bool level)
         // 启用双缓冲后，使能printk滚动动画
         // printk_enable_animation();
         // 初始化第一个屏幕刷新任务
-        struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
-        timer_func_init(tmp, &video_refresh_framebuffer, NULL, REFRESH_INTERVAL);
-        timer_func_add(tmp);
+        // struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
+        // timer_func_init(tmp, &video_refresh_framebuffer, NULL, 10*REFRESH_INTERVAL);
+        // timer_func_add(tmp);
+        register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
+        kdebug("15/5=%#ld", 15 / 5);
+        kdebug("1212121=%#ld", REFRESH_INTERVAL / 5);
+        kdebug("sdds21=%#ld", REFRESH_INTERVAL / 5 + (REFRESH_INTERVAL % HPET0_INTERVAL ? 1 : 0));
+        video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
+        kdebug("video_refresh_expire_jiffies=%ld", video_refresh_expire_jiffies);
+        raise_softirq(VIDEO_REFRESH_SIRQ);
     }
 }

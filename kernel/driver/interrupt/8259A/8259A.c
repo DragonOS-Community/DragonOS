@@ -8,9 +8,9 @@ extern void (*interrupt_table[24])(void);
 
 void init_8259A()
 {
-    // 初始化中断门， 中断使用第二个ist
+    // 初始化中断门， 中断使用第0个ist
     for(int i=32;i<=55;++i)
-        set_intr_gate(i, 2, interrupt_table[i-32]);
+        set_intr_gate(i, 0, interrupt_table[i-32]);
     kinfo("Initializing 8259A...");
     
     // 初始化主芯片

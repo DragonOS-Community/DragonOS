@@ -1,6 +1,7 @@
 #include "softirq.h"
 #include <common/kprint.h>
 #include <process/process.h>
+#include <driver/video/video.h>
 uint64_t softirq_status = 0;
 void set_softirq_status(uint64_t status)
 {
@@ -42,17 +43,18 @@ void unregister_softirq(uint32_t irq_num)
  */
 void do_softirq()
 {
-
     sti();
+    // video_refresh_framebuffer();
     for (uint32_t i = 0; i < MAX_SOFTIRQ_NUM && softirq_status; ++i)
     {
         if (softirq_status & (1 << i) && softirq_vector[i].action != NULL)
-        {            
+        {
             softirq_vector[i].action(softirq_vector[i].data);
         }
     }
 
     cli();
+    
 }
 
 void softirq_init()

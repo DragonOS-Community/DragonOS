@@ -68,6 +68,18 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
             set_softirq_status((1 << TIMER_SIRQ));
 
+        // if (current_pcb->pid == 2)
+        //     kwarn("timer_jiffies = %ld video_refresh_expire_jiffies=%ld", timer_jiffies, video_refresh_expire_jiffies);
+        if (timer_jiffies >= video_refresh_expire_jiffies)
+        {
+            raise_softirq(VIDEO_REFRESH_SIRQ);
+        }
+        else
+        {
+            if (video_last_refresh_pid != current_pcb->pid)
+                raise_softirq(VIDEO_REFRESH_SIRQ);
+        }
+
         sched_update_jiffies();
 
         break;
@@ -142,6 +154,8 @@ int HPET_init()
     HPET_NUM_TIM_CAP = (tmp >> 8) & 0x1f; // 读取计时器数量
 
     // kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, (double)HPET_freq);
+    kdebug("HPET_freq=%ld", (long)HPET_freq);
+    // kdebug("HPET_freq=%lf", HPET_freq);
 
     struct apic_IO_APIC_RTE_entry entry;
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
@@ -149,6 +163,7 @@ int HPET_init()
 
     // 计算HPET0间隔多少个时钟周期触发一次中断
     uint64_t clks_to_intr = 0.001 * HPET0_INTERVAL * HPET_freq;
+    // kdebug("clks_to_intr=%#ld", clks_to_intr);
     if (clks_to_intr <= 0 || clks_to_intr > (HPET_freq * 8))
     {
         kBUG("HPET0: Numof clocks to generate interrupt is INVALID! value=%lld", clks_to_intr);

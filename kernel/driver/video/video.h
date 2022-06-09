@@ -10,3 +10,8 @@
  * @return int
  */
 int video_init(bool level);
+
+extern uint64_t video_refresh_expire_jiffies;
+extern uint64_t video_last_refresh_pid;
+
+extern void video_refresh_framebuffer();

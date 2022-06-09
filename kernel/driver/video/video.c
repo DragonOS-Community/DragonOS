@@ -104,11 +104,9 @@ int video_init(bool level)
         // timer_func_init(tmp, &video_refresh_framebuffer, NULL, 10*REFRESH_INTERVAL);
         // timer_func_add(tmp);
         register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
-        kdebug("15/5=%#ld", 15 / 5);
-        kdebug("1212121=%#ld", REFRESH_INTERVAL / 5);
-        kdebug("sdds21=%#ld", REFRESH_INTERVAL / 5 + (REFRESH_INTERVAL % HPET0_INTERVAL ? 1 : 0));
+        
         video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
-        kdebug("video_refresh_expire_jiffies=%ld", video_refresh_expire_jiffies);
+
         raise_softirq(VIDEO_REFRESH_SIRQ);
     }
 }

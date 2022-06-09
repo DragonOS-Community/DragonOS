@@ -622,7 +622,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     spin_unlock(&process_global_pid_write_lock);
 
     tsk->cpu_id = proc_current_cpu_id;
-    tsk->state = PROC_RUNNING;
+    tsk->state = PROC_UNINTERRUPTIBLE;
 
     tsk->parent_pcb = current_pcb;
     wait_queue_init(&tsk->wait_child_proc_exit, NULL);

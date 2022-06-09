@@ -70,15 +70,12 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 
         // if (current_pcb->pid == 2)
         //     kwarn("timer_jiffies = %ld video_refresh_expire_jiffies=%ld", timer_jiffies, video_refresh_expire_jiffies);
-        if (timer_jiffies >= video_refresh_expire_jiffies)
+        // 当时间到了，或进程发生切换时，刷新帧缓冲区
+        if (timer_jiffies >= video_refresh_expire_jiffies || (video_last_refresh_pid != current_pcb->pid))
         {
             raise_softirq(VIDEO_REFRESH_SIRQ);
         }
-        else
-        {
-            if (video_last_refresh_pid != current_pcb->pid)
-                raise_softirq(VIDEO_REFRESH_SIRQ);
-        }
+        
 
         sched_update_jiffies();
 
@@ -154,7 +151,7 @@ int HPET_init()
     HPET_NUM_TIM_CAP = (tmp >> 8) & 0x1f; // 读取计时器数量
 
     // kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, (double)HPET_freq);
-    kdebug("HPET_freq=%ld", (long)HPET_freq);
+    // kdebug("HPET_freq=%ld", (long)HPET_freq);
     // kdebug("HPET_freq=%lf", HPET_freq);
 
     struct apic_IO_APIC_RTE_entry entry;

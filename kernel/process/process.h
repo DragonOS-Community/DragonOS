@@ -152,15 +152,15 @@ union proc_union
 	{                                     \
 		.state = PROC_UNINTERRUPTIBLE,    \
 		.flags = PF_KTHREAD,              \
+		.preempt_count = 0,               \
+		.signal = 0,                      \
+		.cpu_id = 0,                      \
 		.mm = &initial_mm,                \
 		.thread = &initial_thread,        \
 		.addr_limit = 0xffffffffffffffff, \
 		.pid = 0,                         \
-		.virtual_runtime = 0,             \
-		.signal = 0,                      \
 		.priority = 2,                    \
-		.preempt_count = 0,               \
-		.cpu_id = 0,                      \
+		.virtual_runtime = 0,             \
 		.fds = {0},                       \
 		.next_pcb = &proc,                \
 		.parent_pcb = &proc,              \

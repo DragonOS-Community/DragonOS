@@ -9,7 +9,7 @@
 #define preempt_disable()   \
 do  \
 {   \
-    --(current_pcb->preempt_count);\
+    ++(current_pcb->preempt_count);\
 } while (0)
 
 /**
@@ -19,5 +19,5 @@ do  \
 #define preempt_enable()   \
 do  \
 {   \
-    ++(current_pcb->preempt_count);\
+    --(current_pcb->preempt_count);\
 }while(0)

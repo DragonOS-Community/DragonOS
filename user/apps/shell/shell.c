@@ -19,7 +19,7 @@
  */
 
 int shell_readline(int fd, char *buf);
-
+void print_ascii_logo();
 extern char *shell_current_path;
 
 
@@ -72,7 +72,7 @@ int main()
     char kb_file_path[] = "/dev/keyboard.dev";
     int kb_fd = open(kb_file_path, 0);
     // printf("keyboard fd = %d\n", kb_fd);
-
+    print_ascii_logo();
     main_loop(kb_fd);
     while (1)
         ;
@@ -122,3 +122,14 @@ int shell_readline(int fd, char *buf)
     }
 }
 
+void print_ascii_logo()
+{
+    printf("\n\n");
+    printf(" ____                                      ___   ____ \n");
+    printf("|  _ \\  _ __   __ _   __ _   ___   _ __   / _ \\ / ___| \n");
+    printf("| | | || '__| / _` | / _` | / _ \\ | '_ \\ | | | |\\___ \\  \n");
+    printf("| |_| || |   | (_| || (_| || (_) || | | || |_| | ___) |\n");
+    printf("|____/ |_|    \\__,_| \\__, | \\___/ |_| |_| \\___/ |____/ \n");
+    printf("                     |___/     \n");
+    printf("\n\n");
+}

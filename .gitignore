@@ -8,3 +8,5 @@ kernel/kernel
 *.s
 serial_opt.txt
 user/sys_api_lib
+
+docs/_build

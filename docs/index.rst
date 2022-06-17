@@ -7,22 +7,24 @@
 ====================================
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: 入门
 
    introduction/intro
+   introduction/build_system
 
 .. toctree::
    :maxdepth: 2
    :caption: 内核层
 
-   introduction/intro
+   kernel/intro
+   
 
 .. toctree::
    :maxdepth: 2
    :caption: 用户层
 
-   introduction/intro
+   userland/intro
 
 .. toctree::
    :maxdepth: 2

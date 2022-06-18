@@ -1,13 +1,9 @@
 应用层
 ====================================
-.. toctree::
-   :maxdepth: 1
-   
-   intro
 
 .. toctree::
    :maxdepth: 2
-   :caption: LibC
+   :caption: 目录
 
-   
+   intro
    libc/index

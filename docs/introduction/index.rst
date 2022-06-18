@@ -3,7 +3,7 @@
 
 .. toctree::
    :maxdepth: 1
-   :caption: LibC
+   :caption: 目录
 
    intro
    build_system

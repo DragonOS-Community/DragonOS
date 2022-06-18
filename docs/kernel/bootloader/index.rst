@@ -3,6 +3,6 @@
 
 .. toctree::
    :maxdepth: 2
-   :caption: bl
+   :caption: 目录
 
    intro

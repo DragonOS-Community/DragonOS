@@ -10,27 +10,26 @@
    :maxdepth: 1
    :caption: 入门
 
-   introduction/intro
-   introduction/build_system
+   introduction/index
 
 .. toctree::
    :maxdepth: 2
    :caption: 内核层
 
-   kernel/intro
-   
+   kernel/index
+
 
 .. toctree::
    :maxdepth: 2
-   :caption: 用户层
+   :caption: 应用层
 
-   userland/intro
+   userland/index
 
 .. toctree::
    :maxdepth: 2
    :caption: 系统调用api文档
 
-   syscall_api/intro
+   syscall_api/index
 
 
 Indices and tables

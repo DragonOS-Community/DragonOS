@@ -5,7 +5,7 @@
 - GNU make
 - GCC >= 8.3.0
 - xorriso
-- grub 2.04
+- grub 2.06
 
 ## 开发环境
 

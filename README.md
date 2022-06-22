@@ -6,6 +6,11 @@
 
 这是一个运行于x86_64平台的64位操作系统。目前正在开发之中！
 
+## 网站
+- 项目官网  **[DragonOS.org](https://dragonos.org)**
+- 项目文档  **[docs.DragonOS.org](https://docs.dragonos.org)**
+- 开源论坛  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
+&nbsp;
 ## 开发环境
 
 GCC>=8.0
@@ -72,11 +77,11 @@ grub==2.06
 
 - [x] 浮点数支持
 
-- [ ] 基于POSIX实现系统调用库
+- [x] 基于POSIX实现系统调用库
 
-- [ ] Shell
+- [x] Shell
 
-- [ ] 内核栈反向跟踪
+- [x] 内核栈反向跟踪
 
 - [ ] 动态加载模块
 

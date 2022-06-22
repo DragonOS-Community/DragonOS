@@ -14,16 +14,19 @@ GLOBAL_CFLAGS += -g
 endif
 
 .PHONY: all
-all:
+all: kernel user
+	
+
+
+.PHONY: kernel
+kernel:
 	mkdir -p bin/kernel/
-	mkdir -p bin/user/
-	mkdir -p bin/tmp/
-	@list='$(SUBDIRS)'; for subdir in $$list; do \
-    		echo "make all in $$subdir";\
-    		cd $$subdir;\
-    		 $(MAKE) all;\
-    		cd ..;\
-    done
+	@list='./kernel'; for subdir in $$list; do \
+				echo "make all in $$subdir";\
+				cd $$subdir;\
+				$(MAKE) all;\
+				cd ..;\
+		done
 
 .PHONY: user
 user:

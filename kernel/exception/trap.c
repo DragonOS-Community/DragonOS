@@ -3,12 +3,14 @@
 #include "../process/ptrace.h"
 #include "../common/kprint.h"
 #include <process/process.h>
+#include <debug/traceback/traceback.h>
 
 // 0 #DE 除法错误
 void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
     // kerror("do_divide_error(0)");
     kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\t pid=%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
+    traceback(regs);
     current_pcb->state = PROC_STOPPED;
     while (1)
         hlt();
@@ -75,8 +77,8 @@ void do_bounds(struct pt_regs *regs, unsigned long error_code)
 void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
-
+    kerror("do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d, pid:%ld", error_code, regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
+    traceback(regs);
     while (1)
         hlt();
 }
@@ -98,7 +100,7 @@ void do_double_fault(struct pt_regs *regs, unsigned long error_code)
     printk("[ ");
     printk_color(RED, BLACK, "Terminate");
     printk(" ] do_double_fault(8),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
-
+    traceback(regs);
     while (1)
         hlt();
 }

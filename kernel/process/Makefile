@@ -14,3 +14,6 @@ process.o: process.c
 
 wait_queue.o: wait_queue.c
 	gcc $(CFLAGS) -c wait_queue.c -o wait_queue.o
+
+clean:
+	echo "Done."

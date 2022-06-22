@@ -10,3 +10,6 @@ all:
     		$(MAKE) all CFLAGS="$(CFLAGS)";\
     		cd ..;\
 	done
+
+clean:
+	echo "Done."

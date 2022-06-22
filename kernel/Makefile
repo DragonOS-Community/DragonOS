@@ -18,10 +18,8 @@ LD_LIST := head.o
 OBJ_LIST := head.o
 
 
-kernel_subdirs := common driver process
+kernel_subdirs := common driver process debug
 	
-
-
 
 
 head.o: head.S
@@ -144,17 +142,34 @@ uart.o: driver/uart/uart.c
 	gcc $(CFLAGS) -c driver/uart/uart.c -o driver/uart/uart.o
 
 
-all: kernel
 
+all: kernel
+	echo "Linking kernel..."
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") -T link.lds
+# 生成kallsyms
+	current_dir=$(pwd)
+	
+	@dbg='debug';for x in $$dbg; do \
+		cd $$x;\
+		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)";\
+		cd ..;\
+	done
+	
+# 重新链接
+	echo "Re-Linking kernel..."
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ./debug/kallsyms.o -T link.lds
+	echo "Generating kernel ELF file..."
+# 生成内核文件
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
+	echo "Done."
+
 
 kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
 	
 	@list='$(kernel_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
-    		$(MAKE) all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)";\
+    		$(MAKE) all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" kernel_root_path="$(shell pwd)";\
     		cd ..;\
 	done
 
@@ -163,3 +178,8 @@ kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o sy
 
 clean: 
 	rm -rf $(GARBAGE)
+	@list='$(kernel_subdirs)'; for subdir in $$list; do \
+		echo "Clean in dir: $$subdir";\
+		cd $$subdir && $(MAKE) clean;\
+		cd .. ;\
+	done

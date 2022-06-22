@@ -6,6 +6,12 @@
 
 This project is a operating system running on computer which is in X86_ 64 Architecture . The DragonOS is currently under development!
 
+## Websites
+- Home Page  **[DragonOS.org](https://dragonos.org)**
+- Documentation  **[docs.DragonOS.org](https://docs.dragonos.org)**
+- BBS  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
+&nbsp;
+
 ## Development Environment
 
 GCC>=8.0
@@ -72,11 +78,11 @@ grub==2.06
 
 - [x] Floating point support
 
-- [ ] Implementation of system call library based on POSIX
+- [x] Implementation of system call library based on POSIX
 
-- [ ] Shell
+- [x] Shell
 
-- [ ] Kernel stack backtracking
+- [x] Kernel stack backtracking
 
 - [ ] Dynamic loading module
 

@@ -51,13 +51,15 @@ void traceback(struct pt_regs *regs)
     // 最大追踪10层调用栈
     for (int i = 0; i < 10; ++i)
     {
-        printk_color(ORANGE, BLACK, "rbp:%#018lx,*rbp:%#018lx\n", rbp, *rbp);
         if (lookup_kallsyms(ret_addr, i) != 0)
             break;
 
-        // 由于内核栈大小32K，因此当前rbp的值为按照32K对齐时，表明调用栈已经到头了，追踪结束。
-        if (((*rbp) & (~STACK_SIZE)) == 0)
+        // 当前栈帧的rbp的地址大于等于内核栈的rbp的时候，表明调用栈已经到头了，追踪结束。
+        // 当前rbp的地址为用户空间时，直接退出
+        if((uint64_t)(rbp) >= current_pcb->thread->rbp || ((uint64_t)rbp<regs->rsp))
             break;
+
+        printk_color(ORANGE, BLACK, "rbp:%#018lx,*rbp:%#018lx\n", rbp, *rbp);
 
         // 由于x86处理器在执行call指令时，先将调用返回地址压入栈中，然后再把函数的rbp入栈，最后将rsp设为新的rbp。
         // 因此，此处的rbp就是上一层的rsp，那么，*(rbp+1)得到的就是上一层函数的返回地址

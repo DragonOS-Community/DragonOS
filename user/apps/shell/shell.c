@@ -73,7 +73,7 @@ int main()
     int kb_fd = open(kb_file_path, 0);
     // printf("keyboard fd = %d\n", kb_fd);
     print_ascii_logo();
-    int a = 1/0;
+
     main_loop(kb_fd);
     while (1)
         ;

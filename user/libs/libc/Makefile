@@ -4,6 +4,10 @@ CFLAGS += -I .
 
 libc_sub_dirs=math sys
 
+ifeq ($(ARCH), __x86_64__)
+libc_sub_dirs += sysdeps/x86_64
+endif
+
 
 libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o string.o dirent.o
 	@list='$(libc_sub_dirs)'; for subdir in $$list; do \

@@ -108,7 +108,19 @@ struct vfs_super_block_operations_t
 struct vfs_inode_operations_t
 {
     long (*create)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry, int mode);
+    /**
+     * @brief 在文件系统中查找指定的目录项
+     * @param parent_inode 父目录项（在这个目录下查找）
+     * @param dest_dEntry 构造的目标目录项的结构体（传入名称，然后更多的详细信息将在本函数中完成填写）
+     *
+     */
     struct vfs_dir_entry_t *(*lookup)(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry);
+    /**
+     * @brief 创建文件夹
+     * @param inode 父目录的inode
+     * @param dEntry 新的文件夹的dentry
+     * @param mode 创建文件夹的mode
+     */
     long (*mkdir)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry, int mode);
     long (*rmdir)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry);
     long (*rename)(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry);
@@ -173,6 +185,6 @@ struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags);
 
 /**
  * @brief 填充dentry
- * 
+ *
  */
 int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset);

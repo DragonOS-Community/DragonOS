@@ -74,6 +74,15 @@ uint64_t sys_brk(struct pt_regs *regs);
  */
 uint64_t sys_sbrk(struct pt_regs *regs);
 
+/**
+ * @brief 创建文件夹
+ * 在VFS.c中实现
+ * @param path(r8) 路径
+ * @param mode(r9) 模式
+ * @return uint64_t 
+ */
+uint64_t sys_mkdir(struct pt_regs * regs);
+
 ul sys_ahci_end_req(struct pt_regs *regs);
 
 // 系统调用的内核入口程序

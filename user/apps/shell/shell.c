@@ -5,7 +5,7 @@
 #include <libKeyboard/keyboard.h>
 #include <libc/string.h>
 #include <libc/stddef.h>
-
+#include <libc/sys/stat.h>
 #include "cmd.h"
 
 #define pause_cpu() asm volatile("pause\n\t");
@@ -73,7 +73,9 @@ int main()
     int kb_fd = open(kb_file_path, 0);
     // printf("keyboard fd = %d\n", kb_fd);
     print_ascii_logo();
-
+    printf("before mkdir\n");
+    mkdir("/aaac", 0);
+    printf("after mkdir\n");
     main_loop(kb_fd);
     while (1)
         ;

@@ -168,7 +168,7 @@ static inline struct List *list_next(struct List *entry)
 }
 
 //计算字符串的长度（经过测试，该版本比采用repne/scasb汇编的运行速度快16.8%左右）
-static inline int strlen(char *s)
+static inline int strlen(const char *s)
 {
     if(s == NULL)
         return 0;
@@ -179,6 +179,15 @@ static inline int strlen(char *s)
     }
     return __res;
 }
+
+/**
+ * @brief 测量字符串的长度
+ * 
+ * @param src 字符串
+ * @param maxlen 最大长度
+ * @return long 
+ */
+long strnlen(const char *src, unsigned long maxlen);
 
 void *memset(void *dst, unsigned char C, ul size)
 {
@@ -530,18 +539,9 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
  * @param maxlen
  * @return long
  */
-long strnlen_user(void *src, unsigned long maxlen)
-{
+long strnlen_user(const char *src, unsigned long maxlen);
 
-    unsigned long size = strlen(src);
-    // 地址不合法
-    if (!verify_area((uint64_t)src, size))
-        return 0;
-
-    return size <= maxlen ? size : maxlen;
-}
-
-char *strncpy(char *Dest, char *Src, long Count)
+char *strncpy(char *Dest, const char *Src, long Count)
 {
     __asm__ __volatile__("cld	\n\t"
                          "1:	\n\t"
@@ -560,7 +560,7 @@ char *strncpy(char *Dest, char *Src, long Count)
     return Dest;
 }
 
-long strncpy_from_user(void *dst, void *src, unsigned long size)
+long strncpy_from_user(char *dst, const char *src, unsigned long size)
 {
     if (!verify_area((uint64_t)src, size))
         return 0;

@@ -4,6 +4,8 @@
 #include <common/errno.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
+#include <process/ptrace.h>
+#include <process/process.h>
 
 // 为filesystem_type_t结构体实例化一个链表头
 static struct vfs_filesystem_type_t vfs_fs = {"filesystem", 0};
@@ -164,4 +166,94 @@ int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
 
     // 返回dirent的总大小
     return sizeof(struct dirent) + namelen;
+}
+
+/**
+ * @brief 创建文件夹
+ * 
+ * @param path(r8) 路径
+ * @param mode(r9) 模式
+ * @return uint64_t
+ */
+uint64_t sys_mkdir(struct pt_regs *regs)
+{
+    const char *path = (const char *)regs->r8;
+    kdebug("path = %s", path);
+    mode_t mode = (mode_t)regs->r9;
+    uint32_t pathlen;
+    if (regs->cs & USER_CS)
+        pathlen = strnlen_user(path, PAGE_4K_SIZE - 1);
+    else
+        pathlen = strnlen(path, PAGE_4K_SIZE - 1);
+
+    if (pathlen == 0)
+        return -ENOENT;
+
+    int last_slash = -1;
+
+    // 查找最后一个'/'，忽略路径末尾的'/'
+    for (int i = pathlen - 2; i >= 0; --i)
+    {
+        if (path[i] == '/')
+        {
+            last_slash = i;
+            break;
+        }
+    }
+
+    // 路径格式不合法（必须使用绝对路径）
+    if (last_slash < 0)
+        return ENOTDIR;
+
+    char *buf = (char *)kmalloc(last_slash + 1, 0);
+    memset(buf, 0, pathlen + 1);
+
+    // 拷贝字符串（不包含要被创建的部分）
+    if (regs->cs & USER_CS)
+        strncpy_from_user(buf, path, last_slash);
+    else
+        strncpy(buf, path, last_slash);
+    buf[last_slash + 1] = '\0';
+    // 查找父目录
+    struct vfs_dir_entry_t *parent_dir = vfs_path_walk(buf, 0);
+
+    if (parent_dir == NULL)
+    {
+        kfree(buf);
+        return -ENOENT;
+    }
+    kfree(buf);
+
+    // 检查父目录中是否已经有相同的目录项
+    if (vfs_path_walk(path, 0) != NULL)
+    {
+        // 目录中已有对应的文件夹
+        kwarn("Dir '%s' aleardy exists.", path);
+        return -EEXIST;
+    }
+
+    struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
+    memset((void *)subdir_dentry, 0, sizeof(struct vfs_dir_entry_t));
+
+    if (path[pathlen - 1] == '/')
+        subdir_dentry->name_length = pathlen - last_slash - 2;
+    else
+        subdir_dentry->name_length = pathlen - last_slash - 1;
+    subdir_dentry->name = (char *)kmalloc(subdir_dentry->name_length + 1, 0);
+    memset((void *)subdir_dentry->name, 0, subdir_dentry->name_length + 1);
+
+    
+    for (int i = last_slash + 1, cnt = 0; i < pathlen && cnt < subdir_dentry->name_length; ++i, ++cnt)
+    {
+        subdir_dentry->name[cnt] = path[i];
+    }
+    ++subdir_dentry->name_length;
+
+    kdebug("last_slash=%d", last_slash);
+    kdebug("name=%s", path + last_slash + 1);
+    subdir_dentry->parent = parent_dir;
+    kdebug("to mkdir, parent name=%s", parent_dir->name);
+    int retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
+    kdebug("retval = %d", retval);
+    return 0;
 }

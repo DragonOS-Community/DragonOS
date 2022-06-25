@@ -270,7 +270,7 @@ uint64_t sys_read(struct pt_regs *regs)
     void *buf = (void *)regs->r9;
     int64_t count = (int64_t)regs->r10;
 
-   // kdebug("sys read: fd=%d", fd_num);
+    // kdebug("sys read: fd=%d", fd_num);
 
     // 校验文件描述符范围
     if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
@@ -489,7 +489,13 @@ uint64_t sys_chdir(struct pt_regs *regs)
         return -EFAULT;
 
     // 计算输入的路径长度
-    int dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
+    int dest_path_len;
+    if (regs->cs & USER_CS)
+    {
+        dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
+    }
+    else
+        dest_path_len = strnlen(dest_path, PAGE_4K_SIZE);
 
     // 长度小于等于0
     if (dest_path_len <= 0)
@@ -504,9 +510,13 @@ uint64_t sys_chdir(struct pt_regs *regs)
         return -ENOMEM;
 
     memset(path, 0, dest_path_len + 1);
-
-    // 将字符串从用户空间拷贝进来, +1是为了拷贝结尾的\0
-    strncpy_from_user(path, dest_path, dest_path_len + 1);
+    if (regs->cs & USER_CS)
+    {
+        // 将字符串从用户空间拷贝进来, +1是为了拷贝结尾的\0
+        strncpy_from_user(path, dest_path, dest_path_len + 1);
+    }
+    else
+        strncpy(path, dest_path, dest_path_len + 1);
 
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
 
@@ -605,7 +615,7 @@ uint64_t sys_wait4(struct pt_regs *regs)
     uint64_t pid = regs->r8;
     int *status = (int *)regs->r9;
     int options = regs->r10;
-    void *rusage = (void*)regs->r11;
+    void *rusage = (void *)regs->r11;
 
     struct process_control_block *proc = NULL;
     struct process_control_block *child_proc = NULL;
@@ -647,11 +657,11 @@ uint64_t sys_wait4(struct pt_regs *regs)
 
 /**
  * @brief 进程退出
- * 
+ *
  * @param exit_code 退出返回码
- * @return uint64_t 
+ * @return uint64_t
  */
-uint64_t sys_exit(struct pt_regs * regs)
+uint64_t sys_exit(struct pt_regs *regs)
 {
     return process_do_exit(regs->r8);
 }
@@ -689,5 +699,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [14] = sys_execve,
         [15] = sys_wait4,
         [16] = sys_exit,
-        [17 ... 254] = system_call_not_exists,
+        [17] = sys_mkdir,
+        [18 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

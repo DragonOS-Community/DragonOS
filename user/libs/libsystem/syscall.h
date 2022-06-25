@@ -21,6 +21,7 @@
 #define SYS_EXECVE 14 // 执行新的应用程序
 #define SYS_WAIT4 15 // 等待进程退出
 #define SYS_EXIT 16 // 进程退出
+#define SYS_MKDIR 17 // 创建文件夹
 
 /**
  * @brief 用户态系统调用函数

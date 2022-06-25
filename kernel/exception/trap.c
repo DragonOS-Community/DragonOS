@@ -186,6 +186,7 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
             printk_color(RED, BLACK, "Refers to a descriptor in the current GDT;\n");
 
     printk_color(RED, BLACK, "Segment Selector Index:%#010x\n", error_code & 0xfff8);
+    traceback(regs);
     while (1)
         hlt();
 }
@@ -223,7 +224,8 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
     printk_color(RED, BLACK, "\n");
 
     printk_color(RED, BLACK, "CR2:%#018lx\n", cr2);
-
+    
+    traceback(regs);
     current_pcb->state = PROC_STOPPED;
     while (1)
         hlt();

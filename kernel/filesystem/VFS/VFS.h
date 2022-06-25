@@ -181,7 +181,7 @@ struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, 
  * @param flags 1：返回父目录项， 0：返回结果目录项
  * @return struct vfs_dir_entry_t* 目录项
  */
-struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags);
+struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags);
 
 /**
  * @brief 填充dentry

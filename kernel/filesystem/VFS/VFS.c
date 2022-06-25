@@ -78,7 +78,7 @@ uint64_t vfs_unregister_filesystem(struct vfs_filesystem_type_t *fs)
  * @param flags 1：返回父目录项， 0：返回结果目录项
  * @return struct vfs_dir_entry_t* 目录项
  */
-struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags)
+struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
 {
 
     struct vfs_dir_entry_t *parent = vfs_root_sb->root;
@@ -94,7 +94,7 @@ struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags)
     while (true)
     {
         // 提取出下一级待搜索的目录名或文件名，并保存在dEntry_name中
-        char *tmp_path = path;
+        const char *tmp_path = path;
         while ((*path && *path != '\0') && (*path != '/'))
             ++path;
         int tmp_path_len = path - tmp_path;
@@ -106,7 +106,7 @@ struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags)
         // 貌似这里不需要memset，因为空间会被覆盖
         // memset(dentry->name, 0, tmp_path_len+1);
 
-        memcpy(dentry->name, tmp_path, tmp_path_len);
+        memcpy(dentry->name, (void*)tmp_path, tmp_path_len);
         dentry->name[tmp_path_len] = '\0';
         dentry->name_length = tmp_path_len;
 
@@ -124,6 +124,7 @@ struct vfs_dir_entry_t *vfs_path_walk(char *path, uint64_t flags)
         list_init(&dentry->subdirs_list);
         dentry->parent = parent;
 
+        list_add(&parent->subdirs_list, &dentry->child_node_list);
         while (*path == '/')
             ++path;
 
@@ -170,7 +171,7 @@ int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
 
 /**
  * @brief 创建文件夹
- * 
+ *
  * @param path(r8) 路径
  * @param mode(r9) 模式
  * @return uint64_t
@@ -225,7 +226,7 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     kfree(buf);
 
     // 检查父目录中是否已经有相同的目录项
-    if (vfs_path_walk(path, 0) != NULL)
+    if (vfs_path_walk((const char *)path, 0) != NULL)
     {
         // 目录中已有对应的文件夹
         kwarn("Dir '%s' aleardy exists.", path);
@@ -242,7 +243,6 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     subdir_dentry->name = (char *)kmalloc(subdir_dentry->name_length + 1, 0);
     memset((void *)subdir_dentry->name, 0, subdir_dentry->name_length + 1);
 
-    
     for (int i = last_slash + 1, cnt = 0; i < pathlen && cnt < subdir_dentry->name_length; ++i, ++cnt)
     {
         subdir_dentry->name[cnt] = path[i];
@@ -254,6 +254,7 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     subdir_dentry->parent = parent_dir;
     kdebug("to mkdir, parent name=%s", parent_dir->name);
     int retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
+    list_add(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
     kdebug("retval = %d", retval);
     return 0;
 }

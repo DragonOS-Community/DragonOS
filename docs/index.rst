@@ -10,26 +10,36 @@
    :maxdepth: 1
    :caption: 入门
 
-   introduction/index
+   introduction/intro
+   introduction/build_system
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: 内核层
 
-   kernel/index
+   kernel/bootloader/index
+   kernel/process_management/index
+   kernel/filesystem/index
 
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: 应用层
 
-   userland/index
+   userland/libc/index
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: 系统调用api文档
 
    syscall_api/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: DragonOS社区
+
+   community/code_contribution/index
+   community/contact/index
 
 
 Indices and tables

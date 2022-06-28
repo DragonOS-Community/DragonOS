@@ -3,6 +3,8 @@ LibC文档
 
 .. toctree::
    :maxdepth: 1
-   :caption: LibC
+   :caption: 目录
 
    intro
+   apis/index
+   design/index

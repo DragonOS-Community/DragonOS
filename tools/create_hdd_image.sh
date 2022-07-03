@@ -1,11 +1,12 @@
 echo "Creating virtual disk image..."
-# qemu-img create -f raw disk.img 16M
-# 输入o m w即可
+qemu-img create -f raw disk.img 16M
+# 分别输入o、n, 然后按4次回车，直到回到fdisk的默认界面，
+# 再输入w即可
+# 按顺序输入，并且，每次输入完成后要按下回车）
 fdisk disk.img
 LOOP_DEVICE=$(sudo losetup -f --show -P disk.img) \
     || exit 1
 
-sudo losetup -P /dev/loop1 --show disk.img
 # lsblk
 echo ${LOOP_DEVICE}p1
 

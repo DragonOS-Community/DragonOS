@@ -26,7 +26,7 @@
 
 ​    我们对文件进行操作都会使用到文件描述符，具体来说，就是要调用文件描述符之中的file_ops所包含的各种方法。
 
-## 挂载文件系统到VFS
+## 注册文件系统到VFS
 
 ​    如果需要注册或取消注册某个具体文件系统到VFS之中，则需要以下两个接口：
 
@@ -71,3 +71,53 @@ struct vfs_filesystem_type_t
 **next**
 
 ​    指向链表中下一个`struct vfs_filesystem_type_t`的指针。
+
+## 超级块(superblock)对象
+
+    一个超级块对象代表了一个被挂载到VFS中的具体文件系统。
+
+### struct vfs_superblock_t
+
+    该数据结构为超级块结构体。
+
+    该数据结构定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
+
+```c
+struct vfs_superblock_t
+{
+    struct vfs_dir_entry_t *root;
+    struct vfs_super_block_operations_t *sb_ops;
+    void *private_sb_info;
+};
+```
+
+**root**
+
+    该具体文件系统的根目录的dentry
+
+**sb_ops**
+
+    该超级块对象的操作方法。
+
+**private_sb_info**
+
+    超级块的私有信息。包含了具体文件系统的私有的、全局性的信息。
+
+### struct vfs_super_block_operations_t
+
+    该数据结构为超级块的操作接口。
+
+    该数据结构定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
+
+```c
+struct vfs_super_block_operations_t
+{
+    void (*write_superblock)(struct vfs_superblock_t *sb);
+    void (*put_superblock)(struct vfs_superblock_t *sb);
+    void (*write_inode)(struct vfs_index_node_t *inode); // 将inode信息写入磁盘
+};
+```
+
+**write_superblock**
+
+    

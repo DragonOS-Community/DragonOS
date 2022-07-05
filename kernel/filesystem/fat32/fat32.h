@@ -155,7 +155,7 @@ typedef struct fat32_partition_info_t fat32_sb_info_t;
 
 struct fat32_inode_info_t
 {
-    uint64_t first_clus;    // 文件的起始簇号
+    uint32_t first_clus;    // 文件的起始簇号
     uint64_t dEntry_location_clus;        // fat entry的起始簇号 dEntry struct in cluster (0 is root, 1 is invalid)
     uint64_t dEntry_location_clus_offset; // fat entry在起始簇中的偏移量(是第几个entry) dEntry struct offset in cluster
 

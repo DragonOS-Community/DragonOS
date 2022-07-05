@@ -107,7 +107,13 @@ struct vfs_super_block_operations_t
  */
 struct vfs_inode_operations_t
 {
-    long (*create)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry, int mode);
+    /**
+     * @brief 创建新的文件
+     * @param inode 要被创建的文件的inode结构体
+     * @param parent_dEntry 父目录的dentry
+     * @param mode 创建模式
+     */
+    long (*create)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *parent_dEntry, int mode);
     /**
      * @brief 在文件系统中查找指定的目录项
      * @param parent_inode 父目录项（在这个目录下查找）

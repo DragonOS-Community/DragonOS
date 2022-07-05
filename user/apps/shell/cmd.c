@@ -181,7 +181,7 @@ int shell_cmd_cd(int argc, char **argv)
             goto fail;
         ; // 出错则直接忽略
     }
-    else
+    else // ======进入相对路径=====
     {
         int dest_offset = 0;
         if (dest_len > 2)
@@ -191,7 +191,7 @@ int shell_cmd_cd(int argc, char **argv)
         }
 
         int new_len = current_dir_len + dest_len - dest_offset;
-        // ======进入相对路径=====
+        
         if (new_len >= SHELL_CWD_MAX_SIZE - 1)
         {
             printf("ERROR: Path too long!\n");
@@ -210,7 +210,8 @@ int shell_cmd_cd(int argc, char **argv)
         if (chdir(new_path) == 0) // 成功切换目录
         {
             free(shell_current_path);
-            new_path[new_len] = '\0';
+            // printf("new_path=%s, newlen= %d\n", new_path, new_len);
+            new_path[new_len+1] = '\0';
             shell_current_path = new_path;
             goto done;
         }

@@ -889,7 +889,9 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     // 父目录项的inode
     struct fat32_inode_info_t *parent_inode_info = (struct fat32_inode_info_t *)parent_inode->private_inode_info;
     // ======== todo:检验名称的合法性
-
+    retval = fat32_check_name_available(dEntry->name, dEntry->name_length, 0);
+    if (retval != 0)
+        return retval;
     // ====== 找一块连续的区域放置新的目录项 =====
 
     // 计算总共需要多少个目录项
@@ -952,7 +954,10 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
         {
             if (dEntry->name[tmp_index] == '.')
                 break;
-            empty_fat32_dentry->DIR_Name[tmp_index] = dEntry->name[tmp_index];
+            if (fat32_check_char_available_in_short_name(dEntry->name[tmp_index], tmp_index))
+                empty_fat32_dentry->DIR_Name[tmp_index] = dEntry->name[tmp_index];
+            else
+                empty_fat32_dentry->DIR_Name[tmp_index] = 0x20;
         }
 
         // 不满的部分使用0x20填充

@@ -2,10 +2,11 @@
 
 #include "fat32.h"
 #include <filesystem/VFS/VFS.h>
+#include <stdbool.h>
 
 /**
  * @brief 请求分配指定数量的簇
- * 
+ *
  * @param inode 要分配簇的inode
  * @param clusters 返回的被分配的簇的簇号结构体
  * @param num_clusters 要分配的簇的数量
@@ -15,12 +16,12 @@ int fat32_alloc_clusters(struct vfs_index_node_t *inode, uint32_t *clusters, int
 
 /**
  * @brief 释放从属于inode的，从cluster开始的所有簇
- * 
+ *
  * @param inode 指定的文件的inode
  * @param cluster 指定簇
  * @return int 错误码
  */
-int fat32_free_clusters(struct vfs_index_node_t * inode, int32_t cluster);
+int fat32_free_clusters(struct vfs_index_node_t *inode, int32_t cluster);
 
 /**
  * @brief 读取指定簇的FAT表项
@@ -53,3 +54,23 @@ uint32_t fat32_write_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t
  * @return struct fat32_Directory_t* 符合要求的entry的指针（指向地址高处的空目录项，也就是说，有连续num个≤这个指针的空目录项）
  */
 struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *parent_inode, uint32_t num, uint32_t mode, uint32_t *res_sector, uint64_t *res_cluster, uint64_t *res_data_buf_base);
+
+/**
+ * @brief 检查文件名是否合法
+ *
+ * @param name 文件名
+ * @param namelen 文件名长度
+ * @param reserved 保留字段
+ * @return int 合法：0， 其他：错误码
+ */
+int fat32_check_name_available(const char *name, int namelen, int8_t reserved);
+
+/**
+ * @brief 检查字符在短目录项中是否合法
+ * 
+ * @param c 给定字符
+ * @param index 字符在文件名中处于第几位
+ * @return true 合法
+ * @return false 不合法
+ */
+bool fat32_check_char_available_in_short_name(const char c, int index);

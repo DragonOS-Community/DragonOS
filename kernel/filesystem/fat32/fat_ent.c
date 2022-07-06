@@ -3,6 +3,7 @@
 #include <common/errno.h>
 #include <mm/slab.h>
 
+static const char unavailable_character_in_short_name[] = {0x22, 0x2a, 0x2b, 0x2c, 0x2e, 0x2f, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x5b, 0x5c, 0x5d, 0x7c};
 /**
  * @brief 请求分配指定数量的簇
  *
@@ -93,7 +94,7 @@ done:;
     }
     else // 出现错误
     {
-            kwarn("err in alloc clusters");
+        kwarn("err in alloc clusters");
         if (clus_idx < num_clusters)
             fat32_free_clusters(inode, clusters[0]);
         return retval;
@@ -167,7 +168,6 @@ uint32_t fat32_write_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t
     kfree(buf);
     return 0;
 }
-
 
 /**
  * @brief 在父亲inode的目录项簇中，寻找连续num个空的目录项
@@ -254,4 +254,52 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
             kfree(tmp_buf);
         }
     }
+}
+
+/**
+ * @brief 检查文件名是否合法
+ *
+ * @param name 文件名
+ * @param namelen 文件名长度
+ * @param reserved 保留字段
+ * @return int 合法：0， 其他：错误码
+ */
+int fat32_check_name_available(const char *name, int namelen, int8_t reserved)
+{
+    if (namelen > 255 || namelen <= 0)
+        return -ENAMETOOLONG;
+    // 首个字符不能是空格或者'.'
+    if (name[0] == 0x20 || name[0] == '.')
+        return -EINVAL;
+
+    return 0;
+}
+
+/**
+ * @brief 检查字符在短目录项中是否合法
+ *
+ * @param c 给定字符
+ * @param index 字符在文件名中处于第几位
+ * @return true 合法
+ * @return false 不合法
+ */
+bool fat32_check_char_available_in_short_name(const char c, int index)
+{
+    // todo: 严格按照fat规范完善合法性检查功能
+    if (index == 0)
+    {
+        if (c < 0x20)
+        {
+            if (c != 0x05)
+                return false;
+            return true;
+        }
+    }
+
+    for (int i = 0; i < sizeof(unavailable_character_in_short_name) / sizeof(char); ++i)
+    {
+        if (c == unavailable_character_in_short_name[i])
+            return false;
+    }
+    return true;
 }

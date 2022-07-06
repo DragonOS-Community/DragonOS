@@ -155,7 +155,7 @@ typedef struct fat32_partition_info_t fat32_sb_info_t;
 
 struct fat32_inode_info_t
 {
-    uint32_t first_clus;    // 文件的起始簇号
+    uint32_t first_clus;                  // 文件的起始簇号
     uint64_t dEntry_location_clus;        // fat entry的起始簇号 dEntry struct in cluster (0 is root, 1 is invalid)
     uint64_t dEntry_location_clus_offset; // fat entry在起始簇中的偏移量(是第几个entry) dEntry struct offset in cluster
 
@@ -176,7 +176,6 @@ typedef struct fat32_inode_info_t fat32_inode_info_t;
  */
 struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t ahci_port_num, uint8_t part_num);
 
-
 /**
  * @brief 创建fat32文件系统的超级块
  *
@@ -187,7 +186,13 @@ struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t
  */
 struct vfs_superblock_t *fat32_read_superblock(void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num);
 
-long fat32_create(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dentry, int mode);
+/**
+ * @brief 创建新的文件
+ * @param parent_inode 父目录的inode结构体
+ * @param dest_dEntry 新文件的dentry
+ * @param mode 创建模式
+ */
+long fat32_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry, int mode);
 
 void fat32_init();
 

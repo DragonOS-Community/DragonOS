@@ -331,7 +331,17 @@ int shell_cmd_cat(int argc, char **argv)
  * @return int
  */
 // todo:
-int shell_cmd_touch(int argc, char **argv) {}
+int shell_cmd_touch(int argc, char **argv)
+{
+    int path_len = 0;
+    char *file_path = get_target_filepath(argv[1], &path_len);
+
+    // 打开文件
+    int fd = open(file_path, O_CREAT);
+    close(fd);
+    if (argv != NULL)
+        free(argv);
+}
 
 /**
  * @brief 删除命令
@@ -350,7 +360,6 @@ int shell_cmd_rm(int argc, char **argv) {}
  * @param argv
  * @return int
  */
-// todo:
 int shell_cmd_mkdir(int argc, char **argv)
 {
     int result_path_len = -1;
@@ -364,10 +373,9 @@ int shell_cmd_mkdir(int argc, char **argv)
     printf("mkdir: full_path = %s\n", full_path);
     int retval = mkdir(full_path, 0);
 
-    if (result_path_len != -1)
-    {
-        free((void *)full_path);
-    }
+    if (argv != NULL)
+        free(argv);
+    
     return retval;
 }
 

@@ -108,7 +108,6 @@ ul sys_put_string(struct pt_regs *regs)
 
 uint64_t sys_open(struct pt_regs *regs)
 {
-
     char *filename = (char *)(regs->r8);
     int flags = (int)(regs->r9);
     // kdebug("filename=%s", filename);
@@ -131,6 +130,12 @@ uint64_t sys_open(struct pt_regs *regs)
     memset(path, 0, path_len);
 
     strncpy_from_user(path, filename, path_len);
+    // 去除末尾的 '/'
+    if (path_len >= 2 && path[path_len - 2] == '/')
+    {
+        path[path_len - 2] = '\0';
+        --path_len;
+    }
 
     // 寻找文件
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
@@ -139,7 +144,61 @@ uint64_t sys_open(struct pt_regs *regs)
     //     printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
     // else
     //     printk_color(ORANGE, BLACK, "Can`t find file\n");
+    kdebug("flags=%#018lx", flags);
+    if (dentry == NULL && flags & O_CREAT)
+    {
+        // 先找到倒数第二级目录
+        int tmp_index = -1;
+        for (int i = path_len - 1; i >= 0; --i)
+        {
+            if (path[i] == '/')
+            {
+                tmp_index = i;
+                break;
+            }
+        }
 
+        struct vfs_dir_entry_t *parent_dentry = NULL;
+        kdebug("tmp_index=%d", tmp_index);
+        if (tmp_index > 0)
+        {
+            
+            path[tmp_index] = '\0';
+            dentry = vfs_path_walk(path, 0);
+            if (dentry == NULL)
+            {
+                kfree(path);
+                return -ENOENT;
+            }
+            parent_dentry = dentry;
+        }
+        else
+            parent_dentry = vfs_root_sb->root;
+
+        // 创建新的文件
+        dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
+        memset(dentry, 0, sizeof(struct vfs_dir_entry_t));
+
+        dentry->name_length = path_len - tmp_index - 1;
+        dentry->name = (char *)kmalloc(dentry->name_length, 0);
+        memset(dentry->name, 0, dentry->name_length);
+        strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
+        kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
+        dentry->parent = parent_dentry;
+        uint64_t retval = parent_dentry->dir_inode->inode_ops->create(parent_dentry->dir_inode, dentry, 0);
+        if (retval != 0)
+        {
+            kfree(dentry->name);
+            kfree(dentry);
+            kfree(path);
+            return retval;
+        }
+
+        list_init(&dentry->child_node_list);
+        list_init(&dentry->subdirs_list);
+        list_add(&parent_dentry->subdirs_list, &dentry->child_node_list);
+        kdebug("created.");
+    }
     kfree(path);
     if (dentry == NULL)
         return -ENOENT;
@@ -148,9 +207,9 @@ uint64_t sys_open(struct pt_regs *regs)
     if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_ATTR_DIR))
         return -ENOTDIR;
 
-    // 要找的目标是文件夹
-    if ((flags & O_DIRECTORY) && dentry->dir_inode->attribute == VFS_ATTR_DIR)
-        return -EISDIR;
+    // // 要找的目标是文件夹
+    // if ((flags & O_DIRECTORY) && dentry->dir_inode->attribute == VFS_ATTR_DIR)
+    //     return -EISDIR;
 
     // todo: 引入devfs后删除这段代码
     // 暂时遇到设备文件的话，就将其first clus设置为特定值

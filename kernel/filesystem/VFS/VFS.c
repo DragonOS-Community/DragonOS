@@ -105,7 +105,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         // 貌似这里不需要memset，因为空间会被覆盖
         // memset(dentry->name, 0, tmp_path_len+1);
 
-        memcpy(dentry->name, (void*)tmp_path, tmp_path_len);
+        memcpy(dentry->name, (void *)tmp_path, tmp_path_len);
         dentry->name[tmp_path_len] = '\0';
         kdebug("tmp_path_len=%d, dentry->name= %s", tmp_path_len, dentry->name);
         dentry->name_length = tmp_path_len;
@@ -232,8 +232,7 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     {
         // 目录中已有对应的文件夹
         kwarn("Dir '%s' aleardy exists.", path);
-        kdebug("name = %s", vfs_path_walk((const char *)path, 0)->name)
-        return -EEXIST;
+        kdebug("name = %s", vfs_path_walk((const char *)path, 0)->name) return -EEXIST;
     }
 
     struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);

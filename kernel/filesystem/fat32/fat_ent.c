@@ -328,11 +328,27 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
         }
 
         // 不满的部分使用0x20填充
-        while (tmp_index < 11)
+        while (tmp_index < 8)
         {
             // kdebug("tmp index = %d", tmp_index);
-            dEntry->name[tmp_index] = 0x20;
+            target->DIR_Name[tmp_index] = 0x20;
             ++tmp_index;
+        }
+        if (dEntry->dir_inode->attribute & VFS_ATTR_DIR)
+        {
+            while (tmp_index < 11)
+            {
+                // kdebug("tmp index = %d", tmp_index);
+                target->DIR_Name[tmp_index] = 0x20;
+                ++tmp_index;
+            }
+        }
+        else
+        {
+            for(int j = 8;j<11;++j)
+            {
+                target->DIR_Name[j] = 'a';
+            }
         }
     }
 
@@ -350,7 +366,7 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
 
 /**
  * @brief 填充长目录项的函数
- * 
+ *
  * @param dEntry 目标dentry
  * @param target 起始长目录项
  * @param checksum 短目录项的校验和
@@ -359,7 +375,8 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
 void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirectory_t *target, uint8_t checksum, uint32_t cnt_longname)
 {
     uint32_t current_name_index = 0;
-    struct fat32_LongDirectory_t *Ldentry = (struct fat32_LongDirectory_t *)(target+1);
+    struct fat32_LongDirectory_t *Ldentry = (struct fat32_LongDirectory_t *)(target + 1);
+    // kdebug("filling long name, name=%s, namelen=%d", dEntry->name, dEntry->name_length);
     for (int i = 1; i <= cnt_longname; ++i)
     {
         --Ldentry;

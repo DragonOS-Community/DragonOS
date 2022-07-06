@@ -862,16 +862,101 @@ struct vfs_file_operations_t fat32_file_ops =
 
 /**
  * @brief 创建新的文件
- * @param inode 要被创建的文件的inode结构体
- * @param parent_dEntry 父目录的dentry
+ * @param parent_inode 父目录的inode结构体
+ * @param dest_dEntry 新文件的dentry
  * @param mode 创建模式
  */
-long fat32_create(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *parent_dEntry, int mode)
+long fat32_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry, int mode)
 {
     // 文件系统超级块信息
-    fat32_sb_info_t *fsbi = (fat32_sb_info_t *)parent_dEntry->dir_inode->sb->private_sb_info;
+    fat32_sb_info_t *fsbi = (fat32_sb_info_t *)parent_inode->sb->private_sb_info;
     // 父目录项的inode的私有信息
-    struct fat32_inode_info_t *parent_inode_info = (struct fat32_inode_info_t *)parent_dEntry->dir_inode->private_inode_info;
+    struct fat32_inode_info_t *parent_inode_info = (struct fat32_inode_info_t *)parent_inode->private_inode_info;
+
+    int64_t retval = 0;
+
+    kdebug("dest_dEntry->name=%s",dest_dEntry->name);
+    // ======== 检验名称的合法性
+    retval = fat32_check_name_available(dest_dEntry->name, dest_dEntry->name_length, 0);
+    kdebug("dest_dEntry->name=%s",dest_dEntry->name); 
+    if (retval != 0)
+        return retval;
+
+    if (dest_dEntry->dir_inode != NULL)
+        return -EEXIST;
+
+    struct vfs_index_node_t *inode = (struct vfs_index_node_t *)kmalloc(sizeof(struct vfs_index_node_t), 0);
+    memset((void *)inode, 0, sizeof(struct vfs_index_node_t));
+    dest_dEntry->dir_inode = inode;
+    dest_dEntry->dir_ops = &fat32_dEntry_ops;
+
+    struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)kmalloc(sizeof(struct fat32_inode_info_t), 0);
+    memset((void *)finode, 0, sizeof(struct fat32_inode_info_t));
+    inode->attribute = VFS_ATTR_FILE;
+    inode->file_ops = &fat32_file_ops;
+    inode->file_size = 0;
+    inode->sb = parent_inode->sb;
+    inode->inode_ops = &fat32_inode_ops;
+    inode->private_inode_info = (void *)finode;
+    inode->blocks = fsbi->sec_per_clus;
+
+    // 计算总共需要多少个目录项
+    uint32_t cnt_longname = (dest_dEntry->name_length + 25) / 26;
+    // 默认都是创建长目录项来存储
+    if (cnt_longname == 0)
+        cnt_longname = 1;
+
+    // 空闲dentry所在的扇区号
+    uint32_t tmp_dentry_sector = 0;
+    // 空闲dentry所在的缓冲区的基地址
+    uint64_t tmp_dentry_clus_buf_addr = 0;
+    uint64_t tmp_parent_dentry_clus = 0;
+    // 寻找空闲目录项
+    struct fat32_Directory_t *empty_fat32_dentry = fat32_find_empty_dentry(parent_inode, cnt_longname + 1, 0, &tmp_dentry_sector, &tmp_parent_dentry_clus, &tmp_dentry_clus_buf_addr);
+    kdebug("found empty dentry, cnt_longname=%ld", cnt_longname);
+
+    finode->first_clus = 0;
+    finode->dEntry_location_clus = tmp_parent_dentry_clus;
+    finode->dEntry_location_clus_offset = empty_fat32_dentry - (struct fat32_Directory_t *)tmp_dentry_clus_buf_addr;
+
+    // ====== 为新的文件分配一个簇 =======
+    uint32_t new_dir_clus;
+    if (fat32_alloc_clusters(inode, &new_dir_clus, 1) != 0)
+    {
+        retval = -ENOSPC;
+        goto fail;
+    }
+
+    kdebug("new dir clus=%ld", new_dir_clus);
+    kdebug("dest_dEntry->name=%s",dest_dEntry->name);
+    // ====== 填写短目录项
+    fat32_fill_shortname(dest_dEntry, empty_fat32_dentry, new_dir_clus);
+    kdebug("dest_dEntry->name=%s",dest_dEntry->name);
+
+    // 计算校验和
+    uint8_t short_dentry_ChkSum = fat32_ChkSum(empty_fat32_dentry->DIR_Name);
+
+    kdebug("dest_dEntry->name=%s",dest_dEntry->name);
+    // ======== 填写长目录项
+    fat32_fill_longname(dest_dEntry, (struct fat32_LongDirectory_t *)(empty_fat32_dentry - 1), short_dentry_ChkSum, cnt_longname);
+
+    // ====== 将目录项写回磁盘
+    kdebug("tmp_dentry_sector=%ld", tmp_dentry_sector);
+    ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, tmp_dentry_sector, fsbi->sec_per_clus, tmp_dentry_clus_buf_addr, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+
+    // 注意：parent字段需要在调用函数的地方进行设置
+
+    // 释放在find empty dentry中动态申请的缓冲区
+    kfree((void *)tmp_dentry_clus_buf_addr);
+    return 0;
+fail:;
+    // 释放在find empty dentry中动态申请的缓冲区
+    kfree((void *)tmp_dentry_clus_buf_addr);
+    dest_dEntry->dir_inode = NULL;
+    dest_dEntry->dir_ops = NULL;
+    kfree(finode);
+    kfree(inode);
+    return retval;
 }
 
 /**
@@ -886,9 +971,9 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
 
     // 文件系统超级块信息
     fat32_sb_info_t *fsbi = (fat32_sb_info_t *)parent_inode->sb->private_sb_info;
-    // 父目录项的inode
+    // 父目录项的inode私有信息
     struct fat32_inode_info_t *parent_inode_info = (struct fat32_inode_info_t *)parent_inode->private_inode_info;
-    // ======== todo:检验名称的合法性
+    // ======== 检验名称的合法性
     retval = fat32_check_name_available(dEntry->name, dEntry->name_length, 0);
     if (retval != 0)
         return retval;
@@ -915,7 +1000,7 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     inode->attribute = VFS_ATTR_DIR;
     inode->blocks = fsbi->sec_per_clus;
     inode->file_ops = &fat32_file_ops;
-    inode->file_size = fsbi->bytes_per_clus;
+    inode->file_size = 0;
     inode->inode_ops = &fat32_inode_ops;
     inode->sb = parent_inode->sb;
 
@@ -930,13 +1015,11 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     kdebug(" p->dEntry_location_clus_offset=%d", p->dEntry_location_clus_offset);
     // todo: 填写完全fat32_inode_info的信息
 
-
     // 初始化dentry信息
     list_init(&dEntry->child_node_list);
     list_init(&dEntry->subdirs_list);
     dEntry->dir_ops = &fat32_dEntry_ops;
     dEntry->dir_inode = inode;
-
 
     // ====== 为新的文件夹分配一个簇 =======
     uint32_t new_dir_clus;
@@ -952,10 +1035,10 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     fat32_fill_shortname(dEntry, empty_fat32_dentry, new_dir_clus);
 
     // 计算校验和
-    uint8_t short_dentry_ChkSum = fat32_ChkSum(empty_fat32_dentry->DIR_Name);    
+    uint8_t short_dentry_ChkSum = fat32_ChkSum(empty_fat32_dentry->DIR_Name);
 
     // ======== 填写长目录项
-    fat32_fill_longname(dEntry, (struct fat32_LongDirectory_t * )(empty_fat32_dentry-1), short_dentry_ChkSum, cnt_longname);
+    fat32_fill_longname(dEntry, (struct fat32_LongDirectory_t *)(empty_fat32_dentry - 1), short_dentry_ChkSum, cnt_longname);
 
     // ====== 将目录项写回磁盘
     kdebug("tmp_dentry_sector=%ld", tmp_dentry_sector);
@@ -994,8 +1077,6 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
         kdebug("add dot and dot dot: sector=%ld", sector);
         ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
     }
-
-    
 
     // 注意：parent字段需要在调用函数的地方进行设置
     // 注意：需要将当前dentry加入父目录的subdirs_list

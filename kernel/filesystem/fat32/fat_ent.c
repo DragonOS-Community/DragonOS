@@ -303,3 +303,95 @@ bool fat32_check_char_available_in_short_name(const char c, int index)
     }
     return true;
 }
+
+/**
+ * @brief 填充短目录项的函数
+ *
+ * @param dEntry 目标dentry
+ * @param target 目标dentry对应的短目录项
+ * @param cluster 短目录项对应的文件/文件夹起始簇
+ */
+void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory_t *target, uint32_t cluster)
+{
+    memset(target, 0, sizeof(struct fat32_Directory_t));
+    {
+        int tmp_index = 0;
+        // kdebug("dEntry->name_length=%d", dEntry->name_length);
+        for (tmp_index = 0; tmp_index < min(8, dEntry->name_length); ++tmp_index)
+        {
+            if (dEntry->name[tmp_index] == '.')
+                break;
+            if (fat32_check_char_available_in_short_name(dEntry->name[tmp_index], tmp_index))
+                target->DIR_Name[tmp_index] = dEntry->name[tmp_index];
+            else
+                target->DIR_Name[tmp_index] = 0x20;
+        }
+
+        // 不满的部分使用0x20填充
+        while (tmp_index < 11)
+        {
+            // kdebug("tmp index = %d", tmp_index);
+            dEntry->name[tmp_index] = 0x20;
+            ++tmp_index;
+        }
+    }
+
+    struct vfs_index_node_t *inode = dEntry->dir_inode;
+    target->DIR_Attr = 0;
+    if (inode->attribute & VFS_ATTR_DIR)
+        target->DIR_Attr |= ATTR_DIRECTORY;
+
+    target->DIR_FileSize = dEntry->dir_inode->file_size;
+    target->DIR_FstClusHI = (uint16_t)((cluster >> 16) & 0x0fff);
+    target->DIR_FstClusLO = (uint16_t)(cluster & 0xffff);
+
+    // todo: 填写短目录项中的时间信息
+}
+
+/**
+ * @brief 填充长目录项的函数
+ * 
+ * @param dEntry 目标dentry
+ * @param target 起始长目录项
+ * @param checksum 短目录项的校验和
+ * @param cnt_longname 总的长目录项的个数
+ */
+void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirectory_t *target, uint8_t checksum, uint32_t cnt_longname)
+{
+    uint32_t current_name_index = 0;
+    struct fat32_LongDirectory_t *Ldentry = (struct fat32_LongDirectory_t *)(target+1);
+    for (int i = 1; i <= cnt_longname; ++i)
+    {
+        --Ldentry;
+        Ldentry->LDIR_Ord = i;
+
+        for (int j = 0; j < 5; ++j, ++current_name_index)
+        {
+            if (current_name_index < dEntry->name_length)
+                Ldentry->LDIR_Name1[j] = dEntry->name[current_name_index];
+            else
+                Ldentry->LDIR_Name1[j] = 0xffff;
+        }
+        for (int j = 0; j < 6; ++j, ++current_name_index)
+        {
+            if (current_name_index < dEntry->name_length)
+                Ldentry->LDIR_Name2[j] = dEntry->name[current_name_index];
+            else
+                Ldentry->LDIR_Name2[j] = 0xffff;
+        }
+        for (int j = 0; j < 2; ++j, ++current_name_index)
+        {
+            if (current_name_index < dEntry->name_length)
+                Ldentry->LDIR_Name3[j] = dEntry->name[current_name_index];
+            else
+                Ldentry->LDIR_Name3[j] = 0xffff;
+        }
+        Ldentry->LDIR_Attr = ATTR_LONG_NAME;
+        Ldentry->LDIR_FstClusLO = 0;
+        Ldentry->LDIR_Type = 0;
+        Ldentry->LDIR_Chksum = checksum;
+    }
+
+    // 最后一个长目录项的ord要|=0x40
+    Ldentry->LDIR_Ord |= 0x40;
+}

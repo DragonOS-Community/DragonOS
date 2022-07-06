@@ -67,10 +67,29 @@ int fat32_check_name_available(const char *name, int namelen, int8_t reserved);
 
 /**
  * @brief 检查字符在短目录项中是否合法
- * 
+ *
  * @param c 给定字符
  * @param index 字符在文件名中处于第几位
  * @return true 合法
  * @return false 不合法
  */
 bool fat32_check_char_available_in_short_name(const char c, int index);
+
+/**
+ * @brief 填充短目录项的函数
+ * 
+ * @param dEntry 目标dentry
+ * @param target 目标dentry对应的短目录项
+ * @param cluster 短目录项对应的文件/文件夹起始簇
+ */
+void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory_t *target, uint32_t cluster);
+
+/**
+ * @brief 填充长目录项的函数
+ * 
+ * @param dEntry 目标dentry
+ * @param target 起始长目录项
+ * @param checksum 短目录项的校验和
+ * @param cnt_longname 总的长目录项的个数
+ */
+void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirectory_t *target, uint8_t checksum, uint32_t cnt_longname);

@@ -1,4 +1,8 @@
-sudo losetup -P /dev/loop1 --show ../bin/disk.img
+LOOP_DEVICE=$(sudo losetup -f --show -P ../bin/disk.img) \
+    || exit 1
+
+echo ${LOOP_DEVICE}p1
+sudo mkfs.vfat -F 32 ${LOOP_DEVICE}p1
+mkdir -p ../bin/disk_mount/
+sudo mount ${LOOP_DEVICE}p1 ../bin/disk_mount/ 
 lsblk
-mkdir -p ../bin/disk_mount/ 
-sudo mount /dev/loop1p1 ../bin/disk_mount/ 

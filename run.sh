@@ -93,6 +93,8 @@ cd tools
 bash m*
 sudo cp ${root_folder}/bin/user/shell.elf ${root_folder}/bin/disk_mount
 sudo cp ${root_folder}/bin/user/about.elf ${root_folder}/bin/disk_mount
+sudo mkdir ${root_folder}/bin/disk_mount/dev
+sudo touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
 sync
 bash u*
 cd ..

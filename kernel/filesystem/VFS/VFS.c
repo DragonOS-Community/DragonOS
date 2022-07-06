@@ -90,7 +90,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         return parent;
 
     struct vfs_dir_entry_t *dentry;
-
+    kdebug("path before walk:%s", path);
     while (true)
     {
         // 提取出下一级待搜索的目录名或文件名，并保存在dEntry_name中
@@ -98,7 +98,6 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         while ((*path && *path != '\0') && (*path != '/'))
             ++path;
         int tmp_path_len = path - tmp_path;
-
         dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
         memset(dentry, 0, sizeof(struct vfs_dir_entry_t));
         // 为目录项的名称分配内存
@@ -108,6 +107,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
 
         memcpy(dentry->name, (void*)tmp_path, tmp_path_len);
         dentry->name[tmp_path_len] = '\0';
+        kdebug("tmp_path_len=%d, dentry->name= %s", tmp_path_len, dentry->name);
         dentry->name_length = tmp_path_len;
 
         if (parent->dir_inode->inode_ops->lookup(parent->dir_inode, dentry) == NULL)
@@ -215,11 +215,13 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     else
         strncpy(buf, path, last_slash);
     buf[last_slash + 1] = '\0';
+    kdebug("to walk: %s", buf);
     // 查找父目录
     struct vfs_dir_entry_t *parent_dir = vfs_path_walk(buf, 0);
 
     if (parent_dir == NULL)
     {
+        kwarn("parent dir is NULL.");
         kfree(buf);
         return -ENOENT;
     }
@@ -230,6 +232,7 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     {
         // 目录中已有对应的文件夹
         kwarn("Dir '%s' aleardy exists.", path);
+        kdebug("name = %s", vfs_path_walk((const char *)path, 0)->name)
         return -EEXIST;
     }
 

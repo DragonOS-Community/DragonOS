@@ -101,7 +101,8 @@
         "stdio.h": "c",
         "wait_queue.h": "c",
         "stddef.h": "c",
-        "spinlock.h": "c"
+        "spinlock.h": "c",
+        "stat.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

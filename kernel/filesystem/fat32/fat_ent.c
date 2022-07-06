@@ -41,6 +41,7 @@ int fat32_alloc_clusters(struct vfs_index_node_t *inode, uint32_t *clusters, int
             // 找到空闲簇
             if ((buf[j] & 0x0fffffff) == 0)
             {
+                kdebug("clus[%d] = %d", clus_idx, i * ent_per_sec + j);
                 clusters[clus_idx] = i * ent_per_sec + j;
                 ++clus_idx;
             }
@@ -68,10 +69,11 @@ done:;
             // todo: 跳转到文件当前的最后一个簇
             idx = 0;
             int tmp_clus = finode->first_clus;
+            cluster = tmp_clus;
             while (true)
             {
                 tmp_clus = fat32_read_FAT_entry(fsbi, cluster);
-                if (tmp_clus < 0x0ffffff7)
+                if (tmp_clus <= 0x0ffffff7)
                     cluster = tmp_clus;
                 else
                     break;
@@ -81,6 +83,7 @@ done:;
         // 写入fat表
         for (int i = idx; i < num_clusters; ++i)
         {
+            kdebug("write cluster i=%d : cluster=%d, value= %d", i, cluster, clusters[i]);
             fat32_write_FAT_entry(fsbi, cluster, clusters[i]);
             cluster = clusters[i];
         }
@@ -90,6 +93,7 @@ done:;
     }
     else // 出现错误
     {
+            kwarn("err in alloc clusters");
         if (clus_idx < num_clusters)
             fat32_free_clusters(inode, clusters[0]);
         return retval;

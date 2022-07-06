@@ -10,7 +10,7 @@
 #include <libc/fcntl.h>
 #include <libc/dirent.h>
 #include <libc/sys/wait.h>
-
+#include <libc/sys/stat.h>
 #include "cmd_help.h"
 
 // 当前工作目录（在main_loop中初始化）
@@ -191,7 +191,7 @@ int shell_cmd_cd(int argc, char **argv)
         }
 
         int new_len = current_dir_len + dest_len - dest_offset;
-        
+
         if (new_len >= SHELL_CWD_MAX_SIZE - 1)
         {
             printf("ERROR: Path too long!\n");
@@ -211,7 +211,7 @@ int shell_cmd_cd(int argc, char **argv)
         {
             free(shell_current_path);
             // printf("new_path=%s, newlen= %d\n", new_path, new_len);
-            new_path[new_len+1] = '\0';
+            new_path[new_len + 1] = '\0';
             shell_current_path = new_path;
             goto done;
         }
@@ -351,7 +351,25 @@ int shell_cmd_rm(int argc, char **argv) {}
  * @return int
  */
 // todo:
-int shell_cmd_mkdir(int argc, char **argv) {}
+int shell_cmd_mkdir(int argc, char **argv)
+{
+    int result_path_len = -1;
+    const char *full_path = NULL;
+    if (argv[1][0] == '/')
+        full_path = argv[1];
+    else
+    {
+        full_path = get_target_filepath(argv[1], &result_path_len);
+    }
+    printf("mkdir: full_path = %s\n", full_path);
+    int retval = mkdir(full_path, 0);
+
+    if (result_path_len != -1)
+    {
+        free((void *)full_path);
+    }
+    return retval;
+}
 
 /**
  * @brief 删除文件夹的命令
@@ -407,13 +425,12 @@ int shell_cmd_about(int argc, char **argv)
     char **aav;
 
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
-    
+
     strcpy(input_buffer, "exec /about.elf\0");
 
     parse_command(input_buffer, &aac, &aav);
 
     shell_cmd_exec(aac, aav);
-
 }
 
 /**

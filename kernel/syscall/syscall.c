@@ -156,10 +156,13 @@ uint64_t sys_open(struct pt_regs *regs)
     // 暂时遇到设备文件的话，就将其first clus设置为特定值
     if (path_len >= 5 && filename[0] == '/' && filename[1] == 'd' && filename[2] == 'e' && filename[3] == 'v' && filename[4] == '/')
     {
-        // 对于fat32文件系统上面的设备文件，设置其起始扇区
-        ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus |= 0xf0000000;
-        dentry->dir_inode->sb->sb_ops->write_inode(dentry->dir_inode);
-        dentry->dir_inode->attribute |= VFS_ATTR_DEVICE;
+        if (dentry->dir_inode->attribute & VFS_ATTR_FILE)
+        {
+            // 对于fat32文件系统上面的设备文件，设置其起始扇区
+            ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus |= 0xf0000000;
+            dentry->dir_inode->sb->sb_ops->write_inode(dentry->dir_inode);
+            dentry->dir_inode->attribute |= VFS_ATTR_DEVICE;
+        }
     }
 
     // 创建文件描述符
@@ -483,7 +486,7 @@ uint64_t sys_reboot(struct pt_regs *regs)
 uint64_t sys_chdir(struct pt_regs *regs)
 {
     char *dest_path = (char *)regs->r8;
-    // kdebug("dest_path=%s", dest_path);
+    kdebug("dest_path=%s", dest_path);
     // 检查目标路径是否为NULL
     if (dest_path == NULL)
         return -EFAULT;
@@ -517,14 +520,14 @@ uint64_t sys_chdir(struct pt_regs *regs)
     }
     else
         strncpy(path, dest_path, dest_path_len + 1);
-
+    kdebug("chdir: path = %s", path);
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
 
     kfree(path);
 
     if (dentry == NULL)
         return -ENOENT;
-
+    kdebug("dentry->name=%s, namelen=%d", dentry->name, dentry->name_length);
     // 目标不是目录
     if (dentry->dir_inode->attribute != VFS_ATTR_DIR)
         return -ENOTDIR;

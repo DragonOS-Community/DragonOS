@@ -330,14 +330,26 @@ int shell_cmd_cat(int argc, char **argv)
  * @param argv
  * @return int
  */
-// todo:
 int shell_cmd_touch(int argc, char **argv)
 {
     int path_len = 0;
-    char *file_path = get_target_filepath(argv[1], &path_len);
+    char *file_path;
+    if (argv[1][0] == '/')
+        file_path = argv[1];
+    else
+        file_path = get_target_filepath(argv[1], &path_len);
 
     // 打开文件
     int fd = open(file_path, O_CREAT);
+    switch (fd)
+    {
+    case -ENOENT:
+        put_string("Parent dir not exists.\n", COLOR_RED, COLOR_BLACK);
+        break;
+
+    default:
+        break;
+    }
     close(fd);
     if (argv != NULL)
         free(argv);
@@ -375,7 +387,7 @@ int shell_cmd_mkdir(int argc, char **argv)
 
     if (argv != NULL)
         free(argv);
-    
+
     return retval;
 }
 

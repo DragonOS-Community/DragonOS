@@ -42,7 +42,7 @@ int fat32_alloc_clusters(struct vfs_index_node_t *inode, uint32_t *clusters, int
             // 找到空闲簇
             if ((buf[j] & 0x0fffffff) == 0)
             {
-                kdebug("clus[%d] = %d", clus_idx, i * ent_per_sec + j);
+                // kdebug("clus[%d] = %d", clus_idx, i * ent_per_sec + j);
                 clusters[clus_idx] = i * ent_per_sec + j;
                 ++clus_idx;
             }
@@ -84,7 +84,7 @@ done:;
         // 写入fat表
         for (int i = idx; i < num_clusters; ++i)
         {
-            kdebug("write cluster i=%d : cluster=%d, value= %d", i, cluster, clusters[i]);
+            // kdebug("write cluster i=%d : cluster=%d, value= %d", i, cluster, clusters[i]);
             fat32_write_FAT_entry(fsbi, cluster, clusters[i]);
             cluster = clusters[i];
         }
@@ -182,7 +182,7 @@ uint32_t fat32_write_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t
  */
 struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *parent_inode, uint32_t num, uint32_t mode, uint32_t *res_sector, uint64_t *res_cluster, uint64_t *res_data_buf_base)
 {
-    kdebug("find empty_dentry");
+    // kdebug("find empty_dentry");
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)parent_inode->private_inode_info;
     fat32_sb_info_t *fsbi = (fat32_sb_info_t *)parent_inode->sb->private_sb_info;
 

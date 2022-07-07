@@ -144,7 +144,7 @@ uint64_t sys_open(struct pt_regs *regs)
     //     printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
     // else
     //     printk_color(ORANGE, BLACK, "Can`t find file\n");
-    kdebug("flags=%#018lx", flags);
+    // kdebug("flags=%#018lx", flags);
     if (dentry == NULL && flags & O_CREAT)
     {
         // 先找到倒数第二级目录
@@ -159,7 +159,7 @@ uint64_t sys_open(struct pt_regs *regs)
         }
 
         struct vfs_dir_entry_t *parent_dentry = NULL;
-        kdebug("tmp_index=%d", tmp_index);
+        // kdebug("tmp_index=%d", tmp_index);
         if (tmp_index > 0)
         {
             
@@ -183,7 +183,7 @@ uint64_t sys_open(struct pt_regs *regs)
         dentry->name = (char *)kmalloc(dentry->name_length, 0);
         memset(dentry->name, 0, dentry->name_length);
         strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
-        kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
+        // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
         dentry->parent = parent_dentry;
         uint64_t retval = parent_dentry->dir_inode->inode_ops->create(parent_dentry->dir_inode, dentry, 0);
         if (retval != 0)
@@ -197,7 +197,7 @@ uint64_t sys_open(struct pt_regs *regs)
         list_init(&dentry->child_node_list);
         list_init(&dentry->subdirs_list);
         list_add(&parent_dentry->subdirs_list, &dentry->child_node_list);
-        kdebug("created.");
+        // kdebug("created.");
     }
     kfree(path);
     if (dentry == NULL)
@@ -466,12 +466,7 @@ uint64_t sys_brk(struct pt_regs *regs)
     else
         offset = -(int64_t)(current_pcb->mm->brk_end - new_brk);
 
-    /*
-    if (offset < 0)
-    {
-        kdebug("decrease brk, offset = %#010lx", (uint64_t)(-offset));
-    }
-    */
+    
 
     new_brk = mm_do_brk(current_pcb->mm->brk_end, offset); // 扩展堆内存空间
 
@@ -545,7 +540,7 @@ uint64_t sys_reboot(struct pt_regs *regs)
 uint64_t sys_chdir(struct pt_regs *regs)
 {
     char *dest_path = (char *)regs->r8;
-    kdebug("dest_path=%s", dest_path);
+    // kdebug("dest_path=%s", dest_path);
     // 检查目标路径是否为NULL
     if (dest_path == NULL)
         return -EFAULT;
@@ -579,14 +574,14 @@ uint64_t sys_chdir(struct pt_regs *regs)
     }
     else
         strncpy(path, dest_path, dest_path_len + 1);
-    kdebug("chdir: path = %s", path);
+    // kdebug("chdir: path = %s", path);
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
 
     kfree(path);
 
     if (dentry == NULL)
         return -ENOENT;
-    kdebug("dentry->name=%s, namelen=%d", dentry->name, dentry->name_length);
+    // kdebug("dentry->name=%s, namelen=%d", dentry->name, dentry->name_length);
     // 目标不是目录
     if (dentry->dir_inode->attribute != VFS_ATTR_DIR)
         return -ENOTDIR;

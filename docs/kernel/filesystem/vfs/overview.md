@@ -26,6 +26,8 @@
 
 ​    我们对文件进行操作都会使用到文件描述符，具体来说，就是要调用文件描述符之中的file_ops所包含的各种方法。
 
+---
+
 ## 注册文件系统到VFS
 
 ​    如果需要注册或取消注册某个具体文件系统到VFS之中，则需要以下两个接口：
@@ -72,6 +74,8 @@ struct vfs_filesystem_type_t
 
 ​    指向链表中下一个`struct vfs_filesystem_type_t`的指针。
 
+---
+
 ## 超级块(superblock)对象
 
     一个超级块对象代表了一个被挂载到VFS中的具体文件系统。
@@ -105,7 +109,7 @@ struct vfs_superblock_t
 
 ### struct vfs_super_block_operations_t
 
-    该数据结构为超级块的操作接口。
+    该数据结构为超级块的操作接口。VFS通过这些接口来操作具体的文件系统的超级块。
 
     该数据结构定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
 
@@ -120,4 +124,124 @@ struct vfs_super_block_operations_t
 
 **write_superblock**
 
-    
+    将superblock中的信息写入磁盘
+
+**put_superblock**
+
+    释放超级块
+
+**write_inode**
+
+    将inode的信息写入磁盘
+
+---
+
+## 索引结点(inode)对象
+
+    每个inode对象代表了具体的文件系统之中的一个对象（目录项）。
+
+### struct vfs_index_node_t
+
+    该数据结构为inode对象的数据结构，与文件系统中的具体的文件结点对象具有一对一映射的关系。
+
+    该数据结构定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
+
+```c
+struct vfs_index_node_t
+{
+    uint64_t file_size; // 文件大小
+    uint64_t blocks;    // 占用的扇区数
+    uint64_t attribute;
+
+    struct vfs_superblock_t *sb;
+    struct vfs_file_operations_t *file_ops;
+    struct vfs_inode_operations_t *inode_ops;
+
+    void *private_inode_info;
+};
+```
+
+**file_size**
+
+    文件的大小。若为文件夹，则该值为文件夹内所有文件的大小总和（估计值）。
+
+**blocks**
+
+    文件占用的磁盘块数（扇区数）
+
+**attribute**
+
+    inode的属性。可选值如下：
+
+> - VFS_ATTR_FILE
+> 
+> - VFS_ATTR_DIR
+> 
+> - VFS_ATTR_DEVICE
+
+**sb**
+
+    指向文件系统超级块的指针
+
+**file_ops**
+
+    当前文件的操作接口
+
+**inode_ops**
+
+    当前inode的操作接口
+
+**private_inode_info**
+
+    与具体文件系统相关的inode信息。该部分由具体文件系统实现，包含该inode在具体文件系统之中的特定格式信息。
+
+### struct vfs_inode_operations_t
+
+    该接口为inode的操作方法接口，由具体文件系统实现。并与具体文件系统之中的inode相互绑定。
+
+    该接口定义于`kernel/filesystem/VFS/VFS.h`中，结构如下：
+
+```c
+struct vfs_inode_operations_t
+{
+    long (*create)(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry, int mode);
+    struct vfs_dir_entry_t *(*lookup)(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry);
+    long (*mkdir)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry, int mode);
+    long (*rmdir)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry);
+    long (*rename)(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry);
+    long (*getAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
+    long (*setAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
+};
+```
+
+**create**
+
+    在父节点下，创建一个新的inode，并绑定到dest_dEntry上。
+
+    该函数的应当被`sys_open()`系统调用在使用了`O_CREAT`选项打开文件时调用，从而创建一个新的文件。请注意，传递给create()函数的`dest_dEntry`参数不应包含一个inode，也就是说，inode对象应当被具体文件系统所创建。
+
+**lookup**
+
+    当VFS需要在父目录中查找一个inode的时候，将会调用lookup方法。被查找的目录项的名称将会通过dest_dEntry传给lookup方法。
+
+    若lookup方法找到对应的目录项，将填充完善dest_dEntry对象。否则，返回NULL。
+
+**mkdir**
+
+    该函数被mkdir()系统调用所调用，用于在inode下创建子目录，并将子目录的inode绑定到dEntry对象之中。
+
+**rmdir**
+
+    该函数被rmdir()系统调用所调用，用于删除给定inode下的子目录项。
+
+**rename**
+
+    该函数被rename系统调用（尚未实现）所调用，用于将给定的目录项重命名。
+
+**getAttr**
+
+    用来获取目录项的属性。
+
+**setAttr**
+
+    用来设置目录项的属性

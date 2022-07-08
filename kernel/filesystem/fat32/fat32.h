@@ -87,7 +87,7 @@ struct fat32_FSInfo_t
 struct fat32_Directory_t
 {
     unsigned char DIR_Name[11];
-    unsigned char DIR_Attr;         // 文件属性
+    unsigned char DIR_Attr;         // 目录项属性
     unsigned char DIR_NTRes;        // EXT|BASE => 8(BASE).3(EXT)
                                     // BASE:LowerCase(8),UpperCase(0)
                                     // EXT:LowerCase(16),UpperCase(0)

@@ -91,6 +91,7 @@ fi
 # 拷贝应用程序到硬盘
 cd tools
 bash m*
+sudo mkdir -p ${root_folder}/bin/disk_mount
 sudo cp ${root_folder}/bin/user/shell.elf ${root_folder}/bin/disk_mount
 sudo cp ${root_folder}/bin/user/about.elf ${root_folder}/bin/disk_mount
 sudo mkdir ${root_folder}/bin/disk_mount/dev

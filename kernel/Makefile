@@ -18,7 +18,7 @@ LD_LIST := head.o
 OBJ_LIST := head.o
 
 
-kernel_subdirs := common driver process debug
+kernel_subdirs := common driver process debug filesystem
 	
 
 
@@ -78,14 +78,6 @@ cpu.o: common/cpu.c
 softirq.o: exception/softirq.c
 	gcc $(CFLAGS) -c exception/softirq.c -o exception/softirq.o
 
-fat32.o: filesystem/fat32/fat32.c
-	gcc $(CFLAGS) -c filesystem/fat32/fat32.c -o filesystem/fat32/fat32.o
-
-MBR.o: filesystem/MBR.c
-	gcc $(CFLAGS) -c filesystem/MBR.c -o filesystem/MBR.o
-
-VFS.o: filesystem/VFS/VFS.c
-	gcc $(CFLAGS) -c filesystem/VFS/VFS.c -o filesystem/VFS/VFS.o
 
 # IPI的代码
 ifeq ($(ARCH), __x86_64__)
@@ -164,7 +156,7 @@ all: kernel
 	echo "Done."
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o fat32.o MBR.o VFS.o $(OBJ_LIST)
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o $(OBJ_LIST)
 	
 	@list='$(kernel_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\

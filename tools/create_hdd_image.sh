@@ -5,6 +5,12 @@ qemu-img create -f raw disk.img 16M
 # 按顺序输入，并且，每次输入完成后要按下回车）
 fdisk disk.img
 
-echo "Successfully created disk image, please make a FAT32 filesystem on it"
-sudo mkdir -p ../bin
-sudo cp ./disk.img ../bin/
+LOOP_DEVICE=$(sudo losetup -f --show -P disk.img) \
+    || exit 1
+echo ${LOOP_DEVICE}p1
+sudo mkfs.vfat -F 32 ${LOOP_DEVICE}p1
+sudo losetup -d ${LOOP_DEVICE}
+
+echo "Successfully created disk image."
+mkdir -p ../bin
+mv ./disk.img ../bin/

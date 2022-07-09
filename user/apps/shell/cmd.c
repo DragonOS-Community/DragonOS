@@ -10,7 +10,7 @@
 #include <libc/fcntl.h>
 #include <libc/dirent.h>
 #include <libc/sys/wait.h>
-
+#include <libc/sys/stat.h>
 #include "cmd_help.h"
 
 // 当前工作目录（在main_loop中初始化）
@@ -181,7 +181,7 @@ int shell_cmd_cd(int argc, char **argv)
             goto fail;
         ; // 出错则直接忽略
     }
-    else
+    else // ======进入相对路径=====
     {
         int dest_offset = 0;
         if (dest_len > 2)
@@ -191,7 +191,7 @@ int shell_cmd_cd(int argc, char **argv)
         }
 
         int new_len = current_dir_len + dest_len - dest_offset;
-        // ======进入相对路径=====
+
         if (new_len >= SHELL_CWD_MAX_SIZE - 1)
         {
             printf("ERROR: Path too long!\n");
@@ -210,7 +210,8 @@ int shell_cmd_cd(int argc, char **argv)
         if (chdir(new_path) == 0) // 成功切换目录
         {
             free(shell_current_path);
-            new_path[new_len] = '\0';
+            // printf("new_path=%s, newlen= %d\n", new_path, new_len);
+            new_path[new_len + 1] = '\0';
             shell_current_path = new_path;
             goto done;
         }
@@ -329,8 +330,30 @@ int shell_cmd_cat(int argc, char **argv)
  * @param argv
  * @return int
  */
-// todo:
-int shell_cmd_touch(int argc, char **argv) {}
+int shell_cmd_touch(int argc, char **argv)
+{
+    int path_len = 0;
+    char *file_path;
+    if (argv[1][0] == '/')
+        file_path = argv[1];
+    else
+        file_path = get_target_filepath(argv[1], &path_len);
+
+    // 打开文件
+    int fd = open(file_path, O_CREAT);
+    switch (fd)
+    {
+    case -ENOENT:
+        put_string("Parent dir not exists.\n", COLOR_RED, COLOR_BLACK);
+        break;
+
+    default:
+        break;
+    }
+    close(fd);
+    if (argv != NULL)
+        free(argv);
+}
 
 /**
  * @brief 删除命令
@@ -349,8 +372,24 @@ int shell_cmd_rm(int argc, char **argv) {}
  * @param argv
  * @return int
  */
-// todo:
-int shell_cmd_mkdir(int argc, char **argv) {}
+int shell_cmd_mkdir(int argc, char **argv)
+{
+    int result_path_len = -1;
+    const char *full_path = NULL;
+    if (argv[1][0] == '/')
+        full_path = argv[1];
+    else
+    {
+        full_path = get_target_filepath(argv[1], &result_path_len);
+    }
+    printf("mkdir: full_path = %s\n", full_path);
+    int retval = mkdir(full_path, 0);
+
+    if (argv != NULL)
+        free(argv);
+
+    return retval;
+}
 
 /**
  * @brief 删除文件夹的命令
@@ -406,13 +445,12 @@ int shell_cmd_about(int argc, char **argv)
     char **aav;
 
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
-    
+
     strcpy(input_buffer, "exec /about.elf\0");
 
     parse_command(input_buffer, &aac, &aav);
 
     shell_cmd_exec(aac, aav);
-
 }
 
 /**

@@ -90,7 +90,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         return parent;
 
     struct vfs_dir_entry_t *dentry;
-
+    // kdebug("path before walk:%s", path);
     while (true)
     {
         // 提取出下一级待搜索的目录名或文件名，并保存在dEntry_name中
@@ -98,7 +98,6 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         while ((*path && *path != '\0') && (*path != '/'))
             ++path;
         int tmp_path_len = path - tmp_path;
-
         dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
         memset(dentry, 0, sizeof(struct vfs_dir_entry_t));
         // 为目录项的名称分配内存
@@ -106,14 +105,15 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         // 貌似这里不需要memset，因为空间会被覆盖
         // memset(dentry->name, 0, tmp_path_len+1);
 
-        memcpy(dentry->name, (void*)tmp_path, tmp_path_len);
+        memcpy(dentry->name, (void *)tmp_path, tmp_path_len);
         dentry->name[tmp_path_len] = '\0';
+        // kdebug("tmp_path_len=%d, dentry->name= %s", tmp_path_len, dentry->name);
         dentry->name_length = tmp_path_len;
 
         if (parent->dir_inode->inode_ops->lookup(parent->dir_inode, dentry) == NULL)
         {
             // 搜索失败
-            kerror("cannot find the file/dir : %s", dentry->name);
+            // kerror("cannot find the file/dir : %s", dentry->name);
             kfree(dentry->name);
             kfree(dentry);
             return NULL;
@@ -179,7 +179,7 @@ int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
 uint64_t sys_mkdir(struct pt_regs *regs)
 {
     const char *path = (const char *)regs->r8;
-    kdebug("path = %s", path);
+    // kdebug("path = %s", path);
     mode_t mode = (mode_t)regs->r9;
     uint32_t pathlen;
     if (regs->cs & USER_CS)
@@ -215,11 +215,13 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     else
         strncpy(buf, path, last_slash);
     buf[last_slash + 1] = '\0';
+    // kdebug("to walk: %s", buf);
     // 查找父目录
     struct vfs_dir_entry_t *parent_dir = vfs_path_walk(buf, 0);
 
     if (parent_dir == NULL)
     {
+        kwarn("parent dir is NULL.");
         kfree(buf);
         return -ENOENT;
     }
@@ -249,12 +251,12 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     }
     ++subdir_dentry->name_length;
 
-    kdebug("last_slash=%d", last_slash);
-    kdebug("name=%s", path + last_slash + 1);
+    // kdebug("last_slash=%d", last_slash);
+    // kdebug("name=%s", path + last_slash + 1);
     subdir_dentry->parent = parent_dir;
-    kdebug("to mkdir, parent name=%s", parent_dir->name);
+    // kdebug("to mkdir, parent name=%s", parent_dir->name);
     int retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
     list_add(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
-    kdebug("retval = %d", retval);
+    // kdebug("retval = %d", retval);
     return 0;
 }

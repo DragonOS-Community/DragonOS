@@ -73,9 +73,9 @@ int main()
     int kb_fd = open(kb_file_path, 0);
     // printf("keyboard fd = %d\n", kb_fd);
     print_ascii_logo();
-    printf("before mkdir\n");
-    mkdir("/aaac", 0);
-    printf("after mkdir\n");
+    // printf("before mkdir\n");
+    // mkdir("/aaac", 0);
+    // printf("after mkdir\n");
     main_loop(kb_fd);
     while (1)
         ;

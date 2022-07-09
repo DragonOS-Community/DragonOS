@@ -11,5 +11,5 @@
  */
 int open(const char *path, int options, ...)
 {
-    return syscall_invoke(SYS_OPEN, (uint64_t)path, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_OPEN, (uint64_t)path, options, 0, 0, 0, 0, 0, 0);
 }

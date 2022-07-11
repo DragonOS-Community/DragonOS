@@ -70,16 +70,11 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
             raise_softirq((1 << TIMER_SIRQ));
 
-        // if (current_pcb->pid == 2)
-        //     kwarn("timer_jiffies = %ld video_refresh_expire_jiffies=%ld", timer_jiffies, video_refresh_expire_jiffies);
         // 当时间到了，或进程发生切换时，刷新帧缓冲区
         if (timer_jiffies >= video_refresh_expire_jiffies || (video_last_refresh_pid != current_pcb->pid))
         {
             raise_softirq(VIDEO_REFRESH_SIRQ);
         }
-
-        sched_update_jiffies();
-
         break;
 
     default:
@@ -92,12 +87,12 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
  * @brief 测量apic定时器频率的中断回调函数
  *
  */
-void HPET_measure_apic_timer_handler()
+void HPET_measure_apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
     // 停止apic定时器
     // 写入每1ms的ticks
     apic_timer_stop();
-    apic_timer_ticksIn1ms = 0xFFFFFFFF - apic_timer_get_current();
+    apic_timer_ticks_result = 0xFFFFFFFF - apic_timer_get_current();
     measure_apic_timer_flag = true;
 }
 
@@ -108,7 +103,7 @@ void HPET_measure_apic_timer_handler()
 void HPET_measure_apic_timer_freq()
 {
     kinfo("Measuring local APIC timer's frequency...");
-    const uint64_t interval = 1; // 测量1毫秒内的计数
+    const uint64_t interval = APIC_TIMER_INTERVAL; // 测量给定时间内的计数
     struct apic_IO_APIC_RTE_entry entry;
 
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
@@ -137,15 +132,14 @@ void HPET_measure_apic_timer_freq()
     irq_register(34, &entry, &HPET_measure_apic_timer_handler, 0, &HPET_intr_controller, "HPET0 measure");
 
     // 设置div16
-    apic_timer_set_div(0x3);
     apic_timer_stop();
-    // 设置初始计数
+    apic_timer_set_div(APIC_TIMER_DIVISOR);
 
-    
+    // 设置初始计数
     apic_timer_set_init_cnt(0xFFFFFFFF);
 
     // 启动apic定时器
-    apic_timer_set_LVT(151, APIC_LVT_Timer_One_Shot);
+    apic_timer_set_LVT(151, 0, APIC_LVT_Timer_One_Shot);
     *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位，开始计时
     io_mfence();
 
@@ -156,7 +150,7 @@ void HPET_measure_apic_timer_freq()
 
     *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 0; // 停用HPET定时器
     io_mfence();
-    kinfo("Local APIC timer's freq: %d ticks/ms.", apic_timer_ticksIn1ms);
+    kinfo("Local APIC timer's freq: %d ticks/ms.", apic_timer_ticks_result);
 }
 
 /**

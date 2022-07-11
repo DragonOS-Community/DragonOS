@@ -202,7 +202,7 @@ struct apic_IO_APIC_RTE_entry
 // 屏蔽
 #define UNMASKED 0
 #define MASKED 1
-#define APIC_LVT_INT_MASKED 0x10000
+#define APIC_LVT_INT_MASKED 0x10000UL
 
 // 触发模式
 #define EDGE_TRIGGER 0  // 边沿触发

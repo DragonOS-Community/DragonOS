@@ -1,4 +1,5 @@
 #include "irq.h"
+#include <common/errno.h>
 
 // 对进行
 #if _INTR_8259A_
@@ -148,6 +149,31 @@ void (*SMP_interrupt_table[SMP_IRQ_NUM])(void) =
         IRQ0xd1interrupt,
 };
 
+// 初始化local apic中断服务程序数组
+Build_IRQ(0x96);
+Build_IRQ(0x97);
+Build_IRQ(0x98);
+Build_IRQ(0x99);
+Build_IRQ(0x9a);
+Build_IRQ(0x9b);
+Build_IRQ(0x9c);
+Build_IRQ(0x9d);
+Build_IRQ(0x9e);
+Build_IRQ(0x9f);
+void (*local_apic_interrupt_table[LOCAL_APIC_IRQ_NUM])(void) =
+    {
+        IRQ0x96interrupt,
+        IRQ0x97interrupt,
+        IRQ0x98interrupt,
+        IRQ0x99interrupt,
+        IRQ0x9ainterrupt,
+        IRQ0x9binterrupt,
+        IRQ0x9cinterrupt,
+        IRQ0x9dinterrupt,
+        IRQ0x9einterrupt,
+        IRQ0x9finterrupt,
+};
+
 /**
  * @brief 中断注册函数
  *
@@ -162,14 +188,24 @@ void (*SMP_interrupt_table[SMP_IRQ_NUM])(void) =
 int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter, struct pt_regs *regs), ul paramater, hardware_intr_controller *controller, char *irq_name)
 {
     // 由于为I/O APIC分配的中断向量号是从32开始的，因此要减去32才是对应的interrupt_desc的元素
-    irq_desc_t *p = &interrupt_desc[irq_num - 32];
-
+    irq_desc_t *p = NULL;
+    if (irq_num >= 32 && irq_num < 0x80)
+        p = &interrupt_desc[irq_num - 32];
+    else if (irq_num >= 150 && irq_num < 160)
+        p = &local_apic_interrupt_desc[irq_num - 150];
+    else
+    {
+        kerror("irq_register(): invalid irq num: %ld.", irq_num);
+        return -EINVAL;
+    }
     p->controller = controller;
-
-    int namelen = sizeof(strlen(irq_name)+1);
-    p->irq_name = (char *)kmalloc(namelen,0);
-    memset(p->irq_name, 0, namelen);
-    strncpy(p->irq_name, irq_name, namelen);
+    if (p->irq_name == NULL)
+    {
+        int namelen = sizeof(strlen(irq_name) + 1);
+        p->irq_name = (char *)kmalloc(namelen, 0);
+        memset(p->irq_name, 0, namelen);
+        strncpy(p->irq_name, irq_name, namelen);
+    }
 
     p->parameter = paramater;
     p->flags = 0;

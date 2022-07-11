@@ -20,6 +20,17 @@ uint local_apic_max_LVT_entries;
 
 static struct acpi_Multiple_APIC_Description_Table_t *madt;
 static struct acpi_IO_APIC_Structure_t *io_apic_ICS;
+
+#define send_EOI()                                      \
+    do                                                  \
+    {                                                   \
+        __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"   \
+                             "movq	$0x00,	%%rax	\n\t"   \
+                             "movq 	$0x80b,	%%rcx	\n\t" \
+                             "wrmsr	\n\t" ::            \
+                                 : "memory");            \
+    } while (0)
+
 /**
  * @brief 初始化io_apic
  *
@@ -235,7 +246,7 @@ void apic_local_apic_init()
     // 检测是否成功启用xAPIC和x2APIC
     if (eax & 0xc00)
         kinfo("xAPIC & x2APIC enabled!");
-    
+
     /*
         io_mfence();
         uint *svr = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
@@ -378,6 +389,10 @@ void apic_init()
     for (int i = 32; i <= 55; ++i)
         set_intr_gate(i, 0, interrupt_table[i - 32]);
 
+    // 设置local apic中断门
+    for (int i = 150; i < 160; ++i)
+        set_intr_gate(i, 0, local_apic_interrupt_table[i - 150]);
+
     /*
     // 初始化主芯片
     io_out8(0x20, 0x11); // 初始化主芯片的icw1
@@ -461,7 +476,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         // ps: 当前已经将系统调用直接使用系统调用门实现，不走这里。。
         do_syscall_int(rsp, 0);
     }
-    else if (number > 0x80)
+    else if (number >= 200)
 
     {
         // printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
@@ -473,6 +488,25 @@ void do_IRQ(struct pt_regs *rsp, ul number)
                 irq->handler(number, irq->parameter, rsp);
         }
     }
+    else if (number >= 150 && number < 160)
+    {
+        irq_desc_t *irq = &local_apic_interrupt_desc[number - 150];
+
+        // 执行中断上半部处理程序
+        if (irq != NULL && irq->handler != NULL)
+            irq->handler(number, irq->parameter, rsp);
+        else
+            kwarn("Intr vector [%d] does not have a handler!");
+        // 向中断控制器发送应答消息
+        if (irq->controller != NULL && irq->controller->ack != NULL)
+            irq->controller->ack(number);
+        else
+        {
+
+            // 向EOI寄存器写入0x00表示结束中断
+            send_EOI();
+        }
+    }
     else
     {
 
@@ -482,7 +516,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     // kdebug("before softirq");
     // 进入软中断处理程序
     do_softirq();
-    
+
     // kdebug("after softirq");
     // 检测当前进程是否持有自旋锁，若持有自旋锁，则不进行抢占式的进程调度
     if (current_pcb->preempt_count > 0)

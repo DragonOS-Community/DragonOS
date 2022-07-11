@@ -123,8 +123,7 @@ void sched_cfs()
  */
 void sched_update_jiffies()
 {
-    // if (current_pcb->cpu_id == 0)
-    //     return;
+    
     switch (current_pcb->priority)
     {
     case 0:

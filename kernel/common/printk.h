@@ -157,3 +157,13 @@ void printk_enable_animation();
  * 
  */
 void printk_disable_animation();
+
+/**
+ * @brief 格式化字符串并输出到buf
+ * 
+ * @param buf 输出缓冲区
+ * @param fmt 格式
+ * @param ... 参数
+ * @return int 字符串长度
+ */
+int sprintk(char *buf, const char *fmt, ...);

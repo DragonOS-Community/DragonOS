@@ -891,3 +891,15 @@ void printk_disable_animation()
 {
     sw_show_scroll_animation = false;
 }
+
+int sprintk(char *buf, const char *fmt, ...)
+{
+    int count = 0;
+    va_list args;
+
+    va_start(args, fmt);
+    count = vsprintf(buf, fmt, args);
+    va_end(args);
+
+    return count;
+}

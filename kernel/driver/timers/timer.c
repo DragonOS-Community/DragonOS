@@ -7,6 +7,9 @@
 
 struct timer_func_list_t timer_func_head;
 
+// 定时器循环阈值，每次最大执行10个定时器任务
+#define TIMER_RUN_CYCLE_THRESHOLD 10
+
 void test_timer()
 {
     printk_color(ORANGE, BLACK, "(test_timer)");
@@ -29,17 +32,20 @@ void do_timer_softirq(void *data)
 {
     
     struct timer_func_list_t *tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
-
+    int cycle_count = 0;
     while ((!list_empty(&timer_func_head.list)) && (tmp->expire_jiffies <= timer_jiffies))
     {
         
         timer_func_del(tmp);
         tmp->func(tmp->data);
         kfree(tmp);
-        tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
-    }
 
-    
+        ++cycle_count;
+        // 当前定时器达到阈值
+        if(cycle_count == TIMER_RUN_CYCLE_THRESHOLD)
+            break;
+        tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
+    }    
 }
 
 /**

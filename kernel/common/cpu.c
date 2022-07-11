@@ -7,7 +7,7 @@ uint Cpu_cpuid_max_Basic_mop;
 // cpu支持的最大cpuid指令的扩展主功能号
 uint Cpu_cpuid_max_Extended_mop;
 // cpu制造商信息
-char Cpu_Manufacturer_Name[17]={0};
+char Cpu_Manufacturer_Name[17] = {0};
 // 处理器名称信息
 char Cpu_BrandName[49] = {0};
 // 处理器家族ID
@@ -26,7 +26,6 @@ uint Cpu_Processor_Type;
 uint Cpu_max_phys_addrline_size;
 // 处理器支持的最大线性地址可寻址地址线宽度
 uint Cpu_max_linear_addrline_size;
-
 
 struct cpu_core_info_t cpu_core_info[MAX_CPU_NUM];
 void cpu_init(void)
@@ -90,9 +89,32 @@ void cpu_init(void)
     return;
 }
 
-void cpu_cpuid(uint32_t mop, uint32_t sop, uint32_t *eax, uint32_t*ebx, uint32_t*ecx, uint32_t*edx)
-{   
+void cpu_cpuid(uint32_t mop, uint32_t sop, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
     // 向eax和ecx分别输入主功能号和子功能号
     // 结果输出到eax, ebx, ecx, edx
-    __asm__ __volatile__("cpuid \n\t":"=a"(*eax),"=b"(*ebx), "=c"(*ecx), "=d"(*edx):"0"(mop),"2"(sop):"memory");
+    __asm__ __volatile__("cpuid \n\t"
+                         : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
+                         : "0"(mop), "2"(sop)
+                         : "memory");
+}
+
+/**
+ * @brief 获取当前cpu核心晶振频率（是一个Write-on-box的值）
+ *
+ * hint: 某些cpu无法提供该数据，返回值为0
+ * @return uint32_t 当前cpu核心晶振频率
+ */
+uint32_t cpu_get_core_crysral_freq()
+{
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+
+    // cpu_cpuid(0x15, 0, &a, &b, &c, &d);
+    __asm__ __volatile__("cpuid \n\t"
+                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "0"(0x15), "2"(0)
+                         : "memory");
+    // kdebug("Cpu_cpuid_max_Basic_mop = %#03x, a=%ld, b=%ld, c=%ld, d=%ld", Cpu_cpuid_max_Basic_mop, a, b, c, d);
+    
+    return c;
 }

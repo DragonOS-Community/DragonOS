@@ -57,3 +57,11 @@ struct cpu_core_info_t
 };
 
 extern struct cpu_core_info_t cpu_core_info[MAX_CPU_NUM];
+
+
+/**
+ * @brief 获取当前cpu核心晶振频率
+ * 
+ * @return uint32_t 当前cpu核心晶振频率
+ */
+uint32_t cpu_get_core_crysral_freq();

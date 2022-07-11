@@ -46,19 +46,21 @@ void smp_init()
     ipi_regiserIPI(0xc8, NULL, &ipi_0xc8_handler, NULL, NULL, "IPI 0xc8");
 
     ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, true, 0x00);
-
+    kdebug("total_processor_num=%d", total_processor_num);
     for (int i = 1; i < total_processor_num; ++i) // i从1开始，不初始化bsp
     {
         if (proc_local_apic_structs[i]->ACPI_Processor_UID == 0)
             --total_processor_num;
         if (proc_local_apic_structs[i]->local_apic_id > total_processor_num)
-            continue;
+            {
+                --total_processor_num;
+                continue;}
+        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id, proc_local_apic_structs[i]->flags);
 
         spin_lock(&multi_core_starting_lock);
         preempt_enable();   // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt count
         current_starting_cpu = proc_local_apic_structs[i]->local_apic_id;
 
-        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id, proc_local_apic_structs[i]->flags);
 
         // 为每个AP处理器分配栈空间
         cpu_core_info[current_starting_cpu].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
@@ -154,7 +156,7 @@ void smp_ap_start()
     spin_unlock(&multi_core_starting_lock);
     preempt_disable();// 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count
     sti();
-
+    kdebug("1212221212");
     while (1)
         hlt();
 

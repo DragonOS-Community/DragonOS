@@ -5,29 +5,29 @@
 #define MAX_CPU_NUM 32 // 操作系统支持的最大处理器数量
 
 // cpu支持的最大cpuid指令的基础主功能号
-uint Cpu_cpuid_max_Basic_mop;
+extern uint32_t Cpu_cpuid_max_Basic_mop;
 // cpu支持的最大cpuid指令的扩展主功能号
-uint Cpu_cpuid_max_Extended_mop;
+extern uint32_t Cpu_cpuid_max_Extended_mop;
 // cpu制造商信息
-char Cpu_Manufacturer_Name[17]={0};
+extern char Cpu_Manufacturer_Name[17];
 // 处理器名称信息
-char Cpu_BrandName[49] = {0};
+extern char Cpu_BrandName[49];
 // 处理器家族ID
-uint Cpu_Family_ID;
+extern uint32_t Cpu_Family_ID;
 // 处理器扩展家族ID
-uint Cpu_Extended_Family_ID;
+extern uint32_t Cpu_Extended_Family_ID;
 // 处理器模式ID
-uint Cpu_Model_ID;
+extern uint32_t Cpu_Model_ID;
 // 处理器扩展模式ID
-uint Cpu_Extended_Model_ID;
+extern uint32_t Cpu_Extended_Model_ID;
 // 处理器步进ID
-uint Cpu_Stepping_ID;
+extern uint32_t Cpu_Stepping_ID;
 // 处理器类型
-uint Cpu_Processor_Type;
+extern uint32_t Cpu_Processor_Type;
 // 处理器支持的最大物理地址可寻址地址线宽度
-uint Cpu_max_phys_addrline_size;
+extern uint32_t Cpu_max_phys_addrline_size;
 // 处理器支持的最大线性地址可寻址地址线宽度
-uint Cpu_max_linear_addrline_size;
+extern uint32_t Cpu_max_linear_addrline_size;
 
 /**
  * @brief 执行cpuid指令
@@ -41,12 +41,7 @@ uint Cpu_max_linear_addrline_size;
  * 
  * cpuid指令参考英特尔开发手册卷2A Chapter3 3.2 Instruction
  */
-void cpu_cpuid(uint mop, uint sop, uint *eax, uint*ebx, uint*ecx, uint*edx)
-{   
-    // 向eax和ecx分别输入主功能号和子功能号
-    // 结果输出到eax, ebx, ecx, edx
-    __asm__ __volatile__("cpuid \n\t":"=a"(*eax),"=b"(*ebx), "=c"(*ecx), "=d"(*edx):"0"(mop),"2"(sop):"memory");
-}
+void cpu_cpuid(uint32_t mop, uint32_t sop, uint32_t *eax, uint32_t*ebx, uint32_t*ecx, uint32_t*edx);
 
 /**
  * @brief 初始化获取处理器信息模块
@@ -54,9 +49,11 @@ void cpu_cpuid(uint mop, uint sop, uint *eax, uint*ebx, uint*ecx, uint*edx)
  */
 void cpu_init(void);
 
-struct cpu_core_info
+struct cpu_core_info_t
 {
     uint64_t stack_start;   // 栈基地址
     uint64_t ist_stack_start;   // IST栈基地址
     uint64_t tss_vaddr; // tss地址
-}cpu_core_info[MAX_CPU_NUM];
+};
+
+extern struct cpu_core_info_t cpu_core_info[MAX_CPU_NUM];

@@ -8,14 +8,16 @@
 #include <sched/sched.h>
 #include <smp/ipi.h>
 #include <driver/video/video.h>
+#include <driver/interrupt/apic/apic_timer.h>
+#include <process/spinlock.h>
 
 static struct acpi_HPET_description_table_t *hpet_table;
 static uint64_t HPET_REG_BASE = 0;
 static uint32_t HPET_COUNTER_CLK_PERIOD = 0; // 主计数器时间精度（单位：飞秒）
 static double HPET_freq = 0;                 // 主计时器频率
 static uint8_t HPET_NUM_TIM_CAP = 0;         // 定时器数量
-
-extern struct rtc_time_t rtc_now; // 导出全局墙上时钟
+static char measure_apic_timer_flag;         // 初始化apic时钟时所用到的标志变量
+extern struct rtc_time_t rtc_now;            // 导出全局墙上时钟
 
 enum
 {
@@ -75,7 +77,6 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         {
             raise_softirq(VIDEO_REFRESH_SIRQ);
         }
-        
 
         sched_update_jiffies();
 
@@ -85,6 +86,118 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         kwarn("Unsupported HPET irq: %d.", number);
         break;
     }
+}
+
+/**
+ * @brief 测量apic定时器频率的中断回调函数
+ *
+ */
+void HPET_measure_apic_timer_handler()
+{
+    // 停止apic定时器
+    // 写入每1ms的ticks
+    apic_timer_stop();
+    apic_timer_ticksIn1ms = 0xFFFFFFFF - apic_timer_get_current();
+    measure_apic_timer_flag = true;
+}
+
+/**
+ * @brief 测定apic定时器的频率
+ *
+ */
+void HPET_measure_apic_timer_freq()
+{
+    kinfo("Measuring local APIC timer's frequency...");
+    const uint64_t interval = 1; // 测量1毫秒内的计数
+    struct apic_IO_APIC_RTE_entry entry;
+
+    // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
+    apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
+
+    // 计算HPET0间隔多少个时钟周期触发一次中断
+    uint64_t clks_to_intr = 0.001 * interval * HPET_freq;
+    // kdebug("clks_to_intr=%#ld", clks_to_intr);
+    if (clks_to_intr <= 0 || clks_to_intr > (HPET_freq * 8))
+    {
+        kBUG("HPET0: Numof clocks to generate interrupt is INVALID! value=%lld", clks_to_intr);
+        while (1)
+            hlt();
+    }
+    *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
+    io_mfence();
+    *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x0044; // 设置定时器0为非周期，边沿触发，默认投递到IO APIC的2号引脚
+    io_mfence();
+    *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = clks_to_intr;
+
+    io_mfence();
+
+    measure_apic_timer_flag = false;
+
+    // 注册中断
+    irq_register(34, &entry, &HPET_measure_apic_timer_handler, 0, &HPET_intr_controller, "HPET0 measure");
+
+    // 设置div16
+    apic_timer_set_div(0x3);
+    apic_timer_stop();
+    // 设置初始计数
+
+    
+    apic_timer_set_init_cnt(0xFFFFFFFF);
+
+    // 启动apic定时器
+    apic_timer_set_LVT(151, APIC_LVT_Timer_One_Shot);
+    *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位，开始计时
+    io_mfence();
+
+    while (measure_apic_timer_flag == false)
+        ;
+
+    irq_unregister(34);
+
+    *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 0; // 停用HPET定时器
+    io_mfence();
+    kinfo("Local APIC timer's freq: %d ticks/ms.", apic_timer_ticksIn1ms);
+}
+
+/**
+ * @brief 启用HPET周期中断（5ms）
+ *
+ */
+void HPET_enable()
+{
+    struct apic_IO_APIC_RTE_entry entry;
+    // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
+    apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
+
+    // 计算HPET0间隔多少个时钟周期触发一次中断
+    uint64_t clks_to_intr = 0.001 * HPET0_INTERVAL * HPET_freq;
+    // kdebug("clks_to_intr=%#ld", clks_to_intr);
+    if (clks_to_intr <= 0 || clks_to_intr > (HPET_freq * 8))
+    {
+        kBUG("HPET0: Numof clocks to generate interrupt is INVALID! value=%lld", clks_to_intr);
+        while (1)
+            hlt();
+    }
+    // kdebug("[HPET0] conf register=%#018lx  conf register[63:32]=%#06lx", (*(uint64_t *)(HPET_REG_BASE + TIM0_CONF)), ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))>>32)&0xffffffff);
+    *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
+    io_mfence();
+    *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，默认投递到IO APIC的2号引脚(看conf寄存器的高32bit，哪一位被置1，则可以投递到哪一个I/O apic引脚)
+    io_mfence();
+    *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = clks_to_intr; // 5ms触发一次中断
+
+    io_mfence();
+
+    // kdebug("[HPET0] conf register after modify=%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))));
+    // kdebug("[HPET1] conf register =%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM1_CONF))));
+
+    rtc_get_cmos_time(&rtc_now);
+
+    kinfo("HPET0 enabled.");
+
+    *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位
+    io_mfence();
+    // 注册中断
+    irq_register(34, &entry, &HPET_handler, 0, &HPET_intr_controller, "HPET0");
 }
 
 int HPET_init()
@@ -151,40 +264,8 @@ int HPET_init()
     HPET_NUM_TIM_CAP = (tmp >> 8) & 0x1f; // 读取计时器数量
     kinfo("Total HPET timers: %d", HPET_NUM_TIM_CAP);
 
+    kinfo("HPET driver Initialized.");
     // kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, (double)HPET_freq);
     // kdebug("HPET_freq=%ld", (long)HPET_freq);
     // kdebug("HPET_freq=%lf", HPET_freq);
-
-    struct apic_IO_APIC_RTE_entry entry;
-    // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
-    apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
-
-    // 计算HPET0间隔多少个时钟周期触发一次中断
-    uint64_t clks_to_intr = 0.001 * HPET0_INTERVAL * HPET_freq;
-    // kdebug("clks_to_intr=%#ld", clks_to_intr);
-    if (clks_to_intr <= 0 || clks_to_intr > (HPET_freq * 8))
-    {
-        kBUG("HPET0: Numof clocks to generate interrupt is INVALID! value=%lld", clks_to_intr);
-        while (1)
-            hlt();
-    }
-    // kdebug("[HPET0] conf register=%#018lx  conf register[63:32]=%#06lx", (*(uint64_t *)(HPET_REG_BASE + TIM0_CONF)), ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))>>32)&0xffffffff);
-    *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
-    io_mfence();
-    *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，默认投递到IO APIC的2号引脚(看conf寄存器的高32bit，哪一位被置1，则可以投递到哪一个I/O apic引脚)
-    io_mfence();
-    *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = clks_to_intr; // 5ms触发一次中断
-
-    io_mfence();
-
-    // kdebug("[HPET0] conf register after modify=%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))));
-    // kdebug("[HPET1] conf register =%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM1_CONF))));
-
-    rtc_get_cmos_time(&rtc_now);
-
-    kinfo("HPET Initialized.");
-    *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位
-    io_mfence();
-    // 注册中断
-    irq_register(34, &entry, &HPET_handler, 0, &HPET_intr_controller, "HPET0");
 }

@@ -187,7 +187,7 @@ void apic_init_ap_core_local_apic()
 void apic_local_apic_init()
 {
     // 映射Local APIC 寄存器地址
-    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, 0xfee00000, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, 0xfee00000UL, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
     uint a, b, c, d;
 
     cpu_cpuid(1, 0, &a, &b, &c, &d);
@@ -235,6 +235,7 @@ void apic_local_apic_init()
     // 检测是否成功启用xAPIC和x2APIC
     if (eax & 0xc00)
         kinfo("xAPIC & x2APIC enabled!");
+    
     /*
         io_mfence();
         uint *svr = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
@@ -336,7 +337,7 @@ void apic_local_apic_init()
     io_mfence();
     kdebug("cmci = %#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI));
     */
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = 0x10000;
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = APIC_LVT_INT_MASKED;
     io_mfence();
     /*
     *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = 0x1000000;

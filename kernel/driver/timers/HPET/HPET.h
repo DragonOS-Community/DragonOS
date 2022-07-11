@@ -8,3 +8,15 @@
 
 #define HPET0_INTERVAL 5    // HPET0定时器的中断间隔为5ms
 int HPET_init();
+
+/**
+ * @brief 测定apic定时器的频率
+ *
+ */
+void HPET_measure_apic_timer_freq();
+
+/**
+ * @brief 启用HPET周期中断（5ms）
+ *
+ */
+void HPET_enable();

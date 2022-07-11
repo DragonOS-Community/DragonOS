@@ -89,14 +89,7 @@ ipi.o: arch/x86_64/x86_64_ipi.c
 endif
 
 # 驱动程序
-# 中断处理芯片的驱动程序
-ifeq ($(PIC), _INTR_8259A_)
-pic.o: driver/interrupt/8259A/8259A.c
-	gcc $(CFLAGS) -c driver/interrupt/8259A/8259A.c -o driver/interrupt/pic.o
-else
-pic.o: driver/interrupt/apic/apic.c
-	gcc $(CFLAGS) -c driver/interrupt/apic/apic.c -o driver/interrupt/pic.o
-endif
+
 
 multiboot2.o: driver/multiboot2/multiboot2.c 
 	gcc $(CFLAGS) -c driver/multiboot2/multiboot2.c  -o driver/multiboot2/multiboot2.o
@@ -154,12 +147,12 @@ all: kernel
 	echo "Done."
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o $(OBJ_LIST)
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o $(OBJ_LIST)
 	
 	@list='$(kernel_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
-    		$(MAKE) all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" kernel_root_path="$(shell pwd)";\
+    		$(MAKE) all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)" kernel_root_path="$(shell pwd)";\
     		cd ..;\
 	done
 

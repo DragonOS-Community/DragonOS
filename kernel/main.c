@@ -140,13 +140,18 @@ void system_initialize()
     // test_mm();
 
     // process_init();
-    current_pcb->preempt_count = 0;
+    HPET_init();
+    HPET_measure_apic_timer_freq();
+    // current_pcb->preempt_count = 0;
+    // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
+    // while(1);
     process_init();
     // 对显示模块进行高级初始化，启用double buffer
     video_init(true);
-    HPET_init();
+
     // fat32_init();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
+    HPET_enable();
 }
 
 //操作系统内核从这里开始执行

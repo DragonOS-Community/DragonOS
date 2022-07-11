@@ -99,6 +99,7 @@ sudo touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
 sync
 bash u*
 cd ..
+allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
 
 if [ $flag_can_run -eq 1 ]; then
   if [ ${IA32_USE_QEMU} == 0 ]; then
@@ -106,7 +107,7 @@ if [ $flag_can_run -eq 1 ]; then
     else
         qemu-system-x86_64 -cdrom ${iso} -m 512M -smp 2,cores=2,threads=1,sockets=1 \
         -boot order=d   \
-        -monitor stdio -d cpu_reset,guest_errors,trace:check_exception,exec,cpu,out_asm,in_asm -s -S -cpu IvyBridge --enable-kvm -rtc clock=host,base=localtime -serial file:serial_opt.txt \
+        -monitor stdio -d cpu_reset,guest_errors,trace:check_exception,exec,cpu,out_asm,in_asm -s -S -cpu "IvyBridge,+apic,+x2apic,check,${allflags}" --enable-kvm -rtc clock=host,base=localtime -serial file:serial_opt.txt \
         -drive id=disk,file=bin/disk.img,if=none \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0    \

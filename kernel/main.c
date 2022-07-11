@@ -28,7 +28,7 @@
 #include "driver/disk/ahci/ahci.h"
 #include <driver/timers/rtc/rtc.h>
 #include <driver/timers/HPET/HPET.h>
-#include <driver/timers/timer.h>
+#include <time/timer.h>
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 
@@ -38,24 +38,7 @@ ul bsp_idt_size, bsp_gdt_size;
 struct memory_desc memory_management_struct = {{0}, 0};
 // struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
 void test_slab();
-void show_welcome()
-{
-    /**
-     * @brief 打印欢迎页面
-     *
-     */
 
-    printk("\n\n");
-    for (int i = 0; i < 74; ++i)
-        printk(" ");
-    printk_color(0x00e0ebeb, 0x00e0ebeb, "                                \n");
-    for (int i = 0; i < 74; ++i)
-        printk(" ");
-    printk_color(BLACK, 0x00e0ebeb, "      Welcome to DragonOS !     \n");
-    for (int i = 0; i < 74; ++i)
-        printk(" ");
-    printk_color(0x00e0ebeb, 0x00e0ebeb, "                                \n\n");
-}
 
 struct gdtr gdtp;
 struct idtr idtp;
@@ -190,59 +173,7 @@ void Start_Kernel(void)
 
     system_initialize();
 
-    /*
-    // int part_id = fat32_register_partition(0, 0, 0);
-    struct vfs_dir_entry_t *dentry = vfs_path_walk("a.txt", 0);
-    if (dentry != NULL)
-        printk_color(ORANGE, BLACK, "Found a.txt\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
-    else
-        printk_color(ORANGE, BLACK, "Can`t find file\n");
-
-    dentry = vfs_path_walk("xx/12.png", 0);
-    if (dentry != NULL)
-        printk_color(ORANGE, BLACK, "Found xx/12.png\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
-    else
-        printk_color(ORANGE, BLACK, "Can`t find file\n");
-    */
-    // show_welcome();
-    // test_mm();
-
-    /*
-        while (1)
-        {
-            ps2_keyboard_analyze_keycode();
-            struct ps2_mouse_packet_3bytes packet = {0};
-            // struct ps2_mouse_packet_4bytes packet = {0};
-            int errcode = 0;
-            errcode = ps2_mouse_get_packet(&packet);
-            if (errcode == 0)
-            {
-                printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y);
-                // printk_color(GREEN, BLACK, " (Mouse: byte0:%d, x:%3d, y:%3d, byte3:%3d)\n", packet.byte0, packet.movement_x, packet.movement_y, (unsigned char)packet.byte3);
-            }
-        }
-    */
-    /*
-        while (1)
-        {
-            keyboard_analyze_keycode();
-            analyze_mousecode();
-        }
-    */
-
-    // ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0xc8, ICR_APIC_FIXED, ICR_No_Shorthand, true, 1);  // 测试ipi
-
-    // int last_sec = rtc_now.second;
-    /*
-    while (1)
-    {
-        if (last_sec != rtc_now.second)
-        {
-            last_sec = rtc_now.second;
-            kinfo("Current Time: %04d/%02d/%02d %02d:%02d:%02d", rtc_now.year, rtc_now.month, rtc_now.day, rtc_now.hour, rtc_now.minute, rtc_now.second);
-        }
-    }
-    */
+    
     while (1)
         hlt();
 }

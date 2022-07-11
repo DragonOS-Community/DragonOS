@@ -2,7 +2,7 @@
 #include <mm/mm.h>
 #include <common/printk.h>
 #include <driver/multiboot2/multiboot2.h>
-#include <driver/timers/timer.h>
+#include <time/timer.h>
 #include <common/kprint.h>
 #include <mm/mm.h>
 #include <mm/slab.h>

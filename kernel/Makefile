@@ -18,7 +18,7 @@ LD_LIST := head.o
 OBJ_LIST := head.o
 
 
-kernel_subdirs := common driver process debug filesystem
+kernel_subdirs := common driver process debug filesystem time
 	
 
 
@@ -125,8 +125,6 @@ rtc.o: driver/timers/rtc/rtc.c
 HPET.o: driver/timers/HPET/HPET.c
 	gcc $(CFLAGS) -c driver/timers/HPET/HPET.c -o driver/timers/HPET/HPET.o
 
-timer.o: driver/timers/timer.c
-	gcc $(CFLAGS) -c driver/timers/timer.c -o driver/timers/timer.o
 
 OBJ_LIST += uart.o
 LD_LIST += driver/uart/uart.o
@@ -156,7 +154,7 @@ all: kernel
 	echo "Done."
 
 
-kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o timer.o $(OBJ_LIST)
+kernel: head.o entry.o main.o printk.o trap.o mm.o slab.o irq.o pic.o sched.o syscall.o multiboot2.o cpu.o acpi.o ps2_keyboard.o ps2_mouse.o ata.o pci.o ahci.o smp.o apu_boot.o rtc.o HPET.o softirq.o $(OBJ_LIST)
 	
 	@list='$(kernel_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\

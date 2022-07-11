@@ -3,7 +3,7 @@
 #include <mm/mm.h>
 #include <driver/interrupt/apic/apic.h>
 #include <exception/softirq.h>
-#include <driver/timers/timer.h>
+#include <time/timer.h>
 #include <process/process.h>
 #include <sched/sched.h>
 #include <smp/ipi.h>
@@ -149,6 +149,7 @@ int HPET_init()
     HPET_COUNTER_CLK_PERIOD = (tmp >> 32) & 0xffffffff;
     HPET_freq = 1.0 * 1e15 / HPET_COUNTER_CLK_PERIOD;
     HPET_NUM_TIM_CAP = (tmp >> 8) & 0x1f; // 读取计时器数量
+    kinfo("Total HPET timers: %d", HPET_NUM_TIM_CAP);
 
     // kinfo("HPET CLK_PERIOD=%#03lx Frequency=%f", HPET_COUNTER_CLK_PERIOD, (double)HPET_freq);
     // kdebug("HPET_freq=%ld", (long)HPET_freq);
@@ -167,14 +168,17 @@ int HPET_init()
         while (1)
             hlt();
     }
-
+    // kdebug("[HPET0] conf register=%#018lx  conf register[63:32]=%#06lx", (*(uint64_t *)(HPET_REG_BASE + TIM0_CONF)), ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))>>32)&0xffffffff);
     *(uint64_t *)(HPET_REG_BASE + MAIN_CNT) = 0;
     io_mfence();
-    *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，投递到IO APIC的2号引脚（这里有点绕，写的是8259的引脚号，但是因为禁用了8259，因此会被路由到IO APIC的2号引脚）
+    *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，默认投递到IO APIC的2号引脚(看conf寄存器的高32bit，哪一位被置1，则可以投递到哪一个I/O apic引脚)
     io_mfence();
     *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = clks_to_intr; // 5ms触发一次中断
-    //*(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = HPET_freq; // 1s触发一次中断
+
     io_mfence();
+
+    // kdebug("[HPET0] conf register after modify=%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))));
+    // kdebug("[HPET1] conf register =%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM1_CONF))));
 
     rtc_get_cmos_time(&rtc_now);
 

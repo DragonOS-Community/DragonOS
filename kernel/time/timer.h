@@ -1,8 +1,8 @@
 #pragma once
 
 #include <common/glib.h>
-#include "HPET/HPET.h"
-#include "rtc/rtc.h"
+#include <driver/timers/HPET/HPET.h>
+#include <driver/timers/rtc/rtc.h>
 
 uint64_t volatile timer_jiffies = 0; // 系统时钟计数
 

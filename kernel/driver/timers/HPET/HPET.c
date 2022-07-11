@@ -66,7 +66,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 
         // 若当前时间比定时任务的时间间隔大，则进入中断下半部
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
-            set_softirq_status((1 << TIMER_SIRQ));
+            raise_softirq((1 << TIMER_SIRQ));
 
         // if (current_pcb->pid == 2)
         //     kwarn("timer_jiffies = %ld video_refresh_expire_jiffies=%ld", timer_jiffies, video_refresh_expire_jiffies);

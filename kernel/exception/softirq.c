@@ -2,16 +2,51 @@
 #include <common/kprint.h>
 #include <process/process.h>
 #include <driver/video/video.h>
-uint64_t softirq_status = 0;
-void set_softirq_status(uint64_t status)
+#include <process/spinlock.h>
+
+static spinlock_t softirq_modify_lock; // 软中断状态（status）
+static volatile uint64_t softirq_pending = 0;
+static volatile uint64_t softirq_running = 0;
+
+void set_softirq_pending(uint64_t status)
 {
-    softirq_status |= status;
+    softirq_pending |= status;
 }
 
-uint64_t get_softirq_status()
+uint64_t get_softirq_pending()
 {
-    return softirq_status;
+    return softirq_pending;
 }
+
+#define get_softirq_running() (softirq_running)
+
+/**
+ * @brief 设置软中断运行结束
+ *
+ * @param softirq_num
+ */
+#define clear_softirq_running(softirq_num)        \
+    do                                            \
+    {                                             \
+        softirq_running &= (~(1 << softirq_num)); \
+    } while (0)
+
+// 设置软中断的运行状态（只应在do_softirq中调用此宏）
+#define set_softirq_running(softirq_num)       \
+    do                                         \
+    {                                          \
+        softirq_running |= (1 << softirq_num); \
+    } while (0)
+
+/**
+ * @brief 清除软中断pending标志位
+ *
+ */
+#define softirq_ack(sirq_num)                  \
+    do                                         \
+    {                                          \
+        softirq_pending &= (~(1 << sirq_num)); \
+    } while (0);
 
 /**
  * @brief 软中断注册函数
@@ -44,21 +79,36 @@ void unregister_softirq(uint32_t irq_num)
 void do_softirq()
 {
     sti();
-    // video_refresh_framebuffer();
-    for (uint32_t i = 0; i < MAX_SOFTIRQ_NUM && softirq_status; ++i)
+
+    for (uint32_t i = 0; i < MAX_SOFTIRQ_NUM && softirq_pending; ++i)
     {
-        if (softirq_status & (1 << i) && softirq_vector[i].action != NULL)
+        if (softirq_pending & (1 << i) && softirq_vector[i].action != NULL && (!(get_softirq_running() & (1 << i))))
         {
-            softirq_vector[i].action(softirq_vector[i].data);
+            if (spin_trylock(&softirq_modify_lock))
+            {
+                // 检测该软中断是否已经被其他进程执行
+                if(get_softirq_running() & (1 << i))
+                {
+                    spin_unlock(&softirq_modify_lock);
+                    continue;
+                }
+                softirq_ack(i);
+                set_softirq_running(i);
+                spin_unlock(&softirq_modify_lock);
+
+                softirq_vector[i].action(softirq_vector[i].data);
+
+                clear_softirq_running(i);
+            }
         }
     }
 
     cli();
-    
 }
 
 void softirq_init()
 {
-    softirq_status = 0;
+    softirq_pending = 0;
     memset(softirq_vector, 0, sizeof(struct softirq_t) * MAX_SOFTIRQ_NUM);
+    spin_init(&softirq_modify_lock);
 }

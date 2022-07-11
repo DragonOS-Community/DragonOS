@@ -78,7 +78,6 @@ void video_refresh_framebuffer(void *data)
     // 暂时设置一个很大的值作为屏障，防止二次进入该区域（造成#GP）
     video_refresh_expire_jiffies = timer_jiffies + 100000;
     video_last_refresh_pid = current_pcb->pid;
-    softirq_ack(VIDEO_REFRESH_SIRQ);
 
     memcpy((void *)sc_info.fb_vaddr, (void *)sc_info.double_fb_vaddr, (sc_info.length << 2));
     video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL);

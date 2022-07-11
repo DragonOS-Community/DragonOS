@@ -24,20 +24,11 @@
 #define raise_softirq(sirq_num)            \
     do                                     \
     {                                      \
-        set_softirq_status(1 << sirq_num); \
+        set_softirq_pending(1 << sirq_num); \
     } while (0);
 
-/**
- * @brief 清除软中断标志位（需要软中断处理程序手动调用）
- * 
- */
-#define softirq_ack(sirq_num)        \
-    do                                 \
-    {                                  \
-        softirq_status &= (~(1 << sirq_num)); \
-    } while (0);
 
-extern uint64_t softirq_status;
+
 
 struct softirq_t
 {
@@ -63,8 +54,8 @@ void register_softirq(uint32_t irq_num, void (*action)(void *data), void *data);
  */
 void unregister_softirq(uint32_t irq_num);
 
-void set_softirq_status(uint64_t status);
-uint64_t get_softirq_status();
+void set_softirq_pending(uint64_t status);
+uint64_t get_softirq_pending();
 
 /**
  * @brief 软中断处理程序

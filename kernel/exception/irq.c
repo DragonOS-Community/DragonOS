@@ -10,8 +10,7 @@
 #include "../common/asm.h"
 #include "../common/printk.h"
 #include "gate.h"
-
-
+#include <mm/slab.h>
 
 // 保存函数调用现场的寄存器
 #define SAVE_ALL_REGS       \
@@ -166,7 +165,12 @@ int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter
     irq_desc_t *p = &interrupt_desc[irq_num - 32];
 
     p->controller = controller;
-    p->irq_name = irq_name;
+
+    int namelen = sizeof(strlen(irq_name)+1);
+    p->irq_name = (char *)kmalloc(namelen,0);
+    memset(p->irq_name, 0, namelen);
+    strncpy(p->irq_name, irq_name, namelen);
+
     p->parameter = paramater;
     p->flags = 0;
     p->handler = handler;
@@ -190,6 +194,7 @@ int irq_unregister(ul irq_num)
     p->controller->uninstall(irq_num);
 
     p->controller = NULL;
+    kfree(p->irq_name);
     p->irq_name = NULL;
     p->parameter = NULL;
     p->flags = 0;
@@ -209,7 +214,6 @@ void irq_init()
 
     memset((void *)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
     apic_init();
-
 
 #endif
 }

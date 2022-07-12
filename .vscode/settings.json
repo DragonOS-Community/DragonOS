@@ -103,7 +103,8 @@
         "stddef.h": "c",
         "spinlock.h": "c",
         "stat.h": "c",
-        "video.h": "c"
+        "video.h": "c",
+        "libm.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

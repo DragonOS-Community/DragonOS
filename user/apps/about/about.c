@@ -1,6 +1,8 @@
 #include <libc/stdio.h>
 #include <libc/stdlib.h>
 #include <libc/unistd.h>
+#include <libc/time.h>
+#include <libc/math.h>
 
 void print_ascii_logo()
 {
@@ -26,11 +28,11 @@ int main()
 {
     // printf("Hello World!\n");
     print_ascii_logo();
-    usleep(500000);
-    usleep(500000);
+    
     print_copyright();
     // exit(0);
     // while (1)
     //     ;
+
     return 0;
 }

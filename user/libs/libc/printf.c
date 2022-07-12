@@ -9,7 +9,6 @@
 static char *write_num(char *str, uint64_t num, int base, int field_width, int precision, int flags);
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
 
-
 static int skip_and_atoi(const char **s)
 {
     /**
@@ -323,10 +322,6 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             break;
         case 'f':
             // 默认精度为3
-            // printk("1111\n");
-            // va_arg(args, double);
-            // printk("222\n");
-
             if (precision < 0)
                 precision = 3;
 
@@ -497,11 +492,11 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
     if (sign)
         --field_width;
 
-    int js_num_z = 0, js_num_d = 0;                                      // 临时数字字符串tmp_num_z tmp_num_d的长度
-    uint64_t num_z = (uint64_t)(num);                                    // 获取整数部分
-    uint64_t num_decimal = (uint64_t)(round((num - num_z) * precision)); // 获取小数部分
+    int js_num_z = 0, js_num_d = 0;                                               // 临时数字字符串tmp_num_z tmp_num_d的长度
+    uint64_t num_z = (uint64_t)(num);                                             // 获取整数部分
+    uint64_t num_decimal = (uint64_t)(round(1.0*(num - num_z) * pow(10, precision))); // 获取小数部分
 
-    if (num == 0)
+    if (num == 0 || num_z == 0)
         tmp_num_z[js_num_z++] = '0';
     else
     {
@@ -530,18 +525,23 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
         *str++ = sign;
 
     // 输出整数部分
-    while (js_num_z-- > 0)
-        *str++ = tmp_num_z[js_num_z];
-
+    // while (js_num_z-- > 0)
+    //     *str++ = tmp_num_z[js_num_z];
+    while (js_num_z > 0)
+    {
+        *str++ = tmp_num_z[js_num_z - 1];
+        --js_num_z;
+    }
     *str++ = '.';
 
     // 输出小数部分
-    while (js_num_d-- > 0)
+    int total_dec_count = js_num_d;
+    for (int i = 0; i < precision && js_num_d-- > 0; ++i)
         *str++ = tmp_num_d[js_num_d];
 
-    while (js_num_d < precision)
+    while (total_dec_count < precision)
     {
-        --precision;
+        ++total_dec_count;
         *str++ = '0';
     }
 

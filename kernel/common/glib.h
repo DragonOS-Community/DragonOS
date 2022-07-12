@@ -283,13 +283,6 @@ int strcmp(char *FirstPart, char *SecondPart)
     return __res;
 }
 
-// void *memset_c(void *dst, unsigned char c, ul n)
-// {
-//     unsigned char *s = (unsigned char *)dst;
-//     for (int i = 0; i < n; ++i)
-//         s[i] = c;
-//     return dst;
-// }
 
 // 从io口读入8个bit
 unsigned char io_in8(unsigned short port)
@@ -541,7 +534,7 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
  */
 long strnlen_user(const char *src, unsigned long maxlen);
 
-char *strncpy(char *Dest, const char *Src, long Count)
+char *strncpy(char *dst, const char *src, long count)
 {
     __asm__ __volatile__("cld	\n\t"
                          "1:	\n\t"
@@ -555,9 +548,9 @@ char *strncpy(char *Dest, const char *Src, long Count)
                          "stosb	\n\t"
                          "2:	\n\t"
                          :
-                         : "S"(Src), "D"(Dest), "c"(Count)
+                         : "S"(src), "D"(dst), "c"(count)
                          : "ax", "memory");
-    return Dest;
+    return dst;
 }
 
 long strncpy_from_user(char *dst, const char *src, unsigned long size)

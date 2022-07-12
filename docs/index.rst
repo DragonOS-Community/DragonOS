@@ -18,6 +18,7 @@
    :caption: 内核层
 
    kernel/boot/index
+   kernel/core_api/index
    kernel/process_management/index
    kernel/filesystem/index
 

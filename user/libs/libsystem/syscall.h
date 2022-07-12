@@ -22,6 +22,7 @@
 #define SYS_WAIT4 15 // 等待进程退出
 #define SYS_EXIT 16 // 进程退出
 #define SYS_MKDIR 17 // 创建文件夹
+#define SYS_NANOSLEEP 18 // 纳秒级休眠
 
 /**
  * @brief 用户态系统调用函数

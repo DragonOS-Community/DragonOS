@@ -9,7 +9,7 @@ libc_sub_dirs += sysdeps/x86_64
 endif
 
 
-libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o string.o dirent.o
+libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o string.o dirent.o time.o
 	@list='$(libc_sub_dirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
@@ -43,3 +43,6 @@ string.o: string.c
 
 dirent.o: dirent.c
 	gcc $(CFLAGS) -c dirent.c -o dirent.o
+
+time.o: time.c
+	gcc $(CFLAGS) -c time.c -o time.o

@@ -10,10 +10,13 @@
 #include <filesystem/VFS/VFS.h>
 #include <driver/keyboard/ps2_keyboard.h>
 #include <process/process.h>
+#include <time/sleep.h>
 
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
 extern void syscall_int(void);
+
+
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -723,6 +726,15 @@ uint64_t sys_exit(struct pt_regs *regs)
     return process_do_exit(regs->r8);
 }
 
+
+uint64_t sys_nanosleep(struct pt_regs * regs)
+{
+    const struct timespec * rqtp = (const struct timespec*)regs->r8;
+    struct timespec * rmtp = (struct timespec*)regs->r9;
+
+    return nanosleep(rqtp, rmtp);
+}
+
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
     ahci_end_request();
@@ -757,5 +769,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [15] = sys_wait4,
         [16] = sys_exit,
         [17] = sys_mkdir,
-        [18 ... 254] = system_call_not_exists,
+        [18] = sys_nanosleep,
+        [19 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <common/miniLibc/sys/types.h>
+#include <common/sys/types.h>
 struct dirent
 {
     ino_t d_ino;    // 文件序列号

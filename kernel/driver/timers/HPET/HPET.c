@@ -58,7 +58,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
     switch (param)
     {
     case 0: // 定时器0中断
-        ++timer_jiffies;
+        timer_jiffies += HPET0_INTERVAL;
 
         /*
         // 将HEPT中断消息转发到ap:1处理器
@@ -68,7 +68,7 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 
         // 若当前时间比定时任务的时间间隔大，则进入中断下半部
         if (container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list)->expire_jiffies <= timer_jiffies)
-            raise_softirq((1 << TIMER_SIRQ));
+            raise_softirq(TIMER_SIRQ);
 
         // 当时间到了，或进程发生切换时，刷新帧缓冲区
         if (timer_jiffies >= video_refresh_expire_jiffies || (video_last_refresh_pid != current_pcb->pid))

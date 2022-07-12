@@ -8,7 +8,7 @@
 //引入对bool类型的支持
 #include <stdbool.h>
 #include <stdint.h>
-#include <common/miniLibc/stddef.h>
+#include <common/stddef.h>
 #include <arch/arch.h>
 
 #define sti() __asm__ __volatile__("sti\n\t" :: \

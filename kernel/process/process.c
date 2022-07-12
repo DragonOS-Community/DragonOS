@@ -705,10 +705,20 @@ void process_wakeup(struct process_control_block *pcb)
 {
     pcb->state = PROC_RUNNING;
     sched_cfs_enqueue(pcb);
+}
+
+/**
+ * @brief 将进程加入到调度器的就绪队列中，并标志当前进程需要被调度
+ *
+ * @param pcb 进程的pcb
+ */
+void process_wakeup_immediately(struct process_control_block *pcb)
+{
+    pcb->state = PROC_RUNNING;
+    sched_cfs_enqueue(pcb);
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
     current_pcb->flags |= PF_NEED_SCHED;
 }
-
 /**
  * @brief 拷贝当前进程的标志位
  *

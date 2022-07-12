@@ -287,6 +287,13 @@ struct process_control_block *process_get_pcb(long pid);
 void process_wakeup(struct process_control_block *pcb);
 
 /**
+ * @brief 将进程加入到调度器的就绪队列中，并标志当前进程需要被调度
+ *
+ * @param pcb 进程的pcb
+ */
+void process_wakeup_immediately(struct process_control_block *pcb);
+
+/**
  * @brief 使当前进程去执行新的代码
  *
  * @param regs 当前进程的寄存器

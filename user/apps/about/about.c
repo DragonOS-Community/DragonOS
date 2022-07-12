@@ -1,5 +1,7 @@
 #include <libc/stdio.h>
-#include<libc/stdlib.h>
+#include <libc/stdlib.h>
+#include <libc/unistd.h>
+
 void print_ascii_logo()
 {
     printf(" ____                                      ___   ____ \n");
@@ -24,6 +26,8 @@ int main()
 {
     // printf("Hello World!\n");
     print_ascii_logo();
+    usleep(500000);
+    usleep(500000);
     print_copyright();
     // exit(0);
     // while (1)

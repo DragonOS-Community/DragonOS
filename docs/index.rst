@@ -17,7 +17,7 @@
    :maxdepth: 1
    :caption: 内核层
 
-   kernel/bootloader/index
+   kernel/boot/index
    kernel/process_management/index
    kernel/filesystem/index
 

@@ -29,7 +29,7 @@ OS=`uname -s`
 if [ "${OS}" == "Linux" ]; then
     GRUB_PATH="$(dirname $(which grub-file))"
 elif [ "${OS}" == "Darwin" ]; then
-    GRUB_PATH="$(pwd)/tools/grub-2.04/build/grub/bin"
+    GRUB_PATH="$(pwd)/tools/grub-2.06/build/grub/bin"
 fi
 export PATH="${GRUB_PATH}:$PATH"
 

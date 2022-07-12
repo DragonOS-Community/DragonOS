@@ -27,6 +27,16 @@ int usleep(useconds_t usec)
         tv_sec : (long int)(usec / 1000000),
         tv_nsec : (long int)(usec % 1000000) * 1000UL
     };
-    
+
     return nanosleep(&ts, NULL);
+}
+
+/**
+ * @brief 获取系统当前cpu时间
+ * 
+ * @return clock_t 
+ */
+clock_t clock()
+{
+    return (clock_t)syscall_invoke(SYS_CLOCK, 0,0,0,0,0,0,0,0);
 }

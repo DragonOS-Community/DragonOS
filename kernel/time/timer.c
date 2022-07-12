@@ -35,17 +35,17 @@ void do_timer_softirq(void *data)
     int cycle_count = 0;
     while ((!list_empty(&timer_func_head.list)) && (tmp->expire_jiffies <= timer_jiffies))
     {
-        
+
         timer_func_del(tmp);
         tmp->func(tmp->data);
         kfree(tmp);
 
         ++cycle_count;
         // 当前定时器达到阈值
-        if(cycle_count == TIMER_RUN_CYCLE_THRESHOLD)
+        if (cycle_count == TIMER_RUN_CYCLE_THRESHOLD)
             break;
         tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
-    }    
+    }
 }
 
 /**
@@ -105,4 +105,14 @@ void timer_func_add(struct timer_func_list_t *timer_func)
 void timer_func_del(struct timer_func_list_t *timer_func)
 {
     list_del(&timer_func->list);
+}
+
+uint64_t sys_clock(struct pt_regs *regs)
+{
+    return timer_jiffies;
+}
+
+uint64_t clock()
+{
+    return timer_jiffies;
 }

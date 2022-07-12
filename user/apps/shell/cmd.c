@@ -432,7 +432,7 @@ int shell_cmd_exec(int argc, char **argv)
         // printf("parent process wait for pid:[ %d ]\n", pid);
 
         waitpid(pid, &retval, 0);
-        printf("parent process wait pid [ %d ], exit code=%d\n", pid, retval);
+        // printf("parent process wait pid [ %d ], exit code=%d\n", pid, retval);
         free(argv);
     }
 }

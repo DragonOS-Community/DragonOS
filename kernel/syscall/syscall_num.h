@@ -29,5 +29,6 @@
 #define SYS_EXIT 16 // 进程退出
 #define SYS_MKDIR 17 // 创建文件夹
 #define SYS_NANOSLEEP 18 // 纳秒级休眠
+#define SYS_CLOCK 19 // 获取当前cpu时间
 
 #define SYS_AHCI_END_REQ 255    // AHCI DMA请求结束end_request的系统调用

@@ -36,3 +36,10 @@ struct timespec
  * @return int 
  */
 extern int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
+
+/**
+ * @brief 获取当前的CPU时间
+ * 
+ * @return uint64_t timer_jiffies
+ */
+extern uint64_t clock();

@@ -61,3 +61,6 @@ void timer_func_add(struct timer_func_list_t *timer_func);
  * @param timer_func
  */
 void timer_func_del(struct timer_func_list_t *timer_func);
+
+
+uint64_t clock();

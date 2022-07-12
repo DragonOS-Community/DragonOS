@@ -16,6 +16,7 @@
 extern void system_call(void);
 extern void syscall_int(void);
 
+extern uint64_t sys_clock(struct pt_regs* regs);
 
 
 /**
@@ -770,5 +771,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [16] = sys_exit,
         [17] = sys_mkdir,
         [18] = sys_nanosleep,
-        [19 ... 254] = system_call_not_exists,
+        [19] = sys_clock,
+        [20 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

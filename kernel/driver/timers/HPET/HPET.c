@@ -164,7 +164,7 @@ void HPET_enable()
     apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
 
     // 计算HPET0间隔多少个时钟周期触发一次中断
-    uint64_t clks_to_intr = 0.001 * HPET0_INTERVAL * HPET_freq;
+    uint64_t clks_to_intr = 0.000001 * HPET0_INTERVAL * HPET_freq;
     // kdebug("clks_to_intr=%#ld", clks_to_intr);
     if (clks_to_intr <= 0 || clks_to_intr > (HPET_freq * 8))
     {
@@ -177,7 +177,7 @@ void HPET_enable()
     io_mfence();
     *(uint64_t *)(HPET_REG_BASE + TIM0_CONF) = 0x004c; // 设置定时器0为周期定时，边沿触发，默认投递到IO APIC的2号引脚(看conf寄存器的高32bit，哪一位被置1，则可以投递到哪一个I/O apic引脚)
     io_mfence();
-    *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = clks_to_intr; // 5ms触发一次中断
+    *(uint64_t *)(HPET_REG_BASE + TIM0_COMP) = clks_to_intr;
 
     io_mfence();
 

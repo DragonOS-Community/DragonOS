@@ -7,7 +7,9 @@
 uint64_t volatile timer_jiffies = 0; // 系统时钟计数
 
 // 计算接下来n毫秒对应的系统时间片
-#define cal_next_n_ms_jiffies(expire_ms) (timer_jiffies + expire_ms / 5 + ((expire_ms % HPET0_INTERVAL) ? 1 : 0))
+#define cal_next_n_ms_jiffies(expire_ms) (timer_jiffies + 1000*expire_ms / HPET0_INTERVAL + ((1000*expire_ms % HPET0_INTERVAL) ? 1 : 0))
+// 计算接下来n微秒对应的系统时间片
+#define cal_next_n_us_jiffies(expire_us) (timer_jiffies + expire_us / HPET0_INTERVAL + ((expire_us % HPET0_INTERVAL) ? 1 : 0))
 
 void timer_init();
 

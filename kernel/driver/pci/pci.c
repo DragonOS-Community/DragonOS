@@ -590,7 +590,7 @@ void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_
     
     for (int i = 0; i < count_device_list; ++i)
     {
-        if ((ptr->Class_code == 1) && (ptr->SubClass == 6))
+        if ((ptr->Class_code == class_code) && (ptr->SubClass == sub_class))
         {
             kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, bar5=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->ProgIF,((struct pci_device_structure_general_device_t *)ptr)->BAR5);
             

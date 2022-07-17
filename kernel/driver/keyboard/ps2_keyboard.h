@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../common/glib.h"
+#include <common/glib.h>
 
 #define PS2_KEYBOARD_INTR_VECTOR 0x21   // 键盘的中断向量号
 

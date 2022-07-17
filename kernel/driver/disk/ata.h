@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../common/glib.h"
+#include <common/glib.h>
 
 // ======== PIO端口定义 ========
 #define PORT_DISK0_DATA 0x1f0                     // 数据

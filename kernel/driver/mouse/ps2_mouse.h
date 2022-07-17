@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../common/glib.h"
+#include <common/glib.h>
 
 #define PS2_MOUSE_INTR_VECTOR 0x2c // 鼠标的中断向量号
 

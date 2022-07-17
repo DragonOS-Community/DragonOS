@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../common/glib.h"
+#include <common/glib.h>
 #include "stdint.h"
 
 #define PORT_PCI_CONFIG_ADDRESS 0xcf8

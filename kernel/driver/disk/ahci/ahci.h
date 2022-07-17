@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../block_device.h"
-#include "../../pci/pci.h"
-#include "../../../mm/mm.h"
+#include <driver/disk/block_device.h>
+#include <driver/pci/pci.h>
+#include <mm/mm.h>
 
 /**
  * @todo 加入io调度器（当操作系统实现了多进程之后要加入这个）

@@ -1,10 +1,10 @@
 #include "apic.h"
-#include "../../../common/kprint.h"
-#include "../../../common/printk.h"
-#include "../../../common/cpu.h"
-#include "../../../common/glib.h"
-#include "../../../exception/gate.h"
-#include "../../acpi/acpi.h"
+#include <common/kprint.h>
+#include <common/printk.h>
+#include <common/cpu.h>
+#include <common/glib.h>
+#include <exception/gate.h>
+#include <driver/acpi/acpi.h>
 
 #include <exception/softirq.h>
 #include <process/process.h>
@@ -28,7 +28,7 @@ static struct acpi_IO_APIC_Structure_t *io_apic_ICS;
                              "movq	$0x00,	%%rax	\n\t"   \
                              "movq 	$0x80b,	%%rcx	\n\t" \
                              "wrmsr	\n\t" ::            \
-                                 : "memory");            \
+                                 : "memory");           \
     } while (0)
 
 /**

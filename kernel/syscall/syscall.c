@@ -1,5 +1,5 @@
 #include "syscall.h"
-#include "../process/process.h"
+#include <process/process.h>
 #include <exception/gate.h>
 #include <exception/irq.h>
 #include <driver/disk/ahci/ahci.h>

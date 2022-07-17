@@ -11,8 +11,8 @@
 
 #pragma once
 
-#include "../../common/kprint.h"
-#include "../../driver/interrupt/apic/apic.h"
+#include <common/kprint.h>
+#include <driver/interrupt/apic/apic.h>
 
 /**
  * @brief 发送ipi消息

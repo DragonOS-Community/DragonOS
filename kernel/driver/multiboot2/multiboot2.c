@@ -1,8 +1,8 @@
 #include "multiboot2.h"
 #include "assert.h"
 
-#include "../../common/glib.h"
-#include "../../common/kprint.h"
+#include <common/glib.h>
+#include <common/kprint.h>
 uintptr_t multiboot2_boot_info_addr;
 unsigned int multiboot2_magic;
 unsigned int multiboot2_boot_info_size;

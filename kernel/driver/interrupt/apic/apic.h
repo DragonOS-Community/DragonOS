@@ -1,9 +1,9 @@
 #pragma once
 
-#include "../../../common/asm.h"
-#include "../../../process/ptrace.h"
-#include "../../../exception/irq.h"
-#include "../../../mm/mm.h"
+#include <common/asm.h>
+#include <process/ptrace.h>
+#include <exception/irq.h>
+#include <mm/mm.h>
 
 #define APIC_SUCCESS 0
 #define APIC_E_NOTFOUND 1

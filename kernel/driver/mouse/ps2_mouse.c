@@ -1,9 +1,9 @@
 #include "ps2_mouse.h"
-#include "../interrupt/apic/apic.h"
-#include "../../mm/mm.h"
-#include "../../mm/slab.h"
-#include "../../common/printk.h"
-#include "../../common/kprint.h"
+#include <driver/interrupt/apic/apic.h>
+#include <mm/mm.h>
+#include <mm/slab.h>
+#include <common/printk.h>
+#include <common/kprint.h>
 
 static struct ps2_mouse_input_buffer *ps2_mouse_buf_ptr = NULL;
 static int c = 0;

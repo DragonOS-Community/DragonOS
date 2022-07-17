@@ -9,7 +9,7 @@
 #ifndef __GATE_H__
 #define __GATE_H__
 
-#include "../common/kprint.h"
+#include <common/kprint.h>
 #include <mm/mm.h>
 
 //描述符表的结构体

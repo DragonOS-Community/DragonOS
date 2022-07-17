@@ -1,8 +1,8 @@
 #include "ps2_keyboard.h"
-#include "../interrupt/apic/apic.h"
-#include "../../mm/mm.h"
-#include "../../mm/slab.h"
-#include "../../common/printk.h"
+#include <driver/interrupt/apic/apic.h>
+#include <mm/mm.h>
+#include <mm/slab.h>
+#include <common/printk.h>
 #include <filesystem/VFS/VFS.h>
 #include <process/wait_queue.h>
 #include <process/spinlock.h>

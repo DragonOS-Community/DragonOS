@@ -8,9 +8,9 @@
 
 #pragma once
 
-#include "../common/printk.h"
-#include "../common/glib.h"
-#include "../common/asm.h"
+#include <common/printk.h>
+#include <common/glib.h>
+#include <common/asm.h>
 
 /**
  * @brief 初始化系统中断表

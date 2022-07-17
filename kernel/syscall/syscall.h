@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../common/glib.h"
-#include "../common/kprint.h"
-#include "../process/ptrace.h"
+#include <common/glib.h>
+#include <common/kprint.h>
+#include <process/ptrace.h>
 #include <common/unistd.h>
 // 定义最大系统调用数量
 #define MAX_SYSTEM_CALL_NUM 256

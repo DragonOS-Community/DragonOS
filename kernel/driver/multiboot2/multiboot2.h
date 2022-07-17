@@ -7,8 +7,8 @@
 
 #include "stdint.h"
 #include "stdbool.h"
-#include "../../common/boot_info.h"
-#include "../acpi/acpi.h"
+#include <common/boot_info.h>
+#include <driver/acpi/acpi.h>
 
 /// @see Multiboot2 Specification version 2.0.pdf
 // 启动后，在 32 位内核进入点，机器状态如下：

@@ -11,9 +11,9 @@
 
 #pragma once
 
-#include "../common/glib.h"
+#include <common/glib.h>
 
-#include "../process/ptrace.h"
+#include <process/ptrace.h>
 
 #define SMP_IRQ_NUM 10
 #define LOCAL_APIC_IRQ_NUM 10

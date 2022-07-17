@@ -1,8 +1,8 @@
 #include "mm.h"
 #include "slab.h"
-#include "../common/printk.h"
-#include "../common/kprint.h"
-#include "../driver/multiboot2/multiboot2.h"
+#include <common/printk.h>
+#include <common/kprint.h>
+#include <driver/multiboot2/multiboot2.h>
 #include <process/process.h>
 
 ul Total_Memory = 0;

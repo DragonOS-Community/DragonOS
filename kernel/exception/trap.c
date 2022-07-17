@@ -1,7 +1,7 @@
 #include "trap.h"
 #include "gate.h"
-#include "../process/ptrace.h"
-#include "../common/kprint.h"
+#include <process/ptrace.h>
+#include <common/kprint.h>
 #include <process/process.h>
 #include <debug/traceback/traceback.h>
 

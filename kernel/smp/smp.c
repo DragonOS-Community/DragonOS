@@ -1,11 +1,11 @@
 #include "smp.h"
-#include "../common/kprint.h"
-#include "../driver/interrupt/apic/apic.h"
-#include "../exception/gate.h"
-#include "../common/cpu.h"
-#include "../mm/slab.h"
-#include "../process/process.h"
-#include "../process/spinlock.h"
+#include <common/kprint.h>
+#include <driver/interrupt/apic/apic.h>
+#include <exception/gate.h>
+#include <common/cpu.h>
+#include <mm/slab.h>
+#include <process/process.h>
+#include <process/spinlock.h>
 
 #include <sched/sched.h>
 

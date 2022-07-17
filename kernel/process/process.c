@@ -1,10 +1,10 @@
 #include "process.h"
 
-#include "../exception/gate.h"
-#include "../common/printk.h"
-#include "../common/kprint.h"
-#include "../syscall/syscall.h"
-#include "../syscall/syscall_num.h"
+#include <exception/gate.h>
+#include <common/printk.h>
+#include <common/kprint.h>
+#include <syscall/syscall.h>
+#include <syscall/syscall_num.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
 #include <filesystem/fat32/fat32.h>

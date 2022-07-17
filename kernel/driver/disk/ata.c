@@ -1,6 +1,6 @@
 #include "ata.h"
-#include "../../common/kprint.h"
-#include "../interrupt/apic/apic.h"
+#include <common/kprint.h>
+#include <driver/interrupt/apic/apic.h>
 
 struct apic_IO_APIC_RTE_entry entry;
 

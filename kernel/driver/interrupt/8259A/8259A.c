@@ -1,7 +1,7 @@
 #include "8259A.h"
-#include "../../../common/printk.h"
-#include "../../../common/kprint.h"
-#include "../../../exception/gate.h"
+#include <common/printk.h>
+#include <common/kprint.h>
+#include <exception/gate.h>
 
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);

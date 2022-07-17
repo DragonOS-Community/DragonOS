@@ -3,13 +3,13 @@
 
 // 对进行
 #if _INTR_8259A_
-#include "../driver/interrupt/8259A/8259A.h"
+#include <driver/interrupt/8259A/8259A.h>
 #else
-#include "../driver/interrupt/apic/apic.h"
+#include <driver/interrupt/apic/apic.h>
 #endif
 
-#include "../common/asm.h"
-#include "../common/printk.h"
+#include <common/asm.h>
+#include <common/printk.h>
 #include "gate.h"
 #include <mm/slab.h>
 

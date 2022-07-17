@@ -4,8 +4,8 @@
 
 #pragma once
 
-#include "../../common/glib.h"
-#include "../../mm/mm.h"
+#include <common/glib.h>
+#include <mm/mm.h>
 
 #define ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC 0
 #define ACPI_ICS_TYPE_IO_APIC 1

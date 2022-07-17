@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../common/glib.h"
+#include <common/glib.h>
 #include "stdint.h"
 #include <process/semaphore.h>
 

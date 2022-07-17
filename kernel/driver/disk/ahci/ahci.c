@@ -1,6 +1,6 @@
 #include "ahci.h"
-#include "../../../common/kprint.h"
-#include "../../../mm/slab.h"
+#include <common/kprint.h>
+#include <mm/slab.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
 
@@ -23,6 +23,7 @@ static int ahci_find_cmdslot(HBA_PORT *port);
 
 // 计算HBA_MEM的虚拟内存地址
 #define cal_HBA_MEM_VIRT_ADDR(device_num) (AHCI_MAPPING_BASE + (ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[device_num]))->BAR5 - ((((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5) & PAGE_2M_MASK)))
+
 /**
  * @brief 初始化ahci模块
  *

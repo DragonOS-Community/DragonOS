@@ -1,9 +1,9 @@
 #pragma once
 
 #include "mm.h"
-#include "../common/glib.h"
-#include "../common/printk.h"
-#include "../common/kprint.h"
+#include <common/glib.h>
+#include <common/printk.h>
+#include <common/kprint.h>
 
 #define SIZEOF_LONG_ALIGN(size) ((size + sizeof(long) - 1) & ~(sizeof(long) - 1))
 #define SIZEOF_INT_ALIGN(size) ((size + sizeof(int) - 1) & ~(sizeof(int) - 1))

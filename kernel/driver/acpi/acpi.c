@@ -1,8 +1,8 @@
 #include "acpi.h"
-#include "../../common/printk.h"
-#include "../../common/kprint.h"
-#include "../multiboot2/multiboot2.h"
-#include "../../mm/mm.h"
+#include <common/printk.h>
+#include <common/kprint.h>
+#include <driver/multiboot2/multiboot2.h>
+#include <mm/mm.h>
 
 #define acpi_get_RSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_RSDT_entry_phys_base) // 获取RSDT entry的虚拟地址
 // #define acpi_get_XSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_XSDT_entry_phys_base) // 获取XSDT entry的虚拟地址

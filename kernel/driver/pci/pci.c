@@ -1,6 +1,6 @@
 #include "pci.h"
-#include "../../common/kprint.h"
-#include "../../mm/slab.h"
+#include <common/kprint.h>
+#include <mm/slab.h>
 
 static uint count_device_list = 0;
 static void pci_checkBus(uint8_t bus);

@@ -10,8 +10,8 @@ struct block_device_request_queue ahci_req_queue;
 
 uint32_t count_ahci_devices = 0;
 
-uint64_t ahci_port_base_vaddr;     // 端口映射base addr
-uint64_t ahci_port_base_phys_addr; // 端口映射的物理基地址（ahci控制器的参数的地址都是物理地址）
+static uint64_t ahci_port_base_vaddr;     // 端口映射base addr
+static uint64_t ahci_port_base_phys_addr; // 端口映射的物理基地址（ahci控制器的参数的地址都是物理地址）
 
 static void start_cmd(HBA_PORT *port);
 static void stop_cmd(HBA_PORT *port);

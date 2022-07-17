@@ -4,7 +4,7 @@
 
 /**
  * @brief 当condition为true时输出警告信息
- * 
+ *
  */
 #define WARN_ON(condition) ({                                   \
     int __ret_warn_on = !!(condition);                          \

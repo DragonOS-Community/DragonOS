@@ -3,6 +3,9 @@
 #include <common/kprint.h>
 #include <driver/pci/pci.h>
 #include <debug/bug.h>
+#include <process/spinlock.h>
+
+extern spinlock_t xhci_controller_init_lock; // xhci控制器初始化锁
 
 #define MAX_USB_NUM 8 // pci总线上的usb设备的最大数量
 
@@ -17,6 +20,8 @@ static int usb_pdevs_count = 0;
 void usb_init()
 {
     kinfo("Initializing usb driver...");
+    spin_init(&xhci_controller_init_lock);
+
     // 获取所有usb-pci设备的列表
     pci_get_device_structure(USB_CLASS, USB_SUBCLASS, usb_pdevs, &usb_pdevs_count);
 
@@ -41,7 +46,7 @@ void usb_init()
 
         case USB_TYPE_XHCI:
             // 初始化对应的xhci控制器
-            xhci_init(usb_pdevs[i]);
+            xhci_init((struct pci_device_structure_general_device_t *)usb_pdevs[i]);
             break;
 
         default:

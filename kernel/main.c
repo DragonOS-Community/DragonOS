@@ -25,6 +25,7 @@
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/disk/ata.h"
 #include "driver/pci/pci.h"
+#include <driver/usb/usb.h>
 #include "driver/disk/ahci/ahci.h"
 #include <driver/timers/rtc/rtc.h>
 #include <driver/timers/HPET/HPET.h>
@@ -152,6 +153,7 @@ void system_initialize()
 
     // fat32_init();
     HPET_enable();
+    usb_init();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
     apic_timer_init();
 }

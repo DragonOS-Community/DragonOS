@@ -1,6 +1,7 @@
 #include "pci.h"
 #include <common/kprint.h>
 #include <mm/slab.h>
+#include <debug/bug.h>
 
 static uint count_device_list = 0;
 static void pci_checkBus(uint8_t bus);
@@ -420,7 +421,7 @@ void pci_checkAllBuses()
         {
             tmp_header = (struct pci_device_structure_header_t *)pci_read_header(&header_type, 0, 0, func, false);
 
-            if (header->Vendor_ID != 0xffff) // @todo 这里的判断条件可能有点问题
+            if (WARN_ON(header->Vendor_ID != 0xffff)) // @todo 这里的判断条件可能有点问题
             {
                 kfree(tmp_header);
                 break;

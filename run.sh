@@ -111,7 +111,8 @@ if [ $flag_can_run -eq 1 ]; then
         -drive id=disk,file=bin/disk.img,if=none \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0    \
-        -usb
+        -usb    \
+        -device qemu-xhci,id=xhci 
 
     fi
 else

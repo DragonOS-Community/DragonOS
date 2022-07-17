@@ -1,7 +1,7 @@
 
 CFLAGS += -I .
 
-kernel_driver_subdirs:=video interrupt
+kernel_driver_subdirs:=video interrupt usb
 
 all: 
 	@list='$(kernel_driver_subdirs)'; for subdir in $$list; do \

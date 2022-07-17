@@ -107,7 +107,8 @@
         "libm.h": "c",
         "ahci.h": "c",
         "slab.h": "c",
-        "boot_info.h": "c"
+        "boot_info.h": "c",
+        "pci.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

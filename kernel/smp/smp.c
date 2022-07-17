@@ -156,7 +156,7 @@ void smp_ap_start()
     spin_unlock(&multi_core_starting_lock);
     preempt_disable();// 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count
     sti();
-    kdebug("1212221212");
+
     while (1)
         hlt();
 

@@ -44,6 +44,7 @@
 #define IO_APIC_MAPPING_OFFSET 0xfec00000UL
 #define LOCAL_APIC_MAPPING_OFFSET 0xfee00000UL
 #define AHCI_MAPPING_OFFSET 0xff200000UL // AHCI 映射偏移量,之后使用了4M的地址
+#define XHCI_MAPPING_OFFSET 0x100000000  // XHCI控制器映射偏移量(后方请预留1GB的虚拟空间来映射不同的controller)
 
 // ===== 内存区域属性 =====
 // DMA区域

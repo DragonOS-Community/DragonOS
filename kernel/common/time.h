@@ -38,6 +38,14 @@ struct timespec
 extern int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
 
 /**
+ * @brief 睡眠指定时间
+ *
+ * @param usec 微秒
+ * @return int
+ */
+extern int usleep(useconds_t usec);
+
+/**
  * @brief 获取当前的CPU时间
  * 
  * @return uint64_t timer_jiffies

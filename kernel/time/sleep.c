@@ -60,3 +60,19 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
 
     return 0;
 }
+
+/**
+ * @brief 睡眠指定时间
+ *
+ * @param usec 微秒
+ * @return int
+ */
+int usleep(useconds_t usec)
+{
+    struct timespec ts = {
+        tv_sec : (long int)(usec / 1000000),
+        tv_nsec : (long int)(usec % 1000000) * 1000UL
+    };
+
+    return nanosleep(&ts, NULL);
+}

@@ -2,6 +2,8 @@
 #include <driver/usb/usb.h>
 #include <driver/pci/pci.h>
 
+#define MAX_XHCI_HOST_CONTROLLERS 8
+
 // xhci Capability Registers offset
 #define XHCI_CAPS_CAPLENGTH 0x00 // Cap 寄存器组的长度
 #define XHCI_CAPS_RESERVED 0x01
@@ -85,11 +87,11 @@ struct xhci_port_info_t
     uint8_t reserved;
 } __attribute__((packed));
 
-struct xhci_controller_t
+struct xhci_host_controller_t
 {
     struct pci_device_structure_general_device_t *pci_dev_hdr; // 指向pci header结构体的指针
     int controller_id;                                         // 操作系统给controller的编号
-    int vbase;                                                 // 虚拟地址base（bar0映射到的虚拟地址）
+    uint64_t vbase;                                                 // 虚拟地址base（bar0映射到的虚拟地址）
     struct xhci_port_info_t *ports;                            // 指向端口信息数组的指针
 };
 

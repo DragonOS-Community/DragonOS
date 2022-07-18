@@ -69,7 +69,7 @@ void apic_io_apic_init()
 
     // kdebug("(ul)apic_ioapic_map.virtual_index_addr=%#018lx", (ul)apic_ioapic_map.virtual_index_addr);
     // 填写页表，完成地址映射
-    mm_map_phys_addr((ul)apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+    mm_map_phys_addr((ul)apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
 
     // 设置IO APIC ID 为0x0f000000
     *apic_ioapic_map.virtual_index_addr = 0x00;
@@ -198,7 +198,7 @@ void apic_init_ap_core_local_apic()
 void apic_local_apic_init()
 {
     // 映射Local APIC 寄存器地址
-    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, 0xfee00000UL, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, 0xfee00000UL, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
     uint a, b, c, d;
 
     cpu_cpuid(1, 0, &a, &b, &c, &d);

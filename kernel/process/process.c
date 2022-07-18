@@ -1,17 +1,19 @@
 #include "process.h"
 
-#include <exception/gate.h>
 #include <common/printk.h>
 #include <common/kprint.h>
-#include <syscall/syscall.h>
-#include <syscall/syscall_num.h>
-#include <mm/slab.h>
-#include <sched/sched.h>
-#include <filesystem/fat32/fat32.h>
 #include <common/stdio.h>
-#include <process/spinlock.h>
+#include <common/compiler.h>
 #include <common/libELF/elf.h>
 #include <driver/video/video.h>
+#include <exception/gate.h>
+#include <filesystem/fat32/fat32.h>
+#include <mm/slab.h>
+#include <process/spinlock.h>
+#include <syscall/syscall.h>
+#include <syscall/syscall_num.h>
+#include <sched/sched.h>
+
 
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
@@ -246,7 +248,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
             // todo: 改用slab分配4K大小内存块并映射到4K页
             if (!mm_check_mapped((uint64_t)current_pcb->mm->pgd, virt_base)) // 未映射，则新增物理页
             {
-                mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+                mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, virt_base, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true, false);
 
                 memset((void *)virt_base, 0, PAGE_2M_SIZE);
             }
@@ -273,7 +275,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
     uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
 
-    mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+    mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, current_pcb->mm->stack_start - PAGE_2M_SIZE, pa, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true, false);
 
     // 清空栈空间
     memset((void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), 0, PAGE_2M_SIZE);
@@ -651,11 +653,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 拷贝成功
     retval = tsk->pid;
 
-    // kdebug("fork done: tsk->pid=%d", tsk->pid);
-
-    // kdebug("current_pcb->mm->brk_end=%#018lx", current_pcb->mm->brk_end);
-    // mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, 0x0000500000000000, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true);
-
     // 唤醒进程
     process_wakeup(tsk);
 
@@ -922,8 +919,28 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
             {
                 if ((current_pdt + k)->pdt == 0)
                     continue;
-                // 释放内存页
-                free_pages(Phy_to_2M_Page((current_pdt + k)->pdt & (~0x1fffUL)), 1);
+                // 存在4级页表
+                if (unlikely(((current_pdt + k)->pdt & (1 << 7)) == 0))
+                {
+                    // 存在4K页
+                    uint64_t *pt_ptr = (uint64_t *)phys_2_virt((current_pdt + k)->pdt & (~0x1fffUL));
+                    uint64_t *pte_ptr = pt_ptr;
+
+                    // 循环处理4K页表, 直接清空
+                    // todo: 当支持使用slab分配4K内存作为进程的4K页之后，在这里需要释放这些4K对象
+                    for (int16_t g = 0; g < 512; ++g, ++pte_ptr)
+                        *pte_ptr = 0;
+
+                    // 4级页表已经空了，释放页表
+                    if (unlikely(mm_check_page_table(pt_ptr)) == 0)
+                        kfree(pt_ptr);
+                }
+                else
+                {
+                    // 释放内存页
+                    if (mm_is_2M_page((current_pdt + k)->pdt & (~0x1fffUL))) // 校验是否为内存中的物理页
+                        free_pages(Phy_to_2M_Page((current_pdt + k)->pdt & (~0x1fffUL)), 1);
+                }
             }
             // 释放三级页表
             kfree(current_pdt);

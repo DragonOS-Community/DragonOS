@@ -4,9 +4,12 @@
 #include <common/kprint.h>
 #include <driver/multiboot2/multiboot2.h>
 #include <process/process.h>
+#include <common/compiler.h>
+#include <common/errno.h>
+#include <debug/traceback/traceback.h>
 
-ul Total_Memory = 0;
-ul total_2M_pages = 0;
+static ul Total_Memory = 0;
+static ul total_2M_pages = 0;
 static ul root_page_table_phys_addr = 0; // 内核层根页表的物理地址
 
 /**
@@ -47,6 +50,23 @@ static void mm_calculate_entry_num(uint64_t length, mm_pgt_entry_num_t *ent)
  * @param clear 是否清除标志位
  */
 uint64_t mm_get_PDE(ul proc_page_table_addr, bool is_phys, ul virt_addr, bool clear);
+
+/**
+ * @brief 检查页表是否存在不为0的页表项
+ *
+ * @param ptr 页表基指针
+ * @return int8_t 存在 -> 1
+ *                不存在 -> 0
+ */
+int8_t mm_check_page_table(uint64_t *ptr)
+{
+    for (int i = 0; i < 512; ++i, ++ptr)
+    {
+        if (*ptr != 0)
+            return 1;
+    }
+    return 0;
+}
 
 void mm_init()
 {
@@ -451,7 +471,7 @@ void free_pages(struct Page *page, int number)
 
 /**
  * @brief 重新初始化页表的函数
- * 将0~4GB的物理页映射到线性地址空间
+ * 将所有物理页映射到线性地址空间
  */
 void page_table_init()
 {
@@ -470,10 +490,7 @@ void page_table_init()
 
         for (int j = 0; j < z->count_pages; ++j)
         {
-            // if (p->addr_phys)
-            //     kdebug("(ul)phys_2_virt(p->addr_phys)=%#018lx",(ul)phys_2_virt(p->addr_phys));
-            // mm_map_phys_addr((ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
-            mm_map_proc_page_table((uint64_t)get_CR3(), true, (ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE, false, true);
+            mm_map_proc_page_table((uint64_t)get_CR3(), true, (ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE, false, true, false);
 
             ++p;
             ++js;
@@ -491,18 +508,20 @@ void page_table_init()
  * @param virt_addr_start 要映射到的虚拟地址的起始位置
  * @param phys_addr_start 物理地址的起始位置
  * @param length 要映射的区域的长度（字节）
+ * @param flags 标志位
+ * @param use4k 是否使用4k页
  */
-void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags)
+int mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool use4k)
 {
     uint64_t global_CR3 = (uint64_t)get_CR3();
 
-    mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, false, true);
+    return mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, false, true, use4k);
 }
 
-void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags)
+int mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags)
 {
     uint64_t global_CR3 = (uint64_t)get_CR3();
-    mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, true, true);
+    return mm_map_proc_page_table(global_CR3, true, virt_addr_start, phys_addr_start, length, flags, true, true, false);
 }
 
 /**
@@ -515,8 +534,9 @@ void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul
  * @param length 要映射的区域的长度（字节）
  * @param user 用户态是否可访问
  * @param flush 是否刷新tlb
+ * @param use4k 是否使用4k页
  */
-void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user, bool flush)
+int mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user, bool flush, bool use4k)
 {
 
     // 计算线性地址对应的pml4页表项的地址
@@ -579,22 +599,68 @@ void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_
                 --pgt_num.num_PDE;
                 // 计算当前2M物理页对应的pdt的页表项的物理地址
                 ul *pde_ptr = pd_ptr + pde_id;
-                if (*pde_ptr != 0 && user)
+
+                // ====== 使用4k页 =======
+                if (unlikely(use4k))
                 {
-                    // kwarn("page already mapped!");
-                    // 如果是用户态可访问的页，则释放当前新获取的物理页
-                    free_pages(Phy_to_2M_Page((ul)phys_addr_start + length_mapped), 1);
-                    length_mapped += PAGE_2M_SIZE;
-                    continue;
+                    // kdebug("use 4k");
+                    if (*pde_ptr == 0)
+                    {
+                        // 创建四级页表
+                        // kdebug("create PT");
+                        uint64_t *vaddr = kmalloc(PAGE_4K_SIZE, 0);
+                        memset(vaddr, 0, PAGE_4K_SIZE);
+                        set_pdt(pde_ptr, mk_pdt(virt_2_phys(vaddr), (user ? PAGE_USER_PDE : PAGE_KERNEL_PDE)));
+                    }
+                    else if (unlikely(*pde_ptr & (1 << 7)))
+                    {
+                        // 当前页表项已经被映射了2MB物理页
+                        goto failed;
+                    }
+
+                    uint64_t pte_id = (((virt_addr_start + length_mapped) >> PAGE_4K_SHIFT) & 0x1ff);
+                    uint64_t *pt_ptr = (uint64_t *)phys_2_virt(*pde_ptr & (~0x1fffUL));
+
+                    // 循环填写4级页表，初始化4K页
+                    for (; pgt_num.num_PTE > 0 && pte_id < 512; ++pte_id)
+                    {
+                        --pgt_num.num_PTE;
+                        uint64_t *pte_ptr = pt_ptr + pte_id;
+
+                        if (unlikely(*pte_ptr != 0))
+                        {
+                            kwarn("pte already exists.");
+                            length_mapped += PAGE_4K_SIZE;
+                        }
+
+                        set_pt(pte_ptr, mk_pt((ul)phys_addr_start + length_mapped, flags | (user ? PAGE_USER_4K_PAGE : PAGE_KERNEL_4K_PAGE)));
+                    }
                 }
-                // 页面写穿，禁止缓存
-                set_pdt(pde_ptr, mk_pdt((ul)phys_addr_start + length_mapped, flags | (user ? PAGE_USER_PAGE : PAGE_KERNEL_PAGE)));
-                length_mapped += PAGE_2M_SIZE;
+                // ======= 使用2M页 ========
+                else
+                {
+                    if (unlikely(*pde_ptr != 0 && user))
+                    {
+                        kwarn("page already mapped!");
+                        // 如果是用户态可访问的页，则释放当前新获取的物理页
+                        if (likely(((ul)phys_addr_start + length_mapped) < total_2M_pages)) // 校验是否为内存中的物理页
+                            free_pages(Phy_to_2M_Page((ul)phys_addr_start + length_mapped), 1);
+                        length_mapped += PAGE_2M_SIZE;
+                        continue;
+                    }
+                    // 页面写穿，禁止缓存
+                    set_pdt(pde_ptr, mk_pdt((ul)phys_addr_start + length_mapped, flags | (user ? PAGE_USER_PAGE : PAGE_KERNEL_PAGE)));
+                    length_mapped += PAGE_2M_SIZE;
+                }
             }
         }
     }
-    if (flush)
+    if (likely(flush))
         flush_tlb();
+    return 0;
+failed:;
+    kerror("Map memory failed. use4k=%d, vaddr=%#018lx, paddr=%#018lx", use4k, virt_addr_start, phys_addr_start);
+    return -EFAULT;
 }
 
 /**
@@ -701,11 +767,41 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
                 // 计算当前2M物理页对应的pdt的页表项的物理地址
                 ul *pde_ptr = pd_ptr + pde_id;
 
-                *pde_ptr = 0;
+                // 存在4级页表
+                if (unlikely(((*pde_ptr) & (1 << 7)) == 0))
+                {
+                    // 存在4K页
+                    uint64_t pte_id = (((virt_addr_start + length_unmapped) >> PAGE_4K_SHIFT) & 0x1ff);
+                    uint64_t *pt_ptr = (uint64_t *)phys_2_virt(*pde_ptr & (~0x1fffUL));
+                    uint64_t *pte_ptr = pt_ptr + pte_id;
 
-                length_unmapped += PAGE_2M_SIZE;
+                    // 循环处理4K页表
+                    for (; pgt_num.num_PTE > 0 && pte_id < 512; ++pte_id, ++pte_ptr)
+                    {
+                        --pgt_num.num_PTE;
+                        // todo: 当支持使用slab分配4K内存作为进程的4K页之后，在这里需要释放这些4K对象
+                        *pte_ptr = 0;
+                        length_unmapped += PAGE_4K_SIZE;
+                    }
+
+                    // 4级页表已经空了，释放页表
+                    if (unlikely(mm_check_page_table(pt_ptr)) == 0)
+                        kfree(pt_ptr);
+                }
+                else
+                {
+                    *pde_ptr = 0;
+                    length_unmapped += PAGE_2M_SIZE;
+                }
             }
+
+            // 3级页表已经空了，释放页表
+            if (unlikely(mm_check_page_table(pd_ptr)) == 0)
+                kfree(pd_ptr);
         }
+        // 2级页表已经空了，释放页表
+        if (unlikely(mm_check_page_table(pdpt_ptr)) == 0)
+            kfree(pdpt_ptr);
     }
     flush_tlb();
 }
@@ -793,8 +889,8 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
     {
         for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
         {
-            kdebug("map [%#018lx]", i);
-            mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true);
+            // kdebug("map [%#018lx]", i);
+            mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true, false);
         }
         current_pcb->mm->brk_end = end_addr;
     }
@@ -850,9 +946,36 @@ bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr)
     // 读取pdt页表项
     tmp = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr) >> PAGE_2M_SHIFT) & 0x1ff)));
 
-    // todo: 增加对使用了4K页的页表的检测
-    if (*tmp != 0)
+    // pde页表项为0
+    if (*tmp == 0)
+        return 0;
+
+    if (*tmp & (1 << 7))
+    {
+        // 当前为2M物理页
         return true;
+    }
     else
-        return false;
+    {
+        // 存在4级页表
+        tmp = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr) >> PAGE_4K_SHIFT) & 0x1ff)));
+        if (*tmp != 0)
+            return true;
+        else
+            return false;
+    }
+}
+
+/**
+ * @brief 检测是否为有效的2M页(物理内存页)
+ * 
+ * @param paddr 物理地址
+ * @return int8_t 是 -> 1
+ *                 否 -> 0
+ */
+int8_t mm_is_2M_page(uint64_t paddr)
+{
+    if(likely((paddr >> PAGE_2M_SHIFT)<total_2M_pages))
+        return 1;
+    else return 0;
 }

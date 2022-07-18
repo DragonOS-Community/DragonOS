@@ -77,6 +77,8 @@
 
 //	bit 12	Page Attribute Table
 #define PAGE_PAT (1UL << 12)
+// 对于PTE而言，第7位是PAT
+#define PAGE_4K_PAT (1UL << 7)
 
 //	bit 8	Global Page:1,global;0,part
 #define PAGE_GLOBAL (1UL << 8)
@@ -111,16 +113,25 @@
 // 1,0
 #define PAGE_KERNEL_DIR (PAGE_R_W | PAGE_PRESENT)
 
+// 1,0 (4级页表在3级页表中的页表项的属性)
+#define PAGE_KERNEL_PDE (PAGE_R_W | PAGE_PRESENT)
+
 // 7,1,0
 #define PAGE_KERNEL_PAGE (PAGE_PS | PAGE_R_W | PAGE_PRESENT)
+
+#define PAGE_KERNEL_4K_PAGE (PAGE_R_W | PAGE_PRESENT)
 
 #define PAGE_USER_PGT (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
 // 2,1,0
 #define PAGE_USER_DIR (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
+// 1,0 (4级页表在3级页表中的页表项的属性)
+#define PAGE_USER_PDE (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 // 7,2,1,0
 #define PAGE_USER_PAGE (PAGE_PS | PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
+
+#define PAGE_USER_4K_PAGE (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
 // ===== 错误码定义 ====
 // 物理页结构体为空
@@ -172,7 +183,7 @@ struct memory_desc
 
     ul kernel_code_start, kernel_code_end; // 内核程序代码段起始地址、结束地址
     ul kernel_data_end, rodata_end;        // 内核程序数据段结束地址、 内核程序只读段结束地址
-    uint64_t start_brk; // 堆地址的起始位置
+    uint64_t start_brk;                    // 堆地址的起始位置
 
     ul end_of_struct; // 内存页管理结构的结束地址
 };
@@ -233,7 +244,6 @@ extern char _end;
 int ZONE_DMA_INDEX = 0;
 int ZONE_NORMAL_INDEX = 0;   // low 1GB RAM ,was mapped in pagetable
 int ZONE_UNMAPPED_INDEX = 0; // above 1GB RAM,unmapped in pagetable
-
 
 // 初始化内存管理单元
 void mm_init();
@@ -345,7 +355,7 @@ typedef struct
 
 /**
  * @brief 重新初始化页表的函数
- * 将0~4GB的物理页映射到线性地址空间
+ * 将所有物理页映射到线性地址空间
  */
 void page_table_init();
 
@@ -355,8 +365,10 @@ void page_table_init();
  * @param virt_addr_start 要映射到的虚拟地址的起始位置
  * @param phys_addr_start 物理地址的起始位置
  * @param length 要映射的区域的长度（字节）
+ * @param flags 标志位
+ * @param use4k 是否使用4k页
  */
-void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);
+int mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool use4k);
 
 /**
  * @brief 将将物理地址填写到进程的页表的函数
@@ -368,27 +380,66 @@ void mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flag
  * @param length 要映射的区域的长度（字节）
  * @param user 用户态是否可访问
  * @param flush 是否刷新tlb
+ * @param use4k 是否使用4k页
  */
-void mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user, bool flush);
+int mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user, bool flush, bool use4k);
 
+int mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);
 
-void mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);
+/**
+ * @brief 从页表中清除虚拟地址的映射
+ *
+ * @param proc_page_table_addr 页表的地址
+ * @param is_phys 页表地址是否为物理地址
+ * @param virt_addr_start 要清除的虚拟地址的起始地址
+ * @param length 要清除的区域的长度
+ */
+void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul length);
+
+/**
+ * @brief 取消当前进程的页表中的虚拟地址映射
+ *
+ * @param virt_addr 虚拟地址
+ * @param length 地址长度
+ */
+#define mm_unmap(virt_addr, length) ({                                 \
+    mm_unmap_proc_table((uint64_t)get_CR3(), true, virt_addr, length); \
+})
 
 /**
  * @brief 检测指定地址是否已经被映射
- * 
+ *
  * @param page_table_phys_addr 页表的物理地址
  * @param virt_addr 要检测的地址
  * @return true 已经被映射
- * @return false 
+ * @return false
  */
 bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr);
+
+/**
+ * @brief 检测是否为有效的2M页(物理内存页)
+ *
+ * @param paddr 物理地址
+ * @return int8_t 是 -> 1
+ *                 否 -> 0
+ */
+int8_t mm_is_2M_page(uint64_t paddr);
+
+/**
+ * @brief 检查页表是否存在不为0的页表项
+ *
+ * @param ptr 页表基指针
+ * @return int8_t 存在 -> 1
+ *                不存在 -> 0
+ */
+int8_t mm_check_page_table(uint64_t *ptr);
+
 /**
  * @brief 调整堆区域的大小（暂时只能增加堆区域）
- * 
+ *
  * @todo 缩小堆区域
  * @param old_brk_end_addr 原本的堆内存区域的结束地址
  * @param offset 新的地址相对于原地址的偏移量
- * @return uint64_t 
+ * @return uint64_t
  */
 uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset);

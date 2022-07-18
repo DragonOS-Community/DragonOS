@@ -43,7 +43,7 @@ void ahci_init()
     kdebug("((struct pci_device_structure_general_device_t *)phys_2_virt(ahci_devs[0])))->BAR5= %#018lx", ((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5);
     uint32_t bar5 = ((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5;
 
-    mm_map_phys_addr(AHCI_MAPPING_BASE, (ul)(bar5)&PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+    mm_map_phys_addr(AHCI_MAPPING_BASE, (ul)(bar5)&PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
     kdebug("ABAR mapped!");
     for (int i = 0; i < count_ahci_devices; ++i)
     {

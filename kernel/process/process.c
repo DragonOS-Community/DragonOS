@@ -6,6 +6,7 @@
 #include <common/compiler.h>
 #include <common/libELF/elf.h>
 #include <driver/video/video.h>
+#include <driver/usb/usb.h>
 #include <exception/gate.h>
 #include <filesystem/fat32/fat32.h>
 #include <mm/slab.h>
@@ -410,7 +411,10 @@ ul initial_kernel_thread(ul arg)
     // kinfo("initial proc running...\targ:%#018lx", arg);
 
     fat32_init();
+    usb_init();
 
+
+    // 准备切换到用户态
     struct pt_regs *regs;
 
     current_pcb->thread->rip = (ul)ret_from_system_call;

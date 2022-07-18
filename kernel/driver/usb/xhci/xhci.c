@@ -4,12 +4,69 @@
 #include <process/spinlock.h>
 #include <mm/mm.h>
 #include <debug/traceback/traceback.h>
+#include <common/time.h>
 
 spinlock_t xhci_controller_init_lock; // xhci控制器初始化锁(在usb_init中被初始化)
 
 static int xhci_ctrl_count = 0; // xhci控制器计数
 
 static struct xhci_host_controller_t xhci_hc[MAX_XHCI_HOST_CONTROLLERS] = {0};
+
+#define xhci_read_cap_reg8(id, offset) (*(uint8_t *)(xhci_hc[id].vbase + offset))
+#define xhci_write_cap_reg8(id, offset, value) (*(uint8_t *)(xhci_hc[id].vbase + offset) = (uint8_t)value)
+#define xhci_read_cap_reg32(id, offset) (*(uint32_t *)(xhci_hc[id].vbase + offset))
+#define xhci_write_cap_reg32(id, offset, value) (*(uint32_t *)(xhci_hc[id].vbase + offset) = (uint32_t)value)
+#define xhci_read_cap_reg64(id, offset) (*(uint64_t *)(xhci_hc[id].vbase + offset))
+#define xhci_write_cap_reg64(id, offset, value) (*(uint64_t *)(xhci_hc[id].vbase + offset) = (uint64_t)value)
+
+#define xhci_read_op_reg8(id, offset) (*(uint8_t *)(xhci_hc[id].vbase_op + offset))
+#define xhci_write_op_reg8(id, offset, value) (*(uint8_t *)(xhci_hc[id].vbase_op + offset) = (uint8_t)value)
+#define xhci_read_op_reg32(id, offset) (*(uint32_t *)(xhci_hc[id].vbase_op + offset))
+#define xhci_write_op_reg32(id, offset, value) (*(uint32_t *)(xhci_hc[id].vbase_op + offset) = (uint32_t)value)
+#define xhci_read_op_reg64(id, offset) (*(uint64_t *)(xhci_hc[id].vbase_op + offset))
+#define xhci_write_op_reg64(id, offset, value) (*(uint64_t *)(xhci_hc[id].vbase_op + offset) = (uint64_t)value)
+
+/**
+ * @brief 停止xhci主机控制器
+ *
+ * @param id 主机控制器id
+ * @return int
+ */
+static int xhci_hc_stop(int id)
+{
+    // todo: 停止usb控制器
+}
+
+/**
+ * @brief reset xHCI主机控制器
+ *
+ * @param id 主机控制器id
+ * @return int
+ */
+static int xhci_hc_reset(int id)
+{
+    int retval = 0;
+    // 判断HCHalted是否置位
+    if ((xhci_read_op_reg32(id, XHCI_OPS_USBSTS) & (1 << 0)) == 0)
+    {
+        // 未置位，需要先尝试停止usb主机控制器
+        retval = xhci_hc_stop(id);
+        if (retval)
+            return retval;
+    }
+    int timeout = 500; // wait 500ms
+    // reset
+    xhci_write_cap_reg32(id, XHCI_OPS_USBCMD, (1 << 1));
+    usleep(1000);
+    while (xhci_read_op_reg32(id, XHCI_OPS_USBCMD) & (1 << 1))
+    {
+        usleep(1000);
+        if (--timeout == 0)
+            return -ETIMEDOUT;
+    }
+    kdebug("reset done!, timeout=%d", timeout);
+    return retval;
+}
 
 /**
  * @brief 初始化xhci控制器
@@ -32,19 +89,26 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
 
     // 读取xhci控制寄存器
     uint16_t iversion = *(uint16_t *)(xhci_hc[xhci_ctrl_count].vbase + XHCI_CAPS_HCIVERSION);
-    uint32_t dboff = *(uint16_t *)(xhci_hc[xhci_ctrl_count].vbase + XHCI_CAPS_DBOFF);
-    
-    // kdebug("dboff=%ld", dboff);
-    // struct xhci_caps_HCSPARAMS1_reg_t hcs1 = *(struct xhci_caps_HCSPARAMS1_reg_t *)(xhci_hc[xhci_ctrl_count].vbase + XHCI_CAPS_HCSPARAMS1);
 
-    // kdebug("hcs1.max_ports=%d, hcs1.max_slots=%d, hcs1.max_intrs=%d", hcs1.max_ports, hcs1.max_slots, hcs1.max_intrs);
-    // kdebug("caps size=%d", *(uint8_t *)xhci_hc[xhci_ctrl_count].vbase);
-    // kdebug("iversion=%#06x", iversion);
+    // 计算operational registers的地址
+    xhci_hc[xhci_ctrl_count].vbase_op = xhci_hc[xhci_ctrl_count].vbase + xhci_read_cap_reg8(xhci_ctrl_count, XHCI_CAPS_CAPLENGTH);
+
     if (iversion < 0x95)
     {
         kwarn("Unsupported/Unknowned xHCI controller version: %#06x. This may cause unexpected behavior.", iversion);
     }
 
+    // if it is a Panther Point device, make sure sockets are xHCI controlled.
+    if (((pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0) & 0xffff) == 0x8086) &&
+        ((pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 2) & 0xffff) == 0x1E31) &&
+        ((pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 8) & 0xff) == 4))
+    {
+        kdebug("Is a Panther Point device");
+        pci_write_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0xd8, 0xffffffff);
+        pci_write_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0xd0, 0xffffffff);
+    }
+    
+    xhci_hc_reset(xhci_ctrl_count);
     ++xhci_ctrl_count;
     spin_unlock(&xhci_controller_init_lock);
     return;

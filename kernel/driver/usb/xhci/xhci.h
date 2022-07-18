@@ -73,7 +73,68 @@ struct xhci_caps_HCCPARAMS2_reg_t
     unsigned Reserved : 26;
 } __attribute__((packed));
 
+// xhci operational registers offset
+#define XHCI_OPS_USBCMD 0x00   // USB Command
+#define XHCI_OPS_USBSTS 0x04   // USB status
+#define XHCI_OPS_PAGESIZE 0x08 // Page size
+#define XHCI_OPS_DNCTRL 0x14   // Device notification control
+#define XHCI_OPS_CRCR 0x18     // Command ring control
+#define XHCI_OPS_DCBAAP 0x30   // Device context base address array pointer
+#define XHCI_OPS_CONFIG 0x38   // configuire
+#define XHCI_OPS_PRS 0x400     // Port register sets
 
+struct xhci_ops_usbcmd_reg_t
+{
+    unsigned rs : 1;          // Run/Stop
+    unsigned hcrst : 1;       // host controller reset
+    unsigned inte : 1;        // Interrupt enable
+    unsigned hsee : 1;        // Host system error enable
+    unsigned rsvd_psvd1 : 3;  // Reserved and preserved
+    unsigned lhcrst : 1;      // light host controller reset
+    unsigned css : 1;         // controller save state
+    unsigned crs : 1;         // controller restore state
+    unsigned ewe : 1;         // enable wrap event
+    unsigned ue3s : 1;        // enable U3 MFINDEX Stop
+    unsigned spe : 1;         // stopped short packet enable
+    unsigned cme : 1;         // CEM Enable
+    unsigned rsvd_psvd2 : 18; // Reserved and preserved
+} __attribute__((packed));
+
+struct xhci_ops_usbsts_reg_t
+{
+    unsigned HCHalted : 1;
+    unsigned rsvd_psvd1 : 1;  // Reserved and preserved
+    unsigned hse : 1;         // Host system error
+    unsigned eint : 1;        // event interrupt
+    unsigned pcd : 1;         // Port change detected
+    unsigned rsvd_zerod : 3;  // Reserved and Zero'd
+    unsigned sss : 1;         // Save State Status
+    unsigned rss : 1;         // restore state status
+    unsigned sre : 1;         // save/restore error
+    unsigned cnr : 1;         // controller not ready
+    unsigned hce : 1;         // host controller error
+    unsigned rsvd_psvd2 : 19; // Reserved and Preserved
+} __attribute__((packed));
+
+struct xhci_ops_pagesize_reg_t
+{
+    uint16_t page_size; // The actual pagesize is ((this field)<<12)
+    uint16_t reserved;
+} __attribute__((packed));
+
+struct xhci_ops_dnctrl_reg_t
+{
+    uint16_t value;
+    uint16_t reserved;
+} __attribute__((packed));
+
+struct xhci_ops_config_reg_t
+{
+    uint8_t MaxSlotsEn;      // Max slots enabled
+    unsigned u3e : 1;        // U3 Entry Enable
+    unsigned cie : 1;        // Configuration information enable
+    unsigned rsvd_psvd : 22; // Reserved and Preserved
+} __attribute__((packed));
 
 /**
  * @brief xhci端口信息
@@ -91,7 +152,8 @@ struct xhci_host_controller_t
 {
     struct pci_device_structure_general_device_t *pci_dev_hdr; // 指向pci header结构体的指针
     int controller_id;                                         // 操作系统给controller的编号
-    uint64_t vbase;                                                 // 虚拟地址base（bar0映射到的虚拟地址）
+    uint64_t vbase;                                            // 虚拟地址base（bar0映射到的虚拟地址）
+    uint64_t vbase_op;                                         // Operational registers 起始虚拟地址
     struct xhci_port_info_t *ports;                            // 指向端口信息数组的指针
 };
 

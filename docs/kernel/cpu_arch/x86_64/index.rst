@@ -1,10 +1,8 @@
-内核调试模块
+x86-64相关文档
 ====================================
-
-   这里是DragonOS的内核调试模块文档。
    
 .. toctree::
    :maxdepth: 1
    :caption: 目录
 
-   traceback
+   usb_legacy_support

@@ -22,6 +22,7 @@
    kernel/process_management/index
    kernel/filesystem/index
    kernel/debug/index
+   kernel/cpu_arch/index
 
 
 .. toctree::

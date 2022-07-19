@@ -2,7 +2,8 @@
 #include <driver/usb/usb.h>
 #include <driver/pci/pci.h>
 
-#define MAX_XHCI_HOST_CONTROLLERS 8
+#define XHCI_MAX_HOST_CONTROLLERS 8
+#define XHCI_MAX_ROOT_HUB_PORTS 128
 
 // xhci Capability Registers offset
 #define XHCI_CAPS_CAPLENGTH 0x00 // Cap 寄存器组的长度
@@ -43,20 +44,20 @@ struct xhci_caps_HCSPARAMS3_reg_t
 
 struct xhci_caps_HCCPARAMS1_reg_t
 {
-    unsigned ac64 : 1; // 64-bit addressing capability
-    unsigned bnc : 1;  // bw negotiation capability
-    unsigned csz : 1;  // context size
-    unsigned ppc : 1;  // 端口电源控制
-    unsigned pind : 1; // port indicators
-    unsigned lhrc : 1; // Light HC reset capability
-    unsigned ltc : 1;  // latency tolerance messaging capability
-    unsigned nss : 1;  // no secondary SID support
+    unsigned int ac64 : 1; // 64-bit addressing capability
+    unsigned int bnc : 1;  // bw negotiation capability
+    unsigned int csz : 1;  // context size
+    unsigned int ppc : 1;  // 端口电源控制
+    unsigned int pind : 1; // port indicators
+    unsigned int lhrc : 1; // Light HC reset capability
+    unsigned int ltc : 1;  // latency tolerance messaging capability
+    unsigned int nss : 1;  // no secondary SID support
 
-    unsigned pae : 1;        // parse all event data
-    unsigned spc : 1;        // Stopped - Short packet capability
-    unsigned sec : 1;        // Stopped EDTLA capability
-    unsigned cfc : 1;        // Continuous Frame ID capability
-    unsigned MaxPSASize : 4; // Max Primary Stream Array Size
+    unsigned int pae : 1;        // parse all event data
+    unsigned int spc : 1;        // Stopped - Short packet capability
+    unsigned int sec : 1;        // Stopped EDTLA capability
+    unsigned int cfc : 1;        // Continuous Frame ID capability
+    unsigned int MaxPSASize : 4; // Max Primary Stream Array Size
 
     uint16_t xECP; // xhci extended capabilities pointer
 
@@ -136,6 +137,23 @@ struct xhci_ops_config_reg_t
     unsigned rsvd_psvd : 22; // Reserved and Preserved
 } __attribute__((packed));
 
+// xhci Extended Capabilities List ID
+// ID 部分的含义定义
+#define XHCI_XECP_ID_RESERVED 0
+#define XHCI_XECP_ID_LEGACY 1    // USB Legacy Support
+#define XHCI_XECP_ID_PROTOCAL 2  // Supported protocal
+#define XHCI_XECP_ID_POWER 3     // Extended power management
+#define XHCI_XECP_ID_IOVIRT 4    // I/0 virtualization
+#define XHCI_XECP_ID_MSG 5       // Message interrupt
+#define XHCI_XECP_ID_LOCAL_MEM 6 // local memory
+#define XHCI_XECP_ID_DEBUG 10    // USB Debug capability
+#define XHCI_XECP_ID_EXTMSG 17   // Extended message interrupt
+
+#define XHCI_XECP_LEGACY_TIMEOUT 10           // 设置legacy状态的等待时间
+#define XHCI_XECP_LEGACY_BIOS_OWNED (1 << 16) // 当bios控制着该hc时，该位被置位
+#define XHCI_XECP_LEGACY_OS_OWNED (1 << 24)   // 当系统控制着该hc时，该位被置位
+#define XHCI_XECP_LEGACY_OWNING_MASK (XHCI_XECP_LEGACY_BIOS_OWNED | XHCI_XECP_LEGACY_OS_OWNED)
+
 /**
  * @brief xhci端口信息
  *
@@ -154,7 +172,14 @@ struct xhci_host_controller_t
     int controller_id;                                         // 操作系统给controller的编号
     uint64_t vbase;                                            // 虚拟地址base（bar0映射到的虚拟地址）
     uint64_t vbase_op;                                         // Operational registers 起始虚拟地址
-    struct xhci_port_info_t *ports;                            // 指向端口信息数组的指针
+    uint32_t rts_offset;                                       // Runtime Register Space offset
+    uint32_t db_offset;                                        // Doorbell offset
+    uint32_t ext_caps_off;                                     // 扩展能力寄存器偏移量
+    uint8_t context_size;                                      // 上下文大小
+    uint16_t port_num;                                         // 总的端口数量
+    uint8_t port_num_u2;                                       // usb 2.0端口数量
+    uint8_t port_num_u3;                                       // usb 3端口数量
+    struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针
 };
 
 /**

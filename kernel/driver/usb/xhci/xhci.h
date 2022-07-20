@@ -2,7 +2,7 @@
 #include <driver/usb/usb.h>
 #include <driver/pci/pci.h>
 
-#define XHCI_MAX_HOST_CONTROLLERS 4     // 本驱动程序最大支持4个xhci root hub controller
+#define XHCI_MAX_HOST_CONTROLLERS 4 // 本驱动程序最大支持4个xhci root hub controller
 #define XHCI_MAX_ROOT_HUB_PORTS 128 // 本驱动程序最大支持127个root hub 端口（第0个保留）
 
 // xhci Capability Registers offset
@@ -157,10 +157,134 @@ struct xhci_ops_config_reg_t
 // 端口信息标志位
 #define XHCI_PROTOCOL_USB2 0
 #define XHCI_PROTOCOL_USB3 1
-#define XHCI_PROTOCOL_INFO (1<<0)    // 1->usb3, 0->usb2
-#define XHCI_PROTOCOL_HSO (1<<1) // 1-> usb2 high speed only
-#define XHCI_PROTOCOL_HAS_PAIR (1<<2) // 当前位被置位，意味着当前端口具有一个与之配对的端口
-#define XHCI_PROTOCOL_ACTIVE (1<<3) // 当前端口是这个配对中，被激活的端口
+#define XHCI_PROTOCOL_INFO (1 << 0)     // 1->usb3, 0->usb2
+#define XHCI_PROTOCOL_HSO (1 << 1)      // 1-> usb2 high speed only
+#define XHCI_PROTOCOL_HAS_PAIR (1 << 2) // 当前位被置位，意味着当前端口具有一个与之配对的端口
+#define XHCI_PROTOCOL_ACTIVE (1 << 3)   // 当前端口是这个配对中，被激活的端口
+
+// TRB的Transfer Type可用值定义
+#define XHCI_TRB_TRT_NO_DATA 0
+#define XHCI_TRB_TRT_RESERVED 1
+#define XHCI_TRB_TRT_OUT_DATA 2
+#define XHCI_TRB_TRT_IN_DATA 3
+
+#define XHCI_CMND_RING_TRBS 128 // TRB num of command ring,  not more than 4096
+
+#define XHCI_TRBS_PER_RING 256
+
+/**
+ * @brief xhci通用TRB结构
+ *
+ */
+struct xhci_TRB_t
+{
+    uint64_t param; // 参数
+    uint32_t status;
+    uint32_t command;
+} __attribute__((packed));
+struct xhci_TRB_normal_t
+{
+    uint64_t buf_paddr; // 数据缓冲区物理地址
+
+    unsigned transfer_length : 17; // 传输数据长度
+    unsigned TD_size : 5;          // 传输描述符中剩余的数据包的数量
+    unsigned intr_target : 10;     // 中断目标 [0:MaxIntrs-1]
+
+    unsigned cycle : 1;    // used to mark the enqueue pointer of transfer ring
+    unsigned ent : 1;      // evaluate next TRB before updating the endpoint's state
+    unsigned isp : 1;      // Interrupt on short packet bit
+    unsigned ns : 1;       // No snoop
+    unsigned chain : 1;    // The chain bit is used to tell the controller that this
+                           // TRB is associated with the next TRB in the TD
+    unsigned ioc : 1;      // 完成时发起中断
+    unsigned idt : 1;      // Immediate Data
+    unsigned resv : 2;     // Reserved and zero'd
+    unsigned bei : 1;      // Block event interrupt
+    unsigned TRB_type : 6; // TRB类型
+    uint16_t Reserved;     // 保留且置为0
+} __attribute__((packed));
+
+struct xhci_TRB_setup_state_t
+{
+    uint8_t bmRequestType;
+    uint8_t bRequest;
+    uint16_t wValue;
+
+    uint16_t wIndex;
+    uint16_t wLength;
+
+    unsigned transfer_legth : 17;
+    unsigned resv1 : 5; // Reserved and zero'd
+    unsigned intr_target : 10;
+
+    unsigned cycle : 1;
+    unsigned resv2 : 4; // Reserved and zero'd
+    unsigned ioc : 1;
+    unsigned idt : 1;
+    unsigned resv3 : 3; // Reserved and zero'd
+    unsigned TRB_type : 6;
+    unsigned trt : 2;    // Transfer type
+    unsigned resv4 : 14; // Reserved and zero'd
+
+} __attribute__((packed));
+
+struct xhci_TRB_data_stage_t
+{
+    uint64_t buf_paddr; // 数据缓冲区物理地址
+
+    unsigned transfer_length : 17; // 传输数据长度
+    unsigned TD_size : 5;          // 传输描述符中剩余的数据包的数量
+    unsigned intr_target : 10;     // 中断目标 [0:MaxIntrs-1]
+
+    unsigned cycle : 1;     // used to mark the enqueue pointer of transfer ring
+    unsigned ent : 1;       // evaluate next TRB before updating the endpoint's state
+    unsigned isp : 1;       // Interrupt on short packet bit
+    unsigned ns : 1;        // No snoop
+    unsigned chain : 1;     // The chain bit is used to tell the controller that this
+                            // TRB is associated with the next TRB in the TD
+    unsigned ioc : 1;       // 完成时发起中断
+    unsigned idt : 1;       // Immediate Data
+    unsigned resv : 3;      // Reserved and zero'd
+    unsigned TRB_type : 6;  // TRB类型
+    unsigned dir : 1;       // 0 -> out packet
+                            // 1 -> in packet
+    unsigned Reserved : 15; // 保留且置为0
+} __attribute__((packed));
+
+struct xhci_TRB_status_stage_t
+{
+    uint64_t resv1; // Reserved and zero'd
+
+    unsigned resv2 : 22;       // Reserved and zero'd
+    unsigned intr_target : 10; // 中断目标 [0:MaxIntrs-1]
+
+    unsigned cycle : 1;     // used to mark the enqueue pointer of transfer ring
+    unsigned ent : 1;       // evaluate next TRB before updating the endpoint's state
+    unsigned resv3 : 2;     // Reserved and zero'd
+    unsigned chain : 1;     // The chain bit is used to tell the controller that this
+                            // TRB is associated with the next TRB in the TD
+    unsigned ioc : 1;       // 完成时发起中断
+    unsigned resv4 : 4;     // Reserved and zero'd
+    unsigned TRB_type : 6;  // TRB类型
+    unsigned dir : 1;       // 0 -> out packet
+                            // 1 -> in packet
+    unsigned Reserved : 15; // 保留且置为0
+} __attribute__((packed));
+
+struct xhci_TRB_cmd_complete_t
+{
+    uint64_t cmd_trb_pointer_paddr; //  指向生成当前Event TRB的TRB的物理地址（16bytes对齐）
+
+    unsigned resv1 : 24; // Reserved and zero'd
+    uint8_t code;        // Completion code
+
+    unsigned cycle : 1;    // cycle bit
+    unsigned resv2 : 9;    // Reserved and zero'd
+    unsigned TRB_type : 6; // TRB类型
+    uint8_t VF_ID;
+    uint8_t slot_id; // the id of the slot associated with the
+                     // command that generated the event
+} __attribute__((packed));
 
 /**
  * @brief xhci端口信息
@@ -187,6 +311,9 @@ struct xhci_host_controller_t
     uint16_t port_num;                                         // 总的端口数量
     uint8_t port_num_u2;                                       // usb 2.0端口数量
     uint8_t port_num_u3;                                       // usb 3端口数量
+    uint8_t page_size;                                         // page size
+    uint64_t dcbaap_vaddr;                                     // Device Context Base Address Array Pointer的虚拟地址
+    uint64_t cmd_ring_vaddr;                                   // command ring的虚拟地址
     struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
 };
 

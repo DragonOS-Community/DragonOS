@@ -5,4 +5,4 @@
 
 工作邮箱: longjin@RinGoTek.cn
 
-[内容待完善]
+开发交流QQ群： 115763565

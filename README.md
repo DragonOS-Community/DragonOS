@@ -10,6 +10,7 @@
 - 项目官网  **[DragonOS.org](https://dragonos.org)**
 - 项目文档  **[docs.DragonOS.org](https://docs.dragonos.org)**
 - 开源论坛  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
+- 开发交流QQ群 **115763565**
 &nbsp;
 ## 开发环境
 
@@ -101,7 +102,7 @@ fslongjin
 
 ## 赞赏
 
-如果你愿意的话，点击下面的链接，请我喝杯咖啡吧~请在付款备注处留下您的github ID，我会将其贴到这个页面
+如果你愿意的话，点击下面的链接，请我喝杯咖啡吧~请在付款备注处留下您的github ID，我会将其贴到这个页面. 捐赠所得资金将用于网站、论坛社区维护以及一切与本项目所相关的用途。
 
 [捐赠 | 龙进的博客](https://longjin666.cn/?page_id=54)
 

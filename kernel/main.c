@@ -103,6 +103,7 @@ void system_initialize()
 
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+    memset(ptr, 0, STACK_SIZE); // 将ist清空
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
 
     initial_tss[0].ist1 = (ul)ptr;

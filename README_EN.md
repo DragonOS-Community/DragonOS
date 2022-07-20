@@ -102,7 +102,7 @@ Blog：[longjin666.cn](https://longjin666.cn)
 
 ## Reward
 
-If you like, click the link below and buy me a cup of coffee ~ please leave your GitHub ID in the payment remarks and I will post it to this page
+If you like, click the link below and buy me a cup of coffee ~ please leave your GitHub ID in the payment remarks and I will post it to this page. The donated funds will be used for website, forum community maintenance and all purposes related to the project.
 
 [The reward webpage](https://longjin666.cn/?page_id=54)
 

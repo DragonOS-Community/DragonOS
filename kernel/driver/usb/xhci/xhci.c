@@ -63,10 +63,10 @@ static int xhci_hc_find_available_id()
 {
     if (unlikely(xhci_ctrl_count >= XHCI_MAX_HOST_CONTROLLERS))
         return -1;
-    
+
     for (int i = 0; i < XHCI_MAX_HOST_CONTROLLERS; ++i)
     {
-        if (xhci_hc[i].pci_dev_hdr = NULL)
+        if (xhci_hc[i].pci_dev_hdr == NULL)
             return i;
     }
     return -1;
@@ -195,7 +195,7 @@ static int xhci_hc_pair_ports(int id)
     kinfo("Found %d ports on xhci root hub.", hcs1.max_ports);
 
     // 找到所有的端口并标记其端口信息
-    
+
     return 0;
 }
 
@@ -217,13 +217,19 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     kinfo("Initializing xhci host controller: bus=%#02x, device=%#02x, func=%#02x, VendorID=%#04x, irq_line=%d, irq_pin=%d", dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, dev_hdr->header.Vendor_ID, dev_hdr->Interrupt_Line, dev_hdr->Interrupt_PIN);
 
     int cid = xhci_hc_find_available_id();
+    if (cid < 0)
+    {
+        kerror("Initialize xhci controller failed: exceed the limit of max controllers.");
+        goto failed_exceed_max;
+    }
+
     memset(&xhci_hc[cid], 0, sizeof(struct xhci_host_controller_t));
     xhci_hc[cid].controller_id = cid;
     xhci_hc[cid].pci_dev_hdr = dev_hdr;
     pci_write_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0x4, 0x0006); // mem I/O access enable and bus master enable
 
     // 为当前控制器映射寄存器地址空间
-    xhci_hc[cid].vbase = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + XHCI_MAPPING_OFFSET + PAGE_2M_SIZE * xhci_hc[cid].controller_id;
+    xhci_hc[cid].vbase = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + XHCI_MAPPING_OFFSET + 65536 * xhci_hc[cid].controller_id;
     kdebug("dev_hdr->BAR0 & (~0xf)=%#018lx", dev_hdr->BAR0 & (~0xf));
     mm_map_phys_addr(xhci_hc[cid].vbase, dev_hdr->BAR0 & (~0xf), 65536, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, true);
 
@@ -269,6 +275,7 @@ failed:;
 
     // 清空数组
     memset((void *)&xhci_hc[cid], 0, sizeof(struct xhci_host_controller_t));
+failed_exceed_max:;
     kerror("Failed to initialize controller: bus=%d, dev=%d, func=%d", dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func);
     spin_unlock(&xhci_controller_init_lock);
 }

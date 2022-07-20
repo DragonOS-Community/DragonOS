@@ -2,8 +2,8 @@
 #include <driver/usb/usb.h>
 #include <driver/pci/pci.h>
 
-#define XHCI_MAX_HOST_CONTROLLERS 8
-#define XHCI_MAX_ROOT_HUB_PORTS 128
+#define XHCI_MAX_HOST_CONTROLLERS 4     // 本驱动程序最大支持4个xhci root hub controller
+#define XHCI_MAX_ROOT_HUB_PORTS 128 // 本驱动程序最大支持127个root hub 端口（第0个保留）
 
 // xhci Capability Registers offset
 #define XHCI_CAPS_CAPLENGTH 0x00 // Cap 寄存器组的长度
@@ -141,7 +141,7 @@ struct xhci_ops_config_reg_t
 // ID 部分的含义定义
 #define XHCI_XECP_ID_RESERVED 0
 #define XHCI_XECP_ID_LEGACY 1    // USB Legacy Support
-#define XHCI_XECP_ID_PROTOCAL 2  // Supported protocal
+#define XHCI_XECP_ID_PROTOCOL 2  // Supported protocol
 #define XHCI_XECP_ID_POWER 3     // Extended power management
 #define XHCI_XECP_ID_IOVIRT 4    // I/0 virtualization
 #define XHCI_XECP_ID_MSG 5       // Message interrupt
@@ -153,6 +153,14 @@ struct xhci_ops_config_reg_t
 #define XHCI_XECP_LEGACY_BIOS_OWNED (1 << 16) // 当bios控制着该hc时，该位被置位
 #define XHCI_XECP_LEGACY_OS_OWNED (1 << 24)   // 当系统控制着该hc时，该位被置位
 #define XHCI_XECP_LEGACY_OWNING_MASK (XHCI_XECP_LEGACY_BIOS_OWNED | XHCI_XECP_LEGACY_OS_OWNED)
+
+// 端口信息标志位
+#define XHCI_PROTOCOL_USB2 0
+#define XHCI_PROTOCOL_USB3 1
+#define XHCI_PROTOCOL_INFO (1<<0)    // 1->usb3, 0->usb2
+#define XHCI_PROTOCOL_HSO (1<<1) // 1-> usb2 high speed only
+#define XHCI_PROTOCOL_HAS_PAIR (1<<2) // 当前位被置位，意味着当前端口具有一个与之配对的端口
+#define XHCI_PROTOCOL_ACTIVE (1<<3) // 当前端口是这个配对中，被激活的端口
 
 /**
  * @brief xhci端口信息
@@ -179,7 +187,7 @@ struct xhci_host_controller_t
     uint16_t port_num;                                         // 总的端口数量
     uint8_t port_num_u2;                                       // usb 2.0端口数量
     uint8_t port_num_u3;                                       // usb 3端口数量
-    struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针
+    struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
 };
 
 /**

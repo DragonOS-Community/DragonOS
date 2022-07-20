@@ -46,6 +46,18 @@ static struct xhci_host_controller_t xhci_hc[XHCI_MAX_HOST_CONTROLLERS] = {0};
 #define xhci_get_ptr_op_reg64(id, offset) ((uint64_t *)(xhci_hc[id].vbase_op + offset))
 #define xhci_write_op_reg64(id, offset, value) (*(uint64_t *)(xhci_hc[id].vbase_op + offset) = (uint64_t)value)
 
+/**
+ * @brief 判断端口信息
+ * @param cid 主机控制器id
+ * @param pid 端口id
+ */
+#define XHCI_PORT_IS_USB2(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_INFO) == XHCI_PROTOCOL_USB2)
+#define XHCI_PORT_IS_USB3(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_INFO) == XHCI_PROTOCOL_USB3)
+
+#define XHCI_PORT_IS_USB2_HSO(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_HSO) == XHCI_PROTOCOL_HSO)
+#define XHCI_PORT_HAS_PAIR(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_HAS_PAIR) == XHCI_PROTOCOL_HAS_PAIR)
+#define XHCI_PORT_IS_ACTIVE(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_ACTIVE) == XHCI_PROTOCOL_ACTIVE)
+
 #define FAIL_ON(value, to)        \
     do                            \
     {                             \
@@ -173,6 +185,53 @@ static int xhci_hc_stop_legacy(int id)
 }
 
 /**
+ * @brief
+ *
+ * @return uint32_t
+ */
+
+/**
+ * @brief 在Ex capability list中寻找符合指定的协议号的寄存器offset、count、flag信息
+ *
+ * @param id 主机控制器id
+ * @param list_off 列表项位置距离控制器虚拟基地址的偏移量
+ * @param version 要寻找的端口版本号（2或3）
+ * @param offset 返回的 Compatible Port Offset
+ * @param count 返回的 Compatible Port Count
+ * @param protocol_flag 返回的与协议相关的flag
+ * @return uint32_t 下一个列表项的偏移量
+ */
+static uint32_t xhci_hc_get_protocol_offset(int id, uint32_t list_off, const int version, uint32_t *offset, uint32_t *count, uint16_t *protocol_flag)
+{
+    if (count)
+        *count = 0;
+
+    do
+    {
+        uint32_t dw0 = xhci_read_cap_reg32(id, list_off);
+        uint32_t next_list_off = (dw0 >> 8) & 0xff;
+        next_list_off = next_list_off ? (list_off + (next_list_off << 2)) : 0;
+
+        if ((dw0 & 0xff) == XHCI_XECP_ID_PROTOCOL && ((dw0 & 0xff000000) >> 24) == version)
+        {
+            uint32_t dw2 = xhci_read_cap_reg32(id, list_off + 8);
+
+            if (offset != NULL)
+                *offset = (uint32_t)(dw2 & 0xff);
+            if (count != NULL)
+                *count = (uint32_t)((dw2 & 0xff00) >> 8);
+            if (protocol_flag != NULL)
+                *protocol_flag = (uint16_t)((dw2 >> 16) & 0xffff);
+
+            return next_list_off;
+        }
+
+        list_off = next_list_off;
+    } while (list_off);
+
+    return 0;
+}
+/**
  * @brief 配对xhci主机控制器的usb2、usb3端口
  *
  * @param id 主机控制器id
@@ -192,9 +251,101 @@ static int xhci_hc_pair_ports(int id)
 
     // 从hcs1获取端口数量
     xhci_hc[id].port_num = hcs1.max_ports;
-    kinfo("Found %d ports on xhci root hub.", hcs1.max_ports);
 
     // 找到所有的端口并标记其端口信息
+
+    xhci_hc[id].port_num_u2 = 0;
+    xhci_hc[id].port_num_u3 = 0;
+
+    uint32_t next_off = xhci_hc[id].ext_caps_off;
+    uint32_t offset, cnt;
+    uint16_t protocol_flags;
+
+    // 寻找所有的usb2端口
+    while (next_off)
+    {
+        next_off = xhci_hc_get_protocol_offset(id, next_off, 2, &offset, &cnt, &protocol_flags);
+
+        if (cnt)
+        {
+            for (int i = 0; i < cnt; ++i)
+            {
+                xhci_hc[id].ports[offset + i].offset = ++xhci_hc[id].port_num_u2;
+                xhci_hc[id].ports[offset + i].flags = XHCI_PROTOCOL_USB2;
+
+                // usb2 high speed only
+                if (protocol_flags & 2)
+                    xhci_hc[id].ports[offset + i].flags |= XHCI_PROTOCOL_HSO;
+            }
+        }
+    }
+
+    // 寻找所有的usb3端口
+    next_off = xhci_hc[id].ext_caps_off;
+    while (next_off)
+    {
+        next_off = xhci_hc_get_protocol_offset(id, next_off, 3, &offset, &cnt, &protocol_flags);
+
+        if (cnt)
+        {
+            for (int i = 0; i < cnt; ++i)
+            {
+                xhci_hc[id].ports[offset + i].offset = ++xhci_hc[id].port_num_u3;
+                xhci_hc[id].ports[offset + i].flags = XHCI_PROTOCOL_USB3;
+            }
+        }
+    }
+
+    // 将对应的USB2端口和USB3端口进行配对
+    for (int i = 1; i <= xhci_hc[id].port_num; ++i)
+    {
+        for (int j = i; j <= xhci_hc[id].port_num; ++j)
+        {
+            if (unlikely(i == j))
+                continue;
+
+            if ((xhci_hc[id].ports[i].offset == xhci_hc[id].ports[j].offset) &&
+                ((xhci_hc[id].ports[i].flags & XHCI_PROTOCOL_INFO) != (xhci_hc[id].ports[j].flags & XHCI_PROTOCOL_INFO)))
+            {
+                xhci_hc[id].ports[i].paired_port_num = j;
+                xhci_hc[id].ports[i].flags |= XHCI_PROTOCOL_HAS_PAIR;
+
+                xhci_hc[id].ports[j].paired_port_num = i;
+                xhci_hc[id].ports[j].flags |= XHCI_PROTOCOL_HAS_PAIR;
+            }
+        }
+    }
+
+    // 标记所有的usb3端口为激活状态
+    for (int i = 1; i <= xhci_hc[id].port_num; ++i)
+    {
+        if (XHCI_PORT_IS_USB3(id, i) ||
+            (XHCI_PORT_IS_USB2(id, i) && (!XHCI_PORT_HAS_PAIR(id, i))))
+            xhci_hc[id].ports[i].flags |= XHCI_PROTOCOL_ACTIVE;
+    }
+    kinfo("Found %d ports on root hub, usb2 ports:%d, usb3 ports:%d", xhci_hc[id].port_num, xhci_hc[id].port_num_u2, xhci_hc[id].port_num_u3);
+
+    /*
+    // 打印配对结果
+    for (int i = 1; i <= xhci_hc[id].port_num; ++i)
+    {
+        if (XHCI_PORT_IS_USB3(id, i))
+        {
+            kdebug("USB3 port %d, offset=%d, pair with usb2 port %d, current port is %s", i, xhci_hc[id].ports[i].offset,
+                   xhci_hc[id].ports[i].paired_port_num, XHCI_PORT_IS_ACTIVE(id, i) ? "active" : "inactive");
+        }
+        else if (XHCI_PORT_IS_USB2(id, i) && (!XHCI_PORT_HAS_PAIR(id, i))) // 单独的2.0接口
+        {
+            kdebug("Stand alone USB2 port %d, offset=%d, current port is %s", i, xhci_hc[id].ports[i].offset,
+                   XHCI_PORT_IS_ACTIVE(id, i) ? "active" : "inactive");
+        }
+        else if (XHCI_PORT_IS_USB2(id, i))
+        {
+             kdebug("USB2 port %d, offset=%d, current port is %s, has pair=%s", i, xhci_hc[id].ports[i].offset,
+                   XHCI_PORT_IS_ACTIVE(id, i) ? "active" : "inactive", XHCI_PORT_HAS_PAIR(id, i)?"true":"false");
+        }
+    }
+    */
 
     return 0;
 }
@@ -230,7 +381,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
 
     // 为当前控制器映射寄存器地址空间
     xhci_hc[cid].vbase = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + XHCI_MAPPING_OFFSET + 65536 * xhci_hc[cid].controller_id;
-    kdebug("dev_hdr->BAR0 & (~0xf)=%#018lx", dev_hdr->BAR0 & (~0xf));
+    // kdebug("dev_hdr->BAR0 & (~0xf)=%#018lx", dev_hdr->BAR0 & (~0xf));
     mm_map_phys_addr(xhci_hc[cid].vbase, dev_hdr->BAR0 & (~0xf), 65536, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, true);
 
     // 读取xhci控制寄存器

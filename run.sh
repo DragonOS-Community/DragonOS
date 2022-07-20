@@ -112,7 +112,7 @@ if [ $flag_can_run -eq 1 ]; then
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0    \
         -usb    \
-        -device qemu-xhci,id=xhci 
+        -device qemu-xhci,id=xhci,p2=8,p3=4
 
     fi
 else

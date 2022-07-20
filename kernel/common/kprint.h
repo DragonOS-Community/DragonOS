@@ -35,7 +35,7 @@
         printk("[ DEBUG ] (%s:%d)\t", __FILE__, __LINE__); \
         printk(__VA_ARGS__);                               \
         printk("\n");                                      \
-    } while (0);
+    } while (0)
 
 #define kwarn(...)                                 \
     do                                             \

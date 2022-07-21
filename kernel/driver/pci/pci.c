@@ -577,6 +577,70 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
 }
 
 /**
+ * @brief 禁用指定设备的msi
+ *
+ * @param header pci header
+ * @return int
+ */
+int pci_disable_msi(void *header)
+{
+    struct pci_device_structure_header_t *ptr = (struct pci_device_structure_header_t *)header;
+    uint32_t cap_ptr;
+    uint32_t tmp;
+    uint16_t message_control;
+    uint64_t message_addr;
+    switch (ptr->HeaderType)
+    {
+    case 0x00: // general device
+        if (!(ptr->Status & 0x10))
+            return E_NOT_SUPPORT_MSI;
+        cap_ptr = ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer;
+
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+
+        message_control = (tmp >> 16) & 0xffff;
+
+        if (tmp & 0xff != 0x5)
+            return E_NOT_SUPPORT_MSI;
+
+        // 禁用msi
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+        tmp &= (~(1 << 16));
+        pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr, tmp);
+
+        break;
+
+    case 0x01: // pci to pci bridge
+        if (!(ptr->Status & 0x10))
+            return E_NOT_SUPPORT_MSI;
+        cap_ptr = ((struct pci_device_structure_pci_to_pci_bridge_t *)ptr)->Capability_Pointer;
+
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+
+        message_control = (tmp >> 16) & 0xffff;
+
+        if (tmp & 0xff != 0x5)
+            return E_NOT_SUPPORT_MSI;
+
+        //禁用msi
+        tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
+        tmp &= (~(1 << 16));
+        pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr, tmp);
+
+        break;
+    case 0x02: // pci to card bus bridge
+        return E_NOT_SUPPORT_MSI;
+        break;
+
+    default: // 不应该到达这里
+        return E_WRONG_HEADER_TYPE;
+        break;
+    }
+
+    return 0;
+}
+
+/**
  * @brief 获取 device structure
  *
  * @param class_code
@@ -588,17 +652,16 @@ void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_
 
     struct pci_device_structure_header_t *ptr = container_of(pci_device_structure_list, struct pci_device_structure_header_t, list);
     *count_res = 0;
-    
+
     for (int i = 0; i < count_device_list; ++i)
     {
         if ((ptr->Class_code == class_code) && (ptr->SubClass == sub_class))
         {
-            kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, bar5=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->ProgIF,((struct pci_device_structure_general_device_t *)ptr)->BAR5);
-            
+            kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, bar5=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->ProgIF, ((struct pci_device_structure_general_device_t *)ptr)->BAR5);
+
             res[*count_res] = ptr;
             ++(*count_res);
         }
         ptr = container_of(list_next(&(ptr->list)), struct pci_device_structure_header_t, list);
     }
-    
 }

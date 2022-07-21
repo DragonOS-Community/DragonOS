@@ -219,6 +219,14 @@ void pci_checkAllBuses();
 int pci_enable_msi(void * header, uint8_t vector, uint32_t processor, uint8_t edge_trigger, uint8_t assert);
 
 /**
+ * @brief 禁用指定设备的msi
+ *
+ * @param header pci header
+ * @return int
+ */
+int pci_disable_msi(void *header);
+
+/**
  * @brief 获取 device structure
  * 
  * @param class_code 

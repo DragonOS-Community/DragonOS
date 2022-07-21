@@ -491,7 +491,7 @@ static uint64_t xhci_create_ring(int trbs)
     memset((void *)vaddr, 0, total_size);
 
     // 设置最后一个trb为link trb
-    xhci_TRB_set_link_cmd(vaddr + total_size - sizeof(sizeof(struct xhci_TRB_t)));
+    xhci_TRB_set_link_cmd(vaddr + total_size - sizeof(struct xhci_TRB_t));
 
     return vaddr;
 }

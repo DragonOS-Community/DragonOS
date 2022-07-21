@@ -191,7 +191,7 @@ int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter
     irq_desc_t *p = NULL;
     if (irq_num >= 32 && irq_num < 0x80)
         p = &interrupt_desc[irq_num - 32];
-    else if (irq_num >= 150 && irq_num < 160)
+    else if (irq_num >= 150 && irq_num < 200)
         p = &local_apic_interrupt_desc[irq_num - 150];
     else
     {

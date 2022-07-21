@@ -488,7 +488,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
                 irq->handler(number, irq->parameter, rsp);
         }
     }
-    else if (number >= 150 && number < 160)
+    else if (number >= 150 && number < 200)
     {
         irq_desc_t *irq = &local_apic_interrupt_desc[number - 150];
 

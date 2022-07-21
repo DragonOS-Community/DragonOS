@@ -15,8 +15,10 @@
 
 #include <process/ptrace.h>
 
+#define IRQ_NUM 24
 #define SMP_IRQ_NUM 10
-#define LOCAL_APIC_IRQ_NUM 10
+#define LOCAL_APIC_IRQ_NUM 50
+
 extern void (*interrupt_table[24])(void);
 extern void do_IRQ(struct pt_regs *regs, ul number);
 
@@ -84,7 +86,7 @@ extern void (*local_apic_interrupt_table[LOCAL_APIC_IRQ_NUM])(void);
 0x80		system call
 0x81		system interrupt 系统中断
 
-150 ~   200	Local APIC
+[150,200)	Local APIC
 	150	CMCI
 	151	Timer
 	152	Thermal Monitor
@@ -127,10 +129,10 @@ typedef struct
     ul flags;
 } irq_desc_t;
 
-#define IRQ_NUM 24
-// 这两个表一定要放在这里，否则在HPET初始化后收到中断，会产生page fault
+
+// 这几个表一定要放在这里，否则在HPET初始化后收到中断，会产生page fault
 irq_desc_t interrupt_desc[IRQ_NUM] = {0};
-irq_desc_t local_apic_interrupt_desc[20] = {0};
+irq_desc_t local_apic_interrupt_desc[LOCAL_APIC_IRQ_NUM] = {0};
 irq_desc_t SMP_IPI_desc[SMP_IRQ_NUM] = {0};
 
 

@@ -94,6 +94,10 @@ extern void (*local_apic_interrupt_table[LOCAL_APIC_IRQ_NUM])(void);
 	154	LINT0
 	155	LINT1
 	156	Error
+	157 xhci_controller_0
+	158 xhci_controller_1
+	159 xhci_controller_2
+	160 xhci_controller_3
 
 200 ~   255	MP IPI
 

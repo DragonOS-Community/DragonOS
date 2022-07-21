@@ -230,7 +230,8 @@ int irq_unregister(ul irq_num)
     p->controller->uninstall(irq_num);
 
     p->controller = NULL;
-    kfree(p->irq_name);
+    if (p->irq_name)
+        kfree(p->irq_name);
     p->irq_name = NULL;
     p->parameter = NULL;
     p->flags = 0;

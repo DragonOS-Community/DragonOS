@@ -227,6 +227,14 @@ int pci_enable_msi(void * header, uint8_t vector, uint32_t processor, uint8_t ed
 int pci_disable_msi(void *header);
 
 /**
+ * @brief 在已配置好msi寄存器的设备上，使能msi
+ *
+ * @param header 设备头部
+ * @return int 返回码
+ */
+int pci_start_msi(void *header);
+
+/**
  * @brief 获取 device structure
  * 
  * @param class_code 

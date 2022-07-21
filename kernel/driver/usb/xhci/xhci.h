@@ -323,7 +323,7 @@ struct xhci_intr_moderation_t
 } __attribute__((packed));
 // ======== Runtime Register Set END =========
 
-// ======= xhci Extended Capabilities List ========
+// ======= xhci Extended Capabilities List BEGIN========
 
 // ID 部分的含义定义
 #define XHCI_XECP_ID_RESERVED 0
@@ -340,6 +340,18 @@ struct xhci_intr_moderation_t
 #define XHCI_XECP_LEGACY_BIOS_OWNED (1 << 16) // 当bios控制着该hc时，该位被置位
 #define XHCI_XECP_LEGACY_OS_OWNED (1 << 24)   // 当系统控制着该hc时，该位被置位
 #define XHCI_XECP_LEGACY_OWNING_MASK (XHCI_XECP_LEGACY_BIOS_OWNED | XHCI_XECP_LEGACY_OS_OWNED)
+
+// ======= xhci Extended Capabilities List END ========
+
+// ======= Port status and control registers BEGIN ====
+#define XHCI_PORT_PORTSC 0x00    // Port status and control
+#define XHCI_PORT_PORTPMSC 0x04  // Port power management status and control
+#define XHCI_PORT_PORTLI 0x08    // Port Link info
+#define XHCI_PORT_PORTHLMPC 0x0c // Port hardware LPM control (version 1.10 only
+
+#define XHCI_PORTUSB_CHANGE_BITS ((1 << 17) | (1 << 18) | (1 << 20) | (1 << 21) | (1 << 22))
+
+// ======= Port status and control registers END ====
 
 // 端口信息标志位
 #define XHCI_PROTOCOL_USB2 0
@@ -374,7 +386,7 @@ struct xhci_host_controller_t
     uint16_t port_num;                                         // 总的端口数量
     uint8_t port_num_u2;                                       // usb 2.0端口数量
     uint8_t port_num_u3;                                       // usb 3端口数量
-    uint8_t page_size;                                         // page size
+    uint32_t page_size;                                        // page size
     uint64_t dcbaap_vaddr;                                     // Device Context Base Address Array Pointer的虚拟地址
     uint64_t cmd_ring_vaddr;                                   // command ring的虚拟地址
     uint64_t event_ring_vaddr;                                 // event ring的虚拟地址

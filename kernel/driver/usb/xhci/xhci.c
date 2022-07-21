@@ -20,6 +20,20 @@ void xhci_hc_irq_disable(uint64_t irq_num);
 uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg);
 void xhci_hc_irq_uninstall(uint64_t irq_num);
 
+static int xhci_hc_find_available_id();
+static int xhci_hc_stop(int id);
+static int xhci_hc_reset(int id);
+static int xhci_hc_stop_legacy(int id);
+static int xhci_hc_start_sched(int id);
+static int xhci_hc_stop_sched(int id);
+static uint32_t xhci_hc_get_protocol_offset(int id, uint32_t list_off, const int version, uint32_t *offset, uint32_t *count, uint16_t *protocol_flag);
+static int xhci_hc_pair_ports(int id);
+static uint64_t xhci_create_ring(int trbs);
+static uint64_t xhci_create_event_ring(int trbs, uint64_t *ret_ring_addr);
+void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs);
+static int xhci_hc_init_intr(int id);
+static int xhci_hc_start_ports(int id);
+
 hardware_intr_controller xhci_hc_intr_controller =
     {
         .enable = xhci_hc_irq_enable,
@@ -210,9 +224,11 @@ static int xhci_hc_stop(int id)
 static int xhci_hc_reset(int id)
 {
     int retval = 0;
+    kdebug("usbsts=%#010lx", xhci_read_op_reg32(id, XHCI_OPS_USBSTS));
     // 判断HCHalted是否置位
     if ((xhci_read_op_reg32(id, XHCI_OPS_USBSTS) & (1 << 0)) == 0)
     {
+        kdebug("stopping usb hc...");
         // 未置位，需要先尝试停止usb主机控制器
         retval = xhci_hc_stop(id);
         if (unlikely(retval))
@@ -220,8 +236,11 @@ static int xhci_hc_reset(int id)
     }
     int timeout = 500; // wait 500ms
     // reset
-    xhci_write_op_reg32(id, XHCI_OPS_USBCMD, (1 << 1));
-
+    uint32_t cmd = xhci_read_op_reg32(id, XHCI_OPS_USBCMD);
+    kdebug("cmd=%#010lx", cmd);
+    cmd |= (1 << 1);
+    xhci_write_op_reg32(id, XHCI_OPS_USBCMD, cmd);
+    kdebug("after rst, sts=%#010lx", xhci_read_op_reg32(id, XHCI_OPS_USBSTS));
     while (xhci_read_op_reg32(id, XHCI_OPS_USBCMD) & (1 << 1))
     {
         usleep(1000);
@@ -285,6 +304,7 @@ static int xhci_hc_stop_legacy(int id)
 static int xhci_hc_start_sched(int id)
 {
     xhci_write_op_reg32(id, XHCI_OPS_USBCMD, (1 << 0) | (1 >> 2) | (1 << 3));
+    usleep(100 * 1000);
 }
 
 /**
@@ -331,11 +351,11 @@ static uint32_t xhci_hc_get_protocol_offset(int id, uint32_t list_off, const int
             uint32_t dw2 = xhci_read_cap_reg32(id, list_off + 8);
 
             if (offset != NULL)
-                *offset = (uint32_t)(dw2 & 0xff);
+                *offset = (uint32_t)(dw2 & 0xff) - 1; // 使其转换为zero based
             if (count != NULL)
                 *count = (uint32_t)((dw2 & 0xff00) >> 8);
             if (protocol_flag != NULL)
-                *protocol_flag = (uint16_t)((dw2 >> 16) & 0xffff);
+                *protocol_flag = (uint16_t)((dw2 >> 16) & 0x0fff);
 
             return next_list_off;
         }
@@ -378,7 +398,7 @@ static int xhci_hc_pair_ports(int id)
         {
             for (int i = 0; i < cnt; ++i)
             {
-                xhci_hc[id].ports[offset + i].offset = ++xhci_hc[id].port_num_u2;
+                xhci_hc[id].ports[offset + i].offset = xhci_hc[id].port_num_u2++;
                 xhci_hc[id].ports[offset + i].flags = XHCI_PROTOCOL_USB2;
 
                 // usb2 high speed only
@@ -398,16 +418,16 @@ static int xhci_hc_pair_ports(int id)
         {
             for (int i = 0; i < cnt; ++i)
             {
-                xhci_hc[id].ports[offset + i].offset = ++xhci_hc[id].port_num_u3;
+                xhci_hc[id].ports[offset + i].offset = xhci_hc[id].port_num_u3++;
                 xhci_hc[id].ports[offset + i].flags = XHCI_PROTOCOL_USB3;
             }
         }
     }
 
     // 将对应的USB2端口和USB3端口进行配对
-    for (int i = 1; i <= xhci_hc[id].port_num; ++i)
+    for (int i = 0; i < xhci_hc[id].port_num; ++i)
     {
-        for (int j = i; j <= xhci_hc[id].port_num; ++j)
+        for (int j = 0; j < xhci_hc[id].port_num; ++j)
         {
             if (unlikely(i == j))
                 continue;
@@ -424,8 +444,8 @@ static int xhci_hc_pair_ports(int id)
         }
     }
 
-    // 标记所有的usb3端口为激活状态
-    for (int i = 1; i <= xhci_hc[id].port_num; ++i)
+    // 标记所有的usb3、单独的usb2端口为激活状态
+    for (int i = 0; i < xhci_hc[id].port_num; ++i)
     {
         if (XHCI_PORT_IS_USB3(id, i) ||
             (XHCI_PORT_IS_USB2(id, i) && (!XHCI_PORT_HAS_PAIR(id, i))))
@@ -449,8 +469,8 @@ static int xhci_hc_pair_ports(int id)
         }
         else if (XHCI_PORT_IS_USB2(id, i))
         {
-             kdebug("USB2 port %d, offset=%d, current port is %s, has pair=%s", i, xhci_hc[id].ports[i].offset,
-                   XHCI_PORT_IS_ACTIVE(id, i) ? "active" : "inactive", XHCI_PORT_HAS_PAIR(id, i)?"true":"false");
+            kdebug("USB2 port %d, offset=%d, current port is %s, has pair=%s", i, xhci_hc[id].ports[i].offset,
+                   XHCI_PORT_IS_ACTIVE(id, i) ? "active" : "inactive", XHCI_PORT_HAS_PAIR(id, i) ? "true" : "false");
         }
     }
     */
@@ -511,9 +531,13 @@ void xhci_hc_irq_enable(uint64_t irq_num)
     int cid = xhci_find_hcid_by_irq_num(irq_num);
     if (WARN_ON(cid == -1))
         return;
+    kdebug("start msi");
     pci_start_msi(xhci_hc[cid].pci_dev_hdr);
-
+    kdebug("start sched");
     xhci_hc_start_sched(cid);
+    kdebug("start ports");
+    xhci_hc_start_ports(cid);
+    kdebug("enabled");
 }
 
 void xhci_hc_irq_disable(uint64_t irq_num)
@@ -535,6 +559,7 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     struct xhci_hc_irq_install_info_t *info = (struct xhci_hc_irq_install_info_t *)arg;
 
     pci_enable_msi(xhci_hc[cid].pci_dev_hdr, irq_num, info->processor, info->edge_trigger, info->assert);
+    kdebug("xhci irq %d installed.", irq_num);
     return 0;
 }
 
@@ -557,6 +582,136 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
 {
     // todo: handle irq
     kdebug("USB irq received.");
+}
+
+/**
+ * @brief 重置端口
+ *
+ * @param id 控制器id
+ * @param port 端口id
+ * @return int
+ */
+static int xhci_reset_port(const int id, const int port)
+{
+    int retval = 0;
+    // 相对于op寄存器基地址的偏移量
+    uint64_t port_status_offset = XHCI_OPS_PRS + port * 16;
+    kdebug("to reset %d, offset=%#018lx", port, port_status_offset);
+    // 检查端口电源状态
+    if ((xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC) & (1 << 9)) == 0)
+    {
+        kdebug("port is power off, starting...");
+        xhci_write_cap_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9));
+        usleep(2000);
+        // 检测端口是否被启用, 若未启用，则报错
+        if ((xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC) & (1 << 9)) == 0)
+        {
+            kdebug("cannot power on %d", port);
+            return -EAGAIN;
+        }
+    }
+    kdebug("port:%d, power check ok", port);
+
+    // 确保端口的status被清0
+    xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | XHCI_PORTUSB_CHANGE_BITS);
+
+    // 重置当前端口
+    if (XHCI_PORT_IS_USB3(id, port))
+        xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | (1 << 31));
+    else
+        xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | (1 << 4));
+
+    retval = -ETIMEDOUT;
+    kdebug("val = %#010lx", xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC));
+    // 等待portsc的port reset change位被置位，说明reset完成
+    int timeout = 200;
+    while (timeout)
+    {
+        uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
+        // if (timeout % 100)
+        //     kdebug("val = %#010lx", val);
+        if (val & (1 << 21))
+            break;
+        --timeout;
+        usleep(500);
+    }
+    kdebug("timeout= %d", timeout);
+
+    if (timeout > 0)
+    {
+        // 等待恢复
+        usleep(USB_TIME_RST_REC * 1000);
+        uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
+
+        // 如果reset之后，enable bit仍然是1，那么说明reset成功
+        if (val & (1 << 1))
+        {
+            // 清除status change bit
+            xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | XHCI_PORTUSB_CHANGE_BITS);
+        }
+        retval = 0;
+    }
+
+    // 如果usb2端口成功reset，则处理该端口的active状态
+    if (retval == 0 && XHCI_PORT_IS_USB2(id, port))
+    {
+        xhci_hc[id].ports[port].flags |= XHCI_PROTOCOL_ACTIVE;
+        if (XHCI_PORT_HAS_PAIR(id, port)) // 如果有对应的usb3端口，则将usb3端口设置为未激活
+            xhci_hc[id].ports[xhci_hc[id].ports[port].paired_port_num].flags &= ~(XHCI_PROTOCOL_ACTIVE);
+    }
+
+    // 如果usb3端口reset失败，则启用与之配对的usb2端口
+    if (retval != 0 && XHCI_PORT_IS_USB3(id, port))
+    {
+        xhci_hc[id].ports[port].flags &= ~XHCI_PROTOCOL_ACTIVE;
+        xhci_hc[id].ports[xhci_hc[id].ports[port].paired_port_num].flags |= XHCI_PROTOCOL_ACTIVE;
+    }
+
+    return retval;
+}
+
+/**
+ * @brief 启用xhci控制器的端口
+ *
+ * @param id 控制器id
+ * @return int
+ */
+static int xhci_hc_start_ports(int id)
+{
+    int cnt = 0;
+    // 注意，这两个循环应该不能合并到一起，因为可能存在usb2端口offset在前，usb3端口在后的情况，那样的话就会出错
+
+    // 循环启动所有的usb3端口
+    for (int i = 0; i < xhci_hc[id].port_num; ++i)
+    {
+        if (XHCI_PORT_IS_USB3(id, i) && XHCI_PORT_IS_ACTIVE(id, i))
+        {
+            // reset该端口
+            if (likely(xhci_reset_port(id, i) == 0)) // 如果端口reset成功，就获取它的描述符
+                                                     // 否则，reset函数会把它给设置为未激活，并且标志配对的usb2端口是激活的
+            {
+                // xhci_hc_get_descriptor(id, i);
+                ++cnt;
+            }
+        }
+    }
+    kdebug("active usb3 ports:%d", cnt);
+
+    // 循环启动所有的usb2端口
+    for (int i = 0; i < xhci_hc[id].port_num; ++i)
+    {
+        if (XHCI_PORT_IS_USB2(id, i) && XHCI_PORT_IS_ACTIVE(id, i))
+        {
+            // reset该端口
+            if (likely(xhci_reset_port(id, i) == 0)) // 如果端口reset成功，就获取它的描述符
+                                                     // 否则，reset函数会把它给设置为未激活，并且标志配对的usb2端口是激活的
+            {
+                // xhci_hc_get_descriptor(id, i);
+                ++cnt;
+            }
+        }
+    }
+    kinfo("xHCI controller %d: Started %d ports.", id, cnt);
 }
 
 /**
@@ -594,18 +749,12 @@ static int xhci_hc_init_intr(int id)
     xhci_write_intr_reg64(id, 0, XHCI_IR_TABLE_ADDR, virt_2_phys(xhci_hc[id].event_ring_table_vaddr));   // 写入table地址
 
     // 清除状态位
-    struct xhci_ops_usbsts_reg_t sts = {0};
-    sts.hse = 1;
-    sts.eint = 1;
-    sts.pcd = 1;
-    sts.sre = 1;
-    kdebug("new_sts=%#010lx", *(uint32_t *)(&sts));
-    xhci_write_op_reg32(id, XHCI_OPS_USBSTS, *(uint32_t *)(&sts));
+    xhci_write_op_reg32(id, XHCI_OPS_USBSTS, (1 << 10) | (1 << 4) | (1 << 3) | (1 << 2));
 
     // 开启usb中断
     // 注册中断处理程序
     struct xhci_hc_irq_install_info_t install_info;
-    install_info.assert = 0;
+    install_info.assert = 1;
     install_info.edge_trigger = 1;
     install_info.processor = 0; // 投递到bsp
 
@@ -614,7 +763,7 @@ static int xhci_hc_init_intr(int id)
     sprintk(buf, "xHCI HC%d", id);
     irq_register(xhci_controller_irq_num[id], &install_info, &xhci_hc_irq_handler, id, &xhci_hc_intr_controller, buf);
     kfree(buf);
-    
+
     kdebug("xhci host controller %d: interrupt registered. irq num=%d", id, xhci_controller_irq_num[id]);
 
     return 0;
@@ -674,7 +823,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     xhci_hc[cid].db_offset = xhci_read_cap_reg32(cid, XHCI_CAPS_DBOFF) & (~0x3);    // bits [1:0] reserved
     xhci_hc[cid].rts_offset = xhci_read_cap_reg32(cid, XHCI_CAPS_RTSOFF) & (~0x1f); // bits [4:0] reserved.
 
-    xhci_hc[cid].ext_caps_off = (hcc1.xECP) * 4;
+    xhci_hc[cid].ext_caps_off = 1UL * (hcc1.xECP) * 4;
     xhci_hc[cid].context_size = (hcc1.csz) ? 64 : 32;
 
     if (iversion < 0x95)
@@ -692,15 +841,17 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
         pci_write_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0xd0, 0xffffffff);
     }
 
-    // 重置xhci控制器
-    FAIL_ON(xhci_hc_reset(cid), failed);
     // 关闭legacy支持
     FAIL_ON(xhci_hc_stop_legacy(cid), failed);
+
+    // 重置xhci控制器
+    FAIL_ON(xhci_hc_reset(cid), failed);
     // 端口配对
     FAIL_ON(xhci_hc_pair_ports(cid), failed);
 
     // ========== 设置USB host controller =========
     // 获取页面大小
+    kdebug("ops pgsize=%#010lx", xhci_read_op_reg32(cid, XHCI_OPS_PAGESIZE));
     xhci_hc[cid].page_size = (xhci_read_op_reg32(cid, XHCI_OPS_PAGESIZE) & 0xffff) << 12;
     kdebug("page size=%d", xhci_hc[cid].page_size);
 
@@ -715,7 +866,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
         goto failed_free_dyn;
     }
     // 写入dcbaap
-    xhci_write_cap_reg64(cid, XHCI_OPS_DCBAAP, virt_2_phys(xhci_hc[cid].dcbaap_vaddr));
+    xhci_write_op_reg64(cid, XHCI_OPS_DCBAAP, virt_2_phys(xhci_hc[cid].dcbaap_vaddr));
 
     // 创建command ring
     xhci_hc[cid].cmd_ring_vaddr = xhci_create_ring(XHCI_CMND_RING_TRBS);
@@ -731,7 +882,9 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     // 写入command ring控制寄存器
     xhci_write_op_reg64(cid, XHCI_OPS_CRCR, virt_2_phys(xhci_hc[cid].cmd_ring_vaddr) | xhci_hc[cid].cmd_trb_cycle);
     // 写入配置寄存器
-    xhci_write_op_reg32(cid, XHCI_OPS_CONFIG, hcs1.max_slots);
+    uint32_t max_slots = hcs1.max_slots;
+    kdebug("max slots = %d", max_slots);
+    xhci_write_op_reg32(cid, XHCI_OPS_CONFIG, max_slots);
     // 写入设备通知控制寄存器
     xhci_write_op_reg32(cid, XHCI_OPS_DNCTRL, (1 << 1)); // 目前只有N1被支持
 

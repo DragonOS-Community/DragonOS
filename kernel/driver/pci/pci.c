@@ -36,7 +36,7 @@ static void pci_checkBus(uint8_t bus);
  * @brief 生成架构相关的message data
  *
  */
-#define pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert) ((uint32_t)((vector & 0xff) | (edge_trigger == 1 ? 0 : (1 << 15)) | (assert == 0 ? 0 : (1 << 14))))
+#define pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert) ((uint32_t)((vector & 0xff) | (edge_trigger == 1 ? 0 : (1 << 15)) | ((assert == 0) ? 0 : (1 << 14))))
 
 /**
  * @brief 从pci配置空间读取信息

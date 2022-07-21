@@ -557,8 +557,9 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
         return -EINVAL;
 
     struct xhci_hc_irq_install_info_t *info = (struct xhci_hc_irq_install_info_t *)arg;
-
-    pci_enable_msi(xhci_hc[cid].pci_dev_hdr, irq_num, info->processor, info->edge_trigger, info->assert);
+    // todo: QEMU是使用msix的，因此要先在pci中实现msix
+    int retval = pci_enable_msi(xhci_hc[cid].pci_dev_hdr, irq_num, info->processor, info->edge_trigger, info->assert);
+    kdebug("pci retval = %d", retval);
     kdebug("xhci irq %d installed.", irq_num);
     return 0;
 }
@@ -596,7 +597,7 @@ static int xhci_reset_port(const int id, const int port)
     int retval = 0;
     // 相对于op寄存器基地址的偏移量
     uint64_t port_status_offset = XHCI_OPS_PRS + port * 16;
-    kdebug("to reset %d, offset=%#018lx", port, port_status_offset);
+    // kdebug("to reset %d, offset=%#018lx", port, port_status_offset);
     // 检查端口电源状态
     if ((xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC) & (1 << 9)) == 0)
     {
@@ -610,7 +611,7 @@ static int xhci_reset_port(const int id, const int port)
             return -EAGAIN;
         }
     }
-    kdebug("port:%d, power check ok", port);
+    // kdebug("port:%d, power check ok", port);
 
     // 确保端口的status被清0
     xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | XHCI_PORTUSB_CHANGE_BITS);
@@ -622,20 +623,23 @@ static int xhci_reset_port(const int id, const int port)
         xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | (1 << 4));
 
     retval = -ETIMEDOUT;
-    kdebug("val = %#010lx", xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC));
+
     // 等待portsc的port reset change位被置位，说明reset完成
     int timeout = 200;
     while (timeout)
     {
         uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
-        // if (timeout % 100)
-        //     kdebug("val = %#010lx", val);
-        if (val & (1 << 21))
+        if (XHCI_PORT_IS_USB3(id, port) && (val & (1 << 31)) == 0)
             break;
+        else if (XHCI_PORT_IS_USB2(id, port) && (val & (1 << 4)) == 0)
+            break;
+        else if (val & (1 << 21))
+            break;
+        
         --timeout;
         usleep(500);
     }
-    kdebug("timeout= %d", timeout);
+    // kdebug("timeout= %d", timeout);
 
     if (timeout > 0)
     {

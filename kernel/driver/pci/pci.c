@@ -501,11 +501,11 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
     {
     case 0x00: // general device
         if (!(ptr->Status & 0x10))
-            return E_NOT_SUPPORT_MSI;
+            return E_NOT_SUPPORT_MSI;    
+        
         cap_ptr = ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer;
 
         tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
-
         message_control = (tmp >> 16) & 0xffff;
 
         if (tmp & 0xff != 0x5)

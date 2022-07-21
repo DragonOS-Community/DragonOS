@@ -5,6 +5,35 @@
 #define XHCI_MAX_HOST_CONTROLLERS 4 // 本驱动程序最大支持4个xhci root hub controller
 #define XHCI_MAX_ROOT_HUB_PORTS 128 // 本驱动程序最大支持127个root hub 端口（第0个保留）
 
+// ========== irq BEGIN ===========
+/**
+ * @brief 每个xhci控制器的中断向量号
+ *
+ */
+const uint8_t xhci_controller_irq_num[XHCI_MAX_HOST_CONTROLLERS] = {157, 158, 159, 160};
+
+/**
+ * @brief 通过irq号寻找对应的主机控制器id
+ *
+ */
+#define xhci_find_hcid_by_irq_num(irq_num) ({           \
+    int retval = -1;                                    \
+    for (int i = 0; i < XHCI_MAX_HOST_CONTROLLERS; ++i) \
+        if (xhci_controller_irq_num[i] == irq_num)      \
+            retval = i;                                 \
+    retval;                                             \
+})
+
+struct xhci_hc_irq_install_info_t
+{
+    int processor;       // 中断目标处理器
+    int8_t edge_trigger; // 是否边缘触发
+    int8_t assert;       // 是否高电平触发
+};
+// ========== irq END ===========
+
+// ======== Capability Register Set BEGIN ============
+
 // xhci Capability Registers offset
 #define XHCI_CAPS_CAPLENGTH 0x00 // Cap 寄存器组的长度
 #define XHCI_CAPS_RESERVED 0x01
@@ -28,7 +57,7 @@ struct xhci_caps_HCSPARAMS1_reg_t
 struct xhci_caps_HCSPARAMS2_reg_t
 {
     unsigned ist : 4;      // 同步调度阈值
-    unsigned ERST_Max : 4; // Event Ring Segment Table Max
+    unsigned ERST_Max : 4; // Event Ring Segment Table: Max segs
     unsigned Reserved : 13;
     unsigned max_scratchpad_buf_HI5 : 5; // 草稿行buffer地址（高5bit）
     unsigned spr : 1;                    // scratchpad restore
@@ -73,6 +102,9 @@ struct xhci_caps_HCCPARAMS2_reg_t
     unsigned cic : 1; // configuration information capability
     unsigned Reserved : 26;
 } __attribute__((packed));
+// ======== Capability Register Set END ============
+
+// ======== Operational Register Set BEGIN =========
 
 // xhci operational registers offset
 #define XHCI_OPS_USBCMD 0x00   // USB Command
@@ -137,30 +169,8 @@ struct xhci_ops_config_reg_t
     unsigned rsvd_psvd : 22; // Reserved and Preserved
 } __attribute__((packed));
 
-// xhci Extended Capabilities List ID
-// ID 部分的含义定义
-#define XHCI_XECP_ID_RESERVED 0
-#define XHCI_XECP_ID_LEGACY 1    // USB Legacy Support
-#define XHCI_XECP_ID_PROTOCOL 2  // Supported protocol
-#define XHCI_XECP_ID_POWER 3     // Extended power management
-#define XHCI_XECP_ID_IOVIRT 4    // I/0 virtualization
-#define XHCI_XECP_ID_MSG 5       // Message interrupt
-#define XHCI_XECP_ID_LOCAL_MEM 6 // local memory
-#define XHCI_XECP_ID_DEBUG 10    // USB Debug capability
-#define XHCI_XECP_ID_EXTMSG 17   // Extended message interrupt
-
-#define XHCI_XECP_LEGACY_TIMEOUT 10           // 设置legacy状态的等待时间
-#define XHCI_XECP_LEGACY_BIOS_OWNED (1 << 16) // 当bios控制着该hc时，该位被置位
-#define XHCI_XECP_LEGACY_OS_OWNED (1 << 24)   // 当系统控制着该hc时，该位被置位
-#define XHCI_XECP_LEGACY_OWNING_MASK (XHCI_XECP_LEGACY_BIOS_OWNED | XHCI_XECP_LEGACY_OS_OWNED)
-
-// 端口信息标志位
-#define XHCI_PROTOCOL_USB2 0
-#define XHCI_PROTOCOL_USB3 1
-#define XHCI_PROTOCOL_INFO (1 << 0)     // 1->usb3, 0->usb2
-#define XHCI_PROTOCOL_HSO (1 << 1)      // 1-> usb2 high speed only
-#define XHCI_PROTOCOL_HAS_PAIR (1 << 2) // 当前位被置位，意味着当前端口具有一个与之配对的端口
-#define XHCI_PROTOCOL_ACTIVE (1 << 3)   // 当前端口是这个配对中，被激活的端口
+// ======== Operational Register Set END =========
+// ========= TRB begin ===========
 
 // TRB的Transfer Type可用值定义
 #define XHCI_TRB_TRT_NO_DATA 0
@@ -171,6 +181,9 @@ struct xhci_ops_config_reg_t
 #define XHCI_CMND_RING_TRBS 128 // TRB num of command ring,  not more than 4096
 
 #define XHCI_TRBS_PER_RING 256
+
+#define XHCI_TRB_CYCLE_OFF 0
+#define XHCI_TRB_CYCLE_ON 1
 
 /**
  * @brief xhci通用TRB结构
@@ -285,6 +298,56 @@ struct xhci_TRB_cmd_complete_t
     uint8_t slot_id; // the id of the slot associated with the
                      // command that generated the event
 } __attribute__((packed));
+// ========= TRB end ===========
+
+// ======== Runtime Register Set Begin =========
+
+#define XHCI_RT_IR0 0x20 // 中断寄存器组0距离runtime Register set起始位置的偏移量
+#define XHCI_IR_SIZE 32  // 中断寄存器组大小
+
+// 中断寄存器组内的偏移量
+#define XHCI_IR_MAN 0x00        // Interrupter Management Register
+#define XHCI_IR_MOD 0x04        // Interrupter Moderation
+#define XHCI_IR_TABLE_SIZE 0x08 // Event Ring Segment Table size (count of segments)
+#define XHCI_IR_TABLE_ADDR 0x10 // Event Ring Segment Table Base Address
+#define XHCI_IR_DEQUEUE 0x18    // Event Ring Dequeue Pointer
+
+// MAN寄存器内的bit的含义
+#define XHCI_IR_IMR_PENDING (1 << 0) // Interrupt pending bit in Management Register
+#define XHCI_IR_IMR_ENABLE (1 << 1)  // Interrupt enable bit in Management Register
+
+struct xhci_intr_moderation_t
+{
+    uint16_t interval; // 产生一个中断的时间，是interval*250ns (wait before next interrupt)
+    uint16_t counter;
+} __attribute__((packed));
+// ======== Runtime Register Set END =========
+
+// ======= xhci Extended Capabilities List ========
+
+// ID 部分的含义定义
+#define XHCI_XECP_ID_RESERVED 0
+#define XHCI_XECP_ID_LEGACY 1    // USB Legacy Support
+#define XHCI_XECP_ID_PROTOCOL 2  // Supported protocol
+#define XHCI_XECP_ID_POWER 3     // Extended power management
+#define XHCI_XECP_ID_IOVIRT 4    // I/0 virtualization
+#define XHCI_XECP_ID_MSG 5       // Message interrupt
+#define XHCI_XECP_ID_LOCAL_MEM 6 // local memory
+#define XHCI_XECP_ID_DEBUG 10    // USB Debug capability
+#define XHCI_XECP_ID_EXTMSG 17   // Extended message interrupt
+
+#define XHCI_XECP_LEGACY_TIMEOUT 10           // 设置legacy状态的等待时间
+#define XHCI_XECP_LEGACY_BIOS_OWNED (1 << 16) // 当bios控制着该hc时，该位被置位
+#define XHCI_XECP_LEGACY_OS_OWNED (1 << 24)   // 当系统控制着该hc时，该位被置位
+#define XHCI_XECP_LEGACY_OWNING_MASK (XHCI_XECP_LEGACY_BIOS_OWNED | XHCI_XECP_LEGACY_OS_OWNED)
+
+// 端口信息标志位
+#define XHCI_PROTOCOL_USB2 0
+#define XHCI_PROTOCOL_USB3 1
+#define XHCI_PROTOCOL_INFO (1 << 0)     // 1->usb3, 0->usb2
+#define XHCI_PROTOCOL_HSO (1 << 1)      // 1-> usb2 high speed only
+#define XHCI_PROTOCOL_HAS_PAIR (1 << 2) // 当前位被置位，意味着当前端口具有一个与之配对的端口
+#define XHCI_PROTOCOL_ACTIVE (1 << 3)   // 当前端口是这个配对中，被激活的端口
 
 /**
  * @brief xhci端口信息
@@ -314,6 +377,10 @@ struct xhci_host_controller_t
     uint8_t page_size;                                         // page size
     uint64_t dcbaap_vaddr;                                     // Device Context Base Address Array Pointer的虚拟地址
     uint64_t cmd_ring_vaddr;                                   // command ring的虚拟地址
+    uint64_t event_ring_vaddr;                                 // event ring的虚拟地址
+    uint64_t event_ring_table_vaddr;                           // event ring table的虚拟地址
+    uint8_t cmd_trb_cycle;                                     // 当前command ring cycle
+    uint8_t current_event_ring_cycle;                          // 当前event ring cycle
     struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
 };
 

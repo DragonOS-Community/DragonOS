@@ -6,12 +6,28 @@
 #include <mm/slab.h>
 #include <debug/traceback/traceback.h>
 #include <common/time.h>
+#include <exception/irq.h>
+#include <driver/interrupt/apic/apic.h>
 
 spinlock_t xhci_controller_init_lock; // xhci控制器初始化锁(在usb_init中被初始化)
 
 static int xhci_ctrl_count = 0; // xhci控制器计数
 
 static struct xhci_host_controller_t xhci_hc[XHCI_MAX_HOST_CONTROLLERS] = {0};
+
+void xhci_hc_irq_enable(uint64_t irq_num);
+void xhci_hc_irq_disable(uint64_t irq_num);
+uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg);
+void xhci_hc_irq_uninstall(uint64_t irq_num);
+
+hardware_intr_controller xhci_hc_intr_controller =
+    {
+        .enable = xhci_hc_irq_enable,
+        .disable = xhci_hc_irq_disable,
+        .install = xhci_hc_irq_install,
+        .uninstall = xhci_hc_irq_uninstall,
+        .ack = apic_local_apic_edge_ack,
+};
 
 /*
     注意！！！
@@ -46,6 +62,23 @@ static struct xhci_host_controller_t xhci_hc[XHCI_MAX_HOST_CONTROLLERS] = {0};
 #define xhci_read_op_reg64(id, offset) (*(uint64_t *)(xhci_hc[id].vbase_op + offset))
 #define xhci_get_ptr_op_reg64(id, offset) ((uint64_t *)(xhci_hc[id].vbase_op + offset))
 #define xhci_write_op_reg64(id, offset, value) (*(uint64_t *)(xhci_hc[id].vbase_op + offset) = (uint64_t)value)
+
+/**
+ * @brief 计算中断寄存器组虚拟地址
+ * @param id 主机控制器id
+ * @param num xhci中断寄存器组号
+ */
+#define xhci_calc_intr_vaddr(id, num) (xhci_hc[id].vbase + xhci_hc[id].rts_offset + XHCI_RT_IR0 + num * XHCI_IR_SIZE)
+/**
+ * @brief 读取/写入中断寄存器
+ * @param id 主机控制器id
+ * @param num xhci中断寄存器组号
+ * @param intr_offset 寄存器在当前寄存器组中的偏移量
+ */
+#define xhci_read_intr_reg32(id, num, intr_offset) (*(uint32_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset))
+#define xhci_write_intr_reg32(id, num, intr_offset, value) (*(uint32_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset) = value)
+#define xhci_read_intr_reg64(id, num, intr_offset) (*(uint64_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset))
+#define xhci_write_intr_reg64(id, num, intr_offset, value) (*(uint64_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset) = value)
 
 #define xhci_is_aligned64(addr) ((addr & 0x3f) == 0) // 是否64bytes对齐
 
@@ -244,6 +277,28 @@ static int xhci_hc_stop_legacy(int id)
 }
 
 /**
+ * @brief 启用指定xhci控制器的调度
+ *
+ * @param id 控制器id
+ * @return int
+ */
+static int xhci_hc_start_sched(int id)
+{
+    xhci_write_op_reg32(id, XHCI_OPS_USBCMD, (1 << 0) | (1 >> 2) | (1 << 3));
+}
+
+/**
+ * @brief 停止指定xhci控制器的调度
+ *
+ * @param id 控制器id
+ * @return int
+ */
+static int xhci_hc_stop_sched(int id)
+{
+    xhci_write_op_reg32(id, XHCI_OPS_USBCMD, 0x00);
+}
+
+/**
  * @brief
  *
  * @return uint32_t
@@ -300,7 +355,7 @@ static int xhci_hc_pair_ports(int id)
 {
 
     struct xhci_caps_HCSPARAMS1_reg_t hcs1;
-    memcpy(&hcs1, xhci_get_ptr_cap_reg32(id, XHCI_CAPS_HCSPARAMS1), sizeof(struct xhci_caps_HCCPARAMS1_reg_t));
+    memcpy(&hcs1, xhci_get_ptr_cap_reg32(id, XHCI_CAPS_HCSPARAMS1), sizeof(struct xhci_caps_HCSPARAMS1_reg_t));
 
     // 从hcs1获取端口数量
     xhci_hc[id].port_num = hcs1.max_ports;
@@ -407,18 +462,162 @@ static int xhci_hc_pair_ports(int id)
  * @brief 创建ring，并将最后一个trb指向头一个trb
  *
  * @param trbs 要创建的trb数量
- * @return uint64_t
+ * @return uint64_t trb数组的起始虚拟地址
  */
 static uint64_t xhci_create_ring(int trbs)
 {
     int total_size = trbs * sizeof(struct xhci_TRB_t);
     const uint64_t vaddr = (uint64_t)kmalloc(total_size, 0);
-    memset(vaddr, 0, total_size);
+    memset((void *)vaddr, 0, total_size);
 
     // 设置最后一个trb为link trb
     xhci_TRB_set_link_cmd(vaddr + total_size - sizeof(sizeof(struct xhci_TRB_t)));
 
     return vaddr;
+}
+
+/**
+ * @brief 创建新的event ring table和对应的ring segment
+ *
+ * @param trbs 包含的trb的数量
+ * @param ret_ring_addr 返回的第一个event ring segment的基地址（虚拟）
+ * @return uint64_t trb table的虚拟地址
+ */
+static uint64_t xhci_create_event_ring(int trbs, uint64_t *ret_ring_addr)
+{
+    const uint64_t table_vaddr = (const uint64_t)kmalloc(64, 0); // table支持8个segment
+    if (unlikely(table_vaddr == NULL))
+        return -ENOMEM;
+    memset((void *)table_vaddr, 0, 64);
+
+    // 暂时只创建1个segment
+    const uint64_t seg_vaddr = (const uint64_t)kmalloc(trbs * sizeof(struct xhci_TRB_t), 0);
+
+    if (unlikely(seg_vaddr == NULL))
+        return -ENOMEM;
+
+    memset((void *)seg_vaddr, 0, trbs * sizeof(struct xhci_TRB_t));
+
+    // 将segment地址和大小写入table
+    *(uint64_t *)(table_vaddr) = virt_2_phys(seg_vaddr);
+    *(uint64_t *)(table_vaddr + 8) = trbs;
+
+    *ret_ring_addr = seg_vaddr;
+    return table_vaddr;
+}
+
+void xhci_hc_irq_enable(uint64_t irq_num)
+{
+    int cid = xhci_find_hcid_by_irq_num(irq_num);
+    if (WARN_ON(cid == -1))
+        return;
+    pci_start_msi(xhci_hc[cid].pci_dev_hdr);
+
+    xhci_hc_start_sched(cid);
+}
+
+void xhci_hc_irq_disable(uint64_t irq_num)
+{
+    int cid = xhci_find_hcid_by_irq_num(irq_num);
+    if (WARN_ON(cid == -1))
+        return;
+
+    xhci_hc_stop_sched(cid);
+    pci_disable_msi(xhci_hc[cid].pci_dev_hdr);
+}
+
+uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
+{
+    int cid = xhci_find_hcid_by_irq_num(irq_num);
+    if (WARN_ON(cid == -1))
+        return -EINVAL;
+
+    struct xhci_hc_irq_install_info_t *info = (struct xhci_hc_irq_install_info_t *)arg;
+
+    pci_enable_msi(xhci_hc[cid].pci_dev_hdr, irq_num, info->processor, info->edge_trigger, info->assert);
+    return 0;
+}
+
+void xhci_hc_irq_uninstall(uint64_t irq_num)
+{
+    // todo
+    int cid = xhci_find_hcid_by_irq_num(irq_num);
+    if (WARN_ON(cid == -1))
+        return;
+    xhci_hc_stop(cid);
+}
+/**
+ * @brief xhci主机控制器的中断处理函数
+ *
+ * @param irq_num 中断向量号
+ * @param cid 控制器号
+ * @param regs 寄存器值
+ */
+void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
+{
+    // todo: handle irq
+    kdebug("USB irq received.");
+}
+
+/**
+ * @brief 初始化xhci主机控制器的中断控制
+ *
+ * @param id 主机控制器id
+ * @return int 返回码
+ */
+static int xhci_hc_init_intr(int id)
+{
+    uint64_t retval = 0;
+
+    struct xhci_caps_HCSPARAMS1_reg_t hcs1;
+    struct xhci_caps_HCSPARAMS2_reg_t hcs2;
+    memcpy(&hcs1, xhci_get_ptr_cap_reg32(id, XHCI_CAPS_HCSPARAMS1), sizeof(struct xhci_caps_HCSPARAMS1_reg_t));
+    memcpy(&hcs2, xhci_get_ptr_cap_reg32(id, XHCI_CAPS_HCSPARAMS2), sizeof(struct xhci_caps_HCSPARAMS2_reg_t));
+
+    uint32_t max_segs = (1 << (uint32_t)(hcs2.ERST_Max));
+    uint32_t max_interrupters = hcs1.max_intrs;
+
+    // 创建 event ring
+    retval = xhci_create_event_ring(4096, &xhci_hc[id].event_ring_vaddr);
+    if (unlikely((int64_t)(retval) == -ENOMEM))
+        return -ENOMEM;
+    xhci_hc[id].event_ring_table_vaddr = retval;
+    retval = 0;
+
+    xhci_hc[id].current_event_ring_cycle = 1;
+
+    // 写入第0个中断寄存器组
+    xhci_write_intr_reg32(id, 0, XHCI_IR_MAN, 0x3);                                                      // 使能中断并清除pending位（这个pending位是写入1就清0的）
+    xhci_write_intr_reg32(id, 0, XHCI_IR_MOD, 0);                                                        // 关闭中断管制
+    xhci_write_intr_reg32(id, 0, XHCI_IR_TABLE_SIZE, 1);                                                 // 当前只有1个segment
+    xhci_write_intr_reg64(id, 0, XHCI_IR_DEQUEUE, virt_2_phys(xhci_hc[id].event_ring_vaddr) | (1 << 3)); // 写入dequeue寄存器，并清除busy位（写1就会清除）
+    xhci_write_intr_reg64(id, 0, XHCI_IR_TABLE_ADDR, virt_2_phys(xhci_hc[id].event_ring_table_vaddr));   // 写入table地址
+
+    // 清除状态位
+    struct xhci_ops_usbsts_reg_t sts = {0};
+    sts.hse = 1;
+    sts.eint = 1;
+    sts.pcd = 1;
+    sts.sre = 1;
+    kdebug("new_sts=%#010lx", *(uint32_t *)(&sts));
+    xhci_write_op_reg32(id, XHCI_OPS_USBSTS, *(uint32_t *)(&sts));
+
+    // 开启usb中断
+    // 注册中断处理程序
+    struct xhci_hc_irq_install_info_t install_info;
+    install_info.assert = 0;
+    install_info.edge_trigger = 1;
+    install_info.processor = 0; // 投递到bsp
+
+    char *buf = (char *)kmalloc(16, 0);
+    memset(buf, 0, 16);
+    sprintk(buf, "xHCI HC%d", id);
+    irq_register(xhci_controller_irq_num[id], &install_info, &xhci_hc_irq_handler, id, &xhci_hc_intr_controller, buf);
+    kfree(buf);
+    
+    kdebug("xhci host controller %d: interrupt registered. irq num=%d", id, xhci_controller_irq_num[id]);
+
+    return 0;
 }
 
 /**
@@ -464,9 +663,9 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     struct xhci_caps_HCSPARAMS1_reg_t hcs1;
     struct xhci_caps_HCSPARAMS2_reg_t hcs2;
     memcpy(&hcc1, xhci_get_ptr_cap_reg32(cid, XHCI_CAPS_HCCPARAMS1), sizeof(struct xhci_caps_HCCPARAMS1_reg_t));
-    memcpy(&hcc2, xhci_get_ptr_cap_reg32(cid, XHCI_CAPS_HCCPARAMS2), sizeof(struct xhci_caps_HCCPARAMS1_reg_t));
-    memcpy(&hcs1, xhci_get_ptr_cap_reg32(cid, XHCI_CAPS_HCSPARAMS1), sizeof(struct xhci_caps_HCCPARAMS1_reg_t));
-    memcpy(&hcs2, xhci_get_ptr_cap_reg32(cid, XHCI_CAPS_HCSPARAMS2), sizeof(struct xhci_caps_HCCPARAMS1_reg_t));
+    memcpy(&hcc2, xhci_get_ptr_cap_reg32(cid, XHCI_CAPS_HCCPARAMS2), sizeof(struct xhci_caps_HCCPARAMS2_reg_t));
+    memcpy(&hcs1, xhci_get_ptr_cap_reg32(cid, XHCI_CAPS_HCSPARAMS1), sizeof(struct xhci_caps_HCSPARAMS1_reg_t));
+    memcpy(&hcs2, xhci_get_ptr_cap_reg32(cid, XHCI_CAPS_HCSPARAMS2), sizeof(struct xhci_caps_HCSPARAMS2_reg_t));
 
     // kdebug("hcc1.xECP=%#010lx", hcc1.xECP);
     // 计算operational registers的地址
@@ -500,13 +699,14 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     // 端口配对
     FAIL_ON(xhci_hc_pair_ports(cid), failed);
 
+    // ========== 设置USB host controller =========
     // 获取页面大小
     xhci_hc[cid].page_size = (xhci_read_op_reg32(cid, XHCI_OPS_PAGESIZE) & 0xffff) << 12;
-    kdebug("pg size=%d", xhci_hc[cid].page_size);
+    kdebug("page size=%d", xhci_hc[cid].page_size);
 
     // 获取设备上下文空间
     xhci_hc[cid].dcbaap_vaddr = (uint64_t)kmalloc(2048, 0); // 分配2KB的设备上下文地址数组空间
-    memset(xhci_hc[cid].dcbaap_vaddr, 0, 2048);
+    memset((void *)xhci_hc[cid].dcbaap_vaddr, 0, 2048);
 
     kdebug("dcbaap_vaddr=%#018lx", xhci_hc[cid].dcbaap_vaddr);
     if (unlikely(!xhci_is_aligned64(xhci_hc[cid].dcbaap_vaddr))) // 地址不是按照64byte对齐
@@ -516,14 +716,42 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     }
     // 写入dcbaap
     xhci_write_cap_reg64(cid, XHCI_OPS_DCBAAP, virt_2_phys(xhci_hc[cid].dcbaap_vaddr));
+
+    // 创建command ring
     xhci_hc[cid].cmd_ring_vaddr = xhci_create_ring(XHCI_CMND_RING_TRBS);
+    if (unlikely(!xhci_is_aligned64(xhci_hc[cid].cmd_ring_vaddr))) // 地址不是按照64byte对齐
+    {
+        kerror("cmd ring isn't 64 byte aligned.");
+        goto failed_free_dyn;
+    }
+
+    // 设置初始cycle bit为1
+    xhci_hc[cid].cmd_trb_cycle = XHCI_TRB_CYCLE_ON;
+
+    // 写入command ring控制寄存器
+    xhci_write_op_reg64(cid, XHCI_OPS_CRCR, virt_2_phys(xhci_hc[cid].cmd_ring_vaddr) | xhci_hc[cid].cmd_trb_cycle);
+    // 写入配置寄存器
+    xhci_write_op_reg32(cid, XHCI_OPS_CONFIG, hcs1.max_slots);
+    // 写入设备通知控制寄存器
+    xhci_write_op_reg32(cid, XHCI_OPS_DNCTRL, (1 << 1)); // 目前只有N1被支持
+
+    FAIL_ON(xhci_hc_init_intr(cid), failed_free_dyn);
     ++xhci_ctrl_count;
     spin_unlock(&xhci_controller_init_lock);
     return;
 
 failed_free_dyn:; // 释放动态申请的内存
     if (xhci_hc[cid].dcbaap_vaddr)
-        kfree(xhci_hc[cid].dcbaap_vaddr);
+        kfree((void *)xhci_hc[cid].dcbaap_vaddr);
+
+    if (xhci_hc[cid].cmd_ring_vaddr)
+        kfree((void *)xhci_hc[cid].cmd_ring_vaddr);
+
+    if (xhci_hc[cid].event_ring_table_vaddr)
+        kfree((void *)xhci_hc[cid].event_ring_table_vaddr);
+
+    if (xhci_hc[cid].event_ring_vaddr)
+        kfree((void *)xhci_hc[cid].event_ring_vaddr);
 
 failed:;
     // 取消地址映射

@@ -1,9 +1,18 @@
 echo "Creating virtual disk image..."
+
+# 创建一至少为16MB磁盘镜像（类型选择raw）
 qemu-img create -f raw disk.img 16M
-# 分别输入o、n, 然后按4次回车，直到回到fdisk的默认界面，
-# 再输入w即可
-# 按顺序输入，并且，每次输入完成后要按下回车）
-fdisk disk.img
+
+# 使用fdisk把disk.img的分区表设置为MBR格式(下方的空行请勿删除)
+fdisk disk.img << EOF
+o
+n
+
+
+
+
+w
+EOF
 
 LOOP_DEVICE=$(sudo losetup -f --show -P disk.img) \
     || exit 1

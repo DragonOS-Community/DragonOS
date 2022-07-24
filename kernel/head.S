@@ -275,7 +275,7 @@ ENTRY(_start64)
 // ==== 加载CR3寄存器
 
 load_cr3:
- // 分支，判断是否为apu
+
     movq $__PML4E, %rax //设置页目录基地址
     
     movq %rax, %cr3

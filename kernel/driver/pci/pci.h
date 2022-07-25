@@ -6,9 +6,6 @@
 #define PORT_PCI_CONFIG_ADDRESS 0xcf8
 #define PORT_PCI_CONFIG_DATA 0xcfc
 
-#define E_DEVICE_INVALID -1
-#define E_WRONG_HEADER_TYPE -2
-#define E_NOT_SUPPORT_MSI -3    // 设备不支持msi
 
 // pci设备结构信息的链表
 struct List * pci_device_structure_list = NULL;
@@ -215,3 +212,12 @@ void pci_checkAllBuses();
  * @param res 返回的结果数组
  */
 void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_device_structure_header_t* res[], uint32_t* count_res);
+
+/**
+ * @brief 寻找符合指定类型的capability list
+ *
+ * @param pci_dev pci设备header
+ * @param cap_type c要寻找的capability类型
+ * @return uint64_t cap list的偏移量
+ */
+uint32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci_dev, int cap_type);

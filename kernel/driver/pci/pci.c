@@ -2,6 +2,7 @@
 #include <common/kprint.h>
 #include <mm/slab.h>
 #include <debug/bug.h>
+#include <common/errno.h>
 
 static uint count_device_list = 0;
 static void pci_checkBus(uint8_t bus);
@@ -257,7 +258,7 @@ void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_
     void *ret;
     if (common_header->Vendor_ID == 0xffff)
     {
-        *type = E_DEVICE_INVALID;
+        *type = -ENXIO;
         kfree(common_header);
         return NULL;
     }
@@ -295,7 +296,7 @@ void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_
         break;
     default: // 错误的头类型 这里不应该被执行
         // kerror("PCI->pci_read_header(): Invalid header type.");
-        *type = E_WRONG_HEADER_TYPE;
+        *type = -EINVAL;
         // kerror("vendor id=%#010lx", common_header->Vendor_ID);
         // kerror("header type = %d", common_header->HeaderType);
         kfree(common_header);
@@ -308,7 +309,7 @@ static void pci_checkFunction(uint8_t bus, uint8_t device, uint8_t function)
     int header_type;
     struct pci_device_structure_header_t *header = pci_read_header(&header_type, bus, device, function, true);
 
-    if (header_type == E_WRONG_HEADER_TYPE)
+    if (header_type == -EINVAL)
     {
         // kerror("pci_checkFunction(): wrong header type!");
         //  此处内存已经在read header函数里面释放，不用重复释放
@@ -328,15 +329,15 @@ static int pci_checkDevice(uint8_t bus, uint8_t device)
     int header_type;
 
     struct pci_device_structure_header_t *header = pci_read_header(&header_type, bus, device, 0, false);
-    if (header_type == E_WRONG_HEADER_TYPE)
+    if (header_type == -EINVAL)
     {
         // 此处内存已经在read header函数里面释放，不用重复释放
-        return E_WRONG_HEADER_TYPE;
+        return -EINVAL;
     }
-    if (header_type == E_DEVICE_INVALID)
+    if (header_type == -ENXIO)
     {
         // kerror("DEVICE INVALID");
-        return E_DEVICE_INVALID;
+        return -ENXIO;
     }
 
     uint16_t vendorID = header->Vendor_ID;
@@ -344,7 +345,7 @@ static int pci_checkDevice(uint8_t bus, uint8_t device)
     if (vendorID == 0xffff) // 设备不存在
     {
         kfree(header);
-        return E_DEVICE_INVALID;
+        return -ENXIO;
     }
     pci_checkFunction(bus, device, 0);
 
@@ -388,7 +389,7 @@ void pci_checkAllBuses()
     int header_type;
     struct pci_device_structure_header_t *header = pci_read_header(&header_type, 0, 0, 0, false);
 
-    if (header_type == E_WRONG_HEADER_TYPE)
+    if (header_type == EINVAL)
     {
         kBUG("pci_checkAllBuses(): wrong header type!");
         // 此处内存已经在read header函数里面释放，不用重复释放
@@ -492,5 +493,48 @@ void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_
             ++(*count_res);
         }
         ptr = container_of(list_next(&(ptr->list)), struct pci_device_structure_header_t, list);
+    }
+}
+
+/**
+ * @brief 寻找符合指定类型的capability list
+ *
+ * @param pci_dev pci设备header
+ * @param cap_type c要寻找的capability类型
+ * @return uint64_t cap list的偏移量
+ */
+uint32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci_dev, int cap_type)
+{
+    uint32_t cap_offset;
+    switch (pci_dev->HeaderType)
+    {
+    case 0x00:
+
+        cap_offset = ((struct pci_device_structure_general_device_t *)pci_dev)->Capabilities_Pointer;
+        break;
+
+    case 0x10:
+        cap_offset = ((struct pci_device_structure_pci_to_pci_bridge_t *)pci_dev)->Capability_Pointer;
+        break;
+    default:
+        // 不支持
+        return -ENOSYS;
+    }
+    uint32_t tmp;
+    while (1)
+    {
+        tmp = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->func, cap_offset);
+        if (tmp & 0xff != cap_type)
+        {
+            if ((tmp & 0xff00) >> 8)
+            {
+                cap_offset = (tmp & 0xff00);
+                continue;
+            }
+            else
+                return -ENOSYS;
+        }
+
+        return cap_offset;
     }
 }

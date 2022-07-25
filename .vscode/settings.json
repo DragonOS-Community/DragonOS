@@ -109,7 +109,8 @@
         "slab.h": "c",
         "boot_info.h": "c",
         "pci.h": "c",
-        "time.h": "c"
+        "time.h": "c",
+        "ia64_msi.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

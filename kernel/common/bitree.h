@@ -1,4 +1,5 @@
 #pragma once
+#include <common/glib.h>
 
 struct bt_node_t
 {
@@ -13,6 +14,11 @@ struct bt_root_t
 {
     struct bt_node_t *bt_node;
     int (*cmp)(struct bt_node_t *a, struct bt_node_t *b); // 比较函数   a>b 返回1， a==b返回0, a<b返回-1
+    /**
+     * @brief 释放结点的value的函数
+     * @param value 结点的值
+     */
+    int (*release)(void *value);
 };
 
 /**

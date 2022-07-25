@@ -105,7 +105,8 @@ int bt_query(struct bt_root_t *root, void *value, uint64_t *ret_addr)
     struct bt_node_t *this_node = root->bt_node;
     struct bt_node_t tmp_node = {0};
     tmp_node.value = value;
-    while (this_node != NULL && !equal(root, &this_node, &tmp_node))
+
+    while (this_node != NULL && !equal(root, this_node, &tmp_node))
     {
         if (smaller(root, &tmp_node, this_node))
             this_node = this_node->left;
@@ -113,6 +114,73 @@ int bt_query(struct bt_root_t *root, void *value, uint64_t *ret_addr)
             this_node = this_node->right;
     }
 
-    *ret_addr = (uint64_t)ret_addr;
-    return 0;
+    if (equal(root, this_node, &tmp_node))
+    {
+        *ret_addr = (uint64_t)this_node;
+        return 0;
+    }
+    else
+    {
+        // 找不到则返回-1，且addr设为0
+        *ret_addr = NULL;
+        return -1;
+    }
+}
+
+static struct bt_node_t *bt_get_minimum(struct bt_node_t *this_node)
+{
+    while (this_node->left != NULL)
+        this_node = this_node->left;
+    return this_node;
+}
+
+/**
+ * @brief 删除结点
+ * 
+ * @param root 树根 
+ * @param value 待删除结点的值
+ * @return int 返回码
+ */
+int bt_delete(struct bt_root_t *root, void *value)
+{
+    uint64_t tmp_addr;
+    int retval;
+
+    // 寻找待删除结点
+    retval = bt_query(root, value, &tmp_addr);
+    if (retval != 0 || tmp_addr == NULL)
+        return retval;
+
+    struct bt_node_t *this_node = (struct bt_node_t *)tmp_addr;
+    struct bt_node_t *to_delete = NULL, *to_delete_son = NULL;
+    if (this_node->left == NULL || this_node->right == NULL)
+        to_delete = this_node;
+    else
+    {
+        to_delete = bt_get_minimum(this_node->right);
+        // 释放要被删除的值，并把下一个结点的值替换上来
+        root->release(this_node->value);
+        this_node->value = to_delete->value;
+    }
+
+    if (to_delete->left != NULL)
+        to_delete_son = to_delete->left;
+    else
+        to_delete_son = to_delete->right;
+
+    if (to_delete_son != NULL)
+        to_delete_son->parent = to_delete->parent;
+
+    if (to_delete->parent == NULL)
+        root->bt_node = to_delete_son;
+    else
+    {
+        if (to_delete->parent->left == to_delete)
+            to_delete->parent->left = to_delete_son;
+        else
+            to_delete->parent->right = to_delete_son;
+    }
+
+    // 释放最终要删除的结点的对象
+    kfree(to_delete);
 }

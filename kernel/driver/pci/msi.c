@@ -13,7 +13,6 @@
  */
 #define pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert) ((uint32_t)((vector & 0xff) | (edge_trigger == 1 ? 0 : (1 << 15)) | ((assert == 0) ? 0 : (1 << 14))))
 
-
 /**
  * @brief 启用 Message Signaled Interrupts
  *
@@ -25,9 +24,10 @@
  *
  * @return 返回码
  */
-int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edge_trigger, uint8_t assert)
+// int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edge_trigger, uint8_t assert)
+int pci_enable_msi(struct msi_desc_t *msi_desc)
 {
-    struct pci_device_structure_header_t *ptr = (struct pci_device_structure_header_t *)header;
+    struct pci_device_structure_header_t *ptr = msi_desc->pci_dev;
     uint32_t cap_ptr;
     uint32_t tmp;
     uint16_t message_control;
@@ -36,8 +36,8 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
     {
     case 0x00: // general device
         if (!(ptr->Status & 0x10))
-            return E_NOT_SUPPORT_MSI;    
-        
+            return E_NOT_SUPPORT_MSI;
+
         cap_ptr = ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer;
 
         tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
@@ -47,14 +47,15 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
             return E_NOT_SUPPORT_MSI;
 
         // 写入message address
-        message_addr = pci_get_arch_msi_message_address(processor); // 获取message address
+        message_addr = pci_get_arch_msi_message_address(msi_desc->processor); // 获取message address
         pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x4, (uint32_t)(message_addr & 0xffffffff));
 
         if (message_control & (1 << 7)) // 64位
             pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x8, (uint32_t)((message_addr >> 32) & 0xffffffff));
 
         // 写入message data
-        tmp = pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert);
+
+        tmp = pci_get_arch_msi_message_data(msi_desc->irq_num, msi_desc->processor, msi_desc->edge_trigger, msi_desc->assert);
         if (message_control & (1 << 7)) // 64位
             pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0xc, tmp);
         else
@@ -80,14 +81,14 @@ int pci_enable_msi(void *header, uint8_t vector, uint32_t processor, uint8_t edg
             return E_NOT_SUPPORT_MSI;
 
         // 写入message address
-        message_addr = pci_get_arch_msi_message_address(processor); // 获取message address
+        message_addr = pci_get_arch_msi_message_address(msi_desc->processor); // 获取message address
         pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x4, (uint32_t)(message_addr & 0xffffffff));
 
         if (message_control & (1 << 7)) // 64位
             pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0x8, (uint32_t)((message_addr >> 32) & 0xffffffff));
 
         // 写入message data
-        tmp = pci_get_arch_msi_message_data(vector, processor, edge_trigger, assert);
+        tmp = pci_get_arch_msi_message_data(msi_desc->irq_num, msi_desc->processor, msi_desc->edge_trigger, msi_desc->assert);
         if (message_control & (1 << 7)) // 64位
             pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr + 0xc, tmp);
         else

@@ -63,8 +63,6 @@ kernel: head.o main.o $(OBJ_LIST)
     		cd ..;\
 	done
 
-	
-
 
 clean: 
 	rm -rf $(GARBAGE)

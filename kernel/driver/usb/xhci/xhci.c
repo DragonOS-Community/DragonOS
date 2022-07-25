@@ -557,8 +557,16 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
         return -EINVAL;
 
     struct xhci_hc_irq_install_info_t *info = (struct xhci_hc_irq_install_info_t *)arg;
+    struct msi_desc_t msi_desc;
+    memset(&msi_desc, 0, sizeof(struct msi_desc_t));
+
+    msi_desc.pci_dev = (struct pci_device_structure_header_t*)xhci_hc[cid].pci_dev_hdr;
+    msi_desc.assert = info->assert;
+    msi_desc.edge_trigger = info->edge_trigger;
+    msi_desc.processor = info->processor;
+    msi_desc.pci.msi_attribute.is_64 = 1;
     // todo: QEMU是使用msix的，因此要先在pci中实现msix
-    int retval = pci_enable_msi(xhci_hc[cid].pci_dev_hdr, irq_num, info->processor, info->edge_trigger, info->assert);
+    int retval = pci_enable_msi(&msi_desc);
     kdebug("pci retval = %d", retval);
     kdebug("xhci irq %d installed.", irq_num);
     return 0;

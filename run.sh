@@ -8,8 +8,13 @@
 # 第一个参数如果是--notbuild 那就不构建，直接运行
 if [ ! "$1" == "--nobuild" ]; then
     echo "开始构建..."
-    make all -j 16
-    make clean
+    if [ "$1" == "--docker" ]; then
+        echo "使用docker构建"
+        sudo bash tools/build_in_docker.sh
+    else
+        make all -j 16
+        make clean
+    fi
 fi
 
 IA32_USE_QEMU=1

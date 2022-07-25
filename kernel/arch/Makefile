@@ -1,10 +1,12 @@
 
 CFLAGS += -I .
 
-kernel_driver_subdirs:=video interrupt usb pci uart acpi disk keyboard mouse multiboot2 timers
+ifeq ($(ARCH), __x86_64__)
+kernel_arch_subdirs:=x86_64
+endif
 
 all: 
-	@list='$(kernel_driver_subdirs)'; for subdir in $$list; do \
+	@list='$(kernel_arch_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
     		$(MAKE) all CFLAGS="$(CFLAGS)" PIC="$(PIC)";\

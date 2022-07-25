@@ -3,5 +3,5 @@ p=`pwd`
 cpu_count=$(cat /proc/cpuinfo |grep "processor"|wc -l)
 docker run -v $p:/data --name dragonos-build -i dragonos-dev:v1.0 bash << EOF
 cd /data
-make -j ${cpu_count}
+bash run.sh --current_in_docker
 EOF

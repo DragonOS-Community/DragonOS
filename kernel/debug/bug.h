@@ -12,3 +12,10 @@
         kwarn("Assertion failed at %s:%d", __FILE__, __LINE__); \
     unlikely(__ret_warn_on);                                    \
 })
+
+#define FAIL_ON_TO(condition, to) ({   \
+    int __ret_warn_on = !!(condition); \
+    if (unlikely(__ret_warn_on))       \
+        goto to;                       \
+    unlikely(__ret_warn_on);           \
+})

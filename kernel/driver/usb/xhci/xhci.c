@@ -123,12 +123,6 @@ hardware_intr_controller xhci_hc_intr_controller =
         ptr->cycle = 1;                                                        \
     } while (0)
 
-#define FAIL_ON(value, to)        \
-    do                            \
-    {                             \
-        if (unlikely(value != 0)) \
-            goto to;              \
-    } while (0)
 
 // Common TRB types
 enum
@@ -854,12 +848,12 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     }
 
     // 关闭legacy支持
-    FAIL_ON(xhci_hc_stop_legacy(cid), failed);
+    FAIL_ON_TO(xhci_hc_stop_legacy(cid), failed);
 
     // 重置xhci控制器
-    FAIL_ON(xhci_hc_reset(cid), failed);
+    FAIL_ON_TO(xhci_hc_reset(cid), failed);
     // 端口配对
-    FAIL_ON(xhci_hc_pair_ports(cid), failed);
+    FAIL_ON_TO(xhci_hc_pair_ports(cid), failed);
 
     // ========== 设置USB host controller =========
     // 获取页面大小
@@ -900,7 +894,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     // 写入设备通知控制寄存器
     xhci_write_op_reg32(cid, XHCI_OPS_DNCTRL, (1 << 1)); // 目前只有N1被支持
 
-    FAIL_ON(xhci_hc_init_intr(cid), failed_free_dyn);
+    FAIL_ON_TO(xhci_hc_init_intr(cid), failed_free_dyn);
     ++xhci_ctrl_count;
     spin_unlock(&xhci_controller_init_lock);
     return;

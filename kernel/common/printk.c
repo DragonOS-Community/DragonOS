@@ -10,14 +10,65 @@
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 #include "math.h"
-//#include "linkage.h"
 
 struct printk_screen_info pos;
 extern ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
 static spinlock_t printk_lock;
 static bool sw_show_scroll_animation = false; // 显示换行动画的开关
 
-int calculate_max_charNum(int len, int size)
+/**
+ * @brief Set the printk pos object
+ *
+ * @param x 列坐标
+ * @param y 行坐标
+ */
+static int set_printk_pos(const int x, const int y);
+
+/**
+ * @brief 在屏幕上指定位置打印字符
+ *
+ * @param fb 帧缓存线性地址
+ * @param Xsize 行分辨率
+ * @param x 左上角列像素点位置
+ * @param y 左上角行像素点位置
+ * @param FRcolor 字体颜色
+ * @param BKcolor 背景颜色
+ * @param font 字符的bitmap
+ */
+static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font);
+
+static uint *get_pos_VBE_FB_addr();
+
+/**
+ * @brief 清屏
+ *
+ */
+static int cls();
+
+/**
+ * @brief 滚动窗口（尚不支持向下滚动)
+ *
+ * @param direction  方向，向上滑动为true,否则为false
+ * @param pixels 要滑动的像素数量
+ * @param animation 是否包含滑动动画
+ */
+static int scroll(bool direction, int pixels, bool animation);
+
+/**
+ * @brief 将数字按照指定的要求转换成对应的字符串（2~36进制）
+ *
+ * @param str 要返回的字符串
+ * @param num 要打印的数值
+ * @param base 基数
+ * @param field_width 区域宽度
+ * @param precision 精度
+ * @param flags 标志位
+ */
+static char *write_num(char *str,ul num, int base, int field_width, int precision, int flags);
+
+static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
+
+static int calculate_max_charNum(int len, int size)
 {
     /**
      * @brief 计算屏幕上能有多少行
@@ -85,7 +136,7 @@ int printk_init(const int char_size_x, const int char_size_y)
     return 0;
 }
 
-int set_printk_pos(const int x, const int y)
+static int set_printk_pos(const int x, const int y)
 {
     // 指定的坐标不在屏幕范围内
     if (!((x >= 0 && x <= pos.max_x) && (y >= 0 && y <= pos.max_y)))
@@ -94,7 +145,7 @@ int set_printk_pos(const int x, const int y)
     pos.y = y;
     return 0;
 }
-int skip_and_atoi(const char **s)
+static int skip_and_atoi(const char **s)
 {
     /**
      * @brief 获取连续的一段字符对应整数的值
@@ -109,7 +160,7 @@ int skip_and_atoi(const char **s)
     return ans;
 }
 
-void auto_newline()
+static void auto_newline()
 {
     /**
      * @brief 超过每行最大字符数，自动换行
@@ -138,7 +189,7 @@ void auto_newline()
     }
 }
 
-static int vsprintf(char *buf, const char *fmt, va_list args)
+int vsprintf(char *buf, const char *fmt, va_list args)
 {
     /**
      * 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
@@ -535,7 +586,6 @@ static char *write_num(char *str, ul num, int base, int field_width, int precisi
     return str;
 }
 
-
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags)
 {
     /**
@@ -573,9 +623,9 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
     if (sign)
         --field_width;
 
-    int js_num_z = 0, js_num_d = 0;                                               // 临时数字字符串tmp_num_z tmp_num_d的长度
-    uint64_t num_z = (uint64_t)(num);                                             // 获取整数部分
-    uint64_t num_decimal = (uint64_t)(round(1.0*(num - num_z) * pow(10, precision))); // 获取小数部分
+    int js_num_z = 0, js_num_d = 0;                                                     // 临时数字字符串tmp_num_z tmp_num_d的长度
+    uint64_t num_z = (uint64_t)(num);                                                   // 获取整数部分
+    uint64_t num_decimal = (uint64_t)(round(1.0 * (num - num_z) * pow(10, precision))); // 获取小数部分
 
     if (num == 0 || num_z == 0)
         tmp_num_z[js_num_z++] = '0';
@@ -776,9 +826,7 @@ int do_scroll(bool direction, int pixels)
  * @param pixels 要滑动的像素数量
  * @param animation 是否包含滑动动画
  */
-
-// @todo: 修复用户态触发键盘中断时产生#UD错误
-int scroll(bool direction, int pixels, bool animation)
+static int scroll(bool direction, int pixels, bool animation)
 {
     // 暂时不支持反方向滚动
     if (direction == false)
@@ -851,7 +899,7 @@ int scroll(bool direction, int pixels, bool animation)
  * @brief 清屏
  *
  */
-int cls()
+static int cls()
 {
     memset(pos.FB_address, BLACK, pos.FB_length * sizeof(unsigned int));
     pos.x = 0;
@@ -876,7 +924,7 @@ void set_pos_VBE_FB_addr(uint *virt_addr)
     pos.FB_address = (uint *)virt_addr;
 }
 
-uint *get_pos_VBE_FB_addr()
+static uint *get_pos_VBE_FB_addr()
 {
     return pos.FB_address;
 }

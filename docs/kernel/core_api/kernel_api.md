@@ -42,11 +42,11 @@
 
 **entry**
 
-  已存在于循环链表中的一个结点
+&emsp;&emsp;已存在于循环链表中的一个结点
 
 **node**
 
-  待插入的结点
+&emsp;&emsp;待插入的结点
 
 ### `void list_del(struct List *entry)`
 
@@ -76,13 +76,13 @@
 
 #### 描述
 
-  获取entry的前一个结点
+&emsp;&emsp;获取entry的前一个结点
 
 #### 参数
 
 **entry**
 
-  链表中的一个结点
+&emsp;&emsp;链表中的一个结点
 
 ### `struct List *list_next(struct List *entry)`
 
@@ -108,13 +108,13 @@
 
 ##### 描述
 
-测量并返回字符串长度。
+&emsp;&emsp;测量并返回字符串长度。
 
 ##### 参数
 
 **src**
 
-源字符串
+&emsp;&emsp;源字符串
 
 #### `long strnlen(const char *src, unsigned long maxlen)`
 
@@ -136,7 +136,7 @@
 
 ##### 描述
 
-  测量并返回字符串长度。当字符串长度大于maxlen时，返回maxlen。
+&emsp;&emsp;测量并返回字符串长度。当字符串长度大于maxlen时，返回maxlen。
 
 &emsp;&emsp;该函数会进行地址空间校验，要求src字符串必须来自用户空间。当源字符串来自内核空间时，将返回0.
 
@@ -144,23 +144,23 @@
 
 **src**
 
-  源字符串，地址位于用户空间
+&emsp;&emsp;源字符串，地址位于用户空间
 
 **maxlen**
 
-  最大长度
+&emsp;&emsp;最大长度
 
 #### `char *strncpy(char *dst, const char *src, long count)`
 
 ##### 描述
 
-  拷贝长度为count个字节的字符串，返回dst字符串
+&emsp;&emsp;拷贝长度为count个字节的字符串，返回dst字符串
 
 ##### 参数
 
 **src**
 
-  源字符串
+&emsp;&emsp;源字符串
 
 **dst**
 
@@ -168,9 +168,7 @@
 
 **count**
 
-  要拷贝的源字符串的长度
-
-
+&emsp;&emsp;要拷贝的源字符串的长度
 
 #### `long strncpy_from_user(char *dst, const char *src, unsigned long size)`
 
@@ -188,7 +186,7 @@
 
 **dst**
 
-  目标字符串
+&emsp;&emsp;目标字符串
 
 **size**
 
@@ -212,12 +210,88 @@
 
 **FirstPart**
 
-  第一个字符串
+&emsp;&emsp;第一个字符串
 
 **SecondPart**
 
 &emsp;&emsp;第二个字符串
 
+#### `printk(const char* fmt, ...)`
 
+##### 描述
 
+&emsp;&emsp;该宏能够在控制台上以黑底白字格式化输出字符串.
 
+##### 参数
+
+**fmt**
+
+&emsp;&emsp;源格式字符串
+
+**...**
+
+&emsp;&emsp;可变参数
+
+#### `printk_color(unsigned int FRcolor, unsigned int BKcolor, const char* fmt, ...)`
+
+##### 描述
+
+&emsp;&emsp;在控制台上以指定前景色和背景色格式化输出字符串.
+
+##### 参数
+
+**FRcolor**
+
+&emsp;&emsp;前景色
+
+**BKcolor**
+
+&emsp;&emsp;背景色
+
+**fmt**
+
+&emsp;&emsp;源格式字符串
+
+**...**
+
+&emsp;&emsp;可变参数
+
+#### `int vsprintf(char *buf, const char *fmt, va_list args)`
+
+##### 描述
+
+&emsp;&emsp;按照fmt格式化字符串，并将结果输出到buf中，返回写入buf的字符数量。
+
+##### 参数
+
+**buf**
+
+&emsp;&emsp;输出缓冲区
+
+**fmt**
+
+&emsp;&emsp;源格式字符串
+
+**args**
+
+&emsp;&emsp;可变参数列表
+
+#### `int sprintk(char *buf, const char *fmt, ...)`
+
+##### 描述
+
+&emsp;&emsp;按照fmt格式化字符串，并将结果输出到buf中，返回写入buf的字符数量。
+
+##### 参数
+
+**buf**
+
+&emsp;&emsp;输出缓冲区
+
+**fmt**
+
+&emsp;&emsp;源格式字符串
+
+**...**
+
+&emsp;&emsp;可变参数

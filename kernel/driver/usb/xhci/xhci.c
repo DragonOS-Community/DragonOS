@@ -9,7 +9,7 @@
 #include <exception/irq.h>
 #include <driver/interrupt/apic/apic.h>
 
-spinlock_t xhci_controller_init_lock; // xhci控制器初始化锁(在usb_init中被初始化)
+spinlock_t xhci_controller_init_lock = {0}; // xhci控制器初始化锁(在usb_init中被初始化)
 
 static int xhci_ctrl_count = 0; // xhci控制器计数
 
@@ -121,13 +121,6 @@ hardware_intr_controller xhci_hc_intr_controller =
         ptr->chain = 0;                                                        \
         ptr->ent = 0;                                                          \
         ptr->cycle = 1;                                                        \
-    } while (0)
-
-#define FAIL_ON(value, to)        \
-    do                            \
-    {                             \
-        if (unlikely(value != 0)) \
-            goto to;              \
     } while (0)
 
 // Common TRB types
@@ -387,7 +380,7 @@ static int xhci_hc_pair_ports(int id)
 
     uint32_t next_off = xhci_hc[id].ext_caps_off;
     uint32_t offset, cnt;
-    uint16_t protocol_flags;
+    uint16_t protocol_flags = 0;
 
     // 寻找所有的usb2端口
     while (next_off)
@@ -560,12 +553,12 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     struct msi_desc_t msi_desc;
     memset(&msi_desc, 0, sizeof(struct msi_desc_t));
 
-    msi_desc.pci_dev = (struct pci_device_structure_header_t*)xhci_hc[cid].pci_dev_hdr;
+    msi_desc.pci_dev = (struct pci_device_structure_header_t *)xhci_hc[cid].pci_dev_hdr;
     msi_desc.assert = info->assert;
     msi_desc.edge_trigger = info->edge_trigger;
     msi_desc.processor = info->processor;
     msi_desc.pci.msi_attribute.is_64 = 1;
-    // todo: QEMU是使用msix的，因此要先在pci中实现msix  
+    // todo: QEMU是使用msix的，因此要先在pci中实现msix
     int retval = pci_enable_msi(&msi_desc);
     kdebug("pci retval = %d", retval);
     kdebug("xhci irq %d installed.", irq_num);
@@ -643,7 +636,7 @@ static int xhci_reset_port(const int id, const int port)
             break;
         else if (val & (1 << 21))
             break;
-        
+
         --timeout;
         usleep(500);
     }
@@ -854,12 +847,12 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     }
 
     // 关闭legacy支持
-    FAIL_ON(xhci_hc_stop_legacy(cid), failed);
+    FAIL_ON_TO(xhci_hc_stop_legacy(cid), failed);
 
     // 重置xhci控制器
-    FAIL_ON(xhci_hc_reset(cid), failed);
+    FAIL_ON_TO(xhci_hc_reset(cid), failed);
     // 端口配对
-    FAIL_ON(xhci_hc_pair_ports(cid), failed);
+    FAIL_ON_TO(xhci_hc_pair_ports(cid), failed);
 
     // ========== 设置USB host controller =========
     // 获取页面大小
@@ -900,7 +893,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     // 写入设备通知控制寄存器
     xhci_write_op_reg32(cid, XHCI_OPS_DNCTRL, (1 << 1)); // 目前只有N1被支持
 
-    FAIL_ON(xhci_hc_init_intr(cid), failed_free_dyn);
+    FAIL_ON_TO(xhci_hc_init_intr(cid), failed_free_dyn);
     ++xhci_ctrl_count;
     spin_unlock(&xhci_controller_init_lock);
     return;

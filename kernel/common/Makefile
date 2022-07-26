@@ -3,7 +3,7 @@ CFLAGS += -I .
 
 kernel_common_subdirs:=libELF math
 
-all: glib.o printk.o cpu.o
+all: glib.o printk.o cpu.o bitree.o
 	@list='$(kernel_common_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
@@ -19,3 +19,6 @@ printk.o: printk.c
 
 cpu.o: cpu.c
 	gcc $(CFLAGS) -c cpu.c -o cpu.o
+
+bitree.o: bitree.c
+	gcc $(CFLAGS) -c bitree.c -o bitree.o

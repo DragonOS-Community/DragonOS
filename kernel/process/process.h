@@ -327,6 +327,17 @@ ul process_do_exit(ul code);
 void process_exit_notify();
 
 /**
+ * @brief 初始化内核进程
+ *
+ * @param fn 目标程序的地址
+ * @param arg 向目标程序传入的参数
+ * @param flags
+ * @return int
+ */
+
+int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigned long flags);
+
+/**
  * @brief 切换页表
  * @param prev 前一个进程的pcb
  * @param next 下一个进程的pcb

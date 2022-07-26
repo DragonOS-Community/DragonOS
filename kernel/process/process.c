@@ -15,6 +15,7 @@
 #include <syscall/syscall_num.h>
 #include <sched/sched.h>
 
+#include <ktest/ktest.h>
 
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
@@ -385,7 +386,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         regs->rdi = argc;
         regs->rsi = (uint64_t)dst_argv;
     }
-    kdebug("execve ok");
+    // kdebug("execve ok");
 
     regs->cs = USER_CS | 3;
     regs->ds = USER_DS | 3;
@@ -413,7 +414,8 @@ ul initial_kernel_thread(ul arg)
     fat32_init();
     usb_init();
 
-
+    pid_t test_thread_pid = kernel_thread(ktest_test_bitree, 1, 0);
+    kdebug("test_thread_pid=%d", test_thread_pid);
     // 准备切换到用户态
     struct pt_regs *regs;
 
@@ -569,7 +571,7 @@ void process_init()
     spin_init(&process_global_pid_write_lock);
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
-    kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核进程
+    kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核线程
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;
     initial_proc_union.pcb.cpu_id = 0;
@@ -586,7 +588,6 @@ void process_init()
  * @param stack_size 堆栈大小
  * @return unsigned long
  */
-
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size)
 {
     int retval = 0;
@@ -642,6 +643,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     if (process_copy_flags(clone_flags, tsk))
         goto copy_flags_failed;
 
+    kdebug("before copy mm");
     // 拷贝内存空间分布结构体
     if (process_copy_mm(clone_flags, tsk))
         goto copy_mm_failed;

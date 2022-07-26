@@ -13,8 +13,8 @@ struct bt_node_t
 struct bt_root_t
 {
     struct bt_node_t *bt_node;
-    int32_t size;                                         // 树中的元素个数
-    int (*cmp)(struct bt_node_t *a, struct bt_node_t *b); // 比较函数   a>b 返回1， a==b返回0, a<b返回-1
+    int32_t size;                 // 树中的元素个数
+    int (*cmp)(void *a, void *b); // 比较函数   a>b 返回1， a==b返回0, a<b返回-1
     /**
      * @brief 释放结点的value的函数
      * @param value 结点的值
@@ -30,7 +30,7 @@ struct bt_root_t
  * @param release 用来释放结点的value的函数
  * @return struct bt_root_t* 树根结构体
  */
-struct bt_root_t *bt_create_tree(struct bt_node_t *node, int (*cmp)(struct bt_node_t *a, struct bt_node_t *b), int (*release)(void *value));
+struct bt_root_t *bt_create_tree(struct bt_node_t *node, int (*cmp)(void *a, void *b), int (*release)(void *value));
 
 /**
  * @brief 创建结点

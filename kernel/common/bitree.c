@@ -3,9 +3,9 @@
 #include <common/errno.h>
 #include <debug/bug.h>
 
-#define smaller(root, a, b) (root->cmp(a, b) == -1)
-#define equal(root, a, b) (root->cmp(a, b) == 0)
-#define greater(root, a, b) (root->cmp(a, b) == 1)
+#define smaller(root, a, b) (root->cmp((a)->value, (b)->value) == -1)
+#define equal(root, a, b) (root->cmp((a)->value, (b)->value) == 0)
+#define greater(root, a, b) (root->cmp((a)->value, (b)->value) == 1)
 
 /**
  * @brief 创建二叉搜索树
@@ -15,7 +15,7 @@
  * @param release 用来释放结点的value的函数
  * @return struct bt_root_t* 树根结构体
  */
-struct bt_root_t *bt_create_tree(struct bt_node_t *node, int (*cmp)(struct bt_node_t *a, struct bt_node_t *b), int (*release)(void *value))
+struct bt_root_t *bt_create_tree(struct bt_node_t *node, int (*cmp)(void *a, void *b), int (*release)(void *value))
 {
     if (node == NULL || cmp == NULL)
         return -EINVAL;
@@ -109,6 +109,10 @@ int bt_query(struct bt_root_t *root, void *value, uint64_t *ret_addr)
     struct bt_node_t tmp_node = {0};
     tmp_node.value = value;
 
+    // 如果返回地址为0
+    if (ret_addr == NULL)
+        return -EINVAL;
+
     while (this_node != NULL && !equal(root, this_node, &tmp_node))
     {
         if (smaller(root, &tmp_node, this_node))
@@ -117,7 +121,7 @@ int bt_query(struct bt_root_t *root, void *value, uint64_t *ret_addr)
             this_node = this_node->right;
     }
 
-    if (equal(root, this_node, &tmp_node))
+    if (this_node != NULL && equal(root, this_node, &tmp_node))
     {
         *ret_addr = (uint64_t)this_node;
         return 0;

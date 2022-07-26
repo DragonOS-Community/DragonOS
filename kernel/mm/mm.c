@@ -641,7 +641,7 @@ int mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_s
                 {
                     if (unlikely(*pde_ptr != 0 && user))
                     {
-                        kwarn("page already mapped!");
+                        // kwarn("page already mapped!");
                         // 如果是用户态可访问的页，则释放当前新获取的物理页
                         if (likely(((ul)phys_addr_start + length_mapped) < total_2M_pages)) // 校验是否为内存中的物理页
                             free_pages(Phy_to_2M_Page((ul)phys_addr_start + length_mapped), 1);

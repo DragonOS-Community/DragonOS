@@ -106,6 +106,11 @@ void do_softirq()
     cli();
 }
 
+int clear_softirq_pending(uint32_t irq_num)
+{
+    clear_softirq_running(irq_num);
+}
+
 void softirq_init()
 {
     softirq_pending = 0;

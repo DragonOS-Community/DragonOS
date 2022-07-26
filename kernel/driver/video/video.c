@@ -75,12 +75,8 @@ void init_frame_buffer(bool level)
  */
 void video_refresh_framebuffer(void *data)
 {
-    // 暂时设置一个很大的值作为屏障，防止二次进入该区域（造成#GP）
-    video_refresh_expire_jiffies = timer_jiffies + 100000;
-    video_last_refresh_pid = current_pcb->pid;
-
+    video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
     memcpy((void *)sc_info.fb_vaddr, (void *)sc_info.double_fb_vaddr, (sc_info.length << 2));
-    video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL);
 }
 
 /**
@@ -103,7 +99,7 @@ int video_init(bool level)
         // timer_func_init(tmp, &video_refresh_framebuffer, NULL, 10*REFRESH_INTERVAL);
         // timer_func_add(tmp);
         register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
-        
+
         video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
 
         raise_softirq(VIDEO_REFRESH_SIRQ);

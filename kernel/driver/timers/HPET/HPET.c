@@ -1,5 +1,6 @@
 #include "HPET.h"
 #include <common/kprint.h>
+#include <common/compiler.h>
 #include <mm/mm.h>
 #include <driver/interrupt/apic/apic.h>
 #include <exception/softirq.h>
@@ -74,6 +75,12 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         if (timer_jiffies >= video_refresh_expire_jiffies || (video_last_refresh_pid != current_pcb->pid))
         {
             raise_softirq(VIDEO_REFRESH_SIRQ);
+            // 超过130ms仍未刷新完成，则重新发起刷新(防止由于进程异常退出导致的屏幕无法刷新)
+            if (unlikely(timer_jiffies >= (video_refresh_expire_jiffies + (1 << 17))))
+            {
+                video_refresh_expire_jiffies = timer_jiffies + (1 << 20);
+                clear_softirq_pending(VIDEO_REFRESH_SIRQ);
+            }
         }
         break;
 

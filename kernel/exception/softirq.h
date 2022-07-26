@@ -57,6 +57,7 @@ void unregister_softirq(uint32_t irq_num);
 void set_softirq_pending(uint64_t status);
 uint64_t get_softirq_pending();
 
+int clear_softirq_pending(uint32_t irq_num);
 /**
  * @brief 软中断处理程序
  *

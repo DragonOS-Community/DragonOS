@@ -12,9 +12,10 @@
  *
  * @param node 根节点
  * @param cmp 比较函数
+ * @param release 用来释放结点的value的函数
  * @return struct bt_root_t* 树根结构体
  */
-struct bt_root_t *bt_create_tree(struct bt_node_t *node, int (*cmp)(struct bt_node_t *a, struct bt_node_t *b))
+struct bt_root_t *bt_create_tree(struct bt_node_t *node, int (*cmp)(struct bt_node_t *a, struct bt_node_t *b), int (*release)(void *value))
 {
     if (node == NULL || cmp == NULL)
         return -EINVAL;
@@ -23,6 +24,8 @@ struct bt_root_t *bt_create_tree(struct bt_node_t *node, int (*cmp)(struct bt_no
     memset((void *)root, 0, sizeof(struct bt_root_t));
     root->bt_node = node;
     root->cmp = cmp;
+    root->release = release;
+    root->size = (node == NULL) ? 0 : 1;
 
     return root;
 }
@@ -86,7 +89,7 @@ int bt_insert(struct bt_root_t *root, void *value)
         else
             last_node->right = insert_node;
     }
-
+    ++root->size;
     return 0;
 
 failed:;
@@ -136,8 +139,8 @@ static struct bt_node_t *bt_get_minimum(struct bt_node_t *this_node)
 
 /**
  * @brief 删除结点
- * 
- * @param root 树根 
+ *
+ * @param root 树根
  * @param value 待删除结点的值
  * @return int 返回码
  */
@@ -181,6 +184,19 @@ int bt_delete(struct bt_root_t *root, void *value)
             to_delete->parent->right = to_delete_son;
     }
 
+    --root->size;
     // 释放最终要删除的结点的对象
     kfree(to_delete);
+}
+
+/**
+ * @brief 释放整个二叉搜索树
+ *
+ * @param root 树的根节点
+ * @return int 错误码
+ */
+int bt_destroy_tree(struct bt_root_t *root)
+{
+    //    todo: 待kfifo完成后，使用kfifo队列来辅助destroy
+    return -1;
 }

@@ -372,8 +372,6 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
         }
     }
     kBUG("Cannot alloc page, ZONE=%d\tnums=%d, total_2M_pages=%d", zone_select, num, total_2M_pages);
-    while (1)
-        ;
     return NULL;
 }
 

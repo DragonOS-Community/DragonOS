@@ -1,6 +1,5 @@
 #include "slab.h"
-
-
+#include <common/compiler.h>
 
 struct slab kmalloc_cache_group[16] =
     {
@@ -396,7 +395,7 @@ ul slab_init()
         page_init(page, PAGE_KERNEL_INIT | PAGE_KERNEL | PAGE_PGT_MAPPED);
     }
 
-    //kdebug("2.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+    // kdebug("2.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
 
     // 为slab内存池对象分配内存空间
     ul *virt = NULL;
@@ -417,7 +416,7 @@ ul slab_init()
 
         kmalloc_cache_group[i].cache_pool_entry->vaddr = virt;
     }
-    //kdebug("3.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
+    // kdebug("3.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
 
     kinfo("SLAB initialized successfully!");
 
@@ -550,7 +549,7 @@ void *kmalloc(unsigned long size, unsigned long flags)
 
     struct slab_obj *slab_obj_ptr = kmalloc_cache_group[index].cache_pool_entry;
 
-    //kdebug("count_total_free=%d", kmalloc_cache_group[index].count_total_free);
+    // kdebug("count_total_free=%d", kmalloc_cache_group[index].count_total_free);
 
     // 内存池没有可用的内存对象，需要进行扩容
     if (kmalloc_cache_group[index].count_total_free == 0)
@@ -617,6 +616,8 @@ void *kmalloc(unsigned long size, unsigned long flags)
  */
 unsigned long kfree(void *address)
 {
+    if (unlikely(address == NULL))
+        return 0;
     struct slab_obj *slab_obj_ptr = NULL;
 
     // 将线性地址按照2M物理页对齐, 获得所在物理页的起始线性地址

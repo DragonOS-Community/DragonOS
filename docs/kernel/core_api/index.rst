@@ -21,3 +21,4 @@
    :maxdepth: 1
 
    allocate-memory
+   mm-api

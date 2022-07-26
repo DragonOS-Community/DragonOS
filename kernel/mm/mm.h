@@ -58,10 +58,10 @@
 // 页面在页表中已被映射 mapped=1 unmapped=0
 #define PAGE_PGT_MAPPED (1 << 0)
 
-// 内核初始化程序的页 init-code=1 normal-code/data=0
+// 内核初始化所占用的页 init-code=1 normal-code/data=0
 #define PAGE_KERNEL_INIT (1 << 1)
 
-// 1=设备寄存器映射的内存 0=物理内存
+// 1=设备MMIO映射的内存 0=物理内存
 #define PAGE_DEVICE (1 << 2)
 
 // 内核层页 kernel=1 memory=0

@@ -18,7 +18,7 @@ LD_LIST := head.o
 OBJ_LIST := head.o
 
 
-kernel_subdirs := common driver process debug filesystem time arch exception mm smp sched syscall
+kernel_subdirs := common driver process debug filesystem time arch exception mm smp sched syscall ktest
 	
 
 
@@ -47,7 +47,7 @@ all: kernel
 	
 # 重新链接
 	echo "Re-Linking kernel..."
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") -T link.lds
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ./debug/kallsyms.o -T link.lds
 	echo "Generating kernel ELF file..."
 # 生成内核文件
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf

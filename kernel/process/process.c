@@ -5,6 +5,7 @@
 #include <common/stdio.h>
 #include <common/compiler.h>
 #include <common/libELF/elf.h>
+#include <common/time.h>
 #include <driver/video/video.h>
 #include <driver/usb/usb.h>
 #include <exception/gate.h>

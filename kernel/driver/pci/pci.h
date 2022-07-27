@@ -6,9 +6,8 @@
 #define PORT_PCI_CONFIG_ADDRESS 0xcf8
 #define PORT_PCI_CONFIG_DATA 0xcfc
 
-
 // pci设备结构信息的链表
-struct List * pci_device_structure_list = NULL;
+struct List *pci_device_structure_list = NULL;
 
 /**
  * @brief 初始化pci驱动
@@ -122,7 +121,6 @@ struct pci_device_structure_pci_to_pci_bridge_t
 
 } __attribute__((packed));
 
-
 /**
  * @brief 表头类型为0x2的pci设备结构（PCI to CardBus Bridge）
  *
@@ -162,7 +160,6 @@ struct pci_device_structure_pci_to_cardbus_bridge_t
 
 } __attribute__((packed));
 
-
 /**
  * @brief 从pci配置空间读取信息
  *
@@ -194,24 +191,22 @@ uint pci_write_config(uchar bus, uchar slot, uchar func, uchar offset, uint32_t 
  * @param func 功能号
  * @return 返回的header的指针
  */
-void* pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_list);
+void *pci_read_header(int *type, uchar bus, uchar slot, uchar func, bool add_to_list);
 
 /**
  * @brief 扫描所有pci总线上的所有设备
- * 
+ *
  */
 void pci_checkAllBuses();
 
-
-
 /**
  * @brief 获取 device structure
- * 
- * @param class_code 
- * @param sub_class 
+ *
+ * @param class_code
+ * @param sub_class
  * @param res 返回的结果数组
  */
-void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_device_structure_header_t* res[], uint32_t* count_res);
+void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_device_structure_header_t *res[], uint32_t *count_res);
 
 /**
  * @brief 寻找符合指定类型的capability list

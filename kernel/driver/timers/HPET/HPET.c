@@ -18,7 +18,13 @@ static uint32_t HPET_COUNTER_CLK_PERIOD = 0; // 主计数器时间精度（单�
 static double HPET_freq = 0;                 // 主计时器频率
 static uint8_t HPET_NUM_TIM_CAP = 0;         // 定时器数量
 static char measure_apic_timer_flag;         // 初始化apic时钟时所用到的标志变量
-extern struct rtc_time_t rtc_now;            // 导出全局墙上时钟
+
+// 测定tsc频率的临时变量
+static uint64_t test_tsc_start = 0;
+static uint64_t test_tsc_end = 0;
+extern uint64_t Cpu_tsc_freq; // 导出自cpu.c
+
+extern struct rtc_time_t rtc_now; // 导出全局墙上时钟
 
 enum
 {
@@ -91,11 +97,12 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 }
 
 /**
- * @brief 测量apic定时器频率的中断回调函数
+ * @brief 测定apic定时器以及tsc的频率的中断回调函数
  *
  */
-void HPET_measure_apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
+void HPET_measure_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
+    test_tsc_end = rdtsc();
     // 停止apic定时器
     // 写入每1ms的ticks
     apic_timer_stop();
@@ -104,10 +111,10 @@ void HPET_measure_apic_timer_handler(uint64_t number, uint64_t param, struct pt_
 }
 
 /**
- * @brief 测定apic定时器的频率
+ * @brief 测定apic定时器以及tsc的频率
  *
  */
-void HPET_measure_apic_timer_freq()
+void HPET_measure_freq()
 {
     kinfo("Measuring local APIC timer's frequency...");
     const uint64_t interval = APIC_TIMER_INTERVAL; // 测量给定时间内的计数
@@ -136,7 +143,7 @@ void HPET_measure_apic_timer_freq()
     measure_apic_timer_flag = false;
 
     // 注册中断
-    irq_register(34, &entry, &HPET_measure_apic_timer_handler, 0, &HPET_intr_controller, "HPET0 measure");
+    irq_register(34, &entry, &HPET_measure_handler, 0, &HPET_intr_controller, "HPET0 measure");
 
     // 设置div16
     apic_timer_stop();
@@ -148,6 +155,8 @@ void HPET_measure_apic_timer_freq()
     // 启动apic定时器
     apic_timer_set_LVT(151, 0, APIC_LVT_Timer_One_Shot);
     *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 3; // 置位旧设备中断路由兼容标志位、定时器组使能标志位，开始计时
+    // 顺便测定tsc频率
+    test_tsc_start = rdtsc();
     io_mfence();
 
     while (measure_apic_timer_flag == false)
@@ -158,6 +167,10 @@ void HPET_measure_apic_timer_freq()
     *(uint64_t *)(HPET_REG_BASE + GEN_CONF) = 0; // 停用HPET定时器
     io_mfence();
     kinfo("Local APIC timer's freq: %d ticks/ms.", apic_timer_ticks_result);
+    // 计算tsc频率
+    Cpu_tsc_freq = (test_tsc_end - test_tsc_start) * (1000UL / interval);
+
+    kinfo("TSC frequency: %ldMHz", Cpu_tsc_freq / 1000000);
 }
 
 /**

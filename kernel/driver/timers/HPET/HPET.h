@@ -10,10 +10,10 @@
 int HPET_init();
 
 /**
- * @brief 测定apic定时器的频率
+ * @brief 测定apic定时器以及tsc的频率
  *
  */
-void HPET_measure_apic_timer_freq();
+void HPET_measure_freq();
 
 /**
  * @brief 启用HPET周期中断（5ms）

@@ -26,6 +26,8 @@ uint Cpu_Processor_Type;
 uint Cpu_max_phys_addrline_size;
 // 处理器支持的最大线性地址可寻址地址线宽度
 uint Cpu_max_linear_addrline_size;
+// 处理器的tsc频率（单位：hz）(HPET定时器在测定apic频率时，顺便测定了这个值)
+uint64_t Cpu_tsc_freq = 0;
 
 struct cpu_core_info_t cpu_core_info[MAX_CPU_NUM];
 void cpu_init(void)
@@ -115,6 +117,6 @@ uint32_t cpu_get_core_crysral_freq()
                          : "0"(0x15), "2"(0)
                          : "memory");
     // kdebug("Cpu_cpuid_max_Basic_mop = %#03x, a=%ld, b=%ld, c=%ld, d=%ld", Cpu_cpuid_max_Basic_mop, a, b, c, d);
-    
+
     return c;
 }

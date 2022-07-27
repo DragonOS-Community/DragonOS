@@ -29,39 +29,41 @@ extern uint32_t Cpu_max_phys_addrline_size;
 // 处理器支持的最大线性地址可寻址地址线宽度
 extern uint32_t Cpu_max_linear_addrline_size;
 
+// 处理器的tsc频率（单位：hz）(HPET定时器在测定apic频率时，顺便测定了这个值)
+extern uint64_t Cpu_tsc_freq;
+
 /**
  * @brief 执行cpuid指令
- * 
+ *
  * @param mop 主功能号
  * @param sop 子功能号
  * @param eax 结果的eax值
  * @param ebx 结果的ebx值
  * @param ecx 结果的ecx值
  * @param edx 结果的edx值
- * 
+ *
  * cpuid指令参考英特尔开发手册卷2A Chapter3 3.2 Instruction
  */
-void cpu_cpuid(uint32_t mop, uint32_t sop, uint32_t *eax, uint32_t*ebx, uint32_t*ecx, uint32_t*edx);
+void cpu_cpuid(uint32_t mop, uint32_t sop, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx);
 
 /**
  * @brief 初始化获取处理器信息模块
- * 
+ *
  */
 void cpu_init(void);
 
 struct cpu_core_info_t
 {
-    uint64_t stack_start;   // 栈基地址
-    uint64_t ist_stack_start;   // IST栈基地址
-    uint64_t tss_vaddr; // tss地址
+    uint64_t stack_start;     // 栈基地址
+    uint64_t ist_stack_start; // IST栈基地址
+    uint64_t tss_vaddr;       // tss地址
 };
 
 extern struct cpu_core_info_t cpu_core_info[MAX_CPU_NUM];
 
-
 /**
  * @brief 获取当前cpu核心晶振频率
- * 
+ *
  * @return uint32_t 当前cpu核心晶振频率
  */
 uint32_t cpu_get_core_crysral_freq();

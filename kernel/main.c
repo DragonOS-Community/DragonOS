@@ -144,7 +144,7 @@ void system_initialize()
 
     // process_init();
     HPET_init();
-    HPET_measure_apic_timer_freq();
+    HPET_measure_freq();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
     

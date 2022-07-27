@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <common/stddef.h>
 #include <arch/arch.h>
+#include <common/compiler.h>
 
 #define sti() __asm__ __volatile__("sti\n\t" :: \
                                        : "memory") //开启外部中断
@@ -26,6 +27,13 @@
                                              : "memory") // 在sfence指令前的写操作必须在sfence指令后的写操作前完成
 #define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
                                              : "memory") // 在lfence指令前的读操作必须在lfence指令后的读操作前完成。
+
+#define rdtsc() ({                                    \
+    uint64_t tmp1 = 0, tmp2 = 0;                      \
+    asm volatile("rdtsc"                              \
+                 : "=d"(tmp1), "=a"(tmp2)::"memory"); \
+    (tmp1 << 32 | tmp2);                              \
+})
 
 /**
  * @brief 根据结构体变量内某个成员变量member的基地址，计算出该结构体变量的基地址
@@ -170,7 +178,7 @@ static inline struct List *list_next(struct List *entry)
 //计算字符串的长度（经过测试，该版本比采用repne/scasb汇编的运行速度快16.8%左右）
 static inline int strlen(const char *s)
 {
-    if(s == NULL)
+    if (s == NULL)
         return 0;
     register int __res = 0;
     while (s[__res] != '\0')
@@ -182,10 +190,10 @@ static inline int strlen(const char *s)
 
 /**
  * @brief 测量字符串的长度
- * 
+ *
  * @param src 字符串
  * @param maxlen 最大长度
- * @return long 
+ * @return long
  */
 long strnlen(const char *src, unsigned long maxlen);
 
@@ -213,14 +221,14 @@ void *memset(void *dst, unsigned char C, ul size)
     return dst;
 }
 
-void *memset_c(void* dst, uint8_t c, size_t count)
+void *memset_c(void *dst, uint8_t c, size_t count)
 {
-    uint8_t* xs = (uint8_t*)dst;
- 
-     while (count--)
-          *xs++ = c;
-  
-     return dst;
+    uint8_t *xs = (uint8_t *)dst;
+
+    while (count--)
+        *xs++ = c;
+
+    return dst;
 }
 
 /**
@@ -233,7 +241,7 @@ void *memset_c(void* dst, uint8_t c, size_t count)
  */
 static void *memcpy(void *dst, const void *src, long Num)
 {
-    int d0=0, d1=0, d2=0;
+    int d0 = 0, d1 = 0, d2 = 0;
     __asm__ __volatile__("cld	\n\t"
                          "rep	\n\t"
                          "movsq	\n\t"
@@ -282,7 +290,6 @@ int strcmp(char *FirstPart, char *SecondPart)
                          :);
     return __res;
 }
-
 
 // 从io口读入8个bit
 unsigned char io_in8(unsigned short port)

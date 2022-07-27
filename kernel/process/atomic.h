@@ -24,7 +24,7 @@ typedef struct
  * @param ato 原子变量对象
  * @param val 要增加的值
  */
-static inline void atomic_add(atomic_t *ato, long val)
+inline void atomic_add(atomic_t *ato, long val)
 {
     asm volatile("lock addq %1, %0 \n\t"
                  : "=m"(ato->value)
@@ -38,7 +38,7 @@ static inline void atomic_add(atomic_t *ato, long val)
  * @param ato 原子变量对象
  * @param val 要减少的值
  */
-static inline void atomic_sub(atomic_t *ato, long val)
+inline void atomic_sub(atomic_t *ato, long val)
 {
     asm volatile("lock subq %1, %0  \n\t"
                  : "=m"(ato->value)
@@ -51,7 +51,7 @@ static inline void atomic_sub(atomic_t *ato, long val)
  *
  * @param ato 原子变量对象
  */
-static inline void atomic_inc(atomic_t *ato)
+void atomic_inc(atomic_t *ato)
 {
     asm volatile("lock incq %0   \n\t"
                  : "=m"(ato->value)
@@ -64,7 +64,7 @@ static inline void atomic_inc(atomic_t *ato)
  *
  * @param ato 原子变量对象
  */
-static inline void atomic_dec(atomic_t *ato)
+void atomic_dec(atomic_t *ato)
 {
     asm volatile("lock decq %0 \n\t"
                  : "=m"(ato->value)
@@ -77,7 +77,7 @@ static inline void atomic_dec(atomic_t *ato)
  *
  * @param ato 原子变量对象
  */
-static inline void atomic_set_mask(atomic_t *ato, long mask)
+inline void atomic_set_mask(atomic_t *ato, long mask)
 {
     __asm__ __volatile__("lock	orq	%1,	%0	\n\t"
                          : "=m"(ato->value)
@@ -90,7 +90,7 @@ static inline void atomic_set_mask(atomic_t *ato, long mask)
  *
  * @param ato 原子变量对象
  */
-static inline void atomic_clear_mask(atomic_t *ato, long mask)
+inline void atomic_clear_mask(atomic_t *ato, long mask)
 {
     __asm__ __volatile__("lock	andq	%1,	%0	\n\t"
                          : "=m"(ato->value)

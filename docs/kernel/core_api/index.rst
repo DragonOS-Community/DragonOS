@@ -9,6 +9,7 @@
    :caption: 内核实用函数库
 
    kernel_api
+   atomic
 
 内存管理
 ===================

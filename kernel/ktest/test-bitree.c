@@ -127,6 +127,6 @@ uint64_t ktest_test_bitree(uint64_t arg)
         kTEST("Testing case %d", i);
         kt_bitree_func_table[i](0, 0);
     }
-    kdebug("bitree Test done.");
+    kTEST("bitree Test done.");
     return 0;
 }

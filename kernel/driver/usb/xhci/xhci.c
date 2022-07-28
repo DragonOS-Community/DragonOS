@@ -347,7 +347,7 @@ static uint32_t xhci_hc_get_protocol_offset(int id, uint32_t list_off, const int
                 *offset = (uint32_t)(dw2 & 0xff) - 1; // 使其转换为zero based
             if (count != NULL)
                 *count = (uint32_t)((dw2 & 0xff00) >> 8);
-            if (protocol_flag != NULL)
+            if (protocol_flag != NULL && version == 2)
                 *protocol_flag = (uint16_t)((dw2 >> 16) & 0x0fff);
 
             return next_list_off;

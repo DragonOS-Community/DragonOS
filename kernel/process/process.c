@@ -415,8 +415,10 @@ ul initial_kernel_thread(ul arg)
     fat32_init();
     usb_init();
 
-    pid_t test_thread_pid = kernel_thread(ktest_test_bitree, 1, 0);
-    kdebug("test_thread_pid=%d", test_thread_pid);
+    // 对一些组件进行单元测试
+    kernel_thread(ktest_test_bitree, 0, 0);
+    kernel_thread(ktest_test_kfifo, 0, 0);
+
     // 准备切换到用户态
     struct pt_regs *regs;
 
@@ -644,7 +646,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     if (process_copy_flags(clone_flags, tsk))
         goto copy_flags_failed;
 
-    kdebug("before copy mm");
     // 拷贝内存空间分布结构体
     if (process_copy_mm(clone_flags, tsk))
         goto copy_mm_failed;

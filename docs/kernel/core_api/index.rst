@@ -10,6 +10,7 @@
 
    kernel_api
    atomic
+   data_structures
 
 内存管理
 ===================

@@ -22,7 +22,7 @@ struct kfifo_t
 })
 
 /**
- * @brief 忽略kfifo队列中的所有内容，并使得输出偏移量为输入偏移量
+ * @brief 忽略kfifo队列中的所有内容，并将输入偏移量赋值给输出偏移量
  *
  */
 #define kfifo_reset_out(fifo) (void)({      \
@@ -38,10 +38,10 @@ struct kfifo_t
  */
 #define kfifo_total_size(fifo) ((fifo)->total_size)
 /**
- * @brief 获取kfifo缓冲区当前已有元素大小
+ * @brief 获取kfifo缓冲区当前已使用的大小
  *
  * @param fifo 队列结构体
- * @return uint32_t 缓冲区当前已有元素大小
+ * @return uint32_t 缓冲区当前已使用的大小
  */
 #define kfifo_size(fifo) ((fifo)->size)
 
@@ -88,7 +88,7 @@ void kfifo_free_alloc(struct kfifo_t* fifo);
 void kfifo_init(struct kfifo_t *fifo, void *buffer, uint32_t size);
 
 /**
- * @brief 向kfifo缓冲区推入数据
+ * @brief 向kfifo缓冲区推入指定大小的数据
  *
  * @param fifo 队列结构体
  * @param from 来源数据地址

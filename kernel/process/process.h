@@ -115,7 +115,7 @@ struct process_control_block
 	// 进程切换时保存的状态信息
 	struct thread_struct *thread;
 
-	// 连接各个pcb的双向链表（todo：删除这个变量）
+	// 连接各个pcb的双向链表
 	struct List list;
 
 	// 地址空间范围

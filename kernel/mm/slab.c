@@ -541,11 +541,13 @@ void *kmalloc(unsigned long size, unsigned long flags)
     }
     int index;
     for (int i = 0; i < 16; ++i)
+    {
         if (kmalloc_cache_group[i].size >= size)
         {
             index = i;
             break;
         }
+    }
 
     struct slab_obj *slab_obj_ptr = kmalloc_cache_group[index].cache_pool_entry;
 

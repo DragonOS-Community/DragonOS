@@ -416,8 +416,8 @@ ul initial_kernel_thread(ul arg)
     usb_init();
 
     // 对一些组件进行单元测试
-    kernel_thread(ktest_test_bitree, 0, 0);
-    kernel_thread(ktest_test_kfifo, 0, 0);
+    ktest_start(ktest_test_bitree, 0);
+    ktest_start(ktest_test_kfifo, 0);
 
     // 准备切换到用户态
     struct pt_regs *regs;

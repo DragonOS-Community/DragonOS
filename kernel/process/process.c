@@ -422,6 +422,8 @@ ul initial_kernel_thread(ul arg)
     // 准备切换到用户态
     struct pt_regs *regs;
 
+    // 若在后面这段代码中触发中断，return时会导致段选择子错误，从而触发#GP，因此这里需要cli
+    cli();
     current_pcb->thread->rip = (ul)ret_from_system_call;
     current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
     current_pcb->thread->fs = USER_DS | 0x3;

@@ -27,8 +27,10 @@ ENTRY(kernel_thread_func)
     popq	%rax		   
     movq	%rax,	%es	   
     popq	%rax		   
-    addq	$0x38,	%rsp	   
-    movq	%rdx,	%rdi	   
+    addq	$0x20,	%rsp	   
+    popfq
+    addq    $0x10,  %rsp
+    movq	%rdx,	%rdi  
     callq	*%rbx		   
     movq	%rax,	%rdi	   
     callq	process_do_exit		  

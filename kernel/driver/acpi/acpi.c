@@ -215,5 +215,5 @@ void acpi_init()
             ;
     }
 
-    kinfo("ACPI module initialized!")
+    kinfo("ACPI module initialized!");
 }

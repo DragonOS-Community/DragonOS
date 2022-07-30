@@ -19,7 +19,7 @@
         printk(" ] ");                         \
         printk(__VA_ARGS__);                   \
         printk("\n");                          \
-    } while (0);
+    } while (0)
 
 #define kinfo(...)           \
     do                       \
@@ -27,7 +27,7 @@
         printk("[ INFO ] "); \
         printk(__VA_ARGS__); \
         printk("\n");        \
-    } while (0);
+    } while (0)
 
 #define kdebug(...)                                        \
     do                                                     \
@@ -45,7 +45,7 @@
         printk(" ] "); \
         printk(__VA_ARGS__);                       \
         printk("\n");                              \
-    } while (0);
+    } while (0)
 
 #define kerror(...)                        \
     do                                     \
@@ -55,7 +55,7 @@
         printk(" ] ");                     \
         printk(__VA_ARGS__);               \
         printk("\n");                      \
-    } while (0);
+    } while (0)
 
 #define kterminated(...)                        \
     do                                          \
@@ -65,7 +65,7 @@
         printk(" ] ");                          \
         printk(__VA_ARGS__);                    \
         printk("\n");                           \
-    } while (0);
+    } while (0)
 
 #define kBUG(...)                                   \
     do                                              \
@@ -75,4 +75,4 @@
         printk(" ] (%s:%d)\t", __FILE__, __LINE__); \
         printk(__VA_ARGS__);                        \
         printk("\n");                               \
-    } while (0);
+    } while (0)

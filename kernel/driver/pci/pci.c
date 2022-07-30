@@ -466,7 +466,7 @@ void pci_init()
 
         ptr = container_of(list_next(&(ptr->list)), struct pci_device_structure_header_t, list);
     }
-    kinfo("PCI bus initialized.")
+    kinfo("PCI bus initialized.");
 }
 
 

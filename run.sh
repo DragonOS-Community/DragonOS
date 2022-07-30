@@ -1,9 +1,9 @@
 # ======检查是否以sudo运行=================
-#uid=`id -u`
-#if [ ! $uid == "0" ];then
-#  echo "请以sudo权限运行"
-#  exit
-#fi
+uid=`id -u`
+if [ ! $uid == "0" ];then
+ echo "请以sudo权限运行"
+ exit
+fi
 GENERATE_ISO=0
 IN_DOCKER=0
 
@@ -33,12 +33,9 @@ bochsrc="./bochsrc"
 ARCH="x86_64"
 
 # 内核映像
-kernel='./bin/kernel/kernel.elf'
-iso_boot_grub='./iso/boot/grub'
-iso_boot='./iso/boot/'
-iso='./DragonOS.iso'
-iso_folder='./iso/'
 root_folder="$(pwd)"
+kernel="${root_folder}/bin/kernel/kernel.elf"
+boot_folder="${root_folder}/bin/disk_mount/boot"
 
 if [ "${GENERATE_ISO}" == "1" ]; then
     echo "开始生成iso..."
@@ -75,28 +72,48 @@ if [ "${GENERATE_ISO}" == "1" ]; then
             exit
         fi
     fi
-    # 检测路径是否合法，发生过 rm -rf -f /* 的惨剧
-    if [ "${iso_boot}" == "" ]; then
-        echo iso_boot path error.
-    else
-        mkdir -p ${iso_boot}
-        rm -rf -f ${iso_boot}/*
+
+    # 拷贝程序到硬盘
+    cd tools
+    # 判断是否存在硬盘镜像文件，如果不存在，就创建一个(docker模式下，由于镜像中缺少qemu-img不会创建)
+    if [ ! -f "${root_folder}/bin/disk.img" ]; then
+        echo "创建硬盘镜像文件..."
+        bash ./create_hdd_image.sh
     fi
+
+    mkdir -p ${root_folder}/bin/disk_mount
+    bash mount_virt_disk.sh || exit 1
+    mkdir -p ${boot_folder}/grub
+    cp ${kernel} ${root_folder}/bin/disk_mount/boot
+    cp ${root_folder}/bin/user/shell.elf ${root_folder}/bin/disk_mount
+    cp ${root_folder}/bin/user/about.elf ${root_folder}/bin/disk_mount
+    mkdir -p ${root_folder}/bin/disk_mount/dev
+    touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
+    
 
     # 设置 grub 相关数据
     if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-        cp ${kernel} ${iso_boot}
-        mkdir ${iso_boot_grub}
-        touch ${iso_boot_grub}/grub.cfg
-        echo 'set timeout=15
+        
+        touch ${root_folder}/bin/disk_mount/boot/grub/grub.cfg
+cfg_content='set timeout=15
         set default=0
         menuentry "DragonOS" {
         multiboot2 /boot/kernel.elf "KERNEL_ELF"
-    }' >${iso_boot_grub}/grub.cfg
+    }'
+    echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
     fi
 
-    ${GRUB_PATH}/grub-mkrescue -o ${iso} ${iso_folder}
-    rm -rf ${iso_folder}
+
+    # ${GRUB_PATH}/grub-mkrescue -o ${iso} ${iso_folder}
+    # rm -rf ${iso_folder}
+LOOP_DEVICE=$(lsblk | grep disk_mount)
+
+    grub-install --target=i386-pc --boot-directory=${root_folder}/bin/disk_mount/boot/ /dev/${LOOP_DEVICE:2:5}
+
+    sync
+    bash umount_virt_disk.sh
+    cd ..
+
     if [ "${IN_DOCKER}" == "1" ]; then
         echo "运行在docker中, 构建结束"
         exit 0
@@ -105,26 +122,16 @@ fi
 
 
 # 进行启动前检查
-flag_can_run=0
+flag_can_run=1
 
-if [ -d "${iso_folder}" ]; then
-  flag_can_run=0
-  echo "${iso_folder} 文件夹未删除！"
-else
-  flag_can_run=1
-fi
+# if [ -d "${iso_folder}" ]; then
+#   flag_can_run=0
+#   echo "${iso_folder} 文件夹未删除！"
+# else
+#   flag_can_run=1
+# fi
 
-# 拷贝应用程序到硬盘
-cd tools
-bash m*
-sudo mkdir -p ${root_folder}/bin/disk_mount
-sudo cp ${root_folder}/bin/user/shell.elf ${root_folder}/bin/disk_mount
-sudo cp ${root_folder}/bin/user/about.elf ${root_folder}/bin/disk_mount
-sudo mkdir ${root_folder}/bin/disk_mount/dev
-sudo touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
-sync
-bash u*
-cd ..
+
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
 
 # 调试usb的trace
@@ -134,7 +141,7 @@ if [ $flag_can_run -eq 1 ]; then
   if [ ${IA32_USE_QEMU} == 0 ]; then
         bochs -q -f ${bochsrc} -rc ./tools/bochsinit
     else
-        qemu-system-x86_64 -cdrom ${iso} -m 512M -smp 2,cores=2,threads=1,sockets=1 \
+        qemu-system-x86_64 -d bin/disk.img -m 512M -smp 2,cores=2,threads=1,sockets=1 \
         -boot order=d   \
         -monitor stdio -d cpu_reset,guest_errors,trace:check_exception,exec,cpu,out_asm,in_asm,${qemu_trace_usb} \
         -s -S -cpu "IvyBridge,+apic,+x2apic,+fpu,check,${allflags}" --enable-kvm -rtc clock=host,base=localtime -serial file:serial_opt.txt \

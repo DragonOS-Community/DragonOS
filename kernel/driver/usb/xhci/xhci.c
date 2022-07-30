@@ -115,7 +115,7 @@ hardware_intr_controller xhci_hc_intr_controller =
 #define xhci_TRB_set_link_cmd(trb_vaddr)                                       \
     do                                                                         \
     {                                                                          \
-        struct xhci_TRB_normal_t *ptr = (struct xhci_TRB_normal_t *)trb_vaddr; \
+        struct xhci_TRB_normal_t *ptr = (struct xhci_TRB_normal_t *)(trb_vaddr); \
         ptr->TRB_type = TRB_TYPE_LINK;                                         \
         ptr->ioc = 0;                                                          \
         ptr->chain = 0;                                                        \

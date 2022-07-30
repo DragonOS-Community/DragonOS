@@ -9,17 +9,6 @@
 
 #define KEYBOARD_CMD_RESET_BUFFER 1
 
-/**
- * @brief 键盘循环队列缓冲区结构体
- *
- */
-struct ps2_keyboard_input_buffer
-{
-    unsigned char *ptr_head;
-    unsigned char *ptr_tail;
-    int count;
-    unsigned char buffer[ps2_keyboard_buffer_size];
-};
 
 #define PORT_PS2_KEYBOARD_DATA 0x60
 #define PORT_PS2_KEYBOARD_STATUS 0x64

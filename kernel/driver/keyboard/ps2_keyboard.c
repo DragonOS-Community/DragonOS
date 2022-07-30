@@ -6,9 +6,11 @@
 #include <filesystem/VFS/VFS.h>
 #include <process/wait_queue.h>
 #include <process/spinlock.h>
+#include <common/kfifo.h>
 
 // 键盘输入缓冲区
-static struct ps2_keyboard_input_buffer *kb_buf_ptr = NULL;
+static struct kfifo_t kb_buf;
+
 // 缓冲区等待队列
 static wait_queue_node_t ps2_keyboard_wait_queue;
 
@@ -20,13 +22,9 @@ static spinlock_t ps2_kb_buf_rw_lock;
  *
  * @param kbp 缓冲区对象指针
  */
-static void ps2_keyboard_reset_buffer(struct ps2_keyboard_input_buffer *kbp)
+static void ps2_keyboard_reset_buffer(struct kfifo_t *kbp)
 {
-    kbp->ptr_head = kb_buf_ptr->buffer;
-    kbp->ptr_tail = kb_buf_ptr->buffer;
-    kbp->count = 0;
-    // 清空输入缓冲区
-    memset(kbp->buffer, 0, ps2_keyboard_buffer_size);
+    kfifo_reset(kbp);
 }
 struct apic_IO_APIC_RTE_entry entry;
 
@@ -49,8 +47,8 @@ hardware_intr_controller ps2_keyboard_intr_controller =
  */
 long ps2_keyboard_open(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
 {
-    filp->private_data = (void *)kb_buf_ptr;
-    ps2_keyboard_reset_buffer(kb_buf_ptr);
+    filp->private_data = &kb_buf;
+    ps2_keyboard_reset_buffer(&kb_buf);
     return 0;
 }
 
@@ -64,7 +62,7 @@ long ps2_keyboard_open(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
 long ps2_keyboard_close(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
 {
     filp->private_data = NULL;
-    ps2_keyboard_reset_buffer(kb_buf_ptr);
+    ps2_keyboard_reset_buffer(&kb_buf);
     return 0;
 }
 
@@ -82,7 +80,7 @@ long ps2_keyboard_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *filp,
     switch (cmd)
     {
     case KEYBOARD_CMD_RESET_BUFFER:
-        ps2_keyboard_reset_buffer(kb_buf_ptr);
+        ps2_keyboard_reset_buffer(&kb_buf);
         break;
 
     default:
@@ -103,35 +101,11 @@ long ps2_keyboard_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *filp,
 long ps2_keyboard_read(struct vfs_file_t *filp, char *buf, int64_t count, long *position)
 {
     // 缓冲区为空则等待
-    if (kb_buf_ptr->count == 0)
+    if (kfifo_empty(&kb_buf))
         wait_queue_sleep_on(&ps2_keyboard_wait_queue);
 
-    long counter = kb_buf_ptr->count >= count ? count : kb_buf_ptr->count;
-
-    uint8_t *tail = kb_buf_ptr->ptr_tail;
-    int64_t tmp = (kb_buf_ptr->buffer + ps2_keyboard_buffer_size - tail);
-
-    // 要读取的部分没有越过缓冲区末尾
-    if (counter <= tmp)
-    {
-        copy_to_user(buf, tail, counter);
-        kb_buf_ptr->ptr_tail += counter;
-        // tail越界，则将其重新放置到起始位置
-        if (kb_buf_ptr->ptr_tail == kb_buf_ptr->buffer + ps2_keyboard_buffer_size)
-            kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer;
-    }
-    else // 要读取的部分越过了缓冲区的末尾，进行循环
-    {
-
-        if (tmp > 0)
-            copy_to_user(buf, tail, tmp);
-        if (counter - tmp > 0)
-            copy_to_user(buf, kb_buf_ptr->buffer, counter - tmp);
-        kb_buf_ptr->ptr_tail = kb_buf_ptr->buffer + (counter - tmp);
-    }
-
-    kb_buf_ptr->count -= counter;
-    return counter;
+    count = (count > kb_buf.size) ? kb_buf.size : count;
+    return kfifo_out(&kb_buf, buf, count);
 }
 
 /**
@@ -167,24 +141,16 @@ struct vfs_file_operations_t ps2_keyboard_fops =
  * @param param 参数
  * @param regs 寄存器信息
  */
-void ps2_keyboard_handler(ul irq_num, ul param, struct pt_regs *regs)
+void ps2_keyboard_handler(ul irq_num, ul buf_vaddr, struct pt_regs *regs)
 {
     unsigned char x = io_in8(PORT_PS2_KEYBOARD_DATA);
-    // printk_color(ORANGE, BLACK, "key_pressed:%02x\n", x);
 
-    // 当头指针越过界时，恢复指向数组头部
-    if (kb_buf_ptr->ptr_head == kb_buf_ptr->buffer + ps2_keyboard_buffer_size)
-        kb_buf_ptr->ptr_head = kb_buf_ptr->buffer;
-
-    if (kb_buf_ptr->count >= ps2_keyboard_buffer_size)
+    uint8_t count = kfifo_in((struct kfifo_t*)buf_vaddr, &x, sizeof(unsigned char));
+    if (count == 0)
     {
-        kwarn("ps2_keyboard input buffer is full.");
+        kwarn("ps2 keyboard buffer full.");
         return;
     }
-
-    *kb_buf_ptr->ptr_head = x;
-    ++(kb_buf_ptr->count);
-    ++(kb_buf_ptr->ptr_head);
 
     wait_queue_wakeup(&ps2_keyboard_wait_queue, PROC_UNINTERRUPTIBLE);
 }
@@ -197,10 +163,8 @@ void ps2_keyboard_init()
 
     // ======= 初始化键盘循环队列缓冲区 ===========
 
-    // 申请键盘循环队列缓冲区的内存
-    kb_buf_ptr = (struct ps2_keyboard_input_buffer *)kmalloc(sizeof(struct ps2_keyboard_input_buffer), 0);
-
-    ps2_keyboard_reset_buffer(kb_buf_ptr);
+    // 初始化键盘循环队列缓冲区
+    kfifo_alloc(&kb_buf, ps2_keyboard_buffer_size, 0);
 
     // ======== 初始化中断RTE entry ==========
 
@@ -235,7 +199,7 @@ void ps2_keyboard_init()
     spin_init(&ps2_kb_buf_rw_lock);
 
     // 注册中断处理程序
-    irq_register(PS2_KEYBOARD_INTR_VECTOR, &entry, &ps2_keyboard_handler, (ul)kb_buf_ptr, &ps2_keyboard_intr_controller, "ps/2 keyboard");
+    irq_register(PS2_KEYBOARD_INTR_VECTOR, &entry, &ps2_keyboard_handler, (ul)&kb_buf, &ps2_keyboard_intr_controller, "ps/2 keyboard");
 
     // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
     io_in8(PORT_PS2_KEYBOARD_DATA);
@@ -249,5 +213,5 @@ void ps2_keyboard_init()
 void ps2_keyboard_exit()
 {
     irq_unregister(PS2_KEYBOARD_INTR_VECTOR);
-    kfree((ul *)kb_buf_ptr);
+    kfifo_free_alloc(&kb_buf);
 }

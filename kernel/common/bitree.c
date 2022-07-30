@@ -213,9 +213,7 @@ int bt_destroy_tree(struct bt_root_t *root)
     {
         // 取出队列头部的结点指针
         struct bt_node_t *nd;
-        uint64_t res;
-        int count = kfifo_out(&fifo, &res, sizeof(uint64_t));
-        nd = (struct bt_node_t *)res;
+        int count = kfifo_out(&fifo, &nd, sizeof(uint64_t));
 
         // 将子节点加入队列
         if (nd->left != NULL)

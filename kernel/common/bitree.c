@@ -1,6 +1,7 @@
 #include "bitree.h"
 #include <mm/slab.h>
 #include <common/errno.h>
+#include <common/kfifo.h>
 #include <debug/bug.h>
 
 #define smaller(root, a, b) (root->cmp((a)->value, (b)->value) == -1)
@@ -201,6 +202,34 @@ int bt_delete(struct bt_root_t *root, void *value)
  */
 int bt_destroy_tree(struct bt_root_t *root)
 {
-    //    todo: 待kfifo完成后，使用kfifo队列来辅助destroy
-    return -1;
+    // 新建一个kfifo缓冲区，将指向结点的指针存入fifo队列
+    // 注：为了将指针指向的地址存入队列，我们需要对指针取地址
+    struct kfifo_t fifo;
+    kfifo_alloc(&fifo, ((root->size + 1) / 2) * sizeof(struct bt_node_t *), 0);
+    kfifo_in(&fifo, (void *)&(root->bt_node), sizeof(struct bt_node_t *));
+
+    // bfs
+    while (!kfifo_empty(&fifo))
+    {
+        // 取出队列头部的结点指针
+        struct bt_node_t *nd;
+        uint64_t res;
+        int count = kfifo_out(&fifo, &res, sizeof(uint64_t));
+        nd = (struct bt_node_t *)res;
+
+        // 将子节点加入队列
+        if (nd->left != NULL)
+            kfifo_in(&fifo, (void *)&(nd->left), sizeof(struct bt_node_t *));
+
+        if (nd->right != NULL)
+            kfifo_in(&fifo, (void *)&(nd->right), sizeof(struct bt_node_t *));
+
+        // 销毁当前节点
+        root->release(nd->value);
+        kfree(nd);
+    }
+
+    kfifo_free_alloc(&fifo);
+
+    return 0;
 }

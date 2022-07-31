@@ -5,7 +5,7 @@
 #include <common/cpu.h>
 #include <mm/slab.h>
 #include <process/process.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 
 #include <sched/sched.h>
 

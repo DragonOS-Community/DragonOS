@@ -5,7 +5,7 @@
 #include "kprint.h"
 #include <driver/multiboot2/multiboot2.h>
 #include <mm/mm.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>

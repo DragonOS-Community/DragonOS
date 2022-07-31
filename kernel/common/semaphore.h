@@ -10,7 +10,7 @@
  */
 
 #pragma once
-#include <process/atomic.h>
+#include <common/atomic.h>
 
 #include <process/process.h>
 #include <sched/sched.h>

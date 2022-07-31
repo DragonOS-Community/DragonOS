@@ -1,7 +1,7 @@
 #include "sched.h"
 #include <common/kprint.h>
 #include <driver/video/video.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 
 struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
 

@@ -3,7 +3,7 @@
 #include <common/kprint.h>
 #include <driver/pci/pci.h>
 #include <debug/bug.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 
 extern spinlock_t xhci_controller_init_lock; // xhci控制器初始化锁
 

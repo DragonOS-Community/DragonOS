@@ -2,7 +2,7 @@
 #include <common/kprint.h>
 #include <driver/disk/ahci/ahci.h>
 #include <filesystem/MBR.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 #include <mm/slab.h>
 #include <common/errno.h>
 #include <common/stdio.h>

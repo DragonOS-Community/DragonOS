@@ -2,7 +2,7 @@
 
 ## 简介
 
-&emsp;&emsp;DragonOS实现了原子变量，类型为atomic_t. 原子变量是基于具体体系结构的原子操作指令实现的。具体实现在`kernel/process/atomic.h`中。
+&emsp;&emsp;DragonOS实现了原子变量，类型为atomic_t. 原子变量是基于具体体系结构的原子操作指令实现的。具体实现在`kernel/common/atomic.h`中。
 
 ## API
 

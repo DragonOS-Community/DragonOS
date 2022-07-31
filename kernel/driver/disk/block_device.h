@@ -2,7 +2,7 @@
 
 #include <common/glib.h>
 #include "stdint.h"
-#include <process/semaphore.h>
+#include <common/semaphore.h>
 
 #define BLK_TYPE_AHCI 0
 struct block_device_operation

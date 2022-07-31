@@ -10,7 +10,7 @@
 #include <smp/ipi.h>
 #include <driver/video/video.h>
 #include <driver/interrupt/apic/apic_timer.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 
 static struct acpi_HPET_description_table_t *hpet_table;
 static uint64_t HPET_REG_BASE = 0;

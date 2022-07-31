@@ -6,7 +6,7 @@
 #include <common/kprint.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 #include <exception/softirq.h>
 
 // 每个时刻只能有1个进程新增定时任务

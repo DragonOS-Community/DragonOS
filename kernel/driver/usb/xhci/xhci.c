@@ -1,7 +1,7 @@
 #include "xhci.h"
 #include <common/kprint.h>
 #include <debug/bug.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <debug/traceback/traceback.h>

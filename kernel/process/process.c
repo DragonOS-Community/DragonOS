@@ -11,7 +11,7 @@
 #include <exception/gate.h>
 #include <filesystem/fat32/fat32.h>
 #include <mm/slab.h>
-#include <process/spinlock.h>
+#include <common/spinlock.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
 #include <sched/sched.h>

@@ -4,8 +4,8 @@
 #include <mm/slab.h>
 #include <common/printk.h>
 #include <filesystem/VFS/VFS.h>
-#include <process/wait_queue.h>
-#include <process/spinlock.h>
+#include <common/wait_queue.h>
+#include <common/spinlock.h>
 #include <common/kfifo.h>
 
 // 键盘输入缓冲区

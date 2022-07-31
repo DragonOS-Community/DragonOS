@@ -17,7 +17,7 @@
 #include "ptrace.h"
 #include <common/errno.h>
 #include <filesystem/VFS/VFS.h>
-#include <process/wait_queue.h>
+#include <common/wait_queue.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16

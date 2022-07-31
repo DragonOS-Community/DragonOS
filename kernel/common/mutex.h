@@ -17,8 +17,8 @@ typedef struct
 {
 
     atomic_t count; // 锁计数。1->已解锁。 0->已上锁,且有可能存在等待者
-    spinlock_t wait_lock;
-    struct List wait_list;
+    spinlock_t wait_lock;   // mutex操作锁，用于对mutex的list的操作进行加锁
+    struct List wait_list;  // Mutex的等待队列
 } mutex_t;
 
 /**

@@ -16,8 +16,7 @@
 extern void system_call(void);
 extern void syscall_int(void);
 
-extern uint64_t sys_clock(struct pt_regs* regs);
-
+extern uint64_t sys_clock(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -166,7 +165,7 @@ uint64_t sys_open(struct pt_regs *regs)
         // kdebug("tmp_index=%d", tmp_index);
         if (tmp_index > 0)
         {
-            
+
             path[tmp_index] = '\0';
             dentry = vfs_path_walk(path, 0);
             if (dentry == NULL)
@@ -470,8 +469,6 @@ uint64_t sys_brk(struct pt_regs *regs)
     else
         offset = -(int64_t)(current_pcb->mm->brk_end - new_brk);
 
-    
-
     new_brk = mm_do_brk(current_pcb->mm->brk_end, offset); // 扩展堆内存空间
 
     current_pcb->mm->brk_end = new_brk;
@@ -705,7 +702,8 @@ uint64_t sys_wait4(struct pt_regs *regs)
         wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
 
     // 拷贝子进程的返回码
-    *status = child_proc->exit_code;
+    if (likely(status != NULL))
+        *status = child_proc->exit_code;
     // copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
     proc->next_pcb = child_proc->next_pcb;
 
@@ -727,11 +725,10 @@ uint64_t sys_exit(struct pt_regs *regs)
     return process_do_exit(regs->r8);
 }
 
-
-uint64_t sys_nanosleep(struct pt_regs * regs)
+uint64_t sys_nanosleep(struct pt_regs *regs)
 {
-    const struct timespec * rqtp = (const struct timespec*)regs->r8;
-    struct timespec * rmtp = (struct timespec*)regs->r9;
+    const struct timespec *rqtp = (const struct timespec *)regs->r8;
+    struct timespec *rmtp = (struct timespec *)regs->r9;
 
     return nanosleep(rqtp, rmtp);
 }

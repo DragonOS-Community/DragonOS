@@ -2,7 +2,7 @@
 CFLAGS += -I .
 
 
-all: ktest.o bitree.o kfifo.o
+all: ktest.o bitree.o kfifo.o mutex.o
 
 ktest.o: ktest.c
 	gcc $(CFLAGS) -c ktest.c -o ktest.o
@@ -12,3 +12,6 @@ bitree.o: test-bitree.c
 
 kfifo.o: test-kfifo.c
 	gcc $(CFLAGS) -c test-kfifo.c -o test-kfifo.o
+
+mutex.o: test-mutex.c
+	gcc $(CFLAGS) -c test-mutex.c -o test-mutex.o

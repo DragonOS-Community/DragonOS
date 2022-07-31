@@ -18,7 +18,7 @@
         printk("[ kTEST ] file:%s, Line:%d\t", __FILE__, __LINE__); \
         printk(__VA_ARGS__);                                        \
         printk("\n");                                               \
-    } while (0);
+    } while (0)
 
 /**
  * @brief 测试用例函数表

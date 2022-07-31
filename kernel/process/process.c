@@ -6,6 +6,7 @@
 #include <common/compiler.h>
 #include <common/libELF/elf.h>
 #include <common/time.h>
+#include <common/sys/wait.h>
 #include <driver/video/video.h>
 #include <driver/usb/usb.h>
 #include <exception/gate.h>
@@ -416,8 +417,14 @@ ul initial_kernel_thread(ul arg)
     usb_init();
 
     // 对一些组件进行单元测试
-    ktest_start(ktest_test_bitree, 0);
-    ktest_start(ktest_test_kfifo, 0);
+    uint64_t tpid[] = {
+        ktest_start(ktest_test_bitree, 0),
+        ktest_start(ktest_test_kfifo, 0),
+        ktest_start(ktest_test_mutex, 0),
+    };
+    // 等待测试进程退出
+    for(int i=0;i<sizeof(tpid)/sizeof(uint64_t);++i)
+        waitpid(tpid[i], NULL, NULL);
 
     // 准备切换到用户态
     struct pt_regs *regs;

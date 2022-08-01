@@ -11,8 +11,8 @@
 static ul Total_Memory = 0;
 static ul total_2M_pages = 0;
 static ul root_page_table_phys_addr = 0; // 内核层根页表的物理地址
-#pragma GCC push_options
-#pragma GCC optimize("O0")
+// #pragma GCC push_options
+// #pragma GCC optimize("O3")
 
 struct memory_desc memory_management_struct = {{0}, 0};
 /**
@@ -85,9 +85,10 @@ void mm_init()
     int count;
 
     multiboot2_iter(multiboot2_get_memory, mb2_mem_info, &count);
-
+    io_mfence();
     for (int i = 0; i < count; ++i)
     {
+        io_mfence();
         //可用的内存
         if (mb2_mem_info->type == 1)
             Total_Memory += mb2_mem_info->len;
@@ -106,12 +107,12 @@ void mm_init()
     printk("[ INFO ] Total amounts of RAM : %ld bytes\n", Total_Memory);
 
     // 计算有效内存页数
-
+    io_mfence();
     for (int i = 0; i < memory_management_struct.len_e820; ++i)
     {
         if (memory_management_struct.e820[i].type != 1)
             continue;
-
+        io_mfence();
         // 将内存段的起始物理地址按照2M进行对齐
         ul addr_start = PAGE_2M_ALIGN(memory_management_struct.e820[i].BaseAddr);
         // 将内存段的终止物理地址的低2M区域清空，以实现对齐
@@ -120,7 +121,7 @@ void mm_init()
         // 内存段不可用
         if (addr_end <= addr_start)
             continue;
-
+        io_mfence();
         total_2M_pages += ((addr_end - addr_start) >> PAGE_2M_SHIFT);
     }
     kinfo("Total amounts of 2M pages : %ld.", total_2M_pages);
@@ -129,16 +130,18 @@ void mm_init()
     ul max_addr = memory_management_struct.e820[memory_management_struct.len_e820].BaseAddr + memory_management_struct.e820[memory_management_struct.len_e820].Length;
     // 初始化mms的bitmap
     // bmp的指针指向截止位置的4k对齐的上边界（防止修改了别的数据）
+    io_mfence();
     memory_management_struct.bmp = (unsigned long *)((memory_management_struct.start_brk + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
     memory_management_struct.bits_size = max_addr >> PAGE_2M_SHIFT;                                                                                         // 物理地址空间的最大页面数
     memory_management_struct.bmp_len = (((unsigned long)(max_addr >> PAGE_2M_SHIFT) + sizeof(unsigned long) * 8 - 1) / 8) & (~(sizeof(unsigned long) - 1)); // bmp由多少个unsigned long变量组成
+    io_mfence();
 
     // 初始化bitmap， 先将整个bmp空间全部置位。稍后再将可用物理内存页复位。
     memset(memory_management_struct.bmp, 0xff, memory_management_struct.bmp_len);
-
+    io_mfence();
+    kdebug("1212112");
     // 初始化内存页结构
     // 将页结构映射于bmp之后
-
     memory_management_struct.pages_struct = (struct Page *)(((unsigned long)memory_management_struct.bmp + memory_management_struct.bmp_len + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
 
     memory_management_struct.count_pages = max_addr >> PAGE_2M_SHIFT;
@@ -146,18 +149,25 @@ void mm_init()
     // 将pages_struct全部清空，以备后续初始化
     memset(memory_management_struct.pages_struct, 0x00, memory_management_struct.pages_struct_len); // init pages memory
 
+    kdebug("ffff");
+    io_mfence();
     // 初始化内存区域
     memory_management_struct.zones_struct = (struct Zone *)(((ul)memory_management_struct.pages_struct + memory_management_struct.pages_struct_len + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
+    io_mfence();
     // 由于暂时无法计算zone结构体的数量，因此先将其设为0
     memory_management_struct.count_zones = 0;
+    io_mfence();
     // zones-struct 成员变量暂时按照5个来计算
     memory_management_struct.zones_struct_len = (10 * sizeof(struct Zone) + sizeof(ul) - 1) & (~(sizeof(ul) - 1));
+    io_mfence();
     memset(memory_management_struct.zones_struct, 0x00, memory_management_struct.zones_struct_len);
 
     // ==== 遍历e820数组，完成成员变量初始化工作 ===
 
+    kdebug("ddd");
     for (int i = 0; i < memory_management_struct.len_e820; ++i)
     {
+        io_mfence();
         if (memory_management_struct.e820[i].type != 1) // 不是操作系统可以使用的物理内存
             continue;
         ul addr_start = PAGE_2M_ALIGN(memory_management_struct.e820[i].BaseAddr);
@@ -203,7 +213,7 @@ void mm_init()
 
     // 初始化0~2MB的物理页
     // 由于这个区间的内存由多个内存段组成，因此不会被以上代码初始化，需要我们手动配置page[0]。
-
+    io_mfence();
     memory_management_struct.pages_struct->zone = memory_management_struct.zones_struct;
     memory_management_struct.pages_struct->addr_phys = 0UL;
     set_page_attr(memory_management_struct.pages_struct, PAGE_PGT_MAPPED | PAGE_KERNEL_INIT | PAGE_KERNEL);
@@ -219,27 +229,13 @@ void mm_init()
     ZONE_NORMAL_INDEX = 0;
     ZONE_UNMAPPED_INDEX = 0;
 
-    /*
-    for (int i = 0; i < memory_management_struct.count_zones; ++i)
-    {
-        struct Zone *z = memory_management_struct.zones_struct + i;
-        // printk_color(ORANGE, BLACK, "zone_addr_start:%#18lx, zone_addr_end:%#18lx, zone_length:%#18lx, pages_group:%#18lx, count_pages:%#18lx\n",
-        //             z->zone_addr_start, z->zone_addr_end, z->zone_length, z->pages_group, z->count_pages);
-
-        // 1GB以上的内存空间不做映射
-        // if (z->zone_addr_start >= 0x100000000 && (!ZONE_UNMAPPED_INDEX))
-        //    ZONE_UNMAPPED_INDEX = i;
-    }
-    */
+    
     // kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
     //  设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
-    // printk_color(ORANGE, BLACK, "code_start:%#18lx, code_end:%#18lx, data_end:%#18lx, kernel_end:%#18lx, end_of_struct:%#18lx\n",
-    //              memory_management_struct.kernel_code_start, memory_management_struct.kernel_code_end, memory_management_struct.kernel_data_end, memory_management_struct.kernel_end, memory_management_struct.end_of_struct);
-
+    
     // 初始化内存管理单元结构所占的物理页的结构体
-
     ul mms_max_page = (virt_2_phys(memory_management_struct.end_of_struct) >> PAGE_2M_SHIFT); // 内存管理单元所占据的序号最大的物理页
     // kdebug("mms_max_page=%ld", mms_max_page);
 
@@ -248,6 +244,7 @@ void mm_init()
     // 第0个page已经在上方配置
     for (ul j = 1; j <= mms_max_page; ++j)
     {
+        barrier();
         tmp_page = memory_management_struct.pages_struct + j;
         page_init(tmp_page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
         page_num = tmp_page->addr_phys >> PAGE_2M_SHIFT;
@@ -981,4 +978,4 @@ int8_t mm_is_2M_page(uint64_t paddr)
         return 1;
     else return 0;
 }
-#pragma GCC pop_options
+// #pragma GCC pop_options

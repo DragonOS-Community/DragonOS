@@ -10,8 +10,7 @@
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 #include "math.h"
-#pragma GCC push_options
-#pragma GCC optimize("O0")
+
 struct printk_screen_info pos;
 extern ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
 static spinlock_t printk_lock;
@@ -46,6 +45,8 @@ static uint *get_pos_VBE_FB_addr();
  */
 static int cls();
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 /**
  * @brief 滚动窗口（尚不支持向下滚动)
  *
@@ -54,7 +55,7 @@ static int cls();
  * @param animation 是否包含滑动动画
  */
 static int scroll(bool direction, int pixels, bool animation);
-
+#pragma GCC pop_options
 /**
  * @brief 将数字按照指定的要求转换成对应的字符串（2~36进制）
  *
@@ -960,4 +961,3 @@ int sprintk(char *buf, const char *fmt, ...)
     return count;
 }
 
-#pragma GCC pop_options

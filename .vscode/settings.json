@@ -113,7 +113,8 @@
         "ia64_msi.h": "c",
         "errno.h": "c",
         "bug.h": "c",
-        "apic_timer.h": "c"
+        "apic_timer.h": "c",
+        "sched.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

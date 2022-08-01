@@ -3,13 +3,15 @@ CFLAGS += -I .
 
 kernel_common_subdirs:=libELF math
 
-all: glib.o printk.o cpu.o bitree.o kfifo.o wait_queue.o mutex.o wait.o unistd.o
-	@list='$(kernel_common_subdirs)'; for subdir in $$list; do \
-    		echo "make all in $$subdir";\
-    		cd $$subdir;\
-    		$(MAKE) all CFLAGS="$(CFLAGS)";\
-    		cd ..;\
-	done
+ECHO:
+	@echo "$@"
+
+$(kernel_common_subdirs): ECHO
+
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"
+
+all: glib.o printk.o cpu.o bitree.o kfifo.o wait_queue.o mutex.o wait.o unistd.o $(kernel_common_subdirs)
+
 
 glib.o: glib.c
 	gcc $(CFLAGS) -c glib.c -o glib.o

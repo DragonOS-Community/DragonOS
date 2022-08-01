@@ -17,7 +17,7 @@ generate_kallsyms: kallsyms.o
 	
 	nm -n $(kernel_root_path)/kernel | ./kallsyms > kallsyms.S
 	gcc -c kallsyms.S -o kallsyms.o
-	echo "Kallsyms generated."
+	@echo "Kallsyms generated."
 
 
 clean:

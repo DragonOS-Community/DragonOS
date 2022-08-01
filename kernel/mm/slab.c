@@ -351,6 +351,7 @@ ul slab_init()
 
     for (int i = 0; i < 16; ++i)
     {
+        spin_init(&kmalloc_cache_group[i].lock);
         // 将slab内存池对象的空间放置在mms的后面，并且预留4个unsigned long 的空间以防止内存越界
         kmalloc_cache_group[i].cache_pool_entry = (struct slab_obj *)memory_management_struct.end_of_struct;
 
@@ -395,8 +396,6 @@ ul slab_init()
         page_init(page, PAGE_KERNEL_INIT | PAGE_KERNEL | PAGE_PGT_MAPPED);
     }
 
-    // kdebug("2.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
-
     // 为slab内存池对象分配内存空间
     ul *virt = NULL;
     for (int i = 0; i < 16; ++i)
@@ -416,7 +415,6 @@ ul slab_init()
 
         kmalloc_cache_group[i].cache_pool_entry->vaddr = virt;
     }
-    // kdebug("3.memory_management_struct.bmp:%#018lx\tzone_struct->count_pages_using:%d\tzone_struct->count_pages_free:%d", *memory_management_struct.bmp, memory_management_struct.zones_struct->count_pages_using, memory_management_struct.zones_struct->count_pages_free);
 
     kinfo("SLAB initialized successfully!");
 
@@ -548,22 +546,22 @@ void *kmalloc(unsigned long size, unsigned long flags)
             break;
         }
     }
+    // 对当前内存池加锁
+    spin_lock(&kmalloc_cache_group[index].lock);
 
     struct slab_obj *slab_obj_ptr = kmalloc_cache_group[index].cache_pool_entry;
 
-    // kdebug("count_total_free=%d", kmalloc_cache_group[index].count_total_free);
-
     // 内存池没有可用的内存对象，需要进行扩容
-    if (kmalloc_cache_group[index].count_total_free == 0)
+    if (unlikely(kmalloc_cache_group[index].count_total_free == 0))
     {
         // 创建slab_obj
         slab_obj_ptr = kmalloc_create_slab_obj(kmalloc_cache_group[index].size);
 
         // BUG
-        if (slab_obj_ptr == NULL)
+        if (unlikely(slab_obj_ptr == NULL))
         {
             kBUG("kmalloc()->kmalloc_create_slab_obj()=>slab == NULL");
-            return NULL;
+            goto failed;
         }
 
         kmalloc_cache_group[index].count_total_free += slab_obj_ptr->count_free;
@@ -601,11 +599,14 @@ void *kmalloc(unsigned long size, unsigned long flags)
 
             --kmalloc_cache_group[index].count_total_free;
             ++kmalloc_cache_group[index].count_total_using;
-
+            // 放锁
+            spin_unlock(&kmalloc_cache_group[index].lock);
+            // 返回内存对象
             return (void *)((char *)slab_obj_ptr->vaddr + kmalloc_cache_group[index].size * i);
         }
     }
-
+failed:;
+    spin_unlock(&kmalloc_cache_group[index].lock);
     kerror("kmalloc(): Cannot alloc more memory: %d bytes", size);
     return NULL;
 }
@@ -634,13 +635,14 @@ unsigned long kfree(void *address)
         do
         {
             // 不属于当前slab_obj的管理范围
-            if (slab_obj_ptr->vaddr != page_base_addr)
+            if (likely(slab_obj_ptr->vaddr != page_base_addr))
             {
                 slab_obj_ptr = container_of(list_next(&slab_obj_ptr->list), struct slab_obj, list);
             }
             else
             {
-
+                // 对当前内存池加锁
+                spin_lock(&kmalloc_cache_group[i].lock);
                 // 计算地址属于哪一个内存对象
                 index = (address - slab_obj_ptr->vaddr) / kmalloc_cache_group[i].size;
 
@@ -685,6 +687,8 @@ unsigned long kfree(void *address)
                         break;
                     }
                 }
+                // 放锁
+                spin_unlock(&kmalloc_cache_group[i].lock);
                 return 0;
             }
 

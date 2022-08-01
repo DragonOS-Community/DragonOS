@@ -4,6 +4,7 @@
 #include <common/glib.h>
 #include <common/printk.h>
 #include <common/kprint.h>
+#include <common/spinlock.h>
 
 #define SIZEOF_LONG_ALIGN(size) ((size + sizeof(long) - 1) & ~(sizeof(long) - 1))
 #define SIZEOF_INT_ALIGN(size) ((size + sizeof(int) - 1) & ~(sizeof(int) - 1))
@@ -41,6 +42,8 @@ struct slab
     struct slab_obj *cache_pool_entry;
     // dma内存池对象
     struct slab_obj *cache_dma_pool_entry;
+
+    spinlock_t lock;    // 当前内存池的操作锁
 
     // 内存池的构造函数和析构函数
     void *(*constructor)(void *vaddr, ul arg);

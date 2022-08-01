@@ -93,6 +93,7 @@ struct List
 static inline void list_init(struct List *list)
 {
     list->next = list;
+    io_mfence();
     list->prev = list;
 }
 
@@ -106,8 +107,11 @@ static inline void list_add(struct List *entry, struct List *node)
 {
 
     node->next = entry->next;
+    barrier();
     node->prev = entry;
+    barrier();
     node->next->prev = node;
+    barrier();
     entry->next = node;
 }
 

@@ -3,8 +3,6 @@
 #include <common/glib.h>
 #include <process/process.h>
 
-#pragma GCC push_options
-#pragma GCC optimize("O0")
 // @todo: 用红黑树重写cfs的队列
 struct sched_queue_t
 {
@@ -49,4 +47,3 @@ void sched_init();
  */
 void sched_update_jiffies();
 
-#pragma GCC pop_options

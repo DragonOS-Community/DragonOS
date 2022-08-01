@@ -3,8 +3,6 @@
 #include <driver/video/video.h>
 #include <common/spinlock.h>
 
-#pragma GCC push_options
-#pragma GCC optimize("O0")
 
 struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
 
@@ -161,4 +159,3 @@ void sched_init()
         sched_cfs_ready_queue[i].proc_queue.virtual_runtime = 0x7fffffffffffffff;
     }
 }
-#pragma GCC pop_options

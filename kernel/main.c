@@ -132,6 +132,8 @@ void system_initialize()
     timer_init();
 
     smp_init();
+    kdebug("after smp init");
+    
     cpu_init();
     ps2_keyboard_init();
     // ps2_mouse_init();
@@ -147,17 +149,16 @@ void system_initialize()
     HPET_measure_freq();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
-    
+
     process_init();
     // 对显示模块进行高级初始化，启用double buffer
     video_init(true);
 
     // fat32_init();
     HPET_enable();
-    
+
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
     apic_timer_init();
-    
 }
 
 //操作系统内核从这里开始执行
@@ -191,5 +192,6 @@ void Start_Kernel(void)
 void ignore_int()
 {
     kwarn("Unknown interrupt or fault at RIP.\n");
-    while(1);
+    while (1)
+        ;
 }

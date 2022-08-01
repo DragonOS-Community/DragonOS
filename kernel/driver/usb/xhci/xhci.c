@@ -9,6 +9,9 @@
 #include <exception/irq.h>
 #include <driver/interrupt/apic/apic.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+
 spinlock_t xhci_controller_init_lock = {0}; // xhci控制器初始化锁(在usb_init中被初始化)
 
 static int xhci_ctrl_count = 0; // xhci控制器计数
@@ -922,3 +925,4 @@ failed_exceed_max:;
     kerror("Failed to initialize controller: bus=%d, dev=%d, func=%d", dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func);
     spin_unlock(&xhci_controller_init_lock);
 }
+#pragma GCC optimize("O0")

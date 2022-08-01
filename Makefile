@@ -7,7 +7,7 @@ export ARCH=__x86_64__
 export ROOT_PATH=$(shell pwd)
 
 export DEBUG=DEBUG
-export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -O0 -fno-stack-protector -D $(ARCH) 
+export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -O1 -fno-stack-protector -D $(ARCH) 
 
 ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 

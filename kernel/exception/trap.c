@@ -1,3 +1,4 @@
+// #pragma GCC optimize ("O0")
 #include "trap.h"
 #include "gate.h"
 #include <process/ptrace.h>

@@ -22,9 +22,18 @@ extern uint64_t sys_clock(struct pt_regs *regs);
  * @brief 导出系统调用处理函数的符号
  *
  */
-#define SYSCALL_COMMON(syscall_num, symbol) extern unsigned long symbol(struct pt_regs *regs);
-SYSCALL_COMMON(0, system_call_not_exists); // 导出system_call_not_exists函数
-#undef SYSCALL_COMMON                      // 取消前述宏定义
+
+/**
+ * @brief 系统调用不存在时的处理函数
+ *
+ * @param regs 进程3特权级下的寄存器
+ * @return ul
+ */
+ul system_call_not_exists(struct pt_regs *regs)
+{
+    kerror("System call [ ID #%d ] not exists.", regs->rax);
+    return ESYSCALL_NOT_EXISTS;
+}                    // 取消前述宏定义
 
 /**
  * @brief 重新定义为：把系统调用函数加入系统调用表

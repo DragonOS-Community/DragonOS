@@ -122,7 +122,7 @@ void HPET_measure_freq()
 
     // 使用I/O APIC 的IRQ2接收hpet定时器0的中断
     apic_make_rte_entry(&entry, 34, IO_APIC_FIXED, DEST_PHYSICAL, IDLE, POLARITY_HIGH, IRR_RESET, EDGE_TRIGGER, MASKED, 0);
-
+    
     // 计算HPET0间隔多少个时钟周期触发一次中断
     uint64_t clks_to_intr = 0.001 * interval * HPET_freq;
     // kdebug("clks_to_intr=%#ld", clks_to_intr);
@@ -158,9 +158,9 @@ void HPET_measure_freq()
     // 顺便测定tsc频率
     test_tsc_start = rdtsc();
     io_mfence();
-
     while (measure_apic_timer_flag == false)
         ;
+    kdebug("wait done");
 
     irq_unregister(34);
 

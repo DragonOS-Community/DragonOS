@@ -10,10 +10,11 @@
  */
 
 #pragma once
-
 #include <common/glib.h>
 
 #include <process/ptrace.h>
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
 
 #define IRQ_NUM 24
 #define SMP_IRQ_NUM 10
@@ -165,3 +166,4 @@ int irq_unregister(ul irq_num);
  * @brief 初始化中断模块
  */
 void irq_init();
+#pragma GCC pop_options

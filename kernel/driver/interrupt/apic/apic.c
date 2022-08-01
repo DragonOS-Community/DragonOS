@@ -10,6 +10,8 @@
 #include <process/process.h>
 #include <sched/sched.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
 
@@ -650,6 +652,7 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
  *
  * @param irq_num
  */
+
 void apic_local_apic_edge_ack(ul irq_num)
 {
     // 向EOI寄存器写入0x00表示结束中断
@@ -659,6 +662,7 @@ void apic_local_apic_edge_ack(ul irq_num)
                          "wrmsr	\n\t" ::
                              : "memory");
 }
+
 
 /**
  * @brief 读取指定类型的 Interrupt Control Structure
@@ -735,3 +739,4 @@ void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, u
         entry->destination.logical.reserved1 = 0;
     }
 }
+#pragma GCC pop_options

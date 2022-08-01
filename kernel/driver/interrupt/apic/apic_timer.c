@@ -4,6 +4,8 @@
 #include <common/kprint.h>
 #include <sched/sched.h>
 
+// #pragma GCC push_options
+// #pragma GCC optimize("O0")
 uint64_t apic_timer_ticks_result = 0;
 
 void apic_timer_enable(uint64_t irq_num)

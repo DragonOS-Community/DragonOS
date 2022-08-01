@@ -10,7 +10,8 @@
 #include <sched/sched.h>
 
 #include "ipi.h"
-
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs); // 由BSP转发的HPET中断处理函数
 
 static spinlock_t multi_core_starting_lock; // 多核启动锁
@@ -177,3 +178,5 @@ void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs)
 {
     sched_update_jiffies();
 }
+
+#pragma GCC optimize("O0")

@@ -21,6 +21,9 @@
 
 #include <ktest/ktest.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
 
@@ -108,7 +111,6 @@ void process_exit_thread(struct process_control_block *pcb);
  * 由于程序在进入内核的时候已经保存了寄存器，因此这里不需要保存寄存器。
  * 这里切换fs和gs寄存器
  */
-
 void __switch_to(struct process_control_block *prev, struct process_control_block *next)
 {
     initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
@@ -1088,3 +1090,5 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
 void process_exit_thread(struct process_control_block *pcb)
 {
 }
+
+#pragma GCC pop_options

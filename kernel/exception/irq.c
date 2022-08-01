@@ -47,7 +47,7 @@
 
 // 构造中断entry
 // 为了复用返回函数的代码，需要压入一个错误码0
-
+// todo: 将这里改为volatile，也许能解决编译选项为O1时，系统崩溃的问题
 #define Build_IRQ(number)                                                         \
     void IRQ_NAME(number);                                                        \
     __asm__(SYMBOL_NAME_STR(IRQ) #number "interrupt:   \n\t"                      \

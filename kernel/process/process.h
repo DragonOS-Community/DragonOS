@@ -95,6 +95,7 @@ struct thread_struct
 #define PF_KTHREAD (1UL << 0)	 // 内核线程
 #define PF_NEED_SCHED (1UL << 1) // 进程需要被调度
 #define PF_VFORK (1UL << 2)		 // 标志进程是否由于vfork而存在资源共享
+#define PF_KFORK (1UL << 3)		 // 标志在内核态下调用fork（临时标记，do_fork()结束后会将其复位）
 
 /**
  * @brief 进程控制块
@@ -124,7 +125,7 @@ struct process_control_block
 	uint64_t addr_limit;
 
 	long pid;
-	long priority;		  // 优先级
+	long priority;			 // 优先级
 	int64_t virtual_runtime; // 虚拟运行时间
 
 	// 进程拥有的文件描述符的指针数组

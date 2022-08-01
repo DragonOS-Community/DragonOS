@@ -86,6 +86,7 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
         : "=a"(err_code)
         : "a"(syscall_id), "m"(arg0), "m"(arg1), "m"(arg2), "m"(arg3), "m"(arg4), "m"(arg5), "m"(arg6), "m"(arg7)
         : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+
     return err_code;
 }
 
@@ -426,12 +427,10 @@ uint64_t sys_lseek(struct pt_regs *regs)
 
 uint64_t sys_fork(struct pt_regs *regs)
 {
-    // kdebug("sys_fork");
     return do_fork(regs, 0, regs->rsp, 0);
 }
 uint64_t sys_vfork(struct pt_regs *regs)
 {
-    kdebug("sys vfork");
     return do_fork(regs, CLONE_VM | CLONE_FS | CLONE_SIGNAL, regs->rsp, 0);
 }
 

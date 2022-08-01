@@ -16,6 +16,8 @@
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
 #include <sched/sched.h>
+#include <common/unistd.h>
+#include <debug/traceback/traceback.h>
 
 #include <ktest/ktest.h>
 
@@ -121,7 +123,6 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
-    // wrmsr(0x175, next->thread->rbp);
 }
 
 /**
@@ -375,7 +376,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
             strncpy((char *)(str_addr - argv_len), argv[argc], argv_len - 1);
             str_addr -= argv_len;
             dst_argv[argc] = (char *)str_addr;
-            //字符串加上结尾字符
+            // 字符串加上结尾字符
             ((char *)str_addr)[argv_len] = '\0';
         }
 
@@ -422,9 +423,20 @@ ul initial_kernel_thread(ul arg)
         ktest_start(ktest_test_kfifo, 0),
         ktest_start(ktest_test_mutex, 0),
     };
+    kinfo("Waiting test thread exit...");
     // 等待测试进程退出
-    for(int i=0;i<sizeof(tpid)/sizeof(uint64_t);++i)
+    for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
         waitpid(tpid[i], NULL, NULL);
+    kinfo("All test done.");
+    // pid_t p = fork();
+    // if (p == 0)
+    // {
+    //     kdebug("in subproc, rflags=%#018lx", get_rflags());
+
+    //     while (1)
+    //         usleep(1000);
+    // }
+    // kdebug("subprocess pid=%d", p);
 
     // 准备切换到用户态
     struct pt_regs *regs;
@@ -439,8 +451,6 @@ ul initial_kernel_thread(ul arg)
     // 主动放弃内核线程身份
     current_pcb->flags &= (~PF_KTHREAD);
     kdebug("in initial_kernel_thread: flags=%ld", current_pcb->flags);
-    // current_pcb->mm->pgd = kmalloc(PAGE_4K_SIZE, 0);
-    // memset((void*)current_pcb->mm->pgd, 0, PAGE_4K_SIZE);
 
     regs = (struct pt_regs *)current_pcb->thread->rsp;
     // kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
@@ -492,7 +502,7 @@ ul process_do_exit(ul code)
     sched_cfs();
 
     while (1)
-        hlt();
+        pause();
 }
 
 /**
@@ -604,11 +614,9 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 {
     int retval = 0;
     struct process_control_block *tsk = NULL;
-    // kdebug("222\tregs.rip = %#018lx", regs->rip);
 
     // 为新的进程分配栈空间，并将pcb放置在底部
     tsk = (struct process_control_block *)kmalloc(STACK_SIZE, 0);
-    // kdebug("struct process_control_block ADDRESS=%#018lx", (uint64_t)tsk);
 
     if (tsk == NULL)
     {
@@ -620,12 +628,13 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 将当前进程的pcb复制到新的pcb内
     memcpy(tsk, current_pcb, sizeof(struct process_control_block));
 
-    // kdebug("current_pcb->flags=%#010lx", current_pcb->flags);
-
-    // 将进程加入循环链表
+    // 初始化进程的循环链表结点
     list_init(&tsk->list);
 
-    // list_add(&initial_proc_union.pcb.list, &tsk->list);
+    // 判断是否为内核态调用fork
+    if (current_pcb->flags & PF_KTHREAD && stack_start != 0)
+        tsk->flags |= PF_KFORK;
+
     tsk->priority = 2;
     tsk->preempt_count = 0;
 
@@ -647,7 +656,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     wait_queue_init(&tsk->wait_child_proc_exit, NULL);
 
     list_init(&tsk->list);
-    // list_add(&initial_proc_union.pcb.list, &tsk->list);
 
     retval = -ENOMEM;
 
@@ -669,6 +677,8 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 拷贝成功
     retval = tsk->pid;
+
+    tsk->flags &= ~PF_KFORK;
 
     // 唤醒进程
     process_wakeup(tsk);
@@ -811,7 +821,6 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
     // 与父进程共享内存空间
     if (clone_flags & CLONE_VM)
     {
-        // kdebug("copy_vm\t current_pcb->mm->pgd=%#018lx", current_pcb->mm->pgd);
         pcb->mm = current_pcb->mm;
 
         return retval;
@@ -973,6 +982,48 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
 
     return 0;
 }
+
+/**
+ * @brief 重写内核栈中的rbp地址
+ *
+ * @param new_regs 子进程的reg
+ * @param new_pcb 子进程的pcb
+ * @return int
+ */
+static int process_rewrite_rbp(struct pt_regs *new_regs, struct process_control_block *new_pcb)
+{
+
+    uint64_t new_top = ((uint64_t)new_pcb) + STACK_SIZE;
+    uint64_t old_top = (uint64_t)(current_pcb) + STACK_SIZE;
+
+    uint64_t *rbp = &new_regs->rbp;
+    uint64_t *tmp = rbp;
+
+    // 超出内核栈范围
+    if ((uint64_t)*rbp >= old_top || (uint64_t)*rbp < (old_top - STACK_SIZE))
+        return 0;
+
+    while (1)
+    {
+        // 计算delta
+        uint64_t delta = old_top - *rbp;
+        // 计算新的rbp值
+        uint64_t newVal = new_top - delta;
+
+        // 新的值不合法
+        if (unlikely((uint64_t)newVal >= new_top || (uint64_t)newVal < (new_top - STACK_SIZE)))
+            break;
+        // 将新的值写入对应位置
+        *rbp = newVal;
+        // 跳转栈帧
+        rbp = (uint64_t *)*rbp;
+    }
+
+    // 设置内核态fork返回到enter_syscall_int()函数内的时候，rsp寄存器的值
+    new_regs->rsp = new_top - (old_top - new_regs->rsp);
+    return 0;
+}
+
 /**
  * @brief 拷贝当前进程的线程结构体
  *
@@ -987,26 +1038,45 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
     memset(thd, 0, sizeof(struct thread_struct));
     pcb->thread = thd;
 
+    struct pt_regs *child_regs = NULL;
     // 拷贝栈空间
-    struct pt_regs *child_regs = (struct pt_regs *)((uint64_t)pcb + STACK_SIZE - sizeof(struct pt_regs));
-    memcpy(child_regs, current_regs, sizeof(struct pt_regs));
+    if (pcb->flags & PF_KFORK) // 内核态下的fork
+    {
+        // 内核态下则拷贝整个内核栈
+        uint32_t size = ((uint64_t)current_pcb) + STACK_SIZE - (uint64_t)(current_regs);
+
+        child_regs = (struct pt_regs *)(((uint64_t)pcb) + STACK_SIZE - size);
+        memcpy(child_regs, (void *)current_regs, size);
+        // 然后重写新的栈中，每个栈帧的rbp值
+        process_rewrite_rbp(child_regs, pcb);
+    }
+    else
+    {
+        child_regs = (struct pt_regs *)((uint64_t)pcb + STACK_SIZE - sizeof(struct pt_regs));
+        memcpy(child_regs, current_regs, sizeof(struct pt_regs));
+        child_regs->rsp = stack_start;
+    }
 
     // 设置子进程的返回值为0
     child_regs->rax = 0;
-    child_regs->rsp = stack_start;
+    if (pcb->flags & PF_KFORK)
+        thd->rbp = (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_system_call时的rbp）
+    else
+        thd->rbp = (uint64_t)pcb + STACK_SIZE;
 
-    thd->rbp = (uint64_t)pcb + STACK_SIZE;
+    // 设置新的内核线程开始执行的时候的rsp
     thd->rsp = (uint64_t)child_regs;
     thd->fs = current_pcb->thread->fs;
     thd->gs = current_pcb->thread->gs;
 
-    // kdebug("pcb->flags=%ld", pcb->flags);
-    // 根据是否为内核线程，设置进程的开始执行的地址
-    if (pcb->flags & PF_KTHREAD)
+    // 根据是否为内核线程、是否在内核态fork，设置进程的开始执行的地址
+    if (pcb->flags & PF_KFORK)
+        thd->rip = (uint64_t)ret_from_system_call;
+    else if (pcb->flags & PF_KTHREAD && (!(pcb->flags & PF_KFORK)))
         thd->rip = (uint64_t)kernel_thread_func;
     else
         thd->rip = (uint64_t)ret_from_system_call;
-    // kdebug("new proc's ret addr = %#018lx\tthd->rip=%#018lx   stack_start=%#018lx  child_regs->rsp = %#018lx, new_rip=%#018lx)", child_regs->rbx, thd->rip, stack_start, child_regs->rsp, child_regs->rip);
+
     return 0;
 }
 

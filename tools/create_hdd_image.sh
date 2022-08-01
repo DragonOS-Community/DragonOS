@@ -1,7 +1,7 @@
 echo "Creating virtual disk image..."
 
-# 创建一至少为16MB磁盘镜像（类型选择raw）
-qemu-img create -f raw disk.img 16M
+# 创建一至少为32MB磁盘镜像（类型选择raw）
+qemu-img create -f raw disk.img 32M
 
 # 使用fdisk把disk.img的分区表设置为MBR格式(下方的空行请勿删除)
 fdisk disk.img << EOF

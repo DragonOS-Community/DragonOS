@@ -1,4 +1,3 @@
-//#pragma GCC optimize("O0")
 #include "../common/asm.h"
 
 

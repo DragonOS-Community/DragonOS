@@ -18,8 +18,7 @@
 #include <filesystem/VFS/VFS.h>
 #include <common/wait_queue.h>
 
-// #pragma GCC push_options
-// #pragma GCC optimize("O0")
+
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16

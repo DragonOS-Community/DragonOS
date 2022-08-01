@@ -1,8 +1,6 @@
 #include "slab.h"
 #include <common/compiler.h>
 
-#pragma GCC push_options
-#pragma GCC optimize("O0")
 struct slab kmalloc_cache_group[16] =
     {
         {32, 0, 0, NULL, NULL, NULL, NULL},
@@ -707,4 +705,3 @@ unsigned long kfree(void *address)
     kBUG("kfree(): Can't free memory.");
     return ECANNOT_FREE_MEM;
 }
-#pragma GCC pop_options

@@ -8,8 +8,7 @@
 extern spinlock_t xhci_controller_init_lock; // xhci控制器初始化锁
 
 #define MAX_USB_NUM 8 // pci总线上的usb设备的最大数量
-#pragma GCC push_options
-#pragma GCC optimize("O0")
+
 // 在pci总线上寻找到的usb设备控制器的header
 static struct pci_device_structure_header_t *usb_pdevs[MAX_USB_NUM];
 static int usb_pdevs_count = 0;
@@ -35,6 +34,7 @@ void usb_init()
     // 初始化每个usb控制器
     for (int i = 0; i < usb_pdevs_count; ++i)
     {
+        io_mfence();
         switch (usb_pdevs[i]->ProgIF)
         {
         case USB_TYPE_UHCI:
@@ -48,6 +48,7 @@ void usb_init()
         case USB_TYPE_XHCI:
             // 初始化对应的xhci控制器
             xhci_init((struct pci_device_structure_general_device_t *)usb_pdevs[i]);
+            io_mfence();
             break;
 
         default:
@@ -58,4 +59,3 @@ void usb_init()
     }
     kinfo("Successfully initialized all usb host controllers!");
 }
-#pragma GCC pop_options

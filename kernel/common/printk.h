@@ -2,7 +2,8 @@
 // Created by longjin on 2022/1/21.
 //
 #pragma once
-
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 #define PAD_ZERO 1 // 0填充
 #define LEFT 2     // 靠左对齐
 #define RIGHT 4    // 靠右对齐
@@ -124,3 +125,4 @@ void printk_disable_animation();
  * @return int 字符串长度
  */
 int sprintk(char *buf, const char *fmt, ...);
+#pragma GCC pop_options

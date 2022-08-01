@@ -82,4 +82,4 @@ extern uint64_t apic_timer_ticks_result;
  */
 void apic_timer_init();
 
-#pragma GCC optimize("O0")
+#pragma GCC pop_options

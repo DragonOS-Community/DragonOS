@@ -96,27 +96,7 @@ void apic_io_apic_init()
 
     // 不需要手动启动IO APIC，只要初始化了RTE寄存器之后，io apic就会自动启用了。
     // 而且不是每台电脑都有RCBA寄存器，因此不需要手动启用IO APIC
-    /*
-           // get RCBA address
-           io_out32(0xcf8, 0x8000f8f0);
-           uint x = io_in32(0xcfc);
-           uint *p;
-           printk_color(RED, BLACK, "Get RCBA Address:%#010x\n", x);
-           x = x & 0xffffc000UL;
-           printk_color(RED, BLACK, "Get RCBA Address:%#010x\n", x);
-
-           // get OIC address
-           if (x > 0xfec00000 && x < 0xfee00000)
-           {
-               p = (unsigned int *)(x + 0x31feUL-apic_ioapic_map.addr_phys+apic_ioapic_map.virtual_index_addr);
-           }
-
-           // enable IOAPIC
-           x = (*p & 0xffffff00) | 0x100;
-           io_mfence();
-           *p = x;
-           io_mfence();
-           */
+    
 }
 
 /**

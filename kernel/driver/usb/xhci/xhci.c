@@ -9,6 +9,7 @@
 #include <exception/irq.h>
 #include <driver/interrupt/apic/apic.h>
 
+// 由于xhci寄存器读取需要对齐，因此禁用GCC优化选项
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 

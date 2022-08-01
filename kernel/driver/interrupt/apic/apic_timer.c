@@ -11,9 +11,13 @@ uint64_t apic_timer_ticks_result = 0;
 void apic_timer_enable(uint64_t irq_num)
 {
     // 启动apic定时器
+    io_mfence();
     uint64_t val = apic_timer_get_LVT();
+    io_mfence();
     val &= (~APIC_LVT_INT_MASKED);
+    io_mfence();
     apic_timer_write_LVT(val);
+    io_mfence();
 }
 
 void apic_timer_disable(uint64_t irq_num)
@@ -31,18 +35,24 @@ void apic_timer_disable(uint64_t irq_num)
 uint64_t apic_timer_install(ul irq_num, void *arg)
 {
     // 设置div16
+    io_mfence();
     apic_timer_stop();
+    io_mfence();
     apic_timer_set_div(APIC_TIMER_DIVISOR);
+    io_mfence();
 
     // 设置初始计数
     apic_timer_set_init_cnt(*(uint64_t *)arg);
+    io_mfence();
     // 填写LVT
     apic_timer_set_LVT(APIC_TIMER_IRQ_NUM, 1, APIC_LVT_Timer_Periodic);
+    io_mfence();
 }
 
 void apic_timer_uninstall(ul irq_num)
 {
     apic_timer_write_LVT(APIC_LVT_INT_MASKED);
+    io_mfence();
 }
 
 hardware_intr_controller apic_timer_intr_controller =
@@ -65,6 +75,7 @@ void apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
 
     sched_update_jiffies();
+    io_mfence();
 }
 
 /**

@@ -12,6 +12,8 @@
 #include <common/kprint.h>
 #include <mm/mm.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 //描述符表的结构体
 struct desc_struct
 {
@@ -185,3 +187,5 @@ void set_tss64(unsigned int *Table, unsigned long rsp0, unsigned long rsp1, unsi
     *(unsigned long *)(Table + 21) = ist7;
 }
 #endif
+
+#pragma GCC pop_options

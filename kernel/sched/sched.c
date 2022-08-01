@@ -161,4 +161,4 @@ void sched_init()
         sched_cfs_ready_queue[i].proc_queue.virtual_runtime = 0x7fffffffffffffff;
     }
 }
-#pragma GCC optimize("O0")
+#pragma GCC pop_options

@@ -11,7 +11,10 @@
 static ul Total_Memory = 0;
 static ul total_2M_pages = 0;
 static ul root_page_table_phys_addr = 0; // 内核层根页表的物理地址
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 
+struct memory_desc memory_management_struct = {{0}, 0};
 /**
  * @brief 虚拟地址长度所需要的entry数量
  *
@@ -278,6 +281,7 @@ unsigned long page_init(struct Page *page, ul flags)
     if ((!page->ref_counts) || (page->attr & PAGE_SHARED))
     {
         ++page->ref_counts;
+        barrier();
         ++page->zone->total_pages_link;
     }
     return 0;
@@ -977,3 +981,4 @@ int8_t mm_is_2M_page(uint64_t paddr)
         return 1;
     else return 0;
 }
+#pragma GCC pop_options

@@ -10,7 +10,8 @@
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 #include "math.h"
-
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 struct printk_screen_info pos;
 extern ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
 static spinlock_t printk_lock;
@@ -184,7 +185,9 @@ static void auto_newline()
 #endif
         pos.y = pos.max_y;
         int lines_to_scroll = 1;
+        barrier();
         scroll(true, lines_to_scroll * pos.char_size_y, sw_show_scroll_animation);
+        barrier();
         pos.y -= (lines_to_scroll - 1);
     }
 }
@@ -835,7 +838,6 @@ static int scroll(bool direction, int pixels, bool animation)
     int md = pixels % pos.char_size_y;
     if (md)
         pixels = pixels + pos.char_size_y - md;
-
     if (animation == false)
         return do_scroll(direction, pixels);
     else
@@ -957,3 +959,5 @@ int sprintk(char *buf, const char *fmt, ...)
 
     return count;
 }
+
+#pragma GCC pop_options

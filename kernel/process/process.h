@@ -18,8 +18,8 @@
 #include <filesystem/VFS/VFS.h>
 #include <common/wait_queue.h>
 
-// #pragma GCC push_options
-// #pragma GCC optimize("O0")
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
 
@@ -365,4 +365,4 @@ extern struct mm_struct initial_mm;
 extern struct thread_struct initial_thread;
 extern union proc_union initial_proc_union;
 extern struct process_control_block *initial_proc[MAX_CPU_NUM];
-// #pragma GCC pop_options
+#pragma GCC pop_options

@@ -5,6 +5,9 @@
 #include <exception/irq.h>
 #include <mm/mm.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+
 #define APIC_SUCCESS 0
 #define APIC_E_NOTFOUND 1
 
@@ -73,7 +76,7 @@
 // 分频配置寄存器（定时器专用）
 #define LOCAL_APIC_OFFSET_Local_APIC_CLKDIV 0x3e0
 
-uint32_t RCBA_vaddr = 0;// RCBA寄存器的虚拟地址
+uint32_t RCBA_vaddr = 0; // RCBA寄存器的虚拟地址
 
 /*
 
@@ -319,3 +322,5 @@ void apic_local_apic_edge_ack(ul irq_num); // local apic边沿触发 应答
  */
 void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, uint8_t deliver_mode, uint8_t dest_mode,
                          uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID);
+
+#pragma GCC pop_options

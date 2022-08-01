@@ -12,6 +12,8 @@
 #include <driver/interrupt/apic/apic_timer.h>
 #include <common/spinlock.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 static struct acpi_HPET_description_table_t *hpet_table;
 static uint64_t HPET_REG_BASE = 0;
 static uint32_t HPET_COUNTER_CLK_PERIOD = 0; // 主计数器时间精度（单位：飞秒）
@@ -283,3 +285,4 @@ int HPET_init()
     // kdebug("HPET_freq=%ld", (long)HPET_freq);
     // kdebug("HPET_freq=%lf", HPET_freq);
 }
+#pragma GCC pop_options

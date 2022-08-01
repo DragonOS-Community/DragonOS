@@ -34,11 +34,12 @@
 #include <driver/video/video.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
-
+#pragma GCC push_options
+#pragma GCC optimize("O3")
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 ul bsp_idt_size, bsp_gdt_size;
 
-struct memory_desc memory_management_struct = {{0}, 0};
+
 // struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
 void test_slab();
 
@@ -126,13 +127,18 @@ void system_initialize()
     current_pcb->preempt_count = 0;
     // 先初始化系统调用模块
     syscall_init();
+    io_mfence();
     //  再初始化进程模块。顺序不能调转
     sched_init();
+    io_mfence();
 
     timer_init();
 
+    // 这里必须加内存屏障，否则会出错
+    io_mfence();
     smp_init();
-    kdebug("after smp init");
+    io_mfence();
+
     
     cpu_init();
     ps2_keyboard_init();
@@ -146,19 +152,24 @@ void system_initialize()
 
     // process_init();
     HPET_init();
+    io_mfence();
     HPET_measure_freq();
+    io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
 
     process_init();
     // 对显示模块进行高级初始化，启用double buffer
     video_init(true);
+    io_mfence();
 
     // fat32_init();
     HPET_enable();
 
+    io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
     apic_timer_init();
+    io_mfence();
 }
 
 //操作系统内核从这里开始执行
@@ -182,8 +193,9 @@ void Start_Kernel(void)
     mb2_magic &= 0xffffffff;
     multiboot2_magic = (uint)mb2_magic;
     multiboot2_boot_info_addr = mb2_info + PAGE_OFFSET;
-
+    io_mfence();
     system_initialize();
+    io_mfence();
 
     while (1)
         hlt();
@@ -195,3 +207,4 @@ void ignore_int()
     while (1)
         ;
 }
+#pragma GCC pop_options

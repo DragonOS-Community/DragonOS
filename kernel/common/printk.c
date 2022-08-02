@@ -45,6 +45,8 @@ static uint *get_pos_VBE_FB_addr();
  */
 static int cls();
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 /**
  * @brief 滚动窗口（尚不支持向下滚动)
  *
@@ -53,7 +55,7 @@ static int cls();
  * @param animation 是否包含滑动动画
  */
 static int scroll(bool direction, int pixels, bool animation);
-
+#pragma GCC pop_options
 /**
  * @brief 将数字按照指定的要求转换成对应的字符串（2~36进制）
  *
@@ -184,7 +186,9 @@ static void auto_newline()
 #endif
         pos.y = pos.max_y;
         int lines_to_scroll = 1;
+        barrier();
         scroll(true, lines_to_scroll * pos.char_size_y, sw_show_scroll_animation);
+        barrier();
         pos.y -= (lines_to_scroll - 1);
     }
 }
@@ -835,7 +839,6 @@ static int scroll(bool direction, int pixels, bool animation)
     int md = pixels % pos.char_size_y;
     if (md)
         pixels = pixels + pos.char_size_y - md;
-
     if (animation == false)
         return do_scroll(direction, pixels);
     else
@@ -957,3 +960,4 @@ int sprintk(char *buf, const char *fmt, ...)
 
     return count;
 }
+

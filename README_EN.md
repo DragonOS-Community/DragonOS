@@ -10,7 +10,8 @@ This project is a operating system running on computer which is in X86_ 64 Archi
 - Home Page  **[DragonOS.org](https://dragonos.org)**
 - Documentation  **[docs.DragonOS.org](https://docs.dragonos.org)**
 - BBS  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
-&nbsp;
+- QQ group **115763565**
+- code search engine [code.DragonOS.org](http://code.dragonos.org)&nbsp;
 
 ## Development Environment
 

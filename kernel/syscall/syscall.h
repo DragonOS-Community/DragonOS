@@ -36,11 +36,7 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
  * @param regs 进程3特权级下的寄存器
  * @return ul
  */
-ul system_call_not_exists(struct pt_regs *regs)
-{
-    kerror("System call [ ID #%d ] not exists.", regs->rax);
-    return ESYSCALL_NOT_EXISTS;
-}
+ul system_call_not_exists(struct pt_regs *regs);
 
 /**
  * @brief 打印字符串的系统调用

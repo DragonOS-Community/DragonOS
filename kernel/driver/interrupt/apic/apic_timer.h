@@ -10,6 +10,8 @@ extern uint64_t apic_timer_ticks_result;
 
 #define APIC_TIMER_IRQ_NUM 151
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 /**
  * @brief 设置apic定时器的分频计数
  *
@@ -79,3 +81,5 @@ extern uint64_t apic_timer_ticks_result;
  *
  */
 void apic_timer_init();
+
+#pragma GCC pop_options

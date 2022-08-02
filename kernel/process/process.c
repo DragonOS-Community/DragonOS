@@ -21,6 +21,9 @@
 
 #include <ktest/ktest.h>
 
+// #pragma GCC push_options
+// #pragma GCC optimize("O0")
+
 spinlock_t process_global_pid_write_lock; // 增加pid的写锁
 long process_global_pid = 1;              // 系统中最大的pid
 
@@ -100,6 +103,7 @@ uint64_t process_exit_mm(struct process_control_block *pcb);
 uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start, uint64_t stack_size, struct pt_regs *current_regs);
 
 void process_exit_thread(struct process_control_block *pcb);
+
 /**
  * @brief 切换进程
  *
@@ -108,7 +112,8 @@ void process_exit_thread(struct process_control_block *pcb);
  * 由于程序在进入内核的时候已经保存了寄存器，因此这里不需要保存寄存器。
  * 这里切换fs和gs寄存器
  */
-
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 void __switch_to(struct process_control_block *prev, struct process_control_block *next)
 {
     initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
@@ -124,6 +129,7 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
 }
+#pragma GCC pop_options
 
 /**
  * @brief 打开要执行的程序文件
@@ -299,6 +305,8 @@ load_elf_failed:;
  * @param envp 环境变量
  * @return ul 错误码
  */
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
 
@@ -403,6 +411,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 exec_failed:;
     process_do_exit(tmp);
 }
+#pragma GCC pop_options
 
 /**
  * @brief 内核init进程
@@ -410,6 +419,8 @@ exec_failed:;
  * @param arg
  * @return ul 参数
  */
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
@@ -446,6 +457,7 @@ ul initial_kernel_thread(ul arg)
     current_pcb->thread->rip = (ul)ret_from_system_call;
     current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
     current_pcb->thread->fs = USER_DS | 0x3;
+    barrier();
     current_pcb->thread->gs = USER_DS | 0x3;
 
     // 主动放弃内核线程身份
@@ -467,7 +479,7 @@ ul initial_kernel_thread(ul arg)
 
     return 1;
 }
-
+#pragma GCC pop_options
 /**
  * @brief 当子进程退出后向父进程发送通知
  *
@@ -517,23 +529,29 @@ ul process_do_exit(ul code)
 int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigned long flags)
 {
     struct pt_regs regs;
+    barrier();
     memset(&regs, 0, sizeof(regs));
-
+    barrier();
     // 在rbx寄存器中保存进程的入口地址
     regs.rbx = (ul)fn;
     // 在rdx寄存器中保存传入的参数
     regs.rdx = (ul)arg;
-
+    barrier();
     regs.ds = KERNEL_DS;
+    barrier();
     regs.es = KERNEL_DS;
+    barrier();
     regs.cs = KERNEL_CS;
+    barrier();
     regs.ss = KERNEL_DS;
+    barrier();
 
     // 置位中断使能标志位
     regs.rflags = (1 << 9);
-
+    barrier();
     // rip寄存器指向内核线程的引导程序
     regs.rip = (ul)kernel_thread_func;
+    barrier();
     // kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
     // kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
     // kdebug("1111\tregs.rip = %#018lx", regs.rip);
@@ -577,23 +595,34 @@ void process_init()
     for (int i = 256; i < 512; ++i)
     {
         uint64_t *tmp = idle_pml4t_vaddr + i;
+        barrier();
         if (*tmp == 0)
         {
             void *pdpt = kmalloc(PAGE_4K_SIZE, 0);
+            barrier();
             memset(pdpt, 0, PAGE_4K_SIZE);
+            barrier();
             set_pml4t(tmp, mk_pml4t(virt_2_phys(pdpt), PAGE_KERNEL_PGT));
         }
     }
+    barrier();
+
+    flush_tlb();
     /*
     kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
     kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
     kdebug("initial_tss[0].ist1=%#018lx", initial_tss[0].ist1);
 */
     // 初始化pid的写锁
+
     spin_init(&process_global_pid_write_lock);
+
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
+    barrier();
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核线程
+    barrier();
+
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;
     initial_proc_union.pcb.cpu_id = 0;
@@ -617,6 +646,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 为新的进程分配栈空间，并将pcb放置在底部
     tsk = (struct process_control_block *)kmalloc(STACK_SIZE, 0);
+    barrier();
 
     if (tsk == NULL)
     {
@@ -624,13 +654,17 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
         return retval;
     }
 
+    barrier();
     memset(tsk, 0, sizeof(struct process_control_block));
+    io_mfence();
     // 将当前进程的pcb复制到新的pcb内
     memcpy(tsk, current_pcb, sizeof(struct process_control_block));
+    io_mfence();
 
     // 初始化进程的循环链表结点
     list_init(&tsk->list);
 
+    io_mfence();
     // 判断是否为内核态调用fork
     if (current_pcb->flags & PF_KTHREAD && stack_start != 0)
         tsk->flags |= PF_KFORK;
@@ -641,11 +675,14 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 增加全局的pid并赋值给新进程的pid
     spin_lock(&process_global_pid_write_lock);
     tsk->pid = process_global_pid++;
-
+    barrier();
     // 加入到进程链表中
     tsk->next_pcb = initial_proc_union.pcb.next_pcb;
+    barrier();
     initial_proc_union.pcb.next_pcb = tsk;
+    barrier();
     tsk->parent_pcb = current_pcb;
+    barrier();
 
     spin_unlock(&process_global_pid_write_lock);
 
@@ -654,7 +691,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     tsk->parent_pcb = current_pcb;
     wait_queue_init(&tsk->wait_child_proc_exit, NULL);
-
+    barrier();
     list_init(&tsk->list);
 
     retval = -ENOMEM;
@@ -1047,6 +1084,7 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
 
         child_regs = (struct pt_regs *)(((uint64_t)pcb) + STACK_SIZE - size);
         memcpy(child_regs, (void *)current_regs, size);
+        barrier();
         // 然后重写新的栈中，每个栈帧的rbp值
         process_rewrite_rbp(child_regs, pcb);
     }
@@ -1054,6 +1092,7 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
     {
         child_regs = (struct pt_regs *)((uint64_t)pcb + STACK_SIZE - sizeof(struct pt_regs));
         memcpy(child_regs, current_regs, sizeof(struct pt_regs));
+        barrier();
         child_regs->rsp = stack_start;
     }
 
@@ -1088,3 +1127,5 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
 void process_exit_thread(struct process_control_block *pcb)
 {
 }
+
+// #pragma GCC pop_options

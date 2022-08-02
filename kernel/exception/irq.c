@@ -1,7 +1,8 @@
+
 #include "irq.h"
 #include <common/errno.h>
 
-// 对进行
+
 #if _INTR_8259A_
 #include <driver/interrupt/8259A/8259A.h>
 #else
@@ -13,6 +14,8 @@
 #include "gate.h"
 #include <mm/slab.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 // 保存函数调用现场的寄存器
 #define SAVE_ALL_REGS       \
     "cld; \n\t"             \
@@ -254,3 +257,4 @@ void irq_init()
 
 #endif
 }
+#pragma GCC optimize("O0")

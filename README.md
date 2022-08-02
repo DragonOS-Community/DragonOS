@@ -11,7 +11,7 @@
 - 项目文档  **[docs.DragonOS.org](https://docs.dragonos.org)**
 - 开源论坛  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
 - 开发交流QQ群 **115763565**
-&nbsp;
+- 代码搜索引擎 [code.DragonOS.org](http://code.dragonos.org)&nbsp;
 ## 开发环境
 
 GCC>=8.0

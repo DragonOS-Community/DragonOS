@@ -2,7 +2,7 @@
 #include <driver/usb/usb.h>
 #include <driver/pci/pci.h>
 #include <driver/pci/msi.h>
-
+// #pragma GCC optimize("O0")
 #define XHCI_MAX_HOST_CONTROLLERS 4 // 本驱动程序最大支持4个xhci root hub controller
 #define XHCI_MAX_ROOT_HUB_PORTS 128 // 本驱动程序最大支持127个root hub 端口（第0个保留）
 

@@ -145,6 +145,7 @@
     do                              \
     {                               \
         ul tmp;                     \
+        io_mfence();\
         __asm__ __volatile__(       \
             "movq %%cr3, %0\n\t"    \
             "movq %0, %%cr3\n\t"    \

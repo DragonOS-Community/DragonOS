@@ -9,7 +9,6 @@
  */
 
 #pragma once
-
 #include <common/cpu.h>
 #include <common/glib.h>
 #include <mm/mm.h>
@@ -18,6 +17,8 @@
 #include <common/errno.h>
 #include <filesystem/VFS/VFS.h>
 #include <common/wait_queue.h>
+
+
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -213,17 +214,21 @@ struct tss_struct
 		.io_map_base_addr = 0                                             \
 	}
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 // 获取当前的pcb
 struct process_control_block *get_current_pcb()
 {
 	struct process_control_block *current = NULL;
 	// 利用了当前pcb和栈空间总大小为32k大小对齐，将rsp低15位清空，即可获得pcb的起始地址
+	barrier();
 	__asm__ __volatile__("andq %%rsp, %0   \n\t"
 						 : "=r"(current)
 						 : "0"(~32767UL));
+	barrier();
 	return current;
 };
-
+#pragma GCC pop_options
 #define current_pcb get_current_pcb()
 
 #define GET_CURRENT_PCB    \
@@ -350,7 +355,7 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 		asm volatile("movq %0, %%cr3	\n\t" ::"r"(next_pcb->mm->pgd) \
 					 : "memory");                                      \
 	} while (0)
-// flush_tlb();                                                   \
+// flush_tlb();                                                   
 
 // 获取当前cpu id
 #define proc_current_cpu_id (current_pcb->cpu_id)

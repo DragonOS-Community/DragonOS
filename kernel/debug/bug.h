@@ -2,6 +2,8 @@
 #include <common/compiler.h>
 #include <common/kprint.h>
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 /**
  * @brief 当condition为true时输出警告信息
  *
@@ -19,3 +21,4 @@
         goto to;                       \
     unlikely(__ret_warn_on);           \
 })
+#pragma GCC pop_options

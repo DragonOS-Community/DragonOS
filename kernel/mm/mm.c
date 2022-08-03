@@ -164,7 +164,6 @@ void mm_init()
 
     // ==== 遍历e820数组，完成成员变量初始化工作 ===
 
-    kdebug("ddd");
     for (int i = 0; i < memory_management_struct.len_e820; ++i)
     {
         io_mfence();
@@ -229,12 +228,10 @@ void mm_init()
     ZONE_NORMAL_INDEX = 0;
     ZONE_UNMAPPED_INDEX = 0;
 
-    
     // kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
     //  设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
-    
     // 初始化内存管理单元结构所占的物理页的结构体
     ul mms_max_page = (virt_2_phys(memory_management_struct.end_of_struct) >> PAGE_2M_SHIFT); // 内存管理单元所占据的序号最大的物理页
     // kdebug("mms_max_page=%ld", mms_max_page);
@@ -256,10 +253,10 @@ void mm_init()
     kinfo("Memory management unit initialize complete!");
 
     flush_tlb();
+    // todo: 在这里增加代码，暂时停止视频输出，否则可能会导致图像数据写入slab的区域，从而造成异常
     // 初始化slab内存池
     slab_init();
     page_table_init();
-    // init_frame_buffer();
 }
 
 /**
@@ -640,9 +637,8 @@ int mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_s
                 {
                     if (unlikely(*pde_ptr != 0 && user))
                     {
-                        // kwarn("page already mapped!");
                         // 如果是用户态可访问的页，则释放当前新获取的物理页
-                        if (likely(((ul)phys_addr_start + length_mapped) < total_2M_pages)) // 校验是否为内存中的物理页
+                        if (likely((((ul)phys_addr_start + length_mapped) >> PAGE_2M_SHIFT) < total_2M_pages)) // 校验是否为内存中的物理页
                             free_pages(Phy_to_2M_Page((ul)phys_addr_start + length_mapped), 1);
                         length_mapped += PAGE_2M_SIZE;
                         continue;
@@ -967,15 +963,16 @@ bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr)
 
 /**
  * @brief 检测是否为有效的2M页(物理内存页)
- * 
+ *
  * @param paddr 物理地址
  * @return int8_t 是 -> 1
  *                 否 -> 0
  */
 int8_t mm_is_2M_page(uint64_t paddr)
 {
-    if(likely((paddr >> PAGE_2M_SHIFT)<total_2M_pages))
+    if (likely((paddr >> PAGE_2M_SHIFT) < total_2M_pages))
         return 1;
-    else return 0;
+    else
+        return 0;
 }
 // #pragma GCC pop_options

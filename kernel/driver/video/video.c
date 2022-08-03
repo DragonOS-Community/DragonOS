@@ -8,62 +8,37 @@
 #include <mm/slab.h>
 #include <common/spinlock.h>
 #include <exception/softirq.h>
+#include <driver/uart/uart.h>
+#include <common/time.h>
 
-// 每个时刻只能有1个进程新增定时任务
-spinlock_t video_timer_func_add_lock;
+
 
 uint64_t video_refresh_expire_jiffies = 0;
 uint64_t video_last_refresh_pid = -1;
 
+struct scm_buffer_info_t video_frame_buffer_info = {0};
+static struct multiboot_tag_framebuffer_info_t __fb_info;
+static struct scm_buffer_info_t *video_refresh_target = NULL;
+
 #define REFRESH_INTERVAL 15UL // 启动刷新帧缓冲区任务的时间间隔
 
 ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
-struct screen_info_t
-{
-    int width, height;
-    uint64_t length;
-    uint64_t fb_vaddr, fb_paddr;
-    uint64_t double_fb_vaddr;
-} sc_info;
 
 /**
  * @brief VBE帧缓存区的地址重新映射
  * 将帧缓存区映射到地址SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE处
  */
-void init_frame_buffer(bool level)
+void init_frame_buffer()
 {
     kinfo("Re-mapping VBE frame buffer...");
 
     uint64_t global_CR3 = (uint64_t)get_CR3();
 
-    if (level == false)
-    {
-        struct multiboot_tag_framebuffer_info_t info;
-        int reserved;
+    struct multiboot_tag_framebuffer_info_t info;
+    int reserved;
 
-        multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
-
-        sc_info.fb_vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
-
-        sc_info.fb_paddr = info.framebuffer_addr;
-        sc_info.width = info.framebuffer_width;
-        sc_info.height = info.framebuffer_height;
-
-        sc_info.length = 1UL * sc_info.width * sc_info.height;
-        mm_map_proc_page_table(global_CR3, true, sc_info.fb_vaddr, sc_info.fb_paddr, get_VBE_FB_length() << 2, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true, false);
-        set_pos_VBE_FB_addr((uint *)sc_info.fb_vaddr);
-    }
-    else // 高级初始化，增加双缓冲区的支持
-    {
-        // 申请双重缓冲区
-        struct Page *p = alloc_pages(ZONE_NORMAL, PAGE_2M_ALIGN(sc_info.length << 2) / PAGE_2M_SIZE, 0);
-        sc_info.double_fb_vaddr = (uint64_t)phys_2_virt(p->addr_phys);
-        mm_map_proc_page_table(global_CR3, true, sc_info.double_fb_vaddr, p->addr_phys, PAGE_2M_ALIGN(sc_info.length << 2), PAGE_KERNEL_PAGE, false, true, false);
-
-        // 将原有的数据拷贝到double buffer里面
-        memcpy((void *)sc_info.double_fb_vaddr, (void *)sc_info.fb_vaddr, sc_info.length << 2);
-        set_pos_VBE_FB_addr((uint *)sc_info.double_fb_vaddr);
-    }
+    video_frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
+    mm_map_proc_page_table(global_CR3, true, video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true, false);
 
     flush_tlb();
     kinfo("VBE frame buffer successfully Re-mapped!");
@@ -76,7 +51,9 @@ void init_frame_buffer(bool level)
 void video_refresh_framebuffer(void *data)
 {
     video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
-    memcpy((void *)sc_info.fb_vaddr, (void *)sc_info.double_fb_vaddr, (sc_info.length << 2));
+    if (unlikely(video_refresh_target == NULL))
+        return;
+    memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr, video_refresh_target->size);
 }
 
 /**
@@ -86,22 +63,86 @@ void video_refresh_framebuffer(void *data)
  * true ->高级初始化：增加double buffer的支持
  * @return int
  */
-int video_init(bool level)
+int video_reinitialize(bool level)
 {
-    init_frame_buffer(level);
-    if (level)
+    if (level == false)
+        init_frame_buffer();
+    else
     {
-        spin_init(&video_timer_func_add_lock);
-        // 启用双缓冲后，使能printk滚动动画
-        // printk_enable_animation();
-        // 初始化第一个屏幕刷新任务
-        // struct timer_func_list_t *tmp = (struct timer_func_list_t *)kmalloc(sizeof(struct timer_func_list_t), 0);
-        // timer_func_init(tmp, &video_refresh_framebuffer, NULL, 10*REFRESH_INTERVAL);
-        // timer_func_add(tmp);
+        // 启用屏幕刷新软中断
         register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
 
         video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
 
         raise_softirq(VIDEO_REFRESH_SIRQ);
     }
+    return 0;
+}
+
+/**
+ * @brief 设置帧缓冲区刷新目标
+ *
+ * @param buf
+ * @return int
+ */
+int video_set_refresh_target(struct scm_buffer_info_t *buf)
+{
+
+    unregister_softirq(VIDEO_REFRESH_SIRQ);
+    int counter = 100;
+    while ((get_softirq_pending() & (1 << VIDEO_REFRESH_SIRQ)) && counter > 0)
+    {
+        --counter;
+        usleep(1000);
+    }
+    video_refresh_target = buf;
+    register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
+    raise_softirq(VIDEO_REFRESH_SIRQ);
+}
+
+/**
+ * @brief 初始化显示驱动
+ *
+ * @return int
+ */
+int video_init()
+{
+
+    memset(&video_frame_buffer_info, 0, sizeof(struct scm_buffer_info_t));
+    memset(&__fb_info, 0, sizeof(struct multiboot_tag_framebuffer_info_t));
+    video_refresh_target = NULL;
+
+    io_mfence();
+    // 从multiboot2获取帧缓冲区信息
+    int reserved;
+    multiboot2_iter(multiboot2_get_Framebuffer_info, &__fb_info, &reserved);
+    io_mfence();
+
+    // 初始化帧缓冲区信息结构体
+    if (__fb_info.framebuffer_type == 2)
+    {
+        video_frame_buffer_info.bit_depth = 8; // type=2时，width和height是按照字符数来表示的，因此depth=8
+        video_frame_buffer_info.flags |= SCM_BF_TEXT;
+    }
+    else
+    {
+        video_frame_buffer_info.bit_depth = __fb_info.framebuffer_bpp;
+        video_frame_buffer_info.flags |= SCM_BF_PIXEL;
+    }
+
+    video_frame_buffer_info.flags |= SCM_BF_FB;
+    video_frame_buffer_info.width = __fb_info.framebuffer_width;
+    video_frame_buffer_info.height = __fb_info.framebuffer_height;
+    io_mfence();
+
+    video_frame_buffer_info.size = video_frame_buffer_info.width * video_frame_buffer_info.height * ((video_frame_buffer_info.bit_depth + 7) / 8);
+    // 先临时映射到该地址，稍后再重新映射
+    video_frame_buffer_info.vaddr = 0xffff800003000000;
+    mm_map_phys_addr(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+
+    io_mfence();
+    char init_text2[] = "Video driver initialized.";
+    for (int i = 0; i < sizeof(init_text2) - 1; ++i)
+        uart_send(COM1, init_text2[i]);
+    return 0;
 }

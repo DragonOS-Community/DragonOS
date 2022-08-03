@@ -116,7 +116,8 @@
         "apic_timer.h": "c",
         "sched.h": "c",
         "preempt.h": "c",
-        "softirq.h": "c"
+        "softirq.h": "c",
+        "screen_manager.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

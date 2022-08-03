@@ -8,12 +8,7 @@
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 
-/**
- * @brief 初始化屏幕管理模块
- *
- */
-#pragma GCC push_options
-#pragma GCC optimize("O0")
+
 
 extern struct scm_buffer_info_t video_frame_buffer_info;
 static struct List scm_framework_list;
@@ -84,6 +79,10 @@ static int __destroy_buffer(struct scm_buffer_info_t *buf)
     return 0;
 }
 
+/**
+ * @brief 初始化屏幕管理模块
+ *
+ */
 void scm_init()
 {
     list_init(&scm_framework_list);
@@ -316,4 +315,3 @@ void scm_reinit()
     } while (list_next(&ptr->list) != &scm_framework_list);
     return;
 }
-#pragma GCC pop_options

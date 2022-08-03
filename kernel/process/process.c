@@ -3,6 +3,7 @@
 #include <common/printk.h>
 #include <common/kprint.h>
 #include <common/stdio.h>
+#include <common/string.h>
 #include <common/compiler.h>
 #include <common/libELF/elf.h>
 #include <common/time.h>

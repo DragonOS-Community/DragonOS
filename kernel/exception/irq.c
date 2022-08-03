@@ -11,6 +11,7 @@
 
 #include <common/asm.h>
 #include <common/printk.h>
+#include <common/string.h>
 #include "gate.h"
 #include <mm/slab.h>
 

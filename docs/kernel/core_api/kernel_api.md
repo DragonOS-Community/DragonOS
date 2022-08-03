@@ -170,6 +170,22 @@
 
 &emsp;&emsp;要拷贝的源字符串的长度
 
+#### `char *strcpy(char *dst, const char *src)`
+
+##### 描述
+
+&emsp;&emsp;拷贝源字符串，返回dst字符串
+
+##### 参数
+
+**src**
+
+&emsp;&emsp;源字符串
+
+**dst**
+
+&emsp;&emsp;目标字符串
+
 #### `long strncpy_from_user(char *dst, const char *src, unsigned long size)`
 
 ##### 描述

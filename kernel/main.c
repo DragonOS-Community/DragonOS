@@ -9,6 +9,8 @@
 #include "exception/trap.h"
 #include "exception/irq.h"
 #include <exception/softirq.h>
+#include <lib/libUI/screen_manager.h>
+#include <lib/libUI/textui.h>
 #include "mm/mm.h"
 #include "mm/slab.h"
 #include "process/process.h"
@@ -34,11 +36,9 @@
 #include <driver/video/video.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
-#pragma GCC push_options
-#pragma GCC optimize("O3")
+
 unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 ul bsp_idt_size, bsp_gdt_size;
-
 
 // struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
 void test_slab();
@@ -71,12 +71,14 @@ void reload_idt()
 void system_initialize()
 {
 
-    // 初始化printk
-    printk_init(8, 16);
-    //#ifdef DEBUG
     uart_init(COM1, 115200);
-    //#endif
+    video_init();
+
+    scm_init();
+    textui_init();
+
     kinfo("Kernel Starting...");
+    
     // 重新加载gdt和idt
 
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
@@ -98,9 +100,12 @@ void system_initialize()
 
     //  初始化内存管理单元
     mm_init();
-
+    // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
+    // 原因是，系统启动初期，framebuffer被映射到48M地址处，
+    // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
     // 对显示模块进行低级初始化，不启用double buffer
-    video_init(false);
+    scm_reinit();
+
 
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
@@ -139,7 +144,6 @@ void system_initialize()
     smp_init();
     io_mfence();
 
-    
     cpu_init();
     ps2_keyboard_init();
     // ps2_mouse_init();
@@ -159,8 +163,9 @@ void system_initialize()
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
 
     process_init();
-    // 对显示模块进行高级初始化，启用double buffer
-    video_init(true);
+    // 启用double buffer
+    scm_enable_double_buffer();
+    
     io_mfence();
 
     // fat32_init();
@@ -207,4 +212,3 @@ void ignore_int()
     while (1)
         ;
 }
-#pragma GCC pop_options

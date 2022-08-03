@@ -6,6 +6,8 @@
 #include <driver/multiboot2/multiboot2.h>
 #include <mm/mm.h>
 #include <common/spinlock.h>
+#include <lib/libUI/textui.h>
+#include <lib/libUI/screen_manager.h>
 
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
@@ -13,7 +15,7 @@
 #include <common/string.h>
 
 struct printk_screen_info pos;
-extern ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
+
 static spinlock_t printk_lock;
 static bool sw_show_scroll_animation = false; // 显示换行动画的开关
 
@@ -81,61 +83,34 @@ static int calculate_max_charNum(int len, int size)
     return len / size - 1;
 }
 
-int printk_init(const int char_size_x, const int char_size_y)
+int printk_init(struct scm_buffer_info_t *buf)
 {
-    struct multiboot_tag_framebuffer_info_t info;
-    int reserved;
 
-    multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
+    pos.width = buf->width;
+    pos.height = buf->height;
 
-    pos.width = info.framebuffer_width;
-    pos.height = info.framebuffer_height;
+    pos.char_size_x = 8;
+    pos.char_size_y = 16;
+    pos.max_x = calculate_max_charNum(pos.width, pos.char_size_x);
+    pos.max_y = calculate_max_charNum(pos.height, pos.char_size_y);
 
-    pos.char_size_x = char_size_x;
-    pos.char_size_y = char_size_y;
-    pos.max_x = calculate_max_charNum(pos.width, char_size_x);
-    pos.max_y = calculate_max_charNum(pos.height, char_size_y);
-
-    VBE_FB_phys_addr = (ul)info.framebuffer_addr;
-
-    pos.FB_address = (uint *)0xffff800003000000;
+    pos.FB_address = buf->vaddr;
     pos.FB_length = 1UL * pos.width * pos.height;
 
     // 初始化自旋锁
     spin_init(&printk_lock);
-
-    // ======== 临时的将物理地址填写到0x0000000003000000处 之后会在mm内将帧缓存区重新映射=====
-
-    ul global_CR3 = (ul)get_CR3();
-    ul fb_virt_addr = (ul)pos.FB_address;
-    ul fb_phys_addr = VBE_FB_phys_addr;
-
-    // 计算帧缓冲区的线性地址对应的pml4页表项的地址
-    ul *tmp = phys_2_virt((ul *)((ul)global_CR3 & (~0xfffUL)) + ((fb_virt_addr >> PAGE_GDT_SHIFT) & 0x1ff));
-
-    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((fb_virt_addr >> PAGE_1G_SHIFT) & 0x1ff));
-
-    ul *tmp1;
-    // 初始化2M物理页
-    for (ul i = 0; i < (pos.FB_length << 2); i += PAGE_2M_SIZE)
-    {
-        // 计算当前2M物理页对应的pdt的页表项的物理地址
-        tmp1 = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + (((fb_virt_addr + i) >> PAGE_2M_SHIFT) & 0x1ff));
-
-        // 页面写穿，禁止缓存
-        set_pdt(tmp1, mk_pdt((ul)fb_phys_addr + i, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD));
-    }
-
-    flush_tlb();
 
     pos.x = 0;
     pos.y = 0;
 
     cls();
 
+    io_mfence();
     kdebug("width=%d\theight=%d", pos.width, pos.height);
     // 由于此时系统并未启用双缓冲，因此关闭滚动动画
     printk_disable_animation();
+
+    io_mfence();
     return 0;
 }
 
@@ -961,4 +936,3 @@ int sprintk(char *buf, const char *fmt, ...)
 
     return count;
 }
-

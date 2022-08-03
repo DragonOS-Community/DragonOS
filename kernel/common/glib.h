@@ -179,28 +179,6 @@ static inline struct List *list_next(struct List *entry)
         return NULL;
 }
 
-//计算字符串的长度（经过测试，该版本比采用repne/scasb汇编的运行速度快16.8%左右）
-static inline int strlen(const char *s)
-{
-    if (s == NULL)
-        return 0;
-    register int __res = 0;
-    while (s[__res] != '\0')
-    {
-        ++__res;
-    }
-    return __res;
-}
-
-/**
- * @brief 测量字符串的长度
- *
- * @param src 字符串
- * @param maxlen 最大长度
- * @return long
- */
-long strnlen(const char *src, unsigned long maxlen);
-
 void *memset(void *dst, unsigned char C, ul size)
 {
 
@@ -263,36 +241,6 @@ static void *memcpy(void *dst, const void *src, long Num)
                          : "0"(Num / 8), "q"(Num), "1"(dst), "2"(src)
                          : "memory");
     return dst;
-}
-
-/*
-        比较字符串 FirstPart and SecondPart
-        FirstPart = SecondPart =>  0
-        FirstPart > SecondPart =>  1
-        FirstPart < SecondPart => -1
-*/
-
-int strcmp(char *FirstPart, char *SecondPart)
-{
-    register int __res;
-    __asm__ __volatile__("cld	\n\t"
-                         "1:	\n\t"
-                         "lodsb	\n\t"
-                         "scasb	\n\t"
-                         "jne	2f	\n\t"
-                         "testb	%%al,	%%al	\n\t"
-                         "jne	1b	\n\t"
-                         "xorl	%%eax,	%%eax	\n\t"
-                         "jmp	3f	\n\t"
-                         "2:	\n\t"
-                         "movl	$1,	%%eax	\n\t"
-                         "jl	3f	\n\t"
-                         "negl	%%eax	\n\t"
-                         "3:	\n\t"
-                         : "=a"(__res)
-                         : "D"(FirstPart), "S"(SecondPart)
-                         :);
-    return __res;
 }
 
 // 从io口读入8个bit
@@ -534,41 +482,5 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
                  : "=&c"(size), "=&D"(tmp0), "=&S"(tmp1)
                  : "r"(size & 7), "0"(size >> 3), "1"(dst), "2"(src)
                  : "memory");
-    return size;
-}
-
-/**
- * @brief 测量来自用户空间的字符串的长度，会检验地址空间是否属于用户空间
- * @param src
- * @param maxlen
- * @return long
- */
-long strnlen_user(const char *src, unsigned long maxlen);
-
-char *strncpy(char *dst, const char *src, long count)
-{
-    __asm__ __volatile__("cld	\n\t"
-                         "1:	\n\t"
-                         "decq	%2	\n\t"
-                         "js	2f	\n\t"
-                         "lodsb	\n\t"
-                         "stosb	\n\t"
-                         "testb	%%al,	%%al	\n\t"
-                         "jne	1b	\n\t"
-                         "rep	\n\t"
-                         "stosb	\n\t"
-                         "2:	\n\t"
-                         :
-                         : "S"(src), "D"(dst), "c"(count)
-                         : "ax", "memory");
-    return dst;
-}
-
-long strncpy_from_user(char *dst, const char *src, unsigned long size)
-{
-    if (!verify_area((uint64_t)src, size))
-        return 0;
-
-    strncpy(dst, src, size);
     return size;
 }

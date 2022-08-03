@@ -10,6 +10,7 @@
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 #include "math.h"
+#include <common/string.h>
 
 struct printk_screen_info pos;
 extern ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址

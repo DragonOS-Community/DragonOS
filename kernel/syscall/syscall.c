@@ -6,6 +6,7 @@
 #include <mm/slab.h>
 #include <common/errno.h>
 #include <common/fcntl.h>
+#include <common/string.h>
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/VFS/VFS.h>
 #include <driver/keyboard/ps2_keyboard.h>

@@ -1,6 +1,7 @@
 #include "VFS.h"
 #include <common/kprint.h>
 #include <common/dirent.h>
+#include <common/string.h>
 #include <common/errno.h>
 #include <mm/mm.h>
 #include <mm/slab.h>

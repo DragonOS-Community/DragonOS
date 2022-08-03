@@ -83,6 +83,25 @@ uchar uart_read(uint32_t port)
 {
     while (serial_received(port) == 0)
         pause();
-    
+
     return io_in8(port);
+}
+
+/**
+ * @brief 通过串口发送整个字符串
+ *
+ * @param port 串口端口
+ * @param str 字符串
+ */
+void uart_send_str(uint32_t port, const char *str)
+{
+    if ((unlikely(str == NULL)))
+        return;
+    while (1)
+    {
+        if (unlikely(*str == '\0'))
+            return;
+        uart_send(port, *str);
+        ++str;
+    }
 }

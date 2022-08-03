@@ -62,3 +62,11 @@ void uart_send(uint32_t port, char c);
  * @return uchar 接收到的数据
  */
 uchar uart_read(uint32_t port);
+
+/**
+ * @brief 通过串口发送整个字符串
+ *
+ * @param port 串口端口
+ * @param str 字符串
+ */
+void uart_send_str(uint32_t port, const char *str);

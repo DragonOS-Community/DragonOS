@@ -10,6 +10,7 @@
 #include "exception/irq.h"
 #include <exception/softirq.h>
 #include <lib/libUI/screen_manager.h>
+#include <lib/libUI/textui.h>
 #include "mm/mm.h"
 #include "mm/slab.h"
 #include "process/process.h"
@@ -73,14 +74,11 @@ void system_initialize()
     uart_init(COM1, 115200);
     video_init();
 
-    // scm_init();
-    // 初始化printk
-    printk_init(8, 16);
-    //#ifdef DEBUG
-    //#endif
+    scm_init();
+    textui_init();
+
     kinfo("Kernel Starting...");
-    while (1)
-        pause();
+    
     // 重新加载gdt和idt
 
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
@@ -106,7 +104,7 @@ void system_initialize()
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
     // 对显示模块进行低级初始化，不启用double buffer
-    video_reinitialize(false);
+    scm_reinit();
 
 
     // =========== 重新设置initial_tss[0]的ist
@@ -165,8 +163,9 @@ void system_initialize()
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
 
     process_init();
-    // 对显示模块进行高级初始化，启用double buffer
-    video_reinitialize(true);
+    // 启用double buffer
+    scm_enable_double_buffer();
+    
     io_mfence();
 
     // fat32_init();

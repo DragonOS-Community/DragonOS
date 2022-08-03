@@ -6,6 +6,8 @@
 #include <driver/multiboot2/multiboot2.h>
 #include <mm/mm.h>
 #include <common/spinlock.h>
+#include <lib/libUI/textui.h>
+#include <lib/libUI/screen_manager.h>
 
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
@@ -13,7 +15,7 @@
 #include <common/string.h>
 
 struct printk_screen_info pos;
-extern ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
+
 static spinlock_t printk_lock;
 static bool sw_show_scroll_animation = false; // 显示换行动画的开关
 
@@ -81,24 +83,18 @@ static int calculate_max_charNum(int len, int size)
     return len / size - 1;
 }
 
-int printk_init(const int char_size_x, const int char_size_y)
+int printk_init(struct scm_buffer_info_t *buf)
 {
-    struct multiboot_tag_framebuffer_info_t info;
-    int reserved;
 
-    multiboot2_iter(multiboot2_get_Framebuffer_info, &info, &reserved);
+    pos.width = buf->width;
+    pos.height = buf->height;
 
-    pos.width = info.framebuffer_width;
-    pos.height = info.framebuffer_height;
+    pos.char_size_x = 8;
+    pos.char_size_y = 16;
+    pos.max_x = calculate_max_charNum(pos.width, pos.char_size_x);
+    pos.max_y = calculate_max_charNum(pos.height, pos.char_size_y);
 
-    pos.char_size_x = char_size_x;
-    pos.char_size_y = char_size_y;
-    pos.max_x = calculate_max_charNum(pos.width, char_size_x);
-    pos.max_y = calculate_max_charNum(pos.height, char_size_y);
-
-    VBE_FB_phys_addr = (ul)info.framebuffer_addr;
-
-    pos.FB_address = (uint *)0xffff800003000000;
+    pos.FB_address = buf->vaddr;
     pos.FB_length = 1UL * pos.width * pos.height;
 
     // 初始化自旋锁
@@ -108,7 +104,7 @@ int printk_init(const int char_size_x, const int char_size_y)
     pos.y = 0;
 
     cls();
-    
+
     io_mfence();
     kdebug("width=%d\theight=%d", pos.width, pos.height);
     // 由于此时系统并未启用双缓冲，因此关闭滚动动画

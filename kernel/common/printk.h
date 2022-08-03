@@ -33,7 +33,7 @@
 
 #include "font.h"
 #include "glib.h"
-//#include "linkage.h"
+#include <lib/libUI/screen_manager.h>
 #include <stdarg.h>
 
 struct printk_screen_info
@@ -61,7 +61,7 @@ extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大
  * @param char_size_x 字符的列坐标
  * @param char_size_y 字符的行坐标
  */
-int printk_init(const int char_size_x, const int char_size_y);
+int printk_init(struct scm_buffer_info_t* buf);
 
 /**
  * @brief 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中

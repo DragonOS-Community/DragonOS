@@ -1,4 +1,5 @@
 #include "screen_manager.h"
+#include <common/string.h>
 #include <driver/multiboot2/multiboot2.h>
 #include <common/kprint.h>
 #include <common/spinlock.h>
@@ -7,13 +8,6 @@
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 
-extern const struct scm_buffer_info_t video_frame_buffer_info;
-static struct List scm_framework_list;
-static spinlock_t scm_register_lock; // 框架注册锁
-static uint32_t scm_ui_max_id = 0;
-static bool __scm_alloc_enabled = false;         // 允许动态申请内存的标志位
-static bool __scm_double_buffer_enabled = false; // 允许双缓冲的标志位
-
 /**
  * @brief 初始化屏幕管理模块
  *
@@ -21,6 +15,14 @@ static bool __scm_double_buffer_enabled = false; // 允许双缓冲的标志位
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 
+extern struct scm_buffer_info_t video_frame_buffer_info;
+static struct List scm_framework_list;
+static spinlock_t scm_register_lock;                   // 框架注册锁
+static spinlock_t scm_screen_own_lock = {1};           // 改变屏幕归属者时，需要对该锁加锁
+static struct scm_ui_framework_t *__current_framework; // 当前拥有屏幕控制权的框架
+static uint32_t scm_ui_max_id = 0;
+static bool __scm_alloc_enabled = false;         // 允许动态申请内存的标志位
+static bool __scm_double_buffer_enabled = false; // 允许双缓冲的标志位
 /**
  * @brief 创建新的帧缓冲区
  *
@@ -35,7 +37,7 @@ static struct scm_buffer_info_t *__create_buffer(uint64_t type)
 
     struct scm_buffer_info_t *buf = (struct scm_buffer_info_t *)kmalloc(sizeof(struct scm_buffer_info_t), 0);
     if (buf == NULL)
-        return -ENOMEM;
+        return (void*)-ENOMEM;
     memset(buf, 0, sizeof(struct scm_buffer_info_t));
     buf->bit_depth = video_frame_buffer_info.bit_depth;
     buf->flags = SCM_BF_DB;
@@ -55,7 +57,7 @@ static struct scm_buffer_info_t *__create_buffer(uint64_t type)
     return buf;
 failed:;
     kfree(buf);
-    return -ENOMEM;
+    return (void*)-ENOMEM;
 }
 
 /**
@@ -86,9 +88,12 @@ void scm_init()
 {
     list_init(&scm_framework_list);
     spin_init(&scm_register_lock);
+    spin_init(&scm_screen_own_lock);
+    io_mfence();
     scm_ui_max_id = 0;
     __scm_alloc_enabled = false;         // 禁用动态申请内存
     __scm_double_buffer_enabled = false; // 禁用双缓冲
+    __current_framework = NULL;
 }
 /**
  * @brief 检查ui框架结构体中的参数设置是否合法
@@ -102,7 +107,7 @@ static int __check_ui_param(const char *name, const uint8_t type, const struct s
 {
     if (name == NULL)
         return -EINVAL;
-    if (type != SCM_FRAMWORK_TYPE_GUI || type != SCM_FRAMWORK_TYPE_TEXT)
+    if (!(type == SCM_FRAMWORK_TYPE_GUI || type == SCM_FRAMWORK_TYPE_TEXT))
         return -EINVAL;
     if (ops == NULL)
         return -EINVAL;
@@ -153,6 +158,8 @@ int scm_register_alloc(const char *name, const uint8_t type, struct scm_ui_frame
     // 调用ui框架的回调函数以安装ui框架，并将其激活
     ui->ui_ops->install(ui->buf);
     ui->ui_ops->enable(NULL);
+    if (__current_framework == NULL)
+        return scm_framework_enable(ui);
     return 0;
 }
 
@@ -170,11 +177,12 @@ int scm_register(struct scm_ui_framework_t *ui)
         return -EINVAL;
 
     list_init(&ui->list);
-    spin_lock(&video_frame_buffer_info);
+    spin_lock(&scm_register_lock);
     ui->id = scm_ui_max_id++;
-    spin_unlock(&video_frame_buffer_info);
+    spin_unlock(&scm_register_lock);
 
     ui->buf = __create_buffer(ui->type);
+
     if ((uint64_t)(ui->buf) == (uint64_t)-ENOMEM)
         return -ENOMEM;
 
@@ -184,6 +192,10 @@ int scm_register(struct scm_ui_framework_t *ui)
     // 调用ui框架的回调函数以安装ui框架，并将其激活
     ui->ui_ops->install(ui->buf);
     ui->ui_ops->enable(NULL);
+
+    if (__current_framework == NULL)
+        return scm_framework_enable(ui);
+
     return 0;
 }
 
@@ -225,6 +237,8 @@ int scm_enable_alloc()
  */
 int scm_enable_double_buffer()
 {
+    if (__scm_double_buffer_enabled == true)
+        return 0;
     __scm_double_buffer_enabled = true;
     if (list_empty(&scm_framework_list))
         return 0;
@@ -235,9 +249,11 @@ int scm_enable_double_buffer()
     {
         if (ptr->buf == &video_frame_buffer_info)
         {
+            uart_send_str(COM1, "##init double buffer##");
             struct scm_buffer_info_t *buf = __create_buffer(SCM_BF_DB | SCM_BF_PIXEL);
             if ((uint64_t)(buf) == (uint64_t)-ENOMEM)
                 return -ENOMEM;
+            uart_send_str(COM1, "##to change double buffer##");
             if (ptr->ui_ops->change(buf) != 0)
             {
                 __destroy_buffer(buf);
@@ -245,9 +261,11 @@ int scm_enable_double_buffer()
             }
         }
     } while (list_next(&ptr->list) != &scm_framework_list);
-
+    // 设置定时刷新的对象
+    video_set_refresh_target(__current_framework->buf);
     // 通知显示驱动，启动双缓冲
     video_reinitialize(true);
+    uart_send_str(COM1, "##initialized double buffer##");
     return 0;
 }
 
@@ -261,8 +279,41 @@ int scm_framework_enable(struct scm_ui_framework_t *ui)
 {
     if (ui->buf->vaddr == NULL)
         return -EINVAL;
+    spin_lock(&scm_screen_own_lock);
+    int retval = 0;
+    if (__scm_double_buffer_enabled == true)
+    {
 
-    return video_set_refresh_target(ui->buf);
+        retval = video_set_refresh_target(ui->buf);
+        if (retval == 0)
+            __current_framework = ui;
+    }
+    else
+        __current_framework = ui;
+
+    spin_unlock(&scm_screen_own_lock);
+    return retval;
 }
 
+/**
+ * @brief 当内存管理单元被初始化之后，重新处理帧缓冲区问题
+ *
+ */
+void scm_reinit()
+{
+    scm_enable_alloc();
+    video_reinitialize(false);
+
+    // 遍历当前所有使用帧缓冲区的框架，更新地址
+    // 逐个检查已经注册了的ui框架，将其缓冲区更改为双缓冲
+    struct scm_ui_framework_t *ptr = container_of(list_next(&scm_framework_list), struct scm_ui_framework_t, list);
+    do
+    {
+        if (ptr->buf == &video_frame_buffer_info)
+        {
+            ptr->ui_ops->change(&video_frame_buffer_info);
+        }
+    } while (list_next(&ptr->list) != &scm_framework_list);
+    return;
+}
 #pragma GCC pop_options

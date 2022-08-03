@@ -33,11 +33,11 @@ struct scm_buffer_info_t
  */
 struct scm_ui_framework_operations_t
 {
-    int (*install)(struct scm_buffer_info_t *buf);
-    int (*uninstall)(void *args);
-    int (*enable)(void *args);
-    int (*disable)(void *args);
-    int (*change)(struct scm_buffer_info_t *buf);
+    int (*install)(struct scm_buffer_info_t *buf); // 安装ui框架的回调函数
+    int (*uninstall)(void *args);                  // 卸载ui框架的回调函数
+    int (*enable)(void *args);                     // 启用ui框架的回调函数
+    int (*disable)(void *args);                    // 禁用ui框架的回调函数
+    int (*change)(struct scm_buffer_info_t *buf);  // 改变ui框架的帧缓冲区的回调函数
 };
 struct scm_ui_framework_t
 {
@@ -47,7 +47,7 @@ struct scm_ui_framework_t
     uint8_t type;
     struct scm_ui_framework_operations_t *ui_ops;
     struct scm_buffer_info_t *buf;
-}__attribute__((aligned(sizeof(uint64_t))));
+} __attribute__((aligned(sizeof(uint64_t))));
 
 /**
  * @brief 初始化屏幕管理模块
@@ -56,57 +56,63 @@ struct scm_ui_framework_t
 void scm_init();
 
 /**
- * @brief 向屏幕管理器注册UI框架（动态获取框架对象结构体）
+ * @brief 当内存管理单元被初始化之后，重新处理帧缓冲区问题
  * 
+ */
+void scm_reinit();
+
+/**
+ * @brief 向屏幕管理器注册UI框架（动态获取框架对象结构体）
+ *
  * @param name 框架名
  * @param type 类型
  * @param ops 框架操作方法
- * @return int 
+ * @return int
  */
-int scm_register_alloc(const char* name, const uint8_t type, struct scm_ui_framework_operations_t * ops);
+int scm_register_alloc(const char *name, const uint8_t type, struct scm_ui_framework_operations_t *ops);
 
 /**
  * @brief 向屏幕管理器注册UI框架（静态设置的框架对象）
- * 
+ *
  * @param ui 框架结构体指针
  * @return int 错误码
  */
-int scm_register(struct scm_ui_framework_t*ui);
+int scm_register(struct scm_ui_framework_t *ui);
 
 /**
  * @brief 向屏幕管理器卸载UI框架
- * 
+ *
  * @param ui ui框架结构体
- * @return int 
+ * @return int
  */
-int scm_unregister(struct scm_ui_framework_t*ui);
+int scm_unregister(struct scm_ui_framework_t *ui);
 
 /**
  * @brief 向屏幕管理器卸载动态创建的UI框架
- * 
+ *
  * @param ui ui框架结构体
- * @return int 
+ * @return int
  */
-int scm_unregister_alloc(struct scm_ui_framework_t*ui);
+int scm_unregister_alloc(struct scm_ui_framework_t *ui);
 
 /**
  * @brief 允许动态申请内存
- * 
- * @return int 
+ *
+ * @return int
  */
 int scm_enable_alloc();
 
 /**
  * @brief 允许双缓冲区
- * 
- * @return int 
+ *
+ * @return int
  */
 int scm_enable_double_buffer();
 
 /**
  * @brief 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
- * 
+ *
  * @param ui 要启动的ui框架
  * @return int 返回码
  */
-int scm_framework_enable(struct scm_ui_framework_t*ui);
+int scm_framework_enable(struct scm_ui_framework_t *ui);

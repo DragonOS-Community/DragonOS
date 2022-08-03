@@ -22,7 +22,6 @@ static struct scm_buffer_info_t *video_refresh_target = NULL;
 
 #define REFRESH_INTERVAL 15UL // 启动刷新帧缓冲区任务的时间间隔
 
-ul VBE_FB_phys_addr; // 由bootloader传来的帧缓存区的物理地址
 
 /**
  * @brief VBE帧缓存区的地址重新映射

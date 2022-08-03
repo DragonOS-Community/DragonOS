@@ -17,7 +17,7 @@
 &emsp;&emsp;当您成功安装了docker之后，您可以通过以下命令，下载DragonOS的编译镜像：
 
 ```shell
-sudo docker pull dragonos/dragonos-dev
+docker pull dragonos/dragonos-dev:v1.0
 ```
 
 ### 安装qemu虚拟机

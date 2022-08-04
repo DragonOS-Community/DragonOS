@@ -53,7 +53,7 @@ struct bt_node_t *bt_create_node(struct bt_node_t *left, struct bt_node_t *right
 
     return node;
 nomem:;
-    return -ENOMEM;
+    return (void*)-ENOMEM;
 }
 /**
  * @brief 插入结点

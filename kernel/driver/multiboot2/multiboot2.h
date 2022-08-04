@@ -294,7 +294,7 @@ struct multiboot_tag_framebuffer_info_t
 // indexed color
 struct multiboot_tag_framebuffer_info_type0_t
 {
-    struct multiboot_tag_framebuffer_info_t;
+    struct multiboot_tag_framebuffer_info_t header;
     uint32_t framebuffer_palette_num_colors;
     struct multiboot_color_t color_desc;
 };
@@ -302,7 +302,7 @@ struct multiboot_tag_framebuffer_info_type0_t
 // direct RGB color
 struct multiboot_tag_framebuffer_info_type1_t
 {
-    struct multiboot_tag_framebuffer_info_t;
+    struct multiboot_tag_framebuffer_info_t header;
 
     uint8_t framebuffer_red_field_position;
     uint8_t framebuffer_red_mask_size;

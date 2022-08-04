@@ -44,7 +44,7 @@ int textui_refresh_vlines(struct textui_window_t *window, uint16_t start, uint16
         textui_refresh_vline(window, i);
     }
     start = 0;
-    while (count>0)
+    while (count > 0)
     {
         // sprintk(bufff, "[ 2fresh: %d ] ", start);
         // uart_send_str(COM1, bufff);
@@ -116,17 +116,13 @@ static void __textui_render_chromatic(uint16_t actual_line, uint16_t index, stru
      * @param font 字符的bitmap
      */
 
-    // #if DEBUG
-    // uart_send(COM1, font);
-    // #endif
-
     unsigned char *font_ptr = font_ascii[(uint8_t)character->c];
     unsigned int *addr;
     uint32_t *fb = (uint32_t *)textui_framework.buf->vaddr;
-    // uint32_t FRcolor = YELLOW;
-    uint32_t FRcolor = calculate_color(character->Fr, character->Fg, character->Fb);
-    // uint32_t BKcolor = BLACK;
-    uint32_t BKcolor = calculate_color(character->Br, character->Bg, character->Bb);
+
+    uint32_t FRcolor = character->FRcolor & 0x00ffffff;
+
+    uint32_t BKcolor = character->BKcolor & 0x00ffffff;
 
     uint32_t x = index * TEXTUI_CHAR_WIDTH;
     uint32_t y = actual_line * TEXTUI_CHAR_HEIGHT;

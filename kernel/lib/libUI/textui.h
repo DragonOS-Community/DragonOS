@@ -29,16 +29,13 @@ struct textui_char_normal_t
  */
 struct textui_char_chromatic_t
 {
-    uint16_t c; // 字符
+    unsigned c : 16;
+
     // 前景色
-    uint8_t Fr; // 红
-    uint8_t Fg; // 绿
-    uint8_t Fb; // 蓝
+    unsigned FRcolor : 24; // rgb
 
     // 背景色
-    uint8_t Br;
-    uint8_t Bg;
-    uint8_t Bb;
+    unsigned BKcolor : 24; // rgb
 };
 
 // 注意！！！ 请保持vline结构体的大小、成员变量命名相等！
@@ -122,17 +119,21 @@ int textui_refresh_characters(struct textui_window_t *window, uint16_t vline_id,
  *
  * @param window 窗口
  * @param character 字符
+ * @param FRcolor 前景色（RGB）
+ * @param BKcolor 背景色（RGB）
  * @return int
  */
-int textui_putchar_window(struct textui_window_t *window, uint16_t character);
+int textui_putchar_window(struct textui_window_t *window, uint16_t character, uint32_t FRcolor, uint32_t BKcolor);
 
 /**
  * @brief 在默认窗口上输出一个字符
  *
  * @param character 字符
+ * @param FRcolor 前景色（RGB）
+ * @param BKcolor 背景色（RGB）
  * @return int
  */
-int textui_putchar(uint16_t character);
+int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor);
 
 /**
  * @brief 获取textui的帧缓冲区能容纳的内容的行数

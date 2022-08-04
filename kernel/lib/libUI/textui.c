@@ -90,7 +90,6 @@ int textui_change_handler(struct scm_buffer_info_t *buf)
 {
     memcpy((void *)buf->vaddr, (void *)(textui_framework.buf->vaddr), textui_framework.buf->size);
     textui_framework.buf = buf;
-    set_pos_VBE_FB_addr((uint *)buf->vaddr);
     return 0;
 }
 
@@ -144,13 +143,12 @@ static int __textui_new_line(struct textui_window_t *window, uint16_t vline_id)
 
     if (likely(window->vlines_used == window->vlines_num)) // 需要滚动屏幕
     {
-        // uart_send_str(COM1, " scroll, top vline= ");
+
         ++window->top_vline;
-        // uart_send(COM1, '0' + window->top_vline);
+
         if (unlikely(window->top_vline >= window->vlines_num))
             window->top_vline = 0;
 
-        // int delta = ABS((int)window->vline_operating - (int)window->top_vline);
         // 刷新所有行
         textui_refresh_vlines(window, window->top_vline, window->vlines_num);
     }
@@ -159,19 +157,23 @@ static int __textui_new_line(struct textui_window_t *window, uint16_t vline_id)
 
     return 0;
 }
-static int __textui_putchar_window(struct textui_window_t *window, uint16_t character)
+
+/**
+ * @brief 真正向屏幕上输出字符的函数
+ *
+ * @param window
+ * @param character
+ * @return int
+ */
+static int __textui_putchar_window(struct textui_window_t *window, uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
 {
     if (textui_is_chromatic(window->flags)) // 启用彩色字符
     {
         struct textui_vline_chromatic_t *vline = &window->vlines.chromatic[window->vline_operating];
 
         vline->chars[vline->index].c = character;
-        vline->chars[vline->index].Fr = 0xff;
-        vline->chars[vline->index].Fg = 0xff;
-        vline->chars[vline->index].Fb = 0xff;
-        vline->chars[vline->index].Br = 0;
-        vline->chars[vline->index].Bg = 0;
-        vline->chars[vline->index].Bb = 0;
+        vline->chars[vline->index].FRcolor = FRcolor & 0xffffff;
+        vline->chars[vline->index].BKcolor = BKcolor & 0xffffff;
         ++vline->index;
         textui_refresh_characters(window, window->vline_operating, vline->index - 1, 1);
         // 换行
@@ -188,20 +190,23 @@ static int __textui_putchar_window(struct textui_window_t *window, uint16_t char
     }
     return 0;
 }
+
 /**
  * @brief 在指定窗口上输出一个字符
  *
  * @param window 窗口
  * @param character 字符
+ * @param FRcolor 前景色（RGB）
+ * @param BKcolor 背景色（RGB）
  * @return int
  */
-int textui_putchar_window(struct textui_window_t *window, uint16_t character)
+int textui_putchar_window(struct textui_window_t *window, uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
 {
     if (unlikely(character == '\0'))
         return 0;
     if (!textui_is_chromatic(window->flags)) // 暂不支持纯文本窗口
         return 0;
-    
+
     uint64_t rflags = 0; // 加锁后rflags存储到这里
     spin_lock_irqsave(&window->lock, rflags);
     uart_send(COM1, character);
@@ -217,7 +222,7 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character)
 
         while (space_to_print--)
         {
-            __textui_putchar_window(window, ' ');
+            __textui_putchar_window(window, ' ', FRcolor, BKcolor);
         }
     }
     else if (character == '\b') // 退格
@@ -251,7 +256,7 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character)
         }
     }
     else
-        __textui_putchar_window(window, character);
+        __textui_putchar_window(window, character, FRcolor, BKcolor);
 
     spin_unlock_irqrestore(&window->lock, rflags);
     return 0;
@@ -261,12 +266,14 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character)
  * @brief 在默认窗口上输出一个字符
  *
  * @param character 字符
+ * @param FRcolor 前景色（RGB）
+ * @param BKcolor 背景色（RGB）
  * @return int
  */
-int textui_putchar(uint16_t character)
+int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
 {
-    
-    return textui_putchar_window(__private_info.default_window, character);
+
+    return textui_putchar_window(__private_info.default_window, character, FRcolor, BKcolor);
 }
 
 /**
@@ -293,7 +300,7 @@ int textui_init()
     int retval = scm_register(&textui_framework);
     if (retval != 0)
     {
-        uart_send_str(COM1, "text ui init failed");
+        uart_send_str(COM1, "text ui init failed\n");
         while (1)
             pause();
     }
@@ -317,6 +324,6 @@ int textui_init()
     __private_info.default_window = &__initial_window;
     __private_info.actual_line = textui_framework.buf->height / TEXTUI_CHAR_HEIGHT;
 
-    uart_send_str(COM1, "text ui initialized");
+    uart_send_str(COM1, "text ui initialized\n");
     return 0;
 }

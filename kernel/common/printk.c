@@ -3,63 +3,15 @@
 //
 #include "printk.h"
 #include "kprint.h"
-#include <driver/multiboot2/multiboot2.h>
+
 #include <mm/mm.h>
 #include <common/spinlock.h>
 #include <lib/libUI/textui.h>
-#include <lib/libUI/screen_manager.h>
 
-#include <driver/uart/uart.h>
-#include <driver/video/video.h>
 #include "math.h"
 #include <common/string.h>
-#include <lib/libUI/textui.h>
 
-struct printk_screen_info pos;
-
-static spinlock_t printk_lock={1};
-static bool sw_show_scroll_animation = false; // 显示换行动画的开关
-
-/**
- * @brief Set the printk pos object
- *
- * @param x 列坐标
- * @param y 行坐标
- */
-static int set_printk_pos(const int x, const int y);
-
-/**
- * @brief 在屏幕上指定位置打印字符
- *
- * @param fb 帧缓存线性地址
- * @param Xsize 行分辨率
- * @param x 左上角列像素点位置
- * @param y 左上角行像素点位置
- * @param FRcolor 字体颜色
- * @param BKcolor 背景颜色
- * @param font 字符的bitmap
- */
-static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font);
-
-static uint *get_pos_VBE_FB_addr();
-
-/**
- * @brief 清屏
- *
- */
-static int cls();
-
-#pragma GCC push_options
-#pragma GCC optimize("O0")
-/**
- * @brief 滚动窗口（尚不支持向下滚动)
- *
- * @param direction  方向，向上滑动为true,否则为false
- * @param pixels 要滑动的像素数量
- * @param animation 是否包含滑动动画
- */
-static int scroll(bool direction, int pixels, bool animation);
-#pragma GCC pop_options
+static spinlock_t __printk_lock = {1};
 /**
  * @brief 将数字按照指定的要求转换成对应的字符串（2~36进制）
  *
@@ -74,56 +26,6 @@ static char *write_num(char *str, ul num, int base, int field_width, int precisi
 
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
 
-static int calculate_max_charNum(int len, int size)
-{
-    /**
-     * @brief 计算屏幕上能有多少行
-     * @param len 屏幕长/宽
-     * @param size 字符长/宽
-     */
-    return len / size - 1;
-}
-
-int printk_init(struct scm_buffer_info_t *buf)
-{
-
-    pos.width = buf->width;
-    pos.height = buf->height;
-
-    pos.char_size_x = 8;
-    pos.char_size_y = 16;
-    pos.max_x = calculate_max_charNum(pos.width, pos.char_size_x);
-    pos.max_y = calculate_max_charNum(pos.height, pos.char_size_y);
-
-    pos.FB_address = buf->vaddr;
-    pos.FB_length = 1UL * pos.width * pos.height;
-
-    // 初始化自旋锁
-    spin_init(&printk_lock);
-
-    pos.x = 0;
-    pos.y = 0;
-
-    cls();
-
-    io_mfence();
-    kdebug("width=%d\theight=%d", pos.width, pos.height);
-    // 由于此时系统并未启用双缓冲，因此关闭滚动动画
-    printk_disable_animation();
-
-    io_mfence();
-    return 0;
-}
-
-static int set_printk_pos(const int x, const int y)
-{
-    // 指定的坐标不在屏幕范围内
-    if (!((x >= 0 && x <= pos.max_x) && (y >= 0 && y <= pos.max_y)))
-        return EPOS_OVERFLOW;
-    pos.x = x;
-    pos.y = y;
-    return 0;
-}
 static int skip_and_atoi(const char **s)
 {
     /**
@@ -137,37 +39,6 @@ static int skip_and_atoi(const char **s)
         ++(*s);
     }
     return ans;
-}
-
-static void auto_newline()
-{
-    /**
-     * @brief 超过每行最大字符数，自动换行
-     *
-     */
-
-    if (pos.x > pos.max_x)
-    {
-#ifdef DEBUG
-        uart_send(COM1, '\r');
-        uart_send(COM1, '\n');
-#endif
-        pos.x = 0;
-        ++pos.y;
-    }
-    if (pos.y > pos.max_y)
-    {
-#ifdef DEBUG
-        uart_send(COM1, '\r');
-        uart_send(COM1, '\n');
-#endif
-        pos.y = pos.max_y;
-        int lines_to_scroll = 1;
-        barrier();
-        scroll(true, lines_to_scroll * pos.char_size_y, sw_show_scroll_animation);
-        barrier();
-        pos.y -= (lines_to_scroll - 1);
-    }
 }
 
 int vsprintf(char *buf, const char *fmt, va_list args)
@@ -637,8 +508,6 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
         *str++ = sign;
 
     // 输出整数部分
-    // while (js_num_z-- > 0)
-    //     *str++ = tmp_num_z[js_num_z];
     while (js_num_z > 0)
     {
         *str++ = tmp_num_z[js_num_z - 1];
@@ -672,7 +541,8 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
  */
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...)
 {
-    
+    uint64_t rflags;
+    spin_lock_irqsave(&__printk_lock, rflags);
     va_list args;
     va_start(args, fmt);
     char buf[4096]; // vsprintf()的缓冲区
@@ -685,195 +555,11 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
     for (i = 0; i < len; ++i)
     {
         current = *(buf + i);
-        //输出换行
-        if (current == '\n')
-        {
-
-            textui_putchar(current);
-        }
-        // else if (current == '\t') // 输出制表符
-        // {
-        //     int space_to_print = 8 - pos.x % 8;
-
-        //     while (space_to_print--)
-        //     {
-        //         textui_putchar(' ');
-        //         ++pos.x;
-        //     }
-        // }
-        // else if (current == '\b') // 退格
-        // {
-        //     --pos.x;
-        //     if (pos.x < 0)
-        //     {
-        //         --pos.y;
-        //         if (pos.y <= 0)
-        //             pos.x = pos.y = 0;
-        //         else
-        //             pos.x = pos.max_x;
-        //     }
-
-        //     textui_putchar(' ');
-
-        //     auto_newline();
-        // }
-        else
-        {
-            if (current != '\0')
-                textui_putchar(current);
-        }
+        // 输出
+        textui_putchar(current, FRcolor, BKcolor);
     }
-
-    // spin_unlock_irqrestore(&printk_lock, rflags);
+    spin_unlock_irqrestore(&__printk_lock, rflags);
     return i;
-}
-
-int do_scroll(bool direction, int pixels)
-{
-    if (direction == true) // 向上滚动
-    {
-        pixels = pixels;
-        if (pixels > pos.height)
-            return EPOS_OVERFLOW;
-        // 无需滚动
-        if (pixels == 0)
-            return 0;
-        unsigned int src = pixels * pos.width;
-        unsigned int count = pos.FB_length - src;
-
-        memcpy(pos.FB_address, (pos.FB_address + src), sizeof(unsigned int) * (pos.FB_length - src));
-        memset(pos.FB_address + (pos.FB_length - src), 0, sizeof(unsigned int) * (src));
-
-        return 0;
-    }
-    else
-        return EUNSUPPORTED;
-    return 0;
-}
-/**
- * @brief 滚动窗口（尚不支持向下滚动）
- *
- * @param direction  方向，向上滑动为true,否则为false
- * @param pixels 要滑动的像素数量
- * @param animation 是否包含滑动动画
- */
-static int scroll(bool direction, int pixels, bool animation)
-{
-    // 暂时不支持反方向滚动
-    if (direction == false)
-        return EUNSUPPORTED;
-    // 为了保证打印字符正确，需要对pixel按照字体高度对齐
-    int md = pixels % pos.char_size_y;
-    if (md)
-        pixels = pixels + pos.char_size_y - md;
-    if (animation == false)
-        return do_scroll(direction, pixels);
-    else
-    {
-
-        int steps;
-        if (pixels > 10)
-            steps = 5;
-        else
-            steps = pixels % 10;
-        int half_steps = steps / 2;
-
-        // 计算加速度
-        double accelerate = 0.5 * pixels / (half_steps * half_steps);
-        int current_pixels = 0;
-        double delta_x;
-
-        int trace[13] = {0};
-        int js_trace = 0;
-        // 加速阶段
-        for (int i = 1; i <= half_steps; ++i)
-        {
-            trace[js_trace] = (int)(accelerate * i + 0.5);
-            current_pixels += trace[js_trace];
-            do_scroll(direction, trace[js_trace]);
-
-            ++js_trace;
-        }
-
-        // 强制使得位置位于1/2*pixels
-        if (current_pixels < pixels / 2)
-        {
-            delta_x = pixels / 2 - current_pixels;
-            current_pixels += delta_x;
-            do_scroll(direction, delta_x);
-        }
-
-        // 减速阶段，是加速阶段的重放
-        for (int i = js_trace - 1; i >= 0; --i)
-        {
-            current_pixels += trace[i];
-            do_scroll(direction, trace[i]);
-        }
-
-        if (current_pixels > pixels)
-            kerror("During scrolling: scrolled pixels over bound!");
-
-        // 强制使得位置位于pixels
-        if (current_pixels < pixels)
-        {
-            delta_x = pixels - current_pixels;
-            current_pixels += delta_x;
-            do_scroll(direction, delta_x);
-        }
-    }
-
-    return 0;
-}
-
-/**
- * @brief 清屏
- *
- */
-static int cls()
-{
-    memset(pos.FB_address, BLACK, pos.FB_length * sizeof(unsigned int));
-    pos.x = 0;
-    pos.y = 0;
-    return 0;
-}
-
-/**
- * @brief 获取VBE帧缓冲区长度
- */
-ul get_VBE_FB_length()
-{
-    return pos.FB_length;
-}
-
-/**
- * @brief 设置pos变量中的VBE帧缓存区的线性地址
- * @param virt_addr VBE帧缓存区线性地址
- */
-void set_pos_VBE_FB_addr(uint *virt_addr)
-{
-    pos.FB_address = (uint *)virt_addr;
-}
-
-static uint *get_pos_VBE_FB_addr()
-{
-    return pos.FB_address;
-}
-
-/**
- * @brief 使能滚动动画
- *
- */
-void printk_enable_animation()
-{
-    sw_show_scroll_animation = true;
-}
-/**
- * @brief 禁用滚动动画
- *
- */
-void printk_disable_animation()
-{
-    sw_show_scroll_animation = false;
 }
 
 int sprintk(char *buf, const char *fmt, ...)

@@ -76,7 +76,7 @@ void system_initialize()
 
     scm_init();
     textui_init();
-    // kinfo("Kernel Starting...");
+    kinfo("Kernel Starting...");
 
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
@@ -173,7 +173,7 @@ void system_initialize()
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
     apic_timer_init();
     io_mfence();
-     while(1);
+
 }
 
 //操作系统内核从这里开始执行

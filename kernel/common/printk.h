@@ -36,32 +36,7 @@
 #include <lib/libUI/screen_manager.h>
 #include <stdarg.h>
 
-struct printk_screen_info
-{
-    int width, height; //屏幕大小
-
-    int max_x, max_y; // 最大x、y字符数
-
-    int x, y; //光标位置
-
-    int char_size_x, char_size_y;
-
-    uint *FB_address; //帧缓冲区首地址
-
-    unsigned long FB_length; // 帧缓冲区长度（乘以4才是字节数）
-};
-
 extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中
-
-
-
-/**
- * @brief 初始化printk的屏幕信息
- *
- * @param char_size_x 字符的列坐标
- * @param char_size_y 字符的行坐标
- */
-int printk_init(struct scm_buffer_info_t* buf);
 
 /**
  * @brief 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
@@ -72,9 +47,6 @@ int printk_init(struct scm_buffer_info_t* buf);
  * @return 最终字符串的长度
  */
 int vsprintf(char *buf, const char *fmt, va_list args);
-
-
-
 
 /**
  * @brief 格式化打印字符串
@@ -88,37 +60,9 @@ int vsprintf(char *buf, const char *fmt, va_list args);
 
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...);
 
-
-
-
-/**
- * @brief 获取VBE帧缓冲区长度
-
- */
-ul get_VBE_FB_length();
-
-/**
- * @brief 设置pos变量中的VBE帧缓存区的线性地址
- * @param virt_addr VBE帧缓存区线性地址
- */
-void set_pos_VBE_FB_addr(uint* virt_addr);
-
-
-
-/**
- * @brief 使能滚动动画
- * 
- */
-void printk_enable_animation();
-/**
- * @brief 禁用滚动动画
- * 
- */
-void printk_disable_animation();
-
 /**
  * @brief 格式化字符串并输出到buf
- * 
+ *
  * @param buf 输出缓冲区
  * @param fmt 格式
  * @param ... 参数

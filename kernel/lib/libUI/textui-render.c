@@ -16,6 +16,7 @@
 
 extern struct scm_ui_framework_t textui_framework;
 
+extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中
 static void __textui_render_chromatic(uint16_t actual_line, uint16_t index, struct textui_char_chromatic_t *character);
 
 /**

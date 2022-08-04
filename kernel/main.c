@@ -37,12 +37,10 @@
 
 #include <driver/interrupt/apic/apic_timer.h>
 
-unsigned int *FR_address = (unsigned int *)0xb8000; //帧缓存区的地址
 ul bsp_idt_size, bsp_gdt_size;
 
-// struct Global_Memory_Descriptor memory_management_struct = {{0}, 0};
-void test_slab();
-
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 struct gdtr gdtp;
 struct idtr idtp;
 void reload_gdt()
@@ -148,6 +146,7 @@ void system_initialize()
     // ps2_mouse_init();
     // ata_init();
     pci_init();
+    io_mfence();
     ahci_init();
 
     // test_slab();
@@ -174,6 +173,9 @@ void system_initialize()
     apic_timer_init();
     io_mfence();
 
+    // 这里不能删除，否则在O1会报错
+    // while (1)
+    //     pause();
 }
 
 //操作系统内核从这里开始执行
@@ -202,7 +204,7 @@ void Start_Kernel(void)
     io_mfence();
 
     while (1)
-        hlt();
+        pause();
 }
 
 void ignore_int()
@@ -211,3 +213,4 @@ void ignore_int()
     while (1)
         ;
 }
+#pragma GCC pop_options

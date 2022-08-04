@@ -76,11 +76,9 @@ void system_initialize()
 
     scm_init();
     textui_init();
+    // kinfo("Kernel Starting...");
 
-    kinfo("Kernel Starting...");
-    
     // 重新加载gdt和idt
-
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 
     _stack_start = head_stack_start; // 保存init proc的栈基地址（由于之后取消了地址重映射，因此必须在这里重新保存）
@@ -100,6 +98,7 @@ void system_initialize()
 
     //  初始化内存管理单元
     mm_init();
+    
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
@@ -161,11 +160,10 @@ void system_initialize()
     io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
-
+   
     process_init();
     // 启用double buffer
     scm_enable_double_buffer();
-    
     io_mfence();
 
     // fat32_init();
@@ -175,6 +173,7 @@ void system_initialize()
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
     apic_timer_init();
     io_mfence();
+     while(1);
 }
 
 //操作系统内核从这里开始执行

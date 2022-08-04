@@ -8,8 +8,6 @@
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
 
-
-
 extern struct scm_buffer_info_t video_frame_buffer_info;
 static struct List scm_framework_list;
 static spinlock_t scm_register_lock;                   // 框架注册锁
@@ -32,7 +30,7 @@ static struct scm_buffer_info_t *__create_buffer(uint64_t type)
 
     struct scm_buffer_info_t *buf = (struct scm_buffer_info_t *)kmalloc(sizeof(struct scm_buffer_info_t), 0);
     if (buf == NULL)
-        return (void*)-ENOMEM;
+        return (void *)-ENOMEM;
     memset(buf, 0, sizeof(struct scm_buffer_info_t));
     buf->bit_depth = video_frame_buffer_info.bit_depth;
     buf->flags = SCM_BF_DB;
@@ -52,7 +50,7 @@ static struct scm_buffer_info_t *__create_buffer(uint64_t type)
     return buf;
 failed:;
     kfree(buf);
-    return (void*)-ENOMEM;
+    return (void *)-ENOMEM;
 }
 
 /**
@@ -106,7 +104,7 @@ static int __check_ui_param(const char *name, const uint8_t type, const struct s
 {
     if (name == NULL)
         return -EINVAL;
-    if (!(type == SCM_FRAMWORK_TYPE_GUI || type == SCM_FRAMWORK_TYPE_TEXT))
+    if ((type == SCM_FRAMWORK_TYPE_GUI || type == SCM_FRAMWORK_TYPE_TEXT) == 0)
         return -EINVAL;
     if (ops == NULL)
         return -EINVAL;

@@ -13,10 +13,11 @@
 #include <driver/video/video.h>
 #include "math.h"
 #include <common/string.h>
+#include <lib/libUI/textui.h>
 
 struct printk_screen_info pos;
 
-static spinlock_t printk_lock;
+static spinlock_t printk_lock={1};
 static bool sw_show_scroll_animation = false; // 显示换行动画的开关
 
 /**
@@ -662,49 +663,6 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
     return str;
 }
 
-static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, unsigned int BKcolor, unsigned char font)
-{
-    /**
-     * @brief 在屏幕上指定位置打印字符
-     *
-     * @param fb 帧缓存线性地址
-     * @param Xsize 行分辨率
-     * @param x 左上角列像素点位置
-     * @param y 左上角行像素点位置
-     * @param FRcolor 字体颜色
-     * @param BKcolor 背景颜色
-     * @param font 字符的bitmap
-     */
-
-    //#if DEBUG
-    uart_send(COM1, font);
-    //#endif
-
-    unsigned char *font_ptr = font_ascii[font];
-    unsigned int *addr;
-
-    int testbit; // 用来测试某位是背景还是字体本身
-
-    for (int i = 0; i < pos.char_size_y; ++i)
-    {
-        // 计算出帧缓冲区的地址
-        addr = fb + Xsize * (y + i) + x;
-        testbit = (1 << (pos.char_size_x + 1));
-        for (int j = 0; j < pos.char_size_x; ++j)
-        {
-            //从左往右逐个测试相应位
-            testbit >>= 1;
-            if (*font_ptr & testbit)
-                *addr = FRcolor; // 字，显示前景色
-            else
-                *addr = BKcolor; // 背景色
-
-            ++addr;
-        }
-        ++font_ptr;
-    }
-}
-
 /**
  * @brief 格式化打印字符串
  *
@@ -714,10 +672,7 @@ static void putchar(uint *fb, int Xsize, int x, int y, unsigned int FRcolor, uns
  */
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...)
 {
-
-    uint64_t rflags = 0; // 加锁后rflags存储到这里
-    spin_lock_irqsave(&printk_lock, rflags);
-
+    
     va_list args;
     va_start(args, fmt);
     char buf[4096]; // vsprintf()的缓冲区
@@ -733,47 +688,43 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
         //输出换行
         if (current == '\n')
         {
-            pos.x = 0;
-            ++pos.y;
-            auto_newline();
+
+            textui_putchar(current);
         }
-        else if (current == '\t') // 输出制表符
-        {
-            int space_to_print = 8 - pos.x % 8;
+        // else if (current == '\t') // 输出制表符
+        // {
+        //     int space_to_print = 8 - pos.x % 8;
 
-            while (space_to_print--)
-            {
-                putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, FRcolor, BKcolor, ' ');
-                ++pos.x;
+        //     while (space_to_print--)
+        //     {
+        //         textui_putchar(' ');
+        //         ++pos.x;
+        //     }
+        // }
+        // else if (current == '\b') // 退格
+        // {
+        //     --pos.x;
+        //     if (pos.x < 0)
+        //     {
+        //         --pos.y;
+        //         if (pos.y <= 0)
+        //             pos.x = pos.y = 0;
+        //         else
+        //             pos.x = pos.max_x;
+        //     }
 
-                auto_newline();
-            }
-        }
-        else if (current == '\b') // 退格
-        {
-            --pos.x;
-            if (pos.x < 0)
-            {
-                --pos.y;
-                if (pos.y <= 0)
-                    pos.x = pos.y = 0;
-                else
-                    pos.x = pos.max_x;
-            }
+        //     textui_putchar(' ');
 
-            putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, FRcolor, BKcolor, ' ');
-
-            auto_newline();
-        }
+        //     auto_newline();
+        // }
         else
         {
-            putchar(pos.FB_address, pos.width, pos.x * pos.char_size_x, pos.y * pos.char_size_y, FRcolor, BKcolor, current);
-            ++pos.x;
-            auto_newline();
+            if (current != '\0')
+                textui_putchar(current);
         }
     }
 
-    spin_unlock_irqrestore(&printk_lock, rflags);
+    // spin_unlock_irqrestore(&printk_lock, rflags);
     return i;
 }
 

@@ -9,8 +9,8 @@
 #define SCM_BF_PIXEL (1 << 3) // 使用图像模式
 
 // ui框架类型
-#define SCM_FRAMWORK_TYPE_TEXT 0
-#define SCM_FRAMWORK_TYPE_GUI 1
+#define SCM_FRAMWORK_TYPE_TEXT (uint8_t)0
+#define SCM_FRAMWORK_TYPE_GUI (uint8_t)1
 
 /**
  * @brief 帧缓冲区信息结构体
@@ -47,7 +47,7 @@ struct scm_ui_framework_t
     uint8_t type;
     struct scm_ui_framework_operations_t *ui_ops;
     struct scm_buffer_info_t *buf;
-} __attribute__((aligned(sizeof(uint64_t))));
+};
 
 /**
  * @brief 初始化屏幕管理模块

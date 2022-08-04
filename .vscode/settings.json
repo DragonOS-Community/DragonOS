@@ -117,7 +117,10 @@
         "sched.h": "c",
         "preempt.h": "c",
         "softirq.h": "c",
-        "screen_manager.h": "c"
+        "screen_manager.h": "c",
+        "textui.h": "c",
+        "atomic.h": "c",
+        "uart.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

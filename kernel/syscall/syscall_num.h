@@ -30,5 +30,9 @@
 #define SYS_MKDIR 17 // 创建文件夹
 #define SYS_NANOSLEEP 18 // 纳秒级休眠
 #define SYS_CLOCK 19 // 获取当前cpu时间
+#define SYS_PIPE 20
+
+#define SYS_MSTAT 21    // 获取系统的内存状态信息
+
 
 #define SYS_AHCI_END_REQ 255    // AHCI DMA请求结束end_request的系统调用

@@ -145,7 +145,7 @@
     do                              \
     {                               \
         ul tmp;                     \
-        io_mfence();\
+        io_mfence();                \
         __asm__ __volatile__(       \
             "movq %%cr3, %0\n\t"    \
             "movq %0, %%cr3\n\t"    \
@@ -225,6 +225,21 @@ struct Page
     ul ref_counts;
     // 本页的创建时间
     ul age;
+};
+
+/**
+ * @brief 系统内存信息结构体（单位：字节）
+ *
+ */
+struct mm_stat_t
+{
+    uint64_t total;     // 计算机的总内存数量大小
+    uint64_t used;      // 已使用的内存大小
+    uint64_t free;      // 空闲物理页所占的内存大小
+    uint64_t shared;    // 共享的内存大小
+    uint64_t cache_used;     // 位于slab缓冲区中的已使用的内存大小
+    uint64_t cache_free;     // 位于slab缓冲区中的空闲的内存大小
+    uint64_t available; // 系统总空闲内存大小（包括kmalloc缓冲区）
 };
 
 extern struct memory_desc memory_management_struct;
@@ -444,3 +459,10 @@ int8_t mm_check_page_table(uint64_t *ptr);
  * @return uint64_t
  */
 uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset);
+
+/**
+ * @brief 获取系统当前的内存信息(未上锁，不一定精准)
+ * 
+ * @return struct mm_stat_t 内存信息结构体
+ */
+struct mm_stat_t mm_stat();

@@ -133,6 +133,15 @@ int shell_cmd_reboot(int argc, char **argv);
 int shell_cmd_about(int argc, char **argv);
 
 /**
+ * @brief 显示系统内存空间信息的命令
+ * 
+ * @param argc 
+ * @param argv 
+ * @return int 
+ */
+int shell_cmd_free(int argc, char **argv);
+
+/**
  * @brief 解析shell命令
  *
  * @param buf 输入缓冲区

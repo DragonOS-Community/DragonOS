@@ -32,6 +32,7 @@ struct built_in_cmd_t shell_cmds[] =
         {"reboot", shell_cmd_reboot},
         {"touch", shell_cmd_touch},
         {"about", shell_cmd_about},
+        {"free", shell_cmd_free},
         {"help", shell_help},
 
 };
@@ -460,10 +461,44 @@ int shell_cmd_about(int argc, char **argv)
  * @param argv
  * @return int
  */
-// todo:
 int shell_cmd_reboot(int argc, char **argv)
 {
     return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+int shell_cmd_free(int argc, char **argv)
+{
+    int retval = 0;
+    if (argc == 2 && strcmp("-m", argv[1]) != 0)
+    {
+        retval = -EINVAL;
+        printf("Invalid argument: %s\n", argv[1]);
+        goto done;
+    }
+
+    struct mstat_t mst = {0};
+    retval = mstat(&mst);
+    if(retval!=0)
+    {
+        printf("Failed: retval=%d", retval);
+        goto done;
+    }
+
+    printf("\ttotal\tused\tfree\tshared\tcache\tavailable\n");
+    printf("Mem:\t");
+    if(argc==1) // 按照kb显示
+    {
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total>>10,mst.used>>10,mst.free>>10, mst.shared>>10, mst.cache_used>>10, mst.available>>10);
+    }
+    else    // 按照MB显示
+    {
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total>>20,mst.used>>20,mst.free>>20, mst.shared>>20, mst.cache_used>>20, mst.available>>20);
+    }
+    
+done:;
+    if (argv != NULL)
+        free(argv);
+    return retval;
 }
 
 /**

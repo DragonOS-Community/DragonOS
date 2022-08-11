@@ -227,25 +227,27 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
     }
     else if (character == '\b') // 退格
     {
-
-        --window->vlines.chromatic[window->vline_operating].index;
+        char bufff[128] = {0};
+        --(window->vlines.chromatic[window->vline_operating].index);
         {
             uint16_t tmp = window->vlines.chromatic[window->vline_operating].index;
-            window->vlines.chromatic[window->vline_operating].chars[tmp].c = ' ';
-            textui_refresh_characters(window, window->vline_operating, tmp, 1);
+            if (tmp >= 0)
+            {
+                window->vlines.chromatic[window->vline_operating].chars[tmp].c = ' ';
+                textui_refresh_characters(window, window->vline_operating, tmp, 1);
+            }
         }
-
         // 需要向上缩一行
-        if (window->vlines.chromatic[window->vline_operating].index < 0)
+        if (window->vlines.chromatic[window->vline_operating].index <= 0)
         {
             window->vlines.chromatic[window->vline_operating].index = 0;
             memset(window->vlines.chromatic[window->vline_operating].chars, 0, sizeof(struct textui_char_chromatic_t) * window->chars_per_line);
-            --window->vline_operating;
+            --(window->vline_operating);
             if (unlikely(window->vline_operating < 0))
                 window->vline_operating = window->vlines_num - 1;
 
             // 考虑是否向上滚动
-            if (likely(window->vlines_used >= __private_info.actual_line))
+            if (likely(window->vlines_used > __private_info.actual_line))
             {
                 --window->top_vline;
                 if (unlikely(window->top_vline < 0))
@@ -256,7 +258,11 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
         }
     }
     else
+    {
+        if (window->vlines.chromatic[window->vline_operating].index == window->chars_per_line)
+            __textui_new_line(window, window->vline_operating);
         __textui_putchar_window(window, character, FRcolor, BKcolor);
+    }
 
     spin_unlock_irqrestore(&window->lock, rflags);
     return 0;

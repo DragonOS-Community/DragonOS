@@ -56,7 +56,7 @@ struct textui_vline_normal_t
 struct textui_vline_chromatic_t
 {
     struct textui_char_chromatic_t *chars;
-    uint16_t index; // 当前操作的位置
+    int16_t index; // 当前操作的位置
 };
 
 /**
@@ -68,8 +68,8 @@ struct textui_window_t
     struct List list;
 
     uint32_t id;          // 窗口id
-    uint16_t vlines_num;  // 虚拟行总数
-    uint16_t vlines_used; // 当前已经使用了的虚拟行总数
+    int16_t vlines_num;  // 虚拟行总数
+    int16_t vlines_used; // 当前已经使用了的虚拟行总数
 
     // 指向虚拟行的数组的指针（二选一）
     union
@@ -78,16 +78,16 @@ struct textui_window_t
         struct textui_vline_chromatic_t *chromatic;
     } vlines;
 
-    uint16_t top_vline;       // 位于最顶上的那一个虚拟行的行号
-    uint16_t vline_operating; // 正在操作的vline
-    uint16_t chars_per_line;  // 每行最大容纳的字符数
+    int16_t top_vline;       // 位于最顶上的那一个虚拟行的行号
+    int16_t vline_operating; // 正在操作的vline
+    int16_t chars_per_line;  // 每行最大容纳的字符数
     uint8_t flags;            // 窗口flag
     spinlock_t lock;          // 窗口操作锁
 };
 
 struct textui_private_info_t
 {
-    uint16_t actual_line;                   // 真实行的数量
+    int16_t actual_line;                   // 真实行的数量
     struct textui_window_t *current_window; // 当前的主窗口
     struct textui_window_t *default_window; // 默认print到的窗口
 };

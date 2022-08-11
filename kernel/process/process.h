@@ -17,8 +17,7 @@
 #include <common/errno.h>
 #include <filesystem/VFS/VFS.h>
 #include <common/wait_queue.h>
-
-
+#include <mm/mm-types.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -51,27 +50,6 @@
 #define CLONE_FS (1 << 0) // 在进程间共享打开的文件
 #define CLONE_SIGNAL (1 << 1)
 #define CLONE_VM (1 << 2) // 在进程间共享虚拟内存空间
-
-/**
- * @brief 内存空间分布结构体
- * 包含了进程内存空间分布的信息
- */
-struct mm_struct
-{
-	pml4t_t *pgd; // 内存页表指针
-	// 代码段空间
-	ul code_addr_start, code_addr_end;
-	// 数据段空间
-	ul data_addr_start, data_addr_end;
-	// 只读数据段空间
-	ul rodata_addr_start, rodata_addr_end;
-	// BSS段的空间
-	uint64_t bss_start, bss_end;
-	// 动态内存分配区（堆区域）
-	ul brk_start, brk_end;
-	// 应用层栈基地址
-	ul stack_start;
-};
 
 struct thread_struct
 {
@@ -355,7 +333,7 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 		asm volatile("movq %0, %%cr3	\n\t" ::"r"(next_pcb->mm->pgd) \
 					 : "memory");                                      \
 	} while (0)
-// flush_tlb();                                                   
+// flush_tlb();
 
 // 获取当前cpu id
 #define proc_current_cpu_id (current_pcb->cpu_id)

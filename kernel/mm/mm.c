@@ -1,4 +1,5 @@
 #include "mm.h"
+#include "mm-types.h"
 #include "slab.h"
 #include <common/printk.h>
 #include <common/kprint.h>

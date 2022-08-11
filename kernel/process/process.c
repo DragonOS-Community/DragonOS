@@ -583,6 +583,7 @@ void process_init()
     initial_mm.brk_end = current_pcb->addr_limit;
 
     initial_mm.stack_start = _stack_start;
+    initial_mm.vmas = NULL;
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
 

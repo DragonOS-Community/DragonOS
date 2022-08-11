@@ -1,6 +1,7 @@
 #pragma once
 
 #include <common/glib.h>
+#include <mm/mm-types.h>
 
 // 每个页表的项数
 // 64位下，每个页表4k，每条页表项8B，故一个页表有512条
@@ -233,13 +234,31 @@ struct Page
  */
 struct mm_stat_t
 {
-    uint64_t total;     // 计算机的总内存数量大小
-    uint64_t used;      // 已使用的内存大小
-    uint64_t free;      // 空闲物理页所占的内存大小
-    uint64_t shared;    // 共享的内存大小
-    uint64_t cache_used;     // 位于slab缓冲区中的已使用的内存大小
-    uint64_t cache_free;     // 位于slab缓冲区中的空闲的内存大小
-    uint64_t available; // 系统总空闲内存大小（包括kmalloc缓冲区）
+    uint64_t total;      // 计算机的总内存数量大小
+    uint64_t used;       // 已使用的内存大小
+    uint64_t free;       // 空闲物理页所占的内存大小
+    uint64_t shared;     // 共享的内存大小
+    uint64_t cache_used; // 位于slab缓冲区中的已使用的内存大小
+    uint64_t cache_free; // 位于slab缓冲区中的空闲的内存大小
+    uint64_t available;  // 系统总空闲内存大小（包括kmalloc缓冲区）
+};
+
+/**
+ * @brief 虚拟内存区域的操作方法的结构体
+ *
+ */
+struct vm_operations_t
+{
+    /**
+     * @brief vm area 被打开时的回调函数
+     *
+     */
+    void (*open)(struct vm_area_struct *area);
+    /**
+     * @brief vm area将要被移除的时候，将会调用该回调函数
+     *
+     */
+    void (*close)(struct vm_area_struct *area);
 };
 
 extern struct memory_desc memory_management_struct;
@@ -258,8 +277,8 @@ extern char _end;
 // 每个区域的索引
 
 int ZONE_DMA_INDEX = 0;
-int ZONE_NORMAL_INDEX = 0;   // low 1GB RAM ,was mapped in pagetable
-int ZONE_UNMAPPED_INDEX = 0; // above 1GB RAM,unmapped in pagetable
+int ZONE_NORMAL_INDEX = 0;
+int ZONE_UNMAPPED_INDEX = 0;
 
 // 初始化内存管理单元
 void mm_init();
@@ -332,14 +351,6 @@ ul get_page_attr(struct Page *page);
  */
 ul set_page_attr(struct Page *page, ul flags);
 
-/**
- * @brief 内存页表结构体
- *
- */
-typedef struct
-{
-    unsigned long pml4t;
-} pml4t_t;
 #define mk_pml4t(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
 /**
  * @brief 设置pml4页表的页表项
@@ -348,24 +359,12 @@ typedef struct
  */
 #define set_pml4t(pml4tptr, pml4tval) (*(pml4tptr) = (pml4tval))
 
-typedef struct
-{
-    unsigned long pdpt;
-} pdpt_t;
 #define mk_pdpt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
 #define set_pdpt(pdptptr, pdptval) (*(pdptptr) = (pdptval))
 
-typedef struct
-{
-    unsigned long pdt;
-} pdt_t;
 #define mk_pdt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
 #define set_pdt(pdtptr, pdtval) (*(pdtptr) = (pdtval))
 
-typedef struct
-{
-    unsigned long pt;
-} pt_t;
 #define mk_pt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
 #define set_pt(ptptr, ptval) (*(ptptr) = (ptval))
 
@@ -462,7 +461,7 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset);
 
 /**
  * @brief 获取系统当前的内存信息(未上锁，不一定精准)
- * 
+ *
  * @return struct mm_stat_t 内存信息结构体
  */
 struct mm_stat_t mm_stat();

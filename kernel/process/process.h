@@ -11,7 +11,6 @@
 #pragma once
 #include <common/cpu.h>
 #include <common/glib.h>
-#include <mm/mm.h>
 #include <syscall/syscall.h>
 #include "ptrace.h"
 #include <common/errno.h>

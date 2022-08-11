@@ -2,6 +2,8 @@
 
 #include <common/glib.h>
 #include <mm/mm-types.h>
+#include <process/process.h>
+
 
 // 每个页表的项数
 // 64位下，每个页表4k，每条页表项8B，故一个页表有512条
@@ -368,7 +370,57 @@ ul set_page_attr(struct Page *page, ul flags);
 #define mk_pt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
 #define set_pt(ptptr, ptval) (*(ptptr) = (ptval))
 
+/*
+ *  vm_area_struct中的vm_flags的可选值
+ * 对应的结构体请见mm-types.h
+ */
+#define VM_NONE 0
+#define VM_READ (1 << 0)
+#define VM_WRITE (1 << 1)
+#define VM_EXEC (1 << 2)
+#define VM_SHARED (1 << 3)
+#define VM_IO (1 << 4) // MMIO的内存区域
+#define VM_SOFTDIRTY (1 << 5)
+
+/* VMA basic access permission flags */
+#define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
+
 /**
+ * @brief 初始化虚拟内存区域结构体
+ *
+ * @param vma
+ * @param mm
+ */
+static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
+{
+    memset(vma, 0, sizeof(struct vm_area_struct));
+    vma->vm_mm = mm;
+    vma->vm_ops = NULL;
+    list_init(&vma->list);
+}
+
+/**
+ * @brief 判断给定的vma是否为当前进程所属的vma
+ *
+ * @param vma 给定的vma结构体
+ * @return true
+ * @return false
+ */
+static inline bool vma_is_foreign(struct vm_area_struct *vma)
+{
+    if (current_pcb->mm == NULL)
+        return true;
+    if (current_pcb->mm != vma->vm_mm)
+        return true;
+    return false;
+}
+
+static inline bool vma_is_accessible(struct vm_area_struct *vma)
+{
+    return vma->vm_flags & VM_ACCESS_FLAGS;
+}
+
+/** 
  * @brief 重新初始化页表的函数
  * 将所有物理页映射到线性地址空间
  */

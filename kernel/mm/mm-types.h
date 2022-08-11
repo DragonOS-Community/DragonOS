@@ -39,7 +39,7 @@ struct vm_area_struct
     uint64_t vm_start;       // 区域的起始地址
     uint64_t vm_end;         // 区域的结束地址
     struct mm_struct *vm_mm; // 虚拟内存区域对应的mm结构体
-    uint64_t vm_flags;       // 虚拟内存区域的标志位
+    uint64_t vm_flags;       // 虚拟内存区域的标志位, 具体可选值请见mm.h
 
     struct vm_operations_t *vm_ops; // 操作方法
     uint64_t ref_count;             // 引用计数

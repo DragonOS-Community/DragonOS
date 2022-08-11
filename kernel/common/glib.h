@@ -78,7 +78,7 @@ ul round(double x)
  * @param _align
  * @return ul 对齐后的地址
  */
-ul ALIGN(const ul addr, const ul _align)
+static __always_inline ul ALIGN(const ul addr, const ul _align)
 {
     return (ul)((addr + _align - 1) & (~(_align - 1)));
 }

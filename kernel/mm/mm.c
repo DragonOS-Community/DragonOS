@@ -110,7 +110,6 @@ void mm_init()
     // 初始化bitmap， 先将整个bmp空间全部置位。稍后再将可用物理内存页复位。
     memset(memory_management_struct.bmp, 0xff, memory_management_struct.bmp_len);
     io_mfence();
-    kdebug("1212112");
     // 初始化内存页结构
     // 将页结构映射于bmp之后
     memory_management_struct.pages_struct = (struct Page *)(((unsigned long)memory_management_struct.bmp + memory_management_struct.bmp_len + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
@@ -120,7 +119,6 @@ void mm_init()
     // 将pages_struct全部清空，以备后续初始化
     memset(memory_management_struct.pages_struct, 0x00, memory_management_struct.pages_struct_len); // init pages memory
 
-    kdebug("ffff");
     io_mfence();
     // 初始化内存区域
     memory_management_struct.zones_struct = (struct Zone *)(((ul)memory_management_struct.pages_struct + memory_management_struct.pages_struct_len + PAGE_4K_SIZE - 1) & PAGE_4K_MASK);
@@ -618,65 +616,3 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
     return end_addr;
 }
 
-/**
- * @brief 检测指定地址是否已经被映射
- *
- * @param page_table_phys_addr 页表的物理地址
- * @param virt_addr 要检测的地址
- * @return true 已经被映射
- * @return false
- */
-bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr)
-{
-    ul *tmp;
-
-    tmp = phys_2_virt((ul *)((ul)page_table_phys_addr & (~0xfffUL)) + ((virt_addr >> PAGE_GDT_SHIFT) & 0x1ff));
-
-    // pml4页表项为0
-    if (*tmp == 0)
-        return 0;
-
-    tmp = phys_2_virt((ul *)(*tmp & (~0xfffUL)) + ((virt_addr >> PAGE_1G_SHIFT) & 0x1ff));
-
-    // pdpt页表项为0
-    if (*tmp == 0)
-        return 0;
-
-    // 读取pdt页表项
-    tmp = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr) >> PAGE_2M_SHIFT) & 0x1ff)));
-
-    // pde页表项为0
-    if (*tmp == 0)
-        return 0;
-
-    if (*tmp & (1 << 7))
-    {
-        // 当前为2M物理页
-        return true;
-    }
-    else
-    {
-        // 存在4级页表
-        tmp = phys_2_virt(((ul *)(*tmp & (~0xfffUL)) + (((ul)(virt_addr) >> PAGE_4K_SHIFT) & 0x1ff)));
-        if (*tmp != 0)
-            return true;
-        else
-            return false;
-    }
-}
-
-/**
- * @brief 检测是否为有效的2M页(物理内存页)
- *
- * @param paddr 物理地址
- * @return int8_t 是 -> 1
- *                 否 -> 0
- */
-int8_t mm_is_2M_page(uint64_t paddr)
-{
-    if (likely((paddr >> PAGE_2M_SHIFT) < mm_total_2M_pages))
-        return 1;
-    else
-        return 0;
-}
-// #pragma GCC pop_options

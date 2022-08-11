@@ -2,7 +2,7 @@
 CFLAGS += -I .
 
 
-all:mm.o slab.o mm-stat.o vma.o mmap.o
+all:mm.o slab.o mm-stat.o vma.o mmap.o utils.o
 
 mm.o: mm.c
 	gcc $(CFLAGS) -c mm.c -o mm.o
@@ -18,3 +18,6 @@ vma.o: vma.c
 
 mmap.o: mmap.c
 	gcc $(CFLAGS) -c mmap.c -o mmap.o
+
+utils.o: utils.c
+	gcc $(CFLAGS) -c utils.c -o utils.o

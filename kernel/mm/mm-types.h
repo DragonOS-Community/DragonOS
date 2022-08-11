@@ -2,6 +2,7 @@
 #include <common/glib.h>
 
 struct mm_struct;
+typedef uint64_t vm_flags_t;
 
 /**
  * @brief 内存页表结构体
@@ -33,13 +34,13 @@ typedef struct
  */
 struct vm_area_struct
 {
-    struct List list; // 循环链表结构体
+    struct vm_area_struct *vm_prev, *vm_next;
 
     // 虚拟内存区域的范围是一个左闭右开的区间：[vm_start, vm_end)
     uint64_t vm_start;       // 区域的起始地址
     uint64_t vm_end;         // 区域的结束地址
     struct mm_struct *vm_mm; // 虚拟内存区域对应的mm结构体
-    uint64_t vm_flags;       // 虚拟内存区域的标志位, 具体可选值请见mm.h
+    vm_flags_t vm_flags;       // 虚拟内存区域的标志位, 具体可选值请见mm.h
 
     struct vm_operations_t *vm_ops; // 操作方法
     uint64_t ref_count;             // 引用计数

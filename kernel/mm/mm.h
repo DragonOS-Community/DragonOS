@@ -381,6 +381,7 @@ ul set_page_attr(struct Page *page, ul flags);
 #define VM_IO (1 << 4) // MMIO的内存区域
 #define VM_SOFTDIRTY (1 << 5)
 #define VM_MAYSHARE (1 << 6) // 该vma可被共享
+#define VM_USER (1 << 7)     // 该vma可被用户态访问
 
 /* VMA basic access permission flags */
 #define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
@@ -396,7 +397,6 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
     memset(vma, 0, sizeof(struct vm_area_struct));
     vma->vm_mm = mm;
     vma->vm_ops = NULL;
-    list_init(&vma->list);
 }
 
 /**
@@ -422,15 +422,15 @@ static inline bool vma_is_accessible(struct vm_area_struct *vma)
 
 /**
  * @brief 获取一块新的vma结构体，并将其与指定的mm进行绑定
- * 
+ *
  * @param mm 与VMA绑定的内存空间分布结构体
  * @return struct vm_area_struct* 新的VMA
  */
-struct vm_area_struct * vm_area_alloc(struct mm_struct *mm);
+struct vm_area_struct *vm_area_alloc(struct mm_struct *mm);
 
 /**
  * @brief 释放vma结构体
- * 
+ *
  * @param vma 待释放的vma结构体
  */
 void vm_area_free(struct vm_area_struct *vma);
@@ -489,14 +489,29 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
 })
 
 /**
- * @brief 检测指定地址是否已经被映射
+ * @brief 创建VMA，并将物理地址映射到指定的虚拟地址处
  *
- * @param page_table_phys_addr 页表的物理地址
- * @param virt_addr 要检测的地址
- * @return true 已经被映射
- * @return false
+ * @param mm 要绑定的内存空间分布结构体
+ * @param vaddr 起始虚拟地址
+ * @param length 长度（字节）
+ * @param paddr 起始物理地址
+ * @param vm_flags vma的标志
+ * @param vm_ops vma的操作接口
+ * @return int 错误码
  */
-bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr);
+int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr, vm_flags_t vm_flags, struct vm_operations_t *vm_ops);
+
+/**
+ * @brief 在页表中取消指定的vma的映射
+ *
+ * @param mm 指定的mm
+ * @param vma 待取消映射的vma
+ * @param paddr 返回的被取消映射的起始物理地址
+ * @return int 返回码
+ */
+int mm_umap_vma(struct mm_struct *mm, struct vm_area_struct * vma, uint64_t *paddr);
+
+
 
 /**
  * @brief 检测是否为有效的2M页(物理内存页)

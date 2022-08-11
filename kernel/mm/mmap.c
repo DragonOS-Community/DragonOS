@@ -1,5 +1,6 @@
 #include "mm.h"
 #include "slab.h"
+#include "internal.h"
 #include <common/compiler.h>
 
 extern uint64_t mm_total_2M_pages;
@@ -72,9 +73,15 @@ int mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_s
     // 计算线性地址对应的pml4页表项的地址
     mm_pgt_entry_num_t pgt_num;
     mm_calculate_entry_num(length, &pgt_num);
-    // kdebug("ent1=%d ent2=%d ent3=%d, ent4=%d", pgt_num.num_PML4E, pgt_num.num_PDPTE, pgt_num.num_PDE, pgt_num.num_PTE);
+
     // 已映射的内存大小
     uint64_t length_mapped = 0;
+
+    // 对user标志位进行校正
+    if (flags & PAGE_U_S)
+        user = true;
+    else
+        user = false;
 
     uint64_t pml4e_id = ((virt_addr_start >> PAGE_GDT_SHIFT) & 0x1ff);
     uint64_t *pml4_ptr;
@@ -192,7 +199,6 @@ failed:;
     return -EFAULT;
 }
 
-
 /**
  * @brief 从页表中清除虚拟地址的映射
  *
@@ -262,7 +268,7 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
                 ul *pde_ptr = pd_ptr + pde_id;
 
                 // 存在4级页表
-                if (unlikely(((*pde_ptr) & (1 << 7)) == 0))
+                if (((*pde_ptr) & (1 << 7)) == 0)
                 {
                     // 存在4K页
                     uint64_t pte_id = (((virt_addr_start + length_unmapped) >> PAGE_4K_SHIFT) & 0x1ff);
@@ -291,11 +297,101 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
 
             // 3级页表已经空了，释放页表
             if (unlikely(mm_check_page_table(pd_ptr)) == 0)
-                kfree(pd_ptr); 
+                kfree(pd_ptr);
         }
         // 2级页表已经空了，释放页表
         if (unlikely(mm_check_page_table(pdpt_ptr)) == 0)
             kfree(pdpt_ptr);
     }
     flush_tlb();
+}
+
+/**
+ * @brief 创建VMA，并将物理地址映射到指定的虚拟地址处
+ *
+ * @param mm 要绑定的内存空间分布结构体
+ * @param vaddr 起始虚拟地址
+ * @param length 长度（字节）
+ * @param paddr 起始物理地址
+ * @param vm_flags vma的标志
+ * @param vm_ops vma的操作接口
+ * @return int 错误码
+ */
+int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr, vm_flags_t vm_flags, struct vm_operations_t *vm_ops)
+{
+    int retval = 0;
+    struct vm_area_struct *vma = vm_area_alloc(mm);
+    if (unlikely(vma == NULL))
+        return -ENOMEM;
+    vma->vm_ops = vm_ops;
+    vma->vm_flags = vm_flags;
+    vma->vm_start = vaddr;
+    vma->vm_end = vaddr + length;
+
+    // 将VMA加入链表
+    __vma_link_list(mm, vma, mm->vmas);
+    uint64_t len_4k = length % PAGE_2M_SIZE;
+    uint64_t len_2m = length - len_4k;
+
+    // ==== 将地址映射到页表
+    /*
+        todo: 限制页面的读写权限
+    */
+
+    // 先映射2M页
+    if (likely(len_2m > 0))
+    {
+        uint64_t page_flags = 0;
+        if (vm_flags & VM_USER)
+            page_flags = PAGE_USER_PAGE;
+        else
+            page_flags = PAGE_KERNEL_PAGE;
+        // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
+        retval = mm_map_proc_page_table((uint64_t)mm->pgd, true, vaddr, paddr, len_2m, page_flags, false, false, false);
+        if (unlikely(retval != 0))
+            goto failed;
+    }
+
+    if (likely(len_4k > 0))
+    {
+        len_4k = ALIGN(len_4k, PAGE_4K_SIZE);
+
+        uint64_t page_flags = 0;
+        if (vm_flags & VM_USER)
+            page_flags = PAGE_USER_4K_PAGE;
+        else
+            page_flags = PAGE_KERNEL_4K_PAGE;
+        // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
+        retval = mm_map_proc_page_table((uint64_t)mm->pgd, true, vaddr + len_2m, paddr + len_2m, len_4k, page_flags, false, false, true);
+        if (unlikely(retval != 0))
+            goto failed;
+    }
+
+    flush_tlb();
+    return 0;
+failed:;
+    __vma_unlink_list(mm, vma);
+    vm_area_free(vma);
+    return retval;
+}
+
+/**
+ * @brief 在页表中取消指定的vma的映射
+ *
+ * @param mm 指定的mm
+ * @param vma 待取消映射的vma
+ * @param paddr 返回的被取消映射的起始物理地址
+ * @return int 返回码
+ */
+int mm_umap_vma(struct mm_struct *mm, struct vm_area_struct *vma, uint64_t *paddr)
+{
+    // 确保vma对应的mm与指定的mm相一致
+    if (unlikely(vma->vm_mm != mm))
+        return -EINVAL;
+
+    if (paddr != NULL)
+        *paddr = __mm_get_paddr(mm, vma->vm_start);
+
+    mm_unmap_proc_table((uint64_t)mm->pgd, true, vma->vm_start, vma->vm_end - vma->vm_start);
+    return 0;
 }

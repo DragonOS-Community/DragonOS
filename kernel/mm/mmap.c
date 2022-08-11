@@ -286,6 +286,7 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
                 {
                     *pde_ptr = 0;
                     length_unmapped += PAGE_2M_SIZE;
+                    pgt_num.num_PTE -= 512;
                 }
             }
 

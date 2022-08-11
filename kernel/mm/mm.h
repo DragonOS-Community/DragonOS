@@ -4,7 +4,6 @@
 #include <mm/mm-types.h>
 #include <process/process.h>
 
-
 // 每个页表的项数
 // 64位下，每个页表4k，每条页表项8B，故一个页表有512条
 #define PTRS_PER_PGT 512
@@ -381,6 +380,7 @@ ul set_page_attr(struct Page *page, ul flags);
 #define VM_SHARED (1 << 3)
 #define VM_IO (1 << 4) // MMIO的内存区域
 #define VM_SOFTDIRTY (1 << 5)
+#define VM_MAYSHARE (1 << 6) // 该vma可被共享
 
 /* VMA basic access permission flags */
 #define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
@@ -420,7 +420,22 @@ static inline bool vma_is_accessible(struct vm_area_struct *vma)
     return vma->vm_flags & VM_ACCESS_FLAGS;
 }
 
-/** 
+/**
+ * @brief 获取一块新的vma结构体，并将其与指定的mm进行绑定
+ * 
+ * @param mm 与VMA绑定的内存空间分布结构体
+ * @return struct vm_area_struct* 新的VMA
+ */
+struct vm_area_struct * vm_area_alloc(struct mm_struct *mm);
+
+/**
+ * @brief 释放vma结构体
+ * 
+ * @param vma 待释放的vma结构体
+ */
+void vm_area_free(struct vm_area_struct *vma);
+
+/**
  * @brief 重新初始化页表的函数
  * 将所有物理页映射到线性地址空间
  */

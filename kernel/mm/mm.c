@@ -586,8 +586,7 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
     {
         for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
         {
-            // kdebug("map [%#018lx]", i);
-            mm_map_proc_page_table((uint64_t)current_pcb->mm->pgd, true, i, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, PAGE_2M_SIZE, PAGE_USER_PAGE, true, true, false);
+            mm_map_vma(current_pcb->mm,i, PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, VM_USER|VM_ACCESS_FLAGS, NULL);
         }
         current_pcb->mm->brk_end = end_addr;
     }

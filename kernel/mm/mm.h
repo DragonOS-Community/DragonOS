@@ -382,6 +382,7 @@ ul set_page_attr(struct Page *page, ul flags);
 #define VM_SOFTDIRTY (1 << 5)
 #define VM_MAYSHARE (1 << 6) // 该vma可被共享
 #define VM_USER (1 << 7)     // 该vma可被用户态访问
+#define VM_DONTCOPY (1 << 8) // 当fork的时候不拷贝该虚拟内存区域
 
 /* VMA basic access permission flags */
 #define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
@@ -396,6 +397,7 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
 {
     memset(vma, 0, sizeof(struct vm_area_struct));
     vma->vm_mm = mm;
+    vma->vm_prev = vma->vm_next = NULL;
     vma->vm_ops = NULL;
 }
 
@@ -434,6 +436,31 @@ struct vm_area_struct *vm_area_alloc(struct mm_struct *mm);
  * @param vma 待释放的vma结构体
  */
 void vm_area_free(struct vm_area_struct *vma);
+
+/**
+ * @brief 从链表中删除指定的vma结构体
+ *
+ * @param vma
+ */
+void vm_area_del(struct vm_area_struct *vma);
+
+/**
+ * @brief 查找第一个符合“addr < vm_end”条件的vma
+ * 
+ * @param mm 内存空间分布结构体
+ * @param addr 虚拟地址
+ * @return struct vm_area_struct* 符合条件的vma
+ */
+struct vm_area_struct *vma_find(struct mm_struct *mm, uint64_t addr);
+
+/**
+ * @brief 插入vma
+ *
+ * @param mm
+ * @param vma
+ * @return int
+ */
+int vma_insert(struct mm_struct *mm, struct vm_area_struct *vma);
 
 /**
  * @brief 重新初始化页表的函数
@@ -509,9 +536,7 @@ int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t p
  * @param paddr 返回的被取消映射的起始物理地址
  * @return int 返回码
  */
-int mm_umap_vma(struct mm_struct *mm, struct vm_area_struct * vma, uint64_t *paddr);
-
-
+int mm_umap_vma(struct mm_struct *mm, struct vm_area_struct *vma, uint64_t *paddr);
 
 /**
  * @brief 检测是否为有效的2M页(物理内存页)
@@ -547,3 +572,13 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset);
  * @return struct mm_stat_t 内存信息结构体
  */
 struct mm_stat_t mm_stat();
+
+/**
+ * @brief 检测指定地址是否已经被映射
+ *
+ * @param page_table_phys_addr 页表的物理地址
+ * @param virt_addr 要检测的地址
+ * @return true 已经被映射
+ * @return false
+ */
+bool mm_check_mapped(ul page_table_phys_addr, uint64_t virt_addr);

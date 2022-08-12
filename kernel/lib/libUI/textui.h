@@ -3,6 +3,32 @@
 #include <common/sys/types.h>
 #include <common/spinlock.h>
 
+/*
+textui中的几个对象的关系：
+
+
+                                          textui_vline_normal_t
+                                          +--------------------------------+
+                                          |                                |        textui_char_normal_t
+ textui_window_t                          | chars: textui_char_normal_t *  |        +--------------------------+
++----------------------------+            |                                |        |                          |
+|                            |     +------>                                +-------->  c: char                 |
+|  list:List                 |     |      | index:  int16_t                |        +--------------------------+
+|  vlines_num:int16_t        |     |      |                                |
+|  vlines_used:int16_t       |     |      +--------------------------------+
+|                            |     |
+|  vlines                    +-----+                                                textui_char_chromatic_t
+|                            |     |       textui_vline_chromatic_t                 +--------------------------+
+|  top_vline:int16_t         |     |      +-------------------------------------+   |                          |
+|  vline_operating:int16_t   |     |      |                                     |   |   c: uint16_t            |
+|  chars_per_line:int16_t    |     |      |  chars: textui_char_chromatic_t *   |   |                          |
+|  flags:uint8_t             |     |      |                                     |   |   FRcolor:24             |
+|  lock:spinlock_t           |     +------>                                     +--->                          |
+|                            |            |  index:  int16_t                    |   |   BKcolor:24             |
+|                            |            |                                     |   |                          |
++----------------------------+            +-------------------------------------+   +--------------------------+
+ */
+
 // 文本窗口标志位
 // 文本窗口是否为彩色
 #define TEXTUI_WF_CHROMATIC (1 << 0)
@@ -46,7 +72,7 @@ struct textui_char_chromatic_t
 struct textui_vline_normal_t
 {
     struct textui_char_normal_t *chars; // 字符对象数组
-    uint16_t index;                     // 当前操作的位置
+    int16_t index;                      // 当前操作的位置
 };
 
 /**
@@ -67,7 +93,7 @@ struct textui_window_t
 {
     struct List list;
 
-    uint32_t id;          // 窗口id
+    uint32_t id;         // 窗口id
     int16_t vlines_num;  // 虚拟行总数
     int16_t vlines_used; // 当前已经使用了的虚拟行总数
 
@@ -81,13 +107,13 @@ struct textui_window_t
     int16_t top_vline;       // 位于最顶上的那一个虚拟行的行号
     int16_t vline_operating; // 正在操作的vline
     int16_t chars_per_line;  // 每行最大容纳的字符数
-    uint8_t flags;            // 窗口flag
-    spinlock_t lock;          // 窗口操作锁
+    uint8_t flags;           // 窗口flag
+    spinlock_t lock;         // 窗口操作锁
 };
 
 struct textui_private_info_t
 {
-    int16_t actual_line;                   // 真实行的数量
+    int16_t actual_line;                    // 真实行的数量
     struct textui_window_t *current_window; // 当前的主窗口
     struct textui_window_t *default_window; // 默认print到的窗口
 };

@@ -25,7 +25,7 @@ docker pull dragonos/dragonos-dev:v1.0
 &emsp;&emsp;在本节中，我们建议您采用命令行安装qemu：
 
 ```shell
-sudo apt install -y qemu qemu-system qemu-system-x86_64 qemu-kvm
+sudo apt install -y qemu qemu-system qemu-kvm
 ```
 
 &emsp;&emsp;请留意，若您的Linux系统是在虚拟机中运行的，还请您在您的VMware/Virtual Box虚拟机的处理器设置选项卡中，开启Intel VT-x或AMD-V选项，否则，DragonOS将无法运行。

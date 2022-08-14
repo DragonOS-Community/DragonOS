@@ -327,6 +327,8 @@ int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t p
     vma->vm_start = vaddr;
     vma->vm_end = vaddr + length;
 
+    // 将vma与对应的anon_vma进行绑定
+    struct Page * pg = Phy_to_2M_Page(paddr);
     // 将VMA加入链表
     retval = vma_insert(mm, vma);
     if (retval == -EEXIST) // 之前已经存在了相同的vma，直接返回
@@ -336,7 +338,7 @@ int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t p
     }
     uint64_t len_4k = length % PAGE_2M_SIZE;
     uint64_t len_2m = length - len_4k;
-    // kdebug("len_2m=%ld", len_2m);
+
     // ==== 将地址映射到页表
     /*
         todo: 限制页面的读写权限

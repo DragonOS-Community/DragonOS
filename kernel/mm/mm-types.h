@@ -1,7 +1,10 @@
 #pragma once
 #include <common/glib.h>
+#include <common/semaphore.h>
+#include <common/atomic.h>
 
 struct mm_struct;
+struct anon_vma_t;
 typedef uint64_t vm_flags_t;
 
 /**
@@ -100,6 +103,11 @@ struct Page
     ul ref_counts;
     // 本页的创建时间
     ul age;
+    
+    struct anon_vma_t *anon_vma;    // 本页对应的anon_vma
+
+    spinlock_t op_lock; // 页面操作锁
+
 };
 
 /**
@@ -114,10 +122,14 @@ struct vm_area_struct
     uint64_t vm_start;       // 区域的起始地址
     uint64_t vm_end;         // 区域的结束地址
     struct mm_struct *vm_mm; // 虚拟内存区域对应的mm结构体
-    vm_flags_t vm_flags;       // 虚拟内存区域的标志位, 具体可选值请见mm.h
+    vm_flags_t vm_flags;     // 虚拟内存区域的标志位, 具体可选值请见mm.h
+    
+    
+    struct List anon_vma_list;  // anon_vma的链表结点
+    struct anon_vma_t * anon_vma;   // 属于的anon_vma
 
     struct vm_operations_t *vm_ops; // 操作方法
-    uint64_t ref_count;             // 引用计数
+    atomic_t ref_count;             // 引用计数
     void *private_data;
 };
 
@@ -141,4 +153,20 @@ struct mm_struct
     uint64_t brk_start, brk_end;
     // 应用层栈基地址
     uint64_t stack_start;
+};
+
+/**
+ * @brief 匿名vma对象的结构体
+ *
+ * anon_vma与每个内存页结构体进行一对一绑定
+ * anon_vma也连接着一切使用到该内存页的vma，当发生页面换出时，应当更新与该page相关的所有vma在页表中的映射信息。
+ */
+struct anon_vma_t
+{
+    semaphore_t sem;
+    atomic_t ref_count;
+
+    // todo: 把下面的循环链表更换成红黑树
+    // 与当前anon_vma相关的vma的列表
+    struct List vma_list;
 };

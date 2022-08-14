@@ -106,11 +106,11 @@ cfg_content='set timeout=15
 
     # ${GRUB_PATH}/grub-mkrescue -o ${iso} ${iso_folder}
     # rm -rf ${iso_folder}
-LOOP_DEVICE=$(lsblk | grep disk_mount)
+    LOOP_DEVICE=$(lsblk | grep disk_mount)
 
-LOOP_DEVICE=${LOOP_DEVICE:2:10}
-LOOP_DEVICE=${LOOP_DEVICE%%p1*}
-
+    LOOP_DEVICE=${LOOP_DEVICE:2:10}
+    LOOP_DEVICE=${LOOP_DEVICE%%p1*}
+    echo $LOOP_DEVICE
 
     grub-install --target=i386-pc --boot-directory=${root_folder}/bin/disk_mount/boot/ /dev/$LOOP_DEVICE
 
@@ -127,13 +127,6 @@ fi
 
 # 进行启动前检查
 flag_can_run=1
-
-# if [ -d "${iso_folder}" ]; then
-#   flag_can_run=0
-#   echo "${iso_folder} 文件夹未删除！"
-# else
-#   flag_can_run=1
-# fi
 
 
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")

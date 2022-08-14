@@ -213,6 +213,7 @@ void mm_init()
         barrier();
         tmp_page = memory_management_struct.pages_struct + j;
         page_init(tmp_page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
+        barrier();
         page_num = tmp_page->addr_phys >> PAGE_2M_SHIFT;
         *(memory_management_struct.bmp + (page_num >> 6)) |= (1UL << (page_num % 64));
         ++tmp_page->zone->count_pages_using;
@@ -248,7 +249,7 @@ unsigned long page_init(struct Page *page, ul flags)
         ++page->zone->total_pages_link;
     }
     page->anon_vma = NULL;
-    spin_init(&page->op_lock);
+    spin_init(&(page->op_lock));
     return 0;
 }
 
@@ -588,7 +589,9 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
     {
         for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
         {
-            mm_map_vma(current_pcb->mm, i, PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, VM_USER | VM_ACCESS_FLAGS, NULL);
+            struct vm_area_struct * vma=NULL;
+            mm_create_vma(current_pcb->mm, i, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+            mm_map_vma(vma, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys);
         }
         current_pcb->mm->brk_end = end_addr;
     }

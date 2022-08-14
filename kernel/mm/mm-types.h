@@ -1,6 +1,7 @@
 #pragma once
 #include <common/glib.h>
 #include <common/semaphore.h>
+#include <common/spinlock.h>
 #include <common/atomic.h>
 
 struct mm_struct;
@@ -163,10 +164,18 @@ struct mm_struct
  */
 struct anon_vma_t
 {
+    // anon vma的操作信号量
     semaphore_t sem;
+    
+    /**
+     * 记录当前有多少个vma与该anon_vma关联，当vma被释放时，
+     * 应当检查这个值。当该值为0时，应当释放anon_vma结构体
+     */
     atomic_t ref_count;
 
     // todo: 把下面的循环链表更换成红黑树
     // 与当前anon_vma相关的vma的列表
     struct List vma_list;
+    // 当前anon vma对应的page
+    struct Page* page;
 };

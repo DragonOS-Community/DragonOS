@@ -1,5 +1,7 @@
 #include "textui.h"
 #include <driver/uart/uart.h>
+#include <common/errno.h>
+#include "screen_manager.h"
 
 #define WHITE 0x00ffffff  //白
 #define BLACK 0x00000000  //黑

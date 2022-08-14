@@ -12,10 +12,7 @@
 #pragma once
 #include <common/atomic.h>
 
-#include <process/process.h>
-#include <sched/sched.h>
-#include "wait_queue.h"
-
+#include <common/wait_queue.h>
 
 /**
  * @brief 信号量的结构体
@@ -27,13 +24,16 @@ typedef struct
     wait_queue_node_t wait_queue;
 } semaphore_t;
 
+void __semaphore_invoke_sched();
+void __semaphore_sched_enqueue(struct process_control_block *pcb);
+
 /**
  * @brief 初始化信号量
  *
  * @param sema 信号量对象
  * @param count 信号量的初始值
  */
-void semaphore_init(semaphore_t *sema, ul count)
+static __always_inline void semaphore_init(semaphore_t *sema, ul count)
 {
     atomic_set(&sema->counter, count);
     wait_queue_init(&sema->wait_queue, NULL);
@@ -44,40 +44,6 @@ void semaphore_init(semaphore_t *sema, ul count)
  *
  * @param sema
  */
-void semaphore_down(semaphore_t *sema)
-{
-    if (atomic_read(&sema->counter) > 0) // 信号量大于0，资源充足
-        atomic_dec(&sema->counter);
-    else // 资源不足，进程休眠
-    {
-        // 将当前进程加入信号量的等待队列
-        wait_queue_node_t wait;
-        wait_queue_init(&wait, current_pcb);
+void semaphore_down(semaphore_t *sema);
 
-        current_pcb->state = PROC_UNINTERRUPTIBLE;
-
-        list_append(&sema->wait_queue.wait_list, &wait.wait_list);
-
-        // 执行调度
-        sched_cfs();
-    }
-}
-
-void semaphore_up(semaphore_t *sema)
-{
-    if (list_empty(&sema->wait_queue.wait_list)) // 没有进程在等待资源
-    {
-        atomic_inc(&sema->counter);
-    }
-    else    // 有进程在等待资源，唤醒进程
-    {
-
-        wait_queue_node_t *wq = container_of(list_next(&sema->wait_queue.wait_list), wait_queue_node_t, wait_list);
-        list_del(&wq->wait_list);
-
-        wq->pcb->state = PROC_RUNNING;
-        sched_cfs_enqueue(wq->pcb);
-        // 当前进程缺少需要的资源，立即标为需要被调度
-        current_pcb->flags |= PF_NEED_SCHED;
-    }
-}
+void semaphore_up(semaphore_t *sema);

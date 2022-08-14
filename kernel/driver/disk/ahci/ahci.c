@@ -3,6 +3,7 @@
 #include <mm/slab.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
+#include <sched/sched.h>
 
 struct pci_device_structure_header_t *ahci_devs[MAX_AHCI_DEVICES];
 

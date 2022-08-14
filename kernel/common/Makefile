@@ -10,7 +10,7 @@ $(kernel_common_subdirs): ECHO
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"
 
-all: glib.o printk.o cpu.o bitree.o kfifo.o wait_queue.o mutex.o wait.o unistd.o string.o $(kernel_common_subdirs)
+all: glib.o printk.o cpu.o bitree.o kfifo.o wait_queue.o mutex.o wait.o unistd.o string.o semaphore.o $(kernel_common_subdirs)
 
 
 glib.o: glib.c
@@ -42,3 +42,6 @@ unistd.o: unistd.c
 
 string.o: string.c
 	gcc $(CFLAGS) -c string.c -o string.o
+
+semaphore.o: semaphore.c
+	gcc $(CFLAGS) -c semaphore.c -o semaphore.o

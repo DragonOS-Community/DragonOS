@@ -325,6 +325,7 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
     vma->vm_mm = mm;
     vma->vm_prev = vma->vm_next = NULL;
     vma->vm_ops = NULL;
+    list_init(&vma->anon_vma_list);
 }
 
 /**
@@ -442,17 +443,26 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
 })
 
 /**
- * @brief 创建VMA，并将物理地址映射到指定的虚拟地址处
+ * @brief 创建VMA
  *
  * @param mm 要绑定的内存空间分布结构体
  * @param vaddr 起始虚拟地址
  * @param length 长度（字节）
- * @param paddr 起始物理地址
  * @param vm_flags vma的标志
  * @param vm_ops vma的操作接口
+ * @param res_vma 返回的vma指针
  * @return int 错误码
  */
-int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr, vm_flags_t vm_flags, struct vm_operations_t *vm_ops);
+int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flags_t vm_flags, struct vm_operations_t *vm_ops, struct vm_area_struct **res_vma);
+
+/**
+ * @brief 将指定的物理地址映射到指定的vma处
+ *
+ * @param vma 要进行映射的VMA结构体
+ * @param paddr 起始物理地址
+ * @return int 错误码
+ */
+int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr);
 
 /**
  * @brief 在页表中取消指定的vma的映射

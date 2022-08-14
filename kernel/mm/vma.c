@@ -139,10 +139,10 @@ int vma_insert(struct mm_struct *mm, struct vm_area_struct *vma)
         prev = prev->vm_prev;
     if (prev == NULL) // 要将当前vma插入到链表的尾部
     {
-        struct vm_area_struct * ptr = mm->vmas;
-        while(ptr)
+        struct vm_area_struct *ptr = mm->vmas;
+        while (ptr)
         {
-            if(ptr->vm_next)
+            if (ptr->vm_next)
                 ptr = ptr->vm_next;
             else
             {
@@ -153,4 +153,103 @@ int vma_insert(struct mm_struct *mm, struct vm_area_struct *vma)
     }
     __vma_link_list(mm, vma, prev);
     return 0;
+}
+
+/**
+ * @brief 创建anon_vma，并将其与页面结构体进行绑定
+ * 若提供的页面结构体指针为NULL，则只创建，不绑定
+ *
+ * @param page 页面结构体的指针
+ * @param lock_page 是否将页面结构体加锁
+ * @return struct anon_vma_t* 创建好的anon_vma
+ */
+struct anon_vma_t *__anon_vma_create_alloc(struct Page *page, bool lock_page)
+{
+    struct anon_vma_t *anon_vma = (struct anon_vma_t *)kmalloc(sizeof(struct anon_vma_t), 0);
+    if (unlikely(anon_vma == NULL))
+        return NULL;
+    memset(anon_vma, 0, sizeof(struct anon_vma_t));
+
+    list_init(&anon_vma->vma_list);
+    semaphore_init(&anon_vma->sem, 1);
+
+    // 需要和page进行绑定
+    if (page != NULL)
+    {
+        if (lock_page == true) // 需要加锁
+        {
+            uint64_t rflags;
+            spin_lock_irqsave(&page->op_lock, rflags);
+            page->anon_vma = anon_vma;
+            spin_unlock_irqrestore(&page->op_lock, rflags);
+        }
+        else
+            page->anon_vma = anon_vma;
+
+        anon_vma->page = page;
+    }
+    return anon_vma;
+}
+
+/**
+ * @brief 将指定的vma加入到anon_vma的管理范围之中
+ *
+ * @param anon_vma 页面的anon_vma
+ * @param vma 待加入的vma
+ * @return int 返回码
+ */
+int __anon_vma_add(struct anon_vma_t *anon_vma, struct vm_area_struct *vma)
+{
+    semaphore_down(&anon_vma->sem);
+    list_add(&anon_vma->vma_list, &vma->anon_vma_list);
+    vma->anon_vma = anon_vma;
+    atomic_inc(&anon_vma->ref_count);
+    semaphore_up(&anon_vma->sem);
+    return 0;
+}
+
+/**
+ * @brief 释放anon vma结构体
+ *
+ * @param anon_vma 待释放的anon_vma结构体
+ * @return int 返回码
+ */
+int __anon_vma_free(struct anon_vma_t *anon_vma)
+{
+    if (anon_vma->page != NULL)
+    {
+        spin_lock(&anon_vma->page->op_lock);
+        anon_vma->page->anon_vma = NULL;
+        spin_unlock(&anon_vma->page->op_lock);
+    }
+    kfree(anon_vma);
+
+    return 0;
+}
+
+/**
+ * @brief 从anon_vma的管理范围中删除指定的vma
+ * (在进入这个函数之前，应该要加锁)
+ * @param vma 将要取消对应的anon_vma管理的vma结构体
+ * @return int 返回码
+ */
+int __anon_vma_del(struct vm_area_struct *vma)
+{
+    // 当前vma没有绑定anon_vma
+    if (vma->anon_vma == NULL)
+        return -EINVAL;
+
+    list_del(&vma->anon_vma_list);
+    semaphore_down(&vma->anon_vma->sem);
+    atomic_dec(&vma->anon_vma->ref_count);
+
+    if (unlikely(atomic_read(&vma->anon_vma->ref_count) == 0)) // 应当释放该anon_vma
+    {
+        __anon_vma_free(vma->anon_vma);
+        // 释放了anon_vma之后，清理当前vma的关联数据
+        vma->anon_vma = NULL;
+        list_init(&vma->anon_vma_list);
+    }
+    else
+        semaphore_up(&vma->anon_vma->sem);
 }

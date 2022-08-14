@@ -262,10 +262,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
             {
 
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-                int ret = mm_map_vma(current_pcb->mm, virt_base, PAGE_2M_SIZE, pa, VM_USER | VM_ACCESS_FLAGS, NULL);
+                struct vm_area_struct *vma = NULL;
+                int ret = mm_create_vma(current_pcb->mm, virt_base, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
                 // 防止内存泄露
                 if (ret == -EEXIST)
                     free_pages(Phy_to_2M_Page(pa), 1);
+                else
+                    mm_map_vma(vma, pa);
                 memset((void *)virt_base, 0, PAGE_2M_SIZE);
                 map_size = PAGE_2M_SIZE;
             }
@@ -278,9 +281,12 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 {
                     uint64_t paddr = virt_2_phys((uint64_t)kmalloc(PAGE_4K_SIZE, 0));
 
-                    int val = mm_map_vma(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, paddr, VM_USER | VM_ACCESS_FLAGS, NULL);
+                    struct vm_area_struct *vma = NULL;
+                    int val = mm_create_vma(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
                     if (val == -EEXIST)
                         kfree(phys_2_virt(paddr));
+                    else
+                        mm_map_vma(vma, paddr);
                     memset((void *)(virt_base + off), 0, PAGE_4K_SIZE);
                 }
             }
@@ -307,10 +313,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     regs->rbp = current_pcb->mm->stack_start;
 
     {
+        struct vm_area_struct *vma = NULL;
         uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-        int val = mm_map_vma(current_pcb->mm, current_pcb->mm->stack_start - PAGE_2M_SIZE, PAGE_2M_SIZE, pa, VM_USER | VM_ACCESS_FLAGS, NULL);
+        int val = mm_create_vma(current_pcb->mm, current_pcb->mm->stack_start - PAGE_2M_SIZE, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
         if (val == -EEXIST)
             free_pages(Phy_to_2M_Page(pa), 1);
+        else
+            mm_map_vma(vma, pa);
     }
 
     // 清空栈空间
@@ -928,8 +937,14 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
             {
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
 
-                mm_map_vma(new_mms, vma->vm_start + i * PAGE_2M_SIZE, PAGE_2M_SIZE, pa, vma->vm_flags, vma->vm_ops);
-                // kdebug("phys_2_virt(pa)=%#018lx, vaddr=%#018lx", phys_2_virt(pa), vma->vm_start + i * PAGE_2M_SIZE);
+                struct vm_area_struct *new_vma = NULL;
+                int ret = mm_create_vma(new_mms, vma->vm_start + i * PAGE_2M_SIZE, PAGE_2M_SIZE, vma->vm_flags, vma->vm_ops, &new_vma);
+                // 防止内存泄露
+                if (unlikely(ret == -EEXIST))
+                    free_pages(Phy_to_2M_Page(pa), 1);
+                else
+                    mm_map_vma(new_vma, pa);
+
                 memcpy((void *)phys_2_virt(pa), (void *)(vma->vm_start + i * PAGE_2M_SIZE), (vma_size >= PAGE_2M_SIZE) ? PAGE_2M_SIZE : vma_size);
                 vma_size -= PAGE_2M_SIZE;
             }
@@ -938,7 +953,15 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
         {
             uint64_t map_size = PAGE_4K_ALIGN(vma_size);
             uint64_t va = (uint64_t)kmalloc(map_size, 0);
-            mm_map_vma(new_mms, vma->vm_start, map_size, virt_2_phys(va), vma->vm_flags, vma->vm_ops);
+
+            struct vm_area_struct *new_vma = NULL;
+            int ret = mm_create_vma(new_mms, vma->vm_start, map_size, vma->vm_flags, vma->vm_ops, &new_vma);
+            // 防止内存泄露
+            if (unlikely(ret == -EEXIST))
+                kfree((void *)va);
+            else
+                mm_map_vma(new_vma, virt_2_phys(va));
+
             memcpy((void *)va, (void *)vma->vm_start, vma_size);
         }
         vma = vma->vm_next;

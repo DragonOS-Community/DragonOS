@@ -1,6 +1,7 @@
 #pragma once
 
-#include <process/process.h>
+#include <arch/x86_64/current.h>
+#include "proc-types.h"
 
 /**
  * @brief 增加自旋锁计数变量

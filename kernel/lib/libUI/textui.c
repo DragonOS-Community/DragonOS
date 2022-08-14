@@ -5,6 +5,7 @@
 #include <common/string.h>
 #include <common/printk.h>
 #include <common/atomic.h>
+#include <common/errno.h>
 
 struct scm_ui_framework_t textui_framework;
 static spinlock_t __window_id_lock = {1};

@@ -122,7 +122,10 @@
         "atomic.h": "c",
         "uart.h": "c",
         "fat_ent.h": "c",
-        "semaphore.h": "c"
+        "semaphore.h": "c",
+        "mm-types.h": "c",
+        "vfs.h": "c",
+        "current.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

@@ -306,17 +306,17 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
 }
 
 /**
- * @brief 创建VMA，并将物理地址映射到指定的虚拟地址处
+ * @brief 创建VMA
  *
  * @param mm 要绑定的内存空间分布结构体
  * @param vaddr 起始虚拟地址
  * @param length 长度（字节）
- * @param paddr 起始物理地址
  * @param vm_flags vma的标志
  * @param vm_ops vma的操作接口
+ * @param res_vma 返回的vma指针
  * @return int 错误码
  */
-int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr, vm_flags_t vm_flags, struct vm_operations_t *vm_ops)
+int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flags_t vm_flags, struct vm_operations_t *vm_ops, struct vm_area_struct **res_vma)
 {
     int retval = 0;
     struct vm_area_struct *vma = vm_area_alloc(mm);
@@ -327,19 +327,50 @@ int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t p
     vma->vm_start = vaddr;
     vma->vm_end = vaddr + length;
 
-    // 将vma与对应的anon_vma进行绑定
-    struct Page * pg = Phy_to_2M_Page(paddr);
-    // 将VMA加入链表
+    // 将VMA加入mm的链表
     retval = vma_insert(mm, vma);
     if (retval == -EEXIST) // 之前已经存在了相同的vma，直接返回
     {
+        *res_vma = vma_find(mm, vma->vm_start);
         kfree(vma);
         return -EEXIST;
     }
+    *res_vma = vma;
+    return 0;
+}
+
+/**
+ * @brief 将指定的物理地址映射到指定的vma处
+ *
+ * @param vma 要进行映射的VMA结构体
+ * @param paddr 起始物理地址
+ * @return int 错误码
+ */
+int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
+{
+    int retval = 0;
+    // 获取物理地址对应的页面
+    struct Page *pg = Phy_to_2M_Page(paddr);
+    if (unlikely(pg->anon_vma == NULL)) // 若页面不存在anon_vma，则为页面创建anon_vma
+    {
+        uint64_t rflags;
+        // todo: 查明为什么在mm_init中，spin init之后，pg会变为0
+        spin_init(&pg->op_lock);
+        spin_lock_irqsave(&pg->op_lock, rflags);
+        if (unlikely(pg->anon_vma == NULL))
+            __anon_vma_create_alloc(pg, false);
+        spin_unlock_irqrestore(&pg->op_lock, rflags);
+    }
+    barrier();
+    // 将anon vma与vma进行绑定
+    __anon_vma_add(pg->anon_vma, vma);
+    barrier();
+
+    uint64_t length = vma->vm_end - vma->vm_start;
+    // ==== 将地址映射到页表 ====
     uint64_t len_4k = length % PAGE_2M_SIZE;
     uint64_t len_2m = length - len_4k;
 
-    // ==== 将地址映射到页表
     /*
         todo: 限制页面的读写权限
     */
@@ -348,12 +379,12 @@ int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t p
     if (likely(len_2m > 0))
     {
         uint64_t page_flags = 0;
-        if (vm_flags & VM_USER)
+        if (vma->vm_flags & VM_USER)
             page_flags = PAGE_USER_PAGE;
         else
             page_flags = PAGE_KERNEL_PAGE;
         // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
-        retval = mm_map_proc_page_table((uint64_t)mm->pgd, true, vaddr, paddr, len_2m, page_flags, false, false, false);
+        retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start, paddr, len_2m, page_flags, false, false, false);
         if (unlikely(retval != 0))
             goto failed;
     }
@@ -363,12 +394,12 @@ int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t p
         len_4k = ALIGN(len_4k, PAGE_4K_SIZE);
 
         uint64_t page_flags = 0;
-        if (vm_flags & VM_USER)
+        if (vma->vm_flags & VM_USER)
             page_flags = PAGE_USER_4K_PAGE;
         else
             page_flags = PAGE_KERNEL_4K_PAGE;
         // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
-        retval = mm_map_proc_page_table((uint64_t)mm->pgd, true, vaddr + len_2m, paddr + len_2m, len_4k, page_flags, false, false, true);
+        retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start + len_2m, paddr + len_2m, len_4k, page_flags, false, false, true);
         if (unlikely(retval != 0))
             goto failed;
     }
@@ -376,9 +407,7 @@ int mm_map_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t p
     flush_tlb();
     return 0;
 failed:;
-    kdebug("failed.");
-    __vma_unlink_list(mm, vma);
-    vm_area_free(vma);
+    kdebug("map VMA failed.");
     return retval;
 }
 

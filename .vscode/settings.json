@@ -120,7 +120,8 @@
         "screen_manager.h": "c",
         "textui.h": "c",
         "atomic.h": "c",
-        "uart.h": "c"
+        "uart.h": "c",
+        "fat_ent.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

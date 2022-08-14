@@ -345,7 +345,7 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
         }
         else
         {
-            for(int j = 8;j<11;++j)
+            for (int j = 8; j < 11; ++j)
             {
                 target->DIR_Name[j] = 'a';
             }

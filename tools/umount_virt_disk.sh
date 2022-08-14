@@ -5,10 +5,7 @@ if [ ! $uid == "0" ];then
  exit
 fi
 
-LOOP_DEVICE=$(lsblk | grep disk_mount)
-
-LOOP_DEVICE=${LOOP_DEVICE:2:10}
-LOOP_DEVICE=${LOOP_DEVICE%%p1*}
+LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
 
 umount -f ../bin/disk_mount/
 losetup -d /dev/$LOOP_DEVICE

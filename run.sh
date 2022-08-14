@@ -106,10 +106,7 @@ cfg_content='set timeout=15
 
     # ${GRUB_PATH}/grub-mkrescue -o ${iso} ${iso_folder}
     # rm -rf ${iso_folder}
-    LOOP_DEVICE=$(lsblk | grep disk_mount)
-
-    LOOP_DEVICE=${LOOP_DEVICE:2:10}
-    LOOP_DEVICE=${LOOP_DEVICE%%p1*}
+    LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
     echo $LOOP_DEVICE
 
     grub-install --target=i386-pc --boot-directory=${root_folder}/bin/disk_mount/boot/ /dev/$LOOP_DEVICE

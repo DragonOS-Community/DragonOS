@@ -509,7 +509,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     // 检测当前进程是否可被调度
     if (current_pcb->flags & PF_NEED_SCHED)
     {
-        // kdebug("to sched");
+        io_mfence();
         sched_cfs();
     }
 }

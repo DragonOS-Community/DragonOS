@@ -10,7 +10,6 @@
 #include <driver/interrupt/apic/apic.h>
 
 // 由于xhci寄存器读取需要对齐，因此禁用GCC优化选项
-#pragma GCC push_options
 #pragma GCC optimize("O0")
 
 spinlock_t xhci_controller_init_lock = {0}; // xhci控制器初始化锁(在usb_init中被初始化)
@@ -963,7 +962,9 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     FAIL_ON_TO(xhci_hc_init_intr(cid), failed_free_dyn);
     io_mfence();
     ++xhci_ctrl_count;
+    io_mfence();
     spin_unlock(&xhci_controller_init_lock);
+    io_mfence();
     return;
 
 failed_free_dyn:; // 释放动态申请的内存
@@ -991,4 +992,3 @@ failed_exceed_max:;
     kerror("Failed to initialize controller: bus=%d, dev=%d, func=%d", dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func);
     spin_unlock(&xhci_controller_init_lock);
 }
-#pragma GCC pop_options

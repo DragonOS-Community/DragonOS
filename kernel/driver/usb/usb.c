@@ -30,9 +30,9 @@ void usb_init()
         kwarn("There is no usb hardware in this computer!");
         return;
     }
-
+    kdebug("usb_pdevs_count=%d",usb_pdevs_count);
     // 初始化每个usb控制器
-    for (int i = 0; i < usb_pdevs_count; ++i)
+    for (volatile int i = 0; i < usb_pdevs_count; ++i)
     {
         io_mfence();
         switch (usb_pdevs[i]->ProgIF)
@@ -47,6 +47,7 @@ void usb_init()
 
         case USB_TYPE_XHCI:
             // 初始化对应的xhci控制器
+            io_mfence();
             xhci_init((struct pci_device_structure_general_device_t *)usb_pdevs[i]);
             io_mfence();
             break;

@@ -60,7 +60,7 @@ void mm_init()
     for (int i = 0; i < count; ++i)
     {
         io_mfence();
-        //可用的内存
+        // 可用的内存
         if (mb2_mem_info->type == 1)
             mm_Total_Memory += mb2_mem_info->len;
 
@@ -332,7 +332,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
                         *(memory_management_struct.bmp + ((x->addr_phys >> PAGE_2M_SHIFT) >> 6)) |= (1UL << (x->addr_phys >> PAGE_2M_SHIFT) % 64);
                         ++(z->count_pages_using);
                         --(z->count_pages_free);
-                        x->attr = attr;
+                        page_init(x, attr);
                     }
                     // 成功分配了页面，返回第一个页面的指针
                     // kwarn("start page num=%d\n", start_page_num);
@@ -589,7 +589,7 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
     {
         for (uint64_t i = old_brk_end_addr; i < end_addr; i += PAGE_2M_SIZE)
         {
-            struct vm_area_struct * vma=NULL;
+            struct vm_area_struct *vma = NULL;
             mm_create_vma(current_pcb->mm, i, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
             mm_map_vma(vma, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys);
         }

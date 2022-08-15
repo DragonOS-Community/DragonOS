@@ -208,13 +208,14 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
     if (!textui_is_chromatic(window->flags)) // 暂不支持纯文本窗口
         return 0;
 
-    uint64_t rflags = 0; // 加锁后rflags存储到这里
-    spin_lock_irqsave(&window->lock, rflags);
+    // uint64_t rflags = 0; // 加锁后rflags存储到这里
+    spin_lock(&window->lock);
     uart_send(COM1, character);
     if (unlikely(character == '\n'))
     {
         __textui_new_line(window, window->vline_operating);
-        spin_unlock_irqrestore(&window->lock, rflags);
+        // spin_unlock_irqrestore(&window->lock, rflags);
+        spin_unlock(&window->lock);
         return 0;
     }
     else if (character == '\t') // 输出制表符
@@ -265,7 +266,8 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
         __textui_putchar_window(window, character, FRcolor, BKcolor);
     }
 
-    spin_unlock_irqrestore(&window->lock, rflags);
+    // spin_unlock_irqrestore(&window->lock, rflags);
+    spin_unlock(&window->lock);
     return 0;
 }
 

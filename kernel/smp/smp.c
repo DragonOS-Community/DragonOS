@@ -140,6 +140,7 @@ void smp_ap_start()
     // ============ 为ap处理器初始化IDLE进程 =============
     memset(current_pcb, 0, sizeof(struct process_control_block));
 
+    barrier();
     current_pcb->state = PROC_RUNNING;
     current_pcb->flags = PF_KTHREAD;
     current_pcb->mm = &initial_mm;
@@ -157,11 +158,12 @@ void smp_ap_start()
     current_pcb->cpu_id = current_starting_cpu;
 
     initial_proc[proc_current_cpu_id] = current_pcb;
-
+    barrier();
     load_TR(10 + current_starting_cpu * 2);
     current_pcb->preempt_count = 0;
 
     // kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
+    io_mfence();
     spin_unlock(&multi_core_starting_lock);
     preempt_disable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count
     io_mfence();

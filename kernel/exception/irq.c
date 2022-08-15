@@ -215,8 +215,11 @@ int irq_register(ul irq_num, void *arg, void (*handler)(ul irq_num, ul parameter
     p->flags = 0;
     p->handler = handler;
 
+    io_mfence();
     p->controller->install(irq_num, arg);
+    io_mfence();
     p->controller->enable(irq_num);
+    io_mfence();
 
     return 0;
 }

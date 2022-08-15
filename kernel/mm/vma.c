@@ -179,9 +179,9 @@ struct anon_vma_t *__anon_vma_create_alloc(struct Page *page, bool lock_page)
         if (lock_page == true) // 需要加锁
         {
             uint64_t rflags;
-            spin_lock_irqsave(&page->op_lock, rflags);
+            spin_lock(&page->op_lock);
             page->anon_vma = anon_vma;
-            spin_unlock_irqrestore(&page->op_lock, rflags);
+            spin_unlock(&page->op_lock);
         }
         else
             page->anon_vma = anon_vma;

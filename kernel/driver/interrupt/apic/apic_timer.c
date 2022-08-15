@@ -73,7 +73,7 @@ hardware_intr_controller apic_timer_intr_controller =
  */
 void apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 {
-
+    io_mfence();
     sched_update_jiffies();
     io_mfence();
 }
@@ -91,7 +91,8 @@ void apic_timer_init()
             hlt();
     }
     kinfo("Initializing apic timer for cpu %d", proc_current_cpu_id);
-    
+    io_mfence();
     irq_register(APIC_TIMER_IRQ_NUM, &apic_timer_ticks_result, &apic_timer_handler, 0, &apic_timer_intr_controller, "apic timer");
+    io_mfence();
     kinfo("Successfully initialized apic timer for cpu %d", proc_current_cpu_id);
 }

@@ -353,13 +353,10 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     struct Page *pg = Phy_to_2M_Page(paddr);
     if (unlikely(pg->anon_vma == NULL)) // 若页面不存在anon_vma，则为页面创建anon_vma
     {
-        uint64_t rflags;
-        // todo: 查明为什么在mm_init中，spin init之后，pg会变为0
-        spin_init(&pg->op_lock);
-        spin_lock_irqsave(&pg->op_lock, rflags);
+        spin_lock(&pg->op_lock);
         if (unlikely(pg->anon_vma == NULL))
             __anon_vma_create_alloc(pg, false);
-        spin_unlock_irqrestore(&pg->op_lock, rflags);
+        spin_unlock(&pg->op_lock);
     }
     barrier();
     // 将anon vma与vma进行绑定

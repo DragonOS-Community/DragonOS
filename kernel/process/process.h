@@ -17,7 +17,13 @@
 #include <filesystem/VFS/VFS.h>
 #include <common/wait_queue.h>
 #include <mm/mm-types.h>
+
+#if ARCH(X86_64)
 #include <arch/x86_64/current.h>
+#else
+#error Unsupported architecture!
+#endif
+
 #include "proc-types.h"
 
 // 设置初始进程的PCB

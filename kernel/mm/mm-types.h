@@ -131,6 +131,7 @@ struct vm_area_struct
 
     struct vm_operations_t *vm_ops; // 操作方法
     atomic_t ref_count;             // 引用计数
+    pgoff_t page_offset;    // 起始地址在当前VMA所占的2M物理页中的偏移量
     void *private_data;
 };
 

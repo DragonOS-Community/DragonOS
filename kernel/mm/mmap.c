@@ -400,7 +400,8 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
         if (unlikely(retval != 0))
             goto failed;
     }
-
+    // 计算当前vma的起始地址在对应的物理页中的偏移量
+    vma->page_offset = paddr - (paddr & PAGE_2M_MASK);
     flush_tlb();
     return 0;
 failed:;

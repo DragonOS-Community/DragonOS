@@ -41,6 +41,8 @@ typedef uint64_t fsfilcnt_t;
 #define __socklen_t uint32_t
 typedef __socklen_t socklen_t;
 
+#define pgoff_t unsigned long
+
 struct utimbuf
 {
     time_t actime;

@@ -84,3 +84,5 @@ typedef struct __pthread_condattr_t
 {
     int clockid; // clockid_t
 } pthread_condattr_t;
+
+typedef uint64_t gfp_t;

@@ -11,8 +11,8 @@
 
 // SLAB存储池count_using不为空
 #define ESLAB_NOTNULL 101
-#define ENOT_IN_SLAB 102    // 地址不在当前slab内存池中
-#define ECANNOT_FREE_MEM 103    // 无法释放内存
+#define ENOT_IN_SLAB 102     // 地址不在当前slab内存池中
+#define ECANNOT_FREE_MEM 103 // 无法释放内存
 
 struct slab_obj
 {
@@ -43,21 +43,33 @@ struct slab
     // dma内存池对象
     struct slab_obj *cache_dma_pool_entry;
 
-    spinlock_t lock;    // 当前内存池的操作锁
+    spinlock_t lock; // 当前内存池的操作锁
 
     // 内存池的构造函数和析构函数
     void *(*constructor)(void *vaddr, ul arg);
     void *(*destructor)(void *vaddr, ul arg);
 };
-//extern struct slab kmalloc_cache_group[16];
+
 /**
  * @brief 通用内存分配函数
  *
  * @param size 要分配的内存大小
- * @param flags 内存的flag
- * @return void*
+ * @param gfp 内存的flag
+ * @return void* 分配得到的内存的指针
  */
-void *kmalloc(unsigned long size, unsigned long flags);
+void *kmalloc(unsigned long size, gfp_t gfp);
+
+/**
+ * @brief 从kmalloc申请一块内存，并将这块内存清空
+ * 
+ * @param size 要分配的内存大小
+ * @param gfp 内存的flag
+ * @return void* 分配得到的内存的指针
+ */
+static __always_inline void *kzalloc(size_t size, gfp_t gfp)
+{
+    return kmalloc(size, gfp | __GFP_ZERO);
+}
 
 /**
  * @brief 通用内存释放函数
@@ -108,12 +120,11 @@ ul slab_free(struct slab *slab_pool, void *addr, ul arg);
 
 /**
  * @brief 在kmalloc中创建slab_obj的函数（与slab_malloc()类似)
- * 
- * @param size 
+ *
+ * @param size
  * @return struct slab_obj* 创建好的slab_obj
  */
-struct slab_obj * kmalloc_create_slab_obj(ul size);
-
+struct slab_obj *kmalloc_create_slab_obj(ul size);
 
 /**
  * @brief 初始化内存池组
@@ -121,5 +132,3 @@ struct slab_obj * kmalloc_create_slab_obj(ul size);
  * @return ul
  */
 ul slab_init();
-
-

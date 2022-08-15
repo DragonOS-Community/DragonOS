@@ -4,7 +4,7 @@
 
 SLAB内存池提供小内存对象的分配功能。
 
-### `void *kmalloc(unsigned long size, unsigned long flags)`
+### `void *kmalloc(unsigned long size, gfp_t gfp)`
 
 &emsp;&emsp;获取小块的内存。
 
@@ -18,9 +18,26 @@ SLAB内存池提供小内存对象的分配功能。
 
 &emsp;&emsp;内存对象的大小
 
-**flags**
+**gfp**
 
-&emsp;&emsp;标志位（暂时未实现，默认填0）
+&emsp;&emsp;标志位
+
+### `void *kzalloc(unsigned long size, gfp_t gfp)`
+
+#### 描述
+
+&emsp;&emsp;获取小块的内存，并将其清零。其余功能与kmalloc相同。
+
+
+##### 参数
+
+**size**
+
+&emsp;&emsp;内存对象的大小
+
+**gfp**
+
+&emsp;&emsp;标志位
 
 ### `unsigned long kfree(void *address)`
 
@@ -30,7 +47,7 @@ SLAB内存池提供小内存对象的分配功能。
 
 &emsp;&emsp;该函数用于释放通过kmalloc申请的内存。如果`address`为NULL，则函数被调用后，无事发生。
 
-&emsp;&emsp;请不要通过这个函数释放那些不是从`kmalloc()`申请的内存，否则将会导致系统崩溃。
+&emsp;&emsp;请不要通过这个函数释放那些不是从`kmalloc()`或`kzalloc()`申请的内存，否则将会导致系统崩溃。
 
 ##### 参数
 

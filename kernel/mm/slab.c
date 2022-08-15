@@ -397,7 +397,6 @@ ul slab_init()
         io_mfence();
         --page->zone->count_pages_free;
         page_init(page, PAGE_KERNEL_INIT | PAGE_KERNEL | PAGE_PGT_MAPPED);
-
     }
     io_mfence();
 
@@ -415,7 +414,7 @@ ul slab_init()
         *(memory_management_struct.bmp + (page_num >> 6)) |= (1UL << (page_num % 64));
 
         ++page->zone->count_pages_using;
-        io_mfence();    // 该位置必须加一个mfence，否则O3优化运行时会报错
+        io_mfence(); // 该位置必须加一个mfence，否则O3优化运行时会报错
         --page->zone->count_pages_free;
         page_init(page, PAGE_PGT_MAPPED | PAGE_KERNEL | PAGE_KERNEL_INIT);
 
@@ -535,11 +534,12 @@ struct slab_obj *kmalloc_create_slab_obj(ul size)
  * @brief 通用内存分配函数
  *
  * @param size 要分配的内存大小
- * @param flags 内存的flag
+ * @param gfp 内存的flag
  * @return void* 内核内存虚拟地址
  */
-void *kmalloc(unsigned long size, unsigned long flags)
+void *kmalloc(unsigned long size, gfp_t gfp)
 {
+    void *result = NULL;
     if (size > 1048576)
     {
         kwarn("kmalloc(): Can't alloc such memory: %ld bytes, because it is too large.", size);
@@ -610,9 +610,15 @@ void *kmalloc(unsigned long size, unsigned long flags)
             // 放锁
             spin_unlock(&kmalloc_cache_group[index].lock);
             // 返回内存对象
-            return (void *)((char *)slab_obj_ptr->vaddr + kmalloc_cache_group[index].size * i);
+            result = (void *)((char *)slab_obj_ptr->vaddr + kmalloc_cache_group[index].size * i);
+            goto done;
         }
     }
+    goto failed;
+done:;
+    if (gfp & __GFP_ZERO)
+        memset(result, 0, size);
+    return result;
 failed:;
     spin_unlock(&kmalloc_cache_group[index].lock);
     kerror("kmalloc(): Cannot alloc more memory: %d bytes", size);

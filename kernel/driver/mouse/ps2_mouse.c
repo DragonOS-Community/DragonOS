@@ -201,7 +201,7 @@ static int ps2_mouse_enable_5keys()
 void ps2_mouse_init()
 {
     // 初始化鼠标读入队列缓冲区
-    ps2_mouse_buf_ptr = (struct ps2_mouse_input_buffer *)kmalloc(sizeof(struct ps2_mouse_input_buffer), 0);
+    ps2_mouse_buf_ptr = (struct ps2_mouse_input_buffer *)kzalloc(sizeof(struct ps2_mouse_input_buffer), 0);
     ps2_mouse_buf_ptr->ptr_head = ps2_mouse_buf_ptr->buffer;
     ps2_mouse_buf_ptr->ptr_tail = ps2_mouse_buf_ptr->buffer;
     ps2_mouse_buf_ptr->count = 0;

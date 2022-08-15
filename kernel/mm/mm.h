@@ -1,6 +1,7 @@
 #pragma once
 
 #include <common/glib.h>
+#include <common/gfp.h>
 #include <mm/mm-types.h>
 #include <process/process.h>
 

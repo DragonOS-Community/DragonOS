@@ -9,19 +9,24 @@ IN_DOCKER=0
 
 # 第一个参数如果是--notbuild 那就不构建，直接运行
 if [ ! "$1" == "--nobuild" ]; then
-    echo "开始构建..."
-    if [ "$1" == "--docker" ]; then
+    if [ "$1" == "--nomake" ]; then
+        echo "将会跳过make过程直接构建镜像..."
+        echo "开始构建..."
+        GENERATE_ISO=1
+    elif [ "$1" == "--docker" ]; then
         echo "使用docker构建"
+        echo "开始构建..."
         sudo bash tools/build_in_docker.sh
         GENERATE_ISO=0
     elif [ "$1" == "--current_in_docker" ]; then
         echo "运行在docker内"
+        echo "开始构建..."
         IN_DOCKER=1
         make all -j 16
         make clean
         GENERATE_ISO=1
     else
-        
+        echo "开始构建..."
         make all -j 16
         make clean
         GENERATE_ISO=1

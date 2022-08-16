@@ -1,11 +1,11 @@
-string.h
-====================================
-简介:
-    ====
+# string.h
+
+## 简介:
+
     字符串操作
 
-函数列表:
-    =====
+## 函数列表:
+
     ``size_t strlen(const char *s)`` : 返回字符串长度
     
     ``int strcmp(const char *a,const char *b)`` 比较字符串的字典序

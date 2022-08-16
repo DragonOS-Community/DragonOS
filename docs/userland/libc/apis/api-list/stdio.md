@@ -1,10 +1,10 @@
-stdio.h
-====================================
-简介：
-    =======
+# stdio.h
+
+## 简介：
+
     向标准输入输出里操作
-函数列表：
-    ======
+## 函数列表：
+
     ``int64_t put_string(char *str, uint64_t front_color, uint64_t bg_color)``
 
         输出字符串（带有前景色，背景色）
@@ -20,10 +20,10 @@ stdio.h
     ``int vsprintf(char *buf,const char *fmt,va_list args)``
 
         格式化，不建议调用，请用 printf 或 sprintf 替代。
-宏定义
-    =======
-    字体颜色的宏定义
-        =========
+## 宏定义
+
+    ### 字体颜色的宏定义
+
         ``#define COLOR_WHITE 0x00ffffff  //白``
 
         ``#define COLOR_BLACK 0x00000000  //黑``
@@ -41,8 +41,8 @@ stdio.h
         ``#define COLOR_INDIGO 0x0000ffff //靛``
 
         ``#define COLOR_PURPLE 0x008000ff //紫``
-    无需使用
-        =======
+    ### 无需使用
+        
         ``#define SEEK_SET 0 /* Seek relative to start-of-file */``
         
         ``#define SEEK_CUR 1 /* Seek relative to current position */``

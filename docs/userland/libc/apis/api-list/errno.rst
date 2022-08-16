@@ -10,7 +10,7 @@ errno.h
     ===========
     #define E2BIG 1            /* 参数列表过长，或者在输出buffer中缺少空间 或者参数比系统内建的最大值要大 Argument list too long. */
     
-    #define EACCES 2           /* 访问被拒绝 Permission denied */
+    #define EACCES 2           /* 访问被拒绝 Permission denied */ 
     
     #define EADDRINUSE 3       /* 地址正在被使用 Address in use.*/
     

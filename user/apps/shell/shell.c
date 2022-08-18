@@ -54,26 +54,19 @@ void main_loop(int kb_fd)
         memset(input_buffer, 0, INPUT_BUFFER_SIZE);
 
         // 循环读取每一行到buffer
+        count_history++;
         int count = shell_readline(kb_fd, input_buffer);
-
+        if (!count||pointer < count_history-1)
+            count_history--;
         if (count)
         {
             char command_origin[strlen(input_buffer)];
             strcpy(command_origin, input_buffer);
             int cmd_num = parse_command(input_buffer, &argc, &argv);
-
+            pointer = count_history;
             printf("\n");
             if (cmd_num >= 0)
             {
-                //加入历史命令 不是修改
-                if(pointer >= count_history){
-                    strcpy(history_commands[count_history], command_origin);
-                    count_history++;
-                }else{                
-                    memset(history_commands[pointer],0,sizeof(history_commands[pointer]));
-                    strcpy(history_commands[pointer],command_origin);
-                }
-                pointer = count_history;
                 shell_run_built_in_command(cmd_num, argc, argv);
             }
         }
@@ -118,20 +111,26 @@ void clear_command(int count, char *buf)
  */
 void change_command(char *buf, int type)
 {
+    printf("\n\n");
+    for (int i = 0; i < count_history; i++)
+    {
+        printf("[DEBUG] command %d:%s\n", i, history_commands[i]);
+    }
+    printf("\n\n");
     pointer -= type;
     //处理边界
     if (pointer < 0)
         pointer++;
-    
+    printf("\n\n[DEBUG] %d\n\n",pointer);
     //让超过界限（例如先上再下）显示空行
-    if(pointer < count_history)
+    if (pointer < count_history)
     {
         strcpy(buf, history_commands[pointer]);
     }
     //让指针指向最靠近的
-    if (pointer > count_history)
+    if (pointer >= count_history)
     {
-        pointer--;
+        pointer = count_history-1;
     }
     printf("%s", buf);
 }
@@ -183,8 +182,17 @@ int shell_readline(int fd, char *buf)
             else
             {
                 buf[count++] = key;
-
                 printf("%c", key);
+            }
+            if (count > 0 && pointer >= count_history)
+            {
+                memset(history_commands[count_history-1], 0, sizeof(history_commands[count_history-1]));
+                strcpy(history_commands[count_history - 1], buf);
+            }
+            else if (count > 0)
+            {
+                memset(history_commands[pointer], 0, sizeof(history_commands[pointer]));
+                strcpy(history_commands[pointer], buf);
             }
         }
 

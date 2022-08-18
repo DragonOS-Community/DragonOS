@@ -70,7 +70,9 @@ void main_loop(int kb_fd)
             int cmd_num = parse_command(input_buffer, &argc, &argv);
             printf("\n");
             if (cmd_num >= 0)
+            {
                 shell_run_built_in_command(cmd_num, argc, argv);
+            }
         }
         else
             printf("\n");
@@ -100,7 +102,9 @@ int main()
 void clear_command(int count, char *buf)
 {
     for (int i = 0; i < count; i++)
+    {
         printf("%c", '\b');
+    }
     memset(buf, 0, sizeof(buf));
 }
 /**
@@ -116,7 +120,9 @@ void change_command(char *buf, int type)
     if (current_command_index < 0)
         current_command_index++;
     if (current_command_index >= count_history)
+    {
         current_command_index = count_history - 1;
+    }
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
 }

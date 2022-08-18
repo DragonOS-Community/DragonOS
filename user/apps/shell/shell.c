@@ -56,7 +56,7 @@ void main_loop(int kb_fd)
         // 循环读取每一行到buffer
         count_history++;
         int count = shell_readline(kb_fd, input_buffer);
-        if (!count||pointer < count_history-1)
+        if (!count || pointer < count_history - 1)
             count_history--;
         if (count)
         {
@@ -121,7 +121,7 @@ void change_command(char *buf, int type)
     //处理边界
     if (pointer < 0)
         pointer++;
-    printf("\n\n[DEBUG] %d\n\n",pointer);
+    printf("\n\n[DEBUG] %d\n\n", pointer);
     //让超过界限（例如先上再下）显示空行
     if (pointer < count_history)
     {
@@ -130,7 +130,10 @@ void change_command(char *buf, int type)
     //让指针指向最靠近的
     if (pointer >= count_history)
     {
-        pointer = count_history-1;
+        if (strlen(history_commands[count_history]) == 0)
+            pointer = count_history - 1;
+        else
+            pointer = count_history;
     }
     printf("%s", buf);
 }
@@ -186,7 +189,7 @@ int shell_readline(int fd, char *buf)
             }
             if (count > 0 && pointer >= count_history)
             {
-                memset(history_commands[count_history-1], 0, sizeof(history_commands[count_history-1]));
+                memset(history_commands[count_history - 1], 0, sizeof(history_commands[count_history - 1]));
                 strcpy(history_commands[count_history - 1], buf);
             }
             else if (count > 0)

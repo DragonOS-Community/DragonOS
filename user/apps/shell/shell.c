@@ -25,7 +25,7 @@ extern char *shell_current_path;
 char history_commands[MEM_HISTORY][INPUT_BUFFER_SIZE];
 int count_history;
 //现在对应的命令
-int pointer;
+int current_command_index;
 /**
  * @brief shell主循环
  *
@@ -34,7 +34,7 @@ int pointer;
 void main_loop(int kb_fd)
 {
     count_history = 0;
-    pointer = 0;
+    current_command_index = 0;
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
     // 初始化当前工作目录的路径
@@ -56,14 +56,14 @@ void main_loop(int kb_fd)
         // 循环读取每一行到buffer
         count_history++;
         int count = shell_readline(kb_fd, input_buffer);
-        if (!count || pointer < count_history - 1)
+        if (!count || current_command_index < count_history - 1)
             count_history--;
         if (count)
         {
             char command_origin[strlen(input_buffer)];
             strcpy(command_origin, input_buffer);
             int cmd_num = parse_command(input_buffer, &argc, &argv);
-            pointer = count_history;
+            current_command_index = count_history;
             printf("\n");
             if (cmd_num >= 0)
             {
@@ -111,15 +111,15 @@ void clear_command(int count, char *buf)
  */
 void change_command(char *buf, int type)
 {
-    pointer -= type;
+    current_command_index -= type;
     //处理边界
-    if (pointer < 0)
-        pointer++;
-    if (pointer >= count_history)
+    if (current_command_index < 0)
+        current_command_index++;
+    if (current_command_index >= count_history)
     {
-        pointer = count_history - 1;
+        current_command_index = count_history - 1;
     }
-    strcpy(buf, history_commands[pointer]);
+    strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
 }
 /**
@@ -154,8 +154,12 @@ int shell_readline(int fd, char *buf)
             change_command(buf, -1);
             count = strlen(buf);
         }
-        if (key == '\n')
+        if (key == '\n'){
+            if(current_command_index < count_history-1){
+                memset(history_commands[count_history-1],0,sizeof(history_commands[count_history-1]));
+            }
             return count;
+        }
 
         if (key && key != 0x50 && key != 0xc8)
         {
@@ -172,15 +176,15 @@ int shell_readline(int fd, char *buf)
                 buf[count++] = key;
                 printf("%c", key);
             }
-            if (count > 0 && pointer >= count_history)
+            if (count > 0 && current_command_index >= count_history)
             {
                 memset(history_commands[count_history], 0, sizeof(history_commands[count_history]));
                 strcpy(history_commands[count_history], buf);
             }
             else if (count > 0)
             {
-                memset(history_commands[pointer], 0, sizeof(history_commands[pointer]));
-                strcpy(history_commands[pointer], buf);
+                memset(history_commands[current_command_index], 0, sizeof(history_commands[current_command_index]));
+                strcpy(history_commands[current_command_index], buf);
             }
         }
 

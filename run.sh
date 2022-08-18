@@ -131,6 +131,11 @@ allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}
 # 调试usb的trace
 qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace:usb_xhci_irq_msi,trace:usb_xhci_irq_msix,trace:usb_xhci_port_reset
 
+qemu_accel=kvm
+if [ "${OS}" == "Darwin" ]; then
+    qemu_accel=hvf
+fi
+
 if [ $flag_can_run -eq 1 ]; then
   if [ ${IA32_USE_QEMU} == 0 ]; then
         bochs -q -f ${bochsrc} -rc ./tools/bochsinit
@@ -138,13 +143,13 @@ if [ $flag_can_run -eq 1 ]; then
         qemu-system-x86_64 -d bin/disk.img -m 512M -smp 2,cores=2,threads=1,sockets=1 \
         -boot order=d   \
         -monitor stdio -d cpu_reset,guest_errors,trace:check_exception,exec,cpu,out_asm,in_asm,${qemu_trace_usb} \
-        -s -S -cpu "IvyBridge,+apic,+x2apic,+fpu,check,${allflags}" --enable-kvm -rtc clock=host,base=localtime -serial file:serial_opt.txt \
+        -s -S -cpu IvyBridge,apic,x2apic,+fpu,check,${allflags} -rtc clock=host,base=localtime -serial file:serial_opt.txt \
         -drive id=disk,file=bin/disk.img,if=none \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0    \
         -usb    \
-        -device qemu-xhci,id=xhci,p2=8,p3=4
-
+        -device qemu-xhci,id=xhci,p2=8,p3=4 \
+        -machine accel=${qemu_accel}
     fi
 else
   echo "不满足运行条件"

@@ -119,9 +119,9 @@ void change_command(char *buf, int type)
     //处理边界
     if (current_command_index < 0)
         current_command_index++;
-    if (current_command_index >= count_history)
+    if (current_command_index >= count_history-1)
     {
-        current_command_index = count_history - 1;
+        current_command_index = count_history - 2;
     }
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);

@@ -32,7 +32,7 @@ extern void system_call(void);
 extern void kernel_thread_func(void);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
-struct mm_struct initial_mm = {0};
+extern struct mm_struct initial_mm;
 struct thread_struct initial_thread =
     {
         .rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
@@ -458,7 +458,6 @@ exec_failed:;
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
-
     fat32_init();
     usb_init();
 

@@ -11,6 +11,7 @@
 
 uint64_t mm_Total_Memory = 0;
 uint64_t mm_total_2M_pages = 0;
+struct mm_struct initial_mm = {0};
 
 struct memory_desc memory_management_struct = {{0}, 0};
 

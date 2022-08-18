@@ -126,7 +126,8 @@
         "mm-types.h": "c",
         "vfs.h": "c",
         "current.h": "c",
-        "proc-types.h": "c"
+        "proc-types.h": "c",
+        "traceback.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

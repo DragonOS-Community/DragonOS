@@ -133,7 +133,6 @@ int shell_readline(int fd, char *buf)
 {
     int key = 0;
     int count = 0;
-
     while (1)
     {
         key = keyboard_analyze_keycode(fd);

@@ -65,9 +65,14 @@ void main_loop(int kb_fd)
             printf("\n");
             if (cmd_num >= 0)
             {
-                //加入历史命令
-                strcpy(history_commands[count_history], command_origin);
-                count_history++;
+                //加入历史命令 不是修改
+                if(pointer >= count_history){
+                    strcpy(history_commands[count_history], command_origin);
+                    count_history++;
+                }else{                
+                    memset(history_commands[pointer],0,sizeof(history_commands[pointer]));
+                    strcpy(history_commands[pointer],command_origin);
+                }
                 pointer = count_history;
                 shell_run_built_in_command(cmd_num, argc, argv);
             }
@@ -118,7 +123,6 @@ void change_command(char *buf, int type)
     if (pointer < 0)
         pointer++;
     
-    printf("[DEBUG] pointer: %d\n",pointer);
     //让超过界限（例如先上再下）显示空行
     if(pointer < count_history)
     {

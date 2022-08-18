@@ -21,8 +21,10 @@
 int shell_readline(int fd, char *buf);
 void print_ascii_logo();
 extern char *shell_current_path;
-//保存的历史命令
+//保存的历史命令(瞬时更改)
 char history_commands[MEM_HISTORY][INPUT_BUFFER_SIZE];
+//真正的历史命令
+char real_history_commands[MEM_HISTORY][INPUT_BUFFER_SIZE];
 int count_history;
 //现在对应的命令
 int current_command_index;
@@ -60,9 +62,14 @@ void main_loop(int kb_fd)
         {
             count_history--;
         }
-        strcpy(history_commands[count_history-1],input_buffer);
-        count_history++;
-        current_command_index = count_history-1;
+        if(count){
+            strcpy(real_history_commands[count_history-1],input_buffer);
+            count_history++;
+            memset(history_commands,0,sizeof(history_commands));
+            for(int i = 0;i<=count_history-2;i++)
+                strcpy(history_commands[i],real_history_commands[i]);
+            current_command_index = count_history-1;
+        }
         if (count)
         {
             char command_origin[strlen(input_buffer)];

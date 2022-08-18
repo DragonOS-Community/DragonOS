@@ -59,16 +59,15 @@ void main_loop(int kb_fd)
         count_history++;
         int count = shell_readline(kb_fd, input_buffer);
         if (!count || current_command_index < count_history - 1)
-        {
             count_history--;
-        }
-        if(count){
-            strcpy(real_history_commands[count_history-1],input_buffer);
+        if (count)
+        {
+            strcpy(real_history_commands[count_history - 1], input_buffer);
             count_history++;
-            memset(history_commands,0,sizeof(history_commands));
-            for(int i = 0;i<=count_history-2;i++)
-                strcpy(history_commands[i],real_history_commands[i]);
-            current_command_index = count_history-1;
+            memset(history_commands, 0, sizeof(history_commands));
+            for (int i = 0; i <= count_history - 2; i++)
+                strcpy(history_commands[i], real_history_commands[i]);
+            current_command_index = count_history - 1;
         }
         if (count)
         {
@@ -77,9 +76,7 @@ void main_loop(int kb_fd)
             int cmd_num = parse_command(input_buffer, &argc, &argv);
             printf("\n");
             if (cmd_num >= 0)
-            {
                 shell_run_built_in_command(cmd_num, argc, argv);
-            }
         }
         else
             printf("\n");
@@ -109,9 +106,7 @@ int main()
 void clear_command(int count, char *buf)
 {
     for (int i = 0; i < count; i++)
-    {
         printf("%c", '\b');
-    }
     memset(buf, 0, sizeof(buf));
 }
 /**
@@ -126,10 +121,8 @@ void change_command(char *buf, int type)
     //处理边界
     if (current_command_index < 0)
         current_command_index++;
-    if (current_command_index >= count_history-1)
-    {
+    if (current_command_index >= count_history - 1)
         current_command_index = count_history - 2;
-    }
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
 }
@@ -165,10 +158,11 @@ int shell_readline(int fd, char *buf)
             change_command(buf, -1);
             count = strlen(buf);
         }
-        if (key == '\n'){
-            if(count>0&&current_command_index>=count_history)
+        if (key == '\n')
+        {
+            if (count > 0 && current_command_index >= count_history)
             {
-                memset(history_commands[current_command_index-1],0,sizeof(history_commands[current_command_index-1]));
+                memset(history_commands[current_command_index - 1], 0, sizeof(history_commands[current_command_index - 1]));
                 count_history--;
             }
             return count;

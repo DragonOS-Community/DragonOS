@@ -33,7 +33,20 @@ long long llabs(long long i);
  * @return int 
  */
 int atoi(const char * str);
-
+// 最大的随机数值
+#define	RAND_MAX 2147483647
+/**
+ * @brief 生成随机数
+ * 
+ * @return int 随机数
+ */
+int rand(void);
+/**
+ * @brief 设置随机数种子
+ * 
+ * @param seed 种子
+ */
+void srand(unsigned seed);
 /**
  * @brief 退出进程
  * 

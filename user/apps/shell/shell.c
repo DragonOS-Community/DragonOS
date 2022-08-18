@@ -26,6 +26,7 @@ char history_commands[MEM_HISTORY][INPUT_BUFFER_SIZE];
 int count_history;
 //现在对应的命令
 int current_command_index;
+
 /**
  * @brief shell主循环
  *
@@ -57,7 +58,7 @@ void main_loop(int kb_fd)
         count_history++;
         int count = shell_readline(kb_fd, input_buffer);
         if (!count || current_command_index < count_history - 1)
-            count_history--;
+            --count_history;
         if (count)
         {
             char command_origin[strlen(input_buffer)];
@@ -66,9 +67,7 @@ void main_loop(int kb_fd)
             current_command_index = count_history;
             printf("\n");
             if (cmd_num >= 0)
-            {
                 shell_run_built_in_command(cmd_num, argc, argv);
-            }
         }
         else
             printf("\n");
@@ -98,9 +97,8 @@ int main()
 void clear_command(int count, char *buf)
 {
     for (int i = 0; i < count; i++)
-    {
         printf("%c", '\b');
-    }
+
     memset(buf, 0, sizeof(buf));
 }
 /**
@@ -115,10 +113,10 @@ void change_command(char *buf, int type)
     //处理边界
     if (current_command_index < 0)
         current_command_index++;
+    
     if (current_command_index >= count_history)
-    {
         current_command_index = count_history - 1;
-    }
+
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
 }
@@ -154,10 +152,11 @@ int shell_readline(int fd, char *buf)
             change_command(buf, -1);
             count = strlen(buf);
         }
-        if (key == '\n'){
-            if(current_command_index < count_history-1){
-                memset(history_commands[count_history-1],0,sizeof(history_commands[count_history-1]));
-            }
+        if (key == '\n')
+        {
+            // 重新历史命令时，使用历史命令覆盖最新尚未执行命令的记录
+            if (current_command_index < count_history - 1)
+                memset(history_commands[count_history - 1], 0, sizeof(history_commands[count_history - 1]));
             return count;
         }
 

@@ -115,11 +115,20 @@ void change_command(char *buf, int type)
 {
     pointer -= type;
     //处理边界
-    if (pointer >= count_history)
-        pointer--;
     if (pointer < 0)
         pointer++;
-    strcpy(buf, history_commands[pointer]);
+    
+    printf("[DEBUG] pointer: %d\n",pointer);
+    //让超过界限（例如先上再下）显示空行
+    if(pointer < count_history)
+    {
+        strcpy(buf, history_commands[pointer]);
+    }
+    //让指针指向最靠近的
+    if (pointer > count_history)
+    {
+        pointer--;
+    }
     printf("%s", buf);
 }
 /**

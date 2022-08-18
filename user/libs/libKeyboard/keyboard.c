@@ -427,6 +427,7 @@ int keyboard_analyze_keycode(int fd)
         case 0xc8:
             arrow_u = false;
             key = OTHER_KEY;
+            return 0xc8;
             break;
         case 0x4b:
             arrow_l = true;
@@ -439,6 +440,7 @@ int keyboard_analyze_keycode(int fd)
         case 0x50:
             arrow_d = true;
             key = OTHER_KEY;
+            return 0x50;
             break;
         case 0xd0:
             arrow_d = false;

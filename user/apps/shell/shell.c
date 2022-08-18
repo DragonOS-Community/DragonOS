@@ -22,7 +22,7 @@ int shell_readline(int fd, char *buf);
 void print_ascii_logo();
 extern char *shell_current_path;
 //保存的历史命令
-char history_commands[mem_history][256];
+char history_commands[mem_history][INPUT_BUFFER_SIZE];
 int count_history;
 //现在对应的命令
 int pointer;
@@ -58,7 +58,7 @@ void main_loop(int kb_fd)
 
         if (count)
         {
-            char *command_origin[strlen(input_buffer)];
+            char command_origin[strlen(input_buffer)];
             strcpy(command_origin, input_buffer);
             int cmd_num = parse_command(input_buffer, &argc, &argv);
 

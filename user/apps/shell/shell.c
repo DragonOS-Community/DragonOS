@@ -34,7 +34,7 @@ int pointer;
 void main_loop(int kb_fd)
 {
     count_history = 0;
-    pointer = 1;
+    pointer = 0;
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
     // 初始化当前工作目录的路径
@@ -111,30 +111,15 @@ void clear_command(int count, char *buf)
  */
 void change_command(char *buf, int type)
 {
-    printf("\n\n");
-    for (int i = 0; i < count_history; i++)
-    {
-        printf("[DEBUG] command %d:%s\n", i, history_commands[i]);
-    }
-    printf("\n\n");
     pointer -= type;
     //处理边界
     if (pointer < 0)
         pointer++;
-    printf("\n\n[DEBUG] %d\n\n", pointer);
-    //让超过界限（例如先上再下）显示空行
-    if (pointer < count_history)
-    {
-        strcpy(buf, history_commands[pointer]);
-    }
-    //让指针指向最靠近的
     if (pointer >= count_history)
     {
-        if (strlen(history_commands[count_history]) == 0)
-            pointer = count_history - 1;
-        else
-            pointer = count_history;
+        pointer = count_history - 1;
     }
+    strcpy(buf, history_commands[pointer]);
     printf("%s", buf);
 }
 /**
@@ -189,8 +174,8 @@ int shell_readline(int fd, char *buf)
             }
             if (count > 0 && pointer >= count_history)
             {
-                memset(history_commands[count_history - 1], 0, sizeof(history_commands[count_history - 1]));
-                strcpy(history_commands[count_history - 1], buf);
+                memset(history_commands[count_history], 0, sizeof(history_commands[count_history]));
+                strcpy(history_commands[count_history], buf);
             }
             else if (count > 0)
             {

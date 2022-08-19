@@ -18,7 +18,7 @@
 #include <common/wait_queue.h>
 #include <mm/mm-types.h>
 
-#if ARCH(X86_64)
+#if ARCH(I386) || ARCH(X86_64)
 #include <arch/x86_64/current.h>
 #else
 #error Unsupported architecture!

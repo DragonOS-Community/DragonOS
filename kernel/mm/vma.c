@@ -123,7 +123,7 @@ int vma_insert(struct mm_struct *mm, struct vm_area_struct *vma)
 
     struct vm_area_struct *prev;
     prev = vma_find(mm, vma->vm_start);
-    if (prev && prev->vm_start == vma->vm_start && prev->vm_end == vma->vm_end)
+    if (prev && prev->vm_start <= vma->vm_start && prev->vm_end >= vma->vm_end)
     {
         // 已经存在了相同的vma
         return -EEXIST;

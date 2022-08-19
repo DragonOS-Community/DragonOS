@@ -87,7 +87,6 @@ if [ "${GENERATE_ISO}" == "1" ]; then
     cp ${kernel} ${root_folder}/bin/disk_mount/boot
     cp ${root_folder}/bin/user/shell.elf ${root_folder}/bin/disk_mount
     cp ${root_folder}/bin/user/about.elf ${root_folder}/bin/disk_mount
-    cp ${root_folder}/bin/user/test.elf ${root_folder}/bin/disk_mount
     mkdir -p ${root_folder}/bin/disk_mount/dev
     touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
     

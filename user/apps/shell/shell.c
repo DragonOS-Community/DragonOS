@@ -61,6 +61,7 @@ void main_loop(int kb_fd)
         // 循环读取每一行到buffer
         count_history++;
         pointer_position = -1;
+        put_string(" ", COLOR_BLACK, COLOR_WHITE);
         int count = shell_readline(kb_fd, input_buffer);
         if (!count || current_command_index < count_history - 1)
             count_history--;
@@ -109,8 +110,7 @@ int main()
  */
 void clear_command(int count, char *buf)
 {
-    for (int i = 0; i < count; i++)
-        printf("%c", '\b');
+    clear_noclear_buf(count);
     memset(buf, 0, sizeof(buf));
 }
 /**
@@ -128,7 +128,30 @@ void change_command(char *buf, int type)
     if (current_command_index >= count_history - 1)
         current_command_index = count_history - 2;
     strcpy(buf, history_commands[current_command_index]);
-    printf("%s", buf);
+}
+void print_with_pointer(char *buf, int count)
+{
+    for (int i = 0; i <= pointer_position; i++)
+        printf("%c", buf[i]);
+    char x[4];
+    memset(x,0,sizeof(x));
+    x[0] = " ";
+    if (pointer_position != count - 1)
+    {
+        x[0] = buf[pointer_position + 1];
+        put_string(x, COLOR_BLACK, COLOR_WHITE);
+    }
+    else
+        put_string(" ", COLOR_BLACK, COLOR_WHITE);
+    for (int i = pointer_position + 2; i < count; i++)
+        printf("%c", buf[i]);
+}
+void clear_noclear_buf(int count)
+{
+    for (int i = 0; i < count; i++)
+        printf("\b \b");
+    if (pointer_position == count - 1)
+        printf("\b \b");
 }
 /**
  * @brief 循环读取每一行
@@ -152,7 +175,8 @@ int shell_readline(int fd, char *buf)
             //向历史
             change_command(buf, 1);
             count = strlen(buf);
-            pointer_position = count-1;
+            pointer_position = count - 1;
+            print_with_pointer(buf,count);
         }
         //向下方向键
         if (count_history != 0 && key == 0x50 + OFFSET_FUNCTION)
@@ -162,22 +186,31 @@ int shell_readline(int fd, char *buf)
             //向现在
             change_command(buf, -1);
             count = strlen(buf);
-            pointer_position = count-1;
+            pointer_position = count - 1;
+            print_with_pointer(buf,count);
         }
+        //左方向键
         if (key == 0x4d + OFFSET_FUNCTION)
         {
+            clear_noclear_buf(count);
             pointer_position++;
             if (pointer_position >= count)
                 pointer_position = count-1;
+            print_with_pointer(buf,count);
         }
+        //右方向键
         if (key == 0x4b + OFFSET_FUNCTION)
         {
+            clear_noclear_buf(count);
             pointer_position--;
             if (pointer_position < -1)
                 pointer_position = -1;
+            print_with_pointer(buf,count);
         }
         if (key == '\n')
         {
+            clear_noclear_buf(count);
+            printf("%s",buf);
             if (count > 0 && current_command_index >= count_history)
             {
                 memset(history_commands[current_command_index - 1], 0, sizeof(history_commands[current_command_index - 1]));
@@ -185,46 +218,35 @@ int shell_readline(int fd, char *buf)
             }
             return count;
         }
-
         if (key && key != 0x50 + OFFSET_FUNCTION && key != 0xc8 + OFFSET_FUNCTION &&
-         key != 0x4d + OFFSET_FUNCTION && key != 0x4b + OFFSET_FUNCTION)
+            key != 0x4d + OFFSET_FUNCTION && key != 0x4b + OFFSET_FUNCTION)
         {
             if (key == '\b')
             {
                 if (count > 0)
                 {
-                    if(pointer_position!=-1)
+                    if (pointer_position != -1)
                     {
-                        for (int i = 0; i < count; i++)
-                        {
-                            printf("%c", '\b');
-                        }
+                        clear_noclear_buf(count);
                         buf[pointer_position] = 0;
-                        for (int i = pointer_position+1; i <= count-1; i++)
-                        {
+                        for (int i = pointer_position + 1; i <= count - 1; i++)
                             buf[i - 1] = buf[i];
-                        }
-                        buf[count-1] = 0;
+                        buf[count - 1] = 0;
                         pointer_position--;
                         count--;
-                        printf("%s", buf);
+                        print_with_pointer(buf, count);
                     }
                 }
             }
             else
             {
-                for (int i = 0; i < count; i++)
-                {
-                    printf("%c", '\b');
-                }
+                clear_noclear_buf(count);
                 for (int i = count - 1; i >= pointer_position + 1; i--)
-                {
                     buf[i + 1] = buf[i];
-                }
                 buf[pointer_position + 1] = key;
                 pointer_position++;
                 count++;
-                printf("%s", buf);
+                print_with_pointer(buf, count);
             }
             if (count > 0 && current_command_index >= count_history)
             {

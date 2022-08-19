@@ -129,16 +129,24 @@ void change_command(char *buf, int type)
         current_command_index = count_history - 2;
     strcpy(buf, history_commands[current_command_index]);
 }
+/**
+ * @brief 输出命令（带有光标）
+ * 
+ * @param buf 缓冲区
+ * @param count 缓冲区大小
+ */
 void print_with_pointer(char *buf, int count)
 {
     for (int i = 0; i <= pointer_position; i++)
         printf("%c", buf[i]);
+    //这里要开大一点，不然有问题
     char x[4];
-    memset(x,0,sizeof(x));
+    memset(x, 0, sizeof(x));
     x[0] = " ";
     if (pointer_position != count - 1)
     {
         x[0] = buf[pointer_position + 1];
+        //黑底白字，显示光标
         put_string(x, COLOR_BLACK, COLOR_WHITE);
     }
     else
@@ -146,8 +154,14 @@ void print_with_pointer(char *buf, int count)
     for (int i = pointer_position + 2; i < count; i++)
         printf("%c", buf[i]);
 }
+/**
+ * @brief 清理但不刷新缓冲区
+ * 
+ * @param count 缓冲区大小 
+ */
 void clear_noclear_buf(int count)
 {
+    //这里使用"\b \b"的原因是\b不会刷新背景颜色，所以先退掉字符，在用普通空格覆盖，再去掉空格
     for (int i = 0; i < count; i++)
         printf("\b \b");
     if (pointer_position == count - 1)
@@ -176,7 +190,7 @@ int shell_readline(int fd, char *buf)
             change_command(buf, 1);
             count = strlen(buf);
             pointer_position = count - 1;
-            print_with_pointer(buf,count);
+            print_with_pointer(buf, count);
         }
         //向下方向键
         if (count_history != 0 && key == 0x50 + OFFSET_FUNCTION)
@@ -187,7 +201,7 @@ int shell_readline(int fd, char *buf)
             change_command(buf, -1);
             count = strlen(buf);
             pointer_position = count - 1;
-            print_with_pointer(buf,count);
+            print_with_pointer(buf, count);
         }
         //左方向键
         if (key == 0x4d + OFFSET_FUNCTION)
@@ -195,8 +209,8 @@ int shell_readline(int fd, char *buf)
             clear_noclear_buf(count);
             pointer_position++;
             if (pointer_position >= count)
-                pointer_position = count-1;
-            print_with_pointer(buf,count);
+                pointer_position = count - 1;
+            print_with_pointer(buf, count);
         }
         //右方向键
         if (key == 0x4b + OFFSET_FUNCTION)
@@ -205,12 +219,13 @@ int shell_readline(int fd, char *buf)
             pointer_position--;
             if (pointer_position < -1)
                 pointer_position = -1;
-            print_with_pointer(buf,count);
+            print_with_pointer(buf, count);
         }
         if (key == '\n')
         {
+            //去掉光标
             clear_noclear_buf(count);
-            printf("%s",buf);
+            printf("%s", buf);
             if (count > 0 && current_command_index >= count_history)
             {
                 memset(history_commands[current_command_index - 1], 0, sizeof(history_commands[current_command_index - 1]));
@@ -228,12 +243,15 @@ int shell_readline(int fd, char *buf)
                     if (pointer_position != -1)
                     {
                         clear_noclear_buf(count);
+                        //将所有的向左移动一个位置，移动过去
                         buf[pointer_position] = 0;
                         for (int i = pointer_position + 1; i <= count - 1; i++)
                             buf[i - 1] = buf[i];
+                        //处理最后一个残留
                         buf[count - 1] = 0;
                         pointer_position--;
                         count--;
+                        //显示
                         print_with_pointer(buf, count);
                     }
                 }
@@ -241,6 +259,7 @@ int shell_readline(int fd, char *buf)
             else
             {
                 clear_noclear_buf(count);
+                //与上面的大致相同，这回是向右移动，腾出位置
                 for (int i = count - 1; i >= pointer_position + 1; i--)
                     buf[i + 1] = buf[i];
                 buf[pointer_position + 1] = key;

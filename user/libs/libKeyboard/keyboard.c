@@ -1,6 +1,5 @@
 #include "keyboard.h"
 #include <libc/unistd.h>
-#define OFFSET_FUNCTION 256
 // 功能键标志变量
 static bool shift_l = 0, shift_r = 0, ctrl_l = 0, ctrl_r = 0, alt_l = 0, alt_r = 0;
 static bool gui_l = 0, gui_r = 0, apps = 0, insert = 0, home = 0, pgup = 0, del = 0, end = 0, pgdn = 0, arrow_u = 0, arrow_l = 0, arrow_d = 0, arrow_r = 0;
@@ -428,11 +427,11 @@ int keyboard_analyze_keycode(int fd)
         case 0xc8:
             arrow_u = false;
             key = OTHER_KEY;
-            return 0xc8+OFFSET_FUNCTION;
+            // return 0xc8;
             break;
         case 0x4b:
             arrow_l = true;
-            return 0x4b+OFFSET_FUNCTION;
+            // return 0x4b;
             key = OTHER_KEY;
             break;
         case 0xcb:
@@ -442,7 +441,7 @@ int keyboard_analyze_keycode(int fd)
         case 0x50:
             arrow_d = true;
             key = OTHER_KEY;
-            return 0x50+OFFSET_FUNCTION;
+            // return 0x50;
             break;
         case 0xd0:
             arrow_d = false;
@@ -450,14 +449,13 @@ int keyboard_analyze_keycode(int fd)
             break;
         case 0x4d:
             arrow_r = true;
-            return 0x4d+OFFSET_FUNCTION;
+            // return 0x4d;
             key = OTHER_KEY;
             break;
         case 0xcd:
             arrow_r = false;
             key = OTHER_KEY;
             break;
-
         case 0x35: // 数字小键盘的 / 符号
             kp_forward_slash = true;
             key = OTHER_KEY;

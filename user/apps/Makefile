@@ -1,5 +1,5 @@
 
-user_apps_sub_dirs=shell about
+user_apps_sub_dirs=shell about test
 
 all:
 	@list='$(user_apps_sub_dirs)'; for subdir in $$list; do \

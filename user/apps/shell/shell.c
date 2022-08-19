@@ -7,7 +7,7 @@
 #include <libc/stddef.h>
 #include <libc/sys/stat.h>
 #include "cmd.h"
-
+#define OFFSET_FUNCTION 256
 #define pause_cpu() asm volatile("pause\n\t");
 #define MEM_HISTORY 1024
 /**
@@ -28,6 +28,9 @@ char real_history_commands[MEM_HISTORY][INPUT_BUFFER_SIZE];
 int count_history;
 //现在对应的命令
 int current_command_index;
+
+//现在光标的位置
+int pointer_position;
 /**
  * @brief shell主循环
  *
@@ -57,6 +60,7 @@ void main_loop(int kb_fd)
 
         // 循环读取每一行到buffer
         count_history++;
+        pointer_position = -1;
         int count = shell_readline(kb_fd, input_buffer);
         if (!count || current_command_index < count_history - 1)
             count_history--;
@@ -141,22 +145,36 @@ int shell_readline(int fd, char *buf)
     {
         key = keyboard_analyze_keycode(fd);
         //向上方向键
-        if (count_history != 0 && key == 0xc8)
+        if (count_history != 0 && key == 0xc8 + OFFSET_FUNCTION)
         {
             clear_command(count, buf);
             count = 0;
             //向历史
             change_command(buf, 1);
             count = strlen(buf);
+            pointer_position = count-1;
         }
         //向下方向键
-        if (count_history != 0 && key == 0x50)
+        if (count_history != 0 && key == 0x50 + OFFSET_FUNCTION)
         {
             clear_command(count, buf);
             count = 0;
             //向现在
             change_command(buf, -1);
             count = strlen(buf);
+            pointer_position = count-1;
+        }
+        if (key == 0x4d + OFFSET_FUNCTION)
+        {
+            pointer_position++;
+            if (pointer_position >= count)
+                pointer_position = count-1;
+        }
+        if (key == 0x4b + OFFSET_FUNCTION)
+        {
+            pointer_position--;
+            if (pointer_position < -1)
+                pointer_position = -1;
         }
         if (key == '\n')
         {
@@ -168,20 +186,45 @@ int shell_readline(int fd, char *buf)
             return count;
         }
 
-        if (key && key != 0x50 && key != 0xc8)
+        if (key && key != 0x50 + OFFSET_FUNCTION && key != 0xc8 + OFFSET_FUNCTION &&
+         key != 0x4d + OFFSET_FUNCTION && key != 0x4b + OFFSET_FUNCTION)
         {
             if (key == '\b')
             {
                 if (count > 0)
                 {
-                    buf[--count] = 0;
-                    printf("%c", '\b');
+                    if(pointer_position!=-1)
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            printf("%c", '\b');
+                        }
+                        buf[pointer_position] = 0;
+                        for (int i = pointer_position+1; i <= count-1; i++)
+                        {
+                            buf[i - 1] = buf[i];
+                        }
+                        buf[count-1] = 0;
+                        pointer_position--;
+                        count--;
+                        printf("%s", buf);
+                    }
                 }
             }
             else
             {
-                buf[count++] = key;
-                printf("%c", key);
+                for (int i = 0; i < count; i++)
+                {
+                    printf("%c", '\b');
+                }
+                for (int i = count - 1; i >= pointer_position + 1; i--)
+                {
+                    buf[i + 1] = buf[i];
+                }
+                buf[pointer_position + 1] = key;
+                pointer_position++;
+                count++;
+                printf("%s", buf);
             }
             if (count > 0 && current_command_index >= count_history)
             {

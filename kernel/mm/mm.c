@@ -1,5 +1,6 @@
 #include "mm.h"
 #include "mm-types.h"
+#include "mmio.h"
 #include "slab.h"
 #include <common/printk.h>
 #include <common/kprint.h>
@@ -228,6 +229,7 @@ void mm_init()
     // 初始化slab内存池
     slab_init();
     page_table_init();
+    mmio_init();
 }
 
 /**
@@ -619,4 +621,20 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
         // 在页表中取消映射
     }
     return end_addr;
+}
+
+/**
+ * @brief 创建mmio对应的页结构体
+ *
+ * @param paddr 物理地址
+ * @return struct Page* 创建成功的page
+ */
+struct Page *__create_mmio_page_struct(uint64_t paddr)
+{
+    struct Page *p = (struct Page *)kzalloc(sizeof(struct Page), 0);
+    if (p == NULL)
+        return NULL;
+    p->addr_phys = paddr;
+    page_init(p, PAGE_DEVICE);
+    return p;
 }

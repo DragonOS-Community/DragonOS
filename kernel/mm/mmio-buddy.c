@@ -46,16 +46,6 @@ static __always_inline struct __mmio_buddy_addr_region *__mmio_buddy_create_regi
 }
 
 /**
- * @brief 释放address region结构体
- *
- * @param region 待释放的结构体
- */
-static __always_inline void __release_addr_region(struct __mmio_buddy_addr_region *region)
-{
-    kfree(region);
-}
-
-/**
  * @brief 将给定大小为(2^exp)的地址空间一分为二，并插入下一级的链表中
  *
  * @param region 要被分割的地址区域
@@ -84,9 +74,10 @@ static __always_inline int __buddy_merge_blocks(struct __mmio_buddy_addr_region 
         return -EINVAL;
 
     // === 是一对伙伴，将他们合并
-    // __mmio_pool.free_regions[__exp2index(exp)].num_free -=2;
+    // 减少计数的工作应在该函数外完成
+
     // 释放y
-    __release_addr_region(y);
+    __mmio_buddy_release_addr_region(y);
     // 插入x
     __buddy_add_region_obj(__exp2index(exp + 1), x);
 
@@ -101,7 +92,7 @@ static __always_inline int __buddy_merge_blocks(struct __mmio_buddy_addr_region 
  */
 static __always_inline struct __mmio_buddy_addr_region *__buddy_pop_region(int exp)
 {
-    if (unlikely(&__mmio_pool.free_regions[__exp2index(exp)].list_head))
+    if (unlikely(list_empty(&__mmio_pool.free_regions[__exp2index(exp)].list_head)))
         return NULL;
     struct __mmio_buddy_addr_region *r = container_of(list_next(&__mmio_pool.free_regions[__exp2index(exp)].list_head), struct __mmio_buddy_addr_region, list);
     list_del(&r->list);
@@ -176,7 +167,7 @@ static void __buddy_merge(int exp)
  * @param exp 内存区域的大小(2^exp)
  * @return struct __mmio_buddy_addr_region* 符合要求的内存区域。没有满足要求的时候，返回NULL
  */
-static struct __mmio_buddy_addr_region *__buddy_query_addr_region(int exp)
+struct __mmio_buddy_addr_region *mmio_buddy_query_addr_region(int exp)
 {
     if (exp >= MMIO_BUDDY_MAX_EXP)
         return NULL;
@@ -223,7 +214,7 @@ has_block:; // 有可用的内存块，分配
  * @param exp 内存空间的大小（2^exp）
  * @return int 返回码
  */
-static __always_inline int __buddy_give_back(uint64_t vaddr, int exp)
+int __mmio_buddy_give_back(uint64_t vaddr, int exp)
 {
     // 确保内存对齐，低位都要为0
     if (vaddr & ((1UL << exp) - 1))
@@ -255,6 +246,5 @@ void mmio_buddy_init()
     uint32_t cnt_1g_blocks = (MMIO_TOP - MMIO_BASE) / PAGE_1G_SIZE;
     uint64_t vaddr_base = MMIO_BASE;
     for (uint32_t i = 0; i < cnt_1g_blocks; ++i, vaddr_base += PAGE_1G_SIZE)
-        __buddy_give_back(vaddr_base, PAGE_1G_SHIFT);
-    
+        __mmio_buddy_give_back(vaddr_base, PAGE_1G_SHIFT);
 }

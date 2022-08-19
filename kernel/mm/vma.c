@@ -229,7 +229,7 @@ int __anon_vma_free(struct anon_vma_t *anon_vma)
 
 /**
  * @brief 从anon_vma的管理范围中删除指定的vma
- * (在进入这个函数之前，应该要加锁)
+ * (在进入这个函数之前，应该要对anon_vma加锁)
  * @param vma 将要取消对应的anon_vma管理的vma结构体
  * @return int 返回码
  */
@@ -240,16 +240,20 @@ int __anon_vma_del(struct vm_area_struct *vma)
         return -EINVAL;
 
     list_del(&vma->anon_vma_list);
-    semaphore_down(&vma->anon_vma->sem);
     atomic_dec(&vma->anon_vma->ref_count);
 
+    // 若当前anon_vma的引用计数归零，则意味着可以释放内存页
     if (unlikely(atomic_read(&vma->anon_vma->ref_count) == 0)) // 应当释放该anon_vma
     {
+        // 若页面结构体是mmio创建的，则释放页面结构体
+        if (vma->anon_vma->page->attr & PAGE_DEVICE)
+            kfree(vma->anon_vma->page);
+        else
+            free_pages(vma->anon_vma->page, 1);
         __anon_vma_free(vma->anon_vma);
-        // 释放了anon_vma之后，清理当前vma的关联数据
-        vma->anon_vma = NULL;
-        list_init(&vma->anon_vma_list);
     }
-    else
-        semaphore_up(&vma->anon_vma->sem);
+
+    // 清理当前vma的关联数据
+    vma->anon_vma = NULL;
+    list_init(&vma->anon_vma_list);
 }

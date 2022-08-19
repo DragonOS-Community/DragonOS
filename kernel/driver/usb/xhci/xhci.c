@@ -983,7 +983,7 @@ failed_free_dyn:; // 释放动态申请的内存
 failed:;
     io_mfence();
     // 取消地址映射
-    mm_unmap(xhci_hc[cid].vbase, 65536);
+    mm_unmap_addr(xhci_hc[cid].vbase, 65536);
     io_mfence();
     // 清空数组
     memset((void *)&xhci_hc[cid], 0, sizeof(struct xhci_host_controller_t));

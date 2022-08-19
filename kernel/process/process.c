@@ -22,6 +22,8 @@
 
 #include <ktest/ktest.h>
 
+#include <mm/mmio.h>
+
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
 
@@ -921,7 +923,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
     struct vm_area_struct *vma = current_pcb->mm->vmas;
     while (vma != NULL)
     {
-        if (vma->vm_end > USER_MAX_LINEAR_ADDR)
+        if (vma->vm_end > USER_MAX_LINEAR_ADDR || vma->vm_flags & VM_DONTCOPY)
         {
             vma = vma->vm_next;
             continue;
@@ -997,19 +999,19 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
     struct vm_area_struct *vma = pcb->mm->vmas;
     while (vma != NULL)
     {
+
         struct vm_area_struct *cur_vma = vma;
         vma = cur_vma->vm_next;
 
         uint64_t pa;
-        mm_umap_vma(pcb->mm, cur_vma, &pa);
+        // kdebug("vm start=%#018lx, sem=%d", cur_vma->vm_start, cur_vma->anon_vma->sem.counter);
+        mm_unmap_vma(pcb->mm, cur_vma, &pa);
+
         uint64_t size = (cur_vma->vm_end - cur_vma->vm_start);
 
         // 释放内存
         switch (size)
         {
-        case PAGE_2M_SIZE:
-            free_pages(Phy_to_2M_Page(pa), 1);
-            break;
         case PAGE_4K_SIZE:
             kfree(phys_2_virt(pa));
             break;
@@ -1017,7 +1019,7 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
             break;
         }
         vm_area_del(cur_vma);
-        kfree(cur_vma);
+        vm_area_free(cur_vma);
     }
 
     // 释放顶层页表

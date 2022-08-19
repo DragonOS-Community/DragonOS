@@ -3,6 +3,7 @@
 #include <common/glib.h>
 #include "mm-types.h"
 #include "mm.h"
+#include "slab.h"
 
 #define MMIO_BUDDY_MAX_EXP PAGE_1G_SHIFT
 #define MMIO_BUDDY_MIN_EXP PAGE_4K_SHIFT
@@ -45,7 +46,34 @@ struct mmio_buddy_mem_pool
 };
 
 /**
+ * @brief 释放address region结构体
+ *
+ * @param region 待释放的结构体
+ */
+static __always_inline void __mmio_buddy_release_addr_region(struct __mmio_buddy_addr_region *region)
+{
+    kfree(region);
+}
+
+/**
+ * @brief 归还一块内存空间到buddy
+ *
+ * @param vaddr 虚拟地址
+ * @param exp 内存空间的大小（2^exp）
+ * @return int 返回码
+ */
+int __mmio_buddy_give_back(uint64_t vaddr, int exp);
+
+/**
  * @brief 初始化mmio的伙伴系统
  *
  */
 void mmio_buddy_init();
+
+/**
+ * @brief 从buddy中申请一块指定大小的内存区域
+ *
+ * @param exp 内存区域的大小(2^exp)
+ * @return struct __mmio_buddy_addr_region* 符合要求的内存区域。没有满足要求的时候，返回NULL
+ */
+struct __mmio_buddy_addr_region *mmio_buddy_query_addr_region(int exp);

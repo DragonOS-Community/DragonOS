@@ -2,6 +2,7 @@
 #include "cmd.h"
 #define pause_cpu() asm volatile("pause\n\t");
 #define MEM_HISTORY 1024
+#define LINE_SIZE 180
 /**
  * @brief 循环读取每一行
  *
@@ -99,7 +100,7 @@ void clear_noclear_buf(int count)
     for (int i = 0; i < count; i++)
         printf("\b");
     if (pointer_position == count - 1)
-        printf("\b");
+        printf("\b\b  \b");
     for (int i = 0; i < count; i++)
         printf(" ");
     if (pointer_position == count - 1)
@@ -108,6 +109,10 @@ void clear_noclear_buf(int count)
         printf("\b");
     if (pointer_position == count - 1)
         printf("\b");
+    //第一行（提示符）
+    if(count==LINE_SIZE-14-strlen(shell_current_path)) printf("\b");
+    // 换第二行以及之后
+    if(count%LINE_SIZE==0&&count/LINE_SIZE>=2) printf("\b");
 }
 /**
  * @brief 清除缓冲区
@@ -179,7 +184,7 @@ int shell_readline(int fd, char *buf)
         if (scan1 == 0xE0)
             scan2 = keyboard_get_scancode(fd);
         //向上方向键
-        if (count_history != 0 && scan2 == 0x48)
+        if (count_history != 1 && scan2 == 0x48)
         {
             clear_command(count, buf);
             count = 0;
@@ -190,7 +195,7 @@ int shell_readline(int fd, char *buf)
             print_with_pointer(buf, count);
         }
         //向下方向键
-        if (count_history != 0 && scan2 == 0x50)
+        if (count_history != 1 && scan2 == 0x50)
         {
             clear_command(count, buf);
             count = 0;
@@ -287,6 +292,7 @@ int shell_readline(int fd, char *buf)
                         buf[count - 1] = 0;
                         pointer_position--;
                         count--;
+                        // printf("\n\n%s\n\n",buf);
                         //显示
                         print_with_pointer(buf, count);
                     }

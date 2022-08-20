@@ -236,6 +236,7 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
             if (tmp >= 0)
             {
                 window->vlines.chromatic[window->vline_operating].chars[tmp].c = ' ';
+                window->vlines.chromatic[window->vline_operating].chars[tmp].BKcolor = BKcolor & 0xffffff;
                 textui_refresh_characters(window, window->vline_operating, tmp, 1);
             }
         }

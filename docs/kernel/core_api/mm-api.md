@@ -1,3 +1,5 @@
+(_core_mm_api)=
+
 # 内存管理API
 
 ## SLAB内存池

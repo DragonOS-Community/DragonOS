@@ -12,6 +12,7 @@
 #include <libc/sys/wait.h>
 #include <libc/sys/stat.h>
 #include "cmd_help.h"
+#include "cmd_test.h"
 
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
@@ -34,6 +35,7 @@ struct built_in_cmd_t shell_cmds[] =
         {"about", shell_cmd_about},
         {"free", shell_cmd_free},
         {"help", shell_help},
+        {"pipe", shell_pipe_test},
 
 };
 // 总共的内建命令数量

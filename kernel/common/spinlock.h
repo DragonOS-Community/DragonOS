@@ -19,7 +19,7 @@
 typedef struct
 {
     int8_t lock; // 1:unlocked 0:locked
-} spinlock_t;
+}spinlock_t;
 
 
 /**
@@ -30,11 +30,11 @@ typedef struct
 void spin_lock(spinlock_t *lock)
 {
     __asm__ __volatile__("1:    \n\t"
-                         "lock decq %0   \n\t" // 尝试-1
+                         "lock decb %0   \n\t" // 尝试-1
                          "jns 3f    \n\t"      // 加锁成功，跳转到步骤3
                          "2:    \n\t"          // 加锁失败，稍后再试
                          "pause \n\t"
-                         "cmpq $0, %0   \n\t"
+                         "cmpb $0, %0   \n\t"
                          "jle   2b  \n\t" // 若锁被占用，则继续重试
                          "jmp 1b    \n\t" // 尝试加锁
                          "3:"
@@ -50,7 +50,7 @@ void spin_lock(spinlock_t *lock)
 void spin_unlock(spinlock_t *lock)
 {
     preempt_enable();
-    __asm__ __volatile__("movq $1, %0   \n\t"
+    __asm__ __volatile__("movb $1, %0   \n\t"
                          : "=m"(lock->lock)::"memory");
 }
 
@@ -74,11 +74,11 @@ void spin_init(spinlock_t *lock)
 void spin_lock_no_preempt(spinlock_t *lock)
 {
     __asm__ __volatile__("1:    \n\t"
-                         "lock decq %0   \n\t" // 尝试-1
+                         "lock decb %0   \n\t" // 尝试-1
                          "jns 3f    \n\t"      // 加锁成功，跳转到步骤3
                          "2:    \n\t"          // 加锁失败，稍后再试
                          "pause \n\t"
-                         "cmpq $0, %0   \n\t"
+                         "cmpb $0, %0   \n\t"
                          "jle   2b  \n\t" // 若锁被占用，则继续重试
                          "jmp 1b    \n\t" // 尝试加锁
                          "3:"
@@ -91,7 +91,7 @@ void spin_lock_no_preempt(spinlock_t *lock)
  */
 void spin_unlock_no_preempt(spinlock_t *lock)
 {
-    __asm__ __volatile__("movq $1, %0   \n\t"
+    __asm__ __volatile__("movb $1, %0   \n\t"
                          : "=m"(lock->lock)::"memory");
 }
 
@@ -106,9 +106,9 @@ long spin_trylock(spinlock_t *lock)
     uint64_t tmp_val = 0;
     preempt_disable();
     // 交换tmp_val和lock的值，若tmp_val==1则证明加锁成功
-    asm volatile("lock xchgq %0, %1  \n\t" // 确保只有1个进程能得到锁
+    asm volatile("lock xchg %%bx, %1  \n\t" // 确保只有1个进程能得到锁
                  : "=q"(tmp_val), "=m"(lock->lock)
-                 : "0"(0)
+                 : "b"(0)
                  : "memory");
     if (!tmp_val)
         preempt_enable();

@@ -352,7 +352,12 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     // 获取物理地址对应的页面
     struct Page *pg;
     if (vma->vm_flags & VM_IO) // 对于mmio的内存，创建新的page结构体
-        pg = __create_mmio_page_struct(paddr);
+    {
+        if (unlikely(vma->anon_vma == NULL || vma->anon_vma->page == NULL))
+            pg = __create_mmio_page_struct(paddr);
+        else
+            pg = vma->anon_vma->page;
+    }
     else
         pg = Phy_to_2M_Page(paddr);
 

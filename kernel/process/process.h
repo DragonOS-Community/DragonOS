@@ -213,3 +213,4 @@ extern struct mm_struct initial_mm;
 extern struct thread_struct initial_thread;
 extern union proc_union initial_proc_union;
 extern struct process_control_block *initial_proc[MAX_CPU_NUM];
+int process_fd_alloc(struct vfs_file_t *file);

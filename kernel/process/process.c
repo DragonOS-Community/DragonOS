@@ -1142,4 +1142,23 @@ void process_exit_thread(struct process_control_block *pcb)
 {
 }
 
-// #pragma GCC pop_options
+/**
+ * @brief 申请可用的文件句柄
+ *
+ * @return int
+ */
+int process_fd_alloc(struct vfs_file_t *file)
+{
+    int fd_num = -1;
+    struct vfs_file_t **f = current_pcb->fds;
+
+    for (int i = 0; i < PROC_MAX_FD_NUM; ++i) {
+        /* 找到指针数组中的空位 */
+        if (f[i] == NULL) {
+            fd_num = i;
+            f[i] = file;
+            break;
+        }
+    }
+    return fd_num;
+}

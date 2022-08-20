@@ -2,6 +2,7 @@
 #include <sched/sched.h>
 #include <process/process.h>
 #include <mm/slab.h>
+#include <common/spinlock.h>
 
 /**
  * @brief 初始化等待队列
@@ -27,6 +28,22 @@ void wait_queue_sleep_on(wait_queue_node_t *wait_queue_head)
     current_pcb->state = PROC_UNINTERRUPTIBLE;
     list_append(&wait_queue_head->wait_list, &wait->wait_list);
 
+    sched_cfs();
+}
+
+/**
+ * @brief 在等待队列上进行等待，同时释放自旋锁
+ *
+ * @param wait_queue_head 队列头指针
+ */
+void wait_queue_sleep_on_unlock(wait_queue_node_t *wait_queue_head,
+                                void *lock)
+{
+    wait_queue_node_t *wait = (wait_queue_node_t *)kmalloc(sizeof(wait_queue_node_t), 0);
+    wait_queue_init(wait, current_pcb);
+    current_pcb->state = PROC_UNINTERRUPTIBLE;
+    list_append(&wait_queue_head->wait_list, &wait->wait_list);
+    spin_unlock((spinlock_t *)lock);
     sched_cfs();
 }
 

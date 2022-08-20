@@ -79,6 +79,15 @@ uint64_t sys_sbrk(struct pt_regs *regs);
  */
 uint64_t sys_mkdir(struct pt_regs * regs);
 
+/**
+ * @brief 创建管道
+ * 在pipe.c中实现
+ * @param fd(r8) 文件句柄指针
+ * @param num(r9) 文件句柄个数
+ * @return uint64_t 
+ */
+uint64_t sys_pipe(struct pt_regs * regs);
+
 ul sys_ahci_end_req(struct pt_regs *regs);
 
 // 系统调用的内核入口程序

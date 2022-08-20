@@ -25,3 +25,4 @@ int mkdir(const char *path, mode_t mode);
  * @return int 错误码
  */
 int mstat(struct mstat_t* stat);
+int pipe(int *fd);

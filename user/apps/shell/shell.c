@@ -341,11 +341,6 @@ void main_loop(int kb_fd)
             for (int i = 0; i <= count_history - 2; i++)
                 strcpy(history_commands[i], real_history_commands[i]);
             current_command_index = count_history - 1;
-        }
-        if (count)
-        {
-            char command_origin[strlen(input_buffer)];
-            strcpy(command_origin, input_buffer);
             int cmd_num = parse_command(input_buffer, &argc, &argv);
             printf("\n");
             if (cmd_num >= 0)
@@ -369,6 +364,19 @@ int main()
     main_loop(kb_fd);
     while (1)
         ;
+}
+/**
+ * @brief 清理但不刷新缓冲区
+ *
+ * @param count 缓冲区大小
+ */
+void clear_noclear_buf(int count)
+{
+    //这里使用"\b \b"的原因是\b不会刷新背景颜色，所以先退掉字符，在用普通空格覆盖，再去掉空格
+    for (int i = 0; i < count; i++)
+        printf("\b \b");
+    if (pointer_position == count - 1)
+        printf("\b \b");
 }
 /**
  * @brief 清除缓冲区
@@ -410,7 +418,7 @@ void print_with_pointer(char *buf, int count)
     //这里要开大一点，不然有问题
     char x[4];
     memset(x, 0, sizeof(x));
-    x[0] = " ";
+    x[0] = ' ';
     if (pointer_position != count - 1)
     {
         x[0] = buf[pointer_position + 1];
@@ -421,19 +429,6 @@ void print_with_pointer(char *buf, int count)
         put_string(" ", COLOR_BLACK, COLOR_WHITE);
     for (int i = pointer_position + 2; i < count; i++)
         printf("%c", buf[i]);
-}
-/**
- * @brief 清理但不刷新缓冲区
- *
- * @param count 缓冲区大小
- */
-void clear_noclear_buf(int count)
-{
-    //这里使用"\b \b"的原因是\b不会刷新背景颜色，所以先退掉字符，在用普通空格覆盖，再去掉空格
-    for (int i = 0; i < count; i++)
-        printf("\b \b");
-    if (pointer_position == count - 1)
-        printf("\b \b");
 }
 /**
  * @brief 循环读取每一行
@@ -453,7 +448,7 @@ int shell_readline(int fd, char *buf)
         if (scan1 == 0xE0)
             scan2 = keyboard_get_scancode(fd);
         //向上方向键
-        if (count_history != 0 && scan2 == 0xc8)
+        if (count_history != 0 && scan2 == 0x48)
         {
             clear_command(count, buf);
             count = 0;

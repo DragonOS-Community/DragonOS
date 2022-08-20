@@ -14,7 +14,7 @@ static bool kp_forward_slash = 0, kp_en = 0;
 unsigned char pause_break_scan_code[] = {0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5};
 
 // 第一套键盘扫描码 及其对应的字符
-uint32_t keycode_map_normal[NUM_SCAN_CODES * MAP_COLS] =
+static uint32_t keycode_map_normal[NUM_SCAN_CODES * MAP_COLS] =
     {
         /*scan-code	unShift		Shift		*/
         /*--------------------------------------------------------------*/
@@ -427,11 +427,9 @@ int keyboard_analyze_keycode(int fd)
         case 0xc8:
             arrow_u = false;
             key = OTHER_KEY;
-            // return 0xc8;
             break;
         case 0x4b:
             arrow_l = true;
-            // return 0x4b;
             key = OTHER_KEY;
             break;
         case 0xcb:
@@ -441,7 +439,6 @@ int keyboard_analyze_keycode(int fd)
         case 0x50:
             arrow_d = true;
             key = OTHER_KEY;
-            // return 0x50;
             break;
         case 0xd0:
             arrow_d = false;
@@ -449,7 +446,6 @@ int keyboard_analyze_keycode(int fd)
             break;
         case 0x4d:
             arrow_r = true;
-            // return 0x4d;
             key = OTHER_KEY;
             break;
         case 0xcd:

@@ -593,6 +593,7 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     msi_desc.edge_trigger = info->edge_trigger;
     msi_desc.processor = info->processor;
     msi_desc.pci.msi_attribute.is_64 = 1;
+    msi_desc.pci.msi_attribute.is_msix=1;
     // todo: QEMU是使用msix的，因此要先在pci中实现msix
     io_mfence();
     int retval = pci_enable_msi(&msi_desc);

@@ -503,7 +503,7 @@ void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_
  * @param cap_type c要寻找的capability类型
  * @return uint64_t cap list的偏移量
  */
-uint32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci_dev, int cap_type)
+int32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci_dev, uint32_t cap_type)
 {
     uint32_t cap_offset;
     switch (pci_dev->HeaderType)
@@ -524,7 +524,8 @@ uint32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci
     while (1)
     {
         tmp = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->func, cap_offset);
-        if (tmp & 0xff != cap_type)
+        kdebug("tmp & 0xff=%#010lx",tmp & 0xff);
+        if ((tmp & 0xff) != cap_type)
         {
             if ((tmp & 0xff00) >> 8)
             {

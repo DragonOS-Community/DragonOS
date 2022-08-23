@@ -19,6 +19,13 @@ void pci_init();
 struct pci_device_structure_header_t
 {
     struct List list;
+
+    // 包含msix table地址的bar的mmio基地址
+    uint64_t msix_mmio_vaddr;
+    uint64_t msix_mmio_size;  // msix映射长度
+    uint32_t msix_offset;     // msix表的offset
+    uint16_t msix_table_size; // msix表的表项数量
+
     // ==== 以下三个变量表示该结构体所处的位置
     uint8_t bus;
     uint8_t device;
@@ -43,7 +50,7 @@ struct pci_device_structure_header_t
                            // |     bit7     |    bit6    | Bits 5-4 |     Bits 3-0    |
                            // | BIST Capable | Start BIST | Reserved | Completion Code |
                            // for more details, please visit https://wiki.osdev.org/PCI
-} __attribute__((packed));
+};
 
 /**
  * @brief 表头类型为0x0的pci设备结构
@@ -215,4 +222,4 @@ void pci_get_device_structure(uint8_t class_code, uint8_t sub_class, struct pci_
  * @param cap_type c要寻找的capability类型
  * @return uint64_t cap list的偏移量
  */
-uint32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci_dev, int cap_type);
+int32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci_dev, uint32_t cap_type);

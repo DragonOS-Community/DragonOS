@@ -249,7 +249,8 @@ unsigned long page_init(struct Page *page, ul flags)
     {
         ++page->ref_counts;
         barrier();
-        ++page->zone->total_pages_link;
+        if (page->zone)
+            ++page->zone->total_pages_link;
     }
     page->anon_vma = NULL;
     spin_init(&(page->op_lock));

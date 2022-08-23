@@ -10,6 +10,7 @@ struct msi_msg_t
     uint32_t address_lo;
     uint32_t address_hi;
     uint32_t data;
+    uint32_t vector_control;
 };
 struct pci_msi_desc_t
 {
@@ -28,6 +29,42 @@ struct pci_msi_desc_t
 };
 
 /**
+ * @brief msi capability list的结构
+ *
+ */
+struct pci_msi_cap_t
+{
+    uint8_t cap_id;
+    uint8_t next_off;
+    uint16_t msg_ctrl;
+
+    uint32_t msg_addr_lo;
+    uint32_t msg_addr_hi;
+
+    uint16_t msg_data;
+    uint16_t Rsvd;
+
+    uint32_t mask;
+    uint32_t pending;
+};
+
+/**
+ * @brief MSI-X的capability list结构体
+ * 
+ */
+struct pci_msix_cap_t
+{
+    uint8_t cap_id;
+    uint8_t next_off;
+    uint16_t msg_ctrl;
+
+    uint32_t dword1; // 该DWORD的组成为：[Table Offset][BIR2:0].
+                     // 由于Table Offset是8字节对齐的，因此mask掉该dword的BIR部分，就是table offset的值
+    uint32_t dword2; // 该DWORD的组成为：[Pending Bit Offset][Pending Bit BIR2:0].
+                     // 由于Pending Bit Offset是8字节对齐的，因此mask掉该dword的BIR部分，就是Pending Bit Offset的值
+};
+
+/**
  * @brief msi描述符
  *
  */
@@ -40,7 +77,7 @@ struct msi_desc_t
     struct pci_device_structure_header_t *pci_dev; // 对应的pci设备的结构体
     struct msi_msg_t msg;                          // msi消息
     uint16_t msi_index;                            // msi描述符的index
-    struct pci_msi_desc_t pci;                         // 与pci相关的msi描述符数据
+    struct pci_msi_desc_t pci;                     // 与pci相关的msi描述符数据
 };
 
 /**
@@ -54,7 +91,7 @@ struct msi_desc_t
  *
  * @return 返回码
  */
-int pci_enable_msi(struct msi_desc_t * msi_desc);
+int pci_enable_msi(struct msi_desc_t *msi_desc);
 
 /**
  * @brief 禁用指定设备的msi

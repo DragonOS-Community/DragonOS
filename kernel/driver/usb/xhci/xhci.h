@@ -390,6 +390,7 @@ struct xhci_host_controller_t
     uint32_t page_size;                                        // page size
     uint64_t dcbaap_vaddr;                                     // Device Context Base Address Array Pointer的虚拟地址
     uint64_t cmd_ring_vaddr;                                   // command ring的虚拟地址
+    uint64_t cmd_trb_vaddr;                                    // 下一个要写入的trb的虚拟地址
     uint64_t event_ring_vaddr;                                 // event ring的虚拟地址
     uint64_t event_ring_table_vaddr;                           // event ring table的虚拟地址
     uint8_t cmd_trb_cycle;                                     // 当前command ring cycle

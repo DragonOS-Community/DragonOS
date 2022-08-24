@@ -37,6 +37,8 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs);
 static int xhci_hc_init_intr(int id);
 static int xhci_hc_start_ports(int id);
 
+static int xhci_send_command(int id, struct xhci_TRB_t *trb, const bool do_ring);
+
 hardware_intr_controller xhci_hc_intr_controller =
     {
         .enable = xhci_hc_irq_enable,
@@ -55,9 +57,6 @@ hardware_intr_controller xhci_hc_intr_controller =
     例子：不能在一个32bit的寄存器中的偏移量8的位置开始读取1个字节
             这种情况下，我们必须从32bit的寄存器的0地址处开始读取32bit，然后通过移位的方式得到其中的字节。
 */
-#define xhci_read_cap_reg8(id, offset) (*(uint8_t *)(xhci_hc[id].vbase + offset))
-#define xhci_get_ptr_cap_reg8(id, offset) ((uint8_t *)(xhci_hc[id].vbase + offset))
-#define xhci_write_cap_reg8(id, offset, value) (*(uint8_t *)(xhci_hc[id].vbase + offset) = (uint8_t)value)
 
 #define xhci_read_cap_reg32(id, offset) (*(uint32_t *)(xhci_hc[id].vbase + offset))
 #define xhci_get_ptr_cap_reg32(id, offset) ((uint32_t *)(xhci_hc[id].vbase + offset))
@@ -78,6 +77,11 @@ hardware_intr_controller xhci_hc_intr_controller =
 #define xhci_read_op_reg64(id, offset) (*(uint64_t *)(xhci_hc[id].vbase_op + offset))
 #define xhci_get_ptr_op_reg64(id, offset) ((uint64_t *)(xhci_hc[id].vbase_op + offset))
 #define xhci_write_op_reg64(id, offset, value) (*(uint64_t *)(xhci_hc[id].vbase_op + offset) = (uint64_t)value)
+
+#define xhci_write_mem32(vaddr, value) (*(uint32_t *)(vaddr) = value)
+#define xhci_write_mem64(vaddr, value) (*(uint64_t *)(vaddr) = value)
+#define xhci_read_mem32(vaddr) (*(uint32_t *)(vaddr))
+#define xhci_read_mem64(vaddr) (*(uint64_t *)(vaddr))
 
 /**
  * @brief 计算中断寄存器组虚拟地址
@@ -267,7 +271,7 @@ static int xhci_hc_stop_legacy(int id)
     do
     {
         // 判断当前entry是否为legacy support entry
-        if (xhci_read_cap_reg8(id, current_offset) == XHCI_XECP_ID_LEGACY)
+        if ((xhci_read_cap_reg32(id, current_offset) & 0xff) == XHCI_XECP_ID_LEGACY)
         {
             io_mfence();
             // 接管控制权
@@ -309,7 +313,7 @@ static int xhci_hc_stop_legacy(int id)
 static int xhci_hc_start_sched(int id)
 {
     io_mfence();
-    xhci_write_op_reg32(id, XHCI_OPS_USBCMD, (1 << 0) | (1 >> 2) | (1 << 3));
+    xhci_write_op_reg32(id, XHCI_OPS_USBCMD, (1 << 0) | (1 << 2) | (1 << 3));
     io_mfence();
     usleep(100 * 1000);
 }
@@ -326,12 +330,6 @@ static int xhci_hc_stop_sched(int id)
     xhci_write_op_reg32(id, XHCI_OPS_USBCMD, 0x00);
     io_mfence();
 }
-
-/**
- * @brief
- *
- * @return uint32_t
- */
 
 /**
  * @brief 在Ex capability list中寻找符合指定的协议号的寄存器offset、count、flag信息
@@ -588,17 +586,20 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     struct msi_desc_t msi_desc;
     memset(&msi_desc, 0, sizeof(struct msi_desc_t));
     io_mfence();
+    msi_desc.irq_num = irq_num;
+    msi_desc.msi_index = 0;
     msi_desc.pci_dev = (struct pci_device_structure_header_t *)xhci_hc[cid].pci_dev_hdr;
     msi_desc.assert = info->assert;
     msi_desc.edge_trigger = info->edge_trigger;
     msi_desc.processor = info->processor;
     msi_desc.pci.msi_attribute.is_64 = 1;
-    msi_desc.pci.msi_attribute.is_msix=1;
+    msi_desc.pci.msi_attribute.is_msix = 1;
     // todo: QEMU是使用msix的，因此要先在pci中实现msix
     io_mfence();
     int retval = pci_enable_msi(&msi_desc);
     kdebug("pci retval = %d", retval);
     kdebug("xhci irq %d installed.", irq_num);
+
     return 0;
 }
 
@@ -764,6 +765,7 @@ static int xhci_hc_start_ports(int id)
         }
     }
     kinfo("xHCI controller %d: Started %d ports.", id, cnt);
+    return 0;
 }
 
 /**
@@ -834,6 +836,79 @@ static int xhci_hc_init_intr(int id)
 }
 
 /**
+ * @brief 写入doorbell寄存器
+ *
+ * @param id 主机控制器id
+ * @param slot_id usb控制器插槽id（0用作命令门铃，其他的用于具体的设备的门铃）
+ * @param value 要写入的值
+ */
+static __always_inline void __xhci_write_doorbell(const int id, const uint16_t slot_id, const uint32_t value)
+{
+    // 确保写入门铃寄存器之前，所有的写操作均已完成
+    io_sfence();
+    xhci_write_cap_reg32(id, xhci_hc[id].db_offset + slot_id * sizeof(uint32_t), value);
+    io_sfence();
+}
+
+/**
+ * @brief 往xhci控制器发送命令
+ *
+ * @param id xhci控制器号
+ * @param trb 传输请求块
+ * @param do_ring 是否通知doorbell register
+ * @return int 错误码
+ */
+static int xhci_send_command(int id, struct xhci_TRB_t *trb, const bool do_ring)
+{
+    uint64_t origin_trb_vaddr = xhci_hc[id].cmd_trb_vaddr;
+
+    // 必须先写入参数和状态数据，最后写入command
+    xhci_write_mem64(xhci_hc[id].cmd_trb_vaddr, trb->param);        // 参数
+    xhci_write_mem32(xhci_hc[id].cmd_trb_vaddr + 8, trb->status);   // 状态
+    xhci_write_mem32(xhci_hc[id].cmd_trb_vaddr + 12, trb->command); // 命令
+
+    xhci_hc[id].cmd_trb_vaddr += sizeof(struct xhci_TRB_t); // 跳转到下一个trb
+
+    {
+        // 如果下一个trb是link trb,则将下一个要操作的地址是设置为第一个trb
+        struct xhci_TRB_normal_t *ptr = (struct xhci_TRB_normal_t *)xhci_hc[id].cmd_trb_vaddr;
+        if (ptr->TRB_type == TRB_TYPE_LINK)
+        {
+            ptr->cycle = xhci_hc[id].cmd_trb_cycle;
+            xhci_hc[id].cmd_trb_vaddr = xhci_hc[id].cmd_ring_vaddr;
+            xhci_hc[id].cmd_trb_cycle ^= 1;
+        }
+    }
+
+    if (do_ring) // 按响命令门铃
+    {
+        kdebug("to ring..");
+        __xhci_write_doorbell(id, 0, 0);
+        kdebug("ring..");
+        // 等待中断产生
+        int timer = 20;
+
+        // Now wait for the interrupt to happen
+        // We use bit 31 of the command dword since it is reserved
+
+        while (timer && ((xhci_read_mem32(origin_trb_vaddr + 12) & (1 << 31)) == 0))
+        {
+            usleep(1000);
+            --timer;
+        }
+        uint32_t x = xhci_read_cap_reg32(id, xhci_hc[id].rts_offset + 0x20);
+        kdebug("ip=%#010lx", x);
+        if (timer == 0)
+            kwarn("USB xHCI Command Interrupt wait timed out.");
+        else
+        {
+            kdebug("interrupt done");
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief 初始化xhci控制器
  *
  * @param header 指定控制器的pci device头部
@@ -861,7 +936,12 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     xhci_hc[cid].controller_id = cid;
     xhci_hc[cid].pci_dev_hdr = dev_hdr;
     io_mfence();
-    pci_write_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0x4, 0x0006); // mem I/O access enable and bus master enable
+    {
+        uint32_t tmp = pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0x4);
+        tmp |= 0x6;
+        // mem I/O access enable and bus master enable
+        pci_write_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0x4, tmp);
+    }
     io_mfence();
     // 为当前控制器映射寄存器地址空间
     xhci_hc[cid].vbase = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + XHCI_MAPPING_OFFSET + 65536 * xhci_hc[cid].controller_id;
@@ -883,7 +963,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
 
     // kdebug("hcc1.xECP=%#010lx", hcc1.xECP);
     // 计算operational registers的地址
-    xhci_hc[cid].vbase_op = xhci_hc[cid].vbase + xhci_read_cap_reg8(cid, XHCI_CAPS_CAPLENGTH);
+    xhci_hc[cid].vbase_op = xhci_hc[cid].vbase + (xhci_read_cap_reg32(cid, XHCI_CAPS_CAPLENGTH) & 0xff);
     io_mfence();
     xhci_hc[cid].db_offset = xhci_read_cap_reg32(cid, XHCI_CAPS_DBOFF) & (~0x3); // bits [1:0] reserved
     io_mfence();
@@ -894,13 +974,18 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     xhci_hc[cid].context_size = (hcc1.csz) ? 64 : 32;
 
     if (iversion < 0x95)
-    {
         kwarn("Unsupported/Unknowned xHCI controller version: %#06x. This may cause unexpected behavior.", iversion);
-    }
 
+    {
+
+        // Write to the FLADJ register incase the BIOS didn't
+        uint32_t tmp = pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0x60);
+        tmp |= (0x20 << 8);
+        pci_write_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0x60, tmp);
+    }
     // if it is a Panther Point device, make sure sockets are xHCI controlled.
     if (((pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0) & 0xffff) == 0x8086) &&
-        ((pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 2) & 0xffff) == 0x1E31) &&
+        (((pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 0) >> 16) & 0xffff) == 0x1E31) &&
         ((pci_read_config(dev_hdr->header.bus, dev_hdr->header.device, dev_hdr->header.func, 8) & 0xff) == 4))
     {
         kdebug("Is a Panther Point device");
@@ -939,6 +1024,8 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     io_mfence();
     // 创建command ring
     xhci_hc[cid].cmd_ring_vaddr = xhci_create_ring(XHCI_CMND_RING_TRBS);
+    xhci_hc[cid].cmd_trb_vaddr = xhci_hc[cid].cmd_ring_vaddr;
+
     if (unlikely(!xhci_is_aligned64(xhci_hc[cid].cmd_ring_vaddr))) // 地址不是按照64byte对齐
     {
         kerror("cmd ring isn't 64 byte aligned.");
@@ -962,10 +1049,22 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
 
     FAIL_ON_TO(xhci_hc_init_intr(cid), failed_free_dyn);
     io_mfence();
+
     ++xhci_ctrl_count;
     io_mfence();
     spin_unlock(&xhci_controller_init_lock);
     io_mfence();
+
+    // 发送nop
+    struct xhci_TRB_normal_t nop_trb = {0};
+    nop_trb.cycle = xhci_hc[cid].cmd_trb_cycle;
+    nop_trb.TRB_type = TRB_TYPE_NO_OP;
+    // nop_trb.ioc = 1;
+    kdebug("to send nop TRB");
+    xhci_send_command(cid, &nop_trb, true);
+    xhci_send_command(cid, &nop_trb, true);
+    kdebug("nop TRB send OK");
+
     return;
 
 failed_free_dyn:; // 释放动态申请的内存

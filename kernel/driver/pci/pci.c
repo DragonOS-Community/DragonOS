@@ -70,6 +70,7 @@ uint pci_write_config(uchar bus, uchar slot, uchar func, uchar offset, uint32_t 
     // 构造pci配置空间地址
     uint address = (uint)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((uint)0x80000000));
     io_out32(PORT_PCI_CONFIG_ADDRESS, address);
+
     // 写入数据
     io_out32(PORT_PCI_CONFIG_DATA, data);
 

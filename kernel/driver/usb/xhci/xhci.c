@@ -83,6 +83,11 @@ hardware_intr_controller xhci_hc_intr_controller =
 #define xhci_read_mem32(vaddr) (*(uint32_t *)(vaddr))
 #define xhci_read_mem64(vaddr) (*(uint64_t *)(vaddr))
 
+// 读取xhci中断寄存器组的值
+#define xhci_read_intr_reg32(id, set_id, offset) (*(uint32_t *)(xhci_hc[id].vbase + xhci_hc[id].rts_offset + 0x20 * (set_id + 1) + offset))
+// 向xhci中断寄存器组写入值
+#define xhci_write_intr_reg32(id, set_id, offset, value) (*(uint32_t *)(xhci_hc[id].vbase + xhci_hc[id].rts_offset + 0x20 * (set_id + 1) + offset) = value)
+
 /**
  * @brief 计算中断寄存器组虚拟地址
  * @param id 主机控制器id
@@ -129,47 +134,6 @@ hardware_intr_controller xhci_hc_intr_controller =
         ptr->cycle = 1;                                                          \
     } while (0)
 
-// Common TRB types
-enum
-{
-    TRB_TYPE_NORMAL = 1,
-    TRB_TYPE_SETUP_STAGE,
-    TRB_TYPE_DATA_STAGE,
-    TRB_TYPE_STATUS_STAGE,
-    TRB_TYPE_ISOCH,
-    TRB_TYPE_LINK,
-    TRB_TYPE_EVENT_DATA,
-    TRB_TYPE_NO_OP,
-    TRB_TYPE_ENABLE_SLOT,
-    TRB_TYPE_DISABLE_SLOT = 10,
-
-    TRB_TYPE_ADDRESS_DEVICE = 11,
-    TRB_TYPE_CONFIG_EP,
-    TRB_TYPE_EVALUATE_CONTEXT,
-    TRB_TYPE_RESET_EP,
-    TRB_TYPE_STOP_EP = 15,
-    TRB_TYPE_SET_TR_DEQUEUE,
-    TRB_TYPE_RESET_DEVICE,
-    TRB_TYPE_FORCE_EVENT,
-    TRB_TYPE_DEG_BANDWIDTH,
-    TRB_TYPE_SET_LAT_TOLERANCE = 20,
-
-    TRB_TYPE_GET_PORT_BAND = 21,
-    TRB_TYPE_FORCE_HEADER,
-    TRB_TYPE_NO_OP_CMD, // 24 - 31 = reserved
-
-    TRB_TYPE_TRANS_EVENT = 32,
-    TRB_TYPE_COMMAND_COMPLETION,
-    TRB_TYPE_PORT_STATUS_CHANGE,
-    TRB_TYPE_BANDWIDTH_REQUEST,
-    TRB_TYPE_DOORBELL_EVENT,
-    TRB_TYPE_HOST_CONTROLLER_EVENT = 37,
-    TRB_TYPE_DEVICE_NOTIFICATION,
-    TRB_TYPE_MFINDEX_WRAP,
-    // 40 - 47 = reserved
-    // 48 - 63 = Vendor Defined
-};
-
 /**
  * @brief 在controller数组之中寻找可用插槽
  *
@@ -187,6 +151,32 @@ static int xhci_hc_find_available_id()
             return i;
     }
     return -1;
+}
+
+/**
+ * @brief 从指定地址读取trb
+ *
+ * @param trb 要存储到的trb的地址
+ * @param address 待读取trb的地址
+ */
+static __always_inline void xhci_get_trb(struct xhci_TRB_t *trb, const uint32_t address)
+{
+    trb->param = xhci_read_mem64(address);
+    trb->status = xhci_read_mem32(address + 8);
+    trb->command = xhci_read_mem32(address + 12);
+}
+
+/**
+ * @brief 将给定的trb写入指定的地址
+ *
+ * @param trb 源trb
+ * @param address 拷贝的目标地址
+ */
+static __always_inline void xhci_set_trb(struct xhci_TRB_t *trb, const uint32_t address)
+{
+    xhci_write_mem64(address, trb->param);
+    xhci_write_mem32(address + 8, trb->status);
+    xhci_write_mem32(address + 12, trb->command);
 }
 
 /**
@@ -594,7 +584,6 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     msi_desc.processor = info->processor;
     msi_desc.pci.msi_attribute.is_64 = 1;
     msi_desc.pci.msi_attribute.is_msix = 1;
-    // todo: QEMU是使用msix的，因此要先在pci中实现msix
     io_mfence();
     int retval = pci_enable_msi(&msi_desc);
     kdebug("pci retval = %d", retval);
@@ -624,8 +613,94 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
 {
     // todo: handle irq
     kdebug("USB irq received.");
-}
 
+    /*
+        写入usb status寄存器，以表明当前收到了中断,清除usb status寄存器中的EINT位
+        需要先清除这个位，再清除interrupter中的pending bit）
+    */
+    xhci_write_op_reg32(cid, XHCI_OPS_USBSTS, xhci_read_op_reg32(cid, XHCI_OPS_USBSTS));
+
+    // 读取第0个usb interrupter的intr management寄存器
+    const uint32_t iman0 = xhci_read_intr_reg32(cid, 0, XHCI_IR_MAN);
+    kdebug("iman0=%d", iman0);
+    if ((iman0 & 3) == 3) // 中断被启用，且pending不为0
+    {
+        // 写入1以清除该interrupter的pending bit
+        xhci_write_intr_reg32(cid, 0, XHCI_IR_MAN, iman0 | 3);
+
+        struct xhci_TRB_t event_trb, origin_trb; // event ring trb以及其对应的command trb
+        uint64_t origin_vaddr;
+        // 暂存当前trb的起始地址
+        uint64_t last_event_ring_vaddr = xhci_hc[cid].current_event_ring_vaddr;
+
+        xhci_get_trb(&event_trb, xhci_hc[cid].current_event_ring_vaddr);
+
+        while ((event_trb.command & 1) == xhci_hc[cid].current_event_ring_cycle) // 循环处理处于当前周期的所有event ring
+        {
+            struct xhci_TRB_cmd_complete_t *event_trb_ptr = (struct xhci_TRB_cmd_complete_t *)&event_trb;
+            if ((event_trb.command & (1 << 2)) == 0) // 当前event trb不是由于short packet产生的
+            {
+                switch (event_trb_ptr->code) // 判断它的完成码
+                {
+                case TRB_COMP_TRB_SUCCESS: // trb执行成功，则将结果返回到对应的command ring的trb里面
+
+                    switch (event_trb_ptr->TRB_type) // 根据event trb类型的不同，采取不同的措施
+                    {
+                    case TRB_TYPE_COMMAND_COMPLETION: // 命令已经完成
+                        origin_vaddr = event_trb.param;
+                        // 获取对应的command trb
+                        xhci_get_trb(&origin_trb, origin_vaddr);
+
+                        switch (((struct xhci_TRB_normal_t *)&origin_trb)->TRB_type)
+                        {
+                        case TRB_TYPE_ENABLE_SLOT: // 源命令为enable slot
+                            // 将slot id返回到命令TRB的command字段中
+                            origin_trb.command &= 0x00ffffff;
+                            origin_trb.command |= (event_trb.command & 0xff000000);
+                            origin_trb.status = event_trb.status;
+                            break;
+                        default:
+                            origin_trb.status = event_trb.status;
+                            break;
+                        }
+
+                        // 标记该命令已经执行完成
+                        origin_trb.status |= XHCI_IRQ_DONE;
+                        // 将command trb写入到表中
+                        xhci_set_trb(&origin_trb, origin_vaddr);
+                        break;
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+            }
+            else // 当前TRB是由short packet产生的
+            {
+                switch (event_trb_ptr->TRB_type)
+                {
+                case TRB_TYPE_TRANS_EVENT: // 当前 event trb是 transfer event TRB
+                    // If SPD was encountered in this TD, comp_code will be SPD, else it should be SUCCESS (specs 4.10.1.1)
+                    xhci_write_mem32(event_trb.param, (event_trb.status | XHCI_IRQ_DONE)); // return code + bytes *not* transferred
+                    break;
+
+                default:
+                    break;
+                }
+            }
+
+            // 获取下一个event ring TRB
+            last_event_ring_vaddr = xhci_hc[cid].current_event_ring_vaddr;
+            xhci_hc[cid].current_event_ring_vaddr += sizeof(struct xhci_TRB_t);
+            xhci_get_trb(&event_trb, xhci_hc[cid].current_event_ring_vaddr);
+        }
+
+        // 当前event ring cycle的TRB处理结束
+        // 更新dequeue指针, 并清除event handler busy标志位
+        xhci_write_intr_reg64(cid, 0, XHCI_IR_DEQUEUE, last_event_ring_vaddr | (1 << 3));
+    }
+}
 /**
  * @brief 重置端口
  *
@@ -795,6 +870,7 @@ static int xhci_hc_init_intr(int id)
     if (unlikely((int64_t)(retval) == -ENOMEM))
         return -ENOMEM;
     xhci_hc[id].event_ring_table_vaddr = retval;
+    xhci_hc[id].current_event_ring_vaddr = xhci_hc[id].event_ring_vaddr; // 设置驱动程序要读取的下一个event ring trb的地址
     retval = 0;
 
     xhci_hc[id].current_event_ring_cycle = 1;
@@ -1005,9 +1081,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
 
     // ========== 设置USB host controller =========
     // 获取页面大小
-    kdebug("ops pgsize=%#010lx", xhci_read_op_reg32(cid, XHCI_OPS_PAGESIZE));
     xhci_hc[cid].page_size = (xhci_read_op_reg32(cid, XHCI_OPS_PAGESIZE) & 0xffff) << 12;
-    kdebug("page size=%d", xhci_hc[cid].page_size);
     io_mfence();
     // 获取设备上下文空间
     xhci_hc[cid].dcbaap_vaddr = (uint64_t)kmalloc(2048, 0); // 分配2KB的设备上下文地址数组空间
@@ -1058,8 +1132,8 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     // 发送nop
     struct xhci_TRB_normal_t nop_trb = {0};
     nop_trb.cycle = xhci_hc[cid].cmd_trb_cycle;
-    nop_trb.TRB_type = TRB_TYPE_NO_OP;
-    // nop_trb.ioc = 1;
+    nop_trb.TRB_type = TRB_TYPE_ENABLE_SLOT;
+    nop_trb.ioc = 1;
     kdebug("to send nop TRB");
     xhci_send_command(cid, &nop_trb, true);
     xhci_send_command(cid, &nop_trb, true);

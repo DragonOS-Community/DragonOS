@@ -7,6 +7,8 @@
 #define XHCI_MAX_ROOT_HUB_PORTS 128 // 本驱动程序最大支持127个root hub 端口（第0个保留）
 
 // ========== irq BEGIN ===========
+
+#define XHCI_IRQ_DONE (1<<31)   // 当command trb 的status的第31位被驱动程序置位时，表明该trb已经执行完成（这是由于xhci规定，第31位可以由驱动程序自行决定用途）
 /**
  * @brief 每个xhci控制器的中断向量号
  *
@@ -393,9 +395,93 @@ struct xhci_host_controller_t
     uint64_t cmd_trb_vaddr;                                    // 下一个要写入的trb的虚拟地址
     uint64_t event_ring_vaddr;                                 // event ring的虚拟地址
     uint64_t event_ring_table_vaddr;                           // event ring table的虚拟地址
+    uint64_t current_event_ring_vaddr;                         // 下一个要读取的event TRB的虚拟地址
     uint8_t cmd_trb_cycle;                                     // 当前command ring cycle
     uint8_t current_event_ring_cycle;                          // 当前event ring cycle
     struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
+};
+
+// Common TRB types
+enum
+{
+    TRB_TYPE_NORMAL = 1,
+    TRB_TYPE_SETUP_STAGE,
+    TRB_TYPE_DATA_STAGE,
+    TRB_TYPE_STATUS_STAGE,
+    TRB_TYPE_ISOCH,
+    TRB_TYPE_LINK,
+    TRB_TYPE_EVENT_DATA,
+    TRB_TYPE_NO_OP,
+    TRB_TYPE_ENABLE_SLOT,
+    TRB_TYPE_DISABLE_SLOT = 10,
+
+    TRB_TYPE_ADDRESS_DEVICE = 11,
+    TRB_TYPE_CONFIG_EP,
+    TRB_TYPE_EVALUATE_CONTEXT,
+    TRB_TYPE_RESET_EP,
+    TRB_TYPE_STOP_EP = 15,
+    TRB_TYPE_SET_TR_DEQUEUE,
+    TRB_TYPE_RESET_DEVICE,
+    TRB_TYPE_FORCE_EVENT,
+    TRB_TYPE_DEG_BANDWIDTH,
+    TRB_TYPE_SET_LAT_TOLERANCE = 20,
+
+    TRB_TYPE_GET_PORT_BAND = 21,
+    TRB_TYPE_FORCE_HEADER,
+    TRB_TYPE_NO_OP_CMD, // 24 - 31 = reserved
+
+    TRB_TYPE_TRANS_EVENT = 32,
+    TRB_TYPE_COMMAND_COMPLETION,
+    TRB_TYPE_PORT_STATUS_CHANGE,
+    TRB_TYPE_BANDWIDTH_REQUEST,
+    TRB_TYPE_DOORBELL_EVENT,
+    TRB_TYPE_HOST_CONTROLLER_EVENT = 37,
+    TRB_TYPE_DEVICE_NOTIFICATION,
+    TRB_TYPE_MFINDEX_WRAP,
+    // 40 - 47 = reserved
+    // 48 - 63 = Vendor Defined
+};
+
+// event ring trb的完成码
+enum
+{
+    TRB_COMP_TRB_SUCCESS = 1,
+    TRB_COMP_DATA_BUFFER_ERROR,
+    TRB_COMP_BABBLE_DETECTION,
+    TRB_COMP_TRANSACTION_ERROR,
+    TRB_COMP_TRB_ERROR,
+    TRB_COMP_STALL_ERROR,
+    TRB_COMP_RESOURCE_ERROR = 7,
+    TRB_COMP_BANDWIDTH_ERROR,
+    TRB_COMP_NO_SLOTS_ERROR,
+    TRB_COMP_INVALID_STREAM_TYPE,
+    TRB_COMP_SLOT_NOT_ENABLED,
+    TRB_COMP_EP_NOT_ENABLED,
+    TRB_COMP_SHORT_PACKET = 13,
+    TRB_COMP_RING_UNDERRUN,
+    TRB_COMP_RUNG_OVERRUN,
+    TRB_COMP_VF_EVENT_RING_FULL,
+    TRB_COMP_PARAMETER_ERROR,
+    TRB_COMP_BANDWITDH_OVERRUN,
+    TRB_COMP_CONTEXT_STATE_ERROR = 19,
+    TRB_COMP_NO_PING_RESPONSE,
+    TRB_COMP_EVENT_RING_FULL,
+    TRB_COMP_INCOMPATIBLE_DEVICE,
+    TRB_COMP_MISSED_SERVICE,
+    TRB_COMP_COMMAND_RING_STOPPED = 24,
+    TRB_COMP_COMMAND_ABORTED,
+    TRB_COMP_STOPPED,
+    TRB_COMP_STOPPER_LENGTH_ERROR,
+    TRB_COMP_RESERVED,
+    TRB_COMP_ISOCH_BUFFER_OVERRUN,
+    TRB_COMP_EVERN_LOST = 32,
+    TRB_COMP_UNDEFINED,
+    TRB_COMP_INVALID_STREAM_ID,
+    TRB_COMP_SECONDARY_BANDWIDTH,
+    TRB_COMP_SPLIT_TRANSACTION
+    /* 37 - 191 reserved */
+    /* 192 - 223 vender defined errors */
+    /* 224 - 225 vendor defined info */
 };
 
 /**

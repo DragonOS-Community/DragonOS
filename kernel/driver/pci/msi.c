@@ -23,6 +23,7 @@ static __always_inline struct pci_msix_cap_t __msi_read_msix_cap_list(struct msi
     struct pci_msix_cap_t cap_list = {0};
     uint32_t dw0;
     dw0 = pci_read_config(msi_desc->pci_dev->bus, msi_desc->pci_dev->device, msi_desc->pci_dev->func, cap_off);
+    io_lfence();
     cap_list.cap_id = dw0 & 0xff;
     cap_list.next_off = (dw0 >> 8) & 0xff;
     cap_list.msg_ctrl = (dw0 >> 16) & 0xffff;
@@ -82,7 +83,7 @@ static __always_inline int __msix_map_table(struct pci_device_structure_header_t
     mmio_create(pci_dev->msix_mmio_size, VM_IO | VM_DONTCOPY, &pci_dev->msix_mmio_vaddr, &pci_dev->msix_mmio_size);
     pci_dev->msix_mmio_vaddr &= (~0xf);
     uint32_t bar = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->func, bar_off);
-    kdebug("pci_dev->msix_mmio_vaddr=%#018lx, bar=%#010lx, table offset=%#010lx, table_size=%#010lx, mmio_size=%d", pci_dev->msix_mmio_vaddr, bar, pci_dev->msix_offset, pci_dev->msix_table_size, pci_dev->msix_mmio_size);
+    // kdebug("pci_dev->msix_mmio_vaddr=%#018lx, bar=%#010lx, table offset=%#010lx, table_size=%#010lx, mmio_size=%d", pci_dev->msix_mmio_vaddr, bar, pci_dev->msix_offset, pci_dev->msix_table_size, pci_dev->msix_mmio_size);
 
     // 将msix table映射到页表
     mm_map(&initial_mm, pci_dev->msix_mmio_vaddr, pci_dev->msix_mmio_size, bar);
@@ -98,16 +99,19 @@ static __always_inline int __msix_map_table(struct pci_device_structure_header_t
 static __always_inline void __msix_set_entry(struct msi_desc_t *msi_desc)
 {
     uint64_t *ptr = (uint64_t *)(msi_desc->pci_dev->msix_mmio_vaddr + msi_desc->pci_dev->msix_offset + msi_desc->msi_index * 16);
-    *ptr = (msi_desc->msg.address_hi << 32) | (msi_desc->msg.address_lo);
+    *ptr = ((uint64_t)(msi_desc->msg.address_hi) << 32) | (msi_desc->msg.address_lo);
+    io_mfence();
     ++ptr;
-    *ptr = (msi_desc->msg.vector_control << 32) | (msi_desc->msg.data);
+    io_mfence();
+    *ptr = ((uint64_t)(msi_desc->msg.vector_control) << 32) | (msi_desc->msg.data);
+    io_mfence();
 }
 
 /**
  * @brief 清空设备的msix table的指定表项
- * 
+ *
  * @param pci_dev pci设备
- * @param msi_index 表项号 
+ * @param msi_index 表项号
  */
 static __always_inline void __msix_clear_entry(struct pci_device_structure_header_t *pci_dev, uint16_t msi_index)
 {
@@ -160,21 +164,25 @@ int pci_enable_msi(struct msi_desc_t *msi_desc)
 
     if (msi_desc->pci.msi_attribute.is_msix) // MSI-X
     {
+        kdebug("is msix");
         // 读取msix的信息
         struct pci_msix_cap_t cap = __msi_read_msix_cap_list(msi_desc, cap_ptr);
         // 映射msix table
         __msix_map_table(msi_desc->pci_dev, &cap);
-
+        io_mfence();
         // 设置msix的中断
         __msix_set_entry(msi_desc);
+        io_mfence();
 
-        // 使能msi
+        // todo: disable intx
+        // 使能msi-x
         tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
-        tmp |= (1 << 16);
+        tmp |= (1 << 31);
         pci_write_config(ptr->bus, ptr->device, ptr->func, cap_ptr, tmp);
     }
     else
     {
+        kdebug("is msi");
         tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
         message_control = (tmp >> 16) & 0xffff;
 

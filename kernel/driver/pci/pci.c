@@ -70,6 +70,7 @@ uint pci_write_config(uchar bus, uchar slot, uchar func, uchar offset, uint32_t 
     // 构造pci配置空间地址
     uint address = (uint)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((uint)0x80000000));
     io_out32(PORT_PCI_CONFIG_ADDRESS, address);
+
     // 写入数据
     io_out32(PORT_PCI_CONFIG_DATA, data);
 
@@ -524,12 +525,11 @@ int32_t pci_enumerate_capability_list(struct pci_device_structure_header_t *pci_
     while (1)
     {
         tmp = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->func, cap_offset);
-        kdebug("tmp & 0xff=%#010lx",tmp & 0xff);
         if ((tmp & 0xff) != cap_type)
         {
-            if ((tmp & 0xff00) >> 8)
+            if (((tmp & 0xff00) >> 8))
             {
-                cap_offset = (tmp & 0xff00);
+                cap_offset = (tmp & 0xff00)>>8;
                 continue;
             }
             else

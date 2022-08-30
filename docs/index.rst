@@ -21,6 +21,7 @@
    kernel/core_api/index
    kernel/locking/index
    kernel/process_management/index
+   kernel/sched/index
    kernel/memory_management/index
    kernel/filesystem/index
    kernel/debug/index

@@ -24,8 +24,6 @@ typedef struct
     wait_queue_node_t wait_queue;
 } semaphore_t;
 
-void __semaphore_invoke_sched();
-void __semaphore_sched_enqueue(struct process_control_block *pcb);
 
 /**
  * @brief 初始化信号量

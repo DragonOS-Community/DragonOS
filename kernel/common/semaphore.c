@@ -35,11 +35,7 @@ void semaphore_up(semaphore_t *sema)
         list_del(&wq->wait_list);
 
         wq->pcb->state = PROC_RUNNING;
-<<<<<<< HEAD
-        shced_enqueue(wq->pcb);
-=======
         sched_enqueue(wq->pcb);
->>>>>>> 45a4e5603d4624d81a58a34969799294fa1244c6
 
         // 当前进程缺少需要的资源，立即标为需要被调度
         current_pcb->flags |= PF_NEED_SCHED;

@@ -1,8 +1,6 @@
 #pragma once
 #include <common/glib.h>
-// #include <common/spinlock.h>
 
-// #include <process/process.h>
 /**
  * @brief 信号量的等待队列
  *

@@ -510,7 +510,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     if (current_pcb->flags & PF_NEED_SCHED)
     {
         io_mfence();
-        sched_cfs();
+        sched();
     }
 }
 

@@ -48,6 +48,16 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
 }
 
 /**
+ * @brief 包裹shced_cfs_enqueue(),将PCB加入就绪队列
+ * 
+ * @param pcb
+ */
+void sched_enqueue(struct process_control_block *pcb)
+{
+    sched_cfs_enqueue(pcb);
+}
+
+/**
  * @brief 调度函数
  *
  */
@@ -116,6 +126,15 @@ void sched_cfs()
     }
 
     sti();
+}
+
+/**
+ * @brief 包裹sched_cfs(),调度函数
+ * 
+ */
+void sched()
+{
+    sched_cfs();
 }
 
 /**

@@ -21,12 +21,24 @@ extern struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
 void sched_cfs();
 
 /**
+ * @brief 包裹sched_cfs()，调度函数
+ * 
+ */
+void sched();
+
+/**
  * @brief 将PCB加入就绪队列
  *
  * @param pcb
  */
 void sched_cfs_enqueue(struct process_control_block *pcb);
 
+/**
+ * @brief 包裹sched_enqueue(),将PCB加入就绪队列
+ * 
+ * @param pcb
+ */
+void sched_enqueue(struct process_control_block *pcb);
 
 /**
  * @brief 从就绪队列中取出PCB

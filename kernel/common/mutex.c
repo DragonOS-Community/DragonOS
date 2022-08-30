@@ -17,7 +17,7 @@ void mutex_init(mutex_t *lock)
 static void __mutex_sleep()
 {
     current_pcb->state = PROC_UNINTERRUPTIBLE;
-    sched_cfs();
+    sched();
 }
 
 static void __mutex_acquire(mutex_t *lock)

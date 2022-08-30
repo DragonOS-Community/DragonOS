@@ -546,7 +546,7 @@ ul process_do_exit(ul code)
     sti();
 
     process_exit_notify();
-    sched_cfs();
+    sched();
 
     while (1)
         pause();
@@ -801,7 +801,7 @@ struct process_control_block *process_get_pcb(long pid)
 void process_wakeup(struct process_control_block *pcb)
 {
     pcb->state = PROC_RUNNING;
-    sched_cfs_enqueue(pcb);
+    sched_enqueue(pcb);
 }
 
 /**
@@ -812,7 +812,7 @@ void process_wakeup(struct process_control_block *pcb)
 void process_wakeup_immediately(struct process_control_block *pcb)
 {
     pcb->state = PROC_RUNNING;
-    sched_cfs_enqueue(pcb);
+    sched_enqueue(pcb);
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
     current_pcb->flags |= PF_NEED_SCHED;
 }

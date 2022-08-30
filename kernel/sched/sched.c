@@ -4,25 +4,25 @@
 #include <common/spinlock.h>
 
 
-struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
+struct sched_queue_t sched_ready_queue[MAX_CPU_NUM]; // 就绪队列
 
 /**
  * @brief 从就绪队列中取出PCB
  *
  * @return struct process_control_block*
  */
-struct process_control_block *sched_cfs_dequeue()
+struct process_control_block *sched_dequeue()
 {
-    if (list_empty(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list))
+    if (list_empty(&sched_ready_queue[proc_current_cpu_id].proc_queue.list))
     {
-        // kdebug("list empty, count=%d", sched_cfs_ready_queue[proc_current_cpu_id].count);
+        // kdebug("list empty, count=%d", sched_ready_queue[proc_current_cpu_id].count);
         return &initial_proc_union.pcb;
     }
 
-    struct process_control_block *proc = container_of(list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
+    struct process_control_block *proc = container_of(list_next(&sched_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
 
     list_del(&proc->list);
-    --sched_cfs_ready_queue[proc_current_cpu_id].count;
+    --sched_ready_queue[proc_current_cpu_id].count;
     return proc;
 }
 
@@ -31,12 +31,12 @@ struct process_control_block *sched_cfs_dequeue()
  *
  * @param pcb
  */
-void sched_cfs_enqueue(struct process_control_block *pcb)
+void sched_enqueue(struct process_control_block *pcb)
 {
     if (pcb == initial_proc[proc_current_cpu_id])
         return;
-    struct process_control_block *proc = container_of(list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
-    if ((list_empty(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list)) == 0)
+    struct process_control_block *proc = container_of(list_next(&sched_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
+    if ((list_empty(&sched_ready_queue[proc_current_cpu_id].proc_queue.list)) == 0)
     {
         while (proc->virtual_runtime < pcb->virtual_runtime)
         {
@@ -44,38 +44,38 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
         }
     }
     list_append(&proc->list, &pcb->list);
-    ++sched_cfs_ready_queue[proc_current_cpu_id].count;
+    ++sched_ready_queue[proc_current_cpu_id].count;
 }
 
 /**
  * @brief 调度函数
  *
  */
-void sched_cfs()
+void sched()
 {
 
     cli();
 
     current_pcb->flags &= ~PF_NEED_SCHED;
-    struct process_control_block *proc = sched_cfs_dequeue();
-    // kdebug("sched_cfs_ready_queue[proc_current_cpu_id].count = %d", sched_cfs_ready_queue[proc_current_cpu_id].count);
+    struct process_control_block *proc = sched_dequeue();
+    // kdebug("sched_ready_queue[proc_current_cpu_id].count = %d", sched_ready_queue[proc_current_cpu_id].count);
     if (current_pcb->virtual_runtime >= proc->virtual_runtime || current_pcb->state != PROC_RUNNING) // 当前进程运行时间大于了下一进程的运行时间，进行切换
     {
 
         if (current_pcb->state == PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
-            sched_cfs_enqueue(current_pcb);
-        // kdebug("proc->pid=%d, count=%d", proc->pid, sched_cfs_ready_queue[proc_current_cpu_id].count);
-        if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
+            sched_enqueue(current_pcb);
+        // kdebug("proc->pid=%d, count=%d", proc->pid, sched_ready_queue[proc_current_cpu_id].count);
+        if (sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
         {
             switch (proc->priority)
             {
             case 0:
             case 1:
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = 4 / sched_cfs_ready_queue[proc_current_cpu_id].count;
+                sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = 4 / sched_ready_queue[proc_current_cpu_id].count;
                 break;
             case 2:
             default:
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue[proc_current_cpu_id].count) << 2;
+                sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = (4 / sched_ready_queue[proc_current_cpu_id].count) << 2;
                 break;
             }
         }
@@ -94,22 +94,22 @@ void sched_cfs()
     else // 不进行切换
     {
         // kdebug("not switch.");
-        sched_cfs_enqueue(proc);
+        sched_enqueue(proc);
 
-        if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
+        if (sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
         {
             switch (proc->priority)
             {
             case 0:
             case 1:
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = 4 / sched_cfs_ready_queue[proc_current_cpu_id].count;
-                // sched_cfs_ready_queue.cpu_exec_proc_jiffies = 5;
+                sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = 4 / sched_ready_queue[proc_current_cpu_id].count;
+                // sched_ready_queue.cpu_exec_proc_jiffies = 5;
                 break;
             case 2:
             default:
-                // sched_cfs_ready_queue.cpu_exec_proc_jiffies = 5;
+                // sched_ready_queue.cpu_exec_proc_jiffies = 5;
 
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue[proc_current_cpu_id].count) << 2;
+                sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = (4 / sched_ready_queue[proc_current_cpu_id].count) << 2;
                 break;
             }
         }
@@ -129,17 +129,17 @@ void sched_update_jiffies()
     {
     case 0:
     case 1:
-        --sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies;
+        --sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies;
         ++current_pcb->virtual_runtime;
         break;
     case 2:
     default:
-        sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies -= 2;
+        sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies -= 2;
         current_pcb->virtual_runtime += 2;
         break;
     }
     // 时间片耗尽，标记可调度
-    if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
+    if (sched_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
         current_pcb->flags |= PF_NEED_SCHED;
 }
 
@@ -149,13 +149,22 @@ void sched_update_jiffies()
  */
 void sched_init()
 {
-    memset(&sched_cfs_ready_queue, 0, sizeof(struct sched_queue_t) * MAX_CPU_NUM);
+    memset(&sched_ready_queue, 0, sizeof(struct sched_queue_t) * MAX_CPU_NUM);
     for (int i = 0; i < MAX_CPU_NUM; ++i)
     {
 
-        list_init(&sched_cfs_ready_queue[i].proc_queue.list);
-        sched_cfs_ready_queue[i].count = 1; // 因为存在IDLE进程，因此为1
-        sched_cfs_ready_queue[i].cpu_exec_proc_jiffies = 5;
-        sched_cfs_ready_queue[i].proc_queue.virtual_runtime = 0x7fffffffffffffff;
+        list_init(&sched_ready_queue[i].proc_queue.list);
+        sched_ready_queue[i].count = 1; // 因为存在IDLE进程，因此为1
+        sched_ready_queue[i].cpu_exec_proc_jiffies = 5;
+        sched_ready_queue[i].proc_queue.virtual_runtime = 0x7fffffffffffffff;
     }
+}
+
+/**
+ * @brief 包裹调度函数
+ *
+ */
+void sched()
+{
+    sched();
 }

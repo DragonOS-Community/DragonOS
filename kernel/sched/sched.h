@@ -12,20 +12,20 @@ struct sched_queue_t
 };
 
 
-extern struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
+extern struct sched_queue_t sched_ready_queue[MAX_CPU_NUM]; // 就绪队列
 
 /**
  * @brief 调度函数
  * 
  */
-void sched_cfs();
+void sched();
 
 /**
  * @brief 将PCB加入就绪队列
  *
  * @param pcb
  */
-void sched_cfs_enqueue(struct process_control_block *pcb);
+void sched_enqueue(struct process_control_block *pcb);
 
 
 /**
@@ -33,7 +33,7 @@ void sched_cfs_enqueue(struct process_control_block *pcb);
  *
  * @return struct process_control_block*
  */
-struct process_control_block *sched_cfs_dequeue();
+struct process_control_block *sched_dequeue();
 
 /**
  * @brief 初始化进程调度器

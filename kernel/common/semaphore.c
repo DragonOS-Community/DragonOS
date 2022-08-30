@@ -18,7 +18,7 @@ void semaphore_down(semaphore_t *sema)
         list_append(&sema->wait_queue.wait_list, &wait.wait_list);
 
         // 执行调度
-        sched_cfs();
+        sched();
     }
 }
 
@@ -35,7 +35,7 @@ void semaphore_up(semaphore_t *sema)
         list_del(&wq->wait_list);
 
         wq->pcb->state = PROC_RUNNING;
-        sched_cfs_enqueue(wq->pcb);
+        sched_enqueue(wq->pcb);
 
         // 当前进程缺少需要的资源，立即标为需要被调度
         current_pcb->flags |= PF_NEED_SCHED;

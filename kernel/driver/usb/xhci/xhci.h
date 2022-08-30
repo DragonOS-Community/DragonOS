@@ -8,7 +8,7 @@
 
 // ========== irq BEGIN ===========
 
-#define XHCI_IRQ_DONE (1<<31)   // 当command trb 的status的第31位被驱动程序置位时，表明该trb已经执行完成（这是由于xhci规定，第31位可以由驱动程序自行决定用途）
+#define XHCI_IRQ_DONE (1 << 31) // 当command trb 的status的第31位被驱动程序置位时，表明该trb已经执行完成（这是由于xhci规定，第31位可以由驱动程序自行决定用途）
 /**
  * @brief 每个xhci控制器的中断向量号
  *
@@ -188,6 +188,10 @@ struct xhci_ops_config_reg_t
 #define XHCI_TRB_CYCLE_OFF 0
 #define XHCI_TRB_CYCLE_ON 1
 
+// 获取、设置trb中的status部分的complete code
+#define xhci_get_comp_code(status) (((status) >> 24) & 0x7f)
+#define xhci_set_comp_code(code) ((code & 0x7f) << 24)
+
 /**
  * @brief xhci通用TRB结构
  *
@@ -220,7 +224,7 @@ struct xhci_TRB_normal_t
     uint16_t Reserved;     // 保留且置为0
 } __attribute__((packed));
 
-struct xhci_TRB_setup_state_t
+struct xhci_TRB_setup_stage_t
 {
     uint8_t bmRequestType;
     uint8_t bRequest;
@@ -229,14 +233,14 @@ struct xhci_TRB_setup_state_t
     uint16_t wIndex;
     uint16_t wLength;
 
-    unsigned transfer_legth : 17;
-    unsigned resv1 : 5; // Reserved and zero'd
+    unsigned transfer_legth : 17; // TRB transfer length
+    unsigned resv1 : 5;           // Reserved and zero'd
     unsigned intr_target : 10;
 
     unsigned cycle : 1;
     unsigned resv2 : 4; // Reserved and zero'd
-    unsigned ioc : 1;
-    unsigned idt : 1;
+    unsigned ioc : 1;   // interrupt on complete
+    unsigned idt : 1;   // immediate data (should always set for setup TRB)
     unsigned resv3 : 3; // Reserved and zero'd
     unsigned TRB_type : 6;
     unsigned trt : 2;    // Transfer type
@@ -354,7 +358,131 @@ struct xhci_intr_moderation_t
 
 #define XHCI_PORTUSB_CHANGE_BITS ((1 << 17) | (1 << 18) | (1 << 20) | (1 << 21) | (1 << 22))
 
+// 存储于portsc中的端口速度的可用值
+#define XHCI_PORT_SPEED_FULL 1
+#define XHCI_PORT_SPEED_LOW 2
+#define XHCI_PORT_SPEED_HI 3
+#define XHCI_PORT_SPEED_SUPER 4
+
 // ======= Port status and control registers END ====
+
+// ======= Device Slot Context BEGIN ====
+
+/**
+ * @brief 设备上下文结构体
+ *
+ */
+struct xhci_slot_context_t
+{
+    unsigned route_string : 20;
+    unsigned speed : 4;
+    unsigned Rsvd0 : 1; // Reserved and zero'd
+    unsigned mtt : 1;   // multi-TT
+    unsigned hub : 1;
+    unsigned entries : 5; // count of context entries
+
+    uint16_t max_exit_latency;
+    uint8_t rh_port_num; // root hub port number
+    uint8_t num_ports;   // number of ports
+
+    uint8_t tt_hub_slot_id;
+    uint8_t tt_port_num;
+    unsigned ttt : 2; // TT Think Time
+    unsigned Rsvd2 : 4;
+    unsigned int_target : 10; // Interrupter target
+
+    uint8_t device_address;
+    unsigned Rsvd1 : 19;
+    unsigned slot_state : 5;
+} __attribute__((packed));
+
+#define XHCI_SLOT_STATE_DISABLED_OR_ENABLED 0
+#define XHCI_SLOT_STATE_DEFAULT 1
+#define XHCI_SLOT_STATE_ADDRESSED 2
+#define XHCI_SLOT_STATE_CONFIGURED 3
+
+// ======= Device Slot Context END ====
+
+// ======= Device Endpoint Context BEGIN ====
+
+#define XHCI_EP_STATE_DISABLED 0
+#define XHCI_EP_STATE_RUNNING 1
+#define XHCI_EP_STATE_HALTED 2
+#define XHCI_EP_STATE_STOPPED 3
+#define XHCI_EP_STATE_ERROR 4
+
+// End Point Doorbell numbers
+#define XHCI_SLOT_CNTX 0
+#define XHCI_EP_CONTROL 1
+#define XHCI_EP1_OUT 2
+#define XHCI_EP1_IN 3
+#define XHCI_EP2_OUT 4
+#define XHCI_EP2_IN 5
+#define XHCI_EP3_OUT 6
+#define XHCI_EP3_IN 7
+#define XHCI_EP4_OUT 8
+#define XHCI_EP4_IN 9
+#define XHCI_EP5_OUT 10
+#define XHCI_EP5_IN 11
+#define XHCI_EP6_OUT 12
+#define XHCI_EP6_IN 13
+#define XHCI_EP7_OUT 14
+#define XHCI_EP7_IN 15
+#define XHCI_EP8_OUT 16
+#define XHCI_EP8_IN 17
+#define XHCI_EP9_OUT 18
+#define XHCI_EP9_IN 19
+#define XHCI_EP10_OUT 20
+#define XHCI_EP10_IN 21
+#define XHCI_EP11_OUT 22
+#define XHCI_EP11_IN 23
+#define XHCI_EP12_OUT 24
+#define XHCI_EP12_IN 25
+#define XHCI_EP13_OUT 26
+#define XHCI_EP13_IN 27
+#define XHCI_EP14_OUT 28
+#define XHCI_EP14_IN 29
+#define XHCI_EP15_OUT 30
+#define XHCI_EP15_IN 31
+
+// xhci 传输方向(用于setup stage TRB)
+#define XHCI_DIR_NO_DATA 0
+#define XHCI_DIR_OUT 2
+#define XHCI_DIR_IN 3
+
+// xhci传输方向（单个bit的表示）
+#define XHCI_DIR_OUT_BIT 0
+#define XHCI_DIR_IN_BIT 1
+
+/**
+ * @brief xhci 端点上下文结构体
+ *
+ */
+struct xhci_ep_context_t
+{
+    unsigned ep_state : 3;
+    unsigned Rsvd0 : 5; // Reserved and zero'd
+    unsigned mult : 2;  // the maximum supported number of bursts within an interval
+    unsigned max_primary_streams : 5;
+    unsigned linear_stream_array : 1;
+    uint8_t interval;
+    uint8_t max_esti_payload_hi; // Max Endpoint Service Time Interval Payload (High 8bit)
+
+    unsigned Rsvd1 : 1;
+    unsigned err_cnt : 2; // error count. 当错误发生时，该位会自减。当减为0时，控制器会把这个端点挂起
+    unsigned ep_type : 3; // endpoint type
+    unsigned Rsvd2 : 1;
+    unsigned hid : 1; // Host Initiate Disable
+    uint8_t max_burst_size;
+    uint16_t max_packet_size;
+
+    uint64_t tr_dequeue_ptr; // 第0bit为dequeue cycle state， 第1~3bit应保留。
+
+    uint16_t average_trb_len;     // 平均TRB长度。该部分不应为0
+    uint16_t max_esti_payload_lo; // Max Endpoint Service Time Interval Payload (Low 16bit)
+} __attribute__((packed));
+
+// ======= Device Endpoint Context END ====
 
 // 端口信息标志位
 #define XHCI_PROTOCOL_USB2 0
@@ -376,6 +504,12 @@ struct xhci_port_info_t
     uint8_t reserved;
 } __attribute__((packed));
 
+struct xhci_ep_ring_info_t
+{
+    uint64_t ep_ring_vbase;         // transfer ring的基地址
+    uint64_t current_ep_ring_vaddr; // transfer ring下一个要写入的地址
+    uint8_t current_ep_ring_cycle;  // 当前ep的cycle bit
+};
 struct xhci_host_controller_t
 {
     struct pci_device_structure_general_device_t *pci_dev_hdr; // 指向pci header结构体的指针
@@ -385,7 +519,7 @@ struct xhci_host_controller_t
     uint32_t rts_offset;                                       // Runtime Register Space offset
     uint32_t db_offset;                                        // Doorbell offset
     uint32_t ext_caps_off;                                     // 扩展能力寄存器偏移量
-    uint8_t context_size;                                      // 上下文大小
+    uint8_t context_size;                                      // 设备上下文大小
     uint16_t port_num;                                         // 总的端口数量
     uint8_t port_num_u2;                                       // usb 2.0端口数量
     uint8_t port_num_u3;                                       // usb 3端口数量
@@ -399,6 +533,7 @@ struct xhci_host_controller_t
     uint8_t cmd_trb_cycle;                                     // 当前command ring cycle
     uint8_t current_event_ring_cycle;                          // 当前event ring cycle
     struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
+    struct xhci_ep_ring_info_t control_ep_info;                // 控制端点的信息
 };
 
 // Common TRB types

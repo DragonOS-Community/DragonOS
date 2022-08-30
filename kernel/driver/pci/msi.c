@@ -164,6 +164,7 @@ int pci_enable_msi(struct msi_desc_t *msi_desc)
 
     if (msi_desc->pci.msi_attribute.is_msix) // MSI-X
     {
+        kdebug("is msix");
         // 读取msix的信息
         struct pci_msix_cap_t cap = __msi_read_msix_cap_list(msi_desc, cap_ptr);
         // 映射msix table
@@ -181,6 +182,7 @@ int pci_enable_msi(struct msi_desc_t *msi_desc)
     }
     else
     {
+        kdebug("is msi");
         tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, cap_ptr); // 读取cap+0x0处的值
         message_control = (tmp >> 16) & 0xffff;
 

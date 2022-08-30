@@ -801,7 +801,11 @@ struct process_control_block *process_get_pcb(long pid)
 void process_wakeup(struct process_control_block *pcb)
 {
     pcb->state = PROC_RUNNING;
+<<<<<<< HEAD
     shced_enqueue(pcb);
+=======
+    sched_enqueue(pcb);
+>>>>>>> 45a4e5603d4624d81a58a34969799294fa1244c6
 }
 
 /**
@@ -812,7 +816,11 @@ void process_wakeup(struct process_control_block *pcb)
 void process_wakeup_immediately(struct process_control_block *pcb)
 {
     pcb->state = PROC_RUNNING;
+<<<<<<< HEAD
     shced_enqueue(pcb);
+=======
+    sched_enqueue(pcb);
+>>>>>>> 45a4e5603d4624d81a58a34969799294fa1244c6
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
     current_pcb->flags |= PF_NEED_SCHED;
 }

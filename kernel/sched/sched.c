@@ -52,9 +52,9 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
  * 
  * @param pcb
  */
-void shced_enqueue(struct process_control_block *pcb)
+void sched_enqueue(struct process_control_block *pcb)
 {
-    sched_cfs_dequeue(pcb);
+    sched_cfs_enqueue(pcb);
 }
 
 /**

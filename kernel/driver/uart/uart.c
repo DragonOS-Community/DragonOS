@@ -13,7 +13,9 @@
  * @brief 当前是否有数据正等待发送
  *
  */
+// todo: 这里有bug，在真机上，一直认为端口是忙的
 #define is_transmit_empty(p) ((io_in8(p + 5) & 0x20))
+// #define is_transmit_empty(p) (1)
 
 /**
  * @brief 初始化com口
@@ -48,6 +50,10 @@ int uart_init(uint32_t port, uint32_t bits_rate)
     // If serial is not faulty set it in normal operation mode
     // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
     io_out8(port + 4, 0x0F);
+
+    char init_text2[] = "uart initialized.";
+    for (int i = 0; i < sizeof(init_text2) - 1; ++i)
+        uart_send(COM1, init_text2[i]);
     return UART_SUCCESS;
 
     /*

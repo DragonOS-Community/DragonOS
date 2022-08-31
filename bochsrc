@@ -7,11 +7,11 @@ romimage: file="/usr/local/share/bochs/BIOS-bochs-latest"
 vgaromimage: file="/usr/local/share/bochs/VGABIOS-lgpl-latest"
 # ata0-master: type=disk, path="/data/home/longjin/code/hd.img", mode=flat
 
-boot: cdrom
+boot: disk
 
 # no floppyb
 ata0: enabled=1, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
-ata0-master: type=none
+ata0-master: type=disk, path="bin/disk.img", mode=flat
 ata0-slave: type=none
 
 ata1-master: type=cdrom, path="DragonOS.iso", status=inserted
@@ -36,7 +36,7 @@ clock: sync=none, time0=local, rtc_sync=0
 # no loader
 log: -
 logprefix: %t%e%d
-debug: action=ignore, cpu0=report
+debug: action=ignore, cpu0=ignore
 info: action=report
 error: action=report
 panic: action=ask

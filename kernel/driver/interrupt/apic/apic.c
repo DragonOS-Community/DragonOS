@@ -96,7 +96,6 @@ void apic_io_apic_init()
 
     // 不需要手动启动IO APIC，只要初始化了RTE寄存器之后，io apic就会自动启用了。
     // 而且不是每台电脑都有RCBA寄存器，因此不需要手动启用IO APIC
-    
 }
 
 /**
@@ -108,16 +107,13 @@ void apic_init_ap_core_local_apic()
     kinfo("Initializing AP-core's local apic...");
     uint eax, edx;
     // 启用xAPIC 和x2APIC
-    __asm__ __volatile__("movq  $0x1b, %%rcx   \n\t" // 读取IA32_APIC_BASE寄存器
-                         "rdmsr  \n\t"
-                         "bts $10,   %%rax  \n\t"
-                         "bts $11,   %%rax   \n\t"
-                         "wrmsr  \n\t"
-                         "movq $0x1b,    %%rcx   \n\t"
-                         "rdmsr  \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-
-    // kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
+    uint64_t ia32_apic_base = rdmsr(0x1b);
+    ia32_apic_base |= (1 << 11);
+    if (flag_support_x2apic) // 如果支持x2apic，则启用
+        ia32_apic_base |= (1 << 10);
+    wrmsr(0x1b, ia32_apic_base);
+    ia32_apic_base = rdmsr(0x1b);
+    eax = ia32_apic_base & 0xffffffff;
 
     // 检测是否成功启用xAPIC和x2APIC
     if (eax & 0xc00)
@@ -173,14 +169,129 @@ void apic_init_ap_core_local_apic()
 
     kdebug("All LVT Masked");
 }
+
+/**
+ * @brief 当前使用xapic来初始化local apic
+ *
+ */
+static void __local_apic_xapic_init()
+{
+    // 设置svr的 apic软件使能位
+    uint64_t qword = *(uint64_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
+    kdebug("svr=%#018lx", qword);
+    qword |= (1 << 8);
+    *(uint64_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR) = qword;
+    qword = *(uint64_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
+    if (qword & 0x100)
+        kinfo("APIC Software Enabled.");
+    if (qword & 0x1000)
+        kinfo("EOI-Broadcast Suppression Enabled.");
+
+    // 从  Local APIC Version register 获取Local APIC Version
+    qword = *(uint64_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_Version);
+    qword &= 0xffffffff;
+
+    local_apic_max_LVT_entries = ((qword >> 16) & 0xff) + 1;
+    local_apic_version = qword & 0xff;
+
+    kdebug("local APIC Version:%#010x,Max LVT Entry:%#010x,SVR(Suppress EOI Broadcast):%#04x\t", local_apic_version, local_apic_max_LVT_entries, (qword >> 24) & 0x1);
+
+    if ((qword & 0xff) < 0x10)
+    {
+        kdebug("82489DX discrete APIC");
+    }
+    else if (((qword & 0xff) >= 0x10) && ((qword & 0xff) <= 0x15))
+        kdebug("Integrated APIC.");
+
+    io_mfence();
+    // 如果写入这里的话，在有的机器上面会报错
+    // *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI) = APIC_LVT_INT_MASKED;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = APIC_LVT_INT_MASKED;
+    io_mfence();
+
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = APIC_LVT_INT_MASKED;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_PERFORMANCE_MONITOR) = APIC_LVT_INT_MASKED;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0) = APIC_LVT_INT_MASKED;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1) = APIC_LVT_INT_MASKED;
+    io_mfence();
+    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_ERROR) = APIC_LVT_INT_MASKED;
+    io_mfence();
+
+    kdebug("All LVT Masked");
+}
+
+/**
+ * @brief 当前使用x2apic来初始化local apic
+ *
+ */
+static void __local_apic_x2apic_init()
+{
+    uint32_t eax, edx;
+    __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
+                         "rdmsr  \n\t"
+                         "bts $8, %%rax  \n\t"
+                         //                         "bts $12, %%rax \n\t"
+                         "movq $0x80f, %%rcx    \n\t"
+                         "wrmsr  \n\t"
+                         "movq $0x80f , %%rcx   \n\t"
+                         "rdmsr \n\t"
+                         : "=a"(eax), "=d"(edx)::"memory");
+    if (eax & 0x100)
+        kinfo("APIC Software Enabled.");
+    if (eax & 0x1000)
+        kinfo("EOI-Broadcast Suppression Enabled.");
+
+    // 获取Local APIC Version
+    // 0x803处是 Local APIC Version register
+    __asm__ __volatile__("movq $0x803, %%rcx    \n\t"
+                         "rdmsr  \n\t"
+                         : "=a"(eax), "=d"(edx)::"memory");
+
+    local_apic_max_LVT_entries = ((eax >> 16) & 0xff) + 1;
+    local_apic_version = eax & 0xff;
+
+    kdebug("local APIC Version:%#010x,Max LVT Entry:%#010x,SVR(Suppress EOI Broadcast):%#04x\t", local_apic_version, local_apic_max_LVT_entries, (eax >> 24) & 0x1);
+
+    if ((eax & 0xff) < 0x10)
+        kdebug("82489DX discrete APIC");
+    else if (((eax & 0xff) >= 0x10) && ((eax & 0xff) <= 0x15))
+        kdebug("Integrated APIC.");
+
+    // 由于尚未配置LVT对应的处理程序，因此先屏蔽所有的LVT
+    __asm__ __volatile__(// "movq 	$0x82f,	%%rcx	\n\t" // CMCI
+                         // "wrmsr	\n\t"
+                         "movq 	$0x832,	%%rcx	\n\t" // Timer
+                         "wrmsr	\n\t"
+                         "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
+                         "wrmsr	\n\t"
+                         "movq 	$0x834,	%%rcx	\n\t" // Performance Counter
+                         "wrmsr	\n\t"
+                         "movq 	$0x835,	%%rcx	\n\t" // LINT0
+                         "wrmsr	\n\t"
+                         "movq 	$0x836,	%%rcx	\n\t" // LINT1
+                         "wrmsr	\n\t"
+                         "movq 	$0x837,	%%rcx	\n\t" // Error
+                         "wrmsr	\n\t"
+                         :
+                         : "a"(0x10000), "d"(0x00)
+                         : "memory");
+    kdebug("All LVT Masked");
+}
+
 /**
  * @brief 初始化local apic
  *
  */
 void apic_local_apic_init()
 {
+    uint64_t ia32_apic_base = rdmsr(0x1b);
+    // kdebug("apic base=%#018lx", (ia32_apic_base & 0x1FFFFFFFFFF000));
     // 映射Local APIC 寄存器地址
-    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, 0xfee00000UL, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, (ia32_apic_base & 0x1FFFFFFFFFFFFF), PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
     uint a, b, c, d;
 
     cpu_cpuid(1, 0, &a, &b, &c, &d);
@@ -209,69 +320,33 @@ void apic_local_apic_init()
     }
     else
     {
-        kerror("This computer does not support x2APIC");
+        flag_support_x2apic = false;
+        kwarn("This computer does not support x2APIC");
     }
 
     uint eax, edx;
     // 启用xAPIC 和x2APIC
-    __asm__ __volatile__("movq  $0x1b, %%rcx   \n\t" // 读取IA32_APIC_BASE寄存器
-                         "rdmsr  \n\t"
-                         "bts $10,   %%rax  \n\t"
-                         "bts $11,   %%rax   \n\t"
-                         "wrmsr  \n\t"
-                         "movq $0x1b,    %%rcx   \n\t"
-                         "rdmsr  \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-
-    // kdebug("After enable xAPIC and x2APIC: edx=%#010x, eax=%#010x", edx, eax);
+    ia32_apic_base = rdmsr(0x1b);
+    ia32_apic_base |= (1 << 11);
+    if (flag_support_x2apic) // 如果支持x2apic，则启用
+        ia32_apic_base |= (1 << 10);
+    wrmsr(0x1b, ia32_apic_base);
+    ia32_apic_base = rdmsr(0x1b);
+    eax = ia32_apic_base & 0xffffffff;
 
     // 检测是否成功启用xAPIC和x2APIC
-    if (eax & 0xc00)
+    if ((eax & 0xc00) == 0xc00)
         kinfo("xAPIC & x2APIC enabled!");
+    else if ((eax & 0x800) == 0x800)
+        kinfo("Only xAPIC enabled!");
+    else
+        kerror("Both xAPIC and x2APIC are not enabled.");
 
-    /*
-        io_mfence();
-        uint *svr = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
-        uint tmp_svr = *svr;
-        tmp_svr &= (~(1 << 12));
-        tmp_svr |= (1 << 8);
-        kdebug("tmp_svr = %#018lx", tmp_svr);
-        io_mfence();
-        *svr = tmp_svr;
-        io_mfence();
-        kdebug("svr = %#018lx", *svr);
-    */
     // 设置SVR寄存器，开启local APIC、禁止EOI广播
-
-    __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
-                         "rdmsr  \n\t"
-                         "bts $8, %%rax  \n\t"
-                         //                         "bts $12, %%rax \n\t"
-                         "movq $0x80f, %%rcx    \n\t"
-                         "wrmsr  \n\t"
-                         "movq $0x80f , %%rcx   \n\t"
-                         "rdmsr \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-
-    /*
-   //enable SVR[8]
-    __asm__ __volatile__(	"movq 	$0x80f,	%%rcx	\n\t"
-                "rdmsr	\n\t"
-                "bts	$8,	%%rax	\n\t"
-                "bts	$12,%%rax\n\t"
-                "wrmsr	\n\t"
-                "movq 	$0x80f,	%%rcx	\n\t"
-                "rdmsr	\n\t"
-                :"=a"(eax),"=d"(edx)
-                :
-                :"memory");
-                */
-    // kdebug("After setting SVR: edx=%#010x, eax=%#010x", edx, eax);
-
-    if (eax & 0x100)
-        kinfo("APIC Software Enabled.");
-    if (eax & 0x1000)
-        kinfo("EOI-Broadcast Suppression Enabled.");
+    if (flag_support_x2apic) // 当前为x2APIC
+        __local_apic_x2apic_init();
+    else // 当前为xapic
+        __local_apic_xapic_init();
 
     // 获取Local APIC的基础信息 （参见英特尔开发手册Vol3A 10-39）
     //                          Table 10-6. Local APIC Register Address Map Supported by x2APIC
@@ -284,81 +359,6 @@ void apic_local_apic_init()
     */
     // kdebug("get Local APIC ID: edx=%#010x, eax=%#010x", edx, eax);
     // kdebug("local_apic_id=%#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_ID));
-
-    // 获取Local APIC Version
-    // 0x803处是 Local APIC Version register
-    __asm__ __volatile__("movq $0x803, %%rcx    \n\t"
-                         "rdmsr  \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-
-    local_apic_max_LVT_entries = ((eax >> 16) & 0xff) + 1;
-    local_apic_version = eax & 0xff;
-
-    kdebug("local APIC Version:%#010x,Max LVT Entry:%#010x,SVR(Suppress EOI Broadcast):%#04x\t", local_apic_version, local_apic_max_LVT_entries, (eax >> 24) & 0x1);
-
-    if ((eax & 0xff) < 0x10)
-    {
-        kdebug("82489DX discrete APIC");
-    }
-    else if (((eax & 0xff) >= 0x10) && ((eax & 0xff) <= 0x15))
-        kdebug("Integrated APIC.");
-
-    // 由于尚未配置LVT对应的处理程序，因此先屏蔽所有的LVT
-
-    // mask all LVT
-    __asm__ __volatile__(             //"movq 	$0x82f,	%%rcx	\n\t"	//CMCI
-                                      //"wrmsr	\n\t"
-        "movq 	$0x832,	%%rcx	\n\t" // Timer
-        "wrmsr	\n\t"
-        "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
-        "wrmsr	\n\t"
-        "movq 	$0x834,	%%rcx	\n\t" // Performance Counter
-        "wrmsr	\n\t"
-        "movq 	$0x835,	%%rcx	\n\t" // LINT0
-        "wrmsr	\n\t"
-        "movq 	$0x836,	%%rcx	\n\t" // LINT1
-        "wrmsr	\n\t"
-        "movq 	$0x837,	%%rcx	\n\t" // Error
-        "wrmsr	\n\t"
-        :
-        : "a"(0x10000), "d"(0x00)
-        : "memory");
-
-    /*
-    io_mfence();
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI) = 0x1000000;
-    io_mfence();
-    kdebug("cmci = %#018lx", *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI));
-    */
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = APIC_LVT_INT_MASKED;
-    io_mfence();
-    /*
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL) = 0x1000000;
-    io_mfence();
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_PERFORMANCE_MONITOR) = 0x1000000;
-    io_mfence();
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0) = 0x1000000;
-    io_mfence();
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1) = 0x1000000;
-    io_mfence();
-    *(uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_ERROR) = 0x1000000;
-    io_mfence();
-    */
-    kdebug("All LVT Masked");
-
-    /*
-    // 获取TPR寄存器的值
-    __asm__ __volatile__("movq $0x808, %%rcx    \n\t"
-                         "rdmsr  \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-    kdebug("LVT_TPR=%#010x", eax);
-
-    // 获取PPR寄存器的值
-    __asm__ __volatile__("movq $0x80a, %%rcx    \n\t"
-                         "rdmsr  \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-    kdebug("LVT_PPR=%#010x", eax);
-    */
 }
 
 /**
@@ -375,25 +375,28 @@ void apic_init()
     for (int i = 150; i < 160; ++i)
         set_intr_gate(i, 0, local_apic_interrupt_table[i - 150]);
 
-    /*
+    
     // 初始化主芯片
-    io_out8(0x20, 0x11); // 初始化主芯片的icw1
-    io_out8(0x21, 0x20); // 设置主芯片的中断向量号为0x20(0x20-0x27)
-    io_out8(0x21, 0x04); // 设置int2端口级联从芯片
-    io_out8(0x21, 0x01); // 设置为AEOI模式、FNM、无缓冲
+    // io_out8(0x20, 0x11); // 初始化主芯片的icw1
+    // io_out8(0x21, 0x20); // 设置主芯片的中断向量号为0x20(0x20-0x27)
+    // io_out8(0x21, 0x04); // 设置int2端口级联从芯片
+    // io_out8(0x21, 0x01); // 设置为AEOI模式、FNM、无缓冲
 
-    // 初始化从芯片
-    io_out8(0xa0, 0x11);
-    io_out8(0xa1, 0x28); // 设置从芯片的中断向量号为0x28(0x28-0x2f)
-    io_out8(0xa1, 0x02); // 设置从芯片连接到主芯片的int2
-    io_out8(0xa1, 0x01);
-    */
+    // // 初始化从芯片
+    // io_out8(0xa0, 0x11);
+    // io_out8(0xa1, 0x28); // 设置从芯片的中断向量号为0x28(0x28-0x2f)
+    // io_out8(0xa1, 0x02); // 设置从芯片连接到主芯片的int2
+    // io_out8(0xa1, 0x01);
+    
     //  屏蔽类8259A芯片
-    io_mfence();
-    io_out8(0xa1, 0xff);
-    io_mfence();
+    // todo: 这里有bug：在真机或bochs上，无法屏蔽8259A，以至于sti()后，接收到来自与8259A相连的时钟的中断。然后造成错误。
     io_out8(0x21, 0xff);
-    io_mfence();
+
+    io_out8(0xa1, 0xff);
+
+    // 写入8259A pic的EOI位
+    io_out8(0x20, 0x20);
+    io_out8(0xa0, 0x20);
 
     kdebug("8259A Masked.");
 
@@ -642,7 +645,6 @@ void apic_local_apic_edge_ack(ul irq_num)
                          "wrmsr	\n\t" ::
                              : "memory");
 }
-
 
 /**
  * @brief 读取指定类型的 Interrupt Control Structure

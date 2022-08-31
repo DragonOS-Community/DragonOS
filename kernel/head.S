@@ -467,7 +467,6 @@ m_ignore_int:
     pushq %rax
     lretq
 
-    lretq
 
 
 go_to_ignore_int:

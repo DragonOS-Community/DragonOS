@@ -484,3 +484,10 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
                  : "memory");
     return size;
 }
+
+/**
+ * @brief 这个函数让蜂鸣器发声，目前仅用于真机调试。未来将移除，请勿依赖此函数。
+ * 
+ * @param times 发声循环多少遍
+ */
+void __experimental_beep(uint64_t times);

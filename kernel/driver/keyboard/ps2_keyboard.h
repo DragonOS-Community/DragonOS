@@ -27,7 +27,7 @@
 #define wait_ps2_keyboard_write() while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_INBUF_FULL)
 // #define wait_ps2_keyboard_write() (1)
 // 等待从键盘控制器读取信息完成
-// #define wait_ps2_keyboard_read() while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_OUTBUF_FULL)
+#define wait_ps2_keyboard_read() while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_OUTBUF_FULL)
 // #define wait_ps2_keyboard_read() (1)
 
 

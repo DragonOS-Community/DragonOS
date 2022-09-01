@@ -28,11 +28,19 @@ if [ ! "$1" == "--nobuild" ]; then
         echo "运行在docker内"
         IN_DOCKER=1
         make all -j 16
+        if [ "$?" != "0" ]; then\
+            echo "DragonOS编译失败";\
+            exit 1;\
+        fi;\
         make clean
         GENERATE_ISO=1
     else
         
         make all -j 16
+        if [ "$?" != "0" ]; then\
+            echo "DragonOS编译失败";\
+            exit 1;\
+        fi;\
         make clean
         GENERATE_ISO=1
     fi
@@ -92,8 +100,8 @@ if [ "${GENERATE_ISO}" == "1" ]; then
     bash mount_virt_disk.sh || exit 1
     mkdir -p ${boot_folder}/grub
     cp ${kernel} ${root_folder}/bin/disk_mount/boot
-    cp ${root_folder}/bin/user/shell.elf ${root_folder}/bin/disk_mount
-    cp ${root_folder}/bin/user/about.elf ${root_folder}/bin/disk_mount
+    # 拷贝用户程序到磁盘镜像
+    cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount
     mkdir -p ${root_folder}/bin/disk_mount/dev
     touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
     

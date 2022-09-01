@@ -15,23 +15,36 @@
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
 
-bool flag_support_apic = false;
-bool flag_support_x2apic = false;
-uint local_apic_version;
-uint local_apic_max_LVT_entries;
+static bool flag_support_apic = false;
+static bool flag_support_x2apic = false;
+uint8_t __apic_enable_state = APIC_XAPIC_ENABLED;
+static uint local_apic_version;
+static uint local_apic_max_LVT_entries;
 
 static struct acpi_Multiple_APIC_Description_Table_t *madt;
 static struct acpi_IO_APIC_Structure_t *io_apic_ICS;
 
-#define send_EOI()                                      \
-    do                                                  \
-    {                                                   \
-        __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"   \
-                             "movq	$0x00,	%%rax	\n\t"   \
-                             "movq 	$0x80b,	%%rcx	\n\t" \
-                             "wrmsr	\n\t" ::            \
-                                 : "memory");           \
-    } while (0)
+static void __local_apic_xapic_init();
+static void __local_apic_x2apic_init();
+
+static __always_inline void __send_eoi()
+{
+    if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
+    {
+        __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
+                             "movq	$0x00,	%%rax	\n\t"
+                             "movq 	$0x80b,	%%rcx	\n\t"
+                             "wrmsr	\n\t" ::
+                                 : "memory");
+    }
+    else
+    {
+
+        io_mfence();
+        __write4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
+        io_mfence();
+    }
+}
 
 /**
  * @brief 初始化io_apic
@@ -110,64 +123,26 @@ void apic_init_ap_core_local_apic()
     uint64_t ia32_apic_base = rdmsr(0x1b);
     ia32_apic_base |= (1 << 11);
     if (flag_support_x2apic) // 如果支持x2apic，则启用
+    {
         ia32_apic_base |= (1 << 10);
-    wrmsr(0x1b, ia32_apic_base);
+        wrmsr(0x1b, ia32_apic_base);
+    }
     ia32_apic_base = rdmsr(0x1b);
     eax = ia32_apic_base & 0xffffffff;
 
     // 检测是否成功启用xAPIC和x2APIC
-    if (eax & 0xc00)
+    if ((eax & 0xc00) == 0xc00)
         kinfo("xAPIC & x2APIC enabled!");
+    else if ((eax & 0x800) == 0x800)
+        kinfo("Only xAPIC enabled!");
+    else
+        kerror("Both xAPIC and x2APIC are not enabled.");
+
     // 设置SVR寄存器，开启local APIC、禁止EOI广播
-
-    // enable SVR[8]
-    __asm__ __volatile__("movq 	$0x80f,	%%rcx	\n\t"
-                         "rdmsr	\n\t"
-                         "bts	$8,	%%rax	\n\t"
-                         //				"bts	$12,	%%rax\n\t"
-                         "wrmsr	\n\t"
-                         "movq 	$0x80f,	%%rcx	\n\t"
-                         "rdmsr	\n\t"
-                         : "=a"(eax), "=d"(edx)
-                         :
-                         : "memory");
-
-    if (eax & 0x100)
-        printk_color(RED, YELLOW, "SVR[8] enabled\n");
-    if (edx & 0x1000)
-        printk_color(RED, YELLOW, "SVR[12] enabled\n");
-
-    // get local APIC ID
-    __asm__ __volatile__("movq $0x802,	%%rcx	\n\t"
-                         "rdmsr	\n\t"
-                         : "=a"(eax), "=d"(edx)
-                         :
-                         : "memory");
-
-    printk_color(RED, YELLOW, "x2APIC ID:%#010x\n", eax);
-
-    // 由于尚未配置LVT对应的处理程序，因此先屏蔽所有的LVT
-
-    // mask all LVT
-    __asm__ __volatile__(             //"movq 	$0x82f,	%%rcx	\n\t"	//CMCI
-                                      //"wrmsr	\n\t"
-        "movq 	$0x832,	%%rcx	\n\t" // Timer
-        "wrmsr	\n\t"
-        "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
-        "wrmsr	\n\t"
-        "movq 	$0x834,	%%rcx	\n\t" // Performance Counter
-        "wrmsr	\n\t"
-        "movq 	$0x835,	%%rcx	\n\t" // LINT0
-        "wrmsr	\n\t"
-        "movq 	$0x836,	%%rcx	\n\t" // LINT1
-        "wrmsr	\n\t"
-        "movq 	$0x837,	%%rcx	\n\t" // Error
-        "wrmsr	\n\t"
-        :
-        : "a"(0x10000), "d"(0x00)
-        : "memory");
-
-    kdebug("All LVT Masked");
+    if (flag_support_x2apic) // 当前为x2APIC
+        __local_apic_x2apic_init();
+    else // 当前为xapic
+        __local_apic_xapic_init();
 }
 
 /**
@@ -176,9 +151,10 @@ void apic_init_ap_core_local_apic()
  */
 static void __local_apic_xapic_init()
 {
+    __apic_enable_state = APIC_XAPIC_ENABLED;
     // 设置svr的 apic软件使能位
     uint64_t qword = *(uint64_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
-    kdebug("svr=%#018lx", qword);
+
     qword |= (1 << 8);
     *(uint64_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR) = qword;
     qword = *(uint64_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_SVR);
@@ -230,6 +206,7 @@ static void __local_apic_xapic_init()
  */
 static void __local_apic_x2apic_init()
 {
+    __apic_enable_state = APIC_X2APIC_ENABLED;
     uint32_t eax, edx;
     __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
                          "rdmsr  \n\t"
@@ -262,23 +239,23 @@ static void __local_apic_x2apic_init()
         kdebug("Integrated APIC.");
 
     // 由于尚未配置LVT对应的处理程序，因此先屏蔽所有的LVT
-    __asm__ __volatile__(// "movq 	$0x82f,	%%rcx	\n\t" // CMCI
-                         // "wrmsr	\n\t"
-                         "movq 	$0x832,	%%rcx	\n\t" // Timer
-                         "wrmsr	\n\t"
-                         "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
-                         "wrmsr	\n\t"
-                         "movq 	$0x834,	%%rcx	\n\t" // Performance Counter
-                         "wrmsr	\n\t"
-                         "movq 	$0x835,	%%rcx	\n\t" // LINT0
-                         "wrmsr	\n\t"
-                         "movq 	$0x836,	%%rcx	\n\t" // LINT1
-                         "wrmsr	\n\t"
-                         "movq 	$0x837,	%%rcx	\n\t" // Error
-                         "wrmsr	\n\t"
-                         :
-                         : "a"(0x10000), "d"(0x00)
-                         : "memory");
+    __asm__ __volatile__(             // "movq 	$0x82f,	%%rcx	\n\t" // CMCI
+                                      // "wrmsr	\n\t"
+        "movq 	$0x832,	%%rcx	\n\t" // Timer
+        "wrmsr	\n\t"
+        "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
+        "wrmsr	\n\t"
+        "movq 	$0x834,	%%rcx	\n\t" // Performance Counter
+        "wrmsr	\n\t"
+        "movq 	$0x835,	%%rcx	\n\t" // LINT0
+        "wrmsr	\n\t"
+        "movq 	$0x836,	%%rcx	\n\t" // LINT1
+        "wrmsr	\n\t"
+        "movq 	$0x837,	%%rcx	\n\t" // Error
+        "wrmsr	\n\t"
+        :
+        : "a"(0x10000), "d"(0x00)
+        : "memory");
     kdebug("All LVT Masked");
 }
 
@@ -329,8 +306,10 @@ void apic_local_apic_init()
     ia32_apic_base = rdmsr(0x1b);
     ia32_apic_base |= (1 << 11);
     if (flag_support_x2apic) // 如果支持x2apic，则启用
+    {
         ia32_apic_base |= (1 << 10);
-    wrmsr(0x1b, ia32_apic_base);
+        wrmsr(0x1b, ia32_apic_base);
+    }
     ia32_apic_base = rdmsr(0x1b);
     eax = ia32_apic_base & 0xffffffff;
 
@@ -375,21 +354,7 @@ void apic_init()
     for (int i = 150; i < 160; ++i)
         set_intr_gate(i, 0, local_apic_interrupt_table[i - 150]);
 
-    
-    // 初始化主芯片
-    // io_out8(0x20, 0x11); // 初始化主芯片的icw1
-    // io_out8(0x21, 0x20); // 设置主芯片的中断向量号为0x20(0x20-0x27)
-    // io_out8(0x21, 0x04); // 设置int2端口级联从芯片
-    // io_out8(0x21, 0x01); // 设置为AEOI模式、FNM、无缓冲
-
-    // // 初始化从芯片
-    // io_out8(0xa0, 0x11);
-    // io_out8(0xa1, 0x28); // 设置从芯片的中断向量号为0x28(0x28-0x2f)
-    // io_out8(0xa1, 0x02); // 设置从芯片连接到主芯片的int2
-    // io_out8(0xa1, 0x01);
-    
     //  屏蔽类8259A芯片
-    // todo: 这里有bug：在真机或bochs上，无法屏蔽8259A，以至于sti()后，接收到来自与8259A相连的时钟的中断。然后造成错误。
     io_out8(0x21, 0xff);
 
     io_out8(0xa1, 0xff);
@@ -445,26 +410,10 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         if (irq->controller != NULL && irq->controller->ack != NULL)
             irq->controller->ack(number);
         else
-        {
-
-            // 向EOI寄存器写入0x00表示结束中断
-            __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
-                                 "movq	$0x00,	%%rax	\n\t"
-                                 "movq 	$0x80b,	%%rcx	\n\t"
-                                 "wrmsr	\n\t" ::
-                                     : "memory");
-        }
-    }
-
-    else if (number == 0x80) // 系统调用
-    {
-        // ps: 当前已经将系统调用直接使用系统调用门实现，不走这里。。
-        do_syscall_int(rsp, 0);
+            __send_eoi();
     }
     else if (number >= 200)
-
     {
-        // printk_color(RED, BLACK, "SMP IPI [ %d ]\n", number);
         apic_local_apic_edge_ack(number);
 
         {
@@ -486,16 +435,14 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         if (irq->controller != NULL && irq->controller->ack != NULL)
             irq->controller->ack(number);
         else
-        {
-
-            // 向EOI寄存器写入0x00表示结束中断
-            send_EOI();
-        }
+            __send_eoi(); // 向EOI寄存器写入0x00表示结束中断
     }
     else
     {
 
         kwarn("do IRQ receive: %d", number);
+        // 忽略未知中断
+        return;
     }
 
     // kdebug("before softirq");
@@ -600,17 +547,7 @@ void apic_ioapic_uninstall(ul irq_num)
 
 void apic_ioapic_level_ack(ul irq_num) // 电平触发
 {
-    // 向EOI寄存器写入0x00表示结束中断
-    /*io_mfence();
-    uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
-    *eoi = 0x00;
-    io_mfence(); */
-
-    __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
-                         "movq	$0x00,	%%rax	\n\t"
-                         "movq 	$0x80b,	%%rcx	\n\t"
-                         "wrmsr	\n\t" ::
-                             : "memory");
+    __send_eoi();
     *apic_ioapic_map.virtual_EOI_addr = irq_num;
 }
 
@@ -623,11 +560,7 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
         *eoi = 0x00;
 
         */
-    __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
-                         "movq	$0x00,	%%rax	\n\t"
-                         "movq 	$0x80b,	%%rcx	\n\t"
-                         "wrmsr	\n\t" ::
-                             : "memory");
+    __send_eoi();
 }
 
 /**
@@ -639,11 +572,7 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
 void apic_local_apic_edge_ack(ul irq_num)
 {
     // 向EOI寄存器写入0x00表示结束中断
-    __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
-                         "movq	$0x00,	%%rax	\n\t"
-                         "movq 	$0x80b,	%%rcx	\n\t"
-                         "wrmsr	\n\t" ::
-                             : "memory");
+    __send_eoi();
 }
 
 /**

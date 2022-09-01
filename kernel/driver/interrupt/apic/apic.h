@@ -8,13 +8,20 @@
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 
+
 #define APIC_SUCCESS 0
 #define APIC_E_NOTFOUND 1
 
 #define APIC_IO_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + IO_APIC_MAPPING_OFFSET
 #define APIC_LOCAL_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + LOCAL_APIC_MAPPING_OFFSET
 
-// ======== local apic 寄存器地址偏移量表 =======
+// 当前apic启用状态标志
+extern uint8_t __apic_enable_state;
+#define APIC_XAPIC_ENABLED 0
+#define APIC_X2APIC_ENABLED 1
+#define CURRENT_APIC_STATE (__apic_enable_state )
+
+// ======== local apic 寄存器虚拟地址偏移量表 =======
 // 0x00~0x10 Reserved.
 #define LOCAL_APIC_OFFSET_Local_APIC_ID 0x20
 #define LOCAL_APIC_OFFSET_Local_APIC_Version 0x30

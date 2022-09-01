@@ -42,6 +42,9 @@ all: kernel
 		cd $$x;\
 		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)";\
 		cd ..;\
+		if [ "$$?" != "0" ]; then\
+            exit $$?;\
+        fi;\
 	done
 	
 # 重新链接
@@ -58,7 +61,6 @@ ECHO:
 $(kernel_subdirs): ECHO
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)" kernel_root_path="$(shell pwd)"
-
 
 kernel: head.o main.o $(kernel_subdirs)
 	

@@ -29,6 +29,10 @@ kernel:
 				echo "make all in $$subdir";\
 				cd $$subdir;\
 				$(MAKE) all;\
+				if [ "$$?" != "0" ]; then\
+					echo "内核编译失败";\
+					exit 1;\
+				fi;\
 				cd ..;\
 		done
 
@@ -39,7 +43,11 @@ user:
 	@list='./user'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
-    		 $(MAKE) all;\
+    		$(MAKE) all;\
+			if [ "$$?" != "0" ]; then\
+				echo "用户态程序编译失败";\
+				exit 1;\
+			fi;\
     		cd ..;\
 	done
 

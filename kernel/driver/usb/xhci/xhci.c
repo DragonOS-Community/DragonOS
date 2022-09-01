@@ -69,49 +69,44 @@ hardware_intr_controller xhci_hc_intr_controller =
             这种情况下，我们必须从32bit的寄存器的0地址处开始读取32bit，然后通过移位的方式得到其中的字节。
 */
 
-#define xhci_read_cap_reg32(id, offset) (*(uint32_t *)(xhci_hc[id].vbase + (offset)))
+#define xhci_read_cap_reg32(id, offset) (__read4b(xhci_hc[id].vbase + (offset)))
 #define xhci_get_ptr_cap_reg32(id, offset) ((uint32_t *)(xhci_hc[id].vbase + (offset)))
-#define xhci_write_cap_reg32(id, offset, value) (*(uint32_t *)(xhci_hc[id].vbase + (offset)) = (uint32_t)(value))
+#define xhci_write_cap_reg32(id, offset, value) (__write4b(xhci_hc[id].vbase + (offset), (value)))
 
-#define xhci_read_cap_reg64(id, offset) (*(uint64_t *)(xhci_hc[id].vbase + (offset)))
+#define xhci_read_cap_reg64(id, offset) (__read8b(xhci_hc[id].vbase + (offset)))
 #define xhci_get_ptr_reg64(id, offset) ((uint64_t *)(xhci_hc[id].vbase + (offset)))
-#define xhci_write_cap_reg64(id, offset, value) (*(uint64_t *)(xhci_hc[id].vbase + (offset)) = (uint64_t)(value))
+#define xhci_write_cap_reg64(id, offset, value) (__write8b(xhci_hc[id].vbase + (offset), (value)))
 
 #define xhci_read_op_reg8(id, offset) (*(uint8_t *)(xhci_hc[id].vbase_op + (offset)))
 #define xhci_get_ptr_op_reg8(id, offset) ((uint8_t *)(xhci_hc[id].vbase_op + (offset)))
 #define xhci_write_op_reg8(id, offset, value) (*(uint8_t *)(xhci_hc[id].vbase_op + (offset)) = (uint8_t)(value))
 
-#define xhci_read_op_reg32(id, offset) (*(uint32_t *)(xhci_hc[id].vbase_op + (offset)))
+#define xhci_read_op_reg32(id, offset) (__read4b(xhci_hc[id].vbase_op + (offset)))
 #define xhci_get_ptr_op_reg32(id, offset) ((uint32_t *)(xhci_hc[id].vbase_op + (offset)))
-#define xhci_write_op_reg32(id, offset, value) (*(uint32_t *)(xhci_hc[id].vbase_op + (offset)) = (uint32_t)(value))
+#define xhci_write_op_reg32(id, offset, value) (__write4b(xhci_hc[id].vbase_op + (offset), (value)))
 
-#define xhci_read_op_reg64(id, offset) (*(uint64_t *)(xhci_hc[id].vbase_op + (offset)))
+#define xhci_read_op_reg64(id, offset) (__read8b(xhci_hc[id].vbase_op + (offset)))
 #define xhci_get_ptr_op_reg64(id, offset) ((uint64_t *)(xhci_hc[id].vbase_op + (offset)))
-#define xhci_write_op_reg64(id, offset, value) (*(uint64_t *)(xhci_hc[id].vbase_op + (offset)) = (uint64_t)(value))
-
-#define xhci_write_mem32(vaddr, value) (*(uint32_t *)(vaddr) = (value))
-#define xhci_write_mem64(vaddr, value) (*(uint64_t *)(vaddr) = (value))
-#define xhci_read_mem32(vaddr) (*(uint32_t *)(vaddr))
-#define xhci_read_mem64(vaddr) (*(uint64_t *)(vaddr))
+#define xhci_write_op_reg64(id, offset, value) (__write8b(xhci_hc[id].vbase_op + (offset), (value)))
 
 /**
  * @brief 计算中断寄存器组虚拟地址
  * @param id 主机控制器id
  * @param num xhci中断寄存器组号
  */
-#define xhci_calc_intr_vaddr(id, num) (xhci_hc[id].vbase + xhci_hc[id].rts_offset + XHCI_RT_IR0 + num * XHCI_IR_SIZE)
+#define xhci_calc_intr_vaddr(id, num) (xhci_hc[id].vbase + xhci_hc[id].rts_offset + XHCI_RT_IR0 + (num)*XHCI_IR_SIZE)
 /**
  * @brief 读取/写入中断寄存器
  * @param id 主机控制器id
  * @param num xhci中断寄存器组号
  * @param intr_offset 寄存器在当前寄存器组中的偏移量
  */
-#define xhci_read_intr_reg32(id, num, intr_offset) (*(uint32_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset))
-#define xhci_write_intr_reg32(id, num, intr_offset, value) (*(uint32_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset) = value)
-#define xhci_read_intr_reg64(id, num, intr_offset) (*(uint64_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset))
-#define xhci_write_intr_reg64(id, num, intr_offset, value) (*(uint64_t *)(xhci_calc_intr_vaddr(id, num) + intr_offset) = value)
+#define xhci_read_intr_reg32(id, num, intr_offset) (__read4b(xhci_calc_intr_vaddr(id, num) + (intr_offset)))
+#define xhci_write_intr_reg32(id, num, intr_offset, value) (__write4b(xhci_calc_intr_vaddr(id, num) + (intr_offset), (value)))
+#define xhci_read_intr_reg64(id, num, intr_offset) (__read8b(xhci_calc_intr_vaddr(id, num) + (intr_offset)))
+#define xhci_write_intr_reg64(id, num, intr_offset, value) (__write8b(xhci_calc_intr_vaddr(id, num) + (intr_offset), (value)))
 
-#define xhci_is_aligned64(addr) ((addr & 0x3f) == 0) // 是否64bytes对齐
+#define xhci_is_aligned64(addr) (((addr)&0x3f) == 0) // 是否64bytes对齐
 
 /**
  * @brief 判断端口信息
@@ -172,9 +167,9 @@ static int xhci_hc_find_available_id()
  */
 static __always_inline void xhci_get_trb(struct xhci_TRB_t *trb, const uint64_t address)
 {
-    trb->param = xhci_read_mem64(address);
-    trb->status = xhci_read_mem32(address + 8);
-    trb->command = xhci_read_mem32(address + 12);
+    trb->param = __read8b(address);
+    trb->status = __read4b(address + 8);
+    trb->command = __read4b(address + 12);
 }
 
 /**
@@ -185,9 +180,9 @@ static __always_inline void xhci_get_trb(struct xhci_TRB_t *trb, const uint64_t 
  */
 static __always_inline void xhci_set_trb(struct xhci_TRB_t *trb, const uint64_t address)
 {
-    xhci_write_mem64(address, trb->param);
-    xhci_write_mem32(address + 8, trb->status);
-    xhci_write_mem32(address + 12, trb->command);
+    __write8b(address, trb->param);
+    __write4b(address + 8, trb->status);
+    __write4b(address + 12, trb->command);
 }
 
 /**
@@ -781,7 +776,7 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
                 {
                 case TRB_TYPE_TRANS_EVENT: // 当前 event trb是 transfer event TRB
                     // If SPD was encountered in this TD, comp_code will be SPD, else it should be SUCCESS (specs 4.10.1.1)
-                    xhci_write_mem32(phys_2_virt(event_trb.param), (event_trb.status | XHCI_IRQ_DONE)); // return code + bytes *not* transferred
+                    __write4b((uint64_t)phys_2_virt(event_trb.param), (event_trb.status | XHCI_IRQ_DONE)); // return code + bytes *not* transferred
                     break;
 
                 default:
@@ -841,6 +836,7 @@ static int xhci_reset_port(const int id, const int port)
     io_mfence();
     // 确保端口的status被清0
     xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | XHCI_PORTUSB_CHANGE_BITS);
+    // kdebug("to reset timeout;");
     io_mfence();
     // 重置当前端口
     if (XHCI_PORT_IS_USB3(id, port))
@@ -849,13 +845,14 @@ static int xhci_reset_port(const int id, const int port)
         xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | (1 << 4));
 
     retval = -ETIMEDOUT;
-
+    // kdebug("to wait reset timeout;");
     // 等待portsc的port reset change位被置位，说明reset完成
     int timeout = 200;
     while (timeout)
     {
         io_mfence();
         uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
+        // kdebug("val=%#010lx", val);
         io_mfence();
         if (XHCI_PORT_IS_USB3(id, port) && (val & (1 << 31)) == 0)
             break;
@@ -872,13 +869,15 @@ static int xhci_reset_port(const int id, const int port)
     if (timeout > 0)
     {
         // 等待恢复
-        usleep(USB_TIME_RST_REC * 1000);
+        usleep(USB_TIME_RST_REC * 100);
+        // kdebug("to check if reset ok");
         uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
         io_mfence();
 
         // 如果reset之后，enable bit仍然是1，那么说明reset成功
         if (val & (1 << 1))
         {
+            // kdebug("reset ok");
             retval = 0;
             io_mfence();
             // 清除status change bit
@@ -888,7 +887,7 @@ static int xhci_reset_port(const int id, const int port)
         else
             retval = -1;
     }
-
+    // kdebug("reset ok!");
     // 如果usb2端口成功reset，则处理该端口的active状态
     if (retval == 0 && XHCI_PORT_IS_USB2(id, port))
     {
@@ -928,7 +927,7 @@ static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int 
     uint64_t device_context_vaddr = (uint64_t)kzalloc(xhci_hc[id].context_size * 2, 0);
     // kdebug("slot id=%d, device_context_vaddr=%#018lx, port=%d", slot_id, device_context_vaddr, port);
     // 写到数组中
-    xhci_write_mem64(xhci_hc[id].dcbaap_vaddr + (slot_id * sizeof(uint64_t)), virt_2_phys(device_context_vaddr));
+    __write8b(xhci_hc[id].dcbaap_vaddr + (slot_id * sizeof(uint64_t)), virt_2_phys(device_context_vaddr));
 
     slot_ctx.entries = 1;
     slot_ctx.speed = speed;
@@ -1009,7 +1008,7 @@ static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int s
     uint64_t input_ctx_buffer = (uint64_t)kzalloc(xhci_hc[id].context_size * 32, 0);
 
     // 置位input control context和slot context的add bit
-    xhci_write_mem32(input_ctx_buffer + 4, 0x3);
+    __write4b(input_ctx_buffer + 4, 0x3);
 
     // 拷贝slot上下文和control ep上下文到输入上下文中
     __write_slot(input_ctx_buffer + xhci_hc[id].context_size, (struct xhci_slot_context_t *)slot_vaddr);
@@ -1198,9 +1197,9 @@ static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr)
     int timer = 500;
     while (timer)
     {
-        if (xhci_read_mem32(status_vaddr) & XHCI_IRQ_DONE)
+        if (__read4b(status_vaddr) & XHCI_IRQ_DONE)
         {
-            uint32_t status = xhci_read_mem32(status_vaddr);
+            uint32_t status = __read4b(status_vaddr);
             // 判断完成码
             switch (xhci_get_comp_code(status))
             {
@@ -1349,15 +1348,17 @@ static int xhci_get_descriptor(const int id, const int port_id)
             break;
         }
     }
-
+    kdebug("to init slot");
     // 初始化接口的上下文
     uint64_t slot_vaddr = xhci_initialize_slot(id, slot_id, port_id, speed, max_packet);
 
+    kdebug("to set address");
     // 发送 address_device命令
     retval = xhci_set_address(id, slot_vaddr, slot_id, true);
     if (retval != 0)
         return retval;
 
+    kdebug("to ctrl in");
     // 发送用于 “get_descriptor” 的数据包。
     count = xhci_control_in(id, &dev_desc, 8, slot_id, max_packet);
     if (unlikely(count == 0))
@@ -1370,13 +1371,16 @@ static int xhci_get_descriptor(const int id, const int port_id)
     */
 
     // 重置当前端口
+    kdebug("to reset");
     xhci_reset_port(id, port_id);
 
     // 再次发送 set_address命令
+    kdebug("to set addr again");
     retval = xhci_set_address(id, slot_vaddr, slot_id, false);
     if (retval != 0)
         return retval;
 
+    kdebug("to ctrl in again");
     count = xhci_control_in(id, &dev_desc, 18, slot_id, max_packet);
     if (unlikely(count == 0))
         return -EAGAIN;
@@ -1441,10 +1445,12 @@ static int xhci_hc_start_ports(int id)
     {
         if (XHCI_PORT_IS_USB2(id, i) && XHCI_PORT_IS_ACTIVE(id, i))
         {
+            // kdebug("initializing usb2: %d", i);
             // reset该端口
             if (likely(xhci_reset_port(id, i) == 0)) // 如果端口reset成功，就获取它的描述符
                                                      // 否则，reset函数会把它给设置为未激活，并且标志配对的usb2端口是激活的
             {
+                // kdebug("reset ok");
                 if (xhci_get_descriptor(id, i) == 0)
                     ++cnt;
                 else
@@ -1537,9 +1543,9 @@ static int xhci_send_command(int id, struct xhci_TRB_t *trb, const bool do_ring)
     uint64_t origin_trb_vaddr = xhci_hc[id].cmd_trb_vaddr;
 
     // 必须先写入参数和状态数据，最后写入command
-    xhci_write_mem64(xhci_hc[id].cmd_trb_vaddr, trb->param);                                    // 参数
-    xhci_write_mem32(xhci_hc[id].cmd_trb_vaddr + 8, trb->status);                               // 状态
-    xhci_write_mem32(xhci_hc[id].cmd_trb_vaddr + 12, trb->command | xhci_hc[id].cmd_trb_cycle); // 命令
+    __write8b(xhci_hc[id].cmd_trb_vaddr, trb->param);                                    // 参数
+    __write4b(xhci_hc[id].cmd_trb_vaddr + 8, trb->status);                               // 状态
+    __write4b(xhci_hc[id].cmd_trb_vaddr + 12, trb->command | xhci_hc[id].cmd_trb_cycle); // 命令
 
     xhci_hc[id].cmd_trb_vaddr += sizeof(struct xhci_TRB_t); // 跳转到下一个trb
 
@@ -1564,7 +1570,7 @@ static int xhci_send_command(int id, struct xhci_TRB_t *trb, const bool do_ring)
 
         // Now wait for the interrupt to happen
         // We use bit 31 of the command dword since it is reserved
-        while (timer && ((xhci_read_mem32(origin_trb_vaddr + 8) & XHCI_IRQ_DONE) == 0))
+        while (timer && ((__read4b(origin_trb_vaddr + 8) & XHCI_IRQ_DONE) == 0))
         {
             usleep(1000);
             --timer;

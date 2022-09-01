@@ -198,9 +198,6 @@ void acpi_init()
             ;
     }
 
-    //虚拟内存映射
-    uint64_t padder = (uint64_t)acpi_RSDT_entry_phys_base;
-
     kinfo("ACPI module initialized!");
     return;
 }

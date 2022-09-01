@@ -41,7 +41,7 @@ static __always_inline void __send_eoi()
     {
 
         io_mfence();
-        *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI) = 0;
+        __write4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
         io_mfence();
     }
 }

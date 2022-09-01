@@ -23,7 +23,7 @@ static __always_inline void apic_timer_set_div(uint64_t divider)
     if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
         wrmsr(0x83e, divider);
     else
-        *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_CLKDIV) = (uint32_t)divider;
+        __write4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_CLKDIV, divider);
 }
 
 /**
@@ -36,7 +36,7 @@ static __always_inline void apic_timer_set_init_cnt(uint32_t init_cnt)
     if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
         wrmsr(0x838, init_cnt);
     else
-        *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_INITIAL_COUNT_REG) = (uint32_t)init_cnt;
+        __write4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_INITIAL_COUNT_REG, init_cnt);
 }
 
 /**
@@ -52,7 +52,7 @@ static __always_inline void apic_timer_set_LVT(uint32_t vector, uint32_t mask, u
     if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
         wrmsr(0x832, val);
     else
-        *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = (uint32_t)val;
+        __write4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER, val);
 }
 
 static __always_inline void apic_timer_write_LVT(uint32_t value)
@@ -60,7 +60,7 @@ static __always_inline void apic_timer_write_LVT(uint32_t value)
     if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
         wrmsr(0x832, value);
     else
-        *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER) = (uint32_t)value;
+        __write4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER, value);
 }
 
 /**
@@ -72,7 +72,7 @@ static __always_inline uint32_t apic_timer_get_LVT()
     if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
         return rdmsr(0x832);
     else
-        return *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER);
+        return __read4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER);
 }
 
 /**
@@ -83,8 +83,8 @@ static __always_inline uint32_t apic_timer_get_current()
 {
     if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
         return (uint32_t)rdmsr(0x839);
-    else 
-    return *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_CURRENT_COUNT_REG);
+    else
+        return __read4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_CURRENT_COUNT_REG);
 }
 
 /**

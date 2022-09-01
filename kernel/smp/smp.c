@@ -13,7 +13,7 @@
 
 void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs); // 由BSP转发的HPET中断处理函数
 
-static spinlock_t multi_core_starting_lock; // 多核启动锁
+static spinlock_t multi_core_starting_lock={1}; // 多核启动锁
 
 static struct acpi_Processor_Local_APIC_Structure_t *proc_local_apic_structs[MAX_SUPPORTED_PROCESSOR_NUM];
 static uint32_t total_processor_num = 0;
@@ -43,14 +43,16 @@ void smp_init()
     for (int i = 200; i < 210; ++i)
         set_intr_gate(i, 0, SMP_interrupt_table[i - 200]);
     memset((void *)SMP_IPI_desc, 0, sizeof(irq_desc_t) * SMP_IRQ_NUM);
-    
+
     io_mfence();
 
     // 注册接收bsp处理器的hpet中断转发的处理函数
     ipi_regiserIPI(0xc8, NULL, &ipi_0xc8_handler, NULL, NULL, "IPI 0xc8");
     io_mfence();
-    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, true, 0x00);
+    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, 0x00);
+
     kdebug("total_processor_num=%d", total_processor_num);
+    // total_processor_num = 3;
     for (int i = 1; i < total_processor_num; ++i) // i从1开始，不初始化bsp
     {
         io_mfence();
@@ -90,9 +92,9 @@ void smp_init()
                   cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start);
         io_mfence();
         // 连续发送两次start-up IPI
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->local_apic_id);
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
         io_mfence();
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, true, proc_local_apic_structs[i]->local_apic_id);
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
     }
     io_mfence();
     while (num_cpu_started != total_processor_num)

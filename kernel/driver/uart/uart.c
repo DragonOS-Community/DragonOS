@@ -13,9 +13,7 @@
  * @brief 当前是否有数据正等待发送
  *
  */
-// todo: 这里有bug，在真机上，一直认为端口是忙的
 #define is_transmit_empty(p) ((io_in8(p + 5) & 0x20))
-// #define is_transmit_empty(p) (1)
 
 /**
  * @brief 初始化com口
@@ -32,14 +30,15 @@ int uart_init(uint32_t port, uint32_t bits_rate)
     io_out8(port + 1, 0x00); // Disable all interrupts
     io_out8(port + 3, 0x80); // Enable DLAB (set baud rate divisor)
 
-    uint16_t divisor = E_UART_BITS_RATE_ERROR / bits_rate;
+    uint16_t divisor = UART_MAX_BITS_RATE / bits_rate;
+    
     io_out8(port + 0, divisor & 0xff);        // Set divisor  (lo byte)
     io_out8(port + 1, (divisor >> 8) & 0xff); //                  (hi byte)
     io_out8(port + 3, 0x03);                  // 8 bits, no parity, one stop bit
     io_out8(port + 2, 0xC7);                  // Enable FIFO, clear them, with 14-byte threshold
-    io_out8(port + 4, 0x0B);                  // IRQs enabled, RTS/DSR set
-    io_out8(port + 4, 0x1E);                  // Set in loopback mode, test the serial chip
-    io_out8(port + 0, 0xAE);                  // Test serial chip (send byte 0xAE and check if serial returns same byte)
+    io_out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
+    io_out8(port + 4, 0x1E); // Set in loopback mode, test the serial chip
+    io_out8(port + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
 
     // Check if serial is faulty (i.e: not same byte as sent)
     if (io_in8(port + 0) != 0xAE)
@@ -49,9 +48,9 @@ int uart_init(uint32_t port, uint32_t bits_rate)
 
     // If serial is not faulty set it in normal operation mode
     // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
-    io_out8(port + 4, 0x0F);
+    io_out8(port + 4, 0x08);
 
-    char init_text2[] = "uart initialized.";
+    char init_text2[] = "uart initialized.\n";
     for (int i = 0; i < sizeof(init_text2) - 1; ++i)
         uart_send(COM1, init_text2[i]);
     return UART_SUCCESS;

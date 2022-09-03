@@ -35,7 +35,6 @@ void smp_init()
         proc_local_apic_structs[i] = (struct acpi_Processor_Local_APIC_Structure_t *)(tmp_vaddr[i]);
     }
 
-    //*(uchar *)0x20000 = 0xf4; // 在内存的0x20000处写入HLT指令(AP处理器会执行物理地址0x20000的代码)
     // 将引导程序复制到物理地址0x20000处
     memcpy((unsigned char *)phys_2_virt(0x20000), _apu_boot_start, (unsigned long)&_apu_boot_end - (unsigned long)&_apu_boot_start);
     io_mfence();
@@ -135,11 +134,7 @@ void smp_ap_start()
                          : "memory");
     __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
                          : "memory");
-    /*
-        __asm__ __volatile__("movq %0, %%rbp \n\t" ::"m"(stack_start)
-                             : "memory");
-        __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(stack_start)
-                             : "memory");*/
+
     ksuccess("AP core successfully started!");
     io_mfence();
     ++num_cpu_started;
@@ -183,10 +178,6 @@ void smp_ap_start()
     while (1)
         hlt();
 
-    /*
-        if (proc_current_cpu_id == 1)
-            process_init();
-            */
     while (1)
     {
         printk_color(BLACK, WHITE, "CPU:%d IDLE process.\n", proc_current_cpu_id);

@@ -1323,6 +1323,7 @@ static int xhci_get_descriptor(const int id, const int port_id)
      */
     struct xhci_TRB_normal_t trb = {0};
     trb.TRB_type = TRB_TYPE_ENABLE_SLOT;
+    kdebug("to enable slot");
     if (xhci_send_command(id, (struct xhci_TRB_t *)&trb, true) != 0)
     {
         kerror("portid:%d: send enable slot failed", port_id);
@@ -1348,17 +1349,19 @@ static int xhci_get_descriptor(const int id, const int port_id)
             break;
         }
     }
-    kdebug("to init slot");
+
+
+    kdebug("speed=%d", speed);
     // 初始化接口的上下文
     uint64_t slot_vaddr = xhci_initialize_slot(id, slot_id, port_id, speed, max_packet);
+    kdebug("set addr");
 
-    kdebug("to set address");
     // 发送 address_device命令
     retval = xhci_set_address(id, slot_vaddr, slot_id, true);
     if (retval != 0)
         return retval;
+    kdebug("crtl in");
 
-    kdebug("to ctrl in");
     // 发送用于 “get_descriptor” 的数据包。
     count = xhci_control_in(id, &dev_desc, 8, slot_id, max_packet);
     if (unlikely(count == 0))
@@ -1370,17 +1373,21 @@ static int xhci_get_descriptor(const int id, const int port_id)
           evaluate_slot_context call.
     */
 
+    kdebug("reset port");
     // 重置当前端口
     kdebug("to reset");
     xhci_reset_port(id, port_id);
 
+    kdebug("set addr again");
     // 再次发送 set_address命令
     kdebug("to set addr again");
     retval = xhci_set_address(id, slot_vaddr, slot_id, false);
     if (retval != 0)
         return retval;
 
-    kdebug("to ctrl in again");
+
+    kdebug("ctrl in again");
+
     count = xhci_control_in(id, &dev_desc, 18, slot_id, max_packet);
     if (unlikely(count == 0))
         return -EAGAIN;
@@ -1447,14 +1454,17 @@ static int xhci_hc_start_ports(int id)
         {
             // kdebug("initializing usb2: %d", i);
             // reset该端口
+            kdebug("to reset port %d, rflags=%#018lx", id, get_rflags());
             if (likely(xhci_reset_port(id, i) == 0)) // 如果端口reset成功，就获取它的描述符
                                                      // 否则，reset函数会把它给设置为未激活，并且标志配对的usb2端口是激活的
             {
-                // kdebug("reset ok");
+                kdebug("reset port %d ok", id);
+
                 if (xhci_get_descriptor(id, i) == 0)
                     ++cnt;
                 else
                     break;
+                kdebug("port %d get desc ok", id);
             }
         }
     }

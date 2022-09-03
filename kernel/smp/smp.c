@@ -57,14 +57,6 @@ void smp_init()
     for (int i = 0; i < total_processor_num; ++i) // i从1开始，不初始化bsp
     {
         io_mfence();
-        // if (proc_local_apic_structs[i]->ACPI_Processor_UID == 0)
-        //     --total_processor_num;
-        // io_mfence();
-        // if (proc_local_apic_structs[i]->local_apic_id > total_processor_num)
-        // {
-        //     --total_processor_num;
-        //     continue;
-        // }
 
         // 跳过BSP
         kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id, proc_local_apic_structs[i]->flags);

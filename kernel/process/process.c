@@ -24,6 +24,8 @@
 
 #include <mm/mmio.h>
 
+#include <common/lz4.h>
+
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
 
@@ -462,6 +464,7 @@ ul initial_kernel_thread(ul arg)
     // kinfo("initial proc running...\targ:%#018lx", arg);
     fat32_init();
     usb_init();
+    kinfo("LZ4 lib Version=%s", LZ4_versionString());
 
     // 对一些组件进行单元测试
     uint64_t tpid[] = {
@@ -1152,9 +1155,11 @@ int process_fd_alloc(struct vfs_file_t *file)
     int fd_num = -1;
     struct vfs_file_t **f = current_pcb->fds;
 
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i) {
+    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+    {
         /* 找到指针数组中的空位 */
-        if (f[i] == NULL) {
+        if (f[i] == NULL)
+        {
             fd_num = i;
             f[i] = file;
             break;

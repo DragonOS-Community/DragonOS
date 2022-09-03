@@ -213,6 +213,8 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
     uart_send(COM1, character);
     if (unlikely(character == '\n'))
     {
+        // 换行时还需要输出\r
+        uart_send(COM1, '\r');
         __textui_new_line(window, window->vline_operating);
         // spin_unlock_irqrestore(&window->lock, rflags);
         spin_unlock(&window->lock);

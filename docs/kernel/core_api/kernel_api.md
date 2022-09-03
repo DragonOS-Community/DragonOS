@@ -311,3 +311,45 @@
 **...**
 
 &emsp;&emsp;可变参数
+
+### 内存操作
+
+#### `void *memcpy(void *dst, const void *src, uint64_t size)`
+
+##### 描述
+
+&emsp;&emsp;将内存从src处拷贝到dst处。
+
+##### 参数
+
+**dst**
+
+&emsp;&emsp;指向目标地址的指针
+
+**src**
+
+&emsp;&emsp;指向源地址的指针
+
+**size**
+
+&emsp;&emsp;待拷贝的数据大小
+
+#### `void *memmove(void *dst, const void *src, uint64_t size)`
+
+##### 描述
+
+&emsp;&emsp;与`memcpy()`类似，但是在源数据区域与目标数据区域之间存在重合时，该函数能防止数据被错误的覆盖。
+
+##### 参数
+
+**dst**
+
+&emsp;&emsp;指向目标地址的指针
+
+**src**
+
+&emsp;&emsp;指向源地址的指针
+
+**size**
+
+&emsp;&emsp;待拷贝的数据大小

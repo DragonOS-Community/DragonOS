@@ -66,7 +66,7 @@ void mm_init()
         if (mb2_mem_info->type == 1)
             mm_Total_Memory += mb2_mem_info->len;
 
-        kdebug("[i=%d] mb2_mem_info[i].type=%d, mb2_mem_info[i].addr=%#018lx", i, mb2_mem_info[i].type, mb2_mem_info[i].addr);
+        // kdebug("[i=%d] mb2_mem_info[i].type=%d, mb2_mem_info[i].addr=%#018lx", i, mb2_mem_info[i].type, mb2_mem_info[i].addr);
         // 保存信息到mms
         memory_management_struct.e820[i].BaseAddr = mb2_mem_info[i].addr;
         memory_management_struct.e820[i].Length = mb2_mem_info[i].len;

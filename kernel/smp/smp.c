@@ -13,7 +13,7 @@
 
 void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs); // 由BSP转发的HPET中断处理函数
 
-static spinlock_t multi_core_starting_lock={1}; // 多核启动锁
+static spinlock_t multi_core_starting_lock = {1}; // 多核启动锁
 
 static struct acpi_Processor_Local_APIC_Structure_t *proc_local_apic_structs[MAX_SUPPORTED_PROCESSOR_NUM];
 static uint32_t total_processor_num = 0;
@@ -52,19 +52,26 @@ void smp_init()
     ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, 0x00);
 
     kdebug("total_processor_num=%d", total_processor_num);
+    kdebug("rflags=%#018lx", get_rflags());
     // total_processor_num = 3;
-    for (int i = 1; i < total_processor_num; ++i) // i从1开始，不初始化bsp
+    for (int i = 0; i < total_processor_num; ++i) // i从1开始，不初始化bsp
     {
         io_mfence();
-        if (proc_local_apic_structs[i]->ACPI_Processor_UID == 0)
-            --total_processor_num;
-        io_mfence();
-        if (proc_local_apic_structs[i]->local_apic_id > total_processor_num)
+
+        // 跳过BSP
+        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id, proc_local_apic_structs[i]->flags);
+        if (proc_local_apic_structs[i]->local_apic_id == 0)
         {
             --total_processor_num;
             continue;
         }
-        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id, proc_local_apic_structs[i]->flags);
+        if (!((proc_local_apic_structs[i]->flags & 0x1) || (proc_local_apic_structs[i]->flags & 0x2)))
+        {
+            --total_processor_num;
+            kdebug("processor %d cannot be enabled.", proc_local_apic_structs[i]->ACPI_Processor_UID);
+            continue;
+        }
+        // continue;
         io_mfence();
         spin_lock(&multi_core_starting_lock);
         preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt count
@@ -91,10 +98,12 @@ void smp_init()
         set_tss64((uint *)cpu_core_info[current_starting_cpu].tss_vaddr, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start,
                   cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start);
         io_mfence();
+        kdebug("to send ipi");
         // 连续发送两次start-up IPI
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
         io_mfence();
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
+        kdebug("send ipi ok");
     }
     io_mfence();
     while (num_cpu_started != total_processor_num)

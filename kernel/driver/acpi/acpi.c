@@ -138,7 +138,7 @@ void acpi_init()
         mm_map(&initial_mm, acpi_rsdt_virt_addr_base, PAGE_2M_SIZE, paddr);
 
         // rsdt表虚拟地址
-        rsdt = (struct acpi_RSDT_Structure_t *)acpi_rsdt_virt_addr_base;
+        rsdt = (struct acpi_RSDT_Structure_t *)(acpi_rsdt_virt_addr_base + acpi_RSDT_offset);
         kdebug("RSDT mapped!(v2)");
 
         // 计算RSDT Entry的数量
@@ -161,7 +161,7 @@ void acpi_init()
     }
     else if (rsdpv1->RsdtAddress != (uint)0x00UL)
     {
-        // redt表物理地址
+        // rsdt表物理地址
         ul rsdt_phys_base = rsdpv1->RsdtAddress & PAGE_2M_MASK;
         acpi_RSDT_offset = rsdpv1->RsdtAddress - rsdt_phys_base;
         // rsdt = (struct acpi_RSDT_Structure_t *)(ACPI_RSDT_VIRT_ADDR_BASE + acpi_RSDT_offset);
@@ -175,7 +175,7 @@ void acpi_init()
         mm_map(&initial_mm, acpi_rsdt_virt_addr_base, PAGE_2M_SIZE, paddr);
 
         // rsdt表虚拟地址
-        rsdt = (struct acpi_RSDT_Structure_t *)acpi_rsdt_virt_addr_base;
+        rsdt = (struct acpi_RSDT_Structure_t *)(acpi_rsdt_virt_addr_base + acpi_RSDT_offset);
         kdebug("RSDT mapped!");
 
         // 计算RSDT Entry的数量

@@ -74,7 +74,7 @@ void smp_init()
         io_mfence();
         spin_lock(&multi_core_starting_lock);
         preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt count
-        current_starting_cpu = proc_local_apic_structs[i]->local_apic_id;
+        current_starting_cpu = proc_local_apic_structs[i]->ACPI_Processor_UID;
         io_mfence();
         // 为每个AP处理器分配栈空间
         cpu_core_info[current_starting_cpu].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
@@ -97,12 +97,12 @@ void smp_init()
         set_tss64((uint *)cpu_core_info[current_starting_cpu].tss_vaddr, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start,
                   cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start);
         io_mfence();
-        kdebug("to send ipi");
+
         // 连续发送两次start-up IPI
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
         io_mfence();
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
-        kdebug("send ipi ok");
+
     }
     io_mfence();
     while (num_cpu_started != total_processor_num)
@@ -135,11 +135,9 @@ void smp_ap_start()
     __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
                          : "memory");
 
-    ksuccess("AP core successfully started!");
+    ksuccess("AP core %d successfully started!", current_starting_cpu);
     io_mfence();
     ++num_cpu_started;
-
-    kdebug("current cpu = %d", current_starting_cpu);
 
     apic_init_ap_core_local_apic();
 
@@ -168,7 +166,6 @@ void smp_ap_start()
     load_TR(10 + current_starting_cpu * 2);
     current_pcb->preempt_count = 0;
 
-    // kdebug("IDT_addr = %#018lx", phys_2_virt(IDT_Table));
     io_mfence();
     spin_unlock(&multi_core_starting_lock);
     preempt_disable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count

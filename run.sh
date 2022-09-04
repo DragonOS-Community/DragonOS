@@ -11,6 +11,13 @@ IA32_USE_QEMU=1
 bochsrc="./bochsrc"
 ARCH="x86_64"
 
+for i in "$@"
+do
+    if [ $i == "--no-qemu" ];then
+        IA32_USE_QEMU=0
+    fi
+done
+
 if [ ${IA32_USE_QEMU} == "1" ];then
     export EMULATOR=__QEMU_EMULATION__
 else

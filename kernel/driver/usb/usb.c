@@ -17,7 +17,7 @@ static int usb_pdevs_count = 0;
  * @brief 初始化usb驱动程序
  *
  */
-void usb_init()
+int usb_init()
 {
     kinfo("Initializing usb driver...");
     spin_init(&xhci_controller_init_lock);
@@ -30,7 +30,7 @@ void usb_init()
         kwarn("There is no usb hardware in this computer!");
         return;
     }
-    kdebug("usb_pdevs_count=%d",usb_pdevs_count);
+    kdebug("usb_pdevs_count=%d", usb_pdevs_count);
     // 初始化每个usb控制器
     for (volatile int i = 0; i < usb_pdevs_count; ++i)
     {
@@ -59,4 +59,5 @@ void usb_init()
         }
     }
     kinfo("Successfully initialized all usb host controllers!");
+    return 0;
 }

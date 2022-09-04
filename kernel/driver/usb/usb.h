@@ -133,4 +133,4 @@ enum
  * @brief 初始化usb驱动程序
  *
  */
-void usb_init();
+int usb_init();

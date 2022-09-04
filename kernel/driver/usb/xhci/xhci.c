@@ -47,9 +47,6 @@ static int xhci_data_stage(struct xhci_ep_ring_info_t *ep, uint64_t buf_vaddr, u
 static int xhci_status_stage(const int id, uint8_t direction, uint64_t status_buf_vaddr);
 static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr);
 
-static struct xhci_ep_context_t ep_ctx = {0};
-struct xhci_slot_context_t slot_ctx = {0};
-
 hardware_intr_controller xhci_hc_intr_controller =
     {
         .enable = xhci_hc_irq_enable,
@@ -732,7 +729,8 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
             struct xhci_TRB_cmd_complete_t *event_trb_ptr = (struct xhci_TRB_cmd_complete_t *)&event_trb;
             if ((event_trb.command & (1 << 2)) == 0) // 当前event trb不是由于short packet产生的
             {
-
+                // kdebug("event_trb_ptr->code=%d", event_trb_ptr->code);
+                // kdebug("event_trb_ptr->TRB_type=%d", event_trb_ptr->TRB_type);
                 switch (event_trb_ptr->code) // 判断它的完成码
                 {
                 case TRB_COMP_TRB_SUCCESS: // trb执行成功，则将结果返回到对应的command ring的trb里面
@@ -813,9 +811,7 @@ static int xhci_reset_port(const int id, const int port)
     int retval = 0;
     // 相对于op寄存器基地址的偏移量
     uint64_t port_status_offset = XHCI_OPS_PRS + port * 16;
-    // kdebug("to reset %d, portsc=%#010lx", port, (xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC)));
-    // kdebug("to reset %d, usbcmd=%#010lx", port, xhci_read_op_reg32(id, XHCI_OPS_USBCMD));
-    // kdebug("to reset %d, usbsts=%#010lx", port, xhci_read_op_reg32(id, XHCI_OPS_USBSTS));
+
     io_mfence();
     // 检查端口电源状态
     if ((xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC) & (1 << 9)) == 0)
@@ -847,20 +843,22 @@ static int xhci_reset_port(const int id, const int port)
     retval = -ETIMEDOUT;
     // kdebug("to wait reset timeout;");
     // 等待portsc的port reset change位被置位，说明reset完成
-    int timeout = 200;
+    int timeout = 100;
     while (timeout)
     {
         io_mfence();
         uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
-        // kdebug("val=%#010lx", val);
         io_mfence();
+        if (val & (1 << 21))
+            break;
+        // QEMU对usb的模拟有bug，因此需要检测这里
+#ifdef __QEMU_EMULATION__
+
         if (XHCI_PORT_IS_USB3(id, port) && (val & (1 << 31)) == 0)
             break;
         else if (XHCI_PORT_IS_USB2(id, port) && (val & (1 << 4)) == 0)
             break;
-        else if (val & (1 << 21))
-            break;
-
+#endif
         --timeout;
         usleep(500);
     }
@@ -870,9 +868,10 @@ static int xhci_reset_port(const int id, const int port)
     {
         // 等待恢复
         usleep(USB_TIME_RST_REC * 100);
-        // kdebug("to check if reset ok");
         uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
         io_mfence();
+
+        // kdebug("to check if reset ok, val=%#010lx", val);
 
         // 如果reset之后，enable bit仍然是1，那么说明reset成功
         if (val & (1 << 1))
@@ -928,7 +927,7 @@ static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int 
     // kdebug("slot id=%d, device_context_vaddr=%#018lx, port=%d", slot_id, device_context_vaddr, port);
     // 写到数组中
     __write8b(xhci_hc[id].dcbaap_vaddr + (slot_id * sizeof(uint64_t)), virt_2_phys(device_context_vaddr));
-
+    struct xhci_slot_context_t slot_ctx = {0};
     slot_ctx.entries = 1;
     slot_ctx.speed = speed;
     slot_ctx.route_string = 0;
@@ -964,6 +963,7 @@ static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const in
     // 由于目前只实现获取设备的描述符，因此暂时只支持control ep
     if (type != USB_EP_CONTROL)
         return;
+    struct xhci_ep_context_t ep_ctx = {0};
     memset(&ep_ctx, 0, sizeof(struct xhci_ep_context_t));
 
     xhci_hc[id].control_ep_info.ep_ring_vbase = xhci_create_ring(XHCI_TRBS_PER_RING);
@@ -1004,6 +1004,8 @@ static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const in
 static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int slot_id, const bool block)
 {
     int retval = 0;
+    struct xhci_slot_context_t slot;
+    struct xhci_ep_context_t ep;
     // 创建输入上下文缓冲区
     uint64_t input_ctx_buffer = (uint64_t)kzalloc(xhci_hc[id].context_size * 32, 0);
 
@@ -1011,9 +1013,16 @@ static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int s
     __write4b(input_ctx_buffer + 4, 0x3);
 
     // 拷贝slot上下文和control ep上下文到输入上下文中
-    __write_slot(input_ctx_buffer + xhci_hc[id].context_size, (struct xhci_slot_context_t *)slot_vaddr);
 
-    __write_ep(id, input_ctx_buffer, 2, (struct xhci_ep_context_t *)(slot_vaddr + XHCI_EP_CONTROL * xhci_hc[id].context_size));
+    //  __write_ep(id, input_ctx_buffer, 2, &ep_ctx);
+    __read_from_slot(&slot, slot_vaddr);
+    __read_from_ep(id, slot_vaddr, 1, &ep);
+    ep.err_cnt = 3;
+    kdebug("slot.slot_state=%d, speed=%d, root hub port num=%d", slot.slot_state, slot.speed, slot.rh_port_num);
+    kdebug("ep.type=%d, max_packet=%d, dequeue_ptr=%#018lx", ep.ep_type, ep.max_packet_size, ep.tr_dequeue_ptr);
+
+    __write_slot(input_ctx_buffer + xhci_hc[id].context_size, &slot);
+    __write_ep(id, input_ctx_buffer, 2, &ep);
 
     struct xhci_TRB_normal_t trb = {0};
     trb.buf_paddr = virt_2_phys(input_ctx_buffer);
@@ -1027,25 +1036,15 @@ static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int s
     if (unlikely(retval != 0))
     {
         kerror("slotid:%d, address device failed", slot_id);
-
         goto failed;
     }
 
     struct xhci_TRB_cmd_complete_t *trb_done = (struct xhci_TRB_cmd_complete_t *)&trb;
-    // kdebug("address slot: comp code=%d", trb_done->code);
     if (trb_done->code == TRB_COMP_TRB_SUCCESS) // 成功执行
     {
         // 如果要从控制器获取刚刚设置的设备地址的话，可以在这里读取slot context
-        // ksuccess("slot %d successfully addressed.", slot_id);
-        struct xhci_slot_context_t slot;
-        struct xhci_ep_context_t ep;
-        __read_from_slot(&slot, slot_vaddr);
-        slot_ctx.slot_state = slot.slot_state;
-        slot_ctx.device_address = slot.device_address;
-        __read_from_ep(id, slot_vaddr, 1, &ep);
-        // kdebug("ep.ep_state=%d, slot_state=%d", ep.ep_state, slot.slot_state);
-        ep_ctx.ep_state = ep.ep_state;
-        ep_ctx.max_packet_size = ep.max_packet_size;
+        ksuccess("slot %d successfully addressed.", slot_id);
+
         retval = 0;
     }
     else
@@ -1323,12 +1322,13 @@ static int xhci_get_descriptor(const int id, const int port_id)
      */
     struct xhci_TRB_normal_t trb = {0};
     trb.TRB_type = TRB_TYPE_ENABLE_SLOT;
-    kdebug("to enable slot");
+    // kdebug("to enable slot");
     if (xhci_send_command(id, (struct xhci_TRB_t *)&trb, true) != 0)
     {
         kerror("portid:%d: send enable slot failed", port_id);
         return -ETIMEDOUT;
     }
+    // kdebug("send enable slot ok");
 
     uint32_t slot_id = ((struct xhci_TRB_cmd_complete_t *)&trb)->slot_id;
     int16_t max_packet;
@@ -1350,48 +1350,27 @@ static int xhci_get_descriptor(const int id, const int port_id)
         }
     }
 
-
-    kdebug("speed=%d", speed);
+    // kdebug("speed=%d", speed);
     // 初始化接口的上下文
     uint64_t slot_vaddr = xhci_initialize_slot(id, slot_id, port_id, speed, max_packet);
-    kdebug("set addr");
 
-    // 发送 address_device命令
-    retval = xhci_set_address(id, slot_vaddr, slot_id, true);
+    // kdebug("set addr again");
+    // 再次发送 set_address命令
+    // kdebug("to set addr again");
+    retval = xhci_set_address(id, slot_vaddr, slot_id, false);
     if (retval != 0)
         return retval;
-    kdebug("crtl in");
 
-    // 发送用于 “get_descriptor” 的数据包。
-    count = xhci_control_in(id, &dev_desc, 8, slot_id, max_packet);
+    // kdebug("ctrl in again");
+
+    count = xhci_control_in(id, &dev_desc, 18, slot_id, max_packet);
     if (unlikely(count == 0))
         return -EAGAIN;
-
     /*
         TODO: if the dev_desc.max_packet was different than what we have as max_packet,
           you would need to change it here and in the slot context by doing a
           evaluate_slot_context call.
     */
-
-    kdebug("reset port");
-    // 重置当前端口
-    kdebug("to reset");
-    xhci_reset_port(id, port_id);
-
-    kdebug("set addr again");
-    // 再次发送 set_address命令
-    kdebug("to set addr again");
-    retval = xhci_set_address(id, slot_vaddr, slot_id, false);
-    if (retval != 0)
-        return retval;
-
-
-    kdebug("ctrl in again");
-
-    count = xhci_control_in(id, &dev_desc, 18, slot_id, max_packet);
-    if (unlikely(count == 0))
-        return -EAGAIN;
-
     // print the descriptor
     printk("  Found USB Device:\n"
            "                port: %i\n"
@@ -1430,18 +1409,22 @@ static int xhci_hc_start_ports(int id)
     // 注意，这两个循环应该不能合并到一起，因为可能存在usb2端口offset在前，usb3端口在后的情况，那样的话就会出错
 
     // 循环启动所有的usb3端口
-    // for (int i = 0; i < xhci_hc[id].port_num; ++i)
-    for (int i = 0; i < 1; ++i)
+    for (int i = 0; i < xhci_hc[id].port_num; ++i)
     {
         if (XHCI_PORT_IS_USB3(id, i) && XHCI_PORT_IS_ACTIVE(id, i))
         {
             io_mfence();
+            // kdebug("to reset port %d, rflags=%#018lx", id, get_rflags());
+            int rst_ret = xhci_reset_port(id, i);
+            // kdebug("reset done!, val=%d", rst_ret);
             // reset该端口
-            if (likely(xhci_reset_port(id, i) == 0)) // 如果端口reset成功，就获取它的描述符
-                                                     // 否则，reset函数会把它给设置为未激活，并且标志配对的usb2端口是激活的
+            if (likely(rst_ret == 0)) // 如果端口reset成功，就获取它的描述符
+                                      // 否则，reset函数会把它给设置为未激活，并且标志配对的usb2端口是激活的
             {
+                // kdebug("reset port %d ok", id);
                 if (xhci_get_descriptor(id, i) == 0)
                     ++cnt;
+                kdebug("usb3 port %d get desc ok", i);
             }
         }
     }
@@ -1454,17 +1437,15 @@ static int xhci_hc_start_ports(int id)
         {
             // kdebug("initializing usb2: %d", i);
             // reset该端口
-            kdebug("to reset port %d, rflags=%#018lx", id, get_rflags());
+            // kdebug("to reset port %d, rflags=%#018lx", i, get_rflags());
             if (likely(xhci_reset_port(id, i) == 0)) // 如果端口reset成功，就获取它的描述符
                                                      // 否则，reset函数会把它给设置为未激活，并且标志配对的usb2端口是激活的
             {
-                kdebug("reset port %d ok", id);
+                // kdebug("reset port %d ok", id);
 
                 if (xhci_get_descriptor(id, i) == 0)
                     ++cnt;
-                else
-                    break;
-                kdebug("port %d get desc ok", id);
+                kdebug("USB2 port %d get desc ok", i);
             }
         }
     }
@@ -1711,6 +1692,23 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
     // 写入dcbaap
     xhci_write_op_reg64(cid, XHCI_OPS_DCBAAP, virt_2_phys(xhci_hc[cid].dcbaap_vaddr));
     io_mfence();
+
+    // 创建scratchpad buffer array
+    uint32_t max_scratchpad_buf = (((uint32_t)hcs2.max_scratchpad_buf_HI5) << 5) | hcs2.max_scratchpad_buf_LO5;
+    kdebug("max scratchpad buffer=%d", max_scratchpad_buf);
+    if (max_scratchpad_buf > 0)
+    {
+        xhci_hc[cid].scratchpad_buf_array_vaddr = (uint64_t)kzalloc(sizeof(uint64_t) * max_scratchpad_buf, 0);
+        __write8b(xhci_hc[cid].dcbaap_vaddr, virt_2_phys(xhci_hc[cid].scratchpad_buf_array_vaddr));
+
+        // 创建scratchpad buffers
+        for (int i = 0; i < max_scratchpad_buf; ++i)
+        {
+            uint64_t buf_vaddr = kzalloc(xhci_hc[cid].page_size, 0);
+            __write8b(xhci_hc[cid].scratchpad_buf_array_vaddr, virt_2_phys(buf_vaddr));
+        }
+    }
+
     // 创建command ring
     xhci_hc[cid].cmd_ring_vaddr = xhci_create_ring(XHCI_CMND_RING_TRBS);
     xhci_hc[cid].cmd_trb_vaddr = xhci_hc[cid].cmd_ring_vaddr;

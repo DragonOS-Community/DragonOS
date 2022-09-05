@@ -463,7 +463,9 @@ ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
     fat32_init();
-    usb_init();
+    // 使用单独的内核线程来初始化usb驱动程序
+    int usb_pid = kernel_thread(usb_init, 0, 0);
+
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
 
     // 对一些组件进行单元测试
@@ -471,21 +473,14 @@ ul initial_kernel_thread(ul arg)
         ktest_start(ktest_test_bitree, 0),
         ktest_start(ktest_test_kfifo, 0),
         ktest_start(ktest_test_mutex, 0),
+        usb_pid,
     };
     kinfo("Waiting test thread exit...");
     // 等待测试进程退出
     for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
         waitpid(tpid[i], NULL, NULL);
     kinfo("All test done.");
-    // pid_t p = fork();
-    // if (p == 0)
-    // {
-    //     kdebug("in subproc, rflags=%#018lx", get_rflags());
 
-    //     while (1)
-    //         usleep(1000);
-    // }
-    // kdebug("subprocess pid=%d", p);
 
     // 准备切换到用户态
     struct pt_regs *regs;

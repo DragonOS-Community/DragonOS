@@ -13,7 +13,7 @@ typedef uint32_t gid_t;
 typedef long long ssize_t;
 
 typedef int __pid_t;
-#define pid_t __pid_t
+#define pid_t uint64_t
 typedef __SIZE_TYPE__ size_t;
 
 typedef char *caddr_t;
@@ -36,6 +36,8 @@ typedef uint32_t clock_t;
 
 typedef uint64_t fsblkcnt_t;
 typedef uint64_t fsfilcnt_t;
+
+typedef uint64_t sector_t;
 
 #define __socklen_t_defined
 #define __socklen_t uint32_t

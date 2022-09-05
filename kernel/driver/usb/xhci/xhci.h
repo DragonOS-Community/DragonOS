@@ -518,22 +518,26 @@ struct xhci_host_controller_t
     uint64_t vbase_op;                                         // Operational registers 起始虚拟地址
     uint32_t rts_offset;                                       // Runtime Register Space offset
     uint32_t db_offset;                                        // Doorbell offset
-    uint32_t ext_caps_off;                                     // 扩展能力寄存器偏移量
-    uint8_t context_size;                                      // 设备上下文大小
-    uint16_t port_num;                                         // 总的端口数量
-    uint8_t port_num_u2;                                       // usb 2.0端口数量
-    uint8_t port_num_u3;                                       // usb 3端口数量
-    uint32_t page_size;                                        // page size
-    uint64_t dcbaap_vaddr;                                     // Device Context Base Address Array Pointer的虚拟地址
-    uint64_t cmd_ring_vaddr;                                   // command ring的虚拟地址
-    uint64_t cmd_trb_vaddr;                                    // 下一个要写入的trb的虚拟地址
-    uint64_t event_ring_vaddr;                                 // event ring的虚拟地址
-    uint64_t event_ring_table_vaddr;                           // event ring table的虚拟地址
-    uint64_t current_event_ring_vaddr;                         // 下一个要读取的event TRB的虚拟地址
-    uint8_t cmd_trb_cycle;                                     // 当前command ring cycle
-    uint8_t current_event_ring_cycle;                          // 当前event ring cycle
-    struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS];    // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
-    struct xhci_ep_ring_info_t control_ep_info;                // 控制端点的信息
+
+    uint32_t ext_caps_off; // 扩展能力寄存器偏移量
+    uint16_t port_num;     // 总的端口数量
+    uint8_t context_size;  // 设备上下文大小
+    uint8_t port_num_u2;   // usb 2.0端口数量
+
+    uint8_t port_num_u3;              // usb 3端口数量
+    uint8_t current_event_ring_cycle; // 当前event ring cycle
+    uint8_t cmd_trb_cycle;            // 当前command ring cycle
+    uint32_t page_size;               // page size
+
+    uint64_t dcbaap_vaddr;                                  // Device Context Base Address Array Pointer的虚拟地址
+    uint64_t cmd_ring_vaddr;                                // command ring的虚拟地址
+    uint64_t cmd_trb_vaddr;                                 // 下一个要写入的trb的虚拟地址
+    uint64_t event_ring_vaddr;                              // event ring的虚拟地址
+    uint64_t event_ring_table_vaddr;                        // event ring table的虚拟地址
+    uint64_t current_event_ring_vaddr;                      // 下一个要读取的event TRB的虚拟地址
+    uint64_t scratchpad_buf_array_vaddr;                    // 草稿行缓冲区数组的虚拟地址
+    struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS]; // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
+    struct xhci_ep_ring_info_t control_ep_info;             // 控制端点的信息
 };
 
 // Common TRB types

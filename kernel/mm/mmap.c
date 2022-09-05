@@ -351,6 +351,7 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     int retval = 0;
     // 获取物理地址对应的页面
     struct Page *pg;
+    uint64_t page_flags = PAGE_PWT | PAGE_PCD;
     if (vma->vm_flags & VM_IO) // 对于mmio的内存，创建新的page结构体
     {
         if (unlikely(vma->anon_vma == NULL || vma->anon_vma->page == NULL))
@@ -385,11 +386,10 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     // 先映射2M页
     if (likely(len_2m > 0))
     {
-        uint64_t page_flags = 0;
         if (vma->vm_flags & VM_USER)
-            page_flags = PAGE_USER_PAGE;
+            page_flags |= PAGE_USER_PAGE;
         else
-            page_flags = PAGE_KERNEL_PAGE;
+            page_flags |= PAGE_KERNEL_PAGE;
         // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
         retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start, paddr, len_2m, page_flags, false, false, false);
         if (unlikely(retval != 0))
@@ -400,11 +400,10 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     {
         len_4k = ALIGN(len_4k, PAGE_4K_SIZE);
 
-        uint64_t page_flags = 0;
         if (vma->vm_flags & VM_USER)
-            page_flags = PAGE_USER_4K_PAGE;
+            page_flags |= PAGE_USER_4K_PAGE;
         else
-            page_flags = PAGE_KERNEL_4K_PAGE;
+            page_flags |= PAGE_KERNEL_4K_PAGE;
         // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
         retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start + len_2m, paddr + len_2m, len_4k, page_flags, false, false, true);
         if (unlikely(retval != 0))

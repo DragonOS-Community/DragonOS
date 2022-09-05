@@ -1,20 +1,20 @@
 
 CFLAGS += -I .
 
-all: fat32.o MBR.o VFS.o fat_ent.o
+
+kernel_fs_objs:= $(shell find ./*.c)
+kernel_fs_subdirs:= devfs VFS fat32
+
+ECHO:
+	@echo "$@"
 
 
-fat32.o: fat32/fat32.c
-	gcc $(CFLAGS) -c fat32/fat32.c -o fat32/fat32.o
+$(kernel_fs_objs): ECHO
+	gcc $(CFLAGS) -c $@ -o $@.o
 
-MBR.o: MBR.c
-	gcc $(CFLAGS) -c MBR.c -o MBR.o
+$(kernel_fs_subdirs): ECHO
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"
 
-VFS.o: VFS/VFS.c
-	gcc $(CFLAGS) -c VFS/VFS.c -o VFS/VFS.o
 
-fat_ent.o: fat32/fat_ent.c
-	gcc $(CFLAGS) -c fat32/fat_ent.c -o fat32/fat_ent.o
+all: $(kernel_fs_objs) $(kernel_fs_subdirs)
 
-clean:
-	echo "Done."

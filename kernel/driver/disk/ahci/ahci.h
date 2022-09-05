@@ -1,6 +1,6 @@
 #pragma once
 
-#include <driver/disk/block_device.h>
+#include <common/blk_types.h>
 #include <driver/pci/pci.h>
 #include <mm/mm.h>
 

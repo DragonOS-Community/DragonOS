@@ -1704,7 +1704,7 @@ void xhci_init(struct pci_device_structure_general_device_t *dev_hdr)
         // 创建scratchpad buffers
         for (int i = 0; i < max_scratchpad_buf; ++i)
         {
-            uint64_t buf_vaddr = kzalloc(xhci_hc[cid].page_size, 0);
+            uint64_t buf_vaddr = (uint64_t)kzalloc(xhci_hc[cid].page_size, 0);
             __write8b(xhci_hc[cid].scratchpad_buf_array_vaddr, virt_2_phys(buf_vaddr));
         }
     }

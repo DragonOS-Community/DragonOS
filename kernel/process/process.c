@@ -19,6 +19,7 @@
 #include <sched/sched.h>
 #include <common/unistd.h>
 #include <debug/traceback/traceback.h>
+#include <driver/disk/ahci/ahci.h>
 
 #include <ktest/ktest.h>
 
@@ -462,6 +463,7 @@ exec_failed:;
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
+    ahci_init();
     fat32_init();
     // 使用单独的内核线程来初始化usb驱动程序
     int usb_pid = kernel_thread(usb_init, 0, 0);
@@ -480,7 +482,6 @@ ul initial_kernel_thread(ul arg)
     for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
         waitpid(tpid[i], NULL, NULL);
     kinfo("All test done.");
-
 
     // 准备切换到用户态
     struct pt_regs *regs;

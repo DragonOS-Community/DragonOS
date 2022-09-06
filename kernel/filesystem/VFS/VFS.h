@@ -13,8 +13,9 @@
 
 #include <common/glib.h>
 #include <common/fcntl.h>
+#include <common/blk_types.h>
 
-struct vfs_superblock_t *vfs_root_sb = NULL;
+extern struct vfs_superblock_t *vfs_root_sb;
 
 #define VFS_DPT_MBR 0 // MBR分区表
 #define VFS_DPT_GPT 1 // GPT分区表
@@ -53,6 +54,7 @@ struct vfs_superblock_t
 {
     struct vfs_dir_entry_t *root;
     struct vfs_super_block_operations_t *sb_ops;
+    struct block_device *blk_device;
     void *private_sb_info;
 };
 
@@ -91,7 +93,7 @@ struct vfs_filesystem_type_t
 {
     char *name;
     int fs_flags;
-    struct vfs_superblock_t *(*read_superblock)(void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num); // 解析文件系统引导扇区的函数，为文件系统创建超级块结构。其中DPTE为磁盘分区表entry（MBR、GPT不同）
+    struct vfs_superblock_t *(*read_superblock)(struct block_device *blk); // 解析文件系统引导扇区的函数，为文件系统创建超级块结构。
     struct vfs_filesystem_type_t *next;
 };
 
@@ -173,13 +175,12 @@ uint64_t vfs_unregister_filesystem(struct vfs_filesystem_type_t *fs);
 /**
  * @brief 挂载文件系统
  *
+ * @param path 要挂载到的路径
  * @param name 文件系统名
- * @param DPTE 分区表entry
- * @param DPT_type 分区表类型
- * @param buf 文件系统的引导扇区
- * @return struct vfs_superblock_t*
+ * @param blk 块设备结构体
+ * @return struct vfs_superblock_t* 挂载后，文件系统的超级块
  */
-struct vfs_superblock_t *vfs_mount_fs(char *name, void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num);
+struct vfs_superblock_t *vfs_mount_fs(const char *path, char *name, struct block_device *blk);
 
 /**
  * @brief 按照路径查找文件

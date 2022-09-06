@@ -4,12 +4,17 @@
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
 #include <sched/sched.h>
+#include <common/string.h>
+#include <common/block.h>
+#include <filesystem/MBR.h>
 
 struct pci_device_structure_header_t *ahci_devs[MAX_AHCI_DEVICES];
 
 struct block_device_request_queue ahci_req_queue;
 
-uint32_t count_ahci_devices = 0;
+struct blk_gendisk ahci_gendisk0 = {0}; // 暂时硬性指定一个ahci_device
+
+static uint32_t count_ahci_devices = 0;
 
 static uint64_t ahci_port_base_vaddr;     // 端口映射base addr
 static uint64_t ahci_port_base_phys_addr; // 端口映射的物理基地址（ahci控制器的参数的地址都是物理地址）
@@ -24,6 +29,113 @@ static int ahci_find_cmdslot(HBA_PORT *port);
 
 // 计算HBA_MEM的虚拟内存地址
 #define cal_HBA_MEM_VIRT_ADDR(device_num) (AHCI_MAPPING_BASE + (ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[device_num]))->BAR5 - ((((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5) & PAGE_2M_MASK)))
+
+long ahci_open();
+long ahci_close();
+static long ahci_ioctl(long cmd, long arg);
+static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, uint64_t count, uint64_t buf);
+
+struct block_device_operation ahci_operation =
+    {
+        .open = ahci_open,
+        .close = ahci_close,
+        .ioctl = ahci_ioctl,
+        .transfer = ahci_transfer,
+};
+
+/**
+ * @brief ahci驱动器在block_device中的私有数据结构体
+ *
+ */
+struct ahci_blk_private_data
+{
+    uint16_t ahci_ctrl_num;                        // ahci控制器号
+    uint16_t ahci_port_num;                        // ahci端口号
+    struct MBR_disk_partition_table_t *part_table; // 分区表
+};
+
+/**
+ * @brief 申请ahci设备的私有信息结构体
+ *
+ * @return struct ahci_blk_private_data* 申请到的私有信息结构体
+ */
+static struct ahci_blk_private_data *__alloc_private_data()
+{
+    struct ahci_blk_private_data *data = (struct ahci_blk_private_data *)kzalloc(sizeof(struct ahci_blk_private_data), 0);
+    data->part_table = (struct MBR_disk_partition_table_t *)kzalloc(512, 0);
+    return data;
+}
+
+/**
+ * @brief 释放ahci设备的分区的私有信息结构体
+ *
+ * @param pdata 待释放的结构体
+ * @return int 错误码
+ */
+static int __release_private_data(struct ahci_blk_private_data *pdata)
+{
+    kfree(pdata->part_table);
+    kfree(pdata);
+    return 0;
+}
+
+/**
+ * @brief 初始化gendisk结构体(暂时只支持1个gendisk)
+ *
+ */
+static int ahci_init_gendisk()
+{
+    memset(&ahci_gendisk0, 0, sizeof(ahci_gendisk0));
+    strcpy(ahci_gendisk0.disk_name, "ahci0");
+    ahci_gendisk0.flags = BLK_GF_AHCI;
+    ahci_gendisk0.fops = &ahci_operation;
+    mutex_init(&ahci_gendisk0.open_mutex);
+    ahci_gendisk0.request_queue = &ahci_req_queue;
+    // 为存储分区结构，分配内存空间
+    ahci_gendisk0.private_data = __alloc_private_data();
+    // 读取分区表
+    // 暂时假设全都是MBR分区表的
+    // todo: 支持GPT
+
+    ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->ahci_ctrl_num = 0;
+    ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->ahci_port_num = 0;
+
+    MBR_read_partition_table(&ahci_gendisk0, ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table);
+    struct MBR_disk_partition_table_t *ptable = ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table;
+
+    // 求出可用分区数量
+    for (int i = 0; i < 4; ++i)
+    {
+        // 分区可用
+        if (ptable->DPTE[i].type !=0)
+            ++ahci_gendisk0.part_cnt;
+    }
+    if (ahci_gendisk0.part_cnt)
+    {
+        // 分配分区结构体数组的空间
+        ahci_gendisk0.partition = (struct block_device *)kzalloc(ahci_gendisk0.part_cnt * sizeof(struct block_device), 0);
+        int cnt = 0;
+        // 循环遍历每个分区
+        for (int i = 0; i < 4; ++i)
+        {
+            // 分区可用
+            if (ptable->DPTE[i].type !=0)
+            {
+                // 初始化分区结构体
+                ahci_gendisk0.partition[cnt].bd_disk = &ahci_gendisk0;
+                ahci_gendisk0.partition[cnt].bd_partno = cnt;
+                ahci_gendisk0.partition[cnt].bd_queue = &ahci_req_queue;
+                ahci_gendisk0.partition[cnt].bd_sectors_num = ptable->DPTE[i].total_sectors;
+                ahci_gendisk0.partition[cnt].bd_start_sector = ptable->DPTE[i].starting_sector;
+                ahci_gendisk0.partition[cnt].bd_superblock = NULL; // 挂载文件系统时才会初始化superblock
+                ahci_gendisk0.partition[cnt].bd_start_LBA = ptable->DPTE[i].starting_LBA;
+                ++cnt;
+            }
+        }
+    }
+
+    return 0;
+};
 
 /**
  * @brief 初始化ahci模块
@@ -65,6 +177,8 @@ void ahci_init()
     ahci_req_queue.in_service = NULL;
     wait_queue_init(&ahci_req_queue.wait_queue_list, NULL);
     ahci_req_queue.request_count = 0;
+
+    ahci_init_gendisk();
     kinfo("AHCI initialized.");
 }
 
@@ -362,7 +476,7 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     cmdfis->counth = count >> 8;
     //    printk("[slot]{%d}", slot);
     port->ci = 1; // Issue command
-    
+
     current_pcb->flags |= PF_NEED_SCHED;
     sched();
     int retval = AHCI_SUCCESS;
@@ -486,9 +600,8 @@ static long ahci_query_disk()
     list_del(&(ahci_req_queue.in_service->wait_queue.wait_list));
     --ahci_req_queue.request_count;
 
-    long ret_val;
+    long ret_val = 0;
 
-    
     switch (pack->blk_pak.cmd)
     {
     case AHCI_CMD_READ_DMA_EXT:
@@ -524,21 +637,21 @@ static void ahci_submit(struct ahci_request_packet_t *pack)
 /**
  * @brief ahci驱动程序的传输函数
  *
+ * @param gd 磁盘设备结构体
  * @param cmd 控制命令
  * @param base_addr 48位LBA地址
  * @param count total sectors to read
  * @param buf 缓冲区线性地址
- * @param ahci_ctrl_num ahci控制器号
- * @param port_num ahci控制器端口号
  * @return long
  */
-static long ahci_transfer(long cmd, uint64_t base_addr, uint64_t count, uint64_t buf, uint8_t ahci_ctrl_num, uint8_t port_num)
+static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, uint64_t count, uint64_t buf)
 {
     struct ahci_request_packet_t *pack = NULL;
+    struct ahci_blk_private_data *pdata = (struct ahci_blk_private_data *)gd->private_data;
 
     if (cmd == AHCI_CMD_READ_DMA_EXT || cmd == AHCI_CMD_WRITE_DMA_EXT)
     {
-        pack = ahci_make_request(cmd, base_addr, count, buf, ahci_ctrl_num, port_num);
+        pack = ahci_make_request(cmd, base_addr, count, buf, pdata->ahci_ctrl_num, pdata->ahci_port_num);
         ahci_submit(pack);
     }
     else
@@ -557,10 +670,3 @@ static long ahci_transfer(long cmd, uint64_t base_addr, uint64_t count, uint64_t
 static long ahci_ioctl(long cmd, long arg)
 {
 }
-struct block_device_operation ahci_operation =
-    {
-        .open = ahci_open,
-        .close = ahci_close,
-        .ioctl = ahci_ioctl,
-        .transfer = ahci_transfer,
-};

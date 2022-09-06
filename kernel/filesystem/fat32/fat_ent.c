@@ -18,7 +18,7 @@ int fat32_alloc_clusters(struct vfs_index_node_t *inode, uint32_t *clusters, int
 
     fat32_sb_info_t *fsbi = (fat32_sb_info_t *)inode->sb->private_sb_info;
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)inode->private_inode_info;
-
+    struct block_device *blk = inode->sb->blk_device;
     uint64_t sec_per_fat = fsbi->sec_per_FAT;
 
     // todo: 对alloc的过程加锁
@@ -32,8 +32,7 @@ int fat32_alloc_clusters(struct vfs_index_node_t *inode, uint32_t *clusters, int
         if (clus_idx >= num_clusters)
             goto done;
         memset(buf, 0, fsbi->bytes_per_sec);
-
-        ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + i, 1, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+        blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + i, 1, (uint64_t)buf);
         // 依次检查簇是否空闲
         for (int j = 0; j < ent_per_sec; ++j)
         {
@@ -73,7 +72,7 @@ done:;
             cluster = tmp_clus;
             while (true)
             {
-                tmp_clus = fat32_read_FAT_entry(fsbi, cluster);
+                tmp_clus = fat32_read_FAT_entry(blk, fsbi, cluster);
                 if (tmp_clus <= 0x0ffffff7)
                     cluster = tmp_clus;
                 else
@@ -85,10 +84,10 @@ done:;
         for (int i = idx; i < num_clusters; ++i)
         {
             // kdebug("write cluster i=%d : cluster=%d, value= %d", i, cluster, clusters[i]);
-            fat32_write_FAT_entry(fsbi, cluster, clusters[i]);
+            fat32_write_FAT_entry(blk, fsbi, cluster, clusters[i]);
             cluster = clusters[i];
         }
-        fat32_write_FAT_entry(fsbi, cluster, 0x0ffffff8);
+        fat32_write_FAT_entry(blk, fsbi, cluster, 0x0ffffff8);
 
         return 0;
     }
@@ -119,11 +118,12 @@ int fat32_free_clusters(struct vfs_index_node_t *inode, int32_t cluster)
 /**
  * @brief 读取指定簇的FAT表项
  *
+ * @param blk 块设备结构体
  * @param fsbi fat32超级块私有信息结构体
  * @param cluster 指定簇
  * @return uint32_t 下一个簇的簇号
  */
-uint32_t fat32_read_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster)
+uint32_t fat32_read_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, uint32_t cluster)
 {
     // 计算每个扇区内含有的FAT表项数
     // FAT每项4bytes
@@ -133,8 +133,8 @@ uint32_t fat32_read_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster)
     memset(buf, 0, fsbi->bytes_per_sec);
 
     // 读取一个sector的数据，
-    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
-                            (uint64_t)&buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
+                                 (uint64_t)&buf);
 
     // 返回下一个fat表项的值（也就是下一个cluster）
     return buf[cluster & (fat_ent_per_sec - 1)] & 0x0fffffff;
@@ -143,28 +143,29 @@ uint32_t fat32_read_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster)
 /**
  * @brief 写入指定簇的FAT表项
  *
+ * @param blk 块设备结构体
  * @param fsbi fat32超级块私有信息结构体
  * @param cluster 指定簇
  * @param value 要写入该fat表项的值
  * @return uint32_t errcode
  */
-uint32_t fat32_write_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value)
+uint32_t fat32_write_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value)
 {
     // 计算每个扇区内含有的FAT表项数
     // FAT每项4bytes
     uint32_t fat_ent_per_sec = (fsbi->bytes_per_sec >> 2); // 该值应为2的n次幂
-    uint32_t *buf = kmalloc(fsbi->bytes_per_sec, 0);
-    memset(buf, 0, fsbi->bytes_per_sec);
+    uint32_t *buf = kzalloc(fsbi->bytes_per_sec, 0);
 
-    ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
-                            (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
+                                 (uint64_t)buf);
 
     buf[cluster & (fat_ent_per_sec - 1)] = (buf[cluster & (fat_ent_per_sec - 1)] & 0xf0000000) | (value & 0x0fffffff);
     // 向FAT1和FAT2写入数据
-    ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
-                            (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
-    ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT2_base_sector + (cluster / fat_ent_per_sec), 1,
-                            (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
+                                 (uint64_t)buf);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT2_base_sector + (cluster / fat_ent_per_sec), 1,
+                                 (uint64_t)buf);
+
     kfree(buf);
     return 0;
 }
@@ -186,8 +187,9 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)parent_inode->private_inode_info;
     fat32_sb_info_t *fsbi = (fat32_sb_info_t *)parent_inode->sb->private_sb_info;
 
-    uint8_t *buf = kmalloc(fsbi->bytes_per_clus, 0);
-    memset(buf, 0, fsbi->bytes_per_clus);
+    uint8_t *buf = kzalloc(fsbi->bytes_per_clus, 0);
+
+    struct block_device *blk = parent_inode->sb->blk_device;
 
     // 计算父目录项的起始簇号
     uint32_t cluster = finode->first_clus;
@@ -202,7 +204,7 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
         uint64_t sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
 
         // 读取父目录项的起始簇数据
-        ahci_operation.transfer(AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+        blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)buf);
         tmp_dEntry = (struct fat32_Directory_t *)buf;
         // 计数连续的空目录项
         uint32_t count_continuity = 0;
@@ -233,7 +235,7 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
 
         // 当前簇没有发现符合条件的空闲目录项，寻找下一个簇
         uint64_t old_cluster = cluster;
-        cluster = fat32_read_FAT_entry(fsbi, cluster);
+        cluster = fat32_read_FAT_entry(blk, fsbi, cluster);
         if (cluster >= 0x0ffffff7) // 寻找完父目录的所有簇，都没有找到符合要求的空目录项
         {
 
@@ -248,9 +250,8 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
 
             // 将这个新的簇清空
             sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
-            void *tmp_buf = kmalloc(fsbi->bytes_per_clus, 0);
-            memset(tmp_buf, 0, fsbi->bytes_per_clus);
-            ahci_operation.transfer(AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buf, fsbi->ahci_ctrl_num, fsbi->ahci_port_num);
+            void *tmp_buf = kzalloc(fsbi->bytes_per_clus, 0);
+            blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buf);
             kfree(tmp_buf);
         }
     }

@@ -10,6 +10,7 @@
  */
 #pragma once
 #include <common/glib.h>
+#include <common/blk_types.h>
 
 #define MBR_MAX_AHCI_CTRL_NUM 4  // 系统支持的最大的ahci控制器数量
 #define MBR_MAX_AHCI_PORT_NUM 32 // 系统支持的每个ahci控制器对应的MBR磁盘数量（对应ahci磁盘号）
@@ -53,5 +54,6 @@ extern struct MBR_disk_partition_table_t MBR_partition_tables[MBR_MAX_AHCI_CTRL_
  *
  * @param ahci_ctrl_num ahci控制器编号
  * @param ahci_port_num ahci端口编号
+ * @param buf 输出缓冲区（512字节）
  */
-struct MBR_disk_partition_table_t *MBR_read_partition_table(uint8_t ahci_ctrl_num, uint8_t ahci_port_num);
+int MBR_read_partition_table(struct blk_gendisk* gd, void *buf);

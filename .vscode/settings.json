@@ -129,7 +129,10 @@
         "proc-types.h": "c",
         "traceback.h": "c",
         "bitcount.h": "c",
-        "limits.h": "c"
+        "limits.h": "c",
+        "block.h": "c",
+        "blk_types.h": "c",
+        "mutex.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

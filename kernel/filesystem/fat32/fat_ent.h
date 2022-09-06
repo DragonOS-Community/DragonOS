@@ -26,21 +26,23 @@ int fat32_free_clusters(struct vfs_index_node_t *inode, int32_t cluster);
 /**
  * @brief 读取指定簇的FAT表项
  *
+ * @param blk 块设备结构体
  * @param fsbi fat32超级块私有信息结构体
  * @param cluster 指定簇
  * @return uint32_t 下一个簇的簇号
  */
-uint32_t fat32_read_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster);
+uint32_t fat32_read_FAT_entry(struct block_device * blk, fat32_sb_info_t *fsbi, uint32_t cluster);
 
 /**
  * @brief 写入指定簇的FAT表项
  *
+ * @param blk 块设备结构体
  * @param fsbi fat32超级块私有信息结构体
  * @param cluster 指定簇
  * @param value 要写入该fat表项的值
  * @return uint32_t errcode
  */
-uint32_t fat32_write_FAT_entry(fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value);
+uint32_t fat32_write_FAT_entry(struct block_device * blk, fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value);
 
 /**
  * @brief 在父亲inode的目录项簇中，寻找连续num个空的目录项

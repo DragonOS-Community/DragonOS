@@ -145,7 +145,6 @@ void system_initialize()
     // ata_init();
     pci_init();
     io_mfence();
-    ahci_init();
 
     // test_slab();
     // test_mm();

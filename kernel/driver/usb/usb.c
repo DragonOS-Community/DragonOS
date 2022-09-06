@@ -1,6 +1,7 @@
 #include "usb.h"
 #include "xhci/xhci.h"
 #include <common/kprint.h>
+#include <common/errno.h>
 #include <driver/pci/pci.h>
 #include <debug/bug.h>
 #include <common/spinlock.h>
@@ -28,7 +29,7 @@ int usb_init()
     if (WARN_ON(usb_pdevs_count == 0))
     {
         kwarn("There is no usb hardware in this computer!");
-        return;
+        return 0;
     }
     kdebug("usb_pdevs_count=%d", usb_pdevs_count);
     // 初始化每个usb控制器
@@ -54,7 +55,7 @@ int usb_init()
 
         default:
             kerror("Error value of usb_pdevs[%d]->ProgIF: %#02x", i, usb_pdevs[i]->ProgIF);
-            return;
+            return -EINVAL;
             break;
         }
     }

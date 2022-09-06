@@ -128,9 +128,6 @@ struct fat32_LongDirectory_t
 struct fat32_partition_info_t
 {
     uint16_t partition_id; // 全局fat32分区id
-    uint8_t ahci_ctrl_num;
-    uint8_t ahci_port_num;
-    uint8_t part_num; // 硬盘中的分区号
 
     struct fat32_BootSector_t bootsector;
     struct fat32_FSInfo_t fsinfo;
@@ -179,12 +176,10 @@ struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t
 /**
  * @brief 创建fat32文件系统的超级块
  *
- * @param DPTE 磁盘分区表entry
- * @param DPT_type 磁盘分区表类型
- * @param buf fat32文件系统的引导扇区
+ * @param blk 块设备结构体
  * @return struct vfs_superblock_t* 创建好的超级块
  */
-struct vfs_superblock_t *fat32_read_superblock(void *DPTE, uint8_t DPT_type, void *buf, int8_t ahci_ctrl_num, int8_t ahci_port_num, int8_t part_num);
+struct vfs_superblock_t *fat32_read_superblock(struct block_device* blk);
 
 /**
  * @brief 创建新的文件

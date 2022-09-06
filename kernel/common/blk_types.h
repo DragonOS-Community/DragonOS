@@ -16,7 +16,18 @@ struct block_device_operation
     long (*open)();
     long (*close)();
     long (*ioctl)(long cmd, long arg);
-    long (*transfer)(long cmd, ul LBA_start, ul count, uint64_t buffer, uint8_t arg0, uint8_t arg1);
+    
+    /**
+     * @brief 块设备驱动程序的传输函数
+     *
+     * @param gd 磁盘设备结构体
+     * @param cmd 控制命令
+     * @param base_addr 48位LBA地址
+     * @param count total sectors to read
+     * @param buf 缓冲区线性地址
+     * @return long
+     */
+    long (*transfer)(struct blk_gendisk *gd, long cmd, uint64_t base_addr, uint64_t count, uint64_t buf);
 };
 
 /**
@@ -54,12 +65,16 @@ struct block_device_request_queue
 struct block_device
 {
     sector_t bd_start_sector;                    // 该分区的起始扇区
+    uint64_t bd_start_LBA;                       // 起始LBA号
     sector_t bd_sectors_num;                     // 该分区的扇区数
     struct vfs_superblock_t *bd_superblock;      // 执行超级块的指针
     struct blk_gendisk *bd_disk;                 // 当前分区所属的磁盘
     struct block_device_request_queue *bd_queue; // 请求队列
     uint16_t bd_partno;                          // 在磁盘上的分区号
 };
+
+// 定义blk_gendisk中的标志位
+#define BLK_GF_AHCI (1 << 0)
 
 /**
  * @brief 磁盘设备结构体

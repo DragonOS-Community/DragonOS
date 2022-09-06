@@ -3,7 +3,7 @@
 #include <common/atomic.h>
 #include <common/spinlock.h>
 #include <common/glib.h>
-#include <process/process.h>
+#include <process/proc-types.h>
 
 /**
  * @brief Mutex - 互斥锁

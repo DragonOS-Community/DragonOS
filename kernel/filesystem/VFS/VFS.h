@@ -14,6 +14,7 @@
 #include <common/glib.h>
 #include <common/fcntl.h>
 #include <common/blk_types.h>
+#include <mm/slab.h>
 
 extern struct vfs_superblock_t *vfs_root_sb;
 
@@ -23,6 +24,8 @@ extern struct vfs_superblock_t *vfs_root_sb;
 #define VFS_SUCCESS 0
 #define VFS_E_FS_EXISTED 1   // 错误：文件系统已存在
 #define VFS_E_FS_NOT_EXIST 2 // 错误：文件系统不存在
+
+#define VFS_MAX_PATHLEN 1024
 
 /**
  * @brief 目录项的属性
@@ -54,6 +57,7 @@ struct vfs_superblock_t
 {
     struct vfs_dir_entry_t *root;
     struct vfs_super_block_operations_t *sb_ops;
+    struct vfs_dir_entry_operations_t *dir_ops; // dentry's operations
     struct block_device *blk_device;
     void *private_sb_info;
 };
@@ -195,4 +199,28 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags);
  * @brief 填充dentry
  *
  */
-int vfs_fill_dentry(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset);
+int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset);
+
+/**
+ * @brief 初始化vfs
+ *
+ * @return int 错误码
+ */
+int vfs_init();
+
+/**
+ * @brief 动态分配dentry以及路径字符串名称
+ *
+ * @param name_size 名称字符串大小（字节）(注意考虑字符串最后需要有一个‘\0’作为结尾)
+ * @return struct vfs_dir_entry_t* 创建好的dentry
+ */
+struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
+
+/**
+ * @brief 打开文件
+ * 
+ * @param filename 文件路径 
+ * @param flags 标志位
+ * @return uint64_t 错误码
+ */
+uint64_t do_open(const char *filename, int flags);

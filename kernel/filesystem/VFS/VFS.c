@@ -10,25 +10,31 @@
 
 // 为filesystem_type_t结构体实例化一个链表头
 static struct vfs_filesystem_type_t vfs_fs = {"filesystem", 0};
+struct vfs_superblock_t *vfs_root_sb = NULL;
 
 /**
  * @brief 挂载文件系统
  *
+ * @param path 要挂载到的路径
  * @param name 文件系统名
  * @param blk 块设备结构体
- * @return struct vfs_superblock_t*
+ * @return struct vfs_superblock_t* 挂载后，文件系统的超级块
  */
-struct vfs_superblock_t *vfs_mount_fs(char *name, struct block_device *blk)
+struct vfs_superblock_t *vfs_mount_fs(const char *path, char *name, struct block_device *blk)
 {
-
+    // todo: 选择挂载点
     struct vfs_filesystem_type_t *p = NULL;
     for (p = &vfs_fs; p; p = p->next)
     {
         if (!strcmp(p->name, name)) // 存在符合的文件系统
         {
-            return p->read_superblock(blk);
+            struct vfs_superblock_t *sb = p->read_superblock(blk);
+            if (strcmp(path, "/") == 0) // 如果挂载到的是'/'挂载点，则让其成为最顶层的文件系统
+                vfs_root_sb = sb;
+            return sb;
         }
     }
+
     kdebug("unsupported fs: %s", name);
     return NULL;
 }

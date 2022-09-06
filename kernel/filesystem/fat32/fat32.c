@@ -28,7 +28,7 @@ struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t
 {
 
     // 挂载文件系统到vfs
-    return vfs_mount_fs("FAT32", (ahci_gendisk0.partition + 0));
+    return vfs_mount_fs("/", "FAT32", (ahci_gendisk0.partition + 0));
 }
 
 /**
@@ -552,7 +552,7 @@ long fat32_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *pos
 
     // find the actual cluster on disk of the specified position
     for (int i = 0; i < clus_offset_in_file; ++i)
-        cluster = fat32_read_FAT_entry(blk,fsbi, cluster);
+        cluster = fat32_read_FAT_entry(blk, fsbi, cluster);
 
     // 如果需要读取的数据边界大于文件大小
     if (*position + count > file_ptr->dEntry->dir_inode->file_size)
@@ -597,7 +597,7 @@ long fat32_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *pos
 
         *position += step_trans_len; // 更新文件指针
 
-        cluster = fat32_read_FAT_entry(blk,fsbi, cluster);
+        cluster = fat32_read_FAT_entry(blk, fsbi, cluster);
     } while (bytes_remain && (cluster < 0x0ffffff8) && cluster != 0);
 
     kfree(tmp_buffer);
@@ -641,7 +641,7 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *po
     {
         // 跳转到position所在的簇
         for (uint64_t i = 0; i < clus_offset_in_file; ++i)
-            cluster = fat32_read_FAT_entry(blk,fsbi, cluster);
+            cluster = fat32_read_FAT_entry(blk, fsbi, cluster);
     }
     // kdebug("cluster(start)=%d", cluster);
     //  没有可用的磁盘空间
@@ -704,7 +704,7 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *po
 
         int next_clus = 0;
         if (bytes_remain)
-            next_clus = fat32_read_FAT_entry(blk,fsbi, cluster);
+            next_clus = fat32_read_FAT_entry(blk, fsbi, cluster);
         else
             break;
         if (next_clus >= 0x0ffffff8) // 已经到达了最后一个簇，需要分配新簇
@@ -1069,7 +1069,7 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
     // 循环读取fat entry，直到读取到文件当前位置的所在簇号
     for (int i = 0; i < clus_num; ++i)
     {
-        cluster = fat32_read_FAT_entry(blk,fsbi, cluster);
+        cluster = fat32_read_FAT_entry(blk, fsbi, cluster);
         if (cluster > 0x0ffffff7) // 文件结尾
         {
             kerror("file position out of range! (cluster not exists)");
@@ -1263,6 +1263,6 @@ void fat32_init()
     vfs_register_filesystem(&fat32_fs_type);
 
     // 挂载根文件系统
-    vfs_root_sb = fat32_register_partition(0, 0, 0);
+    fat32_register_partition(0, 0, 0);
     kinfo("FAT32 initialized.");
 }

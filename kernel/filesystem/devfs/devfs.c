@@ -85,8 +85,9 @@ static long devfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir
     ++file_ptr->position;
     // 获取目标dentry（由于是子目录项，因此是child_node_list）
     struct vfs_dir_entry_t *target_dent = container_of(list, struct vfs_dir_entry_t, child_node_list);
+
     // kdebug("target name=%s, namelen=%d", target_dent->name, target_dent->name_length);
-    
+
     char *name = (char *)kzalloc(target_dent->name_length + 1, 0);
     strncpy(name, target_dent->name, target_dent->name_length);
     uint32_t dentry_type;

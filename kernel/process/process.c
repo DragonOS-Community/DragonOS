@@ -12,6 +12,7 @@
 #include <driver/usb/usb.h>
 #include <exception/gate.h>
 #include <filesystem/fat32/fat32.h>
+#include <filesystem/devfs/devfs.h>
 #include <mm/slab.h>
 #include <common/spinlock.h>
 #include <syscall/syscall.h>
@@ -464,7 +465,9 @@ ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
     ahci_init();
+    vfs_init();
     fat32_init();
+    devfs_init();
     // 使用单独的内核线程来初始化usb驱动程序
     int usb_pid = kernel_thread(usb_init, 0, 0);
 

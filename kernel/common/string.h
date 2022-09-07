@@ -38,7 +38,7 @@ long strnlen(const char *src, unsigned long maxlen);
         FirstPart < SecondPart => -1
 */
 
-int strcmp(char *FirstPart, char *SecondPart);
+int strcmp(const char *FirstPart, const char *SecondPart);
 
 char *strncpy(char *dst, const char *src, long count);
 

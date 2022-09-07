@@ -39,7 +39,7 @@ long strnlen(const char *src, unsigned long maxlen)
         FirstPart < SecondPart => -1
 */
 
-int strcmp(char *FirstPart, char *SecondPart)
+int strcmp(const char *FirstPart, const char *SecondPart)
 {
     register int __res;
     __asm__ __volatile__("cld	\n\t"

@@ -9,7 +9,6 @@
 #include <common/string.h>
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/VFS/VFS.h>
-#include <driver/keyboard/ps2_keyboard.h>
 #include <process/process.h>
 #include <time/sleep.h>
 
@@ -19,6 +18,7 @@ extern void syscall_int(void);
 
 extern uint64_t sys_clock(struct pt_regs *regs);
 extern uint64_t sys_mstat(struct pt_regs *regs);
+extern uint64_t sys_open(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -121,186 +121,7 @@ ul sys_put_string(struct pt_regs *regs)
     return 0;
 }
 
-uint64_t sys_open(struct pt_regs *regs)
-{
-    char *filename = (char *)(regs->r8);
-    int flags = (int)(regs->r9);
-    // kdebug("filename=%s", filename);
 
-    long path_len = strnlen_user(filename, PAGE_4K_SIZE) + 1;
-
-    if (path_len <= 0) // 地址空间错误
-    {
-        return -EFAULT;
-    }
-    else if (path_len >= PAGE_4K_SIZE) // 名称过长
-    {
-        return -ENAMETOOLONG;
-    }
-
-    // 为待拷贝文件路径字符串分配内存空间
-    char *path = (char *)kmalloc(path_len, 0);
-    if (path == NULL)
-        return -ENOMEM;
-    memset(path, 0, path_len);
-
-    strncpy_from_user(path, filename, path_len);
-    // 去除末尾的 '/'
-    if (path_len >= 2 && path[path_len - 2] == '/')
-    {
-        path[path_len - 2] = '\0';
-        --path_len;
-    }
-
-    // 寻找文件
-    struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-
-    // if (dentry != NULL)
-    //     printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
-    // else
-    //     printk_color(ORANGE, BLACK, "Can`t find file\n");
-    // kdebug("flags=%#018lx", flags);
-    if (dentry == NULL && flags & O_CREAT)
-    {
-        // 先找到倒数第二级目录
-        int tmp_index = -1;
-        for (int i = path_len - 1; i >= 0; --i)
-        {
-            if (path[i] == '/')
-            {
-                tmp_index = i;
-                break;
-            }
-        }
-
-        struct vfs_dir_entry_t *parent_dentry = NULL;
-        // kdebug("tmp_index=%d", tmp_index);
-        if (tmp_index > 0)
-        {
-
-            path[tmp_index] = '\0';
-            dentry = vfs_path_walk(path, 0);
-            if (dentry == NULL)
-            {
-                kfree(path);
-                return -ENOENT;
-            }
-            parent_dentry = dentry;
-        }
-        else
-            parent_dentry = vfs_root_sb->root;
-
-        // 创建新的文件
-        dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
-        memset(dentry, 0, sizeof(struct vfs_dir_entry_t));
-
-        dentry->name_length = path_len - tmp_index - 1;
-        dentry->name = (char *)kmalloc(dentry->name_length, 0);
-        memset(dentry->name, 0, dentry->name_length);
-        strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
-        // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
-        dentry->parent = parent_dentry;
-        uint64_t retval = parent_dentry->dir_inode->inode_ops->create(parent_dentry->dir_inode, dentry, 0);
-        if (retval != 0)
-        {
-            kfree(dentry->name);
-            kfree(dentry);
-            kfree(path);
-            return retval;
-        }
-
-        list_init(&dentry->child_node_list);
-        list_init(&dentry->subdirs_list);
-        list_add(&parent_dentry->subdirs_list, &dentry->child_node_list);
-        // kdebug("created.");
-    }
-    kfree(path);
-    if (dentry == NULL)
-        return -ENOENT;
-
-    // 要求打开文件夹而目标不是文件夹
-    if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_ATTR_DIR))
-        return -ENOTDIR;
-
-    // // 要找的目标是文件夹
-    // if ((flags & O_DIRECTORY) && dentry->dir_inode->attribute == VFS_ATTR_DIR)
-    //     return -EISDIR;
-
-    // todo: 引入devfs后删除这段代码
-    // 暂时遇到设备文件的话，就将其first clus设置为特定值
-    if (path_len >= 5 && filename[0] == '/' && filename[1] == 'd' && filename[2] == 'e' && filename[3] == 'v' && filename[4] == '/')
-    {
-        if (dentry->dir_inode->attribute & VFS_ATTR_FILE)
-        {
-            // 对于fat32文件系统上面的设备文件，设置其起始扇区
-            ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus |= 0xf0000000;
-            dentry->dir_inode->sb->sb_ops->write_inode(dentry->dir_inode);
-            dentry->dir_inode->attribute |= VFS_ATTR_DEVICE;
-        }
-    }
-
-    // 创建文件描述符
-    struct vfs_file_t *file_ptr = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
-    memset(file_ptr, 0, sizeof(struct vfs_file_t));
-
-    int errcode = -1;
-
-    file_ptr->dEntry = dentry;
-    file_ptr->mode = flags;
-
-    // todo: 接入devfs
-    // 特判一下是否为键盘文件
-    if (dentry->dir_inode->attribute & VFS_ATTR_DEVICE)
-    {
-        file_ptr->file_ops = &ps2_keyboard_fops; // 如果是设备文件，暂时认为它是键盘文件
-    }
-    else
-        file_ptr->file_ops = dentry->dir_inode->file_ops;
-
-    // 如果文件系统实现了打开文件的函数
-    if (file_ptr->file_ops && file_ptr->file_ops->open)
-        errcode = file_ptr->file_ops->open(dentry->dir_inode, file_ptr);
-
-    if (errcode != VFS_SUCCESS)
-    {
-        kfree(file_ptr);
-        return -EFAULT;
-    }
-
-    if (file_ptr->mode & O_TRUNC) // 清空文件
-        file_ptr->dEntry->dir_inode->file_size = 0;
-
-    if (file_ptr->mode & O_APPEND)
-        file_ptr->position = file_ptr->dEntry->dir_inode->file_size;
-    else
-        file_ptr->position = 0;
-
-    struct vfs_file_t **f = current_pcb->fds;
-
-    int fd_num = -1;
-
-    // 在指针数组中寻找空位
-    // todo: 当pcb中的指针数组改为动态指针数组之后，需要更改这里（目前还是静态指针数组）
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-    {
-        if (f[i] == NULL) // 找到指针数组中的空位
-        {
-            fd_num = i;
-            break;
-        }
-    }
-
-    // 指针数组没有空位了
-    if (fd_num == -1)
-    {
-        kfree(file_ptr);
-        return -EMFILE;
-    }
-    // 保存文件描述符
-    f[fd_num] = file_ptr;
-
-    return fd_num;
-}
 
 /**
  * @brief 关闭文件系统调用
@@ -624,7 +445,7 @@ uint64_t sys_getdents(struct pt_regs *regs)
 
     uint64_t retval = 0;
     if (filp->file_ops && filp->file_ops->readdir)
-        retval = filp->file_ops->readdir(filp, dirent, &vfs_fill_dentry);
+        retval = filp->file_ops->readdir(filp, dirent, &vfs_fill_dirent);
 
     return retval;
 }

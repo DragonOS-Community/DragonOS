@@ -343,6 +343,7 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
     struct vfs_superblock_t *sb_ptr = (struct vfs_superblock_t *)kzalloc(sizeof(struct vfs_superblock_t), 0);
     blk->bd_superblock = sb_ptr;
     sb_ptr->sb_ops = &fat32_sb_ops;
+    sb_ptr->dir_ops = &fat32_dEntry_ops;
     sb_ptr->private_sb_info = kzalloc(sizeof(fat32_sb_info_t), 0);
     sb_ptr->blk_device = blk;
 

@@ -157,9 +157,9 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         {
             char bk = *(tmp_path + tmp_path_len);
             *(tmp_path + tmp_path_len) = '\0';
-            kdebug("to search:%s", tmp_path);
+            // kdebug("to search:%s", tmp_path);
             dentry = vfs_search_dentry_list(parent, tmp_path);
-            kdebug("search done, dentry=%#018lx", dentry);
+            // kdebug("search done, dentry=%#018lx", dentry);
             *(tmp_path + tmp_path_len) = bk;
         }
 

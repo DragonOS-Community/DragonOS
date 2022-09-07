@@ -65,8 +65,39 @@ static long devfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_
 static long devfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {}
 static long devfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {}
 static long devfs_lseek(struct vfs_file_t *file_ptr, long offset, long origin) {}
-static long devfs_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg) {return 0;}
-static long devfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler) {return 0;}
+static long devfs_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg) { return 0; }
+
+static long devfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler)
+{
+    // 循环读取目录下的目录项
+    struct vfs_dir_entry_t *dentry = file_ptr->dEntry;
+    struct List *list = &dentry->subdirs_list;
+    // 先切换到position处
+    for (int i = 0; i <= file_ptr->position; ++i)
+    {
+        list = list_next(list);
+        if (list == &dentry->subdirs_list) // 找完了
+            goto failed;
+    }
+
+    // 存在目录项
+    // 增加偏移量
+    ++file_ptr->position;
+    // 获取目标dentry（由于是子目录项，因此是child_node_list）
+    struct vfs_dir_entry_t *target_dent = container_of(list, struct vfs_dir_entry_t, child_node_list);
+    kdebug("target name=%s, namelen=%d", target_dent->name, target_dent->name_length);
+    char *name = (char *)kzalloc(target_dent->name_length + 1, 0);
+    strncpy(name, target_dent->name, target_dent->name_length);
+    uint32_t dentry_type;
+    if (target_dent->dir_inode->attribute & VFS_ATTR_DIR)
+        dentry_type = VFS_ATTR_DIR;
+    else
+        dentry_type = VFS_ATTR_DEVICE;
+
+    return filler(dirent, file_ptr->position - 1, name, target_dent->name_length, dentry_type, file_ptr->position - 1);
+failed:;
+    return 0;
+}
 
 static struct vfs_file_operations_t devfs_file_ops =
     {
@@ -124,6 +155,7 @@ static __always_inline void __devfs_init_root_inode()
     // todo: 增加private inode info
     devfs_root_dentry->dir_inode->private_inode_info = NULL;
     devfs_root_dentry->dir_inode->sb = &devfs_sb;
+    devfs_root_dentry->dir_inode->attribute = VFS_ATTR_DIR;
 }
 /**
  * @brief 初始化devfs的根dentry
@@ -140,6 +172,7 @@ static __always_inline void __devfs_init_root_dentry()
 
 int devfs_register_device()
 {
+    // 暂时只支持键盘文件
     char name[] = "keyboard.dev";
     struct vfs_dir_entry_t *dentry = vfs_alloc_dentry(sizeof(name));
     strcpy(dentry->name, name);
@@ -150,6 +183,7 @@ int devfs_register_device()
     dentry->dir_inode->inode_ops = &devfs_inode_ops;
     dentry->dir_inode->private_inode_info = NULL; // todo:
     dentry->dir_inode->sb = &devfs_sb;
+    dentry->dir_inode->attribute = VFS_ATTR_DEVICE;
     dentry->parent = devfs_root_dentry;
     list_init(&dentry->child_node_list);
     list_init(&dentry->subdirs_list);

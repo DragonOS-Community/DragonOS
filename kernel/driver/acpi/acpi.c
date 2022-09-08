@@ -125,6 +125,34 @@ void acpi_init()
     // An ACPI-compatible OS must use the XSDT if present
     if (rsdpv2->XsdtAddress != 0x00UL)
     {
+        // 不要删除这段注释（因为还不确定是代码的bug，还是真机的bug）
+        /*
+        acpi_use_xsdt = true;
+        ul xsdt_phys_base = rsdpv2->XsdtAddress & PAGE_2M_MASK;
+        acpi_XSDT_offset = rsdpv2->XsdtAddress - xsdt_phys_base;
+        mm_map_phys_addr(ACPI_XSDT_VIRT_ADDR_BASE, xsdt_phys_base, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        kdebug("XSDT mapped!");
+
+        xsdt = (struct acpi_XSDT_Structure_t *)(ACPI_XSDT_VIRT_ADDR_BASE + acpi_XSDT_offset);
+        // 计算RSDT Entry的数量
+        kdebug("offset=%d", sizeof(xsdt->header));
+        kdebug("xsdt sign=%s", xsdt->header.Signature);
+        acpi_XSDT_Entry_num = (xsdt->header.Length - sizeof(xsdt->header)) / 8;
+
+        printk_color(ORANGE, BLACK, "XSDT Length=%dbytes.\n", xsdt->header.Length);
+        printk_color(ORANGE, BLACK, "XSDT Entry num=%d\n", acpi_XSDT_Entry_num);
+
+        mm_map_phys_addr(ACPI_XSDT_VIRT_ADDR_BASE, xsdt_phys_base, xsdt->header.Length + PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        // 映射所有的Entry的物理地址
+        ul *ent = &(xsdt->Entry);
+        for (int j = 0; j < acpi_XSDT_Entry_num; ++j)
+        {
+            kdebug("entry=%#018lx, virt=%#018lx", (*(ent + j)) & PAGE_2M_MASK, ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * j);
+            // 映射RSDT ENTRY的物理地址
+            mm_map_phys_addr(ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * j, (*(ent + j)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        }
+        */
+
         // 由于解析XSDT出现问题。暂时只使用Rsdpv2的rsdt，但是这是不符合ACPI规范的！！！
         ul rsdt_phys_base = rsdpv2->rsdp1.RsdtAddress & PAGE_2M_MASK;
         acpi_RSDT_offset = rsdpv2->rsdp1.RsdtAddress - rsdt_phys_base;
@@ -164,25 +192,24 @@ void acpi_init()
         // rsdt表物理地址
         ul rsdt_phys_base = rsdpv1->RsdtAddress & PAGE_2M_MASK;
         acpi_RSDT_offset = rsdpv1->RsdtAddress - rsdt_phys_base;
-        // rsdt = (struct acpi_RSDT_Structure_t *)(ACPI_RSDT_VIRT_ADDR_BASE + acpi_RSDT_offset);
-
+        
+        kdebug("rsdpv1->RsdtAddress=%#018lx", rsdpv1->RsdtAddress);
         //申请mmio空间
         uint64_t size = 0;
         mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
 
-        kdebug("rsdt = %d,size= %d",acpi_rsdt_virt_addr_base,size);
+        // kdebug("acpi_rsdt_virt_addr_base = %#018lx,size= %#010lx", acpi_rsdt_virt_addr_base, size);
         //映射rsdt表
         paddr = (uint64_t)rsdt_phys_base;
         mm_map(&initial_mm, acpi_rsdt_virt_addr_base, PAGE_2M_SIZE, paddr);
-        
         // rsdt表虚拟地址
         rsdt = (struct acpi_RSDT_Structure_t *)(acpi_rsdt_virt_addr_base + acpi_RSDT_offset);
         kdebug("RSDT mapped!");
 
         // kdebug("length = %d",rsdt->header.Length);
         // 计算RSDT Entry的数量
-        kdebug("offset=%d", sizeof(rsdt->header));
-        // kinfo("begin entry mapped! ");
+        // kdebug("offset=%d", sizeof(rsdt->header));
+
         acpi_RSDT_Entry_num = (rsdt->header.Length - 36) / 4;
 
         printk_color(ORANGE, BLACK, "RSDT Length=%dbytes.\n", rsdt->header.Length);
@@ -199,6 +226,7 @@ void acpi_init()
         paddr = (uint64_t)acpi_RSDT_entry_phys_base;
         mm_map(&initial_mm, acpi_description_header_base, PAGE_2M_SIZE, paddr);
         // kinfo("entry mapped!");
+        
     }
     else
     {

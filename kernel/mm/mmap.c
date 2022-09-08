@@ -383,7 +383,7 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     /*
         todo: 限制页面的读写权限
     */
-
+    // kdebug("len2m=%d", len_2m);
     // 先映射2M页
     if (likely(len_2m > 0))
     {

@@ -5,7 +5,7 @@
 #include <mm/mm.h>
 #include <mm/mmio.h>
 
-#define acpi_get_RSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_RSDT_entry_phys_base) // 获取RSDT entry的虚拟地址
+#define acpi_get_RSDT_entry_vaddr(phys_addr) (acpi_description_header_base + (phys_addr)-acpi_RSDT_entry_phys_base) // 获取RSDT entry的虚拟地址
 // #define acpi_get_XSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_XSDT_entry_phys_base) // 获取XSDT entry的虚拟地址
 
 static struct acpi_RSDP_t *rsdpv1;
@@ -44,8 +44,8 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
         ul *ent = &(xsdt->Entry);
         for (int i = 0; i < acpi_XSDT_Entry_num; ++i)
         {
-            mm_map_phys_addr(ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * i, (*(ent + i)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
-            sdt_header = (struct acpi_system_description_table_header_t *)((ul)(ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * i));
+            mm_map_phys_addr(acpi_description_header_base + PAGE_2M_SIZE * i, (*(ent + i)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+            sdt_header = (struct acpi_system_description_table_header_t *)((ul)(acpi_description_header_base + PAGE_2M_SIZE * i));
 
             if (_fun(sdt_header, _data) == true)
                 return;
@@ -170,16 +170,19 @@ void acpi_init()
         uint64_t size = 0;
         mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
 
+        kdebug("rsdt = %d,size= %d",acpi_rsdt_virt_addr_base,size);
         //映射rsdt表
         paddr = (uint64_t)rsdt_phys_base;
         mm_map(&initial_mm, acpi_rsdt_virt_addr_base, PAGE_2M_SIZE, paddr);
-
+        
         // rsdt表虚拟地址
         rsdt = (struct acpi_RSDT_Structure_t *)(acpi_rsdt_virt_addr_base + acpi_RSDT_offset);
         kdebug("RSDT mapped!");
 
+        // kdebug("length = %d",rsdt->header.Length);
         // 计算RSDT Entry的数量
         kdebug("offset=%d", sizeof(rsdt->header));
+        // kinfo("begin entry mapped! ");
         acpi_RSDT_Entry_num = (rsdt->header.Length - 36) / 4;
 
         printk_color(ORANGE, BLACK, "RSDT Length=%dbytes.\n", rsdt->header.Length);
@@ -195,6 +198,7 @@ void acpi_init()
 
         paddr = (uint64_t)acpi_RSDT_entry_phys_base;
         mm_map(&initial_mm, acpi_description_header_base, PAGE_2M_SIZE, paddr);
+        // kinfo("entry mapped!");
     }
     else
     {

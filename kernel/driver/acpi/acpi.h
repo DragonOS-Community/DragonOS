@@ -25,11 +25,8 @@
 #define ACPI_ICS_TYPE_PROCESSOR_GIC_ITS 0xF
 // 0x10-0x7f Reserved. OSPM skips structures of the reserved type.
 // 0x80-0xff Reserved for OEM use
-
-#define ACPI_RSDT_VIRT_ADDR_BASE SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + ACPI_RSDT_MAPPING_OFFSET
-#define ACPI_XSDT_VIRT_ADDR_BASE SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + ACPI_XSDT_MAPPING_OFFSET
-#define ACPI_DESCRIPTION_HEDERS_BASE ACPI_RSDT_VIRT_ADDR_BASE + (PAGE_2M_SIZE)
-#define ACPI_XSDT_DESCRIPTION_HEDERS_BASE ACPI_XSDT_VIRT_ADDR_BASE + (PAGE_2M_SIZE)
+// extern const uint64_t acpi_rsdt_virt_addr_base ;     // RSDT的虚拟地址
+// extern const uint64_t acpi_description_header_base ; // RSDT中的第一个entry所在虚拟地址
 
 bool acpi_use_xsdt = false;
 struct acpi_RSDP_t

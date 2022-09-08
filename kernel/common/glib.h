@@ -138,6 +138,26 @@ static inline void list_del(struct List *entry)
     entry->prev->next = entry->next;
 }
 
+/**
+ * @brief 将新的链表结点替换掉旧的链表结点，并使得旧的结点的前后指针均为NULL
+ * 
+ * @param old 要被替换的结点
+ * @param new 新的要换上去的结点
+ */
+static inline void list_replace(struct List* old, struct List * new)
+{
+    if(old->prev!=NULL)
+        old->prev->next=new;
+    new->prev = old->prev;
+    if(old->next!=NULL)
+        old->next->prev = new;
+    new->next = old->next;
+
+    old->prev = NULL;
+    old->next = NULL;
+}
+
+
 static inline bool list_empty(struct List *entry)
 {
     /**

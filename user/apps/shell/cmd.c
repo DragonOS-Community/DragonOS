@@ -209,8 +209,9 @@ int shell_cmd_cd(int argc, char **argv)
         if (current_dir_len > 1)
             new_path[current_dir_len] = '/';
         strcat(new_path, argv[1] + dest_offset);
-
-        if (chdir(new_path) == 0) // 成功切换目录
+        int x = chdir(new_path);
+        printf("chdir: retval=%d\n",x);
+        if (x == 0) // 成功切换目录
         {
             free(shell_current_path);
             // printf("new_path=%s, newlen= %d\n", new_path, new_len);
@@ -260,6 +261,8 @@ int shell_cmd_ls(int argc, char **argv)
             color = COLOR_YELLOW;
         else if (buf->d_type & VFS_ATTR_FILE)
             color = COLOR_INDIGO;
+        else if(buf->d_type & VFS_ATTR_DEVICE)
+            color= COLOR_GREEN;
 
         char output_buf[256] = {0};
 

@@ -4,95 +4,57 @@
 
 &nbsp;
 
-这是一个运行于x86_64平台的64位操作系统。目前正在开发之中！
+&emsp;&emsp;这是一个运行于x86_64平台的64位操作系统。目前正在开发之中！
+
+[关于DragonOS，你想了解的都在这儿 - DragonOS](https://dragonos.org/uncategorized/summary/)
 
 ## 网站
+
 - 项目官网  **[DragonOS.org](https://dragonos.org)**
+
 - 项目文档  **[docs.DragonOS.org](https://docs.dragonos.org)**
+
 - 开源论坛  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
+
 - 开发交流QQ群 **115763565**
-- 代码搜索引擎 [code.DragonOS.org](http://code.dragonos.org)&nbsp;
-## 开发环境
 
-GCC>=8.0
-
-qemu==6.2
-
-grub==2.06
+- 代码搜索引擎 [code.DragonOS.org](http://code.dragonos.org)
+  
+  &nbsp;
 
 ## 如何运行？
 
-1. clone本项目
+&emsp;&emsp;运行DragonOS的步骤非常简单，您可以参考以下几个资料，在最短15分钟内运行DragonOS！
 
-2. 运行命令 bash run.sh
+- [构建DragonOS — DragonOS dev 文档](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html#docker)
 
-## To do list:
+- [如何在电脑的虚拟机上运行DragonOS？ | | 龙进的博客](https://longjin666.cn/?p=1514)
 
-- [x] multiboot2
+- [教你在15分钟内运行DragonOS！- Bilibili](https://www.bilibili.com/video/BV1zF411w7s2?share_source=copy_web&vd_source=41ab4a1b73e6f65219a785923511517e)
 
-- [x] printk
+## 系统特性
 
-- [x] 简单的异常捕获及中断处理
+&emsp;&emsp;请参见文档：[系统特性](https://docs.dragonos.org/zh_CN/latest/introduction/features.html)
 
-- [x] APIC
+## 如何加入？
 
-- [x] 初级内存管理单元
+&emsp;&emsp;如果你愿意加入我们，你可以查看GitHub仓库的Project面板，选择近期已规划的功能，对他们进行完善。
 
-- [x] SLAB内存池
+&emsp;&emsp;或者，你也可以带着你的创意与想法，和社区的小伙伴一起讨论，为DragonOS创造一些新的功能。
 
-- [x] PS/2 键盘、鼠标驱动
+## 如何与社区建立联系？
 
-- [x] PCI 总线驱动
+&emsp;&emsp;你可以发邮件给我，我的邮件地址是[longjin@RinGoTek.cn](mailto:longjin@RinGoTek.cn)。
 
-- [ ] usb驱动
+&emsp;&emsp;或者是加入我们的开发交流QQ群：**115763565**
 
-- [x] SATA硬盘驱动(AHCI)
+&emsp;&emsp;对于正式问题的讨论，我们建议在论坛[bbs.DragonOS.org](https://bbs.dragonos.org/)上的对应板块，使用正式的语言发帖讨论。亦或者是在本仓库的issue下提出问题。
 
-- [ ] 驱动程序框架
-
-- [ ] 网卡驱动
-
-- [ ] 网络协议栈
-
-- [ ] 图形驱动
-
-- [x] 第一个进程
-
-- [x] 进程管理
-
-- [ ] IPC进程间通信
-
-- [x] 第一个系统调用函数
-
-- [x] 在物理平台上启动DragonOS（AMD处理器上存在自动重启的问题）
-
-- [x] 多核启动
-
-- [ ] 多核调度及负载均衡
-
-- [x] FAT32文件系统
-
-- [x] VFS虚拟文件系统
-
-- [x] 解析ELF文件格式
-
-- [x] 浮点数支持
-
-- [x] 基于POSIX实现系统调用库
-
-- [x] Shell
-
-- [x] 内核栈反向跟踪
-
-- [ ] 动态加载模块
-
-## 贡献代码
-
-如果你愿意跟我一起开发这个项目，请先发邮件到我的邮箱~
+&emsp;&emsp;在发帖的同时，可以把帖子转发到交流QQ群，这样能使得问题的交流更加高效，也便于问题的归档。
 
 ## 贡献者名单
 
-fslongjin
+[Contributors to fslongjin/DragonOS · GitHub](https://github.com/fslongjin/DragonOS/graphs/contributors)
 
 ## 联系我
 
@@ -102,11 +64,19 @@ fslongjin
 
 ## 赞赏
 
-如果你愿意的话，点击下面的链接，请我喝杯咖啡吧~请在付款备注处留下您的github ID，我会将其贴到这个页面. 捐赠所得资金将用于网站、论坛社区维护以及一切与本项目所相关的用途。
+&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是其日常维护仍需要一些资金，如果你愿意的话，可以通过[赞助 - DragonOS](https://dragonos.org/donate/)，从而促进这个项目的发展。所有的赞助者的名单都会被公示。
 
-[捐赠 | 龙进的博客](https://longjin666.cn/?page_id=54)
+### 赞助的资金都会被用到哪里？
 
-## 赞赏者列表
+- 官网及社区论坛的服务器开支
+
+- 代码搜索引擎服务器的开支（这不是一个小数目）
+
+- 域名、CDN等服务的开支
+
+- 任何有助于DragonOS发展建设的用途
+
+### 赞赏者列表
 
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
@@ -123,7 +93,7 @@ fslongjin
 
 ## 参考资料
 
-本项目参考了以下资料，我对这些项目、书籍、文档的作者表示感谢！
+&emsp;&emsp;本项目参考了以下资料，我对这些项目、书籍、文档的作者表示感谢！
 
 - 《一个64位操作系统的实现》田宇（人民邮电出版社）
 

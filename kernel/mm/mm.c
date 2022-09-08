@@ -229,6 +229,26 @@ void mm_init()
     // 初始化slab内存池
     slab_init();
     page_table_init();
+
+    initial_mm.pgd = (pml4t_t *)get_CR3();
+
+    initial_mm.code_addr_start = memory_management_struct.kernel_code_start;
+    initial_mm.code_addr_end = memory_management_struct.kernel_code_end;
+
+    initial_mm.data_addr_start = (ul)&_data;
+    initial_mm.data_addr_end = memory_management_struct.kernel_data_end;
+
+    initial_mm.rodata_addr_start = (ul)&_rodata;
+    initial_mm.rodata_addr_end = (ul)&_erodata;
+    initial_mm.bss_start = (uint64_t)&_bss;
+    initial_mm.bss_end = (uint64_t)&_ebss;
+
+    initial_mm.brk_start = memory_management_struct.start_brk;
+    initial_mm.brk_end = current_pcb->addr_limit;
+
+    initial_mm.stack_start = _stack_start;
+    initial_mm.vmas = NULL;
+    
     mmio_init();
 }
 

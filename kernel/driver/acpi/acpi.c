@@ -3,8 +3,9 @@
 #include <common/kprint.h>
 #include <driver/multiboot2/multiboot2.h>
 #include <mm/mm.h>
+#include <mm/mmio.h>
 
-#define acpi_get_RSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_RSDT_entry_phys_base) // 获取RSDT entry的虚拟地址
+#define acpi_get_RSDT_entry_vaddr(phys_addr) (acpi_description_header_base + (phys_addr)-acpi_RSDT_entry_phys_base) // 获取RSDT entry的虚拟地址
 // #define acpi_get_XSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_XSDT_entry_phys_base) // 获取XSDT entry的虚拟地址
 
 static struct acpi_RSDP_t *rsdpv1;
@@ -22,7 +23,9 @@ static uint acpi_XSDT_Entry_num = 0;
 
 static ul acpi_RSDT_entry_phys_base = 0; // RSDT中的第一个entry所在物理页的基地址
 
-static uint64_t acpi_madt_vaddr = 0;    // MADT的虚拟地址
+static uint64_t acpi_madt_vaddr = 0;              // MADT的虚拟地址
+static uint64_t acpi_rsdt_virt_addr_base = 0;     // RSDT的虚拟地址
+static uint64_t acpi_description_header_base = 0; // RSDT中的第一个entry所在虚拟地址
 
 // static ul acpi_XSDT_entry_phys_base = 0; // XSDT中的第一个entry所在物理页的基地址
 
@@ -41,8 +44,8 @@ void acpi_iter_SDT(bool (*_fun)(const struct acpi_system_description_table_heade
         ul *ent = &(xsdt->Entry);
         for (int i = 0; i < acpi_XSDT_Entry_num; ++i)
         {
-            mm_map_phys_addr(ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * i, (*(ent + i)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
-            sdt_header = (struct acpi_system_description_table_header_t *)((ul)(ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * i));
+            mm_map_phys_addr(acpi_description_header_base + PAGE_2M_SIZE * i, (*(ent + i)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+            sdt_header = (struct acpi_system_description_table_header_t *)((ul)(acpi_description_header_base + PAGE_2M_SIZE * i));
 
             if (_fun(sdt_header, _data) == true)
                 return;
@@ -100,7 +103,6 @@ bool acpi_get_HPET(const struct acpi_system_description_table_header_t *_iter_da
     return true;
 }
 
-
 /**
  * @brief 初始化acpi模块
  *
@@ -110,26 +112,20 @@ void acpi_init()
 {
     kinfo("Initializing ACPI...");
 
-    // 获取rsdp
-
+    // 获取物理地址
     int reserved;
+
     multiboot2_iter(multiboot2_get_acpi_old_RSDP, &old_acpi, &reserved);
-
     rsdpv1 = &(old_acpi.rsdp);
-
-    kdebug("RSDT_phys_Address=%#018lx", rsdpv1->RsdtAddress);
-    kdebug("RSDP_Revision=%d", rsdpv1->Revision);
 
     multiboot2_iter(multiboot2_get_acpi_new_RSDP, &new_acpi, &reserved);
     rsdpv2 = &(new_acpi.rsdp);
 
-    kdebug("Rsdt_v2_phys_Address=%#018lx", rsdpv2->rsdp1.RsdtAddress);
-    kdebug("Xsdt_phys_Address=%#018lx", rsdpv2->XsdtAddress);
-    kdebug("RSDP_v2_Revision=%d", rsdpv2->rsdp1.Revision);
-
+    uint64_t paddr = 0;
     // An ACPI-compatible OS must use the XSDT if present
     if (rsdpv2->XsdtAddress != 0x00UL)
     {
+        // 不要删除这段注释（因为还不确定是代码的bug，还是真机的bug）
         /*
         acpi_use_xsdt = true;
         ul xsdt_phys_base = rsdpv2->XsdtAddress & PAGE_2M_MASK;
@@ -156,12 +152,23 @@ void acpi_init()
             mm_map_phys_addr(ACPI_XSDT_DESCRIPTION_HEDERS_BASE + PAGE_2M_SIZE * j, (*(ent + j)) & PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
         }
         */
+
         // 由于解析XSDT出现问题。暂时只使用Rsdpv2的rsdt，但是这是不符合ACPI规范的！！！
         ul rsdt_phys_base = rsdpv2->rsdp1.RsdtAddress & PAGE_2M_MASK;
         acpi_RSDT_offset = rsdpv2->rsdp1.RsdtAddress - rsdt_phys_base;
-        mm_map_phys_addr(ACPI_RSDT_VIRT_ADDR_BASE, rsdt_phys_base, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+
+        //申请mmio空间
+        uint64_t size = 0;
+        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
+
+        //映射rsdt表
+        paddr = (uint64_t)rsdt_phys_base;
+        mm_map(&initial_mm, acpi_rsdt_virt_addr_base, PAGE_2M_SIZE, paddr);
+
+        // rsdt表虚拟地址
+        rsdt = (struct acpi_RSDT_Structure_t *)(acpi_rsdt_virt_addr_base + acpi_RSDT_offset);
         kdebug("RSDT mapped!(v2)");
-        rsdt = (struct acpi_RSDT_Structure_t *)(ACPI_RSDT_VIRT_ADDR_BASE + acpi_RSDT_offset);
+
         // 计算RSDT Entry的数量
         kdebug("offset=%d", sizeof(rsdt->header));
         acpi_RSDT_Entry_num = (rsdt->header.Length - 36) / 4;
@@ -169,43 +176,57 @@ void acpi_init()
         printk_color(ORANGE, BLACK, "RSDT Length=%dbytes.\n", rsdt->header.Length);
         printk_color(ORANGE, BLACK, "RSDT Entry num=%d\n", acpi_RSDT_Entry_num);
 
-        mm_map_phys_addr(ACPI_RSDT_VIRT_ADDR_BASE, rsdt_phys_base, rsdt->header.Length + PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        //申请mmio空间
+        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_description_header_base, &size);
+
         // 映射所有的Entry的物理地址
         acpi_RSDT_entry_phys_base = ((ul)(rsdt->Entry)) & PAGE_2M_MASK;
         // 由于地址只是32bit的，并且存在脏数据，这里需要手动清除高32bit，否则会触发#GP
         acpi_RSDT_entry_phys_base = MASK_HIGH_32bit(acpi_RSDT_entry_phys_base);
 
-        kdebug("entry=%#018lx", rsdt->Entry);
-        kdebug("acpi_RSDT_entry_phys_base=%#018lx", acpi_RSDT_entry_phys_base);
-        // 映射RSDT ENTRY的物理地址
-        mm_map_phys_addr(ACPI_DESCRIPTION_HEDERS_BASE, acpi_RSDT_entry_phys_base, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        paddr = (uint64_t)acpi_RSDT_entry_phys_base;
+        mm_map(&initial_mm, acpi_description_header_base, PAGE_2M_SIZE, paddr);
     }
     else if (rsdpv1->RsdtAddress != (uint)0x00UL)
-    { // 映射RSDT的物理地址到页表
-        // 暂定字节数为2MB
-        // 由于页表映射的原因，需要清除低21位地址，才能填入页表
+    {
+        // rsdt表物理地址
         ul rsdt_phys_base = rsdpv1->RsdtAddress & PAGE_2M_MASK;
         acpi_RSDT_offset = rsdpv1->RsdtAddress - rsdt_phys_base;
-        mm_map_phys_addr(ACPI_RSDT_VIRT_ADDR_BASE, rsdt_phys_base, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        
+        kdebug("rsdpv1->RsdtAddress=%#018lx", rsdpv1->RsdtAddress);
+        //申请mmio空间
+        uint64_t size = 0;
+        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
+
+        // kdebug("acpi_rsdt_virt_addr_base = %#018lx,size= %#010lx", acpi_rsdt_virt_addr_base, size);
+        //映射rsdt表
+        paddr = (uint64_t)rsdt_phys_base;
+        mm_map(&initial_mm, acpi_rsdt_virt_addr_base, PAGE_2M_SIZE, paddr);
+        // rsdt表虚拟地址
+        rsdt = (struct acpi_RSDT_Structure_t *)(acpi_rsdt_virt_addr_base + acpi_RSDT_offset);
         kdebug("RSDT mapped!");
-        rsdt = (struct acpi_RSDT_Structure_t *)(ACPI_RSDT_VIRT_ADDR_BASE + acpi_RSDT_offset);
+
+        // kdebug("length = %d",rsdt->header.Length);
         // 计算RSDT Entry的数量
-        kdebug("offset=%d", sizeof(rsdt->header));
+        // kdebug("offset=%d", sizeof(rsdt->header));
+
         acpi_RSDT_Entry_num = (rsdt->header.Length - 36) / 4;
 
         printk_color(ORANGE, BLACK, "RSDT Length=%dbytes.\n", rsdt->header.Length);
         printk_color(ORANGE, BLACK, "RSDT Entry num=%d\n", acpi_RSDT_Entry_num);
 
-        mm_map_phys_addr(ACPI_RSDT_VIRT_ADDR_BASE, rsdt_phys_base, rsdt->header.Length + PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        //申请mmio空间
+        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_description_header_base, &size);
+
         // 映射所有的Entry的物理地址
         acpi_RSDT_entry_phys_base = ((ul)(rsdt->Entry)) & PAGE_2M_MASK;
         // 由于地址只是32bit的，并且存在脏数据，这里需要手动清除高32bit，否则会触发#GP
         acpi_RSDT_entry_phys_base = MASK_HIGH_32bit(acpi_RSDT_entry_phys_base);
 
-        kdebug("entry=%#018lx", rsdt->Entry);
-        kdebug("acpi_RSDT_entry_phys_base=%#018lx", acpi_RSDT_entry_phys_base);
-        // 映射RSDT ENTRY的物理地址
-        mm_map_phys_addr(ACPI_DESCRIPTION_HEDERS_BASE, acpi_RSDT_entry_phys_base, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+        paddr = (uint64_t)acpi_RSDT_entry_phys_base;
+        mm_map(&initial_mm, acpi_description_header_base, PAGE_2M_SIZE, paddr);
+        // kinfo("entry mapped!");
+        
     }
     else
     {
@@ -216,4 +237,5 @@ void acpi_init()
     }
 
     kinfo("ACPI module initialized!");
+    return;
 }

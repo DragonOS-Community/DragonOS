@@ -10,7 +10,7 @@
    :maxdepth: 1
    :caption: 入门
 
-   introduction/intro
+   introduction/index
    introduction/build_system
 
 .. toctree::

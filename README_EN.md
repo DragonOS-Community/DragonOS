@@ -4,96 +4,51 @@
 
 &nbsp;
 
-This project is a operating system running on computer which is in X86_ 64 Architecture . The DragonOS is currently under development!
+&emsp;&emsp;This project is a operating system running on computer which is in X86_ 64 Architecture . The DragonOS is currently under development!
+
+[All you want to know about DragonOS is here - DragonOS](https://dragonos.org/uncategorized/summary/)
 
 ## Websites
+
 - Home Page  **[DragonOS.org](https://dragonos.org)**
 - Documentation  **[docs.DragonOS.org](https://docs.dragonos.org)**
 - BBS  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
 - QQ group **115763565**
 - code search engine [code.DragonOS.org](http://code.dragonos.org)&nbsp;
 
-## Development Environment
-
-GCC>=8.0
-
-qemu==6.2
-
-grub==2.06
-
 ## How to run?
 
-1. clone the project
+&emsp;&emsp;The steps to run DragonOS are very simple. You can refer to the following materials to run DragonOS in the shortest 15 minutes!
 
-2. Run the <u>run.sh</u> 
+- [Building DragonOS - DragonOS dev document](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html#docker)
 
-## To do list:
+- [How to run DragonOS on a computer's virtual machine? || Long Jin's blog](https://longjin666.cn/?p=1514)
 
-- [x] multiboot2
+- [Teach you to run DragonOS in 15 minutes- Bilibili](https://www.bilibili.com/video/BV1zF411w7s2?share_source=copy_web&vd_source=41ab4a1b73e6f65219a785923511517e)
 
-- [x] printk
+## DragonOS' Features
 
-- [x] Simple exception capture and interrupt handling
+&emsp;&emsp;See documentation:[Features](https://docs.dragonos.org/zh_CN/latest/introduction/features.html)
 
-- [x] APIC
+## How to join DragonOS ?
 
-- [x] Primary memory management unit
+&emsp;&emsp;If you are willing to join us, you can check the project panel of GitHub warehouse, select the recently planned functions, and improve them.
 
-- [x] SLAB memory pool
+&emsp;&emsp;Or, you can also bring your ideas and ideas, discuss with the community partners, and create some new functions for dragonos.
 
-- [x] PS/2 Keyboard and mouse driver
+## How to come in contact with the community?
 
-- [x] PCI bus driver
+&emsp;&emsp;You can send me an email. My email address is[ longjin@RinGoTek.cn ](mailto: longjin@RinGoTek.cn )。
 
-- [ ] USB Driver
+&emsp;&emsp;Or join our development exchange QQ group: **115763565**
 
-- [x] SATA Hard disk driver(AHCI)
+&emsp;&emsp;For the discussion of formal issues, we suggest that they be discussed in the forum [BBS.Dragonos.org](https://bbs.dragonos.org/) In the corresponding section of the, use formal language to post for discussion. Or ask questions under the issue of the warehouse.
 
-- [ ] Driver Framework
-
-- [ ] Network card driver
-
-- [ ] Internet protocol stack
-
-- [ ] Graphics driver
-
-- [x] First process
-
-- [x] Process management
-
-- [ ] IPC
-
-- [x] First system call function
-
-- [x] Start dragonos on the physical platform (There is a bug which can make the computer automatically reboot on AMD processor)
-
-- [x] Multi core boot
-
-- [ ] Multi core scheduling and load balancing
-
-- [x] FAT32 file system
-
-- [x] virtual file system
-
-- [x] Parsing ELF file format
-
-- [x] Floating point support
-
-- [x] Implementation of system call library based on POSIX
-
-- [x] Shell
-
-- [x] Kernel stack backtracking
-
-- [ ] Dynamic loading module
-
-## Contribute code
-
-If you are willing to develop this project with me, please email me first~
+&emsp;&emsp;While posting, you can forward the post to the communication QQ group, which can make the communication of problems more efficient and facilitate the archiving of problems.
 
 ## List of contributors
 
-fslongjin
+[Contributors to fslongjin/DragonOS · GitHub](https://github.com/fslongjin/DragonOS/graphs/contributors)
 
 ## Contact with me
 
@@ -103,9 +58,17 @@ Blog：[longjin666.cn](https://longjin666.cn)
 
 ## Reward
 
-If you like, click the link below and buy me a cup of coffee ~ please leave your GitHub ID in the payment remarks and I will post it to this page. The donated funds will be used for website, forum community maintenance and all purposes related to the project.
+&emsp;&emsp;Dragonos is a public welfare open source project, but its daily maintenance still needs some funds. If you want, you can visit [Sponsor - DragonOS](https://dragonos.org/donate/), so as to promote the development of this project. The list of all sponsors will be published.
 
-[The reward webpage](https://longjin666.cn/?page_id=54)
+### Where will the sponsorship funds be used?
+
+- Server expenses of official website and community forum
+
+- Code search engine server expenses (this is not a small amount)
+
+- Expenses for domain name, CDN and other services
+
+- Any use that is conducive to the development and construction of DragonOS
 
 ## Sponsors
 
@@ -114,14 +77,17 @@ If you like, click the link below and buy me a cup of coffee ~ please leave your
 
 ## Open source statement
 
-This project adopts GPLv2 LICENSE for open source. You are welcome to use the code of this project on the basis of abiding by the open source license!
+&emsp;&emsp;This project adopts GPLv2 LICENSE for open source. You are welcome to use the code of this project on the basis of abiding by the open source license!
+
 **What we support:** using this project to create greater value and contribute code to this project under the condition of abiding by the agreement.
+
 **What we condemn**: any non-compliance with the open source license. Including but not limited to: plagiarizing the code of the project as your graduation project and other academic misconduct, as well as commercial closed source use without payment.
+
 If you find any violation of the open source license, we welcome you to send email feedback! Let's build an honest open source community together!
 
 ## References
 
-This project refers to the following materials. I sincerely give my thanks to the authors of these projects, books and documents!
+&emsp;&emsp;This project refers to the following materials. I sincerely give my thanks to the authors of these projects, books and documents!
 
 - Implementation of a 64 bit operating system, Tian Yu (POSTS&TELECOM  PRESS)
 

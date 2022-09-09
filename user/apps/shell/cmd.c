@@ -210,7 +210,7 @@ int shell_cmd_cd(int argc, char **argv)
             new_path[current_dir_len] = '/';
         strcat(new_path, argv[1] + dest_offset);
         int x = chdir(new_path);
-        printf("chdir: retval=%d\n",x);
+        
         if (x == 0) // 成功切换目录
         {
             free(shell_current_path);

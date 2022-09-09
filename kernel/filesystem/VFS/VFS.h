@@ -224,3 +224,13 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
  * @return uint64_t 错误码
  */
 uint64_t do_open(const char *filename, int flags);
+
+/**
+ * @brief 创建文件夹
+ * 
+ * @param path 文件夹路径
+ * @param mode 创建模式
+ * @param from_userland 该创建请求是否来自用户态 
+ * @return int64_t 错误码
+ */
+int64_t vfs_mkdir(const char* path, mode_t mode, bool from_userland);

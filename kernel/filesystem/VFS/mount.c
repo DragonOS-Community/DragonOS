@@ -30,7 +30,7 @@ int do_mount(struct vfs_dir_entry_t *old_dentry, struct vfs_dir_entry_t *new_den
     mp->dentry = old_dentry;
     mp->parent_dentry = old_dentry->parent;
     
-    kdebug("&new_dentry->name=%#018lx, &old_dentry->name=%#018lx", &new_dentry->name, &old_dentry->name);
+    // kdebug("&new_dentry->name=%#018lx, &old_dentry->name=%#018lx", &new_dentry->name, &old_dentry->name);
     // 拷贝名称
     strncpy(new_dentry->name, old_dentry->name, old_dentry->name_length);
 
@@ -41,7 +41,22 @@ int do_mount(struct vfs_dir_entry_t *old_dentry, struct vfs_dir_entry_t *new_den
 
     // 将新的dentry的list结点替换掉父dentry的列表中的old_dentry的list结点
     list_replace(&old_dentry->child_node_list, &new_dentry->child_node_list);
+
+    // 后挂载的dentry在链表的末尾（umount恢复的时候需要依赖这个性质）
     list_append(&mnt_list_head, &mp->mnt_list);
+
+    return 0;
+}
+
+/**
+ * @brief 取消某个文件系统的挂载
+ * 
+ * @param dentry 对应文件系统的根dentry
+ * @return int 错误码
+ */
+int do_umount(struct vfs_dir_entry_t* dentry)
+{
+    // todo: 实现umount（主要是结点的恢复问题）
 
     return 0;
 }

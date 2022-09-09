@@ -16,6 +16,8 @@ extern struct vfs_file_operations_t ps2_keyboard_fops;
 static struct vfs_filesystem_type_t vfs_fs = {"filesystem", 0};
 struct vfs_superblock_t *vfs_root_sb = NULL;
 
+struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
+
 /**
  * @brief 挂载文件系统
  *
@@ -166,11 +168,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         // 如果没有找到dentry缓存，则申请新的dentry
         if (dentry == NULL)
         {
-            dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
-            // 为目录项的名称分配内存
-            dentry->name = (char *)kmalloc(tmp_path_len + 1, 0);
-            // 貌似这里不需要memset，因为空间会被覆盖
-            // memset(dentry->name, 0, tmp_path_len+1);
+            dentry = vfs_alloc_dentry(tmp_path_len+1);
 
             memcpy(dentry->name, (void *)tmp_path, tmp_path_len);
             dentry->name[tmp_path_len] = '\0';
@@ -186,9 +184,6 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
                 return NULL;
             }
             // 找到子目录项
-            // 初始化子目录项的entry
-            list_init(&dentry->child_node_list);
-            list_init(&dentry->subdirs_list);
             dentry->parent = parent;
 
             list_add(&parent->subdirs_list, &dentry->child_node_list);
@@ -214,6 +209,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
 /**
  * @brief 填充dentry
  *
+ * @return dirent的总大小
  */
 int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset)
 {
@@ -240,18 +236,16 @@ int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
 
 /**
  * @brief 创建文件夹
- *
- * @param path(r8) 路径
- * @param mode(r9) 模式
- * @return uint64_t
+ * 
+ * @param path 文件夹路径
+ * @param mode 创建模式
+ * @param from_userland 该创建请求是否来自用户态 
+ * @return int64_t 错误码
  */
-uint64_t sys_mkdir(struct pt_regs *regs)
+int64_t vfs_mkdir(const char* path, mode_t mode, bool from_userland)
 {
-    const char *path = (const char *)regs->r8;
-    // kdebug("path = %s", path);
-    mode_t mode = (mode_t)regs->r9;
     uint32_t pathlen;
-    if (regs->cs & USER_CS)
+    if (from_userland)
         pathlen = strnlen_user(path, PAGE_4K_SIZE - 1);
     else
         pathlen = strnlen(path, PAGE_4K_SIZE - 1);
@@ -279,7 +273,7 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     memset(buf, 0, pathlen + 1);
 
     // 拷贝字符串（不包含要被创建的部分）
-    if (regs->cs & USER_CS)
+    if (from_userland)
         strncpy_from_user(buf, path, last_slash);
     else
         strncpy(buf, path, last_slash);
@@ -306,7 +300,8 @@ uint64_t sys_mkdir(struct pt_regs *regs)
 
     struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
     memset((void *)subdir_dentry, 0, sizeof(struct vfs_dir_entry_t));
-
+    list_init(&subdir_dentry->subdirs_list);
+    list_init(&subdir_dentry->child_node_list);
     if (path[pathlen - 1] == '/')
         subdir_dentry->name_length = pathlen - last_slash - 2;
     else
@@ -325,9 +320,28 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     subdir_dentry->parent = parent_dir;
     // kdebug("to mkdir, parent name=%s", parent_dir->name);
     int retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
-    list_add(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
+    list_append(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
     // kdebug("retval = %d", retval);
     return 0;
+}
+/**
+ * @brief 创建文件夹
+ *
+ * @param path(r8) 路径
+ * @param mode(r9) 模式
+ * @return uint64_t
+ */
+uint64_t sys_mkdir(struct pt_regs *regs)
+{
+    const char *path = (const char *)regs->r8;
+    // kdebug("path = %s", path);
+    mode_t mode = (mode_t)regs->r9;
+
+    if (regs->cs & USER_CS)
+        return vfs_mkdir(path, mode, true);
+    else
+        return vfs_mkdir(path, mode, false);
+    
 }
 
 /**
@@ -502,7 +516,6 @@ uint64_t do_open(const char *filename, int flags)
     }
     // 保存文件描述符
     f[fd_num] = file_ptr;
-
     return fd_num;
 }
 

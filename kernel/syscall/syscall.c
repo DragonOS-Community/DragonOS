@@ -425,7 +425,7 @@ uint64_t sys_chdir(struct pt_regs *regs)
  * @brief 获取目录中的数据
  *
  * @param fd 文件描述符号
- * @return uint64_t
+ * @return uint64_t dirent的总大小
  */
 uint64_t sys_getdents(struct pt_regs *regs)
 {

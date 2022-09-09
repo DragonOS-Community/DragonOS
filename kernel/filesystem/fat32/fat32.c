@@ -900,6 +900,7 @@ fail:;
  * @param inode 父目录的inode
  * @param dEntry 新的文件夹的dentry
  * @param mode 创建文件夹的mode
+ * @return long 错误码
  */
 int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dEntry, int mode)
 {
@@ -1053,7 +1054,7 @@ int64_t fat32_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr)
  * @param file_ptr 文件结构体指针
  * @param dirent 返回的dirent
  * @param filler 填充dirent的函数
- * @return int64_t
+ * @return uint64_t dirent的总大小
  */
 int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler)
 {

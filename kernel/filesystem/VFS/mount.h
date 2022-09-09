@@ -27,3 +27,11 @@ int mount_init();
  * @return int 错误码
  */
 int do_mount(struct vfs_dir_entry_t *old_dentry, struct vfs_dir_entry_t *new_dentry);
+
+/**
+ * @brief 取消某个文件系统的挂载
+ * 
+ * @param dentry 对应文件系统的根dentry
+ * @return int 错误码
+ */
+int do_umount(struct vfs_dir_entry_t* dentry);

@@ -19,7 +19,6 @@ endif
 
 .PHONY: all
 all: kernel user
-	
 
 
 .PHONY: kernel

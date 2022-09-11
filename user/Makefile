@@ -15,19 +15,17 @@ current_CFLAGS := $(CFLAGS)
 ECHO:
 	@echo "$@"
 
-$(user_sub_dirs): ECHO
+$(user_sub_dirs): ECHO sys_api_lib
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
-
-other_dirs: $(user_sub_dirs)
-
-all: sys_api_lib
 	
+app: $(user_sub_dirs)
+
+all: app
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
-	
-# 	在成功编译系统库之后，开始编译用户态其他文件
-	$(MAKE) other_dirs
+
+	@echo 用户态程序编译完成
 
 # 系统库
 sys_api_lib:

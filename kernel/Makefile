@@ -53,7 +53,7 @@ all: kernel
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../bin/kernel/kernel.elf
-	@echo "Done."
+	@echo "Kernel Build Done."
 
 ECHO:
 	@echo "$@"

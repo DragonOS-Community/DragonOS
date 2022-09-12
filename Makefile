@@ -38,7 +38,7 @@ kernel:
 .PHONY: user
 user:
 	mkdir -p bin/user/
-	mkdir -p bin/tmp/
+	mkdir -p bin/tmp/user
 	@list='./user'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\

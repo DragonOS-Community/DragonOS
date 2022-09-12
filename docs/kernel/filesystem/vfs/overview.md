@@ -173,11 +173,11 @@ struct vfs_index_node_t
 
 &emsp;&emsp;inode的属性。可选值如下：
 
-> - VFS_ATTR_FILE
+> - VFS_IF_FILE
 > 
-> - VFS_ATTR_DIR
+> - VFS_IF_DIR
 > 
-> - VFS_ATTR_DEVICE
+> - VFS_IF_DEVICE
 
 **sb**
 

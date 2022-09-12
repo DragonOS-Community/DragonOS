@@ -28,12 +28,13 @@ extern struct vfs_superblock_t *vfs_root_sb;
 #define VFS_MAX_PATHLEN 1024
 
 /**
- * @brief 目录项的属性
+ * @brief inode的属性
  *
  */
-#define VFS_ATTR_FILE (1UL << 0)
-#define VFS_ATTR_DIR (1UL << 1)
-#define VFS_ATTR_DEVICE (1UL << 2)
+#define VFS_IF_FILE (1UL << 0)
+#define VFS_IF_DIR (1UL << 1)
+#define VFS_IF_DEVICE (1UL << 2)
+#define VFS_IF_DEAD (1UL<<3) /* removed, but still open directory */
 
 struct vfs_super_block_operations_t;
 struct vfs_inode_operations_t;
@@ -41,10 +42,13 @@ struct vfs_inode_operations_t;
 struct vfs_index_node_t;
 struct vfs_dir_entry_operations_t;
 
+#define VFS_DF_MOUNTED (1 << 0) // 当前dentry是一个挂载点
+#define VFS_DF_CANNOT_MOUNT (1 << 1) // 当前dentry是一个挂载点
 struct vfs_dir_entry_t
 {
     char *name;
     int name_length;
+    uint32_t d_flags; // dentry标志位
     struct List child_node_list;
     struct List subdirs_list;
 
@@ -218,8 +222,8 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
 
 /**
  * @brief 打开文件
- * 
- * @param filename 文件路径 
+ *
+ * @param filename 文件路径
  * @param flags 标志位
  * @return uint64_t 错误码
  */
@@ -227,10 +231,19 @@ uint64_t do_open(const char *filename, int flags);
 
 /**
  * @brief 创建文件夹
- * 
+ *
  * @param path 文件夹路径
  * @param mode 创建模式
- * @param from_userland 该创建请求是否来自用户态 
+ * @param from_userland 该创建请求是否来自用户态
  * @return int64_t 错误码
  */
-int64_t vfs_mkdir(const char* path, mode_t mode, bool from_userland);
+int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland);
+
+/**
+ * @brief 删除文件夹
+ *
+ * @param path 文件夹路径
+ * @param from_userland 请求是否来自用户态
+ * @return int64_t 错误码
+ */
+int64_t vfs_rmdir(const char *path, bool from_userland);

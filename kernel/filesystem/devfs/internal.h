@@ -58,7 +58,7 @@ static inline struct vfs_dir_entry_t *__devfs_find_dentry(struct vfs_dir_entry_t
 static inline struct vfs_dir_entry_t *__devfs_find_dir(struct vfs_dir_entry_t *parent_dentry, const char *name)
 {
     struct vfs_dir_entry_t *target_dent = __devfs_find_dentry(parent_dentry, name);
-    if (target_dent->dir_inode->attribute & VFS_ATTR_DIR) // 名称相符且为目录，则返回dentry
+    if (target_dent->dir_inode->attribute & VFS_IF_DIR) // 名称相符且为目录，则返回dentry
         return target_dent;
     else
         return NULL; // 否则直接返回空

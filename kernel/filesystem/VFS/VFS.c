@@ -1,6 +1,8 @@
 #include "VFS.h"
 #include "mount.h"
+#include "internal.h"
 #include <common/kprint.h>
+#include <debug/bug.h>
 #include <common/dirent.h>
 #include <common/string.h>
 #include <common/errno.h>
@@ -46,7 +48,9 @@ struct vfs_superblock_t *vfs_mount_fs(const char *path, char *name, struct block
         {
             struct vfs_superblock_t *sb = p->read_superblock(blk);
             if (strcmp(path, "/") == 0) // 如果挂载到的是'/'挂载点，则让其成为最顶层的文件系统
+            {
                 vfs_root_sb = sb;
+            }
             else
             {
                 kdebug("to mount %s", name);
@@ -168,7 +172,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
         // 如果没有找到dentry缓存，则申请新的dentry
         if (dentry == NULL)
         {
-            dentry = vfs_alloc_dentry(tmp_path_len+1);
+            dentry = vfs_alloc_dentry(tmp_path_len + 1);
 
             memcpy(dentry->name, (void *)tmp_path, tmp_path_len);
             dentry->name[tmp_path_len] = '\0';
@@ -236,13 +240,13 @@ int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
 
 /**
  * @brief 创建文件夹
- * 
+ *
  * @param path 文件夹路径
  * @param mode 创建模式
- * @param from_userland 该创建请求是否来自用户态 
+ * @param from_userland 该创建请求是否来自用户态
  * @return int64_t 错误码
  */
-int64_t vfs_mkdir(const char* path, mode_t mode, bool from_userland)
+int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
 {
     uint32_t pathlen;
     if (from_userland)
@@ -267,10 +271,9 @@ int64_t vfs_mkdir(const char* path, mode_t mode, bool from_userland)
 
     // 路径格式不合法（必须使用绝对路径）
     if (last_slash < 0)
-        return ENOTDIR;
+        return -ENOTDIR;
 
-    char *buf = (char *)kmalloc(last_slash + 1, 0);
-    memset(buf, 0, pathlen + 1);
+    char *buf = (char *)kzalloc(last_slash + 2, 0);
 
     // 拷贝字符串（不包含要被创建的部分）
     if (from_userland)
@@ -341,13 +344,12 @@ uint64_t sys_mkdir(struct pt_regs *regs)
         return vfs_mkdir(path, mode, true);
     else
         return vfs_mkdir(path, mode, false);
-    
 }
 
 /**
  * @brief 打开文件
- * 
- * @param filename 文件路径 
+ *
+ * @param filename 文件路径
  * @param flags 标志位
  * @return uint64_t 错误码
  */
@@ -445,23 +447,23 @@ uint64_t do_open(const char *filename, int flags)
         return -ENOENT;
 
     // 要求打开文件夹而目标不是文件夹
-    if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_ATTR_DIR))
+    if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_IF_DIR))
         return -ENOTDIR;
 
     // // 要找的目标是文件夹
-    // if ((flags & O_DIRECTORY) && dentry->dir_inode->attribute == VFS_ATTR_DIR)
+    // if ((flags & O_DIRECTORY) && dentry->dir_inode->attribute == VFS_IF_DIR)
     //     return -EISDIR;
 
     // // todo: 引入devfs后删除这段代码
     // // 暂时遇到设备文件的话，就将其first clus设置为特定值
     // if (path_len >= 5 && filename[0] == '/' && filename[1] == 'd' && filename[2] == 'e' && filename[3] == 'v' && filename[4] == '/')
     // {
-    //     if (dentry->dir_inode->attribute & VFS_ATTR_FILE)
+    //     if (dentry->dir_inode->attribute & VFS_IF_FILE)
     //     {
     //         // 对于fat32文件系统上面的设备文件，设置其起始扇区
     //         ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus |= 0xf0000000;
     //         dentry->dir_inode->sb->sb_ops->write_inode(dentry->dir_inode);
-    //         dentry->dir_inode->attribute |= VFS_ATTR_DEVICE;
+    //         dentry->dir_inode->attribute |= VFS_IF_DEVICE;
     //     }
     // }
 
@@ -544,6 +546,122 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size)
     return dentry;
 }
 
+/**
+ * @brief 判断是否可以删除指定的dentry
+ *
+ * 1、我们不能删除一个只读的dentry
+ * 2、我们应当对这个dentry的inode拥有写、执行权限（暂时还没有实现权限）
+ * 3、如果dentry指向的是文件夹，而isdir为false，则不能删除
+ * 3、如果dentry指向的是文件，而isdir为true，则不能删除
+ * @param dentry 将要被删除的dentry
+ * @param isdir 是否要删除文件夹
+ * @return int 错误码
+ */
+int vfs_may_delete(struct vfs_dir_entry_t *dentry, bool isdir)
+{
+    // 当dentry没有inode的时候，认为是bug
+    BUG_ON(dentry->dir_inode == NULL);
+
+    // todo: 进行权限检查
+
+    if (isdir) // 要删除文件夹
+    {
+        if (!D_ISDIR(dentry))
+            return -ENOTDIR;
+        else if (IS_ROOT(dentry))
+            return -EBUSY;
+    }
+    else if (D_ISDIR(dentry)) // 要删除文件但是当前是文件夹
+        return -EISDIR;
+
+    return 0;
+}
+
+/**
+ * @brief 删除文件夹
+ *
+ * @param path 文件夹路径
+ * @param from_userland 请求是否来自用户态
+ * @return int64_t 错误码
+ */
+int64_t vfs_rmdir(const char *path, bool from_userland)
+{
+    uint32_t pathlen;
+    if (from_userland)
+        pathlen = strnlen_user(path, PAGE_4K_SIZE - 1);
+    else
+        pathlen = strnlen(path, PAGE_4K_SIZE - 1);
+
+    if (pathlen == 0)
+        return -ENOENT;
+
+    int last_slash = -1;
+
+    // 去除末尾的'/'
+    for (int i = pathlen - 1; i >= 0; --i)
+    {
+        if (path[i] != '/')
+        {
+            last_slash = i + 1;
+            break;
+        }
+    }
+
+    // 路径格式不合法
+    if (last_slash < 0)
+        return -ENOTDIR;
+    else if (path[0] != '/')
+        return -EINVAL;
+
+    char *buf = (char *)kzalloc(last_slash + 2, 0);
+
+    // 拷贝字符串（不包含要被创建的部分）
+    if (from_userland)
+        strncpy_from_user(buf, path, last_slash);
+    else
+        strncpy(buf, path, last_slash);
+    buf[last_slash + 1] = '\0';
+
+    struct vfs_dir_entry_t *dentry = vfs_path_walk(buf, 0);
+
+    if (dentry == NULL)
+        return -ENOENT;
+
+    int retval = vfs_may_delete(dentry, true);
+    if (retval != 0)
+        return retval;
+    // todo: 对dentry和inode加锁
+    retval = -EBUSY;
+    if (is_local_mountpoint(dentry))
+        goto out;
+    // todo:
+    retval = dentry->dir_inode->inode_ops->rmdir(dentry->dir_inode, dentry);
+    if (retval != 0)
+        goto out;
+
+    dentry->dir_inode->attribute |= VFS_IF_DEAD; // 将当前inode标记为dead
+    dont_mount(dentry);                          // 将当前dentry标记为不可被挂载
+    detach_mounts(dentry);                       // 清理同样挂载在该路径的所有挂载点的挂载树
+
+    vfs_dentry_put(dentry); // 释放dentry
+out:;
+    // todo: 对dentry和inode放锁
+    return retval;
+}
+
+/**
+ * @brief 删除文件夹的系统调用函数
+ *
+ * @param r8 文件夹路径
+ * @return uint64_t 错误码
+ */
+uint64_t sys_rmdir(struct pt_regs *regs)
+{
+    if (SYSCALL_FROM_USER(regs))
+        return vfs_rmdir((char *)regs->r8, true);
+    else
+        return vfs_rmdir((char *)regs->r8, false);
+}
 /**
  * @brief 初始化vfs
  *

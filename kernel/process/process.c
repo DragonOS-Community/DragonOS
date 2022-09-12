@@ -154,7 +154,7 @@ struct vfs_file_t *process_open_exec_file(char *path)
     if (dentry == NULL)
         return (void *)-ENOENT;
 
-    if (dentry->dir_inode->attribute == VFS_ATTR_DIR)
+    if (dentry->dir_inode->attribute == VFS_IF_DIR)
         return (void *)-ENOTDIR;
 
     filp = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);

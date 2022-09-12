@@ -55,7 +55,7 @@ int __devfs_chardev_register(struct devfs_private_inode_info_t *private_info, st
 
     struct vfs_dir_entry_t *dentry = vfs_alloc_dentry(namelen + 1);
     __devfs_fill_dentry(dentry, devname);
-    __devfs_fill_inode(dentry, __devfs_alloc_inode(), VFS_ATTR_DEVICE, private_info);
+    __devfs_fill_inode(dentry, __devfs_alloc_inode(), VFS_IF_DEVICE, private_info);
 
     // 将dentry挂载到char文件夹下
     __devfs_dentry_bind_parent(chardev_folder_dentry, dentry);

@@ -97,3 +97,11 @@ int execv(const char* path, char * const argv[]);
  * @return int 
  */
 extern int usleep(useconds_t usec);
+
+/**
+ * @brief 删除文件夹
+ * 
+ * @param path 绝对路径
+ * @return int 错误码
+ */
+int rmdir(const char* path);

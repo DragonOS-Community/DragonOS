@@ -33,11 +33,11 @@ struct vfs_superblock_t *devfs_read_superblock(struct block_device *blk)
     return &devfs_sb;
 }
 
-static void devfs_write_superblock(struct vfs_superblock_t *sb) {}
+static void devfs_write_superblock(struct vfs_superblock_t *sb) {return 0; }
 
-static void devfs_put_superblock(struct vfs_superblock_t *sb) {}
+static void devfs_put_superblock(struct vfs_superblock_t *sb) {return 0; }
 
-static void devfs_write_inode(struct vfs_index_node_t *inode) {}
+static void devfs_write_inode(struct vfs_index_node_t *inode) {return 0; }
 struct vfs_super_block_operations_t devfs_sb_ops =
     {
         .write_superblock = &devfs_write_superblock,
@@ -45,13 +45,13 @@ struct vfs_super_block_operations_t devfs_sb_ops =
         .write_inode = &devfs_write_inode,
 };
 
-static long devfs_compare(struct vfs_dir_entry_t *parent_dEntry, char *source_filename, char *dest_filename) {}
+static long devfs_compare(struct vfs_dir_entry_t *parent_dEntry, char *source_filename, char *dest_filename) {return 0; }
 
-static long devfs_hash(struct vfs_dir_entry_t *dEntry, char *filename) {}
+static long devfs_hash(struct vfs_dir_entry_t *dEntry, char *filename) {return 0; }
 
-static long devfs_release(struct vfs_dir_entry_t *dEntry) {}
+static long devfs_release(struct vfs_dir_entry_t *dEntry) { return 0; }
 
-static long devfs_iput(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode) {}
+static long devfs_iput(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode) {return 0; }
 
 struct vfs_dir_entry_operations_t devfs_dentry_ops =
     {
@@ -65,10 +65,10 @@ static long devfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_p
 {
     return 0;
 }
-static long devfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) {}
-static long devfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {}
-static long devfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {}
-static long devfs_lseek(struct vfs_file_t *file_ptr, long offset, long origin) {}
+static long devfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) {return 0; }
+static long devfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {return 0; }
+static long devfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {return 0; }
+static long devfs_lseek(struct vfs_file_t *file_ptr, long offset, long origin) {return 0; }
 static long devfs_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg) { return 0; }
 
 static long devfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler)
@@ -94,10 +94,10 @@ static long devfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir
     char *name = (char *)kzalloc(target_dent->name_length + 1, 0);
     strncpy(name, target_dent->name, target_dent->name_length);
     uint32_t dentry_type;
-    if (target_dent->dir_inode->attribute & VFS_ATTR_DIR)
-        dentry_type = VFS_ATTR_DIR;
+    if (target_dent->dir_inode->attribute & VFS_IF_DIR)
+        dentry_type = VFS_IF_DIR;
     else
-        dentry_type = VFS_ATTR_DEVICE;
+        dentry_type = VFS_IF_DEVICE;
 
     return filler(dirent, file_ptr->position - 1, name, target_dent->name_length, dentry_type, file_ptr->position - 1);
 failed:;
@@ -123,6 +123,7 @@ struct vfs_file_operations_t devfs_file_ops =
  */
 static long devfs_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry, int mode)
 {
+    return 0; 
 }
 
 static struct vfs_dir_entry_t *devfs_lookup(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry)
@@ -148,18 +149,18 @@ static long devfs_mkdir(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *
     dEntry->dir_inode = (struct vfs_index_node_t *)kzalloc(sizeof(struct vfs_index_node_t), 0);
     dEntry->dir_inode->file_ops = &devfs_file_ops;
     dEntry->dir_inode->inode_ops = &devfs_inode_ops;
-
+    dEntry->dir_ops = &devfs_dentry_ops;
     // todo: 增加private inode info
     dEntry->dir_inode->private_inode_info = NULL;
     dEntry->dir_inode->sb = &devfs_sb;
-    dEntry->dir_inode->attribute = VFS_ATTR_DIR;
+    dEntry->dir_inode->attribute = VFS_IF_DIR;
     return 0;
 }
 
-static long devfs_rmdir(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry) {}
-static long devfs_rename(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry) {}
-static long devfs_getAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) {}
-static long devfs_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) {}
+static long devfs_rmdir(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry) { return 0; }
+static long devfs_rename(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry) {return 0; }
+static long devfs_getAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) {return 0; }
+static long devfs_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) {return 0; }
 struct vfs_inode_operations_t devfs_inode_ops = {
     .create = &devfs_create,
     .lookup = &devfs_lookup,
@@ -187,7 +188,7 @@ static __always_inline void __devfs_init_root_inode()
     // todo: 增加private inode info
     devfs_root_dentry->dir_inode->private_inode_info = NULL;
     devfs_root_dentry->dir_inode->sb = &devfs_sb;
-    devfs_root_dentry->dir_inode->attribute = VFS_ATTR_DIR;
+    devfs_root_dentry->dir_inode->attribute = VFS_IF_DIR;
 }
 /**
  * @brief 初始化devfs的根dentry
@@ -250,7 +251,6 @@ void devfs_init()
     __devfs_init_root_dentry();
     vfs_register_filesystem(&devfs_fs_type);
     vfs_mount_fs(__devfs_mount_path, "DEVFS", NULL);
-
 
     __devfs_chardev_init();
 

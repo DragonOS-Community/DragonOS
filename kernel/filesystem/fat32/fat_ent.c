@@ -335,7 +335,7 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
             target->DIR_Name[tmp_index] = 0x20;
             ++tmp_index;
         }
-        if (dEntry->dir_inode->attribute & VFS_ATTR_DIR)
+        if (dEntry->dir_inode->attribute & VFS_IF_DIR)
         {
             while (tmp_index < 11)
             {
@@ -355,7 +355,7 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
 
     struct vfs_index_node_t *inode = dEntry->dir_inode;
     target->DIR_Attr = 0;
-    if (inode->attribute & VFS_ATTR_DIR)
+    if (inode->attribute & VFS_IF_DIR)
         target->DIR_Attr |= ATTR_DIRECTORY;
 
     target->DIR_FileSize = dEntry->dir_inode->file_size;

@@ -19,6 +19,7 @@ extern void syscall_int(void);
 extern uint64_t sys_clock(struct pt_regs *regs);
 extern uint64_t sys_mstat(struct pt_regs *regs);
 extern uint64_t sys_open(struct pt_regs *regs);
+extern uint64_t sys_rmdir(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -415,7 +416,7 @@ uint64_t sys_chdir(struct pt_regs *regs)
         return -ENOENT;
     // kdebug("dentry->name=%s, namelen=%d", dentry->name, dentry->name_length);
     // 目标不是目录
-    if (dentry->dir_inode->attribute != VFS_ATTR_DIR)
+    if (dentry->dir_inode->attribute != VFS_IF_DIR)
         return -ENOTDIR;
 
     return 0;
@@ -602,5 +603,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
         [19] = sys_clock,
         [20] = sys_pipe,
         [21] = sys_mstat,
-        [22 ... 254] = system_call_not_exists,
+        [22] = sys_rmdir,
+        [23 ... 254] = system_call_not_exists,
         [255] = sys_ahci_end_req};

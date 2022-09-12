@@ -142,7 +142,19 @@ int execv(const char *path, char *const argv[])
         return -1;
     }
     int retval = syscall_invoke(SYS_EXECVE, (uint64_t)path, (uint64_t)argv, 0, 0, 0, 0, 0, 0);
-    if(retval != 0)
+    if (retval != 0)
         return -1;
-    else return 0;
+    else
+        return 0;
+}
+
+/**
+ * @brief 删除文件夹
+ *
+ * @param path 绝对路径
+ * @return int 错误码
+ */
+int rmdir(const char *path)
+{
+    return syscall_invoke(SYS_RMDIR, (uint64_t)path, 0, 0, 0, 0, 0, 0, 0);
 }

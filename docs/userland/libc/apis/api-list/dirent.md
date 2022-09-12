@@ -48,11 +48,11 @@
 
     文件夹类型：
 
-    ``#define VFS_ATTR_FILE (1UL << 0)``
+    ``#define VFS_IF_FILE (1UL << 0)``
     
-    ``#define VFS_ATTR_DIR (1UL << 1)``
+    ``#define VFS_IF_DIR (1UL << 1)``
     
-    ``#define VFS_ATTR_DEVICE (1UL << 2)``
+    ``#define VFS_IF_DEVICE (1UL << 2)``
     
     缓冲区长度的默认值
     

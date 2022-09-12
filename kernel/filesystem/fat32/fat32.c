@@ -293,7 +293,7 @@ find_lookup_success:; // 找到目标dentry
     p->file_size = tmp_dEntry->DIR_FileSize;
     // 计算文件占用的扇区数, 由于最小存储单位是簇，因此需要按照簇的大小来对齐扇区
     p->blocks = (p->file_size + fsbi->bytes_per_clus - 1) / fsbi->bytes_per_sec;
-    p->attribute = (tmp_dEntry->DIR_Attr & ATTR_DIRECTORY) ? VFS_ATTR_DIR : VFS_ATTR_FILE;
+    p->attribute = (tmp_dEntry->DIR_Attr & ATTR_DIRECTORY) ? VFS_IF_DIR : VFS_IF_FILE;
     p->sb = parent_inode->sb;
     p->file_ops = &fat32_file_ops;
     p->inode_ops = &fat32_inode_ops;
@@ -315,8 +315,8 @@ find_lookup_success:; // 找到目标dentry
 
     // 暂时使用fat32的高4bit来标志设备文件
     // todo: 引入devfs后删除这段代码
-    if ((tmp_dEntry->DIR_FstClusHI >> 12) && (p->attribute & VFS_ATTR_FILE))
-        p->attribute |= VFS_ATTR_DEVICE;
+    if ((tmp_dEntry->DIR_FstClusHI >> 12) && (p->attribute & VFS_IF_FILE))
+        p->attribute |= VFS_IF_DEVICE;
 
     dest_dentry->dir_inode = p;
     dest_dentry->dir_ops = &fat32_dEntry_ops;
@@ -394,7 +394,7 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
     sb_ptr->root->dir_inode->file_size = 0;
     // 计算文件占用的扇区数, 由于最小存储单位是簇，因此需要按照簇的大小来对齐扇区
     sb_ptr->root->dir_inode->blocks = (sb_ptr->root->dir_inode->file_size + fsbi->bytes_per_clus - 1) / fsbi->bytes_per_sec;
-    sb_ptr->root->dir_inode->attribute = VFS_ATTR_DIR;
+    sb_ptr->root->dir_inode->attribute = VFS_IF_DIR;
     sb_ptr->root->dir_inode->sb = sb_ptr; // 反向绑定对应的超级块
 
     // 初始化inode信息
@@ -826,7 +826,7 @@ long fat32_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t 
 
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)kmalloc(sizeof(struct fat32_inode_info_t), 0);
     memset((void *)finode, 0, sizeof(struct fat32_inode_info_t));
-    inode->attribute = VFS_ATTR_FILE;
+    inode->attribute = VFS_IF_FILE;
     inode->file_ops = &fat32_file_ops;
     inode->file_size = 0;
     inode->sb = parent_inode->sb;
@@ -933,7 +933,7 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     // ====== 初始化inode =======
     struct vfs_index_node_t *inode = (struct vfs_index_node_t *)kmalloc(sizeof(struct vfs_index_node_t), 0);
     memset(inode, 0, sizeof(struct vfs_index_node_t));
-    inode->attribute = VFS_ATTR_DIR;
+    inode->attribute = VFS_IF_DIR;
     inode->blocks = fsbi->sec_per_clus;
     inode->file_ops = &fat32_file_ops;
     inode->file_size = 0;
@@ -1230,9 +1230,9 @@ find_dir_success:;
     file_ptr->position += 32;
     // todo: 计算ino_t
     if (dentry_type & ATTR_DIRECTORY)
-        dentry_type = VFS_ATTR_DIR;
+        dentry_type = VFS_IF_DIR;
     else
-        dentry_type = VFS_ATTR_FILE;
+        dentry_type = VFS_IF_FILE;
 
     return filler(dirent, 0, dir_name, name_len, dentry_type, 0);
 }

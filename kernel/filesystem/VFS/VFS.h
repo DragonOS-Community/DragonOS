@@ -34,7 +34,7 @@ extern struct vfs_superblock_t *vfs_root_sb;
 #define VFS_IF_FILE (1UL << 0)
 #define VFS_IF_DIR (1UL << 1)
 #define VFS_IF_DEVICE (1UL << 2)
-#define VFS_IF_DEAD (1UL<<3) /* removed, but still open directory */
+#define VFS_IF_DEAD (1UL << 3) /* removed, but still open directory */
 
 struct vfs_super_block_operations_t;
 struct vfs_inode_operations_t;
@@ -42,7 +42,7 @@ struct vfs_inode_operations_t;
 struct vfs_index_node_t;
 struct vfs_dir_entry_operations_t;
 
-#define VFS_DF_MOUNTED (1 << 0) // 当前dentry是一个挂载点
+#define VFS_DF_MOUNTED (1 << 0)      // 当前dentry是一个挂载点
 #define VFS_DF_CANNOT_MOUNT (1 << 1) // 当前dentry是一个挂载点
 struct vfs_dir_entry_t
 {
@@ -83,6 +83,18 @@ struct vfs_index_node_t
 
     void *private_inode_info;
 };
+
+/**
+ * @brief 文件的mode
+ *
+ */
+#define VFS_FILE_MODE_READ (1 << 0)
+#define VFS_FILE_MODE_WRITE (1 << 1)
+#define VFS_FILE_MODE_RW (VFS_FILE_MODE_READ | VFS_FILE_MODE_WRITE)
+
+#define vfs_file_can_read(file) (((file)->mode) & VFS_FILE_MODE_READ)
+#define vfs_file_can_write(file) (((file)->mode) & VFS_FILE_MODE_WRITE)
+#define vfs_file_can_rw(file) ((((file)->mode) & VFS_FILE_MODE_RW) == VFS_FILE_MODE_RW)
 
 /**
  * @brief 文件描述符
@@ -223,10 +235,10 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
 
 /**
  * @brief 分配inode并将引用计数初始化为1
- * 
+ *
  * @return struct vfs_index_node_t * 分配得到的inode
  */
-struct vfs_index_node_t * vfs_alloc_inode();
+struct vfs_index_node_t *vfs_alloc_inode();
 
 /**
  * @brief 打开文件

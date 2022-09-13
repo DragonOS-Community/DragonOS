@@ -9,9 +9,6 @@ extern struct vfs_file_operations_t devfs_file_ops;
 extern struct vfs_inode_operations_t devfs_inode_ops;
 extern struct vfs_superblock_t devfs_sb;
 
-// 分配inode
-#define __devfs_alloc_inode() ((struct vfs_index_node_t *)kzalloc(sizeof(struct vfs_index_node_t), 0))
-
 /**
  * @brief 在devfs中注册字符设备（该函数只应被devfs调用）
  *
@@ -101,9 +98,7 @@ static inline void __devfs_fill_dentry(struct vfs_dir_entry_t *dentry, const cha
  * @param parent 父目录项
  * @param dentry 子目录项
  */
-#define __devfs_dentry_bind_parent(parent_dentry, dentry)                            \
-    do                                                                        \
-    {                                                                         \
-        (dentry)->parent = (parent_dentry);                                          \
-        list_append(&((parent_dentry)->subdirs_list), &((dentry)->child_node_list)); \
-    } while (0)
+#define __devfs_dentry_bind_parent(parent_dentry, dentry) ({                     \
+    (dentry)->parent = (parent_dentry);                                          \
+    list_append(&((parent_dentry)->subdirs_list), &((dentry)->child_node_list)); \
+})

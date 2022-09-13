@@ -136,7 +136,8 @@
         "mount.h": "c",
         "internal.h": "c",
         "devfs.h": "c",
-        "devfs-types.h": "c"
+        "devfs-types.h": "c",
+        "chardev.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

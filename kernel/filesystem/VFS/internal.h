@@ -39,3 +39,11 @@ static inline bool is_local_mountpoint(struct vfs_dir_entry_t *dentry)
  * @param dentry 目标dentry
  */
 void vfs_dentry_put(struct vfs_dir_entry_t * dentry);
+
+/**
+ * @brief 释放inode
+ * 
+ * @param inode 待释放的inode
+ * @return int 错误码
+ */
+int vfs_free_inode(struct vfs_index_node_t * inode);

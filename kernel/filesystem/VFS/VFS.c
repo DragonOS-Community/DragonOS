@@ -155,18 +155,19 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
     while (true)
     {
         // 提取出下一级待搜索的目录名或文件名，并保存在dEntry_name中
-        char *tmp_path = path;
+        const char *tmp_path = path;
         while ((*path && *path != '\0') && (*path != '/'))
             ++path;
         int tmp_path_len = path - tmp_path;
         // 搜索是否有dentry缓存
         {
-            char bk = *(tmp_path + tmp_path_len);
-            *(tmp_path + tmp_path_len) = '\0';
-            // kdebug("to search:%s", tmp_path);
-            dentry = vfs_search_dentry_list(parent, tmp_path);
-            // kdebug("search done, dentry=%#018lx", dentry);
-            *(tmp_path + tmp_path_len) = bk;
+            char *tmpname = kzalloc(tmp_path_len + 1, 0);
+            strncpy(tmpname, tmp_path, tmp_path_len);
+            tmpname[tmp_path_len] = '\0';
+
+            dentry = vfs_search_dentry_list(parent, tmpname);
+            
+            kfree(tmpname);
         }
 
         // 如果没有找到dentry缓存，则申请新的dentry
@@ -301,8 +302,8 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
         return -EEXIST;
     }
 
-    struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
-    memset((void *)subdir_dentry, 0, sizeof(struct vfs_dir_entry_t));
+    struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
+
     list_init(&subdir_dentry->subdirs_list);
     list_init(&subdir_dentry->child_node_list);
     if (path[pathlen - 1] == '/')
@@ -449,23 +450,6 @@ uint64_t do_open(const char *filename, int flags)
     // 要求打开文件夹而目标不是文件夹
     if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_IF_DIR))
         return -ENOTDIR;
-
-    // // 要找的目标是文件夹
-    // if ((flags & O_DIRECTORY) && dentry->dir_inode->attribute == VFS_IF_DIR)
-    //     return -EISDIR;
-
-    // // todo: 引入devfs后删除这段代码
-    // // 暂时遇到设备文件的话，就将其first clus设置为特定值
-    // if (path_len >= 5 && filename[0] == '/' && filename[1] == 'd' && filename[2] == 'e' && filename[3] == 'v' && filename[4] == '/')
-    // {
-    //     if (dentry->dir_inode->attribute & VFS_IF_FILE)
-    //     {
-    //         // 对于fat32文件系统上面的设备文件，设置其起始扇区
-    //         ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus |= 0xf0000000;
-    //         dentry->dir_inode->sb->sb_ops->write_inode(dentry->dir_inode);
-    //         dentry->dir_inode->attribute |= VFS_IF_DEVICE;
-    //     }
-    // }
 
     // 创建文件描述符
     struct vfs_file_t *file_ptr = (struct vfs_file_t *)kzalloc(sizeof(struct vfs_file_t), 0);
@@ -662,6 +646,19 @@ uint64_t sys_rmdir(struct pt_regs *regs)
     else
         return vfs_rmdir((char *)regs->r8, false);
 }
+
+/**
+ * @brief 分配inode并将引用计数初始化为1
+ *
+ * @return struct vfs_index_node_t * 分配得到的inode
+ */
+struct vfs_index_node_t *vfs_alloc_inode()
+{
+    struct vfs_index_node_t *inode = kzalloc(sizeof(struct vfs_index_node_t), 0);
+    inode->ref_count = 1; // 初始化引用计数为1
+    return inode;
+}
+
 /**
  * @brief 初始化vfs
  *

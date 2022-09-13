@@ -33,11 +33,11 @@ struct vfs_superblock_t *devfs_read_superblock(struct block_device *blk)
     return &devfs_sb;
 }
 
-static void devfs_write_superblock(struct vfs_superblock_t *sb) {return 0; }
+static void devfs_write_superblock(struct vfs_superblock_t *sb) {return ; }
 
-static void devfs_put_superblock(struct vfs_superblock_t *sb) {return 0; }
+static void devfs_put_superblock(struct vfs_superblock_t *sb) {return ; }
 
-static void devfs_write_inode(struct vfs_index_node_t *inode) {return 0; }
+static void devfs_write_inode(struct vfs_index_node_t *inode) {return ; }
 struct vfs_super_block_operations_t devfs_sb_ops =
     {
         .write_superblock = &devfs_write_superblock,
@@ -146,7 +146,7 @@ static struct vfs_dir_entry_t *devfs_lookup(struct vfs_index_node_t *parent_inod
  */
 static long devfs_mkdir(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry, int mode)
 {
-    dEntry->dir_inode = (struct vfs_index_node_t *)kzalloc(sizeof(struct vfs_index_node_t), 0);
+    dEntry->dir_inode = vfs_alloc_inode();
     dEntry->dir_inode->file_ops = &devfs_file_ops;
     dEntry->dir_inode->inode_ops = &devfs_inode_ops;
     dEntry->dir_ops = &devfs_dentry_ops;
@@ -181,7 +181,7 @@ struct vfs_filesystem_type_t devfs_fs_type =
 
 static __always_inline void __devfs_init_root_inode()
 {
-    devfs_root_dentry->dir_inode = (struct vfs_index_node_t *)kzalloc(sizeof(struct vfs_index_node_t), 0);
+    devfs_root_dentry->dir_inode = vfs_alloc_inode();
     devfs_root_dentry->dir_inode->file_ops = &devfs_file_ops;
     devfs_root_dentry->dir_inode->inode_ops = &devfs_inode_ops;
 

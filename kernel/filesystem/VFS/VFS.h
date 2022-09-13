@@ -75,6 +75,7 @@ struct vfs_index_node_t
     uint64_t file_size; // 文件大小
     uint64_t blocks;    // 占用的扇区数
     uint64_t attribute;
+    int32_t ref_count; // 引用计数
 
     struct vfs_superblock_t *sb;
     struct vfs_file_operations_t *file_ops;
@@ -219,6 +220,13 @@ int vfs_init();
  * @return struct vfs_dir_entry_t* 创建好的dentry
  */
 struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
+
+/**
+ * @brief 分配inode并将引用计数初始化为1
+ * 
+ * @return struct vfs_index_node_t * 分配得到的inode
+ */
+struct vfs_index_node_t * vfs_alloc_inode();
 
 /**
  * @brief 打开文件

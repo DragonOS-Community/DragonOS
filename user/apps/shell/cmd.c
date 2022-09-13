@@ -388,7 +388,7 @@ int shell_cmd_mkdir(int argc, char **argv)
     {
         full_path = get_target_filepath(argv[1], &result_path_len);
     }
-    printf("mkdir: full_path = %s\n", full_path);
+    // printf("mkdir: full_path = %s\n", full_path);
     int retval = mkdir(full_path, 0);
 
     if (argv != NULL)
@@ -414,7 +414,7 @@ int shell_cmd_rmdir(int argc, char **argv)
     else
         full_path = get_target_filepath(argv[1], &result_path_len);
     int retval = rmdir(full_path);
-    printf("rmdir: path=%s, retval=%d", full_path, retval);
+    // printf("rmdir: path=%s, retval=%d\n", full_path, retval);
     if (argv != NULL)
         free(argv);
 

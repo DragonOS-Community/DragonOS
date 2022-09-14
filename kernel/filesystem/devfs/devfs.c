@@ -13,7 +13,6 @@ struct vfs_inode_operations_t devfs_inode_ops;
 struct vfs_dir_entry_t *devfs_root_dentry; // 根结点的dentry
 struct vfs_superblock_t devfs_sb = {0};
 const char __devfs_mount_path[] = "/dev";
-extern struct vfs_file_operations_t ps2_keyboard_fops;
 
 /**
  * @brief 创建devfs的super block
@@ -206,11 +205,10 @@ static __always_inline void __devfs_init_root_dentry()
 /**
  * @brief 在devfs中注册设备
  *
- * @param name
- * @param device_type
- * @param sub_type
- * @param file_ops
- * @return int
+ * @param device_type 设备主类型
+ * @param sub_type 设备子类型
+ * @param file_ops 设备的文件操作接口
+ * @return int 错误码
  */
 int devfs_register_device(uint16_t device_type, uint16_t sub_type, struct vfs_file_operations_t *file_ops)
 {
@@ -254,6 +252,5 @@ void devfs_init()
 
     __devfs_chardev_init();
 
-    // todo: 当rootfs实现后，将ps/2键盘的注册改为在驱动程序中进行（目前没有rootfs，因此还不能在不依赖fat32的情况下，挂载设备）
-    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_PS2_KEYBOARD, &ps2_keyboard_fops);
+    
 }

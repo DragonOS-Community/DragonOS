@@ -3,7 +3,7 @@ CFLAGS += -I .
 
 
 kernel_fs_objs:= $(shell find ./*.c)
-kernel_fs_subdirs:= devfs VFS fat32
+kernel_fs_subdirs:= devfs VFS fat32 rootfs
 
 ECHO:
 	@echo "$@"

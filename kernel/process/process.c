@@ -464,10 +464,11 @@ exec_failed:;
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
+    
     ahci_init();
-    vfs_init();
     fat32_init();
-    devfs_init();
+    rootfs_umount();
+
     // 使用单独的内核线程来初始化usb驱动程序
     int usb_pid = kernel_thread(usb_init, 0, 0);
 

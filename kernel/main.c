@@ -20,6 +20,8 @@
 #include <sched/sched.h>
 
 #include <filesystem/fat32/fat32.h>
+#include <filesystem/VFS/VFS.h>
+#include <filesystem/devfs/devfs.h>
 
 #include "driver/multiboot2/multiboot2.h"
 #include "driver/acpi/acpi.h"
@@ -139,6 +141,8 @@ void system_initialize()
     smp_init();
     io_mfence();
 
+    vfs_init();
+    devfs_init();
     cpu_init();
     ps2_keyboard_init();
     // ps2_mouse_init();

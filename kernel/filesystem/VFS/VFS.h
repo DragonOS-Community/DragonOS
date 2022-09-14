@@ -47,7 +47,7 @@ struct vfs_dir_entry_operations_t;
 struct vfs_dir_entry_t
 {
     char *name;
-    int name_length;
+    int name_length;  // 名字的长度（不包含字符串末尾的'\0'）
     uint32_t d_flags; // dentry标志位
     struct List child_node_list;
     struct List subdirs_list;

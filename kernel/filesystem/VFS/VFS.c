@@ -10,9 +10,7 @@
 #include <mm/slab.h>
 #include <process/ptrace.h>
 #include <process/process.h>
-
-// todo: devfs完善后，删除这个
-extern struct vfs_file_operations_t ps2_keyboard_fops;
+#include <filesystem/rootfs/rootfs.h>
 
 // 为filesystem_type_t结构体实例化一个链表头
 static struct vfs_filesystem_type_t vfs_fs = {"filesystem", 0};
@@ -30,16 +28,13 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
  */
 struct vfs_superblock_t *vfs_mount_fs(const char *path, char *name, struct block_device *blk)
 {
-    // todo: 选择挂载点
+
     // 判断挂载点是否存在
     struct vfs_dir_entry_t *target_dentry = NULL;
-    // 由于目前还没有rootfs，因此挂载根目录时，不需要path walk
-    if (strcmp(path, "/") != 0)
-    {
-        target_dentry = vfs_path_walk(path, 0);
-        if (target_dentry == NULL)
-            return NULL;
-    }
+
+    target_dentry = vfs_path_walk(path, 0);
+    if (target_dentry == NULL)
+        return NULL;
 
     struct vfs_filesystem_type_t *p = NULL;
     for (p = &vfs_fs; p; p = p->next)
@@ -166,7 +161,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
             tmpname[tmp_path_len] = '\0';
 
             dentry = vfs_search_dentry_list(parent, tmpname);
-            
+
             kfree(tmpname);
         }
 
@@ -282,7 +277,7 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
     else
         strncpy(buf, path, last_slash);
     buf[last_slash + 1] = '\0';
-    // kdebug("to walk: %s", buf);
+
     // 查找父目录
     struct vfs_dir_entry_t *parent_dir = vfs_path_walk(buf, 0);
 
@@ -368,10 +363,9 @@ uint64_t do_open(const char *filename, int flags)
     }
 
     // 为待拷贝文件路径字符串分配内存空间
-    char *path = (char *)kmalloc(path_len, 0);
+    char *path = (char *)kzalloc(path_len, 0);
     if (path == NULL)
         return -ENOMEM;
-    memset(path, 0, path_len);
 
     strncpy_from_user(path, filename, path_len);
     // 去除末尾的 '/'
@@ -384,11 +378,6 @@ uint64_t do_open(const char *filename, int flags)
     // 寻找文件
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
 
-    // if (dentry != NULL)
-    //     printk_color(ORANGE, BLACK, "Found %s\nDIR_FstClus:%#018lx\tDIR_FileSize:%#018lx\n", path, ((struct fat32_inode_info_t *)(dentry->dir_inode->private_inode_info))->first_clus, dentry->dir_inode->file_size);
-    // else
-    //     printk_color(ORANGE, BLACK, "Can`t find file\n");
-    // kdebug("flags=%#018lx", flags);
     if (dentry == NULL && flags & O_CREAT)
     {
         // 先找到倒数第二级目录
@@ -420,12 +409,10 @@ uint64_t do_open(const char *filename, int flags)
             parent_dentry = vfs_root_sb->root;
 
         // 创建新的文件
-        dentry = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
-        memset(dentry, 0, sizeof(struct vfs_dir_entry_t));
+        dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
 
         dentry->name_length = path_len - tmp_index - 1;
-        dentry->name = (char *)kmalloc(dentry->name_length, 0);
-        memset(dentry->name, 0, dentry->name_length);
+        dentry->name = (char *)kzalloc(dentry->name_length + 1, 0);
         strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
         // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
         dentry->parent = parent_dentry;
@@ -524,6 +511,8 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size)
     if (unlikely(name_size > VFS_MAX_PATHLEN))
         return NULL;
     struct vfs_dir_entry_t *dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
+    if (unlikely(dentry == NULL))
+        return NULL;
     dentry->name = (char *)kzalloc(name_size, 0);
     list_init(&dentry->child_node_list);
     list_init(&dentry->subdirs_list);
@@ -667,5 +656,6 @@ struct vfs_index_node_t *vfs_alloc_inode()
 int vfs_init()
 {
     mount_init();
+    rootfs_init();
     return 0;
 }

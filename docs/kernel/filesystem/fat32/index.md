@@ -205,8 +205,6 @@ struct fat32_Directory_t
 
 ## TODO
 
-- 实现FAT32文件系统与具体类型的磁盘操作的解耦
-
 - 完全实现VFS定义的文件接口
 
 - 性能优化

@@ -5,8 +5,8 @@ CFLAGS += -I .
 all: entry.o irq.o softirq.o trap.o
 
 entry.o: entry.S
-	gcc -E entry.S > entry.s
-	as $(ASFLAGS) -o entry.o entry.s
+	gcc -E entry.S > _entry.s
+	as $(ASFLAGS) -o entry.o _entry.s
 
 trap.o: trap.c
 	gcc $(CFLAGS) -c trap.c -o trap.o

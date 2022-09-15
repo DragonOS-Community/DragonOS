@@ -22,6 +22,7 @@ static char chardev_name_prefix[CHAR_DEV_STYPE_END + 1][32] = {
     [CHAR_DEV_STYPE_USB_KEYBOARD] = "usb.kb",
     [CHAR_DEV_STYPE_BLUETOOTH_MOUSE] = "bt.mse",
     [CHAR_DEV_STYPE_BLUETOOTH_KEYBOARD] = "bt.kb",
+    [CHAR_DEV_STYPE_TTY] = "vdev.tty",
     [CHAR_DEV_STYPE_END] = "",
 };
 /**

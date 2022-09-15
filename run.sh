@@ -159,7 +159,7 @@ qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace
 
 
 qemu_accel=kvm
-if [ "${OS}" == "Darwin" ]; then
+if [ $(uname) == Darwin ]; then
     qemu_accel=hvf
 fi
 

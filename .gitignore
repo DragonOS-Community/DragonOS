@@ -3,6 +3,7 @@
 DragonOS.iso
 .idea/
 kernel/kernel
+.DS_Store
 
 *.o
 *.s

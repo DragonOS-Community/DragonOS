@@ -22,8 +22,8 @@ kernel_subdirs := common driver process debug filesystem time arch exception mm 
 
 
 head.o: head.S
-	gcc -E head.S > head.s # 预处理
-	as $(ASFLAGS) -o head.o head.s
+	gcc -E head.S > _head.s # 预处理
+	as $(ASFLAGS) -o head.o _head.s
 
 
 main.o: main.c 

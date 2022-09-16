@@ -257,16 +257,23 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         int64_t remain_file_size = phdr->p_filesz;
         pos = phdr->p_offset;
 
-        uint64_t virt_base = phdr->p_vaddr;
+        uint64_t virt_base = 0;
+        uint64_t beginning_offset = 0;       // 由于页表映射导致的virtbase与实际的p_vaddr之间的偏移量
+
+        if (remain_mem_size >= PAGE_2M_SIZE) // 接下来存在映射2M页的情况，因此将vaddr按2M向下对齐
+            virt_base = phdr->p_vaddr & PAGE_2M_MASK;
+        else // 接下来只有4K页的映射
+            virt_base = phdr->p_vaddr & PAGE_4K_MASK;
+
+        beginning_offset = phdr->p_vaddr - virt_base;
+        remain_mem_size += beginning_offset;
 
         while (remain_mem_size > 0)
         {
             // kdebug("loading...");
             int64_t map_size = 0;
-
-            if (remain_mem_size > PAGE_2M_SIZE / 2)
+            if (remain_mem_size >= PAGE_2M_SIZE)
             {
-
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
                 struct vm_area_struct *vma = NULL;
                 int ret = mm_create_vma(current_pcb->mm, virt_base, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
@@ -275,6 +282,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                     free_pages(Phy_to_2M_Page(pa), 1);
                 else
                     mm_map_vma(vma, pa);
+                io_mfence();
                 memset((void *)virt_base, 0, PAGE_2M_SIZE);
                 map_size = PAGE_2M_SIZE;
             }
@@ -293,16 +301,17 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                         kfree(phys_2_virt(paddr));
                     else
                         mm_map_vma(vma, paddr);
+                    io_mfence();
                     memset((void *)(virt_base + off), 0, PAGE_4K_SIZE);
                 }
             }
 
             pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
             int64_t val = 0;
-            if (remain_file_size != 0)
+            if (remain_file_size > 0)
             {
                 int64_t to_trans = (remain_file_size > PAGE_2M_SIZE) ? PAGE_2M_SIZE : remain_file_size;
-                val = filp->file_ops->read(filp, (char *)virt_base, to_trans, &pos);
+                val = filp->file_ops->read(filp, (char *)(virt_base + beginning_offset), to_trans, &pos);
             }
 
             if (val < 0)
@@ -464,7 +473,7 @@ exec_failed:;
 ul initial_kernel_thread(ul arg)
 {
     // kinfo("initial proc running...\targ:%#018lx", arg);
-    
+
     ahci_init();
     fat32_init();
     rootfs_umount();

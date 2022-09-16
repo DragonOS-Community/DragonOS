@@ -61,5 +61,16 @@ html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
 
 myst_enable_extensions = [
+    "amsmath",
+    "colon_fence",
+    "deflist",
+    "dollarmath",
+    "fieldlist",
+    "html_admonition",
+    "html_image",
+    "replacements",
+    "smartquotes",
+    "strikethrough",
+    "substitution",
     "tasklist",
 ]

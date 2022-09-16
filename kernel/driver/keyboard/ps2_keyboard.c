@@ -1,5 +1,6 @@
 #include "ps2_keyboard.h"
 #include <driver/interrupt/apic/apic.h>
+#include <exception/softirq.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <common/printk.h>
@@ -9,8 +10,9 @@
 #include <common/spinlock.h>
 #include <common/kfifo.h>
 
+//Todo: 键盘缓冲区暂时改为全局可见，等完善驱动程序间通信机制后改回去
 // 键盘输入缓冲区
-static struct kfifo_t kb_buf;
+struct kfifo_t kb_buf;
 
 // 缓冲区等待队列
 static wait_queue_node_t ps2_keyboard_wait_queue;
@@ -154,6 +156,7 @@ void ps2_keyboard_handler(ul irq_num, ul buf_vaddr, struct pt_regs *regs)
     }
 
     wait_queue_wakeup(&ps2_keyboard_wait_queue, PROC_UNINTERRUPTIBLE);
+    raise_softirq(TTY_GETCHAR_SIRQ);
 }
 /**
  * @brief 初始化键盘驱动程序的函数

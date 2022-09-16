@@ -1,7 +1,7 @@
 
 CFLAGS += -I .
 
-kernel_lib_subdirs:= libUI
+kernel_lib_subdirs:= libUI libKeyboard
 
 kernel_lib_objs:= $(shell find ./*.c)
 

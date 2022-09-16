@@ -86,9 +86,12 @@ void main_loop(int kb_fd)
 int main()
 {
     // 打开键盘文件
-    char kb_file_path[] = "/dev/char/ps2.kb0";
-
-    int kb_fd = open(kb_file_path, 0);
+    char kb_file_path[] = "/dev/char/vdev.tty0";
+    int kb_fd=0;
+    if((kb_fd = open(kb_file_path, 0))<0)
+    {
+        printf("Failed to open stdio!");
+    }
     print_ascii_logo();
     // printf("before mkdir\n");
     // mkdir("/aaac", 0);
@@ -126,6 +129,11 @@ void change_command(char *buf, int type)
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
 }
+static inline int read_key(int fd){
+    int ret;
+    while(!read(fd, &ret, 1));
+    return ret;
+}
 /**
  * @brief 循环读取每一行
  *
@@ -139,7 +147,7 @@ int shell_readline(int fd, char *buf)
     int count = 0;
     while (1)
     {
-        key = keyboard_analyze_keycode(fd);
+        key = read_key(fd);
         //向上方向键
         if (count_history != 0 && key == 0xc8)
         {
@@ -175,13 +183,14 @@ int shell_readline(int fd, char *buf)
                 if (count > 0)
                 {
                     buf[--count] = 0;
-                    printf("%c", '\b');
+                    //printf("%c", '\b');
+                    printf("");
                 }
             }
             else
             {
                 buf[count++] = key;
-                printf("%c", key);
+                //printf("%c", key);
             }
             if (count > 0 && current_command_index >= count_history)
             {

@@ -16,6 +16,7 @@
 
 #define TIMER_SIRQ 0         // 时钟软中断号
 #define VIDEO_REFRESH_SIRQ 1 // 帧缓冲区刷新软中断
+#define TTY_GETCHAR_SIRQ 2   // TTY读取输入设备软中断
 
 /**
  * @brief 发起软中断

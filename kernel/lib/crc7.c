@@ -1,8 +1,7 @@
-#include <stdio.h>
-#include "types.h"
+#include <common/sys/types.h>
 
 /** CRC table for the CRC-7. The poly is 0X09  */
-u8 const crc7_table[256]={//crc7 generator polynomial : G(x)=x7+x3+1
+uint8_t const crc7_table[256]={//crc7 generator polynomial : G(x)=x7+x3+1
 	0X00, 0X09, 0X12, 0X1B, 0X24, 0X2D, 0X36, 0X3F, 0X48, 0X41, 0X5A, 0X53, 0X6C, 0X65, 0X7E, 0X77,
 	0X19, 0X10, 0X0B, 0X02, 0X3D, 0X34, 0X2F, 0X26, 0X51, 0X58, 0X43, 0X4A, 0X75, 0X7C, 0X67, 0X6E,
 	0X32, 0X3B, 0X20, 0X29, 0X16, 0X1F, 0X04, 0X0D, 0X7A, 0X73, 0X68, 0X61, 0X5E, 0X57, 0X4C, 0X45,
@@ -21,26 +20,33 @@ u8 const crc7_table[256]={//crc7 generator polynomial : G(x)=x7+x3+1
 	0X0E, 0X07, 0X1C, 0X15, 0X2A, 0X23, 0X38, 0X31, 0X46, 0X4F, 0X54, 0X5D, 0X62, 0X6B, 0X70, 0X79,
 }; 
 
-  //µÚÒ»¸ö²ÎÊıcrcĞèÒª³õÊ¼»¯
-  //µÚ¶ş¸ö²ÎÊıÎªĞèÒª×ª»»³ÉĞ£ÑéÂëµÄ¶«Î÷ 
-  //µÚÈı¸öÎª ĞèÒª×ª»»³ÉĞ£ÑéÂëµÄ¶«Î÷µÄ³¤¶È 
- u8 crc7(u8 crc, u8 const *buffer, size_t len) {
+/**
+ * @brief è®¡ç®—crc7
+ * 
+ * @param crc crcåˆå§‹å€¼
+ * @param buffer è¾“å…¥ç¼“å†²åŒº
+ * @param len bufferå¤§å°ï¼ˆbytesï¼‰
+ * @return uint8_t crc
+ */
+uint8_t crc7(uint8_t crc, const uint8_t *buffer, size_t len) 
+{
  	while (len--)
     {
         crc = crc7_table[(crc<<1) ^ *buffer++];
     }
     return (crc);
- }
- 
-    int main(){
-  	unsigned char data1[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
-    unsigned char data2[] = {'5', '6', '7', '8', '9'};
-    u8 c1, c2;
-    c1 = crc7(0x0,data1, 9);
-    c2 = crc7(0x0,data1, 4);
+}
+
+// int main()
+// {
+//   	unsigned char data1[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+//     unsigned char data2[] = {'5', '6', '7', '8', '9'};
+//     uint8_t c1, c2;
+//     c1 = crc7(0x0,data1, 9);
+//     c2 = crc7(0x0,data1, 4);
     
-    printf("%02x\n", c1);
-    printf("%02x\n", c2);
+//     printf("%02x\n", c1);
+//     printf("%02x\n", c2);
     
   	    
-  }
+// }

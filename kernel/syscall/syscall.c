@@ -169,6 +169,10 @@ uint64_t sys_read(struct pt_regs *regs)
     void *buf = (void *)regs->r9;
     int64_t count = (int64_t)regs->r10;
 
+    // 校验buf的空间范围
+    if(SYSCALL_FROM_USER(regs) && (!verify_area(buf, count)))    
+        return -EPERM;  
+    
     // kdebug("sys read: fd=%d", fd_num);
 
     // 校验文件描述符范围
@@ -205,6 +209,9 @@ uint64_t sys_write(struct pt_regs *regs)
     void *buf = (void *)regs->r9;
     int64_t count = (int64_t)regs->r10;
 
+    // 校验buf的空间范围
+    if(SYSCALL_FROM_USER(regs) && (!verify_area(buf, count)))    
+        return -EPERM;  
     kdebug("sys write: fd=%d", fd_num);
 
     // 校验文件描述符范围

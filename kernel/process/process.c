@@ -13,6 +13,7 @@
 #include <exception/gate.h>
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/devfs/devfs.h>
+#include <filesystem/rootfs/rootfs.h>
 #include <mm/slab.h>
 #include <common/spinlock.h>
 #include <syscall/syscall.h>

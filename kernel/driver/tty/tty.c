@@ -2,6 +2,7 @@
 #include <filesystem/VFS/VFS.h>
 #include "tty.h"
 
+static struct devfs_private_inode_info_t * tty_inode_private_data_ptr;  // 由devfs创建的inode私有信息指针
 static int tty_private_data;
 
 /**
@@ -87,6 +88,6 @@ struct vfs_file_operations_t tty_fops={
 
 void tty_init(){
     //注册devfs
-    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_TTY, &tty_fops);
-    kinfo("tty driver registered.");
+    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_TTY, &tty_fops, &tty_inode_private_data_ptr);
+    kinfo("tty driver registered. uuid=%d", tty_inode_private_data_ptr->uuid);
 }

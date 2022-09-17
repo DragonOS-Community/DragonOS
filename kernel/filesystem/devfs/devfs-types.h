@@ -42,4 +42,5 @@ struct devfs_private_inode_info_t
     uint16_t type;     // 设备主类型
     uint16_t sub_type; // 设备子类型
     struct vfs_file_operations_t *f_ops;
+    uint64_t uuid;
 };

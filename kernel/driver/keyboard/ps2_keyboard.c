@@ -205,7 +205,7 @@ void ps2_keyboard_init()
     // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
     io_in8(PORT_PS2_KEYBOARD_DATA);
     // 将设备挂载到devfs
-    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_PS2_KEYBOARD, &ps2_keyboard_fops);
+    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_PS2_KEYBOARD, &ps2_keyboard_fops, NULL);
     kinfo("ps/2 keyboard registered.");
 }
 

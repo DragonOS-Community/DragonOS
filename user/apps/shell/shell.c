@@ -132,6 +132,7 @@ void change_command(char *buf, int type)
 static inline int read_key(int fd){
     int ret;
     while(!read(fd, &ret, 1));
+    //printf("Read from stdin:%x\n",ret);
     return ret;
 }
 /**
@@ -184,7 +185,8 @@ int shell_readline(int fd, char *buf)
                 {
                     buf[--count] = 0;
                     //printf("%c", '\b');
-                    printf("");
+                    //printf("");
+
                 }
             }
             else

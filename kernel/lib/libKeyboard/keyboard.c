@@ -285,7 +285,9 @@ uint32_t keycode_map_normal[NUM_SCAN_CODES * MAP_COLS] =
         0,
 };
 
+//从键盘扫描码缓冲区读取单个字节
 #define keyboard_get_scancode(a,v) a[v++]
+
 /**
  * @brief 解析键盘扫描码
  *
@@ -495,6 +497,12 @@ int keyboard_analyze_keycode(char* keycode)
             col = 1;
         key = key_row[col];
 
+        if (ctrl_l || ctrl_r)
+            key+=0x4000;
+
+        if (alt_l || alt_r)
+            key+=0x2000;
+
         switch (scancode & 0x7f)
         {
         case 0x2a:
@@ -523,3 +531,4 @@ int keyboard_analyze_keycode(char* keycode)
     }
     return 0;
 }
+

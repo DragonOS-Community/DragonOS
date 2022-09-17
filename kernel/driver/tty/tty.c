@@ -16,6 +16,8 @@ static wait_queue_node_t tty_wait_queue;
 
 extern struct kfifo_t kb_buf;
 
+static int able_backspace_counter;
+
 /**
  * @brief 打开tty文件
  *
@@ -129,21 +131,30 @@ void getchar_from_keyboard(void *data)
             textui_putchar('\b', WHITE, BLACK);
         }
     #else
-        textui_putchar(character, WHITE, BLACK);
-        kfifo_in(&tty_private_data,&character,1);
-    #endif
-    }else{
-        if(character<=0xff){
+        if(able_backspace_counter>0){
             textui_putchar(character, WHITE, BLACK);
             kfifo_in(&tty_private_data,&character,1);
+            able_backspace_counter--;
+        }
+    #endif
+    }else{
+        if(character==0) return;
+        if(character<=0xff){
+            if(kfifo_full(&tty_private_data)) return;
+            textui_putchar(character, WHITE, BLACK);
+            kfifo_in(&tty_private_data,&character,1);
+            able_backspace_counter++;
         }else{
             textui_putchar('^',WHITE,BLACK);
             textui_putchar(character&0x7f, WHITE, BLACK);
-
+            able_backspace_counter+=2;
         }
     }
-    if(character=='\n')
+    if(character=='\n'){
+        able_backspace_counter=0;
         wait_queue_wakeup(&tty_wait_queue, PROC_UNINTERRUPTIBLE);
+    }
+    return;
 }
 void tty_init(){
     //注册softirq，Todo: 改为驱动程序接口
@@ -152,6 +163,7 @@ void tty_init(){
     kfifo_alloc(&tty_private_data,MAX_STDIN_BUFFER_SIZE,0);
     //kfifo_reset(&tty_private_data);
     wait_queue_init(&tty_wait_queue, NULL);
+    able_backspace_counter=0;
     //注册devfs
     devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_TTY, &tty_fops, &tty_inode_private_data_ptr);
     kinfo("tty driver registered. uuid=%d", tty_inode_private_data_ptr->uuid);

@@ -1,5 +1,5 @@
 #include <lib/libKeyboard/keyboard.h>
 
-void formatter(){
+void input_formatter(){
 
 }

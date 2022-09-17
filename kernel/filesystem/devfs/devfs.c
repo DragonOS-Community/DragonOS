@@ -4,6 +4,7 @@
 #include <common/glib.h>
 #include <common/string.h>
 #include <mm/slab.h>
+#include <common/spinlock.h>
 
 struct vfs_super_block_operations_t devfs_sb_ops;
 struct vfs_dir_entry_operations_t devfs_dentry_ops;
@@ -13,6 +14,15 @@ struct vfs_inode_operations_t devfs_inode_ops;
 struct vfs_dir_entry_t *devfs_root_dentry; // 根结点的dentry
 struct vfs_superblock_t devfs_sb = {0};
 const char __devfs_mount_path[] = "/dev";
+
+static spinlock_t devfs_global_lock; // devfs的全局锁
+static uint64_t __tmp_uuid = 0;      // devfs的临时uuid变量（todo:在引入uuid lib之后删除这里）
+
+static inline uint64_t __devfs_get_uuid()
+{
+    // todo : 更改为使用uuid库来生成uuid
+    return ++__tmp_uuid;
+}
 
 /**
  * @brief 创建devfs的super block
@@ -32,11 +42,11 @@ struct vfs_superblock_t *devfs_read_superblock(struct block_device *blk)
     return &devfs_sb;
 }
 
-static void devfs_write_superblock(struct vfs_superblock_t *sb) {return ; }
+static void devfs_write_superblock(struct vfs_superblock_t *sb) { return; }
 
-static void devfs_put_superblock(struct vfs_superblock_t *sb) {return ; }
+static void devfs_put_superblock(struct vfs_superblock_t *sb) { return; }
 
-static void devfs_write_inode(struct vfs_index_node_t *inode) {return ; }
+static void devfs_write_inode(struct vfs_index_node_t *inode) { return; }
 struct vfs_super_block_operations_t devfs_sb_ops =
     {
         .write_superblock = &devfs_write_superblock,
@@ -44,13 +54,13 @@ struct vfs_super_block_operations_t devfs_sb_ops =
         .write_inode = &devfs_write_inode,
 };
 
-static long devfs_compare(struct vfs_dir_entry_t *parent_dEntry, char *source_filename, char *dest_filename) {return 0; }
+static long devfs_compare(struct vfs_dir_entry_t *parent_dEntry, char *source_filename, char *dest_filename) { return 0; }
 
-static long devfs_hash(struct vfs_dir_entry_t *dEntry, char *filename) {return 0; }
+static long devfs_hash(struct vfs_dir_entry_t *dEntry, char *filename) { return 0; }
 
 static long devfs_release(struct vfs_dir_entry_t *dEntry) { return 0; }
 
-static long devfs_iput(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode) {return 0; }
+static long devfs_iput(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode) { return 0; }
 
 struct vfs_dir_entry_operations_t devfs_dentry_ops =
     {
@@ -64,10 +74,10 @@ static long devfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_p
 {
     return 0;
 }
-static long devfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) {return 0; }
-static long devfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {return 0; }
-static long devfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) {return 0; }
-static long devfs_lseek(struct vfs_file_t *file_ptr, long offset, long origin) {return 0; }
+static long devfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) { return 0; }
+static long devfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) { return 0; }
+static long devfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) { return 0; }
+static long devfs_lseek(struct vfs_file_t *file_ptr, long offset, long origin) { return 0; }
 static long devfs_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg) { return 0; }
 
 static long devfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t filler)
@@ -122,7 +132,7 @@ struct vfs_file_operations_t devfs_file_ops =
  */
 static long devfs_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry, int mode)
 {
-    return 0; 
+    return 0;
 }
 
 static struct vfs_dir_entry_t *devfs_lookup(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry)
@@ -157,9 +167,9 @@ static long devfs_mkdir(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *
 }
 
 static long devfs_rmdir(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry) { return 0; }
-static long devfs_rename(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry) {return 0; }
-static long devfs_getAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) {return 0; }
-static long devfs_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) {return 0; }
+static long devfs_rename(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry) { return 0; }
+static long devfs_getAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) { return 0; }
+static long devfs_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr) { return 0; }
 struct vfs_inode_operations_t devfs_inode_ops = {
     .create = &devfs_create,
     .lookup = &devfs_lookup,
@@ -208,16 +218,19 @@ static __always_inline void __devfs_init_root_dentry()
  * @param device_type 设备主类型
  * @param sub_type 设备子类型
  * @param file_ops 设备的文件操作接口
+ * @param ret_private_inode_info_ptr 返回的指向inode私有信息结构体的指针
  * @return int 错误码
  */
-int devfs_register_device(uint16_t device_type, uint16_t sub_type, struct vfs_file_operations_t *file_ops)
+int devfs_register_device(uint16_t device_type, uint16_t sub_type, struct vfs_file_operations_t *file_ops, struct devfs_private_inode_info_t **ret_private_inode_info_ptr)
 {
+    spin_lock(&devfs_global_lock);
     int retval = 0;
     // 申请private info结构体
     struct devfs_private_inode_info_t *private_info = (struct devfs_private_inode_info_t *)kzalloc(sizeof(struct devfs_private_inode_info_t), 0);
     private_info->f_ops = file_ops;
     private_info->type = device_type;
     private_info->sub_type = sub_type;
+    private_info->uuid = __devfs_get_uuid();
 
     struct vfs_dir_entry_t *dentry = NULL; // 该指针由对应类型设备的注册函数设置
 
@@ -233,10 +246,14 @@ int devfs_register_device(uint16_t device_type, uint16_t sub_type, struct vfs_fi
         goto failed;
         break;
     }
+    if (ret_private_inode_info_ptr != NULL)
+        *ret_private_inode_info_ptr = private_info;
 
+    spin_unlock(&devfs_global_lock);
     return retval;
 failed:;
     kfree(private_info);
+    spin_unlock(&devfs_global_lock);
     return retval;
 }
 
@@ -248,9 +265,8 @@ void devfs_init()
 {
     __devfs_init_root_dentry();
     vfs_register_filesystem(&devfs_fs_type);
+    spin_init(&devfs_global_lock);
     vfs_mount_fs(__devfs_mount_path, "DEVFS", NULL);
 
     __devfs_chardev_init();
-
-    
 }

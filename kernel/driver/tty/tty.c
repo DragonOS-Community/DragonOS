@@ -8,6 +8,7 @@
 #include <lib/libUI/textui.h>
 #include "tty.h"
 
+static struct devfs_private_inode_info_t * tty_inode_private_data_ptr;  // 由devfs创建的inode私有信息指针
 //stdin缓冲区
 static struct kfifo_t tty_private_data;
 
@@ -152,6 +153,6 @@ void tty_init(){
     //kfifo_reset(&tty_private_data);
     wait_queue_init(&tty_wait_queue, NULL);
     //注册devfs
-    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_TTY, &tty_fops);
-    kinfo("tty driver registered.");
+    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_TTY, &tty_fops, &tty_inode_private_data_ptr);
+    kinfo("tty driver registered. uuid=%d", tty_inode_private_data_ptr->uuid);
 }

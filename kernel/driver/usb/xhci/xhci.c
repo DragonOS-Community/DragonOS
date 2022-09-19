@@ -41,7 +41,7 @@ static int xhci_send_command(int id, struct xhci_TRB_t *trb, const bool do_ring)
 static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int port, const int speed, const int max_packet);
 static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const int slot_id, const int ep_num, const int max_packet, const int type, const int direction, const int speed, const int ep_interval);
 static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int slot_id, const bool block);
-static int xhci_control_in(const int id, void *target, const int in_size, const int slot_id, const int max_packet);
+static int xhci_control_in(const int id, struct usb_request_packet_t *packet, void *target, const int slot_id, const int max_packet);
 static int xhci_setup_stage(struct xhci_ep_ring_info_t *ep, const struct usb_request_packet_t *packet, const uint8_t direction);
 static int xhci_data_stage(struct xhci_ep_ring_info_t *ep, uint64_t buf_vaddr, uint8_t trb_type, const uint32_t size, uint8_t direction, const int max_packet, const uint64_t status_vaddr);
 static int xhci_status_stage(const int id, uint8_t direction, uint64_t status_buf_vaddr);
@@ -1227,27 +1227,23 @@ static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr)
  * @brief 从指定插槽的control endpoint读取信息
  *
  * @param id 主机控制器id
+ * @param packet usb数据包
  * @param target 读取到的信息存放到的位置
- * @param in_size 要读取的数据的大小
  * @param slot_id 插槽id
  * @param max_packet 最大数据包大小
  * @return int 读取到的数据的大小
  */
-static int xhci_control_in(const int id, void *target, const int in_size, const int slot_id, const int max_packet)
+// static int xhci_control_in(const int id, uint8_t request, void *target, const int in_size, const int slot_id, const int max_packet)
+static int xhci_control_in(const int id, struct usb_request_packet_t *packet, void *target, const int slot_id, const int max_packet)
 {
 
     uint64_t status_buf_vaddr = (uint64_t)kzalloc(16, 0); // 本来是要申请4bytes的buffer的，但是因为xhci控制器需要16bytes对齐，因此申请16bytes
     uint64_t data_buf_vaddr = (uint64_t)kzalloc(256, 0);
     int retval = 0;
-    struct usb_request_packet_t packet = {0};
-    packet.request_type = USB_REQ_TYPE_GET_REQUEST;
-    packet.request = USB_REQ_GET_DESCRIPTOR;
-    packet.value = (USB_DT_DEVICE << 8);
-    packet.length = in_size;
 
     // 往control ep写入一个setup stage trb
-    xhci_setup_stage(&xhci_hc[id].control_ep_info, &packet, XHCI_DIR_IN);
-    xhci_data_stage(&xhci_hc[id].control_ep_info, data_buf_vaddr, TRB_TYPE_DATA_STAGE, in_size, XHCI_DIR_IN_BIT, max_packet, status_buf_vaddr);
+    xhci_setup_stage(&xhci_hc[id].control_ep_info, packet, XHCI_DIR_IN);
+    xhci_data_stage(&xhci_hc[id].control_ep_info, data_buf_vaddr, TRB_TYPE_DATA_STAGE, packet->length, XHCI_DIR_IN_BIT, max_packet, status_buf_vaddr);
 
 /*
     QEMU doesn't quite handle SETUP/DATA/STATUS transactions correctly.
@@ -1279,8 +1275,8 @@ static int xhci_control_in(const int id, void *target, const int in_size, const 
         goto failed;
 
     // 将读取到的数据拷贝到目标区域
-    memcpy(target, (void *)data_buf_vaddr, in_size);
-    retval = in_size;
+    memcpy(target, (void *)data_buf_vaddr, packet->length);
+    retval = packet->length;
     goto done;
 
 failed:;
@@ -1362,8 +1358,8 @@ static int xhci_get_descriptor(const int id, const int port_id)
         return retval;
 
     // kdebug("ctrl in again");
-
-    count = xhci_control_in(id, &dev_desc, 18, slot_id, max_packet);
+    DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (USB_DT_DEVICE << 8), 0, 18);
+    count = xhci_control_in(id, &ctrl_in_packet, &dev_desc, slot_id, max_packet);
     if (unlikely(count == 0))
         return -EAGAIN;
     /*

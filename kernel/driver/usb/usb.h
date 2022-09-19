@@ -90,6 +90,21 @@ enum
     USB_REQ_SET_INTERFACE,
     // standard endpoint requests
     USB_REQ_SYNCH_FRAME,
+    USB_REQ_SET_ENCRYPTION,
+    USB_REQ_GET_ENCRYPTION,
+    USB_REQ_SET_HANDSHAKE,
+    USB_REQ_GET_HANDSHAKE,
+    USB_REQ_SET_CONNECTION,
+    USB_REQ_SET_SECURITY_DATA,
+    USB_REQ_GET_SECURITY_DATA,
+    USB_REQ_SET_WUSB_DATA,
+    USB_REQ_LOOPBACK_DATA_WRITE,
+    USB_REQ_LOOPBACK_DATA_READ,
+    USB_REQ_SET_INTERFACE_DS,
+    USB_REQ_GET_FW_STATUS = 26,
+    USB_REQ_SET_FW_STATUS,
+    USB_REQ_SET_SEL = 48,
+    USB_REQ_SET_ISOCH_DELAY,
     // Device specific
     USB_REQ_GET_MAX_LUNS = 0xFE,
     USB_REQ_BULK_ONLY_RESET
@@ -109,6 +124,8 @@ enum
     USB_DT_OTG,
     USB_DT_DEBUG,
     USB_DT_INTERFACE_ASSOSIATION,
+    USB_DT_BOS = 15,
+    USB_DT_DEVICE_CAPABILITY,
 
     USB_DT_HID = 0x21,
     USB_DT_HID_REPORT,
@@ -117,7 +134,10 @@ enum
     USB_DT_INTERFACE_FUNCTION = 0x24,
     USB_DT_ENDPOINT_FUNCTION,
 
-    HUB = 0x29
+    // HUB = 0x29
+
+    USB_DT_SUPERSPEED_USB_ENDPOINT_COMPANION = 48,
+    USB_DT_SUPERSPEEDPLUS_ISOCHRONOUS_ENDPOINT_COMPANION,
 };
 
 // transfer types (Endpoint types) (USB 2.0 page 270)
@@ -129,6 +149,19 @@ enum
     USB_EP_INTERRUPT
 };
 
+/**
+ * @brief 该宏定义用于声明usb请求包，并初始化其中的各个字段
+ *
+ */
+#define DECLARE_USB_PACKET(pak_name, _trans_req_type, _trans_request, _trans_value, _trans_index, _transfer_length) \
+    struct usb_request_packet_t pak_name = {0};                                                                     \
+    pak_name.request_type = (_trans_req_type);                                                                      \
+    pak_name.request = (_trans_request);                                                                            \
+    pak_name.value = (_trans_value);                                                                                \
+    pak_name.index = (_trans_index);                                                                                \
+    pak_name.length = (_transfer_length);
+
+// #define DECLARE_USB_PACKET_NAME(name) struct usb_request_packet_t name = {0}
 /**
  * @brief 初始化usb驱动程序
  *

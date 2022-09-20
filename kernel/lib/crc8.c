@@ -1,11 +1,10 @@
-#include <stdio.h>
-#include "types.h"
+#include <common/sys/types.h>
 //Polynomial=0x31
 //Initial Value=0x0
 //Final Xor Value=0x0
 
 /** CRC table for the CRC-8. The poly is 0x31  */
-u8 const crc8_table[256] ={  
+uint8_t const crc8_table[256] ={  
     0x00,0x31,0x62,0x53,0xc4,0xf5,0xa6,0x97,0xb9,0x88,0xdb,0xea,0x7d,0x4c,0x1f,0x2e,
     0x43,0x72,0x21,0x10,0x87,0xb6,0xe5,0xd4,0xfa,0xcb,0x98,0xa9,0x3e,0x0f,0x5c,0x6d,
     0x86,0xb7,0xe4,0xd5,0x42,0x73,0x20,0x11,0x3f,0x0e,0x5d,0x6c,0xfb,0xca,0x99,0xa8,
@@ -24,10 +23,16 @@ u8 const crc8_table[256] ={
     0x82,0xb3,0xe0,0xd1,0x46,0x77,0x24,0x15,0x3b,0x0a,0x59,0x68,0xff,0xce,0x9d,0xac
 };
 
-  //第一个参数crc需要初始化
-  //第二个参数为需要转换成校验码的东西 
-  //第三个为 需要转换成校验码的东西的长度 
- u8 crc8(u8 crc, u8 const *buffer, size_t len) {
+/**
+ * @brief 计算crc8
+ * 
+ * @param crc crc初始值
+ * @param buffer 输入缓冲区
+ * @param len buffer大小（bytes）
+ * @return uint8_t crc
+ */
+uint8_t crc8(uint8_t crc, uint8_t const *buffer, size_t len) 
+{
  	while (len--)
     {
     	//printf("%04x\n",(crc ^ *buffer)&0xff);
@@ -37,17 +42,18 @@ u8 const crc8_table[256] ={
  }
  
  
- //test main
+
+
  
-   int main(){
-  	unsigned char data1[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
-    unsigned char data2[] = {'5', '6', '7', '8', '9'};
-    u8 c1, c2;
-    c1 = crc8(0x0,data1, 9);
-    c2 = crc8(0x0,data1, 4);
+  //  int main(){
+  // 	unsigned char data1[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+  //   unsigned char data2[] = {'5', '6', '7', '8', '9'};
+  //   uint8_t c1, c2;
+  //   c1 = crc8(0x0,data1, 9);
+  //   c2 = crc8(0x0,data1, 4);
     
-    printf("%02x\n", c1);
-    printf("%02x\n", c2);
+  //   printf("%02x\n", c1);
+  //   printf("%02x\n", c2);
     
   	    
-  }
+  // }

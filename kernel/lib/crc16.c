@@ -1,11 +1,11 @@
-#include <stdio.h>
-#include "types.h"
+#include <common/sys/types.h>
+
 //Polynomial=0x8005
 //Initial Value=0x0
 //Final Xor Value=0x0
   
 /** CRC table for the CRC-16. The poly is 0x8005 (x^16 + x^15 + x^2 + 1) */
-u16 const crc16_table[256]={   
+uint16_t const crc16_table[256]={   
     0x0000, 0x8005, 0x800F, 0x000A, 0x801B, 0x001E, 0x0014, 0x8011, 0x8033, 0x0036, 0x003C, 0x8039, 0x0028, 0x802D, 0x8027, 0x0022,
     0x8063, 0x0066, 0x006C, 0x8069, 0x0078, 0x807D, 0x8077, 0x0072, 0x0050, 0x8055, 0x805F, 0x005A, 0x804B, 0x004E, 0x0044, 0x8041,
     0x80C3, 0x00C6, 0x00CC, 0x80C9, 0x00D8, 0x80DD, 0x80D7, 0x00D2, 0x00F0, 0x80F5, 0x80FF, 0x00FA, 0x80EB, 0x00EE, 0x00E4, 0x80E1,
@@ -24,10 +24,15 @@ u16 const crc16_table[256]={
     0x0220, 0x8225, 0x822F, 0x022A, 0x823B, 0x023E, 0x0234, 0x8231, 0x8213, 0x0216, 0x021C, 0x8219, 0x0208, 0x820D, 0x8207, 0x0202,
   };
   
-//第一个参数crc需要初始化
-//第二个参数为需要转换成校验码的东西 
-//第三个为 需要转换成校验码的东西的长度 
-u16 crc16(u16 crc, u8 const *buffer, size_t len){
+/**
+ * @brief 计算crc16
+ * 
+ * @param crc crc初始值
+ * @param buffer 输入缓冲区
+ * @param len buffer大小（bytes）
+ * @return uint16_t crc
+ */
+uint16_t crc16(uint16_t crc, uint8_t const *buffer, size_t len){
   	while (len--){
   		crc=(crc << 8) ^ crc16_table[((crc>>8) ^ *buffer++) & 0xff];
 	  }
@@ -35,19 +40,19 @@ u16 crc16(u16 crc, u8 const *buffer, size_t len){
   }
   
   
-  //test main
-int main(){
-  	u8 data1[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
-    u8 data2[] = {'5', '6', '7', '8', '9'};
+//   //test main
+// int main(){
+//   	uint8_t data1[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+//     uint8_t data2[] = {'5', '6', '7', '8', '9'};
     
-    u8 c1, c2;
-    c1 = crc16(0x0,data1, 8);
-    c2 = crc16(0x0,data1, 4);
+//     uint16_t c1, c2;
+//     c1 = crc16(0x0,data1, 8);
+//     c2 = crc16(0x0,data1, 4);
     
-    printf("%02x\n", c1);
-    printf("%02x\n", c2);
+//     printf("%02x\n", c1);
+//     printf("%02x\n", c2);
     	    
-}
+// }
   
   
   
@@ -56,7 +61,7 @@ int main(){
   
   
   /** CRC table for the CRC-16. The poly is 0x8005 (x^16 + x^15 + x^2 + 1) */
-//u16 const crc16_table[256] = {   //The poly is 0x8005 (x^16 + x^15 + x^2 + 1),but a reflected table,the same as linux crc16
+//uint16_t const crc16_table[256] = {   //The poly is 0x8005 (x^16 + x^15 + x^2 + 1),but a reflected table,the same as linux crc16
 //	0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
 //  	0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
 //  	0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,

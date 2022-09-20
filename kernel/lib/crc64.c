@@ -1,10 +1,9 @@
-#include <stdio.h>
-#include "types.h"
+#include <common/sys/types.h>
 
 //Polynomial   =0x42F0E1EBA9EA3693
 //Initial Value=0x0
 //Final Xor Value=0x0
-u64 const crc64_table[256]={
+uint64_t const crc64_table[256]={
         0x0000000000000000, 0x42F0E1EBA9EA3693, 0x85E1C3D753D46D26, 0xC711223CFA3E5BB5, 0x493366450E42ECDF, 0x0BC387AEA7A8DA4C, 0xCCD2A5925D9681F9, 0x8E224479F47CB76A,
         0x9266CC8A1C85D9BE, 0xD0962D61B56FEF2D, 0x17870F5D4F51B498, 0x5577EEB6E6BB820B, 0xDB55AACF12C73561, 0x99A54B24BB2D03F2, 0x5EB4691841135847, 0x1C4488F3E8F96ED4,
         0x663D78FF90E185EF, 0x24CD9914390BB37C, 0xE3DCBB28C335E8C9, 0xA12C5AC36ADFDE5A, 0x2F0E1EBA9EA36930, 0x6DFEFF5137495FA3, 0xAAEFDD6DCD770416, 0xE81F3C86649D3285,
@@ -40,8 +39,15 @@ u64 const crc64_table[256]={
 
 };
 
-
-u64 crc64(u64 crc, u8 const *buffer, size_t len) 
+/**
+ * @brief ??crc64
+ * 
+ * @param crc crc???
+ * @param buffer ?????
+ * @param len buffer???bytes?
+ * @return uint64_t crc
+ */
+uint64_t crc64(uint64_t crc, uint8_t const *buffer, size_t len) 
 {
     while(len--){ 
         crc = (crc << 8)^(crc64_table[((crc>>56) ^ *buffer++)&0xff]);
@@ -50,15 +56,4 @@ u64 crc64(u64 crc, u8 const *buffer, size_t len)
 }
 
 
-//≤‚ ‘main 
 
-int main(){
-	unsigned char data1[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
-    unsigned char data2[] = {'5', '6', '7', '8', '9'};
-    u64 c1, c2;
-    c1 = crc64(0x0,data1, 1);
-    c2 = crc64(0x0,data1, 4);
-    //c2 = crc32(data2, 5, c2);
-    printf("%16x\n", c1);
-    printf("%16x\n", c2);
-}

@@ -328,12 +328,16 @@ int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flag
     vma->vm_end = vaddr + length;
     // 将VMA加入mm的链表
     retval = vma_insert(mm, vma);
-    if (retval == -EEXIST) // 之前已经存在了相同的vma，直接返回
+    if (retval == -EEXIST || retval == __VMA_MERGED) // 之前已经存在了相同的vma，直接返回
     {
         *res_vma = vma_find(mm, vma->vm_start);
         kfree(vma);
-        return -EEXIST;
+        if (retval == -EEXIST)
+            return -EEXIST;
+        else
+            return 0;
     }
+    
     if (res_vma != NULL)
         *res_vma = vma;
     return 0;
@@ -344,9 +348,11 @@ int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flag
  *
  * @param vma 要进行映射的VMA结构体
  * @param paddr 起始物理地址
+ * @param offset 要映射的起始位置在vma中的偏移量
+ * @param length 要映射的长度
  * @return int 错误码
  */
-int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
+int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr, uint64_t offset, uint64_t length)
 {
     int retval = 0;
     // 获取物理地址对应的页面
@@ -375,7 +381,7 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     __anon_vma_add(pg->anon_vma, vma);
     barrier();
 
-    uint64_t length = vma->vm_end - vma->vm_start;
+    length = vma->vm_end - vma->vm_start;
     // ==== 将地址映射到页表 ====
     uint64_t len_4k = length % PAGE_2M_SIZE;
     uint64_t len_2m = length - len_4k;
@@ -436,6 +442,7 @@ failed:;
 int mm_map(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr)
 {
     int retval = 0;
+    uint64_t offset = 0;
     for (uint64_t mapped = 0; mapped < length;)
     {
 
@@ -446,17 +453,20 @@ int mm_map(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr
             return -EINVAL;
         }
 
-        if (unlikely(vma->vm_start != (vaddr + mapped)))
-        {
-            kerror("Map addr failed: addr_start is not equal to current: %#018lx.", vaddr + mapped);
-            return -EINVAL;
-        }
+        // if (unlikely(vma->vm_start != (vaddr + mapped)))
+        // {
+        //     kerror("Map addr failed: addr_start is not equal to current: %#018lx.", vaddr + mapped);
+        //     return -EINVAL;
+        // }
 
-        retval = mm_map_vma(vma, paddr + mapped);
+        offset = vaddr + mapped - vma->vm_start;
+        uint64_t m_len = vma->vm_end - vma->vm_start - offset;
+        kdebug("start=%#018lx, offset=%ld",vma->vm_start, offset);
+        retval = mm_map_vma(vma, paddr + mapped, offset, m_len);
         if (unlikely(retval != 0))
             goto failed;
 
-        mapped += vma->vm_end - vma->vm_start;
+        mapped += m_len;
     }
     return 0;
 failed:;

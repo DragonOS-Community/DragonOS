@@ -180,6 +180,7 @@ struct vfs_file_t *process_open_exec_file(char *path)
  */
 static int process_load_elf_file(struct pt_regs *regs, char *path)
 {
+    kdebug("load elf");
     int retval = 0;
     struct vfs_file_t *filp = process_open_exec_file(path);
 
@@ -259,7 +260,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         pos = phdr->p_offset;
 
         uint64_t virt_base = 0;
-        uint64_t beginning_offset = 0;       // 由于页表映射导致的virtbase与实际的p_vaddr之间的偏移量
+        uint64_t beginning_offset = 0; // 由于页表映射导致的virtbase与实际的p_vaddr之间的偏移量
 
         if (remain_mem_size >= PAGE_2M_SIZE) // 接下来存在映射2M页的情况，因此将vaddr按2M向下对齐
             virt_base = phdr->p_vaddr & PAGE_2M_MASK;
@@ -278,11 +279,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
                 struct vm_area_struct *vma = NULL;
                 int ret = mm_create_vma(current_pcb->mm, virt_base, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+                
                 // 防止内存泄露
                 if (ret == -EEXIST)
                     free_pages(Phy_to_2M_Page(pa), 1);
                 else
-                    mm_map_vma(vma, pa);
+                    mm_map(current_pcb->mm, virt_base, PAGE_2M_SIZE, pa);
+                // mm_map_vma(vma, pa, 0, PAGE_2M_SIZE);
                 io_mfence();
                 memset((void *)virt_base, 0, PAGE_2M_SIZE);
                 map_size = PAGE_2M_SIZE;
@@ -298,10 +301,12 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
                     struct vm_area_struct *vma = NULL;
                     int val = mm_create_vma(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+                    kdebug("virt_base=%#018lx", virt_base + off);
                     if (val == -EEXIST)
                         kfree(phys_2_virt(paddr));
                     else
-                        mm_map_vma(vma, paddr);
+                        mm_map(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, paddr);
+                    // mm_map_vma(vma, paddr, 0, PAGE_4K_SIZE);
                     io_mfence();
                     memset((void *)(virt_base + off), 0, PAGE_4K_SIZE);
                 }
@@ -335,7 +340,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         if (val == -EEXIST)
             free_pages(Phy_to_2M_Page(pa), 1);
         else
-            mm_map_vma(vma, pa);
+            mm_map_vma(vma, pa, 0, PAGE_2M_SIZE);
     }
 
     // 清空栈空间
@@ -957,7 +962,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
                 if (unlikely(ret == -EEXIST))
                     free_pages(Phy_to_2M_Page(pa), 1);
                 else
-                    mm_map_vma(new_vma, pa);
+                    mm_map_vma(new_vma, pa, 0, PAGE_2M_SIZE);
 
                 memcpy((void *)phys_2_virt(pa), (void *)(vma->vm_start + i * PAGE_2M_SIZE), (vma_size >= PAGE_2M_SIZE) ? PAGE_2M_SIZE : vma_size);
                 vma_size -= PAGE_2M_SIZE;
@@ -974,7 +979,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
             if (unlikely(ret == -EEXIST))
                 kfree((void *)va);
             else
-                mm_map_vma(new_vma, virt_2_phys(va));
+                mm_map_vma(new_vma, virt_2_phys(va), 0, map_size);
 
             memcpy((void *)va, (void *)vma->vm_start, vma_size);
         }

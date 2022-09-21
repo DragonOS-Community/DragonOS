@@ -2,6 +2,10 @@
 
 #include "mm.h"
 
+
+// 当vma被成功合并后的返回值
+#define __VMA_MERGED 1
+
 /**
  * @brief 将vma结构体插入mm_struct的链表之中
  *
@@ -70,3 +74,6 @@ int __anon_vma_del(struct vm_area_struct *vma);
  * @return struct Page* 创建成功的page
  */
 struct Page* __create_mmio_page_struct(uint64_t paddr);
+
+// 判断给定的两个值是否跨越了2M边界
+#define CROSS_2M_BOUND(val1, val2) ((val1 & PAGE_2M_MASK) != (val2 & PAGE_2M_MASK))

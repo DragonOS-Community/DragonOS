@@ -2,6 +2,7 @@
 #include "slab.h"
 #include "internal.h"
 #include <common/compiler.h>
+#include <debug/bug.h>
 
 extern uint64_t mm_total_2M_pages;
 
@@ -319,6 +320,10 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
 int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flags_t vm_flags, struct vm_operations_t *vm_ops, struct vm_area_struct **res_vma)
 {
     int retval = 0;
+    // 输入的地址如果不是4K对齐，则报错
+    if (unlikely(vaddr & (PAGE_4K_SIZE - 1)))
+        return -EINVAL;
+
     struct vm_area_struct *vma = vm_area_alloc(mm);
     if (unlikely(vma == NULL))
         return -ENOMEM;
@@ -328,12 +333,16 @@ int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flag
     vma->vm_end = vaddr + length;
     // 将VMA加入mm的链表
     retval = vma_insert(mm, vma);
-    if (retval == -EEXIST) // 之前已经存在了相同的vma，直接返回
+    if (retval == -EEXIST || retval == __VMA_MERGED) // 之前已经存在了相同的vma，直接返回
     {
         *res_vma = vma_find(mm, vma->vm_start);
         kfree(vma);
-        return -EEXIST;
+        if (retval == -EEXIST)
+            return -EEXIST;
+        else
+            return 0;
     }
+
     if (res_vma != NULL)
         *res_vma = vma;
     return 0;
@@ -344,11 +353,16 @@ int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flag
  *
  * @param vma 要进行映射的VMA结构体
  * @param paddr 起始物理地址
+ * @param offset 要映射的起始位置在vma中的偏移量
+ * @param length 要映射的长度
  * @return int 错误码
  */
-int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
+int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr, uint64_t offset, uint64_t length)
 {
-    int retval = 0;
+   int retval = 0;
+    uint64_t mapped = 0;
+    BUG_ON((offset & (PAGE_4K_SIZE - 1)) != 0);
+    length = PAGE_4K_ALIGN(length); // 将length按照4K进行对齐
     // 获取物理地址对应的页面
     struct Page *pg;
     uint64_t page_flags = 0;
@@ -374,17 +388,39 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
     // 将anon vma与vma进行绑定
     __anon_vma_add(pg->anon_vma, vma);
     barrier();
-
-    uint64_t length = vma->vm_end - vma->vm_start;
-    // ==== 将地址映射到页表 ====
-    uint64_t len_4k = length % PAGE_2M_SIZE;
-    uint64_t len_2m = length - len_4k;
+    // 长度超过界限
+    BUG_ON(vma->vm_start + offset + length > vma->vm_end);
 
     /*
         todo: 限制页面的读写权限
     */
-    // kdebug("len2m=%d", len_2m);
-    // 先映射2M页
+
+    // ==== 将地址映射到页表 ====
+    uint64_t len_4k, len_2m;
+    // 将地址使用4k页填补，使得地址按照2M对齐
+    len_4k = PAGE_2M_ALIGN(vma->vm_start + offset) - (vma->vm_start + offset);
+    if (len_4k > 0)
+        len_4k = (len_4k > length) ? length : len_4k;
+    if (len_4k)
+    {
+        if (vma->vm_flags & VM_USER)
+            page_flags |= PAGE_USER_4K_PAGE;
+        else
+            page_flags |= PAGE_KERNEL_4K_PAGE;
+
+        // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
+        retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start + offset, paddr, len_4k, page_flags, false, false, true);
+        if (unlikely(retval != 0))
+            goto failed;
+
+        mapped += len_4k;
+        length -= len_4k;
+    }
+
+    len_4k = length % PAGE_2M_SIZE;
+    len_2m = length / PAGE_2M_SIZE;
+
+    // 映射连续的2M页
     if (likely(len_2m > 0))
     {
         if (vma->vm_flags & VM_USER)
@@ -392,31 +428,32 @@ int mm_map_vma(struct vm_area_struct *vma, uint64_t paddr)
         else
             page_flags |= PAGE_KERNEL_PAGE;
         // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
-        retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start, paddr, len_2m, page_flags, false, false, false);
+        retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start + offset + mapped, paddr + mapped, len_2m, page_flags, false, false, false);
+
         if (unlikely(retval != 0))
             goto failed;
+        mapped += len_2m;
     }
-
+    // 最后再使用4K页填补
     if (likely(len_4k > 0))
     {
-        len_4k = ALIGN(len_4k, PAGE_4K_SIZE);
 
         if (vma->vm_flags & VM_USER)
             page_flags |= PAGE_USER_4K_PAGE;
         else
             page_flags |= PAGE_KERNEL_4K_PAGE;
+
         // 这里直接设置user标志位为false，因为该函数内部会对其进行自动校正
-        retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start + len_2m, paddr + len_2m, len_4k, page_flags, false, false, true);
+        retval = mm_map_proc_page_table((uint64_t)vma->vm_mm->pgd, true, vma->vm_start + offset + mapped, paddr + mapped, len_4k, page_flags, false, false, true);
+
         if (unlikely(retval != 0))
             goto failed;
+        mapped += len_4k;
     }
 
     if (vma->vm_flags & VM_IO)
         vma->page_offset = 0;
-    else
-    { // 计算当前vma的起始地址在对应的物理页中的偏移量
-        vma->page_offset = paddr - (paddr & PAGE_2M_MASK);
-    }
+
     flush_tlb();
     return 0;
 failed:;
@@ -436,6 +473,7 @@ failed:;
 int mm_map(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr)
 {
     int retval = 0;
+    uint64_t offset = 0;
     for (uint64_t mapped = 0; mapped < length;)
     {
 
@@ -446,17 +484,20 @@ int mm_map(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr
             return -EINVAL;
         }
 
-        if (unlikely(vma->vm_start != (vaddr + mapped)))
-        {
-            kerror("Map addr failed: addr_start is not equal to current: %#018lx.", vaddr + mapped);
-            return -EINVAL;
-        }
+        // if (unlikely(vma->vm_start != (vaddr + mapped)))
+        // {
+        //     kerror("Map addr failed: addr_start is not equal to current: %#018lx.", vaddr + mapped);
+        //     return -EINVAL;
+        // }
 
-        retval = mm_map_vma(vma, paddr + mapped);
+        offset = vaddr + mapped - vma->vm_start;
+        uint64_t m_len = vma->vm_end - vma->vm_start - offset;
+        // kdebug("start=%#018lx, offset=%ld", vma->vm_start, offset);
+        retval = mm_map_vma(vma, paddr + mapped, offset, m_len);
         if (unlikely(retval != 0))
             goto failed;
 
-        mapped += vma->vm_end - vma->vm_start;
+        mapped += m_len;
     }
     return 0;
 failed:;

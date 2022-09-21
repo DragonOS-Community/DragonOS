@@ -615,7 +615,8 @@ uint64_t mm_do_brk(uint64_t old_brk_end_addr, int64_t offset)
         {
             struct vm_area_struct *vma = NULL;
             mm_create_vma(current_pcb->mm, i, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
-            mm_map_vma(vma, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys);
+            mm_map(current_pcb->mm, i, PAGE_2M_SIZE, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys);
+            // mm_map_vma(vma, alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys, 0, PAGE_2M_SIZE);
         }
         current_pcb->mm->brk_end = end_addr;
     }

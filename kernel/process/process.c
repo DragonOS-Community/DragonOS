@@ -180,7 +180,6 @@ struct vfs_file_t *process_open_exec_file(char *path)
  */
 static int process_load_elf_file(struct pt_regs *regs, char *path)
 {
-    kdebug("load elf");
     int retval = 0;
     struct vfs_file_t *filp = process_open_exec_file(path);
 
@@ -301,7 +300,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
                     struct vm_area_struct *vma = NULL;
                     int val = mm_create_vma(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
-                    kdebug("virt_base=%#018lx", virt_base + off);
+                    // kdebug("virt_base=%#018lx", virt_base + off);
                     if (val == -EEXIST)
                         kfree(phys_2_virt(paddr));
                     else

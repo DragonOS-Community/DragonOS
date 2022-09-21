@@ -492,7 +492,7 @@ int mm_map(struct mm_struct *mm, uint64_t vaddr, uint64_t length, uint64_t paddr
 
         offset = vaddr + mapped - vma->vm_start;
         uint64_t m_len = vma->vm_end - vma->vm_start - offset;
-        kdebug("start=%#018lx, offset=%ld", vma->vm_start, offset);
+        // kdebug("start=%#018lx, offset=%ld", vma->vm_start, offset);
         retval = mm_map_vma(vma, paddr + mapped, offset, m_len);
         if (unlikely(retval != 0))
             goto failed;

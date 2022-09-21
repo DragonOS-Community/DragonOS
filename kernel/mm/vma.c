@@ -122,17 +122,9 @@ int vma_insert(struct mm_struct *mm, struct vm_area_struct *vma)
 {
 
     struct vm_area_struct *prev;
-    bool show_log = false;
+
     prev = vma_find(mm, vma->vm_start);
-    if (vma->vm_start == 0x800000)
-        show_log = true;
-    if (show_log)
-    {
-        if (prev == NULL)
-            kdebug("prev is NULL");
-        else
-            kdebug("prev.start = %#018lx, prev.end=%#018lx", prev->vm_start, prev->vm_end);
-    }
+    
     if (prev && prev->vm_start <= vma->vm_start && prev->vm_end >= vma->vm_end)
     {
         // 已经存在了相同的vma

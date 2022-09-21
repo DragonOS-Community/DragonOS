@@ -708,6 +708,6 @@ unsigned long kfree(void *address)
 
         } while (slab_obj_ptr != kmalloc_cache_group[i].cache_pool_entry);
     }
-    kBUG("kfree(): Can't free memory.");
+    kBUG("kfree(): Can't free memory. address=%#018lx", address);
     return ECANNOT_FREE_MEM;
 }

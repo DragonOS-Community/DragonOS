@@ -1,4 +1,5 @@
 #include "xhci.h"
+#include "internal.h"
 #include <common/kprint.h>
 #include <debug/bug.h>
 #include <common/spinlock.h>
@@ -46,6 +47,7 @@ static int xhci_setup_stage(struct xhci_ep_ring_info_t *ep, const struct usb_req
 static int xhci_data_stage(struct xhci_ep_ring_info_t *ep, uint64_t buf_vaddr, uint8_t trb_type, const uint32_t size, uint8_t direction, const int max_packet, const uint64_t status_vaddr);
 static int xhci_status_stage(const int id, uint8_t direction, uint64_t status_buf_vaddr);
 static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr);
+static int xhci_get_config_desc(const int id, const int port_id, struct usb_config_desc *conf_desc);
 
 hardware_intr_controller xhci_hc_intr_controller =
     {
@@ -55,87 +57,6 @@ hardware_intr_controller xhci_hc_intr_controller =
         .uninstall = xhci_hc_irq_uninstall,
         .ack = apic_local_apic_edge_ack,
 };
-
-/*
-    注意！！！
-
-    尽管采用MMI/O的方式访问寄存器，但是对于指定大小的寄存器，
-    在发起读请求的时候，只能从寄存器的起始地址位置开始读取。
-
-    例子：不能在一个32bit的寄存器中的偏移量8的位置开始读取1个字节
-            这种情况下，我们必须从32bit的寄存器的0地址处开始读取32bit，然后通过移位的方式得到其中的字节。
-*/
-
-#define xhci_read_cap_reg32(id, offset) (__read4b(xhci_hc[id].vbase + (offset)))
-#define xhci_get_ptr_cap_reg32(id, offset) ((uint32_t *)(xhci_hc[id].vbase + (offset)))
-#define xhci_write_cap_reg32(id, offset, value) (__write4b(xhci_hc[id].vbase + (offset), (value)))
-
-#define xhci_read_cap_reg64(id, offset) (__read8b(xhci_hc[id].vbase + (offset)))
-#define xhci_get_ptr_reg64(id, offset) ((uint64_t *)(xhci_hc[id].vbase + (offset)))
-#define xhci_write_cap_reg64(id, offset, value) (__write8b(xhci_hc[id].vbase + (offset), (value)))
-
-#define xhci_read_op_reg8(id, offset) (*(uint8_t *)(xhci_hc[id].vbase_op + (offset)))
-#define xhci_get_ptr_op_reg8(id, offset) ((uint8_t *)(xhci_hc[id].vbase_op + (offset)))
-#define xhci_write_op_reg8(id, offset, value) (*(uint8_t *)(xhci_hc[id].vbase_op + (offset)) = (uint8_t)(value))
-
-#define xhci_read_op_reg32(id, offset) (__read4b(xhci_hc[id].vbase_op + (offset)))
-#define xhci_get_ptr_op_reg32(id, offset) ((uint32_t *)(xhci_hc[id].vbase_op + (offset)))
-#define xhci_write_op_reg32(id, offset, value) (__write4b(xhci_hc[id].vbase_op + (offset), (value)))
-
-#define xhci_read_op_reg64(id, offset) (__read8b(xhci_hc[id].vbase_op + (offset)))
-#define xhci_get_ptr_op_reg64(id, offset) ((uint64_t *)(xhci_hc[id].vbase_op + (offset)))
-#define xhci_write_op_reg64(id, offset, value) (__write8b(xhci_hc[id].vbase_op + (offset), (value)))
-
-/**
- * @brief 计算中断寄存器组虚拟地址
- * @param id 主机控制器id
- * @param num xhci中断寄存器组号
- */
-#define xhci_calc_intr_vaddr(id, num) (xhci_hc[id].vbase + xhci_hc[id].rts_offset + XHCI_RT_IR0 + (num)*XHCI_IR_SIZE)
-/**
- * @brief 读取/写入中断寄存器
- * @param id 主机控制器id
- * @param num xhci中断寄存器组号
- * @param intr_offset 寄存器在当前寄存器组中的偏移量
- */
-#define xhci_read_intr_reg32(id, num, intr_offset) (__read4b(xhci_calc_intr_vaddr(id, num) + (intr_offset)))
-#define xhci_write_intr_reg32(id, num, intr_offset, value) (__write4b(xhci_calc_intr_vaddr(id, num) + (intr_offset), (value)))
-#define xhci_read_intr_reg64(id, num, intr_offset) (__read8b(xhci_calc_intr_vaddr(id, num) + (intr_offset)))
-#define xhci_write_intr_reg64(id, num, intr_offset, value) (__write8b(xhci_calc_intr_vaddr(id, num) + (intr_offset), (value)))
-
-#define xhci_is_aligned64(addr) (((addr)&0x3f) == 0) // 是否64bytes对齐
-
-/**
- * @brief 判断端口信息
- * @param cid 主机控制器id
- * @param pid 端口id
- */
-#define XHCI_PORT_IS_USB2(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_INFO) == XHCI_PROTOCOL_USB2)
-#define XHCI_PORT_IS_USB3(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_INFO) == XHCI_PROTOCOL_USB3)
-
-#define XHCI_PORT_IS_USB2_HSO(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_HSO) == XHCI_PROTOCOL_HSO)
-#define XHCI_PORT_HAS_PAIR(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_HAS_PAIR) == XHCI_PROTOCOL_HAS_PAIR)
-#define XHCI_PORT_IS_ACTIVE(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_ACTIVE) == XHCI_PROTOCOL_ACTIVE)
-
-/**
- * @brief 设置link TRB的命令（dword3）
- *
- */
-#define xhci_TRB_set_link_cmd(trb_vaddr)                                         \
-    do                                                                           \
-    {                                                                            \
-        struct xhci_TRB_normal_t *ptr = (struct xhci_TRB_normal_t *)(trb_vaddr); \
-        ptr->TRB_type = TRB_TYPE_LINK;                                           \
-        ptr->ioc = 0;                                                            \
-        ptr->chain = 0;                                                          \
-        ptr->ent = 0;                                                            \
-        ptr->cycle = 1;                                                          \
-    } while (0)
-
-// 设置endpoint结构体的dequeue_cycle_state bit
-#define xhci_ep_set_dequeue_cycle_state(ep_ctx_ptr, state) ((ep_ctx_ptr)->tr_dequeue_ptr |= ((state)&1))
-// 获取endpoint结构体的dequeue_cycle_state bit
-#define xhci_ep_get_dequeue_cycle_state(ep_ctx_ptr) (((ep_ctx_ptr)->tr_dequeue_ptr) & 1)
 
 /**
  * @brief 在controller数组之中寻找可用插槽
@@ -851,7 +772,7 @@ static int xhci_reset_port(const int id, const int port)
         io_mfence();
         if (val & (1 << 21))
             break;
-        // QEMU对usb的模拟有bug，因此需要检测这里
+            // QEMU对usb的模拟有bug，因此需要检测这里
 #ifdef __QEMU_EMULATION__
 
         if (XHCI_PORT_IS_USB3(id, port) && (val & (1 << 31)) == 0)
@@ -919,11 +840,9 @@ static int xhci_reset_port(const int id, const int port)
  */
 static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int port, const int speed, const int max_packet)
 {
-    // 暂时只初始化slot和control EP0
-
-    // 申请上下文数据结构所占用的内存空间
-
-    uint64_t device_context_vaddr = (uint64_t)kzalloc(xhci_hc[id].context_size * 2, 0);
+    // 为所有的endpoint分配上下文空间
+    // todo: 按需分配上下文空间
+    uint64_t device_context_vaddr = (uint64_t)kzalloc(xhci_hc[id].context_size * 32, 0);
     // kdebug("slot id=%d, device_context_vaddr=%#018lx, port=%d", slot_id, device_context_vaddr, port);
     // 写到数组中
     __write8b(xhci_hc[id].dcbaap_vaddr + (slot_id * sizeof(uint64_t)), virt_2_phys(device_context_vaddr));
@@ -1290,6 +1209,34 @@ done:;
 }
 
 /**
+ * @brief 获取usb 设备的config_desc
+ *
+ * @param id 主机控制器id
+ * @param port_id 端口id
+ * @param conf_desc 要获取的conf_desc
+ * @return int 错误码
+ */
+static int xhci_get_config_desc(const int id, const int port_id, struct usb_config_desc *conf_desc)
+{
+    struct usb_device_desc *dev_desc = xhci_hc[id].ports[port_id].dev_desc;
+    int count;
+
+    BUG_ON(dev_desc == NULL);
+    // 设备端口没有对应的描述符
+    if (unlikely(dev_desc == NULL || conf_desc == NULL))
+        return -EINVAL;
+
+    kdebug("to get conf for port %d", port_id);
+    struct usb_config_desc *conf_desc = (struct usb_config_desc *)kzalloc(sizeof(struct usb_config_desc), 0);
+    DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (USB_DT_CONFIG << 8) | 0, 0, 9);
+    count = xhci_control_in(id, &ctrl_in_packet, conf_desc, xhci_hc[id].ports[port_id].slot_id, dev_desc->max_packet_size);
+    if (unlikely(count == 0))
+        return -EAGAIN;
+    kdebug("port %d got conf ok. type=%d, num_interfaces=%d, max_power=%dmA", port_id, conf_desc->type, conf_desc->num_interfaces, (xhci_get_port_speed(id, port_id) == XHCI_PORT_SPEED_SUPER) ? (conf_desc->max_power * 8) : (conf_desc->max_power * 2));
+    return 0;
+}
+
+/**
  * @brief 获取端口的描述信息
  *
  * @param id 主机控制器id
@@ -1300,7 +1247,7 @@ static int xhci_get_descriptor(const int id, const int port_id)
 {
     int retval = 0;
     int count = 0;
-    struct usb_device_desc dev_desc = {0};
+
     uint32_t dword;
     // 计算port register set相对于operational registers基地址的偏移量
     uint32_t port_register_offset = XHCI_OPS_PRS + 16 * port_id;
@@ -1345,7 +1292,10 @@ static int xhci_get_descriptor(const int id, const int port_id)
             break;
         }
     }
+    else
+        return -EAGAIN; // slot id 不合法
 
+    xhci_hc[id].ports[port_id].slot_id = slot_id;
     // kdebug("speed=%d", speed);
     // 初始化接口的上下文
     uint64_t slot_vaddr = xhci_initialize_slot(id, slot_id, port_id, speed, max_packet);
@@ -1357,16 +1307,19 @@ static int xhci_get_descriptor(const int id, const int port_id)
     if (retval != 0)
         return retval;
 
-    // kdebug("ctrl in again");
+    struct usb_device_desc *dev_desc = (struct usb_device_desc *)kzalloc(sizeof(struct usb_device_desc), 0);
     DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (USB_DT_DEVICE << 8), 0, 18);
-    count = xhci_control_in(id, &ctrl_in_packet, &dev_desc, slot_id, max_packet);
+    count = xhci_control_in(id, &ctrl_in_packet, dev_desc, slot_id, max_packet);
     if (unlikely(count == 0))
         return -EAGAIN;
     /*
-        TODO: if the dev_desc.max_packet was different than what we have as max_packet,
+        TODO: if the dev_desc->max_packet was different than what we have as max_packet,
           you would need to change it here and in the slot context by doing a
           evaluate_slot_context call.
     */
+
+    xhci_hc[id].ports[port_id].dev_desc = dev_desc;
+
     // print the descriptor
     printk("  Found USB Device:\n"
            "                port: %i\n"
@@ -1384,12 +1337,11 @@ static int xhci_get_descriptor(const int id, const int port_id)
            "       product index: %i\n"
            "        serial index: %i\n"
            "   number of configs: %i\n",
-           port_id, dev_desc.len, dev_desc.type, dev_desc.usb_version >> 8, dev_desc.usb_version & 0xFF, dev_desc._class, dev_desc.subclass,
-           dev_desc.protocol, dev_desc.max_packet_size, dev_desc.vendor_id, dev_desc.product_id,
-           (dev_desc.device_rel & 0xF000) >> 12, (dev_desc.device_rel & 0x0F00) >> 8,
-           (dev_desc.device_rel & 0x00F0) >> 4, (dev_desc.device_rel & 0x000F) >> 0,
-           dev_desc.manufacturer_index, dev_desc.procuct_index, dev_desc.serial_index, dev_desc.config);
-
+           port_id, dev_desc->len, dev_desc->type, dev_desc->usb_version >> 8, dev_desc->usb_version & 0xFF, dev_desc->_class, dev_desc->subclass,
+           dev_desc->protocol, dev_desc->max_packet_size, dev_desc->vendor_id, dev_desc->product_id,
+           (dev_desc->device_rel & 0xF000) >> 12, (dev_desc->device_rel & 0x0F00) >> 8,
+           (dev_desc->device_rel & 0x00F0) >> 4, (dev_desc->device_rel & 0x000F) >> 0,
+           dev_desc->manufacturer_index, dev_desc->procuct_index, dev_desc->serial_index, dev_desc->config);
     return 0;
 }
 
@@ -1419,7 +1371,11 @@ static int xhci_hc_start_ports(int id)
             {
                 // kdebug("reset port %d ok", id);
                 if (xhci_get_descriptor(id, i) == 0)
+                {
+                    struct usb_config_desc conf_desc = {0};
+                    xhci_get_config_desc(id, i, &conf_desc);
                     ++cnt;
+                }
                 kdebug("usb3 port %d get desc ok", i);
             }
         }
@@ -1440,7 +1396,11 @@ static int xhci_hc_start_ports(int id)
                 // kdebug("reset port %d ok", id);
 
                 if (xhci_get_descriptor(id, i) == 0)
+                {
+                    struct usb_config_desc conf_desc = {0};
+                    xhci_get_config_desc(id, i, &conf_desc);
                     ++cnt;
+                }
                 kdebug("USB2 port %d get desc ok", i);
             }
         }

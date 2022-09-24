@@ -44,6 +44,42 @@ struct usb_device_desc
 };
 
 /**
+ * @brief usb设备配置信息描述符
+ *
+ */
+struct usb_config_desc
+{
+    uint8_t len;            // 当前描述符的大小（字节）
+    uint8_t type;           // USB_DT_CONFIG
+    uint16_t total_len;     /*
+                                Total length of data returned for this
+                                configuration. Includes the combined length
+                                of all descriptors (configuration, interface,
+                                endpoint, and class- or vendor-specific)
+                                returned for this configuration
+                            */
+    uint8_t num_interfaces; // 当前conf对应的接口数量
+    uint8_t value;          /*
+                                Value to use as an argument to the
+                                SetConfiguration() request to select this
+                                configuration
+                            */
+    uint8_t index;          // Index of string descriptor describing this configuration
+    uint8_t bmAttr;         /*
+                                Configuration characteristics:
+                                D7: Reserved (要设置为1)
+                                D6: Self-powered
+                                D5: Remote Wakeup
+                                D4...0: Reserved (设置为0)
+                            */
+    uint8_t max_power;  /*
+                            当这个设备满载时，为在这个conf上提供对应的功能，需要消耗的电流值。
+                            当设备是在High-speed时，这里的单位是2mA （也就是说，值为50，代表最大消耗100mA的电流）
+                            当设备运行在Gen X speed时，这里的单位是8mA
+                        */
+};
+
+/**
  * @brief usb设备请求包
  *
  */

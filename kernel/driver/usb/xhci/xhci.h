@@ -502,6 +502,8 @@ struct xhci_port_info_t
     uint8_t paired_port_num; // 与当前端口所配对的另一个端口（相同物理接口的不同速度的port）
     uint8_t offset;          // offset of this port within this protocal
     uint8_t reserved;
+    uint8_t slot_id;                  // address device获得的slot id
+    struct usb_device_desc *dev_desc; // 指向设备描述符结构体的指针
 } __attribute__((packed));
 
 struct xhci_ep_ring_info_t

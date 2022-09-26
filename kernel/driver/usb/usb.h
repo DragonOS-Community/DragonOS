@@ -20,6 +20,19 @@
 #define USB_TIME_RST_REC 10   // reset recovery
 
 /**
+ * @brief usb描述符的头部
+ * 
+ * String Descriptor: 
+ * String Language Descriptor: 
+ *      先获取头部，然后根据长度申请空间，再获取整个string desc
+ */
+struct usb_desc_header
+{
+    uint8_t len;    // 整个描述符的大小（字节）
+    uint8_t type;
+}__attribute__((packed));
+
+/**
  * @brief usb 设备描述符
  *
  */
@@ -41,7 +54,7 @@ struct usb_device_desc
 
     uint8_t serial_index;
     uint8_t config; // number of configurations
-};
+}__attribute__((packed));
 
 /**
  * @brief usb设备配置信息描述符
@@ -72,11 +85,49 @@ struct usb_config_desc
                                 D5: Remote Wakeup
                                 D4...0: Reserved (设置为0)
                             */
-    uint8_t max_power;  /*
-                            当这个设备满载时，为在这个conf上提供对应的功能，需要消耗的电流值。
-                            当设备是在High-speed时，这里的单位是2mA （也就是说，值为50，代表最大消耗100mA的电流）
-                            当设备运行在Gen X speed时，这里的单位是8mA
-                        */
+    uint8_t max_power;      /*
+                                当这个设备满载时，为在这个conf上提供对应的功能，需要消耗的电流值。
+                                当设备是在High-speed时，这里的单位是2mA （也就是说，值为50，代表最大消耗100mA的电流）
+                                当设备运行在Gen X speed时，这里的单位是8mA
+                            */
+}__attribute__((packed));
+
+/**
+ * @brief usb接口描述符
+ *
+ */
+struct usb_interface_desc
+{
+    uint8_t len;
+    uint8_t type;                // USB_DT_INTERFACE
+    uint8_t interface_number;    // 当前接口序号（从0开始的）
+    uint8_t alternate_setting;   // used to select alt. setting
+    uint8_t num_endpoints;       // 当前interface的端点数量
+    uint8_t interface_class;     // Class code
+    uint8_t interface_sub_class; // Sub class code
+    uint8_t interface_protocol;  // 协议  These codes are qualified by the value of thebInterfaceClass and the bInterfaceSubClass fields.
+    uint8_t index;               // index of String Descriptor describing this interface
+}__attribute__((packed));
+
+/**
+ * @brief usb端点描述符
+ * 
+ * 详见usb3.2 Specification Table 9-26
+ */
+struct usb_endpoint_desc
+{
+    uint8_t len;
+    uint8_t type;
+    uint8_t endpoint_addr;  /*  Bit 3...0: The endpoint number
+                                Bit 6...4: Reserved, reset to zero
+                                Bit 7: Direction, ignored for
+                                control endpoints
+                                0 = OUT endpoint
+                                1 = IN endpoint
+                                */
+    uint8_t attributes;
+    uint16_t max_packet;
+    uint8_t interval;
 };
 
 /**
@@ -91,7 +142,7 @@ struct usb_request_packet_t
 
     uint16_t index;
     uint16_t length;
-};
+}__attribute__((packed));
 // usb设备请求包的request_type字段的值
 #define __USB_REQ_TYPE_H2D 0x00
 #define __USB_REQ_TYPE_D2H 0x80

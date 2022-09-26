@@ -47,7 +47,11 @@ static int xhci_setup_stage(struct xhci_ep_ring_info_t *ep, const struct usb_req
 static int xhci_data_stage(struct xhci_ep_ring_info_t *ep, uint64_t buf_vaddr, uint8_t trb_type, const uint32_t size, uint8_t direction, const int max_packet, const uint64_t status_vaddr);
 static int xhci_status_stage(const int id, uint8_t direction, uint64_t status_buf_vaddr);
 static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr);
+static inline int xhci_get_desc(const int id, const int port_id, void *target, const uint16_t desc_type, const uint8_t desc_index, const uint16_t lang_id, const uint16_t length);
 static int xhci_get_config_desc(const int id, const int port_id, struct usb_config_desc *conf_desc);
+static inline int xhci_get_config_desc_full(const int id, const int port_id, const struct usb_config_desc *conf_desc, void *target);
+static int xhci_get_interface_desc(const void *in_buf, const uint8_t if_num, struct usb_interface_desc **if_desc);
+static inline int xhci_get_endpoint_desc(const struct usb_interface_desc *if_desc, const uint8_t ep_num, struct usb_endpoint_desc **ep_desc);
 
 hardware_intr_controller xhci_hc_intr_controller =
     {
@@ -859,6 +863,7 @@ static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int 
     // 将slot信息写入上下文空间
     __write_slot(device_context_vaddr, &slot_ctx);
 
+    // 初始化控制端点
     xhci_initialize_ep(id, device_context_vaddr, slot_id, XHCI_EP_CONTROL, max_packet, USB_EP_CONTROL, 0, speed, 0);
 
     return device_context_vaddr;
@@ -1209,6 +1214,33 @@ done:;
 }
 
 /**
+ * @brief 获取描述符
+ *
+ * @param id 控制器号
+ * @param port_id 端口号
+ * @param target 获取到的数据要拷贝到的地址
+ * @param desc_type 描述符类型
+ * @param desc_index 描述符的索引号
+ * @param lang_id 语言id（默认为0）
+ * @param length 要传输的数据长度
+ * @return int 错误码
+ */
+static inline int xhci_get_desc(const int id, const int port_id, void *target, const uint16_t desc_type, const uint8_t desc_index, const uint16_t lang_id, const uint16_t length)
+{
+    struct usb_device_desc *dev_desc = xhci_hc[id].ports[port_id].dev_desc;
+    int count;
+
+    BUG_ON(dev_desc == NULL);
+    // 设备端口没有对应的描述符
+    if (unlikely(dev_desc == NULL))
+        return -EINVAL;
+    DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (desc_type << 8) | desc_index, lang_id, length);
+    count = xhci_control_in(id, &ctrl_in_packet, target, xhci_hc[id].ports[port_id].slot_id, dev_desc->max_packet_size);
+    if (unlikely(count == 0))
+        return -EAGAIN;
+    return 0;
+}
+/**
  * @brief 获取usb 设备的config_desc
  *
  * @param id 主机控制器id
@@ -1218,26 +1250,83 @@ done:;
  */
 static int xhci_get_config_desc(const int id, const int port_id, struct usb_config_desc *conf_desc)
 {
-    struct usb_device_desc *dev_desc = xhci_hc[id].ports[port_id].dev_desc;
-    int count;
-
-    BUG_ON(dev_desc == NULL);
-    // 设备端口没有对应的描述符
-    if (unlikely(dev_desc == NULL || conf_desc == NULL))
+    if (unlikely(conf_desc == NULL))
         return -EINVAL;
 
     kdebug("to get conf for port %d", port_id);
-    struct usb_config_desc *conf_desc = (struct usb_config_desc *)kzalloc(sizeof(struct usb_config_desc), 0);
-    DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (USB_DT_CONFIG << 8) | 0, 0, 9);
-    count = xhci_control_in(id, &ctrl_in_packet, conf_desc, xhci_hc[id].ports[port_id].slot_id, dev_desc->max_packet_size);
-    if (unlikely(count == 0))
-        return -EAGAIN;
-    kdebug("port %d got conf ok. type=%d, num_interfaces=%d, max_power=%dmA", port_id, conf_desc->type, conf_desc->num_interfaces, (xhci_get_port_speed(id, port_id) == XHCI_PORT_SPEED_SUPER) ? (conf_desc->max_power * 8) : (conf_desc->max_power * 2));
+    int retval = xhci_get_desc(id, port_id, conf_desc, USB_DT_CONFIG, 0, 0, 9);
+    if (unlikely(retval != 0))
+        return retval;
+    kdebug("port %d got conf ok. type=%d, len=%d, total_len=%d, num_interfaces=%d, max_power=%dmA", port_id, conf_desc->type, conf_desc->len, conf_desc->total_len, conf_desc->num_interfaces, (xhci_get_port_speed(id, port_id) == XHCI_PORT_SPEED_SUPER) ? (conf_desc->max_power * 8) : (conf_desc->max_power * 2));
     return 0;
 }
 
 /**
- * @brief 获取端口的描述信息
+ * @brief 获取完整的config desc（包含conf、interface、endpoint）
+ *
+ * @param id 控制器id
+ * @param port_id 端口id
+ * @param conf_desc 之前已经获取好的config_desc
+ * @param target 最终结果要拷贝到的地址
+ * @return int 错误码
+ */
+static inline int xhci_get_config_desc_full(const int id, const int port_id, const struct usb_config_desc *conf_desc, void *target)
+{
+    if (unlikely(conf_desc == NULL || target == NULL))
+        return -EINVAL;
+
+    return xhci_get_desc(id, port_id, target, USB_DT_CONFIG, 0, 0, conf_desc->total_len);
+}
+
+/**
+ * @brief 从完整的conf_desc数据中获取指定的interface_desc的指针
+ *
+ * @param in_buf 存储了完整的conf_desc的缓冲区
+ * @param if_num 接口号
+ * @param if_desc 返回的指向接口结构体的指针
+ * @return int 错误码
+ */
+static int xhci_get_interface_desc(const void *in_buf, const uint8_t if_num, struct usb_interface_desc **if_desc)
+{
+    if (unlikely(if_desc == NULL || in_buf == NULL))
+        return -EINVAL;
+    kdebug("to get interface.");
+    // 判断接口index是否合理
+    if (if_num >= ((struct usb_config_desc *)in_buf)->num_interfaces)
+        return -EINVAL;
+    struct usb_interface_desc *ptr = (struct usb_interface_desc *)(in_buf + sizeof(struct usb_config_desc));
+    for (int i = 0; i < if_num; ++i)
+    {
+        ptr = (struct usb_interface_desc *)(((uint64_t)ptr) + sizeof(struct usb_interface_desc) + sizeof(struct usb_endpoint_desc) * ptr->num_endpoints);
+    }
+    // 返回结果
+    *if_desc = ptr;
+
+    kdebug("get interface desc ok. interface_number=%d, num_endpoints=%d, class=%d, subclass=%d", ptr->interface_number, ptr->num_endpoints, ptr->interface_class, ptr->interface_sub_class);
+    return 0;
+}
+
+/**
+ * @brief 获取端点描述符
+ *
+ * @param if_desc 接口描述符
+ * @param ep_num 端点号
+ * @param ep_desc 返回的指向端点描述符的指针
+ * @return int 错误码
+ */
+static inline int xhci_get_endpoint_desc(const struct usb_interface_desc *if_desc, const uint8_t ep_num, struct usb_endpoint_desc **ep_desc)
+{
+    if (unlikely(if_desc == NULL || ep_desc == NULL))
+        return -EINVAL;
+    BUG_ON(ep_num >= if_desc->num_endpoints);
+
+    *ep_desc = (struct usb_endpoint_desc *)((uint64_t)(if_desc + 1) + ep_num * sizeof(struct usb_endpoint_desc));
+    kdebug("get endpoint desc: ep_addr=%d, max_packet=%d, attr=%#06x, interval=%d", (*ep_desc)->endpoint_addr, (*ep_desc)->max_packet, (*ep_desc)->attributes, (*ep_desc)->interval);
+    return 0;
+}
+
+/**
+ * @brief 初始化设备端口，并获取端口的描述信息
  *
  * @param id 主机控制器id
  * @param port_id 端口id
@@ -1248,15 +1337,8 @@ static int xhci_get_descriptor(const int id, const int port_id)
     int retval = 0;
     int count = 0;
 
-    uint32_t dword;
-    // 计算port register set相对于operational registers基地址的偏移量
-    uint32_t port_register_offset = XHCI_OPS_PRS + 16 * port_id;
-
-    // 读取指定端口的port sc寄存器
-    dword = xhci_read_op_reg32(id, port_register_offset + XHCI_PORT_PORTSC);
-
     // 读取端口速度。 full=1, low=2, high=3, super=4
-    uint32_t speed = ((dword >> 10) & 0xf);
+    uint32_t speed = xhci_get_port_speed(id, port_id);
 
     /*
      * Some devices will only send the first 8 bytes of the device descriptor
@@ -1373,7 +1455,13 @@ static int xhci_hc_start_ports(int id)
                 if (xhci_get_descriptor(id, i) == 0)
                 {
                     struct usb_config_desc conf_desc = {0};
+                    struct usb_interface_desc *if_desc = NULL;
+                    struct usb_endpoint_desc *ep_desc = NULL;
                     xhci_get_config_desc(id, i, &conf_desc);
+                    void *buf = kzalloc(conf_desc.total_len, 0);
+                    xhci_get_config_desc_full(id, i, &conf_desc, buf);
+                    xhci_get_interface_desc(buf, 0, &if_desc);
+                    xhci_get_endpoint_desc(if_desc, 0, &ep_desc);
                     ++cnt;
                 }
                 kdebug("usb3 port %d get desc ok", i);
@@ -1398,7 +1486,13 @@ static int xhci_hc_start_ports(int id)
                 if (xhci_get_descriptor(id, i) == 0)
                 {
                     struct usb_config_desc conf_desc = {0};
+                    struct usb_interface_desc *if_desc = NULL;
+                    struct usb_endpoint_desc *ep_desc = NULL;
                     xhci_get_config_desc(id, i, &conf_desc);
+                    void *buf = kzalloc(conf_desc.total_len, 0);
+                    xhci_get_config_desc_full(id, i, &conf_desc, buf);
+                    xhci_get_interface_desc(buf, 0, &if_desc);
+                    xhci_get_endpoint_desc(if_desc, 0, &ep_desc);
                     ++cnt;
                 }
                 kdebug("USB2 port %d get desc ok", i);

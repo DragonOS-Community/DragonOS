@@ -49,9 +49,6 @@
 
 #define xhci_is_aligned64(addr) (((addr)&0x3f) == 0) // 是否64bytes对齐
 
-// 获取端口速度
-#define xhci_get_port_speed(__id, __port_id) (xhci_read_op_reg32((__id), XHCI_OPS_PRS + 16 * (__port_id) + XHCI_PORT_PORTSC))
-
 /**
  * @brief 判断端口信息
  * @param cid 主机控制器id
@@ -63,6 +60,11 @@
 #define XHCI_PORT_IS_USB2_HSO(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_HSO) == XHCI_PROTOCOL_HSO)
 #define XHCI_PORT_HAS_PAIR(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_HAS_PAIR) == XHCI_PROTOCOL_HAS_PAIR)
 #define XHCI_PORT_IS_ACTIVE(cid, pid) ((xhci_hc[cid].ports[pid].flags & XHCI_PROTOCOL_ACTIVE) == XHCI_PROTOCOL_ACTIVE)
+
+#define XHCI_PORT_REGISTER_OFFSET(__port_id) (XHCI_OPS_PRS + 16 * (__port_id))
+
+// 获取端口速度 full=1, low=2, high=3, super=4
+#define xhci_get_port_speed(__id, __port_id) ((xhci_read_op_reg32((__id), XHCI_PORT_REGISTER_OFFSET(__port_id) + XHCI_PORT_PORTSC) >> 10) & 0xf)
 
 /**
  * @brief 设置link TRB的命令（dword3）

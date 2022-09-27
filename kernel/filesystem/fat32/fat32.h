@@ -167,11 +167,12 @@ typedef struct fat32_inode_info_t fat32_inode_info_t;
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统
  *
- * @param ahci_ctrl_num ahci控制器编号
- * @param ahci_port_num ahci控制器端口编号
+ * @param blk_dev 块设备结构体
+ * @param part_num 磁盘分区编号
+ *
  * @return struct vfs_super_block_t * 文件系统的超级块
  */
-struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t ahci_port_num, uint8_t part_num);
+struct vfs_superblock_t *fat32_register_partition(struct block_device *blk_dev, uint8_t part_num);
 
 /**
  * @brief 创建fat32文件系统的超级块
@@ -179,7 +180,7 @@ struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t
  * @param blk 块设备结构体
  * @return struct vfs_superblock_t* 创建好的超级块
  */
-struct vfs_superblock_t *fat32_read_superblock(struct block_device* blk);
+struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk);
 
 /**
  * @brief 创建新的文件

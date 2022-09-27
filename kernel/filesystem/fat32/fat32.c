@@ -18,17 +18,15 @@ extern struct blk_gendisk ahci_gendisk0;
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统
  *
- * @param ahci_ctrl_num ahci控制器编号
- * @param ahci_port_num ahci控制器端口编号
+ * @param blk_dev 块设备结构体
  * @param part_num 磁盘分区编号
  *
  * @return struct vfs_super_block_t * 文件系统的超级块
  */
-struct vfs_superblock_t *fat32_register_partition(uint8_t ahci_ctrl_num, uint8_t ahci_port_num, uint8_t part_num)
+struct vfs_superblock_t *fat32_register_partition(struct block_device *blk_dev, uint8_t part_num)
 {
-
     // 挂载文件系统到vfs
-    return vfs_mount_fs("/", "FAT32", (ahci_gendisk0.partition + 0));
+    return vfs_mount_fs("/", "FAT32", blk_dev);
 }
 
 /**
@@ -1259,6 +1257,6 @@ void fat32_init()
     vfs_register_filesystem(&fat32_fs_type);
 
     // 挂载根文件系统
-    fat32_register_partition(0, 0, 0);
+    fat32_register_partition(ahci_gendisk0.partition + 0, 0);
     kinfo("FAT32 initialized.");
 }

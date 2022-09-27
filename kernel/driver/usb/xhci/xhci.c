@@ -39,14 +39,14 @@ static int xhci_hc_init_intr(int id);
 static int xhci_hc_start_ports(int id);
 
 static int xhci_send_command(int id, struct xhci_TRB_t *trb, const bool do_ring);
-static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int port, const int speed, const int max_packet);
-static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const int slot_id, const int ep_num, const int max_packet, const int type, const int direction, const int speed, const int ep_interval);
+static uint64_t xhci_initialize_slot(const int id, const int port, const int speed, const int max_packet);
+static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const int port_id, const int ep_num, const int max_packet, const int type, const int direction, const int speed, const int ep_interval);
 static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int slot_id, const bool block);
-static int xhci_control_in(const int id, struct usb_request_packet_t *packet, void *target, const int slot_id, const int max_packet);
+static int xhci_control_in(const int id, struct usb_request_packet_t *packet, void *target, const int port_id, const int max_packet);
 static int xhci_control_out(const int id, struct usb_request_packet_t *packet, void *target, const int slot_id, const int max_packet);
-static int xhci_setup_stage(struct xhci_ep_ring_info_t *ep, const struct usb_request_packet_t *packet, const uint8_t direction);
-static int xhci_data_stage(struct xhci_ep_ring_info_t *ep, uint64_t buf_vaddr, uint8_t trb_type, const uint32_t size, uint8_t direction, const int max_packet, const uint64_t status_vaddr);
-static int xhci_status_stage(const int id, uint8_t direction, uint64_t status_buf_vaddr);
+static int xhci_setup_stage(struct xhci_ep_info_t *ep, const struct usb_request_packet_t *packet, const uint8_t direction);
+static int xhci_data_stage(struct xhci_ep_info_t *ep, uint64_t buf_vaddr, uint8_t trb_type, const uint32_t size, uint8_t direction, const int max_packet, const uint64_t status_vaddr);
+static int xhci_status_stage(struct xhci_ep_info_t *ep, uint8_t direction, uint64_t status_buf_vaddr);
 static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr);
 static inline int xhci_get_desc(const int id, const int port_id, void *target, const uint16_t desc_type, const uint8_t desc_index, const uint16_t lang_id, const uint16_t length);
 static int xhci_get_config_desc(const int id, const int port_id, struct usb_config_desc *conf_desc);
@@ -180,7 +180,7 @@ static __always_inline void __xhci_write_doorbell(const int id, const uint16_t s
  * @param ep_info 端点信息结构体
  * @param trb 待写入的trb
  */
-static __always_inline void __xhci_write_trb(struct xhci_ep_ring_info_t *ep_info, struct xhci_TRB_t *trb)
+static __always_inline void __xhci_write_trb(struct xhci_ep_info_t *ep_info, struct xhci_TRB_t *trb)
 {
     memcpy((void *)ep_info->current_ep_ring_vaddr, trb, sizeof(struct xhci_TRB_t));
 
@@ -846,20 +846,19 @@ static int xhci_reset_port(const int id, const int port)
  *   set the slot->hub, ->mtt, ->ttt, ->etc, items.
  *
  * @param id 控制器id
- * @param slot_id enable_slot命令分配的插槽id
  * @param port 端口号
  * @param speed 端口速度
  * @param max_packet 最大数据包大小
  * @return uint64_t 初始化好的设备上下文空间的虚拟地址
  */
-static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int port, const int speed, const int max_packet)
+static uint64_t xhci_initialize_slot(const int id, const int port, const int speed, const int max_packet)
 {
     // 为所有的endpoint分配上下文空间
     // todo: 按需分配上下文空间
     uint64_t device_context_vaddr = (uint64_t)kzalloc(xhci_hc[id].context_size * 32, 0);
     // kdebug("slot id=%d, device_context_vaddr=%#018lx, port=%d", slot_id, device_context_vaddr, port);
     // 写到数组中
-    __write8b(xhci_hc[id].dcbaap_vaddr + (slot_id * sizeof(uint64_t)), virt_2_phys(device_context_vaddr));
+    __write8b(xhci_hc[id].dcbaap_vaddr + (xhci_hc[id].ports[port].slot_id * sizeof(uint64_t)), virt_2_phys(device_context_vaddr));
     struct xhci_slot_context_t slot_ctx = {0};
     slot_ctx.entries = 1;
     slot_ctx.speed = speed;
@@ -874,7 +873,7 @@ static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int 
     __write_slot(device_context_vaddr, &slot_ctx);
 
     // 初始化控制端点
-    xhci_initialize_ep(id, device_context_vaddr, slot_id, XHCI_EP_CONTROL, max_packet, USB_EP_CONTROL, 0, speed, 0);
+    xhci_initialize_ep(id, device_context_vaddr, port, XHCI_EP_CONTROL, max_packet, USB_EP_CONTROL, 0, speed, 0);
 
     return device_context_vaddr;
 }
@@ -884,7 +883,7 @@ static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int 
  *
  * @param id 控制器id
  * @param slot_vaddr slot上下文的虚拟地址
- * @param slot_id 插槽id
+ * @param port_id 插槽id
  * @param ep_num 端点上下文在slot上下文区域内的编号
  * @param max_packet 最大数据包大小
  * @param type 端点类型
@@ -892,7 +891,7 @@ static uint64_t xhci_initialize_slot(const int id, const int slot_id, const int 
  * @param speed 传输速度
  * @param ep_interval 端点的连续请求间隔
  */
-static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const int slot_id, const int ep_num, const int max_packet, const int type, const int direction, const int speed, const int ep_interval)
+static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const int port_id, const int ep_num, const int max_packet, const int type, const int direction, const int speed, const int ep_interval)
 {
     // 由于目前只实现获取设备的描述符，因此暂时只支持control ep
     if (type != USB_EP_CONTROL)
@@ -900,13 +899,13 @@ static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const in
     struct xhci_ep_context_t ep_ctx = {0};
     memset(&ep_ctx, 0, sizeof(struct xhci_ep_context_t));
 
-    xhci_hc[id].control_ep_info.ep_ring_vbase = xhci_create_ring(XHCI_TRBS_PER_RING);
+    xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL].ep_ring_vbase = xhci_create_ring(XHCI_TRBS_PER_RING);
     // 申请ep的 transfer ring
-    ep_ctx.tr_dequeue_ptr = virt_2_phys(xhci_hc[id].control_ep_info.ep_ring_vbase);
+    ep_ctx.tr_dequeue_ptr = virt_2_phys(xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL].ep_ring_vbase);
     xhci_ep_set_dequeue_cycle_state(&ep_ctx, XHCI_TRB_CYCLE_ON);
 
-    xhci_hc[id].control_ep_info.current_ep_ring_vaddr = xhci_hc[id].control_ep_info.ep_ring_vbase;
-    xhci_hc[id].control_ep_info.current_ep_ring_cycle = xhci_ep_get_dequeue_cycle_state(&ep_ctx);
+    xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL].current_ep_ring_vaddr = xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL].ep_ring_vbase;
+    xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL].current_ep_ring_cycle = xhci_ep_get_dequeue_cycle_state(&ep_ctx);
     // kdebug("ep_ctx.tr_dequeue_ptr = %#018lx", ep_ctx.tr_dequeue_ptr);
     // kdebug("xhci_hc[id].control_ep_info.current_ep_ring_cycle  = %d", xhci_hc[id].control_ep_info.current_ep_ring_cycle);
 
@@ -997,7 +996,7 @@ failed:;
  * @param direction 传输的方向
  * @return int 产生的TRB数量
  */
-static int xhci_setup_stage(struct xhci_ep_ring_info_t *ep, const struct usb_request_packet_t *packet, const uint8_t direction)
+static int xhci_setup_stage(struct xhci_ep_info_t *ep, const struct usb_request_packet_t *packet, const uint8_t direction)
 {
     // kdebug("ep->current_ep_ring_cycle=%d", ep->current_ep_ring_cycle);
     struct xhci_TRB_setup_stage_t trb = {0};
@@ -1031,7 +1030,7 @@ static int xhci_setup_stage(struct xhci_ep_ring_info_t *ep, const struct usb_req
  * @param status_vaddr event data TRB的缓冲区（4字节，且地址按照16字节对齐）
  * @return int 产生的TRB数量
  */
-static int xhci_data_stage(struct xhci_ep_ring_info_t *ep, uint64_t buf_vaddr, uint8_t trb_type, const uint32_t size, uint8_t direction, const int max_packet, const uint64_t status_vaddr)
+static int xhci_data_stage(struct xhci_ep_info_t *ep, uint64_t buf_vaddr, uint8_t trb_type, const uint32_t size, uint8_t direction, const int max_packet, const uint64_t status_vaddr)
 {
     if (size == 0)
         return 0;
@@ -1082,26 +1081,26 @@ static int xhci_data_stage(struct xhci_ep_ring_info_t *ep, uint64_t buf_vaddr, u
 /**
  * @brief 填写xhci status stage TRB到control ep的transfer ring
  *
- * @param id 主机控制器id
+ * @param ep 端点信息结构体
  * @param direction 方向：（h2d:0, d2h:1）
  * @param status_buf_vaddr
  * @return int 创建的TRB数量
  */
-static int xhci_status_stage(const int id, uint8_t direction, uint64_t status_buf_vaddr)
+static int xhci_status_stage(struct xhci_ep_info_t *ep, uint8_t direction, uint64_t status_buf_vaddr)
 {
     // kdebug("write status stage trb");
-    
+
     {
         struct xhci_TRB_status_stage_t trb = {0};
 
         // 写入status stage trb
         trb.intr_target = 0;
-        trb.cycle = xhci_hc[id].control_ep_info.current_ep_ring_cycle;
+        trb.cycle = ep->current_ep_ring_cycle;
         trb.ent = 0;
         trb.ioc = 1;
         trb.TRB_type = TRB_TYPE_STATUS_STAGE;
         trb.dir = direction;
-        __xhci_write_trb(&xhci_hc[id].control_ep_info, (struct xhci_TRB_t *)&trb);
+        __xhci_write_trb(ep, (struct xhci_TRB_t *)&trb);
     }
 
     {
@@ -1112,9 +1111,9 @@ static int xhci_status_stage(const int id, uint8_t direction, uint64_t status_bu
         trb.TRB_type = TRB_TYPE_EVENT_DATA;
         trb.ioc = 1;
 
-        trb.cycle = xhci_hc[id].control_ep_info.current_ep_ring_cycle;
+        trb.cycle = ep->current_ep_ring_cycle;
 
-        __xhci_write_trb(&xhci_hc[id].control_ep_info, (struct xhci_TRB_t *)&trb);
+        __xhci_write_trb(ep, (struct xhci_TRB_t *)&trb);
     }
 
     return 2;
@@ -1165,11 +1164,11 @@ static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr)
  * @param id 主机控制器id
  * @param packet usb数据包
  * @param target 读取到的信息存放到的位置
- * @param slot_id 插槽id
+ * @param port_id 端口id
  * @param max_packet 最大数据包大小
  * @return int 读取到的数据的大小
  */
-static int xhci_control_in(const int id, struct usb_request_packet_t *packet, void *target, const int slot_id, const int max_packet)
+static int xhci_control_in(const int id, struct usb_request_packet_t *packet, void *target, const int port_id, const int max_packet)
 {
 
     uint64_t status_buf_vaddr = (uint64_t)kzalloc(16, 0); // 本来是要申请4bytes的buffer的，但是因为xhci控制器需要16bytes对齐，因此申请16bytes
@@ -1177,11 +1176,11 @@ static int xhci_control_in(const int id, struct usb_request_packet_t *packet, vo
     int retval = 0;
 
     // 往control ep写入一个setup stage trb
-    xhci_setup_stage(&xhci_hc[id].control_ep_info, packet, XHCI_DIR_IN);
+    xhci_setup_stage(&xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL], packet, XHCI_DIR_IN);
     if (packet->length)
     {
         data_buf_vaddr = (uint64_t)kzalloc(packet->length, 0);
-        xhci_data_stage(&xhci_hc[id].control_ep_info, data_buf_vaddr, TRB_TYPE_DATA_STAGE, packet->length, XHCI_DIR_IN_BIT, max_packet, status_buf_vaddr);
+        xhci_data_stage(&xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL], data_buf_vaddr, TRB_TYPE_DATA_STAGE, packet->length, XHCI_DIR_IN_BIT, max_packet, status_buf_vaddr);
     }
 
 /*
@@ -1198,15 +1197,15 @@ static int xhci_control_in(const int id, struct usb_request_packet_t *packet, vo
 #ifndef __QEMU_EMULATION__
     // 如果不是qemu虚拟机，则可以直接发起传输
     // kdebug(" not qemu");
-    __xhci_write_doorbell(id, slot_id, XHCI_EP_CONTROL);
+    __xhci_write_doorbell(id, xhci_hc[id].ports[port_id].slot_id, XHCI_EP_CONTROL);
     retval = xhci_wait_for_interrupt(id, status_buf_vaddr);
     if (unlikely(retval != 0))
         goto failed;
 #endif
     memset((void *)status_buf_vaddr, 0, 16);
-    xhci_status_stage(id, XHCI_DIR_OUT_BIT, status_buf_vaddr);
+    xhci_status_stage(&xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL], XHCI_DIR_OUT_BIT, status_buf_vaddr);
 
-    __xhci_write_doorbell(id, slot_id, XHCI_EP_CONTROL);
+    __xhci_write_doorbell(id, xhci_hc[id].ports[port_id].slot_id, XHCI_EP_CONTROL);
 
     retval = xhci_wait_for_interrupt(id, status_buf_vaddr);
 
@@ -1236,37 +1235,37 @@ done:;
  * @param id 主机控制器id
  * @param packet usb数据包
  * @param target 返回的数据存放的位置
- * @param slot_id 插槽id
+ * @param port_id 端口id
  * @param max_packet 最大数据包大小
  * @return int 读取到的数据的大小
  */
-static int xhci_control_out(const int id, struct usb_request_packet_t *packet, void *target, const int slot_id, const int max_packet)
+static int xhci_control_out(const int id, struct usb_request_packet_t *packet, void *target, const int port_id, const int max_packet)
 {
     uint64_t status_buf_vaddr = (uint64_t)kzalloc(16, 0);
     uint64_t data_buf_vaddr = 0;
     int retval = 0;
 
     // 往control ep写入一个setup stage trb
-    xhci_setup_stage(&xhci_hc[id].control_ep_info, packet, XHCI_DIR_OUT);
+    xhci_setup_stage(&xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL], packet, XHCI_DIR_OUT);
 
     if (packet->length)
     {
         data_buf_vaddr = (uint64_t)kzalloc(packet->length, 0);
-        xhci_data_stage(&xhci_hc[id].control_ep_info, data_buf_vaddr, TRB_TYPE_DATA_STAGE, packet->length, XHCI_DIR_OUT_BIT, max_packet, status_buf_vaddr);
+        xhci_data_stage(&xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL], data_buf_vaddr, TRB_TYPE_DATA_STAGE, packet->length, XHCI_DIR_OUT_BIT, max_packet, status_buf_vaddr);
     }
 
 #ifndef __QEMU_EMULATION__
     // 如果不是qemu虚拟机，则可以直接发起传输
-    __xhci_write_doorbell(id, slot_id, XHCI_EP_CONTROL);
+    __xhci_write_doorbell(id, xhci_hc[id].ports[port_id].slot_id, XHCI_EP_CONTROL);
     retval = xhci_wait_for_interrupt(id, status_buf_vaddr);
     if (unlikely(retval != 0))
         goto failed;
 #endif
 
     memset((void *)status_buf_vaddr, 0, 16);
-    xhci_status_stage(id, XHCI_DIR_IN_BIT, status_buf_vaddr);
+    xhci_status_stage(&xhci_hc[id].ports[port_id].ep_info[XHCI_EP_CONTROL], XHCI_DIR_IN_BIT, status_buf_vaddr);
 
-    __xhci_write_doorbell(id, slot_id, XHCI_EP_CONTROL);
+    __xhci_write_doorbell(id, xhci_hc[id].ports[port_id].slot_id, XHCI_EP_CONTROL);
 #ifndef __QEMU_EMULATION__
     // qemu对于这个操作的处理有问题，status_buf并不会被修改。而真机不存在该问题
     retval = xhci_wait_for_interrupt(id, status_buf_vaddr);
@@ -1313,7 +1312,7 @@ static inline int xhci_get_desc(const int id, const int port_id, void *target, c
     if (unlikely(dev_desc == NULL))
         return -EINVAL;
     DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (desc_type << 8) | desc_index, lang_id, length);
-    count = xhci_control_in(id, &ctrl_in_packet, target, xhci_hc[id].ports[port_id].slot_id, dev_desc->max_packet_size);
+    count = xhci_control_in(id, &ctrl_in_packet, target, port_id, dev_desc->max_packet_size);
     if (unlikely(count == 0))
         return -EAGAIN;
     return 0;
@@ -1330,7 +1329,7 @@ static inline int xhci_set_configuration(const int id, const int port_id, const 
         return -EINVAL;
     DECLARE_USB_PACKET(ctrl_out_packet, USB_REQ_TYPE_SET_REQUEST, USB_REQ_SET_CONFIGURATION, conf_value & 0xff, 0, 0);
     kdebug("set conf: to control out");
-    count = xhci_control_out(id, &ctrl_out_packet, NULL, xhci_hc[id].ports[port_id].slot_id, dev_desc->max_packet_size);
+    count = xhci_control_out(id, &ctrl_out_packet, NULL, port_id, dev_desc->max_packet_size);
     kdebug("set conf: count=%d", count);
     return 0;
 }
@@ -1477,7 +1476,7 @@ static int xhci_get_descriptor(const int id, const int port_id, struct usb_devic
     xhci_hc[id].ports[port_id].slot_id = slot_id;
     // kdebug("speed=%d", speed);
     // 初始化接口的上下文
-    uint64_t slot_vaddr = xhci_initialize_slot(id, slot_id, port_id, speed, max_packet);
+    uint64_t slot_vaddr = xhci_initialize_slot(id, port_id, speed, max_packet);
 
     // kdebug("set addr again");
     // 再次发送 set_address命令
@@ -1488,7 +1487,7 @@ static int xhci_get_descriptor(const int id, const int port_id, struct usb_devic
 
     memset(dev_desc, 0, sizeof(struct usb_device_desc));
     DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (USB_DT_DEVICE << 8), 0, 18);
-    count = xhci_control_in(id, &ctrl_in_packet, dev_desc, slot_id, max_packet);
+    count = xhci_control_in(id, &ctrl_in_packet, dev_desc, port_id, max_packet);
     if (unlikely(count == 0))
         return -EAGAIN;
     /*
@@ -1589,6 +1588,29 @@ static int xhci_hc_start_ports(int id)
 }
 
 /**
+ * @brief 发送HID设备的IDLE数据包
+ *
+ * @param id 主机控制器号
+ * @param port_id 端口号
+ * @param if_desc 接口结构体
+ * @return int
+ */
+static int xhci_hid_set_idle(const int id, const int port_id, struct usb_interface_desc *if_desc)
+{
+    struct usb_device_desc *dev_desc = xhci_hc[id].ports[port_id].dev_desc;
+    if (unlikely(dev_desc) == NULL)
+    {
+        BUG_ON(1);
+        return -EINVAL;
+    }
+
+    DECLARE_USB_PACKET(ctrl_out_packet, USB_REQ_TYPE_SET_CLASS_INTERFACE, 0x0a, 0, 0, 0);
+    xhci_control_out(id, &ctrl_out_packet, NULL, port_id, dev_desc->max_packet_size);
+    kdebug("xhci set idle done!");
+    return 0;
+}
+
+/**
  * @brief 配置连接在指定端口上的设备
  *
  * @param id 主机控制器id
@@ -1611,11 +1633,21 @@ static int xhci_configure_port(const int id, const int port_id)
     }
 
     xhci_get_interface_desc(full_conf, 0, &if_desc);
-    xhci_get_endpoint_desc(if_desc, 0, &ep_desc);
-    kdebug("to set conf");
-    xhci_set_configuration(id, port_id, ((struct usb_config_desc *)full_conf)->value);
-    kdebug("set conf ok");
+    if (if_desc->interface_class == USB_CLASS_HID)
+    {
+
+        xhci_get_endpoint_desc(if_desc, 0, &ep_desc);
+
+        kdebug("to set conf");
+        xhci_set_configuration(id, port_id, ((struct usb_config_desc *)full_conf)->value);
+        kdebug("set conf ok");
+
+        // todo: configure endpoint
+
+        xhci_hid_set_idle(id, port_id, if_desc);
+    }
     kfree(full_conf);
+    return 0;
 }
 /**
  * @brief 初始化xhci主机控制器的中断控制

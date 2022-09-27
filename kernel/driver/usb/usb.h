@@ -21,16 +21,16 @@
 
 /**
  * @brief usb描述符的头部
- * 
- * String Descriptor: 
- * String Language Descriptor: 
+ *
+ * String Descriptor:
+ * String Language Descriptor:
  *      先获取头部，然后根据长度申请空间，再获取整个string desc
  */
 struct usb_desc_header
 {
-    uint8_t len;    // 整个描述符的大小（字节）
+    uint8_t len; // 整个描述符的大小（字节）
     uint8_t type;
-}__attribute__((packed));
+} __attribute__((packed));
 
 /**
  * @brief usb 设备描述符
@@ -54,7 +54,7 @@ struct usb_device_desc
 
     uint8_t serial_index;
     uint8_t config; // number of configurations
-}__attribute__((packed));
+} __attribute__((packed));
 
 /**
  * @brief usb设备配置信息描述符
@@ -90,7 +90,7 @@ struct usb_config_desc
                                 当设备是在High-speed时，这里的单位是2mA （也就是说，值为50，代表最大消耗100mA的电流）
                                 当设备运行在Gen X speed时，这里的单位是8mA
                             */
-}__attribute__((packed));
+} __attribute__((packed));
 
 /**
  * @brief usb接口描述符
@@ -107,24 +107,24 @@ struct usb_interface_desc
     uint8_t interface_sub_class; // Sub class code
     uint8_t interface_protocol;  // 协议  These codes are qualified by the value of thebInterfaceClass and the bInterfaceSubClass fields.
     uint8_t index;               // index of String Descriptor describing this interface
-}__attribute__((packed));
+} __attribute__((packed));
 
 /**
  * @brief usb端点描述符
- * 
+ *
  * 详见usb3.2 Specification Table 9-26
  */
 struct usb_endpoint_desc
 {
     uint8_t len;
     uint8_t type;
-    uint8_t endpoint_addr;  /*  Bit 3...0: The endpoint number
-                                Bit 6...4: Reserved, reset to zero
-                                Bit 7: Direction, ignored for
-                                control endpoints
-                                0 = OUT endpoint
-                                1 = IN endpoint
-                                */
+    uint8_t endpoint_addr; /*  Bit 3...0: The endpoint number
+                               Bit 6...4: Reserved, reset to zero
+                               Bit 7: Direction, ignored for
+                               control endpoints
+                               0 = OUT endpoint
+                               1 = IN endpoint
+                               */
     uint8_t attributes;
     uint16_t max_packet;
     uint8_t interval;
@@ -142,7 +142,7 @@ struct usb_request_packet_t
 
     uint16_t index;
     uint16_t length;
-}__attribute__((packed));
+} __attribute__((packed));
 // usb设备请求包的request_type字段的值
 #define __USB_REQ_TYPE_H2D 0x00
 #define __USB_REQ_TYPE_D2H 0x80
@@ -160,6 +160,7 @@ struct usb_request_packet_t
 #define USB_REQ_TYPE_GET_REQUEST (__USB_REQ_TYPE_D2H | __USB_REQ_TYPE_STANDARD | __USB_REQ_TYPE_DEVICE)
 #define USB_REQ_TYPE_SET_REQUEST (__USB_REQ_TYPE_H2D | __USB_REQ_TYPE_STANDARD | __USB_REQ_TYPE_DEVICE)
 #define USB_REQ_TYPE_SET_INTERFACE (__USB_REQ_TYPE_H2D | __USB_REQ_TYPE_STANDARD | __USB_REQ_TYPE_INTERFACE)
+#define USB_REQ_TYPE_SET_CLASS_INTERFACE (__USB_REQ_TYPE_H2D | __USB_REQ_TYPE_CLASS | __USB_REQ_TYPE_INTERFACE)
 
 // device requests
 enum
@@ -248,7 +249,37 @@ enum
     pak_name.index = (_trans_index);                                                                                \
     pak_name.length = (_transfer_length);
 
-// #define DECLARE_USB_PACKET_NAME(name) struct usb_request_packet_t name = {0}
+/*
+    usb class codes
+    refs: https://www.usb.org/defined-class-codes
+*/
+enum
+{
+    USB_CLASS_IF = 0x00,
+    USB_CLASS_AUDIO,
+    USB_CLASS_CDC,
+    USB_CLASS_HID,
+    USB_CLASS_PHYSICAL = 0x05,
+    USB_CLASS_IMAGE,
+    USB_CLASS_PRINTER,
+    USB_CLASS_MASS_STORAGE,
+    USB_CLASS_HUB,
+    USB_CLASS_CDC_DATA,
+    USB_CLASS_SMART_CARD,
+    USB_CLASS_CONTENT_SEC = 0x0d,
+    USB_CLASS_VIDEO,
+    USB_CLASS_PERSONAL_HEALTHCARE = 0x0f,
+    USB_CLASS_AV,
+    USB_CLASS_BILLBOARD,
+    USB_CLASS_TYPEC_BRIDGE,
+    USB_CLASS_I3C = 0x3c,
+    USB_CLASS_DIAGNOSTIC = 0xdc,
+    USB_CLASS_WIRELESS_CTRL = 0xe0,
+    USB_CLASS_MISC = 0xef,
+    USB_CLASS_APP_SPEC = 0xfe,
+    USB_CLASS_VENDOR_SPEC = 0XFF,
+};
+
 /**
  * @brief 初始化usb驱动程序
  *

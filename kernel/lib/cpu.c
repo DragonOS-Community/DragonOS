@@ -1,6 +1,6 @@
-#include "cpu.h"
-#include "kprint.h"
-#include "printk.h"
+#include <common/cpu.h>
+#include <common/kprint.h>
+#include <common/printk.h>
 // #pragma GCC optimize("O0")
 // cpu支持的最大cpuid指令的基础主功能号
 uint Cpu_cpuid_max_Basic_mop;

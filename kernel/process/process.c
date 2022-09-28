@@ -5,7 +5,7 @@
 #include <common/stdio.h>
 #include <common/string.h>
 #include <common/compiler.h>
-#include <common/libELF/elf.h>
+#include <common/elf.h>
 #include <common/time.h>
 #include <common/sys/wait.h>
 #include <driver/video/video.h>

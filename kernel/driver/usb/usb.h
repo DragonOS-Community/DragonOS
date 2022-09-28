@@ -117,7 +117,7 @@ struct usb_interface_desc
 struct usb_endpoint_desc
 {
     uint8_t len;
-    uint8_t type;
+    uint8_t type;          // descriptor type
     uint8_t endpoint_addr; /*  Bit 3...0: The endpoint number
                                Bit 6...4: Reserved, reset to zero
                                Bit 7: Direction, ignored for
@@ -129,6 +129,9 @@ struct usb_endpoint_desc
     uint16_t max_packet;
     uint8_t interval;
 };
+
+// 从endpoint描述符中获取max burst size大小
+#define usb_get_max_burst_from_ep(__ep_desc) (((__ep_desc)->max_packet & 0x1800) >> 11)
 
 /**
  * @brief usb设备请求包

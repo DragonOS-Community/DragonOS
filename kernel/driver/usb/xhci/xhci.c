@@ -1514,6 +1514,7 @@ static int xhci_get_descriptor(const int id, const int port_id, struct usb_devic
     // 初始化接口的上下文
     uint64_t slot_vaddr = xhci_initialize_slot(id, port_id, speed, max_packet);
 
+    retval = xhci_set_address(id, slot_vaddr, slot_id, true);
     // kdebug("set addr again");
     // 再次发送 set_address命令
     // kdebug("to set addr again");
@@ -1664,7 +1665,7 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
     
     xhci_initialize_ep(id, slot_context_vaddr, port_id, ep_num, xhci_hc[id].ports[port_id].dev_desc->max_packet_size,
                        usb_get_max_burst_from_ep(ep_desc), ep_type, (ep_num % 2) ? XHCI_DIR_IN_BIT : XHCI_DIR_OUT_BIT,
-                       xhci_get_port_speed(id, port_id), 24);
+                       xhci_get_port_speed(id, port_id), ep_desc->interval);
 
     struct xhci_slot_context_t slot;
     struct xhci_ep_context_t ep={0};
@@ -1672,8 +1673,9 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
     uint64_t input_ctx_buffer = (uint64_t)kzalloc(xhci_hc[id].context_size * 33, 0);
     // 置位对应的add bit
     __write4b(input_ctx_buffer + 4, 1 << ep_num);
+    __write4b(input_ctx_buffer + 0x1c, 1);
 
-    // // 拷贝slot上下文和control ep
+    // 拷贝slot上下文和control ep
     // __read_from_slot(&slot, slot_context_vaddr);
     // __read_from_ep(id, slot_context_vaddr, 1, &ep);
     // ep.err_cnt = 3;
@@ -1693,6 +1695,7 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
     trb.TRB_type = TRB_TYPE_CONFIG_EP;
     trb.cycle = xhci_hc[id].cmd_trb_cycle;
     trb.Reserved |= (((uint16_t)xhci_hc[id].ports[port_id].slot_id) << 8) & 0xffff;
+
     kdebug("addr=%#018lx", ((struct xhci_TRB_t *)&trb)->param);
     kdebug("status=%#018lx", ((struct xhci_TRB_t *)&trb)->status);
     kdebug("command=%#018lx", ((struct xhci_TRB_t *)&trb)->command);
@@ -1747,12 +1750,12 @@ static int xhci_configure_port(const int id, const int port_id)
 
         xhci_get_endpoint_desc(if_desc, 0, &ep_desc);
 
-        kdebug("to set conf");
+        kdebug("to set conf, val=%#010lx", ((struct usb_config_desc *)full_conf)->value);
         xhci_set_configuration(id, port_id, ((struct usb_config_desc *)full_conf)->value);
         kdebug("set conf ok");
 
         // todo: configure endpoint
-        xhci_configure_endpoint(id, port_id, XHCI_EP1_IN, USB_EP_INTERRUPT, ep_desc);
+        xhci_configure_endpoint(id, port_id, ep_desc->endpoint_addr, USB_EP_INTERRUPT, ep_desc);
         // xhci_configure_endpoint(id, port_id, XHCI_EP1_OUT, USB_EP_INTERRUPT, ep_desc);
         xhci_hid_set_idle(id, port_id, if_desc);
     }

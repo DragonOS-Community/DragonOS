@@ -169,14 +169,13 @@ if [ $flag_can_run -eq 1 ]; then
     else
         qemu-system-x86_64 -d bin/disk.img -m 512M -smp 2,cores=2,threads=1,sockets=1 \
         -boot order=d   \
-        -monitor stdio -d ${qemu_trace_std},${qemu_trace_usb} \
+        -monitor stdio -d ${qemu_trace_std} \
         -s -S -cpu IvyBridge,apic,x2apic,+fpu,check,${allflags} -rtc clock=host,base=localtime -serial file:serial_opt.txt \
         -drive id=disk,file=bin/disk.img,if=none \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0    \
         -usb    \
         -device qemu-xhci,id=xhci,p2=8,p3=4 \
-        -device usb-kbd \
         -machine accel=${qemu_accel}
     fi
 else

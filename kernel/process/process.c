@@ -486,7 +486,8 @@ ul initial_kernel_thread(ul arg)
     rootfs_umount();
 
     // 使用单独的内核线程来初始化usb驱动程序
-    int usb_pid = kernel_thread(usb_init, 0, 0);
+    // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
+    // int usb_pid = kernel_thread(usb_init, 0, 0);
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
 
@@ -495,7 +496,7 @@ ul initial_kernel_thread(ul arg)
         ktest_start(ktest_test_bitree, 0),
         ktest_start(ktest_test_kfifo, 0),
         ktest_start(ktest_test_mutex, 0),
-        usb_pid,
+        // usb_pid,
     };
     kinfo("Waiting test thread exit...");
     // 等待测试进程退出

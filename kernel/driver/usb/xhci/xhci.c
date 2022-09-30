@@ -643,7 +643,7 @@ void xhci_hc_irq_uninstall(uint64_t irq_num)
  */
 void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
 {
-    kdebug("USB irq received.");
+    // kdebug("USB irq received.");
     /*
         写入usb status寄存器，以表明当前收到了中断,清除usb status寄存器中的EINT位
         需要先清除这个位，再清除interrupter中的pending bit）
@@ -656,7 +656,7 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
 
     if (((iman0 & 3) == 3) || (dequeue_reg & 8)) // 中断被启用，且pending不为0
     {
-        kdebug("to handle");
+        // kdebug("to handle");
         // 写入1以清除该interrupter的pending bit
         xhci_write_intr_reg32(cid, 0, XHCI_IR_MAN, iman0 | 3);
         io_mfence();
@@ -668,7 +668,7 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
 
         {
             struct xhci_TRB_cmd_complete_t *event_trb_ptr = (struct xhci_TRB_cmd_complete_t *)&event_trb;
-            kdebug("TRB_type=%d, comp_code=%d", event_trb_ptr->TRB_type, event_trb_ptr->code);
+            // kdebug("TRB_type=%d, comp_code=%d", event_trb_ptr->TRB_type, event_trb_ptr->code);
         }
         while ((event_trb.command & 1) == xhci_hc[cid].current_event_ring_cycle) // 循环处理处于当前周期的所有event ring
         {
@@ -707,7 +707,7 @@ void xhci_hc_irq_handler(uint64_t irq_num, uint64_t cid, struct pt_regs *regs)
                         origin_trb.status |= XHCI_IRQ_DONE;
                         // 将command trb写入到表中
                         xhci_set_trb(&origin_trb, origin_vaddr);
-                        kdebug("set origin:%#018lx", origin_vaddr);
+                        // kdebug("set origin:%#018lx", origin_vaddr);
                         break;
                     }
                     break;
@@ -1683,10 +1683,10 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
     __write_slot(input_ctx_buffer + xhci_hc[id].context_size, &slot);
 
     // __write_ep(id, input_ctx_buffer, 2, &ep);
-    kdebug("ep_num=%d", ep_num);
+    // kdebug("ep_num=%d", ep_num);
     // 拷贝将要被配置的端点的信息
     __read_from_ep(id, slot_context_vaddr, ep_num, &ep);
-    kdebug("ep.tr_dequeue_ptr=%#018lx", ep.tr_dequeue_ptr);
+    // kdebug("ep.tr_dequeue_ptr=%#018lx", ep.tr_dequeue_ptr);
     ep.err_cnt = 3;
     // 加一是因为input_context头部比slot_context多了一个input_control_ctx
     __write_ep(id, input_ctx_buffer, ep_num + 1, &ep);
@@ -1697,9 +1697,9 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
     trb.cycle = xhci_hc[id].cmd_trb_cycle;
     trb.Reserved |= (((uint16_t)xhci_hc[id].ports[port_id].slot_id) << 8) & 0xffff;
 
-    kdebug("addr=%#018lx", ((struct xhci_TRB_t *)&trb)->param);
-    kdebug("status=%#018lx", ((struct xhci_TRB_t *)&trb)->status);
-    kdebug("command=%#018lx", ((struct xhci_TRB_t *)&trb)->command);
+    // kdebug("addr=%#018lx", ((struct xhci_TRB_t *)&trb)->param);
+    // kdebug("status=%#018lx", ((struct xhci_TRB_t *)&trb)->status);
+    // kdebug("command=%#018lx", ((struct xhci_TRB_t *)&trb)->command);
     retval = xhci_send_command(id, (struct xhci_TRB_t *)&trb, true);
 
     if (unlikely(retval != 0))
@@ -1748,17 +1748,23 @@ static int xhci_configure_port(const int id, const int port_id)
     xhci_get_interface_desc(full_conf, 0, &if_desc);
     if (if_desc->interface_class == USB_CLASS_HID)
     {
+        // 由于暂时只支持键盘，因此把键盘的驱动也写在这里
+        // todo: 分离usb键盘驱动
 
         xhci_get_endpoint_desc(if_desc, 0, &ep_desc);
 
-        kdebug("to set conf, val=%#010lx", ((struct usb_config_desc *)full_conf)->value);
+        // kdebug("to set conf, val=%#010lx", ((struct usb_config_desc *)full_conf)->value);
         xhci_set_configuration(id, port_id, ((struct usb_config_desc *)full_conf)->value);
-        kdebug("set conf ok");
+        // kdebug("set conf ok");
 
         // todo: configure endpoint
         xhci_configure_endpoint(id, port_id, ep_desc->endpoint_addr, USB_EP_INTERRUPT, ep_desc);
-        // xhci_configure_endpoint(id, port_id, XHCI_EP1_OUT, USB_EP_INTERRUPT, ep_desc);
+        
         xhci_hid_set_idle(id, port_id, if_desc);
+        
+        // 获取report desc
+        // todo: parse hid report
+
     }
     kfree(full_conf);
     return 0;

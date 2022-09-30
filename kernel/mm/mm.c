@@ -248,6 +248,8 @@ void mm_init()
 
     initial_mm.stack_start = _stack_start;
     initial_mm.vmas = NULL;
+
+    
     
     mmio_init();
 }
@@ -489,8 +491,30 @@ void page_table_init()
         }
     }
 
-    flush_tlb();
+    
+    barrier();
+        // ========= 在IDLE进程的顶层页表中添加对内核地址空间的映射 =====================
 
+    // 由于IDLE进程的顶层页表的高地址部分会被后续进程所复制，为了使所有进程能够共享相同的内核空间，
+    //  因此需要先在IDLE进程的顶层页表内映射二级页表
+
+    uint64_t *idle_pml4t_vaddr = (uint64_t *)phys_2_virt((uint64_t)get_CR3() & (~0xfffUL));
+
+    for (int i = 256; i < 512; ++i)
+    {
+        uint64_t *tmp = idle_pml4t_vaddr + i;
+        barrier();
+        if (*tmp == 0)
+        {
+            void *pdpt = kmalloc(PAGE_4K_SIZE, 0);
+            barrier();
+            memset(pdpt, 0, PAGE_4K_SIZE);
+            barrier();
+            set_pml4t(tmp, mk_pml4t(virt_2_phys(pdpt), PAGE_KERNEL_PGT));
+        }
+    }
+    barrier();
+    flush_tlb();
     kinfo("Page table Initialized. Affects:%d", js);
 }
 

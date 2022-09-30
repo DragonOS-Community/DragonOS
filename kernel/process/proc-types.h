@@ -58,6 +58,7 @@ struct thread_struct
 #define PF_NEED_SCHED (1UL << 1) // 进程需要被调度
 #define PF_VFORK (1UL << 2)		 // 标志进程是否由于vfork而存在资源共享
 #define PF_KFORK (1UL << 3)		 // 标志在内核态下调用fork（临时标记，do_fork()结束后会将其复位）
+#define PF_NOFREEZE (1UL << 4)	 // 当前进程不能被冻结
 
 /**
  * @brief 进程控制块
@@ -101,6 +102,9 @@ struct process_control_block
 
 	int32_t exit_code;						// 进程退出时的返回码
 	wait_queue_node_t wait_child_proc_exit; // 子进程退出等待队列
+
+	/* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
+	void *worker_private;
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

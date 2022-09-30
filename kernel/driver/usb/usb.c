@@ -18,7 +18,7 @@ static int usb_pdevs_count = 0;
  * @brief 初始化usb驱动程序
  *
  */
-int usb_init()
+int usb_init(void* unused)
 {
     kinfo("Initializing usb driver...");
     spin_init(&xhci_controller_init_lock);

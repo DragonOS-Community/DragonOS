@@ -1,9 +1,9 @@
 #pragma once
 #include <common/sys/types.h>
 
-uint64_t ktest_test_bitree(uint64_t arg);
-uint64_t ktest_test_kfifo(uint64_t arg);
-uint64_t ktest_test_mutex(uint64_t arg);
+int ktest_test_bitree(void* arg);
+int ktest_test_kfifo(void* arg);
+int ktest_test_mutex(void* arg);
 
 /**
  * @brief 开启一个新的内核线程以进行测试
@@ -12,4 +12,4 @@ uint64_t ktest_test_mutex(uint64_t arg);
  * @param arg 传递给测试函数的参数
  * @return pid_t 测试内核线程的pid
  */
-pid_t ktest_start(uint64_t (*func)(uint64_t arg), uint64_t arg);
+pid_t ktest_start(int (*func)(void* arg), void* arg);

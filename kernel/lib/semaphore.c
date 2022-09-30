@@ -1,4 +1,4 @@
-#include "semaphore.h"
+#include <common/semaphore.h>
 #include <sched/sched.h>
 #include <process/process.h>
 

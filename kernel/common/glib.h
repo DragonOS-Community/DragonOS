@@ -11,29 +11,13 @@
 #include <common/stddef.h>
 #include <arch/arch.h>
 #include <common/compiler.h>
+#include <common/list.h>
 
-#define sti() __asm__ __volatile__("sti\n\t" :: \
-                                       : "memory") //开启外部中断
-#define cli() __asm__ __volatile__("cli\n\t" :: \
-                                       : "memory") //关闭外部中断
-#define nop() __asm__ __volatile__("nop\n\t")
-#define hlt() __asm__ __volatile__("hlt\n\t")
-#define pause() asm volatile("pause\n\t"); // 处理器等待一段时间
-
-//内存屏障
-#define io_mfence() __asm__ __volatile__("mfence\n\t" :: \
-                                             : "memory") // 在mfence指令前的读写操作必须在mfence指令后的读写操作前完成。
-#define io_sfence() __asm__ __volatile__("sfence\n\t" :: \
-                                             : "memory") // 在sfence指令前的写操作必须在sfence指令后的写操作前完成
-#define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
-                                             : "memory") // 在lfence指令前的读操作必须在lfence指令后的读操作前完成。
-
-#define rdtsc() ({                                    \
-    uint64_t tmp1 = 0, tmp2 = 0;                      \
-    asm volatile("rdtsc"                              \
-                 : "=d"(tmp1), "=a"(tmp2)::"memory"); \
-    (tmp1 << 32 | tmp2);                              \
-})
+#if ARCH(I386) || ARCH(X86_64)
+#include <arch/x86_64/asm.h>
+#else
+#error Arch not supported.
+#endif
 
 /**
  * @brief 根据结构体变量内某个成员变量member的基地址，计算出该结构体变量的基地址
@@ -83,121 +67,7 @@ static __always_inline ul ALIGN(const ul addr, const ul _align)
     return (ul)((addr + _align - 1) & (~(_align - 1)));
 }
 
-//链表数据结构
-struct List
-{
-    struct List *prev, *next;
-};
 
-//初始化循环链表
-static inline void list_init(struct List *list)
-{
-    list->next = list;
-    io_mfence();
-    list->prev = list;
-}
-
-/**
- * @brief
-
- * @param entry 给定的节点
- * @param node 待插入的节点
- **/
-static inline void list_add(struct List *entry, struct List *node)
-{
-
-    node->next = entry->next;
-    barrier();
-    node->prev = entry;
-    barrier();
-    node->next->prev = node;
-    barrier();
-    entry->next = node;
-}
-
-/**
- * @brief 将node添加到给定的list的结尾(也就是当前节点的前面)
- * @param entry 列表的入口
- * @param node 待添加的节点
- */
-static inline void list_append(struct List *entry, struct List *node)
-{
-
-    struct List *tail = entry->prev;
-    list_add(tail, node);
-}
-
-/**
- * @brief 从列表中删除节点
- * @param entry 待删除的节点
- */
-static inline void list_del(struct List *entry)
-{
-
-    entry->next->prev = entry->prev;
-    entry->prev->next = entry->next;
-}
-
-/**
- * @brief 将新的链表结点替换掉旧的链表结点，并使得旧的结点的前后指针均为NULL
- * 
- * @param old 要被替换的结点
- * @param new 新的要换上去的结点
- */
-static inline void list_replace(struct List* old, struct List * new)
-{
-    if(old->prev!=NULL)
-        old->prev->next=new;
-    new->prev = old->prev;
-    if(old->next!=NULL)
-        old->next->prev = new;
-    new->next = old->next;
-
-    old->prev = NULL;
-    old->next = NULL;
-}
-
-
-static inline bool list_empty(struct List *entry)
-{
-    /**
-     * @brief 判断循环链表是否为空
-     * @param entry 入口
-     */
-
-    if (entry == entry->next && entry->prev == entry)
-        return true;
-    else
-        return false;
-}
-
-/**
- * @brief 获取链表的上一个元素
- *
- * @param entry
- * @return 链表的上一个元素
- */
-static inline struct List *list_prev(struct List *entry)
-{
-    if (entry->prev != NULL)
-        return entry->prev;
-    else
-        return NULL;
-}
-
-/**
- * @brief 获取链表的下一个元素
- *
- * @param entry
- * @return 链表的下一个元素
- */
-static inline struct List *list_next(struct List *entry)
-{
-    if (entry->next != NULL)
-        return entry->next;
-    else
-        return NULL;
-}
 
 void *memset(void *dst, unsigned char C, ul size)
 {
@@ -323,113 +193,6 @@ void io_out32(unsigned short port, unsigned int value)
     __asm__ __volatile__("cld;rep;outsw;mfence;" ::"d"(port), "S"(buffer), "c"(nr) \
                          : "memory")
 
-/**
- * @brief 读取rsp寄存器的值（存储了页目录的基地址）
- *
- * @return unsigned*  rsp的值的指针
- */
-unsigned long *get_rsp()
-{
-    ul *tmp;
-    __asm__ __volatile__(
-        "movq %%rsp, %0\n\t"
-        : "=r"(tmp)::"memory");
-    return tmp;
-}
-
-/**
- * @brief 读取rbp寄存器的值（存储了页目录的基地址）
- *
- * @return unsigned*  rbp的值的指针
- */
-unsigned long *get_rbp()
-{
-    ul *tmp;
-    __asm__ __volatile__(
-        "movq %%rbp, %0\n\t"
-        : "=r"(tmp)::"memory");
-    return tmp;
-}
-
-/**
- * @brief 读取ds寄存器的值（存储了页目录的基地址）
- *
- * @return unsigned*  ds的值的指针
- */
-unsigned long *get_ds()
-{
-    ul *tmp;
-    __asm__ __volatile__(
-        "movq %%ds, %0\n\t"
-        : "=r"(tmp)::"memory");
-    return tmp;
-}
-
-/**
- * @brief 读取rax寄存器的值（存储了页目录的基地址）
- *
- * @return unsigned*  rax的值的指针
- */
-unsigned long *get_rax()
-{
-    ul *tmp;
-    __asm__ __volatile__(
-        "movq %%rax, %0\n\t"
-        : "=r"(tmp)::"memory");
-    return tmp;
-}
-/**
- * @brief 读取rbx寄存器的值（存储了页目录的基地址）
- *
- * @return unsigned*  rbx的值的指针
- */
-unsigned long *get_rbx()
-{
-    ul *tmp;
-    __asm__ __volatile__(
-        "movq %%rbx, %0\n\t"
-        : "=r"(tmp)::"memory");
-    return tmp;
-}
-
-// ========= MSR寄存器组操作 =============
-/**
- * @brief 向msr寄存器组的address处的寄存器写入值value
- *
- * @param address 地址
- * @param value 要写入的值
- */
-void wrmsr(ul address, ul value)
-{
-    __asm__ __volatile__("wrmsr    \n\t" ::"d"(value >> 32), "a"(value & 0xffffffff), "c"(address)
-                         : "memory");
-}
-
-/**
- * @brief 从msr寄存器组的address地址处读取值
- * rdmsr返回高32bits在edx，低32bits在eax
- * @param address 地址
- * @return ul address处的寄存器的值
- */
-ul rdmsr(ul address)
-{
-    unsigned int tmp0, tmp1;
-    __asm__ __volatile__("rdmsr \n\t"
-                         : "=d"(tmp0), "=a"(tmp1)
-                         : "c"(address)
-                         : "memory");
-    return ((ul)tmp0 << 32) | tmp1;
-}
-
-uint64_t get_rflags()
-{
-    unsigned long tmp = 0;
-    __asm__ __volatile__("pushfq	\n\t"
-                         "movq	(%%rsp), %0	\n\t"
-                         "popfq	\n\t"
-                         : "=r"(tmp)::"memory");
-    return tmp;
-}
 
 /**
  * @brief 验证地址空间是否为用户地址空间

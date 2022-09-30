@@ -1,5 +1,5 @@
-#include "string.h"
-#include "glib.h"
+#include <common/string.h>
+#include <common/glib.h>
 
 /**
  * @brief 拷贝整个字符串

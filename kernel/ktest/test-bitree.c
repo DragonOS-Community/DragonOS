@@ -119,7 +119,7 @@ static ktest_case_table kt_bitree_func_table[] = {
     ktest_bitree_case1,
 };
 
-uint64_t ktest_test_bitree(uint64_t arg)
+int ktest_test_bitree(void* arg)
 {
     kTEST("Testing bitree...");
     for (int i = 0; i < sizeof(kt_bitree_func_table) / sizeof(ktest_case_table); ++i)

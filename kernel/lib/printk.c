@@ -1,14 +1,14 @@
 //
 // Created by longjin on 2022/1/22.
 //
-#include "printk.h"
-#include "kprint.h"
+#include <common/printk.h>
+#include <common/kprint.h>
 
 #include <mm/mm.h>
 #include <common/spinlock.h>
 #include <lib/libUI/textui.h>
 
-#include "math.h"
+#include <common/math.h>
 #include <common/string.h>
 
 static spinlock_t __printk_lock = {1};

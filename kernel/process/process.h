@@ -52,7 +52,6 @@
  *
  */
 
-
 // 设置初始进程的tss
 #define INITIAL_TSS                                                       \
 	{                                                                     \
@@ -73,17 +72,15 @@
 		.io_map_base_addr = 0                                             \
 	}
 
-
-
 #define GET_CURRENT_PCB    \
 	"movq %rsp, %rbx \n\t" \
 	"andq $-32768, %rbx\n\t"
 
-	/**
-	 * @brief 切换进程上下文
-	 * 先把rbp和rax保存到栈中，然后将rsp和rip保存到prev的thread结构体中
-	 * 然后调用__switch_to切换栈，配置其他信息，最后恢复下一个进程的rax rbp。
-	 */
+/**
+ * @brief 切换进程上下文
+ * 先把rbp和rax保存到栈中，然后将rsp和rip保存到prev的thread结构体中
+ * 然后调用__switch_to切换栈，配置其他信息，最后恢复下一个进程的rax rbp。
+ */
 
 #define switch_proc(prev, next)                                                                     \
 	do                                                                                              \
@@ -134,14 +131,14 @@ struct process_control_block *process_get_pcb(long pid);
  *
  * @param pcb 进程的pcb
  */
-void process_wakeup(struct process_control_block *pcb);
+int process_wakeup(struct process_control_block *pcb);
 
 /**
  * @brief 将进程加入到调度器的就绪队列中，并标志当前进程需要被调度
  *
  * @param pcb 进程的pcb
  */
-void process_wakeup_immediately(struct process_control_block *pcb);
+int process_wakeup_immediately(struct process_control_block *pcb);
 
 /**
  * @brief 使当前进程去执行新的代码
@@ -185,7 +182,17 @@ void process_exit_notify();
  * @return int
  */
 
-int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigned long flags);
+pid_t kernel_thread(int (*fn)(void*), void* arg, unsigned long flags);
+
+int process_fd_alloc(struct vfs_file_t *file);
+
+/**
+ * @brief 释放pcb
+ *
+ * @param pcb
+ * @return int
+ */
+int process_release_pcb(struct process_control_block *pcb);
 
 /**
  * @brief 切换页表
@@ -213,4 +220,3 @@ extern struct mm_struct initial_mm;
 extern struct thread_struct initial_thread;
 extern union proc_union initial_proc_union;
 extern struct process_control_block *initial_proc[MAX_CPU_NUM];
-int process_fd_alloc(struct vfs_file_t *file);

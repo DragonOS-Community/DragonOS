@@ -31,7 +31,7 @@ static long ktest_mutex_case0(uint64_t arg0, uint64_t arg1)
  * @param arg
  * @return long
  */
-static unsigned long ktest_mutex_case1_pid1(uint64_t arg)
+static int ktest_mutex_case1_pid1(void* arg)
 {
     kTEST("ktest_mutex_case1_subproc start.");
     assert(mutex_is_locked(&mtx) == 1);
@@ -78,7 +78,7 @@ static ktest_case_table kt_mutex_func_table[] = {
     ktest_mutex_case0,
     ktest_mutex_case1,
 };
-uint64_t ktest_test_mutex(uint64_t arg)
+int ktest_test_mutex(void* arg)
 {
     kTEST("Testing mutex...");
     mutex_init(&mtx);

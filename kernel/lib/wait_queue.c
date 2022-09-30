@@ -1,4 +1,4 @@
-#include "wait_queue.h"
+#include <common/wait_queue.h>
 #include <sched/sched.h>
 #include <process/process.h>
 #include <mm/slab.h>

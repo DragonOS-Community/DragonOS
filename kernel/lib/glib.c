@@ -1,5 +1,5 @@
-#include "glib.h"
-#include "string.h"
+#include <common/glib.h>
+#include <common/string.h>
 
 /**
  * @brief 这个函数让蜂鸣器发声，目前仅用于真机调试。未来将移除，请勿依赖此函数。

@@ -940,7 +940,7 @@ static void xhci_initialize_ep(const int id, const uint64_t slot_vaddr, const in
 
         break;
     case USB_EP_INTERRUPT:
-        ep_ctx.max_packet_size = max_packet&0x7ff;
+        ep_ctx.max_packet_size = max_packet & 0x7ff;
         ep_ctx.max_burst_size = max_burst;
         ep_ctx.ep_state = XHCI_EP_STATE_DISABLED;
         ep_ctx.mult = 0;
@@ -1662,25 +1662,26 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
 
     int retval = 0;
     uint64_t slot_context_vaddr = xhci_get_device_context_vaddr(id, port_id);
-    
+
     xhci_initialize_ep(id, slot_context_vaddr, port_id, ep_num, xhci_hc[id].ports[port_id].dev_desc->max_packet_size,
                        usb_get_max_burst_from_ep(ep_desc), ep_type, (ep_num % 2) ? XHCI_DIR_IN_BIT : XHCI_DIR_OUT_BIT,
                        xhci_get_port_speed(id, port_id), ep_desc->interval);
 
     struct xhci_slot_context_t slot;
-    struct xhci_ep_context_t ep={0};
+    struct xhci_ep_context_t ep = {0};
     // 创建输入上下文缓冲区
     uint64_t input_ctx_buffer = (uint64_t)kzalloc(xhci_hc[id].context_size * 33, 0);
     // 置位对应的add bit
-    __write4b(input_ctx_buffer + 4, 1 << ep_num);
+    __write4b(input_ctx_buffer + 4, (1 << ep_num)|1);
     __write4b(input_ctx_buffer + 0x1c, 1);
 
-    // 拷贝slot上下文和control ep
-    // __read_from_slot(&slot, slot_context_vaddr);
-    // __read_from_ep(id, slot_context_vaddr, 1, &ep);
-    // ep.err_cnt = 3;
+    // 拷贝slot上下文
+    __read_from_slot(&slot, slot_context_vaddr);
+    // 设置该端口的最大端点号。注意，必须设置这里，否则会出错
+    slot.entries = (ep_num > slot.entries) ? ep_num : slot.entries;
 
-    // __write_slot(input_ctx_buffer + xhci_hc[id].context_size, &slot);
+    __write_slot(input_ctx_buffer + xhci_hc[id].context_size, &slot);
+
     // __write_ep(id, input_ctx_buffer, 2, &ep);
     kdebug("ep_num=%d", ep_num);
     // 拷贝将要被配置的端点的信息

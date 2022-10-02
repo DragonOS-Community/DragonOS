@@ -139,7 +139,9 @@
         "devfs-types.h": "c",
         "chardev.h": "c",
         "rootfs.h": "c",
-        "tty.h": "c"
+        "tty.h": "c",
+        "idr.h": "c",
+        "ktest_utils.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

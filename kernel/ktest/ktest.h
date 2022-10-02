@@ -4,6 +4,7 @@
 uint64_t ktest_test_bitree(uint64_t arg);
 uint64_t ktest_test_kfifo(uint64_t arg);
 uint64_t ktest_test_mutex(uint64_t arg);
+uint64_t ktest_test_idr(uint64_t arg);
 
 /**
  * @brief 开启一个新的内核线程以进行测试

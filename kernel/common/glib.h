@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <common/stddef.h>
 #include <arch/arch.h>
+// #include <common/stdio.h>
 #include <common/compiler.h>
 
 #define sti() __asm__ __volatile__("sti\n\t" :: \
@@ -104,8 +105,7 @@ static inline void list_init(struct List *list)
  * @param node 待插入的节点
  **/
 static inline void list_add(struct List *entry, struct List *node)
-{
-
+{   
     node->next = entry->next;
     barrier();
     node->prev = entry;

@@ -464,7 +464,7 @@ exec_failed:;
 #pragma GCC pop_options
 
 /**
- * @brief 内核init进程
+ * @brief 内核init进程 pid=1
  *
  * @param arg
  * @return ul 参数
@@ -484,11 +484,14 @@ ul initial_kernel_thread(ul arg)
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
 
+    // !!! 测试 IDR
+
     // 对一些组件进行单元测试
     uint64_t tpid[] = {
         ktest_start(ktest_test_bitree, 0),
         ktest_start(ktest_test_kfifo, 0),
         ktest_start(ktest_test_mutex, 0),
+        ktest_start(ktest_test_idr, 0),
         usb_pid,
     };
     kinfo("Waiting test thread exit...");

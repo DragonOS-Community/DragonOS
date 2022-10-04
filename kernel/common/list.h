@@ -214,7 +214,7 @@ static inline struct List *list_next(struct List *entry)
     for ((ptr) = (head)->prev; (ptr) != (head); (ptr) = (ptr)->prev)
 
 /**
- * @brief 遍历整个链表（从前往后）（支持链表的删除操作）
+ * @brief 遍历整个链表（从前往后）（支持删除当前链表结点）
  * 该宏通过暂存中间变量，防止在迭代链表的过程中，由于删除了当前ptr所指向的链表结点从而造成错误
  *
  * @param ptr the &struct list_head to use as a loop cursor.

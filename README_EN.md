@@ -54,6 +54,8 @@
 
 Email：longjin@RinGoTek.cn
 
+Community Contact Email: contact@DragonOS.org
+
 Blog：[longjin666.cn](https://longjin666.cn)
 
 ## Reward

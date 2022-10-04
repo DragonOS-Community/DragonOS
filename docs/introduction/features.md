@@ -30,6 +30,7 @@
 - [x] fork
 - [x] exec
 - [x] 进程睡眠（支持高精度睡眠）
+- [x] kthread机制
 
 #### 同步原语
 
@@ -53,6 +54,7 @@
 - [x] VFS
 - [x] fat32
 - [x] devfs
+- [x] rootfs
 
 ### 异常及中断处理
 

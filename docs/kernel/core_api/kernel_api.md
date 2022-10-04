@@ -2,7 +2,7 @@
 
 ## 循环链表管理函数
 
-&emsp;&emsp;循环链表是内核的重要的数据结构之一。包含在`kernel/common/glib.h`中。
+&emsp;&emsp;循环链表是内核的重要的数据结构之一。包含在`kernel/common/list.h`中。
 
 ### `void list_init(struct List *list)`
 

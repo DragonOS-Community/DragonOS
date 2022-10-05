@@ -88,3 +88,10 @@ typedef struct __pthread_condattr_t
 } pthread_condattr_t;
 
 typedef uint64_t gfp_t;
+
+// 定义8字节对齐变量属性
+#ifndef __aligned_u64
+    #define __aligned_u64 uint64_t __attribute__((aligned(8)))
+#endif
+
+#define aligned_u64 __aligned_u64

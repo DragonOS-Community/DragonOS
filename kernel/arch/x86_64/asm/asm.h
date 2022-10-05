@@ -18,6 +18,21 @@
 #define io_lfence() __asm__ __volatile__("lfence\n\t" :: \
                                              : "memory") // 在lfence指令前的读操作必须在lfence指令后的读操作前完成。
 
+/*
+ * Macros to generate condition code outputs from inline assembly,
+ * The output operand must be type "bool".
+ */
+// 如果编译器支持输出标志寄存器值到变量的话，则会定义__GCC_ASM_FLAG_OUTPUTS__
+#ifdef __GCC_ASM_FLAG_OUTPUTS__
+// CC_SET(c)则是用于设置标志寄存器中的某一位
+#define CC_SET(c) "\n\t/* output condition code " #c "*/\n"
+// "=@cccond"的用法是，将标志寄存器中的cond（也就是指令集定义的标准条件）的值输出到变量中
+#define CC_OUT(c) "=@cc" #c
+#else
+#define CC_SET(c) "\n\tset" #c " %[_cc_" #c "]\n"
+#define CC_OUT(c) [_cc_##c] "=qm"
+#endif
+
 #define rdtsc() ({                                    \
     uint64_t tmp1 = 0, tmp2 = 0;                      \
     asm volatile("rdtsc"                              \

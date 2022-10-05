@@ -1,6 +1,6 @@
 #pragma once
 
-#define __force __attribute__((force))
+#include <common/compiler_attributes.h>
 
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -11,19 +11,37 @@
                                            : "memory");
 #endif
 
-// 编译器属性
+/**
+ * @brief 编译时断言，如果condition不为1，则输出msg
+ * 
+ * @param prefix 一个“不存在的函数名”的前缀
+ * @param suffix 一个“不存在的函数名”的后缀
+ */
+#define __compiletime_assert(condition, msg, prefix, suffix)                                          \
+    do                                                                                                \
+    {                                                                                                 \
+        /**                                                                                           \
+         * 声明一个不存在的函数的extern，如果assert失败，就调用它，从而导致 \
+         * 链接时出错，进而达到“编译时断言”的功能。                            \
+         */                                                                                           \
+        __noreturn extern void prefix##suffix(void)                                                   \
+            __compiletime_error(msg);                                                                 \
+        if (!(condition))                                                                             \
+            prefix##suffix();                                                                         \
+    } while (0)
 
-// 当函数的返回值未被使用时，编译器抛出警告信息
-#define __must_check __attribute__((__warn_unused_result__))
-
-typedef uint8_t __attribute__((__may_alias__)) __u8_alias_t;
-typedef uint16_t __attribute__((__may_alias__)) __u16_alias_t;
-typedef uint32_t __attribute__((__may_alias__)) __u32_alias_t;
-typedef uint64_t __attribute__((__may_alias__)) __u64_alias_t;
+/**
+ * @brief 当condition是false时，中断编译，并输出指定的错误信息
+ * 
+ * @param condition assert的情况
+ * @param msg condition为false时输出的错误信息
+ */
+#define complietime_assert(condition, msg)  \
+    __compiletime_assert(condition, msg, __compiletime_assert__, __COUNTER__)
 
 /**
  * @brief 从src读取数据到dst，该过程避免编译器优化。
- * 
+ *
  * @param dst 目标地址指针
  * @param src 源地址指针
  * @param size 要读取的数据大小（建议1、2、4、8字节，若不满足要求，则采用memcpy读取。）
@@ -54,7 +72,7 @@ static __always_inline void __read_once_size(void *dst, const volatile void *src
 
 /**
  * @brief 把src处的数据到dst，该过程避免编译器优化。
- * 
+ *
  * @param dst 目标地址指针
  * @param src 源地址指针
  * @param size 要写入的数据大小（建议1、2、4、8字节，若不满足要求，则采用memcpy传输。）
@@ -94,7 +112,7 @@ static __always_inline void __write_once_size(volatile void *dst, void *src, int
  * 2.确保编译器不会折叠、旋转或以其他方式对代码进行优化，从而破坏数据访问顺序。
  *
  * 这两个宏的union __u内的__c用作这个union的地址的指针
- * 
+ *
  * 关于READ_ONCE和WRITE_ONCE的简单说明，请转到：https://bbs.dragonos.org/forum.php?mod=viewthread&tid=24
  */
 

@@ -29,7 +29,7 @@
 
 /**
  * @brief 当condition不为0时输出警告信息，且只会输出一次警告信息
- * 
+ *
  */
 #define WARN_ON_ONCE(condition) ({              \
     static int __warned;                        \
@@ -49,4 +49,20 @@
         goto to;                       \
     unlikely(__ret_warn_on);           \
 })
+
+/**
+ * @brief 当condition为true时，中断编译，并输出错误信息msg
+ * 
+ * 如果你的代码依赖于一些能够在编译期间计算出来的值，那么请使用这个宏以防止其他人错误的修改了这些值，从而导致程序运行错误
+ */
+#define BUILD_BUG_ON_MSG(condition, msg) complietime_assert(!(condition), msg)
+
+/**
+ * @brief 当condition为true时，中断编译。
+ * 
+ * 如果你的代码依赖于一些能够在编译期间计算出来的值，那么请使用这个宏以防止其他人错误的修改了这些值，从而导致程序运行错误
+ */
+#define BUILD_BUG_ON(condition) \
+    BUILD_BUG_ON_MSG(condition, "BUILD_BUG_ON failed: " #condition)
+
 #pragma GCC pop_options

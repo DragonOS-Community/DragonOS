@@ -14,6 +14,7 @@
 #include <common/glib.h>
 #include <common/fcntl.h>
 #include <common/blk_types.h>
+#include <common/lockref.h>
 #include <mm/slab.h>
 
 extern struct vfs_superblock_t *vfs_root_sb;
@@ -32,7 +33,7 @@ extern struct vfs_superblock_t *vfs_root_sb;
  *
  */
 #define VFS_IF_FILE (1UL << 0)
-#define VFS_IF_DIR (1UL << 1)
+#define VFS_IF_DIR (1UL << 1)   // 文件夹
 #define VFS_IF_DEVICE (1UL << 2)
 #define VFS_IF_DEAD (1UL << 3) /* removed, but still open directory */
 
@@ -52,6 +53,7 @@ struct vfs_dir_entry_t
     struct List child_node_list;
     struct List subdirs_list;
 
+    struct lockref lockref; // 该lockref包含了dentry的自旋锁以及引用计数
     struct vfs_index_node_t *dir_inode;
     struct vfs_dir_entry_t *parent;
     struct vfs_dir_entry_operations_t *dir_ops;
@@ -75,7 +77,7 @@ struct vfs_index_node_t
     uint64_t file_size; // 文件大小
     uint64_t blocks;    // 占用的扇区数
     uint64_t attribute;
-    int32_t ref_count; // 引用计数
+    struct lockref lockref; // 自旋锁与引用计数
 
     struct vfs_superblock_t *sb;
     struct vfs_file_operations_t *file_ops;
@@ -267,3 +269,13 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland);
  * @return int64_t 错误码
  */
 int64_t vfs_rmdir(const char *path, bool from_userland);
+
+/**
+ * @brief 释放dentry，并视情况自动释放inode
+ *
+ * @param dentry 目标dentry
+ * 
+ * @return 错误码
+ *          注意，当dentry指向文件时，如果返回值为正数，则表示在释放了该dentry后，该dentry指向的inode的引用计数。
+ */
+int vfs_dentry_put(struct vfs_dir_entry_t * dentry);

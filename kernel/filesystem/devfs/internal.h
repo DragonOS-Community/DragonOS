@@ -78,6 +78,8 @@ static inline void __devfs_fill_inode(struct vfs_dir_entry_t *dentry, struct vfs
     dentry->dir_inode->private_inode_info = private_inode_data;
     dentry->dir_inode->sb = &devfs_sb;
     dentry->dir_inode->attribute = inode_attr;
+    // 反向绑定inode
+    private_inode_data->inode = dentry->dir_inode;
 }
 
 /**

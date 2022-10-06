@@ -33,17 +33,13 @@ static inline bool is_local_mountpoint(struct vfs_dir_entry_t *dentry)
         return false;
 }
 
-/**
- * @brief 释放dentry
- * 
- * @param dentry 目标dentry
- */
-void vfs_dentry_put(struct vfs_dir_entry_t * dentry);
+
 
 /**
- * @brief 释放inode
- * 
+ * @brief 释放inode（要求已经对inode进行加锁后调用该函数）
+ *
  * @param inode 待释放的inode
  * @return int 错误码
+ *             当inode还有其他的使用者时，返回inode的使用者数量
  */
 int vfs_free_inode(struct vfs_index_node_t * inode);

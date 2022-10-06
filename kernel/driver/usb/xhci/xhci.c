@@ -207,7 +207,7 @@ static __always_inline void __xhci_write_trb(struct xhci_ep_info_t *ep_info, str
  */
 static __always_inline uint64_t xhci_get_device_context_vaddr(const int id, const int port_id)
 {
-    return phys_2_virt(__read8b(xhci_hc[id].dcbaap_vaddr + (xhci_hc[id].ports[port_id].slot_id * sizeof(uint64_t))));
+    return (uint64_t)phys_2_virt(__read8b(xhci_hc[id].dcbaap_vaddr + (xhci_hc[id].ports[port_id].slot_id * sizeof(uint64_t))));
 }
 
 /**

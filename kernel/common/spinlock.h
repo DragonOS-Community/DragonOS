@@ -11,6 +11,7 @@
 #pragma once
 #include <common/glib.h>
 #include <process/preempt.h>
+#include <debug/bug.h>
 
 /**
  * @brief 定义自旋锁结构体
@@ -19,8 +20,7 @@
 typedef struct
 {
     int8_t lock; // 1:unlocked 0:locked
-}spinlock_t;
-
+} spinlock_t;
 
 /**
  * @brief 自旋锁加锁
@@ -167,3 +167,18 @@ long spin_trylock(spinlock_t *lock)
         spin_unlock(lock);    \
         local_irq_enable();   \
     } while (0)
+
+/**
+ * @brief 判断自旋锁是否已经加锁
+ * 
+ * @param lock 待判断的自旋锁
+ * @return true 已经加锁
+ * @return false 尚未加锁
+ */
+static inline bool spin_is_locked(const spinlock_t *lock)
+{
+    int x = READ_ONCE(lock->lock);
+    return (x == 0) ? true : false;
+}
+
+#define assert_spin_locked(lock) BUG_ON(!spin_is_locked(lock))

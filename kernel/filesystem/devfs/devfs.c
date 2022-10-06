@@ -5,6 +5,7 @@
 #include <common/string.h>
 #include <mm/slab.h>
 #include <common/spinlock.h>
+#include <debug/bug.h>
 
 struct vfs_super_block_operations_t devfs_sb_ops;
 struct vfs_dir_entry_operations_t devfs_dentry_ops;
@@ -253,6 +254,70 @@ int devfs_register_device(uint16_t device_type, uint16_t sub_type, struct vfs_fi
     return retval;
 failed:;
     kfree(private_info);
+    spin_unlock(&devfs_global_lock);
+    return retval;
+}
+
+/**
+ * @brief 卸载设备
+ *
+ * @param private_inode_info 待卸载的设备的inode私有信息
+ * @param put_private_info 设备被卸载后，执行的函数
+ * @return int 错误码
+ */
+int devfs_unregister_device(struct devfs_private_inode_info_t *private_inode_info)
+{
+    int retval = 0;
+    spin_lock(&devfs_global_lock);
+    struct vfs_dir_entry_t *base_dentry = NULL;
+    struct vfs_dir_entry_t *target_dentry = NULL;
+
+    // 找到父目录的dentry
+    {
+
+        char base_path[64] = {0};
+        switch (private_inode_info->type)
+        {
+        case DEV_TYPE_CHAR:
+            strcpy(base_path, "/dev/char");
+            break;
+        default:
+            retval = -ENOTSUP;
+            goto out;
+            break;
+        }
+
+        base_dentry = vfs_path_walk(base_path, 0);
+        // bug
+        if (unlikely(base_dentry == NULL))
+        {
+            BUG_ON(1);
+            retval = -ENODEV;
+            goto out;
+        }
+    }
+
+    // 遍历子目录，寻找拥有指定inode的dentry（暂时不支持一个inode对应多个dentry的情况）
+    // todo: 支持链接文件的卸载
+    struct List *tmp_list = NULL, *target_list = NULL;
+    list_for_each_safe(target_list, tmp_list, &base_dentry->subdirs_list)
+    {
+        target_dentry = list_entry(target_list, struct vfs_dir_entry_t, child_node_list);
+        if (target_dentry->dir_inode == private_inode_info->inode)
+        {
+            spin_lock(&target_dentry->lockref.lock);
+            retval = vfs_dentry_put(target_dentry);
+            if (retval < 0)
+            {
+                kerror("Error when try to unregister device");
+                spin_unlock(&target_dentry->lockref.lock);
+            }
+            else if (retval == 0) // 该设备的所有dentry均被卸载完成，不必继续迭代
+                break;
+        }
+    }
+    retval = 0;
+out:;
     spin_unlock(&devfs_global_lock);
     return retval;
 }

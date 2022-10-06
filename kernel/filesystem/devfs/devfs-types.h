@@ -43,4 +43,5 @@ struct devfs_private_inode_info_t
     uint16_t sub_type; // 设备子类型
     struct vfs_file_operations_t *f_ops;
     uint64_t uuid;
+    struct vfs_index_node_t * inode;    // 当前私有信息所绑定的inode
 };

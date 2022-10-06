@@ -514,6 +514,11 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size)
     if (unlikely(dentry == NULL))
         return NULL;
     dentry->name = (char *)kzalloc(name_size, 0);
+
+    // 初始化lockref
+    spin_init(&dentry->lockref.lock);
+    dentry->lockref.count = 1;
+    // 初始化链表
     list_init(&dentry->child_node_list);
     list_init(&dentry->subdirs_list);
     return dentry;
@@ -604,6 +609,7 @@ int64_t vfs_rmdir(const char *path, bool from_userland)
     if (retval != 0)
         return retval;
     // todo: 对dentry和inode加锁
+    spin_lock(&dentry->lockref.lock);
     retval = -EBUSY;
     if (is_local_mountpoint(dentry))
         goto out;
@@ -616,8 +622,11 @@ int64_t vfs_rmdir(const char *path, bool from_userland)
     dont_mount(dentry);                          // 将当前dentry标记为不可被挂载
     detach_mounts(dentry);                       // 清理同样挂载在该路径的所有挂载点的挂载树
 
-    vfs_dentry_put(dentry); // 释放dentry
+    if (vfs_dentry_put(dentry) != 0)
+        goto out; // 释放dentry
+    return retval;
 out:;
+    spin_unlock(&dentry->lockref.lock);
     // todo: 对dentry和inode放锁
     return retval;
 }
@@ -644,7 +653,8 @@ uint64_t sys_rmdir(struct pt_regs *regs)
 struct vfs_index_node_t *vfs_alloc_inode()
 {
     struct vfs_index_node_t *inode = kzalloc(sizeof(struct vfs_index_node_t), 0);
-    inode->ref_count = 1; // 初始化引用计数为1
+    spin_init(&inode->lockref.lock);
+    inode->lockref.count = 1; // 初始化引用计数为1
     return inode;
 }
 

@@ -395,7 +395,7 @@ static long ktest_idr_case5(uint64_t arg0, uint64_t arg1)
     for (int i = 0; i < N; i++)
     {
         int *ptr;
-        int flags = idr_replace_get_old(&k_idr, &a[(i + 1) % N], i, &ptr);
+        int flags = idr_replace_get_old(&k_idr, &a[(i + 1) % N], i, (void*)&ptr);
         assert(flags == 0); // 0 是成功
         assert(ptr != NULL);
         assert(*ptr == i);

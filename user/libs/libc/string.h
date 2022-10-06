@@ -47,3 +47,5 @@ char* strcpy(char* dst, const char* src);
  * @return char*
  */
 char *strcat(char *dest, const char *src);
+
+#define memcpy(dst, src, n) __builtin_memcpy(dst, src, n)

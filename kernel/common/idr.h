@@ -40,10 +40,10 @@
 #define TREE_SIZE(layer) ((layer >= 0) ? (1ull << ((layer + 1) * IDR_BITS)) : 1)
 
 // 计算最后(最低位)一个1的位置 (注意使用64位的版本)
-#define lowbit_id(x) ((x) ? (__builtin_ctzll(x)) : -1)
+#define __lowbit_id(x) ((x) ? (__builtin_ctzll(x)) : -1)
 
 // 计算最前(最高位)一个1的位置 (注意使用64位的版本)
-#define mostbit_id(x) ((x) ? (__builtin_clzll(x)) : -1)
+#define __mostbit_id(x) ((x) ? (__builtin_clzll(x)) : -1)
 
 // radix-tree 节点定义
 struct idr_layer
@@ -54,6 +54,7 @@ struct idr_layer
     int layer;                       // 层数(从底向上)
 };
 
+// idr: 将id与pointer绑定的数据结构
 struct idr
 {
     struct idr_layer *top;
@@ -77,20 +78,15 @@ struct idr
  * 对外函数声明
  **/
 int idr_pre_get(struct idr *idp, gfp_t gfp_mask);
-
 int idr_get_new(struct idr *idp, void *ptr, int *id);
-
 void idr_remove(struct idr *idp, int id);
 void idr_remove_all(struct idr *idp);
 void idr_destroy(struct idr *idp);
-
 void *idr_find(struct idr *idp, int id);
 void *idr_find_next(struct idr *idp, int start_id);
 void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid);
-
 int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **oldptr);
 int idr_replace(struct idr *idp, void *ptr, int id);
-
 void idr_init(struct idr *idp);
 
 /**
@@ -113,12 +109,14 @@ void idr_init(struct idr *idp);
 #define IDA_BITMAP_BITS IDA_FULL
 #define IDA_BMP_SIZE (8 * sizeof(long))
 
+// 自定义bitmap
 struct ida_bitmap
 {
-    unsigned long count;
-    unsigned long bitmap[IDA_BITMAP_LONGS];
+    unsigned long count;                    // bitmap中已经分配的id数量
+    unsigned long bitmap[IDA_BITMAP_LONGS]; // bitmap本身, 每一个bit代表一个ID
 };
 
+// id-allocater 管理+分配ID的数据结构
 struct ida
 {
     struct idr idr;

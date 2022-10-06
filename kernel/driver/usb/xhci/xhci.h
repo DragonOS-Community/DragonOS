@@ -492,6 +492,13 @@ struct xhci_ep_context_t
 #define XHCI_PROTOCOL_HAS_PAIR (1 << 2) // 当前位被置位，意味着当前端口具有一个与之配对的端口
 #define XHCI_PROTOCOL_ACTIVE (1 << 3)   // 当前端口是这个配对中，被激活的端口
 
+struct xhci_ep_info_t
+{
+    uint64_t ep_ring_vbase;         // transfer ring的基地址
+    uint64_t current_ep_ring_vaddr; // transfer ring下一个要写入的地址
+    uint8_t current_ep_ring_cycle;  // 当前ep的cycle bit
+};
+
 /**
  * @brief xhci端口信息
  *
@@ -502,14 +509,11 @@ struct xhci_port_info_t
     uint8_t paired_port_num; // 与当前端口所配对的另一个端口（相同物理接口的不同速度的port）
     uint8_t offset;          // offset of this port within this protocal
     uint8_t reserved;
+    uint8_t slot_id;                   // address device获得的slot id
+    struct usb_device_desc *dev_desc;  // 指向设备描述符结构体的指针
+    struct xhci_ep_info_t ep_info[32]; // 各个端点的信息
 } __attribute__((packed));
 
-struct xhci_ep_ring_info_t
-{
-    uint64_t ep_ring_vbase;         // transfer ring的基地址
-    uint64_t current_ep_ring_vaddr; // transfer ring下一个要写入的地址
-    uint8_t current_ep_ring_cycle;  // 当前ep的cycle bit
-};
 struct xhci_host_controller_t
 {
     struct pci_device_structure_general_device_t *pci_dev_hdr; // 指向pci header结构体的指针
@@ -537,7 +541,6 @@ struct xhci_host_controller_t
     uint64_t current_event_ring_vaddr;                      // 下一个要读取的event TRB的虚拟地址
     uint64_t scratchpad_buf_array_vaddr;                    // 草稿行缓冲区数组的虚拟地址
     struct xhci_port_info_t ports[XHCI_MAX_ROOT_HUB_PORTS]; // 指向端口信息数组的指针(由于端口offset是从1开始的，因此该数组第0项为空)
-    struct xhci_ep_ring_info_t control_ep_info;             // 控制端点的信息
 };
 
 // Common TRB types
@@ -623,6 +626,21 @@ enum
     /* 224 - 225 vendor defined info */
 };
 
+/**
+ * @brief xhci endpoint类型
+ * 
+ */
+enum
+{
+    XHCI_EP_TYPE_INVALID = 0,
+    XHCI_EP_TYPE_ISO_OUT,
+    XHCI_EP_TYPE_BULK_OUT,
+    XHCI_EP_TYPE_INTR_OUT,
+    XHCI_EP_TYPE_CONTROL,
+    XHCI_EP_TYPE_ISO_IN,
+    XHCI_EP_TYPE_BULK_IN,
+    XHCI_EP_TYPE_INTR_IN,
+};
 /**
  * @brief 初始化xhci控制器
  *

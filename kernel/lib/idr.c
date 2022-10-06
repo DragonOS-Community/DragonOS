@@ -49,7 +49,10 @@ static void *get_from_free_list(struct idr *idp)
     if (idp->id_free_cnt == 0)
     {
         if (idr_pre_get(idp, 0) != 0)
+        {
+            kBUG("idr-module find a BUG: get free node fail.(Possible ENOMEM error)");
             return NULL;
+        }
     }
 
     unsigned long flags;
@@ -71,7 +74,7 @@ static void *get_from_free_list(struct idr *idp)
  *
  * @param idp
  * @param gfp_mask
- * @return int 如果分配成功,将返回0; 否则返回负数 ENOMEM(有可能是内存空间不够)
+ * @return int 如果分配成功,将返回0; 否则返回负数 -ENOMEM(有可能是内存空间不够)
  */
 int idr_pre_get(struct idr *idp, gfp_t gfp_mask)
 {
@@ -81,7 +84,7 @@ int idr_pre_get(struct idr *idp, gfp_t gfp_mask)
         struct idr_layer *new_one;
         new_one = kzalloc(sizeof(struct idr_layer), gfp_mask); // 默认清空?
         if (!new_one)
-            return ENOMEM;
+            return -ENOMEM;
         move_to_free_list(idp, new_one);
         timer++;
     }
@@ -108,7 +111,7 @@ static int idr_grow(struct idr *idp)
 {
     struct idr_layer *new_node = get_from_free_list(idp);
     if (!new_node)
-        return ENOMEM;
+        return -ENOMEM;
 
     swap(&new_node, &idp->top);
 
@@ -134,14 +137,14 @@ static int idr_grow(struct idr *idp)
  *
  * @param idp
  * @param stk  栈空间
- * @return int -1表示获取ID失败, id>=0&&id<=INT_MAX则获取ID成功
+ * @return int -负数表示获取ID失败, id>=0&&id<=INT_MAX则获取ID成功
  */
 static int idr_get_empty_slot(struct idr *idp, struct idr_layer **stk)
 {
     // 注意特判 idp->top == NULL
     while (!idp->top || idp->top->full == IDR_FULL)
         if (idr_grow(idp) != 0)
-            return ENOMEM;
+            return -ENOMEM;
 
     int id = 0;
     int layer = idp->top->layer;
@@ -154,8 +157,11 @@ static int idr_get_empty_slot(struct idr *idp, struct idr_layer **stk)
         stk[layer] = cur_layer;
         int pos = lowbit_id(~cur_layer->full);
 
-        if (pos < 0)
-            return EILLEGAL_VALUE;
+        if (unlikely(pos < 0))
+        {
+            kBUG("Value 'cur_layer->full' had been full;"
+                 "but idr_get_empty_slot still try to insert a value.");
+        }
 
         id = (id << IDR_BITS) | pos;
         cur_layer = cur_layer->ary[pos];
@@ -165,7 +171,7 @@ static int idr_get_empty_slot(struct idr *idp, struct idr_layer **stk)
             // 初始化儿子节点
             cur_layer = get_from_free_list(idp);
             if (!cur_layer)
-                return ENOMEM;
+                return -ENOMEM;
             cur_layer->layer = layer - 1; // 儿子节点的layer
             cur_layer->full = 0;
             cur_layer->bitmap = 0;
@@ -190,7 +196,10 @@ static int idr_get_empty_slot(struct idr *idp, struct idr_layer **stk)
 static __always_inline void idr_mark_full(struct idr *idp, int id, struct idr_layer **stk, int mark)
 {
     if (unlikely(!stk[0] || !idp->top))
+    {
+        kBUG("idr-module find a BUG: idp->top can't be NULL.");
         return;
+    }
 
     // 处理叶子节点的full/bitmap标记
     int layer_id = id & IDR_MASK;
@@ -221,7 +230,10 @@ static __always_inline void idr_mark_full(struct idr *idp, int id, struct idr_la
 static __always_inline int idr_get_path(struct idr *idp, int id, struct idr_layer **stk)
 {
     if (unlikely(idp->top == NULL || id < 0))
+    {
+        kBUG("idr-module find a BUG: idp->top can't be NULL and id must be non-negative.");
         return 0;
+    }
 
     struct idr_layer *cur_layer = idp->top;
     int layer = cur_layer->layer;
@@ -234,7 +246,10 @@ static __always_inline int idr_get_path(struct idr *idp, int id, struct idr_laye
         int layer_id = (id >> (layer * IDR_BITS)) & IDR_MASK;
 
         if (unlikely(((cur_layer->bitmap >> layer_id) & 1) == 0))
+        {
+            kBUG("idr-module find a BUG: no-such son.");
             return 0; // 没有这一个儿子
+        }
 
         cur_layer = cur_layer->ary[layer_id];
         --layer;
@@ -254,7 +269,10 @@ static __always_inline int idr_get_path(struct idr *idp, int id, struct idr_laye
 static __always_inline void idr_erase_full(struct idr *idp, int id, struct idr_layer **stk, int mark)
 {
     if (unlikely(!stk[0] || !idp->top))
+    {
+        kBUG("idr-module find a BUG: idp->top can't be NULL.");
         return;
+    }
 
     // 处理叶子节点的full/bitmap标记
     int layer_id = id & IDR_MASK;
@@ -371,7 +389,10 @@ void idr_remove(struct idr *idp, int id)
 static void idr_remove_all_with_free(struct idr *idp, bool free)
 {
     if (unlikely(!idp->top))
+    {
+        kBUG("idr-module find a BUG: idp->top can't be NULL.");
         return;
+    }
 
     int sz = sizeof(struct idr_layer);
     struct idr_layer *stk[MAX_LEVEL + 1];
@@ -602,21 +623,21 @@ int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
     *old_ptr = NULL;
 
     if (unlikely(idp->top == NULL || id < 0))
-        return EILLEGAL_VALUE;
+        return -EDOM; // 参数错误
 
     struct idr_layer *cur_layer = idp->top;
     int layer = cur_layer->layer;
 
     // 如果查询的ID的bit数量比layer*IDR_BITS还大, 直接返回NULL
     if ((id >> ((layer + 1) * IDR_BITS)) > 0)
-        return EILLEGAL_VALUE;
+        return -EDOM;
 
     while (layer > 0)
     {
         int layer_id = (id >> (layer * IDR_BITS)) & IDR_MASK;
 
         if (unlikely(!cur_layer->ary[layer_id]))
-            return ENOMEM;
+            return -ENOMEM;
 
         cur_layer = cur_layer->ary[layer_id];
         layer--;
@@ -640,7 +661,7 @@ int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
 int idr_replace(struct idr *idp, void *ptr, int id)
 {
     if (id < 0)
-        return EILLEGAL_VALUE;
+        return -EDOM;
 
     void *old_ptr;
     int flags = idr_replace_get_old(idp, ptr, id, &old_ptr);
@@ -679,7 +700,7 @@ static void ida_bitmap_free(struct ida_bitmap *bitmap)
 int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
 {
     if (idr_pre_get(&ida_p->idr, gfp_mask) != 0)
-        return ENOMEM;
+        return -ENOMEM;
 
     unsigned long flags;
     spin_lock_irqsave(&ida_p->idr.lock, flags);
@@ -691,7 +712,7 @@ int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
         if (!bitmap)
         {
             spin_unlock_irqrestore(&ida_p->idr.lock, flags);
-            return ENOMEM;
+            return -ENOMEM;
         }
         ida_p->free_list = bitmap;
     }
@@ -736,7 +757,7 @@ static int get_id_from_bitmap(struct ida_bitmap *bmp)
         }
     }
 
-    return EILLEGAL_VALUE; // 不合法
+    return -EDOM; // 不合法
 }
 
 /**
@@ -756,7 +777,7 @@ int ida_get_new(struct ida *ida_p, int *p_id)
 
     // 如果stk[0]=NULL,可能是idr内部出错/内存空间不够
     if (unlikely(!stk[0]))
-        return ENOMEM;
+        return -ENOMEM;
 
     if (unlikely(idr_id < 0))
         return idr_id;
@@ -767,9 +788,9 @@ int ida_get_new(struct ida *ida_p, int *p_id)
         stk[0]->ary[layer_id] = get_ida_bitmap(ida_p, 0);
 
     if (unlikely(!stk[0]->ary[layer_id]))
-        return ENOMEM;
+        return -ENOMEM;
 
-    struct ida_bitmap *bmp = stk[0]->ary[layer_id];
+    struct ida_bitmap *bmp = (struct ida_bitmap *)stk[0]->ary[layer_id];
     int low_id = get_id_from_bitmap(bmp);
 
     if (unlikely(low_id < 0))
@@ -825,7 +846,7 @@ void ida_remove(struct ida *ida_p, int id)
     if (!idr_get_path(&ida_p->idr, idr_id, stk))
         return;
 
-    struct ida_bitmap *b_p = stk[0]->ary[idr_id & IDR_MASK];
+    struct ida_bitmap *b_p = (struct ida_bitmap *)stk[0]->ary[idr_id & IDR_MASK];
 
     // 不存在这个ID 或者 b_p == NULL
     if (unlikely(!b_p || !((b_p->bitmap[ary_id] >> bmp_id) & 1)))

@@ -5,7 +5,8 @@
 #include <common/stdio.h>
 #include <common/string.h>
 #include <common/compiler.h>
-#include <common/libELF/elf.h>
+#include <common/elf.h>
+#include <common/kthread.h>
 #include <common/time.h>
 #include <common/sys/wait.h>
 #include <driver/video/video.h>
@@ -21,6 +22,7 @@
 #include <sched/sched.h>
 #include <common/unistd.h>
 #include <debug/traceback/traceback.h>
+#include <debug/bug.h>
 #include <driver/disk/ahci/ahci.h>
 
 #include <ktest/ktest.h>
@@ -259,7 +261,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         pos = phdr->p_offset;
 
         uint64_t virt_base = 0;
-        uint64_t beginning_offset = 0;       // 由于页表映射导致的virtbase与实际的p_vaddr之间的偏移量
+        uint64_t beginning_offset = 0; // 由于页表映射导致的virtbase与实际的p_vaddr之间的偏移量
 
         if (remain_mem_size >= PAGE_2M_SIZE) // 接下来存在映射2M页的情况，因此将vaddr按2M向下对齐
             virt_base = phdr->p_vaddr & PAGE_2M_MASK;
@@ -278,11 +280,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
                 struct vm_area_struct *vma = NULL;
                 int ret = mm_create_vma(current_pcb->mm, virt_base, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+
                 // 防止内存泄露
                 if (ret == -EEXIST)
                     free_pages(Phy_to_2M_Page(pa), 1);
                 else
-                    mm_map_vma(vma, pa);
+                    mm_map(current_pcb->mm, virt_base, PAGE_2M_SIZE, pa);
+                // mm_map_vma(vma, pa, 0, PAGE_2M_SIZE);
                 io_mfence();
                 memset((void *)virt_base, 0, PAGE_2M_SIZE);
                 map_size = PAGE_2M_SIZE;
@@ -298,10 +302,12 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
                     struct vm_area_struct *vma = NULL;
                     int val = mm_create_vma(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+                    // kdebug("virt_base=%#018lx", virt_base + off);
                     if (val == -EEXIST)
                         kfree(phys_2_virt(paddr));
                     else
-                        mm_map_vma(vma, paddr);
+                        mm_map(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, paddr);
+                    // mm_map_vma(vma, paddr, 0, PAGE_4K_SIZE);
                     io_mfence();
                     memset((void *)(virt_base + off), 0, PAGE_4K_SIZE);
                 }
@@ -335,7 +341,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
         if (val == -EEXIST)
             free_pages(Phy_to_2M_Page(pa), 1);
         else
-            mm_map_vma(vma, pa);
+            mm_map_vma(vma, pa, 0, PAGE_2M_SIZE);
     }
 
     // 清空栈空间
@@ -464,7 +470,7 @@ exec_failed:;
 #pragma GCC pop_options
 
 /**
- * @brief 内核init进程 pid=1
+ * @brief 内核init进程
  *
  * @param arg
  * @return ul 参数
@@ -480,11 +486,10 @@ ul initial_kernel_thread(ul arg)
     rootfs_umount();
 
     // 使用单独的内核线程来初始化usb驱动程序
-    int usb_pid = kernel_thread(usb_init, 0, 0);
+    // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
+    // int usb_pid = kernel_thread(usb_init, 0, 0);
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
-
-    // !!! 测试 IDR
 
     // 对一些组件进行单元测试
     uint64_t tpid[] = {
@@ -492,7 +497,7 @@ ul initial_kernel_thread(ul arg)
         ktest_start(ktest_test_kfifo, 0),
         ktest_start(ktest_test_mutex, 0),
         ktest_start(ktest_test_idr, 0),
-        usb_pid,
+        // usb_pid,
     };
     kinfo("Waiting test thread exit...");
     // 等待测试进程退出
@@ -577,7 +582,7 @@ ul process_do_exit(ul code)
  * @return int
  */
 
-int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigned long flags)
+pid_t kernel_thread(int (*fn)(void*), void* arg, unsigned long flags)
 {
     struct pt_regs regs;
     barrier();
@@ -616,50 +621,9 @@ int kernel_thread(unsigned long (*fn)(unsigned long), unsigned long arg, unsigne
 void process_init()
 {
     kinfo("Initializing process...");
-    initial_mm.pgd = (pml4t_t *)get_CR3();
-
-    initial_mm.code_addr_start = memory_management_struct.kernel_code_start;
-    initial_mm.code_addr_end = memory_management_struct.kernel_code_end;
-
-    initial_mm.data_addr_start = (ul)&_data;
-    initial_mm.data_addr_end = memory_management_struct.kernel_data_end;
-
-    initial_mm.rodata_addr_start = (ul)&_rodata;
-    initial_mm.rodata_addr_end = (ul)&_erodata;
-    initial_mm.bss_start = (uint64_t)&_bss;
-    initial_mm.bss_end = (uint64_t)&_ebss;
-
-    initial_mm.brk_start = memory_management_struct.start_brk;
-    initial_mm.brk_end = current_pcb->addr_limit;
-
-    initial_mm.stack_start = _stack_start;
-    initial_mm.vmas = NULL;
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
 
-    // ========= 在IDLE进程的顶层页表中添加对内核地址空间的映射 =====================
-
-    // 由于IDLE进程的顶层页表的高地址部分会被后续进程所复制，为了使所有进程能够共享相同的内核空间，
-    //  因此需要先在IDLE进程的顶层页表内映射二级页表
-
-    uint64_t *idle_pml4t_vaddr = (uint64_t *)phys_2_virt((uint64_t)get_CR3() & (~0xfffUL));
-
-    for (int i = 256; i < 512; ++i)
-    {
-        uint64_t *tmp = idle_pml4t_vaddr + i;
-        barrier();
-        if (*tmp == 0)
-        {
-            void *pdpt = kmalloc(PAGE_4K_SIZE, 0);
-            barrier();
-            memset(pdpt, 0, PAGE_4K_SIZE);
-            barrier();
-            set_pml4t(tmp, mk_pml4t(virt_2_phys(pdpt), PAGE_KERNEL_PGT));
-        }
-    }
-    barrier();
-
-    flush_tlb();
     /*
     kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
     kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
@@ -671,14 +635,19 @@ void process_init()
 
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
+
+    // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
+    current_pcb->virtual_runtime = 0;
     barrier();
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核线程
     barrier();
+    kthread_mechanism_init(); // 初始化kthread机制
 
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;
     initial_proc_union.pcb.cpu_id = 0;
     initial_proc_union.pcb.virtual_runtime = (1UL << 60);
+    // 将IDLE进程的虚拟运行时间设置为一个很大的数值
     current_pcb->virtual_runtime = (1UL << 60);
 }
 
@@ -711,6 +680,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     io_mfence();
     // 将当前进程的pcb复制到新的pcb内
     memcpy(tsk, current_pcb, sizeof(struct process_control_block));
+    tsk->worker_private = NULL;
     io_mfence();
 
     // 初始化进程的循环链表结点
@@ -718,9 +688,17 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     io_mfence();
     // 判断是否为内核态调用fork
-    if (current_pcb->flags & PF_KTHREAD && stack_start != 0)
+    if ((current_pcb->flags & PF_KTHREAD) && stack_start != 0)
         tsk->flags |= PF_KFORK;
 
+    if (tsk->flags & PF_KTHREAD)
+    {
+        // 对于内核线程，设置其worker私有信息
+        retval = kthread_set_worker_private(tsk);
+        if (IS_ERR_VALUE(retval))
+            goto copy_flags_failed;
+        tsk->virtual_runtime = 0;
+    }
     tsk->priority = 2;
     tsk->preempt_count = 0;
 
@@ -814,10 +792,17 @@ struct process_control_block *process_get_pcb(long pid)
  *
  * @param pcb 进程的pcb
  */
-void process_wakeup(struct process_control_block *pcb)
+int process_wakeup(struct process_control_block *pcb)
 {
+    BUG_ON(pcb == NULL);
+    if (pcb == current_pcb || pcb == NULL)
+        return -EINVAL;
+    // 如果pcb正在调度队列中，则不重复加入调度队列
+    if (pcb->state == PROC_RUNNING)
+        return 0;
     pcb->state = PROC_RUNNING;
     sched_enqueue(pcb);
+    return 0;
 }
 
 /**
@@ -825,10 +810,13 @@ void process_wakeup(struct process_control_block *pcb)
  *
  * @param pcb 进程的pcb
  */
-void process_wakeup_immediately(struct process_control_block *pcb)
+int process_wakeup_immediately(struct process_control_block *pcb)
 {
-    pcb->state = PROC_RUNNING;
-    sched_enqueue(pcb);
+    if (pcb->state == PROC_RUNNING)
+        return 0;
+    int retval = process_wakeup(pcb);
+    if (retval != 0)
+        return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
     current_pcb->flags |= PF_NEED_SCHED;
 }
@@ -960,7 +948,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
                 if (unlikely(ret == -EEXIST))
                     free_pages(Phy_to_2M_Page(pa), 1);
                 else
-                    mm_map_vma(new_vma, pa);
+                    mm_map_vma(new_vma, pa, 0, PAGE_2M_SIZE);
 
                 memcpy((void *)phys_2_virt(pa), (void *)(vma->vm_start + i * PAGE_2M_SIZE), (vma_size >= PAGE_2M_SIZE) ? PAGE_2M_SIZE : vma_size);
                 vma_size -= PAGE_2M_SIZE;
@@ -977,7 +965,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
             if (unlikely(ret == -EEXIST))
                 kfree((void *)va);
             else
-                mm_map_vma(new_vma, virt_2_phys(va));
+                mm_map_vma(new_vma, virt_2_phys(va), 0, map_size);
 
             memcpy((void *)va, (void *)vma->vm_start, vma_size);
         }
@@ -1158,6 +1146,17 @@ void process_exit_thread(struct process_control_block *pcb)
 {
 }
 
+/**
+ * @brief 释放pcb
+ *
+ * @param pcb
+ * @return int
+ */
+int process_release_pcb(struct process_control_block *pcb)
+{
+    kfree(pcb);
+    return 0;
+}
 /**
  * @brief 申请可用的文件句柄
  *

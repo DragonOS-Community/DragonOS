@@ -152,7 +152,7 @@ static ktest_case_table kt_kfifo_func_table[] = {
     ktest_kfifo_case0_1,
 };
 
-uint64_t ktest_test_kfifo(uint64_t arg)
+int ktest_test_kfifo(void* arg)
 {
     kTEST("Testing kfifo...");
     for (int i = 0; i < sizeof(kt_kfifo_func_table) / sizeof(ktest_case_table); ++i)

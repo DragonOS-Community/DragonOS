@@ -515,7 +515,7 @@ static ktest_case_table kt_idr_func_table[] = {
     ktest_idr_case6,
 };
 
-uint64_t ktest_test_idr(uint64_t arg)
+int ktest_test_idr(void* arg)
 {
     kTEST("Testing idr...");
     unsigned int sz = sizeof(kt_idr_func_table) / sizeof(ktest_case_table);

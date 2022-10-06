@@ -122,21 +122,35 @@ int vma_insert(struct mm_struct *mm, struct vm_area_struct *vma)
 {
 
     struct vm_area_struct *prev;
+
     prev = vma_find(mm, vma->vm_start);
+    
     if (prev && prev->vm_start <= vma->vm_start && prev->vm_end >= vma->vm_end)
     {
         // 已经存在了相同的vma
         return -EEXIST;
     }
-    else if (prev && (prev->vm_start == vma->vm_start || prev->vm_end == vma->vm_end)) // 暂时不支持扩展vma
+    // todo: bugfix: 这里的第二种情况貌似从来不会满足
+    else if (prev && ((vma->vm_start >= prev->vm_start && vma->vm_start <= prev->vm_end) || (prev->vm_start <= vma->vm_end && prev->vm_start >= vma->vm_start)))    
     {
-        kwarn("Not support: expand vma");
-        return -ENOTSUP;
+        //部分重叠
+        if ((!CROSS_2M_BOUND(vma->vm_start, prev->vm_start)) && (!CROSS_2M_BOUND(vma->vm_end, prev->vm_end))&& vma->vm_end)
+        {
+            //合并vma 并改变链表vma的范围
+            kdebug("before combining vma:vm_start = %#018lx, vm_end = %#018lx\n", vma->vm_start, vma->vm_end);
+
+            prev->vm_start = (vma->vm_start < prev->vm_start )? vma->vm_start : prev->vm_start;
+            prev->vm_end = (vma->vm_end > prev->vm_end) ? vma->vm_end : prev->vm_end;
+            // 计算page_offset
+            prev->page_offset = prev->vm_start - (prev->vm_start & PAGE_2M_MASK);
+            kdebug("combined vma:vm_start = %#018lx, vm_end = %#018lx\nprev:vm_start = %018lx, vm_end = %018lx\n", vma->vm_start, vma->vm_end, prev->vm_start, prev->vm_end);
+            kinfo("vma has same part\n");
+            return __VMA_MERGED;
+        }
     }
 
-    prev = vma_find(mm, vma->vm_end);
-    if (prev)
-        prev = prev->vm_prev;
+    // prev = vma_find(mm, vma->vm_start);
+
     if (prev == NULL) // 要将当前vma插入到链表的尾部
     {
         struct vm_area_struct *ptr = mm->vmas;
@@ -151,6 +165,8 @@ int vma_insert(struct mm_struct *mm, struct vm_area_struct *vma)
             }
         }
     }
+    else
+        prev = prev->vm_prev;
     __vma_link_list(mm, vma, prev);
     return 0;
 }

@@ -8,7 +8,7 @@
  * @param arg 传递给测试函数的参数
  * @return pid_t 测试内核线程的pid
  */
-pid_t ktest_start(uint64_t (*func)(uint64_t arg), uint64_t arg)
+pid_t ktest_start(int (*func)(void* arg), void* arg)
 {
     return kernel_thread(func, arg, 0);
 }

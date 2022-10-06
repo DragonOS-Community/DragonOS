@@ -7,12 +7,14 @@
 #include <common/string.h>
 #include <common/block.h>
 #include <filesystem/MBR.h>
+#include <debug/bug.h>
 
 struct pci_device_structure_header_t *ahci_devs[MAX_AHCI_DEVICES];
 
 struct block_device_request_queue ahci_req_queue;
 
 struct blk_gendisk ahci_gendisk0 = {0}; // 暂时硬性指定一个ahci_device
+static int __first_port = -1;           // 临时用于存储 ahci控制器的第一个可用端口 的变量
 
 static uint32_t count_ahci_devices = 0;
 
@@ -98,16 +100,17 @@ static int ahci_init_gendisk()
     // todo: 支持GPT
 
     ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->ahci_ctrl_num = 0;
-    ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->ahci_port_num = 0;
+    ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->ahci_port_num = __first_port;
 
     MBR_read_partition_table(&ahci_gendisk0, ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table);
+
     struct MBR_disk_partition_table_t *ptable = ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table;
 
     // 求出可用分区数量
     for (int i = 0; i < 4; ++i)
     {
         // 分区可用
-        if (ptable->DPTE[i].type !=0)
+        if (ptable->DPTE[i].type != 0)
             ++ahci_gendisk0.part_cnt;
     }
     if (ahci_gendisk0.part_cnt)
@@ -119,7 +122,7 @@ static int ahci_init_gendisk()
         for (int i = 0; i < 4; ++i)
         {
             // 分区可用
-            if (ptable->DPTE[i].type !=0)
+            if (ptable->DPTE[i].type != 0)
             {
                 // 初始化分区结构体
                 ahci_gendisk0.partition[cnt].bd_disk = &ahci_gendisk0;
@@ -171,14 +174,13 @@ void ahci_init()
     ahci_port_base_vaddr = (uint64_t)kmalloc(1048576, 0);
     kdebug("ahci_port_base_vaddr=%#018lx", ahci_port_base_vaddr);
     ahci_probe_port(0);
-    port_rebase(&ahci_devices[0].hba_mem->ports[0], 0);
 
     // 初始化请求队列
     ahci_req_queue.in_service = NULL;
     wait_queue_init(&ahci_req_queue.wait_queue_list, NULL);
     ahci_req_queue.request_count = 0;
 
-    ahci_init_gendisk();
+    BUG_ON(ahci_init_gendisk() != 0);
     kinfo("AHCI initialized.");
 }
 
@@ -224,25 +226,28 @@ static void ahci_probe_port(const uint32_t device_num)
         {
             uint dt = check_type(&abar->ports[i]);
             ahci_devices[i].type = dt;
-            if (dt == AHCI_DEV_SATA)
+            switch (dt)
             {
+            case AHCI_DEV_SATA:
                 kdebug("SATA drive found at port %d", i);
-            }
-            else if (dt == AHCI_DEV_SATAPI)
-            {
+                goto found;
+            case AHCI_DEV_SATAPI:
                 kdebug("SATAPI drive found at port %d", i);
-            }
-            else if (dt == AHCI_DEV_SEMB)
-            {
+                goto found;
+            case AHCI_DEV_SEMB:
                 kdebug("SEMB drive found at port %d", i);
-            }
-            else if (dt == AHCI_DEV_PM)
-            {
+                goto found;
+            case AHCI_DEV_PM:
                 kdebug("PM drive found at port %d", i);
-            }
-            else
-            {
-                // kdebug("No drive found at port %d", i);
+                goto found;
+            found:;
+                port_rebase(&ahci_devices[0].hba_mem->ports[i], i);
+                if (__first_port == -1)
+                    __first_port = i;
+                break;
+            default:
+                kdebug("No drive found at port %d", i);
+                break;
             }
         }
     }
@@ -599,7 +604,7 @@ static long ahci_query_disk()
     ahci_req_queue.in_service = (struct block_device_request_packet *)pack;
     list_del(&(ahci_req_queue.in_service->wait_queue.wait_list));
     --ahci_req_queue.request_count;
-
+    // kdebug("ahci_query_disk");
     long ret_val = 0;
 
     switch (pack->blk_pak.cmd)
@@ -615,7 +620,7 @@ static long ahci_query_disk()
         ret_val = E_UNSUPPORTED_CMD;
         break;
     }
-
+    // kdebug("ahci_query_disk: retval=%d", ret_val);
     // ahci_end_request();
     return ret_val;
 }

@@ -1,12 +1,7 @@
 
 
+#include <common/errno.h>
 #include <common/spinlock.h>
-
-/**
- * 错误码
- */
-#define ENOMEM -1
-#define EILLEGAL_VALUE -2
 
 /**
  * idr: 基于radix-tree的ID-pointer的数据结构

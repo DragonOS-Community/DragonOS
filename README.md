@@ -60,6 +60,8 @@
 
 我的邮箱：longjin@RinGoTek.cn
 
+社区邮箱：contact@DragonOS.org
+
 我的博客：[longjin666.cn](https://longjin666.cn)
 
 ## 赞赏

@@ -18,3 +18,12 @@ void devfs_init();
  * @return int 错误码
  */
 int devfs_register_device(uint16_t device_type, uint16_t sub_type, struct vfs_file_operations_t *file_ops, struct devfs_private_inode_info_t **ret_private_inode_info_ptr);
+
+/**
+ * @brief 卸载设备
+ * 
+ * @param private_inode_info 待卸载的设备的inode私有信息
+ * @param put_private_info 设备被卸载后，执行的函数
+ * @return int 错误码
+ */
+int devfs_unregister_device(struct devfs_private_inode_info_t * private_inode_info);

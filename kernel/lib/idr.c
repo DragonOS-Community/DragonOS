@@ -79,7 +79,7 @@ static void *__get_from_free_list(struct idr *idp)
  *
  * @param idp
  * @param gfp_mask
- * @return int 如果分配成功,将返回0; 否则返回负数 -ENOMEM(有可能是内存空间不够)
+ * @return int (如果分配成功,将返回0; 否则返回负数 -ENOMEM, 有可能是内存空间不够)
  */
 int idr_pre_get(struct idr *idp, gfp_t gfp_mask)
 {
@@ -110,7 +110,7 @@ static void __idr_layer_free(struct idr_layer *p)
  * @brief 向上生长一层idr_layer
  *
  * @param idp
- * @return int 0生长成功, 否则返回错误码
+ * @return int (0生长成功, 否则返回错误码)
  */
 static int __idr_grow(struct idr *idp)
 {
@@ -142,7 +142,7 @@ static int __idr_grow(struct idr *idp)
  *
  * @param idp
  * @param stk  栈空间
- * @return int -负数表示获取ID失败, id>=0&&id<=INT_MAX则获取ID成功
+ * @return int (负数表示获取ID失败, [0 <= id && id <= INT_MAX] 则获取ID成功)
  */
 static int __idr_get_empty_slot(struct idr *idp, struct idr_layer **stk)
 {
@@ -230,7 +230,7 @@ static __always_inline void __idr_mark_full(struct idr *idp, int id, struct idr_
  * @param idp
  * @param id
  * @param stk
- * @return int 0表示没有这条路径, 1表示找到这条路径
+ * @return int (0表示没有这条路径, 1表示找到这条路径)
  */
 static __always_inline int __idr_get_path(struct idr *idp, int id, struct idr_layer **stk)
 {
@@ -332,9 +332,7 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
  * @param idp
  * @param ptr
  * @param starting_id 暂时没用
- * @return
- * 0 <= id <= INT_MAX 表示申请的ID；
- * -1是程序出错(内存空间不够或者程序逻辑有误)；
+ * @return (0 <= id <= INT_MAX 表示申请的ID；否则是负数错误码, 可能是内存空间不够或者程序逻辑有误)；
  */
 static int __idr_get_new_above_int(struct idr *idp, void *ptr, int starting_id)
 {
@@ -356,7 +354,7 @@ static int __idr_get_new_above_int(struct idr *idp, void *ptr, int starting_id)
  * @param idp
  * @param ptr     - id 所对应的指针
  * @param int* id - 传入int指针，获取到的NEW_ID存在id里
- * @return int 0表示获取id成功, 负数代表错误(可能是内存空间不够)
+ * @return int (0表示获取id成功, 负数代表错误 - 可能是内存空间不够)
  */
 int idr_get_new(struct idr *idp, void *ptr, int *id)
 {
@@ -483,7 +481,7 @@ void idr_destroy(struct idr *idp)
  *
  * @param idp
  * @param id
- * @return void* (如果id不存在返回NULL；否则返回对应的指针ptr; 注意,有可能用户的数据本来就是NULL)
+ * @return void* (如果id不存在返回NULL；否则返回对应的指针ptr; 注意: 有可能用户的数据本来就是NULL)
  */
 void *idr_find(struct idr *idp, int id)
 {
@@ -614,7 +612,7 @@ void *idr_find_next(struct idr *idp, int start_id)
  * @brief 根据id替换指针，你需要保证这个id存在于idr中，否则将会出现错误
  *
  * @param idp
- * @param ptr 要替换旧指针的新指针 - new_ptr
+ * @param ptr (要替换旧指针的新指针 - new_ptr)
  * @param id
  * @param old_ptr (返回旧指针, 注意NULL不一定是出现错误，有可能是数据本来就是NULL)
  * @return int (0代表成功，否则就是负数 - 代表错误)
@@ -655,9 +653,9 @@ int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
  * @brief 根据id替换指针，你需要保证这个id存在于idr中，否则将会出现错误
  *
  * @param idp
- * @param ptr 要替换 '旧数据指针' 的 '新数据指针' - new_ptr
+ * @param ptr (要替换 '旧数据指针' 的 '新数据指针' - new_ptr)
  * @param id
- * @return int 0代表成功，否则就是错误码(代表错误)
+ * @return int (0代表成功，否则就是错误码 - 代表错误)
  */
 int idr_replace(struct idr *idp, void *ptr, int id)
 {

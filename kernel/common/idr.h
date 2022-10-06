@@ -120,7 +120,7 @@ struct ida_bitmap
 struct ida
 {
     struct idr idr;
-    struct ida_bitmap *free_list;
+    struct ida_bitmap *free_list; // 预分配的数据块
 };
 
 #define DECLARE_IDA(name)  \

@@ -140,6 +140,8 @@
         "chardev.h": "c",
         "rootfs.h": "c",
         "tty.h": "c",
+        "idr.h": "c",
+        "ktest_utils.h": "c",
         "kthread.h": "c",
         "lockref.h": "c",
         "compiler_attributes.h": "c"

@@ -496,6 +496,7 @@ ul initial_kernel_thread(ul arg)
         ktest_start(ktest_test_bitree, 0),
         ktest_start(ktest_test_kfifo, 0),
         ktest_start(ktest_test_mutex, 0),
+        ktest_start(ktest_test_idr, 0),
         // usb_pid,
     };
     kinfo("Waiting test thread exit...");

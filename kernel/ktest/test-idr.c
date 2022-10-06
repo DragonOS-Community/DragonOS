@@ -508,7 +508,7 @@ static long ktest_idr_case6(uint64_t arg0, uint64_t arg1)
 static ktest_case_table kt_idr_func_table[] = {
     ktest_idr_case0,
     ktest_idr_case1,
-    ktest_idr_case2, // 为了加快启动速度, 暂时注释掉这个测试
+    // ktest_idr_case2, // 为了加快启动速度, 暂时注释掉这个测试
     ktest_idr_case3,
     ktest_idr_case4,
     ktest_idr_case5,

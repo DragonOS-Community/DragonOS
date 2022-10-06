@@ -569,7 +569,7 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
 
             pos_i[layer] = layer_id;
 
-            *nextid = (((ull)*nextid) << IDR_BITS) | layer_id; // 更新答案
+            *nextid = (((uint64_t)*nextid) << IDR_BITS) | layer_id; // 更新答案
             if (layer == 0)
             {
                 //  找到下一个id: nextid

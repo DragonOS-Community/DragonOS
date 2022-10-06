@@ -38,7 +38,7 @@ static long ktest_idr_case0(uint64_t arg0, uint64_t arg1)
 
     for (int i = 1; i < 64; i++)
     {
-        int id = lowbit_id(i), chk_id = -1;
+        int id = __lowbit_id(i), chk_id = -1;
         for (int j = 0; j < 64; j++)
             if ((i >> j) & 1)
             {

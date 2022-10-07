@@ -48,4 +48,32 @@ char* strcpy(char* dst, const char* src);
  */
 char *strcat(char *dest, const char *src);
 
-#define memcpy(dst, src, n) __builtin_memcpy(dst, src, n)
+/**
+ * @brief 内存拷贝函数
+ *
+ * @param dst 目标数组
+ * @param src 源数组
+ * @param Num 字节数
+ * @return void*
+ */
+static void *memcpy(void *dst, const void *src, long Num)
+{
+    int d0 = 0, d1 = 0, d2 = 0;
+    __asm__ __volatile__("cld	\n\t"
+                         "rep	\n\t"
+                         "movsq	\n\t"
+                         "testb	$4,%b4	\n\t"
+                         "je	1f	\n\t"
+                         "movsl	\n\t"
+                         "1:\ttestb	$2,%b4	\n\t"
+                         "je	2f	\n\t"
+                         "movsw	\n\t"
+                         "2:\ttestb	$1,%b4	\n\t"
+                         "je	3f	\n\t"
+                         "movsb	\n\t"
+                         "3:	\n\t"
+                         : "=&c"(d0), "=&D"(d1), "=&S"(d2)
+                         : "0"(Num / 8), "q"(Num), "1"(dst), "2"(src)
+                         : "memory");
+    return dst;
+}

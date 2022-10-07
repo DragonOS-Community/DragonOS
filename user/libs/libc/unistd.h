@@ -83,25 +83,33 @@ int64_t chdir(char *dest_path);
 
 /**
  * @brief 执行新的程序
- * 
+ *
  * @param path 文件路径
  * @param argv 参数列表
- * @return int 
+ * @return int
  */
-int execv(const char* path, char * const argv[]);
+int execv(const char *path, char *const argv[]);
 
 /**
  * @brief 睡眠指定时间
- * 
+ *
  * @param usec 微秒
- * @return int 
+ * @return int
  */
 extern int usleep(useconds_t usec);
 
 /**
  * @brief 删除文件夹
- * 
+ *
  * @param path 绝对路径
  * @return int 错误码
  */
-int rmdir(const char* path);
+int rmdir(const char *path);
+
+/**
+ * @brief  交换n字节
+ *  @param src  源地址
+ *  @param dest  目的地址
+ * @param nbytes  交换字节数
+ */
+void swab(void *restrict src, void *restrict dest, ssize_t nbytes);

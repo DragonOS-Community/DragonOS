@@ -370,10 +370,6 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
 
     // 初始化超级块的dir entry
     sb_ptr->root = vfs_alloc_dentry(2);
-    memset(sb_ptr->root, 0, sizeof(struct vfs_dir_entry_t));
-
-    list_init(&sb_ptr->root->child_node_list);
-    list_init(&sb_ptr->root->subdirs_list);
 
     sb_ptr->root->parent = sb_ptr->root;
     sb_ptr->root->dir_ops = &fat32_dEntry_ops;

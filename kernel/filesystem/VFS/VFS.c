@@ -299,8 +299,6 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
 
     struct vfs_dir_entry_t *subdir_dentry = vfs_alloc_dentry(pathlen - last_slash);
 
-    list_init(&subdir_dentry->subdirs_list);
-    list_init(&subdir_dentry->child_node_list);
     if (path[pathlen - 1] == '/')
         subdir_dentry->name_length = pathlen - last_slash - 2;
     else

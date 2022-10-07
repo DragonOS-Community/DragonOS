@@ -206,8 +206,6 @@ static __always_inline void __devfs_init_root_inode()
 static __always_inline void __devfs_init_root_dentry()
 {
     devfs_root_dentry = vfs_alloc_dentry(0);
-    list_init(&devfs_root_dentry->child_node_list);
-    list_init(&devfs_root_dentry->subdirs_list);
     devfs_root_dentry->dir_ops = &devfs_dentry_ops;
 
     __devfs_init_root_inode();

@@ -369,16 +369,11 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
     printk_color(BLUE, BLACK, "FAT32 FSInfo\n\tFSI_LeadSig:%#018lx\n\tFSI_StrucSig:%#018lx\n\tFSI_Free_Count:%#018lx\n", fsbi->fsinfo.FSI_LeadSig, fsbi->fsinfo.FSI_StrucSig, fsbi->fsinfo.FSI_Free_Count);
 
     // 初始化超级块的dir entry
-    sb_ptr->root = (struct vfs_dir_entry_t *)kmalloc(sizeof(struct vfs_dir_entry_t), 0);
-    memset(sb_ptr->root, 0, sizeof(struct vfs_dir_entry_t));
-
-    list_init(&sb_ptr->root->child_node_list);
-    list_init(&sb_ptr->root->subdirs_list);
+    sb_ptr->root = vfs_alloc_dentry(2);
 
     sb_ptr->root->parent = sb_ptr->root;
     sb_ptr->root->dir_ops = &fat32_dEntry_ops;
     // 分配2个字节的name
-    sb_ptr->root->name = (char *)(kmalloc(2, 0));
     sb_ptr->root->name[0] = '/';
     sb_ptr->root->name_length = 1;
 

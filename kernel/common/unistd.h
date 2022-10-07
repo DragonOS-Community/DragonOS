@@ -33,4 +33,4 @@ pid_t vfork(void);
  *  @param dest  目的地址
  * @param nbytes  交换字节数
  */
-void swab( void *restrict src, void *restrict dest, ssize_t nbytes);
+void swab(void *restrict src, void *restrict dest, ssize_t nbytes);

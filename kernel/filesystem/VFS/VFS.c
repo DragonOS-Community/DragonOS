@@ -297,7 +297,6 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
         return -EEXIST;
     }
 
-    // struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
     struct vfs_dir_entry_t *subdir_dentry = vfs_alloc_dentry(pathlen - last_slash);
 
     list_init(&subdir_dentry->subdirs_list);
@@ -306,7 +305,6 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
         subdir_dentry->name_length = pathlen - last_slash - 2;
     else
         subdir_dentry->name_length = pathlen - last_slash - 1;
-    subdir_dentry->name = (char *)kmalloc(subdir_dentry->name_length + 1, 0);
     memset((void *)subdir_dentry->name, 0, subdir_dentry->name_length + 1);
 
     for (int i = last_slash + 1, cnt = 0; i < pathlen && cnt < subdir_dentry->name_length; ++i, ++cnt)
@@ -410,11 +408,9 @@ uint64_t do_open(const char *filename, int flags)
             parent_dentry = vfs_root_sb->root;
 
         // 创建新的文件
-        // dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
         dentry = vfs_alloc_dentry(path_len - tmp_index);
 
         dentry->name_length = path_len - tmp_index - 1;
-        dentry->name = (char *)kzalloc(dentry->name_length + 1, 0);
         strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
         // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
         dentry->parent = parent_dentry;
@@ -515,7 +511,8 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size)
     struct vfs_dir_entry_t *dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
     if (unlikely(dentry == NULL))
         return NULL;
-    dentry->name = (char *)kzalloc(name_size, 0);
+    if (name_size != 0)
+        dentry->name = (char *)kzalloc(name_size, 0);
 
     // 初始化lockref
     spin_init(&dentry->lockref.lock);

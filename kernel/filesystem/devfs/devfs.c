@@ -205,8 +205,7 @@ static __always_inline void __devfs_init_root_inode()
  */
 static __always_inline void __devfs_init_root_dentry()
 {
-    // devfs_root_dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
-    devfs_root_dentry = vfs_alloc_dentry(2);
+    devfs_root_dentry = vfs_alloc_dentry(0);
     list_init(&devfs_root_dentry->child_node_list);
     list_init(&devfs_root_dentry->subdirs_list);
     devfs_root_dentry->dir_ops = &devfs_dentry_ops;

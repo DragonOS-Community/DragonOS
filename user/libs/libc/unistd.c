@@ -3,6 +3,8 @@
 #include <libc/errno.h>
 #include <libc/stdio.h>
 #include <libc/stddef.h>
+#include<libc/stdlib.h>
+#include<libc/string.h>
 
 /**
  * @brief 关闭文件接口
@@ -157,4 +159,27 @@ int execv(const char *path, char *const argv[])
 int rmdir(const char *path)
 {
     return syscall_invoke(SYS_RMDIR, (uint64_t)path, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * @brief  交换n字节
+ *  @param src  源地址
+ *  @param dest  目的地址
+ * @param nbytes  交换字节数
+ */
+void swab( void *restrict src, void *restrict dest, ssize_t nbytes)
+{
+       unsigned char buf[32];
+       char *_src = src;
+       char *_dest = dest;
+       uint32_t transfer;
+       for (; nbytes > 0; nbytes -= transfer)
+       {
+              transfer = (nbytes > 32) ? 32 : nbytes;
+             memcpy(buf, _src, transfer);
+             memcpy(_src, _dest, transfer);
+             memcpy(_dest, buf, transfer);
+              _src += transfer;
+              _dest += transfer;
+       }
 }

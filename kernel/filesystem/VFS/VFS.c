@@ -297,7 +297,8 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
         return -EEXIST;
     }
 
-    struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
+    // struct vfs_dir_entry_t *subdir_dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
+    struct vfs_dir_entry_t *subdir_dentry = vfs_alloc_dentry(pathlen - last_slash);
 
     list_init(&subdir_dentry->subdirs_list);
     list_init(&subdir_dentry->child_node_list);
@@ -409,7 +410,8 @@ uint64_t do_open(const char *filename, int flags)
             parent_dentry = vfs_root_sb->root;
 
         // 创建新的文件
-        dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
+        // dentry = (struct vfs_dir_entry_t *)kzalloc(sizeof(struct vfs_dir_entry_t), 0);
+        dentry = vfs_alloc_dentry(path_len - tmp_index);
 
         dentry->name_length = path_len - tmp_index - 1;
         dentry->name = (char *)kzalloc(dentry->name_length + 1, 0);

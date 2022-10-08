@@ -296,29 +296,37 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
         kwarn("Dir '%s' aleardy exists.", path);
         return -EEXIST;
     }
-
+    spin_lock(&parent_dir->lockref.lock);
+    int retval=-EAGAIN;
     struct vfs_dir_entry_t *subdir_dentry = vfs_alloc_dentry(pathlen - last_slash);
 
     if (path[pathlen - 1] == '/')
         subdir_dentry->name_length = pathlen - last_slash - 2;
     else
         subdir_dentry->name_length = pathlen - last_slash - 1;
-    memset((void *)subdir_dentry->name, 0, subdir_dentry->name_length + 1);
 
     for (int i = last_slash + 1, cnt = 0; i < pathlen && cnt < subdir_dentry->name_length; ++i, ++cnt)
     {
         subdir_dentry->name[cnt] = path[i];
     }
-    ++subdir_dentry->name_length;
-
+    spin_lock(&subdir_dentry->lockref.lock);
     // kdebug("last_slash=%d", last_slash);
     // kdebug("name=%s", path + last_slash + 1);
     subdir_dentry->parent = parent_dir;
     // kdebug("to mkdir, parent name=%s", parent_dir->name);
-    int retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
+    retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
+    if(retval!=0){
+        goto out;//释放dentry
+    }
     list_append(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
     // kdebug("retval = %d", retval);
+    spin_unlock(&subdir_dentry->lockref.lock);
+    spin_unlock(&parent_dir->lockref.lock);
     return 0;
+out:;
+    spin_unlock(&parent_dir->lockref.lock);
+    spin_unlock(&subdir_dentry->lockref.lock);
+    return retval;
 }
 /**
  * @brief 创建文件夹

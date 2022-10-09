@@ -297,8 +297,8 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
         return -EEXIST;
     }
     spin_lock(&parent_dir->lockref.lock);
-    int retval=-EAGAIN;
     struct vfs_dir_entry_t *subdir_dentry = vfs_alloc_dentry(pathlen - last_slash);
+    struct vfs_dir_entry_t *prev_dentry = NULL;
 
     if (path[pathlen - 1] == '/')
         subdir_dentry->name_length = pathlen - last_slash - 2;
@@ -309,23 +309,37 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
     {
         subdir_dentry->name[cnt] = path[i];
     }
-    spin_lock(&subdir_dentry->lockref.lock);
     // kdebug("last_slash=%d", last_slash);
     // kdebug("name=%s", path + last_slash + 1);
     subdir_dentry->parent = parent_dir;
     // kdebug("to mkdir, parent name=%s", parent_dir->name);
-    retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
-    if(retval!=0){
-        goto out;//释放dentry
+    int retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
+    if (retval != 0)
+    {
+        goto out; //释放parent_dir
     }
-    list_append(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
-    // kdebug("retval = %d", retval);
-    spin_unlock(&subdir_dentry->lockref.lock);
-    spin_unlock(&parent_dir->lockref.lock);
-    return 0;
+
+    // 获取append前一个dentry并加锁
+    struct List *target_list = &parent_dir->subdirs_list;
+    // kdebug("target_list=%#018lx target_list->prev=%#018lx",target_list,target_list->prev);
+    if (list_empty(target_list) == false)
+    {
+        prev_dentry = list_entry(target_list->prev, struct vfs_dir_entry_t, child_node_list);
+        // kdebug("prev_dentry%#018lx",prev_dentry);
+        spin_lock(&prev_dentry->lockref.lock);
+        list_append(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
+        // kdebug("retval = %d", retval);
+        spin_unlock(&prev_dentry->lockref.lock);
+        retval = 0;
+    }
+    else
+    {
+        list_append(&parent_dir->subdirs_list, &subdir_dentry->child_node_list);
+        goto out;
+    }
+
 out:;
     spin_unlock(&parent_dir->lockref.lock);
-    spin_unlock(&subdir_dentry->lockref.lock);
     return retval;
 }
 /**
@@ -382,7 +396,7 @@ uint64_t do_open(const char *filename, int flags)
 
     // 寻找文件
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-
+    spin_lock(&dentry->lockref.lock);
     if (dentry == NULL && flags & O_CREAT)
     {
         // 先找到倒数第二级目录
@@ -406,13 +420,17 @@ uint64_t do_open(const char *filename, int flags)
             if (dentry == NULL)
             {
                 kfree(path);
+                spin_unlock(&dentry->lockref.lock);
                 return -ENOENT;
             }
+            spin_lock(&parent_dentry->lockref.lock);
             parent_dentry = dentry;
         }
         else
+        {
+            spin_lock(&parent_dentry->lockref.lock);
             parent_dentry = vfs_root_sb->root;
-
+        }
         // 创建新的文件
         dentry = vfs_alloc_dentry(path_len - tmp_index);
 
@@ -426,22 +444,29 @@ uint64_t do_open(const char *filename, int flags)
             kfree(dentry->name);
             kfree(dentry);
             kfree(path);
+            spin_unlock(&parent_dentry->lockref.lock);
+            spin_unlock(&dentry->lockref.lock);
             return retval;
         }
 
         list_init(&dentry->child_node_list);
         list_init(&dentry->subdirs_list);
         list_add(&parent_dentry->subdirs_list, &dentry->child_node_list);
+        spin_unlock(&parent_dentry->lockref.lock);
         // kdebug("created.");
     }
     kfree(path);
     if (dentry == NULL)
+    {
+        spin_unlock(&dentry->lockref.lock);
         return -ENOENT;
-
+    }
     // 要求打开文件夹而目标不是文件夹
     if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_IF_DIR))
+    {
+        spin_unlock(&dentry->lockref.lock);
         return -ENOTDIR;
-
+    }
     // 创建文件描述符
     struct vfs_file_t *file_ptr = (struct vfs_file_t *)kzalloc(sizeof(struct vfs_file_t), 0);
 
@@ -459,6 +484,7 @@ uint64_t do_open(const char *filename, int flags)
     if (errcode != VFS_SUCCESS)
     {
         kfree(file_ptr);
+        spin_unlock(&dentry->lockref.lock);
         return -EFAULT;
     }
 
@@ -489,10 +515,12 @@ uint64_t do_open(const char *filename, int flags)
     if (fd_num == -1)
     {
         kfree(file_ptr);
+        spin_unlock(&dentry->lockref.lock);
         return -EMFILE;
     }
     // 保存文件描述符
     f[fd_num] = file_ptr;
+    spin_unlock(&dentry->lockref.lock);
     return fd_num;
 }
 

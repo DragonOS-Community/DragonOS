@@ -245,7 +245,7 @@ int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
 int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
 {
     uint32_t pathlen;
-    int retval;
+    int retval=0;
     if (from_userland)
         pathlen = strnlen_user(path, PAGE_4K_SIZE - 1);
     else
@@ -314,10 +314,14 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
     // kdebug("name=%s", path + last_slash + 1);
     subdir_dentry->parent = parent_dir;
     // kdebug("to mkdir, parent name=%s", parent_dir->name);
+    spin_lock(&parent_dir->dir_inode->lockref.lock);
     retval = parent_dir->dir_inode->inode_ops->mkdir(parent_dir->dir_inode, subdir_dentry, 0);
+    spin_unlock(&parent_dir->dir_inode->lockref.lock);
     if (retval != 0)
     {
-        goto out; //释放parent_dir
+        if (vfs_dentry_put(parent_dir) != 0) // 释放dentry
+                spin_unlock(&parent_dir->lockref.lock);
+        return retval;
     }
 
     // 获取append前一个dentry并加锁
@@ -398,7 +402,6 @@ uint64_t do_open(const char *filename, int flags)
 
     // 寻找文件
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-    spin_lock(&dentry->lockref.lock);
     if (dentry == NULL && flags & O_CREAT)
     {
         // 先找到倒数第二级目录
@@ -433,13 +436,12 @@ uint64_t do_open(const char *filename, int flags)
         // 创建新的文件
         dentry = vfs_alloc_dentry(path_len - tmp_index);
 
-        // dentry地址更换，重新加锁
-        spin_lock(&dentry->lockref.lock);
         dentry->name_length = path_len - tmp_index - 1;
         strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
         // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
         dentry->parent = parent_dentry;
         // 创建inode时对其进行加锁放锁
+        spin_lock(&dentry->lockref.lock);
         spin_lock(&parent_dentry->dir_inode->lockref.lock);
         uint64_t retval = parent_dentry->dir_inode->inode_ops->create(parent_dentry->dir_inode, dentry, 0);
         spin_unlock(&parent_dentry->dir_inode->lockref.lock);
@@ -447,22 +449,22 @@ uint64_t do_open(const char *filename, int flags)
         {
             if (vfs_dentry_put(dentry) != 0) // 释放dentry
                 spin_unlock(&dentry->lockref.lock);
-            kfree(dentry->name);
-            kfree(dentry);
+            BUG_ON(1);
             kfree(path);
             return retval;
         }
-
-        // 添加锁住dentry,前面已经对dentry加锁
+        // 添加锁住dentry
         list_add(&parent_dentry->subdirs_list, &dentry->child_node_list);
+        spin_unlock(&dentry->lockref.lock);
         // kdebug("created.");
     }
+
     kfree(path);
     if (dentry == NULL)
     {
         return -ENOENT;
     }
-    // 上面已对dentry加锁
+    spin_lock(&dentry->lockref.lock);
     // 要求打开文件夹而目标不是文件夹
     if ((flags & O_DIRECTORY) && (dentry->dir_inode->attribute != VFS_IF_DIR))
     {
@@ -518,7 +520,7 @@ uint64_t do_open(const char *filename, int flags)
     {
         kfree(file_ptr);
         spin_unlock(&dentry->lockref.lock);
-        return -EMFILE;
+        return -ENFILE;
     }
     // 保存文件描述符
     f[fd_num] = file_ptr;

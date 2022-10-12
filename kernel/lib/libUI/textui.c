@@ -30,7 +30,8 @@ static spinlock_t change_lock;
  * @param vlines_ptr 虚拟行数组指针
  * @param cperline 每行最大的字符数
  */
-static int __textui_init_window(struct textui_window_t *window, uint8_t flags, uint16_t vlines_num, void *vlines_ptr, uint16_t cperline)
+static int __textui_init_window(struct textui_window_t *window, uint8_t flags, uint16_t vlines_num, void *vlines_ptr,
+                                uint16_t cperline)
 {
     memset((window), 0, sizeof(struct textui_window_t));
     list_init(&(window)->list);
@@ -57,12 +58,12 @@ static int __textui_init_window(struct textui_window_t *window, uint8_t flags, u
  * @param vline 虚拟行对象指针
  * @param chars_ptr 字符对象数组指针
  */
-#define __textui_init_vline(vline, chars_ptr)                      \
-    do                                                             \
-    {                                                              \
-        memset(vline, 0, sizeof(struct textui_vline_chromatic_t)); \
-        (vline)->index = 0;                                        \
-        (vline)->chars = chars_ptr;                                \
+#define __textui_init_vline(vline, chars_ptr)                                                                          \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        memset(vline, 0, sizeof(struct textui_vline_chromatic_t));                                                     \
+        (vline)->index = 0;                                                                                            \
+        (vline)->chars = chars_ptr;                                                                                    \
     } while (0)
 
 int textui_install_handler(struct scm_buffer_info_t *buf)
@@ -79,7 +80,7 @@ int textui_uninstall_handler(void *args)
 
 int textui_enable_handler(void *args)
 {
-    uart_send_str(COM1, "textui_enable_handler");
+    uart_send_str(COM1, "textui_enable_handler\n");
     return 0;
 }
 
@@ -90,28 +91,18 @@ int textui_disable_handler(void *args)
 
 int textui_change_handler(struct scm_buffer_info_t *buf)
 {
-    spin_lock(&change_lock);
-    kdebug("current_pcb->pid = %d", current_pcb->pid);
-    cli();
-
-    kdebug("HANDLE NOW, size = %u", textui_framework.buf->size);
     memcpy((void *)buf->vaddr, (void *)(textui_framework.buf->vaddr), textui_framework.buf->size);
-    kdebug("HANDLE SEC, pre_buf_ptr = %#018lx, nxt buf_ptr = %#018lx", textui_framework.buf, buf);
     textui_framework.buf = buf;
-    kdebug("HANDLE OVER");
-
-    sti();
-    spin_unlock(&change_lock);
+    
     return 0;
 }
 
-struct scm_ui_framework_operations_t textui_ops =
-    {
-        .install = &textui_install_handler,
-        .uninstall = &textui_uninstall_handler,
-        .change = &textui_change_handler,
-        .enable = &textui_enable_handler,
-        .disable = &textui_disable_handler,
+struct scm_ui_framework_operations_t textui_ops = {
+    .install = &textui_install_handler,
+    .uninstall = &textui_uninstall_handler,
+    .change = &textui_change_handler,
+    .enable = &textui_enable_handler,
+    .disable = &textui_disable_handler,
 };
 
 /**
@@ -177,7 +168,8 @@ static int __textui_new_line(struct textui_window_t *window, uint16_t vline_id)
  * @param character
  * @return int
  */
-static int __textui_putchar_window(struct textui_window_t *window, uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
+static int __textui_putchar_window(struct textui_window_t *window, uint16_t character, uint32_t FRcolor,
+                                   uint32_t BKcolor)
 {
     if (textui_is_chromatic(window->flags)) // 启用彩色字符
     {
@@ -257,7 +249,8 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
         if (window->vlines.chromatic[window->vline_operating].index <= 0)
         {
             window->vlines.chromatic[window->vline_operating].index = 0;
-            memset(window->vlines.chromatic[window->vline_operating].chars, 0, sizeof(struct textui_char_chromatic_t) * window->chars_per_line);
+            memset(window->vlines.chromatic[window->vline_operating].chars, 0,
+                   sizeof(struct textui_char_chromatic_t) * window->chars_per_line);
             --(window->vline_operating);
             if (unlikely(window->vline_operating < 0))
                 window->vline_operating = window->vlines_num - 1;

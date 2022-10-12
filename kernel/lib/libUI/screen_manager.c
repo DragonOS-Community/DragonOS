@@ -245,37 +245,32 @@ int scm_enable_double_buffer()
     // 这里的ptr不需要特判空指针吗 问题1
     do
     {
-        kdebug("SHOW ME YOUR BUGS`!");
         if (ptr->buf == &video_frame_buffer_info)
         {
-            kdebug("INSIDE 1");
-            uart_send_str(COM1, "##init double buffer##");
-            kdebug("INSIDE 2");
+            uart_send_str(COM1, "##init double buffer##\n");
             struct scm_buffer_info_t *buf = __create_buffer(SCM_BF_DB | SCM_BF_PIXEL);
             if ((uint64_t)(buf) == (uint64_t)-ENOMEM)
                 return -ENOMEM;
-            kdebug("INSIDE 3");
-            uart_send_str(COM1, "##to change double buffer##");
-            kdebug("INSIDE 4");
+            uart_send_str(COM1, "##to change double buffer##\n");
+
             if (ptr->ui_ops->change(buf) != 0)  // 这里的change回调函数不会是空指针吗 问题2
             {
-                kdebug("BUGG 1");
+
                 __destroy_buffer(buf);
                 kfree(buf);
-                kdebug("BUGG 2");
+
             }
-            kdebug("INSIDE 5");
+
         }
-        kdebug("FRAME OVER!");
+
     } while (list_next(&ptr->list) != &scm_framework_list); // 枚举链表的每一个ui框架
 
-    kdebug("PRINT 22");
 
     // 设置定时刷新的对象
     video_set_refresh_target(__current_framework->buf);
     // 通知显示驱动，启动双缓冲
     video_reinitialize(true);
-    uart_send_str(COM1, "##initialized double buffer##");
+    uart_send_str(COM1, "##initialized double buffer##\n");
     return 0;
 }
 

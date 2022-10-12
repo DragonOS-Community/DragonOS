@@ -483,8 +483,6 @@ ul initial_kernel_thread(ul arg)
 
     scm_enable_double_buffer();
 
-    kdebug("SHOW SHOW WAIT");
-
     ahci_init();
     fat32_init();
     rootfs_umount();
@@ -801,7 +799,7 @@ int process_wakeup(struct process_control_block *pcb)
     // kdebug("pcb pid = %#018lx", pcb->pid);
 
     BUG_ON(pcb == NULL);
-    if (pcb == current_pcb || pcb == NULL) // 这个又是为什么???
+    if (pcb == current_pcb || pcb == NULL)
         return -EINVAL;
     // 如果pcb正在调度队列中，则不重复加入调度队列
     if (pcb->state & PROC_RUNNING)

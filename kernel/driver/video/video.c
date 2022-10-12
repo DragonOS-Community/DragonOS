@@ -38,7 +38,8 @@ void init_frame_buffer()
     int reserved;
 
     video_frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
-    mm_map_proc_page_table(global_CR3, true, video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true, false);
+    mm_map_proc_page_table(global_CR3, true, video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr,
+                           video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true, false);
 
     flush_tlb();
     kinfo("VBE frame buffer successfully Re-mapped!");
@@ -51,6 +52,9 @@ void init_frame_buffer()
  */
 int video_refresh_daemon(void *unused)
 {
+    // 初始化锁, 这个锁只会在daemon中使用
+    spin_init(&daemon_refresh_lock);
+    
     for (;;)
     {
         if (clock() >= video_refresh_expire_jiffies)
@@ -60,7 +64,8 @@ int video_refresh_daemon(void *unused)
             if (likely(video_refresh_target != NULL))
             {
                 spin_lock(&daemon_refresh_lock);
-                memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr, video_refresh_target->size);
+                memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr,
+                       video_refresh_target->size);
                 spin_unlock(&daemon_refresh_lock);
             }
         }
@@ -98,9 +103,6 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
         // 计算开始时间
         video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
 
-        // 创建守护进程的同时初始化锁, 这个锁只会在daemon中使用
-        spin_init(&daemon_refresh_lock);
-
         // 创建video守护进程
         video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, CLONE_FS | CLONE_SIGNAL);
         video_daemon_pcb->virtual_runtime = 0; // 特殊情况， 最高优先级， 以后再改
@@ -123,12 +125,15 @@ int video_set_refresh_target(struct scm_buffer_info_t *buf)
 {
 
     unregister_softirq(VIDEO_REFRESH_SIRQ);
-    int counter = 100;
-    while ((get_softirq_pending() & (1 << VIDEO_REFRESH_SIRQ)) && counter > 0)
-    {
-        --counter;
-        usleep(1000);
-    }
+    // todo: 在completion实现后，在这里等待其他刷新任务完成，再进行下一步。
+
+    // int counter = 100;
+
+    // while ((get_softirq_pending() & (1 << VIDEO_REFRESH_SIRQ)) && counter > 0)
+    // {
+    //     --counter;
+    //     usleep(1000);
+    // }
     // kdebug("buf = %#018lx", buf);
     video_refresh_target = buf;
     register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
@@ -170,10 +175,12 @@ int video_init()
     video_frame_buffer_info.height = __fb_info.framebuffer_height;
     io_mfence();
 
-    video_frame_buffer_info.size = video_frame_buffer_info.width * video_frame_buffer_info.height * ((video_frame_buffer_info.bit_depth + 7) / 8);
+    video_frame_buffer_info.size =
+        video_frame_buffer_info.width * video_frame_buffer_info.height * ((video_frame_buffer_info.bit_depth + 7) / 8);
     // 先临时映射到该地址，稍后再重新映射
     video_frame_buffer_info.vaddr = 0xffff800003000000;
-    mm_map_phys_addr(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+    mm_map_phys_addr(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size,
+                     PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
 
     io_mfence();
     char init_text2[] = "Video driver initialized.";

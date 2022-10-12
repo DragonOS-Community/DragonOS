@@ -165,7 +165,7 @@ void system_initialize()
 
     process_init();
     // 启用double buffer
-    scm_enable_double_buffer();
+    // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
 
     // fat32_init();

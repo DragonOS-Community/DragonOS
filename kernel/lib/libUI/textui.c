@@ -1,11 +1,11 @@
 #include "textui.h"
 
-#include "screen_manager.h"
 #include "driver/uart/uart.h"
-#include <common/string.h>
-#include <common/printk.h>
+#include "screen_manager.h"
 #include <common/atomic.h>
 #include <common/errno.h>
+#include <common/printk.h>
+#include <common/string.h>
 
 struct scm_ui_framework_t textui_framework;
 static spinlock_t __window_id_lock = {1};
@@ -19,6 +19,7 @@ static struct textui_vline_chromatic_t __initial_vlines[INITIAL_VLINES] = {0};
 static struct textui_window_t __initial_window = {0}; // 初始窗口
 static struct textui_private_info_t __private_info = {0};
 static struct List __windows_list;
+static spinlock_t change_lock;
 
 /**
  * @brief 初始化window对象
@@ -89,8 +90,18 @@ int textui_disable_handler(void *args)
 
 int textui_change_handler(struct scm_buffer_info_t *buf)
 {
+    spin_lock(&change_lock);
+    kdebug("current_pcb->pid = %d", current_pcb->pid);
+    cli();
+
+    kdebug("HANDLE NOW, size = %u", textui_framework.buf->size);
     memcpy((void *)buf->vaddr, (void *)(textui_framework.buf->vaddr), textui_framework.buf->size);
+    kdebug("HANDLE SEC, pre_buf_ptr = %#018lx, nxt buf_ptr = %#018lx", textui_framework.buf, buf);
     textui_framework.buf = buf;
+    kdebug("HANDLE OVER");
+
+    sti();
+    spin_unlock(&change_lock);
     return 0;
 }
 
@@ -295,6 +306,8 @@ int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
  */
 int textui_init()
 {
+    spin_init(&change_lock);
+
     spin_init(&__window_id_lock);
     __window_max_id = 0;
     list_init(&__windows_list);

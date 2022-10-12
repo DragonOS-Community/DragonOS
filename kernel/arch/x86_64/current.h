@@ -4,7 +4,8 @@
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 struct process_control_block;
-// 获取当前的pcb
+
+// 获取当前进程的pcb
 struct process_control_block *get_current_pcb()
 {
 	struct process_control_block *current = NULL;
@@ -15,6 +16,7 @@ struct process_control_block *get_current_pcb()
 						 : "0"(~32767UL));
 	barrier();
 	return current;
-};
+}
+
 #define current_pcb get_current_pcb()
 #pragma GCC pop_options

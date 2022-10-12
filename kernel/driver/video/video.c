@@ -1,17 +1,17 @@
 #include "video.h"
-#include <mm/mm.h>
-#include <common/printk.h>
-#include <driver/multiboot2/multiboot2.h>
-#include <time/timer.h>
 #include <common/kprint.h>
+#include <common/kthread.h>
+#include <common/printk.h>
+#include <common/spinlock.h>
+#include <common/time.h>
+#include <driver/multiboot2/multiboot2.h>
+#include <driver/uart/uart.h>
+#include <exception/softirq.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
-#include <common/spinlock.h>
-#include <exception/softirq.h>
-#include <driver/uart/uart.h>
-#include <common/time.h>
-
-
+#include <process/process.h>
+#include <sched/sched.h>
+#include <time/timer.h>
 
 uint64_t video_refresh_expire_jiffies = 0;
 uint64_t video_last_refresh_pid = -1;
@@ -19,9 +19,10 @@ uint64_t video_last_refresh_pid = -1;
 struct scm_buffer_info_t video_frame_buffer_info = {0};
 static struct multiboot_tag_framebuffer_info_t __fb_info;
 static struct scm_buffer_info_t *video_refresh_target = NULL;
+static struct process_control_block *video_daemon_pcb = NULL;
+static spinlock_t daemon_refresh_lock;
 
 #define REFRESH_INTERVAL 15UL // 启动刷新帧缓冲区任务的时间间隔
-
 
 /**
  * @brief VBE帧缓存区的地址重新映射
@@ -44,15 +45,41 @@ void init_frame_buffer()
 }
 
 /**
- * @brief 刷新帧缓冲区
- *
+ * @brief video守护进程, 按时刷新帧缓冲区
+ * @param unused
+ * @return int
+ */
+int video_refresh_daemon(void *unused)
+{
+    for (;;)
+    {
+        if (clock() >= video_refresh_expire_jiffies)
+        {
+            video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
+
+            if (likely(video_refresh_target != NULL))
+            {
+                spin_lock(&daemon_refresh_lock);
+                memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr, video_refresh_target->size);
+                spin_unlock(&daemon_refresh_lock);
+            }
+        }
+        video_daemon_pcb->flags &= ~PROC_RUNNING;
+        sched();
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 唤醒video的守护进程
  */
 void video_refresh_framebuffer(void *data)
 {
-    video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
-    if (unlikely(video_refresh_target == NULL))
+    if (unlikely(video_daemon_pcb == NULL))
         return;
-    memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr, video_refresh_target->size);
+
+    process_wakeup(video_daemon_pcb);
 }
 
 /**
@@ -62,16 +89,24 @@ void video_refresh_framebuffer(void *data)
  * true ->高级初始化：增加double buffer的支持
  * @return int
  */
-int video_reinitialize(bool level)
+int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 video_init() 先被调用
 {
     if (level == false)
         init_frame_buffer();
     else
     {
+        // 计算开始时间
+        video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
+
+        // 创建守护进程的同时初始化锁, 这个锁只会在daemon中使用
+        spin_init(&daemon_refresh_lock);
+
+        // 创建video守护进程
+        video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, CLONE_FS | CLONE_SIGNAL);
+        video_daemon_pcb->virtual_runtime = 0; // 特殊情况， 最高优先级， 以后再改
+
         // 启用屏幕刷新软中断
         register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
-
-        video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
 
         raise_softirq(VIDEO_REFRESH_SIRQ);
     }
@@ -94,6 +129,7 @@ int video_set_refresh_target(struct scm_buffer_info_t *buf)
         --counter;
         usleep(1000);
     }
+    // kdebug("buf = %#018lx", buf);
     video_refresh_target = buf;
     register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
     raise_softirq(VIDEO_REFRESH_SIRQ);
@@ -143,5 +179,6 @@ int video_init()
     char init_text2[] = "Video driver initialized.";
     for (int i = 0; i < sizeof(init_text2) - 1; ++i)
         uart_send(COM1, init_text2[i]);
+
     return 0;
 }

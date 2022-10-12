@@ -1,29 +1,29 @@
 #include "process.h"
 
-#include <common/printk.h>
-#include <common/kprint.h>
-#include <common/stdio.h>
-#include <common/string.h>
 #include <common/compiler.h>
 #include <common/elf.h>
+#include <common/kprint.h>
 #include <common/kthread.h>
-#include <common/time.h>
+#include <common/printk.h>
+#include <common/spinlock.h>
+#include <common/stdio.h>
+#include <common/string.h>
 #include <common/sys/wait.h>
-#include <driver/video/video.h>
+#include <common/time.h>
+#include <common/unistd.h>
+#include <debug/bug.h>
+#include <debug/traceback/traceback.h>
+#include <driver/disk/ahci/ahci.h>
 #include <driver/usb/usb.h>
+#include <driver/video/video.h>
 #include <exception/gate.h>
-#include <filesystem/fat32/fat32.h>
 #include <filesystem/devfs/devfs.h>
+#include <filesystem/fat32/fat32.h>
 #include <filesystem/rootfs/rootfs.h>
 #include <mm/slab.h>
-#include <common/spinlock.h>
+#include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-#include <sched/sched.h>
-#include <common/unistd.h>
-#include <debug/traceback/traceback.h>
-#include <debug/bug.h>
-#include <driver/disk/ahci/ahci.h>
 
 #include <ktest/ktest.h>
 
@@ -372,7 +372,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     // 独立的地址空间才能使新程序正常运行
     if (current_pcb->flags & PF_VFORK)
     {
-        kdebug("proc:%d  creating new mem space", current_pcb->pid);
+        // kdebug("proc:%d  creating new mem space", current_pcb->pid);
         // 分配新的内存空间分布结构体
         struct mm_struct *new_mms = (struct mm_struct *)kmalloc(sizeof(struct mm_struct), 0);
         memset(new_mms, 0, sizeof(struct mm_struct));
@@ -479,7 +479,11 @@ exec_failed:;
 #pragma GCC optimize("O0")
 ul initial_kernel_thread(ul arg)
 {
-    // kinfo("initial proc running...\targ:%#018lx", arg);
+    kinfo("initial proc running...\targ:%#018lx", arg);
+
+    scm_enable_double_buffer();
+
+    kdebug("SHOW SHOW WAIT");
 
     ahci_init();
     fat32_init();
@@ -582,7 +586,7 @@ ul process_do_exit(ul code)
  * @return int
  */
 
-pid_t kernel_thread(int (*fn)(void*), void* arg, unsigned long flags)
+pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
 {
     struct pt_regs regs;
     barrier();
@@ -794,13 +798,16 @@ struct process_control_block *process_get_pcb(long pid)
  */
 int process_wakeup(struct process_control_block *pcb)
 {
+    // kdebug("pcb pid = %#018lx", pcb->pid);
+
     BUG_ON(pcb == NULL);
-    if (pcb == current_pcb || pcb == NULL)
+    if (pcb == current_pcb || pcb == NULL) // 这个又是为什么???
         return -EINVAL;
     // 如果pcb正在调度队列中，则不重复加入调度队列
-    if (pcb->state == PROC_RUNNING)
+    if (pcb->state & PROC_RUNNING)
         return 0;
-    pcb->state = PROC_RUNNING;
+
+    pcb->state |= PROC_RUNNING;
     sched_enqueue(pcb);
     return 0;
 }
@@ -812,7 +819,7 @@ int process_wakeup(struct process_control_block *pcb)
  */
 int process_wakeup_immediately(struct process_control_block *pcb)
 {
-    if (pcb->state == PROC_RUNNING)
+    if (pcb->state & PROC_RUNNING)
         return 0;
     int retval = process_wakeup(pcb);
     if (retval != 0)

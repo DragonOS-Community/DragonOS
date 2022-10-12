@@ -1,12 +1,12 @@
 #include "screen_manager.h"
-#include <common/string.h>
-#include <driver/multiboot2/multiboot2.h>
 #include <common/kprint.h>
 #include <common/spinlock.h>
-#include <mm/mm.h>
-#include <mm/slab.h>
+#include <common/string.h>
+#include <driver/multiboot2/multiboot2.h>
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
+#include <mm/mm.h>
+#include <mm/slab.h>
 
 extern struct scm_buffer_info_t video_frame_buffer_info;
 static struct List scm_framework_list;
@@ -234,30 +234,43 @@ int scm_enable_alloc()
  */
 int scm_enable_double_buffer()
 {
-    if (__scm_double_buffer_enabled == true)
+    if (__scm_double_buffer_enabled == true) // 已经开启了双缓冲区了, 直接退出
         return 0;
     __scm_double_buffer_enabled = true;
-    if (list_empty(&scm_framework_list))
+    if (list_empty(&scm_framework_list)) // scm 框架链表为空
         return 0;
 
     // 逐个检查已经注册了的ui框架，将其缓冲区更改为双缓冲
     struct scm_ui_framework_t *ptr = container_of(list_next(&scm_framework_list), struct scm_ui_framework_t, list);
+    // 这里的ptr不需要特判空指针吗 问题1
     do
     {
+        kdebug("SHOW ME YOUR BUGS`!");
         if (ptr->buf == &video_frame_buffer_info)
         {
+            kdebug("INSIDE 1");
             uart_send_str(COM1, "##init double buffer##");
+            kdebug("INSIDE 2");
             struct scm_buffer_info_t *buf = __create_buffer(SCM_BF_DB | SCM_BF_PIXEL);
             if ((uint64_t)(buf) == (uint64_t)-ENOMEM)
                 return -ENOMEM;
+            kdebug("INSIDE 3");
             uart_send_str(COM1, "##to change double buffer##");
-            if (ptr->ui_ops->change(buf) != 0)
+            kdebug("INSIDE 4");
+            if (ptr->ui_ops->change(buf) != 0)  // 这里的change回调函数不会是空指针吗 问题2
             {
+                kdebug("BUGG 1");
                 __destroy_buffer(buf);
                 kfree(buf);
+                kdebug("BUGG 2");
             }
+            kdebug("INSIDE 5");
         }
-    } while (list_next(&ptr->list) != &scm_framework_list);
+        kdebug("FRAME OVER!");
+    } while (list_next(&ptr->list) != &scm_framework_list); // 枚举链表的每一个ui框架
+
+    kdebug("PRINT 22");
+
     // 设置定时刷新的对象
     video_set_refresh_target(__current_framework->buf);
     // 通知显示驱动，启动双缓冲

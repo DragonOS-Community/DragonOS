@@ -439,7 +439,8 @@ void pci_init()
         {
             if (ptr->Status & 0x10)
             {
-                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\tcap_pointer=%#010lx\tbar5=%#010lx", i, ptr->Class_code, ptr->SubClass, ptr->Status, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer, ((struct pci_device_structure_general_device_t *)ptr)->BAR5);
+                kinfo("[ pci device %d ] class code = %d\tsubclass=%d\tstatus=%#010lx\tcap_pointer=%#010lx\tbar5=%#010lx, vendor=%#08x, device id=%#08x", i, ptr->Class_code, ptr->SubClass, ptr->Status, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer, ((struct pci_device_structure_general_device_t *)ptr)->BAR5,
+                                                                                                                                                            ptr->Vendor_ID, ptr->Device_ID);
                 uint32_t tmp = pci_read_config(ptr->bus, ptr->device, ptr->func, ((struct pci_device_structure_general_device_t *)ptr)->Capabilities_Pointer);
             }
             else

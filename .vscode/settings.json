@@ -144,7 +144,8 @@
         "ktest_utils.h": "c",
         "kthread.h": "c",
         "lockref.h": "c",
-        "compiler_attributes.h": "c"
+        "compiler_attributes.h": "c",
+        "timer.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

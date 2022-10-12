@@ -33,7 +33,7 @@ static long ktest_idr_case0(uint64_t arg0, uint64_t arg1)
     idr_init(&k_idr);
     assert(k_idr.id_free_cnt == 0);
 
-    assert(idr_pre_get(&k_idr, 0) == 1);
+    assert(idr_pre_get(&k_idr, 0) == 0);
     assert(k_idr.id_free_cnt == IDR_FREE_MAX);
 
     for (int i = 1; i < 64; i++)

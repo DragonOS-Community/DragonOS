@@ -502,13 +502,13 @@ struct vfs_dir_entry_operations_t fat32_dEntry_ops =
 // todo: open
 long fat32_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
 {
-    return VFS_SUCCESS;
+    return 0;
 }
 
 // todo: close
 long fat32_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
 {
-    return VFS_SUCCESS;
+    return 0;
 }
 
 /**

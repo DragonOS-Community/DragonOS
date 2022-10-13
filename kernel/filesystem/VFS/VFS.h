@@ -11,9 +11,9 @@
 
 #pragma once
 
-#include <common/glib.h>
-#include <common/fcntl.h>
 #include <common/blk_types.h>
+#include <common/fcntl.h>
+#include <common/glib.h>
 #include <common/lockref.h>
 #include <mm/slab.h>
 
@@ -22,10 +22,6 @@ extern struct vfs_superblock_t *vfs_root_sb;
 #define VFS_DPT_MBR 0 // MBR分区表
 #define VFS_DPT_GPT 1 // GPT分区表
 
-#define VFS_SUCCESS 0
-#define VFS_E_FS_EXISTED 1   // 错误：文件系统已存在
-#define VFS_E_FS_NOT_EXIST 2 // 错误：文件系统不存在
-
 #define VFS_MAX_PATHLEN 1024
 
 /**
@@ -33,7 +29,7 @@ extern struct vfs_superblock_t *vfs_root_sb;
  *
  */
 #define VFS_IF_FILE (1UL << 0)
-#define VFS_IF_DIR (1UL << 1)   // 文件夹
+#define VFS_IF_DIR (1UL << 1) // 文件夹
 #define VFS_IF_DEVICE (1UL << 2)
 #define VFS_IF_DEAD (1UL << 3) /* removed, but still open directory */
 
@@ -116,7 +112,8 @@ struct vfs_filesystem_type_t
 {
     char *name;
     int fs_flags;
-    struct vfs_superblock_t *(*read_superblock)(struct block_device *blk); // 解析文件系统引导扇区的函数，为文件系统创建超级块结构。
+    struct vfs_superblock_t *(*read_superblock)(
+        struct block_device *blk); // 解析文件系统引导扇区的函数，为文件系统创建超级块结构。
     struct vfs_filesystem_type_t *next;
 };
 
@@ -155,7 +152,8 @@ struct vfs_inode_operations_t
      */
     long (*mkdir)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry, int mode);
     long (*rmdir)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry);
-    long (*rename)(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry);
+    long (*rename)(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry,
+                   struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry);
     long (*getAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
     long (*setAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
 };
@@ -271,11 +269,11 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland);
 int64_t vfs_rmdir(const char *path, bool from_userland);
 
 /**
- * @brief 释放dentry，并视情况自动释放inode
+ * @brief 释放dentry，并视情况自动释放inode。 在调用该函数前，需要将dentry加锁。
  *
  * @param dentry 目标dentry
- * 
+ *
  * @return 错误码
  *          注意，当dentry指向文件时，如果返回值为正数，则表示在释放了该dentry后，该dentry指向的inode的引用计数。
  */
-int vfs_dentry_put(struct vfs_dir_entry_t * dentry);
+int vfs_dentry_put(struct vfs_dir_entry_t *dentry);

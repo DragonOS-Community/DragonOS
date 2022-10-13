@@ -3,7 +3,7 @@
 #include <debug/bug.h>
 
 /**
- * @brief 释放dentry，并视情况自动释放inode
+ * @brief 释放dentry，并视情况自动释放inode. 在调用该函数前，需要将dentry加锁。
  *
  * @param dentry 目标dentry
  * 
@@ -21,7 +21,6 @@ int vfs_dentry_put(struct vfs_dir_entry_t *dentry)
     {
         BUG_ON(1);
         retval = -EBUSY;
-        spin_unlock(&dentry->lockref.lock);
         goto out;
     }
 

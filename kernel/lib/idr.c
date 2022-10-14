@@ -32,15 +32,14 @@ void idr_init(struct idr *idp)
  */
 static void __move_to_free_list(struct idr *idp, struct idr_layer *p)
 {
-    unsigned long flags;
-    spin_lock_irqsave(&idp->lock, flags);
+    spin_lock(&idp->lock);
 
     // 插入free_list
     p->ary[0] = idp->free_list;
     idp->free_list = p;
     ++(idp->id_free_cnt);
 
-    spin_unlock_irqrestore(&idp->lock, flags);
+    spin_unlock(&idp->lock);
 }
 
 /**
@@ -60,8 +59,7 @@ static void *__get_from_free_list(struct idr *idp)
         }
     }
 
-    unsigned long flags;
-    spin_lock_irqsave(&idp->lock, flags);
+    spin_lock(&idp->lock);
 
     // free_list还有节点
     struct idr_layer *item = idp->free_list;
@@ -69,7 +67,7 @@ static void *__get_from_free_list(struct idr *idp)
     item->ary[0] = NULL; // 记得清空原来的数据
     --(idp->id_free_cnt);
 
-    spin_unlock_irqrestore(&idp->lock, flags);
+    spin_unlock(&idp->lock);
 
     return item;
 }
@@ -316,9 +314,8 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
     // 特判根节点是否只剩0号儿子节点 (注意还要layer > 0)
     // (注意,有可能出现idp->top=NULL)
     // bitmap: 1000...000/00.....000
-    while (idp->top != NULL &&
-           ((idp->top->bitmap <= 1 && idp->top->layer > 0) || // 一条链的情况
-            (idp->top->layer == 0 && idp->top->bitmap == 0))) // 最后一个点的情况
+    while (idp->top != NULL && ((idp->top->bitmap <= 1 && idp->top->layer > 0) || // 一条链的情况
+                                (idp->top->layer == 0 && idp->top->bitmap == 0))) // 最后一个点的情况
     {
         struct idr_layer *t = idp->top->layer ? idp->top->ary[0] : NULL;
         __idr_layer_free(idp->top);
@@ -505,7 +502,8 @@ void *idr_find(struct idr *idp, int id)
 }
 
 /**
- * @brief  返回id大于 start_id 的数据指针(即非空闲id对应的指针), 如果没有则返回NULL; 可以传入nextid指针，获取下一个id; 时间复杂度O(log_64(n)), 空间复杂度O(log_64(n)) 约为 6;
+ * @brief  返回id大于 start_id 的数据指针(即非空闲id对应的指针), 如果没有则返回NULL; 可以传入nextid指针，获取下一个id;
+ * 时间复杂度O(log_64(n)), 空间复杂度O(log_64(n)) 约为 6;
  *
  * @param idp
  * @param start_id
@@ -699,8 +697,7 @@ int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
     if (idr_pre_get(&ida_p->idr, gfp_mask) != 0)
         return -ENOMEM;
 
-    unsigned long flags;
-    spin_lock_irqsave(&ida_p->idr.lock, flags);
+    spin_lock(&ida_p->idr.lock);
 
     if (NULL == ida_p->free_list)
     {
@@ -708,13 +705,13 @@ int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
         bitmap = kzalloc(sizeof(struct ida_bitmap), gfp_mask);
         if (NULL == bitmap)
         {
-            spin_unlock_irqrestore(&ida_p->idr.lock, flags);
+            spin_unlock(&ida_p->idr.lock);
             return -ENOMEM;
         }
         ida_p->free_list = bitmap;
     }
 
-    spin_unlock_irqrestore(&ida_p->idr.lock, flags);
+    spin_unlock(&ida_p->idr.lock);
     return 0;
 }
 

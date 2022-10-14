@@ -40,11 +40,11 @@ struct hid_data_t
 
     uint8_t report_id; // report id(from incoming report)
     uint8_t type;      // 数据类型：FEATURE / INPUT / OUTPUT
-    uint8_t attribue;  // report field attribute. (2 = (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position))
+    uint8_t attribute;  // report field attribute. (2 = (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position))
                        //                           (6 = (Data,Var,Rel,No Wrap,Linear,Preferred State,No Null Position))
-    int8_t uuit_exp;   // unit exponent;
+    int8_t unit_exp;   // unit exponent;
 
-    uint32_t uuit; // HID unit
+    uint32_t unit; // HID unit
 
     int logical_min; // Logical min
     int logical_max; // Logical max
@@ -79,3 +79,19 @@ struct hid_parser
     int cnt_objects; // report descriptor中的对象数目
     int cnt_report   // report desc中的report数目
 };
+
+
+struct hid_usage_types_string
+{
+    int value;
+    const char *string;
+};
+
+struct hid_usage_pages_string
+{
+    int value;
+    struct hid_usage_types_string * types;
+    const char * string;
+};
+
+int hid_parse_report(const void *report_data, const int len);

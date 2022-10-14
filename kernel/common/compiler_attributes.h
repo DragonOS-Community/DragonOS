@@ -1,4 +1,5 @@
 #pragma once
+#include <common/stddef.h>
 
 // 当函数的返回值未被使用时，编译器抛出警告信息
 #define __must_check __attribute__((__warn_unused_result__))

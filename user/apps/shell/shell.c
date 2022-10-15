@@ -1,13 +1,13 @@
-#include <libc/unistd.h>
-#include <libc/stdio.h>
-#include <libc/fcntl.h>
-#include <libc/stdlib.h>
-#include <libKeyboard/keyboard.h>
-#include <libc/string.h>
-#include <libc/stddef.h>
-#include <libc/sys/stat.h>
-#include <libc/printf.h>
 #include "cmd.h"
+#include <libKeyboard/keyboard.h>
+#include <libc/fcntl.h>
+#include <libc/printf.h>
+#include <libc/stddef.h>
+#include <libc/stdio.h>
+#include <libc/stdlib.h>
+#include <libc/string.h>
+#include <libc/sys/stat.h>
+#include <libc/unistd.h>
 
 #define pause_cpu() asm volatile("pause\n\t");
 #define MEM_HISTORY 1024
@@ -48,7 +48,7 @@ void main_loop(int kb_fd)
     shell_current_path[1] = '\0';
     // shell命令行的主循环
     while (true)
-    { 
+    {
         int argc = 0;
         char **argv;
 
@@ -58,7 +58,7 @@ void main_loop(int kb_fd)
 
         //添加初始光标
         put_string(" ", COLOR_BLACK, COLOR_WHITE);
-        put_string("\b",COLOR_BLACK, COLOR_WHITE);
+        put_string("\b", COLOR_BLACK, COLOR_WHITE);
 
         // 循环读取每一行到buffer
         count_history++;
@@ -167,10 +167,11 @@ int shell_readline(int fd, char *buf)
         {
             if (count > 0 && current_command_index >= count_history)
             {
-                memset(history_commands[current_command_index - 1], 0, sizeof(history_commands[current_command_index - 1]));
+                memset(history_commands[current_command_index - 1], 0,
+                       sizeof(history_commands[current_command_index - 1]));
                 count_history--;
             }
-            put_string(" ",COLOR_WHITE, COLOR_BLACK);
+            put_string(" ", COLOR_WHITE, COLOR_BLACK);
             return count;
         }
 
@@ -180,21 +181,21 @@ int shell_readline(int fd, char *buf)
             {
                 if (count > 0)
                 {
-                    //回退去除先前光标
-                    put_string(" ",COLOR_WHITE, COLOR_BLACK);
+                    // 回退去除先前光标
+                    put_string(" ", COLOR_WHITE, COLOR_BLACK);
                     buf[--count] = 0;
                     printf("%c", '\b');
-                    //在最后一个字符处加光标
-                    put_string("\b",COLOR_BLACK, COLOR_WHITE);
+                    // 在最后一个字符处加光标
+                    put_string("\b", COLOR_BLACK, COLOR_WHITE);
                 }
             }
             else
             {
                 buf[count++] = key;
                 printf("%c", key);
-                //在最后一个字符处加光标
+                // 在最后一个字符处加光标
                 put_string(" ", COLOR_BLACK, COLOR_WHITE);
-                put_string("\b",COLOR_BLACK, COLOR_WHITE);
+                put_string("\b", COLOR_BLACK, COLOR_WHITE);
             }
             if (count > 0 && current_command_index >= count_history)
             {

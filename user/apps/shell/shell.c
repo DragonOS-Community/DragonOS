@@ -6,6 +6,7 @@
 #include <libc/string.h>
 #include <libc/stddef.h>
 #include <libc/sys/stat.h>
+#include <libc/printf.h>
 #include "cmd.h"
 
 #define pause_cpu() asm volatile("pause\n\t");
@@ -47,13 +48,17 @@ void main_loop(int kb_fd)
     shell_current_path[1] = '\0';
     // shell命令行的主循环
     while (true)
-    {
+    { 
         int argc = 0;
         char **argv;
 
         printf("[DragonOS] %s # ", shell_current_path);
 
         memset(input_buffer, 0, INPUT_BUFFER_SIZE);
+
+        //添加初始光标
+        put_string(" ", COLOR_BLACK, COLOR_WHITE);
+        put_string("\b",COLOR_BLACK, COLOR_WHITE);
 
         // 循环读取每一行到buffer
         count_history++;
@@ -165,6 +170,7 @@ int shell_readline(int fd, char *buf)
                 memset(history_commands[current_command_index - 1], 0, sizeof(history_commands[current_command_index - 1]));
                 count_history--;
             }
+            put_string(" ",COLOR_WHITE, COLOR_BLACK);
             return count;
         }
 
@@ -174,14 +180,20 @@ int shell_readline(int fd, char *buf)
             {
                 if (count > 0)
                 {
+                    //回退去除先前光标
+                    put_string(" ",COLOR_WHITE, COLOR_BLACK);
                     buf[--count] = 0;
                     printf("%c", '\b');
+                    put_string("\b",COLOR_BLACK, COLOR_WHITE);
                 }
             }
             else
             {
                 buf[count++] = key;
                 printf("%c", key);
+                //在最后一个字符处加光标
+                put_string(" ", COLOR_BLACK, COLOR_WHITE);
+                put_string("\b",COLOR_BLACK, COLOR_WHITE);
             }
             if (count > 0 && current_command_index >= count_history)
             {

@@ -105,7 +105,8 @@ struct usb_interface_desc
     uint8_t num_endpoints;       // 当前interface的端点数量
     uint8_t interface_class;     // Class code
     uint8_t interface_sub_class; // Sub class code
-    uint8_t interface_protocol;  // 协议  These codes are qualified by the value of thebInterfaceClass and the bInterfaceSubClass fields.
+    uint8_t interface_protocol;  // 协议  These codes are qualified by the value of thebInterfaceClass and the
+                                 // bInterfaceSubClass fields.
     uint8_t index;               // index of String Descriptor describing this interface
 } __attribute__((packed));
 
@@ -162,6 +163,7 @@ struct usb_request_packet_t
 
 #define USB_REQ_TYPE_GET_REQUEST (__USB_REQ_TYPE_D2H | __USB_REQ_TYPE_STANDARD | __USB_REQ_TYPE_DEVICE)
 #define USB_REQ_TYPE_SET_REQUEST (__USB_REQ_TYPE_H2D | __USB_REQ_TYPE_STANDARD | __USB_REQ_TYPE_DEVICE)
+#define USB_REQ_TYPE_GET_INTERFACE_REQUEST (__USB_REQ_TYPE_D2H | __USB_REQ_TYPE_STANDARD | __USB_REQ_TYPE_INTERFACE)
 #define USB_REQ_TYPE_SET_INTERFACE (__USB_REQ_TYPE_H2D | __USB_REQ_TYPE_STANDARD | __USB_REQ_TYPE_INTERFACE)
 #define USB_REQ_TYPE_SET_CLASS_INTERFACE (__USB_REQ_TYPE_H2D | __USB_REQ_TYPE_CLASS | __USB_REQ_TYPE_INTERFACE)
 
@@ -244,12 +246,12 @@ enum
  * @brief 该宏定义用于声明usb请求包，并初始化其中的各个字段
  *
  */
-#define DECLARE_USB_PACKET(pak_name, _trans_req_type, _trans_request, _trans_value, _trans_index, _transfer_length) \
-    struct usb_request_packet_t pak_name = {0};                                                                     \
-    pak_name.request_type = (_trans_req_type);                                                                      \
-    pak_name.request = (_trans_request);                                                                            \
-    pak_name.value = (_trans_value);                                                                                \
-    pak_name.index = (_trans_index);                                                                                \
+#define DECLARE_USB_PACKET(pak_name, _trans_req_type, _trans_request, _trans_value, _trans_index, _transfer_length)    \
+    struct usb_request_packet_t pak_name = {0};                                                                        \
+    pak_name.request_type = (_trans_req_type);                                                                         \
+    pak_name.request = (_trans_request);                                                                               \
+    pak_name.value = (_trans_value);                                                                                   \
+    pak_name.index = (_trans_index);                                                                                   \
     pak_name.length = (_transfer_length);
 
 /*
@@ -281,6 +283,22 @@ enum
     USB_CLASS_MISC = 0xef,
     USB_CLASS_APP_SPEC = 0xfe,
     USB_CLASS_VENDOR_SPEC = 0XFF,
+};
+
+/**
+ * @brief usb hid descriptor的结构体
+ *
+ */
+struct usb_hid_desc
+{
+    uint8_t len;
+    uint8_t type;    // USB_DT_HID
+    uint16_t bcdHID; // 标识HIDClass规范版本的数字表达式。
+
+    uint8_t country_code;
+    uint8_t descriptors_num;  //  the number of class descriptors
+    uint8_t desc_type;        // Constant name identifying type of class descriptor
+    uint16_t report_desc_len; // Report descriptor的大小
 };
 
 /**

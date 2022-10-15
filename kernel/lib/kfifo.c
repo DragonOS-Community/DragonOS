@@ -149,3 +149,35 @@ void kfifo_free_alloc(struct kfifo_t *fifo)
     kfree(fifo->buffer);
     memset(fifo, 0, sizeof(struct kfifo_t));
 }
+
+/**
+ * @brief 向kfifo缓冲区推入指定大小的数据并在过程加锁
+ *
+ * @param fifo 队列结构体
+ * @param from 来源数据地址
+ * @param size 数据大小（字节数）
+ * @param lock 自旋锁
+ * @return uint32_t 推入的数据大小
+ */
+uint32_t kfifo_in_lock(struct kfifo_t *fifo, const void *from, uint32_t size, spinlock_t *lock)
+{
+    spin_lock(&lock);
+    kfifo_in(&fifo, &from, size);
+    spin_unlock(&lock);
+}
+
+/**
+ * @brief 从kfifo缓冲区取出数据，并从队列中删除数据，并在过程加锁
+ *
+ * @param fifo 队列结构体
+ * @param to 拷贝目标地址
+ * @param size 数据大小（字节数）
+ * @param lock 自旋锁
+ * @return uint32_t 取出的数据大小
+ */
+uint32_t kfifo_out_lock(struct kfifo_t *fifo, void *to, uint32_t size, spinlock_t *lock)
+{
+    spin_lock(&lock);
+    kfifo_out(&fifo, &to, size);
+    spin_unlock(&lock);
+}

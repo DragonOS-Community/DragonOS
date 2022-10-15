@@ -1,11 +1,11 @@
 #include "textui.h"
 
-#include "screen_manager.h"
 #include "driver/uart/uart.h"
-#include <common/string.h>
-#include <common/printk.h>
+#include "screen_manager.h"
 #include <common/atomic.h>
 #include <common/errno.h>
+#include <common/printk.h>
+#include <common/string.h>
 
 struct scm_ui_framework_t textui_framework;
 static spinlock_t __window_id_lock = {1};
@@ -19,6 +19,7 @@ static struct textui_vline_chromatic_t __initial_vlines[INITIAL_VLINES] = {0};
 static struct textui_window_t __initial_window = {0}; // 初始窗口
 static struct textui_private_info_t __private_info = {0};
 static struct List __windows_list;
+static spinlock_t change_lock;
 
 /**
  * @brief 初始化window对象
@@ -29,7 +30,8 @@ static struct List __windows_list;
  * @param vlines_ptr 虚拟行数组指针
  * @param cperline 每行最大的字符数
  */
-static int __textui_init_window(struct textui_window_t *window, uint8_t flags, uint16_t vlines_num, void *vlines_ptr, uint16_t cperline)
+static int __textui_init_window(struct textui_window_t *window, uint8_t flags, uint16_t vlines_num, void *vlines_ptr,
+                                uint16_t cperline)
 {
     memset((window), 0, sizeof(struct textui_window_t));
     list_init(&(window)->list);
@@ -56,12 +58,12 @@ static int __textui_init_window(struct textui_window_t *window, uint8_t flags, u
  * @param vline 虚拟行对象指针
  * @param chars_ptr 字符对象数组指针
  */
-#define __textui_init_vline(vline, chars_ptr)                      \
-    do                                                             \
-    {                                                              \
-        memset(vline, 0, sizeof(struct textui_vline_chromatic_t)); \
-        (vline)->index = 0;                                        \
-        (vline)->chars = chars_ptr;                                \
+#define __textui_init_vline(vline, chars_ptr)                                                                          \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        memset(vline, 0, sizeof(struct textui_vline_chromatic_t));                                                     \
+        (vline)->index = 0;                                                                                            \
+        (vline)->chars = chars_ptr;                                                                                    \
     } while (0)
 
 int textui_install_handler(struct scm_buffer_info_t *buf)
@@ -78,7 +80,7 @@ int textui_uninstall_handler(void *args)
 
 int textui_enable_handler(void *args)
 {
-    uart_send_str(COM1, "textui_enable_handler");
+    uart_send_str(COM1, "textui_enable_handler\n");
     return 0;
 }
 
@@ -91,16 +93,16 @@ int textui_change_handler(struct scm_buffer_info_t *buf)
 {
     memcpy((void *)buf->vaddr, (void *)(textui_framework.buf->vaddr), textui_framework.buf->size);
     textui_framework.buf = buf;
+    
     return 0;
 }
 
-struct scm_ui_framework_operations_t textui_ops =
-    {
-        .install = &textui_install_handler,
-        .uninstall = &textui_uninstall_handler,
-        .change = &textui_change_handler,
-        .enable = &textui_enable_handler,
-        .disable = &textui_disable_handler,
+struct scm_ui_framework_operations_t textui_ops = {
+    .install = &textui_install_handler,
+    .uninstall = &textui_uninstall_handler,
+    .change = &textui_change_handler,
+    .enable = &textui_enable_handler,
+    .disable = &textui_disable_handler,
 };
 
 /**
@@ -166,7 +168,8 @@ static int __textui_new_line(struct textui_window_t *window, uint16_t vline_id)
  * @param character
  * @return int
  */
-static int __textui_putchar_window(struct textui_window_t *window, uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
+static int __textui_putchar_window(struct textui_window_t *window, uint16_t character, uint32_t FRcolor,
+                                   uint32_t BKcolor)
 {
     if (textui_is_chromatic(window->flags)) // 启用彩色字符
     {
@@ -246,7 +249,8 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
         if (window->vlines.chromatic[window->vline_operating].index <= 0)
         {
             window->vlines.chromatic[window->vline_operating].index = 0;
-            memset(window->vlines.chromatic[window->vline_operating].chars, 0, sizeof(struct textui_char_chromatic_t) * window->chars_per_line);
+            memset(window->vlines.chromatic[window->vline_operating].chars, 0,
+                   sizeof(struct textui_char_chromatic_t) * window->chars_per_line);
             --(window->vline_operating);
             if (unlikely(window->vline_operating < 0))
                 window->vline_operating = window->vlines_num - 1;
@@ -295,6 +299,8 @@ int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
  */
 int textui_init()
 {
+    spin_init(&change_lock);
+
     spin_init(&__window_id_lock);
     __window_max_id = 0;
     list_init(&__windows_list);

@@ -127,11 +127,11 @@ uint32_t kfifo_out_peek(struct kfifo_t *fifo, void *to, uint32_t size);
  * @param lock 自旋锁
  * @return uint32_t 推入的数据大小
  */
-uint32_t __always_inline kfifo_in_lock(struct kfifo_t *fifo, const void *from, uint32_t size, spinlock_t *lock)
+uint32_t __always_inline kfifo_in_lockd(struct kfifo_t *fifo, const void *from, uint32_t size, spinlock_t *lock)
 {
-    spin_lock(&lock);
+    spin_lock(lock);
     uint32_t retval = kfifo_in(&fifo, &from, size);
-    spin_unlock(&lock);
+    spin_unlock(lock);
     return retval;
 }
 
@@ -144,10 +144,10 @@ uint32_t __always_inline kfifo_in_lock(struct kfifo_t *fifo, const void *from, u
  * @param lock 自旋锁
  * @return uint32_t 取出的数据大小
  */
-uint32_t __always_inline kfifo_out_lock(struct kfifo_t *fifo, void *to, uint32_t size, spinlock_t *lock)
+uint32_t __always_inline kfifo_out_lockd(struct kfifo_t *fifo, void *to, uint32_t size, spinlock_t *lock)
 {
-    spin_lock(&lock);
+    spin_lock(lock);
     uint32_t retval = kfifo_out(&fifo, &to, size);
-    spin_unlock(&lock);
+    spin_unlock(lock);
     return retval;
 }

@@ -127,7 +127,13 @@ uint32_t kfifo_out_peek(struct kfifo_t *fifo, void *to, uint32_t size);
  * @param lock 自旋锁
  * @return uint32_t 推入的数据大小
  */
-uint32_t kfifo_in_lock(struct kfifo_t *fifo, const void *from, uint32_t size, spinlock_t *lock);
+uint32_t __always_inline kfifo_in_lock(struct kfifo_t *fifo, const void *from, uint32_t size, spinlock_t *lock)
+{
+    spin_lock(&lock);
+    uint32_t retval = kfifo_in(&fifo, &from, size);
+    spin_unlock(&lock);
+    return retval;
+}
 
 /**
  * @brief 从kfifo缓冲区取出数据，并从队列中删除数据，并在过程加锁
@@ -138,4 +144,10 @@ uint32_t kfifo_in_lock(struct kfifo_t *fifo, const void *from, uint32_t size, sp
  * @param lock 自旋锁
  * @return uint32_t 取出的数据大小
  */
-uint32_t kfifo_out_lock(struct kfifo_t *fifo, void *to, uint32_t size, spinlock_t *lock);
+uint32_t __always_inline kfifo_out_lock(struct kfifo_t *fifo, void *to, uint32_t size, spinlock_t *lock)
+{
+    spin_lock(&lock);
+    uint32_t retval = kfifo_out(&fifo, &to, size);
+    spin_unlock(&lock);
+    return retval;
+}

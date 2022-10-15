@@ -184,6 +184,7 @@ int shell_readline(int fd, char *buf)
                     put_string(" ",COLOR_WHITE, COLOR_BLACK);
                     buf[--count] = 0;
                     printf("%c", '\b');
+                    //在最后一个字符处加光标
                     put_string("\b",COLOR_BLACK, COLOR_WHITE);
                 }
             }

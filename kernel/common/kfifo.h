@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <common/spinlock.h>
 
 struct kfifo_t
 {
@@ -73,10 +74,10 @@ int kfifo_alloc(struct kfifo_t *fifo, uint32_t size, uint64_t reserved);
 
 /**
  * @brief 释放通过kfifo_alloc创建的fifo缓冲区
- * 
+ *
  * @param fifo fifo队列结构体
  */
-void kfifo_free_alloc(struct kfifo_t* fifo);
+void kfifo_free_alloc(struct kfifo_t *fifo);
 
 /**
  * @brief 使用指定的缓冲区来初始化kfifo缓冲队列
@@ -116,3 +117,37 @@ uint32_t kfifo_out(struct kfifo_t *fifo, void *to, uint32_t size);
  * @return uint32_t 取出的数据大小
  */
 uint32_t kfifo_out_peek(struct kfifo_t *fifo, void *to, uint32_t size);
+
+/**
+ * @brief 向kfifo缓冲区推入指定大小的数据并在过程加锁
+ *
+ * @param fifo 队列结构体
+ * @param from 来源数据地址
+ * @param size 数据大小（字节数）
+ * @param lock 自旋锁
+ * @return uint32_t 推入的数据大小
+ */
+uint32_t __always_inline kfifo_in_lockd(struct kfifo_t *fifo, const void *from, uint32_t size, spinlock_t *lock)
+{
+    spin_lock(lock);
+    uint32_t retval = kfifo_in(&fifo, &from, size);
+    spin_unlock(lock);
+    return retval;
+}
+
+/**
+ * @brief 从kfifo缓冲区取出数据，并从队列中删除数据，并在过程加锁
+ *
+ * @param fifo 队列结构体
+ * @param to 拷贝目标地址
+ * @param size 数据大小（字节数）
+ * @param lock 自旋锁
+ * @return uint32_t 取出的数据大小
+ */
+uint32_t __always_inline kfifo_out_lockd(struct kfifo_t *fifo, void *to, uint32_t size, spinlock_t *lock)
+{
+    spin_lock(lock);
+    uint32_t retval = kfifo_out(&fifo, &to, size);
+    spin_unlock(lock);
+    return retval;
+}

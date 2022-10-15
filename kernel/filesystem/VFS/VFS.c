@@ -245,7 +245,6 @@ int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
 int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
 {
     uint32_t pathlen;
-
     int retval = 0;
     if (from_userland)
         pathlen = strnlen_user(path, PAGE_4K_SIZE - 1);
@@ -300,7 +299,6 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
     }
     spin_lock(&parent_dir->lockref.lock);
     struct vfs_dir_entry_t *subdir_dentry = vfs_alloc_dentry(pathlen - last_slash);
-    struct vfs_dir_entry_t *prev_dentry = NULL;
 
     if (path[pathlen - 1] == '/')
         subdir_dentry->name_length = pathlen - last_slash - 2;

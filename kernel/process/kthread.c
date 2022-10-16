@@ -27,7 +27,7 @@ struct kthread_create_info_t
     void *data;
     int node;
 
-    // kthreadd守护进程传递给kthread_create的结果
+    // kthreadd守护进程传递给kthread_create的结果, 成功则返回PCB，不成功则该值为负数错误码。若该值为NULL，意味着创建过程尚未完成
     struct process_control_block *result;
 
     struct List list;
@@ -170,6 +170,7 @@ static int kthread(void *_create)
     // 将当前pcb返回给创建者
     create->result = current_pcb;
 
+    current_pcb->state &= ~PROC_RUNNING;    // 设置当前进程不是RUNNING态
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
     sched();
 

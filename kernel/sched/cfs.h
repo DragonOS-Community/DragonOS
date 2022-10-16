@@ -32,3 +32,14 @@ void sched_cfs_enqueue(struct process_control_block *pcb);
  * @return struct process_control_block*
  */
 struct process_control_block *sched_cfs_dequeue();
+/**
+ * @brief 初始化进程调度器
+ *
+ */
+void sched_init();
+
+/**
+ * @brief 当时钟中断到达时，更新时间片
+ *
+ */
+void sched_update_jiffies();

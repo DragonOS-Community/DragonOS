@@ -213,10 +213,6 @@ int irq_unregister(ul irq_num)
  */
 void irq_init()
 {
-    // 将idt重置为新的ignore_int入点（此前在head.S中有设置，
-    // 但是那个不完整，某些版本的编译器的输出，在真机运行时会破坏进程执行环境，从而导致#GP
-    for (int i = 0; i < 256; ++i)
-        set_intr_gate(i, 0, ignore_int);
 #if _INTR_8259A_
     init_8259A();
 #else
@@ -227,14 +223,3 @@ void irq_init()
 #endif
 }
 #pragma GCC optimize("O0")
-
-/**
- * @brief 当系统收到未知的中断时，执行此处理函数
- * 
- * @param regs 
- * @param error_code 
- */
-void ignore_int_handler(struct pt_regs *regs, unsigned long error_code)
-{
-    kwarn("Unknown interrupt or fault at RIP.\n");
-}

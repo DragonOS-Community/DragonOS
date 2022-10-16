@@ -32,14 +32,17 @@ void idr_init(struct idr *idp)
  */
 static void __move_to_free_list(struct idr *idp, struct idr_layer *p)
 {
-    spin_lock(&idp->lock);
+    unsigned long flags;
+    spin_lock_irqsave(&idp->lock, flags);
 
     // 插入free_list
     p->ary[0] = idp->free_list;
+    io_sfence();
     idp->free_list = p;
+    io_sfence();
     ++(idp->id_free_cnt);
 
-    spin_unlock(&idp->lock);
+    spin_unlock_irqrestore(&idp->lock, flags);
 }
 
 /**
@@ -52,22 +55,26 @@ static void *__get_from_free_list(struct idr *idp)
 {
     if (idp->id_free_cnt == 0)
     {
-        if (idr_pre_get(idp, 0) != 0)
+        if (idr_preload(idp, 0) != 0)
         {
             kBUG("idr-module find a BUG: get free node fail.(Possible ENOMEM error)");
             return NULL;
         }
     }
 
-    spin_lock(&idp->lock);
+    unsigned long flags;
+    spin_lock_irqsave(&idp->lock, flags);
 
     // free_list还有节点
     struct idr_layer *item = idp->free_list;
+    io_sfence();
     idp->free_list = idp->free_list->ary[0];
+    io_sfence();
     item->ary[0] = NULL; // 记得清空原来的数据
+    io_sfence();
     --(idp->id_free_cnt);
 
-    spin_unlock(&idp->lock);
+    spin_unlock_irqrestore(&idp->lock, flags);
 
     return item;
 }
@@ -79,7 +86,7 @@ static void *__get_from_free_list(struct idr *idp)
  * @param gfp_mask
  * @return int (如果分配成功,将返回0; 否则返回负数 -ENOMEM, 有可能是内存空间不够)
  */
-int idr_pre_get(struct idr *idp, gfp_t gfp_mask)
+int idr_preload(struct idr *idp, gfp_t gfp_mask)
 {
     int timer = 0;
     while (idp->id_free_cnt < IDR_FREE_MAX)
@@ -88,6 +95,7 @@ int idr_pre_get(struct idr *idp, gfp_t gfp_mask)
         new_one = kzalloc(sizeof(struct idr_layer), gfp_mask); // 默认清空?
         if (NULL == new_one)
             return -ENOMEM;
+
         __move_to_free_list(idp, new_one);
         timer++;
     }
@@ -242,6 +250,12 @@ static __always_inline int __idr_get_path(struct idr *idp, int id, struct idr_la
     int layer = cur_layer->layer;
     stk[layer + 1] = NULL; // 标志数组结尾
 
+    if (unlikely((id >> ((layer + 1ull) * IDR_BITS)) > 0))
+    {
+        kBUG("idr-module find a BUG: id is invalid.");
+        return 0;
+    }
+
     // 提取路径
     while (layer >= 0)
     {
@@ -333,7 +347,8 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
  */
 static int __idr_get_new_above_int(struct idr *idp, void *ptr, int starting_id)
 {
-    struct idr_layer *stk[MAX_LEVEL + 1]; // 你可以选择memset(0)
+    struct idr_layer *stk[MAX_LEVEL + 1];
+    // 你可以选择 memset(stk, 0, sizeof(stk));
     int id = __idr_get_empty_slot(idp, stk);
 
     if (id >= 0)
@@ -353,7 +368,7 @@ static int __idr_get_new_above_int(struct idr *idp, void *ptr, int starting_id)
  * @param int* id - 传入int指针，获取到的NEW_ID存在id里
  * @return int (0表示获取id成功, 负数代表错误 - 可能是内存空间不够)
  */
-int idr_get_new(struct idr *idp, void *ptr, int *id)
+int idr_alloc(struct idr *idp, void *ptr, int *id)
 {
     int rv = __idr_get_new_above_int(idp, ptr, 0);
     if (rv < 0)
@@ -363,21 +378,25 @@ int idr_get_new(struct idr *idp, void *ptr, int *id)
 }
 
 /**
- * @brief 删除一个id，但是不释放对应的ptr指向的空间
+ * @brief 删除一个id, 但是不释放对应的ptr指向的空间, 同时返回这个被删除id所对应的ptr
  *
  * @param idp
  * @param id
+ * @return void* (如果删除成功，就返回被删除id所对应的ptr；否则返回NULL。注意：如果这个id本来就和NULL绑定，那么也会返回NULL)
  */
-void idr_remove(struct idr *idp, int id)
+void *idr_remove(struct idr *idp, int id)
 {
     if (unlikely(idp->top == NULL || id < 0))
-        return;
+        return NULL;
 
     struct idr_layer *stk[MAX_LEVEL + 1];
     if (0 == __idr_get_path(idp, id, stk))
-        return; // 找不到路径
+        return NULL; // 找不到路径
 
+    void *ret = stk[0]->ary[id & IDR_MASK];
     __idr_erase_full(idp, id, stk, 0);
+
+    return ret;
 }
 
 /**
@@ -483,7 +502,10 @@ void idr_destroy(struct idr *idp)
 void *idr_find(struct idr *idp, int id)
 {
     if (unlikely(idp->top == NULL || id < 0))
+    {
+        kwarn("idr-find: idp->top == NULL || id < 0.");
         return NULL;
+    }
 
     struct idr_layer *cur_layer = idp->top;
     int layer = cur_layer->layer; // 特判NULL
@@ -508,7 +530,7 @@ void *idr_find(struct idr *idp, int id)
  * @param idp
  * @param start_id
  * @param nextid
- * @return void*
+ * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
  */
 void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
 {
@@ -596,7 +618,7 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
  *
  * @param idp
  * @param start_id
- * @return void*
+ * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
  */
 void *idr_find_next(struct idr *idp, int start_id)
 {
@@ -667,6 +689,72 @@ int idr_replace(struct idr *idp, void *ptr, int id)
 }
 
 /**
+ * @brief 判断一个idr是否为空
+ *
+ * @param idp
+ * @return true
+ * @return false
+ */
+bool idr_empty(struct idr *idp)
+{
+    if (idp == NULL || idp->top == NULL || !idp->top->bitmap)
+        return true;
+
+    return false;
+}
+
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+/**
+ * @brief 这个函数是可以用于判断一个ID是否已经被分配的。
+ *
+ * @param idp
+ * @param id
+ * @return true
+ * @return false
+ */
+bool idr_count(struct idr *idp, int id)
+{
+    if (unlikely(idp == NULL || idp->top == NULL || id < 0))
+        return false;
+
+    struct idr_layer *cur_layer = idp->top;
+    int layer = cur_layer->layer;
+
+    // 如果查询的ID的bit数量比 layer*IDR_BITS 还大, 直接返回 NULL
+    if (unlikely((id >> ((layer + 1ull) * IDR_BITS)) > 0))
+        return false;
+
+    // if (id > 7400)
+    // {
+    //     kdebug("current id = %d", id);
+    // }
+
+    while (layer >= 0) // 提取路径
+    {
+        // if (id > 7400)
+        // {
+        //     kdebug("current id = %d, layer = %d", id, layer);
+        // }
+
+        int layer_id = (id >> (layer * IDR_BITS)) & IDR_MASK;
+
+        if (((cur_layer->bitmap >> layer_id) & 1) == 0)
+            return false; // 没有这一个儿子
+
+        cur_layer = cur_layer->ary[layer_id];
+
+        // assert(cur_layer != NULL);
+
+        --layer;
+    }
+
+    return true;
+}
+#pragma GCC pop_options
+/********* ****************************************** ida - idr 函数实现分割线 **********************************************************/
+
+/**
  * @brief 初始化IDA, 你需要保证调用函数之前, ida的free_list为空, 否则会导致内存泄漏
  * @param ida_p
  */
@@ -692,9 +780,9 @@ static void __ida_bitmap_free(struct ida_bitmap *bitmap)
  * @param gfp_mask
  * @return int (如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够)
  */
-int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
+int ida_preload(struct ida *ida_p, gfp_t gfp_mask)
 {
-    if (idr_pre_get(&ida_p->idr, gfp_mask) != 0)
+    if (idr_preload(&ida_p->idr, gfp_mask) != 0)
         return -ENOMEM;
 
     spin_lock(&ida_p->idr.lock);
@@ -724,8 +812,11 @@ int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
 static void *__get_ida_bitmap(struct ida *ida_p, gfp_t gfp_mask)
 {
     if (NULL == ida_p->free_list)
-        if (ida_pre_get(ida_p, gfp_mask) < 0)
+        if (ida_preload(ida_p, gfp_mask) < 0)
+        {
+            kBUG("error : no memory.");
             return NULL;
+        }
 
     struct ida_bitmap *tmp = ida_p->free_list;
     ida_p->free_list = NULL;
@@ -767,12 +858,14 @@ static int __get_id_from_bitmap(struct ida_bitmap *bmp)
  * @param p_id
  * @return int (0表示获取ID成功， 否则是负数 - 错误码)
  */
-int ida_get_new(struct ida *ida_p, int *p_id)
+int ida_alloc(struct ida *ida_p, int *p_id)
 {
     *p_id = -1;
 
     struct idr_layer *stk[MAX_LEVEL + 1]; // 你可以选择memset(0)
+    io_sfence();
     memset(stk, 0, sizeof(stk));
+    io_sfence();
     int idr_id = __idr_get_empty_slot(&ida_p->idr, stk);
 
     // 如果stk[0]=NULL,可能是idr内部出错/内存空间不够
@@ -843,6 +936,7 @@ void ida_remove(struct ida *ida_p, int id)
 
     struct idr_layer *stk[MAX_LEVEL + 1];
     memset(stk, 0, sizeof(stk));
+
     if (0 == __idr_get_path(&ida_p->idr, idr_id, stk))
         return;
 
@@ -877,4 +971,19 @@ void ida_destroy(struct ida *ida_p)
     ida_p->idr.top = NULL;
     __ida_bitmap_free(ida_p->free_list);
     ida_p->free_list = NULL;
+}
+
+/**
+ * @brief 判断一个ida是否为空
+ *
+ * @param ida_p
+ * @return true
+ * @return false
+ */
+bool ida_empty(struct ida *ida_p)
+{
+    if (ida_p == NULL || ida_p->idr.top == NULL || !ida_p->idr.top->bitmap)
+        return true;
+
+    return false;
 }

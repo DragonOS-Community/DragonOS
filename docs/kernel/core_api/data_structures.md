@@ -277,8 +277,8 @@
 
 &emsp;&emsp;无返回值
 
-### ida_pre_get
-`int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)`
+### ida_preload
+`int ida_preload(struct ida *ida_p, gfp_t gfp_mask)`
 
 #### 描述
 
@@ -298,8 +298,8 @@
 &emsp;&emsp;如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够.
 
 
-### ida_get_new
-`int ida_get_new(struct ida *ida_p, int *p_id)`
+### ida_alloc
+`int ida_alloc(struct ida *ida_p, int *p_id)`
 
 #### 描述
 
@@ -377,6 +377,22 @@
 
 &emsp;&emsp;无返回值
 
+### ida_empty
+`void ida_empty(struct ida *ida_p)`
+
+#### 描述
+
+&emsp;&emsp; 查询一个ida是否为空
+#### 参数
+
+**ida_p**
+
+&emsp;&emsp; 指向ida的指针
+
+#### 返回值
+
+&emsp;&emsp;ida为空则返回true，否则返回false。
+
 
 --------------------
 
@@ -388,10 +404,8 @@
 2. 删除一个已分配的ID                
 3. 根据ID查找对应的指针             
 4. 根据ID使用新的ptr替换旧的ptr     
-
-
-int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **oldptr);
-int idr_replace(struct idr *idp, void *ptr, int id);
+&emsp;&emsp; 您可以使用`DECLARE_idr(my_idr)`来创建一个idr。或者您也可以使用`struct idr my_idr; idr_init(my_idr);`这两句话创建一个idr。
+&emsp;&emsp; 至于什么是radix-tree，您可以把他简单理解为一个向上生长的多叉树，在实现中，我们选取了64叉树。
 
 ### idr_init
 `void idr_init(struct idr *idp)`
@@ -409,8 +423,8 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 
 &emsp;&emsp;无返回值
 
-### idr_pre_get
-`int idr_pre_get(struct idr *idp, gfp_t gfp_mask)`
+### idr_preload
+`int idr_preload(struct idr *idp, gfp_t gfp_mask)`
 
 #### 描述
 
@@ -430,12 +444,13 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 &emsp;&emsp;如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够.
 
 
-### idr_get_new
-`int idr_get_new(struct idr *idp, void *ptr, int *id)`
+### idr_alloc
+`int idr_alloc(struct idr *idp, void *ptr, int *id)`
 
 #### 描述
 
-&emsp;&emsp;获取一个空闲ID. 您需要注意, 返回值是成功/错误码.
+&emsp;&emsp; 获取一个空闲ID. 您需要注意, 返回值是成功/错误码.
+&emsp;&emsp; 调用这个函数，需要您保证ptr是非空的，即: `ptr != NULL`, 否则将会影响 `idr_find/idr_find_next/idr_find_next_getid/...`等函数的使用。(具体请看这三个函数的说明，当然，只会影响到您的使用体验，并不会影响到idr内部函数的决策和逻辑)
 #### 参数
 
 **idp**
@@ -456,11 +471,12 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 
 
 ### idr_remove
-`void idr_remove(struct idr *idp, int id)`
+`void* idr_remove(struct idr *idp, int id)`
 
 #### 描述
 
-&emsp;&emsp;删除一个已经分配的ID. 如果该ID不存在, 该函数不会产生异常错误, 因为在检测到该ID不存在的时候, 函数将会自动退出.
+&emsp;&emsp;删除一个id, 但是不释放对应的ptr指向的空间, 同时返回这个被删除id所对应的ptr。
+&emsp;&emsp; 如果该ID不存在, 该函数不会产生异常错误, 因为在检测到该ID不存在的时候, 函数将会自动退出，并返回NULL。
 #### 参数
 
 **idp**
@@ -473,7 +489,7 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 
 #### 返回值
 
-&emsp;&emsp;无返回值. 
+&emsp;&emsp;如果删除成功，就返回被删除id所对应的ptr；否则返回NULL。注意：如果这个id本来就和NULL绑定，那么也会返回NULL
 
 
 ### idr_remove_all
@@ -532,6 +548,7 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 #### 返回值
 
 &emsp;&emsp; 如果分配,将返回该ID对应的数据指针; 否则返回NULL.(注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
+&emsp;&emsp; 当然，我们也提供了`idr_count`函数来判断id是否被分配，具体请查看idr_count介绍。
 
 ### idr_find_next
 `void *idr_find_next(struct idr *idp, int start_id)`
@@ -552,7 +569,7 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 #### 返回值
 
 &emsp;&emsp; 如果分配,将返回该ID对应的数据指针; 否则返回NULL.(注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
-
+&emsp;&emsp; 当然，我们也提供了`idr_count`函数来判断id是否被分配，具体请查看idr_count介绍。
 
 
 ### idr_find_next_getid
@@ -574,10 +591,7 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 #### 返回值
 
 &emsp;&emsp; 如果分配,将返回该ID对应的数据指针; 否则返回NULL.(注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
-
-&emsp;&emsp; 这个函数是可以用于判断一个ID是否已经被分配的。假设你要查询id是否被分配，使用方法：
-1. 调用 `idr_find_next_getid(idp, id-1, &nextid)`
-2. 如果id已经被分配，那么有：`nextid == id` 成立。
+&emsp;&emsp; 当然，我们也提供了`idr_count`函数来判断id是否被分配，具体请查看idr_count介绍。
 
 
 ### idr_replace
@@ -634,3 +648,39 @@ int idr_replace(struct idr *idp, void *ptr, int id);
 #### 返回值
 
 &emsp;&emsp; 0代表成功，否则就是错误码 - 代表错误。 
+
+### idr_empty
+`void idr_empty(struct idr *idp)`
+
+#### 描述
+
+&emsp;&emsp; 查询一个idr是否为空
+#### 参数
+
+**idp**
+
+&emsp;&emsp; 指向idr的指针
+
+#### 返回值
+
+&emsp;&emsp;idr为空则返回true，否则返回false。
+
+### idr_count
+`bool idr_count(struct idr *idp, int id)`
+
+#### 描述
+
+&emsp;&emsp;查询一个ID是否被分配.
+#### 参数
+
+**ida_p**
+
+&emsp;&emsp; 指向idr的指针
+
+**id**
+
+&emsp;&emsp; 您查询该ID是否被分配.
+
+#### 返回值
+
+&emsp;&emsp;如果分配,将返回true; 否则返回false.

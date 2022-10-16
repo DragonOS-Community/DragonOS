@@ -4,4 +4,4 @@ all: about.o
 
 	objcopy -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/about $(output_dir)/about.elf
 about.o: about.c
-	gcc $(CFLAGS) -c about.c  -o about.o
+	$(CC) $(CFLAGS) -c about.c  -o about.o

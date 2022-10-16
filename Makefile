@@ -16,6 +16,7 @@ ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
 
+export CC=gcc
 
 .PHONY: all
 all: kernel user

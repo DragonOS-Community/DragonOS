@@ -10,7 +10,7 @@ ECHO:
 
 
 $(kernel_fs_objs): ECHO
-	gcc $(CFLAGS) -c $@ -o $@.o
+	$(CC) $(CFLAGS) -c $@ -o $@.o
 
 $(kernel_fs_subdirs): ECHO
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"

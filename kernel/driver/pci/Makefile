@@ -5,7 +5,7 @@ CFLAGS += -I .
 
 
 pci.o: pci.c
-	gcc $(CFLAGS) -c pci.c -o pci.o
+	$(CC) $(CFLAGS) -c pci.c -o pci.o
 
 msi.o: msi.c
-	gcc $(CFLAGS) -c msi.c -o msi.o
+	$(CC) $(CFLAGS) -c msi.c -o msi.o

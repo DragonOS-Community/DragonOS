@@ -5,4 +5,4 @@ CFLAGS += -I .
 
 
 tty.o: tty.c
-	gcc $(CFLAGS) -c tty.c -o tty.o
+	$(CC) $(CFLAGS) -c tty.c -o tty.o

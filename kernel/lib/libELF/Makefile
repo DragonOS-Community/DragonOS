@@ -5,4 +5,4 @@ CFLAGS += -I .
 
 
 elf.o: elf.c
-	gcc $(CFLAGS) -c elf.c -o elf.o
+	$(CC) $(CFLAGS) -c elf.c -o elf.o

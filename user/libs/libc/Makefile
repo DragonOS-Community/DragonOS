@@ -18,31 +18,31 @@ libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o string.o diren
 	done
 
 unistd.o: unistd.c
-	gcc $(CFLAGS) -c unistd.c -o unistd.o
+	$(CC) $(CFLAGS) -c unistd.c -o unistd.o
 
 fcntl.o: fcntl.c
-	gcc $(CFLAGS) -c fcntl.c -o fcntl.o
+	$(CC) $(CFLAGS) -c fcntl.c -o fcntl.o
 
 malloc.o: malloc.c
-	gcc $(CFLAGS) -c malloc.c -o malloc.o
+	$(CC) $(CFLAGS) -c malloc.c -o malloc.o
 
 errno.o: errno.c
-	gcc $(CFLAGS) -c errno.c -o errno.o
+	$(CC) $(CFLAGS) -c errno.c -o errno.o
 
 printf.o: printf.c
-	gcc $(CFLAGS) -c printf.c -o printf.o
+	$(CC) $(CFLAGS) -c printf.c -o printf.o
 
 stdlib.o: stdlib.c
-	gcc $(CFLAGS) -c stdlib.c -o stdlib.o
+	$(CC) $(CFLAGS) -c stdlib.c -o stdlib.o
 	
 ctype.o: ctype.c
-	gcc $(CFLAGS) -c ctype.c -o ctype.o
+	$(CC) $(CFLAGS) -c ctype.c -o ctype.o
 
 string.o: string.c
-	gcc $(CFLAGS) -c string.c -o string.o
+	$(CC) $(CFLAGS) -c string.c -o string.o
 
 dirent.o: dirent.c
-	gcc $(CFLAGS) -c dirent.c -o dirent.o
+	$(CC) $(CFLAGS) -c dirent.c -o dirent.o
 
 time.o: time.c
-	gcc $(CFLAGS) -c time.c -o time.o
+	$(CC) $(CFLAGS) -c time.c -o time.o

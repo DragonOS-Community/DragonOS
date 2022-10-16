@@ -59,11 +59,11 @@ void sched_cfs()
     // kdebug("current_pcb pid= %d", current_pcb->pid);
     struct process_control_block *proc = sched_cfs_dequeue();
     // kdebug("sched_cfs_ready_queue[proc_current_cpu_id].count = %d", sched_cfs_ready_queue[proc_current_cpu_id].count);
-    if (current_pcb->virtual_runtime >= proc->virtual_runtime || current_pcb->state != PROC_RUNNING) // 当前进程运行时间大于了下一进程的运行时间，进行切换
+    if (current_pcb->virtual_runtime >= proc->virtual_runtime || !(current_pcb->state & PROC_RUNNING)) // 当前进程运行时间大于了下一进程的运行时间，进行切换
     {
 
         // kdebug("current_pcb->virtual_runtime = %d,proc->vt= %d", current_pcb->virtual_runtime, proc->virtual_runtime);
-        if (current_pcb->state == PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
+        if (current_pcb->state & PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             sched_cfs_enqueue(current_pcb);
         // kdebug("proc->pid=%d, count=%d", proc->pid, sched_cfs_ready_queue[proc_current_cpu_id].count);
         if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
@@ -148,12 +148,12 @@ void sched_update_jiffies()
 }
 
 /**
- * @brief 初始化进程调度器
+ * @brief 初始化CFS调度器
  *
  */
-void sched_init()
+void sched_cfs_init()
 {
-    kinfo("**************sched init Starting...");
+    kinfo("**************sched cfs init Starting...");
     memset(&sched_cfs_ready_queue, 0, sizeof(struct sched_queue_t) * MAX_CPU_NUM);
     for (int i = 0; i < MAX_CPU_NUM; ++i)
     {

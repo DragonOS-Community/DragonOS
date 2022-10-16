@@ -13,3 +13,6 @@ void sched_enqueue(struct process_control_block *pcb);
  *
  */
 void sched();
+
+
+void sched_init();

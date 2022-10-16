@@ -146,7 +146,8 @@
         "lockref.h": "c",
         "compiler_attributes.h": "c",
         "timer.h": "c",
-        "hid.h": "c"
+        "hid.h": "c",
+        "cfs.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

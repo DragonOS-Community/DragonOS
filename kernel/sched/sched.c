@@ -2,7 +2,7 @@
 #include <common/kprint.h>
 #include <driver/video/video.h>
 #include <common/spinlock.h>
-// #include <sched/cfs.h>
+#include <sched/cfs.h>
 
 /**
  * @brief 包裹shced_cfs_enqueue(),将PCB加入就绪队列
@@ -22,4 +22,9 @@ void sched()
 {
     // kinfo("**************sched  Starting...");
     sched_cfs();
+}
+
+void sched_init()
+{
+    sched_cfs_init();
 }

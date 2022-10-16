@@ -61,7 +61,7 @@ struct idr
     struct idr_layer *free_list;
     int id_free_cnt;
     spinlock_t lock;
-};
+}__attribute__((aligned(8)));
 
 #define DECLARE_IDR(name)    \
     struct idr name = {0};   \
@@ -77,9 +77,9 @@ struct idr
 /**
  * 对外函数声明
  **/
-int idr_pre_get(struct idr *idp, gfp_t gfp_mask);
-int idr_get_new(struct idr *idp, void *ptr, int *id);
-void idr_remove(struct idr *idp, int id);
+int idr_preload(struct idr *idp, gfp_t gfp_mask);
+int idr_alloc(struct idr *idp, void *ptr, int *id);
+void *idr_remove(struct idr *idp, int id);
 void idr_remove_all(struct idr *idp);
 void idr_destroy(struct idr *idp);
 void *idr_find(struct idr *idp, int id);
@@ -88,6 +88,32 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid);
 int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **oldptr);
 int idr_replace(struct idr *idp, void *ptr, int id);
 void idr_init(struct idr *idp);
+bool idr_empty(struct idr *idp);
+bool idr_count(struct idr *idp, int id);
+
+/**
+ * 对外宏：遍历idr两种方式：
+ *     1. 从第一个元素开始遍历
+ *     2. 从某一个id开始遍历
+ */
+
+/**
+ * @brief 第一种遍历方式: 从第一个元素开始遍历
+ * @param idp idr指针
+ * @param id  遍历的id，你不需要初始化这个id，因为它每一次都是从最小已分配的id开始遍历
+ * @param ptr 数据指针(entry)，你不需要初始化这个指针
+ */
+#define for_each_idr_entry(idp, id, ptr) \
+    for (id = -1, ptr = idr_find_next_getid(idp, id, &id); ptr != NULL || !idr_count(idp, id); ptr = idr_find_next_getid(idp, id, &id))
+
+/**
+ * @brief 第二种遍历方式: 从某一个id开始遍历
+ * @param idp idr指针
+ * @param id  遍历的id，你需要初始化这个id(请你设置为你要从哪一个id开始遍历，遍历过程将会包括这个id)
+ * @param ptr 数据指针(entry)，你不需要初始化这个指针
+ */
+#define for_each_idr_entry(idp, id, ptr) \
+    for (ptr = idr_find_next_getid(idp, id - 1, &id); ptr != NULL || !idr_count(idp, id); ptr = idr_find_next_getid(idp, id, &id))
 
 /**
  * ida: 基于IDR实现的ID分配器
@@ -132,8 +158,9 @@ struct ida
  * 对外函数声明
  */
 void ida_init(struct ida *ida_p);
-int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask);
-int ida_get_new(struct ida *ida_p, int *p_id);
+bool ida_empty(struct ida *ida_p);
+int ida_preload(struct ida *ida_p, gfp_t gfp_mask);
+int ida_alloc(struct ida *ida_p, int *p_id);
 bool ida_count(struct ida *ida_p, int id);
 void ida_remove(struct ida *ida_p, int id);
 void ida_destroy(struct ida *ida_p);

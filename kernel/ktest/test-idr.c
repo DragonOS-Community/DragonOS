@@ -8,7 +8,7 @@
  * @brief 测试idr的构建,预获取空间是否成功
  *
  * 以下函数将被测试:
- * 1. idr_pre_get
+ * 1. idr_preload
  * 2. DECLARE_IDR
  * 3. idr_init
  * 4. idr_destroy
@@ -33,7 +33,7 @@ static long ktest_idr_case0(uint64_t arg0, uint64_t arg1)
     idr_init(&k_idr);
     assert(k_idr.id_free_cnt == 0);
 
-    assert(idr_pre_get(&k_idr, 0) == 0);
+    assert(idr_preload(&k_idr, 0) == 0);
     assert(k_idr.id_free_cnt == IDR_FREE_MAX);
 
     for (int i = 1; i < 64; i++)
@@ -71,7 +71,7 @@ static long ktest_idr_case1(uint64_t arg0, uint64_t arg1)
     // 获取128个id
     for (int i = 0; i < 128; i++)
     {
-        assert(idr_get_new(&k_idr, &a[i], &a[i]) == 0);
+        assert(idr_alloc(&k_idr, &a[i], &a[i]) == 0);
         assert(a[i] == i);
     }
 
@@ -87,35 +87,53 @@ static long ktest_idr_case1(uint64_t arg0, uint64_t arg1)
     // 倒序：删除64个id
     for (int i = 127; i >= 64; i--)
     {
-        idr_remove(&k_idr, a[i]);
+        int *id = idr_remove(&k_idr, a[i]);
+        assert(id != NULL);
+        assert(*id == i);
         assert(idr_find(&k_idr, a[i]) == NULL);
     }
 
     // 正序：删除64个id
     for (int i = 0; i <= 63; i++)
     {
-        idr_remove(&k_idr, a[i]);
+        int *id = idr_remove(&k_idr, a[i]);
+        assert(id != NULL);
+        assert(*id == i);
         assert(idr_find(&k_idr, a[i]) == NULL);
+    }
+
+    for (int i = 0; i < 128; i++) 
+    {
+        assert(idr_count(&k_idr, i) == 0);
     }
 
     // 重新申请128个id, 值域范围应该仍然是[0,127]
     for (int i = 0; i < 128; i++)
     {
-        assert(idr_get_new(&k_idr, &a[i], &a[i]) == 0);
+        assert(idr_alloc(&k_idr, &a[i], &a[i]) == 0);
         assert(a[i] == i);
+    }
+
+    for (int i = 0; i < 128; i++) 
+    {
+        assert(idr_count(&k_idr, i));
     }
 
     // 正序：删除32个id
     for (int i = 0; i <= 31; i++)
     {
-        idr_remove(&k_idr, a[i]);
+        int *id = idr_remove(&k_idr, a[i]);
+        assert(id != NULL);
+        assert(*id == i);
         assert(idr_find(&k_idr, a[i]) == NULL);
     }
 
     // 倒序：删除32个id
     for (int i = 127; i >= 96; i--)
     {
-        idr_remove(&k_idr, a[i]);
+        int *id = idr_remove(&k_idr, a[i]);
+        assert(id != NULL);
+        assert(*id == i);
         assert(idr_find(&k_idr, a[i]) == NULL);
     }
 
@@ -126,7 +144,7 @@ static long ktest_idr_case1(uint64_t arg0, uint64_t arg1)
     // 获取128个id
     for (int i = 0; i < 128; i++)
     {
-        assert(idr_get_new(&k_idr, &a[i], &a[i]) == 0);
+        assert(idr_alloc(&k_idr, &a[i], &a[i]) == 0);
         assert(a[i] == i);
     }
 
@@ -177,14 +195,17 @@ static long ktest_idr_case2(uint64_t arg0, uint64_t arg1)
     int tmp;
     for (int i = 0; i < N; i++)
     {
-        assert(idr_get_new(&k_idr, &tmp, &tmp) == 0);
+        assert(idr_alloc(&k_idr, &tmp, &tmp) == 0);
         assert(tmp == i);
 
         int *ptr = idr_find(&k_idr, i);
         assert(ptr != NULL);
         assert(*ptr == i);
-    }
 
+        // if (i >= 7255) kdebug("1e6 !!!!!!! : %d", i);
+        assert(idr_count(&k_idr, i));
+    }
+kdebug("111111");
     // 正向: M 个ID
     for (int i = 0; i < M; i++)
     {
@@ -194,6 +215,7 @@ static long ktest_idr_case2(uint64_t arg0, uint64_t arg1)
         idr_remove(&k_idr, i);
         assert(idr_find(&k_idr, i) == NULL);
     }
+    kdebug("22222");
 
     // 倒序: N-M 个ID
     for (int i = (N)-1; i >= M; i--)
@@ -203,11 +225,11 @@ static long ktest_idr_case2(uint64_t arg0, uint64_t arg1)
         idr_remove(&k_idr, i);
         assert(idr_find(&k_idr, i) == NULL);
     }
-
+kdebug("3333333");
     // 重新插入数据
     for (int i = 0; i < N; i++)
     {
-        assert(idr_get_new(&k_idr, &tmp, &tmp) == 0);
+        assert(idr_alloc(&k_idr, &tmp, &tmp) == 0);
         assert(tmp == i);
         assert(k_idr.top != NULL);
 
@@ -215,19 +237,19 @@ static long ktest_idr_case2(uint64_t arg0, uint64_t arg1)
         assert(ptr != NULL);
         assert(*ptr == i);
     }
-
+kdebug("4444444444");
     assert(k_idr.top != NULL);
 
     for (int i = 0; i < M; i++)
     {
         assert(idr_replace(&k_idr, NULL, i) == 0);
     }
-
+kdebug("555555555555555555");
     // 销毁
     idr_destroy(&k_idr);
     assert(k_idr.id_free_cnt == 0);
     assert(k_idr.free_list == NULL);
-
+kdebug("666666666666");
     return 0;
 }
 
@@ -247,7 +269,7 @@ static long ktest_idr_case3(uint64_t arg0, uint64_t arg1)
     // 获取ID
     for (int i = 0; i < N; i++)
     {
-        assert(idr_get_new(&k_idr, &tmp, &tmp) == 0);
+        assert(idr_alloc(&k_idr, &tmp, &tmp) == 0);
         assert(tmp == i);
 
         int *ptr = idr_find(&k_idr, i);
@@ -333,7 +355,7 @@ static long ktest_idr_case4(uint64_t arg0, uint64_t arg1)
         int M = N / i, T = M / 3, O = 2 * T;
         for (int j = 0; j < M; j++)
         {
-            assert(idr_get_new(&k_idr, &tmp, &tmp) == 0);
+            assert(idr_alloc(&k_idr, &tmp, &tmp) == 0);
             assert(tmp == j);
         }
 
@@ -362,12 +384,14 @@ static long ktest_idr_case4(uint64_t arg0, uint64_t arg1)
         }
 
         assert(k_idr.top == NULL);
+        assert(idr_empty(&k_idr));
     }
 
     // 销毁
     idr_destroy(&k_idr);
     assert(k_idr.id_free_cnt == 0);
     assert(k_idr.free_list == NULL);
+    assert(idr_empty(&k_idr));
 
     return 0;
 }
@@ -387,7 +411,7 @@ static long ktest_idr_case5(uint64_t arg0, uint64_t arg1)
     // 获取128个id
     for (int i = 0; i < N; i++)
     {
-        assert(idr_get_new(&k_idr, &a[i], &a[i]) == 0);
+        assert(idr_alloc(&k_idr, &a[i], &a[i]) == 0);
         assert(a[i] == i);
     }
 
@@ -414,12 +438,13 @@ static long ktest_idr_case5(uint64_t arg0, uint64_t arg1)
     // destroy之后，再获取128个id
     for (int i = 0; i < N; i++)
     {
-        assert(idr_get_new(&k_idr, &a[i], &a[i]) == 0);
+        assert(idr_alloc(&k_idr, &a[i], &a[i]) == 0);
         assert(a[i] == i);
     }
 
     // 销毁
     idr_destroy(&k_idr);
+    assert(idr_empty(&k_idr));
     assert(k_idr.id_free_cnt == 0);
     assert(k_idr.free_list == NULL);
 
@@ -442,65 +467,68 @@ static long ktest_idr_case6(uint64_t arg0, uint64_t arg1)
 
     DECLARE_IDA(k_ida);
     ida_init(&k_ida);
+    io_sfence();
 
     const int N = IDA_FULL * IDR_SIZE + 1;
 
     for (int i = 0; i < N; i++)
     {
-        int p_id;
-        assert(ida_get_new(&k_ida, &p_id) == 0);
-        assert(p_id == i);
+        int p_id;io_sfence();
+        assert(ida_alloc(&k_ida, &p_id) == 0);io_sfence();
+        assert(p_id == i);io_sfence();
     }
 
     for (int i = 0; i < N; i++)
     {
-        assert(ida_count(&k_ida, i) == 1);
+        assert(ida_count(&k_ida, i) == 1);io_sfence();
     }
 
     for (int i = N - 1; i >= 0; i--)
     {
-        ida_remove(&k_ida, i);
-        assert(ida_count(&k_ida, i) == 0);
+        ida_remove(&k_ida, i);io_sfence();
+        assert(ida_count(&k_ida, i) == 0);io_sfence();
     }
 
     assert(k_ida.idr.top == NULL);
 
     for (int i = 0; i < N; i++)
     {
-        int p_id;
-        assert(ida_get_new(&k_ida, &p_id) == 0);
-        assert(p_id == i);
+        int p_id;io_sfence();
+        assert(ida_alloc(&k_ida, &p_id) == 0);io_sfence();
+        assert(p_id == i);io_sfence();
     }
 
-    assert(k_ida.idr.top != NULL);
-    ida_destroy(&k_ida);
-    assert(k_ida.idr.top == NULL);
-    assert(k_ida.free_list == NULL);
+    assert(k_ida.idr.top != NULL);io_sfence();
+    ida_destroy(&k_ida);io_sfence();
+    assert(k_ida.idr.top == NULL);io_sfence();
+    assert(k_ida.free_list == NULL);io_sfence();
+    assert(ida_empty(&k_ida));io_sfence();
 
     // 测试destroy之后能否重新获取ID
     for (int i = 0; i < N; i++)
     {
-        int p_id;
-        assert(ida_get_new(&k_ida, &p_id) == 0);
-        assert(p_id == i);
+        int p_id;io_sfence();
+        assert(ida_alloc(&k_ida, &p_id) == 0);io_sfence();
+        assert(p_id == i);io_sfence();
     }
 
     for (int i = 0; i < N / 3; i++)
     {
-        ida_remove(&k_ida, i);
-        assert(ida_count(&k_ida, i) == 0);
+        ida_remove(&k_ida, i);io_sfence();
+        assert(ida_count(&k_ida, i) == 0);io_sfence();
     }
 
     for (int i = 2 * N / 3; i < N; i++)
     {
-        ida_remove(&k_ida, i);
-        assert(ida_count(&k_ida, i) == 0);
+        ida_remove(&k_ida, i);io_sfence();
+        assert(ida_count(&k_ida, i) == 0);io_sfence();
     }
 
-    assert(k_ida.idr.top != NULL);
-    ida_destroy(&k_ida);
-    assert(k_ida.idr.top == NULL);
-    assert(k_ida.free_list == NULL);
+    assert(k_ida.idr.top != NULL);io_sfence();
+    ida_destroy(&k_ida);io_sfence();
+    assert(k_ida.idr.top == NULL);io_sfence();
+    assert(k_ida.free_list == NULL);io_sfence();
+    assert(ida_empty(&k_ida));io_sfence();
 
     return 0;
 }
@@ -508,7 +536,7 @@ static long ktest_idr_case6(uint64_t arg0, uint64_t arg1)
 static ktest_case_table kt_idr_func_table[] = {
     ktest_idr_case0,
     ktest_idr_case1,
-    // ktest_idr_case2, // 为了加快启动速度, 暂时注释掉这个测试
+    ktest_idr_case2, // 为了加快启动速度, 暂时注释掉这个测试
     ktest_idr_case3,
     ktest_idr_case4,
     ktest_idr_case5,

@@ -344,7 +344,7 @@ void apic_local_apic_init()
  * @brief 初始化apic控制器
  *
  */
-void apic_init()
+int apic_init()
 {
     // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
     for (int i = 32; i <= 55; ++i)
@@ -386,6 +386,7 @@ void apic_init()
         kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
     }
     sti();
+    return 0;
 }
 /**
  * @brief 中断服务程序

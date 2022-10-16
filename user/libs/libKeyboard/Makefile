@@ -4,4 +4,4 @@ CFLAGS += -I .
 
 
 keyboard.o: keyboard.c
-	gcc $(CFLAGS) -c keyboard.c -o keyboard.o
+	$(CC) $(CFLAGS) -c keyboard.c -o keyboard.o

@@ -351,4 +351,11 @@ ENTRY(syscall_int)
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
+// irq模块初始化后的ignore_int入点
+ENTRY(ignore_int)
+    pushq $0
+    pushq %rax
+    leaq ignore_int_handler(%rip), %rax    // 获取ignore处理程序的地址
+    xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
+    jmp Err_Code
 

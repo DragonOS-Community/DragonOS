@@ -290,7 +290,7 @@ void apic_init_ap_core_local_apic();
  * @brief 初始化apic控制器
  *
  */
-void apic_init();
+int apic_init();
 
 /**
  * @brief 读取指定类型的 Interrupt Control Structure

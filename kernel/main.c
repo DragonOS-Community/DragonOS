@@ -209,10 +209,4 @@ void Start_Kernel(void)
     while (1)
         pause();
 }
-
-void ignore_int()
-{
-    kwarn("Unknown interrupt or fault at RIP.\n");
-    sti();
-}
 #pragma GCC pop_options

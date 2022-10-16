@@ -10,7 +10,7 @@ ECHO:
 
 
 $(kernel_fs_devfs_objs): ECHO
-	gcc $(CFLAGS) -c $@ -o $@.o
+	$(CC) $(CFLAGS) -c $@ -o $@.o
 
 
 all: $(kernel_fs_devfs_objs)

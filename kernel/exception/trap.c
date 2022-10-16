@@ -1,15 +1,19 @@
 #include "trap.h"
 #include "gate.h"
-#include <process/ptrace.h>
 #include <common/kprint.h>
-#include <process/process.h>
 #include <debug/traceback/traceback.h>
+#include <process/process.h>
+#include <process/ptrace.h>
 #include <sched/sched.h>
+
+extern void ignore_int();
+
 // 0 #DE 除法错误
 void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
     // kerror("do_divide_error(0)");
-    kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\t pid=%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
+    kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\t pid=%d\n", error_code,
+           regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -20,7 +24,8 @@ void do_debug(struct pt_regs *regs, unsigned long error_code)
 {
     printk("[ ");
     printk_color(RED, BLACK, "ERROR / TRAP");
-    printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip,
+           proc_current_cpu_id);
 
     while (1)
         hlt();
@@ -32,7 +37,8 @@ void do_nmi(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(BLUE, BLACK, "INT");
-    printk(" ] do_nmi(2),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    printk(" ] do_nmi(2),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip,
+           proc_current_cpu_id);
 
     while (1)
         hlt();
@@ -44,7 +50,8 @@ void do_int3(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(YELLOW, BLACK, "TRAP");
-    printk(" ] do_int3(3),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    printk(" ] do_int3(3),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip,
+           proc_current_cpu_id);
 
     while (1)
         hlt();
@@ -56,7 +63,8 @@ void do_overflow(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(YELLOW, BLACK, "TRAP");
-    printk(" ] do_overflow(4),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    printk(" ] do_overflow(4),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -66,7 +74,8 @@ void do_overflow(struct pt_regs *regs, unsigned long error_code)
 void do_bounds(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_bounds(5),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_bounds(5),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip,
+           proc_current_cpu_id);
 
     while (1)
         hlt();
@@ -76,7 +85,8 @@ void do_bounds(struct pt_regs *regs, unsigned long error_code)
 void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d, pid:%ld", error_code, regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
+    kerror("do_undefined_opcode(6),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d, pid:%ld", error_code,
+           regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -86,7 +96,8 @@ void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
 void do_dev_not_avaliable(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -98,7 +109,8 @@ void do_double_fault(struct pt_regs *regs, unsigned long error_code)
 
     printk("[ ");
     printk_color(RED, BLACK, "Terminate");
-    printk(" ] do_double_fault(8),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    printk(" ] do_double_fault(8),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -108,7 +120,8 @@ void do_double_fault(struct pt_regs *regs, unsigned long error_code)
 void do_coprocessor_segment_overrun(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_coprocessor_segment_overrun(9),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_coprocessor_segment_overrun(9),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code,
+           regs->rsp, regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -120,7 +133,8 @@ void do_invalid_TSS(struct pt_regs *regs, unsigned long error_code)
 
     printk("[");
     printk_color(RED, BLACK, "ERROR");
-    printk("] do_invalid_TSS(10),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    printk("] do_invalid_TSS(10),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     printk_color(YELLOW, BLACK, "Information:\n");
     // 解析错误码
@@ -149,7 +163,8 @@ void do_invalid_TSS(struct pt_regs *regs, unsigned long error_code)
 void do_segment_not_exists(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_segment_not_exists(11),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_segment_not_exists(11),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -159,7 +174,8 @@ void do_segment_not_exists(struct pt_regs *regs, unsigned long error_code)
 void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_stack_segment_fault(12),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_stack_segment_fault(12),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -169,9 +185,12 @@ void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
 void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\tpid=%ld\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
+    kerror("do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\tpid=%ld\n", error_code,
+           regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
     if (error_code & 0x01)
-        printk_color(RED, BLACK, "The exception occurred during delivery of an event external to the program,such as an interrupt or an earlier exception.\n");
+        printk_color(RED, BLACK,
+                     "The exception occurred during delivery of an event external to the program,such as an interrupt "
+                     "or an earlier exception.\n");
 
     if (error_code & 0x02)
         printk_color(RED, BLACK, "Refers to a gate descriptor in the IDT;\n");
@@ -196,10 +215,10 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 
     unsigned long cr2 = 0;
 
-    __asm__ __volatile__("movq	%%cr2,	%0"
-                         : "=r"(cr2)::"memory");
+    __asm__ __volatile__("movq	%%cr2,	%0" : "=r"(cr2)::"memory");
 
-    kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx, RBP=%#018lx, RIP:%#018lx CPU:%d, pid=%d\n", error_code, regs->rsp, regs->rbp, regs->rip, proc_current_cpu_id, current_pcb->pid);
+    kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx, RBP=%#018lx, RIP:%#018lx CPU:%d, pid=%d\n", error_code,
+           regs->rsp, regs->rbp, regs->rip, proc_current_cpu_id, current_pcb->pid);
     kerror("regs->rax = %#018lx\n", regs->rax);
     if (!(error_code & 0x01))
         printk_color(RED, BLACK, "Page Not-Present,\t");
@@ -223,7 +242,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
     printk_color(RED, BLACK, "\n");
 
     printk_color(RED, BLACK, "CR2:%#018lx\n", cr2);
-    
+
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -235,7 +254,8 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 void do_x87_FPU_error(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_x87_FPU_error(16),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_x87_FPU_error(16),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     while (1)
         hlt();
@@ -245,7 +265,8 @@ void do_x87_FPU_error(struct pt_regs *regs, unsigned long error_code)
 void do_alignment_check(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_alignment_check(17),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_alignment_check(17),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -255,7 +276,8 @@ void do_alignment_check(struct pt_regs *regs, unsigned long error_code)
 void do_machine_check(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_machine_check(18),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_machine_check(18),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -265,7 +287,8 @@ void do_machine_check(struct pt_regs *regs, unsigned long error_code)
 void do_SIMD_exception(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_SIMD_exception(19),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_SIMD_exception(19),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -275,7 +298,8 @@ void do_SIMD_exception(struct pt_regs *regs, unsigned long error_code)
 void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_virtualization_exception(20),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip, proc_current_cpu_id);
+    kerror("do_virtualization_exception(20),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code,
+           regs->rsp, regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
     sched();
@@ -283,8 +307,24 @@ void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
 
 // 21-21 Intel保留，请勿使用
 
+/**
+ * @brief 当系统收到未知的中断时，执行此处理函数
+ *
+ * @param regs
+ * @param error_code
+ */
+void ignore_int_handler(struct pt_regs *regs, unsigned long error_code)
+{
+    kwarn("Unknown interrupt or fault at RIP.\n");
+}
+
 void sys_vector_init()
 {
+    // 将idt重置为新的ignore_int入点（此前在head.S中有设置，
+    // 但是那个不完整，某些版本的编译器的输出，在真机运行时会破坏进程执行环境，从而导致#GP
+    for (int i = 0; i < 256; ++i)
+        set_intr_gate(i, 0, ignore_int);
+
     set_trap_gate(0, 0, divide_error);
     set_trap_gate(1, 0, debug);
     set_intr_gate(2, 0, nmi);

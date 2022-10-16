@@ -5,4 +5,4 @@ CFLAGS += -I .
 
 
 acpi.o: acpi.c
-	gcc $(CFLAGS) -c acpi.c -o acpi.o
+	$(CC) $(CFLAGS) -c acpi.c -o acpi.o

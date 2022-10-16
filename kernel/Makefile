@@ -22,14 +22,14 @@ kernel_subdirs := common driver process debug filesystem time arch exception mm 
 
 
 head.o: head.S
-	gcc -E head.S > _head.s # 预处理
+	$(CC) -E head.S > _head.s # 预处理
 	as $(ASFLAGS) -o head.o _head.s
 
 
 main.o: main.c 
 # -fno-builtin: 不使用C语言内建函数
 # The -m64 option sets int to 32bits and long and pointer to 64 bits and generates code for AMD’s x86-64 architecture.
-	gcc $(CFLAGS) -c main.c  -o main.o
+	$(CC) $(CFLAGS) -c main.c  -o main.o
 
 
 all: kernel

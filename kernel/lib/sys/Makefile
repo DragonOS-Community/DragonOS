@@ -7,7 +7,7 @@ ECHO:
 	@echo "$@"
 
 $(kernel_lib_sys_objs): ECHO
-	gcc $(CFLAGS) -c $@ -o $@.o
+	$(CC) $(CFLAGS) -c $@ -o $@.o
 
 all: $(kernel_lib_sys_objs)
 	@echo $(kernel_lib_sys_objs)

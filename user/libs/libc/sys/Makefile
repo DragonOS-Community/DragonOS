@@ -5,7 +5,7 @@ CFLAGS += -I .
 
 
 wait.o: wait.c
-	gcc $(CFLAGS) -c wait.c -o wait.o
+	$(CC) $(CFLAGS) -c wait.c -o wait.o
 
 stat.o: stat.c
-	gcc $(CFLAGS) -c stat.c -o stat.o
+	$(CC) $(CFLAGS) -c stat.c -o stat.o

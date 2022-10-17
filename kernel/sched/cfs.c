@@ -81,19 +81,10 @@ void sched_cfs()
             }
         }
 
-        // if (proc->pid == 0)
-        // {
-        //     kdebug("switch to pid0, current pid%ld, vrt=%ld      pid0 vrt=%ld", current_pcb->pid, current_pcb->virtual_runtime, proc->virtual_runtime);
-        //     if(current_pcb->state != PROC_RUNNING)
-        //         kdebug("current_pcb->state!=PROC_RUNNING");
-        // }
 
-        // kinfo("---**************switch bf.=%d", proc->pid);
         process_switch_mm(proc);
 
-        // kinfo("**************switch af.=%d", proc->pid);
         switch_proc(current_pcb, proc);
-        // kinfo("**************switch to.=%d", current_pcb->pid);
     }
     else // 不进行切换
     {
@@ -107,11 +98,9 @@ void sched_cfs()
             case 0:
             case 1:
                 sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = 4 / sched_cfs_ready_queue[proc_current_cpu_id].count;
-                // sched_cfs_ready_queue.cpu_exec_proc_jiffies = 5;
                 break;
             case 2:
             default:
-                // sched_cfs_ready_queue.cpu_exec_proc_jiffies = 5;
 
                 sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue[proc_current_cpu_id].count) << 2;
                 break;
@@ -153,7 +142,6 @@ void sched_update_jiffies()
  */
 void sched_cfs_init()
 {
-    kinfo("**************sched cfs init Starting...");
     memset(&sched_cfs_ready_queue, 0, sizeof(struct sched_queue_t) * MAX_CPU_NUM);
     for (int i = 0; i < MAX_CPU_NUM; ++i)
     {

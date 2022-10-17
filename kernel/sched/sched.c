@@ -20,7 +20,6 @@ void sched_enqueue(struct process_control_block *pcb)
  */
 void sched()
 {
-    // kinfo("**************sched  Starting...");
     sched_cfs();
 }
 

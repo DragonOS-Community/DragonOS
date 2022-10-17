@@ -37,9 +37,3 @@ struct process_control_block *sched_cfs_dequeue();
  *
  */
 void sched_cfs_init();
-
-/**
- * @brief 当时钟中断到达时，更新时间片
- *
- */
-void sched_update_jiffies();

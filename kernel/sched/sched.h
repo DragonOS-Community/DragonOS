@@ -14,5 +14,10 @@ void sched_enqueue(struct process_control_block *pcb);
  */
 void sched();
 
-
 void sched_init();
+
+/**
+ * @brief 当时钟中断到达时，更新时间片
+ *
+ */
+void sched_update_jiffies();

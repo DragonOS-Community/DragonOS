@@ -181,7 +181,8 @@ static int __textui_putchar_window(struct textui_window_t *window, uint16_t char
         ++vline->index;
         textui_refresh_characters(window, window->vline_operating, vline->index - 1, 1);
         // 换行
-        if (vline->index >= window->chars_per_line)
+        // 加入光标后，因为会识别光标，所以需超过该行最大字符数才能创建新行
+        if (vline->index > window->chars_per_line)
         {
             __textui_new_line(window, window->vline_operating);
         }
@@ -295,7 +296,7 @@ int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor)
 /**
  * @brief 初始化text ui框架
  *
- * @return int
+ * @return int 
  */
 int textui_init()
 {
@@ -323,7 +324,7 @@ int textui_init()
             pause();
     }
 
-    uint16_t chars_per_vline = textui_framework.buf->width / TEXTUI_CHAR_WIDTH;
+    uint16_t chars_per_vline = textui_framework.buf->width / TEXTUI_CHAR_WIDTH - 1;
     uint16_t total_vlines = textui_framework.buf->height / TEXTUI_CHAR_HEIGHT;
     int cnt = chars_per_vline * total_vlines;
 

@@ -1,13 +1,13 @@
-#include <libc/unistd.h>
-#include <libc/stdio.h>
-#include <libc/fcntl.h>
-#include <libc/stdlib.h>
-#include <libKeyboard/keyboard.h>
-#include <libc/string.h>
-#include <libc/stddef.h>
-#include <libc/sys/stat.h>
-#include <libc/printf.h>
 #include "cmd.h"
+#include <libKeyboard/keyboard.h>
+#include <libc/fcntl.h>
+#include <libc/printf.h>
+#include <libc/stddef.h>
+#include <libc/stdio.h>
+#include <libc/stdlib.h>
+#include <libc/string.h>
+#include <libc/sys/stat.h>
+#include <libc/unistd.h>
 
 #define pause_cpu() asm volatile("pause\n\t");
 #define MEM_HISTORY 1024
@@ -171,7 +171,8 @@ int shell_readline(int fd, char *buf)
         {
             if (count > 0 && current_command_index >= count_history)
             {
-                memset(history_commands[current_command_index - 1], 0, sizeof(history_commands[current_command_index - 1]));
+                memset(history_commands[current_command_index - 1], 0,
+                       sizeof(history_commands[current_command_index - 1]));
                 count_history--;
             }
             printf("%c", '\b');
@@ -198,7 +199,7 @@ int shell_readline(int fd, char *buf)
                 printf("%c", '\b');
                 buf[count++] = key;
                 printf("%c", key);
-                //在最后一个字符处加光标
+                // 在最后一个字符处加光标
                 put_string(" ", COLOR_BLACK, COLOR_WHITE);
             }
             if (count > 0 && current_command_index >= count_history)

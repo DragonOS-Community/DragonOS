@@ -324,7 +324,7 @@ int textui_init()
             pause();
     }
 
-    uint16_t chars_per_vline = textui_framework.buf->width / TEXTUI_CHAR_WIDTH - 1;
+    uint16_t chars_per_vline = textui_framework.buf->width / TEXTUI_CHAR_WIDTH;
     uint16_t total_vlines = textui_framework.buf->height / TEXTUI_CHAR_HEIGHT;
     int cnt = chars_per_vline * total_vlines;
 

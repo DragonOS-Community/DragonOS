@@ -105,6 +105,8 @@ struct process_control_block
 
 	/* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
 	void *worker_private;
+	// 进程调度策略标志位
+	unsigned int policy;
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

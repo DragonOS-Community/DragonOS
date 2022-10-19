@@ -45,9 +45,14 @@
 		.parent_pcb = &proc,              \
 		.exit_code = 0,                   \
 		.wait_child_proc_exit = 0,        \
-		.worker_private = NULL			  \
+		.worker_private = NULL,           \
+		.policy = SCHED_NORMAL            \
 	}
-
+// 设置进程调度的policy
+#define SET_PROC_POLICY(policy) \
+	{                           \
+		.policy = policy        \
+	}
 /**
  * @brief 任务状态段结构体
  *
@@ -183,7 +188,7 @@ void process_exit_notify();
  * @return int
  */
 
-pid_t kernel_thread(int (*fn)(void*), void* arg, unsigned long flags);
+pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags);
 
 int process_fd_alloc(struct vfs_file_t *file);
 

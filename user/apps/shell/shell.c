@@ -1,12 +1,13 @@
-#include <libc/unistd.h>
-#include <libc/stdio.h>
-#include <libc/fcntl.h>
-#include <libc/stdlib.h>
-#include <libKeyboard/keyboard.h>
-#include <libc/string.h>
-#include <libc/stddef.h>
-#include <libc/sys/stat.h>
 #include "cmd.h"
+#include <libKeyboard/keyboard.h>
+#include <libc/fcntl.h>
+#include <libc/printf.h>
+#include <libc/stddef.h>
+#include <libc/stdio.h>
+#include <libc/stdlib.h>
+#include <libc/string.h>
+#include <libc/sys/stat.h>
+#include <libc/unistd.h>
 
 #define pause_cpu() asm volatile("pause\n\t");
 #define MEM_HISTORY 1024
@@ -50,10 +51,13 @@ void main_loop(int kb_fd)
     {
         int argc = 0;
         char **argv;
-
+        
         printf("[DragonOS] %s # ", shell_current_path);
-
+        
         memset(input_buffer, 0, INPUT_BUFFER_SIZE);
+
+        //添加初始光标
+        put_string(" ", COLOR_BLACK, COLOR_WHITE);
 
         // 循环读取每一行到buffer
         count_history++;
@@ -125,6 +129,7 @@ void change_command(char *buf, int type)
         current_command_index = count_history - 2;
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
+    put_string(" ", COLOR_BLACK, COLOR_WHITE);
 }
 /**
  * @brief 循环读取每一行
@@ -143,6 +148,8 @@ int shell_readline(int fd, char *buf)
         //向上方向键
         if (count_history != 0 && key == 0xc8)
         {
+            // put_string(" ", COLOR_WHITE, COLOR_BLACK);
+            printf("%c", '\b');
             clear_command(count, buf);
             count = 0;
             //向历史
@@ -152,6 +159,8 @@ int shell_readline(int fd, char *buf)
         //向下方向键
         if (count_history != 0 && key == 0x50)
         {
+            // put_string(" ", COLOR_WHITE, COLOR_BLACK);
+            printf("%c", '\b');
             clear_command(count, buf);
             count = 0;
             //向现在
@@ -162,9 +171,11 @@ int shell_readline(int fd, char *buf)
         {
             if (count > 0 && current_command_index >= count_history)
             {
-                memset(history_commands[current_command_index - 1], 0, sizeof(history_commands[current_command_index - 1]));
+                memset(history_commands[current_command_index - 1], 0,
+                       sizeof(history_commands[current_command_index - 1]));
                 count_history--;
             }
+            printf("%c", '\b');
             return count;
         }
 
@@ -174,14 +185,22 @@ int shell_readline(int fd, char *buf)
             {
                 if (count > 0)
                 {
-                    buf[--count] = 0;
+                    // 回退去除先前光标
                     printf("%c", '\b');
+                    // 去除字符
+                    printf("%c", '\b');
+                    buf[--count] = 0;
+                    // 在最后一个字符处加光标
+                    put_string(" ", COLOR_BLACK, COLOR_WHITE);
                 }
             }
             else
             {
+                printf("%c", '\b');
                 buf[count++] = key;
                 printf("%c", key);
+                // 在最后一个字符处加光标
+                put_string(" ", COLOR_BLACK, COLOR_WHITE);
             }
             if (count > 0 && current_command_index >= count_history)
             {
@@ -197,7 +216,10 @@ int shell_readline(int fd, char *buf)
 
         // 输入缓冲区满了之后，直接返回
         if (count >= INPUT_BUFFER_SIZE - 1)
+        {
+            printf("%c", '\b');
             return count;
+        }
 
         pause_cpu();
     }

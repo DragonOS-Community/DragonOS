@@ -398,7 +398,6 @@ uint64_t do_open(const char *filename, int flags)
 
     // 寻找文件
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-
     if (dentry == NULL && flags & O_CREAT)
     {
         // 先找到倒数第二级目录

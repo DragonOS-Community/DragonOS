@@ -75,7 +75,7 @@ struct sched_attr
 	}
 
 static int __sched_setscheduler(struct process_control_block *p,
-								const struct sched_attr *attr, bool attr, bool pi)
+								const struct sched_attr *attr, bool user, bool pi)
 {
 	// int policy = attr->sched_policy;
 	// // 设置不符合要求

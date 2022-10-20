@@ -44,7 +44,8 @@
 		.next_pcb = &proc,                \
 		.parent_pcb = &proc,              \
 		.exit_code = 0,                   \
-		.wait_child_proc_exit = 0         \
+		.wait_child_proc_exit = 0,        \
+		.worker_private = NULL			  \
 	}
 
 /**

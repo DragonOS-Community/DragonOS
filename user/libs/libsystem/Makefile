@@ -5,4 +5,4 @@ all: libsystem
 libsystem: syscall.o
 
 syscall.o: syscall.c
-	gcc $(CFLAGS) -c syscall.c  -o syscall.o
+	$(CC) $(CFLAGS) -c syscall.c  -o syscall.o

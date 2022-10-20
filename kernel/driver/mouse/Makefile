@@ -5,4 +5,4 @@ CFLAGS += -I .
 
 
 ps2_mouse.o: ps2_mouse.c
-	gcc $(CFLAGS) -c ps2_mouse.c -o ps2_mouse.o
+	$(CC) $(CFLAGS) -c ps2_mouse.c -o ps2_mouse.o

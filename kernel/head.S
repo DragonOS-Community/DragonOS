@@ -326,6 +326,7 @@ entry64:
 	jnc	start_smp
 
 setup_IDT:
+    // 该部分代码只在启动初期使用，后面的c文件中会重新设置IDT，
     leaq m_ignore_int(%rip),  %rdx // 将ignore_int的地址暂时存到中段描述符的高8B
     movq $(0x08 << 16), %rax  // 设置段选择子。由IDT结构和段选择子结构可知，本行设置段基地址为0x100000，TI=0,RPL=0
     movw %dx, %ax
@@ -460,6 +461,7 @@ go_to_smp_kernel:
 	.quad	smp_ap_start
 
 // ==== 异常/中断处理模块 ignore int： 忽略中断
+// (该部分代码只在启动初期使用，后面的c文件中会重新设置IDT，从而重设ignore_int的中断入点)
 m_ignore_int:
 // 切换到c语言的ignore_int
     movq go_to_ignore_int(%rip), %rax
@@ -470,7 +472,7 @@ m_ignore_int:
 
 
 go_to_ignore_int:
-    .quad ignore_int
+    .quad ignore_int_handler
 
 
 ENTRY(head_stack_start)

@@ -99,5 +99,5 @@
 
 #define EWOULDBLOCK 80     /* 操作将被禁止 Operation would block (may be the same value as [EAGAIN]). */
 #define EXDEV 81           /* 跨设备连接 Cross-device link. */
-
+#define EINVAL 82          /* 无效参数 Invalid argument. */
 extern int errno;

@@ -48,11 +48,69 @@
 		.worker_private = NULL,           \
 		.policy = SCHED_NORMAL            \
 	}
-// 设置进程调度的policy
-#define SET_PROC_POLICY(policy) \
-	{                           \
-		.policy = policy        \
+
+static int __sched_setscheduler(struct process_control_block *p,
+								struct sched_attr attr, bool check, bool pi)
+{
+	int policy = attr.sched_policy;
+	// 设置不符合要求
+	if (policy < 0 || policy > 5)
+	{
+		return -22;
 	}
+	// 修改成功
+	p->policy = policy;
+	return 0;
+}
+static int _sched_setscheduler(struct process_control_block *p, int policy,
+							   const struct sched_param *param, bool check)
+{
+	struct sched_attr attr = {
+		.sched_policy = policy};
+
+	return __sched_setscheduler(p, &attr, check, true);
+}
+/**
+ * sched_setscheduler -设置进程的policy
+ * @p: 需要修改的pcb
+ * @policy: 需要设置的policy
+ * @param: structure containing the new RT priority. 目前没有用
+ *
+ *
+ * Return: 成功返回0,否则返回-22
+ *
+ */
+int sched_setscheduler(struct process_control_block *p, int policy,
+					   const struct sched_param *param)
+{
+	return _sched_setscheduler(p, policy, param, true);
+}
+struct sched_param
+{
+	int sched_priority;
+};
+struct sched_attr
+{
+	unsigned int size;
+
+	unsigned int sched_policy;
+	unsigned long sched_flags;
+
+	/* SCHED_NORMAL, SCHED_BATCH */
+	signed int sched_nice;
+
+	/* SCHED_FIFO, SCHED_RR */
+	unsigned int sched_priority;
+
+	/* SCHED_DEADLINE */
+	unsigned long sched_runtime;
+	unsigned long sched_deadline;
+	unsigned long sched_period;
+
+	/* Utilization hints */
+	unsigned int sched_util_min;
+	unsigned int sched_util_max;
+};
 /**
  * @brief 任务状态段结构体
  *

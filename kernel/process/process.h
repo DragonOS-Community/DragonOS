@@ -25,7 +25,32 @@
 #endif
 
 #include "proc-types.h"
+struct sched_param
+{
+	int sched_priority;
+};
+struct sched_attr
+{
+	unsigned int size;
 
+	unsigned int sched_policy;
+	unsigned long sched_flags;
+
+	/* SCHED_NORMAL, SCHED_BATCH */
+	signed int sched_nice;
+
+	/* SCHED_FIFO, SCHED_RR */
+	unsigned int sched_priority;
+
+	/* SCHED_DEADLINE */
+	unsigned long sched_runtime;
+	unsigned long sched_deadline;
+	unsigned long sched_period;
+
+	/* Utilization hints */
+	unsigned int sched_util_min;
+	unsigned int sched_util_max;
+};
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                \
 	{                                     \
@@ -85,32 +110,7 @@ int sched_setscheduler(struct process_control_block *p, int policy,
 {
 	return _sched_setscheduler(p, policy, param, true);
 }
-struct sched_param
-{
-	int sched_priority;
-};
-struct sched_attr
-{
-	unsigned int size;
 
-	unsigned int sched_policy;
-	unsigned long sched_flags;
-
-	/* SCHED_NORMAL, SCHED_BATCH */
-	signed int sched_nice;
-
-	/* SCHED_FIFO, SCHED_RR */
-	unsigned int sched_priority;
-
-	/* SCHED_DEADLINE */
-	unsigned long sched_runtime;
-	unsigned long sched_deadline;
-	unsigned long sched_period;
-
-	/* Utilization hints */
-	unsigned int sched_util_min;
-	unsigned int sched_util_max;
-};
 /**
  * @brief 任务状态段结构体
  *

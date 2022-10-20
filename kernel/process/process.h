@@ -77,14 +77,14 @@ struct sched_attr
 static int __sched_setscheduler(struct process_control_block *p,
 								const struct sched_attr *attr, bool attr, bool pi)
 {
-	int policy = attr.sched_policy;
-	// 设置不符合要求
-	if (policy < 0 || policy > 5)
-	{
-		return -22;
-	}
-	// 修改成功
-	p->policy = policy;
+	// int policy = attr->sched_policy;
+	// // 设置不符合要求
+	// if (policy < 0 || policy > 5)
+	// {
+	// 	return -22;
+	// }
+	// // 修改成功
+	// p->policy = policy;
 	return 0;
 }
 static int _sched_setscheduler(struct process_control_block *p, int policy,

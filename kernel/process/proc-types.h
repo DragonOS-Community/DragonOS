@@ -30,9 +30,9 @@
 #define USER_DS (0x30)
 
 // 进程初始化时的数据拷贝标志位
-#define CLONE_FS (1 << 0) // 在进程间共享打开的文件
-#define CLONE_SIGNAL (1 << 1)
-#define CLONE_VM (1 << 2) // 在进程间共享虚拟内存空间
+#define CLONE_FS (1UL << 0) // 在进程间共享打开的文件
+#define CLONE_SIGNAL (1UL << 1)
+#define CLONE_VM (1UL << 2) // 在进程间共享虚拟内存空间
 
 struct thread_struct
 {

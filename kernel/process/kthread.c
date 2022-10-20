@@ -3,6 +3,7 @@
 #include <common/spinlock.h>
 #include <sched/sched.h>
 #include <debug/bug.h>
+#include <time/sleep.h>
 
 static spinlock_t __kthread_create_lock;           // kthread创建过程的锁
 static struct List kthread_create_list;            // kthread创建任务的链表

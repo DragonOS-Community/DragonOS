@@ -77,7 +77,9 @@ struct hid_parser
     int usage_max;
 
     int cnt_objects; // report descriptor中的对象数目
+
     int cnt_report;   // report desc中的report数目
+
 };
 
 

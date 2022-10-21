@@ -1,6 +1,7 @@
 #include <common/idr.h>
 #include <mm/slab.h>
-
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 /**
  * @brief 更换两个idr_layer指针
  *
@@ -67,6 +68,12 @@ static void *__get_from_free_list(struct idr *idp)
 
     // free_list还有节点
     struct idr_layer *item = idp->free_list;
+
+    if (item == NULL)
+    {
+        BUG_ON(1);
+    }
+
     io_sfence();
     idp->free_list = idp->free_list->ary[0];
     io_sfence();
@@ -347,7 +354,8 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
  */
 static int __idr_get_new_above_int(struct idr *idp, void *ptr, int starting_id)
 {
-    struct idr_layer *stk[MAX_LEVEL + 1];
+    struct idr_layer *stk[MAX_LEVEL + 1]={0};
+    memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
     // 你可以选择 memset(stk, 0, sizeof(stk));
     int id = __idr_get_empty_slot(idp, stk);
 
@@ -382,7 +390,8 @@ int idr_alloc(struct idr *idp, void *ptr, int *id)
  *
  * @param idp
  * @param id
- * @return void* (如果删除成功，就返回被删除id所对应的ptr；否则返回NULL。注意：如果这个id本来就和NULL绑定，那么也会返回NULL)
+ * @return void*
+ * (如果删除成功，就返回被删除id所对应的ptr；否则返回NULL。注意：如果这个id本来就和NULL绑定，那么也会返回NULL)
  */
 void *idr_remove(struct idr *idp, int id)
 {
@@ -390,6 +399,7 @@ void *idr_remove(struct idr *idp, int id)
         return NULL;
 
     struct idr_layer *stk[MAX_LEVEL + 1];
+    memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
     if (0 == __idr_get_path(idp, id, stk))
         return NULL; // 找不到路径
 
@@ -415,6 +425,8 @@ static void __idr_remove_all_with_free(struct idr *idp, bool free)
 
     int sz = sizeof(struct idr_layer);
     struct idr_layer *stk[MAX_LEVEL + 1];
+    memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
+
     struct idr_layer *cur_layer = idp->top;
     int layer = cur_layer->layer;
     stk[layer + 1] = NULL; // 标记数组结尾
@@ -530,7 +542,8 @@ void *idr_find(struct idr *idp, int id)
  * @param idp
  * @param start_id
  * @param nextid
- * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
+ * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意，
+ * 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
  */
 void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
 {
@@ -545,9 +558,12 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
     *nextid = 0;
 
     struct idr_layer *stk[MAX_LEVEL + 1];
+
+    memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
     bool state[MAX_LEVEL + 1]; // 标记是否大于等于]
     int pos_i[MAX_LEVEL + 1];
 
+    memset(state, 0, sizeof(state));
     memset(pos_i, 0, sizeof(pos_i)); // 必须清空
 
     struct idr_layer *cur_layer = idp->top;
@@ -618,7 +634,8 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
  *
  * @param idp
  * @param start_id
- * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
+ * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意，
+ * 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
  */
 void *idr_find_next(struct idr *idp, int start_id)
 {
@@ -639,6 +656,11 @@ void *idr_find_next(struct idr *idp, int start_id)
  */
 int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
 {
+    if(unlikely(old_ptr == NULL))
+    {
+        BUG_ON(1);
+        return -EINVAL;
+    }
     *old_ptr = NULL;
 
     if (unlikely(idp->top == NULL || id < 0))
@@ -702,9 +724,62 @@ bool idr_empty(struct idr *idp)
 
     return false;
 }
-
 #pragma GCC push_options
 #pragma GCC optimize("O0")
+static struct idr_layer *__idr_cnt_x(struct idr_layer *cur_layer, int layer_id)
+{
+    return cur_layer->ary[layer_id];
+}
+
+static bool __idr_cnt_pd(struct idr_layer *cur_layer, int layer_id)
+{
+    // if(layer_id)
+    unsigned long flags = ((cur_layer->bitmap) >> layer_id);
+    if ((flags % 2) == 0)
+    {
+        barrier();
+        return false; // 没有这一个儿子
+    }
+    return true;
+}
+
+static bool __idr_cnt(int layer, int id, struct idr_layer *cur_layer)
+{
+    while (layer >= 0) // 提取路径
+    {
+        // if (id > 7400)
+        // {
+        //     kdebug("current id = %d, layer = %d", id, layer);
+        // }
+
+        barrier();
+
+        int layer_id = (id >> (layer * IDR_BITS)) & IDR_MASK;
+
+        barrier();
+
+        if (__idr_cnt_pd(cur_layer, layer_id) == false)
+            return false;
+
+        barrier();
+        //     sprintk(xs, "nil");
+        // }
+
+        // if (layer_id >= 64) {
+        //     kdebug("error id");
+        // }
+
+        barrier();
+        cur_layer = __idr_cnt_x(cur_layer, layer_id);
+
+        // assert(cur_layer != NULL);
+
+        barrier();
+        --layer;
+    }
+    return true;
+}
+#pragma GCC pop_options
 /**
  * @brief 这个函数是可以用于判断一个ID是否已经被分配的。
  *
@@ -715,44 +790,26 @@ bool idr_empty(struct idr *idp)
  */
 bool idr_count(struct idr *idp, int id)
 {
+    static char xs[10];
+    barrier();
     if (unlikely(idp == NULL || idp->top == NULL || id < 0))
         return false;
 
+    barrier();
     struct idr_layer *cur_layer = idp->top;
+    barrier();
     int layer = cur_layer->layer;
 
     // 如果查询的ID的bit数量比 layer*IDR_BITS 还大, 直接返回 NULL
     if (unlikely((id >> ((layer + 1ull) * IDR_BITS)) > 0))
         return false;
+    barrier();
 
-    // if (id > 7400)
-    // {
-    //     kdebug("current id = %d", id);
-    // }
-
-    while (layer >= 0) // 提取路径
-    {
-        // if (id > 7400)
-        // {
-        //     kdebug("current id = %d, layer = %d", id, layer);
-        // }
-
-        int layer_id = (id >> (layer * IDR_BITS)) & IDR_MASK;
-
-        if (((cur_layer->bitmap >> layer_id) & 1) == 0)
-            return false; // 没有这一个儿子
-
-        cur_layer = cur_layer->ary[layer_id];
-
-        // assert(cur_layer != NULL);
-
-        --layer;
-    }
-
-    return true;
+    return __idr_cnt(layer, id, cur_layer);
 }
-#pragma GCC pop_options
-/********* ****************************************** ida - idr 函数实现分割线 **********************************************************/
+
+/********* ****************************************** ida - idr 函数实现分割线
+ * **********************************************************/
 
 /**
  * @brief 初始化IDA, 你需要保证调用函数之前, ida的free_list为空, 否则会导致内存泄漏
@@ -863,8 +920,9 @@ int ida_alloc(struct ida *ida_p, int *p_id)
     *p_id = -1;
 
     struct idr_layer *stk[MAX_LEVEL + 1]; // 你可以选择memset(0)
-    io_sfence();
-    memset(stk, 0, sizeof(stk));
+
+    memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
+
     io_sfence();
     int idr_id = __idr_get_empty_slot(&ida_p->idr, stk);
 
@@ -935,12 +993,12 @@ void ida_remove(struct ida *ida_p, int id)
     int bmp_id = (id % IDA_BITMAP_BITS) % IDA_BMP_SIZE;
 
     struct idr_layer *stk[MAX_LEVEL + 1];
-    memset(stk, 0, sizeof(stk));
+    memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
 
     if (0 == __idr_get_path(&ida_p->idr, idr_id, stk))
         return;
 
-    struct ida_bitmap *b_p = (struct ida_bitmap *)stk[0]->ary[idr_id & IDR_MASK];
+    struct ida_bitmap *b_p = (struct ida_bitmap *)(stk[0]->ary[idr_id & IDR_MASK]);
 
     // 不存在这个ID 或者 b_p == NULL
     if (unlikely(NULL == b_p || 0 == ((b_p->bitmap[ary_id] >> bmp_id) & 1)))
@@ -987,3 +1045,5 @@ bool ida_empty(struct ida *ida_p)
 
     return false;
 }
+
+#pragma GCC pop_options

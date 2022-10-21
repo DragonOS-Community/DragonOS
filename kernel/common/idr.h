@@ -1,7 +1,15 @@
-
+#pragma GCC push_options
+#pragma GCC optimize("O1")
 
 #include <common/errno.h>
 #include <common/spinlock.h>
+
+#if ARCH(I386) || ARCH(X86_64)
+#include <arch/x86_64/math/bitcount.h>
+#else
+#error Arch not supported.
+#endif
+
 
 /**
  * idr: 基于radix-tree的ID-pointer的数据结构
@@ -40,10 +48,10 @@
 #define TREE_SIZE(layer) ((layer >= 0) ? (1ull << ((layer + 1) * IDR_BITS)) : 1)
 
 // 计算最后(最低位)一个1的位置 (注意使用64位的版本)
-#define __lowbit_id(x) ((x) ? (__builtin_ctzll(x)) : -1)
+#define __lowbit_id(x) ((x) ? (__ctzll(x)) : -1)
 
 // 计算最前(最高位)一个1的位置 (注意使用64位的版本)
-#define __mostbit_id(x) ((x) ? (__builtin_clzll(x)) : -1)
+#define __mostbit_id(x) ((x) ? (63 - __clzll(x)) : -1)
 
 // radix-tree 节点定义
 struct idr_layer
@@ -112,7 +120,7 @@ bool idr_count(struct idr *idp, int id);
  * @param id  遍历的id，你需要初始化这个id(请你设置为你要从哪一个id开始遍历，遍历过程将会包括这个id)
  * @param ptr 数据指针(entry)，你不需要初始化这个指针
  */
-#define for_each_idr_entry(idp, id, ptr) \
+#define for_each_idr_entry_continue(idp, id, ptr) \
     for (ptr = idr_find_next_getid(idp, id - 1, &id); ptr != NULL || !idr_count(idp, id); ptr = idr_find_next_getid(idp, id, &id))
 
 /**
@@ -164,3 +172,5 @@ int ida_alloc(struct ida *ida_p, int *p_id);
 bool ida_count(struct ida *ida_p, int id);
 void ida_remove(struct ida *ida_p, int id);
 void ida_destroy(struct ida *ida_p);
+
+#pragma GCC pop_options

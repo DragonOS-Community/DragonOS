@@ -1,5 +1,6 @@
 
-
+#pragma GCC push_options
+#pragma GCC optimize("O1")
 #include "ktest.h"
 #include "ktest_utils.h"
 #include <common/idr.h>
@@ -555,3 +556,5 @@ int ktest_test_idr(void* arg)
     kTEST("idr Test done.");
     return 0;
 }
+
+#pragma GCC pop_options

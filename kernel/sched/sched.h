@@ -13,48 +13,50 @@
 /* SCHED_ISO: reserved but not implemented yet */
 #define SCHED_IDLE 5
 #define SCHED_DEADLINE 6
+#define SCHED_MAX_POLICY_NUM SCHED_DEADLINE
+
+#define IS_VALID_SCHED_POLICY(_policy) ((_policy) > 0 && (_policy) <= SCHED_MAX_POLICY_NUM)
+
 struct sched_param
 {
-	int sched_priority;
+    int sched_priority;
 };
 struct sched_attr
 {
-	unsigned int size;
+    uint32_t size;
 
-	unsigned int sched_policy;
-	unsigned long sched_flags;
+    uint32_t sched_policy;
+    uint64_t sched_flags;
 
-	/* SCHED_NORMAL, SCHED_BATCH */
-	signed int sched_nice;
+    /* SCHED_NORMAL, SCHED_BATCH */
+    int32_t sched_nice;
 
-	/* SCHED_FIFO, SCHED_RR */
-	unsigned int sched_priority;
+    /* SCHED_FIFO, SCHED_RR */
+    uint32_t sched_priority;
 
-	/* SCHED_DEADLINE */
-	unsigned long sched_runtime;
-	unsigned long sched_deadline;
-	unsigned long sched_period;
+    /* SCHED_DEADLINE */
+    uint64_t sched_runtime;
+    uint64_t sched_deadline;
+    uint64_t sched_period;
 
-	/* Utilization hints */
-	unsigned int sched_util_min;
-	unsigned int sched_util_max;
+    /* Utilization hints */
+    uint32_t sched_util_min;
+    uint32_t sched_util_max;
 };
-static int __sched_setscheduler(struct process_control_block *p,
-                                const struct sched_attr *attr, bool user, bool pi);
-static int _sched_setscheduler(struct process_control_block *p, int policy,
-                               const struct sched_param *param, bool check);
+
+static int __sched_setscheduler(struct process_control_block *p, const struct sched_attr *attr, bool user, bool pi);
+static int _sched_setscheduler(struct process_control_block *p, int policy, const struct sched_param *param,
+                               bool check);
 /**
- * sched_setscheduler -设置进程的policy
- * @p: 需要修改的pcb
- * @policy: 需要设置的policy
- * @param: structure containing the new RT priority. 目前没有用
+ * sched_setscheduler -设置进程的调度策略
+ * @param p 需要修改的pcb
+ * @param policy 需要设置的policy
+ * @param param structure containing the new RT priority. 目前没有用
  *
- *
- * Return: 成功返回0,否则返回-22
+ * @return 成功返回0,否则返回对应的错误码
  *
  */
-int sched_setscheduler(struct process_control_block *p, int policy,
-                       const struct sched_param *param);
+int sched_setscheduler(struct process_control_block *p, int policy, const struct sched_param *param);
 /**
  * @brief 包裹sched_enqueue(),将PCB加入就绪队列
  *

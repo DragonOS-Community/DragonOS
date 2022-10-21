@@ -1,14 +1,24 @@
 #include "sched.h"
 #include <common/kprint.h>
-#include <driver/video/video.h>
 #include <common/spinlock.h>
+#include <driver/video/video.h>
 #include <sched/cfs.h>
-static int __sched_setscheduler(struct process_control_block *p,
-                                const struct sched_attr *attr, bool user, bool pi)
+
+/**
+ * @brief 
+ * 
+ * @param p pcb
+ * @param attr 调度属性
+ * @param user 请求是否来自用户态
+ * @param pi 
+ * @return int 
+ */
+static int __sched_setscheduler(struct process_control_block *p, const struct sched_attr *attr, bool user, bool pi)
 {
     int policy = attr->sched_policy;
-    // 设置不符合要求
-    if (policy < 0 || policy > 6)
+recheck:;
+    // 这里policy的设置小于0是因为，需要在临界区内更新值之后，重新到这里判断
+    if (!IS_VALID_SCHED_POLICY(policy))
     {
         return -EINVAL;
     }
@@ -16,26 +26,24 @@ static int __sched_setscheduler(struct process_control_block *p,
     p->policy = policy;
     return 0;
 }
-static int _sched_setscheduler(struct process_control_block *p, int policy,
-                               const struct sched_param *param, bool check)
+
+static int _sched_setscheduler(struct process_control_block *p, int policy, const struct sched_param *param, bool check)
 {
-    struct sched_attr attr = {
-        .sched_policy = policy};
+    struct sched_attr attr = {.sched_policy = policy};
 
     return __sched_setscheduler(p, &attr, check, true);
 }
+
 /**
- * sched_setscheduler -设置进程的policy
- * @p: 需要修改的pcb
- * @policy: 需要设置的policy
- * @param: structure containing the new RT priority. 目前没有用
+ * sched_setscheduler -设置进程的调度策略
+ * @param p 需要修改的pcb
+ * @param policy 需要设置的policy
+ * @param param structure containing the new RT priority. 目前没有用
  *
- *
- * Return: 成功返回0,否则返回-22
+ * @return 成功返回0,否则返回对应的错误码
  *
  */
-int sched_setscheduler(struct process_control_block *p, int policy,
-                       const struct sched_param *param)
+int sched_setscheduler(struct process_control_block *p, int policy, const struct sched_param *param)
 {
     return _sched_setscheduler(p, policy, param, true);
 }

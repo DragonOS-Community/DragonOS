@@ -104,7 +104,7 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
         video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
 
         // 创建video守护进程
-        video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, CLONE_FS | CLONE_SIGNAL);
+        video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, "Video refresh daemon");
         video_daemon_pcb->virtual_runtime = 0; // 特殊情况， 最高优先级， 以后再改
 
         // 启用屏幕刷新软中断

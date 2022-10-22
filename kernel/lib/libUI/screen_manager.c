@@ -108,7 +108,8 @@ static int __check_ui_param(const char *name, const uint8_t type, const struct s
         return -EINVAL;
     if (ops == NULL)
         return -EINVAL;
-    if (ops->install == NULL || ops->uninstall == NULL || ops->enable == NULL || ops->disable == NULL || ops->change == NULL)
+    if (ops->install == NULL || ops->uninstall == NULL || ops->enable == NULL || ops->disable == NULL ||
+        ops->change == NULL)
         return -EINVAL;
 
     return 0;
@@ -204,6 +205,7 @@ int scm_register(struct scm_ui_framework_t *ui)
  */
 int scm_unregister(struct scm_ui_framework_t *ui)
 {
+    return 0;
 }
 
 /**
@@ -214,6 +216,7 @@ int scm_unregister(struct scm_ui_framework_t *ui)
  */
 int scm_unregister_alloc(struct scm_ui_framework_t *ui)
 {
+    return 0;
 }
 
 /**
@@ -253,18 +256,15 @@ int scm_enable_double_buffer()
                 return -ENOMEM;
             uart_send_str(COM1, "##to change double buffer##\n");
 
-            if (ptr->ui_ops->change(buf) != 0)  // 这里的change回调函数不会是空指针吗 问题2
+            if (ptr->ui_ops->change(buf) != 0) // 这里的change回调函数不会是空指针吗 问题2
             {
 
                 __destroy_buffer(buf);
                 kfree(buf);
-
             }
-
         }
 
     } while (list_next(&ptr->list) != &scm_framework_list); // 枚举链表的每一个ui框架
-
 
     // 设置定时刷新的对象
     video_set_refresh_target(__current_framework->buf);

@@ -807,7 +807,7 @@ static int xhci_reset_port(const int id, const int port)
     io_mfence();
     // 重置当前端口
     if (XHCI_PORT_IS_USB3(id, port))
-        xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | (1 << 31));
+        xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | (1U << 31));
     else
         xhci_write_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9) | (1 << 4));
 
@@ -825,7 +825,7 @@ static int xhci_reset_port(const int id, const int port)
             // QEMU对usb的模拟有bug，因此需要检测这里
 #ifdef __QEMU_EMULATION__
 
-        if (XHCI_PORT_IS_USB3(id, port) && (val & (1 << 31)) == 0)
+        if (XHCI_PORT_IS_USB3(id, port) && (val & (1U << 31)) == 0)
             break;
         else if (XHCI_PORT_IS_USB2(id, port) && (val & (1 << 4)) == 0)
             break;

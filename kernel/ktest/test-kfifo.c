@@ -146,6 +146,7 @@ static long ktest_kfifo_case0_1(uint64_t arg0, uint64_t arg1)
         kfifo_free_alloc(&fifo);
         assert(fifo.buffer == NULL);
     }
+    return 0;
 }
 
 static ktest_case_table kt_kfifo_func_table[] = {

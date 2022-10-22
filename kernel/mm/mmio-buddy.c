@@ -39,7 +39,8 @@ static __always_inline void __buddy_add_region_obj(int index, struct __mmio_budd
 static __always_inline struct __mmio_buddy_addr_region *__mmio_buddy_create_region(uint64_t vaddr)
 {
     // 申请内存块的空间
-    struct __mmio_buddy_addr_region *region = (struct __mmio_buddy_addr_region *)kzalloc(sizeof(struct __mmio_buddy_addr_region), 0);
+    struct __mmio_buddy_addr_region *region =
+        (struct __mmio_buddy_addr_region *)kzalloc(sizeof(struct __mmio_buddy_addr_region), 0);
     list_init(&region->list);
     region->vaddr = vaddr;
     return region;
@@ -67,7 +68,8 @@ static __always_inline void __buddy_split(struct __mmio_buddy_addr_region *regio
  * @param exp x、y大小的幂
  * @return int 错误码
  */
-static __always_inline int __buddy_merge_blocks(struct __mmio_buddy_addr_region *x, struct __mmio_buddy_addr_region *y, int exp)
+static __always_inline int __buddy_merge_blocks(struct __mmio_buddy_addr_region *x, struct __mmio_buddy_addr_region *y,
+                                                int exp)
 {
     // 判断这两个是否是一对伙伴
     if (unlikely(x->vaddr != buddy_block_vaddr(y->vaddr, exp))) // 不是一对伙伴
@@ -94,7 +96,8 @@ static __always_inline struct __mmio_buddy_addr_region *__buddy_pop_region(int e
 {
     if (unlikely(list_empty(&__mmio_pool.free_regions[__exp2index(exp)].list_head)))
         return NULL;
-    struct __mmio_buddy_addr_region *r = container_of(list_next(&__mmio_pool.free_regions[__exp2index(exp)].list_head), struct __mmio_buddy_addr_region, list);
+    struct __mmio_buddy_addr_region *r = container_of(list_next(&__mmio_pool.free_regions[__exp2index(exp)].list_head),
+                                                      struct __mmio_buddy_addr_region, list);
     list_del(&r->list);
     // 区域计数减1
     --__mmio_pool.free_regions[__exp2index(exp)].num_free;
@@ -169,15 +172,20 @@ static void __buddy_merge(int exp)
  */
 struct __mmio_buddy_addr_region *mmio_buddy_query_addr_region(int exp)
 {
-    if (exp >= MMIO_BUDDY_MAX_EXP)
+    if (unlikely(exp > MMIO_BUDDY_MAX_EXP || exp < MMIO_BUDDY_MIN_EXP))
+    {
+        BUG_ON(1);
         return NULL;
+    }
+    
     if (!list_empty(&__mmio_pool.free_regions[__exp2index(exp)].list_head))
         goto has_block;
 
     // 若没有符合要求的内存块，则先尝试分裂大的块
-    for (int cur_exp = exp; exp <= MMIO_BUDDY_MAX_EXP; ++cur_exp)
+    for (int cur_exp = exp; cur_exp <= MMIO_BUDDY_MAX_EXP; ++cur_exp)
     {
-        if (unlikely(list_empty(&__mmio_pool.free_regions[__exp2index(cur_exp)].list_head))) // 一直寻找到有空闲空间的链表
+        if (unlikely(
+                list_empty(&__mmio_pool.free_regions[__exp2index(cur_exp)].list_head))) // 一直寻找到有空闲空间的链表
             continue;
 
         // 找到了,逐级向下split

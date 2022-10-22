@@ -5,6 +5,16 @@ ifeq ($(EMULATOR), )
 export EMULATOR=__NO_EMULATION__
 endif
 
+# 计算cpu核心数
+NPROCS:=1
+OS:=$(shell uname -s)
+
+ifeq ($(OS),Linux)
+  NPROCS:=$(shell grep -c ^processor /proc/cpuinfo)
+endif
+ifeq ($(OS),Darwin) # Assume Mac OS X
+  NPROCS:=$(shell system_profiler | awk '/Number Of CPUs/{print $4}{next;}')
+endif
 
 export ARCH=__x86_64__
 export ROOT_PATH=$(shell pwd)
@@ -58,6 +68,12 @@ clean:
 		cd $$subdir && $(MAKE) clean;\
 		cd .. ;\
 	done
+
+cppcheck-xml: 
+	cppcheck kernel user --platform=unix64 --std=c11 -I user/libs/ -I=kernel/ --force -j $(NPROCS) --xml 2> cppcheck.xml
+
+cppcheck:
+	cppcheck kernel user --platform=unix64 --std=c11 -I user/libs/ -I=kernel/ --force -j $(NPROCS)
 
 gdb:
 	gdb -n -x tools/.gdbinit

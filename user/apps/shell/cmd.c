@@ -291,6 +291,7 @@ int shell_cmd_pwd(int argc, char **argv)
         printf("%s\n", shell_current_path);
     if (argv != NULL)
         free(argv);
+    return 0;
 }
 
 /**
@@ -327,6 +328,7 @@ int shell_cmd_cat(int argc, char **argv)
     free(buf);
     if (argv != NULL)
         free(argv);
+    return 0;
 }
 
 /**
@@ -359,6 +361,7 @@ int shell_cmd_touch(int argc, char **argv)
     close(fd);
     if (argv != NULL)
         free(argv);
+    return 0;
 }
 
 /**
@@ -369,7 +372,7 @@ int shell_cmd_touch(int argc, char **argv)
  * @return int
  */
 // todo:
-int shell_cmd_rm(int argc, char **argv) {}
+int shell_cmd_rm(int argc, char **argv) {return 0;}
 
 /**
  * @brief 创建文件夹的命令

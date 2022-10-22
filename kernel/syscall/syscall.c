@@ -1,14 +1,13 @@
 #include "syscall.h"
-#include <process/process.h>
-#include <exception/gate.h>
-#include <exception/irq.h>
-#include <driver/disk/ahci/ahci.h>
-#include <mm/slab.h>
 #include <common/errno.h>
 #include <common/fcntl.h>
 #include <common/string.h>
-#include <filesystem/fat32/fat32.h>
+#include <driver/disk/ahci/ahci.h>
+#include <exception/gate.h>
+#include <exception/irq.h>
 #include <filesystem/VFS/VFS.h>
+#include <filesystem/fat32/fat32.h>
+#include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
 
@@ -36,7 +35,7 @@ ul system_call_not_exists(struct pt_regs *regs)
 {
     kerror("System call [ ID #%d ] not exists.", regs->rax);
     return ESYSCALL_NOT_EXISTS;
-}                    // 取消前述宏定义
+} // 取消前述宏定义
 
 /**
  * @brief 重新定义为：把系统调用函数加入系统调用表
@@ -85,19 +84,19 @@ void syscall_init()
 long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5, ul arg6, ul arg7)
 {
     long err_code;
-    __asm__ __volatile__(
-        "movq %2, %%r8 \n\t"
-        "movq %3, %%r9 \n\t"
-        "movq %4, %%r10 \n\t"
-        "movq %5, %%r11 \n\t"
-        "movq %6, %%r12 \n\t"
-        "movq %7, %%r13 \n\t"
-        "movq %8, %%r14 \n\t"
-        "movq %9, %%r15 \n\t"
-        "int $0x80   \n\t"
-        : "=a"(err_code)
-        : "a"(syscall_id), "m"(arg0), "m"(arg1), "m"(arg2), "m"(arg3), "m"(arg4), "m"(arg5), "m"(arg6), "m"(arg7)
-        : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+    __asm__ __volatile__("movq %2, %%r8 \n\t"
+                         "movq %3, %%r9 \n\t"
+                         "movq %4, %%r10 \n\t"
+                         "movq %5, %%r11 \n\t"
+                         "movq %6, %%r12 \n\t"
+                         "movq %7, %%r13 \n\t"
+                         "movq %8, %%r14 \n\t"
+                         "movq %9, %%r15 \n\t"
+                         "int $0x80   \n\t"
+                         : "=a"(err_code)
+                         : "a"(syscall_id), "m"(arg0), "m"(arg1), "m"(arg2), "m"(arg3), "m"(arg4), "m"(arg5), "m"(arg6),
+                           "m"(arg7)
+                         : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
 
     return err_code;
 }
@@ -121,8 +120,6 @@ ul sys_put_string(struct pt_regs *regs)
 
     return 0;
 }
-
-
 
 /**
  * @brief 关闭文件系统调用
@@ -170,9 +167,9 @@ uint64_t sys_read(struct pt_regs *regs)
     int64_t count = (int64_t)regs->r10;
 
     // 校验buf的空间范围
-    if(SYSCALL_FROM_USER(regs) && (!verify_area((uint64_t)buf, count)))    
-        return -EPERM;  
-    
+    if (SYSCALL_FROM_USER(regs) && (!verify_area((uint64_t)buf, count)))
+        return -EPERM;
+
     // kdebug("sys read: fd=%d", fd_num);
 
     // 校验文件描述符范围
@@ -187,7 +184,7 @@ uint64_t sys_read(struct pt_regs *regs)
         return -EINVAL;
 
     struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
-    uint64_t ret;
+    uint64_t ret = 0;
     if (file_ptr->file_ops && file_ptr->file_ops->read)
         ret = file_ptr->file_ops->read(file_ptr, (char *)buf, count, &(file_ptr->position));
 
@@ -210,8 +207,8 @@ uint64_t sys_write(struct pt_regs *regs)
     int64_t count = (int64_t)regs->r10;
 
     // 校验buf的空间范围
-    if(SYSCALL_FROM_USER(regs) && (!verify_area((uint64_t)buf, count)))    
-        return -EPERM;  
+    if (SYSCALL_FROM_USER(regs) && (!verify_area((uint64_t)buf, count)))
+        return -EPERM;
     kdebug("sys write: fd=%d", fd_num);
 
     // 校验文件描述符范围
@@ -226,7 +223,7 @@ uint64_t sys_write(struct pt_regs *regs)
         return -EINVAL;
 
     struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
-    uint64_t ret;
+    uint64_t ret = 0;
     if (file_ptr->file_ops && file_ptr->file_ops->write)
         ret = file_ptr->file_ops->write(file_ptr, (char *)buf, count, &(file_ptr->position));
 
@@ -287,7 +284,8 @@ uint64_t sys_brk(struct pt_regs *regs)
 {
     uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
 
-    // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
+    // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx
+    // current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
 
     if ((int64_t)regs->r8 == -1)
     {
@@ -586,30 +584,30 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
     regs->rax = ret; // 返回码
 }
 
-system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] =
-    {
-        [0] = system_call_not_exists,
-        [1] = sys_put_string,
-        [2] = sys_open,
-        [3] = sys_close,
-        [4] = sys_read,
-        [5] = sys_write,
-        [6] = sys_lseek,
-        [7] = sys_fork,
-        [8] = sys_vfork,
-        [9] = sys_brk,
-        [10] = sys_sbrk,
-        [11] = sys_reboot,
-        [12] = sys_chdir,
-        [13] = sys_getdents,
-        [14] = sys_execve,
-        [15] = sys_wait4,
-        [16] = sys_exit,
-        [17] = sys_mkdir,
-        [18] = sys_nanosleep,
-        [19] = sys_clock,
-        [20] = sys_pipe,
-        [21] = sys_mstat,
-        [22] = sys_rmdir,
-        [23 ... 254] = system_call_not_exists,
-        [255] = sys_ahci_end_req};
+system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
+    [0] = system_call_not_exists,
+    [1] = sys_put_string,
+    [2] = sys_open,
+    [3] = sys_close,
+    [4] = sys_read,
+    [5] = sys_write,
+    [6] = sys_lseek,
+    [7] = sys_fork,
+    [8] = sys_vfork,
+    [9] = sys_brk,
+    [10] = sys_sbrk,
+    [11] = sys_reboot,
+    [12] = sys_chdir,
+    [13] = sys_getdents,
+    [14] = sys_execve,
+    [15] = sys_wait4,
+    [16] = sys_exit,
+    [17] = sys_mkdir,
+    [18] = sys_nanosleep,
+    [19] = sys_clock,
+    [20] = sys_pipe,
+    [21] = sys_mstat,
+    [22] = sys_rmdir,
+    [23 ... 254] = system_call_not_exists,
+    [255] = sys_ahci_end_req,
+};

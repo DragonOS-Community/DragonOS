@@ -81,7 +81,6 @@ void sched_cfs()
             }
         }
 
-
         process_switch_mm(proc);
 
         switch_proc(current_pcb, proc);

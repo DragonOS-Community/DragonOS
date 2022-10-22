@@ -674,4 +674,5 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
  */
 static long ahci_ioctl(long cmd, long arg)
 {
+    return 0;
 }

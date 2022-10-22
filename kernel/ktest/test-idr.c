@@ -37,7 +37,7 @@ static long ktest_idr_case0(uint64_t arg0, uint64_t arg1)
     assert(idr_preload(&k_idr, 0) == 0);
     assert(k_idr.id_free_cnt == IDR_FREE_MAX);
 
-    for (int i = 1; i < 64; i++)
+    for (uint64_t i = 1; i < 64; i++)
     {
         int id = __lowbit_id(i), chk_id = -1;
         for (int j = 0; j < 64; j++)

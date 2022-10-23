@@ -117,7 +117,7 @@ void clear_command(int count, char *buf)
  * @brief 切换命令(写入到缓冲区)
  *
  * @param buf 缓冲区
- * @param type 如果为1,就向下,如果为-1,就向上
+ * @param type 如果为1,就向上,如果为-1,就向下
  */
 void change_command(char *buf, int type)
 {
@@ -126,7 +126,18 @@ void change_command(char *buf, int type)
     if (current_command_index < 0)
         current_command_index++;
     if (current_command_index >= count_history - 1)
-        current_command_index = count_history - 2;
+    {
+        //初始只含一条空历史记录，需单独考虑
+        if(count_history == 1)
+        {
+            //防止出现多条空历史记录
+            if(current_command_index > 1)
+                current_command_index = 1;
+        }
+        else
+            current_command_index = count_history - 2;
+    }
+        
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
     put_string(" ", COLOR_BLACK, COLOR_WHITE);

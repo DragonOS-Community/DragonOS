@@ -1383,7 +1383,7 @@ static inline int xhci_get_desc(const int id, const int port_id, void *target, c
     // 设备端口没有对应的描述符
     if (unlikely(dev_desc == NULL))
         return -EINVAL;
-    
+
     uint8_t req_type = USB_REQ_TYPE_GET_REQUEST;
     if (desc_type == USB_DT_HID_REPORT)
         req_type = USB_REQ_TYPE_GET_INTERFACE_REQUEST;
@@ -1863,9 +1863,20 @@ static int xhci_configure_port(const int id, const int port_id)
         }
 
         kdebug("to parse hid report");
-        // todo: parse hid report
-        hid_parse_report(hid_report_data, hid_desc->report_desc_len);
+        // todo:这里的parse有问题，详见hid_parse函数的注释
+        // hid_parse_report(hid_report_data, hid_desc->report_desc_len);
         kdebug("parse hid report done");
+
+        // kdebug("to find object from hid path");
+        // struct hid_data_t data = {0};
+        // data.type = HID_ITEM_INPUT;
+        // data.path.node[0].u_page = HID_USAGE_PAGE_GEN_DESKTOP;
+        // data.path.node[0].usage = 0xff;
+        // data.path.node[2].usage = USAGE_POINTER_Y;     // to get the Y Coordinate, comment X above and uncomment this
+        // line data.path.node[2].usage = USAGE_POINTER_WHEEL; // to get the Wheel Coordinate, comment X above and
+        // uncomment this line
+        // data.path.size = 1;
+        // hid_parse_find_object(hid_report_data, hid_desc->report_desc_len, &data);
         kfree(hid_report_data);
     }
     goto out;

@@ -259,7 +259,7 @@
 
 &emsp;&emsp; ida的主要作用是分配+管理id. 它能分配一个最小的, 未被分配出去的id. 当您需要管理某个数据结构时, 可能需要使用id来区分不同的目标. 这个时候, ida将会是很好的选择. 因为ida的十分高效, 运行常数相对数组更小, 而且提供了基本管理id需要用到的功能, 值得您试一试.
 
-&emsp;&emsp;IDA定义于`idr.h`文件中. 您通过`DECLARE_IDA(my_ida)`来创建一个ida对象, 或者`struct ida my_ida; ida_init(my_ida);`来初始化一个ida. 
+&emsp;&emsp;IDA定义于`idr.h`文件中. 您通过`DECLARE_IDA(my_ida)`来创建一个ida对象, 或者`struct ida my_ida; ida_init(&my_ida);`来初始化一个ida. 
 
 ### ida_init
 `void ida_init(struct ida *ida_p)`

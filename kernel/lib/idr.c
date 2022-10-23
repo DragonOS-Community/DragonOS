@@ -1,7 +1,5 @@
 #include <common/idr.h>
 #include <mm/slab.h>
-#pragma GCC push_options
-#pragma GCC optimize("O0")
 
 /**
  * @brief 更换两个idr_layer指针
@@ -222,7 +220,7 @@ static __always_inline void __idr_mark_full(struct idr *idp, int id, struct idr_
     }
 
     // 处理叶子节点的full/bitmap标记
-    int layer_id = __id & IDR_MASK;
+    int64_t layer_id = __id & IDR_MASK;
     if (mark == 2)
         stk[0]->full |= (1ull << layer_id);
     if (mark >= 1)
@@ -270,7 +268,7 @@ static __always_inline int __idr_get_path(struct idr *idp, int id, struct idr_la
     while (layer >= 0)
     {
         stk[layer] = cur_layer;
-        int layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
+        int64_t layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
 
         if (unlikely(((cur_layer->bitmap >> layer_id) & 1) == 0))
         {
@@ -303,7 +301,7 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
     }
 
     // 处理叶子节点的full/bitmap标记
-    int layer_id = __id & IDR_MASK;
+    int64_t layer_id = __id & IDR_MASK;
     if (mark == 0) // 叶子的某个插槽为空
     {
         stk[0]->ary[layer_id] = NULL;
@@ -523,18 +521,24 @@ void *idr_find(struct idr *idp, int id)
     int64_t __id = (int64_t)id;
     if (unlikely(idp->top == NULL || __id < 0))
     {
-        kwarn("idr-find: idp->top == NULL || id < 0.");
+        // kwarn("idr-find: idp->top == NULL || id < 0.");
         return NULL;
     }
 
     struct idr_layer *cur_layer = idp->top;
     int layer = cur_layer->layer; // 特判NULL
+    barrier();
     // 如果查询的ID的bit数量比layer*IDR_BITS还大, 直接返回NULL
     if ((__id >> ((layer + 1) * IDR_BITS)) > 0)
         return NULL;
-    while (layer >= 0 && cur_layer)
+    barrier();
+    barrier();
+    int64_t layer_id = 0;
+    while (layer >= 0 && cur_layer != NULL)
     {
-        int layer_id = (__id >> (IDR_BITS * layer)) & IDR_MASK;
+        barrier();
+        layer_id = (__id >> (IDR_BITS * layer)) & IDR_MASK;
+        barrier();
         cur_layer = cur_layer->ary[layer_id];
         --layer;
     }
@@ -606,10 +610,10 @@ void *idr_find_next_getid(struct idr *idp, int64_t start_id, int *nextid)
         unsigned long t_bitmap = (cur_layer->bitmap >> pos_i[layer]);
         if (t_bitmap) // 进一步递归到儿子下面去
         {
-            int layer_id = __lowbit_id(t_bitmap) + pos_i[layer];
+            int64_t layer_id = __lowbit_id(t_bitmap) + pos_i[layer];
 
             // 特别情况
-            if ((cur_state == false) && layer_id > pos_i[layer] > 0)
+            if ((cur_state == false) && (layer_id > pos_i[layer] > 0))
                 cur_state = true;
 
             pos_i[layer] = layer_id;
@@ -685,7 +689,7 @@ int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
 
     while (layer > 0)
     {
-        int layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
+        int64_t layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
 
         if (unlikely(NULL == cur_layer->ary[layer_id]))
             return -ENOMEM;
@@ -735,8 +739,6 @@ bool idr_empty(struct idr *idp)
 
     return false;
 }
-#pragma GCC push_options
-#pragma GCC optimize("O0")
 
 static bool __idr_cnt_pd(struct idr_layer *cur_layer, int layer_id)
 {
@@ -757,7 +759,7 @@ static bool __idr_cnt(int layer, int id, struct idr_layer *cur_layer)
     {
         barrier();
 
-        int layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
+        int64_t layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
 
         barrier();
 
@@ -774,7 +776,6 @@ static bool __idr_cnt(int layer, int id, struct idr_layer *cur_layer)
     }
     return true;
 }
-#pragma GCC pop_options
 
 /**
  * @brief 这个函数是可以用于判断一个ID是否已经被分配的。
@@ -934,7 +935,7 @@ int ida_alloc(struct ida *ida_p, int *p_id)
     if (unlikely(idr_id < 0))
         return idr_id;
 
-    int layer_id = idr_id & IDR_MASK;
+    int64_t layer_id = idr_id & IDR_MASK;
 
     if (NULL == stk[0]->ary[layer_id])
         stk[0]->ary[layer_id] = __get_ida_bitmap(ida_p, 0);
@@ -1051,5 +1052,3 @@ bool ida_empty(struct ida *ida_p)
 
     return false;
 }
-
-#pragma GCC pop_options

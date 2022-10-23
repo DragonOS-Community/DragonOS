@@ -53,3 +53,17 @@ static __always_inline int __clzll(unsigned long long x)
                  : "memory");
     return res;
 }
+
+static __always_inline int __ctz(uint32_t x)
+{
+    asm volatile("tzcnt %%eax, %%eax":"=a"(x):"a"(x):"memory");
+    return x;
+}
+
+static __always_inline int __ctzl(unsigned long x)
+{
+    asm volatile("tzcnt %%rax, %%rax":"=a"(x):"a"(x):"memory");
+    return x;
+}
+
+#define __ctzll __ctzl

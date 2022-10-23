@@ -68,7 +68,6 @@ static __always_inline ul ALIGN(const ul addr, const ul _align)
 }
 
 
-
 void *memset(void *dst, unsigned char C, ul size)
 {
 

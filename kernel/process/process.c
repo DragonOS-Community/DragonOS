@@ -42,18 +42,19 @@ extern void kernel_thread_func(void);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 extern struct mm_struct initial_mm;
-struct thread_struct initial_thread =
-    {
-        .rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
-        .rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
-        .fs = KERNEL_DS,
-        .gs = KERNEL_DS,
-        .cr2 = 0,
-        .trap_num = 0,
-        .err_code = 0};
+struct thread_struct initial_thread = {
+    .rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+    .rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+    .fs = KERNEL_DS,
+    .gs = KERNEL_DS,
+    .cr2 = 0,
+    .trap_num = 0,
+    .err_code = 0,
+};
 
 // 初始化 初始进程的union ，并将其链接到.data.init_proc段内
-union proc_union initial_proc_union __attribute__((__section__(".data.init_proc_union"))) = {INITIAL_PROC(initial_proc_union.pcb)};
+union proc_union initial_proc_union
+    __attribute__((__section__(".data.init_proc_union"))) = {INITIAL_PROC(initial_proc_union.pcb)};
 
 struct process_control_block *initial_proc[MAX_CPU_NUM] = {&initial_proc_union.pcb, 0};
 
@@ -110,7 +111,8 @@ uint64_t process_exit_mm(struct process_control_block *pcb);
  * @param pcb 新的进程的pcb
  * @return uint64_t
  */
-uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start, uint64_t stack_size, struct pt_regs *current_regs);
+uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
+                             uint64_t stack_size, struct pt_regs *current_regs);
 
 void process_exit_thread(struct process_control_block *pcb);
 
@@ -128,13 +130,13 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
 {
     initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
     // kdebug("next_rsp = %#018lx   ", next->thread->rsp);
-    //  set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2, initial_tss[0].ist1,
-    //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5, initial_tss[0].ist6, initial_tss[0].ist7);
+    //  set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2,
+    //  initial_tss[0].ist1,
+    //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
+    //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
-                         : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
-                         : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -233,8 +235,8 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     regs->rip = ehdr.e_entry;
     current_pcb->mm->code_addr_start = ehdr.e_entry;
 
-    // kdebug("ehdr.e_phoff=%#018lx\t ehdr.e_phentsize=%d, ehdr.e_phnum=%d", ehdr.e_phoff, ehdr.e_phentsize, ehdr.e_phnum);
-    // 将指针移动到program header处
+    // kdebug("ehdr.e_phoff=%#018lx\t ehdr.e_phentsize=%d, ehdr.e_phnum=%d", ehdr.e_phoff, ehdr.e_phentsize,
+    // ehdr.e_phnum); 将指针移动到program header处
     pos = ehdr.e_phoff;
     // 读取所有的phdr
     pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
@@ -250,7 +252,8 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     // 将程序加载到内存中
     for (int i = 0; i < ehdr.e_phnum; ++i, ++phdr)
     {
-        // kdebug("phdr[%d] phdr->p_offset=%#018lx phdr->p_vaddr=%#018lx phdr->p_memsz=%ld phdr->p_filesz=%ld  phdr->p_type=%d", i, phdr->p_offset, phdr->p_vaddr, phdr->p_memsz, phdr->p_filesz, phdr->p_type);
+        // kdebug("phdr[%d] phdr->p_offset=%#018lx phdr->p_vaddr=%#018lx phdr->p_memsz=%ld phdr->p_filesz=%ld
+        // phdr->p_type=%d", i, phdr->p_offset, phdr->p_vaddr, phdr->p_memsz, phdr->p_filesz, phdr->p_type);
 
         // 不是可加载的段
         if (phdr->p_type != PT_LOAD)
@@ -279,7 +282,8 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
             {
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
                 struct vm_area_struct *vma = NULL;
-                int ret = mm_create_vma(current_pcb->mm, virt_base, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+                int ret =
+                    mm_create_vma(current_pcb->mm, virt_base, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
 
                 // 防止内存泄露
                 if (ret == -EEXIST)
@@ -301,7 +305,8 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                     uint64_t paddr = virt_2_phys((uint64_t)kmalloc(PAGE_4K_SIZE, 0));
 
                     struct vm_area_struct *vma = NULL;
-                    int val = mm_create_vma(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+                    int val = mm_create_vma(current_pcb->mm, virt_base + off, PAGE_4K_SIZE, VM_USER | VM_ACCESS_FLAGS,
+                                            NULL, &vma);
                     // kdebug("virt_base=%#018lx", virt_base + off);
                     if (val == -EEXIST)
                         kfree(phys_2_virt(paddr));
@@ -337,7 +342,8 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     {
         struct vm_area_struct *vma = NULL;
         uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-        int val = mm_create_vma(current_pcb->mm, current_pcb->mm->stack_start - PAGE_2M_SIZE, PAGE_2M_SIZE, VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
+        int val = mm_create_vma(current_pcb->mm, current_pcb->mm->stack_start - PAGE_2M_SIZE, PAGE_2M_SIZE,
+                                VM_USER | VM_ACCESS_FLAGS, NULL, &vma);
         if (val == -EEXIST)
             free_pages(Phy_to_2M_Page(pa), 1);
         else
@@ -495,9 +501,7 @@ ul initial_kernel_thread(ul arg)
 
     // 对一些组件进行单元测试
     uint64_t tpid[] = {
-        ktest_start(ktest_test_bitree, 0),
-        ktest_start(ktest_test_kfifo, 0),
-        ktest_start(ktest_test_mutex, 0),
+        ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
         ktest_start(ktest_test_idr, 0),
         // usb_pid,
     };
@@ -525,14 +529,15 @@ ul initial_kernel_thread(ul arg)
     regs = (struct pt_regs *)current_pcb->thread->rsp;
     // kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
     current_pcb->flags = 0;
-    // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数  这里的设计思路和switch_proc类似
-    // 加载用户态程序：shell.elf
+    // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数
+    // 这里的设计思路和switch_proc类似 加载用户态程序：shell.elf
     char init_path[] = "/shell.elf";
     uint64_t addr = (uint64_t)&init_path;
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
                          "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
-                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/shell.elf"), "c"(NULL), "d"(NULL)
+                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/shell.elf"), "c"(NULL),
+                         "d"(NULL)
                          : "memory");
 
     return 1;
@@ -662,7 +667,8 @@ void process_init()
  * @param stack_size 堆栈大小
  * @return unsigned long
  */
-unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size)
+unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start,
+                      unsigned long stack_size)
 {
     int retval = 0;
     struct process_control_block *tsk = NULL;
@@ -922,7 +928,8 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
     memset(phys_2_virt(new_mms->pgd), 0, PAGE_4K_SIZE / 2);
 
     // 拷贝内核空间的页表指针
-    memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]->mm->pgd) + 256, PAGE_4K_SIZE / 2);
+    memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]->mm->pgd) + 256,
+           PAGE_4K_SIZE / 2);
 
     uint64_t *current_pgd = (uint64_t *)phys_2_virt(current_pcb->mm->pgd);
 
@@ -948,14 +955,16 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
                 uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
 
                 struct vm_area_struct *new_vma = NULL;
-                int ret = mm_create_vma(new_mms, vma->vm_start + i * PAGE_2M_SIZE, PAGE_2M_SIZE, vma->vm_flags, vma->vm_ops, &new_vma);
+                int ret = mm_create_vma(new_mms, vma->vm_start + i * PAGE_2M_SIZE, PAGE_2M_SIZE, vma->vm_flags,
+                                        vma->vm_ops, &new_vma);
                 // 防止内存泄露
                 if (unlikely(ret == -EEXIST))
                     free_pages(Phy_to_2M_Page(pa), 1);
                 else
                     mm_map_vma(new_vma, pa, 0, PAGE_2M_SIZE);
 
-                memcpy((void *)phys_2_virt(pa), (void *)(vma->vm_start + i * PAGE_2M_SIZE), (vma_size >= PAGE_2M_SIZE) ? PAGE_2M_SIZE : vma_size);
+                memcpy((void *)phys_2_virt(pa), (void *)(vma->vm_start + i * PAGE_2M_SIZE),
+                       (vma_size >= PAGE_2M_SIZE) ? PAGE_2M_SIZE : vma_size);
                 vma_size -= PAGE_2M_SIZE;
             }
         }
@@ -1091,7 +1100,8 @@ static int process_rewrite_rbp(struct pt_regs *new_regs, struct process_control_
  * @param pcb 新的进程的pcb
  * @return uint64_t
  */
-uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start, uint64_t stack_size, struct pt_regs *current_regs)
+uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
+                             uint64_t stack_size, struct pt_regs *current_regs)
 {
     // 将线程结构体放置在pcb后方
     struct thread_struct *thd = (struct thread_struct *)(pcb + 1);
@@ -1122,7 +1132,8 @@ uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block 
     // 设置子进程的返回值为0
     child_regs->rax = 0;
     if (pcb->flags & PF_KFORK)
-        thd->rbp = (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_system_call时的rbp）
+        thd->rbp =
+            (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_system_call时的rbp）
     else
         thd->rbp = (uint64_t)pcb + STACK_SIZE;
 

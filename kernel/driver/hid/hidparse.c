@@ -44,21 +44,13 @@ static __always_inline const struct hid_usage_types_string *hid_get_usage_type(
 #define HID_ITEM_REP_ID 0x84
 #define HID_ITEM_REP_COUNT 0x94
 
-// 这部分请参考hid_1_11.pdf Section 6.2.2.4
-
-#define HID_ITEM_COLLECTION 0xA0
-#define HID_ITEM_END_COLLECTION 0xC0
-#define HID_ITEM_FEATURE 0xB0
-#define HID_ITEM_INPUT 0x80
-#define HID_ITEM_OUTPUT 0x90
-
 static char __spaces_buf[33];
 char *__spaces(uint8_t cnt)
 {
     static char __space_overflow_str[] = "**";
     if (cnt > 32)
     {
-        return &__space_overflow_str;
+        return __space_overflow_str;
     }
 
     memset(__spaces_buf, ' ', 32);
@@ -111,7 +103,8 @@ static __always_inline void __pop_usage_stack(struct hid_parser *parser)
 
 /**
  * @brief 解析hid report，并获取下一个数据到data字段中
- *
+ * todo:(不知道为什么，在qemu上面，发现键盘的usage都是0xff)
+ * 
  * @param parser 解析器
  * @param data 返回的数据
  * @return true 解析成功
@@ -345,7 +338,7 @@ static bool hid_parse(struct hid_parser *parser, struct hid_data_t *data)
             break;
         default:
             printk("\n Found unknown item %#02X\n", parser->item & HID_ITEM_MASK);
-            return false;
+            return found;
         }
     }
     return found;
@@ -509,7 +502,7 @@ static int *__get_report_offset(struct hid_parser *parser, const uint8_t report_
     while ((pos < HID_MAX_REPORT) && (parser->offset_table[pos][0] != 0)) // 当offset的id不为0时
     {
         if ((parser->offset_table[pos][0] == report_id) && (parser->offset_table[pos][1] == report_type))
-            return &parser->offset_table[2];
+            return &parser->offset_table[pos][2];
         ++pos;
     }
     // 在offset table中占用一个新的表项来存储这个report的offset
@@ -523,4 +516,68 @@ static int *__get_report_offset(struct hid_parser *parser, const uint8_t report_
     }
     // 当offset table满了，且未找到结果的时候，返回NULL
     return NULL;
+}
+
+static __always_inline bool __find_object(struct hid_parser *parser, struct hid_data_t *data)
+{
+    kdebug("target_type=%d report_id=%d, offset=%d, size=%d", data->type, data->report_id, data->offset, data->size);
+    struct hid_data_t found_data = {0};
+
+    while (hid_parse(parser, &found_data))
+    {
+        kdebug("size=%d, type=%d, report_id=%d, u_page=%d, usage=%d", found_data.size, found_data.type,
+               found_data.report_id, found_data.path.node[0].u_page, found_data.path.node[0].usage);
+        // 按照路径完整匹配data
+        if ((data->path.size > 0) && (found_data.type == data->type) &&
+            (memcmp(found_data.path.node, data->path.node, data->path.size * sizeof(struct hid_node_t)) == 0))
+        {
+            goto found;
+        }
+        // 通过report id以及offset匹配成功
+        else if ((found_data.report_id == data->report_id) && (found_data.type == data->type) &&
+                 (found_data.offset == data->offset))
+        {
+            goto found;
+        }
+    }
+    return false;
+
+found:;
+    memcpy(data, &found_data, sizeof(struct hid_data_t));
+    data->report_count = parser->report_count;
+    return true;
+}
+/**
+ * @brief 在hid report中寻找参数data给定的节点数据，并将结果写入到data中
+ *
+ * @param hid_report hid report 数据
+ * @param report_size report_data的大小（字节）
+ * @param data 要寻找的节点数据。
+ * @return true 找到指定的节点
+ * @return false 未找到指定的节点
+ */
+bool hid_parse_find_object(const void *hid_report, const int report_size, struct hid_data_t *data)
+{
+    struct hid_parser parser = {0};
+    hid_reset_parser(&parser);
+    parser.report_desc = hid_report;
+    parser.report_desc_size = report_size;
+    // HID_PARSE_OUTPUT = false;
+
+    printk("\nFinding Coordinate value:");
+    if (__find_object(&parser, data))
+    {
+        printk("    size: %i (in bits)\n"
+               "  offset: %i (in bits)\n"
+               "     min: %i\n"
+               "     max: %i\n"
+               "  attrib: 0x%02X (input, output, or feature, etc.)\n",
+               data->size, data->offset, data->logical_min, data->logical_max, data->attribute);
+        return true;
+    }
+    else
+    {
+        printk("  Did not find Coordinate value.\n");
+        return false;
+    }
 }

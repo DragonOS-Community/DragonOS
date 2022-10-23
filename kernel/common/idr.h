@@ -41,7 +41,7 @@
 #define MAX_ID_MASK (MAX_ID_BIT - 1)
 
 // IDR可能最大的层次 以及 IDR预分配空间的最大限制
-#define MAX_LEVEL (MAX_ID_SHIFT + IDR_BITS - 1) / IDR_BITS
+#define MAX_LEVEL ((MAX_ID_SHIFT + IDR_BITS - 1) / IDR_BITS)
 #define IDR_FREE_MAX (MAX_LEVEL << 1)
 
 // 给定layer, 计算完全64叉树的大小
@@ -73,10 +73,7 @@ struct idr
 
 #define DECLARE_IDR(name)    \
     struct idr name = {0};   \
-    name.top = (NULL);       \
-    name.free_list = (NULL); \
-    name.id_free_cnt = (0);  \
-    spin_init(&name.lock);
+    idr_init(&(name));
 
 #define DECLARE_IDR_LAYER(name)  \
     struct idr_layer name = {0}; \
@@ -92,7 +89,7 @@ void idr_remove_all(struct idr *idp);
 void idr_destroy(struct idr *idp);
 void *idr_find(struct idr *idp, int id);
 void *idr_find_next(struct idr *idp, int start_id);
-void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid);
+void *idr_find_next_getid(struct idr *idp, int64_t start_id, int *nextid);
 int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **oldptr);
 int idr_replace(struct idr *idp, void *ptr, int id);
 void idr_init(struct idr *idp);

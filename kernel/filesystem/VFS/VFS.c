@@ -2,6 +2,7 @@
 #include "internal.h"
 #include "mount.h"
 #include <common/dirent.h>
+#include <common/err.h>
 #include <common/errno.h>
 #include <common/kprint.h>
 #include <common/string.h>
@@ -306,11 +307,8 @@ int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland)
         subdir_dentry->name_length = pathlen - last_slash - 1;
 
     for (int i = last_slash + 1, cnt = 0; i < pathlen && cnt < subdir_dentry->name_length; ++i, ++cnt)
-    {
         subdir_dentry->name[cnt] = path[i];
-    }
-    // kdebug("last_slash=%d", last_slash);
-    // kdebug("name=%s", path + last_slash + 1);
+    // 设置subdir的dentry的父路径
     subdir_dentry->parent = parent_dir;
 
     // kdebug("to mkdir, parent name=%s", parent_dir->name);
@@ -511,20 +509,7 @@ uint64_t do_open(const char *filename, int flags)
     else
         file_ptr->position = 0;
 
-    struct vfs_file_t **f = current_pcb->fds;
-
-    int fd_num = -1;
-
-    // 在指针数组中寻找空位
-    // todo: 当pcb中的指针数组改为动态指针数组之后，需要更改这里（目前还是静态指针数组）
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-    {
-        if (f[i] == NULL) // 找到指针数组中的空位
-        {
-            fd_num = i;
-            break;
-        }
-    }
+    int fd_num = process_fd_alloc(file_ptr);
 
     // 指针数组没有空位了
     if (fd_num == -1)
@@ -533,8 +518,6 @@ uint64_t do_open(const char *filename, int flags)
         spin_unlock(&dentry->lockref.lock);
         return -ENFILE;
     }
-    // 保存文件描述符
-    f[fd_num] = file_ptr;
     spin_unlock(&dentry->lockref.lock);
     return fd_num;
 }
@@ -613,6 +596,7 @@ int vfs_may_delete(struct vfs_dir_entry_t *dentry, bool isdir)
 int64_t vfs_rmdir(const char *path, bool from_userland)
 {
     uint32_t pathlen;
+    int retval = 0;
     if (from_userland)
         pathlen = strnlen_user(path, PAGE_4K_SIZE - 1);
     else
@@ -650,47 +634,203 @@ int64_t vfs_rmdir(const char *path, bool from_userland)
 
     struct vfs_dir_entry_t *dentry = vfs_path_walk(buf, 0);
 
-    if (dentry == NULL)
-        return -ENOENT;
+    kfree(buf);
 
-    int retval = vfs_may_delete(dentry, true);
-    if (retval != 0)
-        return retval;
-    // todo: 对dentry和inode加锁
+    if (dentry == NULL)
+    {
+        retval = -ENOENT;
+        kdebug("noent");
+        goto out0;
+    }
+
+    // todo: 检查文件夹是否为空
+
     spin_lock(&dentry->lockref.lock);
+    retval = vfs_may_delete(dentry, true);
+    if (retval != 0)
+        goto out1;
+    // todo: 对dentry和inode加锁
     retval = -EBUSY;
     if (is_local_mountpoint(dentry))
-        goto out;
+        goto out1;
     // todo:
     retval = dentry->dir_inode->inode_ops->rmdir(dentry->dir_inode, dentry);
     if (retval != 0)
-        goto out;
+    {
+        BUG_ON(1);
+        goto out1;
+    }
 
     dentry->dir_inode->attribute |= VFS_IF_DEAD; // 将当前inode标记为dead
     dont_mount(dentry);                          // 将当前dentry标记为不可被挂载
     detach_mounts(dentry);                       // 清理同样挂载在该路径的所有挂载点的挂载树
 
-    if (vfs_dentry_put(dentry) != 0)
-        goto out; // 释放dentry
-    return retval;
-out:;
+    // 释放dentry
+    retval = vfs_dentry_put(dentry);
+
+    if (retval != 0)
+        goto out1;
+    goto out0;
+out2:;
+    spin_unlock(&dentry->dir_inode->lockref.lock);
+out1:;
     spin_unlock(&dentry->lockref.lock);
-    // todo: 对dentry和inode放锁
+out0:;
     return retval;
 }
 
 /**
- * @brief 删除文件夹的系统调用函数
+ * @brief unlink a filesystem object
  *
- * @param r8 文件夹路径
+ * 调用者必须持有parent_inode->lockref.lock
+ *
+ * @param mnt_userns 暂时未使用 用户命名空间. 请置为NULL
+ * @param parent_inode 父目录项的inode
+ * @param dentry 要被删除的目录项
+ * @param delegated_inode 暂未使用，请置为NULL
+ * @return int
+ */
+int vfs_unlink(struct user_namespace *mnt_userns, struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dentry,
+               struct vfs_index_node_t **delegated_inode)
+{
+    // 暂时不支持用户命名空间，因此发出警告
+    if (unlikely(mnt_userns != NULL))
+    {
+        WARN_ON(1);
+        return -EINVAL;
+    }
+
+    int retval = 0;
+    struct vfs_index_node_t *target = dentry->dir_inode;
+
+    retval = vfs_may_delete(dentry, false);
+    if (unlikely(retval != 0))
+        return retval;
+
+    // 没有unlink方法，则不允许删除
+    if (!parent_inode->inode_ops->unlink)
+        return -EPERM;
+
+    // 对inode加锁
+    spin_lock(&target->lockref.lock);
+
+    if (is_local_mountpoint(dentry))
+        retval = -EBUSY;
+    else
+    {
+        retval = parent_inode->inode_ops->unlink(parent_inode, dentry);
+        if (retval == 0)
+        {
+            dont_mount(dentry);
+            detach_mounts(dentry);
+        }
+    }
+
+    spin_unlock(&target->lockref.lock);
+
+out:;
+    return retval;
+}
+/**
+ * @brief 取消dentry和inode之间的链接
+ *
+ * @param dfd 进程相对路径基准目录的文件描述符(fcntl.h)
+ * @param pathname 路径
+ * @param from_userland 请求是否来自用户态
+ * @return int 错误码
+ */
+int do_unlink_at(int dfd, const char *pathname, bool from_userland)
+{
+    // 暂时不支持相对路径，只支持绝对路径
+    if (dfd & AT_FDCWD)
+    {
+        kwarn("Not support: AT_FDCWD");
+        return -EINVAL;
+    }
+
+    uint32_t pathlen;
+    int retval = 0;
+    if (from_userland)
+        pathlen = strnlen_user(pathname, PAGE_4K_SIZE - 1);
+    else
+        pathlen = strnlen(pathname, PAGE_4K_SIZE - 1);
+
+    if (pathlen == 0)
+        return -ENOENT;
+
+    int last_slash = -1;
+
+    // 去除末尾的'/'
+    for (int i = pathlen - 1; i >= 0; --i)
+    {
+        if (pathname[i] != '/')
+        {
+            last_slash = i + 1;
+            break;
+        }
+    }
+
+    // 路径格式不合法
+    if (last_slash < 0)
+        return -ENOTDIR;
+    else if (pathname[0] != '/')
+        return -EINVAL;
+
+    char *buf = (char *)kzalloc(last_slash + 2, 0);
+
+    // 拷贝字符串（不包含要被创建的部分）
+    if (from_userland)
+        strncpy_from_user(buf, pathname, last_slash);
+    else
+        strncpy(buf, pathname, last_slash);
+    buf[last_slash + 1] = '\0';
+
+    struct vfs_dir_entry_t *dentry = vfs_path_walk(buf, 0);
+    kfree(buf);
+
+    if (dentry == NULL || dentry->parent == NULL)
+    {
+        retval = -ENOENT;
+        goto out;
+    }
+
+    struct vfs_index_node_t *p_inode = dentry->parent->dir_inode;
+    // 对父inode加锁
+    spin_lock(&p_inode);
+    retval = vfs_unlink(NULL, dentry->parent->dir_inode, dentry, NULL);
+
+    spin_lock(&dentry->lockref.lock);
+    retval = vfs_dentry_put(dentry);
+    spin_unlock(&p_inode);
+
+    if (IS_ERR(retval))
+        kwarn("In do_unlink_at: dentry put failed; retval=%d", retval);
+    else
+        retval = 0;
+out:;
+    return retval;
+}
+
+/**
+ * @brief 删除文件夹、取消文件的链接、删除文件的系统调用
+ *
+ * @param regs->r8 dfd 进程相对路径基准目录的文件描述符(见fcntl.h)
+ * @param regs->r9 路径名称字符串
+ * @param regs->r10 flag 预留的标志位，暂时未使用，请置为0。
  * @return uint64_t 错误码
  */
-uint64_t sys_rmdir(struct pt_regs *regs)
+uint64_t sys_unlink_at(struct pt_regs *regs)
 {
-    if (SYSCALL_FROM_USER(regs))
-        return vfs_rmdir((char *)regs->r8, true);
-    else
-        return vfs_rmdir((char *)regs->r8, false);
+    int dfd = regs->r8;
+    const char *pathname = regs->r9;
+    int flag = regs->r10;
+    bool from_user = SYSCALL_FROM_USER(regs) ? true : false;
+    if ((flag & (~AT_REMOVEDIR)) != 0)
+        return -EINVAL;
+    if (flag & AT_REMOVEDIR)
+        return vfs_rmdir(pathname, from_user);
+
+    return do_unlink_at(dfd, pathname, from_user);
 }
 
 /**

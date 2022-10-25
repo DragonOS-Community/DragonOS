@@ -15,6 +15,7 @@
 #include <common/fcntl.h>
 #include <common/glib.h>
 #include <common/lockref.h>
+#include <common/user_namespace.h>
 #include <mm/slab.h>
 
 extern struct vfs_superblock_t *vfs_root_sb;
@@ -156,6 +157,14 @@ struct vfs_inode_operations_t
                    struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry);
     long (*getAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
     long (*setAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
+    
+    /**
+     * @brief 取消inode和dentry之间的链接关系（删除文件）
+     * 
+     * @param inode 要被取消关联关系的目录项的【父目录项】
+     * @param dentry 要被取消关联关系的子目录项
+     */
+    long (*unlink)(struct vfs_index_node_t * inode, struct vfs_dir_entry_t * dentry);
 };
 
 struct vfs_dir_entry_operations_t
@@ -277,3 +286,8 @@ int64_t vfs_rmdir(const char *path, bool from_userland);
  *          注意，当dentry指向文件时，如果返回值为正数，则表示在释放了该dentry后，该dentry指向的inode的引用计数。
  */
 int vfs_dentry_put(struct vfs_dir_entry_t *dentry);
+
+int vfs_unlink(struct user_namespace *mnt_userns, struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dentry,
+               struct vfs_index_node_t **delegated_inode);
+
+int do_unlink_at(int dfd, const char *pathname, bool name);

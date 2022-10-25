@@ -18,7 +18,7 @@ extern void syscall_int(void);
 extern uint64_t sys_clock(struct pt_regs *regs);
 extern uint64_t sys_mstat(struct pt_regs *regs);
 extern uint64_t sys_open(struct pt_regs *regs);
-extern uint64_t sys_rmdir(struct pt_regs *regs);
+extern uint64_t sys_unlink_at(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -607,7 +607,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [19] = sys_clock,
     [20] = sys_pipe,
     [21] = sys_mstat,
-    [22] = sys_rmdir,
+    [22] = sys_unlink_at,
     [23 ... 254] = system_call_not_exists,
     [255] = sys_ahci_end_req,
 };

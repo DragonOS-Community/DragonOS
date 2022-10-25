@@ -969,8 +969,6 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     // todo: 填写完全fat32_inode_info的信息
 
     // 初始化dentry信息
-    list_init(&dEntry->child_node_list);
-    list_init(&dEntry->subdirs_list);
     dEntry->dir_ops = &fat32_dEntry_ops;
     dEntry->dir_inode = inode;
 

@@ -62,6 +62,8 @@ int sched_setscheduler(struct process_control_block *p, int policy, const struct
  *
  * @param pcb
  */
+
+int sched_gerscheduler(struct process_control_block *p, int policy, const struct sched_param *param);
 void sched_enqueue(struct process_control_block *pcb);
 /**
  * @brief 包裹sched_cfs()，调度函数

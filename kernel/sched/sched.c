@@ -5,13 +5,13 @@
 #include <sched/cfs.h>
 
 /**
- * @brief 
- * 
+ * @brief
+ *
  * @param p pcb
  * @param attr 调度属性
  * @param user 请求是否来自用户态
- * @param pi 
- * @return int 
+ * @param pi
+ * @return int
  */
 static int __sched_setscheduler(struct process_control_block *p, const struct sched_attr *attr, bool user, bool pi)
 {
@@ -48,6 +48,10 @@ int sched_setscheduler(struct process_control_block *p, int policy, const struct
     return _sched_setscheduler(p, policy, param, true);
 }
 
+int sched_gerscheduler(struct process_control_block *p, int policy, const struct sched_param *param)
+{
+    return 0;
+}
 /**
  * @brief 包裹shced_cfs_enqueue(),将PCB加入就绪队列
  *

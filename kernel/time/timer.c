@@ -1,11 +1,13 @@
 #include "timer.h"
 #include <common/kprint.h>
+#include <driver/timers/HPET/HPET.h>
 #include <exception/softirq.h>
 #include <mm/slab.h>
-#include <driver/timers/HPET/HPET.h>
 #include <process/process.h>
+#include <sched/sched.h>
 
 struct timer_func_list_t timer_func_head;
+static spinlock_t sched_lock;
 
 // 定时器循环阈值，每次最大执行10个定时器任务
 #define TIMER_RUN_CYCLE_THRESHOLD 10
@@ -17,6 +19,8 @@ void test_timer()
 
 void timer_init()
 {
+    spin_init(&sched_lock);
+
     timer_jiffies = 0;
     timer_func_init(&timer_func_head, NULL, NULL, -1UL);
     register_softirq(TIMER_SIRQ, &do_timer_softirq, NULL);
@@ -28,19 +32,31 @@ void timer_init()
     kdebug("timer func initialized.");
 }
 
+/**
+ * @brief 处理时间软中断
+ *
+ * @param data
+ */
 void do_timer_softirq(void *data)
 {
-    // todo: 修改这里以及softirq的部分，使得timer具有并行性
+    // todo: 修改这里以及 softirq 的部分，使得 timer 具有并行性
     struct timer_func_list_t *tmp = container_of(list_next(&timer_func_head.list), struct timer_func_list_t, list);
     int cycle_count = 0;
     while ((!list_empty(&timer_func_head.list)) && (tmp->expire_jiffies <= timer_jiffies))
     {
+        spin_lock(&sched_lock);
 
         timer_func_del(tmp);
         tmp->func(tmp->data);
         kfree(tmp);
 
+        spin_unlock(&sched_lock);
+
         ++cycle_count;
+
+
+        kdebug("SOLVE SOFT IRQ %d", cycle_count);
+
         // 当前定时器达到阈值
         if (cycle_count == TIMER_RUN_CYCLE_THRESHOLD)
             break;
@@ -115,4 +131,47 @@ uint64_t sys_clock(struct pt_regs *regs)
 uint64_t clock()
 {
     return timer_jiffies;
+}
+
+/**
+ * @brief 辅助函数：传进schedule_timeout函数中, 然后时间一到就唤醒 pcb 指向的进程(即自身)
+ *
+ * @param pcb process_control_block
+ */
+static void __wake_up_helper(struct process_control_block *pcb)
+{
+    BUG_ON(pcb == NULL);
+
+    BUG_ON(process_wakeup(pcb) != 0); // 正常唤醒,返回值为0
+}
+
+/**
+ * @brief 睡眠timeout的时间之后唤醒进程/线程
+ *
+ * @param timeout
+ * @return long
+ */
+long schedule_timeout_ms(long timeout)
+{
+    if (timeout == MAX_TIMEOUT) // 无期停止, 意味着不会调用func
+    {
+        sched();
+        return MAX_TIMEOUT;
+    }
+    else if (timeout < 0)
+    {
+        BUG_ON(1);
+        return 0;
+    }
+
+    spin_lock(&sched_lock);
+    struct timer_func_list_t timer; 
+    timer_func_init(&timer, &__wake_up_helper, current_pcb, timeout);
+    timer_func_add(&timer);
+    sched();
+    spin_unlock(&sched_lock);
+
+    timeout -= timer_jiffies;
+
+    return timeout < 0 ? 0 : timeout;
 }

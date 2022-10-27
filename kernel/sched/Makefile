@@ -2,12 +2,17 @@
 CFLAGS += -I .
 
 
-all: sched.o cfs.o
+kernel_sched_objs:= $(shell find ./*.c)
 
-cfs.o: cfs.c
-	$(CC) $(CFLAGS) -c cfs.c -o cfs.o
+ECHO:
+	@echo "$@"
 
-sched.o: sched.c
-	$(CC) $(CFLAGS) -c sched.c -o sched.o
+
+$(kernel_sched_objs): ECHO
+	$(CC) $(CFLAGS) -c $@ -o $@.o
+
+all: $(kernel_sched_objs)
+
+
 clean:
 	echo "Done."

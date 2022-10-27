@@ -147,7 +147,8 @@
         "compiler_attributes.h": "c",
         "timer.h": "c",
         "hid.h": "c",
-        "cfs.h": "c"
+        "cfs.h": "c",
+        "rtc.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

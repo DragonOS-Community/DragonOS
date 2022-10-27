@@ -1,5 +1,9 @@
 #include "process.h"
 
+/*** include completion ***/
+#include <common/completion.h>
+/*** end ***/
+
 #include <common/compiler.h>
 #include <common/elf.h>
 #include <common/kprint.h>
@@ -135,8 +139,10 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
+                         : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
+                         : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -510,6 +516,64 @@ ul initial_kernel_thread(ul arg)
     for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
         waitpid(tpid[i], NULL, NULL);
     kinfo("All test done.");
+
+    /*************************    completion测试代码 start ***************************************************/
+
+    kdebug("BEGIN COMPLETION TEST");
+    const int N = 10;
+    struct completion *one_to_one = kzalloc(sizeof(struct completion) * N, 0);
+    struct completion *one_to_many = kzalloc(sizeof(struct completion), 0);
+    struct completion *waiter_many_to_one = kzalloc(sizeof(struct completion) * N, 0);
+    struct completion *worker_many_to_one = kzalloc(sizeof(struct completion) * N, 0);
+    struct __test_data *waiter_data = kzalloc(sizeof(struct __test_data) * N, 0);
+    struct __test_data *worker_data = kzalloc(sizeof(struct __test_data) * N, 0);
+
+    completion_init(one_to_many);
+    for (int i = 0; i < N; i++)
+    {
+        completion_init(&one_to_one[i]);
+        completion_init(&waiter_many_to_one[i]);
+        completion_init(&worker_many_to_one[i]);
+    }
+
+    for (int i = 0; i < N; i++)
+    {
+        waiter_data[i].id = -i; // waiter
+        waiter_data[i].many_to_one = &waiter_many_to_one[i];
+        waiter_data[i].one_to_one = &one_to_one[i];
+        waiter_data[i].one_to_many = one_to_many;
+        kthread_run(__test_completion_waiter, &waiter_data[i], "the %dth waiter", i);
+    }
+
+    for (int i = 0; i < N; i++)
+    {
+        worker_data[i].id = i; // worker
+        worker_data[i].many_to_one = &worker_many_to_one[i];
+        worker_data[i].one_to_one = &one_to_one[i];
+        worker_data[i].one_to_many = one_to_many;
+        kthread_run(__test_completion_worker, &worker_data[i], "the %dth worker", i);
+    }
+
+    complete_all(one_to_many);
+    kdebug("all of the waiters and workers begin running");
+
+    kdebug("BEGIN COUNTING");
+    // usleep(50000000);
+    // kdebug("COUNTING OVER");
+
+    wait_for_multicompletion(waiter_many_to_one, N);
+    wait_for_multicompletion(worker_many_to_one, N);
+    kdebug("all of the waiters and workers complete");
+
+    kfree(one_to_one);
+    kfree(one_to_many);
+    kfree(waiter_many_to_one);
+    kfree(worker_many_to_one);
+    kfree(waiter_data);
+    kfree(worker_data);
+    kdebug("COMPLETION TEST DONE");
+
+    /*************************    completion测试代码 end ***************************************************/
 
     // 准备切换到用户态
     struct pt_regs *regs;

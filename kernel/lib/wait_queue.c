@@ -1,8 +1,8 @@
-#include <common/wait_queue.h>
-#include <sched/sched.h>
-#include <process/process.h>
-#include <mm/slab.h>
 #include <common/spinlock.h>
+#include <common/wait_queue.h>
+#include <mm/slab.h>
+#include <process/process.h>
+#include <sched/sched.h>
 
 /**
  * @brief 初始化等待队列
@@ -23,7 +23,7 @@ void wait_queue_init(wait_queue_node_t *wait_queue, struct process_control_block
  */
 void wait_queue_sleep_on(wait_queue_node_t *wait_queue_head)
 {
-    wait_queue_node_t *wait = (wait_queue_node_t *)kmalloc(sizeof(wait_queue_node_t), 0);
+    wait_queue_node_t *wait = (wait_queue_node_t *)kzalloc(sizeof(wait_queue_node_t), 0);
     wait_queue_init(wait, current_pcb);
     current_pcb->state = PROC_UNINTERRUPTIBLE;
     list_append(&wait_queue_head->wait_list, &wait->wait_list);
@@ -39,7 +39,7 @@ void wait_queue_sleep_on(wait_queue_node_t *wait_queue_head)
 void wait_queue_sleep_on_unlock(wait_queue_node_t *wait_queue_head,
                                 void *lock)
 {
-    wait_queue_node_t *wait = (wait_queue_node_t *)kmalloc(sizeof(wait_queue_node_t), 0);
+    wait_queue_node_t *wait = (wait_queue_node_t *)kzalloc(sizeof(wait_queue_node_t), 0);
     wait_queue_init(wait, current_pcb);
     current_pcb->state = PROC_UNINTERRUPTIBLE;
     list_append(&wait_queue_head->wait_list, &wait->wait_list);
@@ -54,7 +54,7 @@ void wait_queue_sleep_on_unlock(wait_queue_node_t *wait_queue_head,
  */
 void wait_queue_sleep_on_interriptible(wait_queue_node_t *wait_queue_head)
 {
-    wait_queue_node_t *wait = (wait_queue_node_t *)kmalloc(sizeof(wait_queue_node_t), 0);
+    wait_queue_node_t *wait = (wait_queue_node_t *)kzalloc(sizeof(wait_queue_node_t), 0);
     wait_queue_init(wait, current_pcb);
     current_pcb->state = PROC_INTERRUPTIBLE;
     list_append(&wait_queue_head->wait_list, &wait->wait_list);

@@ -8,6 +8,7 @@
 static spinlock_t __kthread_create_lock;           // kthread创建过程的锁
 static struct List kthread_create_list;            // kthread创建任务的链表
 struct process_control_block *kthreadd_pcb = NULL; // kthreadd守护线程的pcb
+#define TASK_COMM_LEN 16
 
 // 枚举各个标志位是在第几位
 enum KTHREAD_BITS
@@ -96,6 +97,18 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
     if (!IS_ERR(create->result))
     {
         // todo: 为内核线程设置名字
+        char name[TASK_COMM_LEN];
+        va_list get_args;
+        va_copy(get_args,args);
+        int len = vsprintf(name,name_fmt,get_args);
+        va_end(get_args);
+        if(len >= TASK_COMM_LEN)
+        {
+            struct kthread_info_t* kthread = to_kthread(pcb);
+            //?
+            // kthread->full_name = 
+        }
+        set_pcb_comm(pcb,name);
     }
 
     kfree(create);

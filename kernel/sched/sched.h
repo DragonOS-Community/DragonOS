@@ -76,3 +76,10 @@ void sched_init();
  *
  */
 void sched_update_jiffies();
+
+// /**
+//  * @brief 给pcb的comm字段赋值
+//  * 
+//  * @param 
+//  */
+// void sched_set_pcb_name(struct process_contral_block* pcb,char* name);

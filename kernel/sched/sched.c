@@ -71,3 +71,13 @@ void sched_init()
 {
     sched_cfs_init();
 }
+
+// /**
+//  * @brief 给pcb的comm字段赋值
+//  * 
+//  * @param 
+//  */
+// void sched_set_pcb_comm(struct process_contral_block* pcb,char* name)
+// {
+
+// }

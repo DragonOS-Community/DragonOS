@@ -1,9 +1,10 @@
 #include "fat_ent.h"
-#include <driver/disk/ahci/ahci.h>
 #include <common/errno.h>
+#include <driver/disk/ahci/ahci.h>
 #include <mm/slab.h>
 
-static const char unavailable_character_in_short_name[] = {0x22, 0x2a, 0x2b, 0x2c, 0x2e, 0x2f, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x5b, 0x5c, 0x5d, 0x7c};
+static const char unavailable_character_in_short_name[] = {0x22, 0x2a, 0x2b, 0x2c, 0x2e, 0x2f, 0x3a, 0x3b,
+                                                           0x3c, 0x3d, 0x3e, 0x3f, 0x5b, 0x5c, 0x5d, 0x7c};
 /**
  * @brief 请求分配指定数量的簇
  *
@@ -133,8 +134,8 @@ uint32_t fat32_read_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, u
     memset(buf, 0, fsbi->bytes_per_sec);
 
     // 读取一个sector的数据，
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
-                                 (uint64_t)&buf);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT,
+                                 fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1, (uint64_t)&buf);
 
     // 返回下一个fat表项的值（也就是下一个cluster）
     return buf[cluster & (fat_ent_per_sec - 1)] & 0x0fffffff;
@@ -156,15 +157,15 @@ uint32_t fat32_write_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, 
     uint32_t fat_ent_per_sec = (fsbi->bytes_per_sec >> 2); // 该值应为2的n次幂
     uint32_t *buf = kzalloc(fsbi->bytes_per_sec, 0);
 
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
-                                 (uint64_t)buf);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT,
+                                 fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1, (uint64_t)buf);
 
     buf[cluster & (fat_ent_per_sec - 1)] = (buf[cluster & (fat_ent_per_sec - 1)] & 0xf0000000) | (value & 0x0fffffff);
     // 向FAT1和FAT2写入数据
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1,
-                                 (uint64_t)buf);
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, fsbi->FAT2_base_sector + (cluster / fat_ent_per_sec), 1,
-                                 (uint64_t)buf);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT,
+                                 fsbi->FAT1_base_sector + (cluster / fat_ent_per_sec), 1, (uint64_t)buf);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT,
+                                 fsbi->FAT2_base_sector + (cluster / fat_ent_per_sec), 1, (uint64_t)buf);
 
     kfree(buf);
     return 0;
@@ -179,9 +180,12 @@ uint32_t fat32_write_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, 
  * @param res_sector 返回信息：缓冲区对应的扇区号
  * @param res_cluster 返回信息：缓冲区对应的簇号
  * @param res_data_buf_base 返回信息：缓冲区的内存基地址（记得要释放缓冲区内存！！！！）
- * @return struct fat32_Directory_t* 符合要求的entry的指针（指向地址高处的空目录项，也就是说，有连续num个≤这个指针的空目录项）
+ * @return struct fat32_Directory_t*
+ * 符合要求的entry的指针（指向地址高处的空目录项，也就是说，有连续num个≤这个指针的空目录项）
  */
-struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *parent_inode, uint32_t num, uint32_t mode, uint32_t *res_sector, uint64_t *res_cluster, uint64_t *res_data_buf_base)
+struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *parent_inode, uint32_t num, uint32_t mode,
+                                                  uint32_t *res_sector, uint64_t *res_cluster,
+                                                  uint64_t *res_data_buf_base)
 {
     // kdebug("find empty_dentry");
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)parent_inode->private_inode_info;
@@ -251,7 +255,8 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
             // 将这个新的簇清空
             sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
             void *tmp_buf = kzalloc(fsbi->bytes_per_clus, 0);
-            blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buf);
+            blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus,
+                                         (uint64_t)tmp_buf);
             kfree(tmp_buf);
         }
     }
@@ -327,6 +332,12 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
             else
                 target->DIR_Name[tmp_index] = 0x20;
         }
+        // 在字符串末尾加入\0
+        if (tmp_index < 8 && tmp_index == dEntry->name_length)
+        {
+            target->DIR_Name[tmp_index] = '\0';
+            ++tmp_index;
+        }
 
         // 不满的部分使用0x20填充
         while (tmp_index < 8)
@@ -373,7 +384,8 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
  * @param checksum 短目录项的校验和
  * @param cnt_longname 总的长目录项的个数
  */
-void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirectory_t *target, uint8_t checksum, uint32_t cnt_longname)
+void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirectory_t *target, uint8_t checksum,
+                         uint32_t cnt_longname)
 {
     uint32_t current_name_index = 0;
     struct fat32_LongDirectory_t *Ldentry = (struct fat32_LongDirectory_t *)(target + 1);
@@ -387,6 +399,8 @@ void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirect
         {
             if (current_name_index < dEntry->name_length)
                 Ldentry->LDIR_Name1[j] = dEntry->name[current_name_index];
+            else if (current_name_index == dEntry->name_length)
+                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name1[j] = 0xffff;
         }
@@ -394,6 +408,8 @@ void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirect
         {
             if (current_name_index < dEntry->name_length)
                 Ldentry->LDIR_Name2[j] = dEntry->name[current_name_index];
+            else if (current_name_index == dEntry->name_length)
+                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name2[j] = 0xffff;
         }
@@ -401,6 +417,8 @@ void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirect
         {
             if (current_name_index < dEntry->name_length)
                 Ldentry->LDIR_Name3[j] = dEntry->name[current_name_index];
+            else if (current_name_index == dEntry->name_length)
+                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name3[j] = 0xffff;
         }

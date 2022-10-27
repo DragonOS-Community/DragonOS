@@ -6,7 +6,7 @@
  * @brief 释放dentry，并视情况自动释放inode. 在调用该函数前，需要将dentry加锁。
  *
  * @param dentry 目标dentry
- * 
+ *
  * @return 错误码
  *          注意，当dentry指向文件时，如果返回值为正数，则表示在释放了该dentry后，该dentry指向的inode的引用计数。
  */
@@ -15,9 +15,10 @@ int vfs_dentry_put(struct vfs_dir_entry_t *dentry)
     int retval = 0;
     uint64_t in_value = 0;
     struct kfifo_t fifo = {0};
+    const struct vfs_dir_entry_t *start_dentry = dentry;
 
     // 引用计数大于1时，尝试释放dentry的话，抛出错误信息
-    if (unlikely(dentry->lockref.lock_count > 1))
+    if (unlikely(dentry->lockref.count > 1))
     {
         BUG_ON(1);
         retval = -EBUSY;
@@ -58,10 +59,12 @@ int vfs_dentry_put(struct vfs_dir_entry_t *dentry)
 
                 } while (list_next(list) != (&dentry->subdirs_list));
             }
-            spin_lock(&dentry->lockref.lock);
-            if(dentry->lockref.count>1)
+            if (unlikely(dentry != start_dentry))
+                spin_lock(&dentry->lockref.lock);
+            if (dentry->lockref.count > 1)
             {
-                spin_unlock(&dentry->lockref.lock);
+                if (unlikely(dentry != start_dentry))
+                    spin_unlock(&dentry->lockref.lock);
                 continue;
             }
             // 释放inode

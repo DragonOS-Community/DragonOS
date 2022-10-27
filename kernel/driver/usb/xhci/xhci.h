@@ -8,7 +8,7 @@
 
 // ========== irq BEGIN ===========
 
-#define XHCI_IRQ_DONE (1 << 31) // 当command trb 的status的第31位被驱动程序置位时，表明该trb已经执行完成（这是由于xhci规定，第31位可以由驱动程序自行决定用途）
+#define XHCI_IRQ_DONE (1U << 31) // 当command trb 的status的第31位被驱动程序置位时，表明该trb已经执行完成（这是由于xhci规定，第31位可以由驱动程序自行决定用途）
 /**
  * @brief 每个xhci控制器的中断向量号
  *

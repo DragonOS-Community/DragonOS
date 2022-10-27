@@ -25,6 +25,7 @@ static int compare(void *a, void *b)
 static int release(void *value)
 {
     // kdebug("release");
+    return 0;
 }
 
 /**

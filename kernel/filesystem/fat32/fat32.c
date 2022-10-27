@@ -1,12 +1,12 @@
 #include "fat32.h"
+#include "fat_ent.h"
+#include <common/errno.h>
 #include <common/kprint.h>
+#include <common/spinlock.h>
+#include <common/stdio.h>
 #include <driver/disk/ahci/ahci.h>
 #include <filesystem/MBR.h>
-#include <common/spinlock.h>
 #include <mm/slab.h>
-#include <common/errno.h>
-#include <common/stdio.h>
-#include "fat_ent.h"
 
 struct vfs_super_block_operations_t fat32_sb_ops;
 struct vfs_dir_entry_operations_t fat32_dEntry_ops;
@@ -104,7 +104,9 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                 {
                     if (js > dest_dentry->name_length && tmp_ldEntry->LDIR_Name1[x] == 0xffff)
                         continue;
-                    else if (js > dest_dentry->name_length || tmp_ldEntry->LDIR_Name1[x] != (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
+                    else if (js > dest_dentry->name_length ||
+                             tmp_ldEntry->LDIR_Name1[x] !=
+                                 (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
                         goto continue_cmp_fail;
                 }
 
@@ -113,7 +115,9 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                 {
                     if (js > dest_dentry->name_length && tmp_ldEntry->LDIR_Name2[x] == 0xffff)
                         continue;
-                    else if (js > dest_dentry->name_length || tmp_ldEntry->LDIR_Name2[x] != (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
+                    else if (js > dest_dentry->name_length ||
+                             tmp_ldEntry->LDIR_Name2[x] !=
+                                 (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
                         goto continue_cmp_fail;
                 }
 
@@ -122,7 +126,9 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                 {
                     if (js > dest_dentry->name_length && tmp_ldEntry->LDIR_Name3[x] == 0xffff)
                         continue;
-                    else if (js > dest_dentry->name_length || tmp_ldEntry->LDIR_Name3[x] != (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
+                    else if (js > dest_dentry->name_length ||
+                             tmp_ldEntry->LDIR_Name3[x] !=
+                                 (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
                         goto continue_cmp_fail;
                 }
 
@@ -159,7 +165,8 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                     }
                     else // 是文件夹
                     {
-                        if (js < dest_dentry->name_length && tmp_dEntry->DIR_Name[x] == dest_dentry->name[js]) // 当前位正确匹配
+                        if (js < dest_dentry->name_length &&
+                            tmp_dEntry->DIR_Name[x] == dest_dentry->name[js]) // 当前位正确匹配
                         {
                             ++js;
                             break; // 进行下一位的匹配
@@ -284,6 +291,11 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
             return NULL;
         }
     }
+    if(unlikely(tmp_dEntry==NULL))
+    {
+        BUG_ON(1);
+        return NULL;
+    }
 find_lookup_success:; // 找到目标dentry
     struct vfs_index_node_t *p = vfs_alloc_inode();
 
@@ -360,13 +372,17 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
     fsbi->fsinfo_sector_addr_infat = fbs->BPB_FSInfo;
     fsbi->bootsector_bak_sector_addr_infat = fbs->BPB_BkBootSec;
 
-    printk_color(ORANGE, BLACK, "FAT32 Boot Sector\n\tBPB_FSInfo:%#018lx\n\tBPB_BkBootSec:%#018lx\n\tBPB_TotSec32:%#018lx\n", fbs->BPB_FSInfo, fbs->BPB_BkBootSec, fbs->BPB_TotSec32);
+    printk_color(ORANGE, BLACK,
+                 "FAT32 Boot Sector\n\tBPB_FSInfo:%#018lx\n\tBPB_BkBootSec:%#018lx\n\tBPB_TotSec32:%#018lx\n",
+                 fbs->BPB_FSInfo, fbs->BPB_BkBootSec, fbs->BPB_TotSec32);
 
     // fsinfo扇区的信息
     memset(&fsbi->fsinfo, 0, sizeof(struct fat32_FSInfo_t));
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, blk->bd_start_LBA + fsbi->fsinfo_sector_addr_infat, 1, (uint64_t)&fsbi->fsinfo);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT,
+                                 blk->bd_start_LBA + fsbi->fsinfo_sector_addr_infat, 1, (uint64_t)&fsbi->fsinfo);
 
-    printk_color(BLUE, BLACK, "FAT32 FSInfo\n\tFSI_LeadSig:%#018lx\n\tFSI_StrucSig:%#018lx\n\tFSI_Free_Count:%#018lx\n", fsbi->fsinfo.FSI_LeadSig, fsbi->fsinfo.FSI_StrucSig, fsbi->fsinfo.FSI_Free_Count);
+    printk_color(BLUE, BLACK, "FAT32 FSInfo\n\tFSI_LeadSig:%#018lx\n\tFSI_StrucSig:%#018lx\n\tFSI_Free_Count:%#018lx\n",
+                 fsbi->fsinfo.FSI_LeadSig, fsbi->fsinfo.FSI_StrucSig, fsbi->fsinfo.FSI_Free_Count);
 
     // 初始化超级块的dir entry
     sb_ptr->root = vfs_alloc_dentry(2);
@@ -383,7 +399,8 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
     sb_ptr->root->dir_inode->file_ops = &fat32_file_ops;
     sb_ptr->root->dir_inode->file_size = 0;
     // 计算文件占用的扇区数, 由于最小存储单位是簇，因此需要按照簇的大小来对齐扇区
-    sb_ptr->root->dir_inode->blocks = (sb_ptr->root->dir_inode->file_size + fsbi->bytes_per_clus - 1) / fsbi->bytes_per_sec;
+    sb_ptr->root->dir_inode->blocks =
+        (sb_ptr->root->dir_inode->file_size + fsbi->bytes_per_clus - 1) / fsbi->bytes_per_sec;
     sb_ptr->root->dir_inode->attribute = VFS_IF_DIR;
     sb_ptr->root->dir_inode->sb = sb_ptr; // 反向绑定对应的超级块
 
@@ -449,7 +466,8 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
     struct fat32_Directory_t *buf = (struct fat32_Directory_t *)kmalloc(fsbi->bytes_per_clus, 0);
     memset(buf, 0, fsbi->bytes_per_clus);
 
-    inode->sb->blk_device->bd_disk->fops->transfer(inode->sb->blk_device->bd_disk, AHCI_CMD_READ_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf);
+    inode->sb->blk_device->bd_disk->fops->transfer(inode->sb->blk_device->bd_disk, AHCI_CMD_READ_DMA_EXT, fLBA,
+                                                   fsbi->sec_per_clus, (uint64_t)buf);
     // 计算目标dEntry所在的位置
     struct fat32_Directory_t *fdEntry = buf + finode->dEntry_location_clus_offset;
 
@@ -459,44 +477,47 @@ void fat32_write_inode(struct vfs_index_node_t *inode)
     fdEntry->DIR_FstClusHI = (finode->first_clus >> 16) | (fdEntry->DIR_FstClusHI & 0xf000);
 
     // 将dir entry写回磁盘
-    inode->sb->blk_device->bd_disk->fops->transfer(inode->sb->blk_device->bd_disk, AHCI_CMD_WRITE_DMA_EXT, fLBA, fsbi->sec_per_clus, (uint64_t)buf);
+    inode->sb->blk_device->bd_disk->fops->transfer(inode->sb->blk_device->bd_disk, AHCI_CMD_WRITE_DMA_EXT, fLBA,
+                                                   fsbi->sec_per_clus, (uint64_t)buf);
     kfree(buf);
 }
 
-struct vfs_super_block_operations_t fat32_sb_ops =
-    {
-        .write_superblock = fat32_write_superblock,
-        .put_superblock = fat32_put_superblock,
-        .write_inode = fat32_write_inode,
+struct vfs_super_block_operations_t fat32_sb_ops = {
+    .write_superblock = fat32_write_superblock,
+    .put_superblock = fat32_put_superblock,
+    .write_inode = fat32_write_inode,
 };
 
 // todo: compare
 long fat32_compare(struct vfs_dir_entry_t *parent_dEntry, char *source_filename, char *dest_filename)
 {
+    return 0;
 }
 // todo: hash
 long fat32_hash(struct vfs_dir_entry_t *dEntry, char *filename)
 {
+    return 0;
 }
 // todo: release
 long fat32_release(struct vfs_dir_entry_t *dEntry)
 {
+    return 0;
 }
 // todo: iput
 long fat32_iput(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode)
 {
+    return 0;
 }
 
 /**
  * @brief fat32文件系统对于dEntry的操作
  *
  */
-struct vfs_dir_entry_operations_t fat32_dEntry_ops =
-    {
-        .compare = fat32_compare,
-        .hash = fat32_hash,
-        .release = fat32_release,
-        .iput = fat32_iput,
+struct vfs_dir_entry_operations_t fat32_dEntry_ops = {
+    .compare = fat32_compare,
+    .hash = fat32_hash,
+    .release = fat32_release,
+    .iput = fat32_iput,
 };
 
 // todo: open
@@ -529,7 +550,8 @@ long fat32_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *pos
 
     // First cluster num of the file
     uint64_t cluster = finode->first_clus;
-    // kdebug("fsbi->bytes_per_clus=%d fsbi->sec_per_clus=%d finode->first_clus=%d cluster=%d", fsbi->bytes_per_clus, fsbi->sec_per_clus, finode->first_clus, cluster);
+    // kdebug("fsbi->bytes_per_clus=%d fsbi->sec_per_clus=%d finode->first_clus=%d cluster=%d", fsbi->bytes_per_clus,
+    // fsbi->sec_per_clus, finode->first_clus, cluster);
 
     // kdebug("fsbi->bytes_per_clus=%d", fsbi->bytes_per_clus);
 
@@ -563,7 +585,8 @@ long fat32_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *pos
         uint64_t sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
 
         // 读取一个簇的数据
-        int errno = blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buffer);
+        int errno = blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus,
+                                                 (uint64_t)tmp_buffer);
         if (errno != AHCI_SUCCESS)
         {
             kerror("FAT32 FS(read) error!");
@@ -656,7 +679,8 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *po
         {
             // kdebug("read existed sec=%ld", sector);
             //  读取一个簇的数据
-            int errno = blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buffer);
+            int errno = blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus,
+                                                     (uint64_t)tmp_buffer);
             if (errno != AHCI_SUCCESS)
             {
                 // kerror("FAT32 FS(write)  read disk error!");
@@ -678,7 +702,8 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *po
             memcpy(tmp_buffer + bytes_offset, buf, step_trans_len);
 
         // 写入数据到对应的簇
-        int errno = blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)tmp_buffer);
+        int errno = blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, sector, fsbi->sec_per_clus,
+                                                 (uint64_t)tmp_buffer);
         if (errno != AHCI_SUCCESS)
         {
             kerror("FAT32 FS(write)  write disk error!");
@@ -767,22 +792,21 @@ long fat32_lseek(struct vfs_file_t *file_ptr, long offset, long whence)
 }
 // todo: ioctl
 long fat32_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg)
-{
+{return 0;
 }
 
 /**
  * @brief fat32文件系统，关于文件的操作
  *
  */
-struct vfs_file_operations_t fat32_file_ops =
-    {
-        .open = fat32_open,
-        .close = fat32_close,
-        .read = fat32_read,
-        .write = fat32_write,
-        .lseek = fat32_lseek,
-        .ioctl = fat32_ioctl,
-        .readdir = fat32_readdir,
+struct vfs_file_operations_t fat32_file_ops = {
+    .open = fat32_open,
+    .close = fat32_close,
+    .read = fat32_read,
+    .write = fat32_write,
+    .lseek = fat32_lseek,
+    .ioctl = fat32_ioctl,
+    .readdir = fat32_readdir,
 };
 
 /**
@@ -836,7 +860,8 @@ long fat32_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t 
     uint64_t tmp_dentry_clus_buf_addr = 0;
     uint64_t tmp_parent_dentry_clus = 0;
     // 寻找空闲目录项
-    struct fat32_Directory_t *empty_fat32_dentry = fat32_find_empty_dentry(parent_inode, cnt_longname + 1, 0, &tmp_dentry_sector, &tmp_parent_dentry_clus, &tmp_dentry_clus_buf_addr);
+    struct fat32_Directory_t *empty_fat32_dentry = fat32_find_empty_dentry(
+        parent_inode, cnt_longname + 1, 0, &tmp_dentry_sector, &tmp_parent_dentry_clus, &tmp_dentry_clus_buf_addr);
     // kdebug("found empty dentry, cnt_longname=%ld", cnt_longname);
 
     finode->first_clus = 0;
@@ -862,11 +887,13 @@ long fat32_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t 
 
     // kdebug("dest_dEntry->name=%s",dest_dEntry->name);
     // ======== 填写长目录项
-    fat32_fill_longname(dest_dEntry, (struct fat32_LongDirectory_t *)(empty_fat32_dentry - 1), short_dentry_ChkSum, cnt_longname);
+    fat32_fill_longname(dest_dEntry, (struct fat32_LongDirectory_t *)(empty_fat32_dentry - 1), short_dentry_ChkSum,
+                        cnt_longname);
 
     // ====== 将目录项写回磁盘
     // kdebug("tmp_dentry_sector=%ld", tmp_dentry_sector);
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, tmp_dentry_sector, fsbi->sec_per_clus, tmp_dentry_clus_buf_addr);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, tmp_dentry_sector, fsbi->sec_per_clus,
+                                 tmp_dentry_clus_buf_addr);
 
     // 注意：parent字段需要在调用函数的地方进行设置
 
@@ -916,7 +943,8 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     uint64_t tmp_dentry_clus_buf_addr = 0;
     uint64_t tmp_parent_dentry_clus = 0;
     // 寻找空闲目录项
-    struct fat32_Directory_t *empty_fat32_dentry = fat32_find_empty_dentry(parent_inode, cnt_longname + 1, 0, &tmp_dentry_sector, &tmp_parent_dentry_clus, &tmp_dentry_clus_buf_addr);
+    struct fat32_Directory_t *empty_fat32_dentry = fat32_find_empty_dentry(
+        parent_inode, cnt_longname + 1, 0, &tmp_dentry_sector, &tmp_parent_dentry_clus, &tmp_dentry_clus_buf_addr);
 
     // ====== 初始化inode =======
     struct vfs_index_node_t *inode = vfs_alloc_inode();
@@ -941,8 +969,6 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     // todo: 填写完全fat32_inode_info的信息
 
     // 初始化dentry信息
-    list_init(&dEntry->child_node_list);
-    list_init(&dEntry->subdirs_list);
     dEntry->dir_ops = &fat32_dEntry_ops;
     dEntry->dir_inode = inode;
 
@@ -963,11 +989,13 @@ int64_t fat32_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_
     uint8_t short_dentry_ChkSum = fat32_ChkSum(empty_fat32_dentry->DIR_Name);
 
     // ======== 填写长目录项
-    fat32_fill_longname(dEntry, (struct fat32_LongDirectory_t *)(empty_fat32_dentry - 1), short_dentry_ChkSum, cnt_longname);
+    fat32_fill_longname(dEntry, (struct fat32_LongDirectory_t *)(empty_fat32_dentry - 1), short_dentry_ChkSum,
+                        cnt_longname);
 
     // ====== 将目录项写回磁盘
     // kdebug("tmp_dentry_sector=%ld", tmp_dentry_sector);
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, tmp_dentry_sector, fsbi->sec_per_clus, tmp_dentry_clus_buf_addr);
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_WRITE_DMA_EXT, tmp_dentry_sector, fsbi->sec_per_clus,
+                                 tmp_dentry_clus_buf_addr);
     // ====== 初始化新的文件夹的目录项 =====
     {
         // kdebug("to create dot and dot dot.");
@@ -1019,21 +1047,26 @@ fail:;
 // todo: rmdir
 int64_t fat32_rmdir(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dEntry)
 {
+    return 0;
 }
 
 // todo: rename
-int64_t fat32_rename(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry, struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry)
+int64_t fat32_rename(struct vfs_index_node_t *old_inode, struct vfs_dir_entry_t *old_dEntry,
+                     struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry)
 {
+    return 0;
 }
 
 // todo: getAttr
 int64_t fat32_getAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr)
 {
+    return 0;
 }
 
 // todo: setAttr
 int64_t fat32_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr)
 {
+    return 0;
 }
 /**
  * @brief 读取文件夹(在指定目录中找出有效目录项)
@@ -1077,7 +1110,8 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
         uint64_t sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
         // 读取文件夹目录项当前位置起始扇区的数据
 
-        if (AHCI_SUCCESS != blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus, (uint64_t)buf))
+        if (AHCI_SUCCESS != blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector,
+                                                         fsbi->sec_per_clus, (uint64_t)buf))
         {
             // 读取失败
             kerror("Failed to read the file's first sector.");
@@ -1093,7 +1127,8 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
 
         name_len = 0;
         // 逐个查找短目录项
-        for (int i = file_ptr->position % fsbi->bytes_per_clus; i < fsbi->bytes_per_clus; i += 32, file_ptr->position += 32, ++dentry)
+        for (int i = file_ptr->position % fsbi->bytes_per_clus; i < fsbi->bytes_per_clus;
+             i += 32, file_ptr->position += 32, ++dentry)
         {
             // 若是长目录项则跳过
             if (dentry->DIR_Attr == ATTR_LONG_NAME)
@@ -1107,11 +1142,13 @@ int64_t fat32_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldir_t f
             long_dentry = (struct fat32_LongDirectory_t *)(dentry - 1);
 
             // 如果长目录项有效，则读取长目录项
-            if (long_dentry->LDIR_Attr == ATTR_LONG_NAME && long_dentry->LDIR_Ord != 0xe5 && long_dentry->LDIR_Ord != 0x00 && long_dentry->LDIR_Ord != 0x05)
+            if (long_dentry->LDIR_Attr == ATTR_LONG_NAME && long_dentry->LDIR_Ord != 0xe5 &&
+                long_dentry->LDIR_Ord != 0x00 && long_dentry->LDIR_Ord != 0x05)
             {
                 int count_long_dentry = 0;
                 // 统计长目录项的个数
-                while (long_dentry->LDIR_Attr == ATTR_LONG_NAME && long_dentry->LDIR_Ord != 0xe5 && long_dentry->LDIR_Ord != 0x00 && long_dentry->LDIR_Ord != 0x05)
+                while (long_dentry->LDIR_Attr == ATTR_LONG_NAME && long_dentry->LDIR_Ord != 0xe5 &&
+                       long_dentry->LDIR_Ord != 0x00 && long_dentry->LDIR_Ord != 0x05)
                 {
                     ++count_long_dentry;
                     if (long_dentry->LDIR_Ord & 0x40) // 最后一个长目录项
@@ -1224,24 +1261,22 @@ find_dir_success:;
     return filler(dirent, 0, dir_name, name_len, dentry_type, 0);
 }
 
-struct vfs_inode_operations_t fat32_inode_ops =
-    {
-        .create = fat32_create,
-        .mkdir = fat32_mkdir,
-        .rmdir = fat32_rmdir,
-        .lookup = fat32_lookup,
-        .rename = fat32_rename,
-        .getAttr = fat32_getAttr,
-        .setAttr = fat32_setAttr,
+struct vfs_inode_operations_t fat32_inode_ops = {
+    .create = fat32_create,
+    .mkdir = fat32_mkdir,
+    .rmdir = fat32_rmdir,
+    .lookup = fat32_lookup,
+    .rename = fat32_rename,
+    .getAttr = fat32_getAttr,
+    .setAttr = fat32_setAttr,
 
 };
 
-struct vfs_filesystem_type_t fat32_fs_type =
-    {
-        .name = "FAT32",
-        .fs_flags = 0,
-        .read_superblock = fat32_read_superblock,
-        .next = NULL,
+struct vfs_filesystem_type_t fat32_fs_type = {
+    .name = "FAT32",
+    .fs_flags = 0,
+    .read_superblock = fat32_read_superblock,
+    .next = NULL,
 };
 void fat32_init()
 {

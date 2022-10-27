@@ -32,14 +32,17 @@ void idr_init(struct idr *idp)
  */
 static void __move_to_free_list(struct idr *idp, struct idr_layer *p)
 {
-    spin_lock(&idp->lock);
+    unsigned long flags;
+    spin_lock_irqsave(&idp->lock, flags);
 
     // 插入free_list
     p->ary[0] = idp->free_list;
+    io_sfence();
     idp->free_list = p;
+    io_sfence();
     ++(idp->id_free_cnt);
 
-    spin_unlock(&idp->lock);
+    spin_unlock_irqrestore(&idp->lock, flags);
 }
 
 /**
@@ -52,22 +55,32 @@ static void *__get_from_free_list(struct idr *idp)
 {
     if (idp->id_free_cnt == 0)
     {
-        if (idr_pre_get(idp, 0) != 0)
+        if (idr_preload(idp, 0) != 0)
         {
             kBUG("idr-module find a BUG: get free node fail.(Possible ENOMEM error)");
             return NULL;
         }
     }
 
-    spin_lock(&idp->lock);
+    unsigned long flags;
+    spin_lock_irqsave(&idp->lock, flags);
 
     // free_list还有节点
     struct idr_layer *item = idp->free_list;
+
+    if (item == NULL)
+    {
+        BUG_ON(1);
+    }
+
+    io_sfence();
     idp->free_list = idp->free_list->ary[0];
+    io_sfence();
     item->ary[0] = NULL; // 记得清空原来的数据
+    io_sfence();
     --(idp->id_free_cnt);
 
-    spin_unlock(&idp->lock);
+    spin_unlock_irqrestore(&idp->lock, flags);
 
     return item;
 }
@@ -79,15 +92,16 @@ static void *__get_from_free_list(struct idr *idp)
  * @param gfp_mask
  * @return int (如果分配成功,将返回0; 否则返回负数 -ENOMEM, 有可能是内存空间不够)
  */
-int idr_pre_get(struct idr *idp, gfp_t gfp_mask)
+int idr_preload(struct idr *idp, gfp_t gfp_mask)
 {
     int timer = 0;
     while (idp->id_free_cnt < IDR_FREE_MAX)
     {
         struct idr_layer *new_one;
         new_one = kzalloc(sizeof(struct idr_layer), gfp_mask); // 默认清空?
-        if (NULL == new_one)
+        if (unlikely(new_one == NULL))
             return -ENOMEM;
+
         __move_to_free_list(idp, new_one);
         timer++;
     }
@@ -149,9 +163,9 @@ static int __idr_get_empty_slot(struct idr *idp, struct idr_layer **stk)
         if (__idr_grow(idp) != 0)
             return -ENOMEM;
 
-    int id = 0;
+    int64_t id = 0;
     int layer = idp->top->layer;
-
+    BUG_ON(layer + 1 >= 7);
     stk[layer + 1] = NULL; // 标志为数组末尾
 
     struct idr_layer *cur_layer = idp->top;
@@ -198,6 +212,7 @@ static int __idr_get_empty_slot(struct idr *idp, struct idr_layer **stk)
  */
 static __always_inline void __idr_mark_full(struct idr *idp, int id, struct idr_layer **stk, int mark)
 {
+    int64_t __id = (int64_t)id;
     if (unlikely(NULL == stk[0] || NULL == idp->top))
     {
         kBUG("idr-module find a BUG: idp->top can't be NULL.");
@@ -205,7 +220,7 @@ static __always_inline void __idr_mark_full(struct idr *idp, int id, struct idr_
     }
 
     // 处理叶子节点的full/bitmap标记
-    int layer_id = id & IDR_MASK;
+    int64_t layer_id = __id & IDR_MASK;
     if (mark == 2)
         stk[0]->full |= (1ull << layer_id);
     if (mark >= 1)
@@ -213,8 +228,8 @@ static __always_inline void __idr_mark_full(struct idr *idp, int id, struct idr_
 
     for (int i = 1; stk[i]; ++i)
     {
-        id >>= IDR_BITS;
-        layer_id = id & IDR_MASK;
+        __id >>= IDR_BITS;
+        layer_id = __id & IDR_MASK;
 
         stk[i]->bitmap |= (1ull << layer_id);
         if (stk[i - 1]->full == IDR_FULL)
@@ -232,7 +247,8 @@ static __always_inline void __idr_mark_full(struct idr *idp, int id, struct idr_
  */
 static __always_inline int __idr_get_path(struct idr *idp, int id, struct idr_layer **stk)
 {
-    if (unlikely(idp->top == NULL || id < 0))
+    int64_t __id = (int64_t)id;
+    if (unlikely(idp->top == NULL || __id < 0))
     {
         kBUG("idr-module find a BUG: idp->top can't be NULL and id must be non-negative.");
         return 0;
@@ -242,11 +258,17 @@ static __always_inline int __idr_get_path(struct idr *idp, int id, struct idr_la
     int layer = cur_layer->layer;
     stk[layer + 1] = NULL; // 标志数组结尾
 
+    if (unlikely((__id >> ((layer + 1ull) * IDR_BITS)) > 0))
+    {
+        kBUG("idr-module find a BUG: id is invalid.");
+        return 0;
+    }
+
     // 提取路径
     while (layer >= 0)
     {
         stk[layer] = cur_layer;
-        int layer_id = (id >> (layer * IDR_BITS)) & IDR_MASK;
+        int64_t layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
 
         if (unlikely(((cur_layer->bitmap >> layer_id) & 1) == 0))
         {
@@ -271,6 +293,7 @@ static __always_inline int __idr_get_path(struct idr *idp, int id, struct idr_la
  */
 static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr_layer **stk, int mark)
 {
+    int64_t __id = (int64_t)id;
     if (unlikely(NULL == stk[0] || NULL == idp->top))
     {
         kBUG("idr-module find a BUG: idp->top can't be NULL.");
@@ -278,7 +301,7 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
     }
 
     // 处理叶子节点的full/bitmap标记
-    int layer_id = id & IDR_MASK;
+    int64_t layer_id = __id & IDR_MASK;
     if (mark == 0) // 叶子的某个插槽为空
     {
         stk[0]->ary[layer_id] = NULL;
@@ -290,8 +313,8 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
     // 删除节点
     for (int layer = 1; stk[layer]; ++layer)
     {
-        id >>= IDR_BITS;
-        layer_id = id & IDR_MASK;
+        __id >>= IDR_BITS;
+        layer_id = __id & IDR_MASK;
 
         if (NULL == stk[layer - 1]->bitmap) // 儿子是空节点
         {
@@ -333,8 +356,12 @@ static __always_inline void __idr_erase_full(struct idr *idp, int id, struct idr
  */
 static int __idr_get_new_above_int(struct idr *idp, void *ptr, int starting_id)
 {
-    struct idr_layer *stk[MAX_LEVEL + 1]; // 你可以选择memset(0)
-    int id = __idr_get_empty_slot(idp, stk);
+    struct idr_layer *stk[MAX_LEVEL + 1] = {0};
+
+    // kdebug("stk=%#018lx, sizeof_stk=%d", stk, sizeof(stk));
+    // memset(stk, 0, sizeof(stk));
+    // 你可以选择 memset(stk, 0, sizeof(stk));
+    int64_t id = __idr_get_empty_slot(idp, stk);
 
     if (id >= 0)
     {
@@ -353,7 +380,7 @@ static int __idr_get_new_above_int(struct idr *idp, void *ptr, int starting_id)
  * @param int* id - 传入int指针，获取到的NEW_ID存在id里
  * @return int (0表示获取id成功, 负数代表错误 - 可能是内存空间不够)
  */
-int idr_get_new(struct idr *idp, void *ptr, int *id)
+int idr_alloc(struct idr *idp, void *ptr, int *id)
 {
     int rv = __idr_get_new_above_int(idp, ptr, 0);
     if (rv < 0)
@@ -363,21 +390,28 @@ int idr_get_new(struct idr *idp, void *ptr, int *id)
 }
 
 /**
- * @brief 删除一个id，但是不释放对应的ptr指向的空间
+ * @brief 删除一个id, 但是不释放对应的ptr指向的空间, 同时返回这个被删除id所对应的ptr
  *
  * @param idp
  * @param id
+ * @return void*
+ * (如果删除成功，就返回被删除id所对应的ptr；否则返回NULL。注意：如果这个id本来就和NULL绑定，那么也会返回NULL)
  */
-void idr_remove(struct idr *idp, int id)
+void *idr_remove(struct idr *idp, int id)
 {
-    if (unlikely(idp->top == NULL || id < 0))
-        return;
+    int64_t __id = (int64_t)id;
+    if (unlikely(idp->top == NULL || __id < 0))
+        return NULL;
 
-    struct idr_layer *stk[MAX_LEVEL + 1];
-    if (0 == __idr_get_path(idp, id, stk))
-        return; // 找不到路径
+    struct idr_layer *stk[MAX_LEVEL + 1] = {0};
 
-    __idr_erase_full(idp, id, stk, 0);
+    if (0 == __idr_get_path(idp, __id, stk))
+        return NULL; // 找不到路径
+
+    void *ret = stk[0]->ary[__id & IDR_MASK];
+    __idr_erase_full(idp, __id, stk, 0);
+
+    return ret;
 }
 
 /**
@@ -395,9 +429,11 @@ static void __idr_remove_all_with_free(struct idr *idp, bool free)
     }
 
     int sz = sizeof(struct idr_layer);
-    struct idr_layer *stk[MAX_LEVEL + 1];
+    struct idr_layer *stk[MAX_LEVEL + 1] = {0};
+
     struct idr_layer *cur_layer = idp->top;
     int layer = cur_layer->layer;
+    BUG_ON(layer + 1 >= 7);
     stk[layer + 1] = NULL; // 标记数组结尾
 
     while (cur_layer != NULL)
@@ -405,7 +441,7 @@ static void __idr_remove_all_with_free(struct idr *idp, bool free)
         if (layer > 0 && cur_layer->bitmap) // 非叶子节点
         {
             stk[layer] = cur_layer; // 入栈
-            int id = __lowbit_id(cur_layer->bitmap);
+            int64_t id = __lowbit_id(cur_layer->bitmap);
 
             cur_layer->bitmap ^= (1ull << id);
             cur_layer = cur_layer->ary[id];
@@ -482,19 +518,27 @@ void idr_destroy(struct idr *idp)
  */
 void *idr_find(struct idr *idp, int id)
 {
-    if (unlikely(idp->top == NULL || id < 0))
+    int64_t __id = (int64_t)id;
+    if (unlikely(idp->top == NULL || __id < 0))
+    {
+        // kwarn("idr-find: idp->top == NULL || id < 0.");
         return NULL;
+    }
 
     struct idr_layer *cur_layer = idp->top;
     int layer = cur_layer->layer; // 特判NULL
-
+    barrier();
     // 如果查询的ID的bit数量比layer*IDR_BITS还大, 直接返回NULL
-    if ((id >> ((layer + 1) * IDR_BITS)) > 0)
+    if ((__id >> ((layer + 1) * IDR_BITS)) > 0)
         return NULL;
-
-    while (layer >= 0 && cur_layer)
+    barrier();
+    barrier();
+    int64_t layer_id = 0;
+    while (layer >= 0 && cur_layer != NULL)
     {
-        int layer_id = (id >> (IDR_BITS * layer)) & IDR_MASK;
+        barrier();
+        layer_id = (__id >> (IDR_BITS * layer)) & IDR_MASK;
+        barrier();
         cur_layer = cur_layer->ary[layer_id];
         --layer;
     }
@@ -508,10 +552,12 @@ void *idr_find(struct idr *idp, int id)
  * @param idp
  * @param start_id
  * @param nextid
- * @return void*
+ * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意，
+ * 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
  */
-void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
+void *idr_find_next_getid(struct idr *idp, int64_t start_id, int *nextid)
 {
+    BUG_ON(nextid == NULL);
     if (unlikely(idp->top == NULL))
     {
         *nextid = -1;
@@ -522,16 +568,20 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
     start_id = max(0, start_id); // 特判负数
     *nextid = 0;
 
-    struct idr_layer *stk[MAX_LEVEL + 1];
-    bool state[MAX_LEVEL + 1]; // 标记是否大于等于]
-    int pos_i[MAX_LEVEL + 1];
+    struct idr_layer *stk[MAX_LEVEL + 1] = {0};
 
-    memset(pos_i, 0, sizeof(pos_i)); // 必须清空
+    // memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
+    bool state[MAX_LEVEL + 1] = {0}; // 标记是否大于等于]
+    int pos_i[MAX_LEVEL + 1] = {0};
+
+    // memset(state, 0, sizeof(state));
+    // memset(pos_i, 0, sizeof(pos_i)); // 必须清空
 
     struct idr_layer *cur_layer = idp->top;
     bool cur_state = false;
     bool init_flag = true;
     int layer = cur_layer->layer;
+    BUG_ON(layer + 1 >= 7);
     stk[layer + 1] = NULL; // 标记数组结尾
 
     // 如果查询的ID的bit数量比layer*IDR_BITS还大, 直接返回NULL
@@ -543,6 +593,7 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
 
     while (cur_layer) // layer < top->layer + 1
     {
+        BUG_ON(layer < 0);
         if (init_flag) // 第一次入栈
         {
             stk[layer] = cur_layer;
@@ -555,13 +606,14 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
             state[layer] = cur_state = true;
         }
 
+        BUG_ON(pos_i[layer] >= 64);
         unsigned long t_bitmap = (cur_layer->bitmap >> pos_i[layer]);
         if (t_bitmap) // 进一步递归到儿子下面去
         {
-            int layer_id = __lowbit_id(t_bitmap) + pos_i[layer];
+            int64_t layer_id = __lowbit_id(t_bitmap) + pos_i[layer];
 
             // 特别情况
-            if (NULL == cur_state && layer_id > pos_i[layer] > 0)
+            if ((cur_state == false) && (layer_id > pos_i[layer] > 0))
                 cur_state = true;
 
             pos_i[layer] = layer_id;
@@ -596,7 +648,8 @@ void *idr_find_next_getid(struct idr *idp, int start_id, int *nextid)
  *
  * @param idp
  * @param start_id
- * @return void*
+ * @return void* (如果分配,将返回该ID对应的数据指针; 否则返回NULL。注意，
+ * 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
  */
 void *idr_find_next(struct idr *idp, int start_id)
 {
@@ -617,21 +670,26 @@ void *idr_find_next(struct idr *idp, int start_id)
  */
 int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
 {
+    int64_t __id = (int64_t)id;
+    if (unlikely(old_ptr == NULL))
+    {
+        BUG_ON(1);
+        return -EINVAL;
+    }
     *old_ptr = NULL;
 
-    if (unlikely(idp->top == NULL || id < 0))
+    if (unlikely(idp->top == NULL || __id < 0))
         return -EDOM; // 参数错误
 
     struct idr_layer *cur_layer = idp->top;
-    int layer = cur_layer->layer;
-
+    int64_t layer = cur_layer->layer;
     // 如果查询的ID的bit数量比layer*IDR_BITS还大, 直接返回NULL
-    if ((id >> ((layer + 1) * IDR_BITS)) > 0)
+    if ((__id >> ((layer + 1) * IDR_BITS)) > 0)
         return -EDOM;
 
     while (layer > 0)
     {
-        int layer_id = (id >> (layer * IDR_BITS)) & IDR_MASK;
+        int64_t layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
 
         if (unlikely(NULL == cur_layer->ary[layer_id]))
             return -ENOMEM;
@@ -640,9 +698,9 @@ int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
         layer--;
     }
 
-    id &= IDR_MASK;
-    *old_ptr = cur_layer->ary[id];
-    cur_layer->ary[id] = ptr;
+    __id &= IDR_MASK;
+    *old_ptr = cur_layer->ary[__id];
+    cur_layer->ary[__id] = ptr;
 
     return 0;
 }
@@ -657,14 +715,101 @@ int idr_replace_get_old(struct idr *idp, void *ptr, int id, void **old_ptr)
  */
 int idr_replace(struct idr *idp, void *ptr, int id)
 {
-    if (id < 0)
+    int64_t __id = (int64_t)id;
+    if (__id < 0)
         return -EDOM;
 
     void *old_ptr;
-    int flags = idr_replace_get_old(idp, ptr, id, &old_ptr);
+    int flags = idr_replace_get_old(idp, ptr, __id, &old_ptr);
 
     return flags;
 }
+
+/**
+ * @brief 判断一个idr是否为空
+ *
+ * @param idp
+ * @return true
+ * @return false
+ */
+bool idr_empty(struct idr *idp)
+{
+    if (idp == NULL || idp->top == NULL || !idp->top->bitmap)
+        return true;
+
+    return false;
+}
+
+static bool __idr_cnt_pd(struct idr_layer *cur_layer, int layer_id)
+{
+    // if(layer_id)
+    unsigned long flags = ((cur_layer->bitmap) >> layer_id);
+    if ((flags % 2) == 0)
+    {
+        barrier();
+        return false; // 没有这一个儿子
+    }
+    return true;
+}
+
+static bool __idr_cnt(int layer, int id, struct idr_layer *cur_layer)
+{
+    int64_t __id = (int64_t)id;
+    while (layer >= 0) // 提取路径
+    {
+        barrier();
+
+        int64_t layer_id = (__id >> (layer * IDR_BITS)) & IDR_MASK;
+
+        barrier();
+
+        if (__idr_cnt_pd(cur_layer, layer_id) == false)
+            return false;
+
+        barrier();
+
+        barrier();
+        cur_layer = cur_layer->ary[layer_id];
+
+        barrier();
+        --layer;
+    }
+    return true;
+}
+
+/**
+ * @brief 这个函数是可以用于判断一个ID是否已经被分配的。
+ *
+ * @param idp
+ * @param id
+ * @return true
+ * @return false
+ */
+bool idr_count(struct idr *idp, int id)
+{
+    int64_t __id = (int64_t)id;
+    barrier();
+    if (unlikely(idp == NULL || idp->top == NULL || __id < 0))
+        return false;
+
+    barrier();
+    struct idr_layer *cur_layer = idp->top;
+    barrier();
+    int layer = cur_layer->layer;
+
+    // 如果查询的ID的bit数量比 layer*IDR_BITS 还大, 直接返回false
+    if (unlikely((__id >> ((layer + 1ull) * IDR_BITS)) > 0))
+    {
+        BUG_ON(1);
+        return false;
+    }
+    barrier();
+
+    return __idr_cnt(layer, id, cur_layer);
+}
+
+/********* ****************************************** ida - idr 函数实现分割线
+ * **********************************************************/
 
 /**
  * @brief 初始化IDA, 你需要保证调用函数之前, ida的free_list为空, 否则会导致内存泄漏
@@ -692,9 +837,9 @@ static void __ida_bitmap_free(struct ida_bitmap *bitmap)
  * @param gfp_mask
  * @return int (如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够)
  */
-int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
+int ida_preload(struct ida *ida_p, gfp_t gfp_mask)
 {
-    if (idr_pre_get(&ida_p->idr, gfp_mask) != 0)
+    if (idr_preload(&ida_p->idr, gfp_mask) != 0)
         return -ENOMEM;
 
     spin_lock(&ida_p->idr.lock);
@@ -724,8 +869,11 @@ int ida_pre_get(struct ida *ida_p, gfp_t gfp_mask)
 static void *__get_ida_bitmap(struct ida *ida_p, gfp_t gfp_mask)
 {
     if (NULL == ida_p->free_list)
-        if (ida_pre_get(ida_p, gfp_mask) < 0)
+        if (ida_preload(ida_p, gfp_mask) < 0)
+        {
+            kBUG("error : no memory.");
             return NULL;
+        }
 
     struct ida_bitmap *tmp = ida_p->free_list;
     ida_p->free_list = NULL;
@@ -749,7 +897,8 @@ static int __get_id_from_bitmap(struct ida_bitmap *bmp)
 
             if (unlikely((unsigned long long)ary_id * IDA_BMP_SIZE + bmp_id > INT32_MAX))
             {
-                kBUG("ida设置id范围为[0, INT32_MAX], 但ida获取的id数值超过INT32_MAX.");
+                BUG_ON(1);
+                // kBUG("ida设置id范围为[0, INT32_MAX], 但ida获取的id数值超过INT32_MAX.");
                 return -EDOM;
             }
 
@@ -767,13 +916,17 @@ static int __get_id_from_bitmap(struct ida_bitmap *bmp)
  * @param p_id
  * @return int (0表示获取ID成功， 否则是负数 - 错误码)
  */
-int ida_get_new(struct ida *ida_p, int *p_id)
+int ida_alloc(struct ida *ida_p, int *p_id)
 {
+    BUG_ON(p_id == NULL);
     *p_id = -1;
 
-    struct idr_layer *stk[MAX_LEVEL + 1]; // 你可以选择memset(0)
-    memset(stk, 0, sizeof(stk));
-    int idr_id = __idr_get_empty_slot(&ida_p->idr, stk);
+    struct idr_layer *stk[MAX_LEVEL + 1] = {0}; // 你可以选择memset(0)
+
+    // memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
+
+    io_sfence();
+    int64_t idr_id = __idr_get_empty_slot(&ida_p->idr, stk);
 
     // 如果stk[0]=NULL,可能是idr内部出错/内存空间不够
     if (unlikely(NULL == stk[0]))
@@ -782,7 +935,7 @@ int ida_get_new(struct ida *ida_p, int *p_id)
     if (unlikely(idr_id < 0))
         return idr_id;
 
-    int layer_id = idr_id & IDR_MASK;
+    int64_t layer_id = idr_id & IDR_MASK;
 
     if (NULL == stk[0]->ary[layer_id])
         stk[0]->ary[layer_id] = __get_ida_bitmap(ida_p, 0);
@@ -812,12 +965,13 @@ int ida_get_new(struct ida *ida_p, int *p_id)
  */
 bool ida_count(struct ida *ida_p, int id)
 {
+    int64_t __id = (int64_t)id;
     if (unlikely(NULL == ida_p || NULL == ida_p->idr.top || id < 0))
         return false;
 
-    int idr_id = id / IDA_BITMAP_BITS;
-    int ary_id = (id % IDA_BITMAP_BITS) / IDA_BMP_SIZE;
-    int bmp_id = (id % IDA_BITMAP_BITS) % IDA_BMP_SIZE;
+    int idr_id = __id / IDA_BITMAP_BITS;
+    int ary_id = (__id % IDA_BITMAP_BITS) / IDA_BMP_SIZE;
+    int bmp_id = (__id % IDA_BITMAP_BITS) % IDA_BMP_SIZE;
 
     struct ida_bitmap *bmp = idr_find(&ida_p->idr, idr_id);
     if (NULL == bmp)
@@ -834,19 +988,21 @@ bool ida_count(struct ida *ida_p, int id)
  */
 void ida_remove(struct ida *ida_p, int id)
 {
+    int64_t __id = (int64_t)id;
     if (unlikely(NULL == ida_p || NULL == ida_p->idr.top || id < 0))
         return;
 
-    int idr_id = id / IDA_BITMAP_BITS;
-    int ary_id = (id % IDA_BITMAP_BITS) / IDA_BMP_SIZE;
-    int bmp_id = (id % IDA_BITMAP_BITS) % IDA_BMP_SIZE;
+    int64_t idr_id = __id / IDA_BITMAP_BITS;
+    int64_t ary_id = (__id % IDA_BITMAP_BITS) / IDA_BMP_SIZE;
+    int64_t bmp_id = (__id % IDA_BITMAP_BITS) % IDA_BMP_SIZE;
 
-    struct idr_layer *stk[MAX_LEVEL + 1];
-    memset(stk, 0, sizeof(stk));
+    struct idr_layer *stk[MAX_LEVEL + 1] = {0};
+    // memset(stk, 0, sizeof(struct idr_layer *) * (MAX_LEVEL + 1));
+
     if (0 == __idr_get_path(&ida_p->idr, idr_id, stk))
         return;
 
-    struct ida_bitmap *b_p = (struct ida_bitmap *)stk[0]->ary[idr_id & IDR_MASK];
+    struct ida_bitmap *b_p = (struct ida_bitmap *)(stk[0]->ary[idr_id & IDR_MASK]);
 
     // 不存在这个ID 或者 b_p == NULL
     if (unlikely(NULL == b_p || 0 == ((b_p->bitmap[ary_id] >> bmp_id) & 1)))
@@ -871,10 +1027,28 @@ void ida_remove(struct ida *ida_p, int id)
 void ida_destroy(struct ida *ida_p)
 {
     if (unlikely(ida_p == NULL))
+    {
+        BUG_ON(1);
         return;
+    }
 
     __idr_destroy_with_free(&ida_p->idr);
     ida_p->idr.top = NULL;
     __ida_bitmap_free(ida_p->free_list);
     ida_p->free_list = NULL;
+}
+
+/**
+ * @brief 判断一个ida是否为空
+ *
+ * @param ida_p
+ * @return true
+ * @return false
+ */
+bool ida_empty(struct ida *ida_p)
+{
+    if (ida_p == NULL || ida_p->idr.top == NULL || !ida_p->idr.top->bitmap)
+        return true;
+
+    return false;
 }

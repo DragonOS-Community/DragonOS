@@ -40,6 +40,14 @@
  * Select how default compression functions will allocate memory for their hash table,
  * in memory stack (0:default, fastest), or in memory heap (1:requires malloc()).
  */
+#include<arch/arch.h>
+
+#if ARCH(I386) || ARCH(X86_64)
+#include <arch/x86_64/math/bitcount.h>
+#else
+#error Arch not supported.
+#endif
+
 #ifndef LZ4_HEAPMODE
 #define LZ4_HEAPMODE 0
 #endif
@@ -589,7 +597,7 @@ static unsigned LZ4_NbCommonBytes(reg_t val)
 #if (defined(__clang__) || (defined(__GNUC__) && ((__GNUC__ > 3) ||                                \
                                                   ((__GNUC__ == 3) && (__GNUC_MINOR__ >= 4))))) && \
     !defined(__TINYC__) && !defined(LZ4_FORCE_SW_BITCOUNT)
-            return (unsigned)__builtin_clzll((U64)val) >> 3;
+            return (unsigned)__clzll((U64)val) >> 3;
 #else
 #if 1
             /* this method is probably faster,
@@ -763,7 +771,7 @@ static unsigned LZ4_NbCommonBytes(reg_t val)
 #if (defined(__clang__) || (defined(__GNUC__) && ((__GNUC__ > 3) ||                                \
                                                   ((__GNUC__ == 3) && (__GNUC_MINOR__ >= 4))))) && \
     !defined(LZ4_FORCE_SW_BITCOUNT)
-            return (unsigned)__builtin_clz((U32)val) >> 3;
+            return (unsigned)__clz((U32)val) >> 3;
 #else
             val >>= 8;
             val = ((((val + 0x00FFFF00) | 0x00FFFFFF) + val) |

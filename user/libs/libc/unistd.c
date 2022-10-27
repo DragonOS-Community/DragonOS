@@ -4,6 +4,7 @@
 #include <libc/stdio.h>
 #include <libc/stddef.h>
 #include <libc/string.h>
+#include <libc/fcntl.h>
 
 /**
  * @brief 关闭文件接口
@@ -157,7 +158,7 @@ int execv(const char *path, char *const argv[])
  */
 int rmdir(const char *path)
 {
-    return syscall_invoke(SYS_RMDIR, (uint64_t)path, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_UNLINK_AT, 0, (uint64_t)path, AT_REMOVEDIR, 0, 0, 0, 0, 0);
 }
 
 /**

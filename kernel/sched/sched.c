@@ -3,15 +3,16 @@
 #include <common/spinlock.h>
 #include <driver/video/video.h>
 #include <sched/cfs.h>
+#include <common/string.h>
 
 /**
- * @brief 
- * 
+ * @brief
+ *
  * @param p pcb
  * @param attr 调度属性
  * @param user 请求是否来自用户态
- * @param pi 
- * @return int 
+ * @param pi
+ * @return int
  */
 static int __sched_setscheduler(struct process_control_block *p, const struct sched_attr *attr, bool user, bool pi)
 {
@@ -72,12 +73,28 @@ void sched_init()
     sched_cfs_init();
 }
 
-// /**
-//  * @brief 给pcb的comm字段赋值
-//  * 
-//  * @param 
-//  */
-// void sched_set_pcb_comm(struct process_contral_block* pcb,char* name)
-// {
+/**
+ * @brief 给pcb设置名字
+ *
+ * @param pcb 需要设置名字的pcb
+ * @param pcb_name 保存名字的char数组
+ */
+void __set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
+{
+    spinlock_t sp_lock;
+    spin_init(&sp_lock);
+    spin_lock(&sp_lock);
+    strncpy(pcb->name, pcb_name, sizeof(pcb->name));
+    spin_unlock(&sp_lock);
+}
 
-// }
+/**
+ * @brief 给pcb设置名字
+ *
+ * @param pcb 需要设置名字的pcb
+ * @param pcb_name 保存名字的char数组
+ */
+static inline void set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
+{
+    __set_pcb_name(pcb, pcb_name);
+}

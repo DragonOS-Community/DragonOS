@@ -15,7 +15,11 @@
 #define SCHED_DEADLINE 6
 #define SCHED_MAX_POLICY_NUM SCHED_DEADLINE
 
+/*pcb名字长度*/
+#define PCB_NAME_LEN 16
+
 #define IS_VALID_SCHED_POLICY(_policy) ((_policy) > 0 && (_policy) <= SCHED_MAX_POLICY_NUM)
+
 
 struct sched_param
 {
@@ -43,6 +47,23 @@ struct sched_attr
     uint32_t sched_util_min;
     uint32_t sched_util_max;
 };
+
+/**
+ * @brief 给pcb设置名字
+ * 
+ * @param pcb 需要设置名字的pcb
+ * @param pcb_name 保存名字的char数组
+ * @param exec 
+ */
+void __set_pcb_name(struct process_control_block *pcb, const char *pcb_name);
+
+/**
+ * @brief 给pcb设置名字
+ *
+ * @param pcb 需要设置名字的pcb
+ * @param pcb_name 保存名字的char数组
+ */
+static inline void set_pcb_name(struct process_control_block *pcb, const char *pcb_name);
 
 static int __sched_setscheduler(struct process_control_block *p, const struct sched_attr *attr, bool user, bool pi);
 static int _sched_setscheduler(struct process_control_block *p, int policy, const struct sched_param *param,
@@ -76,10 +97,3 @@ void sched_init();
  *
  */
 void sched_update_jiffies();
-
-// /**
-//  * @brief 给pcb的comm字段赋值
-//  * 
-//  * @param 
-//  */
-// void sched_set_pcb_name(struct process_contral_block* pcb,char* name);

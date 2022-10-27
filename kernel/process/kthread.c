@@ -8,7 +8,7 @@
 static spinlock_t __kthread_create_lock;           // kthread创建过程的锁
 static struct List kthread_create_list;            // kthread创建任务的链表
 struct process_control_block *kthreadd_pcb = NULL; // kthreadd守护线程的pcb
-#define TASK_COMM_LEN 16
+#define PCB_NAME_LEN 16
 
 // 枚举各个标志位是在第几位
 enum KTHREAD_BITS
@@ -97,18 +97,20 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
     if (!IS_ERR(create->result))
     {
         // todo: 为内核线程设置名字
-        char name[TASK_COMM_LEN];
+        char name[PCB_NAME_LEN];
         va_list get_args;
-        va_copy(get_args,args);
-        int len = vsprintf(name,name_fmt,get_args);
+        va_copy(get_args, args);
+        int len = vsprintf(name, name_fmt, get_args);
         va_end(get_args);
-        if(len >= TASK_COMM_LEN)
+        if (len >= PCB_NAME_LEN)
         {
-            struct kthread_info_t* kthread = to_kthread(pcb);
-            //?
-            // kthread->full_name = 
+            //名字过大 放到full_name字段中
+            struct kthread_info_t *kthread = to_kthread(pcb);
+            char *full_name;
+            vsprintf(full_name, name_fmt, get_args);
+            kthread->full_name = full_name;
         }
-        set_pcb_comm(pcb,name);
+        set_pcb_name(pcb, name);
     }
 
     kfree(create);
@@ -184,7 +186,7 @@ static int kthread(void *_create)
     // 将当前pcb返回给创建者
     create->result = current_pcb;
 
-    current_pcb->state &= ~PROC_RUNNING;    // 设置当前进程不是RUNNING态
+    current_pcb->state &= ~PROC_RUNNING; // 设置当前进程不是RUNNING态
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
     sched();
 

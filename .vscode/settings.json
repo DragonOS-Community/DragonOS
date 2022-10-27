@@ -148,7 +148,11 @@
         "timer.h": "c",
         "hid.h": "c",
         "cfs.h": "c",
-        "rtc.h": "c"
+        "rtc.h": "c",
+        "wait_queue_head.h": "c",
+        "list.h": "c",
+        "compiler.h": "c",
+        "completion.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

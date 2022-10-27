@@ -18,14 +18,14 @@ void completion_init(struct completion *x)
  */
 void complete(struct completion *x)
 {
-    unsigned long flags;
-    spin_lock_irqsave(&x->wait_queue.lock, flags);
+
+    spin_lock(&x->wait_queue.lock);
 
     if (x->done != COMPLETE_ALL)
         ++(x->done);
     wait_queue_wakeup_on_stack(&x->wait_queue, -1UL); // -1UL代表所有节点都满足条件,暂时这么写
 
-    spin_unlock_irqrestore(&x->wait_queue.lock, flags);
+    spin_unlock(&x->wait_queue.lock);
 }
 
 /**
@@ -35,14 +35,13 @@ void complete(struct completion *x)
  */
 void complete_all(struct completion *x)
 {
-    unsigned long flags;
-    spin_lock_irqsave(&x->wait_queue.lock, flags);
+    spin_lock(&x->wait_queue.lock);
 
     x->done = COMPLETE_ALL; // 永久赋值
     while (!list_empty(&x->wait_queue.wait_list))
         wait_queue_wakeup_on_stack(&x->wait_queue, -1UL); // -1UL代表所有节点都满足条件,暂时这么写
 
-    spin_unlock_irqrestore(&x->wait_queue.lock, flags);
+    spin_unlock(&x->wait_queue.lock);
 }
 
 /**
@@ -79,7 +78,6 @@ static long __wait_for_common(struct completion *x, long (*action)(long), long t
 
             spin_unlock(&x->wait_queue.lock);
 
-            // 通过定时器? 干了什么?
             timeout = action(timeout);
             spin_lock(&x->wait_queue.lock);
         }
@@ -116,7 +114,7 @@ void wait_for_completion(struct completion *x)
  */
 long wait_for_completion_timeout(struct completion *x, long timeout)
 {
-    BUG_ON(unlikely(timeout < 0));
+    BUG_ON(timeout < 0);
     spin_lock(&x->wait_queue.lock);
     timeout = __wait_for_common(x, &schedule_timeout_ms, timeout, PROC_UNINTERRUPTIBLE);
     spin_unlock(&x->wait_queue.lock);
@@ -144,7 +142,7 @@ void wait_for_completion_interruptible(struct completion *x)
  */
 long wait_for_completion_interruptible_timeout(struct completion *x, long timeout)
 {
-    BUG_ON(unlikely(timeout < 0));
+    BUG_ON(timeout < 0);
 
     spin_lock(&x->wait_queue.lock);
     timeout = __wait_for_common(x, &schedule_timeout_ms, timeout, PROC_INTERRUPTIBLE);
@@ -165,15 +163,14 @@ bool try_wait_for_completion(struct completion *x)
         return false;
 
     bool ret = true;
-    unsigned long flags;
-    spin_lock_irqsave(&x->wait_queue.lock, flags);
+    spin_lock(&x->wait_queue.lock);
 
     if (!x->done)
         ret = false;
     else if (x->done != COMPLETE_ALL)
         --(x->done);
 
-    spin_unlock_irqrestore(&x->wait_queue.lock, flags);
+    spin_unlock(&x->wait_queue.lock);
     return ret;
 }
 
@@ -186,14 +183,19 @@ bool try_wait_for_completion(struct completion *x)
  */
 bool completion_done(struct completion *x)
 {
-    unsigned long flags;
 
     if (!READ_ONCE(x->done))
         return false;
 
     // 这里的意义是: 如果是多线程的情况下，您有可能需要等待另一个进程的complete操作, 才算真正意义上的completed!
-    spin_lock_irqsave(&x->wait_queue.lock, flags);
-    spin_unlock_irqrestore(&x->wait_queue.lock, flags);
+    spin_lock(&x->wait_queue.lock);
+
+    if (!READ_ONCE(x->done))
+    {
+        spin_unlock(&x->wait_queue.lock);
+        return false;
+    }
+    spin_unlock(&x->wait_queue.lock);
     return true;
 }
 
@@ -264,7 +266,9 @@ int __test_completion_worker(void *input_data)
         wait_for_completion(data->one_to_many);
     }
 
-    schedule_timeout_ms(100);
+    schedule_timeout_ms(5000);
+    // for(uint64_t i=0;i<1e7;++i)
+    //     pause();
     complete(data->one_to_one);
 
     // 完成上面两个等待, 执行complete声明自己已经完成

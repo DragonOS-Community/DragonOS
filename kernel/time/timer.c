@@ -138,11 +138,11 @@ uint64_t clock()
  *
  * @param pcb process_control_block
  */
-static void __wake_up_helper(struct process_control_block *pcb)
+static void __wake_up_helper(void *pcb)
 {
     BUG_ON(pcb == NULL);
 
-    BUG_ON(process_wakeup(pcb) != 0); // 正常唤醒,返回值为0
+    BUG_ON(process_wakeup((struct process_control_block *)pcb) != 0); // 正常唤醒,返回值为0
 }
 
 /**
@@ -165,11 +165,12 @@ long schedule_timeout_ms(long timeout)
     }
 
     spin_lock(&sched_lock);
-    struct timer_func_list_t timer; 
+    struct timer_func_list_t timer={0}; 
     timer_func_init(&timer, &__wake_up_helper, current_pcb, timeout);
     timer_func_add(&timer);
-    sched();
+    current_pcb->state &= ~(PROC_RUNNING);
     spin_unlock(&sched_lock);
+    sched();
 
     timeout -= timer_jiffies;
 

@@ -172,6 +172,7 @@ static int kthread(void *_create)
     create->result = current_pcb;
 
     current_pcb->state &= ~PROC_RUNNING;    // 设置当前进程不是RUNNING态
+    io_mfence();
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
     sched();
 
@@ -187,6 +188,7 @@ static int kthread(void *_create)
 static void __create_kthread(struct kthread_create_info_t *create)
 {
     pid_t pid = kernel_thread(kthread, create, CLONE_FS | CLONE_SIGNAL);
+    io_mfence();
     if (IS_ERR((void *)pid))
     {
         // todo: 使用complete机制完善这里

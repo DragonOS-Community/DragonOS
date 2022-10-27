@@ -1,6 +1,6 @@
-
-
 #include <common/wait_queue_head.h>
+#include <process/process.h>
+#include <sched/sched.h>
 
 /**
  * @brief 初始化等待队列

@@ -135,8 +135,10 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
+                         : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
+                         : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -509,6 +511,8 @@ ul initial_kernel_thread(ul arg)
     // 等待测试进程退出
     for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
         waitpid(tpid[i], NULL, NULL);
+    kdebug("test thread name");
+    // kthread_run(NULL, NULL, "my %s %d", "name", 11);
     kinfo("All test done.");
 
     // 准备切换到用户态

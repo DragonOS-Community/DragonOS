@@ -75,3 +75,5 @@ int kthread_mechanism_init();
  * @return bool 成功或失败
  */
 bool kthread_set_worker_private(struct process_control_block *pcb);
+
+void test_kthread();

@@ -34,6 +34,8 @@
 #define CLONE_SIGNAL (1UL << 1)
 #define CLONE_VM (1UL << 2) // 在进程间共享虚拟内存空间
 
+#define PCB_NAME_LEN 16
+
 struct thread_struct
 {
     // 内核层栈基指针
@@ -106,6 +108,8 @@ struct process_control_block
 
     /* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
     void *worker_private;
+
+    char name [PCB_NAME_LEN];
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

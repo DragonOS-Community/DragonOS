@@ -99,18 +99,22 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
         char pcb_name[PCB_NAME_LEN];
         va_list get_args;
         va_copy(get_args, args);
-        int len = vsprintf(pcb_name, name_fmt, get_args);
+        //获取到字符串的前16字节
+        int len = vsnprintf(pcb_name, name_fmt,PCB_NAME_LEN, get_args);
         va_end(get_args);
         if (len >= PCB_NAME_LEN)
         {
             //名字过大 放到full_name字段中
             struct kthread_info_t *kthread = to_kthread(pcb);
-            char *full_name;
+            char *full_name = kmalloc(PCB_NAME_LEN,__GFP_ZERO);
             vsprintf(full_name, name_fmt, get_args);
             kthread->full_name = full_name;
+            // kdebug("kthread:%s", kthread->full_name);
         }
+        //将前16Bytes放到pcb的name字段
         set_pcb_name(pcb, pcb_name);
-        kdebug("pcb:%s,name:%s",pcb->name,pcb_name);
+        // kdebug("len:%d", len);
+        // kdebug("pcb:%s,name:%s", pcb->name, pcb_name);
     }
 
     kfree(create);

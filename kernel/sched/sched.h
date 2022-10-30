@@ -77,19 +77,3 @@ void sched_init();
  */
 void sched_update_jiffies();
 
-/**
- * @brief 给pcb设置名字
- * 
- * @param pcb 需要设置名字的pcb
- * @param pcb_name 保存名字的char数组
- * @param exec 
- */
-void __set_pcb_name(struct process_control_block *pcb, const char *pcb_name);
-
-/**
- * @brief 给pcb设置名字
- *
- * @param pcb 需要设置名字的pcb
- * @param pcb_name 保存名字的char数组
- */
-void set_pcb_name(struct process_control_block *pcb, const char *pcb_name);

@@ -222,3 +222,11 @@ extern struct mm_struct initial_mm;
 extern struct thread_struct initial_thread;
 extern union proc_union initial_proc_union;
 extern struct process_control_block *initial_proc[MAX_CPU_NUM];
+
+/**
+ * @brief 给pcb设置名字
+ *
+ * @param pcb 需要设置名字的pcb
+ * @param pcb_name 保存名字的char数组
+ */
+void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name);

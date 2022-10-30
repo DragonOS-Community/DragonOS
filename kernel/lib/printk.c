@@ -51,7 +51,7 @@ static int skip_and_atoi(const char **s)
  * @param buf_size buf_size为-1时，不指定buf的大小，否则buf大小为buf_size
  * @return 最终字符串的长度
  */
-int __do_vsprintf(char *buf, const char *fmt, int buf_size, va_list args)
+static int __do_vsprintf(char *buf, const char *fmt, int buf_size, va_list args)
 {
 
     // 当需要输出的字符串的指针为空时，使用该字符填充目标字符串的指针
@@ -341,7 +341,7 @@ int __do_vsprintf(char *buf, const char *fmt, int buf_size, va_list args)
         }
         else
         {
-            end[-1] = '\0';
+            *(end-1) = '\0';
         }
         return buf_size;
     }

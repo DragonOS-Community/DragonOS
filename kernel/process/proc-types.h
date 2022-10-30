@@ -86,6 +86,10 @@ struct process_control_block
     // 连接各个pcb的双向链表
     struct List list;
 
+    //todo:给pcb中加一个spinlock_t成员
+    //进程自旋锁
+    // spinlock_t alloc_lock;
+
     // 地址空间范围
     // 用户空间： 0x0000 0000 0000 0000 ~ 0x0000 7fff ffff ffff
     // 内核空间： 0xffff 8000 0000 0000 ~ 0xffff ffff ffff ffff

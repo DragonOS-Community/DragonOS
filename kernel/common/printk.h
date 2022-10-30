@@ -38,17 +38,6 @@
 
 extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中
 
-/**
- * @brief 将字符串按照fmt和args中的内容进行格式化，当buf_size为-1时，字符串直接保存到buf中
- * 否则将字符串前buf_size-1个字符放入，大小为buf_size的buf数组中
- *
- * @param buf 结果缓冲区
- * @param fmt 格式化字符串
- * @param args 内容
- * @param buf_size buf_size为-1时，不指定buf的大小，否则buf大小为buf_size
- * @return 最终字符串的长度
- */
-int __do_vsprintf(char *buf, const char *fmt, int buf_size, va_list args);
 
 /**
  * @brief 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中

@@ -3,15 +3,15 @@
 #include <common/spinlock.h>
 #include <driver/video/video.h>
 #include <sched/cfs.h>
-
+#include <common/string.h>
 /**
- * @brief 
- * 
+ * @brief
+ *
  * @param p pcb
  * @param attr 调度属性
  * @param user 请求是否来自用户态
- * @param pi 
- * @return int 
+ * @param pi
+ * @return int
  */
 static int __sched_setscheduler(struct process_control_block *p, const struct sched_attr *attr, bool user, bool pi)
 {
@@ -71,3 +71,6 @@ void sched_init()
 {
     sched_cfs_init();
 }
+
+
+

@@ -5,6 +5,22 @@
 #include <common/err.h>
 #include <process/process.h>
 
+/**
+ * @brief kthread信息
+ * 该结构体将会绑定到pcb的worker_private中
+ */
+struct kthread_info_t
+{
+    uint64_t flags;
+    uint32_t cpu;
+    int result;
+    int (*thread_fn)(void *);
+    void *data;
+    // todo: 将这里改为completion机制
+    bool exited;     // 是否已退出
+    char *full_name; // 内核线程的名称
+};
+
 struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data),
                                                      void *data,
                                                      int node,
@@ -75,3 +91,4 @@ int kthread_mechanism_init();
  * @return bool 成功或失败
  */
 bool kthread_set_worker_private(struct process_control_block *pcb);
+

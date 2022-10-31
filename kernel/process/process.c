@@ -1259,3 +1259,28 @@ int process_fd_alloc(struct vfs_file_t *file)
     }
     return fd_num;
 }
+
+/**
+ * @brief 给pcb设置名字
+ *
+ * @param pcb 需要设置名字的pcb
+ * @param pcb_name 保存名字的char数组
+ */
+static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
+{
+    //todo:给pcb加锁
+    // spin_lock(&pcb->alloc_lock);
+    strncpy(pcb->name,pcb_name,PCB_NAME_LEN);
+    // spin_unlock(&pcb->alloc_lock);
+}
+
+/**
+ * @brief 给pcb设置名字
+ *
+ * @param pcb 需要设置名字的pcb
+ * @param pcb_name 保存名字的char数组
+ */
+void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
+{
+    __set_pcb_name(pcb, pcb_name);
+}

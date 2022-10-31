@@ -42,18 +42,22 @@ static int skip_and_atoi(const char **s)
 }
 
 /**
- * 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
+ * @brief 将字符串按照fmt和args中的内容进行格式化，当buf_size为-1时，字符串直接保存到buf中
+ * 否则将字符串前buf_size-1个字符放入，大小为buf_size的buf数组中
+ *
  * @param buf 结果缓冲区
  * @param fmt 格式化字符串
  * @param args 内容
+ * @param buf_size buf_size为-1时，不指定buf的大小，否则buf大小为buf_size
  * @return 最终字符串的长度
  */
-int vsprintf(char *buf, const char *fmt, va_list args)
+static int __do_vsprintf(char *buf, const char *fmt, int buf_size, va_list args)
 {
+
     // 当需要输出的字符串的指针为空时，使用该字符填充目标字符串的指针
     static const char __end_zero_char = '\0';
 
-    char *str = NULL, *s = NULL;
+    char *str = NULL, *s = NULL, *end = NULL;
 
     str = buf;
 
@@ -63,6 +67,10 @@ int vsprintf(char *buf, const char *fmt, va_list args)
     int qualifier;   //数据显示的类型
     int len;
 
+    if (buf_size != -1)
+    {
+        end = buf + buf_size;
+    }
     //开始解析字符串
     for (; *fmt; ++fmt)
     {
@@ -324,10 +332,52 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             break;
         }
     }
-    *str = '\0';
+    //实现vsnprintf 的功能
+    if (buf_size > 0)
+    {
+        if (str < end)
+        {
+            *str = '\0';
+        }
+        else
+        {
+            *(end-1) = '\0';
+        }
+        return buf_size;
+    }
+    else
+    {
+        *str = '\0';
+    }
 
     //返回缓冲区已有字符串的长度。
     return str - buf;
+}
+
+/**
+ * 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
+ * @param buf 结果缓冲区
+ * @param fmt 格式化字符串
+ * @param args 内容
+ * @return 最终字符串的长度
+ */
+int vsprintf(char *buf, const char *fmt, va_list args)
+{
+    return __do_vsprintf(buf, fmt, -1, args);
+}
+
+/**
+ * @brief 将字符串按照fmt和args中的内容进行格式化，截取字符串前buf_size-1，保存到buf中
+ *
+ * @param buf 结果缓冲区，大小为buf_size
+ * @param fmt 格式化字符串
+ * @param buf_size 缓冲区长度
+ * @param args 内容
+ * @return 最终字符串的长度
+ */
+int vsnprintf(char *buf, const char *fmt, int buf_size, va_list args)
+{
+    return __do_vsprintf(buf, fmt, buf_size, args);
 }
 
 static char *write_num(char *str, ul num, int base, int field_width, int precision, int flags)
@@ -477,8 +527,8 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
     if (sign)
         --field_width;
 
-    int js_num_z = 0, js_num_d = 0;   // 临时数字字符串tmp_num_z tmp_num_d的长度
-    uint64_t num_z = (uint64_t)(num); // 获取整数部分
+    int js_num_z = 0, js_num_d = 0;                                                     // 临时数字字符串tmp_num_z tmp_num_d的长度
+    uint64_t num_z = (uint64_t)(num);                                                   // 获取整数部分
     uint64_t num_decimal = (uint64_t)(round(1.0 * (num - num_z) * pow(10, precision))); // 获取小数部分
 
     if (num == 0 || num_z == 0)

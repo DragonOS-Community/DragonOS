@@ -1,8 +1,8 @@
-#include <common/kthread.h>
 #include <common/glib.h>
+#include <common/kthread.h>
 #include <common/spinlock.h>
-#include <sched/sched.h>
 #include <debug/bug.h>
+#include <sched/sched.h>
 #include <time/sleep.h>
 
 static spinlock_t __kthread_create_lock;           // kthread创建过程的锁
@@ -28,26 +28,11 @@ struct kthread_create_info_t
     void *data;
     int node;
 
-    // kthreadd守护进程传递给kthread_create的结果, 成功则返回PCB，不成功则该值为负数错误码。若该值为NULL，意味着创建过程尚未完成
+    // kthreadd守护进程传递给kthread_create的结果,
+    // 成功则返回PCB，不成功则该值为负数错误码。若该值为NULL，意味着创建过程尚未完成
     struct process_control_block *result;
 
     struct List list;
-};
-
-/**
- * @brief kthread信息
- * 该结构体将会绑定到pcb的worker_private中
- */
-struct kthread_info_t
-{
-    uint64_t flags;
-    uint32_t cpu;
-    int result;
-    int (*thread_fn)(void *);
-    void *data;
-    // todo: 将这里改为completion机制
-    bool exited;     // 是否已退出
-    char *full_name; // 内核线程的名称
 };
 
 /**
@@ -62,8 +47,7 @@ static inline struct kthread_info_t *to_kthread(struct process_control_block *pc
     return pcb->worker_private;
 }
 
-static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(void *data), void *data,
-                                                              int node,
+static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(void *data), void *data, int node,
                                                               const char name_fmt[], va_list args)
 {
     struct process_control_block *pcb = NULL;
@@ -147,8 +131,7 @@ void kthread_exit(long result)
  * 当内核线程被唤醒时，会运行thread_fn函数，并将data作为参数传入。
  * 内核线程可以直接返回，也可以在kthread_should_stop为真时返回。
  */
-struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data), void *data,
-                                                     int node,
+struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data), void *data, int node,
                                                      const char name_fmt[], ...)
 {
     struct process_control_block *pcb;
@@ -237,7 +220,8 @@ int kthreadd(void *unused)
         {
 
             // 从链表中取出第一个要创建的内核线程任务
-            struct kthread_create_info_t *create = container_of(kthread_create_list.next, struct kthread_create_info_t, list);
+            struct kthread_create_info_t *create =
+                container_of(kthread_create_list.next, struct kthread_create_info_t, list);
             list_del_init(&create->list);
             spin_unlock(&__kthread_create_lock);
 

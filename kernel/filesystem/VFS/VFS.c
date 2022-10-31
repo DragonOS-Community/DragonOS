@@ -776,14 +776,14 @@ int do_unlink_at(int dfd, const char *pathname, bool from_userland)
     else if (pathname[0] != '/')
         return -EINVAL;
 
-    char *buf = (char *)kzalloc(last_slash + 2, 0);
+    char *buf = (char *)kzalloc(last_slash + 1, 0);
 
-    // 拷贝字符串（不包含要被创建的部分）
+    // 拷贝字符串
     if (from_userland)
         strncpy_from_user(buf, pathname, last_slash);
     else
         strncpy(buf, pathname, last_slash);
-    buf[last_slash + 1] = '\0';
+    buf[last_slash] = '\0';
 
     struct vfs_dir_entry_t *dentry = vfs_path_walk(buf, 0);
     kfree(buf);

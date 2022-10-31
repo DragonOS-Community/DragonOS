@@ -128,6 +128,7 @@ struct fat32_LongDirectory_t
 struct fat32_partition_info_t
 {
     uint16_t partition_id; // 全局fat32分区id
+    // todo: 增加mutex，使得对fat32文件系统的访问是互斥的
 
     struct fat32_BootSector_t bootsector;
     struct fat32_FSInfo_t fsinfo;
@@ -163,6 +164,17 @@ struct fat32_inode_info_t
 };
 
 typedef struct fat32_inode_info_t fat32_inode_info_t;
+
+struct fat32_slot_info
+{
+    off_t i_pos;    // on-disk position of directory entry
+    off_t slot_off; // offset for slot or (de) start
+    int num_slots;  // number of slots +1(de) in filename
+    struct fat32_Directory_t * de;
+    
+    void * buffer;  // 存有当前de的buffer（用完后记得释放！！！）
+    // todo: 加入block io层后，把buffer换成page buffer中的buffer_head
+};
 
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统

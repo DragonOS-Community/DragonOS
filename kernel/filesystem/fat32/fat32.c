@@ -7,13 +7,16 @@
 #include <driver/disk/ahci/ahci.h>
 #include <filesystem/MBR.h>
 #include <mm/slab.h>
+#include <common/string.h>
 
 struct vfs_super_block_operations_t fat32_sb_ops;
 struct vfs_dir_entry_operations_t fat32_dEntry_ops;
 struct vfs_file_operations_t fat32_file_ops;
 struct vfs_inode_operations_t fat32_inode_ops;
-
 extern struct blk_gendisk ahci_gendisk0;
+
+static unsigned int vfat_striptail_len(unsigned int len, const char *name);
+static int fat32_find(struct vfs_index_node_t *dir, const char *name, struct fat32_slot_info *slot_info);
 
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统
@@ -291,7 +294,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
             return NULL;
         }
     }
-    if(unlikely(tmp_dEntry==NULL))
+    if (unlikely(tmp_dEntry == NULL))
     {
         BUG_ON(1);
         return NULL;
@@ -792,7 +795,8 @@ long fat32_lseek(struct vfs_file_t *file_ptr, long offset, long whence)
 }
 // todo: ioctl
 long fat32_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg)
-{return 0;
+{
+    return 0;
 }
 
 /**
@@ -1068,6 +1072,25 @@ int64_t fat32_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr)
 {
     return 0;
 }
+
+/**
+ * @brief 取消inode和dentry之间的链接关系（删除文件）
+ *
+ * @param inode 要被取消关联关系的目录项的【父目录项】
+ * @param dentry 要被取消关联关系的子目录项
+ */
+int64_t fat32_unlink(struct vfs_index_node_t *dir, struct vfs_dir_entry_t *dentry)
+{
+    int retval = 0;
+    struct vfs_superblock_t *sb = dir->sb;
+    struct vfs_index_node_t *inode_to_remove = dentry->dir_inode;
+    fat32_sb_info_t *fsbi = (fat32_sb_info_t *)sb->private_sb_info;
+    struct fat32_slot_info sinfo={0};
+    // todo: 对fat32的超级块加锁
+    retval = vfat_find(dir, dentry->name, &sinfo);
+    // todo: 对fat32的超级块放锁
+    return 0;
+}
 /**
  * @brief 读取文件夹(在指定目录中找出有效目录项)
  *
@@ -1269,8 +1292,41 @@ struct vfs_inode_operations_t fat32_inode_ops = {
     .rename = fat32_rename,
     .getAttr = fat32_getAttr,
     .setAttr = fat32_setAttr,
+    .unlink = fat32_unlink,
 
 };
+
+/**
+ * @brief 给定字符串长度，计算去除字符串尾部的'.'后，剩余部分的长度
+ *
+ * @param len 字符串长度（不包括\0）
+ * @param name 名称字符串
+ * @return unsigned int 去除'.'后的
+ */
+static unsigned int vfat_striptail_len(unsigned int len, const char *name)
+{
+    while (len && name[len - 1] == '.')
+        --len;
+    return len;
+}
+
+/**
+ * @brief 在fat32中，根据父inode,寻找给定名称的子inode
+ *
+ * @param dir 父目录项的inode
+ * @param name 子目录项名称
+ * @param slot_info 找到的slot的信息
+ * @return int 错误码
+ */
+static int vfat_find(struct vfs_index_node_t *dir, const char *name, struct fat32_slot_info *slot_info)
+{
+    uint32_t len = vfat_striptail_len(strnlen(name, PAGE_4K_SIZE-1), name);
+    if(len == 0)
+        return -ENOENT;
+    
+    // todo: 实现search long
+    return fat_search_long(dir, name, len, slot_info);
+}
 
 struct vfs_filesystem_type_t fat32_fs_type = {
     .name = "FAT32",

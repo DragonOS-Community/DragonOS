@@ -36,22 +36,6 @@ struct kthread_create_info_t
 };
 
 /**
- * @brief kthread信息
- * 该结构体将会绑定到pcb的worker_private中
- */
-struct kthread_info_t
-{
-    uint64_t flags;
-    uint32_t cpu;
-    int result;
-    int (*thread_fn)(void *);
-    void *data;
-    // todo: 将这里改为completion机制
-    bool exited;     // 是否已退出
-    char *full_name; // 内核线程的名称
-};
-
-/**
  * @brief 获取pcb中的kthread结构体
  *
  * @param pcb pcb
@@ -96,6 +80,22 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
     if (!IS_ERR(create->result))
     {
         // todo: 为内核线程设置名字
+        char pcb_name[PCB_NAME_LEN];
+        va_list get_args;
+        va_copy(get_args, args);
+        //获取到字符串的前16字节
+        int len = vsnprintf(pcb_name, name_fmt, PCB_NAME_LEN, get_args);
+        if (len >= PCB_NAME_LEN)
+        {
+            //名字过大 放到full_name字段中
+            struct kthread_info_t *kthread = to_kthread(pcb);
+            char *full_name = kzalloc(1024, __GFP_ZERO);
+            vsprintf(full_name, name_fmt, get_args);
+            kthread->full_name = full_name;
+        }
+        //将前16Bytes放到pcb的name字段
+        process_set_pcb_name(pcb, pcb_name);
+        va_end(get_args);
     }
 
     kfree(create);
@@ -170,7 +170,7 @@ static int kthread(void *_create)
     // 将当前pcb返回给创建者
     create->result = current_pcb;
 
-    current_pcb->state &= ~PROC_RUNNING;    // 设置当前进程不是RUNNING态
+    current_pcb->state &= ~PROC_RUNNING; // 设置当前进程不是RUNNING态
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
     sched();
 

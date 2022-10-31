@@ -776,6 +776,7 @@ int do_unlink_at(int dfd, const char *pathname, bool from_userland)
     else if (pathname[0] != '/')
         return -EINVAL;
 
+
     char *buf = (char *)kzalloc(last_slash + 1, 0);
 
     // 拷贝字符串
@@ -796,12 +797,15 @@ int do_unlink_at(int dfd, const char *pathname, bool from_userland)
 
     struct vfs_index_node_t *p_inode = dentry->parent->dir_inode;
     // 对父inode加锁
-    spin_lock(&p_inode);
+
+    spin_lock(&p_inode->lockref.lock);
+
     retval = vfs_unlink(NULL, dentry->parent->dir_inode, dentry, NULL);
 
     spin_lock(&dentry->lockref.lock);
     retval = vfs_dentry_put(dentry);
-    spin_unlock(&p_inode);
+
+    spin_unlock(&p_inode->lockref.lock);
 
     if (IS_ERR(retval))
         kwarn("In do_unlink_at: dentry put failed; retval=%d", retval);

@@ -1,13 +1,14 @@
 #include "fat32.h"
 #include "fat_ent.h"
+#include "internal.h"
 #include <common/errno.h>
 #include <common/kprint.h>
 #include <common/spinlock.h>
 #include <common/stdio.h>
+#include <common/string.h>
 #include <driver/disk/ahci/ahci.h>
 #include <filesystem/MBR.h>
 #include <mm/slab.h>
-#include <common/string.h>
 
 struct vfs_super_block_operations_t fat32_sb_ops;
 struct vfs_dir_entry_operations_t fat32_dEntry_ops;
@@ -16,7 +17,10 @@ struct vfs_inode_operations_t fat32_inode_ops;
 extern struct blk_gendisk ahci_gendisk0;
 
 static unsigned int vfat_striptail_len(unsigned int len, const char *name);
-static int fat32_find(struct vfs_index_node_t *dir, const char *name, struct fat32_slot_info *slot_info);
+static int vfat_find(struct vfs_index_node_t *dir, const char *name, struct fat32_slot_info *slot_info);
+static int __fat32_search_long_short(struct vfs_index_node_t *parent_inode, const char *name, int name_len,
+                                     struct fat32_slot_info *sinfo);
+static int fat32_detach_inode(struct vfs_index_node_t *inode);
 
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统
@@ -49,17 +53,9 @@ static uint8_t fat32_ChkSum(uint8_t *name)
     return chksum;
 }
 
-/**
- * @brief 在父目录中寻找指定的目录项
- *
- * @param parent_inode 父目录项的inode
- * @param dest_dentry 搜索目标目录项
- * @return struct vfs_dir_entry_t* 目标目录项
- */
-struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dentry)
+static int __fat32_search_long_short(struct vfs_index_node_t *parent_inode, const char *name, int name_len,
+                                     struct fat32_slot_info *sinfo)
 {
-    int errcode = 0;
-
     struct fat32_inode_info_t *finode = (struct fat32_inode_info_t *)parent_inode->private_inode_info;
     fat32_sb_info_t *fsbi = (fat32_sb_info_t *)parent_inode->sb->private_sb_info;
     struct block_device *blk = parent_inode->sb->blk_device;
@@ -68,14 +64,16 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
 
     // 计算父目录项的起始簇号
     uint32_t cluster = finode->first_clus;
+    uint32_t last_cluster = finode->first_clus;
 
     struct fat32_Directory_t *tmp_dEntry = NULL;
+    int cnt_long_dir = 0; // 最终结果中，长目录项的数量
 
     while (true)
     {
 
         // 计算父目录项的起始LBA扇区号
-        uint64_t sector = fsbi->first_data_sector + (cluster - 2) * fsbi->sec_per_clus;
+        uint64_t sector = __fat32_calculate_LBA(fsbi->first_data_sector, fsbi->sec_per_clus, cluster);
         // kdebug("fat32_part_info[part_id].bootsector.BPB_SecPerClus=%d",fat32_part_info[part_id].bootsector.BPB_SecPerClus);
         // kdebug("sector=%d",sector);
 
@@ -84,7 +82,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
 
         tmp_dEntry = (struct fat32_Directory_t *)buf;
 
-        // 查找短目录项
+        // 查找每个文件的短目录项
         for (int i = 0; i < fsbi->bytes_per_clus; i += 32, ++tmp_dEntry)
         {
             // 跳过长目录项
@@ -97,7 +95,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
             // kdebug("short name [%d] %s\n 33333==[%#02x]", i / 32, tmp_dEntry->DIR_Name, tmp_dEntry->DIR_Name[3]);
             // 找到长目录项，位于短目录项之前
             struct fat32_LongDirectory_t *tmp_ldEntry = (struct fat32_LongDirectory_t *)tmp_dEntry - 1;
-
+            cnt_long_dir = 0;
             int js = 0;
             // 遍历每个长目录项
             while (tmp_ldEntry->LDIR_Attr == ATTR_LONG_NAME && tmp_ldEntry->LDIR_Ord != 0xe5)
@@ -105,41 +103,38 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                 // 比较name1
                 for (int x = 0; x < 5; ++x)
                 {
-                    if (js > dest_dentry->name_length && tmp_ldEntry->LDIR_Name1[x] == 0xffff)
+                    if (js > name_len && tmp_ldEntry->LDIR_Name1[x] == 0xffff)
                         continue;
-                    else if (js > dest_dentry->name_length ||
-                             tmp_ldEntry->LDIR_Name1[x] !=
-                                 (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
+                    else if (js > name_len ||
+                             tmp_ldEntry->LDIR_Name1[x] != (uint16_t)(name[js++])) // 文件名不匹配，检索下一个短目录项
                         goto continue_cmp_fail;
                 }
 
                 // 比较name2
                 for (int x = 0; x < 6; ++x)
                 {
-                    if (js > dest_dentry->name_length && tmp_ldEntry->LDIR_Name2[x] == 0xffff)
+                    if (js > name_len && tmp_ldEntry->LDIR_Name2[x] == 0xffff)
                         continue;
-                    else if (js > dest_dentry->name_length ||
-                             tmp_ldEntry->LDIR_Name2[x] !=
-                                 (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
+                    else if (js > name_len ||
+                             tmp_ldEntry->LDIR_Name2[x] != (uint16_t)(name[js++])) // 文件名不匹配，检索下一个短目录项
                         goto continue_cmp_fail;
                 }
 
                 // 比较name3
                 for (int x = 0; x < 2; ++x)
                 {
-                    if (js > dest_dentry->name_length && tmp_ldEntry->LDIR_Name3[x] == 0xffff)
+                    if (js > name_len && tmp_ldEntry->LDIR_Name3[x] == 0xffff)
                         continue;
-                    else if (js > dest_dentry->name_length ||
-                             tmp_ldEntry->LDIR_Name3[x] !=
-                                 (uint16_t)(dest_dentry->name[js++])) // 文件名不匹配，检索下一个短目录项
+                    else if (js > name_len ||
+                             tmp_ldEntry->LDIR_Name3[x] != (uint16_t)(name[js++])) // 文件名不匹配，检索下一个短目录项
                         goto continue_cmp_fail;
                 }
 
-                if (js >= dest_dentry->name_length) // 找到需要的目录项，返回
+                if (js >= name_len) // 找到需要的目录项，返回
                 {
                     // kdebug("found target long name.");
-
-                    goto find_lookup_success;
+                    cnt_long_dir = tmp_dEntry - (struct fat32_Directory_t *)tmp_ldEntry;
+                    goto success;
                 }
 
                 --tmp_ldEntry; // 检索下一个长目录项
@@ -156,9 +151,9 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                 case ' ':
                     if (!(tmp_dEntry->DIR_Attr & ATTR_DIRECTORY)) // 不是文件夹（是文件）
                     {
-                        if (dest_dentry->name[js] == '.')
+                        if (name[js] == '.')
                             continue;
-                        else if (tmp_dEntry->DIR_Name[x] == dest_dentry->name[js])
+                        else if (tmp_dEntry->DIR_Name[x] == name[js])
                         {
                             ++js;
                             break;
@@ -168,13 +163,12 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                     }
                     else // 是文件夹
                     {
-                        if (js < dest_dentry->name_length &&
-                            tmp_dEntry->DIR_Name[x] == dest_dentry->name[js]) // 当前位正确匹配
+                        if (js < name_len && tmp_dEntry->DIR_Name[x] == name[js]) // 当前位正确匹配
                         {
                             ++js;
                             break; // 进行下一位的匹配
                         }
-                        else if (js == dest_dentry->name_length)
+                        else if (js == name_len)
                             continue;
                         else
                             goto continue_cmp_fail;
@@ -186,7 +180,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                 case 'a' ... 'z':
                     if (tmp_dEntry->DIR_NTRes & LOWERCASE_BASE) // 为兼容windows系统，检测DIR_NTRes字段
                     {
-                        if (js < dest_dentry->name_length && (tmp_dEntry->DIR_Name[x] + 32 == dest_dentry->name[js]))
+                        if (js < name_len && (tmp_dEntry->DIR_Name[x] + 32 == name[js]))
                         {
                             ++js;
                             break;
@@ -196,7 +190,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                     }
                     else
                     {
-                        if (js < dest_dentry->name_length && tmp_dEntry->DIR_Name[x] == dest_dentry->name[js])
+                        if (js < name_len && tmp_dEntry->DIR_Name[x] == name[js])
                         {
                             ++js;
                             break;
@@ -206,7 +200,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                     }
                     break;
                 case '0' ... '9':
-                    if (js < dest_dentry->name_length && tmp_dEntry->DIR_Name[x] == dest_dentry->name[js])
+                    if (js < name_len && tmp_dEntry->DIR_Name[x] == name[js])
                     {
                         ++js;
                         break;
@@ -221,7 +215,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                     break;
                 }
             }
-            if (js > dest_dentry->name_length)
+            if (js > name_len)
             {
                 kdebug("js > namelen");
                 goto continue_cmp_fail;
@@ -239,7 +233,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                     case 'a' ... 'z':
                         if (tmp_dEntry->DIR_NTRes & LOWERCASE_EXT) // 为兼容windows系统，检测DIR_NTRes字段
                         {
-                            if ((tmp_dEntry->DIR_Name[x] + 32 == dest_dentry->name[js]))
+                            if ((tmp_dEntry->DIR_Name[x] + 32 == name[js]))
                             {
                                 ++js;
                                 break;
@@ -249,7 +243,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                         }
                         else
                         {
-                            if (tmp_dEntry->DIR_Name[x] == dest_dentry->name[js])
+                            if (tmp_dEntry->DIR_Name[x] == name[js])
                             {
                                 ++js;
                                 break;
@@ -260,7 +254,7 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                         break;
                     case '0' ... '9':
                     case ' ':
-                        if (tmp_dEntry->DIR_Name[x] == dest_dentry->name[js])
+                        if (tmp_dEntry->DIR_Name[x] == name[js])
                         {
                             ++js;
                             break;
@@ -276,36 +270,71 @@ struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, stru
                     }
                 }
             }
-            if (js > dest_dentry->name_length)
+            if (js > name_len)
             {
                 kdebug("js > namelen");
                 goto continue_cmp_fail;
             }
-            goto find_lookup_success;
+            cnt_long_dir = 0;
+            goto success;
         continue_cmp_fail:;
         }
 
         // 当前簇没有发现目标文件名，寻找下一个簇
+        last_cluster = cluster;
         cluster = fat32_read_FAT_entry(blk, fsbi, cluster);
 
         if (cluster >= 0x0ffffff7) // 寻找完父目录的所有簇，都没有找到目标文件名
         {
+            kdebug("1234");
             kfree(buf);
-            return NULL;
+            return -ENOENT;
         }
     }
     if (unlikely(tmp_dEntry == NULL))
     {
         BUG_ON(1);
-        return NULL;
+        kfree(buf);
+        return -ENOENT;
     }
+success:;
+
+    // 填充sinfo
+    sinfo->buffer = buf;
+    sinfo->de = tmp_dEntry;
+    sinfo->i_pos = __fat32_calculate_LBA(fsbi->first_data_sector, fsbi->sec_per_clus, last_cluster);
+    sinfo->num_slots = cnt_long_dir + 1;
+    sinfo->slot_off = tmp_dEntry - (struct fat32_Directory_t *)buf;
+    kdebug("successfully found:%s", name);
+    return 0;
+}
+
+/**
+ * @brief 在父目录中寻找指定的目录项
+ *
+ * @param parent_inode 父目录项的inode
+ * @param dest_dentry 搜索目标目录项
+ * @return struct vfs_dir_entry_t* 目标目录项
+ */
+struct vfs_dir_entry_t *fat32_lookup(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dentry)
+{
+    int errcode = 0;
+    fat32_sb_info_t *fsbi = (fat32_sb_info_t *)parent_inode->sb->private_sb_info;
+    struct fat32_inode_info_t *finode = NULL;
+
+    struct fat32_slot_info sinfo = {0};
+    errcode = vfat_find(parent_inode, dest_dentry->name, &sinfo);
+    kdebug("errcode=%d", errcode);
+    if (unlikely(errcode != 0))
+        return NULL;
+
 find_lookup_success:; // 找到目标dentry
     struct vfs_index_node_t *p = vfs_alloc_inode();
 
-    p->file_size = tmp_dEntry->DIR_FileSize;
+    p->file_size = sinfo.de->DIR_FileSize;
     // 计算文件占用的扇区数, 由于最小存储单位是簇，因此需要按照簇的大小来对齐扇区
     p->blocks = (p->file_size + fsbi->bytes_per_clus - 1) / fsbi->bytes_per_sec;
-    p->attribute = (tmp_dEntry->DIR_Attr & ATTR_DIRECTORY) ? VFS_IF_DIR : VFS_IF_FILE;
+    p->attribute = (sinfo.de->DIR_Attr & ATTR_DIRECTORY) ? VFS_IF_DIR : VFS_IF_FILE;
     p->sb = parent_inode->sb;
     p->file_ops = &fat32_file_ops;
     p->inode_ops = &fat32_inode_ops;
@@ -314,19 +343,19 @@ find_lookup_success:; // 找到目标dentry
     p->private_inode_info = (void *)kzalloc(sizeof(fat32_inode_info_t), 0);
     finode = (fat32_inode_info_t *)p->private_inode_info;
 
-    finode->first_clus = ((tmp_dEntry->DIR_FstClusHI << 16) | tmp_dEntry->DIR_FstClusLO) & 0x0fffffff;
-    finode->dEntry_location_clus = cluster;
-    finode->dEntry_location_clus_offset = tmp_dEntry - (struct fat32_Directory_t *)buf; // 计算dentry的偏移量
+    finode->first_clus = ((sinfo.de->DIR_FstClusHI << 16) | sinfo.de->DIR_FstClusLO) & 0x0fffffff;
+    finode->dEntry_location_clus = __fat32_LBA_to_cluster(fsbi->first_data_sector, fsbi->sec_per_clus, sinfo.i_pos);
+    finode->dEntry_location_clus_offset = sinfo.slot_off; // 计算dentry的偏移量
     // kdebug("finode->dEntry_location_clus=%#018lx", finode->dEntry_location_clus);
     // kdebug("finode->dEntry_location_clus_offset=%#018lx", finode->dEntry_location_clus_offset);
-    finode->create_date = tmp_dEntry->DIR_CrtDate;
-    finode->create_time = tmp_dEntry->DIR_CrtTime;
-    finode->write_date = tmp_dEntry->DIR_WrtDate;
-    finode->write_time = tmp_dEntry->DIR_WrtTime;
+    finode->create_date = sinfo.de->DIR_CrtDate;
+    finode->create_time = sinfo.de->DIR_CrtTime;
+    finode->write_date = sinfo.de->DIR_WrtDate;
+    finode->write_time = sinfo.de->DIR_WrtTime;
 
     // 暂时使用fat32的高4bit来标志设备文件
     // todo: 引入devfs后删除这段代码
-    if ((tmp_dEntry->DIR_FstClusHI >> 12) && (p->attribute & VFS_IF_FILE))
+    if ((sinfo.de->DIR_FstClusHI >> 12) && (p->attribute & VFS_IF_FILE))
         p->attribute |= VFS_IF_DEVICE;
 
     dest_dentry->dir_inode = p;
@@ -334,7 +363,7 @@ find_lookup_success:; // 找到目标dentry
     list_init(&dest_dentry->child_node_list);
     list_init(&dest_dentry->subdirs_list);
 
-    kfree(buf);
+    kfree(sinfo.buffer);
     return dest_dentry;
 }
 
@@ -684,7 +713,7 @@ long fat32_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *po
             //  读取一个簇的数据
             int errno = blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, sector, fsbi->sec_per_clus,
                                                      (uint64_t)tmp_buffer);
-            if (errno != AHCI_SUCCESS)
+            if (errno != 0)
             {
                 // kerror("FAT32 FS(write)  read disk error!");
                 retval = -EIO;
@@ -1074,6 +1103,19 @@ int64_t fat32_setAttr(struct vfs_dir_entry_t *dEntry, uint64_t *attr)
 }
 
 /**
+ * @brief 从fat32中卸载inode
+ *
+ * @param inode 要被卸载的inode
+ * @return int 错误码
+ */
+static int fat32_detach_inode(struct vfs_index_node_t *inode)
+{
+    // todo: 当引入哈希表管理inode之后，这个函数负责将inode从哈希表中删除
+    // 参考Linux的fat_detach
+    return 0;
+}
+
+/**
  * @brief 取消inode和dentry之间的链接关系（删除文件）
  *
  * @param inode 要被取消关联关系的目录项的【父目录项】
@@ -1085,12 +1127,23 @@ int64_t fat32_unlink(struct vfs_index_node_t *dir, struct vfs_dir_entry_t *dentr
     struct vfs_superblock_t *sb = dir->sb;
     struct vfs_index_node_t *inode_to_remove = dentry->dir_inode;
     fat32_sb_info_t *fsbi = (fat32_sb_info_t *)sb->private_sb_info;
-    struct fat32_slot_info sinfo={0};
+    struct fat32_slot_info sinfo = {0};
     // todo: 对fat32的超级块加锁
+
     retval = vfat_find(dir, dentry->name, &sinfo);
+    if (unlikely(retval != 0))
+        goto out;
+
+    // 从fat表删除目录项
+    retval = fat32_remove_entries(dir, &sinfo);
+
+    fat32_detach_inode(dentry->dir_inode);
+out:;
+    kfree(sinfo.buffer);
     // todo: 对fat32的超级块放锁
-    return 0;
+    return retval;
 }
+
 /**
  * @brief 读取文件夹(在指定目录中找出有效目录项)
  *
@@ -1311,6 +1364,21 @@ static unsigned int vfat_striptail_len(unsigned int len, const char *name)
 }
 
 /**
+ * @brief 在指定inode的长目录项中搜索目标子目录项
+ *
+ * @param dir 父目录项inode
+ * @param name 要查找的子目录项的名称
+ * @param len 子目录项名称长度
+ * @param slot_info 返回的对应的子目录项的短目录项。
+ * @return int 错误码
+ */
+static int fat_search_long(struct vfs_index_node_t *dir, const char *name, int len, struct fat32_slot_info *slot_info)
+{
+    int retval = 0;
+    retval = __fat32_search_long_short(dir, name, len, slot_info);
+    return retval;
+}
+/**
  * @brief 在fat32中，根据父inode,寻找给定名称的子inode
  *
  * @param dir 父目录项的inode
@@ -1320,11 +1388,11 @@ static unsigned int vfat_striptail_len(unsigned int len, const char *name)
  */
 static int vfat_find(struct vfs_index_node_t *dir, const char *name, struct fat32_slot_info *slot_info)
 {
-    uint32_t len = vfat_striptail_len(strnlen(name, PAGE_4K_SIZE-1), name);
-    if(len == 0)
+    uint32_t len = vfat_striptail_len(strnlen(name, PAGE_4K_SIZE - 1), name);
+    kdebug("len=%d", len);
+    if (len == 0)
         return -ENOENT;
-    
-    // todo: 实现search long
+
     return fat_search_long(dir, name, len, slot_info);
 }
 

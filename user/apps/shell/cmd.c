@@ -1,18 +1,17 @@
 #include "cmd.h"
-#include <libc/string.h>
-#include <libc/stdio.h>
-#include <libc/stddef.h>
-#include <libsystem/syscall.h>
-#include <libc/string.h>
-#include <libc/errno.h>
-#include <libc/unistd.h>
-#include <libc/stdlib.h>
-#include <libc/fcntl.h>
-#include <libc/dirent.h>
-#include <libc/sys/wait.h>
-#include <libc/sys/stat.h>
 #include "cmd_help.h"
 #include "cmd_test.h"
+#include <libc/dirent.h>
+#include <libc/errno.h>
+#include <libc/fcntl.h>
+#include <libc/stddef.h>
+#include <libc/stdio.h>
+#include <libc/stdlib.h>
+#include <libc/string.h>
+#include <libc/sys/stat.h>
+#include <libc/sys/wait.h>
+#include <libc/unistd.h>
+#include <libsystem/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
@@ -20,22 +19,11 @@ char *shell_current_path = NULL;
  * @brief shell 内建函数的主命令与处理函数的映射表
  *
  */
-struct built_in_cmd_t shell_cmds[] =
-    {
-        {"cd", shell_cmd_cd},
-        {"cat", shell_cmd_cat},
-        {"exec", shell_cmd_exec},
-        {"ls", shell_cmd_ls},
-        {"mkdir", shell_cmd_mkdir},
-        {"pwd", shell_cmd_pwd},
-        {"rm", shell_cmd_rm},
-        {"rmdir", shell_cmd_rmdir},
-        {"reboot", shell_cmd_reboot},
-        {"touch", shell_cmd_touch},
-        {"about", shell_cmd_about},
-        {"free", shell_cmd_free},
-        {"help", shell_help},
-        {"pipe", shell_pipe_test},
+struct built_in_cmd_t shell_cmds[] = {
+    {"cd", shell_cmd_cd},         {"cat", shell_cmd_cat},     {"exec", shell_cmd_exec},   {"ls", shell_cmd_ls},
+    {"mkdir", shell_cmd_mkdir},   {"pwd", shell_cmd_pwd},     {"rm", shell_cmd_rm},       {"rmdir", shell_cmd_rmdir},
+    {"reboot", shell_cmd_reboot}, {"touch", shell_cmd_touch}, {"about", shell_cmd_about}, {"free", shell_cmd_free},
+    {"help", shell_help},         {"pipe", shell_pipe_test},
 
 };
 // 总共的内建命令数量
@@ -365,16 +353,6 @@ int shell_cmd_touch(int argc, char **argv)
 }
 
 /**
- * @brief 删除命令
- *
- * @param argc
- * @param argv
- * @return int
- */
-// todo:
-int shell_cmd_rm(int argc, char **argv) {return 0;}
-
-/**
  * @brief 创建文件夹的命令
  *
  * @param argc
@@ -407,7 +385,6 @@ int shell_cmd_mkdir(int argc, char **argv)
  * @param argv
  * @return int
  */
-// todo:
 int shell_cmd_rmdir(int argc, char **argv)
 {
     const char *full_path = NULL;
@@ -417,6 +394,30 @@ int shell_cmd_rmdir(int argc, char **argv)
     else
         full_path = get_target_filepath(argv[1], &result_path_len);
     int retval = rmdir(full_path);
+    // printf("rmdir: path=%s, retval=%d\n", full_path, retval);
+    if (argv != NULL)
+        free(argv);
+
+    return retval;
+}
+
+/**
+ * @brief 删除文件的命令
+ *
+ * @param argc
+ * @param argv
+ * @return int
+ */
+int shell_cmd_rm(int argc, char **argv)
+{
+    const char *full_path = NULL;
+    int result_path_len = -1;
+    if (argv[1][0] == '/')
+        full_path = argv[1];
+    else
+        full_path = get_target_filepath(argv[1], &result_path_len);
+    printf("to rm %s\n", full_path);
+    int retval = rm(full_path);
     // printf("rmdir: path=%s, retval=%d\n", full_path, retval);
     if (argv != NULL)
         free(argv);
@@ -510,11 +511,13 @@ int shell_cmd_free(int argc, char **argv)
     printf("Mem:\t");
     if (argc == 1) // 按照kb显示
     {
-        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 10, mst.used >> 10, mst.free >> 10, mst.shared >> 10, mst.cache_used >> 10, mst.available >> 10);
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 10, mst.used >> 10, mst.free >> 10, mst.shared >> 10,
+               mst.cache_used >> 10, mst.available >> 10);
     }
     else // 按照MB显示
     {
-        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 20, mst.used >> 20, mst.free >> 20, mst.shared >> 20, mst.cache_used >> 20, mst.available >> 20);
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 20, mst.used >> 20, mst.free >> 20, mst.shared >> 20,
+               mst.cache_used >> 20, mst.available >> 20);
     }
 
 done:;

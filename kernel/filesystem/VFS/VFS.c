@@ -160,7 +160,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
             char *tmpname = kzalloc(tmp_path_len + 1, 0);
             strncpy(tmpname, tmp_path, tmp_path_len);
             tmpname[tmp_path_len] = '\0';
-
+            kdebug("tmpname=%s", tmpname);
             dentry = vfs_search_dentry_list(parent, tmpname);
 
             kfree(tmpname);
@@ -179,7 +179,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
             if (parent->dir_inode->inode_ops->lookup(parent->dir_inode, dentry) == NULL)
             {
                 // 搜索失败
-                // kerror("cannot find the file/dir : %s", dentry->name);
+                kerror("cannot find the file/dir : %s", dentry->name);
                 kfree(dentry->name);
                 kfree(dentry);
                 return NULL;
@@ -785,29 +785,29 @@ int do_unlink_at(int dfd, const char *pathname, bool from_userland)
     else
         strncpy(buf, pathname, last_slash);
     buf[last_slash] = '\0';
-
+    kdebug("buf=%s", buf);
     struct vfs_dir_entry_t *dentry = vfs_path_walk(buf, 0);
     kfree(buf);
 
     if (dentry == NULL || dentry->parent == NULL)
     {
+        kdebug("dentry=%#018lx", dentry);
         retval = -ENOENT;
         goto out;
     }
 
     struct vfs_index_node_t *p_inode = dentry->parent->dir_inode;
     // 对父inode加锁
-
     spin_lock(&p_inode->lockref.lock);
-
+    kdebug("to vfs_unlink");
     retval = vfs_unlink(NULL, dentry->parent->dir_inode, dentry, NULL);
-
+    kdebug("retval=%d", retval);
     spin_lock(&dentry->lockref.lock);
     retval = vfs_dentry_put(dentry);
-
+    kdebug("vfs_dentry_put=%d", retval);
     spin_unlock(&p_inode->lockref.lock);
 
-    if (IS_ERR(retval))
+    if (IS_ERR_VALUE(retval))
         kwarn("In do_unlink_at: dentry put failed; retval=%d", retval);
     else
         retval = 0;
@@ -826,14 +826,14 @@ out:;
 uint64_t sys_unlink_at(struct pt_regs *regs)
 {
     int dfd = regs->r8;
-    const char *pathname = regs->r9;
+    const char *pathname = (const char*)regs->r9;
     int flag = regs->r10;
     bool from_user = SYSCALL_FROM_USER(regs) ? true : false;
     if ((flag & (~AT_REMOVEDIR)) != 0)
         return -EINVAL;
     if (flag & AT_REMOVEDIR)
         return vfs_rmdir(pathname, from_user);
-
+    kdebug("to do_unlink_at, path=%s", pathname);
     return do_unlink_at(dfd, pathname, from_user);
 }
 

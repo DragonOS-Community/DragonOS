@@ -159,7 +159,7 @@ struct vfs_file_t *process_open_exec_file(char *path)
 {
     struct vfs_dir_entry_t *dentry = NULL;
     struct vfs_file_t *filp = NULL;
-
+    // kdebug("path=%s", path);
     dentry = vfs_path_walk(path, 0);
 
     if (dentry == NULL)
@@ -195,7 +195,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
     if ((long)filp <= 0 && (long)filp >= -255)
     {
-        // kdebug("(long)filp=%ld", (long)filp);
+        kdebug("(long)filp=%ld", (long)filp);
         return (unsigned long)filp;
     }
 
@@ -595,12 +595,10 @@ ul initial_kernel_thread(ul arg)
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数
     // 这里的设计思路和switch_proc类似 加载用户态程序：shell.elf
-    char init_path[] = "/shell.elf";
-    uint64_t addr = (uint64_t)&init_path;
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
                          "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
-                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/shell.elf"), "c"(NULL),
+                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/bin/shell.elf"), "c"(NULL),
                          "d"(NULL)
                          : "memory");
 

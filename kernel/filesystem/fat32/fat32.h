@@ -16,6 +16,8 @@
 
 #define FAT32_MAX_PARTITION_NUM 128 // 系统支持的最大的fat32分区数量
 
+#define FAT32_DELETED_FLAG 0xe5 // 如果短目录项的name[0]为这个值，那么意味着这个短目录项是空闲的
+
 /**
  * @brief fat32文件系统引导扇区结构体
  *
@@ -128,6 +130,7 @@ struct fat32_LongDirectory_t
 struct fat32_partition_info_t
 {
     uint16_t partition_id; // 全局fat32分区id
+    // todo: 增加mutex，使得对fat32文件系统的访问是互斥的
 
     struct fat32_BootSector_t bootsector;
     struct fat32_FSInfo_t fsinfo;
@@ -163,6 +166,21 @@ struct fat32_inode_info_t
 };
 
 typedef struct fat32_inode_info_t fat32_inode_info_t;
+
+/**
+ * @brief FAT32目录项插槽信息
+ * 一个插槽指的是 一个长目录项/短目录项
+ */
+struct fat32_slot_info
+{
+    off_t i_pos;    // on-disk position of directory entry(扇区号)
+    off_t slot_off; // offset for slot or (de) start
+    int num_slots;  // number of slots +1(de) in filename
+    struct fat32_Directory_t * de;
+    
+    // todo: 加入block io层后，在这里引入buffer_head
+    void *buffer;   // 记得释放这个buffer！！！
+};
 
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统

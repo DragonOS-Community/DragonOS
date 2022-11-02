@@ -89,9 +89,12 @@ int vfs_dentry_put(struct vfs_dir_entry_t *dentry)
     }
     else // 是文件或设备
     {
+        kdebug("to put dentry: file: %s", dentry->name);
+        list_del(&dentry->child_node_list); // 从父dentry中删除
         // 释放inode
         spin_lock(&dentry->dir_inode->lockref.lock);
         retval = vfs_free_inode(dentry->dir_inode);
+        kdebug("retval=%d", retval);
         if (retval > 0) // 还有其他的dentry引用着这个inode
             spin_unlock(&dentry->dir_inode->lockref.lock);
 

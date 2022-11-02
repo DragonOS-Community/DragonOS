@@ -160,7 +160,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
             char *tmpname = kzalloc(tmp_path_len + 1, 0);
             strncpy(tmpname, tmp_path, tmp_path_len);
             tmpname[tmp_path_len] = '\0';
-
+            // kdebug("tmpname=%s", tmpname);
             dentry = vfs_search_dentry_list(parent, tmpname);
 
             kfree(tmpname);
@@ -179,7 +179,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
             if (parent->dir_inode->inode_ops->lookup(parent->dir_inode, dentry) == NULL)
             {
                 // 搜索失败
-                // kerror("cannot find the file/dir : %s", dentry->name);
+                // kwarn("cannot find the file/dir : %s", dentry->name);
                 kfree(dentry->name);
                 kfree(dentry);
                 return NULL;
@@ -429,9 +429,10 @@ uint64_t do_open(const char *filename, int flags)
         // 创建新的文件
         dentry = vfs_alloc_dentry(path_len - tmp_index);
 
-        dentry->name_length = path_len - tmp_index - 1;
+        dentry->name_length = path_len - tmp_index - 2;
+        
+        // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length);
         strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
-        // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length)
         dentry->parent = parent_dentry;
 
         // 对父目录项加锁
@@ -639,7 +640,6 @@ int64_t vfs_rmdir(const char *path, bool from_userland)
     if (dentry == NULL)
     {
         retval = -ENOENT;
-        kdebug("noent");
         goto out0;
     }
 
@@ -776,14 +776,14 @@ int do_unlink_at(int dfd, const char *pathname, bool from_userland)
     else if (pathname[0] != '/')
         return -EINVAL;
 
-    char *buf = (char *)kzalloc(last_slash + 2, 0);
+    char *buf = (char *)kzalloc(last_slash + 1, 0);
 
-    // 拷贝字符串（不包含要被创建的部分）
+    // 拷贝字符串
     if (from_userland)
         strncpy_from_user(buf, pathname, last_slash);
     else
         strncpy(buf, pathname, last_slash);
-    buf[last_slash + 1] = '\0';
+    buf[last_slash] = '\0';
 
     struct vfs_dir_entry_t *dentry = vfs_path_walk(buf, 0);
     kfree(buf);
@@ -797,13 +797,20 @@ int do_unlink_at(int dfd, const char *pathname, bool from_userland)
     struct vfs_index_node_t *p_inode = dentry->parent->dir_inode;
     // 对父inode加锁
     spin_lock(&p_inode->lockref.lock);
-    retval = vfs_unlink(NULL, dentry->parent->dir_inode, dentry, NULL);
-
     spin_lock(&dentry->lockref.lock);
-    retval = vfs_dentry_put(dentry);
+    retval = vfs_unlink(NULL, dentry->parent->dir_inode, dentry, NULL);
+    if (unlikely(retval != 0))
+    {
+        // kdebug("retval=%d", retval);
+        spin_unlock(&dentry->lockref.lock);
+        spin_unlock(&p_inode->lockref.lock);
+        goto out;
+    }
+    // kdebug("vfs_dentry_put=%d", retval);
+    spin_unlock(&dentry->lockref.lock);
     spin_unlock(&p_inode->lockref.lock);
 
-    if (IS_ERR(retval))
+    if (IS_ERR_VALUE(retval))
         kwarn("In do_unlink_at: dentry put failed; retval=%d", retval);
     else
         retval = 0;
@@ -822,14 +829,14 @@ out:;
 uint64_t sys_unlink_at(struct pt_regs *regs)
 {
     int dfd = regs->r8;
-    const char *pathname = regs->r9;
+    const char *pathname = (const char *)regs->r9;
     int flag = regs->r10;
     bool from_user = SYSCALL_FROM_USER(regs) ? true : false;
     if ((flag & (~AT_REMOVEDIR)) != 0)
         return -EINVAL;
     if (flag & AT_REMOVEDIR)
         return vfs_rmdir(pathname, from_user);
-
+    // kdebug("to do_unlink_at, path=%s", pathname);
     return do_unlink_at(dfd, pathname, from_user);
 }
 

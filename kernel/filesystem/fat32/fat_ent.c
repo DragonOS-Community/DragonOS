@@ -1,4 +1,5 @@
 #include "fat_ent.h"
+#include "internal.h"
 #include <common/errno.h>
 #include <driver/disk/ahci/ahci.h>
 #include <mm/slab.h>
@@ -22,10 +23,8 @@ int fat32_alloc_clusters(struct vfs_index_node_t *inode, uint32_t *clusters, int
     struct block_device *blk = inode->sb->blk_device;
     uint64_t sec_per_fat = fsbi->sec_per_FAT;
 
-    // todo: 对alloc的过程加锁
-
     // 申请1扇区的缓冲区
-    uint32_t *buf = (uint32_t *)kmalloc(fsbi->bytes_per_sec, 0);
+    uint32_t *buf = (uint32_t *)kzalloc(fsbi->bytes_per_sec, 0);
     int ent_per_sec = (fsbi->bytes_per_sec >> 2);
     int clus_idx = 0;
     for (int i = 0; i < sec_per_fat; ++i)
@@ -67,7 +66,7 @@ done:;
         }
         else
         {
-            // todo: 跳转到文件当前的最后一个簇
+            // 跳转到文件当前的最后一个簇
             idx = 0;
             int tmp_clus = finode->first_clus;
             cluster = tmp_clus;
@@ -150,7 +149,7 @@ uint32_t fat32_read_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, u
  * @param value 要写入该fat表项的值
  * @return uint32_t errcode
  */
-uint32_t fat32_write_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value)
+int fat32_write_FAT_entry(struct block_device *blk, fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value)
 {
     // 计算每个扇区内含有的FAT表项数
     // FAT每项4bytes
@@ -216,7 +215,8 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
         // 查找连续num个空闲目录项
         for (int i = 0; (i < fsbi->bytes_per_clus) && count_continuity < num; i += 32, ++tmp_dEntry)
         {
-            if (!(tmp_dEntry->DIR_Name[0] == 0xe5 || tmp_dEntry->DIR_Name[0] == 0x00))
+            if (!(tmp_dEntry->DIR_Name[0] == 0xe5 || tmp_dEntry->DIR_Name[0] == 0x00 ||
+                  tmp_dEntry->DIR_Name[0] == 0x05))
             {
                 count_continuity = 0;
                 continue;
@@ -234,6 +234,7 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
             *res_sector = sector;
             *res_data_buf_base = (uint64_t)buf;
             *res_cluster = cluster;
+
             return result_dEntry;
         }
 
@@ -332,12 +333,6 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
             else
                 target->DIR_Name[tmp_index] = 0x20;
         }
-        // 在字符串末尾加入\0
-        if (tmp_index < 8 && tmp_index == dEntry->name_length)
-        {
-            target->DIR_Name[tmp_index] = '\0';
-            ++tmp_index;
-        }
 
         // 不满的部分使用0x20填充
         while (tmp_index < 8)
@@ -390,35 +385,31 @@ void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirect
     uint32_t current_name_index = 0;
     struct fat32_LongDirectory_t *Ldentry = (struct fat32_LongDirectory_t *)(target + 1);
     // kdebug("filling long name, name=%s, namelen=%d", dEntry->name, dEntry->name_length);
+    int name_length = dEntry->name_length + 1;
     for (int i = 1; i <= cnt_longname; ++i)
     {
         --Ldentry;
+
         Ldentry->LDIR_Ord = i;
 
         for (int j = 0; j < 5; ++j, ++current_name_index)
         {
-            if (current_name_index < dEntry->name_length)
+            if (current_name_index < name_length)
                 Ldentry->LDIR_Name1[j] = dEntry->name[current_name_index];
-            else if (current_name_index == dEntry->name_length)
-                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name1[j] = 0xffff;
         }
         for (int j = 0; j < 6; ++j, ++current_name_index)
         {
-            if (current_name_index < dEntry->name_length)
+            if (current_name_index < name_length)
                 Ldentry->LDIR_Name2[j] = dEntry->name[current_name_index];
-            else if (current_name_index == dEntry->name_length)
-                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name2[j] = 0xffff;
         }
         for (int j = 0; j < 2; ++j, ++current_name_index)
         {
-            if (current_name_index < dEntry->name_length)
+            if (current_name_index < name_length)
                 Ldentry->LDIR_Name3[j] = dEntry->name[current_name_index];
-            else if (current_name_index == dEntry->name_length)
-                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name3[j] = 0xffff;
         }
@@ -430,4 +421,61 @@ void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirect
 
     // 最后一个长目录项的ord要|=0x40
     Ldentry->LDIR_Ord |= 0x40;
+}
+
+/**
+ * @brief 删除目录项
+ *
+ * @param dir 父目录的inode
+ * @param sinfo 待删除的dentry的插槽信息
+ * @return int 错误码
+ */
+int fat32_remove_entries(struct vfs_index_node_t *dir, struct fat32_slot_info *sinfo)
+{
+    int retval = 0;
+    struct vfs_superblock_t *sb = dir->sb;
+    struct fat32_Directory_t *de = sinfo->de;
+    fat32_sb_info_t *fsbi = (fat32_sb_info_t *)sb->private_sb_info;
+    int cnt_dentries = sinfo->num_slots;
+
+    // 获取文件数据区的起始簇号
+    int data_cluster = ((((uint32_t)de->DIR_FstClusHI) << 16) | ((uint32_t)de->DIR_FstClusLO)) & 0x0fffffff;
+    // kdebug("data_cluster=%d, cnt_dentries=%d, offset=%d", data_cluster, cnt_dentries, sinfo->slot_off);
+    // kdebug("fsbi->first_data_sector=%d, sec per clus=%d, i_pos=%d", fsbi->first_data_sector, fsbi->sec_per_clus,
+    //        sinfo->i_pos);
+    // === 第一阶段，先删除短目录项
+    while (cnt_dentries > 0)
+    {
+        de->DIR_Name[0] = FAT32_DELETED_FLAG;
+        --cnt_dentries;
+        --de;
+    }
+
+    // === 第二阶段：将对目录项的更改写入磁盘
+
+    sb->blk_device->bd_disk->fops->transfer(sb->blk_device->bd_disk, AHCI_CMD_WRITE_DMA_EXT, sinfo->i_pos,
+                                            fsbi->sec_per_clus, (uint64_t)sinfo->buffer);
+
+    // === 第三阶段：清除文件的数据区
+    uint32_t next_clus;
+    int js = 0;
+    // kdebug("data_cluster=%#018lx", data_cluster);
+    while (data_cluster < 0x0ffffff8 && data_cluster >= 2)
+    {
+        // 读取下一个表项
+        next_clus = fat32_read_FAT_entry(sb->blk_device, fsbi, data_cluster);
+        // kdebug("data_cluster=%#018lx, next_clus=%#018lx", data_cluster, next_clus);
+        // 清除当前表项
+        retval = fat32_write_FAT_entry(sb->blk_device, fsbi, data_cluster, 0);
+        if (unlikely(retval != 0))
+        {
+            kerror("fat32_remove_entries: Failed to mark fat entry as unused for cluster:%d", data_cluster);
+            goto out;
+        }
+        ++js;
+        data_cluster = next_clus;
+    }
+out:;
+    // kdebug("Successfully remove %d clusters.", js);
+    return retval;
 }

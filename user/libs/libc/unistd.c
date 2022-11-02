@@ -162,6 +162,17 @@ int rmdir(const char *path)
 }
 
 /**
+ * @brief 删除文件
+ * 
+ * @param path 绝对路径
+ * @return int 
+ */
+int rm(const char * path)
+{
+    return syscall_invoke(SYS_UNLINK_AT, 0, (uint64_t)path, 0, 0, 0, 0, 0, 0);
+}
+
+/**
  * @brief  交换n字节
  *  @param src  源地址
  *  @param dest  目的地址

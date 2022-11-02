@@ -106,6 +106,8 @@ extern int usleep(useconds_t usec);
  */
 int rmdir(const char *path);
 
+int rm(const char * path);
+
 /**
  * @brief  交换n字节
  *  @param src  源地址

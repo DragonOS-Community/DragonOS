@@ -42,7 +42,7 @@ uint32_t fat32_read_FAT_entry(struct block_device * blk, fat32_sb_info_t *fsbi, 
  * @param value 要写入该fat表项的值
  * @return uint32_t errcode
  */
-uint32_t fat32_write_FAT_entry(struct block_device * blk, fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value);
+int fat32_write_FAT_entry(struct block_device * blk, fat32_sb_info_t *fsbi, uint32_t cluster, uint32_t value);
 
 /**
  * @brief 在父亲inode的目录项簇中，寻找连续num个空的目录项
@@ -95,3 +95,5 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
  * @param cnt_longname 总的长目录项的个数
  */
 void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirectory_t *target, uint8_t checksum, uint32_t cnt_longname);
+
+int fat32_remove_entries(struct vfs_index_node_t *dir, struct fat32_slot_info *sinfo);

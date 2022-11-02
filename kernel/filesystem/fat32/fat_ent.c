@@ -215,7 +215,8 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
         // 查找连续num个空闲目录项
         for (int i = 0; (i < fsbi->bytes_per_clus) && count_continuity < num; i += 32, ++tmp_dEntry)
         {
-            if (!(tmp_dEntry->DIR_Name[0] == 0xe5 || tmp_dEntry->DIR_Name[0] == 0x00))
+            if (!(tmp_dEntry->DIR_Name[0] == 0xe5 || tmp_dEntry->DIR_Name[0] == 0x00 ||
+                  tmp_dEntry->DIR_Name[0] == 0x05))
             {
                 count_continuity = 0;
                 continue;
@@ -233,6 +234,7 @@ struct fat32_Directory_t *fat32_find_empty_dentry(struct vfs_index_node_t *paren
             *res_sector = sector;
             *res_data_buf_base = (uint64_t)buf;
             *res_cluster = cluster;
+
             return result_dEntry;
         }
 
@@ -331,12 +333,6 @@ void fat32_fill_shortname(struct vfs_dir_entry_t *dEntry, struct fat32_Directory
             else
                 target->DIR_Name[tmp_index] = 0x20;
         }
-        // 在字符串末尾加入\0
-        if (tmp_index < 8 && tmp_index == dEntry->name_length)
-        {
-            target->DIR_Name[tmp_index] = '\0';
-            ++tmp_index;
-        }
 
         // 不满的部分使用0x20填充
         while (tmp_index < 8)
@@ -389,36 +385,31 @@ void fat32_fill_longname(struct vfs_dir_entry_t *dEntry, struct fat32_LongDirect
     uint32_t current_name_index = 0;
     struct fat32_LongDirectory_t *Ldentry = (struct fat32_LongDirectory_t *)(target + 1);
     // kdebug("filling long name, name=%s, namelen=%d", dEntry->name, dEntry->name_length);
+    int name_length = dEntry->name_length + 1;
     for (int i = 1; i <= cnt_longname; ++i)
     {
         --Ldentry;
-        memset(Ldentry, 0, sizeof(struct fat32_LongDirectory_t));
+
         Ldentry->LDIR_Ord = i;
 
         for (int j = 0; j < 5; ++j, ++current_name_index)
         {
-            if (current_name_index < dEntry->name_length)
+            if (current_name_index < name_length)
                 Ldentry->LDIR_Name1[j] = dEntry->name[current_name_index];
-            else if (current_name_index == dEntry->name_length)
-                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name1[j] = 0xffff;
         }
         for (int j = 0; j < 6; ++j, ++current_name_index)
         {
-            if (current_name_index < dEntry->name_length)
+            if (current_name_index < name_length)
                 Ldentry->LDIR_Name2[j] = dEntry->name[current_name_index];
-            else if (current_name_index == dEntry->name_length)
-                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name2[j] = 0xffff;
         }
         for (int j = 0; j < 2; ++j, ++current_name_index)
         {
-            if (current_name_index < dEntry->name_length)
+            if (current_name_index < name_length)
                 Ldentry->LDIR_Name3[j] = dEntry->name[current_name_index];
-            else if (current_name_index == dEntry->name_length)
-                Ldentry->LDIR_Name1[j] = '\0';
             else
                 Ldentry->LDIR_Name3[j] = 0xffff;
         }
@@ -449,9 +440,9 @@ int fat32_remove_entries(struct vfs_index_node_t *dir, struct fat32_slot_info *s
 
     // 获取文件数据区的起始簇号
     int data_cluster = ((((uint32_t)de->DIR_FstClusHI) << 16) | ((uint32_t)de->DIR_FstClusLO)) & 0x0fffffff;
-    kdebug("data_cluster=%d, cnt_dentries=%d", data_cluster, cnt_dentries);
-    kdebug("fsbi->first_data_sector=%d, sec per clus=%d, i_pos=%d", fsbi->first_data_sector, fsbi->sec_per_clus,
-           sinfo->i_pos);
+    // kdebug("data_cluster=%d, cnt_dentries=%d, offset=%d", data_cluster, cnt_dentries, sinfo->slot_off);
+    // kdebug("fsbi->first_data_sector=%d, sec per clus=%d, i_pos=%d", fsbi->first_data_sector, fsbi->sec_per_clus,
+    //        sinfo->i_pos);
     // === 第一阶段，先删除短目录项
     while (cnt_dentries > 0)
     {
@@ -468,7 +459,7 @@ int fat32_remove_entries(struct vfs_index_node_t *dir, struct fat32_slot_info *s
     // === 第三阶段：清除文件的数据区
     uint32_t next_clus;
     int js = 0;
-    kdebug("data_cluster=%#018lx", data_cluster);
+    // kdebug("data_cluster=%#018lx", data_cluster);
     while (data_cluster < 0x0ffffff8 && data_cluster >= 2)
     {
         // 读取下一个表项
@@ -485,6 +476,6 @@ int fat32_remove_entries(struct vfs_index_node_t *dir, struct fat32_slot_info *s
         data_cluster = next_clus;
     }
 out:;
-    kdebug("Successfully remove %d clusters.", js);
+    // kdebug("Successfully remove %d clusters.", js);
     return retval;
 }

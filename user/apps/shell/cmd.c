@@ -198,7 +198,6 @@ int shell_cmd_cd(int argc, char **argv)
             new_path[current_dir_len] = '/';
         strcat(new_path, argv[1] + dest_offset);
         int x = chdir(new_path);
-
         if (x == 0) // 成功切换目录
         {
             free(shell_current_path);
@@ -209,6 +208,7 @@ int shell_cmd_cd(int argc, char **argv)
         }
         else
         {
+            free(new_path);
             printf("ERROR: Cannot switch to directory: %s\n", new_path);
             goto fail;
         }
@@ -314,6 +314,7 @@ int shell_cmd_cat(int argc, char **argv)
 
     close(fd);
     free(buf);
+    free(file_path);
     if (argv != NULL)
         free(argv);
     return 0;
@@ -330,10 +331,11 @@ int shell_cmd_touch(int argc, char **argv)
 {
     int path_len = 0;
     char *file_path;
+    bool alloc_full_path=false;
     if (argv[1][0] == '/')
         file_path = argv[1];
     else
-        file_path = get_target_filepath(argv[1], &path_len);
+        {file_path = get_target_filepath(argv[1], &path_len);alloc_full_path=true;}
 
     // 打开文件
     int fd = open(file_path, O_CREAT);
@@ -349,6 +351,8 @@ int shell_cmd_touch(int argc, char **argv)
     close(fd);
     if (argv != NULL)
         free(argv);
+    if(alloc_full_path)
+        free(file_path);
     return 0;
 }
 
@@ -362,19 +366,22 @@ int shell_cmd_touch(int argc, char **argv)
 int shell_cmd_mkdir(int argc, char **argv)
 {
     int result_path_len = -1;
-    const char *full_path = NULL;
+    char *full_path = NULL;
+    bool alloc_full_path = false;
     if (argv[1][0] == '/')
         full_path = argv[1];
     else
     {
         full_path = get_target_filepath(argv[1], &result_path_len);
+        alloc_full_path = true;
     }
     // printf("mkdir: full_path = %s\n", full_path);
     int retval = mkdir(full_path, 0);
 
     if (argv != NULL)
         free(argv);
-
+    if (alloc_full_path)
+        free(full_path);
     return retval;
 }
 
@@ -387,17 +394,25 @@ int shell_cmd_mkdir(int argc, char **argv)
  */
 int shell_cmd_rmdir(int argc, char **argv)
 {
-    const char *full_path = NULL;
+    char *full_path = NULL;
     int result_path_len = -1;
+    bool alloc_full_path = false;
+
     if (argv[1][0] == '/')
         full_path = argv[1];
     else
+    {
         full_path = get_target_filepath(argv[1], &result_path_len);
+        alloc_full_path = true;
+    }
     int retval = rmdir(full_path);
+    if (retval != 0)
+        printf("Failed to remove %s, retval=%d\n", full_path, retval);
     // printf("rmdir: path=%s, retval=%d\n", full_path, retval);
     if (argv != NULL)
         free(argv);
-
+    if (alloc_full_path)
+        free(full_path);
     return retval;
 }
 
@@ -410,18 +425,27 @@ int shell_cmd_rmdir(int argc, char **argv)
  */
 int shell_cmd_rm(int argc, char **argv)
 {
-    const char *full_path = NULL;
+     char *full_path = NULL;
     int result_path_len = -1;
+    int retval = 0;
+    bool alloc_full_path = false;
+
     if (argv[1][0] == '/')
         full_path = argv[1];
     else
+    {
         full_path = get_target_filepath(argv[1], &result_path_len);
-    printf("to rm %s\n", full_path);
-    int retval = rm(full_path);
+        alloc_full_path = true;
+    }
+
+    retval = rm(full_path);
     // printf("rmdir: path=%s, retval=%d\n", full_path, retval);
+    if (retval != 0)
+        printf("Failed to remove %s, retval=%d\n", full_path, retval);
+    if (alloc_full_path)
+        free(full_path);
     if (argv != NULL)
         free(argv);
-
     return retval;
 }
 
@@ -447,9 +471,9 @@ int shell_cmd_exec(int argc, char **argv)
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
         execv(file_path, argv);
         free(argv);
-        while (1)
-            ;
-        exit(0);
+        free(file_path);
+        
+        exit(-1);
     }
     else
     {

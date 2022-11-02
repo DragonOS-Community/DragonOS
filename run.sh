@@ -108,8 +108,10 @@ if [ "${GENERATE_ISO}" == "1" ]; then
     mkdir -p ${boot_folder}/grub
     cp ${kernel} ${root_folder}/bin/disk_mount/boot
     # 拷贝用户程序到磁盘镜像
-    cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount
+    mkdir -p ${root_folder}/bin/disk_mount/bin
     mkdir -p ${root_folder}/bin/disk_mount/dev
+
+    cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount/bin
     touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
     
 

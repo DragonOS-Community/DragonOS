@@ -494,7 +494,7 @@ int shell_cmd_about(int argc, char **argv)
 
     unsigned char input_buffer[INPUT_BUFFER_SIZE] = {0};
 
-    strcpy(input_buffer, "exec /about.elf\0");
+    strcpy(input_buffer, "exec /bin/about.elf\0");
 
     parse_command(input_buffer, &aac, &aav);
 

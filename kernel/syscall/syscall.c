@@ -548,6 +548,7 @@ uint64_t sys_wait4(struct pt_regs *regs)
     process_exit_mm(child_proc);
     // 释放子进程的pcb
     free_kthread_struct(child_proc);
+    kdebug("free_kthread_struct(child_proc)");
     kfree(child_proc);
     return 0;
 }
@@ -613,18 +614,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [255] = sys_ahci_end_req,
 };
 
-// /**
-//  * @brief 获取pcb中的kthread结构体
-//  *
-//  * @param pcb pcb
-//  * @return struct kthread* kthread信息结构体
-//  */
-// static inline struct kthread_info_t *to_kthread(struct process_control_block *pcb)
-// {
-//     WARN_ON(!(pcb->flags & PF_KTHREAD));
-//     return pcb->worker_private;
-// }
-
 /**
  * @brief 释放pcb指向的worker private
  *
@@ -633,11 +622,13 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
 void free_kthread_struct(struct process_control_block *pcb)
 {
     struct kthread_info_t *kthread = to_kthread(pcb);
-    if(!kthread)
+    if (!kthread)
     {
         return;
     }
     pcb->worker_private = NULL;
     kfree(kthread->full_name);
+    kdebug("free full name");
     kfree(kthread);
+    kdebug("free kthread");
 }

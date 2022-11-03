@@ -41,7 +41,7 @@ struct kthread_create_info_t
  * @param pcb pcb
  * @return struct kthread* kthread信息结构体
  */
-static inline struct kthread_info_t *to_kthread(struct process_control_block *pcb)
+struct kthread_info_t *to_kthread(struct process_control_block *pcb)
 {
     WARN_ON(!(pcb->flags & PF_KTHREAD));
     return pcb->worker_private;

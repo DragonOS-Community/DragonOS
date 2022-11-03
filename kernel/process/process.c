@@ -1204,9 +1204,9 @@ int process_fd_alloc(struct vfs_file_t *file)
  */
 static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
-    //todo:给pcb加锁
-    // spin_lock(&pcb->alloc_lock);
-    strncpy(pcb->name,pcb_name,PCB_NAME_LEN);
+    // todo:给pcb加锁
+    //  spin_lock(&pcb->alloc_lock);
+    strncpy(pcb->name, pcb_name, PCB_NAME_LEN);
     // spin_unlock(&pcb->alloc_lock);
 }
 
@@ -1223,11 +1223,13 @@ void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_nam
 
 /**
  * @brief 释放pcb
- * 
+ *
  * @param pcb 要被释放的pcb
  */
 void process_free_task(struct process_control_block *pcb)
 {
     free_kthread_struct(pcb);
+    kdebug("free_kthread_struct success");
     kfree(pcb);
+    kdebug("kfree(pcb)");
 }

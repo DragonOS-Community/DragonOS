@@ -92,3 +92,10 @@ int kthread_mechanism_init();
  */
 bool kthread_set_worker_private(struct process_control_block *pcb);
 
+/**
+ * @brief 获取pcb中的kthread结构体
+ *
+ * @param pcb pcb
+ * @return struct kthread* kthread信息结构体
+ */
+struct kthread_info_t *to_kthread(struct process_control_block *pcb);

@@ -172,6 +172,7 @@ static int kthread(void *_create)
 
     current_pcb->state &= ~PROC_RUNNING;    // 设置当前进程不是RUNNING态
     io_mfence();
+
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
     sched();
 

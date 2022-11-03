@@ -44,3 +44,4 @@ struct __test_data
 
 int __test_completion_waiter(void *data); // 等待者
 int __test_completion_worker(void *data); // 执行者
+void __test_completion();

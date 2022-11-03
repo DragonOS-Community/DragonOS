@@ -1,4 +1,5 @@
 #include "common/completion.h"
+#include "common/kthread.h"
 
 /**
  * @brief 初始化一个completion变量
@@ -43,16 +44,6 @@ void complete_all(struct completion *x)
 
     spin_unlock(&x->wait_queue.lock);
 }
-
-/**
- * @brief 辅助函数：传进schedule_timeout函数中, 然后时间一到就唤醒 pcb 指向的进程(即自身)
- *
- * @param pcb process_control_block
- */
-// static void __wake_up_helper(struct process_control_block *pcb)
-// {
-//     BUG_ON(process_wakeup(pcb) != 0); // 正常唤醒,返回值为0
-// }
 
 /**
  * @brief 辅助函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
@@ -200,7 +191,7 @@ bool completion_done(struct completion *x)
 }
 
 /**
- * @brief 对一个completion数组进行wait操作
+ * @brief 对completion数组进行wait操作
  *
  * @param x completion array
  * @param n len of the array
@@ -230,7 +221,7 @@ void wait_for_multicompletion(struct completion x[], int n)
 int __test_completion_waiter(void *input_data)
 {
     struct __test_data *data = (struct __test_data *)input_data;
-    kdebug("THE %d WAITER BEGIN", -data->id);
+    // kdebug("THE %d WAITER BEGIN", -data->id);
     // 测试一对多能不能实现等待 - 由外部统一放闸一起跑
     if (!try_wait_for_completion(data->one_to_many))
     {
@@ -245,7 +236,7 @@ int __test_completion_waiter(void *input_data)
 
     // 完成上面两个等待, 执行complete声明自己已经完成
     complete(data->many_to_one);
-    kdebug("THE %d WAITER SOLVED", -data->id);
+    // kdebug("THE %d WAITER SOLVED", -data->id);
     return true;
 }
 
@@ -259,20 +250,79 @@ int __test_completion_waiter(void *input_data)
 int __test_completion_worker(void *input_data)
 {
     struct __test_data *data = (struct __test_data *)input_data;
-    kdebug("THE %d WORKER BEGIN", data->id);
+    // kdebug("THE %d WORKER BEGIN", data->id);
     // 测试一对多能不能实现等待 - 由外部统一放闸一起跑
     if (!try_wait_for_completion(data->one_to_many))
     {
         wait_for_completion(data->one_to_many);
     }
 
-    schedule_timeout_ms(5000);
+    schedule_timeout_ms(50);
     // for(uint64_t i=0;i<1e7;++i)
     //     pause();
     complete(data->one_to_one);
 
     // 完成上面两个等待, 执行complete声明自己已经完成
     complete(data->many_to_one);
-    kdebug("THE %d WORKER SOLVED", data->id);
+    // kdebug("THE %d WORKER SOLVED", data->id);
     return true;
+}
+
+/**
+ * @brief 测试函数
+ *
+ */
+void __test_completion()
+{
+    // kdebug("BEGIN COMPLETION TEST");
+    const int N = 100;
+    struct completion *one_to_one = kzalloc(sizeof(struct completion) * N, 0);
+    struct completion *one_to_many = kzalloc(sizeof(struct completion), 0);
+    struct completion *waiter_many_to_one = kzalloc(sizeof(struct completion) * N, 0);
+    struct completion *worker_many_to_one = kzalloc(sizeof(struct completion) * N, 0);
+    struct __test_data *waiter_data = kzalloc(sizeof(struct __test_data) * N, 0);
+    struct __test_data *worker_data = kzalloc(sizeof(struct __test_data) * N, 0);
+
+    completion_init(one_to_many);
+    for (int i = 0; i < N; i++)
+    {
+        completion_init(&one_to_one[i]);
+        completion_init(&waiter_many_to_one[i]);
+        completion_init(&worker_many_to_one[i]);
+    }
+
+    for (int i = 0; i < N; i++)
+    {
+        waiter_data[i].id = -i; // waiter
+        waiter_data[i].many_to_one = &waiter_many_to_one[i];
+        waiter_data[i].one_to_one = &one_to_one[i];
+        waiter_data[i].one_to_many = one_to_many;
+        kthread_run(__test_completion_waiter, &waiter_data[i], "the %dth waiter", i);
+    }
+
+    for (int i = 0; i < N; i++)
+    {
+        worker_data[i].id = i; // worker
+        worker_data[i].many_to_one = &worker_many_to_one[i];
+        worker_data[i].one_to_one = &one_to_one[i];
+        worker_data[i].one_to_many = one_to_many;
+        kthread_run(__test_completion_worker, &worker_data[i], "the %dth worker", i);
+    }
+
+    complete_all(one_to_many);
+    // kdebug("all of the waiters and workers begin running");
+
+    // kdebug("BEGIN COUNTING");
+
+    wait_for_multicompletion(waiter_many_to_one, N);
+    wait_for_multicompletion(worker_many_to_one, N);
+    // kdebug("all of the waiters and workers complete");
+
+    kfree(one_to_one);
+    kfree(one_to_many);
+    kfree(waiter_many_to_one);
+    kfree(worker_many_to_one);
+    kfree(waiter_data);
+    kfree(worker_data);
+    // kdebug("completion test done.");
 }

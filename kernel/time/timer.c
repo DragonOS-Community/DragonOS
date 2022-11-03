@@ -9,8 +9,8 @@
 struct timer_func_list_t timer_func_head;
 static spinlock_t sched_lock;
 
-// 定时器循环阈值，每次最大执行10个定时器任务
-#define TIMER_RUN_CYCLE_THRESHOLD 10
+// 定时器循环阈值，每次最大执行20个定时器任务
+#define TIMER_RUN_CYCLE_THRESHOLD 20
 
 void test_timer()
 {
@@ -55,7 +55,7 @@ void do_timer_softirq(void *data)
         ++cycle_count;
 
 
-        kdebug("SOLVE SOFT IRQ %d", cycle_count);
+        // kdebug("SOLVE SOFT IRQ %d", cycle_count);
 
         // 当前定时器达到阈值
         if (cycle_count == TIMER_RUN_CYCLE_THRESHOLD)

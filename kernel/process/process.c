@@ -1,10 +1,7 @@
 #include "process.h"
 
-/*** include completion ***/
-#include <common/completion.h>
-/*** end ***/
-
 #include <common/compiler.h>
+#include <common/completion.h>
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
@@ -505,6 +502,9 @@ ul initial_kernel_thread(ul arg)
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
 
+    // 对completion完成量进行测试
+    __test_completion();
+
     // 对一些组件进行单元测试
     uint64_t tpid[] = {
         ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
@@ -516,64 +516,6 @@ ul initial_kernel_thread(ul arg)
     for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
         waitpid(tpid[i], NULL, NULL);
     kinfo("All test done.");
-
-    /*************************    completion测试代码 start ***************************************************/
-
-    kdebug("BEGIN COMPLETION TEST");
-    const int N = 10;
-    struct completion *one_to_one = kzalloc(sizeof(struct completion) * N, 0);
-    struct completion *one_to_many = kzalloc(sizeof(struct completion), 0);
-    struct completion *waiter_many_to_one = kzalloc(sizeof(struct completion) * N, 0);
-    struct completion *worker_many_to_one = kzalloc(sizeof(struct completion) * N, 0);
-    struct __test_data *waiter_data = kzalloc(sizeof(struct __test_data) * N, 0);
-    struct __test_data *worker_data = kzalloc(sizeof(struct __test_data) * N, 0);
-
-    completion_init(one_to_many);
-    for (int i = 0; i < N; i++)
-    {
-        completion_init(&one_to_one[i]);
-        completion_init(&waiter_many_to_one[i]);
-        completion_init(&worker_many_to_one[i]);
-    }
-
-    for (int i = 0; i < N; i++)
-    {
-        waiter_data[i].id = -i; // waiter
-        waiter_data[i].many_to_one = &waiter_many_to_one[i];
-        waiter_data[i].one_to_one = &one_to_one[i];
-        waiter_data[i].one_to_many = one_to_many;
-        kthread_run(__test_completion_waiter, &waiter_data[i], "the %dth waiter", i);
-    }
-
-    for (int i = 0; i < N; i++)
-    {
-        worker_data[i].id = i; // worker
-        worker_data[i].many_to_one = &worker_many_to_one[i];
-        worker_data[i].one_to_one = &one_to_one[i];
-        worker_data[i].one_to_many = one_to_many;
-        kthread_run(__test_completion_worker, &worker_data[i], "the %dth worker", i);
-    }
-
-    complete_all(one_to_many);
-    kdebug("all of the waiters and workers begin running");
-
-    kdebug("BEGIN COUNTING");
-    // usleep(50000000);
-    // kdebug("COUNTING OVER");
-
-    wait_for_multicompletion(waiter_many_to_one, N);
-    wait_for_multicompletion(worker_many_to_one, N);
-    kdebug("all of the waiters and workers complete");
-
-    kfree(one_to_one);
-    kfree(one_to_many);
-    kfree(waiter_many_to_one);
-    kfree(worker_many_to_one);
-    kfree(waiter_data);
-    kfree(worker_data);
-    kdebug("COMPLETION TEST DONE");
-
-    /*************************    completion测试代码 end ***************************************************/
 
     // 准备切换到用户态
     struct pt_regs *regs;
@@ -1266,9 +1208,9 @@ int process_fd_alloc(struct vfs_file_t *file)
  */
 static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
-    //todo:给pcb加锁
-    // spin_lock(&pcb->alloc_lock);
-    strncpy(pcb->name,pcb_name,PCB_NAME_LEN);
+    // todo:给pcb加锁
+    //  spin_lock(&pcb->alloc_lock);
+    strncpy(pcb->name, pcb_name, PCB_NAME_LEN);
     // spin_unlock(&pcb->alloc_lock);
 }
 

@@ -65,7 +65,7 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
     spin_lock(&__kthread_create_lock);
     list_append(&kthread_create_list, &create->list);
     spin_unlock(&__kthread_create_lock);
-    kdebug("to wakeup kthread daemon..., current preempt=%d, rflags=%#018lx", current_pcb->preempt_count, get_rflags());
+    // kdebug("to wakeup kthread daemon..., current preempt=%d, rflags=%#018lx", current_pcb->preempt_count, get_rflags());
     while (kthreadd_pcb == NULL) // 若kthreadd未初始化，则等待kthreadd启动
         ;
     // 唤醒kthreadd守护进程

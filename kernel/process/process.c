@@ -1229,7 +1229,5 @@ void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_nam
 void process_free_task(struct process_control_block *pcb)
 {
     free_kthread_struct(pcb);
-    kdebug("free_kthread_struct success");
     kfree(pcb);
-    kdebug("kfree(pcb)");
 }

@@ -548,7 +548,6 @@ uint64_t sys_wait4(struct pt_regs *regs)
     process_exit_mm(child_proc);
     // 释放子进程的pcb
     free_kthread_struct(child_proc);
-    kdebug("free_kthread_struct(child_proc)");
     kfree(child_proc);
     return 0;
 }
@@ -628,7 +627,5 @@ void free_kthread_struct(struct process_control_block *pcb)
     }
     pcb->worker_private = NULL;
     kfree(kthread->full_name);
-    kdebug("free full name");
     kfree(kthread);
-    kdebug("free kthread");
 }

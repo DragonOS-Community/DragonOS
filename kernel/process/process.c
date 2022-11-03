@@ -1220,3 +1220,14 @@ void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_nam
 {
     __set_pcb_name(pcb, pcb_name);
 }
+
+/**
+ * @brief 释放pcb
+ * 
+ * @param pcb 要被释放的pcb
+ */
+void process_free_task(struct process_control_block *pcb)
+{
+    free_kthread_struct(pcb);
+    kfree(pcb);
+}

@@ -1,6 +1,7 @@
 #include "process.h"
 
 #include <common/compiler.h>
+#include <common/completion.h>
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
@@ -500,6 +501,9 @@ ul initial_kernel_thread(ul arg)
     // int usb_pid = kernel_thread(usb_init, 0, 0);
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
+
+    // 对completion完成量进行测试
+    __test_completion();
 
     // 对一些组件进行单元测试
     uint64_t tpid[] = {
@@ -1204,9 +1208,9 @@ int process_fd_alloc(struct vfs_file_t *file)
  */
 static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
-    //todo:给pcb加锁
-    // spin_lock(&pcb->alloc_lock);
-    strncpy(pcb->name,pcb_name,PCB_NAME_LEN);
+    // todo:给pcb加锁
+    //  spin_lock(&pcb->alloc_lock);
+    strncpy(pcb->name, pcb_name, PCB_NAME_LEN);
     // spin_unlock(&pcb->alloc_lock);
 }
 

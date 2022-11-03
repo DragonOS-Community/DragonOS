@@ -3,40 +3,40 @@
 //
 
 #include "common/glib.h"
-#include "common/printk.h"
 #include "common/kprint.h"
+#include "common/printk.h"
 #include "exception/gate.h"
-#include "exception/trap.h"
 #include "exception/irq.h"
-#include <exception/softirq.h>
-#include <lib/libUI/screen_manager.h>
-#include <lib/libUI/textui.h>
+#include "exception/trap.h"
 #include "mm/mm.h"
 #include "mm/slab.h"
 #include "process/process.h"
-#include "syscall/syscall.h"
 #include "smp/smp.h"
-#include <smp/ipi.h>
+#include "syscall/syscall.h"
+#include <exception/softirq.h>
+#include <lib/libUI/screen_manager.h>
+#include <lib/libUI/textui.h>
 #include <sched/sched.h>
+#include <smp/ipi.h>
 
-#include <filesystem/fat32/fat32.h>
 #include <filesystem/VFS/VFS.h>
 #include <filesystem/devfs/devfs.h>
+#include <filesystem/fat32/fat32.h>
 
-#include "driver/multiboot2/multiboot2.h"
 #include "driver/acpi/acpi.h"
-#include "driver/keyboard/ps2_keyboard.h"
-#include "driver/tty/tty.h"
-#include "driver/mouse/ps2_mouse.h"
-#include "driver/disk/ata.h"
-#include "driver/pci/pci.h"
-#include <driver/usb/usb.h>
 #include "driver/disk/ahci/ahci.h"
-#include <driver/timers/rtc/rtc.h>
+#include "driver/disk/ata.h"
+#include "driver/keyboard/ps2_keyboard.h"
+#include "driver/mouse/ps2_mouse.h"
+#include "driver/multiboot2/multiboot2.h"
+#include "driver/pci/pci.h"
+#include "driver/tty/tty.h"
 #include <driver/timers/HPET/HPET.h>
-#include <time/timer.h>
+#include <driver/timers/rtc/rtc.h>
 #include <driver/uart/uart.h>
+#include <driver/usb/usb.h>
 #include <driver/video/video.h>
+#include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
 
@@ -52,8 +52,7 @@ void reload_gdt()
     gdtp.size = bsp_gdt_size - 1;
     gdtp.gdt_vaddr = (ul)phys_2_virt((ul)&GDT_Table);
 
-    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp)
-                 : "memory");
+    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp) : "memory");
 }
 
 void reload_idt()
@@ -64,8 +63,7 @@ void reload_idt()
     // kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
     // kdebug("gdt size=%d", p.size);
 
-    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp)
-                 : "memory");
+    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp) : "memory");
 }
 
 // 初始化系统各模块
@@ -86,8 +84,8 @@ void system_initialize()
     kdebug("_stack_start=%#018lx", _stack_start);
 
     load_TR(10); // 加载TR寄存器
-    set_tss64((uint *)&initial_tss[0], _stack_start, _stack_start, _stack_start, tss_item_addr,
-              tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
+    set_tss64((uint *)&initial_tss[0], _stack_start, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
+              tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
 
     cpu_core_info[0].stack_start = _stack_start;
     cpu_core_info[0].tss_vaddr = (uint64_t)&initial_tss[0];
@@ -206,7 +204,20 @@ void Start_Kernel(void)
     system_initialize();
     io_mfence();
 
+    // idle
     while (1)
-        pause();
+    {
+        // 如果调用的时候，启用了中断，则hlt。否则认为是bug
+        if (get_rflags() & 0x200)
+        {
+            kdebug("hlt");
+            hlt();
+        }
+        else
+        {
+            BUG_ON(1);
+            pause();
+        }
+    }
 }
 #pragma GCC pop_options

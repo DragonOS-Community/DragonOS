@@ -65,7 +65,7 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
     spin_lock(&__kthread_create_lock);
     list_append(&kthread_create_list, &create->list);
     spin_unlock(&__kthread_create_lock);
-    kdebug("to wakeup kthread daemon..., current preempt=%d, rflags=%#018lx", current_pcb->preempt_count, get_rflags());
+    // kdebug("to wakeup kthread daemon..., current preempt=%d, rflags=%#018lx", current_pcb->preempt_count, get_rflags());
     while (kthreadd_pcb == NULL) // 若kthreadd未初始化，则等待kthreadd启动
         ;
     // 唤醒kthreadd守护进程
@@ -170,7 +170,9 @@ static int kthread(void *_create)
     // 将当前pcb返回给创建者
     create->result = current_pcb;
 
-    current_pcb->state &= ~PROC_RUNNING; // 设置当前进程不是RUNNING态
+    current_pcb->state &= ~PROC_RUNNING;    // 设置当前进程不是RUNNING态
+    io_mfence();
+
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
     sched();
 
@@ -186,6 +188,7 @@ static int kthread(void *_create)
 static void __create_kthread(struct kthread_create_info_t *create)
 {
     pid_t pid = kernel_thread(kthread, create, CLONE_FS | CLONE_SIGNAL);
+    io_mfence();
     if (IS_ERR((void *)pid))
     {
         // todo: 使用complete机制完善这里

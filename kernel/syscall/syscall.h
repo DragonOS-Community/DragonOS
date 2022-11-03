@@ -4,6 +4,7 @@
 #include <common/kprint.h>
 #include <process/ptrace.h>
 #include <common/unistd.h>
+#include <process/proc-types.h>
 // 定义最大系统调用数量
 #define MAX_SYSTEM_CALL_NUM 256
 
@@ -97,3 +98,10 @@ ul sys_ahci_end_req(struct pt_regs *regs);
 
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code);
+
+/**
+ * @brief 释放pcb指向的worker private
+ * 
+ * @param pcb 要释放的pcb
+ */
+void free_kthread_struct(struct process_control_block *pcb);

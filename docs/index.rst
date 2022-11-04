@@ -47,6 +47,7 @@
 
    community/code_contribution/index
    community/contact/index
+   community/ChangeLog/index
 
 
 Indices and tables

@@ -188,12 +188,6 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags);
 
 int process_fd_alloc(struct vfs_file_t *file);
 
-/**
- * @brief 释放pcb
- *
- * @param pcb
- * @return int
- */
 int process_release_pcb(struct process_control_block *pcb);
 
 /**

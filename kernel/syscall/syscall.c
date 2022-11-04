@@ -10,7 +10,7 @@
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
-
+#include <common/kthread.h>
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
 extern void syscall_int(void);
@@ -544,10 +544,7 @@ uint64_t sys_wait4(struct pt_regs *regs)
     // copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
     proc->next_pcb = child_proc->next_pcb;
 
-    // 释放子进程的页表
-    process_exit_mm(child_proc);
-    // 释放子进程的pcb
-    kfree(child_proc);
+    process_release_pcb(child_proc);
     return 0;
 }
 
@@ -611,3 +608,4 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [23 ... 254] = system_call_not_exists,
     [255] = sys_ahci_end_req,
 };
+

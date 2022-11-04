@@ -2,8 +2,9 @@
 
 #include <common/glib.h>
 #include <common/kprint.h>
-#include <process/ptrace.h>
 #include <common/unistd.h>
+#include <process/ptrace.h>
+
 // 定义最大系统调用数量
 #define MAX_SYSTEM_CALL_NUM 256
 
@@ -63,7 +64,7 @@ ul sys_printf(struct pt_regs *regs);
  * arg0=0  ===> 返回堆区域的起始地址
  * arg0=-1  ===> 返回堆区域的结束地址
  * @return uint64_t 错误码
- * 
+ *
  */
 uint64_t sys_brk(struct pt_regs *regs);
 
@@ -80,18 +81,18 @@ uint64_t sys_sbrk(struct pt_regs *regs);
  * 在VFS.c中实现
  * @param path(r8) 路径
  * @param mode(r9) 模式
- * @return uint64_t 
+ * @return uint64_t
  */
-uint64_t sys_mkdir(struct pt_regs * regs);
+uint64_t sys_mkdir(struct pt_regs *regs);
 
 /**
  * @brief 创建管道
  * 在pipe.c中实现
  * @param fd(r8) 文件句柄指针
  * @param num(r9) 文件句柄个数
- * @return uint64_t 
+ * @return uint64_t
  */
-uint64_t sys_pipe(struct pt_regs * regs);
+uint64_t sys_pipe(struct pt_regs *regs);
 
 ul sys_ahci_end_req(struct pt_regs *regs);
 

@@ -41,7 +41,7 @@ struct kthread_create_info_t
  * @param pcb pcb
  * @return struct kthread* kthread信息结构体
  */
-static inline struct kthread_info_t *to_kthread(struct process_control_block *pcb)
+struct kthread_info_t *to_kthread(struct process_control_block *pcb)
 {
     WARN_ON(!(pcb->flags & PF_KTHREAD));
     return pcb->worker_private;
@@ -55,6 +55,7 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
 
     if (create == NULL)
         return ERR_PTR(-ENOMEM);
+    BUG_ON(name_fmt == NULL);
 
     create->thread_fn = thread_fn;
     create->data = data;
@@ -65,7 +66,9 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
     spin_lock(&__kthread_create_lock);
     list_append(&kthread_create_list, &create->list);
     spin_unlock(&__kthread_create_lock);
-    // kdebug("to wakeup kthread daemon..., current preempt=%d, rflags=%#018lx", current_pcb->preempt_count, get_rflags());
+    // kdebug("to wakeup kthread daemon..., current preempt=%d, rflags=%#018lx", current_pcb->preempt_count,
+
+    // todo: 使用completion优化这里
     while (kthreadd_pcb == NULL) // 若kthreadd未初始化，则等待kthreadd启动
         ;
     // 唤醒kthreadd守护进程
@@ -79,21 +82,21 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
     pcb = create->result;
     if (!IS_ERR(create->result))
     {
-        // todo: 为内核线程设置名字
+        // 为内核线程设置名字
         char pcb_name[PCB_NAME_LEN];
         va_list get_args;
         va_copy(get_args, args);
-        //获取到字符串的前16字节
+        // 获取到字符串的前16字节
         int len = vsnprintf(pcb_name, name_fmt, PCB_NAME_LEN, get_args);
         if (len >= PCB_NAME_LEN)
         {
             //名字过大 放到full_name字段中
             struct kthread_info_t *kthread = to_kthread(pcb);
-            char *full_name = kzalloc(1024, __GFP_ZERO);
+            char *full_name = kzalloc(1024, 0);
             vsprintf(full_name, name_fmt, get_args);
             kthread->full_name = full_name;
         }
-        //将前16Bytes放到pcb的name字段
+        // 将前16Bytes放到pcb的name字段
         process_set_pcb_name(pcb, pcb_name);
         va_end(get_args);
     }
@@ -307,4 +310,21 @@ int kthread_mechanism_init()
     kernel_thread(kthreadd, NULL, CLONE_FS | CLONE_SIGNAL);
 
     return 0;
+}
+
+/**
+ * @brief 释放pcb指向的worker private
+ *
+ * @param pcb 要释放的pcb
+ */
+void free_kthread_struct(struct process_control_block *pcb)
+{
+    struct kthread_info_t *kthread = to_kthread(pcb);
+    if (!kthread)
+    {
+        return;
+    }
+    pcb->worker_private = NULL;
+    kfree(kthread->full_name);
+    kfree(kthread);
 }

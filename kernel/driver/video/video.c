@@ -54,12 +54,11 @@ int video_refresh_daemon(void *unused)
 {
     // 初始化锁, 这个锁只会在daemon中使用
     spin_init(&daemon_refresh_lock);
-    
+
     for (;;)
     {
         if (clock() >= video_refresh_expire_jiffies)
         {
-            video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
 
             if (likely(video_refresh_target != NULL))
             {
@@ -68,6 +67,7 @@ int video_refresh_daemon(void *unused)
                        video_refresh_target->size);
                 spin_unlock(&daemon_refresh_lock);
             }
+            video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
         }
         video_daemon_pcb->flags &= ~PROC_RUNNING;
         sched();

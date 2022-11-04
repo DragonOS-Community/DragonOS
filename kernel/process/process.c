@@ -1,6 +1,7 @@
 #include "process.h"
 
 #include <common/compiler.h>
+#include <common/completion.h>
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
@@ -500,6 +501,9 @@ ul initial_kernel_thread(ul arg)
     // int usb_pid = kernel_thread(usb_init, 0, 0);
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
+
+    // 对completion完成量进行测试
+    __test_completion();
 
     // 对一些组件进行单元测试
     uint64_t tpid[] = {

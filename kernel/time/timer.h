@@ -4,6 +4,9 @@
 #include <driver/timers/HPET/HPET.h>
 #include <driver/timers/rtc/rtc.h>
 
+// 定义LONG_MAX为最大超时时间 - 允许负数
+#define MAX_TIMEOUT (int64_t)((1ul << 63) - 1)
+
 uint64_t volatile timer_jiffies = 0; // 系统时钟计数
 
 // 计算接下来n毫秒对应的系统时间片
@@ -63,3 +66,11 @@ void timer_func_add(struct timer_func_list_t *timer_func);
 void timer_func_del(struct timer_func_list_t *timer_func);
 
 uint64_t clock();
+
+/**
+ * @brief 睡眠timeout的时间之后唤醒进程/线程
+ * 
+ * @param timeout 
+ * @return long 
+ */
+long schedule_timeout_ms(long timeout);

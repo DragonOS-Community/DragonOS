@@ -99,3 +99,10 @@ bool kthread_set_worker_private(struct process_control_block *pcb);
  * @return struct kthread* kthread信息结构体
  */
 struct kthread_info_t *to_kthread(struct process_control_block *pcb);
+
+/**
+ * @brief 释放pcb指向的worker private
+ * 
+ * @param pcb 要释放的pcb
+ */
+void free_kthread_struct(struct process_control_block *pcb);

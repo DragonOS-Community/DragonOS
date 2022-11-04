@@ -1165,14 +1165,19 @@ void process_exit_thread(struct process_control_block *pcb)
 /**
  * @brief 释放pcb
  *
- * @param pcb
+ * @param pcb 要被释放的pcb
  * @return int
  */
 int process_release_pcb(struct process_control_block *pcb)
 {
+    // 释放子进程的页表
+    process_exit_mm(pcb);
+    // 释放子进程的pcb
+    free_kthread_struct(pcb);
     kfree(pcb);
     return 0;
 }
+
 /**
  * @brief 申请可用的文件句柄
  *
@@ -1219,15 +1224,4 @@ static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_na
 void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
     __set_pcb_name(pcb, pcb_name);
-}
-
-/**
- * @brief 释放pcb
- *
- * @param pcb 要被释放的pcb
- */
-void process_free_task(struct process_control_block *pcb)
-{
-    free_kthread_struct(pcb);
-    kfree(pcb);
 }

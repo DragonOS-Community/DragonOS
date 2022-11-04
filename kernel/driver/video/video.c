@@ -183,7 +183,7 @@ int video_init()
                      PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
 
     io_mfence();
-    char init_text2[] = "Video driver initialized.";
+    char init_text2[] = "Video driver initialized.\n";
     for (int i = 0; i < sizeof(init_text2) - 1; ++i)
         uart_send(COM1, init_text2[i]);
 

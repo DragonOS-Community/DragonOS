@@ -148,7 +148,8 @@
         "timer.h": "c",
         "hid.h": "c",
         "cfs.h": "c",
-        "fat32.h": "c"
+        "fat32.h": "c",
+        "err.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

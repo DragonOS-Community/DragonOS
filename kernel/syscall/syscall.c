@@ -544,11 +544,7 @@ uint64_t sys_wait4(struct pt_regs *regs)
     // copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
     proc->next_pcb = child_proc->next_pcb;
 
-    // 释放子进程的页表
-    process_exit_mm(child_proc);
-    // 释放子进程的pcb
-    free_kthread_struct(child_proc);
-    kfree(child_proc);
+    process_release_pcb(child_proc);
     return 0;
 }
 
@@ -613,19 +609,3 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [255] = sys_ahci_end_req,
 };
 
-/**
- * @brief 释放pcb指向的worker private
- *
- * @param pcb 要释放的pcb
- */
-void free_kthread_struct(struct process_control_block *pcb)
-{
-    struct kthread_info_t *kthread = to_kthread(pcb);
-    if (!kthread)
-    {
-        return;
-    }
-    pcb->worker_private = NULL;
-    kfree(kthread->full_name);
-    kfree(kthread);
-}

@@ -136,10 +136,8 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
-                         : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
-                         : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -1176,8 +1174,8 @@ int process_release_pcb(struct process_control_block *pcb)
 {
     // 释放子进程的页表
     process_exit_mm(pcb);
-    // 释放子进程的pcb
-    free_kthread_struct(pcb);
+    if ((pcb->flags & PF_KTHREAD))  // 释放内核线程的worker private结构体
+        free_kthread_struct(pcb);
     kfree(pcb);
     return 0;
 }

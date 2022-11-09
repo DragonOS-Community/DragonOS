@@ -8,6 +8,10 @@ struct sched_queue_rt sched_rt_ready_queue[MAX_CPU_NUM]; // 就绪队列
  */
 void sched_rt()
 {
+    cli();
+// 先选择需要调度的进程、再进行调度
+
+    sti();
 }
 
 /**

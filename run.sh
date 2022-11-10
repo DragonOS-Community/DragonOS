@@ -43,12 +43,12 @@ if [ ! "$1" == "--nobuild" ]; then
         GENERATE_ISO=1
     else
         
-        make all -j 16
-        if [ "$?" != "0" ]; then\
-            echo "DragonOS编译失败";\
-            exit 1;\
-        fi;\
-        make clean
+        # make all -j 16
+        # if [ "$?" != "0" ]; then\
+        #     echo "DragonOS编译失败";\
+        #     exit 1;\
+        # fi;\
+        # make clean
         GENERATE_ISO=1
     fi
 fi

@@ -20,8 +20,6 @@ LD_LIST := head.o
 kernel_subdirs := common driver process debug filesystem time arch exception mm smp sched syscall ktest lib ipc
 	
 
-kernel_rust: ECHO
-	$(shell cargo build) 
 
 head.o: head.S
 	$(CC) -E head.S > _head.s # 预处理
@@ -34,9 +32,11 @@ main.o: main.c
 	$(CC) $(CFLAGS) -c main.c  -o main.o
 
 
-all: kernel kernel_rust
+all: kernel
+	rustup default nightly
+	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json
 	@echo "Linking kernel..."
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") -T link.lds
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds
 # 生成kallsyms
 	current_dir=$(pwd)
 	
@@ -49,9 +49,10 @@ all: kernel kernel_rust
         fi;\
 	done
 	
+	
 # 重新链接
 	@echo "Re-Linking kernel..."
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ./debug/kallsyms.o -T link.lds
+	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../../bin/kernel/kernel.elf

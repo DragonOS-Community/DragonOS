@@ -69,7 +69,6 @@ cfg_content='set timeout=15
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
 fi
 
-# ${GRUB_PATH}/grub-mkrescue -o ${iso} ${iso_folder}
 # rm -rf ${iso_folder}
 LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
 echo $LOOP_DEVICE

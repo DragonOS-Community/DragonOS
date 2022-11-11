@@ -35,7 +35,7 @@ install_ubuntu_debian_pkg()
         curl \
         gnupg \
         lsb-release \
-        llvm-dev libclang-dev clang \
+        llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk
     
     if [ -z "$(which docker)" ]; then

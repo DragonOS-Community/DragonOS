@@ -1,7 +1,9 @@
 extern crate bindgen;
+
 extern crate cbindgen;
 
-use::std::env;
+use ::std::env;
+
 use std::path::PathBuf;
 
 fn main() {
@@ -35,12 +37,12 @@ fn main() {
             // Unwrap the Result and panic on failure.
             .expect("Unable to generate bindings");
 
-        
-
         bindings
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
     }
 
-    cbindgen::generate(crate_dir).unwrap().write_to_file(out_path.join("bindings.h"));
+    cbindgen::generate(crate_dir)
+        .unwrap()
+        .write_to_file(out_path.join("bindings.h"));
 }

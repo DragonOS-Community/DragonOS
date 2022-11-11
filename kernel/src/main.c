@@ -41,6 +41,7 @@
 #include <driver/interrupt/apic/apic_timer.h>
 
 ul bsp_idt_size, bsp_gdt_size;
+
 #include <include/bindings/bindings.h>
 
 #pragma GCC push_options

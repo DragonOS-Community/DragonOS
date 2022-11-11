@@ -9,7 +9,7 @@ on:
 jobs:
   build:
 
-    runs-on: dragonos/dragonos-dev:v1.1.0-beta3
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v3

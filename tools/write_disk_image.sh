@@ -18,7 +18,6 @@ export PATH="${GRUB_PATH}:$PATH"
 
 # ==============检查文件是否齐全================
 
-
 bins[0]=${kernel}
 
 for file in ${bins[*]};do

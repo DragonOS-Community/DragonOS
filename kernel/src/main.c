@@ -41,7 +41,7 @@
 #include <driver/interrupt/apic/apic_timer.h>
 
 ul bsp_idt_size, bsp_gdt_size;
-extern int eestart();
+extern int __rust_demo_func();
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -166,7 +166,7 @@ void system_initialize()
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
-    kdebug("_eestart=%d", eestart());
+    __rust_demo_func();
     // fat32_init();
     HPET_enable();
 

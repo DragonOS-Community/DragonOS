@@ -1,12 +1,17 @@
 extern crate bindgen;
+extern crate cbindgen;
 
+use::std::env;
 use std::path::PathBuf;
 
 fn main() {
     // Tell cargo to look for shared libraries in the specified directory
     println!("cargo:rustc-link-search=src");
     println!("cargo:rerun-if-changed=src/include/bindings/wrapper.h");
-    let binding_file_path = "src/include/bindings/bindings.rs";
+
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_path = PathBuf::from(String::from("src/include/bindings/"));
+
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
     // the resulting bindings.
@@ -30,11 +35,12 @@ fn main() {
             // Unwrap the Result and panic on failure.
             .expect("Unable to generate bindings");
 
-        // Write the bindings to the $OUT_DIR/bindings.rs file.
-        let out_path = PathBuf::from(String::from("."));
+        
 
         bindings
-            .write_to_file(out_path.join(binding_file_path))
+            .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
     }
+
+    cbindgen::generate(crate_dir).unwrap().write_to_file(out_path.join("bindings.h"));
 }

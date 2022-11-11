@@ -8,8 +8,11 @@ edition = "2021"
 [lib]
 crate-type = ["staticlib"]
 
+# 运行时依赖项
 [dependencies]
 x86_64 = "0.14.10"
 
+# 构建时依赖项
 [build-dependencies]
 bindgen = "0.61.0"
+cbindgen = "0.24.3"

@@ -17,7 +17,7 @@
 &emsp;&emsp;当您成功安装了docker之后，您可以通过以下命令，下载DragonOS的编译镜像：
 
 ```shell
-docker pull dragonos/dragonos-dev:v1.0
+docker pull dragonos/dragonos-dev:v1.1.0-beta3
 ```
 
 ### 安装qemu虚拟机
@@ -64,20 +64,19 @@ bash create_hdd_image.sh
 &emsp;&emsp;如果不出意外的话，这将是运行DragonOS的最后一步。您只需要在DragonOS的根目录下方，执行以下命令，即可运行DragonOS。
 
 ```shell
-bash run.sh --docker
+make run-docker
 ```
 
-&emsp;&emsp;若输入密码后仍提示权限不足，您可以使用以下命令运行：
-
-```shell
-sudo bash run.sh --docker
-```
 
 &emsp;&emsp;稍等片刻，DragonOS将会被运行。
 
 &emsp;&emsp;在qemu虚拟机被启动后，我们需要在控制台输入字母`c`，然后回车。这样，虚拟机就会开始执行。
 
+:::{note}
+首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！
+:::
 
+**关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
 
 ## 手动搭建开发环境
 
@@ -92,20 +91,24 @@ sudo bash run.sh --docker
 
 &emsp;&emsp;需要注意的是，编译安装qemu将会是一件费时费力的工作，它可能需要花费你40分钟以上的时间。
 
-&emsp;&emsp;对于以下软件依赖，建议您使用系统自带的包管理器进行安装。
+&emsp;&emsp;对于其余的软件依赖，我们提供了一键配置脚本，可以一键安装，只需要在控制台运行以下命令：
 
-- gcc >= 8.3.0
+```shell
+cd tools
+bash bootstrap.sh
+```
+:::{note}
+一键配置脚本目前只支持以下系统：
 
-- xorriso
+- Ubuntu/Debian/Deepin/UOS 等基于Debian的衍生版本
 
-- fdisk
+欢迎您为其他的系统完善构建脚本！
+:::
 
-- make
 
-- VNC Viewer
+### 创建磁盘镜像
 
-- gdb
-
+&emsp;&emsp;首先，您需要使用`sudo`权限运行`tools/create_hdd_image.sh`，为DragonOS创建一块磁盘镜像文件。该脚本会自动完成创建磁盘镜像的工作，并将其移动到`bin/`目录下。
 
 
 ### 编译DragonOS
@@ -113,19 +116,33 @@ sudo bash run.sh --docker
 1. 安装编译及运行环境
 2. 进入DragonOS文件夹
 3. 输入命令：`make -j 16`即可编译
+4. 输入`make build`即可编译并写入磁盘镜像
 
 
 
-### 创建磁盘镜像
-
-&emsp;&emsp;首先，您需要使用`sudo`权限运行`tools/create_hdd_image.sh`，为DragonOS创建一块磁盘镜像文件。该脚本会自动完成创建磁盘镜像的工作，并将其移动到`bin/`目录下。
 
 ### 运行DragonOS
 
 &emsp;&emsp;至此，准备工作已经完成，您可以在DragonOS项目的根目录下，输入
 
 ```shell
-bash run.sh
+make run
 ```
 
 &emsp;&emsp;然后，DragonOS将会被启动，您可以通过VNC Viewer连接至虚拟机。在qemu虚拟机被启动后，我们需要在控制台输入字母`c`，然后回车。这样，虚拟机就会开始执行。
+
+:::{note}
+首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！
+:::
+
+**关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
+
+(_build_system_command)=
+## 编译命令讲解
+
+- 本地编译，不运行: `make all -j 您的CPU核心数`
+- 本地编译，并写入磁盘镜像，不运行: `make build`
+- 本地编译，写入磁盘镜像，并在QEMU中运行: `make run`
+- Docker编译，并写入磁盘镜像,: `make docker`
+- Docker编译，写入磁盘镜像，并在QEMU中运行: `make run-docker`
+- 不编译，直接从已有的磁盘镜像启动: `make qemu`

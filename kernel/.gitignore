@@ -1,0 +1,5 @@
+target/
+src/kernel
+Cargo.lock
+# 将自动生成的Rust FFI加到gitignore
+src/include/bindings/bindings.rs

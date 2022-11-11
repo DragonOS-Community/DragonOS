@@ -1,0 +1,15 @@
+[package]
+name = "dragonos_kernel"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+x86_64 = "0.14.10"
+
+[build-dependencies]
+bindgen = "0.61.0"

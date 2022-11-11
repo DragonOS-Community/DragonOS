@@ -157,5 +157,7 @@
         "fat32.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
-    "esbonio.sphinx.confDir": ""
+    "esbonio.sphinx.confDir": "",
+    "rust-analyzer.cargo.target": "x86_64-unknown-none",
+    "rust-analyzer.checkOnSave.allTargets": false
 }

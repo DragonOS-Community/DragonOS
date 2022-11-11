@@ -41,7 +41,8 @@
 #include <driver/interrupt/apic/apic_timer.h>
 
 ul bsp_idt_size, bsp_gdt_size;
-extern int __rust_demo_func();
+
+#include <include/bindings/bindings.h>
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")

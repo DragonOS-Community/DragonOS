@@ -42,8 +42,6 @@
 
 ul bsp_idt_size, bsp_gdt_size;
 
-#include <include/bindings/bindings.h>
-
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 struct gdtr gdtp;
@@ -167,7 +165,6 @@ void system_initialize()
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
-    __rust_demo_func();
     // fat32_init();
     HPET_enable();
 

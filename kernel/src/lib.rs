@@ -29,6 +29,6 @@ pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color(GREEN, BLACK, f);
   }
   // 测试从slab获取内存的过程
-  
+  print!("Test custom print!");
   return 0;
 }

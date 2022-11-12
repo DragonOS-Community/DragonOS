@@ -33,7 +33,7 @@
 
 #include "font.h"
 #include "glib.h"
-#include <lib/libUI/screen_manager.h>
+#include <libs/libUI/screen_manager.h>
 #include <stdarg.h>
 
 extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中

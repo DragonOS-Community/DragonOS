@@ -9,7 +9,7 @@ use std::path::PathBuf;
 fn main() {
     // Tell cargo to look for shared libraries in the specified directory
     println!("cargo:rustc-link-search=src");
-    println!("cargo:rerun-if-changed=src/include/bindings/wrapper.h");
+    // println!("cargo:rerun-if-changed=src/include/bindings/wrapper.h");
 
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_path = PathBuf::from(String::from("src/include/bindings/"));
@@ -23,7 +23,6 @@ fn main() {
             // The input header we would like to generate
             // bindings for.
             .header("src/include/bindings/wrapper.h")
-            .blocklist_file("src/include/bindings/bindings.h")
             .clang_arg("--target=x86_64-none-none")
             .clang_arg("-v")
             // 使用core，并将c语言的类型改为core::ffi，而不是使用std库。

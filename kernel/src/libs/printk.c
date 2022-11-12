@@ -5,7 +5,7 @@
 #include <common/printk.h>
 
 #include <common/spinlock.h>
-#include <lib/libUI/textui.h>
+#include <libs/libUI/textui.h>
 #include <mm/mm.h>
 
 #include <common/math.h>

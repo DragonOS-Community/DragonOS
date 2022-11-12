@@ -3,7 +3,7 @@ DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
 GARBAGE_PATTERNS := *.o *.s~ *.s *.S~ *.c~ *.h~ kernel
 GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 
-DIR_LIB=lib
+DIR_LIB=libs
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
@@ -17,7 +17,7 @@ export ASFLAGS := --64
 LD_LIST := head.o
 
 
-kernel_subdirs := common driver process debug filesystem time arch exception mm smp sched syscall ktest lib ipc
+kernel_subdirs := common driver process debug filesystem time arch exception mm smp sched syscall ktest libs ipc
 	
 
 

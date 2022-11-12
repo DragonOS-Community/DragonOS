@@ -14,8 +14,8 @@
 #include "smp/smp.h"
 #include "syscall/syscall.h"
 #include <exception/softirq.h>
-#include <lib/libUI/screen_manager.h>
-#include <lib/libUI/textui.h>
+#include <libs/libUI/screen_manager.h>
+#include <libs/libUI/textui.h>
 #include <sched/sched.h>
 #include <smp/ipi.h>
 

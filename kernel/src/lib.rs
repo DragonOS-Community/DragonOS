@@ -8,8 +8,8 @@
 #[macro_use]
 mod mm;
 mod include;
+mod libs;
 
-use crate::mm::allocator;
 use core::ffi::c_char;
 use core::intrinsics;            // <2>
 use core::panic::PanicInfo;      // <3>
@@ -28,5 +28,7 @@ pub extern "C" fn __rust_demo_func() -> i32 {
     let f = b"\nDragonOS's Rust lib called printk_color()\n".as_ptr() as *const c_char;
     printk_color(GREEN, BLACK, f);
   }
+  // 测试从slab获取内存的过程
+  
   return 0;
 }

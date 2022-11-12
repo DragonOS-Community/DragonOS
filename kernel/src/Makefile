@@ -31,10 +31,11 @@ main.o: main.c
 # The -m64 option sets int to 32bits and long and pointer to 64 bits and generates code for AMD’s x86-64 architecture.
 	$(CC) $(CFLAGS) -c main.c  -o main.o
 
-
-all: kernel
+kernel_rust:
 	rustup default nightly
 	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json
+all: kernel_rust
+	$(MAKE) kernel || exit 1
 	@echo "Linking kernel..."
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds
 # 生成kallsyms

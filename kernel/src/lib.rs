@@ -5,10 +5,16 @@
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 
+#[macro_use]
+mod mm;
+mod include;
+
+use crate::mm::allocator;
 use core::ffi::c_char;
 use core::intrinsics;            // <2>
 use core::panic::PanicInfo;      // <3>
-include!("include/bindings/bindings.rs");
+use crate::include::bindings::bindings::{printk_color, GREEN, BLACK};
+
 
 #[panic_handler]
 #[no_mangle]

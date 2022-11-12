@@ -51,12 +51,12 @@ namespace = "ffi"
 
 # A list of sys headers to #include (with angle brackets)
 # default: []
-sys_includes = []
+sys_includes = ["stdint.h"]
 
 # 生成的binding文件要include的头文件
 # A list of headers to #include (with quotes)
 # default: []
-includes = ["stdint.h"]
+includes = []
 
 # Whether cbindgen's default C/C++ standard imports should be suppressed. These
 # imports are included by default because our generated headers tend to require
@@ -584,7 +584,7 @@ clean = false
 # bindings for.
 #
 # default: []
-extra_bindings = ["my_awesome_dep"]
+# extra_bindings = ["my_awesome_dep"]
 
 [parse.expand]
 # A list of crate names that should be run through `cargo expand` before
@@ -614,7 +614,7 @@ default_features = true
 # appropriate features in its dependencies
 #
 # default: []
-features = ["cbindgen"]
+# features = ["cbindgen"]
 
 [ptr]
 # An optional string to decorate all pointers that are

@@ -23,6 +23,7 @@ fn main() {
             // The input header we would like to generate
             // bindings for.
             .header("src/include/bindings/wrapper.h")
+            .blocklist_file("src/include/bindings/bindings.h")
             .clang_arg("--target=x86_64-none-none")
             .clang_arg("-v")
             // 使用core，并将c语言的类型改为core::ffi，而不是使用std库。
@@ -41,8 +42,4 @@ fn main() {
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
     }
-
-    cbindgen::generate(crate_dir)
-        .unwrap()
-        .write_to_file(out_path.join("bindings.h"));
 }

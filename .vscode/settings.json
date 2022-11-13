@@ -147,7 +147,17 @@
         "compiler_attributes.h": "c",
         "timer.h": "c",
         "hid.h": "c",
-        "cfs.h": "c"
+        "cfs.h": "c",
+        "fat32.h": "c",
+        "proc.h": "c",
+        "compiler.h": "c",
+        "hpet.h": "c",
+        "numa.h": "c",
+        "procfs.h": "c",
+        "bit": "c",
+        "compare": "c",
+        "concepts": "c",
+        "numbers": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": ""

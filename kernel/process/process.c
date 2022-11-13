@@ -20,6 +20,7 @@
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/rootfs/rootfs.h>
+#include <filesystem/procfs/procfs.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
 #include <syscall/syscall.h>
@@ -727,7 +728,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     tsk->cpu_id = proc_current_cpu_id;
     tsk->state = PROC_UNINTERRUPTIBLE;
 
-    tsk->parent_pcb = current_pcb;
+    tsk->parent_pcb = current_pcb; //是不是重复了
     wait_queue_init(&tsk->wait_child_proc_exit, NULL);
     barrier();
     list_init(&tsk->list);
@@ -757,6 +758,10 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 唤醒进程
     process_wakeup(tsk);
+
+    //创建对应procfs文件
+    // kdebug("pid=%d", tsk->pid);
+    mk_proc_dir(tsk->pid);
 
     return retval;
 

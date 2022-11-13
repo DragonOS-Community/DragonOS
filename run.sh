@@ -110,6 +110,7 @@ if [ "${GENERATE_ISO}" == "1" ]; then
     # 拷贝用户程序到磁盘镜像
     cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount
     mkdir -p ${root_folder}/bin/disk_mount/dev
+    mkdir -p ${root_folder}/bin/disk_mount/proc
     touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
     
 

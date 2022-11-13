@@ -47,6 +47,7 @@ SECTIONS
 	{
 		_rodata = .;	
 		*(.rodata)
+		*(.rodata.*)
 		_erodata = .;
 	}
 
@@ -62,6 +63,7 @@ SECTIONS
 	{
 		_bss = .;
 		*(.bss)
+		*(.bss.*)
 		_ebss = .;
 	}
 

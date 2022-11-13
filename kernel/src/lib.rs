@@ -1,32 +1,44 @@
-#![no_std]                       // <1>
-#![no_main]                      // <1>
-#![feature(core_intrinsics)]     // <2>
+#![no_std] // <1>
+#![no_main] // <1>
+#![feature(core_intrinsics)] // <2>
+#![feature(alloc_error_handler)]
+
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 
+use core::intrinsics; // <2>
+use core::panic::PanicInfo;
+
+
 #[macro_use]
 mod mm;
 mod include;
+mod libs;
 
-use crate::mm::allocator;
-use core::ffi::c_char;
-use core::intrinsics;            // <2>
-use core::panic::PanicInfo;      // <3>
-use crate::include::bindings::bindings::{printk_color, GREEN, BLACK};
+extern crate alloc;
 
+use mm::allocator::KernelAllocator;
 
+// <3>
+use crate::include::bindings::bindings::{BLACK, GREEN};
+
+// 声明全局的slab分配器
+#[cfg_attr(not(test), global_allocator)]
+pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator {};
+
+/// 全局的panic处理函数
 #[panic_handler]
 #[no_mangle]
 pub fn panic(_info: &PanicInfo) -> ! {
-  intrinsics::abort();           // <4>
+    intrinsics::abort(); // <4>
 }
 
+/// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
-  unsafe{
-    let f = b"\nDragonOS's Rust lib called printk_color()\n".as_ptr() as *const c_char;
-    printk_color(GREEN, BLACK, f);
-  }
-  return 0;
+    
+    printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
+
+    return 0;
 }

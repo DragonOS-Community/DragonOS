@@ -31,7 +31,7 @@
 #include <mm/mmio.h>
 
 #include <common/lz4.h>
-
+extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
 
@@ -499,21 +499,21 @@ ul initial_kernel_thread(ul arg)
     // int usb_pid = kernel_thread(usb_init, 0, 0);
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
-
+    __rust_demo_func();
     // 对completion完成量进行测试
-    __test_completion();
+    // __test_completion();
 
-    // 对一些组件进行单元测试
-    uint64_t tpid[] = {
-        ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
-        ktest_start(ktest_test_idr, 0),
-        // usb_pid,
-    };
-    kinfo("Waiting test thread exit...");
-    // 等待测试进程退出
-    for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
-        waitpid(tpid[i], NULL, NULL);
-    kinfo("All test done.");
+    // // 对一些组件进行单元测试
+    // uint64_t tpid[] = {
+    //     ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
+    //     ktest_start(ktest_test_idr, 0),
+    //     // usb_pid,
+    // };
+    // kinfo("Waiting test thread exit...");
+    // // 等待测试进程退出
+    // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
+    //     waitpid(tpid[i], NULL, NULL);
+    // kinfo("All test done.");
 
     // 准备切换到用户态
     struct pt_regs *regs;

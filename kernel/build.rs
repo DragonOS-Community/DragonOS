@@ -11,7 +11,7 @@ fn main() {
     println!("cargo:rustc-link-search=src");
     println!("cargo:rerun-if-changed=src/include/bindings/wrapper.h");
 
-    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    // let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_path = PathBuf::from(String::from("src/include/bindings/"));
 
     // The bindgen::Builder is the main entry point

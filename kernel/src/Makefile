@@ -3,7 +3,7 @@ DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
 GARBAGE_PATTERNS := *.o *.s~ *.s *.S~ *.c~ *.h~ kernel
 GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 
-DIR_LIB=lib
+DIR_LIB=libs
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
@@ -17,7 +17,7 @@ export ASFLAGS := --64
 LD_LIST := head.o
 
 
-kernel_subdirs := common driver process debug filesystem time arch exception mm smp sched syscall ktest lib ipc
+kernel_subdirs := common driver process debug filesystem time arch exception mm smp sched syscall ktest libs ipc
 	
 
 
@@ -34,8 +34,9 @@ main.o: main.c
 kernel_rust:
 	rustup default nightly
 	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json
-all: kernel_rust
-	$(MAKE) kernel || exit 1
+
+all: kernel
+
 	@echo "Linking kernel..."
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds
 # 生成kallsyms
@@ -53,6 +54,7 @@ all: kernel_rust
 	
 # 重新链接
 	@echo "Re-Linking kernel..."
+	@echo $(shell find . -name "*.o")
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
@@ -66,7 +68,7 @@ $(kernel_subdirs): ECHO
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)" kernel_root_path="$(shell pwd)"
 
-kernel: head.o main.o $(kernel_subdirs)
+kernel: head.o main.o $(kernel_subdirs) kernel_rust
 	
 
 

@@ -15,12 +15,14 @@
 #include <common/crc64.h>
 #include <common/crc7.h>
 #include <common/crc8.h>
+#include <common/gfp.h>
 #include <common/kfifo.h>
 #include <common/list.h>
 #include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/unistd.h>
+#include <driver/uart/uart.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <sched/cfs.h>

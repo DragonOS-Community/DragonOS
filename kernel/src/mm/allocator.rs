@@ -46,3 +46,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
         self.local_dealloc(ptr, layout);
     }
 }
+
+/// 内存分配错误处理函数
+#[alloc_error_handler]
+pub fn global_alloc_err_handler(_layout:Layout)->!{
+    panic!("global_alloc_error");
+}

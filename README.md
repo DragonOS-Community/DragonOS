@@ -16,6 +16,8 @@
 
 - 开源论坛  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
 
+- 软件镜像站 **[mirrors.DragonOS.org](https://mirrors.DragonOS.org)**
+
 - 开发交流QQ群 **115763565**
 
 - 代码搜索引擎 [code.DragonOS.org](http://code.dragonos.org)
@@ -64,24 +66,33 @@
 
 我的博客：[longjin666.cn](https://longjin666.cn)
 
-## 赞赏
+## 赞助
 
-&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是其日常维护仍需要一些资金，如果你愿意的话，可以通过[赞助 - DragonOS](https://dragonos.org/donate/)，从而促进这个项目的发展。所有的赞助者的名单都会被公示。
+&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是它的发展离不开资金的支持，如果您愿意的话，可以通过**[赞助 - DragonOS](https://dragonos.org/donate/)**，从而促进这个项目的发展。所有的赞助者的名单都会被公示。您的每一分赞助，都会为DragonOS的发展作出贡献！
 
 ### 赞助的资金都会被用到哪里？
 
-- 官网及社区论坛的服务器开支
+我们保证，所有赞助的资金及物品，将会用于：
 
-- 代码搜索引擎服务器的开支（这不是一个小数目）
+- 为活跃的社区开发者发放补贴或设备支持
 
-- 域名、CDN等服务的开支
+- DragonOS的云服务开支
+
+- 设备购置
 
 - 任何有助于DragonOS发展建设的用途
 
-### 赞赏者列表
+### 赞助商列表
+
+**暂无**
+
+我们期望在未来，能有企业赞助DragonOS，为它的发展注入资金动力！
+
+### 个人赞赏者列表
 
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
+- slientbard
 
 ## 开放源代码声明
 

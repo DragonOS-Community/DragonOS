@@ -34,7 +34,9 @@ main.o: main.c
 kernel_rust:
 	rustup default nightly
 	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json
+
 all: kernel
+
 	@echo "Linking kernel..."
 	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds
 # 生成kallsyms

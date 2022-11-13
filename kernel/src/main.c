@@ -209,7 +209,7 @@ void Start_Kernel(void)
         // 如果调用的时候，启用了中断，则hlt。否则认为是bug
         if (get_rflags() & 0x200)
         {
-            kdebug("hlt");
+            // kdebug("hlt");
             hlt();
         }
         else

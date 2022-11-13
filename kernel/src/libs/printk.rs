@@ -1,6 +1,6 @@
 use crate::include::bindings::bindings::{printk_color, BLACK, WHITE};
 use ::core::ffi::c_char;
-use alloc::{vec::Vec, format};
+use alloc::vec::Vec;
 use core::fmt;
 pub struct PrintkWriter;
 
@@ -13,7 +13,7 @@ impl PrintkWriter {
             printk_color(WHITE, BLACK, str_to_print.as_ptr() as *const c_char);
         }
     }
-    
+
     pub fn __write_string_color(&self, fr_color: u32, bk_color: u32, s: &str) {
         let str_to_print = self.__utf8_to_ascii(s);
         unsafe {
@@ -24,11 +24,11 @@ impl PrintkWriter {
     /// 将s这个utf8字符串，转换为ascii字符串
     /// @param s 待转换的utf8字符串
     /// @return Vec<u8> 转换结束后的Ascii字符串
-    fn __utf8_to_ascii(&self, s:&str) -> Vec<u8>{
+    pub fn __utf8_to_ascii(&self, s: &str) -> Vec<u8> {
         let mut ascii_str: Vec<u8> = Vec::with_capacity(s.len() + 1);
         for byte in s.bytes() {
             match byte {
-                8 | 32..=126 => {
+                0..=127 => {
                     ascii_str.push(byte);
                 }
                 _ => {}

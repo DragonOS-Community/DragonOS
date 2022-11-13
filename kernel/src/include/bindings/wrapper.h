@@ -22,6 +22,7 @@
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/unistd.h>
+#include <driver/uart/uart.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <sched/cfs.h>

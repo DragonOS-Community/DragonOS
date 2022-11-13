@@ -49,6 +49,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 /// 内存分配错误处理函数
 #[alloc_error_handler]
-pub fn global_alloc_err_handler(_layout:Layout)->!{
+pub fn global_alloc_err_handler(_layout: Layout) -> ! {
     panic!("global_alloc_error");
 }

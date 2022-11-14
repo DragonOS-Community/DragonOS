@@ -1,12 +1,13 @@
 #include "smp.h"
+#include <common/cpu.h>
 #include <common/kprint.h>
+#include <common/spinlock.h>
 #include <driver/interrupt/apic/apic.h>
 #include <exception/gate.h>
-#include <common/cpu.h>
 #include <mm/slab.h>
 #include <process/process.h>
-#include <common/spinlock.h>
 
+#include <process/preempt.h>
 #include <sched/sched.h>
 
 #include "ipi.h"
@@ -36,7 +37,8 @@ void smp_init()
     }
 
     // 将引导程序复制到物理地址0x20000处
-    memcpy((unsigned char *)phys_2_virt(0x20000), _apu_boot_start, (unsigned long)&_apu_boot_end - (unsigned long)&_apu_boot_start);
+    memcpy((unsigned char *)phys_2_virt(0x20000), _apu_boot_start,
+           (unsigned long)&_apu_boot_end - (unsigned long)&_apu_boot_start);
     io_mfence();
     // 设置多核IPI中断门
     for (int i = 200; i < 210; ++i)
@@ -58,7 +60,9 @@ void smp_init()
         io_mfence();
 
         // 跳过BSP
-        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i, proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id, proc_local_apic_structs[i]->flags);
+        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i,
+               proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id,
+               proc_local_apic_structs[i]->flags);
         if (proc_local_apic_structs[i]->local_apic_id == 0)
         {
             --total_processor_num;
@@ -73,7 +77,8 @@ void smp_init()
         // continue;
         io_mfence();
         spin_lock(&multi_core_starting_lock);
-        preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt count
+        preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt
+                          // count
         current_starting_cpu = proc_local_apic_structs[i]->ACPI_Processor_UID;
         io_mfence();
         // 为每个AP处理器分配栈空间
@@ -85,8 +90,10 @@ void smp_init()
         io_mfence();
 
         // 设置ap处理器的中断栈及内核栈中的cpu_id
-        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].stack_start - STACK_SIZE))->cpu_id = proc_local_apic_structs[i]->local_apic_id;
-        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].ist_stack_start - STACK_SIZE))->cpu_id = proc_local_apic_structs[i]->local_apic_id;
+        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].stack_start - STACK_SIZE))->cpu_id =
+            proc_local_apic_structs[i]->local_apic_id;
+        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].ist_stack_start - STACK_SIZE))->cpu_id =
+            proc_local_apic_structs[i]->local_apic_id;
 
         cpu_core_info[current_starting_cpu].tss_vaddr = (uint64_t)&initial_tss[current_starting_cpu];
 
@@ -94,15 +101,21 @@ void smp_init()
 
         set_tss_descriptor(10 + (current_starting_cpu * 2), (void *)(cpu_core_info[current_starting_cpu].tss_vaddr));
         io_mfence();
-        set_tss64((uint *)cpu_core_info[current_starting_cpu].tss_vaddr, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start,
-                  cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start);
+        set_tss64(
+            (uint *)cpu_core_info[current_starting_cpu].tss_vaddr, cpu_core_info[current_starting_cpu].stack_start,
+            cpu_core_info[current_starting_cpu].stack_start, cpu_core_info[current_starting_cpu].stack_start,
+            cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start,
+            cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start,
+            cpu_core_info[current_starting_cpu].ist_stack_start, cpu_core_info[current_starting_cpu].ist_stack_start,
+            cpu_core_info[current_starting_cpu].ist_stack_start);
         io_mfence();
 
         // 连续发送两次start-up IPI
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
+                     proc_local_apic_structs[i]->local_apic_id);
         io_mfence();
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand, proc_local_apic_structs[i]->local_apic_id);
-
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
+                     proc_local_apic_structs[i]->local_apic_id);
     }
     io_mfence();
     while (num_cpu_started != total_processor_num)
@@ -130,10 +143,8 @@ void smp_ap_start()
 
     //  切换栈基地址
     //  uint64_t stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
-    __asm__ __volatile__("movq %0, %%rbp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
-                         : "memory");
-    __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
-                         : "memory");
+    __asm__ __volatile__("movq %0, %%rbp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start) : "memory");
+    __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start) : "memory");
 
     ksuccess("AP core %d successfully started!", current_starting_cpu);
     io_mfence();

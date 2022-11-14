@@ -1,6 +1,7 @@
 #pragma once
 
 #include <common/wait_queue.h>
+#include <DragonOS/signal.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -73,7 +74,7 @@ struct process_control_block
     // 进程标志：进程、线程、内核线程
     unsigned long flags;
     int64_t preempt_count; // 持有的自旋锁的数量
-    long signal;
+    
     long cpu_id; // 当前进程在哪个CPU核心上运行
     char name[PCB_NAME_LEN];
 
@@ -114,6 +115,15 @@ struct process_control_block
 
     /* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
     void *worker_private;
+
+    // ==== 信号处理相关 =====
+    struct signal_struct *signal;
+    struct sighand_struct *sighand;
+    // 一个bitmap，表示被阻塞的信号
+    sigset_t blocked;
+    // 正在等待的信号的标志位，表示某个信号正在等待处理
+    struct sigpending sig_pending;
+
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

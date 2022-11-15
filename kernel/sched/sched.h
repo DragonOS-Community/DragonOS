@@ -14,8 +14,54 @@
 #define SCHED_IDLE 5
 #define SCHED_DEADLINE 6
 #define SCHED_MAX_POLICY_NUM SCHED_DEADLINE
+#define MAX_RT_PRIO 100
 
 #define IS_VALID_SCHED_POLICY(_policy) ((_policy) > 0 && (_policy) <= SCHED_MAX_POLICY_NUM)
+
+/**
+ * @brief RT调度类的优先级队列数据结构
+ *
+ */
+struct rt_prio_array
+{
+    // TODO: 定义MAX_RT_PRIO为100
+    struct List queue[MAX_RT_PRIO];
+};
+struct sched_rt_entity
+{
+    // 用于加入到优先级队列中
+    struct List run_list;
+    unsigned long timeout;
+    unsigned short on_rq;   // 入队之后设置1
+    unsigned short on_list; // 入队之后设置1
+    /* rq on which this entity is (to be) queued: */
+    struct rt_rq *rt_rq;
+    struct sched_rt_entity *parent;
+    struct sched_rt_entity *back;
+};
+struct plist_head
+{
+    struct List node_list;
+};
+/**
+ * @brief rt运行队列
+ *
+ */
+struct rt_rq
+{
+    struct rt_prio_array active;
+    unsigned int rt_nr_running; // rt队列中的任务数
+    unsigned int rr_nr_running;
+    struct rq *rq;
+    struct plist_head pushable_tasks;
+};
+struct rq
+{
+    /* data */
+    // struct cfs_rq cfs;
+    struct rt_rq rt;
+    // struct dl_rq dl;
+};
 
 struct sched_param
 {

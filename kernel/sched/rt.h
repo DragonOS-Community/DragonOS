@@ -3,7 +3,7 @@
 
 #include <common/glib.h>
 #include <process/process.h>
-
+#include <sched.h>
 struct sched_queue_rt
 {
 
@@ -13,25 +13,6 @@ struct sched_queue_rt
 };
 
 extern struct sched_queue_rt sched_rt_ready_queue[MAX_CPU_NUM]; // 就绪队列
-/**
- * @brief RT调度类的优先级队列数据结构
- *
- */
-struct rt_prio_array
-{
-    // TODO: 定义MAX_RT_PRIO为100
-    struct list_head queue[MAX_RT_PRIO];
-};
-/**
- * @brief rt运行队列
- *
- */
-struct rt_rq
-{
-    struct rt_prio_array active;
-    unsigned int rt_nr_running; //rt队列中的任务数
-    unsigned int rr_nr_running;
-};
 /**
  * @brief 调度函数
  *
@@ -60,3 +41,5 @@ void sched_rt_init();
 
 
 void pick_next_task_rt();
+
+void put_prev_task_rt();

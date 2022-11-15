@@ -57,8 +57,8 @@ struct thread_struct
 #define PF_KTHREAD (1UL << 0)    // 内核线程
 #define PF_NEED_SCHED (1UL << 1) // 进程需要被调度
 #define PF_VFORK (1UL << 2)      // 标志进程是否由于vfork而存在资源共享
-#define PF_KFORK (1UL << 3)    // 标志在内核态下调用fork（临时标记，do_fork()结束后会将其复位）
-#define PF_NOFREEZE (1UL << 4) // 当前进程不能被冻结
+#define PF_KFORK (1UL << 3)      // 标志在内核态下调用fork（临时标记，do_fork()结束后会将其复位）
+#define PF_NOFREEZE (1UL << 4)   // 当前进程不能被冻结
 
 /**
  * @brief 进程控制块
@@ -106,10 +106,17 @@ struct process_control_block
 
     /* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
     void *worker_private;
+    // rt调度器需要使用
+    unsigned int rt_priority;
+
+    struct sched_entity se;
+    struct sched_rt_entity rt;
+    // struct sched_dl_entity dl;
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐
-union proc_union {
+union proc_union
+{
     struct process_control_block pcb;
     ul stack[STACK_SIZE / sizeof(ul)];
 } __attribute__((aligned(8)));

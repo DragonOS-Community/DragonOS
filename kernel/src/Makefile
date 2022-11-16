@@ -10,7 +10,7 @@ LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
 # 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
 PIC := _INTR_APIC_
-CFLAGS = $(GLOBAL_CFLAGS) -D $(PIC) -I $(shell pwd)
+CFLAGS = $(GLOBAL_CFLAGS) -D $(PIC) -I $(shell pwd) -I $(shell pwd)/include -I $(shell pwd)/arch/x86_64/include
 
 export ASFLAGS := --64
 

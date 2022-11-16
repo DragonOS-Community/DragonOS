@@ -15,6 +15,7 @@ use core::panic::PanicInfo;
 mod mm;
 mod include;
 mod libs;
+mod ipc;
 
 extern crate alloc;
 

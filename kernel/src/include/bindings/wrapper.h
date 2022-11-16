@@ -23,6 +23,8 @@
 #include <common/spinlock.h>
 #include <common/unistd.h>
 #include <driver/uart/uart.h>
+#include <include/DragonOS/refcount.h>
+#include <include/DragonOS/signal.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <sched/cfs.h>

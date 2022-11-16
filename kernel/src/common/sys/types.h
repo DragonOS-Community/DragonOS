@@ -13,7 +13,7 @@ typedef uint32_t gid_t;
 typedef long long ssize_t;
 
 typedef int __pid_t;
-#define pid_t uint64_t
+#define pid_t int64_t
 typedef __SIZE_TYPE__ size_t;
 
 typedef char *caddr_t;

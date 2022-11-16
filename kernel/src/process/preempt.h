@@ -1,10 +1,7 @@
 #pragma once
 
-#if ARCH(X86_64)
-#include <arch/x86_64/current.h>
-#else
-#error Unsupported architecture!
-#endif
+#include <asm/current.h>
+
 #include "proc-types.h"
 
 /**

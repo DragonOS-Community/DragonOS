@@ -1,7 +1,8 @@
 #pragma once
 
-#include <common/glib.h>
+#include <asm/current.h>
 #include <common/gfp.h>
+#include <common/glib.h>
 #include <mm/mm-types.h>
 #include <process/process.h>
 
@@ -48,7 +49,7 @@
 #define IO_APIC_MAPPING_OFFSET 0xfec00000UL
 #define LOCAL_APIC_MAPPING_OFFSET 0xfee00000UL
 #define AHCI_MAPPING_OFFSET 0xff200000UL // AHCI 映射偏移量,之后使用了4M的地址
-#define XHCI_MAPPING_OFFSET 0x100000000  // XHCI控制器映射偏移量(后方请预留1GB的虚拟空间来映射不同的controller)
+#define XHCI_MAPPING_OFFSET 0x100000000 // XHCI控制器映射偏移量(后方请预留1GB的虚拟空间来映射不同的controller)
 
 // ===== 内存区域属性 =====
 // DMA区域
@@ -145,16 +146,15 @@
  * @brief 刷新TLB的宏定义
  * 由于任何写入cr3的操作都会刷新TLB，因此这个宏定义可以刷新TLB
  */
-#define flush_tlb()                 \
-    do                              \
-    {                               \
-        ul tmp;                     \
-        io_mfence();                \
-        __asm__ __volatile__(       \
-            "movq %%cr3, %0\n\t"    \
-            "movq %0, %%cr3\n\t"    \
-            : "=r"(tmp)::"memory"); \
-                                    \
+#define flush_tlb()                                                                                                    \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        ul tmp;                                                                                                        \
+        io_mfence();                                                                                                   \
+        __asm__ __volatile__("movq %%cr3, %0\n\t"                                                                      \
+                             "movq %0, %%cr3\n\t"                                                                      \
+                             : "=r"(tmp)::"memory");                                                                   \
+                                                                                                                       \
     } while (0);
 
 /**
@@ -231,9 +231,7 @@ unsigned long page_init(struct Page *page, ul flags);
 unsigned long *get_CR3()
 {
     ul *tmp;
-    __asm__ __volatile__(
-        "movq %%cr3, %0\n\t"
-        : "=r"(tmp)::"memory");
+    __asm__ __volatile__("movq %%cr3, %0\n\t" : "=r"(tmp)::"memory");
     return tmp;
 }
 
@@ -420,7 +418,8 @@ int mm_map_phys_addr(ul virt_addr_start, ul phys_addr_start, ul length, ul flags
  * @param flush 是否刷新tlb
  * @param use4k 是否使用4k页
  */
-int mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length, ul flags, bool user, bool flush, bool use4k);
+int mm_map_proc_page_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_start, ul phys_addr_start, ul length,
+                           ul flags, bool user, bool flush, bool use4k);
 
 int mm_map_phys_addr_user(ul virt_addr_start, ul phys_addr_start, ul length, ul flags);
 
@@ -440,9 +439,7 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
  * @param virt_addr 虚拟地址
  * @param length 地址长度
  */
-#define mm_unmap_addr(virt_addr, length) ({                            \
-    mm_unmap_proc_table((uint64_t)get_CR3(), true, virt_addr, length); \
-})
+#define mm_unmap_addr(virt_addr, length) ({ mm_unmap_proc_table((uint64_t)get_CR3(), true, virt_addr, length); })
 
 /**
  * @brief 创建VMA
@@ -455,7 +452,8 @@ void mm_unmap_proc_table(ul proc_page_table_addr, bool is_phys, ul virt_addr_sta
  * @param res_vma 返回的vma指针
  * @return int 错误码
  */
-int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flags_t vm_flags, struct vm_operations_t *vm_ops, struct vm_area_struct **res_vma);
+int mm_create_vma(struct mm_struct *mm, uint64_t vaddr, uint64_t length, vm_flags_t vm_flags,
+                  struct vm_operations_t *vm_ops, struct vm_area_struct **res_vma);
 
 /**
  * @brief 将指定的物理地址映射到指定的vma处

@@ -15,28 +15,6 @@ void sched_rt()
 }
 
 /**
- * @brief 将PCB加入就绪队列
- *
- * @param pcb
- */
-void sched_rt_enqueue(struct rq *rq, struct process_control_block *pcb, int flags)
-{
-    struct sched_rt_entity *rt_se = &pcb->rt;
-    // 将p的prio插入到对应链表中
-    enque_rt_entity(rt_se, flags);
-    // 如果进程不是当前在执行的进程，并且可以在其他rq上执行，则使用enqueue_pushable_task将进程按照优先级插入多链表中，
-    if (!GET_CURRENT_PCB)
-}
-
-/**
- * @brief 从就绪队列中取出PCB
- *
- * @return struct process_control_block*
- */
-struct process_control_block *sched_rt_dequeue()
-{
-}
-/**
  * @brief 初始化RT进程调度器
  *
  */
@@ -54,22 +32,15 @@ void sched_rt_init()
     }
 }
 
-// struct process_control_block * pick_next_task_rt(struct rq *rq,struct process_control_block *prev,struct rq_flags *rf){
 struct process_control_block *pick_next_task_rt(struct rq *rq)
 {
     struct process_control_block *p = pick_task_rt(rq);
-
-    if (p)
-        set_next_task_rt(rq, p, true);
-
     return p;
 }
 static struct process_control_block *pick_task_rt(struct rq *rq)
 {
     struct process_control_block *p;
-
-    // if (!sched_rt_runnable(rq))
-    //     return NULL;
+    // TODO:如果队列中元素为空，则返回null，
 
     p = _pick_next_task_rt(rq);
 
@@ -79,14 +50,8 @@ static struct process_control_block *_pick_next_task_rt(struct rq *rq)
 {
     struct sched_rt_entity *rt_se;
     struct rt_rq *rt_rq = &rq->rt;
-
+    // 从rt_rq中找优先级最高且最先入队的task
     rt_se = pick_next_rt_entity(rt_rq);
-    // do
-    // {
-    //     rt_se = pick_next_rt_entity(rt_rq);
-    //     BUG_ON(!rt_se);
-    //     rt_rq = group_rt_rq(rt_se);
-    // } while (rt_rq);
 
     return rt_task_of(rt_se);
 }
@@ -99,10 +64,11 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     int idx;
 
     // 此处查找链表中中下一个执行的entity
-    idx = sched_find_first_bit(array->bitmap);
-    // BUG_ON(idx >= MAX_RT_PRIO);
+    // TODO :不适用bitmap时如何找到对应的list
+    // idx = sched_find_first_bit(array->bitmap);
 
     queue = array->queue + idx;
+    // 获取当前的entry
     next = list_entry(queue->next, struct sched_rt_entity, run_list);
 
     return next;

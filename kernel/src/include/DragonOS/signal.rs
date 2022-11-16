@@ -1,7 +1,6 @@
 #![allow(non_camel_case_types)]
 // 这是signal暴露给其他模块的公有的接口文件
 
-use crate::include::bindings::bindings::List;
 // todo: 将这里更换为手动编写的ffi绑定
 use crate::include::bindings::bindings::atomic_t;
 use crate::include::bindings::bindings::refcount_t;
@@ -110,6 +109,5 @@ pub struct sighand_struct {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct sigpending {
-    pub list: List,
     pub signal: sigset_t,
 }

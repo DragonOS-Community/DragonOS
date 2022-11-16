@@ -84,6 +84,5 @@ struct sighand_struct
  */
 struct sigpending
 {
-    struct List list;
     sigset_t signal;
 };

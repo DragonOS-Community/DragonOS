@@ -140,7 +140,7 @@ rustInstall() {
 ############ 开始执行 ###############
 banner
 rustInstall
-exit
+
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1
 else
@@ -174,6 +174,6 @@ else
 fi
 
 # 创建磁盘镜像
-sudo bash create_hdd_image.sh
+bash create_hdd_image.sh
 
 congratulations

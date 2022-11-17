@@ -147,8 +147,17 @@
         "compiler_attributes.h": "c",
         "timer.h": "c",
         "hid.h": "c",
-        "cfs.h": "c"
+        "cfs.h": "c",
+        "err.h": "c",
+        "rtc.h": "c",
+        "list.h": "c",
+        "compiler.h": "c",
+        "completion.h": "c",
+        "fat32.h": "c",
+        "irqflags.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
-    "esbonio.sphinx.confDir": ""
+    "esbonio.sphinx.confDir": "",
+    "rust-analyzer.cargo.target": "x86_64-unknown-none",
+    "rust-analyzer.checkOnSave.allTargets": false
 }

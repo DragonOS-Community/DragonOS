@@ -1,5 +1,3 @@
-
-
 #include "libm.h"
 
 #if __FLT_EVAL_METHOD__ == 0 || __FLT_EVAL_METHOD__ == 1

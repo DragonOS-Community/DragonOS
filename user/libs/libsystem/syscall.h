@@ -27,7 +27,7 @@
 #define SYS_PIPE 20
 
 #define SYS_MSTAT 21    // 获取系统的内存状态信息
-#define SYS_RMDIR 22    // 删除文件夹
+#define SYS_UNLINK_AT 22    // 删除文件夹/删除文件链接
 
 /**
  * @brief 用户态系统调用函数

@@ -1,10 +1,10 @@
 #include "printf.h"
 
-#include <libc/stdio.h>
-#include <libsystem/syscall.h>
-#include <libc/string.h>
 #include <libc/math.h>
+#include <libc/stdio.h>
 #include <libc/stdlib.h>
+#include <libc/string.h>
+#include <libsystem/syscall.h>
 
 static char *write_num(char *str, uint64_t num, int base, int field_width, int precision, int flags);
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
@@ -62,17 +62,19 @@ int sprintf(char *buf, const char *fmt, ...)
     return count;
 }
 
+/**
+ * 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
+ * @param buf 结果缓冲区
+ * @param fmt 格式化字符串
+ * @param args 内容
+ * @return 最终字符串的长度
+ */
 int vsprintf(char *buf, const char *fmt, va_list args)
 {
-    /**
-     * 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
-     * @param buf 结果缓冲区
-     * @param fmt 格式化字符串
-     * @param args 内容
-     * @return 最终字符串的长度
-     */
+    // 当需要输出的字符串的指针为空时，使用该字符填充目标字符串的指针
+    static const char __end_zero_char = '\0';
 
-    char *str, *s;
+    char *str = NULL, *s = NULL;
 
     str = buf;
 
@@ -222,7 +224,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
         case 's':
             s = va_arg(args, char *);
             if (!s)
-                s = '\0';
+                s = &__end_zero_char;
             len = strlen(s);
             if (precision < 0)
             {
@@ -492,9 +494,9 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
     if (sign)
         --field_width;
 
-    int js_num_z = 0, js_num_d = 0;                                               // 临时数字字符串tmp_num_z tmp_num_d的长度
-    uint64_t num_z = (uint64_t)(num);                                             // 获取整数部分
-    uint64_t num_decimal = (uint64_t)(round(1.0*(num - num_z) * pow(10, precision))); // 获取小数部分
+    int js_num_z = 0, js_num_d = 0;   // 临时数字字符串tmp_num_z tmp_num_d的长度
+    uint64_t num_z = (uint64_t)(num); // 获取整数部分
+    uint64_t num_decimal = (uint64_t)(round(1.0 * (num - num_z) * pow(10, precision))); // 获取小数部分
 
     if (num == 0 || num_z == 0)
         tmp_num_z[js_num_z++] = '0';

@@ -13,8 +13,9 @@
 - Home Page  **[DragonOS.org](https://dragonos.org)**
 - Documentation  **[docs.DragonOS.org](https://docs.dragonos.org)**
 - BBS  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
+- Software mirror website **[mirrors.DragonOS.org](https://mirrors.DragonOS.org)**
 - QQ group **115763565**
-- code search engine [code.DragonOS.org](http://code.dragonos.org)&nbsp;
+- Code search engine [code.DragonOS.org](http://code.dragonos.org)&nbsp;
 
 ## How to run?
 
@@ -60,22 +61,28 @@ Blog：[longjin666.cn](https://longjin666.cn)
 
 ## Reward
 
-&emsp;&emsp;Dragonos is a public welfare open source project, but its daily maintenance still needs some funds. If you want, you can visit [Sponsor - DragonOS](https://dragonos.org/donate/), so as to promote the development of this project. The list of all sponsors will be published.
+&emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit **[Sponsor - DragonOS](https://dragonos.org/donate/)**, so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
 
 ### Where will the sponsorship funds be used?
 
-- Server expenses of official website and community forum
+We guarantee that all sponsorship funds and items will be used for:
 
-- Code search engine server expenses (this is not a small amount)
+- Subsidies or equipment support for active community developers
+- Cloud service expenditure of DragonOS
+- Equipment purchase
+- Any use conducive to the development and construction of DragonOS
 
-- Expenses for domain name, CDN and other services
+### Sponsor List
 
-- Any use that is conducive to the development and construction of DragonOS
+**None**
 
-## Sponsors
+We hope that in the future, some enterprises can sponsor DragonOS and inject financial power into its development!
+
+### Individual Sponsor List
 
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
+- slientbard
 
 ## Open source statement
 

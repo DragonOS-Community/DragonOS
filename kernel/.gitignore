@@ -1,0 +1,9 @@
+target/
+src/kernel
+Cargo.lock
+
+# 将自动生成的C-Rust FFI加到gitignore
+src/include/bindings/bindings.rs
+# 将自动生成的Rust-C FFI加到gitignore
+src/include/bindings/bindings.h
+

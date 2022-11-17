@@ -32,6 +32,9 @@ fn main() {
             .use_core()
             .ctypes_prefix("::core::ffi")
             .generate_inline_functions(true)
+            .raw_line("#![allow(dead_code)]")
+            .raw_line("#![allow(non_upper_case_globals)]")
+            .raw_line("#![allow(non_camel_case_types)]")
             // Tell cargo to invalidate the built crate whenever any of the
             // included header files changed.
             .parse_callbacks(Box::new(bindgen::CargoCallbacks))

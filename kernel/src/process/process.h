@@ -18,6 +18,7 @@
 #include <mm/mm-types.h>
 #include <syscall/syscall.h>
 
+#include <asm/current.h>
 #if ARCH(I386) || ARCH(X86_64)
 #include <arch/x86_64/current.h>
 #else

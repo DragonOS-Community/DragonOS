@@ -48,6 +48,10 @@ int sched_setscheduler(struct process_control_block *p, int policy, const struct
     return _sched_setscheduler(p, policy, param, true);
 }
 
+int sched_gerscheduler(struct process_control_block *p, int policy, const struct sched_param *param)
+{
+    return 0;
+}
 /**
  * @brief 包裹shced_cfs_enqueue(),将PCB加入就绪队列
  *

@@ -121,6 +121,14 @@ struct process_control_block
     struct sched_entity se;
     struct sched_rt_entity rt;
     // struct sched_dl_entity dl;
+    // ==== 信号处理相关 =====
+    struct signal_struct *signal;
+    struct sighand_struct *sighand;
+    // 一个bitmap，表示被阻塞的信号
+    sigset_t blocked;
+    // 正在等待的信号的标志位，表示某个信号正在等待处理
+    struct sigpending sig_pending;
+
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

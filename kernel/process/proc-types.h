@@ -1,7 +1,6 @@
 #pragma once
 
 #include <common/wait_queue.h>
-#include <DragonOS/signal.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -34,8 +33,6 @@
 #define CLONE_FS (1UL << 0) // 在进程间共享打开的文件
 #define CLONE_SIGNAL (1UL << 1)
 #define CLONE_VM (1UL << 2) // 在进程间共享虚拟内存空间
-
-#define PCB_NAME_LEN 16
 
 struct thread_struct
 {
@@ -76,8 +73,6 @@ struct process_control_block
     int64_t preempt_count; // 持有的自旋锁的数量
     long signal;
     long cpu_id; // 当前进程在哪个CPU核心上运行
-    char name[PCB_NAME_LEN];
-
     // 内存空间分布结构体， 记录内存页表和程序段信息
     struct mm_struct *mm;
 
@@ -86,10 +81,6 @@ struct process_control_block
 
     // 连接各个pcb的双向链表
     struct List list;
-
-    //todo:给pcb中加一个spinlock_t成员
-    //进程自旋锁
-    // spinlock_t alloc_lock;
 
     // 地址空间范围
     // 用户空间： 0x0000 0000 0000 0000 ~ 0x0000 7fff ffff ffff

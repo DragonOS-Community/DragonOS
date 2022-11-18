@@ -518,14 +518,8 @@ uint64_t sys_wait4(struct pt_regs *regs)
     // 查找pid为指定值的进程
     // ps: 这里判断子进程的方法没有按照posix 2008来写。
     // todo: 根据进程树判断是否为当前进程的子进程
-    for (proc = &initial_proc_union.pcb; proc->next_pcb != &initial_proc_union.pcb; proc = proc->next_pcb)
-    {
-        if (proc->next_pcb->pid == pid)
-        {
-            child_proc = proc->next_pcb;
-            break;
-        }
-    }
+    
+    child_proc = process_find_pcb_by_pid(pid);
 
     if (child_proc == NULL)
         return -ECHILD;
@@ -542,7 +536,6 @@ uint64_t sys_wait4(struct pt_regs *regs)
     if (likely(status != NULL))
         *status = child_proc->exit_code;
     // copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
-    proc->next_pcb = child_proc->next_pcb;
 
     process_release_pcb(child_proc);
     return 0;

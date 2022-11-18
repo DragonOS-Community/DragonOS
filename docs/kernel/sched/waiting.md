@@ -9,13 +9,7 @@
 &emsp;&emsp;当您需要等待一个事件完成时，使用wait_queue机制能减少进程同步的开销。相比于滥用自旋锁以及信号量，或者是循环使用usleep(1000)这样的函数来完成同步，wait_queue是一个高效的解决方案。
 
 :::{warning}
-`wait_queue.h`中的等待队列的实现并没有把队列头独立出来，同时没有考虑为等待队列加锁。所以在后来的开发中加入了`wait_queue_head.h`的队列头实现，实质上就是链表+自旋锁。它与`wait_queue.h`中的队列是兼容的，当你使用`struct wait_queue_head`作为队列头时，你同样可以使用等待队列添加节点的函数。
-
-但是在之后的版本中可能会把两者合并，目前仍然没有进行，且存在头文件相互引用的问题: 
- - "spin_lock.h" 引用了 "wait_queue.h"
- - "wait_queue_head.h" 引用了 "spin_lock.h"；
-
-所以在合并之前必须解决这个问题。
+`wait_queue.h`中的等待队列的实现并没有把队列头独立出来，同时没有考虑为等待队列加锁。所以在后来的开发中加入了`wait_queue_head_t`的队列头实现，实质上就是链表+自旋锁。它与`wait_queue.h`中的队列`wait_queue_node_t`是兼容的，当你使用`struct wait_queue_head`作为队列头时，你同样可以使用等待队列添加节点的函数。
 :::
 
 ### 简单用法
@@ -89,7 +83,7 @@ typedef struct
 
 &emsp;&emsp; 等待队列头的使用逻辑与等待队列实际是一样的，因为他同样也是等待队列的节点(仅仅多了一把锁)。且wait_queue_head的函数基本上与wait_queue一致，只不过多了\*\*\*\_with\_node\_\*\*\*的字符串。
 
-&emsp;&emsp; 同时，wait_queue_head.h文件中提供了很多的宏，可以方便您的工作。
+&emsp;&emsp; 同时，wait_queue.h文件中提供了很多的宏，可以方便您的工作。
 
 ### 提供的宏 
 | 宏                               | 解释                                                          |

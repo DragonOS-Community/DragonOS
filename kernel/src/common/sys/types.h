@@ -12,8 +12,7 @@ typedef uint32_t uid_t;
 typedef uint32_t gid_t;
 typedef long long ssize_t;
 
-typedef int __pid_t;
-#define pid_t uint64_t
+typedef int64_t pid_t;
 typedef __SIZE_TYPE__ size_t;
 
 typedef char *caddr_t;

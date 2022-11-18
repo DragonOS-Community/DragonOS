@@ -1,10 +1,22 @@
+
 CFLAGS += -I .
 
-all: x86_64_ipi.o ia64_msi.o
+kernel_arch_x86_64_subdirs:= asm
 
-x86_64_ipi.o: x86_64_ipi.c
-	$(CC) $(CFLAGS) -c x86_64_ipi.c -o x86_64_ipi.o
+kernel_arch_x86_64_objs:= $(shell find ./*.c)
 
-ia64_msi.o: ia64_msi.c
-	$(CC) $(CFLAGS) -c ia64_msi.c -o ia64_msi.o
+ECHO:
+	@echo "$@"
 
+
+$(kernel_arch_x86_64_objs): ECHO
+	$(CC) $(CFLAGS) -c $@ -o $@.o
+
+$(kernel_arch_x86_64_subdirs): ECHO
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"
+
+all: $(kernel_arch_x86_64_objs) $(kernel_arch_x86_64_subdirs)
+
+
+clean:
+	echo "Done."

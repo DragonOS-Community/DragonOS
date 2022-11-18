@@ -1,5 +1,5 @@
 #include <common/spinlock.h>
-#include <common/wait_queue_head.h>
+#include <common/wait_queue.h>
 #include <process/process.h>
 #include <time/sleep.h>
 #include <time/timer.h>

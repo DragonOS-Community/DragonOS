@@ -677,7 +677,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     struct process_control_block *tsk = NULL;
 
     // 为新的进程分配栈空间，并将pcb放置在底部
-    tsk = (struct process_control_block *)kmalloc(STACK_SIZE, 0);
+    tsk = (struct process_control_block *)kzalloc(STACK_SIZE, 0);
     barrier();
 
     if (tsk == NULL)
@@ -718,6 +718,9 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     tsk->pid = process_global_pid++;
     barrier();
     // 加入到进程链表中
+    // todo: 对pcb_list_lock加锁
+    tsk->prev_pcb = &initial_proc_union.pcb;
+    barrier();
     tsk->next_pcb = initial_proc_union.pcb.next_pcb;
     barrier();
     initial_proc_union.pcb.next_pcb = tsk;
@@ -784,13 +787,14 @@ copy_flags_failed:;
 }
 
 /**
- * @brief 根据pid获取进程的pcb
+ * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL
  *
  * @param pid
  * @return struct process_control_block*
  */
-struct process_control_block *process_get_pcb(long pid)
+struct process_control_block *process_find_pcb_by_pid(pid_t pid)
 {
+    // todo: 当进程管理模块拥有pcblist_lock之后，对其加锁
     struct process_control_block *pcb = initial_proc_union.pcb.next_pcb;
 
     // 使用蛮力法搜索指定pid的pcb
@@ -802,6 +806,7 @@ struct process_control_block *process_get_pcb(long pid)
     }
     return NULL;
 }
+
 /**
  * @brief 将进程加入到调度器的就绪队列中
  *
@@ -1179,8 +1184,15 @@ int process_release_pcb(struct process_control_block *pcb)
 {
     // 释放子进程的页表
     process_exit_mm(pcb);
-    if ((pcb->flags & PF_KTHREAD))  // 释放内核线程的worker private结构体
+    if ((pcb->flags & PF_KTHREAD)) // 释放内核线程的worker private结构体
         free_kthread_struct(pcb);
+    
+    // 将pcb从pcb链表中移除
+    // todo: 对相关的pcb加锁
+    pcb->prev_pcb->next_pcb = pcb->next_pcb;
+    pcb->next_pcb->prev_pcb = pcb->prev_pcb;
+    
+    // 释放当前pcb
     kfree(pcb);
     return 0;
 }

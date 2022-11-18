@@ -155,11 +155,10 @@
         "procfs.h": "c",
         "err.h": "c",
         "rtc.h": "c",
-        "wait_queue_head.h": "c",
         "list.h": "c",
         "completion.h": "c",
-        "fat32.h": "c"
-
+        "fat32.h": "c",
+        "irqflags.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": "",

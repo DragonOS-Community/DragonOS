@@ -84,7 +84,7 @@ struct process_control_block
     // 进程切换时保存的状态信息
     struct thread_struct *thread;
 
-    // 连接各个pcb的双向链表
+    // pcb加入调度队列时，所使用的链表节点
     struct List list;
 
     //todo:给pcb中加一个spinlock_t成员
@@ -105,7 +105,7 @@ struct process_control_block
     struct vfs_file_t *fds[PROC_MAX_FD_NUM];
 
     // 链表中的下一个pcb
-    struct process_control_block *next_pcb;
+    struct process_control_block *prev_pcb, *next_pcb;
     // 父进程的pcb
     struct process_control_block *parent_pcb;
 

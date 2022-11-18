@@ -27,7 +27,7 @@
     {                                                                                                                  \
         .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
         .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,                      \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,    \
         .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL                                      \
     }
 
@@ -95,12 +95,12 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
                       unsigned long stack_size);
 
 /**
- * @brief 根据pid获取进程的pcb
+ * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL
  *
  * @param pid
  * @return struct process_control_block*
  */
-struct process_control_block *process_get_pcb(long pid);
+struct process_control_block *process_find_pcb_by_pid(pid_t pid);
 
 /**
  * @brief 将进程加入到调度器的就绪队列中

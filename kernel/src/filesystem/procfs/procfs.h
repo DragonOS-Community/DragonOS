@@ -7,7 +7,7 @@
 #include <common/stdio.h>
 #include <common/string.h>
 #include <process/process.h>
-// #include <stdio.h>
+#include <common/list.h>
 
 /**
  * @brief 初始化procfs
@@ -31,8 +31,8 @@ typedef struct procfs_sb_info_t procfs_sb_info_t;
  */
 struct procfs_inode_info_t
 {
-    pid_t pid;       //进程号
-    unsigned int fd; //文件描述符
+    long pid;
+    int type;
 };
 
 /**
@@ -40,13 +40,10 @@ struct procfs_inode_info_t
  *
  */
 struct proc_data {
-  	int release_buffer;
   	int readlen;
   	char *rbuffer;
   	int writelen;
-  	int maxwritelen;
   	char *wbuffer;
-  	void (*on_close) (struct vfs_index_node_t *, struct vfs_file_t *);
 };
 
 /**
@@ -74,24 +71,7 @@ int check_name_available(const char *name, int namelen, int8_t reserved)
  * @param pid 进程号
  * @return int64_t 错误码
  */
-int64_t mk_proc_dir(long pid)
-{
-    int retval = 0;
-    
-    //创建文件夹
-    char *path = "/proc/";
-    const char *temp = ltoa(pid);
-    strcat(path, temp);
-    vfs_mkdir(path, 0, false);
-
-    //创建各相关文件
-
-    
-    //获取进程pcb
-    struct process_control_block *tsk = process_get_pcb(pid);
-
-    return retval;
-}
+int64_t mk_proc_dir(long pid);
 
 /**
  * @brief 检查读取并将数据从内核拷贝到用户
@@ -104,4 +84,14 @@ int64_t mk_proc_dir(long pid)
  * 
  * @return long 读取字节数
  */
-long simple_procfs_read(void *to, int64_t count, long *position, const void *from, int64_t available);
+long simple_procfs_read(void *to, int64_t count, long *position, void *from, int64_t available);
+
+/**
+ * @brief 创建文件
+ *
+ * @param path 文件夹路径
+ * @param mode 创建模式
+ * @return int64_t 错误码
+ */
+int64_t proc_create_file(const char *path, mode_t mode,long pid);
+

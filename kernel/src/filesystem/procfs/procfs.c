@@ -49,46 +49,99 @@ struct vfs_dir_entry_operations_t procfs_dentry_ops =
         .iput = &procfs_iput,
 };
 
-static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) { return 0; }
+static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) 
+{ 
+    struct procfs_inode_info_t *finode = inode->private_inode_info;
+    struct proc_data *fdata = kzalloc(sizeof(struct proc_data),0);
+    struct process_control_block *pcb_t = process_get_pcb(finode->pid);
+
+    //判断文件类型
+    int mode = finode->type;
+    fdata->rbuffer = kzalloc(1024,0);
+    int len = 0; 
+    switch (mode)
+    {
+    case 1:
+        strcpy(fdata->rbuffer, "Name:"); len+=5;
+        strcpy((fdata->rbuffer)+len, pcb_t->name); len+=strlen(pcb_t->name);
+        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+        strcpy((fdata->rbuffer)+len, "state:"); len+=6;
+        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->state)); len+=strlen(ltoa(pcb_t->state));
+        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+        strcpy((fdata->rbuffer)+len, "pid:"); len+=4;
+        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->pid)); len+=strlen(ltoa(pcb_t->pid));
+        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+        strcpy((fdata->rbuffer)+len, "Ppid:"); len+=5;
+        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->parent_pcb->pid)); len+=strlen(ltoa(pcb_t->parent_pcb->pid));
+        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+        strcpy((fdata->rbuffer)+len, "cpu_id:"); len+=7;
+        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->cpu_id)); len+=strlen(ltoa(pcb_t->cpu_id));
+        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+        strcpy((fdata->rbuffer)+len, "signal:"); len+=7;
+        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->signal)); len+=strlen(ltoa(pcb_t->signal));
+        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+        strcpy((fdata->rbuffer)+len, "priority:"); len+=9;
+        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->priority)); len+=strlen(ltoa(pcb_t->priority));
+        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+
+        fdata->readlen = len;
+        inode->file_size = len;
+        file_ptr->private_data = fdata;
+        break;
+    
+    default:
+        break;
+    }
+    
+    return 0; 
+}
 static long procfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) { return 0; }
 static long procfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position)
 {
-    //获取私有信息
-    struct proc_data *priv = file_ptr->private_data;
+    // 获取私有信息
+    struct proc_data *priv = (struct proc_data*)file_ptr->private_data;
+    // kdebug("readlen:%ld",priv->readlen);
     if (!priv->rbuffer)
-      		return -EINVAL;
+        return -EINVAL;
 
-	return simple_procfs_read(buf, count, position, priv->rbuffer, priv->readlen);
+    return simple_procfs_read(buf, count, position, priv->rbuffer, priv->readlen);
 }
 
 /**
  * @brief 检查读取并将数据从内核拷贝到用户
- * 
+ *
  * @param to: 要读取的用户空间缓冲区
  * @param count: 要读取的最大字节数
  * @param position: 缓冲区中的当前位置
  * @param from: 要读取的缓冲区
  * @param available: 缓冲区的大小
- * 
+ *
  * @return long 读取字节数
  */
-long simple_procfs_read(void *to, int64_t count, long *position, const void *from, int64_t available)
+long simple_procfs_read(void *to, int64_t count, long *position, void *from, int64_t available)
 {
-	long pos = *position;
-	int64_t ret;
- 
-	if (pos < 0)
-		return -EINVAL;
-	if (pos >= available || !count)
-		return 0;
-	if (count > available - pos)
-		count = available - pos;
-	ret = copy_to_user(to, from + pos, count);
-	if (ret == count)
-		return -EFAULT;
-	count -= ret;
-	*position = pos + count;
-	return count;
+    long pos = *position;
+    // kdebug("pos:%ld",pos);
+    // kdebug("count:%ld",count);
+    // kdebug("available:%ld",available);
+    int64_t ret;
+
+    if (pos < 0)
+        return -EINVAL;
+    if (pos >= available || !count)
+        return 0;
+    if (count > available - pos)
+        count = available - pos;
+    // kdebug("count:%d",count);
+    ret = copy_to_user(to, from + pos, count);
+    // kdebug("to=%#018lx", to);
+    // kdebug("from=%#018lx", from);
+    // kdebug("ret:%ld",ret);
+    // if (ret == count)
+    //     return -EFAULT;
+    // count -= ret;
+    *position = pos + ret;
+    return ret;
 }
 
 static long procfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) { return 0; }
@@ -284,6 +337,139 @@ static __always_inline void __procfs_init_root_dentry()
     procfs_root_dentry->dir_ops = &procfs_dentry_ops;
 
     __procfs_init_root_inode();
+}
+
+/**
+ * @brief 创建进程对应文件夹
+ *
+ * @param pid 进程号
+ * @return int64_t 错误码
+ */
+int64_t mk_proc_dir(long pid)
+{
+    int retval = 0;
+    
+    //创建文件夹
+    char tmp[70]={0};
+    int len = strlen(ltoa(pid));
+    // kdebug("len:%d",len);
+    strcpy(tmp, "/proc/");
+    strcpy(tmp+6,ltoa(pid));
+    // kdebug("tmp:%s",tmp);
+    retval = vfs_mkdir(tmp, 0, false);
+    
+    //创建各相关文件
+    strcpy(tmp+6+len,"/status");
+    // kdebug("tmp:%s",tmp);
+    retval = proc_create_file(tmp,1,pid);
+    
+    return retval;
+}
+
+/**
+ * @brief 创建文件
+ *
+ * @param path 文件夹路径
+ * @param mode 创建模式
+ * @param procfs_ops 文件特定操作
+ * @return int64_t 错误码
+ */
+int64_t proc_create_file(const char *path, mode_t mode, long pid)
+{
+    long pathlen = strnlen(path, PAGE_4K_SIZE - 1);
+    if (pathlen == 0)
+        return -ENOENT;
+
+    int last_slash = -1;
+
+    // 查找最后一个'/'，忽略路径末尾的'/'
+    for (int i = pathlen - 2; i >= 0; --i)
+    {
+        if (path[i] == '/')
+        {
+            last_slash = i;
+            break;
+        }
+    }
+
+    char *buf = (char *)kzalloc(last_slash + 2, 0);
+
+    // 拷贝字符串（不包含要被创建的部分）
+    strncpy(buf, path, last_slash);
+    buf[last_slash + 1] = '\0';
+
+    // 查找父目录
+    struct vfs_dir_entry_t *parent_dir = vfs_path_walk(buf, 0);
+
+    if (parent_dir == NULL)
+    {
+        kwarn("parent dir is NULL.");
+        kfree(buf);
+        return -ENOENT;
+    }
+    kfree(buf);
+
+    //创建文件
+    struct vfs_dir_entry_t *dentry = vfs_alloc_dentry(pathlen - last_slash);
+    if (path[pathlen - 1] == '/')
+        dentry->name_length = pathlen - last_slash - 2;
+    else
+        dentry->name_length = pathlen - last_slash - 1;
+
+    strncpy(dentry->name, path + last_slash + 1, dentry->name_length);
+    dentry->parent = parent_dir;
+
+    // 对父目录项加锁
+    spin_lock(&parent_dir->lockref.lock);
+    spin_lock(&parent_dir->dir_inode->lockref.lock);
+    // 创建子目录项
+    int64_t retval = 0;
+    struct vfs_index_node_t *parent_inode = parent_dir->dir_inode;
+
+    //检验名称和法性
+    retval = check_name_available(dentry->name, dentry->name_length, 0);
+    if (retval != 0)
+        return retval;
+    if (dentry->dir_inode != NULL)
+        return -EEXIST;
+
+    struct vfs_index_node_t *inode = vfs_alloc_inode();
+    dentry->dir_inode = inode;
+    dentry->dir_ops = &procfs_dentry_ops;
+
+    //结点信息初始化
+    struct procfs_inode_info_t *finode = (struct procfs_inode_info_t *)kzalloc(sizeof(struct procfs_inode_info_t), 0);
+    finode->pid = pid;
+    kdebug("pid:%d",finode->pid);
+    finode->type = mode;
+
+    inode->attribute = VFS_IF_FILE;
+    inode->file_ops = &procfs_file_ops;
+    inode->file_size = 0;
+    inode->sb = parent_inode->sb;
+    inode->inode_ops = &procfs_inode_ops;
+    inode->private_inode_info = (void *)finode;
+    kdebug("finode:%#018lx",inode->private_inode_info);
+    inode->blocks = 0;
+
+    spin_unlock(&parent_dir->dir_inode->lockref.lock); // 解锁inode
+
+    // ==== 将子目录项添加到链表 ====
+    struct vfs_dir_entry_t *next_dentry = NULL;
+    // 若list非空，则对前一个dentry加锁
+    if (!list_empty(&parent_dir->subdirs_list))
+    {
+        next_dentry = list_entry(list_next(&parent_dir->subdirs_list), struct vfs_dir_entry_t, child_node_list);
+        spin_lock(&next_dentry->lockref.lock);
+    }
+    list_add(&parent_dir->subdirs_list, &dentry->child_node_list);
+    if (next_dentry != NULL)
+        spin_unlock(&next_dentry->lockref.lock);
+
+    // 新建文件结束，对父目录项解锁
+    spin_unlock(&parent_dir->lockref.lock);
+
+    return retval;
 }
 
 /**

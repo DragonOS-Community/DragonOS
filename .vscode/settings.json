@@ -158,7 +158,8 @@
         "list.h": "c",
         "completion.h": "c",
         "fat32.h": "c",
-        "irqflags.h": "c"
+        "irqflags.h": "c",
+        "dirent.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": "",

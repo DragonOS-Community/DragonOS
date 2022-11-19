@@ -66,8 +66,15 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     // 此处查找链表中中下一个执行的entity
     // TODO :不适用bitmap时如何找到对应的list
     // idx = sched_find_first_bit(array->bitmap);
-
-    queue = array->queue + idx;
+    for (int i=0;i<MAX_CPU_NUM;i++){
+        if(array->queue[i]!=NULL){
+            queue=array->queue[i];
+            break;
+        }
+    }
+    if (queue==NULL){
+        return NULL;
+    }
     // 获取当前的entry
     next = list_entry(queue->next, struct sched_rt_entity, run_list);
 
@@ -148,27 +155,4 @@ static void __delist_rt_entity(struct sched_rt_entity *rt_se, struct rt_prio_arr
 {
     list_del_init(&rt_se->run_list);
     rt_se->on_list = 0;
-}
-static void put_prev_task_rt(struct rq *rq, struct process_control_block *p)
-{
-    struct sched_rt_entity *rt_se = &p->rt;
-    struct rt_rq *rt_rq = &rq->rt;
-    // 这里没看懂
-    // if (on_rt_rq(&p->rt))
-    //     update_stats_wait_start_rt(rt_rq, rt_se);
-
-    // update_curr_rt(rq);
-
-    // update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 1);
-
-    /*
-     * The previous task needs to be made eligible for pushing
-     * if it is still active
-     */
-    if (on_rt_rq(&p->rt))
-        enqueue_pushable_task(rq, p);
-}
-static inline int on_rt_rq(struct sched_rt_entity *rt_se)
-{
-    return rt_se->on_rq;
 }

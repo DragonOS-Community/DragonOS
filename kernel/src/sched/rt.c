@@ -31,31 +31,24 @@ void sched_rt_init()
         sched_rt_ready_queue[i].proc_queue.virtual_runtime = 0x7fffffffffffffff;
     }
 }
-
-struct process_control_block *pick_next_task_rt(struct rq *rq)
+void init_rt_rq(struct rt_rq *rt_rq)
 {
-    struct process_control_block *p = pick_task_rt(rq);
-    return p;
+    struct rt_prio_array *array;
+    int i;
+
+    array = &rt_rq->active;
+    for (i = 0; i < MAX_RT_PRIO; i++)
+    {
+        list_init(array->queue + i);
+    }
+    /* We start is dequeued state, because no RT tasks are queued */
+    rt_rq->rt_queued = 0;
+
+    rt_rq->rt_time = 0;
+    rt_rq->rt_throttled = 0;
+    rt_rq->rt_runtime = 0;
+    raw_spin_lock_init(&rt_rq->rt_runtime_lock);
 }
-static struct process_control_block *pick_task_rt(struct rq *rq)
-{
-    struct process_control_block *p;
-    // TODO:如果队列中元素为空，则返回null，
-
-    p = _pick_next_task_rt(rq);
-
-    return p;
-}
-static struct process_control_block *_pick_next_task_rt(struct rq *rq)
-{
-    struct sched_rt_entity *rt_se;
-    struct rt_rq *rt_rq = &rq->rt;
-    // 从rt_rq中找优先级最高且最先入队的task
-    rt_se = pick_next_rt_entity(rt_rq);
-
-    return rt_task_of(rt_se);
-}
-
 static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 {
     struct rt_prio_array *array = &rt_rq->active;
@@ -66,13 +59,16 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     // 此处查找链表中中下一个执行的entity
     // TODO :不适用bitmap时如何找到对应的list
     // idx = sched_find_first_bit(array->bitmap);
-    for (int i=0;i<MAX_CPU_NUM;i++){
-        if(array->queue[i]!=NULL){
-            queue=array->queue[i];
+    for (int i = 0; i < MAX_CPU_NUM; i++)
+    {
+        if (array->queue[i] != NULL)
+        {
+            queue = array->queue[i];
             break;
         }
     }
-    if (queue==NULL){
+    if (queue == NULL)
+    {
         return NULL;
     }
     // 获取当前的entry
@@ -80,13 +76,52 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 
     return next;
 }
+static struct process_control_block *_pick_next_task_rt(struct rq *rq)
+{
+    struct sched_rt_entity *rt_se;
+    struct rt_rq *rt_rq = &rq->rt;
+    // 从rt_rq中找优先级最高且最先入队的task
+    rt_se = pick_next_rt_entity(rt_rq);
+
+    return rt_task_of(rt_se);
+}
+static struct process_control_block *pick_task_rt(struct rq *rq)
+{
+    struct process_control_block *p;
+    // TODO:如果队列中元素为空，则返回null，
+
+    p = _pick_next_task_rt(rq);
+
+    return p;
+}
+
+struct process_control_block *pick_next_task_rt(struct rq *rq)
+{
+    struct process_control_block *p = pick_task_rt(rq);
+    return p;
+}
+
 static inline struct process_control_block *rt_task_of(struct sched_rt_entity *rt_se)
 {
     return container_of(rt_se, struct process_control_block, rt);
 }
-/*
- * Adding/removing a task to/from a priority array:
- */
+}
+static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
+{
+    struct rt_rq *rt_rq = rt_se->rt_rq;
+    struct rt_prio_array *array = &rt_rq->active;
+    struct List *queue = array->queue + rt_task_of(rt_se)->priority;
+
+    list_append(&rt_se->run_list, queue);
+    rt_se->on_list = 1;
+    rt_se->on_rq = 1;
+}
+
+static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
+{
+    struct rq *rq = rt_se->rt_rq->rq;
+    __enqueue_rt_entity(rt_se, flags); // 将当前task enqueue到rt的rq中
+}
 
 /**
  * @brief 将rt_se插入到进程优先级对应的链表中
@@ -105,42 +140,10 @@ static void enqueue_task_rt(struct rq *rq, struct process_control_block *p, int 
     //     enqueue_pushable_task(rq, p);
 }
 
-static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
+static void __delist_rt_entity(struct sched_rt_entity *rt_se, struct rt_prio_array *array)
 {
-    struct rq *rq = rt_se->rt_rq->rq;
-    __enqueue_rt_entity(rt_se, flags); // 将当前task enqueue到rt的rq中
-}
-static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
-{
-    struct rt_rq *rt_rq = rt_se->rt_rq;
-    struct rt_prio_array *array = &rt_rq->active;
-    struct List *queue = array->queue + rt_task_of(rt_se)->priority;
-
-    list_append(&rt_se->run_list, queue);
-    rt_se->on_list = 1;
-    rt_se->on_rq = 1;
-}
-static inline struct process_control_block *rt_task_of(struct sched_rt_entity *rt_se)
-{
-    return container_of(rt_se, struct process_control_block, rt);
-}
-
-static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
-{
-    struct sched_rt_entity *rt_se = &p->rt;
-
-    // update_curr_rt(rq);
-    dequeue_rt_entity(rt_se, flags);
-
-    // dequeue_pushable_task(rq, p);
-}
-static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
-{
-    struct rq *rq = rt_se->rt_rq->rq;
-
-    __dequeue_rt_entity(rt_se, flags);
-
-    enqueue_top_rt_rq(&rq->rt);
+    list_del_init(&rt_se->run_list);
+    rt_se->on_list = 0;
 }
 static void __dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
@@ -151,8 +154,20 @@ static void __dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
 
     rt_se->on_rq = 0;
 }
-static void __delist_rt_entity(struct sched_rt_entity *rt_se, struct rt_prio_array *array)
+static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
-    list_del_init(&rt_se->run_list);
-    rt_se->on_list = 0;
+    struct rq *rq = rt_se->rt_rq->rq;
+
+    __dequeue_rt_entity(rt_se, flags);
+
+    enqueue_top_rt_rq(&rq->rt);
+}
+static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
+{
+    struct sched_rt_entity *rt_se = &p->rt;
+
+    // update_curr_rt(rq);
+    dequeue_rt_entity(rt_se, flags);
+
+    // dequeue_pushable_task(rq, p);
 }

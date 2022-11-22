@@ -1,5 +1,7 @@
 #pragma once
 
+#define STATUS 1
+
 #include <filesystem/VFS/VFS.h>
 #include <common/lockref.h>
 #include <common/spinlock.h>
@@ -90,8 +92,9 @@ long simple_procfs_read(void *to, int64_t count, long *position, void *from, int
  * @brief 创建文件
  *
  * @param path 文件夹路径
- * @param mode 创建模式
+ * @param type 文件类型
+ * @param pid pid
  * @return int64_t 错误码
  */
-int64_t proc_create_file(const char *path, mode_t mode,long pid);
+int64_t proc_create_file(const char *path, mode_t type,long pid);
 

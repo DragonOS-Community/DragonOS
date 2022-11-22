@@ -49,12 +49,21 @@ struct vfs_dir_entry_operations_t procfs_dentry_ops =
         .iput = &procfs_iput,
 };
 
+void data_puts(struct proc_data *fdata, char *s){
+    int len = strlen(s);
+    strcpy(fdata->rbuffer+fdata->readlen, s);
+    fdata->readlen+=len;
+}
+
 static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) 
 { 
+    if(inode->attribute == VFS_IF_DIR){
+        return 0;
+    }
     struct procfs_inode_info_t *finode = inode->private_inode_info;
+    // kdebug("finode=%#018lx", finode);
     struct proc_data *fdata = kzalloc(sizeof(struct proc_data),0);
-    struct process_control_block *pcb_t = process_get_pcb(finode->pid);
-
+    struct process_control_block *pcb_t = process_find_pcb_by_pid(finode->pid);
     //判断文件类型
     int mode = finode->type;
     fdata->rbuffer = kzalloc(1024,0);
@@ -62,31 +71,37 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
     switch (mode)
     {
     case 1:
-        strcpy(fdata->rbuffer, "Name:"); len+=5;
-        strcpy((fdata->rbuffer)+len, pcb_t->name); len+=strlen(pcb_t->name);
-        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
-        strcpy((fdata->rbuffer)+len, "state:"); len+=6;
-        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->state)); len+=strlen(ltoa(pcb_t->state));
-        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
-        strcpy((fdata->rbuffer)+len, "pid:"); len+=4;
-        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->pid)); len+=strlen(ltoa(pcb_t->pid));
-        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
-        strcpy((fdata->rbuffer)+len, "Ppid:"); len+=5;
-        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->parent_pcb->pid)); len+=strlen(ltoa(pcb_t->parent_pcb->pid));
-        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
-        strcpy((fdata->rbuffer)+len, "cpu_id:"); len+=7;
-        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->cpu_id)); len+=strlen(ltoa(pcb_t->cpu_id));
-        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
-        strcpy((fdata->rbuffer)+len, "signal:"); len+=7;
-        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->signal)); len+=strlen(ltoa(pcb_t->signal));
-        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
-        strcpy((fdata->rbuffer)+len, "priority:"); len+=9;
-        strcpy((fdata->rbuffer)+len, ltoa(pcb_t->priority)); len+=strlen(ltoa(pcb_t->priority));
-        strcpy((fdata->rbuffer)+len, "\n\r"); len++;
+        data_puts(fdata,"Name:");
+        data_puts(fdata,pcb_t->name);
+        data_puts(fdata,"\nstate:");
+        data_puts(fdata,ltoa(pcb_t->state));
+        data_puts(fdata,"\npid:");
+        data_puts(fdata,ltoa(pcb_t->pid));
+        data_puts(fdata,"\nPpid:");
+        data_puts(fdata,ltoa(pcb_t->parent_pcb->pid));
+        data_puts(fdata,"\ncpu_id:");
+        data_puts(fdata,ltoa(pcb_t->cpu_id));
+        data_puts(fdata,"\npriority:");
+        data_puts(fdata,ltoa(pcb_t->priority));
+        // data_puts(fdata,"\n");
 
-        fdata->readlen = len;
-        inode->file_size = len;
-        file_ptr->private_data = fdata;
+        unsigned long hiwater_vm, text, data;
+        hiwater_vm = pcb_t->mm->vmas->vm_end - pcb_t->mm->vmas->vm_start;
+        text = pcb_t->mm->code_addr_end - pcb_t->mm->code_addr_start;
+        data = pcb_t->mm->data_addr_end - pcb_t->mm->data_addr_start;
+
+        data_puts(fdata,"\nVmPeak:");
+        data_puts(fdata,ltoa(hiwater_vm));
+        data_puts(fdata," kB");
+        data_puts(fdata,"\nVmData:");
+        data_puts(fdata,ltoa(data));
+        data_puts(fdata," kB");
+        data_puts(fdata,"\nVmExe:");
+        data_puts(fdata,ltoa(text));
+        data_puts(fdata," kB\n");
+        
+        inode->file_size = fdata->readlen;
+        file_ptr->private_data = fdata;  
         break;
     
     default:
@@ -100,7 +115,7 @@ static long procfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, l
 {
     // 获取私有信息
     struct proc_data *priv = (struct proc_data*)file_ptr->private_data;
-    // kdebug("readlen:%ld",priv->readlen);
+    // kdebug("priv=%#018lx", priv);
     if (!priv->rbuffer)
         return -EINVAL;
 
@@ -114,7 +129,7 @@ static long procfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, l
  * @param count: 要读取的最大字节数
  * @param position: 缓冲区中的当前位置
  * @param from: 要读取的缓冲区
- * @param available: 缓冲区的大小
+ * @param available: 读取的缓冲区大小
  *
  * @return long 读取字节数
  */
@@ -221,6 +236,7 @@ static long procfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldi
 failed:;
     return 0;
 }
+
 struct vfs_file_operations_t procfs_file_ops =
     {
         .open = &procfs_open,
@@ -294,12 +310,16 @@ static long procfs_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_e
 
     //结点信息初始化
     struct procfs_inode_info_t *finode = (struct procfs_inode_info_t *)kzalloc(sizeof(struct procfs_inode_info_t), 0);
+    finode->pid = 0;
+    finode->type = 0;
+
     inode->attribute = VFS_IF_DIR;
     inode->file_ops = &procfs_file_ops;
     inode->file_size = 0;
     inode->sb = parent_inode->sb;
     inode->inode_ops = &procfs_inode_ops;
     inode->private_inode_info = (void *)finode;
+    // kdebug("inode->private_inode_info=%#018lx", inode->private_inode_info);
     inode->blocks = 0;
 
     return 0;
@@ -361,7 +381,7 @@ int64_t mk_proc_dir(long pid)
     //创建各相关文件
     strcpy(tmp+6+len,"/status");
     // kdebug("tmp:%s",tmp);
-    retval = proc_create_file(tmp,1,pid);
+    retval = proc_create_file(tmp,STATUS,pid);
     
     return retval;
 }
@@ -370,11 +390,11 @@ int64_t mk_proc_dir(long pid)
  * @brief 创建文件
  *
  * @param path 文件夹路径
- * @param mode 创建模式
- * @param procfs_ops 文件特定操作
+ * @param type 文件类型
+ * @param pid pid
  * @return int64_t 错误码
  */
-int64_t proc_create_file(const char *path, mode_t mode, long pid)
+int64_t proc_create_file(const char *path, mode_t type, long pid)
 {
     long pathlen = strnlen(path, PAGE_4K_SIZE - 1);
     if (pathlen == 0)
@@ -440,8 +460,8 @@ int64_t proc_create_file(const char *path, mode_t mode, long pid)
     //结点信息初始化
     struct procfs_inode_info_t *finode = (struct procfs_inode_info_t *)kzalloc(sizeof(struct procfs_inode_info_t), 0);
     finode->pid = pid;
-    kdebug("pid:%d",finode->pid);
-    finode->type = mode;
+    // kdebug("pid:%d",finode->pid);
+    finode->type = type;
 
     inode->attribute = VFS_IF_FILE;
     inode->file_ops = &procfs_file_ops;

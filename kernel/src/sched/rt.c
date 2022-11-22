@@ -2,17 +2,6 @@
 
 struct sched_queue_rt sched_rt_ready_queue[MAX_CPU_NUM]; // 就绪队列
 
-/**
- * @brief 调度函数
- *
- */
-void sched_rt()
-{
-    cli();
-    // 先选择需要调度的进程、再进行调度
-
-    sti();
-}
 
 /**
  * @brief 初始化RT进程调度器
@@ -170,4 +159,27 @@ static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int 
     dequeue_rt_entity(rt_se, flags);
 
     // dequeue_pushable_task(rq, p);
+}
+
+
+/**
+ * @brief 调度函数
+ *
+ */
+void sched_rt()
+{
+    cli();
+    // 先选择需要调度的进程、再进行调度
+    current_pcb->flags &= ~PF_NEED_SCHED;
+    // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
+    if (current_pcb->policy == SCHED_FIFO)
+    {   
+        current_pcb->
+        struct process_control_block *proc = pick_next_task_rt(rq)
+    }
+    // RR调度策略需要考虑时间片
+    else if (current_pcb->policy == SCHED_RR)
+    {
+    }
+    sti();
 }

@@ -21,10 +21,11 @@ impl FFIBind2Rust<crate::include::bindings::bindings::refcount_struct> for RefCo
     }
 }
 
+/// @brief 以指定的值初始化refcount
 macro_rules! REFCOUNT_INIT {
     ($x:expr) => {
         $crate::libs::refcount::RefCount {
-            refs: atomic_t { value: 0 },
+            refs: atomic_t { value: $x },
         }
     };
 }

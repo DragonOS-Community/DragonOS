@@ -46,6 +46,9 @@ extern struct mm_struct initial_mm;
 extern struct signal_struct INITIAL_SIGNALS;
 extern struct sighand_struct INITIAL_SIGHAND;
 
+extern void process_exit_sighand(struct process_control_block *pcb);
+extern void process_exit_signal(struct process_control_block *pcb);
+
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                             \
     {                                                                                                                  \
@@ -90,8 +93,6 @@ uint64_t process_exit_files(struct process_control_block *pcb);
  * @return uint64_t
  */
 uint64_t process_exit_mm(struct process_control_block *pcb);
-
-
 
 /**
  * @brief 切换进程
@@ -784,7 +785,6 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
     return 0;
 }
 
-
 /**
  * @brief todo: 回收线程结构体
  *
@@ -811,7 +811,8 @@ int process_release_pcb(struct process_control_block *pcb)
     // todo: 对相关的pcb加锁
     pcb->prev_pcb->next_pcb = pcb->next_pcb;
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
-
+    process_exit_sighand(pcb);
+    process_exit_signal(pcb);
     // 释放当前pcb
     kfree(pcb);
     return 0;

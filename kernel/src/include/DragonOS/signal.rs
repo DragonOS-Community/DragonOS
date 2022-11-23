@@ -4,7 +4,6 @@
 // todo: 将这里更换为手动编写的ffi绑定
 use crate::include::bindings::bindings::atomic_t;
 use crate::include::bindings::bindings::spinlock_t;
-use crate::include::bindings::bindings::wait_queue_head_t;
 use crate::libs::ffi_convert::FFIBind2Rust;
 use crate::libs::ffi_convert::__convert_mut;
 use crate::libs::ffi_convert::__convert_ref;
@@ -25,6 +24,12 @@ pub const MAX_SIG_NUM: i32 = 64;
 #[derive(Debug, Copy, Clone)]
 pub struct signal_struct {
     pub sig_cnt: atomic_t,
+}
+
+impl Default for signal_struct{
+    fn default() -> Self {
+        Self { sig_cnt: Default::default() }
+    }
 }
 
 /**

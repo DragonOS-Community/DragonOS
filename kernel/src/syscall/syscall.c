@@ -1,6 +1,7 @@
 #include "syscall.h"
 #include <common/errno.h>
 #include <common/fcntl.h>
+#include <common/kthread.h>
 #include <common/string.h>
 #include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
@@ -10,7 +11,6 @@
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
-#include <common/kthread.h>
 // 导出系统调用入口函数，定义在entry.S中
 extern void system_call(void);
 extern void syscall_int(void);
@@ -19,6 +19,7 @@ extern uint64_t sys_clock(struct pt_regs *regs);
 extern uint64_t sys_mstat(struct pt_regs *regs);
 extern uint64_t sys_open(struct pt_regs *regs);
 extern uint64_t sys_unlink_at(struct pt_regs *regs);
+extern uint64_t sys_kill(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -518,7 +519,7 @@ uint64_t sys_wait4(struct pt_regs *regs)
     // 查找pid为指定值的进程
     // ps: 这里判断子进程的方法没有按照posix 2008来写。
     // todo: 根据进程树判断是否为当前进程的子进程
-    
+    // todo: 当进程管理模块拥有pcblist_lock之后，调用之前，应当对其加锁
     child_proc = process_find_pcb_by_pid(pid);
 
     if (child_proc == NULL)
@@ -598,7 +599,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [20] = sys_pipe,
     [21] = sys_mstat,
     [22] = sys_unlink_at,
-    [23 ... 254] = system_call_not_exists,
+    [23] = sys_kill,
+    [24 ... 254] = system_call_not_exists,
     [255] = sys_ahci_end_req,
 };
-

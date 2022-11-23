@@ -28,6 +28,7 @@
 
 #define SYS_MSTAT 21    // 获取系统的内存状态信息
 #define SYS_UNLINK_AT 22    // 删除文件夹/删除文件链接
+#define SYS_KILL 23 // kill一个进程(向这个进程发出信号)
 
 /**
  * @brief 用户态系统调用函数

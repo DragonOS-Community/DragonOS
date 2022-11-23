@@ -1,6 +1,6 @@
 #pragma once
 #include <common/compiler.h>
-#include <arch/x86_64/asm/asm.h>
+#include <asm/asm.h>
 
 /**
  * @brief 通过extern不存在的函数，来让编译器报错。以防止不符合要求的代码的产生。

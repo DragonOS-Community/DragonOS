@@ -469,7 +469,7 @@ int64_t proc_create_file(const char *path, mode_t type, long pid)
     inode->sb = parent_inode->sb;
     inode->inode_ops = &procfs_inode_ops;
     inode->private_inode_info = (void *)finode;
-    kdebug("finode:%#018lx",inode->private_inode_info);
+    // kdebug("finode:%#018lx",inode->private_inode_info);
     inode->blocks = 0;
 
     spin_unlock(&parent_dir->dir_inode->lockref.lock); // 解锁inode

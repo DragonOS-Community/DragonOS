@@ -741,9 +741,9 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 唤醒进程
     process_wakeup(tsk);
     //创建对应procfs文件
-    // kdebug("coming to mkdir");
+    kdebug("coming to mkdir");
     mk_proc_dir(tsk->pid);
-    // kdebug("mkdir have done");
+    kdebug("mkdir have done");
     return retval;
 
 copy_thread_failed:;

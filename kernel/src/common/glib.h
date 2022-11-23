@@ -13,11 +13,8 @@
 #include <common/compiler.h>
 #include <common/list.h>
 
-#if ARCH(I386) || ARCH(X86_64)
-#include <arch/x86_64/asm/asm.h>
-#else
-#error Arch not supported.
-#endif
+
+#include <asm/asm.h>
 
 /**
  * @brief 根据结构体变量内某个成员变量member的基地址，计算出该结构体变量的基地址

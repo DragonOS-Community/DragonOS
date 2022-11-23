@@ -2,7 +2,7 @@
 #include <common/compiler.h>
 
 #ifdef __LOCKREF_ENABLE_CMPXCHG__
-#include <arch/x86_64/asm/cmpxchg.h>
+#include <asm/cmpxchg.h>
 
 #define CMPXCHG_LOOP(__lock_ref, CODE, SUCCESS)                                                     \
     {                                                                                               \

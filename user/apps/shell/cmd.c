@@ -4,6 +4,7 @@
 #include <libc/dirent.h>
 #include <libc/errno.h>
 #include <libc/fcntl.h>
+#include <libc/include/signal.h>
 #include <libc/stddef.h>
 #include <libc/stdio.h>
 #include <libc/stdlib.h>
@@ -23,7 +24,7 @@ struct built_in_cmd_t shell_cmds[] = {
     {"cd", shell_cmd_cd},         {"cat", shell_cmd_cat},     {"exec", shell_cmd_exec},   {"ls", shell_cmd_ls},
     {"mkdir", shell_cmd_mkdir},   {"pwd", shell_cmd_pwd},     {"rm", shell_cmd_rm},       {"rmdir", shell_cmd_rmdir},
     {"reboot", shell_cmd_reboot}, {"touch", shell_cmd_touch}, {"about", shell_cmd_about}, {"free", shell_cmd_free},
-    {"help", shell_help},         {"pipe", shell_pipe_test},
+    {"help", shell_help},         {"pipe", shell_pipe_test},  {"kill", shell_cmd_kill},
 
 };
 // 总共的内建命令数量
@@ -330,11 +331,14 @@ int shell_cmd_touch(int argc, char **argv)
 {
     int path_len = 0;
     char *file_path;
-    bool alloc_full_path=false;
+    bool alloc_full_path = false;
     if (argv[1][0] == '/')
         file_path = argv[1];
     else
-        {file_path = get_target_filepath(argv[1], &path_len);alloc_full_path=true;}
+    {
+        file_path = get_target_filepath(argv[1], &path_len);
+        alloc_full_path = true;
+    }
 
     // 打开文件
     int fd = open(file_path, O_CREAT);
@@ -350,7 +354,7 @@ int shell_cmd_touch(int argc, char **argv)
     close(fd);
     if (argv != NULL)
         free(argv);
-    if(alloc_full_path)
+    if (alloc_full_path)
         free(file_path);
     return 0;
 }
@@ -424,7 +428,7 @@ int shell_cmd_rmdir(int argc, char **argv)
  */
 int shell_cmd_rm(int argc, char **argv)
 {
-     char *full_path = NULL;
+    char *full_path = NULL;
     int result_path_len = -1;
     int retval = 0;
     bool alloc_full_path = false;
@@ -471,7 +475,7 @@ int shell_cmd_exec(int argc, char **argv)
         execv(file_path, argv);
         free(argv);
         free(file_path);
-        
+
         exit(-1);
     }
     else
@@ -497,7 +501,24 @@ int shell_cmd_about(int argc, char **argv)
 
     parse_command(input_buffer, &aac, &aav);
 
-    shell_cmd_exec(aac, aav);
+    return shell_cmd_exec(aac, aav);
+}
+
+int shell_cmd_kill(int argc, char **argv)
+{
+    int retval = 0;
+    if (argc < 2)
+    {
+        printf("Usage: Kill <pid>\n");
+        retval = -EINVAL;
+        goto out;
+    }
+    printf("argc = %d, argv[1]=%s\n", argc, argv[1]);
+    printf("atoi(argv[1])=%d\n", atoi(argv[1]));
+    retval = syscall_invoke(SYS_KILL, atoi(argv[1]), SIGKILL, 0, 0, 0, 0, 0, 0);
+out:;
+    free(argv);
+    return retval;
 }
 
 /**

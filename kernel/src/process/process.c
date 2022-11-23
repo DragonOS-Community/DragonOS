@@ -1,5 +1,6 @@
 #include "process.h"
 
+#include <DragonOS/signal.h>
 #include <common/compiler.h>
 #include <common/completion.h>
 #include <common/elf.h>
@@ -22,12 +23,11 @@
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/rootfs/rootfs.h>
 #include <filesystem/procfs/procfs.h>
+#include <ktest/ktest.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-
-#include <ktest/ktest.h>
 
 #include <mm/mmio.h>
 
@@ -44,6 +44,19 @@ extern void kernel_thread_func(void);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 extern struct mm_struct initial_mm;
+extern struct signal_struct INITIAL_SIGNALS;
+extern struct sighand_struct INITIAL_SIGHAND;
+
+// 设置初始进程的PCB
+#define INITIAL_PROC(proc)                                                                                             \
+    {                                                                                                                  \
+        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
+        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,   \
+        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                   \
+        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                       \
+    }
+
 struct thread_struct initial_thread = {
     .rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
     .rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
@@ -64,39 +77,12 @@ struct process_control_block *initial_proc[MAX_CPU_NUM] = {&initial_proc_union.p
 struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_TSS};
 
 /**
- * @brief 拷贝当前进程的标志位
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
-
-/**
- * @brief 拷贝当前进程的文件描述符等信息
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
-
-/**
  * @brief 回收进程的所有文件描述符
  *
  * @param pcb 要被回收的进程的pcb
  * @return uint64_t
  */
 uint64_t process_exit_files(struct process_control_block *pcb);
-
-/**
- * @brief 拷贝当前进程的内存空间分布结构体信息
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb);
 
 /**
  * @brief 释放进程的页表
@@ -106,17 +92,7 @@ uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb
  */
 uint64_t process_exit_mm(struct process_control_block *pcb);
 
-/**
- * @brief 拷贝当前进程的线程结构体
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
-                             uint64_t stack_size, struct pt_regs *current_regs);
 
-void process_exit_thread(struct process_control_block *pcb);
 
 /**
  * @brief 切换进程
@@ -645,6 +621,7 @@ void process_init()
 
     // 初始化进程的循环链表
     list_init(&initial_proc_union.pcb.list);
+    wait_queue_init(&initial_proc_union.pcb.wait_child_proc_exit, NULL);
 
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
@@ -787,7 +764,7 @@ copy_flags_failed:;
 
 /**
  * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL
- *
+ *  当进程管理模块拥有pcblist_lock之后，调用本函数之前，应当对其加锁
  * @param pid
  * @return struct process_control_block*
  */
@@ -807,16 +784,19 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
 }
 
 /**
- * @brief 将进程加入到调度器的就绪队列中
+ * @brief 将进程加入到调度器的就绪队列中.
  *
  * @param pcb 进程的pcb
+ *
+ * @return true 成功加入调度队列
+ * @return false 进程已经在运行
  */
 int process_wakeup(struct process_control_block *pcb)
 {
     // kdebug("pcb pid = %#018lx", pcb->pid);
 
     BUG_ON(pcb == NULL);
-    if (pcb == current_pcb || pcb == NULL)
+    if (pcb == NULL)
         return -EINVAL;
     // 如果pcb正在调度队列中，则不重复加入调度队列
     if (pcb->state & PROC_RUNNING)
@@ -824,7 +804,7 @@ int process_wakeup(struct process_control_block *pcb)
 
     pcb->state |= PROC_RUNNING;
     sched_enqueue(pcb);
-    return 0;
+    return 1;
 }
 
 /**
@@ -841,47 +821,6 @@ int process_wakeup_immediately(struct process_control_block *pcb)
         return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
     current_pcb->flags |= PF_NEED_SCHED;
-}
-/**
- * @brief 拷贝当前进程的标志位
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb)
-{
-    if (clone_flags & CLONE_VM)
-        pcb->flags |= PF_VFORK;
-    return 0;
-}
-
-/**
- * @brief 拷贝当前进程的文件描述符等信息
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_files(uint64_t clone_flags, struct process_control_block *pcb)
-{
-    int retval = 0;
-    // 如果CLONE_FS被置位，那么子进程与父进程共享文件描述符
-    // 文件描述符已经在复制pcb时被拷贝
-    if (clone_flags & CLONE_FS)
-        return retval;
-
-    // 为新进程拷贝新的文件描述符
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-    {
-        if (current_pcb->fds[i] == NULL)
-            continue;
-
-        pcb->fds[i] = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
-        memcpy(pcb->fds[i], current_pcb->fds[i], sizeof(struct vfs_file_t));
-    }
-
-    return retval;
 }
 
 /**
@@ -905,99 +844,6 @@ uint64_t process_exit_files(struct process_control_block *pcb)
     }
     // 清空当前进程的文件描述符列表
     memset(pcb->fds, 0, sizeof(struct vfs_file_t *) * PROC_MAX_FD_NUM);
-}
-
-/**
- * @brief 拷贝当前进程的内存空间分布结构体信息
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb)
-{
-    int retval = 0;
-    // 与父进程共享内存空间
-    if (clone_flags & CLONE_VM)
-    {
-        pcb->mm = current_pcb->mm;
-
-        return retval;
-    }
-
-    // 分配新的内存空间分布结构体
-    struct mm_struct *new_mms = (struct mm_struct *)kmalloc(sizeof(struct mm_struct), 0);
-    memset(new_mms, 0, sizeof(struct mm_struct));
-
-    memcpy(new_mms, current_pcb->mm, sizeof(struct mm_struct));
-    new_mms->vmas = NULL;
-    pcb->mm = new_mms;
-
-    // 分配顶层页表, 并设置顶层页表的物理地址
-    new_mms->pgd = (pml4t_t *)virt_2_phys(kmalloc(PAGE_4K_SIZE, 0));
-    // 由于高2K部分为内核空间，在接下来需要覆盖其数据，因此不用清零
-    memset(phys_2_virt(new_mms->pgd), 0, PAGE_4K_SIZE / 2);
-
-    // 拷贝内核空间的页表指针
-    memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]->mm->pgd) + 256,
-           PAGE_4K_SIZE / 2);
-
-    uint64_t *current_pgd = (uint64_t *)phys_2_virt(current_pcb->mm->pgd);
-
-    uint64_t *new_pml4t = (uint64_t *)phys_2_virt(new_mms->pgd);
-
-    // 拷贝用户空间的vma
-    struct vm_area_struct *vma = current_pcb->mm->vmas;
-    while (vma != NULL)
-    {
-        if (vma->vm_end > USER_MAX_LINEAR_ADDR || vma->vm_flags & VM_DONTCOPY)
-        {
-            vma = vma->vm_next;
-            continue;
-        }
-
-        int64_t vma_size = vma->vm_end - vma->vm_start;
-        // kdebug("vma_size=%ld, vm_start=%#018lx", vma_size, vma->vm_start);
-        if (vma_size > PAGE_2M_SIZE / 2)
-        {
-            int page_to_alloc = (PAGE_2M_ALIGN(vma_size)) >> PAGE_2M_SHIFT;
-            for (int i = 0; i < page_to_alloc; ++i)
-            {
-                uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-
-                struct vm_area_struct *new_vma = NULL;
-                int ret = mm_create_vma(new_mms, vma->vm_start + i * PAGE_2M_SIZE, PAGE_2M_SIZE, vma->vm_flags,
-                                        vma->vm_ops, &new_vma);
-                // 防止内存泄露
-                if (unlikely(ret == -EEXIST))
-                    free_pages(Phy_to_2M_Page(pa), 1);
-                else
-                    mm_map_vma(new_vma, pa, 0, PAGE_2M_SIZE);
-
-                memcpy((void *)phys_2_virt(pa), (void *)(vma->vm_start + i * PAGE_2M_SIZE),
-                       (vma_size >= PAGE_2M_SIZE) ? PAGE_2M_SIZE : vma_size);
-                vma_size -= PAGE_2M_SIZE;
-            }
-        }
-        else
-        {
-            uint64_t map_size = PAGE_4K_ALIGN(vma_size);
-            uint64_t va = (uint64_t)kmalloc(map_size, 0);
-
-            struct vm_area_struct *new_vma = NULL;
-            int ret = mm_create_vma(new_mms, vma->vm_start, map_size, vma->vm_flags, vma->vm_ops, &new_vma);
-            // 防止内存泄露
-            if (unlikely(ret == -EEXIST))
-                kfree((void *)va);
-            else
-                mm_map_vma(new_vma, virt_2_phys(va), 0, map_size);
-
-            memcpy((void *)va, (void *)vma->vm_start, vma_size);
-        }
-        vma = vma->vm_next;
-    }
-
-    return retval;
 }
 
 /**
@@ -1063,106 +909,6 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
     return 0;
 }
 
-/**
- * @brief 重写内核栈中的rbp地址
- *
- * @param new_regs 子进程的reg
- * @param new_pcb 子进程的pcb
- * @return int
- */
-static int process_rewrite_rbp(struct pt_regs *new_regs, struct process_control_block *new_pcb)
-{
-
-    uint64_t new_top = ((uint64_t)new_pcb) + STACK_SIZE;
-    uint64_t old_top = (uint64_t)(current_pcb) + STACK_SIZE;
-
-    uint64_t *rbp = &new_regs->rbp;
-    uint64_t *tmp = rbp;
-
-    // 超出内核栈范围
-    if ((uint64_t)*rbp >= old_top || (uint64_t)*rbp < (old_top - STACK_SIZE))
-        return 0;
-
-    while (1)
-    {
-        // 计算delta
-        uint64_t delta = old_top - *rbp;
-        // 计算新的rbp值
-        uint64_t newVal = new_top - delta;
-
-        // 新的值不合法
-        if (unlikely((uint64_t)newVal >= new_top || (uint64_t)newVal < (new_top - STACK_SIZE)))
-            break;
-        // 将新的值写入对应位置
-        *rbp = newVal;
-        // 跳转栈帧
-        rbp = (uint64_t *)*rbp;
-    }
-
-    // 设置内核态fork返回到enter_syscall_int()函数内的时候，rsp寄存器的值
-    new_regs->rsp = new_top - (old_top - new_regs->rsp);
-    return 0;
-}
-
-/**
- * @brief 拷贝当前进程的线程结构体
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-uint64_t process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
-                             uint64_t stack_size, struct pt_regs *current_regs)
-{
-    // 将线程结构体放置在pcb后方
-    struct thread_struct *thd = (struct thread_struct *)(pcb + 1);
-    memset(thd, 0, sizeof(struct thread_struct));
-    pcb->thread = thd;
-
-    struct pt_regs *child_regs = NULL;
-    // 拷贝栈空间
-    if (pcb->flags & PF_KFORK) // 内核态下的fork
-    {
-        // 内核态下则拷贝整个内核栈
-        uint32_t size = ((uint64_t)current_pcb) + STACK_SIZE - (uint64_t)(current_regs);
-
-        child_regs = (struct pt_regs *)(((uint64_t)pcb) + STACK_SIZE - size);
-        memcpy(child_regs, (void *)current_regs, size);
-        barrier();
-        // 然后重写新的栈中，每个栈帧的rbp值
-        process_rewrite_rbp(child_regs, pcb);
-    }
-    else
-    {
-        child_regs = (struct pt_regs *)((uint64_t)pcb + STACK_SIZE - sizeof(struct pt_regs));
-        memcpy(child_regs, current_regs, sizeof(struct pt_regs));
-        barrier();
-        child_regs->rsp = stack_start;
-    }
-
-    // 设置子进程的返回值为0
-    child_regs->rax = 0;
-    if (pcb->flags & PF_KFORK)
-        thd->rbp =
-            (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_system_call时的rbp）
-    else
-        thd->rbp = (uint64_t)pcb + STACK_SIZE;
-
-    // 设置新的内核线程开始执行的时候的rsp
-    thd->rsp = (uint64_t)child_regs;
-    thd->fs = current_pcb->thread->fs;
-    thd->gs = current_pcb->thread->gs;
-
-    // 根据是否为内核线程、是否在内核态fork，设置进程的开始执行的地址
-    if (pcb->flags & PF_KFORK)
-        thd->rip = (uint64_t)ret_from_system_call;
-    else if (pcb->flags & PF_KTHREAD && (!(pcb->flags & PF_KFORK)))
-        thd->rip = (uint64_t)kernel_thread_func;
-    else
-        thd->rip = (uint64_t)ret_from_system_call;
-
-    return 0;
-}
 
 /**
  * @brief todo: 回收线程结构体
@@ -1185,12 +931,12 @@ int process_release_pcb(struct process_control_block *pcb)
     process_exit_mm(pcb);
     if ((pcb->flags & PF_KTHREAD)) // 释放内核线程的worker private结构体
         free_kthread_struct(pcb);
-    
+
     // 将pcb从pcb链表中移除
     // todo: 对相关的pcb加锁
     pcb->prev_pcb->next_pcb = pcb->next_pcb;
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
-    
+
     // 释放当前pcb
     kfree(pcb);
     return 0;

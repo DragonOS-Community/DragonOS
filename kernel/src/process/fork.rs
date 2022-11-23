@@ -13,9 +13,10 @@ use crate::{
     ipc::signal::DEFAULT_SIGACTION,
     kdebug,
     libs::{
+        atomic::atomic_set,
         ffi_convert::FFIBind2Rust,
         refcount::{refcount_inc, RefCount},
-        spinlock::{spin_lock_irqsave, spin_unlock_irqrestore}, atomic::atomic_set,
+        spinlock::{spin_lock_irqsave, spin_unlock_irqrestore},
     },
 };
 
@@ -87,7 +88,8 @@ pub extern "C" fn process_copy_signal(clone_flags: u64, pcb: *mut process_contro
 pub extern "C" fn process_exit_signal(pcb: *mut process_control_block) {
     // 回收进程的信号结构体
     unsafe {
-        drop((*pcb).sighand as *mut sighand_struct);
+        let sighand = Box::from_raw((*pcb).sighand as *mut sighand_struct);
+        drop(sighand);
         (*pcb).sighand = 0 as *mut crate::include::bindings::bindings::sighand_struct;
     }
 }
@@ -96,7 +98,8 @@ pub extern "C" fn process_exit_signal(pcb: *mut process_control_block) {
 pub extern "C" fn process_exit_sighand(pcb: *mut process_control_block) {
     // todo: 回收进程的sighand结构体
     unsafe {
-        drop((*pcb).signal as *mut signal_struct);
+        let sig = Box::from_raw((*pcb).signal as *mut signal_struct);
+        drop(sig);
         (*pcb).signal = 0 as *mut crate::include::bindings::bindings::signal_struct;
     }
 }

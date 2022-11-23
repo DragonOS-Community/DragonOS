@@ -28,3 +28,9 @@ pub fn spin_is_locked(lock: &spinlock_t) -> bool {
 
     return if val == 0 { true } else { false };
 }
+
+impl Default for spinlock_t {
+    fn default() -> Self {
+        Self { lock: 1 }
+    }
+}

@@ -50,6 +50,13 @@ impl core::fmt::Debug for sigaction__union_u{
     }
 }
 
+
+impl Default for sigaction__union_u {
+    fn default() -> Self {
+        Self{_sa_handler:None}
+    }
+}
+
 /**
  * @brief 信号处理结构体
  */
@@ -61,6 +68,13 @@ pub struct sigaction {
     pub sa_mask: sigset_t,
     pub sa_restorer: ::core::option::Option<unsafe extern "C" fn()>, // 暂时未实现该函数
 }
+
+impl Default for sigaction{
+    fn default() -> Self {
+        Self { _u: Default::default(), sa_flags: Default::default(), sa_mask: Default::default(), sa_restorer: Default::default() }
+    }
+}
+
 
 
 /**
@@ -115,8 +129,13 @@ pub struct __sifields__kill {
 pub struct sighand_struct {
     pub siglock: spinlock_t,
     pub count: RefCount,
-    pub signal_fd_wqh: wait_queue_head_t,
     pub action: [sigaction; MAX_SIG_NUM as usize],
+}
+
+impl Default for sighand_struct{
+    fn default() -> Self {
+        Self { siglock: Default::default(), count: Default::default(), action: [Default::default();MAX_SIG_NUM as usize] }
+    }
 }
 
 /**
@@ -316,6 +335,20 @@ impl FFIBind2Rust<crate::include::bindings::bindings::sighand_struct> for sighan
     }
     fn convert_ref<'a>(
         src: *const crate::include::bindings::bindings::sighand_struct,
+    ) -> Option<&'a Self> {
+        return __convert_ref(src)
+    }
+}
+
+/// @brief 将给定的来自bindgen的sigaction解析为Rust的signal.rs中定义的sigaction的引用
+impl FFIBind2Rust<crate::include::bindings::bindings::sigaction> for sigaction{
+    fn convert_mut<'a>(
+        src: *mut crate::include::bindings::bindings::sigaction,
+    ) -> Option<&'a mut Self> {
+        return __convert_mut(src);
+    }
+    fn convert_ref<'a>(
+        src: *const crate::include::bindings::bindings::sigaction,
     ) -> Option<&'a Self> {
         return __convert_ref(src)
     }

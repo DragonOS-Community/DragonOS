@@ -36,7 +36,7 @@
 #define CLONE_SIGNAL (1UL << 1) // 克隆时，与父进程共享信号结构体
 #define CLONE_VM (1UL << 2) // 在进程间共享虚拟内存空间
 #define CLONE_SIGHAND (1UL << 3) // 克隆时，与父进程共享信号处理结构体
-
+#define CLONE_CLEAR_SIGHAND (1UL<<4) // 克隆时，将原本被设置为SIG_IGNORE的信号，设置回SIG_DEFAULT
 #define PCB_NAME_LEN 16
 
 struct thread_struct

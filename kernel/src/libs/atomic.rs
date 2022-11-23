@@ -9,3 +9,9 @@ pub fn atomic_read(ato:*const atomic_t)-> i64{
         return read_volatile(&(*ato).value);
     }
 }
+
+impl Default for atomic_t{
+    fn default() -> Self {
+        Self { value: 0 }
+    }
+}

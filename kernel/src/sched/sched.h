@@ -27,6 +27,11 @@ struct rt_prio_array
     // TODO: 定义MAX_RT_PRIO为100
     struct List queue[MAX_RT_PRIO];
 };
+struct sched_entity
+{
+    unsigned int on_rq;
+    unsigned long exec_start;
+};
 struct sched_rt_entity
 {
     // 用于加入到优先级队列中
@@ -124,3 +129,8 @@ void sched_init();
  *
  */
 void sched_update_jiffies();
+
+static inline struct process_control_block *task_of(struct sched_entity *se)
+{
+    return container_of(se, struct process_control_block, se);
+}

@@ -12,11 +12,12 @@ int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
-                             uint64_t stack_size, struct pt_regs *current_regs);
+                        uint64_t stack_size, struct pt_regs *current_regs);
 
-extern int process_copy_sighand(uint64_t clone_flags, struct process_control_block * pcb);
-extern int process_copy_signal(uint64_t clone_flags, struct process_control_block * pcb);
-
+extern int process_copy_sighand(uint64_t clone_flags, struct process_control_block *pcb);
+extern int process_copy_signal(uint64_t clone_flags, struct process_control_block *pcb);
+extern void process_exit_sighand(struct process_control_block *pcb);
+extern void process_exit_signal(struct process_control_block *pcb);
 
 /**
  * @brief fork当前进程
@@ -111,14 +112,14 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     retval = process_copy_files(clone_flags, tsk);
     if (retval)
         goto copy_files_failed;
-    
+
     // 拷贝信号处理函数
     retval = process_copy_sighand(clone_flags, tsk);
-    if(retval)
+    if (retval)
         goto copy_sighand_failed;
-    
+
     retval = process_copy_signal(clone_flags, tsk);
-    if(retval)
+    if (retval)
         goto copy_signal_failed;
 
     // 拷贝线程结构体
@@ -338,7 +339,7 @@ static int process_rewrite_rbp(struct pt_regs *new_regs, struct process_control_
  * @return uint64_t
  */
 int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
-                             uint64_t stack_size, struct pt_regs *current_regs)
+                        uint64_t stack_size, struct pt_regs *current_regs)
 {
     // 将线程结构体放置在pcb后方
     struct thread_struct *thd = (struct thread_struct *)(pcb + 1);

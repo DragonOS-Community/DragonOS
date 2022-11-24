@@ -29,13 +29,9 @@ void init_rt_rq(struct rt_rq *rt_rq)
     {
         list_init(array->queue + i);
     }
-    /* We start is dequeued state, because no RT tasks are queued */
     rt_rq->rt_queued = 0;
-
     rt_rq->rt_time = 0;
-    rt_rq->rt_throttled = 0;
     rt_rq->rt_runtime = 0;
-    raw_spin_lock_init(&rt_rq->rt_runtime_lock);
 }
 static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 {

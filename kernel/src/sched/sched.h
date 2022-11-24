@@ -73,6 +73,7 @@ struct rt_rq
     unsigned int rt_nr_running; // rt队列中的任务数
     unsigned int rr_nr_running;
     struct rq *rq;
+    int rt_queued;
     struct plist_head pushable_tasks;
     unsigned long rt_time; //当前队列的累计运行时间
     unsigned long rt_runtime; //当前队列的单个周期内的最大运行时间

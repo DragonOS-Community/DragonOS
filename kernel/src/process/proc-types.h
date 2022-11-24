@@ -2,6 +2,7 @@
 
 #include <common/wait_queue.h>
 #include <DragonOS/signal.h>
+#include <sched/sched.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16

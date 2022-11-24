@@ -186,6 +186,13 @@ void sched_rt()
     {
         // 时间片
         // 判断这个进程是否有时间片，能继续则继续，不能则替换
+        if (--current_pcb->rt.time_slice == 0)
+        {
+            struct process_control_block *proc = pick_next_task_rt(rq);
+            process_switch_mm(proc);
+
+            switch_proc(current_pcb, proc);
+        }
     }
     // 非实时进程，查找rq中的队列进行切换
     else if (current_pcb->policy == SCHED_NORMAL)

@@ -43,6 +43,7 @@ struct sched_rt_entity
     struct rt_rq *rt_rq;
     struct sched_rt_entity *parent;
     struct sched_rt_entity *back;
+    unsigned int time_slice; //针对RR调度策略的调度时隙
 };
 struct plist_head
 {
@@ -59,6 +60,8 @@ struct rt_rq
     unsigned int rr_nr_running;
     struct rq *rq;
     struct plist_head pushable_tasks;
+    unsigned long rt_time; //当前队列的累计运行时间
+    unsigned long rt_runtime; //当前队列的单个周期内的最大运行时间
 };
 struct rq
 {

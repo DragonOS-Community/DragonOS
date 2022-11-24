@@ -1,5 +1,5 @@
 #pragma once
-
+#include <asm/asm.h>
 // 保存当前rflags的值到变量x内并关闭中断
 #define local_irq_save(x) __asm__ __volatile__("pushfq ; popq %0 ; cli" \
                                                : "=g"(x)::"memory")

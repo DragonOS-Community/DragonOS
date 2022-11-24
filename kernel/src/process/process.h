@@ -27,28 +27,8 @@
 
 #include "proc-types.h"
 
-// 设置初始进程的PCB
-#define INITIAL_PROC(proc)                \
-	{                                     \
-		.state = PROC_UNINTERRUPTIBLE,    \
-		.flags = PF_KTHREAD,              \
-		.preempt_count = 0,               \
-		.signal = 0,                      \
-		.cpu_id = 0,                      \
-		.mm = &initial_mm,                \
-		.thread = &initial_thread,        \
-		.addr_limit = 0xffffffffffffffff, \
-		.pid = 0,                         \
-		.priority = 2,                    \
-		.virtual_runtime = 0,             \
-		.fds = {0},                       \
-		.next_pcb = &proc,                \
-		.parent_pcb = &proc,              \
-		.exit_code = 0,                   \
-		.wait_child_proc_exit = 0,        \
-		.worker_private = NULL,           \
-		.policy = SCHED_NORMAL            \
-	}
+extern void process_exit_thread(struct process_control_block *pcb);
+extern uint64_t process_exit_files(struct process_control_block *pcb);
 
 /**
  * @brief 任务状态段结构体
@@ -122,17 +102,19 @@ void process_init();
 unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size);
 
 /**
- * @brief 根据pid获取进程的pcb
- *
+ * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL
+ * 当进程管理模块拥有pcblist_lock之后，调用本函数之前，应当对其加锁
  * @param pid
  * @return struct process_control_block*
  */
-struct process_control_block *process_get_pcb(long pid);
+struct process_control_block *process_find_pcb_by_pid(pid_t pid);
 
 /**
  * @brief 将进程加入到调度器的就绪队列中
  *
  * @param pcb 进程的pcb
+ *
+ * @return 如果进程被成功唤醒，则返回1,如果进程正在运行，则返回0.如果pcb为NULL，则返回-EINVAL
  */
 int process_wakeup(struct process_control_block *pcb);
 
@@ -231,3 +213,30 @@ extern struct process_control_block *initial_proc[MAX_CPU_NUM];
  * @param pcb_name 保存名字的char数组
  */
 void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name);
+
+/**
+ * @brief 判断进程是否已经停止
+ *
+ * hint: 本函数在rust中实现，请参考rust版本的注释
+ *
+ * @param pcb 目标pcb
+ * @return true
+ * @return false
+ */
+extern bool process_is_stopped(struct process_control_block *pcb);
+
+/**
+ * @brief 尝试唤醒指定的进程。
+ * 本函数的行为：If (@_state & @pcb->state) @pcb->state = TASK_RUNNING.
+ *
+ * hint: 本函数在rust中实现，请参考rust版本的注释
+ */
+extern int process_try_to_wake_up(struct process_control_block *_pcb, uint64_t _state, int32_t _wake_flags);
+
+/** @brief 当进程，满足 (@state & @pcb->state)时，唤醒进程，并设置： @pcb->state = TASK_RUNNING.
+ *
+ * hint: 本函数在rust中实现，请参考rust版本的注释
+ * @return true 唤醒成功
+ * @return false 唤醒失败
+ */
+extern int process_wake_up_state(struct process_control_block *pcb, uint64_t state);

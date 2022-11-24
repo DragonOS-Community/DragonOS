@@ -35,7 +35,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     // idx = sched_find_first_bit(array->bitmap);
     for (int i = 0; i < MAX_CPU_NUM; i++)
     {
-        if (array->queue[i] != NULL)
+        if (!list_empty(array->queue[i]))
         {
             queue = array->queue[i];
             break;

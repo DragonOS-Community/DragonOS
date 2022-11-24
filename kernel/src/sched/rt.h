@@ -3,7 +3,7 @@
 
 #include <common/glib.h>
 #include <process/process.h>
-#include <sched.h>
+#include "sched.h"
 
 /**
  * @brief 初始化RT进程调度器

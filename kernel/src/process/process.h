@@ -18,6 +18,8 @@
 #include <mm/mm-types.h>
 #include <syscall/syscall.h>
 
+#include <asm/current.h>
+
 #include "proc-types.h"
 
 extern void process_exit_thread(struct process_control_block *pcb);

@@ -134,7 +134,7 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 
     __dequeue_rt_entity(rt_se, flags);
 
-    enqueue_top_rt_rq(&rq->rt);
+    // enqueue_top_rt_rq(&rq->rt);
 }
 static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
 {

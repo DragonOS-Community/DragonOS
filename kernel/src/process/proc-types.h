@@ -3,7 +3,6 @@
 #include <DragonOS/signal.h>
 #include <common/wait_queue.h>
 #include <stdint.h>
-#include <sched/sched.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -68,6 +67,91 @@ struct thread_struct
 #define PF_NOFREEZE (1UL << 4) // 当前进程不能被冻结
 #define PF_EXITING (1UL << 5)  // 进程正在退出
 #define PF_WAKEKILL (1UL << 6) // 进程由于接收到终止信号唤醒
+
+#define MAX_RT_PRIO 100 //实时进程队列数目
+
+/**
+ * @brief RT调度类的优先级队列数据结构
+ *
+ */
+struct rt_prio_array
+{
+    // TODO: 定义MAX_RT_PRIO为100
+    struct List queue[MAX_RT_PRIO];
+};
+struct sched_entity
+{
+    unsigned int on_rq;
+    unsigned long exec_start;
+};
+struct sched_rt_entity
+{
+    // 用于加入到优先级队列中
+    struct List run_list;
+    unsigned long timeout;
+    unsigned short on_rq;   // 入队之后设置1
+    unsigned short on_list; // 入队之后设置1
+    /* rq on which this entity is (to be) queued: */
+    struct rt_rq *rt_rq;
+    struct sched_rt_entity *parent;
+    struct sched_rt_entity *back;
+    unsigned int time_slice; //针对RR调度策略的调度时隙
+};
+struct plist_head
+{
+    struct List node_list;
+};
+/**
+ * @brief rt运行队列
+ *
+ */
+struct rt_rq
+{
+    struct rt_prio_array active;
+    unsigned int rt_nr_running; // rt队列中的任务数
+    unsigned int rr_nr_running;
+    struct rq *rq;
+    int rt_queued;
+    struct plist_head pushable_tasks;
+    unsigned long rt_time; //当前队列的累计运行时间
+    unsigned long rt_runtime; //当前队列的单个周期内的最大运行时间
+};
+struct rq
+{
+    /* data */
+    // struct cfs_rq cfs;
+    struct rt_rq rt;
+    // struct dl_rq dl;
+};
+
+struct sched_param
+{
+    int sched_priority;
+};
+struct sched_attr
+{
+    uint32_t size;
+
+    uint32_t sched_policy;
+    uint64_t sched_flags;
+
+    /* SCHED_NORMAL, SCHED_BATCH */
+    int32_t sched_nice;
+
+    /* SCHED_FIFO, SCHED_RR */
+    uint32_t sched_priority;
+
+    /* SCHED_DEADLINE */
+    uint64_t sched_runtime;
+    uint64_t sched_deadline;
+    uint64_t sched_period;
+
+    /* Utilization hints */
+    uint32_t sched_util_min;
+    uint32_t sched_util_max;
+};
+
+
 /**
  * @brief 进程控制块
  *

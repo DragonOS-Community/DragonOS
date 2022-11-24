@@ -166,13 +166,13 @@ void sched_rt()
     // 先选择需要调度的进程、再进行调度
     current_pcb->flags &= ~PF_NEED_SCHED;
     // 获取当前CPU的rq
-    struct rt_rq *rt_rq = current_pcb->rt->rt_rq;
-    struct rq = rt_rq->rq;
+    struct rt_rq *curr_rt_rq = current_pcb->rt->rt_rq;
+    struct rq *curr_rq = curr_rt_rq->rq;
     // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
     if (current_pcb->policy == SCHED_FIFO)
     {
 
-        struct process_control_block *proc = pick_next_task_rt(rq);
+        struct process_control_block *proc = pick_next_task_rt(curr_rq);
         process_switch_mm(proc);
 
         switch_proc(current_pcb, proc);
@@ -184,7 +184,8 @@ void sched_rt()
         // 判断这个进程是否有时间片，能继续则继续，不能则替换
         if (--current_pcb->rt.time_slice == 0)
         {
-            struct process_control_block *proc = pick_next_task_rt(rq);
+            enqueue_task_rt(curr_rq,current_pcb,0);
+            struct process_control_block *proc = pick_next_task_rt(curr_rq);
             process_switch_mm(proc);
 
             switch_proc(current_pcb, proc);
@@ -193,7 +194,7 @@ void sched_rt()
     // 非实时进程，查找rq中的队列进行切换
     else if (current_pcb->policy == SCHED_NORMAL)
     {
-        struct process_control_block *proc = pick_next_task_rt(rq);
+        struct process_control_block *proc = pick_next_task_rt(curr_rq);
         process_switch_mm(proc);
 
         switch_proc(current_pcb, proc);

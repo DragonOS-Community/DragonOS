@@ -18,13 +18,6 @@
 #include <mm/mm-types.h>
 #include <syscall/syscall.h>
 
-#include <asm/current.h>
-#if ARCH(I386) || ARCH(X86_64)
-#include <arch/x86_64/current.h>
-#else
-#error Unsupported architecture!
-#endif
-
 #include "proc-types.h"
 
 extern void process_exit_thread(struct process_control_block *pcb);
@@ -36,28 +29,19 @@ extern uint64_t process_exit_files(struct process_control_block *pcb);
  */
 
 // 设置初始进程的tss
-#define INITIAL_TSS                                                       \
-	{                                                                     \
-		.reserved0 = 0,                                                   \
-		.rsp0 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)), \
-		.rsp1 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)), \
-		.rsp2 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)), \
-		.reserved1 = 0,                                                   \
-		.ist1 = 0xffff800000007c00,                                       \
-		.ist2 = 0xffff800000007c00,                                       \
-		.ist3 = 0xffff800000007c00,                                       \
-		.ist4 = 0xffff800000007c00,                                       \
-		.ist5 = 0xffff800000007c00,                                       \
-		.ist6 = 0xffff800000007c00,                                       \
-		.ist7 = 0xffff800000007c00,                                       \
-		.reserved2 = 0,                                                   \
-		.reserved3 = 0,                                                   \
-		.io_map_base_addr = 0                                             \
-	}
+#define INITIAL_TSS                                                                                                    \
+    {                                                                                                                  \
+        .reserved0 = 0, .rsp0 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),                              \
+        .rsp1 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),                                              \
+        .rsp2 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)), .reserved1 = 0, .ist1 = 0xffff800000007c00,  \
+        .ist2 = 0xffff800000007c00, .ist3 = 0xffff800000007c00, .ist4 = 0xffff800000007c00,                            \
+        .ist5 = 0xffff800000007c00, .ist6 = 0xffff800000007c00, .ist7 = 0xffff800000007c00, .reserved2 = 0,            \
+        .reserved3 = 0, .io_map_base_addr = 0                                                                          \
+    }
 
-#define GET_CURRENT_PCB    \
-	"movq %rsp, %rbx \n\t" \
-	"andq $-32768, %rbx\n\t"
+#define GET_CURRENT_PCB                                                                                                \
+    "movq %rsp, %rbx \n\t"                                                                                             \
+    "andq $-32768, %rbx\n\t"
 
 /**
  * @brief 切换进程上下文
@@ -65,24 +49,24 @@ extern uint64_t process_exit_files(struct process_control_block *pcb);
  * 然后调用__switch_to切换栈，配置其他信息，最后恢复下一个进程的rax rbp。
  */
 
-#define switch_proc(prev, next)                                                                     \
-	do                                                                                              \
-	{                                                                                               \
-		__asm__ __volatile__("pushq	%%rbp	\n\t"                                                     \
-							 "pushq	%%rax	\n\t"                                                     \
-							 "movq	%%rsp,	%0	\n\t"                                                  \
-							 "movq	%2,	%%rsp	\n\t"                                                  \
-							 "leaq	switch_proc_ret_addr(%%rip),	%%rax	\n\t"                         \
-							 "movq	%%rax,	%1	\n\t"                                                  \
-							 "pushq	%3		\n\t"                                                       \
-							 "jmp	__switch_to	\n\t"                                                 \
-							 "switch_proc_ret_addr:	\n\t"                                           \
-							 "popq	%%rax	\n\t"                                                      \
-							 "popq	%%rbp	\n\t"                                                      \
-							 : "=m"(prev->thread->rsp), "=m"(prev->thread->rip)                     \
-							 : "m"(next->thread->rsp), "m"(next->thread->rip), "D"(prev), "S"(next) \
-							 : "memory");                                                           \
-	} while (0)
+#define switch_proc(prev, next)                                                                                        \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        __asm__ __volatile__("pushq	%%rbp	\n\t"                                                                        \
+                             "pushq	%%rax	\n\t"                                                                        \
+                             "movq	%%rsp,	%0	\n\t"                                                                     \
+                             "movq	%2,	%%rsp	\n\t"                                                                     \
+                             "leaq	switch_proc_ret_addr(%%rip),	%%rax	\n\t"                                            \
+                             "movq	%%rax,	%1	\n\t"                                                                     \
+                             "pushq	%3		\n\t"                                                                          \
+                             "jmp	__switch_to	\n\t"                                                                    \
+                             "switch_proc_ret_addr:	\n\t"                                                              \
+                             "popq	%%rax	\n\t"                                                                         \
+                             "popq	%%rbp	\n\t"                                                                         \
+                             : "=m"(prev->thread->rsp), "=m"(prev->thread->rip)                                        \
+                             : "m"(next->thread->rsp), "m"(next->thread->rip), "D"(prev), "S"(next)                    \
+                             : "memory");                                                                              \
+    } while (0)
 
 /**
  * @brief 初始化系统的第一个进程
@@ -99,7 +83,8 @@ void process_init();
  * @param stack_size 堆栈大小
  * @return unsigned long
  */
-unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start, unsigned long stack_size);
+unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start,
+                      unsigned long stack_size);
 
 /**
  * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL
@@ -171,12 +156,6 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags);
 
 int process_fd_alloc(struct vfs_file_t *file);
 
-/**
- * @brief 释放pcb
- *
- * @param pcb
- * @return int
- */
 int process_release_pcb(struct process_control_block *pcb);
 
 /**
@@ -185,12 +164,11 @@ int process_release_pcb(struct process_control_block *pcb);
  * @param next 下一个进程的pcb
  *
  */
-#define process_switch_mm(next_pcb)                                    \
-	do                                                                 \
-	{                                                                  \
-		asm volatile("movq %0, %%cr3	\n\t" ::"r"(next_pcb->mm->pgd) \
-					 : "memory");                                      \
-	} while (0)
+#define process_switch_mm(next_pcb)                                                                                    \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        asm volatile("movq %0, %%cr3	\n\t" ::"r"(next_pcb->mm->pgd) : "memory");                                    \
+    } while (0)
 // flush_tlb();
 
 // 获取当前cpu id

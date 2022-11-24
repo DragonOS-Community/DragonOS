@@ -93,7 +93,7 @@ static inline struct process_control_block *rt_task_of(struct sched_rt_entity *r
 {
     return container_of(rt_se, struct process_control_block, rt);
 }
-}
+
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
     struct rt_rq *rt_rq = rt_se->rt_rq;

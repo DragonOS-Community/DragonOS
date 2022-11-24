@@ -19,6 +19,20 @@
 #define IS_VALID_SCHED_POLICY(_policy) ((_policy) > 0 && (_policy) <= SCHED_MAX_POLICY_NUM)
 
 /**
+ * @brief 根据结构体变量内某个成员变量member的基地址，计算出该结构体变量的基地址
+ * @param ptr 指向结构体变量内的成员变量member的指针
+ * @param type 成员变量所在的结构体
+ * @param member 成员变量名
+ *
+ * 方法：使用ptr减去结构体内的偏移，得到结构体变量的基地址
+ */
+#define container_of(ptr, type, member)                                     \
+    ({                                                                      \
+        typeof(((type *)0)->member) *p = (ptr);                             \
+        (type *)((unsigned long)p - (unsigned long)&(((type *)0)->member)); \
+    })
+
+/**
  * @brief RT调度类的优先级队列数据结构
  *
  */
@@ -132,8 +146,3 @@ void sched_init();
  *
  */
 void sched_update_jiffies();
-
-static inline struct process_control_block *task_of(struct sched_entity *se)
-{
-    return container_of(se, struct process_control_block, se);
-}

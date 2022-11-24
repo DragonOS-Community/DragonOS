@@ -39,4 +39,4 @@ static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int 
  * @brief 调度函数
  *
  */
-void sched_rt()；
+void sched_rt();

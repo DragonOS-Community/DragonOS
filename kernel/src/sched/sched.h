@@ -14,7 +14,6 @@
 #define SCHED_IDLE 5
 #define SCHED_DEADLINE 6
 #define SCHED_MAX_POLICY_NUM SCHED_DEADLINE
-#define MAX_RT_PRIO 100
 
 #define IS_VALID_SCHED_POLICY(_policy) ((_policy) > 0 && (_policy) <= SCHED_MAX_POLICY_NUM)
 

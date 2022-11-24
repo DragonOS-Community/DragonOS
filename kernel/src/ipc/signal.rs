@@ -7,8 +7,8 @@ use crate::{
             ENOTSUP, ESRCH, PF_EXITING, PF_KTHREAD, PF_WAKEKILL, PROC_INTERRUPTIBLE,
         },
         DragonOS::signal::{
-            si_code_val, sighand_struct, siginfo, signal_struct, sigpending, sigset_t,
-            SignalNumber, MAX_SIG_NUM, sigaction, sigaction__union_u,
+            si_code_val, sigaction, sigaction__union_u, sighand_struct, siginfo, signal_struct,
+            sigpending, sigset_t, SignalNumber, MAX_SIG_NUM,
         },
     },
     kBUG, kdebug, kwarn,
@@ -26,13 +26,11 @@ use crate::{
 use crate::include::DragonOS::signal::{__siginfo_union, __siginfo_union_data};
 
 /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
-pub static DEFAULT_SIGACTION: sigaction = sigaction{
-    _u: sigaction__union_u{
-        _sa_handler: None,
-    },
-    sa_flags:0,
-    sa_mask:0,
-    sa_restorer:None
+pub static DEFAULT_SIGACTION: sigaction = sigaction {
+    _u: sigaction__union_u { _sa_handler: None },
+    sa_flags: 0,
+    sa_mask: 0,
+    sa_restorer: None,
 };
 
 /// @brief kill系统调用，向指定的进程发送信号
@@ -142,7 +140,7 @@ fn signal_send_sig_info(
     if !lock_process_sighand(target_pcb, &mut flags).is_none() {
         // 发送信号
         retval = send_signal_locked(sig, info, target_pcb, PidType::PID);
-        
+
         kdebug!("flags=0x{:016x}", flags);
         // 对sighand放锁
         unlock_process_sighand(target_pcb, &flags);
@@ -159,22 +157,20 @@ fn lock_process_sighand<'a>(
     flags: &mut u64,
 ) -> Option<&'a mut sighand_struct> {
     kdebug!("lock_process_sighand");
-    let x = unsafe { &mut *pcb.sighand };
 
     let sighand_ptr = sighand_struct::convert_mut(unsafe { &mut *pcb.sighand });
     // kdebug!("sighand_ptr={:?}", &sighand_ptr);
     if !sighand_ptr.is_some() {
         kBUG!("Sighand ptr of process {pid} is NULL!", pid = pcb.pid);
         return None;
-    }else{
-
+    } else {
         kdebug!("7777");
     }
-    let lock =  {&mut sighand_ptr.unwrap().siglock};
+    let lock = { &mut sighand_ptr.unwrap().siglock };
     kdebug!("123");
-    kdebug!("lock={}", unsafe{*(lock as *mut spinlock_t as *mut i8)});
+    kdebug!("lock={}", unsafe { *(lock as *mut spinlock_t as *mut i8) });
     spin_lock_irqsave(lock, flags);
-    kdebug!("lock={}", unsafe{*(lock as *mut spinlock_t as *mut i8)});
+    kdebug!("lock={}", unsafe { *(lock as *mut spinlock_t as *mut i8) });
     kdebug!("locked");
     let ret = unsafe { ((*pcb).sighand as *mut sighand_struct).as_mut() };
 
@@ -186,10 +182,10 @@ fn lock_process_sighand<'a>(
 /// @param flags 用来保存rflags的变量，将这个值恢复到rflags寄存器中
 fn unlock_process_sighand(pcb: &mut process_control_block, flags: &u64) {
     kdebug!("unlock_process_sighand");
-    let lock = unsafe{&mut (*pcb.sighand).siglock};
+    let lock = unsafe { &mut (*pcb.sighand).siglock };
     kdebug!("lock={:?}", lock);
     spin_unlock_irqrestore(lock, flags);
-    kdebug!("lock={}", unsafe{*(lock as *mut spinlock_t as *mut i8)});
+    kdebug!("lock={}", unsafe { *(lock as *mut spinlock_t as *mut i8) });
     kdebug!("123443");
 }
 
@@ -238,7 +234,10 @@ fn __send_signal_locked(
     let mut retval = 0;
 
     // 判断该进入该函数时，是否已经持有了锁
-    println!("locked={}",spin_is_locked(unsafe { &(*pcb.sighand).siglock }));
+    println!(
+        "locked={}",
+        spin_is_locked(unsafe { &(*pcb.sighand).siglock })
+    );
     kdebug!("1234");
     let _pending: Option<&mut sigpending> = sigpending::convert_mut(&mut pcb.sig_pending);
     kdebug!("567");
@@ -399,4 +398,3 @@ fn signal_wake_up_state(pcb: &mut process_control_block, state: u64) {
         process_kick(pcb);
     }
 }
-

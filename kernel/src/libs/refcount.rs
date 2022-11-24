@@ -7,6 +7,12 @@ pub struct RefCount {
     pub refs: atomic_t,
 }
 
+impl Default for RefCount{
+    fn default() -> Self {
+        Self { refs:  atomic_t { value: 1 }}
+    }
+}
+
 /// @brief 将给定的来自bindgen的refcount_t解析为Rust的RefCount的引用
 impl FFIBind2Rust<crate::include::bindings::bindings::refcount_struct> for RefCount{
     fn convert_mut<'a>(
@@ -21,10 +27,11 @@ impl FFIBind2Rust<crate::include::bindings::bindings::refcount_struct> for RefCo
     }
 }
 
+/// @brief 以指定的值初始化refcount
 macro_rules! REFCOUNT_INIT {
     ($x:expr) => {
         $crate::libs::refcount::RefCount {
-            refs: atomic_t { value: 0 },
+            refs: $crate::include::bindings::bindings::atomic_t { value: $x },
         }
     };
 }

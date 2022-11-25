@@ -207,8 +207,9 @@ struct process_control_block
     // rt调度器需要使用
     unsigned int rt_priority;
 
-    struct sched_entity se;
-    struct sched_rt_entity rt;
+    // struct sched_entity se;
+    // struct sched_rt_entity rt;
+    
     // struct sched_dl_entity dl;
     // ==== 信号处理相关 =====
     struct signal_struct *signal;

@@ -1,11 +1,7 @@
 #pragma once
 #include <common/stddef.h>
 
-#if ARCH(I386) || ARCH(X86_64)
-#include <arch/x86_64/asm/asm.h>
-#else
-#error Arch not supported.
-#endif
+#include <asm/asm.h>
 
 //链表数据结构
 struct List

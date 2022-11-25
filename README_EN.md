@@ -80,6 +80,7 @@ We hope that in the future, some enterprises can sponsor DragonOS and inject fin
 
 ### Individual Sponsor List
 
+- David Wen
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 - slientbard

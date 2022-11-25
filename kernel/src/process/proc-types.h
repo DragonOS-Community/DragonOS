@@ -1,8 +1,8 @@
 #pragma once
 
-#include <stdint.h>
 #include <DragonOS/signal.h>
 #include <common/wait_queue.h>
+#include <stdint.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -32,11 +32,12 @@
 #define USER_DS (0x30)
 
 // 进程初始化时的数据拷贝标志位
-#define CLONE_FS (1UL << 0) // 在进程间共享打开的文件
-#define CLONE_SIGNAL (1UL << 1) // 克隆时，与父进程共享信号结构体
-#define CLONE_VM (1UL << 2) // 在进程间共享虚拟内存空间
-#define CLONE_SIGHAND (1UL << 3) // 克隆时，与父进程共享信号处理结构体
-
+#define CLONE_FS (1UL << 0)            // 在进程间共享打开的文件
+#define CLONE_SIGNAL (1UL << 1)        // 克隆时，与父进程共享信号结构体
+#define CLONE_VM (1UL << 2)            // 在进程间共享虚拟内存空间
+#define CLONE_SIGHAND (1UL << 3)       // 克隆时，与父进程共享信号处理结构体
+#define CLONE_CLEAR_SIGHAND (1UL << 4) // 克隆时，将原本被设置为SIG_IGNORE的信号，设置回SIG_DEFAULT
+#define CLONE_THREAD (1UL << 5)       // 拷贝线程
 #define PCB_NAME_LEN 16
 
 struct thread_struct

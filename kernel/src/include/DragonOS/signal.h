@@ -108,13 +108,12 @@ struct signal_struct
 
 /**
  * @brief 信号处理结构体，位于pcb之中。
- *
+ * 请注意，该结构体需要与rust的版本一致，且以rust的为准
  */
 struct sighand_struct
 {
     spinlock_t siglock;
     refcount_t count;
-    wait_queue_head_t signal_fd_wqh;
     // 为每个信号注册的处理函数的结构体
     struct sigaction action[MAX_SIG_NUM];
 };

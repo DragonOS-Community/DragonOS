@@ -14,8 +14,20 @@ static spinlock_t procfs_global_lock;       // procfs的全局锁
 const char __procfs_mount_path[] = "/proc"; // 挂在路径
 
 static int64_t proc_create_file(const char *path, mode_t type, long pid);
-static int check_name_available(const char *name, int namelen, int8_t reserved);
+static int __check_name_available(const char *name, int namelen, int8_t reserved);
 static long simple_procfs_read(void *to, int64_t count, long *position, void *from, int64_t available);
+
+/**
+ * @brief 文件的私有信息结构
+ *
+ */
+struct procfs_file_private_data
+{
+    int readlen;
+    char *rbuffer;
+    int writelen;
+    char *wbuffer;
+};
 
 /**
  * @brief 创建procfs的super block
@@ -34,29 +46,48 @@ struct vfs_superblock_t *procfs_read_superblock(struct block_device *blk)
     return &procfs_sb;
 }
 
-static void procfs_write_superblock(struct vfs_superblock_t *sb) { return; }
-static void procfs_put_superblock(struct vfs_superblock_t *sb) { return; }
-static void procfs_write_inode(struct vfs_index_node_t *inode) { return; }
-struct vfs_super_block_operations_t procfs_sb_ops =
-    {
-        .write_superblock = &procfs_write_superblock,
-        .put_superblock = &procfs_put_superblock,
-        .write_inode = &procfs_write_inode,
+static void procfs_write_superblock(struct vfs_superblock_t *sb)
+{
+    return;
+}
+static void procfs_put_superblock(struct vfs_superblock_t *sb)
+{
+    return;
+}
+static void procfs_write_inode(struct vfs_index_node_t *inode)
+{
+    return;
+}
+struct vfs_super_block_operations_t procfs_sb_ops = {
+    .write_superblock = &procfs_write_superblock,
+    .put_superblock = &procfs_put_superblock,
+    .write_inode = &procfs_write_inode,
 };
 
-static long procfs_compare(struct vfs_dir_entry_t *parent_dEntry, char *source_filename, char *dest_filename) { return 0; }
-static long procfs_hash(struct vfs_dir_entry_t *dEntry, char *filename) { return 0; }
-static long procfs_release(struct vfs_dir_entry_t *dEntry) { return 0; }
-static long procfs_iput(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode) { return 0; }
-struct vfs_dir_entry_operations_t procfs_dentry_ops =
-    {
-        .compare = &procfs_compare,
-        .hash = &procfs_hash,
-        .release = &procfs_release,
-        .iput = &procfs_iput,
+static long procfs_compare(struct vfs_dir_entry_t *parent_dEntry, char *source_filename, char *dest_filename)
+{
+    return 0;
+}
+static long procfs_hash(struct vfs_dir_entry_t *dEntry, char *filename)
+{
+    return 0;
+}
+static long procfs_release(struct vfs_dir_entry_t *dEntry)
+{
+    return 0;
+}
+static long procfs_iput(struct vfs_dir_entry_t *dEntry, struct vfs_index_node_t *inode)
+{
+    return 0;
+}
+struct vfs_dir_entry_operations_t procfs_dentry_ops = {
+    .compare = &procfs_compare,
+    .hash = &procfs_hash,
+    .release = &procfs_release,
+    .iput = &procfs_iput,
 };
 
-void data_puts(struct proc_data *fdata, char *s)
+void data_puts(struct procfs_file_private_data *fdata, const char *s)
 {
     int len = strlen(s);
     strcpy(fdata->rbuffer + fdata->readlen, s);
@@ -70,12 +101,12 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
         return 0;
     }
     struct procfs_inode_info_t *finode = inode->private_inode_info;
-    if(finode == NULL)
+    if (finode == NULL)
     {
         return 0;
     }
     // kdebug("finode=%#018lx", finode);
-    struct proc_data *fdata = kzalloc(sizeof(struct proc_data), 0);
+    struct procfs_file_private_data *fdata = kzalloc(sizeof(struct procfs_file_private_data), 0);
     struct process_control_block *pcb_t = process_find_pcb_by_pid(finode->pid);
     //判断文件类型
     int mode = finode->type;
@@ -123,11 +154,14 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
 
     return 0;
 }
-static long procfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) { return 0; }
+static long procfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
+{
+    return 0;
+}
 static long procfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position)
 {
     // 获取私有信息
-    struct proc_data *priv = (struct proc_data *)file_ptr->private_data;
+    struct procfs_file_private_data *priv = (struct procfs_file_private_data *)file_ptr->private_data;
     // kdebug("priv=%#018lx", priv);
     if (!priv->rbuffer)
         return -EINVAL;
@@ -162,17 +196,15 @@ static long simple_procfs_read(void *to, int64_t count, long *position, void *fr
         count = available - pos;
     // kdebug("count:%d",count);
     ret = copy_to_user(to, from + pos, count);
-    // kdebug("to=%#018lx", to);
-    // kdebug("from=%#018lx", from);
-    // kdebug("ret:%ld",ret);
-    // if (ret == count)
-    //     return -EFAULT;
-    // count -= ret;
+
     *position = pos + ret;
     return ret;
 }
 
-static long procfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position) { return 0; }
+static long procfs_write(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position)
+{
+    return 0;
+}
 /**
  * @brief 调整文件的访问位置
  *
@@ -209,7 +241,10 @@ static long procfs_lseek(struct vfs_file_t *file_ptr, long offset, long whence)
 
     return pos;
 }
-static long procfs_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg) { return 0; }
+static long procfs_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr, uint64_t cmd, uint64_t arg)
+{
+    return 0;
+}
 
 /**
  * @brief 读取该目录下的目录项
@@ -248,15 +283,14 @@ failed:;
     return 0;
 }
 
-struct vfs_file_operations_t procfs_file_ops =
-    {
-        .open = &procfs_open,
-        .close = &procfs_close,
-        .read = &procfs_read,
-        .write = &procfs_write,
-        .lseek = &procfs_lseek,
-        .ioctl = &procfs_ioctl,
-        .readdir = &procfs_readdir,
+struct vfs_file_operations_t procfs_file_ops = {
+    .open = &procfs_open,
+    .close = &procfs_close,
+    .read = &procfs_read,
+    .write = &procfs_write,
+    .lseek = &procfs_lseek,
+    .ioctl = &procfs_ioctl,
+    .readdir = &procfs_readdir,
 };
 
 /**
@@ -267,7 +301,7 @@ struct vfs_file_operations_t procfs_file_ops =
  * @param reserved 保留字段
  * @return int 合法：0， 其他：错误码
  */
-static int check_name_available(const char *name, int namelen, int8_t reserved)
+static int __check_name_available(const char *name, int namelen, int8_t reserved)
 {
     if (namelen > 255 || namelen <= 0)
         return -ENAMETOOLONG;
@@ -291,7 +325,7 @@ static long procfs_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_
     int64_t retval = 0;
 
     //检验名称和法性
-    retval = check_name_available(dest_dEntry->name, dest_dEntry->name_length, 0);
+    retval = __check_name_available(dest_dEntry->name, dest_dEntry->name_length, 0);
     if (retval != 0)
         return retval;
     if (dest_dEntry->dir_inode != NULL)
@@ -311,7 +345,10 @@ static long procfs_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_
 
     return 0;
 }
-static struct vfs_dir_entry_t *procfs_lookup(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry) { return NULL; }
+static struct vfs_dir_entry_t *procfs_lookup(struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dest_dEntry)
+{
+    return NULL;
+}
 
 /**
  * @brief 在procfs中创建文件夹(作用是完善子文件夹的inode信息)
@@ -326,7 +363,7 @@ static long procfs_mkdir(struct vfs_index_node_t *parent_inode, struct vfs_dir_e
     int64_t retval = 0;
 
     //检验名称和法性
-    retval = check_name_available(dEntry->name, dEntry->name_length, 0);
+    retval = __check_name_available(dEntry->name, dEntry->name_length, 0);
     if (retval != 0)
         return retval;
 
@@ -356,12 +393,11 @@ struct vfs_inode_operations_t procfs_inode_ops = {
     .mkdir = &procfs_mkdir,
 };
 
-struct vfs_filesystem_type_t procfs_fs_type =
-    {
-        .name = "procfs",
-        .fs_flags = 0,
-        .read_superblock = procfs_read_superblock,
-        .next = NULL,
+struct vfs_filesystem_type_t procfs_fs_type = {
+    .name = "procfs",
+    .fs_flags = 0,
+    .read_superblock = procfs_read_superblock,
+    .next = NULL,
 };
 
 static __always_inline void __procfs_init_root_inode()
@@ -391,7 +427,7 @@ static __always_inline void __procfs_init_root_dentry()
  * @param pid 进程号
  * @return int64_t 错误码
  */
-int64_t create_proc_dir(long pid)
+int64_t procfs_register_pid(long pid)
 {
     int retval = 0;
 
@@ -423,11 +459,11 @@ int64_t create_proc_dir(long pid)
  */
 static int64_t proc_create_file(const char *path, mode_t type, long pid)
 {
-    kdebug("path:%s",path);
-    int ret = do_open(path, O_CREAT, 0);
-    kdebug("ret:%d",ret);
+    kdebug("procfs: Creating: %s", path);
+    int ret = do_open(path, O_CREAT, false);
+    // kdebug("ret:%d", ret);
     struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-    kdebug("dentry=%#018lx", dentry);
+    // kdebug("dentry=%#018lx", dentry);
 
     //结点信息配置
     struct procfs_inode_info_t *finode = (struct procfs_inode_info_t *)kzalloc(sizeof(struct procfs_inode_info_t), 0);

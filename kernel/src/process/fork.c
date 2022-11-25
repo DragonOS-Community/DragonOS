@@ -137,7 +137,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     process_wakeup(tsk);
 
     //创建对应procfs文件
-    create_proc_dir(tsk->pid);
+    procfs_register_pid(tsk->pid);
 
     return retval;
 

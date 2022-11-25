@@ -249,14 +249,7 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
  */
 struct vfs_index_node_t *vfs_alloc_inode();
 
-/**
- * @brief 打开文件
- *
- * @param filename 文件路径
- * @param flags 标志位
- * @return uint64_t 错误码
- */
-uint64_t do_open(const char *filename, int flags, uint32_t mode);
+uint64_t do_open(const char *filename, int flags, bool from_user);
 
 /**
  * @brief 关闭文件

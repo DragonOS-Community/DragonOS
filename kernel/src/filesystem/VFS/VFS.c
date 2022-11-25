@@ -370,20 +370,16 @@ uint64_t sys_mkdir(struct pt_regs *regs)
  *
  * @param filename 文件路径
  * @param flags 标志位
- * @param mode 是否由用户态调用,1为是，0为否
+ * @param from_user 是否由用户态调用,1为是，0为否
  * @return uint64_t 错误码
  */
-uint64_t do_open(const char *filename, int flags, uint32_t mode)
+uint64_t do_open(const char *filename, int flags, bool from_user)
 {
     long path_len = 0;
-    if (mode == 1)
-    {
+    if (from_user)
         path_len = strnlen_user(filename, PAGE_4K_SIZE) + 1;
-    }
     else
-    {
         path_len = strnlen(filename, PAGE_4K_SIZE) + 1;
-    }
 
     if (path_len <= 0) // 地址空间错误
         return -EFAULT;
@@ -395,14 +391,10 @@ uint64_t do_open(const char *filename, int flags, uint32_t mode)
     if (path == NULL)
         return -ENOMEM;
     
-    if (mode == 1)
-    {
+    if (from_user)
         strncpy_from_user(path, filename, path_len);
-    }
     else
-    {
         strncpy(path, filename, path_len);
-    }
     
     // 去除末尾的 '/'
     if (path_len >= 2 && path[path_len - 2] == '/')
@@ -544,8 +536,7 @@ uint64_t sys_open(struct pt_regs *regs)
 {
     char *filename = (char *)(regs->r8);
     int flags = (int)(regs->r9);
-
-    return do_open(filename, flags, 1);
+    return do_open(filename, flags, true);
 }
 
 /**

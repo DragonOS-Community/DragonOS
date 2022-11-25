@@ -1,5 +1,8 @@
 #include "procfs.h"
 
+//定义文件类型
+#define PROC_STATUS 1
+
 struct vfs_super_block_operations_t procfs_sb_ops;
 struct vfs_dir_entry_operations_t procfs_dentry_ops;
 struct vfs_file_operations_t procfs_file_ops;
@@ -9,6 +12,10 @@ struct vfs_superblock_t procfs_sb = {0};
 struct vfs_dir_entry_t *procfs_root_dentry; // 根结点的dentry
 static spinlock_t procfs_global_lock;       // procfs的全局锁
 const char __procfs_mount_path[] = "/proc"; // 挂在路径
+
+static int64_t proc_create_file(const char *path, mode_t type, long pid);
+static int check_name_available(const char *name, int namelen, int8_t reserved);
+static long simple_procfs_read(void *to, int64_t count, long *position, void *from, int64_t available);
 
 /**
  * @brief 创建procfs的super block
@@ -49,40 +56,46 @@ struct vfs_dir_entry_operations_t procfs_dentry_ops =
         .iput = &procfs_iput,
 };
 
-void data_puts(struct proc_data *fdata, char *s){
+void data_puts(struct proc_data *fdata, char *s)
+{
     int len = strlen(s);
-    strcpy(fdata->rbuffer+fdata->readlen, s);
-    fdata->readlen+=len;
+    strcpy(fdata->rbuffer + fdata->readlen, s);
+    fdata->readlen += len;
 }
 
-static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) 
-{ 
-    if(inode->attribute == VFS_IF_DIR){
+static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
+{
+    if (inode->attribute & VFS_IF_DIR)
+    {
         return 0;
     }
     struct procfs_inode_info_t *finode = inode->private_inode_info;
+    if(finode == NULL)
+    {
+        return 0;
+    }
     // kdebug("finode=%#018lx", finode);
-    struct proc_data *fdata = kzalloc(sizeof(struct proc_data),0);
+    struct proc_data *fdata = kzalloc(sizeof(struct proc_data), 0);
     struct process_control_block *pcb_t = process_find_pcb_by_pid(finode->pid);
     //判断文件类型
     int mode = finode->type;
-    fdata->rbuffer = kzalloc(1024,0);
-    int len = 0; 
+    fdata->rbuffer = kzalloc(1024, 0);
+    int len = 0;
     switch (mode)
     {
     case 1:
-        data_puts(fdata,"Name:");
-        data_puts(fdata,pcb_t->name);
-        data_puts(fdata,"\nstate:");
-        data_puts(fdata,ltoa(pcb_t->state));
-        data_puts(fdata,"\npid:");
-        data_puts(fdata,ltoa(pcb_t->pid));
-        data_puts(fdata,"\nPpid:");
-        data_puts(fdata,ltoa(pcb_t->parent_pcb->pid));
-        data_puts(fdata,"\ncpu_id:");
-        data_puts(fdata,ltoa(pcb_t->cpu_id));
-        data_puts(fdata,"\npriority:");
-        data_puts(fdata,ltoa(pcb_t->priority));
+        data_puts(fdata, "Name:");
+        data_puts(fdata, pcb_t->name);
+        data_puts(fdata, "\nstate:");
+        data_puts(fdata, ltoa(pcb_t->state));
+        data_puts(fdata, "\npid:");
+        data_puts(fdata, ltoa(pcb_t->pid));
+        data_puts(fdata, "\nPpid:");
+        data_puts(fdata, ltoa(pcb_t->parent_pcb->pid));
+        data_puts(fdata, "\ncpu_id:");
+        data_puts(fdata, ltoa(pcb_t->cpu_id));
+        data_puts(fdata, "\npriority:");
+        data_puts(fdata, ltoa(pcb_t->priority));
         // data_puts(fdata,"\n");
 
         unsigned long hiwater_vm, text, data;
@@ -90,31 +103,31 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
         text = pcb_t->mm->code_addr_end - pcb_t->mm->code_addr_start;
         data = pcb_t->mm->data_addr_end - pcb_t->mm->data_addr_start;
 
-        data_puts(fdata,"\nVmPeak:");
-        data_puts(fdata,ltoa(hiwater_vm));
-        data_puts(fdata," kB");
-        data_puts(fdata,"\nVmData:");
-        data_puts(fdata,ltoa(data));
-        data_puts(fdata," kB");
-        data_puts(fdata,"\nVmExe:");
-        data_puts(fdata,ltoa(text));
-        data_puts(fdata," kB\n");
-        
+        data_puts(fdata, "\nVmPeak:");
+        data_puts(fdata, ltoa(hiwater_vm));
+        data_puts(fdata, " kB");
+        data_puts(fdata, "\nVmData:");
+        data_puts(fdata, ltoa(data));
+        data_puts(fdata, " kB");
+        data_puts(fdata, "\nVmExe:");
+        data_puts(fdata, ltoa(text));
+        data_puts(fdata, " kB\n");
+
         inode->file_size = fdata->readlen;
-        file_ptr->private_data = fdata;  
+        file_ptr->private_data = fdata;
         break;
-    
+
     default:
         break;
     }
-    
-    return 0; 
+
+    return 0;
 }
 static long procfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr) { return 0; }
 static long procfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, long *position)
 {
     // 获取私有信息
-    struct proc_data *priv = (struct proc_data*)file_ptr->private_data;
+    struct proc_data *priv = (struct proc_data *)file_ptr->private_data;
     // kdebug("priv=%#018lx", priv);
     if (!priv->rbuffer)
         return -EINVAL;
@@ -133,13 +146,13 @@ static long procfs_read(struct vfs_file_t *file_ptr, char *buf, int64_t count, l
  *
  * @return long 读取字节数
  */
-long simple_procfs_read(void *to, int64_t count, long *position, void *from, int64_t available)
+static long simple_procfs_read(void *to, int64_t count, long *position, void *from, int64_t available)
 {
     long pos = *position;
     // kdebug("pos:%ld",pos);
     // kdebug("count:%ld",count);
     // kdebug("available:%ld",available);
-    int64_t ret;
+    int64_t ret = 0;
 
     if (pos < 0)
         return -EINVAL;
@@ -229,8 +242,6 @@ static long procfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldi
     uint32_t dentry_type;
     if (target_dent->dir_inode->attribute & VFS_IF_DIR)
         dentry_type = VFS_IF_DIR;
-    else
-        dentry_type = VFS_IF_DEVICE;
 
     return filler(dirent, file_ptr->position - 1, name, target_dent->name_length, dentry_type, file_ptr->position - 1);
 failed:;
@@ -246,6 +257,25 @@ struct vfs_file_operations_t procfs_file_ops =
         .lseek = &procfs_lseek,
         .ioctl = &procfs_ioctl,
         .readdir = &procfs_readdir,
+};
+
+/**
+ * @brief 检查文件名是否合法
+ *
+ * @param name 文件名
+ * @param namelen 文件名长度
+ * @param reserved 保留字段
+ * @return int 合法：0， 其他：错误码
+ */
+static int check_name_available(const char *name, int namelen, int8_t reserved)
+{
+    if (namelen > 255 || namelen <= 0)
+        return -ENAMETOOLONG;
+    // 首个字符不能是空格或者'.'
+    if (name[0] == 0x20 || name[0] == '.')
+        return -EINVAL;
+
+    return 0;
 };
 
 /**
@@ -271,17 +301,13 @@ static long procfs_create(struct vfs_index_node_t *parent_inode, struct vfs_dir_
     dest_dEntry->dir_inode = inode;
     dest_dEntry->dir_ops = &procfs_dentry_ops;
 
-    //结点信息初始化
-    struct procfs_inode_info_t *finode = (struct procfs_inode_info_t *)kzalloc(sizeof(struct procfs_inode_info_t), 0);
     inode->attribute = VFS_IF_FILE;
     inode->file_ops = &procfs_file_ops;
     inode->file_size = 0;
     inode->sb = parent_inode->sb;
     inode->inode_ops = &procfs_inode_ops;
-    inode->private_inode_info = (void *)finode;
+    // kdebug("finode:%#018lx",inode->private_inode_info);
     inode->blocks = 0;
-
-    //私有信息初始
 
     return 0;
 }
@@ -365,24 +391,25 @@ static __always_inline void __procfs_init_root_dentry()
  * @param pid 进程号
  * @return int64_t 错误码
  */
-int64_t mk_proc_dir(long pid)
+int64_t create_proc_dir(long pid)
 {
     int retval = 0;
-    
+
     //创建文件夹
-    char tmp[70]={0};
+    char tmp[70] = {0};
     int len = strlen(ltoa(pid));
     // kdebug("len:%d",len);
     strcpy(tmp, "/proc/");
-    strcpy(tmp+6,ltoa(pid));
+    strcpy(tmp + 6, ltoa(pid));
     // kdebug("tmp:%s",tmp);
     retval = vfs_mkdir(tmp, 0, false);
-    
+
+    // kdebug("aaaaaaaaaaaaaaa");
     //创建各相关文件
-    strcpy(tmp+6+len,"/status");
+    strcpy(tmp + 6 + len, "/status");
     // kdebug("tmp:%s",tmp);
-    retval = proc_create_file(tmp,STATUS,pid);
-    
+    retval = proc_create_file(tmp, PROC_STATUS, pid);
+
     return retval;
 }
 
@@ -394,102 +421,23 @@ int64_t mk_proc_dir(long pid)
  * @param pid pid
  * @return int64_t 错误码
  */
-int64_t proc_create_file(const char *path, mode_t type, long pid)
+static int64_t proc_create_file(const char *path, mode_t type, long pid)
 {
-    long pathlen = strnlen(path, PAGE_4K_SIZE - 1);
-    if (pathlen == 0)
-        return -ENOENT;
+    kdebug("path:%s",path);
+    int ret = do_open(path, O_CREAT, 0);
+    kdebug("ret:%d",ret);
+    struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
+    kdebug("dentry=%#018lx", dentry);
 
-    int last_slash = -1;
-
-    // 查找最后一个'/'，忽略路径末尾的'/'
-    for (int i = pathlen - 2; i >= 0; --i)
-    {
-        if (path[i] == '/')
-        {
-            last_slash = i;
-            break;
-        }
-    }
-
-    char *buf = (char *)kzalloc(last_slash + 2, 0);
-
-    // 拷贝字符串（不包含要被创建的部分）
-    strncpy(buf, path, last_slash);
-    buf[last_slash + 1] = '\0';
-
-    // 查找父目录
-    struct vfs_dir_entry_t *parent_dir = vfs_path_walk(buf, 0);
-
-    if (parent_dir == NULL)
-    {
-        kwarn("parent dir is NULL.");
-        kfree(buf);
-        return -ENOENT;
-    }
-    kfree(buf);
-
-    //创建文件
-    struct vfs_dir_entry_t *dentry = vfs_alloc_dentry(pathlen - last_slash);
-    if (path[pathlen - 1] == '/')
-        dentry->name_length = pathlen - last_slash - 2;
-    else
-        dentry->name_length = pathlen - last_slash - 1;
-
-    strncpy(dentry->name, path + last_slash + 1, dentry->name_length);
-    dentry->parent = parent_dir;
-
-    // 对父目录项加锁
-    spin_lock(&parent_dir->lockref.lock);
-    spin_lock(&parent_dir->dir_inode->lockref.lock);
-    // 创建子目录项
-    int64_t retval = 0;
-    struct vfs_index_node_t *parent_inode = parent_dir->dir_inode;
-
-    //检验名称和法性
-    retval = check_name_available(dentry->name, dentry->name_length, 0);
-    if (retval != 0)
-        return retval;
-    if (dentry->dir_inode != NULL)
-        return -EEXIST;
-
-    struct vfs_index_node_t *inode = vfs_alloc_inode();
-    dentry->dir_inode = inode;
-    dentry->dir_ops = &procfs_dentry_ops;
-
-    //结点信息初始化
+    //结点信息配置
     struct procfs_inode_info_t *finode = (struct procfs_inode_info_t *)kzalloc(sizeof(struct procfs_inode_info_t), 0);
     finode->pid = pid;
     // kdebug("pid:%d",finode->pid);
     finode->type = type;
+    dentry->dir_inode->private_inode_info = (void *)finode;
+    ret = vfs_close(ret);
 
-    inode->attribute = VFS_IF_FILE;
-    inode->file_ops = &procfs_file_ops;
-    inode->file_size = 0;
-    inode->sb = parent_inode->sb;
-    inode->inode_ops = &procfs_inode_ops;
-    inode->private_inode_info = (void *)finode;
-    // kdebug("finode:%#018lx",inode->private_inode_info);
-    inode->blocks = 0;
-
-    spin_unlock(&parent_dir->dir_inode->lockref.lock); // 解锁inode
-
-    // ==== 将子目录项添加到链表 ====
-    struct vfs_dir_entry_t *next_dentry = NULL;
-    // 若list非空，则对前一个dentry加锁
-    if (!list_empty(&parent_dir->subdirs_list))
-    {
-        next_dentry = list_entry(list_next(&parent_dir->subdirs_list), struct vfs_dir_entry_t, child_node_list);
-        spin_lock(&next_dentry->lockref.lock);
-    }
-    list_add(&parent_dir->subdirs_list, &dentry->child_node_list);
-    if (next_dentry != NULL)
-        spin_unlock(&next_dentry->lockref.lock);
-
-    // 新建文件结束，对父目录项解锁
-    spin_unlock(&parent_dir->lockref.lock);
-
-    return retval;
+    return ret;
 }
 
 /**

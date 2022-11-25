@@ -165,7 +165,7 @@ void sched_rt()
         struct process_control_block *proc = pick_next_task_rt(curr_rq);
         process_switch_mm(proc);
 
-        switch_proc(current_pcb, proc);
+        // switch_proc(current_pcb, proc);
     }
     // RR调度策略需要考虑时间片
     else if (current_pcb->policy == SCHED_RR)
@@ -187,7 +187,7 @@ void sched_rt()
         struct process_control_block *proc = pick_next_task_rt(curr_rq);
         process_switch_mm(proc);
 
-        switch_proc(current_pcb, proc);
+        // switch_proc(current_pcb, proc);
     }
     sti();
 }

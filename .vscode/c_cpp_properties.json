@@ -3,8 +3,7 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**",
-                "${workspaceFolder}/kernel"
+                "${workspaceFolder}/**"
             ],
             "defines": [
                 "__x86_64__",

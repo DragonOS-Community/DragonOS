@@ -129,7 +129,7 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
         data_puts(fdata, ltoa(pcb_t->priority));
         // data_puts(fdata,"\n");
 
-        unsigned long hiwater_vm, text, data;
+        uint64_t hiwater_vm, text, data;
         hiwater_vm = pcb_t->mm->vmas->vm_end - pcb_t->mm->vmas->vm_start;
         text = pcb_t->mm->code_addr_end - pcb_t->mm->code_addr_start;
         data = pcb_t->mm->data_addr_end - pcb_t->mm->data_addr_start;

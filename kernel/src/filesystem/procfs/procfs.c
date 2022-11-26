@@ -103,10 +103,12 @@ void data_puts(struct procfs_file_private_data *fdata, const char *s)
 
 static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
 {
+    // kdebug("attribute1:%d",inode->attribute);
     if (inode->attribute & VFS_IF_DIR)
     {
         return 0;
     }
+    // kdebug("attribute2:%d",inode->attribute);
     struct procfs_inode_info_t *finode = inode->private_inode_info;
     if (finode == NULL)
     {
@@ -284,6 +286,8 @@ static long procfs_readdir(struct vfs_file_t *file_ptr, void *dirent, vfs_filldi
     uint32_t dentry_type;
     if (target_dent->dir_inode->attribute & VFS_IF_DIR)
         dentry_type = VFS_IF_DIR;
+    else
+        dentry_type = VFS_IF_FILE;
 
     return filler(dirent, file_ptr->position - 1, name, target_dent->name_length, dentry_type, file_ptr->position - 1);
 failed:;

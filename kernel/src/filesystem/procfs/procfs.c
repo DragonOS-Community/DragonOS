@@ -96,6 +96,7 @@ void data_puts(struct procfs_file_private_data *fdata, const char *s)
     if(fdata->readlen+len > FDATA_RBUF_SIZE)
     {
         kerror("out of buffer");
+        return;
     }
     strncpy(fdata->rbuffer + fdata->readlen, s, len);
     fdata->readlen += len;

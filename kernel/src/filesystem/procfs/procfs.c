@@ -96,6 +96,7 @@ void data_puts(struct procfs_file_private_data *fdata, const char *s)
     if(fdata->readlen+len > FDATA_RBUF_SIZE)
     {
         kerror("out of buffer");
+        return;
     }
     strncpy(fdata->rbuffer + fdata->readlen, s, len);
     fdata->readlen += len;
@@ -103,12 +104,11 @@ void data_puts(struct procfs_file_private_data *fdata, const char *s)
 
 static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)
 {
-    // kdebug("attribute1:%d",inode->attribute);
     if (inode->attribute & VFS_IF_DIR)
     {
         return 0;
     }
-    // kdebug("attribute2:%d",inode->attribute);
+    
     struct procfs_inode_info_t *finode = inode->private_inode_info;
     if (finode == NULL)
     {

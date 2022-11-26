@@ -3,6 +3,9 @@
 //定义文件类型
 #define PROC_STATUS 1
 
+//定义buffer大小
+#define FDATA_RBUF_SIZE 1024
+
 struct vfs_super_block_operations_t procfs_sb_ops;
 struct vfs_dir_entry_operations_t procfs_dentry_ops;
 struct vfs_file_operations_t procfs_file_ops;
@@ -90,7 +93,11 @@ struct vfs_dir_entry_operations_t procfs_dentry_ops = {
 void data_puts(struct procfs_file_private_data *fdata, const char *s)
 {
     int len = strlen(s);
-    strcpy(fdata->rbuffer + fdata->readlen, s);
+    if(fdata->readlen+len > FDATA_RBUF_SIZE)
+    {
+        kerror("out of buffer");
+    }
+    strncpy(fdata->rbuffer + fdata->readlen, s, len);
     fdata->readlen += len;
 }
 
@@ -110,7 +117,7 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
     struct process_control_block *pcb_t = process_find_pcb_by_pid(finode->pid);
     //判断文件类型
     int mode = finode->type;
-    fdata->rbuffer = kzalloc(1024, 0);
+    fdata->rbuffer = kzalloc(FDATA_RBUF_SIZE, 0);
     int len = 0;
     switch (mode)
     {
@@ -144,14 +151,14 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
         data_puts(fdata, ltoa(text));
         data_puts(fdata, " kB\n");
 
-        inode->file_size = fdata->readlen;
-        file_ptr->private_data = fdata;
         break;
 
     default:
         break;
     }
 
+    inode->file_size = fdata->readlen;
+    file_ptr->private_data = fdata;
     return 0;
 }
 static long procfs_close(struct vfs_index_node_t *inode, struct vfs_file_t *file_ptr)

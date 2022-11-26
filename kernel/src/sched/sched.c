@@ -3,6 +3,7 @@
 #include <common/spinlock.h>
 #include <driver/video/video.h>
 #include <sched/cfs.h>
+#include "sched/rt.h"
 #include <common/string.h>
 
 /**
@@ -49,7 +50,7 @@ int sched_setscheduler(struct process_control_block *p, int policy, const struct
     return _sched_setscheduler(p, policy, param, true);
 }
 
-int sched_gerscheduler(struct process_control_block *p, int policy, const struct sched_param *param)
+int sched_getscheduler(struct process_control_block *p, int policy, const struct sched_param *param)
 {
     return 0;
 }
@@ -75,6 +76,7 @@ void sched()
 void sched_init()
 {
     sched_cfs_init();
+    sched_rt_init();
 }
 
 

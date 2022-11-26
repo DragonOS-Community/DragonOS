@@ -5,6 +5,8 @@
 #include <process/process.h>
 #include "sched.h"
 
+// #define RR_TIMESLICE       (100 * HZ / 1000)
+#define RR_TIMESLICE       100
 /**
  * @brief 初始化RT进程调度器
  *

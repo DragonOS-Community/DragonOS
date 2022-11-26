@@ -1,5 +1,6 @@
 #include "rt.h"
 
+struct rt_rq *rt_rq_tmp;
 
 /**
  * @brief 初始化RT进程调度器
@@ -7,7 +8,7 @@
  */
 void sched_rt_init()
 {
-// 
+    init_rt_rq(rt_rq_tmp);
 }
 void init_rt_rq(struct rt_rq *rt_rq)
 {
@@ -31,7 +32,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     int idx;
 
     // 此处查找链表中中下一个执行的entity
-    // TODO :不适用bitmap时如何找到对应的list
+    // TODO :使用bitmap查找
     // idx = sched_find_first_bit(array->bitmap);
     for (int i = 0; i < MAX_CPU_NUM; i++)
     {
@@ -163,31 +164,32 @@ void sched_rt()
     {
 
         struct process_control_block *proc = pick_next_task_rt(curr_rq);
-        process_switch_mm(proc);
+        if (proc->priority > current_pcb->priority)
+        {
+            process_switch_mm(proc);
 
-        // switch_proc(current_pcb, proc);
+            // switch_proc(current_pcb, proc);
+        }
+        // 如果挑选的进程优先级小于当前进程，则不进行切换
+        else
+        {
+            dequeue_task_rt(curr_rq, proc, 0);
+        }
     }
     // RR调度策略需要考虑时间片
     else if (current_pcb->policy == SCHED_RR)
     {
-        // 时间片
-        // 判断这个进程是否有时间片，能继续则继续，不能则替换
+        // 判断这个进程时间片是否耗尽
         if (--current_pcb->rt.time_slice == 0)
         {
-            enqueue_task_rt(curr_rq,current_pcb,0);
+            current_pcb->rt.time_slice=RR_TIMESLICE;
+            current_pcb->flags |= PF_NEED_SCHED;
+            enqueue_task_rt(curr_rq, current_pcb, 0);
             struct process_control_block *proc = pick_next_task_rt(curr_rq);
             process_switch_mm(proc);
 
             switch_proc(current_pcb, proc);
         }
-    }
-    // 非实时进程，查找rq中的队列进行切换
-    else if (current_pcb->policy == SCHED_NORMAL)
-    {
-        struct process_control_block *proc = pick_next_task_rt(curr_rq);
-        process_switch_mm(proc);
-
-        // switch_proc(current_pcb, proc);
     }
     sti();
 }

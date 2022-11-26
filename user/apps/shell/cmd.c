@@ -312,7 +312,6 @@ int shell_cmd_cat(int argc, char **argv)
         file_size -= l;
         printf("%s", buf);
     }
-
     close(fd);
     free(buf);
     free(file_path);

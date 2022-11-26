@@ -160,6 +160,10 @@ void rootfs_init()
     // 创建/dev等目录的dentry（以便文件系统的mount）
     if (rootfs_add_dir("dev") != 0)
         kerror("create dir 'dev' in rootfs failed");
+    
+    // 创建/procfs目录的dentry
+    if (rootfs_add_dir("proc") != 0)
+        kerror("create dir 'proc' in rootfs failed");
 }
 
 /**

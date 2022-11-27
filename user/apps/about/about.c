@@ -18,7 +18,7 @@ void print_copyright()
     printf(" DragonOS - An opensource operating system.\n");
     printf(" Copyright: fslongjin & DragonOS Community. 2022, All rights reserved.\n");
     printf(" Version: ");
-    put_string("V0.1.0 - 20221106\n", COLOR_GREEN, COLOR_BLACK);
+    put_string("V0.1.1 - 20221127\n", COLOR_GREEN, COLOR_BLACK);
     printf(" You can visit the project via:\n");
     printf("\n");
     put_string("    Official Website: https://DragonOS.org\n", COLOR_INDIGO, COLOR_BLACK);

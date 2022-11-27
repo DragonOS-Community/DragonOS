@@ -1,10 +1,9 @@
 use crate::{
-    include::{
-        bindings::bindings::{atomic_t, spinlock_t},
-        DragonOS::signal::{sighand_struct, signal_struct, MAX_SIG_NUM},
-    },
+    include::bindings::bindings::{atomic_t, spinlock_t},
     ipc::signal::DEFAULT_SIGACTION,
 };
+
+use crate::ipc::signal_types::{sighand_struct, signal_struct, MAX_SIG_NUM};
 
 /// @brief 初始进程的signal结构体
 #[no_mangle]

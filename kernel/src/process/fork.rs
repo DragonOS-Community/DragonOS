@@ -4,13 +4,13 @@ use alloc::boxed::Box;
 
 use crate::{
     arch::x86_64::asm::current::current_pcb,
-    include::{
-        bindings::bindings::{
-            process_control_block, CLONE_CLEAR_SIGHAND, CLONE_SIGHAND, CLONE_THREAD, ENOMEM,
-        },
-        DragonOS::signal::{sigaction, sighand_struct, signal_struct},
+    include::bindings::bindings::{
+        process_control_block, CLONE_CLEAR_SIGHAND, CLONE_SIGHAND, CLONE_THREAD, ENOMEM,
     },
-    ipc::signal::DEFAULT_SIGACTION,
+    ipc::{
+        signal::DEFAULT_SIGACTION,
+        signal_types::{sigaction, sighand_struct, signal_struct},
+    },
     kdebug,
     libs::{
         atomic::atomic_set,

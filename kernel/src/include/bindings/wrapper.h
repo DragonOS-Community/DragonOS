@@ -22,6 +22,7 @@
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/unistd.h>
+#include <common/glib.h>
 #include <driver/uart/uart.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>

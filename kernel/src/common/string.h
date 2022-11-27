@@ -76,3 +76,12 @@ static inline int memcmp(const void *s1, const void *s2, size_t len)
 
     return diff;
 }
+
+/**
+ * @brief 拼接两个字符串（将src接到dest末尾）
+ *
+ * @param dest 目标串
+ * @param src 源串
+ * @return char*
+ */
+char *strcat(char *dest, const char *src);

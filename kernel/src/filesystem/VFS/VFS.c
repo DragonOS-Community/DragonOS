@@ -173,7 +173,7 @@ struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags)
 
             memcpy(dentry->name, (void *)tmp_path, tmp_path_len);
             dentry->name[tmp_path_len] = '\0';
-            // kdebug("tmp_path_len=%d, dentry->name= %s", tmp_path_len, dentry->name);
+            // kdebug("tmp_path_len=%d, dentry->name=%s", tmp_path_len, dentry->name);
             dentry->name_length = tmp_path_len;
 
             if (parent->dir_inode->inode_ops->lookup(parent->dir_inode, dentry) == NULL)
@@ -370,11 +370,16 @@ uint64_t sys_mkdir(struct pt_regs *regs)
  *
  * @param filename 文件路径
  * @param flags 标志位
+ * @param from_user 是否由用户态调用,1为是，0为否
  * @return uint64_t 错误码
  */
-uint64_t do_open(const char *filename, int flags)
+uint64_t do_open(const char *filename, int flags, bool from_user)
 {
-    long path_len = strnlen_user(filename, PAGE_4K_SIZE) + 1;
+    long path_len = 0;
+    if (from_user)
+        path_len = strnlen_user(filename, PAGE_4K_SIZE) + 1;
+    else
+        path_len = strnlen(filename, PAGE_4K_SIZE) + 1;
 
     if (path_len <= 0) // 地址空间错误
         return -EFAULT;
@@ -385,8 +390,12 @@ uint64_t do_open(const char *filename, int flags)
     char *path = (char *)kzalloc(path_len, 0);
     if (path == NULL)
         return -ENOMEM;
-
-    strncpy_from_user(path, filename, path_len);
+    
+    if (from_user)
+        strncpy_from_user(path, filename, path_len);
+    else
+        strncpy(path, filename, path_len);
+    
     // 去除末尾的 '/'
     if (path_len >= 2 && path[path_len - 2] == '/')
     {
@@ -430,7 +439,7 @@ uint64_t do_open(const char *filename, int flags)
         dentry = vfs_alloc_dentry(path_len - tmp_index);
 
         dentry->name_length = path_len - tmp_index - 2;
-        
+
         // kdebug("to create new file:%s   namelen=%d", dentry->name, dentry->name_length);
         strncpy(dentry->name, path + tmp_index + 1, dentry->name_length);
         dentry->parent = parent_dentry;
@@ -527,10 +536,33 @@ uint64_t sys_open(struct pt_regs *regs)
 {
     char *filename = (char *)(regs->r8);
     int flags = (int)(regs->r9);
-
-    return do_open(filename, flags);
+    return do_open(filename, flags, true);
 }
 
+/**
+ * @brief 关闭文件
+ *
+ * @param fd_num 文件描述符
+ * @return uint64_t 错误码
+ */
+uint64_t vfs_close(int fd_num)
+{
+    // 校验文件描述符范围
+    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
+        return -EBADF;
+    // 文件描述符不存在
+    if (current_pcb->fds[fd_num] == NULL)
+        return -EBADF;
+    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
+    uint64_t ret;
+    // If there is a valid close function
+    if (file_ptr->file_ops && file_ptr->file_ops->close)
+        ret = file_ptr->file_ops->close(file_ptr->dEntry->dir_inode, file_ptr);
+
+    kfree(file_ptr);
+    current_pcb->fds[fd_num] = NULL;
+    return 0;
+}
 /**
  * @brief 动态分配dentry以及路径字符串名称
  *

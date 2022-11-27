@@ -23,7 +23,7 @@ bins[0]=${kernel}
 for file in ${bins[*]};do
 if [ ! -x $file ]; then
 echo "$file 不存在！"
-exit
+exit 1
 fi
 done
 
@@ -43,7 +43,7 @@ fi
 # 判断是否存在硬盘镜像文件，如果不存在，就创建一个(docker模式下，由于镜像中缺少qemu-img不会创建)
 if [ ! -f "${root_folder}/bin/disk.img" ]; then
     echo "创建硬盘镜像文件..."
-    sudo bash ./create_hdd_image.sh
+    sudo bash ./create_hdd_image.sh || exit 1
 fi
 
 mkdir -p ${root_folder}/bin/disk_mount
@@ -53,6 +53,7 @@ cp ${kernel} ${root_folder}/bin/disk_mount/boot
 # 拷贝用户程序到磁盘镜像
 mkdir -p ${root_folder}/bin/disk_mount/bin
 mkdir -p ${root_folder}/bin/disk_mount/dev
+mkdir -p ${root_folder}/bin/disk_mount/proc
 
 cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount/bin
 touch ${root_folder}/bin/disk_mount/dev/keyboard.dev

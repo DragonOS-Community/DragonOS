@@ -2,6 +2,7 @@
 #include <common/err.h>
 #include <common/kthread.h>
 #include <common/spinlock.h>
+#include <filesystem/procfs/procfs.h>
 
 extern spinlock_t process_global_pid_write_lock;
 extern long process_global_pid;
@@ -134,6 +135,9 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 唤醒进程
     process_wakeup(tsk);
+
+    //创建对应procfs文件
+    procfs_register_pid(tsk->pid);
 
     return retval;
 

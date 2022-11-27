@@ -157,14 +157,14 @@ struct vfs_inode_operations_t
                    struct vfs_index_node_t *new_inode, struct vfs_dir_entry_t *new_dEntry);
     long (*getAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
     long (*setAttr)(struct vfs_dir_entry_t *dEntry, uint64_t *attr);
-    
+
     /**
      * @brief 取消inode和dentry之间的链接关系（删除文件）
-     * 
+     *
      * @param inode 要被取消关联关系的目录项的【父目录项】
      * @param dentry 要被取消关联关系的子目录项
      */
-    long (*unlink)(struct vfs_index_node_t * inode, struct vfs_dir_entry_t * dentry);
+    long (*unlink)(struct vfs_index_node_t *inode, struct vfs_dir_entry_t *dentry);
 };
 
 struct vfs_dir_entry_operations_t
@@ -249,14 +249,15 @@ struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
  */
 struct vfs_index_node_t *vfs_alloc_inode();
 
+uint64_t do_open(const char *filename, int flags, bool from_user);
+
 /**
- * @brief 打开文件
+ * @brief 关闭文件
  *
- * @param filename 文件路径
- * @param flags 标志位
+ * @param fd_num 文件描述符
  * @return uint64_t 错误码
  */
-uint64_t do_open(const char *filename, int flags);
+uint64_t vfs_close(int fd_num);
 
 /**
  * @brief 创建文件夹

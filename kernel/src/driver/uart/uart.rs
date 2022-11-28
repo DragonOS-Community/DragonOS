@@ -1,5 +1,6 @@
 use crate::kdebug;
 use crate::include::bindings::bindings::{io_in8, io_out8};
+use core::str;
 
 const UART_SUCCESS: i32 = 0;
 const E_UART_BITS_RATE_ERROR: i32 = 1;
@@ -60,9 +61,9 @@ impl UartDriver {
  * @param port 端口号
  * @param c 要发送的数据
  */
-pub unsafe fn uart_send(port: u16, c: u8) {
+pub extern "C" fn uart_send(port: u16, c: u8) {
     while UartDriver::is_transmit_empty(port) == false {} //TODO:pause
-    io_out8(port, c);
+    unsafe { io_out8(port, c); }
 }
 
 /**
@@ -71,14 +72,33 @@ pub unsafe fn uart_send(port: u16, c: u8) {
  * @param port 端口号
  * @return u8 接收到的数据
  */
-pub unsafe fn uart_read(port: u16) -> u8 {
+#[no_mangle]
+pub extern "C" fn uart_read(port: u16) -> u8 {
     while UartDriver::serial_received(port) == false {} //TODO:pause
-    return io_in8(port);
+    unsafe { return io_in8(port); }
+}
+
+/**
+ * @brief 通过串口发送整个字符串
+ *
+ * @param port 串口端口
+ * @param str 字符串
+ */
+#[no_mangle]
+pub extern "C" fn uart_send_str(port: u16, str: *const u8)
+{
+    let message: &'static str = "uart send str";
+    let bytes = message.as_bytes();
+    for c in bytes {
+        uart_send(port, *c);
+    }
+    unsafe { uart_send(port, *str) };
 }
 
 #[no_mangle]
 pub extern "C" fn uart_init(port: u16, baud_rate: u32) -> i32 {
-    kdebug!("uart_init");
+    let message: &'static str = "uart init";
+    kdebug!("{}", message);
     // 错误的比特率
     if baud_rate > UART_MAX_BITS_RATE || UART_MAX_BITS_RATE % baud_rate != 0 {
         return -E_UART_BITS_RATE_ERROR;
@@ -88,10 +108,10 @@ pub extern "C" fn uart_init(port: u16, baud_rate: u32) -> i32 {
         io_out8(port + 1, 0x00); // Disable all interrupts
         io_out8(port + 3, 0x80); // Enable DLAB (set baud rate divisor)
     
-        let divisor = (UART_MAX_BITS_RATE / baud_rate) as u8;
+        let divisor = UART_MAX_BITS_RATE / baud_rate;
         
-        io_out8(port + 0, divisor & 0xff);        // Set divisor  (lo byte)
-        io_out8(port + 1, (divisor >> 8) & 0xff); //                  (hi byte)
+        io_out8(port + 0, (divisor & 0xff) as u8);        // Set divisor  (lo byte)
+        io_out8(port + 1, ((divisor >> 8) & 0xff) as u8); //                  (hi byte)
         io_out8(port + 3, 0x03);                  // 8 bits, no parity, one stop bit
         io_out8(port + 2, 0xC7);                  // Enable FIFO, clear them, with 14-byte threshold
         io_out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
@@ -106,11 +126,12 @@ pub extern "C" fn uart_init(port: u16, baud_rate: u32) -> i32 {
         // If serial is not faulty set it in normal operation mode
         // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
         io_out8(port + 4, 0x08);
-    
-        uart_send(COM1, 32);
-        return UART_SUCCESS;
+        let bytes = message.as_bytes();
+        for c in bytes {
+            uart_send(port, *c);
+        }
     }
-
+    return UART_SUCCESS;
     /*
             Notice that the initialization code above writes to [PORT + 1]
         twice with different values. This is once to write to the Divisor

@@ -1,5 +1,4 @@
 #include "textui.h"
-#include <driver/uart/uart.h>
 #include <common/errno.h>
 #include "screen_manager.h"
 

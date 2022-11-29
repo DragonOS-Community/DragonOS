@@ -1,6 +1,5 @@
 #include "textui.h"
 
-#include "driver/uart/uart.h"
 #include "screen_manager.h"
 #include <common/atomic.h>
 #include <common/errno.h>
@@ -20,6 +19,11 @@ static struct textui_window_t __initial_window = {0}; // 初始窗口
 static struct textui_private_info_t __private_info = {0};
 static struct List __windows_list;
 static spinlock_t change_lock;
+
+// driver/uart/uart.rs --rust function
+extern const uint16_t COM1 = 0x3f8;
+extern void uart_send(uint16_t port, char c);
+extern void uart_send_str(uint16_t port, const char *str);
 
 /**
  * @brief 初始化window对象

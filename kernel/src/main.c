@@ -34,7 +34,6 @@
 #include "driver/tty/tty.h"
 #include <driver/timers/HPET/HPET.h>
 #include <driver/timers/rtc/rtc.h>
-#include <driver/uart/uart.h>
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
 #include <time/timer.h>
@@ -42,6 +41,10 @@
 #include <driver/interrupt/apic/apic_timer.h>
 
 ul bsp_idt_size, bsp_gdt_size;
+
+//driver/uart/uart.rs
+extern uint16_t COM1;
+extern int uart_init(uint16_t port, uint32_t baud_rate);
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")

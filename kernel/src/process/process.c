@@ -27,6 +27,7 @@
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
+#include <sched/rt.h>
 
 #include <mm/mmio.h>
 
@@ -452,7 +453,15 @@ exec_failed:;
     process_do_exit(tmp);
 }
 #pragma GCC pop_options
-
+int test(void *a)
+{
+    kinfo("this is test_-------------------");
+    kinfo("this is test_-------------------");
+    kinfo("this is test_-------------------");
+    kinfo("this is test_-------------------");
+    kinfo("this is test_-------------------");
+    return 0;
+}
 /**
  * @brief 内核init进程
  *
@@ -491,7 +500,7 @@ ul initial_kernel_thread(ul arg)
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
-
+    // sched_rt();
     // 准备切换到用户态
     struct pt_regs *regs;
 
@@ -680,6 +689,11 @@ int process_wakeup(struct process_control_block *pcb)
 
     pcb->state |= PROC_RUNNING;
     sched_enqueue(pcb);
+    struct process_control_block *test_pcb = kthread_run(&test, NULL, "Video refresh daemon");
+    kinfo("test pcb!!!!!!!!!!!!1");
+    test_pcb->rt.time_slice = 100;
+    kinfo("test pcb!!!!!!!!!!!!1");
+    enqueue_task_rt(current_pcb->rt.rt_rq->rq, test_pcb, 1);
     return 1;
 }
 

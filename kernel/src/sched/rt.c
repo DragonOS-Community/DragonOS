@@ -105,7 +105,7 @@ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
  * @param p
  * @param flags
  */
-static void enqueue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
+void enqueue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
 {
     struct sched_rt_entity *rt_se = &p->rt;
 

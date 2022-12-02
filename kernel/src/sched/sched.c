@@ -6,6 +6,13 @@
 #include "sched/rt.h"
 #include <common/string.h>
 
+
+struct rq * rq_tmp;
+
+
+struct rq * get_rq(){
+    return rq_tmp;
+}
 /**
  * @brief
  *
@@ -75,8 +82,9 @@ void sched()
 
 void sched_init()
 {
+    kinfo("sched_init!");
     sched_cfs_init();
-    sched_rt_init();
+    sched_rt_init(&rq_tmp->rt);
 }
 
 

@@ -11,7 +11,7 @@
  * @brief 初始化RT进程调度器
  *
  */
-void sched_rt_init();
+void sched_rt_init(struct rt_rq *rt_rq);
 void init_rt_rq(struct rt_rq *rt_rq);
 static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq);
 static struct process_control_block *_pick_next_task_rt(struct rq *rq);

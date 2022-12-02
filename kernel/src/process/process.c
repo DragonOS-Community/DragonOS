@@ -439,7 +439,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         regs->rsi = (uint64_t)dst_argv;
     }
     // kdebug("execve ok");
-
+    // 设置进程的段选择子为用户态可访问
     regs->cs = USER_CS | 3;
     regs->ds = USER_DS | 3;
     regs->ss = USER_DS | 0x3;

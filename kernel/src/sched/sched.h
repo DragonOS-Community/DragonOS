@@ -30,7 +30,7 @@
         typeof(((type *)0)->member) *p = (ptr);                             \
         (type *)((unsigned long)p - (unsigned long)&(((type *)0)->member)); \
     })
-
+struct rq get_rq();
 static int __sched_setscheduler(struct process_control_block *p, const struct sched_attr *attr, bool user, bool pi);
 static int _sched_setscheduler(struct process_control_block *p, int policy, const struct sched_param *param,
                                bool check);

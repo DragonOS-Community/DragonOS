@@ -7,10 +7,10 @@
 #include <common/string.h>
 
 
-struct rq * rq_tmp;
+struct rq rq_tmp;
 
 
-struct rq * get_rq(){
+struct rq get_rq(){
     return rq_tmp;
 }
 /**
@@ -83,8 +83,9 @@ void sched()
 void sched_init()
 {
     kinfo("sched_init!");
+    memset(&rq_tmp, 0, sizeof(struct rq));
     sched_cfs_init();
-    sched_rt_init(&rq_tmp->rt);
+    sched_rt_init(&(rq_tmp.rt));
 }
 
 

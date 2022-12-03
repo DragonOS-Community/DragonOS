@@ -12,7 +12,6 @@ void sched_rt_init(struct rt_rq *rt_rq)
 }
 void init_rt_rq(struct rt_rq *rt_rq)
 {
-    kinfo("test pcb!!!!!!!!!!!!0init rq");
 
     struct rt_prio_array *array;
     int i;
@@ -20,9 +19,8 @@ void init_rt_rq(struct rt_rq *rt_rq)
     array = &rt_rq->active;
     for (i = 0; i < MAX_RT_PRIO; i++)
     {
-        kinfo("test pcb!!!!!!!!!!!!0----------------");
-
-        list_init(&array->queue[i]);
+        // list_init(&array->queue[i]);
+        list_init(array->queue+i);
     }
     rt_rq->rt_queued = 0;
     rt_rq->rt_time = 0;

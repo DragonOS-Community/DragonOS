@@ -500,19 +500,13 @@ ul initial_kernel_thread(ul arg)
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
-
-
-    struct rq *myrq=get_rq();
+    struct rq myrq=get_rq();
     struct process_control_block *test_pcb = kthread_run(&test, NULL, "Video refresh daemon");
 
     test_pcb->rt.time_slice = 100;
-    kinfo("test pcb!!!!!!!!!!!!0");
-    init_rt_rq(test_pcb->rt.rt_rq);
-    kinfo("test pcb!!!!!!!!!!!!0");
+    memset(&test_pcb->rt.rt_rq,0,sizeof(struct rt_rq));
 
-    enqueue_task_rt(myrq, test_pcb, 1);
-    // kinfo("test pcb!!!!!!!!!!!!3");
-    // sched_rt();
+    enqueue_task_rt(&myrq, test_pcb, 1);
     // 准备切换到用户态
     struct pt_regs *regs;
 

@@ -23,7 +23,7 @@ static spinlock_t daemon_refresh_lock;
 
 //driver/uart/uart.rs --rust function
 extern const uint16_t COM1;
-extern void uart_send(uint16_t port, char c);
+extern void c_uart_send(uint16_t port, char c);
 
 #define REFRESH_INTERVAL 15UL // 启动刷新帧缓冲区任务的时间间隔
 
@@ -188,7 +188,7 @@ int video_init()
     io_mfence();
     char init_text2[] = "Video driver initialized.\n";
     for (int i = 0; i < sizeof(init_text2) - 1; ++i)
-        uart_send(COM1, init_text2[i]);
+        c_uart_send(COM1, init_text2[i]);
 
     return 0;
 }

@@ -1,6 +1,5 @@
-use crate::kdebug;
 use crate::include::bindings::bindings::{io_in8, io_out8};
-use core::str;
+use core::{str, char, intrinsics::offset};
 
 const UART_SUCCESS: i32 = 0;
 const E_UART_BITS_RATE_ERROR: i32 = 1;
@@ -28,31 +27,51 @@ pub struct UartRegister {
 
 pub struct UartDriver {
     pub name: &'static str,
-    pub addr: u32,
-    pub register: UartRegister,
+    pub port: u16,
     pub baud_rate: u32,
 }
 
 impl UartDriver {
     pub fn serial_received(offset: u16) -> bool {
-        unsafe {
-            if (io_in8(offset + 5) & 1) != 0 {
-                true
-            } else {
-                false
-            }
+        if unsafe{ io_in8(offset + 5) } & 1 != 0 {
+            true
+        } else {
+            false
         }
     }
     
     pub fn is_transmit_empty(offset: u16) -> bool {
-        unsafe {
-            if (io_in8(offset + 5) & 0x20) != 0 {
-                true
-            } else {
-                false
-            }
+        if unsafe{ io_in8(offset + 5) } & 0x20 != 0 {
+            true
+        } else {
+            false
         }
     }
+
+    /// #uart_send(self, str: &str)
+    /// ##Brief
+    /// 串口字符串发送
+    /// ##Param
+    /// str, 要发送的字符串切片
+    /// ##Warn!
+    ///仅支持UTE-8编码字符
+    /// ##Todo!
+    ///支持所有Unicode编码
+    #[allow(dead_code)]
+    pub fn uart_send(self, str: &str) {
+        while UartDriver::is_transmit_empty(self.port) == false {
+            for c in str.bytes() {
+                unsafe { io_out8(self.port, c); }
+            }
+        } //TODO:pause
+    }
+
+    #[allow(dead_code)]
+    pub fn uart_read_byte(self) -> char {
+        while UartDriver::serial_received(self.port) == false {} //TODO:pause
+        unsafe { io_in8(self.port) as char }
+    }
+
 }
 
 /**
@@ -61,7 +80,8 @@ impl UartDriver {
  * @param port 端口号
  * @param c 要发送的数据
  */
-pub extern "C" fn uart_send(port: u16, c: u8) {
+#[no_mangle]
+pub extern "C" fn c_uart_send(port: u16, c: u8) {
     while UartDriver::is_transmit_empty(port) == false {} //TODO:pause
     unsafe { io_out8(port, c); }
 }
@@ -73,32 +93,32 @@ pub extern "C" fn uart_send(port: u16, c: u8) {
  * @return u8 接收到的数据
  */
 #[no_mangle]
-pub extern "C" fn uart_read(port: u16) -> u8 {
+pub extern "C" fn c_uart_read(port: u16) -> u8 {
     while UartDriver::serial_received(port) == false {} //TODO:pause
-    unsafe { return io_in8(port); }
+    unsafe { io_in8(port) }
 }
 
 /**
  * @brief 通过串口发送整个字符串
  *
  * @param port 串口端口
- * @param str 字符串
+ * @param str 字符串S
  */
 #[no_mangle]
-pub extern "C" fn uart_send_str(port: u16, str: *const u8)
+pub extern "C" fn c_uart_send_str(port: u16, str: *const u8)
 {
-    let message: &'static str = "uart send str";
-    let bytes = message.as_bytes();
-    for c in bytes {
-        uart_send(port, *c);
+    unsafe {
+        let mut i = 0;
+        while *offset(str, i) != '\0' as u8 {
+            c_uart_send(port, *offset(str, i));
+            i = i + 1;
+        }
     }
-    unsafe { uart_send(port, *str) };
 }
 
 #[no_mangle]
-pub extern "C" fn uart_init(port: u16, baud_rate: u32) -> i32 {
-    let message: &'static str = "uart init";
-    kdebug!("{}", message);
+pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
+    let message: &'static str = "uart init\n";
     // 错误的比特率
     if baud_rate > UART_MAX_BITS_RATE || UART_MAX_BITS_RATE % baud_rate != 0 {
         return -E_UART_BITS_RATE_ERROR;
@@ -128,7 +148,7 @@ pub extern "C" fn uart_init(port: u16, baud_rate: u32) -> i32 {
         io_out8(port + 4, 0x08);
         let bytes = message.as_bytes();
         for c in bytes {
-            uart_send(port, *c);
+            c_uart_send(port, *c);
         }
     }
     return UART_SUCCESS;

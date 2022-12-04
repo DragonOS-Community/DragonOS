@@ -44,7 +44,7 @@ ul bsp_idt_size, bsp_gdt_size;
 
 //driver/uart/uart.rs
 extern uint16_t COM1;
-extern int uart_init(uint16_t port, uint32_t baud_rate);
+extern int c_uart_init(uint16_t port, uint32_t baud_rate);
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -74,7 +74,7 @@ void reload_idt()
 void system_initialize()
 {
 
-    uart_init(COM1, 115200);
+    c_uart_init(COM1, 115200);
     video_init();
 
     scm_init();

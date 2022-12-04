@@ -22,8 +22,8 @@ static spinlock_t change_lock;
 
 // driver/uart/uart.rs --rust function
 extern const uint16_t COM1 = 0x3f8;
-extern void uart_send(uint16_t port, char c);
-extern void uart_send_str(uint16_t port, const char *str);
+extern void c_uart_send(uint16_t port, char c);
+extern void c_uart_send_str(uint16_t port, const char *str);
 
 /**
  * @brief 初始化window对象
@@ -73,7 +73,7 @@ static int __textui_init_window(struct textui_window_t *window, uint8_t flags, u
 int textui_install_handler(struct scm_buffer_info_t *buf)
 {
     // return printk_init(buf);
-    uart_send_str(COM1, "textui_install_handler");
+    c_uart_send_str(COM1, "textui_install_handler");
     return 0;
 }
 
@@ -84,7 +84,7 @@ int textui_uninstall_handler(void *args)
 
 int textui_enable_handler(void *args)
 {
-    uart_send_str(COM1, "textui_enable_handler\n");
+    c_uart_send_str(COM1, "textui_enable_handler\n");
     return 0;
 }
 
@@ -218,11 +218,11 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
 
     // uint64_t rflags = 0; // 加锁后rflags存储到这里
     spin_lock(&window->lock);
-    uart_send(COM1, character);
+    c_uart_send(COM1, character);
     if (unlikely(character == '\n'))
     {
         // 换行时还需要输出\r
-        uart_send(COM1, '\r');
+        c_uart_send(COM1, '\r');
         __textui_new_line(window, window->vline_operating);
         // spin_unlock_irqrestore(&window->lock, rflags);
         spin_unlock(&window->lock);
@@ -323,7 +323,7 @@ int textui_init()
     int retval = scm_register(&textui_framework);
     if (retval != 0)
     {
-        uart_send_str(COM1, "text ui init failed\n");
+        c_uart_send_str(COM1, "text ui init failed\n");
         while (1)
             pause();
     }
@@ -347,6 +347,6 @@ int textui_init()
     __private_info.default_window = &__initial_window;
     __private_info.actual_line = textui_framework.buf->height / TEXTUI_CHAR_HEIGHT;
 
-    uart_send_str(COM1, "text ui initialized\n");
+    c_uart_send_str(COM1, "text ui initialized\n");
     return 0;
 }

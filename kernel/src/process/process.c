@@ -22,6 +22,7 @@
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/rootfs/rootfs.h>
+#include <filesystem/procfs/procfs.h>
 #include <ktest/ktest.h>
 #include <mm/slab.h>
 #include <sched/sched.h>

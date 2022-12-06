@@ -107,3 +107,15 @@ long strnlen_user(const char *src, unsigned long maxlen)
     return size <= maxlen ? size : maxlen;
 }
 
+/**
+ * @brief 拼接两个字符串（将src接到dest末尾）
+ *
+ * @param dest 目标串
+ * @param src 源串
+ * @return char*
+ */
+char *strcat(char *dest, const char *src)
+{
+    strcpy(dest + strlen(dest), src);
+    return dest;
+}

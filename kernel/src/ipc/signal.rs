@@ -6,10 +6,7 @@ use crate::{
             pid_t, process_control_block, process_find_pcb_by_pid, pt_regs, spinlock_t, EINVAL,
             ENOTSUP, ESRCH, PF_EXITING, PF_KTHREAD, PF_WAKEKILL, PROC_INTERRUPTIBLE,
         },
-        DragonOS::signal::{
-            si_code_val, sigaction, sigaction__union_u, sighand_struct, siginfo, signal_struct,
-            sigpending, sigset_t, SignalNumber, MAX_SIG_NUM,
-        },
+        
     },
     kBUG, kdebug, kwarn,
     libs::{
@@ -23,7 +20,14 @@ use crate::{
     },
 };
 
-use crate::include::DragonOS::signal::{__siginfo_union, __siginfo_union_data};
+use super::signal_types::{
+    si_code_val, sigaction, sigaction__union_u, sighand_struct, siginfo, signal_struct,
+    sigpending, sigset_t, SignalNumber, MAX_SIG_NUM,
+};
+
+
+
+use super::signal_types::{__siginfo_union, __siginfo_union_data};
 
 /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
 pub static DEFAULT_SIGACTION: sigaction = sigaction {
@@ -61,8 +65,8 @@ pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
                 si_code: si_code_val::SI_USER as i32,
                 si_errno: 0,
                 reserved: 0,
-                _sifields: crate::include::DragonOS::signal::__sifields {
-                    _kill: crate::include::DragonOS::signal::__sifields__kill { _pid: pid },
+                _sifields: super::signal_types::__sifields {
+                    _kill: super::signal_types::__sifields__kill { _pid: pid },
                 },
             },
         },

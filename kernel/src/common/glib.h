@@ -253,14 +253,17 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
      * @brief 先每次搬运8 bytes，剩余就直接一个个byte搬运
      *
      */
-    asm volatile("rep   \n\t"
-                 "movsq  \n\t"
-                 "movq %3, %0   \n\t"
-                 "rep   \n\t"
-                 "movsb \n\t"
-                 : "=&c"(size), "=&D"(tmp0), "=&S"(tmp1)
-                 : "r"(size & 7), "0"(size >> 3), "1"(dst), "2"(src)
-                 : "memory");
+    // todo:编译有bug
+    // asm volatile("rep   \n\t"
+    //              "movsq  \n\t"
+    //              "movq %3, %0   \n\t"
+    //              "rep   \n\t"
+    //              "movsb \n\t"
+    //              : "=&c"(size), "=&D"(tmp0), "=&S"(tmp1)
+    //              : "r"(size & 7), "0"(size >> 3), "1"(dst), "2"(src)
+    //              : "memory");
+    memcpy(dst,src,size);
+    
     return size;
 }
 

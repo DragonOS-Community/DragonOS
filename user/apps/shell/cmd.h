@@ -150,3 +150,5 @@ int shell_cmd_free(int argc, char **argv);
  * @return int
  */
 int parse_command(char *buf, int *argc, char ***argv);
+
+int shell_cmd_kill(int argc, char **argv);

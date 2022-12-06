@@ -14,6 +14,9 @@ pub const COM1: u16 = 0x3f8;
 // pub const COM7: u16 = 0x5e8;
 // pub const COM8: u16 = 0x4E8;
 
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct UartRegister {
     pub reg_data: u8,
     pub reg_interrupt_enable: u8,
@@ -24,15 +27,76 @@ pub struct UartRegister {
     pub reg_modem_statue: u8,
     pub reg_scartch: u8,
 }
-
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct UartDriver {
-    pub name: &'static str,
-    pub port: u16,
-    pub baud_rate: u32,
+    port: u16,
+    baud_rate: u32,
+}
+
+impl Default for UartDriver {
+    fn default() -> Self {
+        Self {port: COM1, baud_rate: 115200}
+    }
 }
 
 impl UartDriver {
-    pub fn serial_received(offset: u16) -> bool {
+    /// ##uart_init(port: u16, baud_rate: u32) -> Result<(), &'static str>
+    /// ###Brief
+    /// 串口初始化
+    /// ###Param
+    /// port: 端口号
+    /// baud_rate: 波特率
+    /// ###Return
+    /// ####No error
+    /// no error: () 
+    /// ####Error 
+    /// baud_rate error: "uart init."
+    /// device falty: "uart faulty."
+    #[allow(dead_code)]
+    pub fn uart_init(port: u16, baud_rate: u32) -> Result<(), &'static str> {
+        let message: &'static str = "uart init.";
+        // 错误的比特率
+        if baud_rate > UART_MAX_BITS_RATE || UART_MAX_BITS_RATE % baud_rate != 0 {
+            return Err("uart init error.");
+        }
+    
+        unsafe {
+            io_out8(port + 1, 0x00); // Disable all interrupts
+            io_out8(port + 3, 0x80); // Enable DLAB (set baud rate divisor)
+        
+            let divisor = UART_MAX_BITS_RATE / baud_rate;
+            
+            io_out8(port + 0, (divisor & 0xff) as u8);        // Set divisor  (lo byte)
+            io_out8(port + 1, ((divisor >> 8) & 0xff) as u8); //                  (hi byte)
+            io_out8(port + 3, 0x03);                  // 8 bits, no parity, one stop bit
+            io_out8(port + 2, 0xC7);                  // Enable FIFO, clear them, with 14-byte threshold
+            io_out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
+            io_out8(port + 4, 0x1E); // Set in loopback mode, test the serial chip
+            io_out8(port + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
+        
+            // Check if serial is faulty (i.e: not same byte as sent)
+            if io_in8(port + 0) != 0xAE {
+                return Err("uart faulty");
+            }
+        
+            // If serial is not faulty set it in normal operation mode
+            // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
+            io_out8(port + 4, 0x08);
+            UartDriver::uart_send(port, message);
+        }
+        Ok(())
+        /*
+                Notice that the initialization code above writes to [PORT + 1]
+            twice with different values. This is once to write to the Divisor
+            register along with [PORT + 0] and once to write to the Interrupt
+            register as detailed in the previous section.
+                The second write to the Line Control register [PORT + 3]
+            clears the DLAB again as well as setting various other bits.
+        */
+    }
+
+    fn serial_received(offset: u16) -> bool {
         if unsafe{ io_in8(offset + 5) } & 1 != 0 {
             true
         } else {
@@ -40,7 +104,7 @@ impl UartDriver {
         }
     }
     
-    pub fn is_transmit_empty(offset: u16) -> bool {
+    fn is_transmit_empty(offset: u16) -> bool {
         if unsafe{ io_in8(offset + 5) } & 0x20 != 0 {
             true
         } else {
@@ -48,28 +112,33 @@ impl UartDriver {
         }
     }
 
-    /// #uart_send(self, str: &str)
-    /// ##Brief
+    /// ##uart_send(port: u16, str: &str)
+    /// ###Brief
     /// 串口字符串发送
-    /// ##Param
+    /// ###Param
     /// str, 要发送的字符串切片
-    /// ##Warn!
-    ///仅支持UTE-8编码字符
-    /// ##Todo!
-    ///支持所有Unicode编码
+    /// ###Return
+    /// None
     #[allow(dead_code)]
-    pub fn uart_send(self, str: &str) {
-        while UartDriver::is_transmit_empty(self.port) == false {
+    fn uart_send(port: u16, str: &str) {
+        while UartDriver::is_transmit_empty(port) == false {
             for c in str.bytes() {
-                unsafe { io_out8(self.port, c); }
+                unsafe { io_out8(port, c); }
             }
         } //TODO:pause
     }
-
+    
+    /// ##uart_read_byte(port: u16)
+    /// ###Brief
+    /// 串口读取一个字节
+    /// ###Param
+    /// port: 端口号
+    /// ###Return
+    /// 读取的字节
     #[allow(dead_code)]
-    pub fn uart_read_byte(self) -> char {
-        while UartDriver::serial_received(self.port) == false {} //TODO:pause
-        unsafe { io_in8(self.port) as char }
+    fn uart_read_byte(port: u16) -> char {
+        while UartDriver::serial_received(port) == false {} //TODO:pause
+        unsafe { io_in8(port) as char }
     }
 
 }

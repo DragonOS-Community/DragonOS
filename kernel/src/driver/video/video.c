@@ -5,6 +5,7 @@
 #include <common/spinlock.h>
 #include <common/time.h>
 #include <driver/multiboot2/multiboot2.h>
+#include <driver/uart/uart.h>
 #include <exception/softirq.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
@@ -20,10 +21,6 @@ static struct multiboot_tag_framebuffer_info_t __fb_info;
 static struct scm_buffer_info_t *video_refresh_target = NULL;
 static struct process_control_block *video_daemon_pcb = NULL;
 static spinlock_t daemon_refresh_lock;
-
-//driver/uart/uart.rs --rust function
-extern const uint16_t COM1;
-extern void c_uart_send(uint16_t port, char c);
 
 #define REFRESH_INTERVAL 15UL // 启动刷新帧缓冲区任务的时间间隔
 

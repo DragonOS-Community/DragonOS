@@ -1,51 +1,87 @@
 use crate::include::bindings::bindings::{io_in8, io_out8};
 use core::{str, char, intrinsics::offset};
 
+//C
 const UART_SUCCESS: i32 = 0;
 const E_UART_BITS_RATE_ERROR: i32 = 1;
 const E_UART_SERIAL_FAULT: i32 = 2;
 const UART_MAX_BITS_RATE: u32 = 115200;
-pub const COM1: u16 = 0x3f8;
-// pub const COM2: u16 = 0x2f8;
-// pub const COM3: u16 = 0x3e8;
-// pub const COM4: u16 = 0x2e8;
-// pub const COM5: u16 = 0x5f8;
-// pub const COM6: u16 = 0x4f8;
-// pub const COM7: u16 = 0x5e8;
-// pub const COM8: u16 = 0x4E8;
 
+#[allow(dead_code)]
+#[repr(u16)]
+#[derive(Clone)]
+pub enum UartPort {
+    COM1 = 0x3f8,
+    COM2 = 0x2f8,
+    COM3 = 0x3e8,
+    COM4 = 0x2e8,
+    COM5 = 0x5f8,
+    COM6 = 0x4f8,
+    COM7 = 0x5e8,
+    COM8 = 0x4e8,
+}
+
+impl UartPort {
+    #[allow(dead_code)]
+    pub fn from_u16(val: u16) -> Result<Self, &'static str> {
+        match val {
+            0x3f8 => Ok(Self::COM1),
+            0x2f8 => Ok(Self::COM2),
+            0x3e8 => Ok(Self::COM3),
+            0x2e8 => Ok(Self::COM4),
+            0x5f8 => Ok(Self::COM5),
+            0x4f8 => Ok(Self::COM6),
+            0x5e8 => Ok(Self::COM7),
+            0x4e8 => Ok(Self::COM8),
+            _ => Err("port error!"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn to_u16(self: &Self) -> u16 {
+        match self {
+            Self::COM1 => 0x3f8,
+            Self::COM2 => 0x2f8,
+            Self::COM3 => 0x3e8,
+            Self::COM4 => 0x2e8,
+            Self::COM5 => 0x5f8,
+            Self::COM6 => 0x4f8,
+            Self::COM7 => 0x5e8,
+            Self::COM8 => 0x4e8,
+        }
+    }
+}
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct UartRegister {
-    pub reg_data: u8,
-    pub reg_interrupt_enable: u8,
-    pub reg_ii_fifo: u8,    // 	Interrupt Identification and FIFO control registers
-    pub reg_line_config: u8,
-    pub reg_modem_config: u8,
-    pub reg_line_status: u8,
-    pub reg_modem_statue: u8,
-    pub reg_scartch: u8,
+struct UartRegister {
+    reg_data: u8,
+    reg_interrupt_enable: u8,
+    reg_ii_fifo: u8,    // 	Interrupt Identification and FIFO control registers
+    reg_line_config: u8,
+    reg_modem_config: u8,
+    reg_line_status: u8,
+    reg_modem_statue: u8,
+    reg_scartch: u8,
 }
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
 pub struct UartDriver {
-    port: u16,
+    port: UartPort,
     baud_rate: u32,
 }
 
 impl Default for UartDriver {
     fn default() -> Self {
-        Self {port: COM1, baud_rate: 115200}
+        Self {port: UartPort::COM1, baud_rate: 115200}
     }
 }
 
 impl UartDriver {
-    /// ##uart_init(port: u16, baud_rate: u32) -> Result<(), &'static str>
+    /// ##uart_init(uart_port: &UartPort, baud_rate: u32) -> Result<(), &'static str>
     /// ###Brief
     /// 串口初始化
     /// ###Param
-    /// port: 端口号
+    /// uart_port: 端口号
     /// baud_rate: 波特率
     /// ###Return
     /// ####No error
@@ -54,8 +90,9 @@ impl UartDriver {
     /// baud_rate error: "uart init."
     /// device falty: "uart faulty."
     #[allow(dead_code)]
-    pub fn uart_init(port: u16, baud_rate: u32) -> Result<(), &'static str> {
+    pub fn uart_init(uart_port: &UartPort, baud_rate: u32) -> Result<(), &'static str> {
         let message: &'static str = "uart init.";
+        let port = UartPort::to_u16(&uart_port);
         // 错误的比特率
         if baud_rate > UART_MAX_BITS_RATE || UART_MAX_BITS_RATE % baud_rate != 0 {
             return Err("uart init error.");
@@ -83,8 +120,8 @@ impl UartDriver {
             // If serial is not faulty set it in normal operation mode
             // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
             io_out8(port + 4, 0x08);
-            UartDriver::uart_send(port, message);
         }
+        UartDriver::uart_send(uart_port, message);
         Ok(())
         /*
                 Notice that the initialization code above writes to [PORT + 1]
@@ -112,7 +149,7 @@ impl UartDriver {
         }
     }
 
-    /// ##uart_send(port: u16, str: &str)
+    /// ##uart_send(uart_port: &UartPort, str: &str)
     /// ###Brief
     /// 串口字符串发送
     /// ###Param
@@ -120,7 +157,8 @@ impl UartDriver {
     /// ###Return
     /// None
     #[allow(dead_code)]
-    fn uart_send(port: u16, str: &str) {
+    fn uart_send(port: &UartPort, str: &str) {
+        let port = UartPort::to_u16(port);
         while UartDriver::is_transmit_empty(port) == false {
             for c in str.bytes() {
                 unsafe { io_out8(port, c); }
@@ -128,7 +166,7 @@ impl UartDriver {
         } //TODO:pause
     }
     
-    /// ##uart_read_byte(port: u16)
+    /// ##uart_read_byte(uart_port: &UartPort)
     /// ###Brief
     /// 串口读取一个字节
     /// ###Param
@@ -136,7 +174,8 @@ impl UartDriver {
     /// ###Return
     /// 读取的字节
     #[allow(dead_code)]
-    fn uart_read_byte(port: u16) -> char {
+    fn uart_read_byte(uart_port: &UartPort) -> char {
+        let port = UartPort::to_u16(uart_port);
         while UartDriver::serial_received(port) == false {} //TODO:pause
         unsafe { io_in8(port) as char }
     }

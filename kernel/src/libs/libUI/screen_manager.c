@@ -3,6 +3,7 @@
 #include <common/spinlock.h>
 #include <common/string.h>
 #include <driver/multiboot2/multiboot2.h>
+#include <driver/uart/uart.h>
 #include <driver/video/video.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
@@ -15,10 +16,6 @@ static struct scm_ui_framework_t *__current_framework; // 当前拥有屏幕控�
 static uint32_t scm_ui_max_id = 0;
 static bool __scm_alloc_enabled = false;         // 允许动态申请内存的标志位
 static bool __scm_double_buffer_enabled = false; // 允许双缓冲的标志位
-
-//driver/uart/uart.rs --rust function
-extern const uint16_t COM1;
-extern void c_uart_send_str(uint16_t port, const char *str);
 
 /**
  * @brief 创建新的帧缓冲区

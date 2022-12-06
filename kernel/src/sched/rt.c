@@ -52,8 +52,9 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
         return NULL;
     }
     // 获取当前的entry
-    // next = list_entry(queue->next, struct sched_rt_entity, run_list);
-    next = list_entry(queue, struct sched_rt_entity, run_list);
+    next = list_entry(queue->next, struct sched_rt_entity, run_list);
+    // next = list_entry(queue, struct sched_rt_entity, run_list);
+    // next = list_entry(list_next(queue), struct sched_rt_entity, run_list);
     kinfo("get next is %p",next);
 
     return next;
@@ -62,7 +63,7 @@ static struct process_control_block *_pick_next_task_rt(struct rq *rq)
 {
     kinfo("_pick next task begin!");
     struct sched_rt_entity *rt_se;
-    struct rt_rq *rt_rq = &rq->rt;
+    struct rt_rq *rt_rq = &rq->rt_rq;
     kinfo("_pick next task begin!");
     // 从rt_rq中找优先级最高且最先入队的task
     rt_se = pick_next_rt_entity(rt_rq);
@@ -88,12 +89,13 @@ struct process_control_block *pick_next_task_rt(struct rq *rq)
 
 static inline struct process_control_block *rt_task_of(struct sched_rt_entity *rt_se)
 {
-    return container_of(rt_se, struct process_control_block, rt);
+    // TODO:这里同名会不会有影响？
+    return container_of(rt_se, struct process_control_block, rt_se);
 }
 
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
-    struct rt_prio_array *array = &rq_tmp.rt.active;
+    struct rt_prio_array *array = &rq_tmp.rt_rq.active;
     struct List *queue = array->queue + rt_task_of(rt_se)->priority;
     list_append(&rt_se->run_list, queue);
     rt_se->on_list = 1;
@@ -102,7 +104,7 @@ static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
 
 static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
-    struct rq *rq = rt_se->rt_rq->rq;
+    // struct rq *rq = rt_se->rt_rq->rq;
     __enqueue_rt_entity(rt_se, flags); // 将当前task enqueue到rt的rq中
 }
 
@@ -116,7 +118,7 @@ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 void enqueue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
 {
     kinfo("enqueue_task_rt begin!");
-    struct sched_rt_entity *rt_se = &p->rt;
+    struct sched_rt_entity *rt_se = &p->rt_se;
 
     enqueue_rt_entity(rt_se, flags);
     kinfo("enqueue_task_rt successful!");
@@ -145,11 +147,11 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 
     __dequeue_rt_entity(rt_se, flags);
 
-    // enqueue_top_rt_rq(&rq->rt);
+    // enqueue_top_rt_rq(&rq->rt_rq);
 }
 static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
 {
-    struct sched_rt_entity *rt_se = &p->rt;
+    struct sched_rt_entity *rt_se = &p->rt_se;
 
     // update_curr_rt(rq);
     dequeue_rt_entity(rt_se, flags);
@@ -166,14 +168,10 @@ void sched_rt()
     cli();
     // 先选择需要调度的进程、再进行调度
     current_pcb->flags &= ~PF_NEED_SCHED;
-    // 获取当前CPU的rq
-    struct rt_rq *curr_rt_rq = current_pcb->rt.rt_rq;
-    struct rq *curr_rq = curr_rt_rq->rq;
     // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
     if (current_pcb->policy == SCHED_FIFO)
     {
-
-        struct process_control_block *proc = pick_next_task_rt(curr_rq);
+        struct process_control_block *proc = pick_next_task_rt(&rq_tmp);
         if (proc->priority > current_pcb->priority)
         {
             process_switch_mm(proc);
@@ -183,19 +181,19 @@ void sched_rt()
         // 如果挑选的进程优先级小于当前进程，则不进行切换
         else
         {
-            dequeue_task_rt(curr_rq, proc, 0);
+            dequeue_task_rt(&rq_tmp, proc, 0);
         }
     }
     // RR调度策略需要考虑时间片
     else if (current_pcb->policy == SCHED_RR)
     {
         // 判断这个进程时间片是否耗尽
-        if (--current_pcb->rt.time_slice == 0)
+        if (--current_pcb->rt_se.time_slice == 0)
         {
-            current_pcb->rt.time_slice = RR_TIMESLICE;
+            current_pcb->rt_se.time_slice = RR_TIMESLICE;
             current_pcb->flags |= PF_NEED_SCHED;
-            enqueue_task_rt(curr_rq, current_pcb, 0);
-            struct process_control_block *proc = pick_next_task_rt(curr_rq);
+            enqueue_task_rt(&rq_tmp, current_pcb, 0);
+            struct process_control_block *proc = pick_next_task_rt(&rq_tmp);
             process_switch_mm(proc);
 
             switch_proc(current_pcb, proc);

@@ -83,11 +83,12 @@ void sched_enqueue(struct process_control_block *pcb)
         myrt_rq.rt_time = 0;
         myrt_rq.rt_runtime = 0;
         rt_se.rt_rq = &myrt_rq;
-        list_init(&rt_se.run_list);
-        pcb->rt = rt_se;
+        // list_init(&rt_se.run_list);
+        pcb->rt_se = rt_se;
+        list_init(&pcb->rt_se.run_list);
         pcb->priority=10;
         kinfo("create pid is %d",pcb->pid);
-        kinfo("set sched_rt_entity is %p",pcb->rt);
+        kinfo("set sched_rt_entity is %p",pcb->rt_se);
         // 测试把pcb加入队列
         enqueue_task_rt(&rq_tmp, pcb, 1);
         // dequeue_task_rt(&rq_tmp, pcb, 1);
@@ -120,5 +121,5 @@ void sched_init()
     kinfo("sched_init!");
     memset(&rq_tmp, 0, sizeof(struct rq));
     sched_cfs_init();
-    sched_rt_init(&(rq_tmp.rt));
+    sched_rt_init(&(rq_tmp.rt_rq));
 }

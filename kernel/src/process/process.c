@@ -504,8 +504,8 @@ ul initial_kernel_thread(ul arg)
     struct rq myrq=get_rq();
     struct process_control_block *test_pcb = kthread_run_rt(&test, NULL, "Video refresh daemon");
 
-    test_pcb->rt.time_slice = 100;
-    // memset(&test_pcb->rt.rt_rq,0,sizeof(struct rt_rq));
+    test_pcb->rt_se.time_slice = 100;
+    // memset(&test_pcb->rt_se.rt_rq,0,sizeof(struct rt_rq));
 
     // enqueue_task_rt(&myrq, test_pcb, 1);
     // 准备切换到用户态

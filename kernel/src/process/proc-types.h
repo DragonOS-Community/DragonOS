@@ -79,22 +79,22 @@ struct rt_prio_array
     // TODO: 定义MAX_RT_PRIO为100
     struct List queue[MAX_RT_PRIO];
 };
-struct sched_entity
-{
-    unsigned int on_rq;
-    unsigned long exec_start;
-};
+// struct sched_entity
+// {
+//     unsigned int on_rq;
+//     // unsigned long exec_start;
+// };
 struct sched_rt_entity
 {
     // 用于加入到优先级队列中
     struct List run_list;
-    unsigned long timeout;
+    // unsigned long timeout;
     unsigned short on_rq;   // 入队之后设置1
     unsigned short on_list; // 入队之后设置1
     /* rq on which this entity is (to be) queued: */
     struct rt_rq *rt_rq;
-    struct sched_rt_entity *parent;
-    struct sched_rt_entity *back;
+    // struct sched_rt_entity *parent;
+    // struct sched_rt_entity *back;
     unsigned int time_slice; //针对RR调度策略的调度时隙
 };
 struct plist_head
@@ -108,11 +108,11 @@ struct plist_head
 struct rt_rq
 {
     struct rt_prio_array active;
-    unsigned int rt_nr_running; // rt队列中的任务数
-    unsigned int rr_nr_running;
+    // unsigned int rt_nr_running; // rt队列中的任务数
+    // unsigned int rr_nr_running;
     struct rq *rq;
     int rt_queued;
-    struct plist_head pushable_tasks;
+    // struct plist_head pushable_tasks;
     unsigned long rt_time; //当前队列的累计运行时间
     unsigned long rt_runtime; //当前队列的单个周期内的最大运行时间
 };
@@ -120,7 +120,7 @@ struct rq
 {
     /* data */
     // struct cfs_rq cfs;
-    struct rt_rq rt;
+    struct rt_rq rt_rq;
     // struct dl_rq dl;
 };
 
@@ -207,8 +207,8 @@ struct process_control_block
     // rt调度器需要使用
     unsigned int rt_priority;
 
-    struct sched_entity se;
-    struct sched_rt_entity rt;
+    // struct sched_entity se;
+    struct sched_rt_entity rt_se;
     
     // struct sched_dl_entity dl;
     // ==== 信号处理相关 =====

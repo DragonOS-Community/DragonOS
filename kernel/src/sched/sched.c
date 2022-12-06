@@ -68,7 +68,15 @@ int sched_getscheduler(struct process_control_block *p, int policy, const struct
  */
 void sched_enqueue(struct process_control_block *pcb)
 {
-    sched_cfs_enqueue(pcb);
+    if(pcb->policy==SCHED_NORMAL){
+        sched_cfs_enqueue(pcb);
+    }
+    else{
+        kinfo("policy is %d",pcb->policy);
+        // pcb->rt.rt_rq=(struct rt_rq*)kmalloc(sizeof(struct rt_rq),0);
+        // memset(&pcb->rt,0,sizeof(struct sched_rt_entity));
+        enqueue_task_rt(&rq_tmp, pcb, 1);
+    }
 }
 
 /**
@@ -82,6 +90,8 @@ void sched()
 
 void sched_init()
 {
+    // memset(&rq_tmp,0,sizeof(struct rq));
+    // memset(&rq_tmp.rt,0,sizeof(struct rt_rq));
     kinfo("sched_init!");
     memset(&rq_tmp, 0, sizeof(struct rq));
     sched_cfs_init();

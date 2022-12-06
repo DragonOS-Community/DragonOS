@@ -12,19 +12,23 @@ void sched_rt_init(struct rt_rq *rt_rq)
 }
 void init_rt_rq(struct rt_rq *rt_rq)
 {
-
-    struct rt_prio_array *array;
-    int i;
-
-    array = &rt_rq->active;
-    for (i = 0; i < MAX_RT_PRIO; i++)
-    {
-        // list_init(&array->queue[i]);
-        list_init(array->queue+i);
+    struct rt_rq myrt_rq;
+    
+    struct rt_prio_array active2;
+    for (int i=0;i<MAX_RT_PRIO;i++){
+        list_init(active2.queue+i);
     }
-    rt_rq->rt_queued = 0;
-    rt_rq->rt_time = 0;
-    rt_rq->rt_runtime = 0;
+    myrt_rq.active=active2;
+    myrt_rq.rt_queued = 0;
+    myrt_rq.rt_time = 0;
+    myrt_rq.rt_runtime = 0;
+    rt_rq=&myrt_rq;
+    // array = &rt_rq->active;
+    // for (i = 0; i < MAX_RT_PRIO; i++)
+    // {
+    //     // list_init(&array->queue[i]);
+    //     list_init(array->queue+i);
+    // }
 }
 static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 {
@@ -86,30 +90,13 @@ static inline struct process_control_block *rt_task_of(struct sched_rt_entity *r
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
     struct rt_rq *rt_rq = rt_se->rt_rq;
-    struct rt_prio_array *array = &rt_rq->active;
-    // struct List *queue = array->queue + rt_task_of(rt_se)->priority;
-    kinfo("test pcb!!!!!!!!!!!!510");
     init_rt_rq(rt_rq);
-    list_init(&(array->queue[2]));
-    kinfo("test pcb!!!!!!!!!!!!5100");
-    struct List *queue = &array->queue[2];
-    kinfo("test pcb!!!!!!!!!!!!511");
-    list_del(queue);
-    kinfo("test pcb!!!!!!!!!!!!512");
-    list_init(queue);
-    // kinfo("test pcb!!!!!!!!!!!!511");
-    // kinfo("test pcb!!!!!!!!!!!!%p",&rt_se->run_list);
-    // kinfo("test pcb!!!!!!!!!!!!%p",&queue);
-    // // list_init(&rt_se->run_list);
-    // // struct List *mylist=&rt_se->run_list;
-    // struct List mylist2;
-    // list_init(&mylist2);
-    // struct List mylist3;
-    // list_init(&mylist3);
-    // // list_del_init(queue);
-    // kinfo("test pcb!!!!!!!!!!!!5111");
-    // list_append(&mylist2, &mylist3);
-    // list_append(&mylist2, queue);
+    struct rt_prio_array *array = &rt_rq->active;
+    struct List *queue = array->queue + rt_task_of(rt_se)->priority;
+    kinfo("test pcb!!!!!!!!!!!!510");
+
+
+    list_append(&rt_se->run_list, queue);
     kinfo("test pcb!!!!!!!!!!!!512");
     rt_se->on_list = 1;
     rt_se->on_rq = 1;

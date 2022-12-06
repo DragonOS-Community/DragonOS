@@ -1,7 +1,6 @@
 use crate::include::bindings::bindings::{io_in8, io_out8};
 use core::{str, char, intrinsics::offset};
 
-//C
 const UART_SUCCESS: i32 = 0;
 const E_UART_BITS_RATE_ERROR: i32 = 1;
 const E_UART_SERIAL_FAULT: i32 = 2;
@@ -22,6 +21,9 @@ pub enum UartPort {
 }
 
 impl UartPort {
+    ///@brief 将u16转换为UartPort枚举类型
+    ///@param val 要转换的u16类型
+    ///@return 输入的端口地址正确，返回UartPort类型，错误，返回错误信息
     #[allow(dead_code)]
     pub fn from_u16(val: u16) -> Result<Self, &'static str> {
         match val {
@@ -37,6 +39,9 @@ impl UartPort {
         }
     }
 
+    ///@brief 将UartPort枚举类型转换为u16类型
+    ///@param self 要转换的UartPort
+    ///@return 转换的u16值
     #[allow(dead_code)]
     pub fn to_u16(self: &Self) -> u16 {
         match self {
@@ -51,6 +56,7 @@ impl UartPort {
         }
     }
 }
+
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -64,6 +70,7 @@ struct UartRegister {
     reg_modem_statue: u8,
     reg_scartch: u8,
 }
+
 #[repr(C)]
 pub struct UartDriver {
     port: UartPort,
@@ -77,22 +84,14 @@ impl Default for UartDriver {
 }
 
 impl UartDriver {
-    /// ##uart_init(uart_port: &UartPort, baud_rate: u32) -> Result<(), &'static str>
-    /// ###Brief
-    /// 串口初始化
-    /// ###Param
-    /// uart_port: 端口号
-    /// baud_rate: 波特率
-    /// ###Return
-    /// ####No error
-    /// no error: () 
-    /// ####Error 
-    /// baud_rate error: "uart init."
-    /// device falty: "uart faulty."
+    /// @brief 串口初始化
+    /// @param uart_port 端口号
+    /// @param baud_rate 波特率
+    /// @return 初始化成功，返回0,失败，返回错误信息
     #[allow(dead_code)]
-    pub fn uart_init(uart_port: &UartPort, baud_rate: u32) -> Result<(), &'static str> {
+    pub fn uart_init(uart_port: &UartPort, baud_rate: u32) -> Result<i32, &'static str> {
         let message: &'static str = "uart init.";
-        let port = UartPort::to_u16(&uart_port);
+        let port = uart_port.to_u16();
         // 错误的比特率
         if baud_rate > UART_MAX_BITS_RATE || UART_MAX_BITS_RATE % baud_rate != 0 {
             return Err("uart init error.");
@@ -122,7 +121,7 @@ impl UartDriver {
             io_out8(port + 4, 0x08);
         }
         UartDriver::uart_send(uart_port, message);
-        Ok(())
+        Ok(0)
         /*
                 Notice that the initialization code above writes to [PORT + 1]
             twice with different values. This is once to write to the Divisor
@@ -149,16 +148,13 @@ impl UartDriver {
         }
     }
 
-    /// ##uart_send(uart_port: &UartPort, str: &str)
-    /// ###Brief
-    /// 串口字符串发送
-    /// ###Param
-    /// str, 要发送的字符串切片
-    /// ###Return
-    /// None
+    /// @brief 串口发送
+    /// @param uart_port 端口号
+    /// @param str 发送字符切片
+    /// @return None
     #[allow(dead_code)]
-    fn uart_send(port: &UartPort, str: &str) {
-        let port = UartPort::to_u16(port);
+    fn uart_send(uart_port: &UartPort, str: &str) {
+        let port = uart_port.to_u16();
         while UartDriver::is_transmit_empty(port) == false {
             for c in str.bytes() {
                 unsafe { io_out8(port, c); }
@@ -166,52 +162,39 @@ impl UartDriver {
         } //TODO:pause
     }
     
-    /// ##uart_read_byte(uart_port: &UartPort)
-    /// ###Brief
-    /// 串口读取一个字节
-    /// ###Param
-    /// port: 端口号
-    /// ###Return
-    /// 读取的字节
+    /// @brief 串口接收一个字节
+    /// @param uart_port 端口号
+    /// @return 接收的字节
     #[allow(dead_code)]
     fn uart_read_byte(uart_port: &UartPort) -> char {
-        let port = UartPort::to_u16(uart_port);
+        let port = uart_port.to_u16();
         while UartDriver::serial_received(port) == false {} //TODO:pause
         unsafe { io_in8(port) as char }
     }
 
 }
 
-/**
- * @brief 发送数据
- *
- * @param port 端口号
- * @param c 要发送的数据
- */
+///@brief 发送数据
+///@param port 端口号
+///@param c 要发送的数据
 #[no_mangle]
 pub extern "C" fn c_uart_send(port: u16, c: u8) {
     while UartDriver::is_transmit_empty(port) == false {} //TODO:pause
     unsafe { io_out8(port, c); }
 }
 
-/**
- * @brief 从uart接收数据
- *
- * @param port 端口号
- * @return u8 接收到的数据
- */
+///@brief 从uart接收数据
+///@param port 端口号
+///@return u8 接收到的数据
 #[no_mangle]
 pub extern "C" fn c_uart_read(port: u16) -> u8 {
     while UartDriver::serial_received(port) == false {} //TODO:pause
     unsafe { io_in8(port) }
 }
 
-/**
- * @brief 通过串口发送整个字符串
- *
- * @param port 串口端口
- * @param str 字符串S
- */
+///@brief 通过串口发送整个字符串
+///@param port 串口端口
+///@param str 字符串S
 #[no_mangle]
 pub extern "C" fn c_uart_send_str(port: u16, str: *const u8)
 {
@@ -224,6 +207,10 @@ pub extern "C" fn c_uart_send_str(port: u16, str: *const u8)
     }
 }
 
+/// @brief 串口初始化
+/// @param u16 端口号
+/// @param baud_rate 波特率
+/// @return 初始化成功，返回0,失败，返回错误码
 #[no_mangle]
 pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
     let message: &'static str = "uart init\n";

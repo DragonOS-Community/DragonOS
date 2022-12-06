@@ -67,6 +67,7 @@ struct thread_struct
 #define PF_NOFREEZE (1UL << 4) // 当前进程不能被冻结
 #define PF_EXITING (1UL << 5)  // 进程正在退出
 #define PF_WAKEKILL (1UL << 6) // 进程由于接收到终止信号唤醒
+#define PF_SIGNALED (1UL << 7) // 进程由于接收到信号而退出
 /**
  * @brief 进程控制块
  *

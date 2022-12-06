@@ -1,7 +1,7 @@
 #include "rt.h"
 
 struct rt_rq *rt_rq_tmp;
-
+extern struct rq rq_tmp;
 /**
  * @brief 初始化RT进程调度器
  *
@@ -12,23 +12,14 @@ void sched_rt_init(struct rt_rq *rt_rq)
 }
 void init_rt_rq(struct rt_rq *rt_rq)
 {
-    struct rt_rq myrt_rq;
-    
-    struct rt_prio_array active2;
-    for (int i=0;i<MAX_RT_PRIO;i++){
-        list_init(active2.queue+i);
+    rt_rq = (struct rt_rq *)kmalloc(sizeof(struct rt_rq), 0);
+    for (int i = 0; i < MAX_RT_PRIO; i++)
+    {
+        list_init(rt_rq->active.queue + i);
     }
-    myrt_rq.active=active2;
-    myrt_rq.rt_queued = 0;
-    myrt_rq.rt_time = 0;
-    myrt_rq.rt_runtime = 0;
-    rt_rq=&myrt_rq;
-    // array = &rt_rq->active;
-    // for (i = 0; i < MAX_RT_PRIO; i++)
-    // {
-    //     // list_init(&array->queue[i]);
-    //     list_init(array->queue+i);
-    // }
+    rt_rq->rt_queued = 0;
+    rt_rq->rt_time = 0;
+    rt_rq->rt_runtime = 0;
 }
 static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 {
@@ -89,15 +80,9 @@ static inline struct process_control_block *rt_task_of(struct sched_rt_entity *r
 
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
-    struct rt_rq *rt_rq = rt_se->rt_rq;
-    init_rt_rq(rt_rq);
-    struct rt_prio_array *array = &rt_rq->active;
+    struct rt_prio_array *array = &rq_tmp.rt.active;
     struct List *queue = array->queue + rt_task_of(rt_se)->priority;
-    kinfo("test pcb!!!!!!!!!!!!510");
-
-
     list_append(&rt_se->run_list, queue);
-    kinfo("test pcb!!!!!!!!!!!!512");
     rt_se->on_list = 1;
     rt_se->on_rq = 1;
 }
@@ -117,11 +102,11 @@ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
  */
 void enqueue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
 {
+    kinfo("enqueue_task_rt begin!");
     struct sched_rt_entity *rt_se = &p->rt;
-    kinfo("test pcb!!!!!!!!!!!!5");
 
     enqueue_rt_entity(rt_se, flags);
-    kinfo("test pcb!!!!!!!!!!!!6");
+    kinfo("enqueue_task_rt successful!");
 
     // if (!task_current(rq, p))
     //     enqueue_pushable_task(rq, p);
@@ -194,7 +179,7 @@ void sched_rt()
         // 判断这个进程时间片是否耗尽
         if (--current_pcb->rt.time_slice == 0)
         {
-            current_pcb->rt.time_slice=RR_TIMESLICE;
+            current_pcb->rt.time_slice = RR_TIMESLICE;
             current_pcb->flags |= PF_NEED_SCHED;
             enqueue_task_rt(curr_rq, current_pcb, 0);
             struct process_control_block *proc = pick_next_task_rt(curr_rq);

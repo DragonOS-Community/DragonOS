@@ -6,11 +6,10 @@
 #include "sched/rt.h"
 #include <common/string.h>
 
-
 struct rq rq_tmp;
 
-
-struct rq get_rq(){
+struct rq get_rq()
+{
     return rq_tmp;
 }
 /**
@@ -68,14 +67,35 @@ int sched_getscheduler(struct process_control_block *p, int policy, const struct
  */
 void sched_enqueue(struct process_control_block *pcb)
 {
-    if(pcb->policy==SCHED_NORMAL){
+    if (pcb->policy == SCHED_NORMAL)
+    {
         sched_cfs_enqueue(pcb);
     }
-    else{
-        kinfo("policy is %d",pcb->policy);
+    else
+    {
+        kinfo("policy is %d", pcb->policy);
+        // 把pcb初始化一下，因为还没有找到进程创建后如何初始化，所以暂时在这里做测试
+
+        struct sched_rt_entity rt_se;
+
+        struct rt_rq myrt_rq;
+        struct rt_prio_array active2;
+        for (int i = 0; i < MAX_RT_PRIO; i++)
+        {
+            list_init(active2.queue + i);
+        }
+        myrt_rq.active = active2;
+        myrt_rq.rt_queued = 0;
+        myrt_rq.rt_time = 0;
+        myrt_rq.rt_runtime = 0;
+        rt_se.rt_rq = &myrt_rq;
+        list_init(&rt_se.run_list);
+        pcb->rt = rt_se;
+
         // pcb->rt.rt_rq=(struct rt_rq*)kmalloc(sizeof(struct rt_rq),0);
         // memset(&pcb->rt,0,sizeof(struct sched_rt_entity));
         enqueue_task_rt(&rq_tmp, pcb, 1);
+        dequeue_task_rt(&rq_tmp, pcb, 1)
     }
 }
 
@@ -97,6 +117,3 @@ void sched_init()
     sched_cfs_init();
     sched_rt_init(&(rq_tmp.rt));
 }
-
-
-

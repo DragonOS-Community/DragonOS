@@ -15,14 +15,14 @@ impl Default for RefCount{
 
 /// @brief 将给定的来自bindgen的refcount_t解析为Rust的RefCount的引用
 impl FFIBind2Rust<crate::include::bindings::bindings::refcount_struct> for RefCount{
-    fn convert_mut<'a>(
+    fn convert_mut(
         src: *mut crate::include::bindings::bindings::refcount_struct,
-    ) -> Option<&'a mut Self> {
+    ) -> Option<&'static mut Self> {
         return __convert_mut(src);
     }
-    fn convert_ref<'a>(
+    fn convert_ref(
         src: *const crate::include::bindings::bindings::refcount_struct,
-    ) -> Option<&'a Self> {
+    ) -> Option<&'static Self> {
         return __convert_ref(src)
     }
 }

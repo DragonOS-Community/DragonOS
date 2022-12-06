@@ -12,10 +12,17 @@ void sched_rt_init(struct rt_rq *rt_rq)
 }
 void init_rt_rq(struct rt_rq *rt_rq)
 {
-    rt_rq = (struct rt_rq *)kmalloc(sizeof(struct rt_rq), 0);
+    // 这里要不要分配内存，分配完能否在返回时正确传递？
+    // rt_rq = (struct rt_rq *)kmalloc(sizeof(struct rt_rq), 0);
     for (int i = 0; i < MAX_RT_PRIO; i++)
     {
-        list_init(rt_rq->active.queue + i);
+        // list_init(rt_rq->active.queue + i);
+        list_init(&rt_rq->active.queue[i]);
+        // struct List *atest=&rt_rq->active.queue[i];
+        // if (atest == atest->next&& atest->prev == atest){
+        //     kinfo("+++++++++++_is eq");
+        // }
+        // kinfo("+++++++++++_is not eq");
     }
     rt_rq->rt_queued = 0;
     rt_rq->rt_time = 0;
@@ -33,27 +40,33 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     // idx = sched_find_first_bit(array->bitmap);
     for (int i = 0; i < MAX_CPU_NUM; i++)
     {
-        if (!list_empty(array->queue[i].next))
+        if (!list_empty(&array->queue[i]))
         {
-            queue = array->queue[i].next;
+            queue = &array->queue[i];
             break;
         }
     }
     if (queue == NULL)
     {
+        kinfo("queue is null");
         return NULL;
     }
     // 获取当前的entry
-    next = list_entry(queue->next, struct sched_rt_entity, run_list);
+    // next = list_entry(queue->next, struct sched_rt_entity, run_list);
+    next = list_entry(queue, struct sched_rt_entity, run_list);
+    kinfo("get next is %p",next);
 
     return next;
 }
 static struct process_control_block *_pick_next_task_rt(struct rq *rq)
 {
+    kinfo("_pick next task begin!");
     struct sched_rt_entity *rt_se;
     struct rt_rq *rt_rq = &rq->rt;
+    kinfo("_pick next task begin!");
     // 从rt_rq中找优先级最高且最先入队的task
     rt_se = pick_next_rt_entity(rt_rq);
+    kinfo("_pick next task end!");
 
     return rt_task_of(rt_se);
 }

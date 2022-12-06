@@ -67,17 +67,11 @@ int sched_getscheduler(struct process_control_block *p, int policy, const struct
  */
 void sched_enqueue(struct process_control_block *pcb)
 {
-    if (pcb->policy == SCHED_NORMAL)
-    {
-        sched_cfs_enqueue(pcb);
-    }
-    else
+    if(pcb->policy == SCHED_RR)
     {
         kinfo("policy is %d", pcb->policy);
         // 把pcb初始化一下，因为还没有找到进程创建后如何初始化，所以暂时在这里做测试
-
         struct sched_rt_entity rt_se;
-
         struct rt_rq myrt_rq;
         struct rt_prio_array active2;
         for (int i = 0; i < MAX_RT_PRIO; i++)
@@ -91,11 +85,22 @@ void sched_enqueue(struct process_control_block *pcb)
         rt_se.rt_rq = &myrt_rq;
         list_init(&rt_se.run_list);
         pcb->rt = rt_se;
-
-        // pcb->rt.rt_rq=(struct rt_rq*)kmalloc(sizeof(struct rt_rq),0);
-        // memset(&pcb->rt,0,sizeof(struct sched_rt_entity));
+        pcb->priority=10;
+        kinfo("create pid is %d",pcb->pid);
+        kinfo("set sched_rt_entity is %p",pcb->rt);
+        // 测试把pcb加入队列
         enqueue_task_rt(&rq_tmp, pcb, 1);
-        dequeue_task_rt(&rq_tmp, pcb, 1)
+        // dequeue_task_rt(&rq_tmp, pcb, 1);
+        kinfo("pick next task begin!");
+        // 测试获取下一个进程
+        struct process_control_block * pcb_res=pick_next_task_rt(&rq_tmp);
+        
+        kinfo("pick next pid is %d",pcb_res->pid);
+        kinfo("pick next task end!");
+
+    }
+    else {
+        sched_cfs_enqueue(pcb);
     }
 }
 

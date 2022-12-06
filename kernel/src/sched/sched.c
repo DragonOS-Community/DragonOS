@@ -83,7 +83,7 @@ void sched_enqueue(struct process_control_block *pcb)
         myrt_rq.rt_time = 0;
         myrt_rq.rt_runtime = 0;
         rt_se.rt_rq = &myrt_rq;
-        // list_init(&rt_se.run_list);
+        
         pcb->rt_se = rt_se;
         list_init(&pcb->rt_se.run_list);
         pcb->priority=10;

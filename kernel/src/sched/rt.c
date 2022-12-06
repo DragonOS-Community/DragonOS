@@ -42,6 +42,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     {
         if (!list_empty(&array->queue[i]))
         {
+            kdebug("priority=%d", i);
             queue = &array->queue[i];
             break;
         }
@@ -52,10 +53,9 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
         return NULL;
     }
     // 获取当前的entry
-    next = list_entry(queue->next, struct sched_rt_entity, run_list);
-    // next = list_entry(queue, struct sched_rt_entity, run_list);
-    // next = list_entry(list_next(queue), struct sched_rt_entity, run_list);
-    kinfo("get next is %p",next);
+    // next = list_entry(queue->next, struct sched_rt_entity, run_list);
+    next = list_entry(list_next(queue), struct sched_rt_entity, run_list);
+    kinfo("get next is %p", next);
 
     return next;
 }
@@ -96,15 +96,14 @@ static inline struct process_control_block *rt_task_of(struct sched_rt_entity *r
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
     struct rt_prio_array *array = &rq_tmp.rt_rq.active;
-    struct List *queue = array->queue + rt_task_of(rt_se)->priority;
-    list_append(&rt_se->run_list, queue);
+    struct List *queue = &array->queue[rt_task_of(rt_se)->priority];
+    list_append(queue, &rt_se->run_list);
     rt_se->on_list = 1;
     rt_se->on_rq = 1;
 }
 
 static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
-    // struct rq *rq = rt_se->rt_rq->rq;
     __enqueue_rt_entity(rt_se, flags); // 将当前task enqueue到rt的rq中
 }
 

@@ -71,7 +71,7 @@ void reload_idt()
 void system_initialize()
 {
 
-    uart_init(COM1, 115200);
+    c_uart_init(COM1, 115200);
     video_init();
 
     scm_init();

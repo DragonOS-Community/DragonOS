@@ -21,6 +21,7 @@ mod mm;
 mod process;
 mod sched;
 mod smp;
+mod driver;
 
 extern crate alloc;
 

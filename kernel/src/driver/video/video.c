@@ -185,7 +185,7 @@ int video_init()
     io_mfence();
     char init_text2[] = "Video driver initialized.\n";
     for (int i = 0; i < sizeof(init_text2) - 1; ++i)
-        uart_send(COM1, init_text2[i]);
+        c_uart_send(COM1, init_text2[i]);
 
     return 0;
 }

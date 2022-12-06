@@ -16,6 +16,7 @@ static struct scm_ui_framework_t *__current_framework; // 当前拥有屏幕控�
 static uint32_t scm_ui_max_id = 0;
 static bool __scm_alloc_enabled = false;         // 允许动态申请内存的标志位
 static bool __scm_double_buffer_enabled = false; // 允许双缓冲的标志位
+
 /**
  * @brief 创建新的帧缓冲区
  *
@@ -250,11 +251,11 @@ int scm_enable_double_buffer()
     {
         if (ptr->buf == &video_frame_buffer_info)
         {
-            uart_send_str(COM1, "##init double buffer##\n");
+            c_uart_send_str(COM1, "##init double buffer##\n");
             struct scm_buffer_info_t *buf = __create_buffer(SCM_BF_DB | SCM_BF_PIXEL);
             if ((uint64_t)(buf) == (uint64_t)-ENOMEM)
                 return -ENOMEM;
-            uart_send_str(COM1, "##to change double buffer##\n");
+            c_uart_send_str(COM1, "##to change double buffer##\n");
 
             if (ptr->ui_ops->change(buf) != 0) // 这里的change回调函数不会是空指针吗 问题2
             {
@@ -270,7 +271,7 @@ int scm_enable_double_buffer()
     video_set_refresh_target(__current_framework->buf);
     // 通知显示驱动，启动双缓冲
     video_reinitialize(true);
-    uart_send_str(COM1, "##initialized double buffer##\n");
+    c_uart_send_str(COM1, "##initialized double buffer##\n");
     return 0;
 }
 

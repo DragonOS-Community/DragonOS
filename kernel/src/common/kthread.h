@@ -64,8 +64,9 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
 #define kthread_run_rt(thread_fn, data, name_fmt, ...)                                                          \
     ({                                                                                                       \
         struct process_control_block *__kt = kthread_create(thread_fn, data, name_fmt, ##__VA_ARGS__); \
+        __kt->policy=SCHED_RR;                                                                       \
         if (!IS_ERR(__kt)){                                                                                   \
-            __kt->policy=SCHED_RR;                                                                       \
+        kdebug("--------222--------");                                                                       \
             process_wakeup(__kt); }                                                                           \
         __kt;                                                                                                \
     })

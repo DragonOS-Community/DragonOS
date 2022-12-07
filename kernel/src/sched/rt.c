@@ -16,13 +16,7 @@ void init_rt_rq(struct rt_rq *rt_rq)
     // rt_rq = (struct rt_rq *)kmalloc(sizeof(struct rt_rq), 0);
     for (int i = 0; i < MAX_RT_PRIO; i++)
     {
-        // list_init(rt_rq->active.queue + i);
         list_init(&rt_rq->active.queue[i]);
-        // struct List *atest=&rt_rq->active.queue[i];
-        // if (atest == atest->next&& atest->prev == atest){
-        //     kinfo("+++++++++++_is eq");
-        // }
-        // kinfo("+++++++++++_is not eq");
     }
     rt_rq->rt_queued = 0;
     rt_rq->rt_time = 0;
@@ -55,19 +49,18 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     // 获取当前的entry
     // next = list_entry(queue->next, struct sched_rt_entity, run_list);
     next = list_entry(list_next(queue), struct sched_rt_entity, run_list);
+    // 获取后将该list移除出队列
+    list_del(list_next(queue));
     kinfo("get next is %p", next);
 
     return next;
 }
 static struct process_control_block *_pick_next_task_rt(struct rq *rq)
 {
-    kinfo("_pick next task begin!");
     struct sched_rt_entity *rt_se;
     struct rt_rq *rt_rq = &rq->rt_rq;
-    kinfo("_pick next task begin!");
     // 从rt_rq中找优先级最高且最先入队的task
     rt_se = pick_next_rt_entity(rt_rq);
-    kinfo("_pick next task end!");
 
     return rt_task_of(rt_se);
 }
@@ -116,14 +109,8 @@ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
  */
 void enqueue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
 {
-    kinfo("enqueue_task_rt begin!");
     struct sched_rt_entity *rt_se = &p->rt_se;
-
     enqueue_rt_entity(rt_se, flags);
-    kinfo("enqueue_task_rt successful!");
-
-    // if (!task_current(rq, p))
-    //     enqueue_pushable_task(rq, p);
 }
 
 static void __delist_rt_entity(struct sched_rt_entity *rt_se, struct rt_prio_array *array)
@@ -145,17 +132,12 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
     struct rq *rq = rt_se->rt_rq->rq;
 
     __dequeue_rt_entity(rt_se, flags);
-
-    // enqueue_top_rt_rq(&rq->rt_rq);
 }
+// 目前没用到，考虑移除
 static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int flags)
 {
     struct sched_rt_entity *rt_se = &p->rt_se;
-
-    // update_curr_rt(rq);
     dequeue_rt_entity(rt_se, flags);
-
-    // dequeue_pushable_task(rq, p);
 }
 
 /**
@@ -170,6 +152,7 @@ void sched_rt()
     // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
     if (current_pcb->policy == SCHED_FIFO)
     {
+        kinfo("begin sched_rt fifo");
         struct process_control_block *proc = pick_next_task_rt(&rq_tmp);
         if (proc->priority > current_pcb->priority)
         {
@@ -186,6 +169,7 @@ void sched_rt()
     // RR调度策略需要考虑时间片
     else if (current_pcb->policy == SCHED_RR)
     {
+        kinfo("begin sched_rt RR");
         // 判断这个进程时间片是否耗尽
         if (--current_pcb->rt_se.time_slice == 0)
         {

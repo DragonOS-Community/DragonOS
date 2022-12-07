@@ -134,6 +134,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     tsk->flags &= ~PF_KFORK;
 
     // 唤醒进程
+    kinfo("------------------------5");
     process_wakeup(tsk);
 
     //创建对应procfs文件

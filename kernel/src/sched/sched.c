@@ -67,9 +67,12 @@ int sched_getscheduler(struct process_control_block *p, int policy, const struct
  */
 void sched_enqueue(struct process_control_block *pcb)
 {
-    if(pcb->policy == SCHED_RR)
+    kinfo("sched_enqueue:before if policy is %d", pcb->policy);
+    kinfo("sched_enqueue:before if pid is %d", pcb->pid);
+    if (pcb->policy == SCHED_RR)
     {
-        kinfo("policy is %d", pcb->policy);
+        kinfo("sched_enqueue:policy is %d", pcb->policy);
+        kinfo("sched_enqueue:pid is %d", pcb->pid);
         // 把pcb初始化一下，因为还没有找到进程创建后如何初始化，所以暂时在这里做测试
         struct sched_rt_entity rt_se;
         struct rt_rq myrt_rq;
@@ -83,24 +86,24 @@ void sched_enqueue(struct process_control_block *pcb)
         myrt_rq.rt_time = 0;
         myrt_rq.rt_runtime = 0;
         rt_se.rt_rq = &myrt_rq;
-        
+
         pcb->rt_se = rt_se;
         list_init(&pcb->rt_se.run_list);
-        pcb->priority=10;
-        kinfo("create pid is %d",pcb->pid);
-        kinfo("set sched_rt_entity is %p",pcb->rt_se);
+        pcb->priority = 10;
+        kinfo("sched_enqueue:create pid is %d", pcb->pid);
         // 测试把pcb加入队列
         enqueue_task_rt(&rq_tmp, pcb, 1);
-        // dequeue_task_rt(&rq_tmp, pcb, 1);
-        kinfo("pick next task begin!");
         // 测试获取下一个进程
-        struct process_control_block * pcb_res=pick_next_task_rt(&rq_tmp);
-        
-        kinfo("pick next pid is %d",pcb_res->pid);
-        kinfo("pick next task end!");
+        // struct process_control_block * pcb_res=pick_next_task_rt(&rq_tmp);
 
+        // kinfo("pick next pid is %d",pcb_res->pid);
+        kinfo("sched_enqueue:pick next task end!");
+        sched();
     }
-    else {
+    // 防止出现进程policy还没被修改为RR就被调度，所以暂时设置<4
+    // else if(pcb->pid<4)
+    else
+    {
         sched_cfs_enqueue(pcb);
     }
 }
@@ -111,13 +114,22 @@ void sched_enqueue(struct process_control_block *pcb)
  */
 void sched()
 {
-    sched_cfs();
+    kinfo("sched:the pcb's policy is %d",current_pcb->policy);
+    kinfo("sched:the pcb's pid is %d",current_pcb->pid);
+    if (current_pcb->policy == SCHED_NORMAL)
+    {
+        kinfo("sched:sched_cfs is begin");
+        sched_cfs();
+    }
+    else
+    {
+        kinfo("sched:sched_rt is begin");
+        sched_rt();
+    }
 }
 
 void sched_init()
 {
-    // memset(&rq_tmp,0,sizeof(struct rq));
-    // memset(&rq_tmp.rt,0,sizeof(struct rt_rq));
     kinfo("sched_init!");
     memset(&rq_tmp, 0, sizeof(struct rq));
     sched_cfs_init();

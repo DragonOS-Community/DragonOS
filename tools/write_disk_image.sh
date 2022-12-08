@@ -1,3 +1,12 @@
+###############################################
+# 该脚本用于将disk_mount目录下的文件写入到disk.img的第一个分区中，
+#       并在磁盘镜像中安装grub引导程序
+#
+# 用法：bash write_disk_image.sh --bios legacy/uefi
+# 如果之前创建的disk.img是MBR分区表，那么请这样运行它：bash write_disk_image.sh --bios legacy
+# 如果之前创建的disk.img是GPT分区表，那么请这样运行它：bash write_disk_image.sh --bios uefi
+###############################################
+
 ARCH="x86_64"
 # 内核映像
 root_folder=$(dirname $(pwd))

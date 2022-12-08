@@ -124,18 +124,23 @@ static long procfs_open(struct vfs_index_node_t *inode, struct vfs_file_t *file_
     switch (mode)
     {
     case 1:
-        data_puts(fdata, "Name:");
+        data_puts(fdata, "Name:\t");
         data_puts(fdata, pcb_t->name);
-        data_puts(fdata, "\nstate:");
+        data_puts(fdata, "\nstate:\t");
         data_puts(fdata, ltoa(pcb_t->state));
-        data_puts(fdata, "\npid:");
+        data_puts(fdata, "\npid:\t");
         data_puts(fdata, ltoa(pcb_t->pid));
-        data_puts(fdata, "\nPpid:");
+        data_puts(fdata, "\nPpid:\t");
         data_puts(fdata, ltoa(pcb_t->parent_pcb->pid));
-        data_puts(fdata, "\ncpu_id:");
+        data_puts(fdata, "\ncpu_id:\t");
         data_puts(fdata, ltoa(pcb_t->cpu_id));
-        data_puts(fdata, "\npriority:");
+        data_puts(fdata, "\npriority:\t");
         data_puts(fdata, ltoa(pcb_t->priority));
+        data_puts(fdata, "\npreempt:\t");
+        data_puts(fdata, ltoa(pcb_t->preempt_count));
+        data_puts(fdata, "\nvrtime:\t");
+        data_puts(fdata, ltoa(pcb_t->virtual_runtime));
+
         // data_puts(fdata,"\n");
 
         uint64_t hiwater_vm, text, data;

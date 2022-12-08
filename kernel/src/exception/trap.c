@@ -24,8 +24,8 @@ void do_debug(struct pt_regs *regs, unsigned long error_code)
 {
     printk("[ ");
     printk_color(RED, BLACK, "ERROR / TRAP");
-    printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp, regs->rip,
-           proc_current_cpu_id);
+    printk(" ] do_debug(1),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d, pid:%d\n", error_code, regs->rsp, regs->rip,
+           proc_current_cpu_id, current_pcb->pid);
 
     while (1)
         hlt();

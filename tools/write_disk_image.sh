@@ -3,7 +3,10 @@ ARCH="x86_64"
 root_folder=$(dirname $(pwd))
 kernel="${root_folder}/bin/kernel/kernel.elf"
 boot_folder="${root_folder}/bin/disk_mount/boot"
-
+mount_folder="${root_folder}/bin/disk_mount"
+ARGS=`getopt -o p -l bios: -- "$@"`
+eval set -- "${ARGS}"
+#echo formatted parameters=[$@]
 echo "开始写入磁盘镜像..."
 
 
@@ -23,7 +26,7 @@ bins[0]=${kernel}
 for file in ${bins[*]};do
 if [ ! -x $file ]; then
 echo "$file 不存在！"
-exit 1
+exit
 fi
 done
 
@@ -39,13 +42,19 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
 fi
 
+#考虑到可能在两种启动模式中切换，每次都创建新磁盘
+echo "创建硬盘镜像文件..."
+case "$1" in
+        --bios) 
+     case "$2" in
+            uefi)
+           sudo bash ./create_hdd_image.sh -P GPT #GPT分区
+           ;;
+            legacy)
+           sudo bash ./create_hdd_image.sh -P MBR #MBR分区
+           esac       
+esac
 # 拷贝程序到硬盘
-# 判断是否存在硬盘镜像文件，如果不存在，就创建一个(docker模式下，由于镜像中缺少qemu-img不会创建)
-if [ ! -f "${root_folder}/bin/disk.img" ]; then
-    echo "创建硬盘镜像文件..."
-    sudo bash ./create_hdd_image.sh || exit 1
-fi
-
 mkdir -p ${root_folder}/bin/disk_mount
 bash mount_virt_disk.sh || exit 1
 mkdir -p ${boot_folder}/grub
@@ -53,7 +62,6 @@ cp ${kernel} ${root_folder}/bin/disk_mount/boot
 # 拷贝用户程序到磁盘镜像
 mkdir -p ${root_folder}/bin/disk_mount/bin
 mkdir -p ${root_folder}/bin/disk_mount/dev
-mkdir -p ${root_folder}/bin/disk_mount/proc
 
 cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount/bin
 touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
@@ -73,8 +81,16 @@ fi
 # rm -rf ${iso_folder}
 LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
 echo $LOOP_DEVICE
-
-grub-install --target=i386-pc --boot-directory=${root_folder}/bin/disk_mount/boot/ /dev/$LOOP_DEVICE
-
+case "$1" in
+        --bios) 
+     case "$2" in
+            uefi) #uefi
+           grub-install --target=x86_64-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
+           ;;
+            legacy) #传统bios
+           grub-install --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+           esac   
+           
+esac
 sync
 bash umount_virt_disk.sh

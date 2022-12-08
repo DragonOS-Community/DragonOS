@@ -1,6 +1,7 @@
 # 进行启动前检查
 flag_can_run=1
-
+ARGS=`getopt -o p -l bios: -- "$@"`
+eval set -- "${ARGS}"
 
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
 
@@ -18,18 +19,37 @@ if [ $(uname) == Darwin ]; then
 fi
 
 if [ $flag_can_run -eq 1 ]; then
-    
-    qemu-system-x86_64 -d ../bin/disk.img -m 512M -smp 2,cores=2,threads=1,sockets=1 \
-    -boot order=d   \
-    -monitor stdio -d ${qemu_trace_std} \
-    -s -S -cpu IvyBridge,apic,x2apic,+fpu,check,${allflags} -rtc clock=host,base=localtime -serial file:../serial_opt.txt \
-    -drive id=disk,file=../bin/disk.img,if=none \
-    -device ahci,id=ahci \
-    -device ide-hd,drive=disk,bus=ahci.0    \
-    -net nic,model=virtio \
-    -usb    \
-    -device qemu-xhci,id=xhci,p2=8,p3=4 \
-    -machine accel=${qemu_accel}
+    case "$1" in
+        --bios) 
+     case "$2" in
+            uefi) #uefi启动新增ovmf.fd固件
+            sudo qemu-system-x86_64 -bios OVMF.fd -d ../bin/disk.img -m 512M -smp 2,cores=2,threads=1,sockets=1 \
+	    -boot order=d   \
+	    -monitor stdio -d ${qemu_trace_std} \
+	    -s -S -cpu IvyBridge,apic,x2apic,+fpu,check,${allflags} -rtc clock=host,base=localtime -serial file:../serial_opt.txt \
+	    -drive id=disk,file=../bin/disk.img,if=none \
+	    -device ahci,id=ahci \
+	    -device ide-hd,drive=disk,bus=ahci.0    \
+	    -net nic,model=virtio \
+	    -usb    \
+	    -device qemu-xhci,id=xhci,p2=8,p3=4 \
+	    -machine accel=${qemu_accel}
+           ;;
+            legacy)
+            sudo qemu-system-x86_64 -d ../bin/disk.img -m 512M -smp 2,cores=2,threads=1,sockets=1 \
+	    -boot order=d   \
+	    -monitor stdio -d ${qemu_trace_std} \
+	    -s -S -cpu IvyBridge,apic,x2apic,+fpu,check,${allflags} -rtc clock=host,base=localtime -serial file:../serial_opt.txt \
+	    -drive id=disk,file=../bin/disk.img,if=none \
+	    -device ahci,id=ahci \
+	    -device ide-hd,drive=disk,bus=ahci.0    \
+	    -net nic,model=virtio \
+	    -usb    \
+	    -device qemu-xhci,id=xhci,p2=8,p3=4 \
+	    -machine accel=${qemu_accel}
+           esac       
+esac
+   
     
 else
   echo "不满足运行条件"

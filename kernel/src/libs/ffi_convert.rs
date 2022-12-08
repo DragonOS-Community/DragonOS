@@ -1,9 +1,9 @@
 /// @brief 由bindgen生成的结构体转换成rust原生定义的结构体的特性
 pub trait FFIBind2Rust<T> {
     /// 转换为不可变引用
-    fn convert_ref<'a>(src: *const T) -> Option<&'a Self>;
+    fn convert_ref(src: *const T) -> Option<&'static Self>;
     /// 转换为可变引用
-    fn convert_mut<'a>(src: *mut T) -> Option<&'a mut Self>;
+    fn convert_mut(src: *mut T) -> Option<&'static mut Self>;
 }
 
 

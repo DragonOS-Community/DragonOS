@@ -48,4 +48,5 @@ sudo losetup -d ${LOOP_DEVICE}
 
 echo "Successfully created disk image."
 mkdir -p ../bin
+chmod 777 disk.img
 mv ./disk.img ../bin/

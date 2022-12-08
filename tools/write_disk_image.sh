@@ -42,11 +42,12 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
 fi
 
-#考虑到可能在两种启动模式中切换，每次都创建新磁盘
-echo "创建硬盘镜像文件..."
-case "$1" in
+# 判断是否存在硬盘镜像文件，如果不存在，就创建一个(docker模式下，由于镜像中缺少qemu-img不会创建)
+if [ ! -f "${root_folder}/bin/disk.img" ]; then
+    echo "创建硬盘镜像文件..."
+    case "$1" in
         --bios) 
-     case "$2" in
+    case "$2" in
             uefi)
            sudo bash ./create_hdd_image.sh -P GPT #GPT分区
            ;;
@@ -54,6 +55,7 @@ case "$1" in
            sudo bash ./create_hdd_image.sh -P MBR #MBR分区
            esac       
 esac
+fi
 # 拷贝程序到硬盘
 mkdir -p ${root_folder}/bin/disk_mount
 bash mount_virt_disk.sh || exit 1
@@ -62,7 +64,7 @@ cp ${kernel} ${root_folder}/bin/disk_mount/boot
 # 拷贝用户程序到磁盘镜像
 mkdir -p ${root_folder}/bin/disk_mount/bin
 mkdir -p ${root_folder}/bin/disk_mount/dev
-
+mkdir -p ${root_folder}/bin/disk_mount/proc
 cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount/bin
 touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
 

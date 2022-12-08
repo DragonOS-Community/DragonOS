@@ -69,13 +69,13 @@ write_diskimage:
 	sudo sh -c "cd tools && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 
 # 写入磁盘镜像(uefi)
-write_diskimage_uefi:
+write_diskimage-uefi:
 	sudo sh -c "cd tools && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy && cd .."
 # 不编译，直接启动QEMU(UEFI)
-qemu_uefi:
+qemu-uefi:
 	sh -c "cd tools && bash run-qemu.sh --bios=uefi && cd .."
 	
 # 编译并写入磁盘镜像
@@ -89,10 +89,10 @@ docker:
 	sudo bash tools/build_in_docker.sh || exit 1
 	
 # uefi方式启动
-run_uefi:
+run-uefi:
 	$(MAKE) all -j $(NPROCS)
-	$(MAKE) write_diskimage_uefi || exit 1
-	$(MAKE) qemu_uefi
+	$(MAKE) write_diskimage-uefi || exit 1
+	$(MAKE) qemu-uefi
 	
 # 编译并启动QEMU
 run:

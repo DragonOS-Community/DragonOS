@@ -35,7 +35,7 @@ struct pt_regs
 };
 
 /**
- * @brief 判断用户是否
+ * @brief 判断pt_regs是否来自用户态
  * 
  * @param regs 
  * @return __always_inline 

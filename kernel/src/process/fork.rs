@@ -69,8 +69,8 @@ pub extern "C" fn process_copy_sighand(clone_flags: u64, pcb: *mut process_contr
     // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
     if (clone_flags & (CLONE_CLEAR_SIGHAND as u64)) != 0 {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        let p = pcb;
-        flush_signal_handlers(p, false);
+
+        flush_signal_handlers(pcb, false);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

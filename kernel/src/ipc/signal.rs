@@ -387,7 +387,7 @@ fn has_sig_pending(pcb: &process_control_block) -> bool {
     }
 }
 
-// #[inline]
+#[inline]
 fn signal_wake_up(pcb: &mut process_control_block, fatal: bool) {
     // kdebug!("signal_wake_up");
     let mut state: u64 = 0;

@@ -56,15 +56,22 @@ if [ ! -f "${root_folder}/bin/disk.img" ]; then
     echo "创建硬盘镜像文件..."
     case "$1" in
         --bios) 
-    case "$2" in
-            uefi)
-           sudo bash ./create_hdd_image.sh -P GPT #GPT分区
-           ;;
-            legacy)
-           sudo bash ./create_hdd_image.sh -P MBR #MBR分区
-           esac       
-esac
+        case "$2" in
+                uefi)
+            sudo bash ./create_hdd_image.sh -P GPT #GPT分区
+            ;;
+                legacy)
+            sudo bash ./create_hdd_image.sh -P MBR #MBR分区
+            ;;
+            esac       
+        ;;
+    *)
+        # 默认创建MBR分区
+        sudo bash ./create_hdd_image.sh -P MBR #MBR分区
+        ;;
+    esac
 fi
+
 # 拷贝程序到硬盘
 mkdir -p ${root_folder}/bin/disk_mount
 bash mount_virt_disk.sh || exit 1
@@ -93,15 +100,21 @@ fi
 LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
 echo $LOOP_DEVICE
 case "$1" in
-        --bios) 
-     case "$2" in
-            uefi) #uefi
-           grub-install --target=x86_64-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
-           ;;
-            legacy) #传统bios
-           grub-install --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
-           esac   
+    --bios) 
+        case "$2" in
+                uefi) #uefi
+            grub-install --target=x86_64-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
+            ;;
+                legacy) #传统bios
+            grub-install --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+            ;;
+        esac
+        ;;
+    *)
+    echo "参数错误"
+    ;;
            
 esac
+
 sync
 bash umount_virt_disk.sh

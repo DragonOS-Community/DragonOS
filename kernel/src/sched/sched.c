@@ -119,7 +119,6 @@ void sched()
     kinfo("sched:the pcb's policy is %d", current_pcb->policy);
     kinfo("sched:the pcb's pid is %d", current_pcb->pid);
     struct process_control_block *next = pick_next_task_rt(&rq_tmp);
-    // 这里需要归还
     if (next == NULL)
     {
         kinfo("sched:sched_cfs is begin");

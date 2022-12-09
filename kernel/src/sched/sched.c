@@ -69,8 +69,11 @@ void sched_enqueue(struct process_control_block *pcb)
 {
     kinfo("sched_enqueue:before if policy is %d", pcb->policy);
     kinfo("sched_enqueue:before if pid is %d", pcb->pid);
-    if (pcb->policy == SCHED_RR)
+    // if (pcb->policy == SCHED_RR)
+    // 临时修改，此处作为实时进程的暂时的调度条件
+    if (pcb->pid > 3)
     {
+        pcb->policy = SCHED_RR;
         kinfo("sched_enqueue:policy is %d", pcb->policy);
         kinfo("sched_enqueue:pid is %d", pcb->pid);
         // 把pcb初始化一下，因为还没有找到进程创建后如何初始化，所以暂时在这里做测试
@@ -86,6 +89,7 @@ void sched_enqueue(struct process_control_block *pcb)
         myrt_rq.rt_time = 0;
         myrt_rq.rt_runtime = 0;
         rt_se.rt_rq = &myrt_rq;
+        rt_se.time_slice = 80;
 
         pcb->rt_se = rt_se;
         list_init(&pcb->rt_se.run_list);
@@ -100,8 +104,6 @@ void sched_enqueue(struct process_control_block *pcb)
         kinfo("sched_enqueue:pick next task end!");
         sched();
     }
-    // 防止出现进程policy还没被修改为RR就被调度，所以暂时设置<4
-    // else if(pcb->pid<4)
     else
     {
         sched_cfs_enqueue(pcb);
@@ -114,18 +116,31 @@ void sched_enqueue(struct process_control_block *pcb)
  */
 void sched()
 {
-    kinfo("sched:the pcb's policy is %d",current_pcb->policy);
-    kinfo("sched:the pcb's pid is %d",current_pcb->pid);
-    if (current_pcb->policy == SCHED_NORMAL)
+    kinfo("sched:the pcb's policy is %d", current_pcb->policy);
+    kinfo("sched:the pcb's pid is %d", current_pcb->pid);
+    struct process_control_block *next = pick_next_task_rt(&rq_tmp);
+    // 这里需要归还
+    if (next == NULL)
     {
         kinfo("sched:sched_cfs is begin");
         sched_cfs();
     }
     else
     {
+        enqueue_task_rt(&rq_tmp, next, 0);
         kinfo("sched:sched_rt is begin");
         sched_rt();
     }
+    // if (current_pcb->policy == SCHED_NORMAL)
+    // {
+    //     kinfo("sched:sched_cfs is begin");
+    //     sched_cfs();
+    // }
+    // else
+    // {
+    //     kinfo("sched:sched_rt is begin");
+    //     sched_rt();
+    // }
 }
 
 void sched_init()

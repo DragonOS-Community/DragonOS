@@ -459,6 +459,7 @@ int test(void *a)
     kinfo("this is test_-------------------");
     kinfo("this is test_-------------------");
     kinfo("this is test_-------------------");
+    usleep(100000000);
     kinfo("this is test_-------------------");
     kinfo("this is test_-------------------");
     return 0;
@@ -505,7 +506,7 @@ ul initial_kernel_thread(ul arg)
     struct process_control_block *test_pcb = kthread_run_rt(&test, NULL, "Video refresh daemon");
     struct process_control_block *test_pcb2 = kthread_run_rt(&test, NULL, "Video refresh daemon");
 
-    test_pcb->rt_se.time_slice = 100;
+    test_pcb->rt_se.time_slice = 90;
     // memset(&test_pcb->rt_se.rt_rq,0,sizeof(struct rt_rq));
 
     // enqueue_task_rt(&myrq, test_pcb, 1);

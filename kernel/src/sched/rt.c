@@ -26,7 +26,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 {
     struct rt_prio_array *array = &rt_rq->active;
     struct sched_rt_entity *next = NULL;
-    struct List *queue;
+    struct List *queue = NULL;
     int idx;
 
     // 此处查找链表中中下一个执行的entity
@@ -61,7 +61,11 @@ static struct process_control_block *_pick_next_task_rt(struct rq *rq)
     struct rt_rq *rt_rq = &rq->rt_rq;
     // 从rt_rq中找优先级最高且最先入队的task
     rt_se = pick_next_rt_entity(rt_rq);
-
+    // 队列中无法找到，返回空
+    if (rt_se == NULL)
+    {
+        return NULL;
+    }
     return rt_task_of(rt_se);
 }
 static struct process_control_block *pick_task_rt(struct rq *rq)
@@ -147,40 +151,56 @@ static void dequeue_task_rt(struct rq *rq, struct process_control_block *p, int 
 void sched_rt()
 {
     cli();
-    // 先选择需要调度的进程、再进行调度
-    current_pcb->flags &= ~PF_NEED_SCHED;
+    bool need_change = false;
+    struct process_control_block *proc = pick_next_task_rt(&rq_tmp);
     // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
-    if (current_pcb->policy == SCHED_FIFO)
+    if (proc->policy == SCHED_FIFO)
     {
         kinfo("begin sched_rt fifo");
-        struct process_control_block *proc = pick_next_task_rt(&rq_tmp);
-        if (proc->priority > current_pcb->priority)
-        {
-            process_switch_mm(proc);
-
-            // switch_proc(current_pcb, proc);
-        }
         // 如果挑选的进程优先级小于当前进程，则不进行切换
+        if (proc->priority <= current_pcb->priority)
+        {
+            enqueue_task_rt(&rq_tmp, proc, 0);
+        }
         else
         {
-            dequeue_task_rt(&rq_tmp, proc, 0);
+            need_change = true;
         }
     }
     // RR调度策略需要考虑时间片
-    else if (current_pcb->policy == SCHED_RR)
+    else if (proc->policy == SCHED_RR)
     {
         kinfo("begin sched_rt RR");
-        // 判断这个进程时间片是否耗尽
-        if (--current_pcb->rt_se.time_slice == 0)
+        kinfo("sched_rt:current_pcb->priority %d", current_pcb->priority);
+        kinfo("sched_rt:proc->priorityi %d", proc->priority);
+        kinfo("sched_rt:proc->rt_se.time_slice %d", proc->rt_se.time_slice);
+        if (proc->priority > current_pcb->priority)
         {
-            current_pcb->rt_se.time_slice = RR_TIMESLICE;
-            current_pcb->flags |= PF_NEED_SCHED;
-            enqueue_task_rt(&rq_tmp, current_pcb, 0);
-            struct process_control_block *proc = pick_next_task_rt(&rq_tmp);
-            process_switch_mm(proc);
-
-            switch_proc(current_pcb, proc);
+            // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
+            if (--proc->rt_se.time_slice <= 0)
+            {
+                proc->rt_se.time_slice = RR_TIMESLICE;
+                proc->flags |= PF_NEED_SCHED;
+                enqueue_task_rt(&rq_tmp, proc, 0);
+            }
+            // 目标进程时间片未耗尽，切换到目标进程
+            else
+            {
+                need_change = true;
+            }
+        }
+        // curr优先级更大，说明一定是实时进程，则减去消耗时间片
+        else
+        {
+            current_pcb->rt_se.time_slice--;
+            enqueue_task_rt(&rq_tmp, proc, 0);
         }
     }
+    kinfo("sched_rt:切换到进程proc->pid %d", proc->pid);
+    if(need_change){
+        process_switch_mm(proc);
+        switch_proc(current_pcb, proc);
+    }
+
     sti();
 }

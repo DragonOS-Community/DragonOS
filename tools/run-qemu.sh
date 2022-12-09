@@ -2,6 +2,7 @@
 flag_can_run=1
 ARGS=`getopt -o p -l bios: -- "$@"`
 eval set -- "${ARGS}"
+echo "$@"
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
 
 # 请根据自己的需要，在-d 后方加入所需的trace事件
@@ -14,6 +15,7 @@ qemu_accel=kvm
 if [ $(uname) == Darwin ]; then
     qemu_accel=hvf
 fi
+
 
 QEMU=qemu-system-x86_64
 QEMU_DISK_IMAGE="../bin/disk.img"
@@ -32,18 +34,19 @@ QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot or
 
 QEMU_ARGUMENT+="-s -S -cpu ${QEMU_CPU_FEATURES} -rtc ${QEMU_RTC_CLOCK} -serial ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES}"
 
-echo ${QEMU_ARGUMENT}
 
 if [ $flag_can_run -eq 1 ]; then
     case "$1" in
         --bios) 
-     case "$2" in
-            uefi) #uefi启动新增ovmf.fd固件
-             ${QEMU} -bios arch/X86_64/OVMF.fd ${QEMU_ARGUMENT}
-           ;;
-            legacy)
-             ${QEMU} ${QEMU_ARGUMENT}
-           esac       
+      case "$2" in
+              uefi) #uefi启动新增ovmf.fd固件
+              ${QEMU} -bios arch/X86_64/OVMF.fd ${QEMU_ARGUMENT}
+            ;;
+              legacy)
+              ${QEMU} ${QEMU_ARGUMENT}
+              ;;
+            esac       
+
 esac  
 else
   echo "不满足运行条件"

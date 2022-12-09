@@ -177,3 +177,6 @@ fi
 bash create_hdd_image.sh
 
 congratulations
+USR=$USER
+sudo adduser $USR kvm
+sudo chowm $USR /dev/kvm

@@ -17,7 +17,7 @@ extern void ret_from_system_call(void); // 导出从系统调用返回的函数�
 extern system_call_t system_call_table[MAX_SYSTEM_CALL_NUM];
 
 // 判断系统调用是否来自用户态
-#define SYSCALL_FROM_USER(regs) ((regs)->cs & USER_CS)
+#define SYSCALL_FROM_USER(regs) (user_mode(regs))
 // 判断系统调用是否来自内核态
 #define SYSCALL_FROM_KERNEL(regs) (!SYSCALL_FROM_USER(regs))
 

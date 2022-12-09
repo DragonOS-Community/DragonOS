@@ -135,6 +135,8 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 唤醒进程
     kinfo("------------------------5");
+    kinfo("------------------------pcb_pid %d",current_pcb->pid);
+    kinfo("------------------------55");
     process_wakeup(tsk);
 
     //创建对应procfs文件

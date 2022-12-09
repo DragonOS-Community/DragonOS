@@ -75,8 +75,6 @@ case "$1" in
         exit 1
         ;;
 esac
-# 如果没有传入参数-P，则默认为MBR分区
-
 
 LOOP_DEVICE=$(sudo losetup -f --show -P disk.img) \
     || exit 1

@@ -176,7 +176,9 @@ fi
 # 创建磁盘镜像
 bash create_hdd_image.sh
 
-congratulations
+# 解决kvm权限问题
 USR=$USER
 sudo adduser $USR kvm
 sudo chowm $USR /dev/kvm
+
+congratulations

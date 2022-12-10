@@ -458,10 +458,15 @@ int test(void *a)
 {
     kinfo("this is test_-------------------");
     usleep(990000);
+    usleep(990000);
     kinfo("this is test_-------------------");
     kinfo("this is test_-------------------");
     usleep(990000);
+    usleep(990000);
+    usleep(990000);
     kinfo("this is test_-------------------");
+    usleep(990000);
+    usleep(990000);
     usleep(990000);
     kinfo("this is test_-------------------");
     return 0;
@@ -699,7 +704,6 @@ int process_wakeup(struct process_control_block *pcb)
         return 0;
 
     pcb->state |= PROC_RUNNING;
-    kinfo("process_wakeup:is weakup pcb %d",pcb->pid);
     sched_enqueue(pcb);
     return 1;
 }

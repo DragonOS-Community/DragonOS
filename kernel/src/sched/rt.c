@@ -172,22 +172,26 @@ void sched_rt()
     {
         kinfo("begin sched_rt RR");
         kinfo("sched_rt:current_pcb->priority %d", current_pcb->priority);
-        kinfo("sched_rt:proc->priorityi %d", proc->priority);
+        kinfo("sched_rt:proc->priority %d", proc->priority);
         kinfo("sched_rt:proc->rt_se.time_slice %d", proc->rt_se.time_slice);
         if (proc->priority > current_pcb->priority)
         {
             // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
-            if (--proc->rt_se.time_slice <= 0)
+            if (proc->rt_se.time_slice-- <= 0)
             {
                 proc->rt_se.time_slice = RR_TIMESLICE;
                 proc->flags |= PF_NEED_SCHED;
                 enqueue_task_rt(&rq_tmp, proc, 0);
+                kinfo("sched_rt:if after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
+
             }
             // 目标进程时间片未耗尽，切换到目标进程
             else
             {
+                kinfo("sched_rt:else after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
                 need_change = true;
             }
+
         }
         // curr优先级更大，说明一定是实时进程，则减去消耗时间片
         else
@@ -197,6 +201,7 @@ void sched_rt()
         }
     }
     kinfo("sched_rt:切换到进程proc->pid %d", proc->pid);
+    kinfo("sched_rt:after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
     if(need_change){
         process_switch_mm(proc);
         switch_proc(current_pcb, proc);

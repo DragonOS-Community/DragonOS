@@ -137,7 +137,10 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     kinfo("------------------------5");
     kinfo("------------------------pcb_pid %d",current_pcb->pid);
     kinfo("------------------------55");
-    process_wakeup(tsk);
+    kinfo("------------------------tsk_pid %d",tsk->pid);
+    kdebug("----------333--------------");
+
+    // process_wakeup(tsk);
 
     //创建对应procfs文件
     procfs_register_pid(tsk->pid);

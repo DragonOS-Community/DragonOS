@@ -359,7 +359,7 @@ uint64_t sys_mkdir(struct pt_regs *regs)
     // kdebug("path = %s", path);
     mode_t mode = (mode_t)regs->r9;
 
-    if (regs->cs & USER_CS)
+    if (user_mode(regs))
         return vfs_mkdir(path, mode, true);
     else
         return vfs_mkdir(path, mode, false);

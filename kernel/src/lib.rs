@@ -3,6 +3,7 @@
 #![feature(core_intrinsics)] // <2>
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]
+#![feature(drain_filter)]// 允许Vec的drain_filter特性
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
@@ -21,6 +22,7 @@ mod mm;
 mod process;
 mod sched;
 mod smp;
+mod driver;
 
 extern crate alloc;
 

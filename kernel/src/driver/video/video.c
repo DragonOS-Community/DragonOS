@@ -66,6 +66,7 @@ int video_refresh_daemon(void *unused)
                 memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr,
                        video_refresh_target->size);
                 spin_unlock(&daemon_refresh_lock);
+                video_daemon_pcb->virtual_runtime = 0xfffff0000000; // 临时解决由于显示刷新进程的虚拟运行时间过大/过小，导致其不运行，或者一直运行的问题。将来应使用实时调度解决它
             }
             video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
         }
@@ -83,8 +84,11 @@ void video_refresh_framebuffer(void *data)
 {
     if (unlikely(video_daemon_pcb == NULL))
         return;
-
-    process_wakeup(video_daemon_pcb);
+    if (clock() >= video_refresh_expire_jiffies)
+    {
+        video_daemon_pcb->virtual_runtime = 0;
+        process_wakeup(video_daemon_pcb);
+    }
 }
 
 /**
@@ -185,7 +189,7 @@ int video_init()
     io_mfence();
     char init_text2[] = "Video driver initialized.\n";
     for (int i = 0; i < sizeof(init_text2) - 1; ++i)
-        uart_send(COM1, init_text2[i]);
+        c_uart_send(COM1, init_text2[i]);
 
     return 0;
 }

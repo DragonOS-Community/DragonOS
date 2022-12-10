@@ -312,7 +312,6 @@ int shell_cmd_cat(int argc, char **argv)
         file_size -= l;
         printf("%s", buf);
     }
-
     close(fd);
     free(buf);
     free(file_path);
@@ -468,7 +467,7 @@ int shell_cmd_exec(int argc, char **argv)
 
     if (pid == 0)
     {
-        // printf("child proc\n");
+
         // 子进程
         int path_len = 0;
         char *file_path = get_target_filepath(argv[1], &path_len);
@@ -481,10 +480,13 @@ int shell_cmd_exec(int argc, char **argv)
     }
     else
     {
-        // printf("parent process wait for pid:[ %d ]\n", pid);
-
-        waitpid(pid, &retval, 0);
-        // printf("parent process wait pid [ %d ], exit code=%d\n", pid, retval);
+        // 如果不指定后台运行,则等待退出
+        if (strcmp(argv[argc - 1], "&") != 0)
+            waitpid(pid, &retval, 0);
+        else{
+            // 输出子进程的pid
+            printf("[1] %d\n", pid);
+        }
         free(argv);
     }
 }
@@ -514,8 +516,6 @@ int shell_cmd_kill(int argc, char **argv)
         retval = -EINVAL;
         goto out;
     }
-    printf("argc = %d, argv[1]=%s\n", argc, argv[1]);
-    printf("atoi(argv[1])=%d\n", atoi(argv[1]));
     retval = syscall_invoke(SYS_KILL, atoi(argv[1]), SIGKILL, 0, 0, 0, 0, 0, 0);
 out:;
     free(argv);

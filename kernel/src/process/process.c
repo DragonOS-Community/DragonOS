@@ -22,6 +22,7 @@
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/rootfs/rootfs.h>
+#include <filesystem/procfs/procfs.h>
 #include <ktest/ktest.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
@@ -48,6 +49,7 @@ extern struct sighand_struct INITIAL_SIGHAND;
 
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
+extern void initial_proc_init_signal(struct process_control_block *pcb);
 
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                             \
@@ -438,7 +440,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         regs->rsi = (uint64_t)dst_argv;
     }
     // kdebug("execve ok");
-
+    // 设置进程的段选择子为用户态可访问
     regs->cs = USER_CS | 3;
     regs->ds = USER_DS | 3;
     regs->ss = USER_DS | 0x3;
@@ -463,7 +465,7 @@ exec_failed:;
 #pragma GCC optimize("O0")
 ul initial_kernel_thread(ul arg)
 {
-    kinfo("initial proc running...\targ:%#018lx", arg);
+    kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
 
     scm_enable_double_buffer();
 
@@ -623,6 +625,8 @@ void process_init()
     list_init(&initial_proc_union.pcb.list);
     wait_queue_init(&initial_proc_union.pcb.wait_child_proc_exit, NULL);
 
+    // 初始化init进程的signal相关的信息
+    initial_proc_init_signal(current_pcb);
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
     barrier();

@@ -2,6 +2,7 @@
 #include <common/stddef.h>
 
 #include <asm/asm.h>
+#include <common/compiler.h>
 
 //链表数据结构
 struct List

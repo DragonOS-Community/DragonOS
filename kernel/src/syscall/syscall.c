@@ -135,21 +135,7 @@ uint64_t sys_close(struct pt_regs *regs)
     int fd_num = (int)regs->r8;
 
     // kdebug("sys close: fd=%d", fd_num);
-    // 校验文件描述符范围
-    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
-        return -EBADF;
-    // 文件描述符不存在
-    if (current_pcb->fds[fd_num] == NULL)
-        return -EBADF;
-    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
-    uint64_t ret;
-    // If there is a valid close function
-    if (file_ptr->file_ops && file_ptr->file_ops->close)
-        ret = file_ptr->file_ops->close(file_ptr->dEntry->dir_inode, file_ptr);
-
-    kfree(file_ptr);
-    current_pcb->fds[fd_num] = NULL;
-    return 0;
+    return vfs_close(fd_num);
 }
 
 /**
@@ -386,7 +372,7 @@ uint64_t sys_chdir(struct pt_regs *regs)
 
     // 计算输入的路径长度
     int dest_path_len;
-    if (regs->cs & USER_CS)
+    if (user_mode(regs))
     {
         dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
     }

@@ -21,6 +21,7 @@
 
 #include <filesystem/VFS/VFS.h>
 #include <filesystem/devfs/devfs.h>
+#include <filesystem/procfs/procfs.h>
 #include <filesystem/fat32/fat32.h>
 
 #include "driver/acpi/acpi.h"
@@ -70,7 +71,7 @@ void reload_idt()
 void system_initialize()
 {
 
-    uart_init(COM1, 115200);
+    c_uart_init(COM1, 115200);
     video_init();
 
     scm_init();
@@ -142,6 +143,8 @@ void system_initialize()
 
     vfs_init();
     devfs_init();
+    procfs_init();
+    
     cpu_init();
     ps2_keyboard_init();
     tty_init();

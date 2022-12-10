@@ -457,10 +457,12 @@ exec_failed:;
 int test(void *a)
 {
     kinfo("this is test_-------------------");
+    usleep(990000);
     kinfo("this is test_-------------------");
     kinfo("this is test_-------------------");
-    usleep(100000000);
+    usleep(990000);
     kinfo("this is test_-------------------");
+    usleep(990000);
     kinfo("this is test_-------------------");
     return 0;
 }

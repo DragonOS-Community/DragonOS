@@ -1,2 +1,15 @@
-target/
-Cargo.lock
+/cmake-build-debug/
+/bin/
+DragonOS.iso
+.idea/
+kernel/kernel
+.DS_Store
+
+*.o
+*.s
+serial_opt.txt
+user/sys_api_lib
+
+docs/_build
+draft
+cppcheck.xml

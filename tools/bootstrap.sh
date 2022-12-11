@@ -1,5 +1,7 @@
 emulator="qemu"
 defpackman="apt-get"
+export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
 
 banner()
 {
@@ -179,6 +181,6 @@ bash create_hdd_image.sh
 # 解决kvm权限问题
 USR=$USER
 sudo adduser $USR kvm
-sudo chowm $USR /dev/kvm
+sudo chown $USR /dev/kvm
 
 congratulations

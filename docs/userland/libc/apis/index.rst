@@ -18,4 +18,4 @@ API文档
    api-list/unistd
    
 这里是所有libc头文件的集合,在代码里可以这样引用:  
-``#include<libc/xxx.h>``  
+``#include<libc/src/xxx.h>``  

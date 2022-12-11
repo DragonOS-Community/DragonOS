@@ -1,8 +1,8 @@
-#include <libc/math.h>
-#include <libc/stdio.h>
-#include <libc/stdlib.h>
-#include <libc/time.h>
-#include <libc/unistd.h>
+#include <libc/src/math.h>
+#include <libc/src/stdio.h>
+#include <libc/src/stdlib.h>
+#include <libc/src/time.h>
+#include <libc/src/unistd.h>
 
 void print_ascii_logo()
 {

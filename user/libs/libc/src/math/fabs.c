@@ -1,7 +1,6 @@
-#include <libc/math.h>
-#include <libc/sys/types.h>
+#include <libc/src/math.h>
+#include <libc/src/sys/types.h>
 #include "libm.h"
-
 double fabs(double x)
 {
     union

@@ -1,6 +1,6 @@
 #include "syscall.h"
-#include <libc/stdio.h>
-#include <libc/errno.h>
+#include <libc/src/stdio.h>
+#include <libc/src/errno.h>
 long syscall_invoke(uint64_t syscall_id, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6, uint64_t arg7)
 {
     uint64_t __err_code;

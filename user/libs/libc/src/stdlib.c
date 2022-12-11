@@ -1,6 +1,6 @@
-#include <libc/unistd.h>
-#include <libc/stdlib.h>
-#include <libc/ctype.h>
+#include <libc/src/unistd.h>
+#include <libc/src/stdlib.h>
+#include <libc/src/ctype.h>
 #include <libsystem/syscall.h>
 
 int abs(int i)

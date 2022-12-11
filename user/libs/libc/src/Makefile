@@ -1,3 +1,6 @@
+GARBAGE_PATTERNS := *.o *.s~ *.s *.S~ *.c~ *.h~ kernel
+GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
+
 all: libc
 
 CFLAGS += -I .
@@ -8,6 +11,14 @@ ifeq ($(ARCH), __x86_64__)
 libc_sub_dirs += sysdeps/x86_64
 endif
 
+clean:
+	cargo clean
+	rm -rf $(GARBAGE)
+	@list='$(libc_sub_dirs)'; for subdir in $$list; do \
+		echo "Clean in dir: $$subdir";\
+		cd $$subdir && $(MAKE) clean;\
+		cd .. ;\
+	done
 
 libc: unistd.o fcntl.o malloc.o errno.o printf.o stdlib.o ctype.o string.o dirent.o time.o libc_rust
 	@list='$(libc_sub_dirs)'; for subdir in $$list; do \

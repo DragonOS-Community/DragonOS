@@ -1,5 +1,5 @@
-#include <libc/math.h>
-#include <libc/stddef.h>
+#include <libc/src/math.h>
+#include <libc/src/stddef.h>
 
 int64_t pow(int64_t x, int y)
 {

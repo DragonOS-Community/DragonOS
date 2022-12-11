@@ -75,27 +75,34 @@ void sched_enqueue(struct process_control_block *pcb)
     // 判断是否是running状态
     // if (pcb->pid > 3)
     {
-        pcb->policy = SCHED_RR;
         kinfo("sched_enqueue:policy is %d", pcb->policy);
         kinfo("sched_enqueue:pid is %d", pcb->pid);
-        // 把pcb初始化一下，因为还没有找到进程创建后如何初始化，所以暂时在这里做测试
-        struct sched_rt_entity rt_se;
-        struct rt_rq myrt_rq;
-        struct rt_prio_array active2;
-        for (int i = 0; i < MAX_RT_PRIO; i++)
-        {
-            list_init(active2.queue + i);
-        }
-        myrt_rq.active = active2;
-        myrt_rq.rt_queued = 0;
-        myrt_rq.rt_time = 0;
-        myrt_rq.rt_runtime = 0;
-        rt_se.rt_rq = &myrt_rq;
-        // rt_se.time_slice = 80;
+        pcb=process_init_rt_pcb(pcb);
 
-        pcb->rt_se = rt_se;
-        list_init(&pcb->rt_se.run_list);
-        pcb->priority = 10;
+
+
+
+        // struct sched_rt_entity rt_se;
+        // struct rt_rq myrt_rq;
+        // struct rt_prio_array active2;
+        // for (int i = 0; i < MAX_RT_PRIO; i++)
+        // {
+        //     list_init(active2.queue + i);
+        // }
+        // myrt_rq.active = active2;
+        // myrt_rq.rt_queued = 0;
+        // myrt_rq.rt_time = 0;
+        // myrt_rq.rt_runtime = 0;
+        // rt_se.rt_rq = &myrt_rq;
+        // // rt_se.time_slice = 80;
+
+        // pcb->rt_se = rt_se;
+        // list_init(&pcb->rt_se.run_list);
+        // pcb->priority = 10;
+
+
+
+
         // kinfo("sched_enqueue:create pid is %d", pcb->pid);
         // 测试把pcb加入队列
         enqueue_task_rt(&rq_tmp, pcb, 1);

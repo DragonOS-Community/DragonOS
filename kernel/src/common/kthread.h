@@ -71,6 +71,9 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
             process_wakeup(__kt); }                                                                           \
         __kt;                                                                                                \
     })
+
+        // __kt=process_init_rt_pcb(__kt);                                                                       
+
 /**
  * @brief 向kthread发送停止信号，请求其结束
  * 

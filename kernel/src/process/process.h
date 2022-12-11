@@ -71,6 +71,14 @@ extern uint64_t process_exit_files(struct process_control_block *pcb);
     } while (0)
 
 /**
+ * @brief 初始化实时进程rt_pcb
+ * 
+ * @return 初始化后的进程
+ * 
+*/
+struct process_control_block * process_init_rt_pcb(struct process_control_block *rt_pcb);
+
+/**
  * @brief 初始化系统的第一个进程
  *
  */

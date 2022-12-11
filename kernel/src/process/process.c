@@ -469,7 +469,68 @@ int test(void *a)
     usleep(990000);
     usleep(990000);
     kinfo("this is test_-------------------");
+    // usleep(990000);
+    // usleep(990000);
+    // usleep(990000);
+    // kinfo("this is test_-------------------");
+    // usleep(990000);
+    // usleep(990000);
+    // usleep(990000);
+    // kinfo("this is test_-------------------");
+    // usleep(990000);
+    // usleep(990000);
+    // usleep(990000);
+    // kinfo("this is test_-------------------");
+    // usleep(990000);
+    // usleep(990000);
+    // usleep(990000);
+    // kinfo("this is test_-------------------");
     return 0;
+}
+/**
+ * @brief 初始化实时进程rt_pcb
+ *
+ * @return 初始化后的进程
+ *
+ */
+struct process_control_block *process_init_rt_pcb(struct process_control_block *rt_pcb)
+{
+
+    // // 把pcb初始化一下，因为还没有找到进程创建后如何初始化，所以暂时在这里做测试
+    // // rt_pcb = kmalloc(sizeof(struct process_control_block),0);
+    // // memset(rt_pcb, 0, sizeof(struct process_control_block));
+    // rt_pcb->rt_se.rt_rq = kmalloc(sizeof(struct rt_rq),0); 
+    // memset(rt_pcb->rt_se.rt_rq, 0, sizeof(struct rt_rq));
+    // // pcb->rt_se.rt_rq->active = kmalloc(sizeof(struct rt_prio_array),0); 
+    // // memset(pcb->rt_se.rt_rq, 0, sizeof(struct rt_prio_array));
+    // rt_pcb->policy = SCHED_RR;
+    // rt_pcb->priority = 10;
+    // for (int i = 0; i < MAX_RT_PRIO; i++)
+    // {
+    //     list_init(&rt_pcb->rt_se.rt_rq->active.queue[i]);
+    // }
+    // return rt_pcb;
+
+    struct sched_rt_entity rt_se;
+    struct rt_rq myrt_rq;
+    struct rt_prio_array active2;
+    for (int i = 0; i < MAX_RT_PRIO; i++)
+    {
+        list_init(active2.queue + i);
+    }
+    myrt_rq.active = active2;
+    myrt_rq.rt_queued = 0;
+    myrt_rq.rt_time = 0;
+    myrt_rq.rt_runtime = 0;
+    rt_se.rt_rq = &myrt_rq;
+    // rt_se.time_slice = 100;
+
+    rt_pcb->rt_se = rt_se;
+    list_init(&rt_pcb->rt_se.run_list);
+    rt_pcb->priority = 10;
+    // rt_pcb->policy=SCHED_RR;
+    // rt_pcb->rt_se.time_slice=80;
+    return rt_pcb;
 }
 /**
  * @brief 内核init进程
@@ -509,7 +570,7 @@ ul initial_kernel_thread(ul arg)
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
-    struct rq myrq=get_rq();
+    struct rq myrq = get_rq();
     struct process_control_block *test_pcb = kthread_run_rt(&test, NULL, "Video refresh daemon");
     struct process_control_block *test_pcb2 = kthread_run_rt(&test, NULL, "Video refresh daemon");
 

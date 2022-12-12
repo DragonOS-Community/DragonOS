@@ -134,11 +134,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     tsk->flags &= ~PF_KFORK;
 
     // 唤醒进程
-    kinfo("------------------------5");
-    kinfo("------------------------pcb_pid %d",current_pcb->pid);
-    kinfo("------------------------55");
-    kinfo("------------------------tsk_pid %d",tsk->pid);
-    kdebug("----------333--------------");
 
     process_wakeup(tsk);
 

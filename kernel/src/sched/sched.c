@@ -67,39 +67,40 @@ int sched_getscheduler(struct process_control_block *p, int policy, const struct
  */
 void sched_enqueue(struct process_control_block *pcb)
 {
-    kinfo("sched_enqueue:begin!");
-    kinfo("sched_enqueue:before if policy is %d", pcb->policy);
-    kinfo("sched_enqueue:before if pid is %d", pcb->pid);
+    // kinfo("sched_enqueue:begin!");
+    // kinfo("sched_enqueue:before if policy is %d", pcb->policy);
+    // kinfo("sched_enqueue:before if pid is %d", pcb->pid);
     if (pcb->policy == SCHED_RR && pcb->state & PROC_RUNNING)
     // 临时修改，此处作为实时进程的暂时的调度条件
     // 判断是否是running状态
     // if (pcb->pid > 3)
     {
-        kinfo("sched_enqueue:policy is %d", pcb->policy);
-        kinfo("sched_enqueue:pid is %d", pcb->pid);
-        pcb=process_init_rt_pcb(pcb);
+        // kinfo("sched_enqueue:policy is %d", pcb->policy);
+        // kinfo("sched_enqueue:pid is %d", pcb->pid);
+        // kinfo("sched_enqueue:time_slice is %d", pcb->rt_se.time_slice);
+        // pcb=process_init_rt_pcb(pcb);
 
 
 
+        struct sched_rt_entity rt_se;
+        struct rt_rq myrt_rq;
+        struct rt_prio_array active2;
+        for (int i = 0; i < MAX_RT_PRIO; i++)
+        {
+            list_init(active2.queue + i);
+        }
+        myrt_rq.active = active2;
+        myrt_rq.rt_queued = 0;
+        myrt_rq.rt_time = 0;
+        myrt_rq.rt_runtime = 0;
+        rt_se.rt_rq = &myrt_rq;
+        rt_se.time_slice = 80;
 
-        // struct sched_rt_entity rt_se;
-        // struct rt_rq myrt_rq;
-        // struct rt_prio_array active2;
-        // for (int i = 0; i < MAX_RT_PRIO; i++)
-        // {
-        //     list_init(active2.queue + i);
-        // }
-        // myrt_rq.active = active2;
-        // myrt_rq.rt_queued = 0;
-        // myrt_rq.rt_time = 0;
-        // myrt_rq.rt_runtime = 0;
-        // rt_se.rt_rq = &myrt_rq;
-        // // rt_se.time_slice = 80;
+        pcb->rt_se = rt_se;
+        list_init(&pcb->rt_se.run_list);
+        pcb->priority = 10;
 
-        // pcb->rt_se = rt_se;
-        // list_init(&pcb->rt_se.run_list);
-        // pcb->priority = 10;
-
+        // kinfo("sched_enqueue:init is end  %d", pcb->rt_se.time_slice);
 
 
 
@@ -111,13 +112,13 @@ void sched_enqueue(struct process_control_block *pcb)
 
         // kinfo("pick next pid is %d",pcb_res->pid);
         // kinfo("sched_enqueue:pick next task end!");
-        sched();
+        // sched();
     }
     else if (pcb->policy == SCHED_NORMAL)
     {
         sched_cfs_enqueue(pcb);
     }
-    kinfo("sched_enqueue: end!");
+    // kinfo("sched_enqueue: end!");
     
 }
 
@@ -127,12 +128,12 @@ void sched_enqueue(struct process_control_block *pcb)
  */
 void sched()
 {
-    kinfo("sched:the pcb's policy is %d", current_pcb->policy);
-    kinfo("sched:the pcb's pid is %d", current_pcb->pid);
+    // kinfo("sched:the pcb's policy is %d", current_pcb->policy);
+    // kinfo("sched:the pcb's pid is %d", current_pcb->pid);
     struct process_control_block *next = pick_next_task_rt(&rq_tmp);
     if (next == NULL)
     {
-        kinfo("sched:sched_cfs is begin");
+        // kinfo("sched:sched_cfs is begin");
         sched_cfs();
     }
     else

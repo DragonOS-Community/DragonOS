@@ -36,14 +36,14 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     {
         if (!list_empty(&array->queue[i]))
         {
-            kdebug("priority=%d", i);
+            // kdebug("priority=%d", i);
             queue = &array->queue[i];
             break;
         }
     }
     if (queue == NULL)
     {
-        kinfo("queue is null");
+        // kinfo("queue is null");
         return NULL;
     }
     // 获取当前的entry
@@ -51,7 +51,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
     next = list_entry(list_next(queue), struct sched_rt_entity, run_list);
     // 获取后将该list移除出队列
     list_del(list_next(queue));
-    kinfo("get next is %p", next);
+    // kinfo("get next is %p", next);
 
     return next;
 }
@@ -156,7 +156,7 @@ void sched_rt()
     // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
     if (proc->policy == SCHED_FIFO)
     {
-        kinfo("begin sched_rt fifo");
+        // kinfo("begin sched_rt fifo");
         // 如果挑选的进程优先级小于当前进程，则不进行切换
         if (proc->priority <= current_pcb->priority)
         {
@@ -170,10 +170,10 @@ void sched_rt()
     // RR调度策略需要考虑时间片
     else if (proc->policy == SCHED_RR)
     {
-        kinfo("begin sched_rt RR");
-        kinfo("sched_rt:current_pcb->priority %d", current_pcb->priority);
-        kinfo("sched_rt:proc->priority %d", proc->priority);
-        kinfo("sched_rt:proc->rt_se.time_slice %d", proc->rt_se.time_slice);
+        // kinfo("begin sched_rt RR");
+        // kinfo("sched_rt:current_pcb->priority %d", current_pcb->priority);
+        // kinfo("sched_rt:proc->priority %d", proc->priority);
+        // kinfo("sched_rt:proc->rt_se.time_slice %d", proc->rt_se.time_slice);
         if (proc->priority > current_pcb->priority)
         {
             // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
@@ -182,13 +182,13 @@ void sched_rt()
                 proc->rt_se.time_slice = RR_TIMESLICE;
                 proc->flags |= PF_NEED_SCHED;
                 enqueue_task_rt(&rq_tmp, proc, 0);
-                kinfo("sched_rt:if after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
+                // kinfo("sched_rt:if after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
 
             }
             // 目标进程时间片未耗尽，切换到目标进程
             else
             {
-                kinfo("sched_rt:else after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
+                // kinfo("sched_rt:else after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
                 need_change = true;
             }
 
@@ -201,7 +201,7 @@ void sched_rt()
         }
     }
     kinfo("sched_rt:切换到进程proc->pid %d", proc->pid);
-    kinfo("sched_rt:after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
+    // kinfo("sched_rt:after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
     if(need_change){
         process_switch_mm(proc);
         switch_proc(current_pcb, proc);

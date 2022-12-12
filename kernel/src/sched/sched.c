@@ -82,23 +82,23 @@ void sched_enqueue(struct process_control_block *pcb)
 
 
 
-        struct sched_rt_entity rt_se;
-        struct rt_rq myrt_rq;
-        struct rt_prio_array active2;
-        for (int i = 0; i < MAX_RT_PRIO; i++)
-        {
-            list_init(active2.queue + i);
-        }
-        myrt_rq.active = active2;
-        myrt_rq.rt_queued = 0;
-        myrt_rq.rt_time = 0;
-        myrt_rq.rt_runtime = 0;
-        rt_se.rt_rq = &myrt_rq;
-        rt_se.time_slice = 80;
+        // struct sched_rt_entity rt_se;
+        // struct rt_rq myrt_rq;
+        // struct rt_prio_array active2;
+        // for (int i = 0; i < MAX_RT_PRIO; i++)
+        // {
+        //     list_init(active2.queue + i);
+        // }
+        // myrt_rq.active = active2;
+        // myrt_rq.rt_queued = 0;
+        // myrt_rq.rt_time = 0;
+        // myrt_rq.rt_runtime = 0;
+        // rt_se.rt_rq = &myrt_rq;
+        // rt_se.time_slice = 80;
 
-        pcb->rt_se = rt_se;
-        list_init(&pcb->rt_se.run_list);
-        pcb->priority = 10;
+        // pcb->rt_se = rt_se;
+        // list_init(&pcb->rt_se.run_list);
+        // pcb->priority = 10;
 
         // kinfo("sched_enqueue:init is end  %d", pcb->rt_se.time_slice);
 
@@ -133,7 +133,7 @@ void sched()
     struct process_control_block *next = pick_next_task_rt(&rq_tmp);
     if (next == NULL)
     {
-        // kinfo("sched:sched_cfs is begin");
+        kinfo("sched:sched_cfs is begin");
         sched_cfs();
     }
     else

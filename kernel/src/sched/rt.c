@@ -200,7 +200,7 @@ void sched_rt()
             enqueue_task_rt(&rq_tmp, proc, 0);
         }
     }
-    kinfo("sched_rt:切换到进程proc->pid %d", proc->pid);
+    kinfo("sched_rt:change to proc->pid %d", proc->pid);
     // kinfo("sched_rt:after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
     if(need_change){
         process_switch_mm(proc);

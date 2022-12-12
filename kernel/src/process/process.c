@@ -572,17 +572,25 @@ ul initial_kernel_thread(ul arg)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
     struct rq myrq = get_rq();
-    kinfo("process:pcb1 is ready!");
+    for(int iii=0;iii<10;iii++){
+        kdebug("process:pcb1 is ready!");
+    }
     // struct process_control_block *test_pcb = kthread_run(&test, NULL, "Video refresh daemon");
     // kinfo("process:pcb1 is created!");
     struct process_control_block *test_pcb2 = kthread_run_rt(&test, NULL, "Video refresh daemon");
-    for(int iii=0;iii<10;iii++){
-        kinfo("process:pcb2 is created!!!!");
-    }
+    // 这里创建完进程之后，打印不完整
+    kdebug("process:pcb2 is created!!!!");
+    kdebug("process:-pcb2 is created!!!!");
+    kdebug("process:--pcb2 is created!!!!");
+    kdebug("process:---pcb2 is created!!!!");
+    kinfo("process:pcb2 is created!!!!");
+    kinfo("process:-pcb2 is created!!!!");
+    kinfo("process:--pcb2 is created!!!!");
+    kinfo("process:---pcb2 is created!!!!");
     struct process_control_block *test_pcb3 = kthread_run_rt(&test1, NULL, "Video refresh daemon");
-    kinfo("process:pcb3 is created!");
+    kdebug("process:pcb3 is created!");
     for(int iii=0;iii<10;iii++){
-        kinfo("process:pcb3 is created!!!!");
+        kdebug("process:pcb3 is created!!!!");
     }
     // test_pcb2->rt_se.time_slice = 90;
     // memset(&test_pcb->rt_se.rt_rq,0,sizeof(struct rt_rq));

@@ -372,7 +372,7 @@ uint64_t sys_chdir(struct pt_regs *regs)
 
     // 计算输入的路径长度
     int dest_path_len;
-    if (regs->cs & USER_CS)
+    if (user_mode(regs))
     {
         dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
     }

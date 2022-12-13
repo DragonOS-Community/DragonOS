@@ -45,7 +45,7 @@ int rtc_get_cmos_time(struct rtc_time_t *t)
         t->second = (t->second & 0xf) + (t->second >> 4) * 10;
         t->minute = (t->minute & 0xf) + (t->minute >> 4) * 10;
         t->hour = ((t->hour & 0xf) + ((t->hour & 0x70) >> 4) * 10) | (t->hour & 0x80);
-
+        t->day = (t->day & 0xf) + ((t->day / 16) * 10);
         t->month = (t->month & 0xf) + (t->month >> 4) * 10;
         t->year = (t->year & 0xf) + (t->year >> 4) * 10;
     }

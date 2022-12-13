@@ -1,17 +1,17 @@
 #include "cmd.h"
 #include "cmd_help.h"
 #include "cmd_test.h"
-#include <libc/dirent.h>
-#include <libc/errno.h>
-#include <libc/fcntl.h>
-#include <libc/include/signal.h>
-#include <libc/stddef.h>
-#include <libc/stdio.h>
-#include <libc/stdlib.h>
-#include <libc/string.h>
-#include <libc/sys/stat.h>
-#include <libc/sys/wait.h>
-#include <libc/unistd.h>
+#include <libc/src/dirent.h>
+#include <libc/src/errno.h>
+#include <libc/src/fcntl.h>
+#include <libc/src/include/signal.h>
+#include <libc/src/stddef.h>
+#include <libc/src/stdio.h>
+#include <libc/src/stdlib.h>
+#include <libc/src/string.h>
+#include <libc/src/sys/stat.h>
+#include <libc/src/sys/wait.h>
+#include <libc/src/unistd.h>
 #include <libsystem/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
@@ -467,7 +467,7 @@ int shell_cmd_exec(int argc, char **argv)
 
     if (pid == 0)
     {
-        // printf("child proc\n");
+
         // 子进程
         int path_len = 0;
         char *file_path = get_target_filepath(argv[1], &path_len);
@@ -480,10 +480,13 @@ int shell_cmd_exec(int argc, char **argv)
     }
     else
     {
-        // printf("parent process wait for pid:[ %d ]\n", pid);
-
-        waitpid(pid, &retval, 0);
-        // printf("parent process wait pid [ %d ], exit code=%d\n", pid, retval);
+        // 如果不指定后台运行,则等待退出
+        if (strcmp(argv[argc - 1], "&") != 0)
+            waitpid(pid, &retval, 0);
+        else{
+            // 输出子进程的pid
+            printf("[1] %d\n", pid);
+        }
         free(argv);
     }
 }
@@ -513,8 +516,6 @@ int shell_cmd_kill(int argc, char **argv)
         retval = -EINVAL;
         goto out;
     }
-    printf("argc = %d, argv[1]=%s\n", argc, argv[1]);
-    printf("atoi(argv[1])=%d\n", atoi(argv[1]));
     retval = syscall_invoke(SYS_KILL, atoi(argv[1]), SIGKILL, 0, 0, 0, 0, 0, 0);
 out:;
     free(argv);

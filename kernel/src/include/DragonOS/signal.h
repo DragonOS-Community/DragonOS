@@ -1,3 +1,12 @@
+/**
+ * @file signal.h
+ * @author longjin (longjin@RinGoTek.cn)
+ * @brief signal相关类型在C语言中的导出。（以rust版本为准）
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022
+ *
+ */
 #pragma once
 #include <DragonOS/refcount.h>
 #include <common/atomic.h>
@@ -8,6 +17,8 @@
 
 // 系统最大支持的信号数量
 #define MAX_SIG_NUM 64
+// sigset所占用的u64的数量
+#define _NSIG_U64_CNT (MAX_SIG_NUM / 64)
 
 typedef void __signalfn_t(int);
 typedef __signalfn_t *__sighandler_t;
@@ -97,6 +108,11 @@ struct sigaction
     void (*sa_restorer)(void); // 暂时未实现
 };
 
+// ============ sigaction结构体中的的sa_flags的可选值 ===========
+#define SA_FLAG_IGN (1UL << 0)      // 当前sigaction表示忽略信号的动作
+#define SA_FLAG_DFL (1UL << 1)      // 当前sigaction表示系统默认的动作
+#define SA_FLAG_RESTORER (1UL << 2) // 当前sigaction具有用户指定的restorer
+
 /**
  * 由于signal_struct总是和sighand_struct一起使用，并且信号处理的过程中必定会对sighand加锁，
  * 因此signal_struct不用加锁
@@ -124,4 +140,5 @@ struct sighand_struct
 struct sigpending
 {
     sigset_t signal;
+    void *sigqueue; // 信号队列(在rust中实现)
 };

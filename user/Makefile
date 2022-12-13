@@ -35,4 +35,10 @@ sys_api_lib:
 
 clean: 
 	rm -rf $(GARBAGE)
+	$(MAKE) clean -C libs
+	@list='$(user_sub_dirs)'; for subdir in $$list; do \
+		echo "Clean in dir: $$subdir";\
+		cd $$subdir && $(MAKE) clean;\
+		cd .. ;\
+	done
 	

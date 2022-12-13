@@ -24,12 +24,13 @@ mod sched;
 mod smp;
 mod driver;
 
+
 extern crate alloc;
 
 use mm::allocator::KernelAllocator;
 
 // <3>
-use crate::{include::bindings::bindings::{process_do_exit, BLACK, GREEN}, arch::x86_64::asm::current::current_pcb};
+use crate::{include::bindings::bindings::{process_do_exit, BLACK, GREEN}, arch::x86_64::asm::current::current_pcb, time::timekeep::ktime_get_real_ns};
 
 // 声明全局的slab分配器
 #[cfg_attr(not(test), global_allocator)]
@@ -77,6 +78,5 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-
     return 0;
 }

@@ -528,9 +528,11 @@ struct process_control_block *process_init_rt_pcb(struct process_control_block *
 
     rt_pcb->rt_se = rt_se;
     list_init(&rt_pcb->rt_se.run_list);
+    // 暂时将实时进程的优先级设置为10
     rt_pcb->priority = 10;
-    // rt_pcb->policy=SCHED_RR;
-    // rt_pcb->rt_se.time_slice=80;
+    rt_pcb->policy=SCHED_RR;
+    rt_pcb->rt_se.time_slice=80;
+    rt_pcb->virtual_runtime=0x7fffffffffffffff;
     return rt_pcb;
 }
 /**
@@ -571,6 +573,8 @@ ul initial_kernel_thread(ul arg)
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
+
+    // 测试实时进程
     struct rq myrq = get_rq();
     for(int iii=0;iii<10;iii++){
         kdebug("process:pcb1 is ready!");
@@ -580,22 +584,11 @@ ul initial_kernel_thread(ul arg)
     struct process_control_block *test_pcb2 = kthread_run_rt(&test, NULL, "Video refresh daemon");
     // 这里创建完进程之后，打印不完整
     kdebug("process:pcb2 is created!!!!");
-    kdebug("process:-pcb2 is created!!!!");
-    kdebug("process:--pcb2 is created!!!!");
-    kdebug("process:---pcb2 is created!!!!");
-    kinfo("process:pcb2 is created!!!!");
-    kinfo("process:-pcb2 is created!!!!");
-    kinfo("process:--pcb2 is created!!!!");
-    kinfo("process:---pcb2 is created!!!!");
     struct process_control_block *test_pcb3 = kthread_run_rt(&test1, NULL, "Video refresh daemon");
     kdebug("process:pcb3 is created!");
-    for(int iii=0;iii<10;iii++){
-        kdebug("process:pcb3 is created!!!!");
-    }
-    // test_pcb2->rt_se.time_slice = 90;
-    // memset(&test_pcb->rt_se.rt_rq,0,sizeof(struct rt_rq));
 
-    // enqueue_task_rt(&myrq, test_pcb, 1);
+
+
     // 准备切换到用户态
     struct pt_regs *regs;
 

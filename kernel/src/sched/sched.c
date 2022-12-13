@@ -131,7 +131,10 @@ void sched()
     // kinfo("sched:the pcb's policy is %d", current_pcb->policy);
     // kinfo("sched:the pcb's pid is %d", current_pcb->pid);
     struct process_control_block *next = pick_next_task_rt(&rq_tmp);
-    if (next == NULL)
+    if(next!=NULL){
+        kinfo("pick next task rt p %p",next);
+    }
+    if (next == NULL && current_pcb->policy==SCHED_NORMAL)
     {
         kinfo("sched:sched_cfs is begin");
         sched_cfs();

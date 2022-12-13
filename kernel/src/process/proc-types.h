@@ -110,7 +110,7 @@ struct rt_rq
     struct rt_prio_array active;
     // unsigned int rt_nr_running; // rt队列中的任务数
     // unsigned int rr_nr_running;
-    struct rq *rq;
+    // struct rq *rq;
     int rt_queued;
     // struct plist_head pushable_tasks;
     unsigned long rt_time; //当前队列的累计运行时间

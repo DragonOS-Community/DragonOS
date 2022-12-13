@@ -1,6 +1,5 @@
 #include "rt.h"
 
-struct rt_rq *rt_rq_tmp;
 extern struct rq rq_tmp;
 /**
  * @brief 初始化RT进程调度器
@@ -84,14 +83,15 @@ struct process_control_block *pick_next_task_rt(struct rq *rq)
     return p;
 }
 
-static inline struct process_control_block *rt_task_of(struct sched_rt_entity *rt_se)
+static inline struct process_control_block *rt_task_of(struct sched_rt_entity *rt_se_tmp)
 {
-    // TODO:这里同名会不会有影响？
-    return container_of(rt_se, struct process_control_block, rt_se);
+    return container_of(rt_se_tmp, struct process_control_block, rt_se);
 }
 
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
+    // 这里在switch_proc 会被调用，准确的说，是被enqueue_task_rt调用的，但enqueue_task_rt是在何处被调用的不清楚
+    // 在其他地方调用这里时，rt_se不会报错，但在switch_proc执行时，这里的rt_task_of(rt_se)开始就报错了
     struct rt_prio_array *array = &rq_tmp.rt_rq.active;
     struct List *queue = &array->queue[rt_task_of(rt_se)->priority];
     list_append(queue, &rt_se->run_list);
@@ -133,8 +133,6 @@ static void __dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
 }
 static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
-    struct rq *rq = rt_se->rt_rq->rq;
-
     __dequeue_rt_entity(rt_se, flags);
 }
 // 目前没用到，考虑移除
@@ -153,6 +151,10 @@ void sched_rt()
     cli();
     bool need_change = false;
     struct process_control_block *proc = pick_next_task_rt(&rq_tmp);
+    // 若队列中无下一个进程，则返回
+    if(proc==NULL){
+        return ;
+    }
     // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
     if (proc->policy == SCHED_FIFO)
     {
@@ -170,10 +172,6 @@ void sched_rt()
     // RR调度策略需要考虑时间片
     else if (proc->policy == SCHED_RR)
     {
-        // kinfo("begin sched_rt RR");
-        // kinfo("sched_rt:current_pcb->priority %d", current_pcb->priority);
-        // kinfo("sched_rt:proc->priority %d", proc->priority);
-        // kinfo("sched_rt:proc->rt_se.time_slice %d", proc->rt_se.time_slice);
         if (proc->priority > current_pcb->priority)
         {
             // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
@@ -196,16 +194,21 @@ void sched_rt()
         // curr优先级更大，说明一定是实时进程，则减去消耗时间片
         else
         {
+            // kinfo("sched_rt:if else after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
             current_pcb->rt_se.time_slice--;
             enqueue_task_rt(&rq_tmp, proc, 0);
         }
     }
     kinfo("sched_rt:change to proc->pid %d", proc->pid);
     // kinfo("sched_rt:after rt proc->rt_se.time_slice %d", proc->rt_se.time_slice);
-    if(need_change){
+    if(need_change==true){
+        kinfo("sched_rt:need_change1");
         process_switch_mm(proc);
+        kinfo("sched_rt:need_change2");
         switch_proc(current_pcb, proc);
+        kinfo("sched_rt:need_change3");
     }
+    kinfo("sched_rt:need_change4");
 
     sti();
 }

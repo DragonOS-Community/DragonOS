@@ -19,7 +19,7 @@ static struct process_control_block *pick_task_rt(struct rq *rq);
 
 struct process_control_block *pick_next_task_rt(struct rq *rq);
 
-static inline struct process_control_block *rt_task_of(struct sched_rt_entity *rt_se);
+static inline struct process_control_block *rt_task_of(struct sched_rt_entity *rt_se_tmp);
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags);
 static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags);
 

@@ -1,0 +1,160 @@
+#! /bin/sh
+#
+# Set a default boot entry for GRUB, for the next boot only.
+# Copyright (C) 2004,2009  Free Software Foundation, Inc.
+#
+# GRUB is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# GRUB is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
+
+# Initialize some variables.
+prefix=/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub
+exec_prefix=/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub
+bindir=${exec_prefix}/bin
+sbindir=${exec_prefix}/sbin
+sysconfdir="${prefix}/etc"
+PACKAGE_NAME=GRUB
+PACKAGE_VERSION=2.06
+datarootdir="/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub/share"
+datadir="${datarootdir}"
+if [ "x$pkgdatadir" = x ]; then
+    pkgdatadir="${datadir}/grub"
+fi
+
+self=`basename $0`
+
+grub_editenv=${bindir}/grub-editenv
+grub_probe=${sbindir}/grub-probe
+rootdir=
+bootdir=
+grubdir=`echo "/boot/grub" | sed 's,//*,/,g'`
+
+export TEXTDOMAIN=grub
+export TEXTDOMAINDIR="${datarootdir}/locale"
+
+. "${pkgdatadir}/grub-mkconfig_lib"
+
+# Usage: usage
+# Print the usage.
+usage () {
+    gettext_printf "Usage: %s [OPTION] MENU_ENTRY\n" "$self"
+    gettext "Set the default boot menu entry for GRUB, for the next boot only."; echo
+    print_option_help "-h, --help" "$(gettext "print this message and exit")"
+    print_option_help "-V, --version" "$(gettext "print the version information and exit")"
+    dirmsg="$(gettext_printf "expect GRUB images under the directory DIR/%s instead of the %s directory" "grub" "$grubdir")"
+    print_option_help "--boot-directory=$(gettext "DIR")" "$dirmsg"
+    echo
+    gettext "MENU_ENTRY is a number, a menu item title or a menu item identifier. Please note that menu items in
+submenus or sub-submenus require specifying the submenu components and then the
+menu item component. The titles should be separated using the greater-than
+character (>) with no extra spaces. Depending on your shell some characters including > may need escaping. More information about this is available
+in the GRUB Manual in the section about the 'default' command. "; echo
+    echo
+    gettext "NOTE: In cases where GRUB cannot write to the environment block, such as when it is stored on an MDRAID or LVM device, the chosen boot menu entry will remain the default even after reboot. "; echo
+    echo
+    gettext "Report bugs to <bug-grub@gnu.org>."; echo
+}
+
+argument () {
+  opt=$1
+  shift
+
+  if test $# -eq 0; then
+      gettext_printf "%s: option requires an argument -- \`%s'\n" "$self" "$opt" 1>&2
+      exit 1
+  fi
+  echo $1
+}
+
+# Check the arguments.
+while test $# -gt 0
+do
+    option=$1
+    shift
+
+    case "$option" in
+    -h | --help)
+	usage
+	exit 0 ;;
+    -V | --version)
+	echo "$self (${PACKAGE_NAME}) ${PACKAGE_VERSION}"
+	exit 0 ;;
+
+# Accept for compatibility
+    --root-directory)
+	rootdir=`argument $option "$@"`; shift ;;
+    --root-directory=*)
+	rootdir=`echo "$option" | sed 's/--root-directory=//'` ;;
+
+    --boot-directory)
+    bootdir=`argument $option "$@"`; shift;;
+    --boot-directory=*)
+    bootdir=`echo "$option" | sed 's/--boot-directory=//'` ;;
+
+    -*)
+	gettext_printf "Unrecognized option \`%s'\n" "$option" 1>&2
+	usage
+	exit 1
+	;;
+    *)
+	if test "x$entry" != x; then
+	    gettext "More than one menu entry?" 1>&2
+	    echo >&2
+	    usage
+	    exit 1
+	fi
+	entry="${option}" ;;
+    esac
+done
+
+if test "x$entry" = x; then
+    gettext "Menu entry not specified." 1>&2
+    echo >&2
+    usage
+    exit 1
+fi
+
+if [ -z "$bootdir" ]; then
+    # Default bootdir if bootdir not initialized.
+    bootdir=/boot
+
+    if [ -n "$rootdir" ] ; then
+        # Initialize bootdir if rootdir was initialized.
+        bootdir=${rootdir}/boot
+    fi
+fi
+
+grubdir=`echo "${bootdir}/grub" | sed 's,//*,/,g'`
+
+abstractions=`$grub_probe --target=abstraction ${grubdir}/grubenv`
+for abstraction in $abstractions; do
+    case "$abstraction" in
+	diskfilter | lvm)
+	    gettext_printf "\nWARNING: Detected GRUB environment block on $abstraction device\n"
+	    gettext_printf "%s will remain the default boot entry until manually cleared with:\n" "${entry}"
+	    gettext_printf "    grub-editenv ${grubdir}/grubenv unset next_entry\n\n"
+	    break
+	    ;;
+    esac
+done
+
+# Restore saved_entry if it was set by previous version
+prev_saved_entry=`$grub_editenv ${grubdir}/grubenv list | sed -n 's/^prev_saved_entry=//p'`
+if [ "$prev_saved_entry" ]; then
+    $grub_editenv ${grubdir}/grubenv set saved_entry="$prev_saved_entry"
+    $grub_editenv ${grubdir}/grubenv unset prev_saved_entry
+fi
+
+$grub_editenv ${grubdir}/grubenv set next_entry="$entry"
+
+# Bye.
+exit 0

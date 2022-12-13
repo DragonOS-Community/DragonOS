@@ -1,0 +1,77 @@
+#!/bin/sh
+
+prefix="/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub"
+exec_prefix="/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub"
+bindir="${exec_prefix}/bin"
+datarootdir="/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub/share"
+datadir="${datarootdir}"
+if [ "x$pkgdatadir" = x ]; then
+    pkgdatadir="${datadir}/grub"
+fi
+
+grub_mklayout="${bindir}/grub-mklayout"
+
+ckbcomp_options=""
+
+export TEXTDOMAIN=grub
+export TEXTDOMAINDIR="${datarootdir}/locale"
+
+. "${pkgdatadir}/grub-mkconfig_lib"
+
+self=`basename $0`
+
+usage () {
+    gettext_printf "Usage: %s -o OUTPUT CKBMAP_ARGUMENTS...\n" "$self"
+    gettext "Make GRUB keyboard layout file."; echo
+    echo
+    print_option_help "-h, --help" "$(gettext "print this message and exit")"
+    print_option_help "-V, --version" "$(gettext "print the version information and exit")"
+    print_option_help "-o, --output=$(gettext FILE)" "$(gettext "save output in FILE [required]")"
+    echo
+    gettext_printf "%s generates a keyboard layout for GRUB using ckbcomp\n" "$self"
+    echo
+    gettext "Report bugs to <bug-grub@gnu.org>."; echo
+}
+
+argument () {
+  opt=$1
+  shift
+
+  if test $# -eq 0; then
+      gettext_printf "%s: option requires an argument -- \`%s'\n" "$0" "$opt" 1>&2
+      exit 1
+  fi
+  echo $1
+}
+
+output=
+
+while test $# -gt 0
+do
+    option=$1
+    shift
+    case "$option" in
+    -h | --help)
+	usage
+	exit 0 ;;
+    -V | --version)
+	echo "$self (${PACKAGE_NAME}) ${PACKAGE_VERSION}"
+	exit 0 ;;
+    -o | --output)
+	output=`argument $option "$@"`; shift ;;
+    --output=*)
+	output=`echo "$option" | sed 's/--output=//'` ;;
+    *)
+	ckbcomp_options="$ckbcomp_options $option";;
+    esac
+done
+
+if [ "x${output}" = x ] ; then
+  gettext "output file must be specified" >&2
+  echo >&2
+  usage
+  exit 1
+fi
+
+ckbcomp $ckbcomp_options | "$grub_mklayout" -o "${output}"
+

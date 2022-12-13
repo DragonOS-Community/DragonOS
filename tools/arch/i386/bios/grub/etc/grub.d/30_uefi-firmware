@@ -1,0 +1,44 @@
+#! /bin/sh
+set -e
+
+# grub-mkconfig helper script.
+# Copyright (C) 2020  Free Software Foundation, Inc.
+#
+# GRUB is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# GRUB is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
+
+prefix="/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub"
+exec_prefix="/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub"
+datarootdir="/home/yujianwu/github/DragonOS/tools/arch/i386/bios/grub/share"
+
+export TEXTDOMAIN=grub
+export TEXTDOMAINDIR="${datarootdir}/locale"
+
+. "$pkgdatadir/grub-mkconfig_lib"
+
+EFI_VARS_DIR=/sys/firmware/efi/efivars
+EFI_GLOBAL_VARIABLE=8be4df61-93ca-11d2-aa0d-00e098032b8c
+OS_INDICATIONS="$EFI_VARS_DIR/OsIndicationsSupported-$EFI_GLOBAL_VARIABLE"
+
+if [ -e "$OS_INDICATIONS" ] && \
+   [ "$(( $(printf 0x%x \'"$(cat $OS_INDICATIONS | cut -b5)"\') & 1 ))" = 1 ]; then
+  LABEL="UEFI Firmware Settings"
+
+  gettext_printf "Adding boot menu entry for UEFI Firmware Settings ...\n" >&2
+
+  cat << EOF
+menuentry '$LABEL' \$menuentry_id_option 'uefi-firmware' {
+	fwsetup
+}
+EOF
+fi

@@ -4,8 +4,8 @@ ARGS=`getopt -o p -l bios: -- "$@"`
 eval set -- "${ARGS}"
 echo "$@"
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
-#ARCH="X86_64"
-ARCH="i386"
+ARCH="x86_64"
+#ARCH="i386"
 # 请根据自己的需要，在-d 后方加入所需的trace事件
 
 # 标准的trace events
@@ -41,10 +41,10 @@ if [ $flag_can_run -eq 1 ]; then
         --bios) 
       case "$2" in
               uefi) #uefi启动新增ovmf.fd固件
-              if [ ${ARCH} == X86_64 ] ;then
-              ${QEMU} -bios arch/X86_64/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+              if [ ${ARCH} == x86_64 ] ;then
+              ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
               elif [ ${ARCH} == i386 ] ;then
-              ${QEMU} -bios arch/i386/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+              ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
               fi
             ;;
               legacy)

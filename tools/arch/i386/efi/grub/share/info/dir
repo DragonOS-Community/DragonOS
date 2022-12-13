@@ -1,0 +1,32 @@
+This is the file .../info/dir, which contains the
+topmost node of the Info hierarchy, called (dir)Top.
+The first time you invoke Info you start off looking at this node.
+
+File: dir,	Node: Top	This is the top of the INFO tree
+
+  This (the Directory node) gives a menu of major topics.
+  Typing "q" exits, "H" lists all Info commands, "d" returns here,
+  "h" gives a primer for first-timers,
+  "mEmacs<Return>" visits the Emacs manual, etc.
+
+  In Emacs, you can click mouse button 2 on a menu item or cross reference
+  to select it.
+
+* Menu:
+
+Kernel
+* grub-dev: (grub-dev).         The GRand Unified Bootloader Dev
+* grub-install: (grub)Invoking grub-install.
+                                Install GRUB on your drive
+* grub-mkconfig: (grub)Invoking grub-mkconfig.
+                                Generate GRUB configuration
+* grub-mkpasswd-pbkdf2: (grub)Invoking grub-mkpasswd-pbkdf2.
+* grub-mkrelpath: (grub)Invoking grub-mkrelpath.
+* grub-mkrescue: (grub)Invoking grub-mkrescue.
+                                Make a GRUB rescue image
+* grub-mount: (grub)Invoking grub-mount.
+                                Mount a file system using GRUB
+* grub-probe: (grub)Invoking grub-probe.
+                                Probe device information
+* grub-script-check: (grub)Invoking grub-script-check.
+* GRUB: (grub).                 The GRand Unified Bootloader

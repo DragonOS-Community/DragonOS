@@ -1,0 +1,495 @@
+#
+# Bash completion for grub
+#
+# Copyright (C) 2010  Free Software Foundation, Inc.
+#
+# GRUB is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# GRUB is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
+# bash completion for grub
+
+__grub_dir() {
+    local i c=1 boot_dir
+
+    for (( c=1; c <= ${#COMP_WORDS[@]}; c++ )); do
+        i="${COMP_WORDS[c]}"
+        case "$i" in
+            --boot-directory)
+                c=$((++c))
+                i="${COMP_WORDS[c]}"
+                boot_dir="${i##*=}";
+                break
+                ;;
+        esac
+    done
+    boot_dir=${boot_dir-/boot}
+    echo "${boot_dir%/}/grub"
+}
+
+
+# This function generates completion reply with compgen
+# - arg: accepts 1, 2, 3, or 4 arguments
+#        $1 wordlist separate by space, tab or newline
+#        $2 (optional) prefix to add
+#        $3 (optional) current word to complete
+#        $4 (optional) suffix to add
+__grubcomp () {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    if [ $# -gt 2 ]; then
+        cur="$3"
+    fi
+    case "$cur" in
+    --*=)
+        COMPREPLY=()
+        ;;
+    *)
+        local IFS=' '$'\t'$'\n'
+        COMPREPLY=($(compgen -P "${2-}" -W "${1-}" -S "${4-}" -- "$cur"))
+        ;;
+    esac
+}
+
+# Function that return long options from the help of the command
+# - arg: $1 (optional) command to get the long options from
+__grub_get_options_from_help () {
+     local prog
+
+     if [ $# -ge 1 ]; then
+         prog="$1"
+     else
+         prog="${COMP_WORDS[0]}"
+     fi
+
+     local i IFS=" "$'\t'$'\n'
+     for i in $(LC_ALL=C $prog --help)
+     do
+        case $i in
+             --*) echo "${i%=*}";;
+         esac
+     done
+}
+
+# Function that return long options from the usage of the command
+# - arg: $1 (optional) command to get the long options from
+__grub_get_options_from_usage () {
+     local prog
+
+     if [ $# -ge 1 ]; then
+         prog="$1"
+     else
+         prog="${COMP_WORDS[0]}"
+     fi
+
+     local i IFS=" "$'\t'$'\n'
+     for i in $(LC_ALL=C $prog --usage)
+     do
+        case $i in
+            \[--*\]) i=${i#[}           # Remove leading [
+                     echo ${i%%?(=*)]}  # Remove optional value and trailing ]
+                     ;;
+         esac
+     done
+}
+
+__grub_get_last_option () {
+    local i
+    for (( i=$COMP_CWORD-1; i > 0; i-- )); do
+        if [[ "${COMP_WORDS[i]}" == -* ]]; then
+            echo "${COMP_WORDS[i]}"
+            break;
+        fi
+    done
+}
+
+__grub_list_menuentries () {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local config_file=$(__grub_dir)/grub.cfg
+
+    if [ -f "$config_file" ];then
+        local IFS=$'\n'
+        COMPREPLY=( $(compgen \
+            -W "$( awk -F "[\"']" '/menuentry/ { print $2 }' $config_file )" \
+            -- "$cur" )) #'# Help emacs syntax highlighting
+    fi
+}
+
+__grub_list_modules () {
+    local grub_dir=$(__grub_dir)
+    local IFS=$'\n'
+    COMPREPLY=( $( compgen -f -X '!*/*.mod' -- "${grub_dir}/$cur" | {
+         while read -r tmp; do
+             [ -n $tmp ] && {
+                 tmp=${tmp##*/}
+                 printf '%s\n' ${tmp%.mod}
+             }
+         done
+         }
+        ))
+}
+
+#
+# grub-set-default & grub-reboot
+#
+_grub_set_entry () {
+    local cur prev split=false
+
+    COMPREPLY=()
+    cur=`_get_cword`
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+
+    _split_longopt && split=true
+
+    case "$prev" in
+        --boot-directory)
+            _filedir -d
+            return
+            ;;
+    esac
+
+    $split && return 0
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        # Default complete with a menuentry
+        __grub_list_menuentries
+    fi
+}
+
+__grub_set_default_program="grub-set-default"
+have ${__grub_set_default_program} && \
+    complete -F _grub_set_entry -o filenames ${__grub_set_default_program}
+unset __grub_set_default_program
+
+__grub_reboot_program="grub-reboot"
+have ${__grub_reboot_program} && \
+ complete -F _grub_set_entry -o filenames ${__grub_reboot_program}
+unset __grub_reboot_program
+
+
+#
+# grub-editenv
+#
+_grub_editenv () {
+    local cur prev
+
+    COMPREPLY=()
+    cur=`_get_cword`
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+
+    case "$prev" in
+        create|list|set|unset)
+            COMPREPLY=( "" )
+            return
+            ;;
+    esac
+
+    __grubcomp "$(__grub_get_options_from_help)
+                create list set unset"
+}
+
+__grub_editenv_program="grub-editenv"
+have ${__grub_editenv_program} && \
+ complete -F _grub_editenv -o filenames ${__grub_editenv_program}
+unset __grub_editenv_program
+
+
+#
+# grub-mkconfig
+#
+_grub_mkconfig () {
+    local cur prev
+
+    COMPREPLY=()
+    cur=`_get_cword`
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        _filedir
+    fi
+}
+__grub_mkconfig_program="grub-mkconfig"
+have ${__grub_mkconfig_program} && \
+ complete -F _grub_mkconfig -o filenames ${__grub_mkconfig_program}
+unset __grub_mkconfig_program
+
+
+#
+# grub-setup
+#
+_grub_setup () {
+    local cur prev split=false
+
+    COMPREPLY=()
+    cur=`_get_cword`
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+
+    _split_longopt && split=true
+
+    case "$prev" in
+        -d|--directory)
+            _filedir -d
+            return
+            ;;
+    esac
+
+    $split && return 0
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        # Default complete with a filename
+        _filedir
+    fi
+}
+
+__grub_bios_setup_program="grub-bios-setup"
+have ${__grub_bios_setup_program} && \
+ complete -F _grub_setup -o filenames ${__grub_bios_setup_program}
+unset __grub_bios_setup_program
+
+__grub_sparc64_setup_program="grub-sparc64-setup"
+have ${__grub_sparc64_setup_program} && \
+ complete -F _grub_setup -o filenames ${__grub_sparc64_setup_program}
+unset __grub_sparc64_setup_program
+
+
+#
+# grub-install
+#
+_grub_install () {
+    local cur prev last split=false
+
+    COMPREPLY=()
+    cur=`_get_cword`
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+    last=$(__grub_get_last_option)
+
+    _split_longopt && split=true
+
+    case "$prev" in
+        --boot-directory)
+            _filedir -d
+            return
+            ;;
+        --disk-module)
+            __grubcomp "biosdisk ata"
+            return
+            ;;
+    esac
+
+    $split && return 0
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        case "$last" in
+            --modules)
+                __grub_list_modules
+                return
+                ;;
+        esac
+
+        # Default complete with a filename
+        _filedir
+    fi
+}
+__grub_install_program="grub-install"
+have ${__grub_install_program} && \
+ complete -F _grub_install -o filenames ${__grub_install_program}
+unset __grub_install_program
+
+
+#
+# grub-mkfont
+#
+_grub_mkfont () {
+    local cur
+
+    COMPREPLY=()
+    cur=`_get_cword`
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        # Default complete with a filename
+        _filedir
+    fi
+}
+__grub_mkfont_program="grub-mkfont"
+have ${__grub_mkfont_program} && \
+ complete -F _grub_mkfont -o filenames ${__grub_mkfont_program}
+unset __grub_mkfont_program
+
+
+#
+# grub-mkrescue
+#
+_grub_mkrescue () {
+    local cur prev last
+
+    COMPREPLY=()
+    cur=`_get_cword`
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+    last=$(__grub_get_last_option)
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        case "$last" in
+            --modules)
+                __grub_list_modules
+                return
+                ;;
+        esac
+
+        # Default complete with a filename
+        _filedir
+    fi
+}
+__grub_mkrescue_program="grub-mkrescue"
+have ${__grub_mkrescue_program} && \
+ complete -F _grub_mkrescue -o filenames ${__grub_mkrescue_program}
+unset __grub_mkrescue_program
+
+
+#
+# grub-mkimage
+#
+_grub_mkimage () {
+    local cur prev split=false
+
+    COMPREPLY=()
+    cur=`_get_cword`
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+
+    _split_longopt && split=true
+
+    case "$prev" in
+        -d|--directory|-p|--prefix)
+            _filedir -d
+            return
+            ;;
+        -O|--format)
+            # Get available format from help
+            local prog=${COMP_WORDS[0]}
+            __grubcomp "$(LC_ALL=C $prog --help | \
+                        awk -F ":" '/available formats/ { print $2 }' | \
+                        sed 's/, / /g')"
+            return
+            ;;
+    esac
+
+    $split && return 0
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        # Default complete with a filename
+        _filedir
+    fi
+}
+__grub_mkimage_program="grub-mkimage"
+have ${__grub_mkimage_program} && \
+ complete -F _grub_mkimage -o filenames ${__grub_mkimage_program}
+unset __grub_mkimage_program
+
+
+#
+# grub-mkpasswd-pbkdf2
+#
+_grub_mkpasswd_pbkdf2 () {
+    local cur
+
+    COMPREPLY=()
+    cur=`_get_cword`
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        # Default complete with a filename
+        _filedir
+    fi
+}
+__grub_mkpasswd_pbkdf2_program="grub-mkpasswd-pbkdf2"
+have ${__grub_mkpasswd_pbkdf2_program} && \
+ complete -F _grub_mkpasswd_pbkdf2 -o filenames ${__grub_mkpasswd_pbkdf2_program}
+unset __grub_mkpasswd_pbkdf2_program
+
+
+#
+# grub-probe
+#
+_grub_probe () {
+    local cur prev split=false
+
+    COMPREPLY=()
+    cur=`_get_cword`
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+
+    _split_longopt && split=true
+
+    case "$prev" in
+        -t|--target)
+            # Get target type from help
+            local prog=${COMP_WORDS[0]}
+            __grubcomp "$(LC_ALL=C $prog --help | \
+                        awk -F "[()]" '/--target=/ { print $2 }' | \
+                        sed 's/|/ /g')"
+            return
+            ;;
+    esac
+
+    $split && return 0
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        # Default complete with a filename
+        _filedir
+    fi
+}
+__grub_probe_program="grub-probe"
+have ${__grub_probe_program} && \
+ complete -F _grub_probe -o filenames ${__grub_probe_program}
+unset __grub_probe_program
+
+
+#
+# grub-script-check
+#
+_grub_script_check () {
+    local cur
+
+    COMPREPLY=()
+    cur=`_get_cword`
+
+    if [[ "$cur" == -* ]]; then
+        __grubcomp "$(__grub_get_options_from_help)"
+    else
+        # Default complete with a filename
+        _filedir
+    fi
+}
+__grub_script_check_program="grub-script-check"
+have ${__grub_script_check_program} && \
+ complete -F _grub_script_check -o filenames ${__grub_script_check_program}
+
+
+# Local variables:
+# mode: shell-script
+# sh-basic-offset: 4
+# sh-indent-comment: t
+# indent-tabs-mode: nil
+# End:
+# ex: ts=4 sw=4 et filetype=sh

@@ -1,0 +1,279 @@
+This is grub.info, produced by makeinfo version 6.3 from grub.texi.
+
+This manual is for GNU GRUB (version 2.06, 10 May 2021).
+
+   Copyright (C)
+1999,2000,2001,2002,2004,2006,2008,2009,2010,2011,2012,2013 Free
+Software Foundation, Inc.
+
+     Permission is granted to copy, distribute and/or modify this
+     document under the terms of the GNU Free Documentation License,
+     Version 1.2 or any later version published by the Free Software
+     Foundation; with no Invariant Sections.
+INFO-DIR-SECTION Kernel
+START-INFO-DIR-ENTRY
+* GRUB: (grub).                 The GRand Unified Bootloader
+* grub-install: (grub)Invoking grub-install.    Install GRUB on your drive
+* grub-mkconfig: (grub)Invoking grub-mkconfig.  Generate GRUB configuration
+* grub-mkpasswd-pbkdf2: (grub)Invoking grub-mkpasswd-pbkdf2.
+* grub-mkrelpath: (grub)Invoking grub-mkrelpath.
+* grub-mkrescue: (grub)Invoking grub-mkrescue.  Make a GRUB rescue image
+* grub-mount: (grub)Invoking grub-mount.        Mount a file system using GRUB
+* grub-probe: (grub)Invoking grub-probe.        Probe device information
+* grub-script-check: (grub)Invoking grub-script-check.
+END-INFO-DIR-ENTRY
+
+
+Indirect:
+grub.info-1: 1152
+grub.info-2: 311540
+
+Tag Table:
+(Indirect)
+Node: Top1152
+Node: Introduction4200
+Node: Overview4644
+Node: Overview-Footnotes6634
+Ref: Overview-Footnote-16695
+Node: History6857
+Node: Changes from GRUB Legacy8947
+Node: Features11423
+Node: Features-Footnotes17850
+Ref: Features-Footnote-117911
+Ref: Features-Footnote-218007
+Ref: Features-Footnote-318154
+Node: Role of a boot loader18299
+Node: Role of a boot loader-Footnotes19638
+Ref: Role of a boot loader-Footnote-119725
+Node: Naming convention19804
+Node: OS-specific notes about grub tools22715
+Node: Installation23751
+Node: Installing GRUB using grub-install24873
+Node: Making a GRUB bootable CD-ROM27188
+Node: Making a GRUB bootable CD-ROM-Footnotes29047
+Ref: Making a GRUB bootable CD-ROM-Footnote-129150
+Node: Device map29225
+Node: BIOS installation31192
+Node: Booting35643
+Node: General boot methods36178
+Node: Loading an operating system directly36921
+Node: Chain-loading37652
+Node: Loopback booting38623
+Node: LVM cache booting40297
+Node: OS-specific notes41563
+Node: GNU/Hurd41853
+Node: GNU/Linux42976
+Node: NetBSD44294
+Node: DOS/Windows45768
+Node: Configuration47546
+Node: Simple configuration48258
+Node: Root Identifcation Heuristics64564
+Node: Shell-like scripting67578
+Node: Shell-like scripting-Footnotes75641
+Ref: Shell-like scripting-Footnote-175726
+Node: Multi-boot manual config75853
+Node: Embedded configuration79462
+Node: Theme file format82298
+Ref: Pixmap-styled progress bar83757
+Ref: Plain progress bar, drawn with solid color.83769
+Ref: An example of the slices (in red) used for a terminal window. This drawing was created and sliced in Inkscape_, as the next section explains.87261
+Node: Network107673
+Node: Serial terminal111987
+Node: Vendor power-on keys114224
+Node: Images116159
+Node: Core image size limitation121134
+Node: Filesystem123698
+Node: Device syntax124407
+Node: File name syntax127108
+Node: Block list syntax128154
+Node: Interface128888
+Node: Command-line interface129712
+Node: Command-line interface-Footnotes131656
+Ref: Command-line interface-Footnote-1131745
+Node: Menu interface131840
+Node: Menu entry editor132852
+Node: Environment133590
+Node: Special environment variables134293
+Node: biosnum135347
+Node: check_signatures135871
+Node: chosen136158
+Node: cmdpath136601
+Node: color_highlight137028
+Node: color_normal137440
+Node: config_directory139103
+Node: config_file139397
+Node: debug139790
+Node: default140229
+Node: fallback141657
+Node: gfxmode141990
+Node: gfxpayload142788
+Node: gfxterm_font143942
+Node: grub_cpu144242
+Node: grub_platform144530
+Node: icondir144822
+Node: lang145139
+Node: locale_dir145608
+Node: menu_color_highlight146117
+Node: menu_color_normal146613
+Node: net_<INTERFACE>_boot_file147114
+Node: net_<INTERFACE>_dhcp_server_name147357
+Node: net_<INTERFACE>_domain147619
+Node: net_<INTERFACE>_extensionspath147866
+Node: net_<INTERFACE>_hostname148121
+Node: net_<INTERFACE>_ip148360
+Node: net_<INTERFACE>_mac148576
+Node: net_<INTERFACE>_next_server148797
+Node: net_<INTERFACE>_rootpath149040
+Node: net_default_interface149279
+Node: net_default_ip149499
+Node: net_default_mac149696
+Node: net_default_server149892
+Node: pager150085
+Node: prefix150341
+Node: pxe_blksize150790
+Node: pxe_default_gateway150967
+Node: pxe_default_server151172
+Node: root151368
+Node: superusers151909
+Node: theme152157
+Node: timeout152478
+Node: timeout_style153115
+Node: Environment block153500
+Node: Commands154932
+Node: Menu-specific commands155802
+Node: menuentry156530
+Node: submenu158081
+Node: General commands158630
+Node: serial159126
+Node: terminal_input160177
+Node: terminal_output160843
+Node: terminfo161510
+Node: Command-line and menu entry commands162741
+Node: [168063
+Node: acpi168249
+Node: authenticate169562
+Node: background_color169989
+Node: background_image170662
+Node: badram171212
+Node: blocklist172597
+Node: boot172831
+Node: cat173153
+Node: chainloader173789
+Node: clear174417
+Node: cmosclean174603
+Node: cmosdump174907
+Node: cmostest175202
+Node: cmp175560
+Node: configfile176111
+Node: cpuid176536
+Node: crc177107
+Node: cryptomount177381
+Node: cutmem178375
+Node: date179254
+Node: devicetree179798
+Node: distrust180340
+Node: drivemap181121
+Node: echo181928
+Node: eval182871
+Node: export183154
+Node: false183465
+Node: gettext183761
+Node: gptsync184208
+Node: halt185153
+Node: hashsum185484
+Node: help186710
+Node: initrd187177
+Node: initrd16187612
+Node: insmod188146
+Node: keystatus188368
+Node: linux189007
+Node: linux16189910
+Node: list_env190624
+Node: list_trusted190990
+Node: load_env191573
+Node: loadfont193246
+Node: loopback193617
+Node: ls194065
+Node: lsfonts194607
+Node: lsmod194789
+Node: md5sum194979
+Node: module195258
+Node: multiboot195570
+Node: nativedisk196679
+Node: normal197078
+Node: normal_exit197845
+Node: parttool198167
+Node: password199673
+Node: password_pbkdf2199955
+Node: play200363
+Node: probe201111
+Node: rdmsr201613
+Node: read202396
+Node: reboot202740
+Node: regexp202923
+Node: rmmod203460
+Node: save_env203653
+Node: search204675
+Node: sendkey205453
+Node: set211879
+Node: sha1sum212181
+Node: sha256sum212466
+Node: sha512sum212765
+Node: sleep213062
+Node: smbios213586
+Node: source216629
+Node: test217182
+Node: true219951
+Node: trust220237
+Node: unset221029
+Node: verify_detached221243
+Node: videoinfo222288
+Node: wrmsr222566
+Node: xen_hypervisor223380
+Node: xen_module223841
+Node: Networking commands224365
+Node: net_add_addr225387
+Node: net_add_dns225907
+Node: net_add_route226183
+Node: net_bootp226713
+Node: net_del_addr227078
+Node: net_del_dns227318
+Node: net_del_route227565
+Node: net_dhcp227799
+Node: net_get_dhcp_option229778
+Node: net_ipv6_autoconf230259
+Node: net_ls_addr230680
+Node: net_ls_cards230928
+Node: net_ls_dns231164
+Node: net_ls_routes231395
+Node: net_nslookup231602
+Node: Internationalisation231886
+Node: Security238718
+Node: Authentication and authorisation239294
+Node: Using digital signatures242410
+Node: UEFI secure boot and shim245680
+Node: Secure Boot Advanced Targeting246827
+Node: Measured Boot247858
+Node: Lockdown249823
+Node: Platform limitations250316
+Node: Platform-specific operations258325
+Node: Supported kernels259390
+Node: Troubleshooting267027
+Node: GRUB only offers a rescue shell267297
+Node: Firmware stalls instead of booting GRUB270306
+Node: Invoking grub-install270937
+Node: Invoking grub-mkconfig273107
+Node: Invoking grub-mkpasswd-pbkdf2273744
+Node: Invoking grub-mkrelpath274403
+Node: Invoking grub-mkrescue275176
+Node: Invoking grub-mount276925
+Node: Invoking grub-probe279974
+Node: Invoking grub-script-check282568
+Node: Obtaining and Building GRUB283312
+Node: Reporting bugs284555
+Node: Future287371
+Node: Copying This Manual287771
+Node: GNU Free Documentation License287999
+Node: Index311540
+
+End Tag Table

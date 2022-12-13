@@ -23,7 +23,7 @@ mod process;
 mod sched;
 mod smp;
 mod driver;
-
+mod time;
 
 extern crate alloc;
 

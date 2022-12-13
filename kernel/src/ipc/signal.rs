@@ -667,6 +667,9 @@ fn setup_frame(
     regs.rsi = unsafe { &(*frame).info as *const siginfo as u64 };
     regs.rsp = frame as u64;
     regs.rip = unsafe { ka._u._sa_handler };
+    
+    // 传入信号处理函数的第一个参数
+    regs.rdi = sig as u64;
 
     // 如果handler位于内核空间
     if regs.rip >= USER_MAX_LINEAR_ADDR {

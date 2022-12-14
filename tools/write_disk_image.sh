@@ -22,13 +22,13 @@ echo "开始写入磁盘镜像..."
 
 
 # toolchain
-OS=`uname -s`
-if [ "${OS}" == "Linux" ]; then
-    GRUB_PATH="$(dirname $(which grub-file))"
-elif [ "${OS}" == "Darwin" ]; then
-    GRUB_PATH="${root_folder}/tools/grub-2.06/build/grub/bin"
-fi
-export PATH="${GRUB_PATH}:$PATH"
+
+GRUB_PATH_I386_LEGACY_INSTALL=${root_folder}/tools/arch/i386/legacy/grub/sbin/grub-install
+GRUB_PATH_I386_EFI_INSTALL=${root_folder}/tools/arch/i386/efi/grub/sbin/grub-install
+GRUB_PATH_X86_64_EFI_INSTALL=${root_folder}/tools/arch/x86_64/efi/grub/sbin/grub-install
+
+GRUB_PATH_I386_LEGACY_FILE=${root_folder}/tools/arch/i386/legacy/grub/bin/grub-file
+
 
 # ==============检查文件是否齐全================
 
@@ -45,7 +45,7 @@ done
 
 # 如果是 i386/x86_64，需要判断是否符合 multiboot2 标准
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    if ${GRUB_PATH}/grub-file --is-x86-multiboot2 ${kernel}; then
+    if ${GRUB_PATH_I386_LEGACY_FILE} --is-x86-multiboot2 ${kernel}; then
         echo Multiboot2 Confirmed!
     else
         echo NOT Multiboot2!
@@ -108,13 +108,13 @@ case "$1" in
         case "$2" in
                 uefi) #uefi
                 if [ ${ARCH} == "i386" ];then
-                	./arch/i386/efi/grub/sbin/grub-install --target=i386-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
+                	${GRUB_PATH_I386_EFI_INSTALL} --target=i386-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
                 elif [ ${ARCH} == "x86_64" ];then
-                	./arch/x86_64/efi/grub/sbin/grub-install --target=x86_64-efi --efi-directory=${mount_folder}  --boot-directory=${boot_folder}   --removable
+                	${GRUB_PATH_X86_64_EFI_INSTALL} --target=x86_64-efi --efi-directory=${mount_folder}  --boot-directory=${boot_folder}   --removable
                 fi
             ;;
                 legacy) #传统bios
-            		./arch/i386/bios/grub/sbin/grub-install --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+            		${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
             ;;
         esac
         ;;

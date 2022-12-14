@@ -1,8 +1,7 @@
-use crate::{
-    include::bindings::bindings::{rtc_get_cmos_time, rtc_time_t},
-    println,
-};
+#![allow(dead_code)]
+use crate::include::bindings::bindings::{rtc_get_cmos_time, rtc_time_t};
 
+#[allow(non_camel_case_types)]
 pub type ktime_t = i64;
 
 // @brief 将ktime_t类型转换为纳秒类型
@@ -11,7 +10,9 @@ fn ktime_to_ns(kt: ktime_t) -> i64 {
     return kt as i64;
 }
 
-// @brief 通过rtc时钟得到墙上时间到1970年1月1日8:00am的时间差
+/// @brief 从RTC获取当前时间，然后计算时间戳。
+/// 时间戳为从UTC+0 1970-01-01 00:00到当前UTC+0时间，所经过的纳秒数。
+/// 注意，由于当前未引入时区，因此本函数默认时区为UTC+8来计算
 fn ktime_get_real() -> ktime_t {
     let mut rtc_time: rtc_time_t = rtc_time_t {
         second: (0),
@@ -26,15 +27,7 @@ fn ktime_get_real() -> ktime_t {
         //调用rtc.h里面的函数
         rtc_get_cmos_time(&mut rtc_time);
     }
-    println!(
-        "{year}-{month}-{day}-{hour}-{minute}-{second}\n",
-        year = rtc_time.year,
-        month = rtc_time.month,
-        day = rtc_time.day,
-        hour = rtc_time.hour,
-        minute = rtc_time.minute,
-        second = rtc_time.second
-    );
+
     let mut day_count: i32 = 0;
     for year in 1970..rtc_time.year {
         let leap: bool = (year % 4 == 0) && (year % 100 != 0) || (year % 400 == 0);

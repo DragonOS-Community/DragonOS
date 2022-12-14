@@ -78,5 +78,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
+    kdebug!("ktime_get_real_ns={:?}", ktime_get_real_ns());
     return 0;
 }

@@ -1,6 +1,3 @@
-/// author: Zhi Zu Chang Le
-/// date:   2022/12/13
-#[allow(non_camel_case_types)]
 use crate::{
     include::bindings::bindings::{rtc_get_cmos_time, rtc_time_t},
     println,
@@ -9,9 +6,11 @@ use crate::{
 pub type ktime_t = i64;
 
 // @brief 将ktime_t类型转换为纳秒类型
+#[inline]
 fn ktime_to_ns(kt: ktime_t) -> i64 {
     return kt as i64;
 }
+
 // @brief 通过rtc时钟得到墙上时间到1970年1月1日8:00am的时间差
 fn ktime_get_real() -> ktime_t {
     let mut rtc_time: rtc_time_t = rtc_time_t {
@@ -69,6 +68,7 @@ fn ktime_get_real() -> ktime_t {
 }
 
 /// @brief 暴露给外部使用的接口，返回一个时间戳
+#[inline]
 pub fn ktime_get_real_ns() -> i64 {
     let kt: ktime_t = ktime_get_real();
     return ktime_to_ns(kt);

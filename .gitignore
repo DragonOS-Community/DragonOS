@@ -1,9 +1,9 @@
 /cmake-build-debug/
 /bin/
-!.gitkeep
 tools/arch/i386/bios/grub/*
 tools/arch/i386/efi/grub/*
 tools/arch/x86_64/efi/grub/*
+!.gitkeep
 DragonOS.iso
 .idea/
 kernel/kernel

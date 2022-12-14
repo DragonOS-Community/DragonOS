@@ -5,9 +5,11 @@
 # 用法：bash write_disk_image.sh --bios legacy/uefi
 # 如果之前创建的disk.img是MBR分区表，那么请这样运行它：bash write_disk_image.sh --bios legacy
 # 如果之前创建的disk.img是GPT分区表，那么请这样运行它：bash write_disk_image.sh --bios uefi
+# 通过设置ARCH为x86_64或i386，进行64/32位uefi的install，但是请记住该处的ARCH应与run-qemu.sh中的一致
 ###############################################
 
 ARCH="x86_64"
+#ARCH="i386"
 # 内核映像
 root_folder=$(dirname $(pwd))
 kernel="${root_folder}/bin/kernel/kernel.elf"
@@ -90,9 +92,11 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     touch ${root_folder}/bin/disk_mount/boot/grub/grub.cfg
 cfg_content='set timeout=15
     set default=0
+    insmod efi_gop
     menuentry "DragonOS" {
     multiboot2 /boot/kernel.elf "KERNEL_ELF"
 }'
+# 增加insmod efi_gop防止32位uefi启动报错
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
 fi
 
@@ -103,10 +107,14 @@ case "$1" in
     --bios) 
         case "$2" in
                 uefi) #uefi
-            grub-install --target=x86_64-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
+                if [ ${ARCH} == "i386" ];then
+                	./arch/i386/efi/grub/sbin/grub-install --target=i386-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
+                elif [ ${ARCH} == "x86_64" ];then
+                	./arch/x86_64/efi/grub/sbin/grub-install --target=x86_64-efi --efi-directory=${mount_folder}  --boot-directory=${boot_folder}   --removable
+                fi
             ;;
                 legacy) #传统bios
-            grub-install --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+            		./arch/i386/bios/grub/sbin/grub-install --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
             ;;
         esac
         ;;

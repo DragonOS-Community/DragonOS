@@ -20,11 +20,11 @@ use crate::libs::refcount::RefCount;
 /// 请注意，sigset_t这个bitmap, 第0位表示sig=1的信号。也就是说，SignalNumber-1才是sigset_t中对应的位
 pub type sigset_t = u64;
 /// 存储信号处理函数的地址(来自用户态)
-pub type __signalfn_t = u64;    
+pub type __signalfn_t = u64;
 pub type __sighandler_t = __signalfn_t;
 /// 存储信号处理恢复函数的地址(来自用户态)
 pub type __sigrestorer_fn_t = u64;
-pub type __sigrestorer_t= __sigrestorer_fn_t;
+pub type __sigrestorer_t = __sigrestorer_fn_t;
 
 /// 最大的信号数量（改动这个值的时候请同步到signal.h)
 pub const MAX_SIG_NUM: i32 = 64;
@@ -75,7 +75,9 @@ impl core::fmt::Debug for sigaction__union_u {
 
 impl Default for sigaction__union_u {
     fn default() -> Self {
-        Self { _sa_handler: NULL as u64 }
+        Self {
+            _sa_handler: NULL as u64,
+        }
     }
 }
 
@@ -582,11 +584,20 @@ pub fn sigset_delmask(set: &mut sigset_t, mask: u64) {
     *set &= !mask;
 }
 
+/// @brief 判断两个sigset是否相等
+#[inline]
+pub fn sigset_equal(a: &sigset_t, b: &sigset_t) -> bool {
+    if _NSIG_U64_CNT == 1{
+        return *a == *b;
+    }
+    return false;
+}
+
 /// @brief 使用指定的值，初始化sigset（为支持将来超过64个signal留下接口）
 #[inline]
 pub fn sigset_init(new_set: &mut sigset_t, mask: u64) {
     *new_set = mask;
-    match MAX_SIG_NUM/64 {
+    match _NSIG_U64_CNT {
         1 => {}
         _ => {
             // 暂时不支持大于64个信号
@@ -632,7 +643,7 @@ pub struct sigcontext {
 
     pub regs: pt_regs, // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
     pub trap_num: u64, // 用来保存线程结构体中的trap_num字段
-    pub oldmask: u64,  // 暂存的执行信号处理函数之前的sigmask
+    pub oldmask: u64,  // 暂存的执行信号处理函数之前的，被设置block的信号
     pub cr2: u64,      // 用来保存线程结构体中的cr2字段
     pub err_code: u64, // 用来保存线程结构体中的err_code字段
     // todo: 支持x87浮点处理器后，在这里增加浮点处理器的状态结构体指针

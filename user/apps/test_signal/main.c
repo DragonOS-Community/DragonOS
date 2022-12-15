@@ -25,13 +25,12 @@
 
 #include <libc/src/include/signal.h>
 
+bool handle_ok = false;
+
 void handler(int sig)
 {
-    printf("handle %d", sig);
-    while (1)
-    {
-        /* code */
-    }
+    printf("handle %d\n", sig);
+    handle_ok = true;
 }
 
 int main()
@@ -47,6 +46,11 @@ int main()
         {
             // printf("Test signal running\n");
             last = clock();
+        }
+        if (handle_ok)
+        {
+            printf("Handle OK!\n");
+            handle_ok = false;
         }
     }
 

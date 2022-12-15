@@ -30,9 +30,9 @@ use crate::{
 use super::signal_types::{
     si_code_val, sig_is_member, sigaction, sigaction__union_u, sigcontext, sigframe,
     sighand_struct, siginfo, signal_struct, sigpending, sigset_clear, sigset_del, sigset_delmask,
-    sigset_init, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS, SA_FLAG_DFL,
-    SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, USER_SIG_DFL, USER_SIG_IGN,
-    _NSIG_U64_CNT,
+    sigset_equal, sigset_init, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS,
+    SA_FLAG_DFL, SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, USER_SIG_DFL,
+    USER_SIG_IGN, _NSIG_U64_CNT,
 };
 
 use super::signal_types::{__siginfo_union, __siginfo_union_data};
@@ -662,14 +662,13 @@ fn setup_frame(
         // todo: 在这里生成一个sigsegv,然后core dump
         return Err(1);
     }
-    kdebug!("ka._u._sa_handler=0x{:018x}", unsafe { ka._u._sa_handler });
+    // 传入信号处理函数的第一个参数
     regs.rdi = sig as u64;
     regs.rsi = unsafe { &(*frame).info as *const siginfo as u64 };
     regs.rsp = frame as u64;
     regs.rip = unsafe { ka._u._sa_handler };
     
-    // 传入信号处理函数的第一个参数
-    regs.rdi = sig as u64;
+    // todo: 传入新版的sa_sigaction的处理函数的第三个参数
 
     // 如果handler位于内核空间
     if regs.rip >= USER_MAX_LINEAR_ADDR {
@@ -732,6 +731,25 @@ fn setup_sigcontext(context: &mut sigcontext, mask: &sigset_t, regs: &pt_regs) -
     context.err_code = unsafe { (*current_thread).err_code };
     context.cr2 = unsafe { (*current_thread).cr2 };
     return Ok(0);
+}
+
+/// @brief 将指定的sigcontext恢复到当前进程的内核栈帧中,并将当前线程结构体的几个参数进行恢复
+///
+/// @param context 要被恢复的context
+/// @param regs 目标栈帧（也就是把context恢复到这个栈帧中）
+///
+/// @return bool true -> 成功恢复
+///              false -> 执行失败
+fn restore_sigcontext(context: *const sigcontext, regs: &mut pt_regs) -> bool {
+    let mut current_thread = current_pcb().thread;
+    unsafe {
+        *regs = (*context).regs;
+
+        (*current_thread).trap_num = (*context).trap_num;
+        (*current_thread).cr2 = (*context).cr2;
+        (*current_thread).err_code = (*context).err_code;
+    }
+    return true;
 }
 
 /// @brief 刷新指定进程的sighand的sigaction，将满足条件的sigaction恢复为Default
@@ -952,4 +970,64 @@ fn do_sigaction(
 pub fn sigmask(sig: SignalNumber) -> u64 {
     // 减1的原因是，sigset的第0位表示信号1
     return 1u64 << ((sig as i32) - 1);
+}
+
+#[no_mangle]
+pub extern "C" fn sys_rt_sigreturn(regs: &mut pt_regs) -> u64 {
+    kdebug!(
+        "sigreturn, pid={}, regs.rsp=0x{:018x}",
+        current_pcb().pid,
+        regs.rsp
+    );
+    let frame = regs.rsp as usize as *mut sigframe;
+
+    // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
+    if unsafe { !verify_area(frame as u64, size_of::<sigframe>() as u64) } {
+        // todo：这里改为生成一个sigsegv
+        // 退出进程
+        unsafe {
+            process_do_exit(SignalNumber::SIGSEGV as u64);
+        }
+    }
+
+    let mut sigmask: sigset_t = unsafe { (*frame).context.oldmask };
+    set_current_sig_blocked(&mut sigmask);
+
+    // 从用户栈恢复sigcontext
+    if restore_sigcontext(unsafe { &mut (*frame).context }, regs) == false {
+        // todo：这里改为生成一个sigsegv
+        // 退出进程
+        unsafe {
+            process_do_exit(SignalNumber::SIGSEGV as u64);
+        }
+    }
+
+    // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
+    return regs.rax;
+}
+
+fn set_current_sig_blocked(new_set: &mut sigset_t) {
+    sigset_delmask(
+        new_set,
+        sigmask(SignalNumber::SIGKILL) | sigmask(SignalNumber::SIGSTOP),
+    );
+
+    let mut pcb = current_pcb();
+
+    /*
+        如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
+        请注意，一个进程的sig_blocked字段不能被其他进程修改！
+    */
+    if sigset_equal(&pcb.sig_blocked, new_set) {
+        return;
+    }
+
+    let lock: &mut spinlock_t = &mut sighand_struct::convert_mut(pcb.sighand).unwrap().siglock;
+    spin_lock_irq(lock);
+    // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
+
+    // 设置当前进程的sig blocked
+    pcb.sig_blocked = *new_set;
+    recalc_sigpending();
+    spin_unlock_irq(lock);
 }

@@ -283,7 +283,7 @@ static int LZ4_isAligned(const void *ptr, size_t alignment)
  **************************************/
 #include <limits.h>
 #if defined(__cplusplus) || (defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) /* C99 */)
-#include <stdint.h>
+#include <DragonOS/stdint.h>
 typedef uint8_t BYTE;
 typedef uint16_t U16;
 typedef uint32_t U32;

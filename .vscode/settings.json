@@ -163,7 +163,11 @@
         "cmd_help.h": "c",
         "wait.h": "c",
         "__libc__.h": "c",
-        "ctype.h": "c"
+        "ctype.h": "c",
+        "mmio.h": "c",
+        "stdint-gcc.h": "c",
+        "acpi.h": "c",
+        "assert.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": "",

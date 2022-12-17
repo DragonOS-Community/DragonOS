@@ -7,7 +7,7 @@
 
 //引入对bool类型的支持
 #include <stdbool.h>
-#include <stdint.h>
+#include <DragonOS/stdint.h>
 #include <common/stddef.h>
 #include <arch/arch.h>
 #include <common/compiler.h>

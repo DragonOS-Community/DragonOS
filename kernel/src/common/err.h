@@ -1,6 +1,6 @@
 #pragma once
 #include <common/compiler.h>
-#include <stdint.h>
+#include <DragonOS/stdint.h>
 #define MAX_ERRNO 4095
 
 #define IS_ERR_VALUE(x) unlikely((x) >= (uint64_t)-MAX_ERRNO)

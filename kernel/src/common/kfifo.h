@@ -1,6 +1,6 @@
 #pragma once
 
-#include <stdint.h>
+#include <DragonOS/stdint.h>
 #include <common/spinlock.h>
 
 struct kfifo_t

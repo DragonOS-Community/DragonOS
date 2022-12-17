@@ -1,7 +1,7 @@
 #pragma once
 
 #include <common/glib.h>
-#include "stdint.h"
+#include <DragonOS/stdint.h>
 
 #define PORT_PCI_CONFIG_ADDRESS 0xcf8
 #define PORT_PCI_CONFIG_DATA 0xcfc

@@ -105,7 +105,7 @@ multiboot_header:
     .long CHECKSUM
     // 添加其它内容在此，详细信息见 Multiboot2 Specification version 2.0.pdf
 
-// 设置帧缓冲区(同时在这里设置qemu的分辨率, 默认为: 1440*900)
+// 设置帧缓冲区(同时在这里设置qemu的分辨率, 默认为: 1440*900, 还支持: 640*480, 等)
 .align 8
 framebuffer_tag_start:
     .short MULTIBOOT_HEADER_TAG_FRAMEBUFFER

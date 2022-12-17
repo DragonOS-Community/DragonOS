@@ -43,11 +43,11 @@ while [ True ]; do
         "--cs")
             CHANGE_SOURCE=True
         ;;
-		"--help")
-			echo "脚本选项如下:"
-			echo "--rebuild: 清除上一次安装的全部信息, 即删掉$INSTALL_POS目录下的所有内容, 然后重新构建gcc工具链."
-			echo "--kg(keep-gcc): 您确保${STRUCTURE}-gcc已被编译安装, 本次调用脚本不重复编译安装gcc. 如果没有安装，脚本仍然会自动安装."
-			echo "--nb(keep-binutils): 您确保binutils已被编译安装, 本次调用脚本不重复编译安装binutils. 如果没有安装，脚本仍然会自动安装."
+        "--help")
+            echo "脚本选项如下:"
+            echo "--rebuild: 清除上一次安装的全部信息, 即删掉$INSTALL_POS目录下的所有内容, 然后重新构建gcc工具链."
+            echo "--kg(keep-gcc): 您确保${STRUCTURE}-gcc已被编译安装, 本次调用脚本不重复编译安装gcc. 如果没有安装，脚本仍然会自动安装."
+            echo "--kb(keep-binutils): 您确保binutils已被编译安装, 本次调用脚本不重复编译安装binutils. 如果没有安装，脚本仍然会自动安装."
             echo "--cs(change source): 如果包含该选项, 使用清华源下载gcc和binutils. 否则默认官方源."
 		;;
 		*)

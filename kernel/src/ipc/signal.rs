@@ -20,7 +20,6 @@ use crate::{
             spin_unlock_irqrestore,
         },
     },
-    println,
     process::{
         pid::PidType,
         process::{process_is_stopped, process_kick, process_wake_up_state},
@@ -63,13 +62,6 @@ pub static DEFAULT_SIGACTION_IGNORE: sigaction = sigaction {
 /// @param regs->r9 sig 信号
 #[no_mangle]
 pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
-    println!(
-        "sys kill, target pid={}, file={}, line={}",
-        regs.r8,
-        file!(),
-        line!()
-    );
-
     let pid: pid_t = regs.r8 as pid_t;
     let sig: SignalNumber = SignalNumber::from(regs.r9 as i32);
     if sig == SignalNumber::INVALID {
@@ -621,7 +613,7 @@ fn setup_frame(
 ) -> Result<i32, i32> {
     let mut err = 0;
     let frame: *mut sigframe = get_stack(ka, &regs, size_of::<sigframe>());
-    kdebug!("frame=0x{:016x}", frame as usize);
+    // kdebug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
     let access_check_ok = unsafe { verify_area(frame as u64, size_of::<sigframe>() as u64) };
     if !access_check_ok {
@@ -667,7 +659,7 @@ fn setup_frame(
     regs.rsi = unsafe { &(*frame).info as *const siginfo as u64 };
     regs.rsp = frame as u64;
     regs.rip = unsafe { ka._u._sa_handler };
-    
+
     // todo: 传入新版的sa_sigaction的处理函数的第三个参数
 
     // 如果handler位于内核空间
@@ -974,11 +966,11 @@ pub fn sigmask(sig: SignalNumber) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn sys_rt_sigreturn(regs: &mut pt_regs) -> u64 {
-    kdebug!(
-        "sigreturn, pid={}, regs.rsp=0x{:018x}",
-        current_pcb().pid,
-        regs.rsp
-    );
+    // kdebug!(
+    //     "sigreturn, pid={}, regs.rsp=0x{:018x}",
+    //     current_pcb().pid,
+    //     regs.rsp
+    // );
     let frame = regs.rsp as usize as *mut sigframe;
 
     // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）

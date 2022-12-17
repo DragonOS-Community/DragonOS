@@ -30,7 +30,13 @@ ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
 
-export CC=gcc
+export CC=$(DragonOS_GCC)/x86_64-elf-gcc
+export LD=$(DragonOS_GCC)/x86_64-elf-ld
+export AS=$(DragonOS_GCC)/x86_64-elf-as
+# export CC=gcc
+# export LD=ld
+# export AS=as
+
 
 .PHONY: all
 all: kernel user

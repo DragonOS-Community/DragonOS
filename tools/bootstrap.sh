@@ -5,19 +5,20 @@ export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
 
 banner()
 {
-    echo "|------------------------------------------|"
+	echo "|------------------------------------------|"
 	echo "|    Welcome to the DragonOS bootstrap     |"
 	echo "|------------------------------------------|"
 }
 
+# 因为编码原因, 只有在vim打开该文件的时候对齐才是真的对齐
 congratulations()
 {
-    echo "|-----------Congratulations!---------------|"
+	echo "|-----------Congratulations!---------------|"
 	echo "|                                          |"
-	echo "|   你成功安装了DragonOS所需的依赖项!          |"
-	echo "|   您可以通过以下命令运行它:                  |"
+	echo "|   你成功安装了DragonOS所需的依赖项!      |"
+	echo "|   您可以通过以下命令运行它:              |"
 	echo "|                                          |"
-	echo "|   make run-docker -j 你的cpu核心数         |"
+	echo "|   make run-docker -j 你的cpu核心数       |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
@@ -177,7 +178,7 @@ fi
 
 # 创建磁盘镜像
 bash create_hdd_image.sh
-bash grub_auto_install.sh
+
 # 解决kvm权限问题
 USR=$USER
 sudo adduser $USR kvm

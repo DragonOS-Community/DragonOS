@@ -23,7 +23,7 @@ kernel_subdirs := common driver process debug filesystem time arch exception mm 
 
 head.o: head.S
 	$(CC) -E head.S > _head.s # 预处理
-	as $(ASFLAGS) -o head.o _head.s
+	$(AS) $(ASFLAGS) -o head.o _head.s
 
 
 main.o: main.c 
@@ -38,7 +38,7 @@ kernel_rust:
 all: kernel
 
 	@echo "Linking kernel..."
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds
+	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds
 # 生成kallsyms
 	current_dir=$(pwd)
 	
@@ -55,7 +55,7 @@ all: kernel
 # 重新链接
 	@echo "Re-Linking kernel..."
 	@echo $(shell find . -name "*.o")
-	ld -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds
+	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
 	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../../bin/kernel/kernel.elf

@@ -164,6 +164,7 @@
         "wait.h": "c",
         "__libc__.h": "c",
         "ctype.h": "c",
+        "signal.h": "c",
         "mmio.h": "c",
         "stdint-gcc.h": "c",
         "acpi.h": "c",

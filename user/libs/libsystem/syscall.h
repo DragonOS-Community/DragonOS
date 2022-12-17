@@ -15,20 +15,22 @@
 #define SYS_BRK 9
 #define SYS_SBRK 10
 
-#define SYS_REBOOT 11   // 重启
-#define SYS_CHDIR 12    // 切换工作目录
+#define SYS_REBOOT 11    // 重启
+#define SYS_CHDIR 12     // 切换工作目录
 #define SYS_GET_DENTS 13 // 获取目录中的数据
-#define SYS_EXECVE 14 // 执行新的应用程序
-#define SYS_WAIT4 15 // 等待进程退出
-#define SYS_EXIT 16 // 进程退出
-#define SYS_MKDIR 17 // 创建文件夹
+#define SYS_EXECVE 14    // 执行新的应用程序
+#define SYS_WAIT4 15     // 等待进程退出
+#define SYS_EXIT 16      // 进程退出
+#define SYS_MKDIR 17     // 创建文件夹
 #define SYS_NANOSLEEP 18 // 纳秒级休眠
-#define SYS_CLOCK 19 // 获取当前cpu时间
+#define SYS_CLOCK 19     // 获取当前cpu时间
 #define SYS_PIPE 20
 
-#define SYS_MSTAT 21    // 获取系统的内存状态信息
+#define SYS_MSTAT 21        // 获取系统的内存状态信息
 #define SYS_UNLINK_AT 22    // 删除文件夹/删除文件链接
-#define SYS_KILL 23 // kill一个进程(向这个进程发出信号)
+#define SYS_KILL 23         // kill一个进程(向这个进程发出信号)
+#define SYS_SIGACTION 24    // 设置进程的信号处理动作
+#define SYS_RT_SIGRETURN 25 // 从信号处理函数返回
 
 /**
  * @brief 用户态系统调用函数
@@ -44,4 +46,5 @@
  * @param arg7
  * @return long
  */
-long syscall_invoke(uint64_t syscall_id, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6, uint64_t arg7);
+long syscall_invoke(uint64_t syscall_id, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
+                    uint64_t arg5, uint64_t arg6, uint64_t arg7);

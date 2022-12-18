@@ -28,12 +28,15 @@ ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
 
+ifeq ($(DragonOS_GCC), )
+$(error 尚未安装DragonOS交叉编译器，请使用tools文件夹下的build_gcc_toolchain.sh脚本安装)
+endif
+
 export CC=$(DragonOS_GCC)/x86_64-elf-gcc
-export LD=$(DragonOS_GCC)/x86_64-elf-ld
+export LD=ld
 export AS=$(DragonOS_GCC)/x86_64-elf-as
-# export CC=gcc
-# export LD=ld
-# export AS=as
+export NM=$(DragonOS_GCC)/x86_64-elf-nm
+export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 
 .PHONY: all

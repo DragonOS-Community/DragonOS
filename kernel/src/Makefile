@@ -58,7 +58,7 @@ all: kernel
 	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
-	objcopy -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
+	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
 	@echo "Kernel Build Done."
 
 ECHO:

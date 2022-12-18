@@ -177,6 +177,7 @@ fi
 
 # 创建磁盘镜像
 bash create_hdd_image.sh
+# 编译安装grub
 bash grub_auto_install.sh
 
 # 解决kvm权限问题

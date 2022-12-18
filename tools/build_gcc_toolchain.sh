@@ -22,10 +22,10 @@ if [ "${HOME:0:5}" = "/root" ]; then
 fi
 
 # 获取选项
-KEEP_BINUTILS=False
-KEEP_GCC=False
-CHANGE_SOURCE=False
-while [ True ]; do
+KEEP_BINUTILS=0
+KEEP_GCC=0
+CHANGE_SOURCE=0
+while true; do
 	if [ ! -n "$1" ]; then
 		break
 	fi
@@ -35,13 +35,13 @@ while [ True ]; do
             rm -rf "${INSTALL_POS}"
 		;; 
 		"--kb")
-			KEEP_BINUTILS=True
+			KEEP_BINUTILS=1
 		;;
 		"--kg")
-			KEEP_GCC=True
+			KEEP_GCC=1
 		;;
         "--cs")
-            CHANGE_SOURCE=True
+            CHANGE_SOURCE=1
         ;;
         "--help")
             echo "脚本选项如下:"
@@ -65,7 +65,15 @@ sleep 0.3s
 # install prerequisited
 # 注意texinfo和binutils的版本是否匹配
 # 注意gmp/mpc/mpfr和gcc/g++的版本是否匹配
-sudo apt-get install -y g++ gcc make texinfo libgmp3-dev libmpc-dev libmpfr-dev flex
+sudo apt-get install -y \
+    g++ \
+    gcc \
+    make \
+    texinfo=6.8-4build1 \
+    libgmp3-dev=2:6.2.1+dfsg-3ubuntu1 \
+    libmpc-dev=1.2.1-2build1 \
+    libmpfr-dev=4.1.0-3build3 \
+    flex=2.6.4-8build2 \
 
 # build the workspace
 mkdir $HOME/opt
@@ -75,10 +83,10 @@ cd $INSTALL_POS
 
 
 # compile binutils
-BIN_UTILS="binutils-2.39"
+BIN_UTILS="binutils-2.38"
 BIN_UTILS_TAR="${BIN_UTILS}.tar.gz"
-if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin/ -name ${TARGET_AS})" ]] || [ ! KEEP_BINUTILS ]; then
-    if [ KEEP_BINUTILS ]; then
+if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin/ -name ${TARGET_AS})" ]] || [ KEEP_BINUTILS -ne 1 ]; then
+    if [ KEEP_BINUTILS -eq 1 ]; then
         echo -e "\033[35m 没有检测到 ${TARGET_LD} 或 没有检测到 ${TARGET_AS}, -kb参数无效 \033[0m"
         echo -e "\033[35m 开始安装binutils \033[0m"
         sleep 1s
@@ -108,8 +116,8 @@ fi
 # compile GCC
 GCC_FILE="gcc-11.3.0"
 GCC_FILE_TAR="${GCC_FILE}.tar.gz"
-if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ ! KEEP_GCC ]; then
-    if [ KEEP_GCC ]; then
+if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ KEEP_GCC -ne 1 ]; then
+    if [ KEEP_GCC -eq 1 ]; then
         echo -e "\033[35m 没有检测到 $TARGET_GCC, -kg参数无效 \033[0m"
         echo -e "\033[35m 开始安装binutils \033[0m"
         sleep 1s

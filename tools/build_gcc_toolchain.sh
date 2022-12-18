@@ -162,6 +162,14 @@ source "$HOME/.bashrc"
 if [ -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] &&
    [ -n "$(find $PREFIX/bin/* -name $TARGET_LD)" ] &&
    [ -n "$(find $PREFIX/bin/* -name $TARGET_AS)" ]; then
+    # 删除临时文件
+    rm -rf "$BIN_UTILS"
+    rm -rf "$BIN_UTILS_TAR"
+    rm -rf "build-binutils"
+    rm -rf "$GCC_FILE"
+    rm -rf "$GCC_FILE_TAR"
+    rm -rf "build-gcc"
+
     echo -e "\033[42;37m [构建成功] Build Successfully. \033[0m"
 else 	
     echo -e "\033[31m [错误] 未找到$STRUCTURE-elf-gcc, $STRUCTURE-elf-ld和$STRUCTURE-elf-as. \033[0m"

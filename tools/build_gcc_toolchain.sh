@@ -144,7 +144,7 @@ if [ -n "$(grep -F "export DragonOS_GCC=$PREFIX/bin/" $HOME/.bashrc)" ]; then
 	echo "[info] DragonOS_GCC has been in the "'$PATH'
 else 
 	echo 'export DragonOS_GCC='"$PREFIX"'/bin/' >> "$HOME/.bashrc"
-	echo 'export PATH=$PATH:$DragonOS_GCC'	>> "$HOME/.bashrc"
+	echo 'export PATH="$DragonOS_GCC:$PATH"'	>> "$HOME/.bashrc"
 	echo "[info] Add DragonOS_GCC into PATH successfully."
 fi
 source "$HOME/.bashrc"

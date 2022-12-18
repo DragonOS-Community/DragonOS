@@ -85,5 +85,5 @@ pub fn rtc_get_cmos_time(t: &mut rtc_time_t) -> Result<i32,i32> {
 
         sti();
     }
-    return Ok(i32);
+    return Ok(0);
 }

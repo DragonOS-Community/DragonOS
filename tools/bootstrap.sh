@@ -38,7 +38,7 @@ install_ubuntu_debian_pkg()
         gnupg \
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
-        gcc build-essential fdisk
+        gcc build-essential fdisk dosfstools
     
     if [ -z "$(which docker)" ]; then
         echo "正在安装docker..."

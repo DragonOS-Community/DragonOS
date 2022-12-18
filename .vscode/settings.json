@@ -164,11 +164,13 @@
         "wait.h": "c",
         "__libc__.h": "c",
         "ctype.h": "c",
+        "signal.h": "c",
         "mmio.h": "c",
         "stdint-gcc.h": "c",
         "acpi.h": "c",
-        "assert.h": "c"
-    },
+        "assert.h": "c",
+        "sys_version.h": "c"
+},
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": "",
     "rust-analyzer.cargo.target": "x86_64-unknown-none",

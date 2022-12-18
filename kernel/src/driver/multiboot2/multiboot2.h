@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "stdint.h"
+#include <DragonOS/stdint.h>
 #include "stdbool.h"
 #include <common/boot_info.h>
 #include <driver/acpi/acpi.h>

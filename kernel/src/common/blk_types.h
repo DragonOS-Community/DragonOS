@@ -1,9 +1,9 @@
 #pragma once
 
+#include <DragonOS/stdint.h>
 #include <common/glib.h>
-#include "stdint.h"
-#include <common/semaphore.h>
 #include <common/mutex.h>
+#include <common/semaphore.h>
 
 #define BLK_TYPE_AHCI 0
 
@@ -16,7 +16,7 @@ struct block_device_operation
     long (*open)();
     long (*close)();
     long (*ioctl)(long cmd, long arg);
-    
+
     /**
      * @brief 块设备驱动程序的传输函数
      *

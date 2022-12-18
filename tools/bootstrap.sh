@@ -42,7 +42,6 @@ install_ubuntu_debian_pkg()
     
     if [ -z "$(which docker)" ]; then
         echo "正在安装docker..."
-        exit 1
         sudo mkdir -p /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         echo \
@@ -177,7 +176,7 @@ fi
 
 # 创建磁盘镜像
 bash create_hdd_image.sh
-
+bash grub_auto_install.sh
 # 解决kvm权限问题
 USR=$USER
 sudo adduser $USR kvm

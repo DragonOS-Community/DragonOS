@@ -1,6 +1,6 @@
 #include "cmd_help.h"
-#include <libc/stdio.h>
-#include <libc/stdlib.h>
+#include <libc/src/stdio.h>
+#include <libc/src/stdlib.h>
 struct help_table_item_t
 {
     void (*func)();

@@ -1,17 +1,17 @@
 #include "cmd.h"
 #include "cmd_help.h"
 #include "cmd_test.h"
-#include <libc/dirent.h>
-#include <libc/errno.h>
-#include <libc/fcntl.h>
-#include <libc/include/signal.h>
-#include <libc/stddef.h>
-#include <libc/stdio.h>
-#include <libc/stdlib.h>
-#include <libc/string.h>
-#include <libc/sys/stat.h>
-#include <libc/sys/wait.h>
-#include <libc/unistd.h>
+#include <libc/src/dirent.h>
+#include <libc/src/errno.h>
+#include <libc/src/fcntl.h>
+#include <libc/src/include/signal.h>
+#include <libc/src/stddef.h>
+#include <libc/src/stdio.h>
+#include <libc/src/stdlib.h>
+#include <libc/src/string.h>
+#include <libc/src/sys/stat.h>
+#include <libc/src/sys/wait.h>
+#include <libc/src/unistd.h>
 #include <libsystem/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
@@ -39,26 +39,38 @@ const static int total_built_in_cmd_num = sizeof(shell_cmds) / sizeof(struct bui
  */
 static char *get_target_filepath(const char *filename, int *result_path_len)
 {
-    int cwd_len = strlen(shell_current_path);
+    char *file_path = NULL;
+    if (filename[0] != '/')
+    {
+        int cwd_len = strlen(shell_current_path);
 
-    // 计算文件完整路径的长度
-    *result_path_len = cwd_len + strlen(filename);
+        // 计算文件完整路径的长度
+        *result_path_len = cwd_len + strlen(filename);
 
-    char *file_path = (char *)malloc(*result_path_len + 2);
+        file_path = (char *)malloc(*result_path_len + 2);
 
-    memset(file_path, 0, *result_path_len + 2);
+        memset(file_path, 0, *result_path_len + 2);
 
-    strcpy(file_path, shell_current_path);
+        strncpy(file_path, shell_current_path, cwd_len);
 
-    // 在文件路径中加入斜杠
-    if (cwd_len > 1)
-        file_path[cwd_len] = '/';
+        // 在文件路径中加入斜杠
+        if (cwd_len > 1)
+            file_path[cwd_len] = '/';
 
-    // 拼接完整路径
-    if (filename[0] == '/')
-        strcat(file_path, filename + 1);
-    else
+        // 拼接完整路径
         strcat(file_path, filename);
+    }
+    else
+    {
+        *result_path_len = strlen(filename);
+        file_path = (char *)malloc(*result_path_len + 2);
+
+        memset(file_path, 0, *result_path_len + 2);
+
+        strncpy(file_path, filename, *result_path_len);
+        if(filename[(*result_path_len)-1]!='/')
+            file_path[*result_path_len] = '/';
+    }
 
     return file_path;
 }
@@ -483,7 +495,8 @@ int shell_cmd_exec(int argc, char **argv)
         // 如果不指定后台运行,则等待退出
         if (strcmp(argv[argc - 1], "&") != 0)
             waitpid(pid, &retval, 0);
-        else{
+        else
+        {
             // 输出子进程的pid
             printf("[1] %d\n", pid);
         }

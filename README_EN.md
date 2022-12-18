@@ -74,13 +74,14 @@ We guarantee that all sponsorship funds and items will be used for:
 
 ### Sponsor List
 
-**None**
+**Not yet**
 
 We hope that in the future, some enterprises can sponsor DragonOS and inject financial power into its development!
 
 ### Individual Sponsor List
 
 - David Wen
+- [Seele.Clover](https://github.com/seeleclover)
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 - slientbard

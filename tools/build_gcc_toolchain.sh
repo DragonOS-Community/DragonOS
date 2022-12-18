@@ -108,8 +108,8 @@ if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin
     mkdir build-binutils
     cd build-binutils
     ../${BIN_UTILS}/configure --target=$TARGET --prefix="$PREFIX" --with-sysroot --disable-nls --disable-werror
-    make -j $(nproc)
-    make install
+    make -j $(nproc) || exit 1
+    make install || exit 1
     cd ..
 fi 
 
@@ -139,10 +139,10 @@ if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ KEEP_GCC -ne 1 ]; the
     mkdir build-gcc
     cd build-gcc
     ../${GCC_FILE}/configure --target=$TARGET --prefix="$PREFIX" --disable-nls --enable-languages=c,c++ --without-headers
-    make all-gcc -j $(nproc)
-    make all-target-libgcc -j $(nproc)
-    make install-gcc -j $(nproc)
-    make install-target-libgcc -j $(nproc)
+    make all-gcc -j $(nproc) || exit 1
+    make all-target-libgcc -j $(nproc)  || exit 1
+    make install-gcc -j $(nproc)  || exit 1
+    make install-target-libgcc -j $(nproc)  || exit 1
     cd ..
 fi
 

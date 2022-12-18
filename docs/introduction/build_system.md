@@ -55,6 +55,7 @@ bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依�
 - fdisk
 - lsb-release
 - git
+- dosfstools
 - Rust以及其工具链
 
 **请留意，若您的Linux系统是在虚拟机中运行的，还请您在您的VMware/Virtual Box虚拟机的处理器设置选项卡中，开启Intel VT-x或AMD-V选项，否则，DragonOS将无法运行。**

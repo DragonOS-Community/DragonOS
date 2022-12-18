@@ -39,11 +39,10 @@ install_ubuntu_debian_pkg()
         gnupg \
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
-        gcc build-essential fdisk
+        gcc build-essential fdisk dosfstools
     
     if [ -z "$(which docker)" ]; then
         echo "正在安装docker..."
-        exit 1
         sudo mkdir -p /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         echo \

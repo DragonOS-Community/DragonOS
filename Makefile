@@ -21,8 +21,6 @@ endif
 export ARCH=__x86_64__
 export ROOT_PATH=$(shell pwd)
 
-export RUSTC=$(shell which rustc)
-
 export DEBUG=DEBUG
 export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(ARCH) -D $(EMULATOR) -O1
 

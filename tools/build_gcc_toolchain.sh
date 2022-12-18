@@ -5,8 +5,8 @@ current_pwd=$PWD
 # It's recommended that your pwd is in /DragonOS/tools/. 
 # 建议自行选择安装的位置
 STRUCTURE="x86_64"  # 这里县则 x86_64 (64位)，而不是选择 i686 架构(32位)
-INSTALL_POS="$HOME/opt/dragonos-gcc/"
-PREFIX="$INSTALL_POS/gcc-$STRUCTURE-unknown-none/"
+INSTALL_POS="$HOME/opt/dragonos-gcc"
+PREFIX="$INSTALL_POS/gcc-$STRUCTURE-unknown-none"
 TARGET="$STRUCTURE-elf"
 PATH="$PREFIX/bin:$PATH"
 TARGET_GCC="$STRUCTURE-elf-gcc"
@@ -65,7 +65,7 @@ sleep 0.3s
 # install prerequisited
 # 注意texinfo和binutils的版本是否匹配
 # 注意gmp/mpc/mpfr和gcc/g++的版本是否匹配
-sudo apt-get install g++ gcc make texinfo libgmp3-dev libmpc-dev libmpfr-dev flex
+sudo apt-get install -y g++ gcc make texinfo libgmp3-dev libmpc-dev libmpfr-dev flex
 
 # build the workspace
 mkdir $HOME/opt

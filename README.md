@@ -91,6 +91,7 @@
 ### 个人赞赏者列表
 
 - David Wen
+- [Seele.Clover](https://github.com/seeleclover)
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 - slientbard

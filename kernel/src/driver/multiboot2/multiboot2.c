@@ -1,5 +1,5 @@
 #include "multiboot2.h"
-#include "assert.h"
+
 
 #include <common/glib.h>
 #include <common/kprint.h>

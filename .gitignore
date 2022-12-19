@@ -1,5 +1,6 @@
 /cmake-build-debug/
 /bin/
+!.gitkeep
 DragonOS.iso
 .idea/
 kernel/kernel
@@ -9,7 +10,6 @@ kernel/kernel
 *.s
 serial_opt.txt
 user/sys_api_lib
-
 docs/_build
 draft
 cppcheck.xml

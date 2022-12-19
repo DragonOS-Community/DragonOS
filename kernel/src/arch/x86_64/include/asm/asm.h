@@ -1,6 +1,6 @@
 #pragma once
 
-#include <stdint.h>
+#include <DragonOS/stdint.h>
 
 #define sti() __asm__ __volatile__("sti\n\t" :: \
                                        : "memory") //开启外部中断

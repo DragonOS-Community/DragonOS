@@ -16,6 +16,7 @@
 #include <common/crc7.h>
 #include <common/crc8.h>
 #include <common/gfp.h>
+#include <common/glib.h>
 #include <common/kfifo.h>
 #include <common/list.h>
 #include <common/lz4.h>

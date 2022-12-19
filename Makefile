@@ -21,8 +21,6 @@ endif
 export ARCH=__x86_64__
 export ROOT_PATH=$(shell pwd)
 
-export RUSTC=$(shell which rustc)
-
 export DEBUG=DEBUG
 export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(ARCH) -D $(EMULATOR) -O1
 
@@ -66,11 +64,11 @@ gdb:
 
 # 写入磁盘镜像
 write_diskimage:
-	sudo sh -c "cd tools && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+	sudo sh -c "cd tools && bash grub_auto_install.sh && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi:
-	sudo sh -c "cd tools && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+	sudo sh -c "cd tools && bash grub_auto_install.sh && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy && cd .."

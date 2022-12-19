@@ -112,6 +112,7 @@ struct sigaction
 #define SA_FLAG_IGN (1UL << 0)      // 当前sigaction表示忽略信号的动作
 #define SA_FLAG_DFL (1UL << 1)      // 当前sigaction表示系统默认的动作
 #define SA_FLAG_RESTORER (1UL << 2) // 当前sigaction具有用户指定的restorer
+#define SA_FLAG_IMMUTABLE (1UL << 3) // 当前sigaction不可被更改
 
 /**
  * 由于signal_struct总是和sighand_struct一起使用，并且信号处理的过程中必定会对sighand加锁，

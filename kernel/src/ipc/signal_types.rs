@@ -544,6 +544,13 @@ impl SigQueue {
             drop(x)
         }
     }
+
+    /// @brief 从C的void*指针转换为static生命周期的可变引用
+    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue{
+        let sq = p as *mut SigQueue;
+        let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
+        return sq;
+    }
 }
 
 impl Default for SigQueue {
@@ -587,7 +594,7 @@ pub fn sigset_delmask(set: &mut sigset_t, mask: u64) {
 /// @brief 判断两个sigset是否相等
 #[inline]
 pub fn sigset_equal(a: &sigset_t, b: &sigset_t) -> bool {
-    if _NSIG_U64_CNT == 1{
+    if _NSIG_U64_CNT == 1 {
         return *a == *b;
     }
     return false;

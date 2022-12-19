@@ -63,7 +63,7 @@ if [ "${HOME:0:5}" = "/root" ] && [ $FORCE -eq 0 ]; then
 else
     # 安装开始[提示]
     echo -e "\033[35m [开始安装] \033[0m"
-    echo -e "\033[33m gcc交叉编译工具链默认安装在: /home/<your_usr_name>/opt/dragonos-gcc/ \033[0m"
+    echo -e "\033[33m gcc交叉编译工具链默认安装在: /home/<your_usr_name>/opt/dragonos-gcc/, 整个过程耗时: 5-30mins \033[0m"
     sleep 0.3s  
 fi
 
@@ -98,7 +98,7 @@ if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin
     fi
     if [ ! -d "$BIN_UTILS" ]; then
         if [ ! -f "$BIN_UTILS_TAR" ]; then
-            echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数--cs, 即: bash build_gcc_toolchain.sh --cs  \033[0m "
+            echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数-cs, 即: bash build_gcc_toolchain.sh -cs  \033[0m "
             if [ CHANGE_SOURCE ]; then
                 # 国内源
                 wget "https://mirrors.tuna.tsinghua.edu.cn/gnu/binutils/${BIN_UTILS_TAR}" -P "$INSTALL_POS"
@@ -129,7 +129,7 @@ if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ KEEP_GCC -ne 1 ]; the
     fi
     if [ ! -d "$GCC_FILE" ]; then
         if [ ! -f "$GCC_FILE_TAR" ]; then
-                echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数--cs, 即: bash build_gcc_toolchain.sh --cs  \033[0m "
+                echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数-cs, 即: bash build_gcc_toolchain.sh -cs  \033[0m "
                 if [ CHANGE_SOURCE ]; then
                     # 国内源
                     wget "https://mirrors.tuna.tsinghua.edu.cn/gnu/gcc/${GCC_FILE}/${GCC_FILE_TAR}" -P "$INSTALL_POS"

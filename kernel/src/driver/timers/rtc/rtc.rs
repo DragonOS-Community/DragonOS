@@ -1,10 +1,10 @@
 pub struct rtc_time_t {
-    pub second: u32,
-    pub minute: u32,
-    pub hour: u32,
-    pub day: u32,
-    pub month: u32,
-    pub year: u32,
+    pub second: i32,
+    pub minute: i32,
+    pub hour: i32,
+    pub day: i32,
+    pub month: i32,
+    pub year: i32,
 }
 
 use crate::{
@@ -53,14 +53,14 @@ pub fn rtc_get_cmos_time(t: &mut rtc_time_t) -> Result<i32,i32> {
         }; // 判断是否为二进制码
 
         loop {
-            t.year = read_cmos(CMOSTimeSelector::T_YEAR as u8) as u32;
-            t.month = read_cmos(CMOSTimeSelector::T_MONTH as u8) as u32;
-            t.day = read_cmos(CMOSTimeSelector::T_DAY as u8) as u32;
-            t.hour = read_cmos(CMOSTimeSelector::T_HOUR as u8) as u32;
-            t.minute = read_cmos(CMOSTimeSelector::T_MINUTE as u8) as u32;
-            t.second = read_cmos(CMOSTimeSelector::T_SECOND as u8) as u32;
+            t.year = read_cmos(CMOSTimeSelector::T_YEAR as u8) as i32;
+            t.month = read_cmos(CMOSTimeSelector::T_MONTH as u8) as i32;
+            t.day = read_cmos(CMOSTimeSelector::T_DAY as u8) as i32;
+            t.hour = read_cmos(CMOSTimeSelector::T_HOUR as u8) as i32;
+            t.minute = read_cmos(CMOSTimeSelector::T_MINUTE as u8) as i32;
+            t.second = read_cmos(CMOSTimeSelector::T_SECOND as u8) as i32;
 
-            if t.second == read_cmos(CMOSTimeSelector::T_SECOND as u8) as u32 {
+            if t.second == read_cmos(CMOSTimeSelector::T_SECOND as u8) as i32 {
                 break;
             } // 若读取时间过程中时间发生跳变则重新读取
         }

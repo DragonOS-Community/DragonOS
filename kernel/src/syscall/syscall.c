@@ -22,6 +22,7 @@ extern uint64_t sys_unlink_at(struct pt_regs *regs);
 extern uint64_t sys_kill(struct pt_regs *regs);
 extern uint64_t sys_sigaction(struct pt_regs * regs);
 extern uint64_t sys_rt_sigreturn(struct pt_regs * regs);
+extern uint64_t sys_getpid(struct pt_regs * regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -590,6 +591,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [23] = sys_kill,
     [24] = sys_sigaction,
     [25] = sys_rt_sigreturn,
-    [26 ... 254] = system_call_not_exists,
+    [26] = sys_getpid,
+    [27 ... 254] = system_call_not_exists,
     [255] = sys_ahci_end_req,
 };

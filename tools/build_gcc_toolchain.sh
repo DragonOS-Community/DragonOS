@@ -13,42 +13,39 @@ TARGET_GCC="$STRUCTURE-elf-gcc"
 TARGET_LD="$STRUCTURE-elf-ld"
 TARGET_AS="$STRUCTURE-elf-as"
 
-
-# check: Don't install the gcc-toolchain in /root/*
-if [ "${HOME:0:5}" = "/root" ]; then
-    echo "不要把GCC交叉编译工具链安装在/root/目录下, 或者请不要使用sudo"
-    echo "gcc交叉编译工具链默认安装在: /home/<your_usr_name>/opt/dragonos-gcc/"
-    exit 0
-fi
-
 # 获取选项
 KEEP_BINUTILS=0
 KEEP_GCC=0
 CHANGE_SOURCE=0
+FORCE=0
 while true; do
 	if [ ! -n "$1" ]; then
 		break
 	fi
 	case "$1" in
-		"--rebuild")	
+		"-rebuild")	
 			echo "清除${INSTALL_POS}目录下的所有信息"
             rm -rf "${INSTALL_POS}"
 		;; 
-		"--kb")
+		"-kb")
 			KEEP_BINUTILS=1
 		;;
-		"--kg")
+		"-kg")
 			KEEP_GCC=1
 		;;
-        "--cs")
+        "-cs")
             CHANGE_SOURCE=1
         ;;
-        "--help")
+        "-f")
+            FORCE=1
+        ;;
+        "-help")
             echo "脚本选项如下:"
-            echo "--rebuild: 清除上一次安装的全部信息, 即删掉$INSTALL_POS目录下的所有内容, 然后重新构建gcc工具链."
-            echo "--kg(keep-gcc): 您确保${STRUCTURE}-gcc已被编译安装, 本次调用脚本不重复编译安装gcc. 如果没有安装，脚本仍然会自动安装."
-            echo "--kb(keep-binutils): 您确保binutils已被编译安装, 本次调用脚本不重复编译安装binutils. 如果没有安装，脚本仍然会自动安装."
-            echo "--cs(change source): 如果包含该选项, 使用清华源下载gcc和binutils. 否则默认官方源."
+            echo "-rebuild: 清除上一次安装的全部信息, 即删掉$INSTALL_POS目录下的所有内容, 然后重新构建gcc工具链."
+            echo "-kg(keep-gcc): 您确保${STRUCTURE}-gcc已被编译安装, 本次调用脚本不重复编译安装gcc. 如果没有安装，脚本仍然会自动安装."
+            echo "-kb(keep-binutils): 您确保binutils已被编译安装, 本次调用脚本不重复编译安装binutils. 如果没有安装，脚本仍然会自动安装."
+            echo "-cs(change source): 如果包含该选项, 使用清华源下载gcc和binutils. 否则默认官方源."
+            echo "-f(force): 如果包含该选项, 可以强制使用root权限安装在/root/目录下."
 		;;
 		*)
 			echo "不认识参数$1"
@@ -57,10 +54,18 @@ while true; do
 	shift 1
 done
 
-# 安装开始[提示]
-echo -e "\033[35m [开始安装] \033[0m"
-echo -e "\033[33m gcc交叉编译工具链默认安装在: /home/<your_usr_name>/opt/dragonos-gcc/ \033[0m"
-sleep 0.3s  
+# check: Don't install the gcc-toolchain in /root/*
+if [ "${HOME:0:5}" = "/root" ] && [ $FORCE -eq 0 ]; then
+    echo -e "\033[35m 不要把GCC交叉编译工具链安装在/root/目录下, 或者请不要使用sudo \033[0m"
+    echo -e "\033[35m gcc交叉编译工具链默认安装在: /home/<your_usr_name>/opt/dragonos-gcc/ \033[0m"
+    echo -e "\033[35m 如果想要在/root/目录下安装(或者您的操作系统只有root用户), 请使用指令: sudo bash build_gcc_toolchain.sh -f \033[0m"
+    exit 0
+else
+    # 安装开始[提示]
+    echo -e "\033[35m [开始安装] \033[0m"
+    echo -e "\033[33m gcc交叉编译工具链默认安装在: /home/<your_usr_name>/opt/dragonos-gcc/ \033[0m"
+    sleep 0.3s  
+fi
 
 # install prerequisited
 # 注意texinfo和binutils的版本是否匹配

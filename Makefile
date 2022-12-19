@@ -103,6 +103,7 @@ run-uefi:
 	
 # 编译并启动QEMU
 run:
+	@if [ -n $(DragonOS_GCC) ]; then sudo bash tools/build_gcc_toolchain.sh; fi
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu

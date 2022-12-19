@@ -93,9 +93,9 @@ pub const SA_ALL_FLAGS: u64 = SA_FLAG_IGN | SA_FLAG_DFL | SA_FLAG_RESTORER | SA_
 // ============ sigaction结构体中的的sa_flags的可选值 end ===========
 
 /// 用户态程序传入的SIG_DFL的值
-pub const USER_SIG_DFL: u64 = 1u64 << 0;
+pub const USER_SIG_DFL: u64 = 0;
 /// 用户态程序传入的SIG_IGN的值
-pub const USER_SIG_IGN: u64 = 1u64 << 1;
+pub const USER_SIG_IGN: u64 = 1;
 
 /**
  * @brief 信号处理结构体

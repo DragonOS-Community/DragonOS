@@ -63,11 +63,7 @@ pub static DEFAULT_SIGACTION_IGNORE: sigaction = sigaction {
 #[no_mangle]
 pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     let pid: pid_t = regs.r8 as pid_t;
-    let sig: SignalNumber = SignalNumber::SIGALRM;
-    // let sig: SignalNumber = SignalNumber::from(regs.r9 as i32);
-    let hand = sighand_struct::convert_mut(current_pcb().sighand).unwrap();
-    let tmp_ka = &mut hand.action[sig as usize - 1];
-    kdebug!("before send, tmk_ka={:?}", tmp_ka);
+    let sig: SignalNumber = SignalNumber::from(regs.r9 as i32);
 
     if sig == SignalNumber::INVALID {
         // 传入的signal数值不合法
@@ -100,9 +96,6 @@ pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    let hand = sighand_struct::convert_mut(current_pcb().sighand).unwrap();
-    let tmp_ka = &mut hand.action[sig as usize - 1];
-    kdebug!("send ok, tmk_ka={:?}", tmp_ka);
     return x as u64;
 }
 
@@ -443,11 +436,7 @@ pub extern "C" fn do_signal(regs: &mut pt_regs) {
 
     // 做完上面的检查后，开中断
     sti();
-    // return;
-    // kdebug!("do_signal");
-    let hand = sighand_struct::convert_mut(current_pcb().sighand).unwrap();
-    let tmp_ka = &mut hand.action[SignalNumber::SIGALRM as usize - 1];
-    kdebug!("do_signal, tmk_ka={:?}", tmp_ka);
+
     let oldset = current_pcb().sig_blocked;
     loop {
         let (sig_number, info, ka) = get_signal_to_deliver(regs.clone());
@@ -504,15 +493,12 @@ fn get_signal_to_deliver(
             spin_unlock_irq(unsafe { (&mut (*current_pcb().sighand).siglock) as *mut spinlock_t });
             return (sig_number, None, None);
         }
-        kdebug!(
-            "current_pcb().sighand=0x{:016x}",
-            current_pcb().sighand as usize
-        );
+
         // 获取指向sigaction结构体的引用
         let hand = sighand_struct::convert_mut(current_pcb().sighand).unwrap();
         // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
         let tmp_ka = &mut hand.action[sig_number as usize - 1];
-        kdebug!("tmp_ka={:?}", tmp_ka);
+
         // 如果当前动作是忽略这个信号，则不管它了。
         if (tmp_ka.sa_flags & SA_FLAG_IGN) != 0 {
             continue;
@@ -832,7 +818,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
         }
         let mask: sigset_t = unsafe { (*act).sa_mask };
         let _input_sah = unsafe { (*act).sa_handler as u64 };
-        kdebug!("_input_sah={}", _input_sah);
+        // kdebug!("_input_sah={}", _input_sah);
         match _input_sah {
             USER_SIG_DFL | USER_SIG_IGN => {
                 if _input_sah == USER_SIG_DFL {
@@ -860,7 +846,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
                 };
             }
         }
-        kdebug!("new_ka={:?}", new_ka);
+        // kdebug!("new_ka={:?}", new_ka);
         // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
         if new_ka.sa_restorer != NULL as u64 {
             new_ka.sa_flags |= SA_FLAG_RESTORER;
@@ -918,9 +904,6 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
             (*old_act).sa_restorer = old_ka.sa_restorer as *mut c_void;
         }
     }
-    let hand = sighand_struct::convert_mut(current_pcb().sighand).unwrap();
-    let tmp_ka = &mut hand.action[sig as usize - 1];
-    kdebug!("tmp_ka[{}]={:?}",sig as usize - 1,  tmp_ka);
 
     return retval as u64;
 }
@@ -931,7 +914,7 @@ fn do_sigaction(
     old_act: Option<&mut sigaction>,
 ) -> i32 {
     let pcb = current_pcb();
-    kdebug!("current_pcb().sighand=0x{:016x}", pcb.sighand as usize);
+
     // 指向当前信号的action的引用
     let action =
         sigaction::convert_mut(unsafe { &mut (*(pcb.sighand)).action[(sig as usize) - 1] })
@@ -1000,10 +983,6 @@ fn do_sigaction(
         }
     }
 
-    kdebug!("action={:?}", action);
-    
-    // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
-    
     spin_unlock_irq(unsafe { &mut (*(pcb.sighand)).siglock });
     return 0;
 }
@@ -1016,11 +995,6 @@ pub fn sigmask(sig: SignalNumber) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn sys_rt_sigreturn(regs: &mut pt_regs) -> u64 {
-    // kdebug!(
-    //     "sigreturn, pid={}, regs.rsp=0x{:018x}",
-    //     current_pcb().pid,
-    //     regs.rsp
-    // );
     let frame = regs.rsp as usize as *mut sigframe;
 
     // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）

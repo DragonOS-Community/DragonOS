@@ -1,7 +1,8 @@
-#include <libc/src/unistd.h>
-#include <libc/src/stdlib.h>
 #include <libc/src/ctype.h>
+#include <libc/src/stdlib.h>
+#include <libc/src/unistd.h>
 #include <libsystem/syscall.h>
+#include <libc/src/include/signal.h>
 
 int abs(int i)
 {
@@ -54,4 +55,15 @@ int atoi(const char *str)
 void exit(int status)
 {
     syscall_invoke(SYS_EXIT, status, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * @brief 通过发送SIGABRT，从而退出当前进程
+ *
+ */
+void abort()
+{
+    // step1：设置SIGABRT的处理函数为SIG_DFL
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
 }

@@ -40,3 +40,9 @@ int atoi(const char * str);
  * @param status 
  */
 void exit(int status);
+
+/**
+ * @brief 通过发送SIGABRT，从而退出当前进程
+ * 
+ */
+void abort();

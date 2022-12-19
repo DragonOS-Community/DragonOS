@@ -1,10 +1,10 @@
+#include <libc/src/errno.h>
+#include <libc/src/fcntl.h>
+#include <libc/src/stddef.h>
+#include <libc/src/stdio.h>
+#include <libc/src/string.h>
 #include <libc/src/unistd.h>
 #include <libsystem/syscall.h>
-#include <libc/src/errno.h>
-#include <libc/src/stdio.h>
-#include <libc/src/stddef.h>
-#include <libc/src/string.h>
-#include <libc/src/fcntl.h>
 
 /**
  * @brief 关闭文件接口
@@ -163,11 +163,11 @@ int rmdir(const char *path)
 
 /**
  * @brief 删除文件
- * 
+ *
  * @param path 绝对路径
- * @return int 
+ * @return int
  */
-int rm(const char * path)
+int rm(const char *path)
 {
     return syscall_invoke(SYS_UNLINK_AT, 0, (uint64_t)path, 0, 0, 0, 0, 0, 0);
 }
@@ -193,4 +193,14 @@ void swab(void *restrict src, void *restrict dest, ssize_t nbytes)
         _src += transfer;
         _dest += transfer;
     }
+}
+
+/**
+ * @brief 获取当前进程的pid（进程标识符）
+ * 
+ * @return pid_t 当前进程的pid
+ */
+pid_t getpid(void)
+{
+    syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0, 0, 0);
 }

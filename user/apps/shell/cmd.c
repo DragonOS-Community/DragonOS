@@ -529,7 +529,7 @@ int shell_cmd_kill(int argc, char **argv)
         retval = -EINVAL;
         goto out;
     }
-    retval = syscall_invoke(SYS_KILL, atoi(argv[1]), SIGKILL, 0, 0, 0, 0, 0, 0);
+    retval = kill(atoi(argv[1]), SIGKILL);
 out:;
     free(argv);
     return retval;

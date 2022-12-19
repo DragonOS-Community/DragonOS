@@ -27,7 +27,7 @@ int signal(int signum, __sighandler_t handler)
     sa.sa_restorer = &__libc_sa_restorer;
     // printf("handler address: %#018lx\n", handler);
     // printf("restorer address: %#018lx\n", &__libc_sa_restorer);
-    sigaction(SIGKILL, &sa, NULL);
+    sigaction(signum, &sa, NULL);
 }
 
 /**

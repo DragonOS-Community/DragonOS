@@ -32,7 +32,7 @@ use mm::allocator::KernelAllocator;
 // <3>
 use crate::{
     arch::x86_64::asm::current::current_pcb,
-    include::bindings::bindings::{process_do_exit, BLACK, GREEN}, time::timekeep::ktime_get_real_ns,
+    include::bindings::bindings::{process_do_exit, BLACK, GREEN},
 };
 
 // 声明全局的slab分配器

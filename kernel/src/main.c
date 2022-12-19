@@ -33,7 +33,6 @@
 #include "driver/pci/pci.h"
 #include "driver/tty/tty.h"
 #include <driver/timers/HPET/HPET.h>
-#include <driver/timers/rtc/rtc.h>
 #include <driver/uart/uart.h>
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>

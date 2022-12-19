@@ -23,7 +23,7 @@
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/unistd.h>
-#include <driver/timers/rtc/rtc.h>
+#include <common/glib.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
 #include <mm/mm.h>

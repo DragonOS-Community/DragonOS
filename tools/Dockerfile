@@ -1,4 +1,4 @@
-FROM ubuntu:jammy
+FROM debian:bullseye
 
 # 设置工作目录
 WORKDIR /build-image

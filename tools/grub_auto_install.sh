@@ -1,7 +1,8 @@
 #!/bin/bash
-grub_dir_i386_efi=arch/i386/efi/grub
-grub_dir_i386_legacy=arch/i386/legacy/grub
-grub_dir_x86_64_efi=arch/x86_64/efi/grub
+ABS_PREFIX=$HOME/opt/dragonos-grub
+grub_dir_i386_efi=${ABS_PREFIX}/arch/i386/efi/grub
+grub_dir_i386_legacy=${ABS_PREFIX}/arch/i386/legacy/grub
+grub_dir_x86_64_efi=${ABS_PREFIX}/arch/x86_64/efi/grub
 
 mkdir -p ${grub_dir_i386_efi}
 mkdir -p ${grub_dir_i386_legacy}
@@ -42,17 +43,17 @@ sudo apt-get install -y \
 cd grub-2.06
 echo "开始安装grub2.06"
 #编译安装三个版本的grub
-./configure --target=i386 --prefix=$(dirname $PWD)/${grub_dir_i386_legacy} || exit 1
+./configure --target=i386 --prefix=${grub_dir_i386_legacy} || exit 1
 make -j $(nproc) || exit 1
 make install || exit 1
 make clean || exit 1
 
-./configure --target=i386 --with-platform=efi --prefix=$(dirname $PWD)/${grub_dir_i386_efi} ||	exit 1
+./configure --target=i386 --with-platform=efi --prefix=${grub_dir_i386_efi} ||	exit 1
 make -j $(nproc) || exit 1
 make install || exit 1
 make clean || exit 1
 
-./configure --target=x86_64 --with-platform=efi --prefix=$(dirname $PWD)/${grub_dir_x86_64_efi} || exit 1
+./configure --target=x86_64 --with-platform=efi --prefix=${grub_dir_x86_64_efi} || exit 1
 make -j $(nproc) || exit 1
 make install || exit 1
 

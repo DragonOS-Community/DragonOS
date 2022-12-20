@@ -79,6 +79,7 @@ sudo apt-get install -y \
     libmpc-dev=1.2.1-2build1 \
     libmpfr-dev=4.1.0-3build3 \
     flex=2.6.4-8build2 \
+    wget
 
 # build the workspace
 mkdir $HOME/opt

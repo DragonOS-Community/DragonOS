@@ -102,7 +102,7 @@ if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin
             echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数-cs, 即: bash build_gcc_toolchain.sh -cs  \033[0m "
             if [ CHANGE_SOURCE ]; then
                 # 国内源
-                wget "https://mirrors.tuna.tsinghua.edu.cn/gnu/binutils/${BIN_UTILS_TAR}" -P "$INSTALL_POS"
+                wget "https://mirrors.ustc.edu.cn/gnu/binutils/${BIN_UTILS_TAR}" -P "$INSTALL_POS"
             else
                 # 官方网站
                 wget https://ftp.gnu.org/gnu/binutils/${BIN_UTILS_TAR} -P "$INSTALL_POS"
@@ -133,7 +133,7 @@ if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ KEEP_GCC -ne 1 ]; the
                 echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数-cs, 即: bash build_gcc_toolchain.sh -cs  \033[0m "
                 if [ CHANGE_SOURCE ]; then
                     # 国内源
-                    wget "https://mirrors.tuna.tsinghua.edu.cn/gnu/gcc/${GCC_FILE}/${GCC_FILE_TAR}" -P "$INSTALL_POS"
+                    wget "https://mirrors.ustc.edu.cn/gnu/gcc/${GCC_FILE}/${GCC_FILE_TAR}" -P "$INSTALL_POS"
                 else
                     # 官方网站
                     wget "http://ftp.gnu.org/gnu/gcc/${GCC_FILE}/${GCC_FILE_TAR}" -P "$INSTALL_POS"

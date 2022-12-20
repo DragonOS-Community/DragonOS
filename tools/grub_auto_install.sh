@@ -20,7 +20,7 @@ if ! hash 2>/dev/null apt-get; then
 fi
 #下载grub2.06
 if [ ! -f "grub-2.06.tar.xz" ]; then
-    wget https://mirrors.tuna.tsinghua.edu.cn/gnu/grub/grub-2.06.tar.xz || exit 1
+    wget https://mirrors.ustc.edu.cn/gnu/grub/grub-2.06.tar.xz || exit 1
 fi
 
 echo "开始下载grub2.06"

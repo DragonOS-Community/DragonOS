@@ -22,7 +22,7 @@ echo "开始写入磁盘镜像..."
 
 
 # toolchain
-GRUB_ABS_PREFIX=$HOME/opt/dragonos-grub
+GRUB_ABS_PREFIX=/opt/dragonos-grub
 GRUB_PATH_I386_LEGACY_INSTALL=${GRUB_ABS_PREFIX}/arch/i386/legacy/grub/sbin/grub-install
 GRUB_PATH_I386_EFI_INSTALL=${GRUB_ABS_PREFIX}/arch/i386/efi/grub/sbin/grub-install
 GRUB_PATH_X86_64_EFI_INSTALL=${GRUB_ABS_PREFIX}/arch/x86_64/efi/grub/sbin/grub-install

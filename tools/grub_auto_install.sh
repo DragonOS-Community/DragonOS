@@ -1,5 +1,5 @@
 #!/bin/bash
-ABS_PREFIX=$HOME/opt/dragonos-grub
+ABS_PREFIX=/opt/dragonos-grub
 grub_dir_i386_efi=${ABS_PREFIX}/arch/i386/efi/grub
 grub_dir_i386_legacy=${ABS_PREFIX}/arch/i386/legacy/grub
 grub_dir_x86_64_efi=${ABS_PREFIX}/arch/x86_64/efi/grub
@@ -7,6 +7,13 @@ grub_dir_x86_64_efi=${ABS_PREFIX}/arch/x86_64/efi/grub
 mkdir -p ${grub_dir_i386_efi}
 mkdir -p ${grub_dir_i386_legacy}
 mkdir -p ${grub_dir_x86_64_efi}
+
+# 防止外层声明了环境变量，影响到grub的编译
+export CC=gcc
+export LD=ld
+export AS=as
+export NM=nm
+export OBJCOPY=objcopy
 
 
 #检测grub是否已经安装
@@ -45,17 +52,17 @@ echo "开始安装grub2.06"
 #编译安装三个版本的grub
 ./configure --target=i386 --prefix=${grub_dir_i386_legacy} || exit 1
 make -j $(nproc) || exit 1
-make install || exit 1
+sudo make install || exit 1
 make clean || exit 1
 
 ./configure --target=i386 --with-platform=efi --prefix=${grub_dir_i386_efi} ||	exit 1
 make -j $(nproc) || exit 1
-make install || exit 1
+sudo make install || exit 1
 make clean || exit 1
 
 ./configure --target=x86_64 --with-platform=efi --prefix=${grub_dir_x86_64_efi} || exit 1
 make -j $(nproc) || exit 1
-make install || exit 1
+sudo make install || exit 1
 
 cd ..
 #解除权限限制

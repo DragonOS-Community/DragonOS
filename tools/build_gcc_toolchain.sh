@@ -74,11 +74,11 @@ sudo apt-get install -y \
     g++ \
     gcc \
     make \
-    texinfo=6.8-4build1 \
-    libgmp3-dev=2:6.2.1+dfsg-3ubuntu1 \
-    libmpc-dev=1.2.1-2build1 \
-    libmpfr-dev=4.1.0-3build3 \
-    flex=2.6.4-8build2 \
+    texinfo \
+    libgmp3-dev \
+    libmpc-dev \
+    libmpfr-dev \
+    flex \
     wget
 
 # build the workspace

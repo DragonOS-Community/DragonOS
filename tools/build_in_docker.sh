@@ -1,7 +1,6 @@
 docker rm -f dragonos-build || echo "No existed container"
-p=`pwd`
 cpu_count=$(cat /proc/cpuinfo |grep "processor"|wc -l)
-docker run --rm --privileged=true --cap-add SYS_ADMIN --cap-add MKNOD -v $p:/data -v /dev:/dev -v dragonos-build-cargo:/root/.cargo/registry --name dragonos-build -i dragonos/dragonos-dev:v1.1.0-beta3 bash << EOF
+docker run --rm --privileged=true --cap-add SYS_ADMIN --cap-add MKNOD -v $(pwd):/data -v /dev:/dev -v dragonos-build-cargo:/root/.cargo/registry --name dragonos-build -i dragonos/dragonos-dev:v1.1.0-beta3 bash << EOF
 source ~/.cargo/env
 cd /data
 # Change rust src

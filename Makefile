@@ -73,11 +73,11 @@ gdb:
 
 # 写入磁盘镜像
 write_diskimage:
-	sudo sh -c "cd tools && bash grub_auto_install.sh && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+	bash -c "cd tools && bash grub_auto_install.sh && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi:
-	sudo sh -c "cd tools && bash grub_auto_install.sh && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+	bash -c "cd tools && bash grub_auto_install.sh && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy && cd .."

@@ -94,6 +94,7 @@ build:
 docker:
 	@echo "使用docker构建"
 	sudo bash tools/build_in_docker.sh || exit 1
+	$(MAKE) write_diskimage || exit 1
 	
 # uefi方式启动
 run-uefi:
@@ -112,4 +113,5 @@ run:
 run-docker:
 	@echo "使用docker构建并运行"
 	sudo bash tools/build_in_docker.sh || exit 1
+	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu

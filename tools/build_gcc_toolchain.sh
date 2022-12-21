@@ -2,9 +2,8 @@
 current_path=$PATH
 current_pwd=$PWD
 
-# It's recommended that your pwd is in /DragonOS/tools/. 
-# 建议自行选择安装的位置
-STRUCTURE="x86_64"  # 这里县则 x86_64 (64位)，而不是选择 i686 架构(32位)
+# 不建议自行选择安装的位置, 如果要修改请自行修改 INSTALL_POS
+STRUCTURE="x86_64"  # 这里选择 x86_64 (64位)，而不是选择 i686 架构(32位)
 INSTALL_POS="$HOME/opt/dragonos-gcc"
 PREFIX="$INSTALL_POS/gcc-$STRUCTURE-unknown-none"
 TARGET="${STRUCTURE}-elf"

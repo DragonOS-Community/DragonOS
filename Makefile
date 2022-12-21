@@ -28,9 +28,9 @@ ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
 
-ifeq ($(DragonOS_GCC), )
-$(error 尚未安装DragonOS交叉编译器，请使用tools文件夹下的build_gcc_toolchain.sh脚本安装)
-endif
+# ifeq ($(DragonOS_GCC), )
+# $(error 尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装)
+# endif
 
 export CC=$(DragonOS_GCC)/x86_64-elf-gcc
 export LD=ld
@@ -39,8 +39,9 @@ export NM=$(DragonOS_GCC)/x86_64-elf-nm
 export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 
-.PHONY: all
+.PHONY: all 
 all: kernel user
+	@echo 尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装;
 
 
 .PHONY: kernel
@@ -104,7 +105,6 @@ run-uefi:
 	
 # 编译并启动QEMU
 run:
-	@if [ -n $(DragonOS_GCC) ]; then sudo bash tools/build_gcc_toolchain.sh; fi
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu

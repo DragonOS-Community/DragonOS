@@ -662,3 +662,4 @@ gdt64_pointer:
 gdt64_pointer64:
     .short gdt64_pointer-gdt64-1
     .quad gdt64
+    

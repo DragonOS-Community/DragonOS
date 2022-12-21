@@ -1,5 +1,6 @@
 emulator="qemu"
 defpackman="apt-get"
+dockerInstall="true"
 export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
 export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
 
@@ -40,8 +41,8 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools
-    
-    if [ -z "$(which docker)" ]; then
+
+    if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."
         sudo mkdir -p /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -50,7 +51,9 @@ install_ubuntu_debian_pkg()
             $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
         sudo $1 update
         sudo "$1" install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    else
+    elif [ -z ${dockerInstall} ]; then
+		echo "您传入--no-docker参数生效, 安装docker步骤被跳过."
+	elif [ -n "$(which docker)" ]; then
         echo "您的计算机上已经安装了docker"
     fi
 
@@ -139,9 +142,32 @@ rustInstall() {
 	fi
 }
 
+
+############# 脚本开始 ##############
+# 读取参数及选项，使用 -help 参数查看详细选项
+while true; do
+	if [ -z "$1" ]; then
+		break;
+	fi
+	echo "repeat"
+	case "$1" in
+		"--no-docker")
+			dockerInstall=""
+		;;
+		"--help")
+			echo "--no-docker(not install docker): 该参数表示执行该脚本的过程中不单独安装docker."
+			exit 0
+		;;
+		*)
+			echo "无法识别参数$1, 请传入 --help 参数查看提供的选项."
+		;;
+	esac
+	shift 1
+done
+
 ############ 开始执行 ###############
-banner
-rustInstall
+banner 			# 开始横幅
+rustInstall     # 安装rust
 
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1

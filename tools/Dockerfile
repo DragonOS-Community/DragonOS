@@ -13,7 +13,7 @@ VOLUME [ "/root/.cargo/registry" ]
 ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
 ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
 
-RUN apt update && apt install -y \
+RUN sed -i "s@http://\(deb\|security\).debian.org@http://mirrors.ustc.edu.cn@g" /etc/apt/sources.list && apt update && apt install -y \
     ca-certificates \
     curl \
     gnupg \
@@ -41,9 +41,6 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly -y && 
 
 # 编译安装GCC交叉编译工具链
 RUN bash build_gcc_toolchain.sh -f
-
-# 安装GRUB2.06
-RUN bash grub_auto_install.sh
 
 # 清除缓存
 WORKDIR /

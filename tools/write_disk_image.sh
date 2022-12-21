@@ -77,6 +77,10 @@ fi
 # 拷贝程序到硬盘
 mkdir -p ${root_folder}/bin/disk_mount
 bash mount_virt_disk.sh || exit 1
+
+LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
+echo $LOOP_DEVICE
+
 mkdir -p ${boot_folder}/grub
 cp ${kernel} ${root_folder}/bin/disk_mount/boot
 # 拷贝用户程序到磁盘镜像
@@ -96,13 +100,11 @@ cfg_content='set timeout=15
     menuentry "DragonOS" {
     multiboot2 /boot/kernel.elf "KERNEL_ELF"
 }'
+
 # 增加insmod efi_gop防止32位uefi启动报错
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
 fi
 
-# rm -rf ${iso_folder}
-LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
-echo $LOOP_DEVICE
 case "$1" in
     --bios) 
         case "$2" in

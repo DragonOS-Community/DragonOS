@@ -176,7 +176,7 @@ if [ -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] &&
     rm -rf "$GCC_FILE_TAR"
     rm -rf "build-gcc"
 
-    echo -e "\033[42;37m [构建成功] Build Successfully. \033[0m"
+    echo -e "\033[42;37m [构建成功] Build Successfully.(请重新打开另一个Shell窗口或者重新打开你的IDE以获取新的环境变量) \033[0m"
 else 	
     echo -e "\033[31m [错误] 未找到$STRUCTURE-elf-gcc, $STRUCTURE-elf-ld和$STRUCTURE-elf-as. \033[0m"
     echo -e "\033[31m [构建失败] 请尝试重新运行build_gcc_toolchain.sh, 或者查看输出，找到错误的原因. \033[0m"

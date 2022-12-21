@@ -22,6 +22,7 @@ $(user_sub_dirs): ECHO sys_api_lib
 app: $(user_sub_dirs)
 
 all: app
+	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
 

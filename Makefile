@@ -41,7 +41,6 @@ export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 .PHONY: all 
 all: kernel user
-	@echo 尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装;
 
 
 .PHONY: kernel

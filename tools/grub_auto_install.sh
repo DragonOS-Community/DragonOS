@@ -1,11 +1,19 @@
 #!/bin/bash
-grub_dir_i386_efi=arch/i386/efi/grub
-grub_dir_i386_legacy=arch/i386/legacy/grub
-grub_dir_x86_64_efi=arch/x86_64/efi/grub
+ABS_PREFIX=/opt/dragonos-grub
+grub_dir_i386_efi=${ABS_PREFIX}/arch/i386/efi/grub
+grub_dir_i386_legacy=${ABS_PREFIX}/arch/i386/legacy/grub
+grub_dir_x86_64_efi=${ABS_PREFIX}/arch/x86_64/efi/grub
 
 mkdir -p ${grub_dir_i386_efi}
 mkdir -p ${grub_dir_i386_legacy}
 mkdir -p ${grub_dir_x86_64_efi}
+
+# 防止外层声明了环境变量，影响到grub的编译
+export CC=gcc
+export LD=ld
+export AS=as
+export NM=nm
+export OBJCOPY=objcopy
 
 
 #检测grub是否已经安装
@@ -19,7 +27,7 @@ if ! hash 2>/dev/null apt-get; then
 fi
 #下载grub2.06
 if [ ! -f "grub-2.06.tar.xz" ]; then
-    wget https://mirrors.tuna.tsinghua.edu.cn/gnu/grub/grub-2.06.tar.xz || exit 1
+    wget https://mirrors.ustc.edu.cn/gnu/grub/grub-2.06.tar.xz || exit 1
 fi
 
 echo "开始下载grub2.06"
@@ -42,19 +50,19 @@ sudo apt-get install -y \
 cd grub-2.06
 echo "开始安装grub2.06"
 #编译安装三个版本的grub
-./configure --target=i386 --prefix=$(dirname $PWD)/${grub_dir_i386_legacy} || exit 1
+./configure --target=i386 --prefix=${grub_dir_i386_legacy} || exit 1
 make -j $(nproc) || exit 1
-make install || exit 1
+sudo make install || exit 1
 make clean || exit 1
 
-./configure --target=i386 --with-platform=efi --prefix=$(dirname $PWD)/${grub_dir_i386_efi} ||	exit 1
+./configure --target=i386 --with-platform=efi --prefix=${grub_dir_i386_efi} ||	exit 1
 make -j $(nproc) || exit 1
-make install || exit 1
+sudo make install || exit 1
 make clean || exit 1
 
-./configure --target=x86_64 --with-platform=efi --prefix=$(dirname $PWD)/${grub_dir_x86_64_efi} || exit 1
+./configure --target=x86_64 --with-platform=efi --prefix=${grub_dir_x86_64_efi} || exit 1
 make -j $(nproc) || exit 1
-make install || exit 1
+sudo make install || exit 1
 
 cd ..
 #解除权限限制

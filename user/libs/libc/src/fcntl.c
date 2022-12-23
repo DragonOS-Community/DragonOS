@@ -1,5 +1,5 @@
-#include <libc/src/fcntl.h>
-#include <libsystem/syscall.h>
+#include <libc/src/include/fcntl.h>
+#include <libc/src/include/syscall.h>
 
 /**
  * @brief 打开文件的接口

@@ -1,9 +1,9 @@
-#include "sys_version.h"    // 这是系统的版本头文件，在编译过程中自动生成
-#include <libc/src/math.h>
-#include <libc/src/stdio.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/time.h>
-#include <libc/src/unistd.h>
+#include <libc/src/include/sys_version.h>    // 这是系统的版本头文件，在编译过程中自动生成
+#include <libc/src/include/math.h>
+#include <libc/src/include/stdio.h>
+#include <libc/src/include/stdlib.h>
+#include <libc/src/include/time.h>
+#include <libc/src/include/unistd.h>
 
 void print_ascii_logo()
 {

@@ -1,7 +1,7 @@
-#include "time.h"
-#include "errno.h"
-#include "unistd.h"
-#include <libsystem/syscall.h>
+#include <libc/src/include/time.h>
+#include <libc/src/include/errno.h>
+#include <libc/src/include/unistd.h>
+#include <libc/src/include/syscall.h>
 
 /**
  * @brief 休眠指定时间

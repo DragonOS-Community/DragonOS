@@ -1,7 +1,7 @@
 #include <libc/src/include/signal.h>
-#include <libc/src/printf.h>
-#include <libc/src/stddef.h>
-#include <libsystem/syscall.h>
+#include <libc/src/include/printf.h>
+#include <libc/src/include/stddef.h>
+#include <libc/src/include/syscall.h>
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")

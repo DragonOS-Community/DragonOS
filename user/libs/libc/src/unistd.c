@@ -1,10 +1,10 @@
-#include <libc/src/errno.h>
-#include <libc/src/fcntl.h>
-#include <libc/src/stddef.h>
-#include <libc/src/stdio.h>
-#include <libc/src/string.h>
-#include <libc/src/unistd.h>
-#include <libsystem/syscall.h>
+#include <libc/src/include/errno.h>
+#include <libc/src/include/fcntl.h>
+#include <libc/src/include/stddef.h>
+#include <libc/src/include/stdio.h>
+#include <libc/src/include/string.h>
+#include <libc/src/include/unistd.h>
+#include <libc/src/include/syscall.h>
 
 /**
  * @brief 关闭文件接口

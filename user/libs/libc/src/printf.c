@@ -1,10 +1,9 @@
-#include "printf.h"
-
-#include <libc/src/math.h>
-#include <libc/src/stdio.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/string.h>
-#include <libsystem/syscall.h>
+#include <libc/src/include/printf.h>
+#include <libc/src/include/math.h>
+#include <libc/src/include/stdio.h>
+#include <libc/src/include/stdlib.h>
+#include <libc/src/include/string.h>
+#include <libc/src/include/syscall.h>
 
 static char *write_num(char *str, uint64_t num, int base, int field_width, int precision, int flags);
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);

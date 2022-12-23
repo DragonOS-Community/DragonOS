@@ -1,11 +1,11 @@
-#include "dirent.h"
-#include "unistd.h"
-#include "stdio.h"
-#include "fcntl.h"
-#include "stddef.h"
-#include "stdlib.h"
-#include "string.h"
-#include <libsystem/syscall.h>
+#include <libc/src/include/dirent.h>
+#include <libc/src/include/unistd.h>
+#include <libc/src/include/stdio.h>
+#include <libc/src/include/fcntl.h>
+#include <libc/src/include/stddef.h>
+#include <libc/src/include/stdlib.h>
+#include <libc/src/include/string.h>
+#include <libc/src/include/syscall.h>
 
 /**
  * @brief 打开文件夹

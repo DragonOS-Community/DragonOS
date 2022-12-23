@@ -1,5 +1,5 @@
-#include "stat.h"
-#include <libsystem/syscall.h>
+#include <libc/src/include/stat.h>
+#include <libc/src/include/syscall.h>
 
 int mkdir(const char *path, mode_t mode)
 {

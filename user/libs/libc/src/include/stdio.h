@@ -1,6 +1,6 @@
 #pragma once
 
-#include <libc/src/sys/types.h>
+#include <libc/src/include/types.h>
 #include <stdarg.h>
 
 // 字体颜色的宏定义

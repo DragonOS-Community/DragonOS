@@ -1,6 +1,6 @@
 #pragma once
 
-#include "types.h"
+#include <libc/src/include/types.h>
 
 /**
  * @brief 等待所有子进程退出

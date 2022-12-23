@@ -1,18 +1,18 @@
-#include "cmd.h"
-#include "cmd_help.h"
-#include "cmd_test.h"
-#include <libc/src/dirent.h>
-#include <libc/src/errno.h>
-#include <libc/src/fcntl.h>
+#include <libc/src/include/cmd.h>
+#include <libc/src/include/cmd_help.h>
+#include <libc/src/include/cmd_test.h>
+#include <libc/src/include/dirent.h>
+#include <libc/src/include/errno.h>
+#include <libc/src/include/fcntl.h>
 #include <libc/src/include/signal.h>
-#include <libc/src/stddef.h>
-#include <libc/src/stdio.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/string.h>
-#include <libc/src/sys/stat.h>
-#include <libc/src/sys/wait.h>
-#include <libc/src/unistd.h>
-#include <libsystem/syscall.h>
+#include <libc/src/include/stddef.h>
+#include <libc/src/include/stdio.h>
+#include <libc/src/include/stdlib.h>
+#include <libc/src/include/string.h>
+#include <libc/src/include/stat.h>
+#include <libc/src/include/wait.h>
+#include <libc/src/include/unistd.h>
+#include <libc/src/include/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;

@@ -1,5 +1,5 @@
-#include "wait.h"
-#include <libsystem/syscall.h>
+#include <libc/src/include/wait.h>
+#include <libc/src/include/syscall.h>
 
 /**
  * @brief 等待所有子进程退出

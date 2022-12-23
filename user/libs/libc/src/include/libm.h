@@ -1,5 +1,5 @@
 #pragma once
-#include <libc/src/sys/types.h>
+#include <libc/src/include/types.h>
 
 // ===== 描述long double 的数据比特结构
 #if __LDBL_MANT_DIG__ == 53 && __LDBL_MAX_EXP__ == 1024

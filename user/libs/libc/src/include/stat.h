@@ -1,5 +1,5 @@
 #pragma once
-#include <libc/src/sys/types.h>
+#include <libc/src/include/types.h>
 
 /**
  * @brief 系统内存信息结构体（单位：字节）

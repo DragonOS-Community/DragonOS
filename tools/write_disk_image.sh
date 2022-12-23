@@ -37,7 +37,7 @@ bins[0]=${kernel}
 for file in ${bins[*]};do
 if [ ! -x $file ]; then
 echo "$file 不存在！"
-exit
+exit 
 fi
 done
 

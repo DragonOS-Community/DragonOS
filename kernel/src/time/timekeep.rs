@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-use crate::include::bindings::bindings::{rtc_get_cmos_time, rtc_time_t};
+
+use crate::driver::timers::rtc::rtc::{rtc_get_cmos_time, rtc_time_t};
 
 #[allow(non_camel_case_types)]
 pub type ktime_t = i64;
@@ -23,10 +24,8 @@ fn ktime_get_real() -> ktime_t {
         year: (0),
     };
 
-    unsafe {
-        //调用rtc.h里面的函数
-        rtc_get_cmos_time(&mut rtc_time);
-    }
+    //调用rtc.h里面的函数
+    rtc_get_cmos_time(&mut rtc_time);
 
     let mut day_count: i32 = 0;
     for year in 1970..rtc_time.year {
@@ -36,9 +35,7 @@ fn ktime_get_real() -> ktime_t {
         } else {
             day_count += 365;
         }
-        //println!("{},{}",year,day_count);
     }
-    //println!("day count1: {}",day_count);
     for month in 1..rtc_time.month {
         match month {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => day_count += 31,
@@ -46,16 +43,14 @@ fn ktime_get_real() -> ktime_t {
             4 | 6 | 9 | 11 => day_count += 30,
             _ => day_count += 0,
         }
-        //println!("{}:{}",month,day_count);
     }
 
     day_count += rtc_time.day - 1;
-    //println!("day count2: {}",day_count);
     //转换成纳秒
     let timestamp: ktime_t = day_count as i64 * 86_400_000_000_000i64
         + (rtc_time.hour - 8) as i64 * 3_600_000_000_000i64
         + rtc_time.minute as i64 * 60_000_000_000i64
-        + rtc_time.second as i64 * 1_000_000_000i64 as ktime_t;
+        + rtc_time.second as i64 * 1_000_000_000u64 as ktime_t;
 
     return timestamp;
 }

@@ -27,7 +27,7 @@ jobs:
     - if: ${{ steps.cache-dragonos-gcc.outputs.cache-hit != 'true' }}
       name: build dragonos-gcc
       continue-on-error: true
-      run: bash tools/build_gcc_toolchain.sh
+      run: bash tools/build_gcc_toolchain.sh -f
     
     - name: Cache build tools
       id: cache-build-tools
@@ -45,4 +45,4 @@ jobs:
       run:  sudo apt install -y llvm-dev libclang-dev clang gcc-multilib && cargo install cargo-binutils && rustup toolchain install nightly && rustup default nightly && rustup component add rust-src && rustup component add llvm-tools-preview && rustup target add x86_64-unknown-none 
     
     - name: build the DragonOS
-      run: make -j $(nproc)
+      run: bash -c "source ~/.bashrc && make -j $(nproc) "

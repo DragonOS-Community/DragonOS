@@ -37,6 +37,8 @@ jobs:
       with:
         path: |
           ~/.cargo
+          ~/.rustup
+          ~/.bashrc
         key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('.github/workflows/makefile.yml') }}
     
     - if: ${{ steps.cache-build-tools.outputs.cache-hit != 'true' }}

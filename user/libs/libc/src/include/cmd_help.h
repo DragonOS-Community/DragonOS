@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cmd.h"
+#include <libc/src/include/cmd.h>
 int shell_help(int argc, char **argv);
 
 /**

@@ -27,12 +27,11 @@ if ! hash 2>/dev/null apt-get; then
 fi
 #下载grub2.06
 if [ ! -f "grub-2.06.tar.xz" ]; then
+    echo "开始下载grub2.06"
     wget https://mirrors.ustc.edu.cn/gnu/grub/grub-2.06.tar.xz || exit 1
+    echo "下载完成"
 fi
 
-echo "开始下载grub2.06"
-
-echo "下载完成"
 tar xvf grub-2.06.tar.xz
 #安装对应依赖
 sudo apt-get update

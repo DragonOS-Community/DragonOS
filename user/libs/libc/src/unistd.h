@@ -1,5 +1,5 @@
 #pragma once
-#include <stdint.h>
+#include <libc/src/include/stdint.h>
 #include <libc/src/sys/types.h>
 
 /**

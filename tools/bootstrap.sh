@@ -1,23 +1,25 @@
 emulator="qemu"
 defpackman="apt-get"
+dockerInstall="true"
 export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
 export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
 
 banner()
 {
-    echo "|------------------------------------------|"
+	echo "|------------------------------------------|"
 	echo "|    Welcome to the DragonOS bootstrap     |"
 	echo "|------------------------------------------|"
 }
 
+# 因为编码原因, 只有在vim打开该文件的时候对齐才是真的对齐
 congratulations()
 {
-    echo "|-----------Congratulations!---------------|"
+	echo "|-----------Congratulations!---------------|"
 	echo "|                                          |"
-	echo "|   你成功安装了DragonOS所需的依赖项!          |"
-	echo "|   您可以通过以下命令运行它:                  |"
+	echo "|   你成功安装了DragonOS所需的依赖项!      |"
+	echo "|   您可以通过以下命令运行它:              |"
 	echo "|                                          |"
-	echo "|   make run-docker -j 你的cpu核心数         |"
+	echo "|   make run-docker -j 你的cpu核心数       |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
@@ -39,8 +41,8 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools
-    
-    if [ -z "$(which docker)" ]; then
+
+    if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."
         sudo mkdir -p /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -49,7 +51,9 @@ install_ubuntu_debian_pkg()
             $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
         sudo $1 update
         sudo "$1" install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    else
+    elif [ -z ${dockerInstall} ]; then
+		echo "您传入--no-docker参数生效, 安装docker步骤被跳过."
+	elif [ -n "$(which docker)" ]; then
         echo "您的计算机上已经安装了docker"
     fi
 
@@ -138,9 +142,32 @@ rustInstall() {
 	fi
 }
 
+
+############# 脚本开始 ##############
+# 读取参数及选项，使用 -help 参数查看详细选项
+while true; do
+	if [ -z "$1" ]; then
+		break;
+	fi
+	echo "repeat"
+	case "$1" in
+		"--no-docker")
+			dockerInstall=""
+		;;
+		"--help")
+			echo "--no-docker(not install docker): 该参数表示执行该脚本的过程中不单独安装docker."
+			exit 0
+		;;
+		*)
+			echo "无法识别参数$1, 请传入 --help 参数查看提供的选项."
+		;;
+	esac
+	shift 1
+done
+
 ############ 开始执行 ###############
-banner
-rustInstall
+banner 			# 开始横幅
+rustInstall     # 安装rust
 
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1
@@ -176,7 +203,11 @@ fi
 
 # 创建磁盘镜像
 bash create_hdd_image.sh
+# 编译安装GCC交叉编译工具链
+bash build_gcc_toolchain.sh
+# 编译安装grub
 bash grub_auto_install.sh
+
 # 解决kvm权限问题
 USR=$USER
 sudo adduser $USR kvm

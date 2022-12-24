@@ -1,10 +1,6 @@
 #pragma once
 
-<<<<<<<< HEAD:user/libs/libc/src/include/sys/wait.h
 #include <libc/src/include/sys/types.h>
-========
-#include <libc/src/include/types.h>
->>>>>>>> 6f52b565fa38d82ee93574ac2059721f34e5fab3:user/libs/libc/src/include/wait.h
 
 /**
  * @brief 等待所有子进程退出

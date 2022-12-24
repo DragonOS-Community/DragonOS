@@ -1,1 +1,0 @@
-#define DRAGONOS_GIT_COMMIT_SHA1 "c869e9ae"

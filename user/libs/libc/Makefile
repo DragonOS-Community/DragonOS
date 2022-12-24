@@ -1,6 +1,6 @@
 
 all: 
-	$(MAKE) -C src all
+	$(MAKE) CFLAGS="$(CFLAGS)" -C src all
 
 clean:
 	rm -f Cargo.lock

@@ -1,4 +1,4 @@
-#include <libc/src/include/libm.h>
+#include <libm.h>
 
 #if __FLT_EVAL_METHOD__ == 0 || __FLT_EVAL_METHOD__ == 1
 #define EPS __DBL_EPSILON__

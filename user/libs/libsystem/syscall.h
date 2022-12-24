@@ -1,6 +1,6 @@
 #pragma once
 
-#include <libc/src/include/stdint.h>
+#include <stdint.h>
 
 // 系统调用号
 #define SYS_NOT_EXISTS 0

@@ -1,5 +1,5 @@
 #pragma once
-#include <libc/src/include/stddef.h>
+#include <stddef.h>
 
 double fabs(double x);
 float fabsf(float x);

@@ -1,10 +1,10 @@
 #pragma once
 
-#include <libc/src/include/sys/types.h>
+#include <sys/types.h>
 
 #pragma once
 
-#include <libc/src/include/__libc__.h>
+#include <__libc__.h>
 
 
 int isalnum(int c);

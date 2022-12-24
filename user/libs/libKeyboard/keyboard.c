@@ -1,5 +1,6 @@
 #include "keyboard.h"
-#include <libc/src/include/unistd.h>
+#include <unistd.h>
+
 // 功能键标志变量
 static bool shift_l = 0, shift_r = 0, ctrl_l = 0, ctrl_r = 0, alt_l = 0, alt_r = 0;
 static bool gui_l = 0, gui_r = 0, apps = 0, insert = 0, home = 0, pgup = 0, del = 0, end = 0, pgdn = 0, arrow_u = 0, arrow_l = 0, arrow_d = 0, arrow_r = 0;

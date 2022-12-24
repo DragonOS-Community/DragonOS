@@ -1,5 +1,5 @@
 #pragma once
-#include <libc/src/include/sys/types.h>
+#include <sys/types.h>
 
 /**
  * @brief 获取一块堆内存

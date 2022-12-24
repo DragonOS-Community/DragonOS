@@ -1,6 +1,6 @@
-#include <libc/src/include/signal.h>
-#include <libc/src/include/printf.h>
-#include <libc/src/include/stddef.h>
+#include <signal.h>
+#include <printf.h>
+#include <stddef.h>
 #include <libsystem/syscall.h>
 
 #pragma GCC push_options

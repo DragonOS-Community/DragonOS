@@ -1,6 +1,6 @@
 #pragma once
-#include <libc/src/include/stdint.h>
-#include <libc/src/include/sys/types.h>
+#include <stdint.h>
+#include <sys/types.h>
 
 /**
  * @brief 关闭文件接口

@@ -1,9 +1,9 @@
-#include <libc/src/include/stdlib.h>
+#include <stdlib.h>
 #include <libsystem/syscall.h>
-#include <libc/src/include/stddef.h>
-#include <libc/src/include/unistd.h>
-#include <libc/src/include/errno.h>
-#include <libc/src/include/stdio.h>
+#include <stddef.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
 
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21

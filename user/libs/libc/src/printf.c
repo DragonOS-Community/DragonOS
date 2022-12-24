@@ -1,9 +1,9 @@
-#include <libc/src/include/printf.h>
+#include <printf.h>
 
-#include <libc/src/include/math.h>
-#include <libc/src/include/stdio.h>
-#include <libc/src/include/stdlib.h>
-#include <libc/src/include/string.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <libsystem/syscall.h>
 
 static char *write_num(char *str, uint64_t num, int base, int field_width, int precision, int flags);

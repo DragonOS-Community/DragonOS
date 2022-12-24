@@ -1,6 +1,6 @@
-#include <libc/src/include/math.h>
-#include <libc/src/include/sys/types.h>
-#include <libc/src/include/libm.h>
+#include <math.h>
+#include <sys/types.h>
+#include <libm.h>
 
 double fabs(double x)
 {

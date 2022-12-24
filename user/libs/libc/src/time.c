@@ -1,6 +1,6 @@
-#include "time.h"
-#include "errno.h"
-#include "unistd.h"
+#include <libc/src/include/time.h>
+#include <libc/src/include/errno.h>
+#include <libc/src/include/unistd.h>
 #include <libsystem/syscall.h>
 
 /**

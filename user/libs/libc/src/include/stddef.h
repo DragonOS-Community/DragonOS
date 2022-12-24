@@ -1,6 +1,6 @@
 #pragma once
 
-#include <libc/src/sys/types.h>
+#include <libc/src/include/sys/types.h>
 
 #ifdef __cplusplus
    #define NULL 0

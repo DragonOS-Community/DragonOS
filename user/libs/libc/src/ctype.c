@@ -1,4 +1,4 @@
-#include <libc/src/ctype.h>
+#include <libc/src/include/ctype.h>
 
 
 int isprint(int c)

@@ -9,7 +9,7 @@ GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
 output_dir=$(ROOT_PATH)/bin/user
 
-CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs
+CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs -I $(shell pwd)/libs/libc/src/include -I $(shell pwd)/libs/libc/src/include/sys
 current_CFLAGS := $(CFLAGS)
 
 ECHO:
@@ -22,7 +22,6 @@ $(user_sub_dirs): ECHO sys_api_lib
 app: $(user_sub_dirs)
 
 all: app
-	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
 

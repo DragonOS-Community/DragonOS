@@ -1,4 +1,4 @@
-#include "stat.h"
+#include <libc/src/include/sys/stat.h>
 #include <libsystem/syscall.h>
 
 int mkdir(const char *path, mode_t mode)

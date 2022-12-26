@@ -21,22 +21,17 @@
  * @brief 发起软中断
  *
  */
-#define raise_softirq(sirq_num)            \
-    do                                     \
-    {                                      \
-        set_softirq_pending(1 << sirq_num); \
+#define raise_softirq(sirq_num)                                                                                        \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        set_softirq_pending(1 << sirq_num);                                                                            \
     } while (0);
-
-
-
 
 struct softirq_t
 {
     void (*action)(void *data); // 软中断处理函数
     void *data;
 };
-
-struct softirq_t softirq_vector[MAX_SOFTIRQ_NUM] = {0};
 
 /**
  * @brief 软中断注册函数

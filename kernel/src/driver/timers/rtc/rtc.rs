@@ -8,7 +8,7 @@ pub struct rtc_time_t {
 }
 
 use crate::{
-    arch::x86_64::interrupt::{cli, sti},
+    arch::interrupt::{cli, sti},
     include::bindings::bindings::{io_in8, io_out8},
 };
 

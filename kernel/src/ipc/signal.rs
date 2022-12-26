@@ -1,7 +1,7 @@
 use core::{ffi::c_void, intrinsics::size_of, ptr::read_volatile, sync::atomic::compiler_fence};
 
 use crate::{
-    arch::x86_64::{
+    arch::{
         asm::{bitops::ffz, current::current_pcb, ptrace::user_mode},
         interrupt::sti,
     },

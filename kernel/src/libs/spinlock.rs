@@ -57,11 +57,12 @@ pub fn spin_unlock_irq(lock: *mut spinlock_t) {
     sti();
 }
 
+#[derive(Debug)]
 pub struct RawSpinlock(AtomicBool);
 
 impl RawSpinlock {
     /// @brief 初始化自旋锁
-    const INIT: RawSpinlock = RawSpinlock(AtomicBool::new(false));
+    pub const INIT: RawSpinlock = RawSpinlock(AtomicBool::new(false));
 
     /// @brief 加锁
     pub fn lock(&mut self) {

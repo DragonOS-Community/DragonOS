@@ -1,7 +1,7 @@
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::{
-    arch::x86_64::asm::current::current_pcb,
+    arch::asm::current::current_pcb,
     include::bindings::bindings::{
         process_control_block, sched_enqueue, PROC_RUNNING, PROC_STOPPED,
     },

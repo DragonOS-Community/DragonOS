@@ -1,4 +1,4 @@
-use crate::{include::bindings::bindings::pt_regs, arch::x86_64::asm::current::current_pcb};
+use crate::{include::bindings::bindings::pt_regs, arch::asm::current::current_pcb};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]

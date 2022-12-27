@@ -21,8 +21,8 @@
 #include <exception/gate.h>
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/fat32/fat32.h>
-#include <filesystem/rootfs/rootfs.h>
 #include <filesystem/procfs/procfs.h>
+#include <filesystem/rootfs/rootfs.h>
 #include <ktest/ktest.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
@@ -62,8 +62,8 @@ extern void initial_proc_init_signal(struct process_control_block *pcb);
     }
 
 struct thread_struct initial_thread = {
-    .rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
-    .rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+    .trap_frame.rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
+    .trap_frame.rsp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
     .fs = KERNEL_DS,
     .gs = KERNEL_DS,
     .cr2 = 0,
@@ -95,33 +95,6 @@ uint64_t process_exit_files(struct process_control_block *pcb);
  * @return uint64_t
  */
 uint64_t process_exit_mm(struct process_control_block *pcb);
-
-/**
- * @brief 切换进程
- *
- * @param prev 上一个进程的pcb
- * @param next 将要切换到的进程的pcb
- * 由于程序在进入内核的时候已经保存了寄存器，因此这里不需要保存寄存器。
- * 这里切换fs和gs寄存器
- */
-#pragma GCC push_options
-#pragma GCC optimize("O0")
-void __switch_to(struct process_control_block *prev, struct process_control_block *next)
-{
-    initial_tss[proc_current_cpu_id].rsp0 = next->thread->rbp;
-    // kdebug("next_rsp = %#018lx   ", next->thread->rsp);
-    //  set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2,
-    //  initial_tss[0].ist1,
-    //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
-    //           initial_tss[0].ist6, initial_tss[0].ist7);
-
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
-
-    __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
-    __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
-}
-#pragma GCC pop_options
 
 /**
  * @brief 打开要执行的程序文件
@@ -499,8 +472,10 @@ ul initial_kernel_thread(ul arg)
 
     // 若在后面这段代码中触发中断，return时会导致段选择子错误，从而触发#GP，因此这里需要cli
     cli();
-    current_pcb->thread->rip = (ul)ret_from_system_call;
-    current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
+    // current_pcb->thread->rip = (ul)ret_from_system_call;
+    // current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
+    current_pcb->thread->trap_frame.rip = (ul)ret_from_system_call;
+    current_pcb->thread->trap_frame.rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
     current_pcb->thread->fs = USER_DS | 0x3;
     barrier();
     current_pcb->thread->gs = USER_DS | 0x3;
@@ -509,15 +484,15 @@ ul initial_kernel_thread(ul arg)
     current_pcb->flags &= (~PF_KTHREAD);
     kdebug("in initial_kernel_thread: flags=%ld", current_pcb->flags);
 
-    regs = (struct pt_regs *)current_pcb->thread->rsp;
+    regs = (struct pt_regs *)current_pcb->thread->trap_frame.rsp;
     // kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数
     // 这里的设计思路和switch_proc类似 加载用户态程序：shell.elf
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
-                         "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
-                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/bin/shell.elf"), "c"(NULL),
+                         "jmp do_execve  \n\t" ::"D"(current_pcb->thread->trap_frame.rsp),
+                         "m"(current_pcb->thread->trap_frame.rsp), "m"(current_pcb->thread->trap_frame.rip), "S"("/bin/shell.elf"), "c"(NULL),
                          "d"(NULL)
                          : "memory");
 
@@ -555,7 +530,8 @@ ul process_do_exit(ul code)
     sti();
 
     process_exit_notify();
-    sched();
+    current_pcb->flags |= PF_NEED_SCHED;
+    schedule_immediately();
 
     while (1)
         pause();
@@ -610,7 +586,7 @@ void process_init()
 {
     kinfo("Initializing process...");
 
-    initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
+    initial_tss[proc_current_cpu_id].rsp0 = initial_thread.trap_frame.rbp;
 
     /*
     kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
@@ -869,3 +845,21 @@ void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_nam
 {
     __set_pcb_name(pcb, pcb_name);
 }
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+void __switch_to(struct process_control_block *prev, struct process_control_block *next)
+{
+    initial_tss[proc_current_cpu_id].rsp0 = next->thread->trap_frame.rbp;
+    // kdebug("next_rsp = %#018lx   ", next->thread->rsp);
+    //  set_tss64((uint *)phys_2_virt(TSS64_Table), initial_tss[0].rsp0, initial_tss[0].rsp1, initial_tss[0].rsp2,
+    //  initial_tss[0].ist1,
+    //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
+    //           initial_tss[0].ist6, initial_tss[0].ist7);
+
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
+
+    __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
+    __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
+}
+#pragma GCC pop_options

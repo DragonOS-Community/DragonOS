@@ -33,12 +33,12 @@ main.o: main.c
 
 kernel_rust:
 	rustup default nightly
-	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json
+	cargo +nightly build  --target ./arch/x86_64/x86_64-unknown-none.json
 
 all: kernel
 
 	@echo "Linking kernel..."
-	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds
+	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/debug/libdragonos_kernel.a -T link.lds
 # 生成kallsyms
 	current_dir=$(pwd)
 	
@@ -55,7 +55,7 @@ all: kernel
 # 重新链接
 	@echo "Re-Linking kernel..."
 	@echo $(shell find . -name "*.o")
-	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds
+	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/debug/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
 	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../../bin/kernel/kernel.elf

@@ -90,7 +90,7 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
         int len = vsnprintf(pcb_name, name_fmt, PCB_NAME_LEN, get_args);
         if (len >= PCB_NAME_LEN)
         {
-            //名字过大 放到full_name字段中
+            // 名字过大 放到full_name字段中
             struct kthread_info_t *kthread = to_kthread(pcb);
             char *full_name = kzalloc(1024, 0);
             vsprintf(full_name, name_fmt, get_args);
@@ -173,11 +173,11 @@ static int kthread(void *_create)
     // 将当前pcb返回给创建者
     create->result = current_pcb;
 
-    current_pcb->state &= ~PROC_RUNNING;    // 设置当前进程不是RUNNING态
+    current_pcb->state &= ~PROC_RUNNING; // 设置当前进程不是RUNNING态
     io_mfence();
 
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
-    sched();
+    schedule_immediately();
 
     retval = -EINTR;
     // 如果发起者没有调用kthread_stop()，则该kthread的功能函数开始执行
@@ -200,6 +200,8 @@ static void __create_kthread(struct kthread_create_info_t *create)
     }
 }
 
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 /**
  * @brief kthread守护线程
  *
@@ -208,6 +210,7 @@ static void __create_kthread(struct kthread_create_info_t *create)
  */
 int kthreadd(void *unused)
 {
+    barrier();
     kinfo("kthread daemon started!");
     struct process_control_block *pcb = current_pcb;
     kthreadd_pcb = current_pcb;
@@ -218,7 +221,7 @@ int kthreadd(void *unused)
         current_pcb->state = PROC_INTERRUPTIBLE;
         // 所有的创建任务都被处理完了
         if (list_empty(&kthread_create_list))
-            sched();
+            schedule_immediately();
 
         spin_lock(&__kthread_create_lock);
         // 循环取出链表中的任务
@@ -237,7 +240,10 @@ int kthreadd(void *unused)
         }
         spin_unlock(&__kthread_create_lock);
     }
+    barrier();
 }
+
+#pragma GCC pop_options
 
 /**
  * @brief 内核线程调用该函数，检查自身的标志位，判断自己是否应该执行完任务后退出

@@ -18,7 +18,8 @@ void semaphore_down(semaphore_t *sema)
         list_append(&sema->wait_queue.wait_list, &wait.wait_list);
 
         // 执行调度
-        sched();
+        current_pcb->flags |= PF_NEED_SCHED;
+        schedule_immediately();
     }
 }
 

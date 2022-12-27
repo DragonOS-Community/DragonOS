@@ -56,7 +56,7 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
 
     current_pcb->state = PROC_INTERRUPTIBLE;
     current_pcb->flags |= PF_NEED_SCHED;
-    sched();
+    schedule_immediately();
 
     // todo: 增加信号唤醒的功能后，设置rmtp
 

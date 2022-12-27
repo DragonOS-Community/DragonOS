@@ -3,6 +3,7 @@
 #include <DragonOS/signal.h>
 #include <common/wait_queue.h>
 #include <DragonOS/stdint.h>
+#include "ptrace.h"
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -43,11 +44,11 @@
 struct thread_struct
 {
     // 内核层栈基指针
-    ul rbp; // in tss rsp0
+    // ul rbp; // in tss rsp0
     // 内核层代码指针
-    ul rip;
+    // ul rip;
     // 内核层栈指针
-    ul rsp;
+    // ul rsp;
 
     ul fs, gs;
 
@@ -56,6 +57,9 @@ struct thread_struct
     ul trap_num;
     // 错误码
     ul err_code;
+
+    /// @brief 当进程被调度出cpu时，本字段用于保存进程的上下文。
+    struct pt_regs trap_frame;
 };
 
 // ========= pcb->flags =========
@@ -128,6 +132,7 @@ struct process_control_block
     sigset_t sig_blocked;
     // 正在等待的信号的标志位，表示某个信号正在等待处理
     struct sigpending sig_pending;
+
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

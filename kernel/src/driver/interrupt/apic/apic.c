@@ -1,4 +1,5 @@
 #include "apic.h"
+#include "apic_timer.h"
 #include <common/kprint.h>
 #include <common/printk.h>
 #include <common/cpu.h>
@@ -458,10 +459,10 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         kBUG("current_pcb->preempt_count<0! pid=%d", current_pcb->pid); // should not be here
 
     // 检测当前进程是否可被调度
-    if (current_pcb->flags & PF_NEED_SCHED)
+    if (current_pcb->flags & PF_NEED_SCHED && number == APIC_TIMER_IRQ_NUM)
     {
         io_mfence();
-        sched();
+        sched(rsp);
     }
 }
 

@@ -56,7 +56,7 @@ void traceback(struct pt_regs *regs)
 
         // 当前栈帧的rbp的地址大于等于内核栈的rbp的时候，表明调用栈已经到头了，追踪结束。
         // 当前rbp的地址为用户空间时，直接退出
-        if((uint64_t)(rbp) >= current_pcb->thread->rbp || ((uint64_t)rbp<regs->rsp))
+        if((uint64_t)(rbp) >= current_pcb->thread->trap_frame.rbp || ((uint64_t)rbp<regs->rsp))
             break;
 
         printk_color(ORANGE, BLACK, "rbp:%#018lx,*rbp:%#018lx\n", rbp, *rbp);

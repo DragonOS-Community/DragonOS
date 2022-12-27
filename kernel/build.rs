@@ -1,5 +1,5 @@
 extern crate bindgen;
-
+extern crate dunce;
 // use ::std::env;
 
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ fn main() {
         let bindings = bindgen::Builder::default()
             .clang_arg("-I./src")
             .clang_arg("-I./src/include")
-            .clang_arg("-I./src/arch/x86_64/include")   // todo: 当引入多种架构之后，需要修改这里，对于不同的架构编译时，include不同的路径
+            .clang_arg("-I./src/arch/x86_64/include") // todo: 当引入多种架构之后，需要修改这里，对于不同的架构编译时，include不同的路径
             // The input header we would like to generate
             // bindings for.
             .header("src/include/bindings/wrapper.h")

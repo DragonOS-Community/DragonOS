@@ -70,8 +70,9 @@ int video_refresh_daemon(void *unused)
             }
             video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
         }
-        video_daemon_pcb->flags &= ~PROC_RUNNING;
-        sched();
+        video_daemon_pcb->state &= ~PROC_RUNNING;
+        video_daemon_pcb->flags |= PF_NEED_SCHED;
+        schedule_immediately();
     }
 
     return 0;

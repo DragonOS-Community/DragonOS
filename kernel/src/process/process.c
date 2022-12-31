@@ -21,8 +21,8 @@
 #include <exception/gate.h>
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/fat32/fat32.h>
-#include <filesystem/rootfs/rootfs.h>
 #include <filesystem/procfs/procfs.h>
+#include <filesystem/rootfs/rootfs.h>
 #include <ktest/ktest.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
@@ -122,6 +122,18 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
 }
 #pragma GCC pop_options
+
+/**
+ * @brief 切换进程的fs、gs寄存器
+ * 注意，fs、gs的值在return的时候才会生效，因此本函数不能简化为一个单独的宏
+ * @param fs 目标fs值
+ * @param gs 目标gs值
+ */
+void process_switch_fsgs(uint64_t fs, uint64_t gs)
+{
+    asm volatile("movq	%0,	%%fs \n\t" ::"a"(fs));
+    asm volatile("movq	%0,	%%gs \n\t" ::"a"(gs));
+}
 
 /**
  * @brief 打开要执行的程序文件
@@ -504,6 +516,7 @@ ul initial_kernel_thread(ul arg)
     current_pcb->thread->fs = USER_DS | 0x3;
     barrier();
     current_pcb->thread->gs = USER_DS | 0x3;
+    process_switch_fsgs(current_pcb->thread->fs, current_pcb->thread->gs);
 
     // 主动放弃内核线程身份
     current_pcb->flags &= (~PF_KTHREAD);

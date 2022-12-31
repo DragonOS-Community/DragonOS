@@ -1,2 +1,2 @@
-#include "errno.h"
+#include <errno.h>
 int errno = 0;

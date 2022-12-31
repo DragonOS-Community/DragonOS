@@ -71,6 +71,7 @@
 //  */
 // void sched();
 
+
 // void sched_init();
 
 // /**
@@ -83,5 +84,8 @@
 // ================= Rust 实现 =============
 extern void sched_update_jiffies();
 extern void sched_init();
-extern void sched(struct pt_regs * trap_frame);
+extern void sched();
 extern void schedule_immediately();
+
+void switch_proc(struct process_control_block *prev, struct process_control_block *proc);
+

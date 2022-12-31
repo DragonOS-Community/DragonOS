@@ -4,9 +4,9 @@ grub_dir_i386_efi=${ABS_PREFIX}/arch/i386/efi/grub
 grub_dir_i386_legacy=${ABS_PREFIX}/arch/i386/legacy/grub
 grub_dir_x86_64_efi=${ABS_PREFIX}/arch/x86_64/efi/grub
 
-mkdir -p ${grub_dir_i386_efi}
-mkdir -p ${grub_dir_i386_legacy}
-mkdir -p ${grub_dir_x86_64_efi}
+sudo mkdir -p ${grub_dir_i386_efi}
+sudo mkdir -p ${grub_dir_i386_legacy}
+sudo mkdir -p ${grub_dir_x86_64_efi}
 
 # 防止外层声明了环境变量，影响到grub的编译
 export CC=gcc

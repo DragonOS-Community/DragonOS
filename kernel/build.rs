@@ -1,5 +1,4 @@
 extern crate bindgen;
-extern crate dunce;
 // use ::std::env;
 
 use std::path::PathBuf;

@@ -12,7 +12,6 @@
 #include <process/process.h>
 #include <time/sleep.h>
 // 导出系统调用入口函数，定义在entry.S中
-extern void system_call(void);
 extern void syscall_int(void);
 
 extern uint64_t sys_clock(struct pt_regs *regs);

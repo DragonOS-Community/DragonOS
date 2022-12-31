@@ -130,7 +130,7 @@ void system_initialize()
     syscall_init();
     io_mfence();
     //  再初始化进程模块。顺序不能调转
-    sched_init();
+    // sched_init();
     io_mfence();
 
     timer_init();

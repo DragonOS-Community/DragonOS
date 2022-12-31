@@ -36,6 +36,7 @@ export CC=$(DragonOS_GCC)/x86_64-elf-gcc
 export LD=ld
 export AS=$(DragonOS_GCC)/x86_64-elf-as
 export NM=$(DragonOS_GCC)/x86_64-elf-nm
+export AR=$(DragonOS_GCC)/x86_64-elf-ar
 export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 

@@ -33,7 +33,6 @@ void syscall_init();
  * @param syscall_id 系统调用id
  * @return long 错误码
  */
-long enter_syscall(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5, ul arg6, ul arg7);
 long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5, ul arg6, ul arg7);
 
 /**

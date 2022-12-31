@@ -167,7 +167,7 @@ void do_segment_not_exists(struct pt_regs *regs, unsigned long error_code)
            regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    
+    sched();
 }
 
 // 12 #SS SS段错误
@@ -205,7 +205,6 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
             printk_color(RED, BLACK, "Refers to a descriptor in the current GDT;\n");
 
     printk_color(RED, BLACK, "Segment Selector Index:%#010x\n", error_code & 0xfff8);
-    printk_color(RED, BLACK, "AAAAAAAAAA Segment Selector Index:%#010x\n", regs->ss);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
     sched();

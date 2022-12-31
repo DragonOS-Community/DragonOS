@@ -2,9 +2,7 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
-    include::bindings::bindings::{
-        enter_syscall_int, process_control_block, pt_regs, EPERM, SCHED_NORMAL, SYS_SCHED,
-    },
+    include::bindings::bindings::{process_control_block, pt_regs, EPERM, SCHED_NORMAL},
     process::process::process_cpu,
 };
 

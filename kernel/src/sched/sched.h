@@ -77,3 +77,4 @@ void sched_init();
  */
 void sched_update_jiffies();
 
+void switch_proc(struct process_control_block *prev, struct process_control_block *proc);

@@ -1,7 +1,7 @@
 #include "cfs.h"
 #include <common/kprint.h>
-#include <driver/video/video.h>
 #include <common/spinlock.h>
+#include <driver/video/video.h>
 
 struct sched_queue_t sched_cfs_ready_queue[MAX_CPU_NUM]; // 就绪队列
 
@@ -18,7 +18,8 @@ struct process_control_block *sched_cfs_dequeue()
         return &initial_proc_union.pcb;
     }
 
-    struct process_control_block *proc = container_of(list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
+    struct process_control_block *proc = container_of(
+        list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
 
     list_del(&proc->list);
     --sched_cfs_ready_queue[proc_current_cpu_id].count;
@@ -34,7 +35,8 @@ void sched_cfs_enqueue(struct process_control_block *pcb)
 {
     if (pcb == initial_proc[proc_current_cpu_id])
         return;
-    struct process_control_block *proc = container_of(list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
+    struct process_control_block *proc = container_of(
+        list_next(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list), struct process_control_block, list);
     if ((list_empty(&sched_cfs_ready_queue[proc_current_cpu_id].proc_queue.list)) == 0)
     {
         while (proc->virtual_runtime < pcb->virtual_runtime)
@@ -58,12 +60,16 @@ void sched_cfs()
     current_pcb->flags &= ~PF_NEED_SCHED;
     // kdebug("current_pcb pid= %d", current_pcb->pid);
     struct process_control_block *proc = sched_cfs_dequeue();
-    // kdebug("sched_cfs_ready_queue[proc_current_cpu_id].count = %d", sched_cfs_ready_queue[proc_current_cpu_id].count);
-    if (current_pcb->virtual_runtime >= proc->virtual_runtime || !(current_pcb->state & PROC_RUNNING)) // 当前进程运行时间大于了下一进程的运行时间，进行切换
+    // kdebug("sched_cfs_ready_queue[proc_current_cpu_id].count = %d",
+    // sched_cfs_ready_queue[proc_current_cpu_id].count);
+    if (current_pcb->virtual_runtime >= proc->virtual_runtime ||
+        !(current_pcb->state & PROC_RUNNING)) // 当前进程运行时间大于了下一进程的运行时间，进行切换
     {
 
-        // kdebug("current_pcb->virtual_runtime = %d,proc->vt= %d", current_pcb->virtual_runtime, proc->virtual_runtime);
-        if (current_pcb->state & PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
+        // kdebug("current_pcb->virtual_runtime = %d,proc->vt= %d", current_pcb->virtual_runtime,
+        // proc->virtual_runtime);
+        if (current_pcb->state &
+            PROC_RUNNING) // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             sched_cfs_enqueue(current_pcb);
         // kdebug("proc->pid=%d, count=%d", proc->pid, sched_cfs_ready_queue[proc_current_cpu_id].count);
         if (sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies <= 0)
@@ -72,18 +78,20 @@ void sched_cfs()
             {
             case 0:
             case 1:
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = 4 / sched_cfs_ready_queue[proc_current_cpu_id].count;
+                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies =
+                    4 / sched_cfs_ready_queue[proc_current_cpu_id].count;
                 break;
             case 2:
             default:
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue[proc_current_cpu_id].count) << 2;
+                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies =
+                    (4 / sched_cfs_ready_queue[proc_current_cpu_id].count) << 2;
                 break;
             }
         }
 
-        process_switch_mm(proc);
-
+        barrier();
         switch_proc(current_pcb, proc);
+        barrier();
     }
     else // 不进行切换
     {
@@ -96,12 +104,14 @@ void sched_cfs()
             {
             case 0:
             case 1:
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = 4 / sched_cfs_ready_queue[proc_current_cpu_id].count;
+                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies =
+                    4 / sched_cfs_ready_queue[proc_current_cpu_id].count;
                 break;
             case 2:
             default:
 
-                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies = (4 / sched_cfs_ready_queue[proc_current_cpu_id].count) << 2;
+                sched_cfs_ready_queue[proc_current_cpu_id].cpu_exec_proc_jiffies =
+                    (4 / sched_cfs_ready_queue[proc_current_cpu_id].count) << 2;
                 break;
             }
         }

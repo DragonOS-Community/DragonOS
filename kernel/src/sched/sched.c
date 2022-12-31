@@ -1,9 +1,9 @@
 #include "sched.h"
 #include <common/kprint.h>
 #include <common/spinlock.h>
+#include <common/string.h>
 #include <driver/video/video.h>
 #include <sched/cfs.h>
-#include <common/string.h>
 
 /**
  * @brief
@@ -60,10 +60,10 @@ void sched_enqueue(struct process_control_block *pcb)
 }
 
 /**
- * @brief 包裹sched_cfs(),调度函数
+ * @brief 该函数只能由sys_sched调用
  *
  */
-void sched()
+static void __sched()
 {
     sched_cfs();
 }
@@ -73,5 +73,23 @@ void sched_init()
     sched_cfs_init();
 }
 
+uint64_t sys_sched(struct pt_regs *regs)
+{
+    if(user_mode(regs)){
+        return -EPERM;
+    }
+    __sched();
+}
 
+void sched()
+{
+    
+    enter_syscall_int(SYS_SCHED, 0, 0, 0, 0, 0, 0, 0, 0);
+}
 
+void switch_proc(struct process_control_block *prev, struct process_control_block *proc)
+{
+    process_switch_mm(proc);
+    io_mfence();
+    switch_to(prev, proc);
+}

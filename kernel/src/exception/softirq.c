@@ -4,6 +4,7 @@
 #include <driver/video/video.h>
 #include <common/spinlock.h>
 
+static struct softirq_t softirq_vector[MAX_SOFTIRQ_NUM] = {0};
 static spinlock_t softirq_modify_lock; // 软中断状态（status）
 static volatile uint64_t softirq_pending = 0;
 static volatile uint64_t softirq_running = 0;

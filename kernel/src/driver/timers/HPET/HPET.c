@@ -207,8 +207,6 @@ void HPET_enable()
     // kdebug("[HPET0] conf register after modify=%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))));
     // kdebug("[HPET1] conf register =%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM1_CONF))));
 
-    rtc_get_cmos_time(&rtc_now);
-
     kinfo("HPET0 enabled.");
 
     __write8b(HPET_REG_BASE + GEN_CONF, 3); // 置位旧设备中断路由兼容标志位、定时器组使能标志位

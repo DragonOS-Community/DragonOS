@@ -21,8 +21,6 @@ endif
 export ARCH=__x86_64__
 export ROOT_PATH=$(shell pwd)
 
-export RUSTC=$(shell which rustc)
-
 export DEBUG=DEBUG
 export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(ARCH) -D $(EMULATOR) -O1
 
@@ -30,21 +28,33 @@ ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
 
-export CC=gcc
+# ifeq ($(DragonOS_GCC), )
+# $(error 尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装)
+# endif
 
-.PHONY: all
+export CC=$(DragonOS_GCC)/x86_64-elf-gcc
+export LD=ld
+export AS=$(DragonOS_GCC)/x86_64-elf-as
+export NM=$(DragonOS_GCC)/x86_64-elf-nm
+export AR=$(DragonOS_GCC)/x86_64-elf-ar
+export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
+
+
+.PHONY: all 
 all: kernel user
 
 
 .PHONY: kernel
 kernel:
 	mkdir -p bin/kernel/
+	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
 	$(MAKE) -C ./kernel all || (sh -c "echo 内核编译失败" && exit 1)
 	
 .PHONY: user
 user:
 	mkdir -p bin/user/
 	mkdir -p bin/tmp/user
+	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
 	$(MAKE) -C ./user all || (sh -c "echo 用户程序编译失败" && exit 1)
 
 .PHONY: clean
@@ -66,11 +76,11 @@ gdb:
 
 # 写入磁盘镜像
 write_diskimage:
-	sudo sh -c "cd tools && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+	bash -c "cd tools && bash grub_auto_install.sh && sudo bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi:
-	sudo sh -c "cd tools && bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+	bash -c "cd tools && bash grub_auto_install.sh && sudo bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy && cd .."
@@ -87,6 +97,7 @@ build:
 docker:
 	@echo "使用docker构建"
 	sudo bash tools/build_in_docker.sh || exit 1
+	$(MAKE) write_diskimage || exit 1
 	
 # uefi方式启动
 run-uefi:
@@ -104,4 +115,5 @@ run:
 run-docker:
 	@echo "使用docker构建并运行"
 	sudo bash tools/build_in_docker.sh || exit 1
+	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu

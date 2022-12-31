@@ -17,6 +17,7 @@ void mutex_init(mutex_t *lock)
 static void __mutex_sleep()
 {
     current_pcb->state = PROC_UNINTERRUPTIBLE;
+    current_pcb->flags |= PF_NEED_SCHED;
     sched();
 }
 
@@ -71,7 +72,7 @@ void mutex_unlock(mutex_t *lock)
 {
     if (unlikely(!mutex_is_locked(lock)))
         return;
-    
+
     spin_lock(&lock->wait_lock);
     struct mutex_waiter_t *wt = NULL;
     if (mutex_is_locked(lock))

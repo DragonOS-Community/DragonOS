@@ -6,6 +6,7 @@ use core::fmt::Debug;
 
 use alloc::vec::Vec;
 
+use crate::include::bindings::bindings::NULL;
 // todo: 将这里更换为手动编写的ffi绑定
 use crate::include::bindings::bindings::atomic_t;
 use crate::include::bindings::bindings::pt_regs;
@@ -18,8 +19,12 @@ use crate::libs::refcount::RefCount;
 
 /// 请注意，sigset_t这个bitmap, 第0位表示sig=1的信号。也就是说，SignalNumber-1才是sigset_t中对应的位
 pub type sigset_t = u64;
-pub type __signalfn_t = ::core::option::Option<unsafe extern "C" fn(arg1: ::core::ffi::c_int)>;
+/// 存储信号处理函数的地址(来自用户态)
+pub type __signalfn_t = u64;
 pub type __sighandler_t = __signalfn_t;
+/// 存储信号处理恢复函数的地址(来自用户态)
+pub type __sigrestorer_fn_t = u64;
+pub type __sigrestorer_t = __sigrestorer_fn_t;
 
 /// 最大的信号数量（改动这个值的时候请同步到signal.h)
 pub const MAX_SIG_NUM: i32 = 64;
@@ -70,14 +75,27 @@ impl core::fmt::Debug for sigaction__union_u {
 
 impl Default for sigaction__union_u {
     fn default() -> Self {
-        Self { _sa_handler: None }
+        Self {
+            _sa_handler: NULL as u64,
+        }
     }
 }
 
-// ============ sigaction结构体中的的sa_flags的可选值 ===========
-pub const SA_FLAG_IGN: u64 = 1u64 << 0; // 当前sigaction表示忽略信号的动作
-pub const SA_FLAG_DFL: u64 = 1u64 << 1; // 当前sigaction表示系统默认的动作
+// ============ sigaction结构体中的的sa_flags的可选值 begin ===========
+pub const SA_FLAG_DFL: u64 = 1u64 << 0; // 当前sigaction表示系统默认的动作
+pub const SA_FLAG_IGN: u64 = 1u64 << 1; // 当前sigaction表示忽略信号的动作
 pub const SA_FLAG_RESTORER: u64 = 1u64 << 2; // 当前sigaction具有用户指定的restorer
+pub const SA_FLAG_IMMUTABLE: u64 = 1u64 << 3; // 当前sigaction不可被更改
+
+/// 所有的sa_flags的mask。（用于去除那些不存在的sa_flags位)
+pub const SA_ALL_FLAGS: u64 = SA_FLAG_IGN | SA_FLAG_DFL | SA_FLAG_RESTORER | SA_FLAG_IMMUTABLE;
+
+// ============ sigaction结构体中的的sa_flags的可选值 end ===========
+
+/// 用户态程序传入的SIG_DFL的值
+pub const USER_SIG_DFL: u64 = 0;
+/// 用户态程序传入的SIG_IGN的值
+pub const USER_SIG_IGN: u64 = 1;
 
 /**
  * @brief 信号处理结构体
@@ -87,9 +105,9 @@ pub const SA_FLAG_RESTORER: u64 = 1u64 << 2; // 当前sigaction具有用户指�
 pub struct sigaction {
     pub _u: sigaction__union_u,
     pub sa_flags: u64,
-    pub sa_mask: sigset_t,
+    pub sa_mask: sigset_t, // 为了可扩展性而设置的sa_mask
     /// 信号处理函数执行结束后，将会跳转到这个函数内进行执行，然后执行sigreturn系统调用
-    pub sa_restorer: ::core::option::Option<unsafe extern "C" fn()>,
+    pub sa_restorer: __sigrestorer_t,
 }
 
 impl Default for sigaction {
@@ -101,6 +119,30 @@ impl Default for sigaction {
             sa_restorer: Default::default(),
         }
     }
+}
+
+impl sigaction {
+    /// @brief 判断这个sigaction是否被忽略
+    pub fn ignored(&self, _sig: SignalNumber) -> bool {
+        if (self.sa_flags & SA_FLAG_IGN) != 0 {
+            return true;
+        }
+        // todo: 增加对sa_flags为SA_FLAG_DFL,但是默认处理函数为忽略的情况的判断
+
+        return false;
+    }
+}
+
+/// @brief 用户态传入的sigaction结构体（符合posix规范）
+/// 请注意，我们会在sys_sigaction函数里面将其转换成内核使用的sigaction结构体
+#[repr(C)]
+#[derive(Debug)]
+pub struct user_sigaction {
+    pub sa_handler: *mut core::ffi::c_void,
+    pub sa_sigaction: *mut core::ffi::c_void,
+    pub sa_mask: sigset_t,
+    pub sa_flags: u64,
+    pub sa_restorer: *mut core::ffi::c_void,
 }
 
 /**
@@ -485,6 +527,30 @@ impl SigQueue {
 
         return (filter_result.pop(), still_pending);
     }
+
+    /// @brief 从sigqueue中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
+    pub fn flush_by_mask(&mut self, mask: &sigset_t) {
+        // 定义过滤器，从sigqueue中删除mask中被置位的信号
+        let filter = |x: &mut siginfo| {
+            if sig_is_member(mask, SignalNumber::from(unsafe { x._sinfo.data.si_signo })) {
+                true
+            } else {
+                false
+            }
+        };
+        let filter_result: Vec<siginfo> = self.q.drain_filter(filter).collect();
+        // 回收这些siginfo
+        for x in filter_result {
+            drop(x)
+        }
+    }
+
+    /// @brief 从C的void*指针转换为static生命周期的可变引用
+    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue{
+        let sq = p as *mut SigQueue;
+        let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
+        return sq;
+    }
 }
 
 impl Default for SigQueue {
@@ -509,14 +575,54 @@ pub fn sigset_del(set: &mut sigset_t, sig: SignalNumber) {
 
 /// @brief 将指定的信号在sigset中的对应bit进行置位
 #[inline]
-pub fn sigset_add(set: &mut sigset_t, _sig: SignalNumber) {
-    *set |= 1 << ((_sig as u32) - 1);
+pub fn sigset_add(set: &mut sigset_t, sig: SignalNumber) {
+    *set |= 1 << ((sig as u32) - 1);
 }
 
 /// @brief 将sigset清零
 #[inline]
 pub fn sigset_clear(set: &mut sigset_t) {
     *set = 0;
+}
+
+/// @brief 将mask中置为1的位，在sigset中清零
+#[inline]
+pub fn sigset_delmask(set: &mut sigset_t, mask: u64) {
+    *set &= !mask;
+}
+
+/// @brief 判断两个sigset是否相等
+#[inline]
+pub fn sigset_equal(a: &sigset_t, b: &sigset_t) -> bool {
+    if _NSIG_U64_CNT == 1 {
+        return *a == *b;
+    }
+    return false;
+}
+
+/// @brief 使用指定的值，初始化sigset（为支持将来超过64个signal留下接口）
+#[inline]
+pub fn sigset_init(new_set: &mut sigset_t, mask: u64) {
+    *new_set = mask;
+    match _NSIG_U64_CNT {
+        1 => {}
+        _ => {
+            // 暂时不支持大于64个信号
+            todo!();
+        }
+    };
+}
+
+/// @brief 判断指定的信号在sigset中的对应位是否被置位
+/// @return true: 给定的信号在sigset中被置位
+/// @return false: 给定的信号在sigset中没有被置位
+#[inline]
+pub fn sig_is_member(set: &sigset_t, _sig: SignalNumber) -> bool {
+    return if 1 & (set >> ((_sig as u32) - 1)) != 0 {
+        true
+    } else {
+        false
+    };
 }
 
 #[repr(C)]
@@ -544,7 +650,7 @@ pub struct sigcontext {
 
     pub regs: pt_regs, // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
     pub trap_num: u64, // 用来保存线程结构体中的trap_num字段
-    pub oldmask: u64,  // 暂存的执行信号处理函数之前的sigmask
+    pub oldmask: u64,  // 暂存的执行信号处理函数之前的，被设置block的信号
     pub cr2: u64,      // 用来保存线程结构体中的cr2字段
     pub err_code: u64, // 用来保存线程结构体中的err_code字段
     // todo: 支持x87浮点处理器后，在这里增加浮点处理器的状态结构体指针

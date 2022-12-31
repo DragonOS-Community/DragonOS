@@ -1,13 +1,13 @@
 #include "cmd.h"
 #include <libKeyboard/keyboard.h>
-#include <libc/fcntl.h>
-#include <libc/printf.h>
-#include <libc/stddef.h>
-#include <libc/stdio.h>
-#include <libc/stdlib.h>
-#include <libc/string.h>
-#include <libc/sys/stat.h>
-#include <libc/unistd.h>
+#include <fcntl.h>
+#include <printf.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define pause_cpu() asm volatile("pause\n\t");
 #define MEM_HISTORY 1024

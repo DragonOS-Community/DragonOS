@@ -1,4 +1,4 @@
-use crate::arch::x86_64::asm::current::current_pcb;
+use crate::arch::asm::current::current_pcb;
 
 /// @brief 增加进程的锁持有计数
 #[inline]

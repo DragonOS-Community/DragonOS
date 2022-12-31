@@ -1,8 +1,9 @@
-#include <libc/math.h>
-#include <libc/stdio.h>
-#include <libc/stdlib.h>
-#include <libc/time.h>
-#include <libc/unistd.h>
+#include "sys_version.h"    // 这是系统的版本头文件，在编译过程中自动生成
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 void print_ascii_logo()
 {
@@ -18,8 +19,10 @@ void print_copyright()
     printf(" DragonOS - An opensource operating system.\n");
     printf(" Copyright: fslongjin & DragonOS Community. 2022, All rights reserved.\n");
     printf(" Version: ");
-    put_string("V0.1.1 - 20221127\n", COLOR_GREEN, COLOR_BLACK);
-    printf(" You can visit the project via:\n");
+    put_string("V0.1.2\n", COLOR_GREEN, COLOR_BLACK);
+    printf(" Git commit SHA1: %s\n", DRAGONOS_GIT_COMMIT_SHA1);
+    printf(" Build time: %s %s\n", __DATE__, __TIME__);
+    printf(" \nYou can visit the project via:\n");
     printf("\n");
     put_string("    Official Website: https://DragonOS.org\n", COLOR_INDIGO, COLOR_BLACK);
     put_string("    GitHub: https://github.com/fslongjin/DragonOS\n", COLOR_ORANGE, COLOR_BLACK);
@@ -34,13 +37,9 @@ void print_copyright()
 
 int main()
 {
-    // printf("Hello World!\n");
     print_ascii_logo();
 
     print_copyright();
-    // exit(0);
-    // while (1)
-    //     ;
 
     return 0;
 }

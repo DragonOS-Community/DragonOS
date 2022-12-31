@@ -33,7 +33,6 @@
 #include "driver/pci/pci.h"
 #include "driver/tty/tty.h"
 #include <driver/timers/HPET/HPET.h>
-#include <driver/timers/rtc/rtc.h>
 #include <driver/uart/uart.h>
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
@@ -131,7 +130,7 @@ void system_initialize()
     syscall_init();
     io_mfence();
     //  再初始化进程模块。顺序不能调转
-    sched_init();
+    // sched_init();
     io_mfence();
 
     timer_init();

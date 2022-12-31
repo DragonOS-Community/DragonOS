@@ -9,7 +9,7 @@ GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
 output_dir=$(ROOT_PATH)/bin/user
 
-CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs
+CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs -I $(shell pwd)/libs/libc/src/include
 current_CFLAGS := $(CFLAGS)
 
 ECHO:
@@ -35,4 +35,10 @@ sys_api_lib:
 
 clean: 
 	rm -rf $(GARBAGE)
+	$(MAKE) clean -C libs
+	@list='$(user_sub_dirs)'; for subdir in $$list; do \
+		echo "Clean in dir: $$subdir";\
+		cd $$subdir && $(MAKE) clean;\
+		cd .. ;\
+	done
 	

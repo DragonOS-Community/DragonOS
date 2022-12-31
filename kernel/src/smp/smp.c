@@ -12,8 +12,6 @@
 
 #include "ipi.h"
 
-void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs); // 由BSP转发的HPET中断处理函数
-
 static spinlock_t multi_core_starting_lock = {1}; // 多核启动锁
 
 static struct acpi_Processor_Local_APIC_Structure_t *proc_local_apic_structs[MAX_SUPPORTED_PROCESSOR_NUM];
@@ -47,8 +45,6 @@ void smp_init()
 
     io_mfence();
 
-    // 注册接收bsp处理器的hpet中断转发的处理函数
-    ipi_regiserIPI(0xc8, NULL, &ipi_0xc8_handler, NULL, NULL, "IPI 0xc8");
     io_mfence();
     ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, 0x00);
 
@@ -192,10 +188,4 @@ void smp_ap_start()
     }
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();
-}
-
-// 由BSP转发的HPET中断处理函数
-void ipi_0xc8_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs)
-{
-    sched_update_jiffies();
 }

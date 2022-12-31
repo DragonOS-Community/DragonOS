@@ -26,7 +26,7 @@ void wait_queue_sleep_with_node(wait_queue_head_t *q, wait_queue_node_t *wait)
     wait->pcb->state = PROC_UNINTERRUPTIBLE;
     list_append(&q->wait_list, &wait->wait_list);
 
-    schedule_immediately();
+    sched();
 }
 
 /**
@@ -42,7 +42,7 @@ void wait_queue_sleep_with_node_unlock(wait_queue_head_t *q, wait_queue_node_t *
     list_append(&q->wait_list, &wait->wait_list);
     spin_unlock((spinlock_t *)lock);
 
-    schedule_immediately();
+    sched();
 }
 
 /**
@@ -57,7 +57,7 @@ void wait_queue_sleep_with_node_interriptible(wait_queue_head_t *q, wait_queue_n
     wait->pcb->state = PROC_INTERRUPTIBLE;
     list_append(&q->wait_list, &wait->wait_list);
 
-    schedule_immediately();
+    sched();
 }
 
 /**

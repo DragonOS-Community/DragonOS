@@ -72,7 +72,7 @@ int video_refresh_daemon(void *unused)
         }
         video_daemon_pcb->state &= ~PROC_RUNNING;
         video_daemon_pcb->flags |= PF_NEED_SCHED;
-        schedule_immediately();
+        sched();
     }
 
     return 0;

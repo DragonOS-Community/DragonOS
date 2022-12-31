@@ -44,11 +44,11 @@
 struct thread_struct
 {
     // 内核层栈基指针
-    // ul rbp; // in tss rsp0
+    ul rbp; // in tss rsp0
     // 内核层代码指针
-    // ul rip;
+    ul rip;
     // 内核层栈指针
-    // ul rsp;
+    ul rsp;
 
     ul fs, gs;
 
@@ -57,9 +57,6 @@ struct thread_struct
     ul trap_num;
     // 错误码
     ul err_code;
-
-    /// @brief 当进程被调度出cpu时，本字段用于保存进程的上下文。
-    struct pt_regs trap_frame;
 };
 
 // ========= pcb->flags =========

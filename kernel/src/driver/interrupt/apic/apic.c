@@ -462,7 +462,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     if (current_pcb->flags & PF_NEED_SCHED && number == APIC_TIMER_IRQ_NUM)
     {
         io_mfence();
-        sched(rsp);
+        sched();
     }
 }
 

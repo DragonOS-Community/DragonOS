@@ -155,7 +155,7 @@ long schedule_timeout_ms(long timeout)
 {
     if (timeout == MAX_TIMEOUT) // 无期停止, 意味着不会调用func
     {
-        schedule_immediately();
+        sched();
         return MAX_TIMEOUT;
     }
     else if (timeout < 0)
@@ -170,7 +170,7 @@ long schedule_timeout_ms(long timeout)
     timer_func_add(&timer);
     current_pcb->state &= ~(PROC_RUNNING);
     spin_unlock(&sched_lock);
-    schedule_immediately();
+    sched();
 
     timeout -= timer_jiffies;
 

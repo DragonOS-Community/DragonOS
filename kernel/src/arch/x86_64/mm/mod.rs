@@ -1,8 +1,8 @@
 pub mod barrier;
 use crate::include::bindings::bindings::process_control_block;
-use crate::kdebug;
+
 use core::arch::asm;
-use core::ptr::{read_volatile, read};
+use core::ptr::read_volatile;
 
 use self::barrier::mfence;
 
@@ -11,7 +11,8 @@ use self::barrier::mfence;
 /// @param 下一个进程的pcb。将会把它的页表切换进来。
 ///
 /// @return 下一个进程的pcb(把它return的目的主要是为了归还所有权)
-// #[inline(always)]
+#[inline(always)]
+#[allow(dead_code)]
 pub fn switch_mm(
     next_pcb: &'static mut process_control_block,
 ) -> &'static mut process_control_block {

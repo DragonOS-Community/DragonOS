@@ -166,8 +166,8 @@ void smp_ap_start()
     current_pcb->virtual_runtime = 0;
 
     current_pcb->thread = (struct thread_struct *)(current_pcb + 1); // 将线程结构体放置在pcb后方
-    current_pcb->thread->trap_frame.rbp = _stack_start;
-    current_pcb->thread->trap_frame.rsp = _stack_start;
+    current_pcb->thread->rbp = _stack_start;
+    current_pcb->thread->rsp = _stack_start;
     current_pcb->thread->fs = KERNEL_DS;
     current_pcb->thread->gs = KERNEL_DS;
     current_pcb->cpu_id = current_starting_cpu;

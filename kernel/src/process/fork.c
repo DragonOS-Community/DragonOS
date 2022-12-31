@@ -136,7 +136,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 唤醒进程
     process_wakeup(tsk);
 
-    // 创建对应procfs文件
+    //创建对应procfs文件
     procfs_register_pid(tsk->pid);
 
     return retval;
@@ -374,38 +374,23 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
     // 设置子进程的返回值为0
     child_regs->rax = 0;
     if (pcb->flags & PF_KFORK)
-        thd->trap_frame.rbp =
+        thd->rbp =
             (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_system_call时的rbp）
     else
-        thd->trap_frame.rbp = (uint64_t)pcb + STACK_SIZE;
+        thd->rbp = (uint64_t)pcb + STACK_SIZE;
 
     // 设置新的内核线程开始执行的时候的rsp
-    thd->trap_frame.rsp = (uint64_t)child_regs;
+    thd->rsp = (uint64_t)child_regs;
     thd->fs = current_pcb->thread->fs;
     thd->gs = current_pcb->thread->gs;
-    thd->trap_frame.cs = KERNEL_CS;
-    thd->trap_frame.ds = KERNEL_DS;
-    thd->trap_frame.ss = KERNEL_DS;
-    thd->trap_frame.es = KERNEL_DS;
-    thd->trap_frame.rflags = child_regs->rflags;
-    kdebug("pid:%d, child_regs->rsp=%#018lx, current_regs->rsp=%#018lx", pcb->pid, child_regs->rsp, current_regs->rsp);
 
     // 根据是否为内核线程、是否在内核态fork，设置进程的开始执行的地址
     if (pcb->flags & PF_KFORK)
-    {
-        kdebug("PF_KFORK");
-        thd->trap_frame.rip = (uint64_t)ret_from_system_call;
-    }
+        thd->rip = (uint64_t)ret_from_system_call;
     else if (pcb->flags & PF_KTHREAD && (!(pcb->flags & PF_KFORK)))
-    {
-        kdebug("pcb->flags & PF_KTHREAD && (!(pcb->flags & PF_KFORK))");
-
-        thd->trap_frame.rip = (uint64_t)kernel_thread_func;
-    }
+        thd->rip = (uint64_t)kernel_thread_func;
     else
-    {
-        thd->trap_frame.rip = (uint64_t)ret_from_system_call;
-    }
+        thd->rip = (uint64_t)ret_from_system_call;
 
     return 0;
 }

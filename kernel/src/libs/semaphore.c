@@ -19,7 +19,7 @@ void semaphore_down(semaphore_t *sema)
 
         // 执行调度
         current_pcb->flags |= PF_NEED_SCHED;
-        schedule_immediately();
+        sched();
     }
 }
 

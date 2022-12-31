@@ -16,7 +16,7 @@ void do_divide_error(struct pt_regs *regs, unsigned long error_code)
            regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 1 #DB 调试异常
@@ -67,7 +67,7 @@ void do_overflow(struct pt_regs *regs, unsigned long error_code)
            regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 5 #BR 越界异常
@@ -89,7 +89,7 @@ void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
            regs->rsp, regs->rip, proc_current_cpu_id, current_pcb->pid);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 7 #NM 设备异常（FPU不存在）
@@ -100,7 +100,7 @@ void do_dev_not_avaliable(struct pt_regs *regs, unsigned long error_code)
            regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 8 #DF 双重错误
@@ -113,7 +113,7 @@ void do_double_fault(struct pt_regs *regs, unsigned long error_code)
            regs->rip, proc_current_cpu_id);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 9 协处理器越界（保留）
@@ -124,7 +124,7 @@ void do_coprocessor_segment_overrun(struct pt_regs *regs, unsigned long error_co
            regs->rsp, regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 10 #TS 无效的TSS段
@@ -156,7 +156,7 @@ void do_invalid_TSS(struct pt_regs *regs, unsigned long error_code)
     printk("\n");
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 11 #NP 段不存在
@@ -179,7 +179,7 @@ void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
     // kinfo("cs=%#04x, ds=%#04x, ss=%#04x", regs->cs, regs->ds, regs->ss);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 13 #GP 通用保护性异常
@@ -208,7 +208,7 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
     printk_color(RED, BLACK, "AAAAAAAAAA Segment Selector Index:%#010x\n", regs->ss);
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 14 #PF 页故障
@@ -247,7 +247,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 
     traceback(regs);
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 15 Intel保留，请勿使用
@@ -271,7 +271,7 @@ void do_alignment_check(struct pt_regs *regs, unsigned long error_code)
            regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 18 #MC 机器检测
@@ -282,7 +282,7 @@ void do_machine_check(struct pt_regs *regs, unsigned long error_code)
            regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 19 #XM SIMD浮点异常
@@ -293,7 +293,7 @@ void do_SIMD_exception(struct pt_regs *regs, unsigned long error_code)
            regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 20 #VE 虚拟化异常
@@ -304,7 +304,7 @@ void do_virtualization_exception(struct pt_regs *regs, unsigned long error_code)
            regs->rsp, regs->rip, proc_current_cpu_id);
 
     current_pcb->state = PROC_STOPPED;
-    schedule_immediately();
+    sched();
 }
 
 // 21-21 Intel保留，请勿使用

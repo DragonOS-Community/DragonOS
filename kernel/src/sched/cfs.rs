@@ -1,6 +1,5 @@
 use core::{
-    arch::{asm, x86_64::_mm_mfence},
-    ptr::{null_mut, read_volatile},
+    ptr::null_mut,
     sync::atomic::compiler_fence,
 };
 
@@ -10,15 +9,13 @@ use crate::{
     arch::{
         asm::current::current_pcb,
         context::switch_process,
-        mm::{barrier::mfence, switch_mm},
     },
     include::bindings::bindings::{
-        initial_proc_union, process_control_block, pt_regs, MAX_CPU_NUM, PF_NEED_SCHED,
+        initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED,
         PROC_RUNNING,
     },
-    kBUG, kdebug,
+    kBUG,
     libs::spinlock::RawSpinlock,
-    println,
 };
 
 use super::core::Scheduler;
@@ -140,7 +137,7 @@ impl SchedulerCFS {
         current_cpu_queue.cpu_exec_proc_jiffies -= 1;
         // 时间片耗尽，标记需要被调度
         if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
-            current_pcb().flags |= (PF_NEED_SCHED as u64);
+            current_pcb().flags |= PF_NEED_SCHED as u64;
         }
         current_cpu_queue.lock.unlock();
 
@@ -152,7 +149,7 @@ impl SchedulerCFS {
 impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
-    fn sched(&mut self, trap_frame: &'static mut pt_regs) {
+    fn sched(&mut self) {
         // kdebug!("cfs:sched");
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
         let current_cpu_id = current_pcb().cpu_id as usize;
@@ -177,20 +174,9 @@ impl Scheduler for SchedulerCFS {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(proc.priority, current_cpu_queue);
             }
 
-            // kdebug!("cfs:sched to switch mm");
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            // let proc = switch_mm(proc);
-
-            // kdebug!("cfs:sched to switch proc, next pid={}", proc.pid);
-            // switch_process(current_pcb(), proc);
-            // kdebug!("{}", proc.pid);
-            if proc.pid>3 {
-                kdebug!("cfs:sched to switch proc, next pid={}, next gs={}", proc.pid, unsafe{(*proc.thread).gs});
-
-            }
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-            switch_process(current_pcb(), proc, trap_frame);
+            switch_process(current_pcb(), proc);
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         } else {
             // 不进行切换

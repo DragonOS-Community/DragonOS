@@ -177,7 +177,7 @@ static int kthread(void *_create)
     io_mfence();
 
     // 发起调度，使得当前内核线程休眠。直到创建者通过process_wakeup将当前内核线程唤醒
-    schedule_immediately();
+    sched();
 
     retval = -EINTR;
     // 如果发起者没有调用kthread_stop()，则该kthread的功能函数开始执行
@@ -221,7 +221,7 @@ int kthreadd(void *unused)
         current_pcb->state = PROC_INTERRUPTIBLE;
         // 所有的创建任务都被处理完了
         if (list_empty(&kthread_create_list))
-            schedule_immediately();
+            sched();
 
         spin_lock(&__kthread_create_lock);
         // 循环取出链表中的任务

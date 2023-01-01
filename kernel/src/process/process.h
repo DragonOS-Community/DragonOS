@@ -14,7 +14,7 @@
 #include <common/errno.h>
 #include <common/glib.h>
 #include <common/wait_queue.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <mm/mm-types.h>
 #include <syscall/syscall.h>
 

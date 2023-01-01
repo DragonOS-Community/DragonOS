@@ -2,7 +2,7 @@
 #include <common/spinlock.h>
 #include <process/process.h>
 #include <process/ptrace.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <filesystem/fat32/fat32.h>
 #include <common/atomic.h>
 #include <mm/slab.h>

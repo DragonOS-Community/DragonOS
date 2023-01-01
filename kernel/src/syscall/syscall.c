@@ -6,7 +6,7 @@
 #include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
 #include <exception/irq.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <filesystem/fat32/fat32.h>
 #include <mm/slab.h>
 #include <process/process.h>

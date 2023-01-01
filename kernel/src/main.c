@@ -19,7 +19,7 @@
 #include <sched/sched.h>
 #include <smp/ipi.h>
 
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/procfs/procfs.h>
 #include <filesystem/fat32/fat32.h>

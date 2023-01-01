@@ -16,13 +16,13 @@ use core::panic::PanicInfo;
 #[macro_use]
 mod arch;
 
+mod driver;
+mod filesystem;
 #[macro_use]
 mod include;
 mod ipc;
-
 #[macro_use]
 mod libs;
-mod driver;
 mod mm;
 mod process;
 mod sched;

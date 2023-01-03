@@ -17,8 +17,6 @@
 
 #define IS_VALID_SCHED_POLICY(_policy) ((_policy) > 0 && (_policy) <= SCHED_MAX_POLICY_NUM)
 
-
-
 // struct sched_param
 // {
 //     int sched_priority;
@@ -60,18 +58,10 @@
 //  */
 // int sched_setscheduler(struct process_control_block *p, int policy, const struct sched_param *param);
 
-/**
- * @brief 包裹sched_enqueue(),将PCB加入就绪队列
- *
- * @param pcb
- */
-
 // ================= Rust 实现 =============
 extern void sched_update_jiffies();
 extern void sched_init();
 extern void sched();
 extern void sched_enqueue(struct process_control_block *pcb);
-extern void sched();
 
 void switch_proc(struct process_control_block *prev, struct process_control_block *proc);
-

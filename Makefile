@@ -28,15 +28,13 @@ ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
 
-# ifeq ($(DragonOS_GCC), )
-# $(error 尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装)
-# endif
 
 export CC=$(DragonOS_GCC)/x86_64-elf-gcc
 export LD=ld
 export AS=$(DragonOS_GCC)/x86_64-elf-as
 export NM=$(DragonOS_GCC)/x86_64-elf-nm
 export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
+export AR=$(DragonOS_GCC)/x86_64-elf-ar
 
 
 .PHONY: all 
@@ -53,6 +51,9 @@ kernel:
 user:
 	mkdir -p bin/user/
 	mkdir -p bin/tmp/user
+	mkdir -p bin/sysroot/usr/include
+	mkdir -p bin/sysroot/usr/lib 
+	$(shell cp -r $(shell pwd)/user/libs/libc/src/include/* $(shell pwd)/bin/sysroot/usr/include/)
 	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
 	$(MAKE) -C ./user all || (sh -c "echo 用户程序编译失败" && exit 1)
 

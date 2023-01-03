@@ -17,11 +17,15 @@ KEEP_BINUTILS=0
 KEEP_GCC=0
 CHANGE_SOURCE=0
 FORCE=0
+SAVE=0
 while true; do
 	if [ ! -n "$1" ]; then
 		break
 	fi
 	case "$1" in
+        "-save")
+            SAVE=1
+        ;;
 		"-rebuild")	
 			echo "清除${INSTALL_POS}目录下的所有信息"
             rm -rf "${INSTALL_POS}"
@@ -40,6 +44,7 @@ while true; do
         ;;
         "-help")
             echo "脚本选项如下:"
+            echo "-save: 保留最后的下载压缩包"
             echo "-rebuild: 清除上一次安装的全部信息, 即删掉$INSTALL_POS目录下的所有内容, 然后重新构建gcc工具链."
             echo "-kg(keep-gcc): 您确保${STRUCTURE}-gcc已被编译安装, 本次调用脚本不重复编译安装gcc. 如果没有安装，脚本仍然会自动安装."
             echo "-kb(keep-binutils): 您确保binutils已被编译安装, 本次调用脚本不重复编译安装binutils. 如果没有安装，脚本仍然会自动安装."
@@ -167,13 +172,15 @@ source "$HOME/.bashrc"
 if [ -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] &&
    [ -n "$(find $PREFIX/bin/* -name $TARGET_LD)" ] &&
    [ -n "$(find $PREFIX/bin/* -name $TARGET_AS)" ]; then
-    # 删除临时文件
-    rm -rf "$BIN_UTILS"
-    rm -rf "$BIN_UTILS_TAR"
-    rm -rf "build-binutils"
-    rm -rf "$GCC_FILE"
-    rm -rf "$GCC_FILE_TAR"
-    rm -rf "build-gcc"
+   if [ ${SAVE} -eq 0 ]; then
+        # 删除临时文件
+        rm -rf "$BIN_UTILS"
+        rm -rf "$BIN_UTILS_TAR"
+        rm -rf "build-binutils"
+        rm -rf "$GCC_FILE"
+        rm -rf "$GCC_FILE_TAR"
+        rm -rf "build-gcc"
+    fi
 
     echo -e "\033[42;37m [构建成功] Build Successfully.(请重新打开另一个Shell窗口或者重新打开你的IDE以获取新的环境变量) \033[0m"
 else 	

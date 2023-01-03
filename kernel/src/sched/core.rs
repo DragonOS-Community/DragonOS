@@ -7,6 +7,7 @@ use crate::{
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
+// use super::rt::{sched_RT_init,SchedulerRT,__get_rt_scheduler};
 
 /// @brief 获取指定的cpu上正在执行的进程的pcb
 #[inline]
@@ -32,11 +33,29 @@ pub trait Scheduler {
 fn __sched() {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
+    // let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     cfs_scheduler.sched();
+    // rt_scheduler.sched();
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+    // let next = rt_scheduler.pick_next_task_rt();
+    // if(next!=NULL){
+    //     kinfo("pick next task rt p %p",next);
+    // }
+    // if (next == NULL && current_pcb->policy==SCHED_NORMAL)
+    // {
+    //     kinfo("sched:sched_cfs is begin");
+    //     sched_cfs();
+    // }
+    // else
+    // {
+    //     enqueue_task_rt(&rq_tmp, next, 0);
+    //     kinfo("sched:sched_rt is begin");
+    //     sched_rt();
+    // }
 }
 
 /// @brief 将进程加入调度队列
@@ -53,6 +72,7 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block) {
 pub extern "C" fn sched_init() {
     unsafe {
         sched_cfs_init();
+        // sched_RT_init();
     }
 }
 

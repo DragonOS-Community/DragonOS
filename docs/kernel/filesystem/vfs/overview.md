@@ -33,7 +33,7 @@
 &emsp;&emsp;如果需要注册或取消注册某个具体文件系统到VFS之中，则需要以下两个接口：
 
 ```c
-#include<filesystem/VFS/VFS.h>
+#include<filesystem/vfs/VFS.h>
 
 uint64_t vfs_register_filesystem(struct vfs_filesystem_type_t *fs);
 uint64_t vfs_unregister_filesystem(struct vfs_filesystem_type_t *fs);
@@ -45,7 +45,7 @@ uint64_t vfs_unregister_filesystem(struct vfs_filesystem_type_t *fs);
 
 &emsp;&emsp;这个数据结构描述了具体文件系统的一些信息。当我们挂载具体文件系统的时候，将会调用它的read_superblock方法，以确定要被挂载的文件系统的具体信息。
 
-&emsp;&emsp;该数据结构的定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
+&emsp;&emsp;该数据结构的定义在`kernel/filesystem/vfs/VFS.h`中，结构如下：
 
 ```c
 struct vfs_filesystem_type_t
@@ -84,7 +84,7 @@ struct vfs_filesystem_type_t
 
 &emsp;&emsp;该数据结构为超级块结构体。
 
-&emsp;&emsp;该数据结构定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
+&emsp;&emsp;该数据结构定义在`kernel/filesystem/vfs/VFS.h`中，结构如下：
 
 ```c
 struct vfs_superblock_t
@@ -111,7 +111,7 @@ struct vfs_superblock_t
 
 &emsp;&emsp;该数据结构为超级块的操作接口。VFS通过这些接口来操作具体的文件系统的超级块。
 
-&emsp;&emsp;该数据结构定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
+&emsp;&emsp;该数据结构定义在`kernel/filesystem/vfs/VFS.h`中，结构如下：
 
 ```c
 struct vfs_super_block_operations_t
@@ -144,7 +144,7 @@ struct vfs_super_block_operations_t
 
 &emsp;&emsp;该数据结构为inode对象的数据结构，与文件系统中的具体的文件结点对象具有一对一映射的关系。
 
-&emsp;&emsp;该数据结构定义在`kernel/filesystem/VFS/VFS.h`中，结构如下：
+&emsp;&emsp;该数据结构定义在`kernel/filesystem/vfs/VFS.h`中，结构如下：
 
 ```c
 struct vfs_index_node_t
@@ -199,7 +199,7 @@ struct vfs_index_node_t
 
 &emsp;&emsp;该接口为inode的操作方法接口，由具体文件系统实现。并与具体文件系统之中的inode相互绑定。
 
-&emsp;&emsp;该接口定义于`kernel/filesystem/VFS/VFS.h`中，结构如下：
+&emsp;&emsp;该接口定义于`kernel/filesystem/vfs/VFS.h`中，结构如下：
 
 ```c
 struct vfs_inode_operations_t

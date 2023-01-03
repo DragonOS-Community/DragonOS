@@ -1,5 +1,5 @@
 #pragma once
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 
 /**
  * @brief devfs_private_file_info_t的type字段值

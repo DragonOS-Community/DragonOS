@@ -19,7 +19,7 @@
 #include <sched/sched.h>
 #include <smp/ipi.h>
 
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/procfs/procfs.h>
 #include <filesystem/fat32/fat32.h>
@@ -130,7 +130,7 @@ void system_initialize()
     syscall_init();
     io_mfence();
     //  再初始化进程模块。顺序不能调转
-    sched_init();
+    // sched_init();
     io_mfence();
 
     timer_init();

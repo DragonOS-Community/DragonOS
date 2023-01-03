@@ -2,7 +2,7 @@
 #[inline]
 pub fn smp_get_processor_id() -> u32 {
     if cfg!(x86_64) {
-        return crate::arch::x86_64::cpu::arch_current_apic_id() as u32;
+        return crate::arch::cpu::arch_current_apic_id() as u32;
     } else {
         255
     }

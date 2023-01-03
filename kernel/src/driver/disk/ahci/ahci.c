@@ -403,7 +403,7 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
     port->ci = 1 << slot; // Issue command
 
     current_pcb->flags |= PF_NEED_SCHED;
-    sched();
+
     int retval = AHCI_SUCCESS;
     // Wait for completion
     while (1)
@@ -483,7 +483,6 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     port->ci = 1; // Issue command
 
     current_pcb->flags |= PF_NEED_SCHED;
-    sched();
     int retval = AHCI_SUCCESS;
 
     while (1)

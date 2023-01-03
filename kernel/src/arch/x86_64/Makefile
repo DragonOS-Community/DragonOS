@@ -18,5 +18,6 @@ $(kernel_arch_x86_64_subdirs): ECHO
 all: $(kernel_arch_x86_64_objs) $(kernel_arch_x86_64_subdirs)
 
 
+
 clean:
 	echo "Done."

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "fat32.h"
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <stdbool.h>
 
 /**

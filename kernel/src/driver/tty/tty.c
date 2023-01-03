@@ -1,5 +1,5 @@
 #include <filesystem/devfs/devfs.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include "tty.h"
 
 static struct devfs_private_inode_info_t * tty_inode_private_data_ptr;  // 由devfs创建的inode私有信息指针

@@ -3,10 +3,10 @@ use core::intrinsics::size_of;
 use core::ptr::null_mut;
 use alloc::boxed::Box;
 
-use crate::arch::x86_64::interrupt::cli;
+use crate::arch::interrupt::cli;
 use crate::include::bindings::bindings::{memset, spin_init, spin_trylock, spin_unlock};
 use crate::kBUG;
-use crate::{arch::x86_64::interrupt::sti, include::bindings::bindings::spinlock_t};
+use crate::{arch::interrupt::sti, include::bindings::bindings::spinlock_t};
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
 

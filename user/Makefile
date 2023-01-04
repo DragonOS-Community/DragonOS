@@ -30,9 +30,8 @@ all: app
 # 系统库
 sys_api_lib:
 	$(MAKE) -C libs all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
-	$(AR) -rcs libsysapi.a $(shell find ./libs/* -name "*.o")
-	$(shell cp libsysapi.a  ../bin/sysroot/usr/lib/libsysapi.a)
-
+	$(AR) -rcs $(ROOT_PATH)/bin/sysroot/usr/lib/libsysapi.a $(shell find ./libs/* -name "*.o")
+	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/* $(ROOT_PATH)/bin/sysroot/usr/include/)
 
 clean: 
 	rm -rf $(GARBAGE)

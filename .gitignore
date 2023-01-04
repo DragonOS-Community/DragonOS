@@ -14,4 +14,3 @@ user/sys_api_lib
 docs/_build
 draft
 cppcheck.xml
-user/libsysapi.a

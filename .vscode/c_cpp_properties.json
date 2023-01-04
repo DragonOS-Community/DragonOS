@@ -1,16 +1,16 @@
 {
     "configurations": [
         {
-            "name": "Linux",
+            "name": "DragonOS",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/kernel/src"
+                "${workspaceFolder}/user/libs/libc/src/include"
             ],
             "defines": [
                 "__x86_64__",
                 "DEBUG"
             ],
-            "compilerPath": "/usr/bin/gcc",
+            "compilerPath": "~/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin/x86_64-elf-gcc",
             "cStandard": "gnu17",
             "cppStandard": "gnu++14",
             "intelliSenseMode": "linux-gcc-x64"

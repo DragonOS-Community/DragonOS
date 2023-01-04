@@ -6,13 +6,12 @@
 #include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
 #include <exception/irq.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <filesystem/fat32/fat32.h>
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
 // 导出系统调用入口函数，定义在entry.S中
-extern void system_call(void);
 extern void syscall_int(void);
 
 extern uint64_t sys_clock(struct pt_regs *regs);
@@ -23,6 +22,7 @@ extern uint64_t sys_kill(struct pt_regs *regs);
 extern uint64_t sys_sigaction(struct pt_regs * regs);
 extern uint64_t sys_rt_sigreturn(struct pt_regs * regs);
 extern uint64_t sys_getpid(struct pt_regs * regs);
+extern uint64_t sys_sched(struct pt_regs * regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -592,6 +592,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [24] = sys_sigaction,
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,
-    [27 ... 254] = system_call_not_exists,
+    [27] = sys_sched,
+    [28 ... 254] = system_call_not_exists,
     [255] = sys_ahci_end_req,
 };

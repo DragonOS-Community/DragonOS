@@ -1,5 +1,5 @@
 #pragma once
-#include <libc/src/unistd.h>
+#include <unistd.h>
 
 #define SIGHUP 1
 #define SIGINT 2

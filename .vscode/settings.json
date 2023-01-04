@@ -147,7 +147,6 @@
         "compiler_attributes.h": "c",
         "timer.h": "c",
         "hid.h": "c",
-        "cfs.h": "c",
         "proc.h": "c",
         "compiler.h": "c",
         "hpet.h": "c",
@@ -169,8 +168,9 @@
         "stdint-gcc.h": "c",
         "acpi.h": "c",
         "assert.h": "c",
-        "sys_version.h": "c"
-},
+        "sys_version.h": "c",
+        "cmd.h": "c"
+    },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": "",
     "rust-analyzer.cargo.target": "x86_64-unknown-none",

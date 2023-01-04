@@ -1,4 +1,4 @@
-#include <libc/src/fcntl.h>
+#include <fcntl.h>
 #include <libsystem/syscall.h>
 
 /**

@@ -3,7 +3,7 @@ use core::{ffi::c_void, ptr::null_mut, sync::atomic::compiler_fence};
 use alloc::boxed::Box;
 
 use crate::{
-    arch::x86_64::asm::current::current_pcb,
+    arch::asm::current::current_pcb,
     include::bindings::bindings::{
         process_control_block, CLONE_CLEAR_SIGHAND, CLONE_SIGHAND, CLONE_THREAD, ENOMEM,
     },

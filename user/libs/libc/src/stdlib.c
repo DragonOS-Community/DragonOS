@@ -1,8 +1,8 @@
-#include <libc/src/ctype.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/unistd.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <libsystem/syscall.h>
-#include <libc/src/include/signal.h>
+#include <signal.h>
 
 int abs(int i)
 {

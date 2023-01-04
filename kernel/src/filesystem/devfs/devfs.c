@@ -1,6 +1,6 @@
 #include "devfs.h"
 #include "internal.h"
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <common/glib.h>
 #include <common/string.h>
 #include <mm/slab.h>

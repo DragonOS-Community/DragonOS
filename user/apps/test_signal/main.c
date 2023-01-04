@@ -17,13 +17,12 @@
  *
  */
 
-#include <libc/src/math.h>
-#include <libc/src/stdio.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/time.h>
-#include <libc/src/unistd.h>
-
-#include <libc/src/include/signal.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <signal.h>
 
 bool handle_ok = false;
 

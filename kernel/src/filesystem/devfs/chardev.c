@@ -1,6 +1,6 @@
 #include "chardev.h"
 #include "internal.h"
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 
 #include <common/mutex.h>
 #include <common/stdlib.h>

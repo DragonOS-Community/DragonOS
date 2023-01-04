@@ -9,7 +9,7 @@ GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
 output_dir=$(ROOT_PATH)/bin/user
 
-CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs
+CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs -I $(shell pwd)/libs/libc/src/include
 current_CFLAGS := $(CFLAGS)
 
 ECHO:

@@ -4,7 +4,7 @@
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]
 #![feature(drain_filter)] // 允许Vec的drain_filter特性
-
+#![feature(c_void_variant)] //not stable, used in /home/su/Documents/VSCode/DragonOS/kernel/src/exception/softirq.rs
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -24,6 +24,7 @@ mod process;
 mod sched;
 mod smp;
 mod time;
+mod exception;
 
 extern crate alloc;
 

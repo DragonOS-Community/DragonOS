@@ -1,6 +1,6 @@
 #pragma once
 
-#include <libc/src/sys/types.h>
+#include <sys/types.h>
 
 void *memset(void *dst, unsigned char C, uint64_t size);
 /**

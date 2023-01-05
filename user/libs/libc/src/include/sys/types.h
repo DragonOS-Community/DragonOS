@@ -1,6 +1,6 @@
 #pragma once
 
-#include <libc/src/include/stdint.h>
+#include <stdint.h>
 #include <stdbool.h>
 
 typedef unsigned char u_char;

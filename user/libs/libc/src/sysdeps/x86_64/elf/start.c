@@ -1,6 +1,6 @@
 
-#include <libc/src/stdio.h>
-#include <libc/src/stdlib.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 extern int main(int, char **);
 

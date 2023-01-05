@@ -14,7 +14,7 @@
 #include <common/errno.h>
 #include <common/glib.h>
 #include <common/wait_queue.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <mm/mm-types.h>
 #include <syscall/syscall.h>
 
@@ -51,23 +51,23 @@ extern uint64_t process_exit_files(struct process_control_block *pcb);
  * 然后调用__switch_to切换栈，配置其他信息，最后恢复下一个进程的rax rbp。
  */
 
-#define switch_proc(prev, next)                                                                                        \
+#define switch_to(prev, next)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
         __asm__ __volatile__("pushq	%%rbp	\n\t"                                                                        \
                              "pushq	%%rax	\n\t"                                                                        \
                              "movq	%%rsp,	%0	\n\t"                                                                     \
                              "movq	%2,	%%rsp	\n\t"                                                                     \
-                             "leaq	switch_proc_ret_addr(%%rip),	%%rax	\n\t"                                            \
+                             "leaq	2f(%%rip),	%%rax	\n\t"                                                              \
                              "movq	%%rax,	%1	\n\t"                                                                     \
                              "pushq	%3		\n\t"                                                                          \
                              "jmp	__switch_to	\n\t"                                                                    \
-                             "switch_proc_ret_addr:	\n\t"                                                              \
+                             "2:	\n\t"                                                                                 \
                              "popq	%%rax	\n\t"                                                                         \
                              "popq	%%rbp	\n\t"                                                                         \
                              : "=m"(prev->thread->rsp), "=m"(prev->thread->rip)                                        \
                              : "m"(next->thread->rsp), "m"(next->thread->rip), "D"(prev), "S"(next)                    \
-                             : "memory");                                                                              \
+                             : "memory", "rax");                                                                       \
     } while (0)
 
 /**
@@ -220,3 +220,4 @@ extern int process_try_to_wake_up(struct process_control_block *_pcb, uint64_t _
  * @return false 唤醒失败
  */
 extern int process_wake_up_state(struct process_control_block *pcb, uint64_t state);
+void __switch_to(struct process_control_block *prev, struct process_control_block *next);

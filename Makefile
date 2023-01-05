@@ -36,6 +36,7 @@ export CC=$(DragonOS_GCC)/x86_64-elf-gcc
 export LD=ld
 export AS=$(DragonOS_GCC)/x86_64-elf-as
 export NM=$(DragonOS_GCC)/x86_64-elf-nm
+export AR=$(DragonOS_GCC)/x86_64-elf-ar
 export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 
@@ -46,12 +47,14 @@ all: kernel user
 .PHONY: kernel
 kernel:
 	mkdir -p bin/kernel/
+	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
 	$(MAKE) -C ./kernel all || (sh -c "echo 内核编译失败" && exit 1)
 	
 .PHONY: user
 user:
 	mkdir -p bin/user/
 	mkdir -p bin/tmp/user
+	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
 	$(MAKE) -C ./user all || (sh -c "echo 用户程序编译失败" && exit 1)
 
 .PHONY: clean

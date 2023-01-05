@@ -1,9 +1,9 @@
-#include <libc/src/errno.h>
-#include <libc/src/fcntl.h>
-#include <libc/src/stddef.h>
-#include <libc/src/stdio.h>
-#include <libc/src/string.h>
-#include <libc/src/unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #include <libsystem/syscall.h>
 
 /**

@@ -12,6 +12,5 @@ void _start(int argc, char **argv)
     _init();
     _libc_init();
     int retval = main(argc, argv);
-    // printf("before exit, code=%d\n", retval);
     exit(retval);
 }

@@ -15,7 +15,7 @@ use crate::{
         PROC_RUNNING,
     },
     kBUG,
-    // kdebug,
+    kdebug,
     libs::spinlock::RawSpinlock,
 };
 

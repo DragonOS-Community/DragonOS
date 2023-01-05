@@ -2,12 +2,13 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
-    include::bindings::bindings::{process_control_block, pt_regs, EPERM, SCHED_NORMAL},
+    include::bindings::bindings::{process_control_block, pt_regs, EPERM, SCHED_NORMAL,SCHED_FIFO,SCHED_RR},
     process::process::process_cpu,
+    kdebug,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
-// use super::rt::{sched_RT_init,SchedulerRT,__get_rt_scheduler};
+use super::rt::{sched_RT_init,SchedulerRT,__get_rt_scheduler};
 
 /// @brief 获取指定的cpu上正在执行的进程的pcb
 #[inline]
@@ -33,14 +34,30 @@ pub trait Scheduler {
 fn __sched() {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
-    // let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
+    let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    cfs_scheduler.sched();
-    // rt_scheduler.sched();
+    // let next = rt_scheduler.pick_next_task_rt();
+    // let next: &'static mut process_control_block =rt_scheduler.pick_next_task_rt().expect("No RT process found");
 
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
+    let mut next: &'static mut process_control_block;
+    match rt_scheduler.pick_next_task_rt() {
+        Some(p) => {
+            next = p;
+            kdebug!("next :: policy{}",next.policy);
+            kdebug!("next :: priority{}",next.priority as usize);
+            rt_scheduler.enqueue_task_rt(next.priority as usize,next);
+            kdebug!("sched:sched_rt is begin");
+            rt_scheduler.sched();
+        },
+        None => {
+            kdebug!("next is null");
+            if current_pcb().policy==SCHED_NORMAL{
+                kdebug!("sched:sched_cfs is begin");
+                cfs_scheduler.sched();
+            }
+        },
+    }
     // let next = rt_scheduler.pick_next_task_rt();
     // if(next!=NULL){
     //     kinfo("pick next task rt p %p",next);
@@ -63,7 +80,13 @@ fn __sched() {
 #[no_mangle]
 pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block) {
     let cfs_scheduler = __get_cfs_scheduler();
-    cfs_scheduler.enqueue(pcb);
+    let rt_scheduler = __get_rt_scheduler();
+    if pcb.policy==SCHED_NORMAL{
+        cfs_scheduler.enqueue(pcb);
+    }
+    else{
+        rt_scheduler.enqueue(pcb);
+    }
 }
 
 /// @brief 初始化进程调度器模块
@@ -72,7 +95,7 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block) {
 pub extern "C" fn sched_init() {
     unsafe {
         sched_cfs_init();
-        // sched_RT_init();
+        sched_RT_init();
     }
 }
 
@@ -85,7 +108,12 @@ pub extern "C" fn sched_update_jiffies() {
         SCHED_NORMAL => {
             __get_cfs_scheduler().timer_update_jiffies();
         }
+        SCHED_FIFO | SCHED_RR => {
+            kdebug!("sched_update_jiffies RR");
+        }
         _ => {
+            kdebug!("todo pid {}",current_pcb().pid);
+            kdebug!("todo policy {}",current_pcb().policy);
             todo!()
         }
     }

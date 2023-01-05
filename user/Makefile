@@ -22,16 +22,27 @@ $(user_sub_dirs): ECHO sys_api_lib
 app: $(user_sub_dirs)
 
 all: app
+
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
 
 	@echo 用户态程序编译完成
 
+make_output_dir: ECHO
+	mkdir -p $(ROOT_PATH)/bin/user/
+	mkdir -p $(ROOT_PATH)/bin/tmp/user
+	mkdir -p $(ROOT_PATH)/bin/sysroot/usr/include
+	mkdir -p $(ROOT_PATH)/bin/sysroot/usr/lib
+	
+	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
+	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
 # 系统库
 sys_api_lib:
 	$(MAKE) -C libs all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
 	$(AR) -rcs $(ROOT_PATH)/bin/sysroot/usr/lib/libsysapi.a $(shell find ./libs/* -name "*.o")
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/* $(ROOT_PATH)/bin/sysroot/usr/include/)
+	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/arch/x86_64/c*.o $(ROOT_PATH)/bin/sysroot/usr/lib/)
+
 
 clean: 
 	rm -rf $(GARBAGE)

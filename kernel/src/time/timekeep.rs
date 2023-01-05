@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::driver::timers::rtc::rtc::{rtc_get_cmos_time, rtc_time_t};
+use crate::driver::timers::rtc::rtc::{rtc_get_cmos_time, RtcTimeT};
 
 #[allow(non_camel_case_types)]
 pub type ktime_t = i64;
@@ -15,7 +15,7 @@ fn ktime_to_ns(kt: ktime_t) -> i64 {
 /// 时间戳为从UTC+0 1970-01-01 00:00到当前UTC+0时间，所经过的纳秒数。
 /// 注意，由于当前未引入时区，因此本函数默认时区为UTC+8来计算
 fn ktime_get_real() -> ktime_t {
-    let mut rtc_time: rtc_time_t = rtc_time_t {
+    let mut rtc_time: RtcTimeT = RtcTimeT {
         second: (0),
         minute: (0),
         hour: (0),
@@ -24,7 +24,7 @@ fn ktime_get_real() -> ktime_t {
         year: (0),
     };
 
-    //调用rtc.h里面的函数
+
     rtc_get_cmos_time(&mut rtc_time);
 
     let mut day_count: i32 = 0;

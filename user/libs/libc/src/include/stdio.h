@@ -20,6 +20,14 @@
 
 #define SEEK_MAX 3
 
+typedef struct {
+    int fd;  // 文件描述符
+} FILE;
+
+extern FILE* stdin;
+extern FILE* stdout;
+extern FILE* stderr;
+
 /**
  * @brief 往屏幕上输出字符串
  *
@@ -34,5 +42,5 @@ int printf(const char *fmt, ...);
 int sprintf(char *buf, const char *fmt, ...);
 int vsprintf(char *buf, const char *fmt, va_list args);
 
-int fflush(FILE *stream){}
+int fflush(FILE *stream) {}
 int fprintf(FILE *restrict stream, const char *restrict format, ...);

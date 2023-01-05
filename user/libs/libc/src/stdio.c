@@ -5,13 +5,21 @@
 
 int fprintf(FILE *restrict stream, const char *restrict format, ...)
 {
-    char *buf = malloc(65536 * 2);
-    memset(buf, 0, 65536 * 2);
+    const int bufsize = 65536 * 2;
+    char *buf = malloc(bufsize);
+    memset(buf, 0, bufsize);
     va_list args;
 
     va_start(args, format);
     vsprintf(buf, format, args);
     va_end(args);
-    buf[65536 * 2 - 1] = 0;
-    write(stream->fd, buf, strlen(buf));
+
+    int len = strlen(buf);
+    if (len > bufsize - 1)
+    {
+        len = bufsize - 1;
+        buf[bufsize - 1] = 0;
+    }
+    write(stream->fd, buf, len);
+    free(buf);
 }

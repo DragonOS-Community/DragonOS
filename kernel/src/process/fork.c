@@ -189,12 +189,7 @@ int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb)
         return retval;
 
     // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
-    // stdin
-    current_pcb->fds[0] = -1UL;
-    // stdout
-    current_pcb->fds[1] = -1UL;
-    // stderr
-    current_pcb->fds[2] = -1UL;
+    process_open_stdio(current_pcb);
     // 为新进程拷贝新的文件描述符
     for (int i = 3; i < PROC_MAX_FD_NUM; ++i)
     {

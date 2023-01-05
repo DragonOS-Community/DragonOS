@@ -1,6 +1,9 @@
 # 编译前请先设置参数
-sysroot=请在这里输入sysroot的绝对路径，就是:DragonOS项目的目录的绝对路径/bin/sysroot
-binutils_path=请在这里输入DragonOS-binutils的绝对路径
+sys_root=/media/longjin/4D0406C21F585A40/2022/DragonOS/bin/sys_root
+binutils_path=/media/longjin/4D0406C21F585A40/2022/code/dragonos-binutils-gdb
+
+# 要安装到的目录
+PREFIX=$HOME/opt/dragonos-userspace-binutils
 
 
 if [ ! -d ${binutils_path} ]; then
@@ -13,13 +16,27 @@ if [ ! -d ${sysroot} ]; then
     exit 1
 fi
 
-PREFIX=$(pwd)/build-binutils/install
 
 mkdir -p build-binutils || exit 1
 mkdir -p ${PREFIX} || exit 1
+
+# 安装依赖
+# 注意texinfo和binutils的版本是否匹配
+# 注意gmp/mpc/mpfr和gcc/g++的版本是否匹配
+sudo apt-get install -y \
+    g++ \
+    gcc \
+    make \
+    texinfo \
+    libgmp3-dev \
+    libmpc-dev \
+    libmpfr-dev \
+    flex \
+    wget
 
 cd build-binutils
 ${binutils_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sysroot} --disable-werror || exit 1
 make -j $(nproc) || exit 1
 make install || exit 1
-make clean
+make clean || exit 1
+rm -rf build-binutils

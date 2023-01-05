@@ -123,7 +123,8 @@ case "$1" in
         esac
         ;;
     *)
-    echo "参数错误"
+    #传统bios
+    ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
     ;;
            
 esac

@@ -38,4 +38,5 @@ ${gcc_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot
 make all-gcc all-target-libgcc -j $(nproc) || exit 1
 make install-gcc install-target-libgcc -j $(nproc)  || exit 1
 make clean || exit 1
+cd ..
 rm -rf build-gcc

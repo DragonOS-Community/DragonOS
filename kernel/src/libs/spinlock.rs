@@ -57,6 +57,10 @@ pub fn spin_unlock_irq(lock: *mut spinlock_t) {
     sti();
 }
 
+/// 原始的Spinlock（自旋锁）
+/// 请注意，这个自旋锁和C的不兼容。
+/// 
+/// @param self.0 这个AtomicBool的值为false时，表示没有被加锁。当它为true时，表示自旋锁已经被上锁。
 #[derive(Debug)]
 pub struct RawSpinlock(AtomicBool);
 
@@ -105,6 +109,21 @@ impl RawSpinlock {
     pub fn unlock_irq(&mut self){
         self.unlock();
         sti();
+    }
+
+    /// @brief 判断自旋锁是否被上锁
+    /// 
+    /// @return true 自旋锁被上锁
+    /// @return false 自旋锁处于解锁状态
+    pub fn is_locked(&self)->bool
+    {
+        return self.0.load(Ordering::Relaxed).into();
+    }
+
+    /// @brief 强制设置自旋锁的状态
+    /// 请注意，这样操作可能会带来未知的风险。因此它是unsafe的。（尽管从Rust语言本身来说，它是safe的）
+    pub unsafe fn set_value(&mut self, value:bool){
+        self.0.store(value, Ordering::SeqCst);
     }
 
     // todo: spin_lock_irqsave

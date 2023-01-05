@@ -6,3 +6,4 @@ pub mod refcount;
 pub mod atomic;
 pub mod wait_queue;
 pub mod list;
+pub mod lockref;

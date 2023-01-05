@@ -147,7 +147,6 @@
         "compiler_attributes.h": "c",
         "timer.h": "c",
         "hid.h": "c",
-        "cfs.h": "c",
         "proc.h": "c",
         "compiler.h": "c",
         "hpet.h": "c",

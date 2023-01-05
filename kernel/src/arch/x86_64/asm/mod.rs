@@ -3,3 +3,4 @@ pub mod irqflags;
 pub mod current;
 pub mod ptrace;
 pub mod bitops;
+pub mod cmpxchg;

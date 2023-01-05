@@ -23,3 +23,11 @@ int fprintf(FILE *restrict stream, const char *restrict format, ...)
     write(stream->fd, buf, len);
     free(buf);
 }
+
+int puts(const char *s){
+    return put_string(s, COLOR_WHITE, COLOR_BLACK);
+}
+
+int putchar(int c){
+    return printf("%c", (char)c);
+}

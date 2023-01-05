@@ -44,3 +44,5 @@ int vsprintf(char *buf, const char *fmt, va_list args);
 
 int fflush(FILE *stream) {}
 int fprintf(FILE *restrict stream, const char *restrict format, ...);
+int puts(const char *s);
+int putchar(int c);

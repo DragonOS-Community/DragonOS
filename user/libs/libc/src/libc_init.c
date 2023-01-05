@@ -1,9 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-FILE* stdin;
-FILE* stdout;
-FILE* stderr;
+FILE *stdin;
+FILE *stdout;
+FILE *stderr;
 
 void _libc_init()
 {

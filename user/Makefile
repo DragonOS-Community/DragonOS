@@ -33,11 +33,11 @@ make_output_dir: ECHO
 	mkdir -p $(ROOT_PATH)/bin/tmp/user
 	mkdir -p $(ROOT_PATH)/bin/sysroot/usr/include
 	mkdir -p $(ROOT_PATH)/bin/sysroot/usr/lib
-	
+
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
 # 系统库
-sys_api_lib:
+sys_api_lib: make_output_dir
 	$(MAKE) -C libs all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
 	$(AR) -rcs $(ROOT_PATH)/bin/sysroot/usr/lib/libsysapi.a $(shell find ./libs/* -name "*.o")
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/* $(ROOT_PATH)/bin/sysroot/usr/include/)

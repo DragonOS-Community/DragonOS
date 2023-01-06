@@ -8,6 +8,7 @@
 #include <common/block.h>
 #include <filesystem/MBR.h>
 #include <debug/bug.h>
+#include <common/kthread.h>
 
 struct pci_device_structure_header_t *ahci_devs[MAX_AHCI_DEVICES];
 
@@ -26,8 +27,7 @@ static void stop_cmd(HBA_PORT *port);
 static void port_rebase(HBA_PORT *port, int portno);
 static long ahci_query_disk();
 
-// Find a free command list slot
-static int ahci_find_cmdslot(HBA_PORT *port);
+
 
 // 计算HBA_MEM的虚拟内存地址
 #define cal_HBA_MEM_VIRT_ADDR(device_num) (AHCI_MAPPING_BASE + (ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[device_num]))->BAR5 - ((((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5) & PAGE_2M_MASK)))
@@ -336,7 +336,7 @@ static void port_rebase(HBA_PORT *port, int portno)
  * @return true done
  * @return false failed
  */
-static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf)
+static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf)
 {
     port->is = (uint32_t)-1; // Clear pending interrupt bits
     int spin = 0;            // Spin lock timeout counter
@@ -404,34 +404,53 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
 
     current_pcb->flags |= PF_NEED_SCHED;
 
-    int retval = AHCI_SUCCESS;
+    // int retval = AHCI_SUCCESS;
     // Wait for completion
-    while (1)
-    {
-        // In some longer duration reads, it may be helpful to spin on the DPS bit
-        // in the PxIS port field as well (1 << 5)
-        if ((port->ci & (1 << slot)) == 0)
-            break;
-        if (port->is & HBA_PxIS_TFES) // Task file error
-        {
-            kerror("Read disk error");
-            retval = E_TASK_FILE_ERROR;
-            break;
-        }
-    }
+    // while (1)
+    // {
+    //     // In some longer duration reads, it may be helpful to spin on the DPS bit
+    //     // in the PxIS port field as well (1 << 5)
+    //     if ((port->ci & (1 << slot)) == 0)
+    //         break;
+    //     if (port->is & HBA_PxIS_TFES) // Task file error
+    //     {
+    //         kerror("Read disk error");
+    //         retval = E_TASK_FILE_ERROR;
+    //         break;
+    //     }
+    // }
+    // retval = ahci_check_complete(port, slot, "Read disk error");
+    // // Check again
+    // if (port->is & HBA_PxIS_TFES)
+    // {
+    //     kerror("Read disk error");
+    //     retval = E_TASK_FILE_ERROR;
+    // }
+    // enter_syscall_int(SYS_AHCI_END_REQ, 0, 0, 0, 0, 0, 0, 0, 0);
+    return 0;
+}
 
-    // Check again
-    if (port->is & HBA_PxIS_TFES)
+int ahci_check_complete(uint8_t port_num,uint8_t ahci_ctrl_num, char *err)
+{
+
+    HBA_PORT * port  = ahci_get_port(port_num,ahci_ctrl_num);
+    int slot  = ahci_find_cmdslot(port);
+    int retval = AHCI_SUCCESS;
+
+    // In some longer duration reads, it may be helpful to spin on the DPS bit
+    // in the PxIS port field as well (1 << 5)
+    if ((port->ci & (1 << slot)) == 0)
+        return retval;
+    if (port->is & HBA_PxIS_TFES) // Task file error
     {
-        kerror("Read disk error");
+        kerror(*err);
         retval = E_TASK_FILE_ERROR;
     }
-    enter_syscall_int(SYS_AHCI_END_REQ, 0, 0, 0, 0, 0, 0, 0, 0);
     return retval;
 }
 
-static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
-                       uint64_t buf)
+static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
+                      uint64_t buf)
 {
     // kdebug("ahci write");
     port->is = 0xffff; // Clear pending interrupt bits
@@ -483,33 +502,37 @@ static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_
     port->ci = 1; // Issue command
 
     current_pcb->flags |= PF_NEED_SCHED;
-    int retval = AHCI_SUCCESS;
+    // int retval = AHCI_SUCCESS;
 
-    while (1)
-    {
-        // In some longer duration reads, it may be helpful to spin on the DPS bit
-        // in the PxIS port field as well (1 << 5)
-        if ((port->ci & (1 << slot)) == 0)
-            break;
-        if (port->is & HBA_PxIS_TFES)
-        { // Task file error
-            kerror("Write disk error");
-            retval = E_TASK_FILE_ERROR;
-            break;
-        }
-    }
-    if (port->is & HBA_PxIS_TFES)
-    {
-        kerror("Write disk error");
-        retval = E_TASK_FILE_ERROR;
-    }
+    // while (1)
+    // {
+    //     // In some longer duration reads, it may be helpful to spin on the DPS bit
+    //     // in the PxIS port field as well (1 << 5)
+    //     if ((port->ci & (1 << slot)) == 0)
+    //         break;
+    //     if (port->is & HBA_PxIS_TFES)
+    //     { // Task file error
+    //         kerror("Write disk error");
+    //         retval = E_TASK_FILE_ERROR;
+    //         break;
+    //     }
+    // }
+
+    // retval = ahci_check_complete(port, slot, "Write disk error");
+
+    // if (port->is & HBA_PxIS_TFES)
+    // {
+    //     kerror("Write disk error");
+    //     retval = E_TASK_FILE_ERROR;
+    // }
+
     // kdebug("ahci write retval=%d", retval);
-    enter_syscall_int(SYS_AHCI_END_REQ, 0, 0, 0, 0, 0, 0, 0, 0);
-    return retval;
+    // enter_syscall_int(SYS_AHCI_END_REQ, 0, 0, 0, 0, 0, 0, 0, 0);
+    return 0;
 }
 
 // Find a free command list slot
-static int ahci_find_cmdslot(HBA_PORT *port)
+int ahci_find_cmdslot(HBA_PORT *port)
 {
     // If not set in SACT and CI, the slot is free
     uint32_t slots = (port->sact | port->ci);
@@ -584,28 +607,27 @@ static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_a
  */
 void ahci_end_request()
 {
-    ahci_req_queue.in_service->wait_queue.pcb->state = PROC_RUNNING;
-    // ahci_req_queue.in_service->wait_queue.pcb->flags |= PF_NEED_SCHED;
-    // current_pcb->flags |= PF_NEED_SCHED;
-    kfree((uint64_t *)ahci_req_queue.in_service);
-    ahci_req_queue.in_service = NULL;
+    // ahci_req_queue.in_service->wait_queue.pcb->state = PROC_RUNNING;
+    // // ahci_req_queue.in_service->wait_queue.pcb->flags |= PF_NEED_SCHED;
+    // // current_pcb->flags |= PF_NEED_SCHED;
+    // kfree((uint64_t *)ahci_req_queue.in_service);
+    // ahci_req_queue.in_service = NULL;
 
     // 进行下一轮的磁盘请求 （由于未实现单独的io调度器，这里会造成长时间的io等待）
-    if (ahci_req_queue.request_count > 0)
-        ahci_query_disk();
+    // if (ahci_req_queue.request_count > 0)
+    //     ahci_query_disk();
 }
 
-static long ahci_query_disk()
+static long ahci_query_disk(struct ahci_request_packet_t *pack)
 {
-    wait_queue_node_t *wait_queue_tmp = container_of(list_next(&ahci_req_queue.wait_queue_list.wait_list), wait_queue_node_t, wait_list);
-    struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)container_of(wait_queue_tmp, struct block_device_request_packet, wait_queue);
+    // wait_queue_node_t *wait_queue_tmp = container_of(list_next(&ahci_req_queue.wait_queue_list.wait_list), wait_queue_node_t, wait_list);
+    // struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)container_of(wait_queue_tmp, struct block_device_request_packet, wait_queue);
 
-    ahci_req_queue.in_service = (struct block_device_request_packet *)pack;
-    list_del(&(ahci_req_queue.in_service->wait_queue.wait_list));
-    --ahci_req_queue.request_count;
+    // ahci_req_queue.in_service = (struct block_device_request_packet *)pack;
+    // list_del(&(ahci_req_queue.in_service->wait_queue.wait_list));
+    // --ahci_req_queue.request_count;
     // kdebug("ahci_query_disk");
     long ret_val = 0;
-
     switch (pack->blk_pak.cmd)
     {
     case AHCI_CMD_READ_DMA_EXT:
@@ -634,8 +656,9 @@ static void ahci_submit(struct ahci_request_packet_t *pack)
     list_append(&(ahci_req_queue.wait_queue_list.wait_list), &(pack->blk_pak.wait_queue.wait_list));
     ++ahci_req_queue.request_count;
 
-    if (ahci_req_queue.in_service == NULL) // 当前没有正在请求的io包，立即执行磁盘请求
-        ahci_query_disk();
+    //  FIXME
+    // if (ahci_req_queue.in_service == NULL) // 当前没有正在请求的io包，立即执行磁盘请求
+    //     ahci_query_disk();
 }
 
 /**
@@ -674,4 +697,14 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
 static long ahci_ioctl(long cmd, long arg)
 {
     return 0;
+}
+
+/**
+ * @brief 根据端口号获取端口结构体
+ * @param port_num 端口号
+ * @param ahci_ctrl_num 控制号
+ */
+HBA_PORT *ahci_get_port(uint8_t port_num, uint8_t ahci_ctrl_num)
+{
+    return &(ahci_devices[ahci_ctrl_num].hba_mem->ports[port_num]);
 }

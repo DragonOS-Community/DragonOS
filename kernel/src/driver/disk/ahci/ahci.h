@@ -380,10 +380,9 @@ static void ahci_probe_port(const uint32_t device_num);
  * @param starth high 32bits of start addr
  * @param count total sectors to read
  * @param buf buffer
- * @return true done
- * @return false failed
+ * @return success 0
  */
-static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf);
+static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf);
 
 /**
  * @brief write data to SATA device using 48bit LBA address
@@ -393,10 +392,33 @@ static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
  * @param starth high 32bits of start addr
  * @param count total sectors to read
  * @param buf buffer
- * @return true done
- * @return false failed
+ * @return success 0
  */
-static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
+static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
                        uint64_t buf);
 
 void ahci_end_request();
+
+/**
+ * @brief 检查请求包是否已完成
+ * 
+ * @param port_num HBA PORT 编号
+ * @param ahci_ctrl_num ahci控制号
+ * @param err 错误信息
+*/
+int ahci_check_complete(uint8_t port_num,uint8_t ahci_ctrl_num, char *err);
+
+//FIXME ahci_ctrl_num注释
+/**
+ * @brief 根据端口号获取端口结构体
+ * @param port_num 端口号
+ * @param ahci_ctrl_num 控制号  
+*/
+HBA_PORT* ahci_get_port(uint8_t port_num,uint8_t ahci_ctrl_num );
+
+
+/**
+ * @brief Find a free command list slot
+ * @param port 
+*/
+ int ahci_find_cmdslot(HBA_PORT *port);

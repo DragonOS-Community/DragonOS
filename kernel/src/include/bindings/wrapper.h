@@ -30,3 +30,5 @@
 #include <mm/slab.h>
 #include <process/process.h>
 #include <sched/sched.h>
+#include <driver/disk/ahci/ahci.h>
+#include <common/completion.h>

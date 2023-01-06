@@ -24,10 +24,16 @@ int fprintf(FILE *restrict stream, const char *restrict format, ...)
     free(buf);
 }
 
-int puts(const char *s){
+int puts(const char *s)
+{
     return put_string(s, COLOR_WHITE, COLOR_BLACK);
 }
 
-int putchar(int c){
+int putchar(int c)
+{
     return printf("%c", (char)c);
+}
+int fflush(FILE *stream)
+{
+    return 0;
 }

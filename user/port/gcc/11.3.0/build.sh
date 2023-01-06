@@ -34,11 +34,12 @@ mkdir -p build-gcc || exit 1
 mkdir -p ${PREFIX} || exit 1
 
 cd build-gcc
-${gcc_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sysroot} --disable-werror --enable-languages=c,c++ || exit 1
+${gcc_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sysroot} --disable-werror --disable-shared --disable-bootstrap --enable-languages=c,c++ || exit 1
 make all-gcc all-target-libgcc -j $(nproc) || exit 1
 make install-gcc install-target-libgcc -j $(nproc)  || exit 1
-make all-target-libstdc++-v3 -j $(nproc) || exit 1
-make install-target-libstdc++-v3 -j $(nproc) || exit 1
-make clean || exit 1
+# 这里会报错，暂时不知道为什么
+# make all-target-libstdc++-v3 -j $(nproc) || exit 1
+# make install-target-libstdc++-v3 -j $(nproc) || exit 1
+make clean
 cd ..
 rm -rf build-gcc

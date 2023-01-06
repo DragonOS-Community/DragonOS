@@ -44,7 +44,7 @@ sys_api_lib_stage_1: make_output_dir
 	
 
 sys_api_lib: sys_api_lib_stage_1
-	$(AR) crvs $(ROOT_PATH)/bin/sysroot/usr/lib/libsysapi.a $(shell find ./libs/* -name "*.o")
+	$(AR) crvs $(ROOT_PATH)/bin/sysroot/usr/lib/libc.a $(shell find ./libs/* -name "*.o")
 	$(shell find ./libs/* -name "*.o" | xargs -I {} cp {} $(ROOT_PATH)/bin/sysroot/usr/lib/)
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/* $(ROOT_PATH)/bin/sysroot/usr/include/)
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/arch/x86_64/c*.o $(ROOT_PATH)/bin/sysroot/usr/lib/)

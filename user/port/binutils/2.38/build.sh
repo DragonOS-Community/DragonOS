@@ -1,9 +1,9 @@
 # 编译前请先设置参数
-sys_root=/media/longjin/4D0406C21F585A40/2022/DragonOS/bin/sys_root
-binutils_path=/media/longjin/4D0406C21F585A40/2022/code/dragonos-binutils-gdb
+sys_root=$DRAGONOS_SYSROOT
+binutils_path=请填写binutils的路径
 
 # 要安装到的目录
-PREFIX=$HOME/opt/dragonos-userspace-binutils
+PREFIX=$HOME/opt/dragonos-host-userspace
 
 
 if [ ! -d ${binutils_path} ]; then

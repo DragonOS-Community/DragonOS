@@ -37,12 +37,17 @@ make_output_dir: ECHO
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
 # 系统库
-sys_api_lib: make_output_dir
+
+sys_api_lib_stage_1: make_output_dir
+	@echo Building sys_api_lib...
 	$(MAKE) -C libs all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
-	$(AR) -rcs $(ROOT_PATH)/bin/sysroot/usr/lib/libsysapi.a $(shell find ./libs/* -name "*.o")
+	
+
+sys_api_lib: sys_api_lib_stage_1
+	$(AR) crvs $(ROOT_PATH)/bin/sysroot/usr/lib/libc.a $(shell find ./libs/* -name "*.o")
+	$(shell find ./libs/* -name "*.o" | xargs -I {} cp {} $(ROOT_PATH)/bin/sysroot/usr/lib/)
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/* $(ROOT_PATH)/bin/sysroot/usr/include/)
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/arch/x86_64/c*.o $(ROOT_PATH)/bin/sysroot/usr/lib/)
-
 
 clean: 
 	rm -rf $(GARBAGE)

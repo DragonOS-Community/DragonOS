@@ -1,6 +1,6 @@
 # 编译前请先设置参数
-sys_root=/media/longjin/4D0406C21F585A40/2022/DragonOS/bin/sysroot
-mpc_path=/media/longjin/4D0406C21F585A40/2022/code/dragonos-mpc
+sys_root=$DRAGONOS_SYSROOT
+mpc_path=请填写mpc的路径
 
 # 要安装到的目录
 PREFIX=/usr

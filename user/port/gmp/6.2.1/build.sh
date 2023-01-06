@@ -1,6 +1,6 @@
 # 编译前请先设置参数
-sys_root=/media/longjin/4D0406C21F585A40/2022/DragonOS/bin/sysroot
-gmp_path=/media/longjin/4D0406C21F585A40/2022/code/dragonos-gmp-6.2.1
+sys_root=$DRAGONOS_SYSROOT
+gmp_path=请填写gmp的路径
 
 # 要安装到的目录
 PREFIX=/usr

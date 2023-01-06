@@ -1,8 +1,8 @@
 
 # 编译前请先设置参数
-sys_root=/media/longjin/4D0406C21F585A40/2022/DragonOS/bin/sysroot
+sys_root=$DRAGONOS_SYSROOT
+src_path=请填写flex的路径
 
-src_path=/media/longjin/4D0406C21F585A40/2022/code/dragonos-flex
 current_path=$(pwd)
 # 要安装到的目录
 PREFIX=/usr

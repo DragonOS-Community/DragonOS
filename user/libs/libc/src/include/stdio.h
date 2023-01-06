@@ -20,6 +20,10 @@
 
 #define SEEK_MAX 3
 
+/* The value returned by fgetc and similar functions to indicate the
+   end of the file.  */
+#define EOF (-1)
+
 typedef struct {
     int fd;  // 文件描述符
 } FILE;

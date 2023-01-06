@@ -1,6 +1,10 @@
 #pragma once
 #include <sys/types.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 /**
  * @brief 获取一块堆内存
  * 
@@ -46,3 +50,7 @@ void exit(int status);
  * 
  */
 void abort();
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

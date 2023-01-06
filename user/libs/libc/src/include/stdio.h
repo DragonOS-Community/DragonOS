@@ -3,6 +3,10 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 // 字体颜色的宏定义
 #define COLOR_WHITE 0x00ffffff  //白
 #define COLOR_BLACK 0x00000000  //黑
@@ -50,3 +54,7 @@ int fflush(FILE *stream) {}
 int fprintf(FILE *restrict stream, const char *restrict format, ...);
 int puts(const char *s);
 int putchar(int c);
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

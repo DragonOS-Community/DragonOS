@@ -2,6 +2,10 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 /**
  * @brief 关闭文件接口
  *
@@ -117,3 +121,7 @@ int rm(const char * path);
 void swab(void *restrict src, void *restrict dest, ssize_t nbytes);
 
 pid_t getpid(void);
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

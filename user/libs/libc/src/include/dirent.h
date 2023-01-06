@@ -1,6 +1,9 @@
 #pragma once
 #include <sys/types.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
 
 /**
  * @brief inode的属性（copy from vfs.h）
@@ -64,3 +67,7 @@ int closedir(struct DIR *dirp);
  * @return struct dirent* 
  */
 struct dirent* readdir(struct DIR* dir);
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

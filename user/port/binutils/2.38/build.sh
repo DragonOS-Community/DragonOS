@@ -35,7 +35,7 @@ sudo apt-get install -y \
     wget
 
 cd build-binutils
-${binutils_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sysroot} --disable-werror || exit 1
+${binutils_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sys_root} --disable-werror || exit 1
 make -j $(nproc) || exit 1
 make install || exit 1
 make clean || exit 1

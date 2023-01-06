@@ -34,7 +34,7 @@ mkdir -p build-gcc || exit 1
 mkdir -p ${PREFIX} || exit 1
 
 cd build-gcc
-${gcc_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sysroot} --disable-werror --enable-languages=c || exit 1
+${gcc_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sys_root} --disable-werror --enable-languages=c || exit 1
 make all-gcc all-target-libgcc -j $(nproc) || exit 1
 make install-gcc install-target-libgcc -j $(nproc)  || exit 1
 make clean || exit 1

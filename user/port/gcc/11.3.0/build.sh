@@ -1,9 +1,9 @@
 # 编译前请先设置参数
-sys_root=/media/longjin/4D0406C21F585A40/2022/DragonOS/bin/sys_root
+sys_root=/media/longjin/4D0406C21F585A40/2022/DragonOS/bin/sysroot
 gcc_path=/media/longjin/4D0406C21F585A40/2022/code/dragonos-gcc
 
 # 要安装到的目录
-PREFIX=$HOME/opt/dragonos-userspace-gcc
+PREFIX=$HOME/opt/dragonos-host-userspace
 
 
 if [ ! -d ${gcc_path} ]; then
@@ -34,9 +34,11 @@ mkdir -p build-gcc || exit 1
 mkdir -p ${PREFIX} || exit 1
 
 cd build-gcc
-${gcc_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sysroot} --disable-werror --enable-languages=c || exit 1
+${gcc_path}/configure --prefix=${PREFIX} --target=x86_64-dragonos --with-sysroot=${sysroot} --disable-werror --enable-languages=c,c++ || exit 1
 make all-gcc all-target-libgcc -j $(nproc) || exit 1
 make install-gcc install-target-libgcc -j $(nproc)  || exit 1
+make all-target-libstdc++-v3 -j $(nproc) || exit 1
+make install-target-libstdc++-v3 -j $(nproc) || exit 1
 make clean || exit 1
 cd ..
 rm -rf build-gcc

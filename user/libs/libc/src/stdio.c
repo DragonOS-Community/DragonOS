@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +34,36 @@ int putchar(int c)
 {
     return printf("%c", (char)c);
 }
+
 int fflush(FILE *stream)
 {
     return 0;
+}
+
+int ferror(FILE *stream)
+{
+    return 0;
+}
+
+int fclose(FILE *stream)
+{
+    if (stream->fd >= 3)
+    {
+        int retcval = close(stream);
+        free(stream);
+        return;
+    }
+    else
+        return 0;
+}
+
+FILE *fopen(const char *restrict pathname, const char *restrict mode)
+{
+    FILE *stream = malloc(sizeof(FILE));
+    memset(stream, 0, sizeof(FILE));
+
+    int fd = open(pathname, mode);
+    if (fd >= 0)
+        stream->fd = fd;
+    return stream;
 }

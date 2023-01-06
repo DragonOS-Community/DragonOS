@@ -52,6 +52,9 @@ int vsprintf(char *buf, const char *fmt, va_list args);
 
 int fflush(FILE *stream);
 int fprintf(FILE *restrict stream, const char *restrict format, ...);
+int ferror(FILE *stream);
+FILE *fopen(const char *restrict pathname, const char *restrict mode);
+int fclose(FILE *stream);
 int puts(const char *s);
 int putchar(int c);
 

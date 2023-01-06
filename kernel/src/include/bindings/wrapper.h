@@ -29,5 +29,4 @@
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <process/process.h>
-#include <sched/cfs.h>
 #include <sched/sched.h>

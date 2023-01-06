@@ -3,7 +3,7 @@
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <common/printk.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <filesystem/devfs/devfs.h>
 #include <common/wait_queue.h>
 #include <common/spinlock.h>

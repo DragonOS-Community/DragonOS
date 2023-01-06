@@ -15,8 +15,8 @@
 // ==================implementation with rust===================
 extern void softirq_init();
 extern void raise_softirq(uint64_t sirq_num);
-extern void register_softirq(uint32_t irq_num, void (*action)(void *data), void *data);
-extern void unregister_softirq(uint32_t irq_num);
+extern int register_softirq(uint32_t irq_num, void (*action)(void *data), void *data);
+extern int unregister_softirq(uint32_t irq_num);
 extern void set_softirq_pending(uint64_t status);
 extern void clear_softirq_pending(uint32_t irq_num);
 extern void do_softirq();

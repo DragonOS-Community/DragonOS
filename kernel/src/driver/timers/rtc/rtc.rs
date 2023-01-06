@@ -1,4 +1,4 @@
-pub struct RtcTimeT {
+pub struct RtcTime {
     pub second: i32,
     pub minute: i32,
     pub hour: i32,
@@ -21,20 +21,22 @@ fn read_cmos(addr: u8) -> u8 {
     }
 }
 
+/// used in the form of u8
+#[repr(u8)]
 enum CMOSTimeSelector {
-    TSecond = 0x00,
-    TMinute = 0x02,
-    THour = 0x04,
-    TDay = 0x07,
-    TMonth = 0x08,
-    TYear = 0x09,
+    Second = 0x00,
+    Minute = 0x02,
+    Hour = 0x04,
+    Day = 0x07,
+    Month = 0x08,
+    Year = 0x09,
 }
 
 ///@brief 从主板cmos中获取时间
 ///
 ///@param t time结构体
 ///@return int 成功则为0
-pub fn rtc_get_cmos_time(t: &mut RtcTimeT) -> Result<i32,i32> {
+pub fn rtc_get_cmos_time(t: &mut RtcTime) -> Result<i32,i32> {
     unsafe {
         // 为防止中断请求打断该过程，需要先关中断
         cli();
@@ -53,14 +55,14 @@ pub fn rtc_get_cmos_time(t: &mut RtcTimeT) -> Result<i32,i32> {
         }; // 判断是否为二进制码
 
         loop {
-            t.year = read_cmos(CMOSTimeSelector::TYear as u8) as i32;
-            t.month = read_cmos(CMOSTimeSelector::TMonth as u8) as i32;
-            t.day = read_cmos(CMOSTimeSelector::TDay as u8) as i32;
-            t.hour = read_cmos(CMOSTimeSelector::THour as u8) as i32;
-            t.minute = read_cmos(CMOSTimeSelector::TMinute as u8) as i32;
-            t.second = read_cmos(CMOSTimeSelector::TSecond as u8) as i32;
+            t.year = read_cmos(CMOSTimeSelector::Year as u8) as i32;
+            t.month = read_cmos(CMOSTimeSelector::Month as u8) as i32;
+            t.day = read_cmos(CMOSTimeSelector::Day as u8) as i32;
+            t.hour = read_cmos(CMOSTimeSelector::Hour as u8) as i32;
+            t.minute = read_cmos(CMOSTimeSelector::Minute as u8) as i32;
+            t.second = read_cmos(CMOSTimeSelector::Second as u8) as i32;
 
-            if t.second == read_cmos(CMOSTimeSelector::TSecond as u8) as i32 {
+            if t.second == read_cmos(CMOSTimeSelector::Second as u8) as i32 {
                 break;
             } // 若读取时间过程中时间发生跳变则重新读取
         }

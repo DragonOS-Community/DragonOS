@@ -170,11 +170,11 @@ void system_initialize()
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
-    // fat32_init();
+    
     HPET_enable();
 
     io_mfence();
-    // 系统初始化kdebug("io_mfence_finished");到此结束，剩下的初始化功能应当放在初始内核线程中执行
+    // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 
     apic_timer_init();
     io_mfence();

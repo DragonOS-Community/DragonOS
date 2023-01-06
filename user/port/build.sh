@@ -1,8 +1,8 @@
 source pkg-config.sh
 path=(
-    # gmp/6.2.1
-    # mpfr/4.1.1
-    # mpc/1.2.1
+    gmp/6.2.1
+    mpfr/4.1.1
+    mpc/1.2.1
     flex/2.6.4
 )
 

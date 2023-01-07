@@ -7,6 +7,7 @@
 # 编译前请先设置参数
 sys_root=$DRAGONOS_SYSROOT
 gcc_path=请填写gcc的路径
+# $HOME/opt/gcc 
 
 # 要安装到的目录
 PREFIX=$HOME/opt/dragonos-host-userspace

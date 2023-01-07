@@ -1,8 +1,15 @@
+# 安装命令
+# curl https://ftp.gnu.org/gnu/mpc/mpc-1.2.1.tar.gz
+# tar zxvf mpc-1.2.1.tar.gz
+# rm mpc-1.2.1.tar.gz
+
 # 编译前请先设置参数
 sys_root=$DRAGONOS_SYSROOT
 mpc_path=请填写mpc的路径
 
-# 要安装到的目录
+# $HOME/DragonOS/user/port/mpc/1.2.1/mpc-1.2.1
+
+# 要安装到的目录(/usr相对于sysroot)
 PREFIX=/usr
 current_path=$(pwd)
 
@@ -19,7 +26,7 @@ fi
 cd ${mpc_path}
 autoreconf --install || exit 1
 autoconf
-sed -i 's/ios[*]/ios* | dragonos* /' build-aux/config.sub
+# sed -i 's/gnu*/gnu* | dragonos* /' build-aux/config.sub
 
 cd ${current_path}
 

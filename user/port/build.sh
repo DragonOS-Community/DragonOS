@@ -11,7 +11,7 @@ current_path=$(pwd)
 for i in ${path[@]}; do
     echo "Building $i"
     cd $i
-    ./build.sh || exit 1
+    bash build.sh || exit 1
     cd $current_path
 done
 cd $current_path

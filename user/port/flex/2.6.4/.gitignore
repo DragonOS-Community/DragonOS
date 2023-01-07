@@ -1,1 +1,4 @@
-build/
+flex*/*
+build-flex/*
+build-flex
+flex*

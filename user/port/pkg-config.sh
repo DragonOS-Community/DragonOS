@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fill these in appropriately:
-ROOT_PATH=$(dirname $(dirname $(pwd)))
-DRAGONOS_SYSROOT=$ROOT_PATH/bin/sysroot
+export ROOT_PATH=$(dirname $(dirname $(pwd)))
+export DRAGONOS_SYSROOT=$ROOT_PATH/bin/sysroot
 
 
 

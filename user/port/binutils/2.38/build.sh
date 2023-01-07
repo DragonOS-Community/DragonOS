@@ -1,6 +1,12 @@
+# 从git中获取源代码压缩包
+# curl https://github.com/DragonOS-Community/binutils/archive/refs/heads/DragonOS-binutils-2_38.zip
+# unzip DragonOS-binutils-2_38.zip
+# rm DragonOS-binutils-2_38.zip
+
 # 编译前请先设置参数
 sys_root=$DRAGONOS_SYSROOT
 binutils_path=请填写binutils的路径
+# $HOME/DragonOS/user/port/binutils/2.3.8/DragonOS-binutils-2_38
 
 # 要安装到的目录
 PREFIX=$HOME/opt/dragonos-host-userspace

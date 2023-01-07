@@ -211,7 +211,7 @@ impl Softirq {
                 continue; //running标志位为1
             }
             if self.modify_lock.try_lock() {
-                if self.is_running(irq_num){
+                if self.is_running(irq_num) {
                     self.modify_lock.unlock();
                     continue;
                 }
@@ -240,7 +240,9 @@ impl Softirq {
                 && !self.is_running(softirq_index)
             {
                 if self.modify_lock.try_lock() {
-                    if self.is_running(softirq_index)||!self.table[softirq_index as usize].action.is_some(){
+                    if self.is_running(softirq_index)
+                        || self.table[softirq_index as usize].action.is_none()
+                    {
                         self.modify_lock.unlock();
                         continue;
                     }

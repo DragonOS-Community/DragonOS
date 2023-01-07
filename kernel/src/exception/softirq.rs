@@ -39,9 +39,9 @@ impl Default for SoftirqVector {
 
 pub struct Softirq {
     modify_lock: RawSpinlock,
-    softirq_pending: u64,
-    softirq_running: u64,
-    softirq_table: [SoftirqVector; MAX_SOFTIRQ_NUM as usize],
+    pending: u64,
+    running: u64,
+    table: [SoftirqVector; MAX_SOFTIRQ_NUM as usize],
 }
 
 #[no_mangle]
@@ -126,9 +126,9 @@ impl Default for Softirq {
     fn default() -> Self {
         Self {
             modify_lock: RawSpinlock::INIT,
-            softirq_pending: (0),
-            softirq_running: (0),
-            softirq_table: [Default::default(); MAX_SOFTIRQ_NUM as usize],
+            pending: (0),
+            running: (0),
+            table: [Default::default(); MAX_SOFTIRQ_NUM as usize],
         }
     }
 }
@@ -136,47 +136,47 @@ impl Default for Softirq {
 impl Softirq {
     #[inline]
     pub fn get_softirq_pending(&self) -> u64 {
-        return self.softirq_pending;
+        return self.pending;
     }
 
     #[inline]
     pub fn get_softirq_running(&self) -> u64 {
-        return self.softirq_running;
+        return self.running;
     }
 
     #[inline]
     pub fn set_softirq_pending(&mut self, softirq_num: u32) {
-        self.softirq_pending |= 1 << softirq_num;
+        self.pending |= 1 << softirq_num;
     }
 
     #[inline]
     pub fn set_softirq_running(&mut self, softirq_num: u32) {
-        self.softirq_running |= 1 << softirq_num;
+        self.running |= 1 << softirq_num;
     }
 
     #[inline]
     pub fn clear_softirq_running(&mut self, softirq_num: u32) {
-        self.softirq_running &= !(1 << softirq_num);
+        self.running &= !(1 << softirq_num);
     }
 
     /// @brief 清除软中断pending标志位
     #[inline]
     pub fn clear_softirq_pending(&mut self, softirq_num: u32) {
-        self.softirq_pending &= !(1 << softirq_num);
+        self.pending &= !(1 << softirq_num);
     }
 
     /// @brief 判断对应running标志位是否为0
     /// @return true: 标志位为1; false: 标志位为0
     #[inline]
     pub fn is_running(&mut self, softirq_num: u32) -> bool {
-        return (self.softirq_running & (1 << softirq_num)).ne(&0);
+        return (self.running & (1 << softirq_num)).ne(&0);
     }
 
     /// @brief 判断对应pending标志位是否为0
     /// @return true: 标志位为1; false: 标志位为0
     #[inline]
     pub fn is_pending(&mut self, softirq_num: u32) -> bool {
-        return (self.softirq_pending & (1 << softirq_num)).ne(&0);
+        return (self.pending & (1 << softirq_num)).ne(&0);
     }
 
     /// @brief 注册软中断向量
@@ -189,7 +189,7 @@ impl Softirq {
         action: Option<unsafe extern "C" fn(data: *mut ::core::ffi::c_void)>,
         data: *mut c_void,
     ) -> i32 {
-        if self.softirq_table[irq_num as usize].action.is_some() {
+        if self.table[irq_num as usize].action.is_some() {
             return -(EEXIST as i32);
         }
 
@@ -197,8 +197,8 @@ impl Softirq {
             return -(EPERM as i32);
         }
         self.modify_lock.lock();
-        self.softirq_table[irq_num as usize].action = action;
-        self.softirq_table[irq_num as usize].data = data;
+        self.table[irq_num as usize].action = action;
+        self.table[irq_num as usize].data = data;
         self.modify_lock.unlock();
         return 0;
     }
@@ -224,8 +224,8 @@ impl Softirq {
         }
         self.clear_softirq_running(irq_num);
         self.clear_softirq_pending(irq_num);
-        self.softirq_table[irq_num as usize].action = None;
-        self.softirq_table[irq_num as usize].data = null_mut();
+        self.table[irq_num as usize].action = None;
+        self.table[irq_num as usize].data = null_mut();
         self.modify_lock.unlock();
         return 0;
     }
@@ -234,9 +234,9 @@ impl Softirq {
     pub fn do_softirq(&mut self) {
         sti();
         let mut softirq_index: u32 = 0; //软中断向量号码
-        while (softirq_index as u64) < MAX_SOFTIRQ_NUM && self.softirq_pending != 0 {
+        while (softirq_index as u64) < MAX_SOFTIRQ_NUM && self.pending != 0 {
             if self.is_pending(softirq_index)
-                && self.softirq_table[softirq_index as usize].action.is_some()
+                && self.table[softirq_index as usize].action.is_some()
                 && !self.is_running(softirq_index)
             {
                 if self.modify_lock.try_lock() {
@@ -248,8 +248,8 @@ impl Softirq {
                     self.set_softirq_running(softirq_index);
                     self.modify_lock.unlock();
                     unsafe {
-                        (self.softirq_table[softirq_index as usize].action.unwrap())(
-                            self.softirq_table[softirq_index as usize].data,
+                        (self.table[softirq_index as usize].action.unwrap())(
+                            self.table[softirq_index as usize].data,
                         );
                     }
                     self.clear_softirq_running(softirq_index);

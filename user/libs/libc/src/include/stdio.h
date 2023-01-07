@@ -3,6 +3,10 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 // 字体颜色的宏定义
 #define COLOR_WHITE 0x00ffffff  //白
 #define COLOR_BLACK 0x00000000  //黑
@@ -20,6 +24,18 @@
 
 #define SEEK_MAX 3
 
+/* The value returned by fgetc and similar functions to indicate the
+   end of the file.  */
+#define EOF (-1)
+
+typedef struct {
+    int fd;  // 文件描述符
+} FILE;
+
+extern FILE* stdin;
+extern FILE* stdout;
+extern FILE* stderr;
+
 /**
  * @brief 往屏幕上输出字符串
  *
@@ -33,3 +49,15 @@ int64_t put_string(char *str, uint64_t front_color, uint64_t bg_color);
 int printf(const char *fmt, ...);
 int sprintf(char *buf, const char *fmt, ...);
 int vsprintf(char *buf, const char *fmt, va_list args);
+
+int fflush(FILE *stream);
+int fprintf(FILE *restrict stream, const char *restrict format, ...);
+int ferror(FILE *stream);
+FILE *fopen(const char *restrict pathname, const char *restrict mode);
+int fclose(FILE *stream);
+int puts(const char *s);
+int putchar(int c);
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

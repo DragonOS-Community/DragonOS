@@ -57,8 +57,6 @@ pub extern "C" fn softirq_init() {
             panic!("Try to init SOFTIRQ_HANDLER_PTR twice.");
         }
     }
-    let softirq_handler = __get_softirq_handler_mut();
-    softirq_handler.softirq_init();
 }
 
 /// @brief 将raw pointer转换为指针,减少unsafe块
@@ -137,11 +135,6 @@ impl Default for Softirq {
 }
 
 impl Softirq {
-    pub fn softirq_init(&mut self) {
-        self.softirq_pending = 0;
-        self.softirq_table = [Default::default(); MAX_SOFTIRQ_NUM as usize];
-    }
-    
     pub fn get_softirq_pending(&self) -> u64 {
         return self.softirq_pending;
     }

@@ -17,8 +17,12 @@ fn ktime_to_ns(kt: ktime_t) -> i64 {
 fn ktime_get_real() -> ktime_t {
     let mut rtc_time: RtcTime = RtcTime::default();
 
-    if rtc_time.get() != Ok(0) {
-        rtc_time = RtcTime::default();
+    {
+        let r = rtc_time.get();
+        // 返回错误码
+        if r.is_err() {
+            return r.unwrap_err() as ktime_t;
+        }
     }
 
     let mut day_count: i32 = 0;

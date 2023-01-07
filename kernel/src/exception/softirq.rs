@@ -12,9 +12,10 @@ use crate::kBUG;
 use crate::libs::spinlock::RawSpinlock;
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
-const MAX_UNREGISTER_TRIAL_TIME: u64 = 50;
+const MAX_LOCK_TRIAL_TIME: u64 = 50;
+pub static mut SOFTIRQ_HANDLER_PTR: *mut Softirq = null_mut();
 
-/// not used until softirq.h is removed
+/// 软中断向量号码
 pub enum SirqParam {
     TIMER_SIRQ = 0,         //时钟软中断信号
     VIDEO_REFRESH_SIRQ = 1, //帧缓冲区刷新软中断
@@ -37,25 +38,23 @@ impl Default for SoftirqVector {
 }
 
 pub struct Softirq {
-    softirq_modify_lock: RawSpinlock,
+    modify_lock: RawSpinlock,
     softirq_pending: u64,
     softirq_running: u64,
     softirq_table: [SoftirqVector; MAX_SOFTIRQ_NUM as usize],
 }
 
-pub static mut SOFTIRQ_HANDLER_PTR: *mut Softirq = null_mut();
-
 #[no_mangle]
 #[allow(dead_code)]
 /// @brief 提供给c的接口函数,用于初始化静态指针
 pub extern "C" fn softirq_init() {
-    unsafe {
-        if SOFTIRQ_HANDLER_PTR.is_null() {
+    if unsafe { SOFTIRQ_HANDLER_PTR.is_null() } {
+        unsafe {
             SOFTIRQ_HANDLER_PTR = Box::leak(Box::new(Softirq::default()));
-        } else {
-            kBUG!("Try to init SOFTIRQ_HANDLER_PTR twice.");
-            panic!("Try to init SOFTIRQ_HANDLER_PTR twice.");
         }
+    } else {
+        kBUG!("Try to init SOFTIRQ_HANDLER_PTR twice.");
+        panic!("Try to init SOFTIRQ_HANDLER_PTR twice.");
     }
 }
 
@@ -126,7 +125,7 @@ pub extern "C" fn do_softirq() {
 impl Default for Softirq {
     fn default() -> Self {
         Self {
-            softirq_modify_lock: RawSpinlock::INIT,
+            modify_lock: RawSpinlock::INIT,
             softirq_pending: (0),
             softirq_running: (0),
             softirq_table: [Default::default(); MAX_SOFTIRQ_NUM as usize],
@@ -135,10 +134,12 @@ impl Default for Softirq {
 }
 
 impl Softirq {
+    #[inline]
     pub fn get_softirq_pending(&self) -> u64 {
         return self.softirq_pending;
     }
 
+    #[inline]
     pub fn get_softirq_running(&self) -> u64 {
         return self.softirq_running;
     }
@@ -167,17 +168,21 @@ impl Softirq {
     /// @brief 判断对应running标志位是否为0
     /// @return true: 标志位为1; false: 标志位为0
     #[inline]
-    pub fn read_softirq_running(&mut self, softirq_num: u32) -> bool {
+    pub fn is_running(&mut self, softirq_num: u32) -> bool {
         return (self.softirq_running & (1 << softirq_num)).ne(&0);
     }
 
     /// @brief 判断对应pending标志位是否为0
     /// @return true: 标志位为1; false: 标志位为0
     #[inline]
-    pub fn read_softirq_pending(&mut self, softirq_num: u32) -> bool {
+    pub fn is_pending(&mut self, softirq_num: u32) -> bool {
         return (self.softirq_pending & (1 << softirq_num)).ne(&0);
     }
 
+    /// @brief 注册软中断向量
+    /// @param irq_num 中断向量号码
+    /// @param action 中断函数的入口地址
+    /// @param data 中断函数的操作数据
     pub fn register_softirq(
         &mut self,
         irq_num: u32,
@@ -191,45 +196,57 @@ impl Softirq {
         if unsafe { verify_area(action.unwrap() as u64, 1) } {
             return -(EPERM as i32);
         }
-        self.softirq_modify_lock.lock();
+        self.modify_lock.lock();
         self.softirq_table[irq_num as usize].action = action;
         self.softirq_table[irq_num as usize].data = data;
-        self.softirq_modify_lock.unlock();
+        self.modify_lock.unlock();
         return 0;
     }
 
+    /// @brief 解注册软中断向量
+    /// @param irq_num 中断向量号码
     pub fn unregister_softirq(&mut self, irq_num: u32) -> i32 {
-        for _trial_time in 0..MAX_UNREGISTER_TRIAL_TIME - 1 {
-            if self.read_softirq_running(irq_num) {
+        for _trial_time in 0..MAX_LOCK_TRIAL_TIME {
+            if self.is_running(irq_num) {
                 continue; //running标志位为1
             }
-            if self.softirq_modify_lock.try_lock() {
+            if self.modify_lock.try_lock() {
+                if self.is_running(irq_num){
+                    self.modify_lock.unlock();
+                    continue;
+                }
                 break;
             }
         }
-        if !self.softirq_modify_lock.is_locked() {
+        // 存在尝试加锁规定次数后仍加锁失败的情况,报告错误并退出
+        if !self.modify_lock.is_locked() {
             return -(EBUSY as i32);
         }
         self.clear_softirq_running(irq_num);
         self.clear_softirq_pending(irq_num);
         self.softirq_table[irq_num as usize].action = None;
         self.softirq_table[irq_num as usize].data = null_mut();
-        self.softirq_modify_lock.unlock();
+        self.modify_lock.unlock();
         return 0;
     }
 
+    /// @brief 遍历执行软中断
     pub fn do_softirq(&mut self) {
         sti();
-        let mut softirq_index: u32 = 0;
+        let mut softirq_index: u32 = 0; //软中断向量号码
         while (softirq_index as u64) < MAX_SOFTIRQ_NUM && self.softirq_pending != 0 {
-            if self.read_softirq_pending(softirq_index)
+            if self.is_pending(softirq_index)
                 && self.softirq_table[softirq_index as usize].action.is_some()
-                && !self.read_softirq_running(softirq_index)
+                && !self.is_running(softirq_index)
             {
-                if self.softirq_modify_lock.try_lock() {
+                if self.modify_lock.try_lock() {
+                    if self.is_running(softirq_index){
+                        self.modify_lock.unlock();
+                        continue;
+                    }
                     self.clear_softirq_pending(softirq_index);
                     self.set_softirq_running(softirq_index);
-                    self.softirq_modify_lock.unlock();
+                    self.modify_lock.unlock();
                     unsafe {
                         (self.softirq_table[softirq_index as usize].action.unwrap())(
                             self.softirq_table[softirq_index as usize].data,

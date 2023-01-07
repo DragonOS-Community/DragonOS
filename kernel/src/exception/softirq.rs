@@ -1,24 +1,24 @@
-use alloc::boxed::Box;
-use core::ffi::c_void;
-use core::ptr::null_mut;
+use core::{ffi::c_void, ptr::null_mut};
 
-use crate::arch::interrupt::cli;
-use crate::arch::interrupt::sti;
-use crate::include::bindings::bindings::verify_area;
-use crate::include::bindings::bindings::EBUSY;
-use crate::include::bindings::bindings::EEXIST;
-use crate::include::bindings::bindings::EPERM;
-use crate::kBUG;
-use crate::libs::spinlock::RawSpinlock;
+use alloc::boxed::Box;
+
+use crate::{
+    arch::interrupt::{cli, sti},
+    include::bindings::bindings::{verify_area, EBUSY, EEXIST, EPERM},
+    kBUG,
+    libs::spinlock::RawSpinlock,
+};
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
 const MAX_LOCK_TRIAL_TIME: u64 = 50;
 pub static mut SOFTIRQ_HANDLER_PTR: *mut Softirq = null_mut();
 
 /// 软中断向量号码
-pub enum SirqParam {
-    TIMER_SIRQ = 0,         //时钟软中断信号
-    VIDEO_REFRESH_SIRQ = 1, //帧缓冲区刷新软中断
+#[allow(dead_code)]
+#[repr(u8)]
+pub enum SoftirqNumber {
+    TIMER = 0,        //时钟软中断信号
+    VideoRefresh = 1, //帧缓冲区刷新软中断
 }
 
 #[repr(C)]
@@ -135,11 +135,13 @@ impl Default for Softirq {
 
 impl Softirq {
     #[inline]
+    #[allow(dead_code)]
     pub fn get_softirq_pending(&self) -> u64 {
         return self.pending;
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn get_softirq_running(&self) -> u64 {
         return self.running;
     }

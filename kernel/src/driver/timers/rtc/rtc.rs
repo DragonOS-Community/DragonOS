@@ -30,7 +30,7 @@ impl RtcTime {
     ///
     ///@param self time结构体
     ///@return int 成功则为0
-    pub fn rtc_get_cmos_time(&mut self) -> Result<i32, i32> {
+    pub fn get(&mut self) -> Result<i32, i32> {
         // 为防止中断请求打断该过程，需要先关中断
         cli();
         //0x0B

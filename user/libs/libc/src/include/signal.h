@@ -1,6 +1,10 @@
 #pragma once
 #include <unistd.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 #define SIGHUP 1
 #define SIGINT 2
 #define SIGQUIT 3
@@ -92,3 +96,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 int signal(int signum, __sighandler_t handler);
 int raise(int sig);
 int kill(pid_t, int sig);
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

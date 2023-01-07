@@ -1,6 +1,10 @@
 #pragma once
 #include <sys/types.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 // ===== 描述long double 的数据比特结构
 #if __LDBL_MANT_DIG__ == 53 && __LDBL_MAX_EXP__ == 1024
 #elif __LDBL_MANT_DIG__ == 64 && __LDBL_MAX_EXP__ == 16384 && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -73,3 +77,7 @@ union ldshape
             (void)__x;                        \
         }                                     \
     } while (0)
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

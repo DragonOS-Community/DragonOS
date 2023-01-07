@@ -2,6 +2,10 @@
 
 #include <sys/types.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 void *memset(void *dst, unsigned char C, uint64_t size);
 /**
  * @brief 获取字符串的大小
@@ -77,3 +81,7 @@ static void *memcpy(void *dst, const void *src, long Num)
                          : "memory");
     return dst;
 }
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

@@ -240,7 +240,7 @@ impl Softirq {
                 && !self.is_running(softirq_index)
             {
                 if self.modify_lock.try_lock() {
-                    if self.is_running(softirq_index){
+                    if self.is_running(softirq_index)||!self.table[softirq_index as usize].action.is_some(){
                         self.modify_lock.unlock();
                         continue;
                     }

@@ -1,5 +1,8 @@
 #pragma once
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
 
 #define PAD_ZERO 1 // 0填充
 #define LEFT 2     // 靠左对齐
@@ -11,3 +14,7 @@
 #define SIGN 128   // 显示符号位
 
 #define is_digit(c) ((c) >= '0' && (c) <= '9') // 用来判断是否是数字的宏
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

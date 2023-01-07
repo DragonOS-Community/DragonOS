@@ -37,7 +37,6 @@ use mm::allocator::KernelAllocator;
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
-    libs::lockref::LockRef,
 };
 
 // 声明全局的slab分配器
@@ -84,6 +83,5 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-
     return 0;
 }

@@ -12,7 +12,7 @@ use crate::{
     },
     include::bindings::bindings::{
         initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED,
-        PROC_RUNNING,
+        PROC_RUNNING,SCHED_FIFO,SCHED_RR,SCHED_NORMAL
     },
     kBUG,
     kdebug,
@@ -20,6 +20,7 @@ use crate::{
 };
 
 use super::core::Scheduler;
+use super::rt::{sched_RT_init,SchedulerRT,__get_rt_scheduler};
 
 /// 声明全局的cfs调度器实例
 
@@ -154,6 +155,7 @@ impl Scheduler for SchedulerCFS {
         // kdebug!("cfs:sched");
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
         let current_cpu_id = current_pcb().cpu_id as usize;
+        let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
         let proc: &'static mut process_control_block = current_cpu_queue.dequeue();
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -161,25 +163,38 @@ impl Scheduler for SchedulerCFS {
         if (current_pcb().state & (PROC_RUNNING as u64)) == 0
             || current_pcb().virtual_runtime >= proc.virtual_runtime
         {
+            // kdebug!("cfs:sched 2 state {} running {} pid {}",current_pcb().state,PROC_RUNNING,current_pcb().pid);
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             if current_pcb().state & (PROC_RUNNING as u64) != 0 {
-                // kdebug!("cfs:sched->enqueue");
-                current_cpu_queue.enqueue(current_pcb());
+                kdebug!("cfs:sched->enqueue");
+                // current_cpu_queue.enqueue(current_pcb());
+
+                if current_pcb().policy==SCHED_RR || current_pcb().policy==SCHED_FIFO{
+                    rt_scheduler.enqueue(current_pcb());
+                }
+                else{
+                    current_cpu_queue.enqueue(current_pcb());
+                }
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            // 设置进程可以执行的时间
+            // kdebug!("cfs:sched 21");
+        // 设置进程可以执行的时间
             if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
+                // kdebug!("cfs:sched 22");
                 SchedulerCFS::update_cpu_exec_proc_jiffies(proc.priority, current_cpu_queue);
             }
 
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            kdebug!("cfs:switch_process from {} to {}",current_pcb().pid,proc.pid);
 
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            
             switch_process(current_pcb(), proc);
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         } else {
+            kdebug!("cfs:sched not change");
             // 不进行切换
 
             // 设置进程可以执行的时间
@@ -189,7 +204,14 @@ impl Scheduler for SchedulerCFS {
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            current_cpu_queue.enqueue(proc);
+
+            // current_cpu_queue.enqueue(proc);
+            if current_pcb().policy==SCHED_RR || current_pcb().policy==SCHED_FIFO{
+                rt_scheduler.enqueue(proc);
+            }
+            else{
+                current_cpu_queue.enqueue(proc);
+            }
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);

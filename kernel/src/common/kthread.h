@@ -70,7 +70,7 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
         __kt=process_init_rt_pcb(__kt);                                                              \
         if (!IS_ERR(__kt)){                                                                                   \
             kdebug("kthread_run_rt: %d",process_wakeup(__kt));                                                                            \
-            kdebug("kthread_run_rt:--------2224--------"); }                                                                      \
+            kdebug("kthread_run_rt:--------2224--------%d",__kt->state); }                                                                      \
         __kt;                                                                                                \
     })
 

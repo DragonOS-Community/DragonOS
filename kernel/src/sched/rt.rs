@@ -22,6 +22,9 @@ use crate::{
 };
 
 use super::core::Scheduler;
+use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
+
+
 const RR_TIMESLICE: i64 = 100;
 /// 声明全局的rt调度器实例
 
@@ -122,7 +125,7 @@ impl SchedulerRT {
     /// @brief 挑选下一个可执行的rt进程
     pub fn pick_next_task_rt(&mut self) -> Option<&'static mut process_control_block> {
         // 循环查找，直到找到
-    
+        // 这里应该是优先级数量，而不是CPU数量，需要修改 
         for i in 0..MAX_CPU_NUM {
             let cpu_queue_i: &mut RTQueue = self.cpu_queue[i as usize];
             let proc: &'static mut process_control_block = cpu_queue_i.dequeue();
@@ -145,6 +148,7 @@ impl Scheduler for SchedulerRT {
     /// 请注意，进入该函数之前，需要关中断
     fn sched(&mut self) {
         kdebug!("RT:sched");
+        let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
         let mut need_change:bool=false;
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
 
@@ -171,8 +175,15 @@ impl Scheduler for SchedulerRT {
                 self.enqueue_task_rt(proc.priority as usize, proc);
             }
             else{
-                need_change = true;
-                kdebug!("switch_process to {}",proc.pid);
+                need_change = true;                    
+                kdebug!("sched_rt:current_pcb().pid {}", current_pcb().pid);
+                kdebug!("sched_rt:current_pcb().policy {}", current_pcb().policy);
+                kdebug!("switch_process to state {}",proc.state);
+                kdebug!("rt:switch_process from {} to {}",current_pcb().pid,proc.pid);
+                // 将当前的cfs进程加进队列
+                if current_pcb().policy==SCHED_NORMAL{
+                    cfs_scheduler.enqueue(current_pcb());
+                }
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 switch_process(current_pcb(), proc);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -193,9 +204,17 @@ impl Scheduler for SchedulerRT {
                 else
                 {
                     proc.time_slice-=1;
-                    // kinfo("sched_rt:else after rt proc.rt_se.time_slice %d", proc.rt_se.time_slice);
+                    
+                    kdebug!("sched_rt:current_pcb().pid {}", current_pcb().pid);
+                    kdebug!("sched_rt:current_pcb().policy {}", current_pcb().policy);
+                    kdebug!("sched_rt:else after rt proc.time_slice {}", proc.time_slice);
                     need_change = true;
-                    kdebug!("switch_process to {}",proc.pid);
+                    kdebug!("switch_process to state {}",proc.state);
+                    kdebug!("rt:switch_process from {} to {}",current_pcb().pid,proc.pid);
+                    // 将当前的cfs进程加进队列
+                    if current_pcb().policy==SCHED_NORMAL{
+                        cfs_scheduler.enqueue(current_pcb());
+                    }
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     switch_process(current_pcb(), proc);
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);

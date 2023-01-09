@@ -2,7 +2,7 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
-    include::bindings::bindings::{process_control_block, pt_regs, EPERM, SCHED_NORMAL,SCHED_FIFO,SCHED_RR},
+    include::bindings::bindings::{process_control_block, pt_regs, EPERM, SCHED_NORMAL,SCHED_FIFO,SCHED_RR,PROC_RUNNING,},
     process::process::process_cpu,
     kdebug,
 };
@@ -41,38 +41,33 @@ fn __sched() {
     // let next: &'static mut process_control_block =rt_scheduler.pick_next_task_rt().expect("No RT process found");
 
     let mut next: &'static mut process_control_block;
+    kdebug!("__sched:currpcb pid is {}",current_pcb().pid);
+    kdebug!("__sched:currpcb policy is {}",current_pcb().policy);
+    if current_pcb().policy==SCHED_RR{
+        kdebug!("__sched:currpcb time_slice is {}",current_pcb().time_slice);
+        kdebug!("__sched:currpcb state is {}",current_pcb().state);
+    }
     match rt_scheduler.pick_next_task_rt() {
         Some(p) => {
             next = p;
-            kdebug!("next :: policy{}",next.policy);
-            kdebug!("next :: priority{}",next.priority as usize);
+            kdebug!("next :: policy {}",next.policy);
+            kdebug!("next :: priority {}",next.priority as usize);
+            kdebug!("next :: state {}",next.state);
             rt_scheduler.enqueue_task_rt(next.priority as usize,next);
             kdebug!("sched:sched_rt is begin");
+
             rt_scheduler.sched();
         },
         None => {
             kdebug!("next is null");
-            if current_pcb().policy==SCHED_NORMAL{
+            if current_pcb().policy==SCHED_NORMAL||(current_pcb().state & (PROC_RUNNING as u64) != 0){
+            // if current_pcb().policy==SCHED_NORMAL||current_pcb().policy==SCHED_RR{
                 kdebug!("sched:sched_cfs is begin");
+
                 cfs_scheduler.sched();
             }
         },
     }
-    // let next = rt_scheduler.pick_next_task_rt();
-    // if(next!=NULL){
-    //     kinfo("pick next task rt p %p",next);
-    // }
-    // if (next == NULL && current_pcb->policy==SCHED_NORMAL)
-    // {
-    //     kinfo("sched:sched_cfs is begin");
-    //     sched_cfs();
-    // }
-    // else
-    // {
-    //     enqueue_task_rt(&rq_tmp, next, 0);
-    //     kinfo("sched:sched_rt is begin");
-    //     sched_rt();
-    // }
 }
 
 /// @brief 将进程加入调度队列
@@ -109,7 +104,8 @@ pub extern "C" fn sched_update_jiffies() {
             __get_cfs_scheduler().timer_update_jiffies();
         }
         SCHED_FIFO | SCHED_RR => {
-            kdebug!("sched_update_jiffies RR");
+            // kdebug!("sched_update_jiffies RR");
+            current_pcb().time_slice-=1;
         }
         _ => {
             kdebug!("todo pid {}",current_pcb().pid);

@@ -1,30 +1,18 @@
-use core::{
-    arch::{asm, x86_64::_mm_mfence},
-    ptr::{null_mut, read_volatile},
-    sync::atomic::compiler_fence,
-};
+use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    arch::{
-        asm::current::current_pcb,
-        context::switch_process,
-        mm::{barrier::mfence, switch_mm},
-    },
+    arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        initial_proc_union, process_control_block, pt_regs, PF_NEED_SCHED,
-        PROC_RUNNING, SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
+        initial_proc_union, process_control_block, PF_NEED_SCHED, SCHED_FIFO, SCHED_NORMAL,
+        SCHED_RR,
     },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
-    println,
 };
 
-use super::{
-    cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler},
-    core::Scheduler,
-};
+use super::core::{sched_enqueue, Scheduler};
 
 /// 声明全局的rt调度器实例
 
@@ -99,7 +87,7 @@ pub struct SchedulerRT {
 
 impl SchedulerRT {
     const RR_TIMESLICE: i64 = 100;
-    const MAX_RT_PRIO: i64 =100;
+    const MAX_RT_PRIO: i64 = 100;
 
     pub fn new() -> SchedulerRT {
         // 暂时手动指定核心数目
@@ -128,18 +116,12 @@ impl SchedulerRT {
         // return 一个空值
         None
     }
-
-    pub fn enqueue_task_rt(&mut self, cpu_id: usize, pcb: &'static mut process_control_block) {
-        let curr_cpu_queue: &mut RTQueue = self.cpu_queue[cpu_id];
-        curr_cpu_queue.enqueue(pcb);
-    }
 }
 
 impl Scheduler for SchedulerRT {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
     fn sched(&mut self) -> Option<&'static mut process_control_block> {
-        let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
 
         let proc: &'static mut process_control_block =
@@ -151,32 +133,29 @@ impl Scheduler for SchedulerRT {
         if proc.policy == SCHED_FIFO {
             // 如果挑选的进程优先级小于当前进程，则不进行切换
             if proc.priority <= current_pcb().priority {
-                self.enqueue_task_rt(proc.priority as usize, proc);
+                sched_enqueue(proc);
             } else {
-                // 将当前的cfs进程加进队列
-                if current_pcb().policy == SCHED_NORMAL {
-                    cfs_scheduler.enqueue(current_pcb());
-                }
+                // 将当前的进程加进队列
+                sched_enqueue(current_pcb());
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 return Some(proc);
             }
         }
         // RR调度策略需要考虑时间片
         else if proc.policy == SCHED_RR {
-            if proc.priority > current_pcb().priority {
+            // 同等优先级的，考虑切换
+            if proc.priority >= current_pcb().priority {
                 // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
                 if proc.time_slice <= 0 {
                     proc.time_slice = SchedulerRT::RR_TIMESLICE;
                     proc.flags |= !(PF_NEED_SCHED as u64);
-                    self.enqueue_task_rt(proc.priority as usize, proc);
+                    sched_enqueue(proc);
                 }
                 // 目标进程时间片未耗尽，切换到目标进程
                 else {
                     proc.time_slice -= 1;
-                    // 将当前的cfs进程加进队列
-                    if current_pcb().policy == SCHED_NORMAL {
-                        cfs_scheduler.enqueue(current_pcb());
-                    }
+                    // 将当前进程加进队列
+                    sched_enqueue(current_pcb());
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     return Some(proc);
                 }
@@ -184,7 +163,7 @@ impl Scheduler for SchedulerRT {
             // curr优先级更大，说明一定是实时进程，则减去消耗时间片
             else {
                 current_pcb().time_slice -= 1;
-                self.enqueue_task_rt(current_pcb().priority as usize, proc);
+                sched_enqueue(proc);
             }
         }
         return None;

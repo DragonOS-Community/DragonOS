@@ -64,13 +64,10 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
  */
 #define kthread_run_rt(thread_fn, data, name_fmt, ...)                                                          \
     ({                                                                                                       \
-        kdebug("kthread_run_rt:--------2220--------");                                                   \
         struct process_control_block *__kt = kthread_create(thread_fn, data, name_fmt, ##__VA_ARGS__); \
-        kdebug("kthread_run_rt:--------2222--------");                                                   \
         __kt=process_init_rt_pcb(__kt);                                                              \
         if (!IS_ERR(__kt)){                                                                                   \
-            kdebug("kthread_run_rt: %d",process_wakeup(__kt));                                                                            \
-            kdebug("kthread_run_rt:--------2224--------%d",__kt->state); }                                                                      \
+            process_wakeup(__kt);}                                                                            \
         __kt;                                                                                                \
     })
 

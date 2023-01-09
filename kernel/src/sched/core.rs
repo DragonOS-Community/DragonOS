@@ -6,6 +6,7 @@ use crate::{
     include::bindings::bindings::{
         process_control_block, pt_regs, EPERM, PROC_RUNNING, SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
+    kdebug,
     process::process::process_cpu,
 };
 
@@ -43,14 +44,15 @@ fn __sched() -> Option<&'static mut process_control_block> {
     match rt_scheduler.pick_next_task_rt() {
         Some(p) => {
             next = p;
-            rt_scheduler.enqueue_task_rt(next.priority as usize, next);
+            // kdebug!("next pcb is {}",next.pid);
+            // rt_scheduler.enqueue_task_rt(next.priority as usize, next);
+            sched_enqueue(next);
             return rt_scheduler.sched();
         }
         None => {
             return cfs_scheduler.sched();
         }
     }
-    return None;
 }
 
 /// @brief 将进程加入调度队列
@@ -65,10 +67,9 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block) {
     let rt_scheduler = __get_rt_scheduler();
     if pcb.policy == SCHED_NORMAL {
         cfs_scheduler.enqueue(pcb);
-    } else if pcb.policy == SCHED_FIFO ||pcb.policy == SCHED_RR{
+    } else if pcb.policy == SCHED_FIFO || pcb.policy == SCHED_RR {
         rt_scheduler.enqueue(pcb);
-    }
-    else{
+    } else {
         panic!("This policy is not supported at this time");
     }
 }

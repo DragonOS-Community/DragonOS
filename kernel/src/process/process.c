@@ -565,9 +565,9 @@ ul initial_kernel_thread(ul arg)
 
     // 测试实时进程
 
-    struct process_control_block *test_pcb2 = kthread_run_rt(&test, NULL, "Video refresh daemon");
-    // 这里创建完进程之后，打印不完整
-    kdebug("process:pcb2 is created!!!!");
+    // struct process_control_block *test_pcb2 = kthread_run_rt(&test, NULL, "Video refresh daemon");
+    // // 这里创建完进程之后，打印不完整
+    // kdebug("process:pcb2 is created!!!!");
     // struct process_control_block *test_pcb3 = kthread_run_rt(&test1, NULL, "Video refresh daemon");
     // kdebug("process:pcb3 is created!");
 

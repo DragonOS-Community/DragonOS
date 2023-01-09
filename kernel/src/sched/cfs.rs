@@ -3,17 +3,15 @@ use core::{ptr::null_mut, sync::atomic::compiler_fence};
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    arch::{asm::current::current_pcb, context::switch_process},
+    arch::asm::current::current_pcb,
     include::bindings::bindings::{
         initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, PROC_RUNNING,
-        SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
-    kBUG, kdebug,
+    kBUG,
     libs::spinlock::RawSpinlock,
 };
 
-use super::core::{Scheduler, sched_enqueue};
-use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
+use super::core::{sched_enqueue, Scheduler};
 
 /// 声明全局的cfs调度器实例
 

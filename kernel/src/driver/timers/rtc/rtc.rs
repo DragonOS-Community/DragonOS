@@ -34,7 +34,7 @@ enum CMOSTimeSelector {
 ///
 ///@param t time结构体
 ///@return int 成功则为0
-pub fn rtc_get_cmos_time(t: &mut rtc_time_t) -> Result<i32,i32> {
+pub fn rtc_get_cmos_time(t: &mut rtc_time_t) -> Result<i32, i32> {
     unsafe {
         // 为防止中断请求打断该过程，需要先关中断
         cli();

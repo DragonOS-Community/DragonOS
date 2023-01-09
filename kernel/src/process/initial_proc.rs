@@ -26,10 +26,9 @@ pub static mut INITIAL_SIGHAND: sighand_struct = sighand_struct {
 /// @brief 初始化pid=0的进程的信号相关的信息
 #[no_mangle]
 pub extern "C" fn initial_proc_init_signal(pcb: *mut process_control_block) {
-    
     // 所设置的pcb的pid一定为0
     assert_eq!(unsafe { (*pcb).pid }, 0);
-    
+
     // 设置init进程的sighand和signal
     unsafe {
         (*pcb).sighand = &mut INITIAL_SIGHAND as *mut sighand_struct as usize

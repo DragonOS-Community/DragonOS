@@ -59,7 +59,7 @@ pub fn spin_unlock_irq(lock: *mut spinlock_t) {
 
 /// 原始的Spinlock（自旋锁）
 /// 请注意，这个自旋锁和C的不兼容。
-/// 
+///
 /// @param self.0 这个AtomicBool的值为false时，表示没有被加锁。当它为true时，表示自旋锁已经被上锁。
 #[derive(Debug)]
 pub struct RawSpinlock(AtomicBool);
@@ -74,7 +74,7 @@ impl RawSpinlock {
     }
 
     /// @brief 关中断并加锁
-    pub fn lock_irq(&mut self){
+    pub fn lock_irq(&mut self) {
         cli();
         self.lock();
     }
@@ -90,7 +90,7 @@ impl RawSpinlock {
             .0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok();
-        
+
         // 如果加锁失败恢复自旋锁持有计数
         if res == false {
             preempt_enable();
@@ -99,34 +99,32 @@ impl RawSpinlock {
     }
 
     /// @brief 解锁
-    pub fn unlock(&mut self){
+    pub fn unlock(&mut self) {
         // 减少自旋锁持有计数
         preempt_enable();
         self.0.store(false, Ordering::Release);
     }
 
     /// @brief 放锁并开中断
-    pub fn unlock_irq(&mut self){
+    pub fn unlock_irq(&mut self) {
         self.unlock();
         sti();
     }
 
     /// @brief 判断自旋锁是否被上锁
-    /// 
+    ///
     /// @return true 自旋锁被上锁
     /// @return false 自旋锁处于解锁状态
-    pub fn is_locked(&self)->bool
-    {
+    pub fn is_locked(&self) -> bool {
         return self.0.load(Ordering::Relaxed).into();
     }
 
     /// @brief 强制设置自旋锁的状态
     /// 请注意，这样操作可能会带来未知的风险。因此它是unsafe的。（尽管从Rust语言本身来说，它是safe的）
-    pub unsafe fn set_value(&mut self, value:bool){
+    pub unsafe fn set_value(&mut self, value: bool) {
         self.0.store(value, Ordering::SeqCst);
     }
 
     // todo: spin_lock_irqsave
     // todo: spin_unlock_irqrestore
-
 }

@@ -3,13 +3,14 @@ use core::sync::atomic::compiler_fence;
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
     arch::context::switch_process,
-    include::bindings::bindings::{process_control_block, pt_regs, EPERM, SCHED_NORMAL,SCHED_FIFO,SCHED_RR,PROC_RUNNING,},
+    include::bindings::bindings::{
+        process_control_block, pt_regs, EPERM, PROC_RUNNING, SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
+    },
     process::process::process_cpu,
-    kdebug,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
-use super::rt::{sched_RT_init,SchedulerRT,__get_rt_scheduler};
+use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
 
 /// @brief 获取指定的cpu上正在执行的进程的pcb
 #[inline]
@@ -32,42 +33,22 @@ pub trait Scheduler {
     fn enqueue(&mut self, pcb: &'static mut process_control_block);
 }
 
-fn __sched() ->Option<&'static mut process_control_block>{
+fn __sched() -> Option<&'static mut process_control_block> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    // let next = rt_scheduler.pick_next_task_rt();
-    // let next: &'static mut process_control_block =rt_scheduler.pick_next_task_rt().expect("No RT process found");
-
-    let mut next: &'static mut process_control_block;
-    kdebug!("__sched:currpcb pid is {}",current_pcb().pid);
-    kdebug!("__sched:currpcb policy is {}",current_pcb().policy);
-    if current_pcb().policy==SCHED_RR{
-        kdebug!("__sched:currpcb time_slice is {}",current_pcb().time_slice);
-        kdebug!("__sched:currpcb state is {}",current_pcb().state);
-    }
+    let next: &'static mut process_control_block;
     match rt_scheduler.pick_next_task_rt() {
         Some(p) => {
             next = p;
-            kdebug!("next :: policy {}",next.policy);
-            kdebug!("next :: priority {}",next.priority as usize);
-            kdebug!("next :: state {}",next.state);
-            rt_scheduler.enqueue_task_rt(next.priority as usize,next);
-            kdebug!("sched:sched_rt is begin");
-
+            rt_scheduler.enqueue_task_rt(next.priority as usize, next);
             return rt_scheduler.sched();
-        },
+        }
         None => {
-            kdebug!("next is null");
-            if current_pcb().policy==SCHED_NORMAL||(current_pcb().state & (PROC_RUNNING as u64) != 0){
-            // if current_pcb().policy==SCHED_NORMAL||current_pcb().policy==SCHED_RR{
-                kdebug!("sched:sched_cfs is begin");
-
-                return cfs_scheduler.sched();
-            }
-        },
+            return cfs_scheduler.sched();
+        }
     }
     return None;
 }
@@ -76,13 +57,19 @@ fn __sched() ->Option<&'static mut process_control_block>{
 #[allow(dead_code)]
 #[no_mangle]
 pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block) {
+    // 调度器不处理running位为0的进程
+    if pcb.state & (PROC_RUNNING as u64) == 0 {
+        return;
+    }
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
-    if pcb.policy==SCHED_NORMAL{
+    if pcb.policy == SCHED_NORMAL {
         cfs_scheduler.enqueue(pcb);
+    } else if pcb.policy == SCHED_FIFO ||pcb.policy == SCHED_RR{
+        rt_scheduler.enqueue(pcb);
     }
     else{
-        rt_scheduler.enqueue(pcb);
+        panic!("This policy is not supported at this time");
     }
 }
 
@@ -92,7 +79,7 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block) {
 pub extern "C" fn sched_init() {
     unsafe {
         sched_cfs_init();
-        sched_RT_init();
+        sched_rt_init();
     }
 }
 
@@ -106,12 +93,9 @@ pub extern "C" fn sched_update_jiffies() {
             __get_cfs_scheduler().timer_update_jiffies();
         }
         SCHED_FIFO | SCHED_RR => {
-            // kdebug!("sched_update_jiffies RR");
-            current_pcb().time_slice-=1;
+            current_pcb().time_slice -= 1;
         }
         _ => {
-            kdebug!("todo pid {}",current_pcb().pid);
-            kdebug!("todo policy {}",current_pcb().policy);
             todo!()
         }
     }
@@ -126,8 +110,9 @@ pub extern "C" fn sys_sched(regs: &'static mut pt_regs) -> u64 {
     if user_mode(regs) {
         return (-(EPERM as i64)) as u64;
     }
-    let pcb=__sched();
-    if pcb.is_some(){
+    // 根据调度结果统一进行切换
+    let pcb = __sched();
+    if pcb.is_some() {
         switch_process(current_pcb(), pcb.unwrap());
     }
     0

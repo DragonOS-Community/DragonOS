@@ -146,7 +146,7 @@ impl SchedulerRT {
 impl Scheduler for SchedulerRT {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
-    fn sched(&mut self) {
+    fn sched(&mut self) -> Option<&'static mut process_control_block>{
         kdebug!("RT:sched");
         let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
         let mut need_change:bool=false;
@@ -185,7 +185,8 @@ impl Scheduler for SchedulerRT {
                     cfs_scheduler.enqueue(current_pcb());
                 }
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                switch_process(current_pcb(), proc);
+                return Some(proc);
+                // switch_process(current_pcb(), proc);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -216,7 +217,8 @@ impl Scheduler for SchedulerRT {
                         cfs_scheduler.enqueue(current_pcb());
                     }
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                    switch_process(current_pcb(), proc);
+                    return Some(proc);
+                    // switch_process(current_pcb(), proc);
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 }
             }
@@ -227,7 +229,8 @@ impl Scheduler for SchedulerRT {
                 self.enqueue_task_rt(current_pcb().priority as usize, proc);
             }
         }
-        kdebug!("rt_sched end!");
+        return None;
+        // kdebug!("rt_sched end!");
 }
 
     fn enqueue(&mut self, pcb: &'static mut process_control_block) {

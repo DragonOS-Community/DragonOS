@@ -2,6 +2,7 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
+    arch::context::switch_process,
     include::bindings::bindings::{process_control_block, pt_regs, EPERM, SCHED_NORMAL,SCHED_FIFO,SCHED_RR,PROC_RUNNING,},
     process::process::process_cpu,
     kdebug,
@@ -25,13 +26,13 @@ pub fn cpu_executing(cpu_id: u32) -> &'static mut process_control_block {
 /// @brief 具体的调度器应当实现的trait
 pub trait Scheduler {
     /// @brief 使用该调度器发起调度的时候，要调用的函数
-    fn sched(&mut self);
+    fn sched(&mut self) -> Option<&'static mut process_control_block>;
 
     /// @brief 将pcb加入这个调度器的调度队列
     fn enqueue(&mut self, pcb: &'static mut process_control_block);
 }
 
-fn __sched() {
+fn __sched() ->Option<&'static mut process_control_block>{
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
@@ -56,7 +57,7 @@ fn __sched() {
             rt_scheduler.enqueue_task_rt(next.priority as usize,next);
             kdebug!("sched:sched_rt is begin");
 
-            rt_scheduler.sched();
+            return rt_scheduler.sched();
         },
         None => {
             kdebug!("next is null");
@@ -64,10 +65,11 @@ fn __sched() {
             // if current_pcb().policy==SCHED_NORMAL||current_pcb().policy==SCHED_RR{
                 kdebug!("sched:sched_cfs is begin");
 
-                cfs_scheduler.sched();
+                return cfs_scheduler.sched();
             }
         },
     }
+    return None;
 }
 
 /// @brief 将进程加入调度队列
@@ -124,6 +126,9 @@ pub extern "C" fn sys_sched(regs: &'static mut pt_regs) -> u64 {
     if user_mode(regs) {
         return (-(EPERM as i64)) as u64;
     }
-    __sched();
+    let pcb=__sched();
+    if pcb.is_some(){
+        switch_process(current_pcb(), pcb.unwrap());
+    }
     0
 }

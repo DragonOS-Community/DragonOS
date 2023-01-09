@@ -151,7 +151,7 @@ impl SchedulerCFS {
 impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
-    fn sched(&mut self) {
+    fn sched(&mut self) -> Option<&'static mut process_control_block>{
         // kdebug!("cfs:sched");
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
         let current_cpu_id = current_pcb().cpu_id as usize;
@@ -167,13 +167,14 @@ impl Scheduler for SchedulerCFS {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             if current_pcb().state & (PROC_RUNNING as u64) != 0 {
-                kdebug!("cfs:sched->enqueue");
                 // current_cpu_queue.enqueue(current_pcb());
 
                 if current_pcb().policy==SCHED_RR || current_pcb().policy==SCHED_FIFO{
+                    kdebug!("cfs:rt_sched->enqueue");
                     rt_scheduler.enqueue(current_pcb());
                 }
                 else{
+                    kdebug!("cfs:cfs_sched->enqueue");
                     current_cpu_queue.enqueue(current_pcb());
                 }
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -187,11 +188,11 @@ impl Scheduler for SchedulerCFS {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(proc.priority, current_cpu_queue);
             }
 
-            kdebug!("cfs:switch_process from {} to {}",current_pcb().pid,proc.pid);
+            kdebug!("cfs:switch_process from {} to {}",current_pcb().pid, proc.pid);
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            
-            switch_process(current_pcb(), proc);
+            return Some(proc);
+            // switch_process(current_pcb(), proc);
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         } else {
             kdebug!("cfs:sched not change");
@@ -207,14 +208,17 @@ impl Scheduler for SchedulerCFS {
 
             // current_cpu_queue.enqueue(proc);
             if current_pcb().policy==SCHED_RR || current_pcb().policy==SCHED_FIFO{
+                kdebug!("cfs:rt_sched->enqueue");
                 rt_scheduler.enqueue(proc);
             }
             else{
+                kdebug!("cfs:cfs_sched->enqueue");
                 current_cpu_queue.enqueue(proc);
             }
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        return None;
     }
 
     fn enqueue(&mut self, pcb: &'static mut process_control_block) {

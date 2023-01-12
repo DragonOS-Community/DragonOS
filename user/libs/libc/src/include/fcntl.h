@@ -10,6 +10,10 @@
  */
 #pragma once
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 #define O_RDONLY 00000000 // Open Read-only
 #define O_WRONLY 00000001 // Open Write-only
 #define O_RDWR 00000002   // Open read/write
@@ -63,3 +67,7 @@
  * @return int 文件描述符
  */
 int open(const char * path, int options, ...);
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

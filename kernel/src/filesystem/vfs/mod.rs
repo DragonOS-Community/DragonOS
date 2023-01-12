@@ -18,6 +18,7 @@ pub enum FileType {
     Dir,
     BlockDevice,
     CharDevice,
+    Pipe
 }
 
 /// @brief inode的状态（由poll方法返回）
@@ -157,34 +158,35 @@ pub trait IndexNode: Any + Sync + Send {
         return Err(-(ENOTSUP as i32));
     }
 
-    /// @brief 根据inode号，获取目录项的名字
+    /// @brief 根据inode号，获取子目录项的名字
     ///
-    /// @param id inode号
+    /// @param ino inode号
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn get_entry_name(&self, _id: usize) -> Result<String, i32> {
+    fn get_entry_name(&self, _ino: usize) -> Result<String, i32> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(-(ENOTSUP as i32));
     }
 
     /// @brief 根据inode号，获取目录项的名字
     ///
-    /// @param id inode号
+    /// @param ino inode号
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn get_entry_name_and_metadata(&self, id: usize) -> Result<(String, Metadata), i32> {
+    fn get_entry_name_and_metadata(&self, ino: usize) -> Result<(String, Metadata), i32> {
         // 如果有条件，请在文件系统中使用高效的方式实现本接口，而不是依赖这个低效率的默认实现。
-        let name = self.get_entry_name(id)?;
+        let name = self.get_entry_name(ino)?;
         let entry = self.find(&name)?;
         return Ok((name, entry.metadata()?));
     }
 
     /// @brief io control接口
     ///
-    /// @param id inode号
-    ///
+    /// @param cmd 命令
+    /// @param data 数据
+    /// 
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, i32> {
@@ -217,7 +219,7 @@ pub struct Metadata {
     /// Inode的大小
     /// 文件：文件大小（单位：字节）
     /// 目录：目录项中的文件、文件夹数量
-    pub size: usize,
+    pub size: i64,
 
     /// Inode所在的文件系统中，每个块的大小
     pub blk_size: usize,

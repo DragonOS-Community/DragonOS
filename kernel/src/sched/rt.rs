@@ -64,20 +64,21 @@ impl RTQueue {
         self.lock.unlock();
     }
 
-    /// @brief 将pcb从调度队列中弹出,若队列为空，则返回IDLE进程的pcb
-    pub fn dequeue(&mut self) -> &'static mut process_control_block {
-        let res: &'static mut process_control_block;
+    /// @brief 将pcb从调度队列中弹出,若队列为空，则返回None
+    pub fn dequeue(&mut self) -> Option<&'static mut process_control_block> {
+        let res: Option<&'static mut process_control_block>;
         self.lock.lock();
         if self.queue.len() > 0 {
             // 队列不为空，返回下一个要执行的pcb
-            res = self.queue.pop().unwrap();
+            res = Some(self.queue.pop().unwrap());
         } else {
-            // 如果队列为空，则返回IDLE进程的pcb
-            res = unsafe { &mut initial_proc_union.pcb };
+            // 如果队列为空，则返回None
+            res=None;
         }
         self.lock.unlock();
         return res;
     }
+
 }
 
 /// @brief RT调度器类
@@ -108,9 +109,9 @@ impl SchedulerRT {
         // 这里应该是优先级数量，而不是CPU数量，需要修改
         for i in 0..SchedulerRT::MAX_RT_PRIO {
             let cpu_queue_i: &mut RTQueue = self.cpu_queue[i as usize];
-            let proc: &'static mut process_control_block = cpu_queue_i.dequeue();
-            if proc.policy != SCHED_NORMAL {
-                return Some(proc);
+            let proc: Option<&'static mut process_control_block> = cpu_queue_i.dequeue();
+            if proc.is_some(){
+                return proc;
             }
         }
         // return 一个空值
@@ -123,11 +124,9 @@ impl Scheduler for SchedulerRT {
     /// 请注意，进入该函数之前，需要关中断
     fn sched(&mut self) -> Option<&'static mut process_control_block> {
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
-
+        // 正常流程下，这里一定是会pick到next的pcb的，如果是None的话，要抛出错误
         let proc: &'static mut process_control_block =
             self.pick_next_task_rt().expect("No RT process found");
-
-        // 若队列中无下一个进程，则返回
 
         // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
         if proc.policy == SCHED_FIFO {
@@ -146,23 +145,21 @@ impl Scheduler for SchedulerRT {
             // 同等优先级的，考虑切换
             if proc.priority >= current_pcb().priority {
                 // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
-                if proc.time_slice <= 0 {
-                    proc.time_slice = SchedulerRT::RR_TIMESLICE;
+                if proc.rt_time_slice <= 0 {
+                    proc.rt_time_slice = SchedulerRT::RR_TIMESLICE;
                     proc.flags |= !(PF_NEED_SCHED as u64);
                     sched_enqueue(proc);
                 }
                 // 目标进程时间片未耗尽，切换到目标进程
                 else {
-                    proc.time_slice -= 1;
                     // 将当前进程加进队列
                     sched_enqueue(current_pcb());
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     return Some(proc);
                 }
             }
-            // curr优先级更大，说明一定是实时进程，则减去消耗时间片
+            // curr优先级更大，说明一定是实时进程，将所选进程入队列
             else {
-                current_pcb().time_slice -= 1;
                 sched_enqueue(proc);
             }
         }

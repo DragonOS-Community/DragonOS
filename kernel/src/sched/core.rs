@@ -94,7 +94,7 @@ pub extern "C" fn sched_update_jiffies() {
             __get_cfs_scheduler().timer_update_jiffies();
         }
         SCHED_FIFO | SCHED_RR => {
-            current_pcb().time_slice -= 1;
+            current_pcb().rt_time_slice -= 1;
         }
         _ => {
             todo!()

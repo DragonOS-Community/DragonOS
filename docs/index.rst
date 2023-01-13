@@ -12,6 +12,7 @@
 
    introduction/index
    introduction/build_system
+   introduction/mirrors
 
 .. toctree::
    :maxdepth: 1

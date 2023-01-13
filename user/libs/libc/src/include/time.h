@@ -2,6 +2,10 @@
 
 #include <stddef.h>
 
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
+
 // 操作系统定义时间以ns为单位
 #define CLOCKS_PER_SEC 1000000
 
@@ -43,3 +47,7 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
  * @return clock_t 
  */
 clock_t clock();
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

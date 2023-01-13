@@ -482,7 +482,8 @@ ul initial_kernel_thread(ul arg)
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
 
     scm_enable_double_buffer();
-
+    //TODO 测试io调度器
+    io_schduler_init();
     ahci_init();
     fat32_init();
     rootfs_umount();

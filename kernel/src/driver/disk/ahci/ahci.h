@@ -352,6 +352,7 @@ struct ahci_device_t
 #define HBA_PORT_IPM_ACTIVE 1
 #define HBA_PORT_DET_PRESENT 3
 
+extern void ahci_push_request(struct ahci_request_packet_t *packet);
 struct ahci_request_packet_t
 {
     struct block_device_request_packet blk_pak; // 块设备请求包
@@ -395,30 +396,29 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
  * @return success 0
  */
 static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
-                       uint64_t buf);
+                      uint64_t buf);
 
 void ahci_end_request();
 
 /**
  * @brief 检查请求包是否已完成
- * 
+ *
  * @param port_num HBA PORT 编号
  * @param ahci_ctrl_num ahci控制号
  * @param err 错误信息
-*/
-int ahci_check_complete(uint8_t port_num,uint8_t ahci_ctrl_num, char *err);
+ */
+int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, char *err);
 
-//FIXME ahci_ctrl_num注释
+// FIXME ahci_ctrl_num注释
 /**
  * @brief 根据端口号获取端口结构体
  * @param port_num 端口号
- * @param ahci_ctrl_num 控制号  
-*/
-HBA_PORT* ahci_get_port(uint8_t port_num,uint8_t ahci_ctrl_num );
-
+ * @param ahci_ctrl_num 控制号
+ */
+HBA_PORT *ahci_get_port(uint8_t port_num, uint8_t ahci_ctrl_num);
 
 /**
  * @brief Find a free command list slot
- * @param port 
-*/
- int ahci_find_cmdslot(HBA_PORT *port);
+ * @param port
+ */
+int ahci_find_cmdslot(HBA_PORT *port);

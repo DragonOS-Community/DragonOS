@@ -326,3 +326,12 @@ void __test_completion()
     kfree(worker_data);
     // kdebug("completion test done.");
 }
+
+/**
+ * @brief rust 获取completion
+*/
+struct completion* get_completion()
+{
+    struct completion* cmpl ;
+    return cmpl;
+}

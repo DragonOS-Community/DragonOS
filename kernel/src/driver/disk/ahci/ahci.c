@@ -404,29 +404,6 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
 
     current_pcb->flags |= PF_NEED_SCHED;
 
-    // int retval = AHCI_SUCCESS;
-    // Wait for completion
-    // while (1)
-    // {
-    //     // In some longer duration reads, it may be helpful to spin on the DPS bit
-    //     // in the PxIS port field as well (1 << 5)
-    //     if ((port->ci & (1 << slot)) == 0)
-    //         break;
-    //     if (port->is & HBA_PxIS_TFES) // Task file error
-    //     {
-    //         kerror("Read disk error");
-    //         retval = E_TASK_FILE_ERROR;
-    //         break;
-    //     }
-    // }
-    // retval = ahci_check_complete(port, slot, "Read disk error");
-    // // Check again
-    // if (port->is & HBA_PxIS_TFES)
-    // {
-    //     kerror("Read disk error");
-    //     retval = E_TASK_FILE_ERROR;
-    // }
-    // enter_syscall_int(SYS_AHCI_END_REQ, 0, 0, 0, 0, 0, 0, 0, 0);
     return 0;
 }
 
@@ -502,32 +479,7 @@ static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
     port->ci = 1; // Issue command
 
     current_pcb->flags |= PF_NEED_SCHED;
-    // int retval = AHCI_SUCCESS;
 
-    // while (1)
-    // {
-    //     // In some longer duration reads, it may be helpful to spin on the DPS bit
-    //     // in the PxIS port field as well (1 << 5)
-    //     if ((port->ci & (1 << slot)) == 0)
-    //         break;
-    //     if (port->is & HBA_PxIS_TFES)
-    //     { // Task file error
-    //         kerror("Write disk error");
-    //         retval = E_TASK_FILE_ERROR;
-    //         break;
-    //     }
-    // }
-
-    // retval = ahci_check_complete(port, slot, "Write disk error");
-
-    // if (port->is & HBA_PxIS_TFES)
-    // {
-    //     kerror("Write disk error");
-    //     retval = E_TASK_FILE_ERROR;
-    // }
-
-    // kdebug("ahci write retval=%d", retval);
-    // enter_syscall_int(SYS_AHCI_END_REQ, 0, 0, 0, 0, 0, 0, 0, 0);
     return 0;
 }
 
@@ -679,7 +631,8 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
     if (cmd == AHCI_CMD_READ_DMA_EXT || cmd == AHCI_CMD_WRITE_DMA_EXT)
     {
         pack = ahci_make_request(cmd, base_addr, count, buf, pdata->ahci_ctrl_num, pdata->ahci_port_num);
-        ahci_submit(pack);
+        ahci_push_request(pack);
+        // ahci_submit(pack);
     }
     else
         return E_UNSUPPORTED_CMD;

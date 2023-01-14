@@ -1,5 +1,5 @@
 use crate::include::bindings::bindings::{io_in8, io_out8};
-use core::{str, char, intrinsics::offset};
+use core::{char, intrinsics::offset, str};
 
 const UART_SUCCESS: i32 = 0;
 const E_UART_BITS_RATE_ERROR: i32 = 1;
@@ -63,7 +63,7 @@ impl UartPort {
 struct UartRegister {
     reg_data: u8,
     reg_interrupt_enable: u8,
-    reg_ii_fifo: u8,    // 	Interrupt Identification and FIFO control registers
+    reg_ii_fifo: u8, // 	Interrupt Identification and FIFO control registers
     reg_line_config: u8,
     reg_modem_config: u8,
     reg_line_status: u8,
@@ -79,7 +79,10 @@ pub struct UartDriver {
 
 impl Default for UartDriver {
     fn default() -> Self {
-        Self {port: UartPort::COM1, baud_rate: 115200}
+        Self {
+            port: UartPort::COM1,
+            baud_rate: 115200,
+        }
     }
 }
 
@@ -96,26 +99,26 @@ impl UartDriver {
         if baud_rate > UART_MAX_BITS_RATE || UART_MAX_BITS_RATE % baud_rate != 0 {
             return Err("uart init error.");
         }
-    
+
         unsafe {
             io_out8(port + 1, 0x00); // Disable all interrupts
             io_out8(port + 3, 0x80); // Enable DLAB (set baud rate divisor)
-        
+
             let divisor = UART_MAX_BITS_RATE / baud_rate;
-            
-            io_out8(port + 0, (divisor & 0xff) as u8);        // Set divisor  (lo byte)
+
+            io_out8(port + 0, (divisor & 0xff) as u8); // Set divisor  (lo byte)
             io_out8(port + 1, ((divisor >> 8) & 0xff) as u8); //                  (hi byte)
-            io_out8(port + 3, 0x03);                  // 8 bits, no parity, one stop bit
-            io_out8(port + 2, 0xC7);                  // Enable FIFO, clear them, with 14-byte threshold
+            io_out8(port + 3, 0x03); // 8 bits, no parity, one stop bit
+            io_out8(port + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
             io_out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
             io_out8(port + 4, 0x1E); // Set in loopback mode, test the serial chip
             io_out8(port + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
-        
+
             // Check if serial is faulty (i.e: not same byte as sent)
             if io_in8(port + 0) != 0xAE {
                 return Err("uart faulty");
             }
-        
+
             // If serial is not faulty set it in normal operation mode
             // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
             io_out8(port + 4, 0x08);
@@ -133,15 +136,15 @@ impl UartDriver {
     }
 
     fn serial_received(offset: u16) -> bool {
-        if unsafe{ io_in8(offset + 5) } & 1 != 0 {
+        if unsafe { io_in8(offset + 5) } & 1 != 0 {
             true
         } else {
             false
         }
     }
-    
+
     fn is_transmit_empty(offset: u16) -> bool {
-        if unsafe{ io_in8(offset + 5) } & 0x20 != 0 {
+        if unsafe { io_in8(offset + 5) } & 0x20 != 0 {
             true
         } else {
             false
@@ -157,11 +160,13 @@ impl UartDriver {
         let port = uart_port.to_u16();
         while UartDriver::is_transmit_empty(port) == false {
             for c in str.bytes() {
-                unsafe { io_out8(port, c); }
+                unsafe {
+                    io_out8(port, c);
+                }
             }
         } //TODO:pause
     }
-    
+
     /// @brief 串口接收一个字节
     /// @param uart_port 端口号
     /// @return 接收的字节
@@ -171,7 +176,6 @@ impl UartDriver {
         while UartDriver::serial_received(port) == false {} //TODO:pause
         unsafe { io_in8(port) as char }
     }
-
 }
 
 ///@brief 发送数据
@@ -180,7 +184,9 @@ impl UartDriver {
 #[no_mangle]
 pub extern "C" fn c_uart_send(port: u16, c: u8) {
     while UartDriver::is_transmit_empty(port) == false {} //TODO:pause
-    unsafe { io_out8(port, c); }
+    unsafe {
+        io_out8(port, c);
+    }
 }
 
 ///@brief 从uart接收数据
@@ -196,8 +202,7 @@ pub extern "C" fn c_uart_read(port: u16) -> u8 {
 ///@param port 串口端口
 ///@param str 字符串S
 #[no_mangle]
-pub extern "C" fn c_uart_send_str(port: u16, str: *const u8)
-{
+pub extern "C" fn c_uart_send_str(port: u16, str: *const u8) {
     unsafe {
         let mut i = 0;
         while *offset(str, i) != '\0' as u8 {
@@ -222,22 +227,22 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
     unsafe {
         io_out8(port + 1, 0x00); // Disable all interrupts
         io_out8(port + 3, 0x80); // Enable DLAB (set baud rate divisor)
-    
+
         let divisor = UART_MAX_BITS_RATE / baud_rate;
-        
-        io_out8(port + 0, (divisor & 0xff) as u8);        // Set divisor  (lo byte)
+
+        io_out8(port + 0, (divisor & 0xff) as u8); // Set divisor  (lo byte)
         io_out8(port + 1, ((divisor >> 8) & 0xff) as u8); //                  (hi byte)
-        io_out8(port + 3, 0x03);                  // 8 bits, no parity, one stop bit
-        io_out8(port + 2, 0xC7);                  // Enable FIFO, clear them, with 14-byte threshold
+        io_out8(port + 3, 0x03); // 8 bits, no parity, one stop bit
+        io_out8(port + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
         io_out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
         io_out8(port + 4, 0x1E); // Set in loopback mode, test the serial chip
         io_out8(port + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
-    
+
         // Check if serial is faulty (i.e: not same byte as sent)
         if io_in8(port + 0) != 0xAE {
             return -E_UART_SERIAL_FAULT;
         }
-    
+
         // If serial is not faulty set it in normal operation mode
         // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
         io_out8(port + 4, 0x08);

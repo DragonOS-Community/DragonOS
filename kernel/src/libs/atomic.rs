@@ -13,8 +13,8 @@ pub fn atomic_read(ato: *const atomic_t) -> i64 {
 
 /// @brief 原子的设置原子变量的值
 #[inline]
-pub fn atomic_set(ato: *mut atomic_t, value:i64) {
-    unsafe{
+pub fn atomic_set(ato: *mut atomic_t, value: i64) {
+    unsafe {
         write_volatile(&mut (*ato).value, value);
     }
 }

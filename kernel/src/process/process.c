@@ -52,13 +52,13 @@ extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
 
 // 设置初始进程的PCB
-#define INITIAL_PROC(proc)                                                                                           \
-    {                                                                                                                \
-        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
-        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
-        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
-        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                     \
+#define INITIAL_PROC(proc)                                                                                             \
+    {                                                                                                                  \
+        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
+        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,   \
+        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                   \
+        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                       \
     }
 
 struct thread_struct initial_thread = {
@@ -115,10 +115,8 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
-                         : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
-                         : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -411,7 +409,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 
     // 关闭之前的文件描述符
     process_exit_files(current_pcb);
-    
+
     process_open_stdio(current_pcb);
 
     // 清除进程的vfork标志位
@@ -471,45 +469,6 @@ exec_failed:;
 }
 #pragma GCC pop_options
 
-/// @brief 测试实时进程
-/// @param a
-/// @return
-int test(void *a)
-{
-    kinfo("this is test_-------------------");
-    kinfo("this is test_-------------------");
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test_-------------------");
-    kinfo("this is test_-------------------");
-    usleep(990000);
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test_-------------------");
-    usleep(990000);
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test_-------------------");
-    return 0;
-}
-int test1(void *a)
-{
-    kinfo("this is test1_-------------------");
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test1_-------------------");
-    kinfo("this is test1_-------------------");
-    usleep(990000);
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test1_-------------------");
-    usleep(990000);
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test1_-------------------");
-    return;
-}
-
 /**
  * @brief 初始化实时进程rt_pcb
  *
@@ -567,10 +526,9 @@ ul initial_kernel_thread(ul arg)
 
     // 测试实时进程
 
-    // struct process_control_block *test_pcb2 = kthread_run_rt(&test, NULL, "Video refresh daemon");
-    // kdebug("process:pcb2 is created!!!!");
-    // struct process_control_block *test_pcb3 = kthread_run_rt(&test1, NULL, "Video refresh daemon");
-    // kdebug("process:pcb3 is created!");
+    // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
+    // kdebug("process:rt test kthread is created!!!!");
+
 
     // 准备切换到用户态
     struct pt_regs *regs;

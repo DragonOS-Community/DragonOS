@@ -330,8 +330,9 @@ void __test_completion()
 /**
  * @brief rust 获取completion
 */
-struct completion* get_completion()
+struct completion get_completion()
 {
-    struct completion* cmpl ;
+    struct completion cmpl;
+    DECLARE_COMPLETION_ON_STACK(cmpl);
     return cmpl;
 }

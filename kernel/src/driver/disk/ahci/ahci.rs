@@ -2,13 +2,12 @@ use core::{default, ffi::c_void, ptr::null_mut};
 
 use alloc::{
     boxed::Box,
-    string::{String, ToString},
     vec::Vec,
 };
 
 use crate::{
     include::bindings::bindings::{
-        ahci_check_complete, ahci_find_cmdslot, ahci_get_port, ahci_request_packet_t, complete,
+        ahci_check_complete, ahci_request_packet_t, complete,
         completion, completion_init, get_completion,
     },
     kBUG,
@@ -58,9 +57,7 @@ impl<AhciRequestPacket> BlockDeviceRequestPacket<AhciRequestPacket> {
         ahci_request_packet: AhciRequestPacket,
     ) -> BlockDeviceRequestPacket<AhciRequestPacket> {
 
-        let cmpl: *mut completion =unsafe {
-            get_completion().as_mut().unwrap()
-        }; 
+        let cmpl: *mut completion =unsafe {&mut get_completion()}; 
         unsafe {
             completion_init(cmpl);
         }
@@ -210,7 +207,7 @@ pub extern "C" fn address_requests() {
 /// @brief 将c中的ahci_request_packet_t转换成rust中的BlockDeviceRequestPacket<AhciRequestPacket>
 pub fn crate_ahci_request(ahci_request_packet:&ahci_request_packet_t)->BlockDeviceRequestPacket<AhciRequestPacket>{
         let cmpl: *mut completion =unsafe {
-        get_completion().as_mut().unwrap()
+        &mut get_completion()
     }; 
     unsafe {
         completion_init(cmpl);

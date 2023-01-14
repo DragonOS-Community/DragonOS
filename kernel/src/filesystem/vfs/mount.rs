@@ -1,13 +1,14 @@
-use core::ops::DerefMut;
-
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
 
-use crate::{libs::spinlock::RawSpinlock, include::bindings::bindings::ENOTDIR};
+use crate::{
+    include::bindings::bindings::{EBUSY, ENOTDIR},
+    libs::spinlock::SpinLock,
+};
 
-use super::{FileSystem, IndexNode, InodeId, FileType};
+use super::{FileSystem, FileType, IndexNode, InodeId};
 
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
@@ -15,11 +16,9 @@ use super::{FileSystem, IndexNode, InodeId, FileType};
 pub struct MountFS {
     // MountFS内部的文件系统
     inner_filesystem: Arc<dyn FileSystem>,
-    /// mountpoints B树的锁
-    mountpoints_lock: RawSpinlock,
     /// 用来存储InodeID->挂载点的MountFS的B树
-    mountpoints: BTreeMap<InodeId, Arc<MountFS>>,
-    /// 当前挂载点的Inode
+    mountpoints: SpinLock<BTreeMap<InodeId, Arc<MountFS>>>,
+    /// 当前文件系统挂载到的那个挂载点的Inode
     self_mountpoint: Option<Arc<MountFSInode>>,
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
@@ -37,11 +36,13 @@ pub struct MountFSInode {
 }
 
 impl MountFS {
-    pub fn new(inner_fs: Arc<dyn FileSystem>, self_mountpoint: Option<Arc<MountFSInode>>) -> Arc<Self> {
+    pub fn new(
+        inner_fs: Arc<dyn FileSystem>,
+        self_mountpoint: Option<Arc<MountFSInode>>,
+    ) -> Arc<Self> {
         return MountFS {
             inner_filesystem: inner_fs,
-            mountpoints_lock: RawSpinlock::INIT,
-            mountpoints: BTreeMap::new(),
+            mountpoints: SpinLock::new(BTreeMap::new()),
             self_mountpoint: self_mountpoint,
             self_ref: Weak::default(),
         }
@@ -77,7 +78,6 @@ impl MountFS {
     }
 }
 
-
 impl MountFSInode {
     /// @brief 用Arc指针包裹MountFSInode对象。
     /// 本函数的主要功能为，初始化MountFSInode对象中的自引用Weak指针
@@ -98,18 +98,186 @@ impl MountFSInode {
     }
 
     /// @brief 在当前inode下，挂载一个文件系统
-    /// 
+    ///
     /// @return Ok(Arc<MountFS>) 挂载成功，返回指向
-    pub fn mount(&mut self, fs: Arc<dyn FileSystem>)->Result<Arc<MountFS>, i32>{
+    pub fn mount(&mut self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
         let metadata = self.inner_inode.metadata()?;
-        if metadata.file_type != FileType::Dir{
+        if metadata.file_type != FileType::Dir {
             return Err(-(ENOTDIR as i32));
         }
 
-        let new_mount_fs = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
-
-        self.mount_fs.mountpoints_lock.lock();
-        self.mount_fs.mountpoints_lock.unlock();
+        // 为新的挂载点创建挂载文件系统
+        let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
+        // 将新的挂载点-挂载文件系统添加到父级的挂载树
+        self.mount_fs
+            .mountpoints
+            .lock()
+            .insert(metadata.inode_id, new_mount_fs.clone());
         return Ok(new_mount_fs);
+    }
+
+    /// @brief 判断当前inode是否为它所在的文件系统的root inode
+    fn is_mountpoint_root(&self) -> Result<bool, i32> {
+        return Ok(self.inner_inode.fs().get_root_inode().metadata()?.inode_id
+            == self.inner_inode.metadata()?.inode_id);
+    }
+
+    /// @brief 在挂载树上进行inode替换。
+    /// 如果当前inode是父MountFS内的一个挂载点，那么，本函数将会返回挂载到这个挂载点下的文件系统的root inode.
+    /// 如果当前inode在父MountFS内，但不是挂载点，那么说明在这里不需要进行inode替换，因此直接返回当前inode。
+    ///
+    /// @return Arc<MountFSInode>
+    fn overlaid_inode(&self) -> Arc<MountFSInode> {
+        let inode_id = self.metadata().unwrap().inode_id;
+
+        if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
+            return sub_mountfs.mountpoint_root_inode();
+        } else {
+            return self.self_ref.upgrade().unwrap();
+        }
+    }
+}
+
+impl IndexNode for MountFSInode {
+    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+        return self.inner_inode.read_at(offset, len, buf);
+    }
+
+    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+        return self.inner_inode.write_at(offset, len, buf);
+    }
+
+    fn poll(&self) -> super::PollStatus {
+        return self.inner_inode.poll();
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        return self.mount_fs.clone();
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        return self.inner_inode.as_any_ref();
+    }
+
+    fn metadata(&self) -> Result<super::Metadata, i32> {
+        return self.inner_inode.metadata();
+    }
+
+    fn set_metadata(&self, metadata: &super::Metadata) -> Result<(), i32> {
+        return self.inner_inode.set_metadata(metadata);
+    }
+
+    fn resize(&self, len: usize) -> Result<(), i32> {
+        return self.inner_inode.resize(len);
+    }
+
+    fn create(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: u32,
+    ) -> Result<Arc<dyn IndexNode>, i32> {
+        return Ok(MountFSInode {
+            inner_inode: self.inner_inode.create(name, file_type, mode)?,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: Weak::default(),
+        }
+        .wrap());
+    }
+
+    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), i32> {
+        return self.inner_inode.link(name, other);
+    }
+
+    /// @brief 在挂载文件系统中删除文件/文件夹
+    fn unlink(&self, name: &str) -> Result<(), i32> {
+        let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
+
+        // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
+        if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
+            return Err(-(EBUSY as i32));
+        }
+        // 调用内层的inode的方法来删除这个inode
+        return self.inner_inode.unlink(name);
+    }
+
+    fn move_(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+    ) -> Result<(), i32> {
+        return self.inner_inode.move_(old_name, target, new_name);
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+        match name {
+            // 查找的是当前目录
+            "" | "." => return Ok(self.self_ref.upgrade().unwrap()),
+            // 往父级查找
+            ".." => {
+                if self.is_mountpoint_root()? {
+                    // 当前inode是它所在的文件系统的root inode
+                    match &self.mount_fs.self_mountpoint {
+                        Some(inode) => {
+                            return inode.find(name);
+                        }
+                        None => {
+                            return Ok(self.self_ref.upgrade().unwrap());
+                        }
+                    }
+                } else {
+                    // 向上查找时，不会跨过文件系统的边界，因此直接调用当前inode所在的文件系统的find方法进行查找
+                    return Ok(MountFSInode {
+                        inner_inode: self.inner_inode.find(name)?,
+                        mount_fs: self.mount_fs.clone(),
+                        self_ref: Weak::default(),
+                    }
+                    .wrap());
+                }
+            }
+            // 在当前目录下查找
+            _ => {
+                // 直接调用当前inode所在的文件系统的find方法进行查找
+                // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
+                return Ok(MountFSInode {
+                    inner_inode: self.inner_inode.find(name)?,
+                    mount_fs: self.mount_fs.clone(),
+                    self_ref: Weak::default(),
+                }
+                .wrap()
+                .overlaid_inode());
+            }
+        }
+    }
+
+    fn get_entry_name(&self, ino: InodeId) -> Result<alloc::string::String, i32> {
+        return self.inner_inode.get_entry_name(ino);
+    }
+
+    fn get_entry_name_and_metadata(
+        &self,
+        ino: InodeId,
+    ) -> Result<(alloc::string::String, super::Metadata), i32> {
+        return self.inner_inode.get_entry_name_and_metadata(ino);
+    }
+
+    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, i32> {
+        return self.inner_inode.ioctl(cmd, data);
+    }
+
+}
+
+impl FileSystem for MountFS {
+    fn get_root_inode(&self) -> Arc<dyn IndexNode> {
+        match &self.self_mountpoint {
+            Some(inode) => return inode.mount_fs.get_root_inode(),
+            // 当前文件系统是rootfs
+            None => self.mountpoint_root_inode(),
+        }
+    }
+
+    fn info(&self) -> super::FsInfo {
+        return self.inner_filesystem.info();
     }
 }

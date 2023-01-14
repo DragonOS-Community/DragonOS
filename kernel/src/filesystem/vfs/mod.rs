@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 pub mod file;
+pub mod mount;
 
-use core::any::Any;
+use core::{any::Any, fmt::Debug};
 
 use alloc::{string::String, sync::Arc};
 
@@ -11,6 +12,9 @@ use crate::{include::bindings::bindings::ENOTSUP, time::TimeSpec};
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: u32 = 1024;
 
+/// 定义inode号的类型为usize
+type InodeId = usize;
+
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -18,7 +22,7 @@ pub enum FileType {
     Dir,
     BlockDevice,
     CharDevice,
-    Pipe
+    Pipe,
 }
 
 /// @brief inode的状态（由poll方法返回）
@@ -33,7 +37,7 @@ impl PollStatus {
     pub const ERR_MASK: u8 = (1u8 << 2);
 }
 
-pub trait IndexNode: Any + Sync + Send {
+pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 在inode的指定偏移量开始，读取指定大小的数据
     ///
     /// @param offset 起始位置在Inode中的偏移量
@@ -147,6 +151,19 @@ pub trait IndexNode: Any + Sync + Send {
         return Err(-(ENOTSUP as i32));
     }
 
+    /// @brief 将指定名称的子目录项的文件内容，移动到target所在的目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
+    /// 
+    /// @param old_name 旧的名字
+    fn move_(
+        &self,
+        _old_name: &str,
+        _target: &Arc<dyn IndexNode>,
+        _new_name: &str,
+    ) -> Result<(), i32> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(-(ENOTSUP as i32));
+    }
+
     /// @brief 删除一个名为Name的inode
     ///
     /// @param name 要寻找的inode的名称
@@ -164,7 +181,7 @@ pub trait IndexNode: Any + Sync + Send {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn get_entry_name(&self, _ino: usize) -> Result<String, i32> {
+    fn get_entry_name(&self, _ino: InodeId) -> Result<String, i32> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(-(ENOTSUP as i32));
     }
@@ -175,7 +192,7 @@ pub trait IndexNode: Any + Sync + Send {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn get_entry_name_and_metadata(&self, ino: usize) -> Result<(String, Metadata), i32> {
+    fn get_entry_name_and_metadata(&self, ino: InodeId) -> Result<(String, Metadata), i32> {
         // 如果有条件，请在文件系统中使用高效的方式实现本接口，而不是依赖这个低效率的默认实现。
         let name = self.get_entry_name(ino)?;
         let entry = self.find(&name)?;
@@ -186,7 +203,7 @@ pub trait IndexNode: Any + Sync + Send {
     ///
     /// @param cmd 命令
     /// @param data 数据
-    /// 
+    ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, i32> {
@@ -202,9 +219,7 @@ pub trait IndexNode: Any + Sync + Send {
     fn as_any_ref(&self) -> &dyn Any;
 }
 
-impl dyn IndexNode{
-
-}
+impl dyn IndexNode {}
 
 /// IndexNode的元数据
 ///
@@ -214,7 +229,7 @@ pub struct Metadata {
     /// 当前inode所在的文件系统的设备号
     pub dev_id: usize,
     /// inode号
-    pub inode_id: usize,
+    pub inode_id: InodeId,
 
     /// Inode的大小
     /// 文件：文件大小（单位：字节）
@@ -256,12 +271,12 @@ pub struct Metadata {
 }
 
 /// @brief 所有文件系统都应该实现的trait
-pub trait FileSystem: Sync + Send {
+pub trait FileSystem: Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
     fn get_root_inode(&self) -> Arc<dyn IndexNode>;
 
     /// @brief 获取当前文件系统的信息
-    fn into(&self) -> FsInfo;
+    fn info(&self) -> FsInfo;
 }
 
 #[derive(Debug)]

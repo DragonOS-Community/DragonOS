@@ -90,7 +90,7 @@
 #define EPROTOTYPE 71      /* 对于套接字而言，错误的协议 Protocol wrong type for socket. */
 #define ERANGE 72          /* 结果过大 Result too large. */
 #define EROFS 73           /* 只读的文件系统 Read-only file system. */
-#define ESPIPE 74          /* 错误的寻道 Invalid seek. */
+#define ESPIPE 74          /* 错误的寻道.当前文件是pipe，不允许seek请求  Invalid seek. */
 #define ESRCH 75           /* 没有这样的进程 No such process. */
 #define ESTALE 76          /* 保留 Reserved. */
 #define ETIME 77           /* 流式ioctl()超时 Stream ioctl() timeout */
@@ -99,4 +99,3 @@
 
 #define EWOULDBLOCK 80 /* 操作将被禁止 Operation would block (may be the same value as [EAGAIN]). */
 #define EXDEV 81       /* 跨设备连接 Cross-device link. */
-#define ESPIPE 82      /* 当前文件是pipe，不允许seek请求 */

@@ -21,6 +21,8 @@
 ### 自旋锁
 
 - spinlock_t
+- {ref}`RawSpinLock <_spinlock_doc_rawspinlock>`（Rust版本的spinlock_t，但与spinlock_t不兼容）
+- {ref}`SpinLock <_spinlock_doc_spinlock>` —— 在RawSpinLock的基础上，封装了一层守卫(Guard), 将锁及其要保护到的数据绑定在一个结构体内，并能在编译期避免未加锁就访问数据的问题。
 
 &emsp;&emsp;进程在获取自旋锁后，将改变pcb中的锁变量持有计数，从而隐式地禁止了抢占。为了获得更多灵活的操作，spinlock还提供了以下的方法：
 
@@ -32,6 +34,11 @@
 &emsp;&emsp;当您同时需要使用自旋锁以及引用计数时，一个好的方法是：使用`lockref`. 这是一种额外的加速技术，能额外提供“无锁修改引用计数”的功能。详情请见：{ref}`lockref <_lockref>`
 
 ## 详细介绍
+
+### 自旋锁的详细介绍
+
+&emsp;&emsp;关于自旋锁的详细介绍，请见文档：{ref}`自旋锁 <_spinlock_doc>`
+
 ### semaphore信号量
 
 &emsp;&emsp;semaphore信号量是基于计数实现的。

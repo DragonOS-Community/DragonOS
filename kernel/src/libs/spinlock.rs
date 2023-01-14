@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
 use core::ptr::read_volatile;
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -69,12 +71,12 @@ impl RawSpinlock {
     pub const INIT: RawSpinlock = RawSpinlock(AtomicBool::new(false));
 
     /// @brief 加锁
-    pub fn lock(&mut self) {
+    pub fn lock(&self) {
         while !self.try_lock() {}
     }
 
     /// @brief 关中断并加锁
-    pub fn lock_irq(&mut self) {
+    pub fn lock_irq(&self) {
         cli();
         self.lock();
     }
@@ -82,7 +84,7 @@ impl RawSpinlock {
     /// @brief 尝试加锁
     /// @return 加锁成功->true
     ///         加锁失败->false
-    pub fn try_lock(&mut self) -> bool {
+    pub fn try_lock(&self) -> bool {
         // 先增加自旋锁持有计数
         preempt_disable();
 
@@ -99,14 +101,14 @@ impl RawSpinlock {
     }
 
     /// @brief 解锁
-    pub fn unlock(&mut self) {
+    pub fn unlock(&self) {
         // 减少自旋锁持有计数
         preempt_enable();
         self.0.store(false, Ordering::Release);
     }
 
     /// @brief 放锁并开中断
-    pub fn unlock_irq(&mut self) {
+    pub fn unlock_irq(&self) {
         self.unlock();
         sti();
     }
@@ -127,4 +129,64 @@ impl RawSpinlock {
 
     // todo: spin_lock_irqsave
     // todo: spin_unlock_irqrestore
+}
+
+/// 实现了守卫的SpinLock, 能够支持内部可变性
+///
+#[derive(Debug)]
+pub struct SpinLock<T> {
+    lock: RawSpinlock,
+    /// 自旋锁保护的数据
+    data: UnsafeCell<T>,
+}
+
+/// SpinLock的守卫
+/// 该守卫没有构造器，并且其信息均为私有的。我们只能通过SpinLock的lock()方法获得一个守卫。
+/// 因此我们可以认为，只要能够获得一个守卫，那么数据就在自旋锁的保护之下。
+#[derive(Debug)]
+pub struct SpinLockGuard<'a, T: 'a> {
+    lock: &'a SpinLock<T>,
+}
+
+/// 向编译器保证，SpinLock在线程之间是安全的.
+/// 其中要求类型T实现了Send这个Trait
+unsafe impl<T> Sync for SpinLock<T> where T: Send {}
+
+impl<T> SpinLock<T> {
+    pub const fn new(value: T) -> Self {
+        return Self {
+            lock: RawSpinlock::INIT,
+            data: UnsafeCell::new(value),
+        };
+    }
+
+    #[inline(always)]
+    pub fn lock(&self) -> SpinLockGuard<T> {
+        self.lock.lock();
+        // 加锁成功，返回一个守卫
+        return SpinLockGuard { lock: self };
+    }
+}
+
+/// 实现Deref trait，支持通过获取SpinLockGuard来获取临界区数据的不可变引用
+impl<T> Deref for SpinLockGuard<'_, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        return unsafe { &*self.lock.data.get() };
+    }
+}
+
+/// 实现DerefMut trait，支持通过获取SpinLockGuard来获取临界区数据的可变引用
+impl<T> DerefMut for SpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        return unsafe { &mut *self.lock.data.get() };
+    }
+}
+
+/// @brief 为SpinLockGuard实现Drop方法，那么，一旦守卫的生命周期结束，就会自动释放自旋锁，避免了忘记放锁的情况
+impl<T> Drop for SpinLockGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.lock.unlock();
+    }
 }

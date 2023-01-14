@@ -49,20 +49,35 @@ int fclose(FILE *stream)
 {
     if (stream->fd >= 3)
     {
-        int retcval = close(stream);
+        int retcval = close(stream->fd);
         free(stream);
-        return;
+        return 0;
     }
     else
         return 0;
 }
 
+// FIXME: 请注意，这个函数的实现，没有遵照posix，行为也与Linux的不一致，请在将来用Rust重构时改变它，以使得它的行为与Linux的一致。
 FILE *fopen(const char *restrict pathname, const char *restrict mode)
 {
     FILE *stream = malloc(sizeof(FILE));
     memset(stream, 0, sizeof(FILE));
+    int o_flags = 0;
 
-    int fd = open(pathname, mode);
+    if (strcmp(mode, "r") == 0)
+        o_flags = O_RDONLY;
+    else if (strcmp(mode, "r+") == 0)
+        o_flags = O_RDWR;
+    else if (strcmp(mode, "w") == 0)
+        o_flags = O_WRONLY;
+    else if (strcmp(mode, "w+") == 0)
+        o_flags = O_RDWR | O_CREAT;
+    else if (strcmp(mode, "a") == 0)
+        o_flags = O_APPEND | O_CREAT;
+    else if (strcmp(mode, "a+") == 0)
+        o_flags = O_APPEND | O_CREAT;
+
+    int fd = open(pathname, o_flags);
     if (fd >= 0)
         stream->fd = fd;
     return stream;

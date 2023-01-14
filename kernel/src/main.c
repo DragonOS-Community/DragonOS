@@ -52,7 +52,8 @@ void reload_gdt()
     gdtp.size = bsp_gdt_size - 1;
     gdtp.gdt_vaddr = (ul)phys_2_virt((ul)&GDT_Table);
 
-    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp) : "memory");
+    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp)
+                 : "memory");
 }
 
 void reload_idt()
@@ -63,7 +64,8 @@ void reload_idt()
     // kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
     // kdebug("gdt size=%d", p.size);
 
-    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp) : "memory");
+    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp)
+                 : "memory");
 }
 
 // 初始化系统各模块
@@ -124,17 +126,18 @@ void system_initialize()
     irq_init();
 
     softirq_init();
+
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
     // 先初始化系统调用模块
     syscall_init();
+
     io_mfence();
     //  再初始化进程模块。顺序不能调转
     // sched_init();
     io_mfence();
 
     timer_init();
-
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
@@ -143,7 +146,7 @@ void system_initialize()
     vfs_init();
     devfs_init();
     procfs_init();
-    
+
     cpu_init();
     ps2_keyboard_init();
     tty_init();
@@ -167,11 +170,12 @@ void system_initialize()
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
-    // fat32_init();
+    
     HPET_enable();
 
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
+
     apic_timer_init();
     io_mfence();
 
@@ -180,7 +184,7 @@ void system_initialize()
     //     pause();
 }
 
-//操作系统内核从这里开始执行
+// 操作系统内核从这里开始执行
 void Start_Kernel(void)
 {
 

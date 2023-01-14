@@ -14,3 +14,10 @@ void _start(int argc, char **argv)
     int retval = main(argc, argv);
     exit(retval);
 }
+
+void _init(){
+
+}
+void _fini(){
+    
+}

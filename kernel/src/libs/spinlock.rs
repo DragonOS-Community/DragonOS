@@ -127,11 +127,13 @@ impl RawSpinlock {
         self.0.store(value, Ordering::SeqCst);
     }
 
+    /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
     pub fn lock_irqsave(&self, flags: &mut u64) {
         local_irq_save(flags);
         self.lock();
     }
 
+    /// @brief 恢复rflags以及中断状态并解锁自旋锁
     pub fn unlock_irqrestore(&self, flags: &u64){
         self.unlock();
         local_irq_restore(flags);

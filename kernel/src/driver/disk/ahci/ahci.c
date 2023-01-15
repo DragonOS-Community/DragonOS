@@ -175,10 +175,11 @@ void ahci_init()
     kdebug("ahci_port_base_vaddr=%#018lx", ahci_port_base_vaddr);
     ahci_probe_port(0);
 
-    // 初始化请求队列
-    ahci_req_queue.in_service = NULL;
-    wait_queue_init(&ahci_req_queue.wait_queue_list, NULL);
-    ahci_req_queue.request_count = 0;
+    // // 初始化请求队列
+    // ahci_req_queue.in_service = NULL;
+    // wait_queue_init(&ahci_req_queue.wait_queue_list, NULL);
+    // ahci_req_queue.request_count = 0;
+    crate_io_queue();
 
     BUG_ON(ahci_init_gendisk() != 0);
     kinfo("AHCI initialized.");
@@ -661,3 +662,4 @@ HBA_PORT *ahci_get_port(uint8_t port_num, uint8_t ahci_ctrl_num)
 {
     return &(ahci_devices[ahci_ctrl_num].hba_mem->ports[port_num]);
 }
+

@@ -204,7 +204,7 @@ void wait_for_multicompletion(struct completion x[], int n)
         {
             wait_for_completion(&x[i]);
         }
-        else if (!try_wait_for_completion(&x[i])) //上面测试过done>0，那么这里尝试去获取一个done，如果失败了，就继续wait
+        else if (!try_wait_for_completion(&x[i])) // 上面测试过done>0，那么这里尝试去获取一个done，如果失败了，就继续wait
         {
             wait_for_completion(&x[i]);
         }
@@ -329,10 +329,10 @@ void __test_completion()
 
 /**
  * @brief rust 获取completion
-*/
-struct completion get_completion()
+ */
+struct completion *get_completion()
 {
-    struct completion cmpl;
-    DECLARE_COMPLETION_ON_STACK(cmpl);
+    struct completion *cmpl = kzalloc(sizeof(struct completion), 0);
+    completion_init(cmpl);
     return cmpl;
 }

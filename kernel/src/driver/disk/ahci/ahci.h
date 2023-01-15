@@ -352,7 +352,6 @@ struct ahci_device_t
 #define HBA_PORT_IPM_ACTIVE 1
 #define HBA_PORT_DET_PRESENT 3
 
-extern void ahci_push_request(struct ahci_request_packet_t *packet);
 struct ahci_request_packet_t
 {
     struct block_device_request_packet blk_pak; // 块设备请求包
@@ -422,3 +421,4 @@ HBA_PORT *ahci_get_port(uint8_t port_num, uint8_t ahci_ctrl_num);
  * @param port
  */
 int ahci_find_cmdslot(HBA_PORT *port);
+

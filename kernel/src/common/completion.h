@@ -30,7 +30,7 @@ long wait_for_completion_interruptible_timeout(struct completion *x, long timeou
 void wait_for_multicompletion(struct completion x[], int n);
 bool try_wait_for_completion(struct completion *x);
 bool completion_done(struct completion *x);
-struct completion get_completion();
+struct completion* get_completion();
 /**
  * 测试函数声明 (测试代码辅助函数)
  */

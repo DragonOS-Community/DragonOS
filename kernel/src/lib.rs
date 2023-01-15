@@ -29,6 +29,7 @@ mod sched;
 mod smp;
 mod time;
 mod exception;
+pub mod io;
 
 extern crate alloc;
 

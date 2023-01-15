@@ -32,3 +32,4 @@
 #include <sched/sched.h>
 #include <driver/disk/ahci/ahci.h>
 #include <common/completion.h>
+#include <common/kthread.h>

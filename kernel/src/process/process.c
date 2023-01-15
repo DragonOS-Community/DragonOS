@@ -28,9 +28,8 @@
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-
 #include <mm/mmio.h>
-
+#include <io/scheduler.h>
 #include <common/lz4.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
@@ -52,13 +51,13 @@ extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
 
 // 设置初始进程的PCB
-#define INITIAL_PROC(proc)                                                                                             \
-    {                                                                                                                  \
-        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
-        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,   \
-        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                   \
-        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                       \
+#define INITIAL_PROC(proc)                                                                                           \
+    {                                                                                                                \
+        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
+        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
+        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
+        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                     \
     }
 
 struct thread_struct initial_thread = {
@@ -115,8 +114,10 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
+                         : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
+                         : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -409,7 +410,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 
     // 关闭之前的文件描述符
     process_exit_files(current_pcb);
-    
+
     process_open_stdio(current_pcb);
 
     // 清除进程的vfork标志位
@@ -482,8 +483,10 @@ ul initial_kernel_thread(ul arg)
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
 
     scm_enable_double_buffer();
-    //TODO 测试io调度器
-    io_schduler_init();
+    // TODO 测试io调度器
+    kinfo("*******io schduler init begin*******");
+    io_scheduler_init();
+    kinfo("*******io schduler init end*******");
     ahci_init();
     fat32_init();
     rootfs_umount();

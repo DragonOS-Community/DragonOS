@@ -1,28 +1,39 @@
 #![allow(dead_code)]
 
+pub mod core;
 pub mod file;
 pub mod mount;
 
-use core::{any::Any, fmt::Debug};
+use ::core::{any::Any, fmt::Debug};
 
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{include::bindings::bindings::ENOTSUP, time::TimeSpec};
+use crate::{
+    include::bindings::bindings::{ENOTDIR, ENOTSUP},
+    time::TimeSpec,
+};
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: u32 = 1024;
 
 /// 定义inode号的类型为usize
-type InodeId = usize;
+pub type InodeId = usize;
 
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
+    /// 文件
     File,
+    /// 文件夹
     Dir,
+    /// 块设备
     BlockDevice,
+    /// 字符设备
     CharDevice,
+    /// 管道文件
     Pipe,
+    /// 符号链接
+    SymLink,
 }
 
 /// @brief inode的状态（由poll方法返回）
@@ -61,7 +72,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 获取当前inode的状态。
     ///
     /// @return PollStatus结构体
-    fn poll(&self) -> PollStatus;
+    fn poll(&self) -> Result<PollStatus, i32>;
 
     /// @brief 获取inode的元数据
     ///
@@ -128,7 +139,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(-(ENOTSUP as i32));
     }
 
-    /// @brief 创建一个名为Name的硬链接，指向另一个IndexNode
+    /// @brief 在当前目录下，创建一个名为Name的硬链接，指向另一个IndexNode
     ///
     /// @param name 硬链接的名称
     /// @param other 要被指向的IndexNode的Arc指针
@@ -140,7 +151,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(-(ENOTSUP as i32));
     }
 
-    /// @brief 删除一个名为Name的硬链接
+    /// @brief 在当前目录下，删除一个名为Name的硬链接
     ///
     /// @param name 硬链接的名称
     ///
@@ -151,8 +162,8 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(-(ENOTSUP as i32));
     }
 
-    /// @brief 将指定名称的子目录项的文件内容，移动到target所在的目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
-    /// 
+    /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
+    ///
     /// @param old_name 旧的名字
     fn move_(
         &self,
@@ -164,7 +175,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(-(ENOTSUP as i32));
     }
 
-    /// @brief 删除一个名为Name的inode
+    /// @brief 寻找一个名为Name的inode
     ///
     /// @param name 要寻找的inode的名称
     ///
@@ -219,7 +230,117 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     fn as_any_ref(&self) -> &dyn Any;
 }
 
-impl dyn IndexNode {}
+impl dyn IndexNode {
+    /// @brief 将当前Inode转换为一个具体的结构体（类型由T指定）
+    /// 如果类型正确，则返回Some,否则返回None
+    pub fn downcast_ref<T: IndexNode>(&self) -> Option<&T> {
+        return self.as_any_ref().downcast_ref::<T>();
+    }
+
+    pub fn list(&self) -> Result<Vec<String>, i32> {
+        let info = self.metadata()?;
+        if info.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+
+        // 通过遍历所有inode号的方式，获得当前inode下面的所有子目录项
+        // TODO: 使用更高效的方式获取
+        let result: Vec<String> = (0..)
+            .map(|ino| self.get_entry_name(ino))
+            .take_while(|result| result.is_ok())
+            .filter_map(|result| result.ok())
+            .collect();
+        return Ok(result);
+    }
+
+    /// @brief 查找文件（不考虑符号链接）
+    /// 
+    /// @param path 文件路径
+    /// 
+    /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
+    /// @return Err(i32) 错误码
+    pub fn lookup(&self, path: &str) -> Result<Arc<dyn IndexNode>, i32> {
+        return self.lookup_follow_symlink(path, 0);
+    }
+
+    /// @brief 查找文件（考虑符号链接）
+    /// 
+    /// @param path 文件路径
+    /// @param max_follow_times 最大经过的符号链接的大小
+    /// 
+    /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
+    /// @return Err(i32) 错误码
+    pub fn lookup_follow_symlink(
+        &self,
+        path: &str,
+        max_follow_times: usize,
+    ) -> Result<Arc<dyn IndexNode>, i32> {
+        if self.metadata()?.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+
+        // 处理绝对路径
+        // result: 上一个被找到的inode
+        // rest_path: 还没有查找的路径
+        let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+            (self.fs().get_root_inode(), String::from(rest))
+        } else {
+            // 是相对路径
+            (self.find(".")?, String::from(path))
+        };
+
+        // 逐级查找文件
+        while !rest_path.is_empty() {
+            // 当前这一级不是文件夹
+            if result.metadata()?.file_type != FileType::Dir {
+                return Err(-(ENOTDIR as i32));
+            }
+
+            let name;
+
+            // 寻找“/”
+            match rest_path.find('/') {
+                Some(pos) => {
+                    // 找到了，设置下一个要查找的名字
+                    name = String::from(&rest_path[0..pos]);
+                    // 剩余的路径字符串
+                    rest_path = String::from(&rest_path[pos + 1..]);
+                }
+                None => {
+                    name = rest_path;
+                    rest_path = String::new();
+                }
+            }
+
+            // 遇到连续多个"/"的情况
+            if name.is_empty() {
+                continue;
+            }
+
+            let inode = result.find(&name)?;
+
+            // 处理符号链接的问题
+            if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
+                let mut content = [0u8; 256];
+                // 读取符号链接
+                let len = inode.read_at(0, 256, &mut content)?;
+
+                // 将读到的数据转换为utf8字符串（先转为str，再转为String）
+                let link_path = String::from(
+                    ::core::str::from_utf8(&content[..len]).map_err(|_| -(ENOTDIR as i32))?,
+                );
+
+                let new_path = link_path + "/" + &rest_path;
+                // 继续查找符号链接
+                return result.lookup_follow_symlink(&new_path, max_follow_times - 1);
+            }else {
+                result = inode;
+            }
+        }
+
+        return Ok(result);
+    }
+}
 
 /// IndexNode的元数据
 ///
@@ -282,7 +403,7 @@ pub trait FileSystem: Sync + Send + Debug {
 #[derive(Debug)]
 pub struct FsInfo {
     /// 文件系统所在的块设备的id
-    blk_dev_id: usize,
+    pub blk_dev_id: usize,
     /// 文件名的最大长度
-    max_name_len: usize,
+    pub max_name_len: usize,
 }

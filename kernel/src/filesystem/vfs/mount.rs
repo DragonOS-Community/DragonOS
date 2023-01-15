@@ -147,7 +147,7 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.write_at(offset, len, buf);
     }
 
-    fn poll(&self) -> super::PollStatus {
+    fn poll(&self) -> Result<super::PollStatus, i32> {
         return self.inner_inode.poll();
     }
 

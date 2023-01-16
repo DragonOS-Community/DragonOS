@@ -8,7 +8,7 @@
  * 1、我们不能删除一个只读的dentry
  * 2、我们应当对这个dentry拥有写、执行权限（暂时还没有实现权限）
  * 3、如果dentry指向的是文件夹，而isdir为false，则不能删除
- * 3、如果dentry指向的是文件，而isdir为true，则不能删除
+ * 4、如果dentry指向的是文件，而isdir为true，则不能删除
  * @param dentry 将要被删除的dentry
  * @param isdir 是否要删除文件夹
  * @return int 错误码

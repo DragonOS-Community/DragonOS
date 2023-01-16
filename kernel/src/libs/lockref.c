@@ -52,16 +52,20 @@ void lockref_inc(struct lockref *lock_ref)
  * @brief 原子地将引用计数加1.如果原来的count≤0，则操作失败。
  *
  * @param lock_ref 指向要被操作的lockref变量的指针
- * @return int  操作成功=>true
+ * @return bool  操作成功=>true
  *              操作失败=>false
  */
 bool lockref_inc_not_zero(struct lockref *lock_ref)
 {
-    CMPXCHG_LOOP(lock_ref,
-                 if (old.count <= 0) return false;
-                 ++new.count;
-                 ,
-                 return true;)
+    CMPXCHG_LOOP(
+        lock_ref,
+        {
+            if (old.count <= 0)
+                return false;
+            ++new.count;
+        },
+        { return true; })
+
     bool retval;
     spin_lock(&lock_ref->lock);
     retval = false;
@@ -86,11 +90,14 @@ bool lockref_inc_not_zero(struct lockref *lock_ref)
  */
 int lockref_dec(struct lockref *lock_ref)
 {
-    CMPXCHG_LOOP(lock_ref,
-                 if (old.count <= 0) break;
-                 --new.count;
-                 ,
-                 return new.count;);
+    CMPXCHG_LOOP(
+        lock_ref,
+        {
+            if (old.count <= 0)
+                break;
+            --new.count;
+        },
+        { return new.count; })
 
     // 如果xchg时，处于已加锁的状态或者检测到old.count <= 0，则采取加锁处理
     int retval = -1;
@@ -117,11 +124,14 @@ int lockref_dec(struct lockref *lock_ref)
  */
 int lockref_dec_return(struct lockref *lock_ref)
 {
-    CMPXCHG_LOOP(lock_ref,
-                 if (old.count <= 0) return -1;
-                 --new.count;
-                 ,
-                 return new.count;);
+    CMPXCHG_LOOP(
+        lock_ref,
+        {
+            if (old.count <= 0)
+                return -1;
+            --new.count;
+        },
+        { return new.count; })
 
     return -1;
 }
@@ -138,11 +148,14 @@ int lockref_dec_return(struct lockref *lock_ref)
  */
 bool lockref_dec_not_zero(struct lockref *lock_ref)
 {
-    CMPXCHG_LOOP(lock_ref,
-                 if (old.count <= 1) return false;
-                 --new.count;
-                 ,
-                 return true;)
+    CMPXCHG_LOOP(
+        lock_ref,
+        {
+            if (old.count <= 1)
+                return false;
+            --new.count;
+        },
+        { return true; })
 
     bool retval = false;
     spin_lock(&lock_ref->lock);
@@ -167,11 +180,14 @@ bool lockref_dec_not_zero(struct lockref *lock_ref)
  */
 bool lockref_dec_or_lock_not_zero(struct lockref *lock_ref)
 {
-    CMPXCHG_LOOP(lock_ref,
-                 if (old.count <= 1) break;
-                 --new.count;
-                 ,
-                 return true;);
+    CMPXCHG_LOOP(
+        lock_ref,
+        {
+            if (old.count <= 1)
+                break;
+            --new.count;
+        },
+        { return true; });
 
     bool retval = false;
     spin_lock(&lock_ref->lock);
@@ -205,11 +221,14 @@ void lockref_mark_dead(struct lockref *lock_ref)
  */
 bool lockref_inc_not_dead(struct lockref *lock_ref)
 {
-    CMPXCHG_LOOP(lock_ref,
-                 if (old.count < 0) return false;
-                 ++new.count;
-                 ,
-                 return true;)
+    CMPXCHG_LOOP(
+        lock_ref,
+        {
+            if (old.count < 0)
+                return false;
+            ++new.count;
+        },
+        { return true; })
 
     bool retval = false;
     // 快捷路径操作失败，尝试加锁

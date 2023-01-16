@@ -1,24 +1,17 @@
-use core::{
-    ptr::null_mut,
-    sync::atomic::compiler_fence,
-};
+use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    arch::{
-        asm::current::current_pcb,
-        context::switch_process,
-    },
+    arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED,
-        PROC_RUNNING,
+        initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, PROC_RUNNING,
     },
     kBUG,
     libs::spinlock::RawSpinlock,
 };
 
-use super::core::Scheduler;
+use super::core::{sched_enqueue, Scheduler};
 
 /// 声明全局的cfs调度器实例
 
@@ -149,8 +142,7 @@ impl SchedulerCFS {
 impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
-    fn sched(&mut self) {
-        // kdebug!("cfs:sched");
+    fn sched(&mut self) -> Option<&'static mut process_control_block> {
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
         let current_cpu_id = current_pcb().cpu_id as usize;
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
@@ -163,8 +155,7 @@ impl Scheduler for SchedulerCFS {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             if current_pcb().state & (PROC_RUNNING as u64) != 0 {
-                // kdebug!("cfs:sched->enqueue");
-                current_cpu_queue.enqueue(current_pcb());
+                sched_enqueue(current_pcb());
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
 
@@ -175,9 +166,7 @@ impl Scheduler for SchedulerCFS {
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-            switch_process(current_pcb(), proc);
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            return Some(proc);
         } else {
             // 不进行切换
 
@@ -188,10 +177,11 @@ impl Scheduler for SchedulerCFS {
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            current_cpu_queue.enqueue(proc);
+            sched_enqueue(proc);
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        return None;
     }
 
     fn enqueue(&mut self, pcb: &'static mut process_control_block) {

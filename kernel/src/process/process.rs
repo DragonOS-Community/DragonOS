@@ -2,9 +2,7 @@ use core::ptr::{read_volatile, write_volatile};
 
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{
-        process_control_block, PROC_RUNNING, PROC_STOPPED,
-    },
+    include::bindings::bindings::{process_control_block, PROC_RUNNING, PROC_STOPPED},
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
 };

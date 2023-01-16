@@ -127,10 +127,19 @@ impl RawSpinlock {
         self.0.store(value, Ordering::SeqCst);
     }
 
-    // todo: spin_lock_irqsave
-    // todo: spin_unlock_irqrestore
-}
+    /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
+    pub fn lock_irqsave(&self, flags: &mut u64) {
+        local_irq_save(flags);
+        self.lock();
+    }
 
+    /// @brief 恢复rflags以及中断状态并解锁自旋锁
+    pub fn unlock_irqrestore(&self, flags: &u64){
+        self.unlock();
+        local_irq_restore(flags);
+    }
+
+}
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///
 #[derive(Debug)]
@@ -171,7 +180,7 @@ impl<T> SpinLock<T> {
 /// 实现Deref trait，支持通过获取SpinLockGuard来获取临界区数据的不可变引用
 impl<T> Deref for SpinLockGuard<'_, T> {
     type Target = T;
-    
+
     fn deref(&self) -> &Self::Target {
         return unsafe { &*self.lock.data.get() };
     }

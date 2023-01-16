@@ -66,9 +66,9 @@ pub fn __get_softirq_handler_mut() -> &'static mut Softirq {
 
 #[no_mangle]
 #[allow(dead_code)]
-pub extern "C" fn raise_softirq(sirq_num: u64) {
+pub extern "C" fn raise_softirq(sirq_num: u32) {
     let softirq_handler = __get_softirq_handler_mut();
-    softirq_handler.set_softirq_pending(1 << sirq_num);
+    softirq_handler.set_softirq_pending(sirq_num);
 }
 
 /// @brief 软中断注册函数

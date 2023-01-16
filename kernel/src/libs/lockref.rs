@@ -324,32 +324,32 @@ impl LockRef {
 }
 
 /*
- * 您可以使用以下代码测试lockref
+* 您可以使用以下代码测试lockref
 
-    let mut lockref = LockRef::new();
-    kdebug!("lockref={:?}", lockref);
-    lockref.inc();
-    assert_eq!(lockref.count, 1);
-    kdebug!("lockref={:?}", lockref);
-    assert!(lockref.dec().is_ok());
-    assert_eq!(lockref.count, 0);
+   let mut lockref = LockRef::new();
+   kdebug!("lockref={:?}", lockref);
+   lockref.inc();
+   assert_eq!(lockref.count, 1);
+   kdebug!("lockref={:?}", lockref);
+   assert!(lockref.dec().is_ok());
+   assert_eq!(lockref.count, 0);
 
-    assert!(lockref.dec().is_err());
-    assert_eq!(lockref.count, 0);
+   assert!(lockref.dec().is_err());
+   assert_eq!(lockref.count, 0);
 
-    lockref.inc();
-    assert_eq!(lockref.count, 1);
+   lockref.inc();
+   assert_eq!(lockref.count, 1);
 
-    assert!(lockref.dec_not_zero().is_err());
+   assert!(lockref.dec_not_zero().is_err());
 
-    lockref.inc();
-    assert_eq!(lockref.count, 2);
+   lockref.inc();
+   assert_eq!(lockref.count, 2);
 
-    assert!(lockref.dec_not_zero().is_ok());
+   assert!(lockref.dec_not_zero().is_ok());
 
-    lockref.mark_dead();
-    assert!(lockref.count < 0);
-    
-    assert!(lockref.inc_not_dead().is_err());
-    kdebug!("lockref={:?}", lockref);
- */
+   lockref.mark_dead();
+   assert!(lockref.count < 0);
+
+   assert!(lockref.inc_not_dead().is_err());
+   kdebug!("lockref={:?}", lockref);
+*/

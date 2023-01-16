@@ -5,7 +5,7 @@
 pub type BlockId = usize;
 
 /// 定义常量
-const BLK_SIZE_LOG2_LIMIT: u8 = 2; // 设定块设备的块大小不能超过 1 << 12.
+const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1 << 12.
 
 /// @brief 设备应该实现的操作
 /// @usage Device::read_at()

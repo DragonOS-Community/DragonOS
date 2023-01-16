@@ -372,11 +372,12 @@ impl IndexNode for LockedRamFSInode {
                     .cloned()
                     .collect();
 
-                assert_eq!(key.len(), 1);
-
-                return Ok(key.remove(0));
+                match key.len() {
+                    0=>{return Err(-(ENOENT as i32));}
+                    1=>{return Ok(key.remove(0));}
+                    _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                }
             }
         }
     }
-
 }

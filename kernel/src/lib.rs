@@ -31,12 +31,15 @@ mod smp;
 mod time;
 
 extern crate alloc;
+#[macro_use]
+extern crate lazy_static;
 
 use mm::allocator::KernelAllocator;
 
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
+    filesystem::vfs::core::__test_filesystem,
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
 };
 
@@ -84,5 +87,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
+    __test_filesystem();
     return 0;
 }

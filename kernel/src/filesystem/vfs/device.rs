@@ -13,7 +13,8 @@ const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1
 /// @brief 设备应该实现的操作
 /// @usage Device::read_at()
 pub trait Device: Send + Sync {
-    // buffer对应设备按字节划分
+    /// Notice buffer对应设备按字节划分，使用u8类型
+    /// Notice offset应该从0开始计数
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32>;
     fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, i32>;
     fn sync(&self) -> Result<(), i32>;

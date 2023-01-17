@@ -19,7 +19,7 @@ pub fn switch_mm(
     mfence();
     // kdebug!("to get pml4t");
     let pml4t = unsafe { read_volatile(&next_pcb.mm.as_ref().unwrap().pgd) };
-    
+
     unsafe {
         asm!("mov cr3, {}", in(reg) pml4t);
     }

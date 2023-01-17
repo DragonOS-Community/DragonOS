@@ -176,7 +176,7 @@ impl BlockIter {
         }
 
         let begin = self.begin % blk_size; // 因为是多个整块，这里必然是0
-                                           // assert!(begin == 0);
+        // assert!(begin == 0);
         let end = lba_id_to_addr(lba_end, blk_size) - self.begin;
         // assert!(end % blk_size == 0);
 

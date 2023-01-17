@@ -1,6 +1,9 @@
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
 
+/// 引入Module
+use crate::include::bindings::bindings::E2BIG;
+
 /// 定义类型
 pub type BlockId = usize;
 
@@ -29,7 +32,9 @@ impl<T: BlockDevice> Device for T {
     // 读取设备操作，读取设备内部 [offset, offset + buf.len) 区间内的字符，存放到 buf 中
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
         // assert!(len <= buf.len());
-        if len > buf.len() { return Err(-E2BIG); }
+        if len > buf.len() {
+            return Err(-(E2BIG as i32));
+        }
 
         let iter = BlockIter::new_multiblock(offset, offset + len, Self::BLK_SIZE_LOG2);
         let multi = iter.multiblock;
@@ -48,11 +53,12 @@ impl<T: BlockDevice> Device for T {
             } else {
                 // 判断块的长度不能超过最大值
                 if Self::BLK_SIZE_LOG2 > BLK_SIZE_LOG2_LIMIT {
-                    return Err(-E2BIG);
+                    return Err(-(E2BIG as i32));
                 }
 
-                let mut temp = Box::new([0u8; 1 << BLK_SIZE_LOG2_LIMIT]);
-                BlockDevice::read_at(self, range.lba_start, 1, &mut *temp)?;
+                let mut temp = Vec::new();
+                temp.resize(1usize << Self::BLK_SIZE_LOG2, 0);
+                BlockDevice::read_at(self, range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
                 buf_slice.copy_from_slice(&temp[range.begin..range.end]);
             }
@@ -63,7 +69,9 @@ impl<T: BlockDevice> Device for T {
     /// 写入设备操作，把 buf 的数据写入到设备内部 [offset, offset + len) 区间内
     fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, i32> {
         // assert!(len <= buf.len());
-        if len > buf.len() { return Err(-E2BIG); }
+        if len > buf.len() {
+            return Err(-(E2BIG as i32));
+        }
 
         let iter = BlockIter::new_multiblock(offset, offset + len, Self::BLK_SIZE_LOG2);
         let multi = iter.multiblock;
@@ -79,14 +87,16 @@ impl<T: BlockDevice> Device for T {
                 BlockDevice::write_at(self, range.lba_start, count, buf_slice)?;
             } else {
                 if Self::BLK_SIZE_LOG2 > BLK_SIZE_LOG2_LIMIT {
-                    return Err(-E2BIG);
+                    return Err(-(E2BIG as i32));
                 }
-                let mut temp = Box::new([0u8; 1 << BLK_SIZE_LOG2_LIMIT]);
+
+                let mut temp = Vec::new();
+                temp.resize(1usize << Self::BLK_SIZE_LOG2, 0);
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
-                BlockDevice::read_at(self, range.lba_start, 1, &mut *temp)?;
+                BlockDevice::read_at(self, range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
                 temp[range.begin..range.end].copy_from_slice(&buf_slice);
-                BlockDevice::write_at(self, range.lba_start, 1, &*temp)?;
+                BlockDevice::write_at(self, range.lba_start, 1, &temp[..])?;
             }
         }
         return Ok(len);
@@ -176,8 +186,8 @@ impl BlockIter {
         }
 
         let begin = self.begin % blk_size; // 因为是多个整块，这里必然是0
-        // assert!(begin == 0);
         let end = lba_id_to_addr(lba_end, blk_size) - self.begin;
+        // assert!(begin == 0);
         // assert!(end % blk_size == 0);
 
         self.begin += end - begin;

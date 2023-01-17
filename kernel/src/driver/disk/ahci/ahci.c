@@ -12,7 +12,7 @@
 
 struct pci_device_structure_header_t *ahci_devs[MAX_AHCI_DEVICES];
 
-struct block_device_request_queue ahci_req_queue;
+// struct block_device_request_queue ahci_req_queue;
 
 struct blk_gendisk ahci_gendisk0 = {0}; // 暂时硬性指定一个ahci_device
 static int __first_port = -1;           // 临时用于存储 ahci控制器的第一个可用端口 的变量
@@ -26,8 +26,6 @@ static void start_cmd(HBA_PORT *port);
 static void stop_cmd(HBA_PORT *port);
 static void port_rebase(HBA_PORT *port, int portno);
 static long ahci_query_disk();
-
-
 
 // 计算HBA_MEM的虚拟内存地址
 #define cal_HBA_MEM_VIRT_ADDR(device_num) (AHCI_MAPPING_BASE + (ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[device_num]))->BAR5 - ((((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5) & PAGE_2M_MASK)))
@@ -92,7 +90,8 @@ static int ahci_init_gendisk()
     ahci_gendisk0.flags = BLK_GF_AHCI;
     ahci_gendisk0.fops = &ahci_operation;
     mutex_init(&ahci_gendisk0.open_mutex);
-    ahci_gendisk0.request_queue = &ahci_req_queue;
+    // ahci_gendisk0.request_queue = &ahci_req_queue;
+
     // 为存储分区结构，分配内存空间
     ahci_gendisk0.private_data = __alloc_private_data();
     // 读取分区表
@@ -127,7 +126,8 @@ static int ahci_init_gendisk()
                 // 初始化分区结构体
                 ahci_gendisk0.partition[cnt].bd_disk = &ahci_gendisk0;
                 ahci_gendisk0.partition[cnt].bd_partno = cnt;
-                ahci_gendisk0.partition[cnt].bd_queue = &ahci_req_queue;
+                //FIXME 需要注释
+                // ahci_gendisk0.partition[cnt].bd_queue = &ahci_req_queue;
                 ahci_gendisk0.partition[cnt].bd_sectors_num = ptable->DPTE[i].total_sectors;
                 ahci_gendisk0.partition[cnt].bd_start_sector = ptable->DPTE[i].starting_sector;
                 ahci_gendisk0.partition[cnt].bd_superblock = NULL; // 挂载文件系统时才会初始化superblock
@@ -179,7 +179,6 @@ void ahci_init()
     // ahci_req_queue.in_service = NULL;
     // wait_queue_init(&ahci_req_queue.wait_queue_list, NULL);
     // ahci_req_queue.request_count = 0;
-    crate_io_queue();
 
     BUG_ON(ahci_init_gendisk() != 0);
     kinfo("AHCI initialized.");
@@ -340,8 +339,15 @@ static void port_rebase(HBA_PORT *port, int portno)
 static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf)
 {
     port->is = (uint32_t)-1; // Clear pending interrupt bits
-    int spin = 0;            // Spin lock timeout counter
+    kinfo("***********");
+    kdebug("ahci_read,startl =%d,starth = %d, count = %d,buf = %#018lx", startl, starth, count, buf);
+    kdebug("port, ci = %d, cmd = %d", port->ci, port->cmd);
+
+    int spin = 0; // Spin lock timeout counter
     int slot = ahci_find_cmdslot(port);
+
+    kdebug("slot = %d", slot);
+    kinfo("***********");
 
     if (slot == -1)
         return E_NOEMPTYSLOT;
@@ -408,11 +414,11 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
     return 0;
 }
 
-int ahci_check_complete(uint8_t port_num,uint8_t ahci_ctrl_num, char *err)
+int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, char *err)
 {
 
-    HBA_PORT * port  = ahci_get_port(port_num,ahci_ctrl_num);
-    int slot  = ahci_find_cmdslot(port);
+    HBA_PORT *port = ahci_get_port(port_num, ahci_ctrl_num);
+    int slot = ahci_find_cmdslot(port);
     int retval = AHCI_SUCCESS;
 
     // In some longer duration reads, it may be helpful to spin on the DPS bit
@@ -524,8 +530,8 @@ long ahci_close()
 static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_addr, uint64_t count, uint64_t buffer, uint8_t ahci_ctrl_num, uint8_t port_num)
 {
     struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)kmalloc(sizeof(struct ahci_request_packet_t), 0);
-
-    wait_queue_init(&pack->blk_pak.wait_queue, current_pcb);
+    // FIXME waitqueue
+    // wait_queue_init(&pack->blk_pak.wait_queue, current_pcb);
     pack->blk_pak.device_type = BLK_TYPE_AHCI;
 
     // 由于ahci不需要中断即可读取磁盘，因此end handler为空
@@ -606,8 +612,8 @@ static long ahci_query_disk(struct ahci_request_packet_t *pack)
  */
 static void ahci_submit(struct ahci_request_packet_t *pack)
 {
-    list_append(&(ahci_req_queue.wait_queue_list.wait_list), &(pack->blk_pak.wait_queue.wait_list));
-    ++ahci_req_queue.request_count;
+    // list_append(&(ahci_req_queue.wait_queue_list.wait_list), &(pack->blk_pak.wait_queue.wait_list));
+    // ++ahci_req_queue.request_count;
 
     //  FIXME
     // if (ahci_req_queue.in_service == NULL) // 当前没有正在请求的io包，立即执行磁盘请求
@@ -633,11 +639,18 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
     {
         pack = ahci_make_request(cmd, base_addr, count, buf, pdata->ahci_ctrl_num, pdata->ahci_port_num);
         ahci_push_request(pack);
+        kdebug("ahci_push_request,cmd =%d,ctrl_num = %d, port_num = %d", pack->blk_pak.cmd, pack->ahci_ctrl_num, pack->port_num);
+        kdebug("buffer_vaddr =%#018lx,count = %d, device_type = %#018lx, end_handler = %d, lba = %d", pack->blk_pak.buffer_vaddr, pack->blk_pak.count, pack->blk_pak.device_type, pack->blk_pak.end_handler, pack->blk_pak.LBA_start);
+
         // ahci_submit(pack);
     }
     else
+    {
+        kdebug("ahci_transfer: E_UNSUPPORTED_CMD");
         return E_UNSUPPORTED_CMD;
+    }
 
+    kdebug("ahci_transfer: AHCI_SUCCESS");
     return AHCI_SUCCESS;
 }
 
@@ -662,4 +675,3 @@ HBA_PORT *ahci_get_port(uint8_t port_num, uint8_t ahci_ctrl_num)
 {
     return &(ahci_devices[ahci_ctrl_num].hba_mem->ports[port_num]);
 }
-

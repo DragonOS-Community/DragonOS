@@ -471,6 +471,22 @@ exec_failed:;
 #pragma GCC pop_options
 
 /**
+ * @brief 初始化实时进程rt_pcb
+ *
+ * @return 初始化后的进程
+ *
+ */
+struct process_control_block *process_init_rt_pcb(struct process_control_block *rt_pcb)
+{
+    // 暂时将实时进程的优先级设置为10
+    rt_pcb->priority = 10;
+    rt_pcb->policy = SCHED_RR;
+    rt_pcb->rt_time_slice = 80;
+    rt_pcb->virtual_runtime = 0x7fffffffffffffff;
+    return rt_pcb;
+}
+
+/**
  * @brief 内核init进程
  *
  * @param arg
@@ -483,10 +499,12 @@ ul initial_kernel_thread(ul arg)
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
 
     scm_enable_double_buffer();
+
     // TODO 测试io调度器
     kinfo("*******io schduler init begin*******");
     io_scheduler_init();
     kinfo("*******io schduler init end*******");
+    
     ahci_init();
     fat32_init();
     rootfs_umount();
@@ -511,6 +529,11 @@ ul initial_kernel_thread(ul arg)
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
+
+    // 测试实时进程
+
+    // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
+    // kdebug("process:rt test kthread is created!!!!");
 
     // 准备切换到用户态
     struct pt_regs *regs;

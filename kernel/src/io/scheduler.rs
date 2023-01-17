@@ -1,17 +1,17 @@
-use core::{default, ffi::c_void, ptr::null_mut};
+use core::ptr::null_mut;
 
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{
-        ahci_check_complete, ahci_request_packet_t, complete, completion, completion_init,
-        get_completion, kthread_create_on_node,
+        ahci_check_complete, ahci_request_packet_t, complete, completion, get_completion, wait_for_completion,
     },
     kBUG,
-    libs::spinlock::RawSpinlock,
+    libs::spinlock::RawSpinlock, kdebug,
 };
 
 ///  achi请求包
+#[derive(Debug)]
 pub struct AhciRequestPacket {
     pub ahci_ctrl_num: u8,
     pub port_num: u8,
@@ -35,6 +35,7 @@ impl Default for AhciRequestPacket {
 }
 
 /// io请求包
+#[derive(Debug)]
 pub struct BlockDeviceRequestPacket<T> {
     pub cmd: u8,
     pub lba_start: u64,
@@ -47,7 +48,6 @@ pub struct BlockDeviceRequestPacket<T> {
     pub private_ahci_request_packet: T,
     pub status: *mut completion,
 }
-
 impl<AhciRequestPacket> BlockDeviceRequestPacket<AhciRequestPacket> {
     pub fn new(
         ahci_request_packet: AhciRequestPacket,
@@ -133,7 +133,7 @@ impl SchedulerIO {
 pub static mut IO_SCHEDULER_PTR: *mut SchedulerIO = null_mut();
 
 #[inline]
-pub fn __get_cfs_scheduler() -> &'static mut SchedulerIO {
+pub fn __get_io_scheduler() -> &'static mut SchedulerIO {
     return unsafe { IO_SCHEDULER_PTR.as_mut().unwrap() };
 }
 
@@ -142,6 +142,7 @@ pub fn __get_cfs_scheduler() -> &'static mut SchedulerIO {
 pub unsafe extern "C" fn io_scheduler_init_rust() {
     if IO_SCHEDULER_PTR.is_null() {
         IO_SCHEDULER_PTR = Box::leak(Box::new(SchedulerIO::new()));
+        create_io_queue();
     } else {
         kBUG!("Try to init IO Scheduler twice.");
         panic!("Try to init IO Scheduler twice.");
@@ -150,8 +151,8 @@ pub unsafe extern "C" fn io_scheduler_init_rust() {
 
 /// @brief 初始化io请求队列
 #[no_mangle]
-pub extern "C" fn crate_io_queue() {
-    let io_scheduler = __get_cfs_scheduler();
+pub extern "C" fn create_io_queue() {
+    let io_scheduler = __get_io_scheduler();
     io_scheduler
         .io_queue
         .push(Box::leak(Box::new(RequestQueue::new())));
@@ -160,25 +161,25 @@ pub extern "C" fn crate_io_queue() {
 #[no_mangle]
 /// @brief 处理请求
 pub extern "C" fn address_requests() {
-    let io_scheduler = __get_cfs_scheduler();
+    let io_scheduler = __get_io_scheduler();
     let mut res: i32;
     let mut delete_index: Vec<usize> = Vec::new();
     //FIXME 暂时只考虑了一个io队列的情况
-
     loop {
         //检查 正在执行的请求包
         if io_scheduler.io_queue[0].processing_queue.len() != 0 {
+            kBUG!("processing_queue not empty");
             for (index, packet) in &mut (io_scheduler.io_queue[0].processing_queue)
                 .iter_mut()
                 .enumerate()
             {
-                unsafe {
-                    res = ahci_check_complete(
+                res = unsafe {
+                    ahci_check_complete(
                         packet.private_ahci_request_packet.port_num,
                         packet.private_ahci_request_packet.ahci_ctrl_num,
                         null_mut(),
-                    );
-                }
+                    )
+                };
                 if res == 0 {
                     //将状态设置为完成
                     unsafe { complete(packet.status) };
@@ -192,13 +193,13 @@ pub extern "C" fn address_requests() {
                 }
             }
         }
-
         //将等待中的请求包插入
         for i in 0..2 {
             if i >= io_scheduler.io_queue[0].waiting_queue.len() {
                 break;
             }
             if !io_scheduler.io_queue[0].lock.is_locked() {
+                kBUG!("push_processing_queue");
                 io_scheduler.io_queue[0].lock.lock();
                 if io_scheduler.io_queue[0].processing_queue.len() == 3
                     || io_scheduler.io_queue[0].waiting_queue.len() == 0
@@ -214,7 +215,7 @@ pub extern "C" fn address_requests() {
 }
 
 /// @brief 将c中的ahci_request_packet_t转换成rust中的BlockDeviceRequestPacket<AhciRequestPacket>
-pub fn crate_ahci_request(
+pub fn create_ahci_request(
     ahci_request_packet: &ahci_request_packet_t,
 ) -> BlockDeviceRequestPacket<AhciRequestPacket> {
     let cmpl: *mut completion = unsafe { get_completion() };
@@ -233,13 +234,19 @@ pub fn crate_ahci_request(
         lba_start: ahci_request_packet.blk_pak.LBA_start,
         status: cmpl,
     };
+    // kdebug!("{:?}", packet);
+    // kdebug!("0x{:16x}", packet.buffer_vaddr);
     return packet;
 }
 
 #[no_mangle]
 /// @brief 将ahci的io请求插入等待队列中
 pub extern "C" fn ahci_push_request(ahci_request_packet: &ahci_request_packet_t) {
-    let packet = crate_ahci_request(ahci_request_packet);
-    let io_scheduler = __get_cfs_scheduler();
+    let packet = create_ahci_request(ahci_request_packet);
+    let io_scheduler = __get_io_scheduler();
+    let status  = packet.status;
     io_scheduler.io_queue[0].push_waiting_queue(packet);
+    unsafe{
+        wait_for_completion(status);
+    }
 }

@@ -113,7 +113,7 @@ impl<T: BlockDevice> Device for T {
 /// @usage 某次操作读/写块设备的[L,R]范围内的字节，
 ///        那么可以使用此结构体进行迭代遍历，每次调用next()返回一个BlockRange
 pub struct BlockIter {
-    pub begin: usize, // 迭代器的起始位置 -> 块设备的地址
+    pub begin: usize, // 迭代器的起始位置 -> 块设备的地址 （单位是字节）
     pub end: usize,
     pub blk_size_log2: u8,
     pub multiblock: bool, // 是否启用连续整块同时遍历
@@ -126,7 +126,7 @@ pub struct BlockRange {
     pub lba_start: usize, // 起始块的lba_id
     pub lba_end: usize,   // 终止块的lba_id
     pub begin: usize, // 起始位置在块内的偏移量， 如果BlockIter启用Multiblock，则是多个块的偏移量
-    pub end: usize,   // 结束位置在块内的偏移量
+    pub end: usize,   // 结束位置在块内的偏移量，单位是字节
     pub blk_size_log2: u8,
 }
 
@@ -236,11 +236,11 @@ impl BlockRange {
         return self.len() >= (1usize << self.blk_size_log2)
             && (self.len() % (1usize << self.blk_size_log2) == 0);
     }
-    /// 获取 BlockRange 在块设备内部的起始位置
+    /// 获取 BlockRange 在块设备内部的起始位置 (单位是字节)
     pub fn origin_begin(&self) -> usize {
         return (self.lba_start << self.blk_size_log2) + self.begin;
     }
-    /// 获取 BlockRange 在块设备内部的结尾位置
+    /// 获取 BlockRange 在块设备内部的结尾位置 (单位是字节)
     pub fn origin_end(&self) -> usize {
         return (self.lba_start << self.blk_size_log2) + self.end;
     }

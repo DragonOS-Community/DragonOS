@@ -132,20 +132,20 @@ pub struct BlockRange {
 
 impl BlockIter {
     pub fn new(start_addr: usize, end_addr: usize, blk_size_log2: u8) -> BlockIter {
-        BlockIter {
+        return BlockIter {
             begin: start_addr,
             end: end_addr,
             blk_size_log2: blk_size_log2,
             multiblock: false,
-        }
+        };
     }
     pub fn new_multiblock(start_addr: usize, end_addr: usize, blk_size_log2: u8) -> BlockIter {
-        BlockIter {
+        return BlockIter {
             begin: start_addr,
             end: end_addr,
             blk_size_log2: blk_size_log2,
             multiblock: true,
-        }
+        };
     }
 
     /// 获取下一个整块或者不完整的块
@@ -162,13 +162,13 @@ impl BlockIter {
 
         self.begin += end - begin;
 
-        BlockRange {
+        return BlockRange {
             lba_start: lba_id,
             lba_end: lba_id + 1,
             begin: begin,
             end: end,
             blk_size_log2: blk_size_log2,
-        }
+        };
     }
 
     /// 如果能返回多个连续的整块，则返回；否则调用next_block()返回不完整的块
@@ -193,13 +193,13 @@ impl BlockIter {
 
         self.begin += end - begin;
 
-        BlockRange {
+        return BlockRange {
             lba_start: lba_start,
             lba_end: lba_end,
             begin: begin,
             end: end,
             blk_size_log2: blk_size_log2,
-        }
+        };
     }
 }
 
@@ -212,9 +212,9 @@ impl Iterator for BlockIter {
             return None;
         }
         if self.multiblock {
-            Some(self.next_multiblock())
+            return Some(self.next_multiblock());
         } else {
-            Some(self.next_block())
+            return Some(self.next_block());
         }
     }
 }
@@ -222,27 +222,27 @@ impl Iterator for BlockIter {
 /// BlockRange 函数实现
 impl BlockRange {
     pub fn is_empty(&self) -> bool {
-        self.end == self.begin
+        return self.end == self.begin;
     }
     pub fn len(&self) -> usize {
-        self.end - self.begin
+        return self.end - self.begin;
     }
     /// 判断是不是整块
     pub fn is_full(&self) -> bool {
-        self.len() == (1usize << self.blk_size_log2)
+        return self.len() == (1usize << self.blk_size_log2);
     }
     /// 判断是不是多个整块连在一起
     pub fn is_multi(&self) -> bool {
-        self.len() >= (1usize << self.blk_size_log2)
-            && self.len() % (1usize << self.blk_size_log2) == 0
+        return self.len() >= (1usize << self.blk_size_log2)
+            && (self.len() % (1usize << self.blk_size_log2) == 0);
     }
     /// 获取 BlockRange 在块设备内部的起始位置
     pub fn origin_begin(&self) -> usize {
-        (self.lba_start << self.blk_size_log2) + self.begin
+        return (self.lba_start << self.blk_size_log2) + self.begin;
     }
     /// 获取 BlockRange 在块设备内部的结尾位置
     pub fn origin_end(&self) -> usize {
-        (self.lba_start << self.blk_size_log2) + self.end
+        return (self.lba_start << self.blk_size_log2) + self.end;
     }
 }
 

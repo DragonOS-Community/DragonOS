@@ -28,7 +28,9 @@ pub trait BlockDevice: Send + Sync {
 impl<T: BlockDevice> Device for T {
     // 读取设备操作，读取设备内部 [offset, offset + buf.len) 区间内的字符，存放到 buf 中
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
-        assert!(len <= buf.len());
+        // assert!(len <= buf.len());
+        if len > buf.len() { return Err(-E2BIG); }
+
         let iter = BlockIter::new_multiblock(offset, offset + len, Self::BLK_SIZE_LOG2);
         let multi = iter.multiblock;
 
@@ -44,7 +46,11 @@ impl<T: BlockDevice> Device for T {
                 // 调用 BlockDevice::read_at() 直接把引用传进去，不是把整个数组move进去
                 BlockDevice::read_at(self, range.lba_start, count, buf_slice)?;
             } else {
-                assert!(Self::BLK_SIZE_LOG2 <= BLK_SIZE_LOG2_LIMIT);
+                // 判断块的长度不能超过最大值
+                if Self::BLK_SIZE_LOG2 > BLK_SIZE_LOG2_LIMIT {
+                    return Err(-E2BIG);
+                }
+
                 let mut temp = Box::new([0u8; 1 << BLK_SIZE_LOG2_LIMIT]);
                 BlockDevice::read_at(self, range.lba_start, 1, &mut *temp)?;
                 // 把数据从临时buffer复制到目标buffer
@@ -56,7 +62,9 @@ impl<T: BlockDevice> Device for T {
 
     /// 写入设备操作，把 buf 的数据写入到设备内部 [offset, offset + len) 区间内
     fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, i32> {
-        assert!(len <= buf.len());
+        // assert!(len <= buf.len());
+        if len > buf.len() { return Err(-E2BIG); }
+
         let iter = BlockIter::new_multiblock(offset, offset + len, Self::BLK_SIZE_LOG2);
         let multi = iter.multiblock;
 
@@ -70,7 +78,9 @@ impl<T: BlockDevice> Device for T {
             if full {
                 BlockDevice::write_at(self, range.lba_start, count, buf_slice)?;
             } else {
-                assert!(Self::BLK_SIZE_LOG2 <= BLK_SIZE_LOG2_LIMIT);
+                if Self::BLK_SIZE_LOG2 > BLK_SIZE_LOG2_LIMIT {
+                    return Err(-E2BIG);
+                }
                 let mut temp = Box::new([0u8; 1 << BLK_SIZE_LOG2_LIMIT]);
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
                 BlockDevice::read_at(self, range.lba_start, 1, &mut *temp)?;
@@ -166,9 +176,9 @@ impl BlockIter {
         }
 
         let begin = self.begin % blk_size; // 因为是多个整块，这里必然是0
-        assert!(begin == 0);
+                                           // assert!(begin == 0);
         let end = lba_id_to_addr(lba_end, blk_size) - self.begin;
-        assert!(end % blk_size == 0);
+        // assert!(end % blk_size == 0);
 
         self.begin += end - begin;
 

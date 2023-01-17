@@ -246,11 +246,13 @@ impl BlockRange {
 }
 
 /// 从字节地址转换到lba id
+#[inline]
 fn addr_to_lba_id(addr: usize, blk_size: usize) -> BlockId {
     return addr / blk_size;
 }
 
 /// 从lba id转换到字节地址
+#[inline]
 fn lba_id_to_addr(lba_id: usize, blk_size: usize) -> BlockId {
     return lba_id * blk_size;
 }

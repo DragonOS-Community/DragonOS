@@ -25,7 +25,6 @@ static uint64_t ahci_port_base_phys_addr; // 端口映射的物理基地址（ah
 static void start_cmd(HBA_PORT *port);
 static void stop_cmd(HBA_PORT *port);
 static void port_rebase(HBA_PORT *port, int portno);
-static long ahci_query_disk();
 
 // 计算HBA_MEM的虚拟内存地址
 #define cal_HBA_MEM_VIRT_ADDR(device_num) (AHCI_MAPPING_BASE + (ul)(((struct pci_device_structure_general_device_t *)(ahci_devs[device_num]))->BAR5 - ((((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5) & PAGE_2M_MASK)))
@@ -103,6 +102,7 @@ static int ahci_init_gendisk()
 
     MBR_read_partition_table(&ahci_gendisk0, ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table);
 
+    kdebug("ahci_gendisk0.private_data = %#018lx", ahci_gendisk0.private_data);
     struct MBR_disk_partition_table_t *ptable = ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table;
 
     // 求出可用分区数量
@@ -111,6 +111,7 @@ static int ahci_init_gendisk()
         // 分区可用
         if (ptable->DPTE[i].type != 0)
             ++ahci_gendisk0.part_cnt;
+        kdebug("ptable->DPTE[%d].type = %d", i, ptable->DPTE[i].type);
     }
     if (ahci_gendisk0.part_cnt)
     {
@@ -126,8 +127,8 @@ static int ahci_init_gendisk()
                 // 初始化分区结构体
                 ahci_gendisk0.partition[cnt].bd_disk = &ahci_gendisk0;
                 ahci_gendisk0.partition[cnt].bd_partno = cnt;
-                //FIXME 需要注释
-                // ahci_gendisk0.partition[cnt].bd_queue = &ahci_req_queue;
+                // FIXME 需要注释
+                //  ahci_gendisk0.partition[cnt].bd_queue = &ahci_req_queue;
                 ahci_gendisk0.partition[cnt].bd_sectors_num = ptable->DPTE[i].total_sectors;
                 ahci_gendisk0.partition[cnt].bd_start_sector = ptable->DPTE[i].starting_sector;
                 ahci_gendisk0.partition[cnt].bd_superblock = NULL; // 挂载文件系统时才会初始化superblock
@@ -136,7 +137,9 @@ static int ahci_init_gendisk()
             }
         }
     }
-
+    kdebug("part_cnt = %d", ahci_gendisk0.part_cnt);
+    kdebug("partition = %#018lx", ahci_gendisk0.partition);
+    kdebug("ahci_init_gendisk");
     return 0;
 };
 
@@ -577,7 +580,7 @@ void ahci_end_request()
     //     ahci_query_disk();
 }
 
-static long ahci_query_disk(struct ahci_request_packet_t *pack)
+long ahci_query_disk(struct ahci_request_packet_t *pack)
 {
     // wait_queue_node_t *wait_queue_tmp = container_of(list_next(&ahci_req_queue.wait_queue_list.wait_list), wait_queue_node_t, wait_list);
     // struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)container_of(wait_queue_tmp, struct block_device_request_packet, wait_queue);
@@ -632,6 +635,7 @@ static void ahci_submit(struct ahci_request_packet_t *pack)
  */
 static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, uint64_t count, uint64_t buf)
 {
+    kdebug("gd = %#018lx", gd);
     struct ahci_request_packet_t *pack = NULL;
     struct ahci_blk_private_data *pdata = (struct ahci_blk_private_data *)gd->private_data;
 
@@ -639,6 +643,9 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
     {
         pack = ahci_make_request(cmd, base_addr, count, buf, pdata->ahci_ctrl_num, pdata->ahci_port_num);
         ahci_push_request(pack);
+        kdebug("%d", *((int *)buf));
+
+
         kdebug("ahci_push_request,cmd =%d,ctrl_num = %d, port_num = %d", pack->blk_pak.cmd, pack->ahci_ctrl_num, pack->port_num);
         kdebug("buffer_vaddr =%#018lx,count = %d, device_type = %#018lx, end_handler = %d, lba = %d", pack->blk_pak.buffer_vaddr, pack->blk_pak.count, pack->blk_pak.device_type, pack->blk_pak.end_handler, pack->blk_pak.LBA_start);
 

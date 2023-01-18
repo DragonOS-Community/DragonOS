@@ -33,6 +33,7 @@ static mutex_t mut;
  */
 struct vfs_superblock_t *fat32_register_partition(struct block_device *blk_dev, uint8_t part_num)
 {
+    kdebug("blk_dev = %#018lx,part_num = %d", blk_dev, part_num);
     // 挂载文件系统到vfs
     return vfs_mount_fs("/", "FAT32", blk_dev);
 }
@@ -374,15 +375,13 @@ find_lookup_success:; // 找到目标dentry
 struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
 {
     mutex_lock(&mut);
-     kdebug("blk = %#018lx", blk);
-
+    kdebug("blk = %#018lx", blk);
+    // BUG
     // 读取文件系统的boot扇区
     uint8_t buf[512] = {0};
     kdebug("blk = %#018lx", blk);
 
     blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, blk->bd_start_LBA, 1, (uint64_t)&buf);
-    // BUG
-    kdebug("blk = %#018lx,request_count = %ld", blk, blk->bd_queue->request_count);
     // 分配超级块的空间
     struct vfs_superblock_t *sb_ptr = (struct vfs_superblock_t *)kzalloc(sizeof(struct vfs_superblock_t), 0);
     blk->bd_superblock = sb_ptr;

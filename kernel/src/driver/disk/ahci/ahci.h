@@ -422,3 +422,6 @@ HBA_PORT *ahci_get_port(uint8_t port_num, uint8_t ahci_ctrl_num);
  */
 int ahci_find_cmdslot(HBA_PORT *port);
 
+long ahci_query_disk(struct ahci_request_packet_t *pack);
+
+

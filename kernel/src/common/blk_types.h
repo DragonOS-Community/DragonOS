@@ -44,7 +44,7 @@ struct block_device_request_packet
     uint8_t device_type; // 0: ahci
     void (*end_handler)(ul num, ul arg);
 
-    wait_queue_node_t wait_queue;
+    // wait_queue_node_t wait_queue;
 };
 
 /**
@@ -53,7 +53,7 @@ struct block_device_request_packet
  */
 struct block_device_request_queue
 {
-    wait_queue_node_t wait_queue_list;
+    // wait_queue_node_t wait_queue_list;
     struct block_device_request_packet *in_service; // 正在请求的结点
     ul request_count;
 };
@@ -69,7 +69,7 @@ struct block_device
     sector_t bd_sectors_num;                     // 该分区的扇区数
     struct vfs_superblock_t *bd_superblock;      // 执行超级块的指针
     struct blk_gendisk *bd_disk;                 // 当前分区所属的磁盘
-    struct block_device_request_queue *bd_queue; // 请求队列
+    // struct block_device_request_queue *bd_queue; // 请求队列
     uint16_t bd_partno;                          // 在磁盘上的分区号
 };
 
@@ -87,7 +87,7 @@ struct blk_gendisk
     uint16_t flags;
     struct block_device *partition;                   // 磁盘分区数组
     const struct block_device_operation *fops;        // 磁盘操作
-    struct block_device_request_queue *request_queue; // 磁盘请求队列
+    // struct block_device_request_queue *request_queue; // 磁盘请求队列
     void *private_data;
 
     mutex_t open_mutex; // open()/close()操作的互斥锁

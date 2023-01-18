@@ -4,10 +4,11 @@ use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{
-        ahci_check_complete, ahci_request_packet_t, complete, completion, get_completion, wait_for_completion,
+        ahci_check_complete, ahci_query_disk, ahci_request_packet_t, complete, completion,
+        get_completion, wait_for_completion, block_device_request_packet,
     },
-    kBUG,
-    libs::spinlock::RawSpinlock, kdebug,
+    kBUG, kdebug,
+    libs::spinlock::RawSpinlock, driver::disk::ahci,
 };
 
 ///  achi请求包
@@ -117,6 +118,8 @@ impl RequestQueue {
         res = Some(self.processing_queue.remove(0));
         return res;
     }
+
+
 }
 
 pub struct SchedulerIO {
@@ -162,7 +165,7 @@ pub extern "C" fn create_io_queue() {
 /// @brief 处理请求
 pub extern "C" fn address_requests() {
     let io_scheduler = __get_io_scheduler();
-    let mut res: i32;
+    let mut res: i32 = -1;
     let mut delete_index: Vec<usize> = Vec::new();
     //FIXME 暂时只考虑了一个io队列的情况
     loop {
@@ -182,15 +185,34 @@ pub extern "C" fn address_requests() {
                 };
                 if res == 0 {
                     //将状态设置为完成
+                    kdebug!("ahci complete");
                     unsafe { complete(packet.status) };
                     delete_index.push(index);
                 }
             }
             //将已完成的包移出队列
             if delete_index.len() != 0 {
+                kdebug!("delete_index");
                 for i in &delete_index {
                     io_scheduler.io_queue[0].processing_queue.remove(*i);
                 }
+            }
+        }
+        //将等待中的请求包插入
+        for i in 0..2 {
+            if i >= io_scheduler.io_queue[0].processing_queue.len() {
+                break;
+            }
+            if !io_scheduler.io_queue[0].lock.is_locked() {
+                kBUG!("push_processing_queue");
+                io_scheduler.io_queue[0].lock.lock();
+
+                let packet = &io_scheduler.io_queue[0].processing_queue[i];
+                let mut ahci_packet:ahci_request_packet_t = switch_c_ahci_request(packet);
+                unsafe {
+                    ahci_query_disk(&mut ahci_packet);
+                }
+                io_scheduler.io_queue[0].lock.unlock();
             }
         }
         //将等待中的请求包插入
@@ -214,6 +236,24 @@ pub extern "C" fn address_requests() {
     }
 }
 
+pub fn switch_c_ahci_request(
+    pakcet: &BlockDeviceRequestPacket<AhciRequestPacket>,
+) -> ahci_request_packet_t {
+    // FIXME 类型转换
+    let mut ahci_packet:ahci_request_packet_t ;
+    ahci_packet.ahci_ctrl_num = pakcet.private_ahci_request_packet.ahci_ctrl_num;
+    ahci_packet.port_num =pakcet.private_ahci_request_packet.port_num;
+    let mut blk_pak:block_device_request_packet;
+    blk_pak.LBA_start = pakcet.lba_start;
+    blk_pak.cmd  = pakcet.cmd;
+    blk_pak.buffer_vaddr = pakcet.buffer_vaddr;
+    blk_pak.count  = pakcet.count;
+    blk_pak.device_type = pakcet.device_type;
+    blk_pak.end_handler = pakcet.end_handler;
+    ahci_packet.blk_pak = blk_pak;
+
+    return  ahci_packet;
+}
 /// @brief 将c中的ahci_request_packet_t转换成rust中的BlockDeviceRequestPacket<AhciRequestPacket>
 pub fn create_ahci_request(
     ahci_request_packet: &ahci_request_packet_t,
@@ -234,8 +274,8 @@ pub fn create_ahci_request(
         lba_start: ahci_request_packet.blk_pak.LBA_start,
         status: cmpl,
     };
-    // kdebug!("{:?}", packet);
-    // kdebug!("0x{:16x}", packet.buffer_vaddr);
+    kdebug!("{:?}", packet);
+    kdebug!("0x{:16x}", packet.buffer_vaddr);
     return packet;
 }
 
@@ -244,9 +284,12 @@ pub fn create_ahci_request(
 pub extern "C" fn ahci_push_request(ahci_request_packet: &ahci_request_packet_t) {
     let packet = create_ahci_request(ahci_request_packet);
     let io_scheduler = __get_io_scheduler();
-    let status  = packet.status;
+    let status = packet.status;
+    kdebug!("{:?}", packet);
+    kdebug!("0x{:16x}", packet.buffer_vaddr);
     io_scheduler.io_queue[0].push_waiting_queue(packet);
-    unsafe{
+    unsafe {
         wait_for_completion(status);
     }
+    kdebug!("wait_for_completion");
 }

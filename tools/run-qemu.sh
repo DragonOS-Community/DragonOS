@@ -9,7 +9,6 @@ ARCH="x86_64"
 # 请根据自己的需要，在-d 后方加入所需的trace事件
 
 # 标准的trace events
-qemu_trace_ahci=ahci*
 qemu_trace_std=cpu_reset,guest_errors,exec,cpu
 # 调试usb的trace
 qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace:usb_xhci_irq_msi,trace:usb_xhci_irq_msix,trace:usb_xhci_port_reset,trace:msix_write_config,trace:usb_xhci_irq_msix,trace:usb_xhci_irq_msix_use,trace:usb_xhci_irq_msix_unuse,trace:usb_xhci_irq_msi,trace:usb_xhci_*
@@ -24,7 +23,7 @@ QEMU_DISK_IMAGE="../bin/disk.img"
 QEMU_MEMORY="512M"
 QEMU_SMP="2,cores=2,threads=1,sockets=1"
 QEMU_MONITOR="stdio"
-QEMU_TRACE="${qemu_trace_std}","${qemu_trace_ahci}"
+QEMU_TRACE="${qemu_trace_std}"
 QEMU_CPU_FEATURES="IvyBridge,apic,x2apic,+fpu,check,${allflags}"
 QEMU_RTC_CLOCK="clock=host,base=localtime"
 QEMU_SERIAL="file:../serial_opt.txt"

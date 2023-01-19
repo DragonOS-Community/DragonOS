@@ -22,7 +22,6 @@ static int __fat32_search_long_short(struct vfs_index_node_t *parent_inode, cons
                                      struct fat32_slot_info *sinfo);
 static int fat32_detach_inode(struct vfs_index_node_t *inode);
 
-static mutex_t mut;
 /**
  * @brief 注册指定磁盘上的指定分区的fat32文件系统
  *
@@ -374,7 +373,6 @@ find_lookup_success:; // 找到目标dentry
  */
 struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
 {
-    mutex_lock(&mut);
     kdebug("blk = %#018lx", blk);
     // BUG
     // 读取文件系统的boot扇区
@@ -451,7 +449,6 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
     finode->create_date = 0;
     finode->write_date = 0;
     finode->write_time;
-    mutex_unlock(&mut);
     return sb_ptr;
 }
 
@@ -1412,8 +1409,7 @@ struct vfs_filesystem_type_t fat32_fs_type = {
 };
 void fat32_init()
 {
-    mutex_init(&mut);
-    mutex_lock(&mut);
+
     kinfo("Initializing FAT32...");
 
     // 在VFS中注册fat32文件系统
@@ -1423,5 +1419,4 @@ void fat32_init()
     // 挂载根文件系统
     fat32_register_partition(ahci_gendisk0.partition + 0, 0);
     kinfo("FAT32 initialized.");
-    mutex_unlock(&mut);
 }

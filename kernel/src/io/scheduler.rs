@@ -165,10 +165,10 @@ pub extern "C" fn create_io_queue() {
 pub extern "C" fn address_requests() {
     let io_scheduler = __get_io_scheduler();
     let mut res: i32 = -1;
-    let mut delete_index: Vec<usize> = Vec::new();
     //FIXME 暂时只考虑了一个io队列的情况
     loop {
         //请不要修改下面三个循环的顺序
+        let mut delete_index: Vec<usize> = Vec::new();
 
         //将等待中的请求包插入
         for i in 0..2 {
@@ -208,7 +208,7 @@ pub extern "C" fn address_requests() {
 
         //检查 正在执行的请求包
         if io_scheduler.io_queue[0].processing_queue.len() != 0 {
-            kBUG!("processing_queue not empty");
+            kdebug!("processing_queue not empty");
             for (index, packet) in &mut (io_scheduler.io_queue[0].processing_queue)
                 .iter_mut()
                 .enumerate()
@@ -223,6 +223,7 @@ pub extern "C" fn address_requests() {
                 if res == 0 {
                     //将状态设置为完成
                     kdebug!("ahci complete");
+                    kdebug!("{:?}", packet);
                     unsafe { complete(packet.status) };
                     delete_index.push(index);
                 }

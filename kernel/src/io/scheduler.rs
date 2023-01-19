@@ -3,12 +3,13 @@ use core::ptr::null_mut;
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
+    driver::disk::ahci,
     include::bindings::bindings::{
-        ahci_check_complete, ahci_query_disk, ahci_request_packet_t, complete, completion,
-        get_completion, wait_for_completion, block_device_request_packet,
+        ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
+        complete, completion, get_completion, wait_for_completion,
     },
     kBUG, kdebug,
-    libs::spinlock::RawSpinlock, driver::disk::ahci,
+    libs::spinlock::RawSpinlock,
 };
 
 ///  achi请求包
@@ -118,8 +119,6 @@ impl RequestQueue {
         res = Some(self.processing_queue.remove(0));
         return res;
     }
-
-
 }
 
 pub struct SchedulerIO {
@@ -169,6 +168,44 @@ pub extern "C" fn address_requests() {
     let mut delete_index: Vec<usize> = Vec::new();
     //FIXME 暂时只考虑了一个io队列的情况
     loop {
+        //请不要修改下面三个循环的顺序
+
+        //将等待中的请求包插入
+        for i in 0..2 {
+            if i >= io_scheduler.io_queue[0].waiting_queue.len() {
+                break;
+            }
+            if !io_scheduler.io_queue[0].lock.is_locked() {
+                kBUG!("push_processing_queue");
+                io_scheduler.io_queue[0].lock.lock();
+                if io_scheduler.io_queue[0].processing_queue.len() == 3
+                    || io_scheduler.io_queue[0].waiting_queue.len() == 0
+                {
+                    break;
+                }
+                let packet = io_scheduler.io_queue[0].pop_waiting_queue().unwrap();
+                io_scheduler.io_queue[0].push_processing_queue(packet);
+                io_scheduler.io_queue[0].lock.unlock();
+            }
+        }
+        //分发请求包
+        for i in 0..2 {
+            if i >= io_scheduler.io_queue[0].processing_queue.len() {
+                break;
+            }
+            if !io_scheduler.io_queue[0].lock.is_locked() {
+                kBUG!("send request");
+                io_scheduler.io_queue[0].lock.lock();
+
+                let packet = &io_scheduler.io_queue[0].processing_queue[i];
+                let mut ahci_packet: ahci_request_packet_t = switch_c_ahci_request(packet);
+                unsafe {
+                    ahci_query_disk(&mut ahci_packet);
+                }
+                io_scheduler.io_queue[0].lock.unlock();
+            }
+        }
+
         //检查 正在执行的请求包
         if io_scheduler.io_queue[0].processing_queue.len() != 0 {
             kBUG!("processing_queue not empty");
@@ -198,41 +235,6 @@ pub extern "C" fn address_requests() {
                 }
             }
         }
-        //将等待中的请求包插入
-        for i in 0..2 {
-            if i >= io_scheduler.io_queue[0].processing_queue.len() {
-                break;
-            }
-            if !io_scheduler.io_queue[0].lock.is_locked() {
-                kBUG!("push_processing_queue");
-                io_scheduler.io_queue[0].lock.lock();
-
-                let packet = &io_scheduler.io_queue[0].processing_queue[i];
-                let mut ahci_packet:ahci_request_packet_t = switch_c_ahci_request(packet);
-                unsafe {
-                    ahci_query_disk(&mut ahci_packet);
-                }
-                io_scheduler.io_queue[0].lock.unlock();
-            }
-        }
-        //将等待中的请求包插入
-        for i in 0..2 {
-            if i >= io_scheduler.io_queue[0].waiting_queue.len() {
-                break;
-            }
-            if !io_scheduler.io_queue[0].lock.is_locked() {
-                kBUG!("push_processing_queue");
-                io_scheduler.io_queue[0].lock.lock();
-                if io_scheduler.io_queue[0].processing_queue.len() == 3
-                    || io_scheduler.io_queue[0].waiting_queue.len() == 0
-                {
-                    break;
-                }
-                let packet = io_scheduler.io_queue[0].pop_waiting_queue().unwrap();
-                io_scheduler.io_queue[0].push_processing_queue(packet);
-                io_scheduler.io_queue[0].lock.unlock();
-            }
-        }
     }
 }
 
@@ -240,19 +242,20 @@ pub fn switch_c_ahci_request(
     pakcet: &BlockDeviceRequestPacket<AhciRequestPacket>,
 ) -> ahci_request_packet_t {
     // FIXME 类型转换
-    let mut ahci_packet:ahci_request_packet_t ;
-    ahci_packet.ahci_ctrl_num = pakcet.private_ahci_request_packet.ahci_ctrl_num;
-    ahci_packet.port_num =pakcet.private_ahci_request_packet.port_num;
-    let mut blk_pak:block_device_request_packet;
-    blk_pak.LBA_start = pakcet.lba_start;
-    blk_pak.cmd  = pakcet.cmd;
-    blk_pak.buffer_vaddr = pakcet.buffer_vaddr;
-    blk_pak.count  = pakcet.count;
-    blk_pak.device_type = pakcet.device_type;
-    blk_pak.end_handler = pakcet.end_handler;
-    ahci_packet.blk_pak = blk_pak;
-
-    return  ahci_packet;
+    let ahci_packet: ahci_request_packet_t = ahci_request_packet_t {
+        ahci_ctrl_num: pakcet.private_ahci_request_packet.ahci_ctrl_num,
+        port_num: pakcet.private_ahci_request_packet.port_num,
+        blk_pak: block_device_request_packet {
+            LBA_start: pakcet.lba_start,
+            cmd: pakcet.cmd,
+            buffer_vaddr: pakcet.buffer_vaddr,
+            count: pakcet.count,
+            device_type: pakcet.device_type,
+            end_handler: pakcet.end_handler,
+        },
+    };
+    kdebug!("{:?}", ahci_packet);
+    return ahci_packet;
 }
 /// @brief 将c中的ahci_request_packet_t转换成rust中的BlockDeviceRequestPacket<AhciRequestPacket>
 pub fn create_ahci_request(

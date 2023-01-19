@@ -588,7 +588,10 @@ long ahci_query_disk(struct ahci_request_packet_t *pack)
     // ahci_req_queue.in_service = (struct block_device_request_packet *)pack;
     // list_del(&(ahci_req_queue.in_service->wait_queue.wait_list));
     // --ahci_req_queue.request_count;
-    // kdebug("ahci_query_disk");
+    kdebug("ahci_query_disk");
+    kdebug("ahci_ctrl_num = %d,port_num = %d", pack->ahci_ctrl_num, pack->port_num);
+    kdebug("buffer_vaddr = %d,cmd = %d,count = %d", pack->blk_pak.buffer_vaddr, pack->blk_pak.cmd,pack->blk_pak,pack->blk_pak.count);
+    kdebug("device_type = %d,end_handler = %d,LBA_start = %d",pack->blk_pak.device_type,pack->blk_pak.end_handler,pack->blk_pak.LBA_start);
     long ret_val = 0;
     switch (pack->blk_pak.cmd)
     {
@@ -644,7 +647,6 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
         pack = ahci_make_request(cmd, base_addr, count, buf, pdata->ahci_ctrl_num, pdata->ahci_port_num);
         ahci_push_request(pack);
         kdebug("%d", *((int *)buf));
-
 
         kdebug("ahci_push_request,cmd =%d,ctrl_num = %d, port_num = %d", pack->blk_pak.cmd, pack->ahci_ctrl_num, pack->port_num);
         kdebug("buffer_vaddr =%#018lx,count = %d, device_type = %#018lx, end_handler = %d, lba = %d", pack->blk_pak.buffer_vaddr, pack->blk_pak.count, pack->blk_pak.device_type, pack->blk_pak.end_handler, pack->blk_pak.LBA_start);

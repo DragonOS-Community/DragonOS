@@ -3,17 +3,15 @@ use core::ptr::null_mut;
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    driver::disk::ahci,
     include::bindings::bindings::{
         ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
         complete, completion, get_completion, wait_for_completion,
     },
-    kBUG, kdebug,
+    kBUG,
     libs::spinlock::RawSpinlock,
 };
 
 ///  achi请求包
-#[derive(Debug)]
 pub struct AhciRequestPacket {
     pub ahci_ctrl_num: u8,
     pub port_num: u8,
@@ -37,7 +35,6 @@ impl Default for AhciRequestPacket {
 }
 
 /// io请求包
-#[derive(Debug)]
 pub struct BlockDeviceRequestPacket<T> {
     pub cmd: u8,
     pub lba_start: u64,
@@ -176,7 +173,6 @@ pub extern "C" fn address_requests() {
                 break;
             }
             if !io_scheduler.io_queue[0].lock.is_locked() {
-                kBUG!("push_processing_queue");
                 io_scheduler.io_queue[0].lock.lock();
                 if io_scheduler.io_queue[0].processing_queue.len() == 3
                     || io_scheduler.io_queue[0].waiting_queue.len() == 0
@@ -194,7 +190,6 @@ pub extern "C" fn address_requests() {
                 break;
             }
             if !io_scheduler.io_queue[0].lock.is_locked() {
-                kBUG!("send request");
                 io_scheduler.io_queue[0].lock.lock();
 
                 let packet = &io_scheduler.io_queue[0].processing_queue[i];
@@ -208,7 +203,6 @@ pub extern "C" fn address_requests() {
 
         //检查 正在执行的请求包
         if io_scheduler.io_queue[0].processing_queue.len() != 0 {
-            kdebug!("processing_queue not empty");
             for (index, packet) in &mut (io_scheduler.io_queue[0].processing_queue)
                 .iter_mut()
                 .enumerate()
@@ -222,15 +216,12 @@ pub extern "C" fn address_requests() {
                 };
                 if res == 0 {
                     //将状态设置为完成
-                    kdebug!("ahci complete");
-                    kdebug!("{:?}", packet);
                     unsafe { complete(packet.status) };
                     delete_index.push(index);
                 }
             }
             //将已完成的包移出队列
             if delete_index.len() != 0 {
-                kdebug!("delete_index");
                 for i in &delete_index {
                     io_scheduler.io_queue[0].processing_queue.remove(*i);
                 }
@@ -242,7 +233,6 @@ pub extern "C" fn address_requests() {
 pub fn switch_c_ahci_request(
     pakcet: &BlockDeviceRequestPacket<AhciRequestPacket>,
 ) -> ahci_request_packet_t {
-    // FIXME 类型转换
     let ahci_packet: ahci_request_packet_t = ahci_request_packet_t {
         ahci_ctrl_num: pakcet.private_ahci_request_packet.ahci_ctrl_num,
         port_num: pakcet.private_ahci_request_packet.port_num,
@@ -255,15 +245,14 @@ pub fn switch_c_ahci_request(
             end_handler: pakcet.end_handler,
         },
     };
-    kdebug!("{:?}", ahci_packet);
     return ahci_packet;
 }
+
 /// @brief 将c中的ahci_request_packet_t转换成rust中的BlockDeviceRequestPacket<AhciRequestPacket>
 pub fn create_ahci_request(
     ahci_request_packet: &ahci_request_packet_t,
 ) -> BlockDeviceRequestPacket<AhciRequestPacket> {
     let cmpl: *mut completion = unsafe { get_completion() };
-    //将c的ahci_request_packet_t 转换成rust BlockDeviceRequestPacket<AhciRequestPacket>
     let ahci_packet = AhciRequestPacket {
         ahci_ctrl_num: ahci_request_packet.ahci_ctrl_num,
         port_num: ahci_request_packet.port_num,
@@ -278,8 +267,7 @@ pub fn create_ahci_request(
         lba_start: ahci_request_packet.blk_pak.LBA_start,
         status: cmpl,
     };
-    kdebug!("{:?}", packet);
-    kdebug!("0x{:16x}", packet.buffer_vaddr);
+
     return packet;
 }
 
@@ -289,11 +277,8 @@ pub extern "C" fn ahci_push_request(ahci_request_packet: &ahci_request_packet_t)
     let packet = create_ahci_request(ahci_request_packet);
     let io_scheduler = __get_io_scheduler();
     let status = packet.status;
-    kdebug!("{:?}", packet);
-    kdebug!("0x{:16x}", packet.buffer_vaddr);
     io_scheduler.io_queue[0].push_waiting_queue(packet);
     unsafe {
         wait_for_completion(status);
     }
-    kdebug!("wait_for_completion");
 }

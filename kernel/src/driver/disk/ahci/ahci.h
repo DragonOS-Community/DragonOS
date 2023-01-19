@@ -408,7 +408,6 @@ void ahci_end_request();
  */
 int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, char *err);
 
-// FIXME ahci_ctrl_num注释
 /**
  * @brief 根据端口号获取端口结构体
  * @param port_num 端口号

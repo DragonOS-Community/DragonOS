@@ -342,15 +342,9 @@ static void port_rebase(HBA_PORT *port, int portno)
 static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf)
 {
     port->is = (uint32_t)-1; // Clear pending interrupt bits
-    kinfo("***********");
-    kdebug("ahci_read,startl =%d,starth = %d, count = %d,buf = %#018lx", startl, starth, count, buf);
-    kdebug("port, ci = %d, cmd = %d", port->ci, port->cmd);
 
     int spin = 0; // Spin lock timeout counter
     int slot = ahci_find_cmdslot(port);
-
-    kdebug("slot = %d", slot);
-    kinfo("***********");
 
     if (slot == -1)
         return E_NOEMPTYSLOT;
@@ -412,8 +406,6 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
 
     port->ci = 1 << slot; // Issue command
 
-    // current_pcb->flags |= PF_NEED_SCHED;
-
     return 0;
 }
 
@@ -439,7 +431,6 @@ int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, char *err)
 static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
                       uint64_t buf)
 {
-    // kdebug("ahci write");
     port->is = 0xffff; // Clear pending interrupt bits
     int slot = ahci_find_cmdslot(port);
     if (slot == -1)
@@ -485,10 +476,8 @@ static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
 
     cmdfis->countl = count & 0xff;
     cmdfis->counth = count >> 8;
-    //    printk("[slot]{%d}", slot);
     port->ci = 1; // Issue command
 
-    // current_pcb->flags |= PF_NEED_SCHED;
 
     return 0;
 }
@@ -533,8 +522,6 @@ long ahci_close()
 static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_addr, uint64_t count, uint64_t buffer, uint8_t ahci_ctrl_num, uint8_t port_num)
 {
     struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)kmalloc(sizeof(struct ahci_request_packet_t), 0);
-    // FIXME waitqueue
-    // wait_queue_init(&pack->blk_pak.wait_queue, current_pcb);
     pack->blk_pak.device_type = BLK_TYPE_AHCI;
 
     // 由于ahci不需要中断即可读取磁盘，因此end handler为空
@@ -563,36 +550,11 @@ static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_a
     return pack;
 }
 
-/**
- * @brief 结束磁盘请求
- *
- */
-void ahci_end_request()
-{
-    // ahci_req_queue.in_service->wait_queue.pcb->state = PROC_RUNNING;
-    // // ahci_req_queue.in_service->wait_queue.pcb->flags |= PF_NEED_SCHED;
-    // // current_pcb->flags |= PF_NEED_SCHED;
-    // kfree((uint64_t *)ahci_req_queue.in_service);
-    // ahci_req_queue.in_service = NULL;
 
-    // 进行下一轮的磁盘请求 （由于未实现单独的io调度器，这里会造成长时间的io等待）
-    // if (ahci_req_queue.request_count > 0)
-    //     ahci_query_disk();
-}
 
 long ahci_query_disk(struct ahci_request_packet_t *pack)
 {
-    // wait_queue_node_t *wait_queue_tmp = container_of(list_next(&ahci_req_queue.wait_queue_list.wait_list), wait_queue_node_t, wait_list);
-    // struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)container_of(wait_queue_tmp, struct block_device_request_packet, wait_queue);
 
-    // ahci_req_queue.in_service = (struct block_device_request_packet *)pack;
-    // list_del(&(ahci_req_queue.in_service->wait_queue.wait_list));
-    // --ahci_req_queue.request_count;
-    //BUG
-    kdebug("ahci_query_disk");
-    kdebug("ahci_ctrl_num = %d,port_num = %d", pack->ahci_ctrl_num, pack->port_num);
-    kdebug("buffer_vaddr = %#018lx,cmd = %d,count = %d", pack->blk_pak.buffer_vaddr, pack->blk_pak.cmd,pack->blk_pak.count);
-    kdebug("device_type = %d,end_handler = %d,LBA_start = %#018lx",pack->blk_pak.device_type,pack->blk_pak.end_handler,pack->blk_pak.LBA_start);
     long ret_val = 0;
     switch (pack->blk_pak.cmd)
     {
@@ -607,25 +569,11 @@ long ahci_query_disk(struct ahci_request_packet_t *pack)
         ret_val = E_UNSUPPORTED_CMD;
         break;
     }
-    // kdebug("ahci_query_disk: retval=%d", ret_val);
-    // ahci_end_request();
+
     return ret_val;
 }
 
-/**
- * @brief 将请求包提交到io队列
- *
- * @param pack
- */
-static void ahci_submit(struct ahci_request_packet_t *pack)
-{
-    // list_append(&(ahci_req_queue.wait_queue_list.wait_list), &(pack->blk_pak.wait_queue.wait_list));
-    // ++ahci_req_queue.request_count;
 
-    //  FIXME
-    // if (ahci_req_queue.in_service == NULL) // 当前没有正在请求的io包，立即执行磁盘请求
-    //     ahci_query_disk();
-}
 
 /**
  * @brief ahci驱动程序的传输函数
@@ -639,7 +587,6 @@ static void ahci_submit(struct ahci_request_packet_t *pack)
  */
 static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, uint64_t count, uint64_t buf)
 {
-    kdebug("gd = %#018lx", gd);
     struct ahci_request_packet_t *pack = NULL;
     struct ahci_blk_private_data *pdata = (struct ahci_blk_private_data *)gd->private_data;
 
@@ -647,11 +594,6 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
     {
         pack = ahci_make_request(cmd, base_addr, count, buf, pdata->ahci_ctrl_num, pdata->ahci_port_num);
         ahci_push_request(pack);
-
-        kdebug("ahci_push_request,cmd =%d,ctrl_num = %d, port_num = %d", pack->blk_pak.cmd, pack->ahci_ctrl_num, pack->port_num);
-        kdebug("buffer_vaddr =%#018lx,count = %d, device_type = %#018lx, end_handler = %d, lba = %d", pack->blk_pak.buffer_vaddr, pack->blk_pak.count, pack->blk_pak.device_type, pack->blk_pak.end_handler, pack->blk_pak.LBA_start);
-
-        // ahci_submit(pack);
     }
     else
     {
@@ -659,7 +601,6 @@ static long ahci_transfer(struct blk_gendisk *gd, long cmd, uint64_t base_addr, 
         return E_UNSUPPORTED_CMD;
     }
 
-    kdebug("ahci_transfer: AHCI_SUCCESS");
     return AHCI_SUCCESS;
 }
 

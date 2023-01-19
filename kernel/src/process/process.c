@@ -500,10 +500,6 @@ ul initial_kernel_thread(ul arg)
 
     scm_enable_double_buffer();
 
-    // TODO 测试io调度器
-    kinfo("*******io schduler init begin*******");
-    io_scheduler_init();
-    kinfo("*******io schduler init end*******");
     
     ahci_init();
     fat32_init();
@@ -654,11 +650,6 @@ void process_init()
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
 
-    /*
-    kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
-    kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
-    kdebug("initial_tss[0].ist1=%#018lx", initial_tss[0].ist1);
-*/
     // 初始化pid的写锁
 
     spin_init(&process_global_pid_write_lock);
@@ -719,7 +710,6 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
  */
 int process_wakeup(struct process_control_block *pcb)
 {
-    // kdebug("pcb pid = %#018lx", pcb->pid);
 
     BUG_ON(pcb == NULL);
     if (pcb == NULL)
@@ -807,7 +797,6 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
         vma = cur_vma->vm_next;
 
         uint64_t pa;
-        // kdebug("vm start=%#018lx, sem=%d", cur_vma->vm_start, cur_vma->anon_vma->sem.counter);
         mm_unmap_vma(pcb->mm, cur_vma, &pa);
 
         uint64_t size = (cur_vma->vm_end - cur_vma->vm_start);
@@ -881,7 +870,6 @@ int process_fd_alloc(struct vfs_file_t *file)
 
     for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
     {
-        // kdebug("currentpcb->fds[%d]=%#018lx", i, current_pcb->fds[i]);
         /* 找到指针数组中的空位 */
         if (current_pcb->fds[i] == NULL)
         {

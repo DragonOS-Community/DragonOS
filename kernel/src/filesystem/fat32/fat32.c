@@ -1414,9 +1414,6 @@ void fat32_init()
 
     // 在VFS中注册fat32文件系统
     vfs_register_filesystem(&fat32_fs_type);
-    // BUG
-    kdebug("vfs_register_filesystem");
     // 挂载根文件系统
     fat32_register_partition(ahci_gendisk0.partition + 0, 0);
-    kinfo("FAT32 initialized.");
 }

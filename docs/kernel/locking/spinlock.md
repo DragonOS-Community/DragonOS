@@ -71,6 +71,24 @@ let x :SpinLock<Vec<i32>>= SpinLock::new(Vec::new());
     kdebug!("x={:?}", x);
 ```
 
+&emsp;&emsp;对于结构体内部的变量，我们可以使用SpinLock进行细粒度的加锁，也就是使用SpinLock包裹需要细致加锁的成员变量，比如这样：
+
+```rust
+pub struct a {
+  pub data: SpinLock<data_struct>,
+}
+```
+
+&emsp;&emsp;当然，我们也可以对整个结构体进行加锁：
+
+```rust
+struct MyStruct {
+  pub data: data_struct,
+}
+/// 被全局加锁的结构体
+pub struct LockedMyStruct(SpinLock<MyStruct>);
+```
+
 ### 3.2. 原理
 
 &emsp;&emsp;`SpinLock`之所以能够实现编译期检查，是因为它引入了一个`SpinLockGuard`作为守卫。我们在编写代码的时候，保证只有调用`SpinLock`的`lock()`方法加锁后，才能生成一个`SpinLockGuard`。 并且，当我们想要访问受保护的数据的时候，都必须获得一个守卫。然后，我们为`SpinLockGuard`实现了`Drop` trait，当守卫的生命周期结束时，将会自动释放锁。除此以外，没有别的方法能够释放锁。因此我们能够得知，一个上下文中，只要`SpinLockGuard`的生命周期没有结束，那么它就拥有临界区数据的访问权，数据访问就是安全的。

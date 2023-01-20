@@ -126,7 +126,6 @@ static int ahci_init_gendisk()
                 ahci_gendisk0.partition[cnt].bd_disk = &ahci_gendisk0;
                 ahci_gendisk0.partition[cnt].bd_partno = cnt;
                 // FIXME 需要注释
-                //  ahci_gendisk0.partition[cnt].bd_queue = &ahci_req_queue;
                 ahci_gendisk0.partition[cnt].bd_sectors_num = ptable->DPTE[i].total_sectors;
                 ahci_gendisk0.partition[cnt].bd_start_sector = ptable->DPTE[i].starting_sector;
                 ahci_gendisk0.partition[cnt].bd_superblock = NULL; // 挂载文件系统时才会初始化superblock
@@ -534,7 +533,6 @@ static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_a
     pack->blk_pak.LBA_start = base_addr;
     pack->blk_pak.count = count;
     pack->blk_pak.buffer_vaddr = buffer;
-
     pack->ahci_ctrl_num = ahci_ctrl_num;
     pack->port_num = port_num;
     return pack;

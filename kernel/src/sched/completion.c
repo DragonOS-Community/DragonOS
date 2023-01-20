@@ -330,7 +330,7 @@ void __test_completion()
 /**
  * @brief rust 获取completion
  */
-struct completion *get_completion()
+struct completion *completion_alloc()
 {
     struct completion *cmpl = kzalloc(sizeof(struct completion), 0);
     completion_init(cmpl);

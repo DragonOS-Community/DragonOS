@@ -2,15 +2,15 @@
 CFLAGS += -I .
 
 
-kernel_process_objs:= $(shell find ./*.c)
+kernel_io_objs:= $(shell find ./*.c)
 
 ECHO:
 	@echo "$@"
 
-$(kernel_process_objs): ECHO
+$(kernel_io_objs): ECHO
 	$(CC) $(CFLAGS) -c $@ -o $@.o
 
-all: $(kernel_process_objs)
+all: $(kernel_io_objs)
 
 
 clean:

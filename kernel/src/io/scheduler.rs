@@ -5,7 +5,7 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     include::bindings::bindings::{
         ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
-        complete, completion, get_completion, wait_for_completion,
+        complete, completion, completion_alloc, wait_for_completion,
     },
     kBUG,
     libs::spinlock::RawSpinlock,
@@ -51,7 +51,7 @@ impl<AhciRequestPacket> BlockDeviceRequestPacket<AhciRequestPacket> {
     pub fn new(
         ahci_request_packet: AhciRequestPacket,
     ) -> BlockDeviceRequestPacket<AhciRequestPacket> {
-        let cmpl: *mut completion = unsafe { get_completion() };
+        let cmpl: *mut completion = unsafe { completion_alloc() };
 
         return BlockDeviceRequestPacket {
             cmd: Default::default(),
@@ -159,7 +159,7 @@ pub extern "C" fn create_io_queue() {
 
 #[no_mangle]
 /// @brief 处理请求
-pub extern "C" fn address_requests() {
+pub extern "C" fn io_scheduler_address_requests() {
     let io_scheduler = __get_io_scheduler();
     let mut res: i32 = -1;
     //FIXME 暂时只考虑了一个io队列的情况
@@ -193,7 +193,7 @@ pub extern "C" fn address_requests() {
                 io_scheduler.io_queue[0].lock.lock();
 
                 let packet = &io_scheduler.io_queue[0].processing_queue[i];
-                let mut ahci_packet: ahci_request_packet_t = switch_c_ahci_request(packet);
+                let mut ahci_packet: ahci_request_packet_t = convert_c_ahci_request(packet);
                 unsafe {
                     ahci_query_disk(&mut ahci_packet);
                 }
@@ -230,7 +230,7 @@ pub extern "C" fn address_requests() {
     }
 }
 
-pub fn switch_c_ahci_request(
+pub fn convert_c_ahci_request(
     pakcet: &BlockDeviceRequestPacket<AhciRequestPacket>,
 ) -> ahci_request_packet_t {
     let ahci_packet: ahci_request_packet_t = ahci_request_packet_t {
@@ -252,7 +252,7 @@ pub fn switch_c_ahci_request(
 pub fn create_ahci_request(
     ahci_request_packet: &ahci_request_packet_t,
 ) -> BlockDeviceRequestPacket<AhciRequestPacket> {
-    let cmpl: *mut completion = unsafe { get_completion() };
+    let cmpl: *mut completion = unsafe { completion_alloc() };
     let ahci_packet = AhciRequestPacket {
         ahci_ctrl_num: ahci_request_packet.ahci_ctrl_num,
         port_num: ahci_request_packet.port_num,

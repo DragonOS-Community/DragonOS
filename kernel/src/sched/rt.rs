@@ -73,12 +73,11 @@ impl RTQueue {
             res = Some(self.queue.pop().unwrap());
         } else {
             // 如果队列为空，则返回None
-            res=None;
+            res = None;
         }
         self.lock.unlock();
         return res;
     }
-
 }
 
 /// @brief RT调度器类
@@ -110,7 +109,7 @@ impl SchedulerRT {
         for i in 0..SchedulerRT::MAX_RT_PRIO {
             let cpu_queue_i: &mut RTQueue = self.cpu_queue[i as usize];
             let proc: Option<&'static mut process_control_block> = cpu_queue_i.dequeue();
-            if proc.is_some(){
+            if proc.is_some() {
                 return proc;
             }
         }

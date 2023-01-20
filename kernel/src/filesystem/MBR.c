@@ -13,6 +13,5 @@ struct MBR_disk_partition_table_t MBR_partition_tables[MBR_MAX_AHCI_CTRL_NUM][MB
  */
 int MBR_read_partition_table(struct blk_gendisk *gd, void *buf)
 {
-    kdebug("gd = %#018lx",gd);
     return gd->fops->transfer(gd, AHCI_CMD_READ_DMA_EXT, 0, 1, (uint64_t)buf);
 }

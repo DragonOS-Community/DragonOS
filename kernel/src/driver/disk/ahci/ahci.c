@@ -102,7 +102,6 @@ static int ahci_init_gendisk()
 
     MBR_read_partition_table(&ahci_gendisk0, ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table);
 
-    kdebug("ahci_gendisk0.private_data = %#018lx", ahci_gendisk0.private_data);
     struct MBR_disk_partition_table_t *ptable = ((struct ahci_blk_private_data *)ahci_gendisk0.private_data)->part_table;
 
     // 求出可用分区数量
@@ -111,7 +110,6 @@ static int ahci_init_gendisk()
         // 分区可用
         if (ptable->DPTE[i].type != 0)
             ++ahci_gendisk0.part_cnt;
-        kdebug("ptable->DPTE[%d].type = %d", i, ptable->DPTE[i].type);
     }
     if (ahci_gendisk0.part_cnt)
     {
@@ -137,9 +135,7 @@ static int ahci_init_gendisk()
             }
         }
     }
-    kdebug("part_cnt = %d", ahci_gendisk0.part_cnt);
-    kdebug("partition = %#018lx", ahci_gendisk0.partition);
-    kdebug("ahci_init_gendisk");
+
     return 0;
 };
 
@@ -177,11 +173,6 @@ void ahci_init()
     ahci_port_base_vaddr = (uint64_t)kmalloc(1048576, 0);
     kdebug("ahci_port_base_vaddr=%#018lx", ahci_port_base_vaddr);
     ahci_probe_port(0);
-
-    // // 初始化请求队列
-    // ahci_req_queue.in_service = NULL;
-    // wait_queue_init(&ahci_req_queue.wait_queue_list, NULL);
-    // ahci_req_queue.request_count = 0;
 
     BUG_ON(ahci_init_gendisk() != 0);
     kinfo("AHCI initialized.");
@@ -478,7 +469,6 @@ static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t
     cmdfis->counth = count >> 8;
     port->ci = 1; // Issue command
 
-
     return 0;
 }
 
@@ -550,8 +540,6 @@ static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_a
     return pack;
 }
 
-
-
 long ahci_query_disk(struct ahci_request_packet_t *pack)
 {
 
@@ -572,8 +560,6 @@ long ahci_query_disk(struct ahci_request_packet_t *pack)
 
     return ret_val;
 }
-
-
 
 /**
  * @brief ahci驱动程序的传输函数

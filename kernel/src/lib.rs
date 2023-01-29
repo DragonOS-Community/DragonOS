@@ -1,5 +1,6 @@
 #![no_std] // <1>
 #![no_main] // <1>
+#![feature(const_mut_refs)]
 #![feature(core_intrinsics)] // <2>
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]

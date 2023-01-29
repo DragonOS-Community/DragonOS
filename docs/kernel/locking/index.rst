@@ -10,4 +10,5 @@
    locks
    spinlock
    lockref
+   mutex
 

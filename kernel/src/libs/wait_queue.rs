@@ -34,10 +34,10 @@ struct InnerWaitQueue {
 
 /// 被自旋锁保护的等待队列
 #[derive(Debug)]
-pub struct LockedWaitQueue(SpinLock<InnerWaitQueue>);
+pub struct WaitQueue(SpinLock<InnerWaitQueue>);
 
-impl LockedWaitQueue {
-    pub const INIT: LockedWaitQueue = LockedWaitQueue(SpinLock::new(InnerWaitQueue::INIT));
+impl WaitQueue {
+    pub const INIT: WaitQueue = WaitQueue(SpinLock::new(InnerWaitQueue::INIT));
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {
@@ -125,6 +125,11 @@ impl LockedWaitQueue {
         } else {
             return false;
         }
+    }
+
+    /// @brief 获得当前等待队列的大小
+    pub fn len(&self)->usize{
+        return self.0.lock().wait_list.len();
     }
 }
 

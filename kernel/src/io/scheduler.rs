@@ -218,10 +218,9 @@ pub extern "C" fn io_scheduler_address_requests() {
         //请不要修改下面三个循环的顺序
 
         //将等待中的请求包插入
+        let size = io_scheduler.io_queue[0].waiting_queue.len();
         for i in 0..16 {
-            if i >= io_scheduler.io_queue[0].waiting_queue.len()
-                || io_scheduler.io_queue[0].processing_queue.len() == 16
-            {
+            if i >= size || io_scheduler.io_queue[0].processing_queue.len() == 16 {
                 break;
             }
             compiler_fence(core::sync::atomic::Ordering::SeqCst);

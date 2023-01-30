@@ -1,8 +1,14 @@
-/// 该文件定义了 DeviceOp 和 BlockDeviceOp 的接口
+use crate::include::bindings::bindings::E2BIG;
+/// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
 
+// 使用方法:
+// 假设 blk_dev 是块设备
+// <blk_dev as Device>::read_at() 调用的是Device的函数
+// <blk_dev as BlockDevice>::read_at() 调用的是BlockDevice的函数
+
 /// 引入Module
-use crate::include::bindings::bindings::E2BIG;
+use alloc::vec::Vec;
 
 /// 定义类型
 pub type BlockId = usize;
@@ -11,53 +17,56 @@ pub type BlockId = usize;
 const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1 << 12.
 
 /// @brief 设备应该实现的操作
-/// @usage DeviceOp::read_at()
-pub trait DeviceOp: Send + Sync {
+/// @usage Device::read_at()
+pub trait Device: Send + Sync {
     /// Notice buffer对应设备按字节划分，使用u8类型
     /// Notice offset应该从0开始计数
 
     /// @brief: 从设备的第offset个字节开始，读取len个byte，存放到buf中
     /// @parameter offset: 起始字节偏移量
-    /// @parameter len: 读取字节的数量 
-    /// @parameter buf: 目标数组 
+    /// @parameter len: 读取字节的数量
+    /// @parameter buf: 目标数组
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32>;
-    
+
     /// @brief: 从设备的第offset个字节开始，把buf数组的len个byte，写入到设备中
     /// @parameter offset: 起始字节偏移量
-    /// @parameter len: 读取字节的数量 
-    /// @parameter buf: 目标数组 
+    /// @parameter len: 读取字节的数量
+    /// @parameter buf: 目标数组
     fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, i32>;
 
     /// @brief: 同步信息，把所有的dirty数据写回设备 - 待实现
     fn sync(&self) -> Result<(), i32>;
 
-    /// TODO: 待实现 open, close
+    // TODO: 待实现 open, close
+}
+
+/// @brief 块设备必须定义块大小
+pub trait BlockSize {
+    const BLK_SIZE_LOG2: u8; // 需要保证块设备的块大小是2的幂次 - 块大小是‘硬编码’
 }
 
 /// @brief 块设备应该实现的操作
-pub trait BlockDeviceOp: Send + Sync {
-    const BLK_SIZE_LOG2: u8; // 需要保证块设备的块大小是2的幂次
-
+pub trait BlockDevice: Send + Sync {
     /// @brief: 在块设备中，从第lba_id_start个块开始，读取count个块数据，存放到buf中
-    /// @parameter lba_id_start: 起始块 
-    /// @parameter count: 读取块的数量 
-    /// @parameter buf: 目标数组 
+    /// @parameter lba_id_start: 起始块
+    /// @parameter count: 读取块的数量
+    /// @parameter buf: 目标数组
     fn read_at(&self, lba_id_start: BlockId, count: usize, buf: &mut [u8]) -> Result<usize, i32>;
 
     /// @brief: 在块设备中，从第lba_id_start个块开始，把buf中的count个块数据，存放到设备中
-    /// @parameter lba_id_start: 起始块 
-    /// @parameter count: 写入块的数量 
-    /// @parameter buf: 目标数组 
+    /// @parameter lba_id_start: 起始块
+    /// @parameter count: 写入块的数量
+    /// @parameter buf: 目标数组
     fn write_at(&self, lba_id_start: BlockId, count: usize, buf: &[u8]) -> Result<usize, i32>;
 
     /// @brief: 同步磁盘信息，把所有的dirty数据写回硬盘 - 待实现
     fn sync(&self) -> Result<(), i32>;
 
-    /// TODO: 待实现 open, close
+    // TODO: 待实现 open, close
 }
 
-/// 对于所有块设备自动实现 DeviceOp Trait 的 read_at 和 write_at 函数
-impl<T: BlockDeviceOp> DeviceOp for T {
+/// 对于所有<块设备>自动实现 Device Trait 的 read_at 和 write_at 函数
+impl<T: BlockDevice + BlockSize> Device for T {
     // 读取设备操作，读取设备内部 [offset, offset + buf.len) 区间内的字符，存放到 buf 中
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
         // assert!(len <= buf.len());
@@ -77,8 +86,8 @@ impl<T: BlockDeviceOp> DeviceOp for T {
             let full = multi && range.is_multi() || !multi && range.is_full();
 
             if full {
-                // 调用 BlockDeviceOp::read_at() 直接把引用传进去，不是把整个数组move进去
-                BlockDeviceOp::read_at(self, range.lba_start, count, buf_slice)?;
+                // 调用 BlockDevice::read_at() 直接把引用传进去，不是把整个数组move进去
+                BlockDevice::read_at(self, range.lba_start, count, buf_slice)?;
             } else {
                 // 判断块的长度不能超过最大值
                 if Self::BLK_SIZE_LOG2 > BLK_SIZE_LOG2_LIMIT {
@@ -87,7 +96,7 @@ impl<T: BlockDeviceOp> DeviceOp for T {
 
                 let mut temp = Vec::new();
                 temp.resize(1usize << Self::BLK_SIZE_LOG2, 0);
-                BlockDeviceOp::read_at(self, range.lba_start, 1, &mut temp[..])?;
+                BlockDevice::read_at(self, range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
                 buf_slice.copy_from_slice(&temp[range.begin..range.end]);
             }
@@ -113,7 +122,7 @@ impl<T: BlockDeviceOp> DeviceOp for T {
             let full = multi && range.is_multi() || !multi && range.is_full();
 
             if full {
-                BlockDeviceOp::write_at(self, range.lba_start, count, buf_slice)?;
+                BlockDevice::write_at(self, range.lba_start, count, buf_slice)?;
             } else {
                 if Self::BLK_SIZE_LOG2 > BLK_SIZE_LOG2_LIMIT {
                     return Err(-(E2BIG as i32));
@@ -122,10 +131,10 @@ impl<T: BlockDeviceOp> DeviceOp for T {
                 let mut temp = Vec::new();
                 temp.resize(1usize << Self::BLK_SIZE_LOG2, 0);
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
-                BlockDeviceOp::read_at(self, range.lba_start, 1, &mut temp[..])?;
+                BlockDevice::read_at(self, range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
                 temp[range.begin..range.end].copy_from_slice(&buf_slice);
-                BlockDeviceOp::write_at(self, range.lba_start, 1, &temp[..])?;
+                BlockDevice::write_at(self, range.lba_start, 1, &temp[..])?;
             }
         }
         return Ok(len);
@@ -133,7 +142,7 @@ impl<T: BlockDeviceOp> DeviceOp for T {
 
     /// 数据同步
     fn sync(&self) -> Result<(), i32> {
-        BlockDeviceOp::sync(self)
+        BlockDevice::sync(self)
     }
 }
 

@@ -1,13 +1,15 @@
-use core::ptr::null_mut;
+use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
+    arch::{asm::current::current_pcb, mm::barrier::mfence, sched::sched},
     include::bindings::bindings::{
         ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
-        complete, completion, completion_alloc, wait_for_completion,
+        complete, completion, completion_alloc, process_control_block, process_wakeup,
+        process_wakeup_immediately, usleep, wait_for_completion, PROC_RUNNING, schedule_timeout_ms,
     },
-    kBUG,
+    kBUG, kdebug,
     libs::spinlock::RawSpinlock,
 };
 
@@ -161,9 +163,25 @@ pub extern "C" fn create_io_queue() {
 /// @brief 处理请求
 pub extern "C" fn io_scheduler_address_requests() {
     let io_scheduler = __get_io_scheduler();
+
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let mut res: i32 = -1;
     //FIXME 暂时只考虑了一个io队列的情况
     loop {
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        if io_scheduler.io_queue[0].waiting_queue.len() == 0
+            && io_scheduler.io_queue[0].processing_queue.len() == 0
+        {
+            // kdebug!("sched out");
+            unsafe {
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                schedule_timeout_ms(10);
+                // sched();
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            // compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         //请不要修改下面三个循环的顺序
         let mut delete_index: Vec<usize> = Vec::new();
 
@@ -172,7 +190,8 @@ pub extern "C" fn io_scheduler_address_requests() {
             if i >= io_scheduler.io_queue[0].waiting_queue.len() {
                 break;
             }
-            if !io_scheduler.io_queue[0].lock.is_locked() {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            // if !io_scheduler.io_queue[0].lock.is_locked() {
                 io_scheduler.io_queue[0].lock.lock();
                 if io_scheduler.io_queue[0].processing_queue.len() == 3
                     || io_scheduler.io_queue[0].waiting_queue.len() == 0
@@ -182,31 +201,39 @@ pub extern "C" fn io_scheduler_address_requests() {
                 let packet = io_scheduler.io_queue[0].pop_waiting_queue().unwrap();
                 io_scheduler.io_queue[0].push_processing_queue(packet);
                 io_scheduler.io_queue[0].lock.unlock();
-            }
+            // }
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         //分发请求包
         for i in 0..2 {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
             if i >= io_scheduler.io_queue[0].processing_queue.len() {
                 break;
             }
-            if !io_scheduler.io_queue[0].lock.is_locked() {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            // if !io_scheduler.io_queue[0].lock.is_locked() {
                 io_scheduler.io_queue[0].lock.lock();
-
+                
                 let packet = &io_scheduler.io_queue[0].processing_queue[i];
                 let mut ahci_packet: ahci_request_packet_t = convert_c_ahci_request(packet);
                 unsafe {
+                    compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     ahci_query_disk(&mut ahci_packet);
+                    compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 }
                 io_scheduler.io_queue[0].lock.unlock();
-            }
+            // }
         }
 
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         //检查 正在执行的请求包
         if io_scheduler.io_queue[0].processing_queue.len() != 0 {
             for (index, packet) in &mut (io_scheduler.io_queue[0].processing_queue)
                 .iter_mut()
                 .enumerate()
             {
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 res = unsafe {
                     ahci_check_complete(
                         packet.private_ahci_request_packet.port_num,
@@ -214,19 +241,35 @@ pub extern "C" fn io_scheduler_address_requests() {
                         null_mut(),
                     )
                 };
+
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 if res == 0 {
                     //将状态设置为完成
-                    unsafe { complete(packet.status) };
+                    mfence();
+                    unsafe {
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                        complete(packet.status);
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                    }
+                    mfence();
                     delete_index.push(index);
                 }
             }
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
             //将已完成的包移出队列
             if delete_index.len() != 0 {
+                // kdebug!("detete {} packets", delete_index.len());
                 for i in &delete_index {
                     io_scheduler.io_queue[0].processing_queue.remove(*i);
                 }
             }
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
+
+        mfence();
+
+        
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -277,8 +320,12 @@ pub extern "C" fn ahci_push_request(ahci_request_packet: &ahci_request_packet_t)
     let packet = create_ahci_request(ahci_request_packet);
     let io_scheduler = __get_io_scheduler();
     let status = packet.status;
+    io_scheduler.io_queue[0].lock.lock();
     io_scheduler.io_queue[0].push_waiting_queue(packet);
+    io_scheduler.io_queue[0].lock.unlock();
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     unsafe {
         wait_for_completion(status);
     }
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }

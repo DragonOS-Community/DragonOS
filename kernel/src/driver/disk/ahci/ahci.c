@@ -510,7 +510,7 @@ long ahci_close()
  */
 static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_addr, uint64_t count, uint64_t buffer, uint8_t ahci_ctrl_num, uint8_t port_num)
 {
-    struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)kmalloc(sizeof(struct ahci_request_packet_t), 0);
+    struct ahci_request_packet_t *pack = (struct ahci_request_packet_t *)kzalloc(sizeof(struct ahci_request_packet_t), 0);
     pack->blk_pak.device_type = BLK_TYPE_AHCI;
 
     // 由于ahci不需要中断即可读取磁盘，因此end handler为空

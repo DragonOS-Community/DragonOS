@@ -1,5 +1,5 @@
 use super::libs::lockref::LockRef;
-use device::BlockDeviceOp;
+use device_op::BlockDeviceOp;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 pub type sector_t = u64;

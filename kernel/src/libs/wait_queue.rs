@@ -11,7 +11,8 @@ use crate::{
 
 use super::{
     list::list_init,
-    spinlock::{SpinLock, SpinLockGuard}, mutex::MutexGuard,
+    mutex::MutexGuard,
+    spinlock::{SpinLock, SpinLockGuard},
 };
 
 impl Default for wait_queue_head_t {
@@ -126,6 +127,7 @@ impl LockedWaitQueue {
         }
     }
 }
+
 impl InnerWaitQueue {
     pub const INIT: InnerWaitQueue = InnerWaitQueue {
         wait_list: LinkedList::new(),

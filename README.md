@@ -96,6 +96,8 @@
 
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
+- 叶锦毅
+- 林
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 - slientbard

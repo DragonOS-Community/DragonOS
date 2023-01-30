@@ -210,7 +210,6 @@ pub extern "C" fn io_scheduler_address_requests() {
             unsafe {
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 schedule_timeout_ms(10);
-                // sched();
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
             // compiler_fence(core::sync::atomic::Ordering::SeqCst);

@@ -408,7 +408,8 @@ int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, int8_t slot, ch
 
     HBA_PORT *port = ahci_get_port(port_num, ahci_ctrl_num);
     int retval = -EBUSY;
-
+    if(slot == -1)
+        retval = -EINVAL;
     // In some longer duration reads, it may be helpful to spin on the DPS bit
     // in the PxIS port field as well (1 << 5)
     if ((port->ci & (1 << slot)) == 0)

@@ -329,7 +329,7 @@ static void port_rebase(HBA_PORT *port, int portno)
  * @return true done
  * @return false failed
  */
-static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf)
+static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf, int8_t *ret_slot)
 {
     port->is = (uint32_t)-1; // Clear pending interrupt bits
 
@@ -338,6 +338,10 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
 
     if (slot == -1)
         return E_NOEMPTYSLOT;
+    if (ret_slot)
+    {
+        *ret_slot = slot;
+    }
 
     HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER *)phys_2_virt(port->clb);
     cmdheader += slot;
@@ -399,33 +403,36 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
     return 0;
 }
 
-int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, char *err)
+int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, int8_t slot, char *err)
 {
 
     HBA_PORT *port = ahci_get_port(port_num, ahci_ctrl_num);
-    int slot = ahci_find_cmdslot(port);
-    int retval = AHCI_SUCCESS;
+    int retval = -EBUSY;
 
     // In some longer duration reads, it may be helpful to spin on the DPS bit
     // in the PxIS port field as well (1 << 5)
     if ((port->ci & (1 << slot)) == 0)
-        return retval;
+        retval = 0;
     if (port->is & HBA_PxIS_TFES) // Task file error
     {
-        kerror(*err);
+        if (err != NULL)
+            kerror(*err);
         retval = E_TASK_FILE_ERROR;
     }
     return retval;
 }
 
 static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
-                      uint64_t buf)
+                      uint64_t buf, int8_t *ret_slot)
 {
     port->is = 0xffff; // Clear pending interrupt bits
     int slot = ahci_find_cmdslot(port);
     if (slot == -1)
         return E_NOEMPTYSLOT;
-
+    if (ret_slot)
+    {
+        *ret_slot = slot;
+    }
     HBA_CMD_HEADER *cmdheader = (HBA_CMD_HEADER *)phys_2_virt(port->clb);
 
     cmdheader += slot;
@@ -538,17 +545,17 @@ static struct ahci_request_packet_t *ahci_make_request(long cmd, uint64_t base_a
     return pack;
 }
 
-long ahci_query_disk(struct ahci_request_packet_t *pack)
+long ahci_query_disk(struct ahci_request_packet_t *pack, int8_t *ret_slot)
 {
 
     long ret_val = 0;
     switch (pack->blk_pak.cmd)
     {
     case AHCI_CMD_READ_DMA_EXT:
-        ret_val = ahci_read(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->blk_pak.LBA_start & 0xFFFFFFFF, ((pack->blk_pak.LBA_start) >> 32) & 0xFFFFFFFF, pack->blk_pak.count, pack->blk_pak.buffer_vaddr);
+        ret_val = ahci_read(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->blk_pak.LBA_start & 0xFFFFFFFF, ((pack->blk_pak.LBA_start) >> 32) & 0xFFFFFFFF, pack->blk_pak.count, pack->blk_pak.buffer_vaddr, ret_slot);
         break;
     case AHCI_CMD_WRITE_DMA_EXT:
-        ret_val = ahci_write(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->blk_pak.LBA_start & 0xFFFFFFFF, ((pack->blk_pak.LBA_start) >> 32) & 0xFFFFFFFF, pack->blk_pak.count, pack->blk_pak.buffer_vaddr);
+        ret_val = ahci_write(&(ahci_devices[pack->ahci_ctrl_num].hba_mem->ports[pack->port_num]), pack->blk_pak.LBA_start & 0xFFFFFFFF, ((pack->blk_pak.LBA_start) >> 32) & 0xFFFFFFFF, pack->blk_pak.count, pack->blk_pak.buffer_vaddr, ret_slot);
         break;
     default:
         kerror("Unsupport ahci command: %#05lx", pack->blk_pak.cmd);

@@ -7,7 +7,7 @@ use crate::{
     include::bindings::bindings::{
         ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
         complete, completion, completion_alloc, process_control_block, process_wakeup,
-        process_wakeup_immediately, usleep, wait_for_completion, PROC_RUNNING, schedule_timeout_ms,
+        process_wakeup_immediately, schedule_timeout_ms, usleep, wait_for_completion, PROC_RUNNING,
     },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
@@ -17,6 +17,7 @@ use crate::{
 pub struct AhciRequestPacket {
     pub ahci_ctrl_num: u8,
     pub port_num: u8,
+    pub slot: i8,
 }
 
 impl AhciRequestPacket {
@@ -32,6 +33,7 @@ impl Default for AhciRequestPacket {
         AhciRequestPacket {
             ahci_ctrl_num: 0,
             port_num: Default::default(),
+            slot: -1,
         }
     }
 }
@@ -118,6 +120,39 @@ impl RequestQueue {
         res = Some(self.processing_queue.remove(0));
         return res;
     }
+
+    ///  @brief 将已完成请求包从执行队列中弹出
+    pub fn pop_finished_packets(&mut self) {
+        if self.processing_queue.len() != 0 {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            //将状态设置为完成
+            mfence();
+            let filter = |packet: &mut BlockDeviceRequestPacket<AhciRequestPacket>| {
+                let mut res = unsafe {
+                    ahci_check_complete(
+                        packet.private_ahci_request_packet.port_num,
+                        packet.private_ahci_request_packet.ahci_ctrl_num,
+                        packet.private_ahci_request_packet.slot,
+                        null_mut(),
+                    )
+                };
+                if res == 0 {
+                    unsafe {
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+                        // kdebug!("{:?}\n", packet.private_ahci_request_packet);
+                        complete(packet.status);
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                    }
+                    return true;
+                }
+                return false;
+            };
+            self.processing_queue.drain_filter(filter);
+            mfence();
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 pub struct SchedulerIO {
@@ -165,7 +200,6 @@ pub extern "C" fn io_scheduler_address_requests() {
     let io_scheduler = __get_io_scheduler();
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    let mut res: i32 = -1;
     //FIXME 暂时只考虑了一个io队列的情况
     loop {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -183,92 +217,37 @@ pub extern "C" fn io_scheduler_address_requests() {
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         //请不要修改下面三个循环的顺序
-        let mut delete_index: Vec<usize> = Vec::new();
 
         //将等待中的请求包插入
-        for i in 0..2 {
-            if i >= io_scheduler.io_queue[0].waiting_queue.len() {
-                break;
-            }
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            // if !io_scheduler.io_queue[0].lock.is_locked() {
-                io_scheduler.io_queue[0].lock.lock();
-                if io_scheduler.io_queue[0].processing_queue.len() == 3
-                    || io_scheduler.io_queue[0].waiting_queue.len() == 0
-                {
-                    break;
-                }
-                let packet = io_scheduler.io_queue[0].pop_waiting_queue().unwrap();
-                io_scheduler.io_queue[0].push_processing_queue(packet);
-                io_scheduler.io_queue[0].lock.unlock();
-            // }
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        }
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        //分发请求包
-        for i in 0..2 {
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            if i >= io_scheduler.io_queue[0].processing_queue.len() {
-                break;
-            }
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            // if !io_scheduler.io_queue[0].lock.is_locked() {
-                io_scheduler.io_queue[0].lock.lock();
-                
-                let packet = &io_scheduler.io_queue[0].processing_queue[i];
-                let mut ahci_packet: ahci_request_packet_t = convert_c_ahci_request(packet);
-                unsafe {
-                    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                    ahci_query_disk(&mut ahci_packet);
-                    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                }
-                io_scheduler.io_queue[0].lock.unlock();
-            // }
-        }
-
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        //检查 正在执行的请求包
-        if io_scheduler.io_queue[0].processing_queue.len() != 0 {
-            for (index, packet) in &mut (io_scheduler.io_queue[0].processing_queue)
-                .iter_mut()
-                .enumerate()
+        for i in 0..16 {
+            if i >= io_scheduler.io_queue[0].waiting_queue.len()
+                || io_scheduler.io_queue[0].processing_queue.len() == 16
             {
-                compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                res = unsafe {
-                    ahci_check_complete(
-                        packet.private_ahci_request_packet.port_num,
-                        packet.private_ahci_request_packet.ahci_ctrl_num,
-                        null_mut(),
-                    )
-                };
-
-                compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                if res == 0 {
-                    //将状态设置为完成
-                    mfence();
-                    unsafe {
-                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                        complete(packet.status);
-                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                    }
-                    mfence();
-                    delete_index.push(index);
-                }
+                break;
             }
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            //将已完成的包移出队列
-            if delete_index.len() != 0 {
-                // kdebug!("detete {} packets", delete_index.len());
-                for i in &delete_index {
-                    io_scheduler.io_queue[0].processing_queue.remove(*i);
-                }
+            // if !io_scheduler.io_queue[0].lock.is_locked() {
+            io_scheduler.io_queue[0].lock.lock();
+            let mut packet = io_scheduler.io_queue[0].pop_waiting_queue().unwrap();
+            //分发请求包
+            let mut ahci_packet: ahci_request_packet_t = convert_c_ahci_request(&packet);
+            let mut ret_slot: i8 = -1;
+            unsafe {
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                ahci_query_disk(&mut ahci_packet, &mut ret_slot);
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
+            packet.private_ahci_request_packet.slot = ret_slot;
+            io_scheduler.io_queue[0].push_processing_queue(packet);
+            io_scheduler.io_queue[0].lock.unlock();
+            // }
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
+        io_scheduler.io_queue[0].pop_finished_packets();
         mfence();
 
-        
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -299,6 +278,7 @@ pub fn create_ahci_request(
     let ahci_packet = AhciRequestPacket {
         ahci_ctrl_num: ahci_request_packet.ahci_ctrl_num,
         port_num: ahci_request_packet.port_num,
+        slot: -1,
     };
     let packet = BlockDeviceRequestPacket {
         private_ahci_request_packet: ahci_packet,

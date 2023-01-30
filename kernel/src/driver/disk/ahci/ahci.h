@@ -382,7 +382,7 @@ static void ahci_probe_port(const uint32_t device_num);
  * @param buf buffer
  * @return success 0
  */
-static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf);
+static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf, int8_t *ret_slot);
 
 /**
  * @brief write data to SATA device using 48bit LBA address
@@ -395,7 +395,7 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
  * @return success 0
  */
 static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
-                      uint64_t buf);
+                      uint64_t buf, int8_t *ret_slot);
 
 void ahci_end_request();
 
@@ -406,7 +406,7 @@ void ahci_end_request();
  * @param ahci_ctrl_num ahci控制号
  * @param err 错误信息
  */
-int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, char *err);
+int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, int8_t slot, char *err);
 
 /**
  * @brief 根据端口号获取端口结构体
@@ -425,4 +425,4 @@ int ahci_find_cmdslot(HBA_PORT *port);
  * @brief 读取磁盘信息
  * @param pack io请求包
  */
-long ahci_query_disk(struct ahci_request_packet_t *pack);
+long ahci_query_disk(struct ahci_request_packet_t *pack, int8_t *ret_slot);

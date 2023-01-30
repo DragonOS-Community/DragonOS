@@ -1,7 +1,10 @@
-#include <libc/src/unistd.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/ctype.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <libsystem/syscall.h>
+#include <signal.h>
+
+extern void _fini();
 
 int abs(int i)
 {
@@ -53,5 +56,17 @@ int atoi(const char *str)
  */
 void exit(int status)
 {
+    _fini();
     syscall_invoke(SYS_EXIT, status, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * @brief 通过发送SIGABRT，从而退出当前进程
+ *
+ */
+void abort()
+{
+    // step1：设置SIGABRT的处理函数为SIG_DFL
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
 }

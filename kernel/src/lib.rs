@@ -4,21 +4,26 @@
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]
 #![feature(drain_filter)] // 允许Vec的drain_filter特性
-
+#![feature(c_void_variant)] //not stable, used in /home/su/Documents/VSCode/DragonOS/kernel/src/exception/softirq.rs
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 use core::panic::PanicInfo;
 
+/// 导出x86_64架构相关的代码，命名为arch模块
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64/mod.rs"]
 #[macro_use]
 mod arch;
+
+mod driver;
+mod filesystem;
 #[macro_use]
 mod include;
 mod ipc;
-
 #[macro_use]
 mod libs;
-mod driver;
+mod exception;
 mod mm;
 mod process;
 mod sched;
@@ -31,7 +36,7 @@ use mm::allocator::KernelAllocator;
 
 // <3>
 use crate::{
-    arch::x86_64::asm::current::current_pcb,
+    arch::asm::current::current_pcb,
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
 };
 

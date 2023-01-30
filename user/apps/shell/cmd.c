@@ -1,17 +1,17 @@
 #include "cmd.h"
 #include "cmd_help.h"
 #include "cmd_test.h"
-#include <libc/src/dirent.h>
-#include <libc/src/errno.h>
-#include <libc/src/fcntl.h>
-#include <libc/src/include/signal.h>
-#include <libc/src/stddef.h>
-#include <libc/src/stdio.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/string.h>
-#include <libc/src/sys/stat.h>
-#include <libc/src/sys/wait.h>
-#include <libc/src/unistd.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <libsystem/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
@@ -529,7 +529,7 @@ int shell_cmd_kill(int argc, char **argv)
         retval = -EINVAL;
         goto out;
     }
-    retval = syscall_invoke(SYS_KILL, atoi(argv[1]), SIGKILL, 0, 0, 0, 0, 0, 0);
+    retval = kill(atoi(argv[1]), SIGKILL);
 out:;
     free(argv);
     return retval;

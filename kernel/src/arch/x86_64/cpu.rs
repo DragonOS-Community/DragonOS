@@ -14,3 +14,10 @@ pub fn arch_current_apic_id() -> u8 {
     }
     return (cpuid_res >> 24) as u8;
 }
+
+/// @brief 通过pause指令，让cpu休息一会儿。降低空转功耗
+pub fn cpu_relax() {
+    unsafe {
+        asm!("pause");
+    }
+}

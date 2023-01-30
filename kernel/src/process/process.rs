@@ -1,11 +1,9 @@
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::{
-    arch::x86_64::asm::current::current_pcb,
-    include::bindings::bindings::{
-        process_control_block, sched_enqueue, PROC_RUNNING, PROC_STOPPED,
-    },
-    sched::core::cpu_executing,
+    arch::asm::current::current_pcb,
+    include::bindings::bindings::{process_control_block, PROC_RUNNING, PROC_STOPPED},
+    sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
 };
 
@@ -76,7 +74,6 @@ pub extern "C" fn process_wake_up_state(pcb: *mut process_control_block, state: 
     return process_try_to_wake_up(pcb, state, 0);
 }
 
-
 /// @brief 让一个正在cpu上运行的进程陷入内核
 pub fn process_kick(pcb: *mut process_control_block) {
     preempt_disable();
@@ -99,5 +96,5 @@ pub fn process_cpu(pcb: *const process_control_block) -> u32 {
 /// @param pcb 进程的pcb
 #[inline]
 pub fn process_is_executing(pcb: *const process_control_block) -> bool {
-    return cpu_executing(process_cpu(pcb)) == pcb;
+    return cpu_executing(process_cpu(pcb)) as *const process_control_block == pcb;
 }

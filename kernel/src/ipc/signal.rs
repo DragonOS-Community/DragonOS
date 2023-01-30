@@ -1,7 +1,7 @@
 use core::{ffi::c_void, intrinsics::size_of, ptr::read_volatile, sync::atomic::compiler_fence};
 
 use crate::{
-    arch::x86_64::{
+    arch::{
         asm::{bitops::ffz, current::current_pcb, ptrace::user_mode},
         interrupt::sti,
     },
@@ -64,6 +64,7 @@ pub static DEFAULT_SIGACTION_IGNORE: sigaction = sigaction {
 pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     let pid: pid_t = regs.r8 as pid_t;
     let sig: SignalNumber = SignalNumber::from(regs.r9 as i32);
+
     if sig == SignalNumber::INVALID {
         // 传入的signal数值不合法
         kwarn!("Not a valid signal number");
@@ -86,29 +87,43 @@ pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     };
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    let retval = signal_kill_something_info(sig, Some(&mut info), pid) as u64;
-
+    let retval = signal_kill_something_info(sig, Some(&mut info), pid);
+    let x;
+    if retval.is_ok() {
+        x = retval.unwrap();
+    } else {
+        x = retval.unwrap_err();
+    }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return retval;
+
+    return x as u64;
 }
 
 /// 通过kill的方式向目标进程发送信号
 /// @param sig 要发送的信号
 /// @param info 要发送的信息
 /// @param pid 进程id（目前只支持pid>0)
-fn signal_kill_something_info(sig: SignalNumber, info: Option<&mut siginfo>, pid: pid_t) -> i32 {
+fn signal_kill_something_info(
+    sig: SignalNumber,
+    info: Option<&mut siginfo>,
+    pid: pid_t,
+) -> Result<i32, i32> {
     // 暂时不支持特殊的kill操作
     if pid <= 0 {
         kwarn!("Kill operation not support: pid={}", pid);
-        return -(ENOTSUP as i32);
+        return Err(-(ENOTSUP as i32));
     }
 
     // kill单个进程
     return signal_kill_proc_info(sig, info, pid);
 }
 
-fn signal_kill_proc_info(sig: SignalNumber, info: Option<&mut siginfo>, pid: pid_t) -> i32 {
-    let mut retval: i32 = -(ESRCH as i32);
+fn signal_kill_proc_info(
+    sig: SignalNumber,
+    info: Option<&mut siginfo>,
+    pid: pid_t,
+) -> Result<i32, i32> {
+    let mut retval = Err(-(ESRCH as i32));
 
     // step1: 当进程管理模块拥有pcblist_lock之后，对其加锁
 
@@ -147,16 +162,16 @@ fn signal_send_sig_info(
     sig: SignalNumber,
     info: Option<&mut siginfo>,
     target_pcb: &mut process_control_block,
-) -> i32 {
+) -> Result<i32, i32> {
     // kdebug!("signal_send_sig_info");
     // 检查sig是否符合要求，如果不符合要求，则退出。
     if !verify_signal(sig) {
-        return -(EINVAL as i32);
+        return Err(-(EINVAL as i32));
     }
 
     // 信号符合要求，可以发送
 
-    let mut retval = -(ESRCH as i32);
+    let mut retval = Err(-(ESRCH as i32));
     let mut flags: u64 = 0;
     // 如果上锁成功，则发送信号
     if !lock_process_sighand(target_pcb, &mut flags).is_none() {
@@ -214,7 +229,7 @@ fn send_signal_locked(
     info: Option<&mut siginfo>,
     pcb: &mut process_control_block,
     pt: PidType,
-) -> i32 {
+) -> Result<i32, i32> {
     // 是否强制发送信号
     let mut force_send = false;
     // signal的信息为空
@@ -240,13 +255,12 @@ fn send_signal_locked(
 /// @return i32 错误码
 fn __send_signal_locked(
     sig: SignalNumber,
-    _info: Option<&mut siginfo>,
+    info: Option<&mut siginfo>,
     pcb: &mut process_control_block,
     pt: PidType,
     _force_send: bool,
-) -> i32 {
+) -> Result<i32, i32> {
     // kdebug!("__send_signal_locked");
-    let mut retval = 0;
 
     // 判断该进入该函数时，是否已经持有了锁
     assert!(spin_is_locked(unsafe { &(*pcb.sighand).siglock }));
@@ -257,11 +271,26 @@ fn __send_signal_locked(
     if sig == SignalNumber::SIGKILL || (pcb.flags & (PF_KTHREAD as u64)) != 0 {
         complete_signal(sig, pcb, pt);
     } else {
-        // todo: 如果是其他信号，则加入到sigqueue内，然后complete_signal
-        retval = -(ENOTSUP as i32);
+        // 如果是其他信号，则加入到sigqueue内，然后complete_signal
+        let mut q: siginfo;
+        match info {
+            Some(x) => {
+                // 已经显式指定了siginfo，则直接使用它。
+                q = x.clone();
+            }
+            None => {
+                // 不需要显示指定siginfo，因此设置为默认值
+                q = siginfo::new(sig, 0, si_code_val::SI_USER);
+                q._sinfo.data._sifields._kill._pid = current_pcb().pid;
+            }
+        }
+
+        let sq: &mut SigQueue = SigQueue::from_c_void(current_pcb().sig_pending.sigqueue);
+        sq.q.push(q);
+        complete_signal(sig, pcb, pt);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return retval;
+    return Ok(0);
 }
 
 /// @brief 将信号添加到目标进程的sig_pending。在引入进程组后，本函数还将负责把信号传递给整个进程组。
@@ -407,8 +436,7 @@ pub extern "C" fn do_signal(regs: &mut pt_regs) {
 
     // 做完上面的检查后，开中断
     sti();
-    // return;
-    // kdebug!("do_signal");
+
     let oldset = current_pcb().sig_blocked;
     loop {
         let (sig_number, info, ka) = get_signal_to_deliver(regs.clone());
@@ -790,7 +818,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
         }
         let mask: sigset_t = unsafe { (*act).sa_mask };
         let _input_sah = unsafe { (*act).sa_handler as u64 };
-
+        // kdebug!("_input_sah={}", _input_sah);
         match _input_sah {
             USER_SIG_DFL | USER_SIG_IGN => {
                 if _input_sah == USER_SIG_DFL {
@@ -818,6 +846,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
                 };
             }
         }
+        // kdebug!("new_ka={:?}", new_ka);
         // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
         if new_ka.sa_restorer != NULL as u64 {
             new_ka.sa_flags |= SA_FLAG_RESTORER;
@@ -875,6 +904,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
             (*old_act).sa_restorer = old_ka.sa_restorer as *mut c_void;
         }
     }
+
     return retval as u64;
 }
 
@@ -946,8 +976,7 @@ fn do_sigaction(
             let mut mask: sigset_t = 0;
             sigset_clear(&mut mask);
             sigset_add(&mut mask, sig);
-            let sq = pcb.sig_pending.sigqueue as *mut SigQueue;
-            let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
+            let sq: &mut SigQueue = SigQueue::from_c_void(pcb.sig_pending.sigqueue);
             sq.flush_by_mask(&mask);
 
             // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
@@ -966,11 +995,6 @@ pub fn sigmask(sig: SignalNumber) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn sys_rt_sigreturn(regs: &mut pt_regs) -> u64 {
-    // kdebug!(
-    //     "sigreturn, pid={}, regs.rsp=0x{:018x}",
-    //     current_pcb().pid,
-    //     regs.rsp
-    // );
     let frame = regs.rsp as usize as *mut sigframe;
 
     // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）

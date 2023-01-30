@@ -1,4 +1,4 @@
-#include "wait.h"
+#include <sys/wait.h>
 #include <libsystem/syscall.h>
 
 /**

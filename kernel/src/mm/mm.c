@@ -196,7 +196,7 @@ void mm_init()
     memory_management_struct.zones_struct_len = (memory_management_struct.count_zones * sizeof(struct Zone) + sizeof(ul) - 1) & (~(sizeof(ul) - 1));
 
     ZONE_DMA_INDEX = 0;
-    ZONE_NORMAL_INDEX = 0;
+    ZONE_NORMAL_INDEX = memory_management_struct.count_zones ;
     ZONE_UNMAPPED_INDEX = 0;
 
     // kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
@@ -323,7 +323,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
         break;
     }
 
-    for (int i = zone_start; i <= zone_end; ++i)
+    for (int i = zone_start; i < zone_end; ++i)
     {
         if ((memory_management_struct.zones_struct + i)->count_pages_free < num)
             continue;

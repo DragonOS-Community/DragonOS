@@ -1,9 +1,9 @@
 #include "sys_version.h"    // 这是系统的版本头文件，在编译过程中自动生成
-#include <libc/src/math.h>
-#include <libc/src/stdio.h>
-#include <libc/src/stdlib.h>
-#include <libc/src/time.h>
-#include <libc/src/unistd.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 void print_ascii_logo()
 {
@@ -19,7 +19,7 @@ void print_copyright()
     printf(" DragonOS - An opensource operating system.\n");
     printf(" Copyright: fslongjin & DragonOS Community. 2022, All rights reserved.\n");
     printf(" Version: ");
-    put_string("V0.1.2\n", COLOR_GREEN, COLOR_BLACK);
+    put_string("V0.1.3\n", COLOR_GREEN, COLOR_BLACK);
     printf(" Git commit SHA1: %s\n", DRAGONOS_GIT_COMMIT_SHA1);
     printf(" Build time: %s %s\n", __DATE__, __TIME__);
     printf(" \nYou can visit the project via:\n");

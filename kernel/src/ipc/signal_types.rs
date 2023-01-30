@@ -93,9 +93,9 @@ pub const SA_ALL_FLAGS: u64 = SA_FLAG_IGN | SA_FLAG_DFL | SA_FLAG_RESTORER | SA_
 // ============ sigaction结构体中的的sa_flags的可选值 end ===========
 
 /// 用户态程序传入的SIG_DFL的值
-pub const USER_SIG_DFL: u64 = 1u64 << 0;
+pub const USER_SIG_DFL: u64 = 0;
 /// 用户态程序传入的SIG_IGN的值
-pub const USER_SIG_IGN: u64 = 1u64 << 1;
+pub const USER_SIG_IGN: u64 = 1;
 
 /**
  * @brief 信号处理结构体
@@ -544,6 +544,13 @@ impl SigQueue {
             drop(x)
         }
     }
+
+    /// @brief 从C的void*指针转换为static生命周期的可变引用
+    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue {
+        let sq = p as *mut SigQueue;
+        let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
+        return sq;
+    }
 }
 
 impl Default for SigQueue {
@@ -587,7 +594,7 @@ pub fn sigset_delmask(set: &mut sigset_t, mask: u64) {
 /// @brief 判断两个sigset是否相等
 #[inline]
 pub fn sigset_equal(a: &sigset_t, b: &sigset_t) -> bool {
-    if _NSIG_U64_CNT == 1{
+    if _NSIG_U64_CNT == 1 {
         return *a == *b;
     }
     return false;

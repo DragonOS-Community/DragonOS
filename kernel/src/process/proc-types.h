@@ -3,6 +3,7 @@
 #include <DragonOS/signal.h>
 #include <common/wait_queue.h>
 #include <DragonOS/stdint.h>
+#include "ptrace.h"
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -104,6 +105,7 @@ struct process_control_block
     long pid;
     long priority;           // 优先级
     int64_t virtual_runtime; // 虚拟运行时间
+    int64_t rt_time_slice;  // 由实时调度器管理的时间片
 
     // 进程拥有的文件描述符的指针数组
     // todo: 改用动态指针数组
@@ -128,6 +130,7 @@ struct process_control_block
     sigset_t sig_blocked;
     // 正在等待的信号的标志位，表示某个信号正在等待处理
     struct sigpending sig_pending;
+
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

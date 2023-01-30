@@ -2,10 +2,6 @@
 
 #define __PTRACE_H__
 
-/*
-
-*/
-
 struct pt_regs
 {
     unsigned long r15;
@@ -36,9 +32,9 @@ struct pt_regs
 
 /**
  * @brief 判断pt_regs是否来自用户态
- * 
- * @param regs 
- * @return __always_inline 
+ *
+ * @param regs
+ * @return __always_inline
  */
 static inline int user_mode(struct pt_regs *regs)
 {

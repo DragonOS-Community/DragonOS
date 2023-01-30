@@ -21,8 +21,8 @@
 #include <exception/gate.h>
 #include <filesystem/devfs/devfs.h>
 #include <filesystem/fat32/fat32.h>
-#include <filesystem/rootfs/rootfs.h>
 #include <filesystem/procfs/procfs.h>
+#include <filesystem/rootfs/rootfs.h>
 #include <ktest/ktest.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
@@ -122,6 +122,18 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
 }
 #pragma GCC pop_options
+
+/**
+ * @brief 切换进程的fs、gs寄存器
+ * 注意，fs、gs的值在return的时候才会生效，因此本函数不能简化为一个单独的宏
+ * @param fs 目标fs值
+ * @param gs 目标gs值
+ */
+void process_switch_fsgs(uint64_t fs, uint64_t gs)
+{
+    asm volatile("movq	%0,	%%fs \n\t" ::"a"(fs));
+    asm volatile("movq	%0,	%%gs \n\t" ::"a"(gs));
+}
 
 /**
  * @brief 打开要执行的程序文件
@@ -398,6 +410,8 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     // 关闭之前的文件描述符
     process_exit_files(current_pcb);
 
+    process_open_stdio(current_pcb);
+
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
@@ -456,6 +470,22 @@ exec_failed:;
 #pragma GCC pop_options
 
 /**
+ * @brief 初始化实时进程rt_pcb
+ *
+ * @return 初始化后的进程
+ *
+ */
+struct process_control_block *process_init_rt_pcb(struct process_control_block *rt_pcb)
+{
+    // 暂时将实时进程的优先级设置为10
+    rt_pcb->priority = 10;
+    rt_pcb->policy = SCHED_RR;
+    rt_pcb->rt_time_slice = 80;
+    rt_pcb->virtual_runtime = 0x7fffffffffffffff;
+    return rt_pcb;
+}
+
+/**
  * @brief 内核init进程
  *
  * @param arg
@@ -494,6 +524,12 @@ ul initial_kernel_thread(ul arg)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
 
+    // 测试实时进程
+
+    // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
+    // kdebug("process:rt test kthread is created!!!!");
+
+
     // 准备切换到用户态
     struct pt_regs *regs;
 
@@ -504,6 +540,7 @@ ul initial_kernel_thread(ul arg)
     current_pcb->thread->fs = USER_DS | 0x3;
     barrier();
     current_pcb->thread->gs = USER_DS | 0x3;
+    process_switch_fsgs(current_pcb->thread->fs, current_pcb->thread->gs);
 
     // 主动放弃内核线程身份
     current_pcb->flags &= (~PF_KTHREAD);
@@ -513,7 +550,7 @@ ul initial_kernel_thread(ul arg)
     // kdebug("current_pcb->thread->rsp=%#018lx", current_pcb->thread->rsp);
     current_pcb->flags = 0;
     // 将返回用户层的代码压入堆栈，向rdx传入regs的地址，然后jmp到do_execve这个系统调用api的处理函数
-    // 这里的设计思路和switch_proc类似 加载用户态程序：shell.elf
+    // 这里的设计思路和switch_to类似 加载用户态程序：shell.elf
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
                          "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
@@ -627,6 +664,10 @@ void process_init()
 
     // 初始化init进程的signal相关的信息
     initial_proc_init_signal(current_pcb);
+
+    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
+    process_open_stdio(current_pcb);
+
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
     barrier();
@@ -711,11 +752,13 @@ int process_wakeup_immediately(struct process_control_block *pcb)
  */
 uint64_t process_exit_files(struct process_control_block *pcb)
 {
+    // TODO: 当stdio不再被以-1来特殊处理时，在这里要释放stdio文件的内存
+
     // 不与父进程共享文件描述符
     if (!(pcb->flags & PF_VFORK))
     {
 
-        for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+        for (int i = 3; i < PROC_MAX_FD_NUM; ++i)
         {
             if (pcb->fds[i] == NULL)
                 continue;
@@ -830,15 +873,15 @@ int process_release_pcb(struct process_control_block *pcb)
 int process_fd_alloc(struct vfs_file_t *file)
 {
     int fd_num = -1;
-    struct vfs_file_t **f = current_pcb->fds;
 
     for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
     {
+        // kdebug("currentpcb->fds[%d]=%#018lx", i, current_pcb->fds[i]);
         /* 找到指针数组中的空位 */
-        if (f[i] == NULL)
+        if (current_pcb->fds[i] == NULL)
         {
             fd_num = i;
-            f[i] = file;
+            current_pcb->fds[i] = file;
             break;
         }
     }
@@ -868,4 +911,15 @@ static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_na
 void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
     __set_pcb_name(pcb, pcb_name);
+}
+
+void process_open_stdio(struct process_control_block *pcb)
+{
+    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
+    // stdin
+    pcb->fds[0] = -1UL;
+    // stdout
+    pcb->fds[1] = -1UL;
+    // stderr
+    pcb->fds[2] = -1UL;
 }

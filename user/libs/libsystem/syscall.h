@@ -31,6 +31,7 @@
 #define SYS_KILL 23         // kill一个进程(向这个进程发出信号)
 #define SYS_SIGACTION 24    // 设置进程的信号处理动作
 #define SYS_RT_SIGRETURN 25 // 从信号处理函数返回
+#define SYS_GETPID 26 // 获取当前进程的pid（进程标识符）
 
 /**
  * @brief 用户态系统调用函数

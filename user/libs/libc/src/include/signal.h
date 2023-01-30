@@ -1,5 +1,9 @@
 #pragma once
-#include <libc/src/unistd.h>
+#include <unistd.h>
+
+#if defined(__cplusplus) 
+extern  "C"  { 
+#endif
 
 #define SIGHUP 1
 #define SIGINT 2
@@ -40,7 +44,10 @@
 #define SIGRTMIN 32
 #define SIGRTMAX MAX_SIG_NUM
 
-typedef void (*__sighandler_t) (int);
+typedef void (*__sighandler_t)(int);
+
+#define SIG_DFL ((__sighandler_t)0) /* Default action.  */
+#define SIG_IGN ((__sighandler_t)1) /* Ignore signal.  */
 
 // 注意，该结构体最大16字节
 union __sifields {
@@ -87,3 +94,9 @@ struct sigaction
 
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int signal(int signum, __sighandler_t handler);
+int raise(int sig);
+int kill(pid_t, int sig);
+
+#if defined(__cplusplus) 
+}  /* extern "C" */ 
+#endif

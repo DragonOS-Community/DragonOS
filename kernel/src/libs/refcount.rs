@@ -1,20 +1,28 @@
-use crate::{include::bindings::bindings::{atomic_inc, atomic_t, atomic_dec}, kwarn};
+use crate::{
+    include::bindings::bindings::{atomic_dec, atomic_inc, atomic_t},
+    kwarn,
+};
 
-use super::{ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref}, atomic::atomic_read};
+use super::{
+    atomic::atomic_read,
+    ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref},
+};
 
 #[derive(Debug, Copy, Clone)]
 pub struct RefCount {
     pub refs: atomic_t,
 }
 
-impl Default for RefCount{
+impl Default for RefCount {
     fn default() -> Self {
-        Self { refs:  atomic_t { value: 1 }}
+        Self {
+            refs: atomic_t { value: 1 },
+        }
     }
 }
 
 /// @brief 将给定的来自bindgen的refcount_t解析为Rust的RefCount的引用
-impl FFIBind2Rust<crate::include::bindings::bindings::refcount_struct> for RefCount{
+impl FFIBind2Rust<crate::include::bindings::bindings::refcount_struct> for RefCount {
     fn convert_mut(
         src: *mut crate::include::bindings::bindings::refcount_struct,
     ) -> Option<&'static mut Self> {
@@ -23,7 +31,7 @@ impl FFIBind2Rust<crate::include::bindings::bindings::refcount_struct> for RefCo
     fn convert_ref(
         src: *const crate::include::bindings::bindings::refcount_struct,
     ) -> Option<&'static Self> {
-        return __convert_ref(src)
+        return __convert_ref(src);
     }
 }
 
@@ -40,10 +48,10 @@ macro_rules! REFCOUNT_INIT {
 #[allow(dead_code)]
 #[inline]
 pub fn refcount_inc(r: &mut RefCount) {
-    if atomic_read(&r.refs) == 0{
+    if atomic_read(&r.refs) == 0 {
         kwarn!("Refcount increased from 0, may be use-after free");
     }
-    
+
     unsafe {
         atomic_inc(&mut r.refs);
     }
@@ -52,10 +60,8 @@ pub fn refcount_inc(r: &mut RefCount) {
 /// @brief 引用计数自减1
 #[allow(dead_code)]
 #[inline]
-pub fn refcount_dec(r: &mut RefCount){
-    unsafe{
+pub fn refcount_dec(r: &mut RefCount) {
+    unsafe {
         atomic_dec(&mut r.refs);
     }
 }
-
-

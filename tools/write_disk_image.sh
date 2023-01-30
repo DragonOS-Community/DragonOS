@@ -22,12 +22,12 @@ echo "开始写入磁盘镜像..."
 
 
 # toolchain
+GRUB_ABS_PREFIX=/opt/dragonos-grub
+GRUB_PATH_I386_LEGACY_INSTALL=${GRUB_ABS_PREFIX}/arch/i386/legacy/grub/sbin/grub-install
+GRUB_PATH_I386_EFI_INSTALL=${GRUB_ABS_PREFIX}/arch/i386/efi/grub/sbin/grub-install
+GRUB_PATH_X86_64_EFI_INSTALL=${GRUB_ABS_PREFIX}/arch/x86_64/efi/grub/sbin/grub-install
 
-GRUB_PATH_I386_LEGACY_INSTALL=${root_folder}/tools/arch/i386/legacy/grub/sbin/grub-install
-GRUB_PATH_I386_EFI_INSTALL=${root_folder}/tools/arch/i386/efi/grub/sbin/grub-install
-GRUB_PATH_X86_64_EFI_INSTALL=${root_folder}/tools/arch/x86_64/efi/grub/sbin/grub-install
-
-GRUB_PATH_I386_LEGACY_FILE=${root_folder}/tools/arch/i386/legacy/grub/bin/grub-file
+GRUB_PATH_I386_LEGACY_FILE=${GRUB_ABS_PREFIX}/arch/i386/legacy/grub/bin/grub-file
 
 
 # ==============检查文件是否齐全================
@@ -37,7 +37,7 @@ bins[0]=${kernel}
 for file in ${bins[*]};do
 if [ ! -x $file ]; then
 echo "$file 不存在！"
-exit
+exit 
 fi
 done
 
@@ -77,14 +77,20 @@ fi
 # 拷贝程序到硬盘
 mkdir -p ${root_folder}/bin/disk_mount
 bash mount_virt_disk.sh || exit 1
+
+LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
+echo $LOOP_DEVICE
+
 mkdir -p ${boot_folder}/grub
 cp ${kernel} ${root_folder}/bin/disk_mount/boot
 # 拷贝用户程序到磁盘镜像
 mkdir -p ${root_folder}/bin/disk_mount/bin
 mkdir -p ${root_folder}/bin/disk_mount/dev
 mkdir -p ${root_folder}/bin/disk_mount/proc
+mkdir -p ${root_folder}/bin/disk_mount/usr
 cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount/bin
 touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
+cp -r ${root_folder}/bin/sysroot/usr/* ${root_folder}/bin/disk_mount/usr/ 
 
 # 设置 grub 相关数据
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
@@ -96,13 +102,11 @@ cfg_content='set timeout=15
     menuentry "DragonOS" {
     multiboot2 /boot/kernel.elf "KERNEL_ELF"
 }'
+
 # 增加insmod efi_gop防止32位uefi启动报错
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
 fi
 
-# rm -rf ${iso_folder}
-LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
-echo $LOOP_DEVICE
 case "$1" in
     --bios) 
         case "$2" in
@@ -119,7 +123,8 @@ case "$1" in
         esac
         ;;
     *)
-    echo "参数错误"
+    #传统bios
+    ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
     ;;
            
 esac

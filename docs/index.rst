@@ -12,6 +12,7 @@
 
    introduction/index
    introduction/build_system
+   introduction/mirrors
 
 .. toctree::
    :maxdepth: 1
@@ -22,6 +23,7 @@
    kernel/locking/index
    kernel/process_management/index
    kernel/sched/index
+   kernel/ipc/index
    kernel/memory_management/index
    kernel/filesystem/index
    kernel/debug/index

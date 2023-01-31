@@ -10,7 +10,7 @@
  * @param fifo 队列结构体
  * @param size 缓冲区大小
  * @param reserved 暂时保留，请置为0
- * @return int 错误码：成功->0
+ * @return int 错误码: NOMEM; 成功->0
  */
 int kfifo_alloc(struct kfifo_t *fifo, uint32_t size, uint64_t reserved)
 {

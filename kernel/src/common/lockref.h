@@ -33,8 +33,8 @@ void lockref_inc(struct lockref *lock_ref);
  * @brief 原子地将引用计数加1.如果原来的count≤0，则操作失败。
  *
  * @param lock_ref 指向要被操作的lockref变量的指针
- * @return int  操作成功=>true
- *              操作失败=>false
+ * @return bool  操作成功=>true
+ *               操作失败=>false
  */
 bool lockref_inc_not_zero(struct lockref *lock_ref);
 

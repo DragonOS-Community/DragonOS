@@ -10,15 +10,15 @@
  */
 #pragma once
 
-#define E2BIG 1 /* 参数列表过长，或者在输出buffer中缺少空间 或者参数比系统内建的最大值要大 Argument list too long. */
+#define E2BIG 1         /* 参数列表过长，或者在输出buffer中缺少空间 或者参数比系统内建的最大值要大 Argument list too long. */
 #define EACCES 2        /* 访问被拒绝 Permission denied */
 #define EADDRINUSE 3    /* 地址正在被使用 Address in use.*/
 #define EADDRNOTAVAIL 4 /* 地址不可用 Address  not available.*/
 #define EAFNOSUPPORT 5  /* 地址family不支持 Address family not supported. */
-#define EAGAIN 6 /* 资源不可用，请重试。 Resource unavailable, try again (may be the same value as [EWOULDBLOCK]).*/
-#define EALREADY 7 /* 连接已经在处理 Connection already in progress. */
-#define EBADF 8    /* 错误的文件描述符 Bad file descriptor. */
-#define EBADMSG 9  /* 错误的消息 Bad message. */
+#define EAGAIN 6        /* 资源不可用，请重试。 Resource unavailable, try again (may be the same value as [EWOULDBLOCK]).*/
+#define EALREADY 7      /* 连接已经在处理 Connection already in progress. */
+#define EBADF 8         /* 错误的文件描述符 Bad file descriptor. */
+#define EBADMSG 9       /* 错误的消息 Bad message. */
 
 #define EBUSY 10        /* 设备或资源忙 Device or resource busy. */
 #define ECANCELED 11    /* 操作被取消 Operation canceled. */
@@ -75,10 +75,10 @@
 #define ENOTEMPTY 58       /* 目录非空 Directory not empty. */
 #define ENOTRECOVERABLE 59 /* 状态不可覆盖 State not recoverable. */
 
-#define ENOTSOCK 60 /* 不是一个套接字 Not a socket.*/
-#define ENOTSUP 61  /* 不被支持 Not supported (may be the same value as [EOPNOTSUPP]). */
-#define ENOTTY 62   /* 不正确的I/O控制操作 Inappropriate I/O control operation. */
-#define ENXIO 63    /* 没有这样的设备或地址 No such device or address. */
+#define ENOTSOCK 60   /* 不是一个套接字 Not a socket.*/
+#define ENOTSUP 61    /* 不被支持 Not supported (may be the same value as [EOPNOTSUPP]). */
+#define ENOTTY 62     /* 不正确的I/O控制操作 Inappropriate I/O control operation. */
+#define ENXIO 63      /* 没有这样的设备或地址 No such device or address. */
 #define EOPNOTSUPP 64 /* 套接字不支持该操作 Operation not supported on socket (may be the same value as [ENOTSUP]). */
 #define EOVERFLOW 65  /* 数值过大，产生溢出 Value too large to be stored in data type. */
 #define EOWNERDEAD 66 /* 之前的拥有者挂了 Previous owner died. */

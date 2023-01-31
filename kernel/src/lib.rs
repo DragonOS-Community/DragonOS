@@ -29,6 +29,7 @@ mod process;
 mod sched;
 mod smp;
 mod time;
+mod io;
 
 extern crate alloc;
 #[macro_use]

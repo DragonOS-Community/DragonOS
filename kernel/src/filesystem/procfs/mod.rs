@@ -20,10 +20,12 @@ use crate::{
 
 use super::vfs::{FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus};
 
+//进程文件夹下的各类文件
 #[derive(Debug)]
 #[repr(u8)]
 pub enum ProcFileType {
     ProcStatus = 0,
+    //todo: other file types
     Default,
 }
 
@@ -38,7 +40,9 @@ impl From<u8> for ProcFileType {
 ///节点私有信息结构体
 #[derive(Debug)]
 pub struct InodeInfo {
+    //进程pid
     pid: i64,
+    //文件类型
     ftype: ProcFileType,
 }
 

@@ -719,7 +719,7 @@ int process_wakeup(struct process_control_block *pcb)
         return 0;
 
     pcb->state |= PROC_RUNNING;
-    sched_enqueue(pcb);
+    sched_enqueue(pcb, true);
     return 0;
 }
 

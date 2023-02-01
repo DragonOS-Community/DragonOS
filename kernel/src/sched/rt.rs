@@ -131,10 +131,10 @@ impl Scheduler for SchedulerRT {
         if proc.policy == SCHED_FIFO {
             // 如果挑选的进程优先级小于当前进程，则不进行切换
             if proc.priority <= current_pcb().priority {
-                sched_enqueue(proc);
+                sched_enqueue(proc, false);
             } else {
                 // 将当前的进程加进队列
-                sched_enqueue(current_pcb());
+                sched_enqueue(current_pcb(), false);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 return Some(proc);
             }
@@ -147,19 +147,19 @@ impl Scheduler for SchedulerRT {
                 if proc.rt_time_slice <= 0 {
                     proc.rt_time_slice = SchedulerRT::RR_TIMESLICE;
                     proc.flags |= !(PF_NEED_SCHED as u64);
-                    sched_enqueue(proc);
+                    sched_enqueue(proc, false);
                 }
                 // 目标进程时间片未耗尽，切换到目标进程
                 else {
                     // 将当前进程加进队列
-                    sched_enqueue(current_pcb());
+                    sched_enqueue(current_pcb(), false);
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     return Some(proc);
                 }
             }
             // curr优先级更大，说明一定是实时进程，将所选进程入队列
             else {
-                sched_enqueue(proc);
+                sched_enqueue(proc, false);
             }
         }
         return None;

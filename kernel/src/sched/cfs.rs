@@ -8,7 +8,7 @@ use crate::{
         initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, PROC_RUNNING,
     },
     kBUG,
-    libs::spinlock::RawSpinlock,
+    libs::spinlock::RawSpinlock, kdebug,
 };
 
 use super::core::{sched_enqueue, Scheduler};
@@ -88,6 +88,17 @@ impl CFSQueue {
         self.lock.unlock();
         return res;
     }
+
+    /// @brief 获取cfs队列的最小运行时间
+    /// 
+    /// @return Option<i64> 如果队列不为空，那么返回队列中，最小的虚拟运行时间；否则返回None
+    pub fn min_vruntime(&self) -> Option<i64> {
+        if !self.queue.is_empty() {
+            return Some(self.queue.first().unwrap().virtual_runtime);
+        } else {
+            return None;
+        }
+    }
 }
 
 /// @brief CFS调度器类
@@ -137,6 +148,15 @@ impl SchedulerCFS {
         // 更新当前进程的虚拟运行时间
         current_pcb().virtual_runtime += 1;
     }
+
+    /// @brief 将进程加入cpu的cfs调度队列，并且重设其虚拟运行时间为当前队列的最小值
+    pub fn enqueue_reset_vruntime(&mut self, pcb: &'static mut process_control_block) {
+        let cpu_queue = &mut self.cpu_queue[pcb.cpu_id as usize];
+        if cpu_queue.queue.len() > 0 {
+            pcb.virtual_runtime = cpu_queue.min_vruntime().unwrap();
+        }
+        cpu_queue.enqueue(pcb);
+    }
 }
 
 impl Scheduler for SchedulerCFS {
@@ -155,7 +175,7 @@ impl Scheduler for SchedulerCFS {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
             if current_pcb().state & (PROC_RUNNING as u64) != 0 {
-                sched_enqueue(current_pcb());
+                sched_enqueue(current_pcb(), false);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
 
@@ -177,7 +197,7 @@ impl Scheduler for SchedulerCFS {
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            sched_enqueue(proc);
+            sched_enqueue(proc, false);
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);

@@ -9,7 +9,7 @@ use crate::{
         ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
         clock, clock_t, complete, completion, completion_alloc, process_control_block,
         process_wakeup, process_wakeup_immediately, schedule_timeout_ms, usleep,
-        wait_for_completion, PROC_RUNNING,
+        wait_for_completion, PF_NEED_SCHED, PROC_RUNNING,
     },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
@@ -143,7 +143,7 @@ impl RequestQueue {
                 if res == 0 {
                     unsafe {
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                        kdebug!("{:?}\n", packet);
+                        // kdebug!("{:?}\n", packet);
                         complete(packet.status);
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     }
@@ -218,7 +218,9 @@ pub extern "C" fn io_scheduler_address_requests() {
             // kdebug!("sched out");
             unsafe {
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                schedule_timeout_ms(10);
+                // schedule_timeout_ms(5);
+                current_pcb().flags |= PF_NEED_SCHED as u64;
+                sched();
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
         }

@@ -62,6 +62,6 @@
 extern void sched_update_jiffies();
 extern void sched_init();
 extern void sched();
-extern void sched_enqueue(struct process_control_block *pcb);
+extern void sched_enqueue(struct process_control_block *pcb, bool reset_time);
 
 void switch_proc(struct process_control_block *prev, struct process_control_block *proc);

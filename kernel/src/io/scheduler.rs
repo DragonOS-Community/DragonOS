@@ -1,17 +1,20 @@
 use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
+use x86_64::registers::debug;
 
 use crate::{
     arch::{asm::current::current_pcb, mm::barrier::mfence, sched::sched},
     include::bindings::bindings::{
         ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
-        complete, completion, completion_alloc, process_control_block, process_wakeup,
-        process_wakeup_immediately, schedule_timeout_ms, usleep, wait_for_completion, PROC_RUNNING,
+        clock, clock_t, complete, completion, completion_alloc, process_control_block,
+        process_wakeup, process_wakeup_immediately, schedule_timeout_ms, usleep,
+        wait_for_completion, PROC_RUNNING,
     },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
 };
+#[derive(Debug)]
 
 ///  achi请求包
 pub struct AhciRequestPacket {
@@ -37,6 +40,7 @@ impl Default for AhciRequestPacket {
         }
     }
 }
+#[derive(Debug)]
 
 /// io请求包
 pub struct BlockDeviceRequestPacket<T> {
@@ -139,8 +143,7 @@ impl RequestQueue {
                 if res == 0 {
                     unsafe {
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-                        // kdebug!("{:?}\n", packet.private_ahci_request_packet);
+                        kdebug!("{:?}\n", packet);
                         complete(packet.status);
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     }
@@ -193,16 +196,22 @@ pub extern "C" fn create_io_queue() {
         .io_queue
         .push(Box::leak(Box::new(RequestQueue::new())));
 }
-
+#[derive(Debug)]
+struct log {
+    t: clock_t,
+    dosomething: String,
+}
 #[no_mangle]
-/// @brief 处理请求
+/// @brief 处理请求 （守护线程运行）
 pub extern "C" fn io_scheduler_address_requests() {
     let io_scheduler = __get_io_scheduler();
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    let mut looplog: Vec<log> = Vec::new();
     //FIXME 暂时只考虑了一个io队列的情况
     loop {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
         if io_scheduler.io_queue[0].waiting_queue.len() == 0
             && io_scheduler.io_queue[0].processing_queue.len() == 0
         {
@@ -212,14 +221,17 @@ pub extern "C" fn io_scheduler_address_requests() {
                 schedule_timeout_ms(10);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
-            // compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         //请不要修改下面三个循环的顺序
 
+        // let begin: u64 = unsafe { clock().try_into().unwrap() };
+        // kdebug!("{}",begin);
         //将等待中的请求包插入
         let size = io_scheduler.io_queue[0].waiting_queue.len();
         for i in 0..16 {
+            // let begin: u64 = unsafe { clock().try_into().unwrap() };
+
             if i >= size || io_scheduler.io_queue[0].processing_queue.len() == 16 {
                 break;
             }
@@ -239,13 +251,27 @@ pub extern "C" fn io_scheduler_address_requests() {
             io_scheduler.io_queue[0].push_processing_queue(packet);
             io_scheduler.io_queue[0].lock.unlock();
             // }
+
+            // looplog.push(log {
+            //     t: ((unsafe { clock() } - begin) ).try_into().unwrap(),
+            //     dosomething: String::from("push_processing_queue"),
+            // });
+
+            // kdebug!("{:?} ", ahci_packet,);
+
+            // let t: u64 = ((unsafe { clock() } - begin) / 1000).try_into().unwrap();
+            // if t > 0 {
+            //     kdebug!("{:?}", ahci_packet);
+            // }
+
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
+        io_scheduler.io_queue[0].lock.lock();
         io_scheduler.io_queue[0].pop_finished_packets();
+        io_scheduler.io_queue[0].lock.unlock();
         mfence();
-
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }

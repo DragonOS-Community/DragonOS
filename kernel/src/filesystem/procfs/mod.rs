@@ -20,12 +20,15 @@ use crate::{
 
 use super::vfs::{FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus};
 
-//进程文件夹下的各类文件
+/// @brief 进程文件类型
+/// @usage 用于定义进程文件夹下的各类文件类型
 #[derive(Debug)]
 #[repr(u8)]
 pub enum ProcFileType {
+    ///展示进程状态信息
     ProcStatus = 0,
-    //todo: other file types
+    //todo: 其他文件类型
+    ///默认文件类型
     Default,
 }
 
@@ -37,16 +40,18 @@ impl From<u8> for ProcFileType {
         }
     }
 }
-///节点私有信息结构体
+/// @brief 节点私有信息结构体
+/// @usage 用于传入各类文件所需的信息
 #[derive(Debug)]
 pub struct InodeInfo {
-    //进程pid
+    ///进程的pid
     pid: i64,
-    //文件类型
+    ///文件类型
     ftype: ProcFileType,
+    //其他需要传入的信息在此定义
 }
 
-/// procfs的inode名称的最大长度
+/// @brief procfs的inode名称的最大长度
 const PROCFS_MAX_NAMELEN: usize = 64;
 
 /// @brief procfs文件系统的Inode结构体
@@ -79,13 +84,14 @@ pub struct ProcFSInode {
     fdata: InodeInfo,
 }
 
+/// 对ProcFSInode实现获取各类文件信息的函数
 impl ProcFSInode {
-    // 获取进程status信息
+    /// 获取进程status,展示状态信息
     fn get_info_status(&self) {
-        //获取pcb
+        // 获取该pid对应的pcb结构体
         let pid_t = &self.fdata.pid;
         let pcb_t = unsafe { process_find_pcb_by_pid(pid_t) };
-        //
+        // 传入数据
         let mut pdata = &self.data;
         pdata.push("Name:\t".to_string());
         pdata.push(pcb_t.name);
@@ -104,8 +110,11 @@ impl ProcFSInode {
         pdata.push("\nvrtime:\t".to_string());
         pdata.push(pcb_t.virtual_runtime);
 
+        // 当前进程运行过程中占用内存的峰值
         let hiwater_vm = pcb_t.mm.vmas.vm_end - pcb_t.mm.vmas.vm_start;
+        // 进程数据段的大小
         let text = pcb_t.mm.code_addr_end - pcb_t.mm.code_addr_start;
+        // 进程代码的大小
         let data = pcb_t.mm.data_addr_end - pcb_t.mm.data_addr_start;
 
         pdata.push("\nVmPeak:".to_string());
@@ -119,7 +128,7 @@ impl ProcFSInode {
         pdata.push(" kB\n".to_string());
     }
 
-    //todo:other files info
+    // todo:其他数据获取函数实现
 
 }
 
@@ -185,19 +194,21 @@ impl ProcFS {
         self.root_inode.clone()
     }
 
-    ///@brief 进程注册
+    /// @brief 进程注册函数
+    /// @usage 在进程中调用并创建进程对应文件
+    /// 
     pub fn procfs_register_pid(&self, pid: i64) -> Result<(), i32> {
         
-        //获取当前inode
+        // 获取当前inode
         let proc = self.get_root_inode();
-        //创建对应进程文件夹
+        // 创建对应进程文件夹
         let pf = proc.create(&pid.to_string(), Dir, 0).unwrap();
-        //创建相关文件
-        //status文件
+        // 创建相关文件
+        // status文件
         let sf: ProcFSInode = pf.create("status", File, 0).unwrap().as_any_ref();
         sf.fdata.pid = pid;
         
-        //todo: other files
+        //todo: 创建其他文件
 
         return Ok(());
     }
@@ -216,7 +227,7 @@ impl IndexNode for LockedProcFSInode {
             return Err(-(EISDIR as i32));
         }
 
-        //根据文件类型获取相应数据
+        // 根据文件类型获取相应数据
         match inode.ptype {
             ProcFileType::ProcStatus => inode.get_info_status(),
             ProcFileType::Default => (),

@@ -2,7 +2,7 @@
 CFLAGS += -I .
 
 
-kernel_io_objs:= $(shell find ./*.c)
+kernel_io_objs:= $(shell find ./*.c ./*/*.c)
 
 ECHO:
 	@echo "$@"

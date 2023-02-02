@@ -380,6 +380,7 @@ static void ahci_probe_port(const uint32_t device_num);
  * @param starth high 32bits of start addr
  * @param count total sectors to read
  * @param buf buffer
+ * @param ret_slot 执行命令的插槽号（传出参数）
  * @return success 0
  */
 static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf, int8_t *ret_slot);
@@ -392,6 +393,7 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
  * @param starth high 32bits of start addr
  * @param count total sectors to read
  * @param buf buffer
+ * @param ret_slot 执行命令的插槽号（传出参数）
  * @return success 0
  */
 static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
@@ -404,6 +406,7 @@ void ahci_end_request();
  *
  * @param port_num HBA PORT 编号
  * @param ahci_ctrl_num ahci控制号
+ * @param ret_slot 执行命令的插槽号
  * @param err 错误信息
  */
 int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, int8_t slot, char *err);
@@ -424,5 +427,6 @@ int ahci_find_cmdslot(HBA_PORT *port);
 /**
  * @brief 读取磁盘信息
  * @param pack io请求包
+ * @param ret_slot 执行命令的插槽号（传出参数）
  */
 long ahci_query_disk(struct ahci_request_packet_t *pack, int8_t *ret_slot);

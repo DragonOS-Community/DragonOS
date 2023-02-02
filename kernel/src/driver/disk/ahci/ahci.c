@@ -12,8 +12,6 @@
 
 struct pci_device_structure_header_t *ahci_devs[MAX_AHCI_DEVICES];
 
-// struct block_device_request_queue ahci_req_queue;
-
 struct blk_gendisk ahci_gendisk0 = {0}; // 暂时硬性指定一个ahci_device
 static int __first_port = -1;           // 临时用于存储 ahci控制器的第一个可用端口 的变量
 
@@ -89,7 +87,6 @@ static int ahci_init_gendisk()
     ahci_gendisk0.flags = BLK_GF_AHCI;
     ahci_gendisk0.fops = &ahci_operation;
     mutex_init(&ahci_gendisk0.open_mutex);
-    // ahci_gendisk0.request_queue = &ahci_req_queue;
 
     // 为存储分区结构，分配内存空间
     ahci_gendisk0.private_data = __alloc_private_data();
@@ -326,6 +323,7 @@ static void port_rebase(HBA_PORT *port, int portno)
  * @param starth high 32bits of start addr
  * @param count total sectors to read
  * @param buf buffer
+ * @param ret_slot 执行命令的插槽号（传出参数）
  * @return true done
  * @return false failed
  */
@@ -403,12 +401,20 @@ static int ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t 
     return 0;
 }
 
+/**
+ * @brief 检查请求包是否已完成
+ *
+ * @param port_num HBA PORT 编号
+ * @param ahci_ctrl_num ahci控制号
+ * @param ret_slot 执行命令的插槽号
+ * @param err 错误信息
+ */
 int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, int8_t slot, char *err)
 {
 
     HBA_PORT *port = ahci_get_port(port_num, ahci_ctrl_num);
     int retval = -EBUSY;
-    if(slot == -1)
+    if (slot == -1)
         retval = -EINVAL;
     // In some longer duration reads, it may be helpful to spin on the DPS bit
     // in the PxIS port field as well (1 << 5)
@@ -423,6 +429,17 @@ int ahci_check_complete(uint8_t port_num, uint8_t ahci_ctrl_num, int8_t slot, ch
     return retval;
 }
 
+/**
+ * @brief write data to SATA device using 48bit LBA address
+ *
+ * @param port HBA PORT
+ * @param startl low 32bits of start addr
+ * @param starth high 32bits of start addr
+ * @param count total sectors to read
+ * @param buf buffer
+ * @param ret_slot 执行命令的插槽号（传出参数）
+ * @return success 0
+ */
 static int ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
                       uint64_t buf, int8_t *ret_slot)
 {

@@ -80,7 +80,7 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut res
         reset_time = true;
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    
+
     if pcb.policy == SCHED_NORMAL {
         if reset_time {
             cfs_scheduler.enqueue_reset_vruntime(pcb);
@@ -149,7 +149,7 @@ pub extern "C" fn sched_set_cpu_idle(cpu_id: usize, pcb: *mut process_control_bl
 
 /// @brief 设置进程需要等待迁移到另一个cpu核心。
 /// 当进程被重新加入队列时，将会更新其cpu_id,并加入正确的队列
-/// 
+///
 /// @return i32 成功返回0,否则返回posix错误码
 #[allow(dead_code)]
 #[no_mangle]

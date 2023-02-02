@@ -546,7 +546,7 @@ impl SigQueue {
     }
 
     /// @brief 从C的void*指针转换为static生命周期的可变引用
-    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue{
+    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue {
         let sq = p as *mut SigQueue;
         let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
         return sq;

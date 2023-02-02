@@ -4,7 +4,11 @@
 
 &nbsp;
 
-&emsp;&emsp;这是一个运行于x86_64平台的64位操作系统。目前正在开发之中！
+&emsp;&emsp;DragonOS龙操作系统（以下简称“DragonOS”）是一个面向服务器领域的，从0开发内核及用户态环境，并提供Linux兼容性的64位操作系统。它使用Rust与C语言进行编写，并正在逐步淘汰原有的C代码，以在将来提供更好的安全性与可靠性。
+
+&emsp;&emsp;DragonOS的目标是，构建一个完全独立自主的、开源的、高性能及高可靠性的服务器操作系统，为国家数字基础设施建设提供完全独立自主的底层核心动力。
+
+&emsp;&emsp;作为一个社区驱动的开源操作系统，为了促进其发展，避免让其遭受一些不遵守开源协议的商业公司的侵权，我们决定使用GPLv2协议开放源代码，以严格的开源协议来保护DragonOS。
 
 [关于DragonOS，你想了解的都在这儿 - DragonOS](https://dragonos.org/uncategorized/summary/)
 
@@ -92,6 +96,8 @@
 
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
+- 叶锦毅
+- 林
 - 悟
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 - slientbard

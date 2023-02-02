@@ -10,4 +10,5 @@
    :maxdepth: 1
 
    the-development-process
-   coding-style
+   c-coding-style
+   rust-coding-style

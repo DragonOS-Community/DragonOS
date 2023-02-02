@@ -7,4 +7,5 @@ DragonOS调度
 .. toctree::
    :maxdepth: 1
 
-   waiting
+   c_waiting
+   rust_waiting

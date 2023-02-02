@@ -1,7 +1,7 @@
 #include "rootfs.h"
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <common/string.h>
-#include <filesystem/VFS/mount.h>
+#include <filesystem/vfs/mount.h>
 
 static struct vfs_superblock_t rootfs_sb = {0};
 extern struct vfs_superblock_t *vfs_root_sb;

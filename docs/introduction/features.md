@@ -48,6 +48,7 @@
 ### IPC
 
 - [x] 匿名pipe管道
+- [x] signal信号
 
 ### 文件系统
 
@@ -119,3 +120,11 @@
 ### 驱动程序
 
 - [x] ps/2键盘用户态驱动
+
+## 软件移植
+
+- [x] GCC 11.3.0 （暂时只支持了x86_64的Cross Compiler）[https://github.com/DragonOS-Community/gcc](https://github.com/DragonOS-Community/gcc)
+- [x] binutils 2.38（暂时只支持了x86_64的Cross Compiler）[https://github.com/DragonOS-Community/binutils](https://github.com/DragonOS-Community/binutils)
+- [x] gmp 6.2.1 [https://github.com/DragonOS-Community/gmp-6.2.1](https://github.com/DragonOS-Community/gmp-6.2.1)
+- [x] mpfr 4.1.1 [https://github.com/DragonOS-Community/mpfr](https://github.com/DragonOS-Community/mpfr)
+- [x] mpc 1.2.1 [https://github.com/DragonOS-Community/mpc](https://github.com/DragonOS-Community/mpc)

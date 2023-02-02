@@ -4,6 +4,8 @@
 #include <libsystem/syscall.h>
 #include <signal.h>
 
+extern void _fini();
+
 int abs(int i)
 {
     return i < 0 ? -i : i;
@@ -54,6 +56,7 @@ int atoi(const char *str)
  */
 void exit(int status)
 {
+    _fini();
     syscall_invoke(SYS_EXIT, status, 0, 0, 0, 0, 0, 0, 0);
 }
 

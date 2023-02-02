@@ -12,7 +12,7 @@
 #pragma once
 
 #include <filesystem/MBR.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 
 #define FAT32_MAX_PARTITION_NUM 128 // 系统支持的最大的fat32分区数量
 

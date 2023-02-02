@@ -1,10 +1,11 @@
 #![no_std] // <1>
 #![no_main] // <1>
+#![feature(const_mut_refs)]
 #![feature(core_intrinsics)] // <2>
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]
 #![feature(drain_filter)] // 允许Vec的drain_filter特性
-
+#![feature(c_void_variant)] // used in kernel/src/exception/softirq.rs
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -16,20 +17,19 @@ use core::panic::PanicInfo;
 #[macro_use]
 mod arch;
 
+mod driver;
+mod filesystem;
 #[macro_use]
 mod include;
 mod ipc;
-
 #[macro_use]
 mod libs;
-mod driver;
+mod exception;
 mod mm;
 mod process;
 mod sched;
 mod smp;
 mod time;
-
-
 
 extern crate alloc;
 
@@ -85,5 +85,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
+
     return 0;
 }

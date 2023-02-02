@@ -14,7 +14,7 @@
 #include <common/errno.h>
 #include <common/glib.h>
 #include <common/wait_queue.h>
-#include <filesystem/VFS/VFS.h>
+#include <filesystem/vfs/VFS.h>
 #include <mm/mm-types.h>
 #include <syscall/syscall.h>
 
@@ -221,3 +221,5 @@ extern int process_try_to_wake_up(struct process_control_block *_pcb, uint64_t _
  */
 extern int process_wake_up_state(struct process_control_block *pcb, uint64_t state);
 void __switch_to(struct process_control_block *prev, struct process_control_block *next);
+
+void process_open_stdio(struct process_control_block * pcb);

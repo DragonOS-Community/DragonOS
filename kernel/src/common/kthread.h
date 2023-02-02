@@ -55,6 +55,23 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
     })
 
 /**
+ * @brief 创建内核实时线程，并将其唤醒
+ * 
+ * @param thread_fn 该内核线程要执行的函数
+ * @param data 传递给 thread_fn 的参数数据
+ * @param name_fmt printf-style format string for the thread name
+ * @param arg name_fmt的参数
+ */
+#define kthread_run_rt(thread_fn, data, name_fmt, ...)                                                          \
+    ({                                                                                                       \
+        struct process_control_block *__kt = kthread_create(thread_fn, data, name_fmt, ##__VA_ARGS__); \
+        __kt=process_init_rt_pcb(__kt);                                                              \
+        if (!IS_ERR(__kt)){                                                                                   \
+            process_wakeup(__kt);}                                                                            \
+        __kt;                                                                                                \
+    })
+
+/**
  * @brief 向kthread发送停止信号，请求其结束
  * 
  * @param pcb 内核线程的pcb

@@ -87,8 +87,10 @@ cp ${kernel} ${root_folder}/bin/disk_mount/boot
 mkdir -p ${root_folder}/bin/disk_mount/bin
 mkdir -p ${root_folder}/bin/disk_mount/dev
 mkdir -p ${root_folder}/bin/disk_mount/proc
+mkdir -p ${root_folder}/bin/disk_mount/usr
 cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount/bin
 touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
+cp -r ${root_folder}/bin/sysroot/usr/* ${root_folder}/bin/disk_mount/usr/ 
 
 # 设置 grub 相关数据
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
@@ -121,7 +123,8 @@ case "$1" in
         esac
         ;;
     *)
-    echo "参数错误"
+    #传统bios
+    ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
     ;;
            
 esac

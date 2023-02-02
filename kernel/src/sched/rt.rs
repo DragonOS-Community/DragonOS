@@ -4,10 +4,7 @@ use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{
-        initial_proc_union, process_control_block, PF_NEED_SCHED, SCHED_FIFO, SCHED_NORMAL,
-        SCHED_RR,
-    },
+    include::bindings::bindings::{process_control_block, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR},
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
 };

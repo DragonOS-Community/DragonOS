@@ -2,11 +2,14 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
-    arch::{context::switch_process, interrupt::{cli, sti}},
-    include::bindings::bindings::{
-        process_control_block, pt_regs, EPERM, PROC_RUNNING, SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
+    arch::{
+        context::switch_process,
+        interrupt::{cli, sti},
     },
-    kdebug,
+    include::bindings::bindings::{
+        process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
+        SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
+    },
     process::process::process_cpu,
 };
 
@@ -61,13 +64,23 @@ fn __sched() -> Option<&'static mut process_control_block> {
 /// @param reset_time 是否重置虚拟运行时间
 #[allow(dead_code)]
 #[no_mangle]
-pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, reset_time: bool) {
+pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut reset_time: bool) {
     // 调度器不处理running位为0的进程
     if pcb.state & (PROC_RUNNING as u64) == 0 {
         return;
     }
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
+
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    if (pcb.flags & (PF_NEED_MIGRATE as u64)) != 0 {
+        // kdebug!("migrating pcb:{:?}", pcb);
+        pcb.flags &= !(PF_NEED_MIGRATE as u64);
+        pcb.cpu_id = pcb.migrate_to;
+        reset_time = true;
+    }
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    
     if pcb.policy == SCHED_NORMAL {
         if reset_time {
             cfs_scheduler.enqueue_reset_vruntime(pcb);
@@ -125,5 +138,32 @@ pub extern "C" fn sys_sched(regs: &'static mut pt_regs) -> u64 {
         switch_process(current_pcb(), pcb.unwrap());
     }
     sti();
+    return 0;
+}
+
+#[allow(dead_code)]
+#[no_mangle]
+pub extern "C" fn sched_set_cpu_idle(cpu_id: usize, pcb: *mut process_control_block) {
+    __get_cfs_scheduler().set_cpu_idle(cpu_id, pcb);
+}
+
+/// @brief 设置进程需要等待迁移到另一个cpu核心。
+/// 当进程被重新加入队列时，将会更新其cpu_id,并加入正确的队列
+/// 
+/// @return i32 成功返回0,否则返回posix错误码
+#[allow(dead_code)]
+#[no_mangle]
+pub extern "C" fn sched_migrate_process(
+    pcb: &'static mut process_control_block,
+    target: usize,
+) -> i32 {
+    if target > MAX_CPU_NUM.try_into().unwrap() {
+        // panic!("sched_migrate_process: target > MAX_CPU_NUM");
+        return -(EINVAL as i32);
+    }
+
+    pcb.flags |= PF_NEED_MIGRATE as u64;
+    pcb.migrate_to = target as u32;
+    // kdebug!("pid:{} migrate to cpu:{}", pcb.pid, target);
     return 0;
 }

@@ -6,6 +6,7 @@
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
+#include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/stdio.h>
@@ -23,14 +24,13 @@
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/procfs/procfs.h>
 #include <filesystem/rootfs/rootfs.h>
+#include <io/scheduler.h>
 #include <ktest/ktest.h>
+#include <mm/mmio.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-#include <mm/mmio.h>
-#include <io/scheduler.h>
-#include <common/lz4.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -51,13 +51,13 @@ extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
 
 // 设置初始进程的PCB
-#define INITIAL_PROC(proc)                                                                                           \
-    {                                                                                                                \
-        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
-        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
-        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
-        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                     \
+#define INITIAL_PROC(proc)                                                                                             \
+    {                                                                                                                  \
+        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
+        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,   \
+        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                   \
+        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                       \
     }
 
 struct thread_struct initial_thread = {
@@ -114,10 +114,8 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
-                         : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
-                         : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -736,7 +734,13 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (retval != 0)
         return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
-    current_pcb->flags |= PF_NEED_SCHED;
+        current_pcb->flags |= PF_NEED_SCHED;
+
+    if (pcb->cpu_id == current_pcb->cpu_id)
+        sched();
+    else
+        kick_cpu(pcb->cpu_id);
+    return 0;
 }
 
 /**

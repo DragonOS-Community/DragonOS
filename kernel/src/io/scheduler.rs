@@ -212,19 +212,6 @@ pub extern "C" fn io_scheduler_address_requests() {
     loop {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        if io_scheduler.io_queue[0].waiting_queue.len() == 0
-            && io_scheduler.io_queue[0].processing_queue.len() == 0
-        {
-            // kdebug!("sched out");
-            unsafe {
-                compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                // schedule_timeout_ms(5);
-                current_pcb().flags |= PF_NEED_SCHED as u64;
-                sched();
-                compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         //请不要修改下面三个循环的顺序
 
         // let begin: u64 = unsafe { clock().try_into().unwrap() };

@@ -1,12 +1,12 @@
 use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     arch::mm::barrier::mfence,
     include::bindings::bindings::{
         ahci_check_complete, ahci_query_disk, ahci_request_packet_t, block_device_request_packet,
-        clock_t, complete, completion, completion_alloc, wait_for_completion,
+        complete, completion, completion_alloc, wait_for_completion,
     },
     kBUG,
     libs::spinlock::RawSpinlock,

@@ -169,7 +169,8 @@
         "acpi.h": "c",
         "assert.h": "c",
         "sys_version.h": "c",
-        "cmd.h": "c"
+        "cmd.h": "c",
+        "user_namespace.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": "",

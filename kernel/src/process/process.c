@@ -498,7 +498,7 @@ ul initial_kernel_thread(ul arg)
 
     scm_enable_double_buffer();
 
-    io_scheduler_init();
+    block_io_scheduler_init();
     ahci_init();
     fat32_init();
     rootfs_umount();

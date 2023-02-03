@@ -1,9 +1,9 @@
 #pragma once
 
-extern void io_scheduler_address_requests();
-extern void io_scheduler_init_rust();
+extern void block_io_scheduler_address_requests();
+extern void block_io_scheduler_init_rust();
 
 /**
  * @brief 初始化io调度器
  */
-void io_scheduler_init();
+void block_io_scheduler_init();

@@ -177,7 +177,7 @@ pub fn __get_io_scheduler() -> &'static mut SchedulerIO {
 
 /// @brief 初始化io调度器
 #[no_mangle]
-pub unsafe extern "C" fn io_scheduler_init_rust() {
+pub unsafe extern "C" fn block_io_scheduler_init_rust() {
     if IO_SCHEDULER_PTR.is_null() {
         IO_SCHEDULER_PTR = Box::leak(Box::new(SchedulerIO::new()));
         create_io_queue();
@@ -198,7 +198,7 @@ pub extern "C" fn create_io_queue() {
 
 #[no_mangle]
 /// @brief 处理请求 （守护线程运行）
-pub extern "C" fn io_scheduler_address_requests() {
+pub extern "C" fn block_io_scheduler_address_requests() {
     let io_scheduler = __get_io_scheduler();
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

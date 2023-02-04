@@ -578,7 +578,7 @@ uint64_t sys_nanosleep(struct pt_regs *regs)
 
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
-    ahci_end_request();
+    // ahci_end_request();
     return 0;
 }
 
@@ -619,6 +619,5 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,
     [27] = sys_sched,
-    [28 ... 254] = system_call_not_exists,
-    [255] = sys_ahci_end_req,
+    [28 ... 255] = system_call_not_exists,
 };

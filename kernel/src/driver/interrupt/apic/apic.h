@@ -330,4 +330,5 @@ void apic_local_apic_edge_ack(ul irq_num); // local apic边沿触发 应答
 void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, uint8_t deliver_mode, uint8_t dest_mode,
                          uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID);
 
+uint32_t apic_get_local_apic_id();
 #pragma GCC pop_options

@@ -105,4 +105,6 @@ static __always_inline uint32_t apic_timer_get_current()
  */
 void apic_timer_init();
 
+void apic_timer_ap_core_init();
+
 #pragma GCC pop_options

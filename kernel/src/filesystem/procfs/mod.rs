@@ -1,6 +1,5 @@
-use std::fs::File;
-
 use alloc::{
+    borrow::ToOwned,
     collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
@@ -10,11 +9,9 @@ use alloc::{
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
     include::bindings::bindings::{
-        process_control_block, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT,
-        ENOTDIR, ENOTEMPTY, EPERM,
+        process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR, ENOTEMPTY, EPERM,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    print, println,
     time::TimeSpec,
 };
 
@@ -87,49 +84,58 @@ pub struct ProcFSInode {
 /// 对ProcFSInode实现获取各类文件信息的函数
 impl ProcFSInode {
     /// 获取进程status,展示状态信息
-    fn get_info_status(&self) {
+    fn get_info_status(&mut self) {
         // 获取该pid对应的pcb结构体
         let pid_t = &self.fdata.pid;
-        let pcb_t = unsafe { process_find_pcb_by_pid(pid_t) };
+        let pcb_t = unsafe { *process_find_pcb_by_pid(*pid_t) };
         // 传入数据
-        let mut pdata = &self.data;
-        pdata.push("Name:\t".to_string());
-        pdata.push(pcb_t.name);
-        pdata.push("\nstate:\t".to_string());
-        pdata.push(pcb_t.state);
-        pdata.push("\npid:\t".to_string());
-        pdata.push(pcb_t.pid);
-        pdata.push("\nPpid:\t".to_string());
-        pdata.push(pcb_t.parent_pcb.pid);
-        pdata.push("\ncpu_id:\t".to_string());
-        pdata.push(pcb_t.cpu_id);
-        pdata.push("\npriority:\t".to_string());
-        pdata.push(pcb_t.priority);
-        pdata.push("\npreempt:\t".to_string());
-        pdata.push(pcb_t.preempt_count);
-        pdata.push("\nvrtime:\t".to_string());
-        pdata.push(pcb_t.virtual_runtime);
+        let pdata = &mut self.data;
+        let mut t_name: Vec<u8> = Vec::new();
+        for val in pcb_t.name.iter() {
+            t_name.push(*val as u8)
+        }
+        pdata.append(&mut "Name:\t".as_bytes().to_owned());
+        pdata.append(&mut t_name);
+        pdata.append(&mut "\nstate:\t".as_bytes().to_owned());
+        pdata.push(pcb_t.state as u8);
+        pdata.append(&mut "\npid:\t".as_bytes().to_owned());
+        pdata.push(pcb_t.pid as u8);
+        pdata.append(&mut "\nPpid:\t".as_bytes().to_owned());
+        pdata.push(unsafe { *pcb_t.parent_pcb }.pid as u8);
+        pdata.append(&mut "\ncpu_id:\t".as_bytes().to_owned());
+        pdata.push(pcb_t.cpu_id as u8);
+        pdata.append(&mut "\npriority:\t".as_bytes().to_owned());
+        pdata.push(pcb_t.priority as u8);
+        pdata.append(&mut "\npreempt:\t".as_bytes().to_owned());
+        pdata.push(pcb_t.preempt_count as u8);
+        pdata.append(&mut "\nvrtime:\t".as_bytes().to_owned());
+        pdata.push(pcb_t.virtual_runtime as u8);
 
         // 当前进程运行过程中占用内存的峰值
-        let hiwater_vm = pcb_t.mm.vmas.vm_end - pcb_t.mm.vmas.vm_start;
+        let hiwater_vm =
+            unsafe { *(*pcb_t.mm).vmas }.vm_end - unsafe { *(*pcb_t.mm).vmas }.vm_start;
         // 进程数据段的大小
-        let text = pcb_t.mm.code_addr_end - pcb_t.mm.code_addr_start;
+        let text = unsafe { *pcb_t.mm }.code_addr_end - unsafe { *pcb_t.mm }.code_addr_start;
         // 进程代码的大小
-        let data = pcb_t.mm.data_addr_end - pcb_t.mm.data_addr_start;
+        let data = unsafe { *pcb_t.mm }.data_addr_end - unsafe { *pcb_t.mm }.data_addr_start;
 
-        pdata.push("\nVmPeak:".to_string());
-        pdata.push(hiwater_vm);
-        pdata.push(" kB".to_string());
-        pdata.push("\nVmData:".to_string());
-        pdata.push(data);
-        pdata.push(" kB".to_string());
-        pdata.push("\nVmExe:".to_string());
-        pdata.push(text);
-        pdata.push(" kB\n".to_string());
+        pdata.append(&mut "\nVmPeak:".as_bytes().to_owned());
+        pdata.push(hiwater_vm as u8);
+        pdata.append(&mut " kB".as_bytes().to_owned());
+        pdata.append(&mut "\nVmData:".as_bytes().to_owned());
+        pdata.push(data as u8);
+        pdata.append(&mut " kB".as_bytes().to_owned());
+        pdata.append(&mut "\nVmExe:".as_bytes().to_owned());
+        pdata.push(text as u8);
+        pdata.append(&mut " kB\n".as_bytes().to_owned());
+
+        // self.data = pdata;
     }
 
+    // fn get_priInfo(&self) -> InodeInfo{
+    //     self.fdata.clo
+    // }
     // todo:其他数据获取函数实现
-
 }
 
 impl FileSystem for ProcFS {
@@ -190,24 +196,19 @@ impl ProcFS {
         return result;
     }
 
-    pub fn root(&self) -> Arc<ProcINode> {
-        self.root_inode.clone()
-    }
-
     /// @brief 进程注册函数
     /// @usage 在进程中调用并创建进程对应文件
-    /// 
     pub fn procfs_register_pid(&self, pid: i64) -> Result<(), i32> {
-        
         // 获取当前inode
         let proc = self.get_root_inode();
         // 创建对应进程文件夹
-        let pf = proc.create(&pid.to_string(), Dir, 0).unwrap();
+        let _pf = proc.create(&pid.to_string(), FileType::Dir, 0).unwrap();
         // 创建相关文件
         // status文件
-        let sf: ProcFSInode = pf.create("status", File, 0).unwrap().as_any_ref();
-        sf.fdata.pid = pid;
-        
+        let binding = _pf.create("status", FileType::File, 0).unwrap();
+        let _sf = binding.as_any_ref().downcast_ref::<ProcFSInode>().unwrap();
+        _sf.fdata.pid = pid;
+
         //todo: 创建其他文件
 
         return Ok(());
@@ -220,7 +221,7 @@ impl IndexNode for LockedProcFSInode {
             return Err(-(EINVAL as i32));
         }
         // 加锁
-        let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
+        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
@@ -228,7 +229,7 @@ impl IndexNode for LockedProcFSInode {
         }
 
         // 根据文件类型获取相应数据
-        match inode.ptype {
+        match inode.fdata.ftype {
             ProcFileType::ProcStatus => inode.get_info_status(),
             ProcFileType::Default => (),
         }

@@ -9,7 +9,8 @@ use alloc::{
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
     include::bindings::bindings::{
-        process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR, ENOTEMPTY, EPERM,
+        process_control_block, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT,
+        ENOTDIR, ENOTEMPTY, EPERM,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
@@ -86,10 +87,10 @@ impl ProcFSInode {
     /// 获取进程status,展示状态信息
     fn get_info_status(&mut self) {
         // 获取该pid对应的pcb结构体
-        let pid_t = &self.fdata.pid;
-        let pcb_t = unsafe { *process_find_pcb_by_pid(*pid_t) };
+        let pid_t: &i64 = &self.fdata.pid;
+        let pcb_t: process_control_block = unsafe { *process_find_pcb_by_pid(*pid_t) };
         // 传入数据
-        let pdata = &mut self.data;
+        let pdata: &mut Vec<u8> = &mut self.data;
         let mut t_name: Vec<u8> = Vec::new();
         for val in pcb_t.name.iter() {
             t_name.push(*val as u8)
@@ -112,12 +113,12 @@ impl ProcFSInode {
         pdata.push(pcb_t.virtual_runtime as u8);
 
         // 当前进程运行过程中占用内存的峰值
-        let hiwater_vm =
+        let hiwater_vm: u64 =
             unsafe { *(*pcb_t.mm).vmas }.vm_end - unsafe { *(*pcb_t.mm).vmas }.vm_start;
         // 进程数据段的大小
-        let text = unsafe { *pcb_t.mm }.code_addr_end - unsafe { *pcb_t.mm }.code_addr_start;
+        let text: u64 = unsafe { *pcb_t.mm }.code_addr_end - unsafe { *pcb_t.mm }.code_addr_start;
         // 进程代码的大小
-        let data = unsafe { *pcb_t.mm }.data_addr_end - unsafe { *pcb_t.mm }.data_addr_start;
+        let data: u64 = unsafe { *pcb_t.mm }.data_addr_end - unsafe { *pcb_t.mm }.data_addr_start;
 
         pdata.append(&mut "\nVmPeak:".as_bytes().to_owned());
         pdata.push(hiwater_vm as u8);
@@ -200,14 +201,17 @@ impl ProcFS {
     /// @usage 在进程中调用并创建进程对应文件
     pub fn procfs_register_pid(&self, pid: i64) -> Result<(), i32> {
         // 获取当前inode
-        let proc = self.get_root_inode();
+        let proc: Arc<dyn IndexNode> = self.get_root_inode();
         // 创建对应进程文件夹
-        let _pf = proc.create(&pid.to_string(), FileType::Dir, 0).unwrap();
+        let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0).unwrap();
         // 创建相关文件
         // status文件
-        let binding = _pf.create("status", FileType::File, 0).unwrap();
-        let _sf = binding.as_any_ref().downcast_ref::<ProcFSInode>().unwrap();
-        _sf.fdata.pid = pid;
+        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0).unwrap();
+        let _sf: &LockedProcFSInode = binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        _sf.0.lock().fdata.pid = pid;
 
         //todo: 创建其他文件
 

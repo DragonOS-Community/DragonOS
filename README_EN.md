@@ -4,7 +4,7 @@
 
 &nbsp;
 
-&emsp;&emsp;This project is a operating system running on computer which is in X86_ 64 Architecture . The DragonOS is currently under development!
+&emsp;&emsp;DragonOS is an operating system running on the X86_64 Architecture. This project is currently under development!
 
 [All you want to know about DragonOS is here - DragonOS](https://dragonos.org/uncategorized/summary/)
 
@@ -19,7 +19,7 @@
 
 ## How to run?
 
-&emsp;&emsp;The steps to run DragonOS are very simple. You can refer to the following materials to run DragonOS in the shortest 15 minutes!
+&emsp;&emsp;The steps to run DragonOS are very simple. You can refer to the following information to run DragonOS within 15 minutes at the fastest!
 
 - [Building DragonOS - DragonOS dev document](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html#docker)
 
@@ -33,11 +33,11 @@
 
 ## How to join DragonOS ?
 
-&emsp;&emsp;If you are willing to join us, you can check the project panel of GitHub warehouse, select the recently planned functions, and improve them.
+&emsp;&emsp;If you are willing to join us, you can check the project panel of the GitHub repo, select the recently planned functions, and improve them.
 
-&emsp;&emsp;Or, you can also bring your ideas and ideas, discuss with the community partners, and create some new functions for dragonos.
+&emsp;&emsp;Or, you can also bring your ideas, discuss with community members, and create some new functions for DragonOS.
 
-## How to come in contact with the community?
+## How to contact the community?
 
 &emsp;&emsp;You can send me an email. My email address is[ longjin@RinGoTek.cn ](mailto: longjin@RinGoTek.cn )。
 

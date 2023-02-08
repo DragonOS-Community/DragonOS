@@ -25,12 +25,12 @@ mod ipc;
 #[macro_use]
 mod libs;
 mod exception;
+mod io;
 mod mm;
 mod process;
 mod sched;
 mod smp;
 mod time;
-mod io;
 
 extern crate alloc;
 #[macro_use]

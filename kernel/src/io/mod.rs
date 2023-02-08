@@ -1,3 +1,4 @@
+pub mod block;
 pub mod device;
 pub mod disk_info;
 

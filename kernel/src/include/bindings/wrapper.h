@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include <common/blk_types.h>
+#include <common/completion.h>
 #include <common/crc16.h>
 #include <common/crc32.h>
 #include <common/crc64.h>
@@ -18,12 +20,14 @@
 #include <common/gfp.h>
 #include <common/glib.h>
 #include <common/kfifo.h>
+#include <common/kthread.h>
 #include <common/list.h>
 #include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
+#include <common/time.h>
 #include <common/unistd.h>
-#include <common/glib.h>
+#include <driver/disk/ahci/ahci.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
 #include <mm/mm.h>

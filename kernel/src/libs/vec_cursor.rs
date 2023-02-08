@@ -1,10 +1,3 @@
-/*
-* 模块：VecCursor
-* 说明：本模块用于为数组提供游标的功能，以简化其操作。
-*
-* Maintainer: 龙进 <longjin@RinGoTek.cn>
-*/
-
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
@@ -14,6 +7,7 @@ use crate::{
     io::SeekFrom,
 };
 
+/// @brief 本模块用于为数组提供游标的功能，以简化其操作。
 #[derive(Debug)]
 pub struct VecCursor {
     /// 游标管理的数据
@@ -120,6 +114,7 @@ impl VecCursor {
                 pos = self.pos as i64 + offset;
             }
             SeekFrom::SeekEnd(offset) => {
+                // 请注意，此处的offset应小于等于0，否则肯定是不合法的
                 pos = self.data.len() as i64 + offset;
             }
             SeekFrom::Invalid => {

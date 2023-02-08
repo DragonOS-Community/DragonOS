@@ -1,6 +1,6 @@
 use alloc::{string::String, sync::Arc};
 
-use crate::include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE};
+use crate::{include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE}, io::SeekFrom};
 
 use super::{FileType, IndexNode, Metadata};
 
@@ -41,26 +41,6 @@ pub enum FileMode {
     O_DIRECTORY = 0004000,
     /// Do not follow symbolic links
     O_NOFOLLOW = 0010000,
-}
-
-#[derive(Debug)]
-#[repr(u8)]
-pub enum SeekOrigin {
-    SeekSet = 0,
-    SeekCurrent = 1,
-    SeekEnd = 2,
-    Invalid,
-}
-
-impl From<u8> for SeekOrigin {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => SeekOrigin::SeekSet,
-            1 => SeekOrigin::SeekCurrent,
-            2 => SeekOrigin::SeekEnd,
-            _ => SeekOrigin::Invalid,
-        }
-    }
 }
 
 /// @brief 抽象文件结构体
@@ -133,23 +113,23 @@ impl File {
     /// @brief 调整文件操作指针的位置
     ///
     /// @param origin 调整的起始位置
-    pub fn lseek(&mut self, origin: SeekOrigin, offset: i64) -> Result<usize, i32> {
+    pub fn lseek(&mut self, origin: SeekFrom) -> Result<usize, i32> {
         if self.inode.metadata().unwrap().file_type == FileType::Pipe {
             return Err(-(ESPIPE as i32));
         }
-        let pos;
+        let pos: i64;
         match origin {
-            SeekOrigin::SeekSet => {
+            SeekFrom::SeekSet(offset) => {
                 pos = offset;
             }
-            SeekOrigin::SeekCurrent => {
-                pos = (self.offset as i64) + offset;
+            SeekFrom::SeekCurrent(offset) => {
+                pos = self.offset as i64 + offset;
             }
-            SeekOrigin::SeekEnd => {
+            SeekFrom::SeekEnd(offset) => {
                 let metadata = self.metadata()?;
                 pos = metadata.size + offset;
             }
-            SeekOrigin::Invalid => {
+            SeekFrom::Invalid => {
                 return Err(-(EINVAL as i32));
             }
         }

@@ -6,6 +6,7 @@
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
+#include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/stdio.h>
@@ -23,15 +24,13 @@
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/procfs/procfs.h>
 #include <filesystem/rootfs/rootfs.h>
+#include <io/block/block_io_scheduler.h>
 #include <ktest/ktest.h>
+#include <mm/mmio.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-
-#include <mm/mmio.h>
-
-#include <common/lz4.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -499,6 +498,7 @@ ul initial_kernel_thread(ul arg)
 
     scm_enable_double_buffer();
 
+    block_io_scheduler_init();
     ahci_init();
     fat32_init();
     rootfs_umount();
@@ -528,7 +528,6 @@ ul initial_kernel_thread(ul arg)
 
     // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
     // kdebug("process:rt test kthread is created!!!!");
-
 
     // 准备切换到用户态
     struct pt_regs *regs;
@@ -649,11 +648,6 @@ void process_init()
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
 
-    /*
-    kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
-    kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
-    kdebug("initial_tss[0].ist1=%#018lx", initial_tss[0].ist1);
-*/
     // 初始化pid的写锁
 
     spin_init(&process_global_pid_write_lock);
@@ -714,7 +708,6 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
  */
 int process_wakeup(struct process_control_block *pcb)
 {
-    // kdebug("pcb pid = %#018lx", pcb->pid);
 
     BUG_ON(pcb == NULL);
     if (pcb == NULL)
@@ -724,8 +717,8 @@ int process_wakeup(struct process_control_block *pcb)
         return 0;
 
     pcb->state |= PROC_RUNNING;
-    sched_enqueue(pcb);
-    return 1;
+    sched_enqueue(pcb, true);
+    return 0;
 }
 
 /**
@@ -741,7 +734,13 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (retval != 0)
         return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
-    current_pcb->flags |= PF_NEED_SCHED;
+        current_pcb->flags |= PF_NEED_SCHED;
+
+    if (pcb->cpu_id == current_pcb->cpu_id)
+        sched();
+    else
+        kick_cpu(pcb->cpu_id);
+    return 0;
 }
 
 /**
@@ -802,7 +801,6 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
         vma = cur_vma->vm_next;
 
         uint64_t pa;
-        // kdebug("vm start=%#018lx, sem=%d", cur_vma->vm_start, cur_vma->anon_vma->sem.counter);
         mm_unmap_vma(pcb->mm, cur_vma, &pa);
 
         uint64_t size = (cur_vma->vm_end - cur_vma->vm_start);
@@ -876,7 +874,6 @@ int process_fd_alloc(struct vfs_file_t *file)
 
     for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
     {
-        // kdebug("currentpcb->fds[%d]=%#018lx", i, current_pcb->fds[i]);
         /* 找到指针数组中的空位 */
         if (current_pcb->fds[i] == NULL)
         {

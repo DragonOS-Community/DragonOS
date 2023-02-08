@@ -8,6 +8,7 @@ pub const DISK_NAME_LEN: usize = 32; // 磁盘名称的最大长度
 pub const BLK_GF_AHCI: u16 = 1 << 0; // 定义blk_gendisk中的标志位
 
 /// @brief: 磁盘的分区信息 - (保留了c版本的数据信息)
+#[derive(Debug)]
 pub struct Partition {
     pub start_sector: SectorT, // 该分区的起始扇区
     pub bstart_lba: u64,       // 起始LBA号

@@ -1,8 +1,9 @@
 use alloc::sync::Arc;
 
-use super::fs::BlockDevice;
-
-
+use crate::io::{
+    device::{BlockDevice, Device},
+    disk_info::Partition,
+};
 
 /// 对于所有的FAT文件系统都适用的Bios Parameter Block结构体
 #[derive(Debug, Clone, Copy, Default)]
@@ -145,9 +146,11 @@ impl Default for FATType {
     }
 }
 
-
 impl BiosParameterBlock {
-    pub fn new(device: Arc<dyn BlockDevice>) -> Result<BiosParameterBlock, i32> {
+    pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, i32> {
+        let mut bpb = BiosParameterBlock::default();
+        let device: Arc<dyn Device> = partition.belong_disk.device();
+
         todo!()
     }
 

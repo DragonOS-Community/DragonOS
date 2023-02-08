@@ -7,4 +7,5 @@ pub mod atomic;
 pub mod list;
 pub mod lockref;
 pub mod mutex;
+pub mod vec_cursor;
 pub mod wait_queue;

@@ -1,3 +1,5 @@
+use core::any::Any;
+
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -279,5 +281,11 @@ impl FileSystem for MountFS {
 
     fn info(&self) -> super::FsInfo {
         return self.inner_filesystem.info();
+    }
+
+    /// @brief 本函数用于实现动态转换。
+    /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
+    fn as_any_ref(&self) -> &dyn Any{
+        self
     }
 }

@@ -1,3 +1,5 @@
+use core::{any::Any, fmt::Debug};
+
 use crate::include::bindings::bindings::E2BIG;
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -8,7 +10,7 @@ use crate::include::bindings::bindings::E2BIG;
 // <blk_dev as BlockDevice>::read_at() 调用的是BlockDevice的函数
 
 /// 引入Module
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 /// 定义类型
 pub type BlockId = usize;
@@ -18,7 +20,7 @@ const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1
 
 /// @brief 设备应该实现的操作
 /// @usage Device::read_at()
-pub trait Device: Send + Sync {
+pub trait Device: Any + Send + Sync + Debug {
     /// Notice buffer对应设备按字节划分，使用u8类型
     /// Notice offset应该从0开始计数
 
@@ -46,8 +48,9 @@ pub trait BlockSize {
 }
 
 /// @brief 块设备应该实现的操作
-pub trait BlockDevice: Send + Sync {
+pub trait BlockDevice: Any + Send + Sync + Debug {
     /// @brief: 在块设备中，从第lba_id_start个块开始，读取count个块数据，存放到buf中
+    ///
     /// @parameter lba_id_start: 起始块
     /// @parameter count: 读取块的数量
     /// @parameter buf: 目标数组
@@ -63,10 +66,20 @@ pub trait BlockDevice: Send + Sync {
     fn sync(&self) -> Result<(), i32>;
 
     // TODO: 待实现 open, close
+
+    /// @brief 本函数用于实现动态转换。
+    /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
+    fn as_any_ref(&self) -> &dyn Any;
+
+    /// @brief 本函数用于将BlockDevice转换为Device。
+    /// 由于实现了BlockDevice的结构体，本身也实现了Device Trait, 因此转换是可能的。
+    /// 思路：在BlockDevice的结构体中新增一个self_ref变量，返回self_ref.upgrade()即可。
+    fn device(&self) -> Arc<dyn Device>;
+    
 }
 
 /// 对于所有<块设备>自动实现 Device Trait 的 read_at 和 write_at 函数
-impl<T: BlockDevice + BlockSize> Device for T {
+impl<T: BlockDevice + BlockSize + Debug> Device for T {
     // 读取设备操作，读取设备内部 [offset, offset + buf.len) 区间内的字符，存放到 buf 中
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
         // assert!(len <= buf.len());
@@ -216,15 +229,15 @@ impl BlockIter {
         let lba_end = self.end / blk_size;
 
         // 如果不是整块，先返回非整块的小部分
-        if __addr_to_lba_id(self.begin, blk_size)
-            != __addr_to_lba_id(self.begin + blk_size - 1, blk_size)
+        if __bytes_to_lba(self.begin, blk_size)
+            != __bytes_to_lba(self.begin + blk_size - 1, blk_size)
             || lba_start == lba_end
         {
             return self.next_block();
         }
 
         let begin = self.begin % blk_size; // 因为是多个整块，这里必然是0
-        let end = __lba_id_to_addr(lba_end, blk_size) - self.begin;
+        let end = __lba_to_bytes(lba_end, blk_size) - self.begin;
         // assert!(begin == 0);
         // assert!(end % blk_size == 0);
 
@@ -285,12 +298,12 @@ impl BlockRange {
 
 /// 从字节地址转换到lba id
 #[inline]
-fn __addr_to_lba_id(addr: usize, blk_size: usize) -> BlockId {
+pub fn __bytes_to_lba(addr: usize, blk_size: usize) -> BlockId {
     return addr / blk_size;
 }
 
 /// 从lba id转换到字节地址， 返回lba_id的最左侧字节
 #[inline]
-fn __lba_id_to_addr(lba_id: usize, blk_size: usize) -> BlockId {
+pub fn __lba_to_bytes(lba_id: usize, blk_size: usize) -> BlockId {
     return lba_id * blk_size;
 }

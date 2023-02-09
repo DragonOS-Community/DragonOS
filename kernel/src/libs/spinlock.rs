@@ -134,11 +134,10 @@ impl RawSpinlock {
     }
 
     /// @brief 恢复rflags以及中断状态并解锁自旋锁
-    pub fn unlock_irqrestore(&self, flags: &u64){
+    pub fn unlock_irqrestore(&self, flags: &u64) {
         self.unlock();
         local_irq_restore(flags);
     }
-
 }
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///

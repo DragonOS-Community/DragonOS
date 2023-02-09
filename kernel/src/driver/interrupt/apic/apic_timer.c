@@ -1,12 +1,29 @@
 #include "apic_timer.h"
+#include <common/kprint.h>
 #include <exception/irq.h>
 #include <process/process.h>
-#include <common/kprint.h>
 #include <sched/sched.h>
 
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
 uint64_t apic_timer_ticks_result = 0;
+static spinlock_t apic_timer_init_lock = {1};
+// bsp 是否已经完成apic时钟初始化
+static bool bsp_initialized = false;
+
+/**
+ * @brief 初始化AP核的apic时钟
+ *
+ */
+void apic_timer_ap_core_init()
+{
+    while (!bsp_initialized)
+    {
+        pause();
+    }
+
+    apic_timer_init();
+}
 
 void apic_timer_enable(uint64_t irq_num)
 {
@@ -55,13 +72,12 @@ void apic_timer_uninstall(ul irq_num)
     io_mfence();
 }
 
-hardware_intr_controller apic_timer_intr_controller =
-    {
-        .enable = apic_timer_enable,
-        .disable = apic_timer_disable,
-        .install = apic_timer_install,
-        .uninstall = apic_timer_uninstall,
-        .ack = apic_local_apic_edge_ack,
+hardware_intr_controller apic_timer_intr_controller = {
+    .enable = apic_timer_enable,
+    .disable = apic_timer_disable,
+    .install = apic_timer_install,
+    .uninstall = apic_timer_uninstall,
+    .ack = apic_local_apic_edge_ack,
 };
 
 /**
@@ -84,15 +100,23 @@ void apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
  */
 void apic_timer_init()
 {
+
     if (apic_timer_ticks_result == 0)
     {
         kBUG("APIC timer ticks in 5ms is equal to ZERO!");
         while (1)
             hlt();
     }
+    spin_lock(&apic_timer_init_lock);
     kinfo("Initializing apic timer for cpu %d", proc_current_cpu_id);
     io_mfence();
-    irq_register(APIC_TIMER_IRQ_NUM, &apic_timer_ticks_result, &apic_timer_handler, 0, &apic_timer_intr_controller, "apic timer");
+    irq_register(APIC_TIMER_IRQ_NUM, &apic_timer_ticks_result, &apic_timer_handler, 0, &apic_timer_intr_controller,
+                 "apic timer");
     io_mfence();
+    if (proc_current_cpu_id == 0)
+    {
+        bsp_initialized = true;
+    }
+    spin_unlock(&apic_timer_init_lock);
     // kinfo("Successfully initialized apic timer for cpu %d", proc_current_cpu_id);
 }

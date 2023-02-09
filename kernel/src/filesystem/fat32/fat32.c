@@ -372,10 +372,11 @@ find_lookup_success:; // 找到目标dentry
  */
 struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
 {
+    // BUG
     // 读取文件系统的boot扇区
     uint8_t buf[512] = {0};
-    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, blk->bd_start_LBA, 1, (uint64_t)&buf);
 
+    blk->bd_disk->fops->transfer(blk->bd_disk, AHCI_CMD_READ_DMA_EXT, blk->bd_start_LBA, 1, (uint64_t)&buf);
     // 分配超级块的空间
     struct vfs_superblock_t *sb_ptr = (struct vfs_superblock_t *)kzalloc(sizeof(struct vfs_superblock_t), 0);
     blk->bd_superblock = sb_ptr;
@@ -445,7 +446,6 @@ struct vfs_superblock_t *fat32_read_superblock(struct block_device *blk)
     finode->create_date = 0;
     finode->write_date = 0;
     finode->write_time;
-
     return sb_ptr;
 }
 
@@ -1411,8 +1411,6 @@ void fat32_init()
 
     // 在VFS中注册fat32文件系统
     vfs_register_filesystem(&fat32_fs_type);
-
     // 挂载根文件系统
     fat32_register_partition(ahci_gendisk0.partition + 0, 0);
-    kinfo("FAT32 initialized.");
 }

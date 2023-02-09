@@ -100,7 +100,7 @@ impl MountFSInode {
     /// @brief 在当前inode下，挂载一个文件系统
     ///
     /// @return Ok(Arc<MountFS>) 挂载成功，返回指向
-    pub fn mount(&mut self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
+    pub fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {
             return Err(-(ENOTDIR as i32));

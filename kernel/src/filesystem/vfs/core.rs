@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 
 use crate::{filesystem::{
     ramfs::RamFS,
-    vfs::{mount::MountFS, FileSystem, FileType},
+    vfs::{mount::{MountFS, MountFSInode}, FileSystem, FileType}, procfs::ProcFS,
 }, kdebug};
 
 use super::{IndexNode, InodeId};
@@ -27,9 +27,15 @@ lazy_static! {
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.get_root_inode();
 
-        // 创建文件夹
+        // 创建procfs实例
+        let procfs = ProcFS::new();
+        let proc_fs = MountFS::new(procfs, None);
+
+        // 创建文件夹 
         root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
+        // procfs mount
+        let _t = root_inode.find("proc").unwrap().as_any_ref().downcast_ref::<MountFSInode>().unwrap().mount(proc_fs);
         root_inode
     };
 }
@@ -42,6 +48,19 @@ pub fn __test_filesystem(){
         __test_rootfs();
 }
 
+/// @brief procfs测试函数
+pub fn _test_procfs(pid: i64){
+    __test_procfs(pid);
+}
+
 fn __test_rootfs(){
     kdebug!("root inode.list()={:?}", ROOT_INODE.list());
+}
+
+fn __test_procfs(pid: i64){
+    // 获取procfs实例
+    let _p = ROOT_INODE.find("proc").unwrap();
+    // 调用注册函数
+    // _p.procfs_register_pid(pid);
+    // 
 }

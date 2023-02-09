@@ -12,13 +12,18 @@
 
 #include "ipi.h"
 
+static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
+
 static spinlock_t multi_core_starting_lock = {1}; // 多核启动锁
 
 static struct acpi_Processor_Local_APIC_Structure_t *proc_local_apic_structs[MAX_SUPPORTED_PROCESSOR_NUM];
 static uint32_t total_processor_num = 0;
-int current_starting_cpu = 0;
+static int current_starting_cpu = 0;
 
-int num_cpu_started = 1;
+static int num_cpu_started = 1;
+
+// kick cpu 功能所使用的中断向量号
+#define KICK_CPU_IRQ_NUM 0xc8
 
 void smp_init()
 {
@@ -49,7 +54,10 @@ void smp_init()
     ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, 0x00);
 
     kdebug("total_processor_num=%d", total_processor_num);
-    kdebug("rflags=%#018lx", get_rflags());
+    // 注册接收kick_cpu功能的处理函数。（向量号200）
+    ipi_regiserIPI(KICK_CPU_IRQ_NUM, NULL, &__smp_kick_cpu_handler, NULL, NULL, "IPI kick cpu");
+
+    int core_to_start = 0;
     // total_processor_num = 3;
     for (int i = 0; i < total_processor_num; ++i) // i从1开始，不初始化bsp
     {
@@ -61,15 +69,16 @@ void smp_init()
                proc_local_apic_structs[i]->flags);
         if (proc_local_apic_structs[i]->local_apic_id == 0)
         {
-            --total_processor_num;
+            // --total_processor_num;
             continue;
         }
         if (!((proc_local_apic_structs[i]->flags & 0x1) || (proc_local_apic_structs[i]->flags & 0x2)))
         {
-            --total_processor_num;
+            // --total_processor_num;
             kdebug("processor %d cannot be enabled.", proc_local_apic_structs[i]->ACPI_Processor_UID);
             continue;
         }
+        ++core_to_start;
         // continue;
         io_mfence();
         spin_lock(&multi_core_starting_lock);
@@ -114,7 +123,7 @@ void smp_init()
                      proc_local_apic_structs[i]->local_apic_id);
     }
     io_mfence();
-    while (num_cpu_started != total_processor_num)
+    while (num_cpu_started != (core_to_start + 1))
         pause();
 
     kinfo("Cleaning page table remapping...\n");
@@ -162,8 +171,8 @@ void smp_ap_start()
     current_pcb->virtual_runtime = 0;
 
     current_pcb->thread = (struct thread_struct *)(current_pcb + 1); // 将线程结构体放置在pcb后方
-    current_pcb->thread->rbp = _stack_start;
-    current_pcb->thread->rsp = _stack_start;
+    current_pcb->thread->rbp = cpu_core_info[current_starting_cpu].stack_start;
+    current_pcb->thread->rsp = cpu_core_info[current_starting_cpu].stack_start;
     current_pcb->thread->fs = KERNEL_DS;
     current_pcb->thread->gs = KERNEL_DS;
     current_pcb->cpu_id = current_starting_cpu;
@@ -173,14 +182,22 @@ void smp_ap_start()
     load_TR(10 + current_starting_cpu * 2);
     current_pcb->preempt_count = 0;
 
+    sched_set_cpu_idle(current_starting_cpu, current_pcb);
+
     io_mfence();
     spin_unlock(&multi_core_starting_lock);
     preempt_disable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count
     io_mfence();
+    current_pcb->flags |= PF_NEED_SCHED;
     sti();
+    apic_timer_ap_core_init();
+    sched();
 
     while (1)
+    {
+        // kdebug("123");
         hlt();
+    }
 
     while (1)
     {
@@ -188,4 +205,44 @@ void smp_ap_start()
     }
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();
+}
+
+/**
+ * @brief kick_cpu 核心间通信的处理函数
+ *
+ * @param irq_num
+ * @param param
+ * @param regs
+ */
+static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs)
+{
+    if (user_mode(regs))
+        return;
+    sched();
+}
+
+/**
+ * @brief 使得指定的cpu核心立即运行调度
+ *
+ * @param cpu_id cpu核心号
+ */
+int kick_cpu(uint32_t cpu_id)
+{
+    if (cpu_id >= MAX_CPU_NUM)
+    {
+        return -EINVAL;
+    }
+    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, KICK_CPU_IRQ_NUM, ICR_APIC_FIXED,
+                 ICR_ALL_EXCLUDE_Self, 0);
+    return 0;
+}
+
+/**
+ * @brief 获取当前全部的cpu数目
+ *
+ * @return uint32_t
+ */
+uint32_t smp_get_total_cpu()
+{
+    return num_cpu_started;
 }

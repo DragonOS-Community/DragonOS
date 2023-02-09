@@ -4,10 +4,7 @@ use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{
-        initial_proc_union, process_control_block, PF_NEED_SCHED, SCHED_FIFO, SCHED_NORMAL,
-        SCHED_RR,
-    },
+    include::bindings::bindings::{process_control_block, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR},
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
 };
@@ -73,12 +70,11 @@ impl RTQueue {
             res = Some(self.queue.pop().unwrap());
         } else {
             // 如果队列为空，则返回None
-            res=None;
+            res = None;
         }
         self.lock.unlock();
         return res;
     }
-
 }
 
 /// @brief RT调度器类
@@ -110,7 +106,7 @@ impl SchedulerRT {
         for i in 0..SchedulerRT::MAX_RT_PRIO {
             let cpu_queue_i: &mut RTQueue = self.cpu_queue[i as usize];
             let proc: Option<&'static mut process_control_block> = cpu_queue_i.dequeue();
-            if proc.is_some(){
+            if proc.is_some() {
                 return proc;
             }
         }
@@ -132,10 +128,10 @@ impl Scheduler for SchedulerRT {
         if proc.policy == SCHED_FIFO {
             // 如果挑选的进程优先级小于当前进程，则不进行切换
             if proc.priority <= current_pcb().priority {
-                sched_enqueue(proc);
+                sched_enqueue(proc, false);
             } else {
                 // 将当前的进程加进队列
-                sched_enqueue(current_pcb());
+                sched_enqueue(current_pcb(), false);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 return Some(proc);
             }
@@ -148,19 +144,19 @@ impl Scheduler for SchedulerRT {
                 if proc.rt_time_slice <= 0 {
                     proc.rt_time_slice = SchedulerRT::RR_TIMESLICE;
                     proc.flags |= !(PF_NEED_SCHED as u64);
-                    sched_enqueue(proc);
+                    sched_enqueue(proc, false);
                 }
                 // 目标进程时间片未耗尽，切换到目标进程
                 else {
                     // 将当前进程加进队列
-                    sched_enqueue(current_pcb());
+                    sched_enqueue(current_pcb(), false);
                     compiler_fence(core::sync::atomic::Ordering::SeqCst);
                     return Some(proc);
                 }
             }
             // curr优先级更大，说明一定是实时进程，将所选进程入队列
             else {
-                sched_enqueue(proc);
+                sched_enqueue(proc, false);
             }
         }
         return None;

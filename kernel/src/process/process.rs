@@ -56,8 +56,9 @@ pub extern "C" fn process_try_to_wake_up(
         // 可以wakeup
         unsafe {
             write_volatile(&mut pcb.state, PROC_RUNNING as u64);
-            sched_enqueue(pcb);
         }
+        sched_enqueue(pcb, true);
+
         retval = true;
     }
     // todo: 对pcb的pi_lock放锁

@@ -25,6 +25,7 @@ mod ipc;
 #[macro_use]
 mod libs;
 mod exception;
+pub mod io;
 mod mm;
 mod process;
 mod sched;

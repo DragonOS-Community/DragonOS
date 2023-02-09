@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{fmt::Debug, any::Any};
 
 use alloc::{
     collections::BTreeMap,
@@ -101,6 +101,12 @@ impl FileSystem for FATFileSystem {
 
     fn info(&self) -> crate::filesystem::vfs::FsInfo {
         todo!()
+    }
+
+    /// @brief 本函数用于实现动态转换。
+    /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
+    fn as_any_ref(&self) -> &dyn Any{
+        self
     }
 }
 

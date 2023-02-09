@@ -13,6 +13,8 @@ use crate::{
     time::TimeSpec,
 };
 
+use self::mount::MountFS;
+
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: u32 = 1024;
 
@@ -228,6 +230,12 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+
+    /// @brief 在当前Inode下，挂载一个新的文件系统
+    /// 请注意！该函数只能被MountFS实现，其他文件系统不应实现这个函数
+    fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32>{
+        return Err(-(ENOTSUP as i32));
+    }
 }
 
 impl dyn IndexNode {

@@ -99,25 +99,6 @@ impl MountFSInode {
         }
     }
 
-    /// @brief 在当前inode下，挂载一个文件系统
-    ///
-    /// @return Ok(Arc<MountFS>) 挂载成功，返回指向
-    pub fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
-        let metadata = self.inner_inode.metadata()?;
-        if metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
-        }
-
-        // 为新的挂载点创建挂载文件系统
-        let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
-        // 将新的挂载点-挂载文件系统添加到父级的挂载树
-        self.mount_fs
-            .mountpoints
-            .lock()
-            .insert(metadata.inode_id, new_mount_fs.clone());
-        return Ok(new_mount_fs);
-    }
-
     /// @brief 判断当前inode是否为它所在的文件系统的root inode
     fn is_mountpoint_root(&self) -> Result<bool, i32> {
         return Ok(self.inner_inode.fs().get_root_inode().metadata()?.inode_id
@@ -268,6 +249,24 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.ioctl(cmd, data);
     }
 
+    /// @brief 在当前inode下，挂载一个文件系统
+    ///
+    /// @return Ok(Arc<MountFS>) 挂载成功，返回指向MountFS的指针
+    fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
+        let metadata = self.inner_inode.metadata()?;
+        if metadata.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+
+        // 为新的挂载点创建挂载文件系统
+        let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
+        // 将新的挂载点-挂载文件系统添加到父级的挂载树
+        self.mount_fs
+            .mountpoints
+            .lock()
+            .insert(metadata.inode_id, new_mount_fs.clone());
+        return Ok(new_mount_fs);
+    }
 }
 
 impl FileSystem for MountFS {
@@ -285,7 +284,7 @@ impl FileSystem for MountFS {
 
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
-    fn as_any_ref(&self) -> &dyn Any{
+    fn as_any_ref(&self) -> &dyn Any {
         self
     }
 }

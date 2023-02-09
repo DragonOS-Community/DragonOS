@@ -1,11 +1,21 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use alloc::sync::Arc;
 
-use crate::{filesystem::{
-    ramfs::RamFS,
-    vfs::{mount::{MountFS, MountFSInode}, FileSystem, FileType}, procfs::ProcFS,
-}, kdebug};
+use crate::{
+    filesystem::{
+        procfs::{LockedProcFSInode, ProcFS},
+        ramfs::RamFS,
+        vfs::{
+            mount::{MountFS, MountFSInode},
+            FileSystem, FileType,
+        },
+    },
+    kdebug, println,
+};
 
 use super::{IndexNode, InodeId};
 
@@ -28,39 +38,60 @@ lazy_static! {
         let root_inode = rootfs.get_root_inode();
 
         // 创建procfs实例
-        let procfs = ProcFS::new();
-        let proc_fs = MountFS::new(procfs, None);
-
-        // 创建文件夹 
+        
+        // 创建文件夹
         root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
+        let procfs = ProcFS::new();
+        kdebug!("proc created");
+        kdebug!("root inode.list()={:?}", root_inode.list());
         // procfs mount
-        let _t = root_inode.find("proc").unwrap().as_any_ref().downcast_ref::<MountFSInode>().unwrap().mount(proc_fs);
+        let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
+        kdebug!("root inode.list()={:?}", root_inode.list());
         root_inode
     };
 }
-
-
-/// @brief 在这个函数里面，编写调试文件系统用的代码。该函数仅供重构期间，方便调试使用。
-/// 
-/// 建议在这个函数里面，调用其他的调试函数。（避免merge的时候出现大量冲突）
-pub fn __test_filesystem(){
-        __test_rootfs();
+pub fn print_type_of<T>(_: &T) {
+    println!("{}", core::any::type_name::<T>())
 }
 
+/// @brief 在这个函数里面，编写调试文件系统用的代码。该函数仅供重构期间，方便调试使用。
+///
+/// 建议在这个函数里面，调用其他的调试函数。（避免merge的时候出现大量冲突）
+pub fn __test_filesystem() {
+    __test_rootfs();
+}
+fn __as_any_ref<T: Any>(x: &T) -> &dyn core::any::Any {
+    x
+}
 /// @brief procfs测试函数
-pub fn _test_procfs(pid: i64){
+pub fn _test_procfs(pid: i64) {
     __test_procfs(pid);
 }
 
-fn __test_rootfs(){
+fn __test_rootfs() {
     kdebug!("root inode.list()={:?}", ROOT_INODE.list());
 }
 
-fn __test_procfs(pid: i64){
+fn __test_procfs(pid: i64) {
+    kdebug!("to register pid: {}", pid);
     // 获取procfs实例
     let _p = ROOT_INODE.find("proc").unwrap();
+
+    let procfs_inode = _p.downcast_ref::<LockedProcFSInode>().unwrap();
+    let fs = procfs_inode.fs();
+    let fs = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
+    kdebug!("to procfs_register_pid");
     // 调用注册函数
-    // _p.procfs_register_pid(pid);
-    // 
+    fs.procfs_register_pid(pid).expect("register pid failed");
+    kdebug!("procfs_register_pid ok");
+    kdebug!(
+        "root inode.list()={:?}",
+        ROOT_INODE.list().expect("list / failed.")
+    );
+    let proc_inode = ROOT_INODE.lookup("/proc/1/status").expect("Cannot find /proc/1/status");
+    kdebug!(
+        "proc.list()={:?}",
+        _p.list().expect("list /proc failed.")
+    );
 }

@@ -54,7 +54,7 @@ const PROCFS_MAX_NAMELEN: usize = 64;
 
 /// @brief procfs文件系统的Inode结构体
 #[derive(Debug)]
-struct LockedProcFSInode(SpinLock<ProcFSInode>);
+pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
 
 /// @brief procfs文件系统结构体
 #[derive(Debug)]
@@ -150,6 +150,10 @@ impl FileSystem for ProcFS {
             max_name_len: PROCFS_MAX_NAMELEN,
         };
     }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 impl ProcFS {
@@ -199,14 +203,14 @@ impl ProcFS {
 
     /// @brief 进程注册函数
     /// @usage 在进程中调用并创建进程对应文件
-    pub fn procfs_register_pid(&self, pid: i64){
+    pub fn procfs_register_pid(&self, pid: i64) -> Result<(), i32> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.get_root_inode();
         // 创建对应进程文件夹
-        let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0).unwrap();
+        let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
         // 创建相关文件
         // status文件
-        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0).unwrap();
+        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0)?;
         let _sf: &LockedProcFSInode = binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
@@ -215,6 +219,7 @@ impl ProcFS {
 
         //todo: 创建其他文件
 
+        return Ok(());
     }
 }
 
@@ -500,11 +505,12 @@ impl IndexNode for LockedProcFSInode {
                     .cloned()
                     .collect();
 
-                assert_eq!(key.len(), 1);
-
-                return Ok(key.remove(0));
+                match key.len() {
+                        0=>{return Err(-(ENOENT as i32));}
+                        1=>{return Ok(key.remove(0));}
+                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    }
             }
         }
     }
 }
-

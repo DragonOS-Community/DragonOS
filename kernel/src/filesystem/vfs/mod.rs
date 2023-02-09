@@ -392,12 +392,16 @@ pub struct Metadata {
 }
 
 /// @brief 所有文件系统都应该实现的trait
-pub trait FileSystem: Sync + Send + Debug {
+pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
     fn get_root_inode(&self) -> Arc<dyn IndexNode>;
 
     /// @brief 获取当前文件系统的信息
     fn info(&self) -> FsInfo;
+
+    /// @brief 本函数用于实现动态转换。
+    /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
+    fn as_any_ref(&self) -> &dyn Any;
 }
 
 #[derive(Debug)]

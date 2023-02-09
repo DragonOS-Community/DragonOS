@@ -1,3 +1,5 @@
+use core::any::Any;
+
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -57,6 +59,12 @@ impl FileSystem for RamFS {
             blk_dev_id: 0,
             max_name_len: RAMFS_MAX_NAMELEN,
         };
+    }
+
+    /// @brief 本函数用于实现动态转换。
+    /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
+    fn as_any_ref(&self) -> &dyn Any{
+        self
     }
 }
 

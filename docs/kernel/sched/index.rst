@@ -9,3 +9,6 @@ DragonOS调度
 
    c_waiting
    rust_waiting
+   core
+   cfs
+   rt

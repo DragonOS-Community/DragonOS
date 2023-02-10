@@ -3,7 +3,7 @@ GIT_COMMIT_SHA1=$(shell git log -n 1 | head -n 1 | cut -d ' ' -f 2 | cut -c1-8)
 
 all: about.o
 
-	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/about  $(shell find . -name "*.o") $(shell find $(sys_libs_dir) -name "*.o") -T about.lds
+	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/about  $(shell find . -name "*.o") $(ROOT_PATH)/bin/sysroot/usr/lib/libc.a -T about.lds
 
 	$(OBJCOPY) -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/about $(output_dir)/about.elf
 

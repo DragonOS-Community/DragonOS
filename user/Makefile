@@ -9,7 +9,7 @@ GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
 output_dir=$(ROOT_PATH)/bin/user
 
-CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs -I $(shell pwd)/libs/libc/src/include
+CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs -I $(shell pwd)/libs/libc/src/include -I $(shell pwd)/libs/libc/src/include/export
 current_CFLAGS := $(CFLAGS)
 
 ECHO:
@@ -44,9 +44,14 @@ sys_api_lib_stage_1: make_output_dir
 	
 
 sys_api_lib: sys_api_lib_stage_1
-	$(AR) crvs $(ROOT_PATH)/bin/sysroot/usr/lib/libc.a $(shell find ./libs/* -name "*.o")
-	$(shell find ./libs/* -name "*.o" | xargs -I {} cp {} $(ROOT_PATH)/bin/sysroot/usr/lib/)
-	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/* $(ROOT_PATH)/bin/sysroot/usr/include/)
+
+# 打包系统库
+	mkdir -p $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp
+	$(AR) x $(ROOT_PATH)/user/libs/libc/target/x86_64-unknown-none/release/liblibc.a --output=$(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp 
+	$(AR) crvs $(ROOT_PATH)/bin/sysroot/usr/lib/libc.a $(shell find ./libs/* -name "*.o") $(shell find $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp/* -name "*.o")
+	rm -rf $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp
+# $(shell find ./libs/* -name "*.o" | xargs -I {} cp {} $(ROOT_PATH)/bin/sysroot/usr/lib/)
+	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/export/* $(ROOT_PATH)/bin/sysroot/usr/include/)
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/arch/x86_64/c*.o $(ROOT_PATH)/bin/sysroot/usr/lib/)
 
 clean: 

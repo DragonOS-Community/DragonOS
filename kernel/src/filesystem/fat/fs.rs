@@ -231,6 +231,10 @@ impl IndexNode for LockedFATInode {
     fn metadata(&self) -> Result<Metadata, i32> {
         return Ok(self.0.lock().metadata.clone());
     }
+
+    fn list(&self) -> Result<alloc::vec::Vec<String>, i32> {
+        todo!()
+    }
 }
 
 impl Default for FATFsInfo {

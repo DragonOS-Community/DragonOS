@@ -231,6 +231,9 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
 
+    /// @brief 列出当前inode下的所有目录项的名字
+    fn list(&self) -> Result<Vec<String>, i32>;
+
     /// @brief 在当前Inode下，挂载一个新的文件系统
     /// 请注意！该函数只能被MountFS实现，其他文件系统不应实现这个函数
     fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32>{
@@ -245,21 +248,6 @@ impl dyn IndexNode {
         return self.as_any_ref().downcast_ref::<T>();
     }
 
-    pub fn list(&self) -> Result<Vec<String>, i32> {
-        let info = self.metadata()?;
-        if info.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
-        }
-
-        // 通过遍历所有inode号的方式，获得当前inode下面的所有子目录项
-        // TODO: 使用更高效的方式获取
-        let result: Vec<String> = (0..)
-            .map(|ino| self.get_entry_name(ino))
-            .take_while(|result| result.is_ok())
-            .filter_map(|result| result.ok())
-            .collect();
-        return Ok(result);
-    }
 
     /// @brief 查找文件（不考虑符号链接）
     /// 

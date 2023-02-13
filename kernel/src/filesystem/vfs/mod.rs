@@ -10,10 +10,10 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
-    time::TimeSpec,
+    time::TimeSpec, kdebug,
 };
 
-use self::mount::MountFS;
+use self::{mount::MountFS, file::FilePrivateData};
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: u32 = 1024;
@@ -51,25 +51,46 @@ impl PollStatus {
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug {
+    /// @brief 打开文件
+    ///
+    /// @return 成功：Ok()
+    ///         失败：Err(错误码)
+    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        kdebug!("00000000000000000");
+        return Err(-(ENOTSUP as i32));
+    }
+
+    /// @brief 关闭文件
+    ///
+    /// @return 成功：Ok()
+    ///         失败：Err(错误码)
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(-(ENOTSUP as i32));
+    }
+
     /// @brief 在inode的指定偏移量开始，读取指定大小的数据
     ///
     /// @param offset 起始位置在Inode中的偏移量
     /// @param len 要读取的字节数
     /// @param buf 缓冲区. 请注意，必须满足@buf.len()>=@len
-    ///
+    /// @param _data 各文件系统系统所需私有信息
+    /// 
     /// @return 成功：Ok(读取的字节数)
     ///         失败：Err(Posix错误码)
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32>;
+    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32>;
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
     ///
     /// @param offset 起始位置在Inode中的偏移量
     /// @param len 要写入的字节数
     /// @param buf 缓冲区. 请注意，必须满足@buf.len()>=@len
+    /// @param _data 各文件系统系统所需私有信息
     ///
     /// @return 成功：Ok(写入的字节数)
     ///         失败：Err(Posix错误码)
-    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32>;
+    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32>;
 
     /// @brief 获取当前inode的状态。
     ///
@@ -236,7 +257,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
 
     /// @brief 在当前Inode下，挂载一个新的文件系统
     /// 请注意！该函数只能被MountFS实现，其他文件系统不应实现这个函数
-    fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32>{
+    fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
         return Err(-(ENOTSUP as i32));
     }
 }
@@ -250,9 +271,9 @@ impl dyn IndexNode {
 
 
     /// @brief 查找文件（不考虑符号链接）
-    /// 
+    ///
     /// @param path 文件路径
-    /// 
+    ///
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(i32) 错误码
     pub fn lookup(&self, path: &str) -> Result<Arc<dyn IndexNode>, i32> {
@@ -260,10 +281,10 @@ impl dyn IndexNode {
     }
 
     /// @brief 查找文件（考虑符号链接）
-    /// 
+    ///
     /// @param path 文件路径
     /// @param max_follow_times 最大经过的符号链接的大小
-    /// 
+    ///
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(i32) 错误码
     pub fn lookup_follow_symlink(
@@ -319,7 +340,7 @@ impl dyn IndexNode {
             if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
                 // 读取符号链接
-                let len = inode.read_at(0, 256, &mut content)?;
+                let len = inode.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
                 let link_path = String::from(
@@ -329,7 +350,7 @@ impl dyn IndexNode {
                 let new_path = link_path + "/" + &rest_path;
                 // 继续查找符号链接
                 return result.lookup_follow_symlink(&new_path, max_follow_times - 1);
-            }else {
+            } else {
                 result = inode;
             }
         }

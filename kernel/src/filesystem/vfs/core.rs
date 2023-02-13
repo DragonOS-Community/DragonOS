@@ -10,11 +10,11 @@ use crate::{
         procfs::{LockedProcFSInode, ProcFS},
         ramfs::RamFS,
         vfs::{
-            mount::{MountFS, MountFSInode},
-            FileSystem, FileType,
+            mount::MountFS,
+            FileSystem, FileType, file::File,
         },
     },
-    kdebug, println,
+    kdebug, println, include::bindings::bindings::O_RDWR,
 };
 
 use super::{IndexNode, InodeId};
@@ -36,16 +36,15 @@ lazy_static! {
         let ramfs = RamFS::new();
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.get_root_inode();
-
-        // 创建procfs实例
         
         // 创建文件夹
         root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
+        // 创建procfs实例
         let procfs = ProcFS::new();
         kdebug!("proc created");
         kdebug!("root inode.list()={:?}", root_inode.list());
-        // procfs mount
+        // procfs挂载
         let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
         kdebug!("root inode.list()={:?}", root_inode.list());
         root_inode
@@ -61,16 +60,18 @@ pub fn print_type_of<T>(_: &T) {
 pub fn __test_filesystem() {
     __test_rootfs();
 }
-fn __as_any_ref<T: Any>(x: &T) -> &dyn core::any::Any {
-    x
-}
-/// @brief procfs测试函数
-pub fn _test_procfs(pid: i64) {
-    __test_procfs(pid);
-}
 
 fn __test_rootfs() {
     kdebug!("root inode.list()={:?}", ROOT_INODE.list());
+}
+
+fn __as_any_ref<T: Any>(x: &T) -> &dyn core::any::Any {
+    x
+}
+
+/// @brief procfs测试函数
+pub fn _test_procfs(pid: i64) {
+    __test_procfs(pid);
 }
 
 fn __test_procfs(pid: i64) {
@@ -84,14 +85,20 @@ fn __test_procfs(pid: i64) {
     kdebug!("to procfs_register_pid");
     // 调用注册函数
     fs.procfs_register_pid(pid).expect("register pid failed");
+    // /proc/1/status
     kdebug!("procfs_register_pid ok");
     kdebug!(
         "root inode.list()={:?}",
         ROOT_INODE.list().expect("list / failed.")
     );
-    let proc_inode = ROOT_INODE.lookup("/proc/1/status").expect("Cannot find /proc/1/status");
+    // let proc_inode = ROOT_INODE.lookup("/proc/1/status").expect("Cannot find /proc/1/status");
+    let _t = procfs_inode.find("1").unwrap();
+    let proc_inode = _t.lookup("/1/status").expect("Cannot find /proc/1/status");
+    let _f = File::new(proc_inode, O_RDWR);
+    kdebug!("file created!");
     kdebug!(
         "proc.list()={:?}",
         _p.list().expect("list /proc failed.")
     );
+
 }

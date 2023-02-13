@@ -13,10 +13,12 @@ use crate::{
         ENOTDIR, ENOTEMPTY, EPERM,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
+    time::TimeSpec, kdebug,
 };
 
-use super::vfs::{FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus};
+use super::vfs::{
+    file::FilePrivateData, FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
+};
 
 /// @brief 进程文件类型
 /// @usage 用于定义进程文件夹下的各类文件类型
@@ -63,6 +65,17 @@ pub struct ProcFS {
     root_inode: Arc<LockedProcFSInode>,
 }
 
+#[derive(Debug)]
+pub struct ProcfsFilePrivateData {
+    data: Vec<u8>,
+}
+
+impl ProcfsFilePrivateData {
+    pub fn new() -> Self {
+        return ProcfsFilePrivateData { data: Vec::new() };
+    }
+}
+
 /// @brief procfs文件系统的Inode结构体(不包含锁)
 #[derive(Debug)]
 pub struct ProcFSInode {
@@ -85,12 +98,13 @@ pub struct ProcFSInode {
 /// 对ProcFSInode实现获取各类文件信息的函数
 impl ProcFSInode {
     /// 获取进程status,展示状态信息
-    fn get_info_status(&mut self) {
+    fn get_info_status(&self, _pdata: &mut ProcfsFilePrivateData) {
         // 获取该pid对应的pcb结构体
         let pid_t: &i64 = &self.fdata.pid;
         let pcb_t: process_control_block = unsafe { *process_find_pcb_by_pid(*pid_t) };
         // 传入数据
-        let pdata: &mut Vec<u8> = &mut self.data;
+        // let pdata: &mut Vec<u8> = &mut self.data;
+        let pdata: &mut Vec<u8> = &mut _pdata.data;
         let mut t_name: Vec<u8> = Vec::new();
         for val in pcb_t.name.iter() {
             t_name.push(*val as u8)
@@ -130,13 +144,41 @@ impl ProcFSInode {
         pdata.push(text as u8);
         pdata.append(&mut " kB\n".as_bytes().to_owned());
 
+        kdebug!("status got!");
+        kdebug!("ProcfsFilePrivateData:{:?}",pdata);
         // self.data = pdata;
     }
 
-    // fn get_priInfo(&self) -> InodeInfo{
-    //     self.fdata.clo
-    // }
     // todo:其他数据获取函数实现
+
+    /// status文件打开函数
+    fn open_status(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<(), i32> {
+        self.get_info_status(_pdata);
+        kdebug!("open_status success!");
+        return Ok(());
+    }
+
+    /// status文件读取函数
+    fn read_status(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _pdata: &mut ProcfsFilePrivateData,
+    ) -> Result<usize, i32> {
+        let start = _pdata.data.len().min(offset);
+        let end = _pdata.data.len().min(offset + len);
+
+        // buffer空间不足
+        if buf.len() < (end - start) {
+            return Err(-(ENOBUFS as i32));
+        }
+
+        // 拷贝数据
+        let src = &_pdata.data[start..end];
+        buf[0..src.len()].copy_from_slice(src);
+        return Ok(src.len());
+    }
 }
 
 impl FileSystem for ProcFS {
@@ -216,6 +258,7 @@ impl ProcFS {
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
         _sf.0.lock().fdata.pid = pid;
+        _sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         //todo: 创建其他文件
 
@@ -224,24 +267,71 @@ impl ProcFS {
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        kdebug!("open in!");
+        // 加锁
+        let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
+
+        let mut private_data = ProcfsFilePrivateData::new();
+        // 根据文件类型获取相应数据
+        match inode.fdata.ftype {
+            ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
+            _ => {}
+        };
+
+        *_data = FilePrivateData::Procfs(private_data);
+
+        kdebug!("open success!");
+        return Ok(());
+    }
+
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        
+        // 获取数据信息
+        let _private_data = match _data {
+            FilePrivateData::Procfs(p) => p,
+            _ => {
+                panic!("ProcFS: FilePrivateData mismatch!");
+            }
+        };
+        // 释放资源
+        drop(_private_data);
+        return Ok(());
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
         if buf.len() < len {
             return Err(-(EINVAL as i32));
         }
         // 加锁
-        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
+        let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
             return Err(-(EISDIR as i32));
         }
 
-        // 根据文件类型获取相应数据
-        match inode.fdata.ftype {
-            ProcFileType::ProcStatus => inode.get_info_status(),
-            ProcFileType::Default => (),
-        }
+        // 获取数据信息
+        let private_data = match data {
+            FilePrivateData::Procfs(p) => p,
+            _ => {
+                panic!("ProcFS: FilePrivateData mismatch!");
+            }
+        };
 
+        // 根据文件类型读取相应数据
+        match inode.fdata.ftype {
+            ProcFileType::ProcStatus => return inode.read_status(offset, len, buf, private_data),
+            ProcFileType::Default => (),
+        };
+
+        // 默认读取
         let start = inode.data.len().min(offset);
         let end = inode.data.len().min(offset + len);
 
@@ -256,7 +346,13 @@ impl IndexNode for LockedProcFSInode {
         return Ok(src.len());
     }
 
-    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
         if buf.len() < len {
             return Err(-(EINVAL as i32));
         }
@@ -386,7 +482,7 @@ impl IndexNode for LockedProcFSInode {
 
         // 将子inode插入父inode的B树中
         inode.children.insert(String::from(name), result.clone());
-
+        kdebug!("created file!");
         return Ok(result);
     }
 
@@ -512,5 +608,19 @@ impl IndexNode for LockedProcFSInode {
                     }
             }
         }
+    }
+
+    fn list(&self) -> Result<Vec<String>, i32> {
+        let info = self.metadata()?;
+        if info.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+
+        let mut keys: Vec<String> = Vec::new();
+        keys.push(String::from("."));
+        keys.push(String::from(".."));
+        keys.append(&mut self.0.lock().children.keys().cloned().collect());
+        
+        return Ok(keys);
     }
 }

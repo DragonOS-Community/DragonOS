@@ -7,7 +7,7 @@ use alloc::{
 };
 
 use crate::{
-    filesystem::vfs::{FileSystem, FileType, IndexNode, Metadata, PollStatus},
+    filesystem::vfs::{FileSystem, FileType, IndexNode, Metadata, PollStatus, file::FilePrivateData},
     include::bindings::bindings::EISDIR,
     libs::spinlock::SpinLock, io::{device::BlockDevice, disk_info::Partition},
 };
@@ -198,11 +198,11 @@ impl FATFsInfo {
 }
 
 impl IndexNode for LockedFATInode {
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32> {
         todo!()
     }
 
-    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32> {
         todo!()
     }
 

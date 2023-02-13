@@ -20,16 +20,6 @@ pub struct Partition {
                                      // struct vfs_superblock_t *bd_superblock;      // 执行超级块的指针
 }
 
-/// @brief: 磁盘信息 - (保留了c版本的数据信息)
-// pub struct DiskInfo {
-//     pub name: String,
-//     pub flags: u16,
-//     pub part_s: Vec<Arc<Partition>>, // 磁盘分区数组
-
-//                                      // struct block_device_request_queue *request_queue; // 磁盘请求队列
-//                                      // mutex_lock: LockRef, // open()/close()操作的互斥锁
-// }
-
 /// @brief: 分区信息 - 成员函数
 impl Partition {
     /// @brief: 为 disk new 一个分区结构体

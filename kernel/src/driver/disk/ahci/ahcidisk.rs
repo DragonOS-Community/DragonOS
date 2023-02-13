@@ -1,4 +1,7 @@
-use crate::filesystem::mbr::MbrDiskPartionTable;
+use super::{
+    hba::{HbaCmdTable, HbaPrdtEntry},
+    virt_2_phys,
+};
 use crate::include::bindings::bindings::{EOVERFLOW, E_NOEMPTYSLOT, E_PORT_HUNG};
 use crate::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
@@ -12,27 +15,37 @@ use crate::{
     },
     kerror,
 };
+use crate::{filesystem::mbr::MbrDiskPartionTable, libs::spinlock::SpinLockGuard};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::fmt::Debug;
 use core::ops::{Deref, DerefMut};
 use core::{mem::size_of, ptr::write_bytes};
 
-use super::{
-    hba::{HbaCmdTable, HbaPrdtEntry},
-    virt_2_phys,
-};
-
 /// @brief: 只支持MBR分区格式的磁盘结构体
-#[derive(Debug)]
 pub struct AhciDisk {
     pub name: String,
     pub flags: u16,                  // 磁盘的状态flags
     pub part_s: Vec<Arc<Partition>>, // 磁盘分区数组
-    pub port: &'static mut HbaPort,  // 控制硬盘的端口
+    // port: &'static mut HbaPort,      // 控制硬盘的端口
+    pub ctrl_num: u8,
+    pub port_num: u8,
 }
 
 /// @brief: 带锁的AhciDisk
 #[derive(Debug)]
-pub struct LockedAhciDisk(SpinLock<AhciDisk>);
+pub struct LockedAhciDisk(pub SpinLock<AhciDisk>);
+
+/// 函数实现
+impl Debug for AhciDisk {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{{ name: {}, flags: {}, part_s: {:?} }}",
+            self.name, self.flags, self.part_s
+        );
+        return Ok(());
+    }
+}
 
 impl BlockDevice for AhciDisk {
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -56,7 +69,7 @@ impl BlockDevice for AhciDisk {
             return Ok(0);
         }
 
-        self.port.is.write(u32::MAX); // Clear pending interrupt bits
+        v_write!(self.port.is, u32::MAX); // Clear pending interrupt bits
 
         let slot = self.port.find_cmdslot().unwrap_or(u32::MAX);
         if slot == u32::MAX {
@@ -65,21 +78,26 @@ impl BlockDevice for AhciDisk {
 
         let cmdheader: &mut HbaCmdHeader = unsafe {
             &mut *(phys_2_virt(
-                self.port.clb.read() as usize + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                v_read!(self.port.clb) as usize
+                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
             ) as *mut HbaCmdHeader)
         };
 
-        cmdheader.cfl.write_bit(
+        // write_volatile(dst, src);
+
+        v_write_bit!(
+            cmdheader.cfl,
             (1 << 5) - 1 as u8,
-            (size_of::<FisRegH2D>() / size_of::<u32>()) as u8,
+            (size_of::<FisRegH2D>() / size_of::<u32>()) as u8
         ); // Command FIS size
-        cmdheader.cfl.set_bit(1 << 6, false); //  Read/Write bit : Read from device
-        cmdheader.prdtl.write(((count - 1) >> 4 + 1) as u16); // PRDT entries count
+
+        v_set_bit!(cmdheader.cfl, 1 << 6, false); //  Read/Write bit : Read from device
+        v_write!(cmdheader.prdtl, ((count - 1) >> 4 + 1) as u16); // PRDT entries count
 
         // 设置数据存放地址
         let mut buf_ptr = buf as *mut [u8] as *mut usize as usize;
         let cmdtbl =
-            &mut unsafe { *(phys_2_virt(cmdheader.ctba.read() as usize) as *mut HbaCmdTable) };
+            &mut unsafe { *(phys_2_virt(v_read!(cmdheader.ctba) as usize) as *mut HbaCmdTable) };
         let mut tmp_count = count;
         unsafe {
             // 清空整个table的旧数据
@@ -87,55 +105,53 @@ impl BlockDevice for AhciDisk {
                 cmdtbl,
                 0,
                 (size_of::<HbaCmdTable>()
-                    + (cmdheader.prdtl.read() - 1) as usize * size_of::<HbaPrdtEntry>())
+                    + (v_read!(cmdheader.prdtl) - 1) as usize * size_of::<HbaPrdtEntry>())
                     as usize,
             );
         }
 
         // 8K bytes (16 sectors) per PRDT
-        for i in 0..((cmdheader.prdtl.read() - 1) as usize) {
-            cmdtbl.prdt_entry[i].dba.write(virt_2_phys(buf_ptr) as u64);
-            cmdtbl.prdt_entry[i]
-                .dbc
-                .write_bit((1 << 22) - 1, 8 * 1024 - 1); // 数据长度
-            cmdtbl.prdt_entry[i].dbc.set_bit(1 << 31, true); // 允许中断
+        for i in 0..((v_read!(cmdheader.prdtl) - 1) as usize) {
+            v_write!(cmdtbl.prdt_entry[i].dba, virt_2_phys(buf_ptr) as u64);
+            v_write_bit!(cmdtbl.prdt_entry[i].dbc, (1 << 22) - 1, 8 * 1024 - 1); // 数据长度
+            v_set_bit!(cmdtbl.prdt_entry[i].dbc, 1 << 31, true); // 允许中断
             buf_ptr += 4 * 1024;
             tmp_count -= 16;
         }
 
         // Last entry
-        let las = (cmdheader.prdtl.read() - 1) as usize;
-        cmdtbl.prdt_entry[las]
-            .dba
-            .write(virt_2_phys(buf_ptr) as u64);
-        cmdtbl.prdt_entry[las]
-            .dbc
-            .write_bit((1 << 22) - 1, ((tmp_count << 9) - 1) as u32); // 数据长度
-        cmdtbl.prdt_entry[las].dbc.set_bit(1 << 31, true); // 允许中断
+        let las = (v_read!(cmdheader.prdtl) - 1) as usize;
+        v_write!(cmdtbl.prdt_entry[las].dba, virt_2_phys(buf_ptr) as u64);
+        v_write_bit!(
+            cmdtbl.prdt_entry[las].dbc,
+            (1 << 22) - 1,
+            ((tmp_count << 9) - 1) as u32
+        ); // 数据长度
+        v_set_bit!(cmdtbl.prdt_entry[las].dbc, 1 << 31, true); // 允许中断
 
         // 设置命令
         let cmdfis =
             &mut unsafe { *((&mut cmdtbl.cfis) as *mut [u8] as *mut usize as *mut FisRegH2D) };
-        cmdfis.fis_type.write(FisType::RegH2D as u8);
-        cmdfis.pm.set_bit(1 << 7, true); // command_bit set
-        cmdfis.command.write(ATA_CMD_READ_DMA_EXT);
+        v_write!(cmdfis.fis_type, FisType::RegH2D as u8);
+        v_set_bit!(cmdfis.pm, 1 << 7, true); // command_bit set
+        v_write!(cmdfis.command, ATA_CMD_READ_DMA_EXT);
 
-        cmdfis.lba0.write(lba_id_start as u8);
-        cmdfis.lba1.write((lba_id_start >> 8) as u8);
-        cmdfis.lba2.write((lba_id_start >> 16) as u8);
-        cmdfis.lba3.write((lba_id_start >> 24) as u8);
-        cmdfis.lba4.write((lba_id_start >> 32) as u8);
-        cmdfis.lba5.write((lba_id_start >> 40) as u8);
+        v_write!(cmdfis.lba0, lba_id_start as u8);
+        v_write!(cmdfis.lba1, (lba_id_start >> 8) as u8);
+        v_write!(cmdfis.lba2, (lba_id_start >> 16) as u8);
+        v_write!(cmdfis.lba3, (lba_id_start >> 24) as u8);
+        v_write!(cmdfis.lba4, (lba_id_start >> 32) as u8);
+        v_write!(cmdfis.lba5, (lba_id_start >> 40) as u8);
 
-        cmdfis.counth.write((count & 0xFF) as u8);
-        cmdfis.counth.write(((count >> 8) & 0xFF) as u8);
+        v_write!(cmdfis.countl, (count & 0xFF) as u8);
+        v_write!(cmdfis.counth, ((count >> 8) & 0xFF) as u8);
 
-        cmdfis.device.write(1 << 6); // LBA Mode
+        v_write!(cmdfis.device, 1 << 6); // LBA Mode
 
         // 等待之前的操作完成
         let mut spin_count = 0;
         let SPIN_LIMIT = 1000000;
-        while (self.port.tfd.read() as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
+        while (v_read!(self.port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
             && spin_count < SPIN_LIMIT
         {
             spin_count += 1;
@@ -146,7 +162,7 @@ impl BlockDevice for AhciDisk {
             return Err(-(E_PORT_HUNG as i32));
         }
 
-        self.port.ci.set_bit(1 << slot, true); // Issue command
+        v_set_bit!(self.port.ci, 1 << slot, true); // Issue command
 
         // successfully read
         Ok(count * 512)
@@ -165,7 +181,7 @@ impl BlockDevice for AhciDisk {
             return Ok(0);
         }
 
-        self.port.is.write(u32::MAX); // Clear pending interrupt bits
+        v_write!(self.port.is, u32::MAX); // Clear pending interrupt bits
 
         let slot = self.port.find_cmdslot().unwrap_or(u32::MAX);
         if slot == u32::MAX {
@@ -174,21 +190,24 @@ impl BlockDevice for AhciDisk {
 
         let cmdheader: &mut HbaCmdHeader = unsafe {
             &mut *(phys_2_virt(
-                self.port.clb.read() as usize + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                v_read!(self.port.clb) as usize
+                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
             ) as *mut HbaCmdHeader)
         };
 
-        cmdheader.cfl.write_bit(
+        v_write_bit!(
+            cmdheader.cfl,
             (1 << 5) - 1 as u8,
-            (size_of::<FisRegH2D>() / size_of::<u32>()) as u8,
+            (size_of::<FisRegH2D>() / size_of::<u32>()) as u8
         ); // Command FIS size
-        cmdheader.cfl.set_bit(7 << 5, true); // (p,c,w)都设置为1, Read/Write bit :  Write from device
-        cmdheader.prdtl.write(((count - 1) >> 4 + 1) as u16); // PRDT entries count
+
+        v_set_bit!(cmdheader.cfl, 7 << 5, true); // (p,c,w)都设置为1, Read/Write bit :  Write from device
+        v_write!(cmdheader.prdtl, ((count - 1) >> 4 + 1) as u16); // PRDT entries count
 
         // 设置数据存放地址
         let mut buf_ptr = buf as *const [u8] as *mut usize as usize;
         let cmdtbl =
-            &mut unsafe { *(phys_2_virt(cmdheader.ctba.read() as usize) as *mut HbaCmdTable) };
+            &mut unsafe { *(phys_2_virt(v_read!(cmdheader.ctba) as usize) as *mut HbaCmdTable) };
         let mut tmp_count = count;
         unsafe {
             // 清空整个table的旧数据
@@ -196,55 +215,53 @@ impl BlockDevice for AhciDisk {
                 cmdtbl,
                 0,
                 (size_of::<HbaCmdTable>()
-                    + (cmdheader.prdtl.read() - 1) as usize * size_of::<HbaPrdtEntry>())
+                    + (v_read!(cmdheader.prdtl) - 1) as usize * size_of::<HbaPrdtEntry>())
                     as usize,
             );
         }
 
         // 8K bytes (16 sectors) per PRDT
-        for i in 0..((cmdheader.prdtl.read() - 1) as usize) {
-            cmdtbl.prdt_entry[i].dba.write(virt_2_phys(buf_ptr) as u64);
-            cmdtbl.prdt_entry[i]
-                .dbc
-                .write_bit((1 << 22) - 1, 8 * 1024 - 1); // 数据长度
-            cmdtbl.prdt_entry[i].dbc.set_bit(1 << 31, true); // 允许中断
+        for i in 0..((v_read!(cmdheader.prdtl) - 1) as usize) {
+            v_write!(cmdtbl.prdt_entry[i].dba, virt_2_phys(buf_ptr) as u64);
+            v_write_bit!(cmdtbl.prdt_entry[i].dbc, (1 << 22) - 1, 8 * 1024 - 1); // 数据长度
+            v_set_bit!(cmdtbl.prdt_entry[i].dbc, 1 << 31, true); // 允许中断
             buf_ptr += 4 * 1024;
             tmp_count -= 16;
         }
 
         // Last entry
-        let las = (cmdheader.prdtl.read() - 1) as usize;
-        cmdtbl.prdt_entry[las]
-            .dba
-            .write(virt_2_phys(buf_ptr) as u64);
-        cmdtbl.prdt_entry[las]
-            .dbc
-            .write_bit((1 << 22) - 1, ((tmp_count << 9) - 1) as u32); // 数据长度
-        cmdtbl.prdt_entry[las].dbc.set_bit(1 << 31, true); // 允许中断
+        let las = (v_read!(cmdheader.prdtl) - 1) as usize;
+        v_write!(cmdtbl.prdt_entry[las].dba, virt_2_phys(buf_ptr) as u64);
+        v_set_bit!(cmdtbl.prdt_entry[las].dbc, 1 << 31, true); // 允许中断
+        v_write_bit!(
+            cmdtbl.prdt_entry[las].dbc,
+            (1 << 22) - 1,
+            ((tmp_count << 9) - 1) as u32
+        ); // 数据长度
 
         // 设置命令
         let cmdfis =
             &mut unsafe { *((&mut cmdtbl.cfis) as *mut [u8] as *mut usize as *mut FisRegH2D) };
-        cmdfis.fis_type.write(FisType::RegH2D as u8);
-        cmdfis.pm.set_bit(1 << 7, true); // command_bit set
-        cmdfis.command.write(ATA_CMD_READ_DMA_EXT);
+        v_write!(cmdfis.fis_type, FisType::RegH2D as u8);
+        v_set_bit!(cmdfis.pm, 1 << 7, true); // command_bit set
+        v_write!(cmdfis.command, ATA_CMD_READ_DMA_EXT);
 
-        cmdfis.lba0.write(lba_id_start as u8);
-        cmdfis.lba1.write((lba_id_start >> 8) as u8);
-        cmdfis.lba2.write((lba_id_start >> 16) as u8);
-        cmdfis.lba3.write((lba_id_start >> 24) as u8);
-        cmdfis.lba4.write((lba_id_start >> 32) as u8);
-        cmdfis.lba5.write((lba_id_start >> 40) as u8);
+        v_write!(cmdfis.lba0, lba_id_start as u8);
+        v_write!(cmdfis.lba1, (lba_id_start >> 8) as u8);
+        v_write!(cmdfis.lba2, (lba_id_start >> 16) as u8);
+        v_write!(cmdfis.lba3, (lba_id_start >> 24) as u8);
+        v_write!(cmdfis.lba4, (lba_id_start >> 32) as u8);
+        v_write!(cmdfis.lba5, (lba_id_start >> 40) as u8);
 
-        cmdfis.counth.write((count & 0xFF) as u8);
-        cmdfis.counth.write(((count >> 8) & 0xFF) as u8);
+        v_write!(cmdfis.counth, (count & 0xFF) as u8);
+        v_write!(cmdfis.counth, ((count >> 8) & 0xFF) as u8);
 
-        cmdfis.device.write(1 << 6); // LBA Mode
+        v_write!(cmdfis.device, 1 << 6); // LBA Mode
 
         // 等待之前的操作完成
         let mut spin_count = 0;
         let SPIN_LIMIT = 1000000;
-        while (self.port.tfd.read() as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
+        while (v_read!(self.port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
             && spin_count < SPIN_LIMIT
         {
             spin_count += 1;
@@ -255,7 +272,7 @@ impl BlockDevice for AhciDisk {
             return Err(-(E_PORT_HUNG as i32));
         }
 
-        self.port.ci.set_bit(1 << slot, true); // Issue command
+        v_set_bit!(self.port.ci, 1 << slot, true); // Issue command
 
         // successfully read
         Ok(count * 512)
@@ -266,23 +283,29 @@ impl BlockDevice for AhciDisk {
     }
 }
 
-impl AhciDisk {
-    /// @brief: 获取一个新的Disk
-    pub fn new(name: String, flags: u16, port: &'static mut HbaPort) -> Result<Arc<AhciDisk>, i32> {
+impl LockedAhciDisk {
+    pub fn new(
+        name: String,
+        flags: u16,
+        // port: &'static mut HbaPort,
+        ctrl_num: u8,
+        port_num: u8,
+    ) -> Result<Arc<LockedAhciDisk>, i32> {
         let mut part_s: Vec<Arc<Partition>> = Vec::new();
 
         // 构建磁盘结构体
-        let mut this = Arc::new(AhciDisk {
+        let this = Arc::new(LockedAhciDisk(SpinLock::new(AhciDisk {
             name,
             flags,
             part_s: Default::default(),
-            port,
-        });
+            ctrl_num,
+            port_num,
+        })));
 
         let table = this.read_mbr_table()?;
 
         let weak_this = Arc::downgrade(&this); // 获取this的弱指针
-        let mut raw_this = Arc::into_raw(this) as *mut AhciDisk;
+        let raw_this = Arc::into_raw(this) as *mut LockedAhciDisk;
 
         // 求出有多少可用分区
         for i in 0..4 {
@@ -298,7 +321,7 @@ impl AhciDisk {
         }
 
         unsafe {
-            (*raw_this).part_s = part_s;
+            (*raw_this).0.lock().part_s = part_s;
             return Ok(Arc::from_raw(raw_this));
         }
     }
@@ -329,19 +352,6 @@ impl AhciDisk {
         table.bs_trailsig = cursor.read_u16()?;
 
         Ok(table)
-    }
-}
-
-impl LockedAhciDisk {
-    pub fn new(
-        name: String,
-        flags: u16,
-        port: &'static mut HbaPort,
-    ) -> Result<Arc<LockedAhciDisk>, i32> {
-        let disk_ptr = Arc::into_raw(AhciDisk::new(name, flags, port)?);
-        Ok(Arc::new(LockedAhciDisk(SpinLock::new(unsafe {
-            *disk_ptr
-        })))) // 我不知道这是不是危险的操作！
     }
 }
 

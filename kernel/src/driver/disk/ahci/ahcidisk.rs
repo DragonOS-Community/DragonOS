@@ -1,6 +1,6 @@
 use super::{
     hba::{HbaCmdTable, HbaPrdtEntry},
-    virt_2_phys,
+    port, virt_2_phys,
 };
 use crate::include::bindings::bindings::{EOVERFLOW, E_NOEMPTYSLOT, E_PORT_HUNG};
 use crate::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
@@ -69,17 +69,18 @@ impl BlockDevice for AhciDisk {
             return Ok(0);
         }
 
-        v_write!(self.port.is, u32::MAX); // Clear pending interrupt bits
+        let port = port(self.ctrl_num, self.port_num);
 
-        let slot = self.port.find_cmdslot().unwrap_or(u32::MAX);
+        v_write!(port.is, u32::MAX); // Clear pending interrupt bits
+
+        let slot = port.find_cmdslot().unwrap_or(u32::MAX);
         if slot == u32::MAX {
             return Err(-(E_NOEMPTYSLOT as i32));
         }
 
         let cmdheader: &mut HbaCmdHeader = unsafe {
             &mut *(phys_2_virt(
-                v_read!(self.port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                v_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>() as usize,
             ) as *mut HbaCmdHeader)
         };
 
@@ -151,7 +152,7 @@ impl BlockDevice for AhciDisk {
         // 等待之前的操作完成
         let mut spin_count = 0;
         let SPIN_LIMIT = 1000000;
-        while (v_read!(self.port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
+        while (v_read!(port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
             && spin_count < SPIN_LIMIT
         {
             spin_count += 1;
@@ -162,7 +163,7 @@ impl BlockDevice for AhciDisk {
             return Err(-(E_PORT_HUNG as i32));
         }
 
-        v_set_bit!(self.port.ci, 1 << slot, true); // Issue command
+        v_set_bit!(port.ci, 1 << slot, true); // Issue command
 
         // successfully read
         Ok(count * 512)
@@ -181,17 +182,18 @@ impl BlockDevice for AhciDisk {
             return Ok(0);
         }
 
-        v_write!(self.port.is, u32::MAX); // Clear pending interrupt bits
+        let port = port(self.ctrl_num, self.port_num);
 
-        let slot = self.port.find_cmdslot().unwrap_or(u32::MAX);
+        v_write!(port.is, u32::MAX); // Clear pending interrupt bits
+
+        let slot = port.find_cmdslot().unwrap_or(u32::MAX);
         if slot == u32::MAX {
             return Err(-(E_NOEMPTYSLOT as i32));
         }
 
         let cmdheader: &mut HbaCmdHeader = unsafe {
             &mut *(phys_2_virt(
-                v_read!(self.port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                v_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>() as usize,
             ) as *mut HbaCmdHeader)
         };
 
@@ -261,7 +263,7 @@ impl BlockDevice for AhciDisk {
         // 等待之前的操作完成
         let mut spin_count = 0;
         let SPIN_LIMIT = 1000000;
-        while (v_read!(self.port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
+        while (v_read!(port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
             && spin_count < SPIN_LIMIT
         {
             spin_count += 1;
@@ -272,7 +274,7 @@ impl BlockDevice for AhciDisk {
             return Err(-(E_PORT_HUNG as i32));
         }
 
-        v_set_bit!(self.port.ci, 1 << slot, true); // Issue command
+        v_set_bit!(port.ci, 1 << slot, true); // Issue command
 
         // successfully read
         Ok(count * 512)

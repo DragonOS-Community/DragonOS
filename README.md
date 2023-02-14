@@ -98,9 +98,10 @@
 - [Seele.Clover](https://github.com/seeleclover)
 - 叶锦毅
 - 林
-- 悟
+- Albert
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 - slientbard
+- 悟
 
 ## 开放源代码声明
 

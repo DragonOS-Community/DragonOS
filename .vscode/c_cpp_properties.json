@@ -4,7 +4,8 @@
             "name": "DragonOS",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/user/libs/libc/src/include"
+                "${workspaceFolder}/user/libs/libc/src/include",
+                "${workspaceFolder}/user/libs/libc/src/include/export"
             ],
             "defines": [
                 "__x86_64__",

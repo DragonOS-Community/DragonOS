@@ -1,6 +1,8 @@
 use alloc::vec::Vec;
 use core::{intrinsics::size_of, ptr};
 
+use crate::{kdebug, driver::disk::ahci::{virt_2_phys, phys_2_virt}};
+
 /// 文件说明: 实现了 AHCI 中的控制器 HBA 的相关行为
 
 /// 根据 AHCI 写出 HBA 的 Command
@@ -25,7 +27,7 @@ pub const HBA_SIG_PM: u32 = 0x96690101;
 pub const HBA_SIG_SEMB: u32 = 0xC33C0101;
 
 /// 接入 Port 的 不同设备类型
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum HbaPortType {
     None,
     Unknown(u32),
@@ -37,7 +39,6 @@ pub enum HbaPortType {
 
 /// 声明了 HBA 的所有属性
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct HbaPort {
     pub clb: u64,         // 0x00, command list base address, 1K-byte aligned
     pub fb: u64,          // 0x08, FIS base address, 256-byte aligned
@@ -60,7 +61,6 @@ pub struct HbaPort {
 
 /// 全称 HBA Memory Register，是HBA的寄存器在内存中的映射
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct HbaMem {
     pub cap: u32,             // 0x00, Host capability
     pub ghc: u32,             // 0x04, Global host control
@@ -81,7 +81,6 @@ pub struct HbaMem {
 /// HBA Command Table 里面的 PRDT 项
 /// 作用: 记录了内存中读/写数据的位置，以及长度。你可以把他类比成一个指针？
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct HbaPrdtEntry {
     pub dba: u64, // Data base address
     _rsv0: u32,   // Reserved
@@ -91,7 +90,6 @@ pub struct HbaPrdtEntry {
 /// HAB Command Table
 /// 每个 Port 一个 Table，主机和设备的交互都靠这个数据结构
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct HbaCmdTable {
     // 0x00
     pub cfis: [u8; 64], // Command FIS
@@ -100,14 +98,13 @@ pub struct HbaCmdTable {
     // 0x50
     _rsv: [u8; 48], // Reserved
     // 0x80
-    pub prdt_entry: [HbaPrdtEntry; 65535], // Physical region descriptor table entries, 0 ~ 65535
+    pub prdt_entry: [HbaPrdtEntry; 65535], // Physical region descriptor table entries, 0 ~ 65535, 需要注意不要越界
 }
 
 /// HBA Command Header
 /// 作用: 你可以把他类比成 Command Table 的指针。
 /// 猜测: 这里多了一层 Header，而不是直接在 HbaMem 结构体指向 CmdTable，可能是为了兼容和可移植性？
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct HbaCmdHeader {
     // DW0
     pub cfl: u8,
@@ -142,14 +139,20 @@ impl HbaPort {
 
     /// 启动该端口的命令引擎
     pub fn start(&mut self) {
+
+        kdebug!("begin start");
+        
         while v_read!(self.cmd) & HBA_PORT_CMD_CR > 0 {
+            kdebug!("while running");
             core::hint::spin_loop();
         }
-
+        
+        
         v_write!(
             self.cmd,
             v_read!(self.cmd) | HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST
         );
+        kdebug!("begin finish");
     }
 
     /// 关闭该端口的命令引擎
@@ -187,28 +190,34 @@ impl HbaPort {
         // Command list entry maxim count = 32
         // Command list maxim size = 32*32 = 1K per port
         v_write!(self.clb, clb);
-        unsafe {
-            ptr::write_bytes(clb as *mut u64, 0, 1024);
-        }
 
+        kdebug!("1 wrtie bytes");
+        
+        unsafe {
+            ptr::write_bytes(phys_2_virt(clb as usize) as *mut u64, 0, 1024);
+        }
+        
         // 赋值 fis base address
         // FIS offset: 32K+256*portno
         // FIS entry size = 256 bytes per port
         v_write!(self.fb, fb);
+        kdebug!("2 wrtie bytes");
         unsafe {
-            ptr::write_bytes(fb as *mut u64, 0, 256);
+            ptr::write_bytes(phys_2_virt(fb as usize) as *mut u64, 0, 256);
         }
+        
 
+        kdebug!("3 wrtie bytes");
         // 赋值 command table base address
         // Command table offset: 40K + 8K*portno
         // Command table size = 256*32 = 8K per port
-        let mut cmdheaders = clb as *mut HbaCmdHeader;
+        let mut cmdheaders = phys_2_virt(clb as usize) as *mut u64 as *mut HbaCmdHeader;
         for i in 0..32 as usize {
             unsafe {
                 v_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0
                 v_write!((*cmdheaders).ctba, ctbas[i]);
                 // 这里限制了 prdtl <= 8, 所以一共用了256bytes，如果需要修改，可以修改这里
-                ptr::write_bytes(ctbas[i] as *mut u64, 0, 256);
+                ptr::write_bytes(phys_2_virt(ctbas[i] as usize) as *mut u64, 0, 256);
                 cmdheaders = (cmdheaders as usize + size_of::<HbaCmdHeader>()) as *mut HbaCmdHeader;
             }
         }
@@ -224,7 +233,7 @@ impl HbaPort {
 
         // Power on and spin up device
         v_write!(self.cmd, v_read!(self.cmd) | 1 << 2 | 1 << 1);
-
+        
         self.start(); // 重新开启端口
     }
 }
@@ -250,7 +259,6 @@ pub enum FisType {
 }
 
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct FisRegH2D {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_REG_H2D
@@ -285,7 +293,6 @@ pub struct FisRegH2D {
 }
 
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct FisRegD2H {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_REG_D2H
@@ -317,7 +324,6 @@ pub struct FisRegD2H {
 }
 
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct FisData {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_DATA
@@ -331,7 +337,6 @@ pub struct FisData {
 }
 
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct FisPioSetup {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_PIO_SETUP
@@ -365,7 +370,6 @@ pub struct FisPioSetup {
 }
 
 #[repr(packed)]
-#[derive(Clone, Copy)]
 pub struct FisDmaSetup {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_DMA_SETUP

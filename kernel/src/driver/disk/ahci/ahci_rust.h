@@ -23,7 +23,7 @@ void ahci_cpp_init(uint32_t *count_ahci_devices, struct pci_device_structure_hea
 
     pci_get_device_structure(0x1, 0x6, ahci_devs, count_ahci_devices);
 
-    if (count_ahci_devices == 0)
+    if (*count_ahci_devices == 0)
     {
         kwarn("There is no AHCI device found on this computer!");
         return;

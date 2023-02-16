@@ -1,24 +1,21 @@
 use super::{
+    _port,
     hba::{HbaCmdTable, HbaPrdtEntry},
-    port, virt_2_phys,
+    virt_2_phys,
 };
+use crate::filesystem::mbr::MbrDiskPartionTable;
 use crate::include::bindings::bindings::{EOVERFLOW, E_NOEMPTYSLOT, E_PORT_HUNG};
 use crate::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::{
     driver::disk::ahci::{
-        hba::{
-            FisRegH2D, FisType, HbaCmdHeader, HbaPort, ATA_CMD_READ_DMA_EXT, ATA_DEV_BUSY,
-            ATA_DEV_DRQ,
-        },
+        hba::{FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_DEV_BUSY, ATA_DEV_DRQ},
         phys_2_virt,
     },
     kerror,
 };
-use crate::{filesystem::mbr::MbrDiskPartionTable, libs::spinlock::SpinLockGuard};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt::Debug;
-use core::ops::{Deref, DerefMut};
 use core::{mem::size_of, ptr::write_bytes};
 
 /// @brief: 只支持MBR分区格式的磁盘结构体
@@ -42,7 +39,7 @@ impl Debug for AhciDisk {
             f,
             "{{ name: {}, flags: {}, part_s: {:?} }}",
             self.name, self.flags, self.part_s
-        );
+        )?;
         return Ok(());
     }
 }
@@ -69,7 +66,7 @@ impl BlockDevice for AhciDisk {
             return Ok(0);
         }
 
-        let port = port(self.ctrl_num, self.port_num);
+        let port = _port(self.ctrl_num, self.port_num);
 
         v_write!(port.is, u32::MAX); // Clear pending interrupt bits
 
@@ -151,7 +148,7 @@ impl BlockDevice for AhciDisk {
 
         // 等待之前的操作完成
         let mut spin_count = 0;
-        let SPIN_LIMIT = 1000000;
+        const SPIN_LIMIT: u32 = 1000000;
         while (v_read!(port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
             && spin_count < SPIN_LIMIT
         {
@@ -182,7 +179,7 @@ impl BlockDevice for AhciDisk {
             return Ok(0);
         }
 
-        let port = port(self.ctrl_num, self.port_num);
+        let port = _port(self.ctrl_num, self.port_num);
 
         v_write!(port.is, u32::MAX); // Clear pending interrupt bits
 
@@ -262,7 +259,7 @@ impl BlockDevice for AhciDisk {
 
         // 等待之前的操作完成
         let mut spin_count = 0;
-        let SPIN_LIMIT = 1000000;
+        const SPIN_LIMIT: u32 = 1000000;
         while (v_read!(port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ)) > 0
             && spin_count < SPIN_LIMIT
         {
@@ -335,11 +332,11 @@ impl LockedAhciDisk {
         let mut buf: Vec<u8> = Vec::new();
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
-        self.read_at(0, 1, &mut buf);
+        self.read_at(0, 1, &mut buf)?;
 
         // 创建 Cursor 用于按字节读取
         let mut cursor = VecCursor::new(buf);
-        cursor.seek(SeekFrom::SeekCurrent(446));
+        cursor.seek(SeekFrom::SeekCurrent(446))?;
 
         for i in 0..4 {
             table.dpte[i].flags = cursor.read_u8()?;
@@ -386,19 +383,5 @@ impl BlockDevice for LockedAhciDisk {
 
     fn sync(&self) -> Result<(), i32> {
         self.0.lock().sync()
-    }
-}
-
-impl Deref for LockedAhciDisk {
-    type Target = AhciDisk;
-
-    fn deref(&self) -> &Self::Target {
-        return &self.0.lock();
-    }
-}
-
-impl DerefMut for LockedAhciDisk {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        return &mut self.0.lock();
     }
 }

@@ -36,4 +36,4 @@ libc: $(libc_objs) $(libc_sub_dirs) libc_rust
 
 libc_rust:
 	rustup default nightly
-	cargo +nightly build --release --target ./x86_64-unknown-none.json
+	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json

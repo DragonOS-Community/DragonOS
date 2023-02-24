@@ -14,6 +14,7 @@ SECTIONS
 		_text = .;
 		
 		*(.text)
+		*(.text.*)
 		
 		_etext = .;
 	}
@@ -23,6 +24,7 @@ SECTIONS
 	{
 		_data = .;
 		*(.data)
+		*(.data.*)
 		
 		_edata = .;
 	}
@@ -33,6 +35,7 @@ SECTIONS
 	{
 		_rodata = .;	
 		*(.rodata)
+		*(.rodata.*)
 		_erodata = .;
 	}
 
@@ -41,6 +44,7 @@ SECTIONS
 	{
 		_bss = .;
 		*(.bss)
+		*(.bss.*)
 		_ebss = .;
 	}
 

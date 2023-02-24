@@ -1,6 +1,6 @@
 use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, vec::Vec, collections::LinkedList};
 
 use crate::{
     arch::asm::current::current_pcb,
@@ -37,14 +37,14 @@ pub unsafe fn sched_rt_init() {
 struct RTQueue {
     /// 队列的锁
     lock: RawSpinlock,
-    /// 进程的队列
-    queue: Vec<&'static mut process_control_block>,
+    /// 存储进程的双向队列
+    queue: LinkedList<&'static mut process_control_block>,
 }
 
 impl RTQueue {
     pub fn new() -> RTQueue {
         RTQueue {
-            queue: Vec::new(),
+            queue: LinkedList::new(),
             lock: RawSpinlock::INIT,
         }
     }
@@ -57,17 +57,17 @@ impl RTQueue {
             self.lock.unlock();
             return;
         }
-        self.queue.push(pcb);
+        self.queue.push_back(pcb);
         self.lock.unlock();
     }
 
-    /// @brief 将pcb从调度队列中弹出,若队列为空，则返回None
+    /// @brief 将pcb从调度队列头部取出,若队列为空，则返回None
     pub fn dequeue(&mut self) -> Option<&'static mut process_control_block> {
         let res: Option<&'static mut process_control_block>;
         self.lock.lock();
         if self.queue.len() > 0 {
             // 队列不为空，返回下一个要执行的pcb
-            res = Some(self.queue.pop().unwrap());
+            res = Some(self.queue.pop_front().unwrap());
         } else {
             // 如果队列为空，则返回None
             res = None;
@@ -75,6 +75,18 @@ impl RTQueue {
         self.lock.unlock();
         return res;
     }
+    pub fn enqueue_front(&mut self, pcb: &'static mut process_control_block) {
+        self.lock.lock();
+
+        // 如果进程是IDLE进程，那么就不加入队列
+        if pcb.pid == 0 {
+            self.lock.unlock();
+            return;
+        }
+        self.queue.push_front(pcb);
+        self.lock.unlock();
+    }
+
 }
 
 /// @brief RT调度器类
@@ -154,9 +166,9 @@ impl Scheduler for SchedulerRT {
                     return Some(proc);
                 }
             }
-            // curr优先级更大，说明一定是实时进程，将所选进程入队列
+            // curr优先级更大，说明一定是实时进程，将所选进程入队列，此时需要入队首
             else {
-                sched_enqueue(proc, false);
+                self.cpu_queue[proc.cpu_id as usize].enqueue_front(proc);
             }
         }
         return None;

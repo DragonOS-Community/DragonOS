@@ -57,7 +57,6 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///         失败：Err(错误码)
     fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        kdebug!("00000000000000000");
         return Err(-(ENOTSUP as i32));
     }
 

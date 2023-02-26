@@ -50,17 +50,17 @@ sudo apt-get install -y \
 cd grub-2.06
 echo "开始安装grub2.06"
 #编译安装三个版本的grub
-./configure --target=i386 --prefix=${grub_dir_i386_legacy} || exit 1
+./configure --target=i386 --prefix=${grub_dir_i386_legacy} --disable-werror || exit 1
 make -j $(nproc) || exit 1
 sudo make install || exit 1
 make clean || exit 1
 
-./configure --target=i386 --with-platform=efi --prefix=${grub_dir_i386_efi} ||	exit 1
+./configure --target=i386 --with-platform=efi --prefix=${grub_dir_i386_efi} --disable-werror ||	exit 1
 make -j $(nproc) || exit 1
 sudo make install || exit 1
 make clean || exit 1
 
-./configure --target=x86_64 --with-platform=efi --prefix=${grub_dir_x86_64_efi} || exit 1
+./configure --target=x86_64 --with-platform=efi --prefix=${grub_dir_x86_64_efi} --disable-werror || exit 1
 make -j $(nproc) || exit 1
 sudo make install || exit 1
 

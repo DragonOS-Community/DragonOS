@@ -59,7 +59,7 @@ install_ubuntu_debian_pkg()
 
     if [ -z "$(which qemu-system-x86_64)" ]; then
         echo "正在安装QEMU虚拟机..."
-        sudo $1 install -y qemu qemu-system qemu-kvm
+        sudo $1 install -y qemu-system qemu-kvm
     else
         echo "QEMU已经在您的电脑上安装！"
     fi

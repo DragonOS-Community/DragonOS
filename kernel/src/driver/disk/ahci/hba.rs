@@ -1,7 +1,8 @@
 use alloc::vec::Vec;
 use core::{intrinsics::size_of, ptr};
 
-use crate::{kdebug, driver::disk::ahci::{virt_2_phys, phys_2_virt}};
+use crate::driver::disk::ahci::phys_2_virt;
+use core::sync::atomic::compiler_fence;
 
 /// 文件说明: 实现了 AHCI 中的控制器 HBA 的相关行为
 
@@ -123,8 +124,8 @@ pub struct HbaCmdHeader {
 impl HbaPort {
     /// 获取设备类型
     pub fn check_type(&mut self) -> HbaPortType {
-        if v_read!(self.ssts) & HBA_SSTS_PRESENT > 0 {
-            let sig = v_read!(self.sig);
+        if volatile_read!(self.ssts) & HBA_SSTS_PRESENT > 0 {
+            let sig = volatile_read!(self.sig);
             match sig {
                 HBA_SIG_ATA => HbaPortType::SATA,
                 HBA_SIG_ATAPI => HbaPortType::SATAPI,
@@ -139,44 +140,44 @@ impl HbaPort {
 
     /// 启动该端口的命令引擎
     pub fn start(&mut self) {
-
-        kdebug!("begin start");
-        
-        while v_read!(self.cmd) & HBA_PORT_CMD_CR > 0 {
-            kdebug!("while running");
+        while volatile_read!(self.cmd) & HBA_PORT_CMD_CR > 0 {
             core::hint::spin_loop();
         }
-        
-        
-        v_write!(
+
+        volatile_write!(
             self.cmd,
-            v_read!(self.cmd) | HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST
+            volatile_read!(self.cmd) | HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST
         );
-        kdebug!("begin finish");
     }
 
     /// 关闭该端口的命令引擎
     pub fn stop(&mut self) {
-        v_write!(self.cmd, (u32::MAX ^ HBA_PORT_CMD_ST) & v_read!(self.cmd));
+        volatile_write!(
+            self.cmd,
+            (u32::MAX ^ HBA_PORT_CMD_ST) & volatile_read!(self.cmd)
+        );
 
-        while v_read!(self.cmd) & (HBA_PORT_CMD_FR | HBA_PORT_CMD_CR)
+        while volatile_read!(self.cmd) & (HBA_PORT_CMD_FR | HBA_PORT_CMD_CR)
             == (HBA_PORT_CMD_FR | HBA_PORT_CMD_CR)
         {
             core::hint::spin_loop();
         }
 
-        v_write!(self.cmd, (u32::MAX ^ HBA_PORT_CMD_FRE) & v_read!(self.cmd));
+        volatile_write!(
+            self.cmd,
+            (u32::MAX ^ HBA_PORT_CMD_FRE) & volatile_read!(self.cmd)
+        );
     }
 
     /// @return: 返回一个空闲 cmd table 的 id; 如果没有，则返回 Option::None
     pub fn find_cmdslot(&self) -> Option<u32> {
-        let slots = v_read!(self.sact) | v_read!(self.ci);
+        let slots = volatile_read!(self.sact) | volatile_read!(self.ci);
         for i in 0..32 {
             if slots & 1 << i == 0 {
                 return Some(i);
             }
         }
-        None
+        return None;
     }
 
     /// 初始化,  把 CmdList 等变量的地址赋值到 HbaPort 上 - 这些空间由操作系统分配且固定
@@ -189,51 +190,49 @@ impl HbaPort {
         // Command list entry size = 32
         // Command list entry maxim count = 32
         // Command list maxim size = 32*32 = 1K per port
-        v_write!(self.clb, clb);
+        volatile_write!(self.clb, clb);
 
-        kdebug!("1 wrtie bytes");
-        
         unsafe {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
             ptr::write_bytes(phys_2_virt(clb as usize) as *mut u64, 0, 1024);
         }
-        
+
         // 赋值 fis base address
         // FIS offset: 32K+256*portno
         // FIS entry size = 256 bytes per port
-        v_write!(self.fb, fb);
-        kdebug!("2 wrtie bytes");
+        volatile_write!(self.fb, fb);
         unsafe {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
             ptr::write_bytes(phys_2_virt(fb as usize) as *mut u64, 0, 256);
         }
-        
 
-        kdebug!("3 wrtie bytes");
         // 赋值 command table base address
         // Command table offset: 40K + 8K*portno
         // Command table size = 256*32 = 8K per port
         let mut cmdheaders = phys_2_virt(clb as usize) as *mut u64 as *mut HbaCmdHeader;
         for i in 0..32 as usize {
             unsafe {
-                v_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0
-                v_write!((*cmdheaders).ctba, ctbas[i]);
+                volatile_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0
+                volatile_write!((*cmdheaders).ctba, ctbas[i]);
                 // 这里限制了 prdtl <= 8, 所以一共用了256bytes，如果需要修改，可以修改这里
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 ptr::write_bytes(phys_2_virt(ctbas[i] as usize) as *mut u64, 0, 256);
                 cmdheaders = (cmdheaders as usize + size_of::<HbaCmdHeader>()) as *mut HbaCmdHeader;
             }
         }
 
         // 启动中断
-        v_write!(self.ie, 0 /*TODO: Enable interrupts: 0b10111*/);
+        volatile_write!(self.ie, 0 /*TODO: Enable interrupts: 0b10111*/);
 
         // 错误码
-        v_write!(self.serr, v_read!(self.serr));
+        volatile_write!(self.serr, volatile_read!(self.serr));
 
         // Disable power management
-        v_write!(self.sctl, v_read!(self.sctl) | 7 << 8);
+        volatile_write!(self.sctl, volatile_read!(self.sctl) | 7 << 8);
 
         // Power on and spin up device
-        v_write!(self.cmd, v_read!(self.cmd) | 1 << 2 | 1 << 1);
-        
+        volatile_write!(self.cmd, volatile_read!(self.cmd) | 1 << 2 | 1 << 1);
+
         self.start(); // 重新开启端口
     }
 }

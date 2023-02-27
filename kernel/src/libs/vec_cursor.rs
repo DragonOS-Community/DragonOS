@@ -211,12 +211,12 @@ impl VecCursor {
     }
 
     /// @brief 获取当前的数据切片
-    pub fn data_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         return &self.data[..];
     }
 
     /// @brief 获取当前的数据切片
-    pub fn data_mut_slice(&mut self) -> &mut [u8] {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         return &mut self.data[..];
     }
 

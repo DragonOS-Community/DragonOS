@@ -50,21 +50,26 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
     /// @parameter lba_id_start: 起始块
     /// @parameter count: 读取块的数量
     /// @parameter buf: 目标数组
-    /// @return: 如果操作成功，返回操作的长度(单位是字节)；否则返回错误码；如果操作异常，但是并没有检查出什么错误，将返回已操作的长度
+    /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
+    ///          否则返回Err(错误码)，其中错误码为负数；
+    ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
     fn read_at(&self, lba_id_start: BlockId, count: usize, buf: &mut [u8]) -> Result<usize, i32>;
 
     /// @brief: 在块设备中，从第lba_id_start个块开始，把buf中的count个块数据，存放到设备中
     /// @parameter lba_id_start: 起始块
     /// @parameter count: 写入块的数量
     /// @parameter buf: 目标数组
-    /// @return: 如果操作成功，返回操作的长度(单位是字节)；否则返回错误码；如果操作异常，但是并没有检查出什么错误，将返回已操作的长度
+    /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
+    ///          否则返回Err(错误码)，其中错误码为负数；
+    ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
     fn write_at(&self, lba_id_start: BlockId, count: usize, buf: &[u8]) -> Result<usize, i32>;
 
     /// @brief: 同步磁盘信息，把所有的dirty数据写回硬盘 - 待实现
     fn sync(&self) -> Result<(), i32>;
 
     /// @breif: 每个块设备都必须固定自己块大小，而且该块大小必须是2的幂次
-    fn blk_size_log2(&self) -> u8; // 返回一个固定量，硬编码(编程的时候固定的常量).
+    /// @return: 返回一个固定量，硬编码(编程的时候固定的常量).
+    fn blk_size_log2(&self) -> u8; 
 
     // TODO: 待实现 open, close
 
@@ -77,7 +82,6 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
 impl<T: BlockDevice> Device for T {
     // 读取设备操作，读取设备内部 [offset, offset + buf.len) 区间内的字符，存放到 buf 中
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
-        // assert!(len <= buf.len());
         if len > buf.len() {
             return Err(-(E2BIG as i32));
         }
@@ -233,8 +237,6 @@ impl BlockIter {
 
         let begin = self.begin % blk_size; // 因为是多个整块，这里必然是0
         let end = __lba_to_bytes(lba_end, blk_size) - self.begin;
-        // assert!(begin == 0);
-        // assert!(end % blk_size == 0);
 
         self.begin += end - begin;
 

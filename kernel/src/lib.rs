@@ -16,16 +16,15 @@ use core::panic::PanicInfo;
 #[path = "arch/x86_64/mod.rs"]
 #[macro_use]
 mod arch;
-
-mod driver;
-mod filesystem;
-#[macro_use]
-mod include;
-mod ipc;
 #[macro_use]
 mod libs;
+#[macro_use]
+mod include;
+mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
+mod filesystem;
 mod io;
+mod ipc;
 mod mm;
 mod process;
 mod sched;
@@ -36,6 +35,7 @@ extern crate alloc;
 #[macro_use]
 extern crate lazy_static;
 
+use crate::driver::disk::ahci::__test_ahci;
 use mm::allocator::KernelAllocator;
 
 // <3>
@@ -90,5 +90,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
     __test_filesystem();
+    // __test_ahci(); // ahci测试代码
     return 0;
 }

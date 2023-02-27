@@ -2,7 +2,7 @@
 #include <common/kprint.h>
 #include <driver/disk/ahci/ahci.h>
 
-struct MBR_disk_partition_table_t MBR_partition_tables[MBR_MAX_AHCI_CTRL_NUM][MBR_MAX_AHCI_PORT_NUM] = {0};
+// struct MBR_disk_partition_table_t MBR_partition_tables[MBR_MAX_AHCI_CTRL_NUM][MBR_MAX_AHCI_PORT_NUM] = {0};
 
 /**
  * @brief 读取磁盘的分区表

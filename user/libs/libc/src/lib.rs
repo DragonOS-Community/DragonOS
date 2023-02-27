@@ -7,9 +7,12 @@
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
-
-
 use core::panic::PanicInfo;
+
+use include::internal::bindings::bindings::putchar;
+
+mod include;
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
@@ -17,5 +20,9 @@ fn panic(_info: &PanicInfo) -> ! {
 
 #[no_mangle]
 pub extern "C" fn scanf() {
-
+    loop {
+        unsafe {
+            putchar(88);
+        }
+    }
 }

@@ -63,7 +63,7 @@ impl FileSystem for RamFS {
 
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
-    fn as_any_ref(&self) -> &dyn Any{
+    fn as_any_ref(&self) -> &dyn Any {
         self
     }
 }
@@ -387,5 +387,19 @@ impl IndexNode for LockedRamFSInode {
                 }
             }
         }
+    }
+
+    fn list(&self) -> Result<Vec<String>, i32> {
+        let info = self.metadata()?;
+        if info.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+
+        let mut keys: Vec<String> = Vec::new();
+        keys.push(String::from("."));
+        keys.push(String::from(".."));
+        keys.append(&mut self.0.lock().children.keys().cloned().collect());
+        
+        return Ok(keys);
     }
 }

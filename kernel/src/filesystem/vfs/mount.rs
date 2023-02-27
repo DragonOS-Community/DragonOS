@@ -141,38 +141,47 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
+    #[inline]
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
         return self.inner_inode.read_at(offset, len, buf);
     }
 
+    #[inline]
     fn write_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
         return self.inner_inode.write_at(offset, len, buf);
     }
 
+    #[inline]
     fn poll(&self) -> Result<super::PollStatus, i32> {
         return self.inner_inode.poll();
     }
 
+    #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
         return self.mount_fs.clone();
     }
 
+    #[inline]
     fn as_any_ref(&self) -> &dyn core::any::Any {
         return self.inner_inode.as_any_ref();
     }
 
+    #[inline]
     fn metadata(&self) -> Result<super::Metadata, i32> {
         return self.inner_inode.metadata();
     }
 
+    #[inline]
     fn set_metadata(&self, metadata: &super::Metadata) -> Result<(), i32> {
         return self.inner_inode.set_metadata(metadata);
     }
 
+    #[inline]
     fn resize(&self, len: usize) -> Result<(), i32> {
         return self.inner_inode.resize(len);
     }
 
+    #[inline]
     fn create(
         &self,
         name: &str,
@@ -192,6 +201,7 @@ impl IndexNode for MountFSInode {
     }
 
     /// @brief 在挂载文件系统中删除文件/文件夹
+    #[inline]
     fn unlink(&self, name: &str) -> Result<(), i32> {
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
@@ -203,6 +213,7 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.unlink(name);
     }
 
+    #[inline]
     fn move_(
         &self,
         old_name: &str,
@@ -252,11 +263,13 @@ impl IndexNode for MountFSInode {
             }
         }
     }
-
+    
+    #[inline]
     fn get_entry_name(&self, ino: InodeId) -> Result<alloc::string::String, i32> {
         return self.inner_inode.get_entry_name(ino);
     }
 
+    #[inline]
     fn get_entry_name_and_metadata(
         &self,
         ino: InodeId,
@@ -264,8 +277,14 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.get_entry_name_and_metadata(ino);
     }
 
+    #[inline]
     fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, i32> {
         return self.inner_inode.ioctl(cmd, data);
+    }
+
+    #[inline]
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, i32> {
+        return self.inner_inode.list();
     }
 
 }

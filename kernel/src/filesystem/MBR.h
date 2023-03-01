@@ -16,7 +16,7 @@
 #define MBR_MAX_AHCI_PORT_NUM 32 // 系统支持的每个ahci控制器对应的MBR磁盘数量（对应ahci磁盘号）
 
 /**
- * @brief MBR硬盘分区表项的结构
+ * @brief MBR 硬盘分区表项的结构
  *
  */
 struct MBR_disk_partition_table_entry_t
@@ -37,7 +37,7 @@ struct MBR_disk_partition_table_entry_t
 } __attribute__((packed));
 
 /**
- * @brief MBR磁盘分区表结构体
+ * @brief MBR 磁盘分区表结构体
  *
  */
 struct MBR_disk_partition_table_t
@@ -47,7 +47,8 @@ struct MBR_disk_partition_table_t
     uint16_t BS_TrailSig;
 } __attribute__((packed));
 
-extern struct MBR_disk_partition_table_t MBR_partition_tables[MBR_MAX_AHCI_CTRL_NUM][MBR_MAX_AHCI_PORT_NUM]; // 导出全局的MBR磁盘分区表
+// 导出全局的MBR磁盘分区表
+// extern struct MBR_disk_partition_table_t MBR_partition_tables[MBR_MAX_AHCI_CTRL_NUM][MBR_MAX_AHCI_PORT_NUM]; 
 
 /**
  * @brief 读取磁盘的分区表

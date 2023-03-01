@@ -22,6 +22,16 @@ impl VecCursor {
         return Self { data: data, pos: 0 };
     }
 
+    /// @brief 创建一个全0的cursor
+    pub fn zerod(length: usize) -> Self {
+        let mut result = VecCursor {
+            data: Vec::new(),
+            pos: 0,
+        };
+        result.data.resize(length, 0);
+        return result;
+    }
+
     /// @brief 获取游标管理的数据的可变引用
     pub fn get_mut(&mut self) -> &mut Vec<u8> {
         return &mut self.data;
@@ -127,6 +137,87 @@ impl VecCursor {
         }
         self.pos = pos as usize;
         return Ok(self.pos);
+    }
+
+    /// @brief 写入一个u8的数据（小端对齐）
+    pub fn write_u8(&mut self, value: u8) -> Result<u8, i32> {
+        if self.pos >= self.data.len() {
+            return Err(-(E2BIG as i32));
+        }
+
+        self.data[self.pos] = value;
+        self.pos += 1;
+
+        return Ok(value);
+    }
+
+    /// @brief 写入一个u16的数据（小端对齐）
+    pub fn write_u16(&mut self, value: u16) -> Result<u16, i32> {
+        if self.pos + 2 > self.data.len() {
+            return Err(-(E2BIG as i32));
+        }
+
+        self.data[self.pos] = (value & 0xff) as u8;
+        self.pos += 1;
+        self.data[self.pos] = ((value >> 8) & 0xff) as u8;
+        self.pos += 1;
+
+        return Ok(value);
+    }
+
+    /// @brief 写入一个u32的数据（小端对齐）
+    pub fn write_u32(&mut self, value: u32) -> Result<u32, i32> {
+        if self.pos + 4 > self.data.len() {
+            return Err(-(E2BIG as i32));
+        }
+
+        for i in 0..4 {
+            self.data[self.pos] = ((value >> (i * 8)) & 0xff) as u8;
+            self.pos += 1;
+        }
+
+        return Ok(value);
+    }
+
+    /// @brief 写入一个u64的数据（小端对齐）
+    pub fn write_u64(&mut self, value: u64) -> Result<u64, i32> {
+        if self.pos + 8 > self.data.len() {
+            return Err(-(E2BIG as i32));
+        }
+
+        for i in 0..8 {
+            self.data[self.pos] = ((value >> (i * 8)) & 0xff) as u8;
+            self.pos += 1;
+        }
+
+        return Ok(value);
+    }
+
+    /// @brief 精确写入与buf同样大小的数据。
+    ///
+    /// @param buf 要写入到的目标缓冲区
+    ///
+    /// @return Ok(()) 成功写入
+    /// @retunr Err(-E2BIG) 没有这么多数据，写入失败
+    pub fn write_exact(&mut self, buf: &mut [u8]) -> Result<(), i32> {
+        if self.pos + buf.len() > self.data.len() {
+            return Err(-(E2BIG as i32));
+        }
+
+        self.data[self.pos..self.pos + buf.len()].copy_from_slice(&buf[..]);
+        self.pos += buf.len();
+
+        return Ok(());
+    }
+
+    /// @brief 获取当前的数据切片
+    pub fn as_slice(&self) -> &[u8] {
+        return &self.data[..];
+    }
+
+    /// @brief 获取当前的数据切片
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        return &mut self.data[..];
     }
 
     /// @brief 获取当前游标的位置

@@ -71,7 +71,7 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mode: u32) -> Self {
+    pub fn new(inode: Arc<dyn IndexNode>, mode: u32) -> Result<Self, i32> {
         let mut f =  File {
             inode,
             offset: 0,
@@ -79,8 +79,9 @@ impl File {
             private_data: FilePrivateData::default(),
         };
         // kdebug!("inode:{:?}",f.inode);
-        f.inode.open(&mut f.private_data).ok();
-        return f;
+        f.inode.open(&mut f.private_data)?;
+        kdebug!("File open: f.private_data={:?}", f.private_data);
+        return Ok(f);
     }
 
     /// @brief 从文件中读取指定的字节数到buffer中
@@ -98,7 +99,7 @@ impl File {
             return Err(-(ENOBUFS as i32));
         }
 
-        let len = self.inode.read_at(self.offset, len, buf, &mut FilePrivateData::Unused)?;
+        let len = self.inode.read_at(self.offset, len, buf, &mut self.private_data)?;
 
         return Ok(len);
     }

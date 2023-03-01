@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec, string::String, format};
 
 use crate::{
     filesystem::{
@@ -14,7 +14,7 @@ use crate::{
             FileSystem, FileType, file::File,
         },
     },
-    kdebug, println, include::bindings::bindings::O_RDWR,
+    kdebug, println, include::bindings::bindings::{O_RDWR, O_RDONLY},
 };
 
 use super::{IndexNode, InodeId};
@@ -92,13 +92,21 @@ fn __test_procfs(pid: i64) {
         ROOT_INODE.list().expect("list / failed.")
     );
     // let proc_inode = ROOT_INODE.lookup("/proc/1/status").expect("Cannot find /proc/1/status");
-    let _t = procfs_inode.find("1").unwrap();
-    let proc_inode = _t.lookup("/1/status").expect("Cannot find /proc/1/status");
-    let _f = File::new(proc_inode, O_RDWR);
+    let _t = procfs_inode.find(&format!("{}", pid)).unwrap();
+    let proc_inode = _t.find("status").expect(&format!("Cannot find /proc/{}/status", pid));
+    let mut f = File::new(proc_inode, O_RDONLY).unwrap();
     kdebug!("file created!");
     kdebug!(
         "proc.list()={:?}",
         _p.list().expect("list /proc failed.")
     );
+    let mut buf : Vec<u8> = Vec::new();
+    buf.resize(f.metadata().unwrap().size as usize, 0);
+
+    let size = f.read(
+        f.metadata().unwrap().size as usize, buf.as_mut()).unwrap();
+    kdebug!("size = {}, data={:?}", size, buf);
+    let buf = String::from_utf8(buf).unwrap();
+    kdebug!("data for /proc/{}/status: {}", pid, buf);
 
 }

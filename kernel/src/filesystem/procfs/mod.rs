@@ -1,19 +1,22 @@
+use core::{intrinsics::size_of, str::FromStr};
+
 use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
-    vec::Vec,
+    vec::Vec, format,
 };
 
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
     include::bindings::bindings::{
-        process_control_block, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT,
-        ENOTDIR, ENOTEMPTY, EPERM,
+        process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR, ENOTEMPTY,
+        EPERM, ESRCH,
     },
+    kdebug, kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec, kdebug,
+    time::TimeSpec,
 };
 
 use super::vfs::{
@@ -97,65 +100,66 @@ pub struct ProcFSInode {
 
 /// 对ProcFSInode实现获取各类文件信息的函数
 impl ProcFSInode {
-    /// 获取进程status,展示状态信息
-    fn get_info_status(&self, _pdata: &mut ProcfsFilePrivateData) {
+
+    /// @brief 去除Vec中所有的\0,并在结尾添加\0
+    #[inline]
+    fn trim_string(&self, data: &mut Vec<u8>){
+        data.drain_filter(|x: &mut u8| *x == 0);
+        data.push(0);
+    }
+    // todo:其他数据获取函数实现
+
+    /// @brief 打开status文件
+    ///
+    fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, i32> {
         // 获取该pid对应的pcb结构体
-        let pid_t: &i64 = &self.fdata.pid;
-        let pcb_t: process_control_block = unsafe { *process_find_pcb_by_pid(*pid_t) };
+        let pid: &i64 = &self.fdata.pid;
+        let pcb = unsafe { process_find_pcb_by_pid(*pid).as_mut() };
+        let pcb = if pcb.is_none() {
+            kerror!(
+                "ProcFS: Cannot find pcb for pid {} when opening its 'status' file.",
+                pid
+            );
+            return Err(-(ESRCH as i32));
+        } else {
+            pcb.unwrap()
+        };
         // 传入数据
-        // let pdata: &mut Vec<u8> = &mut self.data;
-        let pdata: &mut Vec<u8> = &mut _pdata.data;
-        let mut t_name: Vec<u8> = Vec::new();
-        for val in pcb_t.name.iter() {
-            t_name.push(*val as u8)
+        let pdata: &mut Vec<u8> = &mut pdata.data;
+        let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
+        for val in pcb.name.iter() {
+            tmp_name.push(*val as u8);
         }
-        pdata.append(&mut "Name:\t".as_bytes().to_owned());
-        pdata.append(&mut t_name);
-        pdata.append(&mut "\nstate:\t".as_bytes().to_owned());
-        pdata.push(pcb_t.state as u8);
-        pdata.append(&mut "\npid:\t".as_bytes().to_owned());
-        pdata.push(pcb_t.pid as u8);
-        pdata.append(&mut "\nPpid:\t".as_bytes().to_owned());
-        pdata.push(unsafe { *pcb_t.parent_pcb }.pid as u8);
-        pdata.append(&mut "\ncpu_id:\t".as_bytes().to_owned());
-        pdata.push(pcb_t.cpu_id as u8);
-        pdata.append(&mut "\npriority:\t".as_bytes().to_owned());
-        pdata.push(pcb_t.priority as u8);
-        pdata.append(&mut "\npreempt:\t".as_bytes().to_owned());
-        pdata.push(pcb_t.preempt_count as u8);
-        pdata.append(&mut "\nvrtime:\t".as_bytes().to_owned());
-        pdata.push(pcb_t.virtual_runtime as u8);
+        kdebug!("pcb.name={}", String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string()));
+        
+        pdata.append(&mut format!("Name:\t{}", String::from_utf8(tmp_name).unwrap_or("NULL".to_string())).as_bytes().to_owned());
+        pdata.append(&mut format!("\nstate:\t{}", pcb.state).as_bytes().to_owned());
+        pdata.append(&mut format!("\npid:\t{}", pcb.pid).as_bytes().to_owned());
+        pdata.append(&mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid).as_bytes().to_owned());
+        pdata.append(&mut format!("\ncpu_id:\t{}", pcb.cpu_id).as_bytes().to_owned());
+        pdata.append(&mut format!("\npriority:\t{}", pcb.priority).as_bytes().to_owned());
+        pdata.append(&mut format!("\npreempt:\t{}", pcb.preempt_count).as_bytes().to_owned());
+        pdata.append(&mut format!("\nvrtime:\t{}", pcb.virtual_runtime).as_bytes().to_owned());
 
         // 当前进程运行过程中占用内存的峰值
         let hiwater_vm: u64 =
-            unsafe { *(*pcb_t.mm).vmas }.vm_end - unsafe { *(*pcb_t.mm).vmas }.vm_start;
+            unsafe { *(*pcb.mm).vmas }.vm_end - unsafe { *(*pcb.mm).vmas }.vm_start;
         // 进程数据段的大小
-        let text: u64 = unsafe { *pcb_t.mm }.code_addr_end - unsafe { *pcb_t.mm }.code_addr_start;
+        let text: u64 = unsafe { *pcb.mm }.code_addr_end - unsafe { *pcb.mm }.code_addr_start;
         // 进程代码的大小
-        let data: u64 = unsafe { *pcb_t.mm }.data_addr_end - unsafe { *pcb_t.mm }.data_addr_start;
+        let data: u64 = unsafe { *pcb.mm }.data_addr_end - unsafe { *pcb.mm }.data_addr_start;
 
-        pdata.append(&mut "\nVmPeak:".as_bytes().to_owned());
-        pdata.push(hiwater_vm as u8);
-        pdata.append(&mut " kB".as_bytes().to_owned());
-        pdata.append(&mut "\nVmData:".as_bytes().to_owned());
-        pdata.push(data as u8);
-        pdata.append(&mut " kB".as_bytes().to_owned());
-        pdata.append(&mut "\nVmExe:".as_bytes().to_owned());
-        pdata.push(text as u8);
-        pdata.append(&mut " kB\n".as_bytes().to_owned());
+        pdata.append(&mut format!("\nVmPeak:\t{} kB", hiwater_vm).as_bytes().to_owned());
+        pdata.append(&mut format!("\nVmData:\t{} kB", data).as_bytes().to_owned());
+        pdata.append(&mut format!("\nVmExe:\t{} kB\n", text).as_bytes().to_owned());
+
+        // 去除多余的\0
+        self.trim_string(pdata);
 
         kdebug!("status got!");
-        kdebug!("ProcfsFilePrivateData:{:?}",pdata);
-        // self.data = pdata;
-    }
-
-    // todo:其他数据获取函数实现
-
-    /// status文件打开函数
-    fn open_status(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<(), i32> {
-        self.get_info_status(_pdata);
+        kdebug!("ProcfsFilePrivateData:{:?}", pdata);
         kdebug!("open_status success!");
-        return Ok(());
+        return Ok((pdata.len() * size_of::<u8>()) as i64);
     }
 
     /// status文件读取函数
@@ -270,23 +274,25 @@ impl IndexNode for LockedProcFSInode {
     fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
         kdebug!("open in!");
         // 加锁
-        let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
+        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
         let mut private_data = ProcfsFilePrivateData::new();
         // 根据文件类型获取相应数据
-        match inode.fdata.ftype {
+        let file_size = match inode.fdata.ftype {
             ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
-            _ => {}
+            _ => {
+                todo!()
+            }
         };
 
         *_data = FilePrivateData::Procfs(private_data);
-
+        // 更新metadata里面的文件大小数值
+        inode.metadata.size = file_size;
         kdebug!("open success!");
         return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
-        
         // 获取数据信息
         let _private_data = match _data {
             FilePrivateData::Procfs(p) => p,
@@ -401,8 +407,7 @@ impl IndexNode for LockedProcFSInode {
 
     fn metadata(&self) -> Result<Metadata, i32> {
         let inode = self.0.lock();
-        let mut metadata = inode.metadata.clone();
-        metadata.size = inode.data.len() as i64;
+        let metadata = inode.metadata.clone();
 
         return Ok(metadata);
     }
@@ -620,7 +625,7 @@ impl IndexNode for LockedProcFSInode {
         keys.push(String::from("."));
         keys.push(String::from(".."));
         keys.append(&mut self.0.lock().children.keys().cloned().collect());
-        
+
         return Ok(keys);
     }
 }

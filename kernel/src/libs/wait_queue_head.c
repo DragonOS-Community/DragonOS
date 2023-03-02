@@ -77,6 +77,6 @@ void wait_queue_wakeup_on_stack(wait_queue_head_t *q, int64_t state)
     if (wait->pcb->state & state)
     {
         list_del_init(&wait->wait_list);
-        process_wakeup(wait->pcb);
+        process_wakeup_immediately(wait->pcb);
     }
 }

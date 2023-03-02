@@ -62,6 +62,18 @@
 
 &emsp;&emsp;该宏定义是`kthread_create()`的简单封装，提供创建了内核线程后，立即运行的功能。
 
+### kthread_run_rt()
+
+#### 原型
+
+&emsp;&emsp;`kthread_run_rt(thread_fn, data, name_fmt, ...)`
+
+#### 简介
+
+&emsp;&emsp;创建内核实时线程并加入调度队列。
+
+&emsp;&emsp;类似`kthread_run()`，该宏定义也是`kthread_create()`的简单封装，提供创建了内核实时线程后，在设置实时进程的参数后，立即运行的功能。
+
 ## 停止内核线程
 
 ### kthread_stop()

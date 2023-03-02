@@ -8,8 +8,11 @@ CFLAGS += -I .
 libc_sub_dirs=math sys
 
 ifeq ($(ARCH), __x86_64__)
-libc_sub_dirs += sysdeps/x86_64
+libc_sub_dirs += arch/x86_64
 endif
+
+$(libc_sub_dirs): ECHO
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS) -I $(shell pwd)"
 
 libc_objs:= $(shell find ./*.c)
 
@@ -29,14 +32,8 @@ clean:
 		cd .. ;\
 	done
 
-libc: $(libc_objs) libc_rust
-	@list='$(libc_sub_dirs)'; for subdir in $$list; do \
-    		echo "make all in $$subdir";\
-    		cd $$subdir;\
-    		$(MAKE) all CFLAGS="$(CFLAGS) -I $(shell pwd)";\
-    		cd ..;\
-	done
+libc: $(libc_objs) $(libc_sub_dirs) libc_rust
 
 libc_rust:
 	rustup default nightly
-	cargo +nightly build --release --target ./x86_64-unknown-none.json
+	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json

@@ -6,8 +6,8 @@
 #include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
 #include <exception/irq.h>
-#include <filesystem/vfs/VFS.h>
 #include <filesystem/fat32/fat32.h>
+#include <filesystem/vfs/VFS.h>
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
@@ -19,10 +19,10 @@ extern uint64_t sys_mstat(struct pt_regs *regs);
 extern uint64_t sys_open(struct pt_regs *regs);
 extern uint64_t sys_unlink_at(struct pt_regs *regs);
 extern uint64_t sys_kill(struct pt_regs *regs);
-extern uint64_t sys_sigaction(struct pt_regs * regs);
-extern uint64_t sys_rt_sigreturn(struct pt_regs * regs);
-extern uint64_t sys_getpid(struct pt_regs * regs);
-extern uint64_t sys_sched(struct pt_regs * regs);
+extern uint64_t sys_sigaction(struct pt_regs *regs);
+extern uint64_t sys_rt_sigreturn(struct pt_regs *regs);
+extern uint64_t sys_getpid(struct pt_regs *regs);
+extern uint64_t sys_sched(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -173,6 +173,18 @@ uint64_t sys_read(struct pt_regs *regs)
     if (count < 0)
         return -EINVAL;
 
+    switch (fd_num)
+    {
+    case 0: // stdin
+        return 0;
+        break;
+    case 1: // stdout
+        return 0;
+        break;
+    case 2: // stderr
+        return 0;
+        break;
+    }
     struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
     uint64_t ret = 0;
     if (file_ptr->file_ops && file_ptr->file_ops->read)
@@ -212,6 +224,20 @@ uint64_t sys_write(struct pt_regs *regs)
     if (count < 0)
         return -EINVAL;
 
+    switch (fd_num)
+    {
+    case 0: // stdin
+        return 0;
+        break;
+    case 1: // stdout
+        printk("%s", buf);
+        return count;
+        break;
+    case 2: // stderr
+        printk("%s", buf);
+        return count;
+        break;
+    }
     struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
     uint64_t ret = 0;
     if (file_ptr->file_ops && file_ptr->file_ops->write)
@@ -552,7 +578,7 @@ uint64_t sys_nanosleep(struct pt_regs *regs)
 
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
-    ahci_end_request();
+    // ahci_end_request();
     return 0;
 }
 
@@ -593,6 +619,5 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,
     [27] = sys_sched,
-    [28 ... 254] = system_call_not_exists,
-    [255] = sys_ahci_end_req,
+    [28 ... 255] = system_call_not_exists,
 };

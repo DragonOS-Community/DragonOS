@@ -1,0 +1,1 @@
+docker run --rm -it -v $PWD:/workdir -w /workdir binutils-2.38

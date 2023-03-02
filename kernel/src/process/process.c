@@ -6,6 +6,7 @@
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
+#include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/stdio.h>
@@ -23,15 +24,13 @@
 #include <filesystem/fat32/fat32.h>
 #include <filesystem/procfs/procfs.h>
 #include <filesystem/rootfs/rootfs.h>
+#include <io/block/block_io_scheduler.h>
 #include <ktest/ktest.h>
+#include <mm/mmio.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-
-#include <mm/mmio.h>
-
-#include <common/lz4.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -410,6 +409,8 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     // 关闭之前的文件描述符
     process_exit_files(current_pcb);
 
+    process_open_stdio(current_pcb);
+
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
@@ -468,6 +469,22 @@ exec_failed:;
 #pragma GCC pop_options
 
 /**
+ * @brief 初始化实时进程rt_pcb
+ *
+ * @return 初始化后的进程
+ *
+ */
+struct process_control_block *process_init_rt_pcb(struct process_control_block *rt_pcb)
+{
+    // 暂时将实时进程的优先级设置为10
+    rt_pcb->priority = 10;
+    rt_pcb->policy = SCHED_RR;
+    rt_pcb->rt_time_slice = 80;
+    rt_pcb->virtual_runtime = 0x7fffffffffffffff;
+    return rt_pcb;
+}
+
+/**
  * @brief 内核init进程
  *
  * @param arg
@@ -481,6 +498,7 @@ ul initial_kernel_thread(ul arg)
 
     scm_enable_double_buffer();
 
+    block_io_scheduler_init();
     ahci_init();
     fat32_init();
     rootfs_umount();
@@ -505,6 +523,11 @@ ul initial_kernel_thread(ul arg)
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
+
+    // 测试实时进程
+
+    // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
+    // kdebug("process:rt test kthread is created!!!!");
 
     // 准备切换到用户态
     struct pt_regs *regs;
@@ -625,11 +648,6 @@ void process_init()
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
 
-    /*
-    kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
-    kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
-    kdebug("initial_tss[0].ist1=%#018lx", initial_tss[0].ist1);
-*/
     // 初始化pid的写锁
 
     spin_init(&process_global_pid_write_lock);
@@ -640,6 +658,10 @@ void process_init()
 
     // 初始化init进程的signal相关的信息
     initial_proc_init_signal(current_pcb);
+
+    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
+    process_open_stdio(current_pcb);
+
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
     barrier();
@@ -686,7 +708,6 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
  */
 int process_wakeup(struct process_control_block *pcb)
 {
-    // kdebug("pcb pid = %#018lx", pcb->pid);
 
     BUG_ON(pcb == NULL);
     if (pcb == NULL)
@@ -696,8 +717,8 @@ int process_wakeup(struct process_control_block *pcb)
         return 0;
 
     pcb->state |= PROC_RUNNING;
-    sched_enqueue(pcb);
-    return 1;
+    sched_enqueue(pcb, true);
+    return 0;
 }
 
 /**
@@ -713,7 +734,13 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (retval != 0)
         return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
-    current_pcb->flags |= PF_NEED_SCHED;
+        current_pcb->flags |= PF_NEED_SCHED;
+
+    if (pcb->cpu_id == current_pcb->cpu_id)
+        sched();
+    else
+        kick_cpu(pcb->cpu_id);
+    return 0;
 }
 
 /**
@@ -724,11 +751,13 @@ int process_wakeup_immediately(struct process_control_block *pcb)
  */
 uint64_t process_exit_files(struct process_control_block *pcb)
 {
+    // TODO: 当stdio不再被以-1来特殊处理时，在这里要释放stdio文件的内存
+
     // 不与父进程共享文件描述符
     if (!(pcb->flags & PF_VFORK))
     {
 
-        for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
+        for (int i = 3; i < PROC_MAX_FD_NUM; ++i)
         {
             if (pcb->fds[i] == NULL)
                 continue;
@@ -772,7 +801,6 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
         vma = cur_vma->vm_next;
 
         uint64_t pa;
-        // kdebug("vm start=%#018lx, sem=%d", cur_vma->vm_start, cur_vma->anon_vma->sem.counter);
         mm_unmap_vma(pcb->mm, cur_vma, &pa);
 
         uint64_t size = (cur_vma->vm_end - cur_vma->vm_start);
@@ -843,15 +871,14 @@ int process_release_pcb(struct process_control_block *pcb)
 int process_fd_alloc(struct vfs_file_t *file)
 {
     int fd_num = -1;
-    struct vfs_file_t **f = current_pcb->fds;
 
     for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
     {
         /* 找到指针数组中的空位 */
-        if (f[i] == NULL)
+        if (current_pcb->fds[i] == NULL)
         {
             fd_num = i;
-            f[i] = file;
+            current_pcb->fds[i] = file;
             break;
         }
     }
@@ -881,4 +908,15 @@ static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_na
 void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
     __set_pcb_name(pcb, pcb_name);
+}
+
+void process_open_stdio(struct process_control_block *pcb)
+{
+    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
+    // stdin
+    pcb->fds[0] = -1UL;
+    // stdout
+    pcb->fds[1] = -1UL;
+    // stderr
+    pcb->fds[2] = -1UL;
 }

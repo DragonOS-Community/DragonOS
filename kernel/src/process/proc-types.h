@@ -1,9 +1,9 @@
 #pragma once
 
-#include <DragonOS/signal.h>
-#include <common/wait_queue.h>
-#include <DragonOS/stdint.h>
 #include "ptrace.h"
+#include <DragonOS/signal.h>
+#include <DragonOS/stdint.h>
+#include <common/wait_queue.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -38,7 +38,7 @@
 #define CLONE_VM (1UL << 2)            // 在进程间共享虚拟内存空间
 #define CLONE_SIGHAND (1UL << 3)       // 克隆时，与父进程共享信号处理结构体
 #define CLONE_CLEAR_SIGHAND (1UL << 4) // 克隆时，将原本被设置为SIG_IGNORE的信号，设置回SIG_DEFAULT
-#define CLONE_THREAD (1UL << 5)       // 拷贝线程
+#define CLONE_THREAD (1UL << 5)        // 拷贝线程
 #define PCB_NAME_LEN 16
 
 struct thread_struct
@@ -69,6 +69,8 @@ struct thread_struct
 #define PF_EXITING (1UL << 5)  // 进程正在退出
 #define PF_WAKEKILL (1UL << 6) // 进程由于接收到终止信号唤醒
 #define PF_SIGNALED (1UL << 7) // 进程由于接收到信号而退出
+#define PF_NEED_MIGRATE (1UL << 8) // 进程需要迁移到其他的核心
+
 /**
  * @brief 进程控制块
  *
@@ -82,6 +84,7 @@ struct process_control_block
     int32_t preempt_count; // 持有的自旋锁的数量
 
     uint32_t cpu_id; // 当前进程在哪个CPU核心上运行
+    // pcb的名字
     char name[PCB_NAME_LEN];
 
     // 内存空间分布结构体， 记录内存页表和程序段信息
@@ -94,7 +97,7 @@ struct process_control_block
     struct List list;
 
     // todo:给pcb中加一个spinlock_t成员
-    //进程自旋锁
+    // 进程自旋锁
     //  spinlock_t alloc_lock;
 
     // 地址空间范围
@@ -105,6 +108,7 @@ struct process_control_block
     long pid;
     long priority;           // 优先级
     int64_t virtual_runtime; // 虚拟运行时间
+    int64_t rt_time_slice;   // 由实时调度器管理的时间片
 
     // 进程拥有的文件描述符的指针数组
     // todo: 改用动态指针数组
@@ -130,6 +134,9 @@ struct process_control_block
     // 正在等待的信号的标志位，表示某个信号正在等待处理
     struct sigpending sig_pending;
 
+    // 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
+    // 该字段存储要被迁移到的目标处理器核心号
+    uint32_t migrate_to;
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐

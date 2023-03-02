@@ -96,6 +96,7 @@
 
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
+- [FindWangHao](https://github.com/FindWangHao)
 - 叶锦毅
 - 林
 - Albert

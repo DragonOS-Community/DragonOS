@@ -1,5 +1,7 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
-use crate::include::bindings::bindings::{E2BIG, E_NOEMPTYSLOT, E_PORT_HUNG, E_TASK_FILE_ERROR};
+use crate::include::bindings::bindings::{
+    E2BIG, ENOTSUP, E_NOEMPTYSLOT, E_PORT_HUNG, E_TASK_FILE_ERROR,
+};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::{
     driver::disk::ahci::{
@@ -16,6 +18,7 @@ use crate::{
     include::bindings::bindings::HBA_PxIS_TFES,
     io::{device::BlockDevice, disk_info::Partition, SeekFrom},
 };
+use alloc::sync::Weak;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::ptr::addr_of;
 use core::sync::atomic::compiler_fence;
@@ -26,37 +29,30 @@ use core::{mem::size_of, ptr::write_bytes};
 pub struct AhciDisk {
     pub name: String,
     pub flags: u16,                  // 磁盘的状态flags
-    pub part_s: Vec<Arc<Partition>>, // 磁盘分区数组
+    pub partitions: Vec<Arc<Partition>>, // 磁盘分区数组
     // port: &'static mut HbaPort,      // 控制硬盘的端口
     pub ctrl_num: u8,
     pub port_num: u8,
+    /// 指向LockAhciDisk的弱引用
+    self_ref: Weak<LockedAhciDisk>,
 }
 
 /// @brief: 带锁的AhciDisk
 #[derive(Debug)]
 pub struct LockedAhciDisk(pub SpinLock<AhciDisk>);
-
 /// 函数实现
 impl Debug for AhciDisk {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "{{ name: {}, flags: {}, part_s: {:?} }}",
-            self.name, self.flags, self.part_s
+            self.name, self.flags, self.partitions
         )?;
         return Ok(());
     }
 }
 
-impl BlockDevice for AhciDisk {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn blk_size_log2(&self) -> u8 {
-        9
-    }
-
+impl AhciDisk {
     fn read_at(
         &self,
         lba_id_start: crate::io::device::BlockId, // 起始lba编号
@@ -308,7 +304,7 @@ impl BlockDevice for AhciDisk {
     }
 
     fn sync(&self) -> Result<(), i32> {
-        return Err(-1);
+        return Err(-(ENOTSUP as i32));
     }
 }
 
@@ -322,16 +318,17 @@ impl LockedAhciDisk {
         let mut part_s: Vec<Arc<Partition>> = Vec::new();
 
         // 构建磁盘结构体
-        let this = Arc::new(LockedAhciDisk(SpinLock::new(AhciDisk {
+        let result: Arc<LockedAhciDisk> = Arc::new(LockedAhciDisk(SpinLock::new(AhciDisk {
             name,
             flags,
-            part_s: Default::default(),
+            partitions: Default::default(),
             ctrl_num,
             port_num,
+            self_ref: Weak::default(),
         })));
 
-        let table = this.read_mbr_table()?;
-        let weak_this = Arc::downgrade(&this); // 获取this的弱指针
+        let table: MbrDiskPartionTable = result.read_mbr_table()?;
+        let weak_this: Weak<LockedAhciDisk> = Arc::downgrade(&result); // 获取this的弱指针
 
         // 求出有多少可用分区
         for i in 0..4 {
@@ -346,9 +343,11 @@ impl LockedAhciDisk {
             }
         }
 
-        this.0.lock().part_s = part_s;
-        return Ok(this);
+        result.0.lock().partitions = part_s;
+        result.0.lock().self_ref = weak_this;
+        return Ok(result);
     }
+
     /// @brief: 从磁盘中读取 MBR 分区表结构体 TODO: Cursor
     pub fn read_mbr_table(&self) -> Result<MbrDiskPartionTable, i32> {
         let mut table: MbrDiskPartionTable = Default::default();
@@ -387,14 +386,17 @@ impl LockedAhciDisk {
 }
 
 impl BlockDevice for LockedAhciDisk {
+    #[inline]
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
+    #[inline]
     fn blk_size_log2(&self) -> u8 {
         9
     }
 
+    #[inline]
     fn read_at(
         &self,
         lba_id_start: crate::io::device::BlockId,
@@ -405,6 +407,7 @@ impl BlockDevice for LockedAhciDisk {
         return self.0.lock().read_at(lba_id_start, count, buf);
     }
 
+    #[inline]
     fn write_at(
         &self,
         lba_id_start: crate::io::device::BlockId,
@@ -415,6 +418,19 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     fn sync(&self) -> Result<(), i32> {
-        self.0.lock().sync()
+        return self.0.lock().sync();
+    }
+
+    #[inline]
+    fn device(&self) -> Arc<dyn crate::io::device::Device> {
+        return self.0.lock().self_ref.upgrade().unwrap();
+    }
+
+    fn block_size(&self) -> usize {
+        todo!()
+    }
+
+    fn partitions(&self) -> Vec<Arc<Partition>> {
+        return self.0.lock().partitions.clone();
     }
 }

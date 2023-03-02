@@ -31,6 +31,7 @@ mod sched;
 mod smp;
 mod time;
 
+#[macro_use]
 extern crate alloc;
 #[macro_use]
 extern crate lazy_static;

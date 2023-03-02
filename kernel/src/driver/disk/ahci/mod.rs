@@ -5,7 +5,7 @@ pub mod hba;
 use crate::io::device::BlockDevice;
 // 依赖的rust工具包
 use crate::io::disk_info::BLK_GF_AHCI;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::{
     driver::disk::ahci::{
         ahcidisk::LockedAhciDisk,
@@ -139,9 +139,9 @@ pub fn disks() -> Vec<Arc<LockedAhciDisk>> {
 }
 
 /// @brief: 通过 name 获取 disk
-pub fn disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, i32> {
+pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, i32> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    let disks_list = LOCKED_DISKS_LIST.lock();
+    let disks_list:SpinLockGuard<Vec<Arc<LockedAhciDisk>>> = LOCKED_DISKS_LIST.lock();
     for i in 0..disks_list.len() {
         if disks_list[i].0.lock().name == name {
             return Ok(disks_list[i].clone());
@@ -154,8 +154,8 @@ pub fn disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, i32> {
 /// @brief: 通过 ctrl_num 和 port_num 获取 port
 pub fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    let list = LOCKED_HBA_MEM_LIST.lock();
-    let port = &list[ctrl_num as usize].ports[port_num as usize];
+    let list:SpinLockGuard<Vec<&mut HbaMem>> = LOCKED_HBA_MEM_LIST.lock();
+    let port:&HbaPort = &list[ctrl_num as usize].ports[port_num as usize];
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     return unsafe { (port as *const HbaPort as *mut HbaPort).as_mut().unwrap() };
 }
@@ -163,7 +163,7 @@ pub fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
 /// @brief: 测试函数
 pub fn __test_ahci() {
     let _res = ahci_rust_init();
-    let disk = disks_by_name("ahci_disk_0".to_string()).unwrap();
+    let disk:Arc<LockedAhciDisk> = get_disks_by_name("ahci_disk_0".to_string()).unwrap();
     #[deny(overflowing_literals)]
     let mut buf = [0u8; 3000usize];
 
@@ -171,7 +171,7 @@ pub fn __test_ahci() {
         buf[i] = i as u8;
     }
 
-    let _dd = disk.0.lock();
+    let _dd = disk;
 
     // 测试1, 写两个块,读4个块
     _dd.write_at(123, 2, &buf).unwrap();

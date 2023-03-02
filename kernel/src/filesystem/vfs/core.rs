@@ -25,7 +25,7 @@ lazy_static! {
         // 使用Ramfs作为默认的根文件系统
         let ramfs = RamFS::new();
         let rootfs = MountFS::new(ramfs, None);
-        let root_inode = rootfs.get_root_inode();
+        let root_inode = rootfs.root_inode();
 
         // 创建文件夹
         root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");

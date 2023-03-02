@@ -50,7 +50,7 @@ pub struct RamFSInode {
 }
 
 impl FileSystem for RamFS {
-    fn get_root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
+    fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
         return self.root_inode.clone();
     }
 

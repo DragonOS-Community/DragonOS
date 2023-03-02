@@ -1,5 +1,10 @@
 use super::device::BlockDevice;
-use alloc::{sync::Arc, sync::Weak};
+
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
 pub type SectorT = u64;
 
@@ -10,14 +15,14 @@ pub const BLK_GF_AHCI: u16 = 1 << 0; // 定义blk_gendisk中的标志位
 /// @brief: 磁盘的分区信息 - (保留了c版本的数据信息)
 #[derive(Debug)]
 pub struct Partition {
-    pub start_sector: SectorT,       // 该分区的起始扇区
-    pub start_lba: u64,              // 起始LBA号
-    pub sectors_num: u64,            // 该分区的扇区数
-    pub disk: Weak<dyn BlockDevice>, // 当前分区所属的磁盘
-    pub partno: u16,                 // 在磁盘上的分区号
+    pub start_sector: SectorT,   // 该分区的起始扇区
+    pub lba_start: u64,          // 起始LBA号
+    pub sectors_num: u64,        // 该分区的扇区数
+    disk: Weak<dyn BlockDevice>, // 当前分区所属的磁盘
+    pub partno: u16,             // 在磁盘上的分区号
 
-                                     // struct block_device_request_queue *bd_queue; // 请求队列
-                                     // struct vfs_superblock_t *bd_superblock;      // 执行超级块的指针
+                                 // struct block_device_request_queue *bd_queue; // 请求队列
+                                 // struct vfs_superblock_t *bd_superblock;      // 执行超级块的指针
 }
 
 /// @brief: 分区信息 - 成员函数
@@ -25,22 +30,24 @@ impl Partition {
     /// @brief: 为 disk new 一个分区结构体
     pub fn new(
         start_sector: SectorT,
-        start_lba: u64,
+        lba_start: u64,
         sectors_num: u64,
         disk: Weak<dyn BlockDevice>,
         partno: u16,
     ) -> Arc<Self> {
         return Arc::new(Partition {
             start_sector,
-            start_lba,
+            lba_start,
             sectors_num,
             disk,
             partno,
         });
     }
 
-    /// @brief: 获取disk的强Arc指针
-    pub fn disk(&self) -> Option<Arc<dyn BlockDevice>> {
-        return self.disk.upgrade();
+    
+    /// @brief 获取当前分区所属的磁盘的Arc指针
+    #[inline]
+    pub fn disk(&self) -> Arc<dyn BlockDevice> {
+        return self.disk.upgrade().unwrap();
     }
 }

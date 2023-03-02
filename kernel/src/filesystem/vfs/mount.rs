@@ -72,7 +72,7 @@ impl MountFS {
     /// @brief 获取挂载点的文件系统的root inode
     pub fn mountpoint_root_inode(&self) -> Arc<MountFSInode> {
         return MountFSInode {
-            inner_inode: self.inner_filesystem.get_root_inode(),
+            inner_inode: self.inner_filesystem.root_inode(),
             mount_fs: self.self_ref.upgrade().unwrap(),
             self_ref: Weak::default(),
         }
@@ -120,7 +120,7 @@ impl MountFSInode {
 
     /// @brief 判断当前inode是否为它所在的文件系统的root inode
     fn is_mountpoint_root(&self) -> Result<bool, i32> {
-        return Ok(self.inner_inode.fs().get_root_inode().metadata()?.inode_id
+        return Ok(self.inner_inode.fs().root_inode().metadata()?.inode_id
             == self.inner_inode.metadata()?.inode_id);
     }
 
@@ -290,9 +290,9 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
-    fn get_root_inode(&self) -> Arc<dyn IndexNode> {
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
         match &self.self_mountpoint {
-            Some(inode) => return inode.mount_fs.get_root_inode(),
+            Some(inode) => return inode.mount_fs.root_inode(),
             // 当前文件系统是rootfs
             None => self.mountpoint_root_inode(),
         }

@@ -149,7 +149,7 @@ impl Default for FATType {
 impl BiosParameterBlock {
     pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, i32> {
         let mut bpb = BiosParameterBlock::default();
-        let device: Arc<dyn Device> = partition.belong_disk.device();
+        // let device: Arc<dyn Device> = partition.belong_disk.device();
 
         todo!()
     }

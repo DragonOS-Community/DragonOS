@@ -4,7 +4,7 @@ use alloc::collections::LinkedList;
 use crate::{
     arch::{asm::current::current_pcb, sched::sched},
     include::bindings::bindings::{
-        process_control_block, process_wakeup, wait_queue_head_t, PROC_INTERRUPTIBLE,
+        process_control_block, process_wakeup, wait_queue_head_t, PROC_INTERRUPTIBLE, PROC_RUNNING,
         PROC_UNINTERRUPTIBLE,
     },
 };
@@ -44,6 +44,7 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         current_pcb().state = PROC_INTERRUPTIBLE as u64;
         guard.wait_list.push_back(current_pcb());
+        current_pcb().state &= !(PROC_RUNNING as u64);
         drop(guard);
         sched();
     }
@@ -53,6 +54,7 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         current_pcb().state = PROC_UNINTERRUPTIBLE as u64;
         guard.wait_list.push_back(current_pcb());
+        current_pcb().state &= !(PROC_RUNNING as u64);
         drop(guard);
         sched();
     }
@@ -63,6 +65,8 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         current_pcb().state = PROC_INTERRUPTIBLE as u64;
         guard.wait_list.push_back(current_pcb());
+        current_pcb().state &= !(PROC_RUNNING as u64);
+        //将pcb的state字段的running比特位置0,如此休眠进程的pcb不会加入到调度器内
         drop(to_unlock);
         drop(guard);
         sched();
@@ -74,6 +78,8 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         current_pcb().state = PROC_INTERRUPTIBLE as u64;
         guard.wait_list.push_back(current_pcb());
+        current_pcb().state &= !(PROC_RUNNING as u64);
+        //将pcb的state字段的running比特位置0,如此休眠进程的pcb不会加入到调度器内
         drop(to_unlock);
         drop(guard);
         sched();
@@ -85,6 +91,8 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         current_pcb().state = PROC_UNINTERRUPTIBLE as u64;
         guard.wait_list.push_back(current_pcb());
+        current_pcb().state &= !(PROC_RUNNING as u64);
+        //将pcb的state字段的running比特位置0,如此休眠进程的pcb不会加入到调度器内
         drop(to_unlock);
         drop(guard);
         sched();
@@ -96,6 +104,8 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         current_pcb().state = PROC_UNINTERRUPTIBLE as u64;
         guard.wait_list.push_back(current_pcb());
+        current_pcb().state &= !(PROC_RUNNING as u64);
+        //将pcb的state字段的running比特位置0,如此休眠进程的pcb不会加入到调度器内
         drop(to_unlock);
         drop(guard);
         sched();
@@ -128,7 +138,7 @@ impl WaitQueue {
     }
 
     /// @brief 获得当前等待队列的大小
-    pub fn len(&self)->usize{
+    pub fn len(&self) -> usize {
         return self.0.lock().wait_list.len();
     }
 }

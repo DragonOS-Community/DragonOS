@@ -87,28 +87,30 @@ impl MmioBuddyMemPool {
         return Ok(0);
     }
 
-    /// @brief 将给定大小为(2^exp)的地址空间一分为二，并插入内存块小一级的链表中
+    /// @brief 将给定大小为2^{exp}的内存块一分为二，并插入内存块大小为2^{exp-1}的链表中
     ///
     /// @param region 要被分割的地址区域结构体（保证其已经从链表中取出）
     ///
     /// @param exp 要被分割的地址区域的大小的幂
+    ///
+    /// @param list_guard 【exp-1】对应的链表
     fn __buddy_split(
         &self,
         region: Box<MmioBuddyAddrRegion>,
         exp: u32,
-        list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
+        low_list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) {
         let vaddr: u64 = self.__buddy_block_vaddr(region.vaddr, exp - 1);
         let new_region: Box<MmioBuddyAddrRegion> = self.__create_region(vaddr);
-        self.__buddy_add_region_obj(region, list_guard);
-        self.__buddy_add_region_obj(new_region, list_guard);
+        self.__buddy_add_region_obj(region, low_list_guard);
+        self.__buddy_add_region_obj(new_region, low_list_guard);
     }
 
     /// @brief 从buddy中申请一块指定大小的内存区域
     ///
-    /// @param exp 内存区域的大小(2^exp)
+    /// @param exp 要申请的内存块的大小的幂(2^exp)
     ///
-    /// @param list_guard 上锁的exp对应的链表
+    /// @param list_guard exp对应的链表
     ///
     /// @return Ok(Box<MmioBuddyAddrRegion>) 符合要求的内存区域。
     ///
@@ -244,7 +246,7 @@ impl MmioBuddyMemPool {
         return vaddr ^ (1 << exp);
     }
 
-    /// @brief 寻找并弹出对应内存块的伙伴块
+    /// @brief 寻找并弹出指定内存块的伙伴块
     ///
     /// @param region 对应内存块的信息
     ///
@@ -283,9 +285,7 @@ impl MmioBuddyMemPool {
         }
     }
 
-    /// @brief 从空闲链表中取出指定大小的内存区域
-    ///
-    /// @param exp 内存大小的幂
+    /// @brief 从指定空闲链表中取出内存区域
     ///
     /// @param list_guard 【exp】对应的链表
     ///
@@ -303,7 +303,7 @@ impl MmioBuddyMemPool {
         return Err(MmioResult::ISEMPTY);
     }
 
-    /// @brief 合并exp对应链表上的块
+    /// @brief 合并所有2^{exp}大小的内存块
     ///
     /// @param exp 内存块大小的幂(2^exp)
     ///

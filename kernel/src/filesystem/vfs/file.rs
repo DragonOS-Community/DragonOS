@@ -1,8 +1,23 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE}, io::SeekFrom};
+use crate::{include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE}, io::SeekFrom, filesystem::procfs::ProcfsFilePrivateData, kdebug};
 
 use super::{FileType, IndexNode, Metadata};
+
+/// 文件私有信息的枚举类型
+#[derive(Debug)]
+pub enum FilePrivateData {
+    // procfs文件私有信息
+    Procfs(ProcfsFilePrivateData),
+    // 不需要文件私有信息
+    Unused
+}
+
+impl Default for FilePrivateData{
+    fn default() -> Self {
+        return Self::Unused;
+    }
+}
 
 /// @brief 文件打开模式
 /// 其中，低2bit组合而成的数字的值，用于表示访问权限。其他的bit，才支持通过按位或的方式来表示参数
@@ -48,6 +63,7 @@ pub struct File {
     inode: Arc<dyn IndexNode>,
     offset: usize,
     mode: u32,
+    private_data: FilePrivateData,
 }
 
 impl File {
@@ -55,12 +71,17 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mode: u32) -> Self {
-        return File {
+    pub fn new(inode: Arc<dyn IndexNode>, mode: u32) -> Result<Self, i32> {
+        let mut f =  File {
             inode,
             offset: 0,
             mode,
+            private_data: FilePrivateData::default(),
         };
+        // kdebug!("inode:{:?}",f.inode);
+        f.inode.open(&mut f.private_data)?;
+        kdebug!("File open: f.private_data={:?}", f.private_data);
+        return Ok(f);
     }
 
     /// @brief 从文件中读取指定的字节数到buffer中
@@ -78,7 +99,7 @@ impl File {
             return Err(-(ENOBUFS as i32));
         }
 
-        let len = self.inode.read_at(self.offset, len, buf)?;
+        let len = self.inode.read_at(self.offset, len, buf, &mut self.private_data)?;
 
         return Ok(len);
     }
@@ -96,7 +117,7 @@ impl File {
         if buf.len() < len {
             return Err(-(ENOBUFS as i32));
         }
-        let len = self.inode.write_at(self.offset, len, buf)?;
+        let len = self.inode.write_at(self.offset, len, buf, &mut FilePrivateData::Unused)?;
         return Ok(len);
     }
 
@@ -161,5 +182,11 @@ impl File {
         }
 
         return Ok(());
+    }
+}
+
+impl Drop for File{
+    fn drop(&mut self) {
+        self.inode.close(&mut self.private_data).ok();
     }
 }

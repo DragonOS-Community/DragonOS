@@ -9,7 +9,7 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{
-        core::generate_inode_id, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
+        core::generate_inode_id, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus, file::FilePrivateData,
     },
     include::bindings::bindings::{EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, EPERM, EROFS},
     io::{
@@ -261,7 +261,7 @@ impl FATFileSystem {
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
 
-        let res:FATEntry = match self.bpb.fat_type {
+        let res: FATEntry = match self.bpb.fat_type {
             FATType::FAT12(_) => {
                 let mut entry = cursor.read_u16()?;
                 // 由于FAT12文件系统的FAT表，每个entry占用1.5字节，因此奇数的簇需要取高12位的值。
@@ -1004,11 +1004,23 @@ impl FATFsInfo {
 }
 
 impl IndexNode for LockedFATInode {
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
         todo!()
     }
 
-    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
         todo!()
     }
 

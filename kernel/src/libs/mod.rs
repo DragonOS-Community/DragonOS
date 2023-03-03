@@ -8,3 +8,4 @@ pub mod list;
 pub mod lockref;
 pub mod mutex;
 pub mod wait_queue;
+pub mod rwlock;

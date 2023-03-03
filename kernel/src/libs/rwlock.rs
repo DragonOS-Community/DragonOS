@@ -434,3 +434,4 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
     }
 }
+

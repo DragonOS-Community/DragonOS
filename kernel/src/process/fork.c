@@ -8,6 +8,7 @@ extern spinlock_t process_global_pid_write_lock;
 extern long process_global_pid;
 
 extern void kernel_thread_func(void);
+extern void rs_procfs_register_pid(uint64_t);
 
 int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
@@ -138,6 +139,8 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 创建对应procfs文件
     procfs_register_pid(tsk->pid);
+    // 调用rust中注册函数
+    rs_procfs_register_pid(tsk->pid);
 
     return retval;
 

@@ -3,28 +3,28 @@ use core::{
     hint::spin_loop,
     mem::{self, ManuallyDrop},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 ///RwLock读写锁
 
 /// @brief READER位占据从右往左数第三个比特位
-const READER: u64 = 1 << 2;
+const READER: u32 = 1 << 2;
 
 /// @brief UPGRADED位占据从右到左数第二个比特位
-const UPGRADED: u64 = 1 << 1;
+const UPGRADED: u32 = 1 << 1;
 
 /// @brief WRITER位占据最右边的比特位
-const WRITER: u64 = 1;
+const WRITER: u32 = 1;
 
 /// @brief 读写锁的基本数据结构
-/// @param lock 64位原子变量,最右边的三位从左到右分别是READER,UPGRADED,WRITER (标志位)
+/// @param lock 32位原子变量,最右边的三位从左到右分别是READER,UPGRADED,WRITER (标志位)
 ///             对于标志位,0代表无, 1代表有
 ///             对于剩下的比特位表征READER的数量的多少
 ///             lock的MSB必须为0,否则溢出
 #[allow(dead_code)]
 pub struct RwLock<T> {
-    lock: AtomicU64,
+    lock: AtomicU32,
     data: UnsafeCell<T>,
 }
 
@@ -32,7 +32,7 @@ pub struct RwLock<T> {
 /// @param lock 是对RwLock的lock属性值的只读引用
 pub struct RwLockReadGuard<'a, T: 'a> {
     data: *const T,
-    lock: &'a AtomicU64,
+    lock: &'a AtomicU32,
 }
 
 /// @brief UPGRADED守卫的数据结构,注册UPGRADED锁只需要查看UPGRADED和WRITER的比特位
@@ -60,7 +60,7 @@ impl<T> RwLock<T> {
     /// @brief  RwLock的初始化
     pub const fn new(data: T) -> Self {
         RwLock {
-            lock: AtomicU64::new(0),
+            lock: AtomicU32::new(0),
             data: UnsafeCell::new(data),
         }
     }
@@ -84,8 +84,8 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取实时的读者数并尝试加1,如果增加值成功则返回增加1后的读者数,否则panic
-    fn current_reader(&self) -> Result<u64, u64> {
-        const MAX_READERS: u64 = core::u64::MAX / READER / 2; //右移3位
+    fn current_reader(&self) -> Result<u32, u32> {
+        const MAX_READERS: u32 = core::u32::MAX / READER / 2; //右移3位
 
         let value = self.lock.fetch_add(READER, Ordering::Acquire);
         //value二进制形式的MSB不能为1, 否则导致溢出
@@ -141,7 +141,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取读者+UPGRADER的数量, 不能保证能否获得同步值
-    pub fn reader_count(&self) -> u64 {
+    pub fn reader_count(&self) -> u32 {
         let state = self.lock.load(Ordering::Relaxed);
         state / READER + (state & UPGRADED) / UPGRADED
     }
@@ -149,7 +149,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取写者数量,不能保证能否获得同步值
-    pub fn writer_count(&self) -> u64 {
+    pub fn writer_count(&self) -> u32 {
         (self.lock.load(Ordering::Relaxed) & WRITER) / WRITER
     }
 

@@ -9,7 +9,8 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{
-        core::generate_inode_id, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus, file::FilePrivateData,
+        core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, FsInfo, IndexNode,
+        Metadata, PollStatus,
     },
     include::bindings::bindings::{EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, EPERM, EROFS},
     io::{
@@ -17,7 +18,7 @@ use crate::{
         disk_info::Partition,
         SeekFrom,
     },
-    kerror,
+    kdebug, kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
@@ -141,17 +142,24 @@ impl FileSystem for FATFileSystem {
 
 impl FATFileSystem {
     pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, i32> {
+        kdebug!("read bpb");
         let bpb = BiosParameterBlock::new(partition.clone())?;
 
+        kdebug!("read fsinfo");
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
-            FATType::FAT32(bpb32) => FATFsInfo::new(
-                partition.clone(),
-                bpb32.fs_info,
-                bpb.bytes_per_sector as usize,
-            )?,
+            FATType::FAT32(bpb32) => {
+                kdebug!("read fsinfo 32");
+                FATFsInfo::new(
+                    partition.clone(),
+                    bpb32.fs_info,
+                    bpb.bytes_per_sector as usize,
+                )?
+            }
             _ => FATFsInfo::default(),
         };
+
+        kdebug!("fs_info = {:?}", fs_info);
 
         // 根目录项占用的扇区数（向上取整）
         let root_dir_sectors: u64 = ((bpb.root_entries_cnt as u64 * 32)

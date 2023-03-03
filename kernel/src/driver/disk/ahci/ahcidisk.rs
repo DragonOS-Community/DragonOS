@@ -62,6 +62,7 @@ impl AhciDisk {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
         if count * 512 > buf.len() || check_length > u16::MAX as usize {
+            kerror!("ahci read: e2big");
             // 不可能的操作
             return Err(-(E2BIG as i32));
         } else if count == 0 {
@@ -166,14 +167,14 @@ impl AhciDisk {
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
-
+        kdebug!("To wait ahci read complete.");
         // 等待操作完成
         loop {
             if (volatile_read!(port.ci) & (1 << slot)) == 0 {
                 break;
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
-                kerror!("Write disk error");
+                kerror!("Read disk error");
                 return Err(-(E_TASK_FILE_ERROR as i32));
             }
         }
@@ -403,7 +404,7 @@ impl BlockDevice for LockedAhciDisk {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, i32> {
-        kdebug!("begin locked\n");
+        kdebug!("ahci read at {lba_id_start}, count={count}, lock={:?}", self.0);
         return self.0.lock().read_at(lba_id_start, count, buf);
     }
 

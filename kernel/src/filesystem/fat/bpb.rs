@@ -7,7 +7,7 @@ use crate::{
         disk_info::Partition,
         SeekFrom,
     },
-    kerror,
+    kdebug, kerror,
     libs::vec_cursor::VecCursor,
 };
 
@@ -155,13 +155,12 @@ impl Default for FATType {
 }
 
 impl FATType {
-
     /// @brief 获取指定的簇对应的FAT表项在分区内的字节偏移量
-    /// 
+    ///
     /// @param cluster 要查询的簇
     /// @param fat_start_sector FAT表的起始扇区
     /// @param bytes_per_sec 文件系统每扇区的字节数
-    /// 
+    ///
     /// @return 指定的簇对应的FAT表项在分区内的字节偏移量
     #[inline]
     pub fn get_fat_bytes_offset(
@@ -184,7 +183,6 @@ impl FATType {
 
 impl BiosParameterBlock {
     pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, i32> {
-
         let mut v = Vec::with_capacity(LBA_SIZE);
         v.resize(LBA_SIZE, 0);
 
@@ -197,7 +195,6 @@ impl BiosParameterBlock {
         let mut cursor = VecCursor::new(v);
 
         let mut bpb = BiosParameterBlock::default();
-
 
         cursor.read_exact(&mut bpb.jmp_boot)?;
         cursor.read_exact(&mut bpb.oem_name)?;
@@ -216,7 +213,6 @@ impl BiosParameterBlock {
 
         let mut bpb32 = BiosParameterBlockFAT32::default();
         bpb32.fat_size_32 = cursor.read_u32()?;
-        bpb32.fat_size_32 = cursor.read_u32()?;
         bpb32.ext_flags = cursor.read_u16()?;
         bpb32.fs_version = cursor.read_u16()?;
         bpb32.root_cluster = cursor.read_u32()?;
@@ -233,10 +229,12 @@ impl BiosParameterBlock {
 
         // 跳过启动代码
         cursor.seek(SeekFrom::SeekCurrent(420))?;
+        // 读取尾部的启动扇区标志
+        bpb.trail_sig = cursor.read_u16()?;
 
         // 验证BPB32的信息是否合法
         bpb.validate(&bpb32)?;
-
+        kdebug!("bpb validate done");
         // 计算根目录项占用的空间（单位：字节）
         let root_sectors = ((bpb.root_entries_cnt as u32 * 32) + (bpb.bytes_per_sector as u32 - 1))
             / (bpb.bytes_per_sector as u32);
@@ -270,6 +268,7 @@ impl BiosParameterBlock {
             FATType::FAT32(bpb32)
         };
 
+        kdebug!("bpb={:?}", bpb);
         return Ok(bpb);
     }
 

@@ -435,3 +435,77 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
     }
 }
 
+// fn t_read1() {
+//     let guard = LOCK.read();
+//     let value = *guard;
+//     let readers_current = LOCK.reader_count();
+//     let writers_current = LOCK.writer_count();
+//     println!(
+//         "Reader1: the value is {value}
+//     There are totally {writers_current} writers, {readers_current} readers"
+//     );
+// }
+
+// fn t_read2() {
+//     let guard = LOCK.read();
+//     let value = *guard;
+//     let readers_current = LOCK.reader_count();
+//     let writers_current = LOCK.writer_count();
+//     println!(
+//         "Reader2: the value is {value}
+//     There are totally {writers_current} writers, {readers_current} readers"
+//     );
+// }
+
+// fn t_write() {
+//     let mut guard = LOCK.write();
+//     *guard += 100;
+//     let writers_current = LOCK.writer_count();
+//     let readers_current = LOCK.reader_count();
+//     println!(
+//         "Writers: the value is {guard}
+//     There are totally {writers_current} writers, {readers_current} readers",
+//         guard = *guard
+//     );
+//     let read_guard=guard.downgrade();
+//     let value=*read_guard;
+//     println!("After downgraded to read_guard: {value}");
+// }
+
+// fn t_upgrade() {
+//     let guard = LOCK.upgradeable_read();
+//     let value = *guard;
+//     let readers_current = LOCK.reader_count();
+//     let writers_current = LOCK.writer_count();
+//     println!(
+//         "Upgrader1 before upgrade: the value is {value}
+//     There are totally {writers_current} writers, {readers_current} readers"
+//     );
+//     let mut upgraded_guard = guard.upgrade();
+//     *upgraded_guard += 100;
+//     let writers_current = LOCK.writer_count();
+//     let readers_current = LOCK.reader_count();
+//     println!(
+//         "Upgrader1 after upgrade: the value is {temp}
+//     There are totally {writers_current} writers, {readers_current} readers",
+//         temp = *upgraded_guard
+//     );
+//     let downgraded_guard=upgraded_guard.downgrade_to_upgradeable();
+//     let value=*downgraded_guard;
+//     println!("value after downgraded: {value}");
+//     let read_guard=downgraded_guard.downgrade();
+//     let value_=*read_guard;
+//     println!("value after downgraded to read_guard: {value_}");
+// }
+
+// fn main() {
+//     let r2=thread::spawn(t_read2);
+//     let r1 = thread::spawn(t_read1);
+//     let t1 = thread::spawn(t_write);
+//     let g1 = thread::spawn(t_upgrade);
+//     r1.join().expect("r1");
+//     t1.join().expect("t1");
+//     g1.join().expect("g1");
+//     r2.join().expect("r2");
+// }
+

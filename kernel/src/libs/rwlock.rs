@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use core::{
     cell::UnsafeCell,
     hint::spin_loop,
@@ -5,6 +6,8 @@ use core::{
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicU32, Ordering},
 };
+
+use crate::include::bindings::bindings::EOVERFLOW;
 
 ///RwLock读写锁
 
@@ -17,12 +20,14 @@ const UPGRADED: u32 = 1 << 1;
 /// @brief WRITER位占据最右边的比特位
 const WRITER: u32 = 1;
 
+const READER_BIT: u32 = 2;
+
 /// @brief 读写锁的基本数据结构
 /// @param lock 32位原子变量,最右边的三位从左到右分别是READER,UPGRADED,WRITER (标志位)
 ///             对于标志位,0代表无, 1代表有
 ///             对于剩下的比特位表征READER的数量的多少
 ///             lock的MSB必须为0,否则溢出
-#[allow(dead_code)]
+#[derive(Debug)]
 pub struct RwLock<T> {
     lock: AtomicU32,
     data: UnsafeCell<T>,
@@ -35,7 +40,8 @@ pub struct RwLockReadGuard<'a, T: 'a> {
     lock: &'a AtomicU32,
 }
 
-/// @brief UPGRADED守卫的数据结构,注册UPGRADED锁只需要查看UPGRADED和WRITER的比特位
+/// @brief UPGRADED是介于READER和WRITER之间的一种锁,它可以升级为WRITER,
+///        UPGRADED守卫的数据结构,注册UPGRADED锁只需要查看UPGRADED和WRITER的比特位
 ///        但是当UPGRADED守卫注册后,不允许有新的读者锁注册
 /// @param inner    是对RwLock数据结构的只读引用
 pub struct RwLockUpgradableGuard<'a, T: 'a> {
@@ -59,10 +65,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief  RwLock的初始化
     pub const fn new(data: T) -> Self {
-        RwLock {
+        return RwLock {
             lock: AtomicU32::new(0),
             data: UnsafeCell::new(data),
-        }
+        };
     }
 
     #[allow(dead_code)]
@@ -70,7 +76,7 @@ impl<T> RwLock<T> {
     /// @brief 将读写锁的皮扒掉,返回内在的data,返回的是一个真身而非引用
     pub fn into_inner(self) -> T {
         let RwLock { data, .. } = self;
-        data.into_inner()
+        return data.into_inner();
     }
 
     #[allow(dead_code)]
@@ -78,22 +84,22 @@ impl<T> RwLock<T> {
     /// @brief 返回data的raw pointer,
     /// unsafe
     pub fn as_mut_ptr(&self) -> *mut T {
-        self.data.get()
+        return self.data.get();
     }
 
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取实时的读者数并尝试加1,如果增加值成功则返回增加1后的读者数,否则panic
-    fn current_reader(&self) -> Result<u32, u32> {
-        const MAX_READERS: u32 = core::u32::MAX / READER / 2; //右移3位
+    fn current_reader(&self) -> Result<u32, i32> {
+        const MAX_READERS: u32 = core::u32::MAX >> READER_BIT >> 1; //右移3位
 
         let value = self.lock.fetch_add(READER, Ordering::Acquire);
         //value二进制形式的MSB不能为1, 否则导致溢出
 
-        if value > MAX_READERS * READER {
+        if value > MAX_READERS << READER_BIT {
             self.lock.fetch_sub(READER, Ordering::Release);
             //panic!("Too many lock readers, cannot safely proceed");
-            return Err(0);
+            return Err(-(EOVERFLOW as i32));
         } else {
             return Ok(value);
         }
@@ -143,14 +149,14 @@ impl<T> RwLock<T> {
     /// @brief 获取读者+UPGRADER的数量, 不能保证能否获得同步值
     pub fn reader_count(&self) -> u32 {
         let state = self.lock.load(Ordering::Relaxed);
-        state / READER + (state & UPGRADED) / UPGRADED
+        return state / READER + (state & UPGRADED) / UPGRADED;
     }
 
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取写者数量,不能保证能否获得同步值
     pub fn writer_count(&self) -> u32 {
-        (self.lock.load(Ordering::Relaxed) & WRITER) / WRITER
+        return (self.lock.load(Ordering::Relaxed) & WRITER) / WRITER;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -165,12 +171,12 @@ impl<T> RwLock<T> {
         //只有lock大小为0的时候能获得写者守卫
 
         if res {
-            Some(RwLockWriteGuard {
+            return Some(RwLockWriteGuard {
                 data: unsafe { &mut *self.data.get() },
                 inner: self,
-            })
+            });
         } else {
-            None
+            return None;
         }
     } //当架构为arm时,有些代码需要作出调整compare_exchange=>compare_exchange_weak
 
@@ -190,15 +196,14 @@ impl<T> RwLock<T> {
     /// @brief 尝试获得UPGRADER守卫
     pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
         //获得UPGRADER守卫不需要查看读者位
-        //如果获得读者锁失败,不撤回fetch_or的原子操作
-
+        //如果获得读者锁失败,不需要撤回fetch_or的原子操作
         if self.lock.fetch_or(UPGRADED, Ordering::Acquire) & (WRITER | UPGRADED) == 0 {
-            Some(RwLockUpgradableGuard {
+            return Some(RwLockUpgradableGuard {
                 inner: self,
                 data: unsafe { &mut *self.data.get() },
-            })
+            });
         } else {
-            None
+            return None;
         }
     }
 
@@ -300,14 +305,11 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
     pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
-        while {
-            let res = self.inner.current_reader();
-            res.is_err()
-        } {
+        while self.inner.current_reader().is_err() {
             spin_loop();
         }
 
-        let inner = self.inner;
+        let inner: &RwLock<T> = self.inner;
 
         //自动移去UPGRADED比特位
         mem::drop(self);
@@ -339,10 +341,7 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
     pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
-        while {
-            let res = self.inner.current_reader();
-            res.is_err()
-        } {
+        while self.inner.current_reader().is_err() {
             spin_loop();
         }
         //本质上来说绝对保证没有任何读者
@@ -351,10 +350,10 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
 
         mem::drop(self);
 
-        RwLockReadGuard {
+        return RwLockReadGuard {
             data: unsafe { &*inner.data.get() },
             lock: &inner.lock,
-        }
+        };
     }
 
     #[allow(dead_code)]
@@ -371,10 +370,10 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
 
         mem::forget(self);
 
-        RwLockUpgradableGuard {
+        return RwLockUpgradableGuard {
             inner,
             data: unsafe { &*inner.data.get() },
-        }
+        };
     }
 }
 
@@ -382,7 +381,7 @@ impl<'rwlock, T> Deref for RwLockReadGuard<'rwlock, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.data }
+        return unsafe { &*self.data };
     }
 }
 
@@ -390,7 +389,7 @@ impl<'rwlock, T> Deref for RwLockUpgradableGuard<'rwlock, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.data }
+        return unsafe { &*self.data };
     }
 }
 
@@ -398,13 +397,13 @@ impl<'rwlock, T> Deref for RwLockWriteGuard<'rwlock, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.data }
+        return unsafe { &*self.data };
     }
 }
 
 impl<'rwlock, T> DerefMut for RwLockWriteGuard<'rwlock, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.data }
+        return unsafe { &mut *self.data };
     }
 }
 
@@ -434,78 +433,4 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
     }
 }
-
-// fn t_read1() {
-//     let guard = LOCK.read();
-//     let value = *guard;
-//     let readers_current = LOCK.reader_count();
-//     let writers_current = LOCK.writer_count();
-//     println!(
-//         "Reader1: the value is {value}
-//     There are totally {writers_current} writers, {readers_current} readers"
-//     );
-// }
-
-// fn t_read2() {
-//     let guard = LOCK.read();
-//     let value = *guard;
-//     let readers_current = LOCK.reader_count();
-//     let writers_current = LOCK.writer_count();
-//     println!(
-//         "Reader2: the value is {value}
-//     There are totally {writers_current} writers, {readers_current} readers"
-//     );
-// }
-
-// fn t_write() {
-//     let mut guard = LOCK.write();
-//     *guard += 100;
-//     let writers_current = LOCK.writer_count();
-//     let readers_current = LOCK.reader_count();
-//     println!(
-//         "Writers: the value is {guard}
-//     There are totally {writers_current} writers, {readers_current} readers",
-//         guard = *guard
-//     );
-//     let read_guard=guard.downgrade();
-//     let value=*read_guard;
-//     println!("After downgraded to read_guard: {value}");
-// }
-
-// fn t_upgrade() {
-//     let guard = LOCK.upgradeable_read();
-//     let value = *guard;
-//     let readers_current = LOCK.reader_count();
-//     let writers_current = LOCK.writer_count();
-//     println!(
-//         "Upgrader1 before upgrade: the value is {value}
-//     There are totally {writers_current} writers, {readers_current} readers"
-//     );
-//     let mut upgraded_guard = guard.upgrade();
-//     *upgraded_guard += 100;
-//     let writers_current = LOCK.writer_count();
-//     let readers_current = LOCK.reader_count();
-//     println!(
-//         "Upgrader1 after upgrade: the value is {temp}
-//     There are totally {writers_current} writers, {readers_current} readers",
-//         temp = *upgraded_guard
-//     );
-//     let downgraded_guard=upgraded_guard.downgrade_to_upgradeable();
-//     let value=*downgraded_guard;
-//     println!("value after downgraded: {value}");
-//     let read_guard=downgraded_guard.downgrade();
-//     let value_=*read_guard;
-//     println!("value after downgraded to read_guard: {value_}");
-// }
-
-// fn main() {
-//     let r2=thread::spawn(t_read2);
-//     let r1 = thread::spawn(t_read1);
-//     let t1 = thread::spawn(t_write);
-//     let g1 = thread::spawn(t_upgrade);
-//     r1.join().expect("r1");
-//     t1.join().expect("t1");
-//     g1.join().expect("g1");
-//     r2.join().expect("r2");
-// }
 

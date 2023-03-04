@@ -106,11 +106,11 @@ impl<T> RwLock<T> {
         let reader_value = self.current_reader();
         //得到自增后的reader_value, 包括了尝试获得READER守卫的进程
         let value;
-
+        
         if reader_value.is_err() {
             return None; //获取失败
         } else {
-            value = reader_value.ok().unwrap();
+            value = reader_value.unwrap();
         }
 
         //判断有没有writer和upgrader
@@ -158,19 +158,17 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得WRITER守卫
     pub fn try_write(&self) -> Option<RwLockWriteGuard<T>> {
-        let res = self
+        let res:bool = self
             .lock
-            .compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok();
+            .compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed).is_ok();
         //只有lock大小为0的时候能获得写者守卫
-
         if res {
-            Some(RwLockWriteGuard {
+            return Some(RwLockWriteGuard {
                 data: unsafe { &mut *self.data.get() },
                 inner: self,
-            })
+            });
         } else {
-            None
+            return None;
         }
     } //当架构为arm时,有些代码需要作出调整compare_exchange=>compare_exchange_weak
 
@@ -508,4 +506,3 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
 //     g1.join().expect("g1");
 //     r2.join().expect("r2");
 // }
-

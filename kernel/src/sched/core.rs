@@ -10,7 +10,7 @@ use crate::{
         process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
         SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
-    process::process::process_cpu,
+    process::process::process_cpu, kdebug,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
@@ -27,7 +27,15 @@ pub fn cpu_executing(cpu_id: u32) -> &'static mut process_control_block {
         todo!()
     }
 }
+// 获取某个cpu的负载情况，返回当前负载，cpu_id 是获取负载的cpu的id
+pub fn get_cpu_loads(cpu_id: u32) -> u32 {
+    let cfs_scheduler = __get_cfs_scheduler();
+    let rt_scheduler = __get_rt_scheduler();
+    let len_cfs=cfs_scheduler.get_cfs_queue_len(cpu_id);
+    let len_rt=rt_scheduler.get_rt_queue_len(cpu_id);
 
+    return (len_rt+len_cfs) as u32;
+}
 /// @brief 具体的调度器应当实现的trait
 pub trait Scheduler {
     /// @brief 使用该调度器发起调度的时候，要调用的函数
@@ -38,6 +46,7 @@ pub trait Scheduler {
 }
 
 fn __sched() -> Option<&'static mut process_control_block> {
+    kdebug!("cpu 0 loads is {}",get_cpu_loads(9));
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();

@@ -86,6 +86,9 @@ impl RTQueue {
         self.queue.push_front(pcb);
         self.lock.unlock();
     }
+    pub fn get_rt_queue_size(&mut self) -> usize {
+        return self.queue.len();
+    }
 }
 
 /// @brief RT调度器类
@@ -123,6 +126,9 @@ impl SchedulerRT {
         }
         // return 一个空值
         None
+    }
+    pub fn get_rt_queue_len(&mut self, cpu_id: u32) -> usize {
+        return self.cpu_queue[cpu_id as usize].get_rt_queue_size();
     }
 }
 

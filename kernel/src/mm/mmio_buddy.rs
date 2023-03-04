@@ -472,9 +472,9 @@ pub extern "C" fn mmio_create(
     vm_flags: vm_flags_t,
     res_vaddr: *mut u64,
     res_length: *mut u64,
-) -> Result<i32, i32> {
+) -> i32 {
     if size > PAGE_1G_SIZE || size == 0 {
-        return Err(-(EPERM as i32));
+        return -(EPERM as i32);
     }
     let mut retval: i32 = 0;
     // 计算前导0
@@ -527,7 +527,7 @@ pub extern "C" fn mmio_create(
                         vm_area_del(*vma);
                         vm_area_free(*vma);
                     }
-                    return Err(retval);
+                    return retval;
                 }
                 loop_i += PAGE_2M_SIZE as u64;
             }
@@ -557,17 +557,17 @@ pub extern "C" fn mmio_create(
                         vm_area_del(*vma);
                         vm_area_free(*vma);
                     }
-                    return Err(retval);
+                    return retval;
                 }
                 loop_i += PAGE_4K_SIZE as u64;
             }
         }
         Err(_) => {
             kdebug!("failed to create mmio vma.pid = {:?}", current_pcb().pid);
-            return Err(-(ENOMEM as i32));
+            return -(ENOMEM as i32);
         }
     }
-    return Ok(retval);
+    return retval;
 }
 
 /// @brief 取消mmio的映射并将地址空间归还到buddy中
@@ -580,7 +580,7 @@ pub extern "C" fn mmio_create(
 ///
 /// @return Err(i32) 失败返回错误码
 #[no_mangle]
-pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> Result<i32, i32> {
+pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> i32 {
     //先将要释放的空间取消映射
     unsafe {
         mm_unmap(&mut initial_mm, vaddr, length, false);
@@ -598,7 +598,7 @@ pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> Result<i32, i32> {
                 vaddr + loop_i,
                 current_pcb().pid
             );
-            return Err(-(EINVAL as i32));
+            return -(EINVAL as i32);
         }
         // 检查vma起始地址是否正确
         if unsafe { (*vma).vm_start != (vaddr + loop_i) } {
@@ -607,7 +607,7 @@ pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> Result<i32, i32> {
                 vaddr + loop_i,
                 current_pcb().pid
             );
-            return Err(-(EINVAL as i32));
+            return -(EINVAL as i32);
         }
         // 将vma对应空间归还
         match MMIO_POOL.__give_back_block(unsafe { (*vma).vm_start }, unsafe {
@@ -626,9 +626,9 @@ pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> Result<i32, i32> {
                     "mmio_release give_back failed: pid = {:?}",
                     current_pcb().pid
                 );
-                return Err(err);
+                return err;
             }
         }
     }
-    return Ok(0);
+    return 0;
 }

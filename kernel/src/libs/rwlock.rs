@@ -23,7 +23,8 @@ const WRITER: u32 = 1;
 const READER_BIT: u32 = 2;
 
 /// @brief 读写锁的基本数据结构
-/// @param lock 32位原子变量,最右边的三位从左到右分别是READER,UPGRADED,WRITER (标志位)
+/// @param lock 32位原子变量,最右边的两位从左到右分别是UPGRADED,WRITER (标志位)
+///             剩下的bit位存储READER数量(除了MSB)
 ///             对于标志位,0代表无, 1代表有
 ///             对于剩下的比特位表征READER的数量的多少
 ///             lock的MSB必须为0,否则溢出
@@ -180,6 +181,7 @@ impl<T> RwLock<T> {
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief 获得WRITER守卫
     pub fn write(&self) -> RwLockWriteGuard<T> {
         loop {
             match self.try_write() {
@@ -207,6 +209,7 @@ impl<T> RwLock<T> {
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief 获得UPGRADER守卫
     pub fn upgradeable_read(&self) -> RwLockUpgradableGuard<T> {
         loop {
             match self.try_upgradeable_read() {
@@ -219,6 +222,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     //extremely unsafe behavior
+    /// @brief 强制减少READER数
     pub unsafe fn force_read_decrement(&self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !WRITER > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
@@ -227,6 +231,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     //extremely unsafe behavior
+    /// @brief 强制给WRITER解锁
     pub unsafe fn force_write_unlock(&self) {
         debug_assert_eq!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED), 0);
         self.lock.fetch_and(!(WRITER | UPGRADED), Ordering::Release);
@@ -244,9 +249,10 @@ impl<T: Default> Default for RwLock<T> {
     }
 }
 
+/// @brief 由原有的值创建新的锁
 impl<T> From<T> for RwLock<T> {
     fn from(data: T) -> Self {
-        Self::new(data)
+        return Self::new(data);
     }
 }
 
@@ -256,7 +262,7 @@ impl<'rwlock, T> RwLockReadGuard<'rwlock, T> {
     /// @brief 释放守卫,获得保护的值的不可变引用
     pub fn leak(this: Self) -> &'rwlock T {
         let Self { data, .. } = this;
-        unsafe { &*data }
+        return unsafe { &*data };
     }
 }
 
@@ -289,6 +295,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief 将upgrader升级成writer
     pub fn upgrade(mut self) -> RwLockWriteGuard<'rwlock, T> {
         loop {
             self = match self.try_upgrade() {
@@ -302,6 +309,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief UPGRADER降级为READER
     pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
         while self.inner.current_reader().is_err() {
             spin_loop();
@@ -320,6 +328,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief 返回内部数据的引用,消除锁
     pub fn leak(this: Self) -> &'rwlock T {
         let this = ManuallyDrop::new(this);
 
@@ -330,14 +339,16 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
+    /// @brief 返回内部数据的引用,消除锁
     pub fn leak(this: Self) -> &'rwlock T {
         let this = ManuallyDrop::new(this);
 
-        unsafe { &*this.data }
+        return unsafe { &*this.data };
     }
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief 将WRITER降级为READER
     pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
         while self.inner.current_reader().is_err() {
             spin_loop();
@@ -356,6 +367,7 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief 将WRITER降级为UPGRADER
     pub fn downgrade_to_upgradeable(self) -> RwLockUpgradableGuard<'rwlock, T> {
         debug_assert_eq!(
             self.inner.lock.load(Ordering::Acquire) & (WRITER | UPGRADED),

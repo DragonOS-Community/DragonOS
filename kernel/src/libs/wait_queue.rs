@@ -128,7 +128,7 @@ impl WaitQueue {
     }
 
     /// @brief 获得当前等待队列的大小
-    pub fn len(&self)->usize{
+    pub fn len(&self) -> usize {
         return self.0.lock().wait_list.len();
     }
 }

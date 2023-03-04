@@ -67,8 +67,8 @@ impl MmioBuddyMemPool {
     ///
     /// @param vaddr 虚拟地址
     ///
-    /// @param exp 内存空间的大小（2^exp
-    /// ）
+    /// @param exp 内存空间的大小（2^exp）
+    ///
     /// @param list_guard 【exp】对应的链表
     ///
     /// @return Ok(i32) 返回0
@@ -405,9 +405,9 @@ impl Default for MmioBuddyAddrRegion {
 
 /// @brief 空闲页数组结构体
 pub struct MmioFreeRegionList {
-    // 存储mmio_buddy的地址链表
+    /// 存储mmio_buddy的地址链表
     list: LinkedList<Box<MmioBuddyAddrRegion>>,
-    // 空闲块的数量
+    /// 空闲块的数量
     num_free: i64,
 }
 impl MmioFreeRegionList {

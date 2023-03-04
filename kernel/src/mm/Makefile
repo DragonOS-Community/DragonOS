@@ -2,7 +2,7 @@
 CFLAGS += -I .
 
 
-all:mm.o slab.o mm-stat.o vma.o mmap.o utils.o mmio.o mmio-buddy.o
+all:mm.o slab.o mm-stat.o vma.o mmap.o utils.o mmio.o 
 
 mm.o: mm.c
 	$(CC) $(CFLAGS) -c mm.c -o mm.o
@@ -25,5 +25,3 @@ utils.o: utils.c
 mmio.o: mmio.c
 	$(CC) $(CFLAGS) -c mmio.c -o mmio.o
 
-mmio-buddy.o: mmio-buddy.c
-	$(CC) $(CFLAGS) -c mmio-buddy.c -o mmio-buddy.o

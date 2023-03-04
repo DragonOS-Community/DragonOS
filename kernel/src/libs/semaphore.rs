@@ -16,8 +16,8 @@ impl Semaphore {
     #[inline]
     /// @brief 初始化信号量
     ///
-    /// @param sema 信号量对象
     /// @param count 信号量的初始值
+    /// @return 条件满足返回semaphore对象,条件不满足返回err信息
     fn new(counter: i32) -> Result<Self, i32> {
         if counter > 0 {
             Ok(Self {
@@ -42,10 +42,13 @@ impl Semaphore {
     #[allow(dead_code)]
     #[inline]
     fn up(&self) {
+        // 判断有没有进程在等待资源
         if self.wait_queue.len() > 0 {
             self.counter.fetch_add(1, Ordering::Release);
         } else {
+            //尝试唤醒
             if !self.wait_queue.wakeup(0x_ffff_ffff_ffff_ffff) {
+                //如果唤醒失败,打印错误信息
                 kdebug!(
                     "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
                     current_pcb().pid,

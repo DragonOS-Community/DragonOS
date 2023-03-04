@@ -1,8 +1,20 @@
 use core::cmp::min;
 
-use alloc::{string::String, sync::Arc, vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
-use crate::include::bindings::bindings::{EEXIST, EILSEQ, EINVAL, ENAMETOOLONG, EROFS};
+use crate::{
+    filesystem::vfs::FileSystem,
+    include::bindings::bindings::{
+        EEXIST, EILSEQ, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EPERM,
+        EROFS,
+    },
+    io::{device::LBA_SIZE, SeekFrom},
+    libs::vec_cursor::VecCursor,
+};
 
 use super::{
     fs::{Cluster, FATFileSystem},
@@ -28,15 +40,16 @@ pub enum FATEntry {
 }
 
 /// FAT目录项的枚举类型
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FATDirEntry {
     File(FATFile),
     VolId(FATFile),
     Dir(FATDir),
+    UnInit,
 }
 
 /// FAT文件系统中的文件
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FATFile {
     /// 文件的第一个簇
     pub first_cluster: Cluster,
@@ -49,7 +62,7 @@ pub struct FATFile {
 }
 
 /// FAT文件系统中的文件夹
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FATDir {
     /// 目录的第一个簇
     pub first_cluster: Cluster,
@@ -62,25 +75,534 @@ pub struct FATDir {
     pub loc: Option<((Cluster, u64), (Cluster, u64))>,
 }
 
+impl FATDir {
+    /// @brief 获得用于遍历当前目录的迭代器
+    ///
+    /// @param fs 当前目录所在的文件系统
+    pub fn to_iter(&self, fs: Arc<FATFileSystem>) -> FATDirIter {
+        return FATDirIter {
+            current_cluster: self.first_cluster,
+            offset: self.root_offset.unwrap_or(0),
+            is_root: self.is_root(),
+            fs: fs,
+        };
+    }
+
+    /// @brief 判断当前目录是否为根目录（仅对FAT12和FAT16生效）
+    #[inline]
+    pub fn is_root(&self) -> bool {
+        return self.root_offset.is_some();
+    }
+
+    /// @brief 获取当前目录所占用的大小
+    pub fn size(self, fs: Arc<FATFileSystem>) -> u64 {
+        return fs.num_clusters_chain(self.first_cluster) * fs.bytes_per_cluster();
+    }
+
+    /// @brief 在目录项中，寻找num_free个连续空闲目录项
+    ///
+    /// @param num_free 需要的空闲目录项数目.
+    /// @param fs 当前文件夹属于的文件系统
+    ///
+    /// @return Ok(Option<(第一个符合条件的空闲目录项所在的簇，簇内偏移量))
+    /// @return Err(错误码)
+    pub fn find_free_entries(
+        &self,
+        num_free: u64,
+        fs: Arc<FATFileSystem>,
+    ) -> Result<Option<(Cluster, u64)>, i32> {
+        let mut free = 0;
+        let mut current_cluster: Cluster = self.first_cluster;
+        let mut offset = self.root_offset.unwrap_or(0);
+        // 第一个符合条件的空闲目录项
+        let mut first_free: Option<(Cluster, u64)> = None;
+
+        loop {
+            // 如果当前簇没有空间了，并且当前不是FAT12和FAT16的根目录，那么就读取下一个簇。
+            if offset >= fs.bytes_per_cluster() && !self.is_root() {
+                // 成功读取下一个簇
+                if let FATEntry::Next(c) = fs.get_fat_entry(current_cluster)? {
+                    current_cluster = c;
+                    // 计算簇内偏移量
+                    offset = offset % fs.bytes_per_cluster();
+                } else {
+                    // 读取失败，当前已经是最后一个簇，退出循环
+                    break;
+                }
+            }
+            // 如果当前目录是FAT12和FAT16的根目录，且已经读取完，就直接返回。
+            if self.is_root() && offset > fs.root_dir_end_bytes_offset().unwrap() {
+                return Ok(None);
+            }
+
+            let e_offset = fs.cluster_bytes_offset(current_cluster) + offset;
+            let entry: FATRawDirEntry = get_raw_dir_entry(&fs, e_offset)?;
+
+            match entry {
+                FATRawDirEntry::Free | FATRawDirEntry::FreeRest => {
+                    if free == 0 {
+                        first_free = Some((current_cluster, offset));
+                    }
+
+                    free += 1;
+                    if free == num_free {
+                        return Ok(first_free);
+                    }
+                }
+
+                // 遇到一个不空闲的目录项，那么重新开始计算空闲目录项
+                _ => {
+                    free = 0;
+                }
+            }
+        }
+
+        // 剩余的需要获取的目录项
+        let remain_entries = num_free - free;
+
+        // 计算需要申请多少个簇
+        let clusters_required =
+            (remain_entries * FATRawDirEntry::DIR_ENTRY_LEN + fs.bytes_per_cluster() - 1)
+                / fs.bytes_per_cluster();
+
+        let mut first_cluster = Cluster::default();
+        let mut prev_cluster = current_cluster;
+        // 申请簇
+        for i in 0..clusters_required {
+            let c: Cluster = fs.allocate_cluster(Some(prev_cluster))?;
+            if i == 0 {
+                first_cluster = c;
+            }
+
+            prev_cluster = c;
+        }
+
+        if free > 0 {
+            // 空闲目录项跨越了簇，返回第一个空闲目录项
+            return Ok(first_free);
+        } else {
+            // 空闲目录项是在全新的簇开始的
+            return Ok(Some((first_cluster, 0)));
+        }
+    }
+
+    /// @brief 在当前目录中寻找目录项
+    ///
+    /// @param name 目录项的名字
+    /// @param expect_dir 该值为Some时有效。如果期待目标目录项是文件夹，那么值为Some(true), 否则为Some(false).
+    /// @param short_name_gen 短目录项名称生成器
+    /// @param fs 当前目录所属的文件系统
+    ///
+    /// @return Ok(FATDirEntry) 找到期待的目录项
+    /// @return Err(i32) 错误码
+    pub fn find_entry(
+        &self,
+        name: &str,
+        expect_dir: Option<bool>,
+        mut short_name_gen: Option<&mut ShortNameGenerator>,
+        fs: Arc<FATFileSystem>,
+    ) -> Result<FATDirEntry, i32> {
+        LongDirEntry::validate_long_name(name)?;
+        // 迭代当前目录下的文件/文件夹
+        for e in self.to_iter(fs) {
+            if e.eq_name(name) {
+                if expect_dir.is_some() && Some(e.is_dir()) != expect_dir {
+                    if e.is_dir() {
+                        // 期望得到文件，但是是文件夹
+                        return Err(-(EISDIR as i32));
+                    } else {
+                        // 期望得到文件夹，但是是文件
+                        return Err(-(ENOTDIR as i32));
+                    }
+                }
+                // 找到期望的目录项
+                return Ok(e);
+            }
+
+            if let Some(ref mut sng) = short_name_gen {
+                sng.add_name(&e.short_name_raw())
+            }
+        }
+        // 找不到文件/文件夹
+        return Err(-(ENOENT as i32));
+    }
+
+    /// @brief 在当前目录下打开文件，获取FATFile结构体
+    pub fn open_file(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATFile, i32> {
+        let f: FATFile = self.find_entry(name, Some(false), None, fs)?.to_file()?;
+        return Ok(f);
+    }
+
+    /// @brief 在当前目录下打开文件夹，获取FATDir结构体
+    pub fn open_dir(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATDir, i32> {
+        let d: FATDir = self.find_entry(name, Some(true), None, fs)?.to_dir()?;
+        return Ok(d);
+    }
+
+    /// @brief 在当前文件夹下创建文件。
+    ///
+    /// @param name 文件名
+    /// @param fs 当前文件夹所属的文件系统
+    pub fn create_file(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATFile, i32> {
+        let r: Result<FATDirEntryOrShortName, i32> =
+            self.check_existence(name, Some(false), fs.clone());
+        // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
+        if r.is_err() {
+            let err_val = r.unwrap_err();
+            if err_val == (-(EISDIR as i32)) || err_val == (-(ENOTDIR as i32)) {
+                return Err(-(EEXIST as i32));
+            } else {
+                return Err(err_val);
+            }
+        }
+
+        match r.unwrap() {
+            FATDirEntryOrShortName::ShortName(short_name) => {
+                // 确认名称是一个可行的长文件名
+                LongDirEntry::validate_long_name(name)?;
+                // 创建目录项
+                let x: Result<FATFile, i32> = self
+                    .create_dir_entries(
+                        name.trim(),
+                        &short_name,
+                        None,
+                        FileAttributes {
+                            value: FileAttributes::ARCHIVE,
+                        },
+                        fs.clone(),
+                    )
+                    .map(|e| e.to_file())?;
+                return x;
+            }
+
+            FATDirEntryOrShortName::DirEntry(_) => {
+                // 已经存在这样的一个目录项了
+                return Err(-(EEXIST as i32));
+            }
+        }
+    }
+
+    pub fn create_dir(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATDir, i32> {
+        let r: Result<FATDirEntryOrShortName, i32> =
+            self.check_existence(name, Some(true), fs.clone());
+        // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
+        if r.is_err() {
+            let err_val = r.unwrap_err();
+            if err_val == (-(EISDIR as i32)) || err_val == (-(ENOTDIR as i32)) {
+                return Err(-(EEXIST as i32));
+            } else {
+                return Err(err_val);
+            }
+        }
+
+        match r.unwrap() {
+            // 文件夹不存在，创建文件夹
+            FATDirEntryOrShortName::ShortName(short_name) => {
+                LongDirEntry::validate_long_name(name)?;
+                // 目标目录项
+                let mut short_entry = ShortDirEntry::default();
+                let first_cluster: Cluster = fs.allocate_cluster(None)?;
+                short_entry.set_first_cluster(first_cluster);
+
+                // === 接下来在子目录中创建'.'目录项和'..'目录项
+                let mut offset = 0;
+                // '.'目录项
+                let mut dot_entry = ShortDirEntry::default();
+                dot_entry.name = ShortNameGenerator::new(".").generate().unwrap();
+                dot_entry.attributes.value = FileAttributes::DIRECTORY;
+                dot_entry.set_first_cluster(first_cluster);
+
+                // todo: 设置创建、访问时间
+                dot_entry.flush(fs.clone(), fs.cluster_bytes_offset(first_cluster) + offset)?;
+
+                drop(dot_entry);
+                // 偏移量加上一个目录项的长度
+                offset += FATRawDirEntry::DIR_ENTRY_LEN;
+
+                // '..'目录项
+                let mut dot_dot_entry = ShortDirEntry::default();
+                dot_dot_entry.name = ShortNameGenerator::new("..").generate().unwrap();
+                dot_dot_entry.attributes.value = FileAttributes::DIRECTORY;
+                dot_dot_entry.set_first_cluster(self.first_cluster);
+                // todo: 设置创建、访问时间
+
+                dot_dot_entry.flush(fs.clone(), fs.cluster_bytes_offset(first_cluster) + offset)?;
+
+                // 在当前目录下创建目标目录项
+                return self
+                    .create_dir_entries(
+                        name.trim(),
+                        &short_name,
+                        Some(short_entry),
+                        FileAttributes {
+                            value: FileAttributes::DIRECTORY,
+                        },
+                        fs.clone(),
+                    )
+                    .map(|e| e.to_dir())?;
+            }
+            FATDirEntryOrShortName::DirEntry(_) => {
+                // 已经存在这样的一个目录项了
+                return Err(-(EEXIST as i32));
+            }
+        }
+    }
+    /// @brief 检查目录项在当前文件夹下是否存在
+    ///
+    /// @param name 目录项的名字
+    /// @param expect_dir 该值为Some时有效。如果期待目标目录项是文件夹，那么值为Some(true), 否则为Some(false).
+    /// @param fs 当前目录所属的文件系统
+    ///
+    /// @return Ok(FATDirEntryOrShortName::DirEntry) 找到期待的目录项
+    /// @return Ok(FATDirEntryOrShortName::ShortName) 当前文件夹下不存在指定的目录项，因此返回一个可行的短文件名
+    /// @return Err(i32) 错误码
+    pub fn check_existence(
+        &self,
+        name: &str,
+        expect_dir: Option<bool>,
+        fs: Arc<FATFileSystem>,
+    ) -> Result<FATDirEntryOrShortName, i32> {
+        let mut sng = ShortNameGenerator::new(name);
+
+        loop {
+            let e: Result<FATDirEntry, i32> =
+                self.find_entry(name, expect_dir, Some(&mut sng), fs.clone());
+            match e {
+                Ok(e) => {
+                    // 找到，返回目录项
+                    return Ok(FATDirEntryOrShortName::DirEntry(e));
+                }
+                Err(e) => {
+                    // 如果没找到，则不返回错误
+                    if e == -(ENOENT as i32) {
+                    } else {
+                        // 其他错误，则返回
+                        return Err(e);
+                    }
+                }
+            }
+
+            // 没找到文件，则生成短文件名
+            if let Ok(name) = sng.generate() {
+                return Ok(FATDirEntryOrShortName::ShortName(name));
+            }
+
+            sng.next_iteration();
+        }
+    }
+
+    /// @brief 创建一系列的目录项
+    ///
+    /// @param long_name 长文件名
+    /// @param short_name 短文件名
+    /// @param short_dentry 可选的生成好的短目录项结构体
+    /// @param attrs FAT目录项的属性
+    /// @param fs 当前文件夹所属的文件系统
+    ///
+    /// @return Ok(FATDirEntry) FAT目录项的枚举类型（目录项链条的最后一个长目录项）
+    fn create_dir_entries(
+        &self,
+        long_name: &str,
+        short_name: &[u8; 11],
+        short_dentry: Option<ShortDirEntry>,
+        attrs: FileAttributes,
+        fs: Arc<FATFileSystem>,
+    ) -> Result<FATDirEntry, i32> {
+        let mut short_dentry: ShortDirEntry = short_dentry.unwrap_or(ShortDirEntry::default());
+        short_dentry.name = short_name.clone();
+        short_dentry.attributes = attrs;
+
+        // todo: 设置创建时间、修改时间
+
+        let mut long_name_gen: LongNameEntryGenerator =
+            LongNameEntryGenerator::new(long_name, short_dentry.checksum());
+        let num_entries = long_name_gen.num_entries() as u64;
+
+        let free_entries: Option<(Cluster, u64)> =
+            self.find_free_entries(num_entries, fs.clone())?;
+        // 目录项开始位置
+        let start_loc: (Cluster, u64) = match free_entries {
+            Some(c) => c,
+            None => return Err(-(ENOSPC as i32)),
+        };
+
+        let offsets: Vec<(Cluster, u64)> =
+            FATDirEntryOffsetIter::new(fs.clone(), start_loc, num_entries, None).collect();
+        // 迭代长目录项
+        for off in &offsets.as_slice()[..offsets.len() - 1] {
+            // 获取生成的下一个长目录项
+            let long_entry: LongDirEntry = long_name_gen.next().unwrap();
+            // 获取这个长目录项在磁盘内的字节偏移量
+            let bytes_offset = fs.cluster_bytes_offset(off.0) + off.1;
+            long_entry.flush(fs.clone(), bytes_offset)?;
+        }
+
+        let start: (Cluster, u64) = offsets[0];
+        let end: (Cluster, u64) = *offsets.last().unwrap();
+        // 短目录项在磁盘上的字节偏移量
+        let offset = fs.cluster_bytes_offset(end.0) + end.1;
+        short_dentry.flush(fs, offset)?;
+
+        return Ok(short_dentry.to_dir_entry_with_long_name(long_name.to_string(), (start, end)));
+    }
+
+    /// @brief 判断当前目录是否为空
+    ///
+    /// @return true 当前目录为空
+    /// @return false 当前目录不为空
+    pub fn is_empty(&self, fs: Arc<FATFileSystem>) -> bool {
+        for e in self.to_iter(fs) {
+            let s = e.short_name();
+            if s == "." || s == ".." {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// @brief 从当前文件夹中删除文件或者文件夹。如果目标文件夹不为空，则不能删除，返回-ENOTEMPTY.
+    ///
+    /// @param fs 当前FATDir所属的文件系统
+    /// @param name 目录项的名字
+    /// @param remove_clusters 是否删除与指定的目录项相关联的数据簇
+    ///
+    /// @return Ok() 成功时无返回值
+    /// @return Err(i32) 如果目标文件夹不为空，则不能删除，返回-ENOTEMPTY. 或者返回底层传上来的错误
+    pub fn remove(
+        &self,
+        fs: Arc<FATFileSystem>,
+        name: &str,
+        remove_clusters: bool,
+    ) -> Result<(), i32> {
+        let e: FATDirEntry = self.find_entry(name, None, None, fs.clone())?;
+
+        // 判断文件夹是否为空，如果空，则不删除，报错。
+        if e.is_dir() && !(e.to_dir().unwrap().is_empty(fs.clone())) {
+            return Err(-(ENOTEMPTY as i32));
+        }
+
+        if e.first_cluster().cluster_num >= 2 && remove_clusters {
+            // 删除与指定的目录项相关联的数据簇
+            fs.deallocate_cluster_chain(e.first_cluster())?;
+        }
+
+        if e.get_dir_range().is_some() {
+            self.remove_dir_entries(fs, e.get_dir_range().unwrap())?;
+        }
+
+        return Ok(());
+    }
+
+    /// @brief 在当前目录中删除多个目录项
+    ///
+    /// @param fs 当前目录所属的文件系统
+    /// @param cluster_range 要删除的目录项的范围（以簇+簇内偏移量的形式表示）
+    fn remove_dir_entries(
+        &self,
+        fs: Arc<FATFileSystem>,
+        cluster_range: ((Cluster, u64), (Cluster, u64)),
+    ) -> Result<(), i32> {
+        // 收集所有的要移除的目录项
+        let offsets: Vec<(Cluster, u64)> =
+            FATDirEntryOffsetIter::new(fs.clone(), cluster_range.0, 15, Some(cluster_range.1))
+                .collect();
+        // 逐个设置这些目录项为“空闲”状态
+        for off in offsets {
+            let disk_bytes_offset = fs.cluster_bytes_offset(off.0) + off.1;
+            let mut short_entry = ShortDirEntry::default();
+            short_entry.name[0] = 0xe5;
+            short_entry.flush(fs.clone(), disk_bytes_offset)?;
+        }
+        return Ok(());
+    }
+
+    /// @brief 根据名字在当前文件夹下寻找目录项
+    ///
+    /// @return Ok(FATDirEntry) 目标目录项
+    /// @return Err(i32) 底层传上来的错误码
+    pub fn get_dir_entry(&self, fs: Arc<FATFileSystem>, name: &str) -> Result<FATDirEntry, i32> {
+        if name == "." || name == "/" {
+            return Ok(FATDirEntry::Dir(self.clone()));
+        }
+
+        LongDirEntry::validate_long_name(name)?;
+        return self.find_entry(name, None, None, fs);
+    }
+
+    /// @brief 在当前目录内，重命名一个目录项
+    ///
+    pub fn rename(
+        &self,
+        fs: Arc<FATFileSystem>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<FATDirEntry, i32> {
+        // https://redox.longjin666.cn/xref/redox-fatfs/src/dir_entry.rs?r=7c4cda40#368
+
+        // 判断源目录项是否存在
+        let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
+            self.check_existence(old_name, None, fs.clone())?
+        {
+            dentry
+        } else {
+            // 如果目标目录项不存在，则返回错误
+            return Err(-(ENOENT as i32));
+        };
+
+        let short_name = if let FATDirEntryOrShortName::ShortName(s) =
+            self.check_existence(new_name, None, fs.clone())?
+        {
+            s
+        } else {
+            // 如果目标目录项存在，那么就返回错误
+            return Err(-(EEXIST as i32));
+        };
+
+        let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
+        if let Some(se) = old_short_dentry {
+            // 删除原来的目录项
+            self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
+
+            // 创建新的目录项
+            let new_dentry: FATDirEntry = self.create_dir_entries(
+                new_name,
+                &short_name,
+                Some(se),
+                se.attributes,
+                fs.clone(),
+            )?;
+
+            return Ok(new_dentry);
+        } else {
+            // 不允许对根目录项进行重命名
+            return Err(-(EPERM as i32));
+        }
+    }
+}
+
 impl FileAttributes {
+    pub const READ_ONLY: u8 = 1 << 0;
+    pub const HIDDEN: u8 = 1 << 1;
+    pub const SYSTEM: u8 = 1 << 2;
+    pub const VOLUME_ID: u8 = 1 << 3;
+    pub const DIRECTORY: u8 = 1 << 4;
+    pub const ARCHIVE: u8 = 1 << 5;
+    pub const LONG_NAME: u8 = FileAttributes::READ_ONLY
+        | FileAttributes::HIDDEN
+        | FileAttributes::SYSTEM
+        | FileAttributes::VOLUME_ID;
+
     /// @brief 判断属性是否存在
     #[inline]
     pub fn contains(&self, attr: u8) -> bool {
         return (self.value & attr) != 0;
     }
-}
 
-impl FileAttributes {
-    const READ_ONLY: u8 = 1 << 0;
-    const HIDDEN: u8 = 1 << 1;
-    const SYSTEM: u8 = 1 << 2;
-    const VOLUME_ID: u8 = 1 << 3;
-    const DIRECTORY: u8 = 1 << 4;
-    const ARCHIVE: u8 = 1 << 5;
-    const LONG_NAME: u8 = FileAttributes::READ_ONLY
-        | FileAttributes::HIDDEN
-        | FileAttributes::SYSTEM
-        | FileAttributes::VOLUME_ID;
+    pub fn new(attr: u8) -> Self {
+        return Self { value: attr };
+    }
 }
 
 /// FAT32的短目录项
@@ -106,7 +628,7 @@ pub struct ShortDirEntry {
     /// 最后一次访问日期
     lst_acc_date: u16,
     /// High word of first cluster(0 for FAT12 and FAT16)
-    fst_clst_hi: u16,
+    fst_clus_hi: u16,
     /// 最后写入时间
     wrt_time: u16,
     /// 最后写入日期
@@ -233,6 +755,58 @@ impl LongDirEntry {
         }
         return Ok(());
     }
+
+    /// @brief 把当前长目录项写入磁盘
+    ///
+    /// @param fs 对应的文件系统
+    /// @param disk_bytes_offset 长目录项所在位置对应的在磁盘上的字节偏移量
+    ///
+    /// @return Ok(())
+    /// @return Err(i32) 错误码
+    pub fn flush(&self, fs: Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), i32> {
+        // 从磁盘读取数据
+        let blk_offset = fs.get_in_block_offset(disk_bytes_offset);
+        let lba = fs.get_lba_from_offset(
+            fs.bytes_to_sector(fs.get_in_partition_bytes_offset(disk_bytes_offset)),
+        );
+        let mut v: Vec<u8> = Vec::new();
+        v.resize(1 * fs.lba_per_sector()*LBA_SIZE, 0);
+        fs.partition
+            .disk()
+            .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
+
+        let mut cursor: VecCursor = VecCursor::new(v);
+        // 切换游标到对应位置
+        cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
+
+        // 写入数据
+        cursor.write_u8(self.ord)?;
+        for b in &self.name1 {
+            cursor.write_u16(*b)?;
+        }
+
+        cursor.write_u8(self.file_attrs.value)?;
+        cursor.write_u8(self.dirent_type)?;
+        cursor.write_u8(self.checksum)?;
+
+        for b in &self.name2 {
+            cursor.write_u16(*b)?;
+        }
+
+        cursor.write_u16(self.first_clus_low)?;
+
+        for b in &self.name3 {
+            cursor.write_u16(*b)?;
+        }
+
+        // 把修改后的长目录项刷入磁盘
+        fs.partition
+            .disk()
+            .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
+        fs.partition.disk().sync()?;
+
+        return Ok(());
+    }
 }
 
 impl ShortDirEntry {
@@ -311,7 +885,7 @@ impl ShortDirEntry {
     pub fn to_dir_entry(&self, loc: (Cluster, u64)) -> FATDirEntry {
         // 当前文件的第一个簇
         let first_cluster =
-            Cluster::new(((self.fst_clst_hi as u64) << 16) | (self.fst_clus_lo as u64));
+            Cluster::new(((self.fst_clus_hi as u64) << 16) | (self.fst_clus_lo as u64));
 
         // 当前是文件或卷号
         if self.is_file() || self.is_volume_id() {
@@ -354,7 +928,7 @@ impl ShortDirEntry {
     ) -> FATDirEntry {
         // 当前文件的第一个簇
         let first_cluster =
-            Cluster::new(((self.fst_clst_hi as u64) << 16) | (self.fst_clus_lo as u64));
+            Cluster::new(((self.fst_clus_hi as u64) << 16) | (self.fst_clus_lo as u64));
 
         if self.is_file() || self.is_volume_id() {
             let mut file = FATFile::default();
@@ -390,6 +964,56 @@ impl ShortDirEntry {
             result = (result << 7) + (result >> 1) + *c;
         }
         return result;
+    }
+
+    /// @brief 把当前短目录项写入磁盘
+    ///
+    /// @param fs 对应的文件系统
+    /// @param disk_bytes_offset 短目录项所在位置对应的在磁盘上的字节偏移量
+    ///
+    /// @return Ok(())
+    /// @return Err(i32) 错误码
+    pub fn flush(&self, fs: Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), i32> {
+        // 从磁盘读取数据
+        let blk_offset = fs.get_in_block_offset(disk_bytes_offset);
+        let lba = fs.get_lba_from_offset(
+            fs.bytes_to_sector(fs.get_in_partition_bytes_offset(disk_bytes_offset)),
+        );
+        let mut v: Vec<u8> = Vec::new();
+        v.resize(1 * fs.lba_per_sector()*LBA_SIZE, 0);
+        fs.partition
+            .disk()
+            .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
+
+        let mut cursor: VecCursor = VecCursor::new(v);
+        // 切换游标到对应位置
+        cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
+        cursor.write_exact(&self.name)?;
+        cursor.write_u8(self.attributes.value)?;
+        cursor.write_u8(self.nt_res)?;
+        cursor.write_u8(self.crt_time_tenth)?;
+        cursor.write_u16(self.crt_time)?;
+        cursor.write_u16(self.crt_date)?;
+        cursor.write_u16(self.lst_acc_date)?;
+        cursor.write_u16(self.fst_clus_hi)?;
+        cursor.write_u16(self.wrt_time)?;
+        cursor.write_u16(self.wrt_date)?;
+        cursor.write_u16(self.fst_clus_lo)?;
+        cursor.write_u32(self.file_size)?;
+
+        // 把修改后的长目录项刷入磁盘
+        fs.partition
+            .disk()
+            .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
+        fs.partition.disk().sync()?;
+
+        return Ok(());
+    }
+
+    /// @brief 设置短目录项的“第一个簇”字段的值
+    pub fn set_first_cluster(&mut self, cluster: Cluster) {
+        self.fst_clus_lo = (cluster.cluster_num & 0x0000ffff) as u16;
+        self.fst_clus_hi = ((cluster.cluster_num & 0xffff0000) >> 16) as u16;
     }
 }
 
@@ -492,7 +1116,7 @@ impl FATDirIter {
             // 获取簇在磁盘内的字节偏移量
             let offset: u64 = self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
             // 从磁盘读取原始的dentry
-            let raw_dentry: FATRawDirEntry = self.fs.get_raw_dir_entry(offset)?;
+            let raw_dentry: FATRawDirEntry = get_raw_dir_entry(&self.fs, offset)?;
 
             // 由于迭代顺序从前往后，因此：
             // 如果找到1个短目录项，那么证明有一个完整的entry被找到，因此返回。
@@ -514,7 +1138,7 @@ impl FATDirIter {
                     // 当前找到一个长目录项
 
                     // 声明一个数组，来容纳所有的entry。（先把最后一个entry放进去）
-                    let mut long_name_entries: vec::Vec<FATRawDirEntry> = vec![raw_dentry];
+                    let mut long_name_entries: Vec<FATRawDirEntry> = vec![raw_dentry];
                     let start_offset: u64 = self.offset;
                     let start_cluster: Cluster = self.current_cluster;
 
@@ -551,7 +1175,7 @@ impl FATDirIter {
                         let offset: u64 =
                             self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
                         // 从磁盘读取原始的dentry
-                        let raw_dentry: FATRawDirEntry = self.fs.get_raw_dir_entry(offset)?;
+                        let raw_dentry: FATRawDirEntry = get_raw_dir_entry(&self.fs, offset)?;
 
                         match raw_dentry {
                             FATRawDirEntry::Short(_) => {
@@ -630,7 +1254,7 @@ impl FATDirEntry {
     /// @return Ok(FATDirEntry) 构建好的FATDirEntry类型的对象
     /// @return Err(i32) 错误码
     pub fn new(
-        mut long_name_entries: vec::Vec<FATRawDirEntry>,
+        mut long_name_entries: Vec<FATRawDirEntry>,
         loc: ((Cluster, u64), (Cluster, u64)),
     ) -> Result<Self, i32> {
         if long_name_entries.is_empty() {
@@ -668,6 +1292,181 @@ impl FATDirEntry {
         } else {
             // 校验和不相同，认为文件系统出错
             return Err(-(EROFS as i32));
+        }
+    }
+
+    /// @brief 获取短目录项的名字
+    pub fn short_name(&self) -> String {
+        match self {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                return f.short_dir_entry.name_to_string();
+            }
+            FATDirEntry::Dir(d) => match d.short_dir_entry {
+                Some(s) => {
+                    return s.name_to_string();
+                }
+                None => {
+                    return String::from("/");
+                }
+            },
+            FATDirEntry::UnInit => unreachable!("FATFS: FATDirEntry uninitialized."),
+        }
+    }
+
+    /// @brief 获取短目录项结构体
+    pub fn short_dir_entry(&self) -> Option<ShortDirEntry> {
+        match &self {
+            FATDirEntry::File(f) => {
+                return Some(f.short_dir_entry);
+            }
+            FATDirEntry::Dir(d) => {
+                return d.short_dir_entry;
+            }
+            FATDirEntry::VolId(s) => {
+                return Some(s.short_dir_entry);
+            }
+            FATDirEntry::UnInit => unreachable!("FATFS: FATDirEntry uninitialized."),
+        }
+    }
+
+    /// @brief 获取目录项的第一个簇的簇号
+    pub fn first_cluster(&self) -> Cluster {
+        match self {
+            FATDirEntry::File(f) => {
+                return f.first_cluster;
+            }
+            FATDirEntry::Dir(d) => {
+                return d.first_cluster;
+            }
+            FATDirEntry::VolId(s) => {
+                return s.first_cluster;
+            }
+            FATDirEntry::UnInit => unreachable!("FATFS: FATDirEntry uninitialized."),
+        }
+    }
+
+    /// @brief 获取当前目录项所占用的簇的范围
+    ///
+    /// @return (起始簇，簇内偏移量), (终止簇，簇内偏移量)
+    pub fn get_dir_range(&self) -> Option<((Cluster, u64), (Cluster, u64))> {
+        match self {
+            FATDirEntry::File(f) => Some(f.loc),
+            FATDirEntry::Dir(d) => d.loc,
+            FATDirEntry::VolId(s) => Some(s.loc),
+            FATDirEntry::UnInit => unreachable!("FATFS: FATDirEntry uninitialized."),
+        }
+    }
+
+    /// @brief 获取原始的短目录项名（FAT标准规定的）
+    pub fn short_name_raw(&self) -> [u8; 11] {
+        match self {
+            FATDirEntry::File(f) => {
+                return f.short_dir_entry.name;
+            }
+            FATDirEntry::Dir(d) => match d.short_dir_entry {
+                // 存在短目录项，直接返回
+                Some(s) => {
+                    return s.name;
+                }
+                // 是根目录项
+                None => {
+                    let mut s = [0x20u8; 11];
+                    s[0] = '/' as u8;
+                    return s;
+                }
+            },
+            FATDirEntry::VolId(s) => {
+                return s.short_dir_entry.name;
+            }
+
+            FATDirEntry::UnInit => unreachable!("FATFS: FATDirEntry uninitialized."),
+        }
+    }
+
+    /// @brief 获取目录项的名字
+    pub fn name(&self) -> String {
+        match self {
+            FATDirEntry::File(f) => {
+                return f.file_name.clone();
+            }
+            FATDirEntry::VolId(s) => {
+                return s.file_name.clone();
+            }
+            FATDirEntry::Dir(d) => {
+                return d.dir_name.clone();
+            }
+            FATDirEntry::UnInit => unreachable!("FATFS: FATDirEntry uninitialized."),
+        }
+    }
+
+    /// @brief 判断目录项是否为文件
+    pub fn is_file(&self) -> bool {
+        match self {
+            &FATDirEntry::File(_) | &FATDirEntry::VolId(_) => true,
+            _ => false,
+        }
+    }
+
+    /// @brief 判断目录项是否为文件夹
+    pub fn is_dir(&self) -> bool {
+        match &self {
+            &FATDirEntry::Dir(_) => true,
+            _ => false,
+        }
+    }
+
+    /// @brief 判断目录项是否为Volume id
+    pub fn is_vol_id(&self) -> bool {
+        match self {
+            &FATDirEntry::VolId(_) => true,
+            _ => false,
+        }
+    }
+
+    /// @brief 判断FAT目录项的名字与给定的是否相等
+    ///
+    /// 由于FAT32对大小写不敏感，因此将字符都转为大写，然后比较
+    ///
+    /// @return bool 相等 => true
+    ///              不相等 => false
+    pub fn eq_name(&self, name: &str) -> bool {
+        // 由于FAT32对大小写不敏感，因此将字符都转为大写，然后比较。
+        let binding = self.short_name();
+        let short_name = binding.chars().flat_map(|c| c.to_uppercase());
+        let binding = self.name();
+        let long_name = binding.chars().flat_map(|c| c.to_uppercase());
+        let name = name.chars().flat_map(|c| c.to_uppercase());
+
+        let long_name_matches: bool = long_name.eq(name.clone());
+        let short_name_matches: bool = short_name.eq(name);
+
+        return long_name_matches || short_name_matches;
+    }
+
+    /// @brief 将FATDirEntry转换为FATFile对象
+    pub fn to_file(&self) -> Result<FATFile, i32> {
+        if self.is_file() == false {
+            return Err(-(EISDIR as i32));
+        }
+
+        match &self {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                return Ok(f.clone());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// @brief 将FATDirEntry转换为FATDir对象
+    pub fn to_dir(&self) -> Result<FATDir, i32> {
+        if self.is_dir() == false {
+            return Err(-(ENOTDIR as i32));
+        }
+        match &self {
+            FATDirEntry::Dir(d) => {
+                return Ok(d.clone());
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -906,10 +1705,10 @@ impl ShortNameGenerator {
     }
 
     /// @brief 构造具有前缀的短目录项名称
-    /// 
+    ///
     /// @param num 这是第几个重名的前缀名
     /// @param with_checksum 前缀名中是否包含校验码
-    /// 
+    ///
     /// @return 构造好的短目录项名称数组
     fn build_prefixed_name(&self, num: u32, with_checksum: bool) -> [u8; 11] {
         let mut buf: [u8; 11] = [0x20u8; 11];
@@ -976,7 +1775,7 @@ impl ShortNameGenerator {
 
 /// 从多个LongName中提取完整文件名字段的提取器
 struct LongNameExtractor {
-    name: vec::Vec<u16>,
+    name: Vec<u16>,
     checksum: u8,
     index: u8,
 }
@@ -984,7 +1783,7 @@ struct LongNameExtractor {
 impl LongNameExtractor {
     fn new() -> Self {
         return LongNameExtractor {
-            name: vec::Vec::new(),
+            name: Vec::new(),
             checksum: 0,
             index: 0,
         };
@@ -1025,7 +1824,7 @@ impl LongNameExtractor {
         // 将当前目录项的值，拷贝到生成器的数组中
         longname_dentry.copy_name_to_slice(
             &mut self.name[pos..pos + (FATRawDirEntry::DIR_ENTRY_LEN as usize)],
-        );
+        )?;
         return Ok(());
     }
 
@@ -1050,5 +1849,245 @@ impl LongNameExtractor {
     ///                 不同 => false
     fn validate_checksum(&self, short_dentry: &ShortDirEntry) -> bool {
         return self.checksum == short_dentry.checksum();
+    }
+}
+
+/// @brief 长目录项生成器
+#[derive(Debug)]
+struct LongNameEntryGenerator {
+    name: Vec<u16>,
+    // 短目录项的校验和
+    checksum: u8,
+    // 当前迭代器的索引
+    idx: u8,
+    /// 最后一个目录项的索引
+    last_index: u8,
+}
+
+impl LongNameEntryGenerator {
+    /// @brief 初始化长目录项生成器
+    ///
+    /// @param name 长文件名数组
+    /// @param checksum 短目录项的校验和
+    pub fn new(name: &str, checksum: u8) -> Self {
+        let mut name: Vec<u16> = name.chars().map(|c| c as u16).collect();
+
+        let padding_bytes: usize = (13 - (name.len() % 13)) % 13;
+        // 填充最后一个长目录项的文件名
+        for i in 0..padding_bytes {
+            if i == 0 {
+                name.push(0);
+            } else {
+                name.push(0xffff);
+            }
+        }
+
+        // 先从最后一个长目录项开始生成
+        let start_index = (name.len() / 13) as u8;
+        return LongNameEntryGenerator {
+            name: name,
+            checksum: checksum,
+            idx: start_index,
+            last_index: start_index,
+        };
+    }
+
+    /// @brief 返回要生成的长目录项的总数
+    pub fn num_entries(&self) -> u8 {
+        return self.last_index + 1;
+    }
+}
+
+impl Iterator for LongNameEntryGenerator {
+    type Item = LongDirEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.idx {
+            0 => {
+                return None;
+            }
+            // 最后一个长目录项
+            n if n == self.last_index => {
+                // 最后一个长目录项的ord需要与0x40相或
+                let ord: u8 = n | 0x40;
+                let start_idx = ((n - 1) * 13) as usize;
+                self.idx -= 1;
+                return Some(LongDirEntry::new(
+                    ord,
+                    &self.name.as_slice()[start_idx..start_idx + 13],
+                    self.checksum,
+                ));
+            }
+            n => {
+                // 其它的长目录项
+                let start_idx = ((n - 1) * 13) as usize;
+                self.idx -= 1;
+                return Some(LongDirEntry::new(
+                    n,
+                    &self.name.as_slice()[start_idx..start_idx + 13],
+                    self.checksum,
+                ));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum FATDirEntryOrShortName {
+    DirEntry(FATDirEntry),
+    ShortName([u8; 11]),
+}
+
+/// @brief 对FAT目录项的迭代器(基于簇和簇内偏移量)
+#[derive(Debug)]
+struct FATDirEntryOffsetIter {
+    /// 当前迭代的偏移量(下一次迭代要返回的值)
+    current_offset: (Cluster, u64),
+    /// 截止迭代的位置（end_offset所在的位置也会被迭代器返回)
+    end_offset: Option<(Cluster, u64)>,
+    /// 属于的文件系统
+    fs: Arc<FATFileSystem>,
+    /// 当前已经迭代了多少次
+    index: u64,
+    /// 总共要迭代多少次
+    len: u64,
+    /// 如果end_offset不为None，该字段表示“是否已经到达了迭代终点”
+    fin: bool,
+}
+
+impl FATDirEntryOffsetIter {
+    /// @brief 初始化FAT目录项的迭代器(基于簇和簇内偏移量)
+    ///
+    /// @param fs 属于的文件系统
+    /// @param start 起始偏移量
+    /// @param len 要迭代的次数
+    /// @param end_offset 截止迭代的位置（end_offset所在的位置也会被迭代器返回)
+    ///
+    /// @return 构建好的迭代器对象
+    pub fn new(
+        fs: Arc<FATFileSystem>,
+        start: (Cluster, u64),
+        len: u64,
+        end_offset: Option<(Cluster, u64)>,
+    ) -> Self {
+        return FATDirEntryOffsetIter {
+            current_offset: start,
+            end_offset,
+            fs,
+            index: 0,
+            len,
+            fin: false,
+        };
+    }
+}
+
+impl Iterator for FATDirEntryOffsetIter {
+    type Item = (Cluster, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.len || self.fin {
+            return None;
+        }
+
+        let r: (Cluster, u64) = self.current_offset;
+        // 计算新的字节偏移量
+        let mut new_offset = r.1 + FATRawDirEntry::DIR_ENTRY_LEN;
+        let mut new_cluster: Cluster = r.0;
+        // 越过了当前簇,则获取下一个簇
+        if new_offset >= self.fs.bytes_per_cluster() {
+            new_offset %= self.fs.bytes_per_cluster();
+            match self.fs.get_fat_entry(new_cluster) {
+                Ok(FATEntry::Next(c)) => {
+                    new_cluster = c;
+                }
+                // 没有下一个簇了,返回None
+                _ => {
+                    return None;
+                }
+            }
+        }
+
+        if let Some(off) = self.end_offset {
+            // 判断当前簇是否是要求停止搜索的最后一个位置
+            self.fin = off == self.current_offset;
+        }
+        // 更新当前迭代的偏移量
+        self.current_offset = (new_cluster, new_offset);
+        self.index += 1;
+        return Some(r);
+    }
+}
+
+/// @brief 根据磁盘内字节偏移量，读取磁盘，并生成一个FATRawDirEntry对象
+pub fn get_raw_dir_entry(
+    fs: &Arc<FATFileSystem>,
+    in_disk_bytes_offset: u64,
+) -> Result<FATRawDirEntry, i32> {
+    // 块内偏移量
+    let blk_offset: u64 = fs.get_in_block_offset(in_disk_bytes_offset);
+    let lba = fs.get_lba_from_offset(
+        fs.bytes_to_sector(fs.get_in_partition_bytes_offset(in_disk_bytes_offset)),
+    );
+    let mut v: Vec<u8> = Vec::new();
+    v.resize(1, 0);
+    fs.partition.disk().read_at(lba, 1, &mut v)?;
+
+    let mut cursor: VecCursor = VecCursor::new(v);
+    // 切换游标到对应位置
+    cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
+
+    let dir_0 = cursor.read_u8()?;
+
+    match dir_0 {
+        0x00 => {
+            return Ok(FATRawDirEntry::FreeRest);
+        }
+        0xe5 => {
+            return Ok(FATRawDirEntry::Free);
+        }
+        _ => {
+            cursor.seek(SeekFrom::SeekCurrent(10))?;
+            let file_attr: FileAttributes = FileAttributes::new(cursor.read_u8()?);
+
+            // 指针回到目录项的开始处
+            cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
+
+            if file_attr.contains(FileAttributes::LONG_NAME) {
+                // 当前目录项是一个长目录项
+                let mut long_dentry = LongDirEntry::default();
+
+                long_dentry.ord = cursor.read_u8()?;
+                cursor.read_u16_into(&mut long_dentry.name1)?;
+                long_dentry.file_attrs = FileAttributes::new(cursor.read_u8()?);
+                long_dentry.dirent_type = cursor.read_u8()?;
+                long_dentry.checksum = cursor.read_u8()?;
+
+                cursor.read_u16_into(&mut long_dentry.name2)?;
+                long_dentry.first_clus_low = cursor.read_u16()?;
+                cursor.read_u16_into(&mut long_dentry.name3)?;
+
+                return Ok(FATRawDirEntry::Long(long_dentry));
+            } else {
+                // 当前目录项是一个短目录项
+                let mut short_dentry = ShortDirEntry::default();
+                cursor.read_exact(&mut short_dentry.name)?;
+
+                short_dentry.attributes = FileAttributes::new(cursor.read_u8()?);
+
+                short_dentry.nt_res = cursor.read_u8()?;
+                short_dentry.crt_time_tenth = cursor.read_u8()?;
+                short_dentry.crt_time = cursor.read_u16()?;
+                short_dentry.crt_date = cursor.read_u16()?;
+                short_dentry.lst_acc_date = cursor.read_u16()?;
+                short_dentry.fst_clus_hi = cursor.read_u16()?;
+                short_dentry.wrt_time = cursor.read_u16()?;
+                short_dentry.wrt_date = cursor.read_u16()?;
+                short_dentry.lst_acc_date = cursor.read_u16()?;
+                short_dentry.fst_clus_lo = cursor.read_u16()?;
+                short_dentry.file_size = cursor.read_u32()?;
+
+                return Ok(FATRawDirEntry::Short(short_dentry));
+            }
+        }
     }
 }

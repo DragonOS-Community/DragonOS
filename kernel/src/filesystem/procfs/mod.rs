@@ -186,7 +186,7 @@ impl ProcFSInode {
 }
 
 impl FileSystem for ProcFS {
-    fn get_root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
+    fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
         return self.root_inode.clone();
     }
 
@@ -251,7 +251,7 @@ impl ProcFS {
     /// @usage 在进程中调用并创建进程对应文件
     pub fn procfs_register_pid(&self, pid: i64) -> Result<(), i32> {
         // 获取当前inode
-        let proc: Arc<dyn IndexNode> = self.get_root_inode();
+        let proc: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
         let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
         // 创建相关文件

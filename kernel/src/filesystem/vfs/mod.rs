@@ -299,7 +299,7 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (self.fs().get_root_inode(), String::from(rest))
+            (self.fs().root_inode(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))
@@ -410,7 +410,7 @@ pub struct Metadata {
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
-    fn get_root_inode(&self) -> Arc<dyn IndexNode>;
+    fn root_inode(&self) -> Arc<dyn IndexNode>;
 
     /// @brief 获取当前文件系统的信息
     fn info(&self) -> FsInfo;

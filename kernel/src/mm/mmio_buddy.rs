@@ -5,7 +5,7 @@ use crate::{
         vma_find, EINVAL, ENOMEM, EPERM, MMIO_BASE, MMIO_TOP, PAGE_1G_SHIFT, PAGE_1G_SIZE,
         PAGE_2M_SIZE, PAGE_4K_SHIFT, PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
     },
-    kdebug, kerror, kinfo,
+    kdebug, kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 use alloc::{boxed::Box, collections::LinkedList, vec::Vec};

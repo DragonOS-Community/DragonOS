@@ -155,9 +155,9 @@ pub struct MmioBuddyAddrRegion {
 
 &emsp;&emsp;DragonOS中，使用`MmioBuddyMemPool`结构体作为buddy（为表述方便，以下将伙伴算法简称为buddy）内存池的数据结构，其记录了内存池的起始地址（pool_start_addr）以及内存池中内存块的总大小（pool_size），同时其维护了大小为`MMIO_BUDDY_REGION_COUNT`的双向链表数组（free_regions）。`free_regions`中的各个链表维护了若干空闲内存块（MmioBuddyAddrRegion）。
 
-&emsp;&emsp;`free_regions`的下标（index）与内存块的大小有关。由于每个内存块大小都为$2^{n}B$，那么可以令$exp = n$。index与exp的换算公式如下：$index = exp - 12$。e.g. 一个大小为$2^{12}B$的内存块，其$exp = 12$，使用上述公式计算得$index = 12 -12 = 0$，所以该内存块会被存入`free_regions[0].list`中。通过上述换算公式，每次取出或释放$2^nB$大小的内存块，只需要操作`free_regions[n -12]`即可。DragonOS中，buddy内存池最大的内存块大小为$1G =  2^{30}B$，最小的内存块大小为 $4K =  2^{12}B$，所以$index\in[0,18]$。
+&emsp;&emsp;`free_regions`的下标（index）与内存块的大小有关。由于每个内存块大小都为$2^{n}$ bytes，那么可以令$exp = n$。index与exp的换算公式如下：$index = exp - 12$。e.g. 一个大小为$2^{12}$ bytes的内存块，其$exp = 12$，使用上述公式计算得$index = 12 -12 = 0$，所以该内存块会被存入`free_regions[0].list`中。通过上述换算公式，每次取出或释放$2^n$大小的内存块，只需要操作`free_regions[n -12]`即可。DragonOS中，buddy内存池最大的内存块大小为$1G =  2^{30}bytes$，最小的内存块大小为 $4K =  2^{12} bytes$，所以$index\in[0,18]$。
 
-&emsp;&emsp;作为内存分配机制，buddy服务于所有进程，为了解决在各个进程之间实现free_regions中的链表数据同步的问题，`free_regions`中的链表类型采用加了{ref}`自旋锁（SpinLock）<_spinlock_doc_spinlock>`的空闲内存块链表（MmioFreeRegionList），`MmioFreeRegionList`中封装有真正的存储了空闲内存块信息的结构体的链表（list）和对应链表长度（num_free）。有了自选锁后，同一时刻只允许一个进程修改某个链表，如取出链表元素（申请内存）或者向链表中插入元素（释放内存）。
+&emsp;&emsp;作为内存分配机制，buddy服务于所有进程，为了解决在各个进程之间实现free_regions中的链表数据同步的问题，`free_regions`中的链表类型采用加了 {ref}`自旋锁 <_spinlock_doc_spinlock>`（SpinLock）的空闲内存块链表（MmioFreeRegionList），`MmioFreeRegionList`中封装有真正的存储了空闲内存块信息的结构体的链表（list）和对应链表长度（num_free）。有了自选锁后，同一时刻只允许一个进程修改某个链表，如取出链表元素（申请内存）或者向链表中插入元素（释放内存）。
 
 &emsp;&emsp;`MmioFreeRegionList`中的元素类型为`MmioBuddyAddrRegion`结构体，`MmioBuddyAddrRegion`记录了内存块的起始地址（vaddr）。
 

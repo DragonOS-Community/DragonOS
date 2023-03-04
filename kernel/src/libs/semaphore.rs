@@ -1,19 +1,31 @@
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
+
+use crate::{arch::asm::current::current_pcb, include::bindings::bindings::EOVERFLOW, kdebug};
 
 use super::wait_queue::WaitQueue;
 
+/// @brief 信号量的结构体
+#[derive(Debug)]
 struct Semaphore {
-    counter: AtomicU32,
+    counter: AtomicI32,
     wait_queue: WaitQueue,
 }
 
 impl Semaphore {
     #[allow(dead_code)]
     #[inline]
-    fn new(counter: u32) -> Self {
-        Self {
-            counter: AtomicU32::new(counter),
-            wait_queue: WaitQueue::INIT,
+    /// @brief 初始化信号量
+    ///
+    /// @param sema 信号量对象
+    /// @param count 信号量的初始值
+    fn new(counter: i32) -> Result<Self, i32> {
+        if counter > 0 {
+            Ok(Self {
+                counter: AtomicI32::new(counter),
+                wait_queue: WaitQueue::INIT,
+            })
+        } else {
+            return Err(-(EOVERFLOW as i32));
         }
     }
 
@@ -22,8 +34,9 @@ impl Semaphore {
     fn down(&self) {
         if self.counter.fetch_sub(1, Ordering::Release) <= 0 {
             self.counter.fetch_add(1, Ordering::Relaxed);
-            self.wait_queue.sleep_uninterruptible();
-        } //资源不充足,信号量<=0
+            self.wait_queue.sleep();
+            //资源不充足,信号量<=0, 此时进程睡眠
+        }
     }
 
     #[allow(dead_code)]
@@ -32,8 +45,13 @@ impl Semaphore {
         if self.wait_queue.len() > 0 {
             self.counter.fetch_add(1, Ordering::Release);
         } else {
-            self.wait_queue.wakeup(0x_ffff_ffff_ffff_ffff);
-            //返回值没有处理
+            if !self.wait_queue.wakeup(0x_ffff_ffff_ffff_ffff) {
+                kdebug!(
+                    "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
+                    current_pcb().pid,
+                    self
+                );
+            }
         }
     }
 }

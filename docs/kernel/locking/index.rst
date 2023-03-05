@@ -9,3 +9,4 @@
 
    locks
    lockref
+   rwlock

@@ -9,4 +9,6 @@
 .. toctree::
    :maxdepth: 1
 
-   coding-style
+   the-development-process
+   c-coding-style
+   rust-coding-style

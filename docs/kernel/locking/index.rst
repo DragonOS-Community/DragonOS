@@ -8,6 +8,5 @@
    :maxdepth: 1
 
    locks
+   spinlock
    lockref
-   mutex
-   rwlock

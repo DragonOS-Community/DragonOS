@@ -1,8 +1,8 @@
 #include "cmd_test.h"
-#include <libc/stdio.h>
-#include <libc/stdlib.h>
-#include <libc/string.h>
-#include <libc/unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 int shell_pipe_test(int argc, char **argv)
 {

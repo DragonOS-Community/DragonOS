@@ -13,6 +13,38 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-      
+    
+    - name: Cache DragonOS GCC
+      id: cache-dragonos-gcc
+      uses: actions/cache@v3
+      env:
+          cache-name: cache-dragonos-gcc
+      with:
+        path: |
+          ~/opt
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
+    
+    - if: ${{ steps.cache-dragonos-gcc.outputs.cache-hit != 'true' }}
+      name: build dragonos-gcc
+      continue-on-error: true
+      run: bash tools/build_gcc_toolchain.sh -f
+    
+    - name: Cache build tools
+      id: cache-build-tools
+      uses: actions/cache@v3
+      env:
+          cache-name: cache-build-tools
+      with:
+        path: |
+          ~/.cargo
+          ~/.rustup
+          ~/.bashrc
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('.github/workflows/makefile.yml') }}
+    
+    - if: ${{ steps.cache-build-tools.outputs.cache-hit != 'true' }}
+      name: Install toolchain
+      continue-on-error: true
+      run:  sudo apt install -y llvm-dev libclang-dev clang gcc-multilib && cargo install cargo-binutils && rustup toolchain install nightly && rustup default nightly && rustup component add rust-src && rustup component add llvm-tools-preview && rustup target add x86_64-unknown-none 
+    
     - name: build the DragonOS
-      run: make
+      run: bash -c "source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "

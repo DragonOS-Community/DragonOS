@@ -93,7 +93,8 @@ pub struct FATInode {
     parent: Weak<LockedFATInode>,
     /// 指向自身的弱引用
     self_ref: Weak<LockedFATInode>,
-    /// 子Inode的B树
+    /// 子Inode的B树. 该数据结构用作缓存区。其中，它的key表示inode的名称。
+    /// 请注意，由于FAT的查询过程对大小写不敏感，因此我们选择让key全部是大写的，方便统一操作。
     children: BTreeMap<String, Arc<LockedFATInode>>,
     /// 当前inode的元数据
     metadata: Metadata,
@@ -102,6 +103,55 @@ pub struct FATInode {
 
     /// 根据不同的Inode类型，创建不同的私有字段
     inode_type: FATDirEntry,
+}
+
+impl FATInode {
+    /// @brief 更新当前inode的元数据
+    pub fn update_metadata(&mut self) {
+        // todo!()
+    }
+}
+
+impl LockedFATInode {
+    pub fn new(
+        fs: Arc<FATFileSystem>,
+        parent: Weak<LockedFATInode>,
+        inode_type: FATDirEntry,
+    ) -> Arc<LockedFATInode> {
+        let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
+            parent: parent,
+            self_ref: Weak::default(),
+            children: BTreeMap::new(),
+            fs: Arc::downgrade(&fs),
+            inode_type: inode_type,
+            metadata: Metadata {
+                dev_id: 0,
+                inode_id: generate_inode_id(),
+                size: 0,
+                blk_size: fs.bpb.bytes_per_sector as usize,
+                blocks: if let FATType::FAT32(_) = fs.bpb.fat_type {
+                    fs.bpb.total_sectors_32 as usize
+                } else {
+                    fs.bpb.total_sectors_16 as usize
+                },
+                atime: TimeSpec::default(),
+                mtime: TimeSpec::default(),
+                ctime: TimeSpec::default(),
+                file_type: FileType::Dir,
+                mode: 0o777,
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                raw_dev: 0,
+            },
+        })));
+
+        inode.0.lock().self_ref = Arc::downgrade(&inode);
+
+        inode.0.lock().update_metadata();
+
+        return inode;
+    }
 }
 
 /// FsInfo结构体（内存中的一份拷贝，当卸载卷或者sync的时候，把它写入磁盘）
@@ -829,7 +879,7 @@ impl FATFileSystem {
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
 
                 cursor.write_u16(raw_val)?;
-                self.partition.disk().write_at(lba, 1, cursor.as_slice());
+                self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
 
                 return Ok(());
             }
@@ -1019,7 +1069,19 @@ impl IndexNode for LockedFATInode {
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
-        todo!()
+        let guard:SpinLockGuard<FATInode> = self.0.lock();
+        match &guard.inode_type {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f)=> {
+                todo!()
+            },
+            FATDirEntry::Dir(_) => {
+                return Err(-(EISDIR as i32));
+            },
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(-(EROFS as i32));
+            }
+        }
     }
 
     fn write_at(
@@ -1079,6 +1141,45 @@ impl IndexNode for LockedFATInode {
                 return Err(-(EROFS as i32));
             }
         }
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        match &guard.inode_type {
+            FATDirEntry::Dir(d) => {
+                // 尝试在缓存区查找
+                if let Some(entry) = guard.children.get(&name.to_uppercase()) {
+                    return Ok(entry.clone());
+                }
+                // 在缓存区找不到
+                // 在磁盘查找
+                let fat_entry: FATDirEntry =
+                    d.find_entry(name, None, None, guard.fs.upgrade().unwrap())?;
+                kdebug!("find entry from disk ok, entry={fat_entry:?}");
+                // 创建新的inode
+                let entry_inode:Arc<LockedFATInode> = LockedFATInode::new(guard.fs.upgrade().unwrap(), guard.self_ref.clone(), fat_entry);
+                // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
+                guard.children.insert(name.to_uppercase(), entry_inode.clone());
+                return Ok(entry_inode);
+            }
+            FATDirEntry::UnInit => {
+                panic!(
+                    "Uninitialized FAT Inode, fs info = {:?}, inode={guard:?}",
+                    self.fs().info()
+                )
+            }
+            _ => {
+                return Err(-(ENOTDIR as i32));
+            }
+        }
+    }
+
+    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        return Ok(());
+    }
+
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        return Ok(());
     }
 }
 

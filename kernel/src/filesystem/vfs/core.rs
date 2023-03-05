@@ -1,6 +1,6 @@
 use core::{
     any::Any,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering}, hint::spin_loop,
 };
 
 use alloc::{sync::Arc, vec::Vec, string::{String, ToString}, format};
@@ -37,11 +37,11 @@ lazy_static! {
         let ramfs = RamFS::new();
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.root_inode();
-        let partiton:Arc<crate::io::disk_info::Partition>= ahci::get_disks_by_name("ahci_disk_0".to_string()).unwrap().0.lock().partitions[0].clone();
-        let fatfs:Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
-        if fatfs.is_err(){
-            kerror!("Failed to initialize fatfs, code={:?}", fatfs.err());
+        test_fatfs();
+        loop {
+            spin_loop();
         }
+        
         // // 创建文件夹
         // root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         // root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
@@ -64,6 +64,42 @@ pub fn print_type_of<T>(_: &T) {
 /// 建议在这个函数里面，调用其他的调试函数。（避免merge的时候出现大量冲突）
 pub fn __test_filesystem() {
     __test_rootfs();
+}
+
+fn test_fatfs(){
+    let partiton: Arc<crate::io::disk_info::Partition>= ahci::get_disks_by_name("ahci_disk_0".to_string()).unwrap().0.lock().partitions[0].clone();
+        let fatfs: Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
+        if fatfs.is_err(){
+            kerror!("Failed to initialize fatfs, code={:?}", fatfs.as_ref().err());
+        }
+        let fatfs = fatfs.unwrap();
+        let fat_root = fatfs.root_inode();
+        kdebug!("get fat root inode ok");
+        let root_items :Result<Vec<String>, i32>= fat_root.list();
+        kdebug!("list root inode = {:?}", root_items);
+        if root_items.is_ok(){
+            let root_items :Vec<String>=  root_items.unwrap();
+            kdebug!("root items = {:?}", root_items);
+        }else{
+            kerror!("list root_items failed, code = {}", root_items.unwrap_err());
+        }
+        kdebug!("to find boot");
+        let boot_inode = fat_root.find("boot").unwrap();
+        kdebug!("to list boot");
+        kdebug!("boot items = {:?}", boot_inode.list().unwrap());
+        kdebug!("to find grub");
+        let grub_inode = boot_inode.find("grub").unwrap();
+        kdebug!("to list grub");
+        kdebug!("grub_items={:?}", grub_inode.list().unwrap());
+        let grub_cfg_inode = grub_inode.find("grub.cfg").unwrap();
+
+        kdebug!("grub_cfg_inode = {:?}", grub_cfg_inode);
+        let mut buf :Vec<u8>= Vec::new();
+        buf.resize(16, 0);
+        let mut file = File::new(grub_cfg_inode, O_RDWR).unwrap();
+        // let r = file.read(16, &mut buf);
+        // kdebug!("r = {r:?}");
+
 }
 
 fn __test_rootfs() {

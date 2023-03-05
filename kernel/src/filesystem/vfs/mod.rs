@@ -13,7 +13,7 @@ use crate::{
     time::TimeSpec, kdebug,
 };
 
-use self::{mount::MountFS, file::FilePrivateData};
+use self::{mount::MountFS, file::FilePrivateData, core::ROOT_INODE};
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: u32 = 1024;
@@ -299,7 +299,7 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (self.fs().root_inode(), String::from(rest))
+            (ROOT_INODE.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))

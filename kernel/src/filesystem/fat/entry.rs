@@ -13,7 +13,7 @@ use crate::{
         EROFS,
     },
     io::{device::LBA_SIZE, SeekFrom},
-    libs::vec_cursor::VecCursor,
+    libs::vec_cursor::VecCursor, kdebug,
 };
 
 use super::{
@@ -59,6 +59,21 @@ pub struct FATFile {
     pub short_dir_entry: ShortDirEntry,
     /// 文件的起始、终止簇。格式：(簇，簇内偏移量)
     pub loc: ((Cluster, u64), (Cluster, u64)),
+}
+
+impl FATFile{
+
+    /// @brief 获取文件大小
+    #[inline]
+    pub fn size(&self) ->u64{
+        return self.short_dir_entry.file_size as u64;
+    }
+
+    /// @brief 设置当前文件大小（仅仅更改short_dir_entry内的值）
+    #[inline]
+    pub fn set_size(&mut self, size:u32){
+        self.short_dir_entry.file_size = size;
+    }
 }
 
 /// FAT文件系统中的文件夹
@@ -1090,7 +1105,10 @@ impl FATDirIter {
     ///             Option<FATDirEntry>: 读取到的目录项（如果没有读取到，就返回失败）
     /// @return Err(错误码) 可能出现了内部错误，或者是磁盘错误等。具体原因看错误码。
     fn get_dir_entry(&mut self) -> Result<(Cluster, u64, Option<FATDirEntry>), i32> {
+        kdebug!("FATDirIter::get_dir_entry");
+
         loop {
+            kdebug!("123");
             // 如果当前簇已经被读完，那么尝试获取下一个簇
             if self.offset >= self.fs.bytes_per_cluster() && !self.is_root {
                 match self.fs.get_fat_entry(self.current_cluster)? {
@@ -1106,23 +1124,27 @@ impl FATDirIter {
                     }
                 }
             }
-
+            kdebug!("123");
+            
             // 如果当前是FAT12/FAT16文件系统，并且当前inode是根目录项。
             // 如果offset大于根目录项的最大大小（已经遍历完根目录），那么就返回None
             if self.is_root && self.offset > self.fs.root_dir_end_bytes_offset().unwrap() {
                 return Ok((self.current_cluster, self.offset, None));
             }
-
+            
             // 获取簇在磁盘内的字节偏移量
             let offset: u64 = self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
+            kdebug!("to get fat raw entry, offset={}", offset);
             // 从磁盘读取原始的dentry
             let raw_dentry: FATRawDirEntry = get_raw_dir_entry(&self.fs, offset)?;
+            kdebug!("raw_dentry={:?}", raw_dentry);
 
             // 由于迭代顺序从前往后，因此：
             // 如果找到1个短目录项，那么证明有一个完整的entry被找到，因此返回。
             // 如果找到1个长目录项，那么，就依次往下迭代查找，直到找到一个短目录项，然后返回结果。这里找到的所有的目录项，都属于同一个文件/文件夹。
             match raw_dentry {
                 FATRawDirEntry::Short(s) => {
+                    kdebug!("short");
                     // 当前找到一个短目录项，更新offset之后，直接返回
                     self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                     return Ok((
@@ -1135,6 +1157,7 @@ impl FATDirIter {
                     ));
                 }
                 FATRawDirEntry::Long(l) => {
+                    kdebug!("Is long entry, l={:?}", l);
                     // 当前找到一个长目录项
 
                     // 声明一个数组，来容纳所有的entry。（先把最后一个entry放进去）
@@ -1176,7 +1199,7 @@ impl FATDirIter {
                             self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
                         // 从磁盘读取原始的dentry
                         let raw_dentry: FATRawDirEntry = get_raw_dir_entry(&self.fs, offset)?;
-
+                        kdebug!("in for: raw_dentry={raw_dentry:?}");
                         match raw_dentry {
                             FATRawDirEntry::Short(_) => {
                                 // 当前遇到1个短目录项，证明当前文件/文件夹的所有dentry都被读取完了，因此在将其加入数组后，退出迭代。
@@ -1195,6 +1218,7 @@ impl FATDirIter {
                             }
                         }
                     }
+                    kdebug!("collect dentries done. long_name_entries={long_name_entries:?}");
                     let dir_entry: Result<FATDirEntry, i32> = FATDirEntry::new(
                         long_name_entries,
                         (
@@ -1202,23 +1226,29 @@ impl FATDirIter {
                             (self.current_cluster, self.offset),
                         ),
                     );
-
+                    kdebug!("dir_entry={:?}", dir_entry);
                     match dir_entry {
                         Ok(d) => {
+                            kdebug!("dir_entry ok");
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                             return Ok((self.current_cluster, self.offset, Some(d)));
                         }
-
-                        Err(_) => {
+                        
+                        Err(e) => {
+                            kdebug!("dir_entry err,  e={}", e);
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                         }
                     }
                 }
                 FATRawDirEntry::Free => {
+
+                    kdebug!("FATRawDirEntry::Free");
                     // 当前目录项是空的
                     self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                 }
                 FATRawDirEntry::FreeRest => {
+
+                    kdebug!("FATRawDirEntry::FreeRest");
                     // 当前目录项是空的，且之后都是空的，因此直接返回
                     return Ok((self.current_cluster, self.offset, None));
                 }
@@ -1257,29 +1287,32 @@ impl FATDirEntry {
         mut long_name_entries: Vec<FATRawDirEntry>,
         loc: ((Cluster, u64), (Cluster, u64)),
     ) -> Result<Self, i32> {
+        kdebug!("new1");
         if long_name_entries.is_empty() {
             return Err(-(EINVAL as i32));
         }
-
+        
         if !long_name_entries[0].is_last() || !long_name_entries.last().unwrap().is_short() {
             // 存在孤立的目录项，文件系统出现异常，因此返回错误，表明其只读。
             // TODO: 标记整个FAT文件系统为只读的
             return Err(-(EROFS as i32));
         }
-
+        
         // 取出短目录项（位于vec的末尾）
         let short_dentry: ShortDirEntry = match long_name_entries.pop().unwrap() {
             FATRawDirEntry::Short(s) => s,
             _ => unreachable!(),
         };
-
+        
+        kdebug!("new2");
         let mut extractor = LongNameExtractor::new();
         for entry in &long_name_entries {
             match entry {
                 &FATRawDirEntry::Long(l) => {
+                    kdebug!("process long={l:?}");
                     extractor.process(l)?;
                 }
-
+                
                 _ => {
                     return Err(-(EROFS as i32));
                 }
@@ -1287,6 +1320,7 @@ impl FATDirEntry {
         }
         // 检验校验和是否正确
         if extractor.validate_checksum(&short_dentry) {
+            kdebug!("new3, short_dentry = {short_dentry:?}");
             // 校验和正确，返回一个长目录项
             return Ok(short_dentry.to_dir_entry_with_long_name(extractor.to_string(), loc));
         } else {
@@ -1806,7 +1840,7 @@ impl LongNameExtractor {
             self.index = index;
             self.checksum = longname_dentry.checksum;
             self.name
-                .resize(index as usize * (FATRawDirEntry::DIR_ENTRY_LEN as usize), 0);
+                .resize(index as usize * LongDirEntry::LONG_NAME_STR_LEN, 0);
         } else if self.index == 0
             || index != self.index - 1
             || self.checksum != longname_dentry.checksum
@@ -1820,15 +1854,16 @@ impl LongNameExtractor {
             self.index -= 1;
         }
 
-        let pos: usize = ((index - 1) as usize) * (FATRawDirEntry::DIR_ENTRY_LEN as usize);
+        let pos: usize = ((index - 1) as usize) * LongDirEntry::LONG_NAME_STR_LEN;
         // 将当前目录项的值，拷贝到生成器的数组中
         longname_dentry.copy_name_to_slice(
-            &mut self.name[pos..pos + (FATRawDirEntry::DIR_ENTRY_LEN as usize)],
+            &mut self.name[pos..pos + LongDirEntry::LONG_NAME_STR_LEN],
         )?;
         return Ok(());
     }
 
     /// @brief 返回名称的长度
+    #[inline]
     fn len(&self) -> usize {
         return self.name.len();
     }
@@ -2028,10 +2063,16 @@ pub fn get_raw_dir_entry(
     let lba = fs.get_lba_from_offset(
         fs.bytes_to_sector(fs.get_in_partition_bytes_offset(in_disk_bytes_offset)),
     );
+    kdebug!("self.partition.lba_start={}", fs.partition.lba_start);
+    // let step1 = fs.get_in_partition_bytes_offset(in_disk_bytes_offset);
+    // let step2 = fs.bytes_to_sector(step1);
+    // let lba = fs.get_lba_from_offset(step2);
+    // kdebug!("step1={step1}, step2={step2}, lba={lba}");
     let mut v: Vec<u8> = Vec::new();
-    v.resize(1, 0);
+    v.resize(1*LBA_SIZE, 0);
+    kdebug!("1234, lba={lba}");
     fs.partition.disk().read_at(lba, 1, &mut v)?;
-
+    kdebug!("1234");
     let mut cursor: VecCursor = VecCursor::new(v);
     // 切换游标到对应位置
     cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -2082,7 +2123,6 @@ pub fn get_raw_dir_entry(
                 short_dentry.fst_clus_hi = cursor.read_u16()?;
                 short_dentry.wrt_time = cursor.read_u16()?;
                 short_dentry.wrt_date = cursor.read_u16()?;
-                short_dentry.lst_acc_date = cursor.read_u16()?;
                 short_dentry.fst_clus_lo = cursor.read_u16()?;
                 short_dentry.file_size = cursor.read_u32()?;
 

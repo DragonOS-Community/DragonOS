@@ -146,7 +146,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @param name 目录项的名字
     /// @param file_type 文件类型
     /// @param mode 权限
-    /// @param data 用于初始化该inode的数据。（为0则表示忽略此字段）
+    /// @param data 用于初始化该inode的数据。（为0则表示忽略此字段）对于不同的文件系统来说，代表的含义可能不同。
     ///
     /// @return 创建成功：返回Ok(新的inode的Arc指针)
     /// @return 创建失败：返回Err(错误码)
@@ -187,6 +187,13 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
     ///
     /// @param old_name 旧的名字
+    ///
+    /// @param target 移动到指定的inode
+    ///
+    /// @param new_name 新的文件名
+    ///
+    /// @return 成功: Ok()
+    ///         失败: Err(错误码)
     fn move_(
         &self,
         _old_name: &str,
@@ -219,11 +226,11 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(-(ENOTSUP as i32));
     }
 
-    /// @brief 根据inode号，获取目录项的名字
+    /// @brief 根据inode号，获取子目录项的名字和元数据
     ///
     /// @param ino inode号
     ///
-    /// @return 成功：Ok()
+    /// @return 成功：Ok(String, Metadata)
     ///         失败：Err(错误码)
     fn get_entry_name_and_metadata(&self, ino: InodeId) -> Result<(String, Metadata), i32> {
         // 如果有条件，请在文件系统中使用高效的方式实现本接口，而不是依赖这个低效率的默认实现。
@@ -267,7 +274,6 @@ impl dyn IndexNode {
     pub fn downcast_ref<T: IndexNode>(&self) -> Option<&T> {
         return self.as_any_ref().downcast_ref::<T>();
     }
-
 
     /// @brief 查找文件（不考虑符号链接）
     ///
@@ -365,6 +371,7 @@ impl dyn IndexNode {
 pub struct Metadata {
     /// 当前inode所在的文件系统的设备号
     pub dev_id: usize,
+
     /// inode号
     pub inode_id: InodeId,
 
@@ -426,4 +433,9 @@ pub struct FsInfo {
     pub blk_dev_id: usize,
     /// 文件名的最大长度
     pub max_name_len: usize,
+}
+
+/// @brief 整合主设备号+次设备号
+pub fn make_rawdev(major: usize, minor: usize) -> usize {
+    ((major & 0xffffff) << 8) | (minor & 0xff)
 }

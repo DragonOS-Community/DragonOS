@@ -128,6 +128,8 @@ pub fn ahci_rust_init() -> Result<(), i32> {
         }
     }
 
+    /// 挂载到devfs上面去
+
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     return Ok(());
 }

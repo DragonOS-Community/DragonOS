@@ -9,4 +9,5 @@
 
    locks
    lockref
+   mutex
    rwlock

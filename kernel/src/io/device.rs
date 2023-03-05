@@ -1,7 +1,9 @@
 /// 引入Module
 use crate::include::bindings::bindings::E2BIG;
-use alloc::vec::Vec;
+use alloc::{vec::Vec, sync::Arc};
 use core::{any::Any, fmt::Debug};
+
+use super::disk_info::Partition;
 
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -16,6 +18,8 @@ pub type BlockId = usize;
 
 /// 定义常量
 const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1 << 12.
+/// 在DragonOS中，我们认为磁盘的每个LBA大小均为512字节。（注意，文件系统的1个扇区可能事实上是多个LBA）
+pub const LBA_SIZE:usize = 512;
 
 /// @brief 设备应该实现的操作
 /// @usage Device::read_at()
@@ -76,6 +80,18 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+
+    /// @brief 本函数用于将BlockDevice转换为Device。
+    /// 由于实现了BlockDevice的结构体，本身也实现了Device Trait, 因此转换是可能的。
+    /// 思路：在BlockDevice的结构体中新增一个self_ref变量，返回self_ref.upgrade()即可。
+    fn device(&self) -> Arc<dyn Device>;
+
+    /// @brief 返回块设备的块大小（单位：字节）
+    fn block_size(&self) -> usize;
+
+    /// @brief 返回当前磁盘上的所有分区的Arc指针数组
+    fn partitions(&self) -> Vec<Arc<Partition>>;
+
 }
 
 /// 对于所有<块设备>自动实现 Device Trait 的 read_at 和 write_at 函数

@@ -326,7 +326,6 @@ impl IndexNode for LockedDevFSInode {
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
-<<<<<<< Updated upstream
     fn read_at(
         &self,
         offset: usize,
@@ -334,14 +333,12 @@ impl IndexNode for LockedDevFSInode {
         buf: &mut [u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, i32> {
-=======
-    fn read_at(&self, _offset: usize, _len: usize, _buf: &mut [u8]) -> Result<usize, i32> {
->>>>>>> Stashed changes
+
         Err(-(ENOTSUP as i32))
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
-<<<<<<< Updated upstream
+
     fn write_at(
         &self,
         offset: usize,
@@ -349,9 +346,6 @@ impl IndexNode for LockedDevFSInode {
         buf: &mut [u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, i32> {
-=======
-    fn write_at(&self, _offset: usize, _len: usize, _buf: &mut [u8]) -> Result<usize, i32> {
->>>>>>> Stashed changes
         Err(-(ENOTSUP as i32))
     }
 }

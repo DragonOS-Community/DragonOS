@@ -16,7 +16,9 @@ use crate::{
     time::TimeSpec,
 };
 
-use super::vfs::{FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus};
+use super::vfs::{
+    file::FilePrivateData, FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
+};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
@@ -50,7 +52,7 @@ pub struct RamFSInode {
 }
 
 impl FileSystem for RamFS {
-    fn get_root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
+    fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
         return self.root_inode.clone();
     }
 
@@ -110,7 +112,13 @@ impl RamFS {
 }
 
 impl IndexNode for LockedRamFSInode {
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
         if buf.len() < len {
             return Err(-(EINVAL as i32));
         }
@@ -136,7 +144,13 @@ impl IndexNode for LockedRamFSInode {
         return Ok(src.len());
     }
 
-    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
         if buf.len() < len {
             return Err(-(EINVAL as i32));
         }

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use core::mem::size_of;
+
 use alloc::vec::Vec;
 
 use crate::{
@@ -108,6 +110,21 @@ impl VecCursor {
         return Ok(());
     }
 
+    /// @brief 小端对齐，读取数据到u16数组.
+    ///
+    /// @param buf 目标u16数组
+    pub fn read_u16_into(&mut self, buf: &mut [u16]) -> Result<(), i32> {
+        if self.pos + buf.len() * size_of::<u16>() > self.data.len() * size_of::<u16>() {
+            return Err(-(E2BIG as i32));
+        }
+
+        for i in 0..buf.len() {
+            buf[i] = self.read_u16()?;
+        }
+
+        return Ok(());
+    }
+
     /// @brief 调整游标的位置
     ///
     /// @param 调整的相对值
@@ -199,7 +216,7 @@ impl VecCursor {
     ///
     /// @return Ok(()) 成功写入
     /// @retunr Err(-E2BIG) 没有这么多数据，写入失败
-    pub fn write_exact(&mut self, buf: &mut [u8]) -> Result<(), i32> {
+    pub fn write_exact(&mut self, buf: &[u8]) -> Result<(), i32> {
         if self.pos + buf.len() > self.data.len() {
             return Err(-(E2BIG as i32));
         }
@@ -215,7 +232,7 @@ impl VecCursor {
         return &self.data[..];
     }
 
-    /// @brief 获取当前的数据切片
+    /// @brief 获取可变数据切片
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         return &mut self.data[..];
     }

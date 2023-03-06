@@ -35,7 +35,7 @@ void handler(int sig)
 int main()
 {
     printf("Test signal running...\n");
-    // signal(SIGKILL, &handler);
+    signal(SIGKILL, &handler);
     printf("registered.\n");
 
     clock_t last = clock();

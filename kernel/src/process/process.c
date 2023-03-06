@@ -40,6 +40,7 @@ long process_global_pid = 1;              // 系统中最大的pid
 
 extern void system_call(void);
 extern void kernel_thread_func(void);
+extern void rs_procfs_unregister_pid(uint64_t);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 extern struct mm_struct initial_mm;
@@ -861,6 +862,7 @@ int process_release_pcb(struct process_control_block *pcb)
     process_exit_signal(pcb);
     // 释放当前pcb
     kfree(pcb);
+    rs_procfs_unregister_pid(pcb->pid);
     return 0;
 }
 

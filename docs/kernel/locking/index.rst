@@ -11,4 +11,5 @@
    spinlock
    lockref
    mutex
+   rwlock
 

@@ -1,20 +1,26 @@
 use core::{
     any::Any,
-    sync::atomic::{AtomicUsize, Ordering}, hint::spin_loop,
+    hint::spin_loop,
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 
-use alloc::{sync::Arc, vec::Vec, string::{String, ToString}, format};
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 use crate::{
+    driver::disk::ahci::{self, ahci_rust_init},
     filesystem::{
+        fat::fs::FATFileSystem,
         procfs::{LockedProcFSInode, ProcFS},
         ramfs::RamFS,
-        vfs::{
-            mount::MountFS,
-            FileSystem, FileType, file::File,
-        }, fat::fs::FATFileSystem,
+        vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
-    kdebug, println, include::bindings::bindings::{O_RDWR, O_RDONLY}, driver::disk::ahci::{self, ahci_rust_init}, kerror,
+    include::bindings::bindings::{O_RDONLY, O_RDWR},
+    kdebug, kerror, print, println,
 };
 
 use super::{IndexNode, InodeId};
@@ -38,10 +44,11 @@ lazy_static! {
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.root_inode();
         test_fatfs();
+        kdebug!("test done2");
         loop {
             spin_loop();
         }
-        
+
         // // 创建文件夹
         // root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         // root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
@@ -66,40 +73,66 @@ pub fn __test_filesystem() {
     __test_rootfs();
 }
 
-fn test_fatfs(){
-    let partiton: Arc<crate::io::disk_info::Partition>= ahci::get_disks_by_name("ahci_disk_0".to_string()).unwrap().0.lock().partitions[0].clone();
-        let fatfs: Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
-        if fatfs.is_err(){
-            kerror!("Failed to initialize fatfs, code={:?}", fatfs.as_ref().err());
-        }
-        let fatfs = fatfs.unwrap();
-        let fat_root = fatfs.root_inode();
-        kdebug!("get fat root inode ok");
-        let root_items :Result<Vec<String>, i32>= fat_root.list();
-        kdebug!("list root inode = {:?}", root_items);
-        if root_items.is_ok(){
-            let root_items :Vec<String>=  root_items.unwrap();
-            kdebug!("root items = {:?}", root_items);
-        }else{
-            kerror!("list root_items failed, code = {}", root_items.unwrap_err());
-        }
-        kdebug!("to find boot");
-        let boot_inode = fat_root.find("boot").unwrap();
-        kdebug!("to list boot");
-        kdebug!("boot items = {:?}", boot_inode.list().unwrap());
-        kdebug!("to find grub");
-        let grub_inode = boot_inode.find("grub").unwrap();
-        kdebug!("to list grub");
-        kdebug!("grub_items={:?}", grub_inode.list().unwrap());
-        let grub_cfg_inode = grub_inode.find("grub.cfg").unwrap();
+fn test_fatfs() {
+    let partiton: Arc<crate::io::disk_info::Partition> =
+        ahci::get_disks_by_name("ahci_disk_0".to_string())
+            .unwrap()
+            .0
+            .lock()
+            .partitions[0]
+            .clone();
+    let fatfs: Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
+    if fatfs.is_err() {
+        kerror!(
+            "Failed to initialize fatfs, code={:?}",
+            fatfs.as_ref().err()
+        );
+    }
+    let fatfs = fatfs.unwrap();
+    let fat_root = fatfs.root_inode();
+    kdebug!("get fat root inode ok");
+    let root_items: Result<Vec<String>, i32> = fat_root.list();
+    kdebug!("list root inode = {:?}", root_items);
+    if root_items.is_ok() {
+        let root_items: Vec<String> = root_items.unwrap();
+        kdebug!("root items = {:?}", root_items);
+    } else {
+        kerror!("list root_items failed, code = {}", root_items.unwrap_err());
+    }
+    kdebug!("to find boot");
+    let boot_inode = fat_root.find("boot").unwrap();
+    kdebug!("to list boot");
+    kdebug!("boot items = {:?}", boot_inode.list().unwrap());
+    kdebug!("to find grub");
+    let grub_inode = boot_inode.find("grub").unwrap();
+    kdebug!("to list grub");
+    kdebug!("grub_items={:?}", grub_inode.list().unwrap());
+    let grub_cfg_inode = grub_inode.find("grub.cfg").unwrap();
 
-        kdebug!("grub_cfg_inode = {:?}", grub_cfg_inode);
-        let mut buf :Vec<u8>= Vec::new();
-        buf.resize(16, 0);
-        let mut file = File::new(grub_cfg_inode, O_RDWR).unwrap();
-        // let r = file.read(16, &mut buf);
-        // kdebug!("r = {r:?}");
-
+    kdebug!("grub_cfg_inode = {:?}", grub_cfg_inode);
+    let mut buf: Vec<u8> = Vec::new();
+    buf.resize(128, 0);
+    let mut file = File::new(grub_cfg_inode, O_RDWR).unwrap();
+    kdebug!("file={file:?}, metadata = {:?}", file.metadata());
+    let r = file.read(128, &mut buf);
+    kdebug!("r = {r:?}, buf={buf:?}");
+    for x in buf.iter() {
+        print!("{}", *x as char);
+    }
+    buf[126] = "X".as_bytes()[0];
+    buf[127] = "X".as_bytes()[0];
+    kdebug!("to_write");
+    let r = file.write(128, &buf);
+    kdebug!("write ok, r = {r:?}");
+    let r = file.read(128, &mut buf);
+    kdebug!("r = {r:?}, buf={buf:?}");
+    for x in buf.iter() {
+        print!("{}", *x as char);
+    }
+    kdebug!("read ok");
+    kdebug!("file={file:?}, metadata = {:?}", file.metadata());
+    kdebug!("test_done");
+    compiler_fence(Ordering::SeqCst);
 }
 
 fn __test_rootfs() {
@@ -134,20 +167,19 @@ fn __test_procfs(pid: i64) {
     );
     // let proc_inode = ROOT_INODE.lookup("/proc/1/status").expect("Cannot find /proc/1/status");
     let _t = procfs_inode.find(&format!("{}", pid)).unwrap();
-    let proc_inode = _t.find("status").expect(&format!("Cannot find /proc/{}/status", pid));
+    let proc_inode = _t
+        .find("status")
+        .expect(&format!("Cannot find /proc/{}/status", pid));
     let mut f = File::new(proc_inode, O_RDONLY).unwrap();
     kdebug!("file created!");
-    kdebug!(
-        "proc.list()={:?}",
-        _p.list().expect("list /proc failed.")
-    );
-    let mut buf : Vec<u8> = Vec::new();
+    kdebug!("proc.list()={:?}", _p.list().expect("list /proc failed."));
+    let mut buf: Vec<u8> = Vec::new();
     buf.resize(f.metadata().unwrap().size as usize, 0);
 
-    let size = f.read(
-        f.metadata().unwrap().size as usize, buf.as_mut()).unwrap();
+    let size = f
+        .read(f.metadata().unwrap().size as usize, buf.as_mut())
+        .unwrap();
     kdebug!("size = {}, data={:?}", size, buf);
     let buf = String::from_utf8(buf).unwrap();
     kdebug!("data for /proc/{}/status: {}", pid, buf);
-
 }

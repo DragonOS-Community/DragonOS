@@ -498,10 +498,10 @@ ul initial_kernel_thread(ul arg)
 
     scm_enable_double_buffer();
 
-    block_io_scheduler_init();
-    ahci_init();
-    fat32_init();
-    rootfs_umount();
+    // block_io_scheduler_init();
+    // ahci_init();
+    // fat32_init();
+    // rootfs_umount();
 
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉

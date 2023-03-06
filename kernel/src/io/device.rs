@@ -1,6 +1,6 @@
 /// 引入Module
 use crate::include::bindings::bindings::E2BIG;
-use alloc::{vec::Vec, sync::Arc};
+use alloc::{sync::Arc, vec::Vec};
 use core::{any::Any, fmt::Debug};
 
 use super::disk_info::Partition;
@@ -19,7 +19,7 @@ pub type BlockId = usize;
 /// 定义常量
 const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1 << 12.
 /// 在DragonOS中，我们认为磁盘的每个LBA大小均为512字节。（注意，文件系统的1个扇区可能事实上是多个LBA）
-pub const LBA_SIZE:usize = 512;
+pub const LBA_SIZE: usize = 512;
 
 /// @brief 设备应该实现的操作
 /// @usage Device::read_at()
@@ -73,7 +73,7 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
 
     /// @breif: 每个块设备都必须固定自己块大小，而且该块大小必须是2的幂次
     /// @return: 返回一个固定量，硬编码(编程的时候固定的常量).
-    fn blk_size_log2(&self) -> u8; 
+    fn blk_size_log2(&self) -> u8;
 
     // TODO: 待实现 open, close
 
@@ -91,7 +91,6 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
 
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
-
 }
 
 /// 对于所有<块设备>自动实现 Device Trait 的 read_at 和 write_at 函数

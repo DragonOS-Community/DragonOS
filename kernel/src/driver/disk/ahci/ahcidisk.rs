@@ -28,7 +28,7 @@ use core::{mem::size_of, ptr::write_bytes};
 /// @brief: 只支持MBR分区格式的磁盘结构体
 pub struct AhciDisk {
     pub name: String,
-    pub flags: u16,                  // 磁盘的状态flags
+    pub flags: u16,                      // 磁盘的状态flags
     pub partitions: Vec<Arc<Partition>>, // 磁盘分区数组
     // port: &'static mut HbaPort,      // 控制硬盘的端口
     pub ctrl_num: u8,
@@ -305,7 +305,8 @@ impl AhciDisk {
     }
 
     fn sync(&self) -> Result<(), i32> {
-        return Err(-(ENOTSUP as i32));
+        // 由于目前没有block cache, 因此sync返回成功即可
+        return Ok(());
     }
 }
 
@@ -404,7 +405,13 @@ impl BlockDevice for LockedAhciDisk {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, i32> {
-        kdebug!("ahci read at {lba_id_start}, count={count}, lock={:?}", self.0);
+        if lba_id_start > 360287970 {
+            panic!("lba_id_start={lba_id_start}");
+        }
+        kdebug!(
+            "ahci read at {lba_id_start}, count={count}, lock={:?}",
+            self.0
+        );
         return self.0.lock().read_at(lba_id_start, count, buf);
     }
 

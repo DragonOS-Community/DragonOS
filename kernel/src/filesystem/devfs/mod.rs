@@ -3,10 +3,13 @@ pub mod null_dev;
 pub mod zero_dev;
 
 use super::vfs::{
-    core::generate_inode_id, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
+    core::{generate_inode_id, ROOT_INODE},
+    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
 };
 use crate::{
+    driver::keyboard,
     include::bindings::bindings::{EEXIST, EISDIR, ENOENT, ENOTDIR, ENOTSUP},
+    kdebug, kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
@@ -17,7 +20,7 @@ use alloc::{
     vec::Vec,
 };
 
-const DevFS_MAX_NAMELEN: usize = 64;
+const DEVFS_MAX_NAMELEN: usize = 64;
 
 /// @brief dev文件系统
 #[derive(Debug)]
@@ -38,13 +41,13 @@ impl FileSystem for DevFS {
     fn info(&self) -> super::vfs::FsInfo {
         return FsInfo {
             blk_dev_id: 0,
-            max_name_len: DevFS_MAX_NAMELEN,
+            max_name_len: DEVFS_MAX_NAMELEN,
         };
     }
 }
 
 impl DevFS {
-    fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         // 初始化root inode
         let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
             // /dev 的权限设置为 读+执行，root 可以读写
@@ -101,7 +104,7 @@ impl DevFSInode {
             self_ref: Weak::default(),
             children: BTreeMap::new(),
             metadata: Metadata {
-                dev_id: 0,
+                dev_id: 1,
                 inode_id: generate_inode_id(),
                 size: 0,
                 blk_size: 0,
@@ -109,7 +112,7 @@ impl DevFSInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: dev_type_, // 文件夹，block设备，char设备
+                file_type: dev_type_, // 文件夹
                 mode: mode_,
                 nlinks: 1,
                 uid: 0,
@@ -123,20 +126,18 @@ impl DevFSInode {
 
 impl LockedDevFSInode {
     pub fn add_dir(&self, name: String) -> Result<(), i32> {
-        let mut this = self.0.lock();
+        let this = self.0.lock();
 
         if this.children.contains_key(&name) {
             return Err(-(EEXIST as i32));
         }
 
-        let inode = match self.create(name.clone().as_str(), FileType::Dir, 0x755 as u32) {
+        match self.create(name.clone().as_str(), FileType::Dir, 0x755 as u32) {
             Ok(inode) => inode,
             Err(err) => {
                 return Err(err);
             }
         };
-
-        this.children.insert(name, inode);
 
         return Ok(());
     }
@@ -230,7 +231,6 @@ impl IndexNode for LockedDevFSInode {
             "" | "." => {
                 return Ok(inode.self_ref.upgrade().ok_or(-(ENOENT as i32))?);
             }
-
             ".." => {
                 return Ok(inode.parent.upgrade().ok_or(-(ENOENT as i32))?);
             }
@@ -299,14 +299,14 @@ impl IndexNode for LockedDevFSInode {
         return Ok(self.0.lock().metadata.clone());
     }
 
-    fn set_metadata(&self, _metadata: &Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), i32> {
         let mut inode = self.0.lock();
-        inode.metadata.atime = _metadata.atime;
-        inode.metadata.mtime = _metadata.mtime;
-        inode.metadata.ctime = _metadata.ctime;
-        inode.metadata.mode = _metadata.mode;
-        inode.metadata.uid = _metadata.uid;
-        inode.metadata.gid = _metadata.gid;
+        inode.metadata.atime = metadata.atime;
+        inode.metadata.mtime = metadata.mtime;
+        inode.metadata.ctime = metadata.ctime;
+        inode.metadata.mode = metadata.mode;
+        inode.metadata.uid = metadata.uid;
+        inode.metadata.gid = metadata.gid;
 
         return Ok(());
     }
@@ -328,24 +328,147 @@ impl IndexNode for LockedDevFSInode {
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
     fn read_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, i32> {
-
         Err(-(ENOTSUP as i32))
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
-
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, i32> {
         Err(-(ENOTSUP as i32))
+    }
+}
+
+/// @brief 所有的设备INode都需要额外实现这个trait
+pub trait DeviceINode: IndexNode {
+    fn set_fs(&self, fs: Weak<DevFS>);
+}
+
+/// @brief devfs的设备注册函数
+pub fn devfs_register<T: DeviceINode>(name: String, device: Arc<T>) -> Result<(), i32> {
+    let devfs = ROOT_INODE.find("dev");
+    if let Err(e) = devfs {
+        kerror!("failed to register device name = {}, error = {}", name, e);
+        return Err(-(ENOENT as i32));
+    }
+    let devfs = devfs.unwrap();
+
+    match device.metadata().unwrap().file_type {
+        // 字节设备挂载在 /dev/char
+        FileType::CharDevice => {
+            if let Err(_) = devfs.find("char") {
+                devfs.create("char", FileType::Dir, 0x755)?;
+            }
+
+            let any_char_inode = devfs.find("char")?;
+            let dev_char_inode: &LockedDevFSInode = any_char_inode
+                .as_any_ref()
+                .downcast_ref::<LockedDevFSInode>()
+                .unwrap();
+
+            device.set_fs(dev_char_inode.0.lock().fs.clone());
+            dev_char_inode.add_dev(name, device)?;
+        }
+        FileType::BlockDevice => {
+            if let Err(_) = devfs.find("block") {
+                devfs.create("block", FileType::Dir, 0x755)?;
+            }
+
+            let any_block_inode = devfs.find("block")?;
+            let dev_block_inode: &LockedDevFSInode = any_block_inode
+                .as_any_ref()
+                .downcast_ref::<LockedDevFSInode>()
+                .unwrap();
+
+            device.set_fs(dev_block_inode.0.lock().fs.clone());
+            dev_block_inode.add_dev(name, device)?;
+        }
+        _ => {
+            return Err(-(ENOTSUP as i32));
+        }
+    }
+
+    return Ok(());
+}
+
+/// @brief devfs的设备卸载函数
+pub fn devfs_unregister<T: DeviceINode>(name: String, device: Arc<T>) -> Result<(), i32> {
+    let devfs = ROOT_INODE.find("dev").unwrap();
+
+    match device.metadata().unwrap().file_type {
+        // 字节设备挂载在 /dev/char
+        FileType::CharDevice => {
+            if let Err(_) = devfs.find("char") {
+                return Err(-(ENOENT as i32));
+            }
+
+            let any_char_inode = devfs.find("char")?;
+            let dev_char_inode = any_char_inode
+                .as_any_ref()
+                .downcast_ref::<LockedDevFSInode>()
+                .unwrap();
+
+            dev_char_inode.remove(name)?;
+        }
+        FileType::BlockDevice => {
+            if let Err(_) = devfs.find("block") {
+                return Err(-(ENOENT as i32));
+            }
+
+            let any_block_inode = devfs.find("block")?;
+            let dev_block_inode = any_block_inode
+                .as_any_ref()
+                .downcast_ref::<LockedDevFSInode>()
+                .unwrap();
+
+            dev_block_inode.remove(name)?;
+        }
+        _ => {
+            return Err(-(ENOTSUP as i32));
+        }
+    }
+
+    return Ok(());
+}
+
+/// @brief 注册系统内部自带的设备
+pub fn register_bultinin_device() {
+    use null_dev::LockedNullInode;
+    use zero_dev::LockedZeroInode;
+    devfs_register::<LockedNullInode>(String::from("null"), LockedNullInode::new()).unwrap();
+    devfs_register::<LockedZeroInode>(String::from("zero"), LockedZeroInode::new()).unwrap();
+}
+
+pub fn __test_dev() {
+    let dev = ROOT_INODE.find("dev").unwrap();
+    kdebug!("ls /dev = {:?}", dev.list().unwrap());
+    let block = dev.find("block").unwrap();
+    kdebug!("ls /dev/block = {:?}", block.list().unwrap());
+    let char = dev.find("char").unwrap();
+    kdebug!("ls /dev/char = {:?}", char.list().unwrap());
+
+    // __test_keyboard();
+}
+
+pub fn __test_keyboard() {
+    let mut buf = [0 as u8; 100 as usize];
+    let dev = ROOT_INODE
+        .find("dev")
+        .unwrap()
+        .find("char")
+        .unwrap()
+        .find("ps2_keyboard")
+        .unwrap();
+    while let Ok(c) = dev.read_at(0, 1, &mut buf, &mut FilePrivateData::Unused) {
+        kdebug!("print = {} | {}", c, buf[0]);
     }
 }

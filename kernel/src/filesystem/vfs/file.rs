@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc};
 
 use crate::{include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE}, io::SeekFrom, filesystem::procfs::ProcfsFilePrivateData, kdebug};
 

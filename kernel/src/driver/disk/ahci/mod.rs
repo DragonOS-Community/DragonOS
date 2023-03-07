@@ -1,10 +1,13 @@
 // 导出 ahci 相关的 module
+pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
 use crate::io::device::BlockDevice;
 // 依赖的rust工具包
+use crate::filesystem::devfs::devfs_register;
 use crate::io::disk_info::BLK_GF_AHCI;
+use crate::kerror;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::{
     driver::disk::ahci::{
@@ -14,6 +17,7 @@ use crate::{
     },
     kdebug,
 };
+use ahci_inode::LockedAhciInode;
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::{format, string::String, sync::Arc, vec::Vec};
@@ -122,13 +126,29 @@ pub fn ahci_rust_init() -> Result<(), i32> {
                             j as u8,
                         )?);
                         id += 1; // ID 从0开始
+
+                        kdebug!("start register ahci device");
+
+                        // 挂载到devfs上面去
+                        let ret = devfs_register(
+                            String::from(format!("ahci_{}", id)),
+                            LockedAhciInode::new(disks_list.last().unwrap().clone()),
+                        );
+
+                        if let Err(err) = ret {
+                            kerror!(
+                                "Ahci_{} ctrl = {}, port = {} failed to register, error code = {}",
+                                id,
+                                i,
+                                j,
+                                err
+                            );
+                        }
                     }
                 }
             }
         }
     }
-
-    /// 挂载到devfs上面去
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     return Ok(());

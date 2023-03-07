@@ -14,6 +14,7 @@ static struct kfifo_t kb_buf;
 
 // 缓冲区等待队列
 static wait_queue_node_t ps2_keyboard_wait_queue;
+extern void keyboard_register(struct vfs_file_operations_t *);
 
 // 缓冲区读写锁
 static spinlock_t ps2_kb_buf_rw_lock;
@@ -146,7 +147,7 @@ void ps2_keyboard_handler(ul irq_num, ul buf_vaddr, struct pt_regs *regs)
 {
     unsigned char x = io_in8(PORT_PS2_KEYBOARD_DATA);
 
-    uint8_t count = kfifo_in((struct kfifo_t*)buf_vaddr, &x, sizeof(unsigned char));
+    uint8_t count = kfifo_in((struct kfifo_t *)buf_vaddr, &x, sizeof(unsigned char));
     if (count == 0)
     {
         kwarn("ps2 keyboard buffer full.");
@@ -206,6 +207,9 @@ void ps2_keyboard_init()
     io_in8(PORT_PS2_KEYBOARD_DATA);
     // 将设备挂载到devfs
     devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_PS2_KEYBOARD, &ps2_keyboard_fops, NULL);
+
+    keyboard_register(&ps2_keyboard_fops);
+
     kinfo("ps/2 keyboard registered.");
 }
 

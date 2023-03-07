@@ -3,18 +3,24 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::{sync::Arc, vec::Vec, string::{String, ToString}, format};
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 use crate::{
+    driver::disk::ahci::{self, ahci_rust_init},
     filesystem::{
+        devfs::{register_bultinin_device, DevFS},
+        fat::fs::FATFileSystem,
         procfs::{LockedProcFSInode, ProcFS},
         ramfs::RamFS,
-        vfs::{
-            mount::MountFS,
-            FileSystem, FileType, file::File,
-        }, fat::fs::FATFileSystem,
+        vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
-    kdebug, println, include::bindings::bindings::{O_RDWR, O_RDONLY}, driver::disk::ahci::{self, ahci_rust_init}, kerror,
+    include::bindings::bindings::{O_RDONLY, O_RDWR},
+    kdebug, kerror, println,
 };
 
 use super::{IndexNode, InodeId};
@@ -32,26 +38,36 @@ pub fn generate_inode_id() -> InodeId {
 // @brief 初始化ROOT INODE
 lazy_static! {
     pub static ref ROOT_INODE: Arc<dyn IndexNode> = {
-        ahci_rust_init().expect("ahci rust init failed.");
         // 使用Ramfs作为默认的根文件系统
         let ramfs = RamFS::new();
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.root_inode();
-        let partiton:Arc<crate::io::disk_info::Partition>= ahci::get_disks_by_name("ahci_disk_0".to_string()).unwrap().0.lock().partitions[0].clone();
-        let fatfs:Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
-        if fatfs.is_err(){
-            kerror!("Failed to initialize fatfs, code={:?}", fatfs.err());
-        }
-        // // 创建文件夹
-        // root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
-        // root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
+
+        // ahci_rust_init().expect("ahci rust init failed.");
+        // let partiton:Arc<crate::io::disk_info::Partition>= ahci::get_disks_by_name("ahci_disk_0".to_string()).unwrap().0.lock().partitions[0].clone();
+        // let fatfs:Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
+        // if fatfs.is_err(){
+        //     kerror!("Failed to initialize fatfs, code={:?}", fatfs.err());
+        // }
+
+        // 创建文件夹
+        root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
+        root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
+
+
         // // 创建procfs实例
-        // let procfs = ProcFS::new();
-        // kdebug!("proc created");
-        // kdebug!("root inode.list()={:?}", root_inode.list());
-        // // procfs挂载
-        // let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
-        // kdebug!("root inode.list()={:?}", root_inode.list());
+        let procfs = ProcFS::new();
+        kdebug!("proc created");
+        kdebug!("root inode.list()={:?}", root_inode.list());
+        // procfs挂载
+        let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
+        kdebug!("root inode.list()={:?}", root_inode.list());
+
+        // 创建 devfs 实例
+        let devfs = DevFS::new();
+        // devfs 挂载
+        let _t = root_inode.find("dev").expect("Cannot find /dev").mount(devfs).expect("Failed to mount devfs");
+
         root_inode
     };
 }
@@ -98,20 +114,19 @@ fn __test_procfs(pid: i64) {
     );
     // let proc_inode = ROOT_INODE.lookup("/proc/1/status").expect("Cannot find /proc/1/status");
     let _t = procfs_inode.find(&format!("{}", pid)).unwrap();
-    let proc_inode = _t.find("status").expect(&format!("Cannot find /proc/{}/status", pid));
+    let proc_inode = _t
+        .find("status")
+        .expect(&format!("Cannot find /proc/{}/status", pid));
     let mut f = File::new(proc_inode, O_RDONLY).unwrap();
     kdebug!("file created!");
-    kdebug!(
-        "proc.list()={:?}",
-        _p.list().expect("list /proc failed.")
-    );
-    let mut buf : Vec<u8> = Vec::new();
+    kdebug!("proc.list()={:?}", _p.list().expect("list /proc failed."));
+    let mut buf: Vec<u8> = Vec::new();
     buf.resize(f.metadata().unwrap().size as usize, 0);
 
-    let size = f.read(
-        f.metadata().unwrap().size as usize, buf.as_mut()).unwrap();
+    let size = f
+        .read(f.metadata().unwrap().size as usize, buf.as_mut())
+        .unwrap();
     kdebug!("size = {}, data={:?}", size, buf);
     let buf = String::from_utf8(buf).unwrap();
     kdebug!("data for /proc/{}/status: {}", pid, buf);
-
 }

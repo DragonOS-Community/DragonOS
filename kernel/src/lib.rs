@@ -33,6 +33,8 @@ mod smp;
 mod time;
 
 extern crate alloc;
+#[macro_use]
+extern crate lazy_static;
 
 use mm::allocator::KernelAllocator;
 

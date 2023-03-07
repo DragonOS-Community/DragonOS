@@ -45,3 +45,145 @@ DragonOS中实现了MMIO地址空间的管理机制，本节将介绍它们。
 1. 取消mmio区域在页表中的映射。
 2. 将释放MMIO区域的VMA
 3. 将地址空间归还给mmio的伙伴系统。
+
+## MMIO的伙伴算法
+
+### 伙伴的定义
+
+&emsp;&emsp;同时满足以下三个条件的两个内存块被称为伙伴内存块：
+
+1. 两个内存块的大小相同
+2. 两个内存块的内存地址连续
+3. 两个内存块由同一个大块内存分裂得到
+
+### 伙伴算法
+
+&emsp;&emsp;伙伴（buddy）算法的作用是维护以及组织大块连续内存块的分配和回收，以减少系统时运行产生的外部碎片。伙伴系统中的每个内存块的大小均为$2^n$。 在DragonOS中，伙伴系统内存池共维护了1TB的连续存储空间，最大的内存块大小为$1G$，即$2^{30}B$，最小的内存块大小为$4K$，即 $2^{12}B$。
+
+&emsp;&emsp;伙伴算法的核心思想是当应用申请内存时，每次都分配比申请的内存大小更大的最小内存块，同时分配出去的内存块大小为$2^nB$。（e.g. 假设某应用申请了$3B$内存，显然并没有整数值n，使$2^n = 3$ ，且$3 \in [2^1,2^2]$，所以系统会去取一块大小为$2^2B$的内存块，将它分配给申请的应用，本次申请内存操作顺利完成。）
+
+&emsp;&emsp;那么当伙伴系统中没有如此“合适”的内存块时该怎么办呢？系统先会去寻找更大的内存块，如果找到了，则会将大内存块分裂成合适的内存块分配给应用。（e.g. 假设申请$3B$内存，此时系统中比$3B$大的最小内存块的大小为$16B$，那么$16B$会被分裂成两块$8B$的内存块，一块放入内存池中，一块继续分裂成两块$4B$的内存块。两块$4B$的内存块，一块放入内存池中，一块分配给应用。至此，本次申请内存操作顺利完成。）
+
+&emsp;&emsp;如果系统没有找到更大的内存块，系统将会尝试合并较小的内存块，直到符合申请空间的大小。（e.g. 假设申请$3B$内存，系统检查内存池发现只有两个$2B$的内存块，那么系统将会把这两个$2B$的内存块合并成一块$4B$的内存块，并分配给应用。至此，本次申请内存操作顺利完成。）
+
+&emsp;&emsp;最后，当系统既没有找到大块内存，又无法成功合并小块内存时，就会通知应用内存不够，无法分配内存。
+
+### 伙伴算法的数据结构
+
+```
+
+                                  MmioBuddyMemPool
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                     │
+│                                 pool_start_addr                                     │
+│                                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                                    pool_size                                        │
+│                                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                                                                                     │
+│                                   free_regions                                      │
+│                                                                                     │
+│                                  ┌────────────┐                                     │
+│                                  │            │     ┌───────┐     ┌────────┐        │
+│                                  │ ┌────────┬─┼────►│       ├────►│        │        │
+│                                  │ │  list  │ │     │ vaddr │     │ vaddr  │        │
+│                                  │ │        │◄├─────┤       │◄────┤        │        │
+│                  MmioFreeRegionList├────────┤ │     └───────┘     └────────┘        │
+│                                  │ │num_free│ │                                     │
+│                                  │ └────────┘ │  MmioBuddyAddrRegion                │
+│          MMIO_BUDDY_MIN_EXP - 12 │      0     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │      1     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │      2     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │      3     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │     ...    │                                     │
+│                                  ├────────────┤                                     │
+│                                  │     ...    │                                     │
+│                                  ├────────────┤                                     │
+│          MMIO_BUDDY_MAX_EXP - 12 │     18     │                                     │
+│                                  └────────────┘                                     │
+│                                                                                     │
+│                                                                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```rust
+
+/// 最大的内存块为1G，其幂为30
+const MMIO_BUDDY_MAX_EXP: u32 = PAGE_1G_SHIFT;
+/// 最小的内存块为4K，其幂为12                                  
+const MMIO_BUDDY_MIN_EXP: u32 = PAGE_4K_SHIFT;
+/// 内存池数组的大小为18
+const MMIO_BUDDY_REGION_COUNT: u32 = MMIO_BUDDY_MAX_EXP - MMIO_BUDDY_MIN_EXP + 1;
+
+/// buddy内存池
+pub struct MmioBuddyMemPool {
+    /// 内存池的起始地址
+    pool_start_addr: u64, 
+    /// 内存池大小：初始化为1TB
+    pool_size: u64,
+    /// 空闲内存块链表数组
+    /// MMIO_BUDDY_REGION_COUNT = MMIO_BUDDY_MAX_EXP - MMIO_BUDDY_MIN_EXP + 1
+    free_regions: [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize],
+}
+
+/// 空闲内存块链表结构体
+pub struct MmioFreeRegionList {
+    /// 存储了空闲内存块信息的结构体的链表
+    list: LinkedList<Box<MmioBuddyAddrRegion>>,
+    /// 当前链表空闲块的数量
+    num_free: i64,
+}
+
+/// mmio伙伴系统内部的地址区域结构体
+pub struct MmioBuddyAddrRegion {
+    /// 内存块的起始地址
+    vaddr: u64,
+}                                  
+                  
+```
+
+### 设计思路
+
+&emsp;&emsp;DragonOS中，使用`MmioBuddyMemPool`结构体作为buddy（为表述方便，以下将伙伴算法简称为buddy）内存池的数据结构，其记录了内存池的起始地址（pool_start_addr）以及内存池中内存块的总大小（pool_size），同时其维护了大小为`MMIO_BUDDY_REGION_COUNT`的双向链表数组（free_regions）。`free_regions`中的各个链表维护了若干空闲内存块（MmioBuddyAddrRegion）。
+
+&emsp;&emsp;`free_regions`的下标（index）与内存块的大小有关。由于每个内存块大小都为$2^{n}$ bytes，那么可以令$exp = n$。index与exp的换算公式如下：$index = exp - 12$。e.g. 一个大小为$2^{12}$ bytes的内存块，其$exp = 12$，使用上述公式计算得$index = 12 -12 = 0$，所以该内存块会被存入`free_regions[0].list`中。通过上述换算公式，每次取出或释放$2^n$大小的内存块，只需要操作`free_regions[n -12]`即可。DragonOS中，buddy内存池最大的内存块大小为$1G =  2^{30}bytes$，最小的内存块大小为 $4K =  2^{12} bytes$，所以$index\in[0,18]$。
+
+&emsp;&emsp;作为内存分配机制，buddy服务于所有进程，为了解决在各个进程之间实现free_regions中的链表数据同步的问题，`free_regions`中的链表类型采用加了 {ref}`自旋锁 <_spinlock_doc_spinlock>`（SpinLock）的空闲内存块链表（MmioFreeRegionList），`MmioFreeRegionList`中封装有真正的存储了空闲内存块信息的结构体的链表（list）和对应链表长度（num_free）。有了自选锁后，同一时刻只允许一个进程修改某个链表，如取出链表元素（申请内存）或者向链表中插入元素（释放内存）。
+
+&emsp;&emsp;`MmioFreeRegionList`中的元素类型为`MmioBuddyAddrRegion`结构体，`MmioBuddyAddrRegion`记录了内存块的起始地址（vaddr）。
+
+### 伙伴算法内部api
+
+**P.S 以下函数均为MmioBuddyMemPool的成员函数。系统中已经创建了一个MmioBuddyMemPool类型的全局引用`MMIO_POOL`，如要使用以下函数，请以`MMIO_POOL.xxx()`形式使用，以此形式使用则不需要传入self。**
+
+| **函数名**                                                           | **描述**                                                    |
+|:----------------------------------------------------------------- |:--------------------------------------------------------- |
+| __create_region(&self, vaddr)                                     | 将虚拟地址传入，创建新的内存块地址结构体                                      |
+| __give_back_block(&self, vaddr, exp)                              | 将地址为vaddr，幂为exp的内存块归还给buddy                               |
+| __buddy_split(&self,region,exp,list_guard)                        | 将给定大小为$2^{exp}$的内存块一分为二，并插入内存块大小为$2^{exp-1}$的链表中          |
+| __query_addr_region(&self,exp,list_guard)                         | 从buddy中申请一块大小为$2^{exp}$的内存块                               |
+| mmio_buddy_query_addr_region(&self,exp)                           | 对query_addr_region进行封装，**请使用这个函数，而不是__query_addr_region** |
+| __buddy_add_region_obj(&self,region,list_guard)                   | 往指定的地址空间链表中添加一个内存块                                        |
+| __buddy_block_vaddr(&self, vaddr, exp)                            | 根据地址和内存块大小，计算伙伴块虚拟内存的地址                                   |
+| __pop_buddy_block( &self, vaddr,exp,list_guard)                   | 寻找并弹出指定内存块的伙伴块                                            |
+| __buddy_pop_region( &self,        list_guard)                     | 从指定空闲链表中取出内存区域                                            |
+| __buddy_merge(&self,exp,list_guard,high_list_guard)               | 合并所有$2^{exp}$大小的内存块                                       |
+| __buddy_merge_blocks(&self,region_1,region_2,exp,high_list_guard) | 合并两个**已经从链表中取出的**内存块                                      |
+
+### 伙伴算法对外api
+
+| **函数名**                                         | **描述**                                      |
+| ----------------------------------------------- | ------------------------------------------- |
+| __mmio_buddy_init()                             | 初始化buddy系统，**在mmio_init()中调用，请勿随意调用**       |
+| __exp2index(exp)                                | 将$2^{exp}$的exp转换成内存池中的数组的下标（index）          |
+| mmio_create(size,vm_flags,res_vaddr,res_length) | 创建一块根据size对齐后的大小的mmio区域，并将其vma绑定到initial_mm |
+| mmio_release(vaddr, length)                     | 取消地址为vaddr，大小为length的mmio的映射并将其归还到buddy中    |

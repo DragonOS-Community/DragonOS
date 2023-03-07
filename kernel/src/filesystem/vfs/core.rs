@@ -81,6 +81,8 @@ fn test_fatfs() {
             .lock()
             .partitions[0]
             .clone();
+
+    // ========== 测试挂载文件系统 ===============
     let fatfs: Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
     if fatfs.is_err() {
         kerror!(
@@ -89,6 +91,8 @@ fn test_fatfs() {
         );
     }
     let fatfs = fatfs.unwrap();
+
+    // ======= 测试读取目录 =============
     let fat_root = fatfs.root_inode();
     kdebug!("get fat root inode ok");
     let root_items: Result<Vec<String>, i32> = fat_root.list();
@@ -99,38 +103,83 @@ fn test_fatfs() {
     } else {
         kerror!("list root_items failed, code = {}", root_items.unwrap_err());
     }
-    kdebug!("to find boot");
-    let boot_inode = fat_root.find("boot").unwrap();
-    kdebug!("to list boot");
-    kdebug!("boot items = {:?}", boot_inode.list().unwrap());
-    kdebug!("to find grub");
-    let grub_inode = boot_inode.find("grub").unwrap();
-    kdebug!("to list grub");
-    kdebug!("grub_items={:?}", grub_inode.list().unwrap());
-    let grub_cfg_inode = grub_inode.find("grub.cfg").unwrap();
+    // kdebug!("to find boot");
+    // let boot_inode = fat_root.find("boot").unwrap();
+    // kdebug!("to list boot");
+    // kdebug!("boot items = {:?}", boot_inode.list().unwrap());
+    // kdebug!("to find grub");
+    // let grub_inode = boot_inode.find("grub").unwrap();
+    // kdebug!("to list grub");
+    // kdebug!("grub_items={:?}", grub_inode.list().unwrap());
+    // let grub_cfg_inode = grub_inode.find("grub.cfg").unwrap();
 
-    kdebug!("grub_cfg_inode = {:?}", grub_cfg_inode);
-    let mut buf: Vec<u8> = Vec::new();
-    buf.resize(128, 0);
-    let mut file = File::new(grub_cfg_inode, O_RDWR).unwrap();
-    kdebug!("file={file:?}, metadata = {:?}", file.metadata());
-    let r = file.read(128, &mut buf);
-    kdebug!("r = {r:?}, buf={buf:?}");
-    for x in buf.iter() {
+    // // ========== 测试读写 =============
+    // kdebug!("grub_cfg_inode = {:?}", grub_cfg_inode);
+    // let mut buf: Vec<u8> = Vec::new();
+    // buf.resize(128, 0);
+    // let mut file = File::new(grub_cfg_inode, O_RDWR).unwrap();
+    // kdebug!("file={file:?}, metadata = {:?}", file.metadata());
+    // let r = file.read(128, &mut buf);
+    // kdebug!("r = {r:?}, buf={buf:?}");
+    // for x in buf.iter() {
+    //     print!("{}", *x as char);
+    // }
+    // buf[126] = "X".as_bytes()[0];
+    // buf[127] = "X".as_bytes()[0];
+    // kdebug!("to_write");
+    // let r = file.write(128, &buf);
+    // kdebug!("write ok, r = {r:?}");
+    // let r = file.read(128, &mut buf);
+    // kdebug!("r = {r:?}, buf={buf:?}");
+    // for x in buf.iter() {
+    //     print!("{}", *x as char);
+    // }
+    // kdebug!("read ok");
+    // kdebug!("file={file:?}, metadata = {:?}", file.metadata());
+
+    // ======== 测试创建文件夹 ============
+
+    // kdebug!(" to create dir 'test_create'.");
+    let r: Result<Arc<dyn IndexNode>, i32> = fat_root.create("test_create", FileType::Dir, 0o777);
+    kdebug!("test_create  r={r:?}");
+    let test_create_inode = r.unwrap();
+    fat_root.create("test1", FileType::Dir, 0o777);
+    let test2 = fat_root.create("test2", FileType::Dir, 0o777).unwrap();
+
+    let test_create_inode = fat_root.create("test3", FileType::Dir, 0o777).unwrap();
+    // fat_root.create("test4", FileType::Dir, 0o777);
+    // fat_root.create("test5", FileType::Dir, 0o777);
+    // fat_root.create("test6", FileType::Dir, 0o777);
+    kdebug!("fat_root.list={:?}", fat_root.list());
+    kdebug!("test_create_inode.list={:?}", test_create_inode.list());
+    kdebug!("test_create_inode.metadata()={:?}", test_create_inode.metadata());
+    // !!!!!!!!!!!! 这里创建文件夹会出错，而创建test_create不出错。
+    let r = test_create_inode.create("test_dir", FileType::Dir, 0o777);
+    kdebug!("test_dir  r={r:?}");
+    let test_dir = r.unwrap();
+    kdebug!("test_dir.list = {:?}", test_dir.list());
+    let r = test_create_inode.create("test_file", FileType::File, 0o777);
+    kdebug!("create test_file  r={r:?}");
+    let test_file = File::new(test_create_inode.find("test_file").unwrap(), O_RDWR);
+    kdebug!("test_file  r={test_file:?}");
+    let mut test_file = test_file.unwrap();
+    kdebug!("test_file metadata = {:?}", test_file.metadata());
+    let mut buf:Vec<u8> = Vec::new();
+    for i in 0..10{
+        buf.append(&mut format!("{}\n", i).as_bytes().to_vec());
+    }
+    let r = test_file.write(buf.len(), &buf);
+    kdebug!("write file, r= {r:?}");
+
+    buf.clear();
+    buf.resize(64, 0);
+    let r = test_file.read(64, &mut buf);
+    kdebug!("read test_file, r={r:?}");
+    for x in buf.iter(){
         print!("{}", *x as char);
     }
-    buf[126] = "X".as_bytes()[0];
-    buf[127] = "X".as_bytes()[0];
-    kdebug!("to_write");
-    let r = file.write(128, &buf);
-    kdebug!("write ok, r = {r:?}");
-    let r = file.read(128, &mut buf);
-    kdebug!("r = {r:?}, buf={buf:?}");
-    for x in buf.iter() {
-        print!("{}", *x as char);
-    }
-    kdebug!("read ok");
-    kdebug!("file={file:?}, metadata = {:?}", file.metadata());
+    
+
     kdebug!("test_done");
     compiler_fence(Ordering::SeqCst);
 }

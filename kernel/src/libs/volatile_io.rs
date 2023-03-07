@@ -1,4 +1,3 @@
-
 macro_rules! volatile_read {
     ($data: expr) => {
         unsafe { core::ptr::read_volatile(core::ptr::addr_of!($data)) }

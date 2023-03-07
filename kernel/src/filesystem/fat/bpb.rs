@@ -176,8 +176,9 @@ impl FATType {
             FATType::FAT16(_) => current_cluster * 2,
             FATType::FAT32(_) => current_cluster * 4,
         };
-
-        return fat_start_sector * bytes_per_sec + fat_bytes_offset;
+        let fat_sec_number = fat_start_sector + (fat_bytes_offset / bytes_per_sec);
+        let fat_ent_offset = fat_bytes_offset % bytes_per_sec;
+        return fat_sec_number * bytes_per_sec + fat_ent_offset;
     }
 }
 

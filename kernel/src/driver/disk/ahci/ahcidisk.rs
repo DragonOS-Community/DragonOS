@@ -167,7 +167,7 @@ impl AhciDisk {
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
-        kdebug!("To wait ahci read complete.");
+        // kdebug!("To wait ahci read complete.");
         // 等待操作完成
         loop {
             if (volatile_read!(port.ci) & (1 << slot)) == 0 {

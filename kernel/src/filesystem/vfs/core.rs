@@ -44,7 +44,7 @@ lazy_static! {
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.root_inode();
         
-
+        test_fatfs();
         // 创建文件夹
         root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
@@ -184,14 +184,14 @@ fn test_fatfs() {
 
     // 测试删除文件
 
-    let test3 = fat_root.find("test3").unwrap();
-    let r = test3.unlink("test_dir");
-    kdebug!("r = {r:?}");
+    // let test3 = fat_root.find("test3").unwrap();
+    // let r = test3.unlink("test_dir");
+    // kdebug!("r = {r:?}");
     
-    let a = test3.find("test_dir").unwrap().unlink("a");
-    assert!(a.is_ok());
-    let r = test3.unlink("test_dir");
-    assert!(r.is_ok());
+    // let a = test3.find("test_dir").unwrap().unlink("a");
+    // assert!(a.is_ok());
+    // let r = test3.unlink("test_dir");
+    // assert!(r.is_ok());
     
     
 

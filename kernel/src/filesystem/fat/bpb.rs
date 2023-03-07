@@ -2,12 +2,8 @@ use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::EINVAL,
-    io::{
-        device::{BlockDevice, Device, LBA_SIZE},
-        disk_info::Partition,
-        SeekFrom,
-    },
-    kdebug, kerror,
+    io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
+    kerror,
     libs::vec_cursor::VecCursor,
 };
 
@@ -235,7 +231,7 @@ impl BiosParameterBlock {
 
         // 验证BPB32的信息是否合法
         bpb.validate(&bpb32)?;
-        kdebug!("bpb validate done");
+
         // 计算根目录项占用的空间（单位：字节）
         let root_sectors = ((bpb.root_entries_cnt as u32 * 32) + (bpb.bytes_per_sector as u32 - 1))
             / (bpb.bytes_per_sector as u32);
@@ -269,7 +265,6 @@ impl BiosParameterBlock {
             FATType::FAT32(bpb32)
         };
 
-        kdebug!("bpb={:?}", bpb);
         return Ok(bpb);
     }
 

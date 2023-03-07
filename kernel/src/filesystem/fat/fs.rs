@@ -132,7 +132,7 @@ impl FATInode {
                 // 在磁盘查找
                 let fat_entry: FATDirEntry =
                     d.find_entry(name, None, None, self.fs.upgrade().unwrap())?;
-                kdebug!("find entry from disk ok, entry={fat_entry:?}");
+                // kdebug!("find entry from disk ok, entry={fat_entry:?}");
                 // 创建新的inode
                 let entry_inode: Arc<LockedFATInode> = LockedFATInode::new(
                     self.fs.upgrade().unwrap(),
@@ -237,14 +237,11 @@ impl FileSystem for FATFileSystem {
 
 impl FATFileSystem {
     pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, i32> {
-        kdebug!("read bpb");
         let bpb = BiosParameterBlock::new(partition.clone())?;
 
-        kdebug!("read fsinfo");
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
             FATType::FAT32(bpb32) => {
-                kdebug!("read fsinfo 32");
                 let fs_info_in_disk_bytes_offset = partition.lba_start * LBA_SIZE as u64
                     + bpb32.fs_info as u64 * bpb.bytes_per_sector as u64;
                 FATFsInfo::new(
@@ -255,8 +252,6 @@ impl FATFileSystem {
             }
             _ => FATFsInfo::default(),
         };
-
-        kdebug!("fs_info = {:?}", fs_info);
 
         // 根目录项占用的扇区数（向上取整）
         let root_dir_sectors: u64 = ((bpb.root_entries_cnt as u64 * 32)
@@ -570,13 +565,11 @@ impl FATFileSystem {
             .0
             .lock()
             .update_next_free((free_cluster.cluster_num + 1) as u32);
-        kdebug!("bytes per cluster={}", self.bytes_per_cluster());
+
         // 如果这个空闲簇不是簇链的第一个簇，那么把当前簇跟前一个簇连上。
         if let Some(prev_cluster) = prev_cluster {
-            kdebug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
+            // kdebug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
             self.set_entry(prev_cluster, FATEntry::Next(free_cluster))?;
-            let raw = self.get_fat_entry_raw(prev_cluster);
-            kdebug!("after set entry, raw={raw:?}");
         }
         // 清空新获取的这个簇
         self.zero_cluster(free_cluster)?;
@@ -809,11 +802,9 @@ impl FATFileSystem {
     pub fn set_shut_bit_ok(&mut self) -> Result<(), i32> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
-                kdebug!("read raw_dentry");
                 let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x0800_0000;
-                kdebug!("read raw_dentry ok");
                 self.set_entry(Cluster::new(1), FATEntry::Next(Cluster::new(raw_entry)))?;
-                kdebug!("set raw_dentry ok");
+
                 return Ok(());
             }
 
@@ -850,15 +841,14 @@ impl FATFileSystem {
 
     /// @brief 执行文件系统卸载前的一些准备工作：设置好对应的标志位，并把缓存中的数据刷入磁盘
     pub fn umount(&mut self) -> Result<(), i32> {
-        kdebug!("to flush");
         self.fs_info.0.lock().flush(&self.partition)?;
-        kdebug!("flush ok");
+
         self.set_shut_bit_ok()?;
-        kdebug!("shut bit ok");
+
         self.set_hard_error_bit_ok()?;
-        kdebug!("hard error bit ok");
+
         self.partition.disk().sync()?;
-        kdebug!("sync ok");
+
         return Ok(());
     }
 
@@ -1105,15 +1095,14 @@ impl FATFileSystem {
                 } else {
                     self.bpb.num_fats as u64
                 };
-                kdebug!("set entry, bound={bound}, fat_size={fat_size}");
+                // kdebug!("set entry, bound={bound}, fat_size={fat_size}");
                 for i in 0..bound {
-                    kdebug!("i={i}");
                     // 当前操作的FAT表在磁盘上的字节偏移量
                     let f_offset: u64 = fat_part_bytes_offset + i * fat_size;
                     let in_block_offset: u64 = self.get_in_block_offset(f_offset);
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(f_offset));
 
-                    kdebug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
+                    // kdebug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
                     let mut v: Vec<u8> = Vec::new();
                     v.resize(LBA_SIZE, 0);
                     self.partition.disk().read_at(lba, 1, &mut v)?;
@@ -1146,7 +1135,7 @@ impl FATFileSystem {
                     // 恢复保留位
                     raw_val |= old_bits;
 
-                    kdebug!("sent entry, raw_val={raw_val}");
+                    // kdebug!("sent entry, raw_val={raw_val}");
 
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                     cursor.write_u32(raw_val)?;
@@ -1429,9 +1418,7 @@ impl IndexNode for LockedFATInode {
                     return Ok(guard.find(name)?);
                 }
                 FileType::Dir => {
-                    kdebug!("to create dir {}", name);
                     d.create_dir(name, fs)?;
-                    kdebug!("create dir {} done", name);
                     return Ok(guard.find(name)?);
                 }
 

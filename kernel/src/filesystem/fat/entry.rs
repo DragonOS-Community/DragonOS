@@ -7,14 +7,14 @@ use alloc::{
 };
 
 use crate::{
-    filesystem::vfs::FileSystem,
     include::bindings::bindings::{
         EEXIST, EILSEQ, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EPERM,
         EROFS,
     },
     io::{device::LBA_SIZE, SeekFrom},
-    kdebug, kerror, kwarn,
-    libs::vec_cursor::VecCursor, print,
+    kdebug, kwarn,
+    libs::vec_cursor::VecCursor,
+    print,
 };
 
 use super::{
@@ -160,9 +160,8 @@ impl FATFile {
         buf: &[u8],
         offset: u64,
     ) -> Result<usize, i32> {
-        kdebug!("to ensure len");
         self.ensure_len(fs, offset, buf.len() as u64)?;
-        kdebug!("ensure len ok");
+
         // 要写入的第一个簇的簇号
         let start_cluster_num = offset / fs.bytes_per_cluster();
 
@@ -182,7 +181,6 @@ impl FATFile {
 
         // 循环写入数据
         loop {
-            kdebug!("in loop");
             if in_cluster_bytes_offset >= fs.bytes_per_cluster() {
                 if let Some(FATEntry::Next(c)) = fs.get_fat_entry(current_cluster).ok() {
                     current_cluster = c;
@@ -438,7 +436,7 @@ impl FATDir {
 
                     free += 1;
                     if free == num_free {
-                        kdebug!("first_free = {first_free:?}, current_free = ({current_cluster:?}, {offset})");
+                        // kdebug!("first_free = {first_free:?}, current_free = ({current_cluster:?}, {offset})");
                         return Ok(first_free);
                     }
                 }
@@ -460,7 +458,9 @@ impl FATDir {
                 / fs.bytes_per_cluster();
         let mut first_cluster = Cluster::default();
         let mut prev_cluster = current_cluster;
-        kdebug!("clusters_required={clusters_required}, prev_cluster={prev_cluster:?}, free ={free}");
+        // kdebug!(
+        //     "clusters_required={clusters_required}, prev_cluster={prev_cluster:?}, free ={free}"
+        // );
         // 申请簇
         for i in 0..clusters_required {
             let c: Cluster = fs.allocate_cluster(Some(prev_cluster))?;
@@ -579,7 +579,7 @@ impl FATDir {
     pub fn create_dir(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATDir, i32> {
         let r: Result<FATDirEntryOrShortName, i32> =
             self.check_existence(name, Some(true), fs.clone());
-        kdebug!("check existence ok");
+        // kdebug!("check existence ok");
         // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
         if r.is_err() {
             let err_val = r.unwrap_err();
@@ -593,18 +593,14 @@ impl FATDir {
         match r.unwrap() {
             // 文件夹不存在，创建文件夹
             FATDirEntryOrShortName::ShortName(short_name) => {
-                kdebug!("to validate long name, short_name=");
-                for x in short_name.iter(){
-                    print!("{}", *x as char);
-                }
                 LongDirEntry::validate_long_name(name)?;
                 // 目标目录项
                 let mut short_entry = ShortDirEntry::default();
-                kdebug!("to allocate cluster");
+                // kdebug!("to allocate cluster");
                 let first_cluster: Cluster = fs.allocate_cluster(None)?;
                 short_entry.set_first_cluster(first_cluster);
 
-                kdebug!("to create dot");
+                // kdebug!("to create dot");
                 // === 接下来在子目录中创建'.'目录项和'..'目录项
                 let mut offset = 0;
                 // '.'目录项
@@ -620,7 +616,7 @@ impl FATDir {
                 // 偏移量加上一个目录项的长度
                 offset += FATRawDirEntry::DIR_ENTRY_LEN;
 
-                kdebug!("to create dot dot");
+                // kdebug!("to create dot dot");
                 // '..'目录项
                 let mut dot_dot_entry = ShortDirEntry::default();
                 dot_dot_entry.name = ShortNameGenerator::new("..").generate().unwrap();
@@ -630,7 +626,7 @@ impl FATDir {
 
                 dot_dot_entry.flush(&fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
 
-                kdebug!("to create dentries");
+                // kdebug!("to create dentries");
                 // 在当前目录下创建目标目录项
                 let res = self
                     .create_dir_entries(
@@ -643,7 +639,7 @@ impl FATDir {
                         fs.clone(),
                     )
                     .map(|e| e.to_dir())?;
-                kdebug!("create dentries ok");
+                // kdebug!("create dentries ok");
                 return res;
             }
             FATDirEntryOrShortName::DirEntry(_) => {
@@ -713,24 +709,17 @@ impl FATDir {
         attrs: FileAttributes,
         fs: Arc<FATFileSystem>,
     ) -> Result<FATDirEntry, i32> {
-        
         let mut short_dentry: ShortDirEntry = short_dentry.unwrap_or(ShortDirEntry::default());
         short_dentry.name = short_name.clone();
         short_dentry.attributes = attrs;
-        kdebug!("long name = {}", long_name);
-        if long_name == "test2"{
-            kdebug!("test2, short_name=");
-            for x in short_name.iter(){
-                print!("{}", *x as char);
-            }
-        }
+
         // todo: 设置创建时间、修改时间
 
         let mut long_name_gen: LongNameEntryGenerator =
             LongNameEntryGenerator::new(long_name, short_dentry.checksum());
         let num_entries = long_name_gen.num_entries() as u64;
 
-        kdebug!("to find free entries");
+        // kdebug!("to find free entries");
         let free_entries: Option<(Cluster, u64)> =
             self.find_free_entries(num_entries, fs.clone())?;
         // 目录项开始位置
@@ -738,11 +727,9 @@ impl FATDir {
             Some(c) => c,
             None => return Err(-(ENOSPC as i32)),
         };
-        kdebug!("free_entries={free_entries:?}");
-        kdebug!("to get iters, start_loc={start_loc:?}  num_entries={num_entries}");
         let offsets: Vec<(Cluster, u64)> =
             FATDirEntryOffsetIter::new(fs.clone(), start_loc, num_entries, None).collect();
-        kdebug!("get iters ok, offsets={offsets:?}");
+
         // 迭代长目录项
         for off in &offsets.as_slice()[..offsets.len() - 1] {
             // 获取生成的下一个长目录项
@@ -854,7 +841,6 @@ impl FATDir {
         old_name: &str,
         new_name: &str,
     ) -> Result<FATDirEntry, i32> {
-        
         // 判断源目录项是否存在
         let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
             self.check_existence(old_name, None, fs.clone())?
@@ -1404,10 +1390,7 @@ impl FATDirIter {
     ///             Option<FATDirEntry>: 读取到的目录项（如果没有读取到，就返回失败）
     /// @return Err(错误码) 可能出现了内部错误，或者是磁盘错误等。具体原因看错误码。
     fn get_dir_entry(&mut self) -> Result<(Cluster, u64, Option<FATDirEntry>), i32> {
-        kdebug!("FATDirIter::get_dir_entry");
-
         loop {
-            kdebug!("123");
             // 如果当前簇已经被读完，那么尝试获取下一个簇
             if self.offset >= self.fs.bytes_per_cluster() && !self.is_root {
                 match self.fs.get_fat_entry(self.current_cluster)? {
@@ -1423,7 +1406,6 @@ impl FATDirIter {
                     }
                 }
             }
-            kdebug!("123");
 
             // 如果当前是FAT12/FAT16文件系统，并且当前inode是根目录项。
             // 如果offset大于根目录项的最大大小（已经遍历完根目录），那么就返回None
@@ -1433,17 +1415,15 @@ impl FATDirIter {
 
             // 获取簇在磁盘内的字节偏移量
             let offset: u64 = self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
-            kdebug!("to get fat raw entry, offset={}", offset);
+
             // 从磁盘读取原始的dentry
             let raw_dentry: FATRawDirEntry = get_raw_dir_entry(&self.fs, offset)?;
-            kdebug!("raw_dentry={:?}", raw_dentry);
 
             // 由于迭代顺序从前往后，因此：
             // 如果找到1个短目录项，那么证明有一个完整的entry被找到，因此返回。
             // 如果找到1个长目录项，那么，就依次往下迭代查找，直到找到一个短目录项，然后返回结果。这里找到的所有的目录项，都属于同一个文件/文件夹。
             match raw_dentry {
                 FATRawDirEntry::Short(s) => {
-                    kdebug!("short");
                     // 当前找到一个短目录项，更新offset之后，直接返回
                     self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                     return Ok((
@@ -1456,7 +1436,6 @@ impl FATDirIter {
                     ));
                 }
                 FATRawDirEntry::Long(l) => {
-                    kdebug!("Is long entry, l={:?}", l);
                     // 当前找到一个长目录项
 
                     // 声明一个数组，来容纳所有的entry。（先把最后一个entry放进去）
@@ -1469,7 +1448,7 @@ impl FATDirIter {
                     // 由于在FAT文件系统中，文件名最长为255字节，因此，最多有20个长目录项以及1个短目录项。
                     // 由于上面已经塞了1个长目录项，因此接下来最多需要迭代20次
                     // 循环查找目录项，直到遇到1个短目录项，或者是空闲目录项
-                    for i in 0..20 {
+                    for _ in 0..20 {
                         // 如果当前簇已经被读完，那么尝试获取下一个簇
                         if self.offset >= self.fs.bytes_per_cluster() && !self.is_root {
                             match self.fs.get_fat_entry(self.current_cluster)? {
@@ -1498,7 +1477,7 @@ impl FATDirIter {
                             self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
                         // 从磁盘读取原始的dentry
                         let raw_dentry: FATRawDirEntry = get_raw_dir_entry(&self.fs, offset)?;
-                        kdebug!("in for: raw_dentry={raw_dentry:?}");
+
                         match raw_dentry {
                             FATRawDirEntry::Short(_) => {
                                 // 当前遇到1个短目录项，证明当前文件/文件夹的所有dentry都被读取完了，因此在将其加入数组后，退出迭代。
@@ -1517,7 +1496,7 @@ impl FATDirIter {
                             }
                         }
                     }
-                    kdebug!("collect dentries done. long_name_entries={long_name_entries:?}");
+                    // kdebug!("collect dentries done. long_name_entries={long_name_entries:?}");
                     let dir_entry: Result<FATDirEntry, i32> = FATDirEntry::new(
                         long_name_entries,
                         (
@@ -1525,27 +1504,25 @@ impl FATDirIter {
                             (self.current_cluster, self.offset),
                         ),
                     );
-                    kdebug!("dir_entry={:?}", dir_entry);
+                    // kdebug!("dir_entry={:?}", dir_entry);
                     match dir_entry {
                         Ok(d) => {
-                            kdebug!("dir_entry ok");
+                            // kdebug!("dir_entry ok");
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                             return Ok((self.current_cluster, self.offset, Some(d)));
                         }
 
                         Err(e) => {
-                            kdebug!("dir_entry err,  e={}", e);
+                            // kdebug!("dir_entry err,  e={}", e);
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                         }
                     }
                 }
                 FATRawDirEntry::Free => {
-                    kdebug!("FATRawDirEntry::Free");
                     // 当前目录项是空的
                     self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                 }
                 FATRawDirEntry::FreeRest => {
-                    kdebug!("FATRawDirEntry::FreeRest");
                     // 当前目录项是空的，且之后都是空的，因此直接返回
                     return Ok((self.current_cluster, self.offset, None));
                 }
@@ -1584,7 +1561,6 @@ impl FATDirEntry {
         mut long_name_entries: Vec<FATRawDirEntry>,
         loc: ((Cluster, u64), (Cluster, u64)),
     ) -> Result<Self, i32> {
-
         if long_name_entries.is_empty() {
             return Err(-(EINVAL as i32));
         }
@@ -1601,12 +1577,10 @@ impl FATDirEntry {
             _ => unreachable!(),
         };
 
-
         let mut extractor = LongNameExtractor::new();
         for entry in &long_name_entries {
             match entry {
                 &FATRawDirEntry::Long(l) => {
-                    kdebug!("process long={l:?}");
                     extractor.process(l)?;
                 }
 
@@ -2325,17 +2299,15 @@ impl Iterator for FATDirEntryOffsetIter {
         let mut new_cluster: Cluster = r.0;
         // 越过了当前簇,则获取下一个簇
         if new_offset >= self.fs.bytes_per_cluster() {
-            kdebug!("cross the cluster, current cluster={:?}", self.current_offset);
             new_offset %= self.fs.bytes_per_cluster();
             let raw = self.fs.get_fat_entry_raw(new_cluster);
-            kdebug!("raw={raw:?}");
+
             match self.fs.get_fat_entry(new_cluster) {
                 Ok(FATEntry::Next(c)) => {
                     new_cluster = c;
                 }
                 // 没有下一个簇了
                 _ => {
-                    kwarn!("no next cluster.");
                     self.fin = true;
                 }
             }
@@ -2348,7 +2320,7 @@ impl Iterator for FATDirEntryOffsetIter {
         // 更新当前迭代的偏移量
         self.current_offset = (new_cluster, new_offset);
         self.index += 1;
-        kdebug!("return {r:?}");
+
         return Some(r);
     }
 }

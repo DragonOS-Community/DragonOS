@@ -209,9 +209,14 @@ fn __as_any_ref<T: Any>(x: &T) -> &dyn core::any::Any {
 
 /// @brief procfs测试函数
 pub fn _test_procfs(pid: i64) {
-    // __test_procfs(pid);
+    __test_procfs(pid);
 }
 
+pub fn _test_procfs_2(pid: i64) {
+    __test_procfs_2(pid);
+}
+
+// 进程注册测试
 fn __test_procfs(pid: i64) {
     kdebug!("to register pid: {}", pid);
     // 获取procfs实例
@@ -246,4 +251,25 @@ fn __test_procfs(pid: i64) {
     kdebug!("size = {}, data={:?}", size, buf);
     let buf = String::from_utf8(buf).unwrap();
     kdebug!("data for /proc/{}/status: {}", pid, buf);
+}
+
+// 解除进程注册测试
+fn __test_procfs_2(pid: i64){
+    // 获取procfs实例
+    let _p = ROOT_INODE.find("proc").unwrap();
+
+    let procfs_inode = _p.downcast_ref::<LockedProcFSInode>().unwrap();
+    let fs = procfs_inode.fs();
+    let fs = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
+    kdebug!("to procfs_register_pid");
+    // 调用解除注册函数
+    fs.procfs_unregister_pid(pid).expect("unregister pid failed");
+
+    kdebug!("procfs_unregister_pid:{} ok", pid);
+
+    // 查看进程文件夹是否存在
+    kdebug!(
+        "proc.list()={:?}",
+        _p.list().expect("list /proc failed.")
+    );
 }

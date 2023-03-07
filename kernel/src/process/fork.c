@@ -9,6 +9,7 @@ extern long process_global_pid;
 
 extern void kernel_thread_func(void);
 extern void rs_procfs_register_pid(uint64_t);
+extern void rs_procfs_unregister_pid(uint64_t);
 
 int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
@@ -150,6 +151,7 @@ copy_thread_failed:;
 copy_files_failed:;
     // 回收文件
     process_exit_files(tsk);
+    rs_procfs_unregister_pid(tsk->pid);
 copy_sighand_failed:;
     process_exit_sighand(tsk);
 copy_signal_failed:;

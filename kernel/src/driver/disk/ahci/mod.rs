@@ -133,6 +133,7 @@ pub fn ahci_rust_init() -> Result<(), i32> {
 }
 
 /// @brief: 获取所有的 disk
+#[allow(dead_code)]
 pub fn disks() -> Vec<Arc<LockedAhciDisk>> {
     let disks_list = LOCKED_DISKS_LIST.lock();
     return disks_list.clone();
@@ -184,6 +185,5 @@ pub fn __test_ahci() {
     }
     // _dd.write_at(123, 2, &buf).unwrap();
     let mut read_buf2 = [0u8; 3000usize];
-    kdebug!("ptr = 0x{:016x}", unsafe { get_rsp() as usize });
     _dd.read_at(122, 4, &mut read_buf2).unwrap();
 }

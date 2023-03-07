@@ -1,11 +1,12 @@
-use core::{intrinsics::size_of};
+use core::intrinsics::size_of;
 
 use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
+    format,
     string::{String, ToString},
     sync::{Arc, Weak},
-    vec::Vec, format,
+    vec::Vec,
 };
 
 use crate::{
@@ -100,10 +101,9 @@ pub struct ProcFSInode {
 
 /// 对ProcFSInode实现获取各类文件信息的函数
 impl ProcFSInode {
-
     /// @brief 去除Vec中所有的\0,并在结尾添加\0
     #[inline]
-    fn trim_string(&self, data: &mut Vec<u8>){
+    fn trim_string(&self, data: &mut Vec<u8>) {
         data.drain_filter(|x: &mut u8| *x == 0);
         data.push(0);
     }
@@ -131,16 +131,42 @@ impl ProcFSInode {
         for val in pcb.name.iter() {
             tmp_name.push(*val as u8);
         }
-        kdebug!("pcb.tmp_name={}", String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string()));
-        
-        pdata.append(&mut format!("Name:\t{}", String::from_utf8(tmp_name).unwrap_or("NULL".to_string())).as_bytes().to_owned());
+        kdebug!(
+            "pcb.tmp_name={}",
+            String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
+        );
+
+        pdata.append(
+            &mut format!(
+                "Name:\t{}",
+                String::from_utf8(tmp_name).unwrap_or("NULL".to_string())
+            )
+            .as_bytes()
+            .to_owned(),
+        );
         pdata.append(&mut format!("\nstate:\t{}", pcb.state).as_bytes().to_owned());
         pdata.append(&mut format!("\npid:\t{}", pcb.pid).as_bytes().to_owned());
-        pdata.append(&mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid)
+                .as_bytes()
+                .to_owned(),
+        );
         pdata.append(&mut format!("\ncpu_id:\t{}", pcb.cpu_id).as_bytes().to_owned());
-        pdata.append(&mut format!("\npriority:\t{}", pcb.priority).as_bytes().to_owned());
-        pdata.append(&mut format!("\npreempt:\t{}", pcb.preempt_count).as_bytes().to_owned());
-        pdata.append(&mut format!("\nvrtime:\t{}", pcb.virtual_runtime).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\npriority:\t{}", pcb.priority)
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\npreempt:\t{}", pcb.preempt_count)
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\nvrtime:\t{}", pcb.virtual_runtime)
+                .as_bytes()
+                .to_owned(),
+        );
 
         // 当前进程运行过程中占用内存的峰值
         let hiwater_vm: u64 =
@@ -150,7 +176,11 @@ impl ProcFSInode {
         // 进程代码的大小
         let data: u64 = unsafe { *pcb.mm }.data_addr_end - unsafe { *pcb.mm }.data_addr_start;
 
-        pdata.append(&mut format!("\nVmPeak:\t{} kB", hiwater_vm).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\nVmPeak:\t{} kB", hiwater_vm)
+                .as_bytes()
+                .to_owned(),
+        );
         pdata.append(&mut format!("\nVmData:\t{} kB", data).as_bytes().to_owned());
         pdata.append(&mut format!("\nVmExe:\t{} kB\n", text).as_bytes().to_owned());
 
@@ -271,24 +301,23 @@ impl ProcFS {
     }
 
     /// @brief 解除进程注册
-    /// 
-    pub fn procfs_unregister_pid(&self, pid: i64)-> Result<(), i32> {
+    ///
+    pub fn procfs_unregister_pid(&self, pid: i64) -> Result<(), i32> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
         let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).unwrap();
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
-        
+
         // 查看进程文件是否还存在
         // let pf= pid_dir.find("status").expect("Cannot find status");
 
         // 删除进程文件夹
         proc.unlink(&format!("{}", pid))?;
-        
+
         return Ok(());
     }
-
 }
 
 impl IndexNode for LockedProcFSInode {
@@ -377,8 +406,8 @@ impl IndexNode for LockedProcFSInode {
         &self,
         offset: usize,
         len: usize,
-        buf: &mut [u8],
-        data: &mut FilePrivateData,
+        buf: &[u8],
+        _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         if buf.len() < len {
             return Err(-(EINVAL as i32));

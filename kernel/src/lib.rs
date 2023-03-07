@@ -43,7 +43,7 @@ use mm::allocator::KernelAllocator;
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
-    filesystem::vfs::core::{__test_filesystem,_test_procfs},
+    filesystem::vfs::core::{__test_filesystem, _test_procfs},
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
 };
 
@@ -97,7 +97,7 @@ pub extern "C" fn __rust_demo_func() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn rs_procfs_register_pid(pid: i64){
+pub extern "C" fn rs_procfs_register_pid(pid: i64) {
     _test_procfs(pid);
 }
 

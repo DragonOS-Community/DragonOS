@@ -1,7 +1,6 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
-use crate::include::bindings::bindings::{
-    E2BIG, ENOTSUP, E_NOEMPTYSLOT, E_PORT_HUNG, E_TASK_FILE_ERROR,
-};
+use crate::filesystem::mbr::MbrDiskPartionTable;
+use crate::include::bindings::bindings::{E2BIG, E_NOEMPTYSLOT, E_PORT_HUNG, E_TASK_FILE_ERROR};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::{
     driver::disk::ahci::{
@@ -13,22 +12,21 @@ use crate::{
     },
     kerror,
 };
-use crate::{filesystem::mbr::MbrDiskPartionTable, kdebug};
 use crate::{
     include::bindings::bindings::HBA_PxIS_TFES,
     io::{device::BlockDevice, disk_info::Partition, SeekFrom},
 };
 use alloc::sync::Weak;
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::ptr::addr_of;
+
+use core::fmt::Debug;
 use core::sync::atomic::compiler_fence;
-use core::{fmt::Debug, ptr::read_unaligned};
 use core::{mem::size_of, ptr::write_bytes};
 
 /// @brief: 只支持MBR分区格式的磁盘结构体
 pub struct AhciDisk {
     pub name: String,
-    pub flags: u16,                  // 磁盘的状态flags
+    pub flags: u16,                      // 磁盘的状态flags
     pub partitions: Vec<Arc<Partition>>, // 磁盘分区数组
     // port: &'static mut HbaPort,      // 控制硬盘的端口
     pub ctrl_num: u8,
@@ -167,8 +165,8 @@ impl AhciDisk {
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
-        kdebug!("To wait ahci read complete.");
-        // 等待操作完成
+                                                     // kdebug!("To wait ahci read complete.");
+                                                     // 等待操作完成
         loop {
             if (volatile_read!(port.ci) & (1 << slot)) == 0 {
                 break;
@@ -305,7 +303,8 @@ impl AhciDisk {
     }
 
     fn sync(&self) -> Result<(), i32> {
-        return Err(-(ENOTSUP as i32));
+        // 由于目前没有block cache, 因此sync返回成功即可
+        return Ok(());
     }
 }
 
@@ -364,7 +363,7 @@ impl LockedAhciDisk {
         cursor.seek(SeekFrom::SeekCurrent(446))?;
 
         for i in 0..4 {
-            kdebug!("infomation of partition {}:\n", i);
+            // kdebug!("infomation of partition {}:\n", i);
 
             table.dpte[i].flags = cursor.read_u8()?;
             table.dpte[i].starting_head = cursor.read_u8()?;
@@ -375,12 +374,12 @@ impl LockedAhciDisk {
             table.dpte[i].starting_lba = cursor.read_u32()?;
             table.dpte[i].total_sectors = cursor.read_u32()?;
 
-            kdebug!("dpte[i] = {:?}", table.dpte[i]);
+            // kdebug!("dpte[i] = {:?}", table.dpte[i]);
         }
         table.bs_trailsig = cursor.read_u16()?;
-        kdebug!("bs_trailsig = {}", unsafe {
-            read_unaligned(addr_of!(table.bs_trailsig))
-        });
+        // kdebug!("bs_trailsig = {}", unsafe {
+        //     read_unaligned(addr_of!(table.bs_trailsig))
+        // });
 
         return Ok(table);
     }
@@ -404,7 +403,10 @@ impl BlockDevice for LockedAhciDisk {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, i32> {
-        kdebug!("ahci read at {lba_id_start}, count={count}, lock={:?}", self.0);
+        // kdebug!(
+        //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
+        //     self.0
+        // );
         return self.0.lock().read_at(lba_id_start, count, buf);
     }
 

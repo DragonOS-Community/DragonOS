@@ -12,7 +12,9 @@ use crate::{
         core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, FsInfo, IndexNode,
         Metadata, PollStatus,
     },
-    include::bindings::bindings::{EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, ENOTSUP, EPERM, EROFS},
+    include::bindings::bindings::{
+        EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM, EROFS,
+    },
     io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kdebug, kerror,
     libs::{
@@ -349,10 +351,10 @@ impl FATFileSystem {
         // cluster对应的FAT表项在分区内的字节偏移量
         let fat_bytes_offset =
             fat_type.get_fat_bytes_offset(cluster, fat_start_sector, bytes_per_sec);
-        
+
         // FAT表项所在的LBA地址
         // let fat_ent_lba = self.get_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
-        let fat_ent_lba = self.partition.lba_start + fat_bytes_offset/LBA_SIZE as u64;
+        let fat_ent_lba = self.partition.lba_start + fat_bytes_offset / LBA_SIZE as u64;
 
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
@@ -1490,6 +1492,40 @@ impl IndexNode for LockedFATInode {
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
         return Ok(());
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), i32> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let target: Arc<LockedFATInode> = guard.find(name)?;
+        // 对目标inode上锁，以防更改
+        let target_guard: SpinLockGuard<FATInode> = target.0.lock();
+        // 先从缓存删除
+        guard.children.remove(&name.to_uppercase());
+
+        let dir = match &guard.inode_type {
+            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
+                return Err(-(ENOTDIR as i32));
+            }
+            FATDirEntry::Dir(d) => d,
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(-(EROFS as i32));
+            }
+        };
+
+        // 再从磁盘删除
+        let r: Result<(), i32> = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
+        if r.is_ok() {
+            return r;
+        } else {
+            let r = r.unwrap_err();
+            if r == -(ENOTEMPTY as i32) {
+                // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
+                drop(target_guard);
+                guard.children.insert(name.to_uppercase(), target);
+            }
+            return Err(r);
+        }
     }
 }
 

@@ -43,22 +43,18 @@ lazy_static! {
         let ramfs = RamFS::new();
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.root_inode();
-        test_fatfs();
-        kdebug!("test done2");
-        loop {
-            spin_loop();
-        }
+        
 
-        // // 创建文件夹
-        // root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
-        // root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
-        // // 创建procfs实例
-        // let procfs = ProcFS::new();
-        // kdebug!("proc created");
-        // kdebug!("root inode.list()={:?}", root_inode.list());
-        // // procfs挂载
-        // let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
-        // kdebug!("root inode.list()={:?}", root_inode.list());
+        // 创建文件夹
+        root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
+        root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
+        // 创建procfs实例
+        let procfs = ProcFS::new();
+        kdebug!("proc created");
+        kdebug!("root inode.list()={:?}", root_inode.list());
+        // procfs挂载
+        let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
+        kdebug!("root inode.list()={:?}", root_inode.list());
         root_inode
     };
 }
@@ -140,44 +136,63 @@ fn test_fatfs() {
     // ======== 测试创建文件夹 ============
 
     // kdebug!(" to create dir 'test_create'.");
-    let r: Result<Arc<dyn IndexNode>, i32> = fat_root.create("test_create", FileType::Dir, 0o777);
-    kdebug!("test_create  r={r:?}");
-    let test_create_inode = r.unwrap();
-    fat_root.create("test1", FileType::Dir, 0o777);
-    let test2 = fat_root.create("test2", FileType::Dir, 0o777).unwrap();
+    // let r: Result<Arc<dyn IndexNode>, i32> = fat_root.create("test_create", FileType::Dir, 0o777);
+    // kdebug!("test_create  r={r:?}");
+    // let test_create_inode = r.unwrap();
+    // fat_root.create("test1", FileType::Dir, 0o777);
+    // let test2 = fat_root.create("test2", FileType::Dir, 0o777).unwrap();
 
-    let test_create_inode = fat_root.create("test3", FileType::Dir, 0o777).unwrap();
+    // let test_create_inode = fat_root.create("test3", FileType::Dir, 0o777).unwrap();
     // fat_root.create("test4", FileType::Dir, 0o777);
     // fat_root.create("test5", FileType::Dir, 0o777);
     // fat_root.create("test6", FileType::Dir, 0o777);
     kdebug!("fat_root.list={:?}", fat_root.list());
-    kdebug!("test_create_inode.list={:?}", test_create_inode.list());
-    kdebug!("test_create_inode.metadata()={:?}", test_create_inode.metadata());
-    // !!!!!!!!!!!! 这里创建文件夹会出错，而创建test_create不出错。
-    let r = test_create_inode.create("test_dir", FileType::Dir, 0o777);
-    kdebug!("test_dir  r={r:?}");
-    let test_dir = r.unwrap();
-    kdebug!("test_dir.list = {:?}", test_dir.list());
-    let r = test_create_inode.create("test_file", FileType::File, 0o777);
-    kdebug!("create test_file  r={r:?}");
-    let test_file = File::new(test_create_inode.find("test_file").unwrap(), O_RDWR);
-    kdebug!("test_file  r={test_file:?}");
-    let mut test_file = test_file.unwrap();
-    kdebug!("test_file metadata = {:?}", test_file.metadata());
-    let mut buf:Vec<u8> = Vec::new();
-    for i in 0..10{
-        buf.append(&mut format!("{}\n", i).as_bytes().to_vec());
-    }
-    let r = test_file.write(buf.len(), &buf);
-    kdebug!("write file, r= {r:?}");
+    // kdebug!("test_create_inode.list={:?}", test_create_inode.list());
+    // kdebug!("test_create_inode.metadata()={:?}", test_create_inode.metadata());
 
-    buf.clear();
-    buf.resize(64, 0);
-    let r = test_file.read(64, &mut buf);
-    kdebug!("read test_file, r={r:?}");
-    for x in buf.iter(){
-        print!("{}", *x as char);
-    }
+    // let r = test_create_inode.create("test_dir", FileType::Dir, 0o777);
+    // kdebug!("test_dir  r={r:?}");
+    // let test_dir = r.unwrap();
+    // kdebug!("test_dir.list = {:?}", test_dir.list());
+    // let r = test_create_inode.create("test_file", FileType::File, 0o777);
+    // kdebug!("create test_file  r={r:?}");
+    // let r = test_create_inode.create("test_file2", FileType::File, 0o777);
+    // kdebug!("create test_file2  r={r:?}");
+    // let test_file = File::new(test_create_inode.find("test_file").unwrap(), O_RDWR);
+    // kdebug!("test_file  r={test_file:?}");
+    // let mut test_file2 = File::new(test_create_inode.find("test_file2").unwrap(), O_RDWR).unwrap();
+    // kdebug!("test_file2  r={test_file2:?}");
+    // let mut test_file = test_file.unwrap();
+    // kdebug!("test_file metadata = {:?}", test_file.metadata());
+    // let mut buf:Vec<u8> = Vec::new();
+    // for i in 0..10{
+    //     buf.append(&mut format!("{}\n", i).as_bytes().to_vec());
+    // }
+    // let r = test_file.write(buf.len(), &buf);
+    // kdebug!("write file, r= {r:?}");
+    // let r = test_file2.write(buf.len(), &buf);
+    // kdebug!("write file, r= {r:?}");
+
+    // buf.clear();
+    // buf.resize(64, 0);
+    // let r = test_file.read(64, &mut buf);
+    // kdebug!("read test_file, r={r:?}");
+    // for x in buf.iter(){
+    //     print!("{}", *x as char);
+    // }
+
+
+    // 测试删除文件
+
+    let test3 = fat_root.find("test3").unwrap();
+    let r = test3.unlink("test_dir");
+    kdebug!("r = {r:?}");
+    
+    let a = test3.find("test_dir").unwrap().unlink("a");
+    assert!(a.is_ok());
+    let r = test3.unlink("test_dir");
+    assert!(r.is_ok());
+    
     
 
     kdebug!("test_done");

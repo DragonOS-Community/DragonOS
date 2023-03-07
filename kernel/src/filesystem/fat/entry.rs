@@ -854,8 +854,7 @@ impl FATDir {
         old_name: &str,
         new_name: &str,
     ) -> Result<FATDirEntry, i32> {
-        // https://redox.longjin666.cn/xref/redox-fatfs/src/dir_entry.rs?r=7c4cda40#368
-
+        
         // 判断源目录项是否存在
         let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
             self.check_existence(old_name, None, fs.clone())?
@@ -1585,7 +1584,7 @@ impl FATDirEntry {
         mut long_name_entries: Vec<FATRawDirEntry>,
         loc: ((Cluster, u64), (Cluster, u64)),
     ) -> Result<Self, i32> {
-        kdebug!("new1");
+
         if long_name_entries.is_empty() {
             return Err(-(EINVAL as i32));
         }
@@ -1602,7 +1601,7 @@ impl FATDirEntry {
             _ => unreachable!(),
         };
 
-        kdebug!("new2");
+
         let mut extractor = LongNameExtractor::new();
         for entry in &long_name_entries {
             match entry {
@@ -1618,7 +1617,6 @@ impl FATDirEntry {
         }
         // 检验校验和是否正确
         if extractor.validate_checksum(&short_dentry) {
-            kdebug!("new3, short_dentry = {short_dentry:?}");
             // 校验和正确，返回一个长目录项
             return Ok(short_dentry.to_dir_entry_with_long_name(extractor.to_string(), loc));
         } else {

@@ -509,6 +509,10 @@ ul initial_kernel_thread(ul arg)
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
     __rust_demo_func();
+    while (1)
+    {
+        /* code */
+    }
 
     // 对completion完成量进行测试
     // __test_completion();

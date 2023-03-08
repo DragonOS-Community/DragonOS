@@ -232,7 +232,7 @@ impl process_control_block {
     /// @param fd 文件描述符序号
     pub fn drop_fd(&self, fd: i32) -> Result<(), i32> {
         // 判断文件描述符的数字是否超过限制
-        if fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
+        if !FileDescriptorVec::validate_fd(fd) {
             return Err(-(EBADF as i32));
         }
         let r: &mut FileDescriptorVec = FileDescriptorVec::from_pcb(current_pcb()).unwrap();

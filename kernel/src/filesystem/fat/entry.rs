@@ -1512,7 +1512,7 @@ impl FATDirIter {
                             return Ok((self.current_cluster, self.offset, Some(d)));
                         }
 
-                        Err(e) => {
+                        Err(_) => {
                             // kdebug!("dir_entry err,  e={}", e);
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                         }

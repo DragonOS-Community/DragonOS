@@ -140,32 +140,15 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
  * @brief 打开要执行的程序文件
  *
  * @param path
- * @return struct vfs_file_t*
+ * @return int 文件描述符编号
  */
 struct vfs_file_t *process_open_exec_file(char *path)
 {
-    struct vfs_dir_entry_t *dentry = NULL;
-    struct vfs_file_t *filp = NULL;
-    // kdebug("path=%s", path);
-    dentry = vfs_path_walk(path, 0);
-
-    if (dentry == NULL)
-        return (void *)-ENOENT;
-
-    if (dentry->dir_inode->attribute == VFS_IF_DIR)
-        return (void *)-ENOTDIR;
-
-    filp = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
-    if (filp == NULL)
-        return (void *)-ENOMEM;
-
-    filp->position = 0;
-    filp->mode = 0;
-    filp->dEntry = dentry;
-    filp->mode = ATTR_READ_ONLY;
-    filp->file_ops = dentry->dir_inode->file_ops;
-
-    return filp;
+    struct pt_regs tmp = {0};
+    tmp.r8 = (uint64_t)path;
+    tmp.r9 = O_RDONLY;
+    int fd = sys_open(&tmp);
+    return fd;
 }
 
 /**
@@ -178,19 +161,32 @@ struct vfs_file_t *process_open_exec_file(char *path)
 static int process_load_elf_file(struct pt_regs *regs, char *path)
 {
     int retval = 0;
-    struct vfs_file_t *filp = process_open_exec_file(path);
+    int fd = process_open_exec_file(path);
 
-    if ((long)filp <= 0 && (long)filp >= -255)
+    if ((long)fd <= 0)
     {
-        kdebug("(long)filp=%ld", (long)filp);
-        return (unsigned long)filp;
+        kdebug("(long)fd=%ld", (long)fd);
+        return (unsigned long)fd;
     }
 
     void *buf = kmalloc(PAGE_4K_SIZE, 0);
     memset(buf, 0, PAGE_4K_SIZE);
     uint64_t pos = 0;
-    pos = filp->file_ops->lseek(filp, 0, SEEK_SET);
-    retval = filp->file_ops->read(filp, (char *)buf, sizeof(Elf64_Ehdr), &pos);
+
+    struct pt_regs tmp_use_fs = {0};
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = 0;
+    tmp_use_fs.r10 = SEEK_SET;
+    retval = sys_lseek(&tmp_use_fs);
+
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = (uint64_t)buf;
+    tmp_use_fs.r10 = sizeof(Elf64_Ehdr);
+    retval = sys_read(&tmp_use_fs);
+    if (retval != sizeof(Elf64_Ehdr))
+    {
+        kerror("retval=%d, not equal to sizeof(Elf64_Ehdr):%d", retval, sizeof(Elf64_Ehdr));
+    }
     retval = 0;
     if (!elf_check(buf))
     {

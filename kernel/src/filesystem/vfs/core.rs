@@ -20,9 +20,9 @@ use crate::{
         ramfs::RamFS,
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
-    include::bindings::bindings::{ENAMETOOLONG, ENOENT, ENOTDIR, O_RDONLY, O_RDWR, PAGE_4K_SIZE},
+    include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
     io::SeekFrom,
-    kdebug, kerror, print, println,
+    kdebug, kerror, println,
 };
 
 use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
@@ -327,3 +327,52 @@ pub fn do_open(path: &str, mode: FileMode) -> Result<i32, i32> {
     return current_pcb().alloc_fd(file);
 }
 
+/// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
+///
+/// @param fd 文件描述符编号
+/// @param buf 输出缓冲区。
+///
+/// @return Ok(usize) 成功读取的数据的字节数
+/// @return Err(i32) 读取失败，返回posix错误码
+pub fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
+    let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+    if file.is_none() {
+        return Err(-(EBADF as i32));
+    }
+    let file: &mut File = file.unwrap();
+
+    return file.read(buf.len(), buf);
+}
+
+/// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
+///
+/// @param fd 文件描述符编号
+/// @param buf 输入缓冲区。
+///
+/// @return Ok(usize) 成功写入的数据的字节数
+/// @return Err(i32) 写入失败，返回posix错误码
+pub fn do_write(fd: i32, buf: &[u8]) -> Result<usize, i32> {
+    let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+    if file.is_none() {
+        return Err(-(EBADF as i32));
+    }
+    let file: &mut File = file.unwrap();
+
+    return file.write(buf.len(), buf);
+}
+
+/// @brief 调整文件操作指针的位置
+///
+/// @param fd 文件描述符编号
+/// @param seek 调整的方式
+///
+/// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
+/// @return Err(i32) 调整失败，返回posix错误码
+pub fn do_lseek(fd: i32, seek: SeekFrom) -> Result<usize, i32> {
+    let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+    if file.is_none() {
+        return Err(-(EBADF as i32));
+    }
+    let file: &mut File = file.unwrap();
+    return file.lseek(seek);
+}

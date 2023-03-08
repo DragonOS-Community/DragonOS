@@ -36,3 +36,4 @@
 #include <sched/sched.h>
 #include <time/sleep.h>
 #include <mm/mm-types.h>
+#include <smp/smp.h>

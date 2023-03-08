@@ -25,10 +25,14 @@
 
 #define O_NONBLOCK 00004000 // 非阻塞式IO模式
 
-#define O_EXEC 00010000      // 以仅执行的方式打开（非目录文件）
-#define O_SEARCH 00020000    // Open the directory for search only
-#define O_DIRECTORY 00040000 // 打开的必须是一个目录
-#define O_NOFOLLOW 00100000  // Do not follow symbolic links
+#define O_DSYNC 00010000  // used to be O_SYNC, see below
+#define FASYNC 00020000   // fcntl, for BSD compatibility
+#define O_DIRECT 00040000 // direct disk access hint
+#define O_LARGEFILE 00100000
+#define O_DIRECTORY 00200000 // 打开的必须是一个目录
+#define O_NOFOLLOW 00400000  // Do not follow symbolic links
+#define O_NOATIME 01000000
+#define O_CLOEXEC 02000000 // set close_on_exec
 
 /*
  * The constants AT_REMOVEDIR and AT_EACCESS have the same value.  AT_EACCESS is

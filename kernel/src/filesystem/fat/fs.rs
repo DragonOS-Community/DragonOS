@@ -1165,7 +1165,13 @@ impl FATFileSystem {
 
 impl Drop for FATFileSystem {
     fn drop(&mut self) {
-        self.umount();
+        let r = self.umount();
+        if r.is_err() {
+            kerror!(
+                "Umount FAT filesystem failed: errno={}, FS detail:{self:?}",
+                r.unwrap_err()
+            );
+        }
     }
 }
 

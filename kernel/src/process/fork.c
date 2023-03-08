@@ -11,7 +11,7 @@ extern void kernel_thread_func(void);
 extern void rs_procfs_register_pid(uint64_t);
 extern void rs_procfs_unregister_pid(uint64_t);
 
-int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
+extern int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
@@ -178,35 +178,6 @@ int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb)
     return 0;
 }
 
-/**
- * @brief 拷贝当前进程的文件描述符等信息
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb)
-{
-    int retval = 0;
-    // 如果CLONE_FS被置位，那么子进程与父进程共享文件描述符
-    // 文件描述符已经在复制pcb时被拷贝
-    if (clone_flags & CLONE_FS)
-        return retval;
-
-    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
-    process_open_stdio(current_pcb);
-    // 为新进程拷贝新的文件描述符
-    for (int i = 3; i < PROC_MAX_FD_NUM; ++i)
-    {
-        if (current_pcb->fds[i] == NULL)
-            continue;
-
-        pcb->fds[i] = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
-        memcpy(pcb->fds[i], current_pcb->fds[i], sizeof(struct vfs_file_t));
-    }
-
-    return retval;
-}
 
 /**
  * @brief 拷贝当前进程的内存空间分布结构体信息

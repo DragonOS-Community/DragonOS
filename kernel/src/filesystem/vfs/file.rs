@@ -1,16 +1,21 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{ffi::c_void, mem::MaybeUninit};
+
+use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
-    include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE},
+    include::bindings::bindings::{
+        process_control_block, EFAULT, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
+    },
     io::SeekFrom,
     kdebug,
+    libs::spinlock::SpinLock,
 };
 
 use super::{FileType, IndexNode, Metadata};
 
 /// 文件私有信息的枚举类型
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FilePrivateData {
     // procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
@@ -24,51 +29,62 @@ impl Default for FilePrivateData {
     }
 }
 
-/// @brief 文件打开模式
-/// 其中，低2bit组合而成的数字的值，用于表示访问权限。其他的bit，才支持通过按位或的方式来表示参数
-#[repr(u32)]
-#[derive(PartialEq)]
-#[allow(non_camel_case_types)]
-pub enum FileMode {
+bitflags! {
+    /// @brief 文件打开模式
+    /// 其中，低2bit组合而成的数字的值，用于表示访问权限。其他的bit，才支持通过按位或的方式来表示参数
+    ///
+    /// 与Linux 5.19.10的uapi/asm-generic/fcntl.h相同
+    /// https://opengrok.ringotek.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
+    pub struct FileMode: u32{
     /* File access modes for `open' and `fcntl'.  */
     /// Open Read-only
-    O_RDONLY = 0,
+    const O_RDONLY = 0;
     /// Open Write-only
-    O_WRONLY = 1,
+    const O_WRONLY = 1;
     /// Open read/write
-    O_RDWR = 2,
+    const O_RDWR = 2;
     /// Mask for file access modes
-    O_ACCMODE = 00000003,
+    const O_ACCMODE = 00000003;
 
     /* Bits OR'd into the second argument to open.  */
     /// Create file if it does not exist
-    O_CREAT = 0000010,
+    const O_CREAT = 00000100;
     /// Fail if file already exists
-    O_EXCL = 0000020,
+    const O_EXCL = 00000200;
     /// Do not assign controlling terminal
-    O_NOCTTY = 0000040,
+    const O_NOCTTY = 00000400;
     /// 文件存在且是普通文件，并以O_RDWR或O_WRONLY打开，则它会被清空
-    O_TRUNC = 0000100,
+    const O_TRUNC = 00001000;
     /// 文件指针会被移动到文件末尾
-    O_APPEND = 0000200,
+    const O_APPEND = 00002000;
     /// 非阻塞式IO模式
-    O_NONBLOCK = 0000400,
-    /// 以仅执行的方式打开（非目录文件）
-    O_EXEC = 0001000,
-    /// Open the directory for search only
-    O_SEARCH = 0002000,
+    const O_NONBLOCK = 00004000;
+    /// used to be O_SYNC, see below
+    const O_DSYNC = 00010000;
+    /// fcntl, for BSD compatibility
+    const FASYNC = 00020000;
+    /* direct disk access hint */
+    const O_DIRECT = 00040000;
+    const O_LARGEFILE = 00100000;
     /// 打开的必须是一个目录
-    O_DIRECTORY = 0004000,
+    const O_DIRECTORY = 00200000;
     /// Do not follow symbolic links
-    O_NOFOLLOW = 0010000,
+    const O_NOFOLLOW = 00400000;
+    const O_NOATIME = 01000000;
+    /// set close_on_exec
+    const O_CLOEXEC = 02000000;
+    }
 }
 
 /// @brief 抽象文件结构体
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct File {
     inode: Arc<dyn IndexNode>,
     offset: usize,
-    mode: u32,
+    /// 文件的打开模式
+    mode: FileMode,
+    /// 文件类型
+    file_type: FileType,
     private_data: FilePrivateData,
 }
 
@@ -77,11 +93,13 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mode: u32) -> Result<Self, i32> {
+    pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, i32> {
+        let file_type: FileType = inode.metadata()?.file_type;
         let mut f = File {
             inode,
             offset: 0,
             mode,
+            file_type,
             private_data: FilePrivateData::default(),
         };
         // kdebug!("inode:{:?}",f.inode);
@@ -176,7 +194,7 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), i32> {
         // 暂时认为只要不是write only, 就可读
-        if self.mode == FileMode::O_WRONLY as u32 {
+        if self.mode == FileMode::O_WRONLY {
             return Err(-(EPERM as i32));
         }
 
@@ -187,7 +205,7 @@ impl File {
     #[inline]
     pub fn writeable(&self) -> Result<(), i32> {
         // 暂时认为只要不是read only, 就可写
-        if self.mode == FileMode::O_RDONLY as u32 {
+        if self.mode == FileMode::O_RDONLY {
             return Err(-(EPERM as i32));
         }
 
@@ -198,5 +216,54 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         self.inode.close(&mut self.private_data).ok();
+    }
+}
+
+/// @brief pcb里面的文件描述符数组
+#[derive(Debug, Clone)]
+pub struct FileDescriptorVec {
+    /// 当前进程打开的文件描述符
+    pub fds: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD],
+}
+
+impl FileDescriptorVec {
+    pub const PROCESS_MAX_FD: usize = 32;
+
+    pub fn new() -> Box<FileDescriptorVec> {
+        // 先声明一个未初始化的数组
+        let mut data: [MaybeUninit<Option<Box<File>>>; FileDescriptorVec::PROCESS_MAX_FD] =
+            unsafe { MaybeUninit::uninit().assume_init() };
+
+        // 逐个把每个元素初始化为None
+        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            data[i] = MaybeUninit::new(None);
+        }
+        // 由于一切都初始化完毕，因此将未初始化的类型强制转换为已经初始化的类型
+        let data: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD] = unsafe {
+            core::mem::transmute::<_, [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD]>(data)
+        };
+
+        // 初始化文件描述符数组结构体
+        return Box::new(FileDescriptorVec { fds: data });
+    }
+
+    /// @brief 从pcb的fds字段，获取文件描述符数组的可变引用
+    #[inline]
+    pub fn from_pcb(pcb: &'static process_control_block) -> Option<&'static mut FileDescriptorVec> {
+        return unsafe { (pcb.fds as usize as *mut FileDescriptorVec).as_mut() };
+    }
+
+    /// @brief 判断文件描述符序号是否合法
+    /// 
+    /// @return true 合法
+    /// 
+    /// @return false 不合法
+    #[inline]
+    pub fn validate_fd(fd: i32) -> bool {
+        if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
+            return false;
+        } else {
+            return true;
+        }
     }
 }

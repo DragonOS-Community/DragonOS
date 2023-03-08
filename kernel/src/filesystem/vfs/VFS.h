@@ -251,13 +251,6 @@ struct vfs_index_node_t *vfs_alloc_inode();
 
 uint64_t do_open(const char *filename, int flags, bool from_user);
 
-/**
- * @brief 关闭文件
- *
- * @param fd_num 文件描述符
- * @return uint64_t 错误码
- */
-uint64_t vfs_close(int fd_num);
 
 /**
  * @brief 创建文件夹

@@ -23,6 +23,15 @@ extern uint64_t sys_sigaction(struct pt_regs *regs);
 extern uint64_t sys_rt_sigreturn(struct pt_regs *regs);
 extern uint64_t sys_getpid(struct pt_regs *regs);
 extern uint64_t sys_sched(struct pt_regs *regs);
+/**
+ * @brief 关闭文件系统调用
+ *
+ * @param fd_num 文件描述符号
+ *
+ * @param regs
+ * @return uint64_t
+ */
+extern uint64_t sys_close(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -123,22 +132,6 @@ ul sys_put_string(struct pt_regs *regs)
     // printk_color(BLACK, WHITE, (char *)regs->r8);
 
     return 0;
-}
-
-/**
- * @brief 关闭文件系统调用
- *
- * @param fd_num 文件描述符号
- *
- * @param regs
- * @return uint64_t
- */
-uint64_t sys_close(struct pt_regs *regs)
-{
-    int fd_num = (int)regs->r8;
-
-    // kdebug("sys close: fd=%d", fd_num);
-    return vfs_close(fd_num);
 }
 
 /**

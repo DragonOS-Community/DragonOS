@@ -69,7 +69,7 @@ pub struct ProcFS {
     root_inode: Arc<LockedProcFSInode>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProcfsFilePrivateData {
     data: Vec<u8>,
 }

@@ -50,6 +50,7 @@ extern struct sighand_struct INITIAL_SIGHAND;
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
+extern int process_init_files();
 
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                             \
@@ -86,7 +87,7 @@ struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_
  * @param pcb 要被回收的进程的pcb
  * @return uint64_t
  */
-uint64_t process_exit_files(struct process_control_block *pcb);
+extern int process_exit_files(struct process_control_block *pcb);
 
 /**
  * @brief 释放进程的页表
@@ -409,8 +410,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 
     // 关闭之前的文件描述符
     process_exit_files(current_pcb);
-
-    process_open_stdio(current_pcb);
+    process_init_files();
 
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
@@ -664,9 +664,7 @@ void process_init()
 
     // 初始化init进程的signal相关的信息
     initial_proc_init_signal(current_pcb);
-
-    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
-    process_open_stdio(current_pcb);
+    process_init_files();
 
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
@@ -740,38 +738,13 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (retval != 0)
         return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
-        current_pcb->flags |= PF_NEED_SCHED;
+    current_pcb->flags |= PF_NEED_SCHED;
 
     if (pcb->cpu_id == current_pcb->cpu_id)
         sched();
     else
         kick_cpu(pcb->cpu_id);
     return 0;
-}
-
-/**
- * @brief 回收进程的所有文件描述符
- *
- * @param pcb 要被回收的进程的pcb
- * @return uint64_t
- */
-uint64_t process_exit_files(struct process_control_block *pcb)
-{
-    // TODO: 当stdio不再被以-1来特殊处理时，在这里要释放stdio文件的内存
-
-    // 不与父进程共享文件描述符
-    if (!(pcb->flags & PF_VFORK))
-    {
-
-        for (int i = 3; i < PROC_MAX_FD_NUM; ++i)
-        {
-            if (pcb->fds[i] == NULL)
-                continue;
-            kfree(pcb->fds[i]);
-        }
-    }
-    // 清空当前进程的文件描述符列表
-    memset(pcb->fds, 0, sizeof(struct vfs_file_t *) * PROC_MAX_FD_NUM);
 }
 
 /**
@@ -871,28 +844,6 @@ int process_release_pcb(struct process_control_block *pcb)
 }
 
 /**
- * @brief 申请可用的文件句柄
- *
- * @return int
- */
-int process_fd_alloc(struct vfs_file_t *file)
-{
-    int fd_num = -1;
-
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-    {
-        /* 找到指针数组中的空位 */
-        if (current_pcb->fds[i] == NULL)
-        {
-            fd_num = i;
-            current_pcb->fds[i] = file;
-            break;
-        }
-    }
-    return fd_num;
-}
-
-/**
  * @brief 给pcb设置名字
  *
  * @param pcb 需要设置名字的pcb
@@ -915,15 +866,4 @@ static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_na
 void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
     __set_pcb_name(pcb, pcb_name);
-}
-
-void process_open_stdio(struct process_control_block *pcb)
-{
-    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
-    // stdin
-    pcb->fds[0] = -1UL;
-    // stdout
-    pcb->fds[1] = -1UL;
-    // stderr
-    pcb->fds[2] = -1UL;
 }

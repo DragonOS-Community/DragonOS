@@ -134,26 +134,51 @@ impl MmioBuddyMemPool {
             // 找到最小符合申请范围的内存块
             // 将大的内存块依次分成小块内存，直到能够满足exp大小，即将exp+1分成两块exp
             for e in exp + 1..MMIO_BUDDY_MAX_EXP + 1 {
-                if self.free_regions[exp2index(e) as usize].lock().num_free == 0 {
+                let pop_list: &mut SpinLockGuard<MmioFreeRegionList> =
+                    &mut self.free_regions[exp2index(e) as usize].lock();
+                if pop_list.num_free == 0 {
                     continue;
                 }
+
                 for e2 in (exp + 1..e + 1).rev() {
-                    match self.pop_block(&mut self.free_regions[exp2index(e2) as usize].lock()) {
-                        Ok(region) => {
-                            if e2 != exp + 1 {
-                                // 要将分裂后的内存块插入到更小的链表中
-                                let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                                    &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
-                                self.split_block(region, e2, low_list_guard);
-                            } else {
-                                // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
-                                // 所以直接将list_guard传入
-                                self.split_block(region, e2, list_guard);
+                    if e2 == e {
+                        match self.pop_block(pop_list) {
+                            Ok(region) => {
+                                if e2 != exp + 1 {
+                                    // 要将分裂后的内存块插入到更小的链表中
+                                    let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
+                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
+                                    self.split_block(region, e2, low_list_guard);
+                                } else {
+                                    // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
+                                    // 所以直接将list_guard传入
+                                    self.split_block(region, e2, list_guard);
+                                }
+                            }
+                            Err(err) => {
+                                kdebug!("buddy_pop_region get wrong");
+                                return Err(err);
                             }
                         }
-                        Err(err) => {
-                            kdebug!("buddy_pop_region get wrong");
-                            return Err(err);
+                    } else {
+                        match self.pop_block(&mut self.free_regions[exp2index(e2) as usize].lock())
+                        {
+                            Ok(region) => {
+                                if e2 != exp + 1 {
+                                    // 要将分裂后的内存块插入到更小的链表中
+                                    let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
+                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
+                                    self.split_block(region, e2, low_list_guard);
+                                } else {
+                                    // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
+                                    // 所以直接将list_guard传入
+                                    self.split_block(region, e2, list_guard);
+                                }
+                            }
+                            Err(err) => {
+                                kdebug!("buddy_pop_region get wrong");
+                                return Err(err);
+                            }
                         }
                     }
                 }
@@ -161,33 +186,49 @@ impl MmioBuddyMemPool {
             }
             // 判断是否获得了exp大小的内存块
             if list_guard.num_free > 0 {
-                return Ok(list_guard.list.pop_back().unwrap());
+                match self.pop_block(list_guard) {
+                    Ok(ret) => return Ok(ret),
+                    Err(err) => return Err(err),
+                }
             }
             // 拆分大内存块无法获得exp大小内存块
             // 尝试用小内存块合成
             // 即将两块exp合成一块exp+1
+
+            // TODO：修改下一个循环的冗余代码，请不要删除此处的注释
+            // let merge = |high_list_guard: &mut SpinLockGuard<MmioFreeRegionList>, exp: u32| {
+            //     if let Err(err) = self.merge_all_exp(
+            //         exp,
+            //         &mut self.free_regions[exp2index(exp) as usize].lock(),
+            //         high_list_guard,
+            //     ) {
+            //         return err;
+            //     } else {
+            //         return MmioResult::SUCCESS;
+            //     }
+            // };
             for e in MMIO_BUDDY_MIN_EXP..exp {
                 if e != exp - 1 {
-                    let high_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                        &mut self.free_regions[exp2index(exp + 1)].lock();
                     match self.merge_all_exp(
-                        e,
-                        &mut self.free_regions[exp2index(e) as usize].lock(),
-                        high_list_guard,
+                        exp,
+                        &mut self.free_regions[exp2index(exp) as usize].lock(),
+                        &mut self.free_regions[exp2index(exp + 1)].lock(),
                     ) {
                         Ok(_) => continue,
                         Err(err) => {
+                            kdebug!("merge_all_exp get wrong");
                             return Err(err);
                         }
                     }
                 } else {
                     match self.merge_all_exp(
-                        e,
-                        &mut self.free_regions[exp2index(e) as usize].lock(),
+                        exp,
+                        &mut self.free_regions[exp2index(exp) as usize].lock(),
                         list_guard,
                     ) {
                         Ok(_) => continue,
                         Err(err) => {
+                            kdebug!("merge_all_exp get wrong");
                             return Err(err);
                         }
                     }
@@ -196,11 +237,17 @@ impl MmioBuddyMemPool {
 
             //判断是否获得了exp大小的内存块
             if list_guard.num_free > 0 {
-                return Ok(list_guard.list.pop_back().unwrap());
+                match self.pop_block(list_guard) {
+                    Ok(ret) => return Ok(ret),
+                    Err(err) => return Err(err),
+                }
             }
             return Err(MmioResult::ENOFOUND);
         } else {
-            return Ok(list_guard.list.pop_back().unwrap());
+            match self.pop_block(list_guard) {
+                Ok(ret) => return Ok(ret),
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -394,7 +441,7 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(i32) 失败返回错误码
-    fn create_mmio(
+    pub fn create_mmio(
         &self,
         size: u32,
         vm_flags: vm_flags_t,
@@ -507,7 +554,7 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(i32) 失败返回错误码
-    fn release_mmio(&self, vaddr: u64, length: u64) -> Result<i32, i32> {
+    pub fn release_mmio(&self, vaddr: u64, length: u64) -> Result<i32, i32> {
         //先将要释放的空间取消映射
         unsafe {
             mm_unmap(&mut initial_mm, vaddr, length, false);

@@ -122,18 +122,19 @@ impl ProcFSInode {
             );
             return Err(-(ESRCH as i32));
         } else {
-            pcb.unwrap()
+            pcb.ok_or(-(EPERM as i32))?
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
-        kdebug!("pcb.name={:?}", pcb.name);
+        kdebug!("pcb.name={:?}", pcb);
         let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
         for val in pcb.name.iter() {
             tmp_name.push(*val as u8);
         }
         kdebug!("pcb.tmp_name={}", String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string()));
         
-        pdata.append(&mut format!("Name:\t{}", String::from_utf8(tmp_name).unwrap_or("NULL".to_string())).as_bytes().to_owned());
+        // pdata.append(&mut format!("Name:\t{}", String::from_utf8(tmp_name).unwrap_or("NULL".to_string())).as_bytes().to_owned());
+        pdata.append(&mut format!("Name:\tunknow").as_bytes().to_owned());
         pdata.append(&mut format!("\nstate:\t{}", pcb.state).as_bytes().to_owned());
         pdata.append(&mut format!("\npid:\t{}", pcb.pid).as_bytes().to_owned());
         pdata.append(&mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid).as_bytes().to_owned());
@@ -261,7 +262,7 @@ impl ProcFS {
         let sf: &LockedProcFSInode = binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
-            .unwrap();
+            .ok_or(-(EPERM as i32))?;
         sf.0.lock().fdata.pid = pid;
         sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
@@ -276,7 +277,7 @@ impl ProcFS {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
-        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).unwrap();
+        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).expect("Cannot find this dir");
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
         

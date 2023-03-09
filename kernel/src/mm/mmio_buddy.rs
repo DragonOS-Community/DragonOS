@@ -134,55 +134,38 @@ impl MmioBuddyMemPool {
             // 找到最小符合申请范围的内存块
             // 将大的内存块依次分成小块内存，直到能够满足exp大小，即将exp+1分成两块exp
             for e in exp + 1..MMIO_BUDDY_MAX_EXP + 1 {
-
                 let pop_list: &mut SpinLockGuard<MmioFreeRegionList> =
                     &mut self.free_regions[exp2index(e) as usize].lock();
                 if pop_list.num_free == 0 {
                     continue;
                 }
+
+                let pop = |list_guard: &mut SpinLockGuard<MmioFreeRegionList>, e: u32| {
+                    match self.pop_block(list_guard) {
+                        Ok(region) => {
+                            if e != exp + 1 {
+                                // 要将分裂后的内存块插入到更小的链表中
+                                let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
+                                    &mut self.free_regions[exp2index(e - 1) as usize].lock();
+                                self.split_block(region, e, low_list_guard);
+                            } else {
+                                // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
+                                // 所以直接将list_guard传入
+                                self.split_block(region, e, list_guard);
+                            }
+                            return MmioResult::SUCCESS;
+                        }
+                        Err(err) => {
+                            kdebug!("buddy_pop_region get wrong");
+                            return err;
+                        }
+                    }
+                };
                 for e2 in (exp + 1..e + 1).rev() {
-
-
-
                     if e2 == e {
-                        match self.pop_block(pop_list) {
-                            Ok(region) => {
-                                if e2 != exp + 1 {
-                                    // 要将分裂后的内存块插入到更小的链表中
-                                    let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
-                                    self.split_block(region, e2, low_list_guard);
-                                } else {
-                                    // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
-                                    // 所以直接将list_guard传入
-                                    self.split_block(region, e2, list_guard);
-                                }
-                            }
-                            Err(err) => {
-                                kdebug!("buddy_pop_region get wrong");
-                                return Err(err);
-                            }
-                        }
+                        pop(pop_list, e2);
                     } else {
-                        match self.pop_block(&mut self.free_regions[exp2index(e2) as usize].lock())
-                        {
-                            Ok(region) => {
-                                if e2 != exp + 1 {
-                                    // 要将分裂后的内存块插入到更小的链表中
-                                    let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
-                                    self.split_block(region, e2, low_list_guard);
-                                } else {
-                                    // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
-                                    // 所以直接将list_guard传入
-                                    self.split_block(region, e2, list_guard);
-                                }
-                            }
-                            Err(err) => {
-                                kdebug!("buddy_pop_region get wrong");
-                                return Err(err);
-                            }
-                        }
+                        pop(&mut self.free_regions[exp2index(e2) as usize].lock(), e2);
                     }
                 }
                 break;

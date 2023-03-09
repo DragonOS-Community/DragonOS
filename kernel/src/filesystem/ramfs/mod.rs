@@ -148,7 +148,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         offset: usize,
         len: usize,
-        buf: &mut [u8],
+        buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         if buf.len() < len {
@@ -413,7 +413,7 @@ impl IndexNode for LockedRamFSInode {
         keys.push(String::from("."));
         keys.push(String::from(".."));
         keys.append(&mut self.0.lock().children.keys().cloned().collect());
-        
+
         return Ok(keys);
     }
 }

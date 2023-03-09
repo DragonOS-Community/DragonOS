@@ -1,4 +1,4 @@
-use core::{intrinsics::size_of};
+use core::{intrinsics::size_of, str::FromStr};
 
 use alloc::{
     borrow::ToOwned,
@@ -122,19 +122,17 @@ impl ProcFSInode {
             );
             return Err(-(ESRCH as i32));
         } else {
-            pcb.ok_or(-(EPERM as i32))?
+            pcb.unwrap()
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
-        kdebug!("pcb.name={:?}", pcb);
         let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
         for val in pcb.name.iter() {
             tmp_name.push(*val as u8);
         }
-        kdebug!("pcb.tmp_name={}", String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string()));
+        kdebug!("pcb.name={}", String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string()));
         
-        // pdata.append(&mut format!("Name:\t{}", String::from_utf8(tmp_name).unwrap_or("NULL".to_string())).as_bytes().to_owned());
-        pdata.append(&mut format!("Name:\tunknow").as_bytes().to_owned());
+        pdata.append(&mut format!("Name:\t{}", String::from_utf8(tmp_name).unwrap_or("NULL".to_string())).as_bytes().to_owned());
         pdata.append(&mut format!("\nstate:\t{}", pcb.state).as_bytes().to_owned());
         pdata.append(&mut format!("\npid:\t{}", pcb.pid).as_bytes().to_owned());
         pdata.append(&mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid).as_bytes().to_owned());
@@ -255,45 +253,25 @@ impl ProcFS {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
-        let pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
+        let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
         // 创建相关文件
         // status文件
-        let binding: Arc<dyn IndexNode> = pf.create("status", FileType::File, 0)?;
-        let sf: &LockedProcFSInode = binding
+        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0)?;
+        let _sf: &LockedProcFSInode = binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
-            .ok_or(-(EPERM as i32))?;
-        sf.0.lock().fdata.pid = pid;
-        sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
+            .unwrap();
+        _sf.0.lock().fdata.pid = pid;
+        _sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         //todo: 创建其他文件
 
         return Ok(());
     }
-
-    /// @brief 解除进程注册
-    /// 
-    pub fn procfs_unregister_pid(&self, pid: i64)-> Result<(), i32> {
-        // 获取当前inode
-        let proc: Arc<dyn IndexNode> = self.root_inode();
-        // 获取进程文件夹
-        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).expect("Cannot find this dir");
-        // 删除进程文件夹下文件
-        pid_dir.unlink("status")?;
-        
-        // 查看进程文件是否还存在
-        // let pf= pid_dir.find("status").expect("Cannot find status");
-
-        // 删除进程文件夹
-        proc.unlink(&format!("{}", pid))?;
-        
-        return Ok(());
-    }
-
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
         kdebug!("open in!");
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
@@ -307,16 +285,16 @@ impl IndexNode for LockedProcFSInode {
             }
         };
 
-        *data = FilePrivateData::Procfs(private_data);
+        *_data = FilePrivateData::Procfs(private_data);
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
         kdebug!("open success!");
         return Ok(());
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
         // 获取数据信息
-        let _private_data = match data {
+        let _private_data = match _data {
             FilePrivateData::Procfs(p) => p,
             _ => {
                 panic!("ProcFS: FilePrivateData mismatch!");
@@ -378,8 +356,8 @@ impl IndexNode for LockedProcFSInode {
         &self,
         offset: usize,
         len: usize,
-        buf: &mut [u8],
-        data: &mut FilePrivateData,
+        buf: &[u8],
+        _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         if buf.len() < len {
             return Err(-(EINVAL as i32));

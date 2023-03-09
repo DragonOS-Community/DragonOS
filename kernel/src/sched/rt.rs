@@ -1,6 +1,6 @@
 use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
-use alloc::{boxed::Box, vec::Vec, collections::LinkedList};
+use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
@@ -86,7 +86,6 @@ impl RTQueue {
         self.queue.push_front(pcb);
         self.lock.unlock();
     }
-
 }
 
 /// @brief RT调度器类

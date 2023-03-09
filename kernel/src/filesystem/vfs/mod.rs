@@ -3,6 +3,8 @@
 pub mod core;
 pub mod file;
 pub mod mount;
+mod syscall;
+mod utils;
 
 use ::core::{any::Any, fmt::Debug};
 
@@ -10,10 +12,10 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
-    time::TimeSpec, kdebug,
+    time::TimeSpec,
 };
 
-use self::{mount::MountFS, file::FilePrivateData};
+use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: u32 = 1024;
@@ -75,10 +77,16 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @param len 要读取的字节数
     /// @param buf 缓冲区. 请注意，必须满足@buf.len()>=@len
     /// @param _data 各文件系统系统所需私有信息
-    /// 
+    ///
     /// @return 成功：Ok(读取的字节数)
     ///         失败：Err(Posix错误码)
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32>;
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32>;
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
     ///
@@ -89,7 +97,13 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功：Ok(写入的字节数)
     ///         失败：Err(Posix错误码)
-    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32>;
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32>;
 
     /// @brief 获取当前inode的状态。
     ///
@@ -259,6 +273,13 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
         return Err(-(ENOTSUP as i32));
     }
+
+    /// @brief 截断当前inode到指定的长度。如果当前文件长度小于len,则不操作。
+    /// 
+    /// @param len 要被截断到的目标长度
+    fn truncate(&self, _len: usize) -> Result<(), i32>{
+        return Err(-(ENOTSUP as i32));
+    }
 }
 
 impl dyn IndexNode {
@@ -267,7 +288,6 @@ impl dyn IndexNode {
     pub fn downcast_ref<T: IndexNode>(&self) -> Option<&T> {
         return self.as_any_ref().downcast_ref::<T>();
     }
-
 
     /// @brief 查找文件（不考虑符号链接）
     ///
@@ -299,7 +319,7 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (self.fs().root_inode(), String::from(rest))
+            (ROOT_INODE.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))

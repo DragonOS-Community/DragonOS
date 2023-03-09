@@ -134,7 +134,7 @@ impl MmioBuddyMemPool {
             // 找到最小符合申请范围的内存块
             // 将大的内存块依次分成小块内存，直到能够满足exp大小，即将exp+1分成两块exp
             for e in exp + 1..MMIO_BUDDY_MAX_EXP + 1 {
-                // FIXME 可能会有死锁问题
+
                 let pop_list: &mut SpinLockGuard<MmioFreeRegionList> =
                     &mut self.free_regions[exp2index(e) as usize].lock();
                 if pop_list.num_free == 0 {

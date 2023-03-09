@@ -1,4 +1,3 @@
-use crate::kinfo;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::{
     arch::asm::current::current_pcb,
@@ -142,6 +141,9 @@ impl MmioBuddyMemPool {
                     continue;
                 }
                 for e2 in (exp + 1..e + 1).rev() {
+
+
+
                     if e2 == e {
                         match self.pop_block(pop_list) {
                             Ok(region) => {
@@ -420,7 +422,7 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(i32) 失败返回错误码
-    fn create_mmio(
+    pub fn create_mmio(
         &self,
         size: u32,
         vm_flags: vm_flags_t,
@@ -533,7 +535,7 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(i32) 失败返回错误码
-    fn release_mmio(&self, vaddr: u64, length: u64) -> Result<i32, i32> {
+    pub fn release_mmio(&self, vaddr: u64, length: u64) -> Result<i32, i32> {
         //先将要释放的空间取消映射
         unsafe {
             mm_unmap(&mut initial_mm, vaddr, length, false);

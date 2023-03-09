@@ -194,22 +194,44 @@ impl MmioBuddyMemPool {
             // 拆分大内存块无法获得exp大小内存块
             // 尝试用小内存块合成
             // 即将两块exp合成一块exp+1
-            let merge = |high_list_guard: &mut SpinLockGuard<MmioFreeRegionList>, exp: u32| {
-                if let Err(err) = self.merge_all_exp(
-                    exp,
-                    &mut self.free_regions[exp2index(exp) as usize].lock(),
-                    high_list_guard,
-                ) {
-                    return err;
-                } else {
-                    return MmioResult::SUCCESS;
-                }
-            };
+
+            // TODO：修改下一个循环的冗余代码，请不要删除此处的注释
+            // let merge = |high_list_guard: &mut SpinLockGuard<MmioFreeRegionList>, exp: u32| {
+            //     if let Err(err) = self.merge_all_exp(
+            //         exp,
+            //         &mut self.free_regions[exp2index(exp) as usize].lock(),
+            //         high_list_guard,
+            //     ) {
+            //         return err;
+            //     } else {
+            //         return MmioResult::SUCCESS;
+            //     }
+            // };
             for e in MMIO_BUDDY_MIN_EXP..exp {
                 if e != exp - 1 {
-                    merge(&mut self.free_regions[exp2index(exp + 1)].lock(), e);
+                    match self.merge_all_exp(
+                        exp,
+                        &mut self.free_regions[exp2index(exp) as usize].lock(),
+                        &mut self.free_regions[exp2index(exp + 1)].lock(),
+                    ) {
+                        Ok(_) => continue,
+                        Err(err) => {
+                            kdebug!("merge_all_exp get wrong");
+                            return Err(err);
+                        }
+                    }
                 } else {
-                    merge(list_guard, e);
+                    match self.merge_all_exp(
+                        exp,
+                        &mut self.free_regions[exp2index(exp) as usize].lock(),
+                        list_guard,
+                    ) {
+                        Ok(_) => continue,
+                        Err(err) => {
+                            kdebug!("merge_all_exp get wrong");
+                            return Err(err);
+                        }
+                    }
                 }
             }
 

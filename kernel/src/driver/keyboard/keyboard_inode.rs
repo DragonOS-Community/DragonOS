@@ -104,7 +104,7 @@ impl IndexNode for LockedKeyBoardInode {
         &self,
         _offset: usize,
         _len: usize,
-        _buf: &mut [u8],
+        _buf: &[u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, i32> {
         return Err(-(ENOTSUP as i32));

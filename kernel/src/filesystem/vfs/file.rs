@@ -137,7 +137,7 @@ impl File {
     ///
     /// @return Ok(usize) 成功写入的字节数
     /// @return Err(i32) 错误码
-    pub fn write(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    pub fn write(&mut self, len: usize, buf: &[u8]) -> Result<usize, i32> {
         // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
         if buf.len() < len {

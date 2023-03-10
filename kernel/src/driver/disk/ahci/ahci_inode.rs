@@ -139,7 +139,7 @@ impl IndexNode for LockedAhciInode {
         &self,
         offset: usize, // lba地址
         len: usize,
-        buf: &mut [u8],
+        buf: &[u8],
         data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         if buf.len() < len {

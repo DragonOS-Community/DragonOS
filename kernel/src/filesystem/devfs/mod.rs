@@ -341,7 +341,7 @@ impl IndexNode for LockedDevFSInode {
         &self,
         _offset: usize,
         _len: usize,
-        _buf: &mut [u8],
+        _buf: &[u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, i32> {
         Err(-(ENOTSUP as i32))

@@ -101,7 +101,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         &self,
         offset: usize,
         len: usize,
-        buf: &mut [u8],
+        buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32>;
 
@@ -282,9 +282,9 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     /// @brief 截断当前inode到指定的长度。如果当前文件长度小于len,则不操作。
-    /// 
+    ///
     /// @param len 要被截断到的目标长度
-    fn truncate(&self, _len: usize) -> Result<(), i32>{
+    fn truncate(&self, _len: usize) -> Result<(), i32> {
         return Err(-(ENOTSUP as i32));
     }
 }

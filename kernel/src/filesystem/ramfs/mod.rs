@@ -153,7 +153,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         offset: usize,
         len: usize,
-        buf: &mut [u8],
+        buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         if buf.len() < len {

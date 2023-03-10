@@ -5,7 +5,7 @@ use crate::{
     include::bindings::bindings::{
         pt_regs, verify_area, EINVAL, EPERM, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET,
     },
-    io::SeekFrom,
+    io::SeekFrom, kdebug,
 };
 
 use super::{
@@ -28,6 +28,8 @@ pub extern "C" fn sys_open(regs: &pt_regs) -> u64 {
     }
     let path: &str = path.unwrap();
     let flags = regs.r9;
+
+    kdebug!("sys_open: path={path}, flags={flags}");
 
     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
     let r: Result<i32, i32> = do_open(path, open_flags);

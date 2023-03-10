@@ -306,7 +306,7 @@ impl ProcFS {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
-        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).unwrap();
+        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid))?;
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
 

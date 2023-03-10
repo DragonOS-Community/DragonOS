@@ -22,7 +22,7 @@ use crate::{
     },
     include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
     io::SeekFrom,
-    kdebug, kerror, println,
+    kdebug, kerror, kinfo, println,
 };
 
 use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
@@ -40,13 +40,13 @@ pub fn generate_inode_id() -> InodeId {
 // @brief 初始化ROOT INODE
 lazy_static! {
     pub static ref ROOT_INODE: Arc<dyn IndexNode> = {
-        ahci_rust_init().expect("ahci rust init failed.");
+        // ahci_rust_init().expect("ahci rust init failed.");
         // 使用Ramfs作为默认的根文件系统
         let ramfs = RamFS::new();
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.root_inode();
 
-        test_fatfs();
+        // test_fatfs();
         // 创建文件夹
         root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
@@ -60,8 +60,72 @@ lazy_static! {
         root_inode
     };
 }
-pub fn print_type_of<T>(_: &T) {
-    println!("{}", core::any::type_name::<T>())
+
+#[no_mangle]
+pub extern "C" fn vfs_init() -> i32 {
+    let root_inode = ROOT_INODE.list().expect("vfs init failed");
+    if root_inode.len() > 0 {
+        kinfo!("Successfully initialized VFS!");
+    }
+    return 0;
+}
+
+/// @brief 迁移伪文件系统的inode
+/// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
+fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>)->Result<(), i32>{
+    // ==== 迁移procfs ===
+    let proc = ROOT_INODE.find("proc").expect("procfs not mounted!");
+    kdebug!("fat root list={:?}", new_fs.root_inode().list());
+    ROOT_INODE.mount(new_fs)?;
+    ROOT_INODE = ROOT_INODE.find("/")?;
+    kdebug!("mount new_fs done");
+    let r= ROOT_INODE.find("proc");
+    let proc_mountpoint = if r.is_err(){
+        ROOT_INODE.create("proc", FileType::Dir, 0o777).expect("Failed to create '/proc'")
+    }else{
+        r.unwrap()
+    };
+    // 迁移挂载点
+    proc_mountpoint.mount(proc.fs()).expect("Failed to migrate ProcFS");
+
+    return Ok(());
+    
+}
+
+#[no_mangle]
+pub extern "C" fn mount_root_fs() -> i32 {
+    kinfo!("Try to mount FAT32 as root fs...");
+    let partiton: Arc<crate::io::disk_info::Partition> =
+        ahci::get_disks_by_name("ahci_disk_0".to_string())
+            .unwrap()
+            .0
+            .lock()
+            .partitions[0]
+            .clone();
+
+    let fatfs: Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
+    if fatfs.is_err() {
+        kerror!(
+            "Failed to initialize fatfs, code={:?}",
+            fatfs.as_ref().err()
+        );
+        loop {
+            spin_loop();
+        }
+    }
+    let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
+    let r = migrate_virtual_filesystem(fatfs);
+    if r.is_err(){
+        kerror!("Failed to migrate virtual filesystem to FAT32!");
+        loop {
+            spin_loop();
+        }
+    }
+
+    kdebug!("root.list()={:?}", ROOT_INODE.list());
+    kinfo!("Successfully migrate rootfs to FAT32!");
+
+    return 0;
 }
 
 /// @brief 在这个函数里面，编写调试文件系统用的代码。该函数仅供重构期间，方便调试使用。
@@ -212,7 +276,7 @@ pub fn _test_procfs(pid: i64) {
 }
 
 pub fn _test_procfs_2(pid: i64) {
-    __test_procfs_2(pid);
+    // __test_procfs_2(pid);
 }
 
 // 进程注册测试

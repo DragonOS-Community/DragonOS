@@ -16,7 +16,7 @@ use crate::{
     },
     include::bindings::bindings::{
         pid_t, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR,
-        ENOTEMPTY, EPERM, ESRCH,
+        ENOTEMPTY, EPERM, ESRCH, ENOTSUP,
     },
     kdebug, kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -341,16 +341,16 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+    fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
         // 获取数据信息
-        let _private_data = match _data {
+        let private_data = match data {
             FilePrivateData::Procfs(p) => p,
             _ => {
                 panic!("ProcFS: FilePrivateData mismatch!");
             }
         };
         // 释放资源
-        drop(_private_data);
+        drop(private_data);
         return Ok(());
     }
 
@@ -408,28 +408,7 @@ impl IndexNode for LockedProcFSInode {
         buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
-        if buf.len() < len {
-            return Err(-(EINVAL as i32));
-        }
-
-        // 加锁
-        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
-        }
-
-        let data: &mut Vec<u8> = &mut inode.data;
-
-        // 如果文件大小比原来的大，那就resize这个数组
-        if offset + len > data.len() {
-            data.resize(offset + len, 0);
-        }
-
-        let target = &mut data[offset..offset + len];
-        target.copy_from_slice(&buf[0..len]);
-        return Ok(len);
+        return Err(-(ENOTSUP as i32));
     }
 
     fn poll(&self) -> Result<PollStatus, i32> {
@@ -597,17 +576,7 @@ impl IndexNode for LockedProcFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), i32> {
-        let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
-
-        // 在新的目录下创建一个硬链接
-        target.link(new_name, &old_inode)?;
-        // 取消现有的目录下的这个硬链接
-        if let Err(err) = self.unlink(old_name) {
-            // 如果取消失败，那就取消新的目录下的硬链接
-            target.unlink(new_name)?;
-            return Err(err);
-        }
-        return Ok(());
+        return Err(-(ENOTSUP as i32));
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {

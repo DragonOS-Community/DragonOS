@@ -334,7 +334,7 @@ impl IndexNode for LockedProcFSInode {
             }
         };
 
-        *_data = FilePrivateData::Procfs(private_data);
+        *data = FilePrivateData::Procfs(private_data);
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
 
@@ -696,8 +696,9 @@ pub fn procfs_register_pid(pid: pid_t) -> Result<(), i32> {
     let procfs_inode = procfs_inode
         .downcast_ref::<LockedProcFSInode>()
         .expect("Failed to find procfs' root inode");
-    let procfs: &ProcFS = procfs_inode
-        .fs()
+    let fs = procfs_inode
+        .fs();
+    let procfs: &ProcFS = fs
         .as_any_ref()
         .downcast_ref::<ProcFS>()
         .unwrap();
@@ -726,8 +727,9 @@ pub fn procfs_unregister_pid(pid: pid_t) -> Result<(), i32> {
     let procfs_inode: &LockedProcFSInode = procfs_inode
         .downcast_ref::<LockedProcFSInode>()
         .expect("Failed to find procfs' root inode");
-    let procfs: &ProcFS = procfs_inode
-        .fs()
+    let fs:Arc<dyn FileSystem> = procfs_inode
+        .fs();
+    let procfs: &ProcFS = fs
         .as_any_ref()
         .downcast_ref::<ProcFS>()
         .unwrap();

@@ -13,5 +13,4 @@ $(kernel_fs_procfs_objs): ECHO
 	$(CC) $(CFLAGS) -c $@ -o $@.o
 
 
-all: $(kernel_fs_procfs_objs)
-
+all:

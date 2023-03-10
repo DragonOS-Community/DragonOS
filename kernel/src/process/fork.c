@@ -139,8 +139,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     process_wakeup(tsk);
 
     // 创建对应procfs文件
-    // procfs_register_pid(tsk->pid);
-    // 调用rust中注册函数
     rs_procfs_register_pid(tsk->pid);
 
     return retval;

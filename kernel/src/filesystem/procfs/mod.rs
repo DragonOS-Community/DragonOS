@@ -129,14 +129,15 @@ impl ProcFSInode {
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
+        // kdebug!("pcb.name={:?}", pcb.name);
         let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
         for val in pcb.name.iter() {
             tmp_name.push(*val as u8);
         }
-        kdebug!(
-            "pcb.name={}",
-            String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
-        );
+        // kdebug!(
+        //     "pcb.tmp_name={}",
+        //     String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
+        // );
 
         pdata.append(
             &mut format!(
@@ -189,9 +190,6 @@ impl ProcFSInode {
         // 去除多余的\0
         self.trim_string(pdata);
 
-        kdebug!("status got!");
-        kdebug!("ProcfsFilePrivateData:{:?}", pdata);
-        kdebug!("open_status success!");
         return Ok((pdata.len() * size_of::<u8>()) as i64);
     }
 
@@ -308,7 +306,7 @@ impl ProcFS {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
-        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).unwrap();
+        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid))?;
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
 
@@ -323,8 +321,7 @@ impl ProcFS {
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
-        kdebug!("open in!");
+    fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
@@ -340,7 +337,7 @@ impl IndexNode for LockedProcFSInode {
         *_data = FilePrivateData::Procfs(private_data);
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
-        kdebug!("open success!");
+
         return Ok(());
     }
 
@@ -539,7 +536,7 @@ impl IndexNode for LockedProcFSInode {
 
         // 将子inode插入父inode的B树中
         inode.children.insert(String::from(name), result.clone());
-        kdebug!("created file!");
+
         return Ok(result);
     }
 

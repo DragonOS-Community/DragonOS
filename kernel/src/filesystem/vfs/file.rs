@@ -1,15 +1,15 @@
-use core::{ffi::c_void, mem::MaybeUninit};
+use core::mem::MaybeUninit;
 
-use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc};
 
 use crate::{
+    arch::asm::current::current_pcb,
     filesystem::procfs::ProcfsFilePrivateData,
     include::bindings::bindings::{
-        process_control_block, EFAULT, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
+        process_control_block, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
     },
     io::SeekFrom,
-    kdebug,
-    libs::spinlock::SpinLock,
+    kdebug, kerror,
 };
 
 use super::{FileType, IndexNode, Metadata};
@@ -104,7 +104,6 @@ impl File {
         };
         // kdebug!("inode:{:?}",f.inode);
         f.inode.open(&mut f.private_data)?;
-        kdebug!("File open: f.private_data={:?}", f.private_data);
         return Ok(f);
     }
 
@@ -215,9 +214,19 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        self.inode.close(&mut self.private_data).ok();
+        let r: Result<(), i32> = self.inode.close(&mut self.private_data);
+        // 打印错误信息
+        if r.is_err() {
+            kerror!(
+                "pid: {} failed to close file: {:?}, errno={}",
+                current_pcb().pid,
+                self,
+                r.unwrap_err()
+            );
+        }
     }
 }
+
 
 /// @brief pcb里面的文件描述符数组
 #[derive(Debug, Clone)]

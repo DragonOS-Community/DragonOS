@@ -3,16 +3,20 @@ use core::{intrinsics::size_of, str::FromStr};
 use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
+    format,
     string::{String, ToString},
     sync::{Arc, Weak},
-    vec::Vec, format,
+    vec::Vec,
 };
 
 use crate::{
-    filesystem::vfs::{core::generate_inode_id, FileType},
+    filesystem::vfs::{
+        core::{generate_inode_id, ROOT_INODE},
+        FileType,
+    },
     include::bindings::bindings::{
-        process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR, ENOTEMPTY,
-        EPERM, ESRCH,
+        pid_t, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR,
+        ENOTEMPTY, EPERM, ESRCH,
     },
     kdebug, kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -68,7 +72,7 @@ pub struct ProcFS {
     root_inode: Arc<LockedProcFSInode>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProcfsFilePrivateData {
     data: Vec<u8>,
 }
@@ -100,10 +104,9 @@ pub struct ProcFSInode {
 
 /// 对ProcFSInode实现获取各类文件信息的函数
 impl ProcFSInode {
-
     /// @brief 去除Vec中所有的\0,并在结尾添加\0
     #[inline]
-    fn trim_string(&self, data: &mut Vec<u8>){
+    fn trim_string(&self, data: &mut Vec<u8>) {
         data.drain_filter(|x: &mut u8| *x == 0);
         data.push(0);
     }
@@ -130,16 +133,42 @@ impl ProcFSInode {
         for val in pcb.name.iter() {
             tmp_name.push(*val as u8);
         }
-        kdebug!("pcb.name={}", String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string()));
-        
-        pdata.append(&mut format!("Name:\t{}", String::from_utf8(tmp_name).unwrap_or("NULL".to_string())).as_bytes().to_owned());
+        kdebug!(
+            "pcb.name={}",
+            String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
+        );
+
+        pdata.append(
+            &mut format!(
+                "Name:\t{}",
+                String::from_utf8(tmp_name).unwrap_or("NULL".to_string())
+            )
+            .as_bytes()
+            .to_owned(),
+        );
         pdata.append(&mut format!("\nstate:\t{}", pcb.state).as_bytes().to_owned());
         pdata.append(&mut format!("\npid:\t{}", pcb.pid).as_bytes().to_owned());
-        pdata.append(&mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid)
+                .as_bytes()
+                .to_owned(),
+        );
         pdata.append(&mut format!("\ncpu_id:\t{}", pcb.cpu_id).as_bytes().to_owned());
-        pdata.append(&mut format!("\npriority:\t{}", pcb.priority).as_bytes().to_owned());
-        pdata.append(&mut format!("\npreempt:\t{}", pcb.preempt_count).as_bytes().to_owned());
-        pdata.append(&mut format!("\nvrtime:\t{}", pcb.virtual_runtime).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\npriority:\t{}", pcb.priority)
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\npreempt:\t{}", pcb.preempt_count)
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\nvrtime:\t{}", pcb.virtual_runtime)
+                .as_bytes()
+                .to_owned(),
+        );
 
         // 当前进程运行过程中占用内存的峰值
         let hiwater_vm: u64 =
@@ -149,7 +178,11 @@ impl ProcFSInode {
         // 进程代码的大小
         let data: u64 = unsafe { *pcb.mm }.data_addr_end - unsafe { *pcb.mm }.data_addr_start;
 
-        pdata.append(&mut format!("\nVmPeak:\t{} kB", hiwater_vm).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\nVmPeak:\t{} kB", hiwater_vm)
+                .as_bytes()
+                .to_owned(),
+        );
         pdata.append(&mut format!("\nVmData:\t{} kB", data).as_bytes().to_owned());
         pdata.append(&mut format!("\nVmExe:\t{} kB\n", text).as_bytes().to_owned());
 
@@ -249,7 +282,7 @@ impl ProcFS {
 
     /// @brief 进程注册函数
     /// @usage 在进程中调用并创建进程对应文件
-    pub fn procfs_register_pid(&self, pid: i64) -> Result<(), i32> {
+    pub fn register_pid(&self, pid: i64) -> Result<(), i32> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
@@ -265,6 +298,25 @@ impl ProcFS {
         _sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         //todo: 创建其他文件
+
+        return Ok(());
+    }
+
+    /// @brief 解除进程注册
+    ///
+    pub fn unregister_pid(&self, pid: i64) -> Result<(), i32> {
+        // 获取当前inode
+        let proc: Arc<dyn IndexNode> = self.root_inode();
+        // 获取进程文件夹
+        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).unwrap();
+        // 删除进程文件夹下文件
+        pid_dir.unlink("status")?;
+
+        // 查看进程文件是否还存在
+        // let pf= pid_dir.find("status").expect("Cannot find status");
+
+        // 删除进程文件夹
+        proc.unlink(&format!("{}", pid))?;
 
         return Ok(());
     }
@@ -628,4 +680,61 @@ impl IndexNode for LockedProcFSInode {
 
         return Ok(keys);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn rs_procfs_register_pid(pid: pid_t) -> u64 {
+    let r = procfs_register_pid(pid);
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err() as u64;
+    }
+}
+
+/// @brief 向procfs注册进程
+pub fn procfs_register_pid(pid: pid_t) -> Result<(), i32> {
+    let procfs_inode = ROOT_INODE.find("proc")?;
+
+    let procfs_inode = procfs_inode
+        .downcast_ref::<LockedProcFSInode>()
+        .expect("Failed to find procfs' root inode");
+    let procfs: &ProcFS = procfs_inode
+        .fs()
+        .as_any_ref()
+        .downcast_ref::<ProcFS>()
+        .unwrap();
+
+    // 调用注册函数
+    procfs.register_pid(pid)?;
+
+    return Ok(());
+}
+
+#[no_mangle]
+pub extern "C" fn rs_procfs_unregister_pid(pid: pid_t) -> u64 {
+    let r = procfs_unregister_pid(pid);
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err() as u64;
+    }
+}
+
+/// @brief 在ProcFS中,解除进程的注册
+pub fn procfs_unregister_pid(pid: pid_t) -> Result<(), i32> {
+    // 获取procfs实例
+    let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE.find("proc")?;
+
+    let procfs_inode: &LockedProcFSInode = procfs_inode
+        .downcast_ref::<LockedProcFSInode>()
+        .expect("Failed to find procfs' root inode");
+    let procfs: &ProcFS = procfs_inode
+        .fs()
+        .as_any_ref()
+        .downcast_ref::<ProcFS>()
+        .unwrap();
+
+    // 调用解除注册函数
+    return procfs.unregister_pid(pid);
 }

@@ -694,10 +694,7 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
     for (; pcb != &initial_proc_union.pcb; pcb = pcb->next_pcb)
     {
         if (pcb->pid == pid)
-        {
-            kdebug("pcb_name=:%s", pcb->name);
             return pcb;
-        }
     }
     return NULL;
 }
@@ -837,9 +834,9 @@ int process_release_pcb(struct process_control_block *pcb)
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
     process_exit_sighand(pcb);
     process_exit_signal(pcb);
+    rs_procfs_unregister_pid(pcb->pid);
     // 释放当前pcb
     kfree(pcb);
-    rs_procfs_unregister_pid(pcb->pid);
     return 0;
 }
 

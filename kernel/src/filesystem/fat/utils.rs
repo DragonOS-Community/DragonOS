@@ -13,4 +13,3 @@ pub fn decode_u8_ascii(value: u8) -> char {
         return REPLACEMENT_CHARACTER;
     }
 }
-

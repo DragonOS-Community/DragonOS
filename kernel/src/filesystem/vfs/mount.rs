@@ -7,10 +7,11 @@ use alloc::{
 
 use crate::{
     include::bindings::bindings::{EBUSY, ENOTDIR},
-    libs::spinlock::SpinLock, kdebug,
+    kdebug,
+    libs::spinlock::SpinLock,
 };
 
-use super::{FileSystem, FileType, IndexNode, InodeId, FilePrivateData};
+use super::{FilePrivateData, FileSystem, FileType, IndexNode, InodeId};
 
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
@@ -127,12 +128,28 @@ impl IndexNode for MountFSInode {
         return Ok(());
     }
 
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32> {
-        return self.inner_inode.read_at(offset, len, buf, &mut FilePrivateData::Unused);
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
+        return self
+            .inner_inode
+            .read_at(offset, len, buf, &mut FilePrivateData::Unused);
     }
 
-    fn write_at(&self, offset: usize, len: usize, buf: &mut [u8], _data: &mut FilePrivateData) -> Result<usize, i32> {
-        return self.inner_inode.write_at(offset, len, buf, &mut FilePrivateData::Unused);
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, i32> {
+        return self
+            .inner_inode
+            .write_at(offset, len, buf, &mut FilePrivateData::Unused);
     }
 
     #[inline]
@@ -247,7 +264,7 @@ impl IndexNode for MountFSInode {
             }
         }
     }
-    
+
     #[inline]
     fn get_entry_name(&self, ino: InodeId) -> Result<alloc::string::String, i32> {
         return self.inner_inode.get_entry_name(ino);

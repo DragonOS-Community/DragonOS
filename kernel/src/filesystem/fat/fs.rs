@@ -1,4 +1,4 @@
-use core::{any::Any, borrow::Borrow, fmt::Debug};
+use core::{any::Any, fmt::Debug};
 
 use alloc::{
     collections::BTreeMap,
@@ -12,12 +12,10 @@ use crate::{
         core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, FsInfo, IndexNode,
         Metadata, PollStatus,
     },
-    include::bindings::bindings::{EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, EPERM, EROFS},
-    io::{
-        device::{BlockDevice, LBA_SIZE},
-        disk_info::Partition,
-        SeekFrom,
+    include::bindings::bindings::{
+        EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM, EROFS,
     },
+    io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kdebug, kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -28,12 +26,12 @@ use crate::{
 
 use super::{
     bpb::{BiosParameterBlock, FATType},
-    entry::{
-        FATDir, FATDirEntry, FATDirIter, FATEntry, FATRawDirEntry, FileAttributes, LongDirEntry,
-        ShortDirEntry,
-    },
+    entry::{FATDir, FATDirEntry, FATDirIter, FATEntry},
     utils::RESERVED_CLUSTERS,
 };
+
+/// FAT32文件系统的最大的文件大小
+pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
 
 /// @brief 表示当前簇和上一个簇的关系的结构体
 /// 定义这样一个结构体的原因是，FAT文件系统的文件中，前后两个簇具有关联关系。
@@ -93,7 +91,8 @@ pub struct FATInode {
     parent: Weak<LockedFATInode>,
     /// 指向自身的弱引用
     self_ref: Weak<LockedFATInode>,
-    /// 子Inode的B树
+    /// 子Inode的B树. 该数据结构用作缓存区。其中，它的key表示inode的名称。
+    /// 请注意，由于FAT的查询过程对大小写不敏感，因此我们选择让key全部是大写的，方便统一操作。
     children: BTreeMap<String, Arc<LockedFATInode>>,
     /// 当前inode的元数据
     metadata: Metadata,
@@ -102,6 +101,102 @@ pub struct FATInode {
 
     /// 根据不同的Inode类型，创建不同的私有字段
     inode_type: FATDirEntry,
+}
+
+impl FATInode {
+    /// @brief 更新当前inode的元数据
+    pub fn update_metadata(&mut self) {
+        // todo: 更新文件的访问时间等信息
+        match &self.inode_type {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                self.metadata.size = f.size() as i64;
+            }
+            FATDirEntry::Dir(d) => {
+                self.metadata.size = d.size(&self.fs.upgrade().unwrap().clone()) as i64;
+            }
+            FATDirEntry::UnInit => {
+                kerror!("update_metadata: Uninitialized FATDirEntry: {:?}", self);
+                return;
+            }
+        };
+    }
+
+    fn find(&mut self, name: &str) -> Result<Arc<LockedFATInode>, i32> {
+        match &self.inode_type {
+            FATDirEntry::Dir(d) => {
+                // 尝试在缓存区查找
+                if let Some(entry) = self.children.get(&name.to_uppercase()) {
+                    return Ok(entry.clone());
+                }
+                // 在缓存区找不到
+                // 在磁盘查找
+                let fat_entry: FATDirEntry =
+                    d.find_entry(name, None, None, self.fs.upgrade().unwrap())?;
+                // kdebug!("find entry from disk ok, entry={fat_entry:?}");
+                // 创建新的inode
+                let entry_inode: Arc<LockedFATInode> = LockedFATInode::new(
+                    self.fs.upgrade().unwrap(),
+                    self.self_ref.clone(),
+                    fat_entry,
+                );
+                // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
+                self.children
+                    .insert(name.to_uppercase(), entry_inode.clone());
+                return Ok(entry_inode);
+            }
+            FATDirEntry::UnInit => {
+                panic!(
+                    "Uninitialized FAT Inode, fs = {:?}, inode={self:?}",
+                    self.fs
+                )
+            }
+            _ => {
+                return Err(-(ENOTDIR as i32));
+            }
+        }
+    }
+}
+
+impl LockedFATInode {
+    pub fn new(
+        fs: Arc<FATFileSystem>,
+        parent: Weak<LockedFATInode>,
+        inode_type: FATDirEntry,
+    ) -> Arc<LockedFATInode> {
+        let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
+            parent: parent,
+            self_ref: Weak::default(),
+            children: BTreeMap::new(),
+            fs: Arc::downgrade(&fs),
+            inode_type: inode_type,
+            metadata: Metadata {
+                dev_id: 0,
+                inode_id: generate_inode_id(),
+                size: 0,
+                blk_size: fs.bpb.bytes_per_sector as usize,
+                blocks: if let FATType::FAT32(_) = fs.bpb.fat_type {
+                    fs.bpb.total_sectors_32 as usize
+                } else {
+                    fs.bpb.total_sectors_16 as usize
+                },
+                atime: TimeSpec::default(),
+                mtime: TimeSpec::default(),
+                ctime: TimeSpec::default(),
+                file_type: FileType::Dir,
+                mode: 0o777,
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                raw_dev: 0,
+            },
+        })));
+
+        inode.0.lock().self_ref = Arc::downgrade(&inode);
+
+        inode.0.lock().update_metadata();
+
+        return inode;
+    }
 }
 
 /// FsInfo结构体（内存中的一份拷贝，当卸载卷或者sync的时候，把它写入磁盘）
@@ -119,7 +214,7 @@ pub struct FATFsInfo {
     trail_sig: u32,
     /// Dirty flag to flush to disk
     dirty: bool,
-    /// Relative Offset of FsInfo Structure
+    /// FsInfo Structure 在磁盘上的字节偏移量
     /// Not present for FAT12 and FAT16
     offset: Option<u64>,
 }
@@ -142,24 +237,21 @@ impl FileSystem for FATFileSystem {
 
 impl FATFileSystem {
     pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, i32> {
-        kdebug!("read bpb");
         let bpb = BiosParameterBlock::new(partition.clone())?;
 
-        kdebug!("read fsinfo");
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
             FATType::FAT32(bpb32) => {
-                kdebug!("read fsinfo 32");
+                let fs_info_in_disk_bytes_offset = partition.lba_start * LBA_SIZE as u64
+                    + bpb32.fs_info as u64 * bpb.bytes_per_sector as u64;
                 FATFsInfo::new(
                     partition.clone(),
-                    bpb32.fs_info,
+                    fs_info_in_disk_bytes_offset,
                     bpb.bytes_per_sector as usize,
                 )?
             }
             _ => FATFsInfo::default(),
         };
-
-        kdebug!("fs_info = {:?}", fs_info);
 
         // 根目录项占用的扇区数（向上取整）
         let root_dir_sectors: u64 = ((bpb.root_entries_cnt as u64 * 32)
@@ -232,6 +324,7 @@ impl FATFileSystem {
     }
 
     /// @brief 计算每个簇有多少个字节
+    #[inline]
     pub fn bytes_per_cluster(&self) -> u64 {
         return (self.bpb.bytes_per_sector as u64) * (self.bpb.sector_per_cluster as u64);
     }
@@ -255,7 +348,8 @@ impl FATFileSystem {
             fat_type.get_fat_bytes_offset(cluster, fat_start_sector, bytes_per_sec);
 
         // FAT表项所在的LBA地址
-        let fat_ent_lba = self.get_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
+        // let fat_ent_lba = self.get_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
+        let fat_ent_lba = self.partition.lba_start + fat_bytes_offset / LBA_SIZE as u64;
 
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
@@ -264,7 +358,7 @@ impl FATFileSystem {
         v.resize(self.bpb.bytes_per_sector as usize, 0);
         self.partition
             .disk()
-            .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
+            .read_at(fat_ent_lba as usize, 1 * self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -327,6 +421,62 @@ impl FATFileSystem {
                 }
             }
         };
+        return Ok(res);
+    }
+
+    /// @brief 读取当前簇在FAT表中存储的信息（直接返回读取到的值，而不加处理）
+    ///
+    /// @param cluster 当前簇
+    ///
+    /// @return Ok(u64) 当前簇在FAT表中，存储的信息。
+    /// @return Err(i32) 错误码
+    pub fn get_fat_entry_raw(&self, cluster: Cluster) -> Result<u64, i32> {
+        let current_cluster = cluster.cluster_num;
+
+        let fat_type: FATType = self.bpb.fat_type;
+        // 获取FAT表的起始扇区（相对分区起始扇区的偏移量）
+        let fat_start_sector = self.fat_start_sector();
+        let bytes_per_sec = self.bpb.bytes_per_sector as u64;
+
+        // cluster对应的FAT表项在分区内的字节偏移量
+        let fat_bytes_offset =
+            fat_type.get_fat_bytes_offset(cluster, fat_start_sector, bytes_per_sec);
+
+        // FAT表项所在的LBA地址
+        let fat_ent_lba = self.get_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
+
+        // FAT表项在逻辑块内的字节偏移量
+        let blk_offset = self.get_in_block_offset(fat_bytes_offset);
+
+        let mut v = Vec::<u8>::new();
+        v.resize(self.bpb.bytes_per_sector as usize, 0);
+        self.partition
+            .disk()
+            .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
+
+        let mut cursor = VecCursor::new(v);
+        cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
+
+        let res = match self.bpb.fat_type {
+            FATType::FAT12(_) => {
+                let mut entry = cursor.read_u16()?;
+                entry = if (current_cluster & 0x0001) > 0 {
+                    entry >> 4
+                } else {
+                    entry & 0x0fff
+                };
+                entry as u64
+            }
+            FATType::FAT16(_) => {
+                let entry = (cursor.read_u16()?) as u64;
+                entry
+            }
+            FATType::FAT32(_) => {
+                let entry = cursor.read_u32()? & 0x0fff_ffff;
+                entry as u64
+            }
+        };
+
         return Ok(res);
     }
 
@@ -418,6 +568,7 @@ impl FATFileSystem {
 
         // 如果这个空闲簇不是簇链的第一个簇，那么把当前簇跟前一个簇连上。
         if let Some(prev_cluster) = prev_cluster {
+            // kdebug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
             self.set_entry(prev_cluster, FATEntry::Next(free_cluster))?;
         }
         // 清空新获取的这个簇
@@ -580,11 +731,125 @@ impl FATFileSystem {
     /// @brief 获取一个簇迭代器对象
     ///
     /// @param start_cluster 整个FAT链的起始簇号
-    pub fn cluster_iter(&self, start_cluster: Cluster) -> ClusterIter {
+    fn cluster_iter(&self, start_cluster: Cluster) -> ClusterIter {
         return ClusterIter {
             current_cluster: Some(start_cluster),
             fs: self,
         };
+    }
+
+    /// @brief 获取从start_cluster开始的簇链中，第n个簇的信息。（请注意，下标从0开始）
+    #[inline]
+    pub fn get_cluster_by_relative(&self, start_cluster: Cluster, n: usize) -> Option<Cluster> {
+        return self.cluster_iter(start_cluster).skip(n).next();
+    }
+
+    /// @brief 获取整个簇链的最后一个簇
+    #[inline]
+    pub fn get_last_cluster(&self, start_cluster: Cluster) -> Option<Cluster> {
+        return self.cluster_iter(start_cluster).last();
+    }
+
+    /// @brief 判断FAT文件系统的shut bit是否正常。
+    /// shut bit 表示文件系统是否正常卸载。如果这一位是1,则表示这个卷是“干净的”
+    /// 参考资料：https://thestarman.pcministry.com/DOS/DirtyShutdownFlag.html
+    ///
+    /// @return Ok(true) 正常
+    /// @return Ok(false) 不正常
+    /// @return Err(i32) 在判断时发生错误
+    pub fn is_shut_bit_ok(&mut self) -> Result<bool, i32> {
+        match self.bpb.fat_type {
+            FATType::FAT32(_) => {
+                // 对于FAT32, error bit位于第一个扇区的第8字节。
+                let bit = self.get_fat_entry_raw(Cluster::new(1))? & 0x0800_0000;
+                return Ok(bit > 0);
+            }
+            FATType::FAT16(_) => {
+                let bit = self.get_fat_entry_raw(Cluster::new(1))? & 0x8000;
+                return Ok(bit > 0);
+            }
+            _ => return Ok(true),
+        }
+    }
+
+    /// @brief 判断FAT文件系统的hard error bit是否正常。
+    /// 如果此位为0，则文件系统驱动程序在上次安装卷时遇到磁盘 I/O 错误，这表明
+    /// 卷上的某些扇区可能已损坏。
+    /// 参考资料：https://thestarman.pcministry.com/DOS/DirtyShutdownFlag.html
+    ///
+    /// @return Ok(true) 正常
+    /// @return Ok(false) 不正常
+    /// @return Err(i32) 在判断时发生错误
+    pub fn is_hard_error_bit_ok(&mut self) -> Result<bool, i32> {
+        match self.bpb.fat_type {
+            FATType::FAT32(_) => {
+                let bit = self.get_fat_entry_raw(Cluster::new(1))? & 0x0400_0000;
+                return Ok(bit > 0);
+            }
+            FATType::FAT16(_) => {
+                let bit = self.get_fat_entry_raw(Cluster::new(1))? & 0x4000;
+                return Ok(bit > 0);
+            }
+            _ => return Ok(true),
+        }
+    }
+
+    /// @brief 设置文件系统的shut bit为正常状态
+    /// 参考资料：https://thestarman.pcministry.com/DOS/DirtyShutdownFlag.html
+    ///
+    /// @return Ok(()) 设置成功
+    /// @return Err(i32) 在设置过程中，出现错误
+    pub fn set_shut_bit_ok(&mut self) -> Result<(), i32> {
+        match self.bpb.fat_type {
+            FATType::FAT32(_) => {
+                let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x0800_0000;
+                self.set_entry(Cluster::new(1), FATEntry::Next(Cluster::new(raw_entry)))?;
+
+                return Ok(());
+            }
+
+            FATType::FAT16(_) => {
+                let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x8000;
+                self.set_entry(Cluster::new(1), FATEntry::Next(Cluster::new(raw_entry)))?;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+
+    /// @brief 设置文件系统的hard error bit为正常状态
+    /// 参考资料：https://thestarman.pcministry.com/DOS/DirtyShutdownFlag.html
+    ///
+    /// @return Ok(()) 设置成功
+    /// @return Err(i32) 在设置过程中，出现错误
+    pub fn set_hard_error_bit_ok(&mut self) -> Result<(), i32> {
+        match self.bpb.fat_type {
+            FATType::FAT32(_) => {
+                let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x0400_0000;
+                self.set_entry(Cluster::new(1), FATEntry::Next(Cluster::new(raw_entry)))?;
+                return Ok(());
+            }
+
+            FATType::FAT16(_) => {
+                let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x4000;
+                self.set_entry(Cluster::new(1), FATEntry::Next(Cluster::new(raw_entry)))?;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+
+    /// @brief 执行文件系统卸载前的一些准备工作：设置好对应的标志位，并把缓存中的数据刷入磁盘
+    pub fn umount(&mut self) -> Result<(), i32> {
+        self.fs_info.0.lock().flush(&self.partition)?;
+
+        self.set_shut_bit_ok()?;
+
+        self.set_hard_error_bit_ok()?;
+
+        self.partition.disk().sync()?;
+
+        return Ok(());
     }
 
     /// @brief 获取文件系统的最大簇号
@@ -643,13 +908,11 @@ impl FATFileSystem {
 
         match fat_type {
             FATType::FAT12(_) => {
-                let disk_bytes_offset: u64 =
+                let part_bytes_offset: u64 =
                     fat_type.get_fat_bytes_offset(start_cluster, fat_start_sector, bytes_per_sec);
-                let in_block_offset = self.get_in_block_offset(disk_bytes_offset);
+                let in_block_offset = self.get_in_block_offset(part_bytes_offset);
 
-                let lba = self.get_lba_from_offset(
-                    self.bytes_to_sector(self.get_in_partition_bytes_offset(disk_bytes_offset)),
-                );
+                let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
                 // 由于FAT12的FAT表不大于6K，因此直接读取6K
                 let num_lba = (6 * 1024) / LBA_SIZE;
@@ -690,16 +953,14 @@ impl FATFileSystem {
             FATType::FAT16(_) => {
                 // todo: 优化这里，减少读取磁盘的次数。
                 while cluster < end_cluster.cluster_num && cluster < max_cluster.cluster_num {
-                    let disk_bytes_offset: u64 = fat_type.get_fat_bytes_offset(
+                    let part_bytes_offset: u64 = fat_type.get_fat_bytes_offset(
                         Cluster::new(cluster),
                         fat_start_sector,
                         bytes_per_sec,
                     );
-                    let in_block_offset = self.get_in_block_offset(disk_bytes_offset);
+                    let in_block_offset = self.get_in_block_offset(part_bytes_offset);
 
-                    let lba = self.get_lba_from_offset(
-                        self.bytes_to_sector(self.get_in_partition_bytes_offset(disk_bytes_offset)),
-                    );
+                    let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
                     let mut v: Vec<u8> = Vec::new();
                     v.resize(self.lba_per_sector() * LBA_SIZE, 0);
@@ -724,16 +985,14 @@ impl FATFileSystem {
             FATType::FAT32(_) => {
                 // todo: 优化这里，减少读取磁盘的次数。
                 while cluster < end_cluster.cluster_num && cluster < max_cluster.cluster_num {
-                    let disk_bytes_offset: u64 = fat_type.get_fat_bytes_offset(
+                    let part_bytes_offset: u64 = fat_type.get_fat_bytes_offset(
                         Cluster::new(cluster),
                         fat_start_sector,
                         bytes_per_sec,
                     );
-                    let in_block_offset = self.get_in_block_offset(disk_bytes_offset);
+                    let in_block_offset = self.get_in_block_offset(part_bytes_offset);
 
-                    let lba = self.get_lba_from_offset(
-                        self.bytes_to_sector(self.get_in_partition_bytes_offset(disk_bytes_offset)),
-                    );
+                    let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
                     let mut v: Vec<u8> = Vec::new();
                     v.resize(self.lba_per_sector() * LBA_SIZE, 0);
@@ -763,8 +1022,8 @@ impl FATFileSystem {
     /// @param cluster 目标簇
     /// @param fat_entry 这个簇在FAT表中，存储的信息（下一个簇的簇号）
     pub fn set_entry(&self, cluster: Cluster, fat_entry: FATEntry) -> Result<(), i32> {
-        // fat表项在磁盘上的字节偏移量
-        let fat_disk_bytes_offset: u64 = self.bpb.fat_type.get_fat_bytes_offset(
+        // fat表项在分区上的字节偏移量
+        let fat_part_bytes_offset: u64 = self.bpb.fat_type.get_fat_bytes_offset(
             cluster,
             self.fat_start_sector(),
             self.bpb.bytes_per_sector as u64,
@@ -780,11 +1039,9 @@ impl FATFileSystem {
                     FATEntry::Next(c) => c.cluster_num as u16,
                 };
 
-                let in_block_offset = self.get_in_block_offset(fat_disk_bytes_offset);
+                let in_block_offset = self.get_in_block_offset(fat_part_bytes_offset);
 
-                let lba = self.get_lba_from_offset(
-                    self.bytes_to_sector(self.get_in_partition_bytes_offset(fat_disk_bytes_offset)),
-                );
+                let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
                 let mut v: Vec<u8> = Vec::new();
                 v.resize(LBA_SIZE, 0);
@@ -815,11 +1072,9 @@ impl FATFileSystem {
                     FATEntry::Next(c) => c.cluster_num as u16,
                 };
 
-                let in_block_offset = self.get_in_block_offset(fat_disk_bytes_offset);
+                let in_block_offset = self.get_in_block_offset(fat_part_bytes_offset);
 
-                let lba = self.get_lba_from_offset(
-                    self.bytes_to_sector(self.get_in_partition_bytes_offset(fat_disk_bytes_offset)),
-                );
+                let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
                 let mut v: Vec<u8> = Vec::new();
                 v.resize(LBA_SIZE, 0);
@@ -829,7 +1084,7 @@ impl FATFileSystem {
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
 
                 cursor.write_u16(raw_val)?;
-                self.partition.disk().write_at(lba, 1, cursor.as_slice());
+                self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
 
                 return Ok(());
             }
@@ -840,14 +1095,14 @@ impl FATFileSystem {
                 } else {
                     self.bpb.num_fats as u64
                 };
-
+                // kdebug!("set entry, bound={bound}, fat_size={fat_size}");
                 for i in 0..bound {
                     // 当前操作的FAT表在磁盘上的字节偏移量
-                    let f_offset: u64 = fat_disk_bytes_offset + i * fat_size;
+                    let f_offset: u64 = fat_part_bytes_offset + i * fat_size;
                     let in_block_offset: u64 = self.get_in_block_offset(f_offset);
-                    let lba = self.get_lba_from_offset(
-                        self.bytes_to_sector(self.get_in_partition_bytes_offset(f_offset)),
-                    );
+                    let lba = self.get_lba_from_offset(self.bytes_to_sector(f_offset));
+
+                    // kdebug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
                     let mut v: Vec<u8> = Vec::new();
                     v.resize(LBA_SIZE, 0);
                     self.partition.disk().read_at(lba, 1, &mut v)?;
@@ -880,6 +1135,8 @@ impl FATFileSystem {
                     // 恢复保留位
                     raw_val |= old_bits;
 
+                    // kdebug!("sent entry, raw_val={raw_val}");
+
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                     cursor.write_u32(raw_val)?;
 
@@ -906,6 +1163,12 @@ impl FATFileSystem {
     }
 }
 
+impl Drop for FATFileSystem {
+    fn drop(&mut self) {
+        self.umount();
+    }
+}
+
 impl FATFsInfo {
     const LEAD_SIG: u32 = 0x41615252;
     const STRUC_SIG: u32 = 0x61417272;
@@ -915,22 +1178,20 @@ impl FATFsInfo {
     /// @brief 从磁盘上读取FAT文件系统的FSInfo结构体
     ///
     /// @param partition 磁盘分区
-    /// @param fs_info_offset FSInfo扇区在分区内的偏移量（单位：扇区）
+    /// @param in_disk_fs_info_offset FSInfo扇区在磁盘内的字节偏移量（单位：字节）
     /// @param bytes_per_sec 每扇区字节数
     pub fn new(
         partition: Arc<Partition>,
-        fs_info_offset: u16,
+        in_disk_fs_info_offset: u64,
         bytes_per_sec: usize,
     ) -> Result<Self, i32> {
         let mut v = Vec::<u8>::new();
         v.resize(bytes_per_sec, 0);
 
-        // 从磁盘读取数据
-        partition.disk().read_at(
-            partition.lba_start as usize + (fs_info_offset as usize) * (bytes_per_sec / LBA_SIZE),
-            1,
-            &mut v,
-        )?;
+        // 计算fs_info扇区在磁盘上的字节偏移量，从磁盘读取数据
+        partition
+            .disk()
+            .read_at(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
         let mut cursor = VecCursor::new(v);
 
         let mut fsinfo = FATFsInfo::default();
@@ -945,6 +1206,7 @@ impl FATFsInfo {
 
         fsinfo.trail_sig = cursor.read_u32()?;
         fsinfo.dirty = false;
+        fsinfo.offset = Some(in_disk_fs_info_offset);
 
         if fsinfo.is_valid() {
             return Ok(fsinfo);
@@ -1009,6 +1271,61 @@ impl FATFsInfo {
             n => return Some(n as u64),
         };
     }
+
+    /// @brief 把fs info刷入磁盘
+    ///
+    /// @param partition fs info所在的分区
+    pub fn flush(&self, partition: &Arc<Partition>) -> Result<(), i32> {
+        if let Some(off) = self.offset {
+            let in_block_offset = off % LBA_SIZE as u64;
+
+            let lba = off as usize / LBA_SIZE;
+
+            let mut v: Vec<u8> = Vec::new();
+            v.resize(LBA_SIZE, 0);
+            partition.disk().read_at(lba, 1, &mut v)?;
+
+            let mut cursor: VecCursor = VecCursor::new(v);
+            cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
+
+            cursor.write_u32(self.lead_sig)?;
+            cursor.seek(SeekFrom::SeekCurrent(480))?;
+            cursor.write_u32(self.struc_sig)?;
+            cursor.write_u32(self.free_count)?;
+            cursor.write_u32(self.next_free)?;
+            cursor.seek(SeekFrom::SeekCurrent(12))?;
+            cursor.write_u32(self.trail_sig)?;
+
+            partition.disk().write_at(lba, 1, cursor.as_slice())?;
+        }
+        return Ok(());
+    }
+
+    /// @brief 读取磁盘上的Fs Info扇区，将里面的内容更新到结构体中
+    ///
+    /// @param partition fs info所在的分区
+    pub fn update(&mut self, partition: Arc<Partition>) -> Result<(), i32> {
+        if let Some(off) = self.offset {
+            let in_block_offset = off % LBA_SIZE as u64;
+
+            let lba = off as usize / LBA_SIZE;
+
+            let mut v: Vec<u8> = Vec::new();
+            v.resize(LBA_SIZE, 0);
+            partition.disk().read_at(lba, 1, &mut v)?;
+            let mut cursor: VecCursor = VecCursor::new(v);
+            cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
+            self.lead_sig = cursor.read_u32()?;
+
+            cursor.seek(SeekFrom::SeekCurrent(480))?;
+            self.struc_sig = cursor.read_u32()?;
+            self.free_count = cursor.read_u32()?;
+            self.next_free = cursor.read_u32()?;
+            cursor.seek(SeekFrom::SeekCurrent(12))?;
+            self.trail_sig = cursor.read_u32()?;
+        }
+        return Ok(());
+    }
 }
 
 impl IndexNode for LockedFATInode {
@@ -1019,7 +1336,25 @@ impl IndexNode for LockedFATInode {
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
-        todo!()
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        match &guard.inode_type {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                let r = f.read(
+                    &guard.fs.upgrade().unwrap(),
+                    &mut buf[0..len],
+                    offset as u64,
+                );
+                guard.update_metadata();
+                return r;
+            }
+            FATDirEntry::Dir(_) => {
+                return Err(-(EISDIR as i32));
+            }
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(-(EROFS as i32));
+            }
+        }
     }
 
     fn write_at(
@@ -1029,7 +1364,23 @@ impl IndexNode for LockedFATInode {
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
-        todo!()
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+
+        match &mut guard.inode_type {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                let r = f.write(fs, &buf[0..len], offset as u64);
+                guard.update_metadata();
+                return r;
+            }
+            FATDirEntry::Dir(_) => {
+                return Err(-(EISDIR as i32));
+            }
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(-(EROFS as i32));
+            }
+        }
     }
 
     fn poll(&self) -> Result<PollStatus, i32> {
@@ -1044,6 +1395,41 @@ impl IndexNode for LockedFATInode {
         return Ok(PollStatus {
             flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
         });
+    }
+
+    fn create(
+        &self,
+        name: &str,
+        file_type: FileType,
+        _mode: u32,
+    ) -> Result<Arc<dyn IndexNode>, i32> {
+        // 由于FAT32不支持文件权限的功能，因此忽略mode参数
+
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+
+        match &mut guard.inode_type {
+            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
+                return Err(-(ENOTDIR as i32));
+            }
+            FATDirEntry::Dir(d) => match file_type {
+                FileType::File => {
+                    d.create_file(name, fs)?;
+                    return Ok(guard.find(name)?);
+                }
+                FileType::Dir => {
+                    d.create_dir(name, fs)?;
+                    return Ok(guard.find(name)?);
+                }
+
+                FileType::SymLink => return Err(-(ENOTSUP as i32)),
+                _ => return Err(-(EINVAL as i32)),
+            },
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(-(EROFS as i32));
+            }
+        }
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -1078,6 +1464,54 @@ impl IndexNode for LockedFATInode {
                 kerror!("FATFS: param: Inode_type uninitialized.");
                 return Err(-(EROFS as i32));
             }
+        }
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let target = guard.find(name)?;
+        return Ok(target);
+    }
+
+    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        return Ok(());
+    }
+
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+        return Ok(());
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), i32> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let target: Arc<LockedFATInode> = guard.find(name)?;
+        // 对目标inode上锁，以防更改
+        let target_guard: SpinLockGuard<FATInode> = target.0.lock();
+        // 先从缓存删除
+        guard.children.remove(&name.to_uppercase());
+
+        let dir = match &guard.inode_type {
+            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
+                return Err(-(ENOTDIR as i32));
+            }
+            FATDirEntry::Dir(d) => d,
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(-(EROFS as i32));
+            }
+        };
+
+        // 再从磁盘删除
+        let r: Result<(), i32> = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
+        if r.is_ok() {
+            return r;
+        } else {
+            let r = r.unwrap_err();
+            if r == -(ENOTEMPTY as i32) {
+                // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
+                drop(target_guard);
+                guard.children.insert(name.to_uppercase(), target);
+            }
+            return Err(r);
         }
     }
 }

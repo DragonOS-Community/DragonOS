@@ -1,6 +1,11 @@
 use alloc::{string::String, sync::Arc};
 
-use crate::{include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE}, io::SeekFrom, filesystem::procfs::ProcfsFilePrivateData, kdebug};
+use crate::{
+    filesystem::procfs::ProcfsFilePrivateData,
+    include::bindings::bindings::{EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE},
+    io::SeekFrom,
+    kdebug,
+};
 
 use super::{FileType, IndexNode, Metadata};
 
@@ -10,10 +15,10 @@ pub enum FilePrivateData {
     // procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
     // 不需要文件私有信息
-    Unused
+    Unused,
 }
 
-impl Default for FilePrivateData{
+impl Default for FilePrivateData {
     fn default() -> Self {
         return Self::Unused;
     }
@@ -59,6 +64,7 @@ pub enum FileMode {
 }
 
 /// @brief 抽象文件结构体
+#[derive(Debug)]
 pub struct File {
     inode: Arc<dyn IndexNode>,
     offset: usize,
@@ -72,7 +78,7 @@ impl File {
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
     pub fn new(inode: Arc<dyn IndexNode>, mode: u32) -> Result<Self, i32> {
-        let mut f =  File {
+        let mut f = File {
             inode,
             offset: 0,
             mode,
@@ -99,7 +105,9 @@ impl File {
             return Err(-(ENOBUFS as i32));
         }
 
-        let len = self.inode.read_at(self.offset, len, buf, &mut self.private_data)?;
+        let len = self
+            .inode
+            .read_at(self.offset, len, buf, &mut self.private_data)?;
 
         return Ok(len);
     }
@@ -117,7 +125,9 @@ impl File {
         if buf.len() < len {
             return Err(-(ENOBUFS as i32));
         }
-        let len = self.inode.write_at(self.offset, len, buf, &mut FilePrivateData::Unused)?;
+        let len = self
+            .inode
+            .write_at(self.offset, len, buf, &mut FilePrivateData::Unused)?;
         return Ok(len);
     }
 
@@ -185,7 +195,7 @@ impl File {
     }
 }
 
-impl Drop for File{
+impl Drop for File {
     fn drop(&mut self) {
         self.inode.close(&mut self.private_data).ok();
     }

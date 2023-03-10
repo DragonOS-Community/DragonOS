@@ -40,6 +40,7 @@ extern crate lazy_static;
 
 use crate::driver::disk::ahci::__test_ahci;
 use crate::filesystem::devfs::__test_dev;
+use filesystem::vfs::core::_test_procfs_2;
 use mm::allocator::KernelAllocator;
 
 // <3>
@@ -103,4 +104,9 @@ pub extern "C" fn __rust_demo_func() -> i32 {
 #[no_mangle]
 pub extern "C" fn rs_procfs_register_pid(pid: i64) {
     _test_procfs(pid);
+}
+
+#[no_mangle]
+pub extern "C" fn rs_procfs_unregister_pid(pid: i64){
+    _test_procfs_2(pid);
 }

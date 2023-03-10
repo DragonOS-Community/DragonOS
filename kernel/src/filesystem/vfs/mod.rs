@@ -10,11 +10,11 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
+    kdebug,
     time::TimeSpec,
 };
 
-/// 这里pub use了其他模块的类型
-pub use self::{file::FilePrivateData, mount::MountFS};
+pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: u32 = 1024;
@@ -318,7 +318,7 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (self.fs().root_inode(), String::from(rest))
+            (ROOT_INODE.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))

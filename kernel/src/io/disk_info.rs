@@ -44,7 +44,6 @@ impl Partition {
         });
     }
 
-    
     /// @brief 获取当前分区所属的磁盘的Arc指针
     #[inline]
     pub fn disk(&self) -> Arc<dyn BlockDevice> {

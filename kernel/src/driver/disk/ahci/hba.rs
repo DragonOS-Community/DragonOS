@@ -9,8 +9,11 @@ use core::sync::atomic::compiler_fence;
 /// 根据 AHCI 写出 HBA 的 Command
 pub const ATA_CMD_READ_DMA_EXT: u8 = 0x25; // 读操作，并且退出
 pub const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35; // 写操作，并且退出
+#[allow(dead_code)]
 pub const ATA_CMD_IDENTIFY: u8 = 0xEC;
+#[allow(dead_code)]
 pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
+#[allow(dead_code)]
 pub const ATA_CMD_PACKET: u8 = 0xA0;
 pub const ATA_DEV_BUSY: u8 = 0x80;
 pub const ATA_DEV_DRQ: u8 = 0x08;
@@ -19,6 +22,7 @@ pub const HBA_PORT_CMD_CR: u32 = 1 << 15;
 pub const HBA_PORT_CMD_FR: u32 = 1 << 14;
 pub const HBA_PORT_CMD_FRE: u32 = 1 << 4;
 pub const HBA_PORT_CMD_ST: u32 = 1;
+#[allow(dead_code)]
 pub const HBA_PORT_IS_ERR: u32 = 1 << 30 | 1 << 29 | 1 << 28 | 1 << 27;
 pub const HBA_SSTS_PRESENT: u32 = 0x3;
 pub const HBA_SIG_ATA: u32 = 0x00000101;
@@ -237,6 +241,7 @@ impl HbaPort {
 }
 
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum FisType {
     /// Register FIS - host to device
     RegH2D = 0x27,
@@ -291,6 +296,7 @@ pub struct FisRegH2D {
 }
 
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct FisRegD2H {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_REG_D2H
@@ -322,6 +328,7 @@ pub struct FisRegD2H {
 }
 
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct FisData {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_DATA
@@ -335,6 +342,7 @@ pub struct FisData {
 }
 
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct FisPioSetup {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_PIO_SETUP
@@ -368,6 +376,7 @@ pub struct FisPioSetup {
 }
 
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct FisDmaSetup {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_DMA_SETUP

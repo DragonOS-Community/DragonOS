@@ -640,6 +640,8 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     msi_desc.pci.msi_attribute.is_64 = 1;
     msi_desc.pci.msi_attribute.is_msix = 1;
     io_mfence();
+    //因pci_enable_msi不再单独映射MSIX表，所以需要对pci设备的bar进行映射
+    
     int retval = pci_enable_msi(&msi_desc);
 
     return 0;

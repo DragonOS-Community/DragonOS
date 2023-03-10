@@ -39,7 +39,7 @@
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
-
+#include <driver/virtio/virtio.h>
 ul bsp_idt_size, bsp_gdt_size;
 
 #pragma GCC push_options
@@ -71,14 +71,11 @@ void reload_idt()
 // 初始化系统各模块
 void system_initialize()
 {
-
     c_uart_init(COM1, 115200);
     video_init();
-
     scm_init();
     textui_init();
     kinfo("Kernel Starting...");
-
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 
@@ -165,7 +162,7 @@ void system_initialize()
     io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
-
+    
     process_init();
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
@@ -178,7 +175,7 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
-
+    c_virtio_probe();
     // 这里不能删除，否则在O1会报错
     // while (1)
     //     pause();

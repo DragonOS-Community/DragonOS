@@ -71,7 +71,7 @@ static __always_inline struct pci_msi_cap_t __msi_read_cap_list(struct msi_desc_
 }
 
 /**
- * @brief 映射设备的msix表
+ * @brief 映射设备的msix表  //MSIX表不再单独映射
  *
  * @param pci_dev pci设备信息结构体
  * @param msix_cap msix capability list的结构体
@@ -178,7 +178,6 @@ int pci_enable_msi(struct msi_desc_t *msi_desc)
         kdebug("is msix");
         // 读取msix的信息
         struct pci_msix_cap_t cap = __msi_read_msix_cap_list(msi_desc, cap_ptr);
-        // 映射msix table
         __msix_map_table(msi_desc->pci_dev, &cap);
         io_mfence();
         // 设置msix的中断

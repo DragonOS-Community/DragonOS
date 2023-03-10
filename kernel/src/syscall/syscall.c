@@ -477,6 +477,9 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }
+uint64_t sys_pipe(struct pt_regs *regs){
+    return -ENOTSUP;
+}
 
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,

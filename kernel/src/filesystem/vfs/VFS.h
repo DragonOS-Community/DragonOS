@@ -232,7 +232,7 @@ int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned ch
  *
  * @return int 错误码
  */
-int vfs_init();
+extern int vfs_init();
 
 /**
  * @brief 动态分配dentry以及路径字符串名称

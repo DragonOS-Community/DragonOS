@@ -686,15 +686,3 @@ struct vfs_index_node_t *vfs_alloc_inode()
     inode->lockref.count = 1; // 初始化引用计数为1
     return inode;
 }
-
-/**
- * @brief 初始化vfs
- *
- * @return int 错误码
- */
-int vfs_init()
-{
-    mount_init();
-    rootfs_init();
-    return 0;
-}

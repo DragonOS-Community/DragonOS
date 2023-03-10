@@ -363,7 +363,7 @@ struct ahci_request_packet_t
  * @brief 初始化ahci模块
  *
  */
-void ahci_init();
+extern void ahci_init();
 
 /**
  * @brief 检测端口连接的设备的类型

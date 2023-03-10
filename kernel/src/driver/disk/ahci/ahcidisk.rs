@@ -1,6 +1,9 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
+use crate::driver::disk::ahci::HBA_PxIS_TFES;
 use crate::filesystem::mbr::MbrDiskPartionTable;
-use crate::include::bindings::bindings::{E2BIG, E_NOEMPTYSLOT, E_PORT_HUNG, E_TASK_FILE_ERROR};
+use crate::include::bindings::bindings::{E2BIG, EIO};
+use crate::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
+
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::{
     driver::disk::ahci::{
@@ -12,10 +15,7 @@ use crate::{
     },
     kerror,
 };
-use crate::{
-    include::bindings::bindings::HBA_PxIS_TFES,
-    io::{device::BlockDevice, disk_info::Partition, SeekFrom},
-};
+
 use alloc::sync::Weak;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -73,7 +73,7 @@ impl AhciDisk {
         let slot = port.find_cmdslot().unwrap_or(u32::MAX);
 
         if slot == u32::MAX {
-            return Err(-(E_NOEMPTYSLOT as i32));
+            return Err(-(EIO as i32));
         }
 
         let cmdheader: &mut HbaCmdHeader = unsafe {
@@ -161,7 +161,7 @@ impl AhciDisk {
 
         if spin_count == SPIN_LIMIT {
             kerror!("Port is hung");
-            return Err(-(E_PORT_HUNG as i32));
+            return Err(-(EIO as i32));
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
@@ -173,7 +173,7 @@ impl AhciDisk {
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
                 kerror!("Read disk error");
-                return Err(-(E_TASK_FILE_ERROR as i32));
+                return Err(-(EIO as i32));
             }
         }
 
@@ -204,7 +204,7 @@ impl AhciDisk {
         let slot = port.find_cmdslot().unwrap_or(u32::MAX);
 
         if slot == u32::MAX {
-            return Err(-(E_NOEMPTYSLOT as i32));
+            return Err(-(EIO as i32));
         }
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -293,7 +293,7 @@ impl AhciDisk {
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
                 kerror!("Write disk error");
-                return Err(-(E_TASK_FILE_ERROR as i32));
+                return Err(-(EIO as i32));
             }
         }
 

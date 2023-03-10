@@ -227,6 +227,7 @@ impl Drop for File {
     }
 }
 
+
 /// @brief pcb里面的文件描述符数组
 #[derive(Debug, Clone)]
 pub struct FileDescriptorVec {
@@ -262,9 +263,9 @@ impl FileDescriptorVec {
     }
 
     /// @brief 判断文件描述符序号是否合法
-    ///
+    /// 
     /// @return true 合法
-    ///
+    /// 
     /// @return false 不合法
     #[inline]
     pub fn validate_fd(fd: i32) -> bool {

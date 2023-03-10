@@ -11,7 +11,6 @@ use crate::{
     include::bindings::bindings::{
         process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_RUNNING, PROC_STOPPED,
     },
-    kdebug,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
 };
@@ -113,17 +112,13 @@ impl process_control_block {
     /// @brief 初始化进程PCB的文件描述符数组。
     /// 请注意，如果当前进程已经有文件描述符数组，那么本操作将被禁止
     pub fn init_files(&mut self) -> Result<(), i32> {
-        kdebug!("to init files, pid={}", self.pid);
-        kdebug!(" self.fds=0x{:016x}", self.fds as usize);
         if self.fds != null_mut() {
             // 这个操作不被允许，否则会产生内存泄露。
             // 原因是，C的pcb里面，文件描述符数组的生命周期是static的，如果继续执行，会产生内存泄露的问题。
             return Err(-(EPERM as i32));
         }
         let fd_vec: &mut FileDescriptorVec = Box::leak(FileDescriptorVec::new());
-        kdebug!("1234");
         self.fds = fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
-        kdebug!("pid {} init files ok", self.pid);
         return Ok(());
     }
 
@@ -139,7 +134,6 @@ impl process_control_block {
         clone_flags: u64,
         from: &'static process_control_block,
     ) -> Result<(), i32> {
-        kdebug!("process copy files, from pid={}", from.pid);
         // 不拷贝父进程的文件描述符
         if clone_flags & CLONE_FS as u64 != 0 {
             // 由于拷贝pcb的时候，直接copy的指针，因此这里置为空
@@ -154,14 +148,12 @@ impl process_control_block {
         } else {
             return self.init_files();
         };
-        kdebug!("old fds = {old_fds:?}");
 
         // 拷贝文件描述符数组
         let new_fd_vec: &mut FileDescriptorVec = Box::leak(Box::new(old_fds.clone()));
 
         self.fds = new_fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
 
-        kdebug!("Copy files ok");
         return Ok(());
     }
 

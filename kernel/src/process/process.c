@@ -148,7 +148,6 @@ int process_open_exec_file(char *path)
     tmp.r8 = (uint64_t)path;
     tmp.r9 = O_RDONLY;
     int fd = sys_open(&tmp);
-    kdebug("open exec file: path=%s, fd=%d", path, fd);
     return fd;
 }
 

@@ -5,7 +5,7 @@ use crate::{
     include::bindings::bindings::{
         pt_regs, verify_area, EINVAL, EPERM, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET,
     },
-    io::SeekFrom, kdebug,
+    io::SeekFrom, 
 };
 
 use super::{
@@ -28,8 +28,6 @@ pub extern "C" fn sys_open(regs: &pt_regs) -> u64 {
     }
     let path: &str = path.unwrap();
     let flags = regs.r9;
-
-    kdebug!("sys_open: path={path}, flags={flags}");
 
     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
     let r: Result<i32, i32> = do_open(path, open_flags);
@@ -72,6 +70,7 @@ pub extern "C" fn sys_read(regs: &pt_regs) -> u64 {
         // 来自用户态，而buffer在内核态，这样的操作不被允许
         return (-(EPERM as i32)) as u64;
     }
+    
     let buf: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len) };
 

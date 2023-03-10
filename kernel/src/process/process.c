@@ -483,23 +483,7 @@ struct process_control_block *process_init_rt_pcb(struct process_control_block *
     rt_pcb->virtual_runtime = 0x7fffffffffffffff;
     return rt_pcb;
 }
-int test(void *a)
-{
-    kinfo("this is test_-------------------");
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test_-------------------");
-    kinfo("this is test_-------------------");
-    usleep(990000);
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test_-------------------");
-    usleep(990000);
-    usleep(990000);
-    usleep(990000);
-    kinfo("this is test_-------------------");
-    return 0;
-}
+
 /**
  * @brief 内核init进程
  *
@@ -542,8 +526,8 @@ ul initial_kernel_thread(ul arg)
 
     // 测试实时进程
 
-    struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
-    kdebug("process:rt test kthread is created!!!!");
+    // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
+    // kdebug("process:rt test kthread is created!!!!");
 
     // 准备切换到用户态
     struct pt_regs *regs;

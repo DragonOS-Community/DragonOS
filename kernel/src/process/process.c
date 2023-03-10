@@ -142,13 +142,13 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
  * @param path
  * @return int 文件描述符编号
  */
-struct vfs_file_t *process_open_exec_file(char *path)
+int process_open_exec_file(char *path)
 {
     struct pt_regs tmp = {0};
     tmp.r8 = (uint64_t)path;
     tmp.r9 = O_RDONLY;
     int fd = sys_open(&tmp);
-    kdebug("open exec file: path=%s, fd=%d", path,fd);
+    kdebug("open exec file: path=%s, fd=%d", path, fd);
     return fd;
 }
 
@@ -164,14 +164,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     int retval = 0;
     int fd = process_open_exec_file(path);
 
-    if ((long)fd <= 0)
+    if ((long)fd < 0)
     {
         kdebug("(long)fd=%ld", (long)fd);
         return (unsigned long)fd;
     }
 
-    void *buf = kmalloc(PAGE_4K_SIZE, 0);
-    memset(buf, 0, PAGE_4K_SIZE);
+    void *buf = kzalloc(PAGE_4K_SIZE, 0);
     uint64_t pos = 0;
 
     struct pt_regs tmp_use_fs = {0};
@@ -242,6 +241,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     tmp_use_fs.r10 = SEEK_SET;
     pos = sys_lseek(&tmp_use_fs);
 
+    memset(buf, 0, PAGE_4K_SIZE);
     tmp_use_fs.r8 = fd;
     tmp_use_fs.r9 = (uint64_t)buf;
     tmp_use_fs.r10 = (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum;
@@ -252,7 +252,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     tmp_use_fs.r10 = SEEK_CUR;
     pos = sys_lseek(&tmp_use_fs);
 
-    if ((unsigned long)retval <= 0)
+    if ((long)retval < 0)
     {
         kdebug("(unsigned long)filp=%d", (long)retval);
         retval = -ENOEXEC;
@@ -260,7 +260,6 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     }
 
     Elf64_Phdr *phdr = buf;
-
     // 将程序加载到内存中
     for (int i = 0; i < ehdr.e_phnum; ++i, ++phdr)
     {
@@ -339,11 +338,28 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
             if (remain_file_size > 0)
             {
                 int64_t to_trans = (remain_file_size > PAGE_2M_SIZE) ? PAGE_2M_SIZE : remain_file_size;
-                tmp_use_fs.r8 = fd;
-                tmp_use_fs.r9 = (uint64_t)(virt_base + beginning_offset);
-                tmp_use_fs.r10 = (uint64_t)to_trans;
-                val = sys_read(&tmp_use_fs);
-                
+
+                void *buf3 = kzalloc(PAGE_4K_SIZE, 0);
+                while (to_trans > 0)
+                {
+                    int64_t x = 0;
+                    tmp_use_fs.r8 = fd;
+                    tmp_use_fs.r9 = (uint64_t)buf3;
+                    tmp_use_fs.r10 = to_trans;
+                    x = sys_read(&tmp_use_fs);
+                    memcpy(virt_base + beginning_offset + val, buf3, x);
+                    val += x;
+                    to_trans -= x;
+                    tmp_use_fs.r8 = fd;
+                    tmp_use_fs.r9 = 0;
+                    tmp_use_fs.r10 = SEEK_CUR;
+                    pos = sys_lseek(&tmp_use_fs);
+                }
+                kfree(buf3);
+
+                // kdebug("virt_base + beginning_offset=%#018lx, val=%d, to_trans=%d", virt_base + beginning_offset, val,
+                //        to_trans);
+                // kdebug("to_trans=%d", to_trans);
             }
 
             if (val < 0)

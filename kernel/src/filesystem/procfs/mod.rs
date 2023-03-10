@@ -126,15 +126,15 @@ impl ProcFSInode {
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
-        kdebug!("pcb.name={:?}", pcb.name);
+        // kdebug!("pcb.name={:?}", pcb.name);
         let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
         for val in pcb.name.iter() {
             tmp_name.push(*val as u8);
         }
-        kdebug!(
-            "pcb.tmp_name={}",
-            String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
-        );
+        // kdebug!(
+        //     "pcb.tmp_name={}",
+        //     String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
+        // );
 
         pdata.append(
             &mut format!(
@@ -187,9 +187,6 @@ impl ProcFSInode {
         // 去除多余的\0
         self.trim_string(pdata);
 
-        kdebug!("status got!");
-        kdebug!("ProcfsFilePrivateData:{:?}", pdata);
-        kdebug!("open_status success!");
         return Ok((pdata.len() * size_of::<u8>()) as i64);
     }
 
@@ -322,7 +319,6 @@ impl ProcFS {
 
 impl IndexNode for LockedProcFSInode {
     fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
-        kdebug!("open in!");
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
@@ -338,7 +334,7 @@ impl IndexNode for LockedProcFSInode {
         *data = FilePrivateData::Procfs(private_data);
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
-        kdebug!("open success!");
+
         return Ok(());
     }
 
@@ -537,7 +533,7 @@ impl IndexNode for LockedProcFSInode {
 
         // 将子inode插入父inode的B树中
         inode.children.insert(String::from(name), result.clone());
-        kdebug!("created file!");
+
         return Ok(result);
     }
 

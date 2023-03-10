@@ -1,10 +1,12 @@
-use core::{ptr::null_mut, sync::atomic::compiler_fence};
+use core::{arch::x86_64::_rdtsc, ptr::null_mut, sync::atomic::compiler_fence};
 
 use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{process_control_block, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR},
+    include::bindings::bindings::{
+        process_control_block, Cpu_tsc_freq, MAX_CPU_NUM, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR,
+    },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
 };
@@ -23,7 +25,7 @@ pub fn __get_rt_scheduler() -> &'static mut SchedulerRT {
 
 /// @brief 初始化rt调度器
 pub unsafe fn sched_rt_init() {
-    kdebug!("test rt init");
+    kdebug!("rt scheduler init");
     if RT_SCHEDULER_PTR.is_null() {
         RT_SCHEDULER_PTR = Box::leak(Box::new(SchedulerRT::new()));
     } else {
@@ -93,7 +95,8 @@ impl RTQueue {
 
 /// @brief RT调度器类
 pub struct SchedulerRT {
-    cpu_queue: Vec<&'static mut RTQueue>,
+    cpu_queue: Vec<Vec<&'static mut RTQueue>>,
+    load_list: Vec<&'static mut LinkedList<u64>>,
 }
 
 impl SchedulerRT {
@@ -105,20 +108,31 @@ impl SchedulerRT {
         // todo: 从cpu模块来获取核心的数目
         let mut result = SchedulerRT {
             cpu_queue: Default::default(),
+            load_list: Default::default(),
         };
 
         // 为每个cpu核心创建队列
-        for _ in 0..SchedulerRT::MAX_RT_PRIO {
-            result.cpu_queue.push(Box::leak(Box::new(RTQueue::new())));
+        for cpu_id in 0..MAX_CPU_NUM {
+            result.cpu_queue.push(Vec::new());
+            // 每个CPU有MAX_RT_PRIO个优先级队列
+            for _ in 0..SchedulerRT::MAX_RT_PRIO {
+                result.cpu_queue[cpu_id as usize].push(Box::leak(Box::new(RTQueue::new())));
+            }
+        }
+        // 为每个cpu核心创建负载统计队列
+        for _ in 0..MAX_CPU_NUM {
+            result
+                .load_list
+                .push(Box::leak(Box::new(LinkedList::new())));
         }
         return result;
     }
     /// @brief 挑选下一个可执行的rt进程
-    pub fn pick_next_task_rt(&mut self) -> Option<&'static mut process_control_block> {
+    pub fn pick_next_task_rt(&mut self, cpu_id: u32) -> Option<&'static mut process_control_block> {
         // 循环查找，直到找到
         // 这里应该是优先级数量，而不是CPU数量，需要修改
         for i in 0..SchedulerRT::MAX_RT_PRIO {
-            let cpu_queue_i: &mut RTQueue = self.cpu_queue[i as usize];
+            let cpu_queue_i: &mut RTQueue = self.cpu_queue[cpu_id as usize][i as usize];
             let proc: Option<&'static mut process_control_block> = cpu_queue_i.dequeue();
             if proc.is_some() {
                 return proc;
@@ -128,7 +142,17 @@ impl SchedulerRT {
         None
     }
     pub fn get_rt_queue_len(&mut self, cpu_id: u32) -> usize {
-        return self.cpu_queue[cpu_id as usize].get_rt_queue_size();
+        let mut sum = 0;
+        for prio in 0..SchedulerRT::MAX_RT_PRIO {
+            sum += self.cpu_queue[cpu_id as usize][prio as usize].get_rt_queue_size();
+        }
+        return sum as usize;
+    }
+    pub fn get_load_list_len(&mut self, cpu_id: u32) -> usize {
+        return self.load_list[cpu_id as usize].len();
+    }
+    pub fn enqueue_front(&mut self, pcb: &'static mut process_control_block){
+        self.cpu_queue[pcb.cpu_id as usize][pcb.priority as usize].enqueue_front(pcb);
     }
 }
 
@@ -138,8 +162,9 @@ impl Scheduler for SchedulerRT {
     fn sched(&mut self) -> Option<&'static mut process_control_block> {
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
         // 正常流程下，这里一定是会pick到next的pcb的，如果是None的话，要抛出错误
+        let cpu_id = current_pcb().cpu_id;
         let proc: &'static mut process_control_block =
-            self.pick_next_task_rt().expect("No RT process found");
+            self.pick_next_task_rt(cpu_id).expect("No RT process found");
 
         // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
         if proc.policy == SCHED_FIFO {
@@ -173,14 +198,27 @@ impl Scheduler for SchedulerRT {
             }
             // curr优先级更大，说明一定是实时进程，将所选进程入队列，此时需要入队首
             else {
-                self.cpu_queue[proc.cpu_id as usize].enqueue_front(proc);
+                self.cpu_queue[cpu_id as usize][proc.cpu_id as usize].enqueue_front(proc);
             }
         }
         return None;
     }
 
     fn enqueue(&mut self, pcb: &'static mut process_control_block) {
+        let cpu_id = pcb.cpu_id;
         let cpu_queue = &mut self.cpu_queue[pcb.cpu_id as usize];
-        cpu_queue.enqueue(pcb);
+        cpu_queue[cpu_id as usize].enqueue(pcb);
+        // // 获取当前时间
+        // let time = unsafe { _rdtsc() };
+        // let freq = unsafe { Cpu_tsc_freq };
+        // // kdebug!("this is timeeeeeeer {},freq is {}, {}", time, freq, cpu_id);
+        // // 将当前时间加入负载记录队列
+        // self.load_list[cpu_id as usize].push_back(time);
+        // // 如果队首元素与当前时间差超过设定值，则移除队首元素
+        // while self.load_list[cpu_id as usize].len() > 1
+        //     && (time - *self.load_list[cpu_id as usize].front().unwrap() > 10000000000)
+        // {
+        //     self.load_list[cpu_id as usize].pop_front();
+        // }
     }
 }

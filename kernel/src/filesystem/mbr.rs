@@ -1,8 +1,5 @@
 use core::default::Default;
 
-pub const MBR_MAX_AHCI_CTRL_NUM: usize = 4; // 系统支持的最大的ahci控制器数量
-pub const MBR_MAX_AHCI_PORT_NUM: usize = 32; // 系统支持的每个ahci控制器对应的MBR磁盘数量（对应ahci磁盘号）
-
 /// @brief MBR硬盘分区表项的结构
 #[repr(packed)]
 #[derive(Debug, Clone, Copy)]

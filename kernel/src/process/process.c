@@ -50,6 +50,7 @@ extern struct sighand_struct INITIAL_SIGHAND;
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
+extern int process_init_files();
 
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                             \
@@ -86,7 +87,7 @@ struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_
  * @param pcb 要被回收的进程的pcb
  * @return uint64_t
  */
-uint64_t process_exit_files(struct process_control_block *pcb);
+extern int process_exit_files(struct process_control_block *pcb);
 
 /**
  * @brief 释放进程的页表
@@ -139,32 +140,15 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
  * @brief 打开要执行的程序文件
  *
  * @param path
- * @return struct vfs_file_t*
+ * @return int 文件描述符编号
  */
 struct vfs_file_t *process_open_exec_file(char *path)
 {
-    struct vfs_dir_entry_t *dentry = NULL;
-    struct vfs_file_t *filp = NULL;
-    // kdebug("path=%s", path);
-    dentry = vfs_path_walk(path, 0);
-
-    if (dentry == NULL)
-        return (void *)-ENOENT;
-
-    if (dentry->dir_inode->attribute == VFS_IF_DIR)
-        return (void *)-ENOTDIR;
-
-    filp = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
-    if (filp == NULL)
-        return (void *)-ENOMEM;
-
-    filp->position = 0;
-    filp->mode = 0;
-    filp->dEntry = dentry;
-    filp->mode = ATTR_READ_ONLY;
-    filp->file_ops = dentry->dir_inode->file_ops;
-
-    return filp;
+    struct pt_regs tmp = {0};
+    tmp.r8 = (uint64_t)path;
+    tmp.r9 = O_RDONLY;
+    int fd = sys_open(&tmp);
+    return fd;
 }
 
 /**
@@ -177,19 +161,32 @@ struct vfs_file_t *process_open_exec_file(char *path)
 static int process_load_elf_file(struct pt_regs *regs, char *path)
 {
     int retval = 0;
-    struct vfs_file_t *filp = process_open_exec_file(path);
+    int fd = process_open_exec_file(path);
 
-    if ((long)filp <= 0 && (long)filp >= -255)
+    if ((long)fd <= 0)
     {
-        kdebug("(long)filp=%ld", (long)filp);
-        return (unsigned long)filp;
+        kdebug("(long)fd=%ld", (long)fd);
+        return (unsigned long)fd;
     }
 
     void *buf = kmalloc(PAGE_4K_SIZE, 0);
     memset(buf, 0, PAGE_4K_SIZE);
     uint64_t pos = 0;
-    pos = filp->file_ops->lseek(filp, 0, SEEK_SET);
-    retval = filp->file_ops->read(filp, (char *)buf, sizeof(Elf64_Ehdr), &pos);
+
+    struct pt_regs tmp_use_fs = {0};
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = 0;
+    tmp_use_fs.r10 = SEEK_SET;
+    retval = sys_lseek(&tmp_use_fs);
+
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = (uint64_t)buf;
+    tmp_use_fs.r10 = sizeof(Elf64_Ehdr);
+    retval = sys_read(&tmp_use_fs);
+    if (retval != sizeof(Elf64_Ehdr))
+    {
+        kerror("retval=%d, not equal to sizeof(Elf64_Ehdr):%d", retval, sizeof(Elf64_Ehdr));
+    }
     retval = 0;
     if (!elf_check(buf))
     {
@@ -409,8 +406,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 
     // 关闭之前的文件描述符
     process_exit_files(current_pcb);
-
-    process_open_stdio(current_pcb);
+    process_init_files();
 
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
@@ -664,9 +660,7 @@ void process_init()
 
     // 初始化init进程的signal相关的信息
     initial_proc_init_signal(current_pcb);
-
-    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
-    process_open_stdio(current_pcb);
+    process_init_files();
 
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
@@ -740,38 +734,13 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (retval != 0)
         return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
-        current_pcb->flags |= PF_NEED_SCHED;
+    current_pcb->flags |= PF_NEED_SCHED;
 
     if (pcb->cpu_id == current_pcb->cpu_id)
         sched();
     else
         kick_cpu(pcb->cpu_id);
     return 0;
-}
-
-/**
- * @brief 回收进程的所有文件描述符
- *
- * @param pcb 要被回收的进程的pcb
- * @return uint64_t
- */
-uint64_t process_exit_files(struct process_control_block *pcb)
-{
-    // TODO: 当stdio不再被以-1来特殊处理时，在这里要释放stdio文件的内存
-
-    // 不与父进程共享文件描述符
-    if (!(pcb->flags & PF_VFORK))
-    {
-
-        for (int i = 3; i < PROC_MAX_FD_NUM; ++i)
-        {
-            if (pcb->fds[i] == NULL)
-                continue;
-            kfree(pcb->fds[i]);
-        }
-    }
-    // 清空当前进程的文件描述符列表
-    memset(pcb->fds, 0, sizeof(struct vfs_file_t *) * PROC_MAX_FD_NUM);
 }
 
 /**
@@ -871,28 +840,6 @@ int process_release_pcb(struct process_control_block *pcb)
 }
 
 /**
- * @brief 申请可用的文件句柄
- *
- * @return int
- */
-int process_fd_alloc(struct vfs_file_t *file)
-{
-    int fd_num = -1;
-
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-    {
-        /* 找到指针数组中的空位 */
-        if (current_pcb->fds[i] == NULL)
-        {
-            fd_num = i;
-            current_pcb->fds[i] = file;
-            break;
-        }
-    }
-    return fd_num;
-}
-
-/**
  * @brief 给pcb设置名字
  *
  * @param pcb 需要设置名字的pcb
@@ -915,15 +862,4 @@ static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_na
 void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
 {
     __set_pcb_name(pcb, pcb_name);
-}
-
-void process_open_stdio(struct process_control_block *pcb)
-{
-    // TODO: 这里是临时性的特殊处理stdio，待文件系统重构及tty设备实现后，需要改写这里
-    // stdin
-    pcb->fds[0] = -1UL;
-    // stdout
-    pcb->fds[1] = -1UL;
-    // stderr
-    pcb->fds[2] = -1UL;
 }

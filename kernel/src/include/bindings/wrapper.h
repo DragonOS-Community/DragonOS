@@ -25,9 +25,12 @@
 #include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
+#include <common/stdio.h>
 #include <common/time.h>
 #include <common/unistd.h>
 #include <driver/disk/ahci/ahci.h>
+#include <driver/disk/ahci/ahci_rust.h>
+#include <driver/pci/pci.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
 #include <mm/mm.h>

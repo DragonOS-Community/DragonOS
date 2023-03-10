@@ -35,12 +35,10 @@ mod time;
 extern crate alloc;
 #[macro_use]
 extern crate lazy_static;
-// #[macro_use]
-// extern crate uuid;
+#[macro_use]
+extern crate bitflags;
 
-use crate::driver::disk::ahci::__test_ahci;
-use crate::filesystem::devfs::__test_dev;
-use filesystem::vfs::core::_test_procfs_2;
+use crate::filesystem::vfs::core::_test_procfs_2;
 use mm::allocator::KernelAllocator;
 
 // <3>

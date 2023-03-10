@@ -3,6 +3,8 @@
 pub mod core;
 pub mod file;
 pub mod mount;
+mod syscall;
+mod utils;
 
 use ::core::{any::Any, fmt::Debug};
 
@@ -10,7 +12,6 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
-    kdebug,
     time::TimeSpec,
 };
 
@@ -277,6 +278,13 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 在当前Inode下，挂载一个新的文件系统
     /// 请注意！该函数只能被MountFS实现，其他文件系统不应实现这个函数
     fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
+        return Err(-(ENOTSUP as i32));
+    }
+
+    /// @brief 截断当前inode到指定的长度。如果当前文件长度小于len,则不操作。
+    /// 
+    /// @param len 要被截断到的目标长度
+    fn truncate(&self, _len: usize) -> Result<(), i32>{
         return Err(-(ENOTSUP as i32));
     }
 }

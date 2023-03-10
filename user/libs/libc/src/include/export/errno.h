@@ -78,7 +78,7 @@ extern "C"
 #define ENOTCONN 56        /* 套接字未连接 The socket is not connected. */
 #define ENOTDIR 57         /* 不是目录 Not a directory. */
 #define ENOTEMPTY 58       /* 目录非空 Directory not empty. */
-#define ENOTRECOVERABLE 59 /* 状态不可覆盖 State not recoverable. */
+#define ENOTRECOVERABLE 59 /* 状态不可恢复 State not recoverable. */
 
 #define ENOTSOCK 60 /* 不是一个套接字 Not a socket.*/
 #define ENOTSUP 61  /* 不被支持 Not supported (may be the same value as [EOPNOTSUPP]). */

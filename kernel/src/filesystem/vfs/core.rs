@@ -12,6 +12,7 @@ use alloc::{
 };
 
 use crate::{
+    arch::asm::current::current_pcb,
     driver::disk::ahci::{self, ahci_rust_init},
     filesystem::{
         devfs::{register_bultinin_device, DevFS},
@@ -21,10 +22,12 @@ use crate::{
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::{O_RDONLY, O_RDWR},
+    include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
+    io::SeekFrom,
     kdebug, kerror, println,
 };
 
-use super::{IndexNode, InodeId};
+use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -44,13 +47,7 @@ lazy_static! {
         let rootfs = MountFS::new(ramfs, None);
         let root_inode = rootfs.root_inode();
 
-        // ahci_rust_init().expect("ahci rust init failed.");
-        // let partiton:Arc<crate::io::disk_info::Partition>= ahci::get_disks_by_name("ahci_disk_0".to_string()).unwrap().0.lock().partitions[0].clone();
-        // let fatfs:Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
-        // if fatfs.is_err(){
-        //     kerror!("Failed to initialize fatfs, code={:?}", fatfs.err());
-        // }
-
+        test_fatfs();
         // 创建文件夹
         root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
         root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
@@ -195,19 +192,16 @@ fn test_fatfs() {
     //     print!("{}", *x as char);
     // }
 
-
     // 测试删除文件
 
     // let test3 = fat_root.find("test3").unwrap();
     // let r = test3.unlink("test_dir");
     // kdebug!("r = {r:?}");
-    
+
     // let a = test3.find("test_dir").unwrap().unlink("a");
     // assert!(a.is_ok());
     // let r = test3.unlink("test_dir");
     // assert!(r.is_ok());
-    
-    
 
     kdebug!("test_done");
     compiler_fence(Ordering::SeqCst);
@@ -253,7 +247,7 @@ fn __test_procfs(pid: i64) {
     let proc_inode = _t
         .find("status")
         .expect(&format!("Cannot find /proc/{}/status", pid));
-    let mut f = File::new(proc_inode, O_RDONLY).unwrap();
+    let mut f = File::new(proc_inode, FileMode::O_RDONLY).unwrap();
     kdebug!("file created!");
     kdebug!("proc.list()={:?}", _p.list().expect("list /proc failed."));
     let mut buf: Vec<u8> = Vec::new();
@@ -268,7 +262,7 @@ fn __test_procfs(pid: i64) {
 }
 
 // 解除进程注册测试
-fn __test_procfs_2(pid: i64){
+fn __test_procfs_2(pid: i64) {
     // 获取procfs实例
     let _p = ROOT_INODE.find("proc").unwrap();
 
@@ -277,13 +271,117 @@ fn __test_procfs_2(pid: i64){
     let fs = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
     kdebug!("to procfs_register_pid");
     // 调用解除注册函数
-    fs.procfs_unregister_pid(pid).expect("unregister pid failed");
+    fs.procfs_unregister_pid(pid)
+        .expect("unregister pid failed");
 
     kdebug!("procfs_unregister_pid:{} ok", pid);
 
     // 查看进程文件夹是否存在
-    kdebug!(
-        "proc.list()={:?}",
-        _p.list().expect("list /proc failed.")
-    );
+    kdebug!("proc.list()={:?}", _p.list().expect("list /proc failed."));
+}
+
+/// @brief 为当前进程打开一个文件
+pub fn do_open(path: &str, mode: FileMode) -> Result<i32, i32> {
+    // 文件名过长
+    if path.len() > PAGE_4K_SIZE as usize {
+        return Err(-(ENAMETOOLONG as i32));
+    }
+
+    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE.lookup(path);
+
+    let inode: Arc<dyn IndexNode> = if inode.is_err() {
+        let errno = inode.unwrap_err();
+        // 文件不存在，且需要创建
+        if mode.contains(FileMode::O_CREAT)
+            && !mode.contains(FileMode::O_DIRECTORY)
+            && errno == -(ENOENT as i32)
+        {
+            let (filename, parent_path) = rsplit_path(path);
+            // 查找父目录
+            let parent_inode: Arc<dyn IndexNode> = ROOT_INODE.lookup(parent_path.unwrap_or("/"))?;
+            // 创建文件
+            let inode: Arc<dyn IndexNode> = parent_inode.create(filename, FileType::File, 0o777)?;
+            inode
+        } else {
+            // 不需要创建文件，因此返回错误码
+            return Err(errno);
+        }
+    } else {
+        inode.unwrap()
+    };
+
+    let file_type: FileType = inode.metadata()?.file_type;
+    // 如果要打开的是文件夹，而目标不是文件夹
+    if mode.contains(FileMode::O_DIRECTORY) && file_type != FileType::Dir {
+        return Err(-(ENOTDIR as i32));
+    }
+
+    // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
+    if mode.contains(FileMode::O_TRUNC)
+        && (mode.contains(FileMode::O_RDWR) || mode.contains(FileMode::O_WRONLY))
+        && file_type == FileType::File
+    {
+        inode.truncate(0)?;
+    }
+
+    // 创建文件对象
+    let mut file: File = File::new(inode, mode)?;
+
+    // 打开模式为“追加”
+    if mode.contains(FileMode::O_APPEND) {
+        file.lseek(SeekFrom::SeekEnd(0))?;
+    }
+
+    // 把文件对象存入pcb
+    return current_pcb().alloc_fd(file);
+}
+
+/// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
+///
+/// @param fd 文件描述符编号
+/// @param buf 输出缓冲区。
+///
+/// @return Ok(usize) 成功读取的数据的字节数
+/// @return Err(i32) 读取失败，返回posix错误码
+pub fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
+    let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+    if file.is_none() {
+        return Err(-(EBADF as i32));
+    }
+    let file: &mut File = file.unwrap();
+
+    return file.read(buf.len(), buf);
+}
+
+/// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
+///
+/// @param fd 文件描述符编号
+/// @param buf 输入缓冲区。
+///
+/// @return Ok(usize) 成功写入的数据的字节数
+/// @return Err(i32) 写入失败，返回posix错误码
+pub fn do_write(fd: i32, buf: &[u8]) -> Result<usize, i32> {
+    let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+    if file.is_none() {
+        return Err(-(EBADF as i32));
+    }
+    let file: &mut File = file.unwrap();
+
+    return file.write(buf.len(), buf);
+}
+
+/// @brief 调整文件操作指针的位置
+///
+/// @param fd 文件描述符编号
+/// @param seek 调整的方式
+///
+/// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
+/// @return Err(i32) 调整失败，返回posix错误码
+pub fn do_lseek(fd: i32, seek: SeekFrom) -> Result<usize, i32> {
+    let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+    if file.is_none() {
+        return Err(-(EBADF as i32));
+    }
+    let file: &mut File = file.unwrap();
+    return file.lseek(seek);
 }

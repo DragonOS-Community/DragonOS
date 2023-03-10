@@ -144,12 +144,12 @@ void system_initialize()
     io_mfence();
 
     vfs_init();
-    devfs_init();
-    procfs_init();
+    // devfs_init();
+    // procfs_init();
 
     cpu_init();
     ps2_keyboard_init();
-    tty_init();
+    // tty_init();
     // ps2_mouse_init();
     // ata_init();
     pci_init();

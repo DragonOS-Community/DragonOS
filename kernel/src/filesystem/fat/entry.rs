@@ -12,9 +12,8 @@ use crate::{
         EROFS,
     },
     io::{device::LBA_SIZE, SeekFrom},
-    kdebug, kwarn,
+    kwarn,
     libs::vec_cursor::VecCursor,
-    print,
 };
 
 use super::{

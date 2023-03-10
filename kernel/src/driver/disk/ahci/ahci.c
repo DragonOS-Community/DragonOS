@@ -135,44 +135,6 @@ static int ahci_init_gendisk()
     return 0;
 };
 
-/**
- * @brief 初始化ahci模块
- *
- */
-void ahci_init()
-{
-    kinfo("Initializing AHCI...");
-    pci_get_device_structure(0x1, 0x6, ahci_devs, &count_ahci_devices);
-
-    if (count_ahci_devices == 0)
-    {
-        kwarn("There is no AHCI device found on this computer!");
-        return;
-    }
-    // 映射ABAR
-    kdebug("phys_2_virt(ahci_devs[0])= %#018lx", (ahci_devs[0]));
-    kdebug("((struct pci_device_structure_general_device_t *)phys_2_virt(ahci_devs[0])))->BAR5= %#018lx", ((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5);
-    uint32_t bar5 = ((struct pci_device_structure_general_device_t *)(ahci_devs[0]))->BAR5;
-
-    mm_map_phys_addr(AHCI_MAPPING_BASE, (ul)(bar5)&PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
-    kdebug("ABAR mapped!");
-    for (int i = 0; i < count_ahci_devices; ++i)
-    {
-        // kdebug("[%d]  class_code=%d, sub_class=%d, progIF=%d, ABAR=%#010lx", i, ahci_devs[i]->Class_code, ahci_devs[i]->SubClass, ahci_devs[i]->ProgIF, ((struct pci_device_structure_general_device_t *)(ahci_devs[i]))->BAR5);
-        //  赋值HBA_MEM结构体
-        ahci_devices[i].dev_struct = ahci_devs[i];
-        ahci_devices[i].hba_mem = (HBA_MEM *)(cal_HBA_MEM_VIRT_ADDR(i));
-        kdebug("ahci_devices[i].hba_mem = %#018lx", (ul)ahci_devices[i].hba_mem);
-    }
-
-    // todo: 支持多个ahci控制器。
-    ahci_port_base_vaddr = (uint64_t)kmalloc(1048576, 0);
-    kdebug("ahci_port_base_vaddr=%#018lx", ahci_port_base_vaddr);
-    ahci_probe_port(0);
-
-    BUG_ON(ahci_init_gendisk() != 0);
-    kinfo("AHCI initialized.");
-}
 
 // Check device type
 static int check_type(HBA_PORT *port)

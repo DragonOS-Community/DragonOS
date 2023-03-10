@@ -25,13 +25,17 @@ use core::sync::atomic::compiler_fence;
 
 // 依赖的C结构体/常量
 use crate::include::bindings::bindings::{
-    ahci_cpp_init, get_rsp, pci_device_structure_general_device_t, pci_device_structure_header_t,
+    ahci_cpp_init, pci_device_structure_general_device_t, pci_device_structure_header_t,
     AHCI_MAPPING_BASE, MAX_AHCI_DEVICES, PAGE_2M_MASK, PAGE_OFFSET,
 };
 
 // 仅module内可见 全局数据区  hbr_port, disks
 static LOCKED_HBA_MEM_LIST: SpinLock<Vec<&mut HbaMem>> = SpinLock::new(Vec::new());
 static LOCKED_DISKS_LIST: SpinLock<Vec<Arc<LockedAhciDisk>>> = SpinLock::new(Vec::new());
+
+/* TFES - Task File Error Status */
+#[allow(non_upper_case_globals)]
+pub const HBA_PxIS_TFES: u32 = 1 << 30;
 
 #[inline]
 pub fn virt_2_phys(addr: usize) -> usize {
@@ -42,6 +46,15 @@ pub fn phys_2_virt(addr: usize) -> usize {
     addr + PAGE_OFFSET as usize
 }
 
+#[no_mangle]
+pub extern "C" fn ahci_init()->i32{
+    let r = ahci_rust_init();
+    if r.is_ok(){
+        return 0;
+    }else {
+        return r.unwrap_err();
+    }
+}
 /// @brief: 初始化 ahci
 pub fn ahci_rust_init() -> Result<(), i32> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

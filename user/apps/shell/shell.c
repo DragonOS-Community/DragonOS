@@ -93,7 +93,6 @@ int main()
     char kb_file_path[] = "/dev/char/ps2_keyboard";
 
     int kb_fd = open(kb_file_path, 0);
-    printf("kb_fd=%d", kb_fd);
     print_ascii_logo();
     // printf("before mkdir\n");
     // mkdir("/aaac", 0);

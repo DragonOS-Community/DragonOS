@@ -20,10 +20,7 @@
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
 #include <exception/gate.h>
-#include <filesystem/devfs/devfs.h>
-#include <filesystem/fat32/fat32.h>
 #include <filesystem/procfs/procfs.h>
-#include <filesystem/rootfs/rootfs.h>
 #include <io/block/block_io_scheduler.h>
 #include <ktest/ktest.h>
 #include <mm/mmio.h>
@@ -142,7 +139,7 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
  * @param path
  * @return int 文件描述符编号
  */
-struct vfs_file_t *process_open_exec_file(char *path)
+int process_open_exec_file(char *path)
 {
     struct pt_regs tmp = {0};
     tmp.r8 = (uint64_t)path;
@@ -163,14 +160,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     int retval = 0;
     int fd = process_open_exec_file(path);
 
-    if ((long)fd <= 0)
+    if ((long)fd < 0)
     {
         kdebug("(long)fd=%ld", (long)fd);
         return (unsigned long)fd;
     }
 
-    void *buf = kmalloc(PAGE_4K_SIZE, 0);
-    memset(buf, 0, PAGE_4K_SIZE);
+    void *buf = kzalloc(PAGE_4K_SIZE, 0);
     uint64_t pos = 0;
 
     struct pt_regs tmp_use_fs = {0};
@@ -179,10 +175,17 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     tmp_use_fs.r10 = SEEK_SET;
     retval = sys_lseek(&tmp_use_fs);
 
+    // 读取 Elf64_Ehdr
     tmp_use_fs.r8 = fd;
     tmp_use_fs.r9 = (uint64_t)buf;
     tmp_use_fs.r10 = sizeof(Elf64_Ehdr);
     retval = sys_read(&tmp_use_fs);
+
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = 0;
+    tmp_use_fs.r10 = SEEK_CUR;
+    pos = sys_lseek(&tmp_use_fs);
+
     if (retval != sizeof(Elf64_Ehdr))
     {
         kerror("retval=%d, not equal to sizeof(Elf64_Ehdr):%d", retval, sizeof(Elf64_Ehdr));
@@ -226,18 +229,33 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
     // kdebug("ehdr.e_phoff=%#018lx\t ehdr.e_phentsize=%d, ehdr.e_phnum=%d", ehdr.e_phoff, ehdr.e_phentsize,
     // ehdr.e_phnum); 将指针移动到program header处
-    pos = ehdr.e_phoff;
+
     // 读取所有的phdr
-    pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
-    filp->file_ops->read(filp, (char *)buf, (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum, &pos);
-    if ((unsigned long)filp <= 0)
+    pos = ehdr.e_phoff;
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = pos;
+    tmp_use_fs.r10 = SEEK_SET;
+    pos = sys_lseek(&tmp_use_fs);
+
+    memset(buf, 0, PAGE_4K_SIZE);
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = (uint64_t)buf;
+    tmp_use_fs.r10 = (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum;
+    sys_read(&tmp_use_fs);
+
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = 0;
+    tmp_use_fs.r10 = SEEK_CUR;
+    pos = sys_lseek(&tmp_use_fs);
+
+    if ((long)retval < 0)
     {
-        kdebug("(unsigned long)filp=%d", (long)filp);
+        kdebug("(unsigned long)filp=%d", (long)retval);
         retval = -ENOEXEC;
         goto load_elf_failed;
     }
-    Elf64_Phdr *phdr = buf;
 
+    Elf64_Phdr *phdr = buf;
     // 将程序加载到内存中
     for (int i = 0; i < ehdr.e_phnum; ++i, ++phdr)
     {
@@ -307,12 +325,38 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 }
             }
 
-            pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
+            tmp_use_fs.r8 = fd;
+            tmp_use_fs.r9 = pos;
+            tmp_use_fs.r10 = SEEK_SET;
+            pos = sys_lseek(&tmp_use_fs);
+
             int64_t val = 0;
             if (remain_file_size > 0)
             {
                 int64_t to_trans = (remain_file_size > PAGE_2M_SIZE) ? PAGE_2M_SIZE : remain_file_size;
-                val = filp->file_ops->read(filp, (char *)(virt_base + beginning_offset), to_trans, &pos);
+
+                void *buf3 = kzalloc(PAGE_4K_SIZE, 0);
+                while (to_trans > 0)
+                {
+                    int64_t x = 0;
+                    tmp_use_fs.r8 = fd;
+                    tmp_use_fs.r9 = (uint64_t)buf3;
+                    tmp_use_fs.r10 = to_trans;
+                    x = sys_read(&tmp_use_fs);
+                    memcpy(virt_base + beginning_offset + val, buf3, x);
+                    val += x;
+                    to_trans -= x;
+                    tmp_use_fs.r8 = fd;
+                    tmp_use_fs.r9 = 0;
+                    tmp_use_fs.r10 = SEEK_CUR;
+                    pos = sys_lseek(&tmp_use_fs);
+                }
+                kfree(buf3);
+
+                // kdebug("virt_base + beginning_offset=%#018lx, val=%d, to_trans=%d", virt_base + beginning_offset,
+                // val,
+                //        to_trans);
+                // kdebug("to_trans=%d", to_trans);
             }
 
             if (val < 0)
@@ -343,6 +387,12 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     memset((void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), 0, PAGE_2M_SIZE);
 
 load_elf_failed:;
+    {
+        struct pt_regs tmp = {0};
+        tmp.r8 = fd;
+        sys_close(&tmp);
+    }
+
     if (buf != NULL)
         kfree(buf);
     return retval;
@@ -496,9 +546,8 @@ ul initial_kernel_thread(ul arg)
     scm_enable_double_buffer();
 
     // block_io_scheduler_init();
-    // ahci_init();
-    // fat32_init();
-    // rootfs_umount();
+    ahci_init();
+    mount_root_fs();
 
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
@@ -506,10 +555,10 @@ ul initial_kernel_thread(ul arg)
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
     __rust_demo_func();
-    while (1)
-    {
-        /* code */
-    }
+    // while (1)
+    // {
+    //     /* code */
+    // }
 
     // 对completion完成量进行测试
     // __test_completion();
@@ -660,7 +709,9 @@ void process_init()
 
     // 初始化init进程的signal相关的信息
     initial_proc_init_signal(current_pcb);
+    kdebug("Initial process to init files");
     process_init_files();
+    kdebug("Initial process init files ok");
 
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
@@ -687,7 +738,6 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
 {
     // todo: 当进程管理模块拥有pcblist_lock之后，对其加锁
     struct process_control_block *pcb = initial_proc_union.pcb.next_pcb;
-
     // 使用蛮力法搜索指定pid的pcb
     // todo: 使用哈希表来管理pcb
     for (; pcb != &initial_proc_union.pcb; pcb = pcb->next_pcb)
@@ -833,9 +883,9 @@ int process_release_pcb(struct process_control_block *pcb)
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
     process_exit_sighand(pcb);
     process_exit_signal(pcb);
+    rs_procfs_unregister_pid(pcb->pid);
     // 释放当前pcb
     kfree(pcb);
-    rs_procfs_unregister_pid(pcb->pid);
     return 0;
 }
 

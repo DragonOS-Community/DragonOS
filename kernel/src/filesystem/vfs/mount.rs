@@ -7,7 +7,6 @@ use alloc::{
 
 use crate::{
     include::bindings::bindings::{EBUSY, ENOTDIR},
-    kdebug,
     libs::spinlock::SpinLock,
 };
 
@@ -79,6 +78,10 @@ impl MountFS {
         }
         .wrap();
     }
+
+    pub fn inner_filesystem(&self) -> Arc<dyn FileSystem> {
+        return self.inner_filesystem.clone();
+    }
 }
 
 impl MountFSInode {
@@ -123,9 +126,28 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
-    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
-        kdebug!("opened in mountfs!");
-        return Ok(());
+    fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+        return self.inner_inode.open(data);
+    }
+
+    fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+        return self.inner_inode.close(data);
+    }
+
+    fn create_with_data(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: u32,
+        data: usize,
+    ) -> Result<Arc<dyn IndexNode>, i32> {
+        return self
+            .inner_inode
+            .create_with_data(name, file_type, mode, data);
+    }
+
+    fn truncate(&self, len: usize) -> Result<(), i32> {
+        return self.inner_inode.truncate(len);
     }
 
     fn read_at(
@@ -144,7 +166,7 @@ impl IndexNode for MountFSInode {
         &self,
         offset: usize,
         len: usize,
-        buf: & [u8],
+        buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         return self

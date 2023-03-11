@@ -10,12 +10,15 @@ use alloc::{
 };
 
 use crate::{
-    filesystem::vfs::{core::generate_inode_id, FileType},
-    include::bindings::bindings::{
-        process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR, ENOTEMPTY,
-        EPERM, ESRCH,
+    filesystem::vfs::{
+        core::{generate_inode_id, ROOT_INODE},
+        FileType,
     },
-    kdebug, kerror,
+    include::bindings::bindings::{
+        pid_t, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR,
+        ENOTEMPTY, ENOTSUP, EPERM, ESRCH,
+    },
+    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
@@ -126,15 +129,15 @@ impl ProcFSInode {
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
-        kdebug!("pcb.name={:?}", pcb.name);
+        // kdebug!("pcb.name={:?}", pcb.name);
         let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
         for val in pcb.name.iter() {
             tmp_name.push(*val as u8);
         }
-        kdebug!(
-            "pcb.tmp_name={}",
-            String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
-        );
+        // kdebug!(
+        //     "pcb.tmp_name={}",
+        //     String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
+        // );
 
         pdata.append(
             &mut format!(
@@ -187,9 +190,6 @@ impl ProcFSInode {
         // 去除多余的\0
         self.trim_string(pdata);
 
-        kdebug!("status got!");
-        kdebug!("ProcfsFilePrivateData:{:?}", pdata);
-        kdebug!("open_status success!");
         return Ok((pdata.len() * size_of::<u8>()) as i64);
     }
 
@@ -280,20 +280,20 @@ impl ProcFS {
 
     /// @brief 进程注册函数
     /// @usage 在进程中调用并创建进程对应文件
-    pub fn procfs_register_pid(&self, pid: i64) -> Result<(), i32> {
+    pub fn register_pid(&self, pid: i64) -> Result<(), i32> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
-        let pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
+        let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
         // 创建相关文件
         // status文件
-        let binding: Arc<dyn IndexNode> = pf.create("status", FileType::File, 0)?;
-        let sf: &LockedProcFSInode = binding
+        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0)?;
+        let _sf: &LockedProcFSInode = binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
-        sf.0.lock().fdata.pid = pid;
-        sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
+        _sf.0.lock().fdata.pid = pid;
+        _sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         //todo: 创建其他文件
 
@@ -302,11 +302,11 @@ impl ProcFS {
 
     /// @brief 解除进程注册
     ///
-    pub fn procfs_unregister_pid(&self, pid: i64) -> Result<(), i32> {
+    pub fn unregister_pid(&self, pid: i64) -> Result<(), i32> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
-        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid)).unwrap();
+        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid))?;
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
 
@@ -322,7 +322,6 @@ impl ProcFS {
 
 impl IndexNode for LockedProcFSInode {
     fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
-        kdebug!("open in!");
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
@@ -338,20 +337,20 @@ impl IndexNode for LockedProcFSInode {
         *data = FilePrivateData::Procfs(private_data);
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
-        kdebug!("open success!");
+
         return Ok(());
     }
 
     fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
         // 获取数据信息
-        let _private_data = match data {
+        let private_data = match data {
             FilePrivateData::Procfs(p) => p,
             _ => {
                 panic!("ProcFS: FilePrivateData mismatch!");
             }
         };
         // 释放资源
-        drop(_private_data);
+        drop(private_data);
         return Ok(());
     }
 
@@ -404,33 +403,12 @@ impl IndexNode for LockedProcFSInode {
 
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: & [u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
-        if buf.len() < len {
-            return Err(-(EINVAL as i32));
-        }
-
-        // 加锁
-        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
-        }
-
-        let data: &mut Vec<u8> = &mut inode.data;
-
-        // 如果文件大小比原来的大，那就resize这个数组
-        if offset + len > data.len() {
-            data.resize(offset + len, 0);
-        }
-
-        let target = &mut data[offset..offset + len];
-        target.copy_from_slice(&buf[0..len]);
-        return Ok(len);
+        return Err(-(ENOTSUP as i32));
     }
 
     fn poll(&self) -> Result<PollStatus, i32> {
@@ -443,7 +421,7 @@ impl IndexNode for LockedProcFSInode {
         }
 
         return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
+            flags: PollStatus::READ_MASK,
         });
     }
 
@@ -537,7 +515,7 @@ impl IndexNode for LockedProcFSInode {
 
         // 将子inode插入父inode的B树中
         inode.children.insert(String::from(name), result.clone());
-        kdebug!("created file!");
+
         return Ok(result);
     }
 
@@ -594,21 +572,11 @@ impl IndexNode for LockedProcFSInode {
 
     fn move_(
         &self,
-        old_name: &str,
-        target: &Arc<dyn IndexNode>,
-        new_name: &str,
+        _old_name: &str,
+        _target: &Arc<dyn IndexNode>,
+        _new_name: &str,
     ) -> Result<(), i32> {
-        let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
-
-        // 在新的目录下创建一个硬链接
-        target.link(new_name, &old_inode)?;
-        // 取消现有的目录下的这个硬链接
-        if let Err(err) = self.unlink(old_name) {
-            // 如果取消失败，那就取消新的目录下的硬链接
-            target.unlink(new_name)?;
-            return Err(err);
-        }
-        return Ok(());
+        return Err(-(ENOTSUP as i32));
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
@@ -678,4 +646,55 @@ impl IndexNode for LockedProcFSInode {
 
         return Ok(keys);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn rs_procfs_register_pid(pid: pid_t) -> u64 {
+    let r = procfs_register_pid(pid);
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err() as u64;
+    }
+}
+
+/// @brief 向procfs注册进程
+pub fn procfs_register_pid(pid: pid_t) -> Result<(), i32> {
+    let procfs_inode = ROOT_INODE().find("proc")?;
+
+    let procfs_inode = procfs_inode
+        .downcast_ref::<LockedProcFSInode>()
+        .expect("Failed to find procfs' root inode");
+    let fs = procfs_inode.fs();
+    let procfs: &ProcFS = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
+
+    // 调用注册函数
+    procfs.register_pid(pid)?;
+
+    return Ok(());
+}
+
+#[no_mangle]
+pub extern "C" fn rs_procfs_unregister_pid(pid: pid_t) -> u64 {
+    let r = procfs_unregister_pid(pid);
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err() as u64;
+    }
+}
+
+/// @brief 在ProcFS中,解除进程的注册
+pub fn procfs_unregister_pid(pid: pid_t) -> Result<(), i32> {
+    // 获取procfs实例
+    let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE().find("proc")?;
+
+    let procfs_inode: &LockedProcFSInode = procfs_inode
+        .downcast_ref::<LockedProcFSInode>()
+        .expect("Failed to find procfs' root inode");
+    let fs: Arc<dyn FileSystem> = procfs_inode.fs();
+    let procfs: &ProcFS = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
+
+    // 调用解除注册函数
+    return procfs.unregister_pid(pid);
 }

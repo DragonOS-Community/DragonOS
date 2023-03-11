@@ -1,1 +1,1 @@
-pub mod keyboard_inode;
+pub mod ps2_keyboard;

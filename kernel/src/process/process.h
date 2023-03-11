@@ -23,7 +23,7 @@
 #include "proc-types.h"
 
 extern void process_exit_thread(struct process_control_block *pcb);
-extern uint64_t process_exit_files(struct process_control_block *pcb);
+extern int process_exit_files(struct process_control_block *pcb);
 
 /**
  * @brief 任务状态段结构体

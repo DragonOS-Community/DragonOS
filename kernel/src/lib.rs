@@ -33,18 +33,16 @@ mod time;
 
 #[macro_use]
 extern crate alloc;
-#[macro_use]
+
 extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
-use crate::filesystem::vfs::core::_test_procfs_2;
 use mm::allocator::KernelAllocator;
 
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
-    filesystem::vfs::core::{__test_filesystem, _test_procfs},
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
 };
 
@@ -92,19 +90,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-    __test_filesystem();
-    // __test_ahci(); // ahci测试代码
-    // __test_dev();  // dev的测试代码
 
     return 0;
-}
-
-#[no_mangle]
-pub extern "C" fn rs_procfs_register_pid(pid: i64) {
-    _test_procfs(pid);
-}
-
-#[no_mangle]
-pub extern "C" fn rs_procfs_unregister_pid(pid: i64){
-    _test_procfs_2(pid);
 }

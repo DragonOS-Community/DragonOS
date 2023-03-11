@@ -4,7 +4,6 @@
 #include <mm/slab.h>
 #include <common/printk.h>
 #include <filesystem/vfs/VFS.h>
-#include <filesystem/devfs/devfs.h>
 #include <common/wait_queue.h>
 #include <common/spinlock.h>
 #include <common/kfifo.h>
@@ -14,7 +13,7 @@ static struct kfifo_t kb_buf;
 
 // 缓冲区等待队列
 static wait_queue_node_t ps2_keyboard_wait_queue;
-extern void keyboard_register(struct vfs_file_operations_t *);
+extern void ps2_keyboard_register(struct vfs_file_operations_t *);
 
 // 缓冲区读写锁
 static spinlock_t ps2_kb_buf_rw_lock;
@@ -49,7 +48,6 @@ hardware_intr_controller ps2_keyboard_intr_controller =
  */
 long ps2_keyboard_open(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
 {
-    filp->private_data = &kb_buf;
     ps2_keyboard_reset_buffer(&kb_buf);
     return 0;
 }
@@ -63,7 +61,6 @@ long ps2_keyboard_open(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
  */
 long ps2_keyboard_close(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
 {
-    filp->private_data = NULL;
     ps2_keyboard_reset_buffer(&kb_buf);
     return 0;
 }
@@ -206,9 +203,7 @@ void ps2_keyboard_init()
     // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
     io_in8(PORT_PS2_KEYBOARD_DATA);
     // 将设备挂载到devfs
-    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_PS2_KEYBOARD, &ps2_keyboard_fops, NULL);
-
-    keyboard_register(&ps2_keyboard_fops);
+    ps2_keyboard_register(&ps2_keyboard_fops);
 
     kinfo("ps/2 keyboard registered.");
 }

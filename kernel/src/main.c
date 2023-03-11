@@ -19,10 +19,8 @@
 #include <sched/sched.h>
 #include <smp/ipi.h>
 
-#include <filesystem/vfs/VFS.h>
-#include <filesystem/devfs/devfs.h>
 #include <filesystem/procfs/procfs.h>
-#include <filesystem/fat32/fat32.h>
+#include <filesystem/vfs/VFS.h>
 
 #include "driver/acpi/acpi.h"
 #include "driver/disk/ahci/ahci.h"
@@ -52,8 +50,7 @@ void reload_gdt()
     gdtp.size = bsp_gdt_size - 1;
     gdtp.gdt_vaddr = (ul)phys_2_virt((ul)&GDT_Table);
 
-    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp)
-                 : "memory");
+    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp) : "memory");
 }
 
 void reload_idt()
@@ -64,8 +61,7 @@ void reload_idt()
     // kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
     // kdebug("gdt size=%d", p.size);
 
-    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp)
-                 : "memory");
+    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp) : "memory");
 }
 
 // 初始化系统各模块
@@ -144,12 +140,10 @@ void system_initialize()
     io_mfence();
 
     vfs_init();
-    devfs_init();
-    procfs_init();
 
     cpu_init();
     ps2_keyboard_init();
-    tty_init();
+    // tty_init();
     // ps2_mouse_init();
     // ata_init();
     pci_init();
@@ -170,7 +164,7 @@ void system_initialize()
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
-    
+
     HPET_enable();
 
     io_mfence();

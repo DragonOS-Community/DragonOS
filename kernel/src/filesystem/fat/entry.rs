@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use core::cmp::min;
 
 use alloc::{
@@ -12,9 +13,8 @@ use crate::{
         EROFS,
     },
     io::{device::LBA_SIZE, SeekFrom},
-    kdebug, kwarn,
+    kwarn,
     libs::vec_cursor::VecCursor,
-    print,
 };
 
 use super::{
@@ -1435,7 +1435,7 @@ impl FATDirIter {
                         ))),
                     ));
                 }
-                FATRawDirEntry::Long(l) => {
+                FATRawDirEntry::Long(_) => {
                     // 当前找到一个长目录项
 
                     // 声明一个数组，来容纳所有的entry。（先把最后一个entry放进去）
@@ -2300,7 +2300,6 @@ impl Iterator for FATDirEntryOffsetIter {
         // 越过了当前簇,则获取下一个簇
         if new_offset >= self.fs.bytes_per_cluster() {
             new_offset %= self.fs.bytes_per_cluster();
-            let raw = self.fs.get_fat_entry_raw(new_cluster);
 
             match self.fs.get_fat_entry(new_cluster) {
                 Ok(FATEntry::Next(c)) => {

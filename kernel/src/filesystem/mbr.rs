@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use core::default::Default;
 
 /// @brief MBR硬盘分区表项的结构

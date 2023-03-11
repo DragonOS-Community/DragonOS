@@ -136,6 +136,8 @@ impl process_control_block {
     ) -> Result<(), i32> {
         // 不拷贝父进程的文件描述符
         if clone_flags & CLONE_FS as u64 != 0 {
+            // 由于拷贝pcb的时候，直接copy的指针，因此这里置为空
+            self.fds = null_mut();
             self.init_files()?;
             return Ok(());
         }
@@ -219,6 +221,7 @@ impl process_control_block {
     /// @param fd 文件描述符序号
     ///
     /// @return Option(&File) 文件对象的不可变引用
+    #[allow(dead_code)]
     pub fn get_file_ref_by_fd(&self, fd: i32) -> Option<&File> {
         if !FileDescriptorVec::validate_fd(fd) {
             return None;
@@ -290,7 +293,7 @@ pub extern "C" fn process_copy_files(
 /// @return i32
 #[no_mangle]
 pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) -> i32 {
-    let r:Result<(), i32> = pcb.exit_files();
+    let r: Result<(), i32> = pcb.exit_files();
     if r.is_ok() {
         return 0;
     } else {

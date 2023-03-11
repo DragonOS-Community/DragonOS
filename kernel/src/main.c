@@ -39,7 +39,7 @@
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
-#include <driver/virtio/virtio.h>
+
 ul bsp_idt_size, bsp_gdt_size;
 
 #pragma GCC push_options
@@ -175,7 +175,7 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
-    c_virtio_probe();
+   
     // 这里不能删除，否则在O1会报错
     // while (1)
     //     pause();

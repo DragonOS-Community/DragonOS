@@ -3,7 +3,8 @@ use crate::include::bindings::bindings::{
     PAGE_OFFSET, PAGE_SHARED, ZONE_NORMAL,
 };
 use crate::kdebug;
-use core::{intrinsics::size_of, ptr::NonNull};
+use core::mem::size_of;
+use core::{ptr::NonNull};
 use virtio_drivers::{BufferDirection, Hal, PhysAddr, VirtAddr, PAGE_SIZE};
 
 pub struct HalImpl;
@@ -38,7 +39,7 @@ impl Hal for HalImpl {
         };
         unsafe {
             let pa = (memory_management_struct.pages_struct as usize
-                + (paddr >> PAGE_2M_SHIFT) * 56) as *mut Page;
+                + (paddr >> PAGE_2M_SHIFT) * size_of::<Page>()) as *mut Page;
             //kdebug!("free pages num:{},Phyaddr={}",page_num,paddr);
             free_pages(pa, page_num);
         }
@@ -49,6 +50,7 @@ impl Hal for HalImpl {
     /// @return VirtAddr 虚拟地址
     fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
         paddr + PAGE_OFFSET as usize
+
     }
     /// @brief 与真实物理设备共享
     /// @param buffer 要共享的buffer _direction：设备到driver或driver到设备

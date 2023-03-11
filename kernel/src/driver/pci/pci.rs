@@ -243,7 +243,7 @@ impl Display for BarInfo {
                 virtaddress,
             } => write!(
                 f,
-                "Memory space at {:#010x}, size {}, type {:?}, prefetchable {},mapped at {}",
+                "Memory space at {:#010x}, size {}, type {:?}, prefetchable {},mapped at {:#x}",
                 address, size, address_type, prefetchable, virtaddress
             ),
             Self::IO { address, size } => {

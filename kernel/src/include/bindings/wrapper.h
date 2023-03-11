@@ -31,9 +31,13 @@
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
 #include <mm/mm.h>
+#include <mm/mmio.h>
 #include <mm/slab.h>
 #include <process/process.h>
 #include <sched/sched.h>
 #include <time/sleep.h>
 #include <mm/mm-types.h>
+#include <driver/pci/pci.h>
+#include <driver/virtio/virtio.h>
 #include <smp/smp.h>
+

@@ -31,6 +31,7 @@
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
+#include <driver/virtio/virtio.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -502,6 +503,7 @@ ul initial_kernel_thread(ul arg)
     ahci_init();
     fat32_init();
     rootfs_umount();
+    c_virtio_probe();
 
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉

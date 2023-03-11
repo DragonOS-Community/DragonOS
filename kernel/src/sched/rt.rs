@@ -1,11 +1,11 @@
-use core::{arch::x86_64::_rdtsc, ptr::null_mut, sync::atomic::compiler_fence};
+use core::{ptr::null_mut, sync::atomic::compiler_fence};
 
 use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        process_control_block, Cpu_tsc_freq, MAX_CPU_NUM, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR,
+        process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR,
     },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
@@ -127,6 +127,7 @@ impl SchedulerRT {
         }
         return result;
     }
+
     /// @brief 挑选下一个可执行的rt进程
     pub fn pick_next_task_rt(&mut self, cpu_id: u32) -> Option<&'static mut process_control_block> {
         // 循环查找，直到找到
@@ -141,6 +142,7 @@ impl SchedulerRT {
         // return 一个空值
         None
     }
+
     pub fn get_rt_queue_len(&mut self, cpu_id: u32) -> usize {
         let mut sum = 0;
         for prio in 0..SchedulerRT::MAX_RT_PRIO {
@@ -148,10 +150,12 @@ impl SchedulerRT {
         }
         return sum as usize;
     }
+
     pub fn get_load_list_len(&mut self, cpu_id: u32) -> usize {
         return self.load_list[cpu_id as usize].len();
     }
-    pub fn enqueue_front(&mut self, pcb: &'static mut process_control_block){
+
+    pub fn enqueue_front(&mut self, pcb: &'static mut process_control_block) {
         self.cpu_queue[pcb.cpu_id as usize][pcb.priority as usize].enqueue_front(pcb);
     }
 }

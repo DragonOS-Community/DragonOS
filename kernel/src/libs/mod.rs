@@ -7,7 +7,6 @@ pub mod atomic;
 pub mod list;
 pub mod lockref;
 pub mod mutex;
+pub mod rwlock;
 pub mod semaphore;
 pub mod wait_queue;
-pub mod rwlock;
-

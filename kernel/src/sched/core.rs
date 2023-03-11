@@ -87,7 +87,7 @@ fn __sched() -> Option<&'static mut process_control_block> {
             // kdebug!("next pcb is {}",next.pid);
             // 将pick的进程放回原处
             rt_scheduler.enqueue_front(next);
-            
+
             return rt_scheduler.sched();
         }
         None => {

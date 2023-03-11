@@ -19,7 +19,6 @@
 #include <sched/sched.h>
 #include <smp/ipi.h>
 
-#include <filesystem/procfs/procfs.h>
 #include <filesystem/vfs/VFS.h>
 
 #include "driver/acpi/acpi.h"

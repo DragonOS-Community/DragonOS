@@ -1,30 +1,22 @@
 use core::{
-    any::Any,
     hint::spin_loop,
     ptr::null_mut,
-    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::{
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
     arch::asm::current::current_pcb,
-    driver::disk::ahci::{self, ahci_rust_init},
+    driver::disk::ahci::{self},
     filesystem::{
-        devfs::{register_bultinin_device, DevFS},
+        devfs::DevFS,
         fat::fs::FATFileSystem,
-        procfs::{LockedProcFSInode, ProcFS},
+        procfs::ProcFS,
         ramfs::RamFS,
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
-    include::bindings::bindings::{O_RDONLY, O_RDWR},
     io::SeekFrom,
     kdebug, kerror, kinfo,
 };
@@ -157,10 +149,10 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), i32> {
 
     unsafe {
         // drop旧的Root inode
-        let old_root_inode:Box<Arc<dyn IndexNode>> = Box::from_raw(__ROOT_INODE);
+        let old_root_inode: Box<Arc<dyn IndexNode>> = Box::from_raw(__ROOT_INODE);
         __ROOT_INODE = null_mut();
         drop(old_root_inode);
-        
+
         // 设置全局的新的ROOT Inode
         __ROOT_INODE = new_root_inode;
     }

@@ -7,7 +7,6 @@ use alloc::{
 
 use crate::{
     include::bindings::bindings::{EBUSY, ENOTDIR},
-    kdebug,
     libs::spinlock::SpinLock,
 };
 
@@ -80,7 +79,7 @@ impl MountFS {
         .wrap();
     }
 
-    pub fn inner_filesystem(&self)-> Arc<dyn FileSystem>{
+    pub fn inner_filesystem(&self) -> Arc<dyn FileSystem> {
         return self.inner_filesystem.clone();
     }
 }
@@ -119,10 +118,8 @@ impl MountFSInode {
         let inode_id = self.metadata().unwrap().inode_id;
 
         if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
-            kdebug!("is mount point");
             return sub_mountfs.mountpoint_root_inode();
         } else {
-            kdebug!("not mount point");
             return self.self_ref.upgrade().unwrap();
         }
     }
@@ -132,7 +129,7 @@ impl IndexNode for MountFSInode {
     fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
         return self.inner_inode.open(data);
     }
-    
+
     fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
         return self.inner_inode.close(data);
     }
@@ -169,7 +166,7 @@ impl IndexNode for MountFSInode {
         &self,
         offset: usize,
         len: usize,
-        buf: & [u8],
+        buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         return self
@@ -336,9 +333,7 @@ impl IndexNode for MountFSInode {
 impl FileSystem for MountFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         match &self.self_mountpoint {
-            Some(inode) => {
-                kdebug!("self mount point");
-                return inode.mount_fs.root_inode()},
+            Some(inode) => return inode.mount_fs.root_inode(),
             // 当前文件系统是rootfs
             None => self.mountpoint_root_inode(),
         }

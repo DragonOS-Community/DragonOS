@@ -20,6 +20,7 @@ pub struct AhciRequestPacket {
 }
 
 impl AhciRequestPacket {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         return AhciRequestPacket {
             ..Default::default()

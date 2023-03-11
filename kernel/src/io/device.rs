@@ -195,6 +195,7 @@ pub struct BlockRange {
 }
 
 impl BlockIter {
+    #[allow(dead_code)]
     pub fn new(start_addr: usize, end_addr: usize, blk_size_log2: u8) -> BlockIter {
         return BlockIter {
             begin: start_addr,
@@ -283,6 +284,7 @@ impl Iterator for BlockIter {
 
 /// BlockRange 函数实现
 impl BlockRange {
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         return self.end == self.begin;
     }

@@ -18,8 +18,8 @@ macro_rules! volatile_set_bit {
         volatile_write!(
             $data,
             match $flag {
-                true => volatile_read!($data) | $val,
-                false => volatile_read!($data) & (!$val),
+                true => core::ptr::read_volatile(core::ptr::addr_of!($data)) | $val,
+                false => core::ptr::read_volatile(core::ptr::addr_of!($data)) & (!$val),
             }
         )
     };

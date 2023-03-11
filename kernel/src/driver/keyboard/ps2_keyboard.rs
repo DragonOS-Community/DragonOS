@@ -1,7 +1,4 @@
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-};
+use alloc::sync::{Arc, Weak};
 
 use crate::{
     filesystem::{
@@ -72,10 +69,8 @@ impl DeviceINode for LockedPS2KeyBoardInode {
 #[no_mangle] // 不重命名
 pub extern "C" fn ps2_keyboard_register(f_ops: &vfs_file_operations_t) {
     kdebug!("register keyboard = {:p}", f_ops);
-    devfs_register(
-        "ps2_keyboard",
-        LockedPS2KeyBoardInode::new(f_ops),
-    ).expect("Failed to register ps/2 keyboard");
+    devfs_register("ps2_keyboard", LockedPS2KeyBoardInode::new(f_ops))
+        .expect("Failed to register ps/2 keyboard");
     kdebug!("register keyboard = {:p}", f_ops);
 }
 

@@ -41,6 +41,31 @@ pub enum FileType {
     SymLink,
 }
 
+/* these are defined by POSIX and also present in glibc's dirent.h */
+pub const DT_UNKNOWN: u16 = 0;
+pub const DT_FIFO: u16 = 1;
+pub const DT_CHR: u16 = 2;
+pub const DT_DIR: u16 = 4;
+pub const DT_BLK: u16 = 6;
+pub const DT_REG: u16 = 8;
+pub const DT_LNK: u16 = 10;
+pub const DT_SOCK: u16 = 12;
+pub const DT_WHT: u16 = 14;
+pub const DT_MAX: u16 = 16;
+
+impl FileType {
+    pub fn get_file_type_num(&self) -> u16 {
+        return match &self {
+            File => DT_REG,
+            Dir => DT_DIR,
+            BlockDevice => DT_BLK,
+            CharDevice => DT_CHR,
+            Pipe => DT_FIFO,
+            SymLink => DT_LNK,
+        };
+    }
+}
+
 /// @brief inode的状态（由poll方法返回）
 #[derive(Debug, Default, PartialEq)]
 pub struct PollStatus {
@@ -454,7 +479,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         dirent.d_ino = inode.metadata().unwrap().inode_id as u64;
         dirent.d_off = 0;
         dirent.d_reclen = 0;
-        // dirent.d_type = ;
+        dirent.d_type = inode.metadata().unwrap().file_type.get_file_type_num() as u8;
         dirent.d_name = match inode.get_entry_name(dirent.d_ino as usize) {
             Err(e) => {
                 kerror!("Failed get name, error = {e}");

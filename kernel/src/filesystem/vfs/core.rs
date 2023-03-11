@@ -329,7 +329,8 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, i32> {
         if errno == -(ENOENT as i32) {
             let (filename, parent_path) = rsplit_path(path);
             // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件夹
             let _create_inode: Arc<dyn IndexNode> =
                 parent_inode.create(filename, FileType::Dir, 0o777)?;
@@ -359,7 +360,8 @@ pub fn do_remove_dir(path: &str, _mode: FileMode) -> Result<u64, i32> {
         } else {
             let (filename, parent_path) = rsplit_path(path);
             // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件夹
             // parent_inode.rmdir(filename)?;
         }
@@ -385,7 +387,8 @@ pub fn do_unlink_at(path: &str, _mode: FileMode) -> Result<u64, i32> {
         } else {
             let (filename, parent_path) = rsplit_path(path);
             // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件夹
             parent_inode.unlink(filename)?;
         }

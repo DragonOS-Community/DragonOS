@@ -51,7 +51,7 @@ impl DevFS {
         let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
             // /dev 的权限设置为 读+执行，root 可以读写
             // root 的 parent 是空指针
-            DevFSInode::new(FileType::Dir, 0x755 as u32, 0),
+            DevFSInode::new(FileType::Dir, 0o755 as u32, 0),
         )));
 
         let devfs: Arc<DevFS> = Arc::new(DevFS { root_inode: root });
@@ -100,7 +100,7 @@ impl DevFS {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
                 if let Err(_) = dev_root_inode.find("char") {
-                    dev_root_inode.create("char", FileType::Dir, 0x755)?;
+                    dev_root_inode.create("char", FileType::Dir, 0o755)?;
                 }
 
                 let any_char_inode = dev_root_inode.find("char")?;
@@ -114,7 +114,7 @@ impl DevFS {
             }
             FileType::BlockDevice => {
                 if let Err(_) = dev_root_inode.find("block") {
-                    dev_root_inode.create("block", FileType::Dir, 0x755)?;
+                    dev_root_inode.create("block", FileType::Dir, 0o755)?;
                 }
 
                 let any_block_inode = dev_root_inode.find("block")?;

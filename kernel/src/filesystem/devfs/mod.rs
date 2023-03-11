@@ -7,7 +7,6 @@ use super::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
 };
 use crate::{
-    driver::keyboard,
     include::bindings::bindings::{EEXIST, EISDIR, ENOENT, ENOTDIR, ENOTSUP},
     kdebug, kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -15,7 +14,7 @@ use crate::{
 };
 use alloc::{
     collections::BTreeMap,
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -55,17 +54,25 @@ impl DevFS {
             DevFSInode::new(FileType::Dir, 0x755 as u32, 0),
         )));
 
-        let result: Arc<DevFS> = Arc::new(DevFS { root_inode: root });
+        let devfs: Arc<DevFS> = Arc::new(DevFS { root_inode: root });
 
         // 对root inode加锁，并继续完成初始化工作
-        let mut root_guard: SpinLockGuard<DevFSInode> = result.root_inode.0.lock();
-        root_guard.parent = Arc::downgrade(&result.root_inode);
-        root_guard.self_ref = Arc::downgrade(&result.root_inode);
-        root_guard.fs = Arc::downgrade(&result);
+        let mut root_guard: SpinLockGuard<DevFSInode> = devfs.root_inode.0.lock();
+        root_guard.parent = Arc::downgrade(&devfs.root_inode);
+        root_guard.self_ref = Arc::downgrade(&devfs.root_inode);
+        root_guard.fs = Arc::downgrade(&devfs);
         // 释放锁
         drop(root_guard);
 
-        return result;
+        // 创建文件夹
+        let root = &devfs.root_inode;
+        root.add_dir("char")
+            .expect("DevFS: Failed to create /dev/char");
+        kdebug!("char init done");
+        root.add_dir("block")
+            .expect("DevFS: Failed to create /dev/block");
+
+        return devfs;
     }
 }
 
@@ -125,14 +132,8 @@ impl DevFSInode {
 }
 
 impl LockedDevFSInode {
-    pub fn add_dir(&self, name: String) -> Result<(), i32> {
-        let this = self.0.lock();
-
-        if this.children.contains_key(&name) {
-            return Err(-(EEXIST as i32));
-        }
-
-        match self.create(name.clone().as_str(), FileType::Dir, 0x755 as u32) {
+    pub fn add_dir(&self, name: &str) -> Result<(), i32> {
+        match self.create(name, FileType::Dir, 0x755 as u32) {
             Ok(inode) => inode,
             Err(err) => {
                 return Err(err);
@@ -142,22 +143,22 @@ impl LockedDevFSInode {
         return Ok(());
     }
 
-    pub fn add_dev(&self, name: String, dev: Arc<dyn IndexNode>) -> Result<(), i32> {
+    pub fn add_dev(&self, name: &str, dev: Arc<dyn IndexNode>) -> Result<(), i32> {
         let mut this = self.0.lock();
 
-        if this.children.contains_key(&name) {
+        if this.children.contains_key(name) {
             return Err(-(EEXIST as i32));
         }
 
-        this.children.insert(name, dev);
+        this.children.insert(name.to_string(), dev);
         return Ok(());
     }
 
-    pub fn remove(&self, name: String) -> Result<(), i32> {
+    pub fn remove(&self, name: &str) -> Result<(), i32> {
         self.0
             .lock()
             .children
-            .remove(&name)
+            .remove(name)
             .ok_or(-(ENOENT as i32))?;
         return Ok(());
     }
@@ -354,8 +355,8 @@ pub trait DeviceINode: IndexNode {
 }
 
 /// @brief devfs的设备注册函数
-pub fn devfs_register<T: DeviceINode>(name: String, device: Arc<T>) -> Result<(), i32> {
-    let devfs = ROOT_INODE.find("dev");
+pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), i32> {
+    let devfs = ROOT_INODE().find("dev");
     if let Err(e) = devfs {
         kerror!("failed to register device name = {}, error = {}", name, e);
         return Err(-(ENOENT as i32));
@@ -401,8 +402,8 @@ pub fn devfs_register<T: DeviceINode>(name: String, device: Arc<T>) -> Result<()
 }
 
 /// @brief devfs的设备卸载函数
-pub fn devfs_unregister<T: DeviceINode>(name: String, device: Arc<T>) -> Result<(), i32> {
-    let devfs = ROOT_INODE.find("dev").unwrap();
+pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), i32> {
+    let devfs = ROOT_INODE().find("dev").unwrap();
 
     match device.metadata().unwrap().file_type {
         // 字节设备挂载在 /dev/char
@@ -444,12 +445,12 @@ pub fn devfs_unregister<T: DeviceINode>(name: String, device: Arc<T>) -> Result<
 pub fn register_bultinin_device() {
     use null_dev::LockedNullInode;
     use zero_dev::LockedZeroInode;
-    devfs_register::<LockedNullInode>(String::from("null"), LockedNullInode::new()).unwrap();
-    devfs_register::<LockedZeroInode>(String::from("zero"), LockedZeroInode::new()).unwrap();
+    devfs_register::<LockedNullInode>("null", LockedNullInode::new()).unwrap();
+    devfs_register::<LockedZeroInode>("zero", LockedZeroInode::new()).unwrap();
 }
 
 pub fn __test_dev() {
-    let dev = ROOT_INODE.find("dev").unwrap();
+    let dev = ROOT_INODE().find("dev").unwrap();
     kdebug!("ls /dev = {:?}", dev.list().unwrap());
     let block = dev.find("block").unwrap();
     kdebug!("ls /dev/block = {:?}", block.list().unwrap());
@@ -461,7 +462,7 @@ pub fn __test_dev() {
 
 pub fn __test_keyboard() {
     let mut buf = [0 as u8; 100 as usize];
-    let dev = ROOT_INODE
+    let dev = ROOT_INODE()
         .find("dev")
         .unwrap()
         .find("char")

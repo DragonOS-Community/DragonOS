@@ -90,9 +90,10 @@ void main_loop(int kb_fd)
 int main()
 {
     // 打开键盘文件
-    char kb_file_path[] = "/dev/char/ps2.kb0";
+    char kb_file_path[] = "/dev/char/ps2_keyboard";
 
     int kb_fd = open(kb_file_path, 0);
+    printf("kb_fd=%d", kb_fd);
     print_ascii_logo();
     // printf("before mkdir\n");
     // mkdir("/aaac", 0);

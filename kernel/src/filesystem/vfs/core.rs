@@ -1,10 +1,12 @@
 use core::{
     any::Any,
     hint::spin_loop,
+    ptr::null_mut,
     sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
     sync::Arc,
@@ -19,11 +21,10 @@ use crate::{
         fat::fs::FATFileSystem,
         procfs::{LockedProcFSInode, ProcFS},
         ramfs::RamFS,
-        rootfs::RootFS,
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
-    include::bindings::bindings::{O_RDONLY, O_RDWR},
     include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
+    include::bindings::bindings::{O_RDONLY, O_RDWR},
     io::SeekFrom,
     kdebug, kerror, kinfo,
 };
@@ -40,77 +41,139 @@ pub fn generate_inode_id() -> InodeId {
     return INO.fetch_add(1, Ordering::SeqCst);
 }
 
-// @brief 初始化ROOT INODE
-lazy_static! {
-    pub static ref ROOT_INODE: Arc<dyn IndexNode> = {
-        // ahci_rust_init().expect("ahci rust init failed.");
-        // 使用Ramfs作为默认的根文件系统
-        let ramfs = RamFS::new();
-        let mount_fs = MountFS::new(ramfs, None);
-        let rootfs = RootFS::new(mount_fs).expect("Cannot create rootfs instance.");
-        let root_inode = rootfs.root_inode();
+static mut __ROOT_INODE: *mut Arc<dyn IndexNode> = null_mut();
 
-        // test_fatfs();
-        // 创建文件夹
-        root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
-        root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
-
-
-        // // 创建procfs实例
-        // let procfs = ProcFS::new();
-        // kdebug!("proc created");
-        // kdebug!("root inode.list()={:?}", root_inode.list());
-        // // procfs挂载
-        // let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
-        // kdebug!("root inode.list()={:?}", root_inode.list());
-
-        // 创建 devfs 实例
-        let devfs = DevFS::new();
-        // devfs 挂载
-        let _t = root_inode.find("dev").expect("Cannot find /dev").mount(devfs).expect("Failed to mount devfs");
-
-        root_inode
-    };
+/// @brief 获取全局的根节点
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn ROOT_INODE() -> Arc<dyn IndexNode> {
+    unsafe {
+        return __ROOT_INODE.as_ref().unwrap().clone();
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn vfs_init() -> i32 {
-    let root_inode = ROOT_INODE.list().expect("vfs init failed");
+    // 使用Ramfs作为默认的根文件系统
+    let ramfs = RamFS::new();
+    let mount_fs = MountFS::new(ramfs, None);
+    let root_inode = Box::leak(Box::new(mount_fs.root_inode()));
+
+    unsafe {
+        __ROOT_INODE = root_inode;
+    }
+
+    // 创建文件夹
+    root_inode
+        .create("proc", FileType::Dir, 0o777)
+        .expect("Failed to create /proc");
+    root_inode
+        .create("dev", FileType::Dir, 0o777)
+        .expect("Failed to create /dev");
+
+    // // 创建procfs实例
+    let procfs = ProcFS::new();
+    kdebug!("proc created");
+    kdebug!("root inode.list()={:?}", root_inode.list());
+    // procfs挂载
+    let _t = root_inode
+        .find("proc")
+        .expect("Cannot find /proc")
+        .mount(procfs)
+        .expect("Failed to mount procfs.");
+    kdebug!("root inode.list()={:?}", root_inode.list());
+
+    // 创建 devfs 实例
+    let devfs = DevFS::new();
+    // devfs 挂载
+    let _t = root_inode
+        .find("dev")
+        .expect("Cannot find /dev")
+        .mount(devfs)
+        .expect("Failed to mount devfs");
+
+    let root_inode = ROOT_INODE().list().expect("vfs init failed");
     if root_inode.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
     return 0;
 }
 
-/// @brief 迁移伪文件系统的inode
-/// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
-fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), i32> {
-    // ==== 迁移procfs ===
-    let proc = ROOT_INODE.find("proc").expect("procfs not mounted!");
-    kdebug!("fat root list={:?}", new_fs.root_inode().list());
+/// @brief 真正执行伪文件系统迁移的过程
+///
+/// @param mountpoint_name 在根目录下的挂载点的名称
+/// @param inode 原本的挂载点的inode
+fn do_migrate(
+    new_root_inode: Arc<dyn IndexNode>,
+    mountpoint_name: &str,
+    fs: &MountFS,
+) -> Result<(), i32> {
+    let r = new_root_inode.find(mountpoint_name);
 
-    let r: Result<Arc<MountFS>, i32> = ROOT_INODE.mount(new_fs);
-    if r.is_err() {
-        let val = r.unwrap_err();
-        // 由于mount方法的返回参数限制，我们约定ROOT_INODE.mount()返回Err(0)时，表示执行成功。
-        if val != 0 {
-            return Err(val);
-        }
-    }
-
-    kdebug!("mount new_fs done, list={:?}", ROOT_INODE.list());
-    let r = ROOT_INODE.find("usr");
-    let proc_mountpoint = if r.is_err() {
-        ROOT_INODE
-            .create("proc", FileType::Dir, 0o777)
-            .expect("Failed to create '/proc'")
+    kdebug!("new root.list()={:?}", new_root_inode.list());
+    let mountpoint = if r.is_err() {
+        new_root_inode
+            .create(mountpoint_name, FileType::Dir, 0o777)
+            .expect(format!("Failed to create '/{mountpoint_name}'").as_str())
     } else {
         r.unwrap()
     };
     // 迁移挂载点
-    proc_mountpoint
-        .mount(proc.fs())
-        .expect("Failed to migrate ProcFS");
+    mountpoint
+        .mount(fs.inner_filesystem())
+        .expect(format!("Failed to migrate {mountpoint_name}").as_str());
+    kdebug!("mountpoint.list={:?}", mountpoint.list());
+    kdebug!("new root.list()={:?}", new_root_inode.list());
+    kdebug!(
+        "/{}.list={:?}",
+        mountpoint_name,
+        new_root_inode
+            .lookup(format!("/{mountpoint_name}").as_str())
+            .unwrap()
+            .list()
+    );
+    return Ok(());
+}
+
+/// @brief 迁移伪文件系统的inode
+/// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
+fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), i32> {
+    // ==== 在这里获取要被迁移的文件系统的inode ===
+    let binding = ROOT_INODE().find("proc").expect("ProcFS not mounted!").fs();
+    let proc: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
+    let binding = ROOT_INODE().find("dev").expect("DevFS not mounted!").fs();
+    let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
+
+    // kdebug!("dev list={:?}", dev.list());
+    // kdebug!("fat root list={:?}", new_fs.root_inode().list());
+
+    let new_fs = MountFS::new(new_fs, None);
+    // 获取新的根文件系统的根节点的引用
+    let new_root_inode = Box::leak(Box::new(new_fs.root_inode()));
+
+    // 把上述文件系统,迁移到新的文件系统下
+    do_migrate(new_root_inode.clone(), "proc", proc)?;
+    do_migrate(new_root_inode.clone(), "dev", dev)?;
+
+    unsafe {
+        // drop旧的Root inode
+        let old_root_inode:Box<Arc<dyn IndexNode>> = Box::from_raw(__ROOT_INODE);
+        __ROOT_INODE = null_mut();
+        drop(old_root_inode);
+        
+        // 设置全局的新的ROOT Inode
+        __ROOT_INODE = new_root_inode;
+    }
+
+    kdebug!(
+        "list /dev  =   {:?}",
+        ROOT_INODE().find("dev").unwrap().list()
+    );
+    kdebug!(
+        "list /proc  =   {:?}",
+        ROOT_INODE().find("proc").unwrap().list()
+    );
+    kinfo!("Migrate filesystems done!");
 
     return Ok(());
 }
@@ -145,217 +208,10 @@ pub extern "C" fn mount_root_fs() -> i32 {
         }
     }
 
-    kdebug!("root.list()={:?}", ROOT_INODE.list());
+    kdebug!("root.list()={:?}", ROOT_INODE().list());
     kinfo!("Successfully migrate rootfs to FAT32!");
 
     return 0;
-}
-
-/// @brief 在这个函数里面，编写调试文件系统用的代码。该函数仅供重构期间，方便调试使用。
-///
-/// 建议在这个函数里面，调用其他的调试函数。（避免merge的时候出现大量冲突）
-pub fn __test_filesystem() {
-    __test_rootfs();
-}
-
-fn test_fatfs() {
-    let partiton: Arc<crate::io::disk_info::Partition> =
-        ahci::get_disks_by_name("ahci_disk_0".to_string())
-            .unwrap()
-            .0
-            .lock()
-            .partitions[0]
-            .clone();
-
-    // ========== 测试挂载文件系统 ===============
-    let fatfs: Result<Arc<FATFileSystem>, i32> = FATFileSystem::new(partiton);
-    if fatfs.is_err() {
-        kerror!(
-            "Failed to initialize fatfs, code={:?}",
-            fatfs.as_ref().err()
-        );
-    }
-    let fatfs = fatfs.unwrap();
-
-    // ======= 测试读取目录 =============
-    let fat_root = fatfs.root_inode();
-    kdebug!("get fat root inode ok");
-    let root_items: Result<Vec<String>, i32> = fat_root.list();
-    kdebug!("list root inode = {:?}", root_items);
-    if root_items.is_ok() {
-        let root_items: Vec<String> = root_items.unwrap();
-        kdebug!("root items = {:?}", root_items);
-    } else {
-        kerror!("list root_items failed, code = {}", root_items.unwrap_err());
-    }
-    // kdebug!("to find boot");
-    // let boot_inode = fat_root.find("boot").unwrap();
-    // kdebug!("to list boot");
-    // kdebug!("boot items = {:?}", boot_inode.list().unwrap());
-    // kdebug!("to find grub");
-    // let grub_inode = boot_inode.find("grub").unwrap();
-    // kdebug!("to list grub");
-    // kdebug!("grub_items={:?}", grub_inode.list().unwrap());
-    // let grub_cfg_inode = grub_inode.find("grub.cfg").unwrap();
-
-    // // ========== 测试读写 =============
-    // kdebug!("grub_cfg_inode = {:?}", grub_cfg_inode);
-    // let mut buf: Vec<u8> = Vec::new();
-    // buf.resize(128, 0);
-    // let mut file = File::new(grub_cfg_inode, O_RDWR).unwrap();
-    // kdebug!("file={file:?}, metadata = {:?}", file.metadata());
-    // let r = file.read(128, &mut buf);
-    // kdebug!("r = {r:?}, buf={buf:?}");
-    // for x in buf.iter() {
-    //     print!("{}", *x as char);
-    // }
-    // buf[126] = "X".as_bytes()[0];
-    // buf[127] = "X".as_bytes()[0];
-    // kdebug!("to_write");
-    // let r = file.write(128, &buf);
-    // kdebug!("write ok, r = {r:?}");
-    // let r = file.read(128, &mut buf);
-    // kdebug!("r = {r:?}, buf={buf:?}");
-    // for x in buf.iter() {
-    //     print!("{}", *x as char);
-    // }
-    // kdebug!("read ok");
-    // kdebug!("file={file:?}, metadata = {:?}", file.metadata());
-
-    // ======== 测试创建文件夹 ============
-
-    // kdebug!(" to create dir 'test_create'.");
-    // let r: Result<Arc<dyn IndexNode>, i32> = fat_root.create("test_create", FileType::Dir, 0o777);
-    // kdebug!("test_create  r={r:?}");
-    // let test_create_inode = r.unwrap();
-    // fat_root.create("test1", FileType::Dir, 0o777);
-    // let test2 = fat_root.create("test2", FileType::Dir, 0o777).unwrap();
-
-    // let test_create_inode = fat_root.create("test3", FileType::Dir, 0o777).unwrap();
-    // fat_root.create("test4", FileType::Dir, 0o777);
-    // fat_root.create("test5", FileType::Dir, 0o777);
-    // fat_root.create("test6", FileType::Dir, 0o777);
-    kdebug!("fat_root.list={:?}", fat_root.list());
-    // kdebug!("test_create_inode.list={:?}", test_create_inode.list());
-    // kdebug!("test_create_inode.metadata()={:?}", test_create_inode.metadata());
-
-    // let r = test_create_inode.create("test_dir", FileType::Dir, 0o777);
-    // kdebug!("test_dir  r={r:?}");
-    // let test_dir = r.unwrap();
-    // kdebug!("test_dir.list = {:?}", test_dir.list());
-    // let r = test_create_inode.create("test_file", FileType::File, 0o777);
-    // kdebug!("create test_file  r={r:?}");
-    // let r = test_create_inode.create("test_file2", FileType::File, 0o777);
-    // kdebug!("create test_file2  r={r:?}");
-    // let test_file = File::new(test_create_inode.find("test_file").unwrap(), O_RDWR);
-    // kdebug!("test_file  r={test_file:?}");
-    // let mut test_file2 = File::new(test_create_inode.find("test_file2").unwrap(), O_RDWR).unwrap();
-    // kdebug!("test_file2  r={test_file2:?}");
-    // let mut test_file = test_file.unwrap();
-    // kdebug!("test_file metadata = {:?}", test_file.metadata());
-    // let mut buf:Vec<u8> = Vec::new();
-    // for i in 0..10{
-    //     buf.append(&mut format!("{}\n", i).as_bytes().to_vec());
-    // }
-    // let r = test_file.write(buf.len(), &buf);
-    // kdebug!("write file, r= {r:?}");
-    // let r = test_file2.write(buf.len(), &buf);
-    // kdebug!("write file, r= {r:?}");
-
-    // buf.clear();
-    // buf.resize(64, 0);
-    // let r = test_file.read(64, &mut buf);
-    // kdebug!("read test_file, r={r:?}");
-    // for x in buf.iter(){
-    //     print!("{}", *x as char);
-    // }
-
-    // 测试删除文件
-
-    // let test3 = fat_root.find("test3").unwrap();
-    // let r = test3.unlink("test_dir");
-    // kdebug!("r = {r:?}");
-
-    // let a = test3.find("test_dir").unwrap().unlink("a");
-    // assert!(a.is_ok());
-    // let r = test3.unlink("test_dir");
-    // assert!(r.is_ok());
-
-    kdebug!("test_done");
-    compiler_fence(Ordering::SeqCst);
-}
-
-fn __test_rootfs() {
-    kdebug!("root inode.list()={:?}", ROOT_INODE.list());
-}
-
-fn __as_any_ref<T: Any>(x: &T) -> &dyn core::any::Any {
-    x
-}
-
-/// @brief procfs测试函数
-pub fn _test_procfs(pid: i64) {
-    __test_procfs(pid);
-}
-
-pub fn _test_procfs_2(pid: i64) {
-    // __test_procfs_2(pid);
-}
-
-// 进程注册测试
-fn __test_procfs(pid: i64) {
-    kdebug!("to register pid: {}", pid);
-    // 获取procfs实例
-    let _p = ROOT_INODE.find("proc").unwrap();
-
-    let procfs_inode = _p.downcast_ref::<LockedProcFSInode>().unwrap();
-    let fs = procfs_inode.fs();
-    let fs = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
-    kdebug!("to procfs_register_pid");
-    // 调用注册函数
-    fs.procfs_register_pid(pid).expect("register pid failed");
-    // /proc/1/status
-    // kdebug!("procfs_register_pid ok");
-    // kdebug!(
-    //     "root inode.list()={:?}",
-    //     ROOT_INODE.list().expect("list / failed.")
-    // );
-    // let proc_inode = ROOT_INODE.lookup("/proc/1/status").expect("Cannot find /proc/1/status");
-    let _t = procfs_inode.find(&format!("{}", pid)).unwrap();
-    let proc_inode = _t
-        .find("status")
-        .expect(&format!("Cannot find /proc/{}/status", pid));
-    let mut f = File::new(proc_inode, FileMode::O_RDONLY).unwrap();
-    // kdebug!("file created!");
-    // kdebug!("proc.list()={:?}", _p.list().expect("list /proc failed."));
-    let mut buf: Vec<u8> = Vec::new();
-    buf.resize(f.metadata().unwrap().size as usize, 0);
-
-    let size = f
-        .read(f.metadata().unwrap().size as usize, buf.as_mut())
-        .unwrap();
-    // kdebug!("size = {}, data={:?}", size, buf);
-    let buf = String::from_utf8(buf).unwrap();
-    // kdebug!("data for /proc/{}/status: {}", pid, buf);
-}
-
-// 解除进程注册测试
-fn __test_procfs_2(pid: i64) {
-    // 获取procfs实例
-    let _p = ROOT_INODE.find("proc").unwrap();
-
-    let procfs_inode = _p.downcast_ref::<LockedProcFSInode>().unwrap();
-    let fs = procfs_inode.fs();
-    let fs = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
-    kdebug!("to procfs_register_pid");
-    // 调用解除注册函数
-    fs.procfs_unregister_pid(pid)
-        .expect("unregister pid failed");
-
-    kdebug!("procfs_unregister_pid:{} ok", pid);
-
-    // 查看进程文件夹是否存在
-    kdebug!("proc.list()={:?}", _p.list().expect("list /proc failed."));
 }
 
 /// @brief 为当前进程打开一个文件
@@ -365,7 +221,7 @@ pub fn do_open(path: &str, mode: FileMode) -> Result<i32, i32> {
         return Err(-(ENAMETOOLONG as i32));
     }
 
-    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE.lookup(path);
+    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE().lookup(path);
 
     let inode: Arc<dyn IndexNode> = if inode.is_err() {
         let errno = inode.unwrap_err();
@@ -376,7 +232,8 @@ pub fn do_open(path: &str, mode: FileMode) -> Result<i32, i32> {
         {
             let (filename, parent_path) = rsplit_path(path);
             // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> = ROOT_INODE.lookup(parent_path.unwrap_or("/"))?;
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件
             let inode: Arc<dyn IndexNode> = parent_inode.create(filename, FileType::File, 0o777)?;
             inode

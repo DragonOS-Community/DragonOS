@@ -6,7 +6,6 @@
 #include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
 #include <exception/irq.h>
-#include <filesystem/fat32/fat32.h>
 #include <filesystem/vfs/VFS.h>
 #include <mm/slab.h>
 #include <process/process.h>
@@ -23,6 +22,7 @@ extern uint64_t sys_sigaction(struct pt_regs *regs);
 extern uint64_t sys_rt_sigreturn(struct pt_regs *regs);
 extern uint64_t sys_getpid(struct pt_regs *regs);
 extern uint64_t sys_sched(struct pt_regs *regs);
+
 /**
  * @brief 关闭文件系统调用
  *
@@ -281,53 +281,7 @@ uint64_t sys_reboot(struct pt_regs *regs)
  */
 uint64_t sys_chdir(struct pt_regs *regs)
 {
-    char *dest_path = (char *)regs->r8;
-    // kdebug("dest_path=%s", dest_path);
-    // 检查目标路径是否为NULL
-    if (dest_path == NULL)
-        return -EFAULT;
-
-    // 计算输入的路径长度
-    int dest_path_len;
-    if (user_mode(regs))
-    {
-        dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
-    }
-    else
-        dest_path_len = strnlen(dest_path, PAGE_4K_SIZE);
-
-    // 长度小于等于0
-    if (dest_path_len <= 0)
-        return -EFAULT;
-    else if (dest_path_len >= PAGE_4K_SIZE)
-        return -ENAMETOOLONG;
-
-    // 为路径字符串申请空间
-    char *path = kmalloc(dest_path_len + 1, 0);
-    // 系统内存不足
-    if (path == NULL)
-        return -ENOMEM;
-
-    memset(path, 0, dest_path_len + 1);
-    if (regs->cs & USER_CS)
-    {
-        // 将字符串从用户空间拷贝进来, +1是为了拷贝结尾的\0
-        strncpy_from_user(path, dest_path, dest_path_len + 1);
-    }
-    else
-        strncpy(path, dest_path, dest_path_len + 1);
-    // kdebug("chdir: path = %s", path);
-    struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-
-    kfree(path);
-
-    if (dentry == NULL)
-        return -ENOENT;
-    // kdebug("dentry->name=%s, namelen=%d", dentry->name, dentry->name_length);
-    // 目标不是目录
-    if (dentry->dir_inode->attribute != VFS_IF_DIR)
-        return -ENOTDIR;
-
+    // todo
     return 0;
 }
 
@@ -478,6 +432,13 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
     regs->rax = ret; // 返回码
 }
 uint64_t sys_pipe(struct pt_regs *regs){
+    return -ENOTSUP;
+}
+uint64_t sys_mkdir(struct pt_regs *regs){
+    return -ENOTSUP;
+}
+
+uint64_t sys_unlink_at(struct pt_regs *regs){
     return -ENOTSUP;
 }
 

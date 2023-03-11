@@ -15,14 +15,14 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct LockedKeyBoardInode(SpinLock<KeyBoardInode>);
+pub struct LockedPS2KeyBoardInode(SpinLock<PS2KeyBoardInode>);
 
 #[derive(Debug)]
-pub struct KeyBoardInode {
+pub struct PS2KeyBoardInode {
     /// uuid 暂时不知道有什么用（x
     // uuid: Uuid,
     /// 指向自身的弱引用
-    self_ref: Weak<LockedKeyBoardInode>,
+    self_ref: Weak<LockedPS2KeyBoardInode>,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<DevFS>,
     /// INode 元数据
@@ -31,9 +31,9 @@ pub struct KeyBoardInode {
     f_ops: vfs_file_operations_t,
 }
 
-impl LockedKeyBoardInode {
+impl LockedPS2KeyBoardInode {
     pub fn new(f_ops: &vfs_file_operations_t) -> Arc<Self> {
-        let inode = KeyBoardInode {
+        let inode = PS2KeyBoardInode {
             // uuid: Uuid::new_v5(),
             self_ref: Weak::default(),
             fs: Weak::default(),
@@ -56,30 +56,30 @@ impl LockedKeyBoardInode {
             },
         };
 
-        let result = Arc::new(LockedKeyBoardInode(SpinLock::new(inode)));
+        let result = Arc::new(LockedPS2KeyBoardInode(SpinLock::new(inode)));
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         return result;
     }
 }
 
-impl DeviceINode for LockedKeyBoardInode {
+impl DeviceINode for LockedPS2KeyBoardInode {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.0.lock().fs = fs;
     }
 }
 
 #[no_mangle] // 不重命名
-pub extern "C" fn keyboard_register(f_ops: &vfs_file_operations_t) {
+pub extern "C" fn ps2_keyboard_register(f_ops: &vfs_file_operations_t) {
     kdebug!("register keyboard = {:p}", f_ops);
     devfs_register(
-        String::from("ps2_keyboard"),
-        LockedKeyBoardInode::new(f_ops),
-    );
+        "ps2_keyboard",
+        LockedPS2KeyBoardInode::new(f_ops),
+    ).expect("Failed to register ps/2 keyboard");
     kdebug!("register keyboard = {:p}", f_ops);
 }
 
-impl IndexNode for LockedKeyBoardInode {
+impl IndexNode for LockedPS2KeyBoardInode {
     fn read_at(
         &self,
         _offset: usize,

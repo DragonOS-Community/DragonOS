@@ -326,7 +326,7 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (ROOT_INODE.clone(), String::from(rest))
+            (ROOT_INODE().clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))

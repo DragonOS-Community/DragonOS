@@ -38,14 +38,12 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
-use crate::filesystem::vfs::core::_test_procfs_2;
 use mm::allocator::KernelAllocator;
 
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
-    filesystem::vfs::core::{__test_filesystem, _test_procfs},
-    include::bindings::bindings::{process_do_exit, BLACK, GREEN},
+    include::bindings::bindings::{process_do_exit, BLACK, GREEN}, filesystem::{vfs::ROOT_INODE, devfs::__test_dev},
 };
 
 // 声明全局的slab分配器
@@ -92,19 +90,8 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-    __test_filesystem();
-    // __test_ahci(); // ahci测试代码
-    // __test_dev();  // dev的测试代码
-
+    __test_dev();
+    let f = ROOT_INODE().lookup("/dev/char").unwrap();
+    kdebug!("char devs: {:?}", f.list());
     return 0;
-}
-
-#[no_mangle]
-pub extern "C" fn rs_procfs_register_pid(pid: i64) {
-    _test_procfs(pid);
-}
-
-#[no_mangle]
-pub extern "C" fn rs_procfs_unregister_pid(pid: i64){
-    _test_procfs_2(pid);
 }

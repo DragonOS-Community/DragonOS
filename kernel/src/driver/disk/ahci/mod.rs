@@ -47,11 +47,11 @@ pub fn phys_2_virt(addr: usize) -> usize {
 }
 
 #[no_mangle]
-pub extern "C" fn ahci_init()->i32{
+pub extern "C" fn ahci_init() -> i32 {
     let r = ahci_rust_init();
-    if r.is_ok(){
+    if r.is_ok() {
         return 0;
-    }else {
+    } else {
         return r.unwrap_err();
     }
 }
@@ -144,7 +144,7 @@ pub fn ahci_rust_init() -> Result<(), i32> {
 
                         // 挂载到devfs上面去
                         let ret = devfs_register(
-                            String::from(format!("ahci_{}", id)),
+                            format!("ahci_{}", id).as_str(),
                             LockedAhciInode::new(disks_list.last().unwrap().clone()),
                         );
                         if let Err(err) = ret {

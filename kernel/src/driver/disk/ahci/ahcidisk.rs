@@ -76,6 +76,7 @@ impl AhciDisk {
             return Err(-(EIO as i32));
         }
 
+        #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
                 volatile_read!(port.clb) as usize
@@ -96,6 +97,7 @@ impl AhciDisk {
 
         // 设置数据存放地址
         let mut buf_ptr = buf as *mut [u8] as *mut usize as usize;
+        #[allow(unused_unsafe)]
         let cmdtbl = unsafe {
             (phys_2_virt(volatile_read!(cmdheader.ctba) as usize) as *mut HbaCmdTable)
                 .as_mut()
@@ -208,6 +210,7 @@ impl AhciDisk {
         }
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
                 volatile_read!(port.clb) as usize
@@ -230,6 +233,7 @@ impl AhciDisk {
         // 设置数据存放地址
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let mut buf_ptr = buf as *const [u8] as *mut usize as usize;
+        #[allow(unused_unsafe)]
         let cmdtbl = unsafe {
             (phys_2_virt(volatile_read!(cmdheader.ctba) as usize) as *mut HbaCmdTable)
                 .as_mut()

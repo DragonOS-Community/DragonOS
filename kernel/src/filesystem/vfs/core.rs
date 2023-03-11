@@ -1,24 +1,19 @@
 use core::{
-    any::Any,
     hint::spin_loop,
-    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+    ptr::null_mut,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::{
-    format,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
     arch::asm::current::current_pcb,
-    driver::disk::ahci::{self, ahci_rust_init},
+    driver::disk::ahci::{self},
     filesystem::{
+        devfs::DevFS,
         fat::fs::FATFileSystem,
-        procfs::{LockedProcFSInode, ProcFS},
+        procfs::ProcFS,
         ramfs::RamFS,
-        rootfs::RootFS,
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
@@ -38,68 +33,139 @@ pub fn generate_inode_id() -> InodeId {
     return INO.fetch_add(1, Ordering::SeqCst);
 }
 
-// @brief 初始化ROOT INODE
-lazy_static! {
-    pub static ref ROOT_INODE: Arc<dyn IndexNode> = {
-        // ahci_rust_init().expect("ahci rust init failed.");
-        // 使用Ramfs作为默认的根文件系统
-        let ramfs = RamFS::new();
-        let mount_fs = MountFS::new(ramfs, None);
-        let rootfs = RootFS::new(mount_fs).expect("Cannot create rootfs instance.");
-        let root_inode = rootfs.root_inode();
+static mut __ROOT_INODE: *mut Arc<dyn IndexNode> = null_mut();
 
-        // 创建文件夹
-        root_inode.create("proc", FileType::Dir, 0o777).expect("Failed to create /proc");
-        root_inode.create("dev", FileType::Dir, 0o777).expect("Failed to create /dev");
-        // 创建procfs实例
-        let procfs = ProcFS::new();
-        kdebug!("proc created");
-        kdebug!("root inode.list()={:?}", root_inode.list());
-        // procfs挂载
-        let _t = root_inode.find("proc").expect("Cannot find /proc").mount(procfs).expect("Failed to mount procfs.");
-        kdebug!("root inode.list()={:?}", root_inode.list());
-        root_inode
-    };
+/// @brief 获取全局的根节点
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn ROOT_INODE() -> Arc<dyn IndexNode> {
+    unsafe {
+        return __ROOT_INODE.as_ref().unwrap().clone();
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn vfs_init() -> i32 {
-    let root_inode = ROOT_INODE.list().expect("vfs init failed");
+    // 使用Ramfs作为默认的根文件系统
+    let ramfs = RamFS::new();
+    let mount_fs = MountFS::new(ramfs, None);
+    let root_inode = Box::leak(Box::new(mount_fs.root_inode()));
+
+    unsafe {
+        __ROOT_INODE = root_inode;
+    }
+
+    // 创建文件夹
+    root_inode
+        .create("proc", FileType::Dir, 0o777)
+        .expect("Failed to create /proc");
+    root_inode
+        .create("dev", FileType::Dir, 0o777)
+        .expect("Failed to create /dev");
+
+    // // 创建procfs实例
+    let procfs = ProcFS::new();
+    kdebug!("proc created");
+    kdebug!("root inode.list()={:?}", root_inode.list());
+    // procfs挂载
+    let _t = root_inode
+        .find("proc")
+        .expect("Cannot find /proc")
+        .mount(procfs)
+        .expect("Failed to mount procfs.");
+    kdebug!("root inode.list()={:?}", root_inode.list());
+
+    // 创建 devfs 实例
+    let devfs = DevFS::new();
+    // devfs 挂载
+    let _t = root_inode
+        .find("dev")
+        .expect("Cannot find /dev")
+        .mount(devfs)
+        .expect("Failed to mount devfs");
+
+    let root_inode = ROOT_INODE().list().expect("vfs init failed");
     if root_inode.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
     return 0;
 }
 
-/// @brief 迁移伪文件系统的inode
-/// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
-fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), i32> {
-    // ==== 迁移procfs ===
-    let proc = ROOT_INODE.find("proc").expect("procfs not mounted!");
-    kdebug!("fat root list={:?}", new_fs.root_inode().list());
+/// @brief 真正执行伪文件系统迁移的过程
+///
+/// @param mountpoint_name 在根目录下的挂载点的名称
+/// @param inode 原本的挂载点的inode
+fn do_migrate(
+    new_root_inode: Arc<dyn IndexNode>,
+    mountpoint_name: &str,
+    fs: &MountFS,
+) -> Result<(), i32> {
+    let r = new_root_inode.find(mountpoint_name);
 
-    let r: Result<Arc<MountFS>, i32> = ROOT_INODE.mount(new_fs);
-    if r.is_err() {
-        let val = r.unwrap_err();
-        // 由于mount方法的返回参数限制，我们约定ROOT_INODE.mount()返回Err(0)时，表示执行成功。
-        if val != 0 {
-            return Err(val);
-        }
-    }
-
-    kdebug!("mount new_fs done, list={:?}", ROOT_INODE.list());
-    let r = ROOT_INODE.find("usr");
-    let proc_mountpoint = if r.is_err() {
-        ROOT_INODE
-            .create("proc", FileType::Dir, 0o777)
-            .expect("Failed to create '/proc'")
+    kdebug!("new root.list()={:?}", new_root_inode.list());
+    let mountpoint = if r.is_err() {
+        new_root_inode
+            .create(mountpoint_name, FileType::Dir, 0o777)
+            .expect(format!("Failed to create '/{mountpoint_name}'").as_str())
     } else {
         r.unwrap()
     };
     // 迁移挂载点
-    proc_mountpoint
-        .mount(proc.fs())
-        .expect("Failed to migrate ProcFS");
+    mountpoint
+        .mount(fs.inner_filesystem())
+        .expect(format!("Failed to migrate {mountpoint_name}").as_str());
+    kdebug!("mountpoint.list={:?}", mountpoint.list());
+    kdebug!("new root.list()={:?}", new_root_inode.list());
+    kdebug!(
+        "/{}.list={:?}",
+        mountpoint_name,
+        new_root_inode
+            .lookup(format!("/{mountpoint_name}").as_str())
+            .unwrap()
+            .list()
+    );
+    return Ok(());
+}
+
+/// @brief 迁移伪文件系统的inode
+/// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
+fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), i32> {
+    // ==== 在这里获取要被迁移的文件系统的inode ===
+    let binding = ROOT_INODE().find("proc").expect("ProcFS not mounted!").fs();
+    let proc: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
+    let binding = ROOT_INODE().find("dev").expect("DevFS not mounted!").fs();
+    let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
+
+    // kdebug!("dev list={:?}", dev.list());
+    // kdebug!("fat root list={:?}", new_fs.root_inode().list());
+
+    let new_fs = MountFS::new(new_fs, None);
+    // 获取新的根文件系统的根节点的引用
+    let new_root_inode = Box::leak(Box::new(new_fs.root_inode()));
+
+    // 把上述文件系统,迁移到新的文件系统下
+    do_migrate(new_root_inode.clone(), "proc", proc)?;
+    do_migrate(new_root_inode.clone(), "dev", dev)?;
+
+    unsafe {
+        // drop旧的Root inode
+        let old_root_inode: Box<Arc<dyn IndexNode>> = Box::from_raw(__ROOT_INODE);
+        __ROOT_INODE = null_mut();
+        drop(old_root_inode);
+
+        // 设置全局的新的ROOT Inode
+        __ROOT_INODE = new_root_inode;
+    }
+
+    kdebug!(
+        "list /dev  =   {:?}",
+        ROOT_INODE().find("dev").unwrap().list()
+    );
+    kdebug!(
+        "list /proc  =   {:?}",
+        ROOT_INODE().find("proc").unwrap().list()
+    );
+    kinfo!("Migrate filesystems done!");
 
     return Ok(());
 }
@@ -134,7 +200,7 @@ pub extern "C" fn mount_root_fs() -> i32 {
         }
     }
 
-    kdebug!("root.list()={:?}", ROOT_INODE.list());
+    kdebug!("root.list()={:?}", ROOT_INODE().list());
     kinfo!("Successfully migrate rootfs to FAT32!");
 
     return 0;
@@ -147,7 +213,7 @@ pub fn do_open(path: &str, mode: FileMode) -> Result<i32, i32> {
         return Err(-(ENAMETOOLONG as i32));
     }
 
-    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE.lookup(path);
+    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE().lookup(path);
 
     let inode: Arc<dyn IndexNode> = if inode.is_err() {
         let errno = inode.unwrap_err();
@@ -158,7 +224,8 @@ pub fn do_open(path: &str, mode: FileMode) -> Result<i32, i32> {
         {
             let (filename, parent_path) = rsplit_path(path);
             // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> = ROOT_INODE.lookup(parent_path.unwrap_or("/"))?;
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件
             let inode: Arc<dyn IndexNode> = parent_inode.create(filename, FileType::File, 0o777)?;
             inode

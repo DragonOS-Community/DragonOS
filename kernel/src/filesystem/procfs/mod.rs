@@ -1,4 +1,4 @@
-use core::{intrinsics::size_of, str::FromStr};
+use core::intrinsics::size_of;
 
 use alloc::{
     borrow::ToOwned,
@@ -16,9 +16,9 @@ use crate::{
     },
     include::bindings::bindings::{
         pid_t, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR,
-        ENOTEMPTY, EPERM, ESRCH, ENOTSUP,
+        ENOTEMPTY, ENOTSUP, EPERM, ESRCH,
     },
-    kdebug, kerror,
+    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
@@ -403,9 +403,9 @@ impl IndexNode for LockedProcFSInode {
 
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         return Err(-(ENOTSUP as i32));
@@ -421,7 +421,7 @@ impl IndexNode for LockedProcFSInode {
         }
 
         return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
+            flags: PollStatus::READ_MASK,
         });
     }
 
@@ -572,9 +572,9 @@ impl IndexNode for LockedProcFSInode {
 
     fn move_(
         &self,
-        old_name: &str,
-        target: &Arc<dyn IndexNode>,
-        new_name: &str,
+        _old_name: &str,
+        _target: &Arc<dyn IndexNode>,
+        _new_name: &str,
     ) -> Result<(), i32> {
         return Err(-(ENOTSUP as i32));
     }
@@ -660,17 +660,13 @@ pub extern "C" fn rs_procfs_register_pid(pid: pid_t) -> u64 {
 
 /// @brief 向procfs注册进程
 pub fn procfs_register_pid(pid: pid_t) -> Result<(), i32> {
-    let procfs_inode = ROOT_INODE.find("proc")?;
+    let procfs_inode = ROOT_INODE().find("proc")?;
 
     let procfs_inode = procfs_inode
         .downcast_ref::<LockedProcFSInode>()
         .expect("Failed to find procfs' root inode");
-    let fs = procfs_inode
-        .fs();
-    let procfs: &ProcFS = fs
-        .as_any_ref()
-        .downcast_ref::<ProcFS>()
-        .unwrap();
+    let fs = procfs_inode.fs();
+    let procfs: &ProcFS = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
 
     // 调用注册函数
     procfs.register_pid(pid)?;
@@ -691,17 +687,13 @@ pub extern "C" fn rs_procfs_unregister_pid(pid: pid_t) -> u64 {
 /// @brief 在ProcFS中,解除进程的注册
 pub fn procfs_unregister_pid(pid: pid_t) -> Result<(), i32> {
     // 获取procfs实例
-    let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE.find("proc")?;
+    let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE().find("proc")?;
 
     let procfs_inode: &LockedProcFSInode = procfs_inode
         .downcast_ref::<LockedProcFSInode>()
         .expect("Failed to find procfs' root inode");
-    let fs:Arc<dyn FileSystem> = procfs_inode
-        .fs();
-    let procfs: &ProcFS = fs
-        .as_any_ref()
-        .downcast_ref::<ProcFS>()
-        .unwrap();
+    let fs: Arc<dyn FileSystem> = procfs_inode.fs();
+    let procfs: &ProcFS = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
 
     // 调用解除注册函数
     return procfs.unregister_pid(pid);

@@ -7,7 +7,6 @@ use alloc::{
 
 use crate::{
     include::bindings::bindings::{EBUSY, ENOTDIR},
-    kdebug,
     libs::spinlock::SpinLock,
 };
 
@@ -79,6 +78,10 @@ impl MountFS {
         }
         .wrap();
     }
+
+    pub fn inner_filesystem(&self) -> Arc<dyn FileSystem> {
+        return self.inner_filesystem.clone();
+    }
 }
 
 impl MountFSInode {
@@ -126,7 +129,7 @@ impl IndexNode for MountFSInode {
     fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
         return self.inner_inode.open(data);
     }
-    
+
     fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
         return self.inner_inode.close(data);
     }

@@ -33,7 +33,7 @@ pub extern "C" fn sys_open(regs: &pt_regs) -> u64 {
     let r: Result<i32, i32> = do_open(path, open_flags);
 
     if r.is_ok() {
-        return 0;
+        return r.unwrap() as u64;
     } else {
         return r.unwrap_err() as u64;
     }

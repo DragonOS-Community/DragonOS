@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use core::{any::Any, fmt::Debug};
 
 use alloc::{
@@ -9,14 +10,14 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{
-        core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, FsInfo, IndexNode,
-        Metadata, PollStatus,
+        core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+        PollStatus,
     },
     include::bindings::bindings::{
         EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM, EROFS,
     },
     io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
-    kdebug, kerror,
+    kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,

@@ -221,6 +221,7 @@ impl process_control_block {
     /// @param fd 文件描述符序号
     ///
     /// @return Option(&File) 文件对象的不可变引用
+    #[allow(dead_code)]
     pub fn get_file_ref_by_fd(&self, fd: i32) -> Option<&File> {
         if !FileDescriptorVec::validate_fd(fd) {
             return None;

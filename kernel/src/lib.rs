@@ -33,7 +33,7 @@ mod time;
 
 #[macro_use]
 extern crate alloc;
-#[macro_use]
+
 extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
@@ -90,5 +90,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
+
     return 0;
 }

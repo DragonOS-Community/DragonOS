@@ -37,6 +37,10 @@ pub struct RamFS {
 /// @brief 内存文件系统的Inode结构体(不包含锁)
 #[derive(Debug)]
 pub struct RamFSInode {
+    // parent变量目前只在find函数中使用到
+    // 所以只有当inode是文件夹的时候，parent才会生效
+    // 对于文件来说，parent就没什么作用了
+    // 关于parent的说明: 目录不允许有硬链接
     /// 指向父Inode的弱引用
     parent: Weak<LockedRamFSInode>,
     /// 指向自身的弱引用

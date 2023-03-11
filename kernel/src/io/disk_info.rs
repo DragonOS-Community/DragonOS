@@ -1,10 +1,7 @@
+#![allow(dead_code)]
 use super::device::BlockDevice;
 
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 
 pub type SectorT = u64;
 

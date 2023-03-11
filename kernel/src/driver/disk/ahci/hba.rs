@@ -146,19 +146,19 @@ impl HbaPort {
         while volatile_read!(self.cmd) & HBA_PORT_CMD_CR > 0 {
             core::hint::spin_loop();
         }
-
-        volatile_write!(
-            self.cmd,
-            volatile_read!(self.cmd) | HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST
-        );
+        let val: u32 = volatile_read!(self.cmd) | HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST;
+        volatile_write!(self.cmd, val);
     }
 
     /// 关闭该端口的命令引擎
     pub fn stop(&mut self) {
-        volatile_write!(
-            self.cmd,
-            (u32::MAX ^ HBA_PORT_CMD_ST) & volatile_read!(self.cmd)
-        );
+        #[allow(unused_unsafe)]
+        {
+            volatile_write!(
+                self.cmd,
+                (u32::MAX ^ HBA_PORT_CMD_ST) & volatile_read!(self.cmd)
+            );
+        }
 
         while volatile_read!(self.cmd) & (HBA_PORT_CMD_FR | HBA_PORT_CMD_CR)
             == (HBA_PORT_CMD_FR | HBA_PORT_CMD_CR)
@@ -166,10 +166,13 @@ impl HbaPort {
             core::hint::spin_loop();
         }
 
-        volatile_write!(
-            self.cmd,
-            (u32::MAX ^ HBA_PORT_CMD_FRE) & volatile_read!(self.cmd)
-        );
+        #[allow(unused_unsafe)]
+        {
+            volatile_write!(
+                self.cmd,
+                (u32::MAX ^ HBA_PORT_CMD_FRE) & volatile_read!(self.cmd)
+            );
+        }
     }
 
     /// @return: 返回一个空闲 cmd table 的 id; 如果没有，则返回 Option::None
@@ -223,19 +226,21 @@ impl HbaPort {
             }
             cmdheaders = (cmdheaders as usize + size_of::<HbaCmdHeader>()) as *mut HbaCmdHeader;
         }
+        
+        #[allow(unused_unsafe)]
+        {
+            // 启动中断
+            volatile_write!(self.ie, 0 /*TODO: Enable interrupts: 0b10111*/);
 
-        // 启动中断
-        volatile_write!(self.ie, 0 /*TODO: Enable interrupts: 0b10111*/);
+            // 错误码
+            volatile_write!(self.serr, volatile_read!(self.serr));
 
-        // 错误码
-        volatile_write!(self.serr, volatile_read!(self.serr));
+            // Disable power management
+            volatile_write!(self.sctl, volatile_read!(self.sctl) | 7 << 8);
 
-        // Disable power management
-        volatile_write!(self.sctl, volatile_read!(self.sctl) | 7 << 8);
-
-        // Power on and spin up device
-        volatile_write!(self.cmd, volatile_read!(self.cmd) | 1 << 2 | 1 << 1);
-
+            // Power on and spin up device
+            volatile_write!(self.cmd, volatile_read!(self.cmd) | 1 << 2 | 1 << 1);
+        }
         self.start(); // 重新开启端口
     }
 }

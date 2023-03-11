@@ -2,7 +2,6 @@
 #include <common/err.h>
 #include <common/kthread.h>
 #include <common/spinlock.h>
-#include <filesystem/procfs/procfs.h>
 
 extern spinlock_t process_global_pid_write_lock;
 extern long process_global_pid;

@@ -20,8 +20,6 @@
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
 #include <exception/gate.h>
-#include <filesystem/procfs/procfs.h>
-#include <io/block/block_io_scheduler.h>
 #include <ktest/ktest.h>
 #include <mm/mmio.h>
 #include <mm/slab.h>

@@ -2300,7 +2300,7 @@ impl Iterator for FATDirEntryOffsetIter {
         // 越过了当前簇,则获取下一个簇
         if new_offset >= self.fs.bytes_per_cluster() {
             new_offset %= self.fs.bytes_per_cluster();
-            
+
             match self.fs.get_fat_entry(new_cluster) {
                 Ok(FATEntry::Next(c)) => {
                     new_cluster = c;

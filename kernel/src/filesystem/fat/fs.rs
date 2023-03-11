@@ -10,14 +10,14 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{
-        core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
-        PollStatus,
+        core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+        Metadata, PollStatus,
     },
     include::bindings::bindings::{
-        EFAULT, EINVAL, EISDIR, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM, EROFS,
+        EFAULT, EINVAL, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM, EROFS,
     },
     io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
-    kerror,
+    kdebug, kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
@@ -164,6 +164,13 @@ impl LockedFATInode {
         parent: Weak<LockedFATInode>,
         inode_type: FATDirEntry,
     ) -> Arc<LockedFATInode> {
+
+        let file_type = if let FATDirEntry::Dir(_) = inode_type{
+            FileType::Dir
+        }else{
+            FileType::File
+        };
+
         let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
             parent: parent,
             self_ref: Weak::default(),
@@ -183,7 +190,7 @@ impl LockedFATInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: FileType::Dir,
+                file_type: file_type,
                 mode: 0o777,
                 nlinks: 1,
                 uid: 0,
@@ -1452,7 +1459,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn list(&self) -> Result<Vec<String>, i32> {
-        let guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fatent: &FATDirEntry = &guard.inode_type;
         match fatent {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
@@ -1464,6 +1471,26 @@ impl IndexNode for LockedFATInode {
                 let dir_iter: FATDirIter = dir.to_iter(guard.fs.upgrade().unwrap());
                 for ent in dir_iter {
                     ret.push(ent.name());
+
+                    // ====== 生成inode缓存，存入B树
+                    let name: String = ent.name();
+                    // kdebug!("name={name}");
+
+                    if guard.children.contains_key(&name.to_uppercase()) == false
+                        && name != "."
+                        && name != ".."
+                    {
+                        // 创建新的inode
+                        let entry_inode: Arc<LockedFATInode> = LockedFATInode::new(
+                            guard.fs.upgrade().unwrap(),
+                            guard.self_ref.clone(),
+                            ent,
+                        );
+                        // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
+                        guard
+                            .children
+                            .insert(name.to_uppercase(), entry_inode.clone());
+                    }
                 }
                 return Ok(ret);
             }
@@ -1519,6 +1546,38 @@ impl IndexNode for LockedFATInode {
                 guard.children.insert(name.to_uppercase(), target);
             }
             return Err(r);
+        }
+    }
+
+    fn get_entry_name(&self, ino: InodeId) -> Result<String, i32> {
+        let guard: SpinLockGuard<FATInode> = self.0.lock();
+        if guard.metadata.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+        kdebug!("ino={ino}");
+        match ino {
+            0 => {
+                return Ok(String::from("."));
+            }
+            1 => {
+                return Ok(String::from(".."));
+            }
+            ino => {
+                // 暴力遍历所有的children，判断inode id是否相同
+                // TODO: 优化这里，这个地方性能很差！
+                let mut key: Vec<String> = guard
+                    .children
+                    .keys()
+                    .filter(|k| guard.children.get(*k).unwrap().metadata().unwrap().inode_id == ino)
+                    .cloned()
+                    .collect();
+
+                match key.len() {
+                    0=>{return Err(-(ENOENT as i32));}
+                    1=>{return Ok(key.remove(0));}
+                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
+                }
+            }
         }
     }
 }

@@ -205,8 +205,6 @@ void ps2_keyboard_init()
     // 将设备挂载到devfs
     ps2_keyboard_register(&ps2_keyboard_fops);
 
-    // devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_PS2_KEYBOARD, &ps2_keyboard_fops, NULL);
-
     kinfo("ps/2 keyboard registered.");
 }
 

@@ -6,15 +6,17 @@ pub mod mount;
 mod syscall;
 mod utils;
 
-use ::core::{any::Any, fmt::Debug};
+use ::core::{any::Any, ffi::c_char, fmt::Debug, mem};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
+    kdebug, kerror,
     time::TimeSpec,
 };
 
+use self::file::File;
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -38,6 +40,40 @@ pub enum FileType {
     Pipe,
     /// 符号链接
     SymLink,
+}
+
+/* these are defined by POSIX and also present in glibc's dirent.h */
+/// 完整含义请见 http://www.gnu.org/software/libc/manual/html_node/Directory-Entries.html
+pub const DT_UNKNOWN: u16 = 0;
+/// 命名管道，或者FIFO
+pub const DT_FIFO: u16 = 1;
+// 字符设备
+pub const DT_CHR: u16 = 2;
+// 目录
+pub const DT_DIR: u16 = 4;
+// 块设备
+pub const DT_BLK: u16 = 6;
+// 常规文件
+pub const DT_REG: u16 = 8;
+// 符号链接
+pub const DT_LNK: u16 = 10;
+// 是一个socket
+pub const DT_SOCK: u16 = 12;
+// 这个是抄Linux的，还不知道含义
+pub const DT_WHT: u16 = 14;
+pub const DT_MAX: u16 = 16;
+
+impl FileType {
+    pub fn get_file_type_num(&self) -> u16 {
+        return match self {
+            FileType::File => DT_REG,
+            FileType::Dir => DT_DIR,
+            FileType::BlockDevice => DT_BLK,
+            FileType::CharDevice => DT_CHR,
+            FileType::Pipe => DT_FIFO,
+            FileType::SymLink => DT_LNK,
+        };
+    }
 }
 
 /// @brief inode的状态（由poll方法返回）
@@ -446,6 +482,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+
 }
 
 #[derive(Debug)]
@@ -459,4 +496,15 @@ pub struct FsInfo {
 /// @brief 整合主设备号+次设备号
 pub fn make_rawdev(major: usize, minor: usize) -> usize {
     ((major & 0xffffff) << 8) | (minor & 0xff)
+}
+
+/// @brief
+#[repr(C)]
+#[derive(Debug)]
+pub struct Dirent {
+    d_ino: u64,    // 文件序列号
+    d_off: i64,    // dir偏移量
+    d_reclen: u16, // 目录下的记录数
+    d_type: u8,    // entry的类型
+    d_name: u8,    // 文件entry的名字(是一个零长数组)， 本字段仅用于占位
 }

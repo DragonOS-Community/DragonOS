@@ -46,7 +46,7 @@ impl LockedNullInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
-                mode: 0x666,
+                mode: 0o666,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

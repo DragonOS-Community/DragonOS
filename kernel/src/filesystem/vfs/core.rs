@@ -17,6 +17,7 @@ use crate::{
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
+    include::bindings::bindings::{O_RDONLY, O_RDWR},
     io::SeekFrom,
     kdebug, kerror, kinfo,
 };
@@ -311,4 +312,87 @@ pub fn do_lseek(fd: i32, seek: SeekFrom) -> Result<usize, i32> {
     }
     let file: &mut File = file.unwrap();
     return file.lseek(seek);
+}
+
+/// @brief 创建文件/文件夹
+pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, i32> {
+    // 文件名过长
+    if path.len() > PAGE_4K_SIZE as usize {
+        return Err(-(ENAMETOOLONG as i32));
+    }
+
+    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE().lookup(path);
+
+    if inode.is_err() {
+        let errno = inode.unwrap_err();
+        // 文件不存在，且需要创建
+        if errno == -(ENOENT as i32) {
+            let (filename, parent_path) = rsplit_path(path);
+            // 查找父目录
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+            // 创建文件夹
+            let _create_inode: Arc<dyn IndexNode> =
+                parent_inode.create(filename, FileType::Dir, 0o777)?;
+        } else {
+            // 不需要创建文件，因此返回错误码
+            return Err(errno);
+        }
+    }
+
+    return Ok(0);
+}
+
+/// @breif 删除文件夹
+pub fn do_remove_dir(path: &str, _mode: FileMode) -> Result<u64, i32> {
+    // 文件名过长
+    if path.len() > PAGE_4K_SIZE as usize {
+        return Err(-(ENAMETOOLONG as i32));
+    }
+
+    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE().lookup(path);
+
+    if inode.is_err() {
+        let errno = inode.unwrap_err();
+        // 文件不存在，且需要创建
+        if errno == -(ENOENT as i32) {
+            return Err(-(ENOENT as i32));
+        } else {
+            let (filename, parent_path) = rsplit_path(path);
+            // 查找父目录
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+            // 创建文件夹
+            // parent_inode.rmdir(filename)?;
+        }
+    }
+
+    return Ok(0);
+}
+
+/// @brief 删除文件
+pub fn do_unlink_at(path: &str, _mode: FileMode) -> Result<u64, i32> {
+    // 文件名过长
+    if path.len() > PAGE_4K_SIZE as usize {
+        return Err(-(ENAMETOOLONG as i32));
+    }
+
+    let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE().lookup(path);
+
+    if inode.is_err() {
+        let errno = inode.unwrap_err();
+        // 文件不存在，且需要创建
+        if errno == -(ENOENT as i32) {
+            return Err(-(ENOENT as i32));
+        } else {
+            let (filename, parent_path) = rsplit_path(path);
+            // 查找父目录
+            let parent_inode: Arc<dyn IndexNode> =
+                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+            // 创建文件夹
+            parent_inode.unlink(filename)?;
+        }
+    }
+
+    return Ok(0);
 }

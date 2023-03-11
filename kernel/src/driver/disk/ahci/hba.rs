@@ -226,7 +226,7 @@ impl HbaPort {
             }
             cmdheaders = (cmdheaders as usize + size_of::<HbaCmdHeader>()) as *mut HbaCmdHeader;
         }
-        
+
         #[allow(unused_unsafe)]
         {
             // 启动中断

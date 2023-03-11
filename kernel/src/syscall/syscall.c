@@ -279,11 +279,7 @@ uint64_t sys_reboot(struct pt_regs *regs)
 | ENAMETOOLONG |        路径过长        |
 +--------------+------------------------+
  */
-uint64_t sys_chdir(struct pt_regs *regs)
-{
-    // todo
-    return 0;
-}
+extern uint64_t sys_chdir(struct pt_regs *regs);
 
 /**
  * @brief 获取目录中的数据
@@ -291,28 +287,8 @@ uint64_t sys_chdir(struct pt_regs *regs)
  * @param fd 文件描述符号
  * @return uint64_t dirent的总大小
  */
-uint64_t sys_getdents(struct pt_regs *regs)
-{
-    // int fd = (int)regs->r8;
-    // void *dirent = (void *)regs->r9;
-    // long count = (long)regs->r10;
+extern uint64_t sys_getdents(struct pt_regs *regs);
 
-    // if (fd < 0 || fd > PROC_MAX_FD_NUM)
-    //     return -EBADF;
-
-    // if (count < 0)
-    //     return -EINVAL;
-
-    // struct vfs_file_t *filp = current_pcb->fds[fd];
-    // if (filp == NULL)
-    //     return -EBADF;
-
-    // uint64_t retval = 0;
-    // if (filp->file_ops && filp->file_ops->readdir)
-    //     retval = filp->file_ops->readdir(filp, dirent, &vfs_fill_dirent);
-
-    return -ENOTSUP;
-}
 
 /**
  * @brief 执行新的程序
@@ -434,13 +410,10 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 uint64_t sys_pipe(struct pt_regs *regs){
     return -ENOTSUP;
 }
-uint64_t sys_mkdir(struct pt_regs *regs){
-    return -ENOTSUP;
-}
 
-uint64_t sys_unlink_at(struct pt_regs *regs){
-    return -ENOTSUP;
-}
+extern uint64_t sys_mkdir(struct pt_regs *regs);
+
+extern uint64_t sys_unlink_at(struct pt_regs *regs);
 
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,
@@ -455,18 +428,18 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [9] = sys_brk,
     [10] = sys_sbrk,
     [11] = sys_reboot,
-    [12] = sys_chdir,
-    [13] = sys_getdents,
+    [12] = sys_chdir,    
+    [13] = sys_getdents, 
     [14] = sys_execve,
     [15] = sys_wait4,
     [16] = sys_exit,
-    [17] = sys_mkdir,
+    [17] = sys_mkdir, 
     [18] = sys_nanosleep,
     [19] = sys_clock,
     [20] = sys_pipe,
     [21] = sys_mstat,
-    [22] = sys_unlink_at,
-    [23] = sys_kill,
+    [22] = sys_unlink_at,  
+    [23] = sys_kill, 
     [24] = sys_sigaction,
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,

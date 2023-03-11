@@ -18,7 +18,7 @@ use crate::{
         pid_t, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR,
         ENOTEMPTY, ENOTSUP, EPERM, ESRCH,
     },
-    kerror,
+    kdebug, kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
@@ -129,15 +129,13 @@ impl ProcFSInode {
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
+        // ！！！！！由于目前有bug，不能获取到pcb的name，因此暂时用'Unknown'代替
+        let tmp_name: Vec<u8> = "Unknown".as_bytes().to_vec();
         // kdebug!("pcb.name={:?}", pcb.name);
-        let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
-        for val in pcb.name.iter() {
-            tmp_name.push(*val as u8);
-        }
-        // kdebug!(
-        //     "pcb.tmp_name={}",
-        //     String::from_utf8(tmp_name.clone()).unwrap_or("NULL".to_string())
-        // );
+        // let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
+        // for val in pcb.name.iter() {
+        //     tmp_name.push(*val as u8);
+        // }
 
         pdata.append(
             &mut format!(
@@ -287,7 +285,7 @@ impl ProcFS {
         let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
         // 创建相关文件
         // status文件
-        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0)?;
+        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0o777)?;
         let _sf: &LockedProcFSInode = binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
@@ -325,6 +323,10 @@ impl IndexNode for LockedProcFSInode {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
+        // 如果inode类型为文件夹，则直接返回成功
+        if let FileType::Dir = inode.metadata.file_type {
+            return Ok(());
+        }
         let mut private_data = ProcfsFilePrivateData::new();
         // 根据文件类型获取相应数据
         let file_size = match inode.fdata.ftype {
@@ -333,7 +335,6 @@ impl IndexNode for LockedProcFSInode {
                 todo!()
             }
         };
-
         *data = FilePrivateData::Procfs(private_data);
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
@@ -342,6 +343,11 @@ impl IndexNode for LockedProcFSInode {
     }
 
     fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+        let guard: SpinLockGuard<ProcFSInode> = self.0.lock();
+        // 如果inode类型为文件夹，则直接返回成功
+        if let FileType::Dir = guard.metadata.file_type {
+            return Ok(());
+        }
         // 获取数据信息
         let private_data = match data {
             FilePrivateData::Procfs(p) => p,

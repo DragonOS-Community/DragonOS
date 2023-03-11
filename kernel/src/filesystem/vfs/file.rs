@@ -210,6 +210,11 @@ impl File {
 
         return Ok(());
     }
+
+
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        return self.inode.clone();
+    }
 }
 
 impl Drop for File {

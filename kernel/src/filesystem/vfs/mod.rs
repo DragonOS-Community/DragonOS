@@ -6,12 +6,13 @@ pub mod mount;
 mod syscall;
 mod utils;
 
-use ::core::{any::Any, fmt::Debug};
+use ::core::{any::Any, fmt::Debug, intrinsics::size_of};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
+    kerror,
     time::TimeSpec,
 };
 
@@ -446,6 +447,24 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+
+    /// @biref 充填dirent结构体
+    /// @return 返回dirent结构体的大小
+    fn fill_dirent(&self, dirent: &mut Dirent, inode: Arc<dyn IndexNode>) -> Result<u64, ()> {
+        dirent.d_ino = inode.metadata().unwrap().inode_id as u64;
+        dirent.d_off = 0;
+        dirent.d_reclen = 0;
+        // dirent.d_type = ;
+        dirent.d_name = match inode.get_entry_name(dirent.d_ino as usize) {
+            Err(e) => {
+                kerror!("Failed get name, error = {e}");
+                return Err(());
+            }
+            Ok(n) => n,
+        };
+
+        return Ok((dirent.d_name.len() + 144) as u64);
+    }
 }
 
 #[derive(Debug)]
@@ -459,4 +478,15 @@ pub struct FsInfo {
 /// @brief 整合主设备号+次设备号
 pub fn make_rawdev(major: usize, minor: usize) -> usize {
     ((major & 0xffffff) << 8) | (minor & 0xff)
+}
+
+/// @brief
+#[repr(C)]
+#[derive(Debug)]
+pub struct Dirent {
+    d_ino: u64,     // 文件序列号
+    d_off: i64,     // dir偏移量
+    d_reclen: u16,  // 目录下的记录数
+    d_type: u8,     // entry的类型
+    d_name: String, // 文件entry的名字(是一个零长数组)
 }

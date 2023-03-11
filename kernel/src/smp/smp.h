@@ -2,8 +2,6 @@
 #include <common/glib.h>
 
 #include <common/asm.h>
-#include <driver/acpi/acpi.h>
-#include <driver/interrupt/apic/apic.h>
 
 #define MAX_SUPPORTED_PROCESSOR_NUM 1024    
 

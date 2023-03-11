@@ -39,3 +39,5 @@
 #include <mm/mm-types.h>
 #include <driver/pci/pci.h>
 #include <driver/virtio/virtio.h>
+#include <smp/smp.h>
+

@@ -231,13 +231,13 @@ impl DevFSInode {
 
 impl LockedDevFSInode {
     pub fn add_dir(&self, name: &str) -> Result<(), i32> {
-        let this = self.0.lock();
+        let guard:SpinLockGuard<DevFSInode> = self.0.lock();
 
-        if this.children.contains_key(name) {
+        if guard.children.contains_key(name) {
             return Err(-(EEXIST as i32));
         }
 
-        match self.create(name, FileType::Dir, 0o755 as u32) {
+        match self.do_create_with_data(guard, name, FileType::Dir, 0o755 as u32, 0) {
             Ok(inode) => inode,
             Err(err) => {
                 return Err(err);
@@ -269,35 +269,23 @@ impl LockedDevFSInode {
         drop(x);
         return Ok(());
     }
-}
 
-impl IndexNode for LockedDevFSInode {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn create_with_data(
-        &self,
-        _name: &str,
+    fn do_create_with_data(&self, mut guard: SpinLockGuard<DevFSInode>,_name: &str,
         _file_type: FileType,
         _mode: u32,
-        _data: usize,
-    ) -> Result<Arc<dyn IndexNode>, i32> {
-        // 获取当前inode
-        let mut inode = self.0.lock();
-        // 如果当前inode不是文件夹，则返回
-        if inode.metadata.file_type != FileType::Dir {
+        _data: usize,) -> Result<Arc<dyn IndexNode>, i32>{
+        if guard.metadata.file_type != FileType::Dir {
             return Err(-(ENOTDIR as i32));
         }
 
         // 如果有重名的，则返回
-        if inode.children.contains_key(_name) {
+        if guard.children.contains_key(_name) {
             return Err(-(EEXIST as i32));
         }
 
         // 创建inode
         let result: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(DevFSInode {
-            parent: inode.self_ref.clone(),
+            parent: guard.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
             metadata: Metadata {
@@ -316,16 +304,35 @@ impl IndexNode for LockedDevFSInode {
                 gid: 0,
                 raw_dev: _data,
             },
-            fs: inode.fs.clone(),
+            fs: guard.fs.clone(),
         })));
 
         // 初始化inode的自引用的weak指针
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        inode.children.insert(String::from(_name), result.clone());
-
+        guard.children.insert(String::from(_name), result.clone());
         return Ok(result);
+
+    }
+}
+
+impl IndexNode for LockedDevFSInode {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn create_with_data(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: u32,
+        data: usize,
+    ) -> Result<Arc<dyn IndexNode>, i32> {
+        // 获取当前inode
+        let guard:SpinLockGuard<DevFSInode> = self.0.lock();
+        // 如果当前inode不是文件夹，则返回
+        return self.do_create_with_data(guard, name, file_type, mode, data);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {

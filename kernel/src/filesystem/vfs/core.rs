@@ -259,7 +259,7 @@ pub fn do_open(path: &str, mode: FileMode) -> Result<i32, i32> {
     if mode.contains(FileMode::O_APPEND) {
         file.lseek(SeekFrom::SeekEnd(0))?;
     }
-    // kdebug!("open {path} ok, file={file:?}, ino={}", file.inode().metadata()?.inode_id);
+
     // 把文件对象存入pcb
     return current_pcb().alloc_fd(file);
 }

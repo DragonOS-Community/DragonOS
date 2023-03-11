@@ -9,7 +9,7 @@ use crate::{
         process_control_block, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
     },
     io::SeekFrom,
-    kerror,
+    kdebug, kerror,
 };
 
 use super::{Dirent, FileType, IndexNode, Metadata};
@@ -88,7 +88,7 @@ pub struct File {
     file_type: FileType,
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
     readdir_subdirs_name: Vec<String>,
-    private_data: FilePrivateData,
+    pub private_data: FilePrivateData,
 }
 
 impl File {

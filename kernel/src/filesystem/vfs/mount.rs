@@ -155,11 +155,11 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        data: &mut FilePrivateData,
     ) -> Result<usize, i32> {
         return self
             .inner_inode
-            .read_at(offset, len, buf, &mut FilePrivateData::Unused);
+            .read_at(offset, len, buf, data);
     }
 
     fn write_at(

@@ -322,6 +322,14 @@ impl IndexNode for LockedDevFSInode {
         self
     }
 
+    fn open(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), i32> {
+        return Ok(());
+    }
+
+    fn close(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), i32> {
+        return Ok(());
+    }
+    
     fn create_with_data(
         &self,
         name: &str,

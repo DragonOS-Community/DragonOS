@@ -1,6 +1,6 @@
 use core::mem::MaybeUninit;
 
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
@@ -80,11 +80,14 @@ bitflags! {
 #[derive(Debug, Clone)]
 pub struct File {
     inode: Arc<dyn IndexNode>,
-    offset: usize,
+    /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
+    pub offset: usize,
     /// 文件的打开模式
     mode: FileMode,
     /// 文件类型
     file_type: FileType,
+    /// readdir时候用的，暂存的子目录项的名字
+    // readdir_subdirs_name: Vec<String>,
     private_data: FilePrivateData,
 }
 
@@ -125,7 +128,7 @@ impl File {
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;
-
+        self.offset += len;
         return Ok(len);
     }
 
@@ -145,6 +148,7 @@ impl File {
         let len = self
             .inode
             .write_at(self.offset, len, buf, &mut FilePrivateData::Unused)?;
+        self.offset += len;
         return Ok(len);
     }
 

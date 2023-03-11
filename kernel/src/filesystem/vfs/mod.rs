@@ -6,16 +6,17 @@ pub mod mount;
 mod syscall;
 mod utils;
 
-use ::core::{any::Any, fmt::Debug, intrinsics::size_of};
+use ::core::{any::Any, ffi::c_char, fmt::Debug, mem};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
-    kerror,
+    kdebug, kerror,
     time::TimeSpec,
 };
 
+use self::file::File;
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -42,26 +43,35 @@ pub enum FileType {
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
+/// 完整含义请见 http://www.gnu.org/software/libc/manual/html_node/Directory-Entries.html
 pub const DT_UNKNOWN: u16 = 0;
+/// 命名管道，或者FIFO
 pub const DT_FIFO: u16 = 1;
+// 字符设备
 pub const DT_CHR: u16 = 2;
+// 目录
 pub const DT_DIR: u16 = 4;
+// 块设备
 pub const DT_BLK: u16 = 6;
+// 常规文件
 pub const DT_REG: u16 = 8;
+// 符号链接
 pub const DT_LNK: u16 = 10;
+// 是一个socket
 pub const DT_SOCK: u16 = 12;
+// 这个是抄Linux的，还不知道含义
 pub const DT_WHT: u16 = 14;
 pub const DT_MAX: u16 = 16;
 
 impl FileType {
     pub fn get_file_type_num(&self) -> u16 {
-        return match &self {
-            File => DT_REG,
-            Dir => DT_DIR,
-            BlockDevice => DT_BLK,
-            CharDevice => DT_CHR,
-            Pipe => DT_FIFO,
-            SymLink => DT_LNK,
+        return match self {
+            FileType::File => DT_REG,
+            FileType::Dir => DT_DIR,
+            FileType::BlockDevice => DT_BLK,
+            FileType::CharDevice => DT_CHR,
+            FileType::Pipe => DT_FIFO,
+            FileType::SymLink => DT_LNK,
         };
     }
 }
@@ -475,20 +485,42 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     /// @biref 充填dirent结构体
     /// @return 返回dirent结构体的大小
-    fn fill_dirent(&self, dirent: &mut Dirent, inode: Arc<dyn IndexNode>) -> Result<u64, ()> {
-        dirent.d_ino = inode.metadata().unwrap().inode_id as u64;
-        dirent.d_off = 0;
-        dirent.d_reclen = 0;
-        dirent.d_type = inode.metadata().unwrap().file_type.get_file_type_num() as u8;
-        dirent.d_name = match inode.get_entry_name(dirent.d_ino as usize) {
-            Err(e) => {
-                kerror!("Failed get name, error = {e}");
-                return Err(());
-            }
-            Ok(n) => n,
+    fn fill_dirent(&self, dirent: &mut Dirent, file: &mut File) -> Result<u64, ()> {
+        let inode = file.inode();
+
+        let sub_entries = inode.list();
+        if let Err(err) = sub_entries {
+            kerror!("fill_dirent error: file={file:?}, errno = {err}");
+            return Err(());
+        }
+        let sub_entries: Vec<String> = sub_entries.unwrap();
+        // kdebug!("sub_entries={sub_entries:?}");
+        if file.offset >= sub_entries.len() {
+            file.offset = 0;
+            return Err(());
+        }
+        let sub_inode = if let Ok(i) = inode.find(&sub_entries[file.offset]) {
+            i
+        } else {
+            kerror!("fill_dirent error: Failed to find sub inode, file={file:?}");
+            return Err(());
         };
 
-        return Ok((dirent.d_name.len() + 144) as u64);
+        let name_bytes = sub_entries[file.offset].as_bytes();
+
+        file.offset += 1;
+        dirent.d_ino = sub_inode.metadata().unwrap().inode_id as u64;
+        dirent.d_off = 0;
+        dirent.d_reclen = 0;
+        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
+        unsafe {
+            let ptr = &mut dirent.d_name as *mut u8;
+            let buf: &mut [u8] =
+                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len());
+            buf.copy_from_slice(name_bytes);
+        }
+
+        return Ok((name_bytes.len() + 19) as u64);
     }
 }
 
@@ -509,9 +541,9 @@ pub fn make_rawdev(major: usize, minor: usize) -> usize {
 #[repr(C)]
 #[derive(Debug)]
 pub struct Dirent {
-    d_ino: u64,     // 文件序列号
-    d_off: i64,     // dir偏移量
-    d_reclen: u16,  // 目录下的记录数
-    d_type: u8,     // entry的类型
-    d_name: String, // 文件entry的名字(是一个零长数组)
+    d_ino: u64,    // 文件序列号
+    d_off: i64,    // dir偏移量
+    d_reclen: u16, // 目录下的记录数
+    d_type: u8,    // entry的类型
+    d_name: u8,    // 文件entry的名字(是一个零长数组)
 }

@@ -13,7 +13,7 @@ use crate::{
         SEEK_SET,
     },
     io::SeekFrom,
-    kerror,
+    kerror, kdebug,
 };
 
 use super::{
@@ -239,14 +239,15 @@ pub extern "C" fn sys_getdents(regs: &pt_regs) -> u64 {
     }
 
     // 获取fd
-    let file: &File = match current_pcb().get_file_ref_by_fd(fd) {
+    let file: &mut File = match current_pcb().get_file_mut_by_fd(fd) {
         None => {
             return (-(EBADF as i32)) as u64;
         }
         Some(file) => file,
     };
+    // kdebug!("file={file:?}");
 
-    return match file.inode().fs().fill_dirent(dirent, file.inode()) {
+    return match file.inode().fs().fill_dirent(dirent, file) {
         Err(_) => 0,
         Ok(len) => len,
     };

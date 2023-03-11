@@ -12,7 +12,7 @@ use crate::{
     kerror,
 };
 
-use super::{FileType, IndexNode, Metadata};
+use super::{Dirent, FileType, IndexNode, Metadata};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -81,13 +81,13 @@ bitflags! {
 pub struct File {
     inode: Arc<dyn IndexNode>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
-    pub offset: usize,
+    offset: usize,
     /// 文件的打开模式
     mode: FileMode,
     /// 文件类型
     file_type: FileType,
-    /// readdir时候用的，暂存的子目录项的名字
-    // readdir_subdirs_name: Vec<String>,
+    /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
+    readdir_subdirs_name: Vec<String>,
     private_data: FilePrivateData,
 }
 
@@ -103,6 +103,7 @@ impl File {
             offset: 0,
             mode,
             file_type,
+            readdir_subdirs_name: Vec::new(),
             private_data: FilePrivateData::default(),
         };
         // kdebug!("inode:{:?}",f.inode);
@@ -215,7 +216,50 @@ impl File {
         return Ok(());
     }
 
+    /// @biref 充填dirent结构体
+    /// @return 返回dirent结构体的大小
+    pub fn readdir(&mut self, dirent: &mut Dirent) -> Result<u64, i32> {
+        let inode: &Arc<dyn IndexNode> = &self.inode;
 
+        // 如果偏移量为0
+        if self.offset == 0 {
+            self.readdir_subdirs_name = inode.list()?;
+            self.readdir_subdirs_name.sort();
+        }
+
+        // kdebug!("sub_entries={sub_entries:?}");
+        if self.readdir_subdirs_name.is_empty() {
+            self.offset = 0;
+            return Ok(0);
+        }
+        let name: String = self.readdir_subdirs_name.remove(0);
+        let sub_inode: Arc<dyn IndexNode> = match inode.find(&name) {
+            Ok(i) => i,
+            Err(e) => {
+                kerror!("Readdir error: Failed to find sub inode, file={self:?}");
+                return Err(e);
+            }
+        };
+
+        let name_bytes: &[u8] = name.as_bytes();
+
+        self.offset += 1;
+        dirent.d_ino = sub_inode.metadata().unwrap().inode_id as u64;
+        dirent.d_off = 0;
+        dirent.d_reclen = 0;
+        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
+        // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
+        unsafe {
+            let ptr = &mut dirent.d_name as *mut u8;
+            let buf: &mut [u8] =
+                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len());
+            buf.copy_from_slice(name_bytes);
+        }
+
+        // 计算dirent结构体的大小
+        return Ok((name_bytes.len() + ::core::mem::size_of::<Dirent>()
+            - ::core::mem::size_of_val(&dirent.d_name)) as u64);
+    }
     pub fn inode(&self) -> Arc<dyn IndexNode> {
         return self.inode.clone();
     }

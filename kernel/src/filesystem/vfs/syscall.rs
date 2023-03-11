@@ -247,7 +247,7 @@ pub extern "C" fn sys_getdents(regs: &pt_regs) -> u64 {
     };
     // kdebug!("file={file:?}");
 
-    return match file.inode().fs().fill_dirent(dirent, file) {
+    return match file.readdir(dirent) {
         Err(_) => 0,
         Ok(len) => len,
     };

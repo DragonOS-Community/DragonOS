@@ -483,45 +483,6 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
 
-    /// @biref 充填dirent结构体
-    /// @return 返回dirent结构体的大小
-    fn fill_dirent(&self, dirent: &mut Dirent, file: &mut File) -> Result<u64, ()> {
-        let inode = file.inode();
-
-        let sub_entries = inode.list();
-        if let Err(err) = sub_entries {
-            kerror!("fill_dirent error: file={file:?}, errno = {err}");
-            return Err(());
-        }
-        let sub_entries: Vec<String> = sub_entries.unwrap();
-        // kdebug!("sub_entries={sub_entries:?}");
-        if file.offset >= sub_entries.len() {
-            file.offset = 0;
-            return Err(());
-        }
-        let sub_inode = if let Ok(i) = inode.find(&sub_entries[file.offset]) {
-            i
-        } else {
-            kerror!("fill_dirent error: Failed to find sub inode, file={file:?}");
-            return Err(());
-        };
-
-        let name_bytes = sub_entries[file.offset].as_bytes();
-
-        file.offset += 1;
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id as u64;
-        dirent.d_off = 0;
-        dirent.d_reclen = 0;
-        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
-        unsafe {
-            let ptr = &mut dirent.d_name as *mut u8;
-            let buf: &mut [u8] =
-                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len());
-            buf.copy_from_slice(name_bytes);
-        }
-
-        return Ok((name_bytes.len() + 19) as u64);
-    }
 }
 
 #[derive(Debug)]
@@ -545,5 +506,5 @@ pub struct Dirent {
     d_off: i64,    // dir偏移量
     d_reclen: u16, // 目录下的记录数
     d_type: u8,    // entry的类型
-    d_name: u8,    // 文件entry的名字(是一个零长数组)
+    d_name: u8,    // 文件entry的名字(是一个零长数组)， 本字段仅用于占位
 }

@@ -413,7 +413,6 @@ uint64_t sys_pipe(struct pt_regs *regs){
 
 extern uint64_t sys_mkdir(struct pt_regs *regs);
 
-extern uint64_t sys_unlink_at(struct pt_regs *regs);
 
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,

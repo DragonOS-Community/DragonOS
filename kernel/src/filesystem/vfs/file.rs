@@ -9,7 +9,7 @@ use crate::{
         process_control_block, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
     },
     io::SeekFrom,
-    kdebug, kerror,
+    kerror,
 };
 
 use super::{Dirent, FileType, IndexNode, Metadata};

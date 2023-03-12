@@ -2,9 +2,9 @@ use crate::include::bindings::bindings::{
     alloc_pages, free_pages, memory_management_struct, Page, PAGE_2M_SHIFT, PAGE_2M_SIZE,
     PAGE_OFFSET, PAGE_SHARED, ZONE_NORMAL,
 };
-use crate::kdebug;
+
 use core::mem::size_of;
-use core::{ptr::NonNull};
+use core::ptr::NonNull;
 use virtio_drivers::{BufferDirection, Hal, PhysAddr, VirtAddr, PAGE_SIZE};
 
 pub struct HalImpl;
@@ -50,7 +50,6 @@ impl Hal for HalImpl {
     /// @return VirtAddr 虚拟地址
     fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
         paddr + PAGE_OFFSET as usize
-
     }
     /// @brief 与真实物理设备共享
     /// @param buffer 要共享的buffer _direction：设备到driver或driver到设备

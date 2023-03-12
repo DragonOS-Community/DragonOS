@@ -1,9 +1,6 @@
 use core::ffi::{c_char, CStr};
 
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-};
+use alloc::{boxed::Box, string::ToString};
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
@@ -12,7 +9,7 @@ use crate::{
         EPERM, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET,
     },
     io::SeekFrom,
-    kdebug, kerror,
+    kerror,
 };
 
 use super::{
@@ -36,7 +33,6 @@ pub extern "C" fn sys_open(regs: &pt_regs) -> u64 {
     }
     let path: &str = path.unwrap();
     let flags = regs.r9;
-
     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
     let r: Result<i32, i32> = do_open(path, open_flags);
 
@@ -191,7 +187,6 @@ pub extern "C" fn sys_chdir(regs: &pt_regs) -> u64 {
 
     let dest_path: &str = dest_path.unwrap();
 
-    kdebug!("chdir: dest_path={dest_path}");
     if dest_path.len() == 0 {
         return (-(EINVAL as i32)) as u64;
     } else if dest_path.len() >= PAGE_4K_SIZE as usize {
@@ -286,7 +281,7 @@ pub extern "C" fn sys_mkdir(regs: &pt_regs) -> u64 {
         return (-(EINVAL as i32)) as u64;
     }
 
-    return match do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)) {
+    return match do_mkdir(&path.trim(), FileMode::from_bits_truncate(mode as u32)) {
         Err(err) => {
             kerror!("Failed in do_mkdir, Error Code = {}", err);
             err as u64

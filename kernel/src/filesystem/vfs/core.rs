@@ -112,7 +112,6 @@ fn do_migrate(
     mountpoint
         .mount(fs.inner_filesystem())
         .expect(format!("Failed to migrate {mountpoint_name}").as_str());
-
     return Ok(());
 }
 

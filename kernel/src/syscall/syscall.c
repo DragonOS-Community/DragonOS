@@ -289,7 +289,6 @@ extern uint64_t sys_chdir(struct pt_regs *regs);
  */
 extern uint64_t sys_getdents(struct pt_regs *regs);
 
-
 /**
  * @brief 执行新的程序
  *
@@ -407,12 +406,12 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }
-uint64_t sys_pipe(struct pt_regs *regs){
+uint64_t sys_pipe(struct pt_regs *regs)
+{
     return -ENOTSUP;
 }
 
 extern uint64_t sys_mkdir(struct pt_regs *regs);
-
 
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,
@@ -427,18 +426,18 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [9] = sys_brk,
     [10] = sys_sbrk,
     [11] = sys_reboot,
-    [12] = sys_chdir,    
-    [13] = sys_getdents, 
+    [12] = sys_chdir,
+    [13] = sys_getdents,
     [14] = sys_execve,
     [15] = sys_wait4,
     [16] = sys_exit,
-    [17] = sys_mkdir, 
+    [17] = sys_mkdir,
     [18] = sys_nanosleep,
     [19] = sys_clock,
     [20] = sys_pipe,
     [21] = sys_mstat,
-    [22] = sys_unlink_at,  
-    [23] = sys_kill, 
+    [22] = sys_unlink_at,
+    [23] = sys_kill,
     [24] = sys_sigaction,
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,

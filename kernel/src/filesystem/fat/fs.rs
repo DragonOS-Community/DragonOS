@@ -1583,7 +1583,6 @@ impl IndexNode for LockedFATInode {
         if guard.metadata.file_type != FileType::Dir {
             return Err(-(ENOTDIR as i32));
         }
-
         match ino {
             0 => {
                 return Ok(String::from("."));

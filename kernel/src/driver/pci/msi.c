@@ -71,7 +71,7 @@ static __always_inline struct pci_msi_cap_t __msi_read_cap_list(struct msi_desc_
 }
 
 /**
- * @brief 映射设备的msix表
+ * @brief 映射设备的msix表  //MSIX表不再单独映射(To do)
  *
  * @param pci_dev pci设备信息结构体
  * @param msix_cap msix capability list的结构体

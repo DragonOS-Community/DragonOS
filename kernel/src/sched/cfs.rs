@@ -103,6 +103,10 @@ impl CFSQueue {
             return None;
         }
     }
+    /// 获取运行队列的长度
+    pub fn get_cfs_queue_size(&mut self) -> usize {
+        return self.queue.len();
+    }
 }
 
 /// @brief CFS调度器类
@@ -171,6 +175,10 @@ impl SchedulerCFS {
     pub fn set_cpu_idle(&mut self, cpu_id: usize, pcb: *mut process_control_block) {
         // kdebug!("set cpu idle: id={}", cpu_id);
         self.cpu_queue[cpu_id].idle_pcb = pcb;
+    }
+    /// 获取某个cpu的运行队列中的进程数
+    pub fn get_cfs_queue_len(&mut self, cpu_id: u32) -> usize {
+        return self.cpu_queue[cpu_id as usize].get_cfs_queue_size();
     }
 }
 

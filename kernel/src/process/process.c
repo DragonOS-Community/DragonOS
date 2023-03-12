@@ -26,6 +26,7 @@
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
+#include <driver/virtio/virtio.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")

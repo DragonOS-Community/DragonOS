@@ -33,6 +33,11 @@ mod time;
 
 #[macro_use]
 extern crate alloc;
+#[macro_use]
+extern crate lazy_static;
+
+#[macro_use]
+extern crate bitflags;
 
 extern crate lazy_static;
 #[macro_use]

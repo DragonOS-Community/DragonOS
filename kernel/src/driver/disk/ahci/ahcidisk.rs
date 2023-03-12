@@ -5,13 +5,11 @@ use crate::include::bindings::bindings::{E2BIG, EIO};
 use crate::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
+use crate::mm::phys_2_virt;
 use crate::{
-    driver::disk::ahci::{
-        hba::{
-            FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT,
-            ATA_DEV_BUSY, ATA_DEV_DRQ,
-        },
-        phys_2_virt,
+    driver::disk::ahci::hba::{
+        FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT,
+        ATA_DEV_BUSY, ATA_DEV_DRQ,
     },
     kerror,
 };

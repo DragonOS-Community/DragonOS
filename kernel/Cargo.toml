@@ -12,14 +12,17 @@ crate-type = ["staticlib"]
 [dependencies]
 x86_64 = "0.14.10"
 bitflags = "1.3.2"
+virtio-drivers = "0.2.0"
+
+
+# 构建时依赖项
+[build-dependencies]
+bindgen = "0.61.0"
 
 [dependencies.lazy_static]
 version = "1.4.0"
 # 由于在no_std环境，而lazy_static依赖了spin库，因此需要指定其使用no_std
 features = ["spin_no_std"]
 
-# 构建时依赖项
-[build-dependencies]
-bindgen = "0.61.0"
 
 

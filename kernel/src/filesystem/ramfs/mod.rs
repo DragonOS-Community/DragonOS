@@ -12,7 +12,6 @@ use crate::{
     include::bindings::bindings::{
         EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR, ENOTEMPTY, EPERM,
     },
-    kdebug,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
@@ -328,7 +327,28 @@ impl IndexNode for LockedRamFSInode {
 
         // 获得要删除的文件的inode
         let to_delete = inode.children.get(name).ok_or(-(ENOENT as i32))?;
+        if to_delete.0.lock().metadata.file_type == FileType::Dir {
+            return Err(-(EPERM as i32));
+        }
         // 减少硬链接计数
+        to_delete.0.lock().metadata.nlinks -= 1;
+        // 在当前目录中删除这个子目录项
+        inode.children.remove(name);
+        return Ok(());
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), i32> {
+        let mut inode: SpinLockGuard<RamFSInode> = self.0.lock();
+        // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+        // 获得要删除的文件夹的inode
+        let to_delete = inode.children.get(name).ok_or(-(ENOENT as i32))?;
+        if to_delete.0.lock().metadata.file_type != FileType::Dir {
+            return Err(-(ENOTDIR as i32));
+        }
+
         to_delete.0.lock().metadata.nlinks -= 1;
         // 在当前目录中删除这个子目录项
         inode.children.remove(name);

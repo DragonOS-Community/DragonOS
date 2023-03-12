@@ -16,10 +16,9 @@ use crate::{
         ramfs::RamFS,
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
-    include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, PAGE_4K_SIZE},
-    include::bindings::bindings::{O_RDONLY, O_RDWR},
+    include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM, PAGE_4K_SIZE},
     io::SeekFrom,
-    kdebug, kerror, kinfo,
+    kerror, kinfo,
 };
 
 use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
@@ -65,27 +64,27 @@ pub extern "C" fn vfs_init() -> i32 {
         .expect("Failed to create /dev");
 
     // // 创建procfs实例
-    let procfs = ProcFS::new();
-    kdebug!("proc created");
-    kdebug!("root inode.list()={:?}", root_inode.list());
+    let procfs: Arc<ProcFS> = ProcFS::new();
+
     // procfs挂载
     let _t = root_inode
         .find("proc")
         .expect("Cannot find /proc")
         .mount(procfs)
         .expect("Failed to mount procfs.");
-    kdebug!("root inode.list()={:?}", root_inode.list());
+    kinfo!("ProcFS mounted.");
 
     // 创建 devfs 实例
-    let devfs = DevFS::new();
+    let devfs: Arc<DevFS> = DevFS::new();
     // devfs 挂载
     let _t = root_inode
         .find("dev")
         .expect("Cannot find /dev")
         .mount(devfs)
         .expect("Failed to mount devfs");
+    kinfo!("DevFS mounted.");
 
-    let root_inode = ROOT_INODE().list().expect("vfs init failed");
+    let root_inode = ROOT_INODE().list().expect("VFS init failed");
     if root_inode.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
@@ -102,8 +101,6 @@ fn do_migrate(
     fs: &MountFS,
 ) -> Result<(), i32> {
     let r = new_root_inode.find(mountpoint_name);
-
-    kdebug!("new root.list()={:?}", new_root_inode.list());
     let mountpoint = if r.is_err() {
         new_root_inode
             .create(mountpoint_name, FileType::Dir, 0o777)
@@ -115,30 +112,19 @@ fn do_migrate(
     mountpoint
         .mount(fs.inner_filesystem())
         .expect(format!("Failed to migrate {mountpoint_name}").as_str());
-    kdebug!("mountpoint.list={:?}", mountpoint.list());
-    kdebug!("new root.list()={:?}", new_root_inode.list());
-    kdebug!(
-        "/{}.list={:?}",
-        mountpoint_name,
-        new_root_inode
-            .lookup(format!("/{mountpoint_name}").as_str())
-            .unwrap()
-            .list()
-    );
     return Ok(());
 }
 
 /// @brief 迁移伪文件系统的inode
 /// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
 fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), i32> {
+    kinfo!("VFS: Migrating filesystems...");
+
     // ==== 在这里获取要被迁移的文件系统的inode ===
     let binding = ROOT_INODE().find("proc").expect("ProcFS not mounted!").fs();
     let proc: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
     let binding = ROOT_INODE().find("dev").expect("DevFS not mounted!").fs();
     let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-
-    // kdebug!("dev list={:?}", dev.list());
-    // kdebug!("fat root list={:?}", new_fs.root_inode().list());
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
@@ -158,15 +144,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), i32> {
         __ROOT_INODE = new_root_inode;
     }
 
-    kdebug!(
-        "list /dev  =   {:?}",
-        ROOT_INODE().find("dev").unwrap().list()
-    );
-    kdebug!(
-        "list /proc  =   {:?}",
-        ROOT_INODE().find("proc").unwrap().list()
-    );
-    kinfo!("Migrate filesystems done!");
+    kinfo!("VFS: Migrate filesystems done!");
 
     return Ok(());
 }
@@ -200,8 +178,6 @@ pub extern "C" fn mount_root_fs() -> i32 {
             spin_loop();
         }
     }
-
-    kdebug!("root.list()={:?}", ROOT_INODE().list());
     kinfo!("Successfully migrate rootfs to FAT32!");
 
     return 0;
@@ -344,7 +320,7 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, i32> {
 }
 
 /// @breif 删除文件夹
-pub fn do_remove_dir(path: &str, _mode: FileMode) -> Result<u64, i32> {
+pub fn do_remove_dir(path: &str) -> Result<u64, i32> {
     // 文件名过长
     if path.len() > PAGE_4K_SIZE as usize {
         return Err(-(ENAMETOOLONG as i32));
@@ -354,18 +330,27 @@ pub fn do_remove_dir(path: &str, _mode: FileMode) -> Result<u64, i32> {
 
     if inode.is_err() {
         let errno = inode.unwrap_err();
-        // 文件不存在，且需要创建
+        // 文件不存在
         if errno == -(ENOENT as i32) {
             return Err(-(ENOENT as i32));
-        } else {
-            let (filename, parent_path) = rsplit_path(path);
-            // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> =
-                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-            // 创建文件夹
-            // parent_inode.rmdir(filename)?;
         }
     }
+
+    let (filename, parent_path) = rsplit_path(path);
+    // 查找父目录
+    let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+
+    if parent_inode.metadata()?.file_type != FileType::Dir {
+        return Err(-(ENOTDIR as i32));
+    }
+
+    let target_inode: Arc<dyn IndexNode> = parent_inode.find(filename)?;
+    if target_inode.metadata()?.file_type != FileType::Dir {
+        return Err(-(ENOTDIR as i32));
+    }
+
+    // 删除文件夹
+    parent_inode.rmdir(filename)?;
 
     return Ok(0);
 }
@@ -380,19 +365,27 @@ pub fn do_unlink_at(path: &str, _mode: FileMode) -> Result<u64, i32> {
     let inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE().lookup(path);
 
     if inode.is_err() {
-        let errno = inode.unwrap_err();
+        let errno = inode.clone().unwrap_err();
         // 文件不存在，且需要创建
         if errno == -(ENOENT as i32) {
             return Err(-(ENOENT as i32));
-        } else {
-            let (filename, parent_path) = rsplit_path(path);
-            // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> =
-                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-            // 创建文件夹
-            parent_inode.unlink(filename)?;
         }
     }
+    // 禁止在目录上unlink
+    if inode.unwrap().metadata()?.file_type == FileType::Dir {
+        return Err(-(EPERM as i32));
+    }
+
+    let (filename, parent_path) = rsplit_path(path);
+    // 查找父目录
+    let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+
+    if parent_inode.metadata()?.file_type != FileType::Dir {
+        return Err(-(ENOTDIR as i32));
+    }
+
+    // 删除文件
+    parent_inode.unlink(filename)?;
 
     return Ok(0);
 }

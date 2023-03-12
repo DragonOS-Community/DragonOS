@@ -1,8 +1,9 @@
 use alloc::vec::Vec;
 use core::{intrinsics::size_of, ptr};
 
-use crate::driver::disk::ahci::phys_2_virt;
 use core::sync::atomic::compiler_fence;
+
+use crate::mm::phys_2_virt;
 
 /// 文件说明: 实现了 AHCI 中的控制器 HBA 的相关行为
 

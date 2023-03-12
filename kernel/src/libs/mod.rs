@@ -10,4 +10,6 @@ pub mod mutex;
 pub mod vec_cursor;
 #[macro_use]
 pub mod volatile_io;
+pub mod rwlock;
+pub mod semaphore;
 pub mod wait_queue;

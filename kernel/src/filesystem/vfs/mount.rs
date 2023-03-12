@@ -7,7 +7,7 @@ use alloc::{
 
 use crate::{
     include::bindings::bindings::{EBUSY, ENOTDIR},
-    libs::spinlock::SpinLock,
+    libs::spinlock::SpinLock, kdebug,
 };
 
 use super::{FilePrivateData, FileSystem, FileType, IndexNode, InodeId};
@@ -234,6 +234,20 @@ impl IndexNode for MountFSInode {
         }
         // 调用内层的inode的方法来删除这个inode
         return self.inner_inode.unlink(name);
+    }
+
+    #[inline]
+    fn rmdir(&self, name: &str) ->Result<(), i32> {
+        let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
+        kdebug!("rmdir {name}");
+        // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
+        if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
+            return Err(-(EBUSY as i32));
+        }
+        // 调用内层的rmdir的方法来删除这个inode
+        let r = self.inner_inode.rmdir(name);
+        kdebug!("r={r:?}");
+        return r;
     }
 
     #[inline]

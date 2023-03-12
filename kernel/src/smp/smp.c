@@ -9,7 +9,8 @@
 
 #include <process/preempt.h>
 #include <sched/sched.h>
-
+#include <driver/acpi/acpi.h>
+#include <driver/interrupt/apic/apic.h>
 #include "ipi.h"
 
 static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);

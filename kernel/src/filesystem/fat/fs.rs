@@ -164,10 +164,9 @@ impl LockedFATInode {
         parent: Weak<LockedFATInode>,
         inode_type: FATDirEntry,
     ) -> Arc<LockedFATInode> {
-
-        let file_type = if let FATDirEntry::Dir(_) = inode_type{
+        let file_type = if let FATDirEntry::Dir(_) = inode_type {
             FileType::Dir
-        }else{
+        } else {
             FileType::File
         };
 
@@ -1533,6 +1532,36 @@ impl IndexNode for LockedFATInode {
                 return Err(-(EROFS as i32));
             }
         };
+        // 检查文件是否存在
+        dir.check_existence(name, Some(false), guard.fs.upgrade().unwrap())?;
+
+        // 再从磁盘删除
+        let r = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
+        drop(target_guard);
+        return r;
+        
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), i32> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let target: Arc<LockedFATInode> = guard.find(name)?;
+        // 对目标inode上锁，以防更改
+        let target_guard: SpinLockGuard<FATInode> = target.0.lock();
+        // 先从缓存删除
+        guard.children.remove(&name.to_uppercase());
+
+        let dir = match &guard.inode_type {
+            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
+                return Err(-(ENOTDIR as i32));
+            }
+            FATDirEntry::Dir(d) => d,
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(-(EROFS as i32));
+            }
+        };
+        // 检查文件夹是否存在
+        dir.check_existence(name, Some(true), guard.fs.upgrade().unwrap())?;
 
         // 再从磁盘删除
         let r: Result<(), i32> = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
@@ -1542,8 +1571,8 @@ impl IndexNode for LockedFATInode {
             let r = r.unwrap_err();
             if r == -(ENOTEMPTY as i32) {
                 // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
+                guard.children.insert(name.to_uppercase(), target.clone());
                 drop(target_guard);
-                guard.children.insert(name.to_uppercase(), target);
             }
             return Err(r);
         }
@@ -1554,7 +1583,6 @@ impl IndexNode for LockedFATInode {
         if guard.metadata.file_type != FileType::Dir {
             return Err(-(ENOTDIR as i32));
         }
-        kdebug!("ino={ino}");
         match ino {
             0 => {
                 return Ok(String::from("."));

@@ -8,12 +8,11 @@ use alloc::{
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
     include::bindings::bindings::{
-        pt_regs, verify_area, AT_REMOVEDIR, EBADF, EFAULT, EINVAL, ENAMETOOLONG,
-        ENOENT, ENOTDIR, EPERM, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR, SEEK_END, SEEK_MAX,
-        SEEK_SET,
+        pt_regs, verify_area, AT_REMOVEDIR, EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOTDIR,
+        EPERM, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET,
     },
     io::SeekFrom,
-    kerror, kdebug,
+    kdebug, kerror,
 };
 
 use super::{
@@ -175,8 +174,15 @@ pub extern "C" fn sys_chdir(regs: &pt_regs) -> u64 {
     if regs.r8 == 0 {
         return -(EFAULT as i32) as u64;
     }
+    let ptr = regs.r8 as usize as *const c_char;
+    // 权限校验
+    if ptr.is_null()
+        || (user_mode(regs) && unsafe { !verify_area(ptr as u64, PAGE_2M_SIZE as u64) })
+    {
+        return -(EINVAL as i32) as u64;
+    }
 
-    let dest_path: &CStr = unsafe { CStr::from_ptr(regs.r8 as usize as *const c_char) };
+    let dest_path: &CStr = unsafe { CStr::from_ptr(ptr) };
     let dest_path: Result<&str, core::str::Utf8Error> = dest_path.to_str();
 
     if dest_path.is_err() {
@@ -260,7 +266,13 @@ pub extern "C" fn sys_getdents(regs: &pt_regs) -> u64 {
 /// @return uint64_t 负数错误码 / 0表示成功
 #[no_mangle]
 pub extern "C" fn sys_mkdir(regs: &pt_regs) -> u64 {
-    let path: &CStr = unsafe { CStr::from_ptr(regs.r8 as usize as *const c_char) };
+    let ptr = regs.r8 as usize as *const c_char;
+    if ptr.is_null()
+        || (user_mode(regs) && unsafe { !verify_area(ptr as u64, PAGE_2M_SIZE as u64) })
+    {
+        return -(EINVAL as i32) as u64;
+    }
+    let path: &CStr = unsafe { CStr::from_ptr(ptr) };
     let path: Result<&str, core::str::Utf8Error> = path.to_str();
     let mode = regs.r9;
 
@@ -268,9 +280,12 @@ pub extern "C" fn sys_mkdir(regs: &pt_regs) -> u64 {
         return (-(EINVAL as i32)) as u64;
     }
 
-    let path = String::clone(&path.unwrap().to_string());
+    let path = &path.unwrap().to_string();
+    if path.trim() == "" {
+        return (-(EINVAL as i32)) as u64;
+    }
 
-    return match do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)) {
+    return match do_mkdir(&path.trim(), FileMode::from_bits_truncate(mode as u32)) {
         Err(err) => {
             kerror!("Failed in do_mkdir, Error Code = {}", err);
             err as u64
@@ -290,22 +305,29 @@ pub extern "C" fn sys_mkdir(regs: &pt_regs) -> u64 {
 ///@return uint64_t 错误码
 #[no_mangle]
 pub extern "C" fn sys_unlink_at(regs: &pt_regs) -> u64 {
-    let dfd = regs.r8;
-    let path: &CStr = unsafe { CStr::from_ptr(regs.r9 as usize as *const c_char) };
+    let _dfd = regs.r8;
+    let ptr = regs.r9 as usize as *const c_char;
+    if ptr.is_null()
+        || (user_mode(regs) && unsafe { !verify_area(ptr as u64, PAGE_2M_SIZE as u64) })
+    {
+        return -(EINVAL as i32) as u64;
+    }
+    let path: &CStr = unsafe { CStr::from_ptr(ptr) };
     let path: Result<&str, core::str::Utf8Error> = path.to_str();
     let flag = regs.r10;
     if path.is_err() {
         return (-(EINVAL as i32)) as u64;
     }
 
-    let path = String::clone(&path.unwrap().to_string());
-
+    let path = &path.unwrap().to_string();
+    // kdebug!("sys_unlink_at={path:?}");
     if (flag & (!(AT_REMOVEDIR as u64))) != 0_u64 {
         return (-(EINVAL as i32)) as u64;
     }
 
     if (flag & (AT_REMOVEDIR as u64)) > 0 {
-        match do_remove_dir(&path, FileMode::from_bits_truncate(flag as u32)) {
+        // kdebug!("rmdir");
+        match do_remove_dir(&path) {
             Err(err) => {
                 kerror!("Failed to Remove Directory, Error Code = {}", err);
                 return err as u64;
@@ -316,6 +338,7 @@ pub extern "C" fn sys_unlink_at(regs: &pt_regs) -> u64 {
         }
     }
 
+    // kdebug!("rm");
     match do_unlink_at(&path, FileMode::from_bits_truncate(flag as u32)) {
         Err(err) => {
             kerror!("Failed to Remove Directory, Error Code = {}", err);

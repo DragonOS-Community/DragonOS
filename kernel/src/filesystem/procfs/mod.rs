@@ -18,7 +18,7 @@ use crate::{
         pid_t, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR,
         ENOTEMPTY, ENOTSUP, EPERM, ESRCH,
     },
-    kdebug, kerror,
+    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };

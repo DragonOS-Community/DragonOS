@@ -6,17 +6,15 @@ pub mod mount;
 mod syscall;
 mod utils;
 
-use ::core::{any::Any, ffi::c_char, fmt::Debug, mem};
+use ::core::{any::Any, fmt::Debug};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::{ENOTDIR, ENOTSUP},
-    kdebug, kerror,
     time::TimeSpec,
 };
 
-use self::file::File;
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -231,6 +229,16 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///         失败：Err(错误码)
     fn unlink(&self, _name: &str) -> Result<(), i32> {
         // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(-(ENOTSUP as i32));
+    }
+
+    /// @brief 删除文件夹
+    /// 
+    /// @param name 文件夹名称
+    /// 
+    /// @return 成功 Ok(())
+    /// @return 失败 Err(错误码)
+    fn rmdir(&self, _name: &str) ->Result<(), i32>{
         return Err(-(ENOTSUP as i32));
     }
 
@@ -482,7 +490,6 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
-
 }
 
 #[derive(Debug)]

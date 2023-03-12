@@ -82,6 +82,7 @@ We hope that in the future, some enterprises can sponsor DragonOS and inject fin
 
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
+- [FindWangHao](https://github.com/FindWangHao)
 - 叶锦毅
 - 林
 - Albert

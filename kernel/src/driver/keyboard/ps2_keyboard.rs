@@ -1,7 +1,4 @@
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-};
+use alloc::sync::{Arc, Weak};
 
 use crate::{
     filesystem::{

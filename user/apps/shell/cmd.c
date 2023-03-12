@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libsystem/syscall.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -12,7 +13,6 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <libsystem/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
@@ -68,7 +68,7 @@ static char *get_target_filepath(const char *filename, int *result_path_len)
         memset(file_path, 0, *result_path_len + 2);
 
         strncpy(file_path, filename, *result_path_len);
-        if(filename[(*result_path_len)-1]!='/')
+        if (filename[(*result_path_len) - 1] != '/')
             file_path[*result_path_len] = '/';
     }
 
@@ -258,11 +258,11 @@ int shell_cmd_ls(int argc, char **argv)
             break;
 
         int color = COLOR_WHITE;
-        if (buf->d_type & VFS_IF_DIR)
+        if (buf->d_type == DT_DIR)
             color = COLOR_YELLOW;
-        else if (buf->d_type & VFS_IF_FILE)
+        else if (buf->d_type == DT_REG)
             color = COLOR_INDIGO;
-        else if (buf->d_type & VFS_IF_DEVICE)
+        else if (buf->d_type == DT_BLK || buf->d_type == DT_CHR)
             color = COLOR_GREEN;
 
         char output_buf[256] = {0};
@@ -315,9 +315,10 @@ int shell_cmd_cat(int argc, char **argv)
     lseek(fd, 0, SEEK_SET);
 
     char *buf = (char *)malloc(512);
-    memset(buf, 0, 512);
+
     while (file_size > 0)
     {
+        memset(buf, 0, 512);
         int l = read(fd, buf, 511);
         buf[l] = '\0';
 

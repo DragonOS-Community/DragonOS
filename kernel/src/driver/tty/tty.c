@@ -1,4 +1,3 @@
-#include <filesystem/devfs/devfs.h>
 #include <filesystem/vfs/VFS.h>
 #include "tty.h"
 
@@ -86,8 +85,8 @@ struct vfs_file_operations_t tty_fops={
     .write = tty_write,
 };
 
-void tty_init(){
-    //注册devfs
-    devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_TTY, &tty_fops, &tty_inode_private_data_ptr);
-    kinfo("tty driver registered. uuid=%d", tty_inode_private_data_ptr->uuid);
-}
+// void tty_init(){
+//     //注册devfs
+//     devfs_register_device(DEV_TYPE_CHAR, CHAR_DEV_STYPE_TTY, &tty_fops, &tty_inode_private_data_ptr);
+//     kinfo("tty driver registered. uuid=%d", tty_inode_private_data_ptr->uuid);
+// }

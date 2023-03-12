@@ -7,7 +7,6 @@ use bitflags::bitflags;
 use core::{
     convert::TryFrom,
     fmt::{self, Display, Formatter},
-    ptr::NonNull,
 };
 //Bar0寄存器的offset
 const BAR0_OFFSET: u8 = 0x10;

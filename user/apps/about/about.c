@@ -19,15 +19,15 @@ void print_copyright()
     printf(" DragonOS - An opensource operating system.\n");
     printf(" Copyright: fslongjin & DragonOS Community. 2022, All rights reserved.\n");
     printf(" Version: ");
-    put_string("V0.1.4\n", COLOR_GREEN, COLOR_BLACK);
+    put_string("V0.1.5\n", COLOR_GREEN, COLOR_BLACK);
     printf(" Git commit SHA1: %s\n", DRAGONOS_GIT_COMMIT_SHA1);
     printf(" Build time: %s %s\n", __DATE__, __TIME__);
     printf(" \nYou can visit the project via:\n");
     printf("\n");
     put_string("    Official Website: https://DragonOS.org\n", COLOR_INDIGO, COLOR_BLACK);
-    put_string("    GitHub: https://github.com/fslongjin/DragonOS\n", COLOR_ORANGE, COLOR_BLACK);
+    put_string("    GitHub: https://github.com/DragonOS-Community/DragonOS\n", COLOR_ORANGE, COLOR_BLACK);
     printf("\n");
-    printf(" Maintainer: longjin <longjin@RinGoTek.cn>\n");
+    printf(" Maintainer: longjin <longjin@DragonOS.org>\n");
     printf(" Get contact with the community: <contact@DragonOS.org>\n");
     printf("\n");
     printf(" If you find any problems during use, please visit:\n");

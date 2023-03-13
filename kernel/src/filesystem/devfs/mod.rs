@@ -73,7 +73,7 @@ impl DevFS {
             .expect("DevFS: Failed to create /dev/block");
         devfs.register_bultinin_device();
 
-        kdebug!("ls /dev: {:?}", root.list());
+        // kdebug!("ls /dev: {:?}", root.list());
         return devfs;
     }
 

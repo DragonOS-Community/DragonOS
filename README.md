@@ -10,7 +10,7 @@
 
 &emsp;&emsp;作为一个社区驱动的开源操作系统，为了促进其发展，避免让其遭受一些不遵守开源协议的商业公司的侵权，我们决定使用GPLv2协议开放源代码，以严格的开源协议来保护DragonOS。
 
-[关于DragonOS，你想了解的都在这儿 - DragonOS](https://dragonos.org/uncategorized/summary/)
+[关于DragonOS，你想了解的都在这儿 - DragonOS](https://dragonos.org/?p=46)
 
 ## 网站
 
@@ -32,9 +32,7 @@
 
 &emsp;&emsp;运行DragonOS的步骤非常简单，您可以参考以下几个资料，在最短15分钟内运行DragonOS！
 
-- [构建DragonOS — DragonOS dev 文档](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html#docker)
-
-- [如何在电脑的虚拟机上运行DragonOS？ | | 龙进的博客](https://longjin666.cn/?p=1514)
+- [构建DragonOS — DragonOS dev 文档](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)
 
 - [教你在15分钟内运行DragonOS！- Bilibili](https://www.bilibili.com/video/BV1zF411w7s2?share_source=copy_web&vd_source=41ab4a1b73e6f65219a785923511517e)
 
@@ -50,7 +48,7 @@
 
 ## 如何与社区建立联系？
 
-&emsp;&emsp;你可以发邮件给我，我的邮件地址是[longjin@RinGoTek.cn](mailto:longjin@RinGoTek.cn)。
+&emsp;&emsp;你可以发邮件给Maintainer: longjin，邮件地址是 [longjin@DragonOS.org](mailto:longjin@DragonOS.org) 。
 
 &emsp;&emsp;或者是加入我们的开发交流QQ群：**115763565**
 
@@ -60,19 +58,17 @@
 
 ## 贡献者名单
 
-[Contributors to fslongjin/DragonOS · GitHub](https://github.com/fslongjin/DragonOS/graphs/contributors)
+[Contributors to DragonOS-Community/DragonOS · GitHub](https://github.com/DragonOS-Community/DragonOS/graphs/contributors)
 
-## 联系我
+## 联系我们
 
-我的邮箱：longjin@RinGoTek.cn
+社区对外联系邮箱：contact@DragonOS.org
 
-社区邮箱：contact@DragonOS.org
-
-我的博客：[longjin666.cn](https://longjin666.cn)
+社区负责人邮箱：longjin@DragonOS.org
 
 ## 赞助
 
-&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是它的发展离不开资金的支持，如果您愿意的话，可以通过**[赞助 - DragonOS](https://dragonos.org/donate/)**，从而促进这个项目的发展。所有的赞助者的名单都会被公示。您的每一分赞助，都会为DragonOS的发展作出贡献！
+&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是它的发展离不开资金的支持，如果您愿意的话，可以通过 ** [赞助 - DragonOS](https://dragonos.org/?page_id=37) ** ，从而促进这个项目的发展。所有的赞助者的名单都会被公示。您的每一分赞助，都会为DragonOS的发展作出贡献！
 
 ### 赞助的资金都会被用到哪里？
 
@@ -94,6 +90,7 @@
 
 ### 个人赞赏者列表
 
+- 万晓兰
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
 - [FindWangHao](https://github.com/FindWangHao)
@@ -126,8 +123,6 @@
 
 - [osdev.org](https://wiki.osdev.org/Main_Page)
 
-- Multiboot2 Specification version 2.0
-
 - ACPI_6_3_final_Jan30
 
 - the GNU GRUB manual
@@ -139,3 +134,7 @@
 - [skiftOS]([GitHub - skiftOS/skift: 🥑 A hobby operating system built from scratch in modern C++. Featuring a reactive UI library and a strong emphasis on user experience.](https://github.com/skiftOS/skift))
 
 - [GuideOS](https://github.com/Codetector1374/GuideOS)
+
+- [redox-os](https://gitlab.redox-os.org/redox-os/redox)
+
+- [rcore](https://github.com/rcore-os/rCore)

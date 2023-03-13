@@ -52,21 +52,23 @@ impl RTQueue {
     }
     /// @brief 将pcb加入队列
     pub fn enqueue(&mut self, pcb: &'static mut process_control_block) {
-        self.lock.lock();
+        let mut rflags = 0u64;
+        self.lock.lock_irqsave(&mut rflags);
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.pid == 0 {
-            self.lock.unlock();
+            self.lock.unlock_irqrestore(&rflags);
             return;
         }
         self.queue.push_back(pcb);
-        self.lock.unlock();
+        self.lock.unlock_irqrestore(&rflags);
     }
 
     /// @brief 将pcb从调度队列头部取出,若队列为空，则返回None
     pub fn dequeue(&mut self) -> Option<&'static mut process_control_block> {
         let res: Option<&'static mut process_control_block>;
-        self.lock.lock();
+        let mut rflags = 0u64;
+        self.lock.lock_irqsave(&mut rflags);
         if self.queue.len() > 0 {
             // 队列不为空，返回下一个要执行的pcb
             res = Some(self.queue.pop_front().unwrap());
@@ -74,19 +76,20 @@ impl RTQueue {
             // 如果队列为空，则返回None
             res = None;
         }
-        self.lock.unlock();
+        self.lock.unlock_irqrestore(&rflags);
         return res;
     }
     pub fn enqueue_front(&mut self, pcb: &'static mut process_control_block) {
-        self.lock.lock();
+        let mut rflags = 0u64;
+        self.lock.lock_irqsave(&mut rflags);
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.pid == 0 {
-            self.lock.unlock();
+            self.lock.unlock_irqrestore(&rflags);
             return;
         }
         self.queue.push_front(pcb);
-        self.lock.unlock();
+        self.lock.unlock_irqrestore(&rflags);
     }
     pub fn get_rt_queue_size(&mut self) -> usize {
         return self.queue.len();
@@ -143,7 +146,7 @@ impl SchedulerRT {
         None
     }
 
-    pub fn get_rt_queue_len(&mut self, cpu_id: u32) -> usize {
+    pub fn rt_queue_len(&mut self, cpu_id: u32) -> usize {
         let mut sum = 0;
         for prio in 0..SchedulerRT::MAX_RT_PRIO {
             sum += self.cpu_queue[cpu_id as usize][prio as usize].get_rt_queue_size();
@@ -151,7 +154,8 @@ impl SchedulerRT {
         return sum as usize;
     }
 
-    pub fn get_load_list_len(&mut self, cpu_id: u32) -> usize {
+    #[inline]
+    pub fn load_list_len(&mut self, cpu_id: u32) -> usize {
         return self.load_list[cpu_id as usize].len();
     }
 

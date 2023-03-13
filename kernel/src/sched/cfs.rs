@@ -66,22 +66,24 @@ impl CFSQueue {
 
     /// @brief 将pcb加入队列
     pub fn enqueue(&mut self, pcb: &'static mut process_control_block) {
-        self.lock.lock();
+        let mut rflags = 0u64;
+        self.lock.lock_irqsave(&mut rflags);
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.pid == 0 {
-            self.lock.unlock();
+            self.lock.unlock_irqrestore(&rflags);
             return;
         }
         self.queue.push(pcb);
         self.sort();
-        self.lock.unlock();
+        self.lock.unlock_irqrestore(&rflags);
     }
 
     /// @brief 将pcb从调度队列中弹出,若队列为空，则返回IDLE进程的pcb
     pub fn dequeue(&mut self) -> &'static mut process_control_block {
         let res: &'static mut process_control_block;
-        self.lock.lock();
+        let mut rflags = 0u64;
+        self.lock.lock_irqsave(&mut rflags);
         if self.queue.len() > 0 {
             // 队列不为空，返回下一个要执行的pcb
             res = self.queue.pop().unwrap();
@@ -89,7 +91,7 @@ impl CFSQueue {
             // 如果队列为空，则返回IDLE进程的pcb
             res = unsafe { self.idle_pcb.as_mut().unwrap() };
         }
-        self.lock.unlock();
+        self.lock.unlock_irqrestore(&rflags);
         return res;
     }
 

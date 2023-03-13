@@ -11,7 +11,7 @@ use crate::{
         process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
         SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
-    process::process::process_cpu,
+    process::process::process_cpu
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
@@ -34,7 +34,7 @@ pub fn get_cpu_loads(cpu_id: u32) -> u32 {
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
     let len_cfs = cfs_scheduler.get_cfs_queue_len(cpu_id);
-    let len_rt = rt_scheduler.get_rt_queue_len(cpu_id);
+    let len_rt = rt_scheduler.rt_queue_len(cpu_id);
     // let load_rt = rt_scheduler.get_load_list_len(cpu_id);
     // kdebug!("this cpu_id {} is load rt {}", cpu_id, load_rt);
 
@@ -111,14 +111,13 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut res
     }
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
-    // TODO 前几号进程不进行迁移，这里需要判断修改，当前的意思为了调试已经初始化完成的rt进程
-    // if pcb.pid > 4 && pcb.policy!=0{
-    if pcb.pid > 4 {
+
+    // 除了IDLE以外的进程，都进行负载均衡
+    if pcb.pid > 0 {
         loads_balance(pcb);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     if (pcb.flags & (PF_NEED_MIGRATE as u64)) != 0 {
         // kdebug!("migrating pcb:{:?}", pcb);
         pcb.flags &= !(PF_NEED_MIGRATE as u64);

@@ -37,7 +37,7 @@
 
 ## How to contact the community?
 
-&emsp;&emsp;You can send an email to the project's maintainer: longjin. His email address is[ longjin@DragonOS.org ](mailto: longjin@DragonOS.org)。
+&emsp;&emsp;You can send an email to the project's maintainer: longjin. His email address is [longjin@DragonOS.org](mailto: longjin@DragonOS.org) .
 
 &emsp;&emsp;Or join our development exchange QQ group: **115763565**
 
@@ -58,7 +58,7 @@ Maintainer longjin's Email：longjin@DragonOS.org
 
 ## Reward
 
-&emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit ** [Sponsor - DragonOS](https://dragonos.org/?page_id=37) **, so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
+&emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit ** [Sponsor - DragonOS](https://dragonos.org/?page_id=37) ** , so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
 
 ### Where will the sponsorship funds be used?
 

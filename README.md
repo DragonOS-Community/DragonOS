@@ -48,7 +48,7 @@
 
 ## 如何与社区建立联系？
 
-&emsp;&emsp;你可以发邮件给Maintainer: longjin，邮件地址是[longjin@DragonOS.org](mailto:longjin@DragonOS.org)。
+&emsp;&emsp;你可以发邮件给Maintainer: longjin，邮件地址是 [longjin@DragonOS.org](mailto:longjin@DragonOS.org) 。
 
 &emsp;&emsp;或者是加入我们的开发交流QQ群：**115763565**
 
@@ -68,7 +68,7 @@
 
 ## 赞助
 
-&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是它的发展离不开资金的支持，如果您愿意的话，可以通过** [赞助 - DragonOS](https://dragonos.org/?page_id=37) **，从而促进这个项目的发展。所有的赞助者的名单都会被公示。您的每一分赞助，都会为DragonOS的发展作出贡献！
+&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是它的发展离不开资金的支持，如果您愿意的话，可以通过 ** [赞助 - DragonOS](https://dragonos.org/?page_id=37) ** ，从而促进这个项目的发展。所有的赞助者的名单都会被公示。您的每一分赞助，都会为DragonOS的发展作出贡献！
 
 ### 赞助的资金都会被用到哪里？
 

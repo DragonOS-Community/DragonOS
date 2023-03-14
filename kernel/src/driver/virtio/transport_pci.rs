@@ -1,5 +1,5 @@
 //! PCI transport for VirtIO.
-use super::volatile::{
+use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
 use crate::driver::pci::pci::{

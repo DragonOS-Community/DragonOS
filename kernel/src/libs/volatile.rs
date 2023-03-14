@@ -1,4 +1,33 @@
-/// An MMIO register which can only be read from.
+/// 该代码来自于virtio-drivers 0.2.0
+/// 在对已经MMIO映射对虚拟地址的寄存器的操作中，我们经常遇到有的寄存器是只读或可读写的
+/// 那么我们就可以使用结构体ReadOnly WriteOnly Volatile对其进行区分
+/// 例：
+/// #[repr(C)]
+/// struct CommonCfg {
+///     device_feature_select: Volatile<u32>,
+///     device_feature: ReadOnly<u32>,
+///     driver_feature_select: Volatile<u32>,
+///     driver_feature: Volatile<u32>,
+///     msix_config: Volatile<u16>,
+///     num_queues: ReadOnly<u16>,
+///     device_status: Volatile<u8>,
+///     config_generation: ReadOnly<u8>,
+///     queue_select: Volatile<u16>,
+///     queue_size: Volatile<u16>,
+///     queue_msix_vector: Volatile<u16>,
+///     queue_enable: Volatile<u16>,
+///     queue_notify_off: Volatile<u16>,
+///     queue_desc: Volatile<u64>,
+///     queue_driver: Volatile<u64>,
+///     queue_device: Volatile<u64>,
+/// }
+/// 
+/// 对CommonCfg里面的某个寄存器进行读写：
+/// volwrite!(self.common_cfg, queue_enable, 0);
+/// 
+/// 这样做不仅使代码的可读性提高了，也避免了对只读寄存器进行写入的误操作
+
+/// 只读寄存器
 #[derive(Default)]
 #[repr(transparent)]
 pub struct ReadOnly<T: Copy>(T);
@@ -10,12 +39,12 @@ impl<T: Copy> ReadOnly<T> {
     }
 }
 
-/// An MMIO register which can only be written to.
+/// 只写寄存器
 #[derive(Default)]
 #[repr(transparent)]
 pub struct WriteOnly<T: Copy>(T);
 
-/// An MMIO register which may be both read and written.
+/// 写读寄存器
 #[derive(Default)]
 #[repr(transparent)]
 pub struct Volatile<T: Copy>(T);

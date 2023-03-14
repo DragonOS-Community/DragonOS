@@ -15,6 +15,7 @@ use crate::{
     time::TimeSpec,
 };
 
+use self::file::FileMode;
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -91,7 +92,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(-(ENOTSUP as i32));
     }

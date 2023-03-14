@@ -38,7 +38,7 @@ extern crate lazy_static;
 
 #[macro_use]
 extern crate bitflags;
-
+extern crate thingbuf;
 
 use mm::allocator::KernelAllocator;
 

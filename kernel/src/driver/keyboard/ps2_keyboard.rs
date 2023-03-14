@@ -3,7 +3,7 @@ use alloc::sync::{Arc, Weak};
 use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{core::generate_inode_id, FileType, IndexNode, Metadata, PollStatus},
+        vfs::{core::generate_inode_id, file::FileMode, FileType, IndexNode, Metadata, PollStatus},
     },
     include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t, ENOTSUP},
     kdebug,
@@ -68,10 +68,8 @@ impl DeviceINode for LockedPS2KeyBoardInode {
 
 #[no_mangle] // 不重命名
 pub extern "C" fn ps2_keyboard_register(f_ops: &vfs_file_operations_t) {
-    kdebug!("register keyboard = {:p}", f_ops);
     devfs_register("ps2_keyboard", LockedPS2KeyBoardInode::new(f_ops))
         .expect("Failed to register ps/2 keyboard");
-    kdebug!("register keyboard = {:p}", f_ops);
 }
 
 impl IndexNode for LockedPS2KeyBoardInode {
@@ -105,7 +103,11 @@ impl IndexNode for LockedPS2KeyBoardInode {
         return Err(-(ENOTSUP as i32));
     }
 
-    fn open(&self, _data: &mut crate::filesystem::vfs::FilePrivateData) -> Result<(), i32> {
+    fn open(
+        &self,
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _mode: &FileMode,
+    ) -> Result<(), i32> {
         let guard = self.0.lock();
         let func = guard.f_ops.open.unwrap();
         let _ = unsafe { func(0 as *mut vfs_index_node_t, 0 as *mut vfs_file_t) };

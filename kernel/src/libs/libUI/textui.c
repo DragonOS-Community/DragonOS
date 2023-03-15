@@ -213,7 +213,7 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
         return 0;
 
     // uint64_t rflags = 0; // 加锁后rflags存储到这里
-    spin_lock(&window->lock);
+    spin_lock_no_preempt(&window->lock);
     c_uart_send(COM1, character);
     if (unlikely(character == '\n'))
     {
@@ -221,7 +221,7 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
         c_uart_send(COM1, '\r');
         __textui_new_line(window, window->vline_operating);
         // spin_unlock_irqrestore(&window->lock, rflags);
-        spin_unlock(&window->lock);
+        spin_unlock_no_preempt(&window->lock);
         return 0;
     }
     else if (character == '\t') // 输出制表符
@@ -275,7 +275,7 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
     }
 
     // spin_unlock_irqrestore(&window->lock, rflags);
-    spin_unlock(&window->lock);
+    spin_unlock_no_preempt(&window->lock);
     return 0;
 }
 

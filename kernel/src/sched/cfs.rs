@@ -1,11 +1,12 @@
-use core::{ptr::null_mut, sync::atomic::compiler_fence};
+use core::{arch::x86_64::_rdtsc, ptr::null_mut, sync::atomic::compiler_fence};
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, PROC_RUNNING,
+        initial_proc_union, process_control_block, Cpu_tsc_freq, LOAD_PERIOD_TIME, MAX_CPU_NUM,
+        PF_NEED_SCHED, PROC_RUNNING,
     },
     kBUG,
     libs::spinlock::RawSpinlock,
@@ -114,6 +115,7 @@ impl CFSQueue {
 /// @brief CFS调度器类
 pub struct SchedulerCFS {
     cpu_queue: Vec<&'static mut CFSQueue>,
+    load_list: Vec<&'static mut LinkedList<u64>>,
 }
 
 impl SchedulerCFS {
@@ -122,6 +124,7 @@ impl SchedulerCFS {
         // todo: 从cpu模块来获取核心的数目
         let mut result = SchedulerCFS {
             cpu_queue: Default::default(),
+            load_list: Default::default(),
         };
 
         // 为每个cpu核心创建队列
@@ -132,7 +135,12 @@ impl SchedulerCFS {
         }
         // 设置cpu0的pcb
         result.cpu_queue[0].idle_pcb = unsafe { &mut initial_proc_union.pcb };
-
+        // 为每个cpu核心创建负载统计队列
+        for _ in 0..MAX_CPU_NUM {
+            result
+                .load_list
+                .push(Box::leak(Box::new(LinkedList::new())));
+        }
         return result;
     }
 
@@ -179,8 +187,12 @@ impl SchedulerCFS {
         self.cpu_queue[cpu_id].idle_pcb = pcb;
     }
     /// 获取某个cpu的运行队列中的进程数
-    pub fn get_cfs_queue_len(&mut self, cpu_id: u32) -> usize {
+    pub fn cfs_queue_len(&mut self, cpu_id: u32) -> usize {
         return self.cpu_queue[cpu_id as usize].get_cfs_queue_size();
+    }
+    #[inline]
+    pub fn load_list_len(&mut self, cpu_id: u32) -> usize {
+        return self.load_list[cpu_id as usize].len();
     }
 }
 
@@ -232,7 +244,20 @@ impl Scheduler for SchedulerCFS {
     }
 
     fn enqueue(&mut self, pcb: &'static mut process_control_block) {
-        let cpu_queue = &mut self.cpu_queue[pcb.cpu_id as usize];
+        let cpu_id = pcb.cpu_id;
+        let cpu_queue = &mut self.cpu_queue[cpu_id as usize];
         cpu_queue.enqueue(pcb);
+        // 获取当前时间
+        let time = unsafe { _rdtsc() };
+        let freq = unsafe { Cpu_tsc_freq };
+        // 将当前时间加入负载记录队列
+        self.load_list[cpu_id as usize].push_back(time);
+        // 如果队首元素与当前时间差超过设定值，则移除队首元素
+        while self.load_list[cpu_id as usize].len() > 1
+            && (time - *self.load_list[cpu_id as usize].front().unwrap()
+                > freq * (LOAD_PERIOD_TIME as u64))
+        {
+            self.load_list[cpu_id as usize].pop_front();
+        }
     }
 }

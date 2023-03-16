@@ -16,6 +16,8 @@
 #define SCHED_MAX_POLICY_NUM SCHED_DEADLINE
 
 #define IS_VALID_SCHED_POLICY(_policy) ((_policy) > 0 && (_policy) <= SCHED_MAX_POLICY_NUM)
+// 多核负载的统计时间设置
+#define LOAD_PERIOD_TIME 5
 
 // struct sched_param
 // {

@@ -1,11 +1,12 @@
-use core::{ptr::null_mut, sync::atomic::compiler_fence};
+use core::{arch::x86_64::_rdtsc, ptr::null_mut, sync::atomic::compiler_fence};
 
 use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR,
+        process_control_block, Cpu_tsc_freq, LOAD_PERIOD_TIME, MAX_CPU_NUM, PF_NEED_SCHED,
+        SCHED_FIFO, SCHED_RR,
     },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
@@ -216,17 +217,18 @@ impl Scheduler for SchedulerRT {
         let cpu_id = pcb.cpu_id;
         let cpu_queue = &mut self.cpu_queue[pcb.cpu_id as usize];
         cpu_queue[cpu_id as usize].enqueue(pcb);
-        // // 获取当前时间
-        // let time = unsafe { _rdtsc() };
-        // let freq = unsafe { Cpu_tsc_freq };
-        // // kdebug!("this is timeeeeeeer {},freq is {}, {}", time, freq, cpu_id);
-        // // 将当前时间加入负载记录队列
-        // self.load_list[cpu_id as usize].push_back(time);
-        // // 如果队首元素与当前时间差超过设定值，则移除队首元素
-        // while self.load_list[cpu_id as usize].len() > 1
-        //     && (time - *self.load_list[cpu_id as usize].front().unwrap() > 10000000000)
-        // {
-        //     self.load_list[cpu_id as usize].pop_front();
-        // }
+        // 获取当前时间
+        let time = unsafe { _rdtsc() };
+        let freq = unsafe { Cpu_tsc_freq };
+        // kdebug!("this is timeeeeeeer {},freq is {}, {}", time, freq, cpu_id);
+        // 将当前时间加入负载记录队列
+        self.load_list[cpu_id as usize].push_back(time);
+        // 如果队首元素与当前时间差超过设定值，则移除队首元素
+        while self.load_list[cpu_id as usize].len() > 1
+            && (time - *self.load_list[cpu_id as usize].front().unwrap()
+                > freq * (LOAD_PERIOD_TIME as u64))
+        {
+            self.load_list[cpu_id as usize].pop_front();
+        }
     }
 }

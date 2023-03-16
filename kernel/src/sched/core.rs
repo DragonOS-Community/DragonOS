@@ -11,7 +11,8 @@ use crate::{
         process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
         SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
-    process::process::process_cpu
+    kdebug,
+    process::process::process_cpu,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
@@ -33,15 +34,15 @@ pub fn cpu_executing(cpu_id: u32) -> &'static mut process_control_block {
 pub fn get_cpu_loads(cpu_id: u32) -> u32 {
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
-    let len_cfs = cfs_scheduler.get_cfs_queue_len(cpu_id);
-    let len_rt = rt_scheduler.rt_queue_len(cpu_id);
-    // let load_rt = rt_scheduler.get_load_list_len(cpu_id);
-    // kdebug!("this cpu_id {} is load rt {}", cpu_id, load_rt);
+    let load_cfs = cfs_scheduler.load_list_len(cpu_id);
 
-    return (len_rt + len_cfs) as u32;
+    let load_rt = rt_scheduler.load_list_len(cpu_id);
+
+    // 目前计算负载方式是将两种调度器的固定时间内运行的队列的和，未来可以考虑rt调度器占据更大比重或其他方式
+    return (load_cfs + load_rt) as u32;
 }
 // 负载均衡
-pub fn loads_balance(pcb: &mut process_control_block) {
+pub fn load_balance(pcb: &mut process_control_block) {
     // 对pcb的迁移情况进行调整
     // 获取总的CPU数量
     let cpu_num = unsafe { smp_get_total_cpu() };
@@ -62,7 +63,11 @@ pub fn loads_balance(pcb: &mut process_control_block) {
         // sched_migrate_process(pcb, min_loads_cpu_id as usize);
         pcb.flags |= PF_NEED_MIGRATE as u64;
         pcb.migrate_to = min_loads_cpu_id;
+        // TODO 此处将打印pcb注释单独取消，会报错，同时取消两行的话，不会报错
+        // kdebug!("set migrating, pcb:");
         // kdebug!("set migrating, pcb:{:?}", pcb);
+        // kdebug!("pcb {},migrate to {}", pcb.pid, min_loads_cpu_id);
+
     }
 }
 /// @brief 具体的调度器应当实现的trait
@@ -113,8 +118,9 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut res
     let rt_scheduler = __get_rt_scheduler();
 
     // 除了IDLE以外的进程，都进行负载均衡
-    if pcb.pid > 0 {
-        loads_balance(pcb);
+    // >0 时采用计算
+    if pcb.pid > 3 {
+        load_balance(pcb);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 

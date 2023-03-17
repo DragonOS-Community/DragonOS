@@ -14,6 +14,7 @@
 #include <common/string.h>
 #include <mm/slab.h>
 extern void ignore_int();
+extern int rs_apic_init();
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -218,6 +219,7 @@ void irq_init()
 
     memset((void *)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
     apic_init();
+    rs_apic_init();
 
 #endif
 }

@@ -40,6 +40,9 @@ extern crate lazy_static;
 extern crate bitflags;
 extern crate thingbuf;
 
+#[cfg(target_arch="x86_64")]
+extern crate x86;
+
 use mm::allocator::KernelAllocator;
 
 // <3>

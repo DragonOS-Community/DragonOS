@@ -1,4 +1,5 @@
 pub mod disk;
+pub mod interrupt;
 pub mod keyboard;
 pub mod pci;
 pub mod timers;

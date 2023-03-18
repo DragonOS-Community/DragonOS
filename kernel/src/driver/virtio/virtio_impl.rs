@@ -8,7 +8,7 @@ use crate::kdebug;
 use core::mem::size_of;
 use core::{ptr::NonNull};
 use virtio_drivers::{BufferDirection, Hal, PhysAddr, PAGE_SIZE};
-
+use crate::mm::virt_2_phys;
 pub struct HalImpl;
 impl Hal for HalImpl {
     /// @brief 申请用于DMA的内存页
@@ -36,11 +36,11 @@ impl Hal for HalImpl {
         }
         return 0;
     }
-    /// @brief 物理地址转换为虚拟地址
+    /// @brief mmio物理地址转换为虚拟地址，不需要使用
     /// @param paddr 起始物理地址
     /// @return NonNull<u8> 虚拟地址的指针
     fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new((paddr + PAGE_OFFSET as usize)as _).unwrap()
+        NonNull::new((0)as _).unwrap()
     }
     /// @brief 与真实物理设备共享
     /// @param buffer 要共享的buffer _direction：设备到driver或driver到设备
@@ -49,7 +49,7 @@ impl Hal for HalImpl {
         let vaddr = buffer.as_ptr() as *mut u8 as usize;
         //kdebug!("virt:{:x}", vaddr);
         // Nothing to do, as the host already has access to all memory.
-        virt_to_phys(vaddr)
+        virt_2_phys(vaddr)
     }
     /// @brief 停止共享（让主机可以访问全部内存的话什么都不用做）
     fn unshare(_paddr: PhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
@@ -58,10 +58,3 @@ impl Hal for HalImpl {
     }
 }
 
-/// @brief 虚拟地址转换为物理地址
-/// @param vaddr 虚拟地址
-/// @return PhysAddr 物理地址
-fn virt_to_phys(vaddr: usize) -> PhysAddr {
-    //kdebug!("page_offset:{:#x}",PAGE_OFFSET as usize);
-    vaddr - PAGE_OFFSET as usize
-}

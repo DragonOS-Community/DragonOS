@@ -12,9 +12,15 @@ crate-type = ["staticlib"]
 [dependencies]
 x86_64 = "0.14.10"
 bitflags = "1.3.2"
-virtio-drivers = "0.2.0"
+virtio-drivers = "0.3.0"
 # 一个无锁MPSC队列
 thingbuf = { version = "0.1.3", default-features = false, features = ["alloc"] }
+# smoltcp 0.9.1
+smoltcp = { git = "https://github.com/DragonOS-Community/smoltcp.git", rev = "9027825", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
+# num-traits 0.2.15
+num-traits = { git = "https://github.com/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
+num = { version = "0.4.0", default-features = false }
+num-derive = "0.3"
 
 # 构建时依赖项
 [build-dependencies]

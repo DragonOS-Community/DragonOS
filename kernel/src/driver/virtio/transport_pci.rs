@@ -1,12 +1,13 @@
 //! PCI transport for VirtIO.
-use super::volatile::{
-    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
-};
 use crate::driver::pci::pci::{
-    capabilities_offset, pci_bar_init, CapabilityIterator, DeviceFunction, PciDeviceBar, PciError,
-    PCI_CAP_ID_VNDR,
+    capabilities_offset, pci_bar_init, pci_enable_master, CapabilityIterator, DeviceFunction,
+    PciDeviceBar, PciError, PCI_CAP_ID_VNDR,
 };
 use crate::include::bindings::bindings::pci_read_config;
+
+use crate::libs::volatile::{
+    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
+};
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -14,9 +15,10 @@ use core::{
 };
 use virtio_drivers::{
     transport::{DeviceStatus, DeviceType, Transport},
-    Error, Hal, PhysAddr, VirtAddr,
+    Error, Hal, PhysAddr,
 };
 
+type VirtAddr = usize;
 /// The PCI vendor ID for VirtIO devices.
 /// PCI Virtio设备的vendor ID
 const VIRTIO_VENDOR_ID: u16 = 0x1af4;
@@ -119,8 +121,9 @@ impl PciTransport {
             device_function: device_function,
             next_capability_offset: capabilities_offset(device_function),
         };
-        let device_bar = pci_bar_init(device_function)?;
 
+        let device_bar = pci_bar_init(device_function)?;
+        pci_enable_master(device_function);
         for capability in device_capability {
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
@@ -197,6 +200,7 @@ impl PciTransport {
                 notify_off_multiplier,
             ));
         }
+        //kdebug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
         let notify_region = get_bar_region_slice::<_>(&device_bar, &notify_cfg)?;
         let isr_status = get_bar_region::<_>(
             &device_bar,
@@ -282,7 +286,9 @@ impl Transport for PciTransport {
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {
         // No-op, the PCI transport doesn't care.
     }
-
+    fn requires_legacy_layout(&self) -> bool {
+        false
+    }
     fn queue_set(
         &mut self,
         queue: u16,
@@ -293,6 +299,10 @@ impl Transport for PciTransport {
     ) {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
+        // kdebug!("queue_select={}",queue);
+        // kdebug!("queue_size={}",size as u16);
+        // kdebug!("queue_desc={:#x}",descriptors as u64);
+        // kdebug!("driver_area={:#x}",driver_area);
         unsafe {
             volwrite!(self.common_cfg, queue_select, queue);
             volwrite!(self.common_cfg, queue_size, size as u16);
@@ -307,7 +317,6 @@ impl Transport for PciTransport {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
         unsafe {
-            volwrite!(self.common_cfg, queue_enable, 0);
             volwrite!(self.common_cfg, queue_select, queue);
             volwrite!(self.common_cfg, queue_size, 0);
             volwrite!(self.common_cfg, queue_desc, 0);
@@ -355,8 +364,13 @@ impl Transport for PciTransport {
     }
 }
 
-/// `virtio_pci_common_cfg`, see 4.1.4.3 "Common configuration structure layout".
-///
+impl Drop for PciTransport {
+    fn drop(&mut self) {
+        // Reset the device when the transport is dropped.
+        self.set_status(DeviceStatus::empty())
+    }
+}
+
 #[repr(C)]
 struct CommonCfg {
     device_feature_select: Volatile<u32>,
@@ -488,6 +502,7 @@ fn get_bar_region<T>(
     {
         return Err(VirtioPciError::BarOffsetOutOfRange);
     }
+    //kdebug!("Chossed bar ={},used={}",struct_info.bar,struct_info.offset + struct_info.length);
     let vaddr = (bar_info
         .virtual_address()
         .ok_or(VirtioPciError::BarGetVaddrFailed)?) as usize
@@ -498,18 +513,25 @@ fn get_bar_region<T>(
             alignment: align_of::<T>(),
         });
     }
-    Ok(NonNull::new((vaddr) as _).unwrap())
+    let vaddr = NonNull::new(vaddr as *mut u8).unwrap();
+    Ok(vaddr.cast())
 }
 
-///@brief 获取虚拟地址并将其转化为对应类型的指针
-///@param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息
+///@brief 获取虚拟地址并将其转化为对应类型的
+///@param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息切片的指针
 ///@return Result<NonNull<[T]>, VirtioPciError> 成功则返回对应类型的指针切片，失败则返回Error
 fn get_bar_region_slice<T>(
     device_bar: &PciDeviceBar,
     struct_info: &VirtioCapabilityInfo,
 ) -> Result<NonNull<[T]>, VirtioPciError> {
     let ptr = get_bar_region::<T>(device_bar, struct_info)?;
-    let raw_slice =
-        ptr::slice_from_raw_parts_mut(ptr.as_ptr(), struct_info.length as usize / size_of::<T>());
-    Ok(NonNull::new(raw_slice).unwrap())
+    // let raw_slice =
+    //     ptr::slice_from_raw_parts_mut(ptr.as_ptr(), struct_info.length as usize / size_of::<T>());
+    Ok(nonnull_slice_from_raw_parts(
+        ptr,
+        struct_info.length as usize / size_of::<T>(),
+    ))
+}
+fn nonnull_slice_from_raw_parts<T>(data: NonNull<T>, len: usize) -> NonNull<[T]> {
+    NonNull::new(ptr::slice_from_raw_parts_mut(data.as_ptr(), len)).unwrap()
 }

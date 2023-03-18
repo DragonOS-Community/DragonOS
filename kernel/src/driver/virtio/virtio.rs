@@ -90,18 +90,41 @@ fn virtio_net<T: Transport>(transport: T) {
             return;
         }
     };
-    // let mut buf = [0u8; 0x100];
+    let mut buf = [0u8; 0x100];
     // let len = match driver_net.recv(&mut buf)
     // {
     //     Ok(len) =>{len},
     //     Err(_) =>{kerror!("virtio_net recv failed");return;}
     // };
-    // kdebug!("recv: {:?}", &buf[..len]);
-    // match driver_net.send(&buf[..len])
-    // {
-    //     Ok(_) =>{kdebug!("virtio_net send success");},
-    //     Err(_) =>{kerror!("virtio_net send failed");return;},
+    match driver_net.can_send() {
+        true => {
+            kdebug!("Virtio-net can send");
+        }
+        false => {
+            kdebug!("Virtio-net can not send");
+        }
+    }
+    // match driver_net.can_recv() {
+    //     true => {
+    //         kdebug!("can recv")
+    //     }
+    //     false => {
+    //         kdebug!("can not recv");
+    //     }
     // }
+
+    let len = 100;
+    //kdebug!("recv: {:?}", &buf[..len]);
+    match driver_net.send(&buf[..len]) {
+        Ok(_) => {
+            kdebug!("virtio_net send success");
+        }
+        Err(_) => {
+            kerror!("virtio_net send failed");
+            return;
+        }
+    }
+
     let mac = driver_net.mac();
     kdebug!("virtio_net MAC={:?}", mac);
     kdebug!("virtio-net test finished");

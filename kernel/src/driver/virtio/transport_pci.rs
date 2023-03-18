@@ -1,12 +1,13 @@
 //! PCI transport for VirtIO.
+use crate::driver::pci::pci::{
+    capabilities_offset, pci_bar_init, pci_enable_master, CapabilityIterator, DeviceFunction,
+    PciDeviceBar, PciError, PCI_CAP_ID_VNDR,
+};
+use crate::include::bindings::bindings::pci_read_config;
+
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
-use crate::driver::pci::pci::{
-    capabilities_offset, pci_bar_init, CapabilityIterator, DeviceFunction, PciDeviceBar, PciError,
-    PCI_CAP_ID_VNDR,pci_enable_master
-};
-use crate::include::bindings::bindings::{pci_read_config, pci_write_config};
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -14,9 +15,8 @@ use core::{
 };
 use virtio_drivers::{
     transport::{DeviceStatus, DeviceType, Transport},
-    Error, Hal, PhysAddr, 
+    Error, Hal, PhysAddr,
 };
-use crate::kdebug;
 
 type VirtAddr = usize;
 /// The PCI vendor ID for VirtIO devices.
@@ -121,7 +121,7 @@ impl PciTransport {
             device_function: device_function,
             next_capability_offset: capabilities_offset(device_function),
         };
-        
+
         let device_bar = pci_bar_init(device_function)?;
         pci_enable_master(device_function);
         for capability in device_capability {
@@ -513,7 +513,7 @@ fn get_bar_region<T>(
             alignment: align_of::<T>(),
         });
     }
-    let vaddr=NonNull::new(vaddr as *mut u8).unwrap();
+    let vaddr = NonNull::new(vaddr as *mut u8).unwrap();
     Ok(vaddr.cast())
 }
 

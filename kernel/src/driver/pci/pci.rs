@@ -7,7 +7,6 @@ use bitflags::bitflags;
 use core::{
     convert::TryFrom,
     fmt::{self, Display, Formatter},
-    ptr::NonNull,
 };
 //Bar0寄存器的offset
 const BAR0_OFFSET: u8 = 0x10;
@@ -132,9 +131,10 @@ impl Display for PciError {
 impl DeviceFunction {
     /// Returns whether the device and function numbers are valid, i.e. the device is between 0 and
     /// 31, and the function is between 0 and 7.
-    ///@brief 检测DeviceFunction实例是否有效
-    ///@param self
-    ///@return bool 是否有效
+    /// @brief 检测DeviceFunction实例是否有效
+    /// @param self
+    /// @return bool 是否有效
+    #[allow(dead_code)]
     pub fn valid(&self) -> bool {
         self.device < 32 && self.function < 8
     }
@@ -513,10 +513,9 @@ pub fn set_command_register(device_function: &DeviceFunction, value: CommandRegi
 /// @brief 使能对PCI Memory/IO空间的写入，使能PCI设备作为主设备(主动进行Memory的写入等，msix中断使用到)
 ///
 /// @param device_function 设备
-pub fn pci_enable_master(device_function: DeviceFunction)
-{
-        set_command_register(
-            &device_function,
-            CommandRegister::IO_SPACE | CommandRegister::MEMORY_SPACE | CommandRegister::BUS_MASTER,
-        );
+pub fn pci_enable_master(device_function: DeviceFunction) {
+    set_command_register(
+        &device_function,
+        CommandRegister::IO_SPACE | CommandRegister::MEMORY_SPACE | CommandRegister::BUS_MASTER,
+    );
 }

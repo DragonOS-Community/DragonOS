@@ -70,6 +70,7 @@ macro_rules! volatile_write_bit {
 #[repr(transparent)]
 pub struct ReadOnly<T: Copy>(T);
 
+#[allow(dead_code)]
 impl<T: Copy> ReadOnly<T> {
     /// Construct a new instance for testing.
     pub fn new(value: T) -> Self {
@@ -87,6 +88,7 @@ pub struct WriteOnly<T: Copy>(T);
 #[repr(transparent)]
 pub struct Volatile<T: Copy>(T);
 
+#[allow(dead_code)]
 impl<T: Copy> Volatile<T> {
     /// Construct a new instance for testing.
     pub fn new(value: T) -> Self {

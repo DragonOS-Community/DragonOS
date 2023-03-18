@@ -6,7 +6,7 @@ use crate::driver::pci::pci::{
     capabilities_offset, pci_bar_init, CapabilityIterator, DeviceFunction, PciDeviceBar, PciError,
     PCI_CAP_ID_VNDR,
 };
-use crate::include::bindings::bindings::pci_read_config;
+use crate::include::bindings::bindings::{pci_read_config, pci_write_config};
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -122,6 +122,7 @@ impl PciTransport {
             device_function: device_function,
             next_capability_offset: capabilities_offset(device_function),
         };
+        
         let device_bar = pci_bar_init(device_function)?;
 
         for capability in device_capability {

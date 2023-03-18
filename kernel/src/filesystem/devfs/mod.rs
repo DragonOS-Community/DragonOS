@@ -508,3 +508,4 @@ pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), 
 pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), i32> {
     return devfs_exact_ref!().unregister_device(name, device);
 }
+

@@ -13,3 +13,4 @@ pub mod volatile_io;
 pub mod rwlock;
 pub mod semaphore;
 pub mod wait_queue;
+pub mod keyboard_parser;

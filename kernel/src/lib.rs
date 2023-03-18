@@ -16,25 +16,29 @@ use core::panic::PanicInfo;
 #[path = "arch/x86_64/mod.rs"]
 #[macro_use]
 mod arch;
-
-mod driver;
-mod filesystem;
-#[macro_use]
-mod include;
-mod ipc;
 #[macro_use]
 mod libs;
+#[macro_use]
+mod include;
+mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
-pub mod io;
+mod filesystem;
+mod io;
+mod ipc;
 mod mm;
 mod process;
 mod sched;
 mod smp;
 mod time;
 
+#[macro_use]
 extern crate alloc;
 #[macro_use]
 extern crate lazy_static;
+
+#[macro_use]
+extern crate bitflags;
+extern crate thingbuf;
 
 use mm::allocator::KernelAllocator;
 

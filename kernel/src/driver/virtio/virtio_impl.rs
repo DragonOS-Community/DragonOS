@@ -19,7 +19,7 @@ impl Hal for HalImpl {
         unsafe {
             let pa = alloc_pages(ZONE_NORMAL, page_num as i32, PAGE_SHARED as u64);
             let page = *pa;
-            kdebug!("alloc pages num:{},Phyaddr={:#x}",pages,page.addr_phys);
+            //kdebug!("alloc pages num:{},Phyaddr={:#x}",pages,page.addr_phys);
             (page.addr_phys as PhysAddr,NonNull::new((page.addr_phys as PhysAddr + PAGE_OFFSET as usize)as _).unwrap())
         }
     }
@@ -47,7 +47,7 @@ impl Hal for HalImpl {
     /// @return buffer在内存中的物理地址
     fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
         let vaddr = buffer.as_ptr() as *mut u8 as usize;
-        kdebug!("virt:{:x}", vaddr);
+        //kdebug!("virt:{:x}", vaddr);
         // Nothing to do, as the host already has access to all memory.
         virt_to_phys(vaddr)
     }

@@ -4,7 +4,7 @@ use crate::libs::volatile::{
 };
 use crate::driver::pci::pci::{
     capabilities_offset, pci_bar_init, CapabilityIterator, DeviceFunction, PciDeviceBar, PciError,
-    PCI_CAP_ID_VNDR,
+    PCI_CAP_ID_VNDR,pci_enable_master
 };
 use crate::include::bindings::bindings::{pci_read_config, pci_write_config};
 use core::{
@@ -17,7 +17,6 @@ use virtio_drivers::{
     Error, Hal, PhysAddr, 
 };
 use crate::kdebug;
-use bitflags::bitflags;
 
 type VirtAddr = usize;
 /// The PCI vendor ID for VirtIO devices.
@@ -124,7 +123,7 @@ impl PciTransport {
         };
         
         let device_bar = pci_bar_init(device_function)?;
-
+        pci_enable_master(device_function);
         for capability in device_capability {
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
@@ -179,9 +178,7 @@ impl PciTransport {
                         );
                         temp
                     };
-                    kdebug!("notify_off_multiplier={}",notify_off_multiplier);
                 }
-                
                 VIRTIO_PCI_CAP_ISR_CFG if isr_cfg.is_none() => {
                     isr_cfg = Some(struct_info);
                 }
@@ -268,9 +265,6 @@ impl Transport for PciTransport {
         // Safe because the common config and notify region pointers are valid and we checked in
         // get_bar_region that they were aligned.
         unsafe {
-            // let config = self.config_space::<Config>().unwrap();
-            // kdebug!("status={:?}", volread!(config, status));
-            //kdebug!("status={:?}", volread!(self.common_cfg, device_status));
             volwrite!(self.common_cfg, queue_select, queue);
             // TODO: Consider caching this somewhere (per queue).
             let queue_notify_off = volread!(self.common_cfg, queue_notify_off);
@@ -376,20 +370,7 @@ impl Drop for PciTransport {
         self.set_status(DeviceStatus::empty())
     }
 }
-// #[repr(C)]
-// struct Config {
-//     mac: ReadOnly<EthernetAddress>,
-//     status: ReadOnly<Status>,
-// }
-// type EthernetAddress = [u8; 6];
-// bitflags! {
-//     struct Status: u16 {
-//         const LINK_UP = 1;
-//         const ANNOUNCE = 2;
-//     }
-// }
-/// `virtio_pci_common_cfg`, see 4.1.4.3 "Common configuration structure layout".
-///
+
 #[repr(C)]
 struct CommonCfg {
     device_feature_select: Volatile<u32>,
@@ -526,7 +507,6 @@ fn get_bar_region<T>(
         .virtual_address()
         .ok_or(VirtioPciError::BarGetVaddrFailed)?) as usize
         + struct_info.offset as usize;
-    //kdebug!("vaddr={:#x}",vaddr);
     if vaddr % align_of::<T>() != 0 {
         return Err(VirtioPciError::Misaligned {
             vaddr,

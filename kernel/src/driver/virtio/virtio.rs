@@ -90,7 +90,6 @@ fn virtio_net<T: Transport>(transport: T) {
             return;
         }
     };
-
     let mut buf = [0u8; 0x100];
     // let len = match driver_net.recv(&mut buf)
     // {
@@ -99,23 +98,23 @@ fn virtio_net<T: Transport>(transport: T) {
     // };
     match driver_net.can_send() {
         true => {
-            kdebug!("can send");
+            kdebug!("Virtio-net can send");
         }
         false => {
-            kdebug!("can not send");
+            kdebug!("Virtio-net can not send");
         }
     }
-    match driver_net.can_recv() {
-        true => {
-            kdebug!("can recv")
-        }
-        false => {
-            kdebug!("can not recv");
-        }
-    }
+    // match driver_net.can_recv() {
+    //     true => {
+    //         kdebug!("can recv")
+    //     }
+    //     false => {
+    //         kdebug!("can not recv");
+    //     }
+    // }
 
     let len = 100;
-    kdebug!("recv: {:?}", &buf[..len]);
+    //kdebug!("recv: {:?}", &buf[..len]);
     match driver_net.send(&buf[..len]) {
         Ok(_) => {
             kdebug!("virtio_net send success");

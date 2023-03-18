@@ -311,7 +311,6 @@ impl Default for PciDeviceBar {
 pub fn pci_bar_init(device_function: DeviceFunction) -> Result<PciDeviceBar, PciError> {
     let mut device_bar: PciDeviceBar = PciDeviceBar::default();
     let mut bar_index_ignore: u8 = 255;
-
     for bar_index in 0..6 {
         if bar_index == bar_index_ignore {
             continue;
@@ -436,12 +435,6 @@ pub fn pci_bar_init(device_function: DeviceFunction) -> Result<PciDeviceBar, Pci
             _ => {}
         }
     }
-
-    // 设置command register，使得设备能够使用它的BAR
-    set_command_register(
-        &device_function,
-        CommandRegister::IO_SPACE | CommandRegister::MEMORY_SPACE | CommandRegister::BUS_MASTER,
-    );
     kdebug!("pci_device_bar:{}", device_bar);
     return Ok(device_bar);
 }
@@ -457,6 +450,7 @@ pub struct CapabilityInfo {
     /// The third and fourth bytes of the capability, to save reading them again.
     pub private_header: u16,
 }
+
 /// Iterator over capabilities for a device.
 /// 创建迭代器以遍历PCI设备的capability
 #[derive(Debug)]
@@ -515,4 +509,14 @@ pub fn set_command_register(device_function: &DeviceFunction, value: CommandRegi
             value.bits().into(),
         );
     }
+}
+/// @brief 使能对PCI Memory/IO空间的写入，使能PCI设备作为主设备(主动进行Memory的写入等，msix中断使用到)
+///
+/// @param device_function 设备
+pub fn pci_enable_master(device_function: DeviceFunction)
+{
+        set_command_register(
+            &device_function,
+            CommandRegister::IO_SPACE | CommandRegister::MEMORY_SPACE | CommandRegister::BUS_MASTER,
+        );
 }

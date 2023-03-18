@@ -16,9 +16,8 @@
 #include <common/glib.h>
 #include <common/lockref.h>
 #include <common/user_namespace.h>
+#include <DragonOS/stdint.h>
 #include <mm/slab.h>
-
-extern struct vfs_superblock_t *vfs_root_sb;
 
 #define VFS_DPT_MBR 0 // MBR分区表
 #define VFS_DPT_GPT 1 // GPT分区表
@@ -194,101 +193,8 @@ struct vfs_file_operations_t
 };
 
 /**
- * @brief 在VFS中注册文件系统
- *
- * @param fs 文件系统类型结构体
- * @return uint64_t
- */
-uint64_t vfs_register_filesystem(struct vfs_filesystem_type_t *fs);
-uint64_t vfs_unregister_filesystem(struct vfs_filesystem_type_t *fs);
-
-/**
- * @brief 挂载文件系统
- *
- * @param path 要挂载到的路径
- * @param name 文件系统名
- * @param blk 块设备结构体
- * @return struct vfs_superblock_t* 挂载后，文件系统的超级块
- */
-struct vfs_superblock_t *vfs_mount_fs(const char *path, char *name, struct block_device *blk);
-
-/**
- * @brief 按照路径查找文件
- *
- * @param path 路径
- * @param flags 1：返回父目录项， 0：返回结果目录项
- * @return struct vfs_dir_entry_t* 目录项
- */
-struct vfs_dir_entry_t *vfs_path_walk(const char *path, uint64_t flags);
-
-/**
- * @brief 填充dentry
- *
- */
-int vfs_fill_dirent(void *buf, ino_t d_ino, char *name, int namelen, unsigned char type, off_t offset);
-
-/**
  * @brief 初始化vfs
  *
  * @return int 错误码
  */
-int vfs_init();
-
-/**
- * @brief 动态分配dentry以及路径字符串名称
- *
- * @param name_size 名称字符串大小（字节）(注意考虑字符串最后需要有一个‘\0’作为结尾)
- * @return struct vfs_dir_entry_t* 创建好的dentry
- */
-struct vfs_dir_entry_t *vfs_alloc_dentry(const int name_size);
-
-/**
- * @brief 分配inode并将引用计数初始化为1
- *
- * @return struct vfs_index_node_t * 分配得到的inode
- */
-struct vfs_index_node_t *vfs_alloc_inode();
-
-uint64_t do_open(const char *filename, int flags, bool from_user);
-
-/**
- * @brief 关闭文件
- *
- * @param fd_num 文件描述符
- * @return uint64_t 错误码
- */
-uint64_t vfs_close(int fd_num);
-
-/**
- * @brief 创建文件夹
- *
- * @param path 文件夹路径
- * @param mode 创建模式
- * @param from_userland 该创建请求是否来自用户态
- * @return int64_t 错误码
- */
-int64_t vfs_mkdir(const char *path, mode_t mode, bool from_userland);
-
-/**
- * @brief 删除文件夹
- *
- * @param path 文件夹路径
- * @param from_userland 请求是否来自用户态
- * @return int64_t 错误码
- */
-int64_t vfs_rmdir(const char *path, bool from_userland);
-
-/**
- * @brief 释放dentry，并视情况自动释放inode。 在调用该函数前，需要将dentry加锁。
- *
- * @param dentry 目标dentry
- *
- * @return 错误码
- *          注意，当dentry指向文件时，如果返回值为正数，则表示在释放了该dentry后，该dentry指向的inode的引用计数。
- */
-int vfs_dentry_put(struct vfs_dir_entry_t *dentry);
-
-int vfs_unlink(struct user_namespace *mnt_userns, struct vfs_index_node_t *parent_inode, struct vfs_dir_entry_t *dentry,
-               struct vfs_index_node_t **delegated_inode);
-
-int do_unlink_at(int dfd, const char *pathname, bool name);
+extern int vfs_init();

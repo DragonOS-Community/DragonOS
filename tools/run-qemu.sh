@@ -9,7 +9,7 @@ ARCH="x86_64"
 # 请根据自己的需要，在-d 后方加入所需的trace事件
 
 # 标准的trace events
-qemu_trace_std=cpu_reset,guest_errors,exec,cpu,trace:virtio*,trace:virtqueue_alloc_element,trace:virtqueue_fill,trace:virtqueue_flush,trace:virtqueue_pop
+qemu_trace_std=cpu_reset,guest_errors,exec,cpu,trace:virtio*
 # 调试usb的trace
 qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace:usb_xhci_irq_msi,trace:usb_xhci_irq_msix,trace:usb_xhci_port_reset,trace:msix_write_config,trace:usb_xhci_irq_msix,trace:usb_xhci_irq_msix_use,trace:usb_xhci_irq_msix_unuse,trace:usb_xhci_irq_msi,trace:usb_xhci_*
 qemu_accel=kvm
@@ -29,7 +29,7 @@ QEMU_RTC_CLOCK="clock=host,base=localtime"
 QEMU_SERIAL="file:../serial_opt.txt"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 
-QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,model=virtio  -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel}"
+QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -nic user,model=virtio  -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel}"
 
 QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d -monitor ${QEMU_MONITOR} -d ${qemu_trace_std} "
 

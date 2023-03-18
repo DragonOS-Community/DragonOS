@@ -47,7 +47,7 @@ bitflags! {
 
 bitflags! {
     /// The command register in PCI configuration space.
-    pub struct Command: u16 {
+    pub struct CommandRegister: u16 {
         /// The device can respond to I/O Space accesses.
         const IO_SPACE = 1 << 0;
         /// The device can respond to Memory Space accesses.
@@ -311,6 +311,7 @@ impl Default for PciDeviceBar {
 pub fn pci_bar_init(device_function: DeviceFunction) -> Result<PciDeviceBar, PciError> {
     let mut device_bar: PciDeviceBar = PciDeviceBar::default();
     let mut bar_index_ignore: u8 = 255;
+
     for bar_index in 0..6 {
         if bar_index == bar_index_ignore {
             continue;
@@ -435,6 +436,12 @@ pub fn pci_bar_init(device_function: DeviceFunction) -> Result<PciDeviceBar, Pci
             _ => {}
         }
     }
+
+    // 设置command register，使得设备能够使用它的BAR
+    set_command_register(
+        &device_function,
+        CommandRegister::IO_SPACE | CommandRegister::MEMORY_SPACE | CommandRegister::BUS_MASTER,
+    );
     kdebug!("pci_device_bar:{}", device_bar);
     return Ok(device_bar);
 }
@@ -491,5 +498,21 @@ impl Iterator for CapabilityIterator {
             id,
             private_header,
         })
+    }
+}
+
+/// @brief 设置PCI Config Space里面的Command Register
+///
+/// @param device_function 设备
+/// @param value command register要被设置成的值
+pub fn set_command_register(device_function: &DeviceFunction, value: CommandRegister) {
+    unsafe {
+        pci_write_config(
+            device_function.bus,
+            device_function.device,
+            device_function.function,
+            STATUS_COMMAND_OFFSET,
+            value.bits().into(),
+        );
     }
 }

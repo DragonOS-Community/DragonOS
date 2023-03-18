@@ -11,5 +11,6 @@ pub mod semaphore;
 pub mod spinlock;
 pub mod vec_cursor;
 #[macro_use]
-pub mod volatile_io;
+pub mod volatile;
 pub mod wait_queue;
+

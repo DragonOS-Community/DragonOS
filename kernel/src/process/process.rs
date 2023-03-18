@@ -9,7 +9,8 @@ use crate::{
     arch::asm::current::current_pcb,
     filesystem::vfs::file::{File, FileDescriptorVec},
     include::bindings::bindings::{
-        process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_RUNNING, PROC_STOPPED,
+        process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_INTERRUPTIBLE,
+        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
     },
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
@@ -252,6 +253,22 @@ impl process_control_block {
         r.fds[fd as usize] = None;
 
         return Ok(());
+    }
+
+    /// @brief 标记当前pcb已经由其他机制进行管理，调度器将不会将他加入队列(且进程可以被信号打断)
+    /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数。
+    ///
+    /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
+    pub unsafe fn mark_sleep_interruptible(&mut self){
+        self.state = PROC_INTERRUPTIBLE as u64;
+    }
+
+    /// @brief 标记当前pcb已经由其他机制进行管理，调度器将不会将他加入队列(且进程不可以被信号打断)
+    /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数
+    ///
+    /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
+    pub unsafe fn mark_sleep_uninterruptible(&mut self){
+        self.state = PROC_UNINTERRUPTIBLE as u64;
     }
 }
 

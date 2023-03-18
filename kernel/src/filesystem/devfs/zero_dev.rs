@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::make_rawdev;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
@@ -72,7 +73,7 @@ impl IndexNode for LockedZeroInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
         Err(-(ENOTSUP as i32))
     }
 

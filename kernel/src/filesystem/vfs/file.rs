@@ -9,7 +9,7 @@ use crate::{
         process_control_block, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
     },
     io::SeekFrom,
-    kerror,
+    kerror, driver::tty::TtyFilePrivateData,
 };
 
 use super::{Dirent, FileType, IndexNode, Metadata};
@@ -17,9 +17,11 @@ use super::{Dirent, FileType, IndexNode, Metadata};
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 pub enum FilePrivateData {
-    // procfs文件私有信息
+    /// procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
-    // 不需要文件私有信息
+    /// Tty设备的私有信息
+    Tty(TtyFilePrivateData),
+    /// 不需要文件私有信息
     Unused,
 }
 
@@ -107,7 +109,7 @@ impl File {
             private_data: FilePrivateData::default(),
         };
         // kdebug!("inode:{:?}",f.inode);
-        f.inode.open(&mut f.private_data)?;
+        f.inode.open(&mut f.private_data, &mode)?;
         return Ok(f);
     }
 

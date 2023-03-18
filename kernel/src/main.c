@@ -28,7 +28,6 @@
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
 #include "driver/pci/pci.h"
-#include "driver/tty/tty.h"
 #include <driver/timers/HPET/HPET.h>
 #include <driver/uart/uart.h>
 #include <driver/usb/usb.h>

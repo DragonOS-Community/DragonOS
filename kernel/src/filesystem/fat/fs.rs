@@ -10,7 +10,7 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{
-        core::generate_inode_id, file::FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+        core::generate_inode_id, file::{FilePrivateData, FileMode}, FileSystem, FileType, IndexNode, InodeId,
         Metadata, PollStatus,
     },
     include::bindings::bindings::{
@@ -1506,7 +1506,7 @@ impl IndexNode for LockedFATInode {
         return Ok(target);
     }
 
-    fn open(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
         return Ok(());
     }
 

@@ -4,7 +4,7 @@ pub mod zero_dev;
 
 use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
-    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
+    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus, file::FileMode,
 };
 use crate::{
     include::bindings::bindings::{EEXIST, EISDIR, ENOENT, ENOTDIR, ENOTSUP},
@@ -322,7 +322,7 @@ impl IndexNode for LockedDevFSInode {
         self
     }
 
-    fn open(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), i32> {
+    fn open(&self, _data: &mut super::vfs::FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
         return Ok(());
     }
 

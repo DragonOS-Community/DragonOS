@@ -99,10 +99,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
 
-    loop {
-        use crate::libs::keyboard_parser::keyboard_get_keycode;
-        kdebug!("code = {:?}", keyboard_get_keycode());
-    };
 
     return 0;
 }

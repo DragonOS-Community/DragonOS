@@ -97,7 +97,8 @@ impl DevFS {
     /// @param device 设备节点的结构体
     pub fn register_device<T: DeviceINode>(&self, name: &str, device: Arc<T>) -> Result<(), i32> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
-        match device.metadata().unwrap().file_type {
+        let metadata = device.metadata()?;
+        match metadata.file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
                 if let Err(_) = dev_root_inode.find("char") {
@@ -109,8 +110,13 @@ impl DevFS {
                     .as_any_ref()
                     .downcast_ref::<LockedDevFSInode>()
                     .unwrap();
-
+                // 在 /dev/char 下创建设备节点
                 dev_char_inode.add_dev(name, device.clone())?;
+
+                // 特殊处理 tty 设备，挂载在 /dev 下
+                if name.starts_with("tty") && name.len() > 3 {
+                    dev_root_inode.add_dev(name, device.clone())?;
+                }
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
             FileType::BlockDevice => {
@@ -460,6 +466,7 @@ impl IndexNode for LockedDevFSInode {
         _buf: &mut [u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, i32> {
+        kerror!("DevFS: read_at is not supported!");    
         Err(-(ENOTSUP as i32))
     }
 

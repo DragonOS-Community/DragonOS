@@ -1,4 +1,4 @@
-use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
 
 #[repr(i32)]
 #[derive(Debug, FromPrimitive)]
@@ -166,4 +166,16 @@ pub enum SystemError {
     EWOULDBLOCK = 80,
     /// 跨设备连接 Cross-device link.
     EXDEV = 81,
+}
+
+impl SystemError{
+    /// @brief 把posix错误码转换为系统错误枚举类型。
+    /// 本函数作为一个临时方案，后续会把所有的错误码都转换为系统错误枚举类型。
+    pub fn from_posix_errno(errno: i32) -> Option<SystemError>{
+        // posix 错误码是小于0的
+        if errno >=0{
+            return None;
+        }
+        <Self as FromPrimitive>::from_i32(errno)
+    }
 }

@@ -40,6 +40,7 @@ extern crate bitflags;
 #[macro_use]
 extern crate lazy_static;
 extern crate num;
+#[macro_use]
 extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
@@ -96,6 +97,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-
+    driver::tty::tty_device::tty_init().expect("tty_init() failed");
     return 0;
 }

@@ -9,7 +9,7 @@ use crate::{
         process_control_block, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
     },
     io::SeekFrom,
-    kerror, driver::tty::TtyFilePrivateData,
+    kerror, driver::tty::TtyFilePrivateData, kdebug,
 };
 
 use super::{Dirent, FileType, IndexNode, Metadata};
@@ -127,7 +127,6 @@ impl File {
         if buf.len() < len {
             return Err(-(ENOBUFS as i32));
         }
-
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;

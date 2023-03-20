@@ -59,6 +59,7 @@ struct TtyCore {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum TtyError {
     /// 缓冲区满,返回成功传送的字节数
     BufferFull(usize),

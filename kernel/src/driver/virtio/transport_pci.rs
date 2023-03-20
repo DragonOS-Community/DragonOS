@@ -73,7 +73,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 /// PCI transport for VirtIO.
 ///
 /// Ref: 4.1 Virtio Over PCI Bus
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.

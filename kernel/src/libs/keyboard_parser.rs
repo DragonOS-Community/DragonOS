@@ -12,8 +12,8 @@ pub const MAP_COLS: u8 = 2;
 pub enum KeyFlag {
     NoneFlag = 0 as u8,
     PauseBreak = 1 as u8,
-    PrintScreenUp = 2 as u8,
-    PrintScreenDown = 4 as u8,
+    PrintScreenPress = 2 as u8,
+    PrintScreenRelease = 4 as u8,
     OtherKey = 8 as u8, // 除了上面两个按键以外的功能按键（不包括下面的第三类按键）
 }
 
@@ -195,8 +195,8 @@ pub fn keyboard_get_keycode() -> Result<(u8, KeyFlag), SystemError> {
                 // print screen 按键被按下
                 if let Ok(0xe0) = keyboard_get_scancode() {
                     if let Ok(0x37) = keyboard_get_scancode() {
-                        key = KeyFlag::PrintScreenUp;
-                        // flag_make = true;
+                        key = KeyFlag::PrintScreenPress;
+                        // flag_make = Release;
                     }
                 }
             }
@@ -205,7 +205,7 @@ pub fn keyboard_get_keycode() -> Result<(u8, KeyFlag), SystemError> {
                 // print screen 按键被松开
                 if let Ok(0xe0) = keyboard_get_scancode() {
                     if let Ok(0xaa) = keyboard_get_scancode() {
-                        key = KeyFlag::PrintScreenDown;
+                        key = KeyFlag::PrintScreenRelease;
                         // flag_make = false;
                     }
                 }

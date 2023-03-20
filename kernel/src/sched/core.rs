@@ -11,7 +11,6 @@ use crate::{
         process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
         SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
-    kdebug,
     process::process::process_cpu,
 };
 
@@ -63,10 +62,6 @@ pub fn load_balance(pcb: &mut process_control_block) {
         // sched_migrate_process(pcb, min_loads_cpu_id as usize);
         pcb.flags |= PF_NEED_MIGRATE as u64;
         pcb.migrate_to = min_loads_cpu_id;
-        // TODO 此处将打印pcb注释单独取消，会报错，同时取消两行的话，不会报错
-        // kdebug!("set migrating, pcb:");
-        // kdebug!("set migrating, pcb:{:?}", pcb);
-        // kdebug!("pcb {},migrate to {}", pcb.pid, min_loads_cpu_id);
 
     }
 }
@@ -119,7 +114,7 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut res
 
     // 除了IDLE以外的进程，都进行负载均衡
     // >0 时采用计算
-    if pcb.pid > 3 {
+    if pcb.pid > 0 {
         load_balance(pcb);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

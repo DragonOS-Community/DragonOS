@@ -46,7 +46,7 @@ bitflags! {
 
 bitflags! {
     /// The command register in PCI configuration space.
-    pub struct Command: u16 {
+    pub struct CommandRegister: u16 {
         /// The device can respond to I/O Space accesses.
         const IO_SPACE = 1 << 0;
         /// The device can respond to Memory Space accesses.
@@ -131,9 +131,10 @@ impl Display for PciError {
 impl DeviceFunction {
     /// Returns whether the device and function numbers are valid, i.e. the device is between 0 and
     /// 31, and the function is between 0 and 7.
-    ///@brief 检测DeviceFunction实例是否有效
-    ///@param self
-    ///@return bool 是否有效
+    /// @brief 检测DeviceFunction实例是否有效
+    /// @param self
+    /// @return bool 是否有效
+    #[allow(dead_code)]
     pub fn valid(&self) -> bool {
         self.device < 32 && self.function < 8
     }
@@ -449,6 +450,7 @@ pub struct CapabilityInfo {
     /// The third and fourth bytes of the capability, to save reading them again.
     pub private_header: u16,
 }
+
 /// Iterator over capabilities for a device.
 /// 创建迭代器以遍历PCI设备的capability
 #[derive(Debug)]
@@ -491,4 +493,29 @@ impl Iterator for CapabilityIterator {
             private_header,
         })
     }
+}
+
+/// @brief 设置PCI Config Space里面的Command Register
+///
+/// @param device_function 设备
+/// @param value command register要被设置成的值
+pub fn set_command_register(device_function: &DeviceFunction, value: CommandRegister) {
+    unsafe {
+        pci_write_config(
+            device_function.bus,
+            device_function.device,
+            device_function.function,
+            STATUS_COMMAND_OFFSET,
+            value.bits().into(),
+        );
+    }
+}
+/// @brief 使能对PCI Memory/IO空间的写入，使能PCI设备作为主设备(主动进行Memory的写入等，msix中断使用到)
+///
+/// @param device_function 设备
+pub fn pci_enable_master(device_function: DeviceFunction) {
+    set_command_register(
+        &device_function,
+        CommandRegister::IO_SPACE | CommandRegister::MEMORY_SPACE | CommandRegister::BUS_MASTER,
+    );
 }

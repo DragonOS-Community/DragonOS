@@ -10,14 +10,15 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{
-        core::generate_inode_id, file::{FilePrivateData, FileMode}, FileSystem, FileType, IndexNode, InodeId,
-        Metadata, PollStatus,
+        core::generate_inode_id,
+        file::{FileMode, FilePrivateData},
+        FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
     include::bindings::bindings::{
         EFAULT, EINVAL, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM, EROFS,
     },
     io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
-    kdebug, kerror,
+    kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
@@ -1539,7 +1540,6 @@ impl IndexNode for LockedFATInode {
         let r = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
         drop(target_guard);
         return r;
-        
     }
 
     fn rmdir(&self, name: &str) -> Result<(), i32> {

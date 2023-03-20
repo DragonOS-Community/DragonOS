@@ -4,11 +4,12 @@ pub mod zero_dev;
 
 use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
-    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus, file::FileMode,
+    file::FileMode,
+    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
 };
 use crate::{
     include::bindings::bindings::{EEXIST, EISDIR, ENOENT, ENOTDIR, ENOTSUP},
-    kdebug, kerror,
+    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
@@ -231,7 +232,7 @@ impl DevFSInode {
 
 impl LockedDevFSInode {
     pub fn add_dir(&self, name: &str) -> Result<(), i32> {
-        let guard:SpinLockGuard<DevFSInode> = self.0.lock();
+        let guard: SpinLockGuard<DevFSInode> = self.0.lock();
 
         if guard.children.contains_key(name) {
             return Err(-(EEXIST as i32));
@@ -270,10 +271,14 @@ impl LockedDevFSInode {
         return Ok(());
     }
 
-    fn do_create_with_data(&self, mut guard: SpinLockGuard<DevFSInode>,_name: &str,
+    fn do_create_with_data(
+        &self,
+        mut guard: SpinLockGuard<DevFSInode>,
+        _name: &str,
         _file_type: FileType,
         _mode: u32,
-        _data: usize,) -> Result<Arc<dyn IndexNode>, i32>{
+        _data: usize,
+    ) -> Result<Arc<dyn IndexNode>, i32> {
         if guard.metadata.file_type != FileType::Dir {
             return Err(-(ENOTDIR as i32));
         }
@@ -313,7 +318,6 @@ impl LockedDevFSInode {
         // 将子inode插入父inode的B树中
         guard.children.insert(String::from(_name), result.clone());
         return Ok(result);
-
     }
 }
 
@@ -329,7 +333,7 @@ impl IndexNode for LockedDevFSInode {
     fn close(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), i32> {
         return Ok(());
     }
-    
+
     fn create_with_data(
         &self,
         name: &str,
@@ -338,7 +342,7 @@ impl IndexNode for LockedDevFSInode {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, i32> {
         // 获取当前inode
-        let guard:SpinLockGuard<DevFSInode> = self.0.lock();
+        let guard: SpinLockGuard<DevFSInode> = self.0.lock();
         // 如果当前inode不是文件夹，则返回
         return self.do_create_with_data(guard, name, file_type, mode, data);
     }

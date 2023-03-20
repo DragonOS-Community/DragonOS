@@ -1,6 +1,5 @@
+use alloc::string::String;
 use smoltcp::wire::EthernetAddress;
-
-use crate::syscall::SystemError;
 
 use super::Driver;
 
@@ -10,5 +9,10 @@ pub trait NetDriver: Driver {
     /// @brief 获取网卡的MAC地址
     fn mac(&self) -> EthernetAddress;
 
-    fn send(&self, data:&[u8])->Result<usize,SystemError>;
+    fn name(&self) -> String {
+        return format!("eth{}", self.nic_id());
+    }
+
+    /// @brief 获取网卡的id
+    fn nic_id(&self) -> usize;
 }

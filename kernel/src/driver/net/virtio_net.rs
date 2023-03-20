@@ -6,14 +6,14 @@ use smoltcp::phy;
 use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use crate::{
-    driver::{virtio::virtio_impl::HalImpl, Driver},
-    kdebug, kerror,
+    driver::{generate_nic_id, virtio::virtio_impl::HalImpl, Driver, NET_DRIVERS},
+    kdebug, kerror, kinfo,
     libs::rwlock::RwLock,
-    syscall::SystemError,
 };
 
 use super::NetDriver;
 
+/// @brief Virtio网络设备驱动(加锁)
 pub struct VirtioNICDriver<T: Transport> {
     inner: RwLock<InnerVirtIONet<T>>,
 }
@@ -23,6 +23,7 @@ impl<T: Transport> VirtioNICDriver<T> {
         let inner = RwLock::new(InnerVirtIONet {
             virtio_net: driver_net,
             self_ref: Weak::new(),
+            netface_id: generate_nic_id(),
         });
         let result: Arc<VirtioNICDriver<T>> = Arc::new(Self { inner });
         result.inner.write().self_ref = Arc::downgrade(&result);
@@ -30,9 +31,14 @@ impl<T: Transport> VirtioNICDriver<T> {
     }
 }
 
+/// @brief Virtio网络设备驱动(不加锁, 仅供内部使用)
 struct InnerVirtIONet<T: Transport> {
+    /// Virtio网络设备
     virtio_net: VirtIONet<HalImpl, T>,
+    /// 自引用
     self_ref: Weak<VirtioNICDriver<T>>,
+    /// 网卡ID
+    netface_id: usize,
 }
 
 pub struct VirtioNetToken<T: Transport> {
@@ -124,10 +130,9 @@ impl<T: Transport> phy::RxToken for VirtioNetToken<T> {
 }
 
 /// @brief virtio-net 驱动的初始化与测试
-pub fn virtio_net<T: Transport>(transport: T) {
+pub fn virtio_net<T: Transport + 'static>(transport: T) {
     let driver_net: VirtIONet<HalImpl, T> = match VirtIONet::<HalImpl, T>::new(transport) {
         Ok(net) => {
-            kdebug!("Virtio-net driver init successfully.");
             net
         }
         Err(_) => {
@@ -135,21 +140,28 @@ pub fn virtio_net<T: Transport>(transport: T) {
             return;
         }
     };
-    let mac = driver_net.mac();
-    kdebug!("virtio_net MAC={:?}", mac);
+    let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac());
     let driver: Arc<VirtioNICDriver<T>> = VirtioNICDriver::new(driver_net);
-
-    kdebug!("virtio-net test finished");
+    let nic_id = driver.inner.read().netface_id;
+    // 将网卡驱动注册到网卡驱动列表中
+    NET_DRIVERS.write().insert(nic_id, driver.clone());
+    kinfo!(
+        "Virtio-net driver init successfully!\tNetface: [{}], MAC: [{}]",
+        driver.name(),
+        mac
+    );
 }
 
 impl<T: Transport> Driver for VirtioNICDriver<T> {}
 impl<T: Transport> NetDriver for VirtioNICDriver<T> {
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
-        todo!()
+        let mac: [u8; 6] = self.inner.read().virtio_net.mac();
+        return smoltcp::wire::EthernetAddress::from_bytes(&mac);
     }
 
-    fn send(&self, _data: &[u8]) -> Result<usize, SystemError> {
-        todo!()
+    #[inline]
+    fn nic_id(&self) -> usize {
+        return self.inner.read().netface_id;
     }
 }
 

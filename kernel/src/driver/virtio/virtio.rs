@@ -41,7 +41,7 @@ fn virtio_probe() {
 }
 
 ///@brief 为virtio设备寻找对应的驱动进行初始化
-fn virtio_device(transport: impl Transport+Clone) {
+fn virtio_device(transport: impl Transport + Clone + 'static) {
     match transport.device_type() {
         DeviceType::Block => {
             kwarn!("Not support virtio_block device for now");

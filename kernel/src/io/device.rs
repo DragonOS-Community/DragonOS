@@ -45,6 +45,7 @@ pub trait Device: Any + Send + Sync + Debug {
     fn sync(&self) -> Result<(), i32>;
 
     // TODO: 待实现 open, close
+
 }
 
 /// @brief 块设备应该实现的操作

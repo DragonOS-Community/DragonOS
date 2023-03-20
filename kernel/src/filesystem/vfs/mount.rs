@@ -10,7 +10,7 @@ use crate::{
     libs::spinlock::SpinLock,
 };
 
-use super::{FilePrivateData, FileSystem, FileType, IndexNode, InodeId};
+use super::{FilePrivateData, FileSystem, FileType, IndexNode, InodeId, file::FileMode};
 
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
@@ -126,8 +126,8 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
-    fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
-        return self.inner_inode.open(data);
+    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), i32> {
+        return self.inner_inode.open(data, mode);
     }
 
     fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {

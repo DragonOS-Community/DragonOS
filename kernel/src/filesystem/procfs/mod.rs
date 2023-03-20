@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::vfs::{
-    file::FilePrivateData, FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
+    file::{FilePrivateData, FileMode}, FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
 };
 
 /// @brief 进程文件类型
@@ -319,7 +319,7 @@ impl ProcFS {
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn open(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 

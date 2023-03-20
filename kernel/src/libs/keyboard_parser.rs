@@ -1,5 +1,6 @@
 use crate::filesystem::vfs::ROOT_INODE;
 use crate::kdebug;
+use crate::syscall::SystemError;
 use crate::{driver::keyboard, filesystem, kerror, libs::rwlock::RwLock};
 use lazy_static::lazy_static;
 
@@ -168,19 +169,12 @@ const KEY_CODE_MAPTABLE: [u8; 256] = [
 ///     ch 如果是功能符，返回 255
 ///        如果是可显示字符，则返回 按下/抬起 的字符的ASCII码
 ///     key_flag key的类型，目前只有printScreen和pausebreak两个功能键，其他都是otherkey
-pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
+pub fn keyboard_get_keycode() -> Result<(u8, KeyFlag), SystemError> {
     let mut ch: u8 = u8::MAX;
     let mut key = KeyFlag::NoneFlag;
-    let mut flag_make; // 按下/抬起
-    let c = keyboard_get_scancode();
+    let flag_make; // 按下/抬起
+    let c = keyboard_get_scancode()?;
 
-    // 循环队列为空
-    if c.is_err() {
-        kdebug!("keyboard find error.");
-        return (0, KeyFlag::NoneFlag);
-    }
-
-    let c: i32 = c.unwrap();
     let mut scancode = c as u8;
 
     if scancode == 0xE1 {
@@ -188,38 +182,31 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
         key = KeyFlag::PauseBreak;
         // 清除缓冲区中剩下的扫描码
         for i in 1..6 {
-            if keyboard_get_scancode() != Ok(PAUSE_BREAK_SCAN_CODE[i] as i32) {
+            if keyboard_get_scancode()? != PAUSE_BREAK_SCAN_CODE[i] as i32 {
                 break;
             }
         }
     } else if scancode == 0xE0 {
         // 功能键, 有多个扫描码
-        scancode = match keyboard_get_scancode() {
-            // 获取下一个扫描码
-            Err(_) => {
-                kerror!("keyboard_get_scancode error.");
-                return (0, KeyFlag::NoneFlag);
-            }
-            Ok(code) => code as u8,
-        };
+        scancode = keyboard_get_scancode()? as u8;
 
         match scancode {
             0x2a => {
                 // print screen 按键被按下
-                if Ok(0xe0) == keyboard_get_scancode() {
-                    if Ok(0x37) == keyboard_get_scancode() {
+                if let Ok(0xe0) = keyboard_get_scancode() {
+                    if let Ok(0x37) = keyboard_get_scancode() {
                         key = KeyFlag::PrintScreenUp;
-                        flag_make = true;
+                        // flag_make = true;
                     }
                 }
             }
 
             0xb7 => {
                 // print screen 按键被松开
-                if keyboard_get_scancode() == Ok(0xe0) {
-                    if keyboard_get_scancode() == Ok(0xaa) {
+                if let Ok(0xe0) = keyboard_get_scancode() {
+                    if let Ok(0xaa) = keyboard_get_scancode() {
                         key = KeyFlag::PrintScreenDown;
-                        flag_make = false;
+                        // flag_make = false;
                     }
                 }
             }
@@ -227,124 +214,124 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
                 // 按下右边的ctrl
                 SCAN_CODE_STATUS.write().ctrl_r = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0x9d => {
                 // 松开右边的ctrl
                 SCAN_CODE_STATUS.write().ctrl_r = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x38 => {
                 // 按下右边的alt
                 SCAN_CODE_STATUS.write().alt_r = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xb8 => {
                 // 松开右边的alt
                 SCAN_CODE_STATUS.write().alt_r = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x5b => {
                 SCAN_CODE_STATUS.write().gui_l = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xdb => {
                 SCAN_CODE_STATUS.write().gui_l = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x5c => {
                 SCAN_CODE_STATUS.write().gui_r = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xdc => {
                 SCAN_CODE_STATUS.write().gui_r = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x5d => {
                 SCAN_CODE_STATUS.write().apps = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xdd => {
                 SCAN_CODE_STATUS.write().apps = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x52 => {
                 SCAN_CODE_STATUS.write().insert = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xd2 => {
                 SCAN_CODE_STATUS.write().insert = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x47 => {
                 SCAN_CODE_STATUS.write().home = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xc7 => {
                 SCAN_CODE_STATUS.write().home = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x49 => {
                 SCAN_CODE_STATUS.write().pgup = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xc9 => {
                 SCAN_CODE_STATUS.write().pgup = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x53 => {
                 SCAN_CODE_STATUS.write().del = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xd3 => {
                 SCAN_CODE_STATUS.write().del = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x4f => {
                 SCAN_CODE_STATUS.write().end = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xcf => {
                 SCAN_CODE_STATUS.write().end = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x51 => {
                 SCAN_CODE_STATUS.write().pgdn = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xd1 => {
                 SCAN_CODE_STATUS.write().pgdn = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x48 => {
                 SCAN_CODE_STATUS.write().arrow_u = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xc8 => {
                 SCAN_CODE_STATUS.write().arrow_u = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
                 ch = 0xc8;
                 // return (0, 0xc8);
@@ -352,33 +339,33 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
             0x4b => {
                 SCAN_CODE_STATUS.write().arrow_l = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xcb => {
                 SCAN_CODE_STATUS.write().arrow_l = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x50 => {
                 SCAN_CODE_STATUS.write().arrow_d = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
                 ch = 0x50;
                 // return (0, 0x50);
             }
             0xd0 => {
                 SCAN_CODE_STATUS.write().arrow_d = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x4d => {
                 SCAN_CODE_STATUS.write().arrow_r = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
             }
             0xcd => {
                 SCAN_CODE_STATUS.write().arrow_r = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
 
@@ -386,23 +373,23 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
                 // 数字小键盘的 / 符号
                 SCAN_CODE_STATUS.write().kp_forward_slash = true;
                 key = KeyFlag::OtherKey;
-                flag_make = true;
+                // flag_make = true;
                 ch = '/' as u8;
             }
             0xb5 => {
                 SCAN_CODE_STATUS.write().kp_forward_slash = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
             0x1c => {
                 SCAN_CODE_STATUS.write().kp_enter = true;
                 ch = '\n' as u8;
-                flag_make = true;
+                // flag_make = true;
                 key = KeyFlag::OtherKey;
             }
             0x9c => {
                 SCAN_CODE_STATUS.write().kp_enter = false;
-                flag_make = false;
+                // flag_make = false;
                 key = KeyFlag::OtherKey;
             }
 
@@ -459,17 +446,17 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
         }
     }
 
-    return (ch, key);
+    return Ok((ch, key));
 }
 
 /// @brief 从键盘设备文件中获取键盘扫描码
-fn keyboard_get_scancode() -> Result<i32, i32> {
+fn keyboard_get_scancode() -> Result<i32, SystemError> {
     // 如果后面对性能有要求，可以把这个inode存下来当作static变量
     let keyboard = ROOT_INODE().lookup("/dev/char/ps2_keyboard");
 
     if keyboard.is_err() {
         kerror!("Failed in finding ps2_keyboard ");
-        return Err(-1);
+        return Err(SystemError::ENXIO);
     }
 
     let keyboard = keyboard.unwrap();
@@ -485,6 +472,7 @@ fn keyboard_get_scancode() -> Result<i32, i32> {
         .is_err()
     {
         kerror!("Read Ps2_keyboard Error");
+        return Err(SystemError::EIO);
     }
     return Ok(buf[0] as i32);
 }

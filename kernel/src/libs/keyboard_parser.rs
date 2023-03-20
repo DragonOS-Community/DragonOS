@@ -1,5 +1,6 @@
 use crate::filesystem::vfs::ROOT_INODE;
 use crate::kdebug;
+use crate::syscall::SystemError;
 use crate::{driver::keyboard, filesystem, kerror, libs::rwlock::RwLock};
 use lazy_static::lazy_static;
 
@@ -167,19 +168,12 @@ const KEY_CODE_MAPTABLE: [u8; 256] = [
 ///     ch 如果是功能符，返回 255
 ///        如果是可显示字符，则返回 按下/抬起 的字符的ASCII码
 ///     key_flag key的类型，目前只有printScreen和pausebreak两个功能键，其他都是otherkey
-pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
+pub fn keyboard_get_keycode() -> Result<(u8, KeyFlag), SystemError> {
     let mut key = KeyFlag::NoneFlag;
     let mut ch: u8 = u8::MAX;
     let mut flag_make; // 按下/抬起
-    let c = keyboard_get_scancode();
+    let c = keyboard_get_scancode()?;
 
-    // 循环队列为空
-    if c.is_err() {
-        kdebug!("keyboard find error.");
-        return (0, KeyFlag::NoneFlag);
-    }
-
-    let c: i32 = c.unwrap();
     let mut scancode = c as u8;
 
     if scancode == 0xE1 {
@@ -187,26 +181,19 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
         key = KeyFlag::PauseBreak;
         // 清除缓冲区中剩下的扫描码
         for i in 1..6 {
-            if keyboard_get_scancode() != Ok(PAUSE_BREAK_SCAN_CODE[i] as i32) {
+            if keyboard_get_scancode()? != PAUSE_BREAK_SCAN_CODE[i] as i32 {
                 break;
             }
         }
     } else if scancode == 0xE0 {
         // 功能键, 有多个扫描码
-        scancode = match keyboard_get_scancode() {
-            // 获取下一个扫描码
-            Err(_) => {
-                kerror!("keyboard_get_scancode error.");
-                return (0, KeyFlag::NoneFlag);
-            }
-            Ok(code) => code as u8,
-        };
+        scancode = keyboard_get_scancode()? as u8;
 
         match scancode {
             0x2a => {
                 // print screen 按键被按下
-                if Ok(0xe0) == keyboard_get_scancode() {
-                    if Ok(0x37) == keyboard_get_scancode() {
+                if 0xe0 == keyboard_get_scancode()? {
+                    if 0x37 == keyboard_get_scancode()? {
                         key = KeyFlag::PrintScreen;
                         flag_make = true;
                     }
@@ -215,8 +202,8 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
 
             0xb7 => {
                 // print screen 按键被松开
-                if keyboard_get_scancode() == Ok(0xe0) {
-                    if keyboard_get_scancode() == Ok(0xaa) {
+                if keyboard_get_scancode()? == 0xe0 {
+                    if keyboard_get_scancode()? == 0xaa {
                         key = KeyFlag::PrintScreen;
                         flag_make = false;
                     }
@@ -424,17 +411,17 @@ pub fn keyboard_get_keycode() -> (u8, KeyFlag) {
         }
     }
 
-    return (ch, key);
+    return Ok((ch, key));
 }
 
 /// @brief 从键盘设备文件中获取键盘扫描码
-fn keyboard_get_scancode() -> Result<i32, i32> {
+fn keyboard_get_scancode() -> Result<i32, SystemError> {
     // 如果后面对性能有要求，可以把这个inode存下来当作static变量
     let keyboard = ROOT_INODE().lookup("/dev/char/ps2_keyboard");
 
     if keyboard.is_err() {
         kerror!("Failed in finding ps2_keyboard ");
-        return Err(-1);
+        return Err(SystemError::ENXIO);
     }
 
     let keyboard = keyboard.unwrap();
@@ -450,6 +437,7 @@ fn keyboard_get_scancode() -> Result<i32, i32> {
         .is_err()
     {
         kerror!("Read Ps2_keyboard Error");
+        return Err(SystemError::EIO);
     }
     return Ok(buf[0] as i32);
 }

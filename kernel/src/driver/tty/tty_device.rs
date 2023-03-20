@@ -2,7 +2,6 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
-use num_traits::FromPrimitive;
 
 use crate::{
     filesystem::{
@@ -10,7 +9,7 @@ use crate::{
         vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
     },
     include::bindings::bindings::{ECONNABORTED, EINVAL, EIO, ENOTSUP, EPERM},
-    kerror,
+    kdebug, kerror,
     libs::rwlock::RwLock,
     print,
     syscall::SystemError,
@@ -69,10 +68,8 @@ impl TtyDevice {
     }
 
     /// @brief 检查TTY文件的读写参数是否合法
-    pub fn check_rw_param(&self, offset: usize, len: usize, buf: &[u8]) -> Result<(), i32> {
-        if offset != 0 {
-            return Err(-(EINVAL as i32));
-        }
+    #[inline]
+    pub fn check_rw_param(&self, len: usize, buf: &[u8]) -> Result<(), i32> {
         if len > buf.len() {
             return Err(-(EINVAL as i32));
         }
@@ -87,15 +84,40 @@ impl DeviceINode for TtyDevice {
 }
 
 impl IndexNode for TtyDevice {
+    /// @brief 打开TTY设备
+    ///
+    /// @param data 文件私有信息
+    /// @param mode 打开模式
+    ///
+    /// TTY设备通过mode来确定这个文件到底是stdin/stdout/stderr
+    /// - mode的值为O_RDONLY时，表示这个文件是stdin
+    /// - mode的值为O_WRONLY时，表示这个文件是stdout
+    /// - mode的值为O_WRONLY | O_SYNC时，表示这个文件是stderr
     fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), i32> {
-        let p = TtyFilePrivateData::default();
+        let mut p = TtyFilePrivateData::default();
+
+        // 检查打开模式
+        let accmode = mode.accmode();
+        if accmode == FileMode::O_RDONLY.accmode() {
+            p.flags.insert(TtyFileFlag::STDIN);
+        } else if accmode == FileMode::O_WRONLY.accmode() {
+            if mode.contains(FileMode::O_SYNC) {
+                p.flags.insert(TtyFileFlag::STDERR);
+            } else {
+                p.flags.insert(TtyFileFlag::STDOUT);
+            }
+        } else {
+            return Err(-(EINVAL as i32));
+        }
+
+        // 保存文件私有信息
         *data = FilePrivateData::Tty(p);
         return Ok(());
     }
 
     fn read_at(
         &self,
-        offset: usize,
+        _offset: usize,
         len: usize,
         buf: &mut [u8],
         data: &mut crate::filesystem::vfs::FilePrivateData,
@@ -107,7 +129,7 @@ impl IndexNode for TtyDevice {
                 return Err(e);
             }
         };
-        self.check_rw_param(offset, len, buf)?;
+        self.check_rw_param(len, buf)?;
 
         // 读取stdin队列
         let r: Result<usize, TtyError> = self.core.read_stdin(&mut buf[0..len], true);
@@ -127,7 +149,7 @@ impl IndexNode for TtyDevice {
 
     fn write_at(
         &self,
-        offset: usize,
+        _offset: usize,
         len: usize,
         buf: &[u8],
         data: &mut crate::filesystem::vfs::FilePrivateData,
@@ -140,7 +162,7 @@ impl IndexNode for TtyDevice {
             }
         };
 
-        self.check_rw_param(offset, len, buf)?;
+        self.check_rw_param(len, buf)?;
 
         // 根据当前文件是stdout还是stderr,选择不同的发送方式
         let r: Result<usize, TtyError> = if data.flags.contains(TtyFileFlag::STDOUT) {
@@ -202,7 +224,7 @@ impl IndexNode for TtyDevice {
                 }
                 _ => return Err(SystemError::EIO),
             }
-
+            
             if len == 0 {
                 break;
             }
@@ -223,6 +245,17 @@ impl TtyDevicePrivateData {
             name: name.to_string(),
             metadata,
         });
+    }
+}
+
+/// @brief 导出到C的tty初始化函数
+#[no_mangle]
+pub extern "C" fn rs_tty_init() -> i32 {
+    let r = tty_init();
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
     }
 }
 

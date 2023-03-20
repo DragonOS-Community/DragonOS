@@ -36,6 +36,8 @@
 
 #include <driver/interrupt/apic/apic_timer.h>
 
+extern int rs_tty_init();
+
 ul bsp_idt_size, bsp_gdt_size;
 
 #pragma GCC push_options
@@ -135,7 +137,8 @@ void system_initialize()
     io_mfence();
 
     vfs_init();
-
+    rs_tty_init();
+    
     cpu_init();
     ps2_keyboard_init();
     // tty_init();

@@ -7,13 +7,17 @@ use alloc::boxed::Box;
 
 use crate::{
     arch::asm::current::current_pcb,
-    filesystem::vfs::file::{File, FileDescriptorVec},
+    filesystem::vfs::{
+        file::{File, FileDescriptorVec, FileMode},
+        ROOT_INODE,
+    },
     include::bindings::bindings::{
         process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_INTERRUPTIBLE,
         PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
     },
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
+    syscall::SystemError,
 };
 
 use super::preempt::{preempt_disable, preempt_enable};
@@ -259,7 +263,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数。
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_interruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_interruptible(&mut self) {
         self.state = PROC_INTERRUPTIBLE as u64;
     }
 
@@ -267,7 +272,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_uninterruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_uninterruptible(&mut self) {
         self.state = PROC_UNINTERRUPTIBLE as u64;
     }
 }
@@ -318,4 +324,37 @@ pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) ->
     }
 }
 
+#[no_mangle]
+pub extern "C" fn rs_init_stdio() -> i32 {
+    let r = init_stdio();
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
+    }
+}
 // =========== 以上为导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们 END ============
+
+/// @brief 初始化pid=1的进程的stdio
+pub fn init_stdio() -> Result<(), SystemError> {
+    if current_pcb().pid != 1 {
+        return Err(SystemError::EPERM);
+    }
+    let tty_inode = ROOT_INODE()
+        .lookup("/dev/tty0")
+        .expect("Init stdio: can't find tty0");
+    let stdin =
+        File::new(tty_inode.clone(), FileMode::O_RDONLY).expect("Init stdio: can't create stdin");
+    let stdout =
+        File::new(tty_inode.clone(), FileMode::O_WRONLY).expect("Init stdio: can't create stdout");
+    let stderr = File::new(tty_inode.clone(), FileMode::O_WRONLY | FileMode::O_SYNC)
+        .expect("Init stdio: can't create stderr");
+
+    /*
+        按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
+     */
+    assert_eq!(current_pcb().alloc_fd(stdin).unwrap(), 0);
+    assert_eq!(current_pcb().alloc_fd(stdout).unwrap(), 1);
+    assert_eq!(current_pcb().alloc_fd(stderr).unwrap(), 2);
+    return Ok(());
+}

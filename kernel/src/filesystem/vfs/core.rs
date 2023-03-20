@@ -18,7 +18,7 @@ use crate::{
     },
     include::bindings::bindings::{EBADF, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM, PAGE_4K_SIZE},
     io::SeekFrom,
-    kerror, kinfo, kdebug,
+    kerror, kinfo,
 };
 
 use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};

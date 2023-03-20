@@ -282,16 +282,18 @@ impl TtyCore {
 
     /// @brief 关闭输入回显
     #[inline]
+    #[allow(dead_code)]
     pub fn disable_echo(&self) {
         self.state.write().set(TtyCoreState::ECHO_ON, false);
     }
-
+    
     /// @brief 判断当前tty核心，是否开启了输入回显
     ///
     /// @return true 开启了输入回显
     ///
     /// @return false 未开启输入回显
     #[inline]
+    #[allow(dead_code)]
     pub fn echo_enabled(&self) -> bool {
         return self.state.read().contains(TtyCoreState::ECHO_ON);
     }

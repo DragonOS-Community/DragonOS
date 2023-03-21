@@ -5,14 +5,13 @@ use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        process_control_block, Cpu_tsc_freq, LOAD_PERIOD_TIME, MAX_CPU_NUM, PF_NEED_SCHED,
-        SCHED_FIFO, SCHED_RR,
+        process_control_block, Cpu_tsc_freq, MAX_CPU_NUM, PF_NEED_SCHED, SCHED_FIFO, SCHED_RR,
     },
     kBUG, kdebug,
     libs::spinlock::RawSpinlock,
 };
 
-use super::core::{sched_enqueue, Scheduler};
+use super::{core::{sched_enqueue, Scheduler}, LOAD_PERIOD_TIME};
 
 /// 声明全局的rt调度器实例
 
@@ -226,7 +225,7 @@ impl Scheduler for SchedulerRT {
         // 如果队首元素与当前时间差超过设定值，则移除队首元素
         while self.load_list[cpu_id as usize].len() > 1
             && (time - *self.load_list[cpu_id as usize].front().unwrap()
-                > freq * (LOAD_PERIOD_TIME as u64))
+                > freq * LOAD_PERIOD_TIME)
         {
             self.load_list[cpu_id as usize].pop_front();
         }

@@ -15,4 +15,5 @@ pub trait NetDriver: Driver {
 
     /// @brief 获取网卡的id
     fn nic_id(&self) -> usize;
+    
 }

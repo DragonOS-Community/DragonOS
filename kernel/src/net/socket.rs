@@ -1,10 +1,16 @@
+use alloc::{sync::Arc, vec::Vec, boxed::Box};
 use smoltcp::{
-    iface::{SocketHandle, SocketSet},
+    iface::{self, SocketHandle, SocketSet},
     socket::raw,
     wire::{IpAddress, IpProtocol, Ipv4Packet},
 };
 
-use crate::{libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{
+    driver::{net::NetDriver, NET_DRIVERS},
+    libs::spinlock::SpinLock,
+    net::{Interface, NET_FACES},
+    syscall::SystemError, kwarn,
+};
 
 use super::{Endpoint, Protocol, Socket};
 
@@ -165,7 +171,7 @@ impl Socket for RawSocket {
             let mut socket_set_guard = SOCKET_SET.lock();
             let socket = socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
             match socket.send_slice(buf) {
-                Ok(len) => {
+                Ok(_len) => {
                     return Ok(buf.len());
                 }
                 Err(smoltcp::socket::raw::SendError::BufferFull) => {
@@ -177,16 +183,56 @@ impl Socket for RawSocket {
 
             if let Some(Endpoint::Ip(to)) = to {
                 let mut socket_set_guard = SOCKET_SET.lock();
-                let socket = socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
+                let socket:&mut raw::Socket = socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
+
+                // 暴力解决方案：只考虑0号网卡。 TODO：考虑多网卡的情况！！！
+                let iface: Arc<Interface> = NET_FACES.read().get(&0).unwrap().clone();
+
                 // 构造IP头
-                // https://priv-code.longjin666.cn/xref/rCore/kernel/src/net/structs.rs?r=6a3a85ca#643
-                todo!()
+                let ipv4_src_addr: Option<smoltcp::wire::Ipv4Address> =
+                    iface.inner_iface.ipv4_addr();
+                if ipv4_src_addr.is_none() {
+                    return Err(SystemError::ENETUNREACH);
+                }
+                let ipv4_src_addr = ipv4_src_addr.unwrap();
+
+                if let IpAddress::Ipv4(ipv4_dst) = to.addr {
+                    let len = buf.len();
+
+                    // 创建20字节的IPv4头部
+                    let mut buffer: Vec<u8> = vec![0u8; len + 20];
+                    let mut packet: Ipv4Packet<&mut Vec<u8>> =
+                        Ipv4Packet::new_unchecked(&mut buffer);
+                    packet.set_version(4);
+                    packet.set_header_len(20);
+                    packet.set_total_len((20+len) as u16);
+                    packet.set_src_addr(ipv4_src_addr);
+                    packet.set_dst_addr(ipv4_dst);
+                    // 设置ipv4 header的protocol字段
+                    packet.set_next_header(socket.ip_protocol().into());
+                    // 获取IP数据包的负载字段
+                    let payload:&mut [u8] = packet.payload_mut();
+                    payload.copy_from_slice(buf);
+                    // 填充checksum字段
+                    packet.fill_checksum();
+
+                    // 发送数据包
+                    socket.send_slice(&buffer).unwrap();
+
+                    drop(socket);
+                    drop(socket_set_guard);
+
+                    // poll?
+                    return Ok(len);
+                }else{
+                    kwarn!("Invalid Ip protocol type!");
+                    return Err(SystemError::EINVAL);
+                }
             } else {
                 // 如果没有指定目的地址，则返回错误
                 return Err(SystemError::ENOTCONN);
             }
         }
-
     }
 
     fn connect(&self, endpoint: super::Endpoint) -> Result<(), SystemError> {
@@ -198,6 +244,6 @@ impl Socket for RawSocket {
     }
 
     fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
-        todo!()
+        let x = self.clone();
     }
 }

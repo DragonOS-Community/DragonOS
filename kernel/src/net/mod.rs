@@ -1,14 +1,28 @@
-use core::fmt::{self, Debug};
+use core::{fmt::{self, Debug}, sync::atomic::AtomicUsize};
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 
-use crate::syscall::SystemError;
-use smoltcp::wire::IpEndpoint;
+use crate::{syscall::SystemError, libs::rwlock::RwLock};
+use smoltcp::{wire::IpEndpoint, iface};
 
 use self::socket::SocketMetadata;
 
 pub mod endpoints;
 pub mod socket;
+
+
+lazy_static! {
+    /// @brief 所有网络接口的列表
+    pub static ref NET_FACES: RwLock<BTreeMap<usize, Arc<Interface>>> = RwLock::new(BTreeMap::new());
+}
+
+/// @brief 生成网络接口的id
+pub fn generate_iface_id() -> usize {
+    static IFACE_ID: AtomicUsize = AtomicUsize::new(0);
+    return IFACE_ID
+        .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+        .into();
+}
 
 #[derive(Debug)]
 pub enum Endpoint {
@@ -187,6 +201,28 @@ impl Into<u8> for Protocol {
             Protocol::Ipv6NoNxt => 0x3b,
             Protocol::Ipv6Opts => 0x3c,
             Protocol::Unknown(id) => id,
+        }
+    }
+}
+
+
+
+pub struct Interface{
+    inner_iface: smoltcp::iface::Interface,
+    pub iface_id: usize,
+}
+
+impl Debug for Interface {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Interface").field("inner_iface", &" smoltcp::iface::Interface,").field("iface_id", &self.iface_id).finish()
+    }
+}
+
+impl Interface{
+    pub fn new(inner_iface: smoltcp::iface::Interface) -> Self{
+        return Self{
+            inner_iface,
+            iface_id: generate_iface_id(),
         }
     }
 }

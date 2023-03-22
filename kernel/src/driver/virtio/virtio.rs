@@ -1,10 +1,9 @@
 use super::transport_pci::PciTransport;
 use super::virtio_impl::HalImpl;
-use crate::driver::pci::pci::DeviceFunction;
+use crate::driver::{net::virtio_net::virtio_net, pci::pci::DeviceFunction};
 use crate::include::bindings::bindings::get_virtio_net_device;
 use crate::{kdebug, kerror, kwarn};
 use alloc::{boxed::Box, collections::LinkedList};
-use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::transport::{DeviceType, Transport};
 
 //Virtio设备寻找过程中出现的问题
@@ -12,31 +11,13 @@ enum VirtioError {
     VirtioNetNotFound,
 }
 
-///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）（for c）
+/// @brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）（for c）
 #[no_mangle]
 pub extern "C" fn c_virtio_probe() {
-    if let Ok(virtio_list) = virtio_device_search() {
-        for device_function in virtio_list {
-            match PciTransport::new::<HalImpl>(*device_function) {
-                Ok(mut transport) => {
-                    kdebug!(
-                        "Detected virtio PCI device with device type {:?}, features {:#018x}",
-                        transport.device_type(),
-                        transport.read_device_features(),
-                    );
-                    virtio_device(transport);
-                }
-                Err(err) => {
-                    kerror!("Pci transport create failed because of error: {}", err);
-                }
-            }
-        }
-    } else {
-        kerror!("Error occured when finding virtio device!");
-    }
+    virtio_probe();
 }
 
-///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
+/// @brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
 fn virtio_probe() {
     if let Ok(virtio_list) = virtio_device_search() {
         for device_function in virtio_list {
@@ -60,7 +41,7 @@ fn virtio_probe() {
 }
 
 ///@brief 为virtio设备寻找对应的驱动进行初始化
-fn virtio_device(transport: impl Transport) {
+fn virtio_device(transport: impl Transport + Clone + 'static) {
     match transport.device_type() {
         DeviceType::Block => {
             kwarn!("Not support virtio_block device for now");
@@ -76,58 +57,6 @@ fn virtio_device(transport: impl Transport) {
             kwarn!("Unrecognized virtio device: {:?}", t);
         }
     }
-}
-
-///@brief virtio-net 驱动的初始化与测试
-fn virtio_net<T: Transport>(transport: T) {
-    let mut driver_net = match VirtIONet::<HalImpl, T>::new(transport) {
-        Ok(mut net) => {
-            kdebug!("Virtio-net driver init successfully.");
-            net
-        }
-        Err(_) => {
-            kerror!("VirtIONet init failed");
-            return;
-        }
-    };
-    let mut buf = [0u8; 0x100];
-    // let len = match driver_net.recv(&mut buf)
-    // {
-    //     Ok(len) =>{len},
-    //     Err(_) =>{kerror!("virtio_net recv failed");return;}
-    // };
-    match driver_net.can_send() {
-        true => {
-            kdebug!("Virtio-net can send");
-        }
-        false => {
-            kdebug!("Virtio-net can not send");
-        }
-    }
-    // match driver_net.can_recv() {
-    //     true => {
-    //         kdebug!("can recv")
-    //     }
-    //     false => {
-    //         kdebug!("can not recv");
-    //     }
-    // }
-
-    let len = 100;
-    //kdebug!("recv: {:?}", &buf[..len]);
-    match driver_net.send(&buf[..len]) {
-        Ok(_) => {
-            kdebug!("virtio_net send success");
-        }
-        Err(_) => {
-            kerror!("virtio_net send failed");
-            return;
-        }
-    }
-
-    let mac = driver_net.mac();
-    kdebug!("virtio_net MAC={:?}", mac);
-    kdebug!("virtio-net test finished");
 }
 
 /// @brief 寻找所有的virtio设备

@@ -73,7 +73,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 /// PCI transport for VirtIO.
 ///
 /// Ref: 4.1 Virtio Over PCI Bus
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
@@ -111,11 +111,11 @@ impl PciTransport {
         }
         let device_type = device_type(device_id);
         // Find the PCI capabilities we need.
-        let mut common_cfg = None;
-        let mut notify_cfg = None;
+        let mut common_cfg: Option<VirtioCapabilityInfo> = None;
+        let mut notify_cfg: Option<VirtioCapabilityInfo> = None;
         let mut notify_off_multiplier = 0;
-        let mut isr_cfg = None;
-        let mut device_cfg = None;
+        let mut isr_cfg: Option<VirtioCapabilityInfo> = None;
+        let mut device_cfg: Option<VirtioCapabilityInfo> = None;
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
         let device_capability = CapabilityIterator {
             device_function: device_function,

@@ -1,9 +1,10 @@
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::syscall::SystemError;
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
         initial_mm, mm_create_vma, mm_unmap, vm_area_del, vm_area_free, vm_area_struct, vm_flags_t,
-        vma_find, EINVAL, ENOMEM, EPERM, MMIO_BASE, MMIO_TOP, PAGE_1G_SHIFT, PAGE_1G_SIZE,
+        vma_find, MMIO_BASE, MMIO_TOP, PAGE_1G_SHIFT, PAGE_1G_SIZE,
         PAGE_2M_SIZE, PAGE_4K_SHIFT, PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
     },
     kdebug, kerror,
@@ -73,11 +74,11 @@ impl MmioBuddyMemPool {
     ///
     /// @return Ok(i32) 返回0
     ///
-    /// @return Err(i32) 返回错误码
-    fn give_back_block(&self, vaddr: u64, exp: u32) -> Result<i32, i32> {
+    /// @return Err(SystemError) 返回错误码
+    fn give_back_block(&self, vaddr: u64, exp: u32) -> Result<i32, SystemError> {
         // 确保内存对齐，低位都要为0
         if (vaddr & ((1 << exp) - 1)) != 0 {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
         let region: Box<MmioBuddyAddrRegion> = self.create_region(vaddr);
         // 加入buddy
@@ -440,16 +441,16 @@ impl MmioBuddyMemPool {
     ///
     /// @return Ok(i32) 成功返回0
     ///
-    /// @return Err(i32) 失败返回错误码
+    /// @return Err(SystemError) 失败返回错误码
     pub fn create_mmio(
         &self,
         size: u32,
         vm_flags: vm_flags_t,
         res_vaddr: *mut u64,
         res_length: *mut u64,
-    ) -> Result<i32, i32> {
+    ) -> Result<i32, SystemError> {
         if size > PAGE_1G_SIZE || size == 0 {
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         }
         let mut retval: i32 = 0;
         // 计算前导0
@@ -502,7 +503,8 @@ impl MmioBuddyMemPool {
                             vm_area_del(*vma);
                             vm_area_free(*vma);
                         }
-                        return Err(retval);
+                        SystemError::from_posix_errno(retval);
+                        return Err(SystemError::from_posix_errno(retval).unwrap());
                     }
                     loop_i += PAGE_2M_SIZE as u64;
                 }
@@ -532,14 +534,14 @@ impl MmioBuddyMemPool {
                             vm_area_del(*vma);
                             vm_area_free(*vma);
                         }
-                        return Err(retval);
+                        return Err(SystemError::from_posix_errno(retval).unwrap());
                     }
                     loop_i += PAGE_4K_SIZE as u64;
                 }
             }
             Err(_) => {
                 kdebug!("failed to create mmio vma.pid = {:?}", current_pcb().pid);
-                return Err(-(ENOMEM as i32));
+                return Err(SystemError::ENOMEM);
             }
         }
         return Ok(retval);
@@ -553,8 +555,8 @@ impl MmioBuddyMemPool {
     ///
     /// @return Ok(i32) 成功返回0
     ///
-    /// @return Err(i32) 失败返回错误码
-    pub fn release_mmio(&self, vaddr: u64, length: u64) -> Result<i32, i32> {
+    /// @return Err(SystemError) 失败返回错误码
+    pub fn release_mmio(&self, vaddr: u64, length: u64) -> Result<i32, SystemError> {
         //先将要释放的空间取消映射
         unsafe {
             mm_unmap(&mut initial_mm, vaddr, length, false);
@@ -572,7 +574,7 @@ impl MmioBuddyMemPool {
                     vaddr + loop_i,
                     current_pcb().pid
                 );
-                return Err(-(EINVAL as i32));
+                return Err(SystemError::EINVAL);
             }
             // 检查vma起始地址是否正确
             if unsafe { (*vma).vm_start != (vaddr + loop_i) } {
@@ -581,7 +583,7 @@ impl MmioBuddyMemPool {
                     vaddr + loop_i,
                     current_pcb().pid
                 );
-                return Err(-(EINVAL as i32));
+                return Err(SystemError::EINVAL);
             }
             // 将vma对应空间归还
             match MMIO_POOL.give_back_block(unsafe { (*vma).vm_start }, unsafe {
@@ -698,7 +700,7 @@ pub extern "C" fn mmio_create(
     res_length: *mut u64,
 ) -> i32 {
     if let Err(err) = MMIO_POOL.create_mmio(size, vm_flags, res_vaddr, res_length) {
-        return err;
+        return -(err as i32);
     } else {
         return 0;
     }
@@ -716,7 +718,7 @@ pub extern "C" fn mmio_create(
 #[no_mangle]
 pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> i32 {
     if let Err(err) = MMIO_POOL.release_mmio(vaddr, length) {
-        return err;
+        return -(err as i32);
     } else {
         return 0;
     }

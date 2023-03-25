@@ -2,7 +2,7 @@
 use super::spinlock::RawSpinlock;
 use crate::{
     arch::asm::cmpxchg::try_cmpxchg_q,
-    include::bindings::bindings::{ENOTSUP, ETIMEDOUT},
+    syscall::SystemError,
 };
 use core::{fmt::Debug, intrinsics::size_of};
 
@@ -46,14 +46,14 @@ impl LockRef {
     /// @brief 为X86架构实现cmpxchg循环，以支持无锁操作。
     ///
     /// @return 操作成功：返回Ok(new.count)
-    /// @return 操作失败，原因：超时 => 返回Err(-ETIMEDOUT)
-    /// @return 操作失败，原因：不满足规则 => 返回Err(1)
+    /// @return 操作失败，原因：超时 => 返回Err(SystemError::ETIMEDOUT)
+    /// @return 操作失败，原因：不满足规则 => 返回Err(SystemError::E2BIG)
     #[cfg(target_arch = "x86_64")]
     #[inline]
-    fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, i32> {
+    fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, SystemError> {
         use core::ptr::read_volatile;
 
-        use crate::arch::cpu::cpu_relax;
+        use crate::{arch::cpu::cpu_relax};
 
         let mut old: LockRef = LockRef::INIT;
         old.count = unsafe { read_volatile(&self.count) };
@@ -74,27 +74,31 @@ impl LockRef {
                     CmpxchgMode::IncreaseNotZero => {
                         // 操作失败
                         if old.count <= 0 {
-                            return Err(1);
+                            //return Err(1)老代码
+                            return Err(SystemError::E2BIG);
                         }
                         new.count += 1;
                     }
 
                     CmpxchgMode::IncreaseNotDead => {
                         if old.count < 0 {
-                            return Err(1);
+                            //return Err(1)老代码
+                            return Err(SystemError::E2BIG);
                         }
                         new.count += 1;
                     }
 
                     CmpxchgMode::Decrease | CmpxchgMode::DecreaseReturn => {
                         if old.count <= 0 {
-                            return Err(1);
+                            //return Err(1)老代码
+                            return Err(SystemError::E2BIG);
                         }
                         new.count -= 1;
                     }
                     CmpxchgMode::DecreaseNotZero | CmpxchgMode::DecreaseOrLockNotZero => {
                         if old.count <= 1 {
-                            return Err(1);
+                            //return Err(1)老代码
+                            return Err(SystemError::E2BIG);
                         }
                         new.count -= 1;
                     }
@@ -114,16 +118,16 @@ impl LockRef {
             }
         }
 
-        return Err(-(ETIMEDOUT as i32));
+        return Err(SystemError::ETIMEDOUT);
     }
 
-    /// @brief 对于不支持无锁lockref的架构，直接返回Err(-ENOTSUP)，表示不支持
+    /// @brief 对于不支持无锁lockref的架构，直接返回Err(SystemError::ENOTSUP)，表示不支持
     #[cfg(not(target_arch = "x86_64"))]
     #[inline]
-    fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, i32> {
+    fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, SystemError> {
         use crate::include::bindings::bindings::ENOTSUP;
 
-        return Err(-(ENOTSUP as i32));
+        return Err(SystemError::ENOTSUP);
     }
 
     /// @brief 原子的将引用计数加1
@@ -141,21 +145,29 @@ impl LockRef {
     /**
      * @brief 原子地将引用计数加1.如果原来的count≤0，则操作失败。
      *
-     * @return Result<i32, i32>     操作成功=>Ok(self.count)
-     *                              操作失败=>Err(-1)
+     * @return Result<i32, SystemError>     操作成功=>Ok(self.count)
+     *                                      操作失败=>Err(SystemError::EFAULT)
      */
-    pub fn inc_not_zero(&mut self) -> Result<i32, i32> {
+    pub fn inc_not_zero(&mut self) -> Result<i32, SystemError> {
         {
             let cmpxchg_res = self.cmpxchg_loop(CmpxchgMode::IncreaseNotZero);
             if cmpxchg_res.is_ok() {
                 return cmpxchg_res;
-            } else if cmpxchg_res.unwrap_err() == 1 {
+            } else if cmpxchg_res.unwrap_err() == SystemError::E2BIG {
                 // 不满足not zero 的条件
-                return Err(-1);
+                return Err(SystemError::EFAULT);
             }
+            //修改原因：cmpxchg函数不满足not zero时返回值变为SystemError::E2BIG
+            /*老代码
+            else if cmpxchg_res.unwrap_err() == 1 {
+                // 不满足not zero 的条件
+                return Err(SystemError::EFAULT);
+            }
+             */
         }
-
-        let mut retval = Err(-1);
+        //let mut retval = Err(-1);老代码
+        //修改理由:该函数错误时返回SystemError::EFAULT
+        let mut retval = Err(SystemError::EFAULT);
         self.lock.lock();
 
         if self.count > 0 {
@@ -171,19 +183,24 @@ impl LockRef {
      * @brief 引用计数自增1。（除非该lockref已经被标记为死亡）
      *
      * @return Ok(self.count) 操作成功
-     * @return Err(-1) 操作失败，lockref已死亡
+     * @return Err(SystemError::EFAULT) 操作失败，lockref已死亡
      */
-    pub fn inc_not_dead(&mut self) -> Result<i32, i32> {
+    pub fn inc_not_dead(&mut self) -> Result<i32, SystemError> {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::IncreaseNotDead);
             if cmpxchg_result.is_ok() {
                 return cmpxchg_result;
-            } else if cmpxchg_result.unwrap_err() == 1 {
-                return Err(-1);
+            } else if cmpxchg_result.unwrap_err() == SystemError::E2BIG {
+                return Err(SystemError::EFAULT);
             }
+            /*老代码
+            else if cmpxchg_result.unwrap_err() == 1 {
+                return Err(SystemError::EFAULT);
+            }
+             */
         }
         // 快捷路径操作失败，尝试加锁
-        let mut retval = Err(-1);
+        let mut retval = Err(SystemError::EFAULT);
 
         self.lock.lock();
         if self.count >= 0 {
@@ -195,29 +212,29 @@ impl LockRef {
     }
 
     /**
-     * @brief 原子地将引用计数-1。如果已处于count≤0的状态，则返回Err(-1)
+     * @brief 原子地将引用计数-1。如果已处于count≤0的状态，则返回Err(SystemError::EFAULT)
      *
      * 本函数与lockref_dec_return()的区别在于，当在cmpxchg()中检测到count<=0或已加锁，本函数会再次尝试通过加锁来执行操作
      * 而后者会直接返回错误
      *
      * @return int 操作成功 => 返回新的引用变量值
-     *             操作失败lockref处于count≤0的状态 => 返回-1
+     *             操作失败lockref处于count≤0的状态 => 返回SystemError::EFAULT
      */
-    pub fn dec(&mut self) -> Result<i32, i32> {
+    pub fn dec(&mut self) -> Result<i32, SystemError> {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::Decrease);
             if cmpxchg_result.is_ok() {
                 return cmpxchg_result;
             }
         }
-        let retval: Result<i32, i32>;
+        let retval: Result<i32, SystemError>;
         self.lock.lock();
 
         if self.count > 0 {
             self.count -= 1;
             retval = Ok(self.count);
         } else {
-            retval = Err(-1);
+            retval = Err(SystemError::EFAULT);
         }
 
         self.lock.unlock();
@@ -226,26 +243,32 @@ impl LockRef {
     }
 
     /**
-     * @brief 原子地将引用计数减1。如果处于已加锁或count≤0的状态，则返回-1
+     * @brief 原子地将引用计数减1。如果处于已加锁或count≤0的状态，则返回SystemError::EFAULT
      *      若当前处理器架构不支持cmpxchg，则退化为self.dec()
      *
      * 本函数与lockref_dec()的区别在于，当在cmpxchg()中检测到count<=0或已加锁，本函数会直接返回错误
      * 而后者会再次尝试通过加锁来执行操作
      *
      * @return int  操作成功 => 返回新的引用变量值
-     *              操作失败，lockref处于已加锁或count≤0的状态 => 返回-1
+     *              操作失败，lockref处于已加锁或count≤0的状态 => 返回SystemError::EFAULT
      */
-    pub fn dec_return(&mut self) -> Result<i32, i32> {
+    pub fn dec_return(&mut self) -> Result<i32, SystemError> {
         let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseReturn);
         if cmpxchg_result.is_ok() {
             return cmpxchg_result;
-        } else if cmpxchg_result.unwrap_err() == 1 {
-            return Err(-1);
+        } else if cmpxchg_result.clone().unwrap_err() == SystemError::E2BIG{
+            return Err(SystemError::EFAULT);
         }
+        //修改理由：cmpxchg函数Err返回值已被修改为SystemError::E2BIG
+        /*老代码
+        else if cmpxchg_result.unwrap_err() == 1 {
+            return Err(SystemError::EFAULT);
+        }
+         */
 
         // 由于cmpxchg超时，操作失败
-        if cmpxchg_result.unwrap_err() != -(ENOTSUP as i32) {
-            return Err(-1);
+        if cmpxchg_result.clone().unwrap_err() != SystemError::ENOTSUP {
+            return Err(SystemError::EFAULT);
         }
 
         // 能走到这里，代表架构当前不支持cmpxchg
@@ -260,25 +283,31 @@ impl LockRef {
      * 而后者在这种情况下，会尝试加锁来进行操作。
      *
      * @return Ok(self.count) 成功将引用计数减1
-     * @return Err(-1) 如果当前的引用计数≤1，操作失败
+     * @return Err(SystemError::EFAULT) 如果当前的引用计数≤1，操作失败
      */
-    pub fn dec_not_zero(&mut self) -> Result<i32, i32> {
+    pub fn dec_not_zero(&mut self) -> Result<i32, SystemError> {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseNotZero);
             if cmpxchg_result.is_ok() {
                 return cmpxchg_result;
-            } else if cmpxchg_result.unwrap_err() == 1 {
-                return Err(-1);
+            } else if cmpxchg_result.unwrap_err() == SystemError::E2BIG {
+                return Err(SystemError::EFAULT);
             }
+            //修改理由：cmpxchg函数Err返回值已被修改为E2BIG
+            /*老代码
+            else if cmpxchg_result.unwrap_err() == 1 {
+                return Err(SystemError::EFAULT);
+            }
+             */
         }
 
-        let retval: Result<i32, i32>;
+        let retval: Result<i32, SystemError>;
         self.lock.lock();
         if self.count > 1 {
             self.count -= 1;
             retval = Ok(self.count);
         } else {
-            retval = Err(-1);
+            retval = Err(SystemError::EFAULT);
         }
         self.lock.unlock();
         return retval;
@@ -288,12 +317,12 @@ impl LockRef {
      * @brief 原子地将引用计数减1。若当前的引用计数≤1，则操作失败
      *
      * 该函数与lockref_dec_not_zero()的区别在于，当cmpxchg()时发现old.count≤1时，该函数会尝试加锁来进行操作。
-     * 而后者在这种情况下，会直接返回Err(-1).
+     * 而后者在这种情况下，会直接返回Err(SystemError::EFAULT).
      *
      * @return Ok(self.count) 成功将引用计数减1
-     * @return Err(-1) 如果当前的引用计数≤1，操作失败
+     * @return Err(SystemError::EFAULT) 如果当前的引用计数≤1，操作失败
      */
-    pub fn dec_or_lock_not_zero(&mut self) -> Result<i32, i32> {
+    pub fn dec_or_lock_not_zero(&mut self) -> Result<i32, SystemError> {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseOrLockNotZero);
             if cmpxchg_result.is_ok() {
@@ -301,13 +330,13 @@ impl LockRef {
             }
         }
 
-        let retval: Result<i32, i32>;
+        let retval: Result<i32, SystemError>;
         self.lock.lock();
         if self.count > 1 {
             self.count -= 1;
             retval = Ok(self.count);
         } else {
-            retval = Err(-1);
+            retval = Err(SystemError::EFAULT);
         }
         self.lock.unlock();
         return retval;

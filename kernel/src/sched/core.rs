@@ -8,10 +8,10 @@ use crate::{
     },
     include::bindings::bindings::smp_get_total_cpu,
     include::bindings::bindings::{
-        process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
+        process_control_block, pt_regs, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
         SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
-    process::process::process_cpu
+    process::process::process_cpu, syscall::SystemError
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
@@ -204,7 +204,7 @@ pub extern "C" fn sched_migrate_process(
 ) -> i32 {
     if target > MAX_CPU_NUM.try_into().unwrap() {
         // panic!("sched_migrate_process: target > MAX_CPU_NUM");
-        return -(EINVAL as i32);
+        return -(SystemError::EINVAL as i32);
     }
 
     pcb.flags |= PF_NEED_MIGRATE as u64;

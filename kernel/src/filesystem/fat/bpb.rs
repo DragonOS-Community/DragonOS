@@ -2,10 +2,9 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    include::bindings::bindings::EINVAL,
     io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kerror,
-    libs::vec_cursor::VecCursor,
+    libs::vec_cursor::VecCursor, syscall::SystemError,
 };
 
 use super::fs::Cluster;
@@ -180,7 +179,7 @@ impl FATType {
 }
 
 impl BiosParameterBlock {
-    pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, i32> {
+    pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, SystemError> {
         let mut v = Vec::with_capacity(LBA_SIZE);
         v.resize(LBA_SIZE, 0);
 
@@ -270,54 +269,54 @@ impl BiosParameterBlock {
     }
 
     /// @brief 验证BPB32的信息是否合法
-    pub fn validate(&self, bpb32: &BiosParameterBlockFAT32) -> Result<(), i32> {
+    pub fn validate(&self, bpb32: &BiosParameterBlockFAT32) -> Result<(), SystemError> {
         // 校验每扇区字节数是否合法
         if self.bytes_per_sector.count_ones() != 1 {
             kerror!("Invalid bytes per sector(not a power of 2)");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         } else if self.bytes_per_sector < 512 {
             kerror!("Invalid bytes per sector (value < 512)");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         } else if self.bytes_per_sector > 4096 {
             kerror!("Invalid bytes per sector (value > 4096)");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         let is_fat32 = self.is_fat32();
 
         if self.rsvd_sec_cnt < 1 {
             kerror!("Invalid rsvd_sec_cnt value in BPB");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         if self.num_fats == 0 {
             kerror!("Invalid fats value in BPB");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         if is_fat32 && self.root_entries_cnt != 0 {
             kerror!("Invalid root_entries value in BPB (should be zero for FAT32)");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         if is_fat32 && self.total_sectors_16 != 0 {
             kerror!("Invalid total_sectors_16 value in BPB (should be zero for FAT32)");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         if (self.total_sectors_16 == 0) && (self.total_sectors_32 == 0) {
             kerror!("Invalid BPB (total_sectors_16 or total_sectors_32 should be non-zero)");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         if is_fat32 && bpb32.fat_size_32 == 0 {
             kerror!("Invalid fat_size_32 value in BPB (should be non-zero for FAT32)");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         if bpb32.fs_version != 0 {
             kerror!("Unknown FAT FS version");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         let root_sectors = ((self.root_entries_cnt as u32 * 32)
@@ -349,13 +348,13 @@ impl BiosParameterBlock {
         // 总扇区数应当大于第一个数据扇区的扇区号
         if total_sectors <= first_data_sector {
             kerror!("Total sectors lesser than first data sector");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         // 检查文件系统类型与总的数据簇数量的关系是否合法
         if (is_fat32 && (count_clusters < 65525)) || ((!is_fat32) && (count_clusters >= 65525)) {
             kerror!("FAT determination using tot_sec_16 and count_cluster differs");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
         return Ok(());
     }

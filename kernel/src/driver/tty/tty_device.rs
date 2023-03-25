@@ -6,7 +6,7 @@ use crate::{
         vfs::{file::FileMode, FilePrivateData, IndexNode},
     },
     include::bindings::bindings::{ECONNABORTED, EIO, ENOTSUP, EPERM},
-    kerror, libs::rwlock::RwLock,
+    kerror, libs::rwlock::RwLock, syscall::SystemError,
 };
 
 use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
@@ -31,11 +31,11 @@ impl TtyDevice {
     fn verify_file_private_data<'a>(
         &self,
         private_data: &'a mut FilePrivateData,
-    ) -> Result<&'a mut TtyFilePrivateData, i32> {
+    ) -> Result<&'a mut TtyFilePrivateData, SystemError> {
         if let FilePrivateData::Tty(t) = private_data {
             return Ok(t);
         }
-        return Err(-(EIO as i32));
+        return Err(SystemError::EIO);
     }
 }
 
@@ -46,7 +46,7 @@ impl DeviceINode for TtyDevice {
 }
 
 impl IndexNode for TtyDevice {
-    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), i32> {
+    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), SystemError> {
         let p = TtyFilePrivateData::default();
         *data = FilePrivateData::Tty(p);
         return Ok(());
@@ -58,7 +58,7 @@ impl IndexNode for TtyDevice {
         len: usize,
         buf: &mut [u8],
         data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let _data: &mut TtyFilePrivateData = match self.verify_file_private_data(data) {
             Ok(t) => t,
             Err(e) => {
@@ -79,7 +79,7 @@ impl IndexNode for TtyDevice {
             }
             x => {
                 kerror!("Error occurred when reading tty, msg={x:?}");
-                return Err(-(ECONNABORTED as i32));
+                return Err(SystemError::ECONNABORTED);
             }
         }
     }
@@ -90,7 +90,7 @@ impl IndexNode for TtyDevice {
         len: usize,
         buf: &[u8],
         data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let data: &mut TtyFilePrivateData = match self.verify_file_private_data(data) {
             Ok(t) => t,
             Err(e) => {
@@ -105,7 +105,7 @@ impl IndexNode for TtyDevice {
         } else if data.flags.contains(TtyFileFlag::STDERR) {
             self.core.stderr(buf, true)
         } else {
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         };
 
         if r.is_ok() {
@@ -114,11 +114,11 @@ impl IndexNode for TtyDevice {
 
         let r: TtyError = r.unwrap_err();
         kerror!("Error occurred when writing tty deivce. Error msg={r:?}");
-        return Err(-(EIO as i32));
+        return Err(SystemError::EIO);
     }
 
-    fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, i32> {
-        return Err(-(ENOTSUP as i32));
+    fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
@@ -129,7 +129,7 @@ impl IndexNode for TtyDevice {
         self
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, i32> {
-        return Err(-(ENOTSUP as i32));
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 }

@@ -8,7 +8,7 @@ use crate::{
     include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t, ENOTSUP},
     kdebug,
     libs::spinlock::SpinLock,
-    time::TimeSpec,
+    time::TimeSpec, syscall::SystemError,
 };
 
 #[derive(Debug)]
@@ -79,7 +79,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         len: usize,
         buf: &mut [u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let guard = self.0.lock();
         let func = guard.f_ops.read.unwrap();
         let r = unsafe {
@@ -99,39 +99,39 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _len: usize,
         _buf: &[u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
-        return Err(-(ENOTSUP as i32));
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 
     fn open(
         &self,
         _data: &mut crate::filesystem::vfs::FilePrivateData,
         _mode: &FileMode,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         let guard = self.0.lock();
         let func = guard.f_ops.open.unwrap();
         let _ = unsafe { func(0 as *mut vfs_index_node_t, 0 as *mut vfs_file_t) };
         return Ok(());
     }
 
-    fn close(&self, _data: &mut crate::filesystem::vfs::FilePrivateData) -> Result<(), i32> {
+    fn close(&self, _data: &mut crate::filesystem::vfs::FilePrivateData) -> Result<(), SystemError> {
         let guard = self.0.lock();
         let func = guard.f_ops.close.unwrap();
         let _ = unsafe { func(0 as *mut vfs_index_node_t, 0 as *mut vfs_file_t) };
         return Ok(());
     }
 
-    fn poll(&self) -> Result<PollStatus, i32> {
+    fn poll(&self) -> Result<PollStatus, SystemError> {
         return Ok(PollStatus {
             flags: PollStatus::READ_MASK,
         });
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -151,7 +151,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         self
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, i32> {
-        return Err(-(ENOTSUP as i32));
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 }

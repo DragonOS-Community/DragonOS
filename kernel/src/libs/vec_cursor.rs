@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use crate::{
     include::bindings::bindings::{E2BIG, EINVAL, EOVERFLOW},
-    io::SeekFrom,
+    io::SeekFrom, syscall::SystemError,
 };
 
 /// @brief 本模块用于为数组提供游标的功能，以简化其操作。
@@ -45,18 +45,18 @@ impl VecCursor {
     }
 
     /// @brief 读取一个u8的数据（小端对齐）
-    pub fn read_u8(&mut self) -> Result<u8, i32> {
+    pub fn read_u8(&mut self) -> Result<u8, SystemError> {
         if self.pos >= self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
         self.pos += 1;
         return Ok(self.data[self.pos - 1]);
     }
 
     /// @brief 读取一个u16的数据（小端对齐）
-    pub fn read_u16(&mut self) -> Result<u16, i32> {
+    pub fn read_u16(&mut self) -> Result<u16, SystemError> {
         if self.pos + 2 > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
         let mut res = 0u16;
         res |= (self.data[self.pos] as u16) & 0xff;
@@ -68,9 +68,9 @@ impl VecCursor {
     }
 
     /// @brief 读取一个u32的数据（小端对齐）
-    pub fn read_u32(&mut self) -> Result<u32, i32> {
+    pub fn read_u32(&mut self) -> Result<u32, SystemError> {
         if self.pos + 4 > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
         let mut res = 0u32;
         for i in 0..4 {
@@ -82,9 +82,9 @@ impl VecCursor {
     }
 
     /// @brief 读取一个u64的数据（小端对齐）
-    pub fn read_u64(&mut self) -> Result<u64, i32> {
+    pub fn read_u64(&mut self) -> Result<u64, SystemError> {
         if self.pos + 8 > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
         let mut res = 0u64;
         for i in 0..8 {
@@ -101,9 +101,9 @@ impl VecCursor {
     ///
     /// @return Ok(()) 成功读取
     /// @retunr Err(-E2BIG) 没有这么多数据，读取失败
-    pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), i32> {
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SystemError> {
         if self.pos + buf.len() > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
         buf.copy_from_slice(&self.data[self.pos..self.pos + buf.len()]);
         self.pos += buf.len();
@@ -113,9 +113,9 @@ impl VecCursor {
     /// @brief 小端对齐，读取数据到u16数组.
     ///
     /// @param buf 目标u16数组
-    pub fn read_u16_into(&mut self, buf: &mut [u16]) -> Result<(), i32> {
+    pub fn read_u16_into(&mut self, buf: &mut [u16]) -> Result<(), SystemError> {
         if self.pos + buf.len() * size_of::<u16>() > self.data.len() * size_of::<u16>() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
 
         for i in 0..buf.len() {
@@ -130,8 +130,8 @@ impl VecCursor {
     /// @param 调整的相对值
     ///
     /// @return Ok(新的游标位置) 调整成功，返回新的游标位置
-    /// @return Err(-EOVERFLOW) 调整失败，游标超出正确的范围。（失败时游标位置不变）
-    pub fn seek(&mut self, origin: SeekFrom) -> Result<usize, i32> {
+    /// @return Err(SystemError::EOVERFLOW) 调整失败，游标超出正确的范围。（失败时游标位置不变）
+    pub fn seek(&mut self, origin: SeekFrom) -> Result<usize, SystemError> {
         let pos: i64;
         match origin {
             SeekFrom::SeekSet(offset) => {
@@ -145,21 +145,21 @@ impl VecCursor {
                 pos = self.data.len() as i64 + offset;
             }
             SeekFrom::Invalid => {
-                return Err(-(EINVAL as i32));
+                return Err(SystemError::EINVAL);
             }
         }
 
         if pos < 0 || pos > self.data.len() as i64 {
-            return Err(-(EOVERFLOW as i32));
+            return Err(SystemError::EOVERFLOW);
         }
         self.pos = pos as usize;
         return Ok(self.pos);
     }
 
     /// @brief 写入一个u8的数据（小端对齐）
-    pub fn write_u8(&mut self, value: u8) -> Result<u8, i32> {
+    pub fn write_u8(&mut self, value: u8) -> Result<u8, SystemError> {
         if self.pos >= self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
 
         self.data[self.pos] = value;
@@ -169,9 +169,9 @@ impl VecCursor {
     }
 
     /// @brief 写入一个u16的数据（小端对齐）
-    pub fn write_u16(&mut self, value: u16) -> Result<u16, i32> {
+    pub fn write_u16(&mut self, value: u16) -> Result<u16, SystemError> {
         if self.pos + 2 > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
 
         self.data[self.pos] = (value & 0xff) as u8;
@@ -183,9 +183,9 @@ impl VecCursor {
     }
 
     /// @brief 写入一个u32的数据（小端对齐）
-    pub fn write_u32(&mut self, value: u32) -> Result<u32, i32> {
+    pub fn write_u32(&mut self, value: u32) -> Result<u32, SystemError> {
         if self.pos + 4 > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
 
         for i in 0..4 {
@@ -197,9 +197,9 @@ impl VecCursor {
     }
 
     /// @brief 写入一个u64的数据（小端对齐）
-    pub fn write_u64(&mut self, value: u64) -> Result<u64, i32> {
+    pub fn write_u64(&mut self, value: u64) -> Result<u64, SystemError> {
         if self.pos + 8 > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
 
         for i in 0..8 {
@@ -216,9 +216,9 @@ impl VecCursor {
     ///
     /// @return Ok(()) 成功写入
     /// @retunr Err(-E2BIG) 没有这么多数据，写入失败
-    pub fn write_exact(&mut self, buf: &[u8]) -> Result<(), i32> {
+    pub fn write_exact(&mut self, buf: &[u8]) -> Result<(), SystemError> {
         if self.pos + buf.len() > self.data.len() {
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         }
 
         self.data[self.pos..self.pos + buf.len()].copy_from_slice(&buf[..]);

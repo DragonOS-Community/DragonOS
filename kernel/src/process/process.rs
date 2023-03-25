@@ -9,11 +9,11 @@ use crate::{
     arch::asm::current::current_pcb,
     filesystem::vfs::file::{File, FileDescriptorVec},
     include::bindings::bindings::{
-        process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_INTERRUPTIBLE,
+        process_control_block, CLONE_FS, PROC_INTERRUPTIBLE,
         PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
     },
     sched::core::{cpu_executing, sched_enqueue},
-    smp::core::{smp_get_processor_id, smp_send_reschedule},
+    smp::core::{smp_get_processor_id, smp_send_reschedule}, syscall::SystemError,
 };
 
 use super::preempt::{preempt_disable, preempt_enable};
@@ -112,11 +112,11 @@ pub fn process_is_executing(pcb: *const process_control_block) -> bool {
 impl process_control_block {
     /// @brief 初始化进程PCB的文件描述符数组。
     /// 请注意，如果当前进程已经有文件描述符数组，那么本操作将被禁止
-    pub fn init_files(&mut self) -> Result<(), i32> {
+    pub fn init_files(&mut self) -> Result<(), SystemError> {
         if self.fds != null_mut() {
             // 这个操作不被允许，否则会产生内存泄露。
             // 原因是，C的pcb里面，文件描述符数组的生命周期是static的，如果继续执行，会产生内存泄露的问题。
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         }
         let fd_vec: &mut FileDescriptorVec = Box::leak(FileDescriptorVec::new());
         self.fds = fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
@@ -129,12 +129,12 @@ impl process_control_block {
     /// @param from 源pcb。从它里面拷贝文件描述符
     ///
     /// @return Ok(()) 拷贝成功
-    /// @return Err(i32) 拷贝失败，错误码
+    /// @return Err(SystemError) 拷贝失败，错误码
     pub fn copy_files(
         &mut self,
         clone_flags: u64,
         from: &'static process_control_block,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         // 不拷贝父进程的文件描述符
         if clone_flags & CLONE_FS as u64 != 0 {
             // 由于拷贝pcb的时候，直接copy的指针，因此这里置为空
@@ -159,7 +159,7 @@ impl process_control_block {
     }
 
     /// @brief 释放文件描述符数组。本函数会drop掉整个文件描述符数组，并把pcb的fds字段设置为空指针。
-    pub fn exit_files(&mut self) -> Result<(), i32> {
+    pub fn exit_files(&mut self) -> Result<(), SystemError> {
         if self.fds.is_null() {
             return Ok(());
         }
@@ -174,8 +174,8 @@ impl process_control_block {
     /// @brief 申请文件描述符，并把文件对象存入其中。
     ///
     /// @return Ok(i32) 申请到的文件描述符编号
-    /// @return Err(i32) 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(&mut self, file: File) -> Result<i32, i32> {
+    /// @return Err(SystemError) 申请失败，返回错误码，并且，file对象将被drop掉
+    pub fn alloc_fd(&mut self, file: File) -> Result<i32, SystemError> {
         // 获取pcb的文件描述符数组的引用
         let fds: &mut FileDescriptorVec =
             if let Some(f) = FileDescriptorVec::from_pcb(current_pcb()) {
@@ -187,7 +187,7 @@ impl process_control_block {
                 if r.is_none() {
                     drop(file);
                     // 初始化失败
-                    return Err(-(EFAULT as i32));
+                    return Err(SystemError::EFAULT);
                 }
                 r.unwrap()
             };
@@ -201,7 +201,7 @@ impl process_control_block {
             }
             cnt += 1;
         }
-        return Err(-(ENFILE as i32));
+        return Err(SystemError::ENFILE);
     }
 
     /// @brief 根据文件描述符序号，获取文件结构体的可变引用
@@ -234,17 +234,17 @@ impl process_control_block {
     /// @brief 释放文件描述符，同时关闭文件。
     ///
     /// @param fd 文件描述符序号
-    pub fn drop_fd(&self, fd: i32) -> Result<(), i32> {
+    pub fn drop_fd(&self, fd: i32) -> Result<(), SystemError> {
         // 判断文件描述符的数字是否超过限制
         if !FileDescriptorVec::validate_fd(fd) {
-            return Err(-(EBADF as i32));
+            return Err(SystemError::EBADF);
         }
         let r: &mut FileDescriptorVec = FileDescriptorVec::from_pcb(current_pcb()).unwrap();
 
         let f: Option<&File> = r.fds[fd as usize].as_deref();
         if f.is_none() {
             // 如果文件描述符不存在，报错
-            return Err(-(EBADF as i32));
+            return Err(SystemError::EBADF);
         }
         // 释放文件
         drop(f);
@@ -282,7 +282,7 @@ pub extern "C" fn process_init_files() -> i32 {
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err();
+        return -(r.unwrap_err() as i32);
     }
 }
 
@@ -299,7 +299,7 @@ pub extern "C" fn process_copy_files(
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err();
+        return -(r.unwrap_err() as i32);
     }
 }
 
@@ -310,11 +310,11 @@ pub extern "C" fn process_copy_files(
 /// @return i32
 #[no_mangle]
 pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) -> i32 {
-    let r: Result<(), i32> = pcb.exit_files();
+    let r: Result<(), SystemError> = pcb.exit_files();
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err();
+        return -(r.unwrap_err() as i32);
     }
 }
 

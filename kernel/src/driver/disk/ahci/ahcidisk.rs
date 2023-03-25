@@ -6,6 +6,7 @@ use crate::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::mm::phys_2_virt;
+use crate::syscall::SystemError;
 use crate::{
     driver::disk::ahci::hba::{
         FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT,
@@ -54,13 +55,13 @@ impl AhciDisk {
         lba_id_start: crate::io::device::BlockId, // 起始lba编号
         count: usize,                             // 读取lba的数量
         buf: &mut [u8],
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
         if count * 512 > buf.len() || check_length > u16::MAX as usize {
             kerror!("ahci read: e2big");
             // 不可能的操作
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         } else if count == 0 {
             return Ok(0);
         }
@@ -71,7 +72,7 @@ impl AhciDisk {
         let slot = port.find_cmdslot().unwrap_or(u32::MAX);
 
         if slot == u32::MAX {
-            return Err(-(EIO as i32));
+            return Err(SystemError::EIO);
         }
 
         #[allow(unused_unsafe)]
@@ -161,7 +162,7 @@ impl AhciDisk {
 
         if spin_count == SPIN_LIMIT {
             kerror!("Port is hung");
-            return Err(-(EIO as i32));
+            return Err(SystemError::EIO);
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
@@ -173,7 +174,7 @@ impl AhciDisk {
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
                 kerror!("Read disk error");
-                return Err(-(EIO as i32));
+                return Err(SystemError::EIO);
             }
         }
 
@@ -187,12 +188,12 @@ impl AhciDisk {
         lba_id_start: crate::io::device::BlockId,
         count: usize,
         buf: &[u8],
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
         if count * 512 > buf.len() || check_length > u16::MAX as usize {
             // 不可能的操作
-            return Err(-(E2BIG as i32));
+            return Err(SystemError::E2BIG);
         } else if count == 0 {
             return Ok(0);
         }
@@ -204,7 +205,7 @@ impl AhciDisk {
         let slot = port.find_cmdslot().unwrap_or(u32::MAX);
 
         if slot == u32::MAX {
-            return Err(-(EIO as i32));
+            return Err(SystemError::EIO);
         }
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -295,7 +296,7 @@ impl AhciDisk {
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
                 kerror!("Write disk error");
-                return Err(-(EIO as i32));
+                return Err(SystemError::EIO);
             }
         }
 
@@ -304,7 +305,7 @@ impl AhciDisk {
         return Ok(count * 512);
     }
 
-    fn sync(&self) -> Result<(), i32> {
+    fn sync(&self) -> Result<(), SystemError> {
         // 由于目前没有block cache, 因此sync返回成功即可
         return Ok(());
     }
@@ -316,7 +317,7 @@ impl LockedAhciDisk {
         flags: u16,
         ctrl_num: u8,
         port_num: u8,
-    ) -> Result<Arc<LockedAhciDisk>, i32> {
+    ) -> Result<Arc<LockedAhciDisk>, SystemError> {
         let mut part_s: Vec<Arc<Partition>> = Vec::new();
 
         // 构建磁盘结构体
@@ -351,7 +352,7 @@ impl LockedAhciDisk {
     }
 
     /// @brief: 从磁盘中读取 MBR 分区表结构体 TODO: Cursor
-    pub fn read_mbr_table(&self) -> Result<MbrDiskPartionTable, i32> {
+    pub fn read_mbr_table(&self) -> Result<MbrDiskPartionTable, SystemError> {
         let mut table: MbrDiskPartionTable = Default::default();
 
         // 数据缓冲区
@@ -404,7 +405,7 @@ impl BlockDevice for LockedAhciDisk {
         lba_id_start: crate::io::device::BlockId,
         count: usize,
         buf: &mut [u8],
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         // kdebug!(
         //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
         //     self.0
@@ -418,11 +419,11 @@ impl BlockDevice for LockedAhciDisk {
         lba_id_start: crate::io::device::BlockId,
         count: usize,
         buf: &[u8],
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         self.0.lock().write_at(lba_id_start, count, buf)
     }
 
-    fn sync(&self) -> Result<(), i32> {
+    fn sync(&self) -> Result<(), SystemError> {
         return self.0.lock().sync();
     }
 

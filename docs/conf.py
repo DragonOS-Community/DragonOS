@@ -18,8 +18,8 @@
 # -- Project information -----------------------------------------------------
 
 project = 'DragonOS'
-copyright = '2022, fslongjin'
-author = 'fslongjin'
+copyright = '2022-2023, DragonOS Community'
+author = 'longjin'
 
 # The full version, including alpha/beta/rc tags
 release = 'dev'

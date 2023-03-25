@@ -23,7 +23,7 @@
 #include "proc-types.h"
 
 extern void process_exit_thread(struct process_control_block *pcb);
-extern uint64_t process_exit_files(struct process_control_block *pcb);
+extern int process_exit_files(struct process_control_block *pcb);
 
 /**
  * @brief 任务状态段结构体
@@ -221,5 +221,3 @@ extern int process_try_to_wake_up(struct process_control_block *_pcb, uint64_t _
  */
 extern int process_wake_up_state(struct process_control_block *pcb, uint64_t state);
 void __switch_to(struct process_control_block *prev, struct process_control_block *next);
-
-void process_open_stdio(struct process_control_block * pcb);

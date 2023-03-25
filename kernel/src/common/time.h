@@ -24,8 +24,8 @@ struct tm
 
 struct timespec
 {
-    long int tv_sec;    // 秒
-    long long tv_nsec;   // 纳秒
+    int64_t tv_sec;    // 秒
+    int64_t tv_nsec;   // 纳秒
 };
 
 /**

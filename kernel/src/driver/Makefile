@@ -1,7 +1,7 @@
 
 CFLAGS += -I .
 
-kernel_driver_subdirs:=video interrupt usb pci acpi disk keyboard mouse multiboot2 timers tty hid
+kernel_driver_subdirs:=video interrupt usb pci acpi disk keyboard mouse multiboot2 timers hid virtio
 
 ECHO:
 	@echo "$@"

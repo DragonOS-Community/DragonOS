@@ -1,5 +1,6 @@
 pub mod devfs;
-pub mod fat32;
+pub mod fat;
+pub mod mbr;
 pub mod procfs;
-pub mod rootfs;
+pub mod ramfs;
 pub mod vfs;

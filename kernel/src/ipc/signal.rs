@@ -1,8 +1,11 @@
 use core::{ffi::c_void, intrinsics::size_of, ptr::read_volatile, sync::atomic::compiler_fence};
 
+use alloc::boxed::Box;
+
 use crate::{
     arch::{
         asm::{bitops::ffz, current::current_pcb, ptrace::user_mode},
+        fpu::FpState,
         interrupt::sti,
     },
     include::bindings::bindings::{
@@ -658,9 +661,16 @@ fn setup_frame(
         (*frame).handler = ka._u._sa_handler as usize as *mut c_void;
     }
 
+    unsafe {
+        (*frame).context.sc_stack.fpstate = *(current_pcb().fp_state as usize as *mut FpState);
+        drop(current_pcb().fp_state);
+        current_pcb().fp_state = NULL as usize as *mut c_void;
+    }
+
     // 将siginfo拷贝到用户栈
     err |= copy_siginfo_to_user(unsafe { &mut (*frame).info }, info).unwrap_or(1);
 
+    //err|=copy_siginfo_to_user(unsafe{&mut(*frame).fpstate},current_pcb().fp_state).unwrap_or(1);
     // todo: 拷贝处理程序备用栈的地址、大小、ss_flags
 
     err |= setup_sigcontext(unsafe { &mut (*frame).context }, oldset, &regs).unwrap_or(1);
@@ -768,7 +778,11 @@ fn restore_sigcontext(context: *const sigcontext, regs: &mut pt_regs) -> bool {
         (*current_thread).trap_num = (*context).trap_num;
         (*current_thread).cr2 = (*context).cr2;
         (*current_thread).err_code = (*context).err_code;
+
+        let fp = Box::leak(Box::new((*context).sc_stack.fpstate));
+        current_pcb().fp_state = fp as *mut FpState as usize as *mut c_void;
     }
+
     return true;
 }
 

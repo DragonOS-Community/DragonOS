@@ -36,9 +36,9 @@ void print_copyright()
 }
 
 int main()
-{
+{   
     print_ascii_logo();
-
+    printf("%lf\n",0.5);
     print_copyright();
 
     return 0;

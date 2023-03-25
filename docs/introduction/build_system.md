@@ -146,7 +146,7 @@ sudo chown $USR /dev/kvm
 &emsp;&emsp;假设您的计算机上已经安装了git，您可以通过以下命令，获得DragonOS的最新的源代码：
 
 ```shell
-git clone https://github.com/fslongjin/DragonOS
+git clone https://github.com/DragonOS-Community/DragonOS
 cd DragonOS
 ```
 

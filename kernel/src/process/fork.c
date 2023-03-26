@@ -352,7 +352,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
     child_regs->rax = 0;
     if (pcb->flags & PF_KFORK)
         thd->rbp =
-            (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_system_call时的rbp）
+            (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_intr时的rbp）
     else
         thd->rbp = (uint64_t)pcb + STACK_SIZE;
 
@@ -360,14 +360,16 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
     thd->rsp = (uint64_t)child_regs;
     thd->fs = current_pcb->thread->fs;
     thd->gs = current_pcb->thread->gs;
-
+    if(pcb->pid>3){
+        kdebug("copy thread: pid=%d, user_mode=%d", pcb->pid, user_mode(child_regs));
+    }
     // 根据是否为内核线程、是否在内核态fork，设置进程的开始执行的地址
     if (pcb->flags & PF_KFORK)
-        thd->rip = (uint64_t)ret_from_system_call;
+        thd->rip = (uint64_t)ret_from_intr;
     else if (pcb->flags & PF_KTHREAD && (!(pcb->flags & PF_KFORK)))
         thd->rip = (uint64_t)kernel_thread_func;
     else
-        thd->rip = (uint64_t)ret_from_system_call;
+        thd->rip = (uint64_t)ret_from_intr;
 
     pcb->fp_state=rs_dup_fpstate();
 

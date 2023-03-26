@@ -126,11 +126,6 @@ Err_Code:
     jmp ret_from_exception
 
 
-// 从系统调用中返回
-ENTRY(ret_from_system_call)
-    jmp Restore_all
-
-
 // 0 #DE 除法错误
 ENTRY(divide_error)
     

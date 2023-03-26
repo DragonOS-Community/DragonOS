@@ -3,12 +3,12 @@ use core::{
         asm, global_asm,
         x86_64::{_fxrstor64, _fxsave64},
     },
-    ffi::c_void,
+    ffi::c_void, ptr::null_mut,
 };
 
 use alloc::boxed::Box;
 
-use crate::{include::bindings::bindings::pt_regs, kdebug, println};
+use crate::{include::bindings::bindings::{pt_regs, PAGE_OFFSET}, kdebug, println};
 
 use crate::arch::asm::ptrace::user_mode;
 use crate::current_pcb;
@@ -88,40 +88,44 @@ impl FpState {
 pub extern "C" fn fp_state_save(regs: &pt_regs) {
     if user_mode(regs) {
         let fp = Box::leak(Box::new(FpState::default()));
-        let i:u64;
-        unsafe{
-            asm!(
-                "mov {0},cr4",
-                out(reg) i,
-            );
-        }
-        let j:u64;
-        unsafe{
-            asm!(
-                "mov {0},cr0 ",
-                out(reg) j,
-            )
-        }
-        kdebug!("before fp_state_save   : cr0: {:#032b}, cr4: {:#032b}, pid={}",
-        j,i,current_pcb().pid);
+        // let i: u64;
+        // unsafe {
+        //     asm!(
+        //         "mov {0},cr4",
+        //         out(reg) i,
+        //     );
+        // }
+        // let j: u64;
+        // unsafe {
+        //     asm!(
+        //         "mov {0},cr0 ",
+        //         out(reg) j,
+        //     )
+        // }
+        // kdebug!(
+        //     "before fp_state_save   : cr0: {:#032b}, cr4: {:#032b}, pid={}",
+        //     j,
+        //     i,
+        //     current_pcb().pid
+        // );
         fp.save();
         current_pcb().fp_state = fp as *mut FpState as usize as *mut c_void;
         unsafe {
             asm!(
                 "mov rax, cr4",
-                "and ax,~(3<<9)",//[9][10]->0
+                "and ax,~(3<<9)", //[9][10]->0
                 "mov cr4,rax",
                 "mov rax, cr0",
-                "and ax,~(02h)",//[1]->0
-                "or ax, ~(0FFFBh)",//[2]->1
-                "mov cr0,rax" /*
-                              "mov rax, cr0",
-                              "and ax, 0xFFFB",
-                              "or ax,0x2",
-                              "mov cr0,rax",
-                              "mov rax, cr4",
-                              "or ax,3<<9",
-                              "mov cr4, rax" */
+                "and ax,~(02h)",    //[1]->0
+                "or ax, ~(0FFFBh)", //[2]->1
+                "mov cr0,rax"       /*
+                                    "mov rax, cr0",
+                                    "and ax, 0xFFFB",
+                                    "or ax,0x2",
+                                    "mov cr0,rax",
+                                    "mov rax, cr4",
+                                    "or ax,3<<9",
+                                    "mov cr4, rax" */
             )
         }
     }
@@ -133,26 +137,34 @@ pub extern "C" fn fp_state_restore(regs: &pt_regs) {
     //("HELLO_WORLD");
 
     //kdebug!("hello world");
-    if current_pcb().pid ==4{
-        kdebug!("the user mode of pid 4:{}",user_mode(regs));
-    }
+    // if current_pcb().pid == 4 {
+    //     kdebug!("the user mode of pid 4:{}", user_mode(regs));
+    // }
     if user_mode(regs) {
-        let i:u64;
-        unsafe{
+        if current_pcb().fp_state == null_mut() {
+            return;
+        }
+        
+        let i: u64;
+        unsafe {
             asm!(
                 "mov {0},cr4",
                 out(reg) i,
             );
         }
-        let j:u64;
-        unsafe{
+        let j: u64;
+        unsafe {
             asm!(
                 "mov {0},cr0 ",
                 out(reg) j,
             )
         }
-        kdebug!("before fp_state_restore: cr0: {:#032b}, cr4: {:#032b}, pid={}",
-        j,i,current_pcb().pid);
+        kdebug!(
+            "before fp_state_restore: cr0: {:#032b}, cr4: {:#032b}, pid={}",
+            j,
+            i,
+            current_pcb().pid
+        );
         //kdebug!("before fp_state_restore: ",current_pcb().pid);
         unsafe {
             asm! {
@@ -164,6 +176,9 @@ pub extern "C" fn fp_state_restore(regs: &pt_regs) {
                 "or ax,3<<9",
                 "mov cr4, rax"
             }
+        }
+        if (current_pcb().fp_state as usize )< (PAGE_OFFSET as usize){
+            kdebug!("fp_state address = 0x{:016x}", current_pcb().fp_state as usize);
         }
         let fp = unsafe { Box::from_raw(current_pcb().fp_state as usize as *mut FpState) };
         fp.as_ref().restore();

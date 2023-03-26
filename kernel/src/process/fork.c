@@ -134,11 +134,12 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     tsk->flags &= ~PF_KFORK;
 
+    // 创建对应procfs文件
+    rs_procfs_register_pid(tsk->pid);
+
     // 唤醒进程
     process_wakeup(tsk);
 
-    // 创建对应procfs文件
-    rs_procfs_register_pid(tsk->pid);
 
     return retval;
 
@@ -334,6 +335,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
 
         child_regs = (struct pt_regs *)(((uint64_t)pcb) + STACK_SIZE - size);
         memcpy(child_regs, (void *)current_regs, size);
+        
         barrier();
         // 然后重写新的栈中，每个栈帧的rbp值
         process_rewrite_rbp(child_regs, pcb);
@@ -366,6 +368,8 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
         thd->rip = (uint64_t)kernel_thread_func;
     else
         thd->rip = (uint64_t)ret_from_system_call;
+
+    pcb->fp_state=rs_dup_fpstate();
 
     return 0;
 }

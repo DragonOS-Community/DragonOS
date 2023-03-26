@@ -6,11 +6,11 @@ use core::{
 use alloc::boxed::Box;
 
 use crate::{
-    arch::asm::current::current_pcb,
+    arch::{asm::current::current_pcb, fpu::FpState},
     filesystem::vfs::file::{File, FileDescriptorVec},
     include::bindings::bindings::{
         process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_INTERRUPTIBLE,
-        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
+        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE, NULL,
     },
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
@@ -318,4 +318,22 @@ pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) ->
     }
 }
 
+#[allow(dead_code)]
+#[no_mangle]
+pub extern "C" fn rs_dup_fpstate()->*mut c_void{
+    if current_pcb().fp_state ==null_mut(){
+        return NULL as *mut c_void;
+    }
+    else{
+        let state=current_pcb().fp_state as usize as *mut FpState;
+        unsafe{
+            let st=Box::leak(Box::new((*state).dup_fpstate()));
+            return  st as *mut FpState as usize as *mut c_void;
+        }
+    }  
+}
+
+
 // =========== 以上为导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们 END ============
+
+

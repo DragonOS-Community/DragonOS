@@ -67,8 +67,10 @@ ENTRY(ret_from_intr)
 
     // 将原本要返回的栈帧的栈指针传入do_signal的第一个参数
     movq %rsp, %rdi
+    pushq %rdi
     callq do_signal
-    movq %rsp, %rdi
+    popq %rdi
+    //movq %rsp, %rdi
     callq fp_state_restore
     // 恢复寄存器
     jmp Restore_all
@@ -110,7 +112,16 @@ Err_Code:
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
-    
+    pushq %rsi
+    pushq %rdi
+    pushq %rdx
+
+    callq fp_state_save
+
+    popq %rdx
+    popq %rdi
+    popq %rsi
+
     callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
     jmp ret_from_exception
 

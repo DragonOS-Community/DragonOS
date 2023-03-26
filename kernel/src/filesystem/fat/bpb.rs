@@ -183,6 +183,48 @@ impl FATType {
     }
 }
 
+impl BiosParameterBlockLegacy {
+
+    /// @brief 验证FAT12/16 BPB的信息是否合法
+    fn validate(&self, bpb: &BiosParameterBlock) -> Result<(), i32> {
+        return Ok(());
+    }
+}
+
+impl BiosParameterBlockFAT32 {
+
+    /// @brief 验证BPB32的信息是否合法
+    fn validate(&self, bpb: &BiosParameterBlock) -> Result<(), i32> {
+
+        if bpb.fat_size_16 != 0 {
+            kerror!("Invalid fat_size_16 value in BPB (should be zero for FAT32)");
+            return Err(-(EINVAL as i32));
+        }
+
+        if bpb.root_entries_cnt != 0 {
+            kerror!("Invalid root_entries value in BPB (should be zero for FAT32)");
+            return Err(-(EINVAL as i32));
+        }
+
+        if bpb.total_sectors_16 != 0 {
+            kerror!("Invalid total_sectors_16 value in BPB (should be zero for FAT32)");
+            return Err(-(EINVAL as i32));
+        }
+
+        if self.fat_size_32 == 0 {
+            kerror!("Invalid fat_size_32 value in BPB (should be non-zero for FAT32)");
+            return Err(-(EINVAL as i32));
+        }
+
+        if self.fs_version != 0 {
+            kerror!("Unknown FAT FS version");
+            return Err(-(EINVAL as i32));
+        }
+
+        return Ok(());
+    }
+}
+
 impl BiosParameterBlock {
     pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, i32> {
         let mut v = Vec::with_capacity(LBA_SIZE);
@@ -267,16 +309,14 @@ impl BiosParameterBlock {
             FATType::FAT32(bpb32)
         };
 
-        if let FATType::FAT32(_) = bpb.fat_type {
-            // 验证BPB32的信息是否合法
-            bpb.validate(&bpb32)?;
-        }
+        // 验证BPB的信息是否合法
+        bpb.validate()?;
 
         return Ok(bpb);
     }
 
     /// @brief 验证BPB32的信息是否合法
-    pub fn validate(&self, bpb32: &BiosParameterBlockFAT32) -> Result<(), i32> {
+    pub fn validate(&self) -> Result<(), i32> {
         // 校验每扇区字节数是否合法
         if self.bytes_per_sector.count_ones() != 1 {
             kerror!("Invalid bytes per sector(not a power of 2)");
@@ -299,41 +339,25 @@ impl BiosParameterBlock {
             return Err(-(EINVAL as i32));
         }
 
-        if self.root_entries_cnt != 0 {
-            kerror!("Invalid root_entries value in BPB (should be zero for FAT32)");
-            return Err(-(EINVAL as i32));
-        }
-
-        if self.total_sectors_16 != 0 {
-            kerror!("Invalid total_sectors_16 value in BPB (should be zero for FAT32)");
-            return Err(-(EINVAL as i32));
-        }
-
         if (self.total_sectors_16 == 0) && (self.total_sectors_32 == 0) {
             kerror!("Invalid BPB (total_sectors_16 or total_sectors_32 should be non-zero)");
             return Err(-(EINVAL as i32));
         }
 
-        if bpb32.fat_size_32 == 0 {
-            kerror!("Invalid fat_size_32 value in BPB (should be non-zero for FAT32)");
-            return Err(-(EINVAL as i32));
-        }
-
-        if bpb32.fs_version != 0 {
-            kerror!("Unknown FAT FS version");
-            return Err(-(EINVAL as i32));
-        }
+        let fat_size = match self.fat_type {
+            FATType::FAT32(bpb32) => {
+                bpb32.validate(self)?;
+                bpb32.fat_size_32
+            },
+            FATType::FAT16(bpb_legacy) | FATType::FAT12(bpb_legacy) => {
+                bpb_legacy.validate(self)?;
+                self.fat_size_16 as u32
+            }
+        };
 
         let root_sectors = ((self.root_entries_cnt as u32 * 32)
             + (self.bytes_per_sector as u32 - 1))
             / (self.bytes_per_sector as u32);
-
-        // 每FAT扇区数
-        let fat_size = if self.fat_size_16 != 0 {
-            self.fat_size_16 as u32
-        } else {
-            bpb32.fat_size_32
-        };
 
         // 当前分区总扇区数
         let total_sectors = if self.total_sectors_16 != 0 {
@@ -344,11 +368,6 @@ impl BiosParameterBlock {
 
         let first_data_sector =
             (self.rsvd_sec_cnt as u32) + (self.num_fats as u32) * fat_size + root_sectors;
-
-        // 数据区扇区数
-        let data_sectors = total_sectors - first_data_sector;
-        // 总的数据簇数量（向下对齐）
-        let count_clusters = data_sectors / (self.sector_per_cluster as u32);
 
         // 总扇区数应当大于第一个数据扇区的扇区号
         if total_sectors <= first_data_sector {

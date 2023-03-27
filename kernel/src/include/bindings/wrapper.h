@@ -29,6 +29,7 @@
 #include <common/time.h>
 #include <common/unistd.h>
 #include <common/string.h>
+#include <common/idr.h>
 #include <driver/disk/ahci/ahci.h>
 #include <driver/disk/ahci/ahci_rust.h>
 #include <driver/pci/pci.h>
@@ -44,4 +45,3 @@
 #include <driver/pci/pci.h>
 #include <driver/virtio/virtio.h>
 #include <smp/smp.h>
-

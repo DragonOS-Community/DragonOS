@@ -18,7 +18,7 @@ lazy_static! {
     pub static ref NET_FACES: RwLock<BTreeMap<usize, Arc<Interface>>> = RwLock::new(BTreeMap::new());
 }
 
-/// @brief 生成网络接口的id
+/// @brief 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {
     static IFACE_ID: AtomicUsize = AtomicUsize::new(0);
     return IFACE_ID
@@ -26,7 +26,7 @@ pub fn generate_iface_id() -> usize {
         .into();
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Endpoint {
     /// 链路层端点
     LinkLayer(endpoints::LinkLayerEndpoint),
@@ -100,17 +100,17 @@ pub trait Socket: Sync + Send + Debug {
         return None;
     }
 
-    /// @brief 
-    ///     The purpose of the poll function is to provide 
-    ///     a non-blocking way to check if a socket is ready for reading or writing, 
-    ///     so that you can efficiently handle multiple sockets in a single thread or event loop. 
-    /// 
-    /// @return (in, out, err) 
-    /// 
+    /// @brief
+    ///     The purpose of the poll function is to provide
+    ///     a non-blocking way to check if a socket is ready for reading or writing,
+    ///     so that you can efficiently handle multiple sockets in a single thread or event loop.
+    ///
+    /// @return (in, out, err)
+    ///
     ///     The first boolean value indicates whether the socket is ready for reading. If it is true, then there is data available to be read from the socket without blocking.
     ///     The second boolean value indicates whether the socket is ready for writing. If it is true, then data can be written to the socket without blocking.
     ///     The third boolean value indicates whether the socket has encountered an error condition. If it is true, then the socket is in an error state and should be closed or reset
-    /// 
+    ///
     fn poll(&self) -> (bool, bool, bool) {
         return (false, false, false);
     }
@@ -222,9 +222,12 @@ impl Into<u8> for Protocol {
     }
 }
 
+/// @brief 对smoltcp的Interface做了简单的封装
+///
+/// smoltcp 中的接口是一个高级抽象，它允许应用程序或操作系统以一致和统一的方式与网络硬件交互，而不管所使用的具体硬件类型如何。
 pub struct Interface {
     inner_iface: smoltcp::iface::Interface,
-    pub iface_id: usize,
+    pub iface_id: usize, // 接口的全局ID
 }
 
 impl Debug for Interface {

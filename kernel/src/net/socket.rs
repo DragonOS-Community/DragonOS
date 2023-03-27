@@ -1,14 +1,15 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use smoltcp::{
     iface::{self, SocketHandle, SocketSet},
-    socket::raw,
-    wire::{IpAddress, IpProtocol, Ipv4Packet},
+    socket::{raw, tcp, udp},
+    wire::{IpAddress, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address},
 };
 
 use crate::{
     driver::{net::NetDriver, NET_DRIVERS},
-    kwarn,
-    libs::spinlock::SpinLock,
+    include::bindings::bindings::ida,
+    kerror, kwarn,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{Interface, NET_FACES},
     syscall::SystemError,
 };
@@ -20,25 +21,26 @@ lazy_static! {
     /// TODO: 优化这里，自己实现SocketSet！！！现在这样的话，不管全局有多少个网卡，每个时间点都只会有1个进程能够访问socket
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
 }
+
 /// @brief socket的句柄管理组件。
 /// 它在smoltcp的SocketHandle上封装了一层，增加更多的功能。
 /// 比如，在socket被关闭时，自动释放socket的资源，通知系统的其他组件。
 #[derive(Debug)]
-struct SocketHandler(SocketHandle);
+struct GlobalSocketHandle(SocketHandle);
 
-impl SocketHandler {
-    pub fn new(handler: SocketHandle) -> Self {
-        Self(handler)
+impl GlobalSocketHandle {
+    pub fn new(handle: SocketHandle) -> Self {
+        Self(handle)
     }
 }
 
-impl Clone for SocketHandler {
+impl Clone for GlobalSocketHandle {
     fn clone(&self) -> Self {
         Self(self.0)
     }
 }
 
-impl Drop for SocketHandler {
+impl Drop for GlobalSocketHandle {
     fn drop(&mut self) {
         todo!()
     }
@@ -47,7 +49,7 @@ impl Drop for SocketHandler {
 /// @brief socket的类型
 #[derive(Debug)]
 pub enum SocketType {
-    /// 原始的socket 
+    /// 原始的socket
     RawSocket = 0x01,
     /// 用于Tcp通信的 Socket
     TcpSocket = 0x02,
@@ -71,7 +73,9 @@ bitflags! {
         const REUSEPORT = 1 << 4;
     }
 }
+
 #[derive(Debug)]
+/// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
 pub struct SocketMetadata {
     /// socket的类型
     socket_type: SocketType,
@@ -85,12 +89,12 @@ pub struct SocketMetadata {
     options: SocketOptions,
 }
 
-/// @brief 表示原始的socket
+/// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
 ///
 /// ref: https://man7.org/linux/man-pages/man7/raw.7.html
 #[derive(Debug, Clone)]
 pub struct RawSocket {
-    handler: SocketHandler,
+    handle: GlobalSocketHandle,
     /// 用户发送的数据包是否包含了IP头.
     /// 如果是true，用户发送的数据包，必须包含IP头。（即用户要自行设置IP头+数据）
     /// 如果是false，用户发送的数据包，不包含IP头。（即用户只要设置数据）
@@ -102,9 +106,9 @@ pub struct RawSocket {
 impl RawSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-    /// 默认的发送缓冲区的大小
+    /// 默认的发送缓冲区的大小 transmiss
     pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
-    /// 默认的接收缓冲区的大小
+    /// 默认的接收缓冲区的大小 receive
     pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
 
     /// @brief 创建一个原始的socket
@@ -129,11 +133,12 @@ impl RawSocket {
             tx_buffer,
             rx_buffer,
         );
+
         // 把socket添加到socket集合中，并得到socket的句柄
-        let handler: SocketHandler = SocketHandler::new(SOCKET_SET.lock().add(socket));
+        let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
 
         return Self {
-            handler,
+            handle,
             header_included: false,
             options,
         };
@@ -145,7 +150,7 @@ impl Socket for RawSocket {
         loop {
             // 如何优化这里？
             let mut socket_set_guard = SOCKET_SET.lock();
-            let socket = socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
+            let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
 
             match socket.recv_slice(buf) {
                 Ok(len) => {
@@ -174,7 +179,7 @@ impl Socket for RawSocket {
         // 如果用户发送的数据包，包含IP头，则直接发送
         if self.header_included {
             let mut socket_set_guard = SOCKET_SET.lock();
-            let socket = socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
+            let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
             match socket.send_slice(buf) {
                 Ok(_len) => {
                     return Ok(buf.len());
@@ -186,10 +191,10 @@ impl Socket for RawSocket {
         } else {
             // 如果用户发送的数据包，不包含IP头，则需要自己构造IP头
 
-            if let Some(Endpoint::Ip(to)) = to {
+            if let Some(Endpoint::Ip(endpoint)) = to {
                 let mut socket_set_guard = SOCKET_SET.lock();
                 let socket: &mut raw::Socket =
-                    socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
+                    socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
 
                 // 暴力解决方案：只考虑0号网卡。 TODO：考虑多网卡的情况！！！
                 let iface: Arc<Interface> = NET_FACES.read().get(&0).unwrap().clone();
@@ -202,23 +207,28 @@ impl Socket for RawSocket {
                 }
                 let ipv4_src_addr = ipv4_src_addr.unwrap();
 
-                if let IpAddress::Ipv4(ipv4_dst) = to.addr {
+                if let IpAddress::Ipv4(ipv4_dst) = endpoint.addr {
                     let len = buf.len();
 
                     // 创建20字节的IPv4头部
                     let mut buffer: Vec<u8> = vec![0u8; len + 20];
                     let mut packet: Ipv4Packet<&mut Vec<u8>> =
                         Ipv4Packet::new_unchecked(&mut buffer);
+
+                    // 封装ipv4 header
                     packet.set_version(4);
                     packet.set_header_len(20);
                     packet.set_total_len((20 + len) as u16);
                     packet.set_src_addr(ipv4_src_addr);
                     packet.set_dst_addr(ipv4_dst);
+
                     // 设置ipv4 header的protocol字段
                     packet.set_next_header(socket.ip_protocol().into());
+
                     // 获取IP数据包的负载字段
                     let payload: &mut [u8] = packet.payload_mut();
                     payload.copy_from_slice(buf);
+
                     // 填充checksum字段
                     packet.fill_checksum();
 
@@ -231,7 +241,7 @@ impl Socket for RawSocket {
                     // poll?
                     return Ok(len);
                 } else {
-                    kwarn!("Invalid Ip protocol type!");
+                    kwarn!("Unsupport Ip protocol type!");
                     return Err(SystemError::EINVAL);
                 }
             } else {
@@ -252,4 +262,258 @@ impl Socket for RawSocket {
     fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
         return Box::new(self.clone());
     }
+}
+
+/// @brief 表示udp socket
+///
+/// https://man7.org/linux/man-pages/man7/udp.7.html
+#[derive(Debug, Clone)]
+pub struct UdpSocket {
+    handle: GlobalSocketHandle,
+    remote_endpoint: Option<Endpoint>, // 记录远程endpoint提供给connect()， 应该使用IP地址。
+    options: SocketOptions,
+}
+
+impl UdpSocket {
+    /// 元数据的缓冲区的大小
+    pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的接收缓冲区的大小 receive
+    pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+
+    /// @brief 创建一个原始的socket
+    ///
+    /// @param protocol 协议号
+    /// @param options socket的选项
+    ///
+    /// @return 返回创建的原始的socket
+    pub fn new(options: SocketOptions) -> Self {
+        let tx_buffer = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
+            vec![0; Self::DEFAULT_TX_BUF_SIZE],
+        );
+        let rx_buffer = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
+            vec![0; Self::DEFAULT_RX_BUF_SIZE],
+        );
+        let socket = udp::Socket::new(tx_buffer, rx_buffer);
+
+        // 把socket添加到socket集合中，并得到socket的句柄
+        let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+
+        return Self {
+            handle,
+            remote_endpoint: None,
+            options,
+        };
+    }
+}
+
+impl Socket for UdpSocket {
+    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError> {
+        loop {
+            let mut socket_set_guard = SOCKET_SET.lock();
+            let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
+
+            if socket.can_recv() {
+                if let Ok((size, endpoint)) = socket.recv_slice(buf) {
+                    drop(socket);
+                    drop(socket_set_guard);
+
+                    return Ok((size, Endpoint::Ip(endpoint)));
+                }
+            } else {
+                return Err(SystemError::ENOTCONN);
+            }
+        }
+    }
+
+    fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+        let endpoint: &IpEndpoint = {
+            if let Some(Endpoint::Ip(ref endpoint)) = to {
+                endpoint
+            } else if let Some(Endpoint::Ip(ref endpoint)) = self.remote_endpoint {
+                endpoint
+            } else {
+                return Err(SystemError::ENOTCONN);
+            }
+        };
+
+        let mut socket_set_guard = SOCKET_SET.lock();
+        let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
+
+        if socket.endpoint().port == 0 {
+            let temp_port = get_ephemeral_port();
+
+            match endpoint.addr {
+                IpAddress::Ipv4(_) => {
+                    socket
+                        .bind(IpEndpoint::new(
+                            smoltcp::wire::IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                            temp_port,
+                        ))
+                        .unwrap();
+                }
+                IpAddress::Ipv6(_) => {
+                    socket
+                        .bind(IpEndpoint::new(
+                            smoltcp::wire::IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+                            temp_port,
+                        ))
+                        .unwrap();
+                }
+            }
+        }
+
+        return if socket.can_send() {
+            match socket.send_slice(&buf, *endpoint) {
+                Ok(()) => {
+                    // avoid deadlock
+                    drop(socket);
+                    drop(socket_set_guard);
+
+                    Ok(buf.len())
+                }
+                Err(_) => Err(SystemError::ENOBUFS),
+            }
+        } else {
+            Err(SystemError::ENOBUFS)
+        };
+    }
+
+    fn connect(&self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+        return Ok(());
+    }
+
+    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
+        todo!()
+    }
+
+    fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
+        return Box::new(self.clone());
+    }
+}
+
+/// @brief 表示 tcp socket
+///
+/// https://man7.org/linux/man-pages/man7/tcp.7.html
+#[derive(Debug, Clone)]
+pub struct TcpSocket {
+    handle: GlobalSocketHandle,
+    local_endpoint: Option<IpEndpoint>, // save local endpoint for bind()
+    is_listening: bool,
+    options: SocketOptions,
+}
+
+impl TcpSocket {
+    /// 元数据的缓冲区的大小
+    pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的接收缓冲区的大小 receive
+    pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+
+    /// @brief 创建一个原始的socket
+    ///
+    /// @param protocol 协议号
+    /// @param options socket的选项
+    ///
+    /// @return 返回创建的原始的socket
+    pub fn new(options: SocketOptions) -> Self {
+        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
+        let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
+        let socket = tcp::Socket::new(tx_buffer, rx_buffer);
+
+        // 把socket添加到socket集合中，并得到socket的句柄
+        let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+
+        return Self {
+            handle,
+            local_endpoint: None,
+            is_listening: false,
+            options,
+        };
+    }
+}
+
+impl Socket for TcpSocket {
+    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError> {
+        loop {
+            let mut socket_set_guard = SOCKET_SET.lock();
+            let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
+
+            if socket.may_recv() {
+                if let Ok(size) = socket.recv_slice(buf) {
+                    if size > 0 {
+                        let endpoint = if let Some(p) = socket.remote_endpoint() {
+                            p
+                        } else {
+                            return Err(SystemError::ENOTCONN);
+                        };
+
+                        drop(socket);
+                        drop(socket_set_guard);
+
+                        return Ok((size, Endpoint::Ip(endpoint)));
+                    }
+                }
+            } else {
+                return Err(SystemError::ENOTCONN);
+            }
+        }
+    }
+
+    fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+        let mut socket_set_guard = SOCKET_SET.lock();
+        let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
+
+        if socket.is_open() {
+            if socket.can_send() {
+                match socket.send_slice(buf) {
+                    Ok(size) => {
+                        drop(socket);
+                        drop(socket_set_guard);
+
+                        return Ok(size);
+                    }
+                    Err(e) => {
+                        kerror!("Tcp Socket Write Error {e:?}");
+                        return Err(SystemError::ENOBUFS);
+                    }
+                }
+            } else {
+                return Err(SystemError::ENOBUFS);
+            }
+        }
+
+        return Err(SystemError::ENOTCONN);
+    }
+
+    fn connect(&self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+        return Ok(());
+    }
+
+    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
+        todo!()
+    }
+
+    fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
+        return Box::new(self.clone());
+    }
+}
+
+/// @brief 标记PORT是否被使用
+pub static mut PORT_RECORD: [bool; 65536_usize] = [false; 65536_usize];
+
+/// @breif 自动分配一个未被使用的PORT
+fn get_ephemeral_port() -> u16 {
+    for i in 0..65536 {
+        if !unsafe { PORT_RECORD[i] } {
+            unsafe { PORT_RECORD[i] = true };
+            return i as u16;
+        }
+    }
+
+    return 0;
 }

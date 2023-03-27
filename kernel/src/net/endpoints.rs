@@ -1,7 +1,7 @@
 pub use smoltcp::wire::IpEndpoint;
 
 /// @brief 链路层端点
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LinkLayerEndpoint {
     /// 网卡的接口号
     pub interface: usize,

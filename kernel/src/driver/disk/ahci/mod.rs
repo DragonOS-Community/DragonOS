@@ -45,7 +45,7 @@ pub extern "C" fn ahci_init() -> i32 {
     if r.is_ok() {
         return 0;
     } else {
-        return -(r.unwrap_err() as i32);
+        return r.unwrap_err().to_posix_errno();
     }
 }
 /// @brief: 初始化 ahci
@@ -176,8 +176,8 @@ pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, SystemErro
         }
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return Err(SystemError::E2BIG);
-    //return Err(-1);老代码
+    return Err(SystemError::ENXIO);
+
 }
 
 /// @brief: 通过 ctrl_num 和 port_num 获取 port

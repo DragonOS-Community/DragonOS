@@ -1,4 +1,5 @@
 use core::{ffi::c_void, intrinsics::size_of, ptr::read_volatile, sync::atomic::compiler_fence};
+//use std::alloc::System;注释原因：全部替换为SystemError后报错->use of undeclared crate or module `std`
 
 use crate::{
     arch::{
@@ -7,7 +8,7 @@ use crate::{
     },
     include::bindings::bindings::{
         pid_t, process_control_block, process_do_exit, process_find_pcb_by_pid, pt_regs,
-        spinlock_t, verify_area, EFAULT, EINVAL, NULL, PF_EXITING,
+        spinlock_t, verify_area, NULL, PF_EXITING,
         PF_KTHREAD, PF_SIGNALED, PF_WAKEKILL, PROC_INTERRUPTIBLE, USER_CS, USER_DS,
         USER_MAX_LINEAR_ADDR,
     },
@@ -68,7 +69,7 @@ pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     if sig == SignalNumber::INVALID {
         // 传入的signal数值不合法
         kwarn!("Not a valid signal number");
-        return (-(EINVAL as i64)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     // 初始化signal info
@@ -92,7 +93,7 @@ pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     if retval.is_ok() {
         x = retval.unwrap();
     } else {
-        x = -(retval.unwrap_err() as i32);
+        x = retval.unwrap_err().to_posix_errno();
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -680,7 +681,10 @@ fn setup_frame(
     }
     if err != 0 {
         // todo: 在这里生成一个sigsegv,然后core dump
-        return Err(SystemError::E2BIG);
+        //临时解决方案：退出当前进程
+        unsafe{
+            process_do_exit(1);
+        }
     }
     // 传入信号处理函数的第一个参数
     regs.rdi = sig as u64;
@@ -704,8 +708,8 @@ fn setup_frame(
     // 设置cs和ds寄存器
     regs.cs = (USER_CS | 0x3) as u64;
     regs.ds = (USER_DS | 0x3) as u64;
-
-    return if err == 0 { Ok(0) } else { Err(SystemError::E2BIG) };
+    
+    return if err == 0 { Ok(0) } else { Err(Option::unwrap(SystemError::from_posix_errno(1))) };
 }
 
 #[inline(always)]
@@ -814,7 +818,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
     if !act.is_null() {
         // 如果参数的范围不在用户空间，则返回错误
         if unsafe { !verify_area(act as usize as u64, size_of::<sigaction>() as u64) } {
-            return (-(EFAULT as i64)) as u64;
+            return SystemError::EFAULT.to_posix_errno() as u64;
         }
         let mask: sigset_t = unsafe { (*act).sa_mask };
         let _input_sah = unsafe { (*act).sa_handler as u64 };
@@ -863,7 +867,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
     let sig = SignalNumber::from(regs.r8 as i32);
     // 如果给出的信号值不合法
     if sig == SignalNumber::INVALID {
-        return (-(EINVAL as i64)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     let retval = do_sigaction(
@@ -883,7 +887,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
     // 将原本的sigaction拷贝到用户程序指定的地址
     if (retval == Ok(())) && (!old_act.is_null()) {
         if unsafe { !verify_area(old_act as usize as u64, size_of::<sigaction>() as u64) } {
-            return (-(EFAULT as i64)) as u64;
+            return SystemError::EFAULT.to_posix_errno() as u64;
         }
         // ！！！！！！！！！！todo: 检查这里old_ka的mask，是否位SIG_IGN SIG_DFL,如果是，则将_sa_handler字段替换为对应的值
         let sah: u64;
@@ -905,7 +909,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
         }
     }
     //return retval as u64;
-    return -SystemError::to_posix_errno(&retval.unwrap_err()) as u64;
+    return retval.unwrap_err().to_posix_errno() as u64;
 }
 
 fn do_sigaction(

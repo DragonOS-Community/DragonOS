@@ -503,7 +503,6 @@ impl MmioBuddyMemPool {
                             vm_area_del(*vma);
                             vm_area_free(*vma);
                         }
-                        SystemError::from_posix_errno(retval);
                         return Err(SystemError::from_posix_errno(retval).unwrap());
                     }
                     loop_i += PAGE_2M_SIZE as u64;
@@ -700,7 +699,7 @@ pub extern "C" fn mmio_create(
     res_length: *mut u64,
 ) -> i32 {
     if let Err(err) = MMIO_POOL.create_mmio(size, vm_flags, res_vaddr, res_length) {
-        return -(err as i32);
+        return err.to_posix_errno();
     } else {
         return 0;
     }
@@ -718,7 +717,7 @@ pub extern "C" fn mmio_create(
 #[no_mangle]
 pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> i32 {
     if let Err(err) = MMIO_POOL.release_mmio(vaddr, length) {
-        return -(err as i32);
+        return err.to_posix_errno();
     } else {
         return 0;
     }

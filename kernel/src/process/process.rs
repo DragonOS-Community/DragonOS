@@ -282,7 +282,7 @@ pub extern "C" fn process_init_files() -> i32 {
     if r.is_ok() {
         return 0;
     } else {
-        return -(r.unwrap_err() as i32);
+        return r.unwrap_err().to_posix_errno();
     }
 }
 
@@ -299,7 +299,7 @@ pub extern "C" fn process_copy_files(
     if r.is_ok() {
         return 0;
     } else {
-        return -(r.unwrap_err() as i32);
+        return r.unwrap_err().to_posix_errno();
     }
 }
 
@@ -314,7 +314,7 @@ pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) ->
     if r.is_ok() {
         return 0;
     } else {
-        return -(r.unwrap_err() as i32);
+        return r.unwrap_err().to_posix_errno();
     }
 }
 

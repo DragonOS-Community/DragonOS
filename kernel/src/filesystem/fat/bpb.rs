@@ -8,7 +8,7 @@ use crate::{
     libs::vec_cursor::VecCursor,
 };
 
-use super::fs::Cluster;
+use super::fs::{Cluster, FATFileSystem};
 
 /// 对于所有的FAT文件系统都适用的Bios Parameter Block结构体
 #[derive(Debug, Clone, Copy, Default)]
@@ -61,10 +61,6 @@ pub struct BiosParameterBlock {
     /// 引导扇区结束标志0xAA55
     pub trail_sig: u16,
 }
-
-const MAX_FAT12: u32 = 0xFF4;
-const MAX_FAT16: u32 = 0xFFF4;
-const MAX_FAT32: u32 = 0x0FFFFFF6;
 
 #[derive(Debug, Clone, Copy)]
 pub enum FATType {
@@ -184,18 +180,15 @@ impl FATType {
 }
 
 impl BiosParameterBlockLegacy {
-
     /// @brief 验证FAT12/16 BPB的信息是否合法
-    fn validate(&self, bpb: &BiosParameterBlock) -> Result<(), i32> {
+    fn validate(&self, _bpb: &BiosParameterBlock) -> Result<(), i32> {
         return Ok(());
     }
 }
 
 impl BiosParameterBlockFAT32 {
-
     /// @brief 验证BPB32的信息是否合法
     fn validate(&self, bpb: &BiosParameterBlock) -> Result<(), i32> {
-
         if bpb.fat_size_16 != 0 {
             kerror!("Invalid fat_size_16 value in BPB (should be zero for FAT32)");
             return Err(-(EINVAL as i32));
@@ -301,12 +294,15 @@ impl BiosParameterBlock {
         let count_clusters = data_sectors / (bpb.sector_per_cluster as u32);
 
         // 设置FAT类型
-        bpb.fat_type = if count_clusters <= MAX_FAT12 {
+        bpb.fat_type = if count_clusters < FATFileSystem::FAT12_MAX_CLUSTER {
             FATType::FAT12(BiosParameterBlockLegacy::default())
-        } else if count_clusters <= MAX_FAT16 {
+        } else if count_clusters <= FATFileSystem::FAT16_MAX_CLUSTER {
             FATType::FAT16(BiosParameterBlockLegacy::default())
-        } else {
+        } else if count_clusters < FATFileSystem::FAT32_MAX_CLUSTER {
             FATType::FAT32(bpb32)
+        } else {
+            // 都不符合条件，报错
+            return Err(-(EINVAL as i32));
         };
 
         // 验证BPB的信息是否合法
@@ -315,7 +311,7 @@ impl BiosParameterBlock {
         return Ok(bpb);
     }
 
-    /// @brief 验证BPB32的信息是否合法
+    /// @brief 验证BPB的信息是否合法
     pub fn validate(&self) -> Result<(), i32> {
         // 校验每扇区字节数是否合法
         if self.bytes_per_sector.count_ones() != 1 {
@@ -348,7 +344,7 @@ impl BiosParameterBlock {
             FATType::FAT32(bpb32) => {
                 bpb32.validate(self)?;
                 bpb32.fat_size_32
-            },
+            }
             FATType::FAT16(bpb_legacy) | FATType::FAT12(bpb_legacy) => {
                 bpb_legacy.validate(self)?;
                 self.fat_size_16 as u32

@@ -1,3 +1,5 @@
+use core::marker::PhantomData;
+
 use crate::filesystem::vfs::ROOT_INODE;
 use crate::kdebug;
 use crate::syscall::SystemError;
@@ -19,7 +21,8 @@ pub enum KeyFlag {
 
 pub const FLAG_BREAK: u8 = 0x80; // 用于判断按键是否被按下
 
-/// 按键状态机
+/// 按键状态
+#[derive(Debug)]
 pub struct ScanCodeStatus {
     // Shift 按键
     shift_l: bool,
@@ -83,8 +86,6 @@ impl ScanCodeStatus {
 lazy_static! {
     static ref SCAN_CODE_STATUS: RwLock<ScanCodeStatus> = RwLock::new(ScanCodeStatus::new());
 }
-
-const PAUSE_BREAK_SCAN_CODE: [u8; 6] = [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5];
 
 const KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x00*/ 0, 0, /*0x01*/ 0, 0, // ESC
@@ -170,6 +171,7 @@ const KEY_CODE_MAPTABLE: [u8; 256] = [
 ///        如果是可显示字符，则返回 按下/抬起 的字符的ASCII码
 ///     key_flag key的类型，目前只有printScreen和pausebreak两个功能键，其他都是otherkey
 pub fn keyboard_get_keycode() -> Result<(u8, KeyFlag), SystemError> {
+    static PAUSE_BREAK_SCAN_CODE: [u8; 6] = [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5];
     let mut ch: u8 = u8::MAX;
     let mut key = KeyFlag::NoneFlag;
     let flag_make; // 按下/抬起
@@ -475,4 +477,136 @@ fn keyboard_get_scancode() -> Result<i32, SystemError> {
         return Err(SystemError::EIO);
     }
     return Ok(buf[0] as i32);
+}
+
+/// @brief 第一类扫描码状态机的状态
+#[derive(Debug)]
+enum TypeOneFSMState {
+    /// 起始状态
+    Start,
+    /// PauseBreak 第n个扫描码
+    PauseBreak(u8),
+    /// 多扫描码功能键起始状态
+    Func0,
+    /// 第三类扫描码或字符
+    Type3,
+
+    PrtscPress(u8),
+}
+
+impl TypeOneFSMState {
+    /// @brief 状态机总控程序
+    fn parse(&self, scancode: u8) -> TypeOneFSMState {
+        match self {
+            TypeOneFSMState::Start => {
+                return self.handle_start(scancode);
+            }
+            TypeOneFSMState::PauseBreak(n) => {
+                return self.handle_pause_break(*n);
+            }
+            TypeOneFSMState::Func0 => {
+                return self.handle_func0(scancode);
+            }
+            TypeOneFSMState::Type3 => {
+                return self.handle_type3(scancode);
+            }
+            TypeOneFSMState::PrtscPress(n) => return self.handle_prtsc_press(*n),
+        }
+    }
+
+    /// @brief 处理起始状态
+    fn handle_start(&self, scancode: u8) -> TypeOneFSMState {
+        match scancode {
+            0xe1 => {
+                return TypeOneFSMState::PauseBreak(1);
+            }
+            0xe0 => {
+                return TypeOneFSMState::Func0;
+            }
+            _ => {
+                return TypeOneFSMState::Type3;
+            }
+        }
+    }
+
+    /// @brief 处理PauseBreak状态
+    fn handle_pause_break(&self, scancode: u8) -> TypeOneFSMState {
+        static PAUSE_BREAK_SCAN_CODE: [u8; 6] = [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5];
+        let i = match self {
+            TypeOneFSMState::PauseBreak(i) => *i,
+            _ => {
+                return self.handle_type3(scancode);
+            }
+        };
+        if scancode != PAUSE_BREAK_SCAN_CODE[i as usize] {
+            return self.handle_type3(scancode);
+        } else {
+            if i == 5 {
+                // 所有Pause Break扫描码都被清除
+                return TypeOneFSMState::Start;
+            } else {
+                return TypeOneFSMState::PauseBreak(i + 1);
+            }
+        }
+    }
+
+    fn handle_func0(&self, scancode: u8) -> TypeOneFSMState {
+        match scancode {
+            0x2a => {
+                return TypeOneFSMState::PrtscPress(2);
+            }
+            _ => {
+                todo!()
+            }
+        }
+    }
+
+    fn handle_type3(&self, scancode: u8) -> TypeOneFSMState {
+        todo!()
+    }
+
+    /// @brief 处理Prtsc按下事件
+    fn handle_prtsc_press(&self, scancode: u8) -> TypeOneFSMState {
+        static PRTSC_SCAN_CODE: [u8; 4] = [0xe0, 0x2a, 0xe0, 0x37];
+        let i = match self {
+            TypeOneFSMState::PrtscPress(i) => *i,
+            _ => return TypeOneFSMState::Start, // 解析错误，返回起始状态
+        };
+        if i > 3 {
+            // 解析错误，返回起始状态
+            return TypeOneFSMState::Start;
+        }
+        if scancode != PRTSC_SCAN_CODE[i as usize] {
+            return self.handle_type3(scancode);
+        } else {
+            if i == 2 {
+                // 成功解析出PrtscPress
+                return TypeOneFSMState::Start;
+            } else {
+                // 继续解析
+                return TypeOneFSMState::PrtscPress(i + 1);
+            }
+        }
+    }
+}
+
+/// @brief A FSM to parse type one keyboard scan code
+#[derive(Debug)]
+struct TypeOneFSM {
+    state: ScanCodeStatus,
+    current_state: TypeOneFSMState,
+}
+
+impl TypeOneFSM {
+    fn new() -> Self {
+        Self {
+            state: ScanCodeStatus::new(),
+            current_state: TypeOneFSMState::Start,
+        }
+    }
+
+    /// @brief 解析扫描码
+    fn parse(&mut self, scancode: u8) {
+        self.current_state = self.current_state.parse(scancode);
+    }
 }

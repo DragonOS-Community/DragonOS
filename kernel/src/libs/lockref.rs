@@ -170,7 +170,7 @@ impl LockRef {
      * @brief 引用计数自增1。（除非该lockref已经被标记为死亡）
      *
      * @return Ok(self.count) 操作成功
-     * @return Err(SystemError::EPERM)) 操作失败，lockref已死亡
+     * @return Err(SystemError::EPERM) 操作失败，lockref已死亡
      */
     pub fn inc_not_dead(&mut self) -> Result<i32, SystemError> {
         {

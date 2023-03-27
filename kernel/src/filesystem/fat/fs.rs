@@ -242,7 +242,14 @@ impl FileSystem for FATFileSystem {
 }
 
 impl FATFileSystem {
-    pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, SystemError> {
+    /// FAT12允许的最大簇号
+    pub const FAT12_MAX_CLUSTER: u32 = 0xFF5;
+    /// FAT16允许的最大簇号
+    pub const FAT16_MAX_CLUSTER: u32 = 0xFFF5;
+    /// FAT32允许的最大簇号
+    pub const FAT32_MAX_CLUSTER: u32 = 0x0FFFFFF7;
+
+    pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, i32> {
         let bpb = BiosParameterBlock::new(partition.clone())?;
 
         // 从磁盘上读取FAT32文件系统的FsInfo结构体

@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec, boxed::Box};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use smoltcp::{
     iface::{self, SocketHandle, SocketSet},
     socket::raw,
@@ -7,9 +7,10 @@ use smoltcp::{
 
 use crate::{
     driver::{net::NetDriver, NET_DRIVERS},
+    kwarn,
     libs::spinlock::SpinLock,
     net::{Interface, NET_FACES},
-    syscall::SystemError, kwarn,
+    syscall::SystemError,
 };
 
 use super::{Endpoint, Protocol, Socket};
@@ -46,8 +47,12 @@ impl Drop for SocketHandler {
 /// @brief socket的类型
 #[derive(Debug)]
 pub enum SocketType {
-    /// 原始的socket
-    Raw,
+    /// 原始的socket 
+    RawSocket = 0x01,
+    /// 用于Tcp通信的 Socket
+    TcpSocket = 0x02,
+    /// 用于Udp通信的 Socket
+    UdpSocket = 0x04,
 }
 
 bitflags! {
@@ -83,7 +88,7 @@ pub struct SocketMetadata {
 /// @brief 表示原始的socket
 ///
 /// ref: https://man7.org/linux/man-pages/man7/raw.7.html
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RawSocket {
     handler: SocketHandler,
     /// 用户发送的数据包是否包含了IP头.
@@ -183,7 +188,8 @@ impl Socket for RawSocket {
 
             if let Some(Endpoint::Ip(to)) = to {
                 let mut socket_set_guard = SOCKET_SET.lock();
-                let socket:&mut raw::Socket = socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
+                let socket: &mut raw::Socket =
+                    socket_set_guard.get_mut::<raw::Socket>(self.handler.0);
 
                 // 暴力解决方案：只考虑0号网卡。 TODO：考虑多网卡的情况！！！
                 let iface: Arc<Interface> = NET_FACES.read().get(&0).unwrap().clone();
@@ -205,13 +211,13 @@ impl Socket for RawSocket {
                         Ipv4Packet::new_unchecked(&mut buffer);
                     packet.set_version(4);
                     packet.set_header_len(20);
-                    packet.set_total_len((20+len) as u16);
+                    packet.set_total_len((20 + len) as u16);
                     packet.set_src_addr(ipv4_src_addr);
                     packet.set_dst_addr(ipv4_dst);
                     // 设置ipv4 header的protocol字段
                     packet.set_next_header(socket.ip_protocol().into());
                     // 获取IP数据包的负载字段
-                    let payload:&mut [u8] = packet.payload_mut();
+                    let payload: &mut [u8] = packet.payload_mut();
                     payload.copy_from_slice(buf);
                     // 填充checksum字段
                     packet.fill_checksum();
@@ -224,7 +230,7 @@ impl Socket for RawSocket {
 
                     // poll?
                     return Ok(len);
-                }else{
+                } else {
                     kwarn!("Invalid Ip protocol type!");
                     return Err(SystemError::EINVAL);
                 }
@@ -236,7 +242,7 @@ impl Socket for RawSocket {
     }
 
     fn connect(&self, endpoint: super::Endpoint) -> Result<(), SystemError> {
-        todo!()
+        return Ok(());
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
@@ -244,6 +250,6 @@ impl Socket for RawSocket {
     }
 
     fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
-        let x = self.clone();
+        return Box::new(self.clone());
     }
 }

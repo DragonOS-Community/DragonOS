@@ -9,7 +9,8 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 use crate::{
     driver::{generate_nic_id, virtio::virtio_impl::HalImpl, Driver, NET_DRIVERS},
     kdebug, kerror, kinfo,
-    libs::rwlock::RwLock, net::{NET_FACES, Interface},
+    libs::rwlock::RwLock,
+    net::{Interface, NET_FACES},
 };
 
 use super::NetDriver;
@@ -19,18 +20,16 @@ pub struct VirtioNICDriver<T: Transport> {
     inner: RwLock<InnerVirtIONet<T>>,
 }
 
-impl<T: Transport> VirtioNICDriver<T> {
+impl<T: 'static + Transport> VirtioNICDriver<T> {
     pub fn new(driver_net: VirtIONet<HalImpl, T>) -> Arc<Self> {
-
         let mut iface_config = smoltcp::iface::Config::new();
         // todo: 随机设定这个值。
         // 参见 https://docs.rs/smoltcp/latest/smoltcp/iface/struct.Config.html#structfield.random_seed
         iface_config.random_seed = 12345;
         iface_config.hardware_addr = Some(wire::HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress(driver_net.mac())
+            smoltcp::wire::EthernetAddress(driver_net.mac()),
         ));
 
-        
         let mut inner = RwLock::new(InnerVirtIONet {
             virtio_net: driver_net,
             self_ref: Weak::new(),
@@ -38,10 +37,10 @@ impl<T: Transport> VirtioNICDriver<T> {
             ifaces: Vec::new(),
         });
 
-        let mut s:VirtioNICDriver<T> =Self { inner };
-        let iface:Arc<Interface> = Arc::new(Interface::new(
-            smoltcp::iface::Interface::new::<VirtioNICDriver<T>>(iface_config, &mut s)
-        ));
+        let mut s: VirtioNICDriver<T> = Self { inner };
+        let iface: Arc<Interface> = Arc::new(Interface::new(smoltcp::iface::Interface::new::<
+            VirtioNICDriver<T>,
+        >(iface_config, &mut s)));
         let result: Arc<VirtioNICDriver<T>> = Arc::new(s);
         result.inner.write().self_ref = Arc::downgrade(&result);
         result.inner.write().ifaces.push(iface.clone());
@@ -66,7 +65,7 @@ struct InnerVirtIONet<T: Transport> {
     net_device_id: usize,
 
     /// 网卡的所有网络接口
-    ifaces: Vec<Arc<Interface>>
+    ifaces: Vec<Arc<Interface>>,
 }
 
 pub struct VirtioNetToken<T: Transport> {
@@ -160,9 +159,7 @@ impl<T: Transport> phy::RxToken for VirtioNetToken<T> {
 /// @brief virtio-net 驱动的初始化与测试
 pub fn virtio_net<T: Transport + 'static>(transport: T) {
     let driver_net: VirtIONet<HalImpl, T> = match VirtIONet::<HalImpl, T>::new(transport) {
-        Ok(net) => {
-            net
-        }
+        Ok(net) => net,
         Err(_) => {
             kerror!("VirtIONet init failed");
             return;
@@ -170,7 +167,7 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
     };
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac());
     let driver: Arc<VirtioNICDriver<T>> = VirtioNICDriver::new(driver_net);
-    
+
     kinfo!(
         "Virtio-net driver init successfully!\tNetDevID: [{}], MAC: [{}]",
         driver.name(),
@@ -189,8 +186,6 @@ impl<T: Transport> NetDriver for VirtioNICDriver<T> {
     fn nic_id(&self) -> usize {
         return self.inner.read().net_device_id;
     }
-
-
 }
 
 /// 向编译器保证，VirtioNICDriver在线程之间是安全的.

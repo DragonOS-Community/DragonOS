@@ -1,15 +1,17 @@
-use core::{fmt::{self, Debug}, sync::atomic::AtomicUsize};
+use core::{
+    fmt::{self, Debug},
+    sync::atomic::AtomicUsize,
+};
 
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 
-use crate::{syscall::SystemError, libs::rwlock::RwLock};
-use smoltcp::{wire::IpEndpoint, iface};
+use crate::{libs::rwlock::RwLock, syscall::SystemError};
+use smoltcp::{iface, wire::IpEndpoint};
 
 use self::socket::SocketMetadata;
 
 pub mod endpoints;
 pub mod socket;
-
 
 lazy_static! {
     /// @brief 所有网络接口的列表
@@ -96,6 +98,21 @@ pub trait Socket: Sync + Send + Debug {
     /// @return 返回socket的对端端点
     fn peer_endpoint(&self) -> Option<Endpoint> {
         return None;
+    }
+
+    /// @brief 
+    ///     The purpose of the poll function is to provide 
+    ///     a non-blocking way to check if a socket is ready for reading or writing, 
+    ///     so that you can efficiently handle multiple sockets in a single thread or event loop. 
+    /// 
+    /// @return (in, out, err) 
+    /// 
+    ///     The first boolean value indicates whether the socket is ready for reading. If it is true, then there is data available to be read from the socket without blocking.
+    ///     The second boolean value indicates whether the socket is ready for writing. If it is true, then data can be written to the socket without blocking.
+    ///     The third boolean value indicates whether the socket has encountered an error condition. If it is true, then the socket is in an error state and should be closed or reset
+    /// 
+    fn poll(&self) -> (bool, bool, bool) {
+        return (false, false, false);
     }
 
     /// @brief socket的ioctl函数
@@ -205,24 +222,25 @@ impl Into<u8> for Protocol {
     }
 }
 
-
-
-pub struct Interface{
+pub struct Interface {
     inner_iface: smoltcp::iface::Interface,
     pub iface_id: usize,
 }
 
 impl Debug for Interface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Interface").field("inner_iface", &" smoltcp::iface::Interface,").field("iface_id", &self.iface_id).finish()
+        f.debug_struct("Interface")
+            .field("inner_iface", &" smoltcp::iface::Interface,")
+            .field("iface_id", &self.iface_id)
+            .finish()
     }
 }
 
-impl Interface{
-    pub fn new(inner_iface: smoltcp::iface::Interface) -> Self{
-        return Self{
+impl Interface {
+    pub fn new(inner_iface: smoltcp::iface::Interface) -> Self {
+        return Self {
             inner_iface,
             iface_id: generate_iface_id(),
-        }
+        };
     }
 }

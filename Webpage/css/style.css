@@ -1,0 +1,137 @@
+* {
+  margin: 0;
+  padding: 0;
+}
+html,
+body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+.main {
+  height: 100%;
+  width: 100%;
+  background: url(../image/bg.jpg) no-repeat center center;
+  background-size: 100% 100%;
+  display: flex;
+  flex-direction: column;
+  text-align: center;
+  text-align: left;
+}
+.main h1 {
+  font-weight: bold;
+  margin-top: 10%;
+  font-size: 40px;
+  line-height: 1;
+  position: relative;
+  left: 30%;
+  color: rgba(25, 70, 127, 1);
+}
+.main span {
+  display: block;
+  font-size: 20px;
+  margin-bottom: 10px;
+  font-weight: 400;
+}
+
+.main .text {
+  padding: 10px;
+  margin: 0 auto;
+  max-width: 800px;
+  position: relative;
+  top: 30px;
+  z-index: 999;
+}
+.text .center {
+  padding: 60px 60px 30px 60px;
+  background: rgb(255, 255, 255);
+  border-radius: 6px;
+  box-shadow: rgba(0, 0, 0, 0.1) 0px 4px 16px 0px;
+  position: relative;
+  margin-bottom: 121px;
+}
+.text .center:before {
+  content: '';
+  position: absolute;
+  background: rgb(36, 147, 239);
+  background-image: linear-gradient(
+    127deg,
+    rgb(13, 183, 189),
+    rgb(226, 71, 196)
+  );
+  inset: -4px;
+  border-radius: 12px;
+  filter: blur(30px);
+  opacity: 0.8;
+  z-index: -1;
+  -webkit-border-radius: 12px;
+  -moz-border-radius: 12px;
+  -ms-border-radius: 12px;
+  -o-border-radius: 12px;
+  -webkit-filter: blur(30px);
+}
+.text .center p {
+  margin-top: 8%;
+  font-size: 17px;
+}
+.text .center p:nth-child(1) {
+  margin-top: 0;
+}
+
+.text .center .container {
+  margin-top: 20%;
+  margin-bottom: 10px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.center .container .line {
+  display: block;
+  height: 1px;
+  width: 100%;
+  border-top: 1px solid red;
+  margin: 2px auto;
+}
+.center .container .one {
+  width: 30%;
+  border-color: rgba(36, 147, 239, 0.8);
+}
+
+.center .container .two {
+  width: 50%;
+  border-color: rgba(36, 147, 239, 0.6);
+}
+
+.center .container .three {
+  width: 70%;
+  border-color: rgba(36, 147, 239, 0.4);
+}
+
+.text .center .name {
+  text-align: center;
+  margin-top: 1%;
+}
+
+/* @keyframes typing {
+  from {
+    width: 20%;
+  }
+}
+
+@keyframes caret {
+  50% {
+    margin-left: 5%;
+    border-right-color: transparent;
+  }
+}
+.main p {
+  margin-top: 5%;
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  border-right: 0.05em solid;
+  animation: typing 5s steps(15), caret 1s steps(1) infinite;
+  -webkit-animation: typing 5s steps(15), caret 1s steps(1) infinite;
+} */

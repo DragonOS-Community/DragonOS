@@ -5,6 +5,8 @@ use crate::include::bindings::bindings::PAGE_OFFSET;
 pub mod allocator;
 pub mod gfp;
 pub mod mmio_buddy;
+pub mod bump;
+pub mod page_frame;
 
 /// @brief 将内核空间的虚拟地址转换为物理地址
 #[inline(always)]
@@ -166,7 +168,6 @@ pub trait MemoryManagementArch: Clone + Copy {
     unsafe fn write<T>(address: VirtAddr, value: T) {
         ptr::write(address.data() as *mut T, value);
     }
-
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
     unsafe fn invalidate_page(address: VirtAddr);
 

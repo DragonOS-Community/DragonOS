@@ -1,9 +1,7 @@
-/*
- * @Auther: Kong
- * @Date: 2023-03-27 11:57:07
- * @FilePath: /DragonOS/kernel/src/mm/page_frame.rs
- * @Description: 页帧分配器
- */
+/// @Auther: Kong
+/// @Date: 2023-03-27 11:57:07
+/// @FilePath: /DragonOS/kernel/src/mm/page_frame.rs
+/// @Description: 页帧分配器
 use crate::mm::PhysAddr;
 
 #[derive(Clone, Copy, Debug)]
@@ -29,12 +27,9 @@ pub struct PageFrameUsage {
 }
 
 impl PageFrameUsage {
-    /**
-     * @description: 初始化FrameUsage
-     * @param {PageFrameCount} used 已使用的页帧数量
-     * @param {PageFrameCount} total 总的页帧数量
-     * @return {*}
-     */    
+    /// @brief:  初始化FrameUsage
+    /// @param {PageFrameCount} used 已使用的页帧数量
+    /// @param {PageFrameCount} total 总的页帧数量
     pub fn new(used: PageFrameCount, total: PageFrameCount) -> Self {
         return Self { used, total };
     }

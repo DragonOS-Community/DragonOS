@@ -1,10 +1,8 @@
-/*
- * @Auther: Kong
- * @Date: 2023-03-27 06:54:08
- * @FilePath: /DragonOS/kernel/src/mm/bump.rs
- * @Description: bump allocator线性分配器
- */
-
+/// @Auther: Kong
+/// @Date: 2023-03-27 06:54:08
+/// @FilePath: /DragonOS/kernel/src/mm/bump.rs
+/// @Description: bump allocator线性分配器
+/// 
 use crate::mm::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea};
 use core::marker::PhantomData;
@@ -19,12 +17,10 @@ pub struct BumpAllocator<MMA> {
 }
 // 为BumpAllocator实现FrameAllocator
 impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
-    /**
-     * @description: 创建一个线性分配器
-     * @param {&'static [PhysMemoryArea]} areas 当前的内存区域
-     * @param {usize} offset 当前的偏移量
-     * @return {*} 分配器本身
-     */    
+    /// @brief: 创建一个线性分配器
+    /// @param Fareas 当前的内存区域
+    /// @param offset 当前的偏移量
+    /// @return 分配器本身
     pub fn new(areas: &'static [PhysMemoryArea], offset: usize) -> Self {
         Self {
             areas,
@@ -43,12 +39,10 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
 }
 
 impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
-    /**
-     * @description: 分配count个物理页帧
-     * @param {*} mut self 
-     * @param {PageFrameCount} count 分配的页帧数量
-     * @return {Option<PhysAddr>} 分配后的物理地址
-     */
+    /// @brief: 分配count个物理页帧
+    /// @param  mut self
+    /// @param  count 分配的页帧数量
+    /// @return 分配后的物理地址
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
         let mut offset = self.offset();
         // 遍历所有的物理内存区域
@@ -70,8 +64,6 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
             // 如果当前offset到area_end的距离大于等于count.data() * PAGE_SIZE，说明当前的物理内存区域足以分配count个页帧
             if offset + count.data() * MMA::PAGE_SIZE <= area_end {
                 let res_page_phys = offset;
-                // 将区域的内存基地址增加
-                area.base.add(count.data() * MMA::PAGE_SIZE);
                 // 将offset增加至分配后的内存
                 self.offset = offset + count.data() * MMA::PAGE_SIZE;
 
@@ -85,12 +77,9 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
         // TODO: 支持释放页帧
         unimplemented!("BumpAllocator::free not implemented");
     }
-    /**
-     * @description: 内存区域页帧的使用情况
-     * 
-     * @param {*} self
-     * @return {PageFrameUsage} 页帧的使用情况
-     */
+    /// @brief: 获取内存区域页帧的使用情况
+    /// @param  self
+    /// @return 页帧的使用情况
     unsafe fn usage(&self) -> PageFrameUsage {
         let mut total = 0;
         let mut used = 0;
@@ -104,8 +93,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
             // 如果offset大于area_end，说明当前物理区域被分配完，都需要加到used中
             if self.offset >= area_end {
                 used += (area_end - area_base) >> MMA::PAGE_SHIFT;
-            }
-            else{
+            } else {
                 used += (self.offset - area_base) >> MMA::PAGE_SHIFT;
             }
         }

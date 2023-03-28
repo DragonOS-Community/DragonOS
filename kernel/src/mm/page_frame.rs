@@ -1,3 +1,9 @@
+/*
+ * @Auther: Kong
+ * @Date: 2023-03-27 11:57:07
+ * @FilePath: /DragonOS/kernel/src/mm/page_frame.rs
+ * @Description: 页帧分配器
+ */
 use crate::mm::PhysAddr;
 
 #[derive(Clone, Copy, Debug)]
@@ -23,13 +29,12 @@ pub struct PageFrameUsage {
 }
 
 impl PageFrameUsage {
-    /// @brief 初始化FrameUsage
-    /// 
-    /// @param used 已使用的页帧数量
-    /// @param total 总的页帧数量
-    /// 
-    /// 
-    /// @return 初始化好的FrameUsage
+    /**
+     * @description: 初始化FrameUsage
+     * @param {PageFrameCount} used 已使用的页帧数量
+     * @param {PageFrameCount} total 总的页帧数量
+     * @return {*}
+     */    
     pub fn new(used: PageFrameCount, total: PageFrameCount) -> Self {
         return Self { used, total };
     }
@@ -64,7 +69,7 @@ pub trait FrameAllocator {
     // @brief 获取页帧使用情况
     unsafe fn usage(&self) -> PageFrameUsage;
 }
-// @brief 通过一个 &mut T 的引用来对一个实现了 FrameAllocator trait 的类型进行调用，是代码更加灵活
+// @brief 通过一个 &mut T 的引用来对一个实现了 FrameAllocator trait 的类型进行调用，使代码更加灵活
 impl<T> FrameAllocator for &mut T
 where
     T: FrameAllocator,

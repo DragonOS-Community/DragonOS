@@ -168,11 +168,6 @@ pub trait MemoryManagementArch: Clone + Copy {
     unsafe fn write<T>(address: VirtAddr, value: T) {
         ptr::write(address.data() as *mut T, value);
     }
-    /// @brief 将指定虚拟地址的count个字节，设置为value
-    #[inline(always)]
-    unsafe fn write_bytes(address: VirtAddr, value: u8, count: usize) {
-        ptr::write_bytes(address.data() as *mut u8, value, count)
-    }
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
     unsafe fn invalidate_page(address: VirtAddr);
 

@@ -635,6 +635,7 @@ pub struct MmioFreeRegionList {
     num_free: i64,
 }
 impl MmioFreeRegionList {
+    #[allow(dead_code)]
     fn new() -> Self {
         return MmioFreeRegionList {
             ..Default::default()

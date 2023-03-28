@@ -9,7 +9,7 @@ extern long process_global_pid;
 extern void kernel_thread_func(void);
 extern uint64_t rs_procfs_register_pid(uint64_t);
 extern uint64_t rs_procfs_unregister_pid(uint64_t);
-extern void* rs_dup_fpstate();
+extern void *rs_dup_fpstate();
 
 extern int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
@@ -141,7 +141,6 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 唤醒进程
     process_wakeup(tsk);
 
-
     return retval;
 
 copy_thread_failed:;
@@ -176,7 +175,6 @@ int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb)
         pcb->flags |= PF_VFORK;
     return 0;
 }
-
 
 /**
  * @brief 拷贝当前进程的内存空间分布结构体信息
@@ -336,7 +334,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
 
         child_regs = (struct pt_regs *)(((uint64_t)pcb) + STACK_SIZE - size);
         memcpy(child_regs, (void *)current_regs, size);
-        
+
         barrier();
         // 然后重写新的栈中，每个栈帧的rbp值
         process_rewrite_rbp(child_regs, pcb);
@@ -352,8 +350,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
     // 设置子进程的返回值为0
     child_regs->rax = 0;
     if (pcb->flags & PF_KFORK)
-        thd->rbp =
-            (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_intr时的rbp）
+        thd->rbp = (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_intr时的rbp）
     else
         thd->rbp = (uint64_t)pcb + STACK_SIZE;
 
@@ -361,9 +358,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
     thd->rsp = (uint64_t)child_regs;
     thd->fs = current_pcb->thread->fs;
     thd->gs = current_pcb->thread->gs;
-    if(pcb->pid>3){
-        kdebug("copy thread: pid=%d, user_mode=%d", pcb->pid, user_mode(child_regs));
-    }
+
     // 根据是否为内核线程、是否在内核态fork，设置进程的开始执行的地址
     if (pcb->flags & PF_KFORK)
         thd->rip = (uint64_t)ret_from_intr;
@@ -372,8 +367,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
     else
         thd->rip = (uint64_t)ret_from_intr;
 
-    pcb->fp_state=rs_dup_fpstate();
-    kdebug("pcb->fpstate = %#018lx", pcb->fp_state);
+    pcb->fp_state = rs_dup_fpstate();
 
     return 0;
 }

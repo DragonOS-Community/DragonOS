@@ -19,6 +19,7 @@
 #include <driver/disk/ahci/ahci.h>
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
+#include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <ktest/ktest.h>
 #include <mm/mmio.h>
@@ -26,7 +27,6 @@
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-#include <driver/virtio/virtio.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -411,9 +411,6 @@ load_elf_failed:;
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
 
-    cli();
-    kdebug("do_execve is running...");
-
     // 当前进程正在与父进程共享地址空间，需要创建
     // 独立的地址空间才能使新程序正常运行
     if (current_pcb->flags & PF_VFORK)
@@ -456,19 +453,14 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     current_pcb->mm->stack_start = stack_start_addr;
 
     // 关闭之前的文件描述符
-    kdebug("process_exit_files");
     process_exit_files(current_pcb);
-    kdebug("process_exit_files ok");
     process_init_files();
-    kdebug("process_init_files ok");
 
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
     // 加载elf格式的可执行文件
-    kdebug("process_load_elf_file");
     int tmp = process_load_elf_file(regs, path);
-    kdebug("process_load_elf_file return %d", tmp);
     if (tmp < 0)
         goto exec_failed;
 
@@ -513,7 +505,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     regs->rflags = 0x200246;
     regs->rax = 1;
     regs->es = 0;
-    
+
     return 0;
 
 exec_failed:;
@@ -623,9 +615,9 @@ ul initial_kernel_thread(ul arg)
  */
 void process_exit_notify()
 {
-
     wait_queue_wakeup(&current_pcb->parent_pcb->wait_child_proc_exit, PROC_INTERRUPTIBLE);
 }
+
 /**
  * @brief 进程退出时执行的函数
  *

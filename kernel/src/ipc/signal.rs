@@ -5,8 +5,6 @@ use core::{
     sync::atomic::compiler_fence,
 };
 
-use alloc::boxed::Box;
-
 use crate::{
     arch::{
         asm::{bitops::ffz, current::current_pcb, ptrace::user_mode},

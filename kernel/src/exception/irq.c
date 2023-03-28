@@ -56,10 +56,6 @@ extern void ignore_int();
     void IRQ_NAME(number);                                                                         \
     __asm__(SYMBOL_NAME_STR(IRQ) #number "interrupt:   \n\t"                                       \
                                          "pushq $0x00 \n\t" SAVE_ALL_REGS "movq %rsp, %rdi   \n\t" \
-                                         "pushq %rdi  \n\t"                                        \
-                                         "leaq fp_state_save(%rip),%rax \n\t"                      \
-                                         "call *%rax \n\t"                                         \
-                                         "popq %rdi \n\t"                                          \
                                          "leaq ret_from_intr(%rip), %rax    \n\t"                  \
                                          "pushq %rax \n\t"                                         \
                                          "movq	$" #number ",	%rsi			\n\t"                         \

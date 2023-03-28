@@ -9,10 +9,9 @@ use core::{
 
 use alloc::boxed::Box;
 
-use crate::include::bindings::bindings::pt_regs;
+use crate::include::bindings::bindings::process_control_block;
 
-use crate::arch::asm::ptrace::user_mode;
-use crate::current_pcb;
+use super::asm::irqflags::{local_irq_restore, local_irq_save};
 /// https://www.felixcloutier.com/x86/fxsave#tbl-3-47
 #[repr(C, align(16))]
 #[derive(Debug, Copy, Clone)]
@@ -78,75 +77,71 @@ impl FpState {
 }
 
 /// @brief 从用户态进入内核时，保存浮点寄存器，并关闭浮点功能
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn fp_state_save(regs: &pt_regs) {
-    if user_mode(regs) {
-        let fp: &mut FpState = if current_pcb().fp_state == null_mut() {
-            let f = Box::leak(Box::new(FpState::default()));
-            current_pcb().fp_state = f as *mut FpState as usize as *mut c_void;
-            f
-        } else {
-            unsafe {
-                (current_pcb().fp_state as usize as *mut FpState)
-                    .as_mut()
-                    .unwrap()
-            }
-        };
+pub fn fp_state_save(pcb: &mut process_control_block) {
+    // 该过程中不允许中断
+    let mut rflags: u64 = 0;
+    local_irq_save(&mut rflags);
 
-        // 保存浮点寄存器
-        fp.save();
+    let fp: &mut FpState = if pcb.fp_state == null_mut() {
+        let f = Box::leak(Box::new(FpState::default()));
+        pcb.fp_state = f as *mut FpState as usize as *mut c_void;
+        f
+    } else {
+        unsafe { (pcb.fp_state as usize as *mut FpState).as_mut().unwrap() }
+    };
 
-        // 关闭浮点功能
-        unsafe {
-            asm!(
-                "mov rax, cr4",
-                "and ax,~(3<<9)", //[9][10]->0
-                "mov cr4,rax",
-                "mov rax, cr0",
-                "and ax,~(02h)",    //[1]->0
-                "or ax, ~(0FFFBh)", //[2]->1
-                "mov cr0,rax"       /*
-                                    "mov rax, cr0",
-                                    "and ax, 0xFFFB",
-                                    "or ax,0x2",
-                                    "mov cr0,rax",
-                                    "mov rax, cr4",
-                                    "or ax,3<<9",
-                                    "mov cr4, rax" */
-            )
-        }
+    // 保存浮点寄存器
+    fp.save();
+
+    // 关闭浮点功能
+    unsafe {
+        asm!(
+            "mov rax, cr4",
+            "and ax,~(3<<9)", //[9][10]->0
+            "mov cr4,rax",
+            "mov rax, cr0",
+            "and ax,~(02h)",    //[1]->0
+            "or ax, ~(0FFFBh)", //[2]->1
+            "mov cr0, rax"      /*
+                                "mov rax, cr0",
+                                "and ax, 0xFFFB",
+                                "or ax,0x2",
+                                "mov cr0,rax",
+                                "mov rax, cr4",
+                                "or ax,3<<9",
+                                "mov cr4, rax" */
+        )
     }
+    local_irq_restore(&rflags);
 }
 
 /// @brief 从内核态返回用户态时，恢复浮点寄存器，并开启浮点功能
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn fp_state_restore(regs: &pt_regs) {
-    // 如果将要返回用户态，且当前进程有浮点状态
-    if user_mode(regs) {
-        if current_pcb().fp_state == null_mut() {
-            return;
-        }
+pub fn fp_state_restore(pcb: &mut process_control_block) {
+    // 该过程中不允许中断
+    let mut rflags: u64 = 0;
+    local_irq_save(&mut rflags);
 
-        unsafe {
-            asm! {
-                "mov rax, cr0",
-                "and ax, 0FFFBh",//[2]->0
-                "or ax,02h",//[1]->1
-                "mov cr0,rax",
-                "mov rax, cr4",
-                "or ax,3<<9",
-                "mov cr4, rax"
-            }
-        }
-
-        let fp = unsafe {
-            (current_pcb().fp_state as usize as *mut FpState)
-                .as_mut()
-                .unwrap()
-        };
-        fp.restore();
-        fp.clear();
+    if pcb.fp_state == null_mut() {
+        panic!("fp_state_restore: fp_state is null. pid={}", pcb.pid);
     }
+
+    unsafe {
+        asm! {
+            "mov rax, cr0",
+            "and ax, 0FFFBh",//[2]->0
+            "or ax,02h",//[1]->1
+            "mov cr0,rax",
+            "mov rax, cr4",
+            "or ax,3<<9",
+            "mov cr4, rax",
+            "clts",
+            "fninit"
+        }
+    }
+
+    let fp = unsafe { (pcb.fp_state as usize as *mut FpState).as_mut().unwrap() };
+    fp.restore();
+    fp.clear();
+
+    local_irq_restore(&rflags);
 }

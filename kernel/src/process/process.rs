@@ -152,7 +152,7 @@ impl process_control_block {
         };
 
         // 拷贝文件描述符数组
-        let new_fd_vec: &mut FileDescriptorVec = Box::leak(Box::new(old_fds.clone()));
+        let new_fd_vec: &mut FileDescriptorVec = Box::leak(old_fds.clone());
 
         self.fds = new_fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
 
@@ -315,10 +315,8 @@ pub extern "C" fn process_copy_files(
 pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) -> i32 {
     let r: Result<(), i32> = pcb.exit_files();
     if r.is_ok() {
-        kdebug!("process_exit_files success");
         return 0;
     } else {
-        kdebug!("process_exit_files error: {}", r.as_ref().unwrap_err());
         return r.unwrap_err();
     }
 }

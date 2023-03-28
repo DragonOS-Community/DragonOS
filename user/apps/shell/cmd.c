@@ -484,9 +484,9 @@ int shell_cmd_exec(int argc, char **argv)
         // 子进程
         int path_len = 0;
         char *file_path = get_target_filepath(argv[1], &path_len);
-        printf("before execv, path=%s, argc=%d\n", file_path, argc);
+        // printf("before execv, path=%s, argc=%d\n", file_path, argc);
         execv(file_path, argv);
-        printf("after execv, path=%s, argc=%d\n", file_path, argc);
+        // printf("after execv, path=%s, argc=%d\n", file_path, argc);
         free(argv);
         free(file_path);
 
@@ -498,10 +498,8 @@ int shell_cmd_exec(int argc, char **argv)
         if (strcmp(argv[argc - 1], "&") != 0)
             waitpid(pid, &retval, 0);
         else
-        {
-            // 输出子进程的pid
-            printf("[1] %d\n", pid);
-        }
+            printf("[1] %d\n", pid); // 输出子进程的pid
+        
         free(argv);
     }
 }

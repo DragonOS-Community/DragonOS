@@ -32,7 +32,6 @@ void handler(int sig)
     handle_ok = true;
 }
 
-#define EPS (0.000001)
 int main()
 {
     printf("Test signal running...\n");

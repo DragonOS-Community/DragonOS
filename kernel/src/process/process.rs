@@ -12,7 +12,6 @@ use crate::{
         process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_INTERRUPTIBLE,
         PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
     },
-    kdebug,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
 };

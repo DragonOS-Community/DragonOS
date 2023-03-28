@@ -46,6 +46,7 @@ extern struct sighand_struct INITIAL_SIGHAND;
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
+extern void rs_process_exit_fpstate(struct process_control_block *pcb);
 extern int process_init_files();
 
 // 设置初始进程的PCB
@@ -410,7 +411,8 @@ load_elf_failed:;
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
 
-    // kdebug("do_execve is running...");
+    cli();
+    kdebug("do_execve is running...");
 
     // 当前进程正在与父进程共享地址空间，需要创建
     // 独立的地址空间才能使新程序正常运行
@@ -454,14 +456,19 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     current_pcb->mm->stack_start = stack_start_addr;
 
     // 关闭之前的文件描述符
+    kdebug("process_exit_files");
     process_exit_files(current_pcb);
+    kdebug("process_exit_files ok");
     process_init_files();
+    kdebug("process_init_files ok");
 
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
     // 加载elf格式的可执行文件
+    kdebug("process_load_elf_file");
     int tmp = process_load_elf_file(regs, path);
+    kdebug("process_load_elf_file return %d", tmp);
     if (tmp < 0)
         goto exec_failed;
 
@@ -506,7 +513,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     regs->rflags = 0x200246;
     regs->rax = 1;
     regs->es = 0;
-
+    
     return 0;
 
 exec_failed:;
@@ -882,6 +889,7 @@ int process_release_pcb(struct process_control_block *pcb)
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
     process_exit_sighand(pcb);
     process_exit_signal(pcb);
+    rs_process_exit_fpstate(pcb);
     rs_procfs_unregister_pid(pcb->pid);
     // 释放当前pcb
     kfree(pcb);

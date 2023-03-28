@@ -1,22 +1,21 @@
 use core::{
     arch::{
-        asm, global_asm,
+        asm,
         x86_64::{_fxrstor64, _fxsave64},
     },
-    ffi::c_void, ptr::null_mut,
+    ffi::c_void,
+    ptr::null_mut,
 };
 
 use alloc::boxed::Box;
 
-use crate::{include::bindings::bindings::{pt_regs, PAGE_OFFSET}, kdebug, println};
+use crate::include::bindings::bindings::pt_regs;
 
 use crate::arch::asm::ptrace::user_mode;
 use crate::current_pcb;
 /// https://www.felixcloutier.com/x86/fxsave#tbl-3-47
-/// 暂时性, 临时借鉴了rcore
-
 #[repr(C, align(16))]
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone)]
 pub struct FpState {
     //0
     fcw: u16,
@@ -36,15 +35,28 @@ pub struct FpState {
     rest: [u64; 12],
 }
 
+impl Default for FpState {
+    fn default() -> Self {
+        Self {
+            fcw: 0x037f,
+            fsw: Default::default(),
+            ftw: Default::default(),
+            fop: Default::default(),
+            word2: Default::default(),
+            word3: Default::default(),
+            mxcsr: 0x1f80,
+            mxcsr_mask: Default::default(),
+            mm: Default::default(),
+            xmm: Default::default(),
+            rest: Default::default(),
+        }
+    }
+}
 impl FpState {
     #[allow(dead_code)]
     pub fn new() -> Self {
         assert!(core::mem::size_of::<Self>() == 512);
-        Self {
-            mxcsr: 0x1f80,
-            fcw: 0x037f,
-            ..Self::default()
-        }
+        return Self::default();
     }
     #[allow(dead_code)]
     pub fn save(&mut self) {
@@ -59,57 +71,33 @@ impl FpState {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn dup_fpstate(&self) -> Self {
-        // Self {
-        //     //0
-        //     fcw: self.fcw,
-        //     fsw: self.fsw,
-        //     ftw: self.ftw,
-        //     fop: self.fop,
-        //     word2: self.word2,
-        //     //16
-        //     word3: self.word3,
-        //     mxcsr: self.mxcsr,
-        //     mxcsr_mask: self.mxcsr_mask,
-        //     //32
-        //     mm: self.mm.clone(),
-        //     //160
-        //     xmm: self.xmm.clone(),
-        //     //416
-        //     rest: self.rest.clone(),
-        // }
-        return self.clone();
+    /// @brief 清空fp_state
+    pub fn clear(&mut self) {
+        *self = Self::default();
     }
 }
 
+/// @brief 从用户态进入内核时，保存浮点寄存器，并关闭浮点功能
 #[allow(dead_code)]
 #[no_mangle]
 pub extern "C" fn fp_state_save(regs: &pt_regs) {
     if user_mode(regs) {
-        let fp = Box::leak(Box::new(FpState::default()));
-        // let i: u64;
-        // unsafe {
-        //     asm!(
-        //         "mov {0},cr4",
-        //         out(reg) i,
-        //     );
-        // }
-        // let j: u64;
-        // unsafe {
-        //     asm!(
-        //         "mov {0},cr0 ",
-        //         out(reg) j,
-        //     )
-        // }
-        // kdebug!(
-        //     "before fp_state_save   : cr0: {:#032b}, cr4: {:#032b}, pid={}",
-        //     j,
-        //     i,
-        //     current_pcb().pid
-        // );
+        let fp: &mut FpState = if current_pcb().fp_state == null_mut() {
+            let f = Box::leak(Box::new(FpState::default()));
+            current_pcb().fp_state = f as *mut FpState as usize as *mut c_void;
+            f
+        } else {
+            unsafe {
+                (current_pcb().fp_state as usize as *mut FpState)
+                    .as_mut()
+                    .unwrap()
+            }
+        };
+
+        // 保存浮点寄存器
         fp.save();
-        current_pcb().fp_state = fp as *mut FpState as usize as *mut c_void;
+
+        // 关闭浮点功能
         unsafe {
             asm!(
                 "mov rax, cr4",
@@ -131,41 +119,16 @@ pub extern "C" fn fp_state_save(regs: &pt_regs) {
     }
 }
 
+/// @brief 从内核态返回用户态时，恢复浮点寄存器，并开启浮点功能
 #[allow(dead_code)]
 #[no_mangle]
 pub extern "C" fn fp_state_restore(regs: &pt_regs) {
-    //("HELLO_WORLD");
-
-    //kdebug!("hello world");
-    // if current_pcb().pid == 4 {
-    //     kdebug!("the user mode of pid 4:{}", user_mode(regs));
-    // }
+    // 如果将要返回用户态，且当前进程有浮点状态
     if user_mode(regs) {
         if current_pcb().fp_state == null_mut() {
             return;
         }
-        
-        let i: u64;
-        unsafe {
-            asm!(
-                "mov {0},cr4",
-                out(reg) i,
-            );
-        }
-        let j: u64;
-        unsafe {
-            asm!(
-                "mov {0},cr0 ",
-                out(reg) j,
-            )
-        }
-        kdebug!(
-            "before fp_state_restore: cr0: {:#032b}, cr4: {:#032b}, pid={}",
-            j,
-            i,
-            current_pcb().pid
-        );
-        //kdebug!("before fp_state_restore: ",current_pcb().pid);
+
         unsafe {
             asm! {
                 "mov rax, cr0",
@@ -177,10 +140,13 @@ pub extern "C" fn fp_state_restore(regs: &pt_regs) {
                 "mov cr4, rax"
             }
         }
-        if (current_pcb().fp_state as usize )< (PAGE_OFFSET as usize){
-            kdebug!("fp_state address = 0x{:016x}", current_pcb().fp_state as usize);
-        }
-        let fp = unsafe { Box::from_raw(current_pcb().fp_state as usize as *mut FpState) };
-        fp.as_ref().restore();
+
+        let fp = unsafe {
+            (current_pcb().fp_state as usize as *mut FpState)
+                .as_mut()
+                .unwrap()
+        };
+        fp.restore();
+        fp.clear();
     }
 }

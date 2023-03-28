@@ -10,8 +10,9 @@ use crate::{
     filesystem::vfs::file::{File, FileDescriptorVec},
     include::bindings::bindings::{
         process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_INTERRUPTIBLE,
-        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE, NULL,
+        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
     },
+    kdebug,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
 };
@@ -259,7 +260,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数。
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_interruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_interruptible(&mut self) {
         self.state = PROC_INTERRUPTIBLE as u64;
     }
 
@@ -267,7 +269,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_uninterruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_uninterruptible(&mut self) {
         self.state = PROC_UNINTERRUPTIBLE as u64;
     }
 }
@@ -312,28 +315,42 @@ pub extern "C" fn process_copy_files(
 pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) -> i32 {
     let r: Result<(), i32> = pcb.exit_files();
     if r.is_ok() {
+        kdebug!("process_exit_files success");
         return 0;
     } else {
+        kdebug!("process_exit_files error: {}", r.as_ref().unwrap_err());
         return r.unwrap_err();
     }
 }
 
+/// @brief 复制当前进程的浮点状态
 #[allow(dead_code)]
 #[no_mangle]
-pub extern "C" fn rs_dup_fpstate()->*mut c_void{
-    if current_pcb().fp_state ==null_mut(){
-        return NULL as *mut c_void;
-    }
-    else{
-        let state=current_pcb().fp_state as usize as *mut FpState;
-        unsafe{
-            let st=Box::leak(Box::new((*state).dup_fpstate()));
-            return  st as *mut FpState as usize as *mut c_void;
+pub extern "C" fn rs_dup_fpstate() -> *mut c_void {
+    // 如果当前进程没有浮点状态，那么就返回一个默认的浮点状态
+    if current_pcb().fp_state == null_mut() {
+        return Box::leak(Box::new(FpState::default())) as *mut FpState as usize as *mut c_void;
+    } else {
+        // 如果当前进程有浮点状态，那么就复制一个新的浮点状态
+        let state = current_pcb().fp_state as usize as *mut FpState;
+        unsafe {
+            let s = state.as_ref().unwrap();
+            let state: &mut FpState = Box::leak(Box::new(s.clone()));
+
+            return state as *mut FpState as usize as *mut c_void;
         }
-    }  
+    }
 }
 
+/// @brief 释放进程的浮点状态所占用的内存
+#[no_mangle]
+pub extern "C" fn rs_process_exit_fpstate(pcb: &'static mut process_control_block) {
+    if pcb.fp_state != null_mut() {
+        let state = pcb.fp_state as usize as *mut FpState;
+        unsafe {
+            drop(Box::from_raw(state));
+        }
+    }
+}
 
 // =========== 以上为导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们 END ============
-
-

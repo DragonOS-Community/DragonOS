@@ -37,10 +37,16 @@ int main()
     printf("Test signal running...\n");
     signal(SIGKILL, &handler);
     printf("registered.\n");
-
+    double x = 0.5;
+   
     clock_t last = clock();
+    uint64_t cnt = 0;
     while (1)
     {
+        x *=2;
+        if(cnt % 100000 == 0)
+            printf("x = %lf", x);
+        ++cnt;
         if ((clock() - last) / CLOCKS_PER_SEC >= 1)
         {
             // printf("Test signal running\n");

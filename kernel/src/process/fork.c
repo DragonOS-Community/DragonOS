@@ -9,6 +9,7 @@ extern long process_global_pid;
 extern void kernel_thread_func(void);
 extern uint64_t rs_procfs_register_pid(uint64_t);
 extern uint64_t rs_procfs_unregister_pid(uint64_t);
+extern void* rs_dup_fpstate();
 
 extern int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
@@ -372,6 +373,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
         thd->rip = (uint64_t)ret_from_intr;
 
     pcb->fp_state=rs_dup_fpstate();
+    kdebug("pcb->fpstate = %#018lx", pcb->fp_state);
 
     return 0;
 }

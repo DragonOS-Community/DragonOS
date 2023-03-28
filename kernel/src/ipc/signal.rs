@@ -1,4 +1,9 @@
-use core::{ffi::c_void, intrinsics::size_of, ptr::read_volatile, sync::atomic::compiler_fence};
+use core::{
+    ffi::c_void,
+    intrinsics::size_of,
+    ptr::{null_mut, read_volatile},
+    sync::atomic::compiler_fence,
+};
 
 use alloc::boxed::Box;
 
@@ -661,16 +666,20 @@ fn setup_frame(
         (*frame).handler = ka._u._sa_handler as usize as *mut c_void;
     }
 
-    unsafe {
-        (*frame).context.sc_stack.fpstate = *(current_pcb().fp_state as usize as *mut FpState);
-        drop(current_pcb().fp_state);
-        current_pcb().fp_state = NULL as usize as *mut c_void;
+    // 将当前进程的fp_state拷贝到用户栈
+    if current_pcb().fp_state != null_mut() {
+        unsafe {
+            let fp_state: &mut FpState = (current_pcb().fp_state as usize as *mut FpState)
+                .as_mut()
+                .unwrap();
+            (*frame).context.sc_stack.fpstate = *fp_state;
+            // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
+            fp_state.clear();
+        }
     }
-
     // 将siginfo拷贝到用户栈
     err |= copy_siginfo_to_user(unsafe { &mut (*frame).info }, info).unwrap_or(1);
 
-    //err|=copy_siginfo_to_user(unsafe{&mut(*frame).fpstate},current_pcb().fp_state).unwrap_or(1);
     // todo: 拷贝处理程序备用栈的地址、大小、ss_flags
 
     err |= setup_sigcontext(unsafe { &mut (*frame).context }, oldset, &regs).unwrap_or(1);
@@ -779,8 +788,8 @@ fn restore_sigcontext(context: *const sigcontext, regs: &mut pt_regs) -> bool {
         (*current_thread).cr2 = (*context).cr2;
         (*current_thread).err_code = (*context).err_code;
 
-        let fp = Box::leak(Box::new((*context).sc_stack.fpstate));
-        current_pcb().fp_state = fp as *mut FpState as usize as *mut c_void;
+        // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
+        *(current_pcb().fp_state as usize as *mut FpState) = (*context).sc_stack.fpstate;
     }
 
     return true;

@@ -1,5 +1,4 @@
 use core::{ffi::c_void, intrinsics::size_of, ptr::read_volatile, sync::atomic::compiler_fence};
-//use std::alloc::System;注释原因：全部替换为SystemError后报错->use of undeclared crate or module `std`
 
 use crate::{
     arch::{
@@ -709,7 +708,7 @@ fn setup_frame(
     regs.cs = (USER_CS | 0x3) as u64;
     regs.ds = (USER_DS | 0x3) as u64;
     
-    return if err == 0 { Ok(0) } else { Err(Option::unwrap(SystemError::from_posix_errno(1))) };
+    return if err == 0 { Ok(0) } else { Err(SystemError::EPERM) };
 }
 
 #[inline(always)]
@@ -909,7 +908,12 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
         }
     }
     //return retval as u64;
-    return retval.unwrap_err().to_posix_errno() as u64;
+    if retval.is_ok(){
+        return 0;
+    }else{
+        return retval.unwrap_err().to_posix_errno() as u64;
+    }
+    
 }
 
 fn do_sigaction(

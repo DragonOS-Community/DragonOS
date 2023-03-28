@@ -148,7 +148,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::IncreaseNotZero);
             if cmpxchg_result.is_ok() {
-                return Ok(cmpxchg_result.unwrap());
+                return Ok(*cmpxchg_result.as_ref().unwrap_err());
             } else if cmpxchg_result.unwrap_err() == 1 {
                 // 不满足not zero 的条件
                 return Err(SystemError::EPERM);
@@ -176,7 +176,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::IncreaseNotDead);
             if cmpxchg_result.is_ok() {
-                return Ok(cmpxchg_result.unwrap())
+                return Ok(*cmpxchg_result.as_ref().unwrap_err())
             } else if cmpxchg_result.unwrap_err() == 1 {
                 return Err(SystemError::EPERM);
             }
@@ -206,7 +206,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::Decrease);
             if cmpxchg_result.is_ok() {
-                return Ok(cmpxchg_result.unwrap());
+                return Ok(*cmpxchg_result.as_ref().unwrap_err());
             }
         }
         let retval: Result<i32, SystemError>;
@@ -237,7 +237,7 @@ impl LockRef {
     pub fn dec_return(&mut self) -> Result<i32, SystemError> {
         let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseReturn);
         if cmpxchg_result.is_ok() {
-            return Ok(cmpxchg_result.unwrap());
+            return Ok(*cmpxchg_result.as_ref().unwrap_err());
         } else if cmpxchg_result.clone().unwrap_err() == 1 {
             return Err(SystemError::EPERM);
         }
@@ -295,7 +295,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseOrLockNotZero);
             if cmpxchg_result.is_ok() {
-                return Ok(cmpxchg_result.unwrap());
+                return Ok(*cmpxchg_result.as_ref().unwrap_err());
             }
         }
 

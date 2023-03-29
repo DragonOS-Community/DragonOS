@@ -7,7 +7,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::include::bindings::bindings::EOVERFLOW;
+use crate::{syscall::SystemError};
 
 ///RwLock读写锁
 
@@ -91,7 +91,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取实时的读者数并尝试加1,如果增加值成功则返回增加1后的读者数,否则panic
-    fn current_reader(&self) -> Result<u32, i32> {
+    fn current_reader(&self) -> Result<u32, SystemError> {
         const MAX_READERS: u32 = core::u32::MAX >> READER_BIT >> 1; //右移3位
 
         let value = self.lock.fetch_add(READER, Ordering::Acquire);
@@ -100,7 +100,7 @@ impl<T> RwLock<T> {
         if value > MAX_READERS << READER_BIT {
             self.lock.fetch_sub(READER, Ordering::Release);
             //panic!("Too many lock readers, cannot safely proceed");
-            return Err(-(EOVERFLOW as i32));
+            return Err(SystemError::EOVERFLOW);
         } else {
             return Ok(value);
         }

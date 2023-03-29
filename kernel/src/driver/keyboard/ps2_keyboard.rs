@@ -7,9 +7,9 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{core::generate_inode_id, file::FileMode, FileType, IndexNode, Metadata, PollStatus},
     },
-    include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t, ENOTSUP},
+    include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t},
     libs::rwlock::RwLock,
-    time::TimeSpec,
+    time::TimeSpec, syscall::SystemError,
 };
 
 #[derive(Debug)]
@@ -83,7 +83,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         len: usize,
         buf: &mut [u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let guard = self.0.read();
         let func = guard.f_ops.read.unwrap();
         let r = unsafe {
@@ -103,15 +103,15 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _len: usize,
         _buf: &[u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
-        return Err(-(ENOTSUP as i32));
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 
     fn open(
         &self,
         _data: &mut crate::filesystem::vfs::FilePrivateData,
         _mode: &FileMode,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 0 {
             // 第一次打开，需要初始化
@@ -122,7 +122,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut crate::filesystem::vfs::FilePrivateData) -> Result<(), i32> {
+    fn close(&self, _data: &mut crate::filesystem::vfs::FilePrivateData) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 1 {
             // 最后一次关闭，需要释放
@@ -133,17 +133,17 @@ impl IndexNode for LockedPS2KeyBoardInode {
         return Ok(());
     }
 
-    fn poll(&self) -> Result<PollStatus, i32> {
+    fn poll(&self) -> Result<PollStatus, SystemError> {
         return Ok(PollStatus {
             flags: PollStatus::READ_MASK,
         });
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.read().metadata.clone());
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let mut inode = self.0.write();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -163,7 +163,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         self
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, i32> {
-        return Err(-(ENOTSUP as i32));
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 }

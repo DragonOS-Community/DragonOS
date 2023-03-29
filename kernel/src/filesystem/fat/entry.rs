@@ -8,13 +8,10 @@ use alloc::{
 };
 
 use crate::{
-    include::bindings::bindings::{
-        EEXIST, EILSEQ, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EPERM,
-        EROFS,
-    },
     io::{device::LBA_SIZE, SeekFrom},
     kwarn,
     libs::vec_cursor::VecCursor,
+    syscall::SystemError,
 };
 
 use super::{
@@ -81,8 +78,8 @@ impl FATFile {
     /// @param offset 起始位置在文件中的偏移量
     ///
     /// @return Ok(usize) 成功读取到的字节数
-    /// @return Err(i32) 读取时出现错误，返回错误码
-    pub fn read(&self, fs: &Arc<FATFileSystem>, buf: &mut [u8], offset: u64) -> Result<usize, i32> {
+    /// @return Err(SystemError) 读取时出现错误，返回错误码
+    pub fn read(&self, fs: &Arc<FATFileSystem>, buf: &mut [u8], offset: u64) -> Result<usize, SystemError> {
         if offset >= self.size() {
             return Ok(0);
         }
@@ -153,13 +150,13 @@ impl FATFile {
     /// @param offset 起始位置在文件中的偏移量
     ///
     /// @return Ok(usize) 成功写入的字节数
-    /// @return Err(i32) 写入时出现错误，返回错误码
+    /// @return Err(SystemError) 写入时出现错误，返回错误码
     pub fn write(
         &mut self,
         fs: &Arc<FATFileSystem>,
         buf: &[u8],
         offset: u64,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         self.ensure_len(fs, offset, buf.len() as u64)?;
 
         // 要写入的第一个簇的簇号
@@ -225,8 +222,8 @@ impl FATFile {
     /// @param len 期待的空闲空间长度
     ///
     /// @return Ok(()) 经过操作后，offset后面具有长度至少为len的空闲空间
-    /// @return Err(i32) 处理过程中出现了异常。
-    fn ensure_len(&mut self, fs: &Arc<FATFileSystem>, offset: u64, len: u64) -> Result<(), i32> {
+    /// @return Err(SystemError) 处理过程中出现了异常。
+    fn ensure_len(&mut self, fs: &Arc<FATFileSystem>, offset: u64, len: u64) -> Result<(), SystemError> {
         // 文件内本身就还有空余的空间
         if offset + len <= self.size() {
             return Ok(());
@@ -257,7 +254,7 @@ impl FATFile {
                 c
             } else {
                 kwarn!("FAT: last cluster not found, File = {self:?}");
-                return Err(-(EINVAL as i32));
+                return Err(SystemError::EINVAL);
             };
             // 申请簇
             let mut current_cluster: Cluster = last_cluster;
@@ -311,7 +308,7 @@ impl FATFile {
         fs: &Arc<FATFileSystem>,
         range_start: u64,
         range_end: u64,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         if range_end <= range_start {
             return Ok(());
         }
@@ -330,8 +327,8 @@ impl FATFile {
     /// @param new_size 新的文件大小，如果它大于当前文件大小，则不做操作。
     ///
     /// @return Ok(()) 操作成功
-    /// @return Err(i32) 在操作时出现错误
-    pub fn truncate(&mut self, fs: &Arc<FATFileSystem>, new_size: u64) -> Result<(), i32> {
+    /// @return Err(SystemError) 在操作时出现错误
+    pub fn truncate(&mut self, fs: &Arc<FATFileSystem>, new_size: u64) -> Result<(), SystemError> {
         if new_size >= self.size() {
             return Ok(());
         }
@@ -400,7 +397,7 @@ impl FATDir {
         &self,
         num_free: u64,
         fs: Arc<FATFileSystem>,
-    ) -> Result<Option<(Cluster, u64)>, i32> {
+    ) -> Result<Option<(Cluster, u64)>, SystemError> {
         let mut free = 0;
         let mut current_cluster: Cluster = self.first_cluster;
         let mut offset = self.root_offset.unwrap_or(0);
@@ -488,14 +485,14 @@ impl FATDir {
     /// @param fs 当前目录所属的文件系统
     ///
     /// @return Ok(FATDirEntry) 找到期待的目录项
-    /// @return Err(i32) 错误码
+    /// @return Err(SystemError) 错误码
     pub fn find_entry(
         &self,
         name: &str,
         expect_dir: Option<bool>,
         mut short_name_gen: Option<&mut ShortNameGenerator>,
         fs: Arc<FATFileSystem>,
-    ) -> Result<FATDirEntry, i32> {
+    ) -> Result<FATDirEntry, SystemError> {
         LongDirEntry::validate_long_name(name)?;
         // 迭代当前目录下的文件/文件夹
         for e in self.to_iter(fs) {
@@ -503,10 +500,10 @@ impl FATDir {
                 if expect_dir.is_some() && Some(e.is_dir()) != expect_dir {
                     if e.is_dir() {
                         // 期望得到文件，但是是文件夹
-                        return Err(-(EISDIR as i32));
+                        return Err(SystemError::EISDIR);
                     } else {
                         // 期望得到文件夹，但是是文件
-                        return Err(-(ENOTDIR as i32));
+                        return Err(SystemError::ENOTDIR);
                     }
                 }
                 // 找到期望的目录项
@@ -518,17 +515,17 @@ impl FATDir {
             }
         }
         // 找不到文件/文件夹
-        return Err(-(ENOENT as i32));
+        return Err(SystemError::ENOENT);
     }
 
     /// @brief 在当前目录下打开文件，获取FATFile结构体
-    pub fn open_file(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATFile, i32> {
+    pub fn open_file(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATFile, SystemError> {
         let f: FATFile = self.find_entry(name, Some(false), None, fs)?.to_file()?;
         return Ok(f);
     }
 
     /// @brief 在当前目录下打开文件夹，获取FATDir结构体
-    pub fn open_dir(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATDir, i32> {
+    pub fn open_dir(&self, name: &str, fs: Arc<FATFileSystem>) -> Result<FATDir, SystemError> {
         let d: FATDir = self.find_entry(name, Some(true), None, fs)?.to_dir()?;
         return Ok(d);
     }
@@ -537,17 +534,18 @@ impl FATDir {
     ///
     /// @param name 文件名
     /// @param fs 当前文件夹所属的文件系统
-    pub fn create_file(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATFile, i32> {
-        let r: Result<FATDirEntryOrShortName, i32> =
+    pub fn create_file(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATFile, SystemError> {
+        let r: Result<FATDirEntryOrShortName, SystemError> =
             self.check_existence(name, Some(false), fs.clone());
         // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
         if r.is_err() {
             let err_val = r.unwrap_err();
-            if err_val == (-(EISDIR as i32)) || err_val == (-(ENOTDIR as i32)) {
-                return Err(-(EEXIST as i32));
+            if err_val == (SystemError::EISDIR) || err_val == (SystemError::ENOTDIR) {
+                return Err(SystemError::EEXIST);
             } else {
                 return Err(err_val);
             }
+            
         }
 
         match r.unwrap() {
@@ -555,7 +553,7 @@ impl FATDir {
                 // 确认名称是一个可行的长文件名
                 LongDirEntry::validate_long_name(name)?;
                 // 创建目录项
-                let x: Result<FATFile, i32> = self
+                let x: Result<FATFile, SystemError> = self
                     .create_dir_entries(
                         name.trim(),
                         &short_name,
@@ -571,20 +569,20 @@ impl FATDir {
 
             FATDirEntryOrShortName::DirEntry(_) => {
                 // 已经存在这样的一个目录项了
-                return Err(-(EEXIST as i32));
+                return Err(SystemError::EEXIST);
             }
         }
     }
 
-    pub fn create_dir(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATDir, i32> {
-        let r: Result<FATDirEntryOrShortName, i32> =
+    pub fn create_dir(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATDir, SystemError> {
+        let r: Result<FATDirEntryOrShortName, SystemError> =
             self.check_existence(name, Some(true), fs.clone());
         // kdebug!("check existence ok");
         // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
         if r.is_err() {
             let err_val = r.unwrap_err();
-            if err_val == (-(EISDIR as i32)) || err_val == (-(ENOTDIR as i32)) {
-                return Err(-(EEXIST as i32));
+            if err_val == (SystemError::EISDIR) || err_val == (SystemError::ENOTDIR) {
+                return Err(SystemError::EEXIST);
             } else {
                 return Err(err_val);
             }
@@ -644,7 +642,7 @@ impl FATDir {
             }
             FATDirEntryOrShortName::DirEntry(_) => {
                 // 已经存在这样的一个目录项了
-                return Err(-(EEXIST as i32));
+                return Err(SystemError::EEXIST);
             }
         }
     }
@@ -656,17 +654,17 @@ impl FATDir {
     ///
     /// @return Ok(FATDirEntryOrShortName::DirEntry) 找到期待的目录项
     /// @return Ok(FATDirEntryOrShortName::ShortName) 当前文件夹下不存在指定的目录项，因此返回一个可行的短文件名
-    /// @return Err(i32) 错误码
+    /// @return Err(SystemError) 错误码
     pub fn check_existence(
         &self,
         name: &str,
         expect_dir: Option<bool>,
         fs: Arc<FATFileSystem>,
-    ) -> Result<FATDirEntryOrShortName, i32> {
+    ) -> Result<FATDirEntryOrShortName, SystemError> {
         let mut sng = ShortNameGenerator::new(name);
 
         loop {
-            let e: Result<FATDirEntry, i32> =
+            let e: Result<FATDirEntry, SystemError> =
                 self.find_entry(name, expect_dir, Some(&mut sng), fs.clone());
             match e {
                 Ok(e) => {
@@ -675,7 +673,7 @@ impl FATDir {
                 }
                 Err(e) => {
                     // 如果没找到，则不返回错误
-                    if e == -(ENOENT as i32) {
+                    if e == SystemError::ENOENT {
                     } else {
                         // 其他错误，则返回
                         return Err(e);
@@ -708,7 +706,7 @@ impl FATDir {
         short_dentry: Option<ShortDirEntry>,
         attrs: FileAttributes,
         fs: Arc<FATFileSystem>,
-    ) -> Result<FATDirEntry, i32> {
+    ) -> Result<FATDirEntry, SystemError> {
         let mut short_dentry: ShortDirEntry = short_dentry.unwrap_or(ShortDirEntry::default());
         short_dentry.name = short_name.clone();
         short_dentry.attributes = attrs;
@@ -725,7 +723,7 @@ impl FATDir {
         // 目录项开始位置
         let start_loc: (Cluster, u64) = match free_entries {
             Some(c) => c,
-            None => return Err(-(ENOSPC as i32)),
+            None => return Err(SystemError::ENOSPC),
         };
         let offsets: Vec<(Cluster, u64)> =
             FATDirEntryOffsetIter::new(fs.clone(), start_loc, num_entries, None).collect();
@@ -771,18 +769,18 @@ impl FATDir {
     /// @param remove_clusters 是否删除与指定的目录项相关联的数据簇
     ///
     /// @return Ok() 成功时无返回值
-    /// @return Err(i32) 如果目标文件夹不为空，则不能删除，返回-ENOTEMPTY. 或者返回底层传上来的错误
+    /// @return Err(SystemError) 如果目标文件夹不为空，则不能删除，返回-ENOTEMPTY. 或者返回底层传上来的错误
     pub fn remove(
         &self,
         fs: Arc<FATFileSystem>,
         name: &str,
         remove_clusters: bool,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         let e: FATDirEntry = self.find_entry(name, None, None, fs.clone())?;
 
         // 判断文件夹是否为空，如果空，则不删除，报错。
         if e.is_dir() && !(e.to_dir().unwrap().is_empty(fs.clone())) {
-            return Err(-(ENOTEMPTY as i32));
+            return Err(SystemError::ENOTEMPTY);
         }
 
         if e.first_cluster().cluster_num >= 2 && remove_clusters {
@@ -805,7 +803,7 @@ impl FATDir {
         &self,
         fs: Arc<FATFileSystem>,
         cluster_range: ((Cluster, u64), (Cluster, u64)),
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         // 收集所有的要移除的目录项
         let offsets: Vec<(Cluster, u64)> =
             FATDirEntryOffsetIter::new(fs.clone(), cluster_range.0, 15, Some(cluster_range.1))
@@ -823,8 +821,8 @@ impl FATDir {
     /// @brief 根据名字在当前文件夹下寻找目录项
     ///
     /// @return Ok(FATDirEntry) 目标目录项
-    /// @return Err(i32) 底层传上来的错误码
-    pub fn get_dir_entry(&self, fs: Arc<FATFileSystem>, name: &str) -> Result<FATDirEntry, i32> {
+    /// @return Err(SystemError) 底层传上来的错误码
+    pub fn get_dir_entry(&self, fs: Arc<FATFileSystem>, name: &str) -> Result<FATDirEntry, SystemError> {
         if name == "." || name == "/" {
             return Ok(FATDirEntry::Dir(self.clone()));
         }
@@ -840,7 +838,7 @@ impl FATDir {
         fs: Arc<FATFileSystem>,
         old_name: &str,
         new_name: &str,
-    ) -> Result<FATDirEntry, i32> {
+    ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
         let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
             self.check_existence(old_name, None, fs.clone())?
@@ -848,7 +846,7 @@ impl FATDir {
             dentry
         } else {
             // 如果目标目录项不存在，则返回错误
-            return Err(-(ENOENT as i32));
+            return Err(SystemError::ENOENT);
         };
 
         let short_name = if let FATDirEntryOrShortName::ShortName(s) =
@@ -857,7 +855,7 @@ impl FATDir {
             s
         } else {
             // 如果目标目录项存在，那么就返回错误
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         };
 
         let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
@@ -877,7 +875,7 @@ impl FATDir {
             return Ok(new_dentry);
         } else {
             // 不允许对根目录项进行重命名
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         }
     }
 }
@@ -991,10 +989,10 @@ impl LongDirEntry {
     /// @param name_part 要被填入当前长目录项的名字（数组长度必须为13）
     ///
     /// @return Ok(())
-    /// @return Err(i32) 错误码
-    fn insert_name(&mut self, name_part: &[u16]) -> Result<(), i32> {
+    /// @return Err(SystemError) 错误码
+    fn insert_name(&mut self, name_part: &[u16]) -> Result<(), SystemError> {
         if name_part.len() != Self::LONG_NAME_STR_LEN {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
         self.name1.copy_from_slice(&name_part[0..5]);
         self.name2.copy_from_slice(&name_part[5..11]);
@@ -1004,9 +1002,9 @@ impl LongDirEntry {
 
     /// @brief 将当前长目录项的名称字段，原样地拷贝到一个长度为13的u16数组中。
     /// @param dst 拷贝的目的地，一个[u16]数组，长度必须为13。
-    pub fn copy_name_to_slice(&self, dst: &mut [u16]) -> Result<(), i32> {
+    pub fn copy_name_to_slice(&self, dst: &mut [u16]) -> Result<(), SystemError> {
         if dst.len() != Self::LONG_NAME_STR_LEN {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
         dst[0..5].copy_from_slice(&self.name1);
         dst[5..11].copy_from_slice(&self.name2);
@@ -1025,19 +1023,19 @@ impl LongDirEntry {
     /// @brief 校验字符串是否符合长目录项的命名要求
     ///
     /// @return Ok(()) 名称合法
-    /// @return Err(i32) 名称不合法，返回错误码
-    pub fn validate_long_name(mut name: &str) -> Result<(), i32> {
+    /// @return Err(SystemError) 名称不合法，返回错误码
+    pub fn validate_long_name(mut name: &str) -> Result<(), SystemError> {
         // 去除首尾多余的空格
         name = name.trim();
 
         // 名称不能为0
         if name.len() == 0 {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         // 名称长度不能大于255
         if name.len() > 255 {
-            return Err(-(ENAMETOOLONG as i32));
+            return Err(SystemError::ENAMETOOLONG);
         }
 
         // 检查是否符合命名要求
@@ -1049,7 +1047,7 @@ impl LongDirEntry {
                 | '^' | '#' | '&' => {}
                 '+' | ',' | ';' | '=' | '[' | ']' | '.' | ' ' => {}
                 _ => {
-                    return Err(-(EILSEQ as i32));
+                    return Err(SystemError::EILSEQ);
                 }
             }
         }
@@ -1062,8 +1060,8 @@ impl LongDirEntry {
     /// @param disk_bytes_offset 长目录项所在位置对应的在磁盘上的字节偏移量
     ///
     /// @return Ok(())
-    /// @return Err(i32) 错误码
-    pub fn flush(&self, fs: Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), i32> {
+    /// @return Err(SystemError) 错误码
+    pub fn flush(&self, fs: Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), SystemError> {
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(disk_bytes_offset);
         let lba = fs.get_lba_from_offset(
@@ -1272,8 +1270,8 @@ impl ShortDirEntry {
     /// @param disk_bytes_offset 短目录项所在位置对应的在磁盘上的字节偏移量
     ///
     /// @return Ok(())
-    /// @return Err(i32) 错误码
-    pub fn flush(&self, fs: &Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), i32> {
+    /// @return Err(SystemError) 错误码
+    pub fn flush(&self, fs: &Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), SystemError> {
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(disk_bytes_offset);
         let lba = fs.get_lba_from_offset(
@@ -1389,7 +1387,7 @@ impl FATDirIter {
     ///             u64: 下一个要读取的簇内偏移量
     ///             Option<FATDirEntry>: 读取到的目录项（如果没有读取到，就返回失败）
     /// @return Err(错误码) 可能出现了内部错误，或者是磁盘错误等。具体原因看错误码。
-    fn get_dir_entry(&mut self) -> Result<(Cluster, u64, Option<FATDirEntry>), i32> {
+    fn get_dir_entry(&mut self) -> Result<(Cluster, u64, Option<FATDirEntry>), SystemError> {
         loop {
             // 如果当前簇已经被读完，那么尝试获取下一个簇
             if self.offset >= self.fs.bytes_per_cluster() && !self.is_root {
@@ -1497,7 +1495,7 @@ impl FATDirIter {
                         }
                     }
                     // kdebug!("collect dentries done. long_name_entries={long_name_entries:?}");
-                    let dir_entry: Result<FATDirEntry, i32> = FATDirEntry::new(
+                    let dir_entry: Result<FATDirEntry, SystemError> = FATDirEntry::new(
                         long_name_entries,
                         (
                             (start_cluster, start_offset),
@@ -1556,19 +1554,19 @@ impl FATDirEntry {
     ///         格式：[第20个（或者是最大ord的那个）, 19, 18, ..., 1, 短目录项]
     ///
     /// @return Ok(FATDirEntry) 构建好的FATDirEntry类型的对象
-    /// @return Err(i32) 错误码
+    /// @return Err(SystemError) 错误码
     pub fn new(
         mut long_name_entries: Vec<FATRawDirEntry>,
         loc: ((Cluster, u64), (Cluster, u64)),
-    ) -> Result<Self, i32> {
+    ) -> Result<Self, SystemError> {
         if long_name_entries.is_empty() {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         if !long_name_entries[0].is_last() || !long_name_entries.last().unwrap().is_short() {
             // 存在孤立的目录项，文件系统出现异常，因此返回错误，表明其只读。
             // TODO: 标记整个FAT文件系统为只读的
-            return Err(-(EROFS as i32));
+            return Err(SystemError::EROFS);
         }
 
         // 取出短目录项（位于vec的末尾）
@@ -1585,7 +1583,7 @@ impl FATDirEntry {
                 }
 
                 _ => {
-                    return Err(-(EROFS as i32));
+                    return Err(SystemError::EROFS);
                 }
             }
         }
@@ -1595,7 +1593,7 @@ impl FATDirEntry {
             return Ok(short_dentry.to_dir_entry_with_long_name(extractor.to_string(), loc));
         } else {
             // 校验和不相同，认为文件系统出错
-            return Err(-(EROFS as i32));
+            return Err(SystemError::EROFS);
         }
     }
 
@@ -1748,9 +1746,9 @@ impl FATDirEntry {
     }
 
     /// @brief 将FATDirEntry转换为FATFile对象
-    pub fn to_file(&self) -> Result<FATFile, i32> {
+    pub fn to_file(&self) -> Result<FATFile, SystemError> {
         if self.is_file() == false {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         match &self {
@@ -1762,9 +1760,9 @@ impl FATDirEntry {
     }
 
     /// @brief 将FATDirEntry转换为FATDir对象
-    pub fn to_dir(&self) -> Result<FATDir, i32> {
+    pub fn to_dir(&self) -> Result<FATDir, SystemError> {
         if self.is_dir() == false {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
         match &self {
             FATDirEntry::Dir(d) => {
@@ -1973,7 +1971,7 @@ impl ShortNameGenerator {
         }
     }
 
-    pub fn generate(&self) -> Result<[u8; 11], i32> {
+    pub fn generate(&self) -> Result<[u8; 11], SystemError> {
         if self.is_dot() || self.is_dotdot() {
             return Ok(self.name);
         }
@@ -1997,7 +1995,7 @@ impl ShortNameGenerator {
             }
         }
         // 由于产生太多的冲突，因此返回错误（“短文件名已经存在”）
-        return Err(-(EEXIST as i32));
+        return Err(SystemError::EEXIST);
     }
 
     pub fn next_iteration(&mut self) {
@@ -2096,13 +2094,13 @@ impl LongNameExtractor {
     /// @brief 提取长目录项的名称
     /// @param longname_dentry 长目录项
     /// 请注意，必须倒序输入长目录项对象
-    fn process(&mut self, longname_dentry: LongDirEntry) -> Result<(), i32> {
+    fn process(&mut self, longname_dentry: LongDirEntry) -> Result<(), SystemError> {
         let is_last: bool = longname_dentry.is_last();
         let index: u8 = longname_dentry.ord & 0x1f;
 
         if index == 0 {
             self.name.clear();
-            return Err(-(EROFS as i32));
+            return Err(SystemError::EROFS);
         }
 
         // 如果是最后一个LongDirEntry，则初始化当前生成器
@@ -2118,7 +2116,7 @@ impl LongNameExtractor {
             // 如果当前index为0,或者index不连续，或者是校验和不同，那么认为文件系统损坏，清除生成器的名称字段
             // TODO: 对文件系统的变为只读状态状况的拦截
             self.name.clear();
-            return Err(-(EROFS as i32));
+            return Err(SystemError::EROFS);
         } else {
             // 由于dentry倒序输入，因此index是每次减1的
             self.index -= 1;
@@ -2328,7 +2326,7 @@ impl Iterator for FATDirEntryOffsetIter {
 pub fn get_raw_dir_entry(
     fs: &Arc<FATFileSystem>,
     in_disk_bytes_offset: u64,
-) -> Result<FATRawDirEntry, i32> {
+) -> Result<FATRawDirEntry, SystemError> {
     // 块内偏移量
     let blk_offset: u64 = fs.get_in_block_offset(in_disk_bytes_offset);
     let lba = fs.get_lba_from_offset(

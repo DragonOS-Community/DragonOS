@@ -81,7 +81,7 @@ fn virtio_device(transport: impl Transport) {
 ///@brief virtio-net 驱动的初始化与测试
 fn virtio_net<T: Transport>(transport: T) {
     let mut driver_net = match VirtIONet::<HalImpl, T>::new(transport) {
-        Ok(mut net) => {
+        Ok(net) => {
             kdebug!("Virtio-net driver init successfully.");
             net
         }

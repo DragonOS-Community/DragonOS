@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use crate::{arch::asm::current::current_pcb, include::bindings::bindings::EOVERFLOW, kdebug, syscall::SystemError};
+use crate::{arch::asm::current::current_pcb, kdebug, syscall::SystemError};
 
 use super::wait_queue::WaitQueue;
 

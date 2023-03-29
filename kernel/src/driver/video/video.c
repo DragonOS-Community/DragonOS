@@ -105,6 +105,7 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
         init_frame_buffer();
     else
     {
+        unregister_softirq(VIDEO_REFRESH_SIRQ);
         // 计算开始时间
         video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
 

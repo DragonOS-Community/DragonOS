@@ -19,6 +19,7 @@
 #include <driver/disk/ahci/ahci.h>
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
+#include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <ktest/ktest.h>
 #include <mm/mmio.h>
@@ -26,7 +27,6 @@
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-#include <driver/virtio/virtio.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -46,6 +46,7 @@ extern struct sighand_struct INITIAL_SIGHAND;
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
+extern void rs_process_exit_fpstate(struct process_control_block *pcb);
 extern int process_init_files();
 
 // 设置初始进程的PCB
@@ -410,8 +411,6 @@ load_elf_failed:;
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
 
-    // kdebug("do_execve is running...");
-
     // 当前进程正在与父进程共享地址空间，需要创建
     // 独立的地址空间才能使新程序正常运行
     if (current_pcb->flags & PF_VFORK)
@@ -584,7 +583,7 @@ ul initial_kernel_thread(ul arg)
 
     // 若在后面这段代码中触发中断，return时会导致段选择子错误，从而触发#GP，因此这里需要cli
     cli();
-    current_pcb->thread->rip = (ul)ret_from_system_call;
+    current_pcb->thread->rip = (ul)ret_from_intr;
     current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
     current_pcb->thread->fs = USER_DS | 0x3;
     barrier();
@@ -616,9 +615,9 @@ ul initial_kernel_thread(ul arg)
  */
 void process_exit_notify()
 {
-
     wait_queue_wakeup(&current_pcb->parent_pcb->wait_child_proc_exit, PROC_INTERRUPTIBLE);
 }
+
 /**
  * @brief 进程退出时执行的函数
  *
@@ -882,6 +881,7 @@ int process_release_pcb(struct process_control_block *pcb)
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
     process_exit_sighand(pcb);
     process_exit_signal(pcb);
+    rs_process_exit_fpstate(pcb);
     rs_procfs_unregister_pid(pcb->pid);
     // 释放当前pcb
     kfree(pcb);

@@ -6,7 +6,7 @@ use core::{
 use alloc::boxed::Box;
 
 use crate::{
-    arch::asm::current::current_pcb,
+    arch::{asm::current::current_pcb, fpu::FpState},
     filesystem::vfs::file::{File, FileDescriptorVec},
     include::bindings::bindings::{
         process_control_block, CLONE_FS, PROC_INTERRUPTIBLE,
@@ -151,7 +151,7 @@ impl process_control_block {
         };
 
         // 拷贝文件描述符数组
-        let new_fd_vec: &mut FileDescriptorVec = Box::leak(Box::new(old_fds.clone()));
+        let new_fd_vec: &mut FileDescriptorVec = Box::leak(old_fds.clone());
 
         self.fds = new_fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
 
@@ -259,7 +259,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数。
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_interruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_interruptible(&mut self) {
         self.state = PROC_INTERRUPTIBLE as u64;
     }
 
@@ -267,7 +268,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_uninterruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_uninterruptible(&mut self) {
         self.state = PROC_UNINTERRUPTIBLE as u64;
     }
 }
@@ -315,6 +317,36 @@ pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) ->
         return 0;
     } else {
         return r.unwrap_err().to_posix_errno();
+    }
+}
+
+/// @brief 复制当前进程的浮点状态
+#[allow(dead_code)]
+#[no_mangle]
+pub extern "C" fn rs_dup_fpstate() -> *mut c_void {
+    // 如果当前进程没有浮点状态，那么就返回一个默认的浮点状态
+    if current_pcb().fp_state == null_mut() {
+        return Box::leak(Box::new(FpState::default())) as *mut FpState as usize as *mut c_void;
+    } else {
+        // 如果当前进程有浮点状态，那么就复制一个新的浮点状态
+        let state = current_pcb().fp_state as usize as *mut FpState;
+        unsafe {
+            let s = state.as_ref().unwrap();
+            let state: &mut FpState = Box::leak(Box::new(s.clone()));
+
+            return state as *mut FpState as usize as *mut c_void;
+        }
+    }
+}
+
+/// @brief 释放进程的浮点状态所占用的内存
+#[no_mangle]
+pub extern "C" fn rs_process_exit_fpstate(pcb: &'static mut process_control_block) {
+    if pcb.fp_state != null_mut() {
+        let state = pcb.fp_state as usize as *mut FpState;
+        unsafe {
+            drop(Box::from_raw(state));
+        }
     }
 }
 

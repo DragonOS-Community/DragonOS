@@ -4,12 +4,13 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
+    driver::tty::TtyFilePrivateData,
     filesystem::procfs::ProcfsFilePrivateData,
     include::bindings::bindings::{
         process_control_block,
     },
     io::SeekFrom,
-    kerror, driver::tty::TtyFilePrivateData, syscall::SystemError,
+    kerror, syscall::SystemError,
 };
 
 use super::{Dirent, FileType, IndexNode, Metadata};
@@ -79,7 +80,7 @@ bitflags! {
 }
 
 /// @brief 抽象文件结构体
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct File {
     inode: Arc<dyn IndexNode>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
@@ -262,8 +263,29 @@ impl File {
         return Ok((name_bytes.len() + ::core::mem::size_of::<Dirent>()
             - ::core::mem::size_of_val(&dirent.d_name)) as u64);
     }
+
     pub fn inode(&self) -> Arc<dyn IndexNode> {
         return self.inode.clone();
+    }
+
+    /// @brief 尝试克隆一个文件
+    ///
+    /// @return Option<Box<File>> 克隆后的文件结构体。如果克隆失败，返回None
+    pub fn try_clone(&self) -> Option<Box<File>> {
+        let mut res: Box<File> = Box::new(Self {
+            inode: self.inode.clone(),
+            offset: self.offset.clone(),
+            mode: self.mode.clone(),
+            file_type: self.file_type.clone(),
+            readdir_subdirs_name: self.readdir_subdirs_name.clone(),
+            private_data: self.private_data.clone(),
+        });
+        // 调用inode的open方法，让inode知道有新的文件打开了这个inode
+        if self.inode.open(&mut res.private_data, &res.mode).is_err() {
+            return None;
+        }
+
+        return Some(res);
     }
 }
 
@@ -283,7 +305,7 @@ impl Drop for File {
 }
 
 /// @brief pcb里面的文件描述符数组
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     pub fds: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD],
@@ -308,6 +330,19 @@ impl FileDescriptorVec {
 
         // 初始化文件描述符数组结构体
         return Box::new(FileDescriptorVec { fds: data });
+    }
+
+    /// @brief 克隆一个文件描述符数组
+    ///
+    /// @return Box<FileDescriptorVec> 克隆后的文件描述符数组
+    pub fn clone(&self) -> Box<FileDescriptorVec> {
+        let mut res: Box<FileDescriptorVec> = FileDescriptorVec::new();
+        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            if let Some(file) = &self.fds[i] {
+                res.fds[i] = file.try_clone();
+            }
+        }
+        return res;
     }
 
     /// @brief 从pcb的fds字段，获取文件描述符数组的可变引用

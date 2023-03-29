@@ -528,6 +528,6 @@ int keyboard_analyze_keycode(int fd)
 int keyboard_get_scancode(int fd)
 {
     unsigned int ret = 0;
-    read(fd, &ret, 1);
+    read(fd, &ret, 1); 
     return ret;
 }

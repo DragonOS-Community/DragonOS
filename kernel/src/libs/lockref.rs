@@ -120,10 +120,10 @@ impl LockRef {
     /// @brief 对于不支持无锁lockref的架构，直接返回Err(SystemError::ENOTSUP)，表示不支持
     #[cfg(not(target_arch = "x86_64"))]
     #[inline]
-    fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, SystemError> {
+    fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, i32> {
         use crate::include::bindings::bindings::ENOTSUP;
 
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::ENOTSUP.to_posix_errno());
     }
 
     /// @brief 原子的将引用计数加1
@@ -148,7 +148,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::IncreaseNotZero);
             if cmpxchg_result.is_ok() {
-                return Ok(*cmpxchg_result.as_ref().unwrap_err());
+                return Ok(cmpxchg_result.unwrap());
             } else if cmpxchg_result.unwrap_err() == 1 {
                 // 不满足not zero 的条件
                 return Err(SystemError::EPERM);
@@ -176,7 +176,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::IncreaseNotDead);
             if cmpxchg_result.is_ok() {
-                return Ok(*cmpxchg_result.as_ref().unwrap_err())
+                return Ok(cmpxchg_result.unwrap());
             } else if cmpxchg_result.unwrap_err() == 1 {
                 return Err(SystemError::EPERM);
             }
@@ -206,7 +206,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::Decrease);
             if cmpxchg_result.is_ok() {
-                return Ok(*cmpxchg_result.as_ref().unwrap_err());
+                return Ok(cmpxchg_result.unwrap());
             }
         }
         let retval: Result<i32, SystemError>;
@@ -237,12 +237,12 @@ impl LockRef {
     pub fn dec_return(&mut self) -> Result<i32, SystemError> {
         let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseReturn);
         if cmpxchg_result.is_ok() {
-            return Ok(*cmpxchg_result.as_ref().unwrap_err());
-        } else if cmpxchg_result.clone().unwrap_err() == 1 {
+            return Ok(cmpxchg_result.unwrap());
+        } else if *cmpxchg_result.as_ref().unwrap_err() == 1 {
             return Err(SystemError::EPERM);
         }
         // 由于cmpxchg超时，操作失败
-        if cmpxchg_result.clone().unwrap_err() != SystemError::ENOTSUP.to_posix_errno() {
+        if *cmpxchg_result.as_ref().unwrap_err() != SystemError::ENOTSUP.to_posix_errno() {
             return Err(SystemError::EFAULT);
         }
 
@@ -295,7 +295,7 @@ impl LockRef {
         {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseOrLockNotZero);
             if cmpxchg_result.is_ok() {
-                return Ok(*cmpxchg_result.as_ref().unwrap_err());
+                return Ok(cmpxchg_result.unwrap());
             }
         }
 

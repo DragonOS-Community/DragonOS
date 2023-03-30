@@ -14,7 +14,7 @@ static struct kfifo_t kb_buf;
 // 缓冲区等待队列
 static wait_queue_node_t ps2_keyboard_wait_queue;
 extern void ps2_keyboard_register(struct vfs_file_operations_t *);
-extern void keyboard_handle(uint8_t input); 
+extern void ps2_keyboard_parse_keycode(uint8_t input); 
 
 // 缓冲区读写锁
 static spinlock_t ps2_kb_buf_rw_lock;
@@ -144,7 +144,7 @@ struct vfs_file_operations_t ps2_keyboard_fops =
 void ps2_keyboard_handler(ul irq_num, ul buf_vaddr, struct pt_regs *regs)
 {
     unsigned char x = io_in8(PORT_PS2_KEYBOARD_DATA);
-    keyboard_handle((uint8_t)x);
+    ps2_keyboard_parse_keycode((uint8_t)x);
     uint8_t count = kfifo_in((struct kfifo_t *)buf_vaddr, &x, sizeof(unsigned char));
     if (count == 0)
     {

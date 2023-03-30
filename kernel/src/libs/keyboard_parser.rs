@@ -1,19 +1,12 @@
-//use core::marker::PhantomData;
-
-use crate::filesystem::vfs::ROOT_INODE;
 use crate::kdebug;
-//use crate::kdebug;
-use crate::syscall::SystemError;
-use crate::{filesystem, kerror, libs::rwlock::RwLock};
-use lazy_static::lazy_static;
 
 #[allow(dead_code)]
 pub const NUM_SCAN_CODES: u8 = 0x80;
 #[allow(dead_code)]
-pub const MAP_COLS: u8 = 2;
+pub const TYPE1_KEYCODE_MAP_TABLE_COLS: u8 = 2;
 
 #[allow(dead_code)]
-pub const FLAG_BREAK: u8 = 0x80; // 用于判断按键是否被按下
+pub const TYPE1_KEYCODE_FLAG_BREAK: u8 = 0x80; // 用于判断按键是否被按下
 
 /// 标志状态
 #[repr(u8)]
@@ -27,43 +20,34 @@ pub enum KeyFlag {
     OtherKey = 8 as u8, // 除了上面两个按键以外的功能按键（不包括下面的第三类按键）
 }
 
-#[allow(dead_code)]
-#[no_mangle]
-/// for test
-pub extern "C" fn keyboard_handle(input:u8){
-    //kdebug!("WHAT IS THE PROBELM?\n");
-    let mut fsm=TypeOneFSM::new();
-    fsm.parse(input).parse(input);
-}
-
 /// @brief A FSM to parse type one keyboard scan code
 #[derive(Debug)]
 #[allow(dead_code)]
-struct TypeOneFSM {
-    state: ScanCodeStatus,
+pub struct TypeOneFSM {
+    status: ScanCodeStatus,
     current_state: TypeOneFSMState,
 }
 
 impl TypeOneFSM {
     #[allow(dead_code)]
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            state: ScanCodeStatus::new(),
+            status: ScanCodeStatus::new(),
             current_state: TypeOneFSMState::Start,
         }
     }
 
     /// @brief 解析扫描码
     #[allow(dead_code)]
-    fn parse(&mut self, scancode: u8)->TypeOneFSMState {
-        self.current_state = self.current_state.parse(scancode);
+    pub fn parse(&mut self, scancode: u8) -> TypeOneFSMState {
+        self.current_state = self.current_state.parse(scancode, &mut self.status);
         self.current_state
     }
 }
 
 /// @brief 第一类扫描码状态机的状态
-#[derive(Debug,Copy,Clone)]
-enum TypeOneFSMState {
+#[derive(Debug, Copy, Clone)]
+pub enum TypeOneFSMState {
     /// 起始状态
     Start,
     /// PauseBreak 第n个扫描码
@@ -79,29 +63,30 @@ enum TypeOneFSMState {
 
 impl TypeOneFSMState {
     /// @brief 状态机总控程序
-    fn parse(&self, scancode: u8) -> TypeOneFSMState {
-        kdebug!("the code is {:#x}\n",scancode);
+    fn parse(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
+        // kdebug!("the code is {:#x}\n", scancode);
         match self {
             TypeOneFSMState::Start => {
-                
-                return self.handle_start(scancode);
+                return self.handle_start(scancode, scancode_status);
             }
             TypeOneFSMState::PauseBreak(n) => {
-                return self.handle_pause_break(*n);
+                return self.handle_pause_break(*n, scancode_status);
             }
             TypeOneFSMState::Func0 => {
-                return self.handle_func0(scancode);
+                return self.handle_func0(scancode, scancode_status);
             }
             TypeOneFSMState::Type3 => {
-                return self.handle_type3(scancode);
+                return self.handle_type3(scancode, scancode_status);
             }
-            TypeOneFSMState::PrtscPress(n) => return self.handle_prtsc_press(*n),
-            TypeOneFSMState::PrtscRelease(n) => return self.handle_prtsc_release(*n),
+            TypeOneFSMState::PrtscPress(n) => return self.handle_prtsc_press(*n, scancode_status),
+            TypeOneFSMState::PrtscRelease(n) => {
+                return self.handle_prtsc_release(*n, scancode_status)
+            }
         }
     }
 
     /// @brief 处理起始状态
-    fn handle_start(&self, scancode: u8) -> TypeOneFSMState {
+    fn handle_start(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         //kdebug!("in handle_start the code is {:#x}\n",scancode);
         match scancode {
             0xe1 => {
@@ -112,22 +97,26 @@ impl TypeOneFSMState {
             }
             _ => {
                 //kdebug!("in _d the code is {:#x}\n",scancode);
-                return TypeOneFSMState::Type3;
+                return TypeOneFSMState::Type3.handle_type3(scancode, scancode_status);
             }
         }
     }
 
     /// @brief 处理PauseBreak状态
-    fn handle_pause_break(&self, scancode: u8) -> TypeOneFSMState {
+    fn handle_pause_break(
+        &self,
+        scancode: u8,
+        scancode_status: &mut ScanCodeStatus,
+    ) -> TypeOneFSMState {
         static PAUSE_BREAK_SCAN_CODE: [u8; 6] = [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5];
         let i = match self {
             TypeOneFSMState::PauseBreak(i) => *i,
             _ => {
-                return self.handle_type3(scancode);
+                return self.handle_type3(scancode, scancode_status);
             }
         };
         if scancode != PAUSE_BREAK_SCAN_CODE[i as usize] {
-            return self.handle_type3(scancode);
+            return self.handle_type3(scancode, scancode_status);
         } else {
             if i == 5 {
                 // 所有Pause Break扫描码都被清除
@@ -138,8 +127,7 @@ impl TypeOneFSMState {
         }
     }
 
-
-    fn handle_func0(&self, scancode: u8) -> TypeOneFSMState {
+    fn handle_func0(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         //0xE0
         match scancode {
             0x2a => {
@@ -150,160 +138,135 @@ impl TypeOneFSMState {
             }
             0x1d => {
                 // 按下右边的ctrl
-                SCAN_CODE_STATUS.write().ctrl_r = true;
+                scancode_status.ctrl_r = true;
             }
             0x9d => {
                 // 松开右边的ctrl
-                SCAN_CODE_STATUS.write().ctrl_r = false;
-                // flag_make = false;
+                scancode_status.ctrl_r = false;
             }
             0x38 => {
                 // 按下右边的alt
-                SCAN_CODE_STATUS.write().alt_r = true;
-
+                scancode_status.alt_r = true;
             }
             0xb8 => {
                 // 松开右边的alt
-                SCAN_CODE_STATUS.write().alt_r = false;
-                // flag_make = false;
+                scancode_status.alt_r = false;
             }
             0x5b => {
-                SCAN_CODE_STATUS.write().gui_l = true;
-                // flag_make = true;
+                scancode_status.gui_l = true;
             }
             0xdb => {
-                SCAN_CODE_STATUS.write().gui_l = false;
-                // flag_make = false;
+                scancode_status.gui_l = false;
             }
             0x5c => {
-                SCAN_CODE_STATUS.write().gui_r = true;
-                // flag_make = true;
+                scancode_status.gui_r = true;
             }
             0xdc => {
-                SCAN_CODE_STATUS.write().gui_r = false;
-                // flag_make = false;
+                scancode_status.gui_r = false;
             }
             0x5d => {
-                SCAN_CODE_STATUS.write().apps = true;
-                // flag_make = true;
+                scancode_status.apps = true;
             }
             0xdd => {
-                SCAN_CODE_STATUS.write().apps = false;
-                // flag_make = false;
+                scancode_status.apps = false;
             }
             0x52 => {
-                SCAN_CODE_STATUS.write().insert = true;
-                // flag_make = true;
+                scancode_status.insert = true;
             }
             0xd2 => {
-                SCAN_CODE_STATUS.write().insert = false;
-                // flag_make = false;
+                scancode_status.insert = false;
             }
             0x47 => {
-                SCAN_CODE_STATUS.write().home = true;
-                // flag_make = true;
+                scancode_status.home = true;
             }
             0xc7 => {
-                SCAN_CODE_STATUS.write().home = false;
-                // flag_make = false;
+                scancode_status.home = false;
             }
             0x49 => {
-                SCAN_CODE_STATUS.write().pgup = true;
-                // flag_make = true;
+                scancode_status.pgup = true;
             }
             0xc9 => {
-                SCAN_CODE_STATUS.write().pgup = false;
-                // flag_make = false;
+                scancode_status.pgup = false;
             }
             0x53 => {
-                SCAN_CODE_STATUS.write().del = true;
-                // flag_make = true;
+                scancode_status.del = true;
+                Self::emit(127);
             }
             0xd3 => {
-                SCAN_CODE_STATUS.write().del = false;
-                // flag_make = false;
+                scancode_status.del = false;
             }
             0x4f => {
-                SCAN_CODE_STATUS.write().end = true;
-                // flag_make = true;
+                scancode_status.end = true;
             }
             0xcf => {
-                SCAN_CODE_STATUS.write().end = false;
-                // flag_make = false;
+                scancode_status.end = false;
             }
             0x51 => {
-                SCAN_CODE_STATUS.write().pgdn = true;
-                // flag_make = true;
+                scancode_status.pgdn = true;
             }
             0xd1 => {
-                SCAN_CODE_STATUS.write().pgdn = false;
-                // flag_make = false;
+                scancode_status.pgdn = false;
             }
             0x48 => {
-                SCAN_CODE_STATUS.write().arrow_u = true;
-                // flag_make = true;
+                scancode_status.arrow_u = true;
+                Self::emit(224);
+                Self::emit(72);
             }
             0xc8 => {
-                SCAN_CODE_STATUS.write().arrow_u = false;
-                // flag_make = false;
-                let ch = 0xc8;
-                Self::emit(ch);
-                // return (0, 0xc8);
+                scancode_status.arrow_u = false;
             }
             0x4b => {
-                SCAN_CODE_STATUS.write().arrow_l = true;
-                // flag_make = true;
+                scancode_status.arrow_l = true;
+                Self::emit(224);
+                Self::emit(75);
             }
             0xcb => {
-                SCAN_CODE_STATUS.write().arrow_l = false;
-                // flag_make = false;
+                scancode_status.arrow_l = false;
             }
             0x50 => {
-                SCAN_CODE_STATUS.write().arrow_d = true;
-                let ch = 0x50;
-                Self::emit(ch);
+                scancode_status.arrow_d = true;
+                Self::emit(224);
+                Self::emit(80);
             }
             0xd0 => {
-                SCAN_CODE_STATUS.write().arrow_d = false;
-                // flag_make = false;
+                scancode_status.arrow_d = false;
             }
             0x4d => {
-                SCAN_CODE_STATUS.write().arrow_r = true;
+                scancode_status.arrow_r = true;
+                Self::emit(224);
+                Self::emit(77);
             }
             0xcd => {
-                SCAN_CODE_STATUS.write().arrow_r = false;
+                scancode_status.arrow_r = false;
             }
 
             0x35 => {
                 // 数字小键盘的 / 符号
-                SCAN_CODE_STATUS.write().kp_forward_slash = true;
-                // flag_make = true;
+                scancode_status.kp_forward_slash = true;
+
                 let ch = '/' as u8;
                 Self::emit(ch);
             }
             0xb5 => {
-                SCAN_CODE_STATUS.write().kp_forward_slash = false;
-
+                scancode_status.kp_forward_slash = false;
             }
             0x1c => {
-                SCAN_CODE_STATUS.write().kp_enter = true;
-                let ch = '\n' as u8;
-                Self::emit(ch);
+                scancode_status.kp_enter = true;
+                Self::emit('\n' as u8);
             }
             0x9c => {
-                SCAN_CODE_STATUS.write().kp_enter = false;
+                scancode_status.kp_enter = false;
             }
             _ => {
                 return TypeOneFSMState::Start;
             }
         }
         return TypeOneFSMState::Start;
-        
     }
 
-    fn handle_type3(&self, scancode: u8) -> TypeOneFSMState {
+    fn handle_type3(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         // 判断按键是被按下还是抬起
-        let flag_make = if (scancode & (FLAG_BREAK as u8)) > 0 {
+        let flag_make = if (scancode & (TYPE1_KEYCODE_FLAG_BREAK as u8)) > 0 {
             false
         } else {
             true
@@ -314,29 +277,29 @@ impl TypeOneFSMState {
         let index = scancode & 0x7f;
 
         // shift被按下
-        if SCAN_CODE_STATUS.read().shift_l || SCAN_CODE_STATUS.read().shift_r {
+        if scancode_status.shift_l || scancode_status.shift_r {
             col = 1;
         }
 
-        let ch = KEY_CODE_MAPTABLE[col + 2 * index as usize];
+        let ch = TYPE1_KEY_CODE_MAPTABLE[col + 2 * index as usize];
         //kdebug!("in type3 ch is {:#x}\n",ch);
         let mut key = KeyFlag::OtherKey; // 可视字符
 
         match index {
             0x2a => {
-                SCAN_CODE_STATUS.write().shift_l = flag_make;
+                scancode_status.shift_l = flag_make;
                 key = KeyFlag::NoneFlag;
             }
             0x36 => {
-                SCAN_CODE_STATUS.write().shift_r = flag_make;
+                scancode_status.shift_r = flag_make;
                 key = KeyFlag::NoneFlag;
             }
             0x1d => {
-                SCAN_CODE_STATUS.write().ctrl_l = flag_make;
+                scancode_status.ctrl_l = flag_make;
                 key = KeyFlag::NoneFlag;
             }
             0x38 => {
-                SCAN_CODE_STATUS.write().ctrl_r = flag_make;
+                scancode_status.ctrl_r = flag_make;
                 key = KeyFlag::NoneFlag;
             }
             _ => {
@@ -345,21 +308,24 @@ impl TypeOneFSMState {
                     key = KeyFlag::NoneFlag;
                 }
             }
-
         }
-        if key!=KeyFlag::NoneFlag{
 
+        if key != KeyFlag::NoneFlag {
             Self::emit(ch);
         }
         return TypeOneFSMState::Start;
     }
 
-    fn emit(_ch:u8){
-        //kdebug!("the character is {}",_ch);
+    fn emit(_ch: u8) {
+        // todo: 发送到tty
     }
 
     /// @brief 处理Prtsc按下事件
-    fn handle_prtsc_press(&self, scancode: u8) -> TypeOneFSMState {
+    fn handle_prtsc_press(
+        &self,
+        scancode: u8,
+        scancode_status: &mut ScanCodeStatus,
+    ) -> TypeOneFSMState {
         static PRTSC_SCAN_CODE: [u8; 4] = [0xe0, 0x2a, 0xe0, 0x37];
         let i = match self {
             TypeOneFSMState::PrtscPress(i) => *i,
@@ -370,7 +336,7 @@ impl TypeOneFSMState {
             return TypeOneFSMState::Start;
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
-            return self.handle_type3(scancode);
+            return self.handle_type3(scancode, scancode_status);
         } else {
             if i == 3 {
                 // 成功解析出PrtscPress
@@ -382,7 +348,11 @@ impl TypeOneFSMState {
         }
     }
 
-    fn handle_prtsc_release(&self, scancode: u8)->TypeOneFSMState{
+    fn handle_prtsc_release(
+        &self,
+        scancode: u8,
+        scancode_status: &mut ScanCodeStatus,
+    ) -> TypeOneFSMState {
         static PRTSC_SCAN_CODE: [u8; 4] = [0xe0, 0xb7, 0xe0, 0xaa];
         let i = match self {
             TypeOneFSMState::PrtscRelease(i) => *i,
@@ -393,7 +363,7 @@ impl TypeOneFSMState {
             return TypeOneFSMState::Start;
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
-            return self.handle_type3(scancode);
+            return self.handle_type3(scancode, scancode_status);
         } else {
             if i == 3 {
                 // 成功解析出PrtscRelease
@@ -408,7 +378,6 @@ impl TypeOneFSMState {
 
 /// 按键状态
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ScanCodeStatus {
     // Shift 按键
     shift_l: bool,
@@ -469,12 +438,7 @@ impl ScanCodeStatus {
     }
 }
 
-lazy_static! {
-    static ref SCAN_CODE_STATUS: RwLock<ScanCodeStatus> = RwLock::new(ScanCodeStatus::new());
-}
-
-#[allow(dead_code)]
-const KEY_CODE_MAPTABLE: [u8; 256] = [
+const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x00*/ 0, 0, /*0x01*/ 0, 0, // ESC
     /*0x02*/ '1' as u8, '!' as u8, /*0x03*/ '2' as u8, '@' as u8,
     /*0x04*/ '3' as u8, '#' as u8, /*0x05*/ '4' as u8, '$' as u8,
@@ -545,328 +509,3 @@ const KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x79*/ 0, 0, /*0x7a*/ 0, 0, /*0x7b*/ 0, 0, /*0x7c*/ 0, 0,
     /*0x7d*/ 0, 0, /*0x7e*/ 0, 0, /*0x7f*/ 0, 0,
 ];
-
-/// @brief 键盘扫描码有三种：
-///
-///     0xE1开头的PauseBreak键;   
-///     0xE0开头的功能键;   
-///     1byte的普通按键;   
-///
-/// @return (ch, key_flag)
-///
-///     ch 如果是功能符，返回 255
-///        如果是可显示字符，则返回 按下/抬起 的字符的ASCII码
-///     key_flag key的类型，目前只有printScreen和pausebreak两个功能键，其他都是otherkey
-#[allow(dead_code)]
-pub fn keyboard_get_keycode() -> Result<(u8, KeyFlag), SystemError> {
-    static PAUSE_BREAK_SCAN_CODE: [u8; 6] = [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5];
-    let mut ch: u8 = u8::MAX;
-    let mut key = KeyFlag::NoneFlag;
-    let flag_make; // (按下/抬起)
-    let c = keyboard_get_scancode()?;
-
-    let mut scancode = c as u8;
-
-    if scancode == 0xE1 {
-        // Pause Break
-        key = KeyFlag::PauseBreak;
-        // 清除缓冲区中剩下的扫描码
-        for i in 1..6 {
-            if keyboard_get_scancode()? != PAUSE_BREAK_SCAN_CODE[i] as i32 {
-                break;
-            }
-        }
-    } else if scancode == 0xE0 {
-        // 功能键, 有多个扫描码
-        scancode = keyboard_get_scancode()? as u8;
-
-        match scancode {
-            0x2a => {
-                // print screen 按键被按下
-                if let Ok(0xe0) = keyboard_get_scancode() {
-                    if let Ok(0x37) = keyboard_get_scancode() {
-                        key = KeyFlag::PrintScreenPress;
-                        // flag_make = Release;
-                    }
-                }
-            }
-
-            0xb7 => {
-                // print screen 按键被松开
-                if let Ok(0xe0) = keyboard_get_scancode() {
-                    if let Ok(0xaa) = keyboard_get_scancode() {
-                        key = KeyFlag::PrintScreenRelease;
-                        // flag_make = false;
-                    }
-                }
-            }
-            0x1d => {
-                // 按下右边的ctrl
-                SCAN_CODE_STATUS.write().ctrl_r = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0x9d => {
-                // 松开右边的ctrl
-                SCAN_CODE_STATUS.write().ctrl_r = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x38 => {
-                // 按下右边的alt
-                SCAN_CODE_STATUS.write().alt_r = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xb8 => {
-                // 松开右边的alt
-                SCAN_CODE_STATUS.write().alt_r = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x5b => {
-                SCAN_CODE_STATUS.write().gui_l = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xdb => {
-                SCAN_CODE_STATUS.write().gui_l = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x5c => {
-                SCAN_CODE_STATUS.write().gui_r = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xdc => {
-                SCAN_CODE_STATUS.write().gui_r = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x5d => {
-                SCAN_CODE_STATUS.write().apps = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xdd => {
-                SCAN_CODE_STATUS.write().apps = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x52 => {
-                SCAN_CODE_STATUS.write().insert = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xd2 => {
-                SCAN_CODE_STATUS.write().insert = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x47 => {
-                SCAN_CODE_STATUS.write().home = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xc7 => {
-                SCAN_CODE_STATUS.write().home = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x49 => {
-                SCAN_CODE_STATUS.write().pgup = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xc9 => {
-                SCAN_CODE_STATUS.write().pgup = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x53 => {
-                SCAN_CODE_STATUS.write().del = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xd3 => {
-                SCAN_CODE_STATUS.write().del = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x4f => {
-                SCAN_CODE_STATUS.write().end = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xcf => {
-                SCAN_CODE_STATUS.write().end = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x51 => {
-                SCAN_CODE_STATUS.write().pgdn = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xd1 => {
-                SCAN_CODE_STATUS.write().pgdn = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x48 => {
-                SCAN_CODE_STATUS.write().arrow_u = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xc8 => {
-                SCAN_CODE_STATUS.write().arrow_u = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-                ch = 0xc8;
-                // return (0, 0xc8);
-            }
-            0x4b => {
-                SCAN_CODE_STATUS.write().arrow_l = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xcb => {
-                SCAN_CODE_STATUS.write().arrow_l = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x50 => {
-                SCAN_CODE_STATUS.write().arrow_d = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-                ch = 0x50;
-                // return (0, 0x50);
-            }
-            0xd0 => {
-                SCAN_CODE_STATUS.write().arrow_d = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x4d => {
-                SCAN_CODE_STATUS.write().arrow_r = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-            }
-            0xcd => {
-                SCAN_CODE_STATUS.write().arrow_r = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-
-            0x35 => {
-                // 数字小键盘的 / 符号
-                SCAN_CODE_STATUS.write().kp_forward_slash = true;
-                key = KeyFlag::OtherKey;
-                // flag_make = true;
-                ch = '/' as u8;
-            }
-            0xb5 => {
-                SCAN_CODE_STATUS.write().kp_forward_slash = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-            0x1c => {
-                SCAN_CODE_STATUS.write().kp_enter = true;
-                ch = '\n' as u8;
-                // flag_make = true;
-                key = KeyFlag::OtherKey;
-            }
-            0x9c => {
-                SCAN_CODE_STATUS.write().kp_enter = false;
-                // flag_make = false;
-                key = KeyFlag::OtherKey;
-            }
-
-            _ => {
-                key = KeyFlag::OtherKey;
-            }
-        }
-    }
-
-    if key == KeyFlag::NoneFlag
-    // 属于第三类扫描码
-    {
-        // 判断按键是被按下还是抬起
-        flag_make = if (scancode & (FLAG_BREAK as u8)) > 0 {
-            false
-        } else {
-            true
-        };
-
-        // 计算扫描码位于码表的第几行
-        let mut col: usize = 0;
-        let index = scancode & 0x7f;
-
-        // shift被按下
-        if SCAN_CODE_STATUS.read().shift_l || SCAN_CODE_STATUS.read().shift_r {
-            col = 1;
-        }
-
-        ch = KEY_CODE_MAPTABLE[col + 2 * index as usize];
-        key = KeyFlag::OtherKey; // 可视字符
-
-        match index {
-            0x2a => {
-                SCAN_CODE_STATUS.write().shift_l = flag_make;
-                key = KeyFlag::NoneFlag;
-            }
-            0x36 => {
-                SCAN_CODE_STATUS.write().shift_r = flag_make;
-                key = KeyFlag::NoneFlag;
-            }
-            0x1d => {
-                SCAN_CODE_STATUS.write().ctrl_l = flag_make;
-                key = KeyFlag::NoneFlag;
-            }
-            0x38 => {
-                SCAN_CODE_STATUS.write().ctrl_r = flag_make;
-                key = KeyFlag::NoneFlag;
-            }
-            _ => {
-                if flag_make == false {
-                    key = KeyFlag::NoneFlag;
-                }
-            }
-        }
-    }
-
-    return Ok((ch, key));
-}
-
-/// @brief 从键盘设备文件中获取键盘扫描码
-fn keyboard_get_scancode() -> Result<i32, SystemError> {
-    // 如果后面对性能有要求，可以把这个inode存下来当作static变量
-    let keyboard = ROOT_INODE().lookup("/dev/char/ps2_keyboard");
-
-    if keyboard.is_err() {
-        kerror!("Failed in finding ps2_keyboard ");
-        return Err(SystemError::ENXIO);
-    }
-
-    let keyboard = keyboard.unwrap();
-
-    let mut buf = [0 as u8];
-    if keyboard
-        .read_at(
-            0,
-            1,
-            &mut buf,
-            &mut filesystem::vfs::FilePrivateData::Unused,
-        )
-        .is_err()
-    {
-        kerror!("Read Ps2_keyboard Error");
-        return Err(SystemError::EIO);
-    }
-    return Ok(buf[0] as i32);
-}
-
-
-
-

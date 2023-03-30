@@ -1,9 +1,10 @@
 //use core::marker::PhantomData;
 
 use crate::filesystem::vfs::ROOT_INODE;
+use crate::kdebug;
 //use crate::kdebug;
 use crate::syscall::SystemError;
-use crate::{driver::keyboard, filesystem, kerror, libs::rwlock::RwLock};
+use crate::{filesystem, kerror, libs::rwlock::RwLock};
 use lazy_static::lazy_static;
 
 #[allow(dead_code)]
@@ -26,6 +27,15 @@ pub enum KeyFlag {
     OtherKey = 8 as u8, // 除了上面两个按键以外的功能按键（不包括下面的第三类按键）
 }
 
+#[allow(dead_code)]
+#[no_mangle]
+/// for test
+pub extern "C" fn keyboard_handle(input:u8){
+    //kdebug!("WHAT IS THE PROBELM?\n");
+    let mut fsm=TypeOneFSM::new();
+    fsm.parse(input).parse(input);
+}
+
 /// @brief A FSM to parse type one keyboard scan code
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -45,13 +55,14 @@ impl TypeOneFSM {
 
     /// @brief 解析扫描码
     #[allow(dead_code)]
-    fn parse(&mut self, scancode: u8) {
+    fn parse(&mut self, scancode: u8)->TypeOneFSMState {
         self.current_state = self.current_state.parse(scancode);
+        self.current_state
     }
 }
 
 /// @brief 第一类扫描码状态机的状态
-#[derive(Debug)]
+#[derive(Debug,Copy,Clone)]
 enum TypeOneFSMState {
     /// 起始状态
     Start,
@@ -69,8 +80,10 @@ enum TypeOneFSMState {
 impl TypeOneFSMState {
     /// @brief 状态机总控程序
     fn parse(&self, scancode: u8) -> TypeOneFSMState {
+        kdebug!("the code is {:#x}\n",scancode);
         match self {
             TypeOneFSMState::Start => {
+                
                 return self.handle_start(scancode);
             }
             TypeOneFSMState::PauseBreak(n) => {
@@ -89,6 +102,7 @@ impl TypeOneFSMState {
 
     /// @brief 处理起始状态
     fn handle_start(&self, scancode: u8) -> TypeOneFSMState {
+        //kdebug!("in handle_start the code is {:#x}\n",scancode);
         match scancode {
             0xe1 => {
                 return TypeOneFSMState::PauseBreak(1);
@@ -97,6 +111,7 @@ impl TypeOneFSMState {
                 return TypeOneFSMState::Func0;
             }
             _ => {
+                //kdebug!("in _d the code is {:#x}\n",scancode);
                 return TypeOneFSMState::Type3;
             }
         }
@@ -304,6 +319,7 @@ impl TypeOneFSMState {
         }
 
         let ch = KEY_CODE_MAPTABLE[col + 2 * index as usize];
+        //kdebug!("in type3 ch is {:#x}\n",ch);
         let mut key = KeyFlag::OtherKey; // 可视字符
 
         match index {
@@ -325,19 +341,21 @@ impl TypeOneFSMState {
             }
             _ => {
                 if flag_make == false {
+                    //kdebug!("in type3 ch is {:#x}\n",ch);
                     key = KeyFlag::NoneFlag;
                 }
             }
 
         }
         if key!=KeyFlag::NoneFlag{
+
             Self::emit(ch);
         }
         return TypeOneFSMState::Start;
     }
 
     fn emit(_ch:u8){
-        todo!()
+        //kdebug!("the character is {}",_ch);
     }
 
     /// @brief 处理Prtsc按下事件

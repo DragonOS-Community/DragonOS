@@ -59,3 +59,4 @@ void ps2_keyboard_analyze_keycode();
  * 若缓冲队列为空则返回-1
  */
 int ps2_keyboard_get_scancode();
+

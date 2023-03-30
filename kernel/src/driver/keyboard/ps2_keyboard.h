@@ -2,13 +2,12 @@
 
 #include <common/glib.h>
 
-#define PS2_KEYBOARD_INTR_VECTOR 0x21   // 键盘的中断向量号
+#define PS2_KEYBOARD_INTR_VECTOR 0x21 // 键盘的中断向量号
 
 // 定义键盘循环队列缓冲区大小为100bytes
 #define ps2_keyboard_buffer_size 8
 
 #define KEYBOARD_CMD_RESET_BUFFER 1
-
 
 #define PORT_PS2_KEYBOARD_DATA 0x60
 #define PORT_PS2_KEYBOARD_STATUS 0x64
@@ -30,10 +29,7 @@
 #define wait_ps2_keyboard_read() while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_OUTBUF_FULL)
 // #define wait_ps2_keyboard_read() (1)
 
-
 extern struct vfs_file_operations_t ps2_keyboard_fops;
-
-
 
 /**
  * @brief 初始化键盘驱动程序的函数
@@ -46,16 +42,3 @@ void ps2_keyboard_init();
  *
  */
 void ps2_keyboard_exit();
-
-/**
- * @brief 解析键盘扫描码
- * 
- */
-void ps2_keyboard_analyze_keycode();
-
-/**
- * @brief 从缓冲队列中获取键盘扫描码
- * @return 键盘扫描码
- * 若缓冲队列为空则返回-1
- */
-int ps2_keyboard_get_scancode();

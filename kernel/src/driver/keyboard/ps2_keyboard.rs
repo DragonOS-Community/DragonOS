@@ -8,12 +8,17 @@ use crate::{
         vfs::{core::generate_inode_id, file::FileMode, FileType, IndexNode, Metadata, PollStatus},
     },
     include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t},
-    libs::rwlock::RwLock,
-    time::TimeSpec, syscall::SystemError,
+    libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
+    syscall::SystemError,
+    time::TimeSpec,
 };
 
 #[derive(Debug)]
 pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>, AtomicI32); // self.1 用来记录有多少个文件打开了这个inode
+
+lazy_static! {
+    static ref PS2_KEYBOARD_FSM: SpinLock<TypeOneFSM> = SpinLock::new(TypeOneFSM::new());
+}
 
 #[derive(Debug)]
 pub struct PS2KeyBoardInode {
@@ -122,7 +127,10 @@ impl IndexNode for LockedPS2KeyBoardInode {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut crate::filesystem::vfs::FilePrivateData) -> Result<(), SystemError> {
+    fn close(
+        &self,
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 1 {
             // 最后一次关闭，需要释放
@@ -166,4 +174,11 @@ impl IndexNode for LockedPS2KeyBoardInode {
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return Err(SystemError::ENOTSUP);
     }
+}
+
+#[allow(dead_code)]
+#[no_mangle]
+/// for test
+pub extern "C" fn ps2_keyboard_parse_keycode(input: u8) {
+    PS2_KEYBOARD_FSM.lock().parse(input);
 }

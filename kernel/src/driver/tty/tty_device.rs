@@ -1,4 +1,5 @@
 use alloc::{
+    collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
 };
@@ -8,12 +9,20 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
     },
-    kerror,
+    include::bindings::bindings::{printk_color, textui_putchar, BLACK, WHITE},
+    kdebug, kerror,
     libs::rwlock::RwLock,
-    syscall::SystemError, print,
+    print,
+    syscall::SystemError,
 };
 
 use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
+
+lazy_static! {
+    /// 所有TTY设备的B树。用于根据名字，找到Arc<TtyDevice>
+    /// TODO: 待设备驱动模型完善，具有类似功能的机制后，删掉这里
+    pub static ref TTY_DEVICES: RwLock<BTreeMap<String, Arc<TtyDevice>>> = RwLock::new(BTreeMap::new());
+}
 
 /// @brief TTY设备
 #[derive(Debug)]
@@ -72,6 +81,24 @@ impl TtyDevice {
             return Err(SystemError::EINVAL);
         }
         return Ok(());
+    }
+
+    /// @brief 向TTY的输入端口导入数据
+    pub fn input(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        let r: Result<usize, TtyError> = self.core.input(buf, false);
+        if r.is_ok() {
+            return Ok(r.unwrap());
+        }
+
+        let r = r.unwrap_err();
+        match r {
+            TtyError::BufferFull(x) => return Ok(x),
+            TtyError::Closed => return Err(SystemError::ENODEV),
+            e => {
+                kerror!("tty error occurred while writing data to its input port, msg={e:?}");
+                return Err(SystemError::EBUSY);
+            }
+        }
     }
 }
 
@@ -261,11 +288,26 @@ pub extern "C" fn rs_tty_init() -> i32 {
 
 /// @brief 初始化TTY设备
 pub fn tty_init() -> Result<(), SystemError> {
-    let tty = TtyDevice::new("tty0");
+    let tty: Arc<TtyDevice> = TtyDevice::new("tty0");
     let devfs_root_inode = ROOT_INODE().lookup("/dev");
     if devfs_root_inode.is_err() {
         return Err(devfs_root_inode.unwrap_err());
     }
+    // 当前关闭键盘输入回显
+    // TODO: 完善Termios之后, 改为默认开启键盘输入回显.
+    tty.core.disable_echo();
+    let guard = TTY_DEVICES.upgradeable_read();
+
+    // 如果已经存在了这个设备
+    if guard.contains_key("tty0") {
+        return Err(SystemError::EEXIST);
+    }
+
+    let mut guard = guard.upgrade();
+
+    guard.insert("tty0".to_string(), tty.clone());
+
+    drop(guard);
 
     let r = devfs_register(&tty.name(), tty);
     if r.is_err() {

@@ -25,6 +25,13 @@ int fprintf(FILE *restrict stream, const char *restrict format, ...)
     free(buf);
 }
 
+int getchar(void)
+{
+    unsigned int c;
+    read(0, &c, 1);
+    return c;
+}
+
 int puts(const char *s)
 {
     return put_string(s, COLOR_WHITE, COLOR_BLACK);

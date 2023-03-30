@@ -5,7 +5,7 @@ use thingbuf::mpsc::{
     errors::{TryRecvError, TrySendError},
 };
 
-use crate::libs::rwlock::RwLock;
+use crate::{libs::rwlock::RwLock, kdebug};
 
 pub mod tty_device;
 

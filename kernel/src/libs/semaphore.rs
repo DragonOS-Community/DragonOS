@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use crate::{arch::asm::current::current_pcb, include::bindings::bindings::EOVERFLOW, kdebug};
+use crate::{arch::asm::current::current_pcb, kdebug, syscall::SystemError};
 
 use super::wait_queue::WaitQueue;
 
@@ -18,14 +18,14 @@ impl Semaphore {
     ///
     /// @param count 信号量的初始值
     /// @return 条件满足返回semaphore对象,条件不满足返回err信息
-    fn new(counter: i32) -> Result<Self, i32> {
+    fn new(counter: i32) -> Result<Self, SystemError> {
         if counter > 0 {
             Ok(Self {
                 counter: AtomicI32::new(counter),
                 wait_queue: WaitQueue::INIT,
             })
         } else {
-            return Err(-(EOVERFLOW as i32));
+            return Err(SystemError::EOVERFLOW);
         }
     }
 

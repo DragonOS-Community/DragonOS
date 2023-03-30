@@ -10,6 +10,7 @@ use crate::io::disk_info::BLK_GF_AHCI;
 use crate::kerror;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::virt_2_phys;
+use crate::syscall::SystemError;
 use crate::{
     driver::disk::ahci::{
         ahcidisk::LockedAhciDisk,
@@ -44,11 +45,11 @@ pub extern "C" fn ahci_init() -> i32 {
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err();
+        return r.unwrap_err().to_posix_errno();
     }
 }
 /// @brief: 初始化 ahci
-pub fn ahci_rust_init() -> Result<(), i32> {
+pub fn ahci_rust_init() -> Result<(), SystemError> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     let mut ahci_dev_counts: u32 = 0;
@@ -141,7 +142,7 @@ pub fn ahci_rust_init() -> Result<(), i32> {
                         );
                         if let Err(err) = ret {
                             kerror!(
-                                "Ahci_{} ctrl = {}, port = {} failed to register, error code = {}",
+                                "Ahci_{} ctrl = {}, port = {} failed to register, error code = {:?}",
                                 id,
                                 i,
                                 j,
@@ -166,7 +167,7 @@ pub fn disks() -> Vec<Arc<LockedAhciDisk>> {
 }
 
 /// @brief: 通过 name 获取 disk
-pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, i32> {
+pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, SystemError> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let disks_list: SpinLockGuard<Vec<Arc<LockedAhciDisk>>> = LOCKED_DISKS_LIST.lock();
     for i in 0..disks_list.len() {
@@ -175,7 +176,8 @@ pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, i32> {
         }
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return Err(-1);
+    return Err(SystemError::ENXIO);
+
 }
 
 /// @brief: 通过 ctrl_num 和 port_num 获取 port

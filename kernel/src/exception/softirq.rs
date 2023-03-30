@@ -4,9 +4,10 @@ use alloc::boxed::Box;
 
 use crate::{
     arch::interrupt::{cli, sti},
-    include::bindings::bindings::{verify_area, EBUSY, EEXIST, EPERM},
+    include::bindings::bindings::verify_area,
     kBUG,
     libs::spinlock::RawSpinlock,
+    syscall::SystemError, kdebug,
 };
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
@@ -84,7 +85,7 @@ pub extern "C" fn register_softirq(
     data: *mut c_void,
 ) {
     let softirq_handler = __get_softirq_handler_mut();
-    softirq_handler.register_softirq(irq_num, action, data);
+    softirq_handler.register_softirq(irq_num, action, data).expect(&format!("Softirq: Failed to register {}", irq_num));
 }
 
 /// @brief 卸载软中断
@@ -93,7 +94,7 @@ pub extern "C" fn register_softirq(
 #[allow(dead_code)]
 pub extern "C" fn unregister_softirq(irq_num: u32) {
     let softirq_handler = __get_softirq_handler_mut();
-    softirq_handler.unregister_softirq(irq_num);
+    softirq_handler.unregister_softirq(irq_num).expect(&format!("Softirq: Failed to unregister {}", irq_num));
 }
 
 /// 设置软中断的运行状态（只应在do_softirq中调用此宏）
@@ -190,24 +191,24 @@ impl Softirq {
         irq_num: u32,
         action: Option<unsafe extern "C" fn(data: *mut ::core::ffi::c_void)>,
         data: *mut c_void,
-    ) -> i32 {
+    ) -> Result<(), SystemError> {
         if self.table[irq_num as usize].action.is_some() {
-            return -(EEXIST as i32);
+            return Err(SystemError::EEXIST);
         }
 
         if unsafe { verify_area(action.unwrap() as u64, 1) } {
-            return -(EPERM as i32);
+            return Err(SystemError::EPERM);
         }
         self.modify_lock.lock();
         self.table[irq_num as usize].action = action;
         self.table[irq_num as usize].data = data;
         self.modify_lock.unlock();
-        return 0;
+        return Ok(());
     }
 
     /// @brief 解注册软中断向量
     /// @param irq_num 中断向量号码
-    pub fn unregister_softirq(&mut self, irq_num: u32) -> i32 {
+    pub fn unregister_softirq(&mut self, irq_num: u32) -> Result<(), SystemError> {
         for _trial_time in 0..MAX_LOCK_TRIAL_TIME {
             if self.is_running(irq_num) {
                 continue; //running标志位为1
@@ -222,14 +223,15 @@ impl Softirq {
         }
         // 存在尝试加锁规定次数后仍加锁失败的情况,报告错误并退出
         if !self.modify_lock.is_locked() {
-            return -(EBUSY as i32);
+            return Err(SystemError::EBUSY);
         }
+        kdebug!("SOftirq: unregister {irq_num}");
         self.clear_softirq_running(irq_num);
         self.clear_softirq_pending(irq_num);
         self.table[irq_num as usize].action = None;
         self.table[irq_num as usize].data = null_mut();
         self.modify_lock.unlock();
-        return 0;
+        return Ok(());
     }
 
     /// @brief 遍历执行软中断

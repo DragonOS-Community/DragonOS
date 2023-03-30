@@ -8,9 +8,9 @@ use alloc::collections::LinkedList;
 use crate::{
     arch::{asm::current::current_pcb, sched::sched},
     include::bindings::bindings::{
-        pid_t, process_control_block, process_wakeup, EBUSY, PROC_INTERRUPTIBLE, PROC_RUNNING,
+        pid_t, process_control_block, process_wakeup,  PROC_INTERRUPTIBLE, PROC_RUNNING,
     },
-    libs::spinlock::SpinLockGuard,
+    libs::spinlock::SpinLockGuard, syscall::SystemError,
 };
 
 use super::spinlock::SpinLock;
@@ -88,12 +88,12 @@ impl<T> Mutex<T> {
     /// @return Err 如果Mutex当前已经上锁，则返回Err.
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn try_lock(&self) -> Result<MutexGuard<T>, i32> {
+    pub fn try_lock(&self) -> Result<MutexGuard<T>, SystemError> {
         let mut inner = self.inner.lock();
 
         // 如果当前mutex已经上锁，则失败
         if inner.is_locked {
-            return Err(-(EBUSY as i32));
+            return Err(SystemError::EBUSY);
         } else {
             // 加锁成功
             inner.is_locked = true;

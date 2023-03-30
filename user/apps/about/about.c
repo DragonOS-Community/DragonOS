@@ -36,9 +36,8 @@ void print_copyright()
 }
 
 int main()
-{
+{   
     print_ascii_logo();
-
     print_copyright();
 
     return 0;

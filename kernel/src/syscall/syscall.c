@@ -90,17 +90,6 @@ ul system_call_not_exists(struct pt_regs *regs)
 #define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
 
 /**
- * @brief sysenter的系统调用函数，从entry.S中跳转到这里
- *
- * @param regs 3特权级下的寄存器值,rax存储系统调用号
- * @return ul 对应的系统调用函数的地址
- */
-ul system_call_function(struct pt_regs *regs)
-{
-    return system_call_table[regs->rax](regs);
-}
-
-/**
  * @brief 初始化系统调用模块
  *
  */
@@ -298,13 +287,12 @@ extern uint64_t sys_getdents(struct pt_regs *regs);
  */
 uint64_t sys_execve(struct pt_regs *regs)
 {
-    // kdebug("sys_execve");
+
     char *user_path = (char *)regs->r8;
     char **argv = (char **)regs->r9;
 
     int path_len = strnlen_user(user_path, PAGE_4K_SIZE);
 
-    // kdebug("path_len=%d", path_len);
     if (path_len >= PAGE_4K_SIZE)
         return -ENAMETOOLONG;
     else if (path_len <= 0)
@@ -316,12 +304,10 @@ uint64_t sys_execve(struct pt_regs *regs)
 
     memset(path, 0, path_len + 1);
 
-    // kdebug("before copy file path from user");
     // 拷贝文件路径
     strncpy_from_user(path, user_path, path_len);
     path[path_len] = '\0';
 
-    // kdebug("before do_execve, path = %s", path);
     // 执行新的程序
     uint64_t retval = do_execve(regs, path, argv, NULL);
 
@@ -362,6 +348,8 @@ uint64_t sys_wait4(struct pt_regs *regs)
         return -EINVAL;
 
     // 如果子进程没有退出，则等待其退出
+    // BUG: 这里存在问题，由于未对进程管理模块加锁，因此可能会出现子进程退出后，父进程还在等待的情况
+    // （子进程退出后，process_exit_notify消息丢失）
     while (child_proc->state != PROC_ZOMBIE)
         wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
 
@@ -402,7 +390,6 @@ ul sys_ahci_end_req(struct pt_regs *regs)
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 {
-
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }

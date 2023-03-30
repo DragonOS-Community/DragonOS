@@ -1,7 +1,7 @@
 use num_traits::{FromPrimitive, ToPrimitive};
 
 #[repr(i32)]
-#[derive(Debug, FromPrimitive, ToPrimitive)]
+#[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
 #[allow(dead_code)]
 pub enum SystemError {
     /// 参数列表过长，或者在输出buffer中缺少空间 或者参数比系统内建的最大值要大 Argument list too long.

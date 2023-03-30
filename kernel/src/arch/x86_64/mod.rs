@@ -5,3 +5,4 @@ pub mod cpu;
 pub mod interrupt;
 pub mod mm;
 pub mod sched;
+pub mod fpu;

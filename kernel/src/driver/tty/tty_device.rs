@@ -8,11 +8,9 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
     },
-    include::bindings::bindings::{ECONNABORTED, EINVAL, EIO, ENOTSUP, EPERM},
-    kdebug, kerror,
+    kerror,
     libs::rwlock::RwLock,
-    print,
-    syscall::SystemError,
+    syscall::SystemError, print,
 };
 
 use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
@@ -54,11 +52,11 @@ impl TtyDevice {
     fn verify_file_private_data<'a>(
         &self,
         private_data: &'a mut FilePrivateData,
-    ) -> Result<&'a mut TtyFilePrivateData, i32> {
+    ) -> Result<&'a mut TtyFilePrivateData, SystemError> {
         if let FilePrivateData::Tty(t) = private_data {
             return Ok(t);
         }
-        return Err(-(EIO as i32));
+        return Err(SystemError::EIO);
     }
 
     /// @brief 获取TTY设备名
@@ -69,9 +67,9 @@ impl TtyDevice {
 
     /// @brief 检查TTY文件的读写参数是否合法
     #[inline]
-    pub fn check_rw_param(&self, len: usize, buf: &[u8]) -> Result<(), i32> {
+    pub fn check_rw_param(&self, len: usize, buf: &[u8]) -> Result<(), SystemError> {
         if len > buf.len() {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
         return Ok(());
     }
@@ -93,7 +91,7 @@ impl IndexNode for TtyDevice {
     /// - mode的值为O_RDONLY时，表示这个文件是stdin
     /// - mode的值为O_WRONLY时，表示这个文件是stdout
     /// - mode的值为O_WRONLY | O_SYNC时，表示这个文件是stderr
-    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), i32> {
+    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), SystemError> {
         let mut p = TtyFilePrivateData::default();
 
         // 检查打开模式
@@ -107,7 +105,7 @@ impl IndexNode for TtyDevice {
                 p.flags.insert(TtyFileFlag::STDOUT);
             }
         } else {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         // 保存文件私有信息
@@ -121,7 +119,7 @@ impl IndexNode for TtyDevice {
         len: usize,
         buf: &mut [u8],
         data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let _data: &mut TtyFilePrivateData = match self.verify_file_private_data(data) {
             Ok(t) => t,
             Err(e) => {
@@ -141,8 +139,10 @@ impl IndexNode for TtyDevice {
             TtyError::EOF(n) => {
                 return Ok(n);
             }
-            _ => {
-                return Err(-(ECONNABORTED as i32));
+
+            x => {
+                kerror!("Error occurred when reading tty, msg={x:?}");
+                return Err(SystemError::ECONNABORTED);
             }
         }
     }
@@ -153,7 +153,7 @@ impl IndexNode for TtyDevice {
         len: usize,
         buf: &[u8],
         data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let data: &mut TtyFilePrivateData = match self.verify_file_private_data(data) {
             Ok(t) => t,
             Err(e) => {
@@ -170,7 +170,7 @@ impl IndexNode for TtyDevice {
         } else if data.flags.contains(TtyFileFlag::STDERR) {
             self.core.stderr(&buf[0..len], true)
         } else {
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         };
 
         if r.is_ok() {
@@ -180,11 +180,11 @@ impl IndexNode for TtyDevice {
 
         let r: TtyError = r.unwrap_err();
         kerror!("Error occurred when writing tty deivce. Error msg={r:?}");
-        return Err(-(EIO as i32));
+        return Err(SystemError::EIO);
     }
 
-    fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, i32> {
-        return Err(-(ENOTSUP as i32));
+    fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
@@ -195,15 +195,15 @@ impl IndexNode for TtyDevice {
         self
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, i32> {
-        return Err(-(ENOTSUP as i32));
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.private_data.read().metadata.clone());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -224,7 +224,7 @@ impl IndexNode for TtyDevice {
                 }
                 _ => return Err(SystemError::EIO),
             }
-            
+
             if len == 0 {
                 break;
             }
@@ -264,12 +264,12 @@ pub fn tty_init() -> Result<(), SystemError> {
     let tty = TtyDevice::new("tty0");
     let devfs_root_inode = ROOT_INODE().lookup("/dev");
     if devfs_root_inode.is_err() {
-        return Err(SystemError::from_posix_errno(devfs_root_inode.unwrap_err()).unwrap());
+        return Err(devfs_root_inode.unwrap_err());
     }
 
     let r = devfs_register(&tty.name(), tty);
     if r.is_err() {
-        return Err(SystemError::from_posix_errno(r.unwrap_err()).unwrap());
+        return Err(devfs_root_inode.unwrap_err());
     }
 
     return Ok(());

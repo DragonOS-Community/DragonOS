@@ -7,10 +7,10 @@ use crate::{
     driver::tty::TtyFilePrivateData,
     filesystem::procfs::ProcfsFilePrivateData,
     include::bindings::bindings::{
-        process_control_block, EINVAL, ENOBUFS, EOVERFLOW, EPERM, ESPIPE,
+        process_control_block,
     },
     io::SeekFrom,
-    kerror,
+    kerror, syscall::SystemError,
 };
 
 use super::{Dirent, FileType, IndexNode, Metadata};
@@ -89,7 +89,7 @@ impl FileMode {
     }
 }
 /// @brief 抽象文件结构体
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct File {
     inode: Arc<dyn IndexNode>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
@@ -108,7 +108,7 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, i32> {
+    pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, SystemError> {
         let file_type: FileType = inode.metadata()?.file_type;
         let mut f = File {
             inode,
@@ -129,13 +129,13 @@ impl File {
     /// @param buf 目标buffer
     ///
     /// @return Ok(usize) 成功读取的字节数
-    /// @return Err(i32) 错误码
-    pub fn read(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    /// @return Err(SystemError) 错误码
+    pub fn read(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         // 先检查本文件在权限等规则下，是否可读取。
         self.readable()?;
 
         if buf.len() < len {
-            return Err(-(ENOBUFS as i32));
+            return Err(SystemError::ENOBUFS);
         }
         let len = self
             .inode
@@ -150,12 +150,12 @@ impl File {
     /// @param buf 源数据buffer
     ///
     /// @return Ok(usize) 成功写入的字节数
-    /// @return Err(i32) 错误码
-    pub fn write(&mut self, len: usize, buf: &[u8]) -> Result<usize, i32> {
+    /// @return Err(SystemError) 错误码
+    pub fn write(&mut self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
         // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
         if buf.len() < len {
-            return Err(-(ENOBUFS as i32));
+            return Err(SystemError::ENOBUFS);
         }
         let len = self
             .inode
@@ -165,21 +165,21 @@ impl File {
     }
 
     /// @brief 获取文件的元数据
-    pub fn metadata(&self) -> Result<Metadata, i32> {
+    pub fn metadata(&self) -> Result<Metadata, SystemError> {
         return self.inode.metadata();
     }
 
     /// @brief 根据inode号获取子目录项的名字
-    pub fn get_entry_name(&self, ino: usize) -> Result<String, i32> {
+    pub fn get_entry_name(&self, ino: usize) -> Result<String, SystemError> {
         return self.inode.get_entry_name(ino);
     }
 
     /// @brief 调整文件操作指针的位置
     ///
     /// @param origin 调整的起始位置
-    pub fn lseek(&mut self, origin: SeekFrom) -> Result<usize, i32> {
+    pub fn lseek(&mut self, origin: SeekFrom) -> Result<usize, SystemError> {
         if self.inode.metadata().unwrap().file_type == FileType::Pipe {
-            return Err(-(ESPIPE as i32));
+            return Err(SystemError::ESPIPE);
         }
         let pos: i64;
         match origin {
@@ -194,12 +194,12 @@ impl File {
                 pos = metadata.size + offset;
             }
             SeekFrom::Invalid => {
-                return Err(-(EINVAL as i32));
+                return Err(SystemError::EINVAL);
             }
         }
 
         if pos < 0 || pos > self.metadata()?.size {
-            return Err(-(EOVERFLOW as i32));
+            return Err(SystemError::EOVERFLOW);
         }
         self.offset = pos as usize;
         return Ok(self.offset);
@@ -207,10 +207,10 @@ impl File {
 
     /// @brief 判断当前文件是否可读
     #[inline]
-    pub fn readable(&self) -> Result<(), i32> {
+    pub fn readable(&self) -> Result<(), SystemError> {
         // 暂时认为只要不是write only, 就可读
         if self.mode == FileMode::O_WRONLY {
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         }
 
         return Ok(());
@@ -218,10 +218,10 @@ impl File {
 
     /// @brief 判断当前文件是否可写
     #[inline]
-    pub fn writeable(&self) -> Result<(), i32> {
+    pub fn writeable(&self) -> Result<(), SystemError> {
         // 暂时认为只要不是read only, 就可写
         if self.mode == FileMode::O_RDONLY {
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         }
 
         return Ok(());
@@ -229,7 +229,7 @@ impl File {
 
     /// @biref 充填dirent结构体
     /// @return 返回dirent结构体的大小
-    pub fn readdir(&mut self, dirent: &mut Dirent) -> Result<u64, i32> {
+    pub fn readdir(&mut self, dirent: &mut Dirent) -> Result<u64, SystemError> {
         let inode: &Arc<dyn IndexNode> = &self.inode;
 
         // 如果偏移量为0
@@ -271,18 +271,39 @@ impl File {
         return Ok((name_bytes.len() + ::core::mem::size_of::<Dirent>()
             - ::core::mem::size_of_val(&dirent.d_name)) as u64);
     }
+
     pub fn inode(&self) -> Arc<dyn IndexNode> {
         return self.inode.clone();
+    }
+
+    /// @brief 尝试克隆一个文件
+    ///
+    /// @return Option<Box<File>> 克隆后的文件结构体。如果克隆失败，返回None
+    pub fn try_clone(&self) -> Option<Box<File>> {
+        let mut res: Box<File> = Box::new(Self {
+            inode: self.inode.clone(),
+            offset: self.offset.clone(),
+            mode: self.mode.clone(),
+            file_type: self.file_type.clone(),
+            readdir_subdirs_name: self.readdir_subdirs_name.clone(),
+            private_data: self.private_data.clone(),
+        });
+        // 调用inode的open方法，让inode知道有新的文件打开了这个inode
+        if self.inode.open(&mut res.private_data, &res.mode).is_err() {
+            return None;
+        }
+
+        return Some(res);
     }
 }
 
 impl Drop for File {
     fn drop(&mut self) {
-        let r: Result<(), i32> = self.inode.close(&mut self.private_data);
+        let r: Result<(), SystemError> = self.inode.close(&mut self.private_data);
         // 打印错误信息
         if r.is_err() {
             kerror!(
-                "pid: {} failed to close file: {:?}, errno={}",
+                "pid: {} failed to close file: {:?}, errno={:?}",
                 current_pcb().pid,
                 self,
                 r.unwrap_err()
@@ -292,7 +313,7 @@ impl Drop for File {
 }
 
 /// @brief pcb里面的文件描述符数组
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     pub fds: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD],
@@ -317,6 +338,19 @@ impl FileDescriptorVec {
 
         // 初始化文件描述符数组结构体
         return Box::new(FileDescriptorVec { fds: data });
+    }
+
+    /// @brief 克隆一个文件描述符数组
+    ///
+    /// @return Box<FileDescriptorVec> 克隆后的文件描述符数组
+    pub fn clone(&self) -> Box<FileDescriptorVec> {
+        let mut res: Box<FileDescriptorVec> = FileDescriptorVec::new();
+        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            if let Some(file) = &self.fds[i] {
+                res.fds[i] = file.try_clone();
+            }
+        }
+        return res;
     }
 
     /// @brief 从pcb的fds字段，获取文件描述符数组的可变引用

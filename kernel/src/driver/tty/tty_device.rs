@@ -9,10 +9,9 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
     },
-    include::bindings::bindings::{printk_color, textui_putchar, BLACK, WHITE},
-    kdebug, kerror,
+    include::bindings::bindings::{textui_putchar, BLACK, WHITE},
+    kerror,
     libs::rwlock::RwLock,
-    print,
     syscall::SystemError,
 };
 
@@ -240,7 +239,7 @@ impl IndexNode for TtyDevice {
 
         loop {
             let mut buf = [0u8; 512];
-            let r: Result<usize, TtyError> = self.core.read_output(&mut buf[0..511], false);
+            let r: Result<usize, TtyError> = self.core.output(&mut buf[0..511], false);
             let len;
             match r {
                 Ok(x) => {
@@ -256,9 +255,11 @@ impl IndexNode for TtyDevice {
                 break;
             }
             // 输出到屏幕
-            print!("{}", unsafe {
-                core::str::from_utf8_unchecked(&buf[0..len])
-            });
+            unsafe {
+                for x in buf {
+                    textui_putchar(x as u16, WHITE, BLACK);
+                }
+            }
         }
         return Ok(());
     }

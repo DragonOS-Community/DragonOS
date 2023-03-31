@@ -5,7 +5,7 @@ use thingbuf::mpsc::{
     errors::{TryRecvError, TrySendError},
 };
 
-use crate::{libs::rwlock::RwLock, kdebug};
+use crate::libs::rwlock::RwLock;
 
 pub mod tty_device;
 
@@ -286,7 +286,7 @@ impl TtyCore {
     pub fn disable_echo(&self) {
         self.state.write().set(TtyCoreState::ECHO_ON, false);
     }
-    
+
     /// @brief 判断当前tty核心，是否开启了输入回显
     ///
     /// @return true 开启了输入回显

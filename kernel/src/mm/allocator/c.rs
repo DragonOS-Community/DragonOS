@@ -1,5 +1,5 @@
-use super::gfp::__GFP_ZERO;
-use crate::include::bindings::bindings::{gfp_t, kfree, kmalloc, PAGE_2M_SIZE};
+
+use crate::{include::bindings::bindings::{gfp_t, kfree, kmalloc, PAGE_2M_SIZE}, mm::gfp::__GFP_ZERO};
 
 use core::alloc::{GlobalAlloc, Layout};
 

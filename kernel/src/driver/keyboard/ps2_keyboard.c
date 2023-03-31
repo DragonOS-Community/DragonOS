@@ -146,11 +146,11 @@ void ps2_keyboard_handler(ul irq_num, ul buf_vaddr, struct pt_regs *regs)
     unsigned char x = io_in8(PORT_PS2_KEYBOARD_DATA);
     ps2_keyboard_parse_keycode((uint8_t)x);
     uint8_t count = kfifo_in((struct kfifo_t *)buf_vaddr, &x, sizeof(unsigned char));
-    if (count == 0)
-    {
-        kwarn("ps2 keyboard buffer full.");
-        return;
-    }
+    // if (count == 0)
+    // {
+    //     kwarn("ps2 keyboard buffer full.");
+    //     return;
+    // }
 
     wait_queue_wakeup(&ps2_keyboard_wait_queue, PROC_UNINTERRUPTIBLE);
     

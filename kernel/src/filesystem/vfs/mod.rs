@@ -15,7 +15,7 @@ use crate::{
     syscall::SystemError,
 };
 
-use self::file::FileMode;
+use self::{core::generate_inode_id, file::FileMode};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -234,9 +234,9 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     /// @brief 删除文件夹
-    /// 
+    ///
     /// @param name 文件夹名称
-    /// 
+    ///
     /// @return 成功 Ok(())
     /// @return 失败 Err(错误码)
     fn rmdir(&self, _name: &str) ->Result<(), SystemError>{
@@ -331,6 +331,11 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @param len 要被截断到的目标长度
     fn truncate(&self, _len: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOTSUP);
+    }
+
+    /// @brief 将当前inode的内容同步到具体设备上
+    fn sync(&self) -> Result<(), SystemError> {
+        return Ok(());
     }
 }
 
@@ -515,4 +520,25 @@ pub struct Dirent {
     d_reclen: u16, // 目录下的记录数
     d_type: u8,    // entry的类型
     d_name: u8,    // 文件entry的名字(是一个零长数组)， 本字段仅用于占位
+}
+
+impl Metadata {
+    pub fn new(file_type: FileType, mode: u32) -> Self {
+        Metadata {
+            dev_id: 0,
+            inode_id: generate_inode_id(),
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: TimeSpec::default(),
+            mtime: TimeSpec::default(),
+            ctime: TimeSpec::default(),
+            file_type,
+            mode,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            raw_dev: 0,
+        }
+    }
 }

@@ -62,7 +62,7 @@ bitflags! {
     const O_APPEND = 0o00002000;
     /// 非阻塞式IO模式
     const O_NONBLOCK = 0o00004000;
-    /// used to be O_SYNC, see below
+    /// 每次write都等待物理I/O完成，但是如果写操作不影响读取刚写入的数据，则不等待文件属性更新
     const O_DSYNC = 0o00010000;
     /// fcntl, for BSD compatibility
     const FASYNC = 0o00020000;
@@ -76,9 +76,18 @@ bitflags! {
     const O_NOATIME = 0o01000000;
     /// set close_on_exec
     const O_CLOEXEC = 0o02000000;
+    /// 每次write都等到物理I/O完成，包括write引起的文件属性的更新
+    const O_SYNC = 0o04000000;
     }
 }
 
+impl FileMode {
+    /// @brief 获取文件的访问模式的值
+    #[inline]
+    pub fn accmode(&self) -> u32 {
+        return self.bits() & FileMode::O_ACCMODE.bits();
+    }
+}
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
@@ -128,7 +137,6 @@ impl File {
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;
@@ -151,7 +159,7 @@ impl File {
         }
         let len = self
             .inode
-            .write_at(self.offset, len, buf, &mut FilePrivateData::Unused)?;
+            .write_at(self.offset, len, buf, &mut self.private_data)?;
         self.offset += len;
         return Ok(len);
     }

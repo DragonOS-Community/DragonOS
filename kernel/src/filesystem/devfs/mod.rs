@@ -10,7 +10,8 @@ use super::vfs::{
 use crate::{
     kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec, syscall::SystemError,
+    syscall::SystemError,
+    time::TimeSpec,
 };
 use alloc::{
     collections::BTreeMap,
@@ -94,9 +95,14 @@ impl DevFS {
     ///
     /// @param name 设备名称
     /// @param device 设备节点的结构体
-    pub fn register_device<T: DeviceINode>(&self, name: &str, device: Arc<T>) -> Result<(), SystemError> {
+    pub fn register_device<T: DeviceINode>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
-        match device.metadata().unwrap().file_type {
+        let metadata = device.metadata()?;
+        match metadata.file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
                 if let Err(_) = dev_root_inode.find("char") {
@@ -108,8 +114,13 @@ impl DevFS {
                     .as_any_ref()
                     .downcast_ref::<LockedDevFSInode>()
                     .unwrap();
-
+                // 在 /dev/char 下创建设备节点
                 dev_char_inode.add_dev(name, device.clone())?;
+
+                // 特殊处理 tty 设备，挂载在 /dev 下
+                if name.starts_with("tty") && name.len() > 3 {
+                    dev_root_inode.add_dev(name, device.clone())?;
+                }
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
             FileType::BlockDevice => {
@@ -135,7 +146,11 @@ impl DevFS {
     }
 
     /// @brief 卸载设备
-    pub fn unregister_device<T: DeviceINode>(&self, name: &str, device: Arc<T>) -> Result<(), SystemError> {
+    pub fn unregister_device<T: DeviceINode>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
         match device.metadata().unwrap().file_type {
             // 字节设备挂载在 /dev/char
@@ -325,7 +340,11 @@ impl IndexNode for LockedDevFSInode {
         self
     }
 
-    fn open(&self, _data: &mut super::vfs::FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: &mut super::vfs::FilePrivateData,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -459,6 +478,7 @@ impl IndexNode for LockedDevFSInode {
         _buf: &mut [u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, SystemError> {
+        kerror!("DevFS: read_at is not supported!");
         Err(SystemError::ENOTSUP)
     }
 
@@ -485,7 +505,7 @@ macro_rules! devfs_exact_ref {
     () => {{
         let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().find("dev");
         if let Err(e) = devfs_inode {
-            kerror!("failed to get DevFS ref. errcode = {:?}",e);
+            kerror!("failed to get DevFS ref. errcode = {:?}", e);
             return Err(SystemError::ENOENT);
         }
 
@@ -511,4 +531,3 @@ pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), 
 pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
     return devfs_exact_ref!().unregister_device(name, device);
 }
-

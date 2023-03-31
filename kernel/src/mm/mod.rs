@@ -3,9 +3,10 @@ use core::ptr;
 use crate::include::bindings::bindings::PAGE_OFFSET;
 
 pub mod allocator;
+pub mod bump;
 pub mod gfp;
 pub mod mmio_buddy;
-pub mod bump;
+pub mod page;
 pub mod page_frame;
 
 /// @brief 将内核空间的虚拟地址转换为物理地址
@@ -123,6 +124,8 @@ pub trait MemoryManagementArch: Clone + Copy {
     const ENTRY_FLAG_CACHE_DISABLE: usize;
     /// 标记当前页面不可执行的标志位（Execute disable）（也就是说，不能从这段内存里面获取处理器指令）
     const ENTRY_FLAG_NO_EXEC: usize;
+    /// 标记当前页面可执行的标志位（Execute enable）
+    const ENTRY_FLAG_EXEC: usize;
 
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
@@ -178,14 +181,13 @@ pub trait MemoryManagementArch: Clone + Copy {
     /// @brief 获取顶级页表的物理地址
     unsafe fn table(table_kind: PageTableKind) -> PhysAddr;
 
-
     /// @brief 设置顶级页表的物理地址到处理器中
     unsafe fn set_table(table_kind: PageTableKind, table: PhysAddr);
 
     /// @brief 将物理地址转换为虚拟地址.
-    /// 
+    ///
     /// @param phys 物理地址
-    /// 
+    ///
     /// @return 转换后的虚拟地址。如果转换失败，返回None
     #[inline(always)]
     unsafe fn phys_2_virt(phys: PhysAddr) -> Option<VirtAddr> {

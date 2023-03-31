@@ -334,7 +334,6 @@ impl TypeOneFSMState {
                     scancode_status.caps_lock = flag_make;
                 } //else false => cap_lock: true
                 key = KeyFlag::NoneFlag;
-
             }
             _ => {
                 if flag_make == false {
@@ -349,18 +348,15 @@ impl TypeOneFSMState {
             col = true;
         }
 
-        if scancode_status.caps_lock{
-            if index>=0x10&&index<=0x19{
-                col=!col;
-            }
-            else if index>=0x1e&&index<=0x26{
-                col=!col;
-            }
-            else if index>=0x2c&&index<=0x32{
-                col=!col;
+        if scancode_status.caps_lock {
+            if index >= 0x10 && index <= 0x19 {
+                col = !col;
+            } else if index >= 0x1e && index <= 0x26 {
+                col = !col;
+            } else if index >= 0x2c && index <= 0x32 {
+                col = !col;
             }
         }
-
 
         let ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
 

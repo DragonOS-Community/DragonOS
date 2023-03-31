@@ -296,21 +296,15 @@ impl TypeOneFSMState {
     ) -> TypeOneFSMState {
         // 判断按键是被按下还是抬起
         let flag_make = if (scancode & (TYPE1_KEYCODE_FLAG_BREAK as u8)) > 0 {
-            false
+            false //up
         } else {
-            true
+            true //down
         };
 
         // 计算扫描码位于码表的第几行
-        let mut col: usize = 0;
+        let mut col: bool = false;
         let index = scancode & 0x7f;
 
-        // shift被按下
-        if scancode_status.shift_l || scancode_status.shift_r {
-            col = 1;
-        }
-
-        let ch = TYPE1_KEY_CODE_MAPTABLE[col + 2 * index as usize];
         //kdebug!("in type3 ch is {:#x}\n",ch);
         let mut key = KeyFlag::OtherKey; // 可视字符
 
@@ -328,8 +322,19 @@ impl TypeOneFSMState {
                 key = KeyFlag::NoneFlag;
             }
             0x38 => {
-                scancode_status.ctrl_r = flag_make;
+                scancode_status.alt_r = flag_make;
                 key = KeyFlag::NoneFlag;
+            }
+            0x3A => {
+                if scancode_status.caps_lock {
+                    scancode_status.caps_lock = !flag_make;
+                }
+                //if caps_lock: true, flag_make: true => cap_lock: false
+                else {
+                    scancode_status.caps_lock = flag_make;
+                } //else false => cap_lock: true
+                key = KeyFlag::NoneFlag;
+
             }
             _ => {
                 if flag_make == false {
@@ -338,6 +343,26 @@ impl TypeOneFSMState {
                 }
             }
         }
+
+        // shift被按下
+        if scancode_status.shift_l || scancode_status.shift_r {
+            col = true;
+        }
+
+        if scancode_status.caps_lock{
+            if index>=0x10&&index<=0x19{
+                col=!col;
+            }
+            else if index>=0x1e&&index<=0x26{
+                col=!col;
+            }
+            else if index>=0x2c&&index<=0x32{
+                col=!col;
+            }
+        }
+
+
+        let ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
 
         if key != KeyFlag::NoneFlag {
             Self::emit(tty, ch);
@@ -411,6 +436,7 @@ impl TypeOneFSMState {
 
 /// 按键状态
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ScanCodeStatus {
     // Shift 按键
     shift_l: bool,
@@ -441,6 +467,7 @@ pub struct ScanCodeStatus {
     kp_forward_slash: bool,
     // 回车
     kp_enter: bool,
+    caps_lock: bool,
 }
 
 impl ScanCodeStatus {
@@ -467,6 +494,7 @@ impl ScanCodeStatus {
             arrow_r: false,
             kp_forward_slash: false,
             kp_enter: false,
+            caps_lock: false,
         }
     }
 }
@@ -481,27 +509,41 @@ const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x0c*/ '-' as u8, '_' as u8, /*0x0d*/ '=' as u8, '+' as u8,
     /*0x0e  \b */ 8 as u8, 8 as u8, // BACKSPACE
     /*0x0f*/ '\t' as u8, '\t' as u8, // TAB
-    /*0x10*/ 'q' as u8, 'Q' as u8, /*0x11*/ 'w' as u8, 'W' as u8,
-    /*0x12*/ 'e' as u8, 'E' as u8, /*0x13*/ 'r' as u8, 'R' as u8,
-    /*0x14*/ 't' as u8, 'T' as u8, /*0x15*/ 'y' as u8, 'Y' as u8,
-    /*0x16*/ 'u' as u8, 'U' as u8, /*0x17*/ 'i' as u8, 'I' as u8,
-    /*0x18*/ 'o' as u8, 'O' as u8, /*0x19*/ 'p' as u8, 'P' as u8,
-    /*0x1a*/ '[' as u8, '{' as u8, /*0x1b*/ ']' as u8, '}' as u8,
-    /*0x1c*/ '\n' as u8, '\n' as u8, // ENTER
+    ////////////////////////character///////////////////////////
+    /*0x10*/ 'q' as u8,
+    'Q' as u8, /*0x11*/ 'w' as u8, 'W' as u8, /*0x12*/ 'e' as u8, 'E' as u8,
+    /*0x13*/ 'r' as u8, 'R' as u8, /*0x14*/ 't' as u8, 'T' as u8,
+    /*0x15*/ 'y' as u8, 'Y' as u8, /*0x16*/ 'u' as u8, 'U' as u8,
+    /*0x17*/ 'i' as u8, 'I' as u8, /*0x18*/ 'o' as u8, 'O' as u8,
+    /*0x19*/ 'p' as u8, 'P' as u8,
+    ////////////////////////character///////////////////////////
+
+    /*0x1a*/ '[' as u8,
+    '{' as u8, /*0x1b*/ ']' as u8, '}' as u8, /*0x1c*/ '\n' as u8,
+    '\n' as u8, // ENTER
     /*0x1d*/ 0x1d, 0x1d, // CTRL Left
-    /*0x1e*/ 'a' as u8, 'A' as u8, /*0x1f*/ 's' as u8, 'S' as u8,
-    /*0x20*/ 'd' as u8, 'D' as u8, /*0x21*/ 'f' as u8, 'F' as u8,
-    /*0x22*/ 'g' as u8, 'G' as u8, /*0x23*/ 'h' as u8, 'H' as u8,
-    /*0x24*/ 'j' as u8, 'J' as u8, /*0x25*/ 'k' as u8, 'K' as u8,
-    /*0x26*/ 'l' as u8, 'L' as u8, /*0x27*/ ';' as u8, ':' as u8,
-    /*0x28*/ '\'' as u8, '"' as u8, /*0x29*/ '`' as u8, '~' as u8, /*0x2a*/ 0x2a,
-    0x2a, // SHIFT Left
-    /*0x2b*/ '\\' as u8, '|' as u8, /*0x2c*/ 'z' as u8, 'Z' as u8,
-    /*0x2d*/ 'x' as u8, 'X' as u8, /*0x2e*/ 'c' as u8, 'C' as u8,
+    ////////////////////////character///////////////////////////
+    /*0x1e*/ 'a' as u8,
+    'A' as u8, /*0x1f*/ 's' as u8, 'S' as u8, /*0x20*/ 'd' as u8, 'D' as u8,
+    /*0x21*/ 'f' as u8, 'F' as u8, /*0x22*/ 'g' as u8, 'G' as u8,
+    /*0x23*/ 'h' as u8, 'H' as u8, /*0x24*/ 'j' as u8, 'J' as u8,
+    /*0x25*/ 'k' as u8, 'K' as u8, /*0x26*/ 'l' as u8, 'L' as u8,
+    ////////////////////////character///////////////////////////
+
+    /*0x27*/ ';' as u8,
+    ':' as u8, /*0x28*/ '\'' as u8, '"' as u8, /*0x29*/ '`' as u8, '~' as u8,
+    /*0x2a*/ 0x2a, 0x2a, // SHIFT Left
+    /*0x2b*/ '\\' as u8, '|' as u8,
+    ////////////////////////character///////////////////////////
+    /*0x2c*/ 'z' as u8,
+    'Z' as u8, /*0x2d*/ 'x' as u8, 'X' as u8, /*0x2e*/ 'c' as u8, 'C' as u8,
     /*0x2f*/ 'v' as u8, 'V' as u8, /*0x30*/ 'b' as u8, 'B' as u8,
     /*0x31*/ 'n' as u8, 'N' as u8, /*0x32*/ 'm' as u8, 'M' as u8,
-    /*0x33*/ ',' as u8, '<' as u8, /*0x34*/ '.' as u8, '>' as u8,
-    /*0x35*/ '/' as u8, '?' as u8, /*0x36*/ 0x36, 0x36, // SHIFT Right
+    ////////////////////////character///////////////////////////
+
+    /*0x33*/ ',' as u8,
+    '<' as u8, /*0x34*/ '.' as u8, '>' as u8, /*0x35*/ '/' as u8, '?' as u8,
+    /*0x36*/ 0x36, 0x36, // SHIFT Right
     /*0x37*/ '*' as u8, '*' as u8, /*0x38*/ 0x38, 0x38, // ALT Left
     /*0x39*/ ' ' as u8, ' ' as u8, /*0x3a*/ 0, 0, // CAPS LOCK
     /*0x3b*/ 0, 0, // F1

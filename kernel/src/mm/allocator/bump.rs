@@ -2,11 +2,12 @@
 /// @Date: 2023-03-27 06:54:08
 /// @FilePath: /DragonOS/kernel/src/mm/bump.rs
 /// @Description: bump allocator线性分配器
-/// 
-use crate::mm::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
+///
+use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea};
 use core::marker::PhantomData;
-// 线性分配器的实现
+
+/// 线性分配器
 pub struct BumpAllocator<MMA> {
     // 表示可用物理内存区域的数组。每个 PhysMemoryArea 结构体描述一个物理内存区域的起始地址和大小。
     areas: &'static [PhysMemoryArea],
@@ -15,7 +16,8 @@ pub struct BumpAllocator<MMA> {
     // 一个占位类型，用于标记 A 类型在结构体中的存在。但是，它并不会占用任何内存空间，因为它的大小为 0。
     phantom: PhantomData<MMA>,
 }
-// 为BumpAllocator实现FrameAllocator
+
+/// 为BumpAllocator实现FrameAllocator
 impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
     /// @brief: 创建一个线性分配器
     /// @param Fareas 当前的内存区域

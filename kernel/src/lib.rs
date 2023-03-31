@@ -46,7 +46,7 @@ extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
 
-use mm::allocator::KernelAllocator;
+use mm::allocator::c::KernelAllocator;
 
 // <3>
 use crate::{

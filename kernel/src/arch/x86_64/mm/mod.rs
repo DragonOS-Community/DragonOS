@@ -63,6 +63,8 @@ impl MemoryManagementArch for X86_64MMArch {
     const ENTRY_FLAG_CACHE_DISABLE: usize = 1 << 4;
 
     const ENTRY_FLAG_NO_EXEC: usize = 1 << 63;
+    /// x86_64不存在EXEC标志位，只有NO_EXEC（XD）标志位
+    const ENTRY_FLAG_EXEC: usize = 0;
 
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
@@ -100,6 +102,8 @@ impl MemoryManagementArch for X86_64MMArch {
     fn virt_is_valid(virt: VirtAddr) -> bool {
         return virt.is_canonical();
     }
+
+    
 }
 
 impl VirtAddr {

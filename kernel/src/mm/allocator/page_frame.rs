@@ -4,9 +4,9 @@
 /// @Description: 页帧分配器
 use crate::mm::PhysAddr;
 
+/// 页帧使用的数量
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
-// 页帧使用的数量
 pub struct PageFrameCount(usize);
 
 impl PageFrameCount {
@@ -19,6 +19,7 @@ impl PageFrameCount {
         return self.0;
     }
 }
+
 // 页帧使用情况
 #[derive(Debug)]
 pub struct PageFrameUsage {
@@ -46,7 +47,8 @@ impl PageFrameUsage {
         return self.total;
     }
 }
-// 能够分配页帧的分配器需要实现的trait
+
+/// 能够分配页帧的分配器需要实现的trait
 pub trait FrameAllocator {
     // @brief 分配count个页帧
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr>;
@@ -64,11 +66,9 @@ pub trait FrameAllocator {
     // @brief 获取页帧使用情况
     unsafe fn usage(&self) -> PageFrameUsage;
 }
-// @brief 通过一个 &mut T 的引用来对一个实现了 FrameAllocator trait 的类型进行调用，使代码更加灵活
-impl<T> FrameAllocator for &mut T
-where
-    T: FrameAllocator,
-{
+
+/// @brief 通过一个 &mut T 的引用来对一个实现了 FrameAllocator trait 的类型进行调用，使代码更加灵活
+impl<T: FrameAllocator> FrameAllocator for &mut T {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
         return T::allocate(self, count);
     }

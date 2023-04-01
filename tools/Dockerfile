@@ -6,9 +6,6 @@ WORKDIR /build-image
 # 将本地的脚本复制到工作目录
 COPY *.sh ./
 
-# 设置用来存放rust缓存的卷
-VOLUME [ "/root/.cargo/registry" ]
-
 # 设置rust源的环境变量
 ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
 ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup

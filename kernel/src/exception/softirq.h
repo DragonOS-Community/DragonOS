@@ -13,11 +13,11 @@
 #include <common/glib.h>
 
 // ==================implementation with rust===================
-extern void softirq_init();
-extern void raise_softirq(uint32_t sirq_num);
-extern int register_softirq(uint32_t irq_num, void (*action)(void *data), void *data);
+extern void rs_softirq_init();
+extern void rs_raise_softirq(uint32_t sirq_num);
+extern int rs_register_softirq(uint32_t irq_num, void (*action)(void *data), void *data);
 extern int unregister_softirq(uint32_t irq_num);
-extern void do_softirq();
+extern void rs_do_softirq();
 
 // for temporary
 #define MAX_SOFTIRQ_NUM 64

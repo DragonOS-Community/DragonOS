@@ -1,4 +1,6 @@
+pub mod sleep;
 pub mod timekeep;
+pub mod timer;
 
 /// 表示时间的结构体
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

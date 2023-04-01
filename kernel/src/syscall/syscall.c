@@ -378,7 +378,7 @@ uint64_t sys_nanosleep(struct pt_regs *regs)
     const struct timespec *rqtp = (const struct timespec *)regs->r8;
     struct timespec *rmtp = (struct timespec *)regs->r9;
 
-    return nanosleep(rqtp, rmtp);
+    return rs_nanosleep(rqtp, rmtp);
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)

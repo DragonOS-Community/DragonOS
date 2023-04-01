@@ -197,10 +197,23 @@ void swab(void *restrict src, void *restrict dest, ssize_t nbytes)
 
 /**
  * @brief 获取当前进程的pid（进程标识符）
- * 
+ *
  * @return pid_t 当前进程的pid
  */
 pid_t getpid(void)
 {
     syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+int dup(int fd)
+{
+    printf("in dup: %d\n",fd);
+    syscall_invoke(SYS_DUP,fd,0,0,0,0,0,0,0);
+    //return sys_dup(fd);
+}
+
+int dup2(int ofd, int nfd)
+{
+
+    syscall_invoke(SYS_DUP2,ofd,nfd,0,0,0,0,0,0);
 }

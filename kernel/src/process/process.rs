@@ -7,13 +7,17 @@ use alloc::boxed::Box;
 
 use crate::{
     arch::{asm::current::current_pcb, fpu::FpState},
-    filesystem::vfs::{file::{File, FileDescriptorVec, FileMode}, ROOT_INODE},
+    filesystem::vfs::{
+        file::{File, FileDescriptorVec, FileMode},
+        ROOT_INODE,
+    },
     include::bindings::bindings::{
-        process_control_block, CLONE_FS, PROC_INTERRUPTIBLE,
-        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
+        process_control_block, CLONE_FS, PROC_INTERRUPTIBLE, PROC_RUNNING, PROC_STOPPED,
+        PROC_UNINTERRUPTIBLE,
     },
     sched::core::{cpu_executing, sched_enqueue},
-    smp::core::{smp_get_processor_id, smp_send_reschedule}, syscall::SystemError,
+    smp::core::{smp_get_processor_id, smp_send_reschedule},
+    syscall::SystemError,
 };
 
 use super::preempt::{preempt_disable, preempt_enable};
@@ -175,7 +179,7 @@ impl process_control_block {
     ///
     /// @return Ok(i32) 申请到的文件描述符编号
     /// @return Err(SystemError) 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(&mut self, file: File) -> Result<i32, SystemError> {
+    pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
         // 获取pcb的文件描述符数组的引用
         let fds: &mut FileDescriptorVec =
             if let Some(f) = FileDescriptorVec::from_pcb(current_pcb()) {
@@ -193,15 +197,27 @@ impl process_control_block {
             };
 
         // 寻找空闲的文件描述符
-        let mut cnt = 0;
-        for x in fds.fds.iter_mut() {
+        
+        if fd.is_some() {
+            let new_fd=fd.unwrap();
+            let x = &mut fds.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Box::new(file));
-                return Ok(cnt);
+                return Ok(new_fd);
+            } else {
+                return Err(SystemError::EBADF);
             }
-            cnt += 1;
+        } else {
+            let mut cnt = 0;
+            for x in fds.fds.iter_mut() {
+                if x.is_none() {
+                    *x = Some(Box::new(file));
+                    return Ok(cnt);
+                }
+                cnt += 1;
+            }
+            return Err(SystemError::ENFILE);
         }
-        return Err(SystemError::ENFILE);
     }
 
     /// @brief 根据文件描述符序号，获取文件结构体的可变引用
@@ -377,10 +393,10 @@ pub fn init_stdio() -> Result<(), SystemError> {
         .expect("Init stdio: can't create stderr");
 
     /*
-        按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
-     */
-    assert_eq!(current_pcb().alloc_fd(stdin).unwrap(), 0);
-    assert_eq!(current_pcb().alloc_fd(stdout).unwrap(), 1);
-    assert_eq!(current_pcb().alloc_fd(stderr).unwrap(), 2);
+       按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
+    */
+    assert_eq!(current_pcb().alloc_fd(stdin, None).unwrap(), 0);
+    assert_eq!(current_pcb().alloc_fd(stdout, None).unwrap(), 1);
+    assert_eq!(current_pcb().alloc_fd(stderr, None).unwrap(), 2);
     return Ok(());
 }

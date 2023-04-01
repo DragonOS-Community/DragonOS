@@ -17,15 +17,17 @@ use super::NetDriver;
 
 /// @brief Virtio网络设备驱动(加锁)
 pub struct VirtioNICDriver<T: Transport> {
-    inner: RwLock<InnerVirtIONet<T>>,
+    pub inner: RwLock<InnerVirtIONet<T>>,
 }
 
 impl<T: 'static + Transport> VirtioNICDriver<T> {
     pub fn new(driver_net: VirtIONet<HalImpl, T>) -> Arc<Self> {
         let mut iface_config = smoltcp::iface::Config::new();
+
         // todo: 随机设定这个值。
         // 参见 https://docs.rs/smoltcp/latest/smoltcp/iface/struct.Config.html#structfield.random_seed
         iface_config.random_seed = 12345;
+
         iface_config.hardware_addr = Some(wire::HardwareAddress::Ethernet(
             smoltcp::wire::EthernetAddress(driver_net.mac()),
         ));
@@ -38,9 +40,11 @@ impl<T: 'static + Transport> VirtioNICDriver<T> {
         });
 
         let mut s: VirtioNICDriver<T> = Self { inner };
+        
         let iface: Arc<Interface> = Arc::new(Interface::new(smoltcp::iface::Interface::new::<
             VirtioNICDriver<T>,
         >(iface_config, &mut s)));
+
         let result: Arc<VirtioNICDriver<T>> = Arc::new(s);
         result.inner.write().self_ref = Arc::downgrade(&result);
         result.inner.write().ifaces.push(iface.clone());
@@ -56,7 +60,7 @@ impl<T: 'static + Transport> VirtioNICDriver<T> {
 }
 
 /// @brief Virtio网络设备驱动(不加锁, 仅供内部使用)
-struct InnerVirtIONet<T: Transport> {
+pub struct InnerVirtIONet<T: Transport> {
     /// Virtio网络设备
     virtio_net: VirtIONet<HalImpl, T>,
     /// 自引用
@@ -176,6 +180,7 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
 }
 
 impl<T: Transport> Driver for VirtioNICDriver<T> {}
+
 impl<T: Transport> NetDriver for VirtioNICDriver<T> {
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac: [u8; 6] = self.inner.read().virtio_net.mac();
@@ -186,6 +191,10 @@ impl<T: Transport> NetDriver for VirtioNICDriver<T> {
     fn nic_id(&self) -> usize {
         return self.inner.read().net_device_id;
     }
+
+    // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+    //     return self;
+    // }
 }
 
 /// 向编译器保证，VirtioNICDriver在线程之间是安全的.

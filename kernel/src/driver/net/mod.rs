@@ -1,5 +1,7 @@
+use core::any::Any;
+
 use alloc::string::String;
-use smoltcp::wire::EthernetAddress;
+use smoltcp::{phy, wire::EthernetAddress};
 
 use super::Driver;
 
@@ -15,5 +17,6 @@ pub trait NetDriver: Driver {
 
     /// @brief 获取网卡的id
     fn nic_id(&self) -> usize;
-    
+
+    // fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
 }

@@ -1,14 +1,15 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use smoltcp::{
     iface::{self, SocketHandle, SocketSet},
-    socket::{raw, tcp, udp},
+    socket::{raw, tcp::{self, State}, udp},
     wire::{IpAddress, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address},
 };
 
 use crate::{
+    arch::rand::rand,
     driver::{net::NetDriver, NET_DRIVERS},
     include::bindings::bindings::ida,
-    kerror, kwarn,
+    kdebug, kerror, kwarn,
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{Interface, NET_FACES},
     syscall::SystemError,
@@ -26,7 +27,7 @@ lazy_static! {
 /// 它在smoltcp的SocketHandle上封装了一层，增加更多的功能。
 /// 比如，在socket被关闭时，自动释放socket的资源，通知系统的其他组件。
 #[derive(Debug)]
-struct GlobalSocketHandle(SocketHandle);
+pub struct GlobalSocketHandle(SocketHandle);
 
 impl GlobalSocketHandle {
     pub fn new(handle: SocketHandle) -> Self {
@@ -42,7 +43,9 @@ impl Clone for GlobalSocketHandle {
 
 impl Drop for GlobalSocketHandle {
     fn drop(&mut self) {
-        todo!()
+        let mut socket_set_guard = SOCKET_SET.lock();
+        socket_set_guard.remove(self.0); // 删除的时候，会发送一条FINISH的信息？
+        drop(socket_set_guard);
     }
 }
 
@@ -50,11 +53,11 @@ impl Drop for GlobalSocketHandle {
 #[derive(Debug)]
 pub enum SocketType {
     /// 原始的socket
-    RawSocket = 0x01,
+    RawSocket,
     /// 用于Tcp通信的 Socket
-    TcpSocket = 0x02,
+    TcpSocket,
     /// 用于Udp通信的 Socket
-    UdpSocket = 0x04,
+    UdpSocket,
 }
 
 bitflags! {
@@ -251,7 +254,7 @@ impl Socket for RawSocket {
         }
     }
 
-    fn connect(&self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+    fn connect(&mut self, endpoint: super::Endpoint) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -269,7 +272,7 @@ impl Socket for RawSocket {
 /// https://man7.org/linux/man-pages/man7/udp.7.html
 #[derive(Debug, Clone)]
 pub struct UdpSocket {
-    handle: GlobalSocketHandle,
+    pub handle: GlobalSocketHandle,
     remote_endpoint: Option<Endpoint>, // 记录远程endpoint提供给connect()， 应该使用IP地址。
     options: SocketOptions,
 }
@@ -311,12 +314,18 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    /// @brief 在read函数执行之前，请先bind到本地的指定端口
     fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError> {
         loop {
+            kdebug!("Wait22 to Read");
+
             let mut socket_set_guard = SOCKET_SET.lock();
             let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
 
+            kdebug!("Wait to Read");
+
             if socket.can_recv() {
+                kdebug!("Can Receive");
                 if let Ok((size, endpoint)) = socket.recv_slice(buf) {
                     drop(socket);
                     drop(socket_set_guard);
@@ -324,7 +333,8 @@ impl Socket for UdpSocket {
                     return Ok((size, Endpoint::Ip(endpoint)));
                 }
             } else {
-                return Err(SystemError::ENOTCONN);
+                // 没有数据可以读取. 如果没有bind到指定端口，也会导致rx_buf为空
+                return Err(SystemError::EAGAIN);
             }
         }
     }
@@ -347,6 +357,8 @@ impl Socket for UdpSocket {
             let temp_port = get_ephemeral_port();
 
             match endpoint.addr {
+                // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
+                // 否则就用 self.endpoint().addr.unwrap()
                 IpAddress::Ipv4(_) => {
                     socket
                         .bind(IpEndpoint::new(
@@ -382,8 +394,28 @@ impl Socket for UdpSocket {
         };
     }
 
-    fn connect(&self, endpoint: super::Endpoint) -> Result<(), SystemError> {
-        return Ok(());
+    fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        let mut sockets = SOCKET_SET.lock();
+        let socket = sockets.get_mut::<udp::Socket>(self.handle.0);
+
+        return if let Endpoint::Ip(ip) = endpoint {
+            match socket.bind(ip) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(SystemError::EINVAL),
+            }
+        } else {
+            Err(SystemError::EINVAL)
+        };
+    }
+
+    /// @brief
+    fn connect(&mut self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+        return if let Endpoint::Ip(_) = endpoint {
+            self.remote_endpoint = Some(endpoint);
+            Ok(())
+        } else {
+            Err(SystemError::EINVAL)
+        };
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
@@ -438,6 +470,7 @@ impl TcpSocket {
 }
 
 impl Socket for TcpSocket {
+    /// @breif
     fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError> {
         loop {
             let mut socket_set_guard = SOCKET_SET.lock();
@@ -459,7 +492,7 @@ impl Socket for TcpSocket {
                     }
                 }
             } else {
-                return Err(SystemError::ENOTCONN);
+                return Err(SystemError::EAGAIN);
             }
         }
     }
@@ -490,8 +523,74 @@ impl Socket for TcpSocket {
         return Err(SystemError::ENOTCONN);
     }
 
-    fn connect(&self, endpoint: super::Endpoint) -> Result<(), SystemError> {
-        return Ok(());
+    fn connect(&mut self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+        // let mut sockets = SOCKET_SET.lock();
+        // let mut socket = sockets.get::<tcp::Socket>(self.handle.0);
+
+        // if let Endpoint::Ip(ip) = endpoint {
+        //     let temp_port = if ip.port == 0 {
+        //         get_ephemeral_port()
+        //     } else {
+        //         ip.port
+        //     };
+
+        //     return match socket.connect(iface.context(), temp_port) {
+        //         Ok(()) => {
+        //             // avoid deadlock
+        //             drop(socket);
+        //             drop(sockets);
+
+        //             // wait for connection result
+        //             loop {
+        //                 // poll_ifaces();
+
+        //                 let mut sockets = SOCKET_SET.lock();
+        //                 let socket = sockets.get::<tcp::Socket>(self.handle.0);
+        //                 match socket.state() {
+        //                     State::SynSent => {
+        //                         // still connecting
+        //                         drop(socket);
+        //                         kdebug!("poll for connection wait");
+        //                         // SOCKET_ACTIVITY.wait(sockets);
+        //                     }
+        //                     State::Established => {
+        //                         break Ok(());
+        //                     }
+        //                     _ => {
+        //                         break Err(SystemError::ECONNREFUSED);
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //         Err(_) => Err(SystemError::ENOBUFS),
+        //     };
+        // } else {
+        //     return Err(SystemError::EINVAL);
+        // }
+        return Err(SystemError::EINVAL);
+    }
+
+    /// @brief tcp socket 监听 local_endpoint 端口
+    fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
+        if self.is_listening {
+            return Ok(());
+        }
+
+        let local_endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
+        let mut sockets = SOCKET_SET.lock();
+        let mut socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
+
+        if socket.is_listening() {
+            return Ok(());
+        }
+
+        return match socket.listen(local_endpoint) {
+            Ok(()) => {
+                self.is_listening = true;
+                Ok(())
+            }
+            Err(_) => Err(SystemError::EINVAL),
+        };
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
@@ -503,17 +602,19 @@ impl Socket for TcpSocket {
     }
 }
 
-/// @brief 标记PORT是否被使用
-pub static mut PORT_RECORD: [bool; 65536_usize] = [false; 65536_usize];
-
 /// @breif 自动分配一个未被使用的PORT
-fn get_ephemeral_port() -> u16 {
-    for i in 0..65536 {
-        if !unsafe { PORT_RECORD[i] } {
-            unsafe { PORT_RECORD[i] = true };
-            return i as u16;
+pub fn get_ephemeral_port() -> u16 {
+    // TODO selects non-conflict high port
+    static mut EPHEMERAL_PORT: u16 = 0;
+    unsafe {
+        if EPHEMERAL_PORT == 0 {
+            EPHEMERAL_PORT = (49152 + rand() % (65536 - 49152)) as u16;
         }
+        if EPHEMERAL_PORT == 65535 {
+            EPHEMERAL_PORT = 49152;
+        } else {
+            EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
+        }
+        EPHEMERAL_PORT
     }
-
-    return 0;
 }

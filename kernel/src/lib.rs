@@ -5,7 +5,9 @@
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]
 #![feature(drain_filter)] // 允许Vec的drain_filter特性
-#![feature(c_void_variant)] // used in kernel/src/exception/softirq.rs
+#![feature(c_void_variant)]
+use core::arch::x86_64::_rdtsc;
+// used in kernel/src/exception/softirq.rs
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -46,12 +48,26 @@ extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
 
+use driver::NET_DRIVERS;
 use mm::allocator::KernelAllocator;
+use smoltcp::{
+    iface::{Interface, SocketSet},
+    time::{Duration, Instant},
+    wire::{IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr},
+};
+use virtio_drivers::device;
 
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{process_do_exit, BLACK, GREEN}, filesystem::vfs::ROOT_INODE,
+    driver::{
+        net::{virtio_net::VirtioNICDriver, NetDriver},
+        virtio::transport_pci::PciTransport,
+    },
+    filesystem::vfs::ROOT_INODE,
+    include::bindings::bindings::{process_do_exit, BLACK, GREEN},
+    net::{socket::SocketOptions, Socket},
+    time::timekeep::ktime_get_real_ns,
 };
 
 // 声明全局的slab分配器
@@ -94,11 +110,116 @@ pub fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
+use net::NET_FACES;
+// use smoltcp::
+use smoltcp::socket::dhcpv4;
+
 /// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
 
+    func();
 
     return 0;
+}
+
+fn func() {
+    let binding = NET_DRIVERS.write();
+
+    let device = unsafe {
+        (binding.get(&0).unwrap().as_ref() as *const dyn NetDriver
+            as *const VirtioNICDriver<PciTransport> as *mut VirtioNICDriver<PciTransport>)
+            .as_mut()
+            .unwrap()
+    };
+
+    let binding = NET_FACES.write();
+    
+    let net_face = binding.get(&0).unwrap();
+
+    let net_face = unsafe {
+        (net_face.as_ref() as *const crate::net::Interface as *mut crate::net::Interface)
+            .as_mut()
+            .unwrap()
+    };
+
+    // Create sockets
+    let mut dhcp_socket = dhcpv4::Socket::new();
+
+    // Set a ridiculously short max lease time to show DHCP renews work properly.
+    // This will cause the DHCP client to start renewing after 5 seconds, and give up the
+    // lease after 10 seconds if renew hasn't succeeded.
+    // IMPORTANT: This should be removed in production.
+    dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(10)));
+
+    let mut sockets = SocketSet::new(vec![]);
+    let dhcp_handle = sockets.add(dhcp_socket);
+
+    kdebug!("初始化 !!!");
+
+    loop {
+        let timestamp = Instant::from_micros(ktime_get_real_ns());
+
+        let _flag = net_face.inner_iface.poll(timestamp, device, &mut sockets);
+
+        let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
+
+        kdebug!("event = {event:?} !!!");
+
+        match event {
+            None => {}
+
+            Some(dhcpv4::Event::Configured(config)) => {
+                set_ipv4_addr(&mut net_face.inner_iface, config.address);
+
+                kdebug!("Find Config!! {config:?}");
+
+                if let Some(router) = config.router {
+                    net_face
+                        .inner_iface
+                        .routes_mut()
+                        .add_default_ipv4_route(router)
+                        .unwrap();
+                } else {
+                    net_face
+                        .inner_iface
+                        .routes_mut()
+                        .remove_default_ipv4_route();
+                }
+            }
+            
+            Some(dhcpv4::Event::Deconfigured) => {
+                set_ipv4_addr(
+                    &mut net_face.inner_iface,
+                    Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
+                );
+                net_face
+                    .inner_iface
+                    .routes_mut()
+                    .remove_default_ipv4_route();
+            }
+        }
+
+        // phy_wait(fd, net_face.inner_iface.poll_delay(timestamp, &sockets)).expect("wait error");
+    }
+}
+
+fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
+    kdebug!("set cidr = {cidr:?}");
+
+    return ;
+
+    iface.update_ip_addrs(|addrs| {
+        kdebug!("addrs = {addrs:?}");
+
+        let dest = addrs.iter_mut().next();
+
+        if let None = dest {
+            kerror!("Dest is None?");
+        } else {
+            let dest = dest.unwrap();
+            *dest = IpCidr::Ipv4(cidr);
+        }
+    });
 }

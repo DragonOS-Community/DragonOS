@@ -26,6 +26,14 @@ pub fn generate_iface_id() -> usize {
         .into();
 }
 
+/// @brief 用于指定socket的关闭类型
+#[derive(Debug, Clone)]
+pub enum ShutdownType {
+    ShutRd,   // Disables further receive operations.
+    ShutWr,   // Disables further send operations.
+    ShutRdwr, // Disables further send and receive operations.
+}
+
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// 链路层端点
@@ -52,19 +60,37 @@ pub trait Socket: Sync + Send + Debug {
     /// @return 返回写入的数据的长度
     fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError>;
 
-    /// @brief 对应于POSIX的connect函数，用于连接到指定的端点
+    /// @brief 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
+    ///
+    /// It is used to establish a connection to a remote server.
+    /// When a socket is connected to a remote server,
+    /// the operating system will establish a network connection with the server
+    /// and allow data to be sent and received between the local socket and the remote server.
     ///
     /// @param endpoint 要连接的端点
     ///
     /// @return 返回连接是否成功
-    fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError>;
+    fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError>;
 
-    /// @brief 对应于POSIX的bind函数，用于绑定到指定的端点
+    /// @brief 对应于POSIX的bind函数，用于绑定到本机指定的端点
+    ///
+    /// The bind() function is used to associate a socket with a particular IP address and port number on the local machine.
     ///
     /// @param endpoint 要绑定的端点
     ///
     /// @return 返回绑定是否成功
     fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 对应于 POSIX 的 shutdown 函数，用于关闭socket。
+    ///
+    /// shutdown() 函数用于启动网络连接的正常关闭。
+    /// 当在两个端点之间建立网络连接时，任一端点都可以通过调用其端点对象上的 shutdown() 函数来启动关闭序列。
+    /// 此函数向远程端点发送关闭消息以指示本地端点不再接受新数据。
+    ///
+    /// @return 返回是否成功关闭
+    fn shutdown(&self, _type: ShutdownType) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -226,7 +252,7 @@ impl Into<u8> for Protocol {
 ///
 /// smoltcp 中的接口是一个高级抽象，它允许应用程序或操作系统以一致和统一的方式与网络硬件交互，而不管所使用的具体硬件类型如何。
 pub struct Interface {
-    inner_iface: smoltcp::iface::Interface,
+    pub inner_iface: smoltcp::iface::Interface,
     pub iface_id: usize, // 接口的全局ID
 }
 

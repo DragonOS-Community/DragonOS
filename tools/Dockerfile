@@ -19,7 +19,7 @@ RUN sed -i "s@http://\(deb\|security\).debian.org@http://mirrors.ustc.edu.cn@g" 
     gnupg \
     lsb-release \
     llvm-dev libclang-dev clang gcc-multilib \
-    gcc build-essential fdisk dosfstools qemu-kvm \
+    gcc build-essential fdisk dosfstools \
     sudo wget
 
 # 安装Rust
@@ -49,5 +49,6 @@ RUN apt-get autoremove -q -y && \
     rm -rf /build-image
 
 ENV DragonOS_GCC=/root/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin/
+ENV CARGO_HOME=/data/.cargo
 # 设置容器启动后执行的命令
 CMD ["/bin/bash"]

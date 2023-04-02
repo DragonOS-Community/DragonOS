@@ -6,6 +6,10 @@ WORKDIR /build-image
 # 将本地的脚本复制到工作目录
 COPY *.sh ./
 
+# 设置用来存放rust缓存的卷
+VOLUME [ "/root/.cargo/registry" ]
+VOLUME [ "/root/.cargo/git" ]
+
 # 设置rust源的环境变量
 ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
 ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
@@ -46,6 +50,6 @@ RUN apt-get autoremove -q -y && \
     rm -rf /build-image
 
 ENV DragonOS_GCC=/root/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin/
-ENV CARGO_HOME=/data/.cargo
+
 # 设置容器启动后执行的命令
 CMD ["/bin/bash"]

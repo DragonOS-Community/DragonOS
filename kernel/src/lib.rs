@@ -50,7 +50,7 @@ use mm::allocator::KernelAllocator;
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{process_do_exit, BLACK, GREEN, SYS_OPEN}, filesystem::vfs::ROOT_INODE,
+    include::bindings::bindings::{process_do_exit, BLACK, GREEN},
 };
 
 // 声明全局的slab分配器

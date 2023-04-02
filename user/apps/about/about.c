@@ -1,10 +1,10 @@
-#include "sys_version.h"    // 这是系统的版本头文件，在编译过程中自动生成
+#include "sys_version.h" // 这是系统的版本头文件，在编译过程中自动生成
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
-
 void print_ascii_logo()
 {
     printf(" ____                                      ___   ____ \n");
@@ -36,7 +36,7 @@ void print_copyright()
 }
 
 int main()
-{   
+{
     print_ascii_logo();
     print_copyright();
 

@@ -4,11 +4,14 @@ use alloc::{boxed::Box, string::ToString};
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
+    filesystem::vfs::file::FileDescriptorVec,
     include::bindings::bindings::{
-        pt_regs, verify_area, AT_REMOVEDIR, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET,
+        pt_regs, verify_area, AT_REMOVEDIR, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR,
+        SEEK_END, SEEK_MAX, SEEK_SET,
     },
     io::SeekFrom,
-    kerror, syscall::SystemError,
+    kerror,
+    syscall::SystemError,
 };
 
 use super::{
@@ -342,5 +345,93 @@ pub extern "C" fn sys_unlink_at(regs: &pt_regs) -> u64 {
         Ok(_) => {
             return 0;
         }
+    }
+}
+
+fn do_dup(oldfd: i32) -> Result<i32, SystemError> {
+    if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+        // 获得当前文件描述符数组
+        // 确认oldfd是否有效
+        if FileDescriptorVec::validate_fd(oldfd) {
+            if let Some(file) = &fds.fds[oldfd as usize] {
+                // 尝试获取对应的文件结构体
+                let file_cp = (file).try_clone();
+                if file_cp.is_none() {
+                    return Err(SystemError::EBADF);
+                }
+                let res = current_pcb().alloc_fd(*file_cp.unwrap(), None);
+                // 申请文件描述符，并把文件对象存入其中
+                return res;
+            }
+            // oldfd对应的文件不存在
+            return Err(SystemError::EBADF);
+        }
+        return Err(SystemError::EBADF);
+    } else {
+        return Err(SystemError::EMFILE);
+    }
+}
+
+#[no_mangle]
+/// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
+pub extern "C" fn sys_dup(regs: &pt_regs) -> u64 {
+    let fd: i32 = regs.r8 as i32;
+    let r = do_dup(fd);
+    if r.is_ok() {
+        return r.unwrap() as u64;
+    } else {
+        return r.unwrap_err().to_posix_errno() as u64;
+    }
+}
+
+fn do_dup2(oldfd: i32, newfd: i32) -> Result<i32, SystemError> {
+    if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+        // 获得当前文件描述符数组
+        if FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd) {
+            //确认oldfd, newid是否有效
+            if oldfd == newfd {
+                // 若oldfd与newfd相等
+                return Ok(newfd);
+            }
+
+            if let Some(file) = &fds.fds[oldfd as usize] {
+                if fds.fds[newfd as usize].is_some() {
+                    // close newfd
+                    if let Err(_) = current_pcb().drop_fd(newfd) {
+                        // An I/O error occurred while attempting to close fildes2.
+                        return Err(SystemError::EIO);
+                    }
+                }
+
+                // 尝试获取对应的文件结构体
+                let file_cp = file.try_clone();
+                if file_cp.is_none() {
+                    return Err(SystemError::EBADF);
+                }
+                // 申请文件描述符，并把文件对象存入其中
+                let res = current_pcb().alloc_fd(*file_cp.unwrap(), Some(newfd));
+
+                return res;
+            }
+            return Err(SystemError::EBADF);
+        } else {
+            return Err(SystemError::EBADF);
+        }
+    }
+    // 从pcb获取文件描述符数组失败
+    return Err(SystemError::EMFILE);
+}
+
+#[no_mangle]
+/// @brief 根据提供的文件描述符的fd，和指定新fd，复制对应的文件结构体，
+/// 并返回新复制的文件结构体对应的fd
+pub extern "C" fn sys_dup2(regs: &pt_regs) -> u64 {
+    let ofd = regs.r8 as i32;
+    let nfd = regs.r9 as i32;
+    let r = do_dup2(ofd, nfd);
+    if r.is_ok() {
+        return r.unwrap() as u64;
+    } else {
+        return r.unwrap_err().to_posix_errno() as u64;
     }
 }

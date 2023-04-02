@@ -37,6 +37,7 @@
 #include <driver/interrupt/apic/apic_timer.h>
 
 extern int rs_tty_init();
+extern void rs_softirq_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -118,7 +119,8 @@ void system_initialize()
     sched_init();
     irq_init();
 
-    softirq_init();
+    // softirq_init();
+    rs_softirq_init();
 
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
@@ -130,7 +132,7 @@ void system_initialize()
     // sched_init();
     io_mfence();
 
-    timer_init();
+    rs_timer_init();
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();

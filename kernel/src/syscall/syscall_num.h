@@ -39,5 +39,7 @@
 #define SYS_RT_SIGRETURN 25 // 从信号处理函数返回
 #define SYS_GETPID 26       // 获取当前进程的pid（进程标识符）
 #define SYS_SCHED 27        // 让系统立即运行调度器（该系统调用不能由运行在Ring3的程序发起）
+#define SYS_DUP 28
+#define SYS_DUP2 29
 
 #define SYS_AHCI_END_REQ 255 // AHCI DMA请求结束end_request的系统调用

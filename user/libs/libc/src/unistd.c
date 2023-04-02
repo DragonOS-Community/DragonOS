@@ -88,7 +88,6 @@ pid_t vfork(void)
 uint64_t brk(uint64_t end_brk)
 {
     uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0, 0, 0);
-    // printf("brk():  end_brk=%#018lx x=%#018lx", (uint64_t)end_brk, x);
     return x;
 }
 
@@ -202,17 +201,15 @@ void swab(void *restrict src, void *restrict dest, ssize_t nbytes)
  */
 pid_t getpid(void)
 {
-    syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 int dup(int fd)
 {
-    printf("in dup: %d\n", fd);
     return syscall_invoke(SYS_DUP, fd, 0, 0, 0, 0, 0, 0, 0);    
 }
 
 int dup2(int ofd, int nfd)
 {
-
-    syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0, 0, 0);
 }

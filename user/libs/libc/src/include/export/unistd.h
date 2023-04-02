@@ -124,7 +124,7 @@ pid_t getpid(void);
 
 int dup(int fd);
 
-int dup2(int ofd,int nfd);
+int dup2(int ofd, int nfd);
 
 #if defined(__cplusplus) 
 }  /* extern "C" */ 

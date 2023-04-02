@@ -177,6 +177,9 @@ impl process_control_block {
 
     /// @brief 申请文件描述符，并把文件对象存入其中。
     ///
+    /// @param file 要存放的文件对象
+    /// @param fd 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
+    ///
     /// @return Ok(i32) 申请到的文件描述符编号
     /// @return Err(SystemError) 申请失败，返回错误码，并且，file对象将被drop掉
     pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
@@ -196,10 +199,9 @@ impl process_control_block {
                 r.unwrap()
             };
 
-        // 寻找空闲的文件描述符
-        
         if fd.is_some() {
-            let new_fd=fd.unwrap();
+            // 指定了要申请的文件描述符编号
+            let new_fd = fd.unwrap();
             let x = &mut fds.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Box::new(file));
@@ -208,6 +210,7 @@ impl process_control_block {
                 return Err(SystemError::EBADF);
             }
         } else {
+            // 寻找空闲的文件描述符
             let mut cnt = 0;
             for x in fds.fds.iter_mut() {
                 if x.is_none() {

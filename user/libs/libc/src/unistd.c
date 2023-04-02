@@ -1,10 +1,10 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <libsystem/syscall.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <libsystem/syscall.h>
 
 /**
  * @brief 关闭文件接口
@@ -207,13 +207,12 @@ pid_t getpid(void)
 
 int dup(int fd)
 {
-    printf("in dup: %d\n",fd);
-    syscall_invoke(SYS_DUP,fd,0,0,0,0,0,0,0);
-    //return sys_dup(fd);
+    printf("in dup: %d\n", fd);
+    return syscall_invoke(SYS_DUP, fd, 0, 0, 0, 0, 0, 0, 0);    
 }
 
 int dup2(int ofd, int nfd)
 {
 
-    syscall_invoke(SYS_DUP2,ofd,nfd,0,0,0,0,0,0);
+    syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0, 0, 0);
 }

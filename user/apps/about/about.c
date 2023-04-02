@@ -1,10 +1,10 @@
-#include "sys_version.h"    // 这是系统的版本头文件，在编译过程中自动生成
+#include "sys_version.h" // 这是系统的版本头文件，在编译过程中自动生成
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
-#include <fcntl.h>
 void print_ascii_logo()
 {
     printf(" ____                                      ___   ____ \n");
@@ -36,17 +36,9 @@ void print_copyright()
 }
 
 int main()
-{   
+{
     print_ascii_logo();
     print_copyright();
 
-    // int result=open("usr/include/string.h",O_RDWR);
-    // printf("%d\n",result);
-    // int result1=dup2(result,9);
-    // printf("%d\n",result1);
-    // write(result1,"hello world",12);
-    // printf("======\n");
-    // int result2=dup(result);
-    // printf("%d\n",result2);
-    // return 0;
+    return 0;
 }

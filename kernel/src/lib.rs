@@ -45,6 +45,9 @@ extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
 
+#[cfg(target_arch = "x86_64")]
+extern crate x86;
+
 use mm::allocator::KernelAllocator;
 
 // <3>

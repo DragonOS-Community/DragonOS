@@ -32,6 +32,7 @@
 #include <driver/disk/ahci/ahci.h>
 #include <driver/disk/ahci/ahci_rust.h>
 #include <driver/pci/pci.h>
+#include <driver/video/video.h>
 #include <driver/virtio/virtio.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>

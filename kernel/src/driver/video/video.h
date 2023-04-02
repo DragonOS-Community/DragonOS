@@ -30,4 +30,4 @@ int video_set_refresh_target(struct scm_buffer_info_t *buf);
 extern uint64_t video_refresh_expire_jiffies;
 extern uint64_t video_last_refresh_pid;
 
-extern void video_refresh_framebuffer();
+void video_refresh_framebuffer(void *data);

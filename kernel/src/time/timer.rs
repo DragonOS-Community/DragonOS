@@ -45,11 +45,9 @@ impl WakeUpHelper {
 
 impl TimerFunction for WakeUpHelper {
     fn run(&mut self) {
-        kdebug!("WakeUpHelper run begin");
         unsafe {
             process_wakeup(self.pcb);
         }
-        kdebug!("WakeUpHelper run end");
     }
 }
 
@@ -77,7 +75,6 @@ impl Timer {
 
     /// @brief 将定时器插入到定时器链表中
     pub fn activate(&self) {
-        kdebug!("activate");
         let timer_list = &mut TIMER_LIST.lock();
         let inner_guard = self.0.lock();
         // 链表为空，则直接插入
@@ -268,7 +265,6 @@ pub extern "C" fn sys_clock(_regs: *const pt_regs) -> u64 {
 pub extern "C" fn rs_schedule_timeout(timeout: i64) -> i64 {
     match schedule_timeout(timeout) {
         Ok(v) => {
-            kdebug!("rs_schedule_timeout run successfully");
             return v;
         }
         Err(e) => {

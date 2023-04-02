@@ -1,4 +1,4 @@
-use core::{arch::x86_64::_rdtsc, ptr::null_mut};
+use core::{arch::x86_64::_rdtsc, hint::spin_loop, ptr::null_mut};
 
 use alloc::{boxed::Box, sync::Arc};
 
@@ -9,9 +9,7 @@ use crate::{
         sched::sched,
     },
     include::bindings::bindings::{timespec, useconds_t, Cpu_tsc_freq},
-    kdebug,
     syscall::SystemError,
-    time::timer::clock,
 };
 
 use super::{
@@ -36,7 +34,7 @@ pub fn nano_sleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
         let expired_tsc: u64 =
             unsafe { _rdtsc() + (sleep_time.tv_nsec as u64 * Cpu_tsc_freq) / 1000000000 };
         while unsafe { _rdtsc() } < expired_tsc {
-            kdebug!("while in nano_sleep");
+            spin_loop()
         }
         return Ok(TimeSpec {
             tv_sec: 0,
@@ -51,7 +49,6 @@ pub fn nano_sleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
     );
 
     cli();
-    kdebug!("nano_sleep timer.activate()");
     timer.activate();
     unsafe {
         current_pcb().mark_sleep_interruptible();
@@ -102,13 +99,6 @@ pub extern "C" fn rs_nanosleep(sleep_time: *const timespec, rm_time: *mut timesp
         tv_sec: unsafe { *sleep_time }.tv_sec,
         tv_nsec: unsafe { *sleep_time }.tv_nsec,
     };
-    kdebug!("rm_time address = {:p}",rm_time);
-    kdebug!(
-        "slt_spec.tv_sec = {:?},slt_spec.tv_nsec = {:?}\nclock = {:?}",
-        slt_spec.tv_sec,
-        slt_spec.tv_nsec,
-        clock()
-    );
 
     match nano_sleep(slt_spec) {
         Ok(value) => {
@@ -116,17 +106,10 @@ pub extern "C" fn rs_nanosleep(sleep_time: *const timespec, rm_time: *mut timesp
                 unsafe { *rm_time }.tv_sec = value.tv_sec;
                 unsafe { *rm_time }.tv_nsec = value.tv_nsec;
             }
-            kdebug!(
-                "value.tv_sec = {:?}, value.tv_nsec = {:?}\nclock = {:?}",
-                value.tv_sec,
-                value.tv_nsec,
-                clock()
-            );
-            kdebug!("nano_sleep_c run successfully");
+
             return 0;
         }
         Err(err) => {
-            kdebug!("nano_sleep_c run failed");
             return err.to_posix_errno();
         }
     }
@@ -147,11 +130,9 @@ pub extern "C" fn rs_usleep(usec: useconds_t) -> i32 {
     };
     match us_sleep(sleep_time) {
         Ok(_) => {
-            kdebug!("rs_us_sleep run successfully");
             return 0;
         }
         Err(err) => {
-            kdebug!("rs_us_sleep run failed");
             return err.to_posix_errno();
         }
     };

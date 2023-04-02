@@ -1,10 +1,9 @@
-#include "sys_version.h"    // 这是系统的版本头文件，在编译过程中自动生成
+#include "sys_version.h" // 这是系统的版本头文件，在编译过程中自动生成
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
-
 void print_ascii_logo()
 {
     printf(" ____                                      ___   ____ \n");
@@ -36,9 +35,22 @@ void print_copyright()
 }
 
 int main()
-{   
+{
     print_ascii_logo();
     print_copyright();
+    struct timespec tmsp;
+    struct timespec *rmtmsp = (struct timespec *)malloc(sizeof(rmtmsp));
+    tmsp.tv_nsec = 800000000;
+    tmsp.tv_sec = 0;
+
+    while (1)
+    {
+        // printf("clock = %d\n", clock());
+        nanosleep(&tmsp, &rmtmsp);
+        printf("remain time address = %p\n", rmtmsp);
+        printf("remain time,s = %d,ns = %d\n", (*rmtmsp).tv_sec, (*rmtmsp).tv_nsec);
+        // printf("clock = %d\n", clock());
+    }
 
     return 0;
 }

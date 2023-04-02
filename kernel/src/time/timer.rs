@@ -14,9 +14,9 @@ use crate::{
     },
     exception::softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
     include::bindings::bindings::{process_control_block, process_wakeup, pt_regs, PROC_RUNNING},
-    kdebug,
+    kdebug, kerror,
     libs::spinlock::SpinLock,
-    syscall::SystemError, kerror,
+    syscall::SystemError,
 };
 
 const MAX_TIMEOUT: i64 = i64::MAX;
@@ -45,9 +45,11 @@ impl WakeUpHelper {
 
 impl TimerFunction for WakeUpHelper {
     fn run(&mut self) {
+        kdebug!("WakeUpHelper run begin");
         unsafe {
             process_wakeup(self.pcb);
         }
+        kdebug!("WakeUpHelper run end");
     }
 }
 
@@ -248,14 +250,17 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     unsafe { TIMER_JIFFIES += add_jiffies };
     return unsafe { TIMER_JIFFIES };
 }
+pub fn clock() -> u64 {
+    return unsafe { TIMER_JIFFIES };
+}
 // ====== 重构完成后请删掉extern C ======
 #[no_mangle]
-pub extern "C" fn clock() -> u64 {
-    return unsafe { TIMER_JIFFIES };
+pub extern "C" fn rs_clock() -> u64 {
+    clock()
 }
 #[no_mangle]
 pub extern "C" fn sys_clock(_regs: *const pt_regs) -> u64 {
-    return unsafe { TIMER_JIFFIES };
+    clock()
 }
 
 // ====== 以下为给C提供的接口 ======
@@ -289,7 +294,7 @@ pub extern "C" fn rs_timer_next_n_us_jiffies(expire_us: u64) -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn rs_timer_get_first_expire() -> i64{
+pub extern "C" fn rs_timer_get_first_expire() -> i64 {
     match timer_get_first_expire() {
         Ok(v) => return v as i64,
         Err(e) => return e.to_posix_errno() as i64,

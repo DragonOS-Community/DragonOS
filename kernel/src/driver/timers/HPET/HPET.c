@@ -76,17 +76,17 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
                      */
 
         // 若当前时间比定时任务的时间间隔大，则进入中断下半部
-         if (rs_timer_get_first_expire() <= clock())
+        if (rs_timer_get_first_expire() <= rs_clock())
             rs_raise_softirq(TIMER_SIRQ);
 
         // 当时间到了，或进程发生切换时，刷新帧缓冲区
-         if (clock() >= video_refresh_expire_jiffies || (video_last_refresh_pid != current_pcb->pid))
+        if (rs_clock() >= video_refresh_expire_jiffies || (video_last_refresh_pid != current_pcb->pid))
         {
             rs_raise_softirq(VIDEO_REFRESH_SIRQ);
             // 超过130ms仍未刷新完成，则重新发起刷新(防止由于进程异常退出导致的屏幕无法刷新)
-            if (unlikely(clock() >= (video_refresh_expire_jiffies + (1 << 17))))
+            if (unlikely(rs_clock() >= (video_refresh_expire_jiffies + (1 << 17))))
             {
-                video_refresh_expire_jiffies = clock() + (1 << 20);
+                video_refresh_expire_jiffies = rs_clock() + (1 << 20);
                 rs_clear_softirq_pending(VIDEO_REFRESH_SIRQ);
             }
         }

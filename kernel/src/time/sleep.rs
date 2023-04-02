@@ -11,6 +11,7 @@ use crate::{
     include::bindings::bindings::{timespec, useconds_t, Cpu_tsc_freq},
     kdebug,
     syscall::SystemError,
+    time::timer::clock,
 };
 
 use super::{
@@ -93,10 +94,7 @@ pub fn us_sleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
 ///
 /// @return Err(SystemError) 错误码
 #[no_mangle]
-pub extern "C" fn rs_nanosleep(
-    sleep_time: *const timespec,
-    rm_time: *mut timespec,
-) -> i32 {
+pub extern "C" fn rs_nanosleep(sleep_time: *const timespec, rm_time: *mut timespec) -> i32 {
     if sleep_time == null_mut() {
         return SystemError::EINVAL.to_posix_errno();
     }
@@ -104,6 +102,13 @@ pub extern "C" fn rs_nanosleep(
         tv_sec: unsafe { *sleep_time }.tv_sec,
         tv_nsec: unsafe { *sleep_time }.tv_nsec,
     };
+    kdebug!("rm_time address = {:p}",rm_time);
+    kdebug!(
+        "slt_spec.tv_sec = {:?},slt_spec.tv_nsec = {:?}\nclock = {:?}",
+        slt_spec.tv_sec,
+        slt_spec.tv_nsec,
+        clock()
+    );
 
     match nano_sleep(slt_spec) {
         Ok(value) => {
@@ -111,6 +116,12 @@ pub extern "C" fn rs_nanosleep(
                 unsafe { *rm_time }.tv_sec = value.tv_sec;
                 unsafe { *rm_time }.tv_nsec = value.tv_nsec;
             }
+            kdebug!(
+                "value.tv_sec = {:?}, value.tv_nsec = {:?}\nclock = {:?}",
+                value.tv_sec,
+                value.tv_nsec,
+                clock()
+            );
             kdebug!("nano_sleep_c run successfully");
             return 0;
         }

@@ -59,7 +59,7 @@ int video_refresh_daemon(void *unused)
 
     for (;;)
     {
-        if (clock() >= video_refresh_expire_jiffies)
+        if (rs_clock() >= video_refresh_expire_jiffies)
         {
 
             if (likely(video_refresh_target != NULL))
@@ -87,7 +87,7 @@ void video_refresh_framebuffer(void *data)
 {
     if (unlikely(video_daemon_pcb == NULL))
         return;
-    if (clock() >= video_refresh_expire_jiffies)
+    if (rs_clock() >= video_refresh_expire_jiffies)
     {
         video_daemon_pcb->virtual_runtime = 0;
         process_wakeup(video_daemon_pcb);

@@ -57,7 +57,6 @@ use smoltcp::{
     time::{Duration, Instant},
     wire::{IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr},
 };
-use virtio_drivers::device;
 
 // <3>
 use crate::{
@@ -67,9 +66,9 @@ use crate::{
         virtio::transport_pci::PciTransport,
     },
     filesystem::vfs::ROOT_INODE,
-    include::bindings::bindings::{process_do_exit,  BLACK, GREEN},
+    include::bindings::bindings::{process_do_exit, BLACK, GREEN},
     net::{socket::SocketOptions, Socket},
-    time::{timekeep::ktime_get_real_ns, sleep::us_sleep, TimeSpec, timer::schedule_timeout},
+    time::{sleep::us_sleep, timekeep::ktime_get_real_ns, timer::schedule_timeout, TimeSpec},
 };
 
 // 声明全局的slab分配器
@@ -128,7 +127,7 @@ pub extern "C" fn __rust_demo_func() -> i32 {
 
 fn func() {
     let binding = NET_DRIVERS.write();
-    
+
     let device = unsafe {
         (binding.get(&0).unwrap().as_ref() as *const dyn NetDriver
             as *const VirtioNICDriver<PciTransport> as *mut VirtioNICDriver<PciTransport>)
@@ -160,14 +159,12 @@ fn func() {
     let mut sockets = SocketSet::new(vec![]);
     let dhcp_handle = sockets.add(dhcp_socket);
 
-    // kdebug!("初始化 !!!");
-    
-    loop {
+    const DHCP_TRY_ROUND: u8 = 10;
+    for _ in 0..DHCP_TRY_ROUND {
         let timestamp = Instant::from_micros(ktime_get_real_ns());
-        kdebug!("to poll");
+
         let _flag = net_face.inner_iface.poll(timestamp, device, &mut sockets);
-        schedule_timeout(1000);
-        kdebug!("1234");
+        schedule_timeout(1000).ok();
         let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
         // kdebug!("event = {event:?} !!!");
 
@@ -175,16 +172,22 @@ fn func() {
             None => {}
 
             Some(dhcpv4::Event::Configured(config)) => {
+                // kdebug!("Find Config!! {config:?}");
+                // kdebug!("Find ip address: {}", config.address);
+                // kdebug!("iface.ip_addrs={:?}", net_face.inner_iface.ip_addrs());
                 set_ipv4_addr(&mut net_face.inner_iface, config.address);
-
-                kdebug!("Find Config!! {config:?}");
-
                 if let Some(router) = config.router {
                     net_face
                         .inner_iface
                         .routes_mut()
                         .add_default_ipv4_route(router)
                         .unwrap();
+                    let cidr = net_face.inner_iface.ip_addrs().first();
+                    if cidr.is_some() {
+                        let cidr = cidr.unwrap();
+                        kinfo!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr,)
+                    }
+                    break;
                 } else {
                     net_face
                         .inner_iface
@@ -205,24 +208,18 @@ fn func() {
                     .remove_default_ipv4_route();
             }
         }
-        schedule_timeout(200);
-
-        // phy_wait(fd, net_face.inner_iface.poll_delay(timestamp, &sockets)).expect("wait error");
     }
 }
 
 fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
-    kdebug!("set cidr = {cidr:?}");
-
-    return;
+    // kdebug!("set cidr = {cidr:?}");
 
     iface.update_ip_addrs(|addrs| {
-        kdebug!("addrs = {addrs:?}");
-
         let dest = addrs.iter_mut().next();
-
         if let None = dest {
-            kerror!("Dest is None?");
+            addrs
+                .push(IpCidr::Ipv4(cidr))
+                .expect("Push ipCidr failed: full");
         } else {
             let dest = dest.unwrap();
             *dest = IpCidr::Ipv4(cidr);

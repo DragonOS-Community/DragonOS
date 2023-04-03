@@ -29,7 +29,7 @@ QEMU_RTC_CLOCK="clock=host,base=localtime"
 QEMU_SERIAL="file:../serial_opt.txt"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 
-QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -nic user,model=virtio  -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel}"
+QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -nic user,model=virtio-net-pci -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel}"
 
 QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d -monitor ${QEMU_MONITOR} -d ${qemu_trace_std} "
 

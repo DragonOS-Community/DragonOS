@@ -11,7 +11,8 @@ use crate::{
     include::bindings::bindings::usleep,
     kdebug, kerror, kinfo, kwarn,
     libs::rwlock::RwLock,
-    net::{Interface, NET_FACES}, time::timer::schedule_timeout,
+    net::{Interface, NET_FACES},
+    time::timer::schedule_timeout,
 };
 
 use super::NetDriver;
@@ -22,7 +23,7 @@ pub struct VirtioNICDriver<T: Transport> {
 }
 
 impl<T: 'static + Transport> VirtioNICDriver<T> {
-    pub fn new(driver_net: VirtIONet<HalImpl, T>) -> Arc<Self> {
+    pub fn new(driver_net: VirtIONet<HalImpl, T, 2>) -> Arc<Self> {
         let mut iface_config = smoltcp::iface::Config::new();
 
         // todo: 随机设定这个值。
@@ -30,10 +31,10 @@ impl<T: 'static + Transport> VirtioNICDriver<T> {
         iface_config.random_seed = 12345;
 
         iface_config.hardware_addr = Some(wire::HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress(driver_net.mac()),
+            smoltcp::wire::EthernetAddress(driver_net.mac_address()),
         ));
 
-        let mut inner = RwLock::new(InnerVirtIONet {
+        let inner = RwLock::new(InnerVirtIONet {
             virtio_net: driver_net,
             self_ref: Weak::new(),
             net_device_id: generate_nic_id(),
@@ -58,16 +59,12 @@ impl<T: 'static + Transport> VirtioNICDriver<T> {
 
         return result;
     }
-
-    pub fn notify_rx_queue(&self){
-        self.inner.write().virtio_net.transport.notify(0);
-    }
 }
 
 /// @brief Virtio网络设备驱动(不加锁, 仅供内部使用)
 pub struct InnerVirtIONet<T: Transport> {
     /// Virtio网络设备
-    virtio_net: VirtIONet<HalImpl, T>,
+    virtio_net: VirtIONet<HalImpl, T, 2>,
     /// 自引用
     self_ref: Weak<VirtioNICDriver<T>>,
     /// 网卡ID
@@ -78,16 +75,16 @@ pub struct InnerVirtIONet<T: Transport> {
 }
 
 pub struct VirtioNetToken<T: Transport> {
-    data: Box<[u8]>,
     driver: Arc<VirtioNICDriver<T>>,
+    rx_buffer: Option<virtio_drivers::device::net::RxBuffer>,
 }
 
 impl<'a, T: Transport> VirtioNetToken<T> {
-    pub fn new(driver: Arc<VirtioNICDriver<T>>) -> Self {
-        return Self {
-            data: Box::new([0u8; 2000]),
-            driver: driver,
-        };
+    pub fn new(
+        driver: Arc<VirtioNICDriver<T>>,
+        rx_buffer: Option<virtio_drivers::device::net::RxBuffer>,
+    ) -> Self {
+        return Self { driver, rx_buffer };
     }
 }
 
@@ -100,31 +97,26 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // self.notify_rx_queue();
-        self.inner.write().virtio_net.transport.notify(0);
-        let driver_net = self.inner.read();
+        // self.inner.write().virtio_net.transport.notify(0);
+        let mut driver_net = self.inner.write();
 
-        schedule_timeout(800);
-            if driver_net.virtio_net.can_recv() {
-                kdebug!("can recv");
-                return Some((
-                    VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
-                    VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
-                ));
-            } else {
-                kwarn!("virtio net : cannot receive");
-                return None;
-            }
-        
-        // return Some((
-        //     VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
-        //     VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
-        // ));
+        match driver_net.virtio_net.receive() {
+            Ok(buf) => Some((
+                VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap(), Some(buf)),
+                VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap(), None),
+            )),
+            Err(virtio_drivers::Error::NotReady) => None,
+            Err(err) => panic!("VirtIO receive failed: {}", err),
+        }
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         let driver_net = self.inner.read();
         if driver_net.virtio_net.can_send() {
-            return Some(VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()));
+            return Some(VirtioNetToken::new(
+                driver_net.self_ref.upgrade().unwrap(),
+                None,
+            ));
         } else {
             return None;
         }
@@ -145,54 +137,54 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
 }
 
 impl<T: Transport> phy::TxToken for VirtioNetToken<T> {
-    fn consume<R, F>(mut self, len: usize, f: F) -> R
+    fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        kdebug!("send");
-        let result = f(&mut self.data[..len]);
-        // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
+        // // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
+
         let mut driver_net = self.driver.inner.write();
+        let mut tx_buf = driver_net.virtio_net.new_tx_buffer(len);
+        let result = f(tx_buf.packet_mut());
         driver_net
             .virtio_net
-            .send(&self.data[..len])
+            .send(tx_buf)
             .expect("virtio_net send failed");
-
         return result;
     }
 }
 
 impl<T: Transport> phy::RxToken for VirtioNetToken<T> {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        kdebug!("receive");
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
-        let mut driver_net = self.driver.inner.write();
-        let len = driver_net
+        let mut rx_buf = self.rx_buffer.unwrap();
+        let result = f(rx_buf.packet_mut());
+        self.driver
+            .inner
+            .write()
             .virtio_net
-            .recv(&mut self.data)
+            .recycle_rx_buffer(rx_buf)
             .expect("virtio_net recv failed");
-        return f(&mut self.data[..len]);
+        result
     }
 }
 
 /// @brief virtio-net 驱动的初始化与测试
 pub fn virtio_net<T: Transport + 'static>(transport: T) {
-    let driver_net: VirtIONet<HalImpl, T> = match VirtIONet::<HalImpl, T>::new(transport) {
-        Ok(net) => net,
-        Err(_) => {
-            kerror!("VirtIONet init failed");
-            return;
-        }
-    };
-    let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac());
+    let driver_net: VirtIONet<HalImpl, T, 2> =
+        match VirtIONet::<HalImpl, T, 2>::new(transport, 4096) {
+            Ok(net) => net,
+            Err(_) => {
+                kerror!("VirtIONet init failed");
+                return;
+            }
+        };
+    let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac_address());
     let driver: Arc<VirtioNICDriver<T>> = VirtioNICDriver::new(driver_net);
 
-    let x = driver.inner.read().virtio_net.can_recv();
-    let y = driver.inner.read().virtio_net.can_send();
-    kdebug!("INIT: can_recv={x}, can_send={y}");
     kinfo!(
         "Virtio-net driver init successfully!\tNetDevID: [{}], MAC: [{}]",
         driver.name(),
@@ -204,7 +196,7 @@ impl<T: Transport> Driver for VirtioNICDriver<T> {}
 
 impl<T: Transport> NetDriver for VirtioNICDriver<T> {
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
-        let mac: [u8; 6] = self.inner.read().virtio_net.mac();
+        let mac: [u8; 6] = self.inner.read().virtio_net.mac_address();
         return smoltcp::wire::EthernetAddress::from_bytes(&mac);
     }
 

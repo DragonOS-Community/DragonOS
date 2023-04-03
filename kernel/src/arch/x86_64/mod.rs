@@ -6,3 +6,4 @@ pub mod interrupt;
 pub mod mm;
 pub mod rand;
 pub mod sched;
+pub mod fpu;

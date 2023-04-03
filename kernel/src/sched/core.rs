@@ -8,10 +8,11 @@ use crate::{
     },
     include::bindings::bindings::smp_get_total_cpu,
     include::bindings::bindings::{
-        process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
-        SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
+        process_control_block, pt_regs, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING, SCHED_FIFO,
+        SCHED_NORMAL, SCHED_RR,
     },
-    process::process::process_cpu
+    process::process::process_cpu,
+    syscall::SystemError,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
@@ -175,7 +176,7 @@ pub extern "C" fn sys_sched(regs: &'static mut pt_regs) -> u64 {
     cli();
     // 进行权限校验，拒绝用户态发起调度
     if user_mode(regs) {
-        return (-(EPERM as i64)) as u64;
+        return SystemError::EPERM.to_posix_errno() as u64;
     }
     // 根据调度结果统一进行切换
     let pcb = __sched();
@@ -204,7 +205,7 @@ pub extern "C" fn sched_migrate_process(
 ) -> i32 {
     if target > MAX_CPU_NUM.try_into().unwrap() {
         // panic!("sched_migrate_process: target > MAX_CPU_NUM");
-        return -(EINVAL as i32);
+        return SystemError::EINVAL.to_posix_errno();
     }
 
     pcb.flags |= PF_NEED_MIGRATE as u64;

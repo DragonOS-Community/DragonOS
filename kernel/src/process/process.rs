@@ -6,14 +6,18 @@ use core::{
 use alloc::boxed::Box;
 
 use crate::{
-    arch::asm::current::current_pcb,
-    filesystem::vfs::file::{File, FileDescriptorVec},
+    arch::{asm::current::current_pcb, fpu::FpState},
+    filesystem::vfs::{
+        file::{File, FileDescriptorVec, FileMode},
+        ROOT_INODE,
+    },
     include::bindings::bindings::{
-        process_control_block, CLONE_FS, EBADF, EFAULT, ENFILE, EPERM, PROC_INTERRUPTIBLE,
-        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
+        process_control_block, CLONE_FS, PROC_INTERRUPTIBLE, PROC_RUNNING, PROC_STOPPED,
+        PROC_UNINTERRUPTIBLE,
     },
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
+    syscall::SystemError,
 };
 
 use super::preempt::{preempt_disable, preempt_enable};
@@ -112,11 +116,11 @@ pub fn process_is_executing(pcb: *const process_control_block) -> bool {
 impl process_control_block {
     /// @brief 初始化进程PCB的文件描述符数组。
     /// 请注意，如果当前进程已经有文件描述符数组，那么本操作将被禁止
-    pub fn init_files(&mut self) -> Result<(), i32> {
+    pub fn init_files(&mut self) -> Result<(), SystemError> {
         if self.fds != null_mut() {
             // 这个操作不被允许，否则会产生内存泄露。
             // 原因是，C的pcb里面，文件描述符数组的生命周期是static的，如果继续执行，会产生内存泄露的问题。
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         }
         let fd_vec: &mut FileDescriptorVec = Box::leak(FileDescriptorVec::new());
         self.fds = fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
@@ -129,12 +133,12 @@ impl process_control_block {
     /// @param from 源pcb。从它里面拷贝文件描述符
     ///
     /// @return Ok(()) 拷贝成功
-    /// @return Err(i32) 拷贝失败，错误码
+    /// @return Err(SystemError) 拷贝失败，错误码
     pub fn copy_files(
         &mut self,
         clone_flags: u64,
         from: &'static process_control_block,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         // 不拷贝父进程的文件描述符
         if clone_flags & CLONE_FS as u64 != 0 {
             // 由于拷贝pcb的时候，直接copy的指针，因此这里置为空
@@ -151,7 +155,7 @@ impl process_control_block {
         };
 
         // 拷贝文件描述符数组
-        let new_fd_vec: &mut FileDescriptorVec = Box::leak(Box::new(old_fds.clone()));
+        let new_fd_vec: &mut FileDescriptorVec = Box::leak(old_fds.clone());
 
         self.fds = new_fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
 
@@ -159,7 +163,7 @@ impl process_control_block {
     }
 
     /// @brief 释放文件描述符数组。本函数会drop掉整个文件描述符数组，并把pcb的fds字段设置为空指针。
-    pub fn exit_files(&mut self) -> Result<(), i32> {
+    pub fn exit_files(&mut self) -> Result<(), SystemError> {
         if self.fds.is_null() {
             return Ok(());
         }
@@ -173,9 +177,12 @@ impl process_control_block {
 
     /// @brief 申请文件描述符，并把文件对象存入其中。
     ///
+    /// @param file 要存放的文件对象
+    /// @param fd 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
+    ///
     /// @return Ok(i32) 申请到的文件描述符编号
-    /// @return Err(i32) 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(&mut self, file: File) -> Result<i32, i32> {
+    /// @return Err(SystemError) 申请失败，返回错误码，并且，file对象将被drop掉
+    pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
         // 获取pcb的文件描述符数组的引用
         let fds: &mut FileDescriptorVec =
             if let Some(f) = FileDescriptorVec::from_pcb(current_pcb()) {
@@ -187,21 +194,33 @@ impl process_control_block {
                 if r.is_none() {
                     drop(file);
                     // 初始化失败
-                    return Err(-(EFAULT as i32));
+                    return Err(SystemError::EFAULT);
                 }
                 r.unwrap()
             };
 
-        // 寻找空闲的文件描述符
-        let mut cnt = 0;
-        for x in fds.fds.iter_mut() {
+        if fd.is_some() {
+            // 指定了要申请的文件描述符编号
+            let new_fd = fd.unwrap();
+            let x = &mut fds.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Box::new(file));
-                return Ok(cnt);
+                return Ok(new_fd);
+            } else {
+                return Err(SystemError::EBADF);
             }
-            cnt += 1;
+        } else {
+            // 寻找空闲的文件描述符
+            let mut cnt = 0;
+            for x in fds.fds.iter_mut() {
+                if x.is_none() {
+                    *x = Some(Box::new(file));
+                    return Ok(cnt);
+                }
+                cnt += 1;
+            }
+            return Err(SystemError::ENFILE);
         }
-        return Err(-(ENFILE as i32));
     }
 
     /// @brief 根据文件描述符序号，获取文件结构体的可变引用
@@ -234,17 +253,17 @@ impl process_control_block {
     /// @brief 释放文件描述符，同时关闭文件。
     ///
     /// @param fd 文件描述符序号
-    pub fn drop_fd(&self, fd: i32) -> Result<(), i32> {
+    pub fn drop_fd(&self, fd: i32) -> Result<(), SystemError> {
         // 判断文件描述符的数字是否超过限制
         if !FileDescriptorVec::validate_fd(fd) {
-            return Err(-(EBADF as i32));
+            return Err(SystemError::EBADF);
         }
         let r: &mut FileDescriptorVec = FileDescriptorVec::from_pcb(current_pcb()).unwrap();
 
         let f: Option<&File> = r.fds[fd as usize].as_deref();
         if f.is_none() {
             // 如果文件描述符不存在，报错
-            return Err(-(EBADF as i32));
+            return Err(SystemError::EBADF);
         }
         // 释放文件
         drop(f);
@@ -259,7 +278,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数。
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_interruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_interruptible(&mut self) {
         self.state = PROC_INTERRUPTIBLE as u64;
     }
 
@@ -267,7 +287,8 @@ impl process_control_block {
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数
     ///
     /// 由于本函数可能造成进程不再被调度，因此标记为unsafe
-    pub unsafe fn mark_sleep_uninterruptible(&mut self){
+    #[allow(dead_code)]
+    pub unsafe fn mark_sleep_uninterruptible(&mut self) {
         self.state = PROC_UNINTERRUPTIBLE as u64;
     }
 }
@@ -282,7 +303,7 @@ pub extern "C" fn process_init_files() -> i32 {
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err();
+        return r.unwrap_err().to_posix_errno();
     }
 }
 
@@ -299,7 +320,7 @@ pub extern "C" fn process_copy_files(
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err();
+        return r.unwrap_err().to_posix_errno();
     }
 }
 
@@ -310,12 +331,75 @@ pub extern "C" fn process_copy_files(
 /// @return i32
 #[no_mangle]
 pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) -> i32 {
-    let r: Result<(), i32> = pcb.exit_files();
+    let r: Result<(), SystemError> = pcb.exit_files();
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err();
+        return r.unwrap_err().to_posix_errno();
     }
 }
 
+/// @brief 复制当前进程的浮点状态
+#[allow(dead_code)]
+#[no_mangle]
+pub extern "C" fn rs_dup_fpstate() -> *mut c_void {
+    // 如果当前进程没有浮点状态，那么就返回一个默认的浮点状态
+    if current_pcb().fp_state == null_mut() {
+        return Box::leak(Box::new(FpState::default())) as *mut FpState as usize as *mut c_void;
+    } else {
+        // 如果当前进程有浮点状态，那么就复制一个新的浮点状态
+        let state = current_pcb().fp_state as usize as *mut FpState;
+        unsafe {
+            let s = state.as_ref().unwrap();
+            let state: &mut FpState = Box::leak(Box::new(s.clone()));
+
+            return state as *mut FpState as usize as *mut c_void;
+        }
+    }
+}
+
+/// @brief 释放进程的浮点状态所占用的内存
+#[no_mangle]
+pub extern "C" fn rs_process_exit_fpstate(pcb: &'static mut process_control_block) {
+    if pcb.fp_state != null_mut() {
+        let state = pcb.fp_state as usize as *mut FpState;
+        unsafe {
+            drop(Box::from_raw(state));
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rs_init_stdio() -> i32 {
+    let r = init_stdio();
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
+    }
+}
 // =========== 以上为导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们 END ============
+
+/// @brief 初始化pid=1的进程的stdio
+pub fn init_stdio() -> Result<(), SystemError> {
+    if current_pcb().pid != 1 {
+        return Err(SystemError::EPERM);
+    }
+    let tty_inode = ROOT_INODE()
+        .lookup("/dev/tty0")
+        .expect("Init stdio: can't find tty0");
+    let stdin =
+        File::new(tty_inode.clone(), FileMode::O_RDONLY).expect("Init stdio: can't create stdin");
+    let stdout =
+        File::new(tty_inode.clone(), FileMode::O_WRONLY).expect("Init stdio: can't create stdout");
+    let stderr = File::new(tty_inode.clone(), FileMode::O_WRONLY | FileMode::O_SYNC)
+        .expect("Init stdio: can't create stderr");
+
+    /*
+       按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
+    */
+    assert_eq!(current_pcb().alloc_fd(stdin, None).unwrap(), 0);
+    assert_eq!(current_pcb().alloc_fd(stdout, None).unwrap(), 1);
+    assert_eq!(current_pcb().alloc_fd(stderr, None).unwrap(), 2);
+    return Ok(());
+}

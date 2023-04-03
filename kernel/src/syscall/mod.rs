@@ -1,5 +1,7 @@
+use num_traits::{FromPrimitive, ToPrimitive};
+
 #[repr(i32)]
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
 #[allow(dead_code)]
 pub enum SystemError {
     /// 参数列表过长，或者在输出buffer中缺少空间 或者参数比系统内建的最大值要大 Argument list too long.
@@ -164,4 +166,20 @@ pub enum SystemError {
     EWOULDBLOCK = 80,
     /// 跨设备连接 Cross-device link.
     EXDEV = 81,
+}
+
+impl SystemError {
+    /// @brief 把posix错误码转换为系统错误枚举类型。
+    pub fn from_posix_errno(errno: i32) -> Option<SystemError> {
+        // posix 错误码是小于0的
+        if errno >= 0 {
+            return None;
+        }
+        return <Self as FromPrimitive>::from_i32(-errno);
+    }
+
+    /// @brief 把系统错误枚举类型转换为负数posix错误码。
+    pub fn to_posix_errno(&self) -> i32 {
+        return -<Self as ToPrimitive>::to_i32(self).unwrap();
+    }
 }

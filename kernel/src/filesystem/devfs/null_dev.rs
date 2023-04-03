@@ -4,7 +4,7 @@ use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
 };
 use crate::{
-    include::bindings::bindings::{EINVAL, ENOTSUP},
+    syscall::SystemError,
     libs::spinlock::SpinLock,
     time::TimeSpec,
 };
@@ -73,15 +73,15 @@ impl IndexNode for LockedNullInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
-        Err(-(ENOTSUP as i32))
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+        Err(SystemError::ENOTSUP)
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
-        Err(-(ENOTSUP as i32))
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+        Err(SystemError::ENOTSUP)
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
     }
 
@@ -89,11 +89,11 @@ impl IndexNode for LockedNullInode {
         return self.0.lock().fs.upgrade().unwrap();
     }
 
-    fn list(&self) -> Result<Vec<String>, i32> {
-        Err(-(ENOTSUP as i32))
+    fn list(&self) -> Result<Vec<String>, SystemError> {
+        Err(SystemError::ENOTSUP)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -105,7 +105,7 @@ impl IndexNode for LockedNullInode {
         return Ok(());
     }
 
-    fn poll(&self) -> Result<PollStatus, i32> {
+    fn poll(&self) -> Result<PollStatus, SystemError> {
         return Ok(PollStatus {
             flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
         });
@@ -118,9 +118,9 @@ impl IndexNode for LockedNullInode {
         len: usize,
         buf: &mut [u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         if buf.len() < len {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         for i in 0..len {
@@ -137,9 +137,9 @@ impl IndexNode for LockedNullInode {
         len: usize,
         buf: &[u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         if buf.len() < len {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         Ok(len)

@@ -6,6 +6,7 @@ use core::fmt::Debug;
 
 use alloc::vec::Vec;
 
+use crate::arch::fpu::FpState;
 use crate::include::bindings::bindings::NULL;
 // todo: 将这里更换为手动编写的ffi绑定
 use crate::include::bindings::bindings::atomic_t;
@@ -664,4 +665,5 @@ pub struct signal_stack {
     pub sp: *mut c_void,
     pub flags: u32,
     pub size: u32,
+    pub fpstate:FpState,
 }

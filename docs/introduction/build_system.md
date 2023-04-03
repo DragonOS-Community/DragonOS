@@ -9,7 +9,26 @@
 
 &emsp;&emsp;对于Linux发行版，建议使用Ubuntu22、Debian、Arch Linux这样的，仓库软件版本较新的发行版，这能为您减少很多麻烦。
 
-### 使用一键初始化脚本进行安装
+### 1.1 下载DragonOS的源代码
+
+&emsp;&emsp;假设您的计算机上已经安装了git，您可以通过以下命令，获得DragonOS的最新的源代码：
+
+```shell
+git clone https://github.com/DragonOS-Community/DragonOS
+cd DragonOS
+```
+
+:::{warning}
+DragonOS的源代码托管在Github上，但是，由于Github在国内的访问速度较慢，因此，我们建议您在github上绑定您的电脑的**ssh公钥**，
+然后通过以下命令来克隆代码，防止频繁出现git clone、pull、push失败的情况。
+
+```shell
+git clone git@github.com:DragonOS-Community/DragonOS.git
+```
+:::
+
+## 2.使用一键初始化脚本进行安装（推荐）
+
 
 &emsp;&emsp;我们提供了一键初始化脚本，可以一键安装，只需要在控制台运行以下命令：
 
@@ -26,20 +45,27 @@ bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依�
 欢迎您为其他的系统完善构建脚本！
 :::
 
-**如果一键初始化脚本能够正常运行，并输出最终的“祝贺”界面(如下所示)，那么恭喜你，可以直接跳到{ref}`这里 <_get_dragonos_source_code>`进行阅读！**
+**如果一键初始化脚本能够正常运行，并输出最终的“祝贺”界面(如下所示)，请关闭当前终端，然后重新打开。**
+
 
 ```shell
 |-----------Congratulations!---------------|
 |                                          |
 |   你成功安装了DragonOS所需的依赖项!          |
-|   您可以通过以下命令运行它:                  |
 |                                          |
-|   make run-docker -j 你的cpu核心数         |
+|   请关闭当前终端, 并重新打开一个终端          |
+|   然后通过以下命令运行:                     |
+|                                          |
+|                make run                  |
 |                                          |
 |------------------------------------------|
 ```
 
-### 依赖清单（手动安装）
+**接着，请直接跳到{ref}`编译命令讲解 <_build_system_command>`进行阅读！**
+
+## 3.手动安装
+
+### 3.1 依赖清单
 
 &emsp;&emsp;如果自动安装脚本不能支持您的操作系统，那么您需要手动安装依赖程序。以下是依赖项的清单：
 
@@ -84,13 +110,13 @@ sudo make install
 请注意，编译安装的QEMU，将通过VNC模式进行链接，因此，您还需要在您的计算机上安装VNC viewer以连接至QEMU虚拟机。
 :::
 
-### 安装Docker
+### 3.2 安装Docker
 
 &emsp;&emsp;您可以在docker官网下载安装docker-ce.
 
 > 详细信息请转到： [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/)
 
-### 安装Rust
+### 3.3 安装Rust
 
 :::{warning}
 **【常见误区】**：如果您打算采用docker进行编译，尽管docker镜像中已经安装了Rust编译环境，但是，为了能够在VSCode中使用Rust-Analyzer进行代码提示，以及`make clean`命令能正常运行，您的客户机上仍然需要安装rust环境。
@@ -129,44 +155,18 @@ rustup target add x86_64-unknown-none
 # Rust安装完成
 ```
 
-### 解决KVM权限问题
-
-&emsp;&emsp;在部分计算机上，可能由于权限问题而无法启动虚拟机，我们可以通过把当前用户加到kvm用户组的方式，解决该问题：
-
-```shell
-# 解决kvm权限问题
-USR=$USER
-sudo adduser $USR kvm
-sudo chown $USR /dev/kvm
-```
-
-(_get_dragonos_source_code)=
-### 下载DragonOS的源代码
-
-&emsp;&emsp;假设您的计算机上已经安装了git，您可以通过以下命令，获得DragonOS的最新的源代码：
-
-```shell
-git clone https://github.com/fslongjin/DragonOS
-cd DragonOS
-```
-
 **至此，公共依赖项已经安装完成，您可以根据自己的需要，阅读后续章节**
 
-## 2.从Docker构建（推荐）
+**关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
 
-&emsp;&emsp;为减轻配置环境的负担，DragonOS发布了一个Docker编译环境，便于开发者运行DragonOS。我们强烈建议您采用这种方式来运行DragonOS。
+## 4.从Docker构建（不推荐）
+
+&emsp;&emsp;DragonOS发布了一个Docker编译环境，便于开发者运行DragonOS。但是，由于编码过程仍需要在客户机上进行，因此，您需要在客户机上安装Rust编译环境。
 
 &emsp;&emsp;本节假设以下操作均在Linux下进行。
 
-### 获取DragonOS编译镜像
 
-&emsp;&emsp;当您成功安装了docker之后，您可以通过以下命令，下载DragonOS的编译镜像：
-
-```shell
-docker pull dragonos/dragonos-dev:v1.1.0-beta3
-```
-
-### 安装qemu虚拟机
+### 4.1 安装qemu虚拟机
 
 &emsp;&emsp;在本节中，我们建议您采用命令行安装qemu：
 
@@ -174,7 +174,7 @@ docker pull dragonos/dragonos-dev:v1.1.0-beta3
 sudo apt install -y qemu qemu-system qemu-kvm
 ```
 
-### 创建磁盘镜像
+### 4.2 创建磁盘镜像
 
 &emsp;&emsp;首先，您需要使用tools文件夹下的create_hdd_image.sh，创建一块虚拟磁盘镜像。您需要在tools文件夹下运行此命令。
 
@@ -182,7 +182,7 @@ sudo apt install -y qemu qemu-system qemu-kvm
 bash create_hdd_image.sh
 ```
 
-### 运行DragonOS
+### 4.3 运行DragonOS
 
 &emsp;&emsp;如果不出意外的话，这将是运行DragonOS的最后一步。您只需要在DragonOS的根目录下方，执行以下命令，即可运行DragonOS。
 
@@ -195,36 +195,21 @@ make run-docker
 &emsp;&emsp;在qemu虚拟机被启动后，我们需要在控制台输入字母`c`，然后回车。这样，虚拟机就会开始执行。
 
 :::{note}
-(1) 首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！
-(2) 输入命令可能需要加上sudo
+1. 首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！
+2. 输入命令可能需要加上sudo
 :::
 
 **关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
 
-## 3.在本机中直接编译
+## 5.其他注意事项
 
-&emsp;&emsp;若您追求快速的编译速度，以及完整的开发调试支持，且愿意花费半个小时来配置开发环境的话，该小节的内容能帮助到您。
+### 5.1 创建磁盘镜像
 
-### 软件依赖
-
-&emsp;&emsp;您需要通过以下命令，获取您本机安装的Grub的版本：
-
-```shell
-grub-install --version
-```
-
-&emsp;&emsp;**如果显示的版本号为2.06及以上，且您已经按照第一小节中的内容，安装相关的依赖，那么，恭喜您，您可以直接在本机编译DragonOS!**
-
-&emsp;&emsp;否则，您需要编译安装Grub-2.06。它的源代码可以通过[https://ftp.gnu.org/gnu/grub/grub-2.06.tar.gz](https://ftp.gnu.org/gnu/grub/grub-2.06.tar.gz)获得。
-
-- grub 2.06 (不必使用sudo权限进行install)
-
-### 创建磁盘镜像
-
-&emsp;&emsp;首先，您需要使用`sudo`权限运行`tools/create_hdd_image.sh`，为DragonOS创建一块磁盘镜像文件。该脚本会自动完成创建磁盘镜像的工作，并将其移动到`bin/`目录下。
+&emsp;&emsp;首先，您需要使用**普通用户**权限运行`tools/create_hdd_image.sh`，为DragonOS创建一块磁盘镜像文件。该脚本会自动完成创建磁盘镜像的工作，并将其移动到`bin/`目录下。
+&emsp;&emsp;请注意，由于权限问题，请务必使用**普通用户**权限运行此脚本。（运行后，需要提升权限时，系统可能会要求您输入密码）
 
 
-### 编译、运行DragonOS
+### 5.2 编译、运行DragonOS
 
 1. 安装编译及运行环境
 2. 进入DragonOS文件夹
@@ -240,7 +225,7 @@ grub-install --version
 **关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
 
 (_build_system_command)=
-## 4.编译命令讲解
+## 6.编译命令讲解
 
 - 本地编译，不运行: `make all -j 您的CPU核心数`
 - 本地编译，并写入磁盘镜像，不运行: `make build`
@@ -248,3 +233,7 @@ grub-install --version
 - Docker编译，并写入磁盘镜像,: `make docker`
 - Docker编译，写入磁盘镜像，并在QEMU中运行: `make run-docker`
 - 不编译，直接从已有的磁盘镜像启动: `make qemu`
+
+:::{note}
+如果您需要在vnc中运行DragonOS，请在上述命令后加上`-vnc`后缀。如：`make run-vnc`
+:::

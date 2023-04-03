@@ -59,8 +59,8 @@ struct lockref
 ### 4.1. 引用计数自增
 
 - `pub fn inc(&mut self)`
-- `pub fn inc_not_zero(&mut self) -> Result<i32, i32>`
-- `pub fn inc_not_dead(&mut self) -> Result<i32, i32>`
+- `pub fn inc_not_zero(&mut self) -> Result<i32, SystemError>`
+- `pub fn inc_not_dead(&mut self) -> Result<i32, SystemError>`
 
 #### 4.1.1. inc
 
@@ -83,7 +83,7 @@ struct lockref
 |   返回值          |      说明    |
 |   :---        |   :---      |
 | Ok(self.count) | 成功，返回新的引用计数 |
-| Err(-1)       | 失败，返回-1 |
+| Err(SystemError::EPERM)       | 失败，返回EPERM |
 
 #### 4.1.3. inc_not_dead
 
@@ -96,19 +96,19 @@ struct lockref
 |   返回值          |      说明    |
 |   :---        |   :---      |
 | Ok(self.count) | 成功，返回新的引用计数 |
-| Err(-1)       | 失败，返回-1 |
+| Err(SystemError::EPERM)       | 失败，返回EPERM |
 
 ### 4.2. 引用计数自减
-- `pub fn dec(&mut self) -> Result<i32, i32>`
-- `pub fn dec_return(&mut self) -> Result<i32, i32>`
-- `pub fn dec_not_zero(&mut self) -> Result<i32, i32>`
-- `pub fn dec_or_lock_not_zero(&mut self) -> Result<i32, i32>`
+- `pub fn dec(&mut self) -> Result<i32, SystemError>`
+- `pub fn dec_return(&mut self) -> Result<i32, SystemError>`
+- `pub fn dec_not_zero(&mut self) -> Result<i32, SystemError>`
+- `pub fn dec_or_lock_not_zero(&mut self) -> Result<i32, SystemError>`
 
 #### 4.2.1. dec
 
 ##### 说明
 
-&emsp;&emsp;原子地将引用计数-1。如果已处于count≤0的状态，则返回Err(-1)
+&emsp;&emsp;原子地将引用计数-1。如果已处于count≤0的状态，则返回Err(SystemError::EPERM)
 
 &emsp;&emsp;本函数与`lockref_dec_return()`的区别在于，当在`cmpxchg()`中检测到`count<=0`或已加锁，本函数会再次尝试通过加锁来执行操作，而`lockref_dec_return()`会直接返回错误
 
@@ -117,11 +117,11 @@ struct lockref
 |   返回值          |      说明    |
 |   :---        |   :---      |
 | Ok(self.count) | 成功，返回新的引用计数 |
-| Err(-1)       | 失败，返回-1 |
+| Err(SystemError::EPERM)       | 失败，返回EPERM |
 
 #### 4.2.2. dec_return
 
-&emsp;&emsp;原子地将引用计数减1。如果处于已加锁或count≤0的状态，则返回-1
+&emsp;&emsp;原子地将引用计数减1。如果处于已加锁或count≤0的状态，则返回SystemError::EPERM
 
 &emsp;&emsp;本函数与`lockref_dec()`的区别在于，当在`cmpxchg()`中检测到`count<=0`或已加锁，本函数会直接返回错误，而`lockref_dec()`会再次尝试通过加锁来执行操作.
 
@@ -134,7 +134,7 @@ struct lockref
 |   返回值          |      说明    |
 |   :---        |   :---      |
 | Ok(self.count) | 成功，返回新的引用计数 |
-| Err(-1)       | 失败，返回-1 |
+| Err(SystemError::EPERM)       | 失败，返回EPERM |
 
 #### 4.2.3. dec_not_zero
 
@@ -149,7 +149,7 @@ struct lockref
 |   返回值          |      说明    |
 |   :---        |   :---      |
 | Ok(self.count) | 成功，返回新的引用计数 |
-| Err(-1)       | 失败，返回-1 |
+| Err(SystemError::EPERM)       | 失败，返回EPERM |
 
 
 #### 4.2.4. dec_or_lock_not_zero
@@ -158,14 +158,14 @@ struct lockref
 
 &emsp;&emsp;原子地将引用计数减1。若当前的引用计数≤1，则操作失败.
 
-&emsp;&emsp;该函数与`lockref_dec_not_zero()`的区别在于，当cmpxchg()时发现`old.count≤1`时，该函数会尝试加锁来进行操作，而`lockref_dec_not_zero()`在这种情况下，会直接返回`Err(-1)`.
+&emsp;&emsp;该函数与`lockref_dec_not_zero()`的区别在于，当cmpxchg()时发现`old.count≤1`时，该函数会尝试加锁来进行操作，而`lockref_dec_not_zero()`在这种情况下，会直接返回`Err(SystemError::EPERM)`.
 
 ##### 返回值
 
 |   返回值          |      说明    |
 |   :---        |   :---      |
 | Ok(self.count) | 成功，返回新的引用计数 |
-| Err(-1)       | 失败，返回-1 |
+| Err(SystemError::EPERM)       | 失败，返回EPERM |
 
 ### 4.3. 其他
 - `pub fn mark_dead(&mut self)`

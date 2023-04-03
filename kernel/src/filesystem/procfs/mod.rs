@@ -15,12 +15,11 @@ use crate::{
         FileType,
     },
     include::bindings::bindings::{
-        pid_t, process_find_pcb_by_pid, EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR,
-        ENOTEMPTY, ENOTSUP, EPERM, ESRCH,
+        pid_t, process_find_pcb_by_pid,
     },
     kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
+    time::TimeSpec, syscall::SystemError,
 };
 
 use super::vfs::{
@@ -114,7 +113,7 @@ impl ProcFSInode {
 
     /// @brief 打开status文件
     ///
-    fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, i32> {
+    fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 获取该pid对应的pcb结构体
         let pid: &i64 = &self.fdata.pid;
         let pcb = unsafe { process_find_pcb_by_pid(*pid).as_mut() };
@@ -123,7 +122,7 @@ impl ProcFSInode {
                 "ProcFS: Cannot find pcb for pid {} when opening its 'status' file.",
                 pid
             );
-            return Err(-(ESRCH as i32));
+            return Err(SystemError::ESRCH);
         } else {
             pcb.unwrap()
         };
@@ -198,13 +197,13 @@ impl ProcFSInode {
         len: usize,
         buf: &mut [u8],
         _pdata: &mut ProcfsFilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let start = _pdata.data.len().min(offset);
         let end = _pdata.data.len().min(offset + len);
 
         // buffer空间不足
         if buf.len() < (end - start) {
-            return Err(-(ENOBUFS as i32));
+            return Err(SystemError::ENOBUFS);
         }
 
         // 拷贝数据
@@ -278,7 +277,7 @@ impl ProcFS {
 
     /// @brief 进程注册函数
     /// @usage 在进程中调用并创建进程对应文件
-    pub fn register_pid(&self, pid: i64) -> Result<(), i32> {
+    pub fn register_pid(&self, pid: i64) -> Result<(), SystemError> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
@@ -300,7 +299,7 @@ impl ProcFS {
 
     /// @brief 解除进程注册
     ///
-    pub fn unregister_pid(&self, pid: i64) -> Result<(), i32> {
+    pub fn unregister_pid(&self, pid: i64) -> Result<(), SystemError> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
@@ -319,7 +318,7 @@ impl ProcFS {
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
+    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
@@ -342,7 +341,7 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
         let guard: SpinLockGuard<ProcFSInode> = self.0.lock();
         // 如果inode类型为文件夹，则直接返回成功
         if let FileType::Dir = guard.metadata.file_type {
@@ -366,16 +365,16 @@ impl IndexNode for LockedProcFSInode {
         len: usize,
         buf: &mut [u8],
         data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         if buf.len() < len {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
         // 加锁
         let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         // 获取数据信息
@@ -398,7 +397,7 @@ impl IndexNode for LockedProcFSInode {
 
         // buffer空间不足
         if buf.len() < (end - start) {
-            return Err(-(ENOBUFS as i32));
+            return Err(SystemError::ENOBUFS);
         }
 
         // 拷贝数据
@@ -413,17 +412,17 @@ impl IndexNode for LockedProcFSInode {
         _len: usize,
         _buf: &[u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
-        return Err(-(ENOTSUP as i32));
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 
-    fn poll(&self) -> Result<PollStatus, i32> {
+    fn poll(&self) -> Result<PollStatus, SystemError> {
         // 加锁
         let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         return Ok(PollStatus {
@@ -439,14 +438,14 @@ impl IndexNode for LockedProcFSInode {
         self
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         let inode = self.0.lock();
         let metadata = inode.metadata.clone();
 
         return Ok(metadata);
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -458,13 +457,13 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn resize(&self, len: usize) -> Result<(), i32> {
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type == FileType::File {
             inode.data.resize(len, 0);
             return Ok(());
         } else {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
     }
 
@@ -474,16 +473,16 @@ impl IndexNode for LockedProcFSInode {
         file_type: FileType,
         mode: u32,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, i32> {
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
         let mut inode = self.0.lock();
         // 如果当前inode不是文件夹，则返回
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
         // 如果有重名的，则返回
         if inode.children.contains_key(name) {
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         }
 
         // 创建inode
@@ -525,26 +524,26 @@ impl IndexNode for LockedProcFSInode {
         return Ok(result);
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), i32> {
+    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let other: &LockedProcFSInode = other
             .downcast_ref::<LockedProcFSInode>()
-            .ok_or(-(EPERM as i32))?;
+            .ok_or(SystemError::EPERM)?;
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
         let mut other_locked: SpinLockGuard<ProcFSInode> = other.0.lock();
 
         // 如果当前inode不是文件夹，那么报错
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         // 如果另一个inode是文件夹，那么也报错
         if other_locked.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         // 如果当前文件夹下已经有同名文件，也报错。
         if inode.children.contains_key(name) {
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         }
 
         inode
@@ -556,19 +555,19 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn unlink(&self, name: &str) -> Result<(), i32> {
+    fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
         // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
-            return Err(-(ENOTEMPTY as i32));
+            return Err(SystemError::ENOTEMPTY);
         }
 
         // 获得要删除的文件的inode
-        let to_delete = inode.children.get(name).ok_or(-(ENOENT as i32))?;
+        let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
         // 在当前目录中删除这个子目录项
@@ -581,36 +580,36 @@ impl IndexNode for LockedProcFSInode {
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
-    ) -> Result<(), i32> {
-        return Err(-(ENOTSUP as i32));
+    ) -> Result<(), SystemError> {
+        return Err(SystemError::ENOTSUP);
     }
 
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inode = self.0.lock();
 
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         match name {
             "" | "." => {
-                return Ok(inode.self_ref.upgrade().ok_or(-(ENOENT as i32))?);
+                return Ok(inode.self_ref.upgrade().ok_or(SystemError::ENOENT)?);
             }
 
             ".." => {
-                return Ok(inode.parent.upgrade().ok_or(-(ENOENT as i32))?);
+                return Ok(inode.parent.upgrade().ok_or(SystemError::ENOENT)?);
             }
             name => {
                 // 在子目录项中查找
-                return Ok(inode.children.get(name).ok_or(-(ENOENT as i32))?.clone());
+                return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
             }
         }
     }
 
-    fn get_entry_name(&self, ino: InodeId) -> Result<String, i32> {
+    fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         match ino {
@@ -631,7 +630,7 @@ impl IndexNode for LockedProcFSInode {
                     .collect();
 
                 match key.len() {
-                        0=>{return Err(-(ENOENT as i32));}
+                        0=>{return Err(SystemError::ENOENT);}
                         1=>{return Ok(key.remove(0));}
                         _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                     }
@@ -639,10 +638,10 @@ impl IndexNode for LockedProcFSInode {
         }
     }
 
-    fn list(&self) -> Result<Vec<String>, i32> {
+    fn list(&self) -> Result<Vec<String>, SystemError> {
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         let mut keys: Vec<String> = Vec::new();
@@ -665,7 +664,7 @@ pub extern "C" fn rs_procfs_register_pid(pid: pid_t) -> u64 {
 }
 
 /// @brief 向procfs注册进程
-pub fn procfs_register_pid(pid: pid_t) -> Result<(), i32> {
+pub fn procfs_register_pid(pid: pid_t) -> Result<(), SystemError> {
     let procfs_inode = ROOT_INODE().find("proc")?;
 
     let procfs_inode = procfs_inode
@@ -691,7 +690,7 @@ pub extern "C" fn rs_procfs_unregister_pid(pid: pid_t) -> u64 {
 }
 
 /// @brief 在ProcFS中,解除进程的注册
-pub fn procfs_unregister_pid(pid: pid_t) -> Result<(), i32> {
+pub fn procfs_unregister_pid(pid: pid_t) -> Result<(), SystemError> {
     // 获取procfs实例
     let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE().find("proc")?;
 

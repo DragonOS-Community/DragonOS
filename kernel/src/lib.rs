@@ -41,7 +41,6 @@ extern crate alloc;
 extern crate bitflags;
 #[macro_use]
 extern crate lazy_static;
-
 extern crate num;
 #[macro_use]
 extern crate num_derive;
@@ -49,6 +48,9 @@ extern crate smoltcp;
 extern crate thingbuf;
 
 use driver::NET_DRIVERS;
+#[cfg(target_arch = "x86_64")]
+extern crate x86;
+
 use mm::allocator::KernelAllocator;
 use smoltcp::{
     iface::{Interface, SocketSet},

@@ -275,7 +275,7 @@ int kthread_stop(struct process_control_block *pcb)
     // 等待指定的内核线程退出
     // todo: 使用completion机制改进这里
     while (target->exited == false)
-        usleep(5000);
+        rs_usleep(5000);
     retval = target->result;
 
     // 释放内核线程的页表

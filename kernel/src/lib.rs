@@ -67,9 +67,9 @@ use crate::{
         virtio::transport_pci::PciTransport,
     },
     filesystem::vfs::ROOT_INODE,
-    include::bindings::bindings::{process_do_exit, BLACK, GREEN},
+    include::bindings::bindings::{process_do_exit,  BLACK, GREEN},
     net::{socket::SocketOptions, Socket},
-    time::timekeep::ktime_get_real_ns,
+    time::{timekeep::ktime_get_real_ns, sleep::us_sleep, TimeSpec, timer::schedule_timeout},
 };
 
 // 声明全局的slab分配器
@@ -128,7 +128,7 @@ pub extern "C" fn __rust_demo_func() -> i32 {
 
 fn func() {
     let binding = NET_DRIVERS.write();
-
+    
     let device = unsafe {
         (binding.get(&0).unwrap().as_ref() as *const dyn NetDriver
             as *const VirtioNICDriver<PciTransport> as *mut VirtioNICDriver<PciTransport>)
@@ -137,7 +137,7 @@ fn func() {
     };
 
     let binding = NET_FACES.write();
-    
+
     let net_face = binding.get(&0).unwrap();
 
     let net_face = unsafe {
@@ -145,6 +145,8 @@ fn func() {
             .as_mut()
             .unwrap()
     };
+
+    drop(binding);
 
     // Create sockets
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -158,16 +160,16 @@ fn func() {
     let mut sockets = SocketSet::new(vec![]);
     let dhcp_handle = sockets.add(dhcp_socket);
 
-    kdebug!("初始化 !!!");
-
+    // kdebug!("初始化 !!!");
+    
     loop {
         let timestamp = Instant::from_micros(ktime_get_real_ns());
-
+        kdebug!("to poll");
         let _flag = net_face.inner_iface.poll(timestamp, device, &mut sockets);
-
+        schedule_timeout(1000);
+        kdebug!("1234");
         let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
-
-        kdebug!("event = {event:?} !!!");
+        // kdebug!("event = {event:?} !!!");
 
         match event {
             None => {}
@@ -190,8 +192,9 @@ fn func() {
                         .remove_default_ipv4_route();
                 }
             }
-            
+
             Some(dhcpv4::Event::Deconfigured) => {
+                kdebug!("deconfigured");
                 set_ipv4_addr(
                     &mut net_face.inner_iface,
                     Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
@@ -202,6 +205,7 @@ fn func() {
                     .remove_default_ipv4_route();
             }
         }
+        schedule_timeout(200);
 
         // phy_wait(fd, net_face.inner_iface.poll_delay(timestamp, &sockets)).expect("wait error");
     }
@@ -210,7 +214,7 @@ fn func() {
 fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
     kdebug!("set cidr = {cidr:?}");
 
-    return ;
+    return;
 
     iface.update_ip_addrs(|addrs| {
         kdebug!("addrs = {addrs:?}");

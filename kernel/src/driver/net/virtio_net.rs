@@ -8,9 +8,10 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use crate::{
     driver::{generate_nic_id, virtio::virtio_impl::HalImpl, Driver, NET_DRIVERS},
-    kdebug, kerror, kinfo,
+    include::bindings::bindings::usleep,
+    kdebug, kerror, kinfo, kwarn,
     libs::rwlock::RwLock,
-    net::{Interface, NET_FACES},
+    net::{Interface, NET_FACES}, time::timer::schedule_timeout,
 };
 
 use super::NetDriver;
@@ -40,7 +41,7 @@ impl<T: 'static + Transport> VirtioNICDriver<T> {
         });
 
         let mut s: VirtioNICDriver<T> = Self { inner };
-        
+
         let iface: Arc<Interface> = Arc::new(Interface::new(smoltcp::iface::Interface::new::<
             VirtioNICDriver<T>,
         >(iface_config, &mut s)));
@@ -56,6 +57,10 @@ impl<T: 'static + Transport> VirtioNICDriver<T> {
         NET_FACES.write().insert(iface.iface_id, iface.clone());
 
         return result;
+    }
+
+    pub fn notify_rx_queue(&self){
+        self.inner.write().virtio_net.transport.notify(0);
     }
 }
 
@@ -94,15 +99,26 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // self.notify_rx_queue();
+        self.inner.write().virtio_net.transport.notify(0);
         let driver_net = self.inner.read();
-        if driver_net.virtio_net.can_recv() {
-            return Some((
-                VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
-                VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
-            ));
-        } else {
-            return None;
-        }
+
+        schedule_timeout(800);
+            if driver_net.virtio_net.can_recv() {
+                kdebug!("can recv");
+                return Some((
+                    VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
+                    VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
+                ));
+            } else {
+                kwarn!("virtio net : cannot receive");
+                return None;
+            }
+        
+        // return Some((
+        //     VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
+        //     VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap()),
+        // ));
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
@@ -133,6 +149,7 @@ impl<T: Transport> phy::TxToken for VirtioNetToken<T> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        kdebug!("send");
         let result = f(&mut self.data[..len]);
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
         let mut driver_net = self.driver.inner.write();
@@ -150,6 +167,7 @@ impl<T: Transport> phy::RxToken for VirtioNetToken<T> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        kdebug!("receive");
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
         let mut driver_net = self.driver.inner.write();
         let len = driver_net
@@ -172,6 +190,9 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac());
     let driver: Arc<VirtioNICDriver<T>> = VirtioNICDriver::new(driver_net);
 
+    let x = driver.inner.read().virtio_net.can_recv();
+    let y = driver.inner.read().virtio_net.can_send();
+    kdebug!("INIT: can_recv={x}, can_send={y}");
     kinfo!(
         "Virtio-net driver init successfully!\tNetDevID: [{}], MAC: [{}]",
         driver.name(),

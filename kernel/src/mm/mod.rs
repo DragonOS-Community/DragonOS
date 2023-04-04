@@ -6,8 +6,6 @@ pub mod allocator;
 pub mod gfp;
 pub mod mmio_buddy;
 pub mod page;
-pub mod bump;
-pub mod page_frame;
 
 /// @brief 将内核空间的虚拟地址转换为物理地址
 #[inline(always)]

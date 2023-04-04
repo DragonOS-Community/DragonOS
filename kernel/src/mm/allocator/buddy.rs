@@ -147,7 +147,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     unsafe fn add_entry(&mut self, entry: BuddyEntry<A>) {
         let order = entry.order;
         // 如果entry.pg_buddy==0，说明entry还没有被使用，那么就将entry添加到free_area中
-        if entry.pg_buddy==0 {
+        if entry.pg_buddy == 0 {
             self.free_area[order].push_back(entry);
         }
         let virt = self.table_virt.add(entry.base.data() >> A::PAGE_SHIFT);
@@ -203,7 +203,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         let start_page = entry.base.data() >> A::PAGE_SHIFT;
         // 设置start_page到start_page+count.data()的entry的pg_buddy位为1
         for i in start_page..(start_page + count.data()) {
-            let mut entry =self.read_entry(i * mem::size_of::<BuddyEntry<A>>());
+            let mut entry = self.read_entry(i * mem::size_of::<BuddyEntry<A>>());
             entry.pg_buddy = 1;
             entry.order = order;
             self.add_entry(entry);
@@ -214,7 +214,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
     unsafe fn free(&mut self, base: PhysAddr, count: PageFrameCount) {
         // 计算base对应的entry的虚拟地址
         let start_page = base.data() >> A::PAGE_SHIFT;
-        let mut entry=self.read_entry(start_page * mem::size_of::<BuddyEntry<A>>());
+        let mut entry = self.read_entry(start_page * mem::size_of::<BuddyEntry<A>>());
 
         // 如果entry的pg_buddy位为0，说明entry已经被释放了，那么就直接返回
         if entry.pg_buddy == 0 {
@@ -232,7 +232,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
             } else {
                 start_page - 1
             };
-            let mut buddy=self.read_entry(buddy_page * mem::size_of::<BuddyEntry<A>>());
+            let mut buddy = self.read_entry(buddy_page * mem::size_of::<BuddyEntry<A>>());
             // 如果entry的buddy的阶数不等于entry的阶数，或者entry的buddy的pg_buddy位为1，那么就退出循环
             if buddy.order != entry.order || buddy.pg_buddy == 1 {
                 break;
@@ -262,7 +262,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         let mut total = 0;
         let mut used = 0;
         // 遍历所有的buddy，计算已经使用的页和总共的页
-        for mut i in 0..Self::BUDDY_ENTRIES{
+        for mut i in 0..Self::BUDDY_ENTRIES {
             let entry = self.read_entry(i * mem::size_of::<BuddyEntry<A>>());
             total += 1 << entry.order;
             if entry.pg_buddy == 1 {

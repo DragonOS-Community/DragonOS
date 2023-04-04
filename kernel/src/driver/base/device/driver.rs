@@ -1,0 +1,10 @@
+use super::IdTable;
+use core::{any::Any, fmt::Debug};
+
+/// @brief: 所有设备驱动都应该实现该trait
+pub trait Driver: Any + Send + Sync + Debug {
+    /// @brief: 获取设备驱动标识符
+    /// @parameter: None
+    /// @return: 该设备驱动唯一标识符
+    fn get_id_table(&self) -> IdTable;
+}

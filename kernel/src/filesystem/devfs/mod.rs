@@ -10,7 +10,8 @@ use super::vfs::{
 use crate::{
     kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec, syscall::SystemError,
+    syscall::SystemError,
+    time::TimeSpec,
 };
 use alloc::{
     collections::BTreeMap,
@@ -94,7 +95,11 @@ impl DevFS {
     ///
     /// @param name 设备名称
     /// @param device 设备节点的结构体
-    pub fn register_device<T: DeviceINode>(&self, name: &str, device: Arc<T>) -> Result<(), SystemError> {
+    pub fn register_device<T: DeviceINode>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
         match device.metadata().unwrap().file_type {
             // 字节设备挂载在 /dev/char
@@ -135,7 +140,11 @@ impl DevFS {
     }
 
     /// @brief 卸载设备
-    pub fn unregister_device<T: DeviceINode>(&self, name: &str, device: Arc<T>) -> Result<(), SystemError> {
+    pub fn unregister_device<T: DeviceINode>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
         match device.metadata().unwrap().file_type {
             // 字节设备挂载在 /dev/char
@@ -325,7 +334,11 @@ impl IndexNode for LockedDevFSInode {
         self
     }
 
-    fn open(&self, _data: &mut super::vfs::FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: &mut super::vfs::FilePrivateData,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -485,7 +498,7 @@ macro_rules! devfs_exact_ref {
     () => {{
         let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().find("dev");
         if let Err(e) = devfs_inode {
-            kerror!("failed to get DevFS ref. errcode = {:?}",e);
+            kerror!("failed to get DevFS ref. errcode = {:?}", e);
             return Err(SystemError::ENOENT);
         }
 

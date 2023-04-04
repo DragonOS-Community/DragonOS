@@ -10,10 +10,7 @@ use ::core::{any::Any, fmt::Debug};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{
-    time::TimeSpec,
-    syscall::SystemError,
-};
+use crate::{syscall::SystemError, time::TimeSpec};
 
 use self::file::FileMode;
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
@@ -234,12 +231,12 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     /// @brief 删除文件夹
-    /// 
+    ///
     /// @param name 文件夹名称
-    /// 
+    ///
     /// @return 成功 Ok(())
     /// @return 失败 Err(错误码)
-    fn rmdir(&self, _name: &str) ->Result<(), SystemError>{
+    fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
         return Err(SystemError::ENOTSUP);
     }
 

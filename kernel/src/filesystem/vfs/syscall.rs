@@ -5,10 +5,12 @@ use alloc::{boxed::Box, string::ToString};
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
     include::bindings::bindings::{
-        pt_regs, verify_area, AT_REMOVEDIR, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET,
+        pt_regs, verify_area, AT_REMOVEDIR, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR,
+        SEEK_END, SEEK_MAX, SEEK_SET,
     },
     io::SeekFrom,
-    kerror, syscall::SystemError,
+    kerror,
+    syscall::SystemError,
 };
 
 use super::{

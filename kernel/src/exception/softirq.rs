@@ -5,9 +5,9 @@ use alloc::boxed::Box;
 use crate::{
     arch::interrupt::{cli, sti},
     include::bindings::bindings::verify_area,
-    kBUG,
+    kBUG, kdebug,
     libs::spinlock::RawSpinlock,
-    syscall::SystemError, kdebug,
+    syscall::SystemError,
 };
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
@@ -85,7 +85,9 @@ pub extern "C" fn register_softirq(
     data: *mut c_void,
 ) {
     let softirq_handler = __get_softirq_handler_mut();
-    softirq_handler.register_softirq(irq_num, action, data).expect(&format!("Softirq: Failed to register {}", irq_num));
+    softirq_handler
+        .register_softirq(irq_num, action, data)
+        .expect(&format!("Softirq: Failed to register {}", irq_num));
 }
 
 /// @brief 卸载软中断
@@ -94,7 +96,9 @@ pub extern "C" fn register_softirq(
 #[allow(dead_code)]
 pub extern "C" fn unregister_softirq(irq_num: u32) {
     let softirq_handler = __get_softirq_handler_mut();
-    softirq_handler.unregister_softirq(irq_num).expect(&format!("Softirq: Failed to unregister {}", irq_num));
+    softirq_handler
+        .unregister_softirq(irq_num)
+        .expect(&format!("Softirq: Failed to unregister {}", irq_num));
 }
 
 /// 设置软中断的运行状态（只应在do_softirq中调用此宏）

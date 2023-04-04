@@ -3,14 +3,9 @@ use core::mem::MaybeUninit;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::current::current_pcb,
-    driver::tty::TtyFilePrivateData,
-    filesystem::procfs::ProcfsFilePrivateData,
-    include::bindings::bindings::{
-        process_control_block,
-    },
-    io::SeekFrom,
-    kerror, syscall::SystemError,
+    arch::asm::current::current_pcb, driver::tty::TtyFilePrivateData,
+    filesystem::procfs::ProcfsFilePrivateData, include::bindings::bindings::process_control_block,
+    io::SeekFrom, kerror, syscall::SystemError,
 };
 
 use super::{Dirent, FileType, IndexNode, Metadata};

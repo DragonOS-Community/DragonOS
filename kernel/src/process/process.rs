@@ -9,11 +9,12 @@ use crate::{
     arch::{asm::current::current_pcb, fpu::FpState},
     filesystem::vfs::file::{File, FileDescriptorVec},
     include::bindings::bindings::{
-        process_control_block, CLONE_FS, PROC_INTERRUPTIBLE,
-        PROC_RUNNING, PROC_STOPPED, PROC_UNINTERRUPTIBLE,
+        process_control_block, CLONE_FS, PROC_INTERRUPTIBLE, PROC_RUNNING, PROC_STOPPED,
+        PROC_UNINTERRUPTIBLE,
     },
     sched::core::{cpu_executing, sched_enqueue},
-    smp::core::{smp_get_processor_id, smp_send_reschedule}, syscall::SystemError,
+    smp::core::{smp_get_processor_id, smp_send_reschedule},
+    syscall::SystemError,
 };
 
 use super::preempt::{preempt_disable, preempt_enable};

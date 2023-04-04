@@ -20,8 +20,8 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
-    time::TimeSpec,
     syscall::SystemError,
+    time::TimeSpec,
 };
 
 use super::{
@@ -1569,7 +1569,8 @@ impl IndexNode for LockedFATInode {
         dir.check_existence(name, Some(true), guard.fs.upgrade().unwrap())?;
 
         // 再从磁盘删除
-        let r: Result<(), SystemError> = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
+        let r: Result<(), SystemError> =
+            dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
         if r.is_ok() {
             return r;
         } else {

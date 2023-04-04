@@ -2,10 +2,12 @@ use alloc::sync::{Arc, Weak};
 
 use crate::{
     filesystem::{
-        devfs::{DeviceINode, DevFS},
+        devfs::{DevFS, DeviceINode},
         vfs::{file::FileMode, FilePrivateData, IndexNode},
     },
-    kerror, libs::rwlock::RwLock, syscall::SystemError,
+    kerror,
+    libs::rwlock::RwLock,
+    syscall::SystemError,
 };
 
 use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
@@ -13,8 +15,7 @@ use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
 #[derive(Debug)]
 pub struct TtyDevice {
     core: TtyCore,
-    fs: RwLock<Weak<DevFS>>
-    
+    fs: RwLock<Weak<DevFS>>,
 }
 
 impl TtyDevice {

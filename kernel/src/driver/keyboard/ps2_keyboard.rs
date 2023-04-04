@@ -9,7 +9,8 @@ use crate::{
     },
     include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t},
     libs::rwlock::RwLock,
-    time::TimeSpec, syscall::SystemError,
+    syscall::SystemError,
+    time::TimeSpec,
 };
 
 #[derive(Debug)]
@@ -122,7 +123,10 @@ impl IndexNode for LockedPS2KeyBoardInode {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut crate::filesystem::vfs::FilePrivateData) -> Result<(), SystemError> {
+    fn close(
+        &self,
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 1 {
             // 最后一次关闭，需要释放

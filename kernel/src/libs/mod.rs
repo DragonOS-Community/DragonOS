@@ -13,4 +13,3 @@ pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;
 pub mod wait_queue;
-

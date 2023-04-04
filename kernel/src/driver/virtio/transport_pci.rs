@@ -1,10 +1,10 @@
 //! PCI transport for VirtIO.
+use crate::arch::{Pci_Arch, TraitPciArch};
 use crate::driver::pci::pci::{
-    capabilities_offset, pci_bar_init, pci_enable_master, CapabilityIterator, DeviceFunction,
-    PciDeviceBar, PciError, PCI_CAP_ID_VNDR,
+    capabilities_offset, pci_bar_init, pci_enable_master, BusDeviceFunction, CapabilityIterator,
+    PciError, PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
-use crate::include::bindings::bindings::pci_read_config;
-
+use crate::kdebug;
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
@@ -77,7 +77,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
-    device_function: DeviceFunction,
+    bus_device_function: BusDeviceFunction,
     /// The common configuration structure within some BAR.
     common_cfg: NonNull<CommonCfg>,
     /// The start of the queue notification region within some BAR.
@@ -94,16 +94,8 @@ impl PciTransport {
     /// root controller.
     ///
     /// The PCI device must already have had its BARs allocated.
-    pub fn new<H: Hal>(device_function: DeviceFunction) -> Result<Self, VirtioPciError> {
-        let device_vendor = unsafe {
-            let bar_temp = pci_read_config(
-                device_function.bus,
-                device_function.device,
-                device_function.function,
-                0,
-            );
-            bar_temp
-        };
+    pub fn new<H: Hal>(bus_device_function: BusDeviceFunction) -> Result<Self, VirtioPciError> {
+        let device_vendor = Pci_Arch::read_config(&bus_device_function, 0);
         let device_id = (device_vendor >> 16) as u16;
         let vendor_id = device_vendor as u16;
         if vendor_id != VIRTIO_VENDOR_ID {
@@ -118,12 +110,12 @@ impl PciTransport {
         let mut device_cfg = None;
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
         let device_capability = CapabilityIterator {
-            device_function: device_function,
-            next_capability_offset: capabilities_offset(device_function),
+            bus_device_function: bus_device_function,
+            next_capability_offset: capabilities_offset(bus_device_function),
         };
 
-        let device_bar = pci_bar_init(device_function)?;
-        pci_enable_master(device_function);
+        let device_bar = pci_bar_init(bus_device_function)?;
+        pci_enable_master(bus_device_function);
         for capability in device_capability {
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
@@ -134,33 +126,16 @@ impl PciTransport {
                 continue;
             }
             let struct_info = VirtioCapabilityInfo {
-                bar: unsafe {
-                    let temp = pci_read_config(
-                        device_function.bus,
-                        device_function.device,
-                        device_function.function,
-                        capability.offset + CAP_BAR_OFFSET,
-                    );
-                    temp as u8
-                },
-                offset: unsafe {
-                    let temp = pci_read_config(
-                        device_function.bus,
-                        device_function.device,
-                        device_function.function,
-                        capability.offset + CAP_BAR_OFFSET_OFFSET,
-                    );
-                    temp
-                },
-                length: unsafe {
-                    let temp = pci_read_config(
-                        device_function.bus,
-                        device_function.device,
-                        device_function.function,
-                        capability.offset + CAP_LENGTH_OFFSET,
-                    );
-                    temp
-                },
+                bar: Pci_Arch::read_config(&bus_device_function, capability.offset + CAP_BAR_OFFSET)
+                    as u8,
+                offset: Pci_Arch::read_config(
+                    &bus_device_function,
+                    capability.offset + CAP_BAR_OFFSET_OFFSET,
+                ),
+                length: Pci_Arch::read_config(
+                    &bus_device_function,
+                    capability.offset + CAP_LENGTH_OFFSET,
+                ),
             };
 
             match cfg_type {
@@ -169,15 +144,10 @@ impl PciTransport {
                 }
                 VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify_cfg.is_none() => {
                     notify_cfg = Some(struct_info);
-                    notify_off_multiplier = unsafe {
-                        let temp = pci_read_config(
-                            device_function.bus,
-                            device_function.device,
-                            device_function.function,
-                            capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET,
-                        );
-                        temp
-                    };
+                    notify_off_multiplier = Pci_Arch::read_config(
+                        &bus_device_function,
+                        capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET,
+                    );
                 }
                 VIRTIO_PCI_CAP_ISR_CFG if isr_cfg.is_none() => {
                     isr_cfg = Some(struct_info);
@@ -213,7 +183,7 @@ impl PciTransport {
         };
         Ok(Self {
             device_type,
-            device_function,
+            bus_device_function,
             common_cfg,
             notify_region,
             notify_off_multiplier,
@@ -487,7 +457,7 @@ impl From<PciError> for VirtioPciError {
 ///@param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息
 ///@return Result<NonNull<T>, VirtioPciError> 成功则返回对应类型的指针，失败则返回Error
 fn get_bar_region<T>(
-    device_bar: &PciDeviceBar,
+    device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,
 ) -> Result<NonNull<T>, VirtioPciError> {
     let bar_info = device_bar.get_bar(struct_info.bar)?;
@@ -521,7 +491,7 @@ fn get_bar_region<T>(
 ///@param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息切片的指针
 ///@return Result<NonNull<[T]>, VirtioPciError> 成功则返回对应类型的指针切片，失败则返回Error
 fn get_bar_region_slice<T>(
-    device_bar: &PciDeviceBar,
+    device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,
 ) -> Result<NonNull<[T]>, VirtioPciError> {
     let ptr = get_bar_region::<T>(device_bar, struct_info)?;

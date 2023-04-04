@@ -5,11 +5,9 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{
-    libs::spinlock::SpinLock, syscall::SystemError,
-};
+use crate::{libs::spinlock::SpinLock, syscall::SystemError};
 
-use super::{FilePrivateData, FileSystem, FileType, IndexNode, InodeId, file::FileMode};
+use super::{file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode, InodeId};
 
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载

@@ -1,3 +1,4 @@
+pub mod acpi;
 pub mod disk;
 pub mod keyboard;
 pub mod pci;

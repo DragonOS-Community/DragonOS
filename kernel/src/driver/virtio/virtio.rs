@@ -1,6 +1,6 @@
 use super::transport_pci::PciTransport;
 use super::virtio_impl::HalImpl;
-use crate::driver::pci::pci::DeviceFunction;
+use crate::driver::pci::pci::BusDeviceFunction;
 use crate::include::bindings::bindings::get_virtio_net_device;
 use crate::{kdebug, kerror, kwarn};
 use alloc::{boxed::Box, collections::LinkedList};
@@ -16,8 +16,8 @@ enum VirtioError {
 #[no_mangle]
 pub extern "C" fn c_virtio_probe() {
     if let Ok(virtio_list) = virtio_device_search() {
-        for device_function in virtio_list {
-            match PciTransport::new::<HalImpl>(*device_function) {
+        for bus_device_function in virtio_list {
+            match PciTransport::new::<HalImpl>(*bus_device_function) {
                 Ok(mut transport) => {
                     kdebug!(
                         "Detected virtio PCI device with device type {:?}, features {:#018x}",
@@ -39,8 +39,8 @@ pub extern "C" fn c_virtio_probe() {
 ///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
 fn virtio_probe() {
     if let Ok(virtio_list) = virtio_device_search() {
-        for device_function in virtio_list {
-            match PciTransport::new::<HalImpl>(*device_function) {
+        for bus_device_function in virtio_list {
+            match PciTransport::new::<HalImpl>(*bus_device_function) {
                 Ok(mut transport) => {
                     kdebug!(
                         "Detected virtio PCI device with device type {:?}, features {:#018x}",
@@ -133,8 +133,8 @@ fn virtio_net<T: Transport>(transport: T) {
 /// @brief 寻找所有的virtio设备
 /// @return Result<LinkedList<Box<DeviceFunction>>,VirtioError> 成功则返回包含所有virtio设备的链表，失败则返回err
 /// 该函数主要是为其他virtio设备预留支持
-fn virtio_device_search() -> Result<LinkedList<Box<DeviceFunction>>, VirtioError> {
-    let mut virtio_list: LinkedList<Box<DeviceFunction>> = LinkedList::new();
+fn virtio_device_search() -> Result<LinkedList<Box<BusDeviceFunction>>, VirtioError> {
+    let mut virtio_list: LinkedList<Box<BusDeviceFunction>> = LinkedList::new();
     let (bus, device, function) = unsafe {
         let mut bus: u8 = 0;
         let mut device: u8 = 0;
@@ -149,11 +149,11 @@ fn virtio_device_search() -> Result<LinkedList<Box<DeviceFunction>>, VirtioError
         kdebug!("get_virtio_net_device failed");
         return Err(VirtioError::VirtioNetNotFound);
     }
-    let device_function = DeviceFunction {
+    let bus_device_function = BusDeviceFunction {
         bus: bus,
         device: device,
         function: function,
     };
-    virtio_list.push_back(Box::new(device_function));
+    virtio_list.push_back(Box::new(bus_device_function));
     Ok(virtio_list)
 }

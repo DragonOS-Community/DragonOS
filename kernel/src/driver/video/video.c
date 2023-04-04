@@ -65,10 +65,12 @@ int video_refresh_daemon(void *unused)
             if (likely(video_refresh_target != NULL))
             {
                 spin_lock(&daemon_refresh_lock);
-                memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr,
-                       video_refresh_target->size);
+                if (video_frame_buffer_info.vaddr != NULL)
+                    memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr,
+                           video_refresh_target->size);
                 spin_unlock(&daemon_refresh_lock);
-                video_daemon_pcb->virtual_runtime = 0xfffff0000000; // 临时解决由于显示刷新进程的虚拟运行时间过大/过小，导致其不运行，或者一直运行的问题。将来应使用实时调度解决它
+                video_daemon_pcb->virtual_runtime =
+                    0xfffff0000000; // 临时解决由于显示刷新进程的虚拟运行时间过大/过小，导致其不运行，或者一直运行的问题。将来应使用实时调度解决它
             }
             video_refresh_expire_jiffies = rs_timer_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
         }

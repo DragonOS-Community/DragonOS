@@ -1,18 +1,12 @@
 use alloc::sync::Arc;
 use super::{
-    super::device::driver::*,
+    super::device::driver::{
+        Driver,
+        DriverError
+    },
     platform_device::PlatformDevice,
     CompatibleTable,
 };
-
-/// @brief: Driver error
-#[allow(dead_code)]
-#[derive(Debug)]
-#[derive(PartialEq, Eq)]
-#[derive(Clone, Copy)]
-pub enum DriverError {
-    ProbeError,
-}
 
 /// @brief: 实现该trait的设备驱动实例应挂载在platform总线上，
 ///         同时应该实现Driver trait

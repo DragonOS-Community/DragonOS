@@ -1,6 +1,10 @@
 use alloc::sync::Arc;
 use super::{
-    super::device::*,
+    super::device::{
+        Device, 
+        DeviceType,
+        DeviceState
+    },
     CompatibleTable, platform_driver::PlatformDriver
 };
 

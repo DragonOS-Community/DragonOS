@@ -6,8 +6,10 @@ use lazy_static::lazy_static;
 use core::fmt::Debug;
 use crate::libs::spinlock::SpinLock;
 use super::{
-    driver::Driver, 
-    *
+    driver::Driver,
+    DeviceState,
+    IdTable,
+    Device
 };
 
 /// @brief: 总线状态
@@ -92,7 +94,7 @@ impl BusManagerLock {
     /// @return: None
     #[inline]
     #[allow(dead_code)]
-    pub fn add_bus_dev(&self, id_table: IdTable, bus_dev: Arc<dyn Bus>) {
+    pub fn add_bus(&self, id_table: IdTable, bus_dev: Arc<dyn Bus>) {
         let mut bus_manager = self.0.lock();
         bus_manager.buses.insert(id_table, bus_dev);
     }
@@ -103,7 +105,7 @@ impl BusManagerLock {
     /// @return: None
     #[inline]
     #[allow(dead_code)]
-    pub fn add_bus_drv(&self, id_table: IdTable, bus_drv: Arc<dyn BusDriver>) {
+    pub fn add_bus_driver(&self, id_table: IdTable, bus_drv: Arc<dyn BusDriver>) {
         let mut bus_manager = self.0.lock();
         bus_manager.bus_drvs.insert(id_table, bus_drv);
     }
@@ -113,7 +115,7 @@ impl BusManagerLock {
     /// @return: None
     #[inline]
     #[allow(dead_code)]
-    pub fn remove_bus_dev(&self, id_table: &IdTable) {
+    pub fn remove_bus(&self, id_table: &IdTable) {
         let mut bus_manager = self.0.lock();
         bus_manager.buses.remove(id_table);
     }
@@ -123,7 +125,7 @@ impl BusManagerLock {
     /// @return: None
     #[inline]
     #[allow(dead_code)]
-    pub fn remove_bus_drv(&self, id_table: &IdTable) {
+    pub fn remove_bus_driver(&self, id_table: &IdTable) {
         let mut bus_manager = self.0.lock();
         bus_manager.bus_drvs.remove(id_table);
     }
@@ -133,7 +135,7 @@ impl BusManagerLock {
     /// @return: 总线设备实例
     #[inline]
     #[allow(dead_code)]
-    pub fn get_bus_dev(&self, id_table: &IdTable) -> Option<Arc<dyn Bus>> {
+    pub fn get_bus(&self, id_table: &IdTable) -> Option<Arc<dyn Bus>> {
         let bus_manager = self.0.lock();
         bus_manager.buses.get(id_table).cloned()
     }
@@ -143,7 +145,7 @@ impl BusManagerLock {
     /// @return: 总线驱动实例
     #[inline]
     #[allow(dead_code)]
-    pub fn get_bus_drv(&self, id_table: &IdTable) -> Option<Arc<dyn BusDriver>> {
+    pub fn get_bus_driver(&self, id_table: &IdTable) -> Option<Arc<dyn BusDriver>> {
         let bus_manager = self.0.lock();
         bus_manager.bus_drvs.get(id_table).cloned()
     }

@@ -5,9 +5,17 @@ use alloc::{
 use lazy_static::lazy_static;
 use core::fmt::Debug;
 use super::device::{
-    bus::*,
-    driver::Driver,    
-    *,
+    bus::{
+        BusDriver, 
+        BusState, 
+        BUS_MANAGER, 
+        Bus
+    },
+    driver::Driver, 
+    IdTable, 
+    DeviceError, 
+    DeviceState, 
+    DeviceType, Device    
 };
 use crate::libs::{rwlock::RwLock, mutex::Mutex};
 use platform_device::PlatformDevice;
@@ -43,7 +51,7 @@ impl CompatibleTable {
                 return true;
             }
         }
-        false
+        return false
     }
 }
 
@@ -106,10 +114,10 @@ impl PlatformBusDriver {
         let mut drivers = self.drivers.write();
         // 如果存在同类型的驱动，返回错误
         if drivers.contains_key(&id_table) {
-            Err(DeviceError::DriverExists)
+            return Err(DeviceError::DriverExists)
         } else {        
             drivers.insert(id_table.clone(), driver.clone());
-            Ok(())
+            return Ok(())
         }
     }
 
@@ -132,10 +140,10 @@ impl PlatformBusDriver {
 
         let mut devices = self.devices.write();
         if devices.contains_key(&id_table) {
-            Err(DeviceError::DeviceExists)
+            return Err(DeviceError::DeviceExists)
         } else {
             devices.insert(id_table.clone(), device.clone());
-            Ok(())
+            return Ok(())
         }
     }
 
@@ -175,7 +183,7 @@ impl PlatformBusDriver {
         if num == 0 {
             return Err(DeviceError::NoDeviceForDriver);
         } else {
-            Ok(num)
+            return Ok(num)
         }
     }
 
@@ -197,7 +205,7 @@ impl PlatformBusDriver {
                 }
             }
         }
-        Err(DeviceError::NoDriverForDevice)
+        return Err(DeviceError::NoDriverForDevice)
     }
 }
 
@@ -212,9 +220,9 @@ impl Driver for PlatformBusDriver {
 impl BusDriver for PlatformBusDriver {
     fn is_empty(&self) -> bool {
         if self.devices.read().is_empty() && self.drivers.read().is_empty() {
-            true
+            return true
         } else {
-            false
+            return false
         }
     }
 }
@@ -277,7 +285,7 @@ impl Platform {
     #[allow(dead_code)]
     fn get_state(&self) -> BusState {
         let state = self.state.lock();
-        *state
+        return *state
     }
 
     /// @brief: 
@@ -298,7 +306,7 @@ impl Device for Platform {
     #[inline]
     #[allow(dead_code)]
     fn get_type(&self) -> DeviceType {
-        DeviceType::Bus
+        return DeviceType::Bus
     }
 
     /// @brief: 获取platform设备标识符
@@ -324,15 +332,15 @@ lazy_static! {
 /// @return: None
 #[allow(dead_code)]
 pub fn platform_bus_init() {
-    BUS_MANAGER.add_bus_drv(BUS_PLATFORM_DRIVER.get_id_table(), BUS_PLATFORM_DRIVER.clone());
-    BUS_MANAGER.add_bus_dev(BUS_PLATFORM_DEVICE.get_id_table(), BUS_PLATFORM_DEVICE.clone());
+    BUS_MANAGER.add_bus_driver(BUS_PLATFORM_DRIVER.get_id_table(), BUS_PLATFORM_DRIVER.clone());
+    BUS_MANAGER.add_bus(BUS_PLATFORM_DEVICE.get_id_table(), BUS_PLATFORM_DEVICE.clone());
     BUS_PLATFORM_DEVICE.set_state(BusState::Initialized);
 }
 
 #[no_mangle]
 extern "C" fn c_platform_bus_init() {
-    BUS_MANAGER.add_bus_drv(BUS_PLATFORM_DRIVER.get_id_table(), BUS_PLATFORM_DRIVER.clone());
-    BUS_MANAGER.add_bus_dev(BUS_PLATFORM_DEVICE.get_id_table(), BUS_PLATFORM_DEVICE.clone());
+    BUS_MANAGER.add_bus_driver(BUS_PLATFORM_DRIVER.get_id_table(), BUS_PLATFORM_DRIVER.clone());
+    BUS_MANAGER.add_bus(BUS_PLATFORM_DEVICE.get_id_table(), BUS_PLATFORM_DEVICE.clone());
     BUS_PLATFORM_DEVICE.set_state(BusState::Initialized);
 }
 

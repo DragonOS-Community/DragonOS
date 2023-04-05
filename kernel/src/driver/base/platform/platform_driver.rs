@@ -5,6 +5,7 @@ use super::{
     CompatibleTable,
 };
 
+/// @brief: Driver error
 #[allow(dead_code)]
 #[derive(Debug)]
 #[derive(PartialEq, Eq)]

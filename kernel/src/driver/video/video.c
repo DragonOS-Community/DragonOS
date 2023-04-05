@@ -116,11 +116,10 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
         // 创建video守护进程
         video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, "Video refresh daemon");
         video_daemon_pcb->virtual_runtime = 0; // 特殊情况， 最高优先级， 以后再改
-
         // 启用屏幕刷新软中断
         rs_register_softirq_video();
-
         rs_raise_softirq(VIDEO_REFRESH_SIRQ);
+
     }
     return 0;
 }

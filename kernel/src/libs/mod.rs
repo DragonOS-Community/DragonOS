@@ -4,6 +4,7 @@ pub mod list;
 pub mod lockref;
 pub mod mutex;
 pub mod printk;
+pub mod rbtree;
 #[macro_use]
 pub mod refcount;
 pub mod rwlock;

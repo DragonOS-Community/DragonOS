@@ -147,7 +147,7 @@ impl BusManagerLock {
     #[allow(dead_code)]
     pub fn get_bus_driver(&self, id_table: &IdTable) -> Option<Arc<dyn BusDriver>> {
         let bus_manager = self.0.lock();
-        bus_manager.bus_drvs.get(id_table).cloned()
+        return bus_manager.bus_drvs.get(id_table).cloned();
     }
 }
 

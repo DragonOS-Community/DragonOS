@@ -51,7 +51,7 @@ impl CompatibleTable {
                 return true;
             }
         }
-        return false
+        return false;
     }
 }
 
@@ -91,7 +91,7 @@ impl PlatformBusDriver {
     #[allow(dead_code)]
     fn get_device(&self, id_table: &IdTable) -> Option<Arc<dyn PlatformDevice>> {
         let device_map = self.devices.read();
-        device_map.get(id_table).cloned()
+        return device_map.get(id_table).cloned();
     }
 
     /// @brief: 根据设备驱动标识符获取platform总线上的驱动
@@ -101,7 +101,7 @@ impl PlatformBusDriver {
     #[allow(dead_code)]
     fn get_driver(&self, id_table: &IdTable) -> Option<Arc<dyn PlatformDriver>> {
         let driver_map = self.drivers.read();
-        driver_map.get(id_table).cloned()
+        return driver_map.get(id_table).cloned();
     }
 
     /// @brief: 注册platform类型驱动
@@ -114,10 +114,10 @@ impl PlatformBusDriver {
         let mut drivers = self.drivers.write();
         // 如果存在同类型的驱动，返回错误
         if drivers.contains_key(&id_table) {
-            return Err(DeviceError::DriverExists)
+            return Err(DeviceError::DriverExists);
         } else {        
             drivers.insert(id_table.clone(), driver.clone());
-            return Ok(())
+            return Ok(());
         }
     }
 
@@ -140,10 +140,10 @@ impl PlatformBusDriver {
 
         let mut devices = self.devices.write();
         if devices.contains_key(&id_table) {
-            return Err(DeviceError::DeviceExists)
+            return Err(DeviceError::DeviceExists);
         } else {
             devices.insert(id_table.clone(), device.clone());
-            return Ok(())
+            return Ok(());
         }
     }
 
@@ -165,7 +165,7 @@ impl PlatformBusDriver {
         let mut num = 0;
         let devices = self.devices.read();
 
-        for (_dev_id_table, device) in &*devices {
+        for (_dev_id_table, device) in devices.iter() {
             if device.get_compatible_table().matches(&driver.get_compatible_table()) {              
                 if !device.is_initialized() {
                     // 设备未初始化，调用驱动probe函数
@@ -183,7 +183,7 @@ impl PlatformBusDriver {
         if num == 0 {
             return Err(DeviceError::NoDeviceForDriver);
         } else {
-            return Ok(num)
+            return Ok(num);
         }
     }
 
@@ -205,7 +205,7 @@ impl PlatformBusDriver {
                 }
             }
         }
-        return Err(DeviceError::NoDriverForDevice)
+        return Err(DeviceError::NoDriverForDevice);
     }
 }
 
@@ -220,9 +220,9 @@ impl Driver for PlatformBusDriver {
 impl BusDriver for PlatformBusDriver {
     fn is_empty(&self) -> bool {
         if self.devices.read().is_empty() && self.drivers.read().is_empty() {
-            return true
+            return true;
         } else {
-            return false
+            return false;
         }
     }
 }
@@ -285,7 +285,7 @@ impl Platform {
     #[allow(dead_code)]
     fn get_state(&self) -> BusState {
         let state = self.state.lock();
-        return *state
+        return *state;
     }
 
     /// @brief: 
@@ -306,7 +306,7 @@ impl Device for Platform {
     #[inline]
     #[allow(dead_code)]
     fn get_type(&self) -> DeviceType {
-        return DeviceType::Bus
+        return DeviceType::Bus;
     }
 
     /// @brief: 获取platform设备标识符

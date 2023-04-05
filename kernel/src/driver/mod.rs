@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicUsize;
+use core::{sync::atomic::AtomicUsize, any::Any, fmt::Debug};
 
 use alloc::{collections::BTreeMap, sync::Arc};
 
@@ -30,4 +30,9 @@ pub fn generate_nic_id() -> usize {
         .into();
 }
 
-pub trait Driver: Sync + Send {}
+pub trait Driver: Sync + Send + Debug{
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
+
+    fn as_any_mut(&'static mut self) -> &'static mut dyn core::any::Any;
+
+}

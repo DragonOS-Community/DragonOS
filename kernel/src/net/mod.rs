@@ -3,14 +3,27 @@ use core::{
     sync::atomic::AtomicUsize,
 };
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
 
-use crate::{libs::rwlock::RwLock, syscall::SystemError};
+use crate::{
+    driver::net::NetDriver,
+    libs::{
+        rwlock::{RwLock, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
+    syscall::SystemError,
+    time::Instant, kdebug,
+};
 use smoltcp::{iface, wire::IpEndpoint};
 
 use self::socket::SocketMetadata;
 
 pub mod endpoints;
+pub mod net_core;
 pub mod socket;
 
 lazy_static! {
@@ -252,8 +265,9 @@ impl Into<u8> for Protocol {
 ///
 /// smoltcp 中的接口是一个高级抽象，它允许应用程序或操作系统以一致和统一的方式与网络硬件交互，而不管所使用的具体硬件类型如何。
 pub struct Interface {
-    pub inner_iface: smoltcp::iface::Interface,
-    pub iface_id: usize, // 接口的全局ID
+    inner_iface: RwLock<smoltcp::iface::Interface>,
+    iface_id: usize,
+    device: Weak<dyn NetDriver>,
 }
 
 impl Debug for Interface {
@@ -261,15 +275,36 @@ impl Debug for Interface {
         f.debug_struct("Interface")
             .field("inner_iface", &" smoltcp::iface::Interface,")
             .field("iface_id", &self.iface_id)
+            .field("device", &self.device)
             .finish()
     }
 }
 
 impl Interface {
-    pub fn new(inner_iface: smoltcp::iface::Interface) -> Self {
+    pub fn new(inner_iface: smoltcp::iface::Interface, device: Weak<dyn NetDriver>) -> Self {
         return Self {
-            inner_iface,
+            inner_iface: RwLock::new(inner_iface),
             iface_id: generate_iface_id(),
+            device,
         };
+    }
+
+    #[inline(always)]
+    pub fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), SystemError> {
+        let dev = self.device.upgrade();
+        if dev.is_none() {
+            return Err(SystemError::ENODEV);
+        }
+        kdebug!("polling iface: {}", self.iface_id);
+        return dev.unwrap().poll(self.iface_id, sockets);
+    }
+
+    pub fn inner_mut(&self) -> RwLockWriteGuard<smoltcp::iface::Interface> {
+        return self.inner_iface.write();
+    }
+
+    #[inline(always)]
+    pub fn iface_id(&self) -> usize {
+        return self.iface_id;
     }
 }

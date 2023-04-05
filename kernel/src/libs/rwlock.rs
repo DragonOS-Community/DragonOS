@@ -239,7 +239,7 @@ impl<T> RwLock<T> {
     }
 
     #[allow(dead_code)]
-    pub fn get_mut(&mut self) -> &mut T {
+    pub unsafe fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
 }

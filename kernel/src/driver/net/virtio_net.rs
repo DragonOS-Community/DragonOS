@@ -1,3 +1,5 @@
+use core::{fmt::Debug, ops::DerefMut};
+
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
@@ -12,7 +14,7 @@ use crate::{
     kdebug, kerror, kinfo, kwarn,
     libs::rwlock::RwLock,
     net::{Interface, NET_FACES},
-    time::timer::schedule_timeout,
+    time::{timer::schedule_timeout, Instant}, syscall::SystemError,
 };
 
 use super::NetDriver;
@@ -43,21 +45,32 @@ impl<T: 'static + Transport> VirtioNICDriver<T> {
 
         let mut s: VirtioNICDriver<T> = Self { inner };
 
-        let iface: Arc<Interface> = Arc::new(Interface::new(smoltcp::iface::Interface::new::<
-            VirtioNICDriver<T>,
-        >(iface_config, &mut s)));
-
         let result: Arc<VirtioNICDriver<T>> = Arc::new(s);
         result.inner.write().self_ref = Arc::downgrade(&result);
+
+        let iface: Arc<Interface> = Arc::new(Interface::new(
+            smoltcp::iface::Interface::new::<InnerVirtIONet<T>>(
+                iface_config,
+                &mut result.inner.write().deref_mut(),
+            ),
+            Arc::downgrade(&(result.clone() as Arc<dyn NetDriver>)),
+        ));
+
         result.inner.write().ifaces.push(iface.clone());
 
         let nic_id = result.inner.read().net_device_id;
         // 将网卡驱动注册到网卡驱动列表中
         NET_DRIVERS.write().insert(nic_id, result.clone());
         // 将网络接口注册到iface列表中
-        NET_FACES.write().insert(iface.iface_id, iface.clone());
+        NET_FACES.write().insert(iface.iface_id(), iface.clone());
 
         return result;
+    }
+}
+
+impl<T: Transport> Debug for VirtioNICDriver<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        return write!(f, "VirtioNICDriver");
     }
 }
 
@@ -88,7 +101,7 @@ impl<'a, T: Transport> VirtioNetToken<T> {
     }
 }
 
-impl<T: Transport> phy::Device for VirtioNICDriver<T> {
+impl<T: Transport> phy::Device for InnerVirtIONet<T> {
     type RxToken<'a> = VirtioNetToken<T> where Self: 'a;
     type TxToken<'a> = VirtioNetToken<T> where Self: 'a;
 
@@ -98,8 +111,8 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // self.notify_rx_queue();
         // self.inner.write().virtio_net.transport.notify(0);
-        let mut driver_net = self.inner.write();
-
+        let mut driver_net = self;
+        kdebug!("VirtioNet: receive");
         match driver_net.virtio_net.receive() {
             Ok(buf) => Some((
                 VirtioNetToken::new(driver_net.self_ref.upgrade().unwrap(), Some(buf)),
@@ -111,13 +124,16 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        let driver_net = self.inner.read();
+        let driver_net = self;
+        kdebug!("VirtioNet: transmit");
         if driver_net.virtio_net.can_send() {
+            kdebug!("VirtioNet: can send");
             return Some(VirtioNetToken::new(
                 driver_net.self_ref.upgrade().unwrap(),
                 None,
             ));
         } else {
+            kdebug!("VirtioNet: can not send");
             return None;
         }
     }
@@ -192,7 +208,15 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
     );
 }
 
-impl<T: Transport> Driver for VirtioNICDriver<T> {}
+impl<T: Transport> Driver for VirtioNICDriver<T> {
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&'static mut self) -> &'static mut dyn core::any::Any {
+        self
+    }
+}
 
 impl<T: Transport> NetDriver for VirtioNICDriver<T> {
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
@@ -205,6 +229,32 @@ impl<T: Transport> NetDriver for VirtioNICDriver<T> {
         return self.inner.read().net_device_id;
     }
 
+    fn poll(
+        &self,
+        iface_id: usize,
+        sockets: &mut smoltcp::iface::SocketSet,
+    ) -> Result<(), crate::syscall::SystemError> {
+        let guard = self.inner.upgradeable_read();
+        let mut iface: Option<Arc<Interface>> = None;
+        for i in guard.ifaces.iter() {
+            if i.iface_id() == iface_id {
+               iface = Some(i.clone());
+               break;
+            }
+        }
+        kdebug!("found iface: {:?}", iface);
+        if let Some(iface) = iface {
+            kdebug!("to upgrade");
+            let mut guard = guard.upgrade();
+            kdebug!("VirtioNet: poll: iface_id: {}", iface_id);
+            // !!!!在这里会由于双重锁的问题，导致死锁。
+            let poll_res = iface.inner_mut().poll(Instant::now().into(), guard.deref_mut(), sockets);
+            kdebug!("VirtioNet: poll: poll_res: {:?}", poll_res);
+            return Ok(());
+        }
+        kdebug!("VirtioNet: poll: iface_id not found");
+        return Err(SystemError::EINVAL);
+    }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
     //     return self;
     // }

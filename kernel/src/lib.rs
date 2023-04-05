@@ -67,7 +67,7 @@ use crate::{
     },
     filesystem::vfs::ROOT_INODE,
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
-    net::{socket::SocketOptions, Socket},
+    net::{socket::SocketOptions, Socket, net_core::net_init},
     time::{sleep::us_sleep, timekeep::ktime_get_real_ns, timer::schedule_timeout, TimeSpec},
 };
 
@@ -119,110 +119,7 @@ use smoltcp::socket::dhcpv4;
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-
-    func();
-
+    net_init();
     return 0;
 }
 
-fn func() {
-    let binding = NET_DRIVERS.write();
-
-    let device = unsafe {
-        (binding.get(&0).unwrap().as_ref() as *const dyn NetDriver
-            as *const VirtioNICDriver<PciTransport> as *mut VirtioNICDriver<PciTransport>)
-            .as_mut()
-            .unwrap()
-    };
-
-    let binding = NET_FACES.write();
-
-    let net_face = binding.get(&0).unwrap();
-
-    let net_face = unsafe {
-        (net_face.as_ref() as *const crate::net::Interface as *mut crate::net::Interface)
-            .as_mut()
-            .unwrap()
-    };
-
-    drop(binding);
-
-    // Create sockets
-    let mut dhcp_socket = dhcpv4::Socket::new();
-
-    // Set a ridiculously short max lease time to show DHCP renews work properly.
-    // This will cause the DHCP client to start renewing after 5 seconds, and give up the
-    // lease after 10 seconds if renew hasn't succeeded.
-    // IMPORTANT: This should be removed in production.
-    dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(10)));
-
-    let mut sockets = SocketSet::new(vec![]);
-    let dhcp_handle = sockets.add(dhcp_socket);
-
-    const DHCP_TRY_ROUND: u8 = 10;
-    for _ in 0..DHCP_TRY_ROUND {
-        let timestamp = Instant::from_micros(ktime_get_real_ns());
-
-        let _flag = net_face.inner_iface.poll(timestamp, device, &mut sockets);
-        schedule_timeout(1000).ok();
-        let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
-        // kdebug!("event = {event:?} !!!");
-
-        match event {
-            None => {}
-
-            Some(dhcpv4::Event::Configured(config)) => {
-                // kdebug!("Find Config!! {config:?}");
-                // kdebug!("Find ip address: {}", config.address);
-                // kdebug!("iface.ip_addrs={:?}", net_face.inner_iface.ip_addrs());
-                set_ipv4_addr(&mut net_face.inner_iface, config.address);
-                if let Some(router) = config.router {
-                    net_face
-                        .inner_iface
-                        .routes_mut()
-                        .add_default_ipv4_route(router)
-                        .unwrap();
-                    let cidr = net_face.inner_iface.ip_addrs().first();
-                    if cidr.is_some() {
-                        let cidr = cidr.unwrap();
-                        kinfo!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr,)
-                    }
-                    break;
-                } else {
-                    net_face
-                        .inner_iface
-                        .routes_mut()
-                        .remove_default_ipv4_route();
-                }
-            }
-
-            Some(dhcpv4::Event::Deconfigured) => {
-                kdebug!("deconfigured");
-                set_ipv4_addr(
-                    &mut net_face.inner_iface,
-                    Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
-                );
-                net_face
-                    .inner_iface
-                    .routes_mut()
-                    .remove_default_ipv4_route();
-            }
-        }
-    }
-}
-
-fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
-    // kdebug!("set cidr = {cidr:?}");
-
-    iface.update_ip_addrs(|addrs| {
-        let dest = addrs.iter_mut().next();
-        if let None = dest {
-            addrs
-                .push(IpCidr::Ipv4(cidr))
-                .expect("Push ipCidr failed: full");
-        } else {
-            let dest = dest.unwrap();
-            *dest = IpCidr::Ipv4(cidr);
-        }
-    });
-}

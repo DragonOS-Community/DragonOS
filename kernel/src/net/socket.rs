@@ -204,7 +204,7 @@ impl Socket for RawSocket {
 
                 // 构造IP头
                 let ipv4_src_addr: Option<smoltcp::wire::Ipv4Address> =
-                    iface.inner_iface.ipv4_addr();
+                    iface.inner_iface.read().ipv4_addr();
                 if ipv4_src_addr.is_none() {
                     return Err(SystemError::ENETUNREACH);
                 }

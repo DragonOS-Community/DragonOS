@@ -1,6 +1,15 @@
 use super::IdTable;
 use core::{any::Any, fmt::Debug};
 
+/// @brief: Driver error
+#[allow(dead_code)]
+#[derive(Debug)]
+#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy)]
+pub enum DriverError {
+    ProbeError,
+}
+
 /// @brief: 所有设备驱动都应该实现该trait
 pub trait Driver: Any + Send + Sync + Debug {
     /// @brief: 获取设备驱动标识符

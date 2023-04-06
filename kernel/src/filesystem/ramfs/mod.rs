@@ -9,11 +9,8 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
-    include::bindings::bindings::{
-        EEXIST, EINVAL, EISDIR, ENOBUFS, ENOENT, ENOTDIR, ENOTEMPTY, EPERM,
-    },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
+    time::TimeSpec, syscall::SystemError,
 };
 
 use super::vfs::{
@@ -122,16 +119,16 @@ impl IndexNode for LockedRamFSInode {
         len: usize,
         buf: &mut [u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         if buf.len() < len {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
         // 加锁
         let inode: SpinLockGuard<RamFSInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         let start = inode.data.len().min(offset);
@@ -139,7 +136,7 @@ impl IndexNode for LockedRamFSInode {
 
         // buffer空间不足
         if buf.len() < (end - start) {
-            return Err(-(ENOBUFS as i32));
+            return Err(SystemError::ENOBUFS);
         }
 
         // 拷贝数据
@@ -154,9 +151,9 @@ impl IndexNode for LockedRamFSInode {
         len: usize,
         buf: &[u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         if buf.len() < len {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
 
         // 加锁
@@ -164,7 +161,7 @@ impl IndexNode for LockedRamFSInode {
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         let data: &mut Vec<u8> = &mut inode.data;
@@ -179,13 +176,13 @@ impl IndexNode for LockedRamFSInode {
         return Ok(len);
     }
 
-    fn poll(&self) -> Result<PollStatus, i32> {
+    fn poll(&self) -> Result<PollStatus, SystemError> {
         // 加锁
         let inode: SpinLockGuard<RamFSInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         return Ok(PollStatus {
@@ -201,7 +198,7 @@ impl IndexNode for LockedRamFSInode {
         self
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         let inode = self.0.lock();
         let mut metadata = inode.metadata.clone();
         metadata.size = inode.data.len() as i64;
@@ -209,7 +206,7 @@ impl IndexNode for LockedRamFSInode {
         return Ok(metadata);
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -221,13 +218,13 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn resize(&self, len: usize) -> Result<(), i32> {
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type == FileType::File {
             inode.data.resize(len, 0);
             return Ok(());
         } else {
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
     }
 
@@ -237,16 +234,16 @@ impl IndexNode for LockedRamFSInode {
         file_type: FileType,
         mode: u32,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, i32> {
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
         let mut inode = self.0.lock();
         // 如果当前inode不是文件夹，则返回
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
         // 如果有重名的，则返回
         if inode.children.contains_key(name) {
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         }
 
         // 创建inode
@@ -283,26 +280,26 @@ impl IndexNode for LockedRamFSInode {
         return Ok(result);
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), i32> {
+    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let other: &LockedRamFSInode = other
             .downcast_ref::<LockedRamFSInode>()
-            .ok_or(-(EPERM as i32))?;
+            .ok_or(SystemError::EPERM)?;
         let mut inode: SpinLockGuard<RamFSInode> = self.0.lock();
         let mut other_locked: SpinLockGuard<RamFSInode> = other.0.lock();
 
         // 如果当前inode不是文件夹，那么报错
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         // 如果另一个inode是文件夹，那么也报错
         if other_locked.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         // 如果当前文件夹下已经有同名文件，也报错。
         if inode.children.contains_key(name) {
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         }
 
         inode
@@ -314,21 +311,21 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn unlink(&self, name: &str) -> Result<(), i32> {
+    fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut inode: SpinLockGuard<RamFSInode> = self.0.lock();
         // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
-            return Err(-(ENOTEMPTY as i32));
+            return Err(SystemError::ENOTEMPTY);
         }
 
         // 获得要删除的文件的inode
-        let to_delete = inode.children.get(name).ok_or(-(ENOENT as i32))?;
+        let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
         if to_delete.0.lock().metadata.file_type == FileType::Dir {
-            return Err(-(EPERM as i32));
+            return Err(SystemError::EPERM);
         }
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
@@ -337,16 +334,16 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), i32> {
+    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let mut inode: SpinLockGuard<RamFSInode> = self.0.lock();
         // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
         // 获得要删除的文件夹的inode
-        let to_delete = inode.children.get(name).ok_or(-(ENOENT as i32))?;
+        let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
         if to_delete.0.lock().metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         to_delete.0.lock().metadata.nlinks -= 1;
@@ -360,7 +357,7 @@ impl IndexNode for LockedRamFSInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
 
         // 在新的目录下创建一个硬链接
@@ -374,32 +371,32 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inode = self.0.lock();
 
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         match name {
             "" | "." => {
-                return Ok(inode.self_ref.upgrade().ok_or(-(ENOENT as i32))?);
+                return Ok(inode.self_ref.upgrade().ok_or(SystemError::ENOENT)?);
             }
 
             ".." => {
-                return Ok(inode.parent.upgrade().ok_or(-(ENOENT as i32))?);
+                return Ok(inode.parent.upgrade().ok_or(SystemError::ENOENT)?);
             }
             name => {
                 // 在子目录项中查找
-                return Ok(inode.children.get(name).ok_or(-(ENOENT as i32))?.clone());
+                return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
             }
         }
     }
 
-    fn get_entry_name(&self, ino: InodeId) -> Result<String, i32> {
+    fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         let inode: SpinLockGuard<RamFSInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         match ino {
@@ -420,7 +417,7 @@ impl IndexNode for LockedRamFSInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(-(ENOENT as i32));}
+                    0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
                     _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                 }
@@ -428,10 +425,10 @@ impl IndexNode for LockedRamFSInode {
         }
     }
 
-    fn list(&self) -> Result<Vec<String>, i32> {
+    fn list(&self) -> Result<Vec<String>, SystemError> {
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         let mut keys: Vec<String> = Vec::new();

@@ -80,8 +80,8 @@ fn virtio_device(transport: impl Transport) {
 
 ///@brief virtio-net 驱动的初始化与测试
 fn virtio_net<T: Transport>(transport: T) {
-    let mut driver_net = match VirtIONet::<HalImpl, T>::new(transport) {
-        Ok(mut net) => {
+    let driver_net = match VirtIONet::<HalImpl, T>::new(transport) {
+        Ok(net) => {
             kdebug!("Virtio-net driver init successfully.");
             net
         }
@@ -90,40 +90,40 @@ fn virtio_net<T: Transport>(transport: T) {
             return;
         }
     };
-    let mut buf = [0u8; 0x100];
-    // let len = match driver_net.recv(&mut buf)
-    // {
-    //     Ok(len) =>{len},
-    //     Err(_) =>{kerror!("virtio_net recv failed");return;}
-    // };
-    match driver_net.can_send() {
-        true => {
-            kdebug!("Virtio-net can send");
-        }
-        false => {
-            kdebug!("Virtio-net can not send");
-        }
-    }
-    // match driver_net.can_recv() {
+    // let mut buf = [0u8; 0x100];
+    // // let len = match driver_net.recv(&mut buf)
+    // // {
+    // //     Ok(len) =>{len},
+    // //     Err(_) =>{kerror!("virtio_net recv failed");return;}
+    // // };
+    // match driver_net.can_send() {
     //     true => {
-    //         kdebug!("can recv")
+    //         kdebug!("Virtio-net can send");
     //     }
     //     false => {
-    //         kdebug!("can not recv");
+    //         kdebug!("Virtio-net can not send");
     //     }
     // }
+    // // match driver_net.can_recv() {
+    // //     true => {
+    // //         kdebug!("can recv")
+    // //     }
+    // //     false => {
+    // //         kdebug!("can not recv");
+    // //     }
+    // // }
 
-    let len = 100;
-    //kdebug!("recv: {:?}", &buf[..len]);
-    match driver_net.send(&buf[..len]) {
-        Ok(_) => {
-            kdebug!("virtio_net send success");
-        }
-        Err(_) => {
-            kerror!("virtio_net send failed");
-            return;
-        }
-    }
+    // let len = 100;
+    // //kdebug!("recv: {:?}", &buf[..len]);
+    // match driver_net.send(&buf[..len]) {
+    //     Ok(_) => {
+    //         kdebug!("virtio_net send success");
+    //     }
+    //     Err(_) => {
+    //         kerror!("virtio_net send failed");
+    //         return;
+    //     }
+    // }
 
     let mac = driver_net.mac();
     kdebug!("virtio_net MAC={:?}", mac);

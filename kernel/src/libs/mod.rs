@@ -4,6 +4,7 @@ pub mod list;
 pub mod lockref;
 pub mod mutex;
 pub mod printk;
+pub mod rbtree;
 #[macro_use]
 pub mod refcount;
 pub mod rwlock;
@@ -13,4 +14,4 @@ pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;
 pub mod wait_queue;
-
+pub mod keyboard_parser;

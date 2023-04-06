@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        process_control_block, CLONE_CLEAR_SIGHAND, CLONE_SIGHAND, CLONE_THREAD, ENOMEM,
+        process_control_block, CLONE_CLEAR_SIGHAND, CLONE_SIGHAND, CLONE_THREAD,
     },
     ipc::{
         signal::{flush_signal_handlers, DEFAULT_SIGACTION},
@@ -16,7 +16,7 @@ use crate::{
         ffi_convert::FFIBind2Rust,
         refcount::{refcount_inc, RefCount},
         spinlock::{spin_lock_irqsave, spin_unlock_irqrestore},
-    },
+    }, syscall::SystemError,
 };
 
 #[no_mangle]
@@ -31,7 +31,7 @@ pub extern "C" fn process_copy_sighand(clone_flags: u64, pcb: *mut process_contr
     // 在这里使用Box::leak将动态申请的内存的生命周期转换为static的
     let mut sig: &mut sighand_struct = Box::leak(Box::new(sighand_struct::default()));
     if (sig as *mut sighand_struct) == null_mut() {
-        return -(ENOMEM as i32);
+        return SystemError::ENOMEM.to_posix_errno();
     }
 
     // 将新的sighand赋值给pcb
@@ -87,7 +87,7 @@ pub extern "C" fn process_copy_signal(clone_flags: u64, pcb: *mut process_contro
     }
     let sig: &mut signal_struct = Box::leak(Box::new(signal_struct::default()));
     if (sig as *mut signal_struct) == null_mut() {
-        return -(ENOMEM as i32);
+        return SystemError::ENOMEM.to_posix_errno();
     }
     atomic_set(&mut sig.sig_cnt, 1);
     // 将sig赋值给pcb中的字段

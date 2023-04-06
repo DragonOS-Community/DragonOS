@@ -13,6 +13,8 @@
 #include <sched/sched.h>
 #include <time/timer.h>
 
+extern void rs_register_softirq_video();
+
 uint64_t video_refresh_expire_jiffies = 0;
 uint64_t video_last_refresh_pid = -1;
 
@@ -57,18 +59,20 @@ int video_refresh_daemon(void *unused)
 
     for (;;)
     {
-        if (clock() >= video_refresh_expire_jiffies)
+        if (rs_clock() >= video_refresh_expire_jiffies)
         {
 
             if (likely(video_refresh_target != NULL))
             {
                 spin_lock(&daemon_refresh_lock);
-                memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr,
-                       video_refresh_target->size);
+                if (video_frame_buffer_info.vaddr != NULL)
+                    memcpy((void *)video_frame_buffer_info.vaddr, (void *)video_refresh_target->vaddr,
+                           video_refresh_target->size);
                 spin_unlock(&daemon_refresh_lock);
-                video_daemon_pcb->virtual_runtime = 0xfffff0000000; // 临时解决由于显示刷新进程的虚拟运行时间过大/过小，导致其不运行，或者一直运行的问题。将来应使用实时调度解决它
+                video_daemon_pcb->virtual_runtime =
+                    0xfffff0000000; // 临时解决由于显示刷新进程的虚拟运行时间过大/过小，导致其不运行，或者一直运行的问题。将来应使用实时调度解决它
             }
-            video_refresh_expire_jiffies = cal_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
+            video_refresh_expire_jiffies = rs_timer_next_n_ms_jiffies(REFRESH_INTERVAL << 1);
         }
         video_daemon_pcb->state &= ~PROC_RUNNING;
         video_daemon_pcb->flags |= PF_NEED_SCHED;
@@ -85,7 +89,7 @@ void video_refresh_framebuffer(void *data)
 {
     if (unlikely(video_daemon_pcb == NULL))
         return;
-    if (clock() >= video_refresh_expire_jiffies)
+    if (rs_clock() >= video_refresh_expire_jiffies)
     {
         video_daemon_pcb->virtual_runtime = 0;
         process_wakeup(video_daemon_pcb);
@@ -105,17 +109,17 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
         init_frame_buffer();
     else
     {
+        rs_unregister_softirq(VIDEO_REFRESH_SIRQ);
         // 计算开始时间
-        video_refresh_expire_jiffies = cal_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
+        video_refresh_expire_jiffies = rs_timer_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
 
         // 创建video守护进程
         video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, "Video refresh daemon");
         video_daemon_pcb->virtual_runtime = 0; // 特殊情况， 最高优先级， 以后再改
-
         // 启用屏幕刷新软中断
-        register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
+        rs_register_softirq_video();
+        rs_raise_softirq(VIDEO_REFRESH_SIRQ);
 
-        raise_softirq(VIDEO_REFRESH_SIRQ);
     }
     return 0;
 }
@@ -129,7 +133,7 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
 int video_set_refresh_target(struct scm_buffer_info_t *buf)
 {
 
-    unregister_softirq(VIDEO_REFRESH_SIRQ);
+    rs_unregister_softirq(VIDEO_REFRESH_SIRQ);
     // todo: 在completion实现后，在这里等待其他刷新任务完成，再进行下一步。
 
     // int counter = 100;
@@ -137,12 +141,13 @@ int video_set_refresh_target(struct scm_buffer_info_t *buf)
     // while ((get_softirq_pending() & (1 << VIDEO_REFRESH_SIRQ)) && counter > 0)
     // {
     //     --counter;
-    //     usleep(1000);
+    //     rs_usleep(1000);
     // }
     // kdebug("buf = %#018lx", buf);
     video_refresh_target = buf;
-    register_softirq(VIDEO_REFRESH_SIRQ, &video_refresh_framebuffer, NULL);
-    raise_softirq(VIDEO_REFRESH_SIRQ);
+    rs_register_softirq_video();
+    kdebug("register softirq video done");
+    // rs_raise_softirq(VIDEO_REFRESH_SIRQ);
 }
 
 /**

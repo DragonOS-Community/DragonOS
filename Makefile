@@ -79,10 +79,16 @@ write_diskimage-uefi:
 	bash -c "cd tools && bash grub_auto_install.sh && sudo bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
-	sh -c "cd tools && bash run-qemu.sh --bios=legacy && cd .."
+	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
 # 不编译，直接启动QEMU(UEFI)
 qemu-uefi:
-	sh -c "cd tools && bash run-qemu.sh --bios=uefi && cd .."
+	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=window && cd .."
+# 不编译，直接启动QEMU,使用VNC Display作为图像输出
+qemu-vnc:
+	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=vnc && cd .."
+# 不编译，直接启动QEMU(UEFI),使用VNC Display作为图像输出
+qemu-uefi-vnc:
+	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=vnc && cd .."
 	
 # 编译并写入磁盘镜像
 build:
@@ -106,6 +112,18 @@ run:
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
+
+# uefi方式启动，使用VNC Display作为图像输出
+run-uefi-vnc:
+	$(MAKE) all -j $(NPROCS)
+	$(MAKE) write_diskimage-uefi || exit 1
+	$(MAKE) qemu-uefi-vnc
+	
+# 编译并启动QEMU，使用VNC Display作为图像输出
+run-vnc:
+	$(MAKE) all -j $(NPROCS)
+	$(MAKE) write_diskimage || exit 1
+	$(MAKE) qemu-vnc
 
 # 在docker中编译，并启动QEMU
 run-docker:

@@ -12,8 +12,6 @@
 
 typedef unsigned long (*system_call_t)(struct pt_regs *regs);
 
-extern void ret_from_system_call(void); // 导出从系统调用返回的函数（定义在entry.S）
-
 extern system_call_t system_call_table[MAX_SYSTEM_CALL_NUM];
 
 // 判断系统调用是否来自用户态

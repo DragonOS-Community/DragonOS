@@ -1,6 +1,6 @@
 # 进行启动前检查
 flag_can_run=1
-ARGS=`getopt -o p -l bios: -- "$@"`
+ARGS=`getopt -o p -l bios:,display: -- "$@"`
 eval set -- "${ARGS}"
 echo "$@"
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
@@ -35,24 +35,40 @@ QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot or
 
 QEMU_ARGUMENT+="-s -S -cpu ${QEMU_CPU_FEATURES} -rtc ${QEMU_RTC_CLOCK} -serial ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES}"
 
-
 if [ $flag_can_run -eq 1 ]; then
+  while true;do
     case "$1" in
         --bios) 
-      case "$2" in
+        case "$2" in
               uefi) #uefi启动新增ovmf.fd固件
-              if [ ${ARCH} == x86_64 ] ;then
-              sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
-              elif [ ${ARCH} == i386 ] ;then
-              sudo ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
-              fi
+              BIOS_TYPE=uefi
             ;;
               legacy)
-              sudo ${QEMU} ${QEMU_ARGUMENT}
+              BIOS_TYPE=lagacy
               ;;
-            esac       
+        esac;shift 2;;
+        --display)
+        case "$2" in
+              vnc)
+              QEMU_ARGUMENT+=" -display vnc=:5900"
+              ;;
+              window)
+              ;;
+        esac;shift 2;;
+        *) break
+      esac 
+  done 
 
-esac  
+if [ ${BIOS_TYPE} == uefi ] ;then
+  if [ ${ARCH} == x86_64 ] ;then
+    sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+  elif [ ${ARCH} == i386 ] ;then
+    sudo ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+  fi
+else
+  sudo ${QEMU} ${QEMU_ARGUMENT}
+fi
+
 else
   echo "不满足运行条件"
 fi

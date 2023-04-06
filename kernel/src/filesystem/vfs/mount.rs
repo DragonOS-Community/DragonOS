@@ -6,8 +6,7 @@ use alloc::{
 };
 
 use crate::{
-    include::bindings::bindings::{EBUSY, ENOTDIR},
-    libs::spinlock::SpinLock,
+    libs::spinlock::SpinLock, syscall::SystemError,
 };
 
 use super::{FilePrivateData, FileSystem, FileType, IndexNode, InodeId, file::FileMode};
@@ -104,7 +103,7 @@ impl MountFSInode {
     }
 
     /// @brief 判断当前inode是否为它所在的文件系统的root inode
-    fn is_mountpoint_root(&self) -> Result<bool, i32> {
+    fn is_mountpoint_root(&self) -> Result<bool, SystemError> {
         return Ok(self.inner_inode.fs().root_inode().metadata()?.inode_id
             == self.inner_inode.metadata()?.inode_id);
     }
@@ -126,11 +125,11 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
-    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), i32> {
+    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), SystemError> {
         return self.inner_inode.open(data, mode);
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), i32> {
+    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
         return self.inner_inode.close(data);
     }
 
@@ -140,13 +139,13 @@ impl IndexNode for MountFSInode {
         file_type: FileType,
         mode: u32,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, i32> {
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self
             .inner_inode
             .create_with_data(name, file_type, mode, data);
     }
 
-    fn truncate(&self, len: usize) -> Result<(), i32> {
+    fn truncate(&self, len: usize) -> Result<(), SystemError> {
         return self.inner_inode.truncate(len);
     }
 
@@ -156,7 +155,7 @@ impl IndexNode for MountFSInode {
         len: usize,
         buf: &mut [u8],
         data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         return self.inner_inode.read_at(offset, len, buf, data);
     }
 
@@ -165,15 +164,15 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+        data: &mut FilePrivateData,
+    ) -> Result<usize, SystemError> {
         return self
             .inner_inode
-            .write_at(offset, len, buf, &mut FilePrivateData::Unused);
+            .write_at(offset, len, buf, data);
     }
 
     #[inline]
-    fn poll(&self) -> Result<super::PollStatus, i32> {
+    fn poll(&self) -> Result<super::PollStatus, SystemError> {
         return self.inner_inode.poll();
     }
 
@@ -188,17 +187,17 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn metadata(&self) -> Result<super::Metadata, i32> {
+    fn metadata(&self) -> Result<super::Metadata, SystemError> {
         return self.inner_inode.metadata();
     }
 
     #[inline]
-    fn set_metadata(&self, metadata: &super::Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &super::Metadata) -> Result<(), SystemError> {
         return self.inner_inode.set_metadata(metadata);
     }
 
     #[inline]
-    fn resize(&self, len: usize) -> Result<(), i32> {
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
         return self.inner_inode.resize(len);
     }
 
@@ -208,7 +207,7 @@ impl IndexNode for MountFSInode {
         name: &str,
         file_type: FileType,
         mode: u32,
-    ) -> Result<Arc<dyn IndexNode>, i32> {
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Ok(MountFSInode {
             inner_inode: self.inner_inode.create(name, file_type, mode)?,
             mount_fs: self.mount_fs.clone(),
@@ -217,30 +216,30 @@ impl IndexNode for MountFSInode {
         .wrap());
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), i32> {
+    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         return self.inner_inode.link(name, other);
     }
 
     /// @brief 在挂载文件系统中删除文件/文件夹
     #[inline]
-    fn unlink(&self, name: &str) -> Result<(), i32> {
+    fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
         // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
         if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
-            return Err(-(EBUSY as i32));
+            return Err(SystemError::EBUSY);
         }
         // 调用内层的inode的方法来删除这个inode
         return self.inner_inode.unlink(name);
     }
 
     #[inline]
-    fn rmdir(&self, name: &str) -> Result<(), i32> {
+    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
         // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
         if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
-            return Err(-(EBUSY as i32));
+            return Err(SystemError::EBUSY);
         }
         // 调用内层的rmdir的方法来删除这个inode
         let r = self.inner_inode.rmdir(name);
@@ -254,11 +253,11 @@ impl IndexNode for MountFSInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
-    ) -> Result<(), i32> {
+    ) -> Result<(), SystemError> {
         return self.inner_inode.move_(old_name, target, new_name);
     }
 
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
             // 查找的是当前目录
             "" | "." => return Ok(self.self_ref.upgrade().unwrap()),
@@ -300,7 +299,7 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn get_entry_name(&self, ino: InodeId) -> Result<alloc::string::String, i32> {
+    fn get_entry_name(&self, ino: InodeId) -> Result<alloc::string::String, SystemError> {
         return self.inner_inode.get_entry_name(ino);
     }
 
@@ -308,27 +307,27 @@ impl IndexNode for MountFSInode {
     fn get_entry_name_and_metadata(
         &self,
         ino: InodeId,
-    ) -> Result<(alloc::string::String, super::Metadata), i32> {
+    ) -> Result<(alloc::string::String, super::Metadata), SystemError> {
         return self.inner_inode.get_entry_name_and_metadata(ino);
     }
 
     #[inline]
-    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, i32> {
+    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
         return self.inner_inode.ioctl(cmd, data);
     }
 
     #[inline]
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, i32> {
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return self.inner_inode.list();
     }
 
     /// @brief 在当前inode下，挂载一个文件系统
     ///
     /// @return Ok(Arc<MountFS>) 挂载成功，返回指向MountFS的指针
-    fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, i32> {
+    fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         // 为新的挂载点创建挂载文件系统

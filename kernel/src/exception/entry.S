@@ -64,17 +64,18 @@ ENTRY(ret_from_intr)
 
     // 进入信号处理流程
     cli
+
     // 将原本要返回的栈帧的栈指针传入do_signal的第一个参数
     movq %rsp, %rdi
     callq do_signal
-    
+
     // 恢复寄存器
     jmp Restore_all
 
     
 Err_Code:
-    // ===== 有错误码的情况下，保存寄存器并跳转服务程序
 
+    // ===== 有错误码的情况下，保存寄存器并跳转服务程序
     pushq	%rax
 	movq	%es,	%rax
 	pushq	%rax
@@ -108,14 +109,8 @@ Err_Code:
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
-    
     callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
     jmp ret_from_exception
-
-
-// 从系统调用中返回
-ENTRY(ret_from_system_call)
-    jmp Restore_all
 
 
 // 0 #DE 除法错误

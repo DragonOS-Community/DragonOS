@@ -66,12 +66,23 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     const BUDDY_ENTRIES: usize = A::PAGE_SIZE / mem::size_of::<BuddyEntry<A>>();
 
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
-        // 分配一个页用于存储 buddy 算法的数据结构
+        // 获取bump_allocator.areas()的所有area的大小之和，并判断有多少个页
+        let mut total_size = 0;
+        for area in bump_allocator.areas().iter() {
+            total_size += area.size;
+        }
+        let total_pages = total_size >> A::PAGE_SHIFT;
+        // 计算需要多少个页来存储 buddy 算法的数据结构
+        let buddy_pages = (total_pages + Self::BUDDY_ENTRIES - 1) / Self::BUDDY_ENTRIES;
+        // 申请buddy_pages个页，用于存储 buddy 算法的数据结构
         let table_phys = bump_allocator.allocate_one()?;
+        for _ in 0..buddy_pages-1 {
+            bump_allocator.allocate_one()?;
+        }
         let table_virt = A::phys_2_virt(table_phys);
         let table_virt = table_virt?;
         // 将申请到的内存全部分配为 BuddyEntry<A> 类型
-        for i in 0..Self::BUDDY_ENTRIES {
+        for i in 0..Self::BUDDY_ENTRIES*buddy_pages {
             let virt = table_virt.add(i * mem::size_of::<BuddyEntry<A>>());
             A::write(virt, BuddyEntry::<A>::empty());
         }

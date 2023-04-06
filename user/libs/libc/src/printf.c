@@ -1,10 +1,11 @@
 #include <printf.h>
 
+#include <libsystem/syscall.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <libsystem/syscall.h>
+#include <unistd.h>
 
 static char *write_num(char *str, uint64_t num, int base, int field_width, int precision, int flags);
 static char *write_float_point_num(char *str, double num, int field_width, int precision, int flags);
@@ -46,7 +47,8 @@ int printf(const char *fmt, ...)
 
     count = vsprintf(buf, fmt, args);
     va_end(args);
-    put_string(buf, COLOR_WHITE, COLOR_BLACK);
+    // put_string(buf, COLOR_WHITE, COLOR_BLACK);
+    write(1, buf, count);
     return count;
 }
 
@@ -79,15 +81,15 @@ int vsprintf(char *buf, const char *fmt, va_list args)
     str = buf;
 
     int flags;       // 用来存储格式信息的bitmap
-    int field_width; //区域宽度
-    int precision;   //精度
-    int qualifier;   //数据显示的类型
+    int field_width; // 区域宽度
+    int precision;   // 精度
+    int qualifier;   // 数据显示的类型
     int len;
 
-    //开始解析字符串
+    // 开始解析字符串
     for (; *fmt; ++fmt)
     {
-        //内容不涉及到格式化，直接输出
+        // 内容不涉及到格式化，直接输出
         if (*fmt != '%')
         {
             *str = *fmt;
@@ -95,9 +97,9 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             continue;
         }
 
-        //开始格式化字符串
+        // 开始格式化字符串
 
-        //清空标志位和field宽度
+        // 清空标志位和field宽度
         field_width = flags = 0;
 
         bool flag_tmp = true;
@@ -109,7 +111,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             switch (*fmt)
             {
             case '\0':
-                //结束解析
+                // 结束解析
                 flag_break = true;
                 flag_tmp = false;
                 break;
@@ -120,7 +122,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 ++fmt;
                 break;
             case '+':
-                //在正数前面显示加号
+                // 在正数前面显示加号
                 flags |= PLUS;
                 ++fmt;
                 break;
@@ -129,12 +131,12 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 ++fmt;
                 break;
             case '#':
-                //在八进制数前面显示 '0o'，在十六进制数前面显示 '0x' 或 '0X'
+                // 在八进制数前面显示 '0o'，在十六进制数前面显示 '0x' 或 '0X'
                 flags |= SPECIAL;
                 ++fmt;
                 break;
             case '0':
-                //显示的数字之前填充‘0’来取代空格
+                // 显示的数字之前填充‘0’来取代空格
                 flags |= PAD_ZERO;
                 ++fmt;
                 break;
@@ -146,7 +148,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
         if (flag_break)
             break;
 
-        //获取区域宽度
+        // 获取区域宽度
         field_width = -1;
         if (*fmt == '*')
         {
@@ -163,7 +165,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             }
         }
 
-        //获取小数精度
+        // 获取小数精度
         precision = -1;
         if (*fmt == '.')
         {
@@ -179,28 +181,28 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             }
         }
 
-        //获取要显示的数据的类型
+        // 获取要显示的数据的类型
         if (*fmt == 'h' || *fmt == 'l' || *fmt == 'L' || *fmt == 'Z')
         {
             qualifier = *fmt;
             ++fmt;
         }
-        //为了支持lld
+        // 为了支持lld
         if (qualifier == 'l' && *fmt == 'l', *(fmt + 1) == 'd')
             ++fmt;
 
-        //转化成字符串
+        // 转化成字符串
         long long *ip;
         switch (*fmt)
         {
-        //输出 %
+        // 输出 %
         case '%':
             *str++ = '%';
 
             break;
         // 显示一个字符
         case 'c':
-            //靠右对齐
+            // 靠右对齐
             if (!(flags & LEFT))
             {
                 while (--field_width > 0)
@@ -220,7 +222,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
 
             break;
 
-        //显示一个字符串
+        // 显示一个字符串
         case 's':
             s = va_arg(args, char *);
             if (!s)
@@ -228,7 +230,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             len = strlen(s);
             if (precision < 0)
             {
-                //未指定精度
+                // 未指定精度
                 precision = len;
             }
 
@@ -237,7 +239,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 len = precision;
             }
 
-            //靠右对齐
+            // 靠右对齐
             if (!(flags & LEFT))
                 while (len < field_width--)
                 {
@@ -259,7 +261,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
             }
 
             break;
-        //以八进制显示字符串
+        // 以八进制显示字符串
         case 'o':
             flags |= SMALL;
         case 'O':
@@ -270,7 +272,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 str = write_num(str, va_arg(args, int), 8, field_width, precision, flags);
             break;
 
-        //打印指针指向的地址
+        // 打印指针指向的地址
         case 'p':
             if (field_width == 0)
             {
@@ -282,7 +284,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
 
             break;
 
-        //打印十六进制
+        // 打印十六进制
         case 'x':
             flags |= SMALL;
         case 'X':
@@ -293,7 +295,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 str = write_num(str, va_arg(args, int), 16, field_width, precision, flags);
             break;
 
-        //打印十进制有符号整数
+        // 打印十进制有符号整数
         case 'i':
         case 'd':
 
@@ -304,7 +306,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 str = write_num(str, va_arg(args, int), 10, field_width, precision, flags);
             break;
 
-        //打印十进制无符号整数
+        // 打印十进制无符号整数
         case 'u':
             if (qualifier == 'l')
                 str = write_num(str, va_arg(args, unsigned long long), 10, field_width, precision, flags);
@@ -312,7 +314,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
                 str = write_num(str, va_arg(args, unsigned int), 10, field_width, precision, flags);
             break;
 
-        //输出有效字符数量到*ip对应的变量
+        // 输出有效字符数量到*ip对应的变量
         case 'n':
 
             if (qualifier == 'l')
@@ -331,7 +333,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
 
             break;
 
-        //对于不识别的控制符，直接输出
+        // 对于不识别的控制符，直接输出
         default:
             *str++ = '%';
             if (*fmt)
@@ -343,7 +345,7 @@ int vsprintf(char *buf, const char *fmt, va_list args)
     }
     *str = '\0';
 
-    //返回缓冲区已有字符串的长度。
+    // 返回缓冲区已有字符串的长度。
     return str - buf;
 }
 
@@ -411,7 +413,7 @@ static char *write_num(char *str, uint64_t num, int base, int field_width, int p
     else
     {
         num = llabs(num);
-        //进制转换
+        // 进制转换
         while (num > 0)
         {
             tmp_num[js_num++] = digits[num % base]; // 注意这里，输出的数字，是小端对齐的。低位存低位
@@ -438,7 +440,7 @@ static char *write_num(char *str, uint64_t num, int base, int field_width, int p
             *str++ = digits[33];
         }
         else if (base == 8)
-            *str++ = digits[24]; //注意这里是英文字母O或者o
+            *str++ = digits[24]; // 注意这里是英文字母O或者o
     if (!(flags & LEFT))
         while (field_width-- > 0)
             *str++ = pad;
@@ -502,7 +504,7 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
         tmp_num_z[js_num_z++] = '0';
     else
     {
-        //存储整数部分
+        // 存储整数部分
         while (num_z > 0)
         {
             tmp_num_z[js_num_z++] = digits[num_z % 10]; // 注意这里，输出的数字，是小端对齐的。低位存低位

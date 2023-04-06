@@ -12,7 +12,7 @@
  * @param rmtp 返回的剩余休眠时间
  * @return int 
  */
-int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
+int rs_nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
 
 /**
  * @brief 睡眠指定时间
@@ -20,4 +20,4 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
  * @param usec 微秒
  * @return int
  */
-int usleep(useconds_t usec);
+int rs_usleep(useconds_t usec);

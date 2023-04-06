@@ -1,6 +1,6 @@
 use core::ptr;
+use crate::include::bindings::bindings::{PAGE_OFFSET, process_control_block, mm_struct};
 
-use crate::include::bindings::bindings::PAGE_OFFSET;
 
 pub mod allocator;
 pub mod gfp;
@@ -199,3 +199,10 @@ pub trait MemoryManagementArch: Clone + Copy {
     /// @brief 判断指定的虚拟地址是否正确（符合规范）
     fn virt_is_valid(virt: VirtAddr) -> bool;
 }
+// ====== 重构内存管理后，请删除18-24行 ======
+//BUG pcb问题
+unsafe impl Send for process_control_block {}
+unsafe impl Sync for process_control_block {}
+
+unsafe impl Send for mm_struct {}
+unsafe impl Sync for mm_struct {}

@@ -245,7 +245,7 @@ static int xhci_hc_stop(int id)
     while ((xhci_read_op_reg32(id, XHCI_OPS_USBSTS) & (1 << 0)) == 0)
     {
         io_mfence();
-        usleep(1000);
+        rs_usleep(1000);
         if (--timeout == 0)
             return -ETIMEDOUT;
     }
@@ -285,7 +285,7 @@ static int xhci_hc_reset(int id)
     while (xhci_read_op_reg32(id, XHCI_OPS_USBCMD) & (1 << 1))
     {
         io_mfence();
-        usleep(1000);
+        rs_usleep(1000);
         if (--timeout == 0)
             return -ETIMEDOUT;
     }
@@ -319,7 +319,7 @@ static int xhci_hc_stop_legacy(int id)
                    XHCI_XECP_LEGACY_OS_OWNED)
             {
                 io_mfence();
-                usleep(1000);
+                rs_usleep(1000);
                 if (--timeout == 0)
                 {
                     kerror("The BIOS doesn't stop legacy support.");
@@ -352,7 +352,7 @@ static int xhci_hc_start_sched(int id)
     io_mfence();
     xhci_write_op_reg32(id, XHCI_OPS_USBCMD, (1 << 0) | (1 << 2) | (1 << 3));
     io_mfence();
-    usleep(100 * 1000);
+    rs_usleep(100 * 1000);
 }
 
 /**
@@ -793,7 +793,7 @@ static int xhci_reset_port(const int id, const int port)
         io_mfence();
         xhci_write_cap_reg32(id, port_status_offset + XHCI_PORT_PORTSC, (1 << 9));
         io_mfence();
-        usleep(2000);
+        rs_usleep(2000);
         // 检测端口是否被启用, 若未启用，则报错
         if ((xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC) & (1 << 9)) == 0)
         {
@@ -833,14 +833,14 @@ static int xhci_reset_port(const int id, const int port)
             break;
 #endif
         --timeout;
-        usleep(500);
+        rs_usleep(500);
     }
     // kdebug("timeout= %d", timeout);
 
     if (timeout > 0)
     {
         // 等待恢复
-        usleep(USB_TIME_RST_REC * 100);
+        rs_usleep(USB_TIME_RST_REC * 100);
         uint32_t val = xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC);
         io_mfence();
 
@@ -1219,7 +1219,7 @@ static int xhci_wait_for_interrupt(const int id, uint64_t status_vaddr)
             }
         }
         --timer;
-        usleep(1000);
+        rs_usleep(1000);
     }
 
     kerror(" USB xHCI Interrupt wait timed out.");
@@ -2001,7 +2001,7 @@ static int xhci_send_command(int id, struct xhci_TRB_t *trb, const bool do_ring)
         // We use bit 31 of the command dword since it is reserved
         while (timer && ((__read4b(origin_trb_vaddr + 8) & XHCI_IRQ_DONE) == 0))
         {
-            usleep(1000);
+            rs_usleep(1000);
             --timer;
         }
         uint32_t x = xhci_read_cap_reg32(id, xhci_hc[id].rts_offset + 0x20);

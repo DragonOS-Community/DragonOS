@@ -6,6 +6,7 @@ use core::{arch::asm, sync::atomic::compiler_fence};
 #[inline]
 pub fn current_pcb() -> &'static mut process_control_block {
     let ret: Option<&mut process_control_block>;
+
     unsafe {
         let mut tmp: u64 = !(32767u64);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);

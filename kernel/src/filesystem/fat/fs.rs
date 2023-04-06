@@ -14,9 +14,6 @@ use crate::{
         file::{FileMode, FilePrivateData},
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
-    include::bindings::bindings::{
-        EFAULT, EINVAL, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EPERM, EROFS,
-    },
     io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kerror,
     libs::{
@@ -24,6 +21,7 @@ use crate::{
         vec_cursor::VecCursor,
     },
     time::TimeSpec,
+    syscall::SystemError,
 };
 
 use super::{
@@ -123,7 +121,7 @@ impl FATInode {
         };
     }
 
-    fn find(&mut self, name: &str) -> Result<Arc<LockedFATInode>, i32> {
+    fn find(&mut self, name: &str) -> Result<Arc<LockedFATInode>, SystemError> {
         match &self.inode_type {
             FATDirEntry::Dir(d) => {
                 // 尝试在缓存区查找
@@ -153,7 +151,7 @@ impl FATInode {
                 )
             }
             _ => {
-                return Err(-(ENOTDIR as i32));
+                return Err(SystemError::ENOTDIR);
             }
         }
     }
@@ -244,7 +242,14 @@ impl FileSystem for FATFileSystem {
 }
 
 impl FATFileSystem {
-    pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, i32> {
+    /// FAT12允许的最大簇号
+    pub const FAT12_MAX_CLUSTER: u32 = 0xFF5;
+    /// FAT16允许的最大簇号
+    pub const FAT16_MAX_CLUSTER: u32 = 0xFFF5;
+    /// FAT32允许的最大簇号
+    pub const FAT32_MAX_CLUSTER: u32 = 0x0FFFFFF7;
+
+    pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, SystemError> {
         let bpb = BiosParameterBlock::new(partition.clone())?;
 
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
@@ -274,7 +279,7 @@ impl FATFileSystem {
                 FATType::FAT32(x) => x.fat_size_32 as u64,
                 _ => {
                     kerror!("FAT12 and FAT16 volumes should have non-zero BPB_FATSz16");
-                    return Err(-(EINVAL as i32));
+                    return Err(SystemError::EINVAL);
                 }
             }
         };
@@ -342,8 +347,8 @@ impl FATFileSystem {
     /// @param cluster 当前簇
     ///
     /// @return Ok(FATEntry) 当前簇在FAT表中，存储的信息。（详情见FATEntry的注释）
-    /// @return Err(i32) 错误码
-    pub fn get_fat_entry(&self, cluster: Cluster) -> Result<FATEntry, i32> {
+    /// @return Err(SystemError) 错误码
+    pub fn get_fat_entry(&self, cluster: Cluster) -> Result<FATEntry, SystemError> {
         let current_cluster = cluster.cluster_num;
 
         let fat_type: FATType = self.bpb.fat_type;
@@ -437,8 +442,8 @@ impl FATFileSystem {
     /// @param cluster 当前簇
     ///
     /// @return Ok(u64) 当前簇在FAT表中，存储的信息。
-    /// @return Err(i32) 错误码
-    pub fn get_fat_entry_raw(&self, cluster: Cluster) -> Result<u64, i32> {
+    /// @return Err(SystemError) 错误码
+    pub fn get_fat_entry_raw(&self, cluster: Cluster) -> Result<u64, SystemError> {
         let current_cluster = cluster.cluster_num;
 
         let fat_type: FATType = self.bpb.fat_type;
@@ -538,8 +543,8 @@ impl FATFileSystem {
     /// @param prev_cluster 簇链的前一个簇。本函数将会把新获取的簇，连接到它的后面。
     ///
     /// @return Ok(Cluster) 新获取的空闲簇
-    /// @return Err(i32) 错误码
-    pub fn allocate_cluster(&self, prev_cluster: Option<Cluster>) -> Result<Cluster, i32> {
+    /// @return Err(SystemError) 错误码
+    pub fn allocate_cluster(&self, prev_cluster: Option<Cluster>) -> Result<Cluster, SystemError> {
         let end_cluster: Cluster = self.max_cluster_number();
         let start_cluster: Cluster = match self.bpb.fat_type {
             FATType::FAT32(_) => {
@@ -587,7 +592,7 @@ impl FATFileSystem {
     /// @brief 释放簇链上的所有簇
     ///
     /// @param start_cluster 簇链的第一个簇
-    pub fn deallocate_cluster_chain(&self, start_cluster: Cluster) -> Result<(), i32> {
+    pub fn deallocate_cluster_chain(&self, start_cluster: Cluster) -> Result<(), SystemError> {
         let clusters: Vec<Cluster> = self.clusters(start_cluster);
         for c in clusters {
             self.deallocate_cluster(c)?;
@@ -598,7 +603,7 @@ impl FATFileSystem {
     /// @brief 释放簇
     ///
     /// @param 要释放的簇
-    pub fn deallocate_cluster(&self, cluster: Cluster) -> Result<(), i32> {
+    pub fn deallocate_cluster(&self, cluster: Cluster) -> Result<(), SystemError> {
         let entry: FATEntry = self.get_fat_entry(cluster)?;
         // 如果不是坏簇
         if entry != FATEntry::Bad {
@@ -611,7 +616,7 @@ impl FATFileSystem {
         } else {
             // 不能释放坏簇
             kerror!("Bad clusters cannot be freed.");
-            return Err(-(EFAULT as i32));
+            return Err(SystemError::EFAULT);
         }
     }
 
@@ -764,8 +769,8 @@ impl FATFileSystem {
     ///
     /// @return Ok(true) 正常
     /// @return Ok(false) 不正常
-    /// @return Err(i32) 在判断时发生错误
-    pub fn is_shut_bit_ok(&mut self) -> Result<bool, i32> {
+    /// @return Err(SystemError) 在判断时发生错误
+    pub fn is_shut_bit_ok(&mut self) -> Result<bool, SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
                 // 对于FAT32, error bit位于第一个扇区的第8字节。
@@ -787,8 +792,8 @@ impl FATFileSystem {
     ///
     /// @return Ok(true) 正常
     /// @return Ok(false) 不正常
-    /// @return Err(i32) 在判断时发生错误
-    pub fn is_hard_error_bit_ok(&mut self) -> Result<bool, i32> {
+    /// @return Err(SystemError) 在判断时发生错误
+    pub fn is_hard_error_bit_ok(&mut self) -> Result<bool, SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
                 let bit = self.get_fat_entry_raw(Cluster::new(1))? & 0x0400_0000;
@@ -806,8 +811,8 @@ impl FATFileSystem {
     /// 参考资料：https://thestarman.pcministry.com/DOS/DirtyShutdownFlag.html
     ///
     /// @return Ok(()) 设置成功
-    /// @return Err(i32) 在设置过程中，出现错误
-    pub fn set_shut_bit_ok(&mut self) -> Result<(), i32> {
+    /// @return Err(SystemError) 在设置过程中，出现错误
+    pub fn set_shut_bit_ok(&mut self) -> Result<(), SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
                 let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x0800_0000;
@@ -829,8 +834,8 @@ impl FATFileSystem {
     /// 参考资料：https://thestarman.pcministry.com/DOS/DirtyShutdownFlag.html
     ///
     /// @return Ok(()) 设置成功
-    /// @return Err(i32) 在设置过程中，出现错误
-    pub fn set_hard_error_bit_ok(&mut self) -> Result<(), i32> {
+    /// @return Err(SystemError) 在设置过程中，出现错误
+    pub fn set_hard_error_bit_ok(&mut self) -> Result<(), SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
                 let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x0400_0000;
@@ -848,7 +853,7 @@ impl FATFileSystem {
     }
 
     /// @brief 执行文件系统卸载前的一些准备工作：设置好对应的标志位，并把缓存中的数据刷入磁盘
-    pub fn umount(&mut self) -> Result<(), i32> {
+    pub fn umount(&mut self) -> Result<(), SystemError> {
         self.fs_info.0.lock().flush(&self.partition)?;
 
         self.set_shut_bit_ok()?;
@@ -901,12 +906,12 @@ impl FATFileSystem {
     /// @param end_cluster 终止簇号（不包含）
     ///
     /// @return Ok(Cluster) 寻找到的空闲簇
-    /// @return Err(i32) 错误码。如果磁盘无剩余空间，或者簇号达到给定的最大值，则返回-ENOSPC.
+    /// @return Err(SystemError) 错误码。如果磁盘无剩余空间，或者簇号达到给定的最大值，则返回-ENOSPC.
     pub fn get_free_cluster(
         &self,
         start_cluster: Cluster,
         end_cluster: Cluster,
-    ) -> Result<Cluster, i32> {
+    ) -> Result<Cluster, SystemError> {
         let max_cluster: Cluster = self.max_cluster_number();
         let mut cluster: u64 = start_cluster.cluster_num;
 
@@ -946,7 +951,7 @@ impl FATFileSystem {
 
                     // 磁盘无剩余空间，或者簇号达到给定的最大值
                     if cluster == end_cluster.cluster_num || cluster == max_cluster.cluster_num {
-                        return Err(-(ENOSPC as i32));
+                        return Err(SystemError::ENOSPC);
                     }
 
                     packed_val = match cluster & 1 {
@@ -988,7 +993,7 @@ impl FATFileSystem {
                 }
 
                 // 磁盘无剩余空间，或者簇号达到给定的最大值
-                return Err(-(ENOSPC as i32));
+                return Err(SystemError::ENOSPC);
             }
             FATType::FAT32(_) => {
                 // todo: 优化这里，减少读取磁盘的次数。
@@ -1020,7 +1025,7 @@ impl FATFileSystem {
                 }
 
                 // 磁盘无剩余空间，或者簇号达到给定的最大值
-                return Err(-(ENOSPC as i32));
+                return Err(SystemError::ENOSPC);
             }
         }
     }
@@ -1029,7 +1034,7 @@ impl FATFileSystem {
     ///
     /// @param cluster 目标簇
     /// @param fat_entry 这个簇在FAT表中，存储的信息（下一个簇的簇号）
-    pub fn set_entry(&self, cluster: Cluster, fat_entry: FATEntry) -> Result<(), i32> {
+    pub fn set_entry(&self, cluster: Cluster, fat_entry: FATEntry) -> Result<(), SystemError> {
         // fat表项在分区上的字节偏移量
         let fat_part_bytes_offset: u64 = self.bpb.fat_type.get_fat_bytes_offset(
             cluster,
@@ -1129,7 +1134,7 @@ impl FATFileSystem {
                             "FAT32: Reserved Cluster {:?} cannot be marked as free",
                             cluster
                         );
-                        return Err(-(EPERM as i32));
+                        return Err(SystemError::EPERM);
                     }
 
                     // 计算要写入的值
@@ -1159,7 +1164,7 @@ impl FATFileSystem {
     /// @brief 清空指定的簇
     ///
     /// @param cluster 要被清空的簇
-    pub fn zero_cluster(&self, cluster: Cluster) -> Result<(), i32> {
+    pub fn zero_cluster(&self, cluster: Cluster) -> Result<(), SystemError> {
         // 准备数据，用于写入
         let zeros: Vec<u8> = vec![0u8; self.bytes_per_cluster() as usize];
         let offset: usize = self.cluster_bytes_offset(cluster) as usize;
@@ -1176,7 +1181,7 @@ impl Drop for FATFileSystem {
         let r = self.umount();
         if r.is_err() {
             kerror!(
-                "Umount FAT filesystem failed: errno={}, FS detail:{self:?}",
+                "Umount FAT filesystem failed: errno={:?}, FS detail:{self:?}",
                 r.unwrap_err()
             );
         }
@@ -1198,7 +1203,7 @@ impl FATFsInfo {
         partition: Arc<Partition>,
         in_disk_fs_info_offset: u64,
         bytes_per_sec: usize,
-    ) -> Result<Self, i32> {
+    ) -> Result<Self, SystemError> {
         let mut v = Vec::<u8>::new();
         v.resize(bytes_per_sec, 0);
 
@@ -1226,7 +1231,7 @@ impl FATFsInfo {
             return Ok(fsinfo);
         } else {
             kerror!("Error occurred while parsing FATFsInfo.");
-            return Err(-(EINVAL as i32));
+            return Err(SystemError::EINVAL);
         }
     }
 
@@ -1289,7 +1294,7 @@ impl FATFsInfo {
     /// @brief 把fs info刷入磁盘
     ///
     /// @param partition fs info所在的分区
-    pub fn flush(&self, partition: &Arc<Partition>) -> Result<(), i32> {
+    pub fn flush(&self, partition: &Arc<Partition>) -> Result<(), SystemError> {
         if let Some(off) = self.offset {
             let in_block_offset = off % LBA_SIZE as u64;
 
@@ -1318,7 +1323,7 @@ impl FATFsInfo {
     /// @brief 读取磁盘上的Fs Info扇区，将里面的内容更新到结构体中
     ///
     /// @param partition fs info所在的分区
-    pub fn update(&mut self, partition: Arc<Partition>) -> Result<(), i32> {
+    pub fn update(&mut self, partition: Arc<Partition>) -> Result<(), SystemError> {
         if let Some(off) = self.offset {
             let in_block_offset = off % LBA_SIZE as u64;
 
@@ -1349,7 +1354,7 @@ impl IndexNode for LockedFATInode {
         len: usize,
         buf: &mut [u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
@@ -1362,11 +1367,11 @@ impl IndexNode for LockedFATInode {
                 return r;
             }
             FATDirEntry::Dir(_) => {
-                return Err(-(EISDIR as i32));
+                return Err(SystemError::EISDIR);
             }
             FATDirEntry::UnInit => {
                 kerror!("FATFS: param: Inode_type uninitialized.");
-                return Err(-(EROFS as i32));
+                return Err(SystemError::EROFS);
             }
         }
     }
@@ -1377,7 +1382,7 @@ impl IndexNode for LockedFATInode {
         len: usize,
         buf: &[u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, i32> {
+    ) -> Result<usize, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
@@ -1388,22 +1393,22 @@ impl IndexNode for LockedFATInode {
                 return r;
             }
             FATDirEntry::Dir(_) => {
-                return Err(-(EISDIR as i32));
+                return Err(SystemError::EISDIR);
             }
             FATDirEntry::UnInit => {
                 kerror!("FATFS: param: Inode_type uninitialized.");
-                return Err(-(EROFS as i32));
+                return Err(SystemError::EROFS);
             }
         }
     }
 
-    fn poll(&self) -> Result<PollStatus, i32> {
+    fn poll(&self) -> Result<PollStatus, SystemError> {
         // 加锁
         let inode: SpinLockGuard<FATInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
         return Ok(PollStatus {
@@ -1416,7 +1421,7 @@ impl IndexNode for LockedFATInode {
         name: &str,
         file_type: FileType,
         _mode: u32,
-    ) -> Result<Arc<dyn IndexNode>, i32> {
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
 
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
@@ -1424,7 +1429,7 @@ impl IndexNode for LockedFATInode {
 
         match &mut guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(-(ENOTDIR as i32));
+                return Err(SystemError::ENOTDIR);
             }
             FATDirEntry::Dir(d) => match file_type {
                 FileType::File => {
@@ -1436,12 +1441,12 @@ impl IndexNode for LockedFATInode {
                     return Ok(guard.find(name)?);
                 }
 
-                FileType::SymLink => return Err(-(ENOTSUP as i32)),
-                _ => return Err(-(EINVAL as i32)),
+                FileType::SymLink => return Err(SystemError::ENOTSUP),
+                _ => return Err(SystemError::EINVAL),
             },
             FATDirEntry::UnInit => {
                 kerror!("FATFS: param: Inode_type uninitialized.");
-                return Err(-(EROFS as i32));
+                return Err(SystemError::EROFS);
             }
         }
     }
@@ -1454,16 +1459,16 @@ impl IndexNode for LockedFATInode {
         return self;
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
     }
 
-    fn list(&self) -> Result<Vec<String>, i32> {
+    fn list(&self) -> Result<Vec<String>, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fatent: &FATDirEntry = &guard.inode_type;
         match fatent {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(-(ENOTDIR as i32));
+                return Err(SystemError::ENOTDIR);
             }
             FATDirEntry::Dir(dir) => {
                 // 获取当前目录下的所有目录项
@@ -1496,26 +1501,26 @@ impl IndexNode for LockedFATInode {
             }
             FATDirEntry::UnInit => {
                 kerror!("FATFS: param: Inode_type uninitialized.");
-                return Err(-(EROFS as i32));
+                return Err(SystemError::EROFS);
             }
         }
     }
 
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let target = guard.find(name)?;
         return Ok(target);
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), i32> {
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn unlink(&self, name: &str) -> Result<(), i32> {
+    fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let target: Arc<LockedFATInode> = guard.find(name)?;
         // 对目标inode上锁，以防更改
@@ -1525,12 +1530,12 @@ impl IndexNode for LockedFATInode {
 
         let dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(-(ENOTDIR as i32));
+                return Err(SystemError::ENOTDIR);
             }
             FATDirEntry::Dir(d) => d,
             FATDirEntry::UnInit => {
                 kerror!("FATFS: param: Inode_type uninitialized.");
-                return Err(-(EROFS as i32));
+                return Err(SystemError::EROFS);
             }
         };
         // 检查文件是否存在
@@ -1542,7 +1547,7 @@ impl IndexNode for LockedFATInode {
         return r;
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), i32> {
+    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let target: Arc<LockedFATInode> = guard.find(name)?;
         // 对目标inode上锁，以防更改
@@ -1552,24 +1557,24 @@ impl IndexNode for LockedFATInode {
 
         let dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(-(ENOTDIR as i32));
+                return Err(SystemError::ENOTDIR);
             }
             FATDirEntry::Dir(d) => d,
             FATDirEntry::UnInit => {
                 kerror!("FATFS: param: Inode_type uninitialized.");
-                return Err(-(EROFS as i32));
+                return Err(SystemError::EROFS);
             }
         };
         // 检查文件夹是否存在
         dir.check_existence(name, Some(true), guard.fs.upgrade().unwrap())?;
 
         // 再从磁盘删除
-        let r: Result<(), i32> = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
+        let r: Result<(), SystemError> = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
         if r.is_ok() {
             return r;
         } else {
             let r = r.unwrap_err();
-            if r == -(ENOTEMPTY as i32) {
+            if r == SystemError::ENOTEMPTY {
                 // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
                 guard.children.insert(name.to_uppercase(), target.clone());
                 drop(target_guard);
@@ -1578,10 +1583,10 @@ impl IndexNode for LockedFATInode {
         }
     }
 
-    fn get_entry_name(&self, ino: InodeId) -> Result<String, i32> {
+    fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         let guard: SpinLockGuard<FATInode> = self.0.lock();
         if guard.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
         match ino {
             0 => {
@@ -1601,7 +1606,7 @@ impl IndexNode for LockedFATInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(-(ENOENT as i32));}
+                    0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
                     _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
                 }

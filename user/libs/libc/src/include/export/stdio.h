@@ -57,7 +57,7 @@ FILE *fopen(const char *restrict pathname, const char *restrict mode);
 int fclose(FILE *stream);
 int puts(const char *s);
 int putchar(int c);
-
+int getchar(void);
 #if defined(__cplusplus) 
 }  /* extern "C" */ 
 #endif

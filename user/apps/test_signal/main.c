@@ -18,11 +18,11 @@
  */
 
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
-#include <signal.h>
 
 bool handle_ok = false;
 
@@ -39,6 +39,7 @@ int main()
     printf("registered.\n");
 
     clock_t last = clock();
+
     while (1)
     {
         if ((clock() - last) / CLOCKS_PER_SEC >= 1)

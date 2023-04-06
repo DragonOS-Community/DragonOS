@@ -21,19 +21,18 @@ struct tm
     const char *__tm_zone; /* Timezone abbreviation.  */
 };
 
-
 struct timespec
 {
-    int64_t tv_sec;    // 秒
-    int64_t tv_nsec;   // 纳秒
+    int64_t tv_sec;  // 秒
+    int64_t tv_nsec; // 纳秒
 };
 
 /**
  * @brief 休眠指定时间
- * 
+ *
  * @param rqtp 指定休眠的时间
  * @param rmtp 返回的剩余休眠时间
- * @return int 
+ * @return int
  */
 extern int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
 
@@ -47,7 +46,7 @@ extern int usleep(useconds_t usec);
 
 /**
  * @brief 获取当前的CPU时间
- * 
+ *
  * @return uint64_t timer_jiffies
  */
-extern uint64_t clock();
+extern uint64_t rs_clock();

@@ -54,7 +54,7 @@ static long ktest_mutex_case1(uint64_t arg0, uint64_t arg1)
     // 启动另一个线程
     pid_t pid = kernel_thread(ktest_mutex_case1_pid1, 0, 0);
     // 等待100ms
-    usleep(100000);
+    rs_usleep(100000);
     while (list_empty(&mtx.wait_list))
         ;
 

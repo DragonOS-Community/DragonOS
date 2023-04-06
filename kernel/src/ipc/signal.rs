@@ -1,13 +1,19 @@
-use core::{ffi::c_void, intrinsics::size_of, ptr::read_volatile, sync::atomic::compiler_fence};
+use core::{
+    ffi::c_void,
+    intrinsics::size_of,
+    ptr::{null_mut, read_volatile},
+    sync::atomic::compiler_fence,
+};
 
 use crate::{
     arch::{
         asm::{bitops::ffz, current::current_pcb, ptrace::user_mode},
+        fpu::FpState,
         interrupt::sti,
     },
     include::bindings::bindings::{
         pid_t, process_control_block, process_do_exit, process_find_pcb_by_pid, pt_regs,
-        spinlock_t, verify_area, EFAULT, EINVAL, ENOTSUP, EPERM, ESRCH, NULL, PF_EXITING,
+        spinlock_t, verify_area, NULL, PF_EXITING,
         PF_KTHREAD, PF_SIGNALED, PF_WAKEKILL, PROC_INTERRUPTIBLE, USER_CS, USER_DS,
         USER_MAX_LINEAR_ADDR,
     },
@@ -23,7 +29,7 @@ use crate::{
     process::{
         pid::PidType,
         process::{process_is_stopped, process_kick, process_wake_up_state},
-    },
+    }, syscall::SystemError,
 };
 
 use super::signal_types::{
@@ -68,7 +74,7 @@ pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     if sig == SignalNumber::INVALID {
         // 传入的signal数值不合法
         kwarn!("Not a valid signal number");
-        return (-(EINVAL as i64)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     // 初始化signal info
@@ -92,7 +98,7 @@ pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
     if retval.is_ok() {
         x = retval.unwrap();
     } else {
-        x = retval.unwrap_err();
+        x = retval.unwrap_err().to_posix_errno();
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -107,11 +113,11 @@ fn signal_kill_something_info(
     sig: SignalNumber,
     info: Option<&mut siginfo>,
     pid: pid_t,
-) -> Result<i32, i32> {
+) -> Result<i32, SystemError> {
     // 暂时不支持特殊的kill操作
     if pid <= 0 {
         kwarn!("Kill operation not support: pid={}", pid);
-        return Err(-(ENOTSUP as i32));
+        return Err(SystemError::ENOTSUP);
     }
 
     // kill单个进程
@@ -122,8 +128,8 @@ fn signal_kill_proc_info(
     sig: SignalNumber,
     info: Option<&mut siginfo>,
     pid: pid_t,
-) -> Result<i32, i32> {
-    let mut retval = Err(-(ESRCH as i32));
+) -> Result<i32, SystemError> {
+    let mut retval = Err(SystemError::ESRCH);
 
     // step1: 当进程管理模块拥有pcblist_lock之后，对其加锁
 
@@ -162,16 +168,16 @@ fn signal_send_sig_info(
     sig: SignalNumber,
     info: Option<&mut siginfo>,
     target_pcb: &mut process_control_block,
-) -> Result<i32, i32> {
+) -> Result<i32, SystemError> {
     // kdebug!("signal_send_sig_info");
     // 检查sig是否符合要求，如果不符合要求，则退出。
     if !verify_signal(sig) {
-        return Err(-(EINVAL as i32));
+        return Err(SystemError::EINVAL);
     }
 
     // 信号符合要求，可以发送
 
-    let mut retval = Err(-(ESRCH as i32));
+    let mut retval = Err(SystemError::ESRCH);
     let mut flags: u64 = 0;
     // 如果上锁成功，则发送信号
     if !lock_process_sighand(target_pcb, &mut flags).is_none() {
@@ -223,13 +229,13 @@ fn unlock_process_sighand(pcb: &mut process_control_block, flags: u64) {
 /// @brief 判断是否需要强制发送信号，然后发送信号
 /// 注意，进入该函数前，我们应当对pcb.sighand.siglock加锁。
 ///
-/// @return i32 错误码
+/// @return SystemError 错误码
 fn send_signal_locked(
     sig: SignalNumber,
     info: Option<&mut siginfo>,
     pcb: &mut process_control_block,
     pt: PidType,
-) -> Result<i32, i32> {
+) -> Result<i32, SystemError> {
     // 是否强制发送信号
     let mut force_send = false;
     // signal的信息为空
@@ -252,14 +258,14 @@ fn send_signal_locked(
 /// @param _info 信号携带的信息
 /// @param pcb 目标进程的pcb
 /// @param pt siginfo结构体中，pid字段代表的含义
-/// @return i32 错误码
+/// @return SystemError 错误码
 fn __send_signal_locked(
     sig: SignalNumber,
     info: Option<&mut siginfo>,
     pcb: &mut process_control_block,
     pt: PidType,
     _force_send: bool,
-) -> Result<i32, i32> {
+) -> Result<i32, SystemError> {
     // kdebug!("__send_signal_locked");
 
     // 判断该进入该函数时，是否已经持有了锁
@@ -452,7 +458,7 @@ pub extern "C" fn do_signal(regs: &mut pt_regs) {
         let res = handle_signal(sig_number, ka.unwrap(), &info.unwrap(), &oldset, regs);
         if res.is_err() {
             kerror!(
-                "Error occurred when handling signal: {}, pid={}, errcode={}",
+                "Error occurred when handling signal: {}, pid={}, errcode={:?}",
                 sig_number as i32,
                 current_pcb().pid,
                 res.unwrap_err()
@@ -613,14 +619,14 @@ fn collect_signal(sig: SignalNumber, pending: &mut sigpending) -> siginfo {
 /// @param oldset
 /// @param regs 之前的系统调用将要返回的时候，要弹出的栈帧的拷贝
 ///
-/// @return Result<0,i32> 若Error, 则返回错误码,否则返回Ok(0)
+/// @return Result<0,SystemError> 若Error, 则返回错误码,否则返回Ok(0)
 fn handle_signal(
     sig: SignalNumber,
     ka: &mut sigaction,
     info: &siginfo,
     oldset: &sigset_t,
     regs: &mut pt_regs,
-) -> Result<i32, i32> {
+) -> Result<i32, SystemError> {
     // 设置栈帧
     let retval = setup_frame(sig, ka, info, oldset, regs);
     if retval.is_err() {
@@ -638,7 +644,7 @@ fn setup_frame(
     info: &siginfo,
     oldset: &sigset_t,
     regs: &mut pt_regs,
-) -> Result<i32, i32> {
+) -> Result<i32, SystemError> {
     let mut err = 0;
     let frame: *mut sigframe = get_stack(ka, &regs, size_of::<sigframe>());
     // kdebug!("frame=0x{:016x}", frame as usize);
@@ -648,7 +654,7 @@ fn setup_frame(
         // 如果地址区域位于内核空间，则直接报错
         // todo: 生成一个sigsegv
         kerror!("In setup frame: access check failed");
-        return Err(-(EPERM as i32));
+        return Err(SystemError::EPERM);
     }
 
     unsafe {
@@ -658,6 +664,17 @@ fn setup_frame(
         (*frame).handler = ka._u._sa_handler as usize as *mut c_void;
     }
 
+    // 将当前进程的fp_state拷贝到用户栈
+    if current_pcb().fp_state != null_mut() {
+        unsafe {
+            let fp_state: &mut FpState = (current_pcb().fp_state as usize as *mut FpState)
+                .as_mut()
+                .unwrap();
+            (*frame).context.sc_stack.fpstate = *fp_state;
+            // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
+            fp_state.clear();
+        }
+    }
     // 将siginfo拷贝到用户栈
     err |= copy_siginfo_to_user(unsafe { &mut (*frame).info }, info).unwrap_or(1);
 
@@ -680,7 +697,10 @@ fn setup_frame(
     }
     if err != 0 {
         // todo: 在这里生成一个sigsegv,然后core dump
-        return Err(1);
+        //临时解决方案：退出当前进程
+        unsafe{
+            process_do_exit(1);
+        }
     }
     // 传入信号处理函数的第一个参数
     regs.rdi = sig as u64;
@@ -704,8 +724,8 @@ fn setup_frame(
     // 设置cs和ds寄存器
     regs.cs = (USER_CS | 0x3) as u64;
     regs.ds = (USER_DS | 0x3) as u64;
-
-    return if err == 0 { Ok(0) } else { Err(1) };
+    
+    return if err == 0 { Ok(0) } else { Err(SystemError::EPERM) };
 }
 
 #[inline(always)]
@@ -718,14 +738,14 @@ fn get_stack(_ka: &sigaction, regs: &pt_regs, size: usize) -> *mut sigframe {
 }
 
 /// @brief 将siginfo结构体拷贝到用户栈
-fn copy_siginfo_to_user(to: *mut siginfo, from: &siginfo) -> Result<i32, i32> {
+fn copy_siginfo_to_user(to: *mut siginfo, from: &siginfo) -> Result<i32, SystemError> {
     // 验证目标地址是否为用户空间
     if unsafe { !verify_area(to as u64, size_of::<siginfo>() as u64) } {
         // 如果目标地址空间不为用户空间，则直接返回错误码 -EPERM
-        return Err(-(EPERM as i32));
+        return Err(SystemError::EPERM);
     }
 
-    let retval: Result<i32, i32> = Ok(0);
+    let retval: Result<i32, SystemError> = Ok(0);
 
     // todo: 将这里按照si_code的类型来分别拷贝不同的信息。
     // 这里参考linux-2.6.39  网址： http://opengrok.ringotek.cn/xref/linux-2.6.39/arch/ia64/kernel/signal.c#137
@@ -742,7 +762,7 @@ fn copy_siginfo_to_user(to: *mut siginfo, from: &siginfo) -> Result<i32, i32> {
 /// @param context 要被设置的目标sigcontext
 /// @param mask 要被暂存的信号mask标志位
 /// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
-fn setup_sigcontext(context: &mut sigcontext, mask: &sigset_t, regs: &pt_regs) -> Result<i32, i32> {
+fn setup_sigcontext(context: &mut sigcontext, mask: &sigset_t, regs: &pt_regs) -> Result<i32, SystemError> {
     let current_thread = current_pcb().thread;
 
     context.oldmask = *mask;
@@ -768,7 +788,11 @@ fn restore_sigcontext(context: *const sigcontext, regs: &mut pt_regs) -> bool {
         (*current_thread).trap_num = (*context).trap_num;
         (*current_thread).cr2 = (*context).cr2;
         (*current_thread).err_code = (*context).err_code;
+
+        // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
+        *(current_pcb().fp_state as usize as *mut FpState) = (*context).sc_stack.fpstate;
     }
+
     return true;
 }
 
@@ -814,7 +838,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
     if !act.is_null() {
         // 如果参数的范围不在用户空间，则返回错误
         if unsafe { !verify_area(act as usize as u64, size_of::<sigaction>() as u64) } {
-            return (-(EFAULT as i64)) as u64;
+            return SystemError::EFAULT.to_posix_errno() as u64;
         }
         let mask: sigset_t = unsafe { (*act).sa_mask };
         let _input_sah = unsafe { (*act).sa_handler as u64 };
@@ -863,7 +887,7 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
     let sig = SignalNumber::from(regs.r8 as i32);
     // 如果给出的信号值不合法
     if sig == SignalNumber::INVALID {
-        return (-(EINVAL as i64)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     let retval = do_sigaction(
@@ -881,9 +905,9 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
     );
 
     // 将原本的sigaction拷贝到用户程序指定的地址
-    if (retval == 0) && (!old_act.is_null()) {
+    if (retval == Ok(())) && (!old_act.is_null()) {
         if unsafe { !verify_area(old_act as usize as u64, size_of::<sigaction>() as u64) } {
-            return (-(EFAULT as i64)) as u64;
+            return SystemError::EFAULT.to_posix_errno() as u64;
         }
         // ！！！！！！！！！！todo: 检查这里old_ka的mask，是否位SIG_IGN SIG_DFL,如果是，则将_sa_handler字段替换为对应的值
         let sah: u64;
@@ -904,15 +928,20 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
             (*old_act).sa_restorer = old_ka.sa_restorer as *mut c_void;
         }
     }
-
-    return retval as u64;
+    //return retval as u64;
+    if retval.is_ok(){
+        return 0;
+    }else{
+        return retval.unwrap_err().to_posix_errno() as u64;
+    }
+    
 }
 
 fn do_sigaction(
     sig: SignalNumber,
     act: Option<&mut sigaction>,
     old_act: Option<&mut sigaction>,
-) -> i32 {
+) -> Result<(),SystemError> {
     let pcb = current_pcb();
 
     // 指向当前信号的action的引用
@@ -924,7 +953,7 @@ fn do_sigaction(
 
     if (action.sa_flags & SA_FLAG_IMMUTABLE) != 0 {
         spin_unlock_irq(unsafe { &mut (*(pcb.sighand)).siglock });
-        return -(EINVAL as i32);
+        return Err(SystemError::EINVAL);
     }
 
     // 如果需要保存原有的sigaction
@@ -984,7 +1013,7 @@ fn do_sigaction(
     }
 
     spin_unlock_irq(unsafe { &mut (*(pcb.sighand)).siglock });
-    return 0;
+    return Ok(());
 }
 
 /// @brief 对于给定的signal number，将u64中对应的位进行置位

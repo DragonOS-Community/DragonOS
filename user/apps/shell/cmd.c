@@ -309,6 +309,11 @@ int shell_cmd_cat(int argc, char **argv)
 
     // 打开文件
     int fd = open(file_path, 0);
+    if (fd <= 0)
+    {
+        printf("ERROR: Cannot open file: %s, fd=%d\n", file_path, fd);
+        return -1;
+    }
     // 获取文件总大小
     int file_size = lseek(fd, 0, SEEK_END);
     // 将文件指针切换回文件起始位置
@@ -320,6 +325,11 @@ int shell_cmd_cat(int argc, char **argv)
     {
         memset(buf, 0, 512);
         int l = read(fd, buf, 511);
+        if (l < 0)
+        {
+            printf("ERROR: Cannot read file: %s\n", file_path);
+            return -1;
+        }
         buf[l] = '\0';
 
         file_size -= l;
@@ -486,6 +496,7 @@ int shell_cmd_exec(int argc, char **argv)
         char *file_path = get_target_filepath(argv[1], &path_len);
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
         execv(file_path, argv);
+        // printf("after execv, path=%s, argc=%d\n", file_path, argc);
         free(argv);
         free(file_path);
 
@@ -497,10 +508,8 @@ int shell_cmd_exec(int argc, char **argv)
         if (strcmp(argv[argc - 1], "&") != 0)
             waitpid(pid, &retval, 0);
         else
-        {
-            // 输出子进程的pid
-            printf("[1] %d\n", pid);
-        }
+            printf("[1] %d\n", pid); // 输出子进程的pid
+        
         free(argv);
     }
 }

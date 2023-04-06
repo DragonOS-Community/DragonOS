@@ -59,6 +59,7 @@ struct TtyCore {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum TtyError {
     /// 缓冲区满,返回成功传送的字节数
     BufferFull(usize),
@@ -281,6 +282,7 @@ impl TtyCore {
 
     /// @brief 关闭输入回显
     #[inline]
+    #[allow(dead_code)]
     pub fn disable_echo(&self) {
         self.state.write().set(TtyCoreState::ECHO_ON, false);
     }
@@ -291,6 +293,7 @@ impl TtyCore {
     ///
     /// @return false 未开启输入回显
     #[inline]
+    #[allow(dead_code)]
     pub fn echo_enabled(&self) -> bool {
         return self.state.read().contains(TtyCoreState::ECHO_ON);
     }

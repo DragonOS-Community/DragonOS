@@ -162,11 +162,9 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return self
-            .inner_inode
-            .write_at(offset, len, buf, &mut FilePrivateData::Unused);
+        return self.inner_inode.write_at(offset, len, buf, data);
     }
 
     #[inline]

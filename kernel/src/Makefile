@@ -1,4 +1,4 @@
-SUBDIR_ROOTS := .
+makSUBDIR_ROOTS := .
 DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
 GARBAGE_PATTERNS := *.o *.s~ *.s *.S~ *.c~ *.h~ kernel
 GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
@@ -17,7 +17,7 @@ export ASFLAGS := --64
 LD_LIST := head.o
 
 
-kernel_subdirs := common driver process debug time arch exception mm smp sched syscall ktest libs ipc io
+kernel_subdirs := common driver process debug arch exception mm smp sched syscall ktest libs ipc io
 	
 
 

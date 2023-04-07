@@ -238,7 +238,7 @@ pub fn do_open(path: &str, mode: FileMode) -> Result<i32, SystemError> {
     }
 
     // 把文件对象存入pcb
-    return current_pcb().alloc_fd(file);
+    return current_pcb().alloc_fd(file, None);
 }
 
 /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。

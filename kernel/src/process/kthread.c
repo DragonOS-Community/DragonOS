@@ -70,7 +70,8 @@ static struct process_control_block *__kthread_create_on_node(int (*thread_fn)(v
 
     // todo: 使用completion优化这里
     while (kthreadd_pcb == NULL) // 若kthreadd未初始化，则等待kthreadd启动
-        ;
+        barrier();
+
     // 唤醒kthreadd守护进程
     process_wakeup_immediately(kthreadd_pcb);
 
@@ -213,17 +214,21 @@ int kthreadd(void *unused)
     barrier();
     kinfo("kthread daemon started!");
     struct process_control_block *pcb = current_pcb;
+    barrier();
     kthreadd_pcb = current_pcb;
+    barrier();
     current_pcb->flags |= PF_NOFREEZE;
 
     for (;;)
     {
         current_pcb->state = PROC_INTERRUPTIBLE;
+
         // 所有的创建任务都被处理完了
         if (list_empty(&kthread_create_list))
             sched();
-
+        
         spin_lock(&__kthread_create_lock);
+
         // 循环取出链表中的任务
         while (!list_empty(&kthread_create_list))
         {
@@ -275,7 +280,7 @@ int kthread_stop(struct process_control_block *pcb)
     // 等待指定的内核线程退出
     // todo: 使用completion机制改进这里
     while (target->exited == false)
-        usleep(5000);
+        rs_usleep(5000);
     retval = target->result;
 
     // 释放内核线程的页表

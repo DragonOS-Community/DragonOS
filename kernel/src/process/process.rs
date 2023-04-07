@@ -7,7 +7,10 @@ use alloc::boxed::Box;
 
 use crate::{
     arch::{asm::current::current_pcb, fpu::FpState},
-    filesystem::vfs::file::{File, FileDescriptorVec},
+    filesystem::vfs::{
+        file::{File, FileDescriptorVec, FileMode},
+        ROOT_INODE,
+    },
     include::bindings::bindings::{
         process_control_block, CLONE_FS, PROC_INTERRUPTIBLE, PROC_RUNNING, PROC_STOPPED,
         PROC_UNINTERRUPTIBLE,
@@ -174,9 +177,12 @@ impl process_control_block {
 
     /// @brief 申请文件描述符，并把文件对象存入其中。
     ///
+    /// @param file 要存放的文件对象
+    /// @param fd 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
+    ///
     /// @return Ok(i32) 申请到的文件描述符编号
     /// @return Err(SystemError) 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(&mut self, file: File) -> Result<i32, SystemError> {
+    pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
         // 获取pcb的文件描述符数组的引用
         let fds: &mut FileDescriptorVec =
             if let Some(f) = FileDescriptorVec::from_pcb(current_pcb()) {
@@ -193,16 +199,28 @@ impl process_control_block {
                 r.unwrap()
             };
 
-        // 寻找空闲的文件描述符
-        let mut cnt = 0;
-        for x in fds.fds.iter_mut() {
+        if fd.is_some() {
+            // 指定了要申请的文件描述符编号
+            let new_fd = fd.unwrap();
+            let x = &mut fds.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Box::new(file));
-                return Ok(cnt);
+                return Ok(new_fd);
+            } else {
+                return Err(SystemError::EBADF);
             }
-            cnt += 1;
+        } else {
+            // 寻找空闲的文件描述符
+            let mut cnt = 0;
+            for x in fds.fds.iter_mut() {
+                if x.is_none() {
+                    *x = Some(Box::new(file));
+                    return Ok(cnt);
+                }
+                cnt += 1;
+            }
+            return Err(SystemError::ENFILE);
         }
-        return Err(SystemError::ENFILE);
     }
 
     /// @brief 根据文件描述符序号，获取文件结构体的可变引用
@@ -351,4 +369,37 @@ pub extern "C" fn rs_process_exit_fpstate(pcb: &'static mut process_control_bloc
     }
 }
 
+#[no_mangle]
+pub extern "C" fn rs_init_stdio() -> i32 {
+    let r = init_stdio();
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
+    }
+}
 // =========== 以上为导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们 END ============
+
+/// @brief 初始化pid=1的进程的stdio
+pub fn init_stdio() -> Result<(), SystemError> {
+    if current_pcb().pid != 1 {
+        return Err(SystemError::EPERM);
+    }
+    let tty_inode = ROOT_INODE()
+        .lookup("/dev/tty0")
+        .expect("Init stdio: can't find tty0");
+    let stdin =
+        File::new(tty_inode.clone(), FileMode::O_RDONLY).expect("Init stdio: can't create stdin");
+    let stdout =
+        File::new(tty_inode.clone(), FileMode::O_WRONLY).expect("Init stdio: can't create stdout");
+    let stderr = File::new(tty_inode.clone(), FileMode::O_WRONLY | FileMode::O_SYNC)
+        .expect("Init stdio: can't create stderr");
+
+    /*
+       按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
+    */
+    assert_eq!(current_pcb().alloc_fd(stdin, None).unwrap(), 0);
+    assert_eq!(current_pcb().alloc_fd(stdout, None).unwrap(), 1);
+    assert_eq!(current_pcb().alloc_fd(stderr, None).unwrap(), 2);
+    return Ok(());
+}

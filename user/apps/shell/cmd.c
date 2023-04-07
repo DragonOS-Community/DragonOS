@@ -309,6 +309,11 @@ int shell_cmd_cat(int argc, char **argv)
 
     // 打开文件
     int fd = open(file_path, 0);
+    if (fd <= 0)
+    {
+        printf("ERROR: Cannot open file: %s, fd=%d\n", file_path, fd);
+        return -1;
+    }
     // 获取文件总大小
     int file_size = lseek(fd, 0, SEEK_END);
     // 将文件指针切换回文件起始位置
@@ -320,6 +325,11 @@ int shell_cmd_cat(int argc, char **argv)
     {
         memset(buf, 0, 512);
         int l = read(fd, buf, 511);
+        if (l < 0)
+        {
+            printf("ERROR: Cannot read file: %s\n", file_path);
+            return -1;
+        }
         buf[l] = '\0';
 
         file_size -= l;

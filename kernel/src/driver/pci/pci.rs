@@ -18,12 +18,13 @@ use core::{
 // PCI_ROOT_0 Segment为0的全局PciRoot
 lazy_static! {
     pub static ref PCI_DEVICE_LINKEDLIST: Pci_Device_LinkedList = Pci_Device_LinkedList::new();
-    pub static ref PCI_ROOT_0:Option<PciRoot>={
-        match PciRoot::new(0)
-        {
-            Ok(root) =>Some(root),
-            Err(err) =>{kerror!("Pci_root init failed because of error: {}", err); 
-            None},
+    pub static ref PCI_ROOT_0: Option<PciRoot> = {
+        match PciRoot::new(0) {
+            Ok(root) => Some(root),
+            Err(err) => {
+                kerror!("Pci_root init failed because of error: {}", err);
+                None
+            }
         }
     };
 }
@@ -42,26 +43,26 @@ impl Pci_Device_LinkedList {
     }
     /// @brief 获取可读的linkedlist(读锁守卫)
     /// @return RwLockReadGuard<LinkedList<Box<dyn Pci_Device_Structure>>>  读锁守卫
-    fn get_linkedlist_readable(
+    pub fn get_linkedlist_readable(
         &self,
     ) -> RwLockReadGuard<LinkedList<Box<dyn Pci_Device_Structure>>> {
         self.list.read()
     }
     /// @brief 获取可写的linkedlist(写锁守卫)
     /// @return RwLockWriteGuard<LinkedList<Box<dyn Pci_Device_Structure>>>  写锁守卫
-    fn get_linkedlist_writeable(
+    pub fn get_linkedlist_writeable(
         &self,
     ) -> RwLockWriteGuard<LinkedList<Box<dyn Pci_Device_Structure>>> {
         self.list.write()
     }
     /// @brief 获取链表中PCI结构体数目
     /// @return usize 链表中PCI结构体数目
-    fn get_linkedlist_num(&self) -> usize {
+    pub fn get_linkedlist_num(&self) -> usize {
         let list = self.list.read();
         list.len()
     }
     /// @brief 添加Pci设备结构体到链表中
-    fn add_to_linkedlist(&self, device: Box<dyn Pci_Device_Structure>) {
+    pub fn add_to_linkedlist(&self, device: Box<dyn Pci_Device_Structure>) {
         let mut list = self.list.write();
         list.push_back(device);
     }
@@ -72,7 +73,7 @@ impl Pci_Device_LinkedList {
 /// @param class_code 寄存器值
 /// @param subclass 寄存器值，与class_code一起确定设备类型
 /// @return Vec<&'a mut Box<(dyn Pci_Device_Structure)  包含链表中所有满足条件的PCI结构体的可变引用的容器
-pub fn get_device_structure_mut<'a>(
+pub fn get_pci_device_structure_mut<'a>(
     list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn Pci_Device_Structure>>>,
     class_code: u8,
     subclass: u8,
@@ -91,7 +92,7 @@ pub fn get_device_structure_mut<'a>(
 /// @param class_code 寄存器值
 /// @param subclass 寄存器值，与class_code一起确定设备类型
 /// @return Vec<&'a Box<(dyn Pci_Device_Structure)  包含链表中所有满足条件的PCI结构体的不可变引用的容器
-pub fn get_device_structure<'a>(
+pub fn get_pci_device_structure<'a>(
     list: &'a mut RwLockReadGuard<'_, LinkedList<Box<dyn Pci_Device_Structure>>>,
     class_code: u8,
     subclass: u8,
@@ -298,6 +299,9 @@ pub trait Pci_Device_Structure: Send + Sync {
     fn msix_init(&mut self) -> Option<Result<u8, PciError>> {
         None
     }
+    fn enable_master(&mut self) {
+        self.set_command(Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER);
+    }
 }
 
 /// Pci_Device_Structure_Header PCI设备结构体共有的头部
@@ -364,20 +368,18 @@ impl Pci_Device_Structure for Pci_Device_Structure_General_Device {
         &mut self.common_header
     }
     fn capabilities(&self) -> Option<CapabilityIterator> {
-        let standard_device = self.as_standard_device()?;
         Some(CapabilityIterator {
-            bus_device_function: self.get_common_header().bus_device_function,
-            next_capability_offset: Some(standard_device.capabilities_pointer),
+            bus_device_function: self.common_header.bus_device_function,
+            next_capability_offset: Some(self.capabilities_pointer),
         })
     }
     fn bar_init(&mut self) -> Option<Result<u8, PciError>> {
-        let common_header = self.get_common_header();
+        let common_header = &self.common_header;
         match pci_bar_init(common_header.bus_device_function) {
             Ok(bar) => {
-                let device=self.as_standard_device_mut().unwrap();
-                device.standard_device_bar=bar;
+                self.standard_device_bar = bar;
                 Some(Ok(0))
-            },
+            }
             Err(e) => Some(Err(e)),
         }
     }
@@ -484,15 +486,25 @@ impl Pci_Device_Structure for Pci_Device_Structure_Pci_to_Cardbus_Bridge {
 /// 代表一个PCI segement greoup.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct PciRoot {
-    pub physical_address_base: u64, //物理地址，acpi获取
-    pub mmio_base: Option<*mut u32>, //映射后的虚拟地址，为方便访问数据这里转化成指针
+    pub physical_address_base: u64,                //物理地址，acpi获取
+    pub mmio_base: Option<*mut u32>,               //映射后的虚拟地址，为方便访问数据这里转化成指针
     pub segement_group_number: SegmentGroupNumber, //segement greoup的id
-    pub bus_begin: u8, //该分组中的最小bus
-    pub bus_end: u8, //该分组中的最大bus
+    pub bus_begin: u8,                             //该分组中的最小bus
+    pub bus_end: u8,                               //该分组中的最大bus
 }
 ///线程间共享需要，该结构体只需要在初始化时写入数据，无需读写锁保证线程安全
 unsafe impl Send for PciRoot {}
 unsafe impl Sync for PciRoot {}
+///实现PciRoot的Display trait，自定义输出
+impl Display for PciRoot {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+         write!(
+                f,
+                "PCI Root with segement:{}, bus begin at {}, bus end at {}, physical address at {},mapped at {:#x}",
+                self.segement_group_number, self.bus_begin, self.bus_end, self.physical_address_base, self.mmio_base.unwrap() as usize
+            )
+        }
+}
 
 impl PciRoot {
     /// @brief 初始化结构体，获取ecam root所在物理地址后map到虚拟地址，再将该虚拟地址加入mmio_base变量
@@ -584,8 +596,8 @@ impl PciRoot {
         &self,
         bus_device_function: BusDeviceFunction,
     ) -> ExternalCapabilityIterator {
-        ExternalCapabilityIterator{
-            root:self,
+        ExternalCapabilityIterator {
+            root: self,
             bus_device_function,
             next_capability_offset: Some(0x100),
         }
@@ -634,7 +646,7 @@ fn pci_read_header(
     let latency_timer = (result >> 8) as u8;
     let header_type = (result >> 16) as u8;
     let bist = (result >> 24) as u8;
-    if (vendor_id == 0xffff) {
+    if vendor_id == 0xffff {
         return Err(PciError::GetWrongHeader);
     }
     let header = Pci_Device_Structure_Header {
@@ -886,7 +898,7 @@ fn pci_read_pci_to_cardbus_bridge_header(
 
 /// @brief 检查所有bus上的设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
-fn pci_checkAllBuses() -> Result<u8, PciError> {
+fn pci_check_all_buses() -> Result<u8, PciError> {
     kinfo!("Checking all devices in PCI bus...");
     let busdevicefunction = BusDeviceFunction {
         bus: 0,
@@ -895,17 +907,18 @@ fn pci_checkAllBuses() -> Result<u8, PciError> {
     };
     let header = pci_read_header(busdevicefunction, false)?;
     let common_header = header.get_common_header();
-    pci_checkBus(0)?;
-    if (common_header.header_type & 0x80 != 0) {
+    pci_check_bus(0)?;
+    if common_header.header_type & 0x80 != 0 {
         for function in 1..8 {
-            pci_checkBus(function)?;
+            pci_check_bus(function)?;
         }
     }
     Ok(0)
 }
 /// @brief 检查特定设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
-fn pci_checkFunction(busdevicefunction: BusDeviceFunction) -> Result<u8, PciError> {
+fn pci_check_function(busdevicefunction: BusDeviceFunction) -> Result<u8, PciError> {
+    //kdebug!("PCI check function {}", busdevicefunction.function);
     let header = match pci_read_header(busdevicefunction, true) {
         Ok(header) => header,
         Err(PciError::GetWrongHeader) => {
@@ -923,13 +936,15 @@ fn pci_checkFunction(busdevicefunction: BusDeviceFunction) -> Result<u8, PciErro
             .as_pci_to_pci_bridge_device()
             .ok_or(PciError::PciDeviceStructureTransformError)?;
         let secondary_bus = pci_to_pci_bridge.secondary_bus_number;
-        pci_checkBus(secondary_bus);
+        pci_check_bus(secondary_bus)?;
     }
     Ok(0)
 }
+
 /// @brief 检查device上的设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
-fn pci_checkDevice(bus: u8, device: u8) -> Result<u8, PciError> {
+fn pci_check_device(bus: u8, device: u8) -> Result<u8, PciError> {
+    //kdebug!("PCI check device {}", device);
     let busdevicefunction = BusDeviceFunction {
         bus,
         device,
@@ -937,20 +952,17 @@ fn pci_checkDevice(bus: u8, device: u8) -> Result<u8, PciError> {
     };
     let header = match pci_read_header(busdevicefunction, false) {
         Ok(header) => header,
-        Err(PciError::GetWrongHeader) => {
+        Err(PciError::GetWrongHeader) => {//设备不存在，直接返回即可，不用终止遍历
             return Ok(255);
         }
         Err(e) => {
             return Err(e);
         }
     };
-    pci_checkFunction(busdevicefunction)?;
+    pci_check_function(busdevicefunction)?;
     let common_header = header.get_common_header();
-    match common_header.header_type & 0x80 {
-        0 => {
-            pci_checkBus(0);
-        }
-        _ => {
+    if common_header.header_type & 0x80!=0
+        {
             kdebug!(
                 "Detected multi func device in bus{},device{}",
                 busdevicefunction.bus,
@@ -963,55 +975,73 @@ fn pci_checkDevice(bus: u8, device: u8) -> Result<u8, PciError> {
                     device,
                     function,
                 };
-                pci_checkFunction(busdevicefunction)?;
+                pci_check_function(busdevicefunction)?;
             }
         }
-    }
     Ok(0)
 }
 /// @brief 检查该bus上的设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
-fn pci_checkBus(bus: u8) -> Result<u8, PciError> {
+fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
+    //kdebug!("PCI check bus {}", bus);
     for device in 0..32 {
-        pci_checkDevice(bus, device)?;
+        pci_check_device(bus, device)?;
     }
     Ok(0)
 }
+/// @brief pci初始化函数(for c)
+#[no_mangle]
+pub extern "C"  fn c_pci_init()
+{
+    pci_init();
+    //kdebug!("{}",PCI_ROOT_0.unwrap());
+}
 /// @brief pci初始化函数
-fn pci_init() {
+pub fn pci_init() {
     kinfo!("Initializing PCI bus...");
-    if let Err(e) =pci_checkAllBuses()  {
+    if let Err(e) = pci_check_all_buses() {
         kerror!("pci init failed when checking bus because of error: {}", e);
         return;
-    } 
+    }
     kinfo!(
         "Total pci device and function num = {}",
         PCI_DEVICE_LINKEDLIST.get_linkedlist_num()
     );
-    let list =PCI_DEVICE_LINKEDLIST.get_linkedlist_readable();
-    for box_pci_device in list.iter()
-    {
-        let common_header=box_pci_device.get_common_header();
-        match box_pci_device.header_type()
-        {
-            HeaderType::Standard if common_header.status &0x10!=0 => { 
+    let list = PCI_DEVICE_LINKEDLIST.get_linkedlist_readable();
+    for box_pci_device in list.iter() {
+        let common_header = box_pci_device.get_common_header();
+        match box_pci_device.header_type() {
+            HeaderType::Standard if common_header.status & 0x10 != 0 => {
                 kinfo!("Found pci standard device with class code ={} subclass={} status={:#x} cap_pointer={:#x}  vendor={:#x}, device id={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer,common_header.vendor_id, common_header.device_id);
             }
-            HeaderType::Standard=>{
-                kinfo!("Found pci standard device with class code ={} subclass={} status={:#x} ", common_header.class_code, common_header.subclass, common_header.status);
+            HeaderType::Standard => {
+                kinfo!(
+                    "Found pci standard device with class code ={} subclass={} status={:#x} ",
+                    common_header.class_code,
+                    common_header.subclass,
+                    common_header.status
+                );
             }
-            HeaderType::PciPciBridge if common_header.status &0x10!=0 => {
+            HeaderType::PciPciBridge if common_header.status & 0x10 != 0 => {
                 kinfo!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer);
-            },
-            HeaderType::PciPciBridge=>{
-                kinfo!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} ", common_header.class_code, common_header.subclass, common_header.status);
+            }
+            HeaderType::PciPciBridge => {
+                kinfo!(
+                    "Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} ",
+                    common_header.class_code,
+                    common_header.subclass,
+                    common_header.status
+                );
             }
             HeaderType::PciCardbusBridge => {
-                kinfo!("Found pcicardbus bridge device with class code ={} subclass={} status={:#x} ", common_header.class_code, common_header.subclass, common_header.status);
-            },
-            HeaderType::Unrecognised(_) => {
-
-            },
+                kinfo!(
+                    "Found pcicardbus bridge device with class code ={} subclass={} status={:#x} ",
+                    common_header.class_code,
+                    common_header.subclass,
+                    common_header.status
+                );
+            }
+            HeaderType::Unrecognised(_) => {}
         }
     }
     kinfo!("PCI bus initialized.");
@@ -1130,7 +1160,7 @@ impl BarInfo {
         }
     }
 }
-///实现BarInfo的Display trait，使其可以直接输出
+///实现BarInfo的Display trait，自定义输出
 impl Display for BarInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -1365,11 +1395,12 @@ pub struct ExternalCapabilityInfo {
     /// The third and fourth bytes of the capability, to save reading them again.
     pub capability_version: u8,
 }
+
 /// Iterator over capabilities for a device.
 /// 创建迭代器以遍历PCIe设备的external capability
 #[derive(Debug)]
 pub struct ExternalCapabilityIterator<'a> {
-    pub root:&'a  PciRoot,
+    pub root: &'a PciRoot,
     pub bus_device_function: BusDeviceFunction,
     pub next_capability_offset: Option<u16>,
 }
@@ -1382,7 +1413,7 @@ impl<'a> Iterator for ExternalCapabilityIterator<'a> {
         let capability_header = self.root.read_config(self.bus_device_function, offset);
         let id = capability_header as u16;
         let next_offset = (capability_header >> 20) as u16;
-        let capability_version = ((capability_header >> 16 )&0xf) as u8;
+        let capability_version = ((capability_header >> 16) & 0xf) as u8;
 
         self.next_capability_offset = if next_offset == 0 {
             None
@@ -1393,32 +1424,10 @@ impl<'a> Iterator for ExternalCapabilityIterator<'a> {
             Some(next_offset)
         };
 
-        Some(ExternalCapabilityInfo
-            {
+        Some(ExternalCapabilityInfo {
             offset,
             id,
             capability_version,
         })
     }
 }
-/// @brief 设置PCI Config Space里面的Command Register
-///
-/// @param bus_device_function 设备
-/// @param value command register要被设置成的值
-pub fn set_command_register(bus_device_function: &BusDeviceFunction, value: Command) {
-    Pci_Arch::write_config(
-        bus_device_function,
-        STATUS_COMMAND_OFFSET,
-        value.bits().into(),
-    );
-}
-/// @brief 使能对PCI Memory/IO空间的写入，使能PCI设备作为主设备(主动进行Memory的写入等，msix中断使用到)
-///
-/// @param bus_device_function 设备
-pub fn pci_enable_master(bus_device_function: BusDeviceFunction) {
-    set_command_register(
-        &bus_device_function,
-        Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER,
-    );
-}
-

@@ -7,6 +7,7 @@ use crate::driver::pci::pci::{
 use crate::include::bindings::bindings::{
     acpi_get_MCFG, acpi_iter_SDT, acpi_system_description_table_header_t, io_in32, io_out32,
 };
+use crate::kdebug;
 use core::ffi::c_void;
 use core::ptr::{addr_of_mut, NonNull};
 pub struct X86_64_Pci_Arch {}
@@ -26,7 +27,7 @@ impl TraitPciArch for X86_64_Pci_Arch {
         return ret;
     }
 
-    fn write_config(bus_device_function: &BusDeviceFunction, offset: u8, data: u32)  {
+    fn write_config(bus_device_function: &BusDeviceFunction, offset: u8, data: u32) {
         let address = ((bus_device_function.bus as u32) << 16)
             | ((bus_device_function.device as u32) << 11)
             | ((bus_device_function.function as u32 & 7) << 8)
@@ -44,10 +45,13 @@ impl TraitPciArch for X86_64_Pci_Arch {
     }
 
     fn get_eacm_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {
-        let data: usize = 0;
+        let mut data: usize = 0;
+        let data_point=&mut data;
         unsafe {
-            acpi_iter_SDT(Some(acpi_get_MCFG), data as *mut c_void);
-        }
+            acpi_iter_SDT(Some(acpi_get_MCFG), data_point as *mut usize as *mut c_void);
+        };
+        //kdebug!("{}",data);
+        //loop{}
         let head = NonNull::new(data as *mut acpi_system_description_table_header_t).unwrap();
         let outcome = unsafe { mcfg_find_segment(head).as_ref() };
         for segmentgroupconfiguration in outcome {

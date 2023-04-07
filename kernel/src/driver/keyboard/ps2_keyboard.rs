@@ -3,18 +3,30 @@ use core::sync::atomic::AtomicI32;
 use alloc::sync::{Arc, Weak};
 
 use crate::{
+    driver::tty::tty_device::TTY_DEVICES,
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{core::generate_inode_id, file::FileMode, FileType, IndexNode, Metadata, PollStatus},
     },
     include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t},
-    libs::rwlock::RwLock,
+    libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
     syscall::SystemError,
     time::TimeSpec,
 };
 
 #[derive(Debug)]
 pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>, AtomicI32); // self.1 用来记录有多少个文件打开了这个inode
+
+lazy_static! {
+    static ref PS2_KEYBOARD_FSM: SpinLock<TypeOneFSM> = {
+        let tty0 = TTY_DEVICES
+            .read()
+            .get("tty0")
+            .expect("Initializing PS2_KEYBOARD_FSM: Cannot found TTY0!")
+            .clone();
+        SpinLock::new(TypeOneFSM::new(tty0))
+    };
+}
 
 #[derive(Debug)]
 pub struct PS2KeyBoardInode {
@@ -170,4 +182,11 @@ impl IndexNode for LockedPS2KeyBoardInode {
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return Err(SystemError::ENOTSUP);
     }
+}
+
+#[allow(dead_code)]
+#[no_mangle]
+/// for test
+pub extern "C" fn ps2_keyboard_parse_keycode(input: u8) {
+    PS2_KEYBOARD_FSM.lock().parse(input);
 }

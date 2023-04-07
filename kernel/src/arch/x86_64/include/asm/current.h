@@ -14,6 +14,7 @@ struct process_control_block *get_current_pcb()
 						 : "=r"(current)
 						 : "0"(~32767UL));
 	barrier();
+	
 	return current;
 };
 #define current_pcb get_current_pcb()

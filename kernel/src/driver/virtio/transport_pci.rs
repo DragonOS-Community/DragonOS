@@ -1,8 +1,9 @@
 //! PCI transport for VirtIO.
 use crate::arch::{Pci_Arch, TraitPciArch};
 use crate::driver::pci::pci::{
-    capabilities_offset, pci_bar_init, pci_enable_master, BusDeviceFunction, CapabilityIterator,
-    PciError, PciStandardDeviceBar, PCI_CAP_ID_VNDR,
+    BusDeviceFunction,
+    PciError, PciStandardDeviceBar, Pci_Device_Structure, Pci_Device_Structure_General_Device,
+    PCI_CAP_ID_VNDR,
 };
 use crate::kdebug;
 use crate::libs::volatile::{
@@ -93,30 +94,26 @@ impl PciTransport {
     /// Construct a new PCI VirtIO device driver for the given device function on the given PCI
     /// root controller.
     ///
-    /// The PCI device must already have had its BARs allocated.
-    pub fn new<H: Hal>(bus_device_function: BusDeviceFunction) -> Result<Self, VirtioPciError> {
-        let device_vendor = Pci_Arch::read_config(&bus_device_function, 0);
-        let device_id = (device_vendor >> 16) as u16;
-        let vendor_id = device_vendor as u16;
-        if vendor_id != VIRTIO_VENDOR_ID {
-            return Err(VirtioPciError::InvalidVendorId(vendor_id));
+    /// 
+    pub fn new<H: Hal>(
+        device: &mut Pci_Device_Structure_General_Device,
+    ) -> Result<Self, VirtioPciError> {
+        let header = &device.common_header;
+        let bus_device_function = header.bus_device_function;
+        if header.vendor_id != VIRTIO_VENDOR_ID {
+            return Err(VirtioPciError::InvalidVendorId(header.vendor_id));
         }
-        let device_type = device_type(device_id);
+        let device_type = device_type(header.device_id);
         // Find the PCI capabilities we need.
         let mut common_cfg = None;
         let mut notify_cfg = None;
         let mut notify_off_multiplier = 0;
         let mut isr_cfg = None;
         let mut device_cfg = None;
+        device.bar_init().unwrap()?;
+        device.enable_master();
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
-        let device_capability = CapabilityIterator {
-            bus_device_function: bus_device_function,
-            next_capability_offset: capabilities_offset(bus_device_function),
-        };
-
-        let device_bar = pci_bar_init(bus_device_function)?;
-        pci_enable_master(bus_device_function);
-        for capability in device_capability {
+        for capability in device.capabilities().unwrap() {
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
             }
@@ -160,7 +157,7 @@ impl PciTransport {
         }
 
         let common_cfg = get_bar_region::<_>(
-            &device_bar,
+            &device.standard_device_bar,
             &common_cfg.ok_or(VirtioPciError::MissingCommonConfig)?,
         )?;
 
@@ -171,13 +168,16 @@ impl PciTransport {
             ));
         }
         //kdebug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
-        let notify_region = get_bar_region_slice::<_>(&device_bar, &notify_cfg)?;
+        let notify_region = get_bar_region_slice::<_>(&device.standard_device_bar, &notify_cfg)?;
         let isr_status = get_bar_region::<_>(
-            &device_bar,
+            &device.standard_device_bar,
             &isr_cfg.ok_or(VirtioPciError::MissingIsrConfig)?,
         )?;
         let config_space = if let Some(device_cfg) = device_cfg {
-            Some(get_bar_region_slice::<_>(&device_bar, &device_cfg)?)
+            Some(get_bar_region_slice::<_>(
+                &device.standard_device_bar,
+                &device_cfg,
+            )?)
         } else {
             None
         };

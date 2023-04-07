@@ -378,7 +378,7 @@ uint64_t sys_nanosleep(struct pt_regs *regs)
     const struct timespec *rqtp = (const struct timespec *)regs->r8;
     struct timespec *rmtp = (struct timespec *)regs->r9;
 
-    return nanosleep(rqtp, rmtp);
+    return rs_nanosleep(rqtp, rmtp);
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)
@@ -399,6 +399,9 @@ uint64_t sys_pipe(struct pt_regs *regs)
 }
 
 extern uint64_t sys_mkdir(struct pt_regs *regs);
+
+extern int sys_dup(int oldfd);
+extern int sys_dup2(int oldfd, int newfd);
 
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,
@@ -429,5 +432,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,
     [27] = sys_sched,
-    [28 ... 255] = system_call_not_exists,
+    [28] = sys_dup,
+    [29] = sys_dup2,
+    [30 ... 255] = system_call_not_exists,
 };

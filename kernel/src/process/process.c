@@ -48,6 +48,7 @@ extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
 extern void rs_process_exit_fpstate(struct process_control_block *pcb);
 extern int process_init_files();
+extern int rs_init_stdio();
 
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                             \
@@ -452,10 +453,6 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     current_pcb->mm->brk_end = brk_start_addr;
     current_pcb->mm->stack_start = stack_start_addr;
 
-    // 关闭之前的文件描述符
-    process_exit_files(current_pcb);
-    process_init_files();
-
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
@@ -540,9 +537,10 @@ struct process_control_block *process_init_rt_pcb(struct process_control_block *
 ul initial_kernel_thread(ul arg)
 {
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
-
-    scm_enable_double_buffer();
-
+    int val = 0;
+    val = scm_enable_double_buffer();
+    
+    rs_init_stdio();
     // block_io_scheduler_init();
     ahci_init();
     mount_root_fs();
@@ -605,7 +603,7 @@ ul initial_kernel_thread(ul arg)
                          "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/bin/shell.elf"), "c"(NULL),
                          "d"(NULL)
                          : "memory");
-
+       
     return 1;
 }
 #pragma GCC pop_options

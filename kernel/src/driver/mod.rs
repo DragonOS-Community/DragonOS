@@ -5,6 +5,7 @@ use alloc::{collections::BTreeMap, sync::Arc};
 use crate::libs::rwlock::RwLock;
 use net::NetDriver;
 
+pub mod base;
 pub mod disk;
 pub mod keyboard;
 pub mod net;
@@ -36,3 +37,4 @@ pub trait Driver: Sync + Send + Debug{
     fn as_any_mut(&'static mut self) -> &'static mut dyn core::any::Any;
 
 }
+

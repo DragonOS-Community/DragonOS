@@ -127,7 +127,7 @@ int scm_register_alloc(const char *name, const uint8_t type, struct scm_ui_frame
 {
     // 若未启用动态申请，则返回。
     if (unlikely(__scm_alloc_enabled == false))
-        return -EAGAIN;
+        return -EAGAIN_OR_EWOULDBLOCK;
 
     // 检查参数合法性
     if (__check_ui_param(name, type, ops) != 0)

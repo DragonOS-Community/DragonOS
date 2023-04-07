@@ -210,7 +210,7 @@ impl<T> SpinLock<T> {
                 flag: 0,
             });
         }
-        return Err(SystemError::EAGAIN);
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     pub fn try_lock_irqsave(&self) -> Result<SpinLockGuard<T>, SystemError> {
@@ -221,7 +221,7 @@ impl<T> SpinLock<T> {
                 flag: flags,
             });
         }
-        return Err(SystemError::EAGAIN);
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 }
 

@@ -640,8 +640,8 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     msi_desc.pci.msi_attribute.is_64 = 1;
     msi_desc.pci.msi_attribute.is_msix = 1;
     io_mfence();
-    //因pci_enable_msi不再单独映射MSIX表，所以需要对pci设备的bar进行映射
-    
+    // 因pci_enable_msi不再单独映射MSIX表，所以需要对pci设备的bar进行映射
+
     int retval = pci_enable_msi(&msi_desc);
 
     return 0;
@@ -798,7 +798,7 @@ static int xhci_reset_port(const int id, const int port)
         if ((xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC) & (1 << 9)) == 0)
         {
             kdebug("cannot power on %d", port);
-            return -EAGAIN;
+            return -EAGAIN_OR_EWOULDBLOCK;
         }
     }
     // kdebug("port:%d, power check ok", port);
@@ -903,8 +903,8 @@ static uint64_t xhci_initialize_slot(const int id, const int port, const int spe
     slot_ctx.speed = speed;
     slot_ctx.route_string = 0;
     slot_ctx.rh_port_num = port + 1; // 由于xhci控制器是1-base的，因此把驱动程序中存储的端口号加1，才是真实的端口号
-    slot_ctx.max_exit_latency = 0; // 稍后会计算这个值
-    slot_ctx.int_target = 0;       // 当前全部使用第0个interrupter
+    slot_ctx.max_exit_latency = 0;   // 稍后会计算这个值
+    slot_ctx.int_target = 0;         // 当前全部使用第0个interrupter
     slot_ctx.slot_state = XHCI_SLOT_STATE_DISABLED_OR_ENABLED;
     slot_ctx.device_address = 0;
 
@@ -1047,7 +1047,7 @@ static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int s
         retval = 0;
     }
     else
-        retval = -EAGAIN;
+        retval = -EAGAIN_OR_EWOULDBLOCK;
 done:;
 failed:;
     kfree((void *)input_ctx_buffer);
@@ -1394,7 +1394,7 @@ static inline int xhci_get_desc(const int id, const int port_id, void *target, c
                        length);
     count = xhci_control_in(id, &ctrl_in_packet, target, port_id, dev_desc->max_packet_size);
     if (unlikely(count == 0))
-        return -EAGAIN;
+        return -EAGAIN_OR_EWOULDBLOCK;
     return 0;
 }
 
@@ -1568,7 +1568,7 @@ static int xhci_get_descriptor(const int id, const int port_id, struct usb_devic
         }
     }
     else
-        return -EAGAIN; // slot id 不合法
+        return -EAGAIN_OR_EWOULDBLOCK; // slot id 不合法
 
     xhci_hc[id].ports[port_id].slot_id = slot_id;
     // kdebug("speed=%d", speed);
@@ -1587,7 +1587,7 @@ static int xhci_get_descriptor(const int id, const int port_id, struct usb_devic
     DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (USB_DT_DEVICE << 8), 0, 18);
     count = xhci_control_in(id, &ctrl_in_packet, dev_desc, port_id, max_packet);
     if (unlikely(count == 0))
-        return -EAGAIN;
+        return -EAGAIN_OR_EWOULDBLOCK;
     /*
         TODO: if the dev_desc->max_packet was different than what we have as max_packet,
           you would need to change it here and in the slot context by doing a
@@ -1779,7 +1779,7 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
         retval = 0;
     }
     else
-        retval = -EAGAIN;
+        retval = -EAGAIN_OR_EWOULDBLOCK;
 done:;
 failed:;
     kfree((void *)input_ctx_buffer);

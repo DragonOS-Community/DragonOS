@@ -3,11 +3,7 @@ use crate::filesystem::vfs::make_rawdev;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
 };
-use crate::{
-    syscall::SystemError,
-    libs::spinlock::SpinLock,
-    time::TimeSpec,
-};
+use crate::{libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -74,11 +70,11 @@ impl IndexNode for LockedNullInode {
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -90,7 +86,7 @@ impl IndexNode for LockedNullInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {

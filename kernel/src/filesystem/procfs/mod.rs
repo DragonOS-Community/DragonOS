@@ -14,16 +14,16 @@ use crate::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
     },
-    include::bindings::bindings::{
-        pid_t, process_find_pcb_by_pid,
-    },
+    include::bindings::bindings::{pid_t, process_find_pcb_by_pid},
     kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec, syscall::SystemError,
+    syscall::SystemError,
+    time::TimeSpec,
 };
 
 use super::vfs::{
-    file::{FilePrivateData, FileMode}, FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
+    file::{FileMode, FilePrivateData},
+    FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
 };
 
 /// @brief 进程文件类型
@@ -413,7 +413,7 @@ impl IndexNode for LockedProcFSInode {
         _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn poll(&self) -> Result<PollStatus, SystemError> {
@@ -581,7 +581,7 @@ impl IndexNode for LockedProcFSInode {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

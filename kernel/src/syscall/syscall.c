@@ -395,7 +395,7 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 }
 uint64_t sys_pipe(struct pt_regs *regs)
 {
-    return -ENOTSUP;
+    return -EOPNOTSUPP_OR_ENOTSUP;
 }
 
 extern uint64_t sys_mkdir(struct pt_regs *regs);

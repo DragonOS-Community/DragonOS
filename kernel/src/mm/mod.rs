@@ -1,6 +1,5 @@
-use core::ptr;
-use crate::include::bindings::bindings::{PAGE_OFFSET, process_control_block, mm_struct};
-
+use crate::include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET};
+use core::{fmt::Debug, ptr};
 
 pub mod allocator;
 pub mod gfp;
@@ -28,7 +27,7 @@ pub enum PageTableKind {
 }
 
 /// 物理内存地址
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct PhysAddr(usize);
 
@@ -49,10 +48,22 @@ impl PhysAddr {
     pub fn add(self, offset: usize) -> Self {
         Self(self.0 + offset)
     }
+
+    /// @brief 判断物理地址是否按照指定要求对齐
+    #[inline(always)]
+    pub fn check_aligned(&self, align: usize) -> bool {
+        return self.0 & (align - 1) == 0;
+    }
+}
+
+impl Debug for PhysAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "PhysAddr({:#x})", self.0)
+    }
 }
 
 /// 虚拟内存地址
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct VirtAddr(usize);
 
@@ -82,6 +93,18 @@ impl VirtAddr {
         } else {
             return PageTableKind::User;
         }
+    }
+
+    /// @brief 判断虚拟地址是否按照指定要求对齐
+    #[inline(always)]
+    pub fn check_aligned(&self, align: usize) -> bool {
+        return self.0 & (align - 1) == 0;
+    }
+}
+
+impl Debug for VirtAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "VirtAddr({:#x})", self.0)
     }
 }
 
@@ -199,10 +222,12 @@ pub trait MemoryManagementArch: Clone + Copy {
     /// @brief 判断指定的虚拟地址是否正确（符合规范）
     fn virt_is_valid(virt: VirtAddr) -> bool;
 }
-// ====== 重构内存管理后，请删除18-24行 ======
+
+// ====== 重构内存管理、进程管理后，请删除这几行 BEGIN ======
 //BUG pcb问题
 unsafe impl Send for process_control_block {}
 unsafe impl Sync for process_control_block {}
 
 unsafe impl Send for mm_struct {}
 unsafe impl Sync for mm_struct {}
+// ====== 重构内存管理后，请删除这几行 END =======

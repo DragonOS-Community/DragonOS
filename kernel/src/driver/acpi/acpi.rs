@@ -1,6 +1,6 @@
 use crate::driver::pci::pci::SegmentGroupNumber;
 use crate::include::bindings::bindings::acpi_system_description_table_header_t;
-use core::ptr::{addr_of_mut, slice_from_raw_parts_mut, NonNull};
+use core::ptr::{slice_from_raw_parts_mut, NonNull};
 // MCFG表中的Segement配置部分，开始位置为44+16*n
 #[repr(C, packed)]
 pub struct Segement_Configuration_Space {

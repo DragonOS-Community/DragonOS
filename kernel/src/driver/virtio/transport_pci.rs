@@ -1,11 +1,10 @@
 //! PCI transport for VirtIO.
-use crate::arch::{Pci_Arch, TraitPciArch};
+use crate::arch::{PciArch, TraitPciArch};
 use crate::driver::pci::pci::{
-    BusDeviceFunction,
-    PciError, PciStandardDeviceBar, Pci_Device_Structure, Pci_Device_Structure_General_Device,
-    PCI_CAP_ID_VNDR,
+    BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
+    PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
-use crate::kdebug;
+
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
@@ -94,9 +93,9 @@ impl PciTransport {
     /// Construct a new PCI VirtIO device driver for the given device function on the given PCI
     /// root controller.
     ///
-    /// 
+    ///
     pub fn new<H: Hal>(
-        device: &mut Pci_Device_Structure_General_Device,
+        device: &mut PciDeviceStructureGeneralDevice,
     ) -> Result<Self, VirtioPciError> {
         let header = &device.common_header;
         let bus_device_function = header.bus_device_function;
@@ -123,13 +122,13 @@ impl PciTransport {
                 continue;
             }
             let struct_info = VirtioCapabilityInfo {
-                bar: Pci_Arch::read_config(&bus_device_function, capability.offset + CAP_BAR_OFFSET)
+                bar: PciArch::read_config(&bus_device_function, capability.offset + CAP_BAR_OFFSET)
                     as u8,
-                offset: Pci_Arch::read_config(
+                offset: PciArch::read_config(
                     &bus_device_function,
                     capability.offset + CAP_BAR_OFFSET_OFFSET,
                 ),
-                length: Pci_Arch::read_config(
+                length: PciArch::read_config(
                     &bus_device_function,
                     capability.offset + CAP_LENGTH_OFFSET,
                 ),
@@ -141,7 +140,7 @@ impl PciTransport {
                 }
                 VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify_cfg.is_none() => {
                     notify_cfg = Some(struct_info);
-                    notify_off_multiplier = Pci_Arch::read_config(
+                    notify_off_multiplier = PciArch::read_config(
                         &bus_device_function,
                         capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET,
                     );

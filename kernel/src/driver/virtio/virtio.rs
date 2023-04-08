@@ -1,10 +1,10 @@
 use super::transport_pci::PciTransport;
 use super::virtio_impl::HalImpl;
+use crate::driver::pci::pci::PciDeviceStructureGeneralDevice;
 use crate::driver::pci::pci::{
-    get_pci_device_structure_mut, Pci_Device_Structure, PCI_DEVICE_LINKEDLIST,
+    get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
-use crate::driver::pci::pci::{BusDeviceFunction, Pci_Device_Structure_General_Device};
-use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::rwlock::RwLockWriteGuard;
 use crate::{kdebug, kerror, kwarn};
 use alloc::{boxed::Box, collections::LinkedList};
 use virtio_drivers::device::net::VirtIONet;
@@ -124,9 +124,9 @@ fn virtio_net<T: Transport>(transport: T) {
 /// @return Result<LinkedList<&'a mut Pci_Device_Structure_General_Device>, VirtioError>  成功则返回包含所有virtio设备结构体的可变引用的链表，失败则返回err
 /// 该函数主要是为其他virtio设备预留支持
 fn virtio_device_search<'a>(
-    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn Pci_Device_Structure>>>,
-) -> Result<LinkedList<&'a mut Pci_Device_Structure_General_Device>, VirtioError> {
-    let mut virtio_list: LinkedList<&mut Pci_Device_Structure_General_Device> = LinkedList::new();
+    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
+) -> Result<LinkedList<&'a mut PciDeviceStructureGeneralDevice>, VirtioError> {
+    let mut virtio_list: LinkedList<&mut PciDeviceStructureGeneralDevice> = LinkedList::new();
     let virtio_net_device = get_virtio_net_device(list)?;
     virtio_list.push_back(virtio_net_device);
     Ok(virtio_list)
@@ -136,8 +136,8 @@ fn virtio_device_search<'a>(
 /// @param list 链表的写锁
 /// @return Result<&'a mut Pci_Device_Structure_General_Device, VirtioError> 成功则返回virtio设备结构体的可变引用，失败则返回err
 fn get_virtio_net_device<'a>(
-    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn Pci_Device_Structure>>>,
-) -> Result<&'a mut Pci_Device_Structure_General_Device, VirtioError> {
+    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
+) -> Result<&'a mut PciDeviceStructureGeneralDevice, VirtioError> {
     let result = get_pci_device_structure_mut(list, NETWORK_CLASS, ETHERNET_SUBCLASS);
     if result.is_empty() {
         return Err(VirtioError::NetDeviceNotFound);

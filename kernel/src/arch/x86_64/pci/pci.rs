@@ -1,5 +1,5 @@
 use crate::arch::TraitPciArch;
-use crate::driver::acpi::acpi::{mcfg_find_segment, Segement_Configuration_Space};
+use crate::driver::acpi::acpi::mcfg_find_segment;
 use crate::driver::pci::pci::{
     BusDeviceFunction, PciError, PciRoot, SegmentGroupNumber, PORT_PCI_CONFIG_ADDRESS,
     PORT_PCI_CONFIG_DATA,
@@ -7,11 +7,11 @@ use crate::driver::pci::pci::{
 use crate::include::bindings::bindings::{
     acpi_get_MCFG, acpi_iter_SDT, acpi_system_description_table_header_t, io_in32, io_out32,
 };
-use crate::kdebug;
+
 use core::ffi::c_void;
-use core::ptr::{addr_of_mut, NonNull};
-pub struct X86_64_Pci_Arch {}
-impl TraitPciArch for X86_64_Pci_Arch {
+use core::ptr::NonNull;
+pub struct X86_64PciArch {}
+impl TraitPciArch for X86_64PciArch {
     fn read_config(bus_device_function: &BusDeviceFunction, offset: u8) -> u32 {
         // 构造pci配置空间地址
         let address = ((bus_device_function.bus as u32) << 16)
@@ -46,7 +46,7 @@ impl TraitPciArch for X86_64_Pci_Arch {
 
     fn get_eacm_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {
         let mut data: usize = 0;
-        let data_point=&mut data;
+        let data_point = &mut data;
         unsafe {
             acpi_iter_SDT(Some(acpi_get_MCFG), data_point as *mut usize as *mut c_void);
         };

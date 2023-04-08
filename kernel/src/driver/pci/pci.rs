@@ -1,6 +1,7 @@
-//目前仅支持单主桥单Segment
+#![allow(dead_code)]
+// 目前仅支持单主桥单Segment
 
-use crate::arch::{Pci_Arch, TraitPciArch};
+use crate::arch::{PciArch, TraitPciArch};
 use crate::include::bindings::bindings::{
     initial_mm, mm_map, mm_struct, PAGE_2M_SIZE, VM_DONTCOPY, VM_IO,
 };
@@ -17,7 +18,7 @@ use core::{
 // PCI_DEVICE_LINKEDLIST 添加了读写锁的全局链表，里面存储了检索到的PCI设备结构体
 // PCI_ROOT_0 Segment为0的全局PciRoot
 lazy_static! {
-    pub static ref PCI_DEVICE_LINKEDLIST: Pci_Device_LinkedList = Pci_Device_LinkedList::new();
+    pub static ref PCI_DEVICE_LINKEDLIST: PciDeviceLinkedList = PciDeviceLinkedList::new();
     pub static ref PCI_ROOT_0: Option<PciRoot> = {
         match PciRoot::new(0) {
             Ok(root) => Some(root),
@@ -30,29 +31,29 @@ lazy_static! {
 }
 
 /// 添加了读写锁的链表，存储PCI设备结构体
-pub struct Pci_Device_LinkedList {
-    list: RwLock<LinkedList<Box<dyn Pci_Device_Structure>>>,
+pub struct PciDeviceLinkedList {
+    list: RwLock<LinkedList<Box<dyn PciDeviceStructure>>>,
 }
 
-impl Pci_Device_LinkedList {
+impl PciDeviceLinkedList {
     /// @brief 初始化结构体
     fn new() -> Self {
-        Pci_Device_LinkedList {
+        PciDeviceLinkedList {
             list: RwLock::new(LinkedList::new()),
         }
     }
     /// @brief 获取可读的linkedlist(读锁守卫)
-    /// @return RwLockReadGuard<LinkedList<Box<dyn Pci_Device_Structure>>>  读锁守卫
+    /// @return RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>>  读锁守卫
     pub fn get_linkedlist_readable(
         &self,
-    ) -> RwLockReadGuard<LinkedList<Box<dyn Pci_Device_Structure>>> {
+    ) -> RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.read()
     }
     /// @brief 获取可写的linkedlist(写锁守卫)
-    /// @return RwLockWriteGuard<LinkedList<Box<dyn Pci_Device_Structure>>>  写锁守卫
+    /// @return RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>>  写锁守卫
     pub fn get_linkedlist_writeable(
         &self,
-    ) -> RwLockWriteGuard<LinkedList<Box<dyn Pci_Device_Structure>>> {
+    ) -> RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.write()
     }
     /// @brief 获取链表中PCI结构体数目
@@ -62,7 +63,7 @@ impl Pci_Device_LinkedList {
         list.len()
     }
     /// @brief 添加Pci设备结构体到链表中
-    pub fn add_to_linkedlist(&self, device: Box<dyn Pci_Device_Structure>) {
+    pub fn add_to_linkedlist(&self, device: Box<dyn PciDeviceStructure>) {
         let mut list = self.list.write();
         list.push_back(device);
     }
@@ -72,12 +73,12 @@ impl Pci_Device_LinkedList {
 /// @param list 链表的写锁守卫  
 /// @param class_code 寄存器值
 /// @param subclass 寄存器值，与class_code一起确定设备类型
-/// @return Vec<&'a mut Box<(dyn Pci_Device_Structure)  包含链表中所有满足条件的PCI结构体的可变引用的容器
+/// @return Vec<&'a mut Box<(dyn PciDeviceStructure)  包含链表中所有满足条件的PCI结构体的可变引用的容器
 pub fn get_pci_device_structure_mut<'a>(
-    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn Pci_Device_Structure>>>,
+    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
     class_code: u8,
     subclass: u8,
-) -> Vec<&'a mut Box<(dyn Pci_Device_Structure)>> {
+) -> Vec<&'a mut Box<(dyn PciDeviceStructure)>> {
     let mut result = Vec::new();
     for box_pci_device_structure in list.iter_mut() {
         let common_header = (*box_pci_device_structure).get_common_header();
@@ -91,12 +92,12 @@ pub fn get_pci_device_structure_mut<'a>(
 /// @param list 链表的读锁守卫  
 /// @param class_code 寄存器值
 /// @param subclass 寄存器值，与class_code一起确定设备类型
-/// @return Vec<&'a Box<(dyn Pci_Device_Structure)  包含链表中所有满足条件的PCI结构体的不可变引用的容器
+/// @return Vec<&'a Box<(dyn PciDeviceStructure)  包含链表中所有满足条件的PCI结构体的不可变引用的容器
 pub fn get_pci_device_structure<'a>(
-    list: &'a mut RwLockReadGuard<'_, LinkedList<Box<dyn Pci_Device_Structure>>>,
+    list: &'a mut RwLockReadGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
     class_code: u8,
     subclass: u8,
-) -> Vec<&'a Box<(dyn Pci_Device_Structure)>> {
+) -> Vec<&'a Box<(dyn PciDeviceStructure)>> {
     let mut result = Vec::new();
     for box_pci_device_structure in list.iter() {
         let common_header = (*box_pci_device_structure).get_common_header();
@@ -228,41 +229,37 @@ impl Display for PciError {
 }
 
 /// trait类型Pci_Device_Structure表示pci设备，动态绑定三种具体设备类型：Pci_Device_Structure_General_Device、Pci_Device_Structure_Pci_to_Pci_Bridge、Pci_Device_Structure_Pci_to_Cardbus_Bridge
-pub trait Pci_Device_Structure: Send + Sync {
+pub trait PciDeviceStructure: Send + Sync {
     /// @brief 获取设备类型
     /// @return HeaderType 设备类型
     fn header_type(&self) -> HeaderType;
     /// @brief 当其为standard设备时返回&Pci_Device_Structure_General_Device，其余情况返回None
-    fn as_standard_device(&self) -> Option<&Pci_Device_Structure_General_Device> {
+    fn as_standard_device(&self) -> Option<&PciDeviceStructureGeneralDevice> {
         None
     }
     /// @brief 当其为pci to pci bridge设备时返回&Pci_Device_Structure_Pci_to_Pci_Bridge，其余情况返回None
-    fn as_pci_to_pci_bridge_device(&self) -> Option<&Pci_Device_Structure_Pci_to_Pci_Bridge> {
+    fn as_pci_to_pci_bridge_device(&self) -> Option<&PciDeviceStructurePciToPciBridge> {
         None
     }
     /// @brief 当其为pci to cardbus bridge设备时返回&Pci_Device_Structure_Pci_to_Cardbus_Bridge，其余情况返回None
-    fn as_pci_to_carbus_bridge_device(
-        &self,
-    ) -> Option<&Pci_Device_Structure_Pci_to_Cardbus_Bridge> {
+    fn as_pci_to_carbus_bridge_device(&self) -> Option<&PciDeviceStructurePciToCardbusBridge> {
         None
     }
     /// @brief 获取Pci设备共有的common_header
     /// @return 返回其不可变引用
-    fn get_common_header(&self) -> &Pci_Device_Structure_Header;
+    fn get_common_header(&self) -> &PciDeviceStructureHeader;
     /// @brief 当其为standard设备时返回&mut Pci_Device_Structure_General_Device，其余情况返回None
-    fn as_standard_device_mut(&mut self) -> Option<&mut Pci_Device_Structure_General_Device> {
+    fn as_standard_device_mut(&mut self) -> Option<&mut PciDeviceStructureGeneralDevice> {
         None
     }
     /// @brief 当其为pci to pci bridge设备时返回&mut Pci_Device_Structure_Pci_to_Pci_Bridge，其余情况返回None
-    fn as_pci_to_pci_bridge_device_mut(
-        &mut self,
-    ) -> Option<&mut Pci_Device_Structure_Pci_to_Pci_Bridge> {
+    fn as_pci_to_pci_bridge_device_mut(&mut self) -> Option<&mut PciDeviceStructurePciToPciBridge> {
         None
     }
     /// @brief 当其为pci to cardbus bridge设备时返回&mut Pci_Device_Structure_Pci_to_Cardbus_Bridge，其余情况返回None
     fn as_pci_to_carbus_bridge_device_mut(
         &mut self,
-    ) -> Option<&mut Pci_Device_Structure_Pci_to_Cardbus_Bridge> {
+    ) -> Option<&mut PciDeviceStructurePciToCardbusBridge> {
         None
     }
     /// @brief 返回迭代器，遍历capabilities
@@ -281,7 +278,7 @@ pub trait Pci_Device_Structure: Send + Sync {
         let common_header = self.get_common_header_mut();
         let command = command.bits();
         common_header.command = command;
-        Pci_Arch::write_config(
+        PciArch::write_config(
             &common_header.bus_device_function,
             STATUS_COMMAND_OFFSET,
             command as u32,
@@ -289,7 +286,7 @@ pub trait Pci_Device_Structure: Send + Sync {
     }
     /// @brief 获取Pci设备共有的common_header
     /// @return 返回其可变引用
-    fn get_common_header_mut(&mut self) -> &mut Pci_Device_Structure_Header;
+    fn get_common_header_mut(&mut self) -> &mut PciDeviceStructureHeader;
     /// @brief 读取standard设备的bar寄存器，映射后将结果加入结构体的standard_device_bar变量
     /// @return 只有standard设备才返回成功或者错误，其余返回None
     fn bar_init(&mut self) -> Option<Result<u8, PciError>> {
@@ -306,7 +303,7 @@ pub trait Pci_Device_Structure: Send + Sync {
 
 /// Pci_Device_Structure_Header PCI设备结构体共有的头部
 #[derive(Clone, Debug)]
-pub struct Pci_Device_Structure_Header {
+pub struct PciDeviceStructureHeader {
     // 包含msix table地址的bar的mmio基地址 todo:以下四个作为一个结构体统一管理
     pub msix_mmio_vaddr: u64,
     pub msix_mmio_size: u64,  // msix映射长度
@@ -334,8 +331,8 @@ pub struct Pci_Device_Structure_Header {
 
 /// Pci_Device_Structure_General_Device PCI标准设备结构体
 #[derive(Clone, Debug)]
-pub struct Pci_Device_Structure_General_Device {
-    pub common_header: Pci_Device_Structure_Header,
+pub struct PciDeviceStructureGeneralDevice {
+    pub common_header: PciDeviceStructureHeader,
     pub standard_device_bar: PciStandardDeviceBar,
     pub cardbus_cis_pointer: u32, // 指向卡信息结构，供在 CardBus 和 PCI 之间共享芯片的设备使用。
     pub subsystem_vendor_id: u16,
@@ -350,21 +347,21 @@ pub struct Pci_Device_Structure_General_Device {
     pub min_grant: u8, // 一个只读寄存器，用于指定设备所需的突发周期长度（以 1/4 微秒为单位）（假设时钟速率为 33 MHz）
     pub max_latency: u8, // 一个只读寄存器，指定设备需要多长时间访问一次 PCI 总线（以 1/4 微秒为单位）。
 }
-impl Pci_Device_Structure for Pci_Device_Structure_General_Device {
+impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
     fn header_type(&self) -> HeaderType {
         HeaderType::Standard
     }
-    fn as_standard_device(&self) -> Option<&Pci_Device_Structure_General_Device> {
+    fn as_standard_device(&self) -> Option<&PciDeviceStructureGeneralDevice> {
         Some(self)
     }
-    fn as_standard_device_mut(&mut self) -> Option<&mut Pci_Device_Structure_General_Device> {
+    fn as_standard_device_mut(&mut self) -> Option<&mut PciDeviceStructureGeneralDevice> {
         Some(self)
     }
-    fn get_common_header(&self) -> &Pci_Device_Structure_Header {
+    fn get_common_header(&self) -> &PciDeviceStructureHeader {
         &self.common_header
     }
 
-    fn get_common_header_mut(&mut self) -> &mut Pci_Device_Structure_Header {
+    fn get_common_header_mut(&mut self) -> &mut PciDeviceStructureHeader {
         &mut self.common_header
     }
     fn capabilities(&self) -> Option<CapabilityIterator> {
@@ -386,8 +383,8 @@ impl Pci_Device_Structure for Pci_Device_Structure_General_Device {
 }
 /// Pci_Device_Structure_Pci_to_Pci_Bridge pci-to-pci桥设备结构体
 #[derive(Clone, Debug)]
-pub struct Pci_Device_Structure_Pci_to_Pci_Bridge {
-    pub common_header: Pci_Device_Structure_Header,
+pub struct PciDeviceStructurePciToPciBridge {
+    pub common_header: PciDeviceStructureHeader,
     pub bar0: u32,
     pub bar1: u32,
     pub primary_bus_number: u8,
@@ -413,30 +410,28 @@ pub struct Pci_Device_Structure_Pci_to_Pci_Bridge {
     pub interrupt_pin: u8,
     pub bridge_control: u16,
 }
-impl Pci_Device_Structure for Pci_Device_Structure_Pci_to_Pci_Bridge {
+impl PciDeviceStructure for PciDeviceStructurePciToPciBridge {
     fn header_type(&self) -> HeaderType {
         HeaderType::PciPciBridge
     }
-    fn as_pci_to_pci_bridge_device(&self) -> Option<&Pci_Device_Structure_Pci_to_Pci_Bridge> {
+    fn as_pci_to_pci_bridge_device(&self) -> Option<&PciDeviceStructurePciToPciBridge> {
         Some(self)
     }
-    fn as_pci_to_pci_bridge_device_mut(
-        &mut self,
-    ) -> Option<&mut Pci_Device_Structure_Pci_to_Pci_Bridge> {
+    fn as_pci_to_pci_bridge_device_mut(&mut self) -> Option<&mut PciDeviceStructurePciToPciBridge> {
         Some(self)
     }
-    fn get_common_header(&self) -> &Pci_Device_Structure_Header {
+    fn get_common_header(&self) -> &PciDeviceStructureHeader {
         &self.common_header
     }
 
-    fn get_common_header_mut(&mut self) -> &mut Pci_Device_Structure_Header {
+    fn get_common_header_mut(&mut self) -> &mut PciDeviceStructureHeader {
         &mut self.common_header
     }
 }
 /// Pci_Device_Structure_Pci_to_Cardbus_Bridge Pci_to_Cardbus桥设备结构体
 #[derive(Clone, Debug)]
-pub struct Pci_Device_Structure_Pci_to_Cardbus_Bridge {
-    pub common_header: Pci_Device_Structure_Header,
+pub struct PciDeviceStructurePciToCardbusBridge {
+    pub common_header: PciDeviceStructureHeader,
     pub cardbus_socket_ex_ca_base_address: u32,
     pub offset_of_capabilities_list: u8,
     pub reserved: u8,
@@ -460,25 +455,23 @@ pub struct Pci_Device_Structure_Pci_to_Cardbus_Bridge {
     pub subsystem_vendor_id: u16,
     pub pc_card_legacy_mode_base_address_16_bit: u32,
 }
-impl Pci_Device_Structure for Pci_Device_Structure_Pci_to_Cardbus_Bridge {
+impl PciDeviceStructure for PciDeviceStructurePciToCardbusBridge {
     fn header_type(&self) -> HeaderType {
         HeaderType::PciCardbusBridge
     }
-    fn as_pci_to_carbus_bridge_device(
-        &self,
-    ) -> Option<&Pci_Device_Structure_Pci_to_Cardbus_Bridge> {
+    fn as_pci_to_carbus_bridge_device(&self) -> Option<&PciDeviceStructurePciToCardbusBridge> {
         Some(&self)
     }
     fn as_pci_to_carbus_bridge_device_mut(
         &mut self,
-    ) -> Option<&mut Pci_Device_Structure_Pci_to_Cardbus_Bridge> {
+    ) -> Option<&mut PciDeviceStructurePciToCardbusBridge> {
         Some(self)
     }
-    fn get_common_header(&self) -> &Pci_Device_Structure_Header {
+    fn get_common_header(&self) -> &PciDeviceStructureHeader {
         &self.common_header
     }
 
-    fn get_common_header_mut(&mut self) -> &mut Pci_Device_Structure_Header {
+    fn get_common_header_mut(&mut self) -> &mut PciDeviceStructureHeader {
         &mut self.common_header
     }
 }
@@ -498,19 +491,19 @@ unsafe impl Sync for PciRoot {}
 ///实现PciRoot的Display trait，自定义输出
 impl Display for PciRoot {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-         write!(
+        write!(
                 f,
                 "PCI Root with segement:{}, bus begin at {}, bus end at {}, physical address at {},mapped at {:#x}",
                 self.segement_group_number, self.bus_begin, self.bus_end, self.physical_address_base, self.mmio_base.unwrap() as usize
             )
-        }
+    }
 }
 
 impl PciRoot {
     /// @brief 初始化结构体，获取ecam root所在物理地址后map到虚拟地址，再将该虚拟地址加入mmio_base变量
     /// @return 成功返回结果，错误返回错误类型
     pub fn new(segment_group_number: SegmentGroupNumber) -> Result<Self, PciError> {
-        let mut pci_root = Pci_Arch::get_eacm_root(segment_group_number)?;
+        let mut pci_root = PciArch::get_eacm_root(segment_group_number)?;
         pci_root.map()?;
         Ok(pci_root)
     }
@@ -608,10 +601,10 @@ impl PciRoot {
 /// @param bus_device_function PCI设备的唯一标识
 /// @return Option<u8> offset
 pub fn capabilities_offset(bus_device_function: BusDeviceFunction) -> Option<u8> {
-    let result = Pci_Arch::read_config(&bus_device_function, STATUS_COMMAND_OFFSET);
+    let result = PciArch::read_config(&bus_device_function, STATUS_COMMAND_OFFSET);
     let status: Status = Status::from_bits_truncate((result >> 16) as u16);
     if status.contains(Status::CAPABILITIES_LIST) {
-        let cap_pointer = Pci_Arch::read_config(&bus_device_function, 0x34) as u8 & 0xFC;
+        let cap_pointer = PciArch::read_config(&bus_device_function, 0x34) as u8 & 0xFC;
         Some(cap_pointer)
     } else {
         None
@@ -625,23 +618,23 @@ pub fn capabilities_offset(bus_device_function: BusDeviceFunction) -> Option<u8>
 fn pci_read_header(
     bus_device_function: BusDeviceFunction,
     add_to_list: bool,
-) -> Result<Box<dyn Pci_Device_Structure>, PciError> {
+) -> Result<Box<dyn PciDeviceStructure>, PciError> {
     // 先读取公共header
-    let result = Pci_Arch::read_config(&bus_device_function, 0x00);
+    let result = PciArch::read_config(&bus_device_function, 0x00);
     let vendor_id = result as u16;
     let device_id = (result >> 16) as u16;
 
-    let result = Pci_Arch::read_config(&bus_device_function, 0x04);
+    let result = PciArch::read_config(&bus_device_function, 0x04);
     let command = result as u16;
     let status = (result >> 16) as u16;
 
-    let result = Pci_Arch::read_config(&bus_device_function, 0x08);
+    let result = PciArch::read_config(&bus_device_function, 0x08);
     let revision_id = result as u8;
     let prog_if = (result >> 8) as u8;
     let subclass = (result >> 16) as u8;
     let class_code = (result >> 24) as u8;
 
-    let result = Pci_Arch::read_config(&bus_device_function, 0x0c);
+    let result = PciArch::read_config(&bus_device_function, 0x0c);
     let cache_line_size = result as u8;
     let latency_timer = (result >> 8) as u8;
     let header_type = (result >> 16) as u8;
@@ -649,7 +642,7 @@ fn pci_read_header(
     if vendor_id == 0xffff {
         return Err(PciError::GetWrongHeader);
     }
-    let header = Pci_Device_Structure_Header {
+    let header = PciDeviceStructureHeader {
         msix_mmio_vaddr: 0,
         msix_mmio_size: 0,
         msix_offset: 0,
@@ -707,31 +700,31 @@ fn pci_read_header(
 /// @param bus_device_function PCI设备的唯一标识
 /// @return Pci_Device_Structure_General_Device 标准设备头部
 fn pci_read_general_device_header(
-    common_header: Pci_Device_Structure_Header,
+    common_header: PciDeviceStructureHeader,
     bus_device_function: &BusDeviceFunction,
-) -> Pci_Device_Structure_General_Device {
+) -> PciDeviceStructureGeneralDevice {
     let standard_device_bar = PciStandardDeviceBar::default();
-    let cardbus_cis_pointer = Pci_Arch::read_config(bus_device_function, 0x28);
+    let cardbus_cis_pointer = PciArch::read_config(bus_device_function, 0x28);
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x2c);
+    let result = PciArch::read_config(bus_device_function, 0x2c);
     let subsystem_vendor_id = result as u16;
     let subsystem_id = (result >> 16) as u16;
 
-    let expansion_rom_base_address = Pci_Arch::read_config(bus_device_function, 0x30);
+    let expansion_rom_base_address = PciArch::read_config(bus_device_function, 0x30);
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x34);
+    let result = PciArch::read_config(bus_device_function, 0x34);
     let capabilities_pointer = result as u8;
     let reserved0 = (result >> 8) as u8;
     let reserved1 = (result >> 16) as u16;
 
-    let reserved2 = Pci_Arch::read_config(bus_device_function, 0x38);
+    let reserved2 = PciArch::read_config(bus_device_function, 0x38);
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x3c);
+    let result = PciArch::read_config(bus_device_function, 0x3c);
     let interrupt_line = result as u8;
     let interrupt_pin = (result >> 8) as u8;
     let min_grant = (result >> 16) as u8;
     let max_latency = (result >> 24) as u8;
-    Pci_Device_Structure_General_Device {
+    PciDeviceStructureGeneralDevice {
         common_header,
         standard_device_bar,
         cardbus_cis_pointer,
@@ -755,51 +748,51 @@ fn pci_read_general_device_header(
 /// @param bus_device_function PCI设备的唯一标识
 /// @return Pci_Device_Structure_Pci_to_Pci_Bridge pci-to-pci 桥设备头部
 fn pci_read_pci_to_pci_bridge_header(
-    common_header: Pci_Device_Structure_Header,
+    common_header: PciDeviceStructureHeader,
     bus_device_function: &BusDeviceFunction,
-) -> Pci_Device_Structure_Pci_to_Pci_Bridge {
-    let bar0 = Pci_Arch::read_config(bus_device_function, 0x10);
-    let bar1 = Pci_Arch::read_config(bus_device_function, 0x14);
+) -> PciDeviceStructurePciToPciBridge {
+    let bar0 = PciArch::read_config(bus_device_function, 0x10);
+    let bar1 = PciArch::read_config(bus_device_function, 0x14);
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x18);
+    let result = PciArch::read_config(bus_device_function, 0x18);
 
     let primary_bus_number = result as u8;
     let secondary_bus_number = (result >> 8) as u8;
     let subordinate_bus_number = (result >> 16) as u8;
     let secondary_latency_timer = (result >> 24) as u8;
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x1c);
+    let result = PciArch::read_config(bus_device_function, 0x1c);
     let io_base = result as u8;
     let io_limit = (result >> 8) as u8;
     let secondary_status = (result >> 16) as u16;
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x20);
+    let result = PciArch::read_config(bus_device_function, 0x20);
     let memory_base = result as u16;
     let memory_limit = (result >> 16) as u16;
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x24);
+    let result = PciArch::read_config(bus_device_function, 0x24);
     let prefetchable_memory_base = result as u16;
     let prefetchable_memory_limit = (result >> 16) as u16;
 
-    let prefetchable_base_upper_32_bits = Pci_Arch::read_config(bus_device_function, 0x28);
-    let prefetchable_limit_upper_32_bits = Pci_Arch::read_config(bus_device_function, 0x2c);
+    let prefetchable_base_upper_32_bits = PciArch::read_config(bus_device_function, 0x28);
+    let prefetchable_limit_upper_32_bits = PciArch::read_config(bus_device_function, 0x2c);
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x30);
+    let result = PciArch::read_config(bus_device_function, 0x30);
     let io_base_upper_16_bits = result as u16;
     let io_limit_upper_16_bits = (result >> 16) as u16;
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x34);
+    let result = PciArch::read_config(bus_device_function, 0x34);
     let capability_pointer = result as u8;
     let reserved0 = (result >> 8) as u8;
     let reserved1 = (result >> 16) as u16;
 
-    let expansion_rom_base_address = Pci_Arch::read_config(bus_device_function, 0x38);
+    let expansion_rom_base_address = PciArch::read_config(bus_device_function, 0x38);
 
-    let result = Pci_Arch::read_config(bus_device_function, 0x3c);
+    let result = PciArch::read_config(bus_device_function, 0x3c);
     let interrupt_line = result as u8;
     let interrupt_pin = (result >> 8) as u8;
     let bridge_control = (result >> 16) as u16;
-    Pci_Device_Structure_Pci_to_Pci_Bridge {
+    PciDeviceStructurePciToPciBridge {
         common_header,
         bar0,
         bar1,
@@ -834,42 +827,42 @@ fn pci_read_pci_to_pci_bridge_header(
 /// @param bus_device_function PCI设备的唯一标识
 /// @return ) -> Pci_Device_Structure_Pci_to_Cardbus_Bridge  pci-to-cardbus 桥设备头部
 fn pci_read_pci_to_cardbus_bridge_header(
-    common_header: Pci_Device_Structure_Header,
+    common_header: PciDeviceStructureHeader,
     busdevicefunction: &BusDeviceFunction,
-) -> Pci_Device_Structure_Pci_to_Cardbus_Bridge {
-    let cardbus_socket_ex_ca_base_address = Pci_Arch::read_config(busdevicefunction, 0x10);
+) -> PciDeviceStructurePciToCardbusBridge {
+    let cardbus_socket_ex_ca_base_address = PciArch::read_config(busdevicefunction, 0x10);
 
-    let result = Pci_Arch::read_config(busdevicefunction, 0x14);
+    let result = PciArch::read_config(busdevicefunction, 0x14);
     let offset_of_capabilities_list = result as u8;
     let reserved = (result >> 8) as u8;
     let secondary_status = (result >> 16) as u16;
 
-    let result = Pci_Arch::read_config(busdevicefunction, 0x18);
+    let result = PciArch::read_config(busdevicefunction, 0x18);
     let pci_bus_number = result as u8;
     let card_bus_bus_number = (result >> 8) as u8;
     let subordinate_bus_number = (result >> 16) as u8;
     let card_bus_latency_timer = (result >> 24) as u8;
 
-    let memory_base_address0 = Pci_Arch::read_config(busdevicefunction, 0x1c);
-    let memory_limit0 = Pci_Arch::read_config(busdevicefunction, 0x20);
-    let memory_base_address1 = Pci_Arch::read_config(busdevicefunction, 0x24);
-    let memory_limit1 = Pci_Arch::read_config(busdevicefunction, 0x28);
+    let memory_base_address0 = PciArch::read_config(busdevicefunction, 0x1c);
+    let memory_limit0 = PciArch::read_config(busdevicefunction, 0x20);
+    let memory_base_address1 = PciArch::read_config(busdevicefunction, 0x24);
+    let memory_limit1 = PciArch::read_config(busdevicefunction, 0x28);
 
-    let io_base_address0 = Pci_Arch::read_config(busdevicefunction, 0x2c);
-    let io_limit0 = Pci_Arch::read_config(busdevicefunction, 0x30);
-    let io_base_address1 = Pci_Arch::read_config(busdevicefunction, 0x34);
-    let io_limit1 = Pci_Arch::read_config(busdevicefunction, 0x38);
-    let result = Pci_Arch::read_config(busdevicefunction, 0x3c);
+    let io_base_address0 = PciArch::read_config(busdevicefunction, 0x2c);
+    let io_limit0 = PciArch::read_config(busdevicefunction, 0x30);
+    let io_base_address1 = PciArch::read_config(busdevicefunction, 0x34);
+    let io_limit1 = PciArch::read_config(busdevicefunction, 0x38);
+    let result = PciArch::read_config(busdevicefunction, 0x3c);
     let interrupt_line = result as u8;
     let interrupt_pin = (result >> 8) as u8;
     let bridge_control = (result >> 16) as u16;
 
-    let result = Pci_Arch::read_config(busdevicefunction, 0x40);
+    let result = PciArch::read_config(busdevicefunction, 0x40);
     let subsystem_device_id = result as u16;
     let subsystem_vendor_id = (result >> 16) as u16;
 
-    let pc_card_legacy_mode_base_address_16_bit = Pci_Arch::read_config(busdevicefunction, 0x44);
-    Pci_Device_Structure_Pci_to_Cardbus_Bridge {
+    let pc_card_legacy_mode_base_address_16_bit = PciArch::read_config(busdevicefunction, 0x44);
+    PciDeviceStructurePciToCardbusBridge {
         common_header,
         cardbus_socket_ex_ca_base_address,
         offset_of_capabilities_list,
@@ -952,7 +945,8 @@ fn pci_check_device(bus: u8, device: u8) -> Result<u8, PciError> {
     };
     let header = match pci_read_header(busdevicefunction, false) {
         Ok(header) => header,
-        Err(PciError::GetWrongHeader) => {//设备不存在，直接返回即可，不用终止遍历
+        Err(PciError::GetWrongHeader) => {
+            //设备不存在，直接返回即可，不用终止遍历
             return Ok(255);
         }
         Err(e) => {
@@ -961,23 +955,22 @@ fn pci_check_device(bus: u8, device: u8) -> Result<u8, PciError> {
     };
     pci_check_function(busdevicefunction)?;
     let common_header = header.get_common_header();
-    if common_header.header_type & 0x80!=0
-        {
-            kdebug!(
-                "Detected multi func device in bus{},device{}",
-                busdevicefunction.bus,
-                busdevicefunction.device
-            );
-            // 这是一个多function的设备，因此查询剩余的function
-            for function in 1..8 {
-                let busdevicefunction = BusDeviceFunction {
-                    bus,
-                    device,
-                    function,
-                };
-                pci_check_function(busdevicefunction)?;
-            }
+    if common_header.header_type & 0x80 != 0 {
+        kdebug!(
+            "Detected multi func device in bus{},device{}",
+            busdevicefunction.bus,
+            busdevicefunction.device
+        );
+        // 这是一个多function的设备，因此查询剩余的function
+        for function in 1..8 {
+            let busdevicefunction = BusDeviceFunction {
+                bus,
+                device,
+                function,
+            };
+            pci_check_function(busdevicefunction)?;
         }
+    }
     Ok(0)
 }
 /// @brief 检查该bus上的设备并将其加入链表
@@ -991,8 +984,7 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
 }
 /// @brief pci初始化函数(for c)
 #[no_mangle]
-pub extern "C"  fn c_pci_init()
-{
+pub extern "C" fn rs_pci_init() {
     pci_init();
     //kdebug!("{}",PCI_ROOT_0.unwrap());
 }
@@ -1249,19 +1241,19 @@ pub fn pci_bar_init(
         }
         let bar_info;
         let mut virtaddress: u64 = 0;
-        let bar_orig = Pci_Arch::read_config(&bus_device_function, BAR0_OFFSET + 4 * bar_index);
-        Pci_Arch::write_config(
+        let bar_orig = PciArch::read_config(&bus_device_function, BAR0_OFFSET + 4 * bar_index);
+        PciArch::write_config(
             &bus_device_function,
             BAR0_OFFSET + 4 * bar_index,
             0xffffffff,
         );
-        let size_mask = Pci_Arch::read_config(&bus_device_function, BAR0_OFFSET + 4 * bar_index);
+        let size_mask = PciArch::read_config(&bus_device_function, BAR0_OFFSET + 4 * bar_index);
         // A wrapping add is necessary to correctly handle the case of unused BARs, which read back
         // as 0, and should be treated as size 0.
         let size = (!(size_mask & 0xfffffff0)).wrapping_add(1);
         //kdebug!("bar_orig:{:#x},size: {:#x}", bar_orig,size);
         // Restore the original value.
-        Pci_Arch::write_config(&bus_device_function, BAR0_OFFSET + 4 * bar_index, bar_orig);
+        PciArch::write_config(&bus_device_function, BAR0_OFFSET + 4 * bar_index, bar_orig);
         if size == 0 {
             continue;
         }
@@ -1279,7 +1271,7 @@ pub fn pci_bar_init(
                     return Err(PciError::InvalidBarType);
                 }
                 let address_top =
-                    Pci_Arch::read_config(&bus_device_function, BAR0_OFFSET + 4 * (bar_index + 1));
+                    PciArch::read_config(&bus_device_function, BAR0_OFFSET + 4 * (bar_index + 1));
                 address |= u64::from(address_top) << 32;
                 bar_index_ignore = bar_index + 1; //下个bar跳过，因为64位的memory bar覆盖了两个bar
             }
@@ -1362,7 +1354,7 @@ impl Iterator for CapabilityIterator {
         let offset = self.next_capability_offset?;
 
         // Read the first 4 bytes of the capability.
-        let capability_header = Pci_Arch::read_config(&self.bus_device_function, offset);
+        let capability_header = PciArch::read_config(&self.bus_device_function, offset);
         let id = capability_header as u8;
         let next_offset = (capability_header >> 8) as u8;
         let private_header = (capability_header >> 16) as u16;

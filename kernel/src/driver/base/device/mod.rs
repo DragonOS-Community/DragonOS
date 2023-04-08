@@ -79,7 +79,7 @@ pub trait Device: Any + Send + Sync + Debug {
     /// @parameter: None
     /// @return: 实现该trait的设备所属类型
     fn get_type(&self) -> DeviceType;
-
+    
     /// @brief: 获取设备标识
     /// @parameter: None
     /// @return: 该设备唯一标识

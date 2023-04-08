@@ -1,6 +1,6 @@
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub use self::x86_64::pci::pci::X86_64_Pci_Arch as Pci_Arch;
+pub use self::x86_64::pci::pci::X86_64PciArch as PciArch;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::*; //公开x86_64架构下的函数，使外界接口统一
 use crate::driver::pci::pci::{BusDeviceFunction, PciError, PciRoot, SegmentGroupNumber};

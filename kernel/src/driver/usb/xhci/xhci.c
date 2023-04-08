@@ -798,7 +798,7 @@ static int xhci_reset_port(const int id, const int port)
         if ((xhci_read_op_reg32(id, port_status_offset + XHCI_PORT_PORTSC) & (1 << 9)) == 0)
         {
             kdebug("cannot power on %d", port);
-            return -EAGAIN_OR_EWOULDBLOCK;
+            return -EAGAIN;
         }
     }
     // kdebug("port:%d, power check ok", port);
@@ -1047,7 +1047,7 @@ static int xhci_set_address(const int id, const uint64_t slot_vaddr, const int s
         retval = 0;
     }
     else
-        retval = -EAGAIN_OR_EWOULDBLOCK;
+        retval = -EAGAIN;
 done:;
 failed:;
     kfree((void *)input_ctx_buffer);
@@ -1394,7 +1394,7 @@ static inline int xhci_get_desc(const int id, const int port_id, void *target, c
                        length);
     count = xhci_control_in(id, &ctrl_in_packet, target, port_id, dev_desc->max_packet_size);
     if (unlikely(count == 0))
-        return -EAGAIN_OR_EWOULDBLOCK;
+        return -EAGAIN;
     return 0;
 }
 
@@ -1568,7 +1568,7 @@ static int xhci_get_descriptor(const int id, const int port_id, struct usb_devic
         }
     }
     else
-        return -EAGAIN_OR_EWOULDBLOCK; // slot id 不合法
+        return -EAGAIN; // slot id 不合法
 
     xhci_hc[id].ports[port_id].slot_id = slot_id;
     // kdebug("speed=%d", speed);
@@ -1587,7 +1587,7 @@ static int xhci_get_descriptor(const int id, const int port_id, struct usb_devic
     DECLARE_USB_PACKET(ctrl_in_packet, USB_REQ_TYPE_GET_REQUEST, USB_REQ_GET_DESCRIPTOR, (USB_DT_DEVICE << 8), 0, 18);
     count = xhci_control_in(id, &ctrl_in_packet, dev_desc, port_id, max_packet);
     if (unlikely(count == 0))
-        return -EAGAIN_OR_EWOULDBLOCK;
+        return -EAGAIN;
     /*
         TODO: if the dev_desc->max_packet was different than what we have as max_packet,
           you would need to change it here and in the slot context by doing a
@@ -1779,7 +1779,7 @@ static int xhci_configure_endpoint(const int id, const int port_id, const uint8_
         retval = 0;
     }
     else
-        retval = -EAGAIN_OR_EWOULDBLOCK;
+        retval = -EAGAIN;
 done:;
 failed:;
     kfree((void *)input_ctx_buffer);

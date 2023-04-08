@@ -197,7 +197,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     if (!elf_check(buf))
     {
         kerror("Not an ELF file: %s", path);
-        retval = -EOPNOTSUPP_OR_ENOTSUP;
+        retval = -ENOTSUP;
         goto load_elf_failed;
     }
 

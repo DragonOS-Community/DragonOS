@@ -44,26 +44,26 @@ impl PciDeviceLinkedList {
     }
     /// @brief 获取可读的linkedlist(读锁守卫)
     /// @return RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>>  读锁守卫
-    pub fn linkedlist_readable(
+    pub fn read(
         &self,
     ) -> RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.read()
     }
     /// @brief 获取可写的linkedlist(写锁守卫)
     /// @return RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>>  写锁守卫
-    pub fn linkedlist_writeable(
+    pub fn write(
         &self,
     ) -> RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.write()
     }
     /// @brief 获取链表中PCI结构体数目
     /// @return usize 链表中PCI结构体数目
-    pub fn linkedlist_num(&self) -> usize {
+    pub fn num(&self) -> usize {
         let list = self.list.read();
         list.len()
     }
     /// @brief 添加Pci设备结构体到链表中
-    pub fn add_to_linkedlist(&self, device: Box<dyn PciDeviceStructure>) {
+    pub fn add(&self, device: Box<dyn PciDeviceStructure>) {
         let mut list = self.list.write();
         list.push_back(device);
     }
@@ -667,7 +667,7 @@ fn pci_read_header(
             let box_general_device = Box::new(general_device);
             let box_general_device_clone = box_general_device.clone();
             if add_to_list {
-                PCI_DEVICE_LINKEDLIST.add_to_linkedlist(box_general_device);
+                PCI_DEVICE_LINKEDLIST.add(box_general_device);
             }
             Ok(box_general_device_clone)
         }
@@ -676,7 +676,7 @@ fn pci_read_header(
             let box_pci_to_pci_bridge = Box::new(pci_to_pci_bridge);
             let box_pci_to_pci_bridge_clone = box_pci_to_pci_bridge.clone();
             if add_to_list {
-                PCI_DEVICE_LINKEDLIST.add_to_linkedlist(box_pci_to_pci_bridge);
+                PCI_DEVICE_LINKEDLIST.add(box_pci_to_pci_bridge);
             }
             Ok(box_pci_to_pci_bridge_clone)
         }
@@ -686,7 +686,7 @@ fn pci_read_header(
             let box_pci_cardbus_bridge = Box::new(pci_cardbus_bridge);
             let box_pci_cardbus_bridge_clone = box_pci_cardbus_bridge.clone();
             if add_to_list {
-                PCI_DEVICE_LINKEDLIST.add_to_linkedlist(box_pci_cardbus_bridge);
+                PCI_DEVICE_LINKEDLIST.add(box_pci_cardbus_bridge);
             }
             Ok(box_pci_cardbus_bridge_clone)
         }
@@ -997,9 +997,9 @@ pub fn pci_init() {
     }
     kinfo!(
         "Total pci device and function num = {}",
-        PCI_DEVICE_LINKEDLIST.linkedlist_num()
+        PCI_DEVICE_LINKEDLIST.num()
     );
-    let list = PCI_DEVICE_LINKEDLIST.linkedlist_readable();
+    let list = PCI_DEVICE_LINKEDLIST.read();
     for box_pci_device in list.iter() {
         let common_header = box_pci_device.common_header();
         match box_pci_device.header_type() {

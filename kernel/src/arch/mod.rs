@@ -23,5 +23,5 @@ pub trait TraitPciArch {
     /// @brief 获取Segement的root地址,x86_64架构为acpi mcfg表中读取
     /// @param segement 组id
     /// @return  Result<PciRoot, PciError> 转换结果或出错原因
-    fn get_eacm_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError>;
+    fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError>;
 }

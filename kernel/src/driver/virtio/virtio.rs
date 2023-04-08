@@ -26,7 +26,7 @@ pub extern "C" fn c_virtio_probe() {
 
 ///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
 pub fn virtio_probe() {
-    let mut list = PCI_DEVICE_LINKEDLIST.get_linkedlist_writeable();
+    let mut list = PCI_DEVICE_LINKEDLIST.linkedlist_writeable();
     if let Ok(virtio_list) = virtio_device_search(&mut list) {
         for virtio_device in virtio_list {
             match PciTransport::new::<HalImpl>(virtio_device) {

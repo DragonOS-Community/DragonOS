@@ -44,7 +44,7 @@ impl TraitPciArch for X86_64PciArch {
         Ok(address)
     }
 
-    fn get_eacm_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {
+    fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {
         let mut data: usize = 0;
         let data_point = &mut data;
         unsafe {

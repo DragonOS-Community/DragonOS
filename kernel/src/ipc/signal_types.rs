@@ -665,5 +665,5 @@ pub struct signal_stack {
     pub sp: *mut c_void,
     pub flags: u32,
     pub size: u32,
-    pub fpstate:FpState,
+    pub fpstate: FpState,
 }

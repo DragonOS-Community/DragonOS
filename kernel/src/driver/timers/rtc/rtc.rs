@@ -1,6 +1,7 @@
 use crate::{
     arch::interrupt::{cli, sti},
-    include::bindings::bindings::{io_in8, io_out8}, syscall::SystemError,
+    include::bindings::bindings::{io_in8, io_out8},
+    syscall::SystemError,
 };
 
 pub struct RtcTime {

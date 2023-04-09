@@ -3,7 +3,6 @@ use crate::include::bindings::bindings::{
     alloc_pages, free_pages, memory_management_struct, Page, PAGE_2M_SHIFT, PAGE_2M_SIZE,
     PAGE_OFFSET, PAGE_SHARED, ZONE_NORMAL,
 };
-
 use crate::mm::virt_2_phys;
 use core::mem::size_of;
 use core::ptr::NonNull;

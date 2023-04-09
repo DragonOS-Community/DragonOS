@@ -192,7 +192,6 @@ pub trait MemoryManagementArch: Clone + Copy {
     unsafe fn write<T>(address: VirtAddr, value: T) {
         ptr::write(address.data() as *mut T, value);
     }
-
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
     unsafe fn invalidate_page(address: VirtAddr);
 

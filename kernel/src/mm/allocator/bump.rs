@@ -1,6 +1,6 @@
 /// @Auther: Kong
 /// @Date: 2023-03-27 06:54:08
-/// @FilePath: /DragonOS/kernel/src/mm/bump.rs
+/// @FilePath: /DragonOS/kernel/src/mm/allocator/bump.rs
 /// @Description: bump allocator线性分配器
 ///
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
@@ -49,10 +49,10 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
         let mut offset = self.offset();
         // 遍历所有的物理内存区域
         for area in self.areas().iter() {
-            // 将area的base地址与PAGE_SIZE对齐，对其时向上取整
-            let area_base = (area.base.data() + MMA::PAGE_SIZE - 1) & !(MMA::PAGE_SIZE - 1);
-            // 将area的末尾地址与PAGE_SIZE对齐，对其时向下取整
-            let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SIZE - 1);
+            // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
+            let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
+            // 将area的末尾地址与PAGE_SIZE对齐，对齐时向下取整
+            let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SHIFT);
 
             // 如果offset大于area_end，说明当前的物理内存区域已经分配完了，需要跳到下一个物理内存区域
             if offset >= area_end {
@@ -87,9 +87,9 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
         let mut used = 0;
         for area in self.areas().iter() {
             // 将area的base地址与PAGE_SIZE对齐，对其时向上取整
-            let area_base = (area.base.data() + MMA::PAGE_SIZE - 1) & !(MMA::PAGE_SIZE - 1);
+            let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
             // 将area的末尾地址与PAGE_SIZE对齐，对其时向下取整
-            let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SIZE - 1);
+            let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SHIFT);
 
             total += (area_end - area_base) >> MMA::PAGE_SHIFT;
             // 如果offset大于area_end，说明当前物理区域被分配完，都需要加到used中

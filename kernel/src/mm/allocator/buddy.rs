@@ -13,10 +13,6 @@ use core::{marker::PhantomData, mem};
 // 一个全局变量MAX_ORDER，表示最大的阶数
 const MAX_ORDER: usize = 11;
 
-// 存放每个entry页的使用情况
-#[repr(transparent)]
-struct BuddyUsage(u8);
-
 /// @brief: 用来表示 buddy 算法中的一个 buddy 块，整体存放在area的头部
 // 这种方式会出现对齐问题
 // #[repr(packed)]
@@ -76,13 +72,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         let total_used_pages = (total_size >> A::PAGE_SHIFT) / Self::BUDDY_ENTRIES;
         // 申请buddy_pages个页，用于存储 buddy 算法的数据结构
         let table_phys = bump_allocator.allocate_one()?;
-        for _ in 0..total_used_pages-1 {
+        for _ in 0..total_used_pages - 1 {
             bump_allocator.allocate_one()?;
         }
         let table_virt = A::phys_2_virt(table_phys);
         let table_virt = table_virt?;
         // 将申请到的内存全部分配为 BuddyEntry<A> 类型
-        for i in 0..Self::BUDDY_ENTRIES*total_used_pages {
+        for i in 0..Self::BUDDY_ENTRIES * total_used_pages {
             let virt = table_virt.add(i * mem::size_of::<BuddyEntry<A>>());
             A::write(virt, BuddyEntry::<A>::empty());
         }
@@ -107,7 +103,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             let new_offset = (area.base.data() + (1 << MAX_ORDER) - 1) & !((1 << MAX_ORDER) - 1);
             area.size -= new_offset - area.base.data();
             area.base = area.base.add(new_offset);
-            
+
             // 如果area的大小大于2^MAX_ORDER，那么将area分割为多个area
             while area.size > (1 << MAX_ORDER) {
                 let mut new_area = area.clone();
@@ -194,7 +190,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         let mut entry = self.free_area[order].pop_front();
         while entry.is_none() {
             order += 1;
-            if order > MAX_ORDER {
+            if order >= MAX_ORDER {
                 return None;
             }
             entry = self.free_area[order].pop_front();
@@ -270,7 +266,8 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         let mut total = 0;
         let mut used = 0;
         // 遍历所有的buddy，计算已经使用的页和总共的页
-        for mut i in 0..Self::BUDDY_ENTRIES*self.total_used_pages {
+        let mut i = 0;
+        while i < self.total_used_pages * Self::BUDDY_ENTRIES {
             let entry = self.read_entry(i * mem::size_of::<BuddyEntry<A>>());
             total += 1 << entry.order;
             if entry.pg_buddy == 1 {

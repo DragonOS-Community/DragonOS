@@ -544,7 +544,7 @@ ul initial_kernel_thread(ul arg)
     // block_io_scheduler_init();
     ahci_init();
     mount_root_fs();
-    c_virtio_probe();
+    rs_virtio_probe();
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);
@@ -560,11 +560,12 @@ ul initial_kernel_thread(ul arg)
     // __test_completion();
 
     // // 对一些组件进行单元测试
-    // uint64_t tpid[] = {
-    //     ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
-    //     ktest_start(ktest_test_idr, 0),
-    //     // usb_pid,
-    // };
+    uint64_t tpid[] = {
+        // ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
+        // ktest_start(ktest_test_idr, 0),
+        // usb_pid,
+    };
+
     // kinfo("Waiting test thread exit...");
     // // 等待测试进程退出
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)

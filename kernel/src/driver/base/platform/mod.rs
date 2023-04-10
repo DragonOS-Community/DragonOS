@@ -175,7 +175,7 @@ impl PlatformBusDriver {
                         Ok(()) => {
                             num = num + 1;
                             device.set_state(DeviceState::Initialized)
-                        },
+                        }
                         // 可以驱动很多设备，一个设备初始化出错即返回
                         Err(_) => return Err(DeviceError::InitializeFailed),
                     }

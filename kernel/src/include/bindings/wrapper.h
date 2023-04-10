@@ -19,6 +19,7 @@
 #include <common/crc8.h>
 #include <common/gfp.h>
 #include <common/glib.h>
+#include <common/idr.h>
 #include <common/kfifo.h>
 #include <common/kthread.h>
 #include <common/list.h>

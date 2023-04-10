@@ -73,7 +73,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 /// PCI transport for VirtIO.
 ///
 /// Ref: 4.1 Virtio Over PCI Bus
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
@@ -104,8 +104,8 @@ impl PciTransport {
         }
         let device_type = device_type(header.device_id);
         // Find the PCI capabilities we need.
-        let mut common_cfg = None;
-        let mut notify_cfg = None;
+        let mut common_cfg: Option<VirtioCapabilityInfo> = None;
+        let mut notify_cfg: Option<VirtioCapabilityInfo> = None;
         let mut notify_off_multiplier = 0;
         let mut isr_cfg = None;
         let mut device_cfg = None;
@@ -361,7 +361,7 @@ struct CommonCfg {
 }
 
 /// Information about a VirtIO structure within some BAR, as provided by a `virtio_pci_cap`.
-///cfg空间在哪个bar的多少偏移处，长度多少
+/// cfg空间在哪个bar的多少偏移处，长度多少
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VirtioCapabilityInfo {
     /// The bar in which the structure can be found.
@@ -445,16 +445,17 @@ impl Display for VirtioPciError {
         }
     }
 }
-///PCI error到VirtioPciError的转换，层层上报
+
+/// PCI error到VirtioPciError的转换，层层上报
 impl From<PciError> for VirtioPciError {
     fn from(error: PciError) -> Self {
         Self::Pci(error)
     }
 }
 
-///@brief 获取虚拟地址并将其转化为对应类型的指针
-///@param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息
-///@return Result<NonNull<T>, VirtioPciError> 成功则返回对应类型的指针，失败则返回Error
+/// @brief 获取虚拟地址并将其转化为对应类型的指针
+/// @param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息
+/// @return Result<NonNull<T>, VirtioPciError> 成功则返回对应类型的指针，失败则返回Error
 fn get_bar_region<T>(
     device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,
@@ -486,9 +487,9 @@ fn get_bar_region<T>(
     Ok(vaddr.cast())
 }
 
-///@brief 获取虚拟地址并将其转化为对应类型的
-///@param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息切片的指针
-///@return Result<NonNull<[T]>, VirtioPciError> 成功则返回对应类型的指针切片，失败则返回Error
+/// @brief 获取虚拟地址并将其转化为对应类型的
+/// @param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息切片的指针
+/// @return Result<NonNull<[T]>, VirtioPciError> 成功则返回对应类型的指针切片，失败则返回Error
 fn get_bar_region_slice<T>(
     device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,
@@ -501,6 +502,7 @@ fn get_bar_region_slice<T>(
         struct_info.length as usize / size_of::<T>(),
     ))
 }
+
 fn nonnull_slice_from_raw_parts<T>(data: NonNull<T>, len: usize) -> NonNull<[T]> {
     NonNull::new(ptr::slice_from_raw_parts_mut(data.as_ptr(), len)).unwrap()
 }

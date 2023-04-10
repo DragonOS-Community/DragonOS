@@ -44,16 +44,12 @@ impl PciDeviceLinkedList {
     }
     /// @brief 获取可读的linkedlist(读锁守卫)
     /// @return RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>>  读锁守卫
-    pub fn read(
-        &self,
-    ) -> RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
+    pub fn read(&self) -> RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.read()
     }
     /// @brief 获取可写的linkedlist(写锁守卫)
     /// @return RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>>  写锁守卫
-    pub fn write(
-        &self,
-    ) -> RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
+    pub fn write(&self) -> RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.write()
     }
     /// @brief 获取链表中PCI结构体数目
@@ -554,11 +550,7 @@ impl PciRoot {
     /// @param bus_device_function 在同一个group中pci设备的唯一标识符
     /// @param register_offset 寄存器在设备中的offset
     /// @return u32 寄存器读值结果
-    pub fn read_config(
-        &self,
-        bus_device_function: BusDeviceFunction,
-        register_offset: u16,
-    ) -> u32 {
+    pub fn read_config(&self, bus_device_function: BusDeviceFunction, register_offset: u16) -> u32 {
         let address = self.cam_offset(bus_device_function, register_offset);
         unsafe {
             // Right shift to convert from byte offset to word offset.

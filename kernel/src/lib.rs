@@ -6,8 +6,6 @@
 #![feature(panic_info_message)]
 #![feature(drain_filter)] // 允许Vec的drain_filter特性
 #![feature(c_void_variant)]
-use core::arch::x86_64::_rdtsc;
-// used in kernel/src/exception/softirq.rs
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -45,28 +43,16 @@ extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
 
-use driver::NET_DRIVERS;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
 use mm::allocator::KernelAllocator;
-use smoltcp::{
-    iface::{Interface, SocketSet},
-    time::{Duration, Instant},
-    wire::{IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr},
-};
 
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
-    driver::{
-        net::{virtio_net::VirtioNICDriver, NetDriver},
-        virtio::transport_pci::PciTransport,
-    },
-    filesystem::vfs::ROOT_INODE,
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
-    net::{socket::SocketOptions, Socket, net_core::net_init},
-    time::{sleep::us_sleep, timekeep::ktime_get_real_ns, timer::schedule_timeout, TimeSpec},
+    net::net_core::net_init,
 };
 
 // 声明全局的slab分配器
@@ -109,15 +95,10 @@ pub fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-use net::NET_FACES;
-// use smoltcp::
-use smoltcp::socket::dhcpv4;
-
 /// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-    net_init();
+    net_init().expect("Failed to init network");
     return 0;
 }
-

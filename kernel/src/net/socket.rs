@@ -1,21 +1,16 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+#![allow(dead_code)]
+use alloc::{boxed::Box, vec::Vec};
 use smoltcp::{
-    iface::{self, SocketHandle, SocketSet},
-    socket::{raw, tcp::{self, State}, udp},
+    iface::{SocketHandle, SocketSet},
+    socket::{raw, tcp, udp},
     wire::{IpAddress, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address},
 };
 
 use crate::{
-    arch::rand::rand,
-    driver::{net::NetDriver, NET_DRIVERS},
-    include::bindings::bindings::ida,
-    kdebug, kerror, kwarn,
-    libs::{rwlock::RwLock, spinlock::SpinLock},
-    net::{Interface, NET_FACES},
-    syscall::SystemError,
+    arch::rand::rand, kdebug, kerror, kwarn, libs::spinlock::SpinLock, syscall::SystemError,
 };
 
-use super::{Endpoint, Protocol, Socket};
+use super::{Endpoint, Protocol, Socket, NET_DRIVERS};
 
 lazy_static! {
     /// 所有socket的集合
@@ -200,11 +195,11 @@ impl Socket for RawSocket {
                     socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
 
                 // 暴力解决方案：只考虑0号网卡。 TODO：考虑多网卡的情况！！！
-                let iface: Arc<Interface> = NET_FACES.read().get(&0).unwrap().clone();
+                let iface = NET_DRIVERS.read().get(&0).unwrap().clone();
 
                 // 构造IP头
                 let ipv4_src_addr: Option<smoltcp::wire::Ipv4Address> =
-                    iface.inner_iface.read().ipv4_addr();
+                    iface.inner_iface().lock().ipv4_addr();
                 if ipv4_src_addr.is_none() {
                     return Err(SystemError::ENETUNREACH);
                 }
@@ -254,7 +249,7 @@ impl Socket for RawSocket {
         }
     }
 
-    fn connect(&mut self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+    fn connect(&mut self, _endpoint: super::Endpoint) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -497,7 +492,7 @@ impl Socket for TcpSocket {
         }
     }
 
-    fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+    fn write(&self, buf: &[u8], _to: Option<super::Endpoint>) -> Result<usize, SystemError> {
         let mut socket_set_guard = SOCKET_SET.lock();
         let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
 
@@ -523,7 +518,7 @@ impl Socket for TcpSocket {
         return Err(SystemError::ENOTCONN);
     }
 
-    fn connect(&mut self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+    fn connect(&mut self, _endpoint: super::Endpoint) -> Result<(), SystemError> {
         // let mut sockets = SOCKET_SET.lock();
         // let mut socket = sockets.get::<tcp::Socket>(self.handle.0);
 
@@ -578,7 +573,7 @@ impl Socket for TcpSocket {
 
         let local_endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         let mut sockets = SOCKET_SET.lock();
-        let mut socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
+        let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
         if socket.is_listening() {
             return Ok(());

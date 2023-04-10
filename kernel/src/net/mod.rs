@@ -3,22 +3,10 @@ use core::{
     sync::atomic::AtomicUsize,
 };
 
-use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
-    sync::{Arc, Weak},
-};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 
-use crate::{
-    driver::net::NetDriver,
-    libs::{
-        rwlock::{RwLock, RwLockWriteGuard},
-        spinlock::SpinLock,
-    },
-    syscall::SystemError,
-    time::Instant, kdebug,
-};
-use smoltcp::{iface, wire::IpEndpoint};
+use crate::{driver::net::NetDriver, libs::rwlock::RwLock, syscall::SystemError};
+use smoltcp::wire::IpEndpoint;
 
 use self::socket::SocketMetadata;
 
@@ -28,7 +16,7 @@ pub mod socket;
 
 lazy_static! {
     /// @brief 所有网络接口的列表
-    pub static ref NET_FACES: RwLock<BTreeMap<usize, Arc<Interface>>> = RwLock::new(BTreeMap::new());
+    pub static ref NET_DRIVERS: RwLock<BTreeMap<usize, Arc<dyn NetDriver>>> = RwLock::new(BTreeMap::new());
 }
 
 /// @brief 生成网络接口的id (全局自增)
@@ -221,7 +209,8 @@ impl fmt::Display for Protocol {
 
 impl From<smoltcp::wire::IpProtocol> for Protocol {
     fn from(value: smoltcp::wire::IpProtocol) -> Self {
-        return Self::from(value);
+        let x: u8 = value.into();
+        Protocol::from(x)
     }
 }
 
@@ -258,53 +247,5 @@ impl Into<u8> for Protocol {
             Protocol::Ipv6Opts => 0x3c,
             Protocol::Unknown(id) => id,
         }
-    }
-}
-
-/// @brief 对smoltcp的Interface做了简单的封装
-///
-/// smoltcp 中的接口是一个高级抽象，它允许应用程序或操作系统以一致和统一的方式与网络硬件交互，而不管所使用的具体硬件类型如何。
-pub struct Interface {
-    inner_iface: RwLock<smoltcp::iface::Interface>,
-    iface_id: usize,
-    device: Weak<dyn NetDriver>,
-}
-
-impl Debug for Interface {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Interface")
-            .field("inner_iface", &" smoltcp::iface::Interface,")
-            .field("iface_id", &self.iface_id)
-            .field("device", &self.device)
-            .finish()
-    }
-}
-
-impl Interface {
-    pub fn new(inner_iface: smoltcp::iface::Interface, device: Weak<dyn NetDriver>) -> Self {
-        return Self {
-            inner_iface: RwLock::new(inner_iface),
-            iface_id: generate_iface_id(),
-            device,
-        };
-    }
-
-    #[inline(always)]
-    pub fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), SystemError> {
-        let dev = self.device.upgrade();
-        if dev.is_none() {
-            return Err(SystemError::ENODEV);
-        }
-        kdebug!("polling iface: {}", self.iface_id);
-        return dev.unwrap().poll(self.iface_id, sockets);
-    }
-
-    pub fn inner_mut(&self) -> RwLockWriteGuard<smoltcp::iface::Interface> {
-        return self.inner_iface.write();
-    }
-
-    #[inline(always)]
-    pub fn iface_id(&self) -> usize {
-        return self.iface_id;
     }
 }

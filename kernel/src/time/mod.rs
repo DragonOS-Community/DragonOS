@@ -26,6 +26,7 @@ pub struct TimeSpec {
 }
 
 impl TimeSpec {
+    #[allow(dead_code)]
     pub fn new(sec: i64, nsec: i64) -> TimeSpec {
         return TimeSpec {
             tv_sec: sec,
@@ -49,6 +50,7 @@ pub struct Instant {
     micros: i64,
 }
 
+#[allow(dead_code)]
 impl Instant {
     pub const ZERO: Instant = Instant::from_micros_const(0);
 

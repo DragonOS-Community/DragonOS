@@ -8,9 +8,10 @@ use alloc::collections::LinkedList;
 use crate::{
     arch::{asm::current::current_pcb, sched::sched},
     include::bindings::bindings::{
-        pid_t, process_control_block, process_wakeup,  PROC_INTERRUPTIBLE, PROC_RUNNING,
+        pid_t, process_control_block, process_wakeup, PROC_INTERRUPTIBLE, PROC_RUNNING,
     },
-    libs::spinlock::SpinLockGuard, syscall::SystemError,
+    libs::spinlock::SpinLockGuard,
+    syscall::SystemError,
 };
 
 use super::spinlock::SpinLock;

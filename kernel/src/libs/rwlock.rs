@@ -7,7 +7,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::{syscall::SystemError};
+use crate::syscall::SystemError;
 
 ///RwLock读写锁
 

@@ -4,8 +4,8 @@ use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
         initial_mm, mm_create_vma, mm_unmap, vm_area_del, vm_area_free, vm_area_struct, vm_flags_t,
-        vma_find, MMIO_BASE, MMIO_TOP, PAGE_1G_SHIFT, PAGE_1G_SIZE,
-        PAGE_2M_SIZE, PAGE_4K_SHIFT, PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
+        vma_find, MMIO_BASE, MMIO_TOP, PAGE_1G_SHIFT, PAGE_1G_SIZE, PAGE_2M_SIZE, PAGE_4K_SHIFT,
+        PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
     },
     kdebug, kerror,
 };

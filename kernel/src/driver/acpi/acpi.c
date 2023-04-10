@@ -104,6 +104,22 @@ bool acpi_get_HPET(const struct acpi_system_description_table_header_t *_iter_da
 }
 
 /**
+ * @brief 获取MCFG MCFG_description_table
+ *
+ * @param _iter_data 要被迭代的信息的结构体
+ * @param _data 返回的MCFG表的虚拟地址
+ * @return true
+ * @return false
+ */
+bool acpi_get_MCFG(const struct acpi_system_description_table_header_t *_iter_data, void *_data)
+{
+    if (!(_iter_data->Signature[0] == 'M' && _iter_data->Signature[1] == 'C' && _iter_data->Signature[2] == 'F' && _iter_data->Signature[3] == 'G'))
+        return false;
+    *(ul *)_data = (ul)_iter_data;
+    return true;
+}
+
+/**
  * @brief 初始化acpi模块
  *
  */

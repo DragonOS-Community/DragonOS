@@ -4,7 +4,8 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::{
     io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kerror,
-    libs::vec_cursor::VecCursor, syscall::SystemError,
+    libs::vec_cursor::VecCursor,
+    syscall::SystemError,
 };
 
 use super::fs::{Cluster, FATFileSystem};

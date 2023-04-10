@@ -5,6 +5,7 @@ use alloc::{collections::BTreeMap, sync::Arc};
 use crate::libs::rwlock::RwLock;
 use net::NetDriver;
 
+pub mod acpi;
 pub mod base;
 pub mod disk;
 pub mod keyboard;

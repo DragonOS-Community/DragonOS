@@ -1,2 +1,2 @@
-pub mod platform;
 pub mod device;
+pub mod platform;

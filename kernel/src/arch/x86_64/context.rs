@@ -2,7 +2,7 @@ use crate::include::bindings::bindings::{process_control_block, switch_proc};
 
 use core::sync::atomic::compiler_fence;
 
-use super::fpu::{fp_state_save, fp_state_restore};
+use super::fpu::{fp_state_restore, fp_state_save};
 
 /// @brief 切换进程的上下文（没有切换页表的动作）
 ///

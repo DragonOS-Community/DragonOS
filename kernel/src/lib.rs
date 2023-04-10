@@ -14,8 +14,6 @@ use core::arch::x86_64::_rdtsc;
 use core::panic::PanicInfo;
 
 /// 导出x86_64架构相关的代码，命名为arch模块
-#[cfg(target_arch = "x86_64")]
-#[path = "arch/x86_64/mod.rs"]
 #[macro_use]
 mod arch;
 #[macro_use]

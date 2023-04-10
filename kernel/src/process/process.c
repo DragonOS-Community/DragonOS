@@ -544,7 +544,7 @@ ul initial_kernel_thread(ul arg)
     // block_io_scheduler_init();
     ahci_init();
     mount_root_fs();
-    c_virtio_probe();
+    rs_virtio_probe();
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);

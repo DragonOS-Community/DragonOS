@@ -17,6 +17,3 @@ impl LinkLayerEndpoint {
         Self { interface }
     }
 }
-
-
-

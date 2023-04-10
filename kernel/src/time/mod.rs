@@ -352,26 +352,26 @@ impl From<Duration> for ::core::time::Duration {
 }
 
 /// 支持与smoltcp的时间转换
-impl From<smoltcp::time::Instant> for Instant{
+impl From<smoltcp::time::Instant> for Instant {
     fn from(val: smoltcp::time::Instant) -> Self {
         Instant::from_micros(val.micros())
     }
 }
 
-impl Into<smoltcp::time::Instant> for Instant{
+impl Into<smoltcp::time::Instant> for Instant {
     fn into(self) -> smoltcp::time::Instant {
         smoltcp::time::Instant::from_millis(self.millis())
     }
 }
 
 /// 支持与smoltcp的时间转换
-impl From<smoltcp::time::Duration> for Duration{
+impl From<smoltcp::time::Duration> for Duration {
     fn from(val: smoltcp::time::Duration) -> Self {
         Duration::from_micros(val.micros())
     }
 }
 
-impl Into<smoltcp::time::Duration> for Duration{
+impl Into<smoltcp::time::Duration> for Duration {
     fn into(self) -> smoltcp::time::Duration {
         smoltcp::time::Duration::from_millis(self.millis())
     }

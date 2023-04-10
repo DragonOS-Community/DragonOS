@@ -7,8 +7,6 @@ pub fn net_init() -> Result<(), SystemError> {
     return Ok(());
 }
 fn dhcp_query() -> Result<(), SystemError> {
-
-
     let binding = NET_DRIVERS.write();
 
     let net_face = binding.get(&0).unwrap().clone();

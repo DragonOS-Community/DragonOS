@@ -121,31 +121,6 @@ impl Instant {
     }
 }
 
-#[cfg(feature = "std")]
-impl From<::std::time::Instant> for Instant {
-    fn from(other: ::std::time::Instant) -> Instant {
-        let elapsed = other.elapsed();
-        Instant::from_micros((elapsed.as_secs() * 1_000000) as i64 + elapsed.subsec_micros() as i64)
-    }
-}
-
-#[cfg(feature = "std")]
-impl From<::std::time::SystemTime> for Instant {
-    fn from(other: ::std::time::SystemTime) -> Instant {
-        let n = other
-            .duration_since(::std::time::UNIX_EPOCH)
-            .expect("start time must not be before the unix epoch");
-        Self::from_micros(n.as_secs() as i64 * 1000000 + n.subsec_micros() as i64)
-    }
-}
-
-#[cfg(feature = "std")]
-impl From<Instant> for ::std::time::SystemTime {
-    fn from(val: Instant) -> Self {
-        ::std::time::UNIX_EPOCH + ::std::time::Duration::from_micros(val.micros as u64)
-    }
-}
-
 impl fmt::Display for Instant {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}.{:0>3}s", self.secs(), self.millis())

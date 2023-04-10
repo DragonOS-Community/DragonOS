@@ -32,6 +32,9 @@ impl<T: Transport> Clone for VirtioNICDriver<T> {
     }
 }
 
+/// @brief 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
+/// 由于smoltcp的设计，导致需要在poll的时候获取网卡驱动的可变引用，
+/// 同时需要在token的consume里面获取可变引用。为了避免双重加锁，所以需要这个包裹器。
 struct VirtioNICDriverWrapper<T: Transport>(UnsafeCell<VirtioNICDriver<T>>);
 unsafe impl<T: Transport> Send for VirtioNICDriverWrapper<T> {}
 unsafe impl<T: Transport> Sync for VirtioNICDriverWrapper<T> {}

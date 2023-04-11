@@ -1,12 +1,9 @@
-use alloc::sync::Arc;
 use super::{
-    super::device::{
-        Device, 
-        DeviceType,
-        DeviceState
-    },
-    CompatibleTable, platform_driver::PlatformDriver
+    super::device::{Device, DeviceState, DeviceType},
+    platform_driver::PlatformDriver,
+    CompatibleTable,
 };
+use alloc::sync::Arc;
 
 /// @brief: 实现该trait的设备实例应挂载在platform总线上，
 ///         同时应该实现Device trait
@@ -35,4 +32,3 @@ pub trait PlatformDevice: Device {
     /// @return: None
     fn set_driver(&self, driver: Option<Arc<dyn PlatformDriver>>);
 }
-

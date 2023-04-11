@@ -10,7 +10,8 @@ use alloc::{
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec, syscall::SystemError,
+    syscall::SystemError,
+    time::TimeSpec,
 };
 
 use super::vfs::{

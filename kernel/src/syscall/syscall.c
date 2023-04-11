@@ -176,22 +176,14 @@ uint64_t sys_vfork(struct pt_regs *regs)
 uint64_t sys_brk(struct pt_regs *regs)
 {
     uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
-
     // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx
     // current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
-
-    if ((int64_t)regs->r8 == -1)
-    {
-        // kdebug("get brk_start=%#018lx", current_pcb->mm->brk_start);
-        return current_pcb->mm->brk_start;
-    }
-    if ((int64_t)regs->r8 == -2)
-    {
-        // kdebug("get brk_end=%#018lx", current_pcb->mm->brk_end);
-        return current_pcb->mm->brk_end;
-    }
-    if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
-        return -ENOMEM;
+    struct mm_struct *mm = current_pcb->mm;
+    if (new_brk < mm->brk_start || new_brk> new_brk >= current_pcb->addr_limit)
+        return mm->brk_end;
+    
+    if (mm->brk_end == new_brk)
+        return new_brk;
 
     int64_t offset;
     if (new_brk >= current_pcb->mm->brk_end)
@@ -202,7 +194,7 @@ uint64_t sys_brk(struct pt_regs *regs)
     new_brk = mm_do_brk(current_pcb->mm->brk_end, offset); // 扩展堆内存空间
 
     current_pcb->mm->brk_end = new_brk;
-    return 0;
+    return mm->brk_end;
 }
 
 /**

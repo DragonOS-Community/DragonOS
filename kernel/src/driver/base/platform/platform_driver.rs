@@ -1,12 +1,9 @@
-use alloc::sync::Arc;
 use super::{
-    super::device::driver::{
-        Driver,
-        DriverError
-    },
+    super::device::driver::{Driver, DriverError},
     platform_device::PlatformDevice,
     CompatibleTable,
 };
+use alloc::sync::Arc;
 
 /// @brief: 实现该trait的设备驱动实例应挂载在platform总线上，
 ///         同时应该实现Driver trait

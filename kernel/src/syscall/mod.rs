@@ -2,7 +2,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 #[repr(i32)]
 #[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code, non_camel_case_types)]
 pub enum SystemError {
     /// 操作不被允许 Operation not permitted.
     EPERM = 1,

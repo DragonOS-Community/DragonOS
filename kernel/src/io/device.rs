@@ -1,5 +1,5 @@
 /// 引入Module
-use crate::{syscall::SystemError};
+use crate::syscall::SystemError;
 use alloc::{sync::Arc, vec::Vec};
 use core::{any::Any, fmt::Debug};
 
@@ -45,7 +45,6 @@ pub trait Device: Any + Send + Sync + Debug {
     fn sync(&self) -> Result<(), SystemError>;
 
     // TODO: 待实现 open, close
-
 }
 
 /// @brief 块设备应该实现的操作
@@ -58,7 +57,12 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
     /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
     ///          否则返回Err(错误码)，其中错误码为负数；
     ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
-    fn read_at(&self, lba_id_start: BlockId, count: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
+    fn read_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError>;
 
     /// @brief: 在块设备中，从第lba_id_start个块开始，把buf中的count个块数据，存放到设备中
     /// @parameter lba_id_start: 起始块
@@ -67,7 +71,12 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
     /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
     ///          否则返回Err(错误码)，其中错误码为负数；
     ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
-    fn write_at(&self, lba_id_start: BlockId, count: usize, buf: &[u8]) -> Result<usize, SystemError>;
+    fn write_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError>;
 
     /// @brief: 同步磁盘信息，把所有的dirty数据写回硬盘 - 待实现
     fn sync(&self) -> Result<(), SystemError>;

@@ -463,7 +463,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 
     int argc = 0;
     char **dst_argv = NULL;
-    kdebug("stack_start_addr=%#018lx", stack_start_addr);
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
     // 拷贝参数列表
     if (argv != NULL)
     {
@@ -492,7 +492,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         stack_start_addr = str_addr - 8;
     }
 
-    kdebug("stack_start_addr=%#018lx", stack_start_addr);
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
     // ==== 生成relibc所需的Stack结构体
     {
         uint64_t *ptr_stack = (uint64_t *)(stack_start_addr - 8);

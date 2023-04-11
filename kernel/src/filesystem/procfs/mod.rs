@@ -413,7 +413,7 @@ impl IndexNode for LockedProcFSInode {
         _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn poll(&self) -> Result<PollStatus, SystemError> {
@@ -581,7 +581,7 @@ impl IndexNode for LockedProcFSInode {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

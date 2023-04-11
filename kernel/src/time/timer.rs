@@ -240,7 +240,7 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
             Err(_) => continue,
         }
     }
-    return Err(SystemError::EAGAIN);
+    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
 
 pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {

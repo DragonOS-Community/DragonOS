@@ -40,8 +40,8 @@ impl TraitPciArch for X86_64PciArch {
         }
     }
 
-    fn address_pci_to_address_memory(address: usize) -> Result<usize, PciError> {
-        Ok(address)
+    fn address_pci_to_address_memory(address: usize) -> usize {
+        address
     }
 
     fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {

@@ -44,16 +44,12 @@ impl PciDeviceLinkedList {
     }
     /// @brief 获取可读的linkedlist(读锁守卫)
     /// @return RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>>  读锁守卫
-    pub fn read(
-        &self,
-    ) -> RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
+    pub fn read(&self) -> RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.read()
     }
     /// @brief 获取可写的linkedlist(写锁守卫)
     /// @return RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>>  写锁守卫
-    pub fn write(
-        &self,
-    ) -> RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
+    pub fn write(&self) -> RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>> {
         self.list.write()
     }
     /// @brief 获取链表中PCI结构体数目
@@ -493,7 +489,7 @@ impl Display for PciRoot {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
                 f,
-                "PCI Root with segement:{}, bus begin at {}, bus end at {}, physical address at {},mapped at {:#x}",
+                "PCI Root with segement:{}, bus begin at {}, bus end at {}, physical address at {:#x},mapped at {:#x}",
                 self.segement_group_number, self.bus_begin, self.bus_end, self.physical_address_base, self.mmio_base.unwrap() as usize
             )
     }
@@ -510,13 +506,14 @@ impl PciRoot {
     /// @brief  完成物理地址到虚拟地址的映射，并将虚拟地址加入mmio_base变量
     /// @return 返回错误或Ok(0)
     fn map(&mut self) -> Result<u8, PciError> {
-        let bus_number = self.bus_end - self.bus_begin + 1;
-        let bus_number_double = (bus_number + 1) / 2;
+        //kdebug!("bus_begin={},bus_end={}", self.bus_begin,self.bus_end);
+        let bus_number = (self.bus_end - self.bus_begin) as u32 + 1;
+        let bus_number_double = (bus_number - 1) / 2 + 1; //一个bus占据1MB空间，计算全部bus占据空间相对于2MB空间的个数
         let mut virtaddress: u64 = 0;
         let vaddr_ptr = &mut virtaddress as *mut u64;
         let mut virtsize: u64 = 0;
         let virtsize_ptr = &mut virtsize as *mut u64;
-        let size = bus_number_double as u32 * PAGE_2M_SIZE;
+        let size = bus_number_double * PAGE_2M_SIZE;
         unsafe {
             let initial_mm_ptr = &mut initial_mm as *mut mm_struct;
             if let Err(_) =
@@ -554,11 +551,7 @@ impl PciRoot {
     /// @param bus_device_function 在同一个group中pci设备的唯一标识符
     /// @param register_offset 寄存器在设备中的offset
     /// @return u32 寄存器读值结果
-    pub fn read_config(
-        &self,
-        bus_device_function: BusDeviceFunction,
-        register_offset: u16,
-    ) -> u32 {
+    pub fn read_config(&self, bus_device_function: BusDeviceFunction, register_offset: u16) -> u32 {
         let address = self.cam_offset(bus_device_function, register_offset);
         unsafe {
             // Right shift to convert from byte offset to word offset.
@@ -986,7 +979,19 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
 #[no_mangle]
 pub extern "C" fn rs_pci_init() {
     pci_init();
-    //kdebug!("{}",PCI_ROOT_0.unwrap());
+    if PCI_ROOT_0.is_some() {
+        kdebug!("{}", PCI_ROOT_0.unwrap());
+        // 以下为ecam的读取寄存器值测试，经测试可正常读取
+        // let bus_device_function = BusDeviceFunction {
+        //     bus: 0,
+        //     device: 2,
+        //     function: 0,
+        // };
+        // kdebug!(
+        //     "Ecam read virtio-net device vendor id={:#x}",
+        //     PCI_ROOT_0.unwrap().read_config(bus_device_function, 0) as u16
+        // );
+    }
 }
 /// @brief pci初始化函数
 pub fn pci_init() {
@@ -1004,7 +1009,7 @@ pub fn pci_init() {
         let common_header = box_pci_device.common_header();
         match box_pci_device.header_type() {
             HeaderType::Standard if common_header.status & 0x10 != 0 => {
-                kinfo!("Found pci standard device with class code ={} subclass={} status={:#x} cap_pointer={:#x}  vendor={:#x}, device id={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer,common_header.vendor_id, common_header.device_id);
+                kinfo!("Found pci standard device with class code ={} subclass={} status={:#x} cap_pointer={:#x}  vendor={:#x}, device id={:#x},bdf={}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer,common_header.vendor_id, common_header.device_id,common_header.bus_device_function);
             }
             HeaderType::Standard => {
                 kinfo!(
@@ -1063,7 +1068,11 @@ impl BusDeviceFunction {
 ///实现BusDeviceFunction的Display trait，使其可以直接输出
 impl Display for BusDeviceFunction {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{:02x}:{:02x}.{}", self.bus, self.device, self.function)
+        write!(
+            f,
+            "bus {} device {} function{}",
+            self.bus, self.device, self.function
+        )
     }
 }
 /// The location allowed for a memory BAR.
@@ -1275,7 +1284,8 @@ pub fn pci_bar_init(
                 address |= u64::from(address_top) << 32;
                 bar_index_ignore = bar_index + 1; //下个bar跳过，因为64位的memory bar覆盖了两个bar
             }
-            //kdebug!("address={:#x},size={:#x}",address,size);
+            address = PciArch::address_pci_to_address_memory(address as usize) as u64; //PCI总线域物理地址转换为存储器域物理地址
+                                                                                       //kdebug!("address={:#x},size={:#x}",address,size);
             unsafe {
                 let vaddr_ptr = &mut virtaddress as *mut u64;
                 let mut virtsize: u64 = 0;

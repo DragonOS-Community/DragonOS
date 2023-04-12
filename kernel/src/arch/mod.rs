@@ -19,7 +19,7 @@ pub trait TraitPciArch {
     /// @brief PCI域地址到存储器域地址的转换,x86_64架构为一一对应
     /// @param address PCI域地址
     /// @return  Result<usize, PciError> 转换结果或出错原因
-    fn address_pci_to_address_memory(address: usize) -> Result<usize, PciError>;
+    fn address_pci_to_address_memory(address: usize) -> usize;
     /// @brief 获取Segement的root地址,x86_64架构为acpi mcfg表中读取
     /// @param segement 组id
     /// @return  Result<PciRoot, PciError> 转换结果或出错原因

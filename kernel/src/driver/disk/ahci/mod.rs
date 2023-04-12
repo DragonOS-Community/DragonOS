@@ -177,7 +177,6 @@ pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, SystemErro
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     return Err(SystemError::ENXIO);
-
 }
 
 /// @brief: 通过 ctrl_num 和 port_num 获取 port

@@ -1,16 +1,8 @@
-use alloc::{
-    collections::BTreeMap,
-    sync::Arc
-};
-use lazy_static::lazy_static;
-use core::fmt::Debug;
+use super::{driver::Driver, Device, DeviceState, IdTable};
 use crate::libs::spinlock::SpinLock;
-use super::{
-    driver::Driver,
-    DeviceState,
-    IdTable,
-    Device
-};
+use alloc::{collections::BTreeMap, sync::Arc};
+use core::fmt::Debug;
+use lazy_static::lazy_static;
 
 /// @brief: 总线状态
 #[derive(Debug, Copy, Clone)]

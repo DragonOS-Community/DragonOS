@@ -172,7 +172,8 @@
         "cmd.h": "c",
         "user_namespace.h": "c",
         "sleep.h": "c",
-        "net.h": "c"
+        "net.h": "c",
+        "lz4.h": "c"
     },
     "C_Cpp.errorSquiggles": "Enabled",
     "esbonio.sphinx.confDir": "",

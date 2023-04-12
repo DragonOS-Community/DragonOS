@@ -19,11 +19,7 @@ pub enum DeviceType {
 }
 
 /// @brief: 设备标识符类型
-#[derive(Debug)]
-#[derive(Clone)]
-#[derive(Hash)]
-#[derive(PartialOrd, PartialEq)]
-#[derive(Ord, Eq)]
+#[derive(Debug, Clone, Hash, PartialOrd, PartialEq, Ord, Eq)]
 pub struct IdTable(&'static str, u32);
 
 /// @brief: 设备标识符操作方法集
@@ -38,8 +34,7 @@ impl IdTable {
 }
 
 /// @brief: 设备当前状态
-#[derive(Debug)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum DeviceState {
     NotInitialized = 0,
     Initialized = 1,

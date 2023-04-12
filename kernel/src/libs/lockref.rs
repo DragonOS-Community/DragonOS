@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 use super::spinlock::RawSpinlock;
-use crate::{
-    arch::asm::cmpxchg::try_cmpxchg_q,
-    syscall::SystemError,
-};
+use crate::{arch::asm::cmpxchg::try_cmpxchg_q, syscall::SystemError};
 use core::{fmt::Debug, intrinsics::size_of};
 
 #[cfg(target_arch = "x86_64")]
@@ -265,7 +262,7 @@ impl LockRef {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseNotZero);
             if cmpxchg_result.is_ok() {
                 return Ok(cmpxchg_result.unwrap());
-            } else if cmpxchg_result.unwrap_err() == 1{
+            } else if cmpxchg_result.unwrap_err() == 1 {
                 return Err(SystemError::EPERM);
             }
         }

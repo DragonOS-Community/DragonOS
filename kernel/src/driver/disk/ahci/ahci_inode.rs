@@ -6,10 +6,7 @@ use crate::filesystem::vfs::{
 };
 use crate::io::device::BlockDevice;
 use crate::syscall::SystemError;
-use crate::{
-    libs::spinlock::SpinLock,
-    time::TimeSpec,
-};
+use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},

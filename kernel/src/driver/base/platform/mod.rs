@@ -1,23 +1,16 @@
-use alloc::{
-    collections::{BTreeSet, BTreeMap}, 
-    vec::Vec, sync::Arc
-};
-use lazy_static::lazy_static;
-use core::fmt::Debug;
 use super::device::{
-    bus::{
-        BusDriver, 
-        BusState, 
-        BUS_MANAGER, 
-        Bus
-    },
-    driver::Driver, 
-    IdTable, 
-    DeviceError, 
-    DeviceState, 
-    DeviceType, Device    
+    bus::{Bus, BusDriver, BusState, BUS_MANAGER},
+    driver::Driver,
+    Device, DeviceError, DeviceState, DeviceType, IdTable,
 };
-use crate::libs::{rwlock::RwLock, mutex::Mutex};
+use crate::libs::{mutex::Mutex, rwlock::RwLock};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    vec::Vec,
+};
+use core::fmt::Debug;
+use lazy_static::lazy_static;
 use platform_device::PlatformDevice;
 use platform_driver::PlatformDriver;
 
@@ -57,7 +50,7 @@ impl CompatibleTable {
 
 /// @brief: platform总线驱动
 #[derive(Debug)]
-pub struct  PlatformBusDriver {
+pub struct PlatformBusDriver {
     drivers: RwLock<BTreeMap<IdTable, Arc<dyn PlatformDriver>>>, // 总线上所有驱动
     devices: RwLock<BTreeMap<IdTable, Arc<dyn PlatformDevice>>>, // 总线上所有设备
 }
@@ -108,14 +101,17 @@ impl PlatformBusDriver {
     /// @parameter driver: platform类型驱动，该驱动需要实现PlatformDriver trait
     /// @return: 注册成功，返回Ok(()),，注册失败，返回BusError类型
     #[allow(dead_code)]
-    fn register_platform_driver(&mut self, driver: Arc<dyn PlatformDriver>) -> Result<(), DeviceError> {
+    fn register_platform_driver(
+        &mut self,
+        driver: Arc<dyn PlatformDriver>,
+    ) -> Result<(), DeviceError> {
         let id_table = driver.get_id_table();
 
         let mut drivers = self.drivers.write();
         // 如果存在同类型的驱动，返回错误
         if drivers.contains_key(&id_table) {
             return Err(DeviceError::DriverExists);
-        } else {        
+        } else {
             drivers.insert(id_table.clone(), driver.clone());
             return Ok(());
         }
@@ -135,7 +131,10 @@ impl PlatformBusDriver {
     /// @parameter driver: platform类型设备，该驱动需要实现PlatformDevice trait
     /// @return: 注册成功，返回Ok(()),，注册失败，返回BusError类型
     #[allow(dead_code)]
-    fn register_platform_device(&mut self, device: Arc<dyn PlatformDevice>) -> Result<(), DeviceError> {
+    fn register_platform_device(
+        &mut self,
+        device: Arc<dyn PlatformDevice>,
+    ) -> Result<(), DeviceError> {
         let id_table = device.get_id_table();
 
         let mut devices = self.devices.write();
@@ -166,14 +165,17 @@ impl PlatformBusDriver {
         let devices = self.devices.read();
 
         for (_dev_id_table, device) in devices.iter() {
-            if device.get_compatible_table().matches(&driver.get_compatible_table()) {              
+            if device
+                .get_compatible_table()
+                .matches(&driver.get_compatible_table())
+            {
                 if !device.is_initialized() {
                     // 设备未初始化，调用驱动probe函数
                     match driver.probe(device.clone()) {
                         Ok(()) => {
                             num = num + 1;
                             device.set_state(DeviceState::Initialized)
-                        },
+                        }
                         // 可以驱动很多设备，一个设备初始化出错即返回
                         Err(_) => return Err(DeviceError::InitializeFailed),
                     }
@@ -194,9 +196,12 @@ impl PlatformBusDriver {
     fn device_match_driver(&self, device: Arc<dyn PlatformDevice>) -> Result<(), DeviceError> {
         let drivers = self.drivers.read();
         for (_drv_id_table, driver) in &*drivers {
-            if driver.get_compatible_table().matches(&device.get_compatible_table()) {
+            if driver
+                .get_compatible_table()
+                .matches(&device.get_compatible_table())
+            {
                 match driver.probe(device.clone()) {
-                    Ok(_driver) => {                
+                    Ok(_driver) => {
                         // 将设备状态置为已初始化
                         device.set_state(DeviceState::Initialized);
                         return Ok(());
@@ -228,10 +233,9 @@ impl BusDriver for PlatformBusDriver {
 }
 
 /// @brief: platform总线
-#[derive(Debug)]
-#[derive(Clone)]
-pub struct Platform { 
-    state: Arc<Mutex<BusState>>, // 总线状态
+#[derive(Debug, Clone)]
+pub struct Platform {
+    state: Arc<Mutex<BusState>>,            // 总线状态
     driver: Option<Arc<PlatformBusDriver>>, // 总线驱动
 }
 
@@ -266,7 +270,7 @@ impl Platform {
         match *state {
             BusState::Initialized => true,
             _ => false,
-        } 
+        }
     }
 
     /// @brief: 设置总线状态
@@ -288,7 +292,7 @@ impl Platform {
         return *state;
     }
 
-    /// @brief: 
+    /// @brief:
     /// @parameter: None
     /// @return: 总线状态
     #[inline]
@@ -332,16 +336,26 @@ lazy_static! {
 /// @return: None
 #[allow(dead_code)]
 pub fn platform_bus_init() {
-    BUS_MANAGER.add_bus_driver(BUS_PLATFORM_DRIVER.get_id_table(), BUS_PLATFORM_DRIVER.clone());
-    BUS_MANAGER.add_bus(BUS_PLATFORM_DEVICE.get_id_table(), BUS_PLATFORM_DEVICE.clone());
+    BUS_MANAGER.add_bus_driver(
+        BUS_PLATFORM_DRIVER.get_id_table(),
+        BUS_PLATFORM_DRIVER.clone(),
+    );
+    BUS_MANAGER.add_bus(
+        BUS_PLATFORM_DEVICE.get_id_table(),
+        BUS_PLATFORM_DEVICE.clone(),
+    );
     BUS_PLATFORM_DEVICE.set_state(BusState::Initialized);
 }
 
 #[no_mangle]
 extern "C" fn c_platform_bus_init() {
-    BUS_MANAGER.add_bus_driver(BUS_PLATFORM_DRIVER.get_id_table(), BUS_PLATFORM_DRIVER.clone());
-    BUS_MANAGER.add_bus(BUS_PLATFORM_DEVICE.get_id_table(), BUS_PLATFORM_DEVICE.clone());
+    BUS_MANAGER.add_bus_driver(
+        BUS_PLATFORM_DRIVER.get_id_table(),
+        BUS_PLATFORM_DRIVER.clone(),
+    );
+    BUS_MANAGER.add_bus(
+        BUS_PLATFORM_DEVICE.get_id_table(),
+        BUS_PLATFORM_DEVICE.clone(),
+    );
     BUS_PLATFORM_DEVICE.set_state(BusState::Initialized);
 }
-
-

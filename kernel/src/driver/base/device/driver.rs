@@ -3,9 +3,7 @@ use core::{any::Any, fmt::Debug};
 
 /// @brief: Driver error
 #[allow(dead_code)]
-#[derive(Debug)]
-#[derive(PartialEq, Eq)]
-#[derive(Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DriverError {
     ProbeError,
 }

@@ -79,7 +79,12 @@ impl FATFile {
     ///
     /// @return Ok(usize) 成功读取到的字节数
     /// @return Err(SystemError) 读取时出现错误，返回错误码
-    pub fn read(&self, fs: &Arc<FATFileSystem>, buf: &mut [u8], offset: u64) -> Result<usize, SystemError> {
+    pub fn read(
+        &self,
+        fs: &Arc<FATFileSystem>,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, SystemError> {
         if offset >= self.size() {
             return Ok(0);
         }
@@ -223,7 +228,12 @@ impl FATFile {
     ///
     /// @return Ok(()) 经过操作后，offset后面具有长度至少为len的空闲空间
     /// @return Err(SystemError) 处理过程中出现了异常。
-    fn ensure_len(&mut self, fs: &Arc<FATFileSystem>, offset: u64, len: u64) -> Result<(), SystemError> {
+    fn ensure_len(
+        &mut self,
+        fs: &Arc<FATFileSystem>,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), SystemError> {
         // 文件内本身就还有空余的空间
         if offset + len <= self.size() {
             return Ok(());
@@ -822,7 +832,11 @@ impl FATDir {
     ///
     /// @return Ok(FATDirEntry) 目标目录项
     /// @return Err(SystemError) 底层传上来的错误码
-    pub fn get_dir_entry(&self, fs: Arc<FATFileSystem>, name: &str) -> Result<FATDirEntry, SystemError> {
+    pub fn get_dir_entry(
+        &self,
+        fs: Arc<FATFileSystem>,
+        name: &str,
+    ) -> Result<FATDirEntry, SystemError> {
         if name == "." || name == "/" {
             return Ok(FATDirEntry::Dir(self.clone()));
         }
@@ -1271,7 +1285,11 @@ impl ShortDirEntry {
     ///
     /// @return Ok(())
     /// @return Err(SystemError) 错误码
-    pub fn flush(&self, fs: &Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), SystemError> {
+    pub fn flush(
+        &self,
+        fs: &Arc<FATFileSystem>,
+        disk_bytes_offset: u64,
+    ) -> Result<(), SystemError> {
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(disk_bytes_offset);
         let lba = fs.get_lba_from_offset(

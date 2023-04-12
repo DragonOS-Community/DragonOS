@@ -7,7 +7,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::{syscall::SystemError};
+use crate::syscall::SystemError;
 
 ///RwLock读写锁
 
@@ -239,7 +239,7 @@ impl<T> RwLock<T> {
     }
 
     #[allow(dead_code)]
-    pub fn get_mut(&mut self) -> &mut T {
+    pub unsafe fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
 }

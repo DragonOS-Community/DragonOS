@@ -59,10 +59,10 @@ macro_rules! volatile_write_bit {
 ///     queue_driver: Volatile<u64>,
 ///     queue_device: Volatile<u64>,
 /// }
-/// 
+///
 /// 对CommonCfg里面的某个寄存器进行读写：
 /// volwrite!(self.common_cfg, queue_enable, 0);
-/// 
+///
 /// 这样做不仅使代码的可读性提高了，也避免了对只读寄存器进行写入的误操作
 
 /// 只读寄存器

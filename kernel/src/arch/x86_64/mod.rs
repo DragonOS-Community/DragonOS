@@ -8,3 +8,7 @@ pub mod mm;
 pub mod pci;
 pub mod rand;
 pub mod sched;
+
+pub use self::pci::pci::X86_64PciArch as PciArch;
+
+pub use self::mm::X86_64MMArch as MMArch;

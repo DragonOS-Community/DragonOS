@@ -1,15 +1,15 @@
 # 进行启动前检查
 flag_can_run=1
-ARGS=`getopt -o p -l bios: -- "$@"`
+ARGS=`getopt -o p -l bios:,display: -- "$@"`
 eval set -- "${ARGS}"
 echo "$@"
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
 ARCH="x86_64"
 #ARCH="i386"
-# 请根据自己的需要，在-d 后方加入所需的trace事件
+# 请根据自己的需要，在-d 后方加入所需的 trace 事件
 
 # 标准的trace events
-qemu_trace_std=cpu_reset,guest_errors,exec,cpu
+qemu_trace_std=cpu_reset,guest_errors,exec,cpu,trace:virtio*
 # 调试usb的trace
 qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace:usb_xhci_irq_msi,trace:usb_xhci_irq_msix,trace:usb_xhci_port_reset,trace:msix_write_config,trace:usb_xhci_irq_msix,trace:usb_xhci_irq_msix_use,trace:usb_xhci_irq_msix_unuse,trace:usb_xhci_irq_msi,trace:usb_xhci_*
 qemu_accel=kvm
@@ -29,30 +29,46 @@ QEMU_RTC_CLOCK="clock=host,base=localtime"
 QEMU_SERIAL="file:../serial_opt.txt"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 
-QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,model=virtio -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel}"
+QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -nic user,model=virtio-net-pci -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel}"
 
 QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d -monitor ${QEMU_MONITOR} -d ${qemu_trace_std} "
 
 QEMU_ARGUMENT+="-s -S -cpu ${QEMU_CPU_FEATURES} -rtc ${QEMU_RTC_CLOCK} -serial ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES}"
 
-
 if [ $flag_can_run -eq 1 ]; then
+  while true;do
     case "$1" in
         --bios) 
-      case "$2" in
+        case "$2" in
               uefi) #uefi启动新增ovmf.fd固件
-              if [ ${ARCH} == x86_64 ] ;then
-              ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
-              elif [ ${ARCH} == i386 ] ;then
-              ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
-              fi
+              BIOS_TYPE=uefi
             ;;
               legacy)
-              ${QEMU} ${QEMU_ARGUMENT}
+              BIOS_TYPE=lagacy
               ;;
-            esac       
+        esac;shift 2;;
+        --display)
+        case "$2" in
+              vnc)
+              QEMU_ARGUMENT+=" -display vnc=:5900"
+              ;;
+              window)
+              ;;
+        esac;shift 2;;
+        *) break
+      esac 
+  done 
 
-esac  
+if [ ${BIOS_TYPE} == uefi ] ;then
+  if [ ${ARCH} == x86_64 ] ;then
+    sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+  elif [ ${ARCH} == i386 ] ;then
+    sudo ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+  fi
+else
+  sudo ${QEMU} ${QEMU_ARGUMENT}
+fi
+
 else
   echo "不满足运行条件"
 fi

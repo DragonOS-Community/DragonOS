@@ -7,7 +7,6 @@
 #include <exception/gate.h>
 #include <exception/irq.h>
 #include <filesystem/vfs/VFS.h>
-#include <filesystem/fat32/fat32.h>
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
@@ -19,10 +18,52 @@ extern uint64_t sys_mstat(struct pt_regs *regs);
 extern uint64_t sys_open(struct pt_regs *regs);
 extern uint64_t sys_unlink_at(struct pt_regs *regs);
 extern uint64_t sys_kill(struct pt_regs *regs);
-extern uint64_t sys_sigaction(struct pt_regs * regs);
-extern uint64_t sys_rt_sigreturn(struct pt_regs * regs);
-extern uint64_t sys_getpid(struct pt_regs * regs);
-extern uint64_t sys_sched(struct pt_regs * regs);
+extern uint64_t sys_sigaction(struct pt_regs *regs);
+extern uint64_t sys_rt_sigreturn(struct pt_regs *regs);
+extern uint64_t sys_getpid(struct pt_regs *regs);
+extern uint64_t sys_sched(struct pt_regs *regs);
+
+/**
+ * @brief 关闭文件系统调用
+ *
+ * @param fd_num 文件描述符号
+ *
+ * @param regs
+ * @return uint64_t
+ */
+extern uint64_t sys_close(struct pt_regs *regs);
+
+/**
+ * @brief 从文件中读取数据
+ *
+ * @param fd_num regs->r8 文件描述符号
+ * @param buf regs->r9 输出缓冲区
+ * @param count regs->r10 要读取的字节数
+ *
+ * @return uint64_t
+ */
+extern uint64_t sys_read(struct pt_regs *regs);
+
+/**
+ * @brief 向文件写入数据
+ *
+ * @param fd_num regs->r8 文件描述符号
+ * @param buf regs->r9 输入缓冲区
+ * @param count regs->r10 要写入的字节数
+ *
+ * @return uint64_t
+ */
+extern uint64_t sys_write(struct pt_regs *regs);
+
+/**
+ * @brief 调整文件的访问位置
+ *
+ * @param fd_num 文件描述符号
+ * @param offset 偏移量
+ * @param whence 调整模式
+ * @return uint64_t 调整结束后的文件访问位置
+ */
+extern uint64_t sys_lseek(struct pt_regs *regs);
 
 /**
  * @brief 导出系统调用处理函数的符号
@@ -47,17 +88,6 @@ ul system_call_not_exists(struct pt_regs *regs)
  * @param symbol 系统调用处理函数
  */
 #define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
-
-/**
- * @brief sysenter的系统调用函数，从entry.S中跳转到这里
- *
- * @param regs 3特权级下的寄存器值,rax存储系统调用号
- * @return ul 对应的系统调用函数的地址
- */
-ul system_call_function(struct pt_regs *regs)
-{
-    return system_call_table[regs->rax](regs);
-}
 
 /**
  * @brief 初始化系统调用模块
@@ -125,133 +155,6 @@ ul sys_put_string(struct pt_regs *regs)
     return 0;
 }
 
-/**
- * @brief 关闭文件系统调用
- *
- * @param fd_num 文件描述符号
- *
- * @param regs
- * @return uint64_t
- */
-uint64_t sys_close(struct pt_regs *regs)
-{
-    int fd_num = (int)regs->r8;
-
-    // kdebug("sys close: fd=%d", fd_num);
-    return vfs_close(fd_num);
-}
-
-/**
- * @brief 从文件中读取数据
- *
- * @param fd_num regs->r8 文件描述符号
- * @param buf regs->r9 输出缓冲区
- * @param count regs->r10 要读取的字节数
- *
- * @return uint64_t
- */
-uint64_t sys_read(struct pt_regs *regs)
-{
-    int fd_num = (int)regs->r8;
-    void *buf = (void *)regs->r9;
-    int64_t count = (int64_t)regs->r10;
-
-    // 校验buf的空间范围
-    if (SYSCALL_FROM_USER(regs) && (!verify_area((uint64_t)buf, count)))
-        return -EPERM;
-
-    // kdebug("sys read: fd=%d", fd_num);
-
-    // 校验文件描述符范围
-    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
-        return -EBADF;
-
-    // 文件描述符不存在
-    if (current_pcb->fds[fd_num] == NULL)
-        return -EBADF;
-
-    if (count < 0)
-        return -EINVAL;
-
-    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
-    uint64_t ret = 0;
-    if (file_ptr->file_ops && file_ptr->file_ops->read)
-        ret = file_ptr->file_ops->read(file_ptr, (char *)buf, count, &(file_ptr->position));
-
-    return ret;
-}
-
-/**
- * @brief 向文件写入数据
- *
- * @param fd_num regs->r8 文件描述符号
- * @param buf regs->r9 输入缓冲区
- * @param count regs->r10 要写入的字节数
- *
- * @return uint64_t
- */
-uint64_t sys_write(struct pt_regs *regs)
-{
-    int fd_num = (int)regs->r8;
-    void *buf = (void *)regs->r9;
-    int64_t count = (int64_t)regs->r10;
-
-    // 校验buf的空间范围
-    if (SYSCALL_FROM_USER(regs) && (!verify_area((uint64_t)buf, count)))
-        return -EPERM;
-    kdebug("sys write: fd=%d", fd_num);
-
-    // 校验文件描述符范围
-    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
-        return -EBADF;
-
-    // 文件描述符不存在
-    if (current_pcb->fds[fd_num] == NULL)
-        return -EBADF;
-
-    if (count < 0)
-        return -EINVAL;
-
-    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
-    uint64_t ret = 0;
-    if (file_ptr->file_ops && file_ptr->file_ops->write)
-        ret = file_ptr->file_ops->write(file_ptr, (char *)buf, count, &(file_ptr->position));
-
-    return ret;
-}
-
-/**
- * @brief 调整文件的访问位置
- *
- * @param fd_num 文件描述符号
- * @param offset 偏移量
- * @param whence 调整模式
- * @return uint64_t 调整结束后的文件访问位置
- */
-uint64_t sys_lseek(struct pt_regs *regs)
-{
-    int fd_num = (int)regs->r8;
-    long offset = (long)regs->r9;
-    int whence = (int)regs->r10;
-
-    // kdebug("sys_lseek: fd=%d", fd_num);
-    uint64_t retval = 0;
-
-    // 校验文件描述符范围
-    if (fd_num < 0 || fd_num > PROC_MAX_FD_NUM)
-        return -EBADF;
-
-    // 文件描述符不存在
-    if (current_pcb->fds[fd_num] == NULL)
-        return -EBADF;
-
-    struct vfs_file_t *file_ptr = current_pcb->fds[fd_num];
-    if (file_ptr->file_ops && file_ptr->file_ops->lseek)
-        retval = file_ptr->file_ops->lseek(file_ptr, offset, whence);
-
-    return retval;
-}
-
 uint64_t sys_fork(struct pt_regs *regs)
 {
     return do_fork(regs, 0, regs->rsp, 0);
@@ -273,22 +176,14 @@ uint64_t sys_vfork(struct pt_regs *regs)
 uint64_t sys_brk(struct pt_regs *regs)
 {
     uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
-
     // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx
     // current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
-
-    if ((int64_t)regs->r8 == -1)
-    {
-        // kdebug("get brk_start=%#018lx", current_pcb->mm->brk_start);
-        return current_pcb->mm->brk_start;
-    }
-    if ((int64_t)regs->r8 == -2)
-    {
-        // kdebug("get brk_end=%#018lx", current_pcb->mm->brk_end);
-        return current_pcb->mm->brk_end;
-    }
-    if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
-        return -ENOMEM;
+    struct mm_struct *mm = current_pcb->mm;
+    if (new_brk < mm->brk_start || new_brk> new_brk >= current_pcb->addr_limit)
+        return mm->brk_end;
+    
+    if (mm->brk_end == new_brk)
+        return new_brk;
 
     int64_t offset;
     if (new_brk >= current_pcb->mm->brk_end)
@@ -299,7 +194,7 @@ uint64_t sys_brk(struct pt_regs *regs)
     new_brk = mm_do_brk(current_pcb->mm->brk_end, offset); // 扩展堆内存空间
 
     current_pcb->mm->brk_end = new_brk;
-    return 0;
+    return mm->brk_end;
 }
 
 /**
@@ -365,57 +260,7 @@ uint64_t sys_reboot(struct pt_regs *regs)
 | ENAMETOOLONG |        路径过长        |
 +--------------+------------------------+
  */
-uint64_t sys_chdir(struct pt_regs *regs)
-{
-    char *dest_path = (char *)regs->r8;
-    // kdebug("dest_path=%s", dest_path);
-    // 检查目标路径是否为NULL
-    if (dest_path == NULL)
-        return -EFAULT;
-
-    // 计算输入的路径长度
-    int dest_path_len;
-    if (user_mode(regs))
-    {
-        dest_path_len = strnlen_user(dest_path, PAGE_4K_SIZE);
-    }
-    else
-        dest_path_len = strnlen(dest_path, PAGE_4K_SIZE);
-
-    // 长度小于等于0
-    if (dest_path_len <= 0)
-        return -EFAULT;
-    else if (dest_path_len >= PAGE_4K_SIZE)
-        return -ENAMETOOLONG;
-
-    // 为路径字符串申请空间
-    char *path = kmalloc(dest_path_len + 1, 0);
-    // 系统内存不足
-    if (path == NULL)
-        return -ENOMEM;
-
-    memset(path, 0, dest_path_len + 1);
-    if (regs->cs & USER_CS)
-    {
-        // 将字符串从用户空间拷贝进来, +1是为了拷贝结尾的\0
-        strncpy_from_user(path, dest_path, dest_path_len + 1);
-    }
-    else
-        strncpy(path, dest_path, dest_path_len + 1);
-    // kdebug("chdir: path = %s", path);
-    struct vfs_dir_entry_t *dentry = vfs_path_walk(path, 0);
-
-    kfree(path);
-
-    if (dentry == NULL)
-        return -ENOENT;
-    // kdebug("dentry->name=%s, namelen=%d", dentry->name, dentry->name_length);
-    // 目标不是目录
-    if (dentry->dir_inode->attribute != VFS_IF_DIR)
-        return -ENOTDIR;
-
-    return 0;
-}
+extern uint64_t sys_chdir(struct pt_regs *regs);
 
 /**
  * @brief 获取目录中的数据
@@ -423,28 +268,7 @@ uint64_t sys_chdir(struct pt_regs *regs)
  * @param fd 文件描述符号
  * @return uint64_t dirent的总大小
  */
-uint64_t sys_getdents(struct pt_regs *regs)
-{
-    int fd = (int)regs->r8;
-    void *dirent = (void *)regs->r9;
-    long count = (long)regs->r10;
-
-    if (fd < 0 || fd > PROC_MAX_FD_NUM)
-        return -EBADF;
-
-    if (count < 0)
-        return -EINVAL;
-
-    struct vfs_file_t *filp = current_pcb->fds[fd];
-    if (filp == NULL)
-        return -EBADF;
-
-    uint64_t retval = 0;
-    if (filp->file_ops && filp->file_ops->readdir)
-        retval = filp->file_ops->readdir(filp, dirent, &vfs_fill_dirent);
-
-    return retval;
-}
+extern uint64_t sys_getdents(struct pt_regs *regs);
 
 /**
  * @brief 执行新的程序
@@ -455,13 +279,12 @@ uint64_t sys_getdents(struct pt_regs *regs)
  */
 uint64_t sys_execve(struct pt_regs *regs)
 {
-    // kdebug("sys_execve");
+
     char *user_path = (char *)regs->r8;
     char **argv = (char **)regs->r9;
 
     int path_len = strnlen_user(user_path, PAGE_4K_SIZE);
 
-    // kdebug("path_len=%d", path_len);
     if (path_len >= PAGE_4K_SIZE)
         return -ENAMETOOLONG;
     else if (path_len <= 0)
@@ -473,12 +296,10 @@ uint64_t sys_execve(struct pt_regs *regs)
 
     memset(path, 0, path_len + 1);
 
-    // kdebug("before copy file path from user");
     // 拷贝文件路径
     strncpy_from_user(path, user_path, path_len);
     path[path_len] = '\0';
 
-    // kdebug("before do_execve, path = %s", path);
     // 执行新的程序
     uint64_t retval = do_execve(regs, path, argv, NULL);
 
@@ -519,6 +340,8 @@ uint64_t sys_wait4(struct pt_regs *regs)
         return -EINVAL;
 
     // 如果子进程没有退出，则等待其退出
+    // BUG: 这里存在问题，由于未对进程管理模块加锁，因此可能会出现子进程退出后，父进程还在等待的情况
+    // （子进程退出后，process_exit_notify消息丢失）
     while (child_proc->state != PROC_ZOMBIE)
         wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
 
@@ -547,22 +370,30 @@ uint64_t sys_nanosleep(struct pt_regs *regs)
     const struct timespec *rqtp = (const struct timespec *)regs->r8;
     struct timespec *rmtp = (struct timespec *)regs->r9;
 
-    return nanosleep(rqtp, rmtp);
+    return rs_nanosleep(rqtp, rmtp);
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)
 {
-    ahci_end_request();
+    // ahci_end_request();
     return 0;
 }
 
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 {
-
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }
+uint64_t sys_pipe(struct pt_regs *regs)
+{
+    return -ENOTSUP;
+}
+
+extern uint64_t sys_mkdir(struct pt_regs *regs);
+
+extern int sys_dup(int oldfd);
+extern int sys_dup2(int oldfd, int newfd);
 
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,
@@ -593,6 +424,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,
     [27] = sys_sched,
-    [28 ... 254] = system_call_not_exists,
-    [255] = sys_ahci_end_req,
+    [28] = sys_dup,
+    [29] = sys_dup2,
+    [30 ... 255] = system_call_not_exists,
 };

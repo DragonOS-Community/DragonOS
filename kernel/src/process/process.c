@@ -6,6 +6,7 @@
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
+#include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/stdio.h>
@@ -18,20 +19,14 @@
 #include <driver/disk/ahci/ahci.h>
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
+#include <driver/virtio/virtio.h>
 #include <exception/gate.h>
-#include <filesystem/devfs/devfs.h>
-#include <filesystem/fat32/fat32.h>
-#include <filesystem/procfs/procfs.h>
-#include <filesystem/rootfs/rootfs.h>
 #include <ktest/ktest.h>
+#include <mm/mmio.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-
-#include <mm/mmio.h>
-
-#include <common/lz4.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -41,6 +36,7 @@ long process_global_pid = 1;              // 系统中最大的pid
 
 extern void system_call(void);
 extern void kernel_thread_func(void);
+extern void rs_procfs_unregister_pid(uint64_t);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 extern struct mm_struct initial_mm;
@@ -50,15 +46,18 @@ extern struct sighand_struct INITIAL_SIGHAND;
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
+extern void rs_process_exit_fpstate(struct process_control_block *pcb);
+extern int process_init_files();
+extern int rs_init_stdio();
 
 // 设置初始进程的PCB
-#define INITIAL_PROC(proc)                                                                                             \
-    {                                                                                                                  \
-        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
-        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,   \
-        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                   \
-        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                       \
+#define INITIAL_PROC(proc)                                                                                           \
+    {                                                                                                                \
+        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
+        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
+        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
+        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                     \
     }
 
 struct thread_struct initial_thread = {
@@ -86,7 +85,7 @@ struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_
  * @param pcb 要被回收的进程的pcb
  * @return uint64_t
  */
-uint64_t process_exit_files(struct process_control_block *pcb);
+extern int process_exit_files(struct process_control_block *pcb);
 
 /**
  * @brief 释放进程的页表
@@ -115,8 +114,10 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
+                         : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
+                         : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -139,32 +140,15 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
  * @brief 打开要执行的程序文件
  *
  * @param path
- * @return struct vfs_file_t*
+ * @return int 文件描述符编号
  */
-struct vfs_file_t *process_open_exec_file(char *path)
+int process_open_exec_file(char *path)
 {
-    struct vfs_dir_entry_t *dentry = NULL;
-    struct vfs_file_t *filp = NULL;
-    // kdebug("path=%s", path);
-    dentry = vfs_path_walk(path, 0);
-
-    if (dentry == NULL)
-        return (void *)-ENOENT;
-
-    if (dentry->dir_inode->attribute == VFS_IF_DIR)
-        return (void *)-ENOTDIR;
-
-    filp = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
-    if (filp == NULL)
-        return (void *)-ENOMEM;
-
-    filp->position = 0;
-    filp->mode = 0;
-    filp->dEntry = dentry;
-    filp->mode = ATTR_READ_ONLY;
-    filp->file_ops = dentry->dir_inode->file_ops;
-
-    return filp;
+    struct pt_regs tmp = {0};
+    tmp.r8 = (uint64_t)path;
+    tmp.r9 = O_RDONLY;
+    int fd = sys_open(&tmp);
+    return fd;
 }
 
 /**
@@ -177,19 +161,38 @@ struct vfs_file_t *process_open_exec_file(char *path)
 static int process_load_elf_file(struct pt_regs *regs, char *path)
 {
     int retval = 0;
-    struct vfs_file_t *filp = process_open_exec_file(path);
+    int fd = process_open_exec_file(path);
 
-    if ((long)filp <= 0 && (long)filp >= -255)
+    if ((long)fd < 0)
     {
-        kdebug("(long)filp=%ld", (long)filp);
-        return (unsigned long)filp;
+        kdebug("(long)fd=%ld", (long)fd);
+        return (unsigned long)fd;
     }
 
-    void *buf = kmalloc(PAGE_4K_SIZE, 0);
-    memset(buf, 0, PAGE_4K_SIZE);
+    void *buf = kzalloc(PAGE_4K_SIZE, 0);
     uint64_t pos = 0;
-    pos = filp->file_ops->lseek(filp, 0, SEEK_SET);
-    retval = filp->file_ops->read(filp, (char *)buf, sizeof(Elf64_Ehdr), &pos);
+
+    struct pt_regs tmp_use_fs = {0};
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = 0;
+    tmp_use_fs.r10 = SEEK_SET;
+    retval = sys_lseek(&tmp_use_fs);
+
+    // 读取 Elf64_Ehdr
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = (uint64_t)buf;
+    tmp_use_fs.r10 = sizeof(Elf64_Ehdr);
+    retval = sys_read(&tmp_use_fs);
+
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = 0;
+    tmp_use_fs.r10 = SEEK_CUR;
+    pos = sys_lseek(&tmp_use_fs);
+
+    if (retval != sizeof(Elf64_Ehdr))
+    {
+        kerror("retval=%d, not equal to sizeof(Elf64_Ehdr):%d", retval, sizeof(Elf64_Ehdr));
+    }
     retval = 0;
     if (!elf_check(buf))
     {
@@ -229,18 +232,33 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
     // kdebug("ehdr.e_phoff=%#018lx\t ehdr.e_phentsize=%d, ehdr.e_phnum=%d", ehdr.e_phoff, ehdr.e_phentsize,
     // ehdr.e_phnum); 将指针移动到program header处
-    pos = ehdr.e_phoff;
+
     // 读取所有的phdr
-    pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
-    filp->file_ops->read(filp, (char *)buf, (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum, &pos);
-    if ((unsigned long)filp <= 0)
+    pos = ehdr.e_phoff;
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = pos;
+    tmp_use_fs.r10 = SEEK_SET;
+    pos = sys_lseek(&tmp_use_fs);
+
+    memset(buf, 0, PAGE_4K_SIZE);
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = (uint64_t)buf;
+    tmp_use_fs.r10 = (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum;
+    sys_read(&tmp_use_fs);
+
+    tmp_use_fs.r8 = fd;
+    tmp_use_fs.r9 = 0;
+    tmp_use_fs.r10 = SEEK_CUR;
+    pos = sys_lseek(&tmp_use_fs);
+
+    if ((long)retval < 0)
     {
-        kdebug("(unsigned long)filp=%d", (long)filp);
+        kdebug("(unsigned long)filp=%d", (long)retval);
         retval = -ENOEXEC;
         goto load_elf_failed;
     }
-    Elf64_Phdr *phdr = buf;
 
+    Elf64_Phdr *phdr = buf;
     // 将程序加载到内存中
     for (int i = 0; i < ehdr.e_phnum; ++i, ++phdr)
     {
@@ -310,12 +328,38 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 }
             }
 
-            pos = filp->file_ops->lseek(filp, pos, SEEK_SET);
+            tmp_use_fs.r8 = fd;
+            tmp_use_fs.r9 = pos;
+            tmp_use_fs.r10 = SEEK_SET;
+            pos = sys_lseek(&tmp_use_fs);
+
             int64_t val = 0;
             if (remain_file_size > 0)
             {
                 int64_t to_trans = (remain_file_size > PAGE_2M_SIZE) ? PAGE_2M_SIZE : remain_file_size;
-                val = filp->file_ops->read(filp, (char *)(virt_base + beginning_offset), to_trans, &pos);
+
+                void *buf3 = kzalloc(PAGE_4K_SIZE, 0);
+                while (to_trans > 0)
+                {
+                    int64_t x = 0;
+                    tmp_use_fs.r8 = fd;
+                    tmp_use_fs.r9 = (uint64_t)buf3;
+                    tmp_use_fs.r10 = to_trans;
+                    x = sys_read(&tmp_use_fs);
+                    memcpy(virt_base + beginning_offset + val, buf3, x);
+                    val += x;
+                    to_trans -= x;
+                    tmp_use_fs.r8 = fd;
+                    tmp_use_fs.r9 = 0;
+                    tmp_use_fs.r10 = SEEK_CUR;
+                    pos = sys_lseek(&tmp_use_fs);
+                }
+                kfree(buf3);
+
+                // kdebug("virt_base + beginning_offset=%#018lx, val=%d, to_trans=%d", virt_base + beginning_offset,
+                // val,
+                //        to_trans);
+                // kdebug("to_trans=%d", to_trans);
             }
 
             if (val < 0)
@@ -346,6 +390,12 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     memset((void *)(current_pcb->mm->stack_start - PAGE_2M_SIZE), 0, PAGE_2M_SIZE);
 
 load_elf_failed:;
+    {
+        struct pt_regs tmp = {0};
+        tmp.r8 = fd;
+        sys_close(&tmp);
+    }
+
     if (buf != NULL)
         kfree(buf);
     return retval;
@@ -363,8 +413,6 @@ load_elf_failed:;
 #pragma GCC optimize("O0")
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
-
-    // kdebug("do_execve is running...");
 
     // 当前进程正在与父进程共享地址空间，需要创建
     // 独立的地址空间才能使新程序正常运行
@@ -407,9 +455,6 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     current_pcb->mm->brk_end = brk_start_addr;
     current_pcb->mm->stack_start = stack_start_addr;
 
-    // 关闭之前的文件描述符
-    process_exit_files(current_pcb);
-
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
@@ -418,13 +463,15 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     if (tmp < 0)
         goto exec_failed;
 
+    int argc = 0;
+    char **dst_argv = NULL;
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
     // 拷贝参数列表
     if (argv != NULL)
     {
-        int argc = 0;
 
         // 目标程序的argv基地址指针，最大8个参数
-        char **dst_argv = (char **)(stack_start_addr - (sizeof(char **) << 3));
+        dst_argv = (char **)(stack_start_addr - (sizeof(char **) << 3));
         uint64_t str_addr = (uint64_t)dst_argv;
 
         for (argc = 0; argc < 8 && argv[argc] != NULL; ++argc)
@@ -443,14 +490,29 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         }
 
         // 重新设定栈基址，并预留空间防止越界
-        stack_start_addr = str_addr - 8;
-        current_pcb->mm->stack_start = stack_start_addr;
-        regs->rsp = regs->rbp = stack_start_addr;
 
-        // 传递参数
-        regs->rdi = argc;
-        regs->rsi = (uint64_t)dst_argv;
+        stack_start_addr = str_addr - 8;
     }
+
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
+    // ==== 生成relibc所需的Stack结构体
+    {
+        uint64_t *ptr_stack = (uint64_t *)(stack_start_addr - 8);
+        if (argc == 0)
+            *ptr_stack = 0;
+        else
+            *ptr_stack = (uint64_t)dst_argv;
+        ptr_stack--;
+        *ptr_stack = argc;
+        stack_start_addr -= 16;
+    }
+
+    // 传递参数(旧版libc)
+    regs->rdi = argc;
+    regs->rsi = (uint64_t)dst_argv;
+    // 设置用户栈基地址
+    current_pcb->mm->stack_start = stack_start_addr;
+    regs->rsp = regs->rbp = stack_start_addr;
     // kdebug("execve ok");
     // 设置进程的段选择子为用户态可访问
     regs->cs = USER_CS | 3;
@@ -468,6 +530,22 @@ exec_failed:;
 #pragma GCC pop_options
 
 /**
+ * @brief 初始化实时进程rt_pcb
+ *
+ * @return 初始化后的进程
+ *
+ */
+struct process_control_block *process_init_rt_pcb(struct process_control_block *rt_pcb)
+{
+    // 暂时将实时进程的优先级设置为10
+    rt_pcb->priority = 10;
+    rt_pcb->policy = SCHED_RR;
+    rt_pcb->rt_time_slice = 80;
+    rt_pcb->virtual_runtime = 0x7fffffffffffffff;
+    return rt_pcb;
+}
+
+/**
  * @brief 内核init进程
  *
  * @param arg
@@ -478,40 +556,52 @@ exec_failed:;
 ul initial_kernel_thread(ul arg)
 {
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
+    int val = 0;
+    val = scm_enable_double_buffer();
 
-    scm_enable_double_buffer();
-
+    rs_init_stdio();
+    // block_io_scheduler_init();
     ahci_init();
-    fat32_init();
-    rootfs_umount();
-
+    mount_root_fs();
+    rs_virtio_probe();
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
     __rust_demo_func();
+    // while (1)
+    // {
+    //     /* code */
+    // }
+
     // 对completion完成量进行测试
     // __test_completion();
 
     // // 对一些组件进行单元测试
-    // uint64_t tpid[] = {
-    //     ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
-    //     ktest_start(ktest_test_idr, 0),
-    //     // usb_pid,
-    // };
+    uint64_t tpid[] = {
+        // ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
+        // ktest_start(ktest_test_idr, 0),
+        // usb_pid,
+    };
+
     // kinfo("Waiting test thread exit...");
     // // 等待测试进程退出
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
     //     waitpid(tpid[i], NULL, NULL);
     // kinfo("All test done.");
 
+    // 测试实时进程
+
+    // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
+    // kdebug("process:rt test kthread is created!!!!");
+
     // 准备切换到用户态
     struct pt_regs *regs;
 
     // 若在后面这段代码中触发中断，return时会导致段选择子错误，从而触发#GP，因此这里需要cli
     cli();
-    current_pcb->thread->rip = (ul)ret_from_system_call;
+    current_pcb->thread->rip = (ul)ret_from_intr;
     current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
     current_pcb->thread->fs = USER_DS | 0x3;
     barrier();
@@ -543,9 +633,9 @@ ul initial_kernel_thread(ul arg)
  */
 void process_exit_notify()
 {
-
     wait_queue_wakeup(&current_pcb->parent_pcb->wait_child_proc_exit, PROC_INTERRUPTIBLE);
 }
+
 /**
  * @brief 进程退出时执行的函数
  *
@@ -625,11 +715,6 @@ void process_init()
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
 
-    /*
-    kdebug("initial_thread.rbp=%#018lx", initial_thread.rbp);
-    kdebug("initial_tss[0].rsp1=%#018lx", initial_tss[0].rsp1);
-    kdebug("initial_tss[0].ist1=%#018lx", initial_tss[0].ist1);
-*/
     // 初始化pid的写锁
 
     spin_init(&process_global_pid_write_lock);
@@ -640,6 +725,10 @@ void process_init()
 
     // 初始化init进程的signal相关的信息
     initial_proc_init_signal(current_pcb);
+    kdebug("Initial process to init files");
+    process_init_files();
+    kdebug("Initial process init files ok");
+
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
     barrier();
@@ -665,7 +754,6 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
 {
     // todo: 当进程管理模块拥有pcblist_lock之后，对其加锁
     struct process_control_block *pcb = initial_proc_union.pcb.next_pcb;
-
     // 使用蛮力法搜索指定pid的pcb
     // todo: 使用哈希表来管理pcb
     for (; pcb != &initial_proc_union.pcb; pcb = pcb->next_pcb)
@@ -686,7 +774,6 @@ struct process_control_block *process_find_pcb_by_pid(pid_t pid)
  */
 int process_wakeup(struct process_control_block *pcb)
 {
-    // kdebug("pcb pid = %#018lx", pcb->pid);
 
     BUG_ON(pcb == NULL);
     if (pcb == NULL)
@@ -696,8 +783,8 @@ int process_wakeup(struct process_control_block *pcb)
         return 0;
 
     pcb->state |= PROC_RUNNING;
-    sched_enqueue(pcb);
-    return 1;
+    sched_enqueue(pcb, true);
+    return 0;
 }
 
 /**
@@ -714,29 +801,12 @@ int process_wakeup_immediately(struct process_control_block *pcb)
         return retval;
     // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
     current_pcb->flags |= PF_NEED_SCHED;
-}
 
-/**
- * @brief 回收进程的所有文件描述符
- *
- * @param pcb 要被回收的进程的pcb
- * @return uint64_t
- */
-uint64_t process_exit_files(struct process_control_block *pcb)
-{
-    // 不与父进程共享文件描述符
-    if (!(pcb->flags & PF_VFORK))
-    {
-
-        for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-        {
-            if (pcb->fds[i] == NULL)
-                continue;
-            kfree(pcb->fds[i]);
-        }
-    }
-    // 清空当前进程的文件描述符列表
-    memset(pcb->fds, 0, sizeof(struct vfs_file_t *) * PROC_MAX_FD_NUM);
+    if (pcb->cpu_id == current_pcb->cpu_id)
+        sched();
+    else
+        kick_cpu(pcb->cpu_id);
+    return 0;
 }
 
 /**
@@ -772,7 +842,6 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
         vma = cur_vma->vm_next;
 
         uint64_t pa;
-        // kdebug("vm start=%#018lx, sem=%d", cur_vma->vm_start, cur_vma->anon_vma->sem.counter);
         mm_unmap_vma(pcb->mm, cur_vma, &pa);
 
         uint64_t size = (cur_vma->vm_end - cur_vma->vm_start);
@@ -830,32 +899,11 @@ int process_release_pcb(struct process_control_block *pcb)
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
     process_exit_sighand(pcb);
     process_exit_signal(pcb);
+    rs_process_exit_fpstate(pcb);
+    rs_procfs_unregister_pid(pcb->pid);
     // 释放当前pcb
     kfree(pcb);
     return 0;
-}
-
-/**
- * @brief 申请可用的文件句柄
- *
- * @return int
- */
-int process_fd_alloc(struct vfs_file_t *file)
-{
-    int fd_num = -1;
-    struct vfs_file_t **f = current_pcb->fds;
-
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-    {
-        /* 找到指针数组中的空位 */
-        if (f[i] == NULL)
-        {
-            fd_num = i;
-            f[i] = file;
-            break;
-        }
-    }
-    return fd_num;
 }
 
 /**

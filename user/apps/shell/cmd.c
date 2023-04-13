@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libsystem/syscall.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -12,7 +13,6 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <libsystem/syscall.h>
 
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
@@ -68,7 +68,7 @@ static char *get_target_filepath(const char *filename, int *result_path_len)
         memset(file_path, 0, *result_path_len + 2);
 
         strncpy(file_path, filename, *result_path_len);
-        if(filename[(*result_path_len)-1]!='/')
+        if (filename[(*result_path_len) - 1] != '/')
             file_path[*result_path_len] = '/';
     }
 
@@ -258,11 +258,11 @@ int shell_cmd_ls(int argc, char **argv)
             break;
 
         int color = COLOR_WHITE;
-        if (buf->d_type & VFS_IF_DIR)
+        if (buf->d_type == DT_DIR)
             color = COLOR_YELLOW;
-        else if (buf->d_type & VFS_IF_FILE)
+        else if (buf->d_type == DT_REG)
             color = COLOR_INDIGO;
-        else if (buf->d_type & VFS_IF_DEVICE)
+        else if (buf->d_type == DT_BLK || buf->d_type == DT_CHR)
             color = COLOR_GREEN;
 
         char output_buf[256] = {0};
@@ -309,16 +309,27 @@ int shell_cmd_cat(int argc, char **argv)
 
     // 打开文件
     int fd = open(file_path, 0);
+    if (fd <= 0)
+    {
+        printf("ERROR: Cannot open file: %s, fd=%d\n", file_path, fd);
+        return -1;
+    }
     // 获取文件总大小
     int file_size = lseek(fd, 0, SEEK_END);
     // 将文件指针切换回文件起始位置
     lseek(fd, 0, SEEK_SET);
 
     char *buf = (char *)malloc(512);
-    memset(buf, 0, 512);
+
     while (file_size > 0)
     {
+        memset(buf, 0, 512);
         int l = read(fd, buf, 511);
+        if (l < 0)
+        {
+            printf("ERROR: Cannot read file: %s\n", file_path);
+            return -1;
+        }
         buf[l] = '\0';
 
         file_size -= l;
@@ -485,6 +496,7 @@ int shell_cmd_exec(int argc, char **argv)
         char *file_path = get_target_filepath(argv[1], &path_len);
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
         execv(file_path, argv);
+        // printf("after execv, path=%s, argc=%d\n", file_path, argc);
         free(argv);
         free(file_path);
 
@@ -496,10 +508,8 @@ int shell_cmd_exec(int argc, char **argv)
         if (strcmp(argv[argc - 1], "&") != 0)
             waitpid(pid, &retval, 0);
         else
-        {
-            // 输出子进程的pid
-            printf("[1] %d\n", pid);
-        }
+            printf("[1] %d\n", pid); // 输出子进程的pid
+        
         free(argv);
     }
 }

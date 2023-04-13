@@ -131,10 +131,10 @@ static int malloc_enlarge(int64_t size)
 {
     if (brk_base_addr == 0) // 第一次调用，需要初始化
     {
-        brk_base_addr = brk(-1);
+        brk_base_addr = sbrk(0);
         // printf("brk_base_addr=%#018lx\n", brk_base_addr);
         brk_managed_addr = brk_base_addr;
-        brk_max_addr = brk(-2);
+        brk_max_addr = brk_base_addr;
     }
 
     int64_t free_space = brk_max_addr - brk_managed_addr;
@@ -142,7 +142,7 @@ static int malloc_enlarge(int64_t size)
     if (free_space < size) // 现有堆空间不足
     {
         if (sbrk(size - free_space) != (void *)(-1))
-            brk_max_addr = brk((-2));
+            brk_max_addr = sbrk((0));
         else
         {
             put_string("malloc_enlarge(): no_mem\n", COLOR_YELLOW, COLOR_BLACK);
@@ -363,7 +363,7 @@ static void release_brk()
         if (delta <= 0) // 不用释放内存
             return;
         sbrk(-delta);
-        brk_max_addr = brk(-2);
+        brk_max_addr = sbrk(0);
         brk_managed_addr = brk_max_addr;
 
         malloc_free_list_end->length = brk_max_addr - (uint64_t)malloc_free_list_end;

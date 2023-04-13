@@ -4,9 +4,9 @@
 
 &nbsp;
 
-&emsp;&emsp;This project is a operating system running on computer which is in X86_ 64 Architecture . The DragonOS is currently under development!
+&emsp;&emsp;DragonOS is an operating system running on the X86_64 Architecture. This project is currently under development!
 
-[All you want to know about DragonOS is here - DragonOS](https://dragonos.org/uncategorized/summary/)
+[All you want to know about DragonOS is here - DragonOS](https://dragonos.org/?p=46)
 
 ## Websites
 
@@ -19,11 +19,9 @@
 
 ## How to run?
 
-&emsp;&emsp;The steps to run DragonOS are very simple. You can refer to the following materials to run DragonOS in the shortest 15 minutes!
+&emsp;&emsp;The steps to run DragonOS are very simple. You can refer to the following information to run DragonOS within 15 minutes at the fastest!
 
-- [Building DragonOS - DragonOS dev document](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html#docker)
-
-- [How to run DragonOS on a computer's virtual machine? || Long Jin's blog](https://longjin666.cn/?p=1514)
+- [Building DragonOS - DragonOS dev document](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)
 
 - [Teach you to run DragonOS in 15 minutes- Bilibili](https://www.bilibili.com/video/BV1zF411w7s2?share_source=copy_web&vd_source=41ab4a1b73e6f65219a785923511517e)
 
@@ -33,13 +31,13 @@
 
 ## How to join DragonOS ?
 
-&emsp;&emsp;If you are willing to join us, you can check the project panel of GitHub warehouse, select the recently planned functions, and improve them.
+&emsp;&emsp;If you are willing to join us, you can check the project panel of the GitHub repo, select the recently planned functions, and improve them.
 
-&emsp;&emsp;Or, you can also bring your ideas and ideas, discuss with the community partners, and create some new functions for dragonos.
+&emsp;&emsp;Or, you can also bring your ideas, discuss with community members, and create some new functions for DragonOS.
 
-## How to come in contact with the community?
+## How to contact the community?
 
-&emsp;&emsp;You can send me an email. My email address is[ longjin@RinGoTek.cn ](mailto: longjin@RinGoTek.cn )。
+&emsp;&emsp;You can send an email to the project's maintainer: longjin. His email address is [longjin@DragonOS.org](mailto: longjin@DragonOS.org) .
 
 &emsp;&emsp;Or join our development exchange QQ group: **115763565**
 
@@ -49,19 +47,18 @@
 
 ## List of contributors
 
-[Contributors to fslongjin/DragonOS · GitHub](https://github.com/fslongjin/DragonOS/graphs/contributors)
+[Contributors to DragonOS-Community/DragonOS · GitHub](https://github.com/DragonOS-Community/DragonOS/graphs/contributors)
 
-## Contact with me
-
-Email：longjin@RinGoTek.cn
+## Get contact with us
 
 Community Contact Email: contact@DragonOS.org
 
-Blog：[longjin666.cn](https://longjin666.cn)
+Maintainer longjin's Email：longjin@DragonOS.org
+
 
 ## Reward
 
-&emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit **[Sponsor - DragonOS](https://dragonos.org/donate/)**, so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
+&emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit ** [Sponsor - DragonOS](https://dragonos.org/?page_id=37) ** , so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
 
 ### Where will the sponsorship funds be used?
 
@@ -80,11 +77,16 @@ We hope that in the future, some enterprises can sponsor DragonOS and inject fin
 
 ### Individual Sponsor List
 
+- 万晓兰
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
-- 悟
+- [FindWangHao](https://github.com/FindWangHao)
+- 叶锦毅
+- 林
+- Albert
 - [TerryLeeSCUT · GitHub](https://github.com/TerryLeeSCUT)
 - slientbard
+- 悟
 
 ## Open source statement
 
@@ -108,8 +110,6 @@ If you find any violation of the open source license, we welcome you to send ema
 
 - [osdev.org](https://wiki.osdev.org/Main_Page)
 
-- Multiboot2 Specification version 2.0
-
 - ACPI_6_3_final_Jan30
 
 - the GNU GRUB manual
@@ -121,3 +121,7 @@ If you find any violation of the open source license, we welcome you to send ema
 - [skiftOS]([GitHub - skiftOS/skift: 🥑 A hobby operating system built from scratch in modern C++. Featuring a reactive UI library and a strong emphasis on user experience.](https://github.com/skiftOS/skift))
 
 - [GuideOS](https://github.com/Codetector1374/GuideOS)
+
+- [redox-os](https://gitlab.redox-os.org/redox-os/redox)
+
+- [rcore](https://github.com/rcore-os/rCore)

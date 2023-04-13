@@ -6,6 +6,7 @@ use core::fmt::Debug;
 
 use alloc::vec::Vec;
 
+use crate::arch::fpu::FpState;
 use crate::include::bindings::bindings::NULL;
 // todo: 将这里更换为手动编写的ffi绑定
 use crate::include::bindings::bindings::atomic_t;
@@ -546,7 +547,7 @@ impl SigQueue {
     }
 
     /// @brief 从C的void*指针转换为static生命周期的可变引用
-    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue{
+    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue {
         let sq = p as *mut SigQueue;
         let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
         return sq;
@@ -664,4 +665,5 @@ pub struct signal_stack {
     pub sp: *mut c_void,
     pub flags: u32,
     pub size: u32,
+    pub fpstate: FpState,
 }

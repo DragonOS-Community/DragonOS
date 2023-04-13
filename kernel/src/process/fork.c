@@ -2,14 +2,16 @@
 #include <common/err.h>
 #include <common/kthread.h>
 #include <common/spinlock.h>
-#include <filesystem/procfs/procfs.h>
 
 extern spinlock_t process_global_pid_write_lock;
 extern long process_global_pid;
 
 extern void kernel_thread_func(void);
+extern uint64_t rs_procfs_register_pid(uint64_t);
+extern uint64_t rs_procfs_unregister_pid(uint64_t);
+extern void *rs_dup_fpstate();
 
-int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
+extern int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb, uint64_t stack_start,
@@ -133,11 +135,11 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     tsk->flags &= ~PF_KFORK;
 
+    // 创建对应procfs文件
+    rs_procfs_register_pid(tsk->pid);
+
     // 唤醒进程
     process_wakeup(tsk);
-
-    //创建对应procfs文件
-    procfs_register_pid(tsk->pid);
 
     return retval;
 
@@ -147,6 +149,7 @@ copy_thread_failed:;
 copy_files_failed:;
     // 回收文件
     process_exit_files(tsk);
+    rs_procfs_unregister_pid(tsk->pid);
 copy_sighand_failed:;
     process_exit_sighand(tsk);
 copy_signal_failed:;
@@ -171,34 +174,6 @@ int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb)
     if (clone_flags & CLONE_VM)
         pcb->flags |= PF_VFORK;
     return 0;
-}
-
-/**
- * @brief 拷贝当前进程的文件描述符等信息
- *
- * @param clone_flags 克隆标志位
- * @param pcb 新的进程的pcb
- * @return uint64_t
- */
-int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb)
-{
-    int retval = 0;
-    // 如果CLONE_FS被置位，那么子进程与父进程共享文件描述符
-    // 文件描述符已经在复制pcb时被拷贝
-    if (clone_flags & CLONE_FS)
-        return retval;
-
-    // 为新进程拷贝新的文件描述符
-    for (int i = 0; i < PROC_MAX_FD_NUM; ++i)
-    {
-        if (current_pcb->fds[i] == NULL)
-            continue;
-
-        pcb->fds[i] = (struct vfs_file_t *)kmalloc(sizeof(struct vfs_file_t), 0);
-        memcpy(pcb->fds[i], current_pcb->fds[i], sizeof(struct vfs_file_t));
-    }
-
-    return retval;
 }
 
 /**
@@ -359,6 +334,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
 
         child_regs = (struct pt_regs *)(((uint64_t)pcb) + STACK_SIZE - size);
         memcpy(child_regs, (void *)current_regs, size);
+
         barrier();
         // 然后重写新的栈中，每个栈帧的rbp值
         process_rewrite_rbp(child_regs, pcb);
@@ -374,8 +350,7 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
     // 设置子进程的返回值为0
     child_regs->rax = 0;
     if (pcb->flags & PF_KFORK)
-        thd->rbp =
-            (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_system_call时的rbp）
+        thd->rbp = (uint64_t)(child_regs + 1); // 设置新的内核线程开始执行时的rbp（也就是进入ret_from_intr时的rbp）
     else
         thd->rbp = (uint64_t)pcb + STACK_SIZE;
 
@@ -386,11 +361,13 @@ int process_copy_thread(uint64_t clone_flags, struct process_control_block *pcb,
 
     // 根据是否为内核线程、是否在内核态fork，设置进程的开始执行的地址
     if (pcb->flags & PF_KFORK)
-        thd->rip = (uint64_t)ret_from_system_call;
+        thd->rip = (uint64_t)ret_from_intr;
     else if (pcb->flags & PF_KTHREAD && (!(pcb->flags & PF_KFORK)))
         thd->rip = (uint64_t)kernel_thread_func;
     else
-        thd->rip = (uint64_t)ret_from_system_call;
+        thd->rip = (uint64_t)ret_from_intr;
+
+    pcb->fp_state = rs_dup_fpstate();
 
     return 0;
 }

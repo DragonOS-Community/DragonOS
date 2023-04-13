@@ -17,12 +17,15 @@ congratulations()
 	echo "|-----------Congratulations!---------------|"
 	echo "|                                          |"
 	echo "|   你成功安装了DragonOS所需的依赖项!      |"
-	echo "|   您可以通过以下命令运行它:              |"
+    echo "|                                          |"
+    echo "|   请关闭当前终端, 并重新打开一个终端     |"
+	echo "|   然后通过以下命令运行:                  |"
 	echo "|                                          |"
-	echo "|   make run-docker -j 你的cpu核心数       |"
+	echo "|                make run                  |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
+
 
 ####################################
 # 当检测到ubuntu或Debian时，执行此函数 #
@@ -59,7 +62,7 @@ install_ubuntu_debian_pkg()
 
     if [ -z "$(which qemu-system-x86_64)" ]; then
         echo "正在安装QEMU虚拟机..."
-        sudo $1 install -y qemu qemu-system qemu-kvm
+        sudo $1 install -y qemu-system qemu-kvm
     else
         echo "QEMU已经在您的电脑上安装！"
     fi

@@ -35,10 +35,6 @@ void semaphore_up(semaphore_t *sema)
         wait_queue_node_t *wq = container_of(list_next(&sema->wait_queue.wait_list), wait_queue_node_t, wait_list);
         list_del(&wq->wait_list);
 
-        wq->pcb->state = PROC_RUNNING;
-        sched_enqueue(wq->pcb);
-
-        // 当前进程缺少需要的资源，立即标为需要被调度
-        current_pcb->flags |= PF_NEED_SCHED;
+        process_wakeup_immediately(wq->pcb);
     }
 };

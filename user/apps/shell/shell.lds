@@ -1,7 +1,7 @@
 
 OUTPUT_FORMAT("elf64-x86-64","elf64-x86-64","elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(main)
+ENTRY(_start)
 
 SECTIONS
 {
@@ -14,6 +14,7 @@ SECTIONS
 		_text = .;
 		
 		*(.text)
+		*(.text.*)
 		
 		_etext = .;
 	}
@@ -23,6 +24,7 @@ SECTIONS
 	{
 		_data = .;
 		*(.data)
+		*(.data.*)
 		
 		_edata = .;
 	}
@@ -33,6 +35,7 @@ SECTIONS
 	{
 		_rodata = .;	
 		*(.rodata)
+		*(.rodata.*)
 		_erodata = .;
 	}
 
@@ -41,6 +44,7 @@ SECTIONS
 	{
 		_bss = .;
 		*(.bss)
+		*(.bss.*)
 		_ebss = .;
 	}
 

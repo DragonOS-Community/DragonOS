@@ -363,40 +363,4 @@ struct ahci_request_packet_t
  * @brief 初始化ahci模块
  *
  */
-void ahci_init();
-
-/**
- * @brief 检测端口连接的设备的类型
- *
- * @param device_num ahci设备号
- */
-static void ahci_probe_port(const uint32_t device_num);
-
-/**
- * @brief read data from SATA device using 48bit LBA address
- *
- * @param port HBA PORT
- * @param startl low 32bits of start addr
- * @param starth high 32bits of start addr
- * @param count total sectors to read
- * @param buf buffer
- * @return true done
- * @return false failed
- */
-static bool ahci_read(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count, uint64_t buf);
-
-/**
- * @brief write data to SATA device using 48bit LBA address
- *
- * @param port HBA PORT
- * @param startl low 32bits of start addr
- * @param starth high 32bits of start addr
- * @param count total sectors to read
- * @param buf buffer
- * @return true done
- * @return false failed
- */
-static bool ahci_write(HBA_PORT *port, uint32_t startl, uint32_t starth, uint32_t count,
-                       uint64_t buf);
-
-void ahci_end_request();
+extern void ahci_init();

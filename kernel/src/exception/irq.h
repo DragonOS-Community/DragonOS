@@ -102,6 +102,8 @@ extern void (*local_apic_interrupt_table[LOCAL_APIC_IRQ_NUM])(void);
 
 200 ~   255	MP IPI
 
+	200 kick cpu 功能（使得某个核心立即运行进程调度）
+
 */
 
 typedef struct hardware_intr_type

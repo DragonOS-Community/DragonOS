@@ -2,8 +2,6 @@
 #include <common/glib.h>
 
 #include <common/asm.h>
-#include <driver/acpi/acpi.h>
-#include <driver/interrupt/apic/apic.h>
 
 #define MAX_SUPPORTED_PROCESSOR_NUM 1024    
 
@@ -16,3 +14,7 @@ extern uchar _apu_boot_end[];
  *
  */
 void smp_init();
+
+int kick_cpu(uint32_t cpu_id);
+
+uint32_t smp_get_total_cpu();

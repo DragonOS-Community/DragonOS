@@ -7,7 +7,7 @@
 
 DragonOS负责人: longjin
 
-工作邮箱: longjin@RinGoTek.cn
+工作邮箱: longjin@DragonOS.org
 
 开发交流QQ群： 115763565
 

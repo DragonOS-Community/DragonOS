@@ -50,7 +50,7 @@ impl LockRef {
     fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, i32> {
         use core::ptr::read_volatile;
 
-        use crate::{arch::cpu::cpu_relax};
+        use crate::arch::cpu::cpu_relax;
 
         let mut old: LockRef = LockRef::INIT;
         old.count = unsafe { read_volatile(&self.count) };

@@ -555,7 +555,6 @@ impl FATDir {
             } else {
                 return Err(err_val);
             }
-            
         }
 
         match r.unwrap() {

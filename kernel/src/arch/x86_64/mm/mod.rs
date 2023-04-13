@@ -4,9 +4,9 @@ pub mod frame;
 use crate::include::bindings::bindings::{
     multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block,
 };
-use crate::{kdebug, kinfo};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
 use crate::syscall::SystemError;
+use crate::{kdebug, kinfo};
 
 use core::arch::asm;
 use core::ffi::c_void;
@@ -224,5 +224,4 @@ pub fn mm_init() {
     unsafe { X86_64MMArch::init() };
     kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
     // todo: 初始化内存管理器
-        
 }

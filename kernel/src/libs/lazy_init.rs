@@ -25,12 +25,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::spinlock::SpinLock;
 
 /// A wrapper around a value that is initialized lazily.
-/// The value is initialized the first time it is accessed.
-/// This is useful for initializing values that are expensive to initialize.
-/// The value is initialized using the provided closure.
-/// The closure is only called once, and the result is cached.
-/// The value is not initialized if it is never accessed.
-pub struct Lazy<T: Sync> {
+pub struct Lazy<T> {
     /// The lock that is used to ensure that only one thread calls the init function at the same time.
     init_lock: SpinLock<()>,
     /// The value that is initialized lazily.
@@ -39,7 +34,7 @@ pub struct Lazy<T: Sync> {
     initialized: AtomicBool,
 }
 
-impl<T: Sync> Lazy<T> {
+impl<T> Lazy<T> {
     /// Creates a new `Lazy` value that will be initialized with the
     /// result of the closure `init`.
     pub const fn new() -> Lazy<T> {
@@ -122,7 +117,7 @@ impl<T: Sync> Lazy<T> {
     }
 }
 
-impl<T: Sync> Deref for Lazy<T> {
+impl<T> Deref for Lazy<T> {
     type Target = T;
 
     #[inline(always)]
@@ -131,14 +126,14 @@ impl<T: Sync> Deref for Lazy<T> {
     }
 }
 
-impl<T: Sync> DerefMut for Lazy<T> {
+impl<T> DerefMut for Lazy<T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut T {
         return self.get_mut();
     }
 }
 
-impl<T: Sync + Debug> Debug for Lazy<T> {
+impl<T: Debug> Debug for Lazy<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         if let Some(value) = self.try_get() {
             return write!(f, "Lazy({:?})", value);
@@ -148,7 +143,7 @@ impl<T: Sync + Debug> Debug for Lazy<T> {
     }
 }
 
-impl<T: Sync> Drop for Lazy<T> {
+impl<T> Drop for Lazy<T> {
     fn drop(&mut self) {
         if self.initialized() {
             unsafe {
@@ -157,3 +152,6 @@ impl<T: Sync> Drop for Lazy<T> {
         }
     }
 }
+
+unsafe impl<T: Send + Sync> Sync for Lazy<T> {}
+unsafe impl<T: Send> Send for Lazy<T> {}

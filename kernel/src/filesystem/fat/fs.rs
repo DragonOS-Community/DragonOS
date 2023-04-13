@@ -1441,7 +1441,7 @@ impl IndexNode for LockedFATInode {
                     return Ok(guard.find(name)?);
                 }
 
-                FileType::SymLink => return Err(SystemError::ENOTSUP),
+                FileType::SymLink => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
                 _ => return Err(SystemError::EINVAL),
             },
             FATDirEntry::UnInit => {

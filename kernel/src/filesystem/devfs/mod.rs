@@ -138,7 +138,7 @@ impl DevFS {
                 device.set_fs(dev_block_inode.0.lock().fs.clone());
             }
             _ => {
-                return Err(SystemError::ENOTSUP);
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
         }
 
@@ -181,7 +181,7 @@ impl DevFS {
                 dev_block_inode.remove(name)?;
             }
             _ => {
-                return Err(SystemError::ENOTSUP);
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
         }
 
@@ -423,7 +423,7 @@ impl IndexNode for LockedDevFSInode {
     }
 
     fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -479,7 +479,7 @@ impl IndexNode for LockedDevFSInode {
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, SystemError> {
         kerror!("DevFS: read_at is not supported!");
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -490,7 +490,7 @@ impl IndexNode for LockedDevFSInode {
         _buf: &[u8],
         _data: &mut super::vfs::file::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 }
 

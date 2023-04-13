@@ -6,7 +6,7 @@ echo "$@"
 allflags=$(qemu-system-x86_64 -cpu help | awk '/flags/ {y=1; getline}; y {print}' | tr ' ' '\n' | grep -Ev "^$" | sed -r 's|^|+|' | tr '\n' ',' | sed -r "s|,$||")
 ARCH="x86_64"
 #ARCH="i386"
-# 请根据自己的需要，在-d 后方加入所需的trace事件
+# 请根据自己的需要，在-d 后方加入所需的 trace 事件
 
 # 标准的trace events
 qemu_trace_std=cpu_reset,guest_errors,exec,cpu,trace:virtio*

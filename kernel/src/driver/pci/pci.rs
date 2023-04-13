@@ -15,6 +15,7 @@ use core::{
     convert::TryFrom,
     fmt::{self, Display, Formatter},
 };
+use core::fmt::Debug;
 // PCI_DEVICE_LINKEDLIST 添加了读写锁的全局链表，里面存储了检索到的PCI设备结构体
 // PCI_ROOT_0 Segment为0的全局PciRoot
 lazy_static! {
@@ -28,6 +29,40 @@ lazy_static! {
             }
         }
     };
+}
+/// PCI域地址
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct PciAddr(usize);
+
+impl PciAddr {
+    #[inline(always)]
+    pub const fn new(address: usize) -> Self {
+        Self(address)
+    }
+
+    /// @brief 获取PCI域地址的值
+    #[inline(always)]
+    pub fn data(&self) -> usize {
+        self.0
+    }
+
+    /// @brief 将PCI域地址加上一个偏移量
+    #[inline(always)]
+    pub fn add(self, offset: usize) -> Self {
+        Self(self.0 + offset)
+    }
+
+    /// @brief 判断PCI域地址是否按照指定要求对齐
+    #[inline(always)]
+    pub fn check_aligned(&self, align: usize) -> bool {
+        return self.0 & (align - 1) == 0;
+    }
+}
+impl Debug for PciAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "PciAddr({:#x})", self.0)
+    }
 }
 
 /// 添加了读写锁的链表，存储PCI设备结构体
@@ -981,15 +1016,15 @@ pub extern "C" fn rs_pci_init() {
     pci_init();
     if PCI_ROOT_0.is_some() {
         kdebug!("{}", PCI_ROOT_0.unwrap());
-        // 以下为ecam的读取寄存器值测试，经测试可正常读取
+        //以下为ecam的读取寄存器值测试，经测试可正常读取
         // let bus_device_function = BusDeviceFunction {
         //     bus: 0,
         //     device: 2,
         //     function: 0,
         // };
         // kdebug!(
-        //     "Ecam read virtio-net device vendor id={:#x}",
-        //     PCI_ROOT_0.unwrap().read_config(bus_device_function, 0) as u16
+        //     "Ecam read virtio-net device status={:#x}",
+        //     (PCI_ROOT_0.unwrap().read_config(bus_device_function, 4)>>16) as u16
         // );
     }
 }
@@ -1284,8 +1319,8 @@ pub fn pci_bar_init(
                 address |= u64::from(address_top) << 32;
                 bar_index_ignore = bar_index + 1; //下个bar跳过，因为64位的memory bar覆盖了两个bar
             }
-            address = PciArch::address_pci_to_address_memory(address as usize) as u64; //PCI总线域物理地址转换为存储器域物理地址
-                                                                                       //kdebug!("address={:#x},size={:#x}",address,size);
+            let pci_address=PciAddr::new(address as usize);
+            address = PciArch::address_pci_to_physical(pci_address) as u64; //PCI总线域物理地址转换为存储器域物理地址
             unsafe {
                 let vaddr_ptr = &mut virtaddress as *mut u64;
                 let mut virtsize: u64 = 0;

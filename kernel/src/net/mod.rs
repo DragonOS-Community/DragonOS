@@ -51,7 +51,7 @@ pub trait Socket: Sync + Send + Debug {
     ///
     /// @return - 成功：(返回读取的数据的长度，读取数据的端点).
     ///         - 失败：错误码
-    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError>;
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Option<Endpoint>);
 
     /// @brief 向socket中写入数据。如果socket是阻塞的，那么直到写入的数据全部写入socket中才返回
     ///
@@ -80,7 +80,7 @@ pub trait Socket: Sync + Send + Debug {
     /// @param endpoint 要绑定的端点
     ///
     /// @return 返回绑定是否成功
-    fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
+    fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
 

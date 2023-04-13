@@ -1,6 +1,12 @@
+use alloc::{collections::BTreeMap, sync::Arc};
 use smoltcp::{socket::dhcpv4, wire};
 
-use crate::{kdebug, kinfo, net::NET_DRIVERS, syscall::SystemError};
+use crate::{
+    driver::net::NetDriver, kdebug, kinfo, libs::rwlock::RwLockReadGuard, net::NET_DRIVERS,
+    syscall::SystemError,
+};
+
+use super::socket::{SOCKET_SET, SOCKET_WAITQUEUE};
 
 pub fn net_init() -> Result<(), SystemError> {
     dhcp_query()?;
@@ -84,4 +90,13 @@ fn dhcp_query() -> Result<(), SystemError> {
     }
 
     return Err(SystemError::ETIMEDOUT);
+}
+
+pub fn poll_ifaces() {
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+    let mut sockets = SOCKET_SET.lock();
+    for (_, iface) in guard.iter() {
+        iface.poll(&mut sockets).ok();
+    }
+    SOCKET_WAITQUEUE.wakeup_all((-1i64) as u64);
 }

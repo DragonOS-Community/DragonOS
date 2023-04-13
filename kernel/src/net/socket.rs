@@ -3,19 +3,23 @@ use alloc::{boxed::Box, vec::Vec};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{raw, tcp, udp},
-    wire::{IpAddress, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address},
+    wire,
 };
 
 use crate::{
-    arch::rand::rand, kdebug, kerror, kwarn, libs::spinlock::SpinLock, syscall::SystemError,
+    arch::rand::rand,
+    kdebug, kerror, kwarn,
+    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    syscall::SystemError,
 };
 
-use super::{Endpoint, Protocol, Socket, NET_DRIVERS};
+use super::{net_core::poll_ifaces, Endpoint, Protocol, Socket, NET_DRIVERS};
 
 lazy_static! {
     /// 所有socket的集合
     /// TODO: 优化这里，自己实现SocketSet！！！现在这样的话，不管全局有多少个网卡，每个时间点都只会有1个进程能够访问socket
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
+    pub static ref SOCKET_WAITQUEUE: WaitQueue = WaitQueue::INIT;
 }
 
 /// @brief socket的句柄管理组件。
@@ -41,6 +45,7 @@ impl Drop for GlobalSocketHandle {
         let mut socket_set_guard = SOCKET_SET.lock();
         socket_set_guard.remove(self.0); // 删除的时候，会发送一条FINISH的信息？
         drop(socket_set_guard);
+        poll_ifaces();
     }
 }
 
@@ -127,7 +132,7 @@ impl RawSocket {
         let protocol: u8 = protocol.into();
         let socket = raw::Socket::new(
             smoltcp::wire::IpVersion::Ipv4,
-            IpProtocol::from(protocol),
+            wire::IpProtocol::from(protocol),
             tx_buffer,
             rx_buffer,
         );
@@ -144,7 +149,7 @@ impl RawSocket {
 }
 
 impl Socket for RawSocket {
-    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError> {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Option<Endpoint>) {
         loop {
             // 如何优化这里？
             let mut socket_set_guard = SOCKET_SET.lock();
@@ -152,24 +157,25 @@ impl Socket for RawSocket {
 
             match socket.recv_slice(buf) {
                 Ok(len) => {
-                    let packet = Ipv4Packet::new_unchecked(buf);
-                    return Ok((
-                        len,
-                        Endpoint::Ip(smoltcp::wire::IpEndpoint {
-                            addr: IpAddress::Ipv4(packet.src_addr()),
+                    let packet = wire::Ipv4Packet::new_unchecked(buf);
+                    return (
+                        Ok(len),
+                        Some(Endpoint::Ip(smoltcp::wire::IpEndpoint {
+                            addr: wire::IpAddress::Ipv4(packet.src_addr()),
                             port: 0,
-                        }),
-                    ));
+                        })),
+                    );
                 }
                 Err(smoltcp::socket::raw::RecvError::Exhausted) => {
                     if !self.options.contains(SocketOptions::BLOCK) {
                         // 如果是非阻塞的socket，就返回错误
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), None);
                     }
                 }
             }
             drop(socket);
             drop(socket_set_guard);
+            SOCKET_WAITQUEUE.sleep();
         }
     }
 
@@ -205,13 +211,13 @@ impl Socket for RawSocket {
                 }
                 let ipv4_src_addr = ipv4_src_addr.unwrap();
 
-                if let IpAddress::Ipv4(ipv4_dst) = endpoint.addr {
+                if let wire::IpAddress::Ipv4(ipv4_dst) = endpoint.addr {
                     let len = buf.len();
 
                     // 创建20字节的IPv4头部
                     let mut buffer: Vec<u8> = vec![0u8; len + 20];
-                    let mut packet: Ipv4Packet<&mut Vec<u8>> =
-                        Ipv4Packet::new_unchecked(&mut buffer);
+                    let mut packet: wire::Ipv4Packet<&mut Vec<u8>> =
+                        wire::Ipv4Packet::new_unchecked(&mut buffer);
 
                     // 封装ipv4 header
                     packet.set_version(4);
@@ -234,9 +240,10 @@ impl Socket for RawSocket {
                     socket.send_slice(&buffer).unwrap();
 
                     drop(socket);
-                    drop(socket_set_guard);
 
-                    // poll?
+                    iface.poll(&mut socket_set_guard).ok();
+
+                    drop(socket_set_guard);
                     return Ok(len);
                 } else {
                     kwarn!("Unsupport Ip protocol type!");
@@ -310,7 +317,7 @@ impl UdpSocket {
 
 impl Socket for UdpSocket {
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
-    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError> {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Option<Endpoint>) {
         loop {
             kdebug!("Wait22 to Read");
 
@@ -321,21 +328,24 @@ impl Socket for UdpSocket {
 
             if socket.can_recv() {
                 kdebug!("Can Receive");
-                if let Ok((size, endpoint)) = socket.recv_slice(buf) {
+                if let Ok((size, remote_endpoint)) = socket.recv_slice(buf) {
                     drop(socket);
                     drop(socket_set_guard);
-
-                    return Ok((size, Endpoint::Ip(endpoint)));
+                    poll_ifaces();
+                    return (Ok(size), Some(Endpoint::Ip(remote_endpoint)));
                 }
             } else {
-                // 没有数据可以读取. 如果没有bind到指定端口，也会导致rx_buf为空
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                // 如果socket没有连接，则返回错误
+                return (Err(SystemError::ENOTCONN), None);
             }
+            drop(socket);
+            drop(socket_set_guard);
+            SOCKET_WAITQUEUE.sleep();
         }
     }
 
     fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
-        let endpoint: &IpEndpoint = {
+        let remote_endpoint: &wire::IpEndpoint = {
             if let Some(Endpoint::Ip(ref endpoint)) = to {
                 endpoint
             } else if let Some(Endpoint::Ip(ref endpoint)) = self.remote_endpoint {
@@ -351,21 +361,21 @@ impl Socket for UdpSocket {
         if socket.endpoint().port == 0 {
             let temp_port = get_ephemeral_port();
 
-            match endpoint.addr {
+            match remote_endpoint.addr {
                 // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
                 // 否则就用 self.endpoint().addr.unwrap()
-                IpAddress::Ipv4(_) => {
+                wire::IpAddress::Ipv4(_) => {
                     socket
-                        .bind(IpEndpoint::new(
-                            smoltcp::wire::IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                        .bind(wire::IpEndpoint::new(
+                            smoltcp::wire::IpAddress::Ipv4(wire::Ipv4Address::UNSPECIFIED),
                             temp_port,
                         ))
                         .unwrap();
                 }
-                IpAddress::Ipv6(_) => {
+                wire::IpAddress::Ipv6(_) => {
                     socket
-                        .bind(IpEndpoint::new(
-                            smoltcp::wire::IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+                        .bind(wire::IpEndpoint::new(
+                            smoltcp::wire::IpAddress::Ipv6(wire::Ipv6Address::UNSPECIFIED),
                             temp_port,
                         ))
                         .unwrap();
@@ -373,52 +383,93 @@ impl Socket for UdpSocket {
             }
         }
 
-        return if socket.can_send() {
-            match socket.send_slice(&buf, *endpoint) {
+        if socket.can_send() {
+            match socket.send_slice(&buf, *remote_endpoint) {
                 Ok(()) => {
                     // avoid deadlock
                     drop(socket);
                     drop(socket_set_guard);
-
-                    Ok(buf.len())
+                    poll_ifaces();
+                    return Ok(buf.len());
                 }
-                Err(_) => Err(SystemError::ENOBUFS),
+                Err(_) => return Err(SystemError::ENOBUFS),
             }
         } else {
-            Err(SystemError::ENOBUFS)
+            return Err(SystemError::ENOBUFS);
         };
     }
 
-    fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+    fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock();
         let socket = sockets.get_mut::<udp::Socket>(self.handle.0);
 
-        return if let Endpoint::Ip(ip) = endpoint {
+        if let Endpoint::Ip(ip) = endpoint {
             match socket.bind(ip) {
-                Ok(()) => Ok(()),
-                Err(_) => Err(SystemError::EINVAL),
+                Ok(()) => return Ok(()),
+                Err(_) => return Err(SystemError::EINVAL),
             }
         } else {
-            Err(SystemError::EINVAL)
+            return Err(SystemError::EINVAL);
         };
+    }
+
+    fn poll(&self) -> (bool, bool, bool) {
+        let sockets = SOCKET_SET.lock();
+        let socket = sockets.get::<udp::Socket>(self.handle.0);
+
+        return (socket.can_send(), socket.can_recv(), false);
     }
 
     /// @brief
     fn connect(&mut self, endpoint: super::Endpoint) -> Result<(), SystemError> {
-        return if let Endpoint::Ip(_) = endpoint {
+        if let Endpoint::Ip(_) = endpoint {
             self.remote_endpoint = Some(endpoint);
-            Ok(())
+            return Ok(());
         } else {
-            Err(SystemError::EINVAL)
+            return Err(SystemError::EINVAL);
         };
     }
 
+    fn ioctl(
+        &self,
+        _cmd: usize,
+        _arg0: usize,
+        _arg1: usize,
+        _arg2: usize,
+    ) -> Result<usize, SystemError> {
+        todo!()
+    }
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
         todo!()
     }
 
     fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
         return Box::new(self.clone());
+    }
+
+    fn endpoint(&self) -> Option<Endpoint> {
+        let sockets = SOCKET_SET.lock();
+        let socket = sockets.get::<udp::Socket>(self.handle.0);
+        let listen_endpoint = socket.endpoint();
+
+        if listen_endpoint.port == 0 {
+            return None;
+        } else {
+            // 如果listen_endpoint的address是None，意味着“监听所有的地址”。
+            // 这里假设所有的地址都是ipv4
+            // TODO: 支持ipv6
+            let result = wire::IpEndpoint::new(
+                listen_endpoint
+                    .addr
+                    .unwrap_or(wire::IpAddress::v4(0, 0, 0, 0)),
+                listen_endpoint.port,
+            );
+            return Some(Endpoint::Ip(result));
+        }
+    }
+
+    fn peer_endpoint(&self) -> Option<Endpoint> {
+        return self.remote_endpoint.clone();
     }
 }
 
@@ -428,7 +479,7 @@ impl Socket for UdpSocket {
 #[derive(Debug, Clone)]
 pub struct TcpSocket {
     handle: GlobalSocketHandle,
-    local_endpoint: Option<IpEndpoint>, // save local endpoint for bind()
+    local_endpoint: Option<wire::IpEndpoint>, // save local endpoint for bind()
     is_listening: bool,
     options: SocketOptions,
 }
@@ -437,9 +488,9 @@ impl TcpSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
 
     /// @brief 创建一个原始的socket
     ///
@@ -466,8 +517,9 @@ impl TcpSocket {
 
 impl Socket for TcpSocket {
     /// @breif
-    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError> {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Option<Endpoint>) {
         loop {
+            poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock();
             let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
 
@@ -477,18 +529,19 @@ impl Socket for TcpSocket {
                         let endpoint = if let Some(p) = socket.remote_endpoint() {
                             p
                         } else {
-                            return Err(SystemError::ENOTCONN);
+                            return (Err(SystemError::ENOTCONN), None);
                         };
 
                         drop(socket);
                         drop(socket_set_guard);
-
-                        return Ok((size, Endpoint::Ip(endpoint)));
+                        poll_ifaces();
+                        return (Ok(size), Some(Endpoint::Ip(endpoint)));
                     }
                 }
             } else {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                return (Err(SystemError::ENOTCONN), None);
             }
+            SOCKET_WAITQUEUE.sleep();
         }
     }
 
@@ -502,7 +555,7 @@ impl Socket for TcpSocket {
                     Ok(size) => {
                         drop(socket);
                         drop(socket_set_guard);
-
+                        poll_ifaces();
                         return Ok(size);
                     }
                     Err(e) => {
@@ -518,51 +571,73 @@ impl Socket for TcpSocket {
         return Err(SystemError::ENOTCONN);
     }
 
-    fn connect(&mut self, _endpoint: super::Endpoint) -> Result<(), SystemError> {
-        // let mut sockets = SOCKET_SET.lock();
-        // let mut socket = sockets.get::<tcp::Socket>(self.handle.0);
+    fn poll(&self) -> (bool, bool, bool) {
+        let mut socket_set_guard = SOCKET_SET.lock();
+        let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
 
-        // if let Endpoint::Ip(ip) = endpoint {
-        //     let temp_port = if ip.port == 0 {
-        //         get_ephemeral_port()
-        //     } else {
-        //         ip.port
-        //     };
+        let mut input = false;
+        let mut output = false;
+        let mut error = false;
+        if self.is_listening && socket.is_active() {
+            input = true;
+        } else if !socket.is_open() {
+            error = true;
+        } else {
+            if socket.may_recv() {
+                input = true;
+            }
+            if socket.can_send() {
+                output = true;
+            }
+        }
 
-        //     return match socket.connect(iface.context(), temp_port) {
-        //         Ok(()) => {
-        //             // avoid deadlock
-        //             drop(socket);
-        //             drop(sockets);
+        return (input, output, error);
+    }
 
-        //             // wait for connection result
-        //             loop {
-        //                 // poll_ifaces();
+    fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
+        let mut sockets = SOCKET_SET.lock();
+        let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
-        //                 let mut sockets = SOCKET_SET.lock();
-        //                 let socket = sockets.get::<tcp::Socket>(self.handle.0);
-        //                 match socket.state() {
-        //                     State::SynSent => {
-        //                         // still connecting
-        //                         drop(socket);
-        //                         kdebug!("poll for connection wait");
-        //                         // SOCKET_ACTIVITY.wait(sockets);
-        //                     }
-        //                     State::Established => {
-        //                         break Ok(());
-        //                     }
-        //                     _ => {
-        //                         break Err(SystemError::ECONNREFUSED);
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //         Err(_) => Err(SystemError::ENOBUFS),
-        //     };
-        // } else {
-        //     return Err(SystemError::EINVAL);
-        // }
-        return Err(SystemError::EINVAL);
+        if let Endpoint::Ip(ip) = endpoint {
+            let temp_port = get_ephemeral_port();
+            let iface = NET_DRIVERS.write().get(&0).unwrap().clone();
+            let mut inner_iface = iface.inner_iface().lock();
+            match socket.connect(&mut inner_iface.context(), ip, temp_port) {
+                Ok(()) => {
+                    drop(socket);
+                    drop(sockets);
+
+                    loop {
+                        poll_ifaces();
+                        let mut sockets = SOCKET_SET.lock();
+                        let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
+
+                        match socket.state() {
+                            tcp::State::Established => {
+                                return Ok(());
+                            }
+                            tcp::State::SynSent => {
+                                drop(socket);
+                                drop(sockets);
+                                SOCKET_WAITQUEUE.sleep();
+                            }
+                            _ => {
+                                return Err(SystemError::ECONNREFUSED);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    kerror!("Tcp Socket Connect Error {e:?}");
+                    match e {
+                        tcp::ConnectError::InvalidState => return Err(SystemError::EISCONN),
+                        tcp::ConnectError::Unaddressable => return Err(SystemError::EADDRNOTAVAIL),
+                    }
+                }
+            }
+        } else {
+            return Err(SystemError::EINVAL);
+        }
     }
 
     /// @brief tcp socket 监听 local_endpoint 端口
@@ -578,7 +653,7 @@ impl Socket for TcpSocket {
         if socket.is_listening() {
             return Ok(());
         }
-
+        // todo: 增加端口占用检查
         return match socket.listen(local_endpoint) {
             Ok(()) => {
                 self.is_listening = true;
@@ -586,6 +661,85 @@ impl Socket for TcpSocket {
             }
             Err(_) => Err(SystemError::EINVAL),
         };
+    }
+
+    fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::Ip(mut ip) = endpoint {
+            if ip.port == 0 {
+                ip.port = get_ephemeral_port();
+            }
+
+            self.local_endpoint = Some(ip);
+            self.is_listening = false;
+            return Ok(());
+        }
+        return Err(SystemError::EINVAL);
+    }
+
+    fn shutdown(&self, _type: super::ShutdownType) -> Result<(), SystemError> {
+        let mut sockets = SOCKET_SET.lock();
+        let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
+        socket.close();
+        return Ok(());
+    }
+
+    fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+        let endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
+        loop {
+            let mut sockets = SOCKET_SET.lock();
+            let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
+
+            if socket.is_active() {
+                let remote_ep = socket.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
+                drop(socket);
+
+                let new_socket = {
+                    // Initialize the TCP socket's buffers.
+                    let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
+                    let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
+                    // The new TCP socket used for sending and receiving data.
+                    let mut tcp_socket = tcp::Socket::new(rx_buffer, tx_buffer);
+                    tcp_socket.listen(endpoint).unwrap();
+
+                    // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
+                    // 因此需要再为当前的socket分配一个新的handle
+                    let new_handle = GlobalSocketHandle::new(sockets.add(tcp_socket));
+                    let old_handle = ::core::mem::replace(&mut self.handle, new_handle);
+
+                    Box::new(TcpSocket {
+                        handle: old_handle,
+                        local_endpoint: self.local_endpoint,
+                        is_listening: false,
+                        options: self.options,
+                    })
+                };
+
+                drop(sockets);
+                poll_ifaces();
+                return Ok((new_socket, Endpoint::Ip(remote_ep)));
+            }
+            drop(socket);
+            drop(sockets);
+            SOCKET_WAITQUEUE.sleep();
+        }
+    }
+
+    fn endpoint(&self) -> Option<Endpoint> {
+        let mut result: Option<Endpoint> = self.local_endpoint.clone().map(|x| Endpoint::Ip(x));
+        if result.is_none() {
+            let sockets = SOCKET_SET.lock();
+            let socket = sockets.get::<tcp::Socket>(self.handle.0);
+            if let Some(ep) = socket.local_endpoint() {
+                result = Some(Endpoint::Ip(ep));
+            }
+        }
+        return result;
+    }
+
+    fn peer_endpoint(&self) -> Option<Endpoint> {
+        let mut sockets = SOCKET_SET.lock();
+        let socket = sockets.get::<tcp::Socket>(self.handle.0);
+        return socket.remote_endpoint().map(|x| Endpoint::Ip(x));
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
@@ -600,6 +754,7 @@ impl Socket for TcpSocket {
 /// @breif 自动分配一个未被使用的PORT
 pub fn get_ephemeral_port() -> u16 {
     // TODO selects non-conflict high port
+    // TODO: 增加ListenTable, 用于检查端口是否被占用
     static mut EPHEMERAL_PORT: u16 = 0;
     unsafe {
         if EPHEMERAL_PORT == 0 {

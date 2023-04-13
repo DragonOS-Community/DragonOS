@@ -18,7 +18,7 @@ pub trait TraitPciArch {
     fn write_config(bus_device_function: &BusDeviceFunction, offset: u8, data: u32);
     /// @brief PCI域地址到存储器域地址的转换,x86_64架构为一一对应
     /// @param address PCI域地址
-    /// @return  Result<usize, PciError> 转换结果或出错原因
+    /// @return usize 转换结果
     fn address_pci_to_physical(pci_address: PciAddr) -> usize;
     /// @brief 获取Segement的root地址,x86_64架构为acpi mcfg表中读取
     /// @param segement 组id

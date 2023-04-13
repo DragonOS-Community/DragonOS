@@ -51,13 +51,13 @@ extern int process_init_files();
 extern int rs_init_stdio();
 
 // 设置初始进程的PCB
-#define INITIAL_PROC(proc)                                                                                             \
-    {                                                                                                                  \
-        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
-        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,   \
-        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                   \
-        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                       \
+#define INITIAL_PROC(proc)                                                                                           \
+    {                                                                                                                \
+        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
+        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
+        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
+        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                     \
     }
 
 struct thread_struct initial_thread = {
@@ -114,8 +114,10 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
+                         : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
+                         : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -461,13 +463,15 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     if (tmp < 0)
         goto exec_failed;
 
+    int argc = 0;
+    char **dst_argv = NULL;
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
     // 拷贝参数列表
     if (argv != NULL)
     {
-        int argc = 0;
 
         // 目标程序的argv基地址指针，最大8个参数
-        char **dst_argv = (char **)(stack_start_addr - (sizeof(char **) << 3));
+        dst_argv = (char **)(stack_start_addr - (sizeof(char **) << 3));
         uint64_t str_addr = (uint64_t)dst_argv;
 
         for (argc = 0; argc < 8 && argv[argc] != NULL; ++argc)
@@ -486,14 +490,29 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         }
 
         // 重新设定栈基址，并预留空间防止越界
-        stack_start_addr = str_addr - 8;
-        current_pcb->mm->stack_start = stack_start_addr;
-        regs->rsp = regs->rbp = stack_start_addr;
 
-        // 传递参数
-        regs->rdi = argc;
-        regs->rsi = (uint64_t)dst_argv;
+        stack_start_addr = str_addr - 8;
     }
+
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
+    // ==== 生成relibc所需的Stack结构体
+    {
+        uint64_t *ptr_stack = (uint64_t *)(stack_start_addr - 8);
+        if (argc == 0)
+            *ptr_stack = 0;
+        else
+            *ptr_stack = (uint64_t)dst_argv;
+        ptr_stack--;
+        *ptr_stack = argc;
+        stack_start_addr -= 16;
+    }
+
+    // 传递参数(旧版libc)
+    regs->rdi = argc;
+    regs->rsi = (uint64_t)dst_argv;
+    // 设置用户栈基地址
+    current_pcb->mm->stack_start = stack_start_addr;
+    regs->rsp = regs->rbp = stack_start_addr;
     // kdebug("execve ok");
     // 设置进程的段选择子为用户态可访问
     regs->cs = USER_CS | 3;
@@ -539,7 +558,7 @@ ul initial_kernel_thread(ul arg)
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
     int val = 0;
     val = scm_enable_double_buffer();
-    
+
     rs_init_stdio();
     // block_io_scheduler_init();
     ahci_init();
@@ -604,7 +623,7 @@ ul initial_kernel_thread(ul arg)
                          "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/bin/shell.elf"), "c"(NULL),
                          "d"(NULL)
                          : "memory");
-       
+
     return 1;
 }
 #pragma GCC pop_options

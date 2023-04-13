@@ -287,7 +287,7 @@ impl<T: Transport> NetDriver for VirtioInterface<T> {
         if poll_res {
             return Ok(());
         }
-        return Err(SystemError::EAGAIN);
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     #[inline(always)]

@@ -164,7 +164,7 @@ impl Socket for RawSocket {
                 Err(smoltcp::socket::raw::RecvError::Exhausted) => {
                     if !self.options.contains(SocketOptions::BLOCK) {
                         // 如果是非阻塞的socket，就返回错误
-                        return Err(SystemError::EAGAIN);
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
                 }
             }
@@ -329,7 +329,7 @@ impl Socket for UdpSocket {
                 }
             } else {
                 // 没有数据可以读取. 如果没有bind到指定端口，也会导致rx_buf为空
-                return Err(SystemError::EAGAIN);
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         }
     }
@@ -487,7 +487,7 @@ impl Socket for TcpSocket {
                     }
                 }
             } else {
-                return Err(SystemError::EAGAIN);
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         }
     }

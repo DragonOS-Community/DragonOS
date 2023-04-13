@@ -640,8 +640,8 @@ uint64_t xhci_hc_irq_install(uint64_t irq_num, void *arg)
     msi_desc.pci.msi_attribute.is_64 = 1;
     msi_desc.pci.msi_attribute.is_msix = 1;
     io_mfence();
-    //因pci_enable_msi不再单独映射MSIX表，所以需要对pci设备的bar进行映射
-    
+    // 因pci_enable_msi不再单独映射MSIX表，所以需要对pci设备的bar进行映射
+
     int retval = pci_enable_msi(&msi_desc);
 
     return 0;
@@ -903,8 +903,8 @@ static uint64_t xhci_initialize_slot(const int id, const int port, const int spe
     slot_ctx.speed = speed;
     slot_ctx.route_string = 0;
     slot_ctx.rh_port_num = port + 1; // 由于xhci控制器是1-base的，因此把驱动程序中存储的端口号加1，才是真实的端口号
-    slot_ctx.max_exit_latency = 0; // 稍后会计算这个值
-    slot_ctx.int_target = 0;       // 当前全部使用第0个interrupter
+    slot_ctx.max_exit_latency = 0;   // 稍后会计算这个值
+    slot_ctx.int_target = 0;         // 当前全部使用第0个interrupter
     slot_ctx.slot_state = XHCI_SLOT_STATE_DISABLED_OR_ENABLED;
     slot_ctx.device_address = 0;
 

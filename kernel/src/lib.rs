@@ -49,7 +49,7 @@ use mm::allocator::c::KernelAllocator;
 
 // <3>
 use crate::{
-    arch::asm::current::current_pcb,
+    arch::{asm::current::current_pcb, mm::mm_init},
     include::bindings::bindings::{process_do_exit, BLACK, GREEN},
     net::net_core::net_init,
 };
@@ -99,5 +99,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
     net_init().expect("Failed to init network");
+    mm_init();
     return 0;
 }

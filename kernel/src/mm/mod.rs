@@ -1,8 +1,10 @@
 use crate::include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET};
+
 use core::{fmt::Debug, ptr};
 
 pub mod allocator;
 pub mod gfp;
+pub mod kernel_mapper;
 pub mod mmio_buddy;
 pub mod page;
 

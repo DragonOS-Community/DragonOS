@@ -7,7 +7,8 @@ use core::{
 use crate::kerror;
 
 use super::{
-    allocator::page_frame::FrameAllocator, MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
+    allocator::page_frame::FrameAllocator, MemoryManagementArch, PageTableKind, PhysAddr,
+    PhysMemoryArea, VirtAddr,
 };
 
 pub struct PageTable<Arch> {

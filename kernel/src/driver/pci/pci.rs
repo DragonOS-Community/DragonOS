@@ -11,11 +11,12 @@ use crate::{kdebug, kerror, kinfo, kwarn};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
 use bitflags::bitflags;
+
 use core::{
     convert::TryFrom,
-    fmt::{self, Display, Formatter},
+    fmt::{self, Debug, Display, Formatter},
 };
-use core::fmt::Debug;
+
 // PCI_DEVICE_LINKEDLIST 添加了读写锁的全局链表，里面存储了检索到的PCI设备结构体
 // PCI_ROOT_0 Segment为0的全局PciRoot
 lazy_static! {
@@ -1319,7 +1320,7 @@ pub fn pci_bar_init(
                 address |= u64::from(address_top) << 32;
                 bar_index_ignore = bar_index + 1; //下个bar跳过，因为64位的memory bar覆盖了两个bar
             }
-            let pci_address=PciAddr::new(address as usize);
+            let pci_address = PciAddr::new(address as usize);
             address = PciArch::address_pci_to_physical(pci_address) as u64; //PCI总线域物理地址转换为存储器域物理地址
             unsafe {
                 let vaddr_ptr = &mut virtaddress as *mut u64;

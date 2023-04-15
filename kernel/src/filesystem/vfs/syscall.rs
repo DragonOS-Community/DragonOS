@@ -435,3 +435,12 @@ pub extern "C" fn sys_dup2(regs: &pt_regs) -> u64 {
         return r.unwrap_err().to_posix_errno() as u64;
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IoVec {
+    /// 缓冲区的起始地址
+    pub iov_base: *mut u8,
+    /// 缓冲区的长度
+    pub iov_len: usize,
+}

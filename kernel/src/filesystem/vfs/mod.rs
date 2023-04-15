@@ -3,7 +3,7 @@
 pub mod core;
 pub mod file;
 pub mod mount;
-mod syscall;
+pub mod syscall;
 mod utils;
 
 use ::core::{any::Any, fmt::Debug};

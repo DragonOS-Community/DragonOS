@@ -541,6 +541,8 @@ impl Socket for TcpSocket {
             } else {
                 return (Err(SystemError::ENOTCONN), None);
             }
+            drop(socket);
+            drop(socket_set_guard);
             SOCKET_WAITQUEUE.sleep();
         }
     }

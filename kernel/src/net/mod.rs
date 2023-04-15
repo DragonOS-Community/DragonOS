@@ -13,6 +13,7 @@ use self::socket::SocketMetadata;
 pub mod endpoints;
 pub mod net_core;
 pub mod socket;
+pub mod syscall;
 
 lazy_static! {
     /// @brief 所有网络接口的列表

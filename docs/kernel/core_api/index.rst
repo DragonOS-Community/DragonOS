@@ -11,6 +11,7 @@
    kernel_api
    atomic
    data_structures
+   casting
 
 内存管理
 ===================

@@ -1,4 +1,5 @@
 pub mod atomic;
+pub mod casting;
 pub mod ffi_convert;
 pub mod list;
 pub mod lockref;

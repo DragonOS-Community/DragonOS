@@ -50,7 +50,7 @@ if [ $flag_can_run -eq 1 ]; then
         --display)
         case "$2" in
               vnc)
-              QEMU_ARGUMENT+=" -display vnc=:5900"
+              QEMU_ARGUMENT+=" -display vnc=:00"
               ;;
               window)
               ;;

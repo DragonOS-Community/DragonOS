@@ -12,6 +12,7 @@
    atomic
    data_structures
    casting
+   softirq
 
 内存管理
 ===================

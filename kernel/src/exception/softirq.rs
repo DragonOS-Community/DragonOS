@@ -249,10 +249,6 @@ pub extern "C" fn rs_raise_softirq(softirq_num: u32) {
     softirq_vectors().raise_softirq(SoftirqNumber::from(softirq_num as u64));
 }
 
-#[no_mangle]
-pub extern "C" fn rs_unregister_softirq(softirq_num: u32) {
-    softirq_vectors().unregister_softirq(SoftirqNumber::from(softirq_num as u64));
-}
 
 #[no_mangle]
 pub extern "C" fn rs_do_softirq() {
@@ -263,3 +259,4 @@ pub extern "C" fn rs_do_softirq() {
 pub extern "C" fn rs_clear_softirq_pending(softirq_num: u32) {
     softirq_vectors().clear_softirq_pending(SoftirqNumber::from(softirq_num as u64));
 }
+

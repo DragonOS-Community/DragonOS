@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 use super::spinlock::RawSpinlock;
-use crate::{
-    arch::asm::cmpxchg::try_cmpxchg_q,
-    syscall::SystemError,
-};
+use crate::{arch::asm::cmpxchg::try_cmpxchg_q, syscall::SystemError};
 use core::{fmt::Debug, intrinsics::size_of};
 
 #[cfg(target_arch = "x86_64")]
@@ -53,7 +50,7 @@ impl LockRef {
     fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, i32> {
         use core::ptr::read_volatile;
 
-        use crate::{arch::cpu::cpu_relax};
+        use crate::arch::cpu::cpu_relax;
 
         let mut old: LockRef = LockRef::INIT;
         old.count = unsafe { read_volatile(&self.count) };
@@ -117,13 +114,13 @@ impl LockRef {
         return Err(SystemError::ETIMEDOUT.to_posix_errno());
     }
 
-    /// @brief 对于不支持无锁lockref的架构，直接返回Err(SystemError::ENOTSUP)，表示不支持
+    /// @brief 对于不支持无锁lockref的架构，直接返回Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)，表示不支持
     #[cfg(not(target_arch = "x86_64"))]
     #[inline]
     fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, i32> {
-        use crate::include::bindings::bindings::ENOTSUP;
+        use crate::include::bindings::bindings::EOPNOTSUPP_OR_ENOTSUP;
 
-        return Err(SystemError::ENOTSUP.to_posix_errno());
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.to_posix_errno());
     }
 
     /// @brief 原子的将引用计数加1
@@ -242,7 +239,9 @@ impl LockRef {
             return Err(SystemError::EPERM);
         }
         // 由于cmpxchg超时，操作失败
-        if *cmpxchg_result.as_ref().unwrap_err() != SystemError::ENOTSUP.to_posix_errno() {
+        if *cmpxchg_result.as_ref().unwrap_err()
+            != SystemError::EOPNOTSUPP_OR_ENOTSUP.to_posix_errno()
+        {
             return Err(SystemError::EFAULT);
         }
 
@@ -265,7 +264,7 @@ impl LockRef {
             let cmpxchg_result = self.cmpxchg_loop(CmpxchgMode::DecreaseNotZero);
             if cmpxchg_result.is_ok() {
                 return Ok(cmpxchg_result.unwrap());
-            } else if cmpxchg_result.unwrap_err() == 1{
+            } else if cmpxchg_result.unwrap_err() == 1 {
                 return Err(SystemError::EPERM);
             }
         }

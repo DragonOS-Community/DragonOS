@@ -271,7 +271,6 @@ int scm_enable_double_buffer()
     video_set_refresh_target(__current_framework->buf);
     // 通知显示驱动，启动双缓冲
     video_reinitialize(true);
-    c_uart_send_str(COM1, "##initialized double buffer##\n");
     return 0;
 }
 

@@ -16,7 +16,8 @@ use crate::{
         ffi_convert::FFIBind2Rust,
         refcount::{refcount_inc, RefCount},
         spinlock::{spin_lock_irqsave, spin_unlock_irqrestore},
-    }, syscall::SystemError,
+    },
+    syscall::SystemError,
 };
 
 #[no_mangle]

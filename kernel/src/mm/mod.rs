@@ -1,4 +1,4 @@
-use crate::include::bindings::bindings::{PAGE_OFFSET, process_control_block, mm_struct};
+use crate::include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET};
 
 pub mod allocator;
 pub mod gfp;

@@ -180,6 +180,7 @@ pub extern "C" fn sys_sched(regs: &'static mut pt_regs) -> u64 {
     }
     // 根据调度结果统一进行切换
     let pcb = __sched();
+
     if pcb.is_some() {
         switch_process(current_pcb(), pcb.unwrap());
     }

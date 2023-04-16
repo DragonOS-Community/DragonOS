@@ -13,9 +13,8 @@ use crate::{
     },
     include::bindings::bindings::{
         pid_t, process_control_block, process_do_exit, process_find_pcb_by_pid, pt_regs,
-        spinlock_t, verify_area, NULL, PF_EXITING,
-        PF_KTHREAD, PF_SIGNALED, PF_WAKEKILL, PROC_INTERRUPTIBLE, USER_CS, USER_DS,
-        USER_MAX_LINEAR_ADDR,
+        spinlock_t, verify_area, NULL, PF_EXITING, PF_KTHREAD, PF_SIGNALED, PF_WAKEKILL,
+        PROC_INTERRUPTIBLE, USER_CS, USER_DS, USER_MAX_LINEAR_ADDR,
     },
     ipc::signal_types::{sigset_add, user_sigaction},
     kBUG, kdebug, kerror, kwarn,
@@ -29,7 +28,8 @@ use crate::{
     process::{
         pid::PidType,
         process::{process_is_stopped, process_kick, process_wake_up_state},
-    }, syscall::SystemError,
+    },
+    syscall::SystemError,
 };
 
 use super::signal_types::{
@@ -117,7 +117,7 @@ fn signal_kill_something_info(
     // 暂时不支持特殊的kill操作
     if pid <= 0 {
         kwarn!("Kill operation not support: pid={}", pid);
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     // kill单个进程
@@ -698,7 +698,7 @@ fn setup_frame(
     if err != 0 {
         // todo: 在这里生成一个sigsegv,然后core dump
         //临时解决方案：退出当前进程
-        unsafe{
+        unsafe {
             process_do_exit(1);
         }
     }
@@ -724,8 +724,12 @@ fn setup_frame(
     // 设置cs和ds寄存器
     regs.cs = (USER_CS | 0x3) as u64;
     regs.ds = (USER_DS | 0x3) as u64;
-    
-    return if err == 0 { Ok(0) } else { Err(SystemError::EPERM) };
+
+    return if err == 0 {
+        Ok(0)
+    } else {
+        Err(SystemError::EPERM)
+    };
 }
 
 #[inline(always)]
@@ -762,7 +766,11 @@ fn copy_siginfo_to_user(to: *mut siginfo, from: &siginfo) -> Result<i32, SystemE
 /// @param context 要被设置的目标sigcontext
 /// @param mask 要被暂存的信号mask标志位
 /// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
-fn setup_sigcontext(context: &mut sigcontext, mask: &sigset_t, regs: &pt_regs) -> Result<i32, SystemError> {
+fn setup_sigcontext(
+    context: &mut sigcontext,
+    mask: &sigset_t,
+    regs: &pt_regs,
+) -> Result<i32, SystemError> {
     let current_thread = current_pcb().thread;
 
     context.oldmask = *mask;
@@ -929,19 +937,18 @@ pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
         }
     }
     //return retval as u64;
-    if retval.is_ok(){
+    if retval.is_ok() {
         return 0;
-    }else{
+    } else {
         return retval.unwrap_err().to_posix_errno() as u64;
     }
-    
 }
 
 fn do_sigaction(
     sig: SignalNumber,
     act: Option<&mut sigaction>,
     old_act: Option<&mut sigaction>,
-) -> Result<(),SystemError> {
+) -> Result<(), SystemError> {
     let pcb = current_pcb();
 
     // 指向当前信号的action的引用

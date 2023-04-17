@@ -2,11 +2,15 @@
 
 &emsp;&emsp;软件中断，也可以被称为中断的下半部，用于延迟处理硬中断（中断上半部）未完成的工作。将中断分为两个阶段可以有效解决中断处理时间过长和中断丢失的问题。
 
-## 设计思路
+## 1. 设计思路
 
-&emsp;&emsp;每个cpu都有自己的pending，软中断是“哪个cpu发起，就哪个cpu执行”，vectors可以在每个cpu上跑，并且每个vector都可以并行的在多个cpu上跑，因为每个cpu的pending不共享。每个cpu的pending存储在`__CPU_PENDING`中。vectors存储在`__SORTIRQ_VECTORS`指向的`Softirq`结构体中。
+&emsp;&emsp;每个cpu都有自己的pending，软中断是“哪个cpu发起，就哪个cpu执行”，每个cpu的pending不共享。同一个软中断向量可以在多核上同时运行。
 
-## 软中断向量号
+&emsp;&emsp;当我们需要注册一个新的软中断时，需要为软中断处理程序实现`SoftirqVec`特征，然后调用`register_softirq`函数，将软中断处理程序注册到软中断机制内。
+
+&emsp;&emsp;请注意，由于软中断的可重入、可并发性，所以软中断处理程序需要自己保证线程安全。
+
+## 2. 软中断向量号
 
 ```rust
 pub enum SoftirqNumber {
@@ -17,38 +21,27 @@ pub enum SoftirqNumber {
 }
 ```
 
-## 软中断API
+## 3. 软中断API
+
+### 3.1. SoftirqVec特征
 
 ```rust
-pub fn softirq_vectors() -> &'static mut Softirq 
+pub trait SoftirqVec: Send + Sync + Debug {
+    fn run(&self);
+}
 ```
 
-- 作用：获取中断向量表的静态可变引用
+&emsp;&emsp;软中断处理程序需要实现的特征，需要实现`run`函数，用于处理软中断。当软中断被执行时，会调用`run`函数。
 
-- 返回：中断向量表的静态可变引用
+### 3.2. Softirq的API
 
-```rust
-fn cpu_pending(cpu_id: usize) -> &'static mut VecStatus
-```
-
-- 作用：获取对应cpu的pending
-
-- 参数：
-  
-  - cpu_id：cpu的id
-
-- 返回：对应cpu的pending的静态可变引用
-
-### Softirq的API
-
+#### 3.2.1. 注册软中断向量
 ```rust
 pub fn register_softirq(&self,
         softirq_num: SoftirqNumber,
         handler: Arc<dyn SoftirqVec>,
     ) -> Result<i32, SystemError>
 ```
-
-- 作用：注册软中断向量
 
 - 参数：
   
@@ -62,15 +55,18 @@ pub fn register_softirq(&self,
   
   - Err(SystemError)：错误码
 
+#### 3.2.2. 解注册软中断向量
+
 ```rust
 pub fn unregister_softirq(&self, softirq_num: SoftirqNumber)
 ```
 
-- 作用：解注册软中断向量
-
 - 参数：
   
   - softirq_num：中断向量号
+
+
+#### 3.2.3. 软中断执行
 
 ```rust
 pub fn do_softirq(&self)
@@ -78,27 +74,31 @@ pub fn do_softirq(&self)
 
 - 作用：执行软中断函数（**只在硬中断执行后调用**）
 
+#### 3.2.4. 清除软中断的pending标志
+
 ```rust
-pub fn clear_softirq_pending(&self, softirq_num: SoftirqNumber)
+pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber)
 ```
 
-- 作用：不需要执行中断号为softirq_num的中断
+- 作用：清除当前CPU上，指定软中断的pending标志。请注意，这个函数是unsafe的，因为它会直接修改pending标志，而没有加锁。
 
 - 参数：
   
   - softirq_num：中断向量号
+
+#### 3.2.5. 标志软中断需要执行
 
 ```rust
 pub fn raise_softirq(&self, softirq_num: SoftirqNumber)
 ```
 
-- 作用：需要执行中断号为softirq_num的中断
+- 作用：标志当前CPU上，指定的软中断需要执行
 
 - 参数：
   
   - softirq_num：中断向量号
 
-### 使用实例
+### 3.3. 使用实例
 
 ```rust
 #[derive(Debug)]
@@ -162,7 +162,7 @@ fn main() {
 }
 ```
 
-### 为C提供的接口
+### 3.4. 为C提供的接口
 
 ```c
 extern void rs_softirq_init();

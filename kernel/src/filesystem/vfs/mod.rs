@@ -10,7 +10,7 @@ use ::core::{any::Any, fmt::Debug};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{syscall::SystemError, time::TimeSpec};
+use crate::{libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec};
 
 use self::{core::generate_inode_id, file::FileMode};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
@@ -36,6 +36,8 @@ pub enum FileType {
     Pipe,
     /// 符号链接
     SymLink,
+    /// 套接字
+    Socket,
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -68,20 +70,18 @@ impl FileType {
             FileType::CharDevice => DT_CHR,
             FileType::Pipe => DT_FIFO,
             FileType::SymLink => DT_LNK,
+            FileType::Socket => DT_SOCK,
         };
     }
 }
 
-/// @brief inode的状态（由poll方法返回）
-#[derive(Debug, Default, PartialEq)]
-pub struct PollStatus {
-    pub flags: u8,
-}
-
-impl PollStatus {
-    pub const WRITE_MASK: u8 = (1u8 << 0);
-    pub const READ_MASK: u8 = (1u8 << 1);
-    pub const ERR_MASK: u8 = (1u8 << 2);
+bitflags! {
+    /// @brief inode的状态（由poll方法返回）
+    pub struct PollStatus: u8 {
+        const WRITE = 1u8 << 0;
+        const READ = 1u8 << 1;
+        const ERROR = 1u8 << 2;
+    }
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug {
@@ -333,6 +333,12 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
         return Ok(());
+    }
+}
+
+impl DowncastArc for dyn IndexNode {
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
+        self
     }
 }
 

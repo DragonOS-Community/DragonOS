@@ -6,6 +6,7 @@
 #![feature(panic_info_message)]
 #![feature(drain_filter)] // 允许Vec的drain_filter特性
 #![feature(c_void_variant)]
+#![feature(trait_upcasting)]
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{raw, tcp, udp},
@@ -8,8 +8,12 @@ use smoltcp::{
 
 use crate::{
     arch::rand::rand,
+    filesystem::vfs::{IndexNode, PollStatus},
     kdebug, kerror, kwarn,
-    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::{
+        spinlock::{SpinLock, SpinLockGuard},
+        wait_queue::WaitQueue,
+    },
     syscall::SystemError,
 };
 
@@ -21,6 +25,10 @@ lazy_static! {
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     pub static ref SOCKET_WAITQUEUE: WaitQueue = WaitQueue::INIT;
 }
+
+/* For setsockopt(2) */
+// See: linux-5.19.10/include/uapi/asm-generic/socket.h#9
+pub const SOL_SOCKET: u8 = 1;
 
 /// @brief socket的句柄管理组件。
 /// 它在smoltcp的SocketHandle上封装了一层，增加更多的功能。
@@ -81,15 +89,15 @@ bitflags! {
 /// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
 pub struct SocketMetadata {
     /// socket的类型
-    socket_type: SocketType,
+    pub socket_type: SocketType,
     /// 发送缓冲区的大小
-    send_buf_size: usize,
+    pub send_buf_size: usize,
     /// 接收缓冲区的大小
-    recv_buf_size: usize,
+    pub recv_buf_size: usize,
     /// 元数据的缓冲区的大小
-    metadata_buf_size: usize,
+    pub metadata_buf_size: usize,
     /// socket的选项
-    options: SocketOptions,
+    pub options: SocketOptions,
 }
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -149,7 +157,7 @@ impl RawSocket {
 }
 
 impl Socket for RawSocket {
-    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Option<Endpoint>) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
             // 如何优化这里？
             let mut socket_set_guard = SOCKET_SET.lock();
@@ -160,7 +168,7 @@ impl Socket for RawSocket {
                     let packet = wire::Ipv4Packet::new_unchecked(buf);
                     return (
                         Ok(len),
-                        Some(Endpoint::Ip(smoltcp::wire::IpEndpoint {
+                        Endpoint::Ip(Some(smoltcp::wire::IpEndpoint {
                             addr: wire::IpAddress::Ipv4(packet.src_addr()),
                             port: 0,
                         })),
@@ -169,7 +177,7 @@ impl Socket for RawSocket {
                 Err(smoltcp::socket::raw::RecvError::Exhausted) => {
                     if !self.options.contains(SocketOptions::BLOCK) {
                         // 如果是非阻塞的socket，就返回错误
-                        return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), None);
+                        return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), Endpoint::Ip(None));
                     }
                 }
             }
@@ -195,7 +203,7 @@ impl Socket for RawSocket {
         } else {
             // 如果用户发送的数据包，不包含IP头，则需要自己构造IP头
 
-            if let Some(Endpoint::Ip(endpoint)) = to {
+            if let Some(Endpoint::Ip(Some(endpoint))) = to {
                 let mut socket_set_guard = SOCKET_SET.lock();
                 let socket: &mut raw::Socket =
                     socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
@@ -317,7 +325,7 @@ impl UdpSocket {
 
 impl Socket for UdpSocket {
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
-    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Option<Endpoint>) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
             kdebug!("Wait22 to Read");
 
@@ -332,11 +340,11 @@ impl Socket for UdpSocket {
                     drop(socket);
                     drop(socket_set_guard);
                     poll_ifaces();
-                    return (Ok(size), Some(Endpoint::Ip(remote_endpoint)));
+                    return (Ok(size), Endpoint::Ip(Some(remote_endpoint)));
                 }
             } else {
                 // 如果socket没有连接，则返回错误
-                return (Err(SystemError::ENOTCONN), None);
+                return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket);
             drop(socket_set_guard);
@@ -346,9 +354,9 @@ impl Socket for UdpSocket {
 
     fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
         let remote_endpoint: &wire::IpEndpoint = {
-            if let Some(Endpoint::Ip(ref endpoint)) = to {
+            if let Some(Endpoint::Ip(Some(ref endpoint))) = to {
                 endpoint
-            } else if let Some(Endpoint::Ip(ref endpoint)) = self.remote_endpoint {
+            } else if let Some(Endpoint::Ip(Some(ref endpoint))) = self.remote_endpoint {
                 endpoint
             } else {
                 return Err(SystemError::ENOTCONN);
@@ -403,7 +411,7 @@ impl Socket for UdpSocket {
         let mut sockets = SOCKET_SET.lock();
         let socket = sockets.get_mut::<udp::Socket>(self.handle.0);
 
-        if let Endpoint::Ip(ip) = endpoint {
+        if let Endpoint::Ip(Some(ip)) = endpoint {
             match socket.bind(ip) {
                 Ok(()) => return Ok(()),
                 Err(_) => return Err(SystemError::EINVAL),
@@ -464,7 +472,7 @@ impl Socket for UdpSocket {
                     .unwrap_or(wire::IpAddress::v4(0, 0, 0, 0)),
                 listen_endpoint.port,
             );
-            return Some(Endpoint::Ip(result));
+            return Some(Endpoint::Ip(Some(result)));
         }
     }
 
@@ -517,7 +525,7 @@ impl TcpSocket {
 
 impl Socket for TcpSocket {
     /// @breif
-    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Option<Endpoint>) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock();
@@ -529,17 +537,17 @@ impl Socket for TcpSocket {
                         let endpoint = if let Some(p) = socket.remote_endpoint() {
                             p
                         } else {
-                            return (Err(SystemError::ENOTCONN), None);
+                            return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
                         };
 
                         drop(socket);
                         drop(socket_set_guard);
                         poll_ifaces();
-                        return (Ok(size), Some(Endpoint::Ip(endpoint)));
+                        return (Ok(size), Endpoint::Ip(Some(endpoint)));
                     }
                 }
             } else {
-                return (Err(SystemError::ENOTCONN), None);
+                return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket);
             drop(socket_set_guard);
@@ -600,7 +608,7 @@ impl Socket for TcpSocket {
         let mut sockets = SOCKET_SET.lock();
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
-        if let Endpoint::Ip(ip) = endpoint {
+        if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = get_ephemeral_port();
             let iface = NET_DRIVERS.write().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
@@ -643,6 +651,8 @@ impl Socket for TcpSocket {
     }
 
     /// @brief tcp socket 监听 local_endpoint 端口
+    ///
+    /// @param backlog 未处理的连接队列的最大长度. 由于smoltcp不支持backlog，所以这个参数目前无效
     fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
         if self.is_listening {
             return Ok(());
@@ -666,7 +676,7 @@ impl Socket for TcpSocket {
     }
 
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
-        if let Endpoint::Ip(mut ip) = endpoint {
+        if let Endpoint::Ip(Some(mut ip)) = endpoint {
             if ip.port == 0 {
                 ip.port = get_ephemeral_port();
             }
@@ -718,7 +728,7 @@ impl Socket for TcpSocket {
 
                 drop(sockets);
                 poll_ifaces();
-                return Ok((new_socket, Endpoint::Ip(remote_ep)));
+                return Ok((new_socket, Endpoint::Ip(Some(remote_ep))));
             }
             drop(socket);
             drop(sockets);
@@ -727,21 +737,23 @@ impl Socket for TcpSocket {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let mut result: Option<Endpoint> = self.local_endpoint.clone().map(|x| Endpoint::Ip(x));
+        let mut result: Option<Endpoint> =
+            self.local_endpoint.clone().map(|x| Endpoint::Ip(Some(x)));
+
         if result.is_none() {
             let sockets = SOCKET_SET.lock();
             let socket = sockets.get::<tcp::Socket>(self.handle.0);
             if let Some(ep) = socket.local_endpoint() {
-                result = Some(Endpoint::Ip(ep));
+                result = Some(Endpoint::Ip(Some(ep)));
             }
         }
         return result;
     }
 
     fn peer_endpoint(&self) -> Option<Endpoint> {
-        let mut sockets = SOCKET_SET.lock();
+        let sockets = SOCKET_SET.lock();
         let socket = sockets.get::<tcp::Socket>(self.handle.0);
-        return socket.remote_endpoint().map(|x| Endpoint::Ip(x));
+        return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
@@ -768,5 +780,208 @@ pub fn get_ephemeral_port() -> u16 {
             EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
         }
         EPHEMERAL_PORT
+    }
+}
+
+/// @brief 地址族的枚举
+///
+/// 参考：https://opengrok.ringotek.cn/xref/linux-5.19.10/include/linux/socket.h#180
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+pub enum AddressFamily {
+    /// AF_UNSPEC 表示地址族未指定
+    Unspecified = 0,
+    /// AF_UNIX 表示Unix域的socket (与AF_LOCAL相同)
+    Unix = 1,
+    ///  AF_INET 表示IPv4的socket
+    INet = 2,
+    /// AF_AX25 表示AMPR AX.25的socket
+    AX25 = 3,
+    /// AF_IPX 表示IPX的socket
+    IPX = 4,
+    /// AF_APPLETALK 表示Appletalk的socket
+    Appletalk = 5,
+    /// AF_NETROM 表示AMPR NET/ROM的socket
+    Netrom = 6,
+    /// AF_BRIDGE 表示多协议桥接的socket
+    Bridge = 7,
+    /// AF_ATMPVC 表示ATM PVCs的socket
+    Atmpvc = 8,
+    /// AF_X25 表示X.25的socket
+    X25 = 9,
+    /// AF_INET6 表示IPv6的socket
+    INet6 = 10,
+    /// AF_ROSE 表示AMPR ROSE的socket
+    Rose = 11,
+    /// AF_DECnet Reserved for DECnet project
+    Decnet = 12,
+    /// AF_NETBEUI Reserved for 802.2LLC project
+    Netbeui = 13,
+    /// AF_SECURITY 表示Security callback的伪AF
+    Security = 14,
+    /// AF_KEY 表示Key management API
+    Key = 15,
+    /// AF_NETLINK 表示Netlink的socket
+    Netlink = 16,
+    /// AF_PACKET 表示Low level packet interface
+    Packet = 17,
+    /// AF_ASH 表示Ash
+    Ash = 18,
+    /// AF_ECONET 表示Acorn Econet
+    Econet = 19,
+    /// AF_ATMSVC 表示ATM SVCs
+    Atmsvc = 20,
+    /// AF_RDS 表示Reliable Datagram Sockets
+    Rds = 21,
+    /// AF_SNA 表示Linux SNA Project
+    Sna = 22,
+    /// AF_IRDA 表示IRDA sockets
+    Irda = 23,
+    /// AF_PPPOX 表示PPPoX sockets
+    Pppox = 24,
+    /// AF_WANPIPE 表示WANPIPE API sockets
+    WanPipe = 25,
+    /// AF_LLC 表示Linux LLC
+    Llc = 26,
+    /// AF_IB 表示Native InfiniBand address
+    /// 介绍：https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/9/html-single/configuring_infiniband_and_rdma_networks/index#understanding-infiniband-and-rdma_configuring-infiniband-and-rdma-networks
+    Ib = 27,
+    /// AF_MPLS 表示MPLS
+    Mpls = 28,
+    /// AF_CAN 表示Controller Area Network
+    Can = 29,
+    /// AF_TIPC 表示TIPC sockets
+    Tipc = 30,
+    /// AF_BLUETOOTH 表示Bluetooth sockets
+    Bluetooth = 31,
+    /// AF_IUCV 表示IUCV sockets
+    Iucv = 32,
+    /// AF_RXRPC 表示RxRPC sockets
+    Rxrpc = 33,
+    /// AF_ISDN 表示mISDN sockets
+    Isdn = 34,
+    /// AF_PHONET 表示Phonet sockets
+    Phonet = 35,
+    /// AF_IEEE802154 表示IEEE 802.15.4 sockets
+    Ieee802154 = 36,
+    /// AF_CAIF 表示CAIF sockets
+    Caif = 37,
+    /// AF_ALG 表示Algorithm sockets
+    Alg = 38,
+    /// AF_NFC 表示NFC sockets
+    Nfc = 39,
+    /// AF_VSOCK 表示vSockets
+    Vsock = 40,
+    /// AF_KCM 表示Kernel Connection Multiplexor
+    Kcm = 41,
+    /// AF_QIPCRTR 表示Qualcomm IPC Router
+    Qipcrtr = 42,
+    /// AF_SMC 表示SMC-R sockets.
+    /// reserve number for PF_SMC protocol family that reuses AF_INET address family
+    Smc = 43,
+    /// AF_XDP 表示XDP sockets
+    Xdp = 44,
+    /// AF_MCTP 表示Management Component Transport Protocol
+    Mctp = 45,
+    /// AF_MAX 表示最大的地址族
+    Max = 46,
+}
+
+impl TryFrom<u16> for AddressFamily {
+    type Error = SystemError;
+    fn try_from(x: u16) -> Result<Self, Self::Error> {
+        use num_traits::FromPrimitive;
+        return <Self as FromPrimitive>::from_u16(x).ok_or_else(|| SystemError::EINVAL);
+    }
+}
+
+/// @brief posix套接字类型的枚举(这些值与linux内核中的值一致)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+pub enum PosixSocketType {
+    Stream = 1,
+    Datagram = 2,
+    Raw = 3,
+    Rdm = 4,
+    SeqPacket = 5,
+    Dccp = 6,
+    Packet = 10,
+}
+
+impl TryFrom<u8> for PosixSocketType {
+    type Error = SystemError;
+    fn try_from(x: u8) -> Result<Self, Self::Error> {
+        use num_traits::FromPrimitive;
+        return <Self as FromPrimitive>::from_u8(x).ok_or_else(|| SystemError::EINVAL);
+    }
+}
+
+/// @brief Socket在文件系统中的inode封装
+#[derive(Debug)]
+pub struct SocketInode(SpinLock<Box<dyn Socket>>);
+
+impl SocketInode {
+    pub fn new(socket: Box<dyn Socket>) -> Arc<Self> {
+        return Arc::new(Self(SpinLock::new(socket)));
+    }
+
+    #[inline]
+    pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
+        return self.0.lock();
+    }
+}
+
+impl IndexNode for SocketInode {
+    fn open(
+        &self,
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        return Ok(());
+    }
+
+    fn read_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        return self.0.lock().read(&mut buf[0..len]).0;
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        return self.0.lock().write(&buf[0..len], None);
+    }
+
+    fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {
+        let (read, write, error) = self.0.lock().poll();
+        let mut result = PollStatus::empty();
+        if read {
+            result.insert(PollStatus::READ);
+        }
+        if write {
+            result.insert(PollStatus::WRITE);
+        }
+        if error {
+            result.insert(PollStatus::ERROR);
+        }
+        return Ok(result);
+    }
+
+    fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn list(&self) -> Result<Vec<alloc::string::String>, SystemError> {
+        return Err(SystemError::ENOTDIR);
     }
 }

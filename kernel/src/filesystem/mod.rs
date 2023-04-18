@@ -4,3 +4,4 @@ pub mod mbr;
 pub mod procfs;
 pub mod ramfs;
 pub mod vfs;
+pub mod sysfs;

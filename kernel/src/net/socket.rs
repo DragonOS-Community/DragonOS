@@ -8,7 +8,7 @@ use smoltcp::{
 
 use crate::{
     arch::rand::rand,
-    filesystem::vfs::{IndexNode, PollStatus},
+    filesystem::vfs::{FileType, IndexNode, Metadata, PollStatus},
     kdebug, kerror, kwarn,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -314,7 +314,7 @@ impl UdpSocket {
 
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
-
+        
         return Self {
             handle,
             remote_endpoint: None,
@@ -327,12 +327,12 @@ impl Socket for UdpSocket {
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
-            kdebug!("Wait22 to Read");
-
+            // kdebug!("Wait22 to Read");
+            poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock();
             let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
 
-            kdebug!("Wait to Read");
+            // kdebug!("Wait to Read");
 
             if socket.can_recv() {
                 kdebug!("Can Receive");
@@ -343,8 +343,8 @@ impl Socket for UdpSocket {
                     return (Ok(size), Endpoint::Ip(Some(remote_endpoint)));
                 }
             } else {
-                // 如果socket没有连接，则返回错误
-                return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
+                // 如果socket没有连接，则忙等
+                // return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket);
             drop(socket_set_guard);
@@ -410,9 +410,15 @@ impl Socket for UdpSocket {
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock();
         let socket = sockets.get_mut::<udp::Socket>(self.handle.0);
-
+        kdebug!("UDP Bind to {:?}", endpoint);
         if let Endpoint::Ip(Some(ip)) = endpoint {
-            match socket.bind(ip) {
+            let bind_res = if ip.addr.is_unspecified() {
+                socket.bind(ip.port)
+            } else {
+                socket.bind(ip)
+            };
+
+            match bind_res {
                 Ok(()) => return Ok(()),
                 Err(_) => return Err(SystemError::EINVAL),
             }
@@ -521,18 +527,47 @@ impl TcpSocket {
             options,
         };
     }
+    fn do_listen(
+        &mut self,
+        socket: &mut smoltcp::socket::tcp::Socket,
+        local_endpoint: smoltcp::wire::IpEndpoint,
+    ) -> Result<(), SystemError> {
+        let listen_result = if local_endpoint.addr.is_unspecified() {
+            kdebug!("Tcp Socket Listen on port {}", local_endpoint.port);
+            socket.listen(local_endpoint.port)
+        } else {
+            kdebug!("Tcp Socket Listen on {local_endpoint}");
+            socket.listen(local_endpoint)
+        };
+        // todo: 增加端口占用检查
+        return match listen_result {
+            Ok(()) => {
+                kdebug!(
+                    "Tcp Socket Listen on {local_endpoint}, open?:{}",
+                    socket.is_open()
+                );
+                self.is_listening = true;
+
+                Ok(())
+            }
+            Err(_) => Err(SystemError::EINVAL),
+        };
+    }
 }
 
 impl Socket for TcpSocket {
     /// @breif
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+        kdebug!("tcp socket: read, buf len={}", buf.len());
+
         loop {
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock();
             let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
 
             if socket.may_recv() {
-                if let Ok(size) = socket.recv_slice(buf) {
+                let recv_res = socket.recv_slice(buf);
+                if let Ok(size) = recv_res {
                     if size > 0 {
                         let endpoint = if let Some(p) = socket.remote_endpoint() {
                             p
@@ -663,16 +698,11 @@ impl Socket for TcpSocket {
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
         if socket.is_listening() {
+            kdebug!("Tcp Socket is already listening on {local_endpoint}");
             return Ok(());
         }
-        // todo: 增加端口占用检查
-        return match socket.listen(local_endpoint) {
-            Ok(()) => {
-                self.is_listening = true;
-                Ok(())
-            }
-            Err(_) => Err(SystemError::EINVAL),
-        };
+        kdebug!("Tcp Socket  before listen, open={}", socket.is_open());
+        return self.do_listen(socket, local_endpoint);
     }
 
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
@@ -698,10 +728,15 @@ impl Socket for TcpSocket {
     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
         let endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         loop {
+            // kdebug!("tcp accept: poll_ifaces()");
+            poll_ifaces();
+
             let mut sockets = SOCKET_SET.lock();
+
             let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
             if socket.is_active() {
+                kdebug!("tcp accept: socket.is_active()");
                 let remote_ep = socket.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
                 drop(socket);
 
@@ -711,7 +746,10 @@ impl Socket for TcpSocket {
                     let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
                     // The new TCP socket used for sending and receiving data.
                     let mut tcp_socket = tcp::Socket::new(rx_buffer, tx_buffer);
-                    tcp_socket.listen(endpoint).unwrap();
+                    self.do_listen(&mut tcp_socket, endpoint)
+                        .expect("do_listen failed");
+
+                    // tcp_socket.listen(endpoint).unwrap();
 
                     // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
                     // 因此需要再为当前的socket分配一个新的handle
@@ -725,9 +763,10 @@ impl Socket for TcpSocket {
                         options: self.options,
                     })
                 };
-
+                kdebug!("tcp accept: new socket: {:?}", new_socket);
                 drop(sockets);
                 poll_ifaces();
+
                 return Ok((new_socket, Endpoint::Ip(Some(remote_ep))));
             }
             drop(socket);
@@ -938,6 +977,13 @@ impl IndexNode for SocketInode {
         return Ok(());
     }
 
+    fn close(
+        &self,
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<(), SystemError> {
+        return Ok(());
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -983,5 +1029,15 @@ impl IndexNode for SocketInode {
 
     fn list(&self) -> Result<Vec<alloc::string::String>, SystemError> {
         return Err(SystemError::ENOTDIR);
+    }
+
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        let meta = Metadata {
+            mode: 0o777,
+            file_type: FileType::Socket,
+            ..Default::default()
+        };
+
+        return Ok(meta);
     }
 }

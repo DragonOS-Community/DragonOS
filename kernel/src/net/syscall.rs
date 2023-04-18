@@ -11,7 +11,8 @@ use crate::{
         syscall::{IoVec, IoVecs},
     },
     include::bindings::bindings::{pt_regs, verify_area},
-    net::socket::{AddressFamily, SOL_SOCKET},
+    kdebug,
+    net::{socket::{AddressFamily, SOL_SOCKET}, net_core::poll_ifaces},
     syscall::SystemError,
 };
 
@@ -24,7 +25,8 @@ use super::{
 pub extern "C" fn sys_socket(regs: &pt_regs) -> u64 {
     let address_family = regs.r8 as usize;
     let socket_type = regs.r9 as usize;
-    let protocol = regs.r10 as usize;
+    let protocol: usize = regs.r10 as usize;
+    kdebug!("sys_socket: address_family: {address_family}, socket_type: {socket_type}, protocol: {protocol}");
     return do_socket(address_family, socket_type, protocol)
         .map(|x| x as u64)
         .unwrap_or_else(|e| e.to_posix_errno() as u64);
@@ -42,7 +44,8 @@ pub fn do_socket(
 ) -> Result<i64, SystemError> {
     let address_family = AddressFamily::try_from(address_family as u16)?;
     let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
-
+    kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol}");
+    // 根据地址族和socket类型创建socket
     let socket: Box<dyn Socket> = match address_family {
         AddressFamily::Unix | AddressFamily::INet => match socket_type {
             PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
@@ -52,18 +55,23 @@ pub fn do_socket(
                 SocketOptions::default(),
             )),
             _ => {
+                kdebug!("do_socket: EINVAL");
                 return Err(SystemError::EINVAL);
             }
         },
         _ => {
+            kdebug!("do_socket: EAFNOSUPPORT");
             return Err(SystemError::EAFNOSUPPORT);
         }
     };
+    kdebug!("do_socket: socket: {socket:?}");
     let socketinode: Arc<SocketInode> = SocketInode::new(socket);
     let f = File::new(socketinode, FileMode::O_RDWR)?;
-
+    kdebug!("do_socket: f: {f:?}");
     // 把socket添加到当前进程的文件描述符表中
-    return current_pcb().alloc_fd(f, None).map(|x| x as i64);
+    let fd = current_pcb().alloc_fd(f, None).map(|x| x as i64);
+    kdebug!("do_socket: fd: {fd:?}");
+    return fd;
 }
 
 #[no_mangle]
@@ -345,12 +353,22 @@ pub fn do_recvfrom(
     if unsafe { verify_area(buf as usize as u64, len as u64) } == false {
         return Err(SystemError::EFAULT);
     }
+    kdebug!(
+        "do_recvfrom: fd: {}, buf: {:x}, len: {}, addr: {:x}, addrlen: {:x}",
+        fd,
+        buf as usize,
+        len,
+        addr as usize,
+        addrlen as usize
+    );
+
+    
     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
     let socket = socket.inner();
-
+    
     let (n, endpoint) = socket.read(buf);
     drop(socket);
 
@@ -476,16 +494,20 @@ pub fn do_accept(fd: usize, addr: *mut SockAddr, addrlen: *mut u32) -> Result<i3
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
+    kdebug!("accept: socket={:?}", socket);
     let mut socket = socket.inner();
     // 从socket中接收连接
+    kdebug!("accept: socket.accept()");
     let (new_socket, remote_endpoint) = socket.accept()?;
     drop(socket);
 
+    kdebug!("accept: new_socket={:?}", new_socket);
     // Insert the new socket into the file descriptor vector
     let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
     let new_fd = current_pcb().alloc_fd(File::new(new_socket, FileMode::O_RDWR)?, None)?;
-
+    kdebug!("accept: new_fd={}", new_fd);
     if !addr.is_null() {
+        kdebug!("accept: write remote_endpoint to user");
         // 将对端地址写入用户空间
         let sockaddr_in = SockAddr::from(remote_endpoint);
         unsafe {
@@ -745,7 +767,7 @@ impl From<Endpoint> for SockAddr {
                 let ip_endpoint = ip_endpoint.unwrap();
                 match ip_endpoint.addr {
                     wire::IpAddress::Ipv4(ipv4_addr) => {
-                        let  addr_in = SockAddrIn {
+                        let addr_in = SockAddrIn {
                             sin_family: AddressFamily::INet as u16,
                             sin_port: ip_endpoint.port.to_be(),
                             sin_addr: u32::from_be_bytes(ipv4_addr.0).to_be(),
@@ -761,7 +783,7 @@ impl From<Endpoint> for SockAddr {
             }
 
             Endpoint::LinkLayer(link_endpoint) => {
-                let  addr_ll = SockAddrLl {
+                let addr_ll = SockAddrLl {
                     sll_family: AddressFamily::Packet as u16,
                     sll_protocol: 0,
                     sll_ifindex: link_endpoint.interface as u32,
@@ -772,12 +794,10 @@ impl From<Endpoint> for SockAddr {
                 };
 
                 return SockAddr { addr_ll };
-            }
-
-            // _ => {
-            //     // todo: support other endpoint, like Netlink...
-            //     unimplemented!("not support {value:?}");
-            // }
+            } // _ => {
+              //     // todo: support other endpoint, like Netlink...
+              //     unimplemented!("not support {value:?}");
+              // }
         }
     }
 }

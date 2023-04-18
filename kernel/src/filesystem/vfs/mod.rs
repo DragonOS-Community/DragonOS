@@ -488,6 +488,27 @@ pub struct Metadata {
     pub raw_dev: usize,
 }
 
+impl Default for Metadata {
+    fn default() -> Self {
+        return Self {
+            dev_id: 0,
+            inode_id: 0,
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: TimeSpec::default(),
+            mtime: TimeSpec::default(),
+            ctime: TimeSpec::default(),
+            file_type: FileType::File,
+            mode: 0,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            raw_dev: 0,
+        };
+    }
+}
+
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针

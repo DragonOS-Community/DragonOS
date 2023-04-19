@@ -25,18 +25,18 @@ extern uint64_t sys_sched(struct pt_regs *regs);
 extern int sys_dup(int oldfd);
 extern int sys_dup2(int oldfd, int newfd);
 extern uint64_t sys_socket(struct pt_regs *regs);
-extern int sys_setsockopt(struct pt_regs *regs);
-extern int sys_getsockopt(struct pt_regs *regs);
-extern int sys_connect(struct pt_regs *regs);
-extern int sys_bind(struct pt_regs *regs);
-extern int sys_sendto(struct pt_regs *regs);
-extern int sys_recvfrom(struct pt_regs *regs);
-extern int sys_recvmsg(struct pt_regs *regs);
-extern int sys_listen(struct pt_regs *regs);
-extern int sys_shutdown(struct pt_regs *regs);
-extern int sys_accept(struct pt_regs *regs);
-extern int sys_getsockname(struct pt_regs *regs);
-extern int sys_getpeername(struct pt_regs *regs);
+extern uint64_t sys_setsockopt(struct pt_regs *regs);
+extern uint64_t sys_getsockopt(struct pt_regs *regs);
+extern uint64_t sys_connect(struct pt_regs *regs);
+extern uint64_t sys_bind(struct pt_regs *regs);
+extern uint64_t sys_sendto(struct pt_regs *regs);
+extern uint64_t sys_recvfrom(struct pt_regs *regs);
+extern uint64_t sys_recvmsg(struct pt_regs *regs);
+extern uint64_t sys_listen(struct pt_regs *regs);
+extern uint64_t sys_shutdown(struct pt_regs *regs);
+extern uint64_t sys_accept(struct pt_regs *regs);
+extern uint64_t sys_getsockname(struct pt_regs *regs);
+extern uint64_t sys_getpeername(struct pt_regs *regs);
 
 /**
  * @brief 关闭文件系统调用

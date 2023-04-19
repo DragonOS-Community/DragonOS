@@ -88,7 +88,6 @@ impl Timer {
             drop(timer_list);
             compiler_fence(Ordering::SeqCst);
 
-            
             return;
         }
         let mut split_pos: usize = 0;
@@ -176,7 +175,7 @@ impl SoftirqVec for DoTimerSoftirq {
                 }
                 timer_list_front_guard = Some(x.unwrap());
             }
-            if timer_list_front_guard.is_none(){
+            if timer_list_front_guard.is_none() {
                 continue;
             }
             let timer_list_front_guard = timer_list_front_guard.unwrap();

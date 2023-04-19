@@ -11,11 +11,7 @@ use crate::{
         syscall::{IoVec, IoVecs},
     },
     include::bindings::bindings::{pt_regs, verify_area},
-    kdebug,
-    net::{
-        net_core::poll_ifaces,
-        socket::{AddressFamily, SOL_SOCKET},
-    },
+    net::socket::{AddressFamily, SOL_SOCKET},
     syscall::SystemError,
 };
 
@@ -29,7 +25,7 @@ pub extern "C" fn sys_socket(regs: &pt_regs) -> u64 {
     let address_family = regs.r8 as usize;
     let socket_type = regs.r9 as usize;
     let protocol: usize = regs.r10 as usize;
-    kdebug!("sys_socket: address_family: {address_family}, socket_type: {socket_type}, protocol: {protocol}");
+    // kdebug!("sys_socket: address_family: {address_family}, socket_type: {socket_type}, protocol: {protocol}");
     return do_socket(address_family, socket_type, protocol)
         .map(|x| x as u64)
         .unwrap_or_else(|e| e.to_posix_errno() as u64);
@@ -47,7 +43,7 @@ pub fn do_socket(
 ) -> Result<i64, SystemError> {
     let address_family = AddressFamily::try_from(address_family as u16)?;
     let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
-    kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol}");
+    // kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol}");
     // 根据地址族和socket类型创建socket
     let socket: Box<dyn Socket> = match address_family {
         AddressFamily::Unix | AddressFamily::INet => match socket_type {
@@ -58,34 +54,35 @@ pub fn do_socket(
                 SocketOptions::default(),
             )),
             _ => {
-                kdebug!("do_socket: EINVAL");
+                // kdebug!("do_socket: EINVAL");
                 return Err(SystemError::EINVAL);
             }
         },
         _ => {
-            kdebug!("do_socket: EAFNOSUPPORT");
+            // kdebug!("do_socket: EAFNOSUPPORT");
             return Err(SystemError::EAFNOSUPPORT);
         }
     };
-    kdebug!("do_socket: socket: {socket:?}");
+    // kdebug!("do_socket: socket: {socket:?}");
     let socketinode: Arc<SocketInode> = SocketInode::new(socket);
     let f = File::new(socketinode, FileMode::O_RDWR)?;
-    kdebug!("do_socket: f: {f:?}");
+    // kdebug!("do_socket: f: {f:?}");
     // 把socket添加到当前进程的文件描述符表中
     let fd = current_pcb().alloc_fd(f, None).map(|x| x as i64);
-    kdebug!("do_socket: fd: {fd:?}");
+    // kdebug!("do_socket: fd: {fd:?}");
     return fd;
 }
 
 #[no_mangle]
-pub extern "C" fn sys_setsockopt(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_setsockopt(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let level = regs.r9 as usize;
     let optname = regs.r10 as usize;
     let optval = regs.r11 as usize;
     let optlen = regs.r12 as usize;
     return do_setsockopt(fd, level, optname, optval as *const u8, optlen)
-        .unwrap_or_else(|e| e.to_posix_errno());
+        .map(|x| x as u64)
+        .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_setsockopt系统调用的实际执行函数
@@ -101,7 +98,7 @@ pub fn do_setsockopt(
     optname: usize,
     optval: *const u8,
     optlen: usize,
-) -> Result<i32, SystemError> {
+) -> Result<i64, SystemError> {
     // 验证optval的地址是否合法
     if unsafe { verify_area(optval as u64, optlen as u64) } == false {
         // 地址空间超出了用户空间的范围，不合法
@@ -118,14 +115,15 @@ pub fn do_setsockopt(
 }
 
 #[no_mangle]
-pub extern "C" fn sys_getsockopt(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_getsockopt(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let level = regs.r9 as usize;
     let optname = regs.r10 as usize;
     let optval = regs.r11 as usize;
     let optlen = regs.r12 as usize;
     return do_getsockopt(fd, level, optname, optval as *mut u8, optlen as *mut u32)
-        .unwrap_or_else(|e| e.to_posix_errno());
+        .map(|x| x as u64)
+        .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_getsockopt系统调用的实际执行函数
@@ -143,7 +141,7 @@ pub fn do_getsockopt(
     optname: usize,
     optval: *mut u8,
     optlen: *mut u32,
-) -> Result<i32, SystemError> {
+) -> Result<i64, SystemError> {
     // 验证optval的地址是否合法
     if unsafe { verify_area(optval as u64, core::mem::size_of::<u8>() as u64) } == false {
         // 地址空间超出了用户空间的范围，不合法
@@ -213,12 +211,13 @@ pub fn do_getsockopt(
 }
 
 #[no_mangle]
-pub extern "C" fn sys_connect(regs: &pt_regs) -> i64 {
+pub extern "C" fn sys_connect(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let addr = regs.r9 as usize;
     let addrlen = regs.r10 as usize;
     return do_connect(fd, addr as *const SockAddr, addrlen)
-        .unwrap_or_else(|e| e.to_posix_errno() as i64);
+        .map(|x| x as u64)
+        .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_connect系统调用的实际执行函数
@@ -234,17 +233,19 @@ pub fn do_connect(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<i6
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
     let mut socket = socket.inner();
-    kdebug!("connect to {:?}...", endpoint);
+    // kdebug!("connect to {:?}...", endpoint);
     socket.connect(endpoint)?;
     return Ok(0);
 }
 
 #[no_mangle]
-pub extern "C" fn sys_bind(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_bind(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let addr = regs.r9 as usize;
     let addrlen = regs.r10 as usize;
-    return do_bind(fd, addr as *const SockAddr, addrlen).unwrap_or_else(|e| e.to_posix_errno());
+    return do_bind(fd, addr as *const SockAddr, addrlen)
+        .map(|x| x as u64)
+        .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_bind系统调用的实际执行函数
@@ -254,7 +255,7 @@ pub extern "C" fn sys_bind(regs: &pt_regs) -> i32 {
 /// @param addrlen 地址长度
 ///
 /// @return 成功返回0，失败返回错误码
-pub fn do_bind(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<i32, SystemError> {
+pub fn do_bind(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<i64, SystemError> {
     let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
@@ -265,7 +266,7 @@ pub fn do_bind(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<i32, 
 }
 
 #[no_mangle]
-pub extern "C" fn sys_sendto(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_sendto(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let buf = regs.r9 as usize;
     let len = regs.r10 as usize;
@@ -280,7 +281,8 @@ pub extern "C" fn sys_sendto(regs: &pt_regs) -> i32 {
         addr as *const SockAddr,
         addrlen,
     )
-    .unwrap_or_else(|e| e.to_posix_errno());
+    .map(|x| x as u64)
+    .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_sendto系统调用的实际执行函数
@@ -300,7 +302,7 @@ pub fn do_sendto(
     _flags: usize,
     addr: *const SockAddr,
     addrlen: usize,
-) -> Result<i32, SystemError> {
+) -> Result<i64, SystemError> {
     if unsafe { verify_area(buf as usize as u64, len as u64) } == false {
         return Err(SystemError::EFAULT);
     }
@@ -315,11 +317,11 @@ pub fn do_sendto(
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
     let socket = socket.inner();
-    return socket.write(buf, endpoint).map(|n| n as i32);
+    return socket.write(buf, endpoint).map(|n| n as i64);
 }
 
 #[no_mangle]
-pub extern "C" fn sys_recvfrom(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_recvfrom(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let buf = regs.r9 as usize;
     let len = regs.r10 as usize;
@@ -334,7 +336,8 @@ pub extern "C" fn sys_recvfrom(regs: &pt_regs) -> i32 {
         addr as *mut SockAddr,
         addrlen as *mut u32,
     )
-    .unwrap_or_else(|e| e.to_posix_errno());
+    .map(|x| x as u64)
+    .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_recvfrom系统调用的实际执行函数
@@ -354,18 +357,18 @@ pub fn do_recvfrom(
     _flags: usize,
     addr: *mut SockAddr,
     addrlen: *mut u32,
-) -> Result<i32, SystemError> {
+) -> Result<i64, SystemError> {
     if unsafe { verify_area(buf as usize as u64, len as u64) } == false {
         return Err(SystemError::EFAULT);
     }
-    kdebug!(
-        "do_recvfrom: fd: {}, buf: {:x}, len: {}, addr: {:x}, addrlen: {:x}",
-        fd,
-        buf as usize,
-        len,
-        addr as usize,
-        addrlen as usize
-    );
+    // kdebug!(
+    //     "do_recvfrom: fd: {}, buf: {:x}, len: {}, addr: {:x}, addrlen: {:x}",
+    //     fd,
+    //     buf as usize,
+    //     len,
+    //     addr as usize,
+    //     addrlen as usize
+    // );
 
     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     let socket: Arc<SocketInode> = current_pcb()
@@ -385,15 +388,17 @@ pub fn do_recvfrom(
             sockaddr_in.write_to_user(addr, addrlen)?;
         }
     }
-    return Ok(n as i32);
+    return Ok(n as i64);
 }
 
 #[no_mangle]
-pub extern "C" fn sys_recvmsg(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_recvmsg(regs: &pt_regs) -> i64 {
     let fd = regs.r8 as usize;
     let msg = regs.r9 as usize;
     let flags = regs.r10 as usize;
-    return do_recvmsg(fd, msg as *mut MsgHdr, flags).unwrap_or_else(|e| e.to_posix_errno());
+    return do_recvmsg(fd, msg as *mut MsgHdr, flags)
+        .map(|x| x as i64)
+        .unwrap_or_else(|e| e.to_posix_errno() as i64);
 }
 
 /// @brief sys_recvmsg系统调用的实际执行函数
@@ -403,7 +408,7 @@ pub extern "C" fn sys_recvmsg(regs: &pt_regs) -> i32 {
 /// @param flags 标志
 ///
 /// @return 成功返回接收的字节数，失败返回错误码
-pub fn do_recvmsg(fd: usize, msg: *mut MsgHdr, _flags: usize) -> Result<i32, SystemError> {
+pub fn do_recvmsg(fd: usize, msg: *mut MsgHdr, _flags: usize) -> Result<i64, SystemError> {
     // 检查指针是否合法
     if unsafe { verify_area(msg as usize as u64, core::mem::size_of::<MsgHdr>() as u64) } == false {
         return Err(SystemError::EFAULT);
@@ -431,14 +436,16 @@ pub fn do_recvmsg(fd: usize, msg: *mut MsgHdr, _flags: usize) -> Result<i32, Sys
     unsafe {
         sockaddr_in.write_to_user(msg.msg_name, &mut msg.msg_namelen)?;
     }
-    return Ok(n as i32);
+    return Ok(n as i64);
 }
 
 #[no_mangle]
-pub extern "C" fn sys_listen(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_listen(regs: &pt_regs) -> i64 {
     let fd = regs.r8 as usize;
     let backlog = regs.r9 as usize;
-    return do_listen(fd, backlog).unwrap_or_else(|e| e.to_posix_errno());
+    return do_listen(fd, backlog)
+        .map(|x| x as i64)
+        .unwrap_or_else(|e| e.to_posix_errno() as i64);
 }
 
 /// @brief sys_listen系统调用的实际执行函数
@@ -447,7 +454,7 @@ pub extern "C" fn sys_listen(regs: &pt_regs) -> i32 {
 /// @param backlog 最大连接数
 ///
 /// @return 成功返回0，失败返回错误码
-pub fn do_listen(fd: usize, backlog: usize) -> Result<i32, SystemError> {
+pub fn do_listen(fd: usize, backlog: usize) -> Result<i64, SystemError> {
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
@@ -457,10 +464,12 @@ pub fn do_listen(fd: usize, backlog: usize) -> Result<i32, SystemError> {
 }
 
 #[no_mangle]
-pub extern "C" fn sys_shutdown(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_shutdown(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let how = regs.r9 as usize;
-    return do_shutdown(fd, how).unwrap_or_else(|e| e.to_posix_errno());
+    return do_shutdown(fd, how)
+        .map(|x| x as u64)
+        .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_shutdown系统调用的实际执行函数
@@ -469,7 +478,7 @@ pub extern "C" fn sys_shutdown(regs: &pt_regs) -> i32 {
 /// @param how 关闭方式
 ///
 /// @return 成功返回0，失败返回错误码
-pub fn do_shutdown(fd: usize, how: usize) -> Result<i32, SystemError> {
+pub fn do_shutdown(fd: usize, how: usize) -> Result<i64, SystemError> {
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
@@ -479,12 +488,13 @@ pub fn do_shutdown(fd: usize, how: usize) -> Result<i32, SystemError> {
 }
 
 #[no_mangle]
-pub extern "C" fn sys_accept(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_accept(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let addr = regs.r9 as usize;
     let addrlen = regs.r10 as usize;
     return do_accept(fd, addr as *mut SockAddr, addrlen as *mut u32)
-        .unwrap_or_else(|e| e.to_posix_errno());
+        .map(|x| x as u64)
+        .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_accept系统调用的实际执行函数
@@ -494,40 +504,40 @@ pub extern "C" fn sys_accept(regs: &pt_regs) -> i32 {
 /// @param addrlen 地址长度
 ///
 /// @return 成功返回新的文件描述符，失败返回错误码
-pub fn do_accept(fd: usize, addr: *mut SockAddr, addrlen: *mut u32) -> Result<i32, SystemError> {
+pub fn do_accept(fd: usize, addr: *mut SockAddr, addrlen: *mut u32) -> Result<i64, SystemError> {
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
-    kdebug!("accept: socket={:?}", socket);
+    // kdebug!("accept: socket={:?}", socket);
     let mut socket = socket.inner();
     // 从socket中接收连接
-    kdebug!("accept: socket.accept()");
     let (new_socket, remote_endpoint) = socket.accept()?;
     drop(socket);
 
-    kdebug!("accept: new_socket={:?}", new_socket);
+    // kdebug!("accept: new_socket={:?}", new_socket);
     // Insert the new socket into the file descriptor vector
     let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
     let new_fd = current_pcb().alloc_fd(File::new(new_socket, FileMode::O_RDWR)?, None)?;
-    kdebug!("accept: new_fd={}", new_fd);
+    // kdebug!("accept: new_fd={}", new_fd);
     if !addr.is_null() {
-        kdebug!("accept: write remote_endpoint to user");
+        // kdebug!("accept: write remote_endpoint to user");
         // 将对端地址写入用户空间
         let sockaddr_in = SockAddr::from(remote_endpoint);
         unsafe {
             sockaddr_in.write_to_user(addr, addrlen)?;
         }
     }
-    return Ok(new_fd as i32);
+    return Ok(new_fd as i64);
 }
 
 #[no_mangle]
-pub extern "C" fn sys_getsockname(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_getsockname(regs: &pt_regs) -> i64 {
     let fd = regs.r8 as usize;
     let addr = regs.r9 as usize;
     let addrlen = regs.r10 as usize;
     return do_getsockname(fd, addr as *mut SockAddr, addrlen as *mut u32)
-        .unwrap_or_else(|e| e.to_posix_errno());
+        .map(|x| x as i64)
+        .unwrap_or_else(|e| e.to_posix_errno() as i64);
 }
 
 /// @brief sys_getsockname系统调用的实际执行函数
@@ -544,7 +554,7 @@ pub fn do_getsockname(
     fd: usize,
     addr: *mut SockAddr,
     addrlen: *mut u32,
-) -> Result<i32, SystemError> {
+) -> Result<i64, SystemError> {
     if addr.is_null() {
         return Err(SystemError::EINVAL);
     }
@@ -563,12 +573,13 @@ pub fn do_getsockname(
 }
 
 #[no_mangle]
-pub extern "C" fn sys_getpeername(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_getpeername(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as usize;
     let addr = regs.r9 as usize;
     let addrlen = regs.r10 as usize;
     return do_getpeername(fd, addr as *mut SockAddr, addrlen as *mut u32)
-        .unwrap_or_else(|e| e.to_posix_errno());
+        .map(|x| x as u64)
+        .unwrap_or_else(|e| e.to_posix_errno() as u64);
 }
 
 /// @brief sys_getpeername系统调用的实际执行函数
@@ -582,7 +593,7 @@ pub fn do_getpeername(
     fd: usize,
     addr: *mut SockAddr,
     addrlen: *mut u32,
-) -> Result<i32, SystemError> {
+) -> Result<i64, SystemError> {
     if addr.is_null() {
         return Err(SystemError::EINVAL);
     }

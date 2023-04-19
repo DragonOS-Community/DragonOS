@@ -16,7 +16,7 @@ use crate::{
         PROC_UNINTERRUPTIBLE,
     },
     libs::casting::DowncastArc,
-    net::{socket::SocketInode},
+    net::socket::SocketInode,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
     syscall::SystemError,

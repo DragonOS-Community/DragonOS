@@ -37,7 +37,7 @@ pub enum ShutdownType {
     ShutRdwr = 2, // Disables further send and receive operations.
 }
 
-impl TryFrom<i32> for ShutdownType{
+impl TryFrom<i32> for ShutdownType {
     type Error = SystemError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {

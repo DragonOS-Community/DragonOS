@@ -8,7 +8,7 @@
 
 #define CONN_QUEUE_SIZE 20
 #define BUFFER_SIZE 1024
-#define SERVER_PORT 6970
+#define SERVER_PORT 12580
 
 int server_sockfd;
 int conn;
@@ -112,11 +112,11 @@ void udp_server()
     char buffer[BUFFER_SIZE];
     struct sockaddr_in client_addr;
     socklen_t client_length = sizeof(client_addr);
-   
+
     while (1)
     {
         memset(buffer, 0, sizeof(buffer));
-        int len = recvfrom(server_sockfd, buffer, sizeof(buffer), 0, (struct sockaddr*)&client_addr, &client_length);
+        int len = recvfrom(server_sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_length);
         if (len <= 0)
         {
             printf("Receive data failed! len=%d", len);
@@ -128,15 +128,16 @@ void udp_server()
         }
 
         printf("Received: %s", buffer);
-        sendto(server_sockfd, buffer, len, 0, (struct sockaddr*)&client_addr,client_length);
+        sendto(server_sockfd, buffer, len, 0, (struct sockaddr *)&client_addr, client_length);
         printf("Send: %s", buffer);
     }
     close(conn);
     close(server_sockfd);
 }
 
-void tcp_client(){
-        printf("Client is running...\n");
+void tcp_client()
+{
+    printf("Client is running...\n");
     int client_sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
     struct sockaddr_in server_addr = {0};
@@ -163,6 +164,7 @@ void tcp_client(){
     while (1)
     {
         fgets(sendbuf, sizeof(sendbuf), stdin);
+        sendbuf[0] = 'a';
 
         // printf("to send\n");
         send(client_sockfd, sendbuf, strlen(sendbuf), 0);
@@ -173,6 +175,11 @@ void tcp_client(){
         }
 
         int x = recv(client_sockfd, recvbuf, sizeof(recvbuf), 0);
+        if (x < 0)
+        {
+            printf("recv error, retval=%d\n", x);
+            break;
+        }
 
         fputs(recvbuf, stdout);
 
@@ -182,51 +189,54 @@ void tcp_client(){
     close(client_sockfd);
 }
 
-void udp_client(){
+void udp_client()
+{
     struct sockaddr_in addr;
-	int sockfd, len = 0;	
-	int addr_len = sizeof(struct sockaddr_in);		
-	char buffer[256];
+    int sockfd, len = 0;
+    int addr_len = sizeof(struct sockaddr_in);
+    char buffer[256];
 
-	/* 建立socket，注意必须是SOCK_DGRAM */
-	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-		perror("socket");
-		exit(1);
-	}
+    /* 建立socket，注意必须是SOCK_DGRAM */
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+    {
+        perror("socket");
+        exit(1);
+    }
 
-	/* 填写sockaddr_in*/
-	bzero(&addr, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(12581);
-	addr.sin_addr.s_addr = inet_addr("192.168.199.129");
+    /* 填写sockaddr_in*/
+    bzero(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(12581);
+    addr.sin_addr.s_addr = inet_addr("192.168.199.129");
 
     printf("to send logo\n");
     sendto(sockfd, logo, sizeof(logo), 0, (struct sockaddr *)&addr, addr_len);
     printf("send logo ok\n");
-	while(1) {
-		bzero(buffer, sizeof(buffer));
+    while (1)
+    {
+        bzero(buffer, sizeof(buffer));
 
-		printf("Please enter a string to send to server: \n");
+        printf("Please enter a string to send to server: \n");
 
-		/* 从标准输入设备取得字符串*/
-		len = read(STDIN_FILENO, buffer, sizeof(buffer));
+        /* 从标准输入设备取得字符串*/
+        len = read(STDIN_FILENO, buffer, sizeof(buffer));
         printf("to send: %d\n", len);
-		/* 将字符串传送给server端*/
-		sendto(sockfd, buffer, len, 0, (struct sockaddr *)&addr, addr_len);
+        /* 将字符串传送给server端*/
+        sendto(sockfd, buffer, len, 0, (struct sockaddr *)&addr, addr_len);
 
-		/* 接收server端返回的字符串*/
-		len = recvfrom(sockfd, buffer, sizeof(buffer), 0, 
-				       (struct sockaddr *)&addr, &addr_len);
-		printf("Receive from server: %s\n", buffer);
-	}
+        /* 接收server端返回的字符串*/
+        len = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&addr, &addr_len);
+        printf("Receive from server: %s\n", buffer);
+    }
 
-	return 0;
+    return 0;
 }
 void main()
 {
     // signal(SIGKILL, signal_handler);
     // signal(SIGINT, signal_handler);
+    tcp_server();
     // udp_server();
     // tcp_client();
-    udp_client();
+    // udp_client();
 }

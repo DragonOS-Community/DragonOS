@@ -1,0 +1,24 @@
+#!/bin/bash
+BRIDGE=dragonos-bridge
+if [ -n "$1" ]; then
+        echo "正在断开接口 $1"
+        ip link set $1 down
+        brctl delif "$BRIDGE" $1
+        tap=`brctl show | grep natnet | awk '{print $4}'`
+        if [[ $tap != tap* ]];then
+            ip link set "$BRIDGE" down
+            brctl delbr "$BRIDGE"
+            iptables -t nat -F
+            kill `ps aux | grep dnsmasq | grep -v grep | awk '{print $2}'`
+            echo "断开接口 $1 成功"
+            echo "网桥 $BRIDGE 卸载成功"
+            echo "dnsmasq 服务停止成功"
+            exit 0
+        else
+            echo "断开接口 $1 成功"
+            exit 0
+        fi
+else
+        echo "删除错误：未指定接口"
+        exit 1
+fi

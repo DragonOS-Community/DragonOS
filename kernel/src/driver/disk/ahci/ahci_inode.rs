@@ -108,9 +108,7 @@ impl IndexNode for LockedAhciInode {
     }
 
     fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
-        });
+        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写

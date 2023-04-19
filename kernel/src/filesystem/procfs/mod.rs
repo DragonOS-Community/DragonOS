@@ -425,9 +425,7 @@ impl IndexNode for LockedProcFSInode {
             return Err(SystemError::EISDIR);
         }
 
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK,
-        });
+        return Ok(PollStatus::READ);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

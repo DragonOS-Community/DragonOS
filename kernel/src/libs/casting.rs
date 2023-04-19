@@ -53,7 +53,7 @@ use alloc::sync::Arc;
 ///     assert!(a_arc2.is_some());
 /// }
 /// ```
-trait DowncastArc: Any + Send + Sync {
+pub trait DowncastArc: Any + Send + Sync {
     /// 请在具体类型中实现这个函数，返回self
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any>;
 

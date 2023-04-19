@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::{
     boxed::Box,
@@ -75,15 +75,21 @@ impl Timer {
 
     /// @brief 将定时器插入到定时器链表中
     pub fn activate(&self) {
-        let timer_list = &mut TIMER_LIST.lock();
         let inner_guard = self.0.lock();
+        let timer_list = &mut TIMER_LIST.lock();
+
         // 链表为空，则直接插入
         if timer_list.is_empty() {
             // FIXME push_timer
+
             timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
+
+            drop(inner_guard);
+            drop(timer_list);
+            compiler_fence(Ordering::SeqCst);
+
             return;
         }
-
         let mut split_pos: usize = 0;
         for (pos, elt) in timer_list.iter().enumerate() {
             if elt.0.lock().expire_jiffies > inner_guard.expire_jiffies {
@@ -94,6 +100,8 @@ impl Timer {
         let mut temp_list: LinkedList<Arc<Timer>> = timer_list.split_off(split_pos);
         timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
         timer_list.append(&mut temp_list);
+        drop(inner_guard);
+        drop(timer_list);
     }
 
     #[inline]
@@ -147,20 +155,38 @@ impl SoftirqVec for DoTimerSoftirq {
         // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器
         for _ in 0..TIMER_RUN_CYCLE_THRESHOLD {
             // kdebug!("DoTimerSoftirq run");
-
-            let timer_list = &mut TIMER_LIST.lock();
+            let timer_list = TIMER_LIST.try_lock();
+            if timer_list.is_err() {
+                continue;
+            }
+            let mut timer_list = timer_list.unwrap();
 
             if timer_list.is_empty() {
                 break;
             }
 
-            if timer_list.front().unwrap().0.lock().expire_jiffies
-                <= unsafe { TIMER_JIFFIES as u64 }
-            {
-                let timer = timer_list.pop_front().unwrap();
-                drop(timer_list);
-                timer.run();
+            let timer_list_front = timer_list.pop_front().unwrap();
+            // kdebug!("to lock timer_list_front");
+            let mut timer_list_front_guard = None;
+            for _ in 0..10 {
+                let x = timer_list_front.0.try_lock();
+                if x.is_err() {
+                    continue;
+                }
+                timer_list_front_guard = Some(x.unwrap());
             }
+            if timer_list_front_guard.is_none() {
+                continue;
+            }
+            let timer_list_front_guard = timer_list_front_guard.unwrap();
+            if timer_list_front_guard.expire_jiffies > unsafe { TIMER_JIFFIES as u64 } {
+                drop(timer_list_front_guard);
+                timer_list.push_front(timer_list_front);
+                break;
+            }
+            drop(timer_list_front_guard);
+            drop(timer_list);
+            timer_list_front.run();
         }
 
         self.clear_run();
@@ -293,7 +319,7 @@ pub extern "C" fn rs_timer_next_n_us_jiffies(expire_us: u64) -> u64 {
 pub extern "C" fn rs_timer_get_first_expire() -> i64 {
     match timer_get_first_expire() {
         Ok(v) => return v as i64,
-        Err(e) => return e.to_posix_errno() as i64,
+        Err(_) => return 0,
     }
 }
 

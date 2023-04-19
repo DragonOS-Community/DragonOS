@@ -96,8 +96,8 @@ void do_undefined_opcode(struct pt_regs *regs, unsigned long error_code)
 void do_dev_not_avaliable(struct pt_regs *regs, unsigned long error_code)
 {
 
-    kerror("do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\n", error_code, regs->rsp,
-           regs->rip, proc_current_cpu_id);
+    kerror("do_dev_not_avaliable(7),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d, pid=%d\n", error_code, regs->rsp,
+           regs->rip, proc_current_cpu_id, current_pcb->pid);
 
     current_pcb->state = PROC_STOPPED;
     sched();

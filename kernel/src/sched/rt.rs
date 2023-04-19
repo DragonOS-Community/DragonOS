@@ -154,6 +154,7 @@ impl SchedulerRT {
         return sum as usize;
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn load_list_len(&mut self, cpu_id: u32) -> usize {
         return self.load_list[cpu_id as usize].len();

@@ -4,12 +4,14 @@ use alloc::{boxed::Box, string::ToString};
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
+    filesystem::vfs::file::FileDescriptorVec,
     include::bindings::bindings::{
-        pt_regs, verify_area, AT_REMOVEDIR, EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOTDIR,
-        EPERM, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET,
+        pt_regs, verify_area, AT_REMOVEDIR, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM, SEEK_CUR,
+        SEEK_END, SEEK_MAX, SEEK_SET,
     },
     io::SeekFrom,
     kerror,
+    syscall::SystemError,
 };
 
 use super::{
@@ -29,17 +31,17 @@ pub extern "C" fn sys_open(regs: &pt_regs) -> u64 {
     let path: &CStr = unsafe { CStr::from_ptr(regs.r8 as usize as *const c_char) };
     let path: Result<&str, core::str::Utf8Error> = path.to_str();
     if path.is_err() {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
     let path: &str = path.unwrap();
     let flags = regs.r9;
     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-    let r: Result<i32, i32> = do_open(path, open_flags);
+    let r: Result<i32, SystemError> = do_open(path, open_flags);
 
     if r.is_ok() {
         return r.unwrap() as u64;
     } else {
-        return r.unwrap_err() as u64;
+        return r.unwrap_err().to_posix_errno() as u64;
     }
 }
 
@@ -49,12 +51,12 @@ pub extern "C" fn sys_open(regs: &pt_regs) -> u64 {
 #[no_mangle]
 pub extern "C" fn sys_close(regs: &pt_regs) -> u64 {
     let fd = regs.r8 as i32;
-    let r: Result<(), i32> = current_pcb().drop_fd(fd);
+    let r: Result<(), SystemError> = current_pcb().drop_fd(fd);
 
     if r.is_ok() {
         return 0;
     } else {
-        return r.unwrap_err() as u64;
+        return r.unwrap_err().to_posix_errno() as u64;
     }
 }
 
@@ -72,18 +74,18 @@ pub extern "C" fn sys_read(regs: &pt_regs) -> u64 {
     // 判断缓冲区是否来自用户态，进行权限校验
     if user_mode(regs) && unsafe { !verify_area(buf_vaddr as u64, len as u64) } {
         // 来自用户态，而buffer在内核态，这样的操作不被允许
-        return (-(EPERM as i32)) as u64;
+        return SystemError::EPERM.to_posix_errno() as u64;
     }
 
     let buf: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len) };
 
-    let r: Result<usize, i32> = do_read(fd, buf);
+    let r: Result<usize, SystemError> = do_read(fd, buf);
 
     if r.is_ok() {
         return r.unwrap() as u64;
     } else {
-        return r.unwrap_err() as u64;
+        return r.unwrap_err().to_posix_errno() as u64;
     }
 }
 
@@ -101,18 +103,18 @@ pub extern "C" fn sys_write(regs: &pt_regs) -> u64 {
     // 判断缓冲区是否来自用户态，进行权限校验
     if user_mode(regs) && unsafe { !verify_area(buf_vaddr as u64, len as u64) } {
         // 来自用户态，而buffer在内核态，这样的操作不被允许
-        return (-(EPERM as i32)) as u64;
+        return SystemError::EPERM.to_posix_errno() as u64;
     }
 
     let buf: &[u8] =
         unsafe { core::slice::from_raw_parts::<'static, u8>(buf_vaddr as *mut u8, len) };
 
-    let r: Result<usize, i32> = do_write(fd, buf);
+    let r: Result<usize, SystemError> = do_write(fd, buf);
 
     if r.is_ok() {
         return r.unwrap() as u64;
     } else {
-        return r.unwrap_err() as u64;
+        return r.unwrap_err().to_posix_errno() as u64;
     }
 }
 
@@ -132,14 +134,14 @@ pub extern "C" fn sys_lseek(regs: &pt_regs) -> u64 {
         SEEK_CUR => SeekFrom::SeekCurrent(offset),
         SEEK_END => SeekFrom::SeekEnd(offset),
         SEEK_MAX => SeekFrom::SeekEnd(0),
-        _ => return (-(EINVAL as i32)) as u64,
+        _ => return SystemError::EINVAL.to_posix_errno() as u64,
     };
 
-    let r: Result<usize, i32> = do_lseek(fd, w);
+    let r: Result<usize, SystemError> = do_lseek(fd, w);
     if r.is_ok() {
         return r.unwrap() as u64;
     } else {
-        return r.unwrap_err() as u64;
+        return r.unwrap_err().to_posix_errno() as u64;
     }
 }
 
@@ -168,50 +170,50 @@ pub extern "C" fn sys_lseek(regs: &pt_regs) -> u64 {
 #[no_mangle]
 pub extern "C" fn sys_chdir(regs: &pt_regs) -> u64 {
     if regs.r8 == 0 {
-        return -(EFAULT as i32) as u64;
+        return SystemError::EFAULT.to_posix_errno() as u64;
     }
     let ptr = regs.r8 as usize as *const c_char;
     // 权限校验
     if ptr.is_null()
         || (user_mode(regs) && unsafe { !verify_area(ptr as u64, PAGE_2M_SIZE as u64) })
     {
-        return -(EINVAL as i32) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     let dest_path: &CStr = unsafe { CStr::from_ptr(ptr) };
     let dest_path: Result<&str, core::str::Utf8Error> = dest_path.to_str();
 
     if dest_path.is_err() {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     let dest_path: &str = dest_path.unwrap();
 
     if dest_path.len() == 0 {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     } else if dest_path.len() >= PAGE_4K_SIZE as usize {
-        return (-(ENAMETOOLONG as i32)) as u64;
+        return SystemError::ENAMETOOLONG.to_posix_errno() as u64;
     }
 
     let path = Box::new(dest_path.clone());
     let inode = match ROOT_INODE().lookup(&path) {
         Err(e) => {
-            kerror!("Change Directory Failed, Error = {}", e);
-            return (-(ENOENT as i32)) as u64;
+            kerror!("Change Directory Failed, Error = {:?}", e);
+            return SystemError::ENOENT.to_posix_errno() as u64;
         }
         Ok(i) => i,
     };
 
     match inode.metadata() {
         Err(e) => {
-            kerror!("INode Get MetaData Failed, Error = {}", e);
-            return (-(ENOENT as i32)) as u64;
+            kerror!("INode Get MetaData Failed, Error = {:?}", e);
+            return SystemError::ENOENT.to_posix_errno() as u64;
         }
         Ok(i) => {
             if let FileType::Dir = i.file_type {
                 return 0;
             } else {
-                return (-(ENOTDIR as i32)) as u64;
+                return SystemError::ENOTDIR.to_posix_errno() as u64;
             }
         }
     }
@@ -233,17 +235,17 @@ pub extern "C" fn sys_getdents(regs: &pt_regs) -> u64 {
     };
 
     if fd < 0 || fd as u32 > PROC_MAX_FD_NUM {
-        return (-(EBADF as i32)) as u64;
+        return SystemError::EBADF.to_posix_errno() as u64;
     }
 
     if count < 0 {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     // 获取fd
     let file: &mut File = match current_pcb().get_file_mut_by_fd(fd) {
         None => {
-            return (-(EBADF as i32)) as u64;
+            return SystemError::EBADF.to_posix_errno() as u64;
         }
         Some(file) => file,
     };
@@ -266,25 +268,25 @@ pub extern "C" fn sys_mkdir(regs: &pt_regs) -> u64 {
     if ptr.is_null()
         || (user_mode(regs) && unsafe { !verify_area(ptr as u64, PAGE_2M_SIZE as u64) })
     {
-        return -(EINVAL as i32) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
     let path: &CStr = unsafe { CStr::from_ptr(ptr) };
     let path: Result<&str, core::str::Utf8Error> = path.to_str();
     let mode = regs.r9;
 
     if path.is_err() {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     let path = &path.unwrap().to_string();
     if path.trim() == "" {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     return match do_mkdir(&path.trim(), FileMode::from_bits_truncate(mode as u32)) {
         Err(err) => {
-            kerror!("Failed in do_mkdir, Error Code = {}", err);
-            err as u64
+            kerror!("Failed in do_mkdir, Error Code = {:#?}", err);
+            err.to_posix_errno() as u64
         }
         Ok(_) => 0,
     };
@@ -306,27 +308,27 @@ pub extern "C" fn sys_unlink_at(regs: &pt_regs) -> u64 {
     if ptr.is_null()
         || (user_mode(regs) && unsafe { !verify_area(ptr as u64, PAGE_2M_SIZE as u64) })
     {
-        return -(EINVAL as i32) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
     let path: &CStr = unsafe { CStr::from_ptr(ptr) };
     let path: Result<&str, core::str::Utf8Error> = path.to_str();
     let flag = regs.r10;
     if path.is_err() {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     let path = &path.unwrap().to_string();
     // kdebug!("sys_unlink_at={path:?}");
     if (flag & (!(AT_REMOVEDIR as u64))) != 0_u64 {
-        return (-(EINVAL as i32)) as u64;
+        return SystemError::EINVAL.to_posix_errno() as u64;
     }
 
     if (flag & (AT_REMOVEDIR as u64)) > 0 {
         // kdebug!("rmdir");
         match do_remove_dir(&path) {
             Err(err) => {
-                kerror!("Failed to Remove Directory, Error Code = {}", err);
-                return err as u64;
+                kerror!("Failed to Remove Directory, Error Code = {:?}", err);
+                return err.to_posix_errno() as u64;
             }
             Ok(_) => {
                 return 0;
@@ -337,11 +339,99 @@ pub extern "C" fn sys_unlink_at(regs: &pt_regs) -> u64 {
     // kdebug!("rm");
     match do_unlink_at(&path, FileMode::from_bits_truncate(flag as u32)) {
         Err(err) => {
-            kerror!("Failed to Remove Directory, Error Code = {}", err);
-            return err as u64;
+            kerror!("Failed to Remove Directory, Error Code = {:?}", err);
+            return err.to_posix_errno() as u64;
         }
         Ok(_) => {
             return 0;
         }
+    }
+}
+
+fn do_dup(oldfd: i32) -> Result<i32, SystemError> {
+    if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+        // 获得当前文件描述符数组
+        // 确认oldfd是否有效
+        if FileDescriptorVec::validate_fd(oldfd) {
+            if let Some(file) = &fds.fds[oldfd as usize] {
+                // 尝试获取对应的文件结构体
+                let file_cp = (file).try_clone();
+                if file_cp.is_none() {
+                    return Err(SystemError::EBADF);
+                }
+                let res = current_pcb().alloc_fd(*file_cp.unwrap(), None);
+                // 申请文件描述符，并把文件对象存入其中
+                return res;
+            }
+            // oldfd对应的文件不存在
+            return Err(SystemError::EBADF);
+        }
+        return Err(SystemError::EBADF);
+    } else {
+        return Err(SystemError::EMFILE);
+    }
+}
+
+#[no_mangle]
+/// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
+pub extern "C" fn sys_dup(regs: &pt_regs) -> u64 {
+    let fd: i32 = regs.r8 as i32;
+    let r = do_dup(fd);
+    if r.is_ok() {
+        return r.unwrap() as u64;
+    } else {
+        return r.unwrap_err().to_posix_errno() as u64;
+    }
+}
+
+fn do_dup2(oldfd: i32, newfd: i32) -> Result<i32, SystemError> {
+    if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+        // 获得当前文件描述符数组
+        if FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd) {
+            //确认oldfd, newid是否有效
+            if oldfd == newfd {
+                // 若oldfd与newfd相等
+                return Ok(newfd);
+            }
+
+            if let Some(file) = &fds.fds[oldfd as usize] {
+                if fds.fds[newfd as usize].is_some() {
+                    // close newfd
+                    if let Err(_) = current_pcb().drop_fd(newfd) {
+                        // An I/O error occurred while attempting to close fildes2.
+                        return Err(SystemError::EIO);
+                    }
+                }
+
+                // 尝试获取对应的文件结构体
+                let file_cp = file.try_clone();
+                if file_cp.is_none() {
+                    return Err(SystemError::EBADF);
+                }
+                // 申请文件描述符，并把文件对象存入其中
+                let res = current_pcb().alloc_fd(*file_cp.unwrap(), Some(newfd));
+
+                return res;
+            }
+            return Err(SystemError::EBADF);
+        } else {
+            return Err(SystemError::EBADF);
+        }
+    }
+    // 从pcb获取文件描述符数组失败
+    return Err(SystemError::EMFILE);
+}
+
+#[no_mangle]
+/// @brief 根据提供的文件描述符的fd，和指定新fd，复制对应的文件结构体，
+/// 并返回新复制的文件结构体对应的fd
+pub extern "C" fn sys_dup2(regs: &pt_regs) -> u64 {
+    let ofd = regs.r8 as i32;
+    let nfd = regs.r9 as i32;
+    let r = do_dup2(ofd, nfd);
+    if r.is_ok() {
+        return r.unwrap() as u64;
+    } else {
+        return r.unwrap_err().to_posix_errno() as u64;
     }
 }

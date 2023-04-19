@@ -90,17 +90,6 @@ ul system_call_not_exists(struct pt_regs *regs)
 #define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
 
 /**
- * @brief sysenter的系统调用函数，从entry.S中跳转到这里
- *
- * @param regs 3特权级下的寄存器值,rax存储系统调用号
- * @return ul 对应的系统调用函数的地址
- */
-ul system_call_function(struct pt_regs *regs)
-{
-    return system_call_table[regs->rax](regs);
-}
-
-/**
  * @brief 初始化系统调用模块
  *
  */
@@ -187,22 +176,14 @@ uint64_t sys_vfork(struct pt_regs *regs)
 uint64_t sys_brk(struct pt_regs *regs)
 {
     uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
-
     // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx
     // current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
-
-    if ((int64_t)regs->r8 == -1)
-    {
-        // kdebug("get brk_start=%#018lx", current_pcb->mm->brk_start);
-        return current_pcb->mm->brk_start;
-    }
-    if ((int64_t)regs->r8 == -2)
-    {
-        // kdebug("get brk_end=%#018lx", current_pcb->mm->brk_end);
-        return current_pcb->mm->brk_end;
-    }
-    if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
-        return -ENOMEM;
+    struct mm_struct *mm = current_pcb->mm;
+    if (new_brk < mm->brk_start || new_brk> new_brk >= current_pcb->addr_limit)
+        return mm->brk_end;
+    
+    if (mm->brk_end == new_brk)
+        return new_brk;
 
     int64_t offset;
     if (new_brk >= current_pcb->mm->brk_end)
@@ -213,7 +194,7 @@ uint64_t sys_brk(struct pt_regs *regs)
     new_brk = mm_do_brk(current_pcb->mm->brk_end, offset); // 扩展堆内存空间
 
     current_pcb->mm->brk_end = new_brk;
-    return 0;
+    return mm->brk_end;
 }
 
 /**
@@ -298,13 +279,12 @@ extern uint64_t sys_getdents(struct pt_regs *regs);
  */
 uint64_t sys_execve(struct pt_regs *regs)
 {
-    // kdebug("sys_execve");
+
     char *user_path = (char *)regs->r8;
     char **argv = (char **)regs->r9;
 
     int path_len = strnlen_user(user_path, PAGE_4K_SIZE);
 
-    // kdebug("path_len=%d", path_len);
     if (path_len >= PAGE_4K_SIZE)
         return -ENAMETOOLONG;
     else if (path_len <= 0)
@@ -316,12 +296,10 @@ uint64_t sys_execve(struct pt_regs *regs)
 
     memset(path, 0, path_len + 1);
 
-    // kdebug("before copy file path from user");
     // 拷贝文件路径
     strncpy_from_user(path, user_path, path_len);
     path[path_len] = '\0';
 
-    // kdebug("before do_execve, path = %s", path);
     // 执行新的程序
     uint64_t retval = do_execve(regs, path, argv, NULL);
 
@@ -362,6 +340,8 @@ uint64_t sys_wait4(struct pt_regs *regs)
         return -EINVAL;
 
     // 如果子进程没有退出，则等待其退出
+    // BUG: 这里存在问题，由于未对进程管理模块加锁，因此可能会出现子进程退出后，父进程还在等待的情况
+    // （子进程退出后，process_exit_notify消息丢失）
     while (child_proc->state != PROC_ZOMBIE)
         wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
 
@@ -390,7 +370,7 @@ uint64_t sys_nanosleep(struct pt_regs *regs)
     const struct timespec *rqtp = (const struct timespec *)regs->r8;
     struct timespec *rmtp = (struct timespec *)regs->r9;
 
-    return nanosleep(rqtp, rmtp);
+    return rs_nanosleep(rqtp, rmtp);
 }
 
 ul sys_ahci_end_req(struct pt_regs *regs)
@@ -402,7 +382,6 @@ ul sys_ahci_end_req(struct pt_regs *regs)
 // 系统调用的内核入口程序
 void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
 {
-
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }
@@ -412,6 +391,9 @@ uint64_t sys_pipe(struct pt_regs *regs)
 }
 
 extern uint64_t sys_mkdir(struct pt_regs *regs);
+
+extern int sys_dup(int oldfd);
+extern int sys_dup2(int oldfd, int newfd);
 
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,
@@ -442,5 +424,7 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [25] = sys_rt_sigreturn,
     [26] = sys_getpid,
     [27] = sys_sched,
-    [28 ... 255] = system_call_not_exists,
+    [28] = sys_dup,
+    [29] = sys_dup2,
+    [30 ... 255] = system_call_not_exists,
 };

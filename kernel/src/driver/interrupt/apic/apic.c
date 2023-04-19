@@ -456,7 +456,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
 
     // kdebug("before softirq");
     // 进入软中断处理程序
-    do_softirq();
+    rs_do_softirq();
 
     // kdebug("after softirq");
     // 检测当前进程是否持有自旋锁，若持有自旋锁，则不进行抢占式的进程调度

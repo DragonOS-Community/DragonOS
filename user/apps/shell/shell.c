@@ -1,6 +1,6 @@
 #include "cmd.h"
-#include <libKeyboard/keyboard.h>
 #include <fcntl.h>
+#include <libKeyboard/keyboard.h>
 #include <printf.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -22,12 +22,12 @@
 int shell_readline(int fd, char *buf);
 void print_ascii_logo();
 extern char *shell_current_path;
-//保存的历史命令(瞬时更改)
+// 保存的历史命令(瞬时更改)
 char history_commands[MEM_HISTORY][INPUT_BUFFER_SIZE];
-//真正的历史命令
+// 真正的历史命令
 char real_history_commands[MEM_HISTORY][INPUT_BUFFER_SIZE];
 int count_history;
-//现在对应的命令
+// 现在对应的命令
 int current_command_index;
 /**
  * @brief shell主循环
@@ -51,12 +51,12 @@ void main_loop(int kb_fd)
     {
         int argc = 0;
         char **argv;
-        
+
         printf("[DragonOS] %s # ", shell_current_path);
-        
+
         memset(input_buffer, 0, INPUT_BUFFER_SIZE);
 
-        //添加初始光标
+        // 添加初始光标
         put_string(" ", COLOR_BLACK, COLOR_WHITE);
 
         // 循环读取每一行到buffer
@@ -90,14 +90,14 @@ void main_loop(int kb_fd)
 int main()
 {
     // 打开键盘文件
-    char kb_file_path[] = "/dev/char/ps2_keyboard";
+    // char kb_file_path[] = "/dev/char/ps2_keyboard";
 
-    int kb_fd = open(kb_file_path, 0);
+    // int kb_fd = open(kb_file_path, 0);
     print_ascii_logo();
     // printf("before mkdir\n");
     // mkdir("/aaac", 0);
     // printf("after mkdir\n");
-    main_loop(kb_fd);
+    main_loop(0);
     while (1)
         ;
 }
@@ -122,22 +122,22 @@ void clear_command(int count, char *buf)
 void change_command(char *buf, int type)
 {
     current_command_index -= type;
-    //处理边界
+    // 处理边界
     if (current_command_index < 0)
         current_command_index++;
     if (current_command_index >= count_history - 1)
     {
-        //初始只含一条空历史记录，需单独考虑
-        if(count_history == 1)
+        // 初始只含一条空历史记录，需单独考虑
+        if (count_history == 1)
         {
-            //防止出现多条空历史记录
-            if(current_command_index > 1)
+            // 防止出现多条空历史记录
+            if (current_command_index > 1)
                 current_command_index = 1;
         }
         else
             current_command_index = count_history - 2;
     }
-        
+
     strcpy(buf, history_commands[current_command_index]);
     printf("%s", buf);
     put_string(" ", COLOR_BLACK, COLOR_WHITE);
@@ -155,29 +155,48 @@ int shell_readline(int fd, char *buf)
     int count = 0;
     while (1)
     {
-        key = keyboard_analyze_keycode(fd);
-        //向上方向键
-        if (count_history != 0 && key == 0xc8)
+        // key = keyboard_analyze_keycode(fd);
+        key = getchar();
+        // printf("key = %d\n", key);
+        if (key == 224)
         {
-            // put_string(" ", COLOR_WHITE, COLOR_BLACK);
-            printf("%c", '\b');
-            clear_command(count, buf);
-            count = 0;
-            //向历史
-            change_command(buf, 1);
-            count = strlen(buf);
+            key = getchar();
+            // printf("key = %d\n", key);
+            switch (key)
+            {
+            case 72:
+                // 向上方向键
+                if (count_history != 0)
+                {
+                    // put_string(" ", COLOR_WHITE, COLOR_BLACK);
+                    printf("%c", '\b');
+                    clear_command(count, buf);
+                    count = 0;
+                    // 向历史
+                    change_command(buf, 1);
+                    count = strlen(buf);
+                }
+                key = 0xc8;
+                break;
+            case 80:
+                // 向下方向键
+                if (count_history != 0)
+                {
+                    // put_string(" ", COLOR_WHITE, COLOR_BLACK);
+                    printf("%c", '\b');
+                    clear_command(count, buf);
+                    count = 0;
+                    // 向历史
+                    change_command(buf, -1);
+                    count = strlen(buf);
+                }
+                key = 0x50;
+                break;
+            default:
+                break;
+            }
         }
-        //向下方向键
-        if (count_history != 0 && key == 0x50)
-        {
-            // put_string(" ", COLOR_WHITE, COLOR_BLACK);
-            printf("%c", '\b');
-            clear_command(count, buf);
-            count = 0;
-            //向现在
-            change_command(buf, -1);
-            count = strlen(buf);
-        }
+
         if (key == '\n')
         {
             if (count > 0 && current_command_index >= count_history)

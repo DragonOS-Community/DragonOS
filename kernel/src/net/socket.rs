@@ -8,6 +8,7 @@ use smoltcp::{
 
 use crate::{
     arch::rand::rand,
+    driver::net::NetDriver,
     filesystem::vfs::{FileType, IndexNode, Metadata, PollStatus},
     kdebug, kerror, kwarn,
     libs::{
@@ -314,11 +315,28 @@ impl UdpSocket {
 
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
-        
+
         return Self {
             handle,
             remote_endpoint: None,
             options,
+        };
+    }
+
+    fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::Ip(Some(ip)) = endpoint {
+            let bind_res = if ip.addr.is_unspecified() {
+                socket.bind(ip.port)
+            } else {
+                socket.bind(ip)
+            };
+
+            match bind_res {
+                Ok(()) => return Ok(()),
+                Err(_) => return Err(SystemError::EINVAL),
+            }
+        } else {
+            return Err(SystemError::EINVAL);
         };
     }
 }
@@ -353,6 +371,7 @@ impl Socket for UdpSocket {
     }
 
     fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+        kdebug!("udp to send: {:?}, len={}", to, buf.len());
         let remote_endpoint: &wire::IpEndpoint = {
             if let Some(Endpoint::Ip(Some(ref endpoint))) = to {
                 endpoint
@@ -362,47 +381,53 @@ impl Socket for UdpSocket {
                 return Err(SystemError::ENOTCONN);
             }
         };
+        kdebug!("udp write: remote = {:?}", remote_endpoint);
 
         let mut socket_set_guard = SOCKET_SET.lock();
         let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
-
+        kdebug!("is open()={}", socket.is_open());
+        kdebug!("socket endpoint={:?}", socket.endpoint());
         if socket.endpoint().port == 0 {
             let temp_port = get_ephemeral_port();
 
-            match remote_endpoint.addr {
+            let local_ep = match remote_endpoint.addr {
                 // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
                 // 否则就用 self.endpoint().addr.unwrap()
                 wire::IpAddress::Ipv4(_) => {
-                    socket
-                        .bind(wire::IpEndpoint::new(
-                            smoltcp::wire::IpAddress::Ipv4(wire::Ipv4Address::UNSPECIFIED),
-                            temp_port,
-                        ))
-                        .unwrap();
+                    Endpoint::Ip(Some(wire::IpEndpoint::new(
+                        smoltcp::wire::IpAddress::Ipv4(wire::Ipv4Address::UNSPECIFIED),
+                        temp_port,
+                    )))
                 }
                 wire::IpAddress::Ipv6(_) => {
-                    socket
-                        .bind(wire::IpEndpoint::new(
-                            smoltcp::wire::IpAddress::Ipv6(wire::Ipv6Address::UNSPECIFIED),
-                            temp_port,
-                        ))
-                        .unwrap();
+                    Endpoint::Ip(Some(wire::IpEndpoint::new(
+                        smoltcp::wire::IpAddress::Ipv6(wire::Ipv6Address::UNSPECIFIED),
+                        temp_port,
+                    )))
                 }
-            }
+            };
+            kdebug!("udp write: local_ep = {:?}", local_ep);
+            self.do_bind(socket, local_ep)?;
         }
-
+        kdebug!("is open()={}", socket.is_open());
         if socket.can_send() {
+            kdebug!("udp write: can send");
             match socket.send_slice(&buf, *remote_endpoint) {
                 Ok(()) => {
+                    kdebug!("udp write: send ok");
                     // avoid deadlock
                     drop(socket);
                     drop(socket_set_guard);
                     poll_ifaces();
                     return Ok(buf.len());
                 }
-                Err(_) => return Err(SystemError::ENOBUFS),
+                Err(_) => {
+                    kdebug!("udp write: send err");
+                    return Err(SystemError::ENOBUFS);
+                }
             }
         } else {
+            kdebug!("udp write: can not send");
             return Err(SystemError::ENOBUFS);
         };
     }
@@ -411,20 +436,8 @@ impl Socket for UdpSocket {
         let mut sockets = SOCKET_SET.lock();
         let socket = sockets.get_mut::<udp::Socket>(self.handle.0);
         kdebug!("UDP Bind to {:?}", endpoint);
-        if let Endpoint::Ip(Some(ip)) = endpoint {
-            let bind_res = if ip.addr.is_unspecified() {
-                socket.bind(ip.port)
-            } else {
-                socket.bind(ip)
-            };
-
-            match bind_res {
-                Ok(()) => return Ok(()),
-                Err(_) => return Err(SystemError::EINVAL),
-            }
-        } else {
-            return Err(SystemError::EINVAL);
-        };
+        return self.do_bind(socket, endpoint);
+        
     }
 
     fn poll(&self) -> (bool, bool, bool) {
@@ -645,28 +658,39 @@ impl Socket for TcpSocket {
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = get_ephemeral_port();
-            let iface = NET_DRIVERS.write().get(&0).unwrap().clone();
+            kdebug!("temp_port: {}", temp_port);
+            let iface: Arc<dyn NetDriver> = NET_DRIVERS.write().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
+            kdebug!("to connect: {ip:?}");
+            let routes = inner_iface.routes();
+            kdebug!("routes: {routes:?}");
             match socket.connect(&mut inner_iface.context(), ip, temp_port) {
                 Ok(()) => {
+                    drop(inner_iface);
+                    drop(iface);
                     drop(socket);
                     drop(sockets);
-
+                    kdebug!("syn sent, wait for syn ack");
                     loop {
+                        kdebug!("to poll ifaces");
                         poll_ifaces();
+                        kdebug!("poll ok");
                         let mut sockets = SOCKET_SET.lock();
                         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
                         match socket.state() {
                             tcp::State::Established => {
+                                kdebug!("connected");
                                 return Ok(());
                             }
                             tcp::State::SynSent => {
+                                kdebug!("syn sent");
                                 drop(socket);
                                 drop(sockets);
                                 SOCKET_WAITQUEUE.sleep();
                             }
                             _ => {
+                                kdebug!("connection refused");
                                 return Err(SystemError::ECONNREFUSED);
                             }
                         }

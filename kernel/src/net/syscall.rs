@@ -12,7 +12,10 @@ use crate::{
     },
     include::bindings::bindings::{pt_regs, verify_area},
     kdebug,
-    net::{socket::{AddressFamily, SOL_SOCKET}, net_core::poll_ifaces},
+    net::{
+        net_core::poll_ifaces,
+        socket::{AddressFamily, SOL_SOCKET},
+    },
     syscall::SystemError,
 };
 
@@ -210,11 +213,12 @@ pub fn do_getsockopt(
 }
 
 #[no_mangle]
-pub extern "C" fn sys_connect(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_connect(regs: &pt_regs) -> i64 {
     let fd = regs.r8 as usize;
     let addr = regs.r9 as usize;
     let addrlen = regs.r10 as usize;
-    return do_connect(fd, addr as *const SockAddr, addrlen).unwrap_or_else(|e| e.to_posix_errno());
+    return do_connect(fd, addr as *const SockAddr, addrlen)
+        .unwrap_or_else(|e| e.to_posix_errno() as i64);
 }
 
 /// @brief sys_connect系统调用的实际执行函数
@@ -224,12 +228,13 @@ pub extern "C" fn sys_connect(regs: &pt_regs) -> i32 {
 /// @param addrlen 地址长度
 ///
 /// @return 成功返回0，失败返回错误码
-pub fn do_connect(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<i32, SystemError> {
+pub fn do_connect(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<i64, SystemError> {
     let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
     let mut socket = socket.inner();
+    kdebug!("connect to {:?}...", endpoint);
     socket.connect(endpoint)?;
     return Ok(0);
 }
@@ -362,13 +367,12 @@ pub fn do_recvfrom(
         addrlen as usize
     );
 
-    
     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     let socket: Arc<SocketInode> = current_pcb()
         .get_socket(fd as i32)
         .ok_or(SystemError::EBADF)?;
     let socket = socket.inner();
-    
+
     let (n, endpoint) = socket.read(buf);
     drop(socket);
 

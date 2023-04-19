@@ -100,6 +100,9 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-    net_init().expect("Failed to init network");
+    let r= net_init();
+    if r.is_err(){
+        kwarn!("net_init() failed: {:?}", r.err().unwrap());
+    }
     return 0;
 }

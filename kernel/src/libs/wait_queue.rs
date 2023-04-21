@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloc::collections::LinkedList;
+use alloc::{collections::LinkedList, vec::Vec};
 
 use crate::{
     arch::{asm::current::current_pcb, sched::sched},
@@ -124,6 +124,33 @@ impl WaitQueue {
             return true;
         } else {
             return false;
+        }
+    }
+
+    /// @brief 唤醒在队列中，符合条件的所有进程。
+    ///
+    /// @param state 用于判断的state，如果队列中第一个进程的state与它进行and操作之后，结果不为0,则唤醒这个进程。
+    pub fn wakeup_all(&self, state: u64) {
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
+        // 如果队列为空，则返回
+        if guard.wait_list.is_empty() {
+            return;
+        }
+
+        let mut to_push_back: Vec<&mut process_control_block> = Vec::new();
+        // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
+        while let Some(to_wakeup) = guard.wait_list.pop_front() {
+            if (to_wakeup.state & state) != 0 {
+                unsafe {
+                    process_wakeup(to_wakeup);
+                }
+            } else {
+                to_push_back.push(to_wakeup);
+            }
+        }
+
+        for to_wakeup in to_push_back {
+            guard.wait_list.push_back(to_wakeup);
         }
     }
 

@@ -3,14 +3,14 @@
 pub mod core;
 pub mod file;
 pub mod mount;
-mod syscall;
+pub mod syscall;
 mod utils;
 
 use ::core::{any::Any, fmt::Debug};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{syscall::SystemError, time::TimeSpec};
+use crate::{libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec};
 
 use self::{core::generate_inode_id, file::FileMode};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
@@ -36,6 +36,8 @@ pub enum FileType {
     Pipe,
     /// 符号链接
     SymLink,
+    /// 套接字
+    Socket,
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -68,20 +70,18 @@ impl FileType {
             FileType::CharDevice => DT_CHR,
             FileType::Pipe => DT_FIFO,
             FileType::SymLink => DT_LNK,
+            FileType::Socket => DT_SOCK,
         };
     }
 }
 
-/// @brief inode的状态（由poll方法返回）
-#[derive(Debug, Default, PartialEq)]
-pub struct PollStatus {
-    pub flags: u8,
-}
-
-impl PollStatus {
-    pub const WRITE_MASK: u8 = (1u8 << 0);
-    pub const READ_MASK: u8 = (1u8 << 1);
-    pub const ERR_MASK: u8 = (1u8 << 2);
+bitflags! {
+    /// @brief inode的状态（由poll方法返回）
+    pub struct PollStatus: u8 {
+        const WRITE = 1u8 << 0;
+        const READ = 1u8 << 1;
+        const ERROR = 1u8 << 2;
+    }
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug {
@@ -336,6 +336,12 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 }
 
+impl DowncastArc for dyn IndexNode {
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
+        self
+    }
+}
+
 impl dyn IndexNode {
     /// @brief 将当前Inode转换为一个具体的结构体（类型由T指定）
     /// 如果类型正确，则返回Some,否则返回None
@@ -480,6 +486,27 @@ pub struct Metadata {
 
     /// 文件指向的设备的id（对于设备文件系统来说）
     pub raw_dev: usize,
+}
+
+impl Default for Metadata {
+    fn default() -> Self {
+        return Self {
+            dev_id: 0,
+            inode_id: 0,
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: TimeSpec::default(),
+            mtime: TimeSpec::default(),
+            ctime: TimeSpec::default(),
+            file_type: FileType::File,
+            mode: 0,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            raw_dev: 0,
+        };
+    }
 }
 
 /// @brief 所有文件系统都应该实现的trait

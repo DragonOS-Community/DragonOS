@@ -22,6 +22,21 @@ extern uint64_t sys_sigaction(struct pt_regs *regs);
 extern uint64_t sys_rt_sigreturn(struct pt_regs *regs);
 extern uint64_t sys_getpid(struct pt_regs *regs);
 extern uint64_t sys_sched(struct pt_regs *regs);
+extern int sys_dup(int oldfd);
+extern int sys_dup2(int oldfd, int newfd);
+extern uint64_t sys_socket(struct pt_regs *regs);
+extern uint64_t sys_setsockopt(struct pt_regs *regs);
+extern uint64_t sys_getsockopt(struct pt_regs *regs);
+extern uint64_t sys_connect(struct pt_regs *regs);
+extern uint64_t sys_bind(struct pt_regs *regs);
+extern uint64_t sys_sendto(struct pt_regs *regs);
+extern uint64_t sys_recvfrom(struct pt_regs *regs);
+extern uint64_t sys_recvmsg(struct pt_regs *regs);
+extern uint64_t sys_listen(struct pt_regs *regs);
+extern uint64_t sys_shutdown(struct pt_regs *regs);
+extern uint64_t sys_accept(struct pt_regs *regs);
+extern uint64_t sys_getsockname(struct pt_regs *regs);
+extern uint64_t sys_getpeername(struct pt_regs *regs);
 
 /**
  * @brief 关闭文件系统调用
@@ -179,9 +194,9 @@ uint64_t sys_brk(struct pt_regs *regs)
     // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx
     // current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
     struct mm_struct *mm = current_pcb->mm;
-    if (new_brk < mm->brk_start || new_brk> new_brk >= current_pcb->addr_limit)
+    if (new_brk < mm->brk_start || new_brk > new_brk >= current_pcb->addr_limit)
         return mm->brk_end;
-    
+
     if (mm->brk_end == new_brk)
         return new_brk;
 
@@ -392,9 +407,6 @@ uint64_t sys_pipe(struct pt_regs *regs)
 
 extern uint64_t sys_mkdir(struct pt_regs *regs);
 
-extern int sys_dup(int oldfd);
-extern int sys_dup2(int oldfd, int newfd);
-
 system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [0] = system_call_not_exists,
     [1] = sys_put_string,
@@ -426,5 +438,18 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [27] = sys_sched,
     [28] = sys_dup,
     [29] = sys_dup2,
-    [30 ... 255] = system_call_not_exists,
+    [30] = sys_socket,
+    [31] = sys_setsockopt,
+    [32] = sys_getsockopt,
+    [33] = sys_connect,
+    [34] = sys_bind,
+    [35] = sys_sendto,
+    [36] = sys_recvfrom,
+    [37] = sys_recvmsg,
+    [38] = sys_listen,
+    [39] = sys_shutdown,
+    [40] = sys_accept,
+    [41] = sys_getsockname,
+    [42] = sys_getpeername,
+    [43 ... 255] = system_call_not_exists,
 };

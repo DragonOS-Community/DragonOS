@@ -1,5 +1,15 @@
-use super::{driver::Driver, Device, DeviceState, IdTable};
-use crate::libs::spinlock::SpinLock;
+use super::{
+    driver::Driver, 
+    Device, 
+    DeviceState, 
+    IdTable, 
+    DeviceError};
+use crate::{
+    filesystem::{
+        sysfs::{self, SYS_BUS_INODE},
+    },
+    libs::spinlock::SpinLock, kdebug,
+};
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::fmt::Debug;
 use lazy_static::lazy_static;
@@ -54,7 +64,27 @@ pub trait BusDriver: Driver {
 }
 
 /// @brief: 总线设备trait，所有总线都应实现该trait
-pub trait Bus: Device {}
+pub trait Bus: Device {
+    /// @brief: 注册bus，在sysfs中生成相应文件夹
+    /// @parameter name: 文件夹名
+    /// @return: 注册成功，返回()，注册失败，返回错误码
+    fn register_bus(&self, name: &str) -> Result<(), DeviceError> {
+        match self.register_device(name) {
+            Ok(_) => {
+                let bus = sysfs::bus::bus_register(name).unwrap();
+                kdebug!("After register_bus: ls /sys/bus/: {:?}", SYS_BUS_INODE().list());
+                match sysfs::bus::bus_init(&bus) {
+                    Ok(_) => {
+                        kdebug!("After register_bus: ls /sys/bus/{}: {:?}", name, bus.list());
+                        return Ok(());
+                    }
+                    Err(_) => Err(DeviceError::RegisterError),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
 
 /// @brief: 总线管理结构体
 #[derive(Debug, Clone)]

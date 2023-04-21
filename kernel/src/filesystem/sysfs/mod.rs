@@ -191,10 +191,8 @@ impl IndexNode for LockedSysFSInode {
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
-        });
+        
+        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

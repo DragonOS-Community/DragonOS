@@ -1,9 +1,5 @@
+use crate::filesystem::sysfs::devices::device_register;
 use core::{any::Any, fmt::Debug};
-use crate::{
-    filesystem::{
-        sysfs::devices::device_register,
-    },
-};
 
 pub mod bus;
 pub mod driver;

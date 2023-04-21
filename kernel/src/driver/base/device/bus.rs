@@ -1,14 +1,8 @@
-use super::{
-    driver::Driver, 
-    Device, 
-    DeviceState, 
-    IdTable, 
-    DeviceError};
+use super::{driver::Driver, Device, DeviceError, DeviceState, IdTable};
 use crate::{
-    filesystem::{
-        sysfs::{self, SYS_BUS_INODE},
-    },
-    libs::spinlock::SpinLock, kdebug,
+    filesystem::sysfs::{self, SYS_BUS_INODE},
+    kdebug,
+    libs::spinlock::SpinLock,
 };
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::fmt::Debug;
@@ -72,7 +66,10 @@ pub trait Bus: Device {
         match self.register_device(name) {
             Ok(_) => {
                 let bus = sysfs::bus::bus_register(name).unwrap();
-                kdebug!("After register_bus: ls /sys/bus/: {:?}", SYS_BUS_INODE().list());
+                kdebug!(
+                    "After register_bus: ls /sys/bus/: {:?}",
+                    SYS_BUS_INODE().list()
+                );
                 match sysfs::bus::bus_init(&bus) {
                     Ok(_) => {
                         kdebug!("After register_bus: ls /sys/bus/{}: {:?}", name, bus.list());

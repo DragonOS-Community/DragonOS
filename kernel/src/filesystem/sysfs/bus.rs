@@ -1,12 +1,6 @@
+use super::{LockedSysFSInode, SYS_BUS_INODE};
+use crate::{filesystem::vfs::IndexNode, kdebug, syscall::SystemError};
 use alloc::sync::Arc;
-use crate::{
-    filesystem::vfs::IndexNode, 
-    syscall::SystemError, kdebug
-};
-use super::{
-    LockedSysFSInode, 
-    SYS_BUS_INODE
-};
 
 /// @brief: 注册bus，在sys/bus下生成文件夹
 /// @parameter bus_name: 总线文件夹名
@@ -44,7 +38,9 @@ pub fn bus_unregister(bus_name: &str) -> Result<(), SystemError> {
 /// @return: 操作成功，返回devices inode和drivers inode，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn bus_init(inode: &Arc<dyn IndexNode>) -> Result<(Arc<dyn IndexNode>, Arc<dyn IndexNode>), SystemError> {
+pub fn bus_init(
+    inode: &Arc<dyn IndexNode>,
+) -> Result<(Arc<dyn IndexNode>, Arc<dyn IndexNode>), SystemError> {
     match inode.as_any_ref().downcast_ref::<LockedSysFSInode>() {
         Some(lock_bus) => match lock_bus.add_dir("devices") {
             Ok(devices) => match lock_bus.add_dir("drivers") {

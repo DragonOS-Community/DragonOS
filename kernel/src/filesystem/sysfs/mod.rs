@@ -191,7 +191,7 @@ impl IndexNode for LockedSysFSInode {
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-        
+
         return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 

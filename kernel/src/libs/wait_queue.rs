@@ -45,9 +45,19 @@ impl WaitQueue {
         current_pcb().state = PROC_INTERRUPTIBLE as u64;
         guard.wait_list.push_back(current_pcb());
         drop(guard);
+        
         sched();
     }
 
+    /// @brief 只sleep，不sched
+    pub fn sleep_without_sched(&self) {
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
+        current_pcb().state = PROC_INTERRUPTIBLE as u64;
+        guard.wait_list.push_back(current_pcb());
+        drop(guard);
+        
+       
+    }
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断
     pub fn sleep_uninterruptible(&self) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
@@ -112,6 +122,7 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         // 如果队列为空，则返回
         if guard.wait_list.is_empty() {
+            
             return false;
         }
 

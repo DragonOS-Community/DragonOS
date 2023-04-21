@@ -393,10 +393,9 @@ void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
     ul ret = system_call_table[regs->rax](regs);
     regs->rax = ret; // 返回码
 }
-uint64_t sys_pipe(struct pt_regs *regs)
-{
-    return -ENOTSUP;
-}
+
+extern uint64_t sys_pipe(struct pt_regs *regs);
+
 
 extern uint64_t sys_mkdir(struct pt_regs *regs);
 

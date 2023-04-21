@@ -65,7 +65,14 @@ pid_t fork(void)
 {
     return (pid_t)syscall_invoke(SYS_FORK, 0, 0, 0, 0, 0, 0, 0, 0);
 }
-
+/**
+ * @brief 调用匿名管道
+ *
+ * @return int 如果失败返回负数
+ */
+int pipe(int fd[2]){
+    return (int)syscall_invoke(SYS_PIPE, fd, 0, 0, 0, 0, 0, 0, 0);
+}
 /**
  * @brief fork当前进程，但是与父进程共享VM、flags、fd
  *

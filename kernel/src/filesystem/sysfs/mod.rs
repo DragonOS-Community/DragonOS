@@ -1,22 +1,68 @@
 use super::vfs::{
-    core::{generate_inode_id, ROOT_INODE},
-    file::FileMode,
-    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
+    core::generate_inode_id, file::FileMode, FileSystem, FileType, FsInfo, IndexNode, Metadata,
+    PollStatus,
 };
 use crate::{
-    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
     syscall::SystemError,
     time::TimeSpec,
 };
 use alloc::{
+    boxed::Box,
     collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::ptr::null_mut;
+
+pub mod bus;
+pub mod class;
+pub mod devices;
+pub mod fs;
 
 const SYSFS_MAX_NAMELEN: usize = 64;
+
+static mut __SYS_DEVICES_INODE: *mut Arc<dyn IndexNode> = null_mut();
+static mut __SYS_BUS_INODE: *mut Arc<dyn IndexNode> = null_mut();
+static mut __SYS_CLASS_INODE: *mut Arc<dyn IndexNode> = null_mut();
+static mut __SYS_FS_INODE: *mut Arc<dyn IndexNode> = null_mut();
+
+/// @brief 获取全局的sys/devices节点
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn SYS_DEVICES_INODE() -> Arc<dyn IndexNode> {
+    unsafe {
+        return __SYS_DEVICES_INODE.as_ref().unwrap().clone();
+    }
+}
+
+/// @brief 获取全局的sys/bus节点
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn SYS_BUS_INODE() -> Arc<dyn IndexNode> {
+    unsafe {
+        return __SYS_BUS_INODE.as_ref().unwrap().clone();
+    }
+}
+
+/// @brief 获取全局的sys/class节点
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn SYS_CLASS_INODE() -> Arc<dyn IndexNode> {
+    unsafe {
+        return __SYS_CLASS_INODE.as_ref().unwrap().clone();
+    }
+}
+
+/// @brief 获取全局的sys/fs节点
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn SYS_FS_INODE() -> Arc<dyn IndexNode> {
+    unsafe {
+        return __SYS_FS_INODE.as_ref().unwrap().clone();
+    }
+}
 
 /// @brief dev文件系统
 #[derive(Debug)]
@@ -63,19 +109,35 @@ impl SysFS {
 
         // 创建文件夹
         let root: &Arc<LockedSysFSInode> = &sysfs.root_inode;
-        root.add_dir("devices")
-            .expect("SysFS: Failed to create /sys/devices");
+        match root.add_dir("devices") {
+            Ok(devices) => unsafe {
+                __SYS_DEVICES_INODE = Box::leak(Box::new(devices));
+            },
+            Err(_) => panic!("SysFS: Failed to create /sys/devices"),
+        }
 
-        root.add_dir("class")
-            .expect("SysFS: Failed to create /sys/class");
+        match root.add_dir("bus") {
+            Ok(bus) => unsafe {
+                __SYS_BUS_INODE = Box::leak(Box::new(bus));
+            },
+            Err(_) => panic!("SysFS: Failed to create /sys/bus"),
+        }
 
-        root.add_dir("bus")
-            .expect("SysFS: Failed to create /sys/bus");
+        match root.add_dir("class") {
+            Ok(class) => unsafe {
+                __SYS_CLASS_INODE = Box::leak(Box::new(class));
+            },
+            Err(_) => panic!("SysFS: Failed to create /sys/class"),
+        }
 
-        root.add_dir("fs")
-            .expect("SysFS: Failed to create /sys/fs");
-
-        // kdebug!("ls /sys: {:?}", root.list());
+        match root.add_dir("fs") {
+            Ok(fs) => unsafe {
+                __SYS_FS_INODE = Box::leak(Box::new(fs));
+            },
+            Err(_) => panic!("SysFS: Failed to create /sys/fs"),
+        }
+        // 初始化platform总线
+        crate::driver::base::platform::platform_bus_init();
         return sysfs;
     }
 }
@@ -103,9 +165,9 @@ impl IndexNode for LockedSysFSInode {
 
     fn read_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut super::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -113,9 +175,9 @@ impl IndexNode for LockedSysFSInode {
 
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
         _data: &mut super::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -169,7 +231,7 @@ impl IndexNode for LockedSysFSInode {
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
-                    _ => panic!("Devfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    _ => panic!("Sysfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                 }
             }
         }
@@ -191,6 +253,10 @@ impl IndexNode for LockedSysFSInode {
             }
             name => {
                 // 在子目录项中查找
+                // match inode.children.get(name) {
+                //     Some(_) => {}
+                //     None => kdebug!("Sysfs find {} error", name),
+                // }
                 return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
             }
         }
@@ -265,7 +331,12 @@ impl LockedSysFSInode {
         return Ok(result);
     }
 
-    pub fn add_dir(&self, name: &str) -> Result<(), SystemError> {
+    /// @brief 在当前目录下，创建一个目录
+    /// @param name: 目录名
+    /// @return 成功返回目录inode, 失败返回Err(错误码)
+    #[inline]
+    #[allow(dead_code)]
+    pub fn add_dir(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let guard: SpinLockGuard<SysFSInode> = self.0.lock();
 
         if guard.children.contains_key(name) {
@@ -273,13 +344,52 @@ impl LockedSysFSInode {
         }
 
         match self.do_create_with_data(guard, name, FileType::Dir, 0o755 as u32, 0) {
-            Ok(inode) => inode,
+            Ok(inode) => return Ok(inode),
             Err(err) => {
                 return Err(err);
             }
         };
+    }
 
+    /// @brief 在当前目录下，创建一个二进制文件
+    /// @param name: 文件名
+    /// @return 成功返回Ok(()), 失败返回Err(错误码)
+    #[inline]
+    #[allow(dead_code)]
+    pub fn add_file(&self, name: &str, file: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let mut this = self.0.lock();
+
+        if this.children.contains_key(name) {
+            return Err(SystemError::EEXIST);
+        }
+
+        this.children.insert(name.to_string(), file);
         return Ok(());
+    }
+
+    /// @brief 为该inode创建符号链接
+    /// @param None
+    /// @return 当前inode弱引用
+    #[inline]
+    #[allow(dead_code)]
+    pub fn symbolic_link(&self) -> Weak<dyn IndexNode> {
+        return self.0.lock().self_ref.clone();
+    }
+
+    /// @brief 为该inode创建硬链接
+    /// @param None
+    /// @return 当前inode强引用
+    #[inline]
+    #[allow(dead_code)]
+    pub fn link(&self) -> Arc<dyn IndexNode> {
+        return self
+            .0
+            .lock()
+            .self_ref
+            .clone()
+            .upgrade()
+            .ok_or(SystemError::E2BIG)
+            .unwrap();
     }
 
     pub fn remove(&self, name: &str) -> Result<(), SystemError> {

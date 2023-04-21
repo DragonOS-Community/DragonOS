@@ -1,11 +1,5 @@
-use super::{
-    LockedSysFSInode, 
-    SYS_CLASS_INODE
-};
-use crate::{
-    filesystem::vfs::IndexNode, 
-    syscall::SystemError
-};
+use super::{LockedSysFSInode, SYS_CLASS_INODE};
+use crate::{filesystem::vfs::IndexNode, syscall::SystemError};
 use alloc::sync::Arc;
 
 /// @brief: 注册class，在sys/class下生成文件夹

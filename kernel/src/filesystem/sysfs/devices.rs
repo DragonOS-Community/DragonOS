@@ -1,11 +1,5 @@
-use super::{
-    LockedSysFSInode, 
-    SYS_DEVICES_INODE
-};
-use crate::{
-    filesystem::vfs::IndexNode, 
-    syscall::SystemError
-};
+use super::{LockedSysFSInode, SYS_DEVICES_INODE};
+use crate::{filesystem::vfs::IndexNode, syscall::SystemError};
 use alloc::sync::Arc;
 
 /// @brief: 注册device，在sys/devices下生成文件夹

@@ -191,7 +191,7 @@ impl IndexNode for LockedSysFSInode {
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-        
+
         return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
@@ -363,15 +363,6 @@ impl LockedSysFSInode {
 
         this.children.insert(name.to_string(), file);
         return Ok(());
-    }
-
-    /// @brief 为该inode创建符号链接
-    /// @param None
-    /// @return 当前inode弱引用
-    #[inline]
-    #[allow(dead_code)]
-    pub fn symbolic_link(&self) -> Weak<dyn IndexNode> {
-        return self.0.lock().self_ref.clone();
     }
 
     /// @brief 为该inode创建硬链接

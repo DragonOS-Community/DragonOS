@@ -1,11 +1,5 @@
-use super::{
-    LockedSysFSInode, 
-    SYS_FS_INODE
-};
-use crate::{
-    filesystem::vfs::IndexNode, 
-    syscall::SystemError
-};
+use super::{LockedSysFSInode, SYS_FS_INODE};
+use crate::{filesystem::vfs::IndexNode, syscall::SystemError};
 use alloc::sync::Arc;
 
 /// @brief: 注册fs，在sys/fs下是生成文件夹

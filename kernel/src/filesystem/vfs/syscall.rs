@@ -436,38 +436,7 @@ pub extern "C" fn sys_dup2(regs: &pt_regs) -> u64 {
     }
 }
 
-#[no_mangle]
-/// @brief 调用匿名管道
-pub extern "C" fn sys_pipe(regs: &pt_regs) -> u64 {
-    let fd =  regs.r8 as *mut i32 ;
-    let pipe_ptr = LockedPipeInode::new();
-    let read_file =File::new(
-        pipe_ptr.clone(),
-        FileMode::O_RDONLY,
 
-    );
-    let write_file = File::new(
-        pipe_ptr.clone(),
-        FileMode::O_WRONLY,
-
-    );
-    
-    let read_fd =  current_pcb().alloc_fd(read_file.unwrap(),None);
-    if !read_fd.is_ok() {
-        return read_fd.unwrap_err().to_posix_errno() as u64;
-    }
-    
-    let write_fd =  current_pcb().alloc_fd(write_file.unwrap(),None);
-    if !write_fd.is_ok() {
-        return write_fd.unwrap_err().to_posix_errno() as u64;
-    }
-    unsafe {
-        *fd.offset(0) = read_fd.unwrap();
-        *fd.offset(1) = write_fd.unwrap();
-    }
-    return 0;
-
-}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {

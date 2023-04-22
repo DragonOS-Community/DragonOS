@@ -82,14 +82,6 @@ uint64_t sys_sbrk(struct pt_regs *regs);
  */
 uint64_t sys_mkdir(struct pt_regs *regs);
 
-/**
- * @brief 创建管道
- * 
- * @param fd(r8) 文件句柄指针
- *
- * @return uint64_t
- */
-uint64_t sys_pipe(struct pt_regs *regs);
 
 ul sys_ahci_end_req(struct pt_regs *regs);
 

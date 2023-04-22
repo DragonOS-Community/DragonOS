@@ -11,7 +11,7 @@ use crate::{
     },
     io::SeekFrom,
     kerror,
-    syscall::SystemError, ipc::pipe::LockedPipeInode,
+    syscall::SystemError,
 };
 
 use super::{
@@ -435,7 +435,6 @@ pub extern "C" fn sys_dup2(regs: &pt_regs) -> u64 {
         return r.unwrap_err().to_posix_errno() as u64;
     }
 }
-
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

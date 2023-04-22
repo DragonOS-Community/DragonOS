@@ -2,10 +2,10 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
-#include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
 #define buf_SIZE 256 // 定义消息的最大长度
 int shell_pipe_test(int argc, char **argv)
 {
@@ -78,7 +78,6 @@ int shell_pipe_test(int argc, char **argv)
         }
         close(fd[1]); // 关闭管道的写端
         wait(NULL);   // 等待子进程结束
-        exit(0);
     }
     return 0;
 }

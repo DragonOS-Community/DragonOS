@@ -176,7 +176,7 @@
         "lz4.h": "c",
         "cmd_test.h": "c"
     },
-    "C_Cpp.errorSquiggles": "disabled",
+    "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",
     "rust-analyzer.cargo.target": "x86_64-unknown-none",
     "rust-analyzer.checkOnSave.allTargets": false

@@ -1,12 +1,16 @@
-use crate::arch::sched::sched;
-use crate::filesystem::vfs::core::generate_inode_id;
-use crate::filesystem::vfs::{
-    FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
+use crate::{
+    arch::{sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
+    filesystem::vfs::{
+        core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+        PollStatus,
+    },
+    include::bindings::bindings::PROC_INTERRUPTIBLE,
+    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    syscall::SystemError,
+    time::TimeSpec, kdebug,
 };
-use crate::include::bindings::bindings::PROC_INTERRUPTIBLE;
-use crate::libs::{spinlock::SpinLock, wait_queue::WaitQueue};
-use crate::syscall::SystemError;
-use crate::time::TimeSpec;
+
 use alloc::sync::{Arc, Weak};
 
 /// 我们设定pipe_buff的总大小为1024字节
@@ -86,8 +90,13 @@ impl IndexNode for LockedPipeInode {
             inode.write_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
 
             // 在读等待队列中睡眠，并释放锁
-            inode.read_wait_queue.sleep_without_sched();
-            drop(inode);
+            unsafe {
+                let irq_guard = CurrentIrqArch::save_and_disable_irq();
+                inode.read_wait_queue.sleep_without_schedule();
+                drop(inode);
+                kdebug!("to drop irq_guard");
+                drop(irq_guard);
+            }
             sched();
             inode = self.0.lock();
         }
@@ -163,8 +172,12 @@ impl IndexNode for LockedPipeInode {
             // 唤醒读端
             inode.read_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
             // 解锁并睡眠
-            inode.write_wait_queue.sleep_without_sched();
-            drop(inode);
+            unsafe {
+                let irq_guard = CurrentIrqArch::save_and_disable_irq();
+                inode.write_wait_queue.sleep_without_schedule();
+                drop(inode);
+                drop(irq_guard);
+            }
             sched();
             inode = self.0.lock();
         }

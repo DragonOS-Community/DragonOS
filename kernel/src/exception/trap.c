@@ -245,8 +245,9 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
     printk_color(RED, BLACK, "CR2:%#018lx\n", cr2);
 
     traceback(regs);
-    current_pcb->state = PROC_STOPPED;
-    sched();
+    process_do_exit(-1);
+    // current_pcb->state = PROC_STOPPED;
+    // sched();
 }
 
 // 15 Intel保留，请勿使用

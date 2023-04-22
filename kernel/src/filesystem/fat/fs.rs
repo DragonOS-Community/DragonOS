@@ -20,8 +20,8 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
-    time::TimeSpec,
     syscall::SystemError,
+    time::TimeSpec,
 };
 
 use super::{
@@ -1411,9 +1411,7 @@ impl IndexNode for LockedFATInode {
             return Err(SystemError::EISDIR);
         }
 
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
-        });
+        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn create(
@@ -1441,7 +1439,7 @@ impl IndexNode for LockedFATInode {
                     return Ok(guard.find(name)?);
                 }
 
-                FileType::SymLink => return Err(SystemError::ENOTSUP),
+                FileType::SymLink => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
                 _ => return Err(SystemError::EINVAL),
             },
             FATDirEntry::UnInit => {
@@ -1569,7 +1567,8 @@ impl IndexNode for LockedFATInode {
         dir.check_existence(name, Some(true), guard.fs.upgrade().unwrap())?;
 
         // 再从磁盘删除
-        let r: Result<(), SystemError> = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
+        let r: Result<(), SystemError> =
+            dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
         if r.is_ok() {
             return r;
         } else {

@@ -147,6 +147,7 @@ void system_initialize()
     // ps2_mouse_init();
     // ata_init();
     pci_init();
+    rs_pci_init();
     io_mfence();
 
     // test_slab();

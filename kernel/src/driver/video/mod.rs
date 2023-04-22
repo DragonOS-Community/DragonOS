@@ -1,23 +1,26 @@
-use core::{ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
+use core::{
+    ptr::null_mut,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use alloc::sync::Arc;
 
 use crate::{
-    exception::softirq::{SoftirqNumber, SoftirqVec, softirq_vectors},
+    exception::softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
     include::bindings::bindings::video_refresh_framebuffer,
 };
 
 #[derive(Debug)]
-pub struct VideoRefreshFramebuffer{
-    running: AtomicBool
+pub struct VideoRefreshFramebuffer {
+    running: AtomicBool,
 }
 
 impl SoftirqVec for VideoRefreshFramebuffer {
     fn run(&self) {
-        if self.set_run() == false{
+        if self.set_run() == false {
             return;
         }
-        
+
         unsafe {
             video_refresh_framebuffer(null_mut());
         }
@@ -28,7 +31,7 @@ impl SoftirqVec for VideoRefreshFramebuffer {
 impl VideoRefreshFramebuffer {
     pub fn new() -> VideoRefreshFramebuffer {
         VideoRefreshFramebuffer {
-            running: AtomicBool::new(false)
+            running: AtomicBool::new(false),
         }
     }
 

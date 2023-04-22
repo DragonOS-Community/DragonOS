@@ -95,7 +95,11 @@ pid_t vfork(void)
 uint64_t brk(uint64_t end_brk)
 {
     uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0, 0, 0);
-    return x;
+    if (x < end_brk){
+        errno = -ENOMEM;
+        return -1;
+    }
+    return 0;
 }
 
 /**

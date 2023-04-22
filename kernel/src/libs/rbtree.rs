@@ -12,13 +12,13 @@
 #![allow(dead_code)]
 
 use core::cmp::Ord;
-use core::fmt::{self, Debug};
 use core::cmp::Ordering;
-use core::ptr;
-use core::iter::{IntoIterator, FromIterator};
+use core::fmt::{self, Debug};
+use core::iter::{FromIterator, IntoIterator};
 use core::marker;
 use core::mem;
 use core::ops::Index;
+use core::ptr;
 
 use alloc::boxed::Box;
 
@@ -234,7 +234,6 @@ impl<K: Ord, V> NodePtr<K, V> {
         unsafe { (*self.0).right = right }
     }
 
-
     #[inline]
     fn parent(&self) -> NodePtr<K, V> {
         if self.is_null() {
@@ -421,9 +420,8 @@ where
             return false;
         }
 
-        self.iter().all(|(key, value)| {
-            other.get(key).map_or(false, |v| *value == *v)
-        })
+        self.iter()
+            .all(|(key, value)| other.get(key).map_or(false, |v| *value == *v))
     }
 }
 
@@ -445,7 +443,6 @@ where
         self.get(index).expect("no entry found for key")
     }
 }
-
 
 impl<K: Ord, V> FromIterator<(K, V)> for RBTree<K, V> {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> RBTree<K, V> {
@@ -483,7 +480,9 @@ pub struct Keys<'a, K: Ord + 'a, V: 'a> {
 
 impl<'a, K: Ord, V> Clone for Keys<'a, K, V> {
     fn clone(&self) -> Keys<'a, K, V> {
-        Keys { inner: self.inner.clone() }
+        Keys {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -526,7 +525,9 @@ pub struct Values<'a, K: 'a + Ord, V: 'a> {
 
 impl<'a, K: Ord, V> Clone for Values<'a, K, V> {
     fn clone(&self) -> Values<'a, K, V> {
-        Values { inner: self.inner.clone() }
+        Values {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -535,7 +536,6 @@ impl<'a, K: Ord + Debug, V: Debug> fmt::Debug for Values<'a, K, V> {
         f.debug_list().entries(self.clone()).finish()
     }
 }
-
 
 impl<'a, K: Ord, V> Iterator for Values<'a, K, V> {
     type Item = &'a V;
@@ -573,7 +573,9 @@ pub struct ValuesMut<'a, K: 'a + Ord, V: 'a> {
 
 impl<'a, K: Ord, V> Clone for ValuesMut<'a, K, V> {
     fn clone(&self) -> ValuesMut<'a, K, V> {
-        ValuesMut { inner: self.inner.clone() }
+        ValuesMut {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -811,7 +813,6 @@ impl<'a, K: Ord + 'a, V: 'a> DoubleEndedIterator for IterMut<'a, K, V> {
         Some((k, v))
     }
 }
-
 
 impl<K: Ord, V> IntoIterator for RBTree<K, V> {
     type Item = (K, V);
@@ -1387,7 +1388,9 @@ impl<K: Ord, V> RBTree<K, V> {
     /// Return the value iter mut
     #[inline]
     pub fn values_mut(&mut self) -> ValuesMut<K, V> {
-        ValuesMut { inner: self.iter_mut() }
+        ValuesMut {
+            inner: self.iter_mut(),
+        }
     }
 
     /// Return the key and value iter
@@ -1440,7 +1443,6 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(*m.get(&2).unwrap(), 6);
     }
-
 
     #[test]
     fn test_clone() {

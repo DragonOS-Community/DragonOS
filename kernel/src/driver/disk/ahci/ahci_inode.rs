@@ -6,10 +6,7 @@ use crate::filesystem::vfs::{
 };
 use crate::io::device::BlockDevice;
 use crate::syscall::SystemError;
-use crate::{
-    libs::spinlock::SpinLock,
-    time::TimeSpec,
-};
+use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -79,11 +76,11 @@ impl IndexNode for LockedAhciInode {
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -95,7 +92,7 @@ impl IndexNode for LockedAhciInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        Err(SystemError::ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -111,9 +108,7 @@ impl IndexNode for LockedAhciInode {
     }
 
     fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
-        });
+        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写

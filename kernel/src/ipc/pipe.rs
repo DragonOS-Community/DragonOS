@@ -104,16 +104,14 @@ impl IndexNode for LockedPipeInode {
         }
 
         // 从管道拷贝数据到用户的缓冲区
-        let mut src = [0 as u8; PIPE_BUFF_SIZE];
-        if end < start {
-            src[0..(PIPE_BUFF_SIZE - 1 - start)]
-                .copy_from_slice(&inode.data[start..PIPE_BUFF_SIZE - 1]);
-            src[(PIPE_BUFF_SIZE - start)..].copy_from_slice(&inode.data[0..end])
-        } else {
-            src[0..num].copy_from_slice(&inode.data[start..end]);
-        }
 
-        buf[0..num].copy_from_slice(&src[0..num]);
+        if end < start {
+            buf[0..(PIPE_BUFF_SIZE - start)]
+                .copy_from_slice(&inode.data[start..PIPE_BUFF_SIZE ]);
+            buf[(PIPE_BUFF_SIZE - start)..num].copy_from_slice(&inode.data[0..end]);
+        } else {
+            buf[0..num].copy_from_slice(&inode.data[start..end]);
+        }
 
         //更新读位置以及valid_cnt
         inode.read_pos = (inode.read_pos + num as i32) % PIPE_BUFF_SIZE as i32;
@@ -177,8 +175,8 @@ impl IndexNode for LockedPipeInode {
         // 从用户的缓冲区拷贝数据到管道
 
         if end < start {
-            inode.data[start..PIPE_BUFF_SIZE - 1]
-                .copy_from_slice(&buf[0..(PIPE_BUFF_SIZE - 1 - start)]);
+            inode.data[start..PIPE_BUFF_SIZE]
+                .copy_from_slice(&buf[0..(PIPE_BUFF_SIZE - start)]);
             inode.data[0..end].copy_from_slice(&buf[(PIPE_BUFF_SIZE - start)..len]);
         } else {
             inode.data[start..end].copy_from_slice(&buf[0..len]);

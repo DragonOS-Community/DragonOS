@@ -54,11 +54,11 @@ pub struct IrqFlagsGuard {
 
 impl IrqFlagsGuard {
     /// @brief 创建IrqFlagsGuard对象
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// 该函数不安全，因为它不会检查flags是否是一个有效的IrqFlags对象, 而当它被drop时，会恢复flags中的中断状态
-    /// 
+    ///
     /// 该函数只应被`CurrentIrqArch::save_and_disable_irq`调用
     pub unsafe fn new(flags: IrqFlags) -> Self {
         IrqFlagsGuard { flags }

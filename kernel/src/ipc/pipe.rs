@@ -6,9 +6,10 @@ use crate::{
         PollStatus,
     },
     include::bindings::bindings::PROC_INTERRUPTIBLE,
+    kdebug,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     syscall::SystemError,
-    time::TimeSpec, kdebug,
+    time::TimeSpec,
 };
 
 use alloc::sync::{Arc, Weak};
@@ -115,8 +116,7 @@ impl IndexNode for LockedPipeInode {
         // 从管道拷贝数据到用户的缓冲区
 
         if end < start {
-            buf[0..(PIPE_BUFF_SIZE - start)]
-                .copy_from_slice(&inode.data[start..PIPE_BUFF_SIZE ]);
+            buf[0..(PIPE_BUFF_SIZE - start)].copy_from_slice(&inode.data[start..PIPE_BUFF_SIZE]);
             buf[(PIPE_BUFF_SIZE - start)..num].copy_from_slice(&inode.data[0..end]);
         } else {
             buf[0..num].copy_from_slice(&inode.data[start..end]);
@@ -188,8 +188,7 @@ impl IndexNode for LockedPipeInode {
         // 从用户的缓冲区拷贝数据到管道
 
         if end < start {
-            inode.data[start..PIPE_BUFF_SIZE]
-                .copy_from_slice(&buf[0..(PIPE_BUFF_SIZE - start)]);
+            inode.data[start..PIPE_BUFF_SIZE].copy_from_slice(&buf[0..(PIPE_BUFF_SIZE - start)]);
             inode.data[0..end].copy_from_slice(&buf[(PIPE_BUFF_SIZE - start)..len]);
         } else {
             inode.data[start..end].copy_from_slice(&buf[0..len]);

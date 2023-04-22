@@ -1,7 +1,10 @@
 #![allow(dead_code)]
-use core::{arch::asm, sync::atomic::{compiler_fence, Ordering}};
+use core::{
+    arch::asm,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
-use crate::{exception::{InterruptArch, IrqFlags, IrqFlagsGuard}, kdebug};
+use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard};
 
 use super::asm::irqflags::{local_irq_restore, local_irq_save};
 
@@ -49,9 +52,8 @@ impl InterruptArch for X86_64InterruptArch {
         compiler_fence(Ordering::SeqCst);
         return guard;
     }
-    
+
     unsafe fn restore_irq(flags: IrqFlags) {
-        kdebug!("restore_irq: {:#x}", flags.flags());
         compiler_fence(Ordering::SeqCst);
         local_irq_restore(&flags.flags());
         compiler_fence(Ordering::SeqCst);

@@ -157,7 +157,7 @@ impl IndexNode for LockedPipeInode {
         }
         // 加锁
 
-        let mut inode = self.0.try_lock().unwrap();
+        let mut inode = self.0.lock();
 
         // 如果管道空间不够
 

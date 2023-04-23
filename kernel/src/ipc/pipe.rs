@@ -6,7 +6,6 @@ use crate::{
         PollStatus,
     },
     include::bindings::bindings::PROC_INTERRUPTIBLE,
-    kdebug,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     syscall::SystemError,
     time::TimeSpec,
@@ -95,7 +94,7 @@ impl IndexNode for LockedPipeInode {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
                 inode.read_wait_queue.sleep_without_schedule();
                 drop(inode);
-                kdebug!("to drop irq_guard");
+                
                 drop(irq_guard);
             }
             sched();

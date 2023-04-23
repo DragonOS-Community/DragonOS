@@ -1,8 +1,4 @@
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    sync::Arc,
-};
+use alloc::{collections::BTreeMap, string::String, sync::Arc};
 
 use crate::{
     filesystem::{

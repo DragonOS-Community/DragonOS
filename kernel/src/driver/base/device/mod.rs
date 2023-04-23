@@ -57,7 +57,7 @@ impl IdTable {
     /// @parameter None
     /// @return: 设备名
     pub fn to_name(&self) -> String {
-        return self.0.to_string() + &':'.to_string() + &self.1.to_string();
+        return format!("{}:{}", self.0, self.1);
     }
 }
 

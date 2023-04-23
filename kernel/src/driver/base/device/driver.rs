@@ -34,6 +34,7 @@ pub trait Driver: Any + Send + Sync + Debug {
     fn get_sys_info(&self) -> Option<Arc<dyn IndexNode>>;
 }
 
+/// @brief: 驱动管理器(锁)
 #[derive(Debug)]
 pub struct LockedDriverManager(SpinLock<DriverManager>);
 
@@ -87,10 +88,11 @@ impl LockedDriverManager {
     }
 }
 
+/// @brief: 驱动管理器
 #[derive(Debug, Clone)]
 pub struct DriverManager {
     drivers: BTreeMap<IdTable, Arc<dyn Driver>>, // 所有驱动
-    sys_info: Option<Arc<dyn IndexNode>>, // sys information
+    sys_info: Option<Arc<dyn IndexNode>>,        // sys information
 }
 
 impl DriverManager {

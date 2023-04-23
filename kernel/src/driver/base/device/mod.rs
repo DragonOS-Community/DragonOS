@@ -52,7 +52,7 @@ impl IdTable {
     /// @parameter None
     /// @return: 设备名
     pub fn to_name(&self) -> String {
-        return self.0.to_string() + &self.1.to_string();
+        return self.0.to_string() + &':'.to_string() + &self.1.to_string();
     }
 }
 
@@ -174,7 +174,7 @@ impl LockedDeviceManager {
 #[derive(Debug, Clone)]
 pub struct DeviceManager {
     devices: BTreeMap<IdTable, Arc<dyn Device>>, // 所有设备
-    sys_info: Option<Arc<dyn IndexNode>>,  // sys information
+    sys_info: Option<Arc<dyn IndexNode>>,        // sys information
 }
 
 impl DeviceManager {

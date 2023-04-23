@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 /// @return: 操作成功，返回inode，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn class_register(class_name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+pub fn sys_class_register(class_name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
     let binding: Arc<dyn IndexNode> = SYS_CLASS_INODE();
     binding
         .as_any_ref()
@@ -22,7 +22,7 @@ pub fn class_register(class_name: &str) -> Result<Arc<dyn IndexNode>, SystemErro
 /// @return: 操作成功，返回()，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn class_unregister(class_name: &str) -> Result<(), SystemError> {
+pub fn sys_class_unregister(class_name: &str) -> Result<(), SystemError> {
     let binding: Arc<dyn IndexNode> = SYS_CLASS_INODE();
     binding
         .as_any_ref()
@@ -38,7 +38,7 @@ pub fn class_unregister(class_name: &str) -> Result<(), SystemError> {
 /// @return: 操作成功，返回inode，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn device_register(
+pub fn class_device_register(
     class: Arc<dyn IndexNode>,
     device_name: &str,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -56,7 +56,7 @@ pub fn device_register(
 /// @return: 操作成功，返回()，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn device_unregister(class: Arc<dyn IndexNode>, device_name: &str) -> Result<(), SystemError> {
+pub fn class_device_unregister(class: Arc<dyn IndexNode>, device_name: &str) -> Result<(), SystemError> {
     class
         .as_any_ref()
         .downcast_ref::<LockedSysFSInode>()

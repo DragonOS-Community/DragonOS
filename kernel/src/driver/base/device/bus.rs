@@ -17,6 +17,10 @@ use alloc::{collections::BTreeMap, sync::Arc};
 use core::fmt::Debug;
 use lazy_static::lazy_static;
 
+lazy_static! {
+    pub static ref BUS_MANAGER: Arc<LockedBusManager> = Arc::new(LockedBusManager::new());
+}
+
 /// @brief: 总线状态
 #[derive(Debug, Copy, Clone)]
 pub enum BusState {
@@ -162,13 +166,9 @@ impl LockedBusManager {
     /// @return: sys inode
     #[inline]
     #[allow(dead_code)]
-    fn get_sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         return self.0.lock().sys_info.clone();
     }
-}
-
-lazy_static! {
-    pub static ref BUS_MANAGER: Arc<LockedBusManager> = Arc::new(LockedBusManager::new());
 }
 
 /// @brief: 总线注册，将总线加入全局总线管理器中，并根据id table在sys/bus和sys/devices下生成文件夹

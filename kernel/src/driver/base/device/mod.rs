@@ -19,6 +19,10 @@ use core::{any::Any, fmt::Debug};
 pub mod bus;
 pub mod driver;
 
+lazy_static! {
+    pub static ref DEVICE_MANAGER: Arc<LockedDeviceManager> = Arc::new(LockedDeviceManager::new());
+}
+
 /// @brief: 设备类型
 #[allow(dead_code)]
 #[derive(Debug, Eq, PartialEq)]
@@ -165,7 +169,7 @@ impl LockedDeviceManager {
     /// @return: 设备实例
     #[inline]
     #[allow(dead_code)]
-    fn get_sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         return self.0.lock().sys_info.clone();
     }
 }
@@ -188,10 +192,6 @@ impl DeviceManager {
             sys_info: Some(SYS_DEVICES_INODE()),
         }
     }
-}
-
-lazy_static! {
-    pub static ref DEVICE_MANAGER: Arc<LockedDeviceManager> = Arc::new(LockedDeviceManager::new());
 }
 
 /// @brief: 设备注册

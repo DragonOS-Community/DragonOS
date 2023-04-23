@@ -3,7 +3,7 @@ use super::device::{
     driver::Driver,
     Device, DeviceError, DeviceState, DeviceType, IdTable,
 };
-use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock};
+use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -240,7 +240,7 @@ impl Driver for LockedPlatformBusDriver {
 
     #[inline]
     #[allow(dead_code)]
-    fn get_sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         return self.0.lock().sys_info.clone();
     }
 
@@ -378,21 +378,21 @@ impl Bus for LockedPlatform {}
 /// @brief: 初始化platform总线
 /// @parameter: None
 /// @return: None
-pub fn platform_bus_init() {
+pub fn platform_bus_init() -> Result<(), SystemError> {
     let platform_driver: Arc<LockedPlatformBusDriver> = Arc::new(LockedPlatformBusDriver::new());
     let platform_device: Arc<LockedPlatform> = Arc::new(LockedPlatform::new());
-    let _ = bus_register(platform_device.clone());
+    match bus_register(platform_device.clone()) {
+        Ok(_) => {}
+        Err(_) => {
+            return Err(SystemError::ESRMNT);
+        }
+    }
     platform_device.set_state(BusState::Initialized);
     platform_device.set_driver(Some(platform_driver.clone()));
-    let _ = bus_driver_register(platform_driver.clone());
-}
-
-#[no_mangle]
-extern "C" fn c_platform_bus_init() {
-    let platform_driver: Arc<LockedPlatformBusDriver> = Arc::new(LockedPlatformBusDriver::new());
-    let platform_device: Arc<LockedPlatform> = Arc::new(LockedPlatform::new());
-    let _ = bus_register(platform_device.clone());
-    platform_device.set_state(BusState::Initialized);
-    platform_device.set_driver(Some(platform_driver.clone()));
-    let _ = bus_driver_register(platform_driver.clone());
+    match bus_driver_register(platform_driver.clone()) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            return Err(SystemError::ESRMNT);
+        }
+    }
 }

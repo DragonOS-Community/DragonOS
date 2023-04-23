@@ -56,7 +56,10 @@ pub fn class_device_register(
 /// @return: 操作成功，返回()，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn class_device_unregister(class: Arc<dyn IndexNode>, device_name: &str) -> Result<(), SystemError> {
+pub fn class_device_unregister(
+    class: Arc<dyn IndexNode>,
+    device_name: &str,
+) -> Result<(), SystemError> {
     class
         .as_any_ref()
         .downcast_ref::<LockedSysFSInode>()

@@ -367,7 +367,7 @@ impl Device for LockedPlatform {
 
     #[inline]
     #[allow(dead_code)]
-    fn get_sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         return self.0.lock().sys_info.clone();
     }
 }
@@ -381,18 +381,10 @@ impl Bus for LockedPlatform {}
 pub fn platform_bus_init() -> Result<(), SystemError> {
     let platform_driver: Arc<LockedPlatformBusDriver> = Arc::new(LockedPlatformBusDriver::new());
     let platform_device: Arc<LockedPlatform> = Arc::new(LockedPlatform::new());
-    match bus_register(platform_device.clone()) {
-        Ok(_) => {}
-        Err(_) => {
-            return Err(SystemError::ESRMNT);
-        }
-    }
+    bus_register(platform_device.clone()).map_err(|e| e.into())?;
     platform_device.set_state(BusState::Initialized);
     platform_device.set_driver(Some(platform_driver.clone()));
-    match bus_driver_register(platform_driver.clone()) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            return Err(SystemError::ESRMNT);
-        }
-    }
+    bus_driver_register(platform_driver.clone()).map_err(|e| e.into())?;
+
+    return Ok(());
 }

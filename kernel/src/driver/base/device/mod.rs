@@ -13,6 +13,7 @@ use crate::{
         vfs::IndexNode,
     },
     libs::spinlock::SpinLock,
+    syscall::SystemError,
 };
 use core::{any::Any, fmt::Debug};
 
@@ -79,6 +80,19 @@ pub enum DeviceError {
     RegisterError,     // 注册失败
 }
 
+impl Into<SystemError> for DeviceError {
+    fn into(self) -> SystemError {
+        match self {
+            DeviceError::DriverExists => SystemError::EEXIST,
+            DeviceError::DeviceExists => SystemError::EEXIST,
+            DeviceError::InitializeFailed => SystemError::EIO,
+            DeviceError::NoDeviceForDriver => SystemError::ENODEV,
+            DeviceError::NoDriverForDevice => SystemError::ENODEV,
+            DeviceError::RegisterError => SystemError::EIO,
+        }
+    }
+}
+
 /// @brief: 将u32类型转换为设备状态类型
 impl From<u32> for DeviceState {
     fn from(state: u32) -> Self {
@@ -121,7 +135,7 @@ pub trait Device: Any + Send + Sync + Debug {
     /// @brief: 获取设备的sys information
     /// @parameter id_table: 设备标识符，用于唯一标识该设备
     /// @return: 设备实例
-    fn get_sys_info(&self) -> Option<Arc<dyn IndexNode>>;
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>>;
 }
 
 /// @brief Device管理器(锁)

@@ -1,5 +1,5 @@
 use super::IdTable;
-use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock};
+use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::{any::Any, fmt::Debug};
 
@@ -13,6 +13,15 @@ lazy_static! {
 pub enum DriverError {
     ProbeError,
     RegisterError,
+}
+
+impl Into<SystemError> for DriverError {
+    fn into(self) -> SystemError {
+        match self {
+            DriverError::ProbeError => SystemError::EIO,
+            DriverError::RegisterError => SystemError::EIO,
+        }
+    }
 }
 
 /// @brief: 所有驱动驱动都应该实现该trait

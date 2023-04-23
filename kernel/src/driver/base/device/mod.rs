@@ -1,3 +1,4 @@
+use crate::filesystem::sysfs::devices::device_register;
 use core::{any::Any, fmt::Debug};
 
 pub mod bus;
@@ -49,6 +50,7 @@ pub enum DeviceError {
     InitializeFailed,  // 初始化错误
     NoDeviceForDriver, // 没有合适的设备匹配驱动
     NoDriverForDevice, // 没有合适的驱动匹配设备
+    RegisterError,     // 注册失败
 }
 
 /// @brief: 将u32类型转换为设备状态类型
@@ -84,4 +86,14 @@ pub trait Device: Any + Send + Sync + Debug {
     /// @parameter: None
     /// @return: 该设备唯一标识
     fn get_id_table(&self) -> IdTable;
+
+    /// @brief: 设备注册
+    /// @parameter: name: 设备名
+    /// @return: 操作成功，返回()，操作失败，返回错误码
+    fn register_device(&self, name: &str) -> Result<(), DeviceError> {
+        match device_register(name) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(DeviceError::RegisterError),
+        }
+    }
 }

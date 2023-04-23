@@ -345,6 +345,7 @@ pub fn platform_bus_init() {
         BUS_PLATFORM_DEVICE.clone(),
     );
     BUS_PLATFORM_DEVICE.set_state(BusState::Initialized);
+    let _ = BUS_PLATFORM_DEVICE.register_bus("platform");
 }
 
 #[no_mangle]

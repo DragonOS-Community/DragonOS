@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 /// @return: 操作成功，返回inode，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn device_register(device_name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+pub fn sys_device_register(device_name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
     let binding: Arc<dyn IndexNode> = SYS_DEVICES_INODE();
     binding
         .as_any_ref()
@@ -22,7 +22,7 @@ pub fn device_register(device_name: &str) -> Result<Arc<dyn IndexNode>, SystemEr
 /// @return: 操作成功，返回()，操作失败，返回错误码
 #[inline]
 #[allow(dead_code)]
-pub fn device_unregister(device_name: &str) -> Result<(), SystemError> {
+pub fn sys_device_unregister(device_name: &str) -> Result<(), SystemError> {
     let binding: Arc<dyn IndexNode> = SYS_DEVICES_INODE();
     binding
         .as_any_ref()

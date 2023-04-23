@@ -137,7 +137,7 @@ impl SysFS {
             Err(_) => panic!("SysFS: Failed to create /sys/fs"),
         }
         // 初始化platform总线
-        crate::driver::base::platform::platform_bus_init();
+        crate::driver::base::platform::platform_bus_init().expect("platform bus init failed");
         return sysfs;
     }
 }

@@ -8,3 +8,5 @@ pub mod mm;
 pub mod pci;
 pub mod rand;
 pub mod sched;
+
+pub use interrupt::X86_64InterruptArch as CurrentIrqArch;

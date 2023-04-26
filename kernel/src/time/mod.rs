@@ -2,10 +2,13 @@ use core::{fmt, ops};
 
 use self::timekeep::ktime_get_real_ns;
 
+pub mod clocksource;
+pub mod hrtimer;
+pub mod posix_timer;
 pub mod sleep;
 pub mod timekeep;
+pub mod timekeeping;
 pub mod timer;
-
 /* Time structures. (Partitially taken from smoltcp)
 
 The `time` module contains structures used to represent both
@@ -17,6 +20,13 @@ absolute and relative time.
 [Instant]: struct.Instant.html
 [Duration]: struct.Duration.html
 */
+pub const MSEC_PER_SEC: u32 = 1000;
+pub const USEC_PER_MSEC: u32 = 1000;
+pub const NSEC_PER_USEC: u32 = 1000;
+pub const NSEC_PER_MSEC: u32 = 1000000;
+pub const USEC_PER_SEC: u32 = 1000000;
+pub const NSEC_PER_SEC: u32 = 1000000000;
+pub const FSEC_PER_SEC: u64 = 1000000000000000;
 
 /// 表示时间的结构体
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

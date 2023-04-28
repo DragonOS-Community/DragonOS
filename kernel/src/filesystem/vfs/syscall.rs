@@ -1,6 +1,6 @@
 use core::ffi::{c_char, CStr};
 
-use alloc::{boxed::Box, string::ToString};
+use alloc::{boxed::Box, string::ToString, vec::Vec};
 
 use crate::{
     arch::asm::{current::current_pcb, ptrace::user_mode},
@@ -433,5 +433,108 @@ pub extern "C" fn sys_dup2(regs: &pt_regs) -> u64 {
         return r.unwrap() as u64;
     } else {
         return r.unwrap_err().to_posix_errno() as u64;
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IoVec {
+    /// 缓冲区的起始地址
+    pub iov_base: *mut u8,
+    /// 缓冲区的长度
+    pub iov_len: usize,
+}
+
+/// 用于存储多个来自用户空间的IoVec
+///
+/// 由于目前内核中的文件系统还不支持分散读写，所以暂时只支持将用户空间的IoVec聚合成一个缓冲区，然后进行操作。
+/// TODO：支持分散读写
+#[derive(Debug)]
+pub struct IoVecs(Vec<&'static mut [u8]>);
+
+impl IoVecs {
+    /// 从用户空间的IoVec中构造IoVecs
+    ///
+    /// @param iov 用户空间的IoVec
+    /// @param iovcnt 用户空间的IoVec的数量
+    /// @param readv 是否为readv系统调用
+    ///
+    /// @return 构造成功返回IoVecs，否则返回错误码
+    pub unsafe fn from_user(
+        iov: *const IoVec,
+        iovcnt: usize,
+        _readv: bool,
+    ) -> Result<Self, SystemError> {
+        // 检查iov指针所在空间是否合法
+        if !verify_area(
+            iov as usize as u64,
+            (iovcnt * core::mem::size_of::<IoVec>()) as u64,
+        ) {
+            return Err(SystemError::EFAULT);
+        }
+
+        // 将用户空间的IoVec转换为引用（注意：这里的引用是静态的，因为用户空间的IoVec不会被释放）
+        let iovs: &[IoVec] = core::slice::from_raw_parts(iov, iovcnt);
+
+        let mut slices: Vec<&mut [u8]> = vec![];
+        slices.reserve(iovs.len());
+
+        for iov in iovs.iter() {
+            if iov.iov_len == 0 {
+                continue;
+            }
+
+            if !verify_area(iov.iov_base as usize as u64, iov.iov_len as u64) {
+                return Err(SystemError::EFAULT);
+            }
+
+            slices.push(core::slice::from_raw_parts_mut(iov.iov_base, iov.iov_len));
+        }
+
+        return Ok(Self(slices));
+    }
+
+    /// @brief 将IoVecs中的数据聚合到一个缓冲区中
+    ///
+    /// @return 返回聚合后的缓冲区
+    pub fn gather(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for slice in self.0.iter() {
+            buf.extend_from_slice(slice);
+        }
+        return buf;
+    }
+
+    /// @brief 将给定的数据分散写入到IoVecs中
+    pub fn scatter(&mut self, data: &[u8]) {
+        let mut data: &[u8] = data;
+        for slice in self.0.iter_mut() {
+            let len = core::cmp::min(slice.len(), data.len());
+            if len == 0 {
+                continue;
+            }
+
+            slice[..len].copy_from_slice(&data[..len]);
+            data = &data[len..];
+        }
+    }
+
+    /// @brief 创建与IoVecs等长的缓冲区
+    ///
+    /// @param set_len 是否设置返回的Vec的len。
+    /// 如果为true，则返回的Vec的len为所有IoVec的长度之和;
+    /// 否则返回的Vec的len为0，capacity为所有IoVec的长度之和.
+    ///
+    /// @return 返回创建的缓冲区
+    pub fn new_buf(&self, set_len: bool) -> Vec<u8> {
+        let total_len: usize = self.0.iter().map(|slice| slice.len()).sum();
+        let mut buf: Vec<u8> = Vec::with_capacity(total_len);
+
+        if set_len {
+            unsafe {
+                buf.set_len(total_len);
+            }
+        }
+        return buf;
     }
 }

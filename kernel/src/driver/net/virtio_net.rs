@@ -10,7 +10,7 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use crate::{
     driver::{virtio::virtio_impl::HalImpl, Driver},
-    kdebug, kerror, kinfo,
+    kerror, kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
     syscall::SystemError,
@@ -287,7 +287,7 @@ impl<T: Transport> NetDriver for VirtioInterface<T> {
         if poll_res {
             return Ok(());
         }
-        return Err(SystemError::EAGAIN);
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     #[inline(always)]

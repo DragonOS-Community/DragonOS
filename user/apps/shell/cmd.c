@@ -600,7 +600,7 @@ done:;
  * @param buf 输入缓冲区
  * @param argc 返回值：参数数量
  * @param argv 返回值：参数列表
- * @return int 主命令的编号
+ * @return int 主命令的编号，小于零为无效命令
  */
 int parse_command(char *buf, int *argc, char ***argv)
 {
@@ -609,6 +609,9 @@ int parse_command(char *buf, int *argc, char ***argv)
     // 去除命令前导的空格
     while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
         ++index;
+    // 如果去除前导空格后第一项为0x00，则归为空命令
+    if(!buf[index])
+        return -1;
 
     // 计算参数数量
     for (int i = index; i < (INPUT_BUFFER_SIZE - 1); ++i)
@@ -619,7 +622,7 @@ int parse_command(char *buf, int *argc, char ***argv)
         if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
             ++(*argc);
     }
-
+    
     // printf("\nargc=%d\n", *argc);
 
     // 为指向每个指令的指针分配空间

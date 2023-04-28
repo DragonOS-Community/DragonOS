@@ -3,6 +3,7 @@
 !.gitkeep
 DragonOS.iso
 .idea/
+/tmp/
 kernel/kernel
 .DS_Store
 

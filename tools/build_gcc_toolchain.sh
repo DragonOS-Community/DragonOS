@@ -158,15 +158,14 @@ fi
 
 
 # update PATH
-if [ -n "$(grep -F "export DragonOS_GCC=$PREFIX/bin/" $HOME/.bashrc)" ]; then 
+if [ -n "$(grep -F "export DragonOS_GCC=$PREFIX/bin/" "$HOME/.$(basename $SHELL)rc")" ]; then 
 	echo "[info] DragonOS_GCC has been in the "'$PATH'
 else 
-	echo 'export DragonOS_GCC='"$PREFIX"'/bin' >> "$HOME/.bashrc"
-	echo 'export PATH="$DragonOS_GCC:$PATH"'	>> "$HOME/.bashrc"
+	echo 'export DragonOS_GCC='"$PREFIX"'/bin' >> "$HOME/.$(basename $SHELL)rc"
+	echo 'export PATH="$DragonOS_GCC:$PATH"'	>> "$HOME/.$(basename $SHELL)rc"
 	echo "[info] Add DragonOS_GCC into PATH successfully."
 fi
-source "$HOME/.bashrc"
-
+source "$HOME/.$(basename $SHELL)rc"
 
 # final check
 if [ -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] &&

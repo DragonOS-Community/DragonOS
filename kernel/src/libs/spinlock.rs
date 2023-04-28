@@ -210,7 +210,7 @@ impl<T> SpinLock<T> {
                 flag: 0,
             });
         }
-        return Err(SystemError::EAGAIN);
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     pub fn try_lock_irqsave(&self) -> Result<SpinLockGuard<T>, SystemError> {
@@ -221,7 +221,7 @@ impl<T> SpinLock<T> {
                 flag: flags,
             });
         }
-        return Err(SystemError::EAGAIN);
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 }
 
@@ -244,6 +244,10 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 /// @brief 为SpinLockGuard实现Drop方法，那么，一旦守卫的生命周期结束，就会自动释放自旋锁，避免了忘记放锁的情况
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.lock.unlock();
+        if self.flag != 0 {
+            self.lock.lock.unlock_irqrestore(&self.flag);
+        } else {
+            self.lock.lock.unlock();
+        }
     }
 }

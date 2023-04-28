@@ -117,7 +117,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _buf: &[u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn open(
@@ -150,9 +150,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
     }
 
     fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK,
-        });
+        return Ok(PollStatus::READ);
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -180,7 +178,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 }
 

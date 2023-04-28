@@ -5,7 +5,7 @@ use core::{
 
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 
-use crate::{driver::net::NetDriver, libs::rwlock::RwLock, syscall::SystemError};
+use crate::{driver::net::NetDriver, kwarn, libs::rwlock::RwLock, syscall::SystemError};
 use smoltcp::wire::IpEndpoint;
 
 use self::socket::SocketMetadata;
@@ -13,6 +13,7 @@ use self::socket::SocketMetadata;
 pub mod endpoints;
 pub mod net_core;
 pub mod socket;
+pub mod syscall;
 
 lazy_static! {
     /// @brief 所有网络接口的列表
@@ -28,11 +29,28 @@ pub fn generate_iface_id() -> usize {
 }
 
 /// @brief 用于指定socket的关闭类型
-#[derive(Debug, Clone)]
+/// 参考：https://pubs.opengroup.org/onlinepubs/9699919799/functions/shutdown.html
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum ShutdownType {
-    ShutRd,   // Disables further receive operations.
-    ShutWr,   // Disables further send operations.
-    ShutRdwr, // Disables further send and receive operations.
+    ShutRd = 0,   // Disables further receive operations.
+    ShutWr = 1,   // Disables further send operations.
+    ShutRdwr = 2, // Disables further send and receive operations.
+}
+
+impl TryFrom<i32> for ShutdownType {
+    type Error = SystemError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        use num_traits::FromPrimitive;
+        <Self as FromPrimitive>::from_i32(value).ok_or(SystemError::EINVAL)
+    }
+}
+
+impl Into<i32> for ShutdownType {
+    fn into(self) -> i32 {
+        use num_traits::ToPrimitive;
+        <Self as ToPrimitive>::to_i32(&self).unwrap()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +58,7 @@ pub enum Endpoint {
     /// 链路层端点
     LinkLayer(endpoints::LinkLayerEndpoint),
     /// 网络层端点
-    Ip(IpEndpoint),
+    Ip(Option<IpEndpoint>),
     // todo: 增加NetLink机制后，增加NetLink端点
 }
 
@@ -51,7 +69,7 @@ pub trait Socket: Sync + Send + Debug {
     ///
     /// @return - 成功：(返回读取的数据的长度，读取数据的端点).
     ///         - 失败：错误码
-    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError>;
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
 
     /// @brief 向socket中写入数据。如果socket是阻塞的，那么直到写入的数据全部写入socket中才返回
     ///
@@ -80,7 +98,7 @@ pub trait Socket: Sync + Send + Debug {
     /// @param endpoint 要绑定的端点
     ///
     /// @return 返回绑定是否成功
-    fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
+    fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -106,7 +124,7 @@ pub trait Socket: Sync + Send + Debug {
 
     /// @brief 对应于POSIX的accept函数，用于接受连接
     ///
-    /// @param endpoint 用于返回连接的端点
+    /// @param endpoint 对端的端点
     ///
     /// @return 返回接受连接是否成功
     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
@@ -164,6 +182,23 @@ pub trait Socket: Sync + Send + Debug {
     fn metadata(&self) -> Result<SocketMetadata, SystemError>;
 
     fn box_clone(&self) -> Box<dyn Socket>;
+
+    /// @brief 设置socket的选项
+    ///
+    /// @param level 选项的层次
+    /// @param optname 选项的名称
+    /// @param optval 选项的值
+    ///
+    /// @return 返回设置是否成功, 如果不支持该选项，返回ENOSYS
+    fn setsockopt(
+        &self,
+        _level: usize,
+        _optname: usize,
+        _optval: &[u8],
+    ) -> Result<(), SystemError> {
+        kwarn!("setsockopt is not implemented");
+        return Err(SystemError::ENOSYS);
+    }
 }
 
 impl Clone for Box<dyn Socket> {

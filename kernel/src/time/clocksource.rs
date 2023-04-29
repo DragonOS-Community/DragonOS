@@ -6,6 +6,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use lazy_static::__Deref;
 
 use crate::{kdebug, kinfo, libs::spinlock::SpinLock, syscall::SystemError};
 
@@ -24,10 +25,10 @@ lazy_static! {
 
     pub static ref CLOCKSOUCE_WATCHDOG:SpinLock<ClocksouceWatchdog>  = SpinLock::new(ClocksouceWatchdog::new());
 
-    pub static ref  OVERRIDE_NAME: SpinLock<String> = SpinLock::new(String::from(""));
+    pub static ref OVERRIDE_NAME: SpinLock<String> = SpinLock::new(String::from(""));
 
 }
-//一些应该放在jeffies里里面的常量 暂时先放一下
+//一些应该放在jiffies里里面的常量 暂时先放一下
 pub const CLOCK_TICK_RATE: u32 = HZ as u32 * 100000;
 pub const JIFFIES_SHIFT: u32 = 8;
 pub const LATCH: u32 = ((CLOCK_TICK_RATE + (HZ as u32) / 2) / HZ as u32) as u32;
@@ -46,7 +47,7 @@ pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 
 // 时钟周期数
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
 pub struct CycleNum(u64);
 impl CycleNum {
@@ -116,10 +117,10 @@ impl ClocksouceWatchdog {
     }
 }
 /// 定时检查器
-pub struct WatchdogTimerFunc {}
+pub struct WatchdogTimerFunc;
 impl TimerFunction for WatchdogTimerFunc {
-    fn run(&mut self) {
-        clocksource_watchdog();
+    fn run(&mut self) -> Result<(), SystemError> {
+        return clocksource_watchdog();
     }
 }
 /// 时钟源的特性
@@ -147,16 +148,20 @@ pub trait Clocksource: Send + Sync {
     fn resume(&self) -> Result<(), SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-    // 获取时钟源数据的可变引用
-    fn get_clocksource_data(&self) -> ClocksourceData;
+    // 获取时钟源数据
+    fn clocksource_data(&self) -> ClocksourceData;
+
+    fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
     // 获取时钟源
-    fn get_clocksource(&self) -> Arc<dyn Clocksource>;
+    fn clocksource(&self) -> Arc<dyn Clocksource>;
 }
 
 impl dyn Clocksource {
     // BUG 可能会出现格式转换导致结果错误的问题
     pub fn clocksource_max_deferment(&self) -> u64 {
-        let cs_data_guard = self.get_clocksource_data();
+        let cs_data_guard = self.clocksource_data();
         let max_nsecs: u64;
         let mut max_cycles: u64;
         max_cycles =
@@ -170,66 +175,70 @@ impl dyn Clocksource {
         return max_nsecs - (max_nsecs >> 5);
     }
 
-    pub fn clocksource_register(&self) {
+    pub fn register(&self) -> Result<(), SystemError> {
         let ns = self.clocksource_max_deferment();
-        let cs_data = self.get_clocksource_data();
-        
+        let mut cs_data = self.clocksource_data();
+
         cs_data.max_idle_ns = ns as u32;
+        self.update_clocksource_data(cs_data)?;
         self.clocksource_enqueue();
         self.clocksource_enqueue_watchdog();
+        return Ok(());
     }
     /// 将时间源插入时间源队列
     pub fn clocksource_enqueue(&self) {
         // 根据rating由大到小排序
-        let cs_data_guard = self.get_clocksource_data();
+        let cs_data = self.clocksource_data();
         let list_guard = &mut CLOCKSOURCE_LIST.lock();
         let mut spilt_pos: usize = 0;
         for (pos, ele) in list_guard.iter().enumerate() {
-            if ele.get_clocksource_data().rating < cs_data_guard.rating {
+            if ele.clocksource_data().rating < cs_data.rating {
                 spilt_pos = pos;
                 break;
             }
         }
         let mut temp_list = list_guard.split_off(spilt_pos);
-        let cs = self.get_clocksource();
+        let cs = self.clocksource();
         list_guard.push_back(cs);
         list_guard.append(&mut temp_list);
     }
 
     /// 将时间源插入监控队列
-    pub fn clocksource_enqueue_watchdog(&self) {
+    pub fn clocksource_enqueue_watchdog(&self) -> Result<(), SystemError> {
         // BUG 可能需要lock irq
-        let cs_data_guard = self.get_clocksource_data();
+        let mut cs_data = self.clocksource_data();
         let list_guard = &mut WATCHDOG_LIST.lock();
-        let cs = self.get_clocksource();
-        if cs_data_guard
+        let cs = self.clocksource();
+        if cs_data
             .flags
             .contains(ClocksourceFlags::CLOCK_SOURCE_MUST_VERIFY)
         {
             // cs是被监视的
-            cs_data_guard
+            cs_data
                 .flags
                 .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
+            cs.update_clocksource_data(cs_data)?;
             list_guard.push_back(cs);
         } else {
             // cs是监视器
-            if cs_data_guard
+            if cs_data
                 .flags
                 .contains(ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS)
             {
-                cs_data_guard
+                cs_data
                     .flags
                     .insert(ClocksourceFlags::CLOCK_SOURCE_VALID_FOR_HRES);
+                cs.update_clocksource_data(cs_data.clone())?;
             }
             // 选择一个最优的监视器
             let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
             if cs_watchdog.watchdog.is_none()
-                || cs_data_guard.rating
+                || cs_data.rating
                     > cs_watchdog
                         .watchdog
                         .clone()
                         .unwrap()
-                        .get_clocksource_data()
+                        .clocksource_data()
                         .rating
             {
                 // 替换监视器
@@ -240,11 +249,13 @@ impl dyn Clocksource {
             }
             self.clocksource_start_watchdog();
         }
+        return Ok(());
     }
+
     pub fn clocksource_reset_watchdog(&self) {
         let list_guard = &mut WATCHDOG_LIST.lock();
         for ele in list_guard.iter() {
-            ele.get_clocksource_data()
+            ele.clocksource_data()
                 .flags
                 .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
         }
@@ -265,9 +276,10 @@ impl dyn Clocksource {
         wd_timer.activate();
         cs_watchdog.is_running = true;
     }
+
     /// 将时钟源设立为unstable
-    pub fn clocksource_unstable(&self, delta: i64) {
-        let cs_data = self.get_clocksource_data();
+    pub fn set_unstable(&self, delta: i64) -> Result<(), SystemError> {
+        let mut cs_data = self.clocksource_data();
         kdebug!(
             "clocksource :{:?} is unstable, its delta is {:?}",
             cs_data.name,
@@ -278,8 +290,12 @@ impl dyn Clocksource {
         );
         cs_data
             .flags
-            .contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE);
+            .insert(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE);
+        self.update_clocksource_data(cs_data)?;
+
+        return Ok(());
     }
+
     /// 根据精度选择最优的时钟源，或者接受用户指定的时间源
     pub fn clocksource_select(&self) {
         let list_guard = &mut CLOCKSOURCE_LIST.lock();
@@ -290,7 +306,7 @@ impl dyn Clocksource {
         let override_name = OVERRIDE_NAME.lock();
         // 判断是否有用户空间指定的时间源
         for ele in list_guard.iter() {
-            if ele.get_clocksource_data().name == *override_name {
+            if ele.clocksource_data().name.eq(override_name.deref()) {
                 // TODO 判断是否是高精度模式
                 // 如果是高精度模式，但是时钟源不支持高精度模式的话，就要退出循环
                 best = ele.clone();
@@ -298,8 +314,8 @@ impl dyn Clocksource {
             }
         }
         let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
-        let best_name = &best.get_clocksource_data().name;
-        if cur_clocksource.get_clocksource_data().name.eq(best_name) {
+        let best_name = &best.clocksource_data().name;
+        if cur_clocksource.clocksource_data().name.eq(best_name) {
             kinfo!("Switching to clocksource {:?}\n", best_name);
             drop(cur_clocksource);
             CUR_CLOCKSOURCE.lock().replace(best);
@@ -308,6 +324,7 @@ impl dyn Clocksource {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ClocksourceData {
     /// 时钟源名字
     name: String,
@@ -342,19 +359,7 @@ impl ClocksourceData {
         };
         return csd;
     }
-    pub fn get_data(&mut self) -> ClocksourceData {
-        let data = ClocksourceData {
-            name: self.name.clone(),
-            rating: self.rating,
-            mask: self.mask,
-            mult: self.mult,
-            shift: self.shift,
-            max_idle_ns: self.max_idle_ns,
-            flags: self.flags,
-            watchdog_last: self.watchdog_last,
-        };
-        return data;
-    }
+
     pub fn set_name(&mut self, name: String) {
         self.name = name;
     }
@@ -391,15 +396,15 @@ pub fn clocksource_cyc2ns(cycles: CycleNum, mult: u32, shift: u32) -> u64 {
 }
 /// 根据watchdog的精度，来检查被监视的时钟源的误差
 /// 如果误差过大，时钟源将被标记为不稳定
-pub fn clocksource_watchdog() {
+pub fn clocksource_watchdog() -> Result<(), SystemError> {
     let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock();
 
     // watchdog没有运行的话直接退出
     if !cs_watchdog.is_running || cs_watchdog.watchdog.is_none() {
-        return;
+        return Ok(());
     }
     let cur_watchdog = cs_watchdog.watchdog.as_ref().unwrap().clone();
-    let cur_wd_data = cur_watchdog.as_ref().get_clocksource_data();
+    let cur_wd_data = cur_watchdog.as_ref().clocksource_data();
     let cur_wd_nowclock = cur_watchdog.as_ref().read().data();
 
     let wd_last = cs_watchdog.last_check.data();
@@ -412,8 +417,7 @@ pub fn clocksource_watchdog() {
     drop(cs_watchdog);
     let watchdog_list = &mut WATCHDOG_LIST.lock();
     for cs in watchdog_list.iter() {
-        
-        let cs_data = cs.get_clocksource_data();
+        let mut cs_data = cs.clocksource_data();
         // 判断时钟源是否已经被标记为不稳定
         if cs_data
             .flags
@@ -435,6 +439,7 @@ pub fn clocksource_watchdog() {
                 .insert(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
             // 记录此次检查的时刻
             cs_data.watchdog_last = cs_now_clock;
+            cs.update_clocksource_data(cs_data.clone())?;
             continue;
         }
 
@@ -446,10 +451,11 @@ pub fn clocksource_watchdog() {
         );
         // 记录此次检查的时刻
         cs_data.watchdog_last = cs_now_clock;
+        cs.update_clocksource_data(cs_data.clone())?;
         // 判断误差大小是否符合要求
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
             // 误差过大
-            cs.clocksource_unstable((cs_dev_nsec - wd_dev_nsec).try_into().unwrap());
+            cs.set_unstable((cs_dev_nsec - wd_dev_nsec).try_into().unwrap())?;
             continue;
         }
         // 判断是否要切换为高精度模式
@@ -466,6 +472,7 @@ pub fn clocksource_watchdog() {
             cs_data
                 .flags
                 .insert(ClocksourceFlags::CLOCK_SOURCE_VALID_FOR_HRES);
+            cs.update_clocksource_data(cs_data)?;
             // TODO 通知tick机制 切换为高精度模式
         }
         let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock();
@@ -476,34 +483,37 @@ pub fn clocksource_watchdog() {
         let watchdog_timer = Timer::new(watchdog_func, cs_watchdog.timer_expires);
         watchdog_timer.activate();
     }
+    return Ok(());
 }
-// TODO 应该放在jeffies.rs
+
+// TODO 应该放在jiffies.rs
 pub const fn sh_div(nom: u32, den: u32, lsh: u32) -> u32 {
     (((nom) / (den)) << (lsh)) + ((((nom) % (den)) << (lsh)) + (den) / 2) / (den)
 }
-pub struct ClocksourceJeffies(SpinLock<InnerJeffies>);
-pub struct InnerJeffies {
+pub struct ClocksourceJiffies(SpinLock<InnerJiffies>);
+pub struct InnerJiffies {
     data: ClocksourceData,
-    self_ref: Weak<ClocksourceJeffies>,
+    self_ref: Weak<ClocksourceJiffies>,
 }
-impl Clocksource for ClocksourceJeffies {
+
+impl Clocksource for ClocksourceJiffies {
     fn read(&self) -> CycleNum {
         CycleNum(clock())
     }
 
-    fn get_clocksource_data(&self) -> ClocksourceData {
-        let mut jeffies = self.0.lock();
-        jeffies.data.get_data()
+    fn clocksource_data(&self) -> ClocksourceData {
+        let inner = self.0.lock();
+        return inner.data.clone();
     }
 
-    fn get_clocksource(&self) -> Arc<dyn Clocksource> {
+    fn clocksource(&self) -> Arc<dyn Clocksource> {
         self.0.lock().self_ref.upgrade().unwrap()
     }
 }
-impl ClocksourceJeffies {
+impl ClocksourceJiffies {
     pub fn new() -> Arc<Self> {
         let data = ClocksourceData {
-            name: "jeffies".to_string(),
+            name: "jiffies".to_string(),
             rating: 1,
             mask: ClocksourceMask { bits: 0xffffffff },
             mult: NSEC_PER_JIFFY << JIFFIES_SHIFT,
@@ -512,16 +522,16 @@ impl ClocksourceJeffies {
             flags: ClocksourceFlags { bits: 0 },
             watchdog_last: CycleNum(0),
         };
-        let jeffies = Arc::new(ClocksourceJeffies(SpinLock::new(InnerJeffies {
+        let jieffies = Arc::new(ClocksourceJiffies(SpinLock::new(InnerJiffies {
             data: data,
             self_ref: Default::default(),
         })));
-        jeffies.0.lock().self_ref = Arc::downgrade(&jeffies);
+        jieffies.0.lock().self_ref = Arc::downgrade(&jieffies);
 
-        return jeffies;
+        return jieffies;
     }
 }
-pub fn clocksource_default_clock() -> Arc<ClocksourceJeffies> {
-    let jeffies = ClocksourceJeffies::new();
-    return jeffies;
+pub fn clocksource_default_clock() -> Arc<ClocksourceJiffies> {
+    let jiffies = ClocksourceJiffies::new();
+    return jiffies;
 }

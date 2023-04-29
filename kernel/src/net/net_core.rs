@@ -17,11 +17,12 @@ use super::socket::{SOCKET_SET, SOCKET_WAITQUEUE};
 /// The main purpose of this function is to poll all network interfaces.
 struct NetWorkPollFunc();
 impl TimerFunction for NetWorkPollFunc {
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), SystemError> {
         poll_ifaces_try_lock(10).ok();
         let next_time = next_n_ms_timer_jiffies(10);
         let timer = Timer::new(Box::new(NetWorkPollFunc()), next_time);
         timer.activate();
+        return Ok(());
     }
 }
 

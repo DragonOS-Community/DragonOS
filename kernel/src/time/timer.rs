@@ -29,7 +29,7 @@ lazy_static! {
 
 /// 定时器要执行的函数的特征
 pub trait TimerFunction: Send + Sync {
-    fn run(&mut self);
+    fn run(&mut self) -> Result<(), SystemError>;
 }
 
 /// WakeUpHelper函数对应的结构体
@@ -44,10 +44,11 @@ impl WakeUpHelper {
 }
 
 impl TimerFunction for WakeUpHelper {
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), SystemError>{
         unsafe {
             process_wakeup(self.pcb);
         }
+        return Ok(());
     }
 }
 

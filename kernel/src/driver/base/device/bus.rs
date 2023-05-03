@@ -1,8 +1,25 @@
-use super::{driver::Driver, Device, DeviceState, IdTable};
-use crate::libs::spinlock::SpinLock;
+use super::{
+    device_register, device_unregister,
+    driver::{driver_register, driver_unregister, Driver, DriverError},
+    Device, DeviceError, DeviceState, IdTable,
+};
+use crate::{
+    filesystem::{
+        sysfs::{
+            bus::{sys_bus_init, sys_bus_register},
+            SYS_BUS_INODE,
+        },
+        vfs::IndexNode,
+    },
+    libs::spinlock::SpinLock,
+};
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::fmt::Debug;
 use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref BUS_MANAGER: Arc<LockedBusManager> = Arc::new(LockedBusManager::new());
+}
 
 /// @brief: 总线状态
 #[derive(Debug, Copy, Clone)]
@@ -61,22 +78,24 @@ pub trait Bus: Device {}
 pub struct BusManager {
     buses: BTreeMap<IdTable, Arc<dyn Bus>>,          // 总线设备表
     bus_drvs: BTreeMap<IdTable, Arc<dyn BusDriver>>, // 总线驱动表
+    sys_info: Option<Arc<dyn IndexNode>>,            // 总线inode
 }
 
-/// @brief: 总线管理结构体加锁
-pub struct BusManagerLock(SpinLock<BusManager>);
+/// @brief: bus管理(锁)
+pub struct LockedBusManager(SpinLock<BusManager>);
 
 /// @brief: 总线管理方法集
-impl BusManagerLock {
+impl LockedBusManager {
     /// @brief: 创建总线管理实例
     /// @parameter: None
     /// @return: 总线管理实例
     #[inline]
     #[allow(dead_code)]
     pub fn new() -> Self {
-        BusManagerLock(SpinLock::new(BusManager {
+        LockedBusManager(SpinLock::new(BusManager {
             buses: BTreeMap::new(),
             bus_drvs: BTreeMap::new(),
+            sys_info: Some(SYS_BUS_INODE()),
         }))
     }
 
@@ -97,7 +116,7 @@ impl BusManagerLock {
     /// @return: None
     #[inline]
     #[allow(dead_code)]
-    pub fn add_bus_driver(&self, id_table: IdTable, bus_drv: Arc<dyn BusDriver>) {
+    pub fn add_driver(&self, id_table: IdTable, bus_drv: Arc<dyn BusDriver>) {
         let mut bus_manager = self.0.lock();
         bus_manager.bus_drvs.insert(id_table, bus_drv);
     }
@@ -137,12 +156,57 @@ impl BusManagerLock {
     /// @return: 总线驱动实例
     #[inline]
     #[allow(dead_code)]
-    pub fn get_bus_driver(&self, id_table: &IdTable) -> Option<Arc<dyn BusDriver>> {
+    pub fn get_driver(&self, id_table: &IdTable) -> Option<Arc<dyn BusDriver>> {
         let bus_manager = self.0.lock();
         return bus_manager.bus_drvs.get(id_table).cloned();
     }
+
+    /// @brief: 获取总线管理器的sys information
+    /// @parameter None
+    /// @return: sys inode
+    #[inline]
+    #[allow(dead_code)]
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+        return self.0.lock().sys_info.clone();
+    }
 }
 
-lazy_static! {
-    pub static ref BUS_MANAGER: Arc<BusManagerLock> = Arc::new(BusManagerLock::new());
+/// @brief: 总线注册，将总线加入全局总线管理器中，并根据id table在sys/bus和sys/devices下生成文件夹
+/// @parameter bus: Bus设备实体
+/// @return: 成功:()   失败:DeviceError
+pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
+    BUS_MANAGER.add_bus(bus.get_id_table(), bus.clone());
+    match sys_bus_register(&bus.get_id_table().to_name()) {
+        Ok(inode) => {
+            let _ = sys_bus_init(&inode);
+            return device_register(bus);
+        }
+        Err(_) => Err(DeviceError::RegisterError),
+    }
+}
+
+/// @brief: 总线注销，将总线从全局总线管理器中删除，并在sys/bus和sys/devices下删除文件夹
+/// @parameter bus: Bus设备实体
+/// @return: 成功:()   失败:DeviceError
+#[allow(dead_code)]
+pub fn bus_unregister<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
+    BUS_MANAGER.add_bus(bus.get_id_table(), bus.clone());
+    return device_unregister(bus);
+}
+
+/// @brief: 总线驱动注册，将总线驱动加入全局总线管理器中
+/// @parameter bus: Bus设备驱动实体
+/// @return: 成功:()   失败:DeviceError
+pub fn bus_driver_register<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), DriverError> {
+    BUS_MANAGER.add_driver(bus_driver.get_id_table(), bus_driver.clone());
+    return driver_register(bus_driver);
+}
+
+/// @brief: 总线驱动注销，将总线从全局总线管理器中删除
+/// @parameter bus: Bus设备驱动实体
+/// @return: 成功:()   失败:DeviceError
+#[allow(dead_code)]
+pub fn bus_driver_unregister<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), DriverError> {
+    BUS_MANAGER.add_driver(bus_driver.get_id_table(), bus_driver.clone());
+    return driver_unregister(bus_driver);
 }

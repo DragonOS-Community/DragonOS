@@ -117,7 +117,7 @@ fn signal_kill_something_info(
     // 暂时不支持特殊的kill操作
     if pid <= 0 {
         kwarn!("Kill operation not support: pid={}", pid);
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     // kill单个进程

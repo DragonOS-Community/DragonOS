@@ -2,6 +2,7 @@ pub mod x86_64;
 
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::*; //公开x86_64架构下的函数，使外界接口统一
+
 use crate::driver::pci::pci::{BusDeviceFunction, PciError, PciRoot, SegmentGroupNumber};
 /// TraitPciArch Pci架构相关函数，任何架构都应独立实现trait里的函数
 pub trait TraitPciArch {

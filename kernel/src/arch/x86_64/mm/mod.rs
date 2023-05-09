@@ -69,7 +69,7 @@ pub fn switch_mm(
 }
 
 /// @brief X86_64的内存管理架构结构体
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy,Hash)]
 pub struct X86_64MMArch;
 
 impl MemoryManagementArch for X86_64MMArch {
@@ -110,6 +110,8 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
+
+    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7fff_ffff_ffff);
 
     /// @brief 获取物理内存区域
     unsafe fn init() -> &'static [crate::mm::PhysMemoryArea] {
@@ -165,6 +167,16 @@ impl MemoryManagementArch for X86_64MMArch {
     /// @brief 判断虚拟地址是否合法
     fn virt_is_valid(virt: VirtAddr) -> bool {
         return virt.is_canonical();
+    }
+
+    /// 获取系统的初始页表（初始CR3的值）
+    fn initial_page_table() -> PhysAddr {
+        todo!()
+    }
+
+    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
+        // https://redox.longjin666.cn/xref/kernel/src/context/memory.rs?r=8e0f54cb#942
+        todo!()
     }
 }
 

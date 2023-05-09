@@ -6,6 +6,7 @@ pub mod lockref;
 pub mod mutex;
 pub mod printk;
 pub mod rbtree;
+pub mod libUI;
 #[macro_use]
 pub mod refcount;
 pub mod rwlock;
@@ -17,3 +18,4 @@ pub mod volatile;
 pub mod keyboard_parser;
 pub mod lazy_init;
 pub mod wait_queue;
+

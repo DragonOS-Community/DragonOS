@@ -103,26 +103,7 @@ void video_refresh_framebuffer(void *data)
  * true ->高级初始化：增加double buffer的支持
  * @return int
  */
-int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 video_init() 先被调用
-{
-    if (level == false)
-        init_frame_buffer();
-    else
-    {
-        rs_unregister_softirq(VIDEO_REFRESH_SIRQ);
-        // 计算开始时间
-        video_refresh_expire_jiffies = rs_timer_next_n_ms_jiffies(10 * REFRESH_INTERVAL);
-
-        // 创建video守护进程
-        video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, "Video refresh daemon");
-        video_daemon_pcb->virtual_runtime = 0; // 特殊情况， 最高优先级， 以后再改
-        // 启用屏幕刷新软中断
-        rs_register_softirq_video();
-        rs_raise_softirq(VIDEO_REFRESH_SIRQ);
-
-    }
-    return 0;
-}
+                                    
 
 /**
  * @brief 设置帧缓冲区刷新目标

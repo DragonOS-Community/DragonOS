@@ -53,13 +53,13 @@ struct scm_ui_framework_t
  * @brief 初始化屏幕管理模块
  *
  */
-void scm_init();
+extern void scm_init();
 
 /**
  * @brief 当内存管理单元被初始化之后，重新处理帧缓冲区问题
  * 
  */
-void scm_reinit();
+extern void scm_reinit();
 
 /**
  * @brief 向屏幕管理器注册UI框架（动态获取框架对象结构体）
@@ -77,7 +77,7 @@ int scm_register_alloc(const char *name, const uint8_t type, struct scm_ui_frame
  * @param ui 框架结构体指针
  * @return int 错误码
  */
-int scm_register(struct scm_ui_framework_t *ui);
+extern int scm_register(struct scm_ui_framework_t *ui);
 
 /**
  * @brief 向屏幕管理器卸载UI框架
@@ -85,7 +85,7 @@ int scm_register(struct scm_ui_framework_t *ui);
  * @param ui ui框架结构体
  * @return int
  */
-int scm_unregister(struct scm_ui_framework_t *ui);
+extern int scm_unregister(struct scm_ui_framework_t *ui);
 
 /**
  * @brief 向屏幕管理器卸载动态创建的UI框架
@@ -107,7 +107,7 @@ int scm_enable_alloc();
  *
  * @return int
  */
-int scm_enable_double_buffer();
+extern int scm_enable_double_buffer();
 
 /**
  * @brief 启用某个ui框架，将它的帧缓冲区渲染到屏幕上

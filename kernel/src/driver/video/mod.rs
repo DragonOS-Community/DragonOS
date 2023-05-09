@@ -9,7 +9,7 @@ use crate::{
     exception::softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
     include::bindings::bindings::video_refresh_framebuffer,
 };
-
+pub mod video;
 #[derive(Debug)]
 pub struct VideoRefreshFramebuffer {
     running: AtomicBool,

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use core::cell::UnsafeCell;
+
 use core::ops::{Deref, DerefMut};
 use core::ptr::read_volatile;
 
@@ -182,7 +183,16 @@ impl<T> SpinLock<T> {
             data: UnsafeCell::new(value),
         };
     }
-
+    // pub fn get_data(&self)-> T{
+    //     let data = unsafe { (*self.data.get()).clone() };        
+    //     // let data=self.data.into_inner();
+    //     // let data=self.data.get_mut();
+    //     return data;
+    // }
+    // pub fn get_data(&self) -> T {
+    //     let data_ref = unsafe { &*self.data.get() };
+    //     replace(&mut data_ref, unsafe { MaybeUninit::uninit().assume_init() })
+    // }
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<T> {
         self.lock.lock();

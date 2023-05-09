@@ -159,7 +159,7 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
  * @param BKcolor 背景色（RGB）
  * @return int
  */
-int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor);
+extern int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor);
 
 /**
  * @brief 获取textui的帧缓冲区能容纳的内容的行数
@@ -180,4 +180,4 @@ uint32_t __textui_get_current_window_id();
  *
  * @return int
  */
-int textui_init();
+extern int textui_init();

@@ -3,7 +3,8 @@ pub mod frame;
 
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
-    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block, BLACK, GREEN,
+    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block, BLACK,
+    GREEN,
 };
 use crate::libs::printk::PrintkWriter;
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
@@ -71,7 +72,7 @@ pub fn switch_mm(
 }
 
 /// @brief X86_64的内存管理架构结构体
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct X86_64MMArch;
 
 impl MemoryManagementArch for X86_64MMArch {
@@ -112,6 +113,8 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
+
+    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7fff_ffff_ffff);
 
     /// @brief 获取物理内存区域
     unsafe fn init() -> &'static [crate::mm::PhysMemoryArea] {
@@ -169,6 +172,16 @@ impl MemoryManagementArch for X86_64MMArch {
     fn virt_is_valid(virt: VirtAddr) -> bool {
         return virt.is_canonical();
     }
+
+    /// 获取系统的初始页表（初始CR3的值）
+    fn initial_page_table() -> PhysAddr {
+        todo!()
+    }
+
+    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
+        // https://redox.longjin666.cn/xref/kernel/src/context/memory.rs?r=8e0f54cb#942
+        todo!()
+    }
 }
 
 impl X86_64MMArch {
@@ -176,7 +189,7 @@ impl X86_64MMArch {
         // 这个数组用来存放内存区域的信息（从C获取）
         let mut mb2_mem_info: [multiboot_mmap_entry_t; 512] = mem::zeroed();
         c_uart_send_str(0x3f8, "init_memory_area_from_multiboot2 begin\n\0".as_ptr());
-        
+
         let mut mb2_count: u32 = 0;
         multiboot2_iter(
             Some(multiboot2_get_memory),
@@ -221,12 +234,14 @@ impl VirtAddr {
 /// @brief 初始化内存管理模块
 pub fn mm_init() {
     c_uart_send_str(0x3f8, "mm_init\n\0".as_ptr());
-    PrintkWriter.write_fmt(format_args!("mm_init() called\n")).unwrap();
+    PrintkWriter
+        .write_fmt(format_args!("mm_init() called\n"))
+        .unwrap();
     // printk_color!(GREEN, BLACK, "mm_init() called\n");
     static _CALL_ONCE: AtomicBool = AtomicBool::new(false);
     if _CALL_ONCE
-    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-    .is_err()
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
     {
         c_uart_send_str(0x3f8, "mm_init err\n\0".as_ptr());
         panic!("mm_init() can only be called once");
@@ -241,7 +256,6 @@ pub fn mm_init() {
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
 }
-
 
 #[no_mangle]
 pub extern "C" fn rs_mm_init() {

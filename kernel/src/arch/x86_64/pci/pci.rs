@@ -1,7 +1,7 @@
 use crate::arch::TraitPciArch;
 use crate::driver::acpi::acpi::mcfg_find_segment;
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PciError, PciRoot, SegmentGroupNumber, PORT_PCI_CONFIG_ADDRESS,
+    BusDeviceFunction, PciAddr, PciError, PciRoot, SegmentGroupNumber, PORT_PCI_CONFIG_ADDRESS,
     PORT_PCI_CONFIG_DATA,
 };
 use crate::include::bindings::bindings::{
@@ -40,8 +40,8 @@ impl TraitPciArch for X86_64PciArch {
         }
     }
 
-    fn address_pci_to_address_memory(address: usize) -> Result<usize, PciError> {
-        Ok(address)
+    fn address_pci_to_physical(pci_address: PciAddr) -> usize {
+        return pci_address.data();
     }
 
     fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {

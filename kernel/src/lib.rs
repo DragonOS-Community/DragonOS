@@ -6,6 +6,7 @@
 #![feature(panic_info_message)]
 #![feature(drain_filter)] // 允许Vec的drain_filter特性
 #![feature(c_void_variant)]
+#![feature(trait_upcasting)]
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -45,7 +46,7 @@ extern crate thingbuf;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
-use mm::allocator::c::KernelAllocator;
+use crate::mm::allocator::c::KernelAllocator;
 
 // <3>
 use crate::{
@@ -98,7 +99,9 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-    net_init().expect("Failed to init network");
-    mm_init();
+    let r = net_init();
+    if r.is_err() {
+        kwarn!("net_init() failed: {:?}", r.err().unwrap());
+    }
     return 0;
 }

@@ -210,7 +210,7 @@ impl IndexNode for TtyDevice {
     }
 
     fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
@@ -222,7 +222,7 @@ impl IndexNode for TtyDevice {
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        return Err(SystemError::ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

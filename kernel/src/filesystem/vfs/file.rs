@@ -290,6 +290,12 @@ impl File {
 
         return Some(res);
     }
+
+    /// @brief 获取文件的类型
+    #[inline]
+    pub fn file_type(&self) -> FileType {
+        return self.file_type;
+    }
 }
 
 impl Drop for File {

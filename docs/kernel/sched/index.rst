@@ -12,3 +12,4 @@ DragonOS调度
    core
    cfs
    rt
+   kernel_timer

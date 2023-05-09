@@ -1,15 +1,42 @@
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 use smoltcp::{socket::dhcpv4, wire};
 
-use crate::{kdebug, kinfo, net::NET_DRIVERS, syscall::SystemError};
+use crate::{
+    driver::net::NetDriver,
+    kdebug, kinfo, kwarn,
+    libs::rwlock::RwLockReadGuard,
+    net::NET_DRIVERS,
+    syscall::SystemError,
+    time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
+};
+
+use super::socket::{SOCKET_SET, SOCKET_WAITQUEUE};
+
+/// The network poll function, which will be called by timer.
+///
+/// The main purpose of this function is to poll all network interfaces.
+struct NetWorkPollFunc();
+impl TimerFunction for NetWorkPollFunc {
+    fn run(&mut self) {
+        poll_ifaces_try_lock(10).ok();
+        let next_time = next_n_ms_timer_jiffies(10);
+        let timer = Timer::new(Box::new(NetWorkPollFunc()), next_time);
+        timer.activate();
+    }
+}
 
 pub fn net_init() -> Result<(), SystemError> {
     dhcp_query()?;
+    // Init poll timer function
+    let next_time = next_n_ms_timer_jiffies(5);
+    let timer = Timer::new(Box::new(NetWorkPollFunc()), next_time);
+    timer.activate();
     return Ok(());
 }
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DRIVERS.write();
 
-    let net_face = binding.get(&0).unwrap().clone();
+    let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
 
     drop(binding);
 
@@ -84,4 +111,50 @@ fn dhcp_query() -> Result<(), SystemError> {
     }
 
     return Err(SystemError::ETIMEDOUT);
+}
+
+pub fn poll_ifaces() {
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+    if guard.len() == 0 {
+        kwarn!("poll_ifaces: No net driver found!");
+        return;
+    }
+    let mut sockets = SOCKET_SET.lock();
+    for (_, iface) in guard.iter() {
+        iface.poll(&mut sockets).ok();
+    }
+    SOCKET_WAITQUEUE.wakeup_all((-1i64) as u64);
+}
+
+/// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。
+///
+/// @return 轮询成功，返回Ok(())
+/// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
+/// @return 没有网卡，返回SystemError::ENODEV
+pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
+    let mut i = 0;
+    while i < times {
+        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+        if guard.len() == 0 {
+            kwarn!("poll_ifaces: No net driver found!");
+            // 没有网卡，返回错误
+            return Err(SystemError::ENODEV);
+        }
+        let sockets = SOCKET_SET.try_lock();
+        // 加锁失败，继续尝试
+        if sockets.is_err() {
+            i += 1;
+            continue;
+        }
+
+        let mut sockets = sockets.unwrap();
+        for (_, iface) in guard.iter() {
+            iface.poll(&mut sockets).ok();
+        }
+        SOCKET_WAITQUEUE.wakeup_all((-1i64) as u64);
+        return Ok(());
+    }
+
+    // 尝试次数用完，返回错误
+    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }

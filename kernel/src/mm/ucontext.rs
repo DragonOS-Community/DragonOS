@@ -146,7 +146,7 @@ impl UserMappings {
 
             if flags.contains(MapFlags::MAP_FIXED) {
                 // 如果指定了MAP_FIXED标志，由于所指定的地址无法成功建立映射，则放弃映射，不对地址做修正
-                return Err(SystemError::EOPNOTSUPP);
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
 
             // 如果没有指定MAP_FIXED标志，那么就对地址做修正

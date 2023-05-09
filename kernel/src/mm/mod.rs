@@ -38,7 +38,7 @@ pub fn phys_2_virt(addr: usize) -> usize {
     addr + PAGE_OFFSET as usize
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd,Hash)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub enum PageTableKind {
     /// 用户可访问的页表
     User,
@@ -47,7 +47,7 @@ pub enum PageTableKind {
 }
 
 /// 物理内存地址
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd,Hash)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct PhysAddr(usize);
 
@@ -83,7 +83,7 @@ impl Debug for PhysAddr {
 }
 
 /// 虚拟内存地址
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd,Hash)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct VirtAddr(usize);
 
@@ -285,7 +285,7 @@ pub trait MemoryManagementArch: Clone + Copy {
 /// 该结构体用于表示一个虚拟地址范围，包括起始地址与大小
 ///
 /// 请注意与VMA进行区分，该结构体被VMA所包含
-#[derive(Debug, Clone, Copy, PartialEq, Eq,Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VirtRegion {
     start: VirtAddr,
     size: usize,

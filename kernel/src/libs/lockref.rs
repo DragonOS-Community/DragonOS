@@ -114,13 +114,13 @@ impl LockRef {
         return Err(SystemError::ETIMEDOUT.to_posix_errno());
     }
 
-    /// @brief 对于不支持无锁lockref的架构，直接返回Err(SystemError::ENOTSUP)，表示不支持
+    /// @brief 对于不支持无锁lockref的架构，直接返回Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)，表示不支持
     #[cfg(not(target_arch = "x86_64"))]
     #[inline]
     fn cmpxchg_loop(&mut self, mode: CmpxchgMode) -> Result<i32, i32> {
-        use crate::include::bindings::bindings::ENOTSUP;
+        use crate::include::bindings::bindings::EOPNOTSUPP_OR_ENOTSUP;
 
-        return Err(SystemError::ENOTSUP.to_posix_errno());
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.to_posix_errno());
     }
 
     /// @brief 原子的将引用计数加1
@@ -239,7 +239,9 @@ impl LockRef {
             return Err(SystemError::EPERM);
         }
         // 由于cmpxchg超时，操作失败
-        if *cmpxchg_result.as_ref().unwrap_err() != SystemError::ENOTSUP.to_posix_errno() {
+        if *cmpxchg_result.as_ref().unwrap_err()
+            != SystemError::EOPNOTSUPP_OR_ENOTSUP.to_posix_errno()
+        {
             return Err(SystemError::EFAULT);
         }
 

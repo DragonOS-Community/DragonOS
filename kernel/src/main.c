@@ -38,6 +38,7 @@
 
 extern int rs_tty_init();
 extern void rs_softirq_init();
+extern void rs_mm_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -92,7 +93,13 @@ void system_initialize()
     sys_vector_init();
 
     //  初始化内存管理单元
-    mm_init();
+    // mm_init();
+    rs_mm_init();
+
+    while (1)
+    {
+        /* code */
+    }
 
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
@@ -160,7 +167,7 @@ void system_initialize()
     io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
-    
+
     process_init();
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
@@ -173,7 +180,7 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
-   
+
     // 这里不能删除，否则在O1会报错
     // while (1)
     //     pause();

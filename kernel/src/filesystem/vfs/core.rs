@@ -14,6 +14,7 @@ use crate::{
         fat::fs::FATFileSystem,
         procfs::ProcFS,
         ramfs::RamFS,
+        sysfs::SysFS,
         vfs::{file::File, mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::PAGE_4K_SIZE,
@@ -63,6 +64,9 @@ pub extern "C" fn vfs_init() -> i32 {
     root_inode
         .create("dev", FileType::Dir, 0o777)
         .expect("Failed to create /dev");
+    root_inode
+        .create("sys", FileType::Dir, 0o777)
+        .expect("Failed to create /sys");
 
     // // 创建procfs实例
     let procfs: Arc<ProcFS> = ProcFS::new();
@@ -84,6 +88,16 @@ pub extern "C" fn vfs_init() -> i32 {
         .mount(devfs)
         .expect("Failed to mount devfs");
     kinfo!("DevFS mounted.");
+
+    // 创建 sysfs 实例
+    let sysfs: Arc<SysFS> = SysFS::new();
+    // sysfs 挂载
+    let _t = root_inode
+        .find("sys")
+        .expect("Cannot find /sys")
+        .mount(sysfs)
+        .expect("Failed to mount sysfs");
+    kinfo!("SysFS mounted.");
 
     let root_inode = ROOT_INODE().list().expect("VFS init failed");
     if root_inode.len() > 0 {
@@ -126,6 +140,8 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let proc: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
     let binding = ROOT_INODE().find("dev").expect("DevFS not mounted!").fs();
     let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
+    let binding = ROOT_INODE().find("sys").expect("SysFs not mounted!").fs();
+    let sys: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
@@ -134,6 +150,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     // 把上述文件系统,迁移到新的文件系统下
     do_migrate(new_root_inode.clone(), "proc", proc)?;
     do_migrate(new_root_inode.clone(), "dev", dev)?;
+    do_migrate(new_root_inode.clone(), "sys", sys)?;
 
     unsafe {
         // drop旧的Root inode

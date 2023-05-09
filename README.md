@@ -94,6 +94,7 @@
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
 - [FindWangHao](https://github.com/FindWangHao)
+- [ferchiel](https://github.com/ferchiel)
 - 叶锦毅
 - 林
 - Albert

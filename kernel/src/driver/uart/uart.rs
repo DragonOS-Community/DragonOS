@@ -156,10 +156,10 @@ impl UartDriver {
     /// @param str 发送字符切片
     /// @return None
     #[allow(dead_code)]
-    fn uart_send(uart_port: &UartPort, str: &str) {
+    fn uart_send(uart_port: &UartPort, s: &str) {
         let port = uart_port.to_u16();
         while UartDriver::is_transmit_empty(port) == false {
-            for c in str.bytes() {
+            for c in s.bytes() {
                 unsafe {
                     io_out8(port, c);
                 }
@@ -202,11 +202,11 @@ pub extern "C" fn c_uart_read(port: u16) -> u8 {
 ///@param port 串口端口
 ///@param str 字符串S
 #[no_mangle]
-pub extern "C" fn c_uart_send_str(port: u16, str: *const u8) {
+pub extern "C" fn c_uart_send_str(port: u16, s: *const u8) {
     unsafe {
-        let mut i = 0;
-        while *offset(str, i) != '\0' as u8 {
-            c_uart_send(port, *offset(str, i));
+        let mut i = 0isize;
+        while *offset(s, i) != '\0' as u8 {
+            c_uart_send(port, *offset(s, i));
             i = i + 1;
         }
     }

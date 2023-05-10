@@ -5,6 +5,7 @@ use alloc::{
     collections::LinkedList,
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use lazy_static::__Deref;
 
@@ -26,6 +27,8 @@ lazy_static! {
     pub static ref CLOCKSOUCE_WATCHDOG:SpinLock<ClocksouceWatchdog>  = SpinLock::new(ClocksouceWatchdog::new());
 
     pub static ref OVERRIDE_NAME: SpinLock<String> = SpinLock::new(String::from(""));
+
+    pub static ref DEFAULT_CLOCK:Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
 
 }
 //一些应该放在jiffies里里面的常量 暂时先放一下
@@ -49,7 +52,7 @@ pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 // 时钟周期数
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
-pub struct CycleNum(u64);
+pub struct CycleNum(pub u64);
 impl CycleNum {
     #[inline(always)]
     pub fn new(cycle: u64) -> Self {
@@ -159,6 +162,31 @@ pub trait Clocksource: Send + Sync {
 }
 
 impl dyn Clocksource {
+    pub fn clocksource_resume() {
+        let list = CLOCKSOURCE_LIST.lock();
+        for ele in list.iter() {
+            let data = ele.clocksource_data();
+            match ele.resume() {
+                Ok(_) => continue,
+                Err(e) => {
+                    kdebug!("clocksource {:?} resume failed", data.name)
+                }
+            }
+        }
+        clocksource_resume_watchdog();
+    }
+    pub fn clocksource_suspend() {
+        let list = CLOCKSOURCE_LIST.lock();
+        for ele in list.iter() {
+            let data = ele.clocksource_data();
+            match ele.suspend() {
+                Ok(_) => continue,
+                Err(e) => {
+                    kdebug!("clocksource {:?} suspend failed", data.name)
+                }
+            }
+        }
+    }
     // BUG 可能会出现格式转换导致结果错误的问题
     pub fn clocksource_max_deferment(&self) -> u64 {
         let cs_data_guard = self.clocksource_data();
@@ -183,6 +211,7 @@ impl dyn Clocksource {
         self.update_clocksource_data(cs_data)?;
         self.clocksource_enqueue();
         self.clocksource_enqueue_watchdog();
+        clocksource_select();
         return Ok(());
     }
     /// 将时间源插入时间源队列
@@ -245,36 +274,11 @@ impl dyn Clocksource {
                 cs_watchdog.watchdog.replace(cs);
                 drop(cs_watchdog);
                 drop(list_guard);
-                self.clocksource_reset_watchdog();
+                clocksource_reset_watchdog();
             }
-            self.clocksource_start_watchdog();
+            clocksource_start_watchdog();
         }
         return Ok(());
-    }
-
-    pub fn clocksource_reset_watchdog(&self) {
-        let list_guard = &mut WATCHDOG_LIST.lock();
-        for ele in list_guard.iter() {
-            ele.clocksource_data()
-                .flags
-                .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
-        }
-    }
-    /// 启用检查器
-    pub fn clocksource_start_watchdog(&self) {
-        let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
-        // 如果watchdog未被设置或者已经启用了就退出
-        let watchdog_list = &WATCHDOG_LIST.lock();
-        if cs_watchdog.is_running || cs_watchdog.watchdog.is_none() || watchdog_list.is_empty() {
-            return;
-        }
-        // 生成一个定时器
-        let wd_timer_func: Box<WatchdogTimerFunc> = Box::new(WatchdogTimerFunc {});
-        cs_watchdog.timer_expires += clock() + WATCHDOG_INTERVAL;
-        cs_watchdog.last_check = cs_watchdog.watchdog.as_ref().unwrap().clone().read();
-        let wd_timer = Timer::new(wd_timer_func, cs_watchdog.timer_expires);
-        wd_timer.activate();
-        cs_watchdog.is_running = true;
     }
 
     /// 将时钟源设立为unstable
@@ -296,46 +300,132 @@ impl dyn Clocksource {
         return Ok(());
     }
 
-    /// 根据精度选择最优的时钟源，或者接受用户指定的时间源
-    pub fn clocksource_select(&self) {
-        let list_guard = &mut CLOCKSOURCE_LIST.lock();
-        if *FINISHED_BOOTING.lock() || list_guard.is_empty() {
-            return;
-        }
-        let mut best = list_guard.front().unwrap().clone();
-        let override_name = OVERRIDE_NAME.lock();
-        // 判断是否有用户空间指定的时间源
-        for ele in list_guard.iter() {
-            if ele.clocksource_data().name.eq(override_name.deref()) {
-                // TODO 判断是否是高精度模式
-                // 如果是高精度模式，但是时钟源不支持高精度模式的话，就要退出循环
-                best = ele.clone();
-                break;
+    /// 将时间源从被监视链表中弹出
+    fn clocksource_dequeue_watchdog(&self) {
+        let data = self.clocksource_data();
+        let locked_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
+        let watchdog = locked_watchdog
+            .get_watchdog()
+            .clone()
+            .unwrap()
+            .clocksource_data();
+        drop(locked_watchdog);
+
+        let list = &mut WATCHDOG_LIST.lock();
+        // 要删除的时钟源是被监控的
+        let size = list.len();
+        let mut del_pos: usize = size;
+        for (pos, ele) in list.iter().enumerate() {
+            let ele_data = ele.clocksource_data();
+            if ele_data.name.eq(&data.name) && ele_data.rating.eq(&data.rating) {
+                del_pos = pos;
             }
         }
-        let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
-        let best_name = &best.clocksource_data().name;
-        if cur_clocksource.clocksource_data().name.eq(best_name) {
-            kinfo!("Switching to clocksource {:?}\n", best_name);
-            drop(cur_clocksource);
-            CUR_CLOCKSOURCE.lock().replace(best);
-            // TODO 通知timerkeeping 切换了时间源
+        if data
+            .flags
+            .contains(ClocksourceFlags::CLOCK_SOURCE_MUST_VERIFY)
+        {
+            // 删除符合的时钟源
+            if del_pos != size {
+                let mut temp_list = list.split_off(del_pos);
+                temp_list.pop_front();
+                list.append(&mut temp_list);
+            }
+        } else if watchdog.name.eq(&data.name) && watchdog.rating.eq(&data.rating) {
+            // 如果要删除的时钟源是监视器，则需要找到一个新的监视器
+            // TODO 重新设置时钟源
+            // 将链表解锁防止reset中双重加锁 并释放保存的旧的watchdog的数据
+            drop(list);
+            drop(watchdog);
+            clocksource_reset_watchdog();
+
+            let list = &mut WATCHDOG_LIST.lock();
+            let mut replace_pos: usize = list.len();
+            let locked_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
+
+            for (pos, ele) in list.iter().enumerate() {
+                let ele_data = ele.clocksource_data();
+
+                if del_pos == pos
+                    || ele_data
+                        .flags
+                        .contains(ClocksourceFlags::CLOCK_SOURCE_MUST_VERIFY)
+                {
+                    continue;
+                }
+                let watchdog = locked_watchdog.get_watchdog().clone();
+                if watchdog.is_none()
+                    || ele_data.rating > watchdog.unwrap().clocksource_data().rating
+                {
+                    replace_pos = pos;
+                }
+            }
+            // 获取新的watchdog
+            let mut temp_list = list.split_off(replace_pos);
+            let new_wd = temp_list.front().unwrap().clone();
+            list.append(&mut temp_list);
+            // 替换watchdog
+            locked_watchdog.watchdog.replace(new_wd);
         }
+        let mut cs_data = self.clocksource_data();
+        cs_data
+            .flags
+            .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
+        self.update_clocksource_data(cs_data);
+        // TODO 停止当前的watchdog
+        // clocksource_stop_watchdog
+    }
+
+    /// 将时间源从链表中弹出
+    fn clocksource_dequeue(&self) {
+        let list = &mut CLOCKSOURCE_LIST.lock();
+        let data = self.clocksource_data();
+        let mut del_pos: usize = list.len();
+        for (pos, ele) in list.iter().enumerate() {
+            let ele_data = ele.clocksource_data();
+
+            if ele_data.name.eq(&data.name) && ele_data.rating.eq(&data.rating) {
+                del_pos = pos;
+            }
+        }
+        // 删除符合的时钟源
+        if del_pos != list.len() {
+            let mut temp_list = list.split_off(del_pos);
+            temp_list.pop_front();
+            list.append(&mut temp_list);
+        }
+    }
+
+    /// 注销一个时间源
+    fn clocksource_unregister(&self) {
+        self.clocksource_dequeue_watchdog();
+        self.clocksource_dequeue();
+        clocksource_select();
+    }
+
+    fn clocksource_change_rating(&self, rating: i32) {
+        self.clocksource_dequeue();
+        let mut data = self.clocksource_data();
+        data.set_rating(rating);
+        self.update_clocksource_data(data)
+            .expect("clocksource_change_rating:updata clocksource failed");
+        self.clocksource_enqueue();
+        clocksource_select();
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ClocksourceData {
     /// 时钟源名字
-    name: String,
+    pub name: String,
     /// 时钟精度
-    rating: i32,
-    mask: ClocksourceMask,
-    mult: u32,
-    shift: u32,
-    max_idle_ns: u32,
-    flags: ClocksourceFlags,
-    watchdog_last: CycleNum,
+    pub rating: i32,
+    pub mask: ClocksourceMask,
+    pub mult: u32,
+    pub shift: u32,
+    pub max_idle_ns: u32,
+    pub flags: ClocksourceFlags,
+    pub watchdog_last: CycleNum,
 }
 impl ClocksourceData {
     pub fn new(
@@ -424,6 +514,8 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             .contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
         {
             // TODO 启动wd thread
+            // BUG 不会重复启动多次嘛
+
             continue;
         }
         // 读时钟源现在的时间
@@ -486,6 +578,97 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
     return Ok(());
 }
 
+pub fn clocksource_watchdog_kthread() {
+    // 将unstable的时钟源都从监视链表移除
+    let mut del_vec: Vec<usize> = Vec::new();
+    let mut del_clocks: Vec<Arc<dyn Clocksource>> = Vec::new();
+    let wd_list = &mut WATCHDOG_LIST.lock();
+    for (pos, ele) in wd_list.iter().enumerate() {
+        let data = ele.clocksource_data();
+        if data.flags.contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE) {
+            del_vec.push(pos);
+            del_clocks.push(ele.clone());
+        }
+    }
+    for pos in del_vec {
+        let mut temp_list = wd_list.split_off(pos);
+        temp_list.pop_front();
+        wd_list.append(&mut temp_list);
+    }
+    drop(wd_list);
+    // 检查是否需要停止watchdog
+    clocksource_stop_watchdog();
+    // 将不稳定的时钟源精度都设置为最低
+    for clock in del_clocks.iter() {
+        clock.clocksource_change_rating(0);
+    }
+}
+/// 重置所有时间源被监视的标志位
+pub fn clocksource_reset_watchdog() {
+    let list_guard = &mut WATCHDOG_LIST.lock();
+    for ele in list_guard.iter() {
+        ele.clocksource_data()
+            .flags
+            .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
+    }
+}
+/// 停止检查器
+pub fn clocksource_stop_watchdog() {
+    let wd = &mut CLOCKSOUCE_WATCHDOG.lock();
+    let wd_list = &WATCHDOG_LIST.lock();
+    // BUG 后面的条件不是很懂
+    if !wd.is_running || (wd.watchdog.is_some() && !wd_list.is_empty()) {
+        return;
+    }
+    // TODO 当实现了周期性的定时器后 需要将监视用的定时器删除
+    wd.is_running = false;
+}
+/// 重启检查器
+pub fn clocksource_resume_watchdog() {
+    clocksource_reset_watchdog();
+}
+/// 启用检查器
+pub fn clocksource_start_watchdog() {
+    let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
+    // 如果watchdog未被设置或者已经启用了就退出
+    let watchdog_list = &WATCHDOG_LIST.lock();
+    if cs_watchdog.is_running || cs_watchdog.watchdog.is_none() || watchdog_list.is_empty() {
+        return;
+    }
+    // 生成一个定时器
+    let wd_timer_func: Box<WatchdogTimerFunc> = Box::new(WatchdogTimerFunc {});
+    cs_watchdog.timer_expires += clock() + WATCHDOG_INTERVAL;
+    cs_watchdog.last_check = cs_watchdog.watchdog.as_ref().unwrap().clone().read();
+    let wd_timer = Timer::new(wd_timer_func, cs_watchdog.timer_expires);
+    wd_timer.activate();
+    cs_watchdog.is_running = true;
+}
+/// 根据精度选择最优的时钟源，或者接受用户指定的时间源
+pub fn clocksource_select() {
+    let list_guard = &mut CLOCKSOURCE_LIST.lock();
+    if *FINISHED_BOOTING.lock() || list_guard.is_empty() {
+        return;
+    }
+    let mut best = list_guard.front().unwrap().clone();
+    let override_name = OVERRIDE_NAME.lock();
+    // 判断是否有用户空间指定的时间源
+    for ele in list_guard.iter() {
+        if ele.clocksource_data().name.eq(override_name.deref()) {
+            // TODO 判断是否是高精度模式
+            // 如果是高精度模式，但是时钟源不支持高精度模式的话，就要退出循环
+            best = ele.clone();
+            break;
+        }
+    }
+    let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
+    let best_name = &best.clocksource_data().name;
+    if cur_clocksource.clocksource_data().name.eq(best_name) {
+        kinfo!("Switching to clocksource {:?}\n", best_name);
+        drop(cur_clocksource);
+        CUR_CLOCKSOURCE.lock().replace(best);
+        // TODO 通知timerkeeping 切换了时间源
+    }
+}
 // TODO 应该放在jiffies.rs
 pub const fn sh_div(nom: u32, den: u32, lsh: u32) -> u32 {
     (((nom) / (den)) << (lsh)) + ((((nom) % (den)) << (lsh)) + (den) / 2) / (den)
@@ -508,6 +691,17 @@ impl Clocksource for ClocksourceJiffies {
 
     fn clocksource(&self) -> Arc<dyn Clocksource> {
         self.0.lock().self_ref.upgrade().unwrap()
+    }
+    fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError> {
+        let d = &mut self.0.lock().data;
+        d.set_flags(_data.flags);
+        d.set_mask(_data.mask);
+        d.set_max_idle_ns(_data.max_idle_ns);
+        d.set_mult(_data.mult);
+        d.set_name(_data.name);
+        d.set_rating(_data.rating);
+        d.set_shift(_data.shift);
+        return Ok(());
     }
 }
 impl ClocksourceJiffies {
@@ -532,6 +726,13 @@ impl ClocksourceJiffies {
     }
 }
 pub fn clocksource_default_clock() -> Arc<ClocksourceJiffies> {
-    let jiffies = ClocksourceJiffies::new();
-    return jiffies;
+    DEFAULT_CLOCK.clone()
+}
+
+pub fn clocksource_init() {
+    let cur_clocksource = &mut CUR_CLOCKSOURCE.lock();
+    cur_clocksource.replace(clocksource_default_clock());
+    *FINISHED_BOOTING.lock() = true;
+    // 清除不稳定的时钟源
+    clocksource_watchdog_kthread();
 }

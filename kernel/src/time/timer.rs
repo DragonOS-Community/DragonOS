@@ -19,6 +19,8 @@ use crate::{
     syscall::SystemError,
 };
 
+use super::timekeeping::update_wall_time;
+
 const MAX_TIMEOUT: i64 = i64::MAX;
 const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
 static mut TIMER_JIFFIES: u64 = 0;
@@ -272,6 +274,7 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
 
 pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     unsafe { TIMER_JIFFIES += add_jiffies };
+    update_wall_time();
     return unsafe { TIMER_JIFFIES };
 }
 pub fn clock() -> u64 {

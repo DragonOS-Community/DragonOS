@@ -16,7 +16,7 @@ use super::core::{sched_enqueue, Scheduler};
 
 /// 声明全局的cfs调度器实例
 
-pub static mut CFS_SCHEDULER_PTR: *mut SchedulerCFS = null_mut();
+
 
 /// @brief 获取cfs调度器实例的可变引用
 #[inline]
@@ -25,12 +25,17 @@ pub fn __get_cfs_scheduler() -> &'static mut SchedulerCFS {
 }
 
 /// @brief 初始化cfs调度器
-pub unsafe fn sched_cfs_init() {
-    if CFS_SCHEDULER_PTR.is_null() {
-        CFS_SCHEDULER_PTR = Box::leak(Box::new(SchedulerCFS::new()));
-    } else {
-        kBUG!("Try to init CFS Scheduler twice.");
-        panic!("Try to init CFS Scheduler twice.");
+pub static mut CFS_SCHEDULER_PTR: Option<Box<SchedulerCFS>> = None;
+
+pub fn sched_cfs_init() {
+    unsafe {
+        if CFS_SCHEDULER_PTR.is_none() {
+            let scheduler = Box::new(SchedulerCFS::new());
+            CFS_SCHEDULER_PTR = Some(scheduler);
+        } else {
+            kBUG!("Try to init CFS Scheduler twice.");
+            panic!("Try to init CFS Scheduler twice.");
+        }
     }
 }
 

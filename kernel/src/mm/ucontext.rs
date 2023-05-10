@@ -34,6 +34,12 @@ pub struct UserMapper {
     pub utable: PageMapper,
 }
 
+impl UserMapper {
+    pub fn new(utable: PageMapper) -> Self {
+        return Self { utable };
+    }
+}
+
 impl Drop for UserMapper {
     fn drop(&mut self) {
         if self.utable.is_current() {

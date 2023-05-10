@@ -1,15 +1,17 @@
 pub mod barrier;
 pub mod frame;
 
+use crate::arch::mm::frame::FRAME_ALLOCATOR;
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
-    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block, BLACK,
-    GREEN,
+    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block,
 };
 use crate::libs::printk::PrintkWriter;
+use crate::mm::kernel_mapper::KernelMapper;
+use crate::mm::page::PageEntry;
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
 use crate::syscall::SystemError;
-use crate::{kdebug, kinfo, printk_color};
+use crate::{kdebug, kinfo};
 
 use core::arch::asm;
 use core::ffi::c_void;
@@ -29,6 +31,13 @@ static mut PHYS_MEMORY_AREAS: [PhysMemoryArea; 512] = [PhysMemoryArea {
     base: PhysAddr::new(0),
     size: 0,
 }; 512];
+
+/// 初始的CR3寄存器的值，用于存储系统启动时内核的页表的位置
+static mut INITIAL_CR3_VALUE: usize = 0;
+
+/// 内核的第一个页表在pml4中的索引
+/// 顶级页表的[256, 512)项是内核的页表
+static KERNEL_PML4E_NO: usize = (X86_64MMArch::PHYS_OFFSET & ((1 << 48) - 1)) >> 39;
 
 #[derive(Clone, Copy)]
 pub struct X86_64MMBootstrapInfo {
@@ -175,12 +184,36 @@ impl MemoryManagementArch for X86_64MMArch {
 
     /// 获取系统的初始页表（初始CR3的值）
     fn initial_page_table() -> PhysAddr {
-        todo!()
+        unsafe {
+            return PhysAddr::new(INITIAL_CR3_VALUE);
+        }
     }
 
+    /// @brief 创建新的顶层页表
+    ///
+    /// 该函数会创建页表并复制内核的映射到新的页表中
+    ///
+    /// @return 新的页表
     fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
-        // https://redox.longjin666.cn/xref/kernel/src/context/memory.rs?r=8e0f54cb#942
-        todo!()
+        let new_umapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::User, FRAME_ALLOCATOR).ok_or(SystemError::ENOMEM)?
+        };
+
+        let current_ktable: KernelMapper = KernelMapper::lock();
+        let copy_mapping = |pml4_entry_no| unsafe {
+            let entry: PageEntry<X86_64MMArch> = current_ktable
+                .table()
+                .entry(pml4_entry_no)
+                .unwrap_or_else(|| panic!("entry {} not found", pml4_entry_no));
+            new_umapper.table().set_entry(pml4_entry_no, entry)
+        };
+
+        // 复制内核的映射
+        for pml4_entry_no in KERNEL_PML4E_NO..512 {
+            copy_mapping(pml4_entry_no);
+        }
+
+        return Ok(crate::mm::ucontext::UserMapper::new(new_umapper));
     }
 }
 

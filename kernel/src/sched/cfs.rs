@@ -25,8 +25,8 @@ pub fn __get_cfs_scheduler() -> &'static mut SchedulerCFS {
 }
 
 /// @brief 初始化cfs调度器
-pub fn sched_cfs_init() {
-    unsafe {
+pub unsafe fn sched_cfs_init() {
+     
         if CFS_SCHEDULER_PTR.is_none() {
             let scheduler = Box::new(SchedulerCFS::new());
             CFS_SCHEDULER_PTR = Some(scheduler);
@@ -34,7 +34,7 @@ pub fn sched_cfs_init() {
             kBUG!("Try to init CFS Scheduler twice.");
             panic!("Try to init CFS Scheduler twice.");
         }
-    }
+    
 }
 
 /// @brief CFS队列（per-cpu的）

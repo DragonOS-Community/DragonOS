@@ -1,9 +1,11 @@
+OLD_LIBC_INSTALL_PATH=$(ROOT_PATH)/bin/sysroot/usr/old_libc
+
 # 获得当前git提交的sha1,并截取前8位
 GIT_COMMIT_SHA1=$(shell git log -n 1 | head -n 1 | cut -d ' ' -f 2 | cut -c1-8)
 
 all: about.o
 
-	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/about  $(shell find . -name "*.o") $(ROOT_PATH)/bin/sysroot/usr/lib/libc.a -T about.lds
+	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/about  $(shell find . -name "*.o") $(OLD_LIBC_INSTALL_PATH)/lib/libc.a -T about.lds
 
 	$(OBJCOPY) -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/about $(output_dir)/about.elf
 

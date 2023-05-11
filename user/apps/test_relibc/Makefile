@@ -1,6 +1,6 @@
-CC=x86_64-elf-gcc
-LD=x86_64-elf-ld
-OBJCOPY=x86_64-dragonos-objcopy
+CC=$(DragonOS_GCC)/x86_64-elf-gcc
+LD=ld
+OBJCOPY=objcopy
 # 修改这里，把它改为你的relibc的sysroot路径
 RELIBC_OPT=$(DADK_BUILD_CACHE_DIR_RELIBC_0_1_0)
 CFLAGS=-I $(RELIBC_OPT)/include

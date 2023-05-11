@@ -2,7 +2,7 @@ user_sub_dirs = apps
 
 SUBDIR_ROOTS := . 
 DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
-GARBAGE_PATTERNS := *.o *.s~ *.s *.S~ *.c~ *.h~ sys_api_lib *.a
+GARBAGE_PATTERNS := *.o sys_api_lib *.a
 GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 
 

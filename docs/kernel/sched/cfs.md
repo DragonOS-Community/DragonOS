@@ -4,7 +4,7 @@
 
 ## 1. CFSQueue 介绍
 
-&emsp;&emsp; CFSQueue是用来存放普通进程的调度队列，每个CPU维护一个RTQueue，主要使用Vec作为主要存储结构来实现。
+&emsp;&emsp; CFSQueue是用来存放普通进程的调度队列，每个CPU维护一个CFSQueue，主要使用Vec作为主要存储结构来实现。
 
 ### 1.1 主要函数
 1. enqueue(): 将pcb入队列

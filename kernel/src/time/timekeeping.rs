@@ -158,7 +158,7 @@ pub fn getnstimeofday() -> TimeSpec {
 pub fn timekeeping_init() {
     timekeeper_init();
     kdebug!("timekeeper_init successfully");
-    let mut rtc_time: RtcTime = Default::default();
+    let mut rtc_time: RtcTime = RtcTime::default();
     rtc_time.get();
 
     // TODO 有ntp模块后 在此初始化ntp模块

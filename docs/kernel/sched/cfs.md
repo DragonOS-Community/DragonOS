@@ -17,7 +17,7 @@
 
 ### 2.1 主要函数
 
-1. sched(): 是对于Scheduler trait的sched()实现，是实时进程进行调度时的逻辑处理，该函数会返回接下来要执行的pcb，若没有符合要求的pcb，返回None
+1. sched(): 是对于Scheduler trait的sched()实现，是普通进程进行调度时的逻辑处理，该函数会返回接下来要执行的pcb，若没有符合要求的pcb，返回None
 2. enqueue(): 同样是对于Scheduler trait的sched()实现，将一个pcb加入调度器的调度队列
 3. update_cpu_exec_proc_jiffies(): 更新这个cpu上，这个进程的可执行时间。
 4. timer_update_jiffies(): 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间

@@ -36,7 +36,7 @@ pub unsafe fn sched_cfs_init() {
 /// @brief CFS队列（per-cpu的）
 #[derive(Debug)]
 struct CFSQueue {
-    /// 当前cpu上执行的进程，剩余的时间片
+    /// 当前cpu上执行的进程剩余的时间片
     cpu_exec_proc_jiffies: i64,
     /// 队列的锁
     lock: RawSpinlock,
@@ -99,7 +99,7 @@ impl CFSQueue {
         }
     }
     /// 获取运行队列的长度
-    pub fn get_cfs_queue_size(&mut self) -> usize {
+    fn get_cfs_queue_size(&mut self) -> usize {
         return self.queue.len();
     }
 }

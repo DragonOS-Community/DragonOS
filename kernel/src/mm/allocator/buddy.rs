@@ -1,4 +1,4 @@
-use crate::mm;
+use crate::{mm, kdebug};
 /// @Auther: Kong
 /// @Date: 2023-03-28 16:03:47
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/buddy.rs
@@ -11,7 +11,7 @@ use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 use core::{marker::PhantomData, mem};
 
 // 一个全局变量MAX_ORDER，表示最大的阶数
-const MAX_ORDER: usize = 11;
+const MAX_ORDER: u8 = 11;
 
 /// @brief: 用来表示 buddy 算法中的一个 buddy 块，整体存放在area的头部
 // 这种方式会出现对齐问题
@@ -21,9 +21,9 @@ pub struct BuddyEntry<A> {
     // 代表的页的起始地址
     base: PhysAddr,
     // entry的阶数
-    order: usize,
+    order: u8,
     // entry是否在Buddy中使用
-    pg_buddy: usize,
+    pg_buddy: bool,
     phantom: PhantomData<A>,
 }
 
@@ -44,7 +44,7 @@ impl<A: MemoryManagementArch> BuddyEntry<A> {
         Self {
             base: PhysAddr::new(0),
             order: 0,
-            pg_buddy: 0,
+            pg_buddy: false,
             phantom: PhantomData,
         }
     }
@@ -54,7 +54,7 @@ pub struct BuddyAllocator<A> {
     // buddy表的虚拟地址
     table_virt: VirtAddr,
     // 使用free_area来表示 MAX_ORDER 个阶数的空闲数组，每个数组元素都是一个链表，链表的每个元素都是一个BuddyEntry
-    free_area: [LinkedList<BuddyEntry<A>>; MAX_ORDER],
+    free_area: [LinkedList<BuddyEntry<A>>; MAX_ORDER as usize],
     total_used_pages: usize,
     phantom: PhantomData<A>,
 }
@@ -123,10 +123,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// @area: 要添加的area
     unsafe fn add_area(&mut self, area: mm::PhysMemoryArea) {
         // 计算area的阶数
-        let order = area.size >> A::PAGE_SHIFT;
+        let order = (area.size >> A::PAGE_SHIFT) as u8;
         // 计算area的起始地址
         let base = area.base;
-        let pg_buddy = 0 as usize;
+        let pg_buddy = false;
         let entry = BuddyEntry {
             base,
             order,
@@ -139,7 +139,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// @brief: 移除一个entry
     /// @param  entry
     pub fn remove_entry(&mut self, entry: BuddyEntry<A>) {
-        let order = entry.order;
+        let order = entry.order as usize;
         let mut count = 0;
         // 在迭代free_area时使用count统计次数
         for i in self.free_area[order].iter_mut() {
@@ -157,8 +157,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// @param  mut
     /// @param  entry
     unsafe fn add_entry(&mut self, entry: BuddyEntry<A>) {
-        let order = entry.order;
-        if entry.pg_buddy == 0 {
+        let order = entry.order as usize;
+        if entry.pg_buddy == false {
             self.free_area[order].push_back(entry);
         }
         let virt = self.table_virt.add(entry.base.data() >> A::PAGE_SHIFT);
@@ -181,19 +181,19 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         }
 
         // 计算要分配的页的阶数
-        let mut order = 0;
+        let mut order = 0 as u8;
         while (1 << order) < count.data() {
             order += 1;
         }
 
         // 从free_area中找到第一个能够满足要求的area
-        let mut entry = self.free_area[order].pop_front();
+        let mut entry = self.free_area[order as usize].pop_front();
         while entry.is_none() {
             order += 1;
             if order >= MAX_ORDER {
                 return None;
             }
-            entry = self.free_area[order].pop_front();
+            entry = self.free_area[order as usize].pop_front();
         }
         let mut entry = entry.unwrap();
 
@@ -203,7 +203,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
             let new_entry = BuddyEntry {
                 base: entry.base.add(1 << entry.order),
                 order: entry.order,
-                pg_buddy: 0,
+                pg_buddy: false,
                 phantom: PhantomData,
             };
             // // 将拆分后的entry的伙伴写入table_virt，并将伙伴添加到free_area中
@@ -211,7 +211,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         }
 
         // 更新entry的使用情况
-        entry.pg_buddy = 1;
+        entry.pg_buddy = true;
         entry.order = order;
         self.add_entry(entry);
         Some(entry.base)
@@ -222,12 +222,12 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         let start_page = base.data() >> A::PAGE_SHIFT;
         let mut entry = self.read_entry(start_page * mem::size_of::<BuddyEntry<A>>());
 
-        // 如果entry的pg_buddy位为0，说明entry已经被释放了，那么就直接返回
-        if entry.pg_buddy == 0 {
+        // 如果entry的pg_buddy为false，说明entry已经被释放了，那么就直接返回
+        if entry.pg_buddy == false {
             return;
         }
-        // 将entry的pg_buddy位设置为0
-        entry.pg_buddy = 0;
+        // 将entry的pg_buddy设置为false
+        entry.pg_buddy = false;
         self.add_entry(entry);
 
         // 如果entry的阶数小于MAX_ORDER，那么就将entry合并到buddy中
@@ -240,7 +240,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
             };
             let buddy = self.read_entry(buddy_page * mem::size_of::<BuddyEntry<A>>());
             // 如果entry的buddy的阶数不等于entry的阶数，或者entry的buddy的pg_buddy位为1，那么就退出循环
-            if buddy.order != entry.order || buddy.pg_buddy == 1 {
+            if buddy.order != entry.order || buddy.pg_buddy == true {
                 break;
             }
             self.add_entry(buddy);
@@ -255,7 +255,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
             if entry.base.data() > buddy.base.data() {
                 entry.base = buddy
                     .base
-                    .add((1 << (entry.order + A::PAGE_SHIFT)) - (1 << A::PAGE_SHIFT));
+                    .add((1 << (entry.order + (A::PAGE_SHIFT as u8))) - (1 << A::PAGE_SHIFT));
             }
 
             // 将entry添加到free_area中
@@ -270,7 +270,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         while i < self.total_used_pages * Self::BUDDY_ENTRIES {
             let entry = self.read_entry(i * mem::size_of::<BuddyEntry<A>>());
             total += 1 << entry.order;
-            if entry.pg_buddy == 1 {
+            if entry.pg_buddy == true {
                 used += 1 << entry.order;
                 // 让i跳过已经使用的页
                 i += 1 << entry.order;

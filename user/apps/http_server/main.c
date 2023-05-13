@@ -17,6 +17,16 @@
 
 #define DEFAULT_PAGE "/index.html"
 
+int security_check(char *path)
+{
+    // 检查路径是否包含 ..
+    if (strstr(path, ".."))
+    {
+        return 0;
+    }
+    return 1;
+}
+
 ssize_t send_response(int sockfd, char *response)
 {
     return write(sockfd, response, strlen(response));
@@ -130,6 +140,13 @@ void handle_request(int sockfd, char *request)
         else
         {
             sprintf(path, "%s%s", WEB_ROOT, url);
+        }
+        if (!security_check(path))
+        {
+            send_response(
+                sockfd,
+                "HTTP/1.1 403 Forbidden\nContent-Type: text/html\n\n<html><body><h1>403 Forbidden</h1><p>DragonOS Http Server</p></body></html>");
+            return;
         }
         send_file(sockfd, path);
     }

@@ -8,7 +8,7 @@ CFLAGS=-I $(RELIBC_OPT)/include
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
 output_dir=$(DADK_BUILD_CACHE_DIR_TEST_RELIBC_0_1_0)
 
-LIBC_OBJS:=$(shell find $(RELIBC_OPT)/lib -name "*.o")
+LIBC_OBJS:=$(shell find $(RELIBC_OPT)/lib -name "*.o" | sort )
 LIBC_OBJS+=$(RELIBC_OPT)/lib/libc.a
 
 all: main.o

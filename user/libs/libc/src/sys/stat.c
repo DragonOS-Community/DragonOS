@@ -16,8 +16,3 @@ int mstat(struct mstat_t *stat)
 {
     return syscall_invoke(SYS_MSTAT, (uint64_t)stat, 0, 0, 0, 0, 0, 0, 0);
 }
-
-int pipe(int *fd)
-{
-    return syscall_invoke(SYS_PIPE, (uint64_t)fd, 0, 0,0,0,0,0,0);
-}

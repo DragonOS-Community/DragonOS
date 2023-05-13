@@ -90,7 +90,7 @@ mkdir -p ${root_folder}/bin/disk_mount/proc
 mkdir -p ${root_folder}/bin/disk_mount/usr
 cp -r ${root_folder}/bin/user/* ${root_folder}/bin/disk_mount/bin
 touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
-cp -r ${root_folder}/bin/sysroot/usr/* ${root_folder}/bin/disk_mount/usr/ 
+cp -r ${root_folder}/bin/sysroot/* ${root_folder}/bin/disk_mount/
 
 # 设置 grub 相关数据
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then

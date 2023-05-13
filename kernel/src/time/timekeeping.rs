@@ -1,13 +1,13 @@
 use alloc::{boxed::Box, sync::Arc};
-use core::{intrinsics::unlikely, ptr::null_mut, time};
+use core::{intrinsics::unlikely, ptr::null_mut};
 
 use crate::{
     arch::CurrentIrqArch, driver::timers::rtc::rtc::RtcTime, exception::InterruptArch, kdebug,
-    libs::rwlock::RwLock, sched::rt, time::TimeSpec,
+    libs::rwlock::RwLock, time::{TimeSpec, jiffies::clocksource_default_clock},
 };
 
 use super::{
-    clocksource::{clocksource_cyc2ns, clocksource_default_clock, Clocksource, CycleNum, HZ},
+    clocksource::{clocksource_cyc2ns, Clocksource, CycleNum, HZ},
     NSEC_PER_SEC,
 };
 
@@ -169,6 +169,7 @@ pub fn timekeeping_init() {
     // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
     let timekeeper = &mut timekeeper().0.write();
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    
     // 初始化wall time到monotonic的时间
     let mut nsec = -timekeeper.xtime.tv_nsec;
     let mut sec = -timekeeper.xtime.tv_sec;

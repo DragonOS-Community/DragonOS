@@ -1,11 +1,24 @@
+use alloc::{
+    string::ToString,
+    sync::{Arc, Weak},
+};
 
+use crate::{libs::spinlock::SpinLock, syscall::SystemError};
+
+use super::{
+    clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
+    timer::clock,
+    NSEC_PER_SEC,
+};
+lazy_static! {
+    pub static ref DEFAULT_CLOCK: Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
+}
 //一些应该放在jiffies里里面的常量 暂时先放一下
 pub const CLOCK_TICK_RATE: u32 = HZ as u32 * 100000;
 pub const JIFFIES_SHIFT: u32 = 8;
 pub const LATCH: u32 = ((CLOCK_TICK_RATE + (HZ as u32) / 2) / HZ as u32) as u32;
 pub const ACTHZ: u32 = sh_div(CLOCK_TICK_RATE, LATCH, 8);
 pub const NSEC_PER_JIFFY: u32 = ((NSEC_PER_SEC << 8) / ACTHZ) as u32;
-// TODO 应该放在jiffies.rs
 pub const fn sh_div(nom: u32, den: u32, lsh: u32) -> u32 {
     (((nom) / (den)) << (lsh)) + ((((nom) % (den)) << (lsh)) + (den) / 2) / (den)
 }
@@ -45,11 +58,11 @@ impl ClocksourceJiffies {
         let data = ClocksourceData {
             name: "jiffies".to_string(),
             rating: 1,
-            mask: ClocksourceMask { bits: 0xffffffff },
+            mask: ClocksourceMask::new(0xffffffff),
             mult: NSEC_PER_JIFFY << JIFFIES_SHIFT,
             shift: JIFFIES_SHIFT,
             max_idle_ns: Default::default(),
-            flags: ClocksourceFlags { bits: 0 },
+            flags: ClocksourceFlags::new(0),
             watchdog_last: CycleNum(0),
         };
         let jieffies = Arc::new(ClocksourceJiffies(SpinLock::new(InnerJiffies {
@@ -60,4 +73,11 @@ impl ClocksourceJiffies {
 
         return jieffies;
     }
+}
+pub fn clocksource_default_clock() -> Arc<ClocksourceJiffies> {
+    DEFAULT_CLOCK.clone()
+}
+
+pub fn jiffies_init() {
+    //注册jiffies
 }

@@ -1,18 +1,15 @@
 use core::{ffi::c_void, intrinsics::log2f32};
 
-use alloc::{
-    boxed::Box,
-    collections::LinkedList,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc, vec::Vec};
 use lazy_static::__Deref;
 
-use crate::{kdebug, kinfo, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{
+    include::bindings::bindings::run_watchdog_kthread, kdebug, kinfo, libs::spinlock::SpinLock,
+    syscall::SystemError,
+};
 
 use super::{
-    jiffies::{ClocksourceJiffies, InnerJiffies},
+    jiffies::{clocksource_default_clock, ClocksourceJiffies},
     timer::{clock, Timer, TimerFunction},
     NSEC_PER_SEC,
 };
@@ -29,10 +26,8 @@ lazy_static! {
 
     pub static ref OVERRIDE_NAME: SpinLock<String> = SpinLock::new(String::from(""));
 
-    pub static ref DEFAULT_CLOCK:Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
 
 }
-
 
 /// 正在被使用时钟源
 pub static CUR_CLOCKSOURCE: SpinLock<Option<Arc<dyn Clocksource>>> = SpinLock::new(None);
@@ -72,12 +67,11 @@ bitflags! {
 
     #[derive(Default)]
     pub struct ClocksourceMask:u64{
-
     }
     /// 时钟状态标记
     #[derive(Default)]
     pub struct ClocksourceFlags:u64{
-        const CLOCK_SOURCE_IS_CONTINUOUS  =0x01;
+      const CLOCK_SOURCE_IS_CONTINUOUS  =0x01;
         const CLOCK_SOURCE_MUST_VERIFY = 0x02;
         const CLOCK_SOURCE_WATCHDOG = 0x10;
         const CLOCK_SOURCE_VALID_FOR_HRES = 0x20;
@@ -92,6 +86,17 @@ impl From<u64> for ClocksourceMask {
         return Self::from_bits_truncate(u64::MAX);
     }
 }
+impl ClocksourceMask {
+    pub fn new(b: u64) -> Self {
+        Self { bits: b }
+    }
+}
+impl ClocksourceFlags {
+    pub fn new(b: u64) -> Self {
+        Self { bits: b }
+    }
+}
+
 pub struct ClocksouceWatchdog {
     /// 监视器
     watchdog: Option<Arc<dyn Clocksource>>,
@@ -158,31 +163,6 @@ pub trait Clocksource: Send + Sync {
 }
 
 impl dyn Clocksource {
-    pub fn clocksource_resume() {
-        let list = CLOCKSOURCE_LIST.lock();
-        for ele in list.iter() {
-            let data = ele.clocksource_data();
-            match ele.resume() {
-                Ok(_) => continue,
-                Err(e) => {
-                    kdebug!("clocksource {:?} resume failed", data.name)
-                }
-            }
-        }
-        clocksource_resume_watchdog();
-    }
-    pub fn clocksource_suspend() {
-        let list = CLOCKSOURCE_LIST.lock();
-        for ele in list.iter() {
-            let data = ele.clocksource_data();
-            match ele.suspend() {
-                Ok(_) => continue,
-                Err(e) => {
-                    kdebug!("clocksource {:?} suspend failed", data.name)
-                }
-            }
-        }
-    }
     // BUG 可能会出现格式转换导致结果错误的问题
     pub fn clocksource_max_deferment(&self) -> u64 {
         let cs_data_guard = self.clocksource_data();
@@ -481,6 +461,36 @@ impl ClocksourceData {
 pub fn clocksource_cyc2ns(cycles: CycleNum, mult: u32, shift: u32) -> u64 {
     return (cycles.data() * mult as u64) >> shift;
 }
+
+/// 将所有的时间源重启
+pub fn clocksource_resume() {
+    let list = CLOCKSOURCE_LIST.lock();
+    for ele in list.iter() {
+        let data = ele.clocksource_data();
+        match ele.resume() {
+            Ok(_) => continue,
+            Err(e) => {
+                kdebug!("clocksource {:?} resume failed", data.name)
+            }
+        }
+    }
+    clocksource_resume_watchdog();
+}
+
+/// 将所有的时间源暂停
+pub fn clocksource_suspend() {
+    let list = CLOCKSOURCE_LIST.lock();
+    for ele in list.iter() {
+        let data = ele.clocksource_data();
+        match ele.suspend() {
+            Ok(_) => continue,
+            Err(e) => {
+                kdebug!("clocksource {:?} suspend failed", data.name)
+            }
+        }
+    }
+}
+
 /// 根据watchdog的精度，来检查被监视的时钟源的误差
 /// 如果误差过大，时钟源将被标记为不稳定
 pub fn clocksource_watchdog() -> Result<(), SystemError> {
@@ -511,7 +521,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             .contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
         {
             // TODO 启动wd thread
-            run_watchdog_kthread();
+            unsafe { run_watchdog_kthread() };
 
             continue;
         }
@@ -575,6 +585,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
     return Ok(());
 }
 
+/// watchdog线程的逻辑
 pub fn clocksource_watchdog_kthread() {
     // 将unstable的时钟源都从监视链表移除
     let mut del_vec: Vec<usize> = Vec::new();
@@ -600,7 +611,8 @@ pub fn clocksource_watchdog_kthread() {
         clock.clocksource_change_rating(0);
     }
 }
-/// 重置所有时间源被监视的标志位
+
+/// 将所有被监视的时间源设置为未被监视
 pub fn clocksource_reset_watchdog() {
     let list_guard = &mut WATCHDOG_LIST.lock();
     for ele in list_guard.iter() {
@@ -609,6 +621,7 @@ pub fn clocksource_reset_watchdog() {
             .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
     }
 }
+
 /// 停止检查器
 pub fn clocksource_stop_watchdog() {
     let wd = &mut CLOCKSOUCE_WATCHDOG.lock();
@@ -619,10 +632,12 @@ pub fn clocksource_stop_watchdog() {
     // TODO 当实现了周期性的定时器后 需要将监视用的定时器删除
     wd.is_running = false;
 }
+
 /// 重启检查器
 pub fn clocksource_resume_watchdog() {
     clocksource_reset_watchdog();
 }
+
 /// 启用检查器
 pub fn clocksource_start_watchdog() {
     let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
@@ -639,6 +654,7 @@ pub fn clocksource_start_watchdog() {
     wd_timer.activate();
     cs_watchdog.is_running = true;
 }
+
 /// 根据精度选择最优的时钟源，或者接受用户指定的时间源
 pub fn clocksource_select() {
     let list_guard = &mut CLOCKSOURCE_LIST.lock();
@@ -666,11 +682,8 @@ pub fn clocksource_select() {
     }
 }
 
-pub fn clocksource_default_clock() -> Arc<ClocksourceJiffies> {
-    DEFAULT_CLOCK.clone()
-}
-
-pub fn clocksource_init() {
+/// clocksource模块加载完成
+pub fn clocksource_boot_finish() {
     let cur_clocksource = &mut CUR_CLOCKSOURCE.lock();
     cur_clocksource.replace(clocksource_default_clock());
     *FINISHED_BOOTING.lock() = true;
@@ -680,7 +693,7 @@ pub fn clocksource_init() {
 
 #[no_mangle]
 pub extern "C" fn rs_clocksource_init() {
-    clocksource_init();
+    clocksource_boot_finish();
 }
 #[no_mangle]
 pub extern "C" fn rs_clocksource_watchdog_kthread(_data: c_void) -> i32 {

@@ -125,6 +125,20 @@ void handle_request(int sockfd, char *request)
     http_version = strtok(NULL, "\r\n");
     
     printf("handle_request: method: %s, url: %s, http_version: %s\n", method, url, http_version);
+    // 检查空指针等异常情况
+    if (method == NULL || url == NULL || http_version == NULL)
+    {
+        send_response(sockfd, "HTTP/1.1 400 Bad Request\nContent-Type: text/html\n\n<html><body><h1>400 Bad "
+                              "Request</h1><p>DragonOS Http Server</p></body></html>");
+        return;
+    }
+    // 检查url是否为空
+    if (strlen(url) == 0)
+    {
+        send_response(sockfd, "HTTP/1.1 400 Bad Request\nContent-Type: text/html\n\n<html><body><h1>400 Bad "
+                              "Request</h1><p>DragonOS Http Server</p></body></html>");
+        return;
+    }
     int default_page = 0;
     if (url[strlen(url) - 1] == '/')
     {

@@ -1,5 +1,4 @@
 use crate::{
-    arch::MMArch,
     include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET},
     syscall::SystemError,
 };

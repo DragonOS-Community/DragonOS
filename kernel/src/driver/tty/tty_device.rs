@@ -12,7 +12,7 @@ use crate::{
     include::bindings::bindings::{textui_putchar, BLACK, WHITE},
     kerror,
     libs::rwlock::RwLock,
-    syscall::SystemError,
+    syscall::SystemError, kdebug, arch::asm::current::current_pcb,
 };
 
 use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
@@ -263,6 +263,7 @@ impl IndexNode for TtyDevice {
         }
         return Ok(());
     }
+
 }
 
 impl TtyDevicePrivateData {

@@ -1,4 +1,8 @@
-use core::{ffi::c_void, intrinsics::log2f32};
+use core::{
+    ffi::c_void,
+    intrinsics::log2f32,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc, vec::Vec};
 use lazy_static::__Deref;
@@ -32,12 +36,14 @@ lazy_static! {
 /// 正在被使用时钟源
 pub static CUR_CLOCKSOURCE: SpinLock<Option<Arc<dyn Clocksource>>> = SpinLock::new(None);
 /// 是否完成加载
-pub static FINISHED_BOOTING: SpinLock<bool> = SpinLock::new(false);
+pub static mut FINISHED_BOOTING: AtomicBool = AtomicBool::new(false);
 
-// Interval: 0.5sec Threshold: 0.0625s
-// BUG HZ无法获取
-pub const HZ: u64 = 1;
+/// Interval: 0.5sec Threshold: 0.0625s
+/// 系统节拍率
+pub const HZ: u64 = 1000;
+/// watchdog检查间隔
 pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
+/// 最大能接受的误差大小
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 
 // 时钟周期数
@@ -119,6 +125,38 @@ impl ClocksouceWatchdog {
     fn get_watchdog(&mut self) -> &mut Option<Arc<dyn Clocksource>> {
         &mut self.watchdog
     }
+
+    /// 启用检查器
+    pub fn clocksource_start_watchdog(&mut self) {
+        kdebug!("enter clocksource_start_watchdog");
+        // let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
+
+        // 如果watchdog未被设置或者已经启用了就退出
+        let watchdog_list = &WATCHDOG_LIST.lock();
+        if self.is_running || self.watchdog.is_none() || watchdog_list.is_empty() {
+            return;
+        }
+        // 生成一个定时器
+        let wd_timer_func: Box<WatchdogTimerFunc> = Box::new(WatchdogTimerFunc {});
+        self.timer_expires += clock() + WATCHDOG_INTERVAL;
+        self.last_check = self.watchdog.as_ref().unwrap().clone().read();
+        let wd_timer = Timer::new(wd_timer_func, self.timer_expires);
+        wd_timer.activate();
+        kdebug!("create a wd_timer");
+        self.is_running = true;
+        kdebug!("clocksource_start_watchdog");
+    }
+    /// 停止检查器
+    pub fn clocksource_stop_watchdog(&mut self, list_len: usize) {
+        kdebug!("enter clocksource_stop_watchdog func");
+        // let wd_list = &WATCHDOG_LIST.lock();
+        // kdebug!("clocksource_stop_watchdog :WATCHDOG_LIST.lock()");
+        if !self.is_running || (self.watchdog.is_some() && list_len != 0) {
+            return;
+        }
+        // TODO 当实现了周期性的定时器后 需要将监视用的定时器删除
+        self.is_running = false;
+    }
 }
 /// 定时检查器
 pub struct WatchdogTimerFunc;
@@ -161,21 +199,47 @@ pub trait Clocksource: Send + Sync {
     // 获取时钟源
     fn clocksource(&self) -> Arc<dyn Clocksource>;
 }
+// TODO log2 暂放
+pub fn log2(x: u32) -> u32 {
+    let mut result = 0;
+    let mut x = x;
 
+    if x >= 1 << 16 {
+        x >>= 16;
+        result |= 16;
+    }
+    if x >= 1 << 8 {
+        x >>= 8;
+        result |= 8;
+    }
+    if x >= 1 << 4 {
+        x >>= 4;
+        result |= 4;
+    }
+    if x >= 1 << 2 {
+        x >>= 2;
+        result |= 2;
+    }
+    if x >= 1 << 1 {
+        result |= 1;
+    }
+
+    result
+}
 impl dyn Clocksource {
     // BUG 可能会出现格式转换导致结果错误的问题
     pub fn clocksource_max_deferment(&self) -> u64 {
         let cs_data_guard = self.clocksource_data();
         let max_nsecs: u64;
         let mut max_cycles: u64;
-        max_cycles =
-            (1 << (63 - (unsafe { log2f32(cs_data_guard.mult as f32) } as u32 + 1))) as u64;
+        max_cycles = (1 << (63 - (log2(cs_data_guard.mult) + 1))) as u64;
         max_cycles = max_cycles.min(cs_data_guard.mask.bits);
         max_nsecs = clocksource_cyc2ns(
             CycleNum(max_cycles),
             cs_data_guard.mult,
             cs_data_guard.shift,
         );
+        kdebug!("clocksource_max_deferment");
         return max_nsecs - (max_nsecs >> 5);
     }
 
@@ -207,18 +271,25 @@ impl dyn Clocksource {
         let cs = self.clocksource();
         list_guard.push_back(cs);
         list_guard.append(&mut temp_list);
+        kdebug!(
+            "CLOCKSOURCE_LIST len = {:?},clocksource_enqueue sccessfully",
+            list_guard.len()
+        );
     }
 
     /// 将时间源插入监控队列
     pub fn clocksource_enqueue_watchdog(&self) -> Result<(), SystemError> {
+        kdebug!("enter clocksource_enqueue_watchdog");
         // BUG 可能需要lock irq
         let mut cs_data = self.clocksource_data();
-        let list_guard = &mut WATCHDOG_LIST.lock();
+        kdebug!("WATCHDOG_LIST.lock_irqsave()");
+
         let cs = self.clocksource();
         if cs_data
             .flags
             .contains(ClocksourceFlags::CLOCK_SOURCE_MUST_VERIFY)
         {
+            let list_guard = &mut WATCHDOG_LIST.lock_irqsave();
             // cs是被监视的
             cs_data
                 .flags
@@ -236,8 +307,10 @@ impl dyn Clocksource {
                     .insert(ClocksourceFlags::CLOCK_SOURCE_VALID_FOR_HRES);
                 cs.update_clocksource_data(cs_data.clone())?;
             }
+
             // 选择一个最优的监视器
             let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
+            kdebug!("CLOCKSOUCE_WATCHDOG.lock()");
             if cs_watchdog.watchdog.is_none()
                 || cs_data.rating
                     > cs_watchdog
@@ -249,12 +322,12 @@ impl dyn Clocksource {
             {
                 // 替换监视器
                 cs_watchdog.watchdog.replace(cs);
-                drop(cs_watchdog);
-                drop(list_guard);
                 clocksource_reset_watchdog();
             }
-            clocksource_start_watchdog();
+            cs_watchdog.clocksource_start_watchdog();
+            kdebug!("clocksource_start_watchdog successfully");
         }
+        kdebug!("clocksource_enqueue_watchdog successfully");
         return Ok(());
     }
 
@@ -350,7 +423,7 @@ impl dyn Clocksource {
             .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
         self.update_clocksource_data(cs_data);
         // TODO 停止当前的watchdog
-        clocksource_stop_watchdog();
+        CLOCKSOUCE_WATCHDOG.lock().clocksource_stop_watchdog(size-1);
     }
 
     /// 将时间源从链表中弹出
@@ -591,6 +664,8 @@ pub fn clocksource_watchdog_kthread() {
     let mut del_vec: Vec<usize> = Vec::new();
     let mut del_clocks: Vec<Arc<dyn Clocksource>> = Vec::new();
     let wd_list = &mut WATCHDOG_LIST.lock();
+    kdebug!("WATCHDOG_LIST.lock()");
+    // 将不稳定的时钟源弹出监视链表
     for (pos, ele) in wd_list.iter().enumerate() {
         let data = ele.clocksource_data();
         if data.flags.contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE) {
@@ -603,9 +678,14 @@ pub fn clocksource_watchdog_kthread() {
         temp_list.pop_front();
         wd_list.append(&mut temp_list);
     }
-    drop(wd_list);
+    // drop(wd_list);
+    // kdebug!("ready to lock watchdog");
     // 检查是否需要停止watchdog
-    clocksource_stop_watchdog();
+    // BUG 双重加锁
+    CLOCKSOUCE_WATCHDOG
+        .lock()
+        .clocksource_stop_watchdog(wd_list.len());
+    kdebug!("clocksource_stop_watchdog finished");
     // 将不稳定的时钟源精度都设置为最低
     for clock in del_clocks.iter() {
         clock.clocksource_change_rating(0);
@@ -620,17 +700,7 @@ pub fn clocksource_reset_watchdog() {
             .flags
             .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
     }
-}
-
-/// 停止检查器
-pub fn clocksource_stop_watchdog() {
-    let wd = &mut CLOCKSOUCE_WATCHDOG.lock();
-    let wd_list = &WATCHDOG_LIST.lock();
-    if !wd.is_running || (wd.watchdog.is_some() && !wd_list.is_empty()) {
-        return;
-    }
-    // TODO 当实现了周期性的定时器后 需要将监视用的定时器删除
-    wd.is_running = false;
+    kdebug!("clocksource_reset_watchdog successfully");
 }
 
 /// 重启检查器
@@ -638,27 +708,10 @@ pub fn clocksource_resume_watchdog() {
     clocksource_reset_watchdog();
 }
 
-/// 启用检查器
-pub fn clocksource_start_watchdog() {
-    let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
-    // 如果watchdog未被设置或者已经启用了就退出
-    let watchdog_list = &WATCHDOG_LIST.lock();
-    if cs_watchdog.is_running || cs_watchdog.watchdog.is_none() || watchdog_list.is_empty() {
-        return;
-    }
-    // 生成一个定时器
-    let wd_timer_func: Box<WatchdogTimerFunc> = Box::new(WatchdogTimerFunc {});
-    cs_watchdog.timer_expires += clock() + WATCHDOG_INTERVAL;
-    cs_watchdog.last_check = cs_watchdog.watchdog.as_ref().unwrap().clone().read();
-    let wd_timer = Timer::new(wd_timer_func, cs_watchdog.timer_expires);
-    wd_timer.activate();
-    cs_watchdog.is_running = true;
-}
-
 /// 根据精度选择最优的时钟源，或者接受用户指定的时间源
 pub fn clocksource_select() {
     let list_guard = &mut CLOCKSOURCE_LIST.lock();
-    if *FINISHED_BOOTING.lock() || list_guard.is_empty() {
+    if unsafe { FINISHED_BOOTING.load(Ordering::Relaxed) } || list_guard.is_empty() {
         return;
     }
     let mut best = list_guard.front().unwrap().clone();
@@ -672,13 +725,17 @@ pub fn clocksource_select() {
             break;
         }
     }
-    let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
-    let best_name = &best.clocksource_data().name;
-    if cur_clocksource.clocksource_data().name.eq(best_name) {
-        kinfo!("Switching to clocksource {:?}\n", best_name);
-        drop(cur_clocksource);
+    if CUR_CLOCKSOURCE.lock().as_ref().is_some() {
+        let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
+        let best_name = &best.clocksource_data().name;
+        if cur_clocksource.clocksource_data().name.ne(best_name) {
+            kinfo!("Switching to clocksource {:?}\n", best_name);
+            drop(cur_clocksource);
+            CUR_CLOCKSOURCE.lock().replace(best);
+            // TODO 通知timerkeeping 切换了时间源
+        }
+    } else {
         CUR_CLOCKSOURCE.lock().replace(best);
-        // TODO 通知timerkeeping 切换了时间源
     }
 }
 
@@ -686,13 +743,15 @@ pub fn clocksource_select() {
 pub fn clocksource_boot_finish() {
     let cur_clocksource = &mut CUR_CLOCKSOURCE.lock();
     cur_clocksource.replace(clocksource_default_clock());
-    *FINISHED_BOOTING.lock() = true;
+    // *unsafe { FINISHED_BOOTING.get_mut() } = true;
+    unsafe { FINISHED_BOOTING.store(true, Ordering::Relaxed) };
     // 清除不稳定的时钟源
     clocksource_watchdog_kthread();
+    kdebug!("clocksource_boot_finish");
 }
 
 #[no_mangle]
-pub extern "C" fn rs_clocksource_init() {
+pub extern "C" fn rs_clocksource_boot_finish() {
     clocksource_boot_finish();
 }
 #[no_mangle]

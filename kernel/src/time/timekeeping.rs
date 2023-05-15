@@ -2,8 +2,12 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{intrinsics::unlikely, ptr::null_mut};
 
 use crate::{
-    arch::CurrentIrqArch, driver::timers::rtc::rtc::RtcTime, exception::InterruptArch, kdebug,
-    libs::rwlock::RwLock, time::{TimeSpec, jiffies::clocksource_default_clock},
+    arch::CurrentIrqArch,
+    driver::timers::rtc::rtc::RtcTime,
+    exception::InterruptArch,
+    kdebug,
+    libs::rwlock::RwLock,
+    time::{jiffies::clocksource_default_clock, TimeSpec},
 };
 
 use super::{
@@ -169,7 +173,7 @@ pub fn timekeeping_init() {
     // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
     let timekeeper = &mut timekeeper().0.write();
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    
+
     // 初始化wall time到monotonic的时间
     let mut nsec = -timekeeper.xtime.tv_nsec;
     let mut sec = -timekeeper.xtime.tv_sec;
@@ -180,6 +184,7 @@ pub fn timekeeping_init() {
     timekeeper.wall_to_monotonic.tv_nsec = nsec;
     timekeeper.wall_to_monotonic.tv_sec = sec;
     drop(irq_guard);
+    kdebug!("timekeeping_init successfully");
 }
 
 // TODO xtime_updata
@@ -206,3 +211,8 @@ pub fn update_wall_time() {
 }
 // TODO timekeeping_adjust
 // TODO wall_to_monotic
+
+#[no_mangle]
+pub extern "C" fn rs_timekeeping_init() {
+    timekeeping_init();
+}

@@ -1,4 +1,6 @@
-#include <clocksource.h>
+#include "clocksource.h"
+#include <common/kthread.h>
+
 void run_watchdog_kthread()
 {
     kdebug("run_watchdog_kthread");

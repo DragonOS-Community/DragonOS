@@ -15,10 +15,10 @@ pub trait LocalAPIC {
     ///
     /// @return true 初始化成功
     /// @return false 初始化失败
-    fn init_current_cpu(&self) -> bool;
+    fn init_current_cpu(&mut self) -> bool;
 
     /// @brief 发送EOI信号（End of interrupt）
-    fn send_eoi(&self);
+    fn send_eoi(&mut self);
 
     /// @brief 获取APIC版本号
     fn version(&self) -> u32;
@@ -30,42 +30,49 @@ pub trait LocalAPIC {
     ///
     /// @param register 寄存器
     /// @param lvt 要被设置成的值
-    fn set_lvt(&self, register: LVTRegister, lvt: LVT);
+    fn set_lvt(&mut self, register: LVTRegister, lvt: LVT);
 }
 
 /// @brief 所有LVT寄存器的枚举类型
 #[allow(dead_code)]
+#[repr(u32)]
 #[derive(Debug)]
 pub enum LVTRegister {
     /// CMCI寄存器
     ///
     /// 如果支持CMCI功能，那么，当修正的机器错误超过阈值时，Local APIC通过CMCI寄存器的配置，
     /// 向处理器核心投递中断消息
-    CMCI,
+    CMCI = 0x02F0,
     /// 定时器寄存器
     ///
     /// 当APIC定时器产生中断信号时，Local APIC通过定时器寄存器的设置，向处理器投递中断消息
-    Timer,
+    Timer = 0x0320,
     /// 温度传感器寄存器
     ///
     /// 当处理器内部的温度传感器产生中断请求信号时，Local APIC会通过温度传感器寄存器的设置，
     /// 向处理器投递中断消息。
-    Thermal,
+    Thermal = 0x0330,
     /// 性能监控计数器寄存器
     ///
     /// 当性能检测计数器寄存器溢出，产生中断请求时，Local APIC将会根据这个寄存器的配置，
     /// 向处理器投递中断消息
-    PerformanceMonitor,
+    PerformanceMonitor = 0x0340,
     /// 当处理器的LINT0引脚接收到中断请求信号时，Local APIC会根据这个寄存器的配置，
     /// 向处理器投递中断消息
-    LINT0,
+    LINT0 = 0x0350,
     /// 当处理器的LINT0引脚接收到中断请求信号时，Local APIC会根据这个寄存器的配置，
     /// 向处理器投递中断消息
-    LINT1,
+    LINT1 = 0x0360,
     /// 错误寄存器
     ///
     /// 当APIC检测到内部错误而产生中断请求信号时，它将会通过错误寄存器的设置，向处理器投递中断消息
-    ErrorReg,
+    ErrorReg = 0x0370,
+}
+
+impl Into<u32> for LVTRegister{
+    fn into(self) -> u32 {
+        self as u32
+    }
 }
 
 #[derive(Debug)]

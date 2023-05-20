@@ -70,9 +70,13 @@ void system_initialize()
 {
     c_uart_init(COM1, 115200);
     video_init();
+
+    io_mfence();
     scm_init();
-    textui_init();
-    kinfo("Kernel Starting...");
+    io_mfence();
+
+    rs_textui_init();
+    io_mfence();
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 

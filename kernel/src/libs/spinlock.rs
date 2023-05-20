@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::asm::irqflags::{local_irq_restore, local_irq_save};
 use crate::arch::interrupt::{cli, sti};
+use crate::driver::uart::uart::{c_uart_send_str, UartPort};
 use crate::include::bindings::bindings::{spin_lock, spin_unlock, spinlock_t};
 use crate::process::preempt::{preempt_disable, preempt_enable};
 use crate::syscall::SystemError;
@@ -74,6 +75,7 @@ impl RawSpinlock {
 
     /// @brief 加锁
     pub fn lock(&self) {
+
         while !self.try_lock() {}
     }
 
@@ -89,7 +91,10 @@ impl RawSpinlock {
     pub fn try_lock(&self) -> bool {
         // 先增加自旋锁持有计数
         preempt_disable();
-
+        c_uart_send_str(
+            UartPort::COM1.to_u16(),
+            "\ntry_lock\n\0".as_ptr(),
+        );
         let res = self
             .0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -195,6 +200,8 @@ impl<T> SpinLock<T> {
     // }
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<T> {
+    c_uart_send_str(UartPort::COM1.to_u16(), "lock1\n\0".as_ptr());
+        
         self.lock.lock();
         // 加锁成功，返回一个守卫
         return SpinLockGuard {

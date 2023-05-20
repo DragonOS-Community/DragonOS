@@ -2,7 +2,7 @@
 #include <common/glib.h>
 #include <stdbool.h>
 #include <libs/libUI/screen_manager.h>
-
+struct scm_buffer_info_t video_frame_buffer_info = {0};
 /**
  * @brief 重新初始化显示驱动，需先低级初始化才能高级初始化
  * @param level 初始化等级

@@ -26,7 +26,11 @@ struct scm_buffer_info_t
     uint64_t vaddr; // 帧缓冲区的地址
     uint64_t flags; // 帧缓冲区标志位
 };
-
+//判断scm_buffer_info_t是否相等
+bool buffer_equal(struct scm_buffer_info_t a,struct scm_buffer_info_t b)
+{
+    return a.width == b.width && a.height == b.height && a.size == b.size && a.bit_depth == b.bit_depth && a.vaddr == b.vaddr && a.flags == b.flags;
+}
 /**
  * @brief 上层ui框架应当实现的接口
  *
@@ -77,7 +81,7 @@ int scm_register_alloc(const char *name, const uint8_t type, struct scm_ui_frame
  * @param ui 框架结构体指针
  * @return int 错误码
  */
-extern int scm_register(struct scm_ui_framework_t *ui);
+int scm_register(struct scm_ui_framework_t *ui);
 
 /**
  * @brief 向屏幕管理器卸载UI框架

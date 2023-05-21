@@ -3,12 +3,15 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{kdebug, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{
+    kdebug,
+    libs::spinlock::SpinLock,
+    syscall::SystemError,
+};
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
-    timer::clock,
-    NSEC_PER_SEC,
+    timer::clock, NSEC_PER_SEC,
 };
 lazy_static! {
     pub static ref DEFAULT_CLOCK: Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
@@ -80,7 +83,6 @@ pub fn clocksource_default_clock() -> Arc<ClocksourceJiffies> {
 
 pub fn jiffies_init() {
     //注册jiffies
-
     let jiffies = clocksource_default_clock() as Arc<dyn Clocksource>;
     jiffies.register();
     kdebug!("jiffies_init sccessfully");

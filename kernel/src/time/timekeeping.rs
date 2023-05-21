@@ -3,15 +3,15 @@ use core::{intrinsics::unlikely, ptr::null_mut};
 
 use crate::{
     arch::CurrentIrqArch,
-    driver::timers::rtc::rtc::RtcTime,
     exception::InterruptArch,
     kdebug,
-    libs::rwlock::RwLock,
-    time::{jiffies::clocksource_default_clock, TimeSpec},
+    libs::{rwlock::RwLock},
+    time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
 };
 
 use super::{
     clocksource::{clocksource_cyc2ns, Clocksource, CycleNum, HZ},
+    syscall::PosixTimeval,
     NSEC_PER_SEC,
 };
 
@@ -145,12 +145,15 @@ pub fn getnstimeofday() -> TimeSpec {
             }
         }
     }
-    let sec = (xtime.tv_nsec as u64 + nsecs)
-        .overflowing_rem(NSEC_PER_SEC.into())
-        .0 as i64;
+    xtime.tv_nsec += nsecs as i64;
+    while xtime.tv_nsec >= NSEC_PER_SEC.into() {
+        xtime.tv_nsec -= NSEC_PER_SEC as i64;
+        xtime.tv_sec += 1;
+    }
+
     // TODO 将xtime和当前时间源的时间相加
-    xtime.tv_sec += sec;
-    xtime.tv_nsec -= sec * NSEC_PER_SEC as i64;
+
+
     kdebug!(
         "xtime.tv_sec = {:?},xtime.tv_nsec = {:?}",
         xtime.tv_sec,
@@ -159,11 +162,16 @@ pub fn getnstimeofday() -> TimeSpec {
     return xtime;
 }
 
+pub fn do_gettimeofday() -> PosixTimeval {
+    let tp = getnstimeofday();
+    return PosixTimeval {
+        tv_sec: tp.tv_sec,
+        tv_usec: (tp.tv_nsec / 1000) as i32,
+    };
+}
+
 pub fn timekeeping_init() {
     timekeeper_init();
-    kdebug!("timekeeper_init successfully");
-    let mut rtc_time: RtcTime = RtcTime::default();
-    rtc_time.get();
 
     // TODO 有ntp模块后 在此初始化ntp模块
 
@@ -172,6 +180,7 @@ pub fn timekeeping_init() {
     timekeeper().timekeeper_setup_internals(clock);
     // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
     let timekeeper = &mut timekeeper().0.write();
+    timekeeper.xtime.tv_nsec = ktime_get_real_ns();
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     // 初始化wall time到monotonic的时间
@@ -212,6 +221,7 @@ pub fn update_wall_time() {
 // TODO timekeeping_adjust
 // TODO wall_to_monotic
 
+// ========= 以下为对C的接口 =========
 #[no_mangle]
 pub extern "C" fn rs_timekeeping_init() {
     timekeeping_init();

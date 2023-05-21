@@ -39,6 +39,7 @@ extern uint64_t sys_getsockname(struct pt_regs *regs);
 extern uint64_t sys_getpeername(struct pt_regs *regs);
 extern uint64_t sys_pipe(struct pt_regs *regs);
 extern uint64_t sys_mkdir(struct pt_regs *regs);
+extern uint64_t sys_gettimeofday(struct pt_regs *regs);
 /**
  * @brief 关闭文件系统调用
  *
@@ -47,7 +48,8 @@ extern uint64_t sys_mkdir(struct pt_regs *regs);
  * @param regs
  * @return uint64_t
  */
-extern uint64_t sys_close(struct pt_regs *regs);
+extern uint64_t
+sys_close(struct pt_regs *regs);
 
 /**
  * @brief 从文件中读取数据
@@ -446,5 +448,6 @@ system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
     [40] = sys_accept,
     [41] = sys_getsockname,
     [42] = sys_getpeername,
-    [43 ... 255] = system_call_not_exists,
+    [43] = sys_gettimeofday,
+    [44 ... 255] = system_call_not_exists,
 };

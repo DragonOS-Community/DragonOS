@@ -9,6 +9,8 @@ pub mod sleep;
 pub mod timekeep;
 pub mod timekeeping;
 pub mod timer;
+pub mod syscall;
+pub mod timeconv;
 /* Time structures. (Partitially taken from smoltcp)
 
 The `time` module contains structures used to represent both

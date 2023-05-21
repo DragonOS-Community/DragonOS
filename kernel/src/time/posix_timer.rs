@@ -1,4 +1,4 @@
-use core::{mem::size_of, ptr::null_mut};
+use core::{ ptr::null_mut};
 
 use alloc::{
     boxed::Box,

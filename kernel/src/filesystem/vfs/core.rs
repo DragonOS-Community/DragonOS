@@ -7,7 +7,6 @@ use core::{
 use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
-    arch::asm::current::current_pcb,
     driver::disk::ahci::{self},
     filesystem::{
         devfs::DevFS,
@@ -15,10 +14,9 @@ use crate::{
         procfs::ProcFS,
         ramfs::RamFS,
         sysfs::SysFS,
-        vfs::{file::File, mount::MountFS, FileSystem, FileType},
+        vfs::{mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::PAGE_4K_SIZE,
-    io::SeekFrom,
     kerror, kinfo,
     syscall::SystemError,
 };

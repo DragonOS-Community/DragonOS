@@ -1,16 +1,15 @@
-use core::{arch::x86_64::_rdtsc, hint::spin_loop, ptr::null_mut};
+use core::{arch::x86_64::_rdtsc, hint::spin_loop};
 
 use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
     arch::{
         asm::current::current_pcb,
-        interrupt::{cli, sti},
         sched::sched,
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    include::bindings::bindings::{timespec, useconds_t, Cpu_tsc_freq},
+    include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
     syscall::SystemError,
 };
 

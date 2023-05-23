@@ -6,7 +6,7 @@ use core::{
 use crate::{
     arch::asm::current::current_pcb,
     filesystem::vfs::file::{File, FileMode},
-    include::bindings::bindings::{pid_t, pt_regs, verify_area, NULL},
+    include::bindings::bindings::{pid_t, verify_area, NULL},
     kwarn,
     syscall::{Syscall, SystemError},
 };
@@ -84,7 +84,7 @@ impl Syscall {
         sig: c_int,
         act: usize,
         old_act: usize,
-        from_user: bool,
+        _from_user: bool,
     ) -> Result<usize, SystemError> {
         // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
         let act = act as *mut user_sigaction;

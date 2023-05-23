@@ -13,8 +13,7 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{mm_stat_t, pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
-    io::SeekFrom,
-    kdebug, kinfo,
+    io::SeekFrom, kinfo,
     net::syscall::SockAddr,
     time::TimeSpec,
 };

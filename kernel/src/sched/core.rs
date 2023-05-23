@@ -1,14 +1,10 @@
 use core::sync::atomic::compiler_fence;
 
 use crate::{
-    arch::asm::{current::current_pcb, ptrace::user_mode},
-    arch::{
-        context::switch_process,
-        interrupt::{cli, sti},
-    },
+    arch::asm::current::current_pcb,
     include::bindings::bindings::smp_get_total_cpu,
     include::bindings::bindings::{
-        process_control_block, pt_regs, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING, SCHED_FIFO,
+        process_control_block, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING, SCHED_FIFO,
         SCHED_NORMAL, SCHED_RR,
     },
     process::process::process_cpu,

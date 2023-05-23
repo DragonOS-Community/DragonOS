@@ -6,14 +6,11 @@ use crate::{
     },
     ipc::signal::sys_rt_sigreturn,
     kinfo,
-    sched::core::do_sched,
-    syscall::{Syscall, SystemError, SYS_EXECVE, SYS_FORK, SYS_RT_SIGRETURN, SYS_SCHED, SYS_VFORK},
+    syscall::{Syscall, SystemError, SYS_EXECVE, SYS_FORK, SYS_RT_SIGRETURN, SYS_VFORK},
 };
 
 use super::{
-    asm::{current::current_pcb, ptrace::user_mode},
-    context::switch_process,
-    interrupt::{cli, sti},
+    asm::{ptrace::user_mode},
     mm::barrier::mfence,
 };
 
@@ -113,21 +110,4 @@ pub fn arch_syscall_init() -> Result<(), SystemError> {
     kinfo!("arch_syscall_init\n");
     unsafe { set_system_trap_gate(0x80, 0, syscall_int as *mut c_void) }; // 系统调用门
     return Ok(());
-}
-
-#[inline(always)]
-pub fn sched(from_user: bool) -> i64 {
-    cli();
-    // 进行权限校验，拒绝用户态发起调度
-    if from_user {
-        return SystemError::EPERM.to_posix_errno() as i64;
-    }
-    // 根据调度结果统一进行切换
-    let pcb = do_sched();
-
-    if pcb.is_some() {
-        switch_process(current_pcb(), pcb.unwrap());
-    }
-    sti();
-    return 0;
 }

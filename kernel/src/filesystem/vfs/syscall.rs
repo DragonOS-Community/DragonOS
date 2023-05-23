@@ -1,11 +1,11 @@
 
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::{current::current_pcb, ptrace::user_mode},
+    arch::asm::{current::current_pcb},
     filesystem::vfs::file::FileDescriptorVec,
     include::bindings::bindings::{
-        pt_regs, verify_area, AT_REMOVEDIR, PAGE_2M_SIZE, PAGE_4K_SIZE, PROC_MAX_FD_NUM,
+        verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM,
     },
     io::SeekFrom,
     kerror,

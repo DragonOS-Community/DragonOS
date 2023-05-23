@@ -380,6 +380,9 @@ impl Syscall {
         return crate::arch::syscall::arch_syscall_init();
     }
     /// @brief 系统调用分发器，用于分发系统调用。
+    /// 
+    /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
+    /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
     pub fn handle(syscall_num: usize, args: &[usize], from_user: bool) -> usize {
         let r = match syscall_num {
             SYS_PUT_STRING => {

@@ -12,8 +12,6 @@
 
 typedef unsigned long (*system_call_t)(struct pt_regs *regs);
 
-extern system_call_t system_call_table[MAX_SYSTEM_CALL_NUM];
-
 // 判断系统调用是否来自用户态
 #define SYSCALL_FROM_USER(regs) (user_mode(regs))
 // 判断系统调用是否来自内核态
@@ -23,7 +21,7 @@ extern system_call_t system_call_table[MAX_SYSTEM_CALL_NUM];
  * @brief 初始化系统调用模块
  *
  */
-void syscall_init();
+extern int syscall_init();
 
 /**
  * @brief 用户态系统调用入口函数
@@ -81,7 +79,6 @@ uint64_t sys_sbrk(struct pt_regs *regs);
  * @return uint64_t
  */
 uint64_t sys_mkdir(struct pt_regs *regs);
-
 
 ul sys_ahci_end_req(struct pt_regs *regs);
 

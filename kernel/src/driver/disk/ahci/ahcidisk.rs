@@ -118,7 +118,6 @@ impl AhciDisk {
             buf_ptr = kbuf.as_mut().unwrap().as_mut_ptr() as usize;
         }
 
-
         #[allow(unused_unsafe)]
         let cmdtbl = unsafe {
             (phys_2_virt(volatile_read!(cmdheader.ctba) as usize) as *mut HbaCmdTable)
@@ -259,7 +258,7 @@ impl AhciDisk {
         // 设置数据存放地址
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let mut buf_ptr = buf as *const [u8] as *mut usize as usize;
-        
+
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
         let user_buf = if unsafe { verify_area(buf_ptr as u64, buf.len() as u64) } {

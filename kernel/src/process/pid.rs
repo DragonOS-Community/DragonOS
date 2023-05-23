@@ -18,11 +18,3 @@ impl PartialEq for PidType {
         *self as u8 == *other as u8
     }
 }
-
-/**
- * @brief 获取当前进程的pid
- */
-#[no_mangle]
-pub extern "C" fn sys_getpid(_regs: &pt_regs) -> u64 {
-    return current_pcb().pid as u64;
-}

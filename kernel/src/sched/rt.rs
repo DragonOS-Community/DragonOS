@@ -1,4 +1,4 @@
-use core::{ptr::null_mut, sync::atomic::compiler_fence};
+use core::sync::atomic::compiler_fence;
 
 use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 

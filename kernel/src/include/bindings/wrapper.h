@@ -35,6 +35,7 @@
 #include <driver/pci/pci.h>
 #include <driver/video/video.h>
 #include <driver/virtio/virtio.h>
+#include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
 #include <libs/libUI/textui.h>

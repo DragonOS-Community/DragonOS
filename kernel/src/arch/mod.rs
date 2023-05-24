@@ -4,7 +4,6 @@ pub use self::x86_64::pci::pci::X86_64PciArch as PciArch;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::*; //公开x86_64架构下的函数，使外界接口统一
 use crate::driver::pci::pci::{BusDeviceFunction, PciAddr, PciError, PciRoot, SegmentGroupNumber};
-
 /// TraitPciArch Pci架构相关函数，任何架构都应独立实现trait里的函数
 pub trait TraitPciArch {
     /// @brief 读取寄存器值，x86_64架构通过读取两个特定io端口实现

@@ -144,10 +144,7 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
  */
 int process_open_exec_file(char *path)
 {
-    struct pt_regs tmp = {0};
-    tmp.r8 = (uint64_t)path;
-    tmp.r9 = O_RDONLY;
-    int fd = sys_open(&tmp);
+    int fd = enter_syscall_int(SYS_OPEN, (uint64_t)path, O_RDONLY, 0, 0, 0, 0, 0, 0);
     return fd;
 }
 
@@ -172,22 +169,12 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     void *buf = kzalloc(PAGE_4K_SIZE, 0);
     uint64_t pos = 0;
 
-    struct pt_regs tmp_use_fs = {0};
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = 0;
-    tmp_use_fs.r10 = SEEK_SET;
-    retval = sys_lseek(&tmp_use_fs);
+    retval = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_SET, 0, 0, 0, 0, 0);
 
     // 读取 Elf64_Ehdr
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = (uint64_t)buf;
-    tmp_use_fs.r10 = sizeof(Elf64_Ehdr);
-    retval = sys_read(&tmp_use_fs);
+    retval = enter_syscall_int(SYS_READ, fd, (uint64_t)buf, sizeof(Elf64_Ehdr), 0, 0, 0, 0, 0);
 
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = 0;
-    tmp_use_fs.r10 = SEEK_CUR;
-    pos = sys_lseek(&tmp_use_fs);
+    pos = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_CUR, 0, 0, 0, 0, 0);
 
     if (retval != sizeof(Elf64_Ehdr))
     {
@@ -235,21 +222,14 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
     // 读取所有的phdr
     pos = ehdr.e_phoff;
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = pos;
-    tmp_use_fs.r10 = SEEK_SET;
-    pos = sys_lseek(&tmp_use_fs);
+
+    pos = enter_syscall_int(SYS_LSEEK, fd, pos, SEEK_SET, 0, 0, 0, 0, 0);
 
     memset(buf, 0, PAGE_4K_SIZE);
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = (uint64_t)buf;
-    tmp_use_fs.r10 = (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum;
-    sys_read(&tmp_use_fs);
 
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = 0;
-    tmp_use_fs.r10 = SEEK_CUR;
-    pos = sys_lseek(&tmp_use_fs);
+    enter_syscall_int(SYS_READ, fd, (uint64_t)buf, (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum, 0, 0, 0, 0, 0);
+
+    pos = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_CUR, 0, 0, 0, 0, 0);
 
     if ((long)retval < 0)
     {
@@ -328,10 +308,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 }
             }
 
-            tmp_use_fs.r8 = fd;
-            tmp_use_fs.r9 = pos;
-            tmp_use_fs.r10 = SEEK_SET;
-            pos = sys_lseek(&tmp_use_fs);
+            pos = enter_syscall_int(SYS_LSEEK, fd, pos, SEEK_SET, 0, 0, 0, 0, 0);
 
             int64_t val = 0;
             if (remain_file_size > 0)
@@ -342,17 +319,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 while (to_trans > 0)
                 {
                     int64_t x = 0;
-                    tmp_use_fs.r8 = fd;
-                    tmp_use_fs.r9 = (uint64_t)buf3;
-                    tmp_use_fs.r10 = to_trans;
-                    x = sys_read(&tmp_use_fs);
+
+                    x = enter_syscall_int(SYS_READ, fd, (uint64_t)buf3, to_trans, 0, 0, 0, 0, 0);
                     memcpy(virt_base + beginning_offset + val, buf3, x);
                     val += x;
                     to_trans -= x;
-                    tmp_use_fs.r8 = fd;
-                    tmp_use_fs.r9 = 0;
-                    tmp_use_fs.r10 = SEEK_CUR;
-                    pos = sys_lseek(&tmp_use_fs);
+
+                    pos = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_CUR, 0, 0, 0, 0, 0);
                 }
                 kfree(buf3);
 
@@ -391,9 +364,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
 load_elf_failed:;
     {
-        struct pt_regs tmp = {0};
-        tmp.r8 = fd;
-        sys_close(&tmp);
+        enter_syscall_int(SYS_CLOSE, fd, 0, 0, 0, 0, 0, 0, 0);
     }
 
     if (buf != NULL)
@@ -460,6 +431,7 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 
     // 加载elf格式的可执行文件
     int tmp = process_load_elf_file(regs, path);
+
     if (tmp < 0)
         goto exec_failed;
 

@@ -16,6 +16,7 @@ use core::{
     convert::TryFrom,
     fmt::{self, Debug, Display, Formatter},
 };
+
 // PCI_DEVICE_LINKEDLIST 添加了读写锁的全局链表，里面存储了检索到的PCI设备结构体
 // PCI_ROOT_0 Segment为0的全局PciRoot
 lazy_static! {

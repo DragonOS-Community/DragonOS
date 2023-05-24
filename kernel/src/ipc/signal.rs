@@ -16,7 +16,7 @@ use crate::{
         spinlock_t, verify_area, NULL, PF_EXITING, PF_KTHREAD, PF_SIGNALED, PF_WAKEKILL,
         PROC_INTERRUPTIBLE, USER_CS, USER_DS, USER_MAX_LINEAR_ADDR,
     },
-    ipc::signal_types::{sigset_add, user_sigaction},
+    ipc::signal_types::sigset_add,
     kBUG, kdebug, kerror, kwarn,
     libs::{
         ffi_convert::FFIBind2Rust,
@@ -35,12 +35,11 @@ use crate::{
 use super::signal_types::{
     si_code_val, sig_is_member, sigaction, sigaction__union_u, sigcontext, sigframe,
     sighand_struct, siginfo, signal_struct, sigpending, sigset_clear, sigset_del, sigset_delmask,
-    sigset_equal, sigset_init, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS,
-    SA_FLAG_DFL, SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, USER_SIG_DFL,
-    USER_SIG_IGN, _NSIG_U64_CNT,
+    sigset_equal, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS,
+    SA_FLAG_DFL, SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, _NSIG_U64_CNT,
 };
 
-use super::signal_types::{__siginfo_union, __siginfo_union_data};
+
 
 /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
 pub static DEFAULT_SIGACTION: sigaction = sigaction {
@@ -63,53 +62,11 @@ pub static DEFAULT_SIGACTION_IGNORE: sigaction = sigaction {
     sa_restorer: NULL as u64,
 };
 
-/// @brief kill系统调用，向指定的进程发送信号
-/// @param regs->r8 pid 要接收信号的进程id
-/// @param regs->r9 sig 信号
-#[no_mangle]
-pub extern "C" fn sys_kill(regs: &pt_regs) -> u64 {
-    let pid: pid_t = regs.r8 as pid_t;
-    let sig: SignalNumber = SignalNumber::from(regs.r9 as i32);
-
-    if sig == SignalNumber::INVALID {
-        // 传入的signal数值不合法
-        kwarn!("Not a valid signal number");
-        return SystemError::EINVAL.to_posix_errno() as u64;
-    }
-
-    // 初始化signal info
-    let mut info = siginfo {
-        _sinfo: __siginfo_union {
-            data: __siginfo_union_data {
-                si_signo: sig as i32,
-                si_code: si_code_val::SI_USER as i32,
-                si_errno: 0,
-                reserved: 0,
-                _sifields: super::signal_types::__sifields {
-                    _kill: super::signal_types::__sifields__kill { _pid: pid },
-                },
-            },
-        },
-    };
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-    let retval = signal_kill_something_info(sig, Some(&mut info), pid);
-    let x;
-    if retval.is_ok() {
-        x = retval.unwrap();
-    } else {
-        x = retval.unwrap_err().to_posix_errno();
-    }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-    return x as u64;
-}
-
 /// 通过kill的方式向目标进程发送信号
 /// @param sig 要发送的信号
 /// @param info 要发送的信息
 /// @param pid 进程id（目前只支持pid>0)
-fn signal_kill_something_info(
+pub fn signal_kill_something_info(
     sig: SignalNumber,
     info: Option<&mut siginfo>,
     pid: pid_t,
@@ -827,124 +784,7 @@ pub fn flush_signal_handlers(pcb: *mut process_control_block, force_default: boo
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
-/// @brief 用户程序用于设置信号处理动作的函数（遵循posix2008）
-///
-/// @param regs->r8 signumber 信号的编号
-/// @param regs->r9 act 新的，将要被设置的sigaction
-/// @param regs->r10 oact 返回给用户的原本的sigaction（内核将原本的sigaction的值拷贝给这个地址）
-///
-/// @return int 错误码
-#[no_mangle]
-pub extern "C" fn sys_sigaction(regs: &mut pt_regs) -> u64 {
-    // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
-    let act = regs.r9 as usize as *mut user_sigaction;
-    let mut old_act = regs.r10 as usize as *mut user_sigaction;
-    let mut new_ka: sigaction = Default::default();
-    let mut old_ka: sigaction = Default::default();
-
-    // 如果传入的，新的sigaction不为空
-    if !act.is_null() {
-        // 如果参数的范围不在用户空间，则返回错误
-        if unsafe { !verify_area(act as usize as u64, size_of::<sigaction>() as u64) } {
-            return SystemError::EFAULT.to_posix_errno() as u64;
-        }
-        let mask: sigset_t = unsafe { (*act).sa_mask };
-        let _input_sah = unsafe { (*act).sa_handler as u64 };
-        // kdebug!("_input_sah={}", _input_sah);
-        match _input_sah {
-            USER_SIG_DFL | USER_SIG_IGN => {
-                if _input_sah == USER_SIG_DFL {
-                    new_ka = DEFAULT_SIGACTION;
-                    new_ka.sa_flags =
-                        (unsafe { (*act).sa_flags } & (!(SA_FLAG_DFL | SA_FLAG_IGN))) | SA_FLAG_DFL;
-                } else {
-                    new_ka = DEFAULT_SIGACTION_IGNORE;
-                    new_ka.sa_flags =
-                        (unsafe { (*act).sa_flags } & (!(SA_FLAG_DFL | SA_FLAG_IGN))) | SA_FLAG_IGN;
-                }
-
-                let sar = unsafe { (*act).sa_restorer };
-                new_ka.sa_restorer = sar as u64;
-            }
-            _ => {
-                // 从用户空间获得sigaction结构体
-                new_ka = sigaction {
-                    _u: sigaction__union_u {
-                        _sa_handler: unsafe { (*act).sa_handler as u64 },
-                    },
-                    sa_flags: unsafe { (*act).sa_flags },
-                    sa_mask: sigset_t::default(),
-                    sa_restorer: unsafe { (*act).sa_restorer as u64 },
-                };
-            }
-        }
-        // kdebug!("new_ka={:?}", new_ka);
-        // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
-        if new_ka.sa_restorer != NULL as u64 {
-            new_ka.sa_flags |= SA_FLAG_RESTORER;
-        } else {
-            kwarn!(
-                "pid:{}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {}.",
-                current_pcb().pid,
-                regs.r8.clone()
-            );
-        }
-        sigset_init(&mut new_ka.sa_mask, mask);
-    }
-
-    let sig = SignalNumber::from(regs.r8 as i32);
-    // 如果给出的信号值不合法
-    if sig == SignalNumber::INVALID {
-        return SystemError::EINVAL.to_posix_errno() as u64;
-    }
-
-    let retval = do_sigaction(
-        sig,
-        if act.is_null() {
-            None
-        } else {
-            Some(&mut new_ka)
-        },
-        if old_act.is_null() {
-            None
-        } else {
-            Some(&mut old_ka)
-        },
-    );
-
-    // 将原本的sigaction拷贝到用户程序指定的地址
-    if (retval == Ok(())) && (!old_act.is_null()) {
-        if unsafe { !verify_area(old_act as usize as u64, size_of::<sigaction>() as u64) } {
-            return SystemError::EFAULT.to_posix_errno() as u64;
-        }
-        // ！！！！！！！！！！todo: 检查这里old_ka的mask，是否位SIG_IGN SIG_DFL,如果是，则将_sa_handler字段替换为对应的值
-        let sah: u64;
-        let flag = old_ka.sa_flags & (SA_FLAG_DFL | SA_FLAG_IGN);
-        match flag {
-            SA_FLAG_DFL => {
-                sah = USER_SIG_DFL;
-            }
-            SA_FLAG_IGN => {
-                sah = USER_SIG_IGN;
-            }
-            _ => sah = unsafe { old_ka._u._sa_handler },
-        }
-        unsafe {
-            (*old_act).sa_handler = sah as *mut c_void;
-            (*old_act).sa_flags = old_ka.sa_flags;
-            (*old_act).sa_mask = old_ka.sa_mask;
-            (*old_act).sa_restorer = old_ka.sa_restorer as *mut c_void;
-        }
-    }
-    //return retval as u64;
-    if retval.is_ok() {
-        return 0;
-    } else {
-        return retval.unwrap_err().to_posix_errno() as u64;
-    }
-}
-
-fn do_sigaction(
+pub fn do_sigaction(
     sig: SignalNumber,
     act: Option<&mut sigaction>,
     old_act: Option<&mut sigaction>,
@@ -1029,8 +869,7 @@ pub fn sigmask(sig: SignalNumber) -> u64 {
     return 1u64 << ((sig as i32) - 1);
 }
 
-#[no_mangle]
-pub extern "C" fn sys_rt_sigreturn(regs: &mut pt_regs) -> u64 {
+pub fn sys_rt_sigreturn(regs: &mut pt_regs) -> u64 {
     let frame = regs.rsp as usize as *mut sigframe;
 
     // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）

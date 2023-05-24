@@ -6,7 +6,7 @@ RELIBC_OPT=$(DADK_BUILD_CACHE_DIR_RELIBC_0_1_0)
 CFLAGS=-I $(RELIBC_OPT)/include
 
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
-output_dir=$(DADK_BUILD_CACHE_DIR_TEST_RELIBC_0_1_0)
+output_dir=$(DADK_BUILD_CACHE_DIR_HTTP_SERVER_0_1_0)
 
 LIBC_OBJS:=$(shell find $(RELIBC_OPT)/lib -name "*.o" | sort )
 LIBC_OBJS+=$(RELIBC_OPT)/lib/libc.a
@@ -14,9 +14,12 @@ LIBC_OBJS+=$(RELIBC_OPT)/lib/libc.a
 all: main.o
 	mkdir -p $(tmp_output_dir)
 	
-	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/test  $(shell find . -name "*.o") $(LIBC_OBJS) -T link.lds
+	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/http_server  $(shell find . -name "*.o") $(LIBC_OBJS) -T link.lds
 
-	$(OBJCOPY) -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/test $(output_dir)/test.elf
+	$(OBJCOPY) -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/http_server $(output_dir)/http_server.elf
+
+	mv $(output_dir)/http_server.elf $(output_dir)/http_server
+	
 main.o: main.c
 	$(CC) $(CFLAGS) -c main.c  -o main.o
 

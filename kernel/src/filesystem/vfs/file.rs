@@ -173,9 +173,14 @@ impl File {
     ///
     /// @param origin 调整的起始位置
     pub fn lseek(&mut self, origin: SeekFrom) -> Result<usize, SystemError> {
-        if self.inode.metadata().unwrap().file_type == FileType::Pipe {
-            return Err(SystemError::ESPIPE);
+        let file_type = self.inode.metadata()?.file_type;
+        match file_type {
+            FileType::Pipe | FileType::CharDevice => {
+                return Err(SystemError::ESPIPE);
+            }
+            _ => {}
         }
+
         let pos: i64;
         match origin {
             SeekFrom::SeekSet(offset) => {

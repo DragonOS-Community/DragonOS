@@ -1,3 +1,5 @@
+use core::intrinsics::unlikely;
+
 use alloc::string::String;
 
 use thingbuf::mpsc::{
@@ -168,11 +170,21 @@ impl TtyCore {
                     _ => return Err(TtyError::Unknown(format!("{err:?}"))),
                 }
             } else {
-                buf[cnt] = *val.unwrap();
+                let x = *val.unwrap();
+                buf[cnt] = x;
                 cnt += 1;
+
+                if unlikely(self.stdin_should_return(x)) {
+                    return Ok(cnt);
+                }
             }
         }
         return Ok(cnt);
+    }
+
+    fn stdin_should_return(&self, c: u8) -> bool {
+        // 如果是换行符或者是ctrl+d，那么就应该返回
+        return c == b'\n' || c == 4;
     }
 
     /// @brief 向stdin缓冲区内写入数据

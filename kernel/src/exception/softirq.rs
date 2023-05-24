@@ -152,7 +152,7 @@ impl Softirq {
 
     /// @brief 解注册软中断向量
     ///
-    /// @param irq_num 中断向量号码
+    /// @param irq_num 中断向量号码   
     pub fn unregister_softirq(&self, softirq_num: SoftirqNumber) {
         // kdebug!("unregister_softirq softirq_num = {:?}", softirq_num as u64);
         let table_guard = &mut self.table.write();

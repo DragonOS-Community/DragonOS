@@ -1,4 +1,4 @@
-use crate::{arch::asm::current::current_pcb, include::bindings::bindings::pt_regs};
+
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
@@ -17,12 +17,4 @@ impl PartialEq for PidType {
     fn eq(&self, other: &PidType) -> bool {
         *self as u8 == *other as u8
     }
-}
-
-/**
- * @brief 获取当前进程的pid
- */
-#[no_mangle]
-pub extern "C" fn sys_getpid(_regs: &pt_regs) -> u64 {
-    return current_pcb().pid as u64;
 }

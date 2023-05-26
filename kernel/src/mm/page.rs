@@ -2,9 +2,10 @@ use core::{
     fmt::{self, Debug},
     marker::PhantomData,
     mem,
+    ops::Add,
 };
 
-use crate::kerror;
+use crate::{arch::MMArch, kerror};
 
 use super::{
     allocator::page_frame::FrameAllocator, MemoryManagementArch, PageTableKind, PhysAddr,
@@ -198,7 +199,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
 }
 
 /// 页表项的标志位
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Hash)]
 pub struct PageFlags<Arch> {
     data: usize,
     phantom: PhantomData<Arch>,
@@ -335,6 +336,7 @@ impl<Arch: MemoryManagementArch> fmt::Debug for PageFlags<Arch> {
 }
 
 /// @brief 页表映射器
+#[derive(Hash)]
 pub struct PageMapper<Arch, F> {
     /// 页表类型
     table_kind: PageTableKind,
@@ -703,4 +705,14 @@ impl<Arch: MemoryManagementArch, T: Flusher<Arch> + ?Sized> Flusher<Arch> for &m
 
 impl<Arch: MemoryManagementArch> Flusher<Arch> for () {
     fn consume(&mut self, flush: PageFlush<Arch>) {}
+}
+
+/// # 把一个地址向下对齐到页大小
+pub fn round_down_to_page_size(addr: usize) -> usize {
+    addr & !(MMArch::PAGE_SIZE - 1)
+}
+
+/// # 把一个地址向上对齐到页大小
+pub fn round_up_to_page_size(addr: usize) -> usize {
+    round_down_to_page_size(addr + MMArch::PAGE_SIZE - 1)
 }

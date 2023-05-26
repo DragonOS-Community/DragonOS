@@ -1,8 +1,125 @@
-/// @Auther: Kong
-/// @Date: 2023-03-27 11:57:07
-/// @FilePath: /DragonOS/kernel/src/mm/page_frame.rs
-/// @Description: 页帧分配器
-use crate::mm::PhysAddr;
+use core::intrinsics::unlikely;
+
+use crate::{
+    arch::{mm::frame::LockedFrameAllocator, MMArch},
+    mm::{MemoryManagementArch, PhysAddr, VirtAddr},
+};
+
+/// @brief 物理页帧的表示
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PhysPageFrame {
+    /// 物理页页号
+    number: usize,
+}
+
+impl PhysPageFrame {
+    pub fn new(paddr: PhysAddr) -> Self {
+        return Self {
+            number: paddr.data() / MMArch::PAGE_SIZE,
+        };
+    }
+
+    /// @brief 获取当前页对应的物理地址
+    pub fn phys_address(&self) -> PhysAddr {
+        return PhysAddr::new(self.number * MMArch::PAGE_SIZE);
+    }
+
+    pub fn next_by(&self, n: usize) -> Self {
+        return Self {
+            number: self.number + n,
+        };
+    }
+
+    pub fn next(&self) -> Self {
+        return self.next_by(1);
+    }
+
+    /// 构造物理页帧的迭代器，范围为[start, end)
+    pub fn iter_range(start: Self, end: Self) -> PhysPageFrameIter {
+        return PhysPageFrameIter {
+            current: start,
+            end,
+        };
+    }
+}
+
+/// @brief 物理页帧的迭代器
+#[derive(Debug)]
+pub struct PhysPageFrameIter {
+    current: PhysPageFrame,
+    /// 结束的物理页帧（不包含）
+    end: PhysPageFrame,
+}
+
+impl Iterator for PhysPageFrameIter {
+    type Item = PhysPageFrame;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if unlikely(self.current == self.end) {
+            return None;
+        }
+        let current = self.current.next();
+        return Some(current);
+    }
+}
+
+/// 虚拟页帧的表示
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct VirtPageFrame {
+    /// 虚拟页页号
+    number: usize,
+}
+
+impl VirtPageFrame {
+    pub fn new(vaddr: VirtAddr) -> Self {
+        return Self {
+            number: vaddr.data() / MMArch::PAGE_SIZE,
+        };
+    }
+
+    /// 获取当前虚拟页对应的虚拟地址
+    pub fn virt_address(&self) -> VirtAddr {
+        return VirtAddr::new(self.number * MMArch::PAGE_SIZE);
+    }
+
+    pub fn next_by(&self, n: usize) -> Self {
+        return Self {
+            number: self.number + n,
+        };
+    }
+
+    pub fn next(&self) -> Self {
+        return self.next_by(1);
+    }
+
+    /// 构造虚拟页帧的迭代器，范围为[start, end)
+    pub fn iter_range(start: Self, end: Self) -> VirtPageFrameIter {
+        return VirtPageFrameIter {
+            current: start,
+            end,
+        };
+    }
+}
+
+/// 虚拟页帧的迭代器
+#[derive(Debug)]
+pub struct VirtPageFrameIter {
+    current: VirtPageFrame,
+    /// 结束的虚拟页帧(不包含)
+    end: VirtPageFrame,
+}
+
+impl Iterator for VirtPageFrameIter {
+    type Item = VirtPageFrame;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if unlikely(self.current == self.end) {
+            return None;
+        }
+        let current: VirtPageFrame = self.current.next();
+        return Some(current);
+    }
+}
 
 /// 页帧使用的数量
 #[derive(Clone, Copy, Debug)]
@@ -29,8 +146,8 @@ pub struct PageFrameUsage {
 
 impl PageFrameUsage {
     /// @brief:  初始化FrameUsage
-    /// @param {PageFrameCount} used 已使用的页帧数量
-    /// @param {PageFrameCount} total 总的页帧数量
+    /// @param PageFrameCount used 已使用的页帧数量
+    /// @param PageFrameCount total 总的页帧数量
     pub fn new(used: PageFrameCount, total: PageFrameCount) -> Self {
         return Self { used, total };
     }
@@ -83,5 +200,27 @@ impl<T: FrameAllocator> FrameAllocator for &mut T {
     }
     unsafe fn usage(&self) -> PageFrameUsage {
         return T::usage(self);
+    }
+}
+
+/// @brief 从全局的页帧分配器中分配连续count个页帧
+///
+/// @param count 请求分配的页帧数量
+pub fn allocate_page_frames(count: PageFrameCount) -> Option<PhysPageFrame> {
+    let frame = unsafe {
+        LockedFrameAllocator
+            .allocate(count)
+            .map(|addr| PhysPageFrame::new(addr))?
+    };
+    return Some(frame);
+}
+
+/// @brief 向全局页帧分配器释放连续count个页帧
+///
+/// @param frame 要释放的第一个页帧
+/// @param count 要释放的页帧数量
+pub fn deallocate_page_frames(frame: PhysPageFrame, count: PageFrameCount) {
+    unsafe {
+        LockedFrameAllocator.free(frame.phys_address(), count);
     }
 }

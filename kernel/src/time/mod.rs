@@ -3,6 +3,7 @@ use core::{fmt, ops};
 use self::timekeep::ktime_get_real_ns;
 
 pub mod sleep;
+pub mod syscall;
 pub mod timekeep;
 pub mod timer;
 
@@ -18,8 +19,9 @@ absolute and relative time.
 [Duration]: struct.Duration.html
 */
 
-/// 表示时间的结构体
+/// 表示时间的结构体，符合POSIX标准。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
 pub struct TimeSpec {
     pub tv_sec: i64,
     pub tv_nsec: i64,

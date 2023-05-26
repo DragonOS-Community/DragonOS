@@ -8,6 +8,7 @@ use alloc::collections::LinkedList;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
+use core::ops::Add;
 use core::{marker::PhantomData, mem};
 
 // 一个全局变量MAX_ORDER，表示最大的阶数

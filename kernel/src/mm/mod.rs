@@ -1,12 +1,29 @@
-use crate::include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET};
+use crate::{
+    include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET},
+    syscall::SystemError,
+};
 
-use core::{fmt::Debug, ptr};
+use core::{
+    cmp,
+    fmt::Debug,
+    intrinsics::unlikely,
+    ops::{Add, Sub},
+    ptr,
+};
+
+use self::{
+    allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
+    page::round_up_to_page_size,
+    ucontext::UserMapper,
+};
 
 pub mod allocator;
 pub mod gfp;
 pub mod kernel_mapper;
 pub mod mmio_buddy;
 pub mod page;
+pub mod syscall;
+pub mod ucontext;
 
 /// @brief 将内核空间的虚拟地址转换为物理地址
 #[inline(always)]
@@ -20,7 +37,7 @@ pub fn phys_2_virt(addr: usize) -> usize {
     addr + PAGE_OFFSET as usize
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub enum PageTableKind {
     /// 用户可访问的页表
     User,
@@ -29,7 +46,7 @@ pub enum PageTableKind {
 }
 
 /// 物理内存地址
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct PhysAddr(usize);
 
@@ -65,7 +82,7 @@ impl Debug for PhysAddr {
 }
 
 /// 虚拟内存地址
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct VirtAddr(usize);
 
@@ -79,12 +96,6 @@ impl VirtAddr {
     #[inline(always)]
     pub fn data(&self) -> usize {
         return self.0;
-    }
-
-    /// @brief 将虚拟地址加上一个偏移量
-    #[inline(always)]
-    pub fn add(self, offset: usize) -> Self {
-        return Self(self.0 + offset);
     }
 
     /// @brief 判断虚拟地址的类型
@@ -101,6 +112,42 @@ impl VirtAddr {
     #[inline(always)]
     pub fn check_aligned(&self, align: usize) -> bool {
         return self.0 & (align - 1) == 0;
+    }
+}
+
+impl Add<VirtAddr> for VirtAddr {
+    type Output = Self;
+
+    #[inline(always)]
+    fn add(self, rhs: VirtAddr) -> Self::Output {
+        return Self(self.0 + rhs.0);
+    }
+}
+
+impl Add<usize> for VirtAddr {
+    type Output = Self;
+
+    #[inline(always)]
+    fn add(self, rhs: usize) -> Self::Output {
+        return Self(self.0 + rhs);
+    }
+}
+
+impl Sub<VirtAddr> for VirtAddr {
+    type Output = Self;
+
+    #[inline(always)]
+    fn sub(self, rhs: VirtAddr) -> Self::Output {
+        return Self(self.0 - rhs.0);
+    }
+}
+
+impl Sub<usize> for VirtAddr {
+    type Output = Self;
+
+    #[inline(always)]
+    fn sub(self, rhs: usize) -> Self::Output {
+        return Self(self.0 - rhs);
     }
 }
 
@@ -179,6 +226,9 @@ pub trait MemoryManagementArch: Clone + Copy {
     /// 这个mask用于获取页表项中的flags
     const ENTRY_FLAGS_MASK: usize = !Self::ENTRY_ADDRESS_MASK;
 
+    /// 用户空间的最高地址
+    const USER_END_VADDR: VirtAddr;
+
     /// @brief 用于初始化内存管理模块与架构相关的信息。
     /// 该函数应调用其他模块的接口，生成内存区域结构体，提供给BumpAllocator使用
     unsafe fn init() -> &'static [PhysMemoryArea];
@@ -222,6 +272,157 @@ pub trait MemoryManagementArch: Clone + Copy {
 
     /// @brief 判断指定的虚拟地址是否正确（符合规范）
     fn virt_is_valid(virt: VirtAddr) -> bool;
+
+    /// @brief 获取系统启动时的初始页表的物理地址
+    fn initial_page_table() -> PhysAddr;
+
+    /// 初始化新的usermapper，为用户进程创建页表
+    fn setup_new_usermapper() -> Result<UserMapper, SystemError>;
+}
+
+/// @brief 虚拟地址范围
+/// 该结构体用于表示一个虚拟地址范围，包括起始地址与大小
+///
+/// 请注意与VMA进行区分，该结构体被VMA所包含
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VirtRegion {
+    start: VirtAddr,
+    size: usize,
+}
+
+impl VirtRegion {
+    /// # 创建一个新的虚拟地址范围
+    pub fn new(start: VirtAddr, size: usize) -> Self {
+        VirtRegion { start, size }
+    }
+
+    /// 获取虚拟地址范围的起始地址
+    #[inline(always)]
+    pub fn start(&self) -> VirtAddr {
+        self.start
+    }
+
+    /// 获取虚拟地址范围的截止地址（不包括返回的地址）
+    #[inline(always)]
+    pub fn end(&self) -> VirtAddr {
+        return self.start().add(self.size);
+    }
+
+    /// # Create a new VirtRegion from a range [start, end)
+    ///
+    /// If end <= start, return None
+    pub fn between(start: VirtAddr, end: VirtAddr) -> Option<Self> {
+        if unlikely(end.data() <= start.data()) {
+            return None;
+        }
+        let size = end.data() - start.data();
+        return Some(VirtRegion::new(start, size));
+    }
+
+    /// # 取两个虚拟地址范围的交集
+    ///
+    /// 如果两个虚拟地址范围没有交集，返回None
+    pub fn intersect(&self, other: &VirtRegion) -> Option<VirtRegion> {
+        let start = self.start.max(other.start);
+        let end = self.end().min(other.end());
+        return VirtRegion::between(start, end);
+    }
+
+    /// 设置虚拟地址范围的起始地址
+    #[inline(always)]
+    pub fn set_start(&mut self, start: VirtAddr) {
+        self.start = start;
+    }
+
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// 设置虚拟地址范围的大小
+    #[inline(always)]
+    pub fn set_size(&mut self, size: usize) {
+        self.size = size;
+    }
+
+    /// 判断虚拟地址范围是否为空
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// 将虚拟地址区域的大小向上对齐到页大小
+    #[inline(always)]
+    pub fn round_up_size_to_page(self) -> Self {
+        return VirtRegion::new(self.start, round_up_to_page_size(self.size));
+    }
+
+    /// 判断两个虚拟地址范围是否由于具有交集而导致冲突
+    #[inline(always)]
+    pub fn collide(&self, other: &VirtRegion) -> bool {
+        return self.intersect(other).is_some();
+    }
+
+    pub fn iter_pages(&self) -> VirtPageFrameIter {
+        return VirtPageFrame::iter_range(
+            VirtPageFrame::new(self.start),
+            VirtPageFrame::new(self.end()),
+        );
+    }
+
+    /// 获取[self.start(), region.start())的虚拟地址范围
+    ///
+    /// 如果self.start() >= region.start()，返回None
+    pub fn before(self, region: &VirtRegion) -> Option<Self> {
+        return Self::between(self.start(), region.start());
+    }
+
+    /// 获取[region.end(),self.end())的虚拟地址范围
+    ///
+    /// 如果 self.end() >= region.end() ，返回None
+    pub fn after(self, region: &VirtRegion) -> Option<Self> {
+        // if self.end() > region.end() none
+        return Self::between(region.end(), self.end());
+    }
+
+    /// 把当前虚拟地址范围内的某个虚拟地址，转换为另一个虚拟地址范围内的虚拟地址
+    ///
+    /// 如果vaddr不在当前虚拟地址范围内，返回None
+    ///
+    /// 如果vaddr在当前虚拟地址范围内，返回vaddr在new_base中的虚拟地址
+    pub fn rebase(self, vaddr: VirtAddr, new_base: &VirtRegion) -> Option<VirtAddr> {
+        if !self.contains(vaddr) {
+            return None;
+        }
+        let offset = vaddr.data() - self.start().data();
+        let new_start = new_base.start().data() + offset;
+        return Some(VirtAddr::new(new_start));
+    }
+
+    /// 判断虚拟地址范围是否包含指定的虚拟地址
+    pub fn contains(&self, addr: VirtAddr) -> bool {
+        return self.start() <= addr && addr < self.end();
+    }
+
+    /// 创建当前虚拟地址范围的页面迭代器
+    pub fn pages(&self) -> VirtPageFrameIter {
+        return VirtPageFrame::iter_range(
+            VirtPageFrame::new(self.start()),
+            VirtPageFrame::new(self.end()),
+        );
+    }
+}
+
+impl PartialOrd for VirtRegion {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        return self.start.partial_cmp(&other.start);
+    }
+}
+
+impl Ord for VirtRegion {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        return self.start.cmp(&other.start);
+    }
 }
 
 // ====== 重构内存管理、进程管理后，请删除这几行 BEGIN ======

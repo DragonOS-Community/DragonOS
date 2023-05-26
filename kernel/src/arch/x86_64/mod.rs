@@ -8,8 +8,11 @@ pub mod mm;
 pub mod pci;
 pub mod rand;
 pub mod sched;
+pub mod syscall;
 
 pub use self::pci::pci::X86_64PciArch as PciArch;
 
+/// 导出内存管理的Arch结构体
 pub use self::mm::X86_64MMArch as MMArch;
+
 pub use interrupt::X86_64InterruptArch as CurrentIrqArch;

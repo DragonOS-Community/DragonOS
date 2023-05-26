@@ -1,14 +1,17 @@
 pub mod barrier;
 pub mod frame;
 
+use crate::arch::mm::frame::FRAME_ALLOCATOR;
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
-    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block, BLACK, GREEN,
+    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block,
 };
 use crate::libs::printk::PrintkWriter;
+use crate::mm::kernel_mapper::KernelMapper;
+use crate::mm::page::PageEntry;
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
 use crate::syscall::SystemError;
-use crate::{kdebug, kinfo, printk_color};
+use crate::{kdebug, kinfo};
 
 use core::arch::asm;
 use core::ffi::c_void;
@@ -28,6 +31,13 @@ static mut PHYS_MEMORY_AREAS: [PhysMemoryArea; 512] = [PhysMemoryArea {
     base: PhysAddr::new(0),
     size: 0,
 }; 512];
+
+/// 初始的CR3寄存器的值，用于存储系统启动时内核的页表的位置
+static mut INITIAL_CR3_VALUE: usize = 0;
+
+/// 内核的第一个页表在pml4中的索引
+/// 顶级页表的[256, 512)项是内核的页表
+static KERNEL_PML4E_NO: usize = (X86_64MMArch::PHYS_OFFSET & ((1 << 48) - 1)) >> 39;
 
 #[derive(Clone, Copy)]
 pub struct X86_64MMBootstrapInfo {
@@ -71,7 +81,7 @@ pub fn switch_mm(
 }
 
 /// @brief X86_64的内存管理架构结构体
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct X86_64MMArch;
 
 impl MemoryManagementArch for X86_64MMArch {
@@ -112,6 +122,8 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
+
+    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7fff_ffff_ffff);
 
     /// @brief 获取物理内存区域
     unsafe fn init() -> &'static [crate::mm::PhysMemoryArea] {
@@ -169,6 +181,40 @@ impl MemoryManagementArch for X86_64MMArch {
     fn virt_is_valid(virt: VirtAddr) -> bool {
         return virt.is_canonical();
     }
+
+    /// 获取系统的初始页表（初始CR3的值）
+    fn initial_page_table() -> PhysAddr {
+        unsafe {
+            return PhysAddr::new(INITIAL_CR3_VALUE);
+        }
+    }
+
+    /// @brief 创建新的顶层页表
+    ///
+    /// 该函数会创建页表并复制内核的映射到新的页表中
+    ///
+    /// @return 新的页表
+    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
+        let new_umapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::User, FRAME_ALLOCATOR).ok_or(SystemError::ENOMEM)?
+        };
+
+        let current_ktable: KernelMapper = KernelMapper::lock();
+        let copy_mapping = |pml4_entry_no| unsafe {
+            let entry: PageEntry<X86_64MMArch> = current_ktable
+                .table()
+                .entry(pml4_entry_no)
+                .unwrap_or_else(|| panic!("entry {} not found", pml4_entry_no));
+            new_umapper.table().set_entry(pml4_entry_no, entry)
+        };
+
+        // 复制内核的映射
+        for pml4_entry_no in KERNEL_PML4E_NO..512 {
+            copy_mapping(pml4_entry_no);
+        }
+
+        return Ok(crate::mm::ucontext::UserMapper::new(new_umapper));
+    }
 }
 
 impl X86_64MMArch {
@@ -176,7 +222,7 @@ impl X86_64MMArch {
         // 这个数组用来存放内存区域的信息（从C获取）
         let mut mb2_mem_info: [multiboot_mmap_entry_t; 512] = mem::zeroed();
         c_uart_send_str(0x3f8, "init_memory_area_from_multiboot2 begin\n\0".as_ptr());
-        
+
         let mut mb2_count: u32 = 0;
         multiboot2_iter(
             Some(multiboot2_get_memory),
@@ -221,12 +267,14 @@ impl VirtAddr {
 /// @brief 初始化内存管理模块
 pub fn mm_init() {
     c_uart_send_str(0x3f8, "mm_init\n\0".as_ptr());
-    PrintkWriter.write_fmt(format_args!("mm_init() called\n")).unwrap();
+    PrintkWriter
+        .write_fmt(format_args!("mm_init() called\n"))
+        .unwrap();
     // printk_color!(GREEN, BLACK, "mm_init() called\n");
     static _CALL_ONCE: AtomicBool = AtomicBool::new(false);
     if _CALL_ONCE
-    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-    .is_err()
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
     {
         c_uart_send_str(0x3f8, "mm_init err\n\0".as_ptr());
         panic!("mm_init() can only be called once");
@@ -241,7 +289,6 @@ pub fn mm_init() {
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
 }
-
 
 #[no_mangle]
 pub extern "C" fn rs_mm_init() {

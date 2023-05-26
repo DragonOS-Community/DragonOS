@@ -1,5 +1,9 @@
 use crate::mm::allocator::page_frame::FrameAllocator;
 
+pub static FRAME_ALLOCATOR: LockedFrameAllocator = LockedFrameAllocator;
+
+/// 全局的页帧分配器
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {

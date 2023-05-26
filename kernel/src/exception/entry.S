@@ -284,7 +284,7 @@ ENTRY(virtualization_exception)
 ENTRY(syscall_int)
     pushq $0
     pushq %rax
-    leaq do_syscall_int(%rip), %rax    // 获取系统调用服务程序的地址
+    leaq syscall_handler(%rip), %rax    // 获取系统调用服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 

@@ -195,7 +195,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         let mut entry = self.free_area[order as usize].pop_front();
         while entry.is_none() {
             order += 1;
-            if order >= MAX_ORDER {
+            if order >= MAX_ORDER as u8{
                 return None;
             }
             entry = self.free_area[order as usize].pop_front();
@@ -236,7 +236,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         self.add_entry(entry);
 
         // 如果entry的阶数小于MAX_ORDER，那么就将entry合并到buddy中
-        while entry.order < MAX_ORDER {
+        while entry.order < MAX_ORDER as u8 {
             // 获取entry的伙伴的页号
             let buddy_page = if entry.base.data() & (1 << entry.order) == 0 {
                 start_page + 1

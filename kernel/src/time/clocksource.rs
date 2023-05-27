@@ -340,7 +340,7 @@ impl dyn Clocksource {
             }
 
             // 将时钟源加入到监控队列中
-            let mut list_guard = WATCHDOG_LIST.lock_irqsave();
+            let mut list_guard = WATCHDOG_LIST.lock();
             list_guard.push_back(cs.clone());
             drop(list_guard);
 

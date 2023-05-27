@@ -5,7 +5,8 @@ use core::{
 
 use crate::{
     include::bindings::bindings::{pt_regs, verify_area},
-    syscall::SystemError,
+    kdebug,
+    syscall::SystemError, time::timeconv::time_to_calendar,
 };
 
 use super::timekeeping::do_gettimeofday;
@@ -41,15 +42,16 @@ pub fn rs_do_gettimeofday(tv: *mut PosixTimeval) {
         (*tv).tv_sec = posix_time.tv_sec;
         (*tv).tv_usec = posix_time.tv_usec;
     }
+    time_to_calendar(posix_time.tv_sec, 0);
 }
 
 #[no_mangle]
-pub extern "C" fn sys_gettimeofday(regs: &pt_regs) -> i32 {
+pub extern "C" fn sys_gettimeofday(regs: &pt_regs) -> u64 {
     if unsafe {
         !verify_area(regs.r8, size_of::<PosixTimeval>() as u64)
             || !verify_area(regs.r9, size_of::<PosixTimezone>() as u64)
     } {
-        return SystemError::EPERM as i32;
+        return SystemError::EPERM as u64;
     }
     let timeval = regs.r8 as *mut PosixTimeval;
     let mut timezone = regs.r9 as *const PosixTimezone;

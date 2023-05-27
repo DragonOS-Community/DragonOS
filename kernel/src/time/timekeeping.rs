@@ -1,11 +1,12 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{intrinsics::unlikely, ptr::null_mut};
+use smoltcp::wire::Icmpv6TimeExceeded;
 
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     kdebug,
-    libs::{rwlock::RwLock},
+    libs::rwlock::RwLock,
     time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
 };
 
@@ -153,7 +154,6 @@ pub fn getnstimeofday() -> TimeSpec {
 
     // TODO 将xtime和当前时间源的时间相加
 
-
     kdebug!(
         "xtime.tv_sec = {:?},xtime.tv_nsec = {:?}",
         xtime.tv_sec,
@@ -200,17 +200,24 @@ pub fn timekeeping_init() {
 // TODO update_wall_time
 /// 使用当前时钟源增加wall time
 pub fn update_wall_time() {
+    // kdebug!("enter update_wall_time");
     // 如果在休眠那就不更新
     if *TIMEKEEPING_SUSPENDED.read() {
         return;
     }
+
     let timekeeper = &mut timekeeper().0.write();
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    timekeeper.xtime_nsec = (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
-    // TODO 当有ntp模块之后 需要将timekeep与ntp进行同步并检查
-    timekeeper.xtime.tv_nsec = ((timekeeper.xtime_nsec as i64) >> timekeeper.shift) + 1;
-    timekeeper.xtime_nsec -= (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
+    let clock = timekeeper.clock.clone().unwrap();
+    let clock_data = clock.clocksource_data();
+    let offset = (clock.read().div(clock_data.watchdog_last).data()) & clock_data.mask.bits();
+    
+    // timekeeper.xtime_nsec = (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
+    // // TODO 当有ntp模块之后 需要将timekeep与ntp进行同步并检查
+    // timekeeper.xtime.tv_nsec = ((timekeeper.xtime_nsec as i64) >> timekeeper.shift) + 1;
+    // timekeeper.xtime_nsec -= (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
 
+    timekeeper.xtime.tv_nsec += offset as i64;
     if unlikely(timekeeper.xtime.tv_nsec >= NSEC_PER_SEC.into()) {
         timekeeper.xtime.tv_nsec -= NSEC_PER_SEC as i64;
         timekeeper.xtime.tv_sec += 1;

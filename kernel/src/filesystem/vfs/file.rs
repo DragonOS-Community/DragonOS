@@ -180,7 +180,7 @@ impl File {
             }
             _ => {}
         }
-        
+
         let pos: i64;
         match origin {
             SeekFrom::SeekSet(offset) => {

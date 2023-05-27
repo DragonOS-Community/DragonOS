@@ -30,7 +30,7 @@ pub unsafe fn sched_cfs_init() {
     } else {
         kBUG!("Try to init CFS Scheduler twice.");
         panic!("Try to init CFS Scheduler twice.");
-    }    
+    }
 }
 
 /// @brief CFS队列（per-cpu的）

@@ -6,6 +6,7 @@ pub mod clocksource;
 pub mod jiffies;
 pub mod posix_timer;
 pub mod sleep;
+pub mod syscall;
 pub mod timekeep;
 pub mod timekeeping;
 pub mod timer;
@@ -30,8 +31,9 @@ pub const USEC_PER_SEC: u32 = 1000000;
 pub const NSEC_PER_SEC: u32 = 1000000000;
 pub const FSEC_PER_SEC: u64 = 1000000000000000;
 
-/// 表示时间的结构体
+/// 表示时间的结构体，符合POSIX标准。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
 pub struct TimeSpec {
     pub tv_sec: i64,
     pub tv_nsec: i64,

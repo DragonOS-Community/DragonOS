@@ -175,8 +175,8 @@ impl LockedBusManager {
 /// @parameter bus: Bus设备实体
 /// @return: 成功:()   失败:DeviceError
 pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
-    BUS_MANAGER.add_bus(bus.get_id_table(), bus.clone());
-    match sys_bus_register(&bus.get_id_table().to_name()) {
+    BUS_MANAGER.add_bus(bus.id_table(), bus.clone());
+    match sys_bus_register(&bus.id_table().to_name()) {
         Ok(inode) => {
             let _ = sys_bus_init(&inode);
             return device_register(bus);
@@ -190,7 +190,7 @@ pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
 /// @return: 成功:()   失败:DeviceError
 #[allow(dead_code)]
 pub fn bus_unregister<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
-    BUS_MANAGER.add_bus(bus.get_id_table(), bus.clone());
+    BUS_MANAGER.add_bus(bus.id_table(), bus.clone());
     return device_unregister(bus);
 }
 

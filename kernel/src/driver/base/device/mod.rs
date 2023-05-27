@@ -116,12 +116,12 @@ pub trait Device: Any + Send + Sync + Debug {
     /// @brief: 获取设备类型
     /// @parameter: None
     /// @return: 实现该trait的设备所属类型
-    fn get_type(&self) -> DeviceType;
+    fn dev_type(&self) -> DeviceType;
 
     /// @brief: 获取设备标识
     /// @parameter: None
     /// @return: 该设备唯一标识
-    fn get_id_table(&self) -> IdTable;
+    fn id_table(&self) -> IdTable;
 
     /// @brief: 设置sysfs info
     /// @parameter: None
@@ -208,8 +208,8 @@ impl DeviceManager {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
-    DEVICE_MANAGER.add_device(device.get_id_table(), device.clone());
-    match sys_device_register(&device.get_id_table().to_name()) {
+    DEVICE_MANAGER.add_device(device.id_table(), device.clone());
+    match sys_device_register(&device.id_table().to_name()) {
         Ok(sys_info) => {
             device.set_sys_info(Some(sys_info));
             return Ok(());
@@ -222,8 +222,8 @@ pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_unregister<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
-    DEVICE_MANAGER.add_device(device.get_id_table(), device.clone());
-    match sys_device_unregister(&device.get_id_table().to_name()) {
+    DEVICE_MANAGER.add_device(device.id_table(), device.clone());
+    match sys_device_unregister(&device.id_table().to_name()) {
         Ok(_) => {
             device.set_sys_info(None);
             return Ok(());

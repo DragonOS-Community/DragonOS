@@ -124,7 +124,7 @@ impl LockedPlatformBusDriver {
         &mut self,
         device: Arc<dyn PlatformDevice>,
     ) -> Result<(), DeviceError> {
-        let id_table = device.get_id_table();
+        let id_table = device.id_table();
 
         let devices = &mut self.0.lock().devices;
         if devices.contains_key(&id_table) {
@@ -141,7 +141,7 @@ impl LockedPlatformBusDriver {
     #[inline]
     #[allow(dead_code)]
     fn unregister_platform_device(&mut self, device: Arc<dyn PlatformDevice>) {
-        let id_table = device.get_id_table();
+        let id_table = device.id_table();
         self.0.lock().devices.remove(&id_table);
     }
 
@@ -350,13 +350,13 @@ impl Platform {
 impl Device for LockedPlatform {
     #[inline]
     #[allow(dead_code)]
-    fn get_type(&self) -> DeviceType {
+    fn dev_type(&self) -> DeviceType {
         return DeviceType::Bus;
     }
 
     #[inline]
     #[allow(dead_code)]
-    fn get_id_table(&self) -> IdTable {
+    fn id_table(&self) -> IdTable {
         IdTable::new("platform", 0)
     }
 

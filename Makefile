@@ -131,3 +131,12 @@ run-docker:
 	sudo bash tools/build_in_docker.sh || exit 1
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
+
+help:
+	@echo "编译命令:"
+	@echo "  make all -j <n>       - 本地编译，不运行,n为要用于编译的CPU核心数"
+	@echo "  make build            - 本地编译，并写入磁盘镜像，不运行"
+	@echo "  make run              - 本地编译，写入磁盘镜像，并在QEMU中运行"
+	@echo "  make docker           - Docker编译，并写入磁盘镜像"
+	@echo "  make run-docker       - Docker编译，写入磁盘镜像，并在QEMU中运行"
+	@echo "  make qemu             - 不编译，直接从已有的磁盘镜像启动"	

@@ -88,6 +88,10 @@ macro_rules! int_like {
                     Err(result) => Err($new_type_name::from(result))
                 }
             }
+            #[allow(dead_code)]
+            pub fn fetch_add(&self, val: $new_type_name, order: ::core::sync::atomic::Ordering) -> $new_type_name {
+                $new_type_name::from(self.container.fetch_add(val.into(), order))
+            }
         }
     }
 }

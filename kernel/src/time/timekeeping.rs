@@ -1,5 +1,9 @@
 use alloc::{boxed::Box, sync::Arc};
-use core::{intrinsics::unlikely, ptr::null_mut};
+use core::{
+    intrinsics::unlikely,
+    ptr::null_mut,
+    sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering},
+};
 
 use crate::{
     arch::CurrentIrqArch,
@@ -20,11 +24,11 @@ pub const NTP_INTERVAL_FREQ: u64 = HZ;
 pub const NTP_INTERVAL_LENGTH: u64 = NSEC_PER_SEC as u64 / NTP_INTERVAL_FREQ;
 pub const NTP_SCALE_SHIFT: u32 = 32;
 
-pub static TIMEKEEPING_SUSPENDED: RwLock<bool> = RwLock::new(false);
-static mut __ADDED_USEC: SpinLock<i64> = SpinLock::new(0);
-static mut __ADDED_NSEC: SpinLock<i64> = SpinLock::new(0);
-static mut __ADDED_SEC: SpinLock<i64> = SpinLock::new(0);
-static mut __TIMEKEEPER: *mut Timekeeper = null_mut();
+pub static TIMEKEEPING_SUSPENDED: AtomicBool = AtomicBool::new(false);
+static __ADDED_USEC: AtomicI64 = AtomicI64::new(0);
+static __ADDED_NSEC: SpinLock<i64> = SpinLock::new(0);
+static __ADDED_SEC: SpinLock<i64> = SpinLock::new(0);
+static mut __TIMEKEEPER: Option<Timekeeper> = None;
 pub struct Timekeeper(RwLock<TimekeeperData>);
 pub struct TimekeeperData {
     /// 用于计时的当前时钟源。
@@ -128,7 +132,7 @@ pub fn timekeeper() -> &'static mut Timekeeper {
 }
 
 pub fn timekeeper_init() {
-    unsafe { __TIMEKEEPER = Box::leak(Box::new(Timekeeper(RwLock::new(TimekeeperData::new())))) };
+    unsafe { __TIMEKEEPER = Some(Timekeeper(RwLock::new(TimekeeperData::new()))) };
 }
 
 pub fn getnstimeofday() -> TimeSpec {
@@ -204,14 +208,13 @@ pub fn timekeeping_init() {
 // TODO update_wall_time
 /// 使用当前时钟源增加wall time
 pub fn update_wall_time() {
+    compiler_fence(Ordering::SeqCst);
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     // kdebug!("enter update_wall_time");
     // 如果在休眠那就不更新
-    if *TIMEKEEPING_SUSPENDED.read() {
+    if TIMEKEEPING_SUSPENDED.load(Ordering::SeqCst) {
         return;
     }
-
-    let timekeeper = &mut timekeeper().0.write();
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     // ===== 请不要删除这些注释 =====
     // let clock = timekeeper.clock.clone().unwrap();
@@ -231,19 +234,34 @@ pub fn update_wall_time() {
     // }
     // ================
 
-    // 暂时使用的机制
-    let mut usec = unsafe { __ADDED_USEC.lock() };
-    *usec += 500;
-    if (*usec & !((1 << 26) - 1)) != 0 {
-        // BUG 该行出错
-        // 同步时间
-        timekeeper.xtime.tv_nsec = ktime_get_real_ns();
-        timekeeper.xtime.tv_sec = 0;
-        *usec = 0;
-    }
+    compiler_fence(Ordering::SeqCst);
+    // 一分钟同步一次
+    __ADDED_USEC.fetch_add(500, Ordering::SeqCst);
+    let mut retry = 10;
+    loop {
+        let usec = __ADDED_USEC.load(Ordering::SeqCst);
+        if (usec & !((1 << 26) - 1)) != 0 {
+            if __ADDED_USEC
+                .compare_exchange(usec, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+                || retry == 0
+            {
+                // 同步时间
+                let mut timekeeper = timekeeper().0.write();
 
+                timekeeper.xtime.tv_nsec = ktime_get_real_ns();
+                timekeeper.xtime.tv_sec = 0;
+                break;
+            }
+            retry -= 1;
+        } else {
+            break;
+        }
+    }
     // TODO 需要检查是否更新时间源
+    compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
+    compiler_fence(Ordering::SeqCst);
 }
 // TODO timekeeping_adjust
 // TODO wall_to_monotic

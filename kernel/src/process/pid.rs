@@ -1,5 +1,3 @@
-
-
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]

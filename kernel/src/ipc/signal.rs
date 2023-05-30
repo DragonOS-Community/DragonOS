@@ -35,11 +35,9 @@ use crate::{
 use super::signal_types::{
     si_code_val, sig_is_member, sigaction, sigaction__union_u, sigcontext, sigframe,
     sighand_struct, siginfo, signal_struct, sigpending, sigset_clear, sigset_del, sigset_delmask,
-    sigset_equal, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS,
-    SA_FLAG_DFL, SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, _NSIG_U64_CNT,
+    sigset_equal, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS, SA_FLAG_DFL,
+    SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, _NSIG_U64_CNT,
 };
-
-
 
 /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
 pub static DEFAULT_SIGACTION: sigaction = sigaction {

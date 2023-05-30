@@ -275,7 +275,7 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
 
 pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     unsafe { TIMER_JIFFIES += add_jiffies };
-    // update_wall_time();
+    update_wall_time();
     return unsafe { TIMER_JIFFIES };
 }
 pub fn clock() -> u64 {

@@ -4,14 +4,15 @@ use alloc::{
 };
 
 use crate::{
-    kdebug,
-    libs::spinlock::SpinLock,
-    syscall::SystemError,
+    kdebug, libs::spinlock::SpinLock, syscall::SystemError, time::timekeeping::do_gettimeofday,
 };
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
-    timer::clock, NSEC_PER_SEC, timekeeping::getnstimeofday, timeconv::time_to_calendar,
+    timeconv::time_to_calendar,
+    timekeeping::getnstimeofday,
+    timer::clock,
+    NSEC_PER_SEC,
 };
 lazy_static! {
     pub static ref DEFAULT_CLOCK: Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
@@ -92,7 +93,5 @@ pub fn jiffies_init() {
 pub extern "C" fn rs_jiffies_init() {
     jiffies_init();
     let tm = getnstimeofday();
-    time_to_calendar(tm.tv_sec, 0);
-    
-
+    time_to_calendar(tm.tv_sec + 8 * 3600, 0);
 }

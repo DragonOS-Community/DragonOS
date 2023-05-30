@@ -13,9 +13,13 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{mm_stat_t, pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
-    io::SeekFrom, kinfo,
+    io::SeekFrom,
+    kinfo,
     net::syscall::SockAddr,
-    time::TimeSpec,
+    time::{
+        syscall::{PosixTimeval, PosixTimezone, SYS_TIMEZONE},
+        TimeSpec,
+    },
 };
 
 #[repr(i32)]
@@ -353,6 +357,7 @@ pub const SYS_ACCEPT: usize = 40;
 
 pub const SYS_GETSOCKNAME: usize = 41;
 pub const SYS_GETPEERNAME: usize = 42;
+pub const SYS_GETTIMEOFDAY: usize = 43;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -380,7 +385,7 @@ impl Syscall {
         return crate::arch::syscall::arch_syscall_init();
     }
     /// @brief 系统调用分发器，用于分发系统调用。
-    /// 
+    ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
     pub fn handle(syscall_num: usize, args: &[usize], from_user: bool) -> usize {
@@ -865,6 +870,41 @@ impl Syscall {
             }
             SYS_GETPEERNAME => {
                 Self::getpeername(args[0], args[1] as *mut SockAddr, args[2] as *mut u32)
+            }
+            SYS_GETTIMEOFDAY => {
+                let timeval = args[0] as *mut PosixTimeval;
+                let mut timezone = args[1] as *const PosixTimezone;
+                let security_check = || {
+                    if unsafe {
+                        verify_area(timeval as u64, core::mem::size_of::<PosixTimeval>() as u64)
+                    } == false
+                    {
+                        return Err(SystemError::EFAULT);
+                    }
+                    if unsafe {
+                        verify_area(
+                            timezone as u64,
+                            core::mem::size_of::<PosixTimezone>() as u64,
+                        )
+                    } == false
+                    {
+                        return Err(SystemError::EFAULT);
+                    }
+                    return Ok(());
+                };
+                let r = security_check();
+                if r.is_err() {
+                    Err(r.unwrap_err())
+                } else {
+                    if !timezone.is_null() {
+                        timezone = &SYS_TIMEZONE;
+                    }
+                    if !timeval.is_null() {
+                        Self::sys_do_gettimeofday(timeval)
+                    } else {
+                        Err(SystemError::EFAULT)
+                    }
+                }
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

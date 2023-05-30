@@ -1,19 +1,19 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{intrinsics::unlikely, ptr::null_mut};
-use smoltcp::wire::Icmpv6TimeExceeded;
 
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     kdebug,
-    libs::rwlock::RwLock,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
     time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
 };
 
 use super::{
     clocksource::{clocksource_cyc2ns, Clocksource, CycleNum, HZ},
     syscall::PosixTimeval,
-    NSEC_PER_SEC,
+    timeconv::time_to_calendar,
+    NSEC_PER_SEC, NSEC_PER_USEC, USEC_PER_SEC,
 };
 
 pub const NTP_INTERVAL_FREQ: u64 = HZ;
@@ -21,6 +21,9 @@ pub const NTP_INTERVAL_LENGTH: u64 = NSEC_PER_SEC as u64 / NTP_INTERVAL_FREQ;
 pub const NTP_SCALE_SHIFT: u32 = 32;
 
 pub static TIMEKEEPING_SUSPENDED: RwLock<bool> = RwLock::new(false);
+static mut __ADDED_USEC: SpinLock<i64> = SpinLock::new(0);
+static mut __ADDED_NSEC: SpinLock<i64> = SpinLock::new(0);
+static mut __ADDED_SEC: SpinLock<i64> = SpinLock::new(0);
 static mut __TIMEKEEPER: *mut Timekeeper = null_mut();
 pub struct Timekeeper(RwLock<TimekeeperData>);
 pub struct TimekeeperData {
@@ -164,6 +167,7 @@ pub fn getnstimeofday() -> TimeSpec {
 
 pub fn do_gettimeofday() -> PosixTimeval {
     let tp = getnstimeofday();
+    time_to_calendar(tp.tv_sec + 8 * 3600, 0);
     return PosixTimeval {
         tv_sec: tp.tv_sec,
         tv_usec: (tp.tv_nsec / 1000) as i32,
@@ -208,20 +212,36 @@ pub fn update_wall_time() {
 
     let timekeeper = &mut timekeeper().0.write();
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let clock = timekeeper.clock.clone().unwrap();
-    let clock_data = clock.clocksource_data();
-    let offset = (clock.read().div(clock_data.watchdog_last).data()) & clock_data.mask.bits();
-    
+
+    // ===== 请不要删除这些注释 =====
+    // let clock = timekeeper.clock.clone().unwrap();
+    // let clock_data = clock.clocksource_data();
+    // let offset = (clock.read().div(clock_data.watchdog_last).data()) & clock_data.mask.bits();
+
     // timekeeper.xtime_nsec = (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
     // // TODO 当有ntp模块之后 需要将timekeep与ntp进行同步并检查
     // timekeeper.xtime.tv_nsec = ((timekeeper.xtime_nsec as i64) >> timekeeper.shift) + 1;
     // timekeeper.xtime_nsec -= (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
 
-    timekeeper.xtime.tv_nsec += offset as i64;
-    if unlikely(timekeeper.xtime.tv_nsec >= NSEC_PER_SEC.into()) {
-        timekeeper.xtime.tv_nsec -= NSEC_PER_SEC as i64;
-        timekeeper.xtime.tv_sec += 1;
+    // timekeeper.xtime.tv_nsec += offset as i64;
+    // while unlikely(timekeeper.xtime.tv_nsec >= NSEC_PER_SEC.into()) {
+    //     timekeeper.xtime.tv_nsec -= NSEC_PER_SEC as i64;
+    //     timekeeper.xtime.tv_sec += 1;
+    //     // TODO 需要处理闰秒
+    // }
+    // ================
+
+    // 暂时使用的机制
+    let mut usec = unsafe { __ADDED_USEC.lock() };
+    *usec += 500;
+    if (*usec & !((1 << 26) - 1)) != 0 {
+        // BUG 该行出错
+        // 同步时间
+        timekeeper.xtime.tv_nsec = ktime_get_real_ns();
+        timekeeper.xtime.tv_sec = 0;
+        *usec = 0;
     }
+
     // TODO 需要检查是否更新时间源
     drop(irq_guard);
 }

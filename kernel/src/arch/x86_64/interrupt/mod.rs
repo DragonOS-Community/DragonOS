@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+
+pub mod ipi;
+
 use core::{
     arch::asm,
     sync::atomic::{compiler_fence, Ordering},

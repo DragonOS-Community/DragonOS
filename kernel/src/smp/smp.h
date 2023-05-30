@@ -15,6 +15,6 @@ extern uchar _apu_boot_end[];
  */
 void smp_init();
 
-int kick_cpu(uint32_t cpu_id);
+extern int64_t rs_kick_cpu(uint32_t cpu_id);
 
 uint32_t smp_get_total_cpu();

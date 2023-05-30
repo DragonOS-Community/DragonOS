@@ -776,7 +776,7 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (pcb->cpu_id == current_pcb->cpu_id)
         sched();
     else
-        kick_cpu(pcb->cpu_id);
+        rs_kick_cpu(pcb->cpu_id);
     return 0;
 }
 

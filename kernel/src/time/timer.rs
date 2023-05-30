@@ -1,4 +1,4 @@
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use alloc::{
     boxed::Box,
@@ -23,7 +23,7 @@ use super::timekeeping::update_wall_time;
 
 const MAX_TIMEOUT: i64 = i64::MAX;
 const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
-static mut TIMER_JIFFIES: u64 = 0;
+static TIMER_JIFFIES: AtomicU64 = AtomicU64::new(0);
 
 lazy_static! {
     pub static ref TIMER_LIST: SpinLock<LinkedList<Arc<Timer>>> = SpinLock::new(LinkedList::new());
@@ -46,7 +46,7 @@ impl WakeUpHelper {
 }
 
 impl TimerFunction for WakeUpHelper {
-    fn run(&mut self) -> Result<(), SystemError>{
+    fn run(&mut self) -> Result<(), SystemError> {
         unsafe {
             process_wakeup(self.pcb);
         }
@@ -100,7 +100,7 @@ impl Timer {
                 break;
             }
         }
-        
+
         let mut temp_list: LinkedList<Arc<Timer>> = timer_list.split_off(split_pos);
         timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
         timer_list.append(&mut temp_list);
@@ -183,7 +183,7 @@ impl SoftirqVec for DoTimerSoftirq {
                 continue;
             }
             let timer_list_front_guard = timer_list_front_guard.unwrap();
-            if timer_list_front_guard.expire_jiffies > unsafe { TIMER_JIFFIES as u64 } {
+            if timer_list_front_guard.expire_jiffies > TIMER_JIFFIES.load(Ordering::SeqCst) {
                 drop(timer_list_front_guard);
                 timer_list.push_front(timer_list_front);
                 break;
@@ -209,11 +209,11 @@ pub fn timer_init() {
 
 /// 计算接下来n毫秒对应的定时器时间片
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
-    return unsafe { TIMER_JIFFIES as u64 } + 1000 * (expire_ms);
+    return TIMER_JIFFIES.load(Ordering::SeqCst) + 1000 * (expire_ms);
 }
 /// 计算接下来n微秒对应的定时器时间片
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
-    return unsafe { TIMER_JIFFIES as u64 } + (expire_us);
+    return TIMER_JIFFIES.load(Ordering::SeqCst) + (expire_us);
 }
 
 /// @brief 让pcb休眠timeout个jiffies
@@ -234,14 +234,14 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     } else {
         // 禁用中断，防止在这段期间发生调度，造成死锁
         cli();
-        timeout += unsafe { TIMER_JIFFIES } as i64;
+        timeout += TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         let timer = Timer::new(WakeUpHelper::new(current_pcb()), timeout as u64);
         timer.activate();
         current_pcb().state &= (!PROC_RUNNING) as u64;
         sti();
 
         sched();
-        let time_remaining: i64 = timeout - unsafe { TIMER_JIFFIES } as i64;
+        let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {
             // 被提前唤醒，返回剩余时间
             return Ok(time_remaining);
@@ -274,12 +274,15 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
 }
 
 pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
-    unsafe { TIMER_JIFFIES += add_jiffies };
+    let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
     update_wall_time();
-    return unsafe { TIMER_JIFFIES };
+
+    compiler_fence(Ordering::SeqCst);
+    return prev + add_jiffies;
 }
 pub fn clock() -> u64 {
-    return unsafe { TIMER_JIFFIES };
+    return TIMER_JIFFIES.load(Ordering::SeqCst);
 }
 // ====== 重构完成后请删掉extern C ======
 #[no_mangle]

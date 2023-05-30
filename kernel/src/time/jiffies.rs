@@ -56,6 +56,10 @@ impl Clocksource for ClocksourceJiffies {
         d.set_shift(_data.shift);
         return Ok(());
     }
+
+    fn enable(&self) -> Result<i32, SystemError> {
+        return Ok(0);
+    }
 }
 impl ClocksourceJiffies {
     pub fn new() -> Arc<Self> {

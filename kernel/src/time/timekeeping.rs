@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, sync::Arc};
+use x86_64::align_up;
 use core::{
     intrinsics::unlikely,
     ptr::null_mut,
@@ -90,7 +91,7 @@ impl TimekeeperData {
 }
 impl Timekeeper {
     pub fn timekeeper_setup_internals(&self, clock: Arc<dyn Clocksource>) {
-        let timekeeper = &mut self.0.write();
+        let mut timekeeper = self.0.write();
         // 更新clock
         let mut clock_data = clock.clocksource_data();
         clock_data.watchdog_last = clock.read();
@@ -127,8 +128,8 @@ impl Timekeeper {
         return clocksource_cyc2ns(CycleNum(clock_delta), clcok_data.mult, clcok_data.shift);
     }
 }
-pub fn timekeeper() -> &'static mut Timekeeper {
-    return unsafe { __TIMEKEEPER.as_mut().unwrap() };
+pub fn timekeeper() -> &'static Timekeeper {
+    return unsafe { __TIMEKEEPER.as_ref().unwrap() };
 }
 
 pub fn timekeeper_init() {
@@ -179,17 +180,17 @@ pub fn do_gettimeofday() -> PosixTimeval {
 }
 
 pub fn timekeeping_init() {
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     timekeeper_init();
 
     // TODO 有ntp模块后 在此初始化ntp模块
 
     let clock = clocksource_default_clock();
-    clock.enable();
+    clock.enable().expect("clocksource_default_clock enable failed");
     timekeeper().timekeeper_setup_internals(clock);
     // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
-    let timekeeper = &mut timekeeper().0.write();
+    let mut timekeeper = timekeeper().0.write();
     timekeeper.xtime.tv_nsec = ktime_get_real_ns();
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     // 初始化wall time到monotonic的时间
     let mut nsec = -timekeeper.xtime.tv_nsec;
@@ -208,6 +209,11 @@ pub fn timekeeping_init() {
 // TODO update_wall_time
 /// 使用当前时钟源增加wall time
 pub fn update_wall_time() {
+    let rsp = unsafe{crate::include::bindings::bindings::get_rsp()} as usize;
+    let stack_use = align_up(rsp as u64, 32768)-rsp as u64;
+
+
+    // kdebug!("enter update_wall_time, stack_use = {:}",stack_use);
     compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     // kdebug!("enter update_wall_time");
@@ -237,6 +243,7 @@ pub fn update_wall_time() {
     compiler_fence(Ordering::SeqCst);
     // 一分钟同步一次
     __ADDED_USEC.fetch_add(500, Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
     let mut retry = 10;
     loop {
         let usec = __ADDED_USEC.load(Ordering::SeqCst);
@@ -247,6 +254,8 @@ pub fn update_wall_time() {
                 || retry == 0
             {
                 // 同步时间
+                // 我感觉这里会出问题：多个读者不退出的话，写者就无法写入
+                // 然后这里会超时，导致在中断返回之后，会不断的进入这个中断，最终爆栈。
                 let mut timekeeper = timekeeper().0.write();
 
                 timekeeper.xtime.tv_nsec = ktime_get_real_ns();
@@ -260,6 +269,7 @@ pub fn update_wall_time() {
     }
     // TODO 需要检查是否更新时间源
     compiler_fence(Ordering::SeqCst);
+    // kdebug!("exit update_wall_time");
     drop(irq_guard);
     compiler_fence(Ordering::SeqCst);
 }

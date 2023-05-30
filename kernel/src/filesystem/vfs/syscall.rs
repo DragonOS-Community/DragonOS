@@ -1,12 +1,9 @@
-
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::{current::current_pcb},
+    arch::asm::current::current_pcb,
     filesystem::vfs::file::FileDescriptorVec,
-    include::bindings::bindings::{
-        verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM,
-    },
+    include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
     io::SeekFrom,
     kerror,
     syscall::{Syscall, SystemError},

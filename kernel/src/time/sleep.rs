@@ -3,11 +3,7 @@ use core::{arch::x86_64::_rdtsc, hint::spin_loop};
 use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
-    arch::{
-        asm::current::current_pcb,
-        sched::sched,
-        CurrentIrqArch,
-    },
+    arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
     syscall::SystemError,

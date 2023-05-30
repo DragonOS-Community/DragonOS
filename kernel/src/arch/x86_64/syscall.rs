@@ -9,10 +9,7 @@ use crate::{
     syscall::{Syscall, SystemError, SYS_EXECVE, SYS_FORK, SYS_RT_SIGRETURN, SYS_VFORK},
 };
 
-use super::{
-    asm::{ptrace::user_mode},
-    mm::barrier::mfence,
-};
+use super::{asm::ptrace::user_mode, mm::barrier::mfence};
 
 extern "C" {
     fn do_fork(regs: *mut pt_regs, clone_flags: u64, stack_start: u64, stack_size: u64) -> u64;

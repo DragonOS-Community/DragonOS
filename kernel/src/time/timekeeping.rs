@@ -1,10 +1,10 @@
 use alloc::{boxed::Box, sync::Arc};
-use x86_64::align_up;
 use core::{
     intrinsics::unlikely,
     ptr::null_mut,
     sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering},
 };
+use x86_64::align_up;
 
 use crate::{
     arch::CurrentIrqArch,
@@ -148,13 +148,13 @@ pub fn getnstimeofday() -> TimeSpec {
             Some(tk) => {
                 xtime = tk.xtime;
                 drop(tk);
-                nsecs = timekeeper().timekeeping_get_ns();
+                // nsecs = timekeeper().timekeeping_get_ns();
                 // TODO 不同架构可能需要加上不同的偏移量
                 break;
             }
         }
     }
-    xtime.tv_nsec += nsecs as i64;
+    // xtime.tv_nsec += nsecs as i64;
     while xtime.tv_nsec >= NSEC_PER_SEC.into() {
         xtime.tv_nsec -= NSEC_PER_SEC as i64;
         xtime.tv_sec += 1;
@@ -186,7 +186,9 @@ pub fn timekeeping_init() {
     // TODO 有ntp模块后 在此初始化ntp模块
 
     let clock = clocksource_default_clock();
-    clock.enable().expect("clocksource_default_clock enable failed");
+    clock
+        .enable()
+        .expect("clocksource_default_clock enable failed");
     timekeeper().timekeeper_setup_internals(clock);
     // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
     let mut timekeeper = timekeeper().0.write();
@@ -195,7 +197,7 @@ pub fn timekeeping_init() {
     // 初始化wall time到monotonic的时间
     let mut nsec = -timekeeper.xtime.tv_nsec;
     let mut sec = -timekeeper.xtime.tv_sec;
-    //
+    // FIXME: 这里有个奇怪的奇怪的bug
     let num = nsec % NSEC_PER_SEC as i64;
     nsec += num * NSEC_PER_SEC as i64;
     sec -= num;
@@ -209,9 +211,8 @@ pub fn timekeeping_init() {
 // TODO update_wall_time
 /// 使用当前时钟源增加wall time
 pub fn update_wall_time() {
-    let rsp = unsafe{crate::include::bindings::bindings::get_rsp()} as usize;
-    let stack_use = align_up(rsp as u64, 32768)-rsp as u64;
-
+    let rsp = unsafe { crate::include::bindings::bindings::get_rsp() } as usize;
+    let stack_use = align_up(rsp as u64, 32768) - rsp as u64;
 
     // kdebug!("enter update_wall_time, stack_use = {:}",stack_use);
     compiler_fence(Ordering::SeqCst);
@@ -247,6 +248,13 @@ pub fn update_wall_time() {
     let mut retry = 10;
     loop {
         let usec = __ADDED_USEC.load(Ordering::SeqCst);
+        // 尝试增加秒数
+        if usec % 1000000 == 0 {
+            let mut timekeeper = timekeeper().0.write();
+            timekeeper.xtime.tv_nsec -= NSEC_PER_SEC as i64;
+            timekeeper.xtime.tv_sec += 1;
+            drop(timekeeper);
+        }
         if (usec & !((1 << 26) - 1)) != 0 {
             if __ADDED_USEC
                 .compare_exchange(usec, 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -260,6 +268,7 @@ pub fn update_wall_time() {
 
                 timekeeper.xtime.tv_nsec = ktime_get_real_ns();
                 timekeeper.xtime.tv_sec = 0;
+                drop(timekeeper);
                 break;
             }
             retry -= 1;

@@ -136,6 +136,7 @@ void smp_init()
         io_mfence();
         *(ul *)(phys_2_virt(global_CR3) + i) = 0UL;
     }
+    
     kdebug("init proc's preempt_count=%ld", current_pcb->preempt_count);
     kinfo("Successfully cleaned page table remapping!\n");
 }

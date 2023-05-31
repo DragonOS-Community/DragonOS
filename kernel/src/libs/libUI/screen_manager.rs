@@ -23,7 +23,10 @@ use crate::{
     syscall::SystemError,
 };
 
-use super::textui::TextuiPrivateInfo;
+use super::{
+    textui::TextuiPrivateInfo,
+    textui_render::{BUF_WIDTH, FB},
+};
 
 use lazy_static::lazy_static;
 lazy_static! {
@@ -77,10 +80,8 @@ impl ScmBufferInfo {
      * @return struct ScmBufferInfo 新的帧缓冲区结构体
      */
     fn new(b_type: ScmBfFlag) -> Result<Self, SystemError> {
-        c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_buf_new_start\n\0".as_ptr());
         if unlikely(unsafe { SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) } == false) {
-            c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_buf_new_4\n\0".as_ptr());
-            return Ok(ScmBufferInfo::copy_from_c(unsafe { &video_frame_buffer_info }).unwrap());
+            return Ok(ScmBufferInfo::copy_from_c(unsafe { &video_frame_buffer_info })?);
         } else {
             let mut frame_buffer_info: ScmBufferInfo = ScmBufferInfo {
                 width: unsafe { video_frame_buffer_info.width }, // 帧缓冲区宽度（pixel或columns）
@@ -88,8 +89,8 @@ impl ScmBufferInfo {
                 size: unsafe { video_frame_buffer_info.size },   // 帧缓冲区大小（bytes）
                 bit_depth: unsafe { video_frame_buffer_info.bit_depth }, // 像素点位深度
 
-                vaddr: 0,                    // 帧缓冲区的地址
-                flags: ScmBfFlag::SCM_BF_DB, // 帧缓冲区标志位
+                vaddr: unsafe { video_frame_buffer_info.vaddr }, // 帧缓冲区的地址
+                flags: ScmBfFlag::SCM_BF_DB,                     // 帧缓冲区标志位
             };
             if b_type.contains(ScmBfFlag::SCM_BF_PIXEL) {
                 frame_buffer_info.flags |= ScmBfFlag::SCM_BF_PIXEL;
@@ -160,7 +161,6 @@ impl ScmUiFrameworkMetadata {
                     name: "".to_string(),
                     f_type: ScmFramworkType::Text,
                     buf: ScmBufferInfo::new(ScmBfFlag::SCM_BF_TEXT).unwrap(),
-                    // private_info: ScmUiPrivateInfo::Textui(TextuiPrivateInfo::new()),
                     is_null: true,
                     window_max_id: 0,
                 };
@@ -211,14 +211,9 @@ pub trait ScmUiFramework: Sync + Send + Debug {
  */
 #[no_mangle]
 pub extern "C" fn scm_init() {
-    // spin_init(&scm_register_lock);
-    // spin_init(&scm_screen_own_lock);
-    //  io_mfence();
-    // fence(Ordering::SeqCst);
     c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_init\n\0".as_ptr());
     unsafe { SCM_DOUBLE_BUFFER_ENABLED.store(false, Ordering::SeqCst) }; // 禁用双缓冲
-
-    // CURRENT_FRAMEWORK_METADATA.lock().is_null = true;
+                                                                         // CURRENT_FRAMEWORK_METADATA.lock().is_null = true;
     c_uart_send_str(UartPort::COM1.to_u16(), "\nfinish_init\n\0".as_ptr());
 }
 /**
@@ -232,8 +227,6 @@ pub fn scm_framework_enable(textuiframework: Arc<dyn ScmUiFramework>) -> Result<
         return Err(SystemError::EINVAL);
     }
     let mut current_framework = CURRENT_FRAMEWORK_METADATA.lock();
-
-    // spin_lock(&scm_screen_own_lock);
 
     if unsafe { SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) } == true {
         let buf: *mut scm_buffer_info_t =
@@ -257,8 +250,9 @@ pub fn scm_framework_enable(textuiframework: Arc<dyn ScmUiFramework>) -> Result<
         current_framework.is_null = textuiframework.metadata()?.is_null;
         current_framework.window_max_id = textuiframework.metadata()?.window_max_id;
     }
+    unsafe { FB = current_framework.buf.vaddr };
+    unsafe { BUF_WIDTH = current_framework.buf.width };
 
-    // spin_unlock(&scm_screen_own_lock);
     return Ok(0);
 }
 /**
@@ -267,20 +261,19 @@ pub fn scm_framework_enable(textuiframework: Arc<dyn ScmUiFramework>) -> Result<
  * @param ui 框架结构体指针
  * @return int 错误码
  */
-pub fn scm_register(ui: Arc<dyn ScmUiFramework>) -> i32 {
+pub fn scm_register(ui: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     // 把ui框架加入链表
     SCM_FRAMEWORK_LIST.lock().push_back(ui.clone());
-    c_uart_send_str(UartPort::COM1.to_u16(), "\nscm register 1\n\0".as_ptr());
     // 调用ui框架的回调函数以安装ui框架，并将其激活
-    let _ = ui.install(ui.metadata().unwrap().buf);
-    let _ = ui.enable();
-    c_uart_send_str(UartPort::COM1.to_u16(), "\nscm register 2\n\0".as_ptr());
+    
+    ui.install(ui.metadata()?.buf)?;
+    ui.enable()?;
 
     if CURRENT_FRAMEWORK_METADATA.lock().is_null {
-        return scm_framework_enable(ui).unwrap();
+        return scm_framework_enable(ui);
     }
-
-    return 0;
+    
+    return Ok(0);
 }
 /**
  * @brief 销毁双缓冲区
@@ -330,13 +323,14 @@ pub extern "C" fn scm_enable_double_buffer() -> i32 {
         return 0;
     }
     unsafe { SCM_DOUBLE_BUFFER_ENABLED.store(true, Ordering::SeqCst) };
-    if SCM_FRAMEWORK_LIST.lock().is_empty() {
+    let mut scm_list = SCM_FRAMEWORK_LIST.lock();
+    if scm_list.is_empty() {
         // scm 框架链表为空
         return 0;
     }
 
     // 逐个检查已经注册了的ui框架，将其缓冲区更改为双缓冲
-    for ptr in SCM_FRAMEWORK_LIST.lock().iter_mut() {
+    for ptr in scm_list.iter_mut() {
         if unsafe { buffer_equal(ptr.metadata().unwrap().buf.to_c(), video_frame_buffer_info) } {
             let message: *const u8 = "\ninit double buffer\n\0".as_ptr();
             c_uart_send_str(UartPort::COM1.to_u16(), message);

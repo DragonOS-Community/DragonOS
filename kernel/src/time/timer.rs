@@ -201,6 +201,7 @@ pub fn timer_init() {
         .register_softirq(SoftirqNumber::TIMER, do_timer_softirq)
         .expect("Failed to register timer softirq");
     kdebug!("timer initiated successfully");
+    
 }
 
 /// 计算接下来n毫秒对应的定时器时间片

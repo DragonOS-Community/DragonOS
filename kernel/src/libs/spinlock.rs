@@ -91,10 +91,7 @@ impl RawSpinlock {
     pub fn try_lock(&self) -> bool {
         // 先增加自旋锁持有计数
         preempt_disable();
-        c_uart_send_str(
-            UartPort::COM1.to_u16(),
-            "\ntry_lock\n\0".as_ptr(),
-        );
+
         let res = self
             .0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -200,8 +197,7 @@ impl<T> SpinLock<T> {
     // }
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<T> {
-    c_uart_send_str(UartPort::COM1.to_u16(), "lock1\n\0".as_ptr());
-        
+            
         self.lock.lock();
         // 加锁成功，返回一个守卫
         return SpinLockGuard {

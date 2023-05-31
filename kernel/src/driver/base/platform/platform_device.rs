@@ -8,14 +8,10 @@ use alloc::sync::Arc;
 /// @brief: 实现该trait的设备实例应挂载在platform总线上，
 ///         同时应该实现Device trait
 pub trait PlatformDevice: Device {
-    fn get_type(&self) -> DeviceType {
-        DeviceType::PlatformDev
-    }
-
     /// @brief: 获取设备匹配表
     /// @parameter: None
     /// @return: 设备匹配表
-    fn get_compatible_table(&self) -> CompatibleTable;
+    fn compatible_table(&self) -> CompatibleTable;
 
     /// @brief: 判断设备是否初始化
     /// @parameter: None

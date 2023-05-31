@@ -198,7 +198,7 @@ pub fn bus_unregister<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
 /// @parameter bus: Bus设备驱动实体
 /// @return: 成功:()   失败:DeviceError
 pub fn bus_driver_register<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), DriverError> {
-    BUS_MANAGER.add_driver(bus_driver.get_id_table(), bus_driver.clone());
+    BUS_MANAGER.add_driver(bus_driver.id_table(), bus_driver.clone());
     return driver_register(bus_driver);
 }
 
@@ -207,6 +207,6 @@ pub fn bus_driver_register<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), Drive
 /// @return: 成功:()   失败:DeviceError
 #[allow(dead_code)]
 pub fn bus_driver_unregister<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), DriverError> {
-    BUS_MANAGER.add_driver(bus_driver.get_id_table(), bus_driver.clone());
+    BUS_MANAGER.add_driver(bus_driver.id_table(), bus_driver.clone());
     return driver_unregister(bus_driver);
 }

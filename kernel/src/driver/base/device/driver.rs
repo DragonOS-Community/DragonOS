@@ -28,13 +28,13 @@ impl Into<SystemError> for DriverError {
 pub trait Driver: Any + Send + Sync + Debug {
     /// @brief: 本函数用于实现动态转换
     /// @parameter: None
-    /// @return: 该驱动驱动唯一标识符
+    /// @return: any
     fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
 
     /// @brief: 获取驱动驱动标识符
     /// @parameter: None
     /// @return: 该驱动驱动唯一标识符
-    fn get_id_table(&self) -> IdTable;
+    fn id_table(&self) -> IdTable;
 
     /// @brief: 设置驱动的sys information
     /// @parameter id_table: 驱动标识符，用于唯一标识该驱动
@@ -125,7 +125,7 @@ impl DriverManager {
 /// @parameter: name: 驱动名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn driver_register<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
-    DRIVER_MANAGER.add_driver(driver.get_id_table(), driver);
+    DRIVER_MANAGER.add_driver(driver.id_table(), driver);
     return Ok(());
 }
 
@@ -134,6 +134,6 @@ pub fn driver_register<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
 /// @return: 操作成功，返回()，操作失败，返回错误码
 #[allow(dead_code)]
 pub fn driver_unregister<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
-    DRIVER_MANAGER.add_driver(driver.get_id_table(), driver);
+    DRIVER_MANAGER.add_driver(driver.id_table(), driver);
     return Ok(());
 }

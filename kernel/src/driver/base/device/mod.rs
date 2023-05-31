@@ -113,6 +113,11 @@ impl From<DeviceState> for u32 {
 
 /// @brief: 所有设备都应该实现该trait
 pub trait Device: Any + Send + Sync + Debug {
+    /// @brief: 本函数用于实现动态转换
+    /// @parameter: None
+    /// @return: any
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
+
     /// @brief: 获取设备类型
     /// @parameter: None
     /// @return: 实现该trait的设备所属类型

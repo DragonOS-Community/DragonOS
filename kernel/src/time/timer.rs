@@ -110,7 +110,11 @@ impl Timer {
 
     #[inline]
     fn run(&self) {
-        self.0.lock().timer_func.run();
+        self.0
+            .lock()
+            .timer_func
+            .run()
+            .expect("Timer run: failed to run timer_func");
     }
 }
 

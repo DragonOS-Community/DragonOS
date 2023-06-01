@@ -3,9 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{
-    kdebug, libs::spinlock::SpinLock, syscall::SystemError, time::timekeeping::do_gettimeofday,
-};
+use crate::{kdebug, libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
@@ -17,7 +15,6 @@ use super::{
 lazy_static! {
     pub static ref DEFAULT_CLOCK: Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
 }
-//一些应该放在jiffies里里面的常量 暂时先放一下
 pub const CLOCK_TICK_RATE: u32 = HZ as u32 * 100000;
 pub const JIFFIES_SHIFT: u32 = 8;
 pub const LATCH: u32 = ((CLOCK_TICK_RATE + (HZ as u32) / 2) / HZ as u32) as u32;

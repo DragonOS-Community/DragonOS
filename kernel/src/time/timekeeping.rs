@@ -1,9 +1,5 @@
-use alloc::{boxed::Box, sync::Arc};
-use core::{
-    intrinsics::unlikely,
-    ptr::null_mut,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering},
-};
+use alloc::{sync::Arc};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering};
 use x86_64::align_up;
 
 use crate::{
@@ -17,8 +13,7 @@ use crate::{
 use super::{
     clocksource::{clocksource_cyc2ns, Clocksource, CycleNum, HZ},
     syscall::PosixTimeval,
-    timeconv::time_to_calendar,
-    NSEC_PER_SEC, NSEC_PER_USEC, USEC_PER_SEC,
+    NSEC_PER_SEC, USEC_PER_SEC,
 };
 
 pub const NTP_INTERVAL_FREQ: u64 = HZ;
@@ -28,7 +23,7 @@ pub const NTP_SCALE_SHIFT: u32 = 32;
 pub static TIMEKEEPING_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static __ADDED_USEC: AtomicI64 = AtomicI64::new(0);
 static __ADDED_NSEC: SpinLock<i64> = SpinLock::new(0);
-static __ADDED_SEC: SpinLock<i64> = SpinLock::new(0);
+static __ADDED_SEC: AtomicI64 = AtomicI64::new(0);
 static mut __TIMEKEEPER: Option<Timekeeper> = None;
 pub struct Timekeeper(RwLock<TimekeeperData>);
 pub struct TimekeeperData {
@@ -90,6 +85,12 @@ impl TimekeeperData {
     }
 }
 impl Timekeeper {
+    
+    /// # 设置timekeeper的参数
+    /// 
+    /// ## 参数
+    /// 
+    /// * 'clock' - 指定的时钟实际类型。初始为ClocksourceJiffies
     pub fn timekeeper_setup_internals(&self, clock: Arc<dyn Clocksource>) {
         let mut timekeeper = self.0.write();
         // 更新clock
@@ -119,6 +120,7 @@ impl Timekeeper {
         timekeeper.mult = clock_data.mult;
     }
 
+    /// # 获取当前时钟源距离上次检测走过的纳秒数
     pub fn timekeeping_get_ns(&self) -> u64 {
         let timekeeper = self.0.read();
         let clock = timekeeper.clock.clone().unwrap();
@@ -136,8 +138,13 @@ pub fn timekeeper_init() {
     unsafe { __TIMEKEEPER = Some(Timekeeper(RwLock::new(TimekeeperData::new()))) };
 }
 
+/// # 获取1970.1.1至今的UTC时间戳(最小单位:nsec)
+/// 
+/// ## 返回值
+/// 
+/// * 'TimeSpec' - 时间戳
 pub fn getnstimeofday() -> TimeSpec {
-    let mut nsecs: u64 = 0;
+    // let mut nsecs: u64 = 0;0
     let mut xtime = TimeSpec {
         tv_nsec: 0,
         tv_sec: 0,
@@ -155,6 +162,8 @@ pub fn getnstimeofday() -> TimeSpec {
         }
     }
     // xtime.tv_nsec += nsecs as i64;
+    let sec = __ADDED_SEC.load(Ordering::SeqCst);
+    xtime.tv_sec += sec;
     while xtime.tv_nsec >= NSEC_PER_SEC.into() {
         xtime.tv_nsec -= NSEC_PER_SEC as i64;
         xtime.tv_sec += 1;
@@ -162,23 +171,29 @@ pub fn getnstimeofday() -> TimeSpec {
 
     // TODO 将xtime和当前时间源的时间相加
 
-    kdebug!(
-        "xtime.tv_sec = {:?},xtime.tv_nsec = {:?}",
-        xtime.tv_sec,
-        xtime.tv_nsec
-    );
+    // kdebug!(
+    //     "xtime.tv_sec = {:?},xtime.tv_nsec = {:?}",
+    //     xtime.tv_sec,
+    //     xtime.tv_nsec
+    // );
     return xtime;
 }
 
+/// # 获取1970.1.1至今的UTC时间戳(最小单位:usec)
+/// 
+/// ## 返回值
+/// 
+/// * 'PosixTimeval' - 时间戳
 pub fn do_gettimeofday() -> PosixTimeval {
     let tp = getnstimeofday();
-    time_to_calendar(tp.tv_sec + 8 * 3600, 0);
+    // time_to_calendar(tp.tv_sec + 8 * 3600, 0);
     return PosixTimeval {
         tv_sec: tp.tv_sec,
         tv_usec: (tp.tv_nsec / 1000) as i32,
     };
 }
 
+/// # 初始化timekeeping模块
 pub fn timekeeping_init() {
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     timekeeper_init();
@@ -203,21 +218,23 @@ pub fn timekeeping_init() {
     sec -= num;
     timekeeper.wall_to_monotonic.tv_nsec = nsec;
     timekeeper.wall_to_monotonic.tv_sec = sec;
+
+    __ADDED_USEC.store(0, Ordering::SeqCst);
+    __ADDED_SEC.store(0, Ordering::SeqCst);
+
     drop(irq_guard);
     kdebug!("timekeeping_init successfully");
 }
 
-// TODO xtime_updata
-// TODO update_wall_time
-/// 使用当前时钟源增加wall time
+
+/// # 使用当前时钟源增加wall time
 pub fn update_wall_time() {
     let rsp = unsafe { crate::include::bindings::bindings::get_rsp() } as usize;
-    let stack_use = align_up(rsp as u64, 32768) - rsp as u64;
+    let _stack_use = align_up(rsp as u64, 32768) - rsp as u64;
 
     // kdebug!("enter update_wall_time, stack_use = {:}",stack_use);
     compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    // kdebug!("enter update_wall_time");
     // 如果在休眠那就不更新
     if TIMEKEEPING_SUSPENDED.load(Ordering::SeqCst) {
         return;
@@ -240,21 +257,20 @@ pub fn update_wall_time() {
     //     // TODO 需要处理闰秒
     // }
     // ================
-
     compiler_fence(Ordering::SeqCst);
     // 一分钟同步一次
     __ADDED_USEC.fetch_add(500, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
     let mut retry = 10;
+
+    let usec = __ADDED_USEC.load(Ordering::SeqCst);
+    if usec % USEC_PER_SEC as i64 == 0 {
+        compiler_fence(Ordering::SeqCst);
+
+        __ADDED_SEC.fetch_add(1, Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
+    }
     loop {
-        let usec = __ADDED_USEC.load(Ordering::SeqCst);
-        // 尝试增加秒数
-        if usec % 1000000 == 0 {
-            let mut timekeeper = timekeeper().0.write();
-            timekeeper.xtime.tv_nsec -= NSEC_PER_SEC as i64;
-            timekeeper.xtime.tv_sec += 1;
-            drop(timekeeper);
-        }
         if (usec & !((1 << 26) - 1)) != 0 {
             if __ADDED_USEC
                 .compare_exchange(usec, 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -265,9 +281,9 @@ pub fn update_wall_time() {
                 // 我感觉这里会出问题：多个读者不退出的话，写者就无法写入
                 // 然后这里会超时，导致在中断返回之后，会不断的进入这个中断，最终爆栈。
                 let mut timekeeper = timekeeper().0.write();
-
                 timekeeper.xtime.tv_nsec = ktime_get_real_ns();
                 timekeeper.xtime.tv_sec = 0;
+                __ADDED_SEC.store(0, Ordering::SeqCst);
                 drop(timekeeper);
                 break;
             }

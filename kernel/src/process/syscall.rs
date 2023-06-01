@@ -16,13 +16,13 @@ impl Syscall {
         // 由于进程管理未完成重构，fork调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
         todo!()
     }
-    
+
     #[allow(dead_code)]
     pub fn vfork(&self) -> Result<usize, SystemError> {
         // 由于进程管理未完成重构，vfork调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
         todo!()
     }
-    
+
     #[allow(dead_code)]
     pub fn execve(
         _path: *const c_void,

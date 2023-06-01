@@ -4,7 +4,10 @@
 /// @Description: bump allocator线性分配器
 ///
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
-use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea};
+use crate::{
+    kdebug,
+    mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea},
+};
 use core::marker::PhantomData;
 
 /// 线性分配器
@@ -50,18 +53,23 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
         // 遍历所有的物理内存区域
         for area in self.areas().iter() {
             // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
-            let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
+            // let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
+            let area_base = (area.base.data() + (MMA::PAGE_SIZE - 1)) & !(MMA::PAGE_SIZE - 1);
             // 将area的末尾地址与PAGE_SIZE对齐，对齐时向下取整
-            let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SHIFT);
+            // let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SHIFT);
+            let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SIZE - 1);
 
             // 如果offset大于area_end，说明当前的物理内存区域已经分配完了，需要跳到下一个物理内存区域
             if offset >= area_end {
                 continue;
             }
 
-            // 如果offset小于area_base 或者不小于area_base但小于area_end，说明当前的物理内存区域还没有分配过页帧，需要将offset调整到area_base
-            if offset < area_base || offset < area_end {
+            // 如果offset小于area_base ,说明当前的物理内存区域还没有分配过页帧，将offset设置为area_base
+            if offset < area_base {
                 offset = area_base;
+            } else if offset < area_end {
+                // 将offset对齐到PAGE_SIZE
+                offset = (offset + (MMA::PAGE_SIZE - 1)) & !(MMA::PAGE_SIZE - 1);
             }
             // 如果当前offset到area_end的距离大于等于count.data() * PAGE_SIZE，说明当前的物理内存区域足以分配count个页帧
             if offset + count.data() * MMA::PAGE_SIZE <= area_end {
@@ -95,6 +103,9 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
             // 如果offset大于area_end，说明当前物理区域被分配完，都需要加到used中
             if self.offset >= area_end {
                 used += (area_end - area_base) >> MMA::PAGE_SHIFT;
+            } else if self.offset < area_base {
+                // 如果offset小于area_base，说明当前物理区域还没有分配过页帧，都不需要加到used中
+                continue;
             } else {
                 used += (self.offset - area_base) >> MMA::PAGE_SHIFT;
             }

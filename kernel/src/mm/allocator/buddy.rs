@@ -1,4 +1,5 @@
-use crate::{kdebug, kerror, mm};
+use crate::{mm, kdebug,kerror};
+use alloc::boxed::Box;
 /// @Auther: Kong
 /// @Date: 2023-03-28 16:03:47
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/buddy.rs
@@ -7,7 +8,7 @@ use alloc::collections::LinkedList;
 
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
-use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr, phys_2_virt, virt_2_phys};
 use core::cmp::{self, max};
 use core::intrinsics::{likely, unlikely};
 use core::ops::Add;
@@ -22,6 +23,7 @@ const MIN_ORDER: usize = 12;
 // 这种方式会出现对齐问题
 // #[repr(packed)]
 #[repr(C)]
+
 pub struct BuddyEntry<A> {
     // 代表的页的起始地址
     base: PhysAddr,
@@ -59,37 +61,96 @@ pub struct BuddyAllocator<A> {
     // buddy表的虚拟地址
     table_virt: VirtAddr,
     // 使用free_area来表示 MAX_ORDER 个阶数的空闲数组，每个数组元素都是一个链表，链表的每个元素都是一个BuddyEntry
-    free_area: [LinkedList<BuddyEntry<A>>; MAX_ORDER as usize],
+    free_area: [LinkedList<BuddyEntry<A>>; (MAX_ORDER+1) as usize],
     total_used_pages: usize,
     phantom: PhantomData<A>,
 }
-
 impl<A: MemoryManagementArch> BuddyAllocator<A> {
     const BUDDY_ENTRIES: usize = A::PAGE_SIZE / mem::size_of::<BuddyEntry<A>>();
     // 定义一个变量记录buddy表的大小
-    pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
+    pub unsafe  fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
+        // 打印前三个area的起始地址和大小和结束地址
+        for i in 0..2 {
+            kdebug!("area.base: {:b}", bump_allocator.areas()[i].base.data());
+            kdebug!("area.size: {:b}", bump_allocator.areas()[i].size);
+            kdebug!("area.end: {:b}", bump_allocator.areas()[i].base.data() + bump_allocator.areas()[i].size);
+        }
+        // kdebug!("buddy_allocator start 0");
+        // let phy_test=virt_2_phys(18446603336222255104);
+        // // 打印phy_test
+        // kdebug!("phy_test: {:b}",phy_test); 
+        // // 100000010100000000000
+        // A::write(VirtAddr(18446603336222255104), BuddyEntry::<A>::empty());
+        // kdebug!("address {:b}",18446603336222255104 as u128);
+        // // 1111111111111111100000000000000000000000000100000010100000000000
+        // // 1111111111111111100000000000000000000000001101111010001111110000
+        // // 打印一句话
+        // kdebug!("buddy_allocator start");
+        // while true {
+        //     // test
+        // }
+        
         // 获取bump_allocator.areas()的所有area的大小之和，并判断有多少个页
         let mut total_size = 0;
+        let offset=bump_allocator.offset();
         for area in bump_allocator.areas().iter() {
-            total_size += area.size;
+            if area.base.data()+area.size < offset {
+                continue;
+            }
+            if area.base.data() < offset {
+                total_size+=area.size-(offset-area.base.data());
+            }
+            else{
+                total_size+=area.size;
+            }
         }
         // 计算需要多少个页来存储 buddy 算法的数据结构
         let total_used_pages = (total_size >> A::PAGE_SHIFT) / Self::BUDDY_ENTRIES;
         // 申请buddy_pages个页，用于存储 buddy 算法的数据结构
-        let table_phys = bump_allocator.allocate_one()?;
-        for _ in 0..total_used_pages - 1 {
-            bump_allocator.allocate_one()?;
+        // let table_phys = bump_allocator.allocate_one()?;
+        // for _ in 0..total_used_pages - 1 {
+        //     bump_allocator.allocate_one()?;
+        // }
+        // let table_virt = A::phys_2_virt(table_phys);
+        // let table_virt = table_virt?;
+        // // 打印Self::BUDDY_ENTRIES * total_used_pages
+        // kdebug!("Self::BUDDY_ENTRIES * total_used_pages: {}", Self::BUDDY_ENTRIES * total_used_pages);
+        // // 将申请到的内存全部分配为 BuddyEntry<A> 类型
+        // for i in 66100..Self::BUDDY_ENTRIES * total_used_pages {
+
+        //     let virt = table_virt.add(i * mem::size_of::<BuddyEntry<A>>());
+        //     // 打印virt
+        //     kdebug!("virt: {:b}", virt.data());
+        //     A::write(virt, BuddyEntry::<A>::empty());
+        //     // 每隔10000打印一次i
+        //     if i % 1 == 0 {
+        //         kdebug!("i: {}", i);
+        //     }
+        // }
+        // 打印total_used_pages
+        kdebug!("total_used_pages: {}", total_used_pages);
+        let mut table_virt=VirtAddr(0);
+        for j in 0..total_used_pages{
+            let table_phys_tmp = bump_allocator.allocate_one()?;
+            // 打印table_phys_tmp
+            let table_virt_tmp = A::phys_2_virt(table_phys_tmp);
+            let table_virt_tmp = table_virt_tmp?;
+            // 将申请到的内存全部分配为 BuddyEntry<A> 类型
+            for i in 0..Self::BUDDY_ENTRIES {
+                let virt = table_virt_tmp.add(i * mem::size_of::<BuddyEntry<A>>());
+                A::write(virt, BuddyEntry::<A>::empty());
+            }
+            if j==0{
+                table_virt = table_virt_tmp;
+            }
+
         }
-        let table_virt = A::phys_2_virt(table_phys);
-        let table_virt = table_virt?;
-        // 将申请到的内存全部分配为 BuddyEntry<A> 类型
-        for i in 0..Self::BUDDY_ENTRIES * total_used_pages {
-            let virt = table_virt.add(i * mem::size_of::<BuddyEntry<A>>());
-            A::write(virt, BuddyEntry::<A>::empty());
-        }
+        kdebug!("for end");
+
         // 初始化free_area
 
         let free_area = Default::default();
+        // let free_area = [LinkedList::<BuddyEntry<A>>::new(); (MAX_ORDER+1) as usize];
 
         let mut allocator = Self {
             table_virt,
@@ -97,26 +158,62 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             total_used_pages,
             phantom: PhantomData,
         };
+        kdebug!("for end 1");
         for old_area in bump_allocator.areas().iter() {
             let mut area = old_area.clone();
-            // 如果offset大于area的起始地址，那么需要跳过offset的大小
-            if bump_allocator.offset() > area.base.data() {
-                area.base = area.base.add(bump_allocator.offset());
-                area.size -= bump_allocator.offset();
+            kdebug!("for end 2");
+            // 如果offset大于area的结束地址，那么就跳过这个area
+            if offset > area.base.data()+area.size {
+                continue;
             }
+            // 打印area.base
+            kdebug!("area.base: {:b}", area.base.data());
+            kdebug!("area.size: {:b}", area.size);
+            // 对齐area的起始地址和结束地址
+            area.base = PhysAddr::new((area.base.data() + (A::PAGE_SIZE - 1) & !(A::PAGE_SIZE - 1)));
+            area.size -= area.base.data() - old_area.base.data();
+            // 将size对齐到page_size
+            area.size &= !(A::PAGE_SIZE - 1);
+            // 打印对齐后的area.base
+            kdebug!("area.base 1: {:b}", area.base.data());
+            // 打印area.size
+            kdebug!("area.size 1: {:b}", area.size);
+
+
+            // 如果offset大于area的起始地址，那么需要跳过offset的大小
+            if offset > area.base.data() {
+                area.base = PhysAddr::new(offset);
+                area.size -= offset;
+            }
+            // 打印对齐后的area.base
+            kdebug!("area.base 2: {:b}", area.base.data());
+            // 打印area.size
+            kdebug!("area.size 2: {:b}", area.size);
+// TODO:对齐的是页
             // 将area的起始地址对齐到最大的阶数
             let new_offset = (area.base.data() + (1 << MAX_ORDER) - 1) & !((1 << MAX_ORDER) - 1);
             area.size -= new_offset - area.base.data();
-            area.base = area.base.add(new_offset);
-
+            // area.base = area.base.add(new_offset);
+            area.base = PhysAddr::new(new_offset);
+            // 打印对齐后的area.base
+            kdebug!("area.base 3: {:b}", area.base.data());
+            // 打印area.size
+            kdebug!("area.size 3: {:b}", area.size);
+            kdebug!("for end 3");
             // 如果area的大小大于2^MAX_ORDER，那么将area分割为多个area
-            while area.size > (1 << MAX_ORDER) {
+            // while area.size > (1 << MAX_ORDER) {
+            while area.size > (1 << (MAX_ORDER+A::PAGE_SHIFT)) {
+                kdebug!("for end 31");
                 let mut new_area = area.clone();
-                new_area.size = 1 << MAX_ORDER;
+                // new_area.size = 1 << MAX_ORDER;
+                new_area.size = 1 << (MAX_ORDER+A::PAGE_SHIFT);
                 area.base = area.base.add(1 << MAX_ORDER);
-                area.size -= 1 << MAX_ORDER;
+                // area.size -= 1 << MAX_ORDER;
+                area.size -= 1 << (MAX_ORDER+A::PAGE_SHIFT);
+                kdebug!("for end 32, new area.size:{}",new_area.size);
                 allocator.add_area(new_area);
             }
+            kdebug!("for end 4");
             // TODO 对于分配的内存的前后两段空间，需不需要被分配出去？5
         }
 
@@ -127,8 +224,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// @param {type}
     /// @area: 要添加的area
     unsafe fn add_area(&mut self, area: mm::PhysMemoryArea) {
+        kdebug!("for end 311");
+
         // 计算area的阶数
-        let order = (area.size >> A::PAGE_SHIFT) as u8;
+        let mut order = 0;
+        while (1 << order) < area.size>>A::PAGE_SHIFT {
+            order += 1;
+        }
         // 计算area的起始地址
         let base = area.base;
         let pg_buddy = false;
@@ -138,7 +240,22 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             pg_buddy,
             phantom: PhantomData,
         };
-        self.add_entry(entry);
+        kdebug!("for end 312, order:{}",order);
+        let test=self.free_area[order as usize].pop_back();
+        kdebug!("for end 3121, test:{}",test.is_none());
+        // 打印free_area的长度
+        kdebug!("self.free_area.len():{}",self.free_area.len());
+        let mut test_linked_list=LinkedList::<u32>::new();
+        test_linked_list.push_back(1);
+        kdebug!("for end 3122,test_linked_list.len{}",test_linked_list.len());
+        let mut test_buddy=LinkedList::<BuddyEntry<A>>::new();
+        test_buddy.push_back(entry);
+        kdebug!("for end 3122,{}",test_buddy.len());
+        self.free_area[1 as usize].push_back(entry);
+        // self.free_area[order as usize].push_back(entry);
+
+        // self.add_entry(entry);
+        kdebug!("for end 313");
     }
 
     /// @brief: 移除一个entry
@@ -162,12 +279,23 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// @param  mut
     /// @param  entry
     unsafe fn add_entry(&mut self, entry: BuddyEntry<A>) {
+        kdebug!("for end 3110");
         let order = entry.order as usize;
+        kdebug!("for end 3110");
         if entry.pg_buddy == false {
+            kdebug!("for end 31101");
+            kdebug!("self.free_area[order].len(){}",self.free_area[order].len());
+            kdebug!("for end 31101{}",entry.base.data());
+            self.free_area[order].push_front(entry);
+            kdebug!("for end 31103{}",entry.base.data());
             self.free_area[order].push_back(entry);
+            kdebug!("for end 31102");
         }
+        kdebug!("for end 3110");
         let virt = self.table_virt.add(entry.base.data() >> A::PAGE_SHIFT);
+        kdebug!("for end 3111");
         A::write(virt, entry);
+        kdebug!("for end 3112");
     }
     /// @brief: 从内存中读入entry
     /// @param  offset

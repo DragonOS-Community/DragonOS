@@ -6,6 +6,7 @@ use core::{
 
 use crate::{
     include::bindings::bindings::{pt_regs, verify_area},
+    kdebug,
     syscall::{Syscall, SystemError},
     time::{sleep::nanosleep, timeconv::time_to_calendar, TimeSpec},
 };
@@ -79,6 +80,7 @@ impl Syscall {
     }
 
     pub fn sys_do_gettimeofday(tv: *mut PosixTimeval) -> Result<usize, SystemError> {
+        kdebug!("enter sys_do_gettimeofday");
         if tv == null_mut() {
             return Err(SystemError::EFAULT);
         }
@@ -87,6 +89,7 @@ impl Syscall {
             (*tv).tv_sec = posix_time.tv_sec;
             (*tv).tv_usec = posix_time.tv_usec;
         }
+        kdebug!("exit sys_do_gettimeofday");
         return Ok(0);
         // time_to_calendar(posix_time.tv_sec, 0);
     }

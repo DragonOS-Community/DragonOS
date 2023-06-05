@@ -4,7 +4,6 @@ use self::timekeep::ktime_get_real_ns;
 
 pub mod clocksource;
 pub mod jiffies;
-pub mod posix_timer;
 pub mod sleep;
 pub mod syscall;
 pub mod timekeep;

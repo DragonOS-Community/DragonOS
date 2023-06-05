@@ -1,4 +1,4 @@
-use alloc::{sync::Arc};
+use alloc::sync::Arc;
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering};
 use x86_64::align_up;
 
@@ -85,11 +85,10 @@ impl TimekeeperData {
     }
 }
 impl Timekeeper {
-    
     /// # 设置timekeeper的参数
-    /// 
+    ///
     /// ## 参数
-    /// 
+    ///
     /// * 'clock' - 指定的时钟实际类型。初始为ClocksourceJiffies
     pub fn timekeeper_setup_internals(&self, clock: Arc<dyn Clocksource>) {
         let mut timekeeper = self.0.write();
@@ -139,11 +138,13 @@ pub fn timekeeper_init() {
 }
 
 /// # 获取1970.1.1至今的UTC时间戳(最小单位:nsec)
-/// 
+///
 /// ## 返回值
-/// 
+///
 /// * 'TimeSpec' - 时间戳
 pub fn getnstimeofday() -> TimeSpec {
+    kdebug!("enter getnstimeofday");
+
     // let mut nsecs: u64 = 0;0
     let mut xtime = TimeSpec {
         tv_nsec: 0,
@@ -176,17 +177,23 @@ pub fn getnstimeofday() -> TimeSpec {
     //     xtime.tv_sec,
     //     xtime.tv_nsec
     // );
+    kdebug!("exit getnstimeofday");
+
     return xtime;
 }
 
 /// # 获取1970.1.1至今的UTC时间戳(最小单位:usec)
-/// 
+///
 /// ## 返回值
-/// 
+///
 /// * 'PosixTimeval' - 时间戳
 pub fn do_gettimeofday() -> PosixTimeval {
+    kdebug!("enter do_gettimeofday");
+
     let tp = getnstimeofday();
     // time_to_calendar(tp.tv_sec + 8 * 3600, 0);
+    kdebug!("exit do_gettimeofday");
+
     return PosixTimeval {
         tv_sec: tp.tv_sec,
         tv_usec: (tp.tv_nsec / 1000) as i32,
@@ -225,7 +232,6 @@ pub fn timekeeping_init() {
     drop(irq_guard);
     kdebug!("timekeeping_init successfully");
 }
-
 
 /// # 使用当前时钟源增加wall time
 pub fn update_wall_time() {

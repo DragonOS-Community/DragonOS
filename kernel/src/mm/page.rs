@@ -5,11 +5,16 @@ use core::{
     ops::Add,
 };
 
-use crate::{arch::MMArch, kerror};
+use crate::{
+    arch::{interrupt::ipi::send_ipi, MMArch},
+    exception::ipi::{IpiKind, IpiTarget},
+    kerror,
+};
 
 use super::{
-    allocator::page_frame::FrameAllocator, MemoryManagementArch, PageTableKind, PhysAddr,
-    PhysMemoryArea, VirtAddr,
+    allocator::page_frame::FrameAllocator,
+    syscall::{MapFlags, ProtFlags},
+    MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr,
 };
 
 pub struct PageTable<Arch> {
@@ -211,6 +216,21 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return unsafe { Self::from_data(data) };
     }
 
+    /// 根据ProtFlags生成PageFlags
+    ///
+    /// ## 参数
+    ///
+    /// - prot_flags: 页的保护标志
+    /// - user: 用户空间是否可访问
+    pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> PageFlags<Arch> {
+        let flags: PageFlags<Arch> = PageFlags::new(0)
+            .set_user(user)
+            .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
+            .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
+
+        return flags;
+    }
+
     #[inline(always)]
     pub fn data(&self) -> usize {
         self.data
@@ -280,7 +300,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
 
     /// @brief 用户态是否可以访问当前页表项
     #[inline(always)]
-    pub fn user(&self) -> bool {
+    pub fn has_user(&self) -> bool {
         return self.has_flag(Arch::ENTRY_FLAG_USER);
     }
 
@@ -298,7 +318,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
 
     /// @brief 当前页表项是否可写
     #[inline(always)]
-    pub fn write(&self) -> bool {
+    pub fn has_write(&self) -> bool {
         // 有的架构同时具有可写和不可写的标志位，因此需要同时判断
         return self.data & (Arch::ENTRY_FLAG_READWRITE | Arch::ENTRY_FLAG_READONLY)
             == Arch::ENTRY_FLAG_READWRITE;
@@ -316,7 +336,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
 
     /// @brief 当前页表项是否可执行
     #[inline(always)]
-    pub fn execute(&self) -> bool {
+    pub fn has_execute(&self) -> bool {
         // 有的架构同时具有可执行和不可执行的标志位，因此需要同时判断
         return self.data & (Arch::ENTRY_FLAG_EXEC | Arch::ENTRY_FLAG_NO_EXEC)
             == Arch::ENTRY_FLAG_EXEC;
@@ -328,9 +348,9 @@ impl<Arch: MemoryManagementArch> fmt::Debug for PageFlags<Arch> {
         f.debug_struct("PageFlags")
             .field("bits", &format_args!("{:#0x}", self.data))
             .field("present", &self.present())
-            .field("write", &self.write())
-            .field("executable", &self.execute())
-            .field("user", &self.user())
+            .field("has_write", &self.has_write())
+            .field("has_execute", &self.has_execute())
+            .field("has_user", &self.has_user())
             .finish()
     }
 }
@@ -705,6 +725,35 @@ impl<Arch: MemoryManagementArch, T: Flusher<Arch> + ?Sized> Flusher<Arch> for &m
 
 impl<Arch: MemoryManagementArch> Flusher<Arch> for () {
     fn consume(&mut self, flush: PageFlush<Arch>) {}
+}
+
+/// 未在当前CPU上激活的页表的刷新器
+///
+/// 如果页表没有在当前cpu上激活，那么需要发送ipi到其他核心，尝试在其他核心上刷新页表
+///
+/// TODO: 这个方式很暴力，也许把它改成在指定的核心上刷新页表会更好。（可以测试一下开销）
+#[derive(Debug)]
+pub struct InactiveFlusher;
+
+impl InactiveFlusher {
+    pub fn new() -> Self {
+        return Self {};
+    }
+}
+
+impl Flusher<MMArch> for InactiveFlusher {
+    fn consume(&mut self, flush: PageFlush<MMArch>) {
+        unsafe {
+            flush.ignore();
+        }
+    }
+}
+
+impl Drop for InactiveFlusher {
+    fn drop(&mut self) {
+        // 发送刷新页表的IPI
+        send_ipi(IpiKind::FlushTLB, IpiTarget::Other);
+    }
 }
 
 /// # 把一个地址向下对齐到页大小

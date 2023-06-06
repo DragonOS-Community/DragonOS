@@ -61,14 +61,14 @@ struct thread_struct
 
 // ========= pcb->flags =========
 // 进程标志位
-#define PF_KTHREAD (1UL << 0)    // 内核线程
-#define PF_NEED_SCHED (1UL << 1) // 进程需要被调度
-#define PF_VFORK (1UL << 2)      // 标志进程是否由于vfork而存在资源共享
-#define PF_KFORK (1UL << 3)    // 标志在内核态下调用fork（临时标记，do_fork()结束后会将其复位）
-#define PF_NOFREEZE (1UL << 4) // 当前进程不能被冻结
-#define PF_EXITING (1UL << 5)  // 进程正在退出
-#define PF_WAKEKILL (1UL << 6) // 进程由于接收到终止信号唤醒
-#define PF_SIGNALED (1UL << 7) // 进程由于接收到信号而退出
+#define PF_KTHREAD (1UL << 0)      // 内核线程
+#define PF_NEED_SCHED (1UL << 1)   // 进程需要被调度
+#define PF_VFORK (1UL << 2)        // 标志进程是否由于vfork而存在资源共享
+#define PF_KFORK (1UL << 3)        // 标志在内核态下调用fork（临时标记，do_fork()结束后会将其复位）
+#define PF_NOFREEZE (1UL << 4)     // 当前进程不能被冻结
+#define PF_EXITING (1UL << 5)      // 进程正在退出
+#define PF_WAKEKILL (1UL << 6)     // 进程由于接收到终止信号唤醒
+#define PF_SIGNALED (1UL << 7)     // 进程由于接收到信号而退出
 #define PF_NEED_MIGRATE (1UL << 8) // 进程需要迁移到其他的核心
 
 /**
@@ -111,7 +111,7 @@ struct process_control_block
     int64_t rt_time_slice;   // 由实时调度器管理的时间片
 
     // 进程拥有的文件描述符的指针数组(由Rust进行管理)
-    void * fds;
+    void *fds;
 
     // 链表中的下一个pcb
     struct process_control_block *prev_pcb, *next_pcb;
@@ -136,11 +136,14 @@ struct process_control_block
     // 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     // 该字段存储要被迁移到的目标处理器核心号
     uint32_t migrate_to;
-    void* fp_state;//Fpstate 用于用户态切换到内核态时保存浮点寄存器里面的值
+    void *fp_state; // Fpstate 用于用户态切换到内核态时保存浮点寄存器里面的值
+    // 指向进程的地址空间的arc指针.
+    void *address_space;
 };
 
 // 将进程的pcb和内核栈融合到一起,8字节对齐
-union proc_union {
+union proc_union
+{
     struct process_control_block pcb;
     ul stack[STACK_SIZE / sizeof(ul)];
 } __attribute__((aligned(8)));

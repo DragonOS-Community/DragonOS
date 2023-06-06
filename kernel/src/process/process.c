@@ -47,6 +47,7 @@ extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
 extern void rs_process_exit_fpstate(struct process_control_block *pcb);
+extern void rs_drop_address_space(struct process_control_block *pcb);
 extern int process_init_files();
 extern int rs_init_stdio();
 
@@ -788,6 +789,8 @@ int process_wakeup_immediately(struct process_control_block *pcb)
  */
 uint64_t process_exit_mm(struct process_control_block *pcb)
 {
+
+    rs_drop_address_space(pcb);
     if (pcb->flags & CLONE_VM)
         return 0;
     if (pcb->mm == NULL)
@@ -838,6 +841,7 @@ uint64_t process_exit_mm(struct process_control_block *pcb)
     }
     // 释放内存空间分布结构体
     kfree(pcb->mm);
+    
 
     return 0;
 }

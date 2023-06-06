@@ -15,7 +15,8 @@ use crate::{
         process_control_block, CLONE_FS, PROC_INTERRUPTIBLE, PROC_RUNNING, PROC_STOPPED,
         PROC_UNINTERRUPTIBLE,
     },
-    libs::casting::DowncastArc,
+    libs::{casting::DowncastArc, rwlock::RwLock},
+    mm::ucontext::AddressSpace,
     net::socket::SocketInode,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
@@ -311,6 +312,14 @@ impl process_control_block {
             .expect("Not a socket inode");
         return Some(socket);
     }
+
+    /// 释放pcb中存储的地址空间的指针
+    pub unsafe fn drop_address_space(&self) {
+        let p = self.address_space as *const RwLock<AddressSpace>;
+
+        let p: Arc<RwLock<AddressSpace>> = Arc::from_raw(p);
+        drop(p);
+    }
 }
 
 // =========== 导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们  BEGIN ============
@@ -325,6 +334,14 @@ pub extern "C" fn process_init_files() -> i32 {
     } else {
         return r.unwrap_err().to_posix_errno();
     }
+}
+
+#[no_mangle]
+pub extern "C" fn rs_drop_address_space(pcb: &'static process_control_block) -> i32 {
+    unsafe {
+        pcb.drop_address_space();
+    }
+    return 0;
 }
 
 /// @brief 拷贝当前进程的文件描述符信息

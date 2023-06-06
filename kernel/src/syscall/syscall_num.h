@@ -53,3 +53,7 @@
 #define SYS_ACCEPT 40      // 接受一个socket连接
 #define SYS_GETSOCKNAME 41 // 获取socket的名字
 #define SYS_GETPEERNAME 42 // 获取socket的对端名字
+
+#define SYS_MMAP 44   // 内存映射
+#define SYS_MUNMAP 45 // 内存解除映射
+#define SYS_MPROTECT 46 // 内存保护

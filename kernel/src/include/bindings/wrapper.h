@@ -19,6 +19,7 @@
 #include <common/crc8.h>
 #include <common/gfp.h>
 #include <common/glib.h>
+#include <common/idr.h>
 #include <common/kfifo.h>
 #include <common/kthread.h>
 #include <common/list.h>
@@ -26,22 +27,23 @@
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/stdio.h>
+#include <common/string.h>
 #include <common/time.h>
 #include <common/unistd.h>
-#include <common/string.h>
 #include <driver/disk/ahci/ahci.h>
 #include <driver/disk/ahci/ahci_rust.h>
 #include <driver/pci/pci.h>
+#include <driver/video/video.h>
+#include <driver/virtio/virtio.h>
+#include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
+#include <libs/libUI/textui.h>
+#include <mm/mm-types.h>
 #include <mm/mm.h>
 #include <mm/mmio.h>
 #include <mm/slab.h>
 #include <process/process.h>
 #include <sched/sched.h>
-#include <time/sleep.h>
-#include <mm/mm-types.h>
-#include <driver/pci/pci.h>
-#include <driver/virtio/virtio.h>
 #include <smp/smp.h>
-
+#include <time/sleep.h>

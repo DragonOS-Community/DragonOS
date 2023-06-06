@@ -25,6 +25,13 @@ int fprintf(FILE *restrict stream, const char *restrict format, ...)
     free(buf);
 }
 
+int getchar(void)
+{
+    unsigned int c;
+    read(0, &c, 1);
+    return c;
+}
+
 int puts(const char *s)
 {
     return put_string(s, COLOR_WHITE, COLOR_BLACK);
@@ -47,17 +54,17 @@ int ferror(FILE *stream)
 
 int fclose(FILE *stream)
 {
+    int retval = close(stream->fd);
+    if (retval)
+        return retval;
     if (stream->fd >= 3)
-    {
-        int retcval = close(stream->fd);
         free(stream);
-        return 0;
-    }
-    else
-        return 0;
+
+    return 0;
 }
 
-// FIXME: 请注意，这个函数的实现，没有遵照posix，行为也与Linux的不一致，请在将来用Rust重构时改变它，以使得它的行为与Linux的一致。
+// FIXME:
+// 请注意，这个函数的实现，没有遵照posix，行为也与Linux的不一致，请在将来用Rust重构时改变它，以使得它的行为与Linux的一致。
 FILE *fopen(const char *restrict pathname, const char *restrict mode)
 {
     FILE *stream = malloc(sizeof(FILE));

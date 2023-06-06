@@ -9,6 +9,7 @@ use crate::arch::asm::irqflags::{local_irq_restore, local_irq_save};
 use crate::arch::interrupt::{cli, sti};
 use crate::include::bindings::bindings::{spin_lock, spin_unlock, spinlock_t};
 use crate::process::preempt::{preempt_disable, preempt_enable};
+use crate::syscall::SystemError;
 
 /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
 #[inline]
@@ -138,6 +139,19 @@ impl RawSpinlock {
         self.unlock();
         local_irq_restore(flags);
     }
+
+    /// @brief 尝试保存中断状态到flags中，关闭中断，并对自旋锁加锁
+    /// @return 加锁成功->true
+    ///         加锁失败->false
+    #[inline(always)]
+    pub fn try_lock_irqsave(&self, flags: &mut u64) -> bool {
+        local_irq_save(flags);
+        if self.try_lock() {
+            return true;
+        }
+        local_irq_restore(flags);
+        return false;
+    }
 }
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///
@@ -154,6 +168,7 @@ pub struct SpinLock<T> {
 #[derive(Debug)]
 pub struct SpinLockGuard<'a, T: 'a> {
     lock: &'a SpinLock<T>,
+    flag: u64,
 }
 
 /// 向编译器保证，SpinLock在线程之间是安全的.
@@ -172,7 +187,41 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<T> {
         self.lock.lock();
         // 加锁成功，返回一个守卫
-        return SpinLockGuard { lock: self };
+        return SpinLockGuard {
+            lock: self,
+            flag: 0,
+        };
+    }
+
+    pub fn lock_irqsave(&self) -> SpinLockGuard<T> {
+        let mut flags: u64 = 0;
+        self.lock.lock_irqsave(&mut flags);
+        // 加锁成功，返回一个守卫
+        return SpinLockGuard {
+            lock: self,
+            flag: flags,
+        };
+    }
+
+    pub fn try_lock(&self) -> Result<SpinLockGuard<T>, SystemError> {
+        if self.lock.try_lock() {
+            return Ok(SpinLockGuard {
+                lock: self,
+                flag: 0,
+            });
+        }
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+
+    pub fn try_lock_irqsave(&self) -> Result<SpinLockGuard<T>, SystemError> {
+        let mut flags: u64 = 0;
+        if self.lock.try_lock_irqsave(&mut flags) {
+            return Ok(SpinLockGuard {
+                lock: self,
+                flag: flags,
+            });
+        }
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 }
 
@@ -195,6 +244,10 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 /// @brief 为SpinLockGuard实现Drop方法，那么，一旦守卫的生命周期结束，就会自动释放自旋锁，避免了忘记放锁的情况
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.lock.unlock();
+        if self.flag != 0 {
+            self.lock.lock.unlock_irqrestore(&self.flag);
+        } else {
+            self.lock.lock.unlock();
+        }
     }
 }

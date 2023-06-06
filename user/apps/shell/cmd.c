@@ -309,6 +309,11 @@ int shell_cmd_cat(int argc, char **argv)
 
     // 打开文件
     int fd = open(file_path, 0);
+    if (fd <= 0)
+    {
+        printf("ERROR: Cannot open file: %s, fd=%d\n", file_path, fd);
+        return -1;
+    }
     // 获取文件总大小
     int file_size = lseek(fd, 0, SEEK_END);
     // 将文件指针切换回文件起始位置
@@ -320,6 +325,11 @@ int shell_cmd_cat(int argc, char **argv)
     {
         memset(buf, 0, 512);
         int l = read(fd, buf, 511);
+        if (l < 0)
+        {
+            printf("ERROR: Cannot read file: %s\n", file_path);
+            return -1;
+        }
         buf[l] = '\0';
 
         file_size -= l;
@@ -486,6 +496,7 @@ int shell_cmd_exec(int argc, char **argv)
         char *file_path = get_target_filepath(argv[1], &path_len);
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
         execv(file_path, argv);
+        // printf("after execv, path=%s, argc=%d\n", file_path, argc);
         free(argv);
         free(file_path);
 
@@ -497,10 +508,8 @@ int shell_cmd_exec(int argc, char **argv)
         if (strcmp(argv[argc - 1], "&") != 0)
             waitpid(pid, &retval, 0);
         else
-        {
-            // 输出子进程的pid
-            printf("[1] %d\n", pid);
-        }
+            printf("[1] %d\n", pid); // 输出子进程的pid
+        
         free(argv);
     }
 }
@@ -591,7 +600,7 @@ done:;
  * @param buf 输入缓冲区
  * @param argc 返回值：参数数量
  * @param argv 返回值：参数列表
- * @return int 主命令的编号
+ * @return int 主命令的编号，小于零为无效命令
  */
 int parse_command(char *buf, int *argc, char ***argv)
 {
@@ -600,6 +609,9 @@ int parse_command(char *buf, int *argc, char ***argv)
     // 去除命令前导的空格
     while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
         ++index;
+    // 如果去除前导空格后第一项为0x00，则归为空命令
+    if(!buf[index])
+        return -1;
 
     // 计算参数数量
     for (int i = index; i < (INPUT_BUFFER_SIZE - 1); ++i)
@@ -610,7 +622,7 @@ int parse_command(char *buf, int *argc, char ***argv)
         if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
             ++(*argc);
     }
-
+    
     // printf("\nargc=%d\n", *argc);
 
     // 为指向每个指令的指针分配空间

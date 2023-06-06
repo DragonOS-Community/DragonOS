@@ -19,6 +19,7 @@
 #include <driver/disk/ahci/ahci.h>
 #include <driver/usb/usb.h>
 #include <driver/video/video.h>
+#include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <ktest/ktest.h>
 #include <mm/mmio.h>
@@ -26,7 +27,6 @@
 #include <sched/sched.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_num.h>
-#include <driver/virtio/virtio.h>
 extern int __rust_demo_func();
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
@@ -46,7 +46,9 @@ extern struct sighand_struct INITIAL_SIGHAND;
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
+extern void rs_process_exit_fpstate(struct process_control_block *pcb);
 extern int process_init_files();
+extern int rs_init_stdio();
 
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                             \
@@ -140,10 +142,7 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
  */
 int process_open_exec_file(char *path)
 {
-    struct pt_regs tmp = {0};
-    tmp.r8 = (uint64_t)path;
-    tmp.r9 = O_RDONLY;
-    int fd = sys_open(&tmp);
+    int fd = enter_syscall_int(SYS_OPEN, (uint64_t)path, O_RDONLY, 0, 0, 0, 0, 0, 0);
     return fd;
 }
 
@@ -168,22 +167,12 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
     void *buf = kzalloc(PAGE_4K_SIZE, 0);
     uint64_t pos = 0;
 
-    struct pt_regs tmp_use_fs = {0};
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = 0;
-    tmp_use_fs.r10 = SEEK_SET;
-    retval = sys_lseek(&tmp_use_fs);
+    retval = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_SET, 0, 0, 0, 0, 0);
 
     // 读取 Elf64_Ehdr
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = (uint64_t)buf;
-    tmp_use_fs.r10 = sizeof(Elf64_Ehdr);
-    retval = sys_read(&tmp_use_fs);
+    retval = enter_syscall_int(SYS_READ, fd, (uint64_t)buf, sizeof(Elf64_Ehdr), 0, 0, 0, 0, 0);
 
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = 0;
-    tmp_use_fs.r10 = SEEK_CUR;
-    pos = sys_lseek(&tmp_use_fs);
+    pos = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_CUR, 0, 0, 0, 0, 0);
 
     if (retval != sizeof(Elf64_Ehdr))
     {
@@ -231,21 +220,14 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
     // 读取所有的phdr
     pos = ehdr.e_phoff;
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = pos;
-    tmp_use_fs.r10 = SEEK_SET;
-    pos = sys_lseek(&tmp_use_fs);
+
+    pos = enter_syscall_int(SYS_LSEEK, fd, pos, SEEK_SET, 0, 0, 0, 0, 0);
 
     memset(buf, 0, PAGE_4K_SIZE);
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = (uint64_t)buf;
-    tmp_use_fs.r10 = (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum;
-    sys_read(&tmp_use_fs);
 
-    tmp_use_fs.r8 = fd;
-    tmp_use_fs.r9 = 0;
-    tmp_use_fs.r10 = SEEK_CUR;
-    pos = sys_lseek(&tmp_use_fs);
+    enter_syscall_int(SYS_READ, fd, (uint64_t)buf, (uint64_t)ehdr.e_phentsize * (uint64_t)ehdr.e_phnum, 0, 0, 0, 0, 0);
+
+    pos = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_CUR, 0, 0, 0, 0, 0);
 
     if ((long)retval < 0)
     {
@@ -324,10 +306,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 }
             }
 
-            tmp_use_fs.r8 = fd;
-            tmp_use_fs.r9 = pos;
-            tmp_use_fs.r10 = SEEK_SET;
-            pos = sys_lseek(&tmp_use_fs);
+            pos = enter_syscall_int(SYS_LSEEK, fd, pos, SEEK_SET, 0, 0, 0, 0, 0);
 
             int64_t val = 0;
             if (remain_file_size > 0)
@@ -338,17 +317,13 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
                 while (to_trans > 0)
                 {
                     int64_t x = 0;
-                    tmp_use_fs.r8 = fd;
-                    tmp_use_fs.r9 = (uint64_t)buf3;
-                    tmp_use_fs.r10 = to_trans;
-                    x = sys_read(&tmp_use_fs);
+
+                    x = enter_syscall_int(SYS_READ, fd, (uint64_t)buf3, to_trans, 0, 0, 0, 0, 0);
                     memcpy(virt_base + beginning_offset + val, buf3, x);
                     val += x;
                     to_trans -= x;
-                    tmp_use_fs.r8 = fd;
-                    tmp_use_fs.r9 = 0;
-                    tmp_use_fs.r10 = SEEK_CUR;
-                    pos = sys_lseek(&tmp_use_fs);
+
+                    pos = enter_syscall_int(SYS_LSEEK, fd, 0, SEEK_CUR, 0, 0, 0, 0, 0);
                 }
                 kfree(buf3);
 
@@ -387,9 +362,7 @@ static int process_load_elf_file(struct pt_regs *regs, char *path)
 
 load_elf_failed:;
     {
-        struct pt_regs tmp = {0};
-        tmp.r8 = fd;
-        sys_close(&tmp);
+        enter_syscall_int(SYS_CLOSE, fd, 0, 0, 0, 0, 0, 0, 0);
     }
 
     if (buf != NULL)
@@ -409,8 +382,6 @@ load_elf_failed:;
 #pragma GCC optimize("O0")
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
-
-    // kdebug("do_execve is running...");
 
     // 当前进程正在与父进程共享地址空间，需要创建
     // 独立的地址空间才能使新程序正常运行
@@ -453,25 +424,24 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
     current_pcb->mm->brk_end = brk_start_addr;
     current_pcb->mm->stack_start = stack_start_addr;
 
-    // 关闭之前的文件描述符
-    process_exit_files(current_pcb);
-    process_init_files();
-
     // 清除进程的vfork标志位
     current_pcb->flags &= ~PF_VFORK;
 
     // 加载elf格式的可执行文件
     int tmp = process_load_elf_file(regs, path);
+
     if (tmp < 0)
         goto exec_failed;
 
+    int argc = 0;
+    char **dst_argv = NULL;
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
     // 拷贝参数列表
     if (argv != NULL)
     {
-        int argc = 0;
 
         // 目标程序的argv基地址指针，最大8个参数
-        char **dst_argv = (char **)(stack_start_addr - (sizeof(char **) << 3));
+        dst_argv = (char **)(stack_start_addr - (sizeof(char **) << 3));
         uint64_t str_addr = (uint64_t)dst_argv;
 
         for (argc = 0; argc < 8 && argv[argc] != NULL; ++argc)
@@ -490,14 +460,29 @@ ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
         }
 
         // 重新设定栈基址，并预留空间防止越界
-        stack_start_addr = str_addr - 8;
-        current_pcb->mm->stack_start = stack_start_addr;
-        regs->rsp = regs->rbp = stack_start_addr;
 
-        // 传递参数
-        regs->rdi = argc;
-        regs->rsi = (uint64_t)dst_argv;
+        stack_start_addr = str_addr - 8;
     }
+
+    // kdebug("stack_start_addr=%#018lx", stack_start_addr);
+    // ==== 生成relibc所需的Stack结构体
+    {
+        uint64_t *ptr_stack = (uint64_t *)(stack_start_addr - 8);
+        if (argc == 0)
+            *ptr_stack = 0;
+        else
+            *ptr_stack = (uint64_t)dst_argv;
+        ptr_stack--;
+        *ptr_stack = argc;
+        stack_start_addr -= 16;
+    }
+
+    // 传递参数(旧版libc)
+    regs->rdi = argc;
+    regs->rsi = (uint64_t)dst_argv;
+    // 设置用户栈基地址
+    current_pcb->mm->stack_start = stack_start_addr;
+    regs->rsp = regs->rbp = stack_start_addr;
     // kdebug("execve ok");
     // 设置进程的段选择子为用户态可访问
     regs->cs = USER_CS | 3;
@@ -541,13 +526,14 @@ struct process_control_block *process_init_rt_pcb(struct process_control_block *
 ul initial_kernel_thread(ul arg)
 {
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
+    int val = 0;
+    val = scm_enable_double_buffer();
 
-    scm_enable_double_buffer();
-
+    rs_init_stdio();
     // block_io_scheduler_init();
     ahci_init();
     mount_root_fs();
-    c_virtio_probe();
+    rs_virtio_probe();
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);
@@ -563,11 +549,12 @@ ul initial_kernel_thread(ul arg)
     // __test_completion();
 
     // // 对一些组件进行单元测试
-    // uint64_t tpid[] = {
-    //     ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
-    //     ktest_start(ktest_test_idr, 0),
-    //     // usb_pid,
-    // };
+    uint64_t tpid[] = {
+        // ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
+        // ktest_start(ktest_test_idr, 0),
+        // usb_pid,
+    };
+
     // kinfo("Waiting test thread exit...");
     // // 等待测试进程退出
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
@@ -584,7 +571,7 @@ ul initial_kernel_thread(ul arg)
 
     // 若在后面这段代码中触发中断，return时会导致段选择子错误，从而触发#GP，因此这里需要cli
     cli();
-    current_pcb->thread->rip = (ul)ret_from_system_call;
+    current_pcb->thread->rip = (ul)ret_from_intr;
     current_pcb->thread->rsp = (ul)current_pcb + STACK_SIZE - sizeof(struct pt_regs);
     current_pcb->thread->fs = USER_DS | 0x3;
     barrier();
@@ -616,9 +603,9 @@ ul initial_kernel_thread(ul arg)
  */
 void process_exit_notify()
 {
-
     wait_queue_wakeup(&current_pcb->parent_pcb->wait_child_proc_exit, PROC_INTERRUPTIBLE);
 }
+
 /**
  * @brief 进程退出时执行的函数
  *
@@ -788,7 +775,7 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (pcb->cpu_id == current_pcb->cpu_id)
         sched();
     else
-        kick_cpu(pcb->cpu_id);
+        rs_kick_cpu(pcb->cpu_id);
     return 0;
 }
 
@@ -882,6 +869,7 @@ int process_release_pcb(struct process_control_block *pcb)
     pcb->next_pcb->prev_pcb = pcb->prev_pcb;
     process_exit_sighand(pcb);
     process_exit_signal(pcb);
+    rs_process_exit_fpstate(pcb);
     rs_procfs_unregister_pid(pcb->pid);
     // 释放当前pcb
     kfree(pcb);

@@ -1,3 +1,5 @@
+use core::intrinsics::unlikely;
+
 use alloc::string::String;
 
 use thingbuf::mpsc::{
@@ -59,6 +61,7 @@ struct TtyCore {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum TtyError {
     /// 缓冲区满,返回成功传送的字节数
     BufferFull(usize),
@@ -167,11 +170,21 @@ impl TtyCore {
                     _ => return Err(TtyError::Unknown(format!("{err:?}"))),
                 }
             } else {
-                buf[cnt] = *val.unwrap();
+                let x = *val.unwrap();
+                buf[cnt] = x;
                 cnt += 1;
+
+                if unlikely(self.stdin_should_return(x)) {
+                    return Ok(cnt);
+                }
             }
         }
         return Ok(cnt);
+    }
+
+    fn stdin_should_return(&self, c: u8) -> bool {
+        // 如果是换行符或者是ctrl+d，那么就应该返回
+        return c == b'\n' || c == 4;
     }
 
     /// @brief 向stdin缓冲区内写入数据
@@ -281,6 +294,7 @@ impl TtyCore {
 
     /// @brief 关闭输入回显
     #[inline]
+    #[allow(dead_code)]
     pub fn disable_echo(&self) {
         self.state.write().set(TtyCoreState::ECHO_ON, false);
     }
@@ -291,6 +305,7 @@ impl TtyCore {
     ///
     /// @return false 未开启输入回显
     #[inline]
+    #[allow(dead_code)]
     pub fn echo_enabled(&self) -> bool {
         return self.state.read().contains(TtyCoreState::ECHO_ON);
     }

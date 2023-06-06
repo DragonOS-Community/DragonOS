@@ -151,14 +151,15 @@ static uint64_t __count_kmalloc_total()
     uint64_t result = 0;
     for (int i = 0; i < sizeof(kmalloc_cache_group) / sizeof(struct slab); ++i)
     {
-        result += kmalloc_cache_group[i].size * (kmalloc_cache_group[i].count_total_free + kmalloc_cache_group[i].count_total_using);
+        result += kmalloc_cache_group[i].size *
+                  (kmalloc_cache_group[i].count_total_free + kmalloc_cache_group[i].count_total_using);
     }
     return result;
 }
 
 /**
  * @brief 获取系统当前的内存信息(未上锁，不一定精准)
- * 
+ *
  * @return struct mm_stat_t 内存信息结构体
  */
 struct mm_stat_t mm_stat()
@@ -182,14 +183,14 @@ struct mm_stat_t mm_stat()
  * @param r8 返回的内存信息结构体的地址
  * @return uint64_t
  */
-uint64_t sys_mstat(struct pt_regs *regs)
+uint64_t sys_do_mstat(struct mm_stat_t *dst, bool from_user)
 {
-    if (regs->r8 == NULL)
-        return -EINVAL;
+    if (dst == NULL)
+        return -EFAULT;
     struct mm_stat_t stat = mm_stat();
-    if (regs->cs == (USER_CS | 0x3))
-        copy_to_user((void *)regs->r8, &stat, sizeof(struct mm_stat_t));
+    if (from_user)
+        copy_to_user((void *)dst, &stat, sizeof(struct mm_stat_t));
     else
-        memcpy((void *)regs->r8, &stat, sizeof(struct mm_stat_t));
+        memcpy((void *)dst, &stat, sizeof(struct mm_stat_t));
     return 0;
 }

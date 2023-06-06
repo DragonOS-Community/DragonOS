@@ -1,10 +1,10 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <libsystem/syscall.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <libsystem/syscall.h>
 
 /**
  * @brief 关闭文件接口
@@ -65,7 +65,14 @@ pid_t fork(void)
 {
     return (pid_t)syscall_invoke(SYS_FORK, 0, 0, 0, 0, 0, 0, 0, 0);
 }
-
+/**
+ * @brief 调用匿名管道
+ *
+ * @return int 如果失败返回负数
+ */
+int pipe(int fd[2]){
+    return (int)syscall_invoke(SYS_PIPE, fd, 0, 0, 0, 0, 0, 0, 0);
+}
 /**
  * @brief fork当前进程，但是与父进程共享VM、flags、fd
  *
@@ -88,8 +95,11 @@ pid_t vfork(void)
 uint64_t brk(uint64_t end_brk)
 {
     uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0, 0, 0);
-    // printf("brk():  end_brk=%#018lx x=%#018lx", (uint64_t)end_brk, x);
-    return x;
+    if (x < end_brk){
+        errno = -ENOMEM;
+        return -1;
+    }
+    return 0;
 }
 
 /**
@@ -197,10 +207,20 @@ void swab(void *restrict src, void *restrict dest, ssize_t nbytes)
 
 /**
  * @brief 获取当前进程的pid（进程标识符）
- * 
+ *
  * @return pid_t 当前进程的pid
  */
 pid_t getpid(void)
 {
-    syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+int dup(int fd)
+{
+    return syscall_invoke(SYS_DUP, fd, 0, 0, 0, 0, 0, 0, 0);    
+}
+
+int dup2(int ofd, int nfd)
+{
+    return syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0, 0, 0);
 }

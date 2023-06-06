@@ -14,6 +14,7 @@
 #include "ipi.h"
 
 static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
+static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
 
 static spinlock_t multi_core_starting_lock = {1}; // 多核启动锁
 
@@ -25,6 +26,7 @@ static int num_cpu_started = 1;
 
 // kick cpu 功能所使用的中断向量号
 #define KICK_CPU_IRQ_NUM 0xc8
+#define FLUSH_TLB_IRQ_NUM 0xc9
 
 void smp_init()
 {
@@ -57,6 +59,7 @@ void smp_init()
     kdebug("total_processor_num=%d", total_processor_num);
     // 注册接收kick_cpu功能的处理函数。（向量号200）
     ipi_regiserIPI(KICK_CPU_IRQ_NUM, NULL, &__smp_kick_cpu_handler, NULL, NULL, "IPI kick cpu");
+    ipi_regiserIPI(FLUSH_TLB_IRQ_NUM, NULL, &__smp__flush_tlb_ipi_handler, NULL, NULL, "IPI flush tlb");
 
     int core_to_start = 0;
     // total_processor_num = 3;
@@ -149,8 +152,10 @@ void smp_ap_start()
 
     //  切换栈基地址
     //  uint64_t stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
-    __asm__ __volatile__("movq %0, %%rbp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start) : "memory");
-    __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start) : "memory");
+    __asm__ __volatile__("movq %0, %%rbp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
+                         : "memory");
+    __asm__ __volatile__("movq %0, %%rsp \n\t" ::"m"(cpu_core_info[current_starting_cpu].stack_start)
+                         : "memory");
 
     ksuccess("AP core %d successfully started!", current_starting_cpu);
     io_mfence();
@@ -222,6 +227,12 @@ static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_r
     sched();
 }
 
+static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs)
+{
+    if (user_mode(regs))
+        return;
+    flush_tlb();
+}
 
 /**
  * @brief 获取当前全部的cpu数目

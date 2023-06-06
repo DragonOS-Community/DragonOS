@@ -1,32 +1,363 @@
 // 进程的用户空间内存管理
 
-use core::{cmp, hash::Hasher, intrinsics::unlikely, ops::Add};
+use core::{cmp, hash::Hasher, intrinsics::unlikely, mem::ManuallyDrop, ops::Add};
 
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use hashbrown::HashSet;
 
 use crate::{
-    arch::{mm::PageMapper, MMArch},
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    arch::{asm::current::current_pcb, mm::PageMapper, MMArch},
+    libs::{
+        align::page_align_up,
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     syscall::SystemError,
 };
 
 use super::{
-    allocator::page_frame::{deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame},
-    page::{Flusher, PageFlags},
-    syscall::MapFlags,
+    allocator::page_frame::{
+        deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
+    },
+    page::{Flusher, InactiveFlusher, PageFlags, PageFlushAll},
+    syscall::{MapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion,
 };
+
+/// MMAP_MIN_ADDR的默认值
+/// 以下内容来自linux-5.19:
+///  This is the portion of low virtual memory which should be protected
+//   from userspace allocation.  Keeping a user from writing to low pages
+//   can help reduce the impact of kernel NULL pointer bugs.
+//   For most ia64, ppc64 and x86 users with lots of address space
+//   a value of 65536 is reasonable and should cause no problems.
+//   On arm and other archs it should not be higher than 32768.
+//   Programs which use vm86 functionality or have some need to map
+//   this low address space will need CAP_SYS_RAWIO or disable this
+//   protection by setting the value to 0.
+pub const DEFAULT_MMAP_MIN_ADDR: usize = 65536;
 
 /// @brief 用户地址空间结构体（每个进程都有一个）
 #[derive(Debug)]
 pub struct AddressSpace {
     pub user_mapper: UserMapper,
     pub mappings: UserMappings,
-    pub mmap_min: usize,
+    pub mmap_min: VirtAddr,
+}
+
+impl AddressSpace {
+    pub fn new() -> Result<Arc<RwLock<Self>>, SystemError> {
+        let a = Self {
+            user_mapper: MMArch::setup_new_usermapper()?,
+            mappings: UserMappings::new(),
+            mmap_min: VirtAddr(DEFAULT_MMAP_MIN_ADDR),
+        };
+        let result: Arc<RwLock<AddressSpace>> = Arc::new(RwLock::new(a));
+        return Ok(result);
+    }
+
+    /// 从pcb中获取当前进程的地址空间结构体的Arc指针
+    ///
+    /// todo: 进程管理重构后，应该修改这个函数
+    pub fn current() -> Result<Arc<RwLock<AddressSpace>>, SystemError> {
+        let ptr = current_pcb().address_space as *const RwLock<AddressSpace>;
+        if ptr.is_null() {
+            panic!("current process has no address space");
+        }
+        // 为了防止pcb中的指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
+        let arc_wrapper = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
+
+        let result = Arc::clone(&arc_wrapper);
+        return Ok(result);
+    }
+
+    /// 尝试克隆当前进程的地址空间，包括这些映射都会被克隆
+    ///
+    /// # Returns
+    ///
+    /// 返回克隆后的，新的地址空间的Arc指针
+    pub fn try_clone(&mut self) -> Result<Arc<RwLock<AddressSpace>>, SystemError> {
+        let new_addr_space = AddressSpace::new()?;
+        let mut new_guard = new_addr_space.write();
+
+        let current_mapper = &mut self.user_mapper.utable;
+
+        for vma in self.mappings.vmas.iter() {
+            // TODO: 增加对VMA是否为文件映射的判断，如果是的话，就跳过
+
+            let vma_guard = vma.lock();
+
+            // 分配内存页并创建新的VMA
+            let new_vma = VMA::zeroed(
+                VirtPageFrame::new(vma_guard.region.start()),
+                PageFrameCount::new(vma_guard.region.size() / MMArch::PAGE_SIZE),
+                vma_guard.flags(),
+                &mut new_guard.user_mapper.utable,
+                (),
+            )?;
+            let new_vma_guard = new_vma.lock();
+            for page in new_vma_guard.pages().map(|p| p.virt_address()) {
+                let current_frame = unsafe {
+                    MMArch::phys_2_virt(
+                        current_mapper
+                            .translate(page)
+                            .expect("VMA page not mapped")
+                            .0,
+                    )
+                }
+                .expect("Phys2Virt: vaddr overflow.")
+                .data() as *mut u8;
+
+                let new_frame = unsafe {
+                    MMArch::phys_2_virt(
+                        new_guard
+                            .user_mapper
+                            .utable
+                            .translate(page)
+                            .expect("VMA page not mapped")
+                            .0,
+                    )
+                }
+                .expect("Phys2Virt: vaddr overflow.")
+                .data() as *mut u8;
+
+                unsafe {
+                    // 拷贝数据
+                    new_frame.copy_from_nonoverlapping(current_frame, MMArch::PAGE_SIZE);
+                }
+                new_guard.mappings.vmas.insert(new_vma.clone());
+            }
+        }
+        drop(new_guard);
+        return Ok(new_addr_space);
+    }
+
+    /// 判断当前的地址空间是否是当前进程的地址空间
+    #[inline]
+    pub fn is_current(&self) -> bool {
+        return self.user_mapper.utable.is_current();
+    }
+
+    /// 进行匿名页映射
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：映射的起始地址
+    /// - `len`：映射的长度
+    /// - `prot_flags`：保护标志
+    /// - `map_flags`：映射标志
+    pub fn map_anonymous(
+        &mut self,
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: ProtFlags,
+        map_flags: MapFlags,
+    ) -> Result<VirtPageFrame, SystemError> {
+        // 用于对齐hint的函数
+        let round_hint_to_min = |hint: VirtAddr| {
+            // 先把hint向下对齐到页边界
+            let addr = hint.data() & !MMArch::PAGE_OFFSET_MASK;
+            // 如果hint不是0，且hint小于DEFAULT_MMAP_MIN_ADDR，则对齐到DEFAULT_MMAP_MIN_ADDR
+            if addr != 0 && (addr < DEFAULT_MMAP_MIN_ADDR) {
+                Some(VirtAddr::new(page_align_up(DEFAULT_MMAP_MIN_ADDR)))
+            } else if addr == 0 {
+                None
+            } else {
+                Some(VirtAddr::new(addr))
+            }
+        };
+
+        let len = page_align_up(len);
+
+        let start_page: VirtPageFrame = self.mmap(
+            round_hint_to_min(start_vaddr),
+            PageFrameCount::from_bytes(len).unwrap(),
+            prot_flags,
+            map_flags,
+            move |page, count, flags, mapper, flusher| {
+                Ok(VMA::zeroed(page, count, flags, mapper, flusher)?)
+            },
+        )?;
+
+        return Ok(start_page);
+    }
+
+    /// 向进程的地址空间映射页面
+    ///
+    /// # 参数
+    ///
+    /// - `addr`：映射的起始地址，如果为`None`，则由内核自动分配
+    /// - `page_count`：映射的页面数量
+    /// - `prot_flags`：保护标志
+    /// - `map_flags`：映射标志
+    /// - `map_func`：映射函数，用于创建VMA
+    ///
+    /// # Returns
+    ///
+    /// 返回映射的起始虚拟页帧
+    ///
+    /// # Errors
+    ///
+    /// - `EINVAL`：参数错误
+    pub fn mmap<
+        F: FnOnce(
+            VirtPageFrame,
+            PageFrameCount,
+            PageFlags<MMArch>,
+            &mut PageMapper,
+            &mut dyn Flusher<MMArch>,
+        ) -> Result<Arc<LockedVMA>, SystemError>,
+    >(
+        &mut self,
+        addr: Option<VirtAddr>,
+        page_count: PageFrameCount,
+        prot_flags: ProtFlags,
+        map_flags: MapFlags,
+        map_func: F,
+    ) -> Result<VirtPageFrame, SystemError> {
+        if page_count == PageFrameCount::new(0) {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 找到未使用的区域
+        let region = match addr {
+            Some(vaddr) => {
+                self.mappings
+                    .find_free_at(self.mmap_min, vaddr, page_count.bytes(), map_flags)?
+            }
+            None => self
+                .mappings
+                .find_free(self.mmap_min, page_count.bytes())
+                .ok_or(SystemError::ENOMEM)?,
+        };
+
+        let page = VirtPageFrame::new(region.start());
+
+        let (mut active, mut inactive);
+        let flusher = if self.is_current() {
+            active = PageFlushAll::new();
+            &mut active as &mut dyn Flusher<MMArch>
+        } else {
+            inactive = InactiveFlusher::new();
+            &mut inactive as &mut dyn Flusher<MMArch>
+        };
+
+        // 映射页面，并将VMA插入到地址空间的VMA列表中
+        self.mappings.insert_vma(map_func(
+            page,
+            page_count,
+            PageFlags::from_prot_flags(prot_flags, true),
+            &mut self.user_mapper.utable,
+            flusher,
+        )?);
+        return Ok(page);
+    }
+
+    /// 取消进程的地址空间中的映射
+    ///
+    /// # 参数
+    ///
+    /// - `start_page`：起始页帧
+    /// - `page_count`：取消映射的页帧数量
+    ///
+    /// # Errors
+    ///
+    /// - `EINVAL`：参数错误
+    /// - `ENOMEM`：内存不足
+    pub fn munmap(
+        &mut self,
+        start_page: VirtPageFrame,
+        page_count: PageFrameCount,
+    ) -> Result<(), SystemError> {
+        let to_unmap = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+
+        let regions: Vec<Arc<LockedVMA>> = self.mappings.conflicts(to_unmap).collect::<Vec<_>>();
+
+        for r in regions {
+            let r = r.lock().region;
+            let r = self.mappings.remove_vma(&r).unwrap();
+            let intersection = r.lock().region().intersect(&to_unmap).unwrap();
+            let (before, r, after) = r.extract(intersection).unwrap();
+
+            // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
+
+            if let Some(before) = before {
+                // 如果前面有VMA，则需要将前面的VMA重新插入到地址空间的VMA列表中
+                self.mappings.insert_vma(before);
+            }
+
+            if let Some(after) = after {
+                // 如果后面有VMA，则需要将后面的VMA重新插入到地址空间的VMA列表中
+                self.mappings.insert_vma(after);
+            }
+
+            r.unmap(&mut self.user_mapper.utable, &mut flusher);
+        }
+
+        // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
+
+        return Ok(());
+    }
+
+    pub fn mprotect(
+        &mut self,
+        start_page: VirtPageFrame,
+        page_count: PageFrameCount,
+        prot_flags: ProtFlags,
+    ) -> Result<(), SystemError> {
+        let (mut active, mut inactive);
+        let mut flusher = if self.is_current() {
+            active = PageFlushAll::new();
+            &mut active as &mut dyn Flusher<MMArch>
+        } else {
+            inactive = InactiveFlusher::new();
+            &mut inactive as &mut dyn Flusher<MMArch>
+        };
+
+        let mapper = &mut self.user_mapper.utable;
+        let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+
+        let regions = self.mappings.conflicts(region).collect::<Vec<_>>();
+
+        for r in regions {
+            let r = r.lock().region().clone();
+            let r = self.mappings.remove_vma(&r).unwrap();
+
+            let intersection = r.lock().region().intersect(&region).unwrap();
+            let (before, r, after) = r.extract(intersection).expect("Failed to extract VMA");
+
+            if let Some(before) = before {
+                self.mappings.insert_vma(before);
+            }
+            if let Some(after) = after {
+                self.mappings.insert_vma(after);
+            }
+
+            let mut r_guard = r.lock();
+            // 如果VMA的保护标志不允许指定的修改，则返回错误
+            if !r_guard.can_have_flags(prot_flags) {
+                drop(r_guard);
+                self.mappings.insert_vma(r.clone());
+                return Err(SystemError::EACCES);
+            }
+
+            let new_flags: PageFlags<MMArch> = r_guard
+                .flags()
+                .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
+                .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
+
+            r_guard.remap(new_flags, mapper, &mut flusher)?;
+            drop(r_guard);
+            self.mappings.insert_vma(r);
+        }
+
+        return Ok(());
+    }
 }
 
 #[derive(Debug, Hash)]
@@ -68,7 +399,8 @@ impl UserMappings {
     pub fn new() -> Self {
         return Self {
             vmas: HashSet::new(),
-            vm_holes: BTreeMap::new(),
+            vm_holes: core::iter::once((VirtAddr::new(0), MMArch::USER_END_VADDR.data()))
+                .collect::<BTreeMap<_, _>>(),
         };
     }
 
@@ -102,7 +434,7 @@ impl UserMappings {
     ///
     /// @return 如果找到了，返回虚拟内存范围，否则返回None
     pub fn find_free(&self, min_vaddr: VirtAddr, size: usize) -> Option<VirtRegion> {
-        let mut vaddr = min_vaddr;
+        let vaddr = min_vaddr;
         let mut iter = self
             .vm_holes
             .iter()
@@ -147,11 +479,12 @@ impl UserMappings {
 
         if let Some(_x) = self.conflicts(requested).next() {
             if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
+                // 如果指定了 MAP_FIXED_NOREPLACE 标志，由于所指定的地址无法成功建立映射，则放弃映射，不对地址做修正
                 return Err(SystemError::EEXIST);
             }
 
             if flags.contains(MapFlags::MAP_FIXED) {
-                // 如果指定了MAP_FIXED标志，由于所指定的地址无法成功建立映射，则放弃映射，不对地址做修正
+                // todo: 支持MAP_FIXED标志对已有的VMA进行覆盖
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
 
@@ -195,7 +528,7 @@ impl UserMappings {
         // 如果将要插入的空洞与后一个空洞相邻，那么就需要合并。
         let next_hole_size: Option<usize> = self.vm_holes.remove(&region.end());
 
-        if let Some((prev_hole_vaddr, prev_hole_size)) = self
+        if let Some((_prev_hole_vaddr, prev_hole_size)) = self
             .vm_holes
             .range_mut(..region.start())
             .next_back()
@@ -406,7 +739,7 @@ pub struct VMA {
     /// VMA内的页帧是否已经映射到页表
     mapped: bool,
     /// VMA所属的用户地址空间
-    user_address_space: Option<Weak<AddressSpace>>,
+    user_address_space: Option<Weak<RwLock<AddressSpace>>>,
     self_ref: Weak<LockedVMA>,
 }
 
@@ -436,6 +769,49 @@ impl VMA {
             user_address_space: self.user_address_space.clone(),
             self_ref: self.self_ref.clone(),
         };
+    }
+
+    #[inline(always)]
+    pub fn flags(&self) -> PageFlags<MMArch> {
+        return self.flags;
+    }
+
+    pub fn pages(&self) -> VirtPageFrameIter {
+        return VirtPageFrameIter::new(
+            VirtPageFrame::new(self.region.start()),
+            VirtPageFrame::new(self.region.end()),
+        );
+    }
+
+    pub fn remap(
+        &mut self,
+        flags: PageFlags<MMArch>,
+        mapper: &mut PageMapper,
+        mut flusher: impl Flusher<MMArch>,
+    ) -> Result<(), SystemError> {
+        assert!(self.mapped);
+        for page in self.region.pages() {
+            // 暂时要求所有的页帧都已经映射到页表
+            // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
+            let r = unsafe {
+                mapper
+                    .remap(page.virt_address(), flags)
+                    .expect("Failed to remap, beacuse of some page is not mapped")
+            };
+            flusher.consume(r);
+        }
+        self.flags = flags;
+        return Ok(());
+    }
+
+    /// 检查当前VMA是否可以拥有指定的标志位
+    ///
+    /// ## 参数
+    ///
+    /// - `prot_flags` 要检查的标志位
+    pub fn can_have_flags(&self, prot_flags: ProtFlags) -> bool {
+        return (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
+            && (self.flags.has_execute() || !prot_flags.contains(ProtFlags::PROT_EXEC));
     }
 
     /// 把物理地址映射到虚拟地址

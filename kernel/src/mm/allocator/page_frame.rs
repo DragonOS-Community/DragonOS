@@ -51,6 +51,15 @@ pub struct PhysPageFrameIter {
     end: PhysPageFrame,
 }
 
+impl PhysPageFrameIter {
+    pub fn new(start: PhysPageFrame, end: PhysPageFrame) -> Self {
+        return Self {
+            current: start,
+            end,
+        };
+    }
+}
+
 impl Iterator for PhysPageFrameIter {
     type Item = PhysPageFrame;
 
@@ -109,6 +118,16 @@ pub struct VirtPageFrameIter {
     end: VirtPageFrame,
 }
 
+impl VirtPageFrameIter {
+    /// @brief 构造虚拟页帧的迭代器，范围为[start, end)
+    pub fn new(start: VirtPageFrame, end: VirtPageFrame) -> Self {
+        return Self {
+            current: start,
+            end,
+        };
+    }
+}
+
 impl Iterator for VirtPageFrameIter {
     type Item = VirtPageFrame;
 
@@ -122,7 +141,7 @@ impl Iterator for VirtPageFrameIter {
 }
 
 /// 页帧使用的数量
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct PageFrameCount(usize);
 
@@ -134,6 +153,22 @@ impl PageFrameCount {
     // @brief 获取页帧数量
     pub fn data(&self) -> usize {
         return self.0;
+    }
+
+    /// 计算这一段页帧占用的字节数
+    pub fn bytes(&self) -> usize {
+        return self.0 * MMArch::PAGE_SIZE;
+    }
+
+    /// 将字节数转换为页帧数量
+    ///
+    /// 如果字节数不是页帧大小的整数倍，则返回None. 否则返回页帧数量
+    pub fn from_bytes(bytes: usize) -> Option<Self> {
+        if bytes & MMArch::PAGE_OFFSET_MASK != 0 {
+            return None;
+        } else {
+            return Some(Self(bytes / MMArch::PAGE_SIZE));
+        }
     }
 }
 

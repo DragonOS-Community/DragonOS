@@ -1,6 +1,7 @@
 #![no_std] // <1>
 #![no_main] // <1>
 #![feature(alloc_error_handler)]
+#![feature(arbitrary_self_types)]
 #![feature(const_mut_refs)]
 #![feature(core_intrinsics)] // <2>
 #![feature(c_void_variant)]

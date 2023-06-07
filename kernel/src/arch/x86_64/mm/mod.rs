@@ -10,7 +10,7 @@ use crate::include::bindings::bindings::{
 use crate::libs::printk::PrintkWriter;
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::PageEntry;
-use crate::mm::allocator::buddy::{BuddyAllocator, BuddyEntry};
+use crate::mm::allocator::buddy::{BuddyAllocator};
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
 use crate::mm::{
@@ -18,17 +18,10 @@ use crate::mm::{
 };
 use crate::syscall::SystemError;
 use crate::{kdebug, kinfo};
-use alloc::alloc::{alloc, dealloc};
-use alloc::boxed::Box;
-use alloc::collections::LinkedList;
-// use alloc::collections::{linked_list, LinkedList};
-use alloc::vec::Vec;
 
-use core::alloc::Layout;
 use core::arch::asm;
 use core::ffi::c_void;
 use core::fmt::{Debug, Write};
-use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
 use core::ptr::{addr_of_mut, read_volatile, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -298,37 +291,13 @@ pub fn mm_init() {
     kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // todo: 初始化内存管理器
-    test_list();
-    // test4();
 
     // test_bump_alloc();
-    // test_buddy_alloc();
+    test_buddy_alloc();
     while true {}
 
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
-}
-pub fn test_list(){
-    // use crate::mm::allocator::my_list::LinkedList;
-    let mut list = LinkedList::new();
-    kdebug!("test list");
-    list.push_front(1);
-    kdebug!("test list{}",list.len());
-    list.push_front(2);
-    kdebug!("test list{}",list.len());
-    list.push_front(1);
-    kdebug!("test list{}",list.len());
-    
-    list.push_front(1);
-    kdebug!("test list{}",list.len());
-    list.push_front(1);
-    kdebug!("test list{}",list.len());
-    list.push_front(1);
-    kdebug!("test list{}",list.len());
-    for i in 0..100 {
-        list.push_front(1);
-        kdebug!("test list{}",list.len());
-    }
 }
 
 #[no_mangle]
@@ -384,17 +353,8 @@ pub fn test_buddy_alloc() {
     let mut buddy_allocator_opt =
         unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
     kdebug!("buddy_allocator_opt success");
-    unsafe { buddy_allocator_opt.allocate(PageFrameCount::new(1)) };
-    // 打印buddy_allocator的usage
-    kdebug!("buddy_allocator_opt success 1");
+    let test_addr=unsafe { buddy_allocator_opt.allocate(PageFrameCount::new(2)) };
+    // 打印test_addr
+    kdebug!("test_addr: {:b}", test_addr.unwrap().data());
 
-    // 取出buddy_allocator
-    let mut buddy_allocator = buddy_allocator_opt;
-    kdebug!("buddy_allocator_opt success 2");
-
-    // 调用buddy_allocator的allocate函数，分配一个页帧
-    let page = unsafe { buddy_allocator.allocate(PageFrameCount::new(1)) };
-
-    // 打印page
-    kdebug!("page: {:b}", page.unwrap().data());
 }

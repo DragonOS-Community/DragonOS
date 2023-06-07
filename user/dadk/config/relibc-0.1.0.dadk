@@ -4,8 +4,10 @@
   "description": "从GitHub克隆最新的relibc来编译",
   "task_type": {
     "BuildFromSource": {
-      "Local": {
-        "path": "/home/mkh/桌面/dgos/relibc"
+        "Git": {
+        "url": "https://github.com/houmkh/relibc.git",
+        "branch": "gettimeofday",
+        "revision": null
       }
     }
   },

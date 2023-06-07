@@ -1,4 +1,5 @@
 use crate::{
+    arch::MMArch,
     include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET},
     syscall::SystemError,
 };
@@ -101,10 +102,10 @@ impl VirtAddr {
     /// @brief 判断虚拟地址的类型
     #[inline(always)]
     pub fn kind(&self) -> PageTableKind {
-        if (self.0 as isize) < 0 {
-            return PageTableKind::Kernel;
-        } else {
+        if self.check_user() {
             return PageTableKind::User;
+        } else {
+            return PageTableKind::Kernel;
         }
     }
 
@@ -112,6 +113,16 @@ impl VirtAddr {
     #[inline(always)]
     pub fn check_aligned(&self, align: usize) -> bool {
         return self.0 & (align - 1) == 0;
+    }
+
+    /// @brief 判断虚拟地址是否在用户空间
+    #[inline(always)]
+    pub fn check_user(&self) -> bool {
+        if self < &MMArch::USER_END_VADDR {
+            return true;
+        } else {
+            return false;
+        }
     }
 }
 
@@ -425,6 +436,24 @@ impl Ord for VirtRegion {
     }
 }
 
+/// ## 判断虚拟地址是否超出了用户空间
+///
+/// 如果虚拟地址超出了用户空间，返回Err(SystemError::EFAULT).
+/// 如果end < start，返回Err(SystemError::EOVERFLOW)
+///
+/// 否则返回Ok(())
+pub fn verify_area(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
+    let end = addr.add(size);
+    if unlikely(end.data() < addr.data()) {
+        return Err(SystemError::EOVERFLOW);
+    }
+
+    if !addr.check_user() || !end.check_user() {
+        return Err(SystemError::EFAULT);
+    }
+
+    return Ok(());
+}
 // ====== 重构内存管理、进程管理后，请删除这几行 BEGIN ======
 //BUG pcb问题
 unsafe impl Send for process_control_block {}

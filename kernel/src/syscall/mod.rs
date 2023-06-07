@@ -6,14 +6,17 @@ use core::{
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
-    arch::cpu::cpu_reset,
+    arch::{cpu::cpu_reset, MMArch},
     filesystem::vfs::{
         file::FileMode,
         syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
     include::bindings::bindings::{mm_stat_t, pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
-    io::SeekFrom, kinfo,
+    io::SeekFrom,
+    kinfo,
+    libs::align::page_align_up,
+    mm::{MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
     time::TimeSpec,
 };
@@ -354,6 +357,10 @@ pub const SYS_ACCEPT: usize = 40;
 pub const SYS_GETSOCKNAME: usize = 41;
 pub const SYS_GETPEERNAME: usize = 42;
 
+pub const SYS_MMAP: usize = 44;
+pub const SYS_MUNMAP: usize = 45;
+pub const SYS_MPROTECT: usize = 46;
+
 #[derive(Debug)]
 pub struct Syscall;
 
@@ -380,7 +387,7 @@ impl Syscall {
         return crate::arch::syscall::arch_syscall_init();
     }
     /// @brief 系统调用分发器，用于分发系统调用。
-    /// 
+    ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
     pub fn handle(syscall_num: usize, args: &[usize], from_user: bool) -> usize {
@@ -865,6 +872,41 @@ impl Syscall {
             }
             SYS_GETPEERNAME => {
                 Self::getpeername(args[0], args[1] as *mut SockAddr, args[2] as *mut u32)
+            }
+            SYS_MMAP => {
+                let len = page_align_up(args[1]);
+                if unsafe { !verify_area(args[0] as u64, len as u64) } {
+                    Err(SystemError::EFAULT)
+                } else {
+                    Self::mmap(
+                        VirtAddr::new(args[0]),
+                        len,
+                        args[2],
+                        args[3],
+                        args[4] as i32,
+                        args[5],
+                    )
+                }
+            }
+            SYS_MUNMAP => {
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & MMArch::PAGE_SIZE != 0 {
+                    // The addr argument is not a multiple of the page size
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::munmap(VirtAddr::new(addr), len)
+                }
+            }
+            SYS_MPROTECT => {
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & MMArch::PAGE_SIZE != 0 {
+                    // The addr argument is not a multiple of the page size
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::mprotect(VirtAddr::new(addr), len, args[2])
+                }
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

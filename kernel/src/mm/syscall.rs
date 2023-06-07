@@ -1,7 +1,22 @@
+use core::intrinsics::unlikely;
+
+use alloc::sync::Arc;
+
 use crate::{
+    arch::MMArch,
     include::bindings::bindings::mm_stat_t,
+    kerror,
+    libs::{align::check_aligned, rwlock::RwLock},
+    mm::MemoryManagementArch,
     syscall::{Syscall, SystemError},
 };
+
+use super::{
+    allocator::page_frame::{PageFrameCount, VirtPageFrame},
+    ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
+    verify_area, VirtAddr,
+};
+
 bitflags! {
     /// Memory protection flags
     pub struct ProtFlags: u64 {
@@ -87,5 +102,127 @@ impl Syscall {
                 .expect("mstat: Invalid errno"));
         }
         return Ok(ret);
+    }
+
+    /// ## mmap系统调用
+    ///
+    /// 该函数的实现参考了Linux内核的实现，但是并不完全相同。因为有些功能咱们还没实现
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：映射的起始地址
+    /// - `len`：映射的长度
+    /// - `prot`：保护标志
+    /// - `flags`：映射标志
+    /// - `fd`：文件描述符（暂时不支持）
+    /// - `offset`：文件偏移量 （暂时不支持）
+    ///
+    /// ## 返回值
+    ///
+    /// 成功时返回映射的起始地址，失败时返回错误码
+    pub fn mmap(
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: usize,
+        map_flags: usize,
+        _fd: i32,
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
+        let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
+
+        if start_vaddr < VirtAddr::new(DEFAULT_MMAP_MIN_ADDR)
+            && map_flags.contains(MapFlags::MAP_FIXED)
+        {
+            kerror!(
+                "mmap: MAP_FIXED is not supported for address below {}",
+                DEFAULT_MMAP_MIN_ADDR
+            );
+            return Err(SystemError::EINVAL);
+        }
+        // 暂时不支持除匿名页以外的映射
+        if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+            kerror!("mmap: not support file mapping");
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+
+        // 暂时不支持巨页映射
+        if map_flags.contains(MapFlags::MAP_HUGETLB) {
+            kerror!("mmap: not support huge page mapping");
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let current_address_space: Arc<RwLock<AddressSpace>> = AddressSpace::current()?;
+        let start_page =
+            current_address_space
+                .write()
+                .map_anonymous(start_vaddr, len, prot_flags, map_flags)?;
+        return Ok(start_page.virt_address().data());
+    }
+
+    /// ## munmap系统调用
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：取消映射的起始地址（已经对齐到页）
+    /// - `len`：取消映射的字节数(已经对齐到页)
+    ///
+    /// ## 返回值
+    ///
+    /// 成功时返回0，失败时返回错误码
+    pub fn munmap(start_vaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
+        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
+        assert!(check_aligned(len, MMArch::PAGE_SIZE));
+
+        if unlikely(verify_area(start_vaddr, len).is_err()) {
+            return Err(SystemError::EINVAL);
+        }
+        if unlikely(len == 0) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let current_address_space: Arc<RwLock<AddressSpace>> = AddressSpace::current()?;
+        let start_frame = VirtPageFrame::new(start_vaddr);
+        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
+
+        current_address_space
+            .write()
+            .munmap(start_frame, page_count)
+            .map_err(|_| SystemError::EINVAL)?;
+        return Ok(0);
+    }
+
+    /// ## mprotect系统调用
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：起始地址(已经对齐到页)
+    /// - `len`：长度(已经对齐到页)
+    /// - `prot_flags`：保护标志
+    pub fn mprotect(
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: usize,
+    ) -> Result<usize, SystemError> {
+        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
+        assert!(check_aligned(len, MMArch::PAGE_SIZE));
+
+        if unlikely(verify_area(start_vaddr, len).is_err()) {
+            return Err(SystemError::EINVAL);
+        }
+        if unlikely(len == 0) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let prot_flags = ProtFlags::from_bits(prot_flags as u64).ok_or(SystemError::EINVAL)?;
+
+        let current_address_space: Arc<RwLock<AddressSpace>> = AddressSpace::current()?;
+        let start_frame = VirtPageFrame::new(start_vaddr);
+        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
+
+        current_address_space
+            .write()
+            .mprotect(start_frame, page_count, prot_flags)
+            .map_err(|_| SystemError::EINVAL)?;
+        return Ok(0);
     }
 }

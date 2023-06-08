@@ -25,6 +25,7 @@ static __ADDED_USEC: AtomicI64 = AtomicI64::new(0);
 static __ADDED_NSEC: SpinLock<i64> = SpinLock::new(0);
 static __ADDED_SEC: AtomicI64 = AtomicI64::new(0);
 static mut __TIMEKEEPER: Option<Timekeeper> = None;
+
 pub struct Timekeeper(RwLock<TimekeeperData>);
 pub struct TimekeeperData {
     /// 用于计时的当前时钟源。

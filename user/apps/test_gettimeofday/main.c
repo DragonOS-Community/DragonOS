@@ -4,7 +4,8 @@
 // #include <sleep.h>
 #include <unistd.h>
 #include <time.h>
-void main()
+
+int main()
 {
     struct timeval *tv = malloc(sizeof(struct timeval));
     // struct timezone *tz = malloc(sizeof(struct timezone));
@@ -20,5 +21,5 @@ void main()
     gettimeofday(tv, NULL);
     printf("tv = %ld.%06ld\n", tv->tv_sec, tv->tv_usec);
     // printf("tz_minuteswest = %d,tz_dsttime = %d", (*tz).tz_minuteswest, (*tz).tz_dsttime);
-    return;
+    return 0;
 }

@@ -146,10 +146,7 @@ pub fn getnstimeofday() -> TimeSpec {
     kdebug!("enter getnstimeofday");
 
     // let mut nsecs: u64 = 0;0
-    let mut xtime = TimeSpec {
-        tv_nsec: 0,
-        tv_sec: 0,
-    };
+    let mut xtime;
     loop {
         match timekeeper().0.try_read() {
             None => continue,

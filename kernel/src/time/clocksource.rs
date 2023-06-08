@@ -49,6 +49,8 @@ pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
 pub struct CycleNum(pub u64);
+
+#[allow(dead_code)]
 impl CycleNum {
     #[inline(always)]
     pub fn new(cycle: u64) -> Self {
@@ -559,13 +561,13 @@ impl ClocksourceData {
         flags: ClocksourceFlags,
     ) -> Self {
         let csd = ClocksourceData {
-            name: name,
-            rating: rating,
-            mask: mask,
-            mult: mult,
-            shift: shift,
-            max_idle_ns: max_idle_ns,
-            flags: flags,
+            name,
+            rating,
+            mask,
+            mult,
+            shift,
+            max_idle_ns,
+            flags,
             watchdog_last: CycleNum(0),
         };
         return csd;

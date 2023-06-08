@@ -17,7 +17,7 @@ use crate::{
     kinfo,
     net::syscall::SockAddr,
     time::{
-        syscall::{PosixTimeval, PosixTimezone, SYS_TIMEZONE},
+        syscall::{PosixTimeZone, PosixTimeval, SYS_TIMEZONE},
         TimeSpec,
     },
 };
@@ -873,7 +873,7 @@ impl Syscall {
             }
             SYS_GETTIMEOFDAY => {
                 let timeval = args[0] as *mut PosixTimeval;
-                let mut timezone = args[1] as *const PosixTimezone;
+                let timezone_ptr = args[1] as *const PosixTimeZone;
                 let security_check = || {
                     if unsafe {
                         verify_area(timeval as u64, core::mem::size_of::<PosixTimeval>() as u64)
@@ -883,8 +883,8 @@ impl Syscall {
                     }
                     if unsafe {
                         verify_area(
-                            timezone as u64,
-                            core::mem::size_of::<PosixTimezone>() as u64,
+                            timezone_ptr as u64,
+                            core::mem::size_of::<PosixTimeZone>() as u64,
                         )
                     } == false
                     {
@@ -896,11 +896,13 @@ impl Syscall {
                 if r.is_err() {
                     Err(r.unwrap_err())
                 } else {
-                    if !timezone.is_null() {
-                        timezone = &SYS_TIMEZONE;
-                    }
+                    let timezone = if !timezone_ptr.is_null() {
+                        &SYS_TIMEZONE
+                    } else {
+                        unsafe { timezone_ptr.as_ref().unwrap() }
+                    };
                     if !timeval.is_null() {
-                        Self::sys_do_gettimeofday(timeval)
+                        Self::gettimeofday(timeval, timezone)
                     } else {
                         Err(SystemError::EFAULT)
                     }

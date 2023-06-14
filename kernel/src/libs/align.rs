@@ -113,7 +113,7 @@ pub unsafe trait SafeForZero {}
 
 unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}
 
-/// 将给定的地址向上对齐到页面边界。
+/// 将给定的地址按照页面大小，向上对齐。
 ///
 /// 参数 `addr`：要对齐的地址。
 ///

@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     allocator::page_frame::{PageFrameCount, VirtPageFrame},
-    ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
+    ucontext::{AddressSpace, InnerAddressSpace, DEFAULT_MMAP_MIN_ADDR},
     verify_area, VirtAddr,
 };
 
@@ -151,11 +151,14 @@ impl Syscall {
             kerror!("mmap: not support huge page mapping");
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        let current_address_space: Arc<RwLock<AddressSpace>> = AddressSpace::current()?;
-        let start_page =
-            current_address_space
-                .write()
-                .map_anonymous(start_vaddr, len, prot_flags, map_flags)?;
+        let current_address_space = AddressSpace::current()?;
+        let start_page = current_address_space.write().map_anonymous(
+            start_vaddr,
+            len,
+            prot_flags,
+            map_flags,
+            true,
+        )?;
         return Ok(start_page.virt_address().data());
     }
 
@@ -180,7 +183,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        let current_address_space: Arc<RwLock<AddressSpace>> = AddressSpace::current()?;
+        let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
         let start_frame = VirtPageFrame::new(start_vaddr);
         let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
 
@@ -215,7 +218,7 @@ impl Syscall {
 
         let prot_flags = ProtFlags::from_bits(prot_flags as u64).ok_or(SystemError::EINVAL)?;
 
-        let current_address_space: Arc<RwLock<AddressSpace>> = AddressSpace::current()?;
+        let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
         let start_frame = VirtPageFrame::new(start_vaddr);
         let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
 

@@ -41,32 +41,27 @@ use super::{
 //   protection by setting the value to 0.
 pub const DEFAULT_MMAP_MIN_ADDR: usize = 65536;
 
-/// @brief 用户地址空间结构体（每个进程都有一个）
 #[derive(Debug)]
 pub struct AddressSpace {
-    pub user_mapper: UserMapper,
-    pub mappings: UserMappings,
-    pub mmap_min: VirtAddr,
+    inner: RwLock<InnerAddressSpace>,
 }
 
 impl AddressSpace {
-    pub fn new() -> Result<Arc<RwLock<Self>>, SystemError> {
-        let a = Self {
-            user_mapper: MMArch::setup_new_usermapper()?,
-            mappings: UserMappings::new(),
-            mmap_min: VirtAddr(DEFAULT_MMAP_MIN_ADDR),
+    pub fn new() -> Result<Arc<Self>, SystemError> {
+        let inner = InnerAddressSpace::new()?;
+        let result = Self {
+            inner: RwLock::new(inner),
         };
-        let result: Arc<RwLock<AddressSpace>> = Arc::new(RwLock::new(a));
-        return Ok(result);
+        return Ok(Arc::new(result));
     }
 
     /// 从pcb中获取当前进程的地址空间结构体的Arc指针
     ///
     /// todo: 进程管理重构后，应该修改这个函数
-    pub fn current() -> Result<Arc<RwLock<AddressSpace>>, SystemError> {
-        let ptr = current_pcb().address_space as *const RwLock<AddressSpace>;
+    pub fn current() -> Result<Arc<AddressSpace>, SystemError> {
+        let ptr = current_pcb().address_space as *const AddressSpace;
         if ptr.is_null() {
-            panic!("current process has no address space");
+            panic!("Current process has no address space");
         }
         // 为了防止pcb中的指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
         let arc_wrapper = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
@@ -75,12 +70,75 @@ impl AddressSpace {
         return Ok(result);
     }
 
+    /// 判断某个地址空间是否为当前进程的地址空间
+    pub fn is_current(self: &Arc<Self>) -> bool {
+        let current = Self::current();
+        if let Ok(current) = current {
+            return Arc::ptr_eq(&current, self);
+        }
+        return false;
+    }
+}
+
+impl core::ops::Deref for AddressSpace {
+    type Target = RwLock<InnerAddressSpace>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for AddressSpace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+/// @brief 用户地址空间结构体（每个进程都有一个）
+#[derive(Debug)]
+pub struct InnerAddressSpace {
+    pub user_mapper: UserMapper,
+    pub mappings: UserMappings,
+    pub mmap_min: VirtAddr,
+    /// 用户栈信息结构体
+    pub user_stack: Option<UserStack>,
+    /// 当前进程的堆空间的起始地址
+    pub brk_start: VirtAddr,
+    /// 当前进程的堆空间的结束地址(不包含)
+    pub brk: VirtAddr,
+
+    pub start_code: VirtAddr,
+    pub end_code: VirtAddr,
+    pub start_data: VirtAddr,
+    pub end_data: VirtAddr,
+}
+
+impl InnerAddressSpace {
+    pub fn new() -> Result<Self, SystemError> {
+        let mut result = Self {
+            user_mapper: MMArch::setup_new_usermapper()?,
+            mappings: UserMappings::new(),
+            mmap_min: VirtAddr(DEFAULT_MMAP_MIN_ADDR),
+            brk_start: MMArch::USER_BRK_START,
+            brk: MMArch::USER_BRK_START,
+            user_stack: None,
+            start_code: VirtAddr(0),
+            end_code: VirtAddr(0),
+            start_data: VirtAddr(0),
+            end_data: VirtAddr(0),
+        };
+
+        result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
+
+        return Ok(result);
+    }
+
     /// 尝试克隆当前进程的地址空间，包括这些映射都会被克隆
     ///
     /// # Returns
     ///
     /// 返回克隆后的，新的地址空间的Arc指针
-    pub fn try_clone(&mut self) -> Result<Arc<RwLock<AddressSpace>>, SystemError> {
+    pub fn try_clone(&mut self) -> Result<Arc<AddressSpace>, SystemError> {
         let new_addr_space = AddressSpace::new()?;
         let mut new_guard = new_addr_space.write();
 
@@ -150,19 +208,21 @@ impl AddressSpace {
     /// - `len`：映射的长度
     /// - `prot_flags`：保护标志
     /// - `map_flags`：映射标志
+    /// - `round_to_min`：是否将`start_vaddr`对齐到`mmap_min`，如果为`true`，则当`start_vaddr`不为0时，会对齐到`mmap_min`，否则仅向下对齐到页边界
     pub fn map_anonymous(
         &mut self,
         start_vaddr: VirtAddr,
         len: usize,
         prot_flags: ProtFlags,
         map_flags: MapFlags,
+        round_to_min: bool,
     ) -> Result<VirtPageFrame, SystemError> {
         // 用于对齐hint的函数
         let round_hint_to_min = |hint: VirtAddr| {
             // 先把hint向下对齐到页边界
             let addr = hint.data() & !MMArch::PAGE_OFFSET_MASK;
             // 如果hint不是0，且hint小于DEFAULT_MMAP_MIN_ADDR，则对齐到DEFAULT_MMAP_MIN_ADDR
-            if addr != 0 && (addr < DEFAULT_MMAP_MIN_ADDR) {
+            if addr != 0 && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
                 Some(VirtAddr::new(page_align_up(DEFAULT_MMAP_MIN_ADDR)))
             } else if addr == 0 {
                 None
@@ -171,7 +231,7 @@ impl AddressSpace {
             }
         };
 
-        let len = page_align_up(len);
+        let len = page_align_up(len + start_vaddr.data() & MMArch::PAGE_OFFSET_MASK);
 
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
@@ -358,6 +418,27 @@ impl AddressSpace {
 
         return Ok(());
     }
+
+    /// 创建新的用户栈
+    ///
+    /// ## 参数
+    ///
+    /// - `size`：栈的大小
+    pub fn new_user_stack(&mut self, size: usize) -> Result<(), SystemError> {
+        assert!(self.user_stack.is_none(), "User stack already exists");
+        let stack = UserStack::new(self, None, size)?;
+        self.user_stack = Some(stack);
+        return Ok(());
+    }
+}
+
+impl Drop for InnerAddressSpace {
+    fn drop(&mut self) {
+        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        for vma in self.mappings.iter_vmas() {
+            vma.unmap(&mut self.user_mapper.utable, &mut flusher);
+        }
+    }
 }
 
 #[derive(Debug, Hash)]
@@ -444,7 +525,7 @@ impl UserMappings {
             // 计算当前空洞的可用大小
             let available_size: usize =
                 if hole_vaddr <= &&min_vaddr && min_vaddr <= hole_vaddr.add(**hole_size) {
-                    **hole_size - (min_vaddr - **hole_vaddr).data()
+                    **hole_size - (min_vaddr - **hole_vaddr)
                 } else {
                     **hole_size
                 };
@@ -517,7 +598,7 @@ impl UserMappings {
             if prev_hole_end > region.end() {
                 // 如果前一个空洞的结束地址大于当前空洞的结束地址，那么就需要增加一个新的空洞。
                 self.vm_holes
-                    .insert(region.end(), (prev_hole_end - region.end()).data());
+                    .insert(region.end(), prev_hole_end - region.end());
             }
         }
     }
@@ -739,7 +820,7 @@ pub struct VMA {
     /// VMA内的页帧是否已经映射到页表
     mapped: bool,
     /// VMA所属的用户地址空间
-    user_address_space: Option<Weak<RwLock<AddressSpace>>>,
+    user_address_space: Option<Weak<AddressSpace>>,
     self_ref: Weak<LockedVMA>,
 }
 
@@ -931,5 +1012,115 @@ impl PartialOrd for VMA {
 impl Ord for VMA {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         return self.region.cmp(&other.region);
+    }
+}
+
+#[derive(Debug)]
+pub struct UserStack {
+    // 栈底地址
+    stack_bottom: VirtAddr,
+    // 当前已映射的大小
+    mapped_size: usize,
+    /// 栈顶地址（这个值需要仔细确定！因为它可能不会实时与用户栈的真实栈顶保持一致！要小心！）
+    current_sp: VirtAddr,
+}
+
+impl UserStack {
+    /// 默认的用户栈底地址
+    pub const DEFAULT_USER_STACK_BOTTOM: VirtAddr = MMArch::USER_STACK_START;
+    /// 默认的用户栈大小为8MB
+    pub const DEFAULT_USER_STACK_SIZE: usize = 8 * 1024 * 1024;
+    /// 用户栈的保护页数量
+    pub const GUARD_PAGES_NUM: usize = 4;
+
+    /// 创建一个用户栈
+    pub fn new(
+        vm: &mut InnerAddressSpace,
+        stack_bottom: Option<VirtAddr>,
+        stack_size: usize,
+    ) -> Result<Self, SystemError> {
+        let stack_bottom = stack_bottom.unwrap_or(Self::DEFAULT_USER_STACK_BOTTOM);
+        assert!(stack_bottom.check_aligned(MMArch::PAGE_SIZE));
+
+        // 分配用户栈的保护页
+        let guard_size = Self::GUARD_PAGES_NUM * MMArch::PAGE_SIZE;
+        let actual_stack_bottom = stack_bottom - guard_size;
+
+        let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+        vm.map_anonymous(
+            actual_stack_bottom,
+            guard_size,
+            prot_flags,
+            map_flags,
+            false,
+        )?;
+        // 清空保护页
+        unsafe {
+            let p = actual_stack_bottom.data() as *mut u8;
+            p.write_bytes(0, guard_size);
+        }
+        // 设置保护页只读
+        prot_flags.remove(ProtFlags::PROT_WRITE);
+        vm.mprotect(
+            VirtPageFrame::new(actual_stack_bottom),
+            PageFrameCount::new(Self::GUARD_PAGES_NUM),
+            prot_flags,
+        )?;
+
+        let mut user_stack = UserStack {
+            stack_bottom: actual_stack_bottom,
+            mapped_size: guard_size,
+            current_sp: actual_stack_bottom,
+        };
+
+        // 分配用户栈
+        user_stack.expand(vm, stack_size)?;
+
+        return Ok(user_stack);
+    }
+
+    /// 扩展用户栈
+    ///
+    /// ## 参数
+    ///
+    /// - `vm` 用户地址空间结构体
+    /// - `bytes` 要扩展的字节数
+    ///
+    /// ## 返回值
+    ///
+    /// - **Ok(())** 扩展成功
+    /// - **Err(SystemError)** 扩展失败
+    pub fn expand(
+        &mut self,
+        vm: &mut InnerAddressSpace,
+        mut bytes: usize,
+    ) -> Result<(), SystemError> {
+        let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+
+        bytes = page_align_up(bytes);
+        self.mapped_size += bytes;
+
+        vm.map_anonymous(
+            self.stack_bottom - self.mapped_size,
+            bytes,
+            prot_flags,
+            map_flags,
+            false,
+        )?;
+
+        return Ok(());
+    }
+
+    /// 获取栈顶地址
+    ///
+    /// 请注意，如果用户栈的栈顶地址发生变化，这个值可能不会实时更新！
+    pub fn sp(&self) -> VirtAddr {
+        return self.current_sp;
+    }
+
+    pub unsafe fn set_sp(&mut self, sp: VirtAddr) {
+        self.current_sp = sp;
     }
 }

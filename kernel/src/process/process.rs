@@ -16,7 +16,7 @@ use crate::{
         PROC_UNINTERRUPTIBLE,
     },
     libs::{casting::DowncastArc, rwlock::RwLock},
-    mm::ucontext::AddressSpace,
+    mm::ucontext::InnerAddressSpace,
     net::socket::SocketInode,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
@@ -315,9 +315,9 @@ impl process_control_block {
 
     /// 释放pcb中存储的地址空间的指针
     pub unsafe fn drop_address_space(&self) {
-        let p = self.address_space as *const RwLock<AddressSpace>;
+        let p = self.address_space as *const RwLock<InnerAddressSpace>;
 
-        let p: Arc<RwLock<AddressSpace>> = Arc::from_raw(p);
+        let p: Arc<RwLock<InnerAddressSpace>> = Arc::from_raw(p);
         drop(p);
     }
 }

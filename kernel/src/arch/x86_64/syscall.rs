@@ -2,10 +2,11 @@ use core::ffi::c_void;
 
 use crate::{
     include::bindings::bindings::{
-        pt_regs, set_system_trap_gate, verify_area, CLONE_FS, CLONE_SIGNAL, CLONE_VM, PAGE_4K_SIZE,
+        pt_regs, set_system_trap_gate, CLONE_FS, CLONE_SIGNAL, CLONE_VM, PAGE_4K_SIZE,
     },
     ipc::signal::sys_rt_sigreturn,
     kinfo,
+    mm::{verify_area, VirtAddr},
     syscall::{Syscall, SystemError, SYS_EXECVE, SYS_FORK, SYS_RT_SIGRETURN, SYS_VFORK},
 };
 
@@ -71,9 +72,9 @@ pub extern "C" fn syscall_handler(regs: &mut pt_regs) -> () {
 
             // 权限校验
             if from_user
-                && (unsafe { !verify_area(path_ptr as u64, PAGE_4K_SIZE as u64) }
-                    || unsafe { !verify_area(argv_ptr as u64, PAGE_4K_SIZE as u64) })
-                || unsafe { !verify_area(env_ptr as u64, PAGE_4K_SIZE as u64) }
+                && (verify_area(VirtAddr::new(path_ptr), 4096).is_err()
+                    || verify_area(VirtAddr::new(argv_ptr), 4096).is_err()
+                    || verify_area(VirtAddr::new(env_ptr), 4096).is_err())
             {
                 syscall_return!(SystemError::EFAULT.to_posix_errno() as u64, regs);
             } else {
@@ -107,4 +108,29 @@ pub fn arch_syscall_init() -> Result<(), SystemError> {
     kinfo!("arch_syscall_init\n");
     unsafe { set_system_trap_gate(0x80, 0, syscall_int as *mut c_void) }; // 系统调用门
     return Ok(());
+}
+
+fn tmp_rs_execve(
+    path: *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
+    regs: &mut pt_regs,
+) -> u64 {
+    if path.is_null() || argv.is_null() || envp.is_null() {
+        return SystemError::EFAULT.to_posix_errno() as u64;
+    }
+
+    let path = unsafe { core::slice::from_raw_parts(path, 4096) };
+    let path = core::str::from_utf8(path).unwrap();
+    let argv = unsafe { core::slice::from_raw_parts(argv, 4096) };
+    let envp = unsafe { core::slice::from_raw_parts(envp, 4096) };
+    kinfo!("path: {:?}\n", path);
+    kinfo!("argv: {:?}\n", argv);
+    kinfo!("envp: {:?}\n", envp);
+
+    todo!("execve");
+    // todo: 在这里调用load_binary_file
+    // todo: 把proc_init_info写到用户栈上
+    // todo!("write proc_init_info to user stack");
+    return 0;
 }

@@ -3,7 +3,7 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
-        ROOT_INODE, IndexNode,
+        IndexNode, ROOT_INODE,
     },
     libs::{elf::ELF_LOADER, rwlock::RwLock},
     mm::{
@@ -106,11 +106,7 @@ pub enum ExecLoadMode {
 }
 
 impl<'a> ExecParam<'a> {
-    pub fn new(
-        file_path: &'a str,
-        vm: Arc<AddressSpace>,
-        flags: ExecParamFlags,
-    ) -> Self {
+    pub fn new(file_path: &'a str, vm: Arc<AddressSpace>, flags: ExecParamFlags) -> Self {
         Self {
             file_path,
             file: None,
@@ -157,7 +153,7 @@ impl<'a> ExecParam<'a> {
 /// ## 加载二进制文件
 pub fn load_binary_file(param: &mut ExecParam) -> Result<(), SystemError> {
     let inode = ROOT_INODE().lookup(param.file_path)?;
-    
+
     let file = File::new(inode, FileMode::O_RDONLY)?;
     param.file = Some(file);
     let mut head_buf = [0u8; 256];
@@ -178,7 +174,6 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<(), SystemError> {
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
     loader.load(param, &head_buf).map_err(|e| e.into())?;
-
 
     return Ok(());
 }

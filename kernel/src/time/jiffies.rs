@@ -7,8 +7,6 @@ use crate::{kdebug, libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
-    timeconv::time_to_calendar,
-    timekeeping::getnstimeofday,
     timer::clock,
     NSEC_PER_SEC,
 };
@@ -86,13 +84,14 @@ pub fn clocksource_default_clock() -> Arc<ClocksourceJiffies> {
 pub fn jiffies_init() {
     //注册jiffies
     let jiffies = clocksource_default_clock() as Arc<dyn Clocksource>;
-    jiffies.register();
-    kdebug!("jiffies_init sccessfully");
+    match jiffies.register() {
+        Ok(_) => kdebug!("jiffies_init sccessfully"),
+        Err(_) => kdebug!("jiffies_init failed, no default clock running"),
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn rs_jiffies_init() {
     jiffies_init();
-    let tm = getnstimeofday();
-    time_to_calendar(tm.tv_sec + 8 * 3600, 0);
+    
 }

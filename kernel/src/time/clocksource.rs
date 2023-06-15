@@ -59,6 +59,7 @@ impl CycleNum {
         self.0
     }
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn add(&self, other: CycleNum) -> CycleNum {
         CycleNum(self.data() + other.data())
     }
@@ -134,8 +135,6 @@ impl ClocksouceWatchdog {
 
     /// 启用检查器
     pub fn clocksource_start_watchdog(&mut self) {
-        // let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
-
         // 如果watchdog未被设置或者已经启用了就退出
         let watchdog_list = &WATCHDOG_LIST.lock();
         if self.is_running || self.watchdog.is_none() || watchdog_list.is_empty() {
@@ -507,6 +506,7 @@ impl dyn Clocksource {
     }
 
     /// # 注销时钟源
+    #[allow(dead_code)]
     pub fn unregister(&self) {
         // 将时钟源从监视链表中弹出
         self.clocksource_dequeue_watchdog();
@@ -592,9 +592,11 @@ impl ClocksourceData {
     pub fn set_flags(&mut self, flags: ClocksourceFlags) {
         self.flags = flags;
     }
+    #[allow(dead_code)]
     pub fn remove_flags(&mut self, flags: ClocksourceFlags) {
         self.flags.remove(flags)
     }
+    #[allow(dead_code)]
     pub fn insert_flags(&mut self, flags: ClocksourceFlags) {
         self.flags.insert(flags)
     }
@@ -607,6 +609,7 @@ pub fn clocksource_cyc2ns(cycles: CycleNum, mult: u32, shift: u32) -> u64 {
 }
 
 /// # 重启所有的时间源
+#[allow(dead_code)]
 pub fn clocksource_resume() {
     let list = CLOCKSOURCE_LIST.lock();
     for ele in list.iter() {
@@ -622,6 +625,7 @@ pub fn clocksource_resume() {
 }
 
 /// # 暂停所有的时间源
+#[allow(dead_code)]
 pub fn clocksource_suspend() {
     let list = CLOCKSOURCE_LIST.lock();
     for ele in list.iter() {

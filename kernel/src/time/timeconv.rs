@@ -1,12 +1,9 @@
-
-
-use crate::{kdebug};
-
 use super::syscall::PosixTimeT;
-
+/// 一小时所包含的秒数
 const SECS_PER_HOUR: i64 = 60 * 60;
+/// 一天所包含的秒数
 const SECS_PER_DAY: i64 = SECS_PER_HOUR * 24;
-
+/// 每年中每个月最后一天所对应天数
 const MON_OF_YDAY: [[i64; 13]; 2] = [
     // 普通年
     [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365],
@@ -14,6 +11,7 @@ const MON_OF_YDAY: [[i64; 13]; 2] = [
     [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366],
 ];
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct CalendarTime {
     tm_sec: i32,
     tm_min: i32,
@@ -38,6 +36,12 @@ impl CalendarTime {
         }
     }
 }
+
+/// # 判断是否是闰年
+///
+/// ## 参数
+///
+/// * 'year' - 年份
 fn is_leap(year: u32) -> bool {
     let mut flag = false;
     if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
@@ -46,14 +50,22 @@ fn is_leap(year: u32) -> bool {
     return flag;
 }
 
+/// # 计算除法
+///
+/// # 参数
+///
+/// * 'left' - 被除数
+/// * 'right' - 除数
 fn math_div(left: u32, right: u32) -> u32 {
-    if left % right < 0 {
-        return left / right - 1;
-    }
     return left / right;
 }
 
-/// 计算两年之间的闰年数目
+/// # 计算两年之间的闰年数目
+///
+/// ## 参数
+///
+/// * 'y1' - 起始年份
+/// * 'y2' - 结束年份
 fn leaps_between(y1: u32, y2: u32) -> u32 {
     // 算出y1之前的闰年数量
     let y1_leaps = math_div(y1 - 1, 4) - math_div(y1 - 1, 100) + math_div(y1 - 1, 400);
@@ -63,7 +75,13 @@ fn leaps_between(y1: u32, y2: u32) -> u32 {
     y2_leaps - y1_leaps
 }
 
-/// 将秒数转换成日期
+/// # 将秒数转换成日期
+///
+/// ## 参数
+///
+/// * 'totalsecs' - 1970年1月1日 00:00:00 UTC到现在的秒数
+/// * 'offset' - 指定的秒数对应的时间段（含）的偏移量（以秒为单位）
+#[allow(dead_code)]
 pub fn time_to_calendar(totalsecs: PosixTimeT, offset: i32) -> CalendarTime {
     let mut result = CalendarTime::new();
     // 计算对应的天数
@@ -100,10 +118,8 @@ pub fn time_to_calendar(totalsecs: PosixTimeT, offset: i32) -> CalendarTime {
     while days < 0 || (is_leap(year) && days >= 366) || (!is_leap(year) && days >= 365) {
         // 假设每一年都是365天，计算出大概的年份
         let guess_year = year + math_div(days.try_into().unwrap(), 365);
-
         // 将已经计算过的天数去掉
         days -= ((guess_year - year) * 365 + leaps_between(year, guess_year)) as i64;
-
         year = guess_year;
     }
     result.tm_year = (year - 1900) as i32;
@@ -122,17 +138,6 @@ pub fn time_to_calendar(totalsecs: PosixTimeT, offset: i32) -> CalendarTime {
     days -= MON_OF_YDAY[il][mon - 1];
     result.tm_mon = (mon - 1) as i32;
     result.tm_mday = (days + 1) as i32;
-    // kdebug!("{:?}", result);
-    kdebug!(
-        "now: year:{:?},month:{:?},day:{:?},clock:{:?},min:{:?},sec:{:?}, wday:{:?}",
-        result.tm_year + 1900,
-        result.tm_mon + 1,
-        result.tm_mday,
-        result.tm_hour,
-        result.tm_min,
-        result.tm_sec,
-        result.tm_wday
-    );
 
     result
 }

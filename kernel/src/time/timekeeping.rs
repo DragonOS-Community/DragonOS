@@ -6,7 +6,7 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     kdebug,
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::rwlock::RwLock,
     time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
 };
 
@@ -15,15 +15,20 @@ use super::{
     syscall::PosixTimeval,
     NSEC_PER_SEC, USEC_PER_SEC,
 };
-
+/// NTP周期频率
 pub const NTP_INTERVAL_FREQ: u64 = HZ;
+/// NTP周期长度
 pub const NTP_INTERVAL_LENGTH: u64 = NSEC_PER_SEC as u64 / NTP_INTERVAL_FREQ;
+/// NTP转换比例
 pub const NTP_SCALE_SHIFT: u32 = 32;
 
+/// timekeeping休眠标志，false为未休眠
 pub static TIMEKEEPING_SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// 已经递增的微秒数
 static __ADDED_USEC: AtomicI64 = AtomicI64::new(0);
-static __ADDED_NSEC: SpinLock<i64> = SpinLock::new(0);
+/// 已经递增的秒数
 static __ADDED_SEC: AtomicI64 = AtomicI64::new(0);
+/// timekeeper全局变量，用于管理timekeeper模块
 static mut __TIMEKEEPER: Option<Timekeeper> = None;
 pub struct Timekeeper(RwLock<TimekeeperData>);
 pub struct TimekeeperData {
@@ -120,7 +125,8 @@ impl Timekeeper {
     }
 
     /// # 获取当前时钟源距离上次检测走过的纳秒数
-    pub fn timekeeping_get_ns(&self) -> u64 {
+    #[allow(dead_code)]
+    pub fn tk_get_ns(&self) -> u64 {
         let timekeeper = self.0.read();
         let clock = timekeeper.clock.clone().unwrap();
         let clock_now = clock.read();
@@ -146,7 +152,7 @@ pub fn getnstimeofday() -> TimeSpec {
     kdebug!("enter getnstimeofday");
 
     // let mut nsecs: u64 = 0;0
-    let mut xtime = TimeSpec {
+    let mut _xtime = TimeSpec {
         tv_nsec: 0,
         tv_sec: 0,
     };
@@ -154,9 +160,9 @@ pub fn getnstimeofday() -> TimeSpec {
         match timekeeper().0.try_read() {
             None => continue,
             Some(tk) => {
-                xtime = tk.xtime;
+                _xtime = tk.xtime;
                 drop(tk);
-                // nsecs = timekeeper().timekeeping_get_ns();
+                // nsecs = timekeeper().tk_get_ns();
                 // TODO 不同架构可能需要加上不同的偏移量
                 break;
             }
@@ -164,22 +170,15 @@ pub fn getnstimeofday() -> TimeSpec {
     }
     // xtime.tv_nsec += nsecs as i64;
     let sec = __ADDED_SEC.load(Ordering::SeqCst);
-    xtime.tv_sec += sec;
-    while xtime.tv_nsec >= NSEC_PER_SEC.into() {
-        xtime.tv_nsec -= NSEC_PER_SEC as i64;
-        xtime.tv_sec += 1;
+    _xtime.tv_sec += sec;
+    while _xtime.tv_nsec >= NSEC_PER_SEC.into() {
+        _xtime.tv_nsec -= NSEC_PER_SEC as i64;
+        _xtime.tv_sec += 1;
     }
 
     // TODO 将xtime和当前时间源的时间相加
 
-    // kdebug!(
-    //     "xtime.tv_sec = {:?},xtime.tv_nsec = {:?}",
-    //     xtime.tv_sec,
-    //     xtime.tv_nsec
-    // );
-    kdebug!("exit getnstimeofday");
-
-    return xtime;
+    return _xtime;
 }
 
 /// # 获取1970.1.1至今的UTC时间戳(最小单位:usec)
@@ -188,12 +187,7 @@ pub fn getnstimeofday() -> TimeSpec {
 ///
 /// * 'PosixTimeval' - 时间戳
 pub fn do_gettimeofday() -> PosixTimeval {
-    kdebug!("enter do_gettimeofday");
-
     let tp = getnstimeofday();
-    // time_to_calendar(tp.tv_sec + 8 * 3600, 0);
-    kdebug!("exit do_gettimeofday");
-
     return PosixTimeval {
         tv_sec: tp.tv_sec,
         tv_usec: (tp.tv_nsec / 1000) as i32,
@@ -300,7 +294,6 @@ pub fn update_wall_time() {
     }
     // TODO 需要检查是否更新时间源
     compiler_fence(Ordering::SeqCst);
-    // kdebug!("exit update_wall_time");
     drop(irq_guard);
     compiler_fence(Ordering::SeqCst);
 }

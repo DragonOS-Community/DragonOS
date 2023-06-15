@@ -53,7 +53,6 @@
 #define SYS_ACCEPT 40      // 接受一个socket连接
 #define SYS_GETSOCKNAME 41 // 获取socket的名字
 #define SYS_GETPEERNAME 42 // 获取socket的对端名字
-
 #define SYS_GETTIMEOFDAY 43 // 获取当前时间
 
 #define SYS_AHCI_END_REQ 255 // AHCI DMA请求结束end_request的系统调用

@@ -7,13 +7,9 @@ use alloc::{
 };
 
 use crate::{
-    arch::{
-        asm::current::current_pcb,
-        interrupt::{cli, sti},
-        sched::sched,
-    },
-    exception::softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
-    include::bindings::bindings::{process_control_block, process_wakeup, pt_regs, PROC_RUNNING},
+    arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
+    exception::{softirq::{softirq_vectors, SoftirqNumber, SoftirqVec}, InterruptArch},
+    include::bindings::bindings::{process_control_block, process_wakeup, PROC_RUNNING},
     kdebug, kerror,
     libs::spinlock::SpinLock,
     syscall::SystemError,
@@ -237,12 +233,14 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         return Err(SystemError::EINVAL);
     } else {
         // 禁用中断，防止在这段期间发生调度，造成死锁
-        cli();
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        
         timeout += TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         let timer = Timer::new(WakeUpHelper::new(current_pcb()), timeout as u64);
         timer.activate();
         current_pcb().state &= (!PROC_RUNNING) as u64;
-        sti();
+
+        drop(irq_guard);
 
         sched();
         let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
@@ -285,16 +283,13 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     compiler_fence(Ordering::SeqCst);
     return prev + add_jiffies;
 }
+
 pub fn clock() -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst);
 }
 // ====== 重构完成后请删掉extern C ======
 #[no_mangle]
 pub extern "C" fn rs_clock() -> u64 {
-    clock()
-}
-#[no_mangle]
-pub extern "C" fn sys_clock(_regs: *const pt_regs) -> u64 {
     clock()
 }
 

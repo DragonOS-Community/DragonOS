@@ -46,5 +46,5 @@
 #include <process/process.h>
 #include <sched/sched.h>
 #include <smp/smp.h>
-#include <time/sleep.h>
 #include <time/clocksource.h>
+#include <time/sleep.h>

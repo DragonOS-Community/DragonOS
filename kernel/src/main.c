@@ -126,12 +126,11 @@ void system_initialize()
 
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
-    // 先初始化系统调用模块
+    
     syscall_init();
 
     io_mfence();
-    //  再初始化进程模块。顺序不能调转
-    // sched_init();
+
     rs_timekeeping_init();
     io_mfence();
 

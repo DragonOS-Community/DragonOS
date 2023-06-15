@@ -1,7 +1,8 @@
 use crate::{
     arch::CurrentIrqArch,
+    exception::InterruptArch,
     include::bindings::bindings::{io_in8, io_out8},
-    syscall::SystemError, exception::InterruptArch,
+    syscall::SystemError,
 };
 
 pub struct RtcTime {
@@ -60,7 +61,7 @@ impl RtcTime {
                 break;
             } // 若读取时间过程中时间发生跳变则重新读取
         }
-        
+
         unsafe {
             io_out8(0x70, 0x00);
         }

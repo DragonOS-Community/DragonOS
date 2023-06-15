@@ -6,10 +6,10 @@ pub mod clocksource;
 pub mod jiffies;
 pub mod sleep;
 pub mod syscall;
+pub mod timeconv;
 pub mod timekeep;
 pub mod timekeeping;
 pub mod timer;
-pub mod timeconv;
 /* Time structures. (Partitially taken from smoltcp)
 
 The `time` module contains structures used to represent both
@@ -21,12 +21,19 @@ absolute and relative time.
 [Instant]: struct.Instant.html
 [Duration]: struct.Duration.html
 */
+#[allow(dead_code)]
 pub const MSEC_PER_SEC: u32 = 1000;
+#[allow(dead_code)]
 pub const USEC_PER_MSEC: u32 = 1000;
+#[allow(dead_code)]
 pub const NSEC_PER_USEC: u32 = 1000;
+#[allow(dead_code)]
 pub const NSEC_PER_MSEC: u32 = 1000000;
+#[allow(dead_code)]
 pub const USEC_PER_SEC: u32 = 1000000;
+#[allow(dead_code)]
 pub const NSEC_PER_SEC: u32 = 1000000000;
+#[allow(dead_code)]
 pub const FSEC_PER_SEC: u64 = 1000000000000000;
 
 /// 表示时间的结构体，符合POSIX标准。

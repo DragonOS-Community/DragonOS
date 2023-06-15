@@ -1,14 +1,12 @@
 use core::{
     ffi::{c_int, c_longlong},
-    intrinsics::size_of,
     ptr::null_mut,
 };
 
 use crate::{
-    include::bindings::bindings::{pt_regs, verify_area},
     kdebug,
     syscall::{Syscall, SystemError},
-    time::{sleep::nanosleep, timeconv::time_to_calendar, TimeSpec},
+    time::{sleep::nanosleep, TimeSpec},
 };
 
 use super::timekeeping::do_gettimeofday;
@@ -26,7 +24,7 @@ pub struct PosixTimeval {
 #[repr(C)]
 #[derive(Default)]
 /// 当前时区信息
-pub struct PosixTimezone {
+pub struct PosixTimeZone {
     /// 格林尼治相对于当前时区相差的分钟数
     pub tz_minuteswest: c_int,
     /// DST矫正时差
@@ -34,7 +32,7 @@ pub struct PosixTimezone {
 }
 
 /// 系统时区 暂时写定为东八区
-pub const SYS_TIMEZONE: PosixTimezone = PosixTimezone {
+pub const SYS_TIMEZONE: PosixTimeZone = PosixTimeZone {
     tz_minuteswest: -480,
     tz_dsttime: 0,
 };
@@ -79,7 +77,11 @@ impl Syscall {
         return Ok(super::timer::clock() as usize);
     }
 
-    pub fn sys_do_gettimeofday(tv: *mut PosixTimeval) -> Result<usize, SystemError> {
+    pub fn gettimeofday(
+        tv: *mut PosixTimeval,
+        _timezone: &PosixTimeZone,
+    ) -> Result<usize, SystemError> {
+        // TODO; 处理时区信息
         kdebug!("enter sys_do_gettimeofday");
         if tv == null_mut() {
             return Err(SystemError::EFAULT);
@@ -91,25 +93,5 @@ impl Syscall {
         }
         kdebug!("exit sys_do_gettimeofday");
         return Ok(0);
-        // time_to_calendar(posix_time.tv_sec, 0);
     }
 }
-
-// #[no_mangle]
-// pub extern "C" fn sys_gettimeofday(regs: &pt_regs) -> u64 {
-//     if unsafe {
-//         !verify_area(regs.r8, size_of::<PosixTimeval>() as u64)
-//             || !verify_area(regs.r9, size_of::<PosixTimezone>() as u64)
-//     } {
-//         return SystemError::EPERM as u64;
-//     }
-//     let timeval = regs.r8 as *mut PosixTimeval;
-//     let mut timezone = regs.r9 as *const PosixTimezone;
-//     if !timeval.is_null() {
-//         rs_do_gettimeofday(timeval);
-//     }
-//     if !timezone.is_null() {
-//         timezone = &SYS_TIMEZONE;
-//     }
-//     return 0;
-// }

@@ -1,4 +1,4 @@
-use core::{arch::asm};
+use core::arch::asm;
 
 #[inline]
 pub fn local_irq_save() -> usize {

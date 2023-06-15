@@ -1,7 +1,7 @@
 use super::device::{
     bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
     driver::Driver,
-    Device, DeviceError, DeviceState, DeviceType, IdTable,
+    Device, DeviceError, DeviceState, DeviceType, IdTable, KObject,
 };
 use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{
@@ -262,6 +262,8 @@ impl BusDriver for LockedPlatformBusDriver {
     }
 }
 
+impl KObject for LockedPlatformBusDriver {}
+
 #[derive(Debug)]
 pub struct LockedPlatform(SpinLock<Platform>);
 
@@ -278,7 +280,7 @@ impl LockedPlatform {
     /// @return: platform总线匹配表
     #[inline]
     #[allow(dead_code)]
-    fn get_compatible_table(&self) -> CompatibleTable {
+    fn compatible_table(&self) -> CompatibleTable {
         CompatibleTable::new(vec!["platform"])
     }
 
@@ -378,6 +380,8 @@ impl Device for LockedPlatform {
 
 /// @brief: 为Platform实现Bus trait，platform总线是一种总线设备
 impl Bus for LockedPlatform {}
+
+impl KObject for LockedPlatform {}
 
 /// @brief: 初始化platform总线
 /// @parameter: None

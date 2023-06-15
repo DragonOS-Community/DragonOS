@@ -1,5 +1,5 @@
 use super::{
-    super::device::{Device, DeviceState, DeviceType},
+    super::device::{Device, DeviceState},
     platform_driver::PlatformDriver,
     CompatibleTable,
 };

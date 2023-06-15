@@ -1,4 +1,17 @@
-use crate::include::bindings::bindings::{io_in8, io_out8};
+use super::{super::base::device::Device, UartOperations};
+use crate::{
+    driver::{
+        base::{
+            device::{DeviceState, DeviceType, IdTable},
+            platform::{self, platform_device::PlatformDevice, platform_driver::PlatformDriver},
+        },
+        Driver,
+    },
+    filesystem::vfs::IndexNode,
+    include::bindings::bindings::{io_in8, io_out8},
+    libs::spinlock::SpinLock,
+};
+use alloc::sync::Arc;
 use core::{char, intrinsics::offset, str};
 
 const UART_SUCCESS: i32 = 0;
@@ -8,7 +21,7 @@ const UART_MAX_BITS_RATE: u32 = 115200;
 
 #[allow(dead_code)]
 #[repr(u16)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum UartPort {
     COM1 = 0x3f8,
     COM2 = 0x2f8,
@@ -71,7 +84,64 @@ struct UartRegister {
     reg_scartch: u8,
 }
 
+#[derive(Debug)]
+pub struct Uart {
+    port: UartPort,
+    state: DeviceState,
+    sys_info: Option<Arc<dyn IndexNode>>,
+    driver: Option<Arc<dyn PlatformDriver>>,
+}
+
+#[derive(Debug)]
+pub struct LockUart(SpinLock<Uart>);
+
+impl PlatformDevice for LockUart {
+    fn compatible_table(&self) -> platform::CompatibleTable {
+        platform::CompatibleTable::new(vec!["uart"])
+    }
+
+    fn is_initialized(&self) -> bool {
+        let state = self.0.lock().state;
+        match state {
+            DeviceState::Initialized => true,
+            _ => false,
+        }
+    }
+
+    fn set_state(&self, set_state: DeviceState) {
+        let state = &mut self.0.lock().state;
+        *state = set_state;
+    }
+
+    fn set_driver(&self, driver: Option<Arc<dyn PlatformDriver>>) {
+        self.0.lock().driver = driver;
+    }
+}
+
+impl Device for LockUart {
+    fn id_table(&self) -> IdTable {
+        IdTable::new("uart", 0)
+    }
+
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
+        self.0.lock().sys_info = sys_info;
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+        self.0.lock().sys_info.clone()
+    }
+
+    fn dev_type(&self) -> DeviceType {
+        DeviceType::Serial
+    }
+
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+        self
+    }
+}
+
 #[repr(C)]
+#[derive(Debug)]
 pub struct UartDriver {
     port: UartPort,
     baud_rate: u32,
@@ -83,6 +153,15 @@ impl Default for UartDriver {
             port: UartPort::COM1,
             baud_rate: 115200,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct LockUartDriver(SpinLock<UartDriver>);
+
+impl Driver for LockUartDriver {
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+        self
     }
 }
 
@@ -176,6 +255,33 @@ impl UartDriver {
         while UartDriver::serial_received(port) == false {} //TODO:pause
         unsafe { io_in8(port) as char }
     }
+
+    fn port() -> u16 {
+        UartPort::COM1.to_u16()
+    }
+}
+
+impl UartOperations for UartDriver {
+    fn open(baud_rate: u32) -> Result<i32, &'static str> {
+        Self::uart_init(&UartPort::from_u16(Self::port())?, baud_rate)
+    }
+
+    fn close() {}
+
+    fn start() {}
+
+    fn send(s: &str) {
+        let port = UartDriver::port();
+        while UartDriver::is_transmit_empty(port) == false {
+            for c in s.bytes() {
+                unsafe {
+                    io_out8(port, c);
+                }
+            }
+        } //TODO:pause
+    }
+
+    fn stop() {}
 }
 
 ///@brief 发送数据

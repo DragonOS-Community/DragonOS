@@ -20,6 +20,43 @@ lazy_static! {
     pub static ref DEVICE_MANAGER: Arc<LockedDeviceManager> = Arc::new(LockedDeviceManager::new());
 }
 
+pub trait KObject: Any + Send + Sync + Debug {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceNumber(usize);
+
+impl Default for DeviceNumber {
+    fn default() -> Self {
+        DeviceNumber(0)
+    }
+}
+
+impl From<usize> for DeviceNumber {
+    fn from(dev_t: usize) -> Self {
+        DeviceNumber(dev_t)
+    }
+}
+
+impl Into<usize> for DeviceNumber {
+    fn into(self) -> usize {
+        self.0
+    }
+}
+
+impl DeviceNumber {
+    pub fn major(&self) -> usize {
+        (self.0 >> 20) & 0xfff
+    }
+
+    pub fn minor(&self) -> usize {
+        self.0 & 0xfffff
+    }
+}
+
+pub fn mkdev(major: usize, minor: usize) -> DeviceNumber {
+    DeviceNumber(((major & 0xfff) << 20) | (minor & 0xfffff))
+}
+
 /// @brief: 设备类型
 #[allow(dead_code)]
 #[derive(Debug, Eq, PartialEq)]
@@ -112,7 +149,7 @@ impl From<DeviceState> for u32 {
 }
 
 /// @brief: 所有设备都应该实现该trait
-pub trait Device: Any + Send + Sync + Debug {
+pub trait Device: KObject {
     /// @brief: 本函数用于实现动态转换
     /// @parameter: None
     /// @return: any

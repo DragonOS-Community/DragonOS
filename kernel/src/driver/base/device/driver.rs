@@ -1,4 +1,4 @@
-use super::IdTable;
+use super::{IdTable, KObject};
 use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::{any::Any, fmt::Debug};
@@ -25,7 +25,7 @@ impl Into<SystemError> for DriverError {
 }
 
 /// @brief: 所有驱动驱动都应该实现该trait
-pub trait Driver: Any + Send + Sync + Debug {
+pub trait Driver: KObject {
     /// @brief: 本函数用于实现动态转换
     /// @parameter: None
     /// @return: any

@@ -199,11 +199,14 @@ impl ProcInitInfo {
 
     /// 把程序初始化信息压入用户栈中
     /// 这个函数会把参数、环境变量、auxv等信息压入用户栈中
-    /// 
+    ///
     /// ## 返回值
-    /// 
+    ///
     /// 返回值是一个元组，第一个元素是最终的用户栈顶地址，第二个元素是环境变量pointer数组的起始地址     
-    pub unsafe fn push_at(&self, ustack: &mut UserStack) -> Result<(VirtAddr, VirtAddr), SystemError> {
+    pub unsafe fn push_at(
+        &self,
+        ustack: &mut UserStack,
+    ) -> Result<(VirtAddr, VirtAddr), SystemError> {
         // 先把程序的名称压入栈中
         self.push_str(ustack, self.args[0].as_str())?;
 

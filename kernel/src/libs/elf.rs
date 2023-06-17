@@ -20,7 +20,10 @@ use crate::{
         abi::AtType,
         exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
     },
-    syscall::{SystemError, user_access::{clear_user, copy_to_user}},
+    syscall::{
+        user_access::{clear_user, copy_to_user},
+        SystemError,
+    },
 };
 
 use super::rwlock::RwLockWriteGuard;

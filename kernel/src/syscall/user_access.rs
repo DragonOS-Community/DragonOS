@@ -6,13 +6,9 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::{
-    mm::{verify_area, VirtAddr},
-};
+use crate::mm::{verify_area, VirtAddr};
 
 use super::SystemError;
-
-
 
 /// 清空用户空间指定范围内的数据
 ///
@@ -56,7 +52,6 @@ pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, Sys
 
     return Ok(dst.len());
 }
-
 
 /// 检查并从用户态拷贝一个 C 字符串。
 ///

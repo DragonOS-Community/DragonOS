@@ -120,7 +120,7 @@ pub fn arch_syscall_init() -> Result<(), SystemError> {
 }
 
 /// 临时的execve系统调用实现，以后要把它改为普通的系统调用。
-/// 
+///
 /// 现在放在这里的原因是，还没有重构中断管理模块，未实现TrapFrame这个抽象，
 /// 导致我们必须手动设置中断返回时，各个寄存器的值，这个过程很繁琐，所以暂时放在这里。
 fn tmp_rs_execve(

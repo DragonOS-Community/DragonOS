@@ -385,6 +385,7 @@ impl dyn Clocksource {
 
         // 启动watchdog线程 进行后续处理
         if unsafe { FINISHED_BOOTING.load(Ordering::Relaxed) } {
+            // TODO 在实现了工作队列后，将启动线程换成schedule work
             unsafe { run_watchdog_kthread() }
         }
         return Ok(0);

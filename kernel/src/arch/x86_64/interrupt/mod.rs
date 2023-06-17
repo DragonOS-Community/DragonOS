@@ -48,8 +48,7 @@ impl InterruptArch for X86_64InterruptArch {
 
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard {
         compiler_fence(Ordering::SeqCst);
-        let mut rflags: u64 = 0;
-        local_irq_save(&mut rflags);
+        let rflags = local_irq_save() as u64;
         let flags = IrqFlags::new(rflags);
         let guard = IrqFlagsGuard::new(flags);
         compiler_fence(Ordering::SeqCst);
@@ -58,7 +57,7 @@ impl InterruptArch for X86_64InterruptArch {
 
     unsafe fn restore_irq(flags: IrqFlags) {
         compiler_fence(Ordering::SeqCst);
-        local_irq_restore(&flags.flags());
+        local_irq_restore(flags.flags() as usize);
         compiler_fence(Ordering::SeqCst);
     }
 }

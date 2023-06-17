@@ -1,4 +1,8 @@
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::{
+    fmt::Debug,
+    intrinsics::unlikely,
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+};
 
 use alloc::{
     boxed::Box,
@@ -7,31 +11,33 @@ use alloc::{
 };
 
 use crate::{
-    arch::{
-        asm::current::current_pcb,
-        interrupt::{cli, sti},
-        sched::sched,
+    arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
+    exception::{
+        softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
+        InterruptArch,
     },
-    exception::softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
-    include::bindings::bindings::{process_control_block, process_wakeup, pt_regs, PROC_RUNNING},
+    include::bindings::bindings::{process_control_block, process_wakeup, PROC_RUNNING},
     kdebug, kerror,
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
 
+use super::timekeeping::update_wall_time;
+
 const MAX_TIMEOUT: i64 = i64::MAX;
 const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
-static mut TIMER_JIFFIES: u64 = 0;
+static TIMER_JIFFIES: AtomicU64 = AtomicU64::new(0);
 
 lazy_static! {
     pub static ref TIMER_LIST: SpinLock<LinkedList<Arc<Timer>>> = SpinLock::new(LinkedList::new());
 }
 
 /// 定时器要执行的函数的特征
-pub trait TimerFunction: Send + Sync {
-    fn run(&mut self);
+pub trait TimerFunction: Send + Sync + Debug {
+    fn run(&mut self) -> Result<(), SystemError>;
 }
 
+#[derive(Debug)]
 /// WakeUpHelper函数对应的结构体
 pub struct WakeUpHelper {
     pcb: &'static mut process_control_block,
@@ -44,13 +50,15 @@ impl WakeUpHelper {
 }
 
 impl TimerFunction for WakeUpHelper {
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), SystemError> {
         unsafe {
             process_wakeup(self.pcb);
         }
+        return Ok(());
     }
 }
 
+#[derive(Debug)]
 pub struct Timer(SpinLock<InnerTimer>);
 
 impl Timer {
@@ -97,6 +105,7 @@ impl Timer {
                 break;
             }
         }
+
         let mut temp_list: LinkedList<Arc<Timer>> = timer_list.split_off(split_pos);
         timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
         timer_list.append(&mut temp_list);
@@ -106,11 +115,18 @@ impl Timer {
 
     #[inline]
     fn run(&self) {
-        self.0.lock().timer_func.run();
+        let r = self.0.lock().timer_func.run();
+        if unlikely(r.is_err()) {
+            kerror!(
+                "Failed to run timer function: {self:?} {:?}",
+                r.err().unwrap()
+            );
+        }
     }
 }
 
 /// 定时器类型
+#[derive(Debug)]
 pub struct InnerTimer {
     /// 定时器结束时刻
     pub expire_jiffies: u64,
@@ -179,7 +195,7 @@ impl SoftirqVec for DoTimerSoftirq {
                 continue;
             }
             let timer_list_front_guard = timer_list_front_guard.unwrap();
-            if timer_list_front_guard.expire_jiffies > unsafe { TIMER_JIFFIES as u64 } {
+            if timer_list_front_guard.expire_jiffies > TIMER_JIFFIES.load(Ordering::SeqCst) {
                 drop(timer_list_front_guard);
                 timer_list.push_front(timer_list_front);
                 break;
@@ -205,11 +221,11 @@ pub fn timer_init() {
 
 /// 计算接下来n毫秒对应的定时器时间片
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
-    return unsafe { TIMER_JIFFIES as u64 } + 1000 * (expire_ms);
+    return TIMER_JIFFIES.load(Ordering::SeqCst) + 1000 * (expire_ms);
 }
 /// 计算接下来n微秒对应的定时器时间片
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
-    return unsafe { TIMER_JIFFIES as u64 } + (expire_us);
+    return TIMER_JIFFIES.load(Ordering::SeqCst) + (expire_us);
 }
 
 /// @brief 让pcb休眠timeout个jiffies
@@ -229,15 +245,17 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         return Err(SystemError::EINVAL);
     } else {
         // 禁用中断，防止在这段期间发生调度，造成死锁
-        cli();
-        timeout += unsafe { TIMER_JIFFIES } as i64;
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        timeout += TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         let timer = Timer::new(WakeUpHelper::new(current_pcb()), timeout as u64);
         timer.activate();
         current_pcb().state &= (!PROC_RUNNING) as u64;
-        sti();
+
+        drop(irq_guard);
 
         sched();
-        let time_remaining: i64 = timeout - unsafe { TIMER_JIFFIES } as i64;
+        let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {
             // 被提前唤醒，返回剩余时间
             return Ok(time_remaining);
@@ -270,19 +288,20 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
 }
 
 pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
-    unsafe { TIMER_JIFFIES += add_jiffies };
-    return unsafe { TIMER_JIFFIES };
+    let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+    update_wall_time();
+
+    compiler_fence(Ordering::SeqCst);
+    return prev + add_jiffies;
 }
+
 pub fn clock() -> u64 {
-    return unsafe { TIMER_JIFFIES };
+    return TIMER_JIFFIES.load(Ordering::SeqCst);
 }
 // ====== 重构完成后请删掉extern C ======
 #[no_mangle]
 pub extern "C" fn rs_clock() -> u64 {
-    clock()
-}
-#[no_mangle]
-pub extern "C" fn sys_clock(_regs: *const pt_regs) -> u64 {
     clock()
 }
 

@@ -15,14 +15,14 @@ pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct PosixTimeval {
     pub tv_sec: PosixTimeT,
     pub tv_usec: PosixSusecondsT,
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 /// 当前时区信息
 pub struct PosixTimeZone {
     /// 格林尼治相对于当前时区相差的分钟数

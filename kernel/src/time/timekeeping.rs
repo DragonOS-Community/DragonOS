@@ -31,7 +31,11 @@ static __ADDED_SEC: AtomicI64 = AtomicI64::new(0);
 /// timekeeper全局变量，用于管理timekeeper模块
 static mut __TIMEKEEPER: Option<Timekeeper> = None;
 
+#[derive(Debug)]
 pub struct Timekeeper(RwLock<TimekeeperData>);
+
+#[allow(dead_code)]
+#[derive(Debug)]
 pub struct TimekeeperData {
     /// 用于计时的当前时钟源。
     clock: Option<Arc<dyn Clocksource>>,

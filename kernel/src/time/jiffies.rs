@@ -21,7 +21,11 @@ pub const NSEC_PER_JIFFY: u32 = ((NSEC_PER_SEC << 8) / ACTHZ) as u32;
 pub const fn sh_div(nom: u32, den: u32, lsh: u32) -> u32 {
     (((nom) / (den)) << (lsh)) + ((((nom) % (den)) << (lsh)) + (den) / 2) / (den)
 }
+
+#[derive(Debug)]
 pub struct ClocksourceJiffies(SpinLock<InnerJiffies>);
+
+#[derive(Debug)]
 pub struct InnerJiffies {
     data: ClocksourceData,
     self_ref: Weak<ClocksourceJiffies>,
@@ -69,7 +73,7 @@ impl ClocksourceJiffies {
             watchdog_last: CycleNum(0),
         };
         let jieffies = Arc::new(ClocksourceJiffies(SpinLock::new(InnerJiffies {
-            data: data,
+            data,
             self_ref: Default::default(),
         })));
         jieffies.0.lock().self_ref = Arc::downgrade(&jieffies);
@@ -93,5 +97,4 @@ pub fn jiffies_init() {
 #[no_mangle]
 pub extern "C" fn rs_jiffies_init() {
     jiffies_init();
-    
 }

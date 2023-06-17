@@ -1,5 +1,6 @@
 use core::{
     ffi::c_void,
+    fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -74,13 +75,13 @@ impl CycleNum {
 bitflags! {
 
     #[derive(Default)]
-    pub struct ClocksourceMask:u64{
+    pub struct ClocksourceMask: u64 {
     }
     /// 时钟状态标记
     #[derive(Default)]
-    pub struct ClocksourceFlags:u64{
+    pub struct ClocksourceFlags: u64 {
         /// 表示时钟设备是连续的
-        const CLOCK_SOURCE_IS_CONTINUOUS  =0x01;
+        const CLOCK_SOURCE_IS_CONTINUOUS = 0x01;
         /// 表示该时钟源需要经过watchdog检查
         const CLOCK_SOURCE_MUST_VERIFY = 0x02;
         /// 表示该时钟源是watchdog
@@ -110,6 +111,7 @@ impl ClocksourceFlags {
     }
 }
 
+#[derive(Debug)]
 pub struct ClocksouceWatchdog {
     /// 监视器
     watchdog: Option<Arc<dyn Clocksource>>,
@@ -163,6 +165,7 @@ impl ClocksouceWatchdog {
 }
 
 /// 定时检查器
+#[derive(Debug)]
 pub struct WatchdogTimerFunc;
 impl TimerFunction for WatchdogTimerFunc {
     fn run(&mut self) -> Result<(), SystemError> {
@@ -171,7 +174,7 @@ impl TimerFunction for WatchdogTimerFunc {
 }
 
 /// 时钟源的特性
-pub trait Clocksource: Send + Sync {
+pub trait Clocksource: Send + Sync + Debug {
     // TODO 返回值类型可能需要改变
     /// returns a cycle value, passes clocksource as argument
     fn read(&self) -> CycleNum;
@@ -205,7 +208,7 @@ pub trait Clocksource: Send + Sync {
     fn clocksource(&self) -> Arc<dyn Clocksource>;
 }
 
-/// # 实现log2的运算
+/// # 实现整数log2的运算
 ///
 /// ## 参数
 ///
@@ -214,7 +217,7 @@ pub trait Clocksource: Send + Sync {
 /// ## 返回值
 ///
 /// * `u32` - 返回\log_2(x)的值
-pub fn log2(x: u32) -> u32 {
+fn log2(x: u32) -> u32 {
     let mut result = 0;
     let mut x = x;
 
@@ -550,7 +553,9 @@ pub struct ClocksourceData {
     pub flags: ClocksourceFlags,
     pub watchdog_last: CycleNum,
 }
+
 impl ClocksourceData {
+    #[allow(dead_code)]
     pub fn new(
         name: String,
         rating: i32,

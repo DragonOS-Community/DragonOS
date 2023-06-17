@@ -1,4 +1,8 @@
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
+use core::{
+    fmt::Debug,
+    intrinsics::unlikely,
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+};
 
 use alloc::{
     boxed::Box,
@@ -8,7 +12,10 @@ use alloc::{
 
 use crate::{
     arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
-    exception::{softirq::{softirq_vectors, SoftirqNumber, SoftirqVec}, InterruptArch},
+    exception::{
+        softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
+        InterruptArch,
+    },
     include::bindings::bindings::{process_control_block, process_wakeup, PROC_RUNNING},
     kdebug, kerror,
     libs::spinlock::SpinLock,
@@ -26,10 +33,11 @@ lazy_static! {
 }
 
 /// 定时器要执行的函数的特征
-pub trait TimerFunction: Send + Sync {
+pub trait TimerFunction: Send + Sync + Debug {
     fn run(&mut self) -> Result<(), SystemError>;
 }
 
+#[derive(Debug)]
 /// WakeUpHelper函数对应的结构体
 pub struct WakeUpHelper {
     pcb: &'static mut process_control_block,
@@ -50,6 +58,7 @@ impl TimerFunction for WakeUpHelper {
     }
 }
 
+#[derive(Debug)]
 pub struct Timer(SpinLock<InnerTimer>);
 
 impl Timer {
@@ -106,15 +115,18 @@ impl Timer {
 
     #[inline]
     fn run(&self) {
-        self.0
-            .lock()
-            .timer_func
-            .run()
-            .expect("Timer run: failed to run timer_func");
+        let r = self.0.lock().timer_func.run();
+        if unlikely(r.is_err()) {
+            kerror!(
+                "Failed to run timer function: {self:?} {:?}",
+                r.err().unwrap()
+            );
+        }
     }
 }
 
 /// 定时器类型
+#[derive(Debug)]
 pub struct InnerTimer {
     /// 定时器结束时刻
     pub expire_jiffies: u64,
@@ -234,7 +246,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     } else {
         // 禁用中断，防止在这段期间发生调度，造成死锁
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        
+
         timeout += TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         let timer = Timer::new(WakeUpHelper::new(current_pcb()), timeout as u64);
         timer.activate();

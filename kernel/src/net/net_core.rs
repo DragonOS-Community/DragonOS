@@ -15,12 +15,14 @@ use super::socket::{SOCKET_SET, SOCKET_WAITQUEUE};
 /// The network poll function, which will be called by timer.
 ///
 /// The main purpose of this function is to poll all network interfaces.
-struct NetWorkPollFunc();
+#[derive(Debug)]
+struct NetWorkPollFunc;
+
 impl TimerFunction for NetWorkPollFunc {
     fn run(&mut self) -> Result<(), SystemError> {
         poll_ifaces_try_lock(10).ok();
         let next_time = next_n_ms_timer_jiffies(10);
-        let timer = Timer::new(Box::new(NetWorkPollFunc()), next_time);
+        let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
         timer.activate();
         return Ok(());
     }
@@ -30,7 +32,7 @@ pub fn net_init() -> Result<(), SystemError> {
     dhcp_query()?;
     // Init poll timer function
     let next_time = next_n_ms_timer_jiffies(5);
-    let timer = Timer::new(Box::new(NetWorkPollFunc()), next_time);
+    let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
     timer.activate();
     return Ok(());
 }

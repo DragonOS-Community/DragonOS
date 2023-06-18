@@ -153,18 +153,6 @@ impl RawSpinlock {
         return false;
     }
 
-    /// @brief 尝试保存中断状态到flags中，关闭中断，并对自旋锁加锁
-    /// @return 加锁成功->true
-    ///         加锁失败->false
-    #[inline(always)]
-    pub fn try_lock_irqsave(&self, flags: &mut u64) -> bool {
-        local_irq_save(flags);
-        if self.try_lock() {
-            return true;
-        }
-        local_irq_restore(flags);
-        return false;
-    }
 }
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///

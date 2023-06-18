@@ -125,6 +125,7 @@ void apic_init_ap_core_local_apic()
     uint eax, edx;
     // 启用xAPIC 和x2APIC
     uint64_t ia32_apic_base = rdmsr(0x1b);
+    kdebug("AP Core's IA32_APIC_BASE=%#018lx", ia32_apic_base);
     ia32_apic_base |= (1 << 11);
     if (flag_support_x2apic) // 如果支持x2apic，则启用
     {
@@ -276,6 +277,7 @@ static void __local_apic_x2apic_init()
 void apic_local_apic_init()
 {
     uint64_t ia32_apic_base = rdmsr(0x1b);
+    kdebug("BSP's IA32_APIC_BASE=%#018lx", ia32_apic_base);
     // kdebug("apic base=%#018lx", (ia32_apic_base & 0x1FFFFFFFFFF000));
     // 映射Local APIC 寄存器地址
     mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, (ia32_apic_base & 0x1FFFFFFFFFFFFF), PAGE_2M_SIZE,

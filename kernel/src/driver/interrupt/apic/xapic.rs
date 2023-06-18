@@ -75,7 +75,7 @@ impl Into<u32> for LocalApicOffset {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct XApic {
-    /// xAPIC的MMIO空间起始地址
+    /// 当前xAPIC的MMIO空间起始地址。注意，每个CPU都有自己的xAPIC，所以这个地址是每个CPU都不一样的。
     map_vaddr: usize,
 }
 

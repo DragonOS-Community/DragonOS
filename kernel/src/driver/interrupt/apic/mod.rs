@@ -1,5 +1,8 @@
-use crate::kdebug;
+use crate::{kdebug, syscall::SystemError};
 
+use self::apic_timer::ApicTimerMode;
+
+pub mod apic_timer;
 pub mod ioapic;
 pub mod x2apic;
 pub mod xapic;
@@ -36,7 +39,7 @@ pub trait LocalAPIC {
 /// @brief 所有LVT寄存器的枚举类型
 #[allow(dead_code)]
 #[repr(u32)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum LVTRegister {
     /// CMCI寄存器
     ///
@@ -77,30 +80,220 @@ impl Into<u32> for LVTRegister {
 
 #[derive(Debug)]
 pub struct LVT {
+    register: LVTRegister,
     data: u32,
 }
 
 impl LVT {
-    pub fn new(vector: u8, mode: DeliveryMode, status: DeliveryStatus) {
-        // new函数还需要加入更多的形参，以便完整的设置LVT
-        todo!()
+    pub fn new(register: LVTRegister, data: u32) -> Option<Self> {
+        // vector: u8, mode: DeliveryMode, status: DeliveryStatus
+        let mut result = Self { register, data: 0 };
+        result.set_vector((data & 0xFF) as u8);
+        match result.register {
+            LVTRegister::Timer | LVTRegister::ErrorReg => {}
+            _ => {
+                result
+                    .set_delivery_mode(DeliveryMode::try_from(((data >> 8) & 0b111) as u8).ok()?)
+                    .ok()?;
+            }
+        }
+
+        if let LVTRegister::LINT0 | LVTRegister::LINT1 = result.register {
+            result.set_interrupt_input_pin_polarity((data & (1 << 13)) == 0);
+
+            if data & (1 << 15) != 0 {
+                result.set_trigger_mode(TriggerMode::Level).ok()?;
+            } else {
+                result.set_trigger_mode(TriggerMode::Edge).ok()?;
+            }
+        }
+        result.set_mask((data & (1 << 16)) != 0);
+
+        if let LVTRegister::Timer = result.register {
+            result
+                .set_timer_mode(ApicTimerMode::try_from(((data >> 17) & 0b11) as u8).ok()?)
+                .ok()?;
+        }
+
+        return Some(result);
     }
 
-    /// @brief 判断LVT结构体的值是否合法
-    pub fn validate(&self) -> Result<(), LVTError> {
-        todo!()
+    pub fn data(&self) -> u32 {
+        return self.data;
     }
-}
 
-/// @brief LVT结构体的错误
-#[derive(Debug)]
-pub enum LVTError {
-    // todo
+    pub fn register(&self) -> LVTRegister {
+        return self.register;
+    }
+
+    pub fn set_vector(&mut self, vector: u8) {
+        self.data &= !((1 << 8) - 1);
+        self.data |= vector as u32;
+    }
+
+    pub fn vector(&self) -> u8 {
+        return (self.data & 0xFF) as u8;
+    }
+
+    /// 设置中断投递模式
+    ///
+    /// Timer、ErrorReg寄存器不支持这个功能
+    ///
+    /// ## 参数
+    ///
+    /// - `mode`：投递模式
+    pub fn set_delivery_mode(&mut self, mode: DeliveryMode) -> Result<(), SystemError> {
+        match self.register {
+            LVTRegister::Timer | LVTRegister::ErrorReg => {
+                return Err(SystemError::EINVAL);
+            }
+            _ => {}
+        }
+
+        self.data &= 0xFFFF_F8FF;
+        self.data |= ((mode as u32) & 0x7) << 8;
+        return Ok(());
+    }
+
+    /// 获取中断投递模式
+    /// Timer、ErrorReg寄存器不支持这个功能
+    pub fn delivery_mode(&self) -> Option<DeliveryMode> {
+        if let LVTRegister::Timer | LVTRegister::ErrorReg = self.register {
+            return None;
+        }
+        return DeliveryMode::try_from(((self.data >> 8) & 0b111) as u8).ok();
+    }
+
+    pub fn delivery_status(&self) -> DeliveryStatus {
+        return DeliveryStatus::from(self.data);
+    }
+
+    /// 设置中断输入引脚的极性
+    ///
+    /// ## 参数
+    ///
+    /// - `high`：true表示高电平有效，false表示低电平有效
+    pub fn set_interrupt_input_pin_polarity(&mut self, high: bool) {
+        self.data &= 0xFFFF_DFFF;
+        // 0表示高电平有效，1表示低电平有效
+        if !high {
+            self.data |= 1 << 13;
+        }
+    }
+
+    /// 获取中断输入引脚的极性
+    ///
+    /// true表示高电平有效，false表示低电平有效
+    pub fn interrupt_input_pin_polarity(&self) -> bool {
+        return (self.data & (1 << 13)) == 0;
+    }
+
+    /// 设置中断输入引脚的触发模式
+    ///
+    /// 只有LINT0和LINT1寄存器支持这个功能
+    ///
+    /// ## 参数
+    ///
+    /// - `trigger_mode`：触发模式
+    pub fn set_trigger_mode(&mut self, trigger_mode: TriggerMode) -> Result<(), SystemError> {
+        match self.register {
+            LVTRegister::LINT0 | LVTRegister::LINT1 => {
+                self.data &= 0xFFFF_7FFF;
+                if trigger_mode == TriggerMode::Level {
+                    self.data |= 1 << 15;
+                }
+                return Ok(());
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        }
+    }
+
+    /// 获取中断输入引脚的触发模式
+    ///
+    /// 只有LINT0和LINT1寄存器支持这个功能
+    pub fn trigger_mode(&self) -> Option<TriggerMode> {
+        match self.register {
+            LVTRegister::LINT0 | LVTRegister::LINT1 => {
+                if self.data & (1 << 15) != 0 {
+                    return Some(TriggerMode::Level);
+                } else {
+                    return Some(TriggerMode::Edge);
+                }
+            }
+            _ => {
+                return None;
+            }
+        }
+    }
+
+    /// 设置是否屏蔽中断
+    ///
+    /// ## 参数
+    ///
+    /// - `mask`：true表示屏蔽中断，false表示不屏蔽中断
+    pub fn set_mask(&mut self, mask: bool) {
+        self.data &= 0xFFFE_FFFF;
+        if mask {
+            self.data |= 1 << 16;
+        }
+    }
+
+    /// 获取是否屏蔽中断
+    pub fn mask(&self) -> bool {
+        return (self.data & (1 << 16)) != 0;
+    }
+
+    /// 设置定时器模式
+    pub fn set_timer_mode(&mut self, mode: ApicTimerMode) -> Result<(), SystemError> {
+        match self.register {
+            LVTRegister::Timer => {
+                self.data &= 0xFFF9_FFFF;
+                match mode {
+                    ApicTimerMode::OneShot => {
+                        self.data |= 0b00 << 17;
+                    }
+                    ApicTimerMode::Periodic => {
+                        self.data |= 0b01 << 17;
+                    }
+                    ApicTimerMode::TSCDeadline => {
+                        self.data |= 0b10 << 17;
+                    }
+                }
+                return Ok(());
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        }
+    }
+
+    pub fn timer_mode(&self) -> Option<ApicTimerMode> {
+        if let LVTRegister::Timer = self.register {
+            let mode = (self.data >> 17) & 0b11;
+            match mode {
+                0b00 => {
+                    return Some(ApicTimerMode::OneShot);
+                }
+                0b01 => {
+                    return Some(ApicTimerMode::Periodic);
+                }
+                0b10 => {
+                    return Some(ApicTimerMode::TSCDeadline);
+                }
+                _ => {
+                    return None;
+                }
+            }
+        }
+        return None;
+    }
 }
 
 /// @brief
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum DeliveryMode {
     /// 由LVT寄存器的向量号区域指定中断向量号
     Fixed = 0b000,
@@ -128,6 +321,36 @@ pub enum DeliveryMode {
     ExtINT = 0b111,
 }
 
+impl TryFrom<u8> for DeliveryMode {
+    type Error = SystemError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0b000 => {
+                return Ok(DeliveryMode::Fixed);
+            }
+            0b010 => {
+                return Ok(DeliveryMode::SMI);
+            }
+            0b100 => {
+                return Ok(DeliveryMode::NMI);
+            }
+            0b101 => {
+                return Ok(DeliveryMode::INIT);
+            }
+            0b110 => {
+                return Ok(DeliveryMode::StartUp);
+            }
+            0b111 => {
+                return Ok(DeliveryMode::ExtINT);
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        }
+    }
+}
+
 /// @brief 投递状态
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -138,6 +361,24 @@ pub enum DeliveryStatus {
     /// 发送挂起状态。
     /// 此状态表明，中断源产生的请求已经投递至处理器，但尚未被处理器处理。
     SendPending = 1,
+}
+
+impl DeliveryStatus {
+    pub fn from(data: u32) -> Self {
+        if data & (1 << 12) == 0 {
+            return DeliveryStatus::Idle;
+        } else {
+            return DeliveryStatus::SendPending;
+        }
+    }
+}
+
+/// IPI Trigger Mode
+#[derive(Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum TriggerMode {
+    Edge = 0,
+    Level = 1,
 }
 
 #[no_mangle]

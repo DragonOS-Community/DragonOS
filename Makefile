@@ -79,10 +79,16 @@ write_diskimage-uefi:
 	bash -c "cd tools && bash grub_auto_install.sh && sudo bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
-	sh -c "cd tools && bash run-qemu.sh --bios=legacy && cd .."
+	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
 # 不编译，直接启动QEMU(UEFI)
 qemu-uefi:
-	sh -c "cd tools && bash run-qemu.sh --bios=uefi && cd .."
+	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=window && cd .."
+# 不编译，直接启动QEMU,使用VNC Display作为图像输出
+qemu-vnc:
+	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=vnc && cd .."
+# 不编译，直接启动QEMU(UEFI),使用VNC Display作为图像输出
+qemu-uefi-vnc:
+	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=vnc && cd .."
 	
 # 编译并写入磁盘镜像
 build:
@@ -107,9 +113,39 @@ run:
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
 
+# uefi方式启动，使用VNC Display作为图像输出
+run-uefi-vnc:
+	$(MAKE) all -j $(NPROCS)
+	$(MAKE) write_diskimage-uefi || exit 1
+	$(MAKE) qemu-uefi-vnc
+	
+# 编译并启动QEMU，使用VNC Display作为图像输出
+run-vnc:
+	$(MAKE) all -j $(NPROCS)
+	$(MAKE) write_diskimage || exit 1
+	$(MAKE) qemu-vnc
+
 # 在docker中编译，并启动QEMU
 run-docker:
 	@echo "使用docker构建并运行"
 	sudo bash tools/build_in_docker.sh || exit 1
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
+
+help:
+	@echo "编译:"
+	@echo "  make all -j <n>       - 本地编译，不运行,n为要用于编译的CPU核心数"
+	@echo "  make build            - 本地编译，并写入磁盘镜像"
+	@echo "  make docker           - Docker编译，并写入磁盘镜像"
+	@echo ""
+	@echo "编译并运行:"
+	@echo "  make run-docker       - Docker编译，写入磁盘镜像，并在QEMU中运行"
+	@echo "  make run              - 本地编译，写入磁盘镜像，并在QEMU中运行"
+	@echo "  make run-uefi         - 以uefi方式启动运行"
+	@echo ""
+	@echo "运行:"
+	@echo "  make qemu             - 不编译，直接从已有的磁盘镜像启动运行"	
+	@echo "  make qemu-uefi        - 不编译，直接从已有的磁盘镜像以UEFI启动运行"	
+	@echo ""
+	@echo ""
+	@echo "注: 对于上述的run, run-uefi, qemu, qemu-uefi命令可以在命令后加上-vnc后缀,来通过vnc连接到DragonOS, 默认会在5900端口运行vnc服务器。如：make run-vnc "

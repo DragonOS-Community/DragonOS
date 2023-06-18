@@ -17,12 +17,15 @@ congratulations()
 	echo "|-----------Congratulations!---------------|"
 	echo "|                                          |"
 	echo "|   你成功安装了DragonOS所需的依赖项!      |"
-	echo "|   您可以通过以下命令运行它:              |"
+    echo "|                                          |"
+    echo "|   请关闭当前终端, 并重新打开一个终端     |"
+	echo "|   然后通过以下命令运行:                  |"
 	echo "|                                          |"
-	echo "|   make run-docker -j 你的cpu核心数       |"
+	echo "|                make run                  |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
+
 
 ####################################
 # 当检测到ubuntu或Debian时，执行此函数 #
@@ -40,7 +43,7 @@ install_ubuntu_debian_pkg()
         gnupg \
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
-        gcc build-essential fdisk dosfstools
+        gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config
 
     if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."
@@ -120,7 +123,7 @@ rustInstall() {
 		echo "curl -sSf https://static.rust-lang.org/rustup.sh | sh -s -- --channel=nightly"
 		exit
 	else
-        echo "是否为Rust换源为Gitee镜像源？"
+        echo "是否为Rust换源为国内镜像源？(Tuna)"
 		echo "如果您在国内，我们推荐您这样做，以提升网络速度。"
 		echo "*WARNING* 这将会替换原有的镜像源设置。"
 		printf "(y/N): "
@@ -138,6 +141,7 @@ rustInstall() {
         rustup component add rust-src
         rustup component add llvm-tools-preview
 		rustup target add x86_64-unknown-none
+		cargo install dadk
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi
 }

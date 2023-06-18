@@ -2,7 +2,7 @@ user_sub_dirs = apps
 
 SUBDIR_ROOTS := . 
 DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
-GARBAGE_PATTERNS := *.o *.s~ *.s *.S~ *.c~ *.h~ sys_api_lib *.a
+GARBAGE_PATTERNS := *.o sys_api_lib *.a
 GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 
 
@@ -12,16 +12,50 @@ output_dir=$(ROOT_PATH)/bin/user
 CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs -I $(shell pwd)/libs/libc/src/include -I $(shell pwd)/libs/libc/src/include/export
 current_CFLAGS := $(CFLAGS)
 
+DADK_VERSION = $(shell dadk -V | awk 'END {print $2}')
+# 最小的DADK版本
+MIN_DADK_VERSION = 0.1.1
+DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
+
+# 旧版的libc安装路径
+OLD_LIBC_INSTALL_PATH=$(ROOT_PATH)/bin/sysroot/usr/old_libc
+
 ECHO:
 	@echo "$@"
 
-$(user_sub_dirs): ECHO sys_api_lib
+
+install_dadk:
+# 如果未安装
+ifeq ("$(DADK_VERSION)", "")
+	@echo "\ndadk is not installed."
+	@echo "Please install dadk $(MIN_DADK_VERSION) or higher version"
+	@echo "\nYou can install dadk by running the following command:"
+	@echo "\n\tcargo install dadk"
+	@echo "\nOr you can install dadk from source by running the following command:"
+	@echo "\n\tcargo install --git https://github.com/DragonOS-Community/DADK.git"
+	@echo "\n"
+	@exit 1
+else
+	@echo "dadk version $(DADK_VERSION) installed"
+endif
+
+dadk_run: install_dadk
+	mkdir -p $(DADK_CACHE_DIR)
+# 之所以在这里临时设置ARCH为空，是因为如果要设置这个环境变量，应当在DADK的配置文件中设置
+	ARCH= dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot build
+	ARCH= dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot install
+
+dadk_clean: install_dadk
+	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean
+
+$(user_sub_dirs): ECHO sys_api_lib 
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
-	
-app: $(user_sub_dirs)
 
-all: app
+app: $(user_sub_dirs)
+	$(MAKE) dadk_run 
+
+all: install_dadk app
 
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
@@ -47,15 +81,18 @@ sys_api_lib: sys_api_lib_stage_1
 
 # 打包系统库
 	mkdir -p $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp
+	mkdir -p $(OLD_LIBC_INSTALL_PATH)/include
+	mkdir -p $(OLD_LIBC_INSTALL_PATH)/lib
 	$(AR) x $(ROOT_PATH)/user/libs/libc/target/x86_64-unknown-none/release/liblibc.a --output=$(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp 
-	$(AR) crvs $(ROOT_PATH)/bin/sysroot/usr/lib/libc.a $(shell find ./libs/* -name "*.o") $(shell find $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp/* -name "*.o")
+	$(AR) crvs $(OLD_LIBC_INSTALL_PATH)/lib/libc.a $(shell find ./libs/* -name "*.o") $(shell find $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp/* -name "*.o")
 	rm -rf $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp
 # $(shell find ./libs/* -name "*.o" | xargs -I {} cp {} $(ROOT_PATH)/bin/sysroot/usr/lib/)
-	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/export/* $(ROOT_PATH)/bin/sysroot/usr/include/)
-	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/arch/x86_64/c*.o $(ROOT_PATH)/bin/sysroot/usr/lib/)
+	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/export/* $(OLD_LIBC_INSTALL_PATH)/include/)
+	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/arch/x86_64/c*.o $(OLD_LIBC_INSTALL_PATH)/lib/)
 
 clean: 
 	rm -rf $(GARBAGE)
+	$(MAKE) dadk_clean
 	$(MAKE) clean -C libs
 	@list='$(user_sub_dirs)'; for subdir in $$list; do \
 		echo "Clean in dir: $$subdir";\

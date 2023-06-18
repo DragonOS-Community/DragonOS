@@ -8,7 +8,6 @@
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 
-
 #define APIC_SUCCESS 0
 #define APIC_E_NOTFOUND 1
 
@@ -19,7 +18,7 @@
 extern uint8_t __apic_enable_state;
 #define APIC_XAPIC_ENABLED 0
 #define APIC_X2APIC_ENABLED 1
-#define CURRENT_APIC_STATE (__apic_enable_state )
+#define CURRENT_APIC_STATE (__apic_enable_state)
 
 // ======== local apic 寄存器虚拟地址偏移量表 =======
 // 0x00~0x10 Reserved.
@@ -331,4 +330,6 @@ void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, u
                          uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID);
 
 uint32_t apic_get_local_apic_id();
+void apic_write_icr(uint64_t value);
+bool apic_x2apic_enabled();
 #pragma GCC pop_options

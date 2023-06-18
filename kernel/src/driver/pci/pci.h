@@ -14,7 +14,7 @@ struct List *pci_device_structure_list = NULL;
  *
  */
 void pci_init();
-
+void rs_pci_init();
 // pci设备结构的通用标题字段
 struct pci_device_structure_header_t
 {

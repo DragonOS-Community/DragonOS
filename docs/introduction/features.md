@@ -53,9 +53,10 @@
 ### 文件系统
 
 - [x] VFS
-- [x] fat32
-- [x] devfs
-- [x] rootfs
+- [x] fat12/16/32
+- [x] Devfs
+- [x] RamFS
+- [x] procfs
 
 ### 异常及中断处理
 
@@ -103,6 +104,9 @@
 - [x] local apic定时器
 - [x] UART串口
 - [x] VBE显示
+- [x] VirtIO网卡
+- [x] x87FPU
+- [x] TTY终端
 
 ## 用户层
 

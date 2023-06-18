@@ -8,15 +8,14 @@ use crate::{
         initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, PROC_RUNNING,
     },
     kBUG,
-    libs::spinlock::RawSpinlock,
+    libs::{rbtree::RBTree, spinlock::RawSpinlock},
     smp::core::smp_get_processor_id,
 };
 
 use super::core::{sched_enqueue, Scheduler};
 
 /// 声明全局的cfs调度器实例
-
-pub static mut CFS_SCHEDULER_PTR: *mut SchedulerCFS = null_mut();
+pub static mut CFS_SCHEDULER_PTR: Option<Box<SchedulerCFS>> = None;
 
 /// @brief 获取cfs调度器实例的可变引用
 #[inline]
@@ -26,8 +25,8 @@ pub fn __get_cfs_scheduler() -> &'static mut SchedulerCFS {
 
 /// @brief 初始化cfs调度器
 pub unsafe fn sched_cfs_init() {
-    if CFS_SCHEDULER_PTR.is_null() {
-        CFS_SCHEDULER_PTR = Box::leak(Box::new(SchedulerCFS::new()));
+    if CFS_SCHEDULER_PTR.is_none() {
+        CFS_SCHEDULER_PTR = Some(Box::new(SchedulerCFS::new()));
     } else {
         kBUG!("Try to init CFS Scheduler twice.");
         panic!("Try to init CFS Scheduler twice.");
@@ -37,12 +36,12 @@ pub unsafe fn sched_cfs_init() {
 /// @brief CFS队列（per-cpu的）
 #[derive(Debug)]
 struct CFSQueue {
-    /// 当前cpu上执行的进程，剩余的时间片
+    /// 当前cpu上执行的进程剩余的时间片
     cpu_exec_proc_jiffies: i64,
     /// 队列的锁
     lock: RawSpinlock,
     /// 进程的队列
-    queue: Vec<&'static mut process_control_block>,
+    queue: RBTree<i64, &'static mut process_control_block>,
     /// 当前核心的队列专属的IDLE进程的pcb
     idle_pcb: *mut process_control_block,
 }
@@ -52,16 +51,9 @@ impl CFSQueue {
         CFSQueue {
             cpu_exec_proc_jiffies: 0,
             lock: RawSpinlock::INIT,
-            queue: Vec::new(),
+            queue: RBTree::new(),
             idle_pcb: idle_pcb,
         }
-    }
-
-    /// @brief 将进程按照虚拟运行时间的升序进行排列
-    /// todo: 换掉这个sort方法，因为它底层是归并很占内存，且时间复杂度为nlogn，（遍历然后插入的方法，时间复杂度最坏是n）
-    pub fn sort(&mut self) {
-        self.queue
-            .sort_by(|a, b| (*a).virtual_runtime.cmp(&(*b).virtual_runtime));
     }
 
     /// @brief 将pcb加入队列
@@ -74,8 +66,9 @@ impl CFSQueue {
             self.lock.unlock_irqrestore(&rflags);
             return;
         }
-        self.queue.push(pcb);
-        self.sort();
+
+        self.queue.insert(pcb.virtual_runtime, pcb);
+
         self.lock.unlock_irqrestore(&rflags);
     }
 
@@ -84,9 +77,9 @@ impl CFSQueue {
         let res: &'static mut process_control_block;
         let mut rflags = 0u64;
         self.lock.lock_irqsave(&mut rflags);
-        if self.queue.len() > 0 {
+        if !self.queue.is_empty() {
             // 队列不为空，返回下一个要执行的pcb
-            res = self.queue.pop().unwrap();
+            res = self.queue.pop_first().unwrap().1;
         } else {
             // 如果队列为空，则返回IDLE进程的pcb
             res = unsafe { self.idle_pcb.as_mut().unwrap() };
@@ -100,13 +93,13 @@ impl CFSQueue {
     /// @return Option<i64> 如果队列不为空，那么返回队列中，最小的虚拟运行时间；否则返回None
     pub fn min_vruntime(&self) -> Option<i64> {
         if !self.queue.is_empty() {
-            return Some(self.queue.first().unwrap().virtual_runtime);
+            return Some(self.queue.get_first().unwrap().1.virtual_runtime);
         } else {
             return None;
         }
     }
     /// 获取运行队列的长度
-    pub fn get_cfs_queue_size(&mut self) -> usize {
+    fn get_cfs_queue_size(&mut self) -> usize {
         return self.queue.len();
     }
 }
@@ -189,10 +182,13 @@ impl Scheduler for SchedulerCFS {
     /// 请注意，进入该函数之前，需要关中断
     fn sched(&mut self) -> Option<&'static mut process_control_block> {
         current_pcb().flags &= !(PF_NEED_SCHED as u64);
+
         let current_cpu_id = smp_get_processor_id() as usize;
 
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
+
         let proc: &'static mut process_control_block = current_cpu_queue.dequeue();
+
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果当前不是running态，或者当前进程的虚拟运行时间大于等于下一个进程的，那就需要切换。
         if (current_pcb().state & (PROC_RUNNING as u64)) == 0
@@ -221,6 +217,7 @@ impl Scheduler for SchedulerCFS {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(proc.priority, current_cpu_queue);
+                // kdebug!("cpu:{:?}",current_cpu_id);
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -228,6 +225,7 @@ impl Scheduler for SchedulerCFS {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
         return None;
     }
 

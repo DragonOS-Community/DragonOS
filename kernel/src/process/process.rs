@@ -16,7 +16,7 @@ use crate::{
         PROC_UNINTERRUPTIBLE,
     },
     libs::{casting::DowncastArc, rwlock::RwLock},
-    mm::ucontext::AddressSpace,
+    mm::ucontext::{AddressSpace, InnerAddressSpace},
     net::socket::SocketInode,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
@@ -314,11 +314,21 @@ impl process_control_block {
     }
 
     /// 释放pcb中存储的地址空间的指针
-    pub unsafe fn drop_address_space(&self) {
-        let p = self.address_space as *const RwLock<AddressSpace>;
+    pub unsafe fn drop_address_space(&mut self) {
+        let p = self.address_space as *const AddressSpace;
 
-        let p: Arc<RwLock<AddressSpace>> = Arc::from_raw(p);
+        let p: Arc<AddressSpace> = Arc::from_raw(p);
         drop(p);
+        self.address_space = null_mut();
+    }
+
+    /// 设置pcb中存储的地址空间的指针
+    ///
+    /// ## panic
+    /// 如果当前pcb已经有地址空间，那么panic
+    pub unsafe fn set_address_space(&mut self, address_space: Arc<AddressSpace>) {
+        assert!(self.address_space.is_null(), "Address space already set");
+        self.address_space = Arc::into_raw(address_space) as *mut c_void;
     }
 }
 
@@ -337,7 +347,7 @@ pub extern "C" fn process_init_files() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn rs_drop_address_space(pcb: &'static process_control_block) -> i32 {
+pub extern "C" fn rs_drop_address_space(pcb: &'static mut process_control_block) -> i32 {
     unsafe {
         pcb.drop_address_space();
     }

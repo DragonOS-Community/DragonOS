@@ -8,7 +8,7 @@ use core::{
     cmp,
     fmt::Debug,
     intrinsics::unlikely,
-    ops::{Add, Sub},
+    ops::{Add, AddAssign, Sub, SubAssign},
     ptr,
 };
 
@@ -124,6 +124,11 @@ impl VirtAddr {
             return false;
         }
     }
+
+    #[inline(always)]
+    pub fn as_ptr<T>(self) -> *mut T {
+        return self.0 as *mut T;
+    }
 }
 
 impl Add<VirtAddr> for VirtAddr {
@@ -145,11 +150,11 @@ impl Add<usize> for VirtAddr {
 }
 
 impl Sub<VirtAddr> for VirtAddr {
-    type Output = Self;
+    type Output = usize;
 
     #[inline(always)]
     fn sub(self, rhs: VirtAddr) -> Self::Output {
-        return Self(self.0 - rhs.0);
+        return self.0 - rhs.0;
     }
 }
 
@@ -159,6 +164,34 @@ impl Sub<usize> for VirtAddr {
     #[inline(always)]
     fn sub(self, rhs: usize) -> Self::Output {
         return Self(self.0 - rhs);
+    }
+}
+
+impl AddAssign<usize> for VirtAddr {
+    #[inline(always)]
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs;
+    }
+}
+
+impl AddAssign<VirtAddr> for VirtAddr {
+    #[inline(always)]
+    fn add_assign(&mut self, rhs: VirtAddr) {
+        self.0 += rhs.0;
+    }
+}
+
+impl SubAssign<usize> for VirtAddr {
+    #[inline(always)]
+    fn sub_assign(&mut self, rhs: usize) {
+        self.0 -= rhs;
+    }
+}
+
+impl SubAssign<VirtAddr> for VirtAddr {
+    #[inline(always)]
+    fn sub_assign(&mut self, rhs: VirtAddr) {
+        self.0 -= rhs.0;
     }
 }
 
@@ -239,6 +272,10 @@ pub trait MemoryManagementArch: Clone + Copy {
 
     /// 用户空间的最高地址
     const USER_END_VADDR: VirtAddr;
+    /// 用户堆的起始地址
+    const USER_BRK_START: VirtAddr;
+    /// 用户栈起始地址（向下生长，不包含该值）
+    const USER_STACK_START: VirtAddr;
 
     /// @brief 用于初始化内存管理模块与架构相关的信息。
     /// 该函数应调用其他模块的接口，生成内存区域结构体，提供给BumpAllocator使用

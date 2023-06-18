@@ -1,5 +1,6 @@
 use crate::arch::CurrentIrqArch;
 
+pub mod ipi;
 pub mod softirq;
 
 /// @brief 中断相关的操作

@@ -207,12 +207,13 @@ void HPET_enable()
     // kdebug("[HPET0] conf register after modify=%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM0_CONF))));
     // kdebug("[HPET1] conf register =%#018lx", ((*(uint64_t *)(HPET_REG_BASE + TIM1_CONF))));
 
-    kinfo("HPET0 enabled.");
-
-    __write8b(HPET_REG_BASE + GEN_CONF, 3); // 置位旧设备中断路由兼容标志位、定时器组使能标志位
-    io_mfence();
     // 注册中断
     irq_register(34, &entry, &HPET_handler, 0, &HPET_intr_controller, "HPET0");
+    io_mfence();
+    __write8b(HPET_REG_BASE + GEN_CONF, 3); // 置位旧设备中断路由兼容标志位、定时器组使能标志位
+    kinfo("HPET0 enabled.");
+
+    io_mfence();
 }
 
 int HPET_init()

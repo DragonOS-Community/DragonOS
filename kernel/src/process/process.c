@@ -775,7 +775,7 @@ int process_wakeup_immediately(struct process_control_block *pcb)
     if (pcb->cpu_id == current_pcb->cpu_id)
         sched();
     else
-        kick_cpu(pcb->cpu_id);
+        rs_kick_cpu(pcb->cpu_id);
     return 0;
 }
 
@@ -859,7 +859,8 @@ void process_exit_thread(struct process_control_block *pcb)
 int process_release_pcb(struct process_control_block *pcb)
 {
     // 释放子进程的页表
-    process_exit_mm(pcb);
+    // BUG 暂时注释process_exit_mm
+    // process_exit_mm(pcb);
     if ((pcb->flags & PF_KTHREAD)) // 释放内核线程的worker private结构体
         free_kthread_struct(pcb);
 

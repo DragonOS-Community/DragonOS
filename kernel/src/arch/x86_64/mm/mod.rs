@@ -294,9 +294,6 @@ pub fn mm_init() {
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // todo: 初始化内存管理器
 
-    // test_bump_alloc();
-    test_buddy_alloc();
-    while true {}
 
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
@@ -305,58 +302,4 @@ pub fn mm_init() {
 #[no_mangle]
 pub extern "C" fn rs_mm_init() {
     mm_init();
-}
-pub fn test_bump_alloc() {
-    let virt_offset = unsafe { BOOTSTRAP_MM_INFO.unwrap().start_brk };
-    let phy_offset = virt_2_phys(virt_offset);
-
-    let mut bump_allocator =
-        BumpAllocator::<X86_64MMArch>::new(unsafe { &PHYS_MEMORY_AREAS }, phy_offset);
-
-    // 打印offset
-    kdebug!("bump_allocator.offset(): {:b}", bump_allocator.offset());
-    // 打印前三个区域的起始地址和终止地址
-    for i in 0..3 {
-        kdebug!(
-            "area[{}]: base: {:b}, size: {:b}",
-            i,
-            bump_allocator.areas()[i].base.data(),
-            bump_allocator.areas()[i].size
-        );
-    }
-    let page = unsafe { bump_allocator.allocate(PageFrameCount::new(159)) };
-    // 打印offset
-    kdebug!("bump_allocator.offset(): {:b}", bump_allocator.offset());
-    // 获取page的内容
-    let test1 = page.unwrap().data();
-    kdebug!("page.unwrap().start_address(): {:b}", test1);
-    // 打印分配后的bump_allocator的usage
-    let test_usage1 = unsafe { bump_allocator.usage() };
-    kdebug!(
-        "bump_allocator.usage_total(): {}",
-        test_usage1.total().data()
-    );
-    // 打印分配后的bump_allocator的usage的used
-    kdebug!("bump_allocator.usage_used(): {}", test_usage1.used().data());
-    // todo!("确定大内存是否跳过");
-}
-
-pub fn test_buddy_alloc() {
-    let virt_offset = unsafe { BOOTSTRAP_MM_INFO.unwrap().start_brk };
-    let phy_offset = virt_2_phys(virt_offset);
-    kdebug!("phy_offset: {:b}", phy_offset);
-    // 将phy_offset对齐到PAGE_SIZE
-    let phy_offset = (phy_offset + (X86_64MMArch::PAGE_SIZE - 1)) & !(X86_64MMArch::PAGE_SIZE - 1);
-    kdebug!("phy_offset: {:b}", phy_offset);
-
-    let bump_allocator =
-        BumpAllocator::<X86_64MMArch>::new(unsafe { &PHYS_MEMORY_AREAS }, phy_offset);
-    // 初始化buddy_allocator
-    let mut buddy_allocator_opt =
-        unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
-    kdebug!("buddy_allocator_opt success");
-    let test_addr=unsafe { buddy_allocator_opt.allocate(PageFrameCount::new(2)) };
-    // 打印test_addr
-    kdebug!("test_addr: {:b}", test_addr.unwrap().data());
-
 }

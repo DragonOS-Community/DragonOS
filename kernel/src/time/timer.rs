@@ -105,7 +105,6 @@ impl Timer {
                 break;
             }
         }
-
         let mut temp_list: LinkedList<Arc<Timer>> = timer_list.split_off(split_pos);
         timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
         timer_list.append(&mut temp_list);

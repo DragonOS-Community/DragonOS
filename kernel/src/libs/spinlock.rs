@@ -152,6 +152,7 @@ impl RawSpinlock {
         local_irq_restore(*flags as usize);
         return false;
     }
+
 }
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///

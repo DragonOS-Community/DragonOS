@@ -148,7 +148,6 @@ void system_initialize()
 
     vfs_init();
     rs_tty_init();
-
     cpu_init();
     ps2_keyboard_init();
     // tty_init();

@@ -6,10 +6,7 @@ use core::{
 use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader, ElfBytes};
 
 use crate::{
-    arch::{
-        libs::user_access::{clear_user, copy_to_user},
-        MMArch,
-    },
+    arch::MMArch,
     current_pcb,
     io::SeekFrom,
     kerror,
@@ -23,7 +20,10 @@ use crate::{
         abi::AtType,
         exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
     },
-    syscall::SystemError,
+    syscall::{
+        user_access::{clear_user, copy_to_user},
+        SystemError,
+    },
 };
 
 use super::rwlock::RwLockWriteGuard;

@@ -21,6 +21,8 @@ use crate::{
     time::TimeSpec,
 };
 
+pub mod user_access;
+
 #[repr(i32)]
 #[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
 #[allow(dead_code, non_camel_case_types)]

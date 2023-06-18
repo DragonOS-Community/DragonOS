@@ -1,3 +1,5 @@
+use core::ptr::null;
+
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
 use crate::{
@@ -7,7 +9,7 @@ use crate::{
     },
     libs::{elf::ELF_LOADER, rwlock::RwLock},
     mm::{
-        ucontext::{AddressSpace, InnerAddressSpace},
+        ucontext::{AddressSpace, InnerAddressSpace, UserStack},
         VirtAddr,
     },
     syscall::SystemError,
@@ -178,6 +180,7 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<(), SystemError> {
     return Ok(());
 }
 
+/// 程序初始化信息，这些信息会被压入用户栈中
 #[derive(Debug)]
 pub struct ProcInitInfo {
     pub args: Vec<String>,
@@ -192,5 +195,80 @@ impl ProcInitInfo {
             envs: Vec::new(),
             auxv: BTreeMap::new(),
         }
+    }
+
+    /// 把程序初始化信息压入用户栈中
+    /// 这个函数会把参数、环境变量、auxv等信息压入用户栈中
+    ///
+    /// ## 返回值
+    ///
+    /// 返回值是一个元组，第一个元素是最终的用户栈顶地址，第二个元素是环境变量pointer数组的起始地址     
+    pub unsafe fn push_at(
+        &self,
+        ustack: &mut UserStack,
+    ) -> Result<(VirtAddr, VirtAddr), SystemError> {
+        // 先把程序的名称压入栈中
+        self.push_str(ustack, self.args[0].as_str())?;
+
+        // 然后把环境变量压入栈中
+        let envps = self
+            .envs
+            .iter()
+            .map(|s| {
+                self.push_str(ustack, s.as_str()).expect("push_str failed");
+                ustack.sp()
+            })
+            .collect::<Vec<_>>();
+
+        // 然后把参数压入栈中
+        let argps = self
+            .args
+            .iter()
+            .map(|s| {
+                self.push_str(ustack, s.as_str()).expect("push_str failed");
+                ustack.sp()
+            })
+            .collect::<Vec<_>>();
+
+        // 压入auxv
+        self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
+        for (&k, &v) in self.auxv.iter() {
+            self.push_slice(ustack, &[k as usize, v])?;
+        }
+
+        // 把环境变量指针压入栈中
+        self.push_slice(ustack, &[null::<u8>()])?;
+        self.push_slice(ustack, envps.as_slice())?;
+
+        // 把参数指针压入栈中
+        self.push_slice(ustack, &[null::<u8>()])?;
+        self.push_slice(ustack, argps.as_slice())?;
+
+        let argv_ptr = ustack.sp();
+
+        // 把argc压入栈中
+        self.push_slice(ustack, &[self.args.len()])?;
+
+        return Ok((ustack.sp(), argv_ptr));
+    }
+
+    fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {
+        let mut sp = ustack.sp();
+        sp -= slice.len() * core::mem::size_of::<T>();
+        sp -= sp.data() % core::mem::align_of::<T>();
+
+        unsafe { core::slice::from_raw_parts_mut(sp.data() as *mut T, slice.len()) }
+            .copy_from_slice(slice);
+        unsafe {
+            ustack.set_sp(sp);
+        }
+
+        return Ok(());
+    }
+
+    fn push_str(&self, ustack: &mut UserStack, s: &str) -> Result<(), SystemError> {
+        self.push_slice(ustack, &[b'\0'])?;
+        self.push_slice(ustack, s.as_bytes())?;
+        return Ok(());
     }
 }

@@ -430,13 +430,25 @@ impl InnerAddressSpace {
         self.user_stack = Some(stack);
         return Ok(());
     }
+
+    #[inline(always)]
+    pub fn user_stack_mut(&mut self) -> Option<&mut UserStack> {
+        return self.user_stack.as_mut();
+    }
+
+    /// 取消用户空间内的所有映射
+    pub unsafe fn unmap_all(&mut self) {
+        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        for vma in self.mappings.iter_vmas() {
+            vma.unmap(&mut self.user_mapper.utable, &mut flusher);
+        }
+    }
 }
 
 impl Drop for InnerAddressSpace {
     fn drop(&mut self) {
-        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
-        for vma in self.mappings.iter_vmas() {
-            vma.unmap(&mut self.user_mapper.utable, &mut flusher);
+        unsafe {
+            self.unmap_all();
         }
     }
 }
@@ -1096,7 +1108,7 @@ impl UserStack {
         vm: &mut InnerAddressSpace,
         mut bytes: usize,
     ) -> Result<(), SystemError> {
-        let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+        let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
         let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
 
         bytes = page_align_up(bytes);

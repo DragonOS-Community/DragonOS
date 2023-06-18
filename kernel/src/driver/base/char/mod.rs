@@ -1,3 +1,4 @@
+use core::cmp::Ordering;
 use alloc::{sync::Arc, vec::Vec};
 use crate::{
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -105,39 +106,27 @@ pub fn register_chrdev_region(
     if major == 0 {
         return alloc_chrdev_region(count, name, char);
     }
-    let mut map: SpinLockGuard<ChrDevs> = CHRDEVS.0.lock();
-    match map.0.get_mut(major % 255) {
-        Some(value) => {
-            if value.is_empty() {
-                // 主设备号还未注册任何设备，创建次设备实例
-                let chrdev: CharDeviceStruct =
-                    CharDeviceStruct::new(mkdev(major, 0), count, name, char);
-                value.push(chrdev);
-                return Ok(mkdev(major, 0));
-            } else {
-                for (index, char) in value {
-                    if char.major() > major { // 找到了主设备号大于major的主设备
-                        // 获取属于major最后的次设备号
-                        let minor = value[index - 1].final_minor();
-                        // 创建管理字符设备实例
-                        let chrdev: CharDeviceStruct =
-                            CharDeviceStruct::new(mkdev(major, minor), count, name, char);
-                        value.insert(index, chrdev);
-                        return Ok(mkdev(major, minor));
+    let mut minor: usize = 0;
+    if let Some(mut vector) = CHRDEVS.0.lock().0.get_mut(major % 255) {
+        for (index, dev) in vector {
+            match dev.major().cmp(&major) {
+                Ordering::Greater => { // 如果找到大于该设备号的主设备号设备
+                    if index != 0 { // 如果不是第一个设备
+                        let prev = vector.get(index - 1).ok_or(SystemError::EPERM).unwrap();
+                        if prev.major() == major { // 如果前一个设备主设备号与注册的主设备号相同，则向后添加次设备
+                            minor = prev.final_minor(); // 获取插入位置
+                        }
                     }
-                    if index == value.len() - 1 { // 该主设备号为最大
-                        // 创建管理字符设备实例
-                        let chrdev: CharDeviceStruct =
-                            CharDeviceStruct::new(mkdev(major, 0), count, name, char);
-                        value.push(chrdev);
-                        return Ok(mkdev(major, 0));
-                    }
+                    // 如果是第一个设备或者该主设备号还未注册，次设备号从0开始，如果不是，则从最后的次设备号开始
+                    vector.insert(index, CharDeviceStruct::new(mkdev(major, minor), count, name, char));
+                    return Ok(mkdev(major, minor));
                 }
+                _ => {}
             }
         }
-        None => {      
-            return Err(SystemError::EPERM);
-        }
+        // 如果没有找到大于该主设备号的主设备或者该数组上没有任何设备，直接向后插入，次设备号从0开始
+        vector.push_back(CharDeviceStruct::new(mkdev(major, minor), count, name, char));
+        return Ok(mkdev(major, minor));
     }
 }
 

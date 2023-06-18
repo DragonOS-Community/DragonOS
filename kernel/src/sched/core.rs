@@ -1,17 +1,14 @@
 use core::sync::atomic::compiler_fence;
 
 use crate::{
-    arch::asm::{current::current_pcb, ptrace::user_mode},
-    arch::{
-        context::switch_process,
-        interrupt::{cli, sti},
-    },
+    arch::asm::current::current_pcb,
     include::bindings::bindings::smp_get_total_cpu,
     include::bindings::bindings::{
-        process_control_block, pt_regs, EINVAL, EPERM, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING,
-        SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
+        process_control_block, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING, SCHED_FIFO,
+        SCHED_NORMAL, SCHED_RR,
     },
-    process::process::process_cpu
+    process::process::process_cpu,
+    syscall::SystemError,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
@@ -74,7 +71,7 @@ pub trait Scheduler {
     fn enqueue(&mut self, pcb: &'static mut process_control_block);
 }
 
-fn __sched() -> Option<&'static mut process_control_block> {
+pub fn do_sched() -> Option<&'static mut process_control_block> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
@@ -167,25 +164,6 @@ pub extern "C" fn sched_update_jiffies() {
     }
 }
 
-/// @brief 让系统立即运行调度器的系统调用
-/// 请注意，该系统调用不能由ring3的程序发起
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn sys_sched(regs: &'static mut pt_regs) -> u64 {
-    cli();
-    // 进行权限校验，拒绝用户态发起调度
-    if user_mode(regs) {
-        return (-(EPERM as i64)) as u64;
-    }
-    // 根据调度结果统一进行切换
-    let pcb = __sched();
-    if pcb.is_some() {
-        switch_process(current_pcb(), pcb.unwrap());
-    }
-    sti();
-    return 0;
-}
-
 #[allow(dead_code)]
 #[no_mangle]
 pub extern "C" fn sched_set_cpu_idle(cpu_id: usize, pcb: *mut process_control_block) {
@@ -204,7 +182,7 @@ pub extern "C" fn sched_migrate_process(
 ) -> i32 {
     if target > MAX_CPU_NUM.try_into().unwrap() {
         // panic!("sched_migrate_process: target > MAX_CPU_NUM");
-        return -(EINVAL as i32);
+        return SystemError::EINVAL.to_posix_errno();
     }
 
     pcb.flags |= PF_NEED_MIGRATE as u64;

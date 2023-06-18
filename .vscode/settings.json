@@ -172,10 +172,15 @@
         "cmd.h": "c",
         "user_namespace.h": "c",
         "sleep.h": "c",
-        "net.h": "c"
+        "net.h": "c",
+        "lz4.h": "c",
+        "cmd_test.h": "c"
     },
-    "C_Cpp.errorSquiggles": "Enabled",
+    "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",
     "rust-analyzer.cargo.target": "x86_64-unknown-none",
-    "rust-analyzer.checkOnSave.allTargets": false
+    "rust-analyzer.checkOnSave.allTargets": false,
+    "rust-analyzer.linkedProjects": [
+        "./kernel/Cargo.toml"
+    ]
 }

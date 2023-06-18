@@ -1,13 +1,8 @@
 
-all: timer.o sleep.o
-
 CFLAGS += -I .
 
-timer.o: timer.c
-	$(CC) $(CFLAGS) -c timer.c -o timer.o
 
-sleep.o: sleep.c
-	$(CC) $(CFLAGS) -c sleep.c -o sleep.o
+all: clocksource.o
 
-clean:
-	echo "Done."
+clocksource.o: clocksource.c
+	$(CC) $(CFLAGS) -c clocksource.c -o clocksource.o

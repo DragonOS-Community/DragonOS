@@ -122,6 +122,10 @@ void swab(void *restrict src, void *restrict dest, ssize_t nbytes);
 
 pid_t getpid(void);
 
+int dup(int fd);
+
+int dup2(int ofd, int nfd);
+
 #if defined(__cplusplus) 
 }  /* extern "C" */ 
 #endif

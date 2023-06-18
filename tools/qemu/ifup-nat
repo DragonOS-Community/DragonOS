@@ -1,0 +1,85 @@
+#!/bin/bash
+# 设置 bridge 名称
+BRIDGE=dragonos-bridge
+# 设置网络信息
+NETWORK=192.168.137.0
+NETMASK=255.255.255.0
+GATEWAY=192.168.137.1
+DHCPRANGE=192.168.137.100,192.168.137.200
+# 启用PXE支持的可选参数
+TFTPROOT=
+BOOTP=
+
+function check_bridge()
+{
+        if brctl show | grep "^$BRIDGE" &> /dev/null; then
+                return 1
+        else
+                return 0
+        fi
+}
+
+function create_bridge()
+{
+        brctl addbr "$BRIDGE"
+        brctl stp "$BRIDGE" on
+        brctl setfd "$BRIDGE" 0
+        ifconfig "$BRIDGE" "$GATEWAY" netmask "$NETMASK" up
+}
+
+function enable_ip_forward()
+{
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+}
+
+function add_filter_rules()
+{
+        iptables -t nat -A POSTROUTING -s "$NETWORK"/"$NETMASK" \
+                ! -d "$NETWORK"/"$NETMASK" -j MASQUERADE
+}
+
+function start_dnsmasq()
+{
+# 禁止重复运行dnsmasq
+        ps -ef | grep "dnsmasq" | grep -v "grep" &> /dev/null
+        if [ $? -eq 0 ]; then
+                echo "dnsmasq 已经在运行"
+                return 1
+        fi
+        dnsmasq \
+                --strict-order \
+                --except-interface=lo \
+                --interface=$BRIDGE \
+                --listen-address=$GATEWAY \
+                --bind-interfaces \
+                --dhcp-range=$DHCPRANGE \
+                --conf-file="" \
+                --pid-file=/var/run/qemu-dhcp-$BRIDGE.pid \
+                --dhcp-leasefile=/var/run/qemu-dhcp-$BRIDGE.leases \
+                --dhcp-no-override \
+                ${TFTPROOT:+"--enable-tftp"} \
+                ${TFTPROOT:+"--tftp-root=$TFTPROOT"} \
+                ${BOOTP:+"--dhcp-boot=$BOOTP"}
+}
+
+function setup_bridge_nat()
+{
+        check_bridge "$BRIDGE"
+        if [ $? -eq 0 ]; then
+                create_bridge
+        fi
+        enable_ip_forward
+        add_filter_rules "$BRIDGE"
+        start_dnsmasq "$BRIDGE"
+}
+
+# 安装前需要检查$1参数
+if [ -n "$1" ]; then
+        setup_bridge_nat
+        brctl addif "$BRIDGE" "$1"
+        ifconfig "$1" 0.0.0.0 up
+        exit 0
+else
+        echo "发现错误：没有指定接口"
+        exit 1
+fi

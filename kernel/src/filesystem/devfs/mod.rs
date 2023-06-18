@@ -4,12 +4,13 @@ pub mod zero_dev;
 
 use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
-    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus, file::FileMode,
+    file::FileMode,
+    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
 };
 use crate::{
-    include::bindings::bindings::{EEXIST, EISDIR, ENOENT, ENOTDIR, ENOTSUP},
-    kdebug, kerror,
+    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
+    syscall::SystemError,
     time::TimeSpec,
 };
 use alloc::{
@@ -94,9 +95,14 @@ impl DevFS {
     ///
     /// @param name 设备名称
     /// @param device 设备节点的结构体
-    pub fn register_device<T: DeviceINode>(&self, name: &str, device: Arc<T>) -> Result<(), i32> {
+    pub fn register_device<T: DeviceINode>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
-        match device.metadata().unwrap().file_type {
+        let metadata = device.metadata()?;
+        match metadata.file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
                 if let Err(_) = dev_root_inode.find("char") {
@@ -108,8 +114,13 @@ impl DevFS {
                     .as_any_ref()
                     .downcast_ref::<LockedDevFSInode>()
                     .unwrap();
-
+                // 在 /dev/char 下创建设备节点
                 dev_char_inode.add_dev(name, device.clone())?;
+
+                // 特殊处理 tty 设备，挂载在 /dev 下
+                if name.starts_with("tty") && name.len() > 3 {
+                    dev_root_inode.add_dev(name, device.clone())?;
+                }
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
             FileType::BlockDevice => {
@@ -127,7 +138,7 @@ impl DevFS {
                 device.set_fs(dev_block_inode.0.lock().fs.clone());
             }
             _ => {
-                return Err(-(ENOTSUP as i32));
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
         }
 
@@ -135,13 +146,17 @@ impl DevFS {
     }
 
     /// @brief 卸载设备
-    pub fn unregister_device<T: DeviceINode>(&self, name: &str, device: Arc<T>) -> Result<(), i32> {
+    pub fn unregister_device<T: DeviceINode>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
         match device.metadata().unwrap().file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
                 if let Err(_) = dev_root_inode.find("char") {
-                    return Err(-(ENOENT as i32));
+                    return Err(SystemError::ENOENT);
                 }
 
                 let any_char_inode = dev_root_inode.find("char")?;
@@ -154,7 +169,7 @@ impl DevFS {
             }
             FileType::BlockDevice => {
                 if let Err(_) = dev_root_inode.find("block") {
-                    return Err(-(ENOENT as i32));
+                    return Err(SystemError::ENOENT);
                 }
 
                 let any_block_inode = dev_root_inode.find("block")?;
@@ -166,7 +181,7 @@ impl DevFS {
                 dev_block_inode.remove(name)?;
             }
             _ => {
-                return Err(-(ENOTSUP as i32));
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
         }
 
@@ -230,11 +245,11 @@ impl DevFSInode {
 }
 
 impl LockedDevFSInode {
-    pub fn add_dir(&self, name: &str) -> Result<(), i32> {
-        let guard:SpinLockGuard<DevFSInode> = self.0.lock();
+    pub fn add_dir(&self, name: &str) -> Result<(), SystemError> {
+        let guard: SpinLockGuard<DevFSInode> = self.0.lock();
 
         if guard.children.contains_key(name) {
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         }
 
         match self.do_create_with_data(guard, name, FileType::Dir, 0o755 as u32, 0) {
@@ -247,40 +262,44 @@ impl LockedDevFSInode {
         return Ok(());
     }
 
-    pub fn add_dev(&self, name: &str, dev: Arc<dyn IndexNode>) -> Result<(), i32> {
+    pub fn add_dev(&self, name: &str, dev: Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let mut this = self.0.lock();
 
         if this.children.contains_key(name) {
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         }
 
         this.children.insert(name.to_string(), dev);
         return Ok(());
     }
 
-    pub fn remove(&self, name: &str) -> Result<(), i32> {
+    pub fn remove(&self, name: &str) -> Result<(), SystemError> {
         let x = self
             .0
             .lock()
             .children
             .remove(name)
-            .ok_or(-(ENOENT as i32))?;
+            .ok_or(SystemError::ENOENT)?;
 
         drop(x);
         return Ok(());
     }
 
-    fn do_create_with_data(&self, mut guard: SpinLockGuard<DevFSInode>,_name: &str,
+    fn do_create_with_data(
+        &self,
+        mut guard: SpinLockGuard<DevFSInode>,
+        _name: &str,
         _file_type: FileType,
         _mode: u32,
-        _data: usize,) -> Result<Arc<dyn IndexNode>, i32>{
+        _data: usize,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if guard.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         // 如果有重名的，则返回
         if guard.children.contains_key(_name) {
-            return Err(-(EEXIST as i32));
+            return Err(SystemError::EEXIST);
         }
 
         // 创建inode
@@ -313,7 +332,6 @@ impl LockedDevFSInode {
         // 将子inode插入父inode的B树中
         guard.children.insert(String::from(_name), result.clone());
         return Ok(result);
-
     }
 }
 
@@ -322,44 +340,48 @@ impl IndexNode for LockedDevFSInode {
         self
     }
 
-    fn open(&self, _data: &mut super::vfs::FilePrivateData, _mode: &FileMode) -> Result<(), i32> {
+    fn open(
+        &self,
+        _data: &mut super::vfs::FilePrivateData,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), i32> {
+    fn close(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), SystemError> {
         return Ok(());
     }
-    
+
     fn create_with_data(
         &self,
         name: &str,
         file_type: FileType,
         mode: u32,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, i32> {
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
-        let guard:SpinLockGuard<DevFSInode> = self.0.lock();
+        let guard: SpinLockGuard<DevFSInode> = self.0.lock();
         // 如果当前inode不是文件夹，则返回
         return self.do_create_with_data(guard, name, file_type, mode, data);
     }
 
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, i32> {
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inode = self.0.lock();
 
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         match name {
             "" | "." => {
-                return Ok(inode.self_ref.upgrade().ok_or(-(ENOENT as i32))?);
+                return Ok(inode.self_ref.upgrade().ok_or(SystemError::ENOENT)?);
             }
             ".." => {
-                return Ok(inode.parent.upgrade().ok_or(-(ENOENT as i32))?);
+                return Ok(inode.parent.upgrade().ok_or(SystemError::ENOENT)?);
             }
             name => {
                 // 在子目录项中查找
-                return Ok(inode.children.get(name).ok_or(-(ENOENT as i32))?.clone());
+                return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
             }
         }
     }
@@ -368,10 +390,10 @@ impl IndexNode for LockedDevFSInode {
         return self.0.lock().fs.upgrade().unwrap();
     }
 
-    fn get_entry_name(&self, ino: super::vfs::InodeId) -> Result<String, i32> {
+    fn get_entry_name(&self, ino: super::vfs::InodeId) -> Result<String, SystemError> {
         let inode: SpinLockGuard<DevFSInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         match ino {
@@ -392,7 +414,7 @@ impl IndexNode for LockedDevFSInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(-(ENOENT as i32));}
+                    0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
                     _ => panic!("Devfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                 }
@@ -400,14 +422,14 @@ impl IndexNode for LockedDevFSInode {
         }
     }
 
-    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, i32> {
-        Err(-(ENOTSUP as i32))
+    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
-    fn list(&self) -> Result<Vec<String>, i32> {
+    fn list(&self) -> Result<Vec<String>, SystemError> {
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
-            return Err(-(ENOTDIR as i32));
+            return Err(SystemError::ENOTDIR);
         }
 
         let mut keys: Vec<String> = Vec::new();
@@ -418,11 +440,11 @@ impl IndexNode for LockedDevFSInode {
         return Ok(keys);
     }
 
-    fn metadata(&self) -> Result<Metadata, i32> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), i32> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -434,18 +456,16 @@ impl IndexNode for LockedDevFSInode {
         return Ok(());
     }
 
-    fn poll(&self) -> Result<super::vfs::PollStatus, i32> {
+    fn poll(&self) -> Result<super::vfs::PollStatus, SystemError> {
         // 加锁
         let inode: SpinLockGuard<DevFSInode> = self.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
-            return Err(-(EISDIR as i32));
+            return Err(SystemError::EISDIR);
         }
 
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
-        });
+        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -455,8 +475,9 @@ impl IndexNode for LockedDevFSInode {
         _len: usize,
         _buf: &mut [u8],
         _data: &mut super::vfs::file::FilePrivateData,
-    ) -> Result<usize, i32> {
-        Err(-(ENOTSUP as i32))
+    ) -> Result<usize, SystemError> {
+        kerror!("DevFS: read_at is not supported!");
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -466,8 +487,8 @@ impl IndexNode for LockedDevFSInode {
         _len: usize,
         _buf: &[u8],
         _data: &mut super::vfs::file::FilePrivateData,
-    ) -> Result<usize, i32> {
-        Err(-(ENOTSUP as i32))
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 }
 
@@ -480,10 +501,10 @@ pub trait DeviceINode: IndexNode {
 /// @brief 获取devfs实例的强类型不可变引用
 macro_rules! devfs_exact_ref {
     () => {{
-        let devfs_inode: Result<Arc<dyn IndexNode>, i32> = ROOT_INODE().find("dev");
+        let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().find("dev");
         if let Err(e) = devfs_inode {
-            kerror!("failed to get DevFS ref. errcode = {e}");
-            return Err(-(ENOENT as i32));
+            kerror!("failed to get DevFS ref. errcode = {:?}", e);
+            return Err(SystemError::ENOENT);
         }
 
         let binding = devfs_inode.unwrap();
@@ -499,12 +520,12 @@ macro_rules! devfs_exact_ref {
     .unwrap()};
 }
 /// @brief devfs的设备注册函数
-pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), i32> {
+pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
     return devfs_exact_ref!().register_device(name, device);
 }
 
 /// @brief devfs的设备卸载函数
 #[allow(dead_code)]
-pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), i32> {
+pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
     return devfs_exact_ref!().unregister_device(name, device);
 }

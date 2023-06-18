@@ -14,7 +14,7 @@ use crate::syscall::SystemError;
 /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
 #[inline]
 pub fn spin_lock_irqsave(lock: *mut spinlock_t, flags: &mut u64) {
-    local_irq_save(flags);
+    *flags = local_irq_save() as u64;
     unsafe {
         spin_lock(lock);
     }
@@ -27,7 +27,7 @@ pub fn spin_unlock_irqrestore(lock: *mut spinlock_t, flags: &u64) {
         spin_unlock(lock);
     }
     // kdebug!("123");
-    local_irq_restore(flags);
+    local_irq_restore(*flags as usize);
 }
 
 /// 判断一个自旋锁是否已经被加锁
@@ -130,14 +130,27 @@ impl RawSpinlock {
 
     /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
     pub fn lock_irqsave(&self, flags: &mut u64) {
-        local_irq_save(flags);
+        *flags = local_irq_save() as u64;
         self.lock();
     }
 
     /// @brief 恢复rflags以及中断状态并解锁自旋锁
     pub fn unlock_irqrestore(&self, flags: &u64) {
         self.unlock();
-        local_irq_restore(flags);
+        local_irq_restore(*flags as usize);
+    }
+
+    /// @brief 尝试保存中断状态到flags中，关闭中断，并对自旋锁加锁
+    /// @return 加锁成功->true
+    ///         加锁失败->false
+    #[inline(always)]
+    pub fn try_lock_irqsave(&self, flags: &mut u64) -> bool {
+        *flags = local_irq_save() as u64;
+        if self.try_lock() {
+            return true;
+        }
+        local_irq_restore(*flags as usize);
+        return false;
     }
 
     /// @brief 尝试保存中断状态到flags中，关闭中断，并对自旋锁加锁

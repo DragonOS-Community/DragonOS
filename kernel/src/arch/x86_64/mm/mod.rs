@@ -1,18 +1,18 @@
 pub mod barrier;
 pub mod frame;
-use crate::arch::mm::mem::transmute;
 use crate::arch::mm::frame::FRAME_ALLOCATOR;
+use crate::arch::mm::mem::transmute;
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
     multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block, BLACK,
     GREEN,
 };
 use crate::libs::printk::PrintkWriter;
-use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::PageEntry;
-use crate::mm::allocator::buddy::{BuddyAllocator};
+use crate::mm::allocator::buddy::BuddyAllocator;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
+use crate::mm::kernel_mapper::KernelMapper;
+use crate::mm::page::PageEntry;
 use crate::mm::{
     virt_2_phys, MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr,
 };
@@ -293,7 +293,6 @@ pub fn mm_init() {
     kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // todo: 初始化内存管理器
-
 
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();

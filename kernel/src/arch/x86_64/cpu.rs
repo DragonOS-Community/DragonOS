@@ -15,3 +15,10 @@ pub fn cpu_relax() {
         asm!("pause");
     }
 }
+
+/// 重置cpu
+pub fn cpu_reset() -> ! {
+    // 重启计算机
+    unsafe { x86::io::outb(0x64, 0xfe) };
+    loop {}
+}

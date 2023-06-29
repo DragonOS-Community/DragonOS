@@ -1411,9 +1411,7 @@ impl IndexNode for LockedFATInode {
             return Err(SystemError::EISDIR);
         }
 
-        return Ok(PollStatus {
-            flags: PollStatus::READ_MASK | PollStatus::WRITE_MASK,
-        });
+        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn create(

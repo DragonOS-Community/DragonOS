@@ -169,5 +169,9 @@ macro_rules! volwrite {
         VolatileWritable::vwrite(core::ptr::addr_of_mut!((*$nonnull.as_ptr()).$field), $value)
     };
 }
+
+
+use core::ptr::NonNull;
+
 pub(crate) use volread;
 pub(crate) use volwrite;

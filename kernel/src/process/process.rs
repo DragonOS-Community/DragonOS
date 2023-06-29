@@ -3,18 +3,20 @@ use core::{
     ptr::{null_mut, read_volatile, write_volatile},
 };
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
     arch::{asm::current::current_pcb, fpu::FpState},
     filesystem::vfs::{
         file::{File, FileDescriptorVec, FileMode},
-        ROOT_INODE,
+        FileType, ROOT_INODE,
     },
     include::bindings::bindings::{
         process_control_block, CLONE_FS, PROC_INTERRUPTIBLE, PROC_RUNNING, PROC_STOPPED,
         PROC_UNINTERRUPTIBLE,
     },
+    libs::casting::DowncastArc,
+    net::socket::SocketInode,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
     syscall::SystemError,
@@ -290,6 +292,24 @@ impl process_control_block {
     #[allow(dead_code)]
     pub unsafe fn mark_sleep_uninterruptible(&mut self) {
         self.state = PROC_UNINTERRUPTIBLE as u64;
+    }
+
+    /// @brief 根据文件描述符序号，获取socket对象的可变引用
+    ///
+    /// @param fd 文件描述符序号
+    ///
+    /// @return Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
+    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
+        let f = self.get_file_mut_by_fd(fd)?;
+
+        if f.file_type() != FileType::Socket {
+            return None;
+        }
+        let socket: Arc<SocketInode> = f
+            .inode()
+            .downcast_arc::<SocketInode>()
+            .expect("Not a socket inode");
+        return Some(socket);
     }
 }
 

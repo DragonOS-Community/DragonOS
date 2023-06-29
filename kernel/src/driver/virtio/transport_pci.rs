@@ -6,7 +6,8 @@ use crate::driver::pci::pci::{
 };
 
 use crate::libs::volatile::{
-    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
+    volread, volwrite, ReadOnly, Volatile, VolatileReadable,
+    VolatileWritable, WriteOnly,
 };
 use core::{
     fmt::{self, Display, Formatter},
@@ -109,7 +110,7 @@ impl PciTransport {
         let mut notify_off_multiplier = 0;
         let mut isr_cfg = None;
         let mut device_cfg = None;
-        device.bar_init().unwrap()?;
+        device.bar_ioremap().unwrap()?;
         device.enable_master();
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
         for capability in device.capabilities().unwrap() {
@@ -487,7 +488,7 @@ fn get_bar_region<T>(
     Ok(vaddr.cast())
 }
 
-/// @brief 获取虚拟地址并将其转化为对应类型的
+/// @brief 获取虚拟地址并将其转化为对应类型的切片的指针
 /// @param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息切片的指针
 /// @return Result<NonNull<[T]>, VirtioPciError> 成功则返回对应类型的指针切片，失败则返回Error
 fn get_bar_region_slice<T>(

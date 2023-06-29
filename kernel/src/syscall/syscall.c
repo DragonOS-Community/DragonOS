@@ -13,92 +13,12 @@
 // 导出系统调用入口函数，定义在entry.S中
 extern void syscall_int(void);
 
-extern uint64_t sys_clock(struct pt_regs *regs);
-extern uint64_t sys_mstat(struct pt_regs *regs);
-extern uint64_t sys_open(struct pt_regs *regs);
-extern uint64_t sys_unlink_at(struct pt_regs *regs);
-extern uint64_t sys_kill(struct pt_regs *regs);
-extern uint64_t sys_sigaction(struct pt_regs *regs);
-extern uint64_t sys_rt_sigreturn(struct pt_regs *regs);
-extern uint64_t sys_getpid(struct pt_regs *regs);
-extern uint64_t sys_sched(struct pt_regs *regs);
-
-/**
- * @brief 关闭文件系统调用
- *
- * @param fd_num 文件描述符号
- *
- * @param regs
- * @return uint64_t
- */
-extern uint64_t sys_close(struct pt_regs *regs);
-
-/**
- * @brief 从文件中读取数据
- *
- * @param fd_num regs->r8 文件描述符号
- * @param buf regs->r9 输出缓冲区
- * @param count regs->r10 要读取的字节数
- *
- * @return uint64_t
- */
-extern uint64_t sys_read(struct pt_regs *regs);
-
-/**
- * @brief 向文件写入数据
- *
- * @param fd_num regs->r8 文件描述符号
- * @param buf regs->r9 输入缓冲区
- * @param count regs->r10 要写入的字节数
- *
- * @return uint64_t
- */
-extern uint64_t sys_write(struct pt_regs *regs);
-
-/**
- * @brief 调整文件的访问位置
- *
- * @param fd_num 文件描述符号
- * @param offset 偏移量
- * @param whence 调整模式
- * @return uint64_t 调整结束后的文件访问位置
- */
-extern uint64_t sys_lseek(struct pt_regs *regs);
-
-/**
- * @brief 导出系统调用处理函数的符号
- *
- */
-
-/**
- * @brief 系统调用不存在时的处理函数
- *
- * @param regs 进程3特权级下的寄存器
- * @return ul
- */
-ul system_call_not_exists(struct pt_regs *regs)
-{
-    kerror("System call [ ID #%d ] not exists.", regs->rax);
-    return ESYSCALL_NOT_EXISTS;
-} // 取消前述宏定义
-
 /**
  * @brief 重新定义为：把系统调用函数加入系统调用表
  * @param syscall_num 系统调用号
  * @param symbol 系统调用处理函数
  */
 #define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
-
-/**
- * @brief 初始化系统调用模块
- *
- */
-void syscall_init()
-{
-    kinfo("Initializing syscall...");
-
-    set_system_trap_gate(0x80, 0, syscall_int); // 系统调用门
-}
 
 /**
  * @brief 通过中断进入系统调用
@@ -146,42 +66,29 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
  * @param arg2 背景色
  * @return ul 返回值
  */
-ul sys_put_string(struct pt_regs *regs)
+ul do_put_string(char *s, uint32_t front_color, uint32_t background_color)
 {
 
-    printk_color(regs->r9, regs->r10, (char *)regs->r8);
-    // printk_color(BLACK, WHITE, (char *)regs->r8);
-
+    printk_color(front_color, background_color, s);
     return 0;
-}
-
-uint64_t sys_fork(struct pt_regs *regs)
-{
-    return do_fork(regs, 0, regs->rsp, 0);
-}
-uint64_t sys_vfork(struct pt_regs *regs)
-{
-    return do_fork(regs, CLONE_VM | CLONE_FS | CLONE_SIGNAL, regs->rsp, 0);
 }
 
 /**
  * @brief 将堆内存调整为arg0
  *
  * @param arg0 新的堆区域的结束地址
- * arg0=-1  ===> 返回堆区域的起始地址
- * arg0=-2  ===> 返回堆区域的结束地址
  * @return uint64_t 错误码
  *
  */
-uint64_t sys_brk(struct pt_regs *regs)
+uint64_t sys_do_brk(uint64_t newaddr)
 {
-    uint64_t new_brk = PAGE_2M_ALIGN(regs->r8);
+    uint64_t new_brk = PAGE_2M_ALIGN(newaddr);
     // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx
     // current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
     struct mm_struct *mm = current_pcb->mm;
-    if (new_brk < mm->brk_start || new_brk> new_brk >= current_pcb->addr_limit)
+    if (new_brk < mm->brk_start || new_brk > new_brk >= current_pcb->addr_limit)
         return mm->brk_end;
-    
+
     if (mm->brk_end == new_brk)
         return new_brk;
 
@@ -200,16 +107,16 @@ uint64_t sys_brk(struct pt_regs *regs)
 /**
  * @brief 将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
  *
- * @param arg0 offset偏移量
+ * @param incr offset偏移量
  * @return uint64_t the previous program break
  */
-uint64_t sys_sbrk(struct pt_regs *regs)
+uint64_t sys_do_sbrk(int64_t incr)
 {
     uint64_t retval = current_pcb->mm->brk_end;
-    if ((int64_t)regs->r8 > 0)
+    if ((int64_t)incr > 0)
     {
 
-        uint64_t new_brk = PAGE_2M_ALIGN(retval + regs->r8);
+        uint64_t new_brk = PAGE_2M_ALIGN(retval + incr);
         if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
         {
             kdebug("exceed mem limit, new_brk = %#018lx", new_brk);
@@ -218,57 +125,15 @@ uint64_t sys_sbrk(struct pt_regs *regs)
     }
     else
     {
-        if ((__int128_t)current_pcb->mm->brk_end + (__int128_t)regs->r8 < current_pcb->mm->brk_start)
+        if ((__int128_t)current_pcb->mm->brk_end + (__int128_t)incr < current_pcb->mm->brk_start)
             return retval;
     }
     // kdebug("do brk");
-    uint64_t new_brk = mm_do_brk(current_pcb->mm->brk_end, (int64_t)regs->r8); // 调整堆内存空间
+    uint64_t new_brk = mm_do_brk(current_pcb->mm->brk_end, (int64_t)incr); // 调整堆内存空间
     // kdebug("do brk done, new_brk = %#018lx", new_brk);
     current_pcb->mm->brk_end = new_brk;
     return retval;
 }
-
-/**
- * @brief 重启计算机
- *
- * @return
- */
-uint64_t sys_reboot(struct pt_regs *regs)
-{
-    // 重启计算机
-    io_out8(0x64, 0xfe);
-
-    return 0;
-}
-
-/**
- * @brief 切换工作目录
- *
- * @param dest_path 目标路径
- * @return
-+--------------+------------------------+
-|    返回码    |          描述          |
-+--------------+------------------------+
-|      0       |          成功          |
-|   EACCESS    |        权限不足        |
-|    ELOOP     | 解析path时遇到路径循环 |
-| ENAMETOOLONG |       路径名过长       |
-|    ENOENT    |  目标文件或目录不存在  |
-|    ENODIR    |  检索期间发现非目录项  |
-|    ENOMEM    |      系统内存不足      |
-|    EFAULT    |       错误的地址       |
-| ENAMETOOLONG |        路径过长        |
-+--------------+------------------------+
- */
-extern uint64_t sys_chdir(struct pt_regs *regs);
-
-/**
- * @brief 获取目录中的数据
- *
- * @param fd 文件描述符号
- * @return uint64_t dirent的总大小
- */
-extern uint64_t sys_getdents(struct pt_regs *regs);
 
 /**
  * @brief 执行新的程序
@@ -277,11 +142,8 @@ extern uint64_t sys_getdents(struct pt_regs *regs);
  * @param argv(r9寄存器) 参数列表
  * @return uint64_t
  */
-uint64_t sys_execve(struct pt_regs *regs)
+uint64_t c_sys_execve(char *user_path, char **argv, char **envp, struct pt_regs *regs)
 {
-
-    char *user_path = (char *)regs->r8;
-    char **argv = (char **)regs->r9;
 
     int path_len = strnlen_user(user_path, PAGE_4K_SIZE);
 
@@ -316,12 +178,8 @@ uint64_t sys_execve(struct pt_regs *regs)
  * @param rusage
  * @return uint64_t
  */
-uint64_t sys_wait4(struct pt_regs *regs)
+uint64_t c_sys_wait4(pid_t pid, int *status, int options, void *rusage)
 {
-    uint64_t pid = regs->r8;
-    int *status = (int *)regs->r9;
-    int options = regs->r10;
-    void *rusage = (void *)regs->r11;
 
     struct process_control_block *proc = NULL;
     struct process_control_block *child_proc = NULL;
@@ -353,78 +211,3 @@ uint64_t sys_wait4(struct pt_regs *regs)
     process_release_pcb(child_proc);
     return 0;
 }
-
-/**
- * @brief 进程退出
- *
- * @param exit_code 退出返回码
- * @return uint64_t
- */
-uint64_t sys_exit(struct pt_regs *regs)
-{
-    return process_do_exit(regs->r8);
-}
-
-uint64_t sys_nanosleep(struct pt_regs *regs)
-{
-    const struct timespec *rqtp = (const struct timespec *)regs->r8;
-    struct timespec *rmtp = (struct timespec *)regs->r9;
-
-    return rs_nanosleep(rqtp, rmtp);
-}
-
-ul sys_ahci_end_req(struct pt_regs *regs)
-{
-    // ahci_end_request();
-    return 0;
-}
-
-// 系统调用的内核入口程序
-void do_syscall_int(struct pt_regs *regs, unsigned long error_code)
-{
-    ul ret = system_call_table[regs->rax](regs);
-    regs->rax = ret; // 返回码
-}
-uint64_t sys_pipe(struct pt_regs *regs)
-{
-    return -ENOTSUP;
-}
-
-extern uint64_t sys_mkdir(struct pt_regs *regs);
-
-extern int sys_dup(int oldfd);
-extern int sys_dup2(int oldfd, int newfd);
-
-system_call_t system_call_table[MAX_SYSTEM_CALL_NUM] = {
-    [0] = system_call_not_exists,
-    [1] = sys_put_string,
-    [2] = sys_open,
-    [3] = sys_close,
-    [4] = sys_read,
-    [5] = sys_write,
-    [6] = sys_lseek,
-    [7] = sys_fork,
-    [8] = sys_vfork,
-    [9] = sys_brk,
-    [10] = sys_sbrk,
-    [11] = sys_reboot,
-    [12] = sys_chdir,
-    [13] = sys_getdents,
-    [14] = sys_execve,
-    [15] = sys_wait4,
-    [16] = sys_exit,
-    [17] = sys_mkdir,
-    [18] = sys_nanosleep,
-    [19] = sys_clock,
-    [20] = sys_pipe,
-    [21] = sys_mstat,
-    [22] = sys_unlink_at,
-    [23] = sys_kill,
-    [24] = sys_sigaction,
-    [25] = sys_rt_sigreturn,
-    [26] = sys_getpid,
-    [27] = sys_sched,
-    [28] = sys_dup,
-    [29] = sys_dup2,
-    [30 ... 255] = system_call_not_exists,
-};

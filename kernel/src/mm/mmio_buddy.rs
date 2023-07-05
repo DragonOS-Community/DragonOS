@@ -319,7 +319,7 @@ impl MmioBuddyMemPool {
             // element 只会有一个元素
             let mut element: Vec<Box<MmioBuddyAddrRegion>> = list_guard
                 .list
-                .drain_filter(|x| x.vaddr == buddy_vaddr)
+                .extract_if(|x| x.vaddr == buddy_vaddr)
                 .collect();
             if element.len() == 1 {
                 list_guard.num_free -= 1;

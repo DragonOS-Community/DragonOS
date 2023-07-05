@@ -4,7 +4,7 @@
 #![feature(const_mut_refs)]
 #![feature(core_intrinsics)] // <2>
 #![feature(c_void_variant)]
-#![feature(drain_filter)] // 允许Vec的drain_filter特性
+#![feature(extract_if)] // 允许 Vec 的 extract_if 特性
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]

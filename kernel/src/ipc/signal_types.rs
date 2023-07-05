@@ -522,7 +522,7 @@ impl SigQueue {
             }
         };
         // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<siginfo> = self.q.drain_filter(filter).collect();
+        let mut filter_result: Vec<siginfo> = self.q.extract_if(filter).collect();
         // 筛选出的结果不能大于1个
         assert!(filter_result.len() <= 1);
 
@@ -539,7 +539,7 @@ impl SigQueue {
                 false
             }
         };
-        let filter_result: Vec<siginfo> = self.q.drain_filter(filter).collect();
+        let filter_result: Vec<siginfo> = self.q.extract_if(filter).collect();
         // 回收这些siginfo
         for x in filter_result {
             drop(x)

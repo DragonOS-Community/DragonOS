@@ -6,8 +6,7 @@ use crate::driver::pci::pci::{
 };
 
 use crate::libs::volatile::{
-    volread, volwrite, ReadOnly, Volatile, VolatileReadable,
-    VolatileWritable, WriteOnly,
+    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
 use core::{
     fmt::{self, Display, Formatter},

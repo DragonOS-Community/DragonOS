@@ -170,8 +170,5 @@ macro_rules! volwrite {
     };
 }
 
-
-use core::ptr::NonNull;
-
 pub(crate) use volread;
 pub(crate) use volwrite;

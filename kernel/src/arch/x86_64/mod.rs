@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod fpu;
 pub mod interrupt;
 pub mod mm;
+pub mod msi;
 pub mod pci;
 pub mod rand;
 pub mod sched;

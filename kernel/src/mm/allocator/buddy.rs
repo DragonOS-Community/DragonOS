@@ -1,16 +1,18 @@
-use crate::{kdebug, kerror, mm};
+use crate::arch::MMArch;
 /// @Auther: Kong
 /// @Date: 2023-03-28 16:03:47
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/buddy.rs
 /// @Description:
-use alloc::collections::LinkedList;
-
+use crate::libs::spinlock::SpinLock;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
-use core::cmp::{self, max};
+use crate::{kdebug, kerror};
+use core::alloc::{AllocError, Allocator, Layout};
+use core::cmp::{self, max, min};
+use core::fmt::Debug;
 use core::intrinsics::{likely, unlikely};
-use core::ops::Add;
+use core::ptr::NonNull;
 use core::{marker::PhantomData, mem};
 
 // 一个全局变量MAX_ORDER，用来表示buddy算法的最大阶数 [MIN_ORDER, MAX_ORDER)左闭右开区间
@@ -18,534 +20,647 @@ const MAX_ORDER: usize = 31;
 // 4KB
 const MIN_ORDER: usize = 12;
 
+/// 保存buddy算法中每一页存放的BuddyEntry的信息，占据每个页的起始位置
+#[derive(Debug)]
+pub struct PageList<A> {
+    // 页存放entry的数量
+    entry_num: usize,
+    // 下一个页面的地址
+    next_page: PhysAddr,
+    phantom: PhantomData<A>,
+}
+
+impl<A> Clone for PageList<A> {
+    fn clone(&self) -> Self {
+        Self {
+            entry_num: self.entry_num,
+            next_page: self.next_page,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<A> PageList<A> {
+    fn empty() -> Self {
+        Self {
+            entry_num: 0,
+            next_page: PhysAddr::new(0),
+            phantom: PhantomData,
+        }
+    }
+    fn new(entry_num: usize, next_page: PhysAddr) -> Self {
+        Self {
+            entry_num,
+            next_page,
+            phantom: PhantomData,
+        }
+    }
+}
+
 /// @brief: 用来表示 buddy 算法中的一个 buddy 块，整体存放在area的头部
 // 这种方式会出现对齐问题
 // #[repr(packed)]
 #[repr(C)]
-pub struct BuddyEntry<A> {
-    // 代表的页的起始地址
-    base: PhysAddr,
-    // entry的阶数
-    order: usize,
-    // entry是否在Buddy中使用
-    pg_buddy: usize,
-    phantom: PhantomData<A>,
-}
-
-impl<A> Clone for BuddyEntry<A> {
-    fn clone(&self) -> Self {
-        Self {
-            base: self.base,
-            order: self.order,
-            pg_buddy: self.pg_buddy,
-            phantom: PhantomData,
-        }
-    }
-}
-impl<A> Copy for BuddyEntry<A> {}
-
-impl<A: MemoryManagementArch> BuddyEntry<A> {
-    fn empty() -> Self {
-        Self {
-            base: PhysAddr::new(0),
-            order: 0,
-            pg_buddy: 0,
-            phantom: PhantomData,
-        }
-    }
-}
-
+#[derive(Debug)]
 pub struct BuddyAllocator<A> {
-    // buddy表的虚拟地址
-    table_virt: VirtAddr,
-    // 使用free_area来表示 MAX_ORDER 个阶数的空闲数组，每个数组元素都是一个链表，链表的每个元素都是一个BuddyEntry
-    free_area: [LinkedList<BuddyEntry<A>>; MAX_ORDER],
-    total_used_pages: usize,
+    // 存放每个阶的空闲“链表”的头部地址
+    free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize],
     phantom: PhantomData<A>,
+}
+#[derive(Debug)]
+pub struct LockedBuddyAllocator<A>(SpinLock<BuddyAllocator<A>>);
+impl<A: MemoryManagementArch> LockedBuddyAllocator<A> {
+    pub fn new(buddy_allocator: BuddyAllocator<A>) -> Self {
+        Self(SpinLock::new(buddy_allocator))
+    }
 }
 
 impl<A: MemoryManagementArch> BuddyAllocator<A> {
-    const BUDDY_ENTRIES: usize = A::PAGE_SIZE / mem::size_of::<BuddyEntry<A>>();
+    const BUDDY_ENTRIES: usize =
+        (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
     // 定义一个变量记录buddy表的大小
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
-        // 获取bump_allocator.areas()的所有area的大小之和，并判断有多少个页
-        let mut total_size = 0;
-        for area in bump_allocator.areas().iter() {
-            total_size += area.size;
-        }
-        // 计算需要多少个页来存储 buddy 算法的数据结构
-        let total_used_pages = (total_size >> A::PAGE_SHIFT) / Self::BUDDY_ENTRIES;
-        // 申请buddy_pages个页，用于存储 buddy 算法的数据结构
-        let table_phys = bump_allocator.allocate_one()?;
-        for _ in 0..total_used_pages - 1 {
-            bump_allocator.allocate_one()?;
-        }
-        let table_virt = A::phys_2_virt(table_phys);
-        let table_virt = table_virt?;
-        // 将申请到的内存全部分配为 BuddyEntry<A> 类型
-        for i in 0..Self::BUDDY_ENTRIES * total_used_pages {
-            let virt = table_virt.add(i * mem::size_of::<BuddyEntry<A>>());
-            A::write(virt, BuddyEntry::<A>::empty());
-        }
-        // 初始化free_area
+        let initial_bump_usage = bump_allocator.usage();
+        kdebug!("initial_bump_usage {:?}", initial_bump_usage);
 
-        let free_area = Default::default();
+        let pages_to_buddy = initial_bump_usage.free();
+        // 最高阶的链表页数
+        let max_order_linked_list_page_num = max(
+            1,
+            (((pages_to_buddy.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES - 1)
+                / Self::BUDDY_ENTRIES,
+        );
 
-        let mut allocator = Self {
-            table_virt,
+        let mut free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize] =
+            [PhysAddr::new(0); (MAX_ORDER - MIN_ORDER) as usize];
+
+        // Buddy初始占用的空间从bump分配
+        for f in free_area.iter_mut() {
+            let curr_page = bump_allocator.allocate_one();
+            // 保存每个阶的空闲链表的头部地址
+            *f = curr_page.unwrap();
+            // 清空当前页
+            core::ptr::write_bytes(f.data() as *mut u8, 0, A::PAGE_SIZE);
+
+            let page_list: PageList<A> = PageList::new(0, PhysAddr::new(0));
+            Self::write_page(*f, page_list);
+        }
+
+        // 分配最高阶的链表页
+        for _ in 1..max_order_linked_list_page_num {
+            let curr_page = bump_allocator.allocate_one().unwrap();
+            // 清空当前页
+            core::ptr::write_bytes(curr_page.data() as *mut u8, 0, A::PAGE_SIZE);
+
+            let page_list: PageList<A> =
+                PageList::new(0, free_area[Self::order2index((MAX_ORDER - 1) as u8)]);
+            Self::write_page(curr_page, page_list);
+            free_area[Self::order2index((MAX_ORDER - 1) as u8)] = curr_page;
+        }
+
+        let initial_bump_offset = bump_allocator.offset();
+        // kdebug!("initial_bump_offset {:#x}", initial_bump_offset);
+        let mut paddr = initial_bump_offset;
+        let mut remain_pages = pages_to_buddy;
+        // 设置entry,这里假设了bump_allocator当前offset之后，所有的area的地址是连续的.
+        // TODO: 这里需要修改，按照area来处理
+        for i in MIN_ORDER..MAX_ORDER {
+            // kdebug!("i {i}, remain pages={}", remain_pages.data());
+            if remain_pages.data() < (1 << (i - MIN_ORDER)) {
+                break;
+            }
+
+            assert!(paddr & ((1 << i) - 1) == 0);
+
+            if likely(i != MAX_ORDER - 1) {
+                // 要填写entry
+                if paddr & (1 << i) != 0 {
+                    let page_list_paddr: PhysAddr = free_area[Self::order2index(i as u8)];
+                    let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
+
+                    A::write(
+                        Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
+                        paddr,
+                    );
+                    page_list.entry_num += 1;
+                    Self::write_page(page_list_paddr, page_list);
+
+                    paddr += 1 << i;
+                    remain_pages -= 1 << (i - MIN_ORDER);
+                };
+            } else {
+                // 往最大的阶数的链表中添加entry（注意要考虑到最大阶数的链表可能有多页）
+                // 断言剩余页面数量是MAX_ORDER-1阶的整数倍
+
+                let mut entries = (remain_pages.data() * A::PAGE_SIZE) >> i;
+                let mut page_list_paddr: PhysAddr = free_area[Self::order2index(i as u8)];
+                let block_size = 1usize << i;
+
+                if entries > Self::BUDDY_ENTRIES {
+                    // 在第一页填写一些entries
+                    let num = entries % Self::BUDDY_ENTRIES;
+                    entries -= num;
+
+                    let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
+                    for j in 0..num {
+                        A::write(
+                            Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
+                            paddr,
+                        );
+                        page_list.entry_num += 1;
+                        paddr += block_size;
+                        remain_pages -= 1 << (i - MIN_ORDER);
+                    }
+                    page_list_paddr = page_list.next_page;
+                    Self::write_page(page_list_paddr, page_list);
+                    assert!(!page_list_paddr.is_null());
+                }
+
+                while entries > 0 {
+                    let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
+
+                    for j in 0..Self::BUDDY_ENTRIES {
+                        A::write(
+                            Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
+                            paddr,
+                        );
+                        page_list.entry_num += 1;
+                        paddr += block_size;
+                        remain_pages -= 1 << (i - MIN_ORDER);
+                        entries -= 1;
+                        if entries == 0 {
+                            break;
+                        }
+                    }
+                    page_list_paddr = page_list.next_page;
+                    Self::write_page(page_list_paddr, page_list);
+
+                    if likely(entries > 0) {
+                        assert!(!page_list_paddr.is_null());
+                    }
+                }
+            }
+        }
+
+        let mut remain_bytes = remain_pages.data() * A::PAGE_SIZE;
+        kdebug!("remain_bytes {}", remain_bytes);
+        assert!(remain_bytes < (1 << MAX_ORDER - 1));
+
+        for i in (MIN_ORDER..MAX_ORDER).rev() {
+            if remain_bytes & (1 << i) != 0 {
+                let page_list_paddr: PhysAddr = free_area[Self::order2index(i as u8)];
+                let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
+
+                A::write(
+                    Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
+                    paddr,
+                );
+                page_list.entry_num += 1;
+                Self::write_page(page_list_paddr, page_list);
+
+                paddr += 1 << i;
+                remain_bytes -= 1 << i;
+            }
+        }
+
+        assert!(remain_bytes == 0);
+        assert!(paddr == initial_bump_offset + pages_to_buddy.data() * A::PAGE_SIZE);
+
+        // Self::print_free_area(free_area);
+        let allocator = Self {
             free_area,
-            total_used_pages,
             phantom: PhantomData,
         };
-        for old_area in bump_allocator.areas().iter() {
-            let mut area = old_area.clone();
-            // 如果offset大于area的起始地址，那么需要跳过offset的大小
-            if bump_allocator.offset() > area.base.data() {
-                area.base = area.base.add(bump_allocator.offset());
-                area.size -= bump_allocator.offset();
-            }
-            // 将area的起始地址对齐到最大的阶数
-            let new_offset = (area.base.data() + (1 << MAX_ORDER) - 1) & !((1 << MAX_ORDER) - 1);
-            area.size -= new_offset - area.base.data();
-            area.base = area.base.add(new_offset);
-
-            // 如果area的大小大于2^MAX_ORDER，那么将area分割为多个area
-            while area.size > (1 << MAX_ORDER) {
-                let mut new_area = area.clone();
-                new_area.size = 1 << MAX_ORDER;
-                area.base = area.base.add(1 << MAX_ORDER);
-                area.size -= 1 << MAX_ORDER;
-                allocator.add_area(new_area);
-            }
-            // TODO 对于分配的内存的前后两段空间，需不需要被分配出去？5
-        }
 
         Some(allocator)
     }
-
-    /// @brief: 将一个area添加到free_area中
-    /// @param {type}
-    /// @area: 要添加的area
-    unsafe fn add_area(&mut self, area: mm::PhysMemoryArea) {
-        // 计算area的阶数
-        let order = area.size >> A::PAGE_SHIFT;
-        // 计算area的起始地址
-        let base = area.base;
-        let pg_buddy = 0 as usize;
-        let entry = BuddyEntry {
-            base,
-            order,
-            pg_buddy,
-            phantom: PhantomData,
-        };
-        self.add_entry(entry);
+    pub unsafe fn print_free_area(free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER + 1) as usize]) {
+        // 打印所有free_area的信息
+        for i in 0..free_area.len() - 1 {
+            let virt_addr = A::phys_2_virt(free_area[i]);
+            let mut page_list: PageList<A> = A::read(virt_addr.unwrap());
+            kdebug!("free_area[{}]: {:b}", i, free_area[i].data());
+            while page_list.next_page.data() != 0 {
+                let next_page_phy_addr = page_list.next_page;
+                let virt_addr = A::phys_2_virt(next_page_phy_addr);
+                page_list = A::read(virt_addr.unwrap());
+                kdebug!("page_list: {:b}", page_list.next_page.data());
+            }
+            // 从page_list中读取每个entry的地址
+            let mut entry_addr = free_area[i].add(mem::size_of::<PageList<A>>());
+            for _ in 0..Self::BUDDY_ENTRIES {
+                let entry_virt_addr = A::phys_2_virt(entry_addr);
+                let entry: PhysAddr = A::read(entry_virt_addr.unwrap());
+                kdebug!("entry: {:b}", entry.data());
+                entry_addr = entry_addr.add(mem::size_of::<PhysAddr>());
+            }
+        }
+    }
+    /// 获取第j个entry的虚拟地址，
+    /// j从0开始计数
+    pub fn entry_virt_addr(base_addr: PhysAddr, j: usize) -> VirtAddr {
+        let entry_virt_addr = unsafe { A::phys_2_virt(Self::entry_addr(base_addr, j)) };
+        return entry_virt_addr.unwrap();
+    }
+    pub fn entry_addr(base_addr: PhysAddr, j: usize) -> PhysAddr {
+        let entry_addr = base_addr + mem::size_of::<PageList<A>>() + j * mem::size_of::<PhysAddr>();
+        return entry_addr;
+    }
+    pub fn read_page<T>(addr: PhysAddr) -> T {
+        let page_list = unsafe { A::read(A::phys_2_virt(addr).unwrap()) };
+        return page_list;
     }
 
-    /// @brief: 移除一个entry
-    /// @param  entry
-    pub fn remove_entry(&mut self, entry: BuddyEntry<A>) {
-        let order = entry.order;
-        let mut count = 0;
-        // 在迭代free_area时使用count统计次数
-        for i in self.free_area[order].iter_mut() {
-            // 如果i的起始地址等于entry的伙伴的起始地址，那么就将i从free_area中移除
-            if i.base.data() == entry.base.data() {
+    pub fn write_page(curr_page: PhysAddr, page_list: PageList<A>) {
+        // 把物理地址转换为虚拟地址
+        let virt_addr = unsafe { A::phys_2_virt(curr_page) };
+        let virt_addr = virt_addr.unwrap();
+        unsafe { A::write(virt_addr, page_list) };
+    }
+
+    /// 从order转换为free_area的下标
+    ///
+    /// # 参数
+    ///
+    /// - `order` - order
+    ///
+    /// # 返回值
+    ///
+    /// free_area的下标
+    #[inline]
+    fn order2index(order: u8) -> usize {
+        (order as usize - MIN_ORDER) as usize
+    }
+
+    /// 从空闲链表的开头，取出1个指定阶数的伙伴块，如果没有，则返回None
+    ///
+    /// ## 参数
+    ///
+    /// - `order` - 伙伴块的阶数
+    fn pop_front(&mut self, order: u8) -> Option<PhysAddr> {
+        let mut alloc_in_specific_order = |spec_order: u8| {
+            // 先尝试在order阶的“空闲链表”的开头位置分配一个伙伴块
+            let mut page_list_addr = self.free_area[Self::order2index(spec_order)];
+            let mut page_list: PageList<A> = Self::read_page(page_list_addr);
+
+            // kdebug!("page_list={page_list:?}");
+
+            // 循环删除头部的空闲链表页
+            while page_list.entry_num == 0 {
+                let next_page_list_addr = page_list.next_page;
+                // 找完了，都是空的
+                if next_page_list_addr.is_null() {
+                    return None;
+                }
+
+                if !next_page_list_addr.is_null() {
+                    // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
+                    self.free_area[Self::order2index(spec_order)] = next_page_list_addr;
+                    drop(page_list);
+                    // kdebug!("FREE: page_list_addr={:b}", page_list_addr.data());
+                    unsafe {
+                        self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8);
+                    }
+                }
+                page_list = Self::read_page(next_page_list_addr);
+                page_list_addr = next_page_list_addr;
+            }
+
+            // 有空闲页面，直接分配
+            if page_list.entry_num > 0 {
+                let entry: PhysAddr = unsafe {
+                    A::read(Self::entry_virt_addr(
+                        page_list_addr,
+                        page_list.entry_num - 1,
+                    ))
+                };
+                if entry.is_null() {
+                    kerror!(
+                        "entry is null, entry={:?}, order={}, entry_num = {}",
+                        entry,
+                        spec_order,
+                        page_list.entry_num - 1
+                    );
+                }
+                // kdebug!("entry={entry:?}");
+                // 更新page_list的entry_num
+                page_list.entry_num -= 1;
+                let tmp_current_entry_num = page_list.entry_num;
+                if page_list.entry_num == 0 {
+                    if !page_list.next_page.is_null() {
+                        // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
+                        self.free_area[Self::order2index(spec_order)] = page_list.next_page;
+                        drop(page_list);
+                        unsafe { self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8) };
+                    } else {
+                        Self::write_page(page_list_addr, page_list);
+                    }
+                } else {
+                    // 若entry_num不为0，说明该page_list还有空闲伙伴块，需要更新该page_list
+                    // 把更新后的page_list写回
+                    Self::write_page(page_list_addr, page_list.clone());
+                }
+
+                // 检测entry 是否对齐
+                if !entry.check_aligned(1 << spec_order) {
+                    panic!("entry={:?} is not aligned, spec_order={spec_order}, page_list.entry_num={}", entry,tmp_current_entry_num);
+                }
+                return Some(entry);
+            }
+            return None;
+        };
+
+        let result: Option<PhysAddr> = alloc_in_specific_order(order as u8);
+        // kdebug!("result={:?}", result);
+        if result.is_some() {
+            return result;
+        }
+        // 尝试从更大的链表中分裂
+
+        let mut current_order = (order + 1) as usize;
+        let mut x: Option<PhysAddr> = None;
+        while current_order < MAX_ORDER {
+            x = alloc_in_specific_order(current_order as u8);
+            // kdebug!("current_order={:?}", current_order);
+            if x.is_some() {
                 break;
             }
-            count += 1;
+            current_order += 1;
         }
-        let mut split_list = self.free_area[order].split_off(count);
-        split_list.pop_front();
-        self.free_area[order].append(&mut split_list);
-    }
-    /// @brief: 将entry添加到free_area和写入内存中
-    /// @param  mut
-    /// @param  entry
-    unsafe fn add_entry(&mut self, entry: BuddyEntry<A>) {
-        let order = entry.order;
-        if entry.pg_buddy == 0 {
-            self.free_area[order].push_back(entry);
+
+        // kdebug!("x={:?}", x);
+        // 如果找到一个大的块，就进行分裂
+        if x.is_some() {
+            // 分裂到order阶
+            while current_order > order as usize {
+                current_order -= 1;
+                // 把后面那半块放回空闲链表
+
+                let buddy = *x.as_ref().unwrap() + (1 << current_order);
+                // kdebug!("x={:?}, buddy={:?}", x, buddy);
+                // kdebug!("current_order={:?}, buddy={:?}", current_order, buddy);
+                unsafe { self.buddy_free(buddy, current_order as u8) };
+            }
+            return x;
         }
-        let virt = self.table_virt.add(entry.base.data() >> A::PAGE_SHIFT);
-        A::write(virt, entry);
+
+        return None;
     }
-    /// @brief: 从内存中读入entry
-    /// @param  offset
-    /// @return BuddyEntry<A>
-    unsafe fn read_entry(&self, offset: usize) -> BuddyEntry<A> {
-        let virt = self.table_virt.add(offset);
-        return A::read(virt);
+
+    fn buddy_alloc(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
+        // 计算需要分配的阶数
+        let mut order = log2(count.data() as usize);
+        if count.data() & ((1 << order) - 1) != 0 {
+            order += 1;
+        }
+        let order = (order + MIN_ORDER) as u8;
+        if order as usize >= MAX_ORDER {
+            return None;
+        }
+
+        // kdebug!("buddy_alloc: order = {}", order);
+        // 获取该阶数的一个空闲页面
+        let free_addr = self.pop_front(order);
+        // kdebug!(
+        //     "buddy_alloc: order = {}, free_addr = {:?}",
+        //     order,
+        //     free_addr
+        // );
+        return free_addr;
+    }
+
+    /// 释放一个块
+    ///
+    /// ## 参数
+    ///
+    /// - `base` - 块的起始地址
+    /// - `order` - 块的阶数
+    unsafe fn buddy_free(&mut self, mut base: PhysAddr, order: u8) {
+        // kdebug!("buddy_free: base = {:?}, order = {}", base, order);
+        let mut order = order as usize;
+
+        while order < MAX_ORDER {
+            // 检测地址是否合法
+            if base.data() & ((1 << (order)) - 1) != 0 {
+                panic!(
+                    "buddy_free: base is not aligned, base = {:#x}, order = {}",
+                    base.data(),
+                    order
+                );
+            }
+
+            // 在链表中寻找伙伴块
+            // 伙伴块的地址是base ^ (1 << order)
+            let buddy_addr = PhysAddr::new(base.data() ^ (1 << order));
+
+            let first_page_list_paddr = self.free_area[Self::order2index(order as u8)];
+            let mut page_list_paddr = first_page_list_paddr;
+            let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
+            let first_page_list = page_list.clone();
+
+            let mut buddy_entry_virt_vaddr = None;
+            let mut buddy_entry_page_list_paddr = None;
+            // 除非order是最大的，否则尝试查找伙伴块
+            if likely(order != MAX_ORDER - 1) {
+                'outer: loop {
+                    for i in 0..page_list.entry_num {
+                        let entry_virt_addr = Self::entry_virt_addr(page_list_paddr, i);
+                        let entry: PhysAddr = unsafe { A::read(entry_virt_addr) };
+                        if entry == buddy_addr {
+                            // 找到了伙伴块，记录该entry相关信息，然后退出查找
+                            buddy_entry_virt_vaddr = Some(entry_virt_addr);
+                            buddy_entry_page_list_paddr = Some(page_list_paddr);
+                            break 'outer;
+                        }
+                    }
+                    if page_list.next_page.is_null() {
+                        break;
+                    }
+                    page_list_paddr = page_list.next_page;
+                    page_list = Self::read_page(page_list_paddr);
+                }
+            }
+
+            // 如果没有找到伙伴块
+            if buddy_entry_virt_vaddr.is_none() {
+                assert!(
+                    page_list.entry_num <= Self::BUDDY_ENTRIES,
+                    "buddy_free: page_list.entry_num > Self::BUDDY_ENTRIES"
+                );
+
+                // 当前第一个page_list没有空间了
+                if first_page_list.entry_num == Self::BUDDY_ENTRIES {
+                    // 如果当前order是最小的，那么就把这个块当作新的page_list使用
+                    let new_page_list_addr = if order == MIN_ORDER {
+                        base
+                    } else {
+                        // 否则分配新的page_list
+                        // 请注意，分配之后，有可能当前的entry_num会减1（伙伴块分裂），造成出现整个链表为null的entry数量为Self::BUDDY_ENTRIES+1的情况
+                        // 但是不影响，我们在后面插入链表项的时候，会处理这种情况，检查链表中的第2个页是否有空位
+                        self.buddy_alloc(PageFrameCount::new(1))
+                            .expect("buddy_alloc failed: no enough memory")
+                    };
+
+                    // 清空这个页面
+                    core::ptr::write_bytes(
+                        A::phys_2_virt(new_page_list_addr)
+                            .expect(
+                                "Buddy free: failed to get virt address of [new_page_list_addr]",
+                            )
+                            .as_ptr::<u8>(),
+                        0,
+                        1 << order,
+                    );
+
+                    // 初始化新的page_list
+                    let new_page_list = PageList::new(Self::BUDDY_ENTRIES, first_page_list_paddr);
+                    Self::write_page(new_page_list_addr, new_page_list);
+                    self.free_area[Self::order2index(order as u8)] = new_page_list_addr;
+                }
+
+                // 由于上面可能更新了第一个链表页，因此需要重新获取这个值
+                let first_page_list_paddr = self.free_area[Self::order2index(order as u8)];
+                let first_page_list: PageList<A> = Self::read_page(first_page_list_paddr);
+
+                // 检查第二个page_list是否有空位
+                let second_page_list = if first_page_list.next_page.is_null() {
+                    None
+                } else {
+                    Some(Self::read_page::<PageList<A>>(first_page_list.next_page))
+                };
+
+                let (paddr, mut page_list) = if let Some(second) = second_page_list {
+                    // 第二个page_list有空位
+                    // 应当符合之前的假设：还有1个空位
+                    assert!(second.entry_num == Self::BUDDY_ENTRIES - 1);
+
+                    (first_page_list.next_page, second)
+                } else {
+                    // 在第一个page list中分配
+                    (first_page_list_paddr, first_page_list)
+                };
+
+                // kdebug!("to write entry, page_list_base={paddr:?}, page_list.entry_num={}, value={base:?}", page_list.entry_num);
+                // 把要归还的块，写入到链表项中
+                unsafe { A::write(Self::entry_virt_addr(paddr, page_list.entry_num), base) }
+                page_list.entry_num += 1;
+                Self::write_page(paddr, page_list);
+                return;
+            } else {
+                // 如果找到了伙伴块，合并，向上递归
+
+                // 伙伴块所在的表项的虚拟地址
+                let buddy_entry_virt_addr = buddy_entry_virt_vaddr.unwrap();
+                // 伙伴块所在的page_list的物理地址
+                let buddy_entry_page_list_paddr = buddy_entry_page_list_paddr.unwrap();
+
+                let mut page_list_paddr = self.free_area[Self::order2index(order as u8)];
+                let mut page_list = Self::read_page::<PageList<A>>(page_list_paddr);
+                // 找第一个有空闲块的链表页。跳过空闲链表页。不进行回收的原因是担心出现死循环
+                while page_list.entry_num == 0 {
+                    if page_list.next_page.is_null() {
+                        panic!(
+                            "buddy_free: page_list.entry_num == 0 && page_list.next_page.is_null()"
+                        );
+                    }
+                    page_list_paddr = page_list.next_page;
+                    page_list = Self::read_page(page_list_paddr);
+                }
+
+                // 如果伙伴块不在第一个链表页，则把第一个链表中的某个空闲块替换到伙伴块的位置
+                if page_list_paddr != buddy_entry_page_list_paddr {
+                    let entry: PhysAddr = unsafe {
+                        A::read(Self::entry_virt_addr(
+                            page_list_paddr,
+                            page_list.entry_num - 1,
+                        ))
+                    };
+                    // 把这个空闲块写入到伙伴块的位置
+                    unsafe {
+                        A::write(buddy_entry_virt_addr, entry);
+                    }
+                    // 更新当前链表页的统计数据
+                    page_list.entry_num -= 1;
+                    Self::write_page(page_list_paddr, page_list);
+                } else {
+                    // 伙伴块所在的链表页就是第一个链表页
+                    let last_entry: PhysAddr = unsafe {
+                        A::read(Self::entry_virt_addr(
+                            page_list_paddr,
+                            page_list.entry_num - 1,
+                        ))
+                    };
+
+                    // 如果最后一个空闲块不是伙伴块，则把最后一个空闲块移动到伙伴块的位置
+                    // 否则后面的操作也将删除这个伙伴块
+                    if last_entry != buddy_addr {
+                        unsafe {
+                            A::write(buddy_entry_virt_addr, last_entry);
+                        }
+                    }
+                    // 更新当前链表页的统计数据
+                    page_list.entry_num -= 1;
+                    Self::write_page(page_list_paddr, page_list);
+                }
+            }
+            base = min(base, buddy_addr);
+            order += 1;
+        }
+        // 走到这一步，order应该为MAX_ORDER-1
+        assert!(order == MAX_ORDER - 1);
     }
 }
 
 impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
-        // 如果table_virt为0，说明buddy还没有初始化，那么就直接返回None
-        if self.table_virt.data() == 0 {
-            return None;
-        }
-
-        // 计算要分配的页的阶数
-        let mut order = 0;
-        while (1 << order) < count.data() {
-            order += 1;
-        }
-
-        // 从free_area中找到第一个能够满足要求的area
-        let mut entry = self.free_area[order].pop_front();
-        while entry.is_none() {
-            order += 1;
-            if order >= MAX_ORDER {
-                return None;
-            }
-            entry = self.free_area[order].pop_front();
-        }
-        let mut entry = entry.unwrap();
-
-        // 如果entry的阶数大于要分配的阶数，那么将entry分割
-        while entry.order > order {
-            entry.order -= 1;
-            let new_entry = BuddyEntry {
-                base: entry.base.add(1 << entry.order),
-                order: entry.order,
-                pg_buddy: 0,
-                phantom: PhantomData,
-            };
-            // // 将拆分后的entry的伙伴写入table_virt，并将伙伴添加到free_area中
-            self.add_entry(new_entry)
-        }
-
-        // 更新entry的使用情况
-        entry.pg_buddy = 1;
-        entry.order = order;
-        self.add_entry(entry);
-        Some(entry.base)
+        return self.buddy_alloc(count);
     }
 
-    unsafe fn free(&mut self, base: PhysAddr, count: PageFrameCount) {
-        // 计算base对应的entry的虚拟地址
-        let start_page = base.data() >> A::PAGE_SHIFT;
-        let mut entry = self.read_entry(start_page * mem::size_of::<BuddyEntry<A>>());
-
-        // 如果entry的pg_buddy位为0，说明entry已经被释放了，那么就直接返回
-        if entry.pg_buddy == 0 {
-            return;
-        }
-        // 将entry的pg_buddy位设置为0
-        entry.pg_buddy = 0;
-        self.add_entry(entry);
-
-        // 如果entry的阶数小于MAX_ORDER，那么就将entry合并到buddy中
-        while entry.order < MAX_ORDER {
-            // 获取entry的伙伴的页号
-            let buddy_page = if entry.base.data() & (1 << entry.order) == 0 {
-                start_page + 1
-            } else {
-                start_page - 1
-            };
-            let buddy = self.read_entry(buddy_page * mem::size_of::<BuddyEntry<A>>());
-            // 如果entry的buddy的阶数不等于entry的阶数，或者entry的buddy的pg_buddy位为1，那么就退出循环
-            if buddy.order != entry.order || buddy.pg_buddy == 1 {
-                break;
-            }
-            self.add_entry(buddy);
-
-            // 遍历free_area[entry.order]中的链表，移除buddy
-            self.remove_entry(buddy);
-            // 将entry的buddy从free_area中移除，因为entry和entry的buddy已经合并了
-            self.remove_entry(entry);
-            // 将entry的阶数加1
-            entry.order += 1;
-            // 如果entry的起始地址大于entry的buddy的起始地址，那么就将entry的起始地址设置为entry的buddy的起始地址
-            if entry.base.data() > buddy.base.data() {
-                entry.base = buddy
-                    .base
-                    .add((1 << (entry.order + A::PAGE_SHIFT)) - (1 << A::PAGE_SHIFT));
-            }
-
-            // 将entry添加到free_area中
-            self.add_entry(entry);
-        }
-    }
-    unsafe fn usage(&self) -> PageFrameUsage {
-        let mut total = 0;
-        let mut used = 0;
-        // 遍历所有的buddy，计算已经使用的页和总共的页
-        let mut i = 0;
-        while i < self.total_used_pages * Self::BUDDY_ENTRIES {
-            let entry = self.read_entry(i * mem::size_of::<BuddyEntry<A>>());
-            total += 1 << entry.order;
-            if entry.pg_buddy == 1 {
-                used += 1 << entry.order;
-                // 让i跳过已经使用的页
-                i += 1 << entry.order;
-                break;
-            }
-        }
-        let frame = PageFrameUsage::new(PageFrameCount::new(used), PageFrameCount::new(total));
-        return frame;
-    }
-}
-
-// ====== 计算 Buddy预留内存页的代码 BEGIN =====
-
-// Buddy预留内存页的计算结果
-static mut PRESERVE_PAGES_RESULT: [BuddyPreservePageResult; MAX_ORDER - MIN_ORDER] =
-    [BuddyPreservePageResult::zeroed(); MAX_ORDER - MIN_ORDER];
-
-#[derive(Debug, Clone)]
-enum CalculateError {
-    PagesError,
-    EntriesError,
-    NoEnoughPages,
-}
-
-struct PreservePageCalculator {
-    layers: [BuddyCalculatorLayer; MAX_ORDER - MIN_ORDER],
-    /// 总的页数
-    total_pages: usize,
-    /// 每个页能够存放的buddy entry的数量
-    entries_per_page: usize,
-    max_order: usize,
-}
-
-macro_rules! calculator_layer {
-    ($self: ident, $order: expr) => {
-        $self.layers[$order - MIN_ORDER]
-    };
-}
-
-impl PreservePageCalculator {
-    const PAGE_4K: usize = (1 << 12);
-    const PAGE_1G: usize = (1 << 30);
-    const MAX_ORDER_SIZE: usize = (1 << (MAX_ORDER - 1));
-
-    const fn new(entries_per_page: usize) -> Self {
-        PreservePageCalculator {
-            layers: [BuddyCalculatorLayer::new(); MAX_ORDER - MIN_ORDER],
-            total_pages: 0,
-            entries_per_page,
-            max_order: 0,
-        }
-    }
-
-    /// ## 开始仿真计算
+    /// 释放一个块
     ///
     /// ## 参数
     ///
-    /// * `pages` - 交给buddy管理的总的页数
+    /// - `base` - 块的起始地址
+    /// - `count` - 块的页数（必须是2的幂）
     ///
-    /// ## 返回
+    /// ## Panic
     ///
-    /// * `&'static [BuddyCalculatorResult]` - 计算结果，每个元素表示一个阶数的buddy的计算结果。包含这个阶数需要的页数和链表内的buddy entry的数量
-    fn calculate(
-        &mut self,
-        pages: usize,
-    ) -> Result<&'static [BuddyPreservePageResult], CalculateError> {
-        self.total_pages = pages;
-        self.init_layers();
-
-        self.sim()?;
-
-        // 将结果保存到PRESERVE_PAGES_RESULT中
-        for order in MIN_ORDER..MAX_ORDER {
-            let layer = &calculator_layer!(self, order);
-
-            unsafe {
-                PRESERVE_PAGES_RESULT[order - MIN_ORDER] =
-                    BuddyPreservePageResult::new(order, layer.allocated_pages, layer.entries);
-            }
-        }
-        // 检查结果是否合法
-        self.check_result(unsafe { &PRESERVE_PAGES_RESULT })?;
-        return Ok(unsafe { &PRESERVE_PAGES_RESULT });
+    /// 如果count不是2的幂，会panic
+    unsafe fn free(&mut self, base: PhysAddr, count: PageFrameCount) {
+        // 要求count是2的幂
+        assert!(count.data().is_power_of_two());
+        // kdebug!("free: base={:?}, count={:?}", base, count);
+        self.buddy_free(base, (log2(count.data()) + MIN_ORDER) as u8);
     }
 
-    fn sim(&mut self) -> Result<(), CalculateError> {
-        loop {
-            let mut flag = false;
-            'outer: for order in (MIN_ORDER..MAX_ORDER).rev() {
-                let mut to_alloc =
-                    self.pages_need_to_alloc(order, calculator_layer!(self, order).entries);
-                // 模拟申请
-                while to_alloc > 0 {
-                    let page4k = calculator_layer!(self, MIN_ORDER).entries;
-                    let page4k = cmp::min(page4k, to_alloc);
-                    calculator_layer!(self, order).allocated_pages += page4k;
-                    calculator_layer!(self, MIN_ORDER).entries -= page4k;
-                    to_alloc -= page4k;
-
-                    if to_alloc == 0 {
-                        break;
-                    }
-
-                    // 从最小的order开始找，然后分裂
-                    let split_order = ((MIN_ORDER + 1)..=order).find(|&i| {
-                        let layer = &calculator_layer!(self, i);
-                        // println!("find: order: {}, entries: {}", i, layer.entries);
-                        layer.entries > 0
-                    });
-
-                    if let Some(split_order) = split_order {
-                        for i in (MIN_ORDER + 1..=split_order).rev() {
-                            let layer = &mut calculator_layer!(self, i);
-                            layer.entries -= 1;
-                            calculator_layer!(self, i - 1).entries += 2;
-                        }
-                    } else {
-                        // 从大的开始分裂
-                        let split_order = ((order + 1)..MAX_ORDER).find(|&i| {
-                            let layer = &calculator_layer!(self, i);
-                            // println!("find: order: {}, entries: {}", i, layer.entries);
-                            layer.entries > 0
-                        });
-                        if let Some(split_order) = split_order {
-                            for i in (order + 1..=split_order).rev() {
-                                let layer = &mut calculator_layer!(self, i);
-                                layer.entries -= 1;
-                                calculator_layer!(self, i - 1).entries += 2;
-                            }
-                            flag = true;
-                            break 'outer;
-                        } else {
-                            if order == MIN_ORDER
-                                && to_alloc == 1
-                                && calculator_layer!(self, MIN_ORDER).entries > 0
-                            {
-                                calculator_layer!(self, MIN_ORDER).entries -= 1;
-                                calculator_layer!(self, MIN_ORDER).allocated_pages += 1;
-                                break;
-                            } else {
-                                kerror!("BuddyPageCalculator::sim: NoEnoughPages: order: {}, pages_needed: {}",  order, to_alloc);
-                                return Err(CalculateError::NoEnoughPages);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !flag {
-                break;
-            }
-        }
-        return Ok(());
-    }
-
-    fn init_layers(&mut self) {
-        let max_order = cmp::min(log2(self.total_pages * Self::PAGE_4K), MAX_ORDER - 1);
-
-        self.max_order = max_order;
-        let mut remain_bytes = self.total_pages * Self::PAGE_4K;
-        for order in (MIN_ORDER..=max_order).rev() {
-            let entries = remain_bytes / (1 << order);
-            remain_bytes -= entries * (1 << order);
-            calculator_layer!(self, order).entries = entries;
-            // kdebug!(
-            //     "order: {}, entries: {}, pages: {}",
-            //     order,
-            //     entries,
-            //     calculator_layer!(self, order).allocated_pages
-            // );
-        }
-    }
-
-    fn entries_to_page(&self, entries: usize) -> usize {
-        (entries + self.entries_per_page - 1) / self.entries_per_page
-    }
-
-    fn pages_needed(&self, entries: usize) -> usize {
-        max(1, self.entries_to_page(entries))
-    }
-    fn pages_need_to_alloc(&self, order: usize, current_entries: usize) -> usize {
-        let allocated = calculator_layer!(self, order).allocated_pages;
-        let tot_need = self.pages_needed(current_entries);
-        if tot_need > allocated {
-            tot_need - allocated
-        } else {
-            0
-        }
-    }
-    fn check_result(
-        &self,
-        results: &'static [BuddyPreservePageResult],
-    ) -> Result<(), CalculateError> {
-        // 检查pages是否正确
-        let mut total_pages = 0;
-        for r in results.iter() {
-            total_pages += r.pages;
-            total_pages += r.entries * (1 << r.order) / Self::PAGE_4K;
-        }
-        if unlikely(total_pages != self.total_pages) {
-            // println!("total_pages: {}, self.total_pages: {}", total_pages, self.total_pages);
-            kerror!(
-                "total_pages: {}, self.total_pages: {}",
-                total_pages,
-                self.total_pages
-            );
-            return Err(CalculateError::PagesError);
-        }
-        // 在确认pages正确的情况下，检查每个链表的entries是否正确
-        // 检查entries是否正确
-        for r in results.iter() {
-            let pages_needed = self.pages_needed(r.entries);
-            if pages_needed != r.pages {
-                if likely(
-                    r.order == (MAX_ORDER - 1)
-                        && (pages_needed as isize - r.pages as isize).abs() == 1,
-                ) {
-                    continue;
-                }
-                kerror!(
-                    "order: {}, pages_needed: {}, pages: {}",
-                    r.order,
-                    self.pages_needed(r.entries),
-                    r.pages
-                );
-                return Err(CalculateError::EntriesError);
-            }
-        }
-        return Ok(());
+    unsafe fn usage(&self) -> PageFrameUsage {
+        todo!("BuddyAllocator::usage")
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-struct BuddyCalculatorLayer {
-    /// 当前层的buddy entry的数量
-    entries: usize,
-    allocated_pages: usize,
-}
-
-impl BuddyCalculatorLayer {
-    const fn new() -> Self {
-        BuddyCalculatorLayer {
-            entries: 0,
-            allocated_pages: 0,
+unsafe impl<A: MemoryManagementArch> Allocator for LockedBuddyAllocator<A> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // 计算需要申请的页数，向上取整
+        let count = (layout.size() + A::PAGE_SIZE - 1) & (!(A::PAGE_SIZE - 1));
+        let page_frame_count = PageFrameCount::new(count);
+        let phy_addr = self.0.lock().buddy_alloc(page_frame_count);
+        if phy_addr.is_none() {
+            return Err(AllocError);
         }
+        let phy_addr = phy_addr.unwrap();
+        let virt_addr = unsafe { A::phys_2_virt(phy_addr).ok_or(AllocError)? };
+        let ptr = NonNull::new(virt_addr.data() as *mut u8).unwrap();
+        let slice = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), layout.size()) };
+        // kdebug!("allocate");
+        return Ok(NonNull::from(slice));
     }
-}
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // // 计算需要释放的页数，向上取整
+        let count = (layout.size() + A::PAGE_SIZE - 1) & (!(A::PAGE_SIZE - 1));
+        // 由于buddy分配的页数量是2的幂，因此释放的时候也需要2的幂(向上取整)
+        let page_frame_count = PageFrameCount::new(count.next_power_of_two());
 
-#[derive(Debug, Clone, Copy)]
-struct BuddyPreservePageResult {
-    order: usize,
-    pages: usize,
-    entries: usize,
-}
-
-impl BuddyPreservePageResult {
-    fn new(order: usize, pages: usize, entries: usize) -> Self {
-        BuddyPreservePageResult {
-            order,
-            pages,
-            entries,
-        }
-    }
-
-    const fn zeroed() -> Self {
-        BuddyPreservePageResult {
-            order: 0,
-            pages: 0,
-            entries: 0,
-        }
+        let phy_addr = unsafe { A::virt_2_phys(VirtAddr::new(ptr.as_ptr() as usize)).unwrap() };
+        self.0.lock().free(phy_addr, page_frame_count);
     }
 }
 
@@ -555,4 +670,3 @@ fn log2(x: usize) -> usize {
     let log2x = 63 - leading_zeros;
     return log2x;
 }
-// ====== 计算 Buddy预留内存页的代码 END =====

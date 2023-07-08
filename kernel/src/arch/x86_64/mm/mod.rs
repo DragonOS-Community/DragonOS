@@ -1,12 +1,18 @@
 pub mod barrier;
 pub mod frame;
-
-use crate::arch::mm::frame::FRAME_ALLOCATOR;
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
-    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block,
+    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block, BLACK,
+    GREEN,
 };
+use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
+use crate::mm::allocator::page_frame::FrameAllocator;
+use crate::{
+    arch::{mm::frame::FRAME_ALLOCATOR, MMArch},
+    mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator, page_frame::PageFrameCount},
+};
+
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::PageEntry;
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
@@ -16,7 +22,7 @@ use crate::{kdebug, kinfo};
 use core::arch::asm;
 use core::ffi::c_void;
 use core::fmt::{Debug, Write};
-use core::mem;
+use core::mem::{self, MaybeUninit};
 use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -287,9 +293,51 @@ pub fn mm_init() {
     kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // todo: 初始化内存管理器
-
+    allocator_init();
+    loop {}
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
+}
+
+fn allocator_init() {
+    let virt_offset = unsafe { BOOTSTRAP_MM_INFO.unwrap().start_brk };
+    let phy_offset =
+        unsafe { MMArch::virt_2_phys(VirtAddr::new(page_align_up(virt_offset))) }.unwrap();
+    kdebug!("phy_offset: {:?}", phy_offset);
+
+    let bump_allocator =
+        BumpAllocator::<X86_64MMArch>::new(unsafe { &PHYS_MEMORY_AREAS }, phy_offset.data());
+    // 初始化buddy_allocator
+    let mut buddy_allocator_opt =
+        unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
+    kdebug!("buddy_allocator_opt success");
+    let test_addr = unsafe { buddy_allocator_opt.allocate(PageFrameCount::new(2)) };
+    // 打印test_addr
+    kdebug!("test_addr: {:?}", test_addr);
+    // loop{}
+    // unsafe { buddy_allocator_opt.free(test_addr.unwrap(), PageFrameCount::new(2)) };
+    const test_size: usize = 1026;
+    let mut x = [PhysAddr::new(0); test_size];
+
+    for i in 0..test_size {
+        let t = unsafe { buddy_allocator_opt.allocate(PageFrameCount::new(2)) };
+        if t.is_some() {
+            x[i] = t.unwrap();
+        } else {
+            panic!("allocate failed, i={i}");
+        }
+    }
+
+    kdebug!("x[0]: {:p}", x[0].data() as *const u8);
+    kdebug!("x[1]: {:p}", x[1].data() as *const u8);
+    kdebug!("x[255]: {:p}", x[255].data() as *const u8);
+
+    for i in 0..test_size {
+        // kdebug!("free x[{}]", i);
+        unsafe { buddy_allocator_opt.free(x[i], PageFrameCount::new(2)) };
+    }
+    kdebug!("buddy_allocator test success");
+    loop {}
 }
 
 #[no_mangle]

@@ -1,4 +1,4 @@
-use core::intrinsics::unlikely;
+use core::{intrinsics::unlikely, ops::{Add, Sub, AddAssign, SubAssign, Mul}};
 
 use crate::{
     arch::{mm::frame::LockedFrameAllocator, MMArch},
@@ -147,7 +147,7 @@ pub struct PageFrameCount(usize);
 
 impl PageFrameCount {
     // @brief 初始化PageFrameCount
-    pub fn new(count: usize) -> Self {
+    pub const fn new(count: usize) -> Self {
         return Self(count);
     }
     // @brief 获取页帧数量
@@ -171,6 +171,79 @@ impl PageFrameCount {
         }
     }
 }
+
+impl Add for PageFrameCount {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        return Self(self.0 + rhs.0);
+    }
+}
+
+impl AddAssign for PageFrameCount {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl Sub for PageFrameCount {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        return Self(self.0 - rhs.0);
+    }
+}
+
+impl SubAssign for PageFrameCount {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
+    }
+}
+
+impl Mul for PageFrameCount {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        return Self(self.0 * rhs.0);
+    }
+}
+
+impl Add<usize> for PageFrameCount {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        return Self(self.0 + rhs);
+    }
+}
+
+impl AddAssign<usize> for PageFrameCount {
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs;
+    }
+}
+
+impl Sub<usize> for PageFrameCount {
+    type Output = Self;
+
+    fn sub(self, rhs: usize) -> Self::Output {
+        return Self(self.0 - rhs);
+    }
+}
+
+impl SubAssign<usize> for PageFrameCount {
+    fn sub_assign(&mut self, rhs: usize) {
+        self.0 -= rhs;
+    }
+}
+
+impl Mul<usize> for PageFrameCount {
+    type Output = Self;
+
+    fn mul(self, rhs: usize) -> Self::Output {
+        return Self(self.0 * rhs);
+    }
+}
+
 
 // 页帧使用情况
 #[derive(Debug)]

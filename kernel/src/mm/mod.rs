@@ -74,11 +74,80 @@ impl PhysAddr {
     pub fn check_aligned(&self, align: usize) -> bool {
         return self.0 & (align - 1) == 0;
     }
+
+    #[inline(always)]
+    pub fn is_null(&self) -> bool {
+        return self.0 == 0;
+    }
 }
 
 impl Debug for PhysAddr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "PhysAddr({:#x})", self.0)
+    }
+}
+
+impl core::ops::Add<usize> for PhysAddr {
+    type Output = Self;
+
+    #[inline(always)]
+    fn add(self, rhs: usize) -> Self::Output {
+        return Self(self.0 + rhs);
+    }
+}
+
+impl core::ops::AddAssign<usize> for PhysAddr {
+    #[inline(always)]
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs;
+    }
+}
+
+impl core::ops::Add<PhysAddr> for PhysAddr {
+    type Output = Self;
+
+    #[inline(always)]
+    fn add(self, rhs: PhysAddr) -> Self::Output {
+        return Self(self.0 + rhs.0);
+    }
+}
+
+impl core::ops::AddAssign<PhysAddr> for PhysAddr {
+    #[inline(always)]
+    fn add_assign(&mut self, rhs: PhysAddr) {
+        self.0 += rhs.0;
+    }
+}
+
+impl core::ops::Sub<usize> for PhysAddr {
+    type Output = Self;
+
+    #[inline(always)]
+    fn sub(self, rhs: usize) -> Self::Output {
+        return Self(self.0 - rhs);
+    }
+}
+
+impl core::ops::SubAssign<usize> for PhysAddr {
+    #[inline(always)]
+    fn sub_assign(&mut self, rhs: usize) {
+        self.0 -= rhs;
+    }
+}
+
+impl core::ops::Sub<PhysAddr> for PhysAddr {
+    type Output = usize;
+
+    #[inline(always)]
+    fn sub(self, rhs: PhysAddr) -> Self::Output {
+        return self.0 - rhs.0;
+    }
+}
+
+impl core::ops::SubAssign<PhysAddr> for PhysAddr {
+    #[inline(always)]
+    fn sub_assign(&mut self, rhs: PhysAddr) {
+        self.0 -= rhs.0;
     }
 }
 
@@ -210,7 +279,7 @@ pub struct PhysMemoryArea {
     pub size: usize,
 }
 
-pub trait MemoryManagementArch: Clone + Copy {
+pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// 页面大小的shift（假如页面4K，那么这个值就是12,因为2^12=4096）
     const PAGE_SHIFT: usize;
     /// 每个页表的页表项数目。（以2^n次幂来表示）假如有512个页表项，那么这个值就是9
@@ -313,6 +382,24 @@ pub trait MemoryManagementArch: Clone + Copy {
     unsafe fn phys_2_virt(phys: PhysAddr) -> Option<VirtAddr> {
         if let Some(vaddr) = phys.data().checked_add(Self::PHYS_OFFSET) {
             return Some(VirtAddr::new(vaddr));
+        } else {
+            return None;
+        }
+    }
+
+    /// 将虚拟地址转换为物理地址
+    ///
+    /// ## 参数
+    ///
+    /// - `virt` 虚拟地址
+    ///
+    /// ## 返回值
+    ///
+    /// 转换后的物理地址。如果转换失败，返回None
+    #[inline(always)]
+    unsafe fn virt_2_phys(virt: VirtAddr) -> Option<PhysAddr> {
+        if let Some(paddr) = virt.data().checked_sub(Self::PHYS_OFFSET) {
+            return Some(PhysAddr::new(paddr));
         } else {
             return None;
         }

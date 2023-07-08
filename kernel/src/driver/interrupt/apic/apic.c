@@ -513,50 +513,50 @@ ul apic_ioapic_read_rte(unsigned char index)
  */
 void apic_ioapic_write_rte(unsigned char index, ul value)
 {
-    // 先写入低32bit
-    *apic_ioapic_map.virtual_index_addr = index;
-    io_mfence();
+    // // 先写入低32bit
+    // *apic_ioapic_map.virtual_index_addr = index;
+    // io_mfence();
 
-    *apic_ioapic_map.virtual_data_addr = value & 0xffffffff;
-    io_mfence();
-    // 再写入高32bit
-    value >>= 32;
-    io_mfence();
-    *apic_ioapic_map.virtual_index_addr = index + 1;
-    io_mfence();
-    *apic_ioapic_map.virtual_data_addr = value & 0xffffffff;
-    io_mfence();
+    // *apic_ioapic_map.virtual_data_addr = value & 0xffffffff;
+    // io_mfence();
+    // // 再写入高32bit
+    // value >>= 32;
+    // io_mfence();
+    // *apic_ioapic_map.virtual_index_addr = index + 1;
+    // io_mfence();
+    // *apic_ioapic_map.virtual_data_addr = value & 0xffffffff;
+    // io_mfence();
 }
 
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num)
 {
-    ul index = 0x10 + ((irq_num - 32) << 1);
-    ul value = apic_ioapic_read_rte(index);
-    value &= (~0x10000UL);
-    apic_ioapic_write_rte(index, value);
+    // ul index = 0x10 + ((irq_num - 32) << 1);
+    // ul value = apic_ioapic_read_rte(index);
+    // value &= (~0x10000UL);
+    // apic_ioapic_write_rte(index, value);
 }
 
 void apic_ioapic_disable(ul irq_num)
 {
-    ul index = 0x10 + ((irq_num - 32) << 1);
-    ul value = apic_ioapic_read_rte(index);
-    value |= (0x10000UL);
-    apic_ioapic_write_rte(index, value);
+    // ul index = 0x10 + ((irq_num - 32) << 1);
+    // ul value = apic_ioapic_read_rte(index);
+    // value |= (0x10000UL);
+    // apic_ioapic_write_rte(index, value);
 }
 
 ul apic_ioapic_install(ul irq_num, void *arg)
 {
-    struct apic_IO_APIC_RTE_entry *entry = (struct apic_IO_APIC_RTE_entry *)arg;
-    // RTE表项值写入对应的RTE寄存器
-    apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), *(ul *)entry);
-    return 0;
+    // struct apic_IO_APIC_RTE_entry *entry = (struct apic_IO_APIC_RTE_entry *)arg;
+    // // RTE表项值写入对应的RTE寄存器
+    // apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), *(ul *)entry);
+    // return 0;
 }
 
 void apic_ioapic_uninstall(ul irq_num)
 {
     // 将对应的RTE表项设置为屏蔽状态
-    apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), 0x10000UL);
+    // apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), 0x10000UL);
 }
 
 void apic_ioapic_level_ack(ul irq_num) // 电平触发
@@ -574,7 +574,7 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
         *eoi = 0x00;
 
         */
-    __send_eoi();
+    // __send_eoi();
 }
 
 /**
@@ -585,8 +585,8 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
 
 void apic_local_apic_edge_ack(ul irq_num)
 {
-    // 向EOI寄存器写入0x00表示结束中断
-    __send_eoi();
+    // // 向EOI寄存器写入0x00表示结束中断
+    // __send_eoi();
 }
 
 /**

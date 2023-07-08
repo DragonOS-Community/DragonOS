@@ -33,7 +33,7 @@ main.o: main.c
 
 kernel_rust:
 	rustup default nightly
-	cargo +nightly build --release --target ./arch/x86_64/x86_64-unknown-none.json
+	cargo +nightly-2023-01-21 build --release --target ./arch/x86_64/x86_64-unknown-none.json
 
 all: kernel
 

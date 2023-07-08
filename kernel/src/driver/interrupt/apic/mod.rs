@@ -2,6 +2,7 @@ use crate::{kdebug, syscall::SystemError};
 
 use self::apic_timer::ApicTimerMode;
 
+//这个文件实现RTE相关
 pub mod apic_timer;
 pub mod ioapic;
 pub mod x2apic;

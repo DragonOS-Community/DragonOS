@@ -49,9 +49,8 @@ impl IoApic {
     }
 
     pub fn enable(&mut self, irq: u8, cpunum: u8) {
-        // Mark interrupt edge-triggered, active high,
-        // enabled, and routed to the given cpunum,
-        // which happens to be that cpu's APIC ID.
+        // 标记中断边沿触发、高电平有效、
+        // 启用并路由到给定的 cpunum，即是是该 cpu 的 APIC ID（不是cpuid）
         let vector = self.irq_vector(irq);
         self.write_irq(irq, vector, RedirectionEntry::NONE, cpunum);
     }
@@ -72,6 +71,14 @@ impl IoApic {
         dest_logic: bool,
         mut mask: bool,
     ) {
+        //重定向表从 REG_TABLE 开始，使用两个寄存器来配置每个中断。 
+        //一对中的第一个（低位）寄存器包含配置位。32bit 
+        //第二个（高）寄存器包含一个位掩码，告诉哪些 CPU 可以服务该中断。
+        // level_triggered：如果为真，表示中断触发方式为电平触发（level-triggered），则将RedirectionEntry::LEVEL标志位设置在flags中。
+        // active_high：如果为假，表示中断的极性为低电平有效（active-low），则将RedirectionEntry::ACTIVELOW标志位设置在flags中。
+        // dest_logic：如果为真，表示中断目标为逻辑模式（logical mode），则将RedirectionEntry::LOGICAL标志位设置在flags中。
+        // !(0x20..=0xef).contains(&vector)：判断中断向量号（vector）是否在范围0x20到0xef之外，如果是，则表示中断无效，将mask标志位设置为真。
+        // mask：如果为真，表示中断被屏蔽（masked），将RedirectionEntry::DISABLED标志位设置在flags中。
         let mut flags = RedirectionEntry::NONE;
         if level_triggered {
             flags |= RedirectionEntry::LEVEL;
@@ -109,21 +116,26 @@ impl IoApic {
     pub fn id(&mut self) -> u8 {
         unsafe { self.read(REG_ID).get_bits(24..28) as u8 }
     }
-
+    // ics的类型
     pub fn version(&mut self) -> u8 {
         unsafe { self.read(REG_VER).get_bits(0..8) as u8 }
     }
-
+    // 获取range指定的位范围； 注意，索引 0 是最低有效位，而索引 length() - 1 是最高有效位。元素总个数
     pub fn maxintr(&mut self) -> u8 {
         unsafe { self.read(REG_VER).get_bits(16..24) as u8 }
     }
 }
 
 /// Default physical address of IO APIC
-pub const IOAPIC_ADDR: u32 = 0xFEC00000;
+/// 设置IO APIC ID 为0x0f000000
+/// *apic_ioapic_map.virtual_index_addr = 0x00;
+/// io_mfence();
+/// *apic_ioapic_map.virtual_data_addr = 0x0f000000;
+/// io_mfence();
+pub const IOAPIC_ADDR: u32 = 0x0f000000;
 /// Register index: ID
 const REG_ID: u8 = 0x00;
-/// Register index: version
+/// 获取IO APIC Version
 const REG_VER: u8 = 0x01;
 /// Redirection table base
 const REG_TABLE: u8 = 0x10;

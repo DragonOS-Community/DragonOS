@@ -1,7 +1,7 @@
 use super::{IdTable, KObject};
 use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{collections::BTreeMap, sync::Arc};
-use core::{any::Any, fmt::Debug};
+use core::fmt::Debug;
 
 lazy_static! {
     pub static ref DRIVER_MANAGER: Arc<LockedDriverManager> = Arc::new(LockedDriverManager::new());

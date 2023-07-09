@@ -1,5 +1,3 @@
-use alloc::{collections::BTreeMap, string::String, sync::Arc};
-
 use crate::{
     filesystem::{
         sysfs::{
@@ -11,6 +9,7 @@ use crate::{
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
+use alloc::{collections::BTreeMap, string::String, sync::Arc};
 use core::{any::Any, fmt::Debug};
 
 pub mod bus;
@@ -22,7 +21,8 @@ lazy_static! {
 
 pub trait KObject: Any + Send + Sync + Debug {}
 
-#[derive(Debug, Clone, Copy)]
+/// @brief: 设备号实例
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DeviceNumber(usize);
 
 impl Default for DeviceNumber {
@@ -44,15 +44,32 @@ impl Into<usize> for DeviceNumber {
 }
 
 impl DeviceNumber {
+    /// @brief: 设备号创建
+    /// @parameter: dev_t: 设备号
+    /// @return: 设备号实例
+    pub fn new(dev_t: usize) -> DeviceNumber {
+        Self(dev_t)
+    }
+
+    /// @brief: 获取主设备号
+    /// @parameter: none
+    /// @return: 主设备号
     pub fn major(&self) -> usize {
         (self.0 >> 20) & 0xfff
     }
 
+    /// @brief: 获取次设备号
+    /// @parameter: none
+    /// @return: 次设备号
     pub fn minor(&self) -> usize {
         self.0 & 0xfffff
     }
 }
 
+/// @brief: 根据主次设备号创建设备号实例
+/// @parameter: major: 主设备号
+///             minor: 次设备号
+/// @return: 设备号实例
 pub fn mkdev(major: usize, minor: usize) -> DeviceNumber {
     DeviceNumber(((major & 0xfff) << 20) | (minor & 0xfffff))
 }

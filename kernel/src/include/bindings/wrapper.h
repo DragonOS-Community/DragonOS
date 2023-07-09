@@ -35,6 +35,7 @@
 #include <driver/pci/pci.h>
 #include <driver/video/video.h>
 #include <driver/virtio/virtio.h>
+#include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
 #include <libs/libUI/textui.h>
@@ -45,4 +46,7 @@
 #include <process/process.h>
 #include <sched/sched.h>
 #include <smp/smp.h>
+#include <time/clocksource.h>
 #include <time/sleep.h>
+#include <driver/pci/pci_irq.h>
+#include <common/errno.h>

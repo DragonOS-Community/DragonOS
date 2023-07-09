@@ -1,14 +1,11 @@
-use core::{arch::x86_64::_rdtsc, hint::spin_loop, ptr::null_mut};
+use core::{arch::x86_64::_rdtsc, hint::spin_loop};
 
 use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
-    arch::{
-        asm::current::current_pcb,
-        interrupt::{cli, sti},
-        sched::sched,
-    },
-    include::bindings::bindings::{timespec, useconds_t, Cpu_tsc_freq},
+    arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
+    include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
     syscall::SystemError,
 };
 
@@ -24,7 +21,7 @@ use super::{
 /// @return Ok(TimeSpec) 剩余休眠时间
 ///
 /// @return Err(SystemError) 错误码
-pub fn nano_sleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
+pub fn nanosleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
     if sleep_time.tv_nsec < 0 || sleep_time.tv_nsec >= 1000000000 {
         return Err(SystemError::EINVAL);
     }
@@ -48,12 +45,13 @@ pub fn nano_sleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
         next_n_us_timer_jiffies((sleep_time.tv_nsec / 1000) as u64),
     );
 
-    cli();
+    let irq_guard: crate::exception::IrqFlagsGuard =
+        unsafe { CurrentIrqArch::save_and_disable_irq() };
     timer.activate();
     unsafe {
         current_pcb().mark_sleep_interruptible();
     }
-    sti();
+    drop(irq_guard);
 
     sched();
 
@@ -72,48 +70,14 @@ pub fn nano_sleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
 /// @return Ok(TimeSpec) 剩余休眠时间
 ///
 /// @return Err(SystemError) 错误码
-pub fn us_sleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
-    match nano_sleep(sleep_time) {
+pub fn usleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
+    match nanosleep(sleep_time) {
         Ok(value) => return Ok(value),
         Err(err) => return Err(err),
     };
 }
 
 //===== 以下为提供给C的接口 =====
-
-/// @brief 休眠指定时间（单位：纳秒）（提供给C的接口）
-///
-/// @param sleep_time 指定休眠的时间
-///
-/// @param rm_time 剩余休眠时间（传出参数）
-///
-/// @return Ok(i32) 0
-///
-/// @return Err(SystemError) 错误码
-#[no_mangle]
-pub extern "C" fn rs_nanosleep(sleep_time: *const timespec, rm_time: *mut timespec) -> i32 {
-    if sleep_time == null_mut() {
-        return SystemError::EINVAL.to_posix_errno();
-    }
-    let slt_spec = TimeSpec {
-        tv_sec: unsafe { *sleep_time }.tv_sec,
-        tv_nsec: unsafe { *sleep_time }.tv_nsec,
-    };
-
-    match nano_sleep(slt_spec) {
-        Ok(value) => {
-            if rm_time != null_mut() {
-                unsafe { *rm_time }.tv_sec = value.tv_sec;
-                unsafe { *rm_time }.tv_nsec = value.tv_nsec;
-            }
-
-            return 0;
-        }
-        Err(err) => {
-            return err.to_posix_errno();
-        }
-    }
-}
 
 /// @brief 休眠指定时间（单位：微秒）（提供给C的接口）
 ///
@@ -128,7 +92,7 @@ pub extern "C" fn rs_usleep(usec: useconds_t) -> i32 {
         tv_sec: (usec / 1000000) as i64,
         tv_nsec: ((usec % 1000000) * 1000) as i64,
     };
-    match us_sleep(sleep_time) {
+    match usleep(sleep_time) {
         Ok(_) => {
             return 0;
         }

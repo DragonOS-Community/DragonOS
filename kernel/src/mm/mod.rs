@@ -3,6 +3,7 @@ use crate::include::bindings::bindings::{mm_struct, process_control_block, PAGE_
 pub mod allocator;
 pub mod gfp;
 pub mod mmio_buddy;
+pub mod syscall;
 
 /// @brief 将内核空间的虚拟地址转换为物理地址
 #[inline(always)]

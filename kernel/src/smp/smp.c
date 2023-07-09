@@ -223,21 +223,6 @@ static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_r
     sched();
 }
 
-/**
- * @brief 使得指定的cpu核心立即运行调度
- *
- * @param cpu_id cpu核心号
- */
-int kick_cpu(uint32_t cpu_id)
-{
-    if (cpu_id >= MAX_CPU_NUM)
-    {
-        return -EINVAL;
-    }
-    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, KICK_CPU_IRQ_NUM, ICR_APIC_FIXED,
-                 ICR_ALL_EXCLUDE_Self, 0);
-    return 0;
-}
 
 /**
  * @brief 获取当前全部的cpu数目

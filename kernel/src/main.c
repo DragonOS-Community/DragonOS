@@ -30,7 +30,6 @@
 #include "driver/pci/pci.h"
 #include <driver/timers/HPET/HPET.h>
 #include <driver/uart/uart.h>
-#include <driver/usb/usb.h>
 #include <driver/video/video.h>
 #include <time/timer.h>
 

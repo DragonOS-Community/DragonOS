@@ -17,7 +17,6 @@
 #include <debug/bug.h>
 #include <debug/traceback/traceback.h>
 #include <driver/disk/ahci/ahci.h>
-#include <driver/usb/usb.h>
 #include <driver/video/video.h>
 #include <driver/virtio/virtio.h>
 #include <exception/gate.h>

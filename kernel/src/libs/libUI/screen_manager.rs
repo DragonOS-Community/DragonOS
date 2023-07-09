@@ -1,11 +1,10 @@
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use alloc::{
-    boxed::Box,
     collections::LinkedList,
     string::{String, ToString},
     sync::Arc,
@@ -14,18 +13,17 @@ use alloc::{
 use crate::{
     driver::uart::uart::{c_uart_send_str, UartPort},
     include::bindings::bindings::{
-        alloc_pages, buffer_equal, free_pages, scm_buffer_info_t, verify_area,
-        video_frame_buffer_info, video_reinitialize, video_set_refresh_target, Page, PAGE_2M_SIZE,
-        ZONE_NORMAL,
+        alloc_pages, scm_buffer_info_t, video_frame_buffer_info, video_reinitialize,
+        video_set_refresh_target, Page, PAGE_2M_SIZE, ZONE_NORMAL,
     },
-    libs::spinlock::SpinLock,
-    mm::{phys_2_virt, virt_2_phys, Phy_to_2M_Page, PAGE_2M_ALIGN},
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+    mm::{phys_2_virt, PAGE_2M_ALIGN},
     syscall::SystemError,
 };
 
-use super::{
-    textui::TextuiPrivateInfo,
-    textui_render::{BUF_WIDTH, FB},
+use super::textui::{
+    renew_buf, textui_change_buf, TextuiPrivateInfo, CHAR_PER_LINE, TEXTUI_CHAR_HEIGHT,
+    TEXTUI_CHAR_WIDTH, TRUE_LINE_NUM,
 };
 
 use lazy_static::lazy_static;
@@ -34,10 +32,10 @@ lazy_static! {
         SpinLock::new(LinkedList::new());
 }
 lazy_static! {
-    pub static ref CURRENT_FRAMEWORK_METADATA: SpinLock<ScmUiFrameworkMetadata> =
-        SpinLock::new(ScmUiFrameworkMetadata::new(ScmFramworkType::Text));
+    pub static ref CURRENT_FRAMEWORK_METADATA: RwLock<ScmUiFrameworkMetadata> =
+        RwLock::new(ScmUiFrameworkMetadata::new(ScmFramworkType::Text));
 }
-pub static mut SCM_DOUBLE_BUFFER_ENABLED: AtomicBool = AtomicBool::new(false); // 允许双缓冲的标志位
+pub static SCM_DOUBLE_BUFFER_ENABLED: AtomicBool = AtomicBool::new(false); // 允许双缓冲的标志位
 
 bitflags! {
   pub struct ScmBfFlag:u8{
@@ -50,118 +48,194 @@ bitflags! {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum ScmUiPrivateInfo {
     Textui(TextuiPrivateInfo),
     Gui,
     Unused,
 }
+
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum ScmFramworkType {
     Text,
     Gui,
     Unused,
 }
 
-#[derive(Clone, Debug)]
+// #[derive(Debug)]
+// pub struct Buf<'a>(&'a mut [u32]);
+// impl Buf<'_> {
+//     pub fn new(buf: &mut [u32]) -> Buf {
+//         Buf(buf)
+//     }
+//     pub fn get_buf_from_vaddr(vaddr: usize, len: usize) -> Buf<'static> {
+//         let new_buf: &mut [u32] =
+//             unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u32, len) };
+//         let buf: Buf<'_> = Buf::new(new_buf);
+//         return buf;
+//     }
+//     pub fn get_buf_from_video_frame_buffer_info() -> Buf<'static> {
+//         let len =
+//             unsafe { video_frame_buffer_info.width * video_frame_buffer_info.height } as usize;
+//         Buf::get_buf_from_vaddr(unsafe { video_frame_buffer_info.vaddr }, len)
+//     }
+// }
+// impl Into<&mut [u32]> for Buf<'_> {
+//     fn into(self) -> &'static mut [u32] {
+//         self.0
+//     }
+// }
+// impl Clone for Buf<'_> {
+//     fn clone(&self) -> Self {
+//         let mut buf = Vec::new();
+//         for i in self.0.iter() {
+//             &buf.push(*i);
+//         }
+//         let b = buf.as_mut_slice();
+//         // 转移对 cloned_data 的所有权到新创建的 Buf 实例中
+//         let cloned = Buf::new(b);
+//         core::mem::forget(b);
+//         return cloned;
+//     }
+// }
+#[derive(Debug, Clone)]
 pub struct ScmBufferInfo {
-    pub width: u32,     // 帧缓冲区宽度（pixel或columns）
-    pub height: u32,    // 帧缓冲区高度（pixel或lines）
-    pub size: u32,      // 帧缓冲区大小（bytes）
-    pub bit_depth: u32, // 像素点位深度
-
-    pub vaddr: u64,       // 帧缓冲区的地址
-    pub flags: ScmBfFlag, // 帧缓冲区标志位
+    width: u32,       // 帧缓冲区宽度（pixel或columns）
+    height: u32,      // 帧缓冲区高度（pixel或lines）
+    size: u32,        // 帧缓冲区大小（bytes）
+    bit_depth: u32,   // 像素点位深度
+    vaddr: usize,     // 指向帧缓冲区的指针(用于video里面的scm_buffer_info_t)
+    flags: ScmBfFlag, // 帧缓冲区标志位
 }
+fn alloc_pages_for_video_frame_buffer_info_size() -> Result<*mut Page, SystemError> {
+    let p: *mut Page = unsafe {
+        alloc_pages(
+            ZONE_NORMAL,
+            (PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE) as i32,
+            0,
+        )
+    };
+    if p.is_null() {
+        return Err(SystemError::ENOMEM);
+    }
+    return Ok(p);
+}
+fn get_vaddr_of_double_buf() -> Result<usize, SystemError> {
+    let p = alloc_pages_for_video_frame_buffer_info_size()?;
+    let vaddr = phys_2_virt(((unsafe { *p }).addr_phys) as usize);
+    return Ok(vaddr);
+}
+
 impl ScmBufferInfo {
     /**
-     * @brief 创建新的帧缓冲区
-     *
+     * @brief 创建新的帧缓冲区信息
+     * @param buf 帧缓冲区
      * @param b_type 帧缓冲区类型
      * @return struct ScmBufferInfo 新的帧缓冲区结构体
      */
-    fn new(b_type: ScmBfFlag) -> Result<Self, SystemError> {
-        if unlikely(unsafe { SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) } == false) {
-            return Ok(ScmBufferInfo::copy_from_c(unsafe { &video_frame_buffer_info })?);
+    pub fn new(buf_type: ScmBfFlag) -> Result<Self, SystemError> {
+        if unlikely(SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == false) {
+            return Ok(ScmBufferInfo::from(unsafe { &video_frame_buffer_info }));
         } else {
-            let mut frame_buffer_info: ScmBufferInfo = ScmBufferInfo {
-                width: unsafe { video_frame_buffer_info.width }, // 帧缓冲区宽度（pixel或columns）
-                height: unsafe { video_frame_buffer_info.height }, // 帧缓冲区高度（pixel或lines）
-                size: unsafe { video_frame_buffer_info.size },   // 帧缓冲区大小（bytes）
-                bit_depth: unsafe { video_frame_buffer_info.bit_depth }, // 像素点位深度
+            //创建双缓冲区
+            let mut frame_buffer_info: ScmBufferInfo =
+                ScmBufferInfo::from(unsafe { &video_frame_buffer_info });
+            frame_buffer_info.flags = buf_type;
 
-                vaddr: unsafe { video_frame_buffer_info.vaddr }, // 帧缓冲区的地址
-                flags: ScmBfFlag::SCM_BF_DB,                     // 帧缓冲区标志位
-            };
-            if b_type.contains(ScmBfFlag::SCM_BF_PIXEL) {
-                frame_buffer_info.flags |= ScmBfFlag::SCM_BF_PIXEL;
-            } else {
-                frame_buffer_info.flags |= ScmBfFlag::SCM_BF_TEXT;
-            }
-
-            let p: *mut Page = unsafe {
-                alloc_pages(
-                    ZONE_NORMAL,
-                    (PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE) as i32,
-                    0,
-                )
-            };
-            c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_buf_new_2\n\0".as_ptr());
-            if p.is_null() {
-                c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_buf_new_1\n\0".as_ptr());
-                return Err(SystemError::ENOMEM);
-            } else {
-                frame_buffer_info.vaddr = phys_2_virt(((unsafe { *p }).addr_phys) as usize) as u64;
-                c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_buf_new_finish\n\0".as_ptr());
-                return Ok(frame_buffer_info);
-            }
+            // let p: *mut Page = unsafe {
+            //     alloc_pages(
+            //         ZONE_NORMAL,
+            //         (PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE) as i32,
+            //         0,
+            //     )
+            // };
+            // if p.is_null() {
+            //     return Err(SystemError::ENOMEM);
+            // } else {
+            //     frame_buffer_info.vaddr = phys_2_virt(((unsafe { *p }).addr_phys) as usize);
+            //     return Ok(frame_buffer_info);
+            // }
+            frame_buffer_info.vaddr = get_vaddr_of_double_buf()?;
+            // println!("vaddr:{}", frame_buffer_info.vaddr);
+            // loop{}
+            return Ok(frame_buffer_info);
         }
     }
-    pub fn to_c(&self) -> scm_buffer_info_t {
+
+    pub fn get_vaddr(&self) -> usize {
+        self.vaddr.clone()
+    }
+    pub fn get_size_about_u8(&self) -> u32 {
+        self.size.clone()
+    }
+    pub fn get_height_about_u32(&self) -> u32 {
+        self.height.clone()
+    }
+    pub fn get_width_about_u32(&self) -> u32 {
+        self.width.clone()
+    }
+    pub fn get_size_about_u32(&self) -> u32 {
+        self.height.clone() * self.width.clone()
+    }
+}
+
+impl From<&scm_buffer_info_t> for ScmBufferInfo {
+    fn from(value: &scm_buffer_info_t) -> Self {
+        Self {
+            width: value.width,
+            height: value.height,
+            size: value.size,
+            bit_depth: value.bit_depth,
+            // buf,
+            vaddr: value.vaddr as usize,
+            flags: ScmBfFlag::from_bits_truncate(value.flags as u8),
+        }
+    }
+}
+impl Into<scm_buffer_info_t> for ScmBufferInfo {
+    fn into(self) -> scm_buffer_info_t {
         scm_buffer_info_t {
             width: self.width,
             height: self.height,
             size: self.size,
             bit_depth: self.bit_depth,
-            vaddr: self.vaddr,
+            vaddr: self.vaddr as u64,
             flags: self.flags.bits as u64,
         }
     }
-    fn copy_from_c(buf: &scm_buffer_info_t) -> Result<Self, SystemError> {
-        Ok(ScmBufferInfo {
-            width: buf.width,
-            height: buf.height,
-            size: buf.size,
-            bit_depth: buf.bit_depth,
-            vaddr: buf.vaddr,
-            flags: ScmBfFlag::from_bits_truncate(buf.flags as u8),
-        })
+}
+#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
+pub struct ScmUiFrameworkId(u32);
+
+impl ScmUiFrameworkId {
+    pub fn new() -> Self {
+        static MAX_ID: AtomicU32 = AtomicU32::new(0);
+        return ScmUiFrameworkId(MAX_ID.fetch_add(1, Ordering::SeqCst));
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct ScmUiFrameworkMetadata {
-    // pub list: LinkedList<Box<TextuiWindow>>,
-    pub id: i16,
+    pub id: ScmUiFrameworkId,
     pub name: String,
     pub f_type: ScmFramworkType,
-    pub buf: ScmBufferInfo,
+    pub buf_info: ScmBufferInfo,
     // pub private_info: ScmUiPrivateInfo,
-    pub is_null: bool,
+    pub is_enable: bool,
     pub window_max_id: u32,
 }
-static F_ID: AtomicUsize = AtomicUsize::new(0);
 
 impl ScmUiFrameworkMetadata {
     pub fn new(f_type: ScmFramworkType) -> Self {
         match f_type {
             ScmFramworkType::Text => {
-                let count = F_ID.fetch_add(1, Ordering::SeqCst);
                 let result = ScmUiFrameworkMetadata {
                     // list: LinkedList::new(),
-                    id: count as i16,
+                    id: ScmUiFrameworkId::new(),
                     name: "".to_string(),
                     f_type: ScmFramworkType::Text,
-                    buf: ScmBufferInfo::new(ScmBfFlag::SCM_BF_TEXT).unwrap(),
-                    is_null: true,
+                    buf_info: ScmBufferInfo::new(ScmBfFlag::SCM_BF_TEXT).unwrap(),
+                    is_enable: false,
                     window_max_id: 0,
                 };
                 return result;
@@ -173,7 +247,7 @@ impl ScmUiFrameworkMetadata {
 }
 pub trait ScmUiFramework: Sync + Send + Debug {
     // 安装ui框架的回调函数
-    fn install(&self, _buf: ScmBufferInfo) -> Result<i32, SystemError> {
+    fn install(&self) -> Result<i32, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     // 卸载ui框架的回调函数
@@ -193,16 +267,12 @@ pub trait ScmUiFramework: Sync + Send + Debug {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     /// @brief 获取ScmUiFramework的元数据
-    ///
     /// @return 成功：Ok(ScmUiFramework的元数据)
     ///         失败：Err(错误码)
     fn metadata(&self) -> Result<ScmUiFrameworkMetadata, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-    // fn clone_box(&self) -> Result<Box<dyn ScmUiFramework>,SystemError>{
-    //     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    // }
 }
 
 /**
@@ -211,10 +281,18 @@ pub trait ScmUiFramework: Sync + Send + Debug {
  */
 #[no_mangle]
 pub extern "C" fn scm_init() {
-    c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_init\n\0".as_ptr());
-    unsafe { SCM_DOUBLE_BUFFER_ENABLED.store(false, Ordering::SeqCst) }; // 禁用双缓冲
-                                                                         // CURRENT_FRAMEWORK_METADATA.lock().is_null = true;
-    c_uart_send_str(UartPort::COM1.to_u16(), "\nfinish_init\n\0".as_ptr());
+    SCM_DOUBLE_BUFFER_ENABLED.store(false, Ordering::SeqCst); // 禁用双缓冲
+
+    //用于textui未初始化时
+    no_texiui_init();
+
+    c_uart_send_str(UartPort::COM1.to_u16(), "\nfinish_scm_init\n\0".as_ptr());
+}
+// 因为没有动态分配，texiui不能启动，只能暂时暴力往屏幕（video_frame_buffer_info）输出信息
+fn no_texiui_init() {
+    *TRUE_LINE_NUM.write() =
+        unsafe { (video_frame_buffer_info.height / TEXTUI_CHAR_HEIGHT) as i32 };
+    *CHAR_PER_LINE.write() = unsafe { (video_frame_buffer_info.width / TEXTUI_CHAR_WIDTH) as i32 };
 }
 /**
  * @brief 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
@@ -222,36 +300,27 @@ pub extern "C" fn scm_init() {
  * @param ui 要启动的ui框架
  * @return int 返回码
  */
-pub fn scm_framework_enable(textuiframework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
-    if textuiframework.metadata()?.buf.vaddr == 0 {
+pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
+    if framework.metadata()?.buf_info.vaddr == 0 {
         return Err(SystemError::EINVAL);
     }
-    let mut current_framework = CURRENT_FRAMEWORK_METADATA.lock();
+    let mut current_framework = CURRENT_FRAMEWORK_METADATA.write();
+    // 获取信息
+    let metadata = framework.metadata()?;
 
-    if unsafe { SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) } == true {
-        let buf: *mut scm_buffer_info_t =
-            &mut textuiframework.metadata()?.buf.to_c() as *mut scm_buffer_info_t;
+    if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == true {
+        // let buf: *mut scm_buffer_info_t =
+        //     &mut framework.metadata()?.buf_info.into() as *mut scm_buffer_info_t;
+        let buf:scm_buffer_info_t =framework.metadata()?.buf_info.into() ;
         let retval = unsafe { video_set_refresh_target(buf) };
         if retval == 0 {
-            current_framework.id = textuiframework.metadata()?.id;
-            current_framework.buf = textuiframework.metadata()?.buf;
-            current_framework.f_type = textuiframework.metadata()?.f_type;
-            current_framework.name = textuiframework.metadata()?.name;
-            // current_framework.private_info = ui.metadata().unwrap().private_info;
-            current_framework.is_null = textuiframework.metadata()?.is_null;
-            current_framework.window_max_id = textuiframework.metadata()?.window_max_id;
+            *current_framework = metadata;
+            (*current_framework).is_enable = true;
         }
     } else {
-        current_framework.id = textuiframework.metadata()?.id;
-        current_framework.buf = textuiframework.metadata()?.buf;
-        current_framework.f_type = textuiframework.metadata()?.f_type;
-        current_framework.name = textuiframework.metadata()?.name;
-        // current_framework.private_info = ui.metadata()?.private_info;
-        current_framework.is_null = textuiframework.metadata()?.is_null;
-        current_framework.window_max_id = textuiframework.metadata()?.window_max_id;
+        *current_framework = metadata;
+        (*current_framework).is_enable = true;
     }
-    unsafe { FB = current_framework.buf.vaddr };
-    unsafe { BUF_WIDTH = current_framework.buf.width };
 
     return Ok(0);
 }
@@ -261,18 +330,18 @@ pub fn scm_framework_enable(textuiframework: Arc<dyn ScmUiFramework>) -> Result<
  * @param ui 框架结构体指针
  * @return int 错误码
  */
-pub fn scm_register(ui: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
+pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     // 把ui框架加入链表
-    SCM_FRAMEWORK_LIST.lock().push_back(ui.clone());
-    // 调用ui框架的回调函数以安装ui框架，并将其激活
-    
-    ui.install(ui.metadata()?.buf)?;
-    ui.enable()?;
 
-    if CURRENT_FRAMEWORK_METADATA.lock().is_null {
-        return scm_framework_enable(ui);
+    SCM_FRAMEWORK_LIST.lock().push_back(framework.clone());
+    // 调用ui框架的回调函数以安装ui框架，并将其激活
+    framework.install()?;
+    framework.enable()?;
+    // 如果当前还没有框架获得了屏幕的控制权，就让其拿去
+    if !CURRENT_FRAMEWORK_METADATA.read().is_enable {
+        return scm_framework_enable(framework);
     }
-    
+
     return Ok(0);
 }
 /**
@@ -281,35 +350,35 @@ pub fn scm_register(ui: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
  * @param buf
  * @return int
  */
-fn destroy_buffer(buf: &mut scm_buffer_info_t) -> Result<i32, SystemError> {
-    // 不能销毁帧缓冲区对象
-    // if buf == unsafe { &mut video_frame_buffer_info }.as_mut().unwrap() {
-    //     return Err(SystemError::EINVAL);
-    // }
-    if buf.vaddr == 0 {
-        return Err(SystemError::EINVAL);
-    }
-    if unsafe { verify_area(buf.vaddr, buf.size.into()) } {
-        return Err(SystemError::EINVAL);
-    }
-    // 是否双缓冲区
-    if ScmBfFlag::from_bits_truncate(buf.flags as u8).contains(ScmBfFlag::SCM_BF_FB) {
-        return Err(SystemError::EINVAL);
-    }
+// fn destroy_buffer(buf: &mut scm_buffer_info_t) -> Result<i32, SystemError> {
+//     // 不能销毁帧缓冲区对象
+//     if unsafe { scm_buffer_info_is_equal(*buf, video_frame_buffer_info) } {
+//         return Err(SystemError::EINVAL);
+//     }
+//     if buf.vaddr == 0 {
+//         return Err(SystemError::EINVAL);
+//     }
+//     if unsafe { verify_area(buf.vaddr as u64, buf.size.into()) } {
+//         return Err(SystemError::EINVAL);
+//     }
+//     // 是否双缓冲区
+//     if ScmBfFlag::from_bits_truncate(buf.flags as u8).contains(ScmBfFlag::SCM_BF_FB) {
+//         return Err(SystemError::EINVAL);
+//     }
 
-    // 释放内存页
-    let page_size = PAGE_2M_SIZE;
-    let page_align = PAGE_2M_ALIGN(unsafe { video_frame_buffer_info.size });
-    let page_count = page_align / page_size;
-    unsafe {
-        free_pages(
-            Phy_to_2M_Page(virt_2_phys(buf.vaddr as usize)),
-            page_count as i32,
-        )
-    };
+//     // 释放内存页
+//     let page_size = PAGE_2M_SIZE;
+//     let page_align = PAGE_2M_ALIGN(unsafe { video_frame_buffer_info.size });
+//     let page_count = page_align / page_size;
+//     unsafe {
+//         free_pages(
+//             Phy_to_2M_Page(virt_2_phys(buf.vaddr as usize)),
+//             page_count as i32,
+//         )
+//     };
 
-    return Ok(0);
-}
+//     return Ok(0);
+// }
 /**
  * @brief 允许双缓冲区
  *
@@ -317,64 +386,97 @@ fn destroy_buffer(buf: &mut scm_buffer_info_t) -> Result<i32, SystemError> {
  */
 #[no_mangle]
 pub extern "C" fn scm_enable_double_buffer() -> i32 {
-    c_uart_send_str(UartPort::COM1.to_u16(), "\nscm_enable_double\n\0".as_ptr());
-    if unsafe { SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) } {
+    let r = ture_scm_enable_double_buffer()
+        .map_err(|e| e.to_posix_errno())
+        .unwrap();
+    if r.is_negative() {
+        c_uart_send_str(
+            UartPort::COM1.to_u16(),
+            "scm enable double buffer fail.\n\0".as_ptr(),
+        );
+    }
+
+    return r;
+}
+fn ture_scm_enable_double_buffer() -> Result<i32, SystemError> {
+    if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) {
         // 已经开启了双缓冲区了, 直接退出
-        return 0;
+        return Ok(0);
     }
-    unsafe { SCM_DOUBLE_BUFFER_ENABLED.store(true, Ordering::SeqCst) };
-    let mut scm_list = SCM_FRAMEWORK_LIST.lock();
-    if scm_list.is_empty() {
-        // scm 框架链表为空
-        return 0;
-    }
+    // let mut scm_list = SCM_FRAMEWORK_LIST.lock();
+    // if scm_list.is_empty() {
+    //     // scm 框架链表为空
+    //     return Ok(0);
+    // }
+    SCM_DOUBLE_BUFFER_ENABLED.store(true, Ordering::SeqCst);
+    // 逐个检查已经注册了的ui框架，将其缓冲区更改为双缓冲(暂时还没想好怎么不用指针把各个框架的缓冲区更改为双缓冲区，先直接把textui框架的缓冲区更改为双缓冲)
+    // for framework in scm_list.iter_mut() {
+    //     if unsafe {
+    //         scm_buffer_info_is_equal(
+    //             framework.metadata()?.buf_info.into(),
+    //             video_frame_buffer_info,
+    //         )
+    //     } {
+    //         c_uart_send_str(UartPort::COM1.to_u16(), "\ninit double buffer\n\0".as_ptr());
+    //         // 创建双缓冲区
+    //         let buf_into = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL)?;
+    //         if !framework.change(buf_into.clone()).is_err() {
+    //             destroy_buffer(&mut buf_into.into())?;
+    //         }
+    //     }
+    // }
 
-    // 逐个检查已经注册了的ui框架，将其缓冲区更改为双缓冲
-    for ptr in scm_list.iter_mut() {
-        if unsafe { buffer_equal(ptr.metadata().unwrap().buf.to_c(), video_frame_buffer_info) } {
-            let message: *const u8 = "\ninit double buffer\n\0".as_ptr();
-            c_uart_send_str(UartPort::COM1.to_u16(), message);
-            let buf = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL);
-            if buf.is_err() {
-                return -1;
-            }
-            c_uart_send_str(
-                UartPort::COM1.to_u16(),
-                "\nto change double buffer\n\0".as_ptr(),
-            );
-
-            if ptr.change(buf.clone().unwrap()).unwrap() != 0 {
-                let _ = destroy_buffer(&mut buf.unwrap().to_c());
-            }
-        }
-    }
-
+    // 创建双缓冲区
+    let buf_info = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL)?;
+    // let buf_info=ScmBufferInfo::from(unsafe { __create_double_buffer(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL) });
+    (*CURRENT_FRAMEWORK_METADATA.write()).buf_info = buf_info.clone();
     // 设置定时刷新的对象
-    unsafe {
-        video_set_refresh_target(
-            &mut CURRENT_FRAMEWORK_METADATA.lock().buf.to_c() as *mut scm_buffer_info_t
-        )
-    };
+    // unsafe {
+    //     video_set_refresh_target(
+    //         &mut CURRENT_FRAMEWORK_METADATA.read().buf_info.clone().into()
+    //             as *mut scm_buffer_info_t,
+    //     )
+    // };
+    // let target_buf: *mut scm_buffer_info_t = &mut buf_info.clone().into() as *mut scm_buffer_info_t;
+    // println!("target_buf:{:#018x}",buf_info.vaddr);
+
+    // unsafe { video_set_refresh_target(target_buf) };
+    unsafe { video_set_refresh_target(buf_info.clone().into()) };
+    textui_change_buf(buf_info.clone())?;
     // 通知显示驱动，启动双缓冲
     unsafe { video_reinitialize(true) };
-    return 0;
+    renew_buf(buf_info.get_vaddr(), buf_info.get_height_about_u32());
+    // println!("vaddr:{:#018x}",buf_info.get_vaddr());
+    // loop{}
+    return Ok(0);
 }
+
 /**
  * @brief 当内存管理单元被初始化之后，重新处理帧缓冲区问题
  *
  */
 #[no_mangle]
 pub extern "C" fn scm_reinit() -> i32 {
-    unsafe { video_reinitialize(false) };
-
-    // 遍历当前所有使用帧缓冲区的框架，更新地址
-    // 逐个检查已经注册了的ui框架，将其缓冲区更改为双缓冲
-    for ptr in SCM_FRAMEWORK_LIST.lock().iter_mut() {
-        if unsafe { buffer_equal(ptr.metadata().unwrap().buf.to_c(), video_frame_buffer_info) } {
-            let _ = ptr
-                .change(unsafe { ScmBufferInfo::copy_from_c(&video_frame_buffer_info).unwrap() });
-        }
+    let r = true_scm_reinit().map_err(|e| e.to_posix_errno()).unwrap();
+    if r.is_negative() {
+        c_uart_send_str(UartPort::COM1.to_u16(), "scm reinit failed.\n\0".as_ptr());
     }
-
-    return 0;
+    return r;
+}
+fn true_scm_reinit() -> Result<i32, SystemError> {
+    unsafe { video_reinitialize(false) };
+    // 遍历当前所有使用帧缓冲区的框架，更新地址(暂时还没想好怎么不用指针把各个框架的缓冲区更改为双缓冲区，先直接把textui框架的缓冲区更改为双缓冲)
+    // for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
+    //     if unsafe {
+    //         scm_buffer_info_is_equal(
+    //             framework.metadata()?.buf_info.into(),
+    //             video_frame_buffer_info,
+    //         )
+    //     } {
+    //         framework.change(unsafe { ScmBufferInfo::from(&video_frame_buffer_info) })?;
+    //     }
+    // }
+    textui_change_buf(unsafe { ScmBufferInfo::from(&video_frame_buffer_info) })?;
+    // unsafe { scm_enable_put_to_window() };
+    return Ok(0);
 }

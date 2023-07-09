@@ -1,5 +1,5 @@
 #include "process.h"
-
+#include <driver/uart/uart.h>
 #include <DragonOS/signal.h>
 #include <common/compiler.h>
 #include <common/completion.h>
@@ -558,7 +558,9 @@ ul initial_kernel_thread(ul arg)
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
     int val = 0;
     val = scm_enable_double_buffer();
-
+    // c_uart_send_str(COM1, "\ntextui_install_handler4444444444\n\0");
+    
+    // while (1);    
     rs_init_stdio();
     // block_io_scheduler_init();
     ahci_init();
@@ -623,7 +625,7 @@ ul initial_kernel_thread(ul arg)
                          "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/bin/shell.elf"), "c"(NULL),
                          "d"(NULL)
                          : "memory");
-       
+
     return 1;
 }
 #pragma GCC pop_options
@@ -889,7 +891,7 @@ void process_exit_thread(struct process_control_block *pcb)
 int process_release_pcb(struct process_control_block *pcb)
 {
     // 释放子进程的页表
-    process_exit_mm(pcb);
+    // process_exit_mm(pcb);
     if ((pcb->flags & PF_KTHREAD)) // 释放内核线程的worker private结构体
         free_kthread_struct(pcb);
 

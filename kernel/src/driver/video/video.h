@@ -25,9 +25,11 @@ int video_init();
  * @param buf 
  * @return int 
  */
-int video_set_refresh_target(struct scm_buffer_info_t *buf);
+// int video_set_refresh_target(struct scm_buffer_info_t *buf);
+int video_set_refresh_target(struct scm_buffer_info_t buf);
 
 extern uint64_t video_refresh_expire_jiffies;
 extern uint64_t video_last_refresh_pid;
 
 void video_refresh_framebuffer(void *data);
+uint64_t get_video_refresh_target_vaddr();

@@ -1,7 +1,14 @@
 #pragma once
 #include <common/sys/types.h>
 #include <common/glib.h>
-
+// #include <common/kprint.h>
+// #include <common/spinlock.h>
+// #include <common/string.h>
+// #include <driver/multiboot2/multiboot2.h>
+// #include <driver/uart/uart.h>
+// #include <driver/video/video.h>
+// #include <mm/mm.h>
+// #include <mm/slab.h>
 // 帧缓冲区标志位
 #define SCM_BF_FB (1 << 0)    // 当前buffer是设备显存中的帧缓冲区
 #define SCM_BF_DB (1 << 1)    // 当前buffer是双缓冲
@@ -27,7 +34,7 @@ struct scm_buffer_info_t
     uint64_t flags; // 帧缓冲区标志位
 };
 //判断scm_buffer_info_t是否相等
-bool buffer_equal(struct scm_buffer_info_t a,struct scm_buffer_info_t b)
+bool scm_buffer_info_is_equal(struct scm_buffer_info_t a,struct scm_buffer_info_t b)
 {
     return a.width == b.width && a.height == b.height && a.size == b.size && a.bit_depth == b.bit_depth && a.vaddr == b.vaddr && a.flags == b.flags;
 }
@@ -114,9 +121,51 @@ int scm_enable_alloc();
 extern int scm_enable_double_buffer();
 
 /**
+ * @brief 允许往窗口打印信息
+ *
+ */
+extern void scm_enable_put_to_window();
+/**
+ * @brief 禁止往窗口打印信息
+ *
+ */
+extern void scm_disable_put_to_window();
+/**
  * @brief 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
  *
  * @param ui 要启动的ui框架
  * @return int 返回码
  */
 int scm_framework_enable(struct scm_ui_framework_t *ui);
+
+/**
+ * @brief 创建双缓冲区
+ *
+ * @param type 帧缓冲区类型
+ * @return struct scm_buffer_info_t* 新的帧缓冲区结构体
+ */
+// struct scm_buffer_info_t __create_double_buffer(uint64_t type){
+//     struct scm_buffer_info_t buf;
+//     memset(&buf, 0, sizeof(struct scm_buffer_info_t));
+//     buf.bit_depth = video_frame_buffer_info.bit_depth;
+//     buf.flags = SCM_BF_DB;
+  
+//     if (type & SCM_BF_PIXEL)
+//         buf.flags |= SCM_BF_PIXEL;
+//     else
+//         buf.flags |= SCM_BF_TEXT;
+//     buf.height = video_frame_buffer_info.height;
+//     buf.width = video_frame_buffer_info.width;
+//     buf.size = video_frame_buffer_info.size;
+
+//     struct Page *p = alloc_pages(ZONE_NORMAL, PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE, 0);
+//     if (p == NULL)
+//         goto failed;
+//     buf.vaddr = (uint64_t)phys_2_virt(p->addr_phys);
+
+//     return buf;
+
+// failed:
+//     memset(&buf, 0, sizeof(struct scm_buffer_info_t));
+//     return buf;
+// }

@@ -234,7 +234,7 @@ void mm_init()
 
     initial_mm.code_addr_start = memory_management_struct.kernel_code_start;
     initial_mm.code_addr_end = memory_management_struct.kernel_code_end;
-   
+
     initial_mm.data_addr_start = (ul)&_data;
     initial_mm.data_addr_end = memory_management_struct.kernel_data_end;
 
@@ -323,6 +323,8 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
 
     for (int i = zone_start; i < zone_end; ++i)
     {
+        
+        
         if ((memory_management_struct.zones_struct + i)->count_pages_free < num)
             continue;
 
@@ -334,6 +336,8 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
         ul tmp = 64 - page_start % 64;
         for (ul j = page_start; j < page_end; j += ((j % 64) ? tmp : 64))
         {
+            // kdebug("jjjjjjjjjjjjj");
+
             // 按照bmp中的每一个元素进行查找
             // 先将p定位到bmp的起始元素
             ul *p = memory_management_struct.bmp + (j >> 6);
@@ -342,9 +346,10 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
             ul tmp_num = ((1UL << num) - 1);
             for (ul k = shift; k < 64; ++k)
             {
+                // kdebug("kkkkkkkkkkkkkkk");
+
                 // 寻找连续num个空页
                 if (!((k ? ((*p >> k) | (*(p + 1) << (64 - k))) : *p) & tmp_num))
-
                 {
                     ul start_page_num = j + k - shift; // 计算得到要开始获取的内存页的页号
                     for (ul l = 0; l < num; ++l)
@@ -365,7 +370,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
             }
         }
     }
-    kBUG("Cannot alloc page, ZONE=%d\tnums=%d, mm_total_2M_pages=%d", zone_select, num, mm_total_2M_pages);
+    kBUG("Cannot alloc page, ZONE=%d \tnums=%d, mm_total_2M_pages=%d", zone_select, num, mm_total_2M_pages);
     return NULL;
 }
 
@@ -468,12 +473,12 @@ void free_pages(struct Page *page, int number)
 void page_table_init()
 {
     kinfo("Re-Initializing page table...");
+    scm_disable_put_to_window();
     ul *global_CR3 = get_CR3();
-    
 
     int js = 0;
     ul *tmp_addr;
-    
+
     for (int i = 0; i < memory_management_struct.count_zones; ++i)
     {
         struct Zone *z = memory_management_struct.zones_struct + i;
@@ -483,13 +488,12 @@ void page_table_init()
             break;
 
         for (int j = 0; j < z->count_pages; ++j)
-        {         
+        {
             mm_map_proc_page_table((uint64_t)get_CR3(), true, (ul)phys_2_virt(p->addr_phys), p->addr_phys, PAGE_2M_SIZE, PAGE_KERNEL_PAGE, false, true, false);
-            
+
             ++p;
             ++js;
         }
-        
     }
 
     barrier();
@@ -515,7 +519,8 @@ void page_table_init()
     }
     barrier();
     flush_tlb();
-    kinfo("Page table Initialized. Affects:%d", js);
+    // kinfo("Page table Initialized. Affects:%d", js);
+    // c_uart_send_str(COM1, "\nscm_enable_double\n\0".as_ptr());
 }
 
 /**

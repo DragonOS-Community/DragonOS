@@ -153,6 +153,7 @@ int execv(const char *path, char *const argv[])
         errno = -ENOENT;
         return -1;
     }
+
     int retval = syscall_invoke(SYS_EXECVE, (uint64_t)path, (uint64_t)argv, 0, 0, 0, 0, 0, 0);
     if (retval != 0)
         return -1;
@@ -217,7 +218,7 @@ pid_t getpid(void)
 
 int dup(int fd)
 {
-    return syscall_invoke(SYS_DUP, fd, 0, 0, 0, 0, 0, 0, 0);    
+    return syscall_invoke(SYS_DUP, fd, 0, 0, 0, 0, 0, 0, 0);
 }
 
 int dup2(int ofd, int nfd)

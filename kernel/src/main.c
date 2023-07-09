@@ -62,15 +62,22 @@ void reload_idt()
     // kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
     // kdebug("gdt size=%d", p.size);
 
-    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp) : "memory");
+    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp)
+                 : "memory");
 }
 
 // 初始化系统各模块
 void system_initialize()
 {
     c_uart_init(COM1, 115200);
-    video_init();
 
+    video_init();
+    // kinfo("11111111111vaddr:%d", video_frame_buffer_info.vaddr);
+    // kinfo("11111111111vaddr:%#018lx", 0xffffa00003000000UL);
+    // kinfo("11111111111vaddr:%#018lx", 0xffff800003000000UL);
+
+    // while (1);
+    scm_init();
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 
@@ -89,28 +96,30 @@ void system_initialize()
     // 初始化中断描述符表
     sys_vector_init();
     //  初始化内存管理单元
+    // scm_disable_put_to_window();
+
     mm_init();
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
     // 对显示模块进行低级初始化，不启用double buffer
+
     io_mfence();
-    video_init();
-    scm_init();
+
     scm_reinit();
-    io_mfence();
+    // scm_enable_put_to_window();
+
     rs_textui_init();
+    // kinfo("vaddr:%d", video_frame_buffer_info.vaddr);
+    // while (1);
+    // for (int i = 0; i < 10; i++)
+    // {
+    //     kinfo("i:%d",i);
+    // }
+    // kinfo("vaddr:%d", video_frame_buffer_info.vaddr);
+    // while (1)
+    scm_enable_put_to_window();
     io_mfence();
-    
-    kinfo("333333333");
-    
-    kinfo("333333333");
-    kinfo("333333333");kinfo("333333333");kinfo("333333333");kinfo("333333333");
-    kinfo("333333333");
-    while(1);
-    kinfo("333333333");
-    
-    
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
@@ -151,7 +160,7 @@ void system_initialize()
 
     vfs_init();
     rs_tty_init();
-    
+
     cpu_init();
     ps2_keyboard_init();
     // tty_init();
@@ -171,7 +180,7 @@ void system_initialize()
     io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
-    
+
     process_init();
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
@@ -184,7 +193,7 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
-   
+
     // 这里不能删除，否则在O1会报错
     // while (1)
     //     pause();

@@ -495,10 +495,12 @@ int shell_cmd_exec(int argc, char **argv)
         int path_len = 0;
         char *file_path = get_target_filepath(argv[1], &path_len);
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
+    
         execv(file_path, argv);
         // printf("after execv, path=%s, argc=%d\n", file_path, argc);
         free(argv);
         free(file_path);
+
 
         exit(-1);
     }
@@ -511,11 +513,13 @@ int shell_cmd_exec(int argc, char **argv)
             printf("[1] %d\n", pid); // 输出子进程的pid
         
         free(argv);
+
     }
 }
 
 int shell_cmd_about(int argc, char **argv)
 {
+    
     if (argv != NULL)
         free(argv);
     int aac = 0;

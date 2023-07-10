@@ -63,7 +63,7 @@ pub fn bus_driver_register(
     name: &str,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     match SYS_BUS_INODE().find(bus_name) {
-        Ok(platform) => match platform.find("driver") {
+        Ok(platform) => match platform.find("drivers") {
             Ok(device) => {
                 device
                     .as_any_ref()
@@ -87,7 +87,7 @@ pub fn bus_device_register(
     name: &str,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     match SYS_BUS_INODE().find(bus_name) {
-        Ok(platform) => match platform.find("device") {
+        Ok(platform) => match platform.find("devices") {
             Ok(device) => {
                 device
                     .as_any_ref()

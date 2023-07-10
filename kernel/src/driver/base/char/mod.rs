@@ -25,8 +25,14 @@ lazy_static! {
 }
 
 pub trait CharDevice: KObject {
+    /// @brief: 打开设备
+    /// @parameter: file: devfs inode
+    /// @return: 打开成功，返回OK(())，失败，返回错误代码
     fn open(&self, file: Arc<dyn IndexNode>) -> Result<(), SystemError>;
 
+    /// @brief: 关闭设备
+    /// @parameter: file: devfs inode
+    /// @return: 关闭成功，返回OK(())，失败，返回错误代码
     fn close(&self, file: Arc<dyn IndexNode>) -> Result<(), SystemError>;
 }
 
@@ -134,7 +140,7 @@ fn find_dynamic_major() -> Result<usize, SystemError> {
 }
 
 /// @brief: 注册设备号，该函数需要指定主设备号
-/// @parameter: major: 主设备号
+/// @parameter: from: 主设备号
 ///             count: 次设备号数量
 ///             name: 字符设备名
 /// @return: 如果注册成功，返回设备号，否则，返回错误码
@@ -147,7 +153,7 @@ pub fn register_chrdev_region(
 }
 
 /// @brief: 注册设备号，该函数自动分配主设备号
-/// @parameter: major: 主设备号
+/// @parameter: baseminor: 主设备号
 ///             count: 次设备号数量
 ///             name: 字符设备名
 /// @return: 如果注册成功，返回，否则，返回false
@@ -160,8 +166,7 @@ pub fn alloc_chrdev_region(
 }
 
 /// @brief: 注册设备号
-/// @parameter: major: 主设备号，如果为0，动态分配
-///             baseminor: 起始次设备号
+/// @parameter: device_number: 设备号，主设备号如果为0，则动态分配
 ///             minorct: 次设备号数量
 ///             name: 字符设备名
 /// @return: 如果注册成功，返回设备号，否则，返回错误码

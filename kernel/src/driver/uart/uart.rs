@@ -1,16 +1,19 @@
 use super::super::base::device::Device;
 use crate::{
-    driver::{
-        base::{
-            char::CharDevice,
-            device::{DeviceState, DeviceType, IdTable, KObject},
-            platform::{self, platform_device::PlatformDevice, platform_driver::PlatformDriver},
+    driver::base::{
+        char::{CharDevice, register_chrdev_region, cdev_add},
+        device::{driver::Driver, DeviceState, DeviceType, IdTable, KObject, DeviceNumber},
+        platform::{
+            self, platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
         },
-        Driver,
     },
-    filesystem::{vfs::IndexNode, sysfs::bus::{bus_device_register, bus_driver_register}},
+    filesystem::{
+        sysfs::bus::{bus_device_register, bus_driver_register},
+        vfs::IndexNode,
+    },
     include::bindings::bindings::{io_in8, io_out8},
-    libs::spinlock::SpinLock, syscall::SystemError,
+    libs::spinlock::SpinLock,
+    syscall::SystemError,
 };
 use alloc::sync::Arc;
 use core::{char, intrinsics::offset, str};
@@ -21,10 +24,13 @@ const E_UART_SERIAL_FAULT: i32 = 2;
 const UART_MAX_BITS_RATE: u32 = 115200;
 
 lazy_static! {
+    // 串口设备
     pub static ref UART_DEV: Arc<LockUart> = Arc::new(LockUart::default());
+    // 串口驱动
     pub static ref UART_DRV: Arc<LockUartDriver> = Arc::new(LockUartDriver::default());
 }
 
+// @brief 串口端口
 #[allow(dead_code)]
 #[repr(u16)]
 #[derive(Clone, Debug)]
@@ -76,6 +82,7 @@ impl UartPort {
     }
 }
 
+// @brief 串口寄存器
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -90,9 +97,10 @@ struct UartRegister {
     reg_scartch: u8,
 }
 
+// @brief 串口设备结构体
 #[derive(Debug)]
 pub struct Uart {
-    state: DeviceState,
+    state: DeviceState, // 设备状态
     sys_info: Option<Arc<dyn IndexNode>>,
     driver: Option<Arc<dyn PlatformDriver>>,
 }
@@ -107,6 +115,7 @@ impl Default for Uart {
     }
 }
 
+// @brief 串口设备结构体(加锁)
 #[derive(Debug)]
 pub struct LockUart(SpinLock<Uart>);
 
@@ -163,6 +172,7 @@ impl Device for LockUart {
     }
 }
 
+// @brief 串口驱动结构体
 #[repr(C)]
 #[derive(Debug)]
 pub struct UartDriver {
@@ -181,6 +191,7 @@ impl Default for UartDriver {
     }
 }
 
+// @brief 串口驱动结构体(加锁)
 #[derive(Debug)]
 pub struct LockUartDriver(SpinLock<UartDriver>);
 
@@ -195,6 +206,18 @@ impl KObject for LockUartDriver {}
 impl Driver for LockUartDriver {
     fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
         self
+    }
+
+    fn id_table(&self) -> IdTable {
+        return IdTable::new("uart_driver", 0);
+    }
+
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
+        self.0.lock().sys_info = sys_info;
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+        return self.0.lock().sys_info.clone();
     }
 }
 
@@ -214,7 +237,25 @@ impl LockUartDriver {
     }
 }
 
+impl PlatformDriver for LockUartDriver {
+    fn probe(
+        &self,
+        device: Arc<dyn PlatformDevice>,
+    ) -> Result<(), crate::driver::base::device::driver::DriverError> {
+        return Ok(());
+    }
+
+    fn compatible_table(&self) -> platform::CompatibleTable {
+        return CompatibleTable::new(vec!["uart"]);
+    }
+}
+
 impl UartDriver {
+    /// @brief 创建串口驱动
+    /// @param port 端口号
+    ///        baud_rate 波特率
+    ///        sys_info: sys文件系统inode
+    /// @return 返回串口驱动
     pub fn new(port: UartPort, baud_rate: u32, sys_info: Option<Arc<dyn IndexNode>>) -> Self {
         Self {
             port,
@@ -402,8 +443,17 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
     */
 }
 
+/// @brief 串口初始化，注册串口
+/// @param none
+/// @return 初始化成功，返回(),失败，返回错误码
 pub fn uart_init() -> Result<(), SystemError> {
-    bus_device_register("platform", "uart").map_err(|e| e.into())?;
-    bus_driver_register("platform", "uart_driver").map_err(|e| e.into())?;
+    let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().to_name())
+        .expect("uart device register error");
+    UART_DEV.set_sys_info(Some(device_inode));
+    let driver_inode = bus_driver_register("platform:0", &UART_DRV.id_table().to_name())
+        .expect("uart driver register error");
+    UART_DRV.set_sys_info(Some(driver_inode));
+    UART_DEV.set_driver(Some(UART_DRV.clone()));
+    UART_DEV.set_state(DeviceState::Initialized);
     return Ok(());
 }

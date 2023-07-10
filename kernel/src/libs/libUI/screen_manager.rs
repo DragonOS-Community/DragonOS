@@ -63,42 +63,7 @@ pub enum ScmFramworkType {
     Unused,
 }
 
-// #[derive(Debug)]
-// pub struct Buf<'a>(&'a mut [u32]);
-// impl Buf<'_> {
-//     pub fn new(buf: &mut [u32]) -> Buf {
-//         Buf(buf)
-//     }
-//     pub fn get_buf_from_vaddr(vaddr: usize, len: usize) -> Buf<'static> {
-//         let new_buf: &mut [u32] =
-//             unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u32, len) };
-//         let buf: Buf<'_> = Buf::new(new_buf);
-//         return buf;
-//     }
-//     pub fn get_buf_from_video_frame_buffer_info() -> Buf<'static> {
-//         let len =
-//             unsafe { video_frame_buffer_info.width * video_frame_buffer_info.height } as usize;
-//         Buf::get_buf_from_vaddr(unsafe { video_frame_buffer_info.vaddr }, len)
-//     }
-// }
-// impl Into<&mut [u32]> for Buf<'_> {
-//     fn into(self) -> &'static mut [u32] {
-//         self.0
-//     }
-// }
-// impl Clone for Buf<'_> {
-//     fn clone(&self) -> Self {
-//         let mut buf = Vec::new();
-//         for i in self.0.iter() {
-//             &buf.push(*i);
-//         }
-//         let b = buf.as_mut_slice();
-//         // 转移对 cloned_data 的所有权到新创建的 Buf 实例中
-//         let cloned = Buf::new(b);
-//         core::mem::forget(b);
-//         return cloned;
-//     }
-// }
+
 #[derive(Debug, Clone)]
 pub struct ScmBufferInfo {
     width: u32,       // 帧缓冲区宽度（pixel或columns）
@@ -143,22 +108,10 @@ impl ScmBufferInfo {
                 ScmBufferInfo::from(unsafe { &video_frame_buffer_info });
             frame_buffer_info.flags = buf_type;
 
-            // let p: *mut Page = unsafe {
-            //     alloc_pages(
-            //         ZONE_NORMAL,
-            //         (PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE) as i32,
-            //         0,
-            //     )
-            // };
-            // if p.is_null() {
-            //     return Err(SystemError::ENOMEM);
-            // } else {
-            //     frame_buffer_info.vaddr = phys_2_virt(((unsafe { *p }).addr_phys) as usize);
-            //     return Ok(frame_buffer_info);
-            // }
+
             frame_buffer_info.vaddr = get_vaddr_of_double_buf()?;
             // println!("vaddr:{}", frame_buffer_info.vaddr);
-            // loop{}
+
             return Ok(frame_buffer_info);
         }
     }
@@ -309,8 +262,7 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
     let metadata = framework.metadata()?;
 
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == true {
-        // let buf: *mut scm_buffer_info_t =
-        //     &mut framework.metadata()?.buf_info.into() as *mut scm_buffer_info_t;
+
         let buf:scm_buffer_info_t =framework.metadata()?.buf_info.into() ;
         let retval = unsafe { video_set_refresh_target(buf) };
         if retval == 0 {
@@ -428,19 +380,9 @@ fn ture_scm_enable_double_buffer() -> Result<i32, SystemError> {
 
     // 创建双缓冲区
     let buf_info = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL)?;
-    // let buf_info=ScmBufferInfo::from(unsafe { __create_double_buffer(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL) });
+
     (*CURRENT_FRAMEWORK_METADATA.write()).buf_info = buf_info.clone();
     // 设置定时刷新的对象
-    // unsafe {
-    //     video_set_refresh_target(
-    //         &mut CURRENT_FRAMEWORK_METADATA.read().buf_info.clone().into()
-    //             as *mut scm_buffer_info_t,
-    //     )
-    // };
-    // let target_buf: *mut scm_buffer_info_t = &mut buf_info.clone().into() as *mut scm_buffer_info_t;
-    // println!("target_buf:{:#018x}",buf_info.vaddr);
-
-    // unsafe { video_set_refresh_target(target_buf) };
     unsafe { video_set_refresh_target(buf_info.clone().into()) };
     textui_change_buf(buf_info.clone())?;
     // 通知显示驱动，启动双缓冲

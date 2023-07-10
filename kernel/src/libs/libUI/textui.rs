@@ -24,10 +24,6 @@ use super::screen_manager::{
 };
 use lazy_static::lazy_static;
 
-// 暂时初始化16080个初始字符对象以及67个虚拟行对象
-// const INITIAL_CHARS_NUM: usize = 200;
-// const INITIAL_VLINES_NUM: usize = 67;
-// const CHARS_PER_VLINE: usize = 200;
 lazy_static! {
     pub static ref WINDOW_LIST: SpinLock<LinkedList<Arc<TextuiWindow>>> =
         SpinLock::new(LinkedList::new());
@@ -292,11 +288,6 @@ impl TextuiBuf<'_> {
         return buf;
     }
 
-    // pub fn get_buf_from_video_frame_buffer_info() -> TextuiBuf<'static> {
-    //     let len =
-    //         unsafe { video_frame_buffer_info.width * video_frame_buffer_info.height } as usize;
-    //     TextuiBuf::get_buf_from_vaddr(unsafe { video_frame_buffer_info.vaddr }as usize, len)
-    // }
     pub fn put_color_in_pixel(&mut self, color: u32, index: usize) {
         let buf: &mut [u32] = self.0;
         buf[index] = color;
@@ -464,28 +455,7 @@ impl TextuiCharChromatic {
                 }
             }
         }
-        // let font: Font = Font::get_font(self.c as usize);
 
-        // let mut count = TextuiBuf::get_start_index_by_lineid_lineindex(lineid, lineindex);
-
-        // // let buf=TEXTUI_BUF.lock();
-        // // let vaddr = unsafe { video_frame_buffer_info.vaddr } as usize;
-        // // let len = unsafe { video_frame_buffer_info.height*video_frame_buffer_info.width }as usize;
-        // let mut buf = TextuiBuf::get_buf_from_video_frame_buffer_info();
-        // for i in 0..TEXTUI_CHAR_HEIGHT {
-        //     let start = count;
-        //     for j in 0..TEXTUI_CHAR_WIDTH {
-        //         if font.is_frcolor(i as usize, j as usize) {
-        //             // 字，显示前景色
-        //             buf.put_color_in_pixel(self.frcolor.into(), count);
-        //         } else {
-        //             // 背景色
-        //             buf.put_color_in_pixel(self.bkcolor.into(), count);
-        //         }
-        //         count += 1;
-        //     }
-        //     count = TextuiBuf::get_index_of_next_line(start);
-        // }
     }
 }
 // 注意！！！ 请保持vline结构体的大小、成员变量命名相等！
@@ -1331,7 +1301,6 @@ fn textui_init() -> Result<i32, SystemError> {
 
     framework.metadata.window_max_id += 1;
 
-    // let num = framework.metadata.buf_info.get_width() * framework.metadata.buf_info.get_height();
     let num = framework.metadata.buf_info.get_size_about_u32();
 
     private_info.current_window = initial_window.clone();
@@ -1346,30 +1315,19 @@ fn textui_init() -> Result<i32, SystemError> {
 
     unsafe { TEST_IS_INIT = true };
 
-    // *TEXTUI_BUF_WIDTH.write() = framework.metadata.buf_info.get_width();
+
     set_textui_buf_width(framework.metadata.buf_info.get_width_about_u32());
 
-    // *TEXTUI_BUF_VADDR.write() = framework.metadata.buf_info.get_vaddr();
+
     set_textui_buf_vaddr(framework.metadata.buf_info.get_vaddr());
 
-    // *TEXTUI_BUF_SIZE.write() = num as usize;
+
     set_textui_buf_size(num as usize);
 
     renew_buf(framework.metadata.buf_info.get_vaddr(), num);
 
     drop(framework);
 
-    //     let c = TextuiCharChromatic {
-    //         c: b'3',
-    //         frcolor: FontColor::WHITE,
-    //         bkcolor: FontColor::BLACK,
-    //     };
-    // for i in 0..150{
-    //     for j in 0..100{
-    //     c.textui_refresh_character(LineId(i), LineIndex(j));
-    //     }
-    // }
-    // loop {}
 
     c_uart_send_str(
         UartPort::COM1.to_u16(),

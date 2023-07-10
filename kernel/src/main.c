@@ -72,11 +72,7 @@ void system_initialize()
     c_uart_init(COM1, 115200);
 
     video_init();
-    // kinfo("11111111111vaddr:%d", video_frame_buffer_info.vaddr);
-    // kinfo("11111111111vaddr:%#018lx", 0xffffa00003000000UL);
-    // kinfo("11111111111vaddr:%#018lx", 0xffff800003000000UL);
 
-    // while (1);
     scm_init();
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
@@ -107,17 +103,12 @@ void system_initialize()
     io_mfence();
 
     scm_reinit();
-    // scm_enable_put_to_window();
+
 
     rs_textui_init();
     // kinfo("vaddr:%d", video_frame_buffer_info.vaddr);
     // while (1);
-    // for (int i = 0; i < 10; i++)
-    // {
-    //     kinfo("i:%d",i);
-    // }
-    // kinfo("vaddr:%d", video_frame_buffer_info.vaddr);
-    // while (1)
+
     scm_enable_put_to_window();
     io_mfence();
     // =========== 重新设置initial_tss[0]的ist

@@ -56,6 +56,7 @@ impl Default for ChrDevs {
 }
 
 // 字符设备在系统中的实例，devfs通过该结构与实际字符设备进行联系
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CharDeviceStruct {
     dev_t: DeviceNumber, //起始设备号
@@ -70,6 +71,8 @@ impl CharDeviceStruct {
     ///             name: 字符设备名
     ///             char: 字符设备实例
     /// @return: 实例
+    /// 
+    #[allow(dead_code)]
     pub fn new(dev_t: DeviceNumber, minorct: usize, name: &'static str) -> Self {
         Self {
             dev_t,
@@ -81,6 +84,8 @@ impl CharDeviceStruct {
     /// @brief: 获取起始次设备号
     /// @parameter: None
     /// @return: 起始设备号
+    /// 
+    #[allow(dead_code)]
     pub fn device_number(&self) -> DeviceNumber {
         self.dev_t
     }
@@ -88,6 +93,8 @@ impl CharDeviceStruct {
     /// @brief: 获取起始次设备号
     /// @parameter: None
     /// @return: 起始设备号
+    /// 
+    #[allow(dead_code)]
     pub fn base_minor(&self) -> usize {
         self.dev_t.minor()
     }
@@ -95,6 +102,7 @@ impl CharDeviceStruct {
     /// @brief: 获取次设备号数量
     /// @parameter: None
     /// @return: 次设备号数量
+    #[allow(dead_code)]
     pub fn minorct(&self) -> usize {
         self.minorct
     }
@@ -103,13 +111,15 @@ impl CharDeviceStruct {
 /// @brief: 主设备号转下标
 /// @parameter: major: 主设备号
 /// @return: 返回下标
+#[allow(dead_code)]
 fn major_to_index(major: usize) -> usize {
     return major % CHRDEV_MAJOR_HASH_SIZE;
 }
 
 /// @brief: 动态获取主设备号
 /// @parameter: None
-/// @return: 如果成功，返回主设备号，否则，返回错误码
+/// @return: 如果成功，返回主设备号，否则，返回错误码 
+#[allow(dead_code)]
 fn find_dynamic_major() -> Result<usize, SystemError> {
     let chrdevs = CHRDEVS.0.lock();
     // 寻找主设备号为234～255的设备
@@ -144,6 +154,7 @@ fn find_dynamic_major() -> Result<usize, SystemError> {
 ///             count: 次设备号数量
 ///             name: 字符设备名
 /// @return: 如果注册成功，返回设备号，否则，返回错误码
+#[allow(dead_code)]
 pub fn register_chrdev_region(
     from: DeviceNumber,
     count: usize,
@@ -156,7 +167,8 @@ pub fn register_chrdev_region(
 /// @parameter: baseminor: 主设备号
 ///             count: 次设备号数量
 ///             name: 字符设备名
-/// @return: 如果注册成功，返回，否则，返回false
+/// @return: 如果注册成功，返回，否则，返回false 
+#[allow(dead_code)]
 pub fn alloc_chrdev_region(
     baseminor: usize,
     count: usize,
@@ -250,6 +262,7 @@ pub fn __unregister_chrdev_region(
 ///             dev_t: 字符设备号
 ///             range: 次设备号范围
 /// @return: none
+#[allow(dead_code)]
 pub fn cdev_add(cdev: Arc<dyn CharDevice>, dev_t: DeviceNumber, range: usize) {
     if Into::<usize>::into(dev_t) == 0 {
         kerror!("Device number can't be 0!\n");
@@ -261,6 +274,7 @@ pub fn cdev_add(cdev: Arc<dyn CharDevice>, dev_t: DeviceNumber, range: usize) {
 /// @parameter: dev_t: 字符设备号
 ///             range: 次设备号范围
 /// @return: none
+#[allow(dead_code)]
 pub fn cdev_del(dev_t: DeviceNumber, range: usize) {
     kobj_unmap(CDEVMAP.clone(), dev_t, range);
 }

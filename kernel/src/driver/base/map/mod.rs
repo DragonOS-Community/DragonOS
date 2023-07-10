@@ -82,6 +82,7 @@ pub fn kobj_unmap(domain: Arc<LockKObjMap>, dev_t: DeviceNumber, range: usize) {
 /// @parameter: domain: 管理实例
 ///             dev_t: 设备号
 /// @return: 查找成功，返回设备实例，否则返回None
+#[allow(dead_code)]
 pub fn kobj_lookup(domain: Arc<LockKObjMap>, dev_t: DeviceNumber) -> Option<Arc<dyn KObject>> {
     if let Some(map) = domain.0.lock().0.get(dev_t.major() % 255) {
         match map.get(&dev_t) {

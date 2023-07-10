@@ -1,8 +1,8 @@
 use super::super::base::device::Device;
 use crate::{
     driver::base::{
-        char::{CharDevice, register_chrdev_region, cdev_add},
-        device::{driver::Driver, DeviceState, DeviceType, IdTable, KObject, DeviceNumber},
+        char::CharDevice,
+    device::{driver::Driver, DeviceState, DeviceType, IdTable, KObject},
         platform::{
             self, platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
         },
@@ -222,16 +222,22 @@ impl Driver for LockUartDriver {
 }
 
 impl CharDevice for LockUartDriver {
-    fn open(&self, file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
+    fn open(&self, _file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
         return Ok(());
     }
 
-    fn close(&self, file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
+    fn close(&self, _file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
         return Ok(());
     }
 }
 
 impl LockUartDriver {
+    /// @brief 创建串口驱动
+    /// @param port 端口号
+    ///        baud_rate 波特率
+    ///        sys_info: sys文件系统inode
+    /// @return  
+    #[allow(dead_code)]
     pub fn new(port: UartPort, baud_rate: u32, sys_info: Option<Arc<dyn IndexNode>>) -> Self {
         Self(SpinLock::new(UartDriver::new(port, baud_rate, sys_info)))
     }
@@ -240,7 +246,7 @@ impl LockUartDriver {
 impl PlatformDriver for LockUartDriver {
     fn probe(
         &self,
-        device: Arc<dyn PlatformDevice>,
+        _device: Arc<dyn PlatformDevice>,
     ) -> Result<(), crate::driver::base::device::driver::DriverError> {
         return Ok(());
     }
@@ -256,6 +262,7 @@ impl UartDriver {
     ///        baud_rate 波特率
     ///        sys_info: sys文件系统inode
     /// @return 返回串口驱动
+    #[allow(dead_code)]
     pub fn new(port: UartPort, baud_rate: u32, sys_info: Option<Arc<dyn IndexNode>>) -> Self {
         Self {
             port,
@@ -354,6 +361,7 @@ impl UartDriver {
         unsafe { io_in8(port) as char }
     }
 
+    #[allow(dead_code)]
     fn port() -> u16 {
         UartPort::COM1.to_u16()
     }

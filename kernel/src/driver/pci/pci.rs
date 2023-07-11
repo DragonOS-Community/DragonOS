@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 // 目前仅支持单主桥单Segment
 
+use super::pci_irq::{IrqType, PciIrqError};
 use crate::arch::{PciArch, TraitPciArch};
 use crate::include::bindings::bindings::{
     initial_mm, mm_map, mm_struct, PAGE_2M_SIZE, VM_DONTCOPY, VM_IO,
@@ -11,12 +12,10 @@ use crate::{kdebug, kerror, kinfo, kwarn};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
 use bitflags::bitflags;
-
 use core::{
     convert::TryFrom,
     fmt::{self, Debug, Display, Formatter},
 };
-
 // PCI_DEVICE_LINKEDLIST 添加了读写锁的全局链表，里面存储了检索到的PCI设备结构体
 // PCI_ROOT_0 Segment为0的全局PciRoot
 lazy_static! {
@@ -146,6 +145,8 @@ const BAR0_OFFSET: u8 = 0x10;
 const STATUS_COMMAND_OFFSET: u8 = 0x04;
 /// ID for vendor-specific PCI capabilities.(Virtio Capabilities)
 pub const PCI_CAP_ID_VNDR: u8 = 0x09;
+pub const PCI_CAP_ID_MSI: u8 = 0x05;
+pub const PCI_CAP_ID_MSIX: u8 = 0x11;
 pub const PORT_PCI_CONFIG_ADDRESS: u16 = 0xcf8;
 pub const PORT_PCI_CONFIG_DATA: u16 = 0xcfc;
 // pci设备分组的id
@@ -239,9 +240,11 @@ pub enum PciError {
     CreateMmioError,
     InvalidBusDeviceFunction,
     SegmentNotFound,
+    McfgTableNotFound,
     GetWrongHeader,
     UnrecognisedHeaderType,
     PciDeviceStructureTransformError,
+    PciIrqError(PciIrqError),
 }
 ///实现PciError的Display trait，使其可以直接输出
 impl Display for PciError {
@@ -251,11 +254,13 @@ impl Display for PciError {
             Self::CreateMmioError => write!(f, "Error occurred while creating mmio."),
             Self::InvalidBusDeviceFunction => write!(f, "Found invalid BusDeviceFunction."),
             Self::SegmentNotFound => write!(f, "Target segment not found"),
+            Self::McfgTableNotFound => write!(f, "ACPI MCFG Table not found"),
             Self::GetWrongHeader => write!(f, "GetWrongHeader with vendor id 0xffff"),
             Self::UnrecognisedHeaderType => write!(f, "Found device with unrecognised header type"),
             Self::PciDeviceStructureTransformError => {
                 write!(f, "Found None When transform Pci device structure")
             }
+            Self::PciIrqError(err) => write!(f, "Error occurred while setting irq :{:?}.", err),
         }
     }
 }
@@ -266,14 +271,17 @@ pub trait PciDeviceStructure: Send + Sync {
     /// @return HeaderType 设备类型
     fn header_type(&self) -> HeaderType;
     /// @brief 当其为standard设备时返回&Pci_Device_Structure_General_Device，其余情况返回None
+    #[inline(always)]
     fn as_standard_device(&self) -> Option<&PciDeviceStructureGeneralDevice> {
         None
     }
     /// @brief 当其为pci to pci bridge设备时返回&Pci_Device_Structure_Pci_to_Pci_Bridge，其余情况返回None
+    #[inline(always)]
     fn as_pci_to_pci_bridge_device(&self) -> Option<&PciDeviceStructurePciToPciBridge> {
         None
     }
     /// @brief 当其为pci to cardbus bridge设备时返回&Pci_Device_Structure_Pci_to_Cardbus_Bridge，其余情况返回None
+    #[inline(always)]
     fn as_pci_to_carbus_bridge_device(&self) -> Option<&PciDeviceStructurePciToCardbusBridge> {
         None
     }
@@ -281,14 +289,17 @@ pub trait PciDeviceStructure: Send + Sync {
     /// @return 返回其不可变引用
     fn common_header(&self) -> &PciDeviceStructureHeader;
     /// @brief 当其为standard设备时返回&mut Pci_Device_Structure_General_Device，其余情况返回None
+    #[inline(always)]
     fn as_standard_device_mut(&mut self) -> Option<&mut PciDeviceStructureGeneralDevice> {
         None
     }
     /// @brief 当其为pci to pci bridge设备时返回&mut Pci_Device_Structure_Pci_to_Pci_Bridge，其余情况返回None
+    #[inline(always)]
     fn as_pci_to_pci_bridge_device_mut(&mut self) -> Option<&mut PciDeviceStructurePciToPciBridge> {
         None
     }
     /// @brief 当其为pci to cardbus bridge设备时返回&mut Pci_Device_Structure_Pci_to_Cardbus_Bridge，其余情况返回None
+    #[inline(always)]
     fn as_pci_to_carbus_bridge_device_mut(
         &mut self,
     ) -> Option<&mut PciDeviceStructurePciToCardbusBridge> {
@@ -319,28 +330,50 @@ pub trait PciDeviceStructure: Send + Sync {
     /// @brief 获取Pci设备共有的common_header
     /// @return 返回其可变引用
     fn common_header_mut(&mut self) -> &mut PciDeviceStructureHeader;
+
     /// @brief 读取standard设备的bar寄存器，映射后将结果加入结构体的standard_device_bar变量
     /// @return 只有standard设备才返回成功或者错误，其余返回None
-    fn bar_init(&mut self) -> Option<Result<u8, PciError>> {
+    #[inline(always)]
+    fn bar_ioremap(&mut self) -> Option<Result<u8, PciError>> {
         None
     }
-    /// todo
-    fn msix_init(&mut self) -> Option<Result<u8, PciError>> {
+    /// @brief 获取PCI设备的bar寄存器的引用
+    /// @return
+    #[inline(always)]
+    fn bar(&mut self) -> Option<&PciStandardDeviceBar> {
         None
     }
+    /// @brief 通过设置该pci设备的command
     fn enable_master(&mut self) {
         self.set_command(Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER);
     }
+    /// @brief 寻找设备的msix空间的offset
+    fn msix_capability_offset(&self) -> Option<u8> {
+        for capability in self.capabilities()? {
+            if capability.id == PCI_CAP_ID_MSIX {
+                return Some(capability.offset);
+            }
+        }
+        None
+    }
+    /// @brief 寻找设备的msi空间的offset
+    fn msi_capability_offset(&self) -> Option<u8> {
+        for capability in self.capabilities()? {
+            if capability.id == PCI_CAP_ID_MSI {
+                return Some(capability.offset);
+            }
+        }
+        None
+    }
+    /// @brief 返回结构体中的irq_type的可变引用
+    fn irq_type_mut(&mut self) -> Option<&mut IrqType>;
+    /// @brief 返回结构体中的irq_vector的可变引用
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>>;
 }
 
 /// Pci_Device_Structure_Header PCI设备结构体共有的头部
 #[derive(Clone, Debug)]
 pub struct PciDeviceStructureHeader {
-    // 包含msix table地址的bar的mmio基地址 todo:以下四个作为一个结构体统一管理
-    pub msix_mmio_vaddr: u64,
-    pub msix_mmio_size: u64,  // msix映射长度
-    pub msix_offset: u32,     // msix表的offset
-    pub msix_table_size: u16, // msix表的表项数量
     // ==== busdevicefunction变量表示该结构体所处的位置
     pub bus_device_function: BusDeviceFunction,
     pub vendor_id: u16, // 供应商ID 0xffff是一个无效值，在读取访问不存在的设备的配置空间寄存器时返回
@@ -365,6 +398,10 @@ pub struct PciDeviceStructureHeader {
 #[derive(Clone, Debug)]
 pub struct PciDeviceStructureGeneralDevice {
     pub common_header: PciDeviceStructureHeader,
+    // 中断结构体，包括legacy,msi,msix三种情况
+    pub irq_type: IrqType,
+    // 使用的中断号的vec集合
+    pub irq_vector: Vec<u16>,
     pub standard_device_bar: PciStandardDeviceBar,
     pub cardbus_cis_pointer: u32, // 指向卡信息结构，供在 CardBus 和 PCI 之间共享芯片的设备使用。
     pub subsystem_vendor_id: u16,
@@ -380,19 +417,23 @@ pub struct PciDeviceStructureGeneralDevice {
     pub max_latency: u8, // 一个只读寄存器，指定设备需要多长时间访问一次 PCI 总线（以 1/4 微秒为单位）。
 }
 impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
+    #[inline(always)]
     fn header_type(&self) -> HeaderType {
         HeaderType::Standard
     }
+    #[inline(always)]
     fn as_standard_device(&self) -> Option<&PciDeviceStructureGeneralDevice> {
         Some(self)
     }
+    #[inline(always)]
     fn as_standard_device_mut(&mut self) -> Option<&mut PciDeviceStructureGeneralDevice> {
         Some(self)
     }
+    #[inline(always)]
     fn common_header(&self) -> &PciDeviceStructureHeader {
         &self.common_header
     }
-
+    #[inline(always)]
     fn common_header_mut(&mut self) -> &mut PciDeviceStructureHeader {
         &mut self.common_header
     }
@@ -402,7 +443,7 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
             next_capability_offset: Some(self.capabilities_pointer),
         })
     }
-    fn bar_init(&mut self) -> Option<Result<u8, PciError>> {
+    fn bar_ioremap(&mut self) -> Option<Result<u8, PciError>> {
         let common_header = &self.common_header;
         match pci_bar_init(common_header.bus_device_function) {
             Ok(bar) => {
@@ -412,11 +453,27 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
             Err(e) => Some(Err(e)),
         }
     }
+    fn bar(&mut self) -> Option<&PciStandardDeviceBar> {
+        Some(&self.standard_device_bar)
+    }
+    #[inline(always)]
+    fn irq_type_mut(&mut self) -> Option<&mut IrqType> {
+        Some(&mut self.irq_type)
+    }
+    #[inline(always)]
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>> {
+        Some(&mut self.irq_vector)
+    }
 }
+
 /// Pci_Device_Structure_Pci_to_Pci_Bridge pci-to-pci桥设备结构体
 #[derive(Clone, Debug)]
 pub struct PciDeviceStructurePciToPciBridge {
     pub common_header: PciDeviceStructureHeader,
+    // 中断结构体，包括legacy,msi,msix三种情况
+    pub irq_type: IrqType,
+    // 使用的中断号的vec集合
+    pub irq_vector: Vec<u16>,
     pub bar0: u32,
     pub bar1: u32,
     pub primary_bus_number: u8,
@@ -443,21 +500,33 @@ pub struct PciDeviceStructurePciToPciBridge {
     pub bridge_control: u16,
 }
 impl PciDeviceStructure for PciDeviceStructurePciToPciBridge {
+    #[inline(always)]
     fn header_type(&self) -> HeaderType {
         HeaderType::PciPciBridge
     }
+    #[inline(always)]
     fn as_pci_to_pci_bridge_device(&self) -> Option<&PciDeviceStructurePciToPciBridge> {
         Some(self)
     }
+    #[inline(always)]
     fn as_pci_to_pci_bridge_device_mut(&mut self) -> Option<&mut PciDeviceStructurePciToPciBridge> {
         Some(self)
     }
+    #[inline(always)]
     fn common_header(&self) -> &PciDeviceStructureHeader {
         &self.common_header
     }
-
+    #[inline(always)]
     fn common_header_mut(&mut self) -> &mut PciDeviceStructureHeader {
         &mut self.common_header
+    }
+    #[inline(always)]
+    fn irq_type_mut(&mut self) -> Option<&mut IrqType> {
+        Some(&mut self.irq_type)
+    }
+    #[inline(always)]
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>> {
+        Some(&mut self.irq_vector)
     }
 }
 /// Pci_Device_Structure_Pci_to_Cardbus_Bridge Pci_to_Cardbus桥设备结构体
@@ -488,23 +557,35 @@ pub struct PciDeviceStructurePciToCardbusBridge {
     pub pc_card_legacy_mode_base_address_16_bit: u32,
 }
 impl PciDeviceStructure for PciDeviceStructurePciToCardbusBridge {
+    #[inline(always)]
     fn header_type(&self) -> HeaderType {
         HeaderType::PciCardbusBridge
     }
+    #[inline(always)]
     fn as_pci_to_carbus_bridge_device(&self) -> Option<&PciDeviceStructurePciToCardbusBridge> {
         Some(&self)
     }
+    #[inline(always)]
     fn as_pci_to_carbus_bridge_device_mut(
         &mut self,
     ) -> Option<&mut PciDeviceStructurePciToCardbusBridge> {
         Some(self)
     }
+    #[inline(always)]
     fn common_header(&self) -> &PciDeviceStructureHeader {
         &self.common_header
     }
-
+    #[inline(always)]
     fn common_header_mut(&mut self) -> &mut PciDeviceStructureHeader {
         &mut self.common_header
+    }
+    #[inline(always)]
+    fn irq_type_mut(&mut self) -> Option<&mut IrqType> {
+        None
+    }
+    #[inline(always)]
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>> {
+        None
     }
 }
 
@@ -672,10 +753,6 @@ fn pci_read_header(
         return Err(PciError::GetWrongHeader);
     }
     let header = PciDeviceStructureHeader {
-        msix_mmio_vaddr: 0,
-        msix_mmio_size: 0,
-        msix_offset: 0,
-        msix_table_size: 0,
         bus_device_function,
         vendor_id,
         device_id,
@@ -755,6 +832,8 @@ fn pci_read_general_device_header(
     let max_latency = (result >> 24) as u8;
     PciDeviceStructureGeneralDevice {
         common_header,
+        irq_type: IrqType::Unused,
+        irq_vector: Vec::new(),
         standard_device_bar,
         cardbus_cis_pointer,
         subsystem_vendor_id,
@@ -823,6 +902,8 @@ fn pci_read_pci_to_pci_bridge_header(
     let bridge_control = (result >> 16) as u16;
     PciDeviceStructurePciToPciBridge {
         common_header,
+        irq_type: IrqType::Unused,
+        irq_vector: Vec::new(),
         bar0,
         bar1,
         primary_bus_number,
@@ -854,7 +935,7 @@ fn pci_read_pci_to_pci_bridge_header(
 /// 本函数只应被 pci_read_header()调用
 /// @param common_header 共有头部
 /// @param bus_device_function PCI设备的唯一标识
-/// @return ) -> Pci_Device_Structure_Pci_to_Cardbus_Bridge  pci-to-cardbus 桥设备头部
+/// @return   Pci_Device_Structure_Pci_to_Cardbus_Bridge  pci-to-cardbus 桥设备头部
 fn pci_read_pci_to_cardbus_bridge_header(
     common_header: PciDeviceStructureHeader,
     busdevicefunction: &BusDeviceFunction,
@@ -1221,6 +1302,8 @@ impl Display for BarInfo {
         }
     }
 }
+//todo 增加对桥的bar的支持
+pub trait PciDeviceBar {}
 ///一个普通PCI设备（非桥）有6个BAR寄存器，PciStandardDeviceBar存储其全部信息
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PciStandardDeviceBar {

@@ -159,7 +159,7 @@ impl CharDevOps {
     ///             name: 字符设备名
     /// @return: 如果注册成功，返回设备号，否则，返回错误码
     #[allow(dead_code)]
-    fn register_chrdev_region(
+    pub fn register_chrdev_region(
         from: DeviceNumber,
         count: usize,
         name: &'static str,
@@ -173,7 +173,7 @@ impl CharDevOps {
     ///             name: 字符设备名
     /// @return: 如果注册成功，返回，否则，返回false 
     #[allow(dead_code)]
-    fn alloc_chrdev_region(
+    pub fn alloc_chrdev_region(
         baseminor: usize,
         count: usize,
         name: &'static str,
@@ -186,7 +186,7 @@ impl CharDevOps {
     ///             minorct: 次设备号数量
     ///             name: 字符设备名
     /// @return: 如果注册成功，返回设备号，否则，返回错误码
-    pub fn __register_chrdev_region(
+    fn __register_chrdev_region(
         device_number: DeviceNumber,
         minorct: usize,
         name: &'static str,
@@ -240,7 +240,7 @@ impl CharDevOps {
     ///             baseminor: 起始次设备号
     ///             minorct: 次设备号数量
     /// @return: 如果注销成功，返回()，否则，返回错误码
-    pub fn __unregister_chrdev_region(
+    fn __unregister_chrdev_region(
         device_number: DeviceNumber,
         minorct: usize,
     ) -> Result<(), SystemError> {

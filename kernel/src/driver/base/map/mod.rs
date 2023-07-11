@@ -19,9 +19,9 @@ impl Probe {
 
 /// @brief: 字符设备和块设备管理实例(锁)
 #[derive(Debug)]
-pub struct LockKObjMap(SpinLock<KObjMap>);
+pub struct LockedKObjMap(SpinLock<KObjMap>);
 
-impl Default for LockKObjMap {
+impl Default for LockedKObjMap {
     fn default() -> Self {
         Self(SpinLock::new(KObjMap::default()))
     }
@@ -44,7 +44,7 @@ impl Default for KObjMap {
 ///             data: 设备实例
 /// @return: none
 pub fn kobj_map(
-    domain: Arc<LockKObjMap>,
+    domain: Arc<LockedKObjMap>,
     dev_t: DeviceNumber,
     range: usize,
     data: Arc<dyn KObject>,
@@ -64,7 +64,7 @@ pub fn kobj_map(
 ///             dev_t: 设备号
 ///             range: 次设备号范围
 /// @return: none
-pub fn kobj_unmap(domain: Arc<LockKObjMap>, dev_t: DeviceNumber, range: usize) {
+pub fn kobj_unmap(domain: Arc<LockedKObjMap>, dev_t: DeviceNumber, range: usize) {
     if let Some(map) = domain.0.lock().0.get_mut(dev_t.major() % 255) {
         for i in 0..range {
             let rm_dev_t = &DeviceNumber::new(Into::<usize>::into(dev_t) + i);
@@ -83,7 +83,7 @@ pub fn kobj_unmap(domain: Arc<LockKObjMap>, dev_t: DeviceNumber, range: usize) {
 ///             dev_t: 设备号
 /// @return: 查找成功，返回设备实例，否则返回None
 #[allow(dead_code)]
-pub fn kobj_lookup(domain: Arc<LockKObjMap>, dev_t: DeviceNumber) -> Option<Arc<dyn KObject>> {
+pub fn kobj_lookup(domain: Arc<LockedKObjMap>, dev_t: DeviceNumber) -> Option<Arc<dyn KObject>> {
     if let Some(map) = domain.0.lock().0.get(dev_t.major() % 255) {
         match map.get(&dev_t) {
             Some(value) => {

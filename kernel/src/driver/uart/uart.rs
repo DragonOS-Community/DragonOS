@@ -25,9 +25,9 @@ const UART_MAX_BITS_RATE: u32 = 115200;
 
 lazy_static! {
     // 串口设备
-    pub static ref UART_DEV: Arc<LockUart> = Arc::new(LockUart::default());
+    pub static ref UART_DEV: Arc<LockedUart> = Arc::new(LockedUart::default());
     // 串口驱动
-    pub static ref UART_DRV: Arc<LockUartDriver> = Arc::new(LockUartDriver::default());
+    pub static ref UART_DRV: Arc<LockedUartDriver> = Arc::new(LockedUartDriver::default());
 }
 
 // @brief 串口端口
@@ -117,17 +117,17 @@ impl Default for Uart {
 
 // @brief 串口设备结构体(加锁)
 #[derive(Debug)]
-pub struct LockUart(SpinLock<Uart>);
+pub struct LockedUart(SpinLock<Uart>);
 
-impl Default for LockUart {
+impl Default for LockedUart {
     fn default() -> Self {
         Self(SpinLock::new(Uart::default()))
     }
 }
 
-impl KObject for LockUart {}
+impl KObject for LockedUart {}
 
-impl PlatformDevice for LockUart {
+impl PlatformDevice for LockedUart {
     fn compatible_table(&self) -> platform::CompatibleTable {
         platform::CompatibleTable::new(vec!["uart"])
     }
@@ -150,7 +150,7 @@ impl PlatformDevice for LockUart {
     }
 }
 
-impl Device for LockUart {
+impl Device for LockedUart {
     fn id_table(&self) -> IdTable {
         IdTable::new("uart", 0)
     }
@@ -193,17 +193,17 @@ impl Default for UartDriver {
 
 // @brief 串口驱动结构体(加锁)
 #[derive(Debug)]
-pub struct LockUartDriver(SpinLock<UartDriver>);
+pub struct LockedUartDriver(SpinLock<UartDriver>);
 
-impl Default for LockUartDriver {
+impl Default for LockedUartDriver {
     fn default() -> Self {
         Self(SpinLock::new(UartDriver::default()))
     }
 }
 
-impl KObject for LockUartDriver {}
+impl KObject for LockedUartDriver {}
 
-impl Driver for LockUartDriver {
+impl Driver for LockedUartDriver {
     fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
         self
     }
@@ -221,7 +221,7 @@ impl Driver for LockUartDriver {
     }
 }
 
-impl CharDevice for LockUartDriver {
+impl CharDevice for LockedUartDriver {
     fn open(&self, _file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
         return Ok(());
     }
@@ -231,7 +231,7 @@ impl CharDevice for LockUartDriver {
     }
 }
 
-impl LockUartDriver {
+impl LockedUartDriver {
     /// @brief 创建串口驱动
     /// @param port 端口号
     ///        baud_rate 波特率
@@ -243,7 +243,7 @@ impl LockUartDriver {
     }
 }
 
-impl PlatformDriver for LockUartDriver {
+impl PlatformDriver for LockedUartDriver {
     fn probe(
         &self,
         _device: Arc<dyn PlatformDevice>,

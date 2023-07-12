@@ -84,13 +84,13 @@ pub struct XApic {
 impl XApic {
     /// 读取指定寄存器的值
     #[allow(dead_code)]
-    unsafe fn read(&self, reg: u32) -> u32 {
+    pub unsafe fn read(&self, reg: u32) -> u32 {
         read_volatile((self.map_vaddr + reg as usize) as *const u32)
     }
 
     /// 将指定的值写入寄存器
     #[allow(dead_code)]
-    unsafe fn write(&mut self, reg: u32, value: u32) {
+    pub unsafe fn write(&mut self, reg: u32, value: u32) {
         write_volatile((self.map_vaddr + reg as usize) as *mut u32, value);
         self.read(0x20); // 等待写操作完成，通过读取进行同步
     }

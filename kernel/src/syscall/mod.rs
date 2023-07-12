@@ -7,6 +7,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::cpu::cpu_reset,
+    filesystem::syscall::PosixKstat,
     filesystem::vfs::{
         file::FileMode,
         syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
@@ -909,6 +910,30 @@ impl Syscall {
                     }
                 }
             }
+            SYS_FSTAT => {
+                let kstat = args[0] as *mut PosixKstat;
+                let fd = args[1] as i32;
+                let security_check = || {
+                    if unsafe {
+                        verify_area(kstat as u64, core::mem::size_of::<PosixTimeval>() as u64)
+                    } == false
+                    {
+                        return Err(SystemError::EFAULT);
+                    }
+                    return Ok(());
+                };
+                let r = security_check();
+                if r.is_err() {
+                    Err(r.unwrap_err())
+                } else {
+                    if !kstat.is_null() {
+                        Self::fstat(kstat, fd)
+                    } else {
+                        Err(SystemError::EFAULT)
+                    }
+                }
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

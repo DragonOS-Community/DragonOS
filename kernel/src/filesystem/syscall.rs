@@ -1,5 +1,3 @@
-
-
 use crate::{
     arch::asm::current::current_pcb,
     filesystem::vfs::FileType,
@@ -42,7 +40,7 @@ bitflags! {
         const S_IXOTH = 0o0001;
     }
 }
-pub struct Kstat {
+pub struct PosixKstat {
     inode: u64,
     dev_id: DevType,
     mode: ModeType,
@@ -57,7 +55,7 @@ pub struct Kstat {
     blcok_size: u64,
     blocks: u64,
 }
-impl Default for Kstat {
+impl Default for PosixKstat {
     fn default() -> Self {
         Self {
             inode: 0,
@@ -87,11 +85,11 @@ impl Default for Kstat {
 }
 impl Syscall {
     pub fn vfs_fstat(fd: i32) {}
-    pub fn do_fstat(fd: i32) -> Result<Kstat, SystemError> {
+    pub fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
         let cur = current_pcb();
         match cur.get_file_ref_by_fd(fd) {
             Some(file) => {
-                let mut kstat = Kstat::default();
+                let mut kstat = PosixKstat::default();
 
                 match file.metadata() {
                     Ok(matedata) => {
@@ -134,10 +132,15 @@ impl Syscall {
             }
         }
     }
-    pub fn fstat(mut usr_kstat: *mut Kstat, fd: i32) -> Result<i32, SystemError> {
+    pub fn fstat(usr_kstat: *mut PosixKstat, fd: i32) -> Result<usize, SystemError> {
         match Self::do_fstat(fd) {
             Ok(kstat) => {
-                // TODO 给传出指针赋值
+                if usr_kstat.is_null() {
+                    return Err(SystemError::EFAULT);
+                }
+                unsafe {
+                    *usr_kstat = kstat;
+                }
                 return Ok(0);
             }
             Err(e) => return Err(e),

@@ -70,11 +70,7 @@ int video_refresh_daemon(void *unused)
                 spin_lock(&daemon_refresh_lock);
                 if (video_frame_buffer_info.vaddr != NULL)
                 {
-                    // kinfo("video_frame_buffer_info.vaddr:%#018lx", video_frame_buffer_info.vaddr);
-                    // 不知为何这里读取不了
-                    // kinfo("video_refresh_target->vaddr:%#018lx", get_video_refresh_target_vaddr());
-                    // memcpy((void *)video_frame_buffer_info.vaddr, (void *)0xffff800009800000,
-                    //        _video_refresh_target->size);
+
                     memcpy((void *)video_frame_buffer_info.vaddr, (void *) get_video_refresh_target_vaddr(),
                            video_refresh_target.size);
                 }
@@ -161,9 +157,9 @@ int video_set_refresh_target(struct scm_buffer_info_t buf)
     //     rs_usleep(1000);
     // }
     // kdebug("buf = %#018lx", buf);
-    // _video_refresh_target = _buf;
+
     video_refresh_target = buf;
-    // kdebug("buf = %#018lx", buf.vaddr);
+
 
     rs_register_softirq_video();
     kdebug("register softirq video done");
@@ -209,7 +205,7 @@ int video_init()
         video_frame_buffer_info.width * video_frame_buffer_info.height * ((video_frame_buffer_info.bit_depth + 7) / 8);
     // 先临时映射到该地址，稍后再重新映射
     video_frame_buffer_info.vaddr = 0xffff800003000000;
-    // video_frame_buffer_info.vaddr = 0xffff800010000000;
+ 
 
     mm_map_phys_addr(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size,
                      PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);

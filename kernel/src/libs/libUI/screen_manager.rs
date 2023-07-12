@@ -250,8 +250,7 @@ fn no_texiui_init() {
 /**
  * @brief 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
  *
- * @param ui 要启动的ui框架
- * @return int 返回码
+ * @param framework 要启动的ui框架
  */
 pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     if framework.metadata()?.buf_info.vaddr == 0 {
@@ -277,10 +276,9 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
     return Ok(0);
 }
 /**
- * @brief 向屏幕管理器注册UI框架（静态设置的框架对象）
+ * @brief 向屏幕管理器注册UI框架
  *
- * @param ui 框架结构体指针
- * @return int 错误码
+ * @param framework 框架结构体
  */
 pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     // 把ui框架加入链表

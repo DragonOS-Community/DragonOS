@@ -14,10 +14,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use thingbuf::mpsc::{
-    self,
-    errors::{TryRecvError, TrySendError},
-};
+
 
 use super::screen_manager::{
     scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
@@ -43,22 +40,22 @@ lazy_static! {
     pub static ref TEXTUI_PRIVATE_INFO: SpinLock<TextuiPrivateInfo> =
         SpinLock::new(TextuiPrivateInfo::new());
 }
-lazy_static! {
-    pub static ref WINDOW_MPSC: WindowMpsc = WindowMpsc::new();
-}
+// lazy_static! {
+//     pub static ref WINDOW_MPSC: WindowMpsc = WindowMpsc::new();
+// }
 // 利用mpsc实现当前窗口
-pub struct WindowMpsc {
-    window_r: mpsc::Receiver<TextuiWindow>,
-    window_s: mpsc::Sender<TextuiWindow>,
-}
-pub const MPSC_BUF_SIZE: usize = 512;
-impl WindowMpsc {
-    fn new() -> Self {
-        // let window = &TEXTUI_PRIVATE_INFO.lock().current_window;
-        let (window_s, window_r) = mpsc::channel::<TextuiWindow>(MPSC_BUF_SIZE);
-        WindowMpsc { window_r, window_s }
-    }
-}
+// pub struct WindowMpsc {
+//     window_r: mpsc::Receiver<TextuiWindow>,
+//     window_s: mpsc::Sender<TextuiWindow>,
+// }
+// pub const MPSC_BUF_SIZE: usize = 512;
+// impl WindowMpsc {
+//     fn new() -> Self {
+//         // let window = &TEXTUI_PRIVATE_INFO.lock().current_window;
+//         let (window_s, window_r) = mpsc::channel::<TextuiWindow>(MPSC_BUF_SIZE);
+//         WindowMpsc { window_r, window_s }
+//     }
+// }
 
 /**
  * @brief 黑白字符对象
@@ -1136,11 +1133,10 @@ pub extern "C" fn textui_putchar(character: u8, fr_color: u32, bk_color: u32) ->
             "textui putchar failed.\n\0".as_ptr(),
         );
     }
-
     return r;
 }
 lazy_static! {
-    pub static ref CURRENT_WINDOW: TextuiWindow = TEXTUI_PRIVATE_INFO.lock().current_window.clone();
+    pub static ref CURRENT_WINDOW: SpinLock<TextuiWindow> = SpinLock::new(TEXTUI_PRIVATE_INFO.lock().current_window.clone());
 }
 fn true_textui_putchar(
     character: u8,
@@ -1148,47 +1144,10 @@ fn true_textui_putchar(
     bk_color: FontColor,
 ) -> Result<i32, SystemError> {
     if unsafe { TEST_IS_INIT } {
-        let val = WINDOW_MPSC.window_r.try_recv_ref();
 
-        let mut window: TextuiWindow;
-        if let Err(err) = val {
-            match err {
-                TryRecvError::Empty => {
-                    window = CURRENT_WINDOW.clone();
-                }
-                _ => {
-                    c_uart_send_str(
-                        UartPort::COM1.to_u16(),
-                        "true_textui_putchar fail\n\0".as_ptr(),
-                    );
-                    todo!();
-                }
-            }
-        } else {
-            let r = val.unwrap();
-
-            window = r.clone(); //当mpsc_buf_size太大时会卡在这里，不知为何
-        }
-        window.textui_putchar_window(character, fr_color, bk_color)?;
-
-        let mut window_s = WINDOW_MPSC.window_s.try_send_ref();
-
-        loop {
-            if let Err(err) = window_s {
-                match err {
-                    TrySendError::Full(_) => {
-                        window_s = WINDOW_MPSC.window_s.try_send_ref();
-                    }
-                    _ => todo!(),
-                }
-            } else {
-                break;
-            }
-        }
-        *window_s.unwrap() = window;
+        CURRENT_WINDOW.lock().textui_putchar_window(character, fr_color, bk_color)?;
     } else {
         //未初始化暴力输出
-
         return no_init_textui_putchar_window(character, fr_color, bk_color, unsafe {
             ENABLE_PUT_TO_WINDOW
         });

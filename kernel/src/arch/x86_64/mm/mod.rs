@@ -2,19 +2,19 @@ pub mod barrier;
 pub mod frame;
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
-    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block, BLACK,
-    GREEN,
+    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block,
 };
 use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
+use crate::libs::spinlock::SpinLock;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::{
-    arch::{mm::frame::FRAME_ALLOCATOR, MMArch},
-    mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator, page_frame::PageFrameCount},
+    arch::MMArch,
+    mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::PageEntry;
+use crate::mm::page::{PageEntry, PageFlags};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
 use crate::syscall::SystemError;
 use crate::{kdebug, kinfo};
@@ -27,7 +27,6 @@ use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use self::barrier::mfence;
-use self::frame::LockedFrameAllocator;
 
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
@@ -44,6 +43,8 @@ static mut INITIAL_CR3_VALUE: usize = 0;
 /// 内核的第一个页表在pml4中的索引
 /// 顶级页表的[256, 512)项是内核的页表
 static KERNEL_PML4E_NO: usize = (X86_64MMArch::PHYS_OFFSET & ((1 << 48) - 1)) >> 39;
+
+static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = SpinLock::new(None);
 
 #[derive(Clone, Copy)]
 pub struct X86_64MMBootstrapInfo {
@@ -204,7 +205,8 @@ impl MemoryManagementArch for X86_64MMArch {
     /// @return 新的页表
     fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
         let new_umapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
-            PageMapper::create(PageTableKind::User, FRAME_ALLOCATOR).ok_or(SystemError::ENOMEM)?
+            PageMapper::create(PageTableKind::User, LockedFrameAllocator)
+                .ok_or(SystemError::ENOMEM)?
         };
 
         let current_ktable: KernelMapper = KernelMapper::lock();
@@ -292,52 +294,147 @@ pub fn mm_init() {
     c_uart_send_str(0x3f8, "mm_init3\n\0".as_ptr());
     kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
-    // todo: 初始化内存管理器
-    allocator_init();
-    loop {}
+    // 初始化内存管理器
+    unsafe { allocator_init() };
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
 }
 
-fn allocator_init() {
-    let virt_offset = unsafe { BOOTSTRAP_MM_INFO.unwrap().start_brk };
+unsafe fn allocator_init() {
+    let virt_offset = BOOTSTRAP_MM_INFO.unwrap().start_brk;
     let phy_offset =
         unsafe { MMArch::virt_2_phys(VirtAddr::new(page_align_up(virt_offset))) }.unwrap();
-    kdebug!("phy_offset: {:?}", phy_offset);
 
-    let bump_allocator =
-        BumpAllocator::<X86_64MMArch>::new(unsafe { &PHYS_MEMORY_AREAS }, phy_offset.data());
+    let mut bump_allocator =
+        BumpAllocator::<X86_64MMArch>::new(&PHYS_MEMORY_AREAS, phy_offset.data());
+
+    // 使用bump分配器，把所有的内存页都映射到页表
+    {
+        let mut mapper = crate::mm::page::PageMapper::<MMArch, _>::create(
+            PageTableKind::Kernel,
+            &mut bump_allocator,
+        )
+        .expect("Failed to create page mapper for bump allocator");
+
+        // 取消最开始时候，在head.S中指定的映射(暂时不刷新TLB)
+        {
+            let table = mapper.table();
+            let empty_entry = PageEntry::<MMArch>::new(0);
+            for i in 0..MMArch::PAGE_ENTRY_NUM {
+                table
+                    .set_entry(i, empty_entry)
+                    .expect("Failed to empty page table entry");
+            }
+        }
+        kdebug!("Successfully emptied page table");
+        for area in PHYS_MEMORY_AREAS.iter() {
+            for i in 0..area.size / MMArch::PAGE_SIZE {
+                let paddr = area.base.add(i * MMArch::PAGE_SIZE);
+                let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
+                let flags = page_flags::<MMArch>(vaddr);
+
+                let flusher = mapper
+                    .map_phys(vaddr, paddr, flags)
+                    .expect("Failed to map frame");
+                // 暂时不刷新TLB
+                flusher.ignore();
+            }
+        }
+
+        // 添加低地址的映射（在smp完成初始化之前，需要使用低地址的映射.初始化之后需要取消这一段映射）
+        // 映射32M
+        for i in 0..32 * 1024 * 1024 / MMArch::PAGE_SIZE {
+            let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
+            let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
+            let flags = page_flags::<MMArch>(vaddr);
+
+            let flusher = mapper
+                .map_phys(vaddr, paddr, flags)
+                .expect("Failed to map frame");
+            // 暂时不刷新TLB
+            flusher.ignore();
+        }
+
+        kdebug!(
+            "Successfully mapped all physical memory, table={:?}",
+            mapper.table().phys()
+        );
+        loop {}
+        // todo: 在这里关闭显示输出
+
+        // todo: 在这里重置显示输出目标
+
+        // 使映射后的页表生效
+        mapper.make_current();
+        // todo: 在这里打开显示输出
+    }
+    kdebug!(
+        "After mapping all physical memory, DragonOS used: {} KB",
+        bump_allocator.offset() / 1024
+    );
     // 初始化buddy_allocator
-    let mut buddy_allocator_opt =
-        unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
-    kdebug!("buddy_allocator_opt success");
-    let test_addr = unsafe { buddy_allocator_opt.allocate(PageFrameCount::new(2)) };
-    // 打印test_addr
-    kdebug!("test_addr: {:?}", test_addr);
-    // loop{}
-    // unsafe { buddy_allocator_opt.free(test_addr.unwrap(), PageFrameCount::new(2)) };
-    const test_size: usize = 1026;
-    let mut x = [PhysAddr::new(0); test_size];
+    let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
+    // 设置全局的页帧分配器
+    unsafe { set_inner_allocator(buddy_allocator) };
+    kdebug!("Successfully initialized buddy allocator");
 
-    for i in 0..test_size {
-        let t = unsafe { buddy_allocator_opt.allocate(PageFrameCount::new(2)) };
-        if t.is_some() {
-            x[i] = t.unwrap();
+    loop {}
+}
+
+/// 全局的页帧分配器
+#[derive(Debug, Clone, Copy, Hash)]
+pub struct LockedFrameAllocator;
+
+impl FrameAllocator for LockedFrameAllocator {
+    unsafe fn allocate(
+        &mut self,
+        count: crate::mm::allocator::page_frame::PageFrameCount,
+    ) -> Option<crate::mm::PhysAddr> {
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock() {
+            return allocator.allocate(count);
         } else {
-            panic!("allocate failed, i={i}");
+            return None;
         }
     }
 
-    kdebug!("x[0]: {:p}", x[0].data() as *const u8);
-    kdebug!("x[1]: {:p}", x[1].data() as *const u8);
-    kdebug!("x[255]: {:p}", x[255].data() as *const u8);
-
-    for i in 0..test_size {
-        // kdebug!("free x[{}]", i);
-        unsafe { buddy_allocator_opt.free(x[i], PageFrameCount::new(2)) };
+    unsafe fn free(
+        &mut self,
+        address: crate::mm::PhysAddr,
+        count: crate::mm::allocator::page_frame::PageFrameCount,
+    ) {
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock() {
+            return allocator.free(address, count);
+        }
     }
-    kdebug!("buddy_allocator test success");
-    loop {}
+
+    unsafe fn usage(&self) -> crate::mm::allocator::page_frame::PageFrameUsage {
+        todo!()
+    }
+}
+
+unsafe fn page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
+    let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
+
+    if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
+        // Remap kernel code read only, execute
+        return PageFlags::new().set_execute(true);
+    } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
+        // Remap kernel rodata read only, no execute
+        return PageFlags::new();
+    } else {
+        return PageFlags::new().set_write(true);
+    }
+}
+
+unsafe fn set_inner_allocator(allocator: BuddyAllocator<MMArch>) {
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    if FLAG
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        panic!("Cannot set inner allocator twice!");
+    }
+    *INNER_ALLOCATOR.lock() = Some(allocator);
 }
 
 #[no_mangle]

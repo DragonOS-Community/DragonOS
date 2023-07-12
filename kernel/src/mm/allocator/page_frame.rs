@@ -1,7 +1,10 @@
-use core::{intrinsics::unlikely, ops::{Add, Sub, AddAssign, SubAssign, Mul}};
+use core::{
+    intrinsics::unlikely,
+    ops::{Add, AddAssign, Mul, Sub, SubAssign},
+};
 
 use crate::{
-    arch::{mm::frame::LockedFrameAllocator, MMArch},
+    arch::{mm::LockedFrameAllocator, MMArch},
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
 };
 
@@ -243,7 +246,6 @@ impl Mul<usize> for PageFrameCount {
         return Self(self.0 * rhs);
     }
 }
-
 
 // 页帧使用情况
 #[derive(Debug)]

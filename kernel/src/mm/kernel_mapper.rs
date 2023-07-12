@@ -2,7 +2,7 @@ use super::{PageTableKind, PhysAddr, PhysMemoryArea};
 use crate::{
     arch::{
         asm::irqflags::{local_irq_restore, local_irq_save},
-        mm::{frame::LockedFrameAllocator, PageMapper},
+        mm::{PageMapper, LockedFrameAllocator},
     },
     smp::core::smp_get_processor_id,
 };

@@ -171,8 +171,8 @@ pub struct ScmUiFrameworkMetadata {
     pub name: String,
     pub framework_type: ScmFramworkType,
     pub buf_info: ScmBufferInfo,
-    // pub private_info: ScmUiPrivateInfo,
-    pub is_enable: bool,
+
+   
 }
 
 impl ScmUiFrameworkMetadata {
@@ -181,10 +181,10 @@ impl ScmUiFrameworkMetadata {
             ScmFramworkType::Text => {
                 let result = ScmUiFrameworkMetadata {
                     id: ScmUiFrameworkId::new(),
-                    name: "".to_string(),
+                    name,
                     framework_type: ScmFramworkType::Text,
                     buf_info: ScmBufferInfo::new(ScmBfFlag::SCM_BF_TEXT).unwrap(),
-                    is_enable: false,
+     
                 };
                 return result;
             }
@@ -237,11 +237,10 @@ pub extern "C" fn scm_init() {
     c_uart_send_str(UartPort::COM1.to_u16(), "\nfinish_scm_init\n\0".as_ptr());
 }
 
-/**
- * @brief 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
- *
- * @param framework 要启动的ui框架
- */
+/// 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
+/// ## 参数
+/// - framework 要启动的ui框架
+
 pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     if framework.metadata()?.buf_info.vaddr == 0 {
         return Err(SystemError::EINVAL);
@@ -264,11 +263,10 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
 
     return Ok(0);
 }
-/**
- * @brief 向屏幕管理器注册UI框架
- *
- * @param framework 框架结构体
- */
+/// 向屏幕管理器注册UI框架
+/// ## 参数
+/// - framework 框架结构体
+
 pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     // 把ui框架加入链表
 
@@ -277,18 +275,15 @@ pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemErr
     framework.install()?;
 
     // 如果当前还没有框架获得了屏幕的控制权，就让其拿去
-    if !CURRENT_FRAMEWORK.read().is_none() {
+    if CURRENT_FRAMEWORK.read().is_none() {
         return scm_framework_enable(framework);
     }
 
     return Ok(0);
 }
 
-/**
- * @brief 允许双缓冲区
- *
- * @return int
- */
+/// 允许双缓冲区
+
 #[no_mangle]
 pub extern "C" fn scm_enable_double_buffer() -> i32 {
     let r = true_scm_enable_double_buffer().unwrap_or_else(|e| e.to_posix_errno());
@@ -315,7 +310,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
 
     // 创建双缓冲区
     let buf_info = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL)?;
-
+    // (*CURRENT_FRAMEWORK.write()).buf_info = buf_info.clone();
     CURRENT_FRAMEWORK
         .write()
         .as_ref()
@@ -323,6 +318,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
         .change(buf_info.clone())?;
     // 设置定时刷新的对象
     unsafe { video_set_refresh_target(buf_info.clone().into()) };
+    // 遍历当前所有使用帧缓冲区的框架，更新地址(暂时还没想好怎么不用指针把各个框架的缓冲区更改为双缓冲区，先直接把textui框架的缓冲区更改为双缓冲)
     textui_change_buf(buf_info.clone())?;
     // 通知显示驱动，启动双缓冲
     unsafe { video_reinitialize(true) };
@@ -332,10 +328,8 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
     return Ok(0);
 }
 
-/**
- * @brief 当内存管理单元被初始化之后，重新处理帧缓冲区问题
- *
- */
+/// 当内存管理单元被初始化之后，重新处理帧缓冲区问题
+
 #[no_mangle]
 pub extern "C" fn scm_reinit() -> i32 {
     let r = true_scm_reinit().unwrap_or_else(|e| e.to_posix_errno());

@@ -53,11 +53,8 @@ pub fn no_init_textui_putchar_window(
     // 输出制表符
     else if character == b'\t' {
         if is_put_to_window == true {
-            let char = TextuiCharChromatic {
-                c: b' ',
-                frcolor,
-                bkcolor,
-            };
+            let char = TextuiCharChromatic::new_by_param(b' ',frcolor,bkcolor);
+
 
             //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
             let mut space_to_print = 8 - NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst) % 8;
@@ -78,11 +75,7 @@ pub fn no_init_textui_putchar_window(
             NO_ALLOC_OPERATIONS_INDEX.fetch_sub(1, Ordering::SeqCst);
             let op_char = NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst);
             if op_char >= 0 {
-                let char = TextuiCharChromatic {
-                    c: b' ',
-                    frcolor,
-                    bkcolor,
-                };
+                let char = TextuiCharChromatic::new_by_param(b' ',frcolor,bkcolor);
                 char.no_init_textui_render_chromatic(
                     LineId::new(NO_ALLOC_OPERATIONS_LINE.load(Ordering::SeqCst)),
                     LineIndex::new(NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)),
@@ -104,11 +97,7 @@ pub fn no_init_textui_putchar_window(
     } else {
         if is_put_to_window == true {
             // 输出其他字符
-            let char = TextuiCharChromatic {
-                c: character,
-                frcolor,
-                bkcolor,
-            };
+            let char = TextuiCharChromatic::new_by_param(character, frcolor, bkcolor);
 
             if NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst) == CHAR_PER_LINE.load(Ordering::SeqCst) {
                 NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);

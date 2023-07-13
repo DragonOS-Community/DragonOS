@@ -1,4 +1,21 @@
-use crate::include::bindings::bindings::{io_in8, io_out8};
+use super::super::base::device::Device;
+use crate::{
+    driver::base::{
+        char::CharDevice,
+    device::{driver::Driver, DeviceState, DeviceType, IdTable, KObject},
+        platform::{
+            self, platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
+        },
+    },
+    filesystem::{
+        sysfs::bus::{bus_device_register, bus_driver_register},
+        vfs::IndexNode,
+    },
+    include::bindings::bindings::{io_in8, io_out8},
+    libs::spinlock::SpinLock,
+    syscall::SystemError,
+};
+use alloc::sync::Arc;
 use core::{char, intrinsics::offset, str};
 
 const UART_SUCCESS: i32 = 0;
@@ -6,9 +23,17 @@ const E_UART_BITS_RATE_ERROR: i32 = 1;
 const E_UART_SERIAL_FAULT: i32 = 2;
 const UART_MAX_BITS_RATE: u32 = 115200;
 
+lazy_static! {
+    // 串口设备
+    pub static ref UART_DEV: Arc<LockedUart> = Arc::new(LockedUart::default());
+    // 串口驱动
+    pub static ref UART_DRV: Arc<LockedUartDriver> = Arc::new(LockedUartDriver::default());
+}
+
+// @brief 串口端口
 #[allow(dead_code)]
 #[repr(u16)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum UartPort {
     COM1 = 0x3f8,
     COM2 = 0x2f8,
@@ -57,6 +82,7 @@ impl UartPort {
     }
 }
 
+// @brief 串口寄存器
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -71,10 +97,88 @@ struct UartRegister {
     reg_scartch: u8,
 }
 
+// @brief 串口设备结构体
+#[derive(Debug)]
+pub struct Uart {
+    state: DeviceState, // 设备状态
+    sys_info: Option<Arc<dyn IndexNode>>,
+    driver: Option<Arc<dyn PlatformDriver>>,
+}
+
+impl Default for Uart {
+    fn default() -> Self {
+        Self {
+            state: DeviceState::NotInitialized,
+            sys_info: None,
+            driver: None,
+        }
+    }
+}
+
+// @brief 串口设备结构体(加锁)
+#[derive(Debug)]
+pub struct LockedUart(SpinLock<Uart>);
+
+impl Default for LockedUart {
+    fn default() -> Self {
+        Self(SpinLock::new(Uart::default()))
+    }
+}
+
+impl KObject for LockedUart {}
+
+impl PlatformDevice for LockedUart {
+    fn compatible_table(&self) -> platform::CompatibleTable {
+        platform::CompatibleTable::new(vec!["uart"])
+    }
+
+    fn is_initialized(&self) -> bool {
+        let state = self.0.lock().state;
+        match state {
+            DeviceState::Initialized => true,
+            _ => false,
+        }
+    }
+
+    fn set_state(&self, set_state: DeviceState) {
+        let state = &mut self.0.lock().state;
+        *state = set_state;
+    }
+
+    fn set_driver(&self, driver: Option<Arc<dyn PlatformDriver>>) {
+        self.0.lock().driver = driver;
+    }
+}
+
+impl Device for LockedUart {
+    fn id_table(&self) -> IdTable {
+        IdTable::new("uart", 0)
+    }
+
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
+        self.0.lock().sys_info = sys_info;
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+        self.0.lock().sys_info.clone()
+    }
+
+    fn dev_type(&self) -> DeviceType {
+        DeviceType::Serial
+    }
+
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+        self
+    }
+}
+
+// @brief 串口驱动结构体
 #[repr(C)]
+#[derive(Debug)]
 pub struct UartDriver {
     port: UartPort,
     baud_rate: u32,
+    sys_info: Option<Arc<dyn IndexNode>>,
 }
 
 impl Default for UartDriver {
@@ -82,11 +186,91 @@ impl Default for UartDriver {
         Self {
             port: UartPort::COM1,
             baud_rate: 115200,
+            sys_info: None,
         }
     }
 }
 
+// @brief 串口驱动结构体(加锁)
+#[derive(Debug)]
+pub struct LockedUartDriver(SpinLock<UartDriver>);
+
+impl Default for LockedUartDriver {
+    fn default() -> Self {
+        Self(SpinLock::new(UartDriver::default()))
+    }
+}
+
+impl KObject for LockedUartDriver {}
+
+impl Driver for LockedUartDriver {
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+        self
+    }
+
+    fn id_table(&self) -> IdTable {
+        return IdTable::new("uart_driver", 0);
+    }
+
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
+        self.0.lock().sys_info = sys_info;
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
+        return self.0.lock().sys_info.clone();
+    }
+}
+
+impl CharDevice for LockedUartDriver {
+    fn open(&self, _file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
+        return Ok(());
+    }
+
+    fn close(&self, _file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
+        return Ok(());
+    }
+}
+
+impl LockedUartDriver {
+    /// @brief 创建串口驱动
+    /// @param port 端口号
+    ///        baud_rate 波特率
+    ///        sys_info: sys文件系统inode
+    /// @return  
+    #[allow(dead_code)]
+    pub fn new(port: UartPort, baud_rate: u32, sys_info: Option<Arc<dyn IndexNode>>) -> Self {
+        Self(SpinLock::new(UartDriver::new(port, baud_rate, sys_info)))
+    }
+}
+
+impl PlatformDriver for LockedUartDriver {
+    fn probe(
+        &self,
+        _device: Arc<dyn PlatformDevice>,
+    ) -> Result<(), crate::driver::base::device::driver::DriverError> {
+        return Ok(());
+    }
+
+    fn compatible_table(&self) -> platform::CompatibleTable {
+        return CompatibleTable::new(vec!["uart"]);
+    }
+}
+
 impl UartDriver {
+    /// @brief 创建串口驱动
+    /// @param port 端口号
+    ///        baud_rate 波特率
+    ///        sys_info: sys文件系统inode
+    /// @return 返回串口驱动
+    #[allow(dead_code)]
+    pub fn new(port: UartPort, baud_rate: u32, sys_info: Option<Arc<dyn IndexNode>>) -> Self {
+        Self {
+            port,
+            baud_rate,
+            sys_info,
+        }
+    }
+
     /// @brief 串口初始化
     /// @param uart_port 端口号
     /// @param baud_rate 波特率
@@ -176,6 +360,11 @@ impl UartDriver {
         while UartDriver::serial_received(port) == false {} //TODO:pause
         unsafe { io_in8(port) as char }
     }
+
+    #[allow(dead_code)]
+    fn port() -> u16 {
+        UartPort::COM1.to_u16()
+    }
 }
 
 ///@brief 发送数据
@@ -231,7 +420,7 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
         let divisor = UART_MAX_BITS_RATE / baud_rate;
 
         io_out8(port + 0, (divisor & 0xff) as u8); // Set divisor  (lo byte)
-        io_out8(port + 1, ((divisor >> 8) & 0xff) as u8); //                  (hi byte)
+        io_out8(port + 1, ((divisor >> 8) & 0xff) as u8); //                  CompatibleTable(hi byte)
         io_out8(port + 3, 0x03); // 8 bits, no parity, one stop bit
         io_out8(port + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
         io_out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
@@ -260,4 +449,19 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
             The second write to the Line Control register [PORT + 3]
         clears the DLAB again as well as setting various other bits.
     */
+}
+
+/// @brief 串口初始化，注册串口
+/// @param none
+/// @return 初始化成功，返回(),失败，返回错误码
+pub fn uart_init() -> Result<(), SystemError> {
+    let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().to_name())
+        .expect("uart device register error");
+    UART_DEV.set_sys_info(Some(device_inode));
+    let driver_inode = bus_driver_register("platform:0", &UART_DRV.id_table().to_name())
+        .expect("uart driver register error");
+    UART_DRV.set_sys_info(Some(driver_inode));
+    UART_DEV.set_driver(Some(UART_DRV.clone()));
+    UART_DEV.set_state(DeviceState::Initialized);
+    return Ok(());
 }

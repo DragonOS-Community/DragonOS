@@ -114,7 +114,7 @@ impl File {
             readdir_subdirs_name: Vec::new(),
             private_data: FilePrivateData::default(),
         };
-        kdebug!("inode:{:?}",f.inode);
+        // kdebug!("inode:{:?}",f.inode);
         f.inode.open(&mut f.private_data, &mode)?;
        
         return Ok(f);

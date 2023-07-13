@@ -408,7 +408,7 @@ impl Syscall {
 
                     Self::open(path, open_flags)
                 };
-                kdebug!("open: {:?}, res: {:?}", path, res);
+                // kdebug!("open: {:?}, res: {:?}", path, res);
                 res
             }
             SYS_CLOSE => {

@@ -526,7 +526,6 @@ macro_rules! devfs_exact_ref {
 }
 /// @brief devfs的设备注册函数
 pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
-    kdebug!("register_device {}", name);
     return devfs_exact_ref!().register_device(name, device);
 }
 

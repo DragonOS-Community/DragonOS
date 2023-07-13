@@ -68,7 +68,7 @@ cppcheck:
 	cppcheck kernel user --platform=unix64 --std=c11 -I user/libs/ -I=kernel/ --force -j $(NPROCS)
 
 gdb:
-	gdb -n -x tools/.gdbinit
+	rust-gdb -n -x tools/.gdbinit
 
 # 写入磁盘镜像
 write_diskimage:

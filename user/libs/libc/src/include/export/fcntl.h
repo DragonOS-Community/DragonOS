@@ -71,6 +71,7 @@ extern  "C"  {
  * @return int 文件描述符
  */
 int open(const char * path, int options, ...);
+int ioctl(int fd, int cmd, ...);
 
 #if defined(__cplusplus) 
 }  /* extern "C" */ 

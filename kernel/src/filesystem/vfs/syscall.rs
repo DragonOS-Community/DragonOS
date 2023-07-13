@@ -15,6 +15,7 @@ use super::{
     utils::rsplit_path,
     Dirent, FileType, IndexNode, ROOT_INODE,
 };
+use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -30,6 +31,7 @@ impl Syscall {
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
         // 文件名过长
+        kdebug!("Open {}", path);
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
@@ -80,7 +82,7 @@ impl Syscall {
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
         }
-
+        kdebug!("file:{:?}",file);
         // 把文件对象存入pcb
         return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
     }

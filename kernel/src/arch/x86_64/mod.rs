@@ -9,5 +9,6 @@ pub mod pci;
 pub mod rand;
 pub mod sched;
 pub mod syscall;
+pub mod kvm;
 
 pub use interrupt::X86_64InterruptArch as CurrentIrqArch;

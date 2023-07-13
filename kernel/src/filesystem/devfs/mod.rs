@@ -8,7 +8,7 @@ use super::vfs::{
     FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
 };
 use crate::{
-    kerror,
+    kerror, kdebug,
     libs::spinlock::{SpinLock, SpinLockGuard},
     syscall::SystemError,
     time::TimeSpec,
@@ -136,6 +136,11 @@ impl DevFS {
 
                 dev_block_inode.add_dev(name, device.clone())?;
                 device.set_fs(dev_block_inode.0.lock().fs.clone());
+            }
+            FileType::KvmDevice => {
+                dev_root_inode
+                    .add_dev(name, device.clone())
+                    .expect("DevFS: Failed to register /dev/kvm");
             }
             _ => {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -521,6 +526,7 @@ macro_rules! devfs_exact_ref {
 }
 /// @brief devfs的设备注册函数
 pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
+    kdebug!("register_device {}", name);
     return devfs_exact_ref!().register_device(name, device);
 }
 

@@ -3,6 +3,8 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use crate::kdebug;
+
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
@@ -358,6 +360,7 @@ pub const SYS_ACCEPT: usize = 40;
 pub const SYS_GETSOCKNAME: usize = 41;
 pub const SYS_GETPEERNAME: usize = 42;
 pub const SYS_GETTIMEOFDAY: usize = 43;
+pub const SYS_IOCTL: usize = 44;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -405,7 +408,7 @@ impl Syscall {
 
                     Self::open(path, open_flags)
                 };
-                // kdebug!("open: {:?}, res: {:?}", path, res);
+                kdebug!("open: {:?}, res: {:?}", path, res);
                 res
             }
             SYS_CLOSE => {
@@ -470,6 +473,10 @@ impl Syscall {
                 };
 
                 res
+            }
+            SYS_IOCTL => {
+                kdebug!("SYS_IOCTL");
+                Ok(0)
             }
 
             SYS_BRK => {

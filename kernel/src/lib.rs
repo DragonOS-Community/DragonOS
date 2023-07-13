@@ -32,6 +32,7 @@ mod sched;
 mod smp;
 mod syscall;
 mod time;
+mod virt;
 
 #[macro_use]
 extern crate alloc;

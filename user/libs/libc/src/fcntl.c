@@ -17,10 +17,10 @@ int open(const char *path, int options, ...)
 /**
  * @brief ioctl的接口
  *
- * @param path 文件路径
- * @param options 打开选项
+ * @param fd 文件句柄
+ * @param cmd 设备相关的请求类型
  * @param ...
- * @return int 文件描述符
+ * @return int 成功返回0
  */
 int ioctl(int fd, int cmd, ...)
 {

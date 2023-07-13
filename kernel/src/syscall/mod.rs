@@ -476,7 +476,10 @@ impl Syscall {
             }
             SYS_IOCTL => {
                 kdebug!("SYS_IOCTL");
-                Ok(0)
+                let fd = args[0];
+                let cmd = args[1];
+                let data = args[2];
+                Self::ioctl(fd, cmd as u32, data)
             }
 
             SYS_BRK => {

@@ -96,6 +96,22 @@ impl Syscall {
         return current_pcb().drop_fd(fd as i32).map(|_| 0);
     }
 
+    /// @brief 发送命令到文件描述符对应的设备，
+    ///
+    /// @param fd 文件描述符编号
+    /// @param cmd 设备相关的请求类型
+    ///
+    /// @return Ok(usize) 成功返回0
+    /// @return Err(SystemError) 读取失败，返回posix错误码
+    pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
+        let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd as i32);
+        if file.is_none() {
+            return Err(SystemError::EBADF);
+        }
+        let file: &mut File = file.unwrap();
+        file.inode().ioctl(cmd, data)
+    }
+
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
     ///
     /// @param fd 文件描述符编号

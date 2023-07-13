@@ -13,18 +13,28 @@ use core::{
     ptr::copy_nonoverlapping,
     sync::atomic::{AtomicU32, Ordering},
 };
+use thingbuf::mpsc;
 
-
-
-use super::screen_manager::{
-    scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
+use super::{
+    screen_manager::{
+        scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
+    },
+    textui_no_alloc::no_init_textui_putchar_window,
 };
 use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref WINDOW_LIST: SpinLock<LinkedList<Arc<TextuiWindow>>> =
         SpinLock::new(LinkedList::new());
+    pub static ref TEXTUI_FRAMEWORK: Arc<LockedTextUiFramework> =
+        Arc::new(LockedTextUiFramework::new());
+    pub static ref TEXTUI_PRIVATE_INFO: SpinLock<TextuiPrivateInfo> =
+        SpinLock::new(TextuiPrivateInfo::new());
+    pub static ref WINDOW_MPSC: WindowMpsc = WindowMpsc::new();
+    pub static ref CURRENT_WINDOW: SpinLock<TextuiWindow> =
+        SpinLock::new(TEXTUI_PRIVATE_INFO.lock().current_window.clone());
 }
+
 //window标志位
 bitflags! {
     pub struct WindowFlag: u8 {
@@ -33,29 +43,34 @@ bitflags! {
     }
 }
 
-lazy_static! {
-    pub static ref TEXTUIFRAMEWORK: LockedTextUiFramework = LockedTextUiFramework::new();
-}
-lazy_static! {
-    pub static ref TEXTUI_PRIVATE_INFO: SpinLock<TextuiPrivateInfo> =
-        SpinLock::new(TextuiPrivateInfo::new());
-}
-// lazy_static! {
-//     pub static ref WINDOW_MPSC: WindowMpsc = WindowMpsc::new();
-// }
+/// 每个字符的宽度和高度（像素）
+pub const TEXTUI_CHAR_WIDTH: u32 = 8;
+pub const TEXTUI_CHAR_HEIGHT: u32 = 16;
+
+pub static mut TEST_IS_INIT: bool = false;
+
+pub static mut ENABLE_PUT_TO_WINDOW: bool = true; //因为只在未初始化textui之前而其他模块使用的内存将要到达48M时到在初始化textui时才为false,所以只会修改两次，应该不需加锁
+pub static ACTUAL_LINE_NUM: RwLock<i32> = RwLock::new(0);
+pub static CURRENT_WINDOW_ID: RwLock<WindowId> = RwLock::new(WindowId(0));
+
+pub static TEXTUI_BUF_WIDTH: RwLock<u32> = RwLock::new(0);
+pub static TEXTUI_BUF_VADDR: RwLock<usize> = RwLock::new(0);
+pub static TEXTUI_BUF_SIZE: RwLock<usize> = RwLock::new(0);
+
 // 利用mpsc实现当前窗口
-// pub struct WindowMpsc {
-//     window_r: mpsc::Receiver<TextuiWindow>,
-//     window_s: mpsc::Sender<TextuiWindow>,
-// }
-// pub const MPSC_BUF_SIZE: usize = 512;
-// impl WindowMpsc {
-//     fn new() -> Self {
-//         // let window = &TEXTUI_PRIVATE_INFO.lock().current_window;
-//         let (window_s, window_r) = mpsc::channel::<TextuiWindow>(MPSC_BUF_SIZE);
-//         WindowMpsc { window_r, window_s }
-//     }
-// }
+pub struct WindowMpsc {
+    receiver: mpsc::Receiver<TextuiWindow>,
+    sender: mpsc::Sender<TextuiWindow>,
+}
+
+impl WindowMpsc {
+    pub const MPSC_BUF_SIZE: usize = 512;
+    fn new() -> Self {
+        // let window = &TEXTUI_PRIVATE_INFO.lock().current_window;
+        let (sender, receiver) = mpsc::channel::<TextuiWindow>(Self::MPSC_BUF_SIZE);
+        WindowMpsc { receiver, sender }
+    }
+}
 
 /**
  * @brief 黑白字符对象
@@ -63,16 +78,22 @@ lazy_static! {
  */
 #[derive(Clone, Debug)]
 struct TextuiCharNormal {
-    _c: u8,
+    data: u8,
 }
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Default)]
 pub struct LineId(i32);
 impl LineId {
-    fn new(num: i32) -> Self {
+    pub fn new(num: i32) -> Self {
         LineId(num)
     }
-    fn check(&self, max: i32) -> bool {
+
+    pub fn check(&self, max: i32) -> bool {
         self.0 < max && self.0 >= 0
+    }
+
+    pub fn data(&self) -> i32 {
+        self.0
     }
 }
 impl Add<i32> for LineId {
@@ -118,13 +139,12 @@ impl AddAssign<LineId> for LineId {
     }
 }
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Default)]
-
 pub struct LineIndex(i32);
 impl LineIndex {
-    fn new(num: i32) -> Self {
+    pub fn new(num: i32) -> Self {
         LineIndex(num)
     }
-    fn check(&self, chars_per_line: i32) -> bool {
+    pub fn check(&self, chars_per_line: i32) -> bool {
         self.0 < chars_per_line && self.0 >= 0
     }
 }
@@ -223,45 +243,6 @@ pub struct TextuiCharChromatic {
     bkcolor: FontColor, // rgb
 }
 
-// #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
-// pub struct BufAddr(usize);
-// impl BufAddr {
-//     pub fn new(vaddr: usize) -> Self {
-//         return Self(vaddr);
-//     }
-//     // fn get_buf_addr_start() -> BufAddr {
-//     //     Self(*BUF_VADDR.read() as *mut usize)
-//     // }
-//     pub fn get_buf_addr_by_offset(count: isize) -> BufAddr {
-//         let mut addr = BufAddr::new(BUF_VADDR.load(Ordering::SeqCst));
-//         if count < 0 {
-//             return addr - count.abs() as usize;
-//         }else{
-//             return addr + count as usize;
-//         }
-//     }
-// }
-// impl Into<usize> for BufAddr {
-//     fn into(self) -> usize {
-//         self.0
-//     }
-// }
-// impl core::ops::Add<usize> for BufAddr {
-//     type Output = Self;
-//     fn add(self, rhs: usize) -> Self::Output {
-//         BufAddr::new(self.0 + rhs)
-//     }
-// }
-// impl core::ops::Sub<usize> for BufAddr {
-//     type Output = Self;
-//     fn sub(self, rhs: usize) -> Self::Output {
-//         Self::new(self.0 - rhs)
-//     }
-// }
-pub static TEXTUI_BUF_WIDTH: RwLock<u32> = RwLock::new(0);
-pub static TEXTUI_BUF_VADDR: RwLock<usize> = RwLock::new(0);
-pub static TEXTUI_BUF_SIZE: RwLock<usize> = RwLock::new(0);
-
 pub fn set_textui_buf_vaddr(vaddr: usize) {
     *TEXTUI_BUF_VADDR.write() = vaddr;
 }
@@ -307,53 +288,7 @@ impl TextuiBuf<'_> {
         TextuiBuf::get_index_by_x_y(x as usize, y as usize)
     }
 }
-// impl Into<&mut [u32]> for TextuiBuf<'_> {
-//     fn into(&self) -> &mut [u32] {
-//         self.0
-//     }
-// }
-// impl Clone for Buf<'_> {
-//     fn clone(&self) -> Self {
-//         let mut buf = Vec::new();
-//         for i in self.0.iter() {
-//             &buf.push(*i);
-//         }
-//         let b = buf.as_mut_slice();
-//         // 转移对 cloned_data 的所有权到新创建的 Buf 实例中
-//         let cloned = Buf::new(b);
-//         core::mem::forget(b);
-//         return cloned;
-//     }
-// }
-// impl TextuiBuf<'_>{
-//     pub fn new(buf:Buf)->Self{
-//         TextuiBuf(buf)
-//     }
-//     pub fn put_color_in_pixel(&self,color:u32,index:usize){
-//         let buf:&mut [u32]=(*self).into();
-//         buf[index]=color;
-//     }
-//     pub fn get_index_of_next_line(now_index:usize)->usize{
-//         *(BUF_WIDTH.read()) as usize+now_index
-//     }
-//     pub fn get_index_by_x_y(x:usize,y:usize)->usize{
-//         *(BUF_WIDTH.read()) as usize*y+x
-//     }
-//     pub fn get_start_index_by_lineid_lineindex(lineid:LineId,lineindex:LineIndex)->usize{
-//         //   x 左上角列像素点位置
-//         //   y 左上角行像素点位置
-//         let index_x: u32 = lineindex.into();
-//         let x: u32 = index_x * TEXTUI_CHAR_WIDTH;
-//         let id_y: u32 = lineid.into();
-//         let y: u32 = id_y * TEXTUI_CHAR_HEIGHT;
-//         TextuiBuf::get_index_by_x_y(x as usize, y as usize)
-//     }
-// }
-// impl Into<&mut [u32]> for TextuiBuf<'_> {
-//     fn into(self) -> &'static mut [u32] {
-//         self.0.into()
-//     }
-// }
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct Font([u8; 16]);
 impl Font {
@@ -452,7 +387,6 @@ impl TextuiCharChromatic {
                 }
             }
         }
-
     }
 }
 // 注意！！！ 请保持vline结构体的大小、成员变量命名相等！
@@ -462,8 +396,8 @@ impl TextuiCharChromatic {
  */
 #[derive(Clone, Debug, Default)]
 pub struct TextuiVlineNormal {
-    _chars: Vec<TextuiCharNormal>, // 字符对象数组
-    _index: i16,                   // 当前操作的位置
+    characters: Vec<TextuiCharNormal>, // 字符对象数组
+    index: i16,                        // 当前操作的位置
 }
 /**
  * @brief 彩色显示的虚拟行结构体
@@ -475,31 +409,24 @@ pub struct TextuiVlineChromatic {
     index: LineIndex,                // 当前操作的位置
 }
 impl TextuiVlineChromatic {
-    fn new() -> Self {
-        TextuiVlineChromatic {
-            chars: Vec::new(),
+    fn new(characters: usize) -> Self {
+        let mut r = TextuiVlineChromatic {
+            chars: Vec::with_capacity(characters),
             index: LineIndex::new(0),
+        };
+
+        for _ in 0..characters {
+            r.chars.push(TextuiCharChromatic::new());
         }
-    }
-    /**
-     * @brief 初始化虚拟行对象
-     *
-     * @param vline 虚拟行对象指针
-     * @param chars_ptr 字符对象数组指针
-     */
-    fn textui_init_vline(&mut self, num: usize) {
-        self.index = LineIndex(0);
-        let value = TextuiCharChromatic::new();
-        for _i in 0..num {
-            self.chars.push(value);
-        }
+
+        return r;
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum TextuiVline {
     Chromatic(TextuiVlineChromatic),
-    _Normal(TextuiVlineNormal),
+    Normal(TextuiVlineNormal),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
@@ -530,8 +457,7 @@ pub struct TextuiWindow {
     // 窗口flag
     flags: WindowFlag,
 }
-pub static ACTUAL_LINE_NUM: RwLock<i32> = RwLock::new(0);
-pub static CORRENT_WINDOW_ID: RwLock<WindowId> = RwLock::new(WindowId(0));
+
 impl TextuiWindow {
     fn new() -> Self {
         TextuiWindow {
@@ -591,7 +517,7 @@ impl TextuiWindow {
         start: LineIndex,
         count: i32,
     ) -> Result<i32, SystemError> {
-        let corrent_window_id = *CORRENT_WINDOW_ID.read();
+        let corrent_window_id = *CURRENT_WINDOW_ID.read();
 
         let actual_line_sum = *ACTUAL_LINE_NUM.read();
         // 要刷新的窗口正在使用，则退出刷新
@@ -726,7 +652,7 @@ impl TextuiWindow {
      * @param character
      * @return int
      */
-    fn ture_textui_putchar_window(
+    fn true_textui_putchar_window(
         &mut self,
         character: u8,
         frcolor: FontColor,
@@ -734,7 +660,7 @@ impl TextuiWindow {
     ) -> Result<i32, SystemError> {
         // 启用彩色字符
         if self.flags.contains(WindowFlag::TEXTUI_IS_CHROMATIC) {
-            let mut s_index = LineIndex::new(0); //操作的列号
+            let mut line_index = LineIndex::new(0); //操作的列号
             if let TextuiVline::Chromatic(vline) =
                 &mut (self.vlines[<LineId as Into<usize>>::into(self.vline_operating)])
             {
@@ -745,14 +671,14 @@ impl TextuiWindow {
                     v_char.frcolor = frcolor;
                     v_char.bkcolor = bkcolor;
                 }
-                s_index = vline.index;
+                line_index = vline.index;
                 vline.index = vline.index + 1;
             }
 
-            self.textui_refresh_characters(self.vline_operating, s_index, 1)?;
+            self.textui_refresh_characters(self.vline_operating, line_index, 1)?;
 
             // 加入光标后，因为会识别光标，所以需超过该行最大字符数才能创建新行
-            if !s_index.check(self.chars_per_line - 1) {
+            if !line_index.check(self.chars_per_line - 1) {
                 self.textui_new_line()?;
             }
         } else {
@@ -801,7 +727,7 @@ impl TextuiWindow {
                 //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
                 let mut space_to_print = 8 - <LineIndex as Into<usize>>::into(vline.index) % 8;
                 while space_to_print > 0 {
-                    self.ture_textui_putchar_window(b' ', frcolor, bkcolor)?;
+                    self.true_textui_putchar_window(b' ', frcolor, bkcolor)?;
                     space_to_print -= 1;
                 }
             }
@@ -848,7 +774,7 @@ impl TextuiWindow {
                 }
                 // 上缩一行
                 self.vline_operating = self.vline_operating - 1;
-                if <LineId as Into<i32>>::into(self.vline_operating) < 0 {
+                if self.vline_operating.data() < 0 {
                     self.vline_operating = LineId(self.vline_sum - 1);
                 }
 
@@ -873,7 +799,7 @@ impl TextuiWindow {
                     self.textui_new_line()?;
                 }
 
-                return self.ture_textui_putchar_window(character, frcolor, bkcolor);
+                return self.true_textui_putchar_window(character, frcolor, bkcolor);
             }
         }
 
@@ -915,15 +841,21 @@ impl TextuiPrivateInfo {
 pub struct TextUiFramework {
     metadata: ScmUiFrameworkMetadata,
 }
+
+impl TextUiFramework {
+    pub fn new() -> Self {
+        let inner = TextUiFramework {
+            metadata: ScmUiFrameworkMetadata::new("TextUI".to_string(), ScmFramworkType::Text),
+        };
+        return inner;
+    }
+}
 #[derive(Debug)]
 pub struct LockedTextUiFramework(pub SpinLock<TextUiFramework>);
 impl LockedTextUiFramework {
     pub fn new() -> Self {
-        let inner = TextUiFramework {
-            metadata: ScmUiFrameworkMetadata::new(ScmFramworkType::Text),
-        };
+        let inner = TextUiFramework::new();
         let result = Self(SpinLock::new(inner));
-
         return result;
     }
 }
@@ -971,19 +903,7 @@ impl ScmUiFramework for TextUiFramework {
         return Ok(self.metadata.clone());
     }
 }
-// impl<'a> Deref for TextUiFramework<'a> {
-//     type Target = ScmUiFrameworkMetadata<'a>;
 
-//     fn deref(&self) -> &Self::Target {
-//         &self.metadata
-//     }
-// }
-
-// impl DerefMut for TextUiFramework<'_> {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         &mut self.metadata
-//     }
-// }
 impl Deref for TextUiFramework {
     type Target = ScmUiFrameworkMetadata;
 
@@ -996,118 +916,6 @@ impl DerefMut for TextUiFramework {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.metadata
     }
-}
-// 每个字符的宽度和高度（像素）
-pub const TEXTUI_CHAR_WIDTH: u32 = 8;
-pub const TEXTUI_CHAR_HEIGHT: u32 = 16;
-
-pub static mut TEST_IS_INIT: bool = false;
-pub static TRUE_LINE_NUM: RwLock<i32> = RwLock::new(0);
-pub static CHAR_PER_LINE: RwLock<i32> = RwLock::new(0);
-//textui 未初始化时直接向缓冲区写，不使用虚拟行
-pub static NO_INIT_OPERATIONS_LINE: RwLock<i32> = RwLock::new(0);
-pub static NO_INIT_OPERATIONS_INDEX: RwLock<i32> = RwLock::new(0);
-pub static mut ENABLE_PUT_TO_WINDOW: bool = true; //因为只在未初始化textui之前而其他模块使用的内存将要到达48M时到在初始化textui时才为false,所以只会修改两次，应该不需加锁
-
-pub fn no_init_textui_putchar_window(
-    character: u8,
-    frcolor: FontColor,
-    bkcolor: FontColor,
-    is_put_to_window: bool,
-) -> Result<i32, SystemError> {
-    if *NO_INIT_OPERATIONS_LINE.read() > *TRUE_LINE_NUM.read() {
-        *NO_INIT_OPERATIONS_LINE.write() = 0;
-    }
-    //字符'\0'代表ASCII码表中的空字符,表示字符串的结尾
-    if unlikely(character == b'\0') {
-        return Ok(0);
-    }
-
-    c_uart_send(UartPort::COM1.to_u16(), character);
-
-    //进行换行操作
-    if unlikely(character == b'\n') {
-        // 换行时还需要输出\r
-        c_uart_send(UartPort::COM1.to_u16(), b'\r');
-        if is_put_to_window == true {
-            *NO_INIT_OPERATIONS_LINE.write() += 1;
-            *NO_INIT_OPERATIONS_INDEX.write() = 0;
-        }
-        return Ok(0);
-    }
-    // 输出制表符
-    else if character == b'\t' {
-        if is_put_to_window == true {
-            let char = TextuiCharChromatic {
-                c: b' ',
-                frcolor,
-                bkcolor,
-            };
-
-            //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
-            let mut space_to_print = 8 - *NO_INIT_OPERATIONS_INDEX.read() % 8;
-            while space_to_print > 0 {
-                char.no_init_textui_render_chromatic(
-                    LineId::new(*NO_INIT_OPERATIONS_LINE.read()),
-                    LineIndex::new(*NO_INIT_OPERATIONS_INDEX.read()),
-                );
-                *NO_INIT_OPERATIONS_INDEX.write() += 1;
-                space_to_print -= 1;
-            }
-            return Ok(0);
-        }
-    }
-    // 字符 '\x08' 代表 ASCII 码中的退格字符。它在输出中的作用是将光标向左移动一个位置，并在该位置上输出后续的字符，从而实现字符的删除或替换。
-    else if character == b'\x08' {
-        if is_put_to_window == true {
-            *NO_INIT_OPERATIONS_INDEX.write() -= 1;
-            let op_char = *NO_INIT_OPERATIONS_INDEX.read();
-            if op_char >= 0 {
-                let char = TextuiCharChromatic {
-                    c: b' ',
-                    frcolor,
-                    bkcolor,
-                };
-                char.no_init_textui_render_chromatic(
-                    LineId::new(*NO_INIT_OPERATIONS_LINE.read()),
-                    LineIndex::new(*NO_INIT_OPERATIONS_INDEX.read()),
-                );
-
-                *NO_INIT_OPERATIONS_INDEX.write() += 1;
-            }
-            // 需要向上缩一行
-            if op_char < 0 {
-                // 上缩一行
-                *NO_INIT_OPERATIONS_LINE.write() -= 1;
-                *NO_INIT_OPERATIONS_INDEX.write() = 0;
-                if *NO_INIT_OPERATIONS_LINE.read() < 0 {
-                    *NO_INIT_OPERATIONS_INDEX.write() = 0
-                }
-            }
-        }
-    } else {
-        if is_put_to_window == true {
-            // 输出其他字符
-            let char = TextuiCharChromatic {
-                c: character,
-                frcolor,
-                bkcolor,
-            };
-
-            if *NO_INIT_OPERATIONS_INDEX.read() == *CHAR_PER_LINE.read() {
-                *NO_INIT_OPERATIONS_INDEX.write() = 0;
-                *NO_INIT_OPERATIONS_LINE.write() += 1;
-            }
-            char.no_init_textui_render_chromatic(
-                LineId::new(*NO_INIT_OPERATIONS_LINE.read()),
-                LineIndex::new(*NO_INIT_OPERATIONS_INDEX.read()),
-            );
-
-            *NO_INIT_OPERATIONS_INDEX.write() += 1;
-        }
-    }
-
-    return Ok(0);
 }
 
 /**
@@ -1135,17 +943,16 @@ pub extern "C" fn textui_putchar(character: u8, fr_color: u32, bk_color: u32) ->
     }
     return r;
 }
-lazy_static! {
-    pub static ref CURRENT_WINDOW: SpinLock<TextuiWindow> = SpinLock::new(TEXTUI_PRIVATE_INFO.lock().current_window.clone());
-}
+
 fn true_textui_putchar(
     character: u8,
     fr_color: FontColor,
     bk_color: FontColor,
 ) -> Result<i32, SystemError> {
     if unsafe { TEST_IS_INIT } {
-
-        CURRENT_WINDOW.lock().textui_putchar_window(character, fr_color, bk_color)?;
+        CURRENT_WINDOW
+            .lock()
+            .textui_putchar_window(character, fr_color, bk_color)?;
     } else {
         //未初始化暴力输出
         return no_init_textui_putchar_window(character, fr_color, bk_color, unsafe {
@@ -1191,21 +998,9 @@ pub fn renew_buf(fb: usize, num: u32) {
         }
     }
 }
-// pub fn textui_enable_double_buffer() -> Result<i32, SystemError> {
-//     c_uart_send_str(
-//         UartPort::COM1.to_u16(),
-//         "\ninit textui double buffer\n\0".as_ptr(),
-//     );
-//     // 创建双缓冲区
-//     let buf_into = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL)?;
-//     let mut framework = TEXTUIFRAMEWORK.0.lock();
-//     if !framework.change(buf_into.clone()).is_err() {
-//         framework.buf_info = buf_into;
-//     }
-//     return Ok(0);
-// }
+
 pub fn textui_change_buf(buf_info: ScmBufferInfo) -> Result<i32, SystemError> {
-    let mut framework = TEXTUIFRAMEWORK.0.lock();
+    let mut framework = TEXTUI_FRAMEWORK.0.lock();
     if !framework.change(buf_info.clone()).is_err() {
         framework.buf_info = buf_info;
     }
@@ -1215,34 +1010,34 @@ pub fn textui_change_buf(buf_info: ScmBufferInfo) -> Result<i32, SystemError> {
 fn textui_init() -> Result<i32, SystemError> {
     let name: &str = "textui";
 
-    let mut framework = TEXTUIFRAMEWORK.0.lock();
+    let mut textui_guard = TEXTUI_FRAMEWORK.0.lock();
 
-    framework.metadata.name = name.to_string();
+    textui_guard.metadata.name = name.to_string();
 
-    framework.metadata.f_type = ScmFramworkType::Text;
+    textui_guard.metadata.framework_type = ScmFramworkType::Text;
 
-    let private_info = &mut TEXTUI_PRIVATE_INFO.lock();
+    let mut private_info = TEXTUI_PRIVATE_INFO.lock();
 
     private_info.actual_line =
-        (framework.metadata.buf_info.get_height_about_u32() / TEXTUI_CHAR_HEIGHT) as i32;
+        (textui_guard.metadata.buf_info.get_height_about_u32() / TEXTUI_CHAR_HEIGHT) as i32;
 
     // 注册框架到屏幕管理器
     let textui = TextUiFramework {
-        metadata: framework.metadata.clone(),
+        metadata: textui_guard.metadata.clone(),
     };
     scm_register(Arc::new(textui))?;
 
     // 初始化虚拟行
-    let vlines_num = (framework.metadata.buf_info.get_height_about_u32() / TEXTUI_CHAR_HEIGHT) as usize;
+    let vlines_num =
+        (textui_guard.metadata.buf_info.get_height_about_u32() / TEXTUI_CHAR_HEIGHT) as usize;
 
-    let chars_num = (framework.metadata.buf_info.get_width_about_u32() / TEXTUI_CHAR_WIDTH) as usize;
+    let chars_num =
+        (textui_guard.metadata.buf_info.get_width_about_u32() / TEXTUI_CHAR_WIDTH) as usize;
 
     let mut initial_vlines = Vec::new();
 
-    for _i in 0..vlines_num {
-        let mut vline = TextuiVlineChromatic::new();
-
-        vline.textui_init_vline(chars_num);
+    for _ in 0..vlines_num {
+        let vline = TextuiVlineChromatic::new(chars_num);
 
         initial_vlines.push(TextuiVline::Chromatic(vline));
     }
@@ -1258,15 +1053,13 @@ fn textui_init() -> Result<i32, SystemError> {
         chars_num as i32,
     )?;
 
-    framework.metadata.window_max_id += 1;
-
-    let num = framework.metadata.buf_info.get_size_about_u32();
+    let num = textui_guard.metadata.buf_info.get_size_about_u32();
 
     private_info.current_window = initial_window.clone();
 
     private_info.default_window = initial_window;
 
-    *CORRENT_WINDOW_ID.write() = private_info.current_window.id;
+    *CURRENT_WINDOW_ID.write() = private_info.current_window.id;
 
     *ACTUAL_LINE_NUM.write() = private_info.actual_line as i32;
 
@@ -1274,19 +1067,15 @@ fn textui_init() -> Result<i32, SystemError> {
 
     unsafe { TEST_IS_INIT = true };
 
+    set_textui_buf_width(textui_guard.metadata.buf_info.get_width_about_u32());
 
-    set_textui_buf_width(framework.metadata.buf_info.get_width_about_u32());
-
-
-    set_textui_buf_vaddr(framework.metadata.buf_info.get_vaddr());
-
+    set_textui_buf_vaddr(textui_guard.metadata.buf_info.get_vaddr());
 
     set_textui_buf_size(num as usize);
 
-    renew_buf(framework.metadata.buf_info.get_vaddr(), num);
+    renew_buf(textui_guard.metadata.buf_info.get_vaddr(), num);
 
-    drop(framework);
-
+    drop(textui_guard);
 
     c_uart_send_str(
         UartPort::COM1.to_u16(),

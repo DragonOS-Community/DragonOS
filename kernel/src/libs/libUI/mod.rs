@@ -1,3 +1,3 @@
-pub mod textui;
 pub mod screen_manager;
-pub mod textui_render;
+pub mod textui;
+pub mod textui_no_alloc;

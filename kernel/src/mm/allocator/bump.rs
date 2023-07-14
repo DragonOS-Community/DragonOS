@@ -48,7 +48,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
     /// @param  mut self
     /// @param  count 分配的页帧数量
     /// @return 分配后的物理地址
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         let mut offset = self.offset();
         // 遍历所有的物理内存区域
         for area in self.areas().iter() {
@@ -77,7 +77,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
                 // 将offset增加至分配后的内存
                 self.offset = offset + count.data() * MMA::PAGE_SIZE;
 
-                return Some(PhysAddr(res_page_phys));
+                return Some((PhysAddr(res_page_phys), count));
             }
         }
         return None;

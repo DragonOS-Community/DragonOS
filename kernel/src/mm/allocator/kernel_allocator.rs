@@ -1,0 +1,102 @@
+use crate::{
+    arch::mm::LockedFrameAllocator,
+    include::bindings::bindings::{gfp_t, kfree, kmalloc, PAGE_2M_SIZE},
+    libs::align::page_align_up,
+    mm::{gfp::__GFP_ZERO, MMArch, MemoryManagementArch, VirtAddr}, kdebug,
+};
+
+use core::{
+    alloc::{AllocError, GlobalAlloc, Layout},
+    intrinsics::unlikely,
+    ptr::NonNull,
+};
+
+use super::page_frame::{FrameAllocator, PageFrameCount};
+
+/// 类kmalloc的分配器应当实现的trait
+pub trait LocalAlloc {
+    unsafe fn local_alloc(&self, layout: Layout, gfp: gfp_t) -> *mut u8;
+    unsafe fn local_alloc_zeroed(&self, layout: Layout, gfp: gfp_t) -> *mut u8;
+    unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout);
+}
+
+pub struct KernelAllocator;
+
+impl KernelAllocator {
+    unsafe fn alloc_in_buddy(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // 计算需要申请的页数，向上取整
+        let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
+        let page_frame_count = PageFrameCount::new(count);
+        let (phy_addr, allocated_frame_count) = LockedFrameAllocator
+            .allocate(page_frame_count)
+            .ok_or(AllocError)?;
+
+        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr).ok_or(AllocError)? };
+        if unlikely(virt_addr.is_null()) {
+            return Err(AllocError);
+        }
+        let ptr = NonNull::new(virt_addr.data() as *mut u8).unwrap();
+        let slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                ptr.as_ptr(),
+                allocated_frame_count.data() * MMArch::PAGE_SIZE,
+            )
+        };
+        return Ok(NonNull::from(slice));
+    }
+
+    unsafe fn free_in_buddy(&self, ptr: *mut u8, layout: Layout) {
+        // 由于buddy分配的页数量是2的幂，因此释放的时候也需要按照2的幂向上取整。
+        let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
+        let page_frame_count = PageFrameCount::new(count);
+        let phy_addr = MMArch::virt_2_phys(VirtAddr::new(ptr as usize)).unwrap();
+        LockedFrameAllocator.free(phy_addr, page_frame_count);
+    }
+}
+
+/// 为内核SLAB分配器实现LocalAlloc的trait
+impl LocalAlloc for KernelAllocator {
+    unsafe fn local_alloc(&self, layout: Layout, gfp: gfp_t) -> *mut u8 {
+        return self
+            .alloc_in_buddy(layout)
+            .map(|x| x.as_ptr() as *mut u8)
+            .unwrap_or(core::ptr::null_mut() as *mut u8);
+    }
+
+    unsafe fn local_alloc_zeroed(&self, layout: Layout, gfp: gfp_t) -> *mut u8 {
+        return self
+            .alloc_in_buddy(layout)
+            .map(|x| {
+                let ptr: *mut u8 = x.as_mut_ptr();
+                core::ptr::write_bytes(ptr, 0, x.len());
+                ptr
+            })
+            .unwrap_or(core::ptr::null_mut() as *mut u8);
+    }
+
+    unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.free_in_buddy(ptr, layout);
+    }
+}
+
+/// 为内核slab分配器实现GlobalAlloc特性
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let x = self.local_alloc(layout, 0);
+        return x;
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        self.local_alloc_zeroed(layout, 0)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.local_dealloc(ptr, layout);
+    }
+}
+
+/// 内存分配错误处理函数
+#[alloc_error_handler]
+pub fn global_alloc_err_handler(layout: Layout) -> ! {
+    panic!("global_alloc_error, layout: {:?}", layout);
+}

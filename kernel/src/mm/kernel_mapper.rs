@@ -2,12 +2,12 @@ use super::{PageTableKind, PhysAddr, PhysMemoryArea};
 use crate::{
     arch::{
         asm::irqflags::{local_irq_restore, local_irq_save},
-        mm::{frame::LockedFrameAllocator, PageMapper},
+        mm::{LockedFrameAllocator, PageMapper},
     },
     smp::core::smp_get_processor_id,
 };
 use core::{
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 
@@ -80,13 +80,12 @@ impl KernelMapper {
 impl Drop for KernelMapper {
     fn drop(&mut self) {
         // 为了防止fetch_sub和store之间，由于中断，导致store错误清除了owner，导致错误，因此需要关中断。
-        let mut flags = 0;
-        local_irq_save(&mut flags);
+        let flags = local_irq_save();
         let prev_count = KERNEL_MAPPER_LOCK_COUNT.fetch_sub(1, Ordering::Relaxed);
         if prev_count == 1 {
             KERNEL_MAPPER_LOCK_OWNER.store(KERNEL_MAPPER_NO_PROCESSOR, Ordering::Release);
         }
-        local_irq_restore(&flags);
+        local_irq_restore(flags);
         compiler_fence(Ordering::Release);
     }
 }

@@ -1,14 +1,15 @@
 use core::{
-    fmt::{self, Debug},
+    fmt::{self, Debug, Error, Formatter},
     marker::PhantomData,
     mem,
     ops::Add,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    kerror,
+    kdebug, kerror, kwarn,
 };
 
 use super::{
@@ -17,6 +18,7 @@ use super::{
     MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr,
 };
 
+#[derive(Debug)]
 pub struct PageTable<Arch> {
     /// 当前页表表示的虚拟地址空间的起始地址
     base: VirtAddr,
@@ -129,11 +131,12 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         let addr = VirtAddr::new(addr.data() & Arch::PAGE_ADDRESS_MASK);
         let shift = self.level * Arch::PAGE_ENTRY_SHIFT + Arch::PAGE_SHIFT;
 
-        let index = addr.data() >> shift;
-        if index >= Arch::PAGE_ENTRY_NUM {
+        let mask = (MMArch::PAGE_ENTRY_NUM << shift) - 1;
+        if addr < self.base || addr >= self.base.add(mask) {
             return None;
+        } else {
+            return Some((addr.data() >> shift) & MMArch::PAGE_ENTRY_MASK);
         }
-        return Some(index & Arch::PAGE_ENTRY_MASK);
     }
 
     /// @brief 获取第i个页表项指向的下一级页表
@@ -152,10 +155,16 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
 }
 
 /// 页表项
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct PageEntry<Arch> {
     data: usize,
     phantom: PhantomData<Arch>,
+}
+
+impl<Arch> Debug for PageEntry<Arch> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        f.write_fmt(format_args!("PageEntry({:#x})", self.data))
+    }
 }
 
 impl<Arch: MemoryManagementArch> PageEntry<Arch> {
@@ -189,7 +198,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
 
     #[inline(always)]
     pub fn flags(&self) -> PageFlags<Arch> {
-        PageFlags::new(self.data & Arch::ENTRY_FLAGS_MASK)
+        unsafe { PageFlags::from_data(self.data & Arch::ENTRY_FLAGS_MASK) }
     }
 
     #[inline(always)]
@@ -212,8 +221,14 @@ pub struct PageFlags<Arch> {
 
 impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
-    pub fn new(data: usize) -> Self {
-        return unsafe { Self::from_data(data) };
+    pub fn new() -> Self {
+        return unsafe {
+            Self::from_data(
+                Arch::ENTRY_FLAG_DEFAULT_PAGE
+                    | Arch::ENTRY_FLAG_READONLY
+                    | Arch::ENTRY_FLAG_NO_EXEC,
+            )
+        };
     }
 
     /// 根据ProtFlags生成PageFlags
@@ -223,10 +238,12 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
     pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> PageFlags<Arch> {
-        let flags: PageFlags<Arch> = PageFlags::new(0)
-            .set_user(user)
-            .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
-            .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
+        let flags: PageFlags<Arch> = unsafe {
+            PageFlags::from_data(0)
+                .set_user(user)
+                .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
+                .set_write(prot_flags.contains(ProtFlags::PROT_WRITE))
+        };
 
         return flags;
     }
@@ -456,29 +473,36 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             );
             return None;
         }
+        let virt = VirtAddr::new(virt.data() & (!Arch::PAGE_NEGATIVE_MASK));
 
         // TODO： 验证flags是否合法
 
         // 创建页表项
         let entry = PageEntry::new(phys.data() | flags.data());
         let mut table = self.table();
-
         loop {
             let i = table.index_of(virt)?;
             if table.level() == 0 {
-                // 检查是否已经映射
+                // todo: 检查是否已经映射
+                // 现在不检查的原因是，刚刚启动系统时，内核会映射一些页。
                 if table.entry_mapped(i)? == true {
-                    panic!("Page {:?} already mapped", virt);
+                    kwarn!("Page {:?} already mapped", virt);
                 }
+                // kdebug!("Mapping {:?} to {:?}, i = {i}, entry={:?}, flags={:?}", virt, phys, entry, flags);
                 table.set_entry(i, entry);
                 return Some(PageFlush::new(virt));
             } else {
                 let next_table = table.next_level_table(i);
                 if let Some(next_table) = next_table {
                     table = next_table;
+                    // kdebug!("Mapping {:?} to next level table...", virt);
                 } else {
+                    // kdebug!("Allocating next level table for {:?}..., i={i}", virt);
                     // 分配下一级页表
                     let frame = self.frame_allocator.allocate_one()?;
+                    // 清空这个页帧
+                    MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+
                     // 设置页表项的flags
                     let flags = Arch::ENTRY_FLAG_READWRITE
                         | Arch::ENTRY_FLAG_DEFAULT_TABLE
@@ -487,8 +511,16 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                         } else {
                             0
                         };
+                    // kdebug!("Flags: {:?}", flags);
+                    // kdebug!(
+                    //     "Map page table, level={}, next level table phys={:?}",
+                    //     table.level(),
+                    //     frame
+                    // );
+
                     // 把新分配的页表映射到当前页表
                     table.set_entry(i, PageEntry::new(frame.data() | flags));
+
                     // 获取新分配的页表
                     table = table.next_level_table(i)?;
                 }

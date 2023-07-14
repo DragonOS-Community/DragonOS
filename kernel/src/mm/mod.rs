@@ -19,9 +19,11 @@ use self::{
 };
 
 pub mod allocator;
+pub mod c_adapter;
 pub mod gfp;
 pub mod kernel_mapper;
 pub mod mmio_buddy;
+pub mod no_init;
 pub mod page;
 pub mod syscall;
 pub mod ucontext;
@@ -198,6 +200,11 @@ impl VirtAddr {
     pub fn as_ptr<T>(self) -> *mut T {
         return self.0 as *mut T;
     }
+
+    #[inline(always)]
+    pub fn is_null(&self) -> bool {
+        return self.0 == 0;
+    }
 }
 
 impl Add<VirtAddr> for VirtAddr {
@@ -361,6 +368,12 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     unsafe fn write<T>(address: VirtAddr, value: T) {
         ptr::write(address.data() as *mut T, value);
     }
+
+    #[inline(always)]
+    unsafe fn write_bytes(address: VirtAddr, value: u8, count: usize) {
+        ptr::write_bytes(address.data() as *mut u8, value, count);
+    }
+
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
     unsafe fn invalidate_page(address: VirtAddr);
 

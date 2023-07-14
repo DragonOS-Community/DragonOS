@@ -225,15 +225,14 @@ impl Softirq {
     }
 
     pub fn raise_softirq(&self, softirq_num: SoftirqNumber) {
-        let mut flags = 0;
-        local_irq_save(&mut flags);
+        let mut flags = local_irq_save();
         let processor_id = smp_get_processor_id() as usize;
 
         cpu_pending(processor_id).insert(VecStatus::from(softirq_num));
 
         compiler_fence(Ordering::SeqCst);
 
-        local_irq_restore(&flags);
+        local_irq_restore(flags);
         // kdebug!("raise_softirq exited");
     }
     pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber) {

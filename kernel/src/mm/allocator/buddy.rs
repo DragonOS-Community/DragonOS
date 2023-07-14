@@ -7,7 +7,7 @@ use crate::libs::spinlock::SpinLock;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
-use crate::{kdebug, kerror};
+use crate::{kdebug, kerror, kwarn};
 use core::alloc::{AllocError, Allocator, Layout};
 use core::cmp::{self, max, min};
 use core::fmt::Debug;
@@ -80,14 +80,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
     // 定义一个变量记录buddy表的大小
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
-        let initial_bump_usage = bump_allocator.usage();
-        kdebug!("initial_bump_usage {:?}", initial_bump_usage);
-
-        let pages_to_buddy = initial_bump_usage.free();
+        let initial_free_pages = bump_allocator.usage().free();
+        kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
         // 最高阶的链表页数
         let max_order_linked_list_page_num = max(
             1,
-            (((pages_to_buddy.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES - 1)
+            (((initial_free_pages.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES
+                - 1)
                 / Self::BUDDY_ENTRIES,
         );
 
@@ -119,6 +118,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         }
 
         let initial_bump_offset = bump_allocator.offset();
+        let pages_to_buddy = bump_allocator.usage().free();
+        kdebug!("pages_to_buddy {:?}", pages_to_buddy);
         // kdebug!("initial_bump_offset {:#x}", initial_bump_offset);
         let mut paddr = initial_bump_offset;
         let mut remain_pages = pages_to_buddy;
@@ -179,7 +180,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 while entries > 0 {
                     let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
 
-                    for j in 0..Self::BUDDY_ENTRIES {
+                    for _ in 0..Self::BUDDY_ENTRIES {
                         A::write(
                             Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
                             paddr,
@@ -203,7 +204,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         }
 
         let mut remain_bytes = remain_pages.data() * A::PAGE_SIZE;
-        kdebug!("remain_bytes {}", remain_bytes);
+
         assert!(remain_bytes < (1 << MAX_ORDER - 1));
 
         for i in (MIN_ORDER..MAX_ORDER).rev() {
@@ -407,7 +408,16 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         return None;
     }
 
-    fn buddy_alloc(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
+    /// 从伙伴系统中分配count个页面
+    ///
+    /// ## 参数
+    ///
+    /// - `count`：需要分配的页面数
+    ///
+    /// ## 返回值
+    ///
+    /// 返回分配的页面的物理地址和页面数
+    fn buddy_alloc(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         // 计算需要分配的阶数
         let mut order = log2(count.data() as usize);
         if count.data() & ((1 << order) - 1) != 0 {
@@ -426,7 +436,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         //     order,
         //     free_addr
         // );
-        return free_addr;
+        return free_addr
+            .map(|addr| (addr, PageFrameCount::new(1 << (order as usize - MIN_ORDER))));
     }
 
     /// 释放一个块
@@ -499,6 +510,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                         // 但是不影响，我们在后面插入链表项的时候，会处理这种情况，检查链表中的第2个页是否有空位
                         self.buddy_alloc(PageFrameCount::new(1))
                             .expect("buddy_alloc failed: no enough memory")
+                            .0
                     };
 
                     // 清空这个页面
@@ -612,7 +624,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 }
 
 impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         return self.buddy_alloc(count);
     }
 
@@ -628,7 +640,9 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
     /// 如果count不是2的幂，会panic
     unsafe fn free(&mut self, base: PhysAddr, count: PageFrameCount) {
         // 要求count是2的幂
-        assert!(count.data().is_power_of_two());
+        if unlikely(!count.data().is_power_of_two()) {
+            kwarn!("buddy free: count is not power of two");
+        }
         // kdebug!("free: base={:?}, count={:?}", base, count);
         self.buddy_free(base, (log2(count.data()) + MIN_ORDER) as u8);
     }
@@ -642,14 +656,24 @@ unsafe impl<A: MemoryManagementArch> Allocator for LockedBuddyAllocator<A> {
         // 计算需要申请的页数，向上取整
         let count = (layout.size() + A::PAGE_SIZE - 1) & (!(A::PAGE_SIZE - 1));
         let page_frame_count = PageFrameCount::new(count);
-        let phy_addr = self.0.lock().buddy_alloc(page_frame_count);
-        if phy_addr.is_none() {
+        let (phy_addr, allocated_frame_count) = self
+            .0
+            .lock()
+            .buddy_alloc(page_frame_count)
+            .ok_or(AllocError)?;
+
+        if unlikely(allocated_frame_count < page_frame_count) {
             return Err(AllocError);
         }
-        let phy_addr = phy_addr.unwrap();
+
         let virt_addr = unsafe { A::phys_2_virt(phy_addr).ok_or(AllocError)? };
         let ptr = NonNull::new(virt_addr.data() as *mut u8).unwrap();
-        let slice = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), layout.size()) };
+        let slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                ptr.as_ptr(),
+                allocated_frame_count.data() * A::PAGE_SIZE,
+            )
+        };
         // kdebug!("allocate");
         return Ok(NonNull::from(slice));
     }

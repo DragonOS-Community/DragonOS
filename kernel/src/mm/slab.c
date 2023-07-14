@@ -537,7 +537,7 @@ struct slab_obj *kmalloc_create_slab_obj(ul size)
  * @param gfp 内存的flag
  * @return void* 内核内存虚拟地址
  */
-void *kmalloc(unsigned long size, gfp_t gfp)
+void *c_kmalloc(unsigned long size, gfp_t gfp)
 {
     void *result = NULL;
     if (size > 1048576)
@@ -631,7 +631,7 @@ failed:;
  * @param address 要释放的内存线性地址
  * @return unsigned long
  */
-unsigned long kfree(void *address)
+unsigned long c_kfree(void *address)
 {
     if (unlikely(address == NULL))
         return 0;

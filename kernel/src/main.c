@@ -96,10 +96,6 @@ void system_initialize()
     // mm_init();
     rs_mm_init();
 
-    while (1)
-    {
-        /* code */
-    }
 
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
@@ -107,6 +103,7 @@ void system_initialize()
     // 对显示模块进行低级初始化，不启用double buffer
     scm_reinit();
 
+    
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
@@ -119,9 +116,12 @@ void system_initialize()
     initial_tss[0].ist6 = (ul)ptr;
     initial_tss[0].ist7 = (ul)ptr;
     // ===========================
-
+    
     acpi_init();
-
+while (1)
+    {
+        /* code */
+    }
     // 初始化中断模块
     sched_init();
     irq_init();

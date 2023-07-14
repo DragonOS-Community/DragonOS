@@ -44,7 +44,7 @@ pub extern "C" fn process_copy_sighand(clone_flags: u64, pcb: *mut process_contr
     // kdebug!("DEFAULT_SIGACTION.sa_flags={}", DEFAULT_SIGACTION.sa_flags);
 
     // 拷贝sigaction
-    let mut flags: u64 = 0;
+    let mut flags: usize = 0;
 
     spin_lock_irqsave(unsafe { &mut (*current_pcb().sighand).siglock }, &mut flags);
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -64,7 +64,7 @@ pub extern "C" fn process_copy_sighand(clone_flags: u64, pcb: *mut process_contr
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    spin_unlock_irqrestore(unsafe { &mut (*current_pcb().sighand).siglock }, &flags);
+    spin_unlock_irqrestore(unsafe { &mut (*current_pcb().sighand).siglock }, flags);
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     // 将信号的处理函数设置为default(除了那些被手动屏蔽的)

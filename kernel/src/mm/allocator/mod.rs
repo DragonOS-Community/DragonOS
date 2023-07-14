@@ -1,5 +1,6 @@
 pub mod buddy;
 pub mod bump;
-pub mod c;
+pub mod kernel_allocator;
 pub mod page_frame;
 pub mod slab;
+

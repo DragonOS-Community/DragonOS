@@ -1,7 +1,10 @@
-use core::{intrinsics::unlikely, ops::{Add, Sub, AddAssign, SubAssign, Mul}};
+use core::{
+    intrinsics::unlikely,
+    ops::{Add, AddAssign, Mul, Sub, SubAssign},
+};
 
 use crate::{
-    arch::{mm::frame::LockedFrameAllocator, MMArch},
+    arch::{mm::LockedFrameAllocator, MMArch},
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
 };
 
@@ -244,7 +247,6 @@ impl Mul<usize> for PageFrameCount {
     }
 }
 
-
 // 页帧使用情况
 #[derive(Debug)]
 pub struct PageFrameUsage {
@@ -276,13 +278,13 @@ impl PageFrameUsage {
 /// 能够分配页帧的分配器需要实现的trait
 pub trait FrameAllocator {
     // @brief 分配count个页帧
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr>;
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)>;
 
     // @brief 通过地址释放count个页帧
     unsafe fn free(&mut self, address: PhysAddr, count: PageFrameCount);
     // @brief 分配一个页帧
     unsafe fn allocate_one(&mut self) -> Option<PhysAddr> {
-        return self.allocate(PageFrameCount::new(1));
+        return self.allocate(PageFrameCount::new(1)).map(|(addr, _)| addr);
     }
     // @brief 通过地址释放一个页帧
     unsafe fn free_one(&mut self, address: PhysAddr) {
@@ -294,7 +296,7 @@ pub trait FrameAllocator {
 
 /// @brief 通过一个 &mut T 的引用来对一个实现了 FrameAllocator trait 的类型进行调用，使代码更加灵活
 impl<T: FrameAllocator> FrameAllocator for &mut T {
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         return T::allocate(self, count);
     }
     unsafe fn free(&mut self, address: PhysAddr, count: PageFrameCount) {
@@ -314,12 +316,8 @@ impl<T: FrameAllocator> FrameAllocator for &mut T {
 /// @brief 从全局的页帧分配器中分配连续count个页帧
 ///
 /// @param count 请求分配的页帧数量
-pub fn allocate_page_frames(count: PageFrameCount) -> Option<PhysPageFrame> {
-    let frame = unsafe {
-        LockedFrameAllocator
-            .allocate(count)
-            .map(|addr| PhysPageFrame::new(addr))?
-    };
+pub fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+    let frame = unsafe { LockedFrameAllocator.allocate(count)? };
     return Some(frame);
 }
 

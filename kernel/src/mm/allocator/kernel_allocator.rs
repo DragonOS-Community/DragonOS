@@ -2,7 +2,7 @@ use crate::{
     arch::mm::LockedFrameAllocator,
     include::bindings::bindings::{gfp_t, kfree, kmalloc, PAGE_2M_SIZE},
     libs::align::page_align_up,
-    mm::{gfp::__GFP_ZERO, MMArch, MemoryManagementArch, VirtAddr},
+    mm::{gfp::__GFP_ZERO, MMArch, MemoryManagementArch, VirtAddr}, kdebug,
 };
 
 use core::{
@@ -25,7 +25,7 @@ pub struct KernelAllocator;
 impl KernelAllocator {
     unsafe fn alloc_in_buddy(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         // 计算需要申请的页数，向上取整
-        let count = page_align_up(layout.size()) / MMArch::PAGE_SIZE;
+        let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
         let page_frame_count = PageFrameCount::new(count);
         let (phy_addr, allocated_frame_count) = LockedFrameAllocator
             .allocate(page_frame_count)
@@ -82,7 +82,8 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.local_alloc(layout, 0)
+        let x = self.local_alloc(layout, 0);
+        return x;
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {

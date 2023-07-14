@@ -249,9 +249,6 @@ void mm_init()
     initial_mm.stack_start = _stack_start;
     initial_mm.vmas = NULL;
 
-    
-    
-    mmio_init();
 }
 
 /**

@@ -6,7 +6,7 @@ use crate::include::bindings::bindings::{
     initial_mm, mm_map, mm_struct, PAGE_2M_SIZE, VM_DONTCOPY, VM_IO,
 };
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use crate::mm::mmio_buddy::MMIO_POOL;
+use crate::mm::mmio_buddy::mmio_pool;
 use crate::{kdebug, kerror, kinfo, kwarn};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
@@ -553,7 +553,7 @@ impl PciRoot {
         unsafe {
             let initial_mm_ptr = &mut initial_mm as *mut mm_struct;
             if let Err(_) =
-                MMIO_POOL.create_mmio(size as usize, (VM_IO | VM_DONTCOPY) as u64, vaddr_ptr, virtsize_ptr)
+                mmio_pool().create_mmio(size as usize, (VM_IO | VM_DONTCOPY) as u64, vaddr_ptr, virtsize_ptr)
             {
                 kerror!("Create mmio failed when initing ecam");
                 return Err(PciError::CreateMmioError);
@@ -1328,7 +1328,7 @@ pub fn pci_bar_init(
                 let virtsize_ptr = &mut virtsize as *mut u64;
                 let initial_mm_ptr = &mut initial_mm as *mut mm_struct;
                 //kdebug!("size want={:#x}", size);
-                if let Err(_) = MMIO_POOL.create_mmio(
+                if let Err(_) = mmio_pool().create_mmio(
                     size as usize,
                     (VM_IO | VM_DONTCOPY) as u64,
                     vaddr_ptr,

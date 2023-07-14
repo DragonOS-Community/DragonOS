@@ -9,6 +9,7 @@ use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
+use crate::mm::mmio_buddy::mmio_init;
 use crate::{
     arch::MMArch,
     mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
@@ -301,6 +302,8 @@ pub fn mm_init() {
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // 初始化内存管理器
     unsafe { allocator_init() };
+    // enable mmio
+    mmio_init();
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
 }

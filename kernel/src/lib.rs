@@ -64,7 +64,7 @@ use crate::{
 
 // 声明全局的slab分配器
 #[cfg_attr(not(test), global_allocator)]
-pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator {};
+pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 /// 全局的panic处理函数
 #[panic_handler]

@@ -8,7 +8,7 @@ use crate::include::bindings::bindings::{
 use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
-use crate::mm::allocator::page_frame::FrameAllocator;
+use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
 use crate::{
     arch::MMArch,
     mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
@@ -445,8 +445,8 @@ impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(
         &mut self,
         count: crate::mm::allocator::page_frame::PageFrameCount,
-    ) -> Option<crate::mm::PhysAddr> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock() {
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);
         } else {
             return None;
@@ -458,7 +458,8 @@ impl FrameAllocator for LockedFrameAllocator {
         address: crate::mm::PhysAddr,
         count: crate::mm::allocator::page_frame::PageFrameCount,
     ) {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock() {
+        assert!(count.data().is_power_of_two());
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.free(address, count);
         }
     }

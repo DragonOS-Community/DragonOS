@@ -1,15 +1,17 @@
 #![no_std] // <1>
 #![no_main] // <1>
 #![feature(alloc_error_handler)]
+#![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
 #![feature(const_mut_refs)]
-#![feature(core_intrinsics)] // <2>
+#![feature(core_intrinsics)]
 #![feature(c_void_variant)]
-#![feature(drain_filter)] // 允许Vec的drain_filter特性
+#![feature(drain_filter)]
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]
-#![feature(allocator_api)] // 允许自定义Allocator
+#![feature(slice_ptr_get)]
+#![feature(vec_into_raw_parts)]
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
@@ -51,7 +53,7 @@ extern crate thingbuf;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
-use crate::mm::allocator::c::KernelAllocator;
+use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 // <3>
 use crate::{

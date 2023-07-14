@@ -32,7 +32,7 @@ impl<MMA: MemoryManagementArch> PseudoAllocator<MMA> {
 
 /// 为NoInitAllocator实现FrameAllocator
 impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
-    unsafe fn allocate(&mut self, _count: PageFrameCount) -> Option<PhysAddr> {
+    unsafe fn allocate(&mut self, _count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         panic!("NoInitAllocator can't allocate page frame");
     }
 

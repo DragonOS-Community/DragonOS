@@ -103,10 +103,7 @@ void system_initialize()
     // 对显示模块进行低级初始化，不启用double buffer
     scm_reinit();
 
-    while (1)
-    {
-        /* code */
-    }
+    
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
@@ -119,9 +116,12 @@ void system_initialize()
     initial_tss[0].ist6 = (ul)ptr;
     initial_tss[0].ist7 = (ul)ptr;
     // ===========================
-
+    
     acpi_init();
-
+while (1)
+    {
+        /* code */
+    }
     // 初始化中断模块
     sched_init();
     irq_init();

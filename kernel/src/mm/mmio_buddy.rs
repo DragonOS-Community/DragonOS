@@ -1,16 +1,20 @@
+use crate::kwarn;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::mm::kernel_mapper::KernelMapper;
 use crate::syscall::SystemError;
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
         initial_mm, mm_create_vma, mm_unmap, vm_area_del, vm_area_free, vm_area_struct, vm_flags_t,
-        vma_find, MMIO_BASE, MMIO_TOP, PAGE_1G_SHIFT, PAGE_1G_SIZE, PAGE_2M_SIZE, PAGE_4K_SHIFT,
-        PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
+        vma_find, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
     },
     kdebug, kerror,
+    mm::{MMArch, MemoryManagementArch},
 };
 use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 use core::{mem, ptr::null_mut};
+
+use super::VirtAddr;
 
 // 最大的伙伴块的幂
 const MMIO_BUDDY_MAX_EXP: u32 = PAGE_1G_SHIFT;
@@ -18,6 +22,11 @@ const MMIO_BUDDY_MAX_EXP: u32 = PAGE_1G_SHIFT;
 const MMIO_BUDDY_MIN_EXP: u32 = PAGE_4K_SHIFT;
 // 内存池数组的范围
 const MMIO_BUDDY_REGION_COUNT: u32 = MMIO_BUDDY_MAX_EXP - MMIO_BUDDY_MIN_EXP + 1;
+
+const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
+const MMIO_TOP: VirtAddr = VirtAddr::new(0xffffa20000000000);
+
+const PAGE_1G_SIZE: usize = 1 << 30;
 
 lazy_static! {
     pub static ref MMIO_POOL: MmioBuddyMemPool = MmioBuddyMemPool::new();
@@ -33,24 +42,37 @@ pub enum MmioResult {
 
 /// @brief buddy内存池
 pub struct MmioBuddyMemPool {
-    pool_start_addr: u64,
-    pool_size: u64,
+    pool_start_addr: VirtAddr,
+    pool_size: usize,
     free_regions: [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize],
 }
-impl Default for MmioBuddyMemPool {
-    fn default() -> Self {
-        MmioBuddyMemPool {
-            pool_start_addr: MMIO_BASE as u64,
-            pool_size: (MMIO_TOP - MMIO_BASE) as u64,
-            free_regions: unsafe { mem::zeroed() },
-        }
-    }
-}
+
 impl MmioBuddyMemPool {
     fn new() -> Self {
-        return MmioBuddyMemPool {
-            ..Default::default()
+        let mut pool = MmioBuddyMemPool {
+            pool_start_addr: MMIO_BASE,
+            pool_size: MMIO_TOP - MMIO_BASE,
+            free_regions: unsafe { mem::zeroed() },
         };
+
+        for i in 0..MMIO_BUDDY_REGION_COUNT {
+            pool.free_regions[i as usize] = SpinLock::new(MmioFreeRegionList::new());
+        }
+
+        let cnt_1g_blocks = (MMIO_TOP - MMIO_BASE) >> 30;
+        let mut vaddr_base = MMIO_BASE;
+
+        for _ in 0..cnt_1g_blocks {
+            match pool.give_back_block(vaddr_base, PAGE_1G_SHIFT) {
+                Ok(_) => {
+                    vaddr_base += PAGE_1G_SIZE;
+                }
+                Err(_) => {
+                    panic!("MMIO buddy pool init failed");
+                }
+            }
+        }
+        return pool;
     }
 
     /// @brief 创建新的地址区域结构体
@@ -58,7 +80,8 @@ impl MmioBuddyMemPool {
     /// @param vaddr 虚拟地址
     ///
     /// @return 创建好的地址区域结构体
-    fn create_region(&self, vaddr: u64) -> Box<MmioBuddyAddrRegion> {
+    fn create_region(&self, vaddr: VirtAddr) -> Box<MmioBuddyAddrRegion> {
+        // todo: 为什么要用Box? 这么小的内存块，不用Box也行，重写的时候要更换存储Region的方式
         let mut region: Box<MmioBuddyAddrRegion> = Box::new(MmioBuddyAddrRegion::new());
         region.vaddr = vaddr;
         return region;
@@ -75,9 +98,9 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 返回0
     ///
     /// @return Err(SystemError) 返回错误码
-    fn give_back_block(&self, vaddr: u64, exp: u32) -> Result<i32, SystemError> {
+    fn give_back_block(&self, vaddr: VirtAddr, exp: u32) -> Result<i32, SystemError> {
         // 确保内存对齐，低位都要为0
-        if (vaddr & ((1 << exp) - 1)) != 0 {
+        if (vaddr.data() & ((1 << exp) - 1)) != 0 {
             return Err(SystemError::EINVAL);
         }
         let region: Box<MmioBuddyAddrRegion> = self.create_region(vaddr);
@@ -101,7 +124,7 @@ impl MmioBuddyMemPool {
         exp: u32,
         low_list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) {
-        let vaddr: u64 = self.calculate_block_vaddr(region.vaddr, exp - 1);
+        let vaddr = self.calculate_block_vaddr(region.vaddr, exp - 1);
         let new_region: Box<MmioBuddyAddrRegion> = self.create_region(vaddr);
         self.push_block(region, low_list_guard);
         self.push_block(new_region, low_list_guard);
@@ -288,8 +311,8 @@ impl MmioBuddyMemPool {
 
     /// @brief 根据地址和内存块大小，计算伙伴块虚拟内存的地址
     #[inline(always)]
-    fn calculate_block_vaddr(&self, vaddr: u64, exp: u32) -> u64 {
-        return vaddr ^ (1 << exp);
+    fn calculate_block_vaddr(&self, vaddr: VirtAddr, exp: u32) -> VirtAddr {
+        return VirtAddr::new(vaddr.data() ^ (1 << exp as usize));
     }
 
     /// @brief 寻找并弹出指定内存块的伙伴块
@@ -306,7 +329,7 @@ impl MmioBuddyMemPool {
     /// - 没有找到伙伴块，返回ENOFOUND
     fn pop_buddy_block(
         &self,
-        vaddr: u64,
+        vaddr: VirtAddr,
         exp: u32,
         list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) -> Result<Box<MmioBuddyAddrRegion>, MmioResult> {
@@ -377,7 +400,7 @@ impl MmioBuddyMemPool {
                 break;
             }
             // 获取内存块
-            let vaddr: u64 = list_guard.list.back().unwrap().vaddr;
+            let vaddr: VirtAddr = list_guard.list.back().unwrap().vaddr;
             // 获取伙伴内存块
             match self.pop_buddy_block(vaddr, exp, list_guard) {
                 Err(err) => {
@@ -444,7 +467,7 @@ impl MmioBuddyMemPool {
     /// @return Err(SystemError) 失败返回错误码
     pub fn create_mmio(
         &self,
-        size: u32,
+        size: usize,
         vm_flags: vm_flags_t,
         res_vaddr: *mut u64,
         res_length: *mut u64,
@@ -454,13 +477,14 @@ impl MmioBuddyMemPool {
         }
         let mut retval: i32 = 0;
         // 计算前导0
-        let mut size_exp: u32 = 31 - size.leading_zeros();
+        #[cfg(target_arch = "x86_64")]
+        let mut size_exp: u32 = 63 - size.leading_zeros();
         // 记录最终申请的空间大小
-        let mut new_size: u32 = size;
+        let mut new_size = size;
         // 对齐要申请的空间大小
         // 如果要申请的空间大小小于4k，则分配4k
         if size_exp < PAGE_4K_SHIFT {
-            new_size = PAGE_4K_SIZE;
+            new_size = PAGE_4K_SIZE as usize;
             size_exp = PAGE_4K_SHIFT;
         } else if (new_size & (!(1 << size_exp))) != 0 {
             // 向左对齐空间大小
@@ -469,74 +493,14 @@ impl MmioBuddyMemPool {
         }
         match MMIO_POOL.mmio_buddy_query_addr_region(size_exp) {
             Ok(region) => {
-                unsafe {
-                    *res_vaddr = region.vaddr;
-                    *res_length = new_size as u64;
-                }
-                // 创建vma
-                let flags: u64 = vm_flags | (VM_IO | VM_DONTCOPY) as u64;
-                let len_4k: u64 = (new_size % PAGE_2M_SIZE) as u64;
-                let len_2m: u64 = new_size as u64 - len_4k;
-                let mut loop_i: u64 = 0;
-                // 先分配2M的vma
-                loop {
-                    if loop_i >= len_2m {
-                        break;
-                    }
-                    let vma: *mut *mut vm_area_struct = null_mut();
-                    retval = unsafe {
-                        mm_create_vma(
-                            &mut initial_mm,
-                            region.vaddr + loop_i,
-                            PAGE_2M_SIZE.into(),
-                            flags,
-                            null_mut(),
-                            vma,
-                        )
-                    };
-                    if retval != 0 {
-                        kdebug!(
-                            "failed to create mmio 2m vma. pid = {:?}",
-                            current_pcb().pid
-                        );
-                        unsafe {
-                            vm_area_del(*vma);
-                            vm_area_free(*vma);
-                        }
-                        return Err(SystemError::from_posix_errno(retval).unwrap());
-                    }
-                    loop_i += PAGE_2M_SIZE as u64;
-                }
-                // 分配4K的vma
-                loop_i = len_2m;
-                loop {
-                    if loop_i >= size as u64 {
-                        break;
-                    }
-                    let vma: *mut *mut vm_area_struct = null_mut();
-                    retval = unsafe {
-                        mm_create_vma(
-                            &mut initial_mm,
-                            region.vaddr + loop_i,
-                            PAGE_4K_SIZE.into(),
-                            flags,
-                            null_mut(),
-                            vma,
-                        )
-                    };
-                    if retval != 0 {
-                        kdebug!(
-                            "failed to create mmio 4k vma. pid = {:?}",
-                            current_pcb().pid
-                        );
-                        unsafe {
-                            vm_area_del(*vma);
-                            vm_area_free(*vma);
-                        }
-                        return Err(SystemError::from_posix_errno(retval).unwrap());
-                    }
-                    loop_i += PAGE_4K_SIZE as u64;
-                }
+                // todo: 是否需要创建vma？或者用新重写的机制去做？
+                kdebug!(
+                    "create_mmio: vaddr = {:?}, length = {}",
+                    region.vaddr,
+                    new_size
+                );
+                unsafe { *res_vaddr = region.vaddr.data() as u64 };
+                unsafe { *res_length = new_size as u64 };
             }
             Err(_) => {
                 kdebug!("failed to create mmio vma.pid = {:?}", current_pcb().pid);
@@ -555,63 +519,44 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(SystemError) 失败返回错误码
-    pub fn release_mmio(&self, vaddr: u64, length: u64) -> Result<i32, SystemError> {
-        //先将要释放的空间取消映射
-        unsafe {
-            mm_unmap(&mut initial_mm, vaddr, length, false);
+    pub fn release_mmio(&self, vaddr: VirtAddr, length: usize) -> Result<i32, SystemError> {
+        assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
+        assert!(length & (MMArch::PAGE_SIZE - 1) == 0);
+        if vaddr < MMIO_POOL.pool_start_addr
+            || vaddr.data() >= MMIO_POOL.pool_start_addr.data() + MMIO_POOL.pool_size
+        {
+            return Err(SystemError::EINVAL);
         }
-        let mut loop_i: u64 = 0;
-        loop {
-            if loop_i >= length {
-                break;
-            }
-            // 获取要释放的vma的结构体
-            let vma: *mut vm_area_struct = unsafe { vma_find(&mut initial_mm, vaddr + loop_i) };
-            if vma == null_mut() {
-                kdebug!(
-                    "mmio_release failed: vma not found. At address: {:?}, pid = {:?}",
-                    vaddr + loop_i,
-                    current_pcb().pid
-                );
-                return Err(SystemError::EINVAL);
-            }
-            // 检查vma起始地址是否正确
-            if unsafe { (*vma).vm_start != (vaddr + loop_i) } {
-                kdebug!(
-                    "mmio_release failed: addr_start is not equal to current: {:?}. pid = {:?}",
-                    vaddr + loop_i,
-                    current_pcb().pid
-                );
-                return Err(SystemError::EINVAL);
-            }
-            // 将vma对应空间归还
-            match MMIO_POOL.give_back_block(unsafe { (*vma).vm_start }, unsafe {
-                31 - ((*vma).vm_end - (*vma).vm_start).leading_zeros()
-            }) {
-                Ok(_) => {
-                    loop_i += unsafe { (*vma).vm_end - (*vma).vm_start };
-                    unsafe {
-                        vm_area_del(vma);
-                        vm_area_free(vma);
-                    }
-                }
-                Err(err) => {
-                    // vma对应空间没有成功归还的话，就不删除vma
-                    kdebug!(
-                        "mmio_release give_back failed: pid = {:?}",
-                        current_pcb().pid
-                    );
-                    return Err(err);
-                }
-            }
+        // todo: 重构MMIO管理机制，创建类似全局的manager之类的，管理MMIO的空间？
+
+        // 暂时认为传入的vaddr都是正确的
+        let page_count = length / MMArch::PAGE_SIZE;
+        // 取消映射
+        let mut bindings = KernelMapper::lock();
+        let mut kernel_mapper = bindings.as_mut();
+        if kernel_mapper.is_none() {
+            kwarn!("release_mmio: kernel_mapper is read only");
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
+
+        for i in 0..page_count {
+            unsafe {
+                kernel_mapper
+                    .as_mut()
+                    .unwrap()
+                    .unmap(vaddr + i * MMArch::PAGE_SIZE, true)
+            };
+        }
+
+        // todo: 归还到buddy
+
         return Ok(0);
     }
 }
 
 /// @brief mmio伙伴系统内部的地址区域结构体
 pub struct MmioBuddyAddrRegion {
-    vaddr: u64,
+    vaddr: VirtAddr,
 }
 impl MmioBuddyAddrRegion {
     pub fn new() -> Self {
@@ -623,7 +568,7 @@ impl MmioBuddyAddrRegion {
 impl Default for MmioBuddyAddrRegion {
     fn default() -> Self {
         MmioBuddyAddrRegion {
-            vaddr: Default::default(),
+            vaddr: VirtAddr::new(0),
         }
     }
 }
@@ -656,19 +601,6 @@ impl Default for MmioFreeRegionList {
 #[no_mangle]
 pub extern "C" fn __mmio_buddy_init() {
     // 创建一堆1GB的地址块
-    let cnt_1g_blocks: u32 = ((MMIO_TOP - MMIO_BASE) / PAGE_1G_SIZE as i64) as u32;
-    let mut vaddr_base: u64 = MMIO_BASE as u64;
-    for _ in 0..cnt_1g_blocks {
-        match MMIO_POOL.give_back_block(vaddr_base, PAGE_1G_SHIFT) {
-            Ok(_) => {
-                vaddr_base += PAGE_1G_SIZE as u64;
-            }
-            Err(_) => {
-                kerror!("__mmio_buddy_init failed");
-                return;
-            }
-        }
-    }
 }
 
 /// @brief 将内存对象大小的幂转换成内存池中的数组的下标
@@ -699,7 +631,8 @@ pub extern "C" fn mmio_create(
     res_vaddr: *mut u64,
     res_length: *mut u64,
 ) -> i32 {
-    if let Err(err) = MMIO_POOL.create_mmio(size, vm_flags, res_vaddr, res_length) {
+    kdebug!("mmio_create");
+    if let Err(err) = MMIO_POOL.create_mmio(size as usize, vm_flags, res_vaddr, res_length) {
         return err.to_posix_errno();
     } else {
         return 0;
@@ -717,9 +650,7 @@ pub extern "C" fn mmio_create(
 /// @return Err(i32) 失败返回错误码
 #[no_mangle]
 pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> i32 {
-    if let Err(err) = MMIO_POOL.release_mmio(vaddr, length) {
-        return err.to_posix_errno();
-    } else {
-        return 0;
-    }
+    return MMIO_POOL
+        .release_mmio(VirtAddr::new(vaddr as usize), length as usize)
+        .unwrap_or_else(|err| err.to_posix_errno());
 }

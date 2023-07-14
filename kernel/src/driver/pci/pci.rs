@@ -553,7 +553,7 @@ impl PciRoot {
         unsafe {
             let initial_mm_ptr = &mut initial_mm as *mut mm_struct;
             if let Err(_) =
-                MMIO_POOL.create_mmio(size, (VM_IO | VM_DONTCOPY) as u64, vaddr_ptr, virtsize_ptr)
+                MMIO_POOL.create_mmio(size as usize, (VM_IO | VM_DONTCOPY) as u64, vaddr_ptr, virtsize_ptr)
             {
                 kerror!("Create mmio failed when initing ecam");
                 return Err(PciError::CreateMmioError);
@@ -1329,7 +1329,7 @@ pub fn pci_bar_init(
                 let initial_mm_ptr = &mut initial_mm as *mut mm_struct;
                 //kdebug!("size want={:#x}", size);
                 if let Err(_) = MMIO_POOL.create_mmio(
-                    size,
+                    size as usize,
                     (VM_IO | VM_DONTCOPY) as u64,
                     vaddr_ptr,
                     virtsize_ptr,

@@ -1,20 +1,31 @@
 //! 这是暴露给C的接口，用于在C语言中使用Rust的内存分配器。
 
+use core::intrinsics::unlikely;
+
+use alloc::{boxed::Box, vec::Vec};
+use hashbrown::HashMap;
+
 use crate::{
     driver::uart::uart::c_uart_send,
-    include::bindings::bindings::{PAGE_KERNEL, PAGE_U_S},
-    kdebug,
-    libs::align::page_align_up,
+    include::bindings::bindings::{gfp_t, PAGE_KERNEL, PAGE_U_S},
+    kdebug, kerror,
+    libs::{align::page_align_up, spinlock::SpinLock},
+    mm::MMArch,
+    syscall::SystemError,
 };
 
 use super::{
-    allocator::page_frame::PageFrameCount,
+    allocator::page_frame::{FrameAllocator, PageFrameCount},
     kernel_mapper::KernelMapper,
     no_init::pseudo_map_phys,
     page::{PageFlags, PageMapper},
     MemoryManagementArch, PhysAddr, VirtAddr,
 };
-use crate::mm::MMArch;
+
+lazy_static! {
+    // 用于记录内核分配给C的空间信息
+    static ref C_ALLOCATION_MAP: SpinLock<HashMap<VirtAddr, (VirtAddr, usize, usize)>> = SpinLock::new(HashMap::new());
+}
 
 /// [EXTERN TO C] Use pseudo mapper to map physical memory to virtual memory.
 #[no_mangle]
@@ -39,18 +50,87 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
     }
 
     let mut kernel_mapper = KernelMapper::lock();
+    let mut kernel_mapper = kernel_mapper.as_mut();
+    assert!(kernel_mapper.is_some());
+    for i in 0..count.data() {
+        if paddr.data() == 0x1fe00000{
 
-    for _ in 0..count.data() {
+            kdebug!("rs map: i={i}, vaddr={vaddr:?}, paddr={paddr:?}");
+        }
         let flusher = kernel_mapper
             .as_mut()
             .unwrap()
             .map_phys(vaddr, paddr, page_flags)
             .unwrap();
-
+        
         flusher.flush();
 
         vaddr += MMArch::PAGE_SIZE;
         paddr += MMArch::PAGE_SIZE;
     }
     c_uart_send(0x3f8, 'F' as u8);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kzalloc(size: usize, _gfp: gfp_t) -> usize {
+    kdebug!("kzalloc: size: {size}");
+    return do_kmalloc(size, true);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kmalloc(size: usize, _gfp: gfp_t) -> usize {
+    kdebug!("kmalloc: size: {size}");
+    return do_kmalloc(size, false);
+}
+
+fn do_kmalloc(size: usize, zero: bool) -> usize {
+    let space: Vec<u8> = if zero {
+        vec![0u8; size]
+    } else {
+        let mut v = Vec::with_capacity(size);
+        unsafe {
+            v.set_len(size);
+        }
+        v
+    };
+
+    assert!(space.len() == size);
+    let (ptr, len, cap) = space.into_raw_parts();
+    if !ptr.is_null() {
+        let vaddr = VirtAddr::new(ptr as usize);
+        let len = len as usize;
+        let cap = cap as usize;
+        let mut guard = C_ALLOCATION_MAP.lock();
+        if unlikely(guard.contains_key(&vaddr)) {
+            drop(guard);
+            unsafe {
+                drop(Vec::from_raw_parts(vaddr.data() as *mut u8, len, cap));
+            }
+            panic!(
+                "do_kmalloc: vaddr {:?} already exists in C Allocation Map, query size: {size}, zero: {zero}",
+                vaddr
+            );
+        }
+        // 插入到C Allocation Map中
+        guard.insert(vaddr, (vaddr, len, cap));
+        return vaddr.data();
+    } else {
+        return SystemError::ENOMEM.to_posix_errno() as i64 as usize;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kfree(vaddr: usize) -> usize {
+    let vaddr = VirtAddr::new(vaddr);
+    let mut guard = C_ALLOCATION_MAP.lock();
+    let p = guard.remove(&vaddr);
+    drop(guard);
+
+    if p.is_none() {
+        kerror!("kfree: vaddr {:?} not found in C Allocation Map", vaddr);
+        return SystemError::EINVAL.to_posix_errno() as i64 as usize;
+    }
+    let (vaddr, len, cap) = p.unwrap();
+    drop(Vec::from_raw_parts(vaddr.data() as *mut u8, len, cap));
+    return 0;
 }

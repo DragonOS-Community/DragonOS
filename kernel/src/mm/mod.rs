@@ -200,6 +200,11 @@ impl VirtAddr {
     pub fn as_ptr<T>(self) -> *mut T {
         return self.0 as *mut T;
     }
+
+    #[inline(always)]
+    pub fn is_null(&self) -> bool {
+        return self.0 == 0;
+    }
 }
 
 impl Add<VirtAddr> for VirtAddr {

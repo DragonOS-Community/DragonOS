@@ -80,13 +80,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
     // 定义一个变量记录buddy表的大小
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
-
         let initial_free_pages = bump_allocator.usage().free();
         kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
         // 最高阶的链表页数
         let max_order_linked_list_page_num = max(
             1,
-            (((initial_free_pages.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES - 1)
+            (((initial_free_pages.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES
+                - 1)
                 / Self::BUDDY_ENTRIES,
         );
 
@@ -624,8 +624,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 }
 
 impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<PhysAddr> {
-        return self.buddy_alloc(count).map(|(base, _)| base);
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        return self.buddy_alloc(count);
     }
 
     /// 释放一个块

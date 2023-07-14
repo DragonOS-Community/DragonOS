@@ -295,7 +295,35 @@ int scm_framework_enable(struct scm_ui_framework_t *ui)
     }
     else
         __current_framework = ui;
+    ui->ui_ops->enable(NULL);
+    spin_unlock(&scm_screen_own_lock);
+    return retval;
+}
 
+/**
+ * @brief 禁用某个ui框架，将它的帧缓冲区从屏幕上移除
+ *
+ * @param ui 要禁用的ui框架
+ * @return int 返回码
+ */
+int scm_framework_disable(struct scm_ui_framework_t *ui)
+{
+    if (ui->buf->vaddr == NULL)
+        return -EINVAL;
+    spin_lock(&scm_screen_own_lock);
+    if (ui != __current_framework)
+        return -EINVAL;
+    int retval = 0;
+    if (__scm_double_buffer_enabled == true)
+    {
+        retval = video_set_refresh_target(NULL);
+        if (retval == 0)
+            __current_framework = NULL;
+    }
+    else
+        __current_framework = NULL;
+
+    ui->ui_ops->disable(NULL);
     spin_unlock(&scm_screen_own_lock);
     return retval;
 }
@@ -307,7 +335,7 @@ int scm_framework_enable(struct scm_ui_framework_t *ui)
 void scm_reinit()
 {
     scm_enable_alloc();
-    video_reinitialize(false);
+    // video_reinitialize(false);
 
     // 遍历当前所有使用帧缓冲区的框架，更新地址
     // 逐个检查已经注册了的ui框架，将其缓冲区更改为双缓冲

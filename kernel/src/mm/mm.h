@@ -6,6 +6,9 @@
 #include <mm/mm-types.h>
 #include <process/process.h>
 
+extern void rs_pseudo_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size);
+extern void rs_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size,uint64_t flags);
+
 // 每个页表的项数
 // 64位下，每个页表4k，每条页表项8B，故一个页表有512条
 #define PTRS_PER_PGT 512

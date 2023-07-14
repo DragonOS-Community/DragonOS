@@ -2,7 +2,8 @@ pub mod barrier;
 pub mod frame;
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
-    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t, process_control_block,
+    disable_textui, enable_textui, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
+    process_control_block, video_reinitialize,
 };
 use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
@@ -24,7 +25,7 @@ use core::ffi::c_void;
 use core::fmt::{Debug, Write};
 use core::mem::{self, MaybeUninit};
 use core::ptr::read_volatile;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use self::barrier::mfence;
 
@@ -293,6 +294,10 @@ pub fn mm_init() {
     unsafe { X86_64MMArch::init() };
     c_uart_send_str(0x3f8, "mm_init3\n\0".as_ptr());
     kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
+    kdebug!("phys[0]=virt[0x{:x}]", unsafe {
+        MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
+    });
+    
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // 初始化内存管理器
     unsafe { allocator_init() };
@@ -304,17 +309,32 @@ unsafe fn allocator_init() {
     let virt_offset = BOOTSTRAP_MM_INFO.unwrap().start_brk;
     let phy_offset =
         unsafe { MMArch::virt_2_phys(VirtAddr::new(page_align_up(virt_offset))) }.unwrap();
-
+    kdebug!(
+        "virt_offset: {:#x}, phy_offset: {:?}",
+        virt_offset,
+        phy_offset
+    );
+    kdebug!("PhysArea[0..10] = {:?}", &PHYS_MEMORY_AREAS[0..10]);
     let mut bump_allocator =
         BumpAllocator::<X86_64MMArch>::new(&PHYS_MEMORY_AREAS, phy_offset.data());
+    kdebug!("BumpAllocator created, offset={:?}", bump_allocator.offset());
+    
+    // 暂存初始在head.S中指定的页表的地址，后面再考虑是否需要把它加到buddy的可用空间里面！
+    // 现在不加的原因是，我担心会有安全漏洞问题：这些初始的页表，位于内核的数据段。如果归还到buddy，
+    // 可能会产生一定的安全风险（有的代码可能根据虚拟地址来进行安全校验）
+    let _old_page_table = MMArch::table(PageTableKind::Kernel);
 
+    let new_page_table: PhysAddr;
     // 使用bump分配器，把所有的内存页都映射到页表
     {
+        // 用bump allocator创建新的页表
         let mut mapper = crate::mm::page::PageMapper::<MMArch, _>::create(
             PageTableKind::Kernel,
             &mut bump_allocator,
         )
-        .expect("Failed to create page mapper for bump allocator");
+        .expect("Failed to create page mapper");
+        new_page_table = mapper.table().phys();
+        kdebug!("PageMapper created");
 
         // 取消最开始时候，在head.S中指定的映射(暂时不刷新TLB)
         {
@@ -327,11 +347,16 @@ unsafe fn allocator_init() {
             }
         }
         kdebug!("Successfully emptied page table");
+
         for area in PHYS_MEMORY_AREAS.iter() {
+            // kdebug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
             for i in 0..area.size / MMArch::PAGE_SIZE {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
                 let flags = page_flags::<MMArch>(vaddr);
+                if paddr.data() >= 0x1fff0000{
+                    kdebug!("NOTICE: vaddr: {:?}, paddr: {:?}, flags: {:?}", vaddr, paddr, flags);
+                }
 
                 let flusher = mapper
                     .map_phys(vaddr, paddr, flags)
@@ -359,26 +384,57 @@ unsafe fn allocator_init() {
             "Successfully mapped all physical memory, table={:?}",
             mapper.table().phys()
         );
-        loop {}
-        // todo: 在这里关闭显示输出
-
-        // todo: 在这里重置显示输出目标
-
-        // 使映射后的页表生效
-        mapper.make_current();
-        // todo: 在这里打开显示输出
     }
     kdebug!(
         "After mapping all physical memory, DragonOS used: {} KB",
         bump_allocator.offset() / 1024
     );
+
+    kdebug!("bump offset = {:?}", bump_allocator.offset());
     // 初始化buddy_allocator
-    let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
+    let buddy_allocator =
+        unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
+
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
     kdebug!("Successfully initialized buddy allocator");
+    // 关闭显示输出
+    unsafe {
+        disable_textui();
+    }
 
-    loop {}
+    kdebug!("To enable new page table");
+    // make the new page table current
+    {
+        let mut binding = INNER_ALLOCATOR.lock();
+        let mut allocator_guard = binding.as_mut().unwrap();
+        kdebug!("To enable new page table.");
+        compiler_fence(Ordering::SeqCst);
+        let mapper = crate::mm::page::PageMapper::<MMArch, _>::new(
+            PageTableKind::Kernel,
+            new_page_table,
+            &mut allocator_guard,
+        );
+        compiler_fence(Ordering::SeqCst);
+        mapper.make_current();
+        compiler_fence(Ordering::SeqCst);
+        c_uart_send_str(0x3f8, "make current ok\n\0".as_ptr());
+        kdebug!("New page table enabled");
+        c_uart_send_str(0x3f8, "make current ok2\n\0".as_ptr());
+    }
+    kdebug!("Successfully enabled new page table");
+    // 重置显示输出目标
+    unsafe {
+        video_reinitialize(false);
+    }
+
+    // 打开显示输出
+    unsafe {
+        enable_textui();
+    }
+    kdebug!("Text UI enabled");
+
+
 }
 
 /// 全局的页帧分配器
@@ -417,12 +473,12 @@ unsafe fn page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code read only, execute
-        return PageFlags::new().set_execute(true);
+        return PageFlags::new().set_execute(true).set_write(true);
     } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
-        // Remap kernel rodata read only, no execute
-        return PageFlags::new();
+        // Remap kernel rodata read only
+        return PageFlags::new().set_execute(true);
     } else {
-        return PageFlags::new().set_write(true);
+        return PageFlags::new().set_write(true).set_execute(true);
     }
 }
 

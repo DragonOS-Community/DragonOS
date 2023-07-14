@@ -7,7 +7,7 @@ use crate::{
     smp::core::smp_get_processor_id,
 };
 use core::{
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 

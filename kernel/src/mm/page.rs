@@ -1,5 +1,5 @@
 use core::{
-    fmt::{self, Debug},
+    fmt::{self, Debug, Error, Formatter},
     marker::PhantomData,
     mem,
     ops::Add,
@@ -155,10 +155,16 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
 }
 
 /// 页表项
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct PageEntry<Arch> {
     data: usize,
     phantom: PhantomData<Arch>,
+}
+
+impl<Arch> Debug for PageEntry<Arch> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        f.write_fmt(format_args!("PageEntry({:#x})", self.data))
+    }
 }
 
 impl<Arch: MemoryManagementArch> PageEntry<Arch> {
@@ -467,27 +473,22 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             );
             return None;
         }
+        let virt = VirtAddr::new(virt.data() & (!Arch::PAGE_NEGATIVE_MASK));
 
         // TODO： 验证flags是否合法
 
         // 创建页表项
         let entry = PageEntry::new(phys.data() | flags.data());
         let mut table = self.table();
-        // static CNT:AtomicU32 = AtomicU32::new(0);
         loop {
             let i = table.index_of(virt)?;
             if table.level() == 0 {
-                // if CNT.load(Ordering::SeqCst) >=2 {
-                //     kdebug!("cnt = {}, i={i}", CNT.load(Ordering::SeqCst));
-                // if i < 10 || i >= 500 {
-                //     kdebug!(" i={i}, table={:?}", table);
-                // }
-                // }
                 // todo: 检查是否已经映射
                 // 现在不检查的原因是，刚刚启动系统时，内核会映射一些页。
                 if table.entry_mapped(i)? == true {
-                    // kwarn!("Page {:?} already mapped", virt);
+                    kwarn!("Page {:?} already mapped", virt);
                 }
+                // kdebug!("Mapping {:?} to {:?}, i = {i}, entry={:?}, flags={:?}", virt, phys, entry, flags);
                 table.set_entry(i, entry);
                 return Some(PageFlush::new(virt));
             } else {
@@ -501,6 +502,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     let frame = self.frame_allocator.allocate_one()?;
                     // 清空这个页帧
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+
                     // 设置页表项的flags
                     let flags = Arch::ENTRY_FLAG_READWRITE
                         | Arch::ENTRY_FLAG_DEFAULT_TABLE
@@ -509,20 +511,18 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                         } else {
                             0
                         };
+                    // kdebug!("Flags: {:?}", flags);
                     // kdebug!(
                     //     "Map page table, level={}, next level table phys={:?}",
                     //     table.level(),
                     //     frame
                     // );
+
                     // 把新分配的页表映射到当前页表
                     table.set_entry(i, PageEntry::new(frame.data() | flags));
-                    // kdebug!("Map page table ok");
-                    // if table.level() == 1{
-                    //     CNT.fetch_add(1, Ordering::SeqCst);
-                    // }
+
                     // 获取新分配的页表
                     table = table.next_level_table(i)?;
-                    // kdebug!("Next level table: {:?}", table);
                 }
             }
         }

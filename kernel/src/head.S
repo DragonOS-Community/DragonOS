@@ -263,13 +263,39 @@ ENTRY(_start64)
     mov $__PDPTE, %ebx
     or $0x3, %ebx
     mov %ebx, 0(%eax)
-    mov %ebx, 256(%eax)
+
+    mov $__PML4E, %eax
+    // 加256个表项, 映射高地址
+    add $2048, %eax
+    mov %ebx, 0(%eax)
 
     // 次级
     mov $__PDPTE, %eax
     mov $__PDE, %ebx
     or $0x3, %ebx
     mov %ebx, 0(%eax)
+
+    // 次低级
+    mov $__PDE, %eax
+    mov $50, %ecx
+    mov $__PT_S, %ebx
+    or $0x3, %ebx
+.fill_pde_64:
+    mov %ebx, 0(%eax)
+    add $0x1000, %ebx
+    add $8, %eax
+    loop .fill_pde_64
+
+    // 最低级
+    // 循环 512*50=25600 次，填满50页
+    mov $25600, %ecx
+    mov $__PT_S, %eax
+    mov $0x3, %ebx
+.fill_pt_64:
+    mov %ebx, 0(%eax)
+    add $0x1000, %ebx
+    add $8, %eax
+    loop .fill_pt_64
 
 
 // ==== 加载CR3寄存器
@@ -481,73 +507,18 @@ ENTRY(head_stack_start)
 
 // 初始化页表
 .align 0x1000 //设置为4k对齐
-//.org 0x1000 //设置页表位置为内核执行头程序的0x1000处
-
 __PML4E:
-    .quad 0x103007 // 用户访问，可读写，已存在， 地址在31~12位
-    .fill	255,8,0
-	.quad 0x103003
-	.fill	255,8,0
-
-.org	0x2000
-
+    .skip 0x1000
 __PDPTE:
+	.skip 0x1000
 
-	.quad	0x104003 // 用户访问，可读写，已存在
-	.fill	511,8,0
-
-.org	0x3000
-
+// 三级页表
 __PDE:
+    .skip 0x1000
 
-	.quad	0x000083    // 用户访问，可读写，已存在
-	.quad	0x200083
-	.quad	0x400083
-	.quad	0x600083
-	.quad	0x800083
-    .quad	0xa00083
-	.quad	0xc00083
-	.quad	0xe00083
-	.quad	0x1000083
-	.quad	0x1200083
-	.quad	0x1400083
-	.quad	0x1600083
-	.quad	0x1800083
-	.quad	0x1a00083
-	.quad	0x1c00083
-	.quad	0x1e00083
-	.quad	0x2000083
-	.quad	0x2200083
-	.quad	0x2400083
-	.quad	0x2600083
-	.quad	0x2800083
-	.quad	0x2a00083
-	.quad	0x2c00083
-	.quad	0x2e00083
-	.quad	0x3000083
-	.quad	0x3200083
-	.quad	0x3400083
-	.quad	0x3600083
-
-
-	.quad	0xe0000083		/*虚拟地址0x 3000000 初始情况下，帧缓冲区映射到这里*/ 
-	.quad	0xe0200083
-	.quad	0xe0400083
-	.quad	0xe0600083		/*0x1000000*/
-	.quad	0xe0800083
-	.quad	0xe0a00083
-	.quad	0xe0c00083
-	.quad	0xe0e00083
-    .quad	0xe1000083
-    .quad	0xe1200083
-    .quad	0xe1400083
-    .quad	0xe1600083
-    .quad	0xe1800083
-    .quad	0xe1a00083
-    .quad	0xe1c00083
-    .quad	0xe1e00083
-	.fill	468,8,0
-
+// 预留50个四级页表，总共表示100M的内存空间。这50个页表占用200KB的空间
+__PT_S:
+    .skip 0x32000
 
 // GDT表
 

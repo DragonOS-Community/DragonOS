@@ -80,14 +80,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
     // 定义一个变量记录buddy表的大小
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
-        let initial_bump_usage = bump_allocator.usage();
-        kdebug!("initial_bump_usage {:?}", initial_bump_usage);
 
-        let pages_to_buddy = initial_bump_usage.free();
+        let initial_free_pages = bump_allocator.usage().free();
+        kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
         // 最高阶的链表页数
         let max_order_linked_list_page_num = max(
             1,
-            (((pages_to_buddy.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES - 1)
+            (((initial_free_pages.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES - 1)
                 / Self::BUDDY_ENTRIES,
         );
 
@@ -119,6 +118,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         }
 
         let initial_bump_offset = bump_allocator.offset();
+        let pages_to_buddy = bump_allocator.usage().free();
+        kdebug!("pages_to_buddy {:?}", pages_to_buddy);
         // kdebug!("initial_bump_offset {:#x}", initial_bump_offset);
         let mut paddr = initial_bump_offset;
         let mut remain_pages = pages_to_buddy;
@@ -179,7 +180,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 while entries > 0 {
                     let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
 
-                    for j in 0..Self::BUDDY_ENTRIES {
+                    for _ in 0..Self::BUDDY_ENTRIES {
                         A::write(
                             Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
                             paddr,
@@ -203,7 +204,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         }
 
         let mut remain_bytes = remain_pages.data() * A::PAGE_SIZE;
-        kdebug!("remain_bytes {}", remain_bytes);
+
         assert!(remain_bytes < (1 << MAX_ORDER - 1));
 
         for i in (MIN_ORDER..MAX_ORDER).rev() {
@@ -668,7 +669,10 @@ unsafe impl<A: MemoryManagementArch> Allocator for LockedBuddyAllocator<A> {
         let virt_addr = unsafe { A::phys_2_virt(phy_addr).ok_or(AllocError)? };
         let ptr = NonNull::new(virt_addr.data() as *mut u8).unwrap();
         let slice = unsafe {
-            core::slice::from_raw_parts_mut(ptr.as_ptr(), allocated_frame_count.data() * A::PAGE_SIZE)
+            core::slice::from_raw_parts_mut(
+                ptr.as_ptr(),
+                allocated_frame_count.data() * A::PAGE_SIZE,
+            )
         };
         // kdebug!("allocate");
         return Ok(NonNull::from(slice));

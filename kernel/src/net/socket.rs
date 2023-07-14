@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use hashbrown::HashMap;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{raw, tcp, udp},
@@ -25,6 +26,8 @@ lazy_static! {
     /// TODO: 优化这里，自己实现SocketSet！！！现在这样的话，不管全局有多少个网卡，每个时间点都只会有1个进程能够访问socket
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     pub static ref SOCKET_WAITQUEUE: WaitQueue = WaitQueue::INIT;
+    // 检测端口是否冲突的表
+    pub static ref LISTEN_TABLE: SpinLock<HashMap<u16, GlobalSocketHandle>> = SpinLock::new(HashMap::new());
 }
 
 /* For setsockopt(2) */
@@ -326,6 +329,9 @@ impl UdpSocket {
 
     fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(ip)) = endpoint {
+            // 检测端口是否已被占用
+            check_port_used(ip.port, self.handle.clone())?;
+
             let bind_res = if ip.addr.is_unspecified() {
                 socket.bind(ip.port)
             } else {
@@ -740,6 +746,9 @@ impl Socket for TcpSocket {
                 ip.port = get_ephemeral_port();
             }
 
+            // 检测端口是否已被占用
+            check_port_used(ip.port, self.handle.clone())?;
+
             self.local_endpoint = Some(ip);
             self.is_listening = false;
             return Ok(());
@@ -833,9 +842,7 @@ impl Socket for TcpSocket {
     }
 }
 
-/// @breif 自动分配一个未被使用的PORT
-///
-/// TODO: 增加ListenTable, 用于检查端口是否被占用
+/// @breif 自动分配一个未被使用的PORT，如果动态端口均已被占用，直接返回一个被占用的端口
 pub fn get_ephemeral_port() -> u16 {
     // TODO selects non-conflict high port
 
@@ -844,13 +851,37 @@ pub fn get_ephemeral_port() -> u16 {
         if EPHEMERAL_PORT == 0 {
             EPHEMERAL_PORT = (49152 + rand() % (65536 - 49152)) as u16;
         }
-        if EPHEMERAL_PORT == 65535 {
-            EPHEMERAL_PORT = 49152;
-        } else {
-            EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
+        loop {
+            if EPHEMERAL_PORT == 65535 {
+                EPHEMERAL_PORT = 49152;
+            } else {
+                EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
+            }
+            // 使用 ListenTable 检查端口是否被占用
+            let listen_table_guard = LISTEN_TABLE.lock();
+            if listen_table_guard.len() == (65536 - 49152)
+                || !listen_table_guard.get(&EPHEMERAL_PORT).is_some()
+            {
+                drop(listen_table_guard);
+                break;
+            }
         }
         EPHEMERAL_PORT
     }
+}
+
+/// @breif 检测给定端口是否已被占用，如果未被占用则在 ListenTable 中记录
+pub fn check_port_used(port: u16, handle: GlobalSocketHandle) -> Result<(), SystemError> {
+    // 只检测动态端口的占用情况
+    if port >= 49152 {
+        let mut listen_table_guard = LISTEN_TABLE.lock();
+        match listen_table_guard.get(&port) {
+            Some(_) => return Err(SystemError::EADDRINUSE),
+            None => listen_table_guard.insert(port, handle),
+        };
+        drop(listen_table_guard);
+    }
+    Ok(())
 }
 
 /// @brief 地址族的枚举
@@ -1012,6 +1043,12 @@ impl IndexNode for SocketInode {
         &self,
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<(), SystemError> {
+        let socket = self.0.lock();
+        if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
+            let mut listen_table_guard = LISTEN_TABLE.lock();
+            listen_table_guard.remove(&ip.port);
+            drop(listen_table_guard);
+        }
         return Ok(());
     }
 

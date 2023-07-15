@@ -1,6 +1,14 @@
-use core::{sync::atomic::{compiler_fence, Ordering}, ptr::null_mut};
+use core::{
+    ptr::null_mut,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
-use crate::{mm::{set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, INITIAL_PROCESS_ADDRESS_SPACE}, arch::asm::current::current_pcb};
+use crate::{
+    arch::asm::current::current_pcb,
+    mm::{
+        set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, INITIAL_PROCESS_ADDRESS_SPACE,
+    },
+};
 
 pub mod abi;
 pub mod c_adapter;

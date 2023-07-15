@@ -68,7 +68,6 @@ impl Debug for X86_64MMBootstrapInfo {
 
 pub static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
 
-
 /// @brief X86_64的内存管理架构结构体
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct X86_64MMArch;
@@ -151,7 +150,7 @@ impl MemoryManagementArch for X86_64MMArch {
         asm!("invlpg [{0}]", in(reg) address.data(), options(nostack, preserves_flags));
         compiler_fence(Ordering::SeqCst);
     }
-    
+
     /// @brief 刷新TLB中，所有的条目
     unsafe fn invalidate_all() {
         compiler_fence(Ordering::SeqCst);
@@ -159,7 +158,7 @@ impl MemoryManagementArch for X86_64MMArch {
         Self::set_table(PageTableKind::User, Self::table(PageTableKind::User));
         compiler_fence(Ordering::SeqCst);
     }
-    
+
     /// @brief 获取顶级页表的物理地址
     unsafe fn table(_table_kind: PageTableKind) -> PhysAddr {
         let paddr: usize;
@@ -168,7 +167,7 @@ impl MemoryManagementArch for X86_64MMArch {
         compiler_fence(Ordering::SeqCst);
         return PhysAddr::new(paddr);
     }
-    
+
     /// @brief 设置顶级页表的物理地址到处理器中
     unsafe fn set_table(_table_kind: PageTableKind, table: PhysAddr) {
         compiler_fence(Ordering::SeqCst);
@@ -482,7 +481,7 @@ unsafe fn set_inner_allocator(allocator: BuddyAllocator<MMArch>) {
 }
 
 /// 低地址重映射的管理器
-/// 
+///
 /// 低地址重映射的管理器，在smp初始化完成之前，需要使用低地址的映射，因此需要在smp初始化完成之后，取消这一段映射
 pub struct LowAddressRemapping;
 

@@ -7,8 +7,9 @@ use crate::{
         process_control_block, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING, SCHED_FIFO,
         SCHED_NORMAL, SCHED_RR,
     },
+    kinfo,
     process::process::process_cpu,
-    syscall::SystemError, kinfo,
+    syscall::SystemError,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};

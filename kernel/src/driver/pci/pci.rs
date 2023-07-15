@@ -649,11 +649,7 @@ impl PciRoot {
             let vaddr = VirtAddr::new(virtaddress as usize);
             let paddr = PhysAddr::new(self.physical_address_base as usize);
             kdebug!("pci root: map: vaddr={vaddr:?}, paddr={paddr:?}, size={size}");
-            let page_flags = PageFlags::new()
-                .set_write(true)
-                .set_execute(true)
-                .set_page_cache_disable(true)
-                .set_page_write_through(true);
+            let page_flags = PageFlags::mmio_flags();
             let mut kernel_mapper = KernelMapper::lock();
             // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
             assert!(kernel_mapper

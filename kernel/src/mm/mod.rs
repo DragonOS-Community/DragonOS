@@ -11,13 +11,14 @@ use core::{
     fmt::Debug,
     intrinsics::unlikely,
     ops::{Add, AddAssign, Sub, SubAssign},
-    ptr, sync::atomic::{AtomicBool, Ordering},
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use self::{
     allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
     page::round_up_to_page_size,
-    ucontext::{UserMapper, AddressSpace},
+    ucontext::{AddressSpace, UserMapper},
 };
 
 pub mod allocator;
@@ -29,8 +30,6 @@ pub mod no_init;
 pub mod page;
 pub mod syscall;
 pub mod ucontext;
-
-
 
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）
 static mut __INITIAL_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
@@ -51,7 +50,10 @@ pub fn INITIAL_PROCESS_ADDRESS_SPACE() -> Arc<AddressSpace> {
 #[allow(non_snake_case)]
 pub unsafe fn set_INITIAL_PROCESS_ADDRESS_SPACE(address_space: Arc<AddressSpace>) {
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
-    if INITIALIZED.compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire).is_err() {
+    if INITIALIZED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire)
+        .is_err()
+    {
         panic!("INITIAL_PROCESS_ADDRESS_SPACE is already initialized");
     }
     __INITIAL_PROCESS_ADDRESS_SPACE = Some(address_space);
@@ -68,8 +70,6 @@ pub fn virt_2_phys(addr: usize) -> usize {
 pub fn phys_2_virt(addr: usize) -> usize {
     addr + PAGE_OFFSET as usize
 }
-
-
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub enum PageTableKind {

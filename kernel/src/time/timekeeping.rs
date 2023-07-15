@@ -5,9 +5,9 @@ use x86_64::align_up;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kdebug,
+    kdebug, kinfo,
     libs::rwlock::RwLock,
-    time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec}, kinfo,
+    time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
 };
 
 use super::{

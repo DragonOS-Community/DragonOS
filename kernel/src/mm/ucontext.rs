@@ -1,6 +1,13 @@
 // 进程的用户空间内存管理
 
-use core::{cmp, hash::Hasher, intrinsics::unlikely, mem::ManuallyDrop, ops::Add};
+use core::{
+    cmp,
+    hash::Hasher,
+    intrinsics::unlikely,
+    mem::ManuallyDrop,
+    ops::Add,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use alloc::{
     collections::BTreeMap,
@@ -292,6 +299,7 @@ impl InnerAddressSpace {
 
         let page = VirtPageFrame::new(region.start());
 
+        compiler_fence(Ordering::SeqCst);
         let (mut active, mut inactive);
         let flusher = if self.is_current() {
             active = PageFlushAll::new();
@@ -300,7 +308,7 @@ impl InnerAddressSpace {
             inactive = InactiveFlusher::new();
             &mut inactive as &mut dyn Flusher<MMArch>
         };
-
+        compiler_fence(Ordering::SeqCst);
         // 映射页面，并将VMA插入到地址空间的VMA列表中
         self.mappings.insert_vma(map_func(
             page,
@@ -479,10 +487,12 @@ impl Drop for UserMapper {
         }
         // 释放用户空间顶层页表占用的页帧
         // 请注意，在释放这个页帧之前，用户页表应该已经被完全释放，否则会产生内存泄露
-        unsafe { deallocate_page_frames(
-            PhysPageFrame::new(self.utable.table().phys()),
-            PageFrameCount::new(1),
-        ) };
+        unsafe {
+            deallocate_page_frames(
+                PhysPageFrame::new(self.utable.table().phys()),
+                PageFrameCount::new(1),
+            )
+        };
     }
 }
 

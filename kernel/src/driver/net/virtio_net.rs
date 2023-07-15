@@ -10,7 +10,7 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use crate::{
     driver::{virtio::virtio_impl::HalImpl, Driver},
-    kerror, kinfo,
+    kdebug, kerror, kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
     syscall::SystemError,
@@ -147,7 +147,10 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        match self.inner.lock().receive() {
+        let mut guard = self.inner.lock();
+
+        // kdebug!("VirtioNet: receive. recv queue info: {}", guard.get_queue_debug_info(true));
+        match guard.receive() {
             Ok(buf) => Some((
                 VirtioNetToken::new(self.clone(), Some(buf)),
                 VirtioNetToken::new(self.clone(), None),

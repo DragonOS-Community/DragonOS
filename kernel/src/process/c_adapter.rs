@@ -16,4 +16,3 @@ pub extern "C" fn rs_process_copy_mm(clone_vm: bool, new_pcb: &mut process_contr
         .map(|_| 0)
         .unwrap_or_else(|err| err.to_posix_errno() as usize);
 }
-

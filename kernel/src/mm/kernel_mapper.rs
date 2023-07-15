@@ -8,7 +8,8 @@ use crate::{
     libs::align::page_align_up,
     mm::allocator::page_frame::PageFrameCount,
     mm::{MMArch, MemoryManagementArch},
-    smp::core::smp_get_processor_id, syscall::SystemError,
+    smp::core::smp_get_processor_id,
+    syscall::SystemError,
 };
 use core::{
     ops::{Deref, DerefMut},
@@ -81,17 +82,17 @@ impl KernelMapper {
     }
 
     /// 映射一段物理地址到指定的虚拟地址。
-    /// 
+    ///
     /// ## 参数
-    /// 
+    ///
     /// - `vaddr`: 要映射的虚拟地址
     /// - `paddr`: 要映射的物理地址
     /// - `size`: 要映射的大小（字节，必须是页大小的整数倍，否则会向上取整）
     /// - `flags`: 页面标志
     /// - `flush`: 是否刷新TLB
-    /// 
+    ///
     /// ## 返回
-    /// 
+    ///
     /// - 成功：返回Ok(())
     /// - 失败： 如果当前映射器为只读，则返回EAGAIN_OR_EWOULDBLOCK
     pub unsafe fn map_phys_with_size(

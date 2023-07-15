@@ -76,7 +76,8 @@ pub unsafe extern "C" fn kzalloc(size: usize, _gfp: gfp_t) -> usize {
 #[no_mangle]
 pub unsafe extern "C" fn kmalloc(size: usize, _gfp: gfp_t) -> usize {
     kdebug!("kmalloc: size: {size}");
-    return do_kmalloc(size, false);
+    // 由于C代码不规范，因此都全部清空
+    return do_kmalloc(size, true);
 }
 
 fn do_kmalloc(size: usize, zero: bool) -> usize {

@@ -17,9 +17,9 @@ use crate::{
         InterruptArch,
     },
     include::bindings::bindings::{process_control_block, process_wakeup, PROC_RUNNING},
-    kdebug, kerror,
+    kdebug, kerror, kinfo,
     libs::spinlock::SpinLock,
-    syscall::SystemError, kinfo,
+    syscall::SystemError,
 };
 
 use super::timekeeping::update_wall_time;

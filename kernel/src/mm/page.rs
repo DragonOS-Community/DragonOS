@@ -3,7 +3,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{compiler_fence, AtomicU32, Ordering},
 };
 
 use crate::{
@@ -504,7 +504,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         flags: PageFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
+        compiler_fence(Ordering::SeqCst);
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
+        compiler_fence(Ordering::SeqCst);
         return self.map_phys(virt, phys, flags);
     }
 

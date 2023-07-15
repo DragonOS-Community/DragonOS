@@ -5,6 +5,7 @@ use crate::driver::pci::pci::{
     PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
+use crate::kdebug;
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };

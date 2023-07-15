@@ -6,6 +6,7 @@ use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 
 use crate::{
+    arch::mm::LowAddressRemapping,
     driver::uart::uart::c_uart_send,
     include::bindings::bindings::{gfp_t, PAGE_KERNEL, PAGE_U_S},
     kdebug, kerror,
@@ -128,5 +129,11 @@ pub unsafe extern "C" fn kfree(vaddr: usize) -> usize {
     }
     let (vaddr, len, cap) = p.unwrap();
     drop(Vec::from_raw_parts(vaddr.data() as *mut u8, len, cap));
+    return 0;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rs_unmap_at_low_addr() -> usize {
+    LowAddressRemapping::unmap_at_low_address(true);
     return 0;
 }

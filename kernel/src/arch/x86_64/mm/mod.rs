@@ -334,11 +334,12 @@ unsafe fn allocator_init() {
     // 使用bump分配器，把所有的内存页都映射到页表
     {
         // 用bump allocator创建新的页表
-        let mut mapper = crate::mm::page::PageMapper::<MMArch, _>::create(
-            PageTableKind::Kernel,
-            &mut bump_allocator,
-        )
-        .expect("Failed to create page mapper");
+        let mut mapper: crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>> =
+            crate::mm::page::PageMapper::<MMArch, _>::create(
+                PageTableKind::Kernel,
+                &mut bump_allocator,
+            )
+            .expect("Failed to create page mapper");
         new_page_table = mapper.table().phys();
         kdebug!("PageMapper created");
 
@@ -378,18 +379,7 @@ unsafe fn allocator_init() {
         }
 
         // 添加低地址的映射（在smp完成初始化之前，需要使用低地址的映射.初始化之后需要取消这一段映射）
-        // 映射32M
-        for i in 0..32 * 1024 * 1024 / MMArch::PAGE_SIZE {
-            let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
-            let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
-            let flags = page_flags::<MMArch>(vaddr);
-
-            let flusher = mapper
-                .map_phys(vaddr, paddr, flags)
-                .expect("Failed to map frame");
-            // 暂时不刷新TLB
-            flusher.ignore();
-        }
+        LowAddressRemapping::remap_at_low_address(&mut mapper);
 
         kdebug!(
             "Successfully mapped all physical memory, table={:?}",
@@ -502,6 +492,48 @@ unsafe fn set_inner_allocator(allocator: BuddyAllocator<MMArch>) {
     *INNER_ALLOCATOR.lock() = Some(allocator);
 }
 
+/// 低地址重映射的管理器
+/// 
+/// 低地址重映射的管理器，在smp初始化完成之前，需要使用低地址的映射，因此需要在smp初始化完成之后，取消这一段映射
+pub struct LowAddressRemapping;
+
+impl LowAddressRemapping {
+    // 映射32M
+    const REMAP_SIZE: usize = 32 * 1024 * 1024;
+
+    pub unsafe fn remap_at_low_address(
+        mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
+    ) {
+        for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
+            let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
+            let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
+            let flags = page_flags::<MMArch>(vaddr);
+
+            let flusher = mapper
+                .map_phys(vaddr, paddr, flags)
+                .expect("Failed to map frame");
+            // 暂时不刷新TLB
+            flusher.ignore();
+        }
+    }
+
+    /// 取消低地址的映射
+    pub unsafe fn unmap_at_low_address(flush: bool) {
+        let mut mapper = KernelMapper::lock();
+        assert!(mapper.as_mut().is_some());
+        for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
+            let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
+            let flusher = mapper
+                .as_mut()
+                .unwrap()
+                .unmap(vaddr, true)
+                .expect("Failed to unmap frame");
+            if flush == false {
+                flusher.ignore();
+            }
+        }
+    }
+}
 #[no_mangle]
 pub extern "C" fn rs_mm_init() {
     mm_init();

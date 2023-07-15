@@ -255,7 +255,7 @@ ENTRY(_start64)
     movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
 	rdmsr
 	bt	$8,	%rax
-	jnc	load_cr3
+	jnc	load_apu_cr3
 
     // 2. 设置临时页表
     // 最高级
@@ -305,7 +305,20 @@ load_cr3:
     movq $__PML4E, %rax //设置页目录基地址
     
     movq %rax, %cr3
-    
+    jmp to_switch_seg
+
+load_apu_cr3:
+    // 由于内存管理模块重置了页表，因此ap核心初始化的时候，需要使用新的内核页表。
+    // 这个页表的值由smp模块设置到__APU_START_CR3变量中
+
+    // 加载__APU_START_CR3中的值
+    movq $__APU_START_CR3, %rax
+    movq 0(%rax), %rax
+    movq %rax, %cr3
+    jmp to_switch_seg
+
+to_switch_seg:
+
     movq switch_seg(%rip), %rax
     // 由于ljmp和lcall在GAS中不受支持，因此我们需要先伪造函数调用现场，通过lret的方式，给它跳转过去。才能更新cs寄存器
     // 实在是太妙了！Amazing！
@@ -519,6 +532,11 @@ __PDE:
 // 预留50个四级页表，总共表示100M的内存空间。这50个页表占用200KB的空间
 __PT_S:
     .skip 0x32000
+
+
+.global __APU_START_CR3
+__APU_START_CR3:
+    .quad 0
 
 // GDT表
 

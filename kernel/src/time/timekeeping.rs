@@ -7,7 +7,7 @@ use crate::{
     exception::InterruptArch,
     kdebug,
     libs::rwlock::RwLock,
-    time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
+    time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec}, kinfo,
 };
 
 use super::{
@@ -201,6 +201,7 @@ pub fn do_gettimeofday() -> PosixTimeval {
 
 /// # 初始化timekeeping模块
 pub fn timekeeping_init() {
+    kinfo!("Initializing timekeeping module...");
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     timekeeper_init();
 
@@ -229,7 +230,7 @@ pub fn timekeeping_init() {
     __ADDED_SEC.store(0, Ordering::SeqCst);
 
     drop(irq_guard);
-    kdebug!("timekeeping_init successfully");
+    kinfo!("timekeeping_init successfully");
 }
 
 /// # 使用当前时钟源增加wall time

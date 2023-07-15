@@ -97,14 +97,12 @@ void system_initialize()
     // mm_init();
     rs_mm_init();
 
-
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
     // 对显示模块进行低级初始化，不启用double buffer
     scm_reinit();
 
-    
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
@@ -117,14 +115,12 @@ void system_initialize()
     initial_tss[0].ist6 = (ul)ptr;
     initial_tss[0].ist7 = (ul)ptr;
     // ===========================
-    
+
     acpi_init();
-while (1)
-    {
-        /* code */
-    }
+
     // 初始化中断模块
     sched_init();
+
     irq_init();
 
     // softirq_init();
@@ -132,9 +128,8 @@ while (1)
 
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
-    
-    syscall_init();
 
+    syscall_init();
     io_mfence();
 
     rs_timekeeping_init();
@@ -147,14 +142,19 @@ while (1)
     io_mfence();
 
     rs_clocksource_boot_finish();
+
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
     io_mfence();
 
     vfs_init();
+
     rs_tty_init();
-    
+    while (1)
+    {
+        /* code */
+    }
     cpu_init();
     ps2_keyboard_init();
     // tty_init();

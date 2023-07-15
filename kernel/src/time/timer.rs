@@ -19,7 +19,7 @@ use crate::{
     include::bindings::bindings::{process_control_block, process_wakeup, PROC_RUNNING},
     kdebug, kerror,
     libs::spinlock::SpinLock,
-    syscall::SystemError,
+    syscall::SystemError, kinfo,
 };
 
 use super::timekeeping::update_wall_time;
@@ -215,7 +215,7 @@ pub fn timer_init() {
     softirq_vectors()
         .register_softirq(SoftirqNumber::TIMER, do_timer_softirq)
         .expect("Failed to register timer softirq");
-    kdebug!("timer initiated successfully");
+    kinfo!("timer initialized successfully");
 }
 
 /// 计算接下来n毫秒对应的定时器时间片

@@ -197,20 +197,25 @@ ul initial_kernel_thread(ul arg)
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
     int val = 0;
     val = scm_enable_double_buffer();
+    io_mfence();
     rs_init_stdio();
+    io_mfence();
     // block_io_scheduler_init();
     ahci_init();
     mount_root_fs();
     io_mfence();
     rs_virtio_probe();
     io_mfence();
-    while(1);
+    
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);
 
     kinfo("LZ4 lib Version=%s", LZ4_versionString());
+    io_mfence();
     __rust_demo_func();
+    io_mfence();
+    while(1);
     // while (1)
     // {
     //     /* code */
@@ -369,9 +374,11 @@ void process_init()
     list_init(&initial_proc_union.pcb.list);
     wait_queue_init(&initial_proc_union.pcb.wait_child_proc_exit, NULL);
 
+    io_mfence();
     // 初始化init进程的signal相关的信息
     initial_proc_init_signal(current_pcb);
     kdebug("Initial process to init files");
+    io_mfence();
     process_init_files();
     kdebug("Initial process init files ok");
     io_mfence();
@@ -382,6 +389,7 @@ void process_init()
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核线程
     barrier();
     kthread_mechanism_init(); // 初始化kthread机制
+    barrier();
 
     initial_proc_union.pcb.state = PROC_RUNNING;
     initial_proc_union.pcb.preempt_count = 0;

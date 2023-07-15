@@ -25,7 +25,7 @@ unsafe impl Hal for HalImpl {
         _direction: BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
         let page_num =
-            PageFrameCount::new((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE);
+            PageFrameCount::new(((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two());
         unsafe {
             let (paddr, _count) =
                 allocate_page_frames(page_num).expect("VirtIO Impl: alloc page failed");

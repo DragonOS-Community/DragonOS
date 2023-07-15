@@ -1,5 +1,6 @@
 use crate::{
-    arch::interrupt::{cli, sti},
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
     include::bindings::bindings::{io_in8, io_out8},
     syscall::SystemError,
 };
@@ -33,7 +34,7 @@ impl RtcTime {
     ///@return int 成功则为0
     pub fn get(&mut self) -> Result<i32, SystemError> {
         // 为防止中断请求打断该过程，需要先关中断
-        cli();
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         //0x0B
         let status_register_b: u8 = read_cmos(0x0B); // 读取状态寄存器B
         let is_24h: bool = if (status_register_b & 0x02) != 0 {
@@ -81,7 +82,7 @@ impl RtcTime {
             self.hour = ((self.hour & 0x7f) + 12) % 24;
         } // 将十二小时制转为24小时
 
-        sti();
+        drop(irq_guard);
 
         return Ok(0);
     }

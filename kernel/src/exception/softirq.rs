@@ -225,7 +225,7 @@ impl Softirq {
     }
 
     pub fn raise_softirq(&self, softirq_num: SoftirqNumber) {
-        let mut flags = local_irq_save();
+        let flags = local_irq_save();
         let processor_id = smp_get_processor_id() as usize;
 
         cpu_pending(processor_id).insert(VecStatus::from(softirq_num));

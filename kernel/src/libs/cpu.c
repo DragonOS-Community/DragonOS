@@ -120,3 +120,12 @@ uint32_t cpu_get_core_crysral_freq()
 
     return c;
 }
+/**
+ * @brief 获取处理器的tsc频率（单位：hz）
+ *
+ * @return uint64_t
+ */
+uint64_t cpu_get_tsc_freq()
+{
+    return Cpu_tsc_freq;
+}

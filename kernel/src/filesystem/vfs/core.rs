@@ -7,7 +7,7 @@ use core::{
 use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
-    driver::disk::ahci,
+    driver::disk::ahci::{self},
     filesystem::{
         devfs::DevFS,
         fat::fs::FATFileSystem,

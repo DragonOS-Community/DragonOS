@@ -26,7 +26,6 @@ pub fn spin_unlock_irqrestore(lock: *mut spinlock_t, flags: usize) {
     unsafe {
         spin_unlock(lock);
     }
-    // kdebug!("123");
     local_irq_restore(flags);
 }
 

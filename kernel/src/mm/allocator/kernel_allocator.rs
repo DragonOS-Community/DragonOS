@@ -1,8 +1,9 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
     include::bindings::bindings::{gfp_t, kfree, kmalloc, PAGE_2M_SIZE},
+    kdebug,
     libs::align::page_align_up,
-    mm::{gfp::__GFP_ZERO, MMArch, MemoryManagementArch, VirtAddr}, kdebug,
+    mm::{gfp::__GFP_ZERO, MMArch, MemoryManagementArch, VirtAddr},
 };
 
 use core::{

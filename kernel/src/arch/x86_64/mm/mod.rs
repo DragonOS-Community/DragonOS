@@ -26,7 +26,7 @@ use core::ffi::c_void;
 use core::fmt::{Debug, Write};
 use core::mem::{self, MaybeUninit};
 use core::ptr::read_volatile;
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use self::barrier::mfence;
 
@@ -298,7 +298,7 @@ pub fn mm_init() {
     kdebug!("phys[0]=virt[0x{:x}]", unsafe {
         MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
     });
-    
+
     c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // 初始化内存管理器
     unsafe { allocator_init() };
@@ -320,8 +320,11 @@ unsafe fn allocator_init() {
     kdebug!("PhysArea[0..10] = {:?}", &PHYS_MEMORY_AREAS[0..10]);
     let mut bump_allocator =
         BumpAllocator::<X86_64MMArch>::new(&PHYS_MEMORY_AREAS, phy_offset.data());
-    kdebug!("BumpAllocator created, offset={:?}", bump_allocator.offset());
-    
+    kdebug!(
+        "BumpAllocator created, offset={:?}",
+        bump_allocator.offset()
+    );
+
     // 暂存初始在head.S中指定的页表的地址，后面再考虑是否需要把它加到buddy的可用空间里面！
     // 现在不加的原因是，我担心会有安全漏洞问题：这些初始的页表，位于内核的数据段。如果归还到buddy，
     // 可能会产生一定的安全风险（有的代码可能根据虚拟地址来进行安全校验）
@@ -357,8 +360,13 @@ unsafe fn allocator_init() {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
                 let flags = page_flags::<MMArch>(vaddr);
-                if paddr.data() >= 0x1fff0000{
-                    kdebug!("NOTICE: vaddr: {:?}, paddr: {:?}, flags: {:?}", vaddr, paddr, flags);
+                if paddr.data() >= 0x1fff0000 {
+                    kdebug!(
+                        "NOTICE: vaddr: {:?}, paddr: {:?}, flags: {:?}",
+                        vaddr,
+                        paddr,
+                        flags
+                    );
                 }
 
                 let flusher = mapper
@@ -395,8 +403,7 @@ unsafe fn allocator_init() {
 
     kdebug!("bump offset = {:?}", bump_allocator.offset());
     // 初始化buddy_allocator
-    let buddy_allocator =
-        unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
+    let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
 
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
@@ -436,8 +443,6 @@ unsafe fn allocator_init() {
         enable_textui();
     }
     kdebug!("Text UI enabled");
-
-
 }
 
 /// 全局的页帧分配器

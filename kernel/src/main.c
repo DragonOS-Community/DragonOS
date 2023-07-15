@@ -143,39 +143,37 @@ void system_initialize()
 
     rs_clocksource_boot_finish();
 
+    io_mfence();
+    vfs_init();
+    rs_tty_init();
+    io_mfence();
+    // 由于进程管理模块依赖于文件系统，因此必须在文件系统初始化完毕后再初始化进程管理模块
+    // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，
+    // 因此必须在进程管理模块初始化完毕后再初始化smp。
+    process_init();
+
+    cpu_init();
+
+    ps2_keyboard_init();
+    io_mfence();
+
+    pci_init();
+
+    rs_pci_init();
+
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
     io_mfence();
 
-    vfs_init();
-
-    rs_tty_init();
-    while (1)
-    {
-        /* code */
-    }
-    cpu_init();
-    ps2_keyboard_init();
-    // tty_init();
-    // ps2_mouse_init();
-    // ata_init();
-    pci_init();
-    rs_pci_init();
-    io_mfence();
-
-    // test_slab();
-    // test_mm();
-
-    // process_init();
     HPET_init();
+
     io_mfence();
     HPET_measure_freq();
     io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
 
-    process_init();
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
@@ -187,6 +185,10 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
+    while (1)
+    {
+        /* code */
+    }
 
     // 这里不能删除，否则在O1会报错
     // while (1)

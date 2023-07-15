@@ -23,6 +23,7 @@ static uint32_t total_processor_num = 0;
 static int current_starting_cpu = 0;
 
 static int num_cpu_started = 1;
+extern void rs_smp_init_idle();
 
 // 在head.S中定义的，APU启动时，要加载的页表
 // 由于内存管理模块初始化的时候，重置了页表，因此我们要把当前的页表传给APU
@@ -174,6 +175,8 @@ void smp_ap_start()
     current_pcb->state = PROC_RUNNING;
     current_pcb->flags = PF_KTHREAD;
     current_pcb->mm = &initial_mm;
+    current_pcb->address_space = NULL;
+    rs_smp_init_idle();
 
     list_init(&current_pcb->list);
     current_pcb->addr_limit = KERNEL_BASE_LINEAR_ADDR;
@@ -199,6 +202,7 @@ void smp_ap_start()
     preempt_disable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count
     io_mfence();
     current_pcb->flags |= PF_NEED_SCHED;
+
     sti();
     apic_timer_ap_core_init();
     sched();

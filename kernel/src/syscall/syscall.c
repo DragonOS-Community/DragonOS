@@ -74,68 +74,6 @@ ul do_put_string(char *s, uint32_t front_color, uint32_t background_color)
 }
 
 /**
- * @brief 将堆内存调整为arg0
- *
- * @param arg0 新的堆区域的结束地址
- * @return uint64_t 错误码
- *
- */
-uint64_t sys_do_brk(uint64_t newaddr)
-{
-    uint64_t new_brk = PAGE_2M_ALIGN(newaddr);
-    // kdebug("sys_brk input= %#010lx ,  new_brk= %#010lx bytes current_pcb->mm->brk_start=%#018lx
-    // current->end_brk=%#018lx", regs->r8, new_brk, current_pcb->mm->brk_start, current_pcb->mm->brk_end);
-    struct mm_struct *mm = current_pcb->mm;
-    if (new_brk < mm->brk_start || new_brk > new_brk >= current_pcb->addr_limit)
-        return mm->brk_end;
-
-    if (mm->brk_end == new_brk)
-        return new_brk;
-
-    int64_t offset;
-    if (new_brk >= current_pcb->mm->brk_end)
-        offset = (int64_t)(new_brk - current_pcb->mm->brk_end);
-    else
-        offset = -(int64_t)(current_pcb->mm->brk_end - new_brk);
-
-    new_brk = mm_do_brk(current_pcb->mm->brk_end, offset); // 扩展堆内存空间
-
-    current_pcb->mm->brk_end = new_brk;
-    return mm->brk_end;
-}
-
-/**
- * @brief 将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
- *
- * @param incr offset偏移量
- * @return uint64_t the previous program break
- */
-uint64_t sys_do_sbrk(int64_t incr)
-{
-    uint64_t retval = current_pcb->mm->brk_end;
-    if ((int64_t)incr > 0)
-    {
-
-        uint64_t new_brk = PAGE_2M_ALIGN(retval + incr);
-        if (new_brk > current_pcb->addr_limit) // 堆地址空间超过限制
-        {
-            kdebug("exceed mem limit, new_brk = %#018lx", new_brk);
-            return -ENOMEM;
-        }
-    }
-    else
-    {
-        if ((__int128_t)current_pcb->mm->brk_end + (__int128_t)incr < current_pcb->mm->brk_start)
-            return retval;
-    }
-    // kdebug("do brk");
-    uint64_t new_brk = mm_do_brk(current_pcb->mm->brk_end, (int64_t)incr); // 调整堆内存空间
-    // kdebug("do brk done, new_brk = %#018lx", new_brk);
-    current_pcb->mm->brk_end = new_brk;
-    return retval;
-}
-
-/**
  * @brief 执行新的程序
  *
  * @param user_path(r8寄存器) 文件路径

@@ -138,7 +138,8 @@ impl Iterator for VirtPageFrameIter {
         if unlikely(self.current == self.end) {
             return None;
         }
-        let current: VirtPageFrame = self.current.next();
+        let current: VirtPageFrame = self.current;
+        self.current = self.current.next_by(1);
         return Some(current);
     }
 }
@@ -316,7 +317,7 @@ impl<T: FrameAllocator> FrameAllocator for &mut T {
 /// @brief 从全局的页帧分配器中分配连续count个页帧
 ///
 /// @param count 请求分配的页帧数量
-pub fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
     let frame = unsafe { LockedFrameAllocator.allocate(count)? };
     return Some(frame);
 }
@@ -324,8 +325,8 @@ pub fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFram
 /// @brief 向全局页帧分配器释放连续count个页帧
 ///
 /// @param frame 要释放的第一个页帧
-/// @param count 要释放的页帧数量
-pub fn deallocate_page_frames(frame: PhysPageFrame, count: PageFrameCount) {
+/// @param count 要释放的页帧数量 (必须是2的n次幂)
+pub unsafe fn deallocate_page_frames(frame: PhysPageFrame, count: PageFrameCount) {
     unsafe {
         LockedFrameAllocator.free(frame.phys_address(), count);
     }

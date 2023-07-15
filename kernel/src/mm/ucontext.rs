@@ -11,6 +11,7 @@ use hashbrown::HashSet;
 
 use crate::{
     arch::{asm::current::current_pcb, mm::PageMapper, MMArch},
+    kdebug,
     libs::{
         align::page_align_up,
         rwlock::RwLock,
@@ -56,17 +57,10 @@ impl AddressSpace {
     }
 
     /// 从pcb中获取当前进程的地址空间结构体的Arc指针
-    ///
-    /// todo: 进程管理重构后，应该修改这个函数
     pub fn current() -> Result<Arc<AddressSpace>, SystemError> {
-        let ptr = current_pcb().address_space as *const AddressSpace;
-        if ptr.is_null() {
-            panic!("Current process has no address space");
-        }
-        // 为了防止pcb中的指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
-        let arc_wrapper = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
-
-        let result = Arc::clone(&arc_wrapper);
+        let result = current_pcb()
+            .address_space()
+            .expect("Current process has no address space");
         return Ok(result);
     }
 
@@ -127,7 +121,7 @@ impl InnerAddressSpace {
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
         };
-
+        kdebug!("to create user stack.");
         result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
 
         return Ok(result);
@@ -230,9 +224,10 @@ impl InnerAddressSpace {
                 Some(VirtAddr::new(addr))
             }
         };
-
-        let len = page_align_up(len + start_vaddr.data() & MMArch::PAGE_OFFSET_MASK);
-
+        kdebug!("map_anonymous: start_vaddr = {:?}", start_vaddr);
+        kdebug!("map_anonymous: len(no align) = {}", len);
+        let len = page_align_up(len);
+        kdebug!("map_anonymous: len = {}", len);
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
             PageFrameCount::from_bytes(len).unwrap(),
@@ -370,6 +365,11 @@ impl InnerAddressSpace {
         page_count: PageFrameCount,
         prot_flags: ProtFlags,
     ) -> Result<(), SystemError> {
+        kdebug!(
+            "mprotect: start_page: {:?}, page_count: {:?}, prot_flags:{prot_flags:?}",
+            start_page,
+            page_count
+        );
         let (mut active, mut inactive);
         let mut flusher = if self.is_current() {
             active = PageFlushAll::new();
@@ -381,22 +381,26 @@ impl InnerAddressSpace {
 
         let mapper = &mut self.user_mapper.utable;
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        kdebug!("mprotect: region: {:?}", region);
 
         let regions = self.mappings.conflicts(region).collect::<Vec<_>>();
-
+        kdebug!("mprotect: regions: {:?}", regions);
         for r in regions {
+            kdebug!("mprotect: r: {:?}", r);
             let r = r.lock().region().clone();
             let r = self.mappings.remove_vma(&r).unwrap();
-
+            kdebug!("11");
             let intersection = r.lock().region().intersect(&region).unwrap();
             let (before, r, after) = r.extract(intersection).expect("Failed to extract VMA");
 
+            kdebug!("22");
             if let Some(before) = before {
                 self.mappings.insert_vma(before);
             }
             if let Some(after) = after {
                 self.mappings.insert_vma(after);
             }
+            kdebug!("33");
 
             let mut r_guard = r.lock();
             // 如果VMA的保护标志不允许指定的修改，则返回错误
@@ -406,14 +410,17 @@ impl InnerAddressSpace {
                 return Err(SystemError::EACCES);
             }
 
+            kdebug!("44");
             let new_flags: PageFlags<MMArch> = r_guard
                 .flags()
                 .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
                 .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
 
+            kdebug!("55");
             r_guard.remap(new_flags, mapper, &mut flusher)?;
             drop(r_guard);
             self.mappings.insert_vma(r);
+            kdebug!("66");
         }
 
         return Ok(());
@@ -472,10 +479,10 @@ impl Drop for UserMapper {
         }
         // 释放用户空间顶层页表占用的页帧
         // 请注意，在释放这个页帧之前，用户页表应该已经被完全释放，否则会产生内存泄露
-        deallocate_page_frames(
+        unsafe { deallocate_page_frames(
             PhysPageFrame::new(self.utable.table().phys()),
             PageFrameCount::new(1),
-        );
+        ) };
     }
 }
 
@@ -751,7 +758,7 @@ impl LockedVMA {
 
             // 目前由于还没有实现共享页，所以直接释放物理页也没问题。
             // 但是在实现共享页之后，就不能直接释放物理页了，需要在anon_vma链表长度为0的时候才能释放物理页
-            deallocate_page_frames(PhysPageFrame::new(paddr), PageFrameCount::new(1));
+            unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), PageFrameCount::new(1)) };
 
             flusher.consume(flush);
         }
@@ -884,6 +891,7 @@ impl VMA {
     ) -> Result<(), SystemError> {
         assert!(self.mapped);
         for page in self.region.pages() {
+            kdebug!("remap page {:?}", page.virt_address());
             // 暂时要求所有的页帧都已经映射到页表
             // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
             let r = unsafe {
@@ -891,7 +899,9 @@ impl VMA {
                     .remap(page.virt_address(), flags)
                     .expect("Failed to remap, beacuse of some page is not mapped")
             };
+            kdebug!("consume page {:?}", page.virt_address());
             flusher.consume(r);
+            kdebug!("remap page {:?} done", page.virt_address());
         }
         self.flags = flags;
         return Ok(());
@@ -1060,6 +1070,11 @@ impl UserStack {
 
         let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
         let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+        kdebug!(
+            "map anonymous stack: {:?} {}",
+            actual_stack_bottom,
+            guard_size
+        );
         vm.map_anonymous(
             actual_stack_bottom,
             guard_size,
@@ -1067,18 +1082,24 @@ impl UserStack {
             map_flags,
             false,
         )?;
-        // 清空保护页
-        unsafe {
-            let p = actual_stack_bottom.data() as *mut u8;
-            p.write_bytes(0, guard_size);
-        }
+
         // 设置保护页只读
         prot_flags.remove(ProtFlags::PROT_WRITE);
+        kdebug!(
+            "to mprotect stack guard pages: {:?} {}",
+            actual_stack_bottom,
+            guard_size
+        );
         vm.mprotect(
             VirtPageFrame::new(actual_stack_bottom),
             PageFrameCount::new(Self::GUARD_PAGES_NUM),
             prot_flags,
         )?;
+        kdebug!(
+            "mprotect stack guard pages done: {:?} {}",
+            actual_stack_bottom,
+            guard_size
+        );
 
         let mut user_stack = UserStack {
             stack_bottom: actual_stack_bottom,
@@ -1086,9 +1107,10 @@ impl UserStack {
             current_sp: actual_stack_bottom,
         };
 
+        kdebug!("expand user stack: {:?} {}", stack_bottom, stack_size);
         // 分配用户栈
         user_stack.expand(vm, stack_size)?;
-
+        kdebug!("user stack created: {:?} {}", stack_bottom, stack_size);
         return Ok(user_stack);
     }
 

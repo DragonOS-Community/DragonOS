@@ -3,7 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{kdebug, kerror, kinfo, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{kerror, kinfo, libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},

@@ -140,7 +140,9 @@ fn tmp_rs_execve(
     let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
     let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
 
-    // 释放原来的用户地址空间
+    // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
+    let old_address_space = current_pcb().address_space();
+    // 在pcb中原来的用户地址空间
     unsafe {
         current_pcb().drop_address_space();
     }
@@ -161,6 +163,8 @@ fn tmp_rs_execve(
             address_space.read().user_mapper.utable.table().phys(),
         )
     };
+
+    drop(old_address_space);
 
     let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
     // 加载可执行文件

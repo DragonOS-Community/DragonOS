@@ -20,7 +20,7 @@ use super::{
     kernel_mapper::KernelMapper,
     no_init::pseudo_map_phys,
     page::{PageFlags, PageMapper},
-    MemoryManagementArch, PhysAddr, VirtAddr,
+    MemoryManagementArch, PhysAddr, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE,
 };
 
 lazy_static! {
@@ -65,7 +65,6 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
         vaddr += MMArch::PAGE_SIZE;
         paddr += MMArch::PAGE_SIZE;
     }
-    c_uart_send(0x3f8, 'F' as u8);
 }
 
 #[no_mangle]

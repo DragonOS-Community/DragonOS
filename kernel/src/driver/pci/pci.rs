@@ -3,11 +3,12 @@
 
 use super::pci_irq::{IrqType, PciIrqError};
 use crate::arch::{PciArch, TraitPciArch};
-use crate::include::bindings::bindings::{
-    initial_mm, mm_map, mm_struct, PAGE_2M_SIZE, VM_DONTCOPY, VM_IO,
-};
+use crate::include::bindings::bindings::{  PAGE_2M_SIZE, VM_DONTCOPY, VM_IO};
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::mmio_buddy::mmio_pool;
+use crate::mm::page::PageFlags;
+use crate::mm::{PhysAddr, VirtAddr};
 use crate::{kdebug, kerror, kinfo, kwarn};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
@@ -634,7 +635,6 @@ impl PciRoot {
         let virtsize_ptr = &mut virtsize as *mut u64;
         let size = bus_number_double * PAGE_2M_SIZE;
         unsafe {
-            let initial_mm_ptr = &mut initial_mm as *mut mm_struct;
             if let Err(_) = mmio_pool().create_mmio(
                 size as usize,
                 (VM_IO | VM_DONTCOPY) as u64,
@@ -644,13 +644,17 @@ impl PciRoot {
                 kerror!("Create mmio failed when initing ecam");
                 return Err(PciError::CreateMmioError);
             };
+
             //kdebug!("virtaddress={:#x},virtsize={:#x}",virtaddress,virtsize);
-            mm_map(
-                initial_mm_ptr,
-                virtaddress,
-                size as u64,
-                self.physical_address_base,
-            );
+            let vaddr = VirtAddr::new(virtaddress as usize);
+            let paddr = PhysAddr::new(self.physical_address_base as usize);
+            let page_flags = PageFlags::new().set_write(true).set_execute(true);
+            let mut kernel_mapper = KernelMapper::lock();
+            // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
+            assert!(kernel_mapper
+                .map_phys_with_size(vaddr, paddr, size as usize, page_flags, true)
+                .is_ok());
+            drop(kernel_mapper);
         }
         self.mmio_base = Some(virtaddress as *mut u32);
         Ok(0)
@@ -1414,7 +1418,6 @@ pub fn pci_bar_init(
                 let vaddr_ptr = &mut virtaddress as *mut u64;
                 let mut virtsize: u64 = 0;
                 let virtsize_ptr = &mut virtsize as *mut u64;
-                let initial_mm_ptr = &mut initial_mm as *mut mm_struct;
                 //kdebug!("size want={:#x}", size);
                 if let Err(_) = mmio_pool().create_mmio(
                     size as usize,
@@ -1426,7 +1429,16 @@ pub fn pci_bar_init(
                     return Err(PciError::CreateMmioError);
                 };
                 //kdebug!("virtaddress={:#x},virtsize={:#x}",virtaddress,virtsize);
-                mm_map(initial_mm_ptr, virtaddress, size as u64, address);
+
+                let vaddr = VirtAddr::new(virtaddress as usize);
+                let paddr = PhysAddr::new(address as usize);
+                let page_flags = PageFlags::new().set_write(true).set_execute(true);
+                let mut kernel_mapper = KernelMapper::lock();
+                // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
+                assert!(kernel_mapper
+                    .map_phys_with_size(vaddr, paddr, size as usize, page_flags, true)
+                    .is_ok());
+                drop(kernel_mapper);
             }
             bar_info = BarInfo::Memory {
                 address_type,

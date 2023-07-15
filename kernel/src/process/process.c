@@ -196,13 +196,15 @@ ul initial_kernel_thread(ul arg)
 {
     kinfo("initial proc running...\targ:%#018lx, vruntime=%d", arg, current_pcb->virtual_runtime);
     int val = 0;
-    while(1);
     val = scm_enable_double_buffer();
     rs_init_stdio();
     // block_io_scheduler_init();
     ahci_init();
     mount_root_fs();
+    io_mfence();
     rs_virtio_probe();
+    io_mfence();
+    while(1);
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);
@@ -348,10 +350,14 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
  * @brief 初始化进程模块
  * ☆前置条件：已完成系统调用模块的初始化
  */
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 void process_init()
 {
     kinfo("Initializing process...");
+    io_mfence();
     rs_process_init();
+    io_mfence();
 
     initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
 
@@ -384,6 +390,7 @@ void process_init()
     // 将IDLE进程的虚拟运行时间设置为一个很大的数值
     current_pcb->virtual_runtime = (1UL << 60);
 }
+#pragma GCC pop_options
 
 /**
  * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL

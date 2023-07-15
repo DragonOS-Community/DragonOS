@@ -1,6 +1,6 @@
 /// 为virtio-drivers库提供的操作系统接口
 use crate::include::bindings::bindings::{
-    alloc_pages, free_pages, memory_management_struct, Page, PAGE_2M_SHIFT, PAGE_2M_SIZE,
+    memory_management_struct, Page, PAGE_2M_SHIFT, PAGE_2M_SIZE,
     PAGE_OFFSET, PAGE_SHARED, ZONE_NORMAL,
 };
 

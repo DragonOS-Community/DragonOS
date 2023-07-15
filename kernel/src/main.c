@@ -150,7 +150,9 @@ void system_initialize()
     // 由于进程管理模块依赖于文件系统，因此必须在文件系统初始化完毕后再初始化进程管理模块
     // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，
     // 因此必须在进程管理模块初始化完毕后再初始化smp。
+    io_mfence();
     process_init();
+    io_mfence();
 
     cpu_init();
 

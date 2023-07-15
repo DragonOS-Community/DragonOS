@@ -68,26 +68,6 @@ impl Debug for X86_64MMBootstrapInfo {
 
 pub static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
 
-/// @brief 切换进程的页表
-///
-/// @param 下一个进程的pcb。将会把它的页表切换进来。
-///
-/// @return 下一个进程的pcb(把它return的目的主要是为了归还所有权)
-#[inline(always)]
-#[allow(dead_code)]
-pub fn switch_mm(
-    next_pcb: &'static mut process_control_block,
-) -> &'static mut process_control_block {
-    mfence();
-    // kdebug!("to get pml4t");
-    let pml4t = unsafe { read_volatile(&next_pcb.mm.as_ref().unwrap().pgd) };
-
-    unsafe {
-        asm!("mov cr3, {}", in(reg) pml4t);
-    }
-    mfence();
-    return next_pcb;
-}
 
 /// @brief X86_64的内存管理架构结构体
 #[derive(Debug, Clone, Copy, Hash)]
@@ -167,25 +147,33 @@ impl MemoryManagementArch for X86_64MMArch {
 
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
     unsafe fn invalidate_page(address: VirtAddr) {
-        asm!("invlpg [{0}]", in(reg) address.data());
+        compiler_fence(Ordering::SeqCst);
+        asm!("invlpg [{0}]", in(reg) address.data(), options(nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
     }
-
+    
     /// @brief 刷新TLB中，所有的条目
     unsafe fn invalidate_all() {
+        compiler_fence(Ordering::SeqCst);
         // 通过设置cr3寄存器，来刷新整个TLB
         Self::set_table(PageTableKind::User, Self::table(PageTableKind::User));
+        compiler_fence(Ordering::SeqCst);
     }
-
+    
     /// @brief 获取顶级页表的物理地址
     unsafe fn table(_table_kind: PageTableKind) -> PhysAddr {
         let paddr: usize;
-        asm!("mov {0}, cr3", out(reg) paddr);
+        compiler_fence(Ordering::SeqCst);
+        asm!("mov {}, cr3", out(reg) paddr, options(nomem, nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
         return PhysAddr::new(paddr);
     }
-
+    
     /// @brief 设置顶级页表的物理地址到处理器中
     unsafe fn set_table(_table_kind: PageTableKind, table: PhysAddr) {
-        asm!("mov cr3, {0}", in(reg) table.data());
+        compiler_fence(Ordering::SeqCst);
+        asm!("mov cr3, {}", in(reg) table.data(), options(nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// @brief 判断虚拟地址是否合法
@@ -360,7 +348,7 @@ unsafe fn allocator_init() {
             for i in 0..area.size / MMArch::PAGE_SIZE {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
-                let flags = page_flags::<MMArch>(vaddr);
+                let flags = kernel_page_flags::<MMArch>(vaddr);
                 if paddr.data() >= 0x1fff0000 {
                     kdebug!(
                         "NOTICE: vaddr: {:?}, paddr: {:?}, flags: {:?}",
@@ -467,7 +455,8 @@ impl FrameAllocator for LockedFrameAllocator {
     }
 }
 
-unsafe fn page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
+/// 获取内核地址默认的页面标志
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
@@ -507,7 +496,7 @@ impl LowAddressRemapping {
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
-            let flags = page_flags::<MMArch>(vaddr);
+            let flags = kernel_page_flags::<MMArch>(vaddr);
 
             let flusher = mapper
                 .map_phys(vaddr, paddr, flags)

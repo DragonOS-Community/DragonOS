@@ -3,7 +3,7 @@
 
 use super::pci_irq::{IrqType, PciIrqError};
 use crate::arch::{PciArch, TraitPciArch};
-use crate::include::bindings::bindings::{  PAGE_2M_SIZE, VM_DONTCOPY, VM_IO};
+use crate::include::bindings::bindings::{PAGE_2M_SIZE, VM_DONTCOPY, VM_IO};
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::mmio_buddy::mmio_pool;
@@ -648,7 +648,12 @@ impl PciRoot {
             //kdebug!("virtaddress={:#x},virtsize={:#x}",virtaddress,virtsize);
             let vaddr = VirtAddr::new(virtaddress as usize);
             let paddr = PhysAddr::new(self.physical_address_base as usize);
-            let page_flags = PageFlags::new().set_write(true).set_execute(true);
+            kdebug!("pci root: map: vaddr={vaddr:?}, paddr={paddr:?}, size={size}");
+            let page_flags = PageFlags::new()
+                .set_write(true)
+                .set_execute(true)
+                .set_page_cache_disable(true)
+                .set_page_write_through(true);
             let mut kernel_mapper = KernelMapper::lock();
             // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
             assert!(kernel_mapper
@@ -1418,9 +1423,11 @@ pub fn pci_bar_init(
                 let vaddr_ptr = &mut virtaddress as *mut u64;
                 let mut virtsize: u64 = 0;
                 let virtsize_ptr = &mut virtsize as *mut u64;
-                //kdebug!("size want={:#x}", size);
+
+                let size_want = size as usize;
+
                 if let Err(_) = mmio_pool().create_mmio(
-                    size as usize,
+                    size_want,
                     (VM_IO | VM_DONTCOPY) as u64,
                     vaddr_ptr,
                     virtsize_ptr,
@@ -1429,14 +1436,18 @@ pub fn pci_bar_init(
                     return Err(PciError::CreateMmioError);
                 };
                 //kdebug!("virtaddress={:#x},virtsize={:#x}",virtaddress,virtsize);
-
                 let vaddr = VirtAddr::new(virtaddress as usize);
                 let paddr = PhysAddr::new(address as usize);
-                let page_flags = PageFlags::new().set_write(true).set_execute(true);
+                let page_flags = PageFlags::new()
+                    .set_write(true)
+                    .set_execute(true)
+                    .set_page_cache_disable(true)
+                    .set_page_write_through(true);
+                kdebug!("Pci bar init: vaddr={vaddr:?}, paddr={paddr:?}, size_want={size_want}, page_flags={page_flags:?}");
                 let mut kernel_mapper = KernelMapper::lock();
                 // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
                 assert!(kernel_mapper
-                    .map_phys_with_size(vaddr, paddr, size as usize, page_flags, true)
+                    .map_phys_with_size(vaddr, paddr, size_want, page_flags, true)
                     .is_ok());
                 drop(kernel_mapper);
             }

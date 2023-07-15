@@ -1,3 +1,4 @@
+use crate::arch::mm::kernel_page_flags;
 /// 为virtio-drivers库提供的操作系统接口
 use crate::include::bindings::bindings::{
     memory_management_struct, Page, PAGE_2M_SHIFT, PAGE_2M_SIZE,
@@ -5,6 +6,9 @@ use crate::include::bindings::bindings::{
 };
 
 use crate::arch::MMArch;
+use crate::kdebug;
+use crate::mm::kernel_mapper::KernelMapper;
+use crate::mm::page::PageFlags;
 use crate::mm::{
     allocator::page_frame::{
         allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
@@ -29,10 +33,16 @@ unsafe impl Hal for HalImpl {
         unsafe {
             let (paddr, _count) =
                 allocate_page_frames(page_num).expect("VirtIO Impl: alloc page failed");
-
+            let virt = MMArch::phys_2_virt(paddr).unwrap();
+            let dma_flags:PageFlags<MMArch>  = PageFlags::mmio_flags();
+            kdebug!("dma alloc: page num={page_num:?}, paddr={paddr:?}, page actual count={_count:?}");
+            let mut kernel_mapper = KernelMapper::lock();
+            let kernel_mapper = kernel_mapper.as_mut().unwrap();
+            let flusher = kernel_mapper.remap(virt, dma_flags).expect("VirtIO Impl: remap failed");
+            flusher.flush();
             return (
                 paddr.data(),
-                NonNull::new(MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).unwrap(),
+                NonNull::new(MMArch::phys_2_virt(paddr).unwrap().data() as _).unwrap(),
             );
         }
     }
@@ -41,12 +51,20 @@ unsafe impl Hal for HalImpl {
     /// @return i32 0表示成功
     unsafe fn dma_dealloc(
         paddr: virtio_drivers::PhysAddr,
-        _vaddr: NonNull<u8>,
+        vaddr: NonNull<u8>,
         pages: usize,
     ) -> i32 {
         let page_count = PageFrameCount::new(
             ((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two(),
         );
+
+        // 恢复页面属性
+        let vaddr = VirtAddr::new(vaddr.as_ptr() as *mut u8 as usize);
+        let mut kernel_mapper = KernelMapper::lock();
+        let kernel_mapper = kernel_mapper.as_mut().unwrap();
+        let flusher = kernel_mapper.remap(vaddr, kernel_page_flags(vaddr)).expect("VirtIO Impl: remap failed");
+        flusher.flush();
+        
         unsafe {
             deallocate_page_frames(PhysPageFrame::new(PhysAddr::new(paddr)), page_count);
         }

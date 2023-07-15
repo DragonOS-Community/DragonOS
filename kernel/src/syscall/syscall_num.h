@@ -51,9 +51,10 @@
 #define SYS_LISTEN 38      // 监听一个socket
 #define SYS_SHUTDOWN 39    // 关闭socket
 #define SYS_ACCEPT 40      // 接受一个socket连接
+
 #define SYS_GETSOCKNAME 41 // 获取socket的名字
 #define SYS_GETPEERNAME 42 // 获取socket的对端名字
-
+#define SYS_GETTIMEOFDAY 43 // 获取当前时间
 #define SYS_MMAP 44   // 内存映射
 #define SYS_MUNMAP 45 // 内存解除映射
 #define SYS_MPROTECT 46 // 内存保护

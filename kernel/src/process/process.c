@@ -17,7 +17,6 @@
 #include <debug/bug.h>
 #include <debug/traceback/traceback.h>
 #include <driver/disk/ahci/ahci.h>
-#include <driver/usb/usb.h>
 #include <driver/video/video.h>
 #include <driver/virtio/virtio.h>
 #include <exception/gate.h>
@@ -864,7 +863,8 @@ void process_exit_thread(struct process_control_block *pcb)
 int process_release_pcb(struct process_control_block *pcb)
 {
     // 释放子进程的页表
-    process_exit_mm(pcb);
+    // BUG 暂时注释process_exit_mm
+    // process_exit_mm(pcb);
     if ((pcb->flags & PF_KTHREAD)) // 释放内核线程的worker private结构体
         free_kthread_struct(pcb);
 

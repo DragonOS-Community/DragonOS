@@ -115,7 +115,6 @@ impl MmioBuddyMemPool {
     ///
     /// @return Err(SystemError) 返回错误码
     fn give_back_block(&self, vaddr: VirtAddr, exp: u32) -> Result<i32, SystemError> {
-
         // 确保内存对齐，低位都要为0
         if (vaddr.data() & ((1 << exp) - 1)) != 0 {
             return Err(SystemError::EINVAL);
@@ -123,7 +122,6 @@ impl MmioBuddyMemPool {
         let region: MmioBuddyAddrRegion = self.create_region(vaddr);
         // 加入buddy
         let mut list_guard = self.free_regions[exp2index(exp)].lock();
-        
 
         self.push_block(region, &mut list_guard);
         return Ok(0);

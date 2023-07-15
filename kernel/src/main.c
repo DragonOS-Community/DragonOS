@@ -30,7 +30,6 @@
 #include "driver/pci/pci.h"
 #include <driver/timers/HPET/HPET.h>
 #include <driver/uart/uart.h>
-#include <driver/usb/usb.h>
 #include <driver/video/video.h>
 #include <time/timer.h>
 
@@ -52,7 +51,8 @@ void reload_gdt()
     gdtp.size = bsp_gdt_size - 1;
     gdtp.gdt_vaddr = (ul)phys_2_virt((ul)&GDT_Table);
 
-    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp) : "memory");
+    asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp)
+                 : "memory");
 }
 
 void reload_idt()
@@ -63,7 +63,8 @@ void reload_idt()
     // kdebug("gdtvaddr=%#018lx", p.gdt_vaddr);
     // kdebug("gdt size=%d", p.size);
 
-    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp) : "memory");
+    asm volatile("lidt (%0)   \n\t" ::"r"(&idtp)
+                 : "memory");
 }
 
 // 初始化系统各模块
@@ -131,15 +132,21 @@ while (1)
 
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
-    // 先初始化系统调用模块
+    
     syscall_init();
 
     io_mfence();
-    //  再初始化进程模块。顺序不能调转
-    // sched_init();
+
+    rs_timekeeping_init();
     io_mfence();
 
     rs_timer_init();
+    io_mfence();
+
+    rs_jiffies_init();
+    io_mfence();
+
+    rs_clocksource_boot_finish();
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();

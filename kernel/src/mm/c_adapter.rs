@@ -53,13 +53,12 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
     let mut kernel_mapper = kernel_mapper.as_mut();
     assert!(kernel_mapper.is_some());
     for i in 0..count.data() {
-        
         let flusher = kernel_mapper
             .as_mut()
             .unwrap()
             .map_phys(vaddr, paddr, page_flags)
             .unwrap();
-        
+
         flusher.flush();
 
         vaddr += MMArch::PAGE_SIZE;

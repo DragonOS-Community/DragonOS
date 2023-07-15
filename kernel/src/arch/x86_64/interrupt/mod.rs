@@ -48,7 +48,7 @@ impl InterruptArch for X86_64InterruptArch {
 
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard {
         compiler_fence(Ordering::SeqCst);
-        let rflags=local_irq_save();
+        let rflags = local_irq_save();
         let flags = IrqFlags::new(rflags);
         let guard = IrqFlagsGuard::new(flags);
         compiler_fence(Ordering::SeqCst);

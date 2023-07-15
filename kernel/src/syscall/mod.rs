@@ -18,7 +18,10 @@ use crate::{
     libs::align::page_align_up,
     mm::{MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    time::TimeSpec,
+    time::{
+        syscall::{PosixTimeZone, PosixTimeval, SYS_TIMEZONE},
+        TimeSpec,
+    },
 };
 
 pub mod user_access;
@@ -358,7 +361,7 @@ pub const SYS_ACCEPT: usize = 40;
 
 pub const SYS_GETSOCKNAME: usize = 41;
 pub const SYS_GETPEERNAME: usize = 42;
-
+pub const SYS_GETTIMEOFDAY: usize = 43;
 pub const SYS_MMAP: usize = 44;
 pub const SYS_MUNMAP: usize = 45;
 pub const SYS_MPROTECT: usize = 46;
@@ -875,6 +878,43 @@ impl Syscall {
             SYS_GETPEERNAME => {
                 Self::getpeername(args[0], args[1] as *mut SockAddr, args[2] as *mut u32)
             }
+            SYS_GETTIMEOFDAY => {
+                let timeval = args[0] as *mut PosixTimeval;
+                let timezone_ptr = args[1] as *const PosixTimeZone;
+                let security_check = || {
+                    if unsafe {
+                        verify_area(timeval as u64, core::mem::size_of::<PosixTimeval>() as u64)
+                    } == false
+                    {
+                        return Err(SystemError::EFAULT);
+                    }
+                    if unsafe {
+                        verify_area(
+                            timezone_ptr as u64,
+                            core::mem::size_of::<PosixTimeZone>() as u64,
+                        )
+                    } == false
+                    {
+                        return Err(SystemError::EFAULT);
+                    }
+                    return Ok(());
+                };
+                let r = security_check();
+                if r.is_err() {
+                    Err(r.unwrap_err())
+                } else {
+                    let timezone = if !timezone_ptr.is_null() {
+                        &SYS_TIMEZONE
+                    } else {
+                        unsafe { timezone_ptr.as_ref().unwrap() }
+                    };
+                    if !timeval.is_null() {
+                        Self::gettimeofday(timeval, timezone)
+                    } else {
+                        Err(SystemError::EFAULT)
+                    }
+                }
+            }
             SYS_MMAP => {
                 let len = page_align_up(args[1]);
                 if unsafe { !verify_area(args[0] as u64, len as u64) } {
@@ -910,6 +950,7 @@ impl Syscall {
                     Self::mprotect(VirtAddr::new(addr), len, args[2])
                 }
             }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

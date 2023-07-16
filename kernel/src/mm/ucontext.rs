@@ -994,12 +994,19 @@ impl VMA {
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<Arc<LockedVMA>, SystemError> {
-        let mut cur_dest = destination;
+        let mut cur_dest: VirtPageFrame = destination;
+        kdebug!(
+            "VMA::zeroed: page_count = {:?}, destination={destination:?}",
+            page_count
+        );
         for _ in 0..page_count.data() {
+            // kdebug!(
+            //     "VMA::zeroed: cur_dest={cur_dest:?}, vaddr = {:?}",
+            //     cur_dest.virt_address()
+            // );
             let r = unsafe { mapper.map(cur_dest.virt_address(), flags) }
                 .expect("Failed to map zero, may be OOM error");
             // todo: 将VMA加入到anon_vma中
-
             // todo: 增加OOM处理
 
             // 刷新TLB
@@ -1114,7 +1121,7 @@ impl UserStack {
         let mut user_stack = UserStack {
             stack_bottom: actual_stack_bottom,
             mapped_size: guard_size,
-            current_sp: actual_stack_bottom,
+            current_sp: actual_stack_bottom - guard_size,
         };
 
         kdebug!("expand user stack: {:?} {}", stack_bottom, stack_size);

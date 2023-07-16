@@ -1,4 +1,4 @@
-use core::ffi::c_void;
+use core::{ffi::c_void, panic};
 
 use alloc::{string::String, vec::Vec};
 
@@ -9,7 +9,7 @@ use crate::{
         pt_regs, set_system_trap_gate, CLONE_FS, CLONE_SIGNAL, CLONE_VM, USER_CS, USER_DS,
     },
     ipc::signal::sys_rt_sigreturn,
-    kinfo,
+    kdebug, kinfo,
     mm::{ucontext::AddressSpace, verify_area, MemoryManagementArch, VirtAddr},
     process::exec::{load_binary_file, ExecParam, ExecParamFlags},
     syscall::{
@@ -86,18 +86,17 @@ pub extern "C" fn syscall_handler(regs: &mut pt_regs) -> () {
             {
                 syscall_return!(SystemError::EFAULT.to_posix_errno() as u64, regs);
             } else {
-                syscall_return!(
-                    tmp_rs_execve(
-                        path_ptr as *const u8,
-                        argv_ptr as *const *const u8,
-                        env_ptr as *const *const u8,
-                        regs,
-                    )
-                    .map(|_| 0)
-                    .map_err(|e| e.to_posix_errno() as u64)
-                    .unwrap_or_else(|e| e),
-                    regs
-                );
+                unsafe {
+                    syscall_return!(
+                        rs_do_execve(
+                            path_ptr as *const u8,
+                            argv_ptr as *const *const u8,
+                            env_ptr as *const *const u8,
+                            regs
+                        ),
+                        regs
+                    );
+                }
             }
         }
 
@@ -119,27 +118,66 @@ pub fn arch_syscall_init() -> Result<(), SystemError> {
     return Ok(());
 }
 
-/// 临时的execve系统调用实现，以后要把它改为普通的系统调用。
-///
-/// 现在放在这里的原因是，还没有重构中断管理模块，未实现TrapFrame这个抽象，
-/// 导致我们必须手动设置中断返回时，各个寄存器的值，这个过程很繁琐，所以暂时放在这里。
-fn tmp_rs_execve(
+#[no_mangle]
+pub unsafe extern "C" fn rs_do_execve(
     path: *const u8,
     argv: *const *const u8,
     envp: *const *const u8,
     regs: &mut pt_regs,
-) -> Result<(), SystemError> {
-    if path.is_null() || argv.is_null() || envp.is_null() {
-        return Err(SystemError::EFAULT);
+) -> usize {
+    if path.is_null() {
+        return SystemError::EINVAL.to_posix_errno() as usize;
     }
 
     kinfo!("path: {:p}\n", path);
     kinfo!("argv: {:p}\n", argv);
     kinfo!("envp: {:p}\n", envp);
-    let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-    let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
-    let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
+    let x = || {
+        let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
+        let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
+        Ok((path, argv, envp))
+    };
+    let r: Result<(String, Vec<String>, Vec<String>), SystemError> = x();
+    if let Err(e) = r {
+        panic!("Failed to execve: {:?}", e);
+    }
+    let (path, argv, envp) = r.unwrap();
 
+    return tmp_rs_execve(path, argv, envp, regs)
+        .map(|_| 0)
+        .unwrap_or_else(|e| e.to_posix_errno() as usize);
+}
+
+/// 执行第一个用户进程的函数（只应该被调用一次）
+///
+/// 当进程管理重构完成后，这个函数应该被删除。调整为别的函数。
+#[no_mangle]
+pub extern "C" fn rs_exec_init_process(regs: &mut pt_regs) -> usize {
+    let path = String::from("/bin/shell.elf");
+    let argv = vec![String::from("/bin/shell.elf")];
+    let envp = vec![String::from("PATH=/bin")];
+    let r = tmp_rs_execve(path, argv, envp, regs);
+    kdebug!("rs_exec_init_process: r: {:?}\n", r);
+    return r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize);
+}
+
+/// 临时的execve系统调用实现，以后要把它改为普通的系统调用。
+///
+/// 现在放在这里的原因是，还没有重构中断管理模块，未实现TrapFrame这个抽象，
+/// 导致我们必须手动设置中断返回时，各个寄存器的值，这个过程很繁琐，所以暂时放在这里。
+fn tmp_rs_execve(
+    path: String,
+    argv: Vec<String>,
+    envp: Vec<String>,
+    regs: &mut pt_regs,
+) -> Result<(), SystemError> {
+    kdebug!(
+        "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
+        path,
+        argv,
+        envp
+    );
     // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
     let old_address_space = current_pcb().address_space();
     // 在pcb中原来的用户地址空间
@@ -155,20 +193,23 @@ fn tmp_rs_execve(
         AddressSpace::is_current(&address_space),
         "Failed to set address space"
     );
-
+    kdebug!("Switch to new address space");
     // 切换到新的用户地址空间
-    unsafe {
-        MMArch::set_table(
-            crate::mm::PageTableKind::User,
-            address_space.read().user_mapper.utable.table().phys(),
-        )
-    };
-
+    // unsafe {
+    //     MMArch::set_table(
+    //         crate::mm::PageTableKind::User,
+    //         address_space.read().user_mapper.utable.table().phys(),
+    //     )
+    // };
+    
+    unsafe { address_space.write().user_mapper.utable.make_current() };
+    
     drop(old_address_space);
-
+    kdebug!("to load binary file");
     let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
     // 加载可执行文件
-    load_binary_file(&mut param)?;
+    let load_result = load_binary_file(&mut param)?;
+    kdebug!("load binary file done");
 
     param.init_info_mut().args = argv;
     param.init_info_mut().envs = envp;
@@ -187,6 +228,8 @@ fn tmp_rs_execve(
             .expect("Failed to push proc_init_info to user stack")
     };
 
+    kdebug!("write proc_init_info to user stack done");
+
     // （兼容旧版libc）把argv的指针写到寄存器内
     // TODO: 改写旧版libc，不再需要这个兼容
     regs.rdi = param.init_info().args.len() as u64;
@@ -196,6 +239,7 @@ fn tmp_rs_execve(
     // TODO: 中断管理重构后，这里的寄存器状态设置要删掉！！！改为对trap frame的设置。要增加架构抽象。
     regs.rsp = user_sp.data() as u64;
     regs.rbp = user_sp.data() as u64;
+    regs.rip = load_result.entry_point().data() as u64;
 
     regs.cs = USER_CS as u64 | 3;
     regs.ds = USER_DS as u64 | 3;
@@ -204,5 +248,6 @@ fn tmp_rs_execve(
     regs.rflags = 0x200;
     regs.rax = 1;
 
+    kdebug!("tmp_rs_execve: done");
     return Ok(());
 }

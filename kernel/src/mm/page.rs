@@ -238,12 +238,10 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
     pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> PageFlags<Arch> {
-        let flags: PageFlags<Arch> = unsafe {
-            PageFlags::from_data(0)
-                .set_user(user)
-                .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
-                .set_write(prot_flags.contains(ProtFlags::PROT_WRITE))
-        };
+        let flags: PageFlags<Arch> = PageFlags::new()
+            .set_user(user)
+            .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
+            .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
 
         return flags;
     }
@@ -542,7 +540,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     kwarn!("Page {:?} already mapped", virt);
                 }
                 // kdebug!("Mapping {:?} to {:?}, i = {i}, entry={:?}, flags={:?}", virt, phys, entry, flags);
+                compiler_fence(Ordering::SeqCst);
                 table.set_entry(i, entry);
+                compiler_fence(Ordering::SeqCst);
                 return Some(PageFlush::new(virt));
             } else {
                 let next_table = table.next_level_table(i);
@@ -620,7 +620,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ///
     /// @return 如果查找成功，返回物理地址和页表项的flags，否则返回None
     pub fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags<Arch>)> {
-        let entry: PageEntry<Arch> = self.visit(virt, |p1, i| unsafe { p1.entry(i) }).flatten()?;
+        let entry: PageEntry<Arch> = self.visit(virt, |p1, i| unsafe { p1.entry(i) })??;
         let paddr = entry.address().ok()?;
         let flags = entry.flags();
         return Some((paddr, flags));

@@ -37,7 +37,6 @@ extern void system_call(void);
 extern void kernel_thread_func(void);
 extern void rs_procfs_unregister_pid(uint64_t);
 
-
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
 extern struct mm_struct initial_mm;
 extern struct signal_struct INITIAL_SIGNALS;
@@ -50,6 +49,8 @@ extern void rs_process_exit_fpstate(struct process_control_block *pcb);
 extern void rs_drop_address_space(struct process_control_block *pcb);
 extern int process_init_files();
 extern int rs_init_stdio();
+extern uint64_t rs_do_execve(const char *filename, const char *const argv[], const char *const envp[], struct pt_regs *regs);
+extern uint64_t rs_exec_init_process(struct pt_regs *regs);
 
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                           \
@@ -149,7 +150,6 @@ int process_open_exec_file(char *path)
     return fd;
 }
 
-
 /**
  * @brief 使当前进程去执行新的代码
  *
@@ -163,8 +163,7 @@ int process_open_exec_file(char *path)
 #pragma GCC optimize("O0")
 ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
 {
-    while(1);
-    return 0;
+    return rs_do_execve(regs, path, argv, envp);
 }
 #pragma GCC pop_options
 
@@ -206,7 +205,7 @@ ul initial_kernel_thread(ul arg)
     io_mfence();
     rs_virtio_probe();
     io_mfence();
-    
+
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);
@@ -215,33 +214,9 @@ ul initial_kernel_thread(ul arg)
     io_mfence();
     __rust_demo_func();
     io_mfence();
-    while(1);
     // while (1)
-    // {
-    //     /* code */
-    // }
-
-    // 对completion完成量进行测试
-    // __test_completion();
-
-    // // 对一些组件进行单元测试
-    uint64_t tpid[] = {
-        // ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
-        // ktest_start(ktest_test_idr, 0),
-        // usb_pid,
-    };
-
-    // kinfo("Waiting test thread exit...");
-    // // 等待测试进程退出
-    // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
-    //     waitpid(tpid[i], NULL, NULL);
-    // kinfo("All test done.");
-
-    // 测试实时进程
-
-    // struct process_control_block *test_rt1 = kthread_run_rt(&test, NULL, "test rt");
-    // kdebug("process:rt test kthread is created!!!!");
-
+    //     ;
+    
     // 准备切换到用户态
     struct pt_regs *regs;
 
@@ -265,8 +240,8 @@ ul initial_kernel_thread(ul arg)
     // 这里的设计思路和switch_to类似 加载用户态程序：shell.elf
     __asm__ __volatile__("movq %1, %%rsp   \n\t"
                          "pushq %2    \n\t"
-                         "jmp do_execve  \n\t" ::"D"(current_pcb->thread->rsp),
-                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "S"("/bin/shell.elf"), "c"(NULL),
+                         "jmp rs_exec_init_process  \n\t" ::"D"(current_pcb->thread->rsp),
+                         "m"(current_pcb->thread->rsp), "m"(current_pcb->thread->rip), "c"(NULL),
                          "d"(NULL)
                          : "memory");
 

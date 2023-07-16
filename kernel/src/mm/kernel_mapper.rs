@@ -108,9 +108,9 @@ impl KernelMapper {
         }
 
         let count = PageFrameCount::new(page_align_up(size) / MMArch::PAGE_SIZE);
-        kdebug!("kernel mapper: map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
+        // kdebug!("kernel mapper: map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
 
-        for i in 0..count.data() {
+        for _ in 0..count.data() {
             let flusher = self.mapper.map_phys(vaddr, paddr, flags).unwrap();
 
             if flush {

@@ -15,7 +15,7 @@ use crate::{
     },
     include::bindings::bindings::{mm_stat_t, pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
     io::SeekFrom,
-    kinfo,
+    kdebug, kinfo,
     net::syscall::SockAddr,
     time::{
         syscall::{PosixTimeZone, PosixTimeval, SYS_TIMEZONE},
@@ -911,11 +911,13 @@ impl Syscall {
                 }
             }
             SYS_FSTAT => {
-                let kstat = args[0] as *mut PosixKstat;
-                let fd = args[1] as i32;
+                kdebug!("sys_fstat begin");
+                let fd = args[0] as i32;
+                let kstat = args[1] as *mut PosixKstat;
+                kdebug!("fd1 = {:?}", fd);
                 let security_check = || {
                     if unsafe {
-                        verify_area(kstat as u64, core::mem::size_of::<PosixTimeval>() as u64)
+                        verify_area(kstat as u64, core::mem::size_of::<PosixKstat>() as u64)
                     } == false
                     {
                         return Err(SystemError::EFAULT);
@@ -927,7 +929,8 @@ impl Syscall {
                     Err(r.unwrap_err())
                 } else {
                     if !kstat.is_null() {
-                        Self::fstat(kstat, fd)
+                        kdebug!("enter fstat");
+                        Self::fstat(fd, kstat)
                     } else {
                         Err(SystemError::EFAULT)
                     }

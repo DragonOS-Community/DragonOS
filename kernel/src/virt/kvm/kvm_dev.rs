@@ -17,7 +17,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-
+// use crate::virt::kvm::kvm_dev_ioctl_create_vm;
 /*
  * ioctls for /dev/kvm fds:
  */
@@ -134,6 +134,10 @@ impl IndexNode for LockedKvmInode {
         match _cmd {
             0xdeadbeef => {
                 kdebug!("kvm ioctl");
+                Ok(0)
+            }
+            KVM_CREATE_VM => {
+                // kvm_dev_ioctl_create_vm(_data);
                 Ok(0)
             }
             _ => Err(SystemError::EINVAL),

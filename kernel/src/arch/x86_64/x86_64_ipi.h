@@ -29,6 +29,8 @@
 void ipi_send_IPI(uint32_t dest_mode, uint32_t deliver_status, uint32_t level, uint32_t trigger,
                   uint32_t vector, uint32_t deliver_mode, uint32_t dest_shorthand,  uint32_t destination);
 
+void rs_ipi_send_IPI(uint32_t dest_mode, uint32_t deliver_status, uint32_t level, uint32_t trigger,
+                  uint32_t vector, uint32_t deliver_mode, uint32_t dest_shorthand,  uint32_t destination);
 /**
  * @brief ipi中断处理注册函数
  * 

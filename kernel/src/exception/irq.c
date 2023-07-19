@@ -254,7 +254,7 @@ void irq_init()
 #else
 
     memset((void *)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
-    apic_init();
+    // apic_init();
     rs_apic_init();
 
 #endif

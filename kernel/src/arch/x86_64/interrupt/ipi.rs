@@ -11,6 +11,7 @@ extern "C" {
 pub enum ArchIpiKind {
     KickCpu = 200,
     FlushTLB = 201,
+    StartUp = 0,
 }
 
 impl From<IpiKind> for ArchIpiKind {
@@ -18,6 +19,7 @@ impl From<IpiKind> for ArchIpiKind {
         match kind {
             IpiKind::KickCpu => ArchIpiKind::KickCpu,
             IpiKind::FlushTLB => ArchIpiKind::FlushTLB,
+            IpiKind::StartUp => ArchIpiKind::StartUp,
         }
     }
 }

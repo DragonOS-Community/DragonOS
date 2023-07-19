@@ -1,4 +1,5 @@
 use x86::time::rdtsc;
+// use x86::cpuid::CpuId
 use x86::msr::{rdmsr, wrmsr};
 use ::core::arch::asm;
 use crate::kerror;
@@ -301,7 +302,7 @@ impl LocalApicTimer {
     ///
     /// 这不会设置中断管理器，必须手动设置。
     /// 之后要开始中断，执行[`Self:：start_interrupt`]。
-    pub fn set_up_interrupt<T: Timer>(
+    pub fn start_interrupt_periodic<T: Timer>(
         &mut self,
         vector: u16,
         local_apic: &mut XApic,
@@ -330,7 +331,7 @@ impl LocalApicTimer {
     ///
     /// 在调用之前确保已设置中断。
     /// 目前，该函数将1000ms设置为间隔，是可变的
-    pub fn start_interrupt(&mut self, local_apic: &mut XApic) -> bool {
+    pub fn start_interrupt_deadline(&mut self, local_apic: &mut XApic) -> bool {
         unsafe{
         let irq_guard = CurrentIrqArch::save_and_disable_irq();
         if self.is_interrupt_enabled || self.frequency == 0 {

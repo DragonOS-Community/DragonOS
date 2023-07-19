@@ -262,6 +262,7 @@ struct apic_IO_APIC_map
  * @param number 中断向量号
  */
 void do_IRQ(struct pt_regs *rsp, ul number);
+void rs_apic_init_ap_core_local_apic();
 
 /**
  * @brief 读取RTE寄存器
@@ -300,6 +301,7 @@ int apic_init();
  * @return uint
  */
 uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total);
+uint rs_apic_get_ics(const uint type, ul ret_vaddr[], uint *total);
 
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num);

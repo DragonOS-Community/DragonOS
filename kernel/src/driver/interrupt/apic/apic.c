@@ -16,6 +16,11 @@
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
 
+uint rs_apic_get_ics(const uint type, ul ret_vaddr[], uint *total){
+    return 0;
+}
+extern void rs_apic_init_ap_core_local_apic(){};
+
 static bool flag_support_apic = false;
 static bool flag_support_x2apic = false;
 uint8_t __apic_enable_state = APIC_XAPIC_ENABLED;

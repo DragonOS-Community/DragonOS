@@ -2,12 +2,11 @@ use crate::{kdebug, syscall::SystemError};
 
 use self::apic_timer::ApicTimerMode;
 
-//这个文件实现RTE相关
 pub mod apic_timer;
 pub mod ioapic;
 pub mod x2apic;
 pub mod xapic;
-mod new_timer;
+pub mod new_timer;
 
 pub trait LocalAPIC {
     /// @brief 判断当前处理器是否支持这个类型的apic

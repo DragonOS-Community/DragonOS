@@ -27,7 +27,7 @@ lazy_static! {
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     pub static ref SOCKET_WAITQUEUE: WaitQueue = WaitQueue::INIT;
     // 检测端口是否冲突的表
-    pub static ref LISTEN_TABLE: SpinLock<HashMap<u16, GlobalSocketHandle>> = SpinLock::new(HashMap::new());
+    pub static ref PORT_LISTEN_TABLE: SpinLock<HashMap<u16, GlobalSocketHandle>> = SpinLock::new(HashMap::new());
 }
 
 /* For setsockopt(2) */
@@ -394,7 +394,7 @@ impl Socket for UdpSocket {
         // kdebug!("is open()={}", socket.is_open());
         // kdebug!("socket endpoint={:?}", socket.endpoint());
         if socket.endpoint().port == 0 {
-            let temp_port = get_ephemeral_port();
+            let temp_port = get_ephemeral_port()?;
 
             let local_ep = match remote_endpoint.addr {
                 // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
@@ -545,6 +545,8 @@ impl TcpSocket {
         socket: &mut smoltcp::socket::tcp::Socket,
         local_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
+        // 监听前进行端口占用检查
+        check_port_used(local_endpoint.port, self.handle.clone())?;
         let listen_result = if local_endpoint.addr.is_unspecified() {
             // kdebug!("Tcp Socket Listen on port {}", local_endpoint.port);
             socket.listen(local_endpoint.port)
@@ -552,7 +554,6 @@ impl TcpSocket {
             // kdebug!("Tcp Socket Listen on {local_endpoint}");
             socket.listen(local_endpoint)
         };
-        // todo: 增加端口占用检查
         return match listen_result {
             Ok(()) => {
                 // kdebug!(
@@ -674,7 +675,7 @@ impl Socket for TcpSocket {
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
-            let temp_port = get_ephemeral_port();
+            let temp_port = get_ephemeral_port()?;
             // kdebug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDriver> = NET_DRIVERS.write().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
@@ -743,7 +744,7 @@ impl Socket for TcpSocket {
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(mut ip)) = endpoint {
             if ip.port == 0 {
-                ip.port = get_ephemeral_port();
+                ip.port = get_ephemeral_port()?;
             }
 
             // 检测端口是否已被占用
@@ -842,8 +843,8 @@ impl Socket for TcpSocket {
     }
 }
 
-/// @breif 自动分配一个未被使用的PORT，如果动态端口均已被占用，直接返回一个被占用的端口
-pub fn get_ephemeral_port() -> u16 {
+/// @breif 自动分配一个未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
+pub fn get_ephemeral_port() -> Result<u16, SystemError> {
     // TODO selects non-conflict high port
 
     static mut EPHEMERAL_PORT: u16 = 0;
@@ -851,30 +852,36 @@ pub fn get_ephemeral_port() -> u16 {
         if EPHEMERAL_PORT == 0 {
             EPHEMERAL_PORT = (49152 + rand() % (65536 - 49152)) as u16;
         }
-        loop {
+    }
+
+    let mut remaining = 65536 - 49152; // 剩余尝试分配端口次数
+    let mut port: u16;
+    while remaining > 0 {
+        unsafe {
             if EPHEMERAL_PORT == 65535 {
                 EPHEMERAL_PORT = 49152;
             } else {
                 EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
             }
-            // 使用 ListenTable 检查端口是否被占用
-            let listen_table_guard = LISTEN_TABLE.lock();
-            if listen_table_guard.len() == (65536 - 49152)
-                || !listen_table_guard.get(&EPHEMERAL_PORT).is_some()
-            {
-                drop(listen_table_guard);
-                break;
-            }
+            port = EPHEMERAL_PORT;
         }
-        EPHEMERAL_PORT
+        // 使用 ListenTable 检查端口是否被占用
+        let listen_table_guard = PORT_LISTEN_TABLE.lock();
+        if let None = listen_table_guard.get(&port) {
+            drop(listen_table_guard);
+            return Ok(port);
+        }
+        remaining -= 1;
     }
+    Err(SystemError::EADDRINUSE)
 }
 
 /// @breif 检测给定端口是否已被占用，如果未被占用则在 ListenTable 中记录
+///
+/// TODO: 增加支持端口复用的逻辑
 pub fn check_port_used(port: u16, handle: GlobalSocketHandle) -> Result<(), SystemError> {
-    // 只检测动态端口的占用情况
-    if port >= 49152 {
-        let mut listen_table_guard = LISTEN_TABLE.lock();
+    if port > 0 {
+        let mut listen_table_guard = PORT_LISTEN_TABLE.lock();
         match listen_table_guard.get(&port) {
             Some(_) => return Err(SystemError::EADDRINUSE),
             None => listen_table_guard.insert(port, handle),
@@ -1045,7 +1052,7 @@ impl IndexNode for SocketInode {
     ) -> Result<(), SystemError> {
         let socket = self.0.lock();
         if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-            let mut listen_table_guard = LISTEN_TABLE.lock();
+            let mut listen_table_guard = PORT_LISTEN_TABLE.lock();
             listen_table_guard.remove(&ip.port);
             drop(listen_table_guard);
         }

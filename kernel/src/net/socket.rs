@@ -27,7 +27,7 @@ lazy_static! {
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     pub static ref SOCKET_WAITQUEUE: WaitQueue = WaitQueue::INIT;
     // 检测端口是否冲突的表
-    pub static ref PORT_LISTEN_TABLE: SpinLock<HashMap<u16, GlobalSocketHandle>> = SpinLock::new(HashMap::new());
+    pub static ref PORT_LISTEN_TABLE: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>> = SpinLock::new(HashMap::new());
 }
 
 /* For setsockopt(2) */
@@ -109,7 +109,7 @@ pub struct SocketMetadata {
 /// ref: https://man7.org/linux/man-pages/man7/raw.7.html
 #[derive(Debug, Clone)]
 pub struct RawSocket {
-    handle: GlobalSocketHandle,
+    handle: Arc<GlobalSocketHandle>,
     /// 用户发送的数据包是否包含了IP头.
     /// 如果是true，用户发送的数据包，必须包含IP头。（即用户要自行设置IP头+数据）
     /// 如果是false，用户发送的数据包，不包含IP头。（即用户只要设置数据）
@@ -150,7 +150,7 @@ impl RawSocket {
         );
 
         // 把socket添加到socket集合中，并得到socket的句柄
-        let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+        let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
 
         return Self {
             handle,
@@ -287,7 +287,7 @@ impl Socket for RawSocket {
 /// https://man7.org/linux/man-pages/man7/udp.7.html
 #[derive(Debug, Clone)]
 pub struct UdpSocket {
-    pub handle: GlobalSocketHandle,
+    pub handle: Arc<GlobalSocketHandle>,
     remote_endpoint: Option<Endpoint>, // 记录远程endpoint提供给connect()， 应该使用IP地址。
     options: SocketOptions,
 }
@@ -318,7 +318,7 @@ impl UdpSocket {
         let socket = udp::Socket::new(tx_buffer, rx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
-        let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+        let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
 
         return Self {
             handle,
@@ -505,7 +505,7 @@ impl Socket for UdpSocket {
 /// https://man7.org/linux/man-pages/man7/tcp.7.html
 #[derive(Debug, Clone)]
 pub struct TcpSocket {
-    handle: GlobalSocketHandle,
+    handle: Arc<GlobalSocketHandle>,
     local_endpoint: Option<wire::IpEndpoint>, // save local endpoint for bind()
     is_listening: bool,
     options: SocketOptions,
@@ -531,7 +531,7 @@ impl TcpSocket {
         let socket = tcp::Socket::new(tx_buffer, rx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
-        let handle: GlobalSocketHandle = GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+        let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
 
         return Self {
             handle,
@@ -792,7 +792,7 @@ impl Socket for TcpSocket {
 
                     // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
                     // 因此需要再为当前的socket分配一个新的handle
-                    let new_handle = GlobalSocketHandle::new(sockets.add(tcp_socket));
+                    let new_handle = Arc::new(GlobalSocketHandle::new(sockets.add(tcp_socket)));
                     let old_handle = ::core::mem::replace(&mut self.handle, new_handle);
 
                     Box::new(TcpSocket {
@@ -879,7 +879,7 @@ pub fn get_ephemeral_port() -> Result<u16, SystemError> {
 /// @breif 检测给定端口是否已被占用，如果未被占用则在 ListenTable 中记录
 ///
 /// TODO: 增加支持端口复用的逻辑
-pub fn check_port_used(port: u16, handle: GlobalSocketHandle) -> Result<(), SystemError> {
+pub fn check_port_used(port: u16, handle: Arc<GlobalSocketHandle>) -> Result<(), SystemError> {
     if port > 0 {
         let mut listen_table_guard = PORT_LISTEN_TABLE.lock();
         match listen_table_guard.get(&port) {

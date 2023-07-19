@@ -545,8 +545,6 @@ impl TcpSocket {
         socket: &mut smoltcp::socket::tcp::Socket,
         local_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
-        // 监听前进行端口占用检查
-        check_port_used(local_endpoint.port, self.handle.clone())?;
         let listen_result = if local_endpoint.addr.is_unspecified() {
             // kdebug!("Tcp Socket Listen on port {}", local_endpoint.port);
             socket.listen(local_endpoint.port)
@@ -554,6 +552,7 @@ impl TcpSocket {
             // kdebug!("Tcp Socket Listen on {local_endpoint}");
             socket.listen(local_endpoint)
         };
+        // TODO: 增加端口占用检查
         return match listen_result {
             Ok(()) => {
                 // kdebug!(

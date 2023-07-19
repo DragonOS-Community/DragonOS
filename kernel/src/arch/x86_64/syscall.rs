@@ -22,12 +22,6 @@ use super::{asm::ptrace::user_mode, mm::barrier::mfence};
 
 extern "C" {
     fn do_fork(regs: *mut pt_regs, clone_flags: u64, stack_start: u64, stack_size: u64) -> u64;
-    // fn c_sys_execve(
-    //     path: *const u8,
-    //     argv: *const *const u8,
-    //     envp: *const *const u8,
-    //     regs: &mut pt_regs,
-    // ) -> u64;
 
     fn syscall_int();
 }
@@ -87,15 +81,26 @@ pub extern "C" fn syscall_handler(regs: &mut pt_regs) -> () {
                 syscall_return!(SystemError::EFAULT.to_posix_errno() as u64, regs);
             } else {
                 unsafe {
+                    // syscall_return!(
+                    //     rs_do_execve(
+                    //         path_ptr as *const u8,
+                    //         argv_ptr as *const *const u8,
+                    //         env_ptr as *const *const u8,
+                    //         regs
+                    //     ),
+                    //     regs
+                    // );
+                    kdebug!("syscall: execve\n");
+                    let path = String::from("/bin/about.elf");
+                    let argv = vec![String::from("/bin/about.elf")];
+                    let envp = vec![String::from("PATH=/bin")];
+                    let r = tmp_rs_execve(path, argv, envp, regs);
+                    kdebug!("syscall: execve r: {:?}\n", r);
+
                     syscall_return!(
-                        rs_do_execve(
-                            path_ptr as *const u8,
-                            argv_ptr as *const *const u8,
-                            env_ptr as *const *const u8,
-                            regs
-                        ),
+                        r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize),
                         regs
-                    );
+                    )
                 }
             }
         }
@@ -185,7 +190,7 @@ fn tmp_rs_execve(
         current_pcb().drop_address_space();
     }
     // 创建新的地址空间并设置为当前地址空间
-    let address_space = AddressSpace::new()?;
+    let address_space = AddressSpace::new(true)?;
     unsafe {
         current_pcb().set_address_space(address_space.clone());
     }
@@ -201,9 +206,9 @@ fn tmp_rs_execve(
     //         address_space.read().user_mapper.utable.table().phys(),
     //     )
     // };
-    
+
     unsafe { address_space.write().user_mapper.utable.make_current() };
-    
+
     drop(old_address_space);
     kdebug!("to load binary file");
     let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
@@ -248,6 +253,11 @@ fn tmp_rs_execve(
     regs.rflags = 0x200;
     regs.rax = 1;
 
-    kdebug!("tmp_rs_execve: done");
+    kdebug!("regs: {:?}\n", regs);
+
+    kdebug!(
+        "tmp_rs_execve: done, load_result.entry_point()={:?}",
+        load_result.entry_point()
+    );
     return Ok(());
 }

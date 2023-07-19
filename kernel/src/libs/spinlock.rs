@@ -184,6 +184,7 @@ impl<T> SpinLock<T> {
 
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<T> {
+
         self.lock.lock();
         // 加锁成功，返回一个守卫
         return SpinLockGuard {
@@ -194,6 +195,7 @@ impl<T> SpinLock<T> {
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<T> {
         let mut flags: usize = 0;
+
         self.lock.lock_irqsave(&mut flags);
         // 加锁成功，返回一个守卫
         return SpinLockGuard {

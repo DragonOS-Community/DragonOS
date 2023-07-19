@@ -25,7 +25,7 @@ pub fn process_init() {
         compiler_fence(Ordering::SeqCst);
         current_pcb().address_space = null_mut();
         set_INITIAL_PROCESS_ADDRESS_SPACE(
-            AddressSpace::new().expect("Failed to create address space for INIT process."),
+            AddressSpace::new(true).expect("Failed to create address space for INIT process."),
         );
         compiler_fence(Ordering::SeqCst);
         current_pcb().set_address_space(INITIAL_PROCESS_ADDRESS_SPACE());

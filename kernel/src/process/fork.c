@@ -138,7 +138,7 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 创建对应procfs文件
     rs_procfs_register_pid(tsk->pid);
-
+    kdebug("Fork ok. pid: %d\n", tsk->pid);
     // 唤醒进程
     process_wakeup(tsk);
 

@@ -203,8 +203,8 @@ void smp_ap_start()
     io_mfence();
     current_pcb->flags |= PF_NEED_SCHED;
 
-    sti();
     apic_timer_ap_core_init();
+    sti();
     sched();
 
     while (1)

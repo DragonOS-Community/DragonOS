@@ -83,14 +83,14 @@ impl ElfLoader {
     /// - `start` - 本次映射的起始地址
     /// - `end` - 本次映射的结束地址（不包含）
     /// - `prot_flags` - 本次映射的权限
-    fn set_brk(
+    fn set_elf_brk(
         &self,
         user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
     ) -> Result<(), ExecError> {
-        let start = self.elf_page_align_up(start);
+        let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
 
         if end > start {
@@ -105,8 +105,8 @@ impl ElfLoader {
                 return Err(ExecError::OutOfMemory);
             }
         }
-        user_vm_guard.brk_start = end;
-        user_vm_guard.brk = end;
+        user_vm_guard.elf_brk_start = end;
+        user_vm_guard.elf_brk = end;
         return Ok(());
     }
 
@@ -490,7 +490,7 @@ impl BinaryLoader for ElfLoader {
                     elf_brk,
                     elf_bss
                 );
-                self.set_brk(
+                self.set_elf_brk(
                     &mut user_vm,
                     elf_bss + load_bias,
                     elf_brk + load_bias,
@@ -647,7 +647,7 @@ impl BinaryLoader for ElfLoader {
             elf_brk,
             bss_prot_flags
         );
-        self.set_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
+        self.set_elf_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
 
         if likely(elf_bss != elf_brk) && unlikely(self.pad_zero(elf_bss).is_err()) {
             kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");

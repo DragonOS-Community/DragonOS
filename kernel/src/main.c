@@ -117,10 +117,10 @@ void system_initialize()
     // ===========================
 
     acpi_init();
-
-    // 初始化中断模块
+    io_mfence();
     sched_init();
-
+    io_mfence();
+    // 初始化中断模块
     irq_init();
 
     // softirq_init();
@@ -141,7 +141,6 @@ void system_initialize()
     rs_jiffies_init();
     io_mfence();
 
-    rs_clocksource_boot_finish();
 
     io_mfence();
     vfs_init();
@@ -152,6 +151,9 @@ void system_initialize()
     // 因此必须在进程管理模块初始化完毕后再初始化smp。
     io_mfence();
     process_init();
+    io_mfence();
+    rs_clocksource_boot_finish();
+
     io_mfence();
 
     cpu_init();

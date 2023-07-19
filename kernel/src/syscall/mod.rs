@@ -480,13 +480,13 @@ impl Syscall {
             }
 
             SYS_BRK => {
-                let new_brk = args[0];
-                Self::brk(new_brk)
+                let new_brk = VirtAddr::new(args[0]);
+                Self::brk(new_brk).map(|_| 0)
             }
 
             SYS_SBRK => {
                 let increment = args[0] as isize;
-                Self::sbrk(increment)
+                Self::sbrk(increment).map(|vaddr| vaddr.data())
             }
 
             SYS_REBOOT => Self::reboot(),

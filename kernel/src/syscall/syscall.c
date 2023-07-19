@@ -72,41 +72,6 @@ ul do_put_string(char *s, uint32_t front_color, uint32_t background_color)
     printk_color(front_color, background_color, s);
     return 0;
 }
-
-/**
- * @brief 执行新的程序
- *
- * @param user_path(r8寄存器) 文件路径
- * @param argv(r9寄存器) 参数列表
- * @return uint64_t
- */
-uint64_t c_sys_execve(char *user_path, char **argv, char **envp, struct pt_regs *regs)
-{
-
-    int path_len = strnlen_user(user_path, PAGE_4K_SIZE);
-
-    if (path_len >= PAGE_4K_SIZE)
-        return -ENAMETOOLONG;
-    else if (path_len <= 0)
-        return -EFAULT;
-
-    char *path = (char *)kmalloc(path_len + 1, 0);
-    if (path == NULL)
-        return -ENOMEM;
-
-    memset(path, 0, path_len + 1);
-
-    // 拷贝文件路径
-    strncpy_from_user(path, user_path, path_len);
-    path[path_len] = '\0';
-
-    // 执行新的程序
-    uint64_t retval = do_execve(regs, path, argv, NULL);
-
-    kfree(path);
-    return retval;
-}
-
 /**
  * @brief 等待进程退出
  *

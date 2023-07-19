@@ -120,7 +120,7 @@ unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}
 /// 返回值：对齐后的地址。
 pub fn page_align_up(addr: usize) -> usize {
     let page_size = MMArch::PAGE_SIZE;
-    return (addr + page_size - 1) & !(page_size - 1);
+    return (addr + page_size - 1) & (!(page_size - 1));
 }
 
 /// ## 检查是否对齐

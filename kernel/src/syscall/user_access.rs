@@ -6,7 +6,10 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::mm::{verify_area, VirtAddr};
+use crate::{
+    kdebug,
+    mm::{verify_area, VirtAddr},
+};
 
 use super::SystemError;
 
@@ -76,32 +79,25 @@ pub fn check_and_clone_cstr(
     if user.is_null() {
         return Ok(String::new());
     }
-    // 如果指定了最大长度，则限定最大长度，然后从用户态读取
-    if max_length.is_some() {
-        let max_length = max_length.unwrap();
-        verify_area(VirtAddr::new(user as usize), max_length)?;
-        let user_buf = unsafe { core::slice::from_raw_parts(user, max_length) };
-        let s = core::str::from_utf8(user_buf)
-            .map_err(|_| SystemError::EFAULT)?
-            .to_string();
 
-        return Ok(s);
-    } else {
-        // 如果没有指定最大长度，就从用户态读取，直到遇到空字符
-        let mut buffer = Vec::new();
-        for i in 0.. {
-            let addr = unsafe { user.add(i) };
-            let mut c = [0u8; 1];
-            unsafe {
-                copy_from_user(&mut c, VirtAddr::new(addr as usize))?;
-            }
-            if c[0] == 0 {
-                break;
-            }
-            buffer.push(c[0]);
+    // 从用户态读取，直到遇到空字符 '\0' 或者达到最大长度
+    let mut buffer = Vec::new();
+    for i in 0.. {
+        if max_length.is_some() && max_length.as_ref().unwrap() <= &i {
+            break;
         }
-        return Ok(String::from_utf8(buffer).map_err(|_| SystemError::EFAULT)?);
+
+        let addr = unsafe { user.add(i) };
+        let mut c = [0u8; 1];
+        unsafe {
+            copy_from_user(&mut c, VirtAddr::new(addr as usize))?;
+        }
+        if c[0] == 0 {
+            break;
+        }
+        buffer.push(c[0]);
     }
+    return Ok(String::from_utf8(buffer).map_err(|_| SystemError::EFAULT)?);
 }
 
 /// 检查并从用户态拷贝一个 C 字符串数组
@@ -122,6 +118,7 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
     if user.is_null() {
         Ok(Vec::new())
     } else {
+        kdebug!("check_and_clone_cstr_array: {:p}\n", user);
         let mut buffer = Vec::new();
         for i in 0.. {
             let addr = unsafe { user.add(i) };
@@ -133,6 +130,8 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
                 copy_from_user(&mut dst, VirtAddr::new(addr as usize))?;
                 let dst = core::mem::transmute::<[u8; size_of::<usize>()], [usize; 1]>(dst);
                 str_ptr = dst[0] as *const u8;
+
+                kdebug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
             }
 
             if str_ptr.is_null() {

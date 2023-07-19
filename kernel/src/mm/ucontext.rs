@@ -17,14 +17,14 @@ use alloc::{
 use hashbrown::HashSet;
 
 use crate::{
-    arch::{asm::current::current_pcb, mm::PageMapper, MMArch},
+    arch::{asm::current::current_pcb, mm::PageMapper, MMArch, CurrentIrqArch},
     kdebug,
     libs::{
         align::page_align_up,
-        rwlock::RwLock,
+        rwlock::{RwLock, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    syscall::SystemError,
+    syscall::SystemError, exception::InterruptArch,
 };
 
 use super::{
@@ -55,8 +55,8 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    pub fn new() -> Result<Arc<Self>, SystemError> {
-        let inner = InnerAddressSpace::new()?;
+    pub fn new(create_stack: bool) -> Result<Arc<Self>, SystemError> {
+        let inner = InnerAddressSpace::new(create_stack)?;
         let result = Self {
             inner: RwLock::new(inner),
         };
@@ -103,6 +103,10 @@ pub struct InnerAddressSpace {
     pub mmap_min: VirtAddr,
     /// 用户栈信息结构体
     pub user_stack: Option<UserStack>,
+
+    pub elf_brk_start: VirtAddr,
+    pub elf_brk: VirtAddr,
+
     /// 当前进程的堆空间的起始地址
     pub brk_start: VirtAddr,
     /// 当前进程的堆空间的结束地址(不包含)
@@ -115,11 +119,13 @@ pub struct InnerAddressSpace {
 }
 
 impl InnerAddressSpace {
-    pub fn new() -> Result<Self, SystemError> {
+    pub fn new(create_stack: bool) -> Result<Self, SystemError> {
         let mut result = Self {
             user_mapper: MMArch::setup_new_usermapper()?,
             mappings: UserMappings::new(),
             mmap_min: VirtAddr(DEFAULT_MMAP_MIN_ADDR),
+            elf_brk_start: VirtAddr::new(0),
+            elf_brk: VirtAddr::new(0),
             brk_start: MMArch::USER_BRK_START,
             brk: MMArch::USER_BRK_START,
             user_stack: None,
@@ -128,8 +134,10 @@ impl InnerAddressSpace {
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
         };
-        kdebug!("to create user stack.");
-        result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
+        if create_stack {
+            kdebug!("to create user stack.");
+            result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
+        }
 
         return Ok(result);
     }
@@ -140,26 +148,38 @@ impl InnerAddressSpace {
     ///
     /// 返回克隆后的，新的地址空间的Arc指针
     pub fn try_clone(&mut self) -> Result<Arc<AddressSpace>, SystemError> {
-        let new_addr_space = AddressSpace::new()?;
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let new_addr_space = AddressSpace::new(false)?;
         let mut new_guard = new_addr_space.write();
+
+        // 拷贝用户栈的结构体信息，但是不拷贝用户栈的内容（因为后面VMA的拷贝会拷贝用户栈的内容）
+        unsafe {
+            new_guard.user_stack = Some(self.user_stack.as_ref().unwrap().clone_info_only());
+        }
+        let current_stack_size = self.user_stack.as_ref().unwrap().stack_size();
 
         let current_mapper = &mut self.user_mapper.utable;
 
         for vma in self.mappings.vmas.iter() {
             // TODO: 增加对VMA是否为文件映射的判断，如果是的话，就跳过
 
-            let vma_guard = vma.lock();
+            let vma_guard: SpinLockGuard<'_, VMA> = vma.lock();
+            let old_flags = vma_guard.flags();
+            let tmp_flags: PageFlags<MMArch> = PageFlags::new().set_write(true);
 
             // 分配内存页并创建新的VMA
             let new_vma = VMA::zeroed(
                 VirtPageFrame::new(vma_guard.region.start()),
                 PageFrameCount::new(vma_guard.region.size() / MMArch::PAGE_SIZE),
-                vma_guard.flags(),
+                tmp_flags,
                 &mut new_guard.user_mapper.utable,
                 (),
             )?;
-            let new_vma_guard = new_vma.lock();
+            new_guard.mappings.vmas.insert(new_vma.clone());
+            kdebug!("new vma: {:x?}", new_vma);
+            let mut new_vma_guard = new_vma.lock();
             for page in new_vma_guard.pages().map(|p| p.virt_address()) {
+                // kdebug!("page: {:x?}", page);
                 let current_frame = unsafe {
                     MMArch::phys_2_virt(
                         current_mapper
@@ -188,10 +208,15 @@ impl InnerAddressSpace {
                     // 拷贝数据
                     new_frame.copy_from_nonoverlapping(current_frame, MMArch::PAGE_SIZE);
                 }
-                new_guard.mappings.vmas.insert(new_vma.clone());
             }
+            drop(vma_guard);
+
+            new_vma_guard.remap(old_flags, &mut new_guard.user_mapper.utable, ())?;
+            drop(new_vma_guard);
+            
         }
         drop(new_guard);
+        drop(irq_guard);
         return Ok(new_addr_space);
     }
 
@@ -221,9 +246,10 @@ impl InnerAddressSpace {
         // 用于对齐hint的函数
         let round_hint_to_min = |hint: VirtAddr| {
             // 先把hint向下对齐到页边界
-            let addr = hint.data() & !MMArch::PAGE_OFFSET_MASK;
+            let addr = hint.data() & (!MMArch::PAGE_OFFSET_MASK);
+            kdebug!("map_anonymous: hint = {:?}, addr = {addr:#x}", hint);
             // 如果hint不是0，且hint小于DEFAULT_MMAP_MIN_ADDR，则对齐到DEFAULT_MMAP_MIN_ADDR
-            if addr != 0 && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
+            if (addr != 0) && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
                 Some(VirtAddr::new(page_align_up(DEFAULT_MMAP_MIN_ADDR)))
             } else if addr == 0 {
                 None
@@ -457,6 +483,63 @@ impl InnerAddressSpace {
         for vma in self.mappings.iter_vmas() {
             vma.unmap(&mut self.user_mapper.utable, &mut flusher);
         }
+    }
+
+    /// 设置进程的堆的内存空间
+    ///
+    /// ## 参数
+    ///
+    /// - `new_brk`：新的堆的结束地址。需要满足页对齐要求，并且是用户空间地址，且大于等于当前的堆的起始地址
+    ///
+    /// ## 返回值
+    ///
+    /// 返回旧的堆的结束地址
+    pub unsafe fn set_brk(&mut self, new_brk: VirtAddr) -> Result<VirtAddr, SystemError> {
+        assert!(new_brk.check_aligned(MMArch::PAGE_SIZE));
+
+        if !new_brk.check_user() || new_brk < self.brk_start {
+            return Err(SystemError::EFAULT);
+        }
+
+        let old_brk = self.brk;
+        kdebug!("set_brk: old_brk: {:?}, new_brk: {:?}", old_brk, new_brk);
+        if new_brk > self.brk {
+            let len = new_brk - self.brk;
+            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+            let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
+            self.map_anonymous(old_brk, len, prot_flags, map_flags, true)?
+                .virt_address();
+            self.brk = new_brk;
+            return Ok(old_brk);
+        } else {
+            let unmap_len = self.brk - new_brk;
+            let unmap_start = new_brk;
+            if unmap_len == 0 {
+                return Ok(old_brk);
+            }
+            self.munmap(
+                VirtPageFrame::new(unmap_start),
+                PageFrameCount::from_bytes(unmap_len).unwrap(),
+            )?;
+            self.brk = new_brk;
+            return Ok(old_brk);
+        }
+    }
+
+    pub unsafe fn sbrk(&mut self, incr: isize) -> Result<VirtAddr, SystemError> {
+        if incr == 0 {
+            return Ok(self.brk);
+        }
+
+        let new_brk = if incr > 0 {
+            self.brk + incr as usize
+        } else {
+            self.brk - (incr.abs() as usize)
+        };
+
+        let new_brk = VirtAddr::new(page_align_up(new_brk.data()));
+
+        return self.set_brk(new_brk);
     }
 }
 
@@ -901,7 +984,7 @@ impl VMA {
     ) -> Result<(), SystemError> {
         assert!(self.mapped);
         for page in self.region.pages() {
-            kdebug!("remap page {:?}", page.virt_address());
+            // kdebug!("remap page {:?}", page.virt_address());
             // 暂时要求所有的页帧都已经映射到页表
             // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
             let r = unsafe {
@@ -909,9 +992,9 @@ impl VMA {
                     .remap(page.virt_address(), flags)
                     .expect("Failed to remap, beacuse of some page is not mapped")
             };
-            kdebug!("consume page {:?}", page.virt_address());
+            // kdebug!("consume page {:?}", page.virt_address());
             flusher.consume(r);
-            kdebug!("remap page {:?} done", page.virt_address());
+            // kdebug!("remap page {:?} done", page.virt_address());
         }
         self.flags = flags;
         return Ok(());
@@ -1086,7 +1169,8 @@ impl UserStack {
         let actual_stack_bottom = stack_bottom - guard_size;
 
         let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+        let map_flags =
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE;
         kdebug!(
             "map anonymous stack: {:?} {}",
             actual_stack_bottom,
@@ -1126,9 +1210,31 @@ impl UserStack {
 
         kdebug!("expand user stack: {:?} {}", stack_bottom, stack_size);
         // 分配用户栈
-        user_stack.expand(vm, stack_size)?;
+        user_stack.initial_extend(vm, stack_size)?;
         kdebug!("user stack created: {:?} {}", stack_bottom, stack_size);
         return Ok(user_stack);
+    }
+
+    fn initial_extend(
+        &mut self,
+        vm: &mut InnerAddressSpace,
+        mut bytes: usize,
+    ) -> Result<(), SystemError> {
+        let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+
+        bytes = page_align_up(bytes);
+        self.mapped_size += bytes;
+
+        vm.map_anonymous(
+            self.stack_bottom - self.mapped_size,
+            bytes,
+            prot_flags,
+            map_flags,
+            false,
+        )?;
+
+        return Ok(());
     }
 
     /// 扩展用户栈
@@ -1142,9 +1248,9 @@ impl UserStack {
     ///
     /// - **Ok(())** 扩展成功
     /// - **Err(SystemError)** 扩展失败
-    pub fn expand(
+    pub fn extend(
         &mut self,
-        vm: &mut InnerAddressSpace,
+        vm: &mut RwLockWriteGuard<InnerAddressSpace>,
         mut bytes: usize,
     ) -> Result<(), SystemError> {
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
@@ -1173,5 +1279,19 @@ impl UserStack {
 
     pub unsafe fn set_sp(&mut self, sp: VirtAddr) {
         self.current_sp = sp;
+    }
+
+    /// 仅仅克隆用户栈的信息，不会克隆用户栈的内容/映射
+    pub unsafe fn clone_info_only(&self) -> Self {
+        return Self {
+            stack_bottom: self.stack_bottom,
+            mapped_size: self.mapped_size,
+            current_sp: self.current_sp,
+        };
+    }
+
+    /// 获取当前用户栈的大小（不包括保护页）
+    pub fn stack_size(&self) -> usize {
+        return self.mapped_size - Self::GUARD_PAGES_NUM * MMArch::PAGE_SIZE;
     }
 }

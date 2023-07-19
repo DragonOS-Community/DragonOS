@@ -4,8 +4,9 @@ use alloc::sync::Arc;
 
 use crate::{
     arch::MMArch,
+    current_pcb,
     include::bindings::bindings::mm_stat_t,
-    kerror,
+    kdebug, kerror,
     libs::{align::check_aligned, rwlock::RwLock},
     mm::MemoryManagementArch,
     syscall::{Syscall, SystemError},
@@ -67,29 +68,23 @@ bitflags! {
     }
 }
 extern "C" {
-    fn sys_do_brk(new_addr: usize) -> usize;
-    fn sys_do_sbrk(incr: isize) -> usize;
     fn sys_do_mstat(dst: *mut mm_stat_t, from_user: bool) -> usize;
 }
 impl Syscall {
-    pub fn brk(new_addr: usize) -> Result<usize, SystemError> {
-        let ret = unsafe { sys_do_brk(new_addr) };
-        if (ret as isize) < 0 {
-            return Err(
-                SystemError::from_posix_errno(-(ret as isize) as i32).expect("brk: Invalid errno")
-            );
-        }
-        return Ok(ret);
+    pub fn brk(new_addr: VirtAddr) -> Result<(), SystemError> {
+        kdebug!("brk: new_addr={:?}", new_addr);
+        let address_space = AddressSpace::current()?;
+        let mut address_space = address_space.write();
+        return unsafe { address_space.set_brk(new_addr).map(|_| ()) };
     }
 
-    pub fn sbrk(incr: isize) -> Result<usize, SystemError> {
-        let ret = unsafe { sys_do_sbrk(incr) };
-        if (ret as isize) < 0 {
-            return Err(
-                SystemError::from_posix_errno(-(ret as isize) as i32).expect("sbrk: Invalid errno")
-            );
-        }
-        return Ok(ret);
+    pub fn sbrk(incr: isize) -> Result<VirtAddr, SystemError> {
+        kdebug!("pid:{}, sbrk: incr={}", current_pcb().pid, incr);
+        let address_space = AddressSpace::current()?;
+        let mut address_space = address_space.write();
+        let r = unsafe { address_space.sbrk(incr) };
+        kdebug!("pid:{}, sbrk: r={:?}", current_pcb().pid, r);
+        return r;
     }
 
     /// 获取内存统计信息

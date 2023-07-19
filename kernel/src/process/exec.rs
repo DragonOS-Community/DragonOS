@@ -1,4 +1,4 @@
-use core::ptr::null;
+use core::{fmt::Debug, ptr::null};
 
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
@@ -7,18 +7,19 @@ use crate::{
         file::{File, FileMode},
         IndexNode, ROOT_INODE,
     },
+    kdebug,
     libs::{elf::ELF_LOADER, rwlock::RwLock},
     mm::{
         ucontext::{AddressSpace, InnerAddressSpace, UserStack},
         VirtAddr,
     },
-    syscall::SystemError,
+    syscall::SystemError, io::SeekFrom,
 };
 
 /// 系统支持的所有二进制文件加载器的列表
 const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
 
-pub trait BinaryLoader: 'static {
+pub trait BinaryLoader: 'static + Debug {
     /// 检查二进制文件是否为当前加载器支持的格式
     fn probe(self: &'static Self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError>;
 
@@ -63,7 +64,7 @@ pub enum ExecError {
     /// 参数错误
     InvalidParemeter,
     /// 无效的地址
-    BadAddress(VirtAddr),
+    BadAddress(Option<VirtAddr>),
 }
 
 impl Into<SystemError> for ExecError {
@@ -153,31 +154,37 @@ impl<'a> ExecParam<'a> {
 }
 
 /// ## 加载二进制文件
-pub fn load_binary_file(param: &mut ExecParam) -> Result<(), SystemError> {
+pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, SystemError> {
     let inode = ROOT_INODE().lookup(param.file_path)?;
 
     let file = File::new(inode, FileMode::O_RDONLY)?;
     param.file = Some(file);
-    let mut head_buf = [0u8; 256];
-    let _bytes = param.file_mut().read(256, &mut head_buf)?;
+    let mut head_buf = [0u8; 512];
+    param.file_mut().lseek(SeekFrom::SeekSet(0))?;
+    let _bytes = param.file_mut().read(512, &mut head_buf)?;
+    kdebug!("load_binary_file: read {} bytes", _bytes);
 
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
-        if bl.probe(param, &head_buf).is_ok() {
+        let probe_result = bl.probe(param, &head_buf);
+        if probe_result.is_ok() {
             loader = Some(bl);
             break;
+        } else {
+            kdebug!("load_binary_file: probe failed: {:?}", probe_result);
         }
     }
-
+    kdebug!("load_binary_file: loader: {:?}", loader);
     if loader.is_none() {
         return Err(SystemError::ENOEXEC);
     }
 
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
-    loader.load(param, &head_buf).map_err(|e| e.into())?;
-
-    return Ok(());
+    kdebug!("load_binary_file: to load with param: {:?}", param);
+    let result: BinaryLoaderResult = loader.load(param, &head_buf).map_err(|e| e.into())?;
+    kdebug!("load_binary_file: load success");
+    return Ok(result);
 }
 
 /// 程序初始化信息，这些信息会被压入用户栈中

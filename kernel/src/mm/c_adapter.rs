@@ -6,6 +6,7 @@ use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 
 use crate::{
+    arch::mm::LowAddressRemapping,
     driver::uart::uart::c_uart_send,
     include::bindings::bindings::{gfp_t, PAGE_KERNEL, PAGE_U_S},
     kdebug, kerror,
@@ -19,7 +20,7 @@ use super::{
     kernel_mapper::KernelMapper,
     no_init::pseudo_map_phys,
     page::{PageFlags, PageMapper},
-    MemoryManagementArch, PhysAddr, VirtAddr,
+    MemoryManagementArch, PhysAddr, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE,
 };
 
 lazy_static! {
@@ -64,7 +65,6 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
         vaddr += MMArch::PAGE_SIZE;
         paddr += MMArch::PAGE_SIZE;
     }
-    c_uart_send(0x3f8, 'F' as u8);
 }
 
 #[no_mangle]
@@ -76,7 +76,8 @@ pub unsafe extern "C" fn kzalloc(size: usize, _gfp: gfp_t) -> usize {
 #[no_mangle]
 pub unsafe extern "C" fn kmalloc(size: usize, _gfp: gfp_t) -> usize {
     kdebug!("kmalloc: size: {size}");
-    return do_kmalloc(size, false);
+    // 由于C代码不规范，因此都全部清空
+    return do_kmalloc(size, true);
 }
 
 fn do_kmalloc(size: usize, zero: bool) -> usize {
@@ -128,5 +129,11 @@ pub unsafe extern "C" fn kfree(vaddr: usize) -> usize {
     }
     let (vaddr, len, cap) = p.unwrap();
     drop(Vec::from_raw_parts(vaddr.data() as *mut u8, len, cap));
+    return 0;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rs_unmap_at_low_addr() -> usize {
+    LowAddressRemapping::unmap_at_low_address(true);
     return 0;
 }

@@ -37,10 +37,6 @@ void init_frame_buffer()
     // uint64_t global_CR3 = (uint64_t)get_CR3();
 
     video_frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
-    // mm_map_proc_page_table(global_CR3, true, video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr,
-    //                        video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true, false);
-
-    // flush_tlb();
 
     rs_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
     
@@ -191,8 +187,6 @@ int video_init()
     char init_text1[] = "Video driver to map.\n";
     for (int i = 0; i < sizeof(init_text1) - 1; ++i)
         c_uart_send(COM1, init_text1[i]);
-    // mm_map_phys_addr(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size,
-    //                  PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
     rs_pseudo_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size);
 
     io_mfence();

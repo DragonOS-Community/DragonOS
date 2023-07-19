@@ -1,5 +1,6 @@
 use core::{
     ffi::c_void,
+    mem::ManuallyDrop,
     ptr::{null_mut, read_volatile, write_volatile},
 };
 
@@ -316,7 +317,9 @@ impl process_control_block {
     /// 释放pcb中存储的地址空间的指针
     pub unsafe fn drop_address_space(&mut self) {
         let p = self.address_space as *const AddressSpace;
-
+        if p.is_null() {
+            return;
+        }
         let p: Arc<AddressSpace> = Arc::from_raw(p);
         drop(p);
         self.address_space = null_mut();
@@ -329,6 +332,19 @@ impl process_control_block {
     pub unsafe fn set_address_space(&mut self, address_space: Arc<AddressSpace>) {
         assert!(self.address_space.is_null(), "Address space already set");
         self.address_space = Arc::into_raw(address_space) as *mut c_void;
+    }
+
+    /// 获取当前进程的地址空间的指针
+    pub fn address_space(&self) -> Option<Arc<AddressSpace>> {
+        let ptr = self.address_space as *const AddressSpace;
+        if ptr.is_null() {
+            return None;
+        }
+        // 为了防止pcb中的指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
+        let arc_wrapper = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
+
+        let result = Arc::clone(&arc_wrapper);
+        return Some(result);
     }
 }
 

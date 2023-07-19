@@ -1,15 +1,17 @@
 use core::{
     cmp::min,
     intrinsics::{likely, unlikely},
+    ops::Range,
 };
 
+use alloc::vec::Vec;
 use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader, ElfBytes};
 
 use crate::{
     arch::MMArch,
     current_pcb,
     io::SeekFrom,
-    kerror,
+    kdebug, kerror,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
         syscall::{MapFlags, ProtFlags},
@@ -81,14 +83,14 @@ impl ElfLoader {
     /// - `start` - 本次映射的起始地址
     /// - `end` - 本次映射的结束地址（不包含）
     /// - `prot_flags` - 本次映射的权限
-    fn set_brk(
+    fn set_elf_brk(
         &self,
         user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
     ) -> Result<(), ExecError> {
-        let start = self.elf_page_align_up(start);
+        let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
 
         if end > start {
@@ -103,8 +105,8 @@ impl ElfLoader {
                 return Err(ExecError::OutOfMemory);
             }
         }
-        user_vm_guard.brk_start = end;
-        user_vm_guard.brk = end;
+        user_vm_guard.elf_brk_start = end;
+        user_vm_guard.elf_brk = end;
         return Ok(());
     }
 
@@ -167,6 +169,7 @@ impl ElfLoader {
         map_flags: &MapFlags,
         total_size: usize,
     ) -> Result<(VirtAddr, bool), SystemError> {
+        kdebug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
         // 当前段应该被加载到的内存地址
         let size =
             phent.p_filesz as usize + self.elf_page_offset(VirtAddr::new(phent.p_vaddr as usize));
@@ -204,12 +207,15 @@ impl ElfLoader {
         // the end. (which unmap is needed for ELF images with holes.)
         if total_size != 0 {
             let total_size = self.elf_page_align_up(VirtAddr::new(total_size)).data();
+            kdebug!("total_size={}", total_size);
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, total_size, *prot, *map_flags, false)
                 .map_err(map_err_handler)?
                 .virt_address();
+            kdebug!("map ok: addr_to_map={:?}", addr_to_map);
             let to_unmap = map_addr + size;
             let to_unmap_size = total_size - size;
+            kdebug!("to_unmap={:?}, to_unmap_size={}", to_unmap, to_unmap_size);
             user_vm_guard.munmap(
                 VirtPageFrame::new(to_unmap),
                 PageFrameCount::from_bytes(to_unmap_size).unwrap(),
@@ -218,14 +224,20 @@ impl ElfLoader {
             // 加载文件到内存
             self.do_load_file(map_addr, size, offset, param)?;
         } else {
+            kdebug!("total size = 0");
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, size, *prot, *map_flags, false)?
                 .virt_address();
-
+            kdebug!(
+                "map ok: addr_to_map={:?}, map_addr={map_addr:?}",
+                addr_to_map
+            );
+            let paddr = user_vm_guard.user_mapper.utable.translate(addr_to_map);
+            kdebug!("paddr={:?}", paddr);
             // 加载文件到内存
             self.do_load_file(map_addr, size, offset, param)?;
         }
-
+        kdebug!("load_elf_segment OK: map_addr={:?}", map_addr);
         return Ok((map_addr, true));
     }
 
@@ -258,9 +270,11 @@ impl ElfLoader {
         while remain > 0 {
             let read_size = min(remain, buf_size);
             file.read(read_size, &mut buf[..read_size])?;
+            kdebug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
             unsafe {
                 copy_to_user(vaddr, &buf[..read_size]).map_err(|_| SystemError::EFAULT)?;
             }
+            kdebug!("copy ok");
             vaddr += read_size;
             remain -= read_size;
         }
@@ -289,35 +303,131 @@ impl ElfLoader {
         &self,
         param: &mut ExecParam,
         entrypoint_vaddr: VirtAddr,
-        phdr_vaddr: VirtAddr,
-        elf_header: &ElfBytes<AnyEndian>,
+        phdr_vaddr: Option<VirtAddr>,
+        ehdr: &elf::file::FileHeader<AnyEndian>,
     ) -> Result<(), ExecError> {
+        let phdr_vaddr = phdr_vaddr.unwrap_or(VirtAddr::new(0));
+
         let init_info = param.init_info_mut();
         init_info
             .auxv
-            .insert(AtType::PhEnt as u8, elf_header.ehdr.e_phentsize as usize);
+            .insert(AtType::PhEnt as u8, ehdr.e_phentsize as usize);
         init_info
             .auxv
             .insert(AtType::PageSize as u8, MMArch::PAGE_SIZE);
         init_info.auxv.insert(AtType::Phdr as u8, phdr_vaddr.data());
         init_info
             .auxv
-            .insert(AtType::PhNum as u8, elf_header.ehdr.e_phnum as usize);
+            .insert(AtType::PhNum as u8, ehdr.e_phnum as usize);
         init_info
             .auxv
             .insert(AtType::Entry as u8, entrypoint_vaddr.data());
 
         return Ok(());
     }
+
+    /// 解析文件的ehdr
+    fn parse_ehdr(data: &[u8]) -> Result<FileHeader<AnyEndian>, elf::ParseError> {
+        let ident_buf = data.get_bytes(0..elf::abi::EI_NIDENT)?;
+        let ident = elf::file::parse_ident::<AnyEndian>(ident_buf)?;
+
+        let tail_start = elf::abi::EI_NIDENT;
+        let tail_end = match ident.1 {
+            elf::file::Class::ELF32 => tail_start + elf::file::ELF32_EHDR_TAILSIZE,
+            elf::file::Class::ELF64 => tail_start + elf::file::ELF64_EHDR_TAILSIZE,
+        };
+        let tail_buf = data.get_bytes(tail_start..tail_end)?;
+
+        let ehdr: FileHeader<_> = FileHeader::parse_tail(ident, tail_buf)?;
+        return Ok(ehdr);
+    }
+
+    /// 解析文件的program header table
+    ///
+    /// ## 参数
+    ///
+    /// - `param`：执行参数
+    /// - `ehdr`：文件头
+    /// - `data_buf`：用于缓存SegmentTable的Vec。
+    ///     这是因为SegmentTable的生命周期与data_buf一致。初始化这个Vec的大小为0即可。
+    ///
+    /// ## 说明
+    ///
+    /// 这个函数由elf库的`elf::elf_bytes::find_phdrs`修改而来。
+    fn parse_segments<'a>(
+        param: &mut ExecParam,
+        ehdr: &FileHeader<AnyEndian>,
+        data_buf: &'a mut Vec<u8>,
+    ) -> Result<Option<elf::segment::SegmentTable<'a, AnyEndian>>, elf::ParseError> {
+        // It's Ok to have no program headers
+        if ehdr.e_phoff == 0 {
+            return Ok(None);
+        }
+        let file = param.file_mut();
+        // If the number of segments is greater than or equal to PN_XNUM (0xffff),
+        // e_phnum is set to PN_XNUM, and the actual number of program header table
+        // entries is contained in the sh_info field of the section header at index 0.
+        let mut phnum = ehdr.e_phnum as usize;
+        if phnum == elf::abi::PN_XNUM as usize {
+            let shoff: usize = ehdr.e_shoff.try_into()?;
+
+            // 从磁盘读取shdr的前2个entry
+            file.lseek(SeekFrom::SeekSet(shoff as i64))
+                .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
+            let shdr_buf_size = ehdr.e_shentsize * 2;
+            let mut shdr_buf = vec![0u8; shdr_buf_size as usize];
+            file.read(shdr_buf_size as usize, &mut shdr_buf)
+                .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
+
+            let mut offset = 0;
+            let shdr0 = <elf::section::SectionHeader as elf::parse::ParseAt>::parse_at(
+                ehdr.endianness,
+                ehdr.class,
+                &mut offset,
+                &shdr_buf,
+            )?;
+            phnum = shdr0.sh_info.try_into()?;
+        }
+
+        // Validate phentsize before trying to read the table so that we can error early for corrupted files
+        let entsize = <ProgramHeader as elf::parse::ParseAt>::validate_entsize(
+            ehdr.class,
+            ehdr.e_phentsize as usize,
+        )?;
+        let phoff: usize = ehdr.e_phoff.try_into()?;
+        let size = entsize
+            .checked_mul(phnum)
+            .ok_or(elf::ParseError::IntegerOverflow)?;
+        phoff
+            .checked_add(size)
+            .ok_or(elf::ParseError::IntegerOverflow)?;
+
+        // 读取program header table
+
+        file.lseek(SeekFrom::SeekSet(phoff as i64))
+            .map_err(|_| elf::ParseError::BadOffset(phoff as u64))?;
+        data_buf.clear();
+        data_buf.resize(size, 0);
+
+        file.read(size, data_buf)
+            .expect("read program header table failed");
+        let buf = data_buf.get_bytes(0..size)?;
+
+        return Ok(Some(elf::segment::SegmentTable::new(
+            ehdr.endianness,
+            ehdr.class,
+            buf,
+        )));
+    }
 }
 
 impl BinaryLoader for ElfLoader {
     fn probe(self: &'static Self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError> {
-        let elf_bytes =
-            ElfBytes::<AnyEndian>::minimal_parse(buf).map_err(|_| ExecError::NotExecutable)?;
-
-        let ehdr = elf_bytes.ehdr;
-
+        // let elf_bytes =
+        //     ElfBytes::<AnyEndian>::minimal_parse(buf).map_err(|_| ExecError::NotExecutable)?;
+        kdebug!("ElfLoader probe: buf={:?}", buf);
+        let ehdr = Self::parse_ehdr(buf).map_err(|_| ExecError::NotExecutable)?;
+        kdebug!("ElfLoader probe: ehdr={:?}", ehdr);
         #[cfg(target_arch = "x86_64")]
         return self.probe_x86_64(param, &ehdr);
 
@@ -331,12 +441,13 @@ impl BinaryLoader for ElfLoader {
         head_buf: &[u8],
     ) -> Result<BinaryLoaderResult, ExecError> {
         // 解析elf文件头
-        let elf_bytes =
-            ElfBytes::<AnyEndian>::minimal_parse(head_buf).map_err(|_| ExecError::NotExecutable)?;
+        let ehdr = Self::parse_ehdr(head_buf).map_err(|_| ExecError::NotExecutable)?;
+
         // 参考linux-5.19的load_elf_binary函数
         // https://opengrok.ringotek.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#1034
 
-        let elf_type = ElfType::from(elf_bytes.ehdr.e_type);
+        let elf_type = ElfType::from(ehdr.e_type);
+        kdebug!("ehdr = {:?}", ehdr);
 
         let binding = param.vm().clone();
         let mut user_vm = binding.write();
@@ -345,12 +456,16 @@ impl BinaryLoader for ElfLoader {
 
         // todo: 增加对动态链接的处理
 
+        kdebug!("to parse segments");
         // 加载ELF文件并映射到用户空间
-        let loadable_sections = elf_bytes
-            .segments()
+        let mut phdr_buf = Vec::new();
+        let loadable_sections = Self::parse_segments(param, &ehdr, &mut phdr_buf)
+            .map_err(|_| ExecError::ParseError)?
             .ok_or(ExecError::ParseError)?
             .iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
+
+        kdebug!("loadable_sections = {:?}", loadable_sections);
 
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);
@@ -368,8 +483,14 @@ impl BinaryLoader for ElfLoader {
         // program header的虚拟地址
         let mut phdr_vaddr: Option<VirtAddr> = None;
         for seg_to_load in loadable_sections {
+            kdebug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
-                self.set_brk(
+                kdebug!(
+                    "to set brk, elf_brk = {:?}, elf_bss = {:?}",
+                    elf_brk,
+                    elf_bss
+                );
+                self.set_elf_brk(
                     &mut user_vm,
                     elf_bss + load_bias,
                     elf_brk + load_bias,
@@ -421,11 +542,14 @@ impl BinaryLoader for ElfLoader {
                     &elf_map_flags,
                     0,
                 )
-                .map_err(|_| ExecError::InvalidParemeter)?;
+                .map_err(|e| match e {
+                    SystemError::EFAULT => ExecError::BadAddress(None),
+                    _ => ExecError::InvalidParemeter,
+                })?;
 
             // 如果地址不对，那么就报错
             if !e.1 {
-                return Err(ExecError::BadAddress(e.0));
+                return Err(ExecError::BadAddress(Some(e.0)));
             }
 
             if first_pt_load {
@@ -436,13 +560,16 @@ impl BinaryLoader for ElfLoader {
                 }
             }
 
+            kdebug!("seg_to_load.p_offset={}", seg_to_load.p_offset);
+            kdebug!("e_phoff={}", ehdr.e_phoff);
+            kdebug!("seg_to_load.p_filesz={}", seg_to_load.p_filesz);
             // Figure out which segment in the file contains the Program Header Table,
             // and map to the associated virtual address.
-            if (seg_to_load.p_offset < elf_bytes.ehdr.e_phoff)
-                && (elf_bytes.ehdr.e_phoff < (seg_to_load.p_offset + seg_to_load.p_filesz))
+            if (seg_to_load.p_offset <= ehdr.e_phoff)
+                && (ehdr.e_phoff < (seg_to_load.p_offset + seg_to_load.p_filesz))
             {
                 phdr_vaddr = Some(VirtAddr::new(
-                    (elf_bytes.ehdr.e_phoff - seg_to_load.p_offset + seg_to_load.p_vaddr) as usize,
+                    (ehdr.e_phoff - seg_to_load.p_offset + seg_to_load.p_vaddr) as usize,
                 ));
             }
 
@@ -464,6 +591,7 @@ impl BinaryLoader for ElfLoader {
                 || seg_to_load.p_filesz > seg_to_load.p_memsz
                 || seg_to_load.p_memsz > MMArch::USER_END_VADDR.data() as u64
             {
+                kdebug!("ERR:     p_vaddr={p_vaddr:?}");
                 return Err(ExecError::InvalidParemeter);
             }
 
@@ -498,13 +626,14 @@ impl BinaryLoader for ElfLoader {
                 elf_brk = seg_end_vaddr;
             }
         }
+        kdebug!("elf load: phdr_vaddr={phdr_vaddr:?}");
+        let program_entrypoint = VirtAddr::new(ehdr.e_entry as usize + load_bias);
+        let phdr_vaddr = if phdr_vaddr.is_some() {
+            Some(phdr_vaddr.unwrap() + load_bias)
+        } else {
+            None
+        };
 
-        let program_entrypoint = VirtAddr::new(elf_bytes.ehdr.e_entry as usize + load_bias);
-        if phdr_vaddr.is_none() {
-            return Err(ExecError::InvalidParemeter);
-        }
-
-        let phdr_vaddr: VirtAddr = phdr_vaddr.unwrap() + load_bias;
         elf_bss += load_bias;
         elf_brk += load_bias;
         start_code = start_code.map(|v| v + load_bias);
@@ -512,21 +641,29 @@ impl BinaryLoader for ElfLoader {
         start_data = start_data.map(|v| v + load_bias);
         end_data = end_data.map(|v| v + load_bias);
 
-        self.set_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
+        kdebug!(
+            "to set brk: elf_bss: {:?}, elf_brk: {:?}, bss_prot_flags: {:?}",
+            elf_bss,
+            elf_brk,
+            bss_prot_flags
+        );
+        self.set_elf_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
 
-        if likely(elf_bss != elf_brk) && unlikely(self.pad_zero(elf_bss).is_ok()) {
-            return Err(ExecError::BadAddress(elf_bss));
+        if likely(elf_bss != elf_brk) && unlikely(self.pad_zero(elf_bss).is_err()) {
+            kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
+            return Err(ExecError::BadAddress(Some(elf_bss)));
         }
         // todo: 动态链接：增加加载interpreter的代码
-
-        self.create_auxv(param, program_entrypoint, phdr_vaddr, &elf_bytes)?;
-
+        kdebug!("to create auxv");
+        self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;
+        kdebug!("auxv create ok");
         user_vm.start_code = start_code.unwrap_or(VirtAddr::new(0));
         user_vm.end_code = end_code.unwrap_or(VirtAddr::new(0));
         user_vm.start_data = start_data.unwrap_or(VirtAddr::new(0));
         user_vm.end_data = end_data.unwrap_or(VirtAddr::new(0));
 
         let result = BinaryLoaderResult::new(program_entrypoint);
+        kdebug!("elf load OK!!!");
         return Ok(result);
     }
 }
@@ -584,5 +721,18 @@ impl From<u16> for ElfType {
             0x04 => Self::Core,
             _ => Self::Unknown,
         }
+    }
+}
+
+// Simple convenience extension trait to wrap get() with .ok_or(SliceReadError)
+trait ReadBytesExt<'data> {
+    fn get_bytes(self, range: Range<usize>) -> Result<&'data [u8], elf::ParseError>;
+}
+impl<'data> ReadBytesExt<'data> for &'data [u8] {
+    fn get_bytes(self, range: Range<usize>) -> Result<&'data [u8], elf::ParseError> {
+        let start = range.start;
+        let end = range.end;
+        self.get(range)
+            .ok_or(elf::ParseError::SliceReadError((start, end)))
     }
 }

@@ -1,3 +1,5 @@
+use alloc::sync::Arc;
+
 use crate::{
     arch::MMArch,
     include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET},
@@ -10,12 +12,13 @@ use core::{
     intrinsics::unlikely,
     ops::{Add, AddAssign, Sub, SubAssign},
     ptr,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use self::{
     allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
     page::round_up_to_page_size,
-    ucontext::UserMapper,
+    ucontext::{AddressSpace, UserMapper},
 };
 
 pub mod allocator;
@@ -27,6 +30,34 @@ pub mod no_init;
 pub mod page;
 pub mod syscall;
 pub mod ucontext;
+
+/// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）
+static mut __INITIAL_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
+
+/// 获取内核INIT进程的用户地址空间结构体
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn INITIAL_PROCESS_ADDRESS_SPACE() -> Arc<AddressSpace> {
+    unsafe {
+        return __INITIAL_PROCESS_ADDRESS_SPACE
+            .as_ref()
+            .expect("INITIAL_PROCESS_ADDRESS_SPACE is null")
+            .clone();
+    }
+}
+
+/// 设置内核INIT进程的用户地址空间结构体全局变量
+#[allow(non_snake_case)]
+pub unsafe fn set_INITIAL_PROCESS_ADDRESS_SPACE(address_space: Arc<AddressSpace>) {
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    if INITIALIZED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire)
+        .is_err()
+    {
+        panic!("INITIAL_PROCESS_ADDRESS_SPACE is already initialized");
+    }
+    __INITIAL_PROCESS_ADDRESS_SPACE = Some(address_space);
+}
 
 /// @brief 将内核空间的虚拟地址转换为物理地址
 #[inline(always)]

@@ -23,6 +23,11 @@ static uint32_t total_processor_num = 0;
 static int current_starting_cpu = 0;
 
 static int num_cpu_started = 1;
+extern void rs_smp_init_idle();
+
+// 在head.S中定义的，APU启动时，要加载的页表
+// 由于内存管理模块初始化的时候，重置了页表，因此我们要把当前的页表传给APU
+extern uint64_t __APU_START_CR3;
 
 // kick cpu 功能所使用的中断向量号
 #define KICK_CPU_IRQ_NUM 0xc8
@@ -31,6 +36,9 @@ static int num_cpu_started = 1;
 void smp_init()
 {
     spin_init(&multi_core_starting_lock); // 初始化多核启动锁
+    // 设置多核启动时，要加载的页表
+    __APU_START_CR3 = (uint64_t)get_CR3();
+
     ul tmp_vaddr[MAX_SUPPORTED_PROCESSOR_NUM] = {0};
 
     apic_get_ics(ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC, tmp_vaddr, &total_processor_num);
@@ -107,7 +115,7 @@ void smp_init()
         cpu_core_info[current_starting_cpu].tss_vaddr = (uint64_t)&initial_tss[current_starting_cpu];
 
         memset(&initial_tss[current_starting_cpu], 0, sizeof(struct tss_struct));
-
+        // kdebug("core %d, set tss", current_starting_cpu);
         set_tss_descriptor(10 + (current_starting_cpu * 2), (void *)(cpu_core_info[current_starting_cpu].tss_vaddr));
         io_mfence();
         set_tss64(
@@ -119,12 +127,14 @@ void smp_init()
             cpu_core_info[current_starting_cpu].ist_stack_start);
         io_mfence();
 
+        // kdebug("core %d, to send start up", current_starting_cpu);
         // 连续发送两次start-up IPI
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
                      proc_local_apic_structs[i]->local_apic_id);
         io_mfence();
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
                      proc_local_apic_structs[i]->local_apic_id);
+        // kdebug("core %d, send start up ok", current_starting_cpu);
     }
     io_mfence();
     while (num_cpu_started != (core_to_start + 1))
@@ -133,12 +143,7 @@ void smp_init()
     kinfo("Cleaning page table remapping...\n");
 
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
-    uint64_t *global_CR3 = get_CR3();
-    for (int i = 0; i < 256; ++i)
-    {
-        io_mfence();
-        *(ul *)(phys_2_virt(global_CR3) + i) = 0UL;
-    }
+    rs_unmap_at_low_addr();
     kdebug("init proc's preempt_count=%ld", current_pcb->preempt_count);
     kinfo("Successfully cleaned page table remapping!\n");
 }
@@ -170,6 +175,8 @@ void smp_ap_start()
     current_pcb->state = PROC_RUNNING;
     current_pcb->flags = PF_KTHREAD;
     current_pcb->mm = &initial_mm;
+    current_pcb->address_space = NULL;
+    rs_smp_init_idle();
 
     list_init(&current_pcb->list);
     current_pcb->addr_limit = KERNEL_BASE_LINEAR_ADDR;
@@ -195,8 +202,9 @@ void smp_ap_start()
     preempt_disable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count
     io_mfence();
     current_pcb->flags |= PF_NEED_SCHED;
-    sti();
+
     apic_timer_ap_core_init();
+    sti();
     sched();
 
     while (1)

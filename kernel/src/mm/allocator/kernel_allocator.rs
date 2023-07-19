@@ -36,10 +36,10 @@ impl KernelAllocator {
         if unlikely(virt_addr.is_null()) {
             return Err(AllocError);
         }
-        let ptr = NonNull::new(virt_addr.data() as *mut u8).unwrap();
+
         let slice = unsafe {
             core::slice::from_raw_parts_mut(
-                ptr.as_ptr(),
+                virt_addr.data() as *mut u8,
                 allocated_frame_count.data() * MMArch::PAGE_SIZE,
             )
         };
@@ -60,7 +60,7 @@ impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout, gfp: gfp_t) -> *mut u8 {
         return self
             .alloc_in_buddy(layout)
-            .map(|x| x.as_ptr() as *mut u8)
+            .map(|x| x.as_mut_ptr() as *mut u8)
             .unwrap_or(core::ptr::null_mut() as *mut u8);
     }
 
@@ -83,8 +83,8 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let x = self.local_alloc(layout, 0);
-        return x;
+        return self.local_alloc(layout, 0);
+        // self.local_alloc_zeroed(layout, 0)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {

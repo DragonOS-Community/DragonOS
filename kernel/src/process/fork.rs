@@ -11,12 +11,14 @@ use crate::{
         signal::{flush_signal_handlers, DEFAULT_SIGACTION},
         signal_types::{sigaction, sighand_struct, signal_struct, SigQueue},
     },
+    kdebug,
     libs::{
         atomic::atomic_set,
         ffi_convert::FFIBind2Rust,
         refcount::{refcount_inc, RefCount},
         spinlock::{spin_lock_irqsave, spin_unlock_irqrestore},
     },
+    mm::ucontext::AddressSpace,
     syscall::SystemError,
 };
 
@@ -130,4 +132,35 @@ pub extern "C" fn process_exit_sighand(pcb: *mut process_control_block) {
         drop(sig);
         (*pcb).signal = 0 as *mut crate::include::bindings::bindings::signal_struct;
     }
+}
+
+/// 拷贝进程的地址空间
+///
+/// ## 参数
+///
+/// - `clone_vm`: 是否与父进程共享地址空间。true表示共享
+/// - `new_pcb`: 新进程的pcb
+///
+/// ## 返回值
+///
+/// - 成功：返回Ok(())
+/// - 失败：返回Err(SystemError)
+///
+/// ## Panic
+///
+/// - 如果当前进程没有用户地址空间，则panic
+pub fn copy_mm(clone_vm: bool, new_pcb: &mut process_control_block) -> Result<(), SystemError> {
+    kdebug!("copy_mm, clone_vm: {}", clone_vm);
+    let old_address_space = current_pcb()
+        .address_space()
+        .expect("copy_mm: Failed to get address space of current process.");
+
+    if clone_vm {
+        unsafe { new_pcb.set_address_space(old_address_space) };
+        return Ok(());
+    }
+
+    let new_address_space = old_address_space.write().try_clone()?;
+    unsafe { new_pcb.set_address_space(new_address_space) };
+    return Ok(());
 }

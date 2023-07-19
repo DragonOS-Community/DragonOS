@@ -44,10 +44,10 @@ static struct scm_buffer_info_t *__create_buffer(uint64_t type)
     buf->width = video_frame_buffer_info.width;
     buf->size = video_frame_buffer_info.size;
 
-    struct Page *p = alloc_pages(ZONE_NORMAL, PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE, 0);
-    if (p == NULL)
+    void* buf_vaddr = kzalloc(video_frame_buffer_info.size, 0);
+    if (buf_vaddr == NULL)
         goto failed;
-    buf->vaddr = (uint64_t)phys_2_virt(p->addr_phys);
+    buf->vaddr = buf_vaddr;
     return buf;
 failed:;
     kfree(buf);
@@ -74,7 +74,7 @@ static int __destroy_buffer(struct scm_buffer_info_t *buf)
         return -EINVAL;
 
     // 释放内存页
-    free_pages(Phy_to_2M_Page(virt_2_phys(buf->vaddr)), PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE);
+    kfree((void*)buf->vaddr);
     return 0;
 }
 

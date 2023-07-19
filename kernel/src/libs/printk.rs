@@ -59,7 +59,7 @@ macro_rules! printk_color {
 #[macro_export]
 macro_rules! kdebug {
     ($($arg:tt)*) => {
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)));
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)))
 
     }
 }
@@ -67,7 +67,7 @@ macro_rules! kdebug {
 #[macro_export]
 macro_rules! kinfo {
     ($($arg:tt)*) => {
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)));
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)))
     }
 }
 

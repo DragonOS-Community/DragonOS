@@ -4,7 +4,7 @@ use crate::syscall::SystemError;
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        vm_flags_t, vma_find, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
+        vm_flags_t, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
     },
     kdebug, kerror,
     mm::{MMArch, MemoryManagementArch},

@@ -68,27 +68,6 @@ impl Debug for X86_64MMBootstrapInfo {
 
 pub static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
 
-/// @brief 切换进程的页表
-///
-/// @param 下一个进程的pcb。将会把它的页表切换进来。
-///
-/// @return 下一个进程的pcb(把它return的目的主要是为了归还所有权)
-#[inline(always)]
-#[allow(dead_code)]
-pub fn switch_mm(
-    next_pcb: &'static mut process_control_block,
-) -> &'static mut process_control_block {
-    mfence();
-    // kdebug!("to get pml4t");
-    let pml4t = unsafe { read_volatile(&next_pcb.mm.as_ref().unwrap().pgd) };
-
-    unsafe {
-        asm!("mov cr3, {}", in(reg) pml4t);
-    }
-    mfence();
-    return next_pcb;
-}
-
 /// @brief X86_64的内存管理架构结构体
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct X86_64MMArch;
@@ -132,7 +111,7 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
 
-    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7fff_ffff_ffff);
+    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7eff_ffff_ffff);
     const USER_BRK_START: VirtAddr = VirtAddr::new(0x700000000000);
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
 
@@ -167,25 +146,33 @@ impl MemoryManagementArch for X86_64MMArch {
 
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
     unsafe fn invalidate_page(address: VirtAddr) {
-        asm!("invlpg [{0}]", in(reg) address.data());
+        compiler_fence(Ordering::SeqCst);
+        asm!("invlpg [{0}]", in(reg) address.data(), options(nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// @brief 刷新TLB中，所有的条目
     unsafe fn invalidate_all() {
+        compiler_fence(Ordering::SeqCst);
         // 通过设置cr3寄存器，来刷新整个TLB
         Self::set_table(PageTableKind::User, Self::table(PageTableKind::User));
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// @brief 获取顶级页表的物理地址
     unsafe fn table(_table_kind: PageTableKind) -> PhysAddr {
         let paddr: usize;
-        asm!("mov {0}, cr3", out(reg) paddr);
+        compiler_fence(Ordering::SeqCst);
+        asm!("mov {}, cr3", out(reg) paddr, options(nomem, nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
         return PhysAddr::new(paddr);
     }
 
     /// @brief 设置顶级页表的物理地址到处理器中
     unsafe fn set_table(_table_kind: PageTableKind, table: PhysAddr) {
-        asm!("mov cr3, {0}", in(reg) table.data());
+        compiler_fence(Ordering::SeqCst);
+        asm!("mov cr3, {}", in(reg) table.data(), options(nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// @brief 判断虚拟地址是否合法
@@ -334,11 +321,12 @@ unsafe fn allocator_init() {
     // 使用bump分配器，把所有的内存页都映射到页表
     {
         // 用bump allocator创建新的页表
-        let mut mapper = crate::mm::page::PageMapper::<MMArch, _>::create(
-            PageTableKind::Kernel,
-            &mut bump_allocator,
-        )
-        .expect("Failed to create page mapper");
+        let mut mapper: crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>> =
+            crate::mm::page::PageMapper::<MMArch, _>::create(
+                PageTableKind::Kernel,
+                &mut bump_allocator,
+            )
+            .expect("Failed to create page mapper");
         new_page_table = mapper.table().phys();
         kdebug!("PageMapper created");
 
@@ -359,7 +347,7 @@ unsafe fn allocator_init() {
             for i in 0..area.size / MMArch::PAGE_SIZE {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
-                let flags = page_flags::<MMArch>(vaddr);
+                let flags = kernel_page_flags::<MMArch>(vaddr);
                 if paddr.data() >= 0x1fff0000 {
                     kdebug!(
                         "NOTICE: vaddr: {:?}, paddr: {:?}, flags: {:?}",
@@ -378,18 +366,7 @@ unsafe fn allocator_init() {
         }
 
         // 添加低地址的映射（在smp完成初始化之前，需要使用低地址的映射.初始化之后需要取消这一段映射）
-        // 映射32M
-        for i in 0..32 * 1024 * 1024 / MMArch::PAGE_SIZE {
-            let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
-            let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
-            let flags = page_flags::<MMArch>(vaddr);
-
-            let flusher = mapper
-                .map_phys(vaddr, paddr, flags)
-                .expect("Failed to map frame");
-            // 暂时不刷新TLB
-            flusher.ignore();
-        }
+        LowAddressRemapping::remap_at_low_address(&mut mapper);
 
         kdebug!(
             "Successfully mapped all physical memory, table={:?}",
@@ -477,7 +454,8 @@ impl FrameAllocator for LockedFrameAllocator {
     }
 }
 
-unsafe fn page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
+/// 获取内核地址默认的页面标志
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
@@ -502,6 +480,48 @@ unsafe fn set_inner_allocator(allocator: BuddyAllocator<MMArch>) {
     *INNER_ALLOCATOR.lock() = Some(allocator);
 }
 
+/// 低地址重映射的管理器
+///
+/// 低地址重映射的管理器，在smp初始化完成之前，需要使用低地址的映射，因此需要在smp初始化完成之后，取消这一段映射
+pub struct LowAddressRemapping;
+
+impl LowAddressRemapping {
+    // 映射32M
+    const REMAP_SIZE: usize = 32 * 1024 * 1024;
+
+    pub unsafe fn remap_at_low_address(
+        mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
+    ) {
+        for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
+            let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
+            let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
+            let flags = kernel_page_flags::<MMArch>(vaddr);
+
+            let flusher = mapper
+                .map_phys(vaddr, paddr, flags)
+                .expect("Failed to map frame");
+            // 暂时不刷新TLB
+            flusher.ignore();
+        }
+    }
+
+    /// 取消低地址的映射
+    pub unsafe fn unmap_at_low_address(flush: bool) {
+        let mut mapper = KernelMapper::lock();
+        assert!(mapper.as_mut().is_some());
+        for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
+            let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
+            let flusher = mapper
+                .as_mut()
+                .unwrap()
+                .unmap(vaddr, true)
+                .expect("Failed to unmap frame");
+            if flush == false {
+                flusher.ignore();
+            }
+        }
+    }
+}
 #[no_mangle]
 pub extern "C" fn rs_mm_init() {
     mm_init();

@@ -3,7 +3,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{compiler_fence, AtomicU32, Ordering},
 };
 
 use crate::{
@@ -238,12 +238,10 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
     pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> PageFlags<Arch> {
-        let flags: PageFlags<Arch> = unsafe {
-            PageFlags::from_data(0)
-                .set_user(user)
-                .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
-                .set_write(prot_flags.contains(ProtFlags::PROT_WRITE))
-        };
+        let flags: PageFlags<Arch> = PageFlags::new()
+            .set_user(user)
+            .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
+            .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
 
         return flags;
     }
@@ -358,6 +356,57 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return self.data & (Arch::ENTRY_FLAG_EXEC | Arch::ENTRY_FLAG_NO_EXEC)
             == Arch::ENTRY_FLAG_EXEC;
     }
+
+    /// 设置当前页表项的缓存策略
+    ///
+    /// ## 参数
+    ///
+    /// - value: 如果为true，那么将当前页表项的缓存策略设置为不缓存。
+    #[inline(always)]
+    pub fn set_page_cache_disable(self, value: bool) -> Self {
+        return self.update_flags(Arch::ENTRY_FLAG_CACHE_DISABLE, value);
+    }
+
+    /// 获取当前页表项的缓存策略
+    ///
+    /// ## 返回值
+    ///
+    /// 如果当前页表项的缓存策略为不缓存，那么返回true，否则返回false。
+    #[inline(always)]
+    pub fn has_page_cache_disable(&self) -> bool {
+        return self.has_flag(Arch::ENTRY_FLAG_CACHE_DISABLE);
+    }
+
+    /// 设置当前页表项的写穿策略
+    ///
+    /// ## 参数
+    ///
+    /// - value: 如果为true，那么将当前页表项的写穿策略设置为写穿。
+    #[inline(always)]
+    pub fn set_page_write_through(self, value: bool) -> Self {
+        return self.update_flags(Arch::ENTRY_FLAG_WRITE_THROUGH, value);
+    }
+
+    /// 获取当前页表项的写穿策略
+    ///
+    /// ## 返回值
+    ///
+    /// 如果当前页表项的写穿策略为写穿，那么返回true，否则返回false。
+    #[inline(always)]
+    pub fn has_page_write_through(&self) -> bool {
+        return self.has_flag(Arch::ENTRY_FLAG_WRITE_THROUGH);
+    }
+
+    /// MMIO内存的页表项标志
+    #[inline(always)]
+    pub fn mmio_flags() -> Self {
+        return Self::new()
+            .set_user(true)
+            .set_write(true)
+            .set_execute(true)
+            .set_page_cache_disable(true)
+            .set_page_write_through(true);
+    }
 }
 
 impl<Arch: MemoryManagementArch> fmt::Debug for PageFlags<Arch> {
@@ -453,7 +502,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         flags: PageFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
+        compiler_fence(Ordering::SeqCst);
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
+        compiler_fence(Ordering::SeqCst);
         return self.map_phys(virt, phys, flags);
     }
 
@@ -489,7 +540,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     kwarn!("Page {:?} already mapped", virt);
                 }
                 // kdebug!("Mapping {:?} to {:?}, i = {i}, entry={:?}, flags={:?}", virt, phys, entry, flags);
+                compiler_fence(Ordering::SeqCst);
                 table.set_entry(i, entry);
+                compiler_fence(Ordering::SeqCst);
                 return Some(PageFlush::new(virt));
             } else {
                 let next_table = table.next_level_table(i);
@@ -567,7 +620,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ///
     /// @return 如果查找成功，返回物理地址和页表项的flags，否则返回None
     pub fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags<Arch>)> {
-        let entry: PageEntry<Arch> = self.visit(virt, |p1, i| unsafe { p1.entry(i) }).flatten()?;
+        let entry: PageEntry<Arch> = self.visit(virt, |p1, i| unsafe { p1.entry(i) })??;
         let paddr = entry.address().ok()?;
         let flags = entry.flags();
         return Some((paddr, flags));

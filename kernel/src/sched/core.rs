@@ -7,6 +7,7 @@ use crate::{
         process_control_block, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING, SCHED_FIFO,
         SCHED_NORMAL, SCHED_RR,
     },
+    kinfo,
     process::process::process_cpu,
     syscall::SystemError,
 };
@@ -140,10 +141,12 @@ pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut res
 #[allow(dead_code)]
 #[no_mangle]
 pub extern "C" fn sched_init() {
+    kinfo!("Initializing schedulers...");
     unsafe {
         sched_cfs_init();
         sched_rt_init();
     }
+    kinfo!("Schedulers initialized");
 }
 
 /// @brief 当时钟中断到达时，更新时间片

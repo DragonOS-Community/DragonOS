@@ -97,14 +97,12 @@ void system_initialize()
     // mm_init();
     rs_mm_init();
 
-
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
     // 对显示模块进行低级初始化，不启用double buffer
     scm_reinit();
 
-    
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
@@ -117,14 +115,12 @@ void system_initialize()
     initial_tss[0].ist6 = (ul)ptr;
     initial_tss[0].ist7 = (ul)ptr;
     // ===========================
-    
+
     acpi_init();
-while (1)
-    {
-        /* code */
-    }
-    // 初始化中断模块
+    io_mfence();
     sched_init();
+    io_mfence();
+    // 初始化中断模块
     irq_init();
 
     // softirq_init();
@@ -132,9 +128,8 @@ while (1)
 
     current_pcb->cpu_id = 0;
     current_pcb->preempt_count = 0;
-    
-    syscall_init();
 
+    syscall_init();
     io_mfence();
 
     rs_timekeeping_init();
@@ -146,36 +141,43 @@ while (1)
     rs_jiffies_init();
     io_mfence();
 
+
+    io_mfence();
+    vfs_init();
+    rs_tty_init();
+    io_mfence();
+    // 由于进程管理模块依赖于文件系统，因此必须在文件系统初始化完毕后再初始化进程管理模块
+    // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，
+    // 因此必须在进程管理模块初始化完毕后再初始化smp。
+    io_mfence();
+    process_init();
+    io_mfence();
     rs_clocksource_boot_finish();
+
+    io_mfence();
+
+    cpu_init();
+
+    ps2_keyboard_init();
+    io_mfence();
+
+    pci_init();
+
+    rs_pci_init();
+
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
     io_mfence();
 
-    vfs_init();
-    rs_tty_init();
-    
-    cpu_init();
-    ps2_keyboard_init();
-    // tty_init();
-    // ps2_mouse_init();
-    // ata_init();
-    pci_init();
-    rs_pci_init();
-    io_mfence();
-
-    // test_slab();
-    // test_mm();
-
-    // process_init();
     HPET_init();
+
     io_mfence();
     HPET_measure_freq();
     io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
 
-    process_init();
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
@@ -187,6 +189,10 @@ while (1)
 
     apic_timer_init();
     io_mfence();
+    while (1)
+    {
+        /* code */
+    }
 
     // 这里不能删除，否则在O1会报错
     // while (1)

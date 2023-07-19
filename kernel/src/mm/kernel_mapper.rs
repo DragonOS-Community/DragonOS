@@ -1,10 +1,15 @@
-use super::{PageTableKind, PhysAddr, PhysMemoryArea};
+use super::{page::PageFlags, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
 use crate::{
     arch::{
         asm::irqflags::{local_irq_restore, local_irq_save},
         mm::{LockedFrameAllocator, PageMapper},
     },
+    kdebug,
+    libs::align::page_align_up,
+    mm::allocator::page_frame::PageFrameCount,
+    mm::{MMArch, MemoryManagementArch},
     smp::core::smp_get_processor_id,
+    syscall::SystemError,
 };
 use core::{
     ops::{Deref, DerefMut},
@@ -74,6 +79,48 @@ impl KernelMapper {
     #[inline(always)]
     pub fn as_ref(&self) -> &PageMapper {
         return &self.mapper;
+    }
+
+    /// 映射一段物理地址到指定的虚拟地址。
+    ///
+    /// ## 参数
+    ///
+    /// - `vaddr`: 要映射的虚拟地址
+    /// - `paddr`: 要映射的物理地址
+    /// - `size`: 要映射的大小（字节，必须是页大小的整数倍，否则会向上取整）
+    /// - `flags`: 页面标志
+    /// - `flush`: 是否刷新TLB
+    ///
+    /// ## 返回
+    ///
+    /// - 成功：返回Ok(())
+    /// - 失败： 如果当前映射器为只读，则返回EAGAIN_OR_EWOULDBLOCK
+    pub unsafe fn map_phys_with_size(
+        &mut self,
+        mut vaddr: VirtAddr,
+        mut paddr: PhysAddr,
+        size: usize,
+        flags: PageFlags<MMArch>,
+        flush: bool,
+    ) -> Result<(), SystemError> {
+        if self.readonly {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let count = PageFrameCount::new(page_align_up(size) / MMArch::PAGE_SIZE);
+        // kdebug!("kernel mapper: map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
+
+        for _ in 0..count.data() {
+            let flusher = self.mapper.map_phys(vaddr, paddr, flags).unwrap();
+
+            if flush {
+                flusher.flush();
+            }
+
+            vaddr += MMArch::PAGE_SIZE;
+            paddr += MMArch::PAGE_SIZE;
+        }
+        return Ok(());
     }
 }
 

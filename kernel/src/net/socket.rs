@@ -64,7 +64,7 @@ impl Drop for GlobalSocketHandle {
 }
 
 /// @brief socket的类型
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum SocketType {
     /// 原始的socket
     RawSocket,
@@ -91,7 +91,7 @@ bitflags! {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
 pub struct SocketMetadata {
     /// socket的类型
@@ -116,8 +116,8 @@ pub struct RawSocket {
     /// 如果是true，用户发送的数据包，必须包含IP头。（即用户要自行设置IP头+数据）
     /// 如果是false，用户发送的数据包，不包含IP头。（即用户只要设置数据）
     header_included: bool,
-    /// socket的选项
-    options: SocketOptions,
+    /// socket的metadata
+    metadata: SocketMetadata,
 }
 
 impl RawSocket {
@@ -154,10 +154,18 @@ impl RawSocket {
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
 
+        let metadata = SocketMetadata {
+            socket_type: SocketType::RawSocket,
+            send_buf_size: Self::DEFAULT_RX_BUF_SIZE,
+            recv_buf_size: Self::DEFAULT_TX_BUF_SIZE,
+            metadata_buf_size: Self::DEFAULT_METADATA_BUF_SIZE,
+            options,
+        };
+
         return Self {
             handle,
             header_included: false,
-            options,
+            metadata,
         };
     }
 }
@@ -182,7 +190,7 @@ impl Socket for RawSocket {
                     );
                 }
                 Err(smoltcp::socket::raw::RecvError::Exhausted) => {
-                    if !self.options.contains(SocketOptions::BLOCK) {
+                    if !self.metadata.options.contains(SocketOptions::BLOCK) {
                         // 如果是非阻塞的socket，就返回错误
                         return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), Endpoint::Ip(None));
                     }
@@ -276,7 +284,7 @@ impl Socket for RawSocket {
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        todo!()
+        Ok(self.metadata.clone())
     }
 
     fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
@@ -291,7 +299,7 @@ impl Socket for RawSocket {
 pub struct UdpSocket {
     pub handle: Arc<GlobalSocketHandle>,
     remote_endpoint: Option<Endpoint>, // 记录远程endpoint提供给connect()， 应该使用IP地址。
-    options: SocketOptions,
+    metadata: SocketMetadata,
 }
 
 impl UdpSocket {
@@ -322,17 +330,25 @@ impl UdpSocket {
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
 
+        let metadata = SocketMetadata {
+            socket_type: SocketType::UdpSocket,
+            send_buf_size: Self::DEFAULT_RX_BUF_SIZE,
+            recv_buf_size: Self::DEFAULT_TX_BUF_SIZE,
+            metadata_buf_size: Self::DEFAULT_METADATA_BUF_SIZE,
+            options,
+        };
+
         return Self {
             handle,
             remote_endpoint: None,
-            options,
+            metadata,
         };
     }
 
     fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(ip)) = endpoint {
             // 检测端口是否已被占用
-            get_port(SocketType::UdpSocket, ip.port, self.handle.clone())?;
+            get_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
 
             let bind_res = if ip.addr.is_unspecified() {
                 socket.bind(ip.port)
@@ -396,7 +412,7 @@ impl Socket for UdpSocket {
         // kdebug!("is open()={}", socket.is_open());
         // kdebug!("socket endpoint={:?}", socket.endpoint());
         if socket.endpoint().port == 0 {
-            let temp_port = get_ephemeral_port(SocketType::UdpSocket)?;
+            let temp_port = get_ephemeral_port(self.metadata.socket_type)?;
 
             let local_ep = match remote_endpoint.addr {
                 // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
@@ -469,7 +485,7 @@ impl Socket for UdpSocket {
         todo!()
     }
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        todo!()
+        Ok(self.metadata.clone())
     }
 
     fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
@@ -510,7 +526,7 @@ pub struct TcpSocket {
     handle: Arc<GlobalSocketHandle>,
     local_endpoint: Option<wire::IpEndpoint>, // save local endpoint for bind()
     is_listening: bool,
-    options: SocketOptions,
+    metadata: SocketMetadata,
 }
 
 impl TcpSocket {
@@ -535,11 +551,19 @@ impl TcpSocket {
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
 
+        let metadata = SocketMetadata {
+            socket_type: SocketType::TcpSocket,
+            send_buf_size: Self::DEFAULT_RX_BUF_SIZE,
+            recv_buf_size: Self::DEFAULT_TX_BUF_SIZE,
+            metadata_buf_size: Self::DEFAULT_METADATA_BUF_SIZE,
+            options,
+        };
+
         return Self {
             handle,
             local_endpoint: None,
             is_listening: false,
-            options,
+            metadata,
         };
     }
     fn do_listen(
@@ -676,7 +700,7 @@ impl Socket for TcpSocket {
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
-            let temp_port = get_ephemeral_port(SocketType::TcpSocket)?;
+            let temp_port = get_ephemeral_port(self.metadata.socket_type)?;
             // kdebug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDriver> = NET_DRIVERS.write().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
@@ -745,11 +769,11 @@ impl Socket for TcpSocket {
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(mut ip)) = endpoint {
             if ip.port == 0 {
-                ip.port = get_ephemeral_port(SocketType::TcpSocket)?;
+                ip.port = get_ephemeral_port(self.metadata.socket_type)?;
             }
 
             // 检测端口是否已被占用
-            get_port(SocketType::TcpSocket, ip.port, self.handle.clone())?;
+            get_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
@@ -796,11 +820,19 @@ impl Socket for TcpSocket {
                     let new_handle = Arc::new(GlobalSocketHandle::new(sockets.add(tcp_socket)));
                     let old_handle = ::core::mem::replace(&mut self.handle, new_handle);
 
+                    let metadata = SocketMetadata {
+                        socket_type: SocketType::TcpSocket,
+                        send_buf_size: Self::DEFAULT_RX_BUF_SIZE,
+                        recv_buf_size: Self::DEFAULT_TX_BUF_SIZE,
+                        metadata_buf_size: Self::DEFAULT_METADATA_BUF_SIZE,
+                        options: self.metadata.options,
+                    };
+
                     Box::new(TcpSocket {
                         handle: old_handle,
                         local_endpoint: self.local_endpoint,
                         is_listening: false,
-                        options: self.options,
+                        metadata,
                     })
                 };
                 // kdebug!("tcp accept: new socket: {:?}", new_socket);
@@ -836,7 +868,7 @@ impl Socket for TcpSocket {
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        todo!()
+        Ok(self.metadata.clone())
     }
 
     fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
@@ -845,7 +877,7 @@ impl Socket for TcpSocket {
 }
 
 /// @breif 自动分配一个未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
-pub fn get_ephemeral_port(sk_type: SocketType) -> Result<u16, SystemError> {
+pub fn get_ephemeral_port(socket_type: SocketType) -> Result<u16, SystemError> {
     // TODO selects non-conflict high port
 
     static mut EPHEMERAL_PORT: u16 = 0;
@@ -868,7 +900,7 @@ pub fn get_ephemeral_port(sk_type: SocketType) -> Result<u16, SystemError> {
         }
 
         // 使用 ListenTable 检查端口是否被占用
-        let listen_table_guard = match sk_type {
+        let listen_table_guard = match socket_type {
             SocketType::UdpSocket => UDP_PORT_TABLE.lock(),
             _ => TCP_PORT_TABLE.lock(),
         };
@@ -899,6 +931,7 @@ pub fn get_port(socket_type: SocketType, port: u16, handle: Arc<GlobalSocketHand
     Ok(())
 }
 
+/// @breif 在对应的端口记录表中将端口和 socket 解绑
 pub fn unbind_port(socket_type: SocketType, port: u16) -> Result<(), SystemError> {
     let mut listen_table_guard = match socket_type {
         SocketType::UdpSocket => UDP_PORT_TABLE.lock(),

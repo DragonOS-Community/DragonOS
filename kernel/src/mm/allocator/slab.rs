@@ -1,3 +1,6 @@
+//! 当前slab分配器暂时不使用，等待后续完善后合并主线
+#![allow(dead_code)]
+
 use core::alloc::Layout;
 
 // 定义Slab，用来存放空闲块
@@ -39,7 +42,7 @@ impl Slab {
     }
     /// @brief: 从slab中分配一个block
     /// @return 分配的内存地址
-    pub fn allocate(&mut self, layout: Layout) -> Option<*mut u8> {
+    pub fn allocate(&mut self, _layout: Layout) -> Option<*mut u8> {
         match self.free_block_list.pop() {
             Some(block) => return Some(block.addr() as *mut u8),
             None => return None,

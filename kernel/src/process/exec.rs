@@ -5,13 +5,13 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
-        IndexNode, ROOT_INODE,
+        ROOT_INODE,
     },
     io::SeekFrom,
     kdebug,
-    libs::{elf::ELF_LOADER, rwlock::RwLock},
+    libs::elf::ELF_LOADER,
     mm::{
-        ucontext::{AddressSpace, InnerAddressSpace, UserStack},
+        ucontext::{AddressSpace, UserStack},
         VirtAddr,
     },
     syscall::SystemError,
@@ -48,6 +48,7 @@ impl BinaryLoaderResult {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum ExecError {
     /// 二进制文件不可执行
@@ -66,6 +67,7 @@ pub enum ExecError {
     InvalidParemeter,
     /// 无效的地址
     BadAddress(Option<VirtAddr>),
+    Other(String),
 }
 
 impl Into<SystemError> for ExecError {
@@ -78,7 +80,8 @@ impl Into<SystemError> for ExecError {
             ExecError::ParseError => SystemError::ENOEXEC,
             ExecError::OutOfMemory => SystemError::ENOMEM,
             ExecError::InvalidParemeter => SystemError::EINVAL,
-            ExecError::BadAddress(addr) => SystemError::EFAULT,
+            ExecError::BadAddress(_addr) => SystemError::EFAULT,
+            ExecError::Other(_msg) => SystemError::ENOEXEC,
         }
     }
 }
@@ -109,6 +112,7 @@ pub enum ExecLoadMode {
     DSO,
 }
 
+#[allow(dead_code)]
 impl<'a> ExecParam<'a> {
     pub fn new(file_path: &'a str, vm: Arc<AddressSpace>, flags: ExecParamFlags) -> Self {
         Self {
@@ -183,7 +187,9 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
     kdebug!("load_binary_file: to load with param: {:?}", param);
-    let result: BinaryLoaderResult = loader.load(param, &head_buf).map_err(|e| e.into())?;
+    let result: BinaryLoaderResult = loader
+        .load(param, &head_buf)
+        .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
     kdebug!("load_binary_file: load success");
     return Ok(result);
 }

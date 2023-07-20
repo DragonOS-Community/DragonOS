@@ -1,18 +1,18 @@
-use crate::arch::MMArch;
-/// @Auther: Kong
+/// @Author: longjin@dragonos.org
+/// @Author: kongweichao@dragonos.org
 /// @Date: 2023-03-28 16:03:47
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/buddy.rs
-/// @Description:
-use crate::libs::spinlock::SpinLock;
+/// @Description: 伙伴分配器
+/// 
+use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 use crate::{kdebug, kerror, kwarn};
-use core::alloc::{AllocError, Allocator, Layout};
-use core::cmp::{self, max, min};
+use core::cmp::{max, min};
 use core::fmt::Debug;
 use core::intrinsics::{likely, unlikely};
-use core::ptr::NonNull;
+
 use core::{marker::PhantomData, mem};
 
 // 一个全局变量MAX_ORDER，用来表示buddy算法的最大阶数 [MIN_ORDER, MAX_ORDER)左闭右开区间
@@ -41,6 +41,7 @@ impl<A> Clone for PageList<A> {
 }
 
 impl<A> PageList<A> {
+    #[allow(dead_code)]
     fn empty() -> Self {
         Self {
             entry_num: 0,
@@ -66,13 +67,6 @@ pub struct BuddyAllocator<A> {
     // 存放每个阶的空闲“链表”的头部地址
     free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize],
     phantom: PhantomData<A>,
-}
-#[derive(Debug)]
-pub struct LockedBuddyAllocator<A>(SpinLock<BuddyAllocator<A>>);
-impl<A: MemoryManagementArch> LockedBuddyAllocator<A> {
-    pub fn new(buddy_allocator: BuddyAllocator<A>) -> Self {
-        Self(SpinLock::new(buddy_allocator))
-    }
 }
 
 impl<A: MemoryManagementArch> BuddyAllocator<A> {
@@ -168,7 +162,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     entries -= num;
 
                     let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
-                    for j in 0..num {
+                    for _j in 0..num {
                         A::write(
                             Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
                             paddr,
@@ -240,28 +234,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
         Some(allocator)
     }
-    pub unsafe fn print_free_area(free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER + 1) as usize]) {
-        // 打印所有free_area的信息
-        for i in 0..free_area.len() - 1 {
-            let virt_addr = A::phys_2_virt(free_area[i]);
-            let mut page_list: PageList<A> = A::read(virt_addr.unwrap());
-            kdebug!("free_area[{}]: {:b}", i, free_area[i].data());
-            while page_list.next_page.data() != 0 {
-                let next_page_phy_addr = page_list.next_page;
-                let virt_addr = A::phys_2_virt(next_page_phy_addr);
-                page_list = A::read(virt_addr.unwrap());
-                kdebug!("page_list: {:b}", page_list.next_page.data());
-            }
-            // 从page_list中读取每个entry的地址
-            let mut entry_addr = free_area[i].add(mem::size_of::<PageList<A>>());
-            for _ in 0..Self::BUDDY_ENTRIES {
-                let entry_virt_addr = A::phys_2_virt(entry_addr);
-                let entry: PhysAddr = A::read(entry_virt_addr.unwrap());
-                kdebug!("entry: {:b}", entry.data());
-                entry_addr = entry_addr.add(mem::size_of::<PhysAddr>());
-            }
-        }
-    }
+    
     /// 获取第j个entry的虚拟地址，
     /// j从0开始计数
     pub fn entry_virt_addr(base_addr: PhysAddr, j: usize) -> VirtAddr {
@@ -684,42 +657,6 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
 
     unsafe fn usage(&self) -> PageFrameUsage {
         todo!("BuddyAllocator::usage")
-    }
-}
-unsafe impl<A: MemoryManagementArch> Allocator for LockedBuddyAllocator<A> {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        // 计算需要申请的页数，向上取整
-        let count = (layout.size() + A::PAGE_SIZE - 1) & (!(A::PAGE_SIZE - 1));
-        let page_frame_count = PageFrameCount::new(count);
-        let (phy_addr, allocated_frame_count) = self
-            .0
-            .lock()
-            .buddy_alloc(page_frame_count)
-            .ok_or(AllocError)?;
-
-        if unlikely(allocated_frame_count < page_frame_count) {
-            return Err(AllocError);
-        }
-
-        let virt_addr = unsafe { A::phys_2_virt(phy_addr).ok_or(AllocError)? };
-        let ptr = NonNull::new(virt_addr.data() as *mut u8).unwrap();
-        let slice = unsafe {
-            core::slice::from_raw_parts_mut(
-                ptr.as_ptr(),
-                allocated_frame_count.data() * A::PAGE_SIZE,
-            )
-        };
-        // kdebug!("allocate");
-        return Ok(NonNull::from(slice));
-    }
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        // // 计算需要释放的页数，向上取整
-        let count = (layout.size() + A::PAGE_SIZE - 1) & (!(A::PAGE_SIZE - 1));
-        // 由于buddy分配的页数量是2的幂，因此释放的时候也需要2的幂(向上取整)
-        let page_frame_count = PageFrameCount::new(count.next_power_of_two());
-
-        let phy_addr = unsafe { A::virt_2_phys(VirtAddr::new(ptr.as_ptr() as usize)).unwrap() };
-        self.0.lock().free(phy_addr, page_frame_count);
     }
 }
 

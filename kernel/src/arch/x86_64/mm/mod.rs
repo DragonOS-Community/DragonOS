@@ -3,16 +3,17 @@ pub mod frame;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
 use x86::time::rdtsc;
+use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
     disable_textui, enable_textui, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
-    process_control_block, video_reinitialize,
+    video_reinitialize,
 };
 use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
-use crate::mm::allocator::kernel_allocator::KernelAllocator;
+
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
 use crate::mm::mmio_buddy::mmio_init;
 use crate::{
@@ -29,11 +30,9 @@ use crate::{kdebug, kinfo};
 use core::arch::asm;
 use core::ffi::c_void;
 use core::fmt::{Debug, Write};
-use core::mem::{self, MaybeUninit};
-use core::ptr::read_volatile;
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::mem::{self};
 
-use self::barrier::mfence;
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
@@ -76,6 +75,9 @@ pub static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
 /// @brief X86_64的内存管理架构结构体
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct X86_64MMArch;
+
+/// XD标志位是否被保留
+static XD_RESERVED: AtomicBool = AtomicBool::new(false);
 
 impl MemoryManagementArch for X86_64MMArch {
     /// 4K页
@@ -129,6 +131,8 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _erodata();
             fn _end();
         }
+
+        Self::init_xd_rsvd();
 
         let bootstrap_info = X86_64MMBootstrapInfo {
             kernel_code_start: _text as usize,
@@ -253,7 +257,27 @@ impl X86_64MMArch {
         }
         c_uart_send_str(0x3f8, "init_memory_area_from_multiboot2 end\n\0".as_ptr());
         kinfo!("Total memory size: {} MB, total areas from multiboot2: {mb2_count}, valid areas: {areas_count}", total_mem_size / 1024 / 1024);
+
         return Ok(areas_count);
+    }
+
+    fn init_xd_rsvd() {
+        // 读取ia32-EFER寄存器的值
+        let efer: EferFlags = x86_64::registers::model_specific::Efer::read();
+        if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
+            // NO_EXECUTE_ENABLE是false，那么就设置xd_reserved为true
+            kdebug!("NO_EXECUTE_ENABLE is false, set XD_RESERVED to true");
+            XD_RESERVED.store(true, Ordering::Relaxed);
+            kdebug!("11efer.contains(EferFlags::NO_EXECUTE_ENABLE)={}, XD_RESERVED={}", efer.contains(EferFlags::NO_EXECUTE_ENABLE), XD_RESERVED.load(Ordering::Relaxed));
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        kdebug!("efer.contains(EferFlags::NO_EXECUTE_ENABLE)={}, XD_RESERVED={}", efer.contains(EferFlags::NO_EXECUTE_ENABLE), XD_RESERVED.load(Ordering::Relaxed));
+    }
+
+    /// 判断XD标志位是否被保留
+    pub fn is_xd_reserved() -> bool {
+        return XD_RESERVED.load(Ordering::Relaxed);
     }
 }
 
@@ -557,7 +581,7 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> Page
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
-        // Remap kernel code read only, execute
+        // Remap kernel code  execute
         return PageFlags::new().set_execute(true).set_write(true);
     } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only

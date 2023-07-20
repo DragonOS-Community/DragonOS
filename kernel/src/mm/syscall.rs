@@ -7,14 +7,14 @@ use crate::{
     current_pcb,
     include::bindings::bindings::mm_stat_t,
     kdebug, kerror,
-    libs::{align::check_aligned, rwlock::RwLock},
+    libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
     syscall::{Syscall, SystemError},
 };
 
 use super::{
     allocator::page_frame::{PageFrameCount, VirtPageFrame},
-    ucontext::{AddressSpace, InnerAddressSpace, DEFAULT_MMAP_MIN_ADDR},
+    ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
     verify_area, VirtAddr,
 };
 
@@ -71,11 +71,16 @@ extern "C" {
     fn sys_do_mstat(dst: *mut mm_stat_t, from_user: bool) -> usize;
 }
 impl Syscall {
-    pub fn brk(new_addr: VirtAddr) -> Result<(), SystemError> {
+    pub fn brk(new_addr: VirtAddr) -> Result<VirtAddr, SystemError> {
         kdebug!("brk: new_addr={:?}", new_addr);
         let address_space = AddressSpace::current()?;
         let mut address_space = address_space.write();
-        return unsafe { address_space.set_brk(new_addr).map(|_| ()) };
+
+        unsafe {
+            address_space.set_brk(VirtAddr::new(page_align_up(new_addr.data()))).ok();
+
+            return Ok(address_space.sbrk(0).unwrap());
+        }
     }
 
     pub fn sbrk(incr: isize) -> Result<VirtAddr, SystemError> {

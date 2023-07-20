@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    arch::{asm::current::current_pcb, mm::test_buddy},
+    arch::asm::current::current_pcb,
     kdebug,
     mm::{
         set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, INITIAL_PROCESS_ADDRESS_SPACE,

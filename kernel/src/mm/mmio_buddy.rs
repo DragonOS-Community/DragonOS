@@ -4,16 +4,16 @@ use crate::syscall::SystemError;
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{
-        vm_flags_t, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE, VM_DONTCOPY, VM_IO,
+        vm_flags_t, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE,
     },
-    kdebug, kerror,
+    kdebug,
     mm::{MMArch, MemoryManagementArch},
 };
 use crate::{kinfo, kwarn};
-use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
+use alloc::{collections::LinkedList, vec::Vec};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{compiler_fence, Ordering};
-use core::{mem, ptr::null_mut};
+use core::mem;
 
 use super::VirtAddr;
 
@@ -74,7 +74,7 @@ impl MmioBuddyMemPool {
         let cnt_1g_blocks = (MMIO_TOP - MMIO_BASE) >> 30;
         let mut vaddr_base = MMIO_BASE;
         kdebug!("total 1G blocks: {cnt_1g_blocks}");
-        for i in 0..cnt_1g_blocks {
+        for _i in 0..cnt_1g_blocks {
             compiler_fence(Ordering::SeqCst);
             match pool.give_back_block(vaddr_base, PAGE_1G_SHIFT) {
                 Ok(_) => {
@@ -479,7 +479,7 @@ impl MmioBuddyMemPool {
     pub fn create_mmio(
         &self,
         size: usize,
-        vm_flags: vm_flags_t,
+        _vm_flags: vm_flags_t,
         res_vaddr: *mut u64,
         res_length: *mut u64,
     ) -> Result<i32, SystemError> {
@@ -575,6 +575,7 @@ impl MmioBuddyAddrRegion {
         return MmioBuddyAddrRegion { vaddr };
     }
 
+    #[allow(dead_code)]
     pub fn vaddr(&self) -> VirtAddr {
         return self.vaddr;
     }

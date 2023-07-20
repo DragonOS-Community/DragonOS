@@ -15,6 +15,7 @@ pub struct PhysPageFrame {
     number: usize,
 }
 
+#[allow(dead_code)]
 impl PhysPageFrame {
     pub fn new(paddr: PhysAddr) -> Self {
         return Self {
@@ -39,10 +40,7 @@ impl PhysPageFrame {
 
     /// 构造物理页帧的迭代器，范围为[start, end)
     pub fn iter_range(start: Self, end: Self) -> PhysPageFrameIter {
-        return PhysPageFrameIter {
-            current: start,
-            end,
-        };
+        return PhysPageFrameIter::new(start, end);
     }
 }
 
@@ -261,6 +259,7 @@ pub struct PageFrameUsage {
     total: PageFrameCount,
 }
 
+#[allow(dead_code)]
 impl PageFrameUsage {
     /// @brief:  初始化FrameUsage
     /// @param PageFrameCount used 已使用的页帧数量
@@ -268,6 +267,7 @@ impl PageFrameUsage {
     pub fn new(used: PageFrameCount, total: PageFrameCount) -> Self {
         return Self { used, total };
     }
+    
     // @brief 获取已使用的页帧数量
     pub fn used(&self) -> PageFrameCount {
         return self.used;

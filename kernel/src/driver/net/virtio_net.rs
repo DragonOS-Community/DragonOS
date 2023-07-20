@@ -9,8 +9,7 @@ use smoltcp::{phy, wire};
 use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use crate::{
-    driver::{virtio::virtio_impl::HalImpl, Driver},
-    kdebug, kerror, kinfo,
+    driver::{virtio::virtio_impl::HalImpl, Driver}, kerror, kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
     syscall::SystemError,

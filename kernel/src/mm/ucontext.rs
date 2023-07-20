@@ -4,7 +4,6 @@ use core::{
     cmp,
     hash::Hasher,
     intrinsics::unlikely,
-    mem::ManuallyDrop,
     ops::Add,
     sync::atomic::{compiler_fence, Ordering},
 };
@@ -19,7 +18,7 @@ use hashbrown::HashSet;
 use crate::{
     arch::{
         asm::current::current_pcb,
-        mm::{test_buddy, PageMapper},
+        mm::PageMapper,
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
@@ -162,7 +161,7 @@ impl InnerAddressSpace {
         unsafe {
             new_guard.user_stack = Some(self.user_stack.as_ref().unwrap().clone_info_only());
         }
-        let current_stack_size = self.user_stack.as_ref().unwrap().stack_size();
+        let _current_stack_size = self.user_stack.as_ref().unwrap().stack_size();
 
         let current_mapper = &mut self.user_mapper.utable;
 
@@ -609,6 +608,7 @@ impl UserMappings {
     /// 判断当前进程的VMA内，是否有包含指定的虚拟地址的VMA。
     ///
     /// 如果有，返回包含指定虚拟地址的VMA的Arc指针，否则返回None。
+    #[allow(dead_code)]
     pub fn contains(&self, vaddr: VirtAddr) -> Option<Arc<LockedVMA>> {
         for v in self.vmas.iter() {
             let guard = v.lock();
@@ -636,7 +636,7 @@ impl UserMappings {
     ///
     /// @return 如果找到了，返回虚拟内存范围，否则返回None
     pub fn find_free(&self, min_vaddr: VirtAddr, size: usize) -> Option<VirtRegion> {
-        let vaddr = min_vaddr;
+        let _vaddr = min_vaddr;
         let mut iter = self
             .vm_holes
             .iter()
@@ -804,6 +804,7 @@ impl PartialEq for LockedVMA {
 
 impl Eq for LockedVMA {}
 
+#[allow(dead_code)]
 impl LockedVMA {
     pub fn new(vma: VMA) -> Arc<Self> {
         let r = Arc::new(Self(SpinLock::new(vma)));
@@ -953,6 +954,7 @@ impl core::hash::Hash for VMA {
     }
 }
 
+#[allow(dead_code)]
 impl VMA {
     pub fn region(&self) -> &VirtRegion {
         return &self.region;
@@ -1271,6 +1273,7 @@ impl UserStack {
     ///
     /// - **Ok(())** 扩展成功
     /// - **Err(SystemError)** 扩展失败
+    #[allow(dead_code)]
     pub fn extend(
         &mut self,
         vm: &mut RwLockWriteGuard<InnerAddressSpace>,

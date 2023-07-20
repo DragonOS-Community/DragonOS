@@ -5,7 +5,6 @@
 ///
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::{
-    kdebug,
     mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea},
 };
 use core::marker::PhantomData;

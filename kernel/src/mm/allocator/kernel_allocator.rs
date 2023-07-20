@@ -1,9 +1,8 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
-    include::bindings::bindings::{gfp_t, kfree, kmalloc, PAGE_2M_SIZE},
-    kdebug,
+    include::bindings::bindings::{gfp_t},
     libs::align::page_align_up,
-    mm::{gfp::__GFP_ZERO, MMArch, MemoryManagementArch, VirtAddr},
+    mm::{MMArch, MemoryManagementArch, VirtAddr},
 };
 
 use core::{
@@ -57,14 +56,14 @@ impl KernelAllocator {
 
 /// 为内核SLAB分配器实现LocalAlloc的trait
 impl LocalAlloc for KernelAllocator {
-    unsafe fn local_alloc(&self, layout: Layout, gfp: gfp_t) -> *mut u8 {
+    unsafe fn local_alloc(&self, layout: Layout, _gfp: gfp_t) -> *mut u8 {
         return self
             .alloc_in_buddy(layout)
             .map(|x| x.as_mut_ptr() as *mut u8)
             .unwrap_or(core::ptr::null_mut() as *mut u8);
     }
 
-    unsafe fn local_alloc_zeroed(&self, layout: Layout, gfp: gfp_t) -> *mut u8 {
+    unsafe fn local_alloc_zeroed(&self, layout: Layout, _gfp: gfp_t) -> *mut u8 {
         return self
             .alloc_in_buddy(layout)
             .map(|x| {

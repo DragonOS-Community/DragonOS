@@ -82,26 +82,26 @@ pub extern "C" fn syscall_handler(regs: &mut pt_regs) -> () {
                 syscall_return!(SystemError::EFAULT.to_posix_errno() as u64, regs);
             } else {
                 unsafe {
-                    // syscall_return!(
-                    //     rs_do_execve(
-                    //         path_ptr as *const u8,
-                    //         argv_ptr as *const *const u8,
-                    //         env_ptr as *const *const u8,
-                    //         regs
-                    //     ),
-                    //     regs
-                    // );
                     kdebug!("syscall: execve\n");
-                    let path = String::from("/bin/about.elf");
-                    let argv = vec![String::from("/bin/about.elf")];
-                    let envp = vec![String::from("PATH=/bin")];
-                    let r = tmp_rs_execve(path, argv, envp, regs);
-                    kdebug!("syscall: execve r: {:?}\n", r);
-
                     syscall_return!(
-                        r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize),
+                        rs_do_execve(
+                            path_ptr as *const u8,
+                            argv_ptr as *const *const u8,
+                            env_ptr as *const *const u8,
+                            regs
+                        ),
                         regs
-                    )
+                    );
+                    // let path = String::from("/bin/about.elf");
+                    // let argv = vec![String::from("/bin/about.elf")];
+                    // let envp = vec![String::from("PATH=/bin")];
+                    // let r = tmp_rs_execve(path, argv, envp, regs);
+                    // kdebug!("syscall: execve r: {:?}\n", r);
+
+                    // syscall_return!(
+                    //     r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize),
+                    //     regs
+                    // )
                 }
             }
         }

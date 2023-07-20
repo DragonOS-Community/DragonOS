@@ -1111,6 +1111,18 @@ impl VMA {
             self_ref: Weak::default(),
         });
         drop(flusher);
+        kdebug!("VMA::zeroed: flusher dropped");
+
+        // 清空这些内存
+        let virt_iter = VirtPageFrameIter::new(destination, destination.add(page_count));
+        for frame in virt_iter {
+            let paddr = mapper.translate(frame.virt_address()).unwrap().0;
+
+            unsafe {
+                let vaddr = MMArch::phys_2_virt(paddr).unwrap();
+                MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE);
+            }
+        }
         kdebug!("VMA::zeroed: done");
         return Ok(r);
     }

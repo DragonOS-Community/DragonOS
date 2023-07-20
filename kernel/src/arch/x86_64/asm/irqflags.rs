@@ -5,7 +5,7 @@ pub fn local_irq_save() -> usize {
     let x: usize;
     // x86_64::registers::rflags::
     unsafe {
-        asm!("pushfq; pop {};cli", out(reg) x, options(nomem, preserves_flags));
+        asm!("pushfq; pop {}; cli", out(reg) x, options(nomem, preserves_flags));
     }
     x
 }

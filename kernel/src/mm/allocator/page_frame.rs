@@ -111,6 +111,12 @@ impl VirtPageFrame {
             end,
         };
     }
+
+    pub fn add(&self, n: PageFrameCount) -> Self {
+        return Self {
+            number: self.number + n.data(),
+        };
+    }
 }
 
 /// 虚拟页帧的迭代器

@@ -17,7 +17,11 @@ use alloc::{
 use hashbrown::HashSet;
 
 use crate::{
-    arch::{asm::current::current_pcb, mm::{PageMapper, test_buddy}, CurrentIrqArch, MMArch},
+    arch::{
+        asm::current::current_pcb,
+        mm::{test_buddy, PageMapper},
+        CurrentIrqArch, MMArch,
+    },
     exception::InterruptArch,
     kdebug,
     libs::{

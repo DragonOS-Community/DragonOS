@@ -298,7 +298,6 @@ pub fn mm_init() {
     mmio_init();
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
-
 }
 
 unsafe fn allocator_init() {
@@ -426,11 +425,10 @@ unsafe fn allocator_init() {
         enable_textui();
     }
     kdebug!("Text UI enabled");
-
 }
 
 #[no_mangle]
-pub extern "C" fn rs_test_buddy(){
+pub extern "C" fn rs_test_buddy() {
     test_buddy();
 }
 pub fn test_buddy() {
@@ -469,8 +467,7 @@ pub fn test_buddy() {
                 assert!(MMArch::phys_2_virt(paddr)
                     .as_ref()
                     .unwrap()
-                    .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE
-                ));
+                    .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE));
             }
             allocated += allocated_frame_count.data() * MMArch::PAGE_SIZE;
             v.push((paddr, allocated_frame_count));

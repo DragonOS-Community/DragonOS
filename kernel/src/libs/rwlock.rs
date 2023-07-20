@@ -476,8 +476,8 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
     fn drop(&mut self) {
         debug_assert_eq!(self.inner.lock.load(Ordering::Relaxed) & WRITER, WRITER);
         self.inner
-        .lock
-        .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+            .lock
+            .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
 
         preempt_enable();
     }

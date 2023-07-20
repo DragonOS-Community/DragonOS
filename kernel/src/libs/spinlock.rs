@@ -184,7 +184,6 @@ impl<T> SpinLock<T> {
 
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<T> {
-
         self.lock.lock();
         // 加锁成功，返回一个守卫
         return SpinLockGuard {

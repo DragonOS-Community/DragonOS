@@ -533,6 +533,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let mut table = self.table();
         loop {
             let i = table.index_of(virt)?;
+            assert!(i < Arch::PAGE_ENTRY_NUM);
             if table.level() == 0 {
                 // todo: 检查是否已经映射
                 // 现在不检查的原因是，刚刚启动系统时，内核会映射一些页。
@@ -564,6 +565,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                         } else {
                             0
                         };
+
                     // kdebug!("Flags: {:?}", flags);
                     // kdebug!(
                     //     "Map page table, level={}, next level table phys={:?}",
@@ -810,6 +812,14 @@ impl<Arch: MemoryManagementArch, T: Flusher<Arch> + ?Sized> Flusher<Arch> for &m
 
 impl<Arch: MemoryManagementArch> Flusher<Arch> for () {
     fn consume(&mut self, flush: PageFlush<Arch>) {}
+}
+
+impl<Arch: MemoryManagementArch> Drop for PageFlushAll<Arch> {
+    fn drop(&mut self) {
+        unsafe {
+            Arch::invalidate_all();
+        }
+    }
 }
 
 /// 未在当前CPU上激活的页表的刷新器

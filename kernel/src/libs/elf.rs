@@ -5,7 +5,7 @@ use core::{
 };
 
 use alloc::vec::Vec;
-use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader, ElfBytes};
+use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader};
 
 use crate::{
     arch::MMArch,
@@ -92,16 +92,17 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
-
+        kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
                 end - start,
                 prot_flags,
-                MapFlags::MAP_ANONYMOUS,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
                 false,
             );
             if r.is_err() {
+                kerror!("set_elf_brk: map_anonymous failed, err={:?}", r);
                 return Err(ExecError::OutOfMemory);
             }
         }
@@ -170,19 +171,23 @@ impl ElfLoader {
         total_size: usize,
     ) -> Result<(VirtAddr, bool), SystemError> {
         kdebug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
-        // 当前段应该被加载到的内存地址
-        let size =
-            phent.p_filesz as usize + self.elf_page_offset(VirtAddr::new(phent.p_vaddr as usize));
-        let size = self.elf_page_align_up(VirtAddr::new(size)).data();
-        // 当前段在文件中的偏移
-        let offset =
-            phent.p_offset as usize - self.elf_page_offset(VirtAddr::new(phent.p_vaddr as usize));
 
+        // 映射位置的偏移量（页内偏移）
+        let beginning_page_offset = self.elf_page_offset(addr_to_map);
         addr_to_map = self.elf_page_start(addr_to_map);
+        // 计算要映射的内存的大小
+        let map_size = phent.p_filesz as usize
+            + self.elf_page_offset(VirtAddr::new(phent.p_vaddr as usize))
+            + beginning_page_offset;
+        let map_size = self.elf_page_align_up(VirtAddr::new(map_size)).data();
+        // 当前段在文件中的大小
+        let seg_in_file_size = phent.p_filesz as usize;
+        // 当前段在文件中的偏移量
+        let file_offset = phent.p_offset as usize;
 
         // 如果当前段的大小为0，则直接返回.
         // 段在文件中的大小为0,是合法的，但是段在内存中的大小不能为0
-        if size == 0 {
+        if map_size == 0 {
             return Ok((addr_to_map, true));
         }
 
@@ -213,8 +218,8 @@ impl ElfLoader {
                 .map_err(map_err_handler)?
                 .virt_address();
             kdebug!("map ok: addr_to_map={:?}", addr_to_map);
-            let to_unmap = map_addr + size;
-            let to_unmap_size = total_size - size;
+            let to_unmap = map_addr + map_size;
+            let to_unmap_size = total_size - map_size;
             kdebug!("to_unmap={:?}, to_unmap_size={}", to_unmap, to_unmap_size);
             user_vm_guard.munmap(
                 VirtPageFrame::new(to_unmap),
@@ -222,20 +227,30 @@ impl ElfLoader {
             )?;
 
             // 加载文件到内存
-            self.do_load_file(map_addr, size, offset, param)?;
+            self.do_load_file(
+                map_addr + beginning_page_offset,
+                seg_in_file_size,
+                file_offset,
+                param,
+            )?;
         } else {
             kdebug!("total size = 0");
             map_addr = user_vm_guard
-                .map_anonymous(addr_to_map, size, *prot, *map_flags, false)?
+                .map_anonymous(addr_to_map, map_size, *prot, *map_flags, false)?
                 .virt_address();
             kdebug!(
-                "map ok: addr_to_map={:?}, map_addr={map_addr:?}",
+                "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
                 addr_to_map
             );
             let paddr = user_vm_guard.user_mapper.utable.translate(addr_to_map);
             kdebug!("paddr={:?}", paddr);
             // 加载文件到内存
-            self.do_load_file(map_addr, size, offset, param)?;
+            self.do_load_file(
+                map_addr + beginning_page_offset,
+                seg_in_file_size,
+                file_offset,
+                param,
+            )?;
         }
         kdebug!("load_elf_segment OK: map_addr={:?}", map_addr);
         return Ok((map_addr, true));
@@ -598,8 +613,10 @@ impl BinaryLoader for ElfLoader {
             drop(p_vaddr);
 
             // end vaddr of this segment(code+data+bss)
-            let seg_end_vaddr_f =
-                VirtAddr::new((seg_to_load.p_vaddr + seg_to_load.p_filesz) as usize);
+            let seg_end_vaddr_f = self.elf_page_align_up(VirtAddr::new(
+                (seg_to_load.p_vaddr + seg_to_load.p_filesz) as usize,
+            ));
+
             if seg_end_vaddr_f > elf_bss {
                 elf_bss = seg_end_vaddr_f;
             }

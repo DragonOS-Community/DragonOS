@@ -160,7 +160,12 @@ pub fn copy_mm(clone_vm: bool, new_pcb: &mut process_control_block) -> Result<()
         return Ok(());
     }
 
-    let new_address_space = old_address_space.write().try_clone()?;
+    let new_address_space = old_address_space.write().try_clone().unwrap_or_else(|e| {
+        panic!(
+            "copy_mm: Failed to clone address space of current process, current pid: [{}], new pid: [{}]. Error: {:?}",
+            current_pcb().pid, new_pcb.pid, e
+        )
+    });
     unsafe { new_pcb.set_address_space(new_address_space) };
     return Ok(());
 }

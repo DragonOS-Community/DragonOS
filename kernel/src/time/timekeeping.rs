@@ -118,6 +118,7 @@ impl Timekeeper {
 
         timekeeper.cycle_interval = CycleNum(temp);
         timekeeper.xtime_interval = temp * clock_data.mult as u64;
+        // 这里可能存在下界溢出问题，debug模式下会报错panic
         timekeeper.xtime_remainder = (ntpinterval - timekeeper.xtime_interval) as i64;
         timekeeper.raw_interval = (timekeeper.xtime_interval >> clock_data.shift) as i64;
         timekeeper.xtime_nsec = 0;

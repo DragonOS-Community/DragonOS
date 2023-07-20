@@ -3,7 +3,8 @@ use core::{ffi::c_void, panic};
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    arch::{asm::current::current_pcb, MMArch},
+    arch::{asm::current::current_pcb, CurrentIrqArch},
+    exception::InterruptArch,
     filesystem::vfs::MAX_PATHLEN,
     include::bindings::bindings::{
         pt_regs, set_system_trap_gate, CLONE_FS, CLONE_SIGNAL, CLONE_VM, USER_CS, USER_DS,
@@ -183,6 +184,8 @@ fn tmp_rs_execve(
         argv,
         envp
     );
+    // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
     let old_address_space = current_pcb().address_space();
     // 在pcb中原来的用户地址空间
@@ -210,6 +213,7 @@ fn tmp_rs_execve(
     unsafe { address_space.write().user_mapper.utable.make_current() };
 
     drop(old_address_space);
+    drop(irq_guard);
     kdebug!("to load binary file");
     let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
     // 加载可执行文件

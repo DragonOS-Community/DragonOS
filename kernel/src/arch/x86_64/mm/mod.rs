@@ -1,5 +1,9 @@
 pub mod barrier;
 pub mod frame;
+use alloc::vec::Vec;
+use hashbrown::HashSet;
+use x86::time::rdtsc;
+
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
     disable_textui, enable_textui, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
@@ -8,6 +12,7 @@ use crate::include::bindings::bindings::{
 use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
+use crate::mm::allocator::kernel_allocator::KernelAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
 use crate::mm::mmio_buddy::mmio_init;
 use crate::{
@@ -293,6 +298,7 @@ pub fn mm_init() {
     mmio_init();
     // 启用printk的alloc选项
     PrintkWriter.enable_alloc();
+
 }
 
 unsafe fn allocator_init() {
@@ -420,8 +426,104 @@ unsafe fn allocator_init() {
         enable_textui();
     }
     kdebug!("Text UI enabled");
+
 }
 
+#[no_mangle]
+pub extern "C" fn rs_test_buddy(){
+    test_buddy();
+}
+pub fn test_buddy() {
+    // 申请内存然后写入数据然后free掉
+    // 总共申请200MB内存
+    const TOTAL_SIZE: usize = 200 * 1024 * 1024;
+
+    for i in 0..10 {
+        kdebug!("Test buddy, round: {i}");
+        // 存放申请的内存块
+        let mut v: Vec<(PhysAddr, PageFrameCount)> = Vec::with_capacity(60 * 1024);
+        // 存放已经申请的内存块的地址（用于检查重复）
+        let mut addr_set: HashSet<PhysAddr> = HashSet::new();
+
+        let mut allocated = 0usize;
+
+        let mut free_count = 0usize;
+
+        while allocated < TOTAL_SIZE {
+            let mut random_size = 0u64;
+            unsafe { x86::random::rdrand64(&mut random_size) };
+            // 一次最多申请4M
+            random_size = random_size % (1024 * 4096);
+            if random_size == 0 {
+                continue;
+            }
+            let random_size =
+                core::cmp::min(page_align_up(random_size as usize), TOTAL_SIZE - allocated);
+            let random_size = PageFrameCount::from_bytes(random_size.next_power_of_two()).unwrap();
+            // 获取帧
+            let (paddr, allocated_frame_count) =
+                unsafe { LockedFrameAllocator.allocate(random_size).unwrap() };
+            assert!(allocated_frame_count.data().is_power_of_two());
+            assert!(paddr.data() % MMArch::PAGE_SIZE == 0);
+            unsafe {
+                assert!(MMArch::phys_2_virt(paddr)
+                    .as_ref()
+                    .unwrap()
+                    .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE
+                ));
+            }
+            allocated += allocated_frame_count.data() * MMArch::PAGE_SIZE;
+            v.push((paddr, allocated_frame_count));
+            assert!(addr_set.insert(paddr), "duplicate address: {:?}", paddr);
+
+            // 写入数据
+            let vaddr = unsafe { MMArch::phys_2_virt(paddr).unwrap() };
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(
+                    vaddr.data() as *mut u8,
+                    allocated_frame_count.data() * MMArch::PAGE_SIZE,
+                )
+            };
+            for i in 0..slice.len() {
+                slice[i] = ((i + unsafe { rdtsc() } as usize) % 256) as u8;
+            }
+
+            // 随机释放一个内存块
+            if v.len() > 0 {
+                let mut random_index = 0u64;
+                unsafe { x86::random::rdrand64(&mut random_index) };
+                // 70%概率释放
+                if random_index % 10 > 7 {
+                    continue;
+                }
+                random_index = random_index % v.len() as u64;
+                let random_index = random_index as usize;
+                let (paddr, allocated_frame_count) = v.remove(random_index);
+                assert!(addr_set.remove(&paddr));
+                unsafe { LockedFrameAllocator.free(paddr, allocated_frame_count) };
+                free_count += allocated_frame_count.data() * MMArch::PAGE_SIZE;
+            }
+        }
+
+        kdebug!(
+            "Allocated {} MB memory, release: {} MB, no release: {} bytes",
+            allocated / 1024 / 1024,
+            free_count / 1024 / 1024,
+            (allocated - free_count)
+        );
+
+        kdebug!("Now, to release buddy memory");
+        // 释放所有的内存
+        for (paddr, allocated_frame_count) in v {
+            unsafe { LockedFrameAllocator.free(paddr, allocated_frame_count) };
+            assert!(addr_set.remove(&paddr));
+            free_count += allocated_frame_count.data() * MMArch::PAGE_SIZE;
+        }
+
+        kdebug!("release done!, allocated: {allocated}, free_count: {free_count}");
+    }
+    loop {}
+}
 /// 全局的页帧分配器
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;

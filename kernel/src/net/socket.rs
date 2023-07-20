@@ -1103,7 +1103,7 @@ impl IndexNode for SocketInode {
     ) -> Result<(), SystemError> {
         let socket = self.0.lock();
         if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-            // TODO:
+            unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
         }
         return Ok(());
     }

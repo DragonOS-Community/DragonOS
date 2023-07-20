@@ -17,14 +17,15 @@ use alloc::{
 use hashbrown::HashSet;
 
 use crate::{
-    arch::{asm::current::current_pcb, mm::PageMapper, MMArch, CurrentIrqArch},
+    arch::{asm::current::current_pcb, mm::PageMapper, CurrentIrqArch, MMArch},
+    exception::InterruptArch,
     kdebug,
     libs::{
         align::page_align_up,
         rwlock::{RwLock, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    syscall::SystemError, exception::InterruptArch,
+    syscall::SystemError,
 };
 
 use super::{
@@ -213,7 +214,6 @@ impl InnerAddressSpace {
 
             new_vma_guard.remap(old_flags, &mut new_guard.user_mapper.utable, ())?;
             drop(new_vma_guard);
-            
         }
         drop(new_guard);
         drop(irq_guard);
@@ -310,6 +310,7 @@ impl InnerAddressSpace {
         if page_count == PageFrameCount::new(0) {
             return Err(SystemError::EINVAL);
         }
+        kdebug!("mmap: addr: {addr:?}, page_count: {page_count:?}, prot_flags: {prot_flags:?}, map_flags: {map_flags:?}");
 
         // 找到未使用的区域
         let region = match addr {
@@ -328,9 +329,11 @@ impl InnerAddressSpace {
         compiler_fence(Ordering::SeqCst);
         let (mut active, mut inactive);
         let flusher = if self.is_current() {
+            kdebug!("mmap: current ucontext");
             active = PageFlushAll::new();
             &mut active as &mut dyn Flusher<MMArch>
         } else {
+            kdebug!("mmap: not current ucontext");
             inactive = InactiveFlusher::new();
             &mut inactive as &mut dyn Flusher<MMArch>
         };
@@ -343,6 +346,7 @@ impl InnerAddressSpace {
             &mut self.user_mapper.utable,
             flusher,
         )?);
+
         return Ok(page);
     }
 
@@ -1092,7 +1096,7 @@ impl VMA {
             // todo: 将VMA加入到anon_vma中
             // todo: 增加OOM处理
 
-            // 刷新TLB
+            // 稍后再刷新TLB，这里取消刷新
             flusher.consume(r);
             cur_dest = cur_dest.next();
         }
@@ -1106,6 +1110,8 @@ impl VMA {
             user_address_space: None,
             self_ref: Weak::default(),
         });
+        drop(flusher);
+        kdebug!("VMA::zeroed: done");
         return Ok(r);
     }
 }

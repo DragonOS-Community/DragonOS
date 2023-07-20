@@ -82,6 +82,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
         let initial_free_pages = bump_allocator.usage().free();
         kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
+        kdebug!("Buddy entries: {}", Self::BUDDY_ENTRIES);
         // 最高阶的链表页数
         let max_order_linked_list_page_num = max(
             1,
@@ -99,7 +100,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             // 保存每个阶的空闲链表的头部地址
             *f = curr_page.unwrap();
             // 清空当前页
-            core::ptr::write_bytes(f.data() as *mut u8, 0, A::PAGE_SIZE);
+            core::ptr::write_bytes(MMArch::phys_2_virt(*f)?.data() as *mut u8, 0, A::PAGE_SIZE);
 
             let page_list: PageList<A> = PageList::new(0, PhysAddr::new(0));
             Self::write_page(*f, page_list);
@@ -109,7 +110,11 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         for _ in 1..max_order_linked_list_page_num {
             let curr_page = bump_allocator.allocate_one().unwrap();
             // 清空当前页
-            core::ptr::write_bytes(curr_page.data() as *mut u8, 0, A::PAGE_SIZE);
+            core::ptr::write_bytes(
+                MMArch::phys_2_virt(curr_page)?.data() as *mut u8,
+                0,
+                A::PAGE_SIZE,
+            );
 
             let page_list: PageList<A> =
                 PageList::new(0, free_area[Self::order2index((MAX_ORDER - 1) as u8)]);
@@ -323,6 +328,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                         self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8);
                     }
                 }
+                // 由于buddy_free可能导致首部的链表页发生变化，因此需要重新读取
+                let next_page_list_addr = self.free_area[Self::order2index(spec_order)];
+                assert!(!next_page_list_addr.is_null());
                 page_list = Self::read_page(next_page_list_addr);
                 page_list_addr = next_page_list_addr;
             }
@@ -418,6 +426,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     ///
     /// 返回分配的页面的物理地址和页面数
     fn buddy_alloc(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        assert!(count.data().is_power_of_two());
         // 计算需要分配的阶数
         let mut order = log2(count.data() as usize);
         if count.data() & ((1 << order) - 1) != 0 {
@@ -523,9 +532,11 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                         0,
                         1 << order,
                     );
-
+                    assert!(
+                        first_page_list_paddr == self.free_area[Self::order2index(order as u8)]
+                    );
                     // 初始化新的page_list
-                    let new_page_list = PageList::new(Self::BUDDY_ENTRIES, first_page_list_paddr);
+                    let new_page_list = PageList::new(0, first_page_list_paddr);
                     Self::write_page(new_page_list_addr, new_page_list);
                     self.free_area[Self::order2index(order as u8)] = new_page_list_addr;
                 }
@@ -553,6 +564,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 };
 
                 // kdebug!("to write entry, page_list_base={paddr:?}, page_list.entry_num={}, value={base:?}", page_list.entry_num);
+                assert!(page_list.entry_num < Self::BUDDY_ENTRIES);
                 // 把要归还的块，写入到链表项中
                 unsafe { A::write(Self::entry_virt_addr(paddr, page_list.entry_num), base) }
                 page_list.entry_num += 1;
@@ -591,6 +603,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     unsafe {
                         A::write(buddy_entry_virt_addr, entry);
                     }
+                    // 设置刚才那个entry为空
+                    unsafe {
+                        A::write(
+                            Self::entry_virt_addr(page_list_paddr, page_list.entry_num - 1),
+                            PhysAddr::new(0),
+                        );
+                    }
                     // 更新当前链表页的统计数据
                     page_list.entry_num -= 1;
                     Self::write_page(page_list_paddr, page_list);
@@ -608,6 +627,17 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     if last_entry != buddy_addr {
                         unsafe {
                             A::write(buddy_entry_virt_addr, last_entry);
+                            A::write(
+                                Self::entry_virt_addr(page_list_paddr, page_list.entry_num - 1),
+                                PhysAddr::new(0),
+                            );
+                        }
+                    } else {
+                        unsafe {
+                            A::write(
+                                Self::entry_virt_addr(page_list_paddr, page_list.entry_num - 1),
+                                PhysAddr::new(0),
+                            );
                         }
                     }
                     // 更新当前链表页的统计数据
@@ -643,8 +673,13 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         if unlikely(!count.data().is_power_of_two()) {
             kwarn!("buddy free: count is not power of two");
         }
+        let mut order = log2(count.data() as usize);
+        if count.data() & ((1 << order) - 1) != 0 {
+            order += 1;
+        }
+        let order = (order + MIN_ORDER) as u8;
         // kdebug!("free: base={:?}, count={:?}", base, count);
-        self.buddy_free(base, (log2(count.data()) + MIN_ORDER) as u8);
+        self.buddy_free(base, order);
     }
 
     unsafe fn usage(&self) -> PageFrameUsage {

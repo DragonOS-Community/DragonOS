@@ -16,9 +16,12 @@ pub fn switch_process(
     fp_state_save(prev);
     fp_state_restore(next);
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    let new_address_space = next
-        .address_space()
-        .expect("Next process: address space is null");
+    let new_address_space = next.address_space().unwrap_or_else(|| {
+        panic!(
+            "switch_process: next process:{} address space is null",
+            next.pid
+        )
+    });
     unsafe {
         // 加载页表
         new_address_space.write().user_mapper.utable.make_current();

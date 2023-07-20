@@ -152,7 +152,7 @@ void system_initialize()
     // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，
     // 因此必须在进程管理模块初始化完毕后再初始化smp。
     io_mfence();
-    // rs_test_buddy();
+    
     process_init();
     
     io_mfence();

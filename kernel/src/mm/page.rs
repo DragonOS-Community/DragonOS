@@ -401,7 +401,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub fn mmio_flags() -> Self {
         return Self::new()
-            .set_user(true)
+            .set_user(false)
             .set_write(true)
             .set_execute(true)
             .set_page_cache_disable(true)
@@ -453,6 +453,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     /// @brief 创建页表，并为这个页表创建页面映射器
     pub unsafe fn create(table_kind: PageTableKind, mut allocator: F) -> Option<Self> {
         let table_paddr = allocator.allocate_one()?;
+        // 清空页表
+        let table_vaddr = Arch::phys_2_virt(table_paddr)?;
+        Arch::write_bytes(table_vaddr, 0, Arch::PAGE_SIZE);
         return Some(Self::new(table_kind, table_paddr, allocator));
     }
 

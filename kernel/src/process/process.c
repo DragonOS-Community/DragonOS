@@ -335,6 +335,7 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
 void process_init()
 {
     kinfo("Initializing process...");
+    // rs_test_buddy();
     io_mfence();
     rs_process_init();
     io_mfence();
@@ -360,6 +361,7 @@ void process_init()
 
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
+    
     barrier();
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核线程
     barrier();

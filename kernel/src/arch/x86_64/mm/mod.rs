@@ -522,7 +522,6 @@ pub fn test_buddy() {
 
         kdebug!("release done!, allocated: {allocated}, free_count: {free_count}");
     }
-    loop {}
 }
 /// 全局的页帧分配器
 #[derive(Debug, Clone, Copy, Hash)]

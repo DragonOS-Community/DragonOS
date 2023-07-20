@@ -17,7 +17,7 @@ use alloc::{
 use hashbrown::HashSet;
 
 use crate::{
-    arch::{asm::current::current_pcb, mm::PageMapper, CurrentIrqArch, MMArch},
+    arch::{asm::current::current_pcb, mm::{PageMapper, test_buddy}, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     kdebug,
     libs::{
@@ -135,6 +135,7 @@ impl InnerAddressSpace {
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
         };
+        // test_buddy();
         if create_stack {
             kdebug!("to create user stack.");
             result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
@@ -325,7 +326,7 @@ impl InnerAddressSpace {
         };
 
         let page = VirtPageFrame::new(region.start());
-
+        kdebug!("mmap: page: {:?}, region={region:?}", page.virt_address());
         compiler_fence(Ordering::SeqCst);
         let (mut active, mut inactive);
         let flusher = if self.is_current() {
@@ -1201,7 +1202,7 @@ impl UserStack {
             map_flags,
             false,
         )?;
-
+        // test_buddy();
         // 设置保护页只读
         prot_flags.remove(ProtFlags::PROT_WRITE);
         kdebug!(

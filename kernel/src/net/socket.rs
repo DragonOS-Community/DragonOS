@@ -26,8 +26,10 @@ lazy_static! {
     /// TODO: 优化这里，自己实现SocketSet！！！现在这样的话，不管全局有多少个网卡，每个时间点都只会有1个进程能够访问socket
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     pub static ref SOCKET_WAITQUEUE: WaitQueue = WaitQueue::INIT;
-    // 检测端口是否冲突的表
-    pub static ref PORT_LISTEN_TABLE: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>> = SpinLock::new(HashMap::new());
+    // TCP 端口记录表
+    pub static ref TCP_PORT_TABLE: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>> = SpinLock::new(HashMap::new());
+    // UDP 端口记录表
+    pub static ref UDP_PORT_TABLE: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>> = SpinLock::new(HashMap::new());
 }
 
 /* For setsockopt(2) */
@@ -330,7 +332,7 @@ impl UdpSocket {
     fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(ip)) = endpoint {
             // 检测端口是否已被占用
-            check_port_used(ip.port, self.handle.clone())?;
+            get_port(SocketType::UdpSocket, ip.port, self.handle.clone())?;
 
             let bind_res = if ip.addr.is_unspecified() {
                 socket.bind(ip.port)
@@ -394,7 +396,7 @@ impl Socket for UdpSocket {
         // kdebug!("is open()={}", socket.is_open());
         // kdebug!("socket endpoint={:?}", socket.endpoint());
         if socket.endpoint().port == 0 {
-            let temp_port = get_ephemeral_port()?;
+            let temp_port = get_ephemeral_port(SocketType::UdpSocket)?;
 
             let local_ep = match remote_endpoint.addr {
                 // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
@@ -674,7 +676,7 @@ impl Socket for TcpSocket {
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
-            let temp_port = get_ephemeral_port()?;
+            let temp_port = get_ephemeral_port(SocketType::TcpSocket)?;
             // kdebug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDriver> = NET_DRIVERS.write().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
@@ -743,11 +745,11 @@ impl Socket for TcpSocket {
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(mut ip)) = endpoint {
             if ip.port == 0 {
-                ip.port = get_ephemeral_port()?;
+                ip.port = get_ephemeral_port(SocketType::TcpSocket)?;
             }
 
             // 检测端口是否已被占用
-            check_port_used(ip.port, self.handle.clone())?;
+            get_port(SocketType::TcpSocket, ip.port, self.handle.clone())?;
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
@@ -843,7 +845,7 @@ impl Socket for TcpSocket {
 }
 
 /// @breif 自动分配一个未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
-pub fn get_ephemeral_port() -> Result<u16, SystemError> {
+pub fn get_ephemeral_port(sk_type: SocketType) -> Result<u16, SystemError> {
     // TODO selects non-conflict high port
 
     static mut EPHEMERAL_PORT: u16 = 0;
@@ -864,8 +866,12 @@ pub fn get_ephemeral_port() -> Result<u16, SystemError> {
             }
             port = EPHEMERAL_PORT;
         }
+
         // 使用 ListenTable 检查端口是否被占用
-        let listen_table_guard = PORT_LISTEN_TABLE.lock();
+        let listen_table_guard = match sk_type {
+            SocketType::UdpSocket => UDP_PORT_TABLE.lock(),
+            _ => TCP_PORT_TABLE.lock(),
+        };
         if let None = listen_table_guard.get(&port) {
             drop(listen_table_guard);
             return Ok(port);
@@ -875,18 +881,31 @@ pub fn get_ephemeral_port() -> Result<u16, SystemError> {
     Err(SystemError::EADDRINUSE)
 }
 
-/// @breif 检测给定端口是否已被占用，如果未被占用则在 ListenTable 中记录
+/// @breif 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
 ///
 /// TODO: 增加支持端口复用的逻辑
-pub fn check_port_used(port: u16, handle: Arc<GlobalSocketHandle>) -> Result<(), SystemError> {
+pub fn get_port(socket_type: SocketType, port: u16, handle: Arc<GlobalSocketHandle>) -> Result<(), SystemError> {
     if port > 0 {
-        let mut listen_table_guard = PORT_LISTEN_TABLE.lock();
+        let mut listen_table_guard = match socket_type {
+            SocketType::UdpSocket => UDP_PORT_TABLE.lock(),
+            _ => TCP_PORT_TABLE.lock(),
+        };
         match listen_table_guard.get(&port) {
             Some(_) => return Err(SystemError::EADDRINUSE),
             None => listen_table_guard.insert(port, handle),
         };
         drop(listen_table_guard);
     }
+    Ok(())
+}
+
+pub fn unbind_port(socket_type: SocketType, port: u16) -> Result<(), SystemError> {
+    let mut listen_table_guard = match socket_type {
+        SocketType::UdpSocket => UDP_PORT_TABLE.lock(),
+        _ => TCP_PORT_TABLE.lock(),
+    };
+    listen_table_guard.remove(&port);
+    drop(listen_table_guard);
     Ok(())
 }
 
@@ -1051,9 +1070,7 @@ impl IndexNode for SocketInode {
     ) -> Result<(), SystemError> {
         let socket = self.0.lock();
         if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-            let mut listen_table_guard = PORT_LISTEN_TABLE.lock();
-            listen_table_guard.remove(&ip.port);
-            drop(listen_table_guard);
+            // TODO:
         }
         return Ok(());
     }

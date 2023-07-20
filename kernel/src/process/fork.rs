@@ -18,7 +18,6 @@ use crate::{
         refcount::{refcount_inc, RefCount},
         spinlock::{spin_lock_irqsave, spin_unlock_irqrestore},
     },
-    mm::ucontext::AddressSpace,
     syscall::SystemError,
 };
 

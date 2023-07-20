@@ -123,6 +123,8 @@ void system_initialize()
     // 初始化中断模块
     irq_init();
 
+
+
     // softirq_init();
     rs_softirq_init();
 
@@ -150,6 +152,7 @@ void system_initialize()
     // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，
     // 因此必须在进程管理模块初始化完毕后再初始化smp。
     io_mfence();
+    
     process_init();
     
     io_mfence();

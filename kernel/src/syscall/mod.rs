@@ -481,7 +481,7 @@ impl Syscall {
 
             SYS_BRK => {
                 let new_brk = VirtAddr::new(args[0]);
-                Self::brk(new_brk).map(|_| 0)
+                Self::brk(new_brk).map(|vaddr| vaddr.data())
             }
 
             SYS_SBRK => {

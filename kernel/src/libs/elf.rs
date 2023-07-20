@@ -12,6 +12,7 @@ use crate::{
     current_pcb,
     io::SeekFrom,
     kdebug, kerror,
+    libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
         syscall::{MapFlags, ProtFlags},
@@ -113,7 +114,7 @@ impl ElfLoader {
 
     /// 计算addr在ELF PAGE内的偏移
     fn elf_page_offset(&self, addr: VirtAddr) -> usize {
-        addr.data() & Self::ELF_PAGE_SIZE
+        addr.data() & (Self::ELF_PAGE_SIZE - 1)
     }
 
     fn elf_page_start(&self, addr: VirtAddr) -> VirtAddr {
@@ -201,9 +202,16 @@ impl ElfLoader {
             }
             err
         };
+        // 由于后面需要把ELF文件的内容加载到内存，因此暂时把当前段的权限设置为可写
+        let tmp_prot = if !prot.contains(ProtFlags::PROT_WRITE) {
+            *prot | ProtFlags::PROT_WRITE
+        } else {
+            *prot
+        };
 
         // 映射到的虚拟地址。请注意，这个虚拟地址是user_vm_guard这个地址空间的虚拟地址。不一定是当前进程地址空间的
         let map_addr: VirtAddr;
+
         // total_size is the size of the ELF (interpreter) image.
         // The _first_ mmap needs to know the full size, otherwise
         // randomization might put this image into an overlapping
@@ -212,15 +220,19 @@ impl ElfLoader {
         // the end. (which unmap is needed for ELF images with holes.)
         if total_size != 0 {
             let total_size = self.elf_page_align_up(VirtAddr::new(total_size)).data();
-            kdebug!("total_size={}", total_size);
+
+            // kdebug!("total_size={}", total_size);
+
             map_addr = user_vm_guard
-                .map_anonymous(addr_to_map, total_size, *prot, *map_flags, false)
+                .map_anonymous(addr_to_map, total_size, tmp_prot, *map_flags, false)
                 .map_err(map_err_handler)?
                 .virt_address();
-            kdebug!("map ok: addr_to_map={:?}", addr_to_map);
+            // kdebug!("map ok: addr_to_map={:?}", addr_to_map);
+
             let to_unmap = map_addr + map_size;
             let to_unmap_size = total_size - map_size;
-            kdebug!("to_unmap={:?}, to_unmap_size={}", to_unmap, to_unmap_size);
+
+            // kdebug!("to_unmap={:?}, to_unmap_size={}", to_unmap, to_unmap_size);
             user_vm_guard.munmap(
                 VirtPageFrame::new(to_unmap),
                 PageFrameCount::from_bytes(to_unmap_size).unwrap(),
@@ -233,10 +245,18 @@ impl ElfLoader {
                 file_offset,
                 param,
             )?;
+            if tmp_prot != *prot {
+                user_vm_guard.mprotect(
+                    VirtPageFrame::new(map_addr),
+                    PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
+                    *prot,
+                )?;
+            }
         } else {
             kdebug!("total size = 0");
+
             map_addr = user_vm_guard
-                .map_anonymous(addr_to_map, map_size, *prot, *map_flags, false)?
+                .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false)?
                 .virt_address();
             kdebug!(
                 "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
@@ -251,6 +271,14 @@ impl ElfLoader {
                 file_offset,
                 param,
             )?;
+
+            if tmp_prot != *prot {
+                user_vm_guard.mprotect(
+                    VirtPageFrame::new(map_addr),
+                    PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
+                    *prot,
+                )?;
+            }
         }
         kdebug!("load_elf_segment OK: map_addr={:?}", map_addr);
         return Ok((map_addr, true));
@@ -531,7 +559,7 @@ impl BinaryLoader for ElfLoader {
             let vaddr = VirtAddr::new(seg_to_load.p_vaddr as usize);
 
             if !first_pt_load {
-                elf_map_flags.insert(MapFlags::MAP_FIXED);
+                elf_map_flags.insert(MapFlags::MAP_FIXED_NOREPLACE);
             } else if elf_type == ElfType::Executable {
                 /*
                  * This logic is run once for the first LOAD Program
@@ -559,7 +587,8 @@ impl BinaryLoader for ElfLoader {
                 )
                 .map_err(|e| match e {
                     SystemError::EFAULT => ExecError::BadAddress(None),
-                    _ => ExecError::InvalidParemeter,
+                    SystemError::ENOMEM => ExecError::OutOfMemory,
+                    _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
                 })?;
 
             // 如果地址不对，那么就报错

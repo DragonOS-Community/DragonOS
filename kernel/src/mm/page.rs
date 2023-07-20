@@ -3,19 +3,18 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicU32, Ordering},
+    sync::atomic::{compiler_fence, Ordering},
 };
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    kdebug, kerror, kwarn,
+    kerror, kwarn,
 };
 
 use super::{
-    allocator::page_frame::FrameAllocator,
-    syscall::{MapFlags, ProtFlags},
-    MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr,
+    allocator::page_frame::FrameAllocator, syscall::ProtFlags, MemoryManagementArch, PageTableKind,
+    PhysAddr, VirtAddr,
 };
 
 #[derive(Debug)]
@@ -29,6 +28,7 @@ pub struct PageTable<Arch> {
     phantom: PhantomData<Arch>,
 }
 
+#[allow(dead_code)]
 impl<Arch: MemoryManagementArch> PageTable<Arch> {
     pub unsafe fn new(base: VirtAddr, phys: PhysAddr, level: usize) -> Self {
         Self {
@@ -39,11 +39,15 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         }
     }
 
-    /// @brief 获取顶级页表
+    /// 获取顶级页表
     ///
-    /// @param table_kind 页表类型
+    /// ## 参数
     ///
-    /// @return 顶级页表
+    /// - table_kind 页表类型
+    ///
+    /// ## 返回值
+    ///
+    /// 返回顶级页表
     pub unsafe fn top_level_table(table_kind: PageTableKind) -> Self {
         return Self::new(
             VirtAddr::new(0),
@@ -52,31 +56,31 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         );
     }
 
-    /// @brief 获取当前页表的物理地址
+    /// 获取当前页表的物理地址
     #[inline(always)]
     pub fn phys(&self) -> PhysAddr {
         self.phys
     }
 
-    /// @brief 获取当前页表表示的内存空间的起始地址
+    /// 当前页表表示的虚拟地址空间的起始地址
     #[inline(always)]
     pub fn base(&self) -> VirtAddr {
         self.base
     }
 
-    /// @brief 获取当前页表的层级
+    /// 获取当前页表的层级
     #[inline(always)]
     pub fn level(&self) -> usize {
         self.level
     }
 
-    /// @brief 获取当前页表自身所在的虚拟地址
+    /// 获取当前页表自身所在的虚拟地址
     #[inline(always)]
     pub unsafe fn virt(&self) -> VirtAddr {
         return Arch::phys_2_virt(self.phys).unwrap();
     }
 
-    /// @brief 获取第i个页表项所表示的虚拟内存空间的起始地址
+    /// 获取第i个页表项所表示的虚拟内存空间的起始地址
     pub fn entry_base(&self, i: usize) -> Option<VirtAddr> {
         if i < Arch::PAGE_ENTRY_NUM {
             let shift = self.level * Arch::PAGE_ENTRY_SHIFT + Arch::PAGE_SHIFT;
@@ -86,7 +90,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         }
     }
 
-    /// @brief 获取当前页表的第i个页表项所在的虚拟地址（注意与entry_base进行区分）
+    /// 获取当前页表的第i个页表项所在的虚拟地址（注意与entry_base进行区分）
     pub unsafe fn entry_virt(&self, i: usize) -> Option<VirtAddr> {
         if i < Arch::PAGE_ENTRY_NUM {
             return Some(self.virt().add(i * Arch::PAGE_ENTRY_SIZE));
@@ -95,24 +99,25 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         }
     }
 
-    /// @brief 获取当前页表的第i个页表项
+    /// 获取当前页表的第i个页表项
     pub unsafe fn entry(&self, i: usize) -> Option<PageEntry<Arch>> {
         let entry_virt = self.entry_virt(i)?;
         return Some(PageEntry::new(Arch::read::<usize>(entry_virt)));
     }
 
-    /// @brief 设置当前页表的第i个页表项
+    /// 设置当前页表的第i个页表项
     pub unsafe fn set_entry(&self, i: usize, entry: PageEntry<Arch>) -> Option<()> {
         let entry_virt = self.entry_virt(i)?;
         Arch::write::<usize>(entry_virt, entry.data());
         return Some(());
     }
 
-    /// @brief 判断当前页表的第i个页表项是否已经填写了值
+    /// 判断当前页表的第i个页表项是否已经填写了值
     ///
-    /// @return Some(true) 如果已经填写了值
-    /// @return Some(false) 如果未填写值
-    /// @return None 如果i超出了页表项的范围
+    /// ## 参数
+    /// - Some(true) 如果已经填写了值
+    /// - Some(false) 如果未填写值
+    /// - None 如果i超出了页表项的范围
     pub fn entry_mapped(&self, i: usize) -> Option<bool> {
         let etv = unsafe { self.entry_virt(i) }?;
         if unsafe { Arch::read::<usize>(etv) } != 0 {
@@ -122,11 +127,15 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         }
     }
 
-    /// @brief 根据虚拟地址，获取对应的页表项在页表中的下标
+    /// 根据虚拟地址，获取对应的页表项在页表中的下标
     ///
-    /// @param addr 虚拟地址
+    /// ## 参数
     ///
-    /// @return 页表项在页表中的下标。如果addr不在当前页表所表示的虚拟地址空间中，则返回None
+    /// - addr: 虚拟地址
+    ///
+    /// ## 返回值
+    ///
+    /// 页表项在页表中的下标。如果addr不在当前页表所表示的虚拟地址空间中，则返回None
     pub unsafe fn index_of(&self, addr: VirtAddr) -> Option<usize> {
         let addr = VirtAddr::new(addr.data() & Arch::PAGE_ADDRESS_MASK);
         let shift = self.level * Arch::PAGE_ENTRY_SHIFT + Arch::PAGE_SHIFT;
@@ -139,7 +148,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         }
     }
 
-    /// @brief 获取第i个页表项指向的下一级页表
+    /// 获取第i个页表项指向的下一级页表
     pub unsafe fn next_level_table(&self, index: usize) -> Option<Self> {
         if self.level == 0 {
             return None;
@@ -181,10 +190,12 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
         self.data
     }
 
-    /// @brief 获取当前页表项指向的物理地址
+    /// 获取当前页表项指向的物理地址
     ///
-    /// @return Ok(PhysAddr) 如果当前页面存在于物理内存中, 返回物理地址
-    /// @return Err(PhysAddr) 如果当前页表项不存在, 返回物理地址
+    /// ## 返回值
+    ///
+    /// - Ok(PhysAddr) 如果当前页面存在于物理内存中, 返回物理地址
+    /// - Err(PhysAddr) 如果当前页表项不存在, 返回物理地址
     #[inline(always)]
     pub fn address(&self) -> Result<PhysAddr, PhysAddr> {
         let paddr = PhysAddr::new(self.data & Arch::PAGE_ADDRESS_MASK);
@@ -219,16 +230,26 @@ pub struct PageFlags<Arch> {
     phantom: PhantomData<Arch>,
 }
 
+#[allow(dead_code)]
 impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub fn new() -> Self {
-        return unsafe {
+        let mut r = unsafe {
             Self::from_data(
                 Arch::ENTRY_FLAG_DEFAULT_PAGE
                     | Arch::ENTRY_FLAG_READONLY
                     | Arch::ENTRY_FLAG_NO_EXEC,
             )
         };
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::arch::mm::X86_64MMArch::is_xd_reserved() {
+                r = r.set_execute(true);
+            }
+        }
+
+        return r;
     }
 
     /// 根据ProtFlags生成PageFlags
@@ -252,36 +273,41 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     }
 
     #[inline(always)]
-    pub unsafe fn from_data(data: usize) -> Self {
+    pub const unsafe fn from_data(data: usize) -> Self {
         return Self {
             data: data,
             phantom: PhantomData,
         };
     }
 
-    /// @brief 为新页表的页表项设置默认值
+    /// 为新页表的页表项设置默认值
+    ///
     /// 默认值为：
     /// - present
     /// - read only
     /// - kernel space
     /// - no exec
     #[inline(always)]
-    pub fn new_page_table() -> Self {
+    pub fn new_page_table(user: bool) -> Self {
         return unsafe {
-            Self::from_data(
-                Arch::ENTRY_FLAG_DEFAULT_TABLE
-                    | Arch::ENTRY_FLAG_READONLY
-                    | Arch::ENTRY_FLAG_NO_EXEC,
-            )
+            let r = Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE | Arch::ENTRY_FLAG_READWRITE);
+            if user {
+                r.set_user(true)
+            } else {
+                r
+            }
         };
     }
 
-    /// @brief 取得当前页表项的所有权，更新当前页表项的标志位，并返回更新后的页表项。
+    /// 取得当前页表项的所有权，更新当前页表项的标志位，并返回更新后的页表项。
     ///
-    /// @param flag 要更新的标志位的值
-    /// @param value 如果为true，那么将flag对应的位设置为1，否则设置为0
+    /// ## 参数
+    /// - flag 要更新的标志位的值
+    /// - value 如果为true，那么将flag对应的位设置为1，否则设置为0
     ///
-    /// @return 更新后的页表项
+    /// ## 返回值
+    ///
+    /// 更新后的页表项
     #[inline(always)]
     #[must_use]
     pub fn update_flags(mut self, flag: usize, value: bool) -> Self {
@@ -293,7 +319,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return self;
     }
 
-    /// @brief 判断当前页表项是否存在指定的flag（只有全部flag都存在才返回true）
+    /// 判断当前页表项是否存在指定的flag（只有全部flag都存在才返回true）
     #[inline(always)]
     pub fn has_flag(&self, flag: usize) -> bool {
         return self.data & flag == flag;
@@ -304,7 +330,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return self.has_flag(Arch::ENTRY_FLAG_PRESENT);
     }
 
-    /// @brief 设置当前页表项的权限
+    /// 设置当前页表项的权限
     ///
     /// @param value 如果为true，那么将当前页表项的权限设置为用户态可访问
     #[must_use]
@@ -313,15 +339,19 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return self.update_flags(Arch::ENTRY_FLAG_USER, value);
     }
 
-    /// @brief 用户态是否可以访问当前页表项
+    /// 用户态是否可以访问当前页表项
     #[inline(always)]
     pub fn has_user(&self) -> bool {
         return self.has_flag(Arch::ENTRY_FLAG_USER);
     }
 
-    /// @brief 设置当前页表项的可写性, 如果为true，那么将当前页表项的权限设置为可写, 否则设置为只读
+    /// 设置当前页表项的可写性, 如果为true，那么将当前页表项的权限设置为可写, 否则设置为只读
     ///
-    /// @return 更新后的页表项. 请注意，本函数会取得当前页表项的所有权，因此返回的页表项不是原来的页表项
+    /// ## 返回值
+    ///
+    /// 更新后的页表项.
+    ///
+    /// **请注意，**本函数会取得当前页表项的所有权，因此返回的页表项不是原来的页表项
     #[must_use]
     #[inline(always)]
     pub fn set_write(self, value: bool) -> Self {
@@ -331,7 +361,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
             .update_flags(Arch::ENTRY_FLAG_READWRITE, value);
     }
 
-    /// @brief 当前页表项是否可写
+    /// 当前页表项是否可写
     #[inline(always)]
     pub fn has_write(&self) -> bool {
         // 有的架构同时具有可写和不可写的标志位，因此需要同时判断
@@ -339,17 +369,25 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
             == Arch::ENTRY_FLAG_READWRITE;
     }
 
-    /// @brief 设置当前页表项的可执行性, 如果为true，那么将当前页表项的权限设置为可执行, 否则设置为不可执行
+    /// 设置当前页表项的可执行性, 如果为true，那么将当前页表项的权限设置为可执行, 否则设置为不可执行
     #[must_use]
     #[inline(always)]
-    pub fn set_execute(self, value: bool) -> Self {
+    pub fn set_execute(self, mut value: bool) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 如果xd位被保留，那么将可执行性设置为true
+            if crate::arch::mm::X86_64MMArch::is_xd_reserved() {
+                value = true;
+            }
+        }
+
         // 有的架构同时具有可执行和不可执行的标志位，因此需要同时更新
         return self
             .update_flags(Arch::ENTRY_FLAG_NO_EXEC, !value)
             .update_flags(Arch::ENTRY_FLAG_EXEC, value);
     }
 
-    /// @brief 当前页表项是否可执行
+    /// 当前页表项是否可执行
     #[inline(always)]
     pub fn has_execute(&self) -> bool {
         // 有的架构同时具有可执行和不可执行的标志位，因此需要同时判断
@@ -401,7 +439,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub fn mmio_flags() -> Self {
         return Self::new()
-            .set_user(true)
+            .set_user(false)
             .set_write(true)
             .set_execute(true)
             .set_page_cache_disable(true)
@@ -421,7 +459,7 @@ impl<Arch: MemoryManagementArch> fmt::Debug for PageFlags<Arch> {
     }
 }
 
-/// @brief 页表映射器
+/// 页表映射器
 #[derive(Hash)]
 pub struct PageMapper<Arch, F> {
     /// 页表类型
@@ -434,13 +472,16 @@ pub struct PageMapper<Arch, F> {
 }
 
 impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
-    /// @brief 创建新的页面映射器
+    /// 创建新的页面映射器
     ///
-    /// @param table_kind 页表类型
-    /// @param table_paddr 根页表物理地址
-    /// @param allocator 页分配器
+    /// ## 参数
+    /// - table_kind 页表类型
+    /// - table_paddr 根页表物理地址
+    /// - allocator 页分配器
     ///
-    /// @return 页面映射器
+    /// ## 返回值
+    ///
+    /// 页面映射器
     pub unsafe fn new(table_kind: PageTableKind, table_paddr: PhysAddr, allocator: F) -> Self {
         return Self {
             table_kind,
@@ -450,32 +491,35 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         };
     }
 
-    /// @brief 创建页表，并为这个页表创建页面映射器
+    /// 创建页表，并为这个页表创建页面映射器
     pub unsafe fn create(table_kind: PageTableKind, mut allocator: F) -> Option<Self> {
         let table_paddr = allocator.allocate_one()?;
+        // 清空页表
+        let table_vaddr = Arch::phys_2_virt(table_paddr)?;
+        Arch::write_bytes(table_vaddr, 0, Arch::PAGE_SIZE);
         return Some(Self::new(table_kind, table_paddr, allocator));
     }
 
-    /// @brief 获取当前页表的页面映射器
+    /// 获取当前页表的页面映射器
     #[inline(always)]
     pub unsafe fn current(table_kind: PageTableKind, allocator: F) -> Self {
         let table_paddr = Arch::table(table_kind);
         return Self::new(table_kind, table_paddr, allocator);
     }
 
-    /// @brief 判断当前页表分配器所属的页表是否是当前页表
+    /// 判断当前页表分配器所属的页表是否是当前页表
     #[inline(always)]
     pub fn is_current(&self) -> bool {
         return unsafe { self.table().phys() == Arch::table(self.table_kind) };
     }
 
-    /// @brief 将当前页表分配器所属的页表设置为当前页表
+    /// 将当前页表分配器所属的页表设置为当前页表
     #[inline(always)]
     pub unsafe fn make_current(&self) {
         Arch::set_table(self.table_kind, self.table_paddr);
     }
 
-    /// @brief 获取当前页表分配器所属的根页表的结构体
+    /// 获取当前页表分配器所属的根页表的结构体
     #[inline(always)]
     pub fn table(&self) -> PageTable<Arch> {
         // 由于只能通过new方法创建PageMapper，因此这里假定table_paddr是有效的
@@ -484,19 +528,20 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         };
     }
 
-    /// @brief 获取当前PageMapper所对应的页分配器实例的引用
+    /// 获取当前PageMapper所对应的页分配器实例的引用
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn allocator_ref(&self) -> &F {
         return &self.frame_allocator;
     }
 
-    /// @brief 获取当前PageMapper所对应的页分配器实例的可变引用
+    /// 获取当前PageMapper所对应的页分配器实例的可变引用
     #[inline(always)]
     pub fn allocator_mut(&mut self) -> &mut F {
         return &mut self.frame_allocator;
     }
 
-    /// @brief 从当前PageMapper的页分配器中分配一个物理页，并将其映射到指定的虚拟地址
+    /// 从当前PageMapper的页分配器中分配一个物理页，并将其映射到指定的虚拟地址
     pub unsafe fn map(
         &mut self,
         virt: VirtAddr,
@@ -508,7 +553,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         return self.map_phys(virt, phys, flags);
     }
 
-    /// @brief 映射一个物理页到指定的虚拟地址
+    /// 映射一个物理页到指定的虚拟地址
     pub unsafe fn map_phys(
         &mut self,
         virt: VirtAddr,
@@ -558,23 +603,20 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
 
                     // 设置页表项的flags
-                    let flags = Arch::ENTRY_FLAG_READWRITE
-                        | Arch::ENTRY_FLAG_DEFAULT_TABLE
-                        | if virt.kind() == PageTableKind::User {
-                            Arch::ENTRY_FLAG_USER
-                        } else {
-                            0
-                        };
+                    // let flags = Arch::ENTRY_FLAG_READWRITE
+                    //     | Arch::ENTRY_FLAG_DEFAULT_TABLE
+                    //     | if virt.kind() == PageTableKind::User {
+                    //         Arch::ENTRY_FLAG_USER
+                    //     } else {
+                    //         0
+                    //     };
+                    let flags: PageFlags<MMArch> =
+                        PageFlags::new_page_table(virt.kind() == PageTableKind::User);
 
                     // kdebug!("Flags: {:?}", flags);
-                    // kdebug!(
-                    //     "Map page table, level={}, next level table phys={:?}",
-                    //     table.level(),
-                    //     frame
-                    // );
 
                     // 把新分配的页表映射到当前页表
-                    table.set_entry(i, PageEntry::new(frame.data() | flags));
+                    table.set_entry(i, PageEntry::new(frame.data() | flags.data()));
 
                     // 获取新分配的页表
                     table = table.next_level_table(i)?;
@@ -583,7 +625,8 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         }
     }
 
-    /// @brief 将物理地址映射到具有线性偏移量的虚拟地址
+    /// 将物理地址映射到具有线性偏移量的虚拟地址
+    #[allow(dead_code)]
     pub unsafe fn map_linearly(
         &mut self,
         phys: PhysAddr,
@@ -593,14 +636,17 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         return self.map_phys(virt, phys, flags).map(|flush| (virt, flush));
     }
 
-    /// @brief 修改虚拟地址的页表项的flags，并返回页表项刷新器
+    /// 修改虚拟地址的页表项的flags，并返回页表项刷新器
     ///
     /// 请注意，需要在修改完flags后，调用刷新器的flush方法，才能使修改生效
     ///
-    /// @param virt 虚拟地址
-    /// @param flags 新的页表项的flags
+    /// ## 参数
+    /// - virt 虚拟地址
+    /// - flags 新的页表项的flags
     ///
-    /// @return 如果修改成功，返回刷新器，否则返回None
+    /// ## 返回值
+    ///
+    /// 如果修改成功，返回刷新器，否则返回None
     pub unsafe fn remap(
         &mut self,
         virt: VirtAddr,
@@ -616,11 +662,15 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             .flatten();
     }
 
-    /// @brief 根据虚拟地址，查找页表，获取对应的物理地址和页表项的flags
+    /// 根据虚拟地址，查找页表，获取对应的物理地址和页表项的flags
     ///
-    /// @param virt 虚拟地址
+    /// ## 参数
     ///
-    /// @return 如果查找成功，返回物理地址和页表项的flags，否则返回None
+    /// - virt 虚拟地址
+    ///
+    /// ## 返回值
+    ///
+    /// 如果查找成功，返回物理地址和页表项的flags，否则返回None
     pub fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags<Arch>)> {
         let entry: PageEntry<Arch> = self.visit(virt, |p1, i| unsafe { p1.entry(i) })??;
         let paddr = entry.address().ok()?;
@@ -628,26 +678,33 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         return Some((paddr, flags));
     }
 
-    /// @brief 取消虚拟地址的映射，释放页面，并返回页表项刷新器
+    /// 取消虚拟地址的映射，释放页面，并返回页表项刷新器
     ///
     /// 请注意，需要在取消映射后，调用刷新器的flush方法，才能使修改生效
     ///
-    /// @param virt 虚拟地址
-    /// @param unmap_parents 是否在父页表内，取消空闲子页表的映射
+    /// ## 参数
     ///
-    /// @return 如果取消成功，返回刷新器，否则返回None
+    /// - virt 虚拟地址
+    /// - unmap_parents 是否在父页表内，取消空闲子页表的映射
+    ///
+    /// ## 返回值
+    /// 如果取消成功，返回刷新器，否则返回None
     pub unsafe fn unmap(&mut self, virt: VirtAddr, unmap_parents: bool) -> Option<PageFlush<Arch>> {
         let (paddr, _, flusher) = self.unmap_phys(virt, unmap_parents)?;
         self.frame_allocator.free_one(paddr);
         return Some(flusher);
     }
 
-    /// @brief 取消虚拟地址的映射，并返回物理地址和页表项的flags
+    /// 取消虚拟地址的映射，并返回物理地址和页表项的flags
     ///
-    /// @param vaddr 虚拟地址
-    /// @param unmap_parents 是否在父页表内，取消空闲子页表的映射
+    /// ## 参数
     ///
-    /// @return 如果取消成功，返回物理地址和页表项的flags，否则返回None
+    /// - vaddr 虚拟地址
+    /// - unmap_parents 是否在父页表内，取消空闲子页表的映射
+    ///
+    /// ## 返回值
+    ///
+    /// 如果取消成功，返回物理地址和页表项的flags，否则返回None
     pub unsafe fn unmap_phys(
         &mut self,
         virt: VirtAddr,
@@ -663,7 +720,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt)));
     }
 
-    /// @brief 在页表中，访问虚拟地址对应的页表项，并调用传入的函数F
+    /// 在页表中，访问虚拟地址对应的页表项，并调用传入的函数F
     fn visit<T>(
         &self,
         virt: VirtAddr,
@@ -683,14 +740,18 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     }
 }
 
-/// @brief 取消页面映射，返回被取消映射的页表项的：【物理地址】和【flags】
+/// 取消页面映射，返回被取消映射的页表项的：【物理地址】和【flags】
 ///
-/// @param vaddr 虚拟地址
-/// @param table 页表
-/// @param unmap_parents 是否在父页表内，取消空闲子页表的映射
-/// @param allocator 页面分配器（如果页表从这个分配器分配，那么在取消映射时，也需要归还到这个分配器内）
+/// ## 参数
 ///
-/// @return 如果取消成功，返回被取消映射的页表项的：【物理地址】和【flags】，否则返回None
+/// - vaddr 虚拟地址
+/// - table 页表
+/// - unmap_parents 是否在父页表内，取消空闲子页表的映射
+/// - allocator 页面分配器（如果页表从这个分配器分配，那么在取消映射时，也需要归还到这个分配器内）
+///
+/// ## 返回值
+///
+/// 如果取消成功，返回被取消映射的页表项的：【物理地址】和【flags】，否则返回None
 unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     vaddr: VirtAddr,
     table: &mut PageTable<Arch>,
@@ -746,7 +807,7 @@ pub trait Flusher<Arch> {
     fn consume(&mut self, flush: PageFlush<Arch>);
 }
 
-/// @brief 用于刷新某个虚拟地址的刷新器。这个刷新器一经产生，就必须调用flush()方法，
+/// 用于刷新某个虚拟地址的刷新器。这个刷新器一经产生，就必须调用flush()方法，
 /// 否则会造成对页表的更改被忽略，这是不安全的
 #[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
 pub struct PageFlush<Arch> {
@@ -766,19 +827,20 @@ impl<Arch: MemoryManagementArch> PageFlush<Arch> {
         unsafe { Arch::invalidate_page(self.virt) };
     }
 
-    /// @brief 忽略掉这个刷新器
+    /// 忽略掉这个刷新器
     pub unsafe fn ignore(self) {
         mem::forget(self);
     }
 }
 
-/// @brief 用于刷新整个页表的刷新器。这个刷新器一经产生，就必须调用flush()方法，
+/// 用于刷新整个页表的刷新器。这个刷新器一经产生，就必须调用flush()方法，
 /// 否则会造成对页表的更改被忽略，这是不安全的
 #[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
 pub struct PageFlushAll<Arch: MemoryManagementArch> {
     phantom: PhantomData<fn() -> Arch>,
 }
 
+#[allow(dead_code)]
 impl<Arch: MemoryManagementArch> PageFlushAll<Arch> {
     pub fn new() -> Self {
         return Self {
@@ -790,7 +852,7 @@ impl<Arch: MemoryManagementArch> PageFlushAll<Arch> {
         unsafe { Arch::invalidate_all() };
     }
 
-    /// @brief 忽略掉这个刷新器
+    /// 忽略掉这个刷新器
     pub unsafe fn ignore(self) {
         mem::forget(self);
     }
@@ -811,7 +873,7 @@ impl<Arch: MemoryManagementArch, T: Flusher<Arch> + ?Sized> Flusher<Arch> for &m
 }
 
 impl<Arch: MemoryManagementArch> Flusher<Arch> for () {
-    fn consume(&mut self, flush: PageFlush<Arch>) {}
+    fn consume(&mut self, _flush: PageFlush<Arch>) {}
 }
 
 impl<Arch: MemoryManagementArch> Drop for PageFlushAll<Arch> {

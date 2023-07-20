@@ -469,6 +469,7 @@ pub struct VirtRegion {
     size: usize,
 }
 
+#[allow(dead_code)]
 impl VirtRegion {
     /// # 创建一个新的虚拟地址范围
     pub fn new(start: VirtAddr, size: usize) -> Self {

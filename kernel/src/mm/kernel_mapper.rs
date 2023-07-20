@@ -1,10 +1,9 @@
-use super::{page::PageFlags, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
+use super::{page::PageFlags, PageTableKind, PhysAddr, VirtAddr};
 use crate::{
     arch::{
         asm::irqflags::{local_irq_restore, local_irq_save},
         mm::{LockedFrameAllocator, PageMapper},
     },
-    kdebug,
     libs::align::page_align_up,
     mm::allocator::page_frame::PageFrameCount,
     mm::{MMArch, MemoryManagementArch},
@@ -12,7 +11,7 @@ use crate::{
     syscall::SystemError,
 };
 use core::{
-    ops::{Deref, DerefMut},
+    ops::Deref,
     sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 

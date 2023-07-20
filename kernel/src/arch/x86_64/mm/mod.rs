@@ -1,13 +1,19 @@
 pub mod barrier;
 pub mod frame;
+use alloc::vec::Vec;
+use hashbrown::HashSet;
+use x86::time::rdtsc;
+use x86_64::registers::model_specific::EferFlags;
+
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
     disable_textui, enable_textui, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
-    process_control_block, video_reinitialize,
+    video_reinitialize,
 };
 use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
+
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
 use crate::mm::mmio_buddy::mmio_init;
 use crate::{
@@ -24,11 +30,9 @@ use crate::{kdebug, kinfo};
 use core::arch::asm;
 use core::ffi::c_void;
 use core::fmt::{Debug, Write};
-use core::mem::{self, MaybeUninit};
-use core::ptr::read_volatile;
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::mem::{self};
 
-use self::barrier::mfence;
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
@@ -71,6 +75,9 @@ pub static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
 /// @brief X86_64的内存管理架构结构体
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct X86_64MMArch;
+
+/// XD标志位是否被保留
+static XD_RESERVED: AtomicBool = AtomicBool::new(false);
 
 impl MemoryManagementArch for X86_64MMArch {
     /// 4K页
@@ -124,6 +131,8 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _erodata();
             fn _end();
         }
+
+        Self::init_xd_rsvd();
 
         let bootstrap_info = X86_64MMBootstrapInfo {
             kernel_code_start: _text as usize,
@@ -248,7 +257,27 @@ impl X86_64MMArch {
         }
         c_uart_send_str(0x3f8, "init_memory_area_from_multiboot2 end\n\0".as_ptr());
         kinfo!("Total memory size: {} MB, total areas from multiboot2: {mb2_count}, valid areas: {areas_count}", total_mem_size / 1024 / 1024);
+
         return Ok(areas_count);
+    }
+
+    fn init_xd_rsvd() {
+        // 读取ia32-EFER寄存器的值
+        let efer: EferFlags = x86_64::registers::model_specific::Efer::read();
+        if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
+            // NO_EXECUTE_ENABLE是false，那么就设置xd_reserved为true
+            kdebug!("NO_EXECUTE_ENABLE is false, set XD_RESERVED to true");
+            XD_RESERVED.store(true, Ordering::Relaxed);
+            kdebug!("11efer.contains(EferFlags::NO_EXECUTE_ENABLE)={}, XD_RESERVED={}", efer.contains(EferFlags::NO_EXECUTE_ENABLE), XD_RESERVED.load(Ordering::Relaxed));
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        kdebug!("efer.contains(EferFlags::NO_EXECUTE_ENABLE)={}, XD_RESERVED={}", efer.contains(EferFlags::NO_EXECUTE_ENABLE), XD_RESERVED.load(Ordering::Relaxed));
+    }
+
+    /// 判断XD标志位是否被保留
+    pub fn is_xd_reserved() -> bool {
+        return XD_RESERVED.load(Ordering::Relaxed);
     }
 }
 
@@ -344,7 +373,7 @@ unsafe fn allocator_init() {
 
         for area in PHYS_MEMORY_AREAS.iter() {
             // kdebug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
-            for i in 0..area.size / MMArch::PAGE_SIZE {
+            for i in 0..((area.size + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE) {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
                 let flags = kernel_page_flags::<MMArch>(vaddr);
@@ -422,6 +451,99 @@ unsafe fn allocator_init() {
     kdebug!("Text UI enabled");
 }
 
+#[no_mangle]
+pub extern "C" fn rs_test_buddy() {
+    test_buddy();
+}
+pub fn test_buddy() {
+    // 申请内存然后写入数据然后free掉
+    // 总共申请200MB内存
+    const TOTAL_SIZE: usize = 200 * 1024 * 1024;
+
+    for i in 0..10 {
+        kdebug!("Test buddy, round: {i}");
+        // 存放申请的内存块
+        let mut v: Vec<(PhysAddr, PageFrameCount)> = Vec::with_capacity(60 * 1024);
+        // 存放已经申请的内存块的地址（用于检查重复）
+        let mut addr_set: HashSet<PhysAddr> = HashSet::new();
+
+        let mut allocated = 0usize;
+
+        let mut free_count = 0usize;
+
+        while allocated < TOTAL_SIZE {
+            let mut random_size = 0u64;
+            unsafe { x86::random::rdrand64(&mut random_size) };
+            // 一次最多申请4M
+            random_size = random_size % (1024 * 4096);
+            if random_size == 0 {
+                continue;
+            }
+            let random_size =
+                core::cmp::min(page_align_up(random_size as usize), TOTAL_SIZE - allocated);
+            let random_size = PageFrameCount::from_bytes(random_size.next_power_of_two()).unwrap();
+            // 获取帧
+            let (paddr, allocated_frame_count) =
+                unsafe { LockedFrameAllocator.allocate(random_size).unwrap() };
+            assert!(allocated_frame_count.data().is_power_of_two());
+            assert!(paddr.data() % MMArch::PAGE_SIZE == 0);
+            unsafe {
+                assert!(MMArch::phys_2_virt(paddr)
+                    .as_ref()
+                    .unwrap()
+                    .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE));
+            }
+            allocated += allocated_frame_count.data() * MMArch::PAGE_SIZE;
+            v.push((paddr, allocated_frame_count));
+            assert!(addr_set.insert(paddr), "duplicate address: {:?}", paddr);
+
+            // 写入数据
+            let vaddr = unsafe { MMArch::phys_2_virt(paddr).unwrap() };
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(
+                    vaddr.data() as *mut u8,
+                    allocated_frame_count.data() * MMArch::PAGE_SIZE,
+                )
+            };
+            for i in 0..slice.len() {
+                slice[i] = ((i + unsafe { rdtsc() } as usize) % 256) as u8;
+            }
+
+            // 随机释放一个内存块
+            if v.len() > 0 {
+                let mut random_index = 0u64;
+                unsafe { x86::random::rdrand64(&mut random_index) };
+                // 70%概率释放
+                if random_index % 10 > 7 {
+                    continue;
+                }
+                random_index = random_index % v.len() as u64;
+                let random_index = random_index as usize;
+                let (paddr, allocated_frame_count) = v.remove(random_index);
+                assert!(addr_set.remove(&paddr));
+                unsafe { LockedFrameAllocator.free(paddr, allocated_frame_count) };
+                free_count += allocated_frame_count.data() * MMArch::PAGE_SIZE;
+            }
+        }
+
+        kdebug!(
+            "Allocated {} MB memory, release: {} MB, no release: {} bytes",
+            allocated / 1024 / 1024,
+            free_count / 1024 / 1024,
+            (allocated - free_count)
+        );
+
+        kdebug!("Now, to release buddy memory");
+        // 释放所有的内存
+        for (paddr, allocated_frame_count) in v {
+            unsafe { LockedFrameAllocator.free(paddr, allocated_frame_count) };
+            assert!(addr_set.remove(&paddr));
+            free_count += allocated_frame_count.data() * MMArch::PAGE_SIZE;
+        }
+
+        kdebug!("release done!, allocated: {allocated}, free_count: {free_count}");
+    }
+}
 /// 全局的页帧分配器
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
@@ -459,7 +581,7 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> Page
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
-        // Remap kernel code read only, execute
+        // Remap kernel code  execute
         return PageFlags::new().set_execute(true).set_write(true);
     } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only

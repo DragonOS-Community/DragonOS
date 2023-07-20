@@ -2,13 +2,12 @@
 
 use core::intrinsics::unlikely;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use crate::{
     arch::mm::LowAddressRemapping,
-    driver::uart::uart::c_uart_send,
-    include::bindings::bindings::{gfp_t, PAGE_KERNEL, PAGE_U_S},
+    include::bindings::bindings::{gfp_t, PAGE_U_S},
     kdebug, kerror,
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::MMArch,
@@ -16,11 +15,11 @@ use crate::{
 };
 
 use super::{
-    allocator::page_frame::{FrameAllocator, PageFrameCount},
+    allocator::page_frame::PageFrameCount,
     kernel_mapper::KernelMapper,
     no_init::pseudo_map_phys,
-    page::{PageFlags, PageMapper},
-    MemoryManagementArch, PhysAddr, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE,
+    page::PageFlags,
+    MemoryManagementArch, PhysAddr, VirtAddr,
 };
 
 lazy_static! {
@@ -53,7 +52,7 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
     let mut kernel_mapper = KernelMapper::lock();
     let mut kernel_mapper = kernel_mapper.as_mut();
     assert!(kernel_mapper.is_some());
-    for i in 0..count.data() {
+    for _i in 0..count.data() {
         let flusher = kernel_mapper
             .as_mut()
             .unwrap()

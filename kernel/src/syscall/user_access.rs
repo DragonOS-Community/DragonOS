@@ -2,7 +2,7 @@
 use core::mem::size_of;
 
 use alloc::{
-    string::{String, ToString},
+    string::{String},
     vec::Vec,
 };
 

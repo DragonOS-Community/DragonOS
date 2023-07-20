@@ -11,7 +11,7 @@ use crate::{
     },
     ipc::signal::sys_rt_sigreturn,
     kdebug, kinfo,
-    mm::{ucontext::AddressSpace, verify_area, MemoryManagementArch, VirtAddr},
+    mm::{ucontext::AddressSpace, verify_area, VirtAddr},
     process::exec::{load_binary_file, ExecParam, ExecParamFlags},
     syscall::{
         user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
@@ -82,26 +82,26 @@ pub extern "C" fn syscall_handler(regs: &mut pt_regs) -> () {
                 syscall_return!(SystemError::EFAULT.to_posix_errno() as u64, regs);
             } else {
                 unsafe {
-                    // syscall_return!(
-                    //     rs_do_execve(
-                    //         path_ptr as *const u8,
-                    //         argv_ptr as *const *const u8,
-                    //         env_ptr as *const *const u8,
-                    //         regs
-                    //     ),
-                    //     regs
-                    // );
                     kdebug!("syscall: execve\n");
-                    let path = String::from("/bin/about.elf");
-                    let argv = vec![String::from("/bin/about.elf")];
-                    let envp = vec![String::from("PATH=/bin")];
-                    let r = tmp_rs_execve(path, argv, envp, regs);
-                    kdebug!("syscall: execve r: {:?}\n", r);
-
                     syscall_return!(
-                        r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize),
+                        rs_do_execve(
+                            path_ptr as *const u8,
+                            argv_ptr as *const *const u8,
+                            env_ptr as *const *const u8,
+                            regs
+                        ),
                         regs
-                    )
+                    );
+                    // let path = String::from("/bin/about.elf");
+                    // let argv = vec![String::from("/bin/about.elf")];
+                    // let envp = vec![String::from("PATH=/bin")];
+                    // let r = tmp_rs_execve(path, argv, envp, regs);
+                    // kdebug!("syscall: execve r: {:?}\n", r);
+
+                    // syscall_return!(
+                    //     r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize),
+                    //     regs
+                    // )
                 }
             }
         }
@@ -217,7 +217,13 @@ fn tmp_rs_execve(
     kdebug!("to load binary file");
     let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
     // 加载可执行文件
-    let load_result = load_binary_file(&mut param)?;
+    let load_result = load_binary_file(&mut param).unwrap_or_else(|e| {
+        panic!(
+            "Failed to load binary file: {:?}, path: {:?}",
+            e,
+            path
+        )
+    });
     kdebug!("load binary file done");
 
     param.init_info_mut().args = argv;

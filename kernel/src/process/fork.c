@@ -142,6 +142,9 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
     // 唤醒进程
     process_wakeup(tsk);
 
+    // 唤醒进程
+    process_wakeup(tsk);
+
     return retval;
 
 copy_thread_failed:;

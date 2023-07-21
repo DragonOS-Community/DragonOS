@@ -12,3 +12,5 @@ DragonOS负责人: longjin
 开发交流QQ群： 115763565
 
 DragonOS官网： https://DragonOS.org
+
+了解开发动态、开发任务，请访问DragonOS的zulip社群： https://DragonOS.zulipchat.com

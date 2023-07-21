@@ -72,6 +72,7 @@ ul do_put_string(char *s, uint32_t front_color, uint32_t background_color)
     printk_color(front_color, background_color, s);
     return 0;
 }
+
 /**
  * @brief 等待进程退出
  *

@@ -193,14 +193,7 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
-    while (1)
-    {
-        /* code */
-    }
-
-    // 这里不能删除，否则在O1会报错
-    // while (1)
-    //     pause();
+ 
 }
 
 // 操作系统内核从这里开始执行

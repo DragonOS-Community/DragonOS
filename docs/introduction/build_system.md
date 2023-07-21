@@ -235,7 +235,7 @@ make run-docker
 - 不编译，直接从已有的磁盘镜像启动: `make qemu`
 - 清理编译产生的文件: `make clean`
 - 编译文档: `make docs` （需要手动安装sphinx以及docs下的`requirements.txt`中的依赖）
-- 清理文档: `make clean-doc`
+- 清理文档: `make clean-docs`
 
 :::{note}
 如果您需要在vnc中运行DragonOS，请在上述命令后加上`-vnc`后缀。如：`make run-vnc`

@@ -1,20 +1,20 @@
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering}
 };
 
 use alloc::{
     collections::LinkedList,
-    string::{String, ToString},
+    string::String,
     sync::Arc,
 };
 
 use crate::{
     driver::uart::uart::{c_uart_send_str, UartPort},
     include::bindings::bindings::{
-        alloc_pages, scm_buffer_info_t, video_frame_buffer_info, video_reinitialize,
-        video_set_refresh_target, Page, PAGE_2M_SIZE, ZONE_NORMAL,
+        alloc_pages, scm_buffer_info_t, video_frame_buffer_info,
+        video_reinitialize, video_set_refresh_target, Page, PAGE_2M_SIZE, ZONE_NORMAL,
     },
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::{phys_2_virt, PAGE_2M_ALIGN},
@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    textui::{renew_buf, textui_change_buf},
+    textui::ENABLE_PUT_TO_WINDOW,
     textui_no_alloc::textui_init_no_alloc,
 };
 
@@ -34,6 +34,7 @@ lazy_static! {
         SpinLock::new(LinkedList::new());
     /// 当前在使用的UI框架
     pub static ref CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
+    
 }
 
 /// 是否启用双缓冲
@@ -81,7 +82,7 @@ fn alloc_pages_for_video_frame_buffer_info_size() -> Result<*mut Page, SystemErr
     return Ok(p);
 }
 
-fn get_vaddr_of_double_buf() -> Result<usize, SystemError> {
+fn vaddr_of_double_buf() -> Result<usize, SystemError> {
     let p = alloc_pages_for_video_frame_buffer_info_size()?;
     let vaddr = phys_2_virt(((unsafe { *p }).addr_phys) as usize);
     return Ok(vaddr);
@@ -106,26 +107,26 @@ impl ScmBufferInfo {
                 ScmBufferInfo::from(unsafe { &video_frame_buffer_info });
             frame_buffer_info.flags = buf_type;
 
-            frame_buffer_info.vaddr = get_vaddr_of_double_buf()?;
+            frame_buffer_info.vaddr = vaddr_of_double_buf()?;
             // println!("vaddr:{}", frame_buffer_info.vaddr);
 
             return Ok(frame_buffer_info);
         }
     }
 
-    pub fn get_vaddr(&self) -> usize {
+    pub fn vaddr(&self) -> usize {
         self.vaddr
     }
-    pub fn get_size_about_u8(&self) -> u32 {
+    pub fn buf_size_about_u8(&self) -> u32 {
         self.size
     }
-    pub fn get_height_about_u32(&self) -> u32 {
+    pub fn buf_height(&self) -> u32 {
         self.height
     }
-    pub fn get_width_about_u32(&self) -> u32 {
+    pub fn buf_width(&self) -> u32 {
         self.width
     }
-    pub fn get_size_about_u32(&self) -> u32 {
+    pub fn buf_size_about_u32(&self) -> u32 {
         self.height * self.width
     }
 }
@@ -171,8 +172,6 @@ pub struct ScmUiFrameworkMetadata {
     pub name: String,
     pub framework_type: ScmFramworkType,
     pub buf_info: ScmBufferInfo,
-
-   
 }
 
 impl ScmUiFrameworkMetadata {
@@ -184,7 +183,6 @@ impl ScmUiFrameworkMetadata {
                     name,
                     framework_type: ScmFramworkType::Text,
                     buf_info: ScmBufferInfo::new(ScmBfFlag::SCM_BF_TEXT).unwrap(),
-     
                 };
                 return result;
             }
@@ -239,15 +237,19 @@ pub extern "C" fn scm_init() {
 
 /// 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
 /// ## 参数
+/// 
 /// - framework 要启动的ui框架
 
 pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
-    if framework.metadata()?.buf_info.vaddr == 0 {
+    // 获取信息
+
+    let metadata = framework.metadata()?;
+
+    if metadata.buf_info.vaddr == 0 {
         return Err(SystemError::EINVAL);
     }
     let mut current_framework = CURRENT_FRAMEWORK.write();
-    // 获取信息
-    let metadata = framework.metadata()?;
+
 
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == true {
         let buf: scm_buffer_info_t = metadata.buf_info.into();
@@ -264,6 +266,7 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
     return Ok(0);
 }
 /// 向屏幕管理器注册UI框架
+/// 
 /// ## 参数
 /// - framework 框架结构体
 
@@ -273,6 +276,7 @@ pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemErr
     SCM_FRAMEWORK_LIST.lock().push_back(framework.clone());
     // 调用ui框架的回调函数以安装ui框架，并将其激活
     framework.install()?;
+
 
     // 如果当前还没有框架获得了屏幕的控制权，就让其拿去
     if CURRENT_FRAMEWORK.read().is_none() {
@@ -301,16 +305,16 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
         // 已经开启了双缓冲区了, 直接退出
         return Ok(0);
     }
-    // let mut scm_list = SCM_FRAMEWORK_LIST.lock();
-    // if scm_list.is_empty() {
-    //     // scm 框架链表为空
-    //     return Ok(0);
-    // }
+    let scm_list = SCM_FRAMEWORK_LIST.lock();
+    if scm_list.is_empty() {
+        // scm 框架链表为空
+        return Ok(0);
+    }
     SCM_DOUBLE_BUFFER_ENABLED.store(true, Ordering::SeqCst);
 
     // 创建双缓冲区
     let buf_info = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL)?;
-    // (*CURRENT_FRAMEWORK.write()).buf_info = buf_info.clone();
+   
     CURRENT_FRAMEWORK
         .write()
         .as_ref()
@@ -318,18 +322,61 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
         .change(buf_info.clone())?;
     // 设置定时刷新的对象
     unsafe { video_set_refresh_target(buf_info.clone().into()) };
-    // 遍历当前所有使用帧缓冲区的框架，更新地址(暂时还没想好怎么不用指针把各个框架的缓冲区更改为双缓冲区，先直接把textui框架的缓冲区更改为双缓冲)
-    textui_change_buf(buf_info.clone())?;
+    // 遍历当前所有使用帧缓冲区的框架，更新地址
+    drop(scm_list);
+    for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
+        (*framework).change(buf_info.clone())?;
+    }
     // 通知显示驱动，启动双缓冲
     unsafe { video_reinitialize(true) };
-    renew_buf(buf_info.get_vaddr(), buf_info.get_height_about_u32());
+    // renew_buf(buf_info.vaddr(), buf_info.buf_height());
     // println!("vaddr:{:#018x}",buf_info.get_vaddr());
     // loop{}
     return Ok(0);
 }
-
+/// 允许往窗口打印信息
+#[no_mangle]
+pub extern "C" fn scm_enable_put_to_window() {
+    // mm之前要继续往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
+    if CURRENT_FRAMEWORK.read().is_none() {
+        unsafe { ENABLE_PUT_TO_WINDOW = true };
+    } else {
+        let r = CURRENT_FRAMEWORK
+            .write()
+            .as_ref()
+            .unwrap()
+            .enable()
+            .unwrap_or_else(|e| e.to_posix_errno());
+        if r.is_negative() {
+            c_uart_send_str(
+                UartPort::COM1.to_u16(),
+                "scm_enable_put_to_window() failed.\n\0".as_ptr(),
+            );
+        }
+    }
+}
+/// 禁止往窗口打印信息
+#[no_mangle]
+pub extern "C" fn scm_disable_put_to_window() {
+    // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
+    if CURRENT_FRAMEWORK.read().is_none() {
+        unsafe { ENABLE_PUT_TO_WINDOW = false };
+    } else {
+        let r = CURRENT_FRAMEWORK
+            .write()
+            .as_ref()
+            .unwrap()
+            .disable()
+            .unwrap_or_else(|e| e.to_posix_errno());
+        if r.is_negative() {
+            c_uart_send_str(
+                UartPort::COM1.to_u16(),
+                "scm_disable_put_to_window() failed.\n\0".as_ptr(),
+            );
+        }
+    }
+}
 /// 当内存管理单元被初始化之后，重新处理帧缓冲区问题
-
 #[no_mangle]
 pub extern "C" fn scm_reinit() -> i32 {
     let r = true_scm_reinit().unwrap_or_else(|e| e.to_posix_errno());
@@ -340,18 +387,10 @@ pub extern "C" fn scm_reinit() -> i32 {
 }
 fn true_scm_reinit() -> Result<i32, SystemError> {
     unsafe { video_reinitialize(false) };
-    // 遍历当前所有使用帧缓冲区的框架，更新地址(暂时还没想好怎么不用指针把各个框架的缓冲区更改为双缓冲区，先直接把textui框架的缓冲区更改为双缓冲)
-    // for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
-    //     if unsafe {
-    //         scm_buffer_info_is_equal(
-    //             framework.metadata()?.buf_info.into(),
-    //             video_frame_buffer_info,
-    //         )
-    //     } {
-    //         framework.change(unsafe { ScmBufferInfo::from(&video_frame_buffer_info) })?;
-    //     }
-    // }
-    textui_change_buf(unsafe { ScmBufferInfo::from(&video_frame_buffer_info) })?;
+    // 遍历当前所有使用帧缓冲区的框架，更新地址
+    for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
+        framework.change(unsafe { ScmBufferInfo::from(&video_frame_buffer_info) })?;
+    }
     // unsafe { scm_enable_put_to_window() };
     return Ok(0);
 }

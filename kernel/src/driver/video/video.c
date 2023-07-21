@@ -70,8 +70,9 @@ int video_refresh_daemon(void *unused)
                 spin_lock(&daemon_refresh_lock);
                 if (video_frame_buffer_info.vaddr != NULL)
                 {
+                    // kdebug("video_frame_buffer_info.vaddr = %#018lx,get_video_refresh_target_vaddr()= %#018lx" ,video_frame_buffer_info.vaddr,get_video_refresh_target_vaddr());
 
-                    memcpy((void *)video_frame_buffer_info.vaddr, (void *) get_video_refresh_target_vaddr(),
+                    memcpy((void *)video_frame_buffer_info.vaddr, (void *)get_video_refresh_target_vaddr(),
                            video_refresh_target.size);
                 }
                 spin_unlock(&daemon_refresh_lock);
@@ -90,7 +91,7 @@ int video_refresh_daemon(void *unused)
 
 uint64_t get_video_refresh_target_vaddr()
 {
-    barrier();
+    // barrier();
     return video_refresh_target.vaddr;
 }
 /**
@@ -123,7 +124,8 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
         rs_unregister_softirq(VIDEO_REFRESH_SIRQ);
         // 计算开始时间
         video_refresh_expire_jiffies = rs_timer_next_n_ms_jiffies(50 * REFRESH_INTERVAL);
-        // kdebug("buf = %#018lx", video_refresh_target->vaddr);
+        kdebug("video_frame_buffer_info.vaddr = %#018lx,get_video_refresh_target_vaddr()= %#018lx", video_frame_buffer_info.vaddr, get_video_refresh_target_vaddr());
+
         io_mfence();
         // 创建video守护进程
         video_daemon_pcb = kthread_run(&video_refresh_daemon, NULL, "Video refresh daemon");
@@ -159,7 +161,6 @@ int video_set_refresh_target(struct scm_buffer_info_t buf)
     // kdebug("buf = %#018lx", buf);
 
     video_refresh_target = buf;
-
 
     rs_register_softirq_video();
     kdebug("register softirq video done");
@@ -205,7 +206,6 @@ int video_init()
         video_frame_buffer_info.width * video_frame_buffer_info.height * ((video_frame_buffer_info.bit_depth + 7) / 8);
     // 先临时映射到该地址，稍后再重新映射
     video_frame_buffer_info.vaddr = 0xffff800003000000;
- 
 
     mm_map_phys_addr(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size,
                      PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);

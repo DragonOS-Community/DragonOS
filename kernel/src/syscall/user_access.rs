@@ -1,15 +1,9 @@
 //! 这个文件用于放置一些内核态访问用户态数据的函数
 use core::mem::size_of;
 
-use alloc::{
-    string::{String},
-    vec::Vec,
-};
+use alloc::{string::String, vec::Vec};
 
-use crate::{
-    kdebug,
-    mm::{verify_area, VirtAddr},
-};
+use crate::mm::{verify_area, VirtAddr};
 
 use super::SystemError;
 
@@ -118,7 +112,7 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
     if user.is_null() {
         Ok(Vec::new())
     } else {
-        kdebug!("check_and_clone_cstr_array: {:p}\n", user);
+        // kdebug!("check_and_clone_cstr_array: {:p}\n", user);
         let mut buffer = Vec::new();
         for i in 0.. {
             let addr = unsafe { user.add(i) };
@@ -131,7 +125,7 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
                 let dst = core::mem::transmute::<[u8; size_of::<usize>()], [usize; 1]>(dst);
                 str_ptr = dst[0] as *const u8;
 
-                kdebug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
+                // kdebug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
             }
 
             if str_ptr.is_null() {

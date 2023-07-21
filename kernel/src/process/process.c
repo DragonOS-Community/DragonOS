@@ -38,7 +38,6 @@ extern void kernel_thread_func(void);
 extern void rs_procfs_unregister_pid(uint64_t);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
-extern struct mm_struct initial_mm;
 extern struct signal_struct INITIAL_SIGNALS;
 extern struct sighand_struct INITIAL_SIGHAND;
 
@@ -56,7 +55,7 @@ extern uint64_t rs_exec_init_process(struct pt_regs *regs);
 #define INITIAL_PROC(proc)                                                                                           \
     {                                                                                                                \
         .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
-        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
+        .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
         .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
         .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
         .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND, .address_space = NULL                               \
@@ -335,7 +334,6 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
 void process_init()
 {
     kinfo("Initializing process...");
-    // rs_test_buddy();
     io_mfence();
     rs_process_init();
     io_mfence();

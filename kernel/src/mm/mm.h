@@ -7,12 +7,8 @@
 #include <process/process.h>
 
 extern void rs_pseudo_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size);
-extern void rs_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size,uint64_t flags);
+extern void rs_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size, uint64_t flags);
 extern uint64_t rs_unmap_at_low_addr();
-
-// 每个页表的项数
-// 64位下，每个页表4k，每条页表项8B，故一个页表有512条
-#define PTRS_PER_PGT 512
 
 // 内核层的起始地址
 #define PAGE_OFFSET 0xffff800000000000UL
@@ -43,9 +39,6 @@ extern uint64_t rs_unmap_at_low_addr();
 // 虚拟地址与物理地址转换
 #define virt_2_phys(addr) ((unsigned long)(addr)-PAGE_OFFSET)
 #define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + PAGE_OFFSET))
-// 获取对应的页结构体
-#define Virt_To_2M_Page(kaddr) (memory_management_struct.pages_struct + (virt_2_phys(kaddr) >> PAGE_2M_SHIFT))
-#define Phy_to_2M_Page(kaddr) (memory_management_struct.pages_struct + ((unsigned long)(kaddr) >> PAGE_2M_SHIFT))
 
 // 在这个地址以上的虚拟空间，用来进行特殊的映射
 #define SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE 0xffffa00000000000UL
@@ -53,7 +46,6 @@ extern uint64_t rs_unmap_at_low_addr();
 #define IO_APIC_MAPPING_OFFSET 0xfec00000UL
 #define LOCAL_APIC_MAPPING_OFFSET 0xfee00000UL
 #define AHCI_MAPPING_OFFSET 0xff200000UL // AHCI 映射偏移量,之后使用了4M的地址
-#define XHCI_MAPPING_OFFSET 0x100000000 // XHCI控制器映射偏移量(后方请预留1GB的虚拟空间来映射不同的controller)
 
 // ===== 内存区域属性 =====
 // DMA区域
@@ -142,59 +134,21 @@ extern uint64_t rs_unmap_at_low_addr();
 
 #define PAGE_USER_4K_PAGE (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
-// ===== 错误码定义 ====
-// 物理页结构体为空
-#define EPAGE_NULL 1
-
 /**
  * @brief 刷新TLB的宏定义
  * 由于任何写入cr3的操作都会刷新TLB，因此这个宏定义可以刷新TLB
  */
-#define flush_tlb()                                                                                                    \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        ul tmp;                                                                                                        \
-        io_mfence();                                                                                                   \
-        __asm__ __volatile__("movq %%cr3, %0\n\t"                                                                      \
-                             "movq %0, %%cr3\n\t"                                                                      \
-                             : "=r"(tmp)::"memory");                                                                   \
-                                                                                                                       \
+#define flush_tlb()                                  \
+    do                                               \
+    {                                                \
+        ul tmp;                                      \
+        io_mfence();                                 \
+        __asm__ __volatile__("movq %%cr3, %0\n\t"    \
+                             "movq %0, %%cr3\n\t"    \
+                             : "=r"(tmp)::"memory"); \
+                                                     \
     } while (0);
 
-/**
- * @brief 系统内存信息结构体（单位：字节）
- *
- */
-struct mm_stat_t
-{
-    uint64_t total;      // 计算机的总内存数量大小
-    uint64_t used;       // 已使用的内存大小
-    uint64_t free;       // 空闲物理页所占的内存大小
-    uint64_t shared;     // 共享的内存大小
-    uint64_t cache_used; // 位于slab缓冲区中的已使用的内存大小
-    uint64_t cache_free; // 位于slab缓冲区中的空闲的内存大小
-    uint64_t available;  // 系统总空闲内存大小（包括kmalloc缓冲区）
-};
-
-/**
- * @brief 虚拟内存区域的操作方法的结构体
- *
- */
-struct vm_operations_t
-{
-    /**
-     * @brief vm area 被打开时的回调函数
-     *
-     */
-    void (*open)(struct vm_area_struct *area);
-    /**
-     * @brief vm area将要被移除的时候，将会调用该回调函数
-     *
-     */
-    void (*close)(struct vm_area_struct *area);
-};
-
-extern struct memory_desc memory_management_struct;
 
 // 导出内核程序的几个段的起止地址
 extern char _text;
@@ -207,26 +161,6 @@ extern char _bss;
 extern char _ebss;
 extern char _end;
 
-// 每个区域的索引
-
-int ZONE_DMA_INDEX = 0;
-int ZONE_NORMAL_INDEX = 0;
-int ZONE_UNMAPPED_INDEX = 0;
-
-// 初始化内存管理单元
-void mm_init();
-
-/**
- * @brief 初始化内存页
- *
- * @param page 内存页结构体
- * @param flags 标志位
- * 本函数只负责初始化内存页，允许对同一页面进行多次初始化
- * 而维护计数器及置位bmp标志位的功能，应当在分配页面的时候手动完成
- * @return unsigned long
- */
-unsigned long page_init(struct Page *page, ul flags);
-
 /**
  * @brief 读取CR3寄存器的值（存储了页目录的基地址）
  *
@@ -235,27 +169,10 @@ unsigned long page_init(struct Page *page, ul flags);
 unsigned long *get_CR3()
 {
     ul *tmp;
-    __asm__ __volatile__("movq %%cr3, %0\n\t" : "=r"(tmp)::"memory");
+    __asm__ __volatile__("movq %%cr3, %0\n\t"
+                         : "=r"(tmp)::"memory");
     return tmp;
 }
-
-
-#define mk_pml4t(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
-/**
- * @brief 设置pml4页表的页表项
- * @param pml4tptr pml4页表项的地址
- * @param pml4val pml4页表项的值
- */
-#define set_pml4t(pml4tptr, pml4tval) (*(pml4tptr) = (pml4tval))
-
-#define mk_pdpt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
-#define set_pdpt(pdptptr, pdptval) (*(pdptptr) = (pdptval))
-
-#define mk_pdt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
-#define set_pdt(pdtptr, pdtval) (*(pdtptr) = (pdtval))
-
-#define mk_pt(addr, attr) ((unsigned long)(addr) | (unsigned long)(attr))
-#define set_pt(ptptr, ptval) (*(ptptr) = (ptval))
 
 /*
  *  vm_area_struct中的vm_flags的可选值
@@ -274,11 +191,3 @@ unsigned long *get_CR3()
 
 /* VMA basic access permission flags */
 #define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
-
-
-/**
- * @brief 获取系统当前的内存信息(未上锁，不一定精准)
- *
- * @return struct mm_stat_t 内存信息结构体
- */
-struct mm_stat_t mm_stat();

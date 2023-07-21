@@ -3,17 +3,15 @@ use crate::mm::kernel_mapper::KernelMapper;
 use crate::syscall::SystemError;
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{
-        vm_flags_t, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE,
-    },
+    include::bindings::bindings::{vm_flags_t, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE},
     kdebug,
     mm::{MMArch, MemoryManagementArch},
 };
-use crate::{kinfo, kwarn};
+use crate::{kerror, kinfo, kwarn};
 use alloc::{collections::LinkedList, vec::Vec};
+use core::mem;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{compiler_fence, Ordering};
-use core::mem;
 
 use super::VirtAddr;
 
@@ -505,16 +503,16 @@ impl MmioBuddyMemPool {
         match self.mmio_buddy_query_addr_region(size_exp) {
             Ok(region) => {
                 // todo: 是否需要创建vma？或者用新重写的机制去做？
-                kdebug!(
-                    "create_mmio: vaddr = {:?}, length = {}",
-                    region.vaddr,
-                    new_size
-                );
+                // kdebug!(
+                //     "create_mmio: vaddr = {:?}, length = {}",
+                //     region.vaddr,
+                //     new_size
+                // );
                 unsafe { *res_vaddr = region.vaddr.data() as u64 };
                 unsafe { *res_length = new_size as u64 };
             }
             Err(_) => {
-                kdebug!("failed to create mmio vma.pid = {:?}", current_pcb().pid);
+                kerror!("failed to create mmio. pid = {:?}", current_pcb().pid);
                 return Err(SystemError::ENOMEM);
             }
         }
@@ -643,7 +641,7 @@ pub extern "C" fn mmio_create(
     res_vaddr: *mut u64,
     res_length: *mut u64,
 ) -> i32 {
-    kdebug!("mmio_create");
+    // kdebug!("mmio_create");
     if let Err(err) = mmio_pool().create_mmio(size as usize, vm_flags, res_vaddr, res_length) {
         return err.to_posix_errno();
     } else {

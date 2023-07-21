@@ -1,6 +1,5 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
-    include::bindings::bindings::{gfp_t},
     libs::align::page_align_up,
     mm::{MMArch, MemoryManagementArch, VirtAddr},
 };
@@ -15,8 +14,8 @@ use super::page_frame::{FrameAllocator, PageFrameCount};
 
 /// 类kmalloc的分配器应当实现的trait
 pub trait LocalAlloc {
-    unsafe fn local_alloc(&self, layout: Layout, gfp: gfp_t) -> *mut u8;
-    unsafe fn local_alloc_zeroed(&self, layout: Layout, gfp: gfp_t) -> *mut u8;
+    unsafe fn local_alloc(&self, layout: Layout) -> *mut u8;
+    unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8;
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout);
 }
 
@@ -56,14 +55,14 @@ impl KernelAllocator {
 
 /// 为内核SLAB分配器实现LocalAlloc的trait
 impl LocalAlloc for KernelAllocator {
-    unsafe fn local_alloc(&self, layout: Layout, _gfp: gfp_t) -> *mut u8 {
+    unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
         return self
             .alloc_in_buddy(layout)
             .map(|x| x.as_mut_ptr() as *mut u8)
             .unwrap_or(core::ptr::null_mut() as *mut u8);
     }
 
-    unsafe fn local_alloc_zeroed(&self, layout: Layout, _gfp: gfp_t) -> *mut u8 {
+    unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         return self
             .alloc_in_buddy(layout)
             .map(|x| {
@@ -82,12 +81,12 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        return self.local_alloc(layout, 0);
+        return self.local_alloc(layout);
         // self.local_alloc_zeroed(layout, 0)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.local_alloc_zeroed(layout, 0)
+        self.local_alloc_zeroed(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {

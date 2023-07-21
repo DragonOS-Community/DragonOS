@@ -4,9 +4,7 @@
 /// @Description: bump allocator线性分配器
 ///
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
-use crate::{
-    mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea},
-};
+use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea};
 use core::marker::PhantomData;
 
 /// 线性分配器

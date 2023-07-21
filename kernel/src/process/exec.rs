@@ -8,7 +8,6 @@ use crate::{
         ROOT_INODE,
     },
     io::SeekFrom,
-    kdebug,
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -162,12 +161,13 @@ impl<'a> ExecParam<'a> {
 pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, SystemError> {
     let inode = ROOT_INODE().lookup(param.file_path)?;
 
+    // 读取文件头部，用于判断文件类型
     let file = File::new(inode, FileMode::O_RDONLY)?;
     param.file = Some(file);
     let mut head_buf = [0u8; 512];
     param.file_mut().lseek(SeekFrom::SeekSet(0))?;
     let _bytes = param.file_mut().read(512, &mut head_buf)?;
-    kdebug!("load_binary_file: read {} bytes", _bytes);
+    // kdebug!("load_binary_file: read {} bytes", _bytes);
 
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
@@ -175,22 +175,22 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
         if probe_result.is_ok() {
             loader = Some(bl);
             break;
-        } else {
-            kdebug!("load_binary_file: probe failed: {:?}", probe_result);
         }
     }
-    kdebug!("load_binary_file: loader: {:?}", loader);
+    // kdebug!("load_binary_file: loader: {:?}", loader);
     if loader.is_none() {
         return Err(SystemError::ENOEXEC);
     }
 
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
-    kdebug!("load_binary_file: to load with param: {:?}", param);
+    // kdebug!("load_binary_file: to load with param: {:?}", param);
+
     let result: BinaryLoaderResult = loader
         .load(param, &head_buf)
         .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
-    kdebug!("load_binary_file: load success");
+
+    // kdebug!("load_binary_file: load success");
     return Ok(result);
 }
 

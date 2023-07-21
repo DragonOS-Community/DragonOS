@@ -267,7 +267,7 @@ impl PageFrameUsage {
     pub fn new(used: PageFrameCount, total: PageFrameCount) -> Self {
         return Self { used, total };
     }
-    
+
     // @brief 获取已使用的页帧数量
     pub fn used(&self) -> PageFrameCount {
         return self.used;

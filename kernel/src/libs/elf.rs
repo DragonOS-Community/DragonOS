@@ -11,7 +11,7 @@ use crate::{
     arch::MMArch,
     current_pcb,
     io::SeekFrom,
-    kdebug, kerror,
+    kerror,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -93,7 +93,7 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
-        kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
+        // kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
@@ -171,7 +171,7 @@ impl ElfLoader {
         map_flags: &MapFlags,
         total_size: usize,
     ) -> Result<(VirtAddr, bool), SystemError> {
-        kdebug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
+        // kdebug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
 
         // 映射位置的偏移量（页内偏移）
         let beginning_page_offset = self.elf_page_offset(addr_to_map);
@@ -253,17 +253,16 @@ impl ElfLoader {
                 )?;
             }
         } else {
-            kdebug!("total size = 0");
+            // kdebug!("total size = 0");
 
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false)?
                 .virt_address();
-            kdebug!(
-                "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
-                addr_to_map
-            );
-            let paddr = user_vm_guard.user_mapper.utable.translate(addr_to_map);
-            kdebug!("paddr={:?}", paddr);
+            // kdebug!(
+            //     "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
+            //     addr_to_map
+            // );
+
             // 加载文件到内存
             self.do_load_file(
                 map_addr + beginning_page_offset,
@@ -280,7 +279,7 @@ impl ElfLoader {
                 )?;
             }
         }
-        kdebug!("load_elf_segment OK: map_addr={:?}", map_addr);
+        // kdebug!("load_elf_segment OK: map_addr={:?}", map_addr);
         return Ok((map_addr, true));
     }
 
@@ -313,11 +312,11 @@ impl ElfLoader {
         while remain > 0 {
             let read_size = min(remain, buf_size);
             file.read(read_size, &mut buf[..read_size])?;
-            kdebug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
+            // kdebug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
             unsafe {
                 copy_to_user(vaddr, &buf[..read_size]).map_err(|_| SystemError::EFAULT)?;
             }
-            kdebug!("copy ok");
+
             vaddr += read_size;
             remain -= read_size;
         }
@@ -468,9 +467,9 @@ impl BinaryLoader for ElfLoader {
     fn probe(self: &'static Self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError> {
         // let elf_bytes =
         //     ElfBytes::<AnyEndian>::minimal_parse(buf).map_err(|_| ExecError::NotExecutable)?;
-        kdebug!("ElfLoader probe: buf={:?}", buf);
+
         let ehdr = Self::parse_ehdr(buf).map_err(|_| ExecError::NotExecutable)?;
-        kdebug!("ElfLoader probe: ehdr={:?}", ehdr);
+
         #[cfg(target_arch = "x86_64")]
         return self.probe_x86_64(param, &ehdr);
 
@@ -490,7 +489,7 @@ impl BinaryLoader for ElfLoader {
         // https://opengrok.ringotek.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#1034
 
         let elf_type = ElfType::from(ehdr.e_type);
-        kdebug!("ehdr = {:?}", ehdr);
+        // kdebug!("ehdr = {:?}", ehdr);
 
         let binding = param.vm().clone();
         let mut user_vm = binding.write();
@@ -499,7 +498,7 @@ impl BinaryLoader for ElfLoader {
 
         // todo: 增加对动态链接的处理
 
-        kdebug!("to parse segments");
+        // kdebug!("to parse segments");
         // 加载ELF文件并映射到用户空间
         let mut phdr_buf = Vec::new();
         let loadable_sections = Self::parse_segments(param, &ehdr, &mut phdr_buf)
@@ -508,7 +507,7 @@ impl BinaryLoader for ElfLoader {
             .iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
 
-        kdebug!("loadable_sections = {:?}", loadable_sections);
+        // kdebug!("loadable_sections = {:?}", loadable_sections);
 
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);
@@ -526,13 +525,13 @@ impl BinaryLoader for ElfLoader {
         // program header的虚拟地址
         let mut phdr_vaddr: Option<VirtAddr> = None;
         for seg_to_load in loadable_sections {
-            kdebug!("seg_to_load = {:?}", seg_to_load);
+            // kdebug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
-                kdebug!(
-                    "to set brk, elf_brk = {:?}, elf_bss = {:?}",
-                    elf_brk,
-                    elf_bss
-                );
+                // kdebug!(
+                //     "to set brk, elf_brk = {:?}, elf_bss = {:?}",
+                //     elf_brk,
+                //     elf_bss
+                // );
                 self.set_elf_brk(
                     &mut user_vm,
                     elf_bss + load_bias,
@@ -604,9 +603,9 @@ impl BinaryLoader for ElfLoader {
                 }
             }
 
-            kdebug!("seg_to_load.p_offset={}", seg_to_load.p_offset);
-            kdebug!("e_phoff={}", ehdr.e_phoff);
-            kdebug!("seg_to_load.p_filesz={}", seg_to_load.p_filesz);
+            // kdebug!("seg_to_load.p_offset={}", seg_to_load.p_offset);
+            // kdebug!("e_phoff={}", ehdr.e_phoff);
+            // kdebug!("seg_to_load.p_filesz={}", seg_to_load.p_filesz);
             // Figure out which segment in the file contains the Program Header Table,
             // and map to the associated virtual address.
             if (seg_to_load.p_offset <= ehdr.e_phoff)
@@ -635,7 +634,7 @@ impl BinaryLoader for ElfLoader {
                 || seg_to_load.p_filesz > seg_to_load.p_memsz
                 || seg_to_load.p_memsz > MMArch::USER_END_VADDR.data() as u64
             {
-                kdebug!("ERR:     p_vaddr={p_vaddr:?}");
+                // kdebug!("ERR:     p_vaddr={p_vaddr:?}");
                 return Err(ExecError::InvalidParemeter);
             }
 
@@ -672,7 +671,7 @@ impl BinaryLoader for ElfLoader {
                 elf_brk = seg_end_vaddr;
             }
         }
-        kdebug!("elf load: phdr_vaddr={phdr_vaddr:?}");
+        // kdebug!("elf load: phdr_vaddr={phdr_vaddr:?}");
         let program_entrypoint = VirtAddr::new(ehdr.e_entry as usize + load_bias);
         let phdr_vaddr = if phdr_vaddr.is_some() {
             Some(phdr_vaddr.unwrap() + load_bias)
@@ -687,29 +686,31 @@ impl BinaryLoader for ElfLoader {
         start_data = start_data.map(|v| v + load_bias);
         end_data = end_data.map(|v| v + load_bias);
 
-        kdebug!(
-            "to set brk: elf_bss: {:?}, elf_brk: {:?}, bss_prot_flags: {:?}",
-            elf_bss,
-            elf_brk,
-            bss_prot_flags
-        );
+        // kdebug!(
+        //     "to set brk: elf_bss: {:?}, elf_brk: {:?}, bss_prot_flags: {:?}",
+        //     elf_bss,
+        //     elf_brk,
+        //     bss_prot_flags
+        // );
         self.set_elf_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
 
         if likely(elf_bss != elf_brk) && unlikely(self.pad_zero(elf_bss).is_err()) {
-            kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
+            // kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
             return Err(ExecError::BadAddress(Some(elf_bss)));
         }
         // todo: 动态链接：增加加载interpreter的代码
-        kdebug!("to create auxv");
+        // kdebug!("to create auxv");
+
         self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;
-        kdebug!("auxv create ok");
+
+        // kdebug!("auxv create ok");
         user_vm.start_code = start_code.unwrap_or(VirtAddr::new(0));
         user_vm.end_code = end_code.unwrap_or(VirtAddr::new(0));
         user_vm.start_data = start_data.unwrap_or(VirtAddr::new(0));
         user_vm.end_data = end_data.unwrap_or(VirtAddr::new(0));
 
         let result = BinaryLoaderResult::new(program_entrypoint);
-        kdebug!("elf load OK!!!");
+        // kdebug!("elf load OK!!!");
         return Ok(result);
     }
 }

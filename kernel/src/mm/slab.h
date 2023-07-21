@@ -1,10 +1,6 @@
 #pragma once
 
 #include "mm.h"
-#include <common/glib.h>
-#include <common/printk.h>
-#include <common/kprint.h>
-#include <common/spinlock.h>
 
 /**
  * @brief 通用内存分配函数
@@ -13,7 +9,6 @@
  * @param gfp 内存的flag
  * @return void* 分配得到的内存的指针
  */
-// void *kmalloc(unsigned long size, gfp_t gfp);
 extern void *kmalloc(unsigned long size, gfp_t gfp);
 
 /**
@@ -23,10 +18,6 @@ extern void *kmalloc(unsigned long size, gfp_t gfp);
  * @param gfp 内存的flag
  * @return void* 分配得到的内存的指针
  */
-// static __always_inline void *kzalloc(size_t size, gfp_t gfp)
-// {
-//     return kmalloc(size, gfp | __GFP_ZERO);
-// }
 extern void *kzalloc(size_t size, gfp_t gfp);
 
 /**
@@ -35,5 +26,4 @@ extern void *kzalloc(size_t size, gfp_t gfp);
  * @param address 要释放的内存地址
  * @return unsigned long
  */
-// unsigned long kfree(void *address);
 extern unsigned long kfree(void *address);

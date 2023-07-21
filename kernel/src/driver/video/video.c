@@ -34,8 +34,6 @@ void init_frame_buffer()
 {
     kinfo("Re-mapping VBE frame buffer...");
 
-    // uint64_t global_CR3 = (uint64_t)get_CR3();
-
     video_frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
 
     rs_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);

@@ -1,6 +1,4 @@
-use crate::{
-    include::bindings::bindings::process_control_block,
-};
+use crate::include::bindings::bindings::process_control_block;
 
 use super::{fork::copy_mm, process_init};
 

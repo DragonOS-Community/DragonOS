@@ -8,18 +8,15 @@ use hashbrown::HashMap;
 use crate::{
     arch::mm::LowAddressRemapping,
     include::bindings::bindings::{gfp_t, PAGE_U_S},
-    kdebug, kerror,
+    kerror,
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::MMArch,
     syscall::SystemError,
 };
 
 use super::{
-    allocator::page_frame::PageFrameCount,
-    kernel_mapper::KernelMapper,
-    no_init::pseudo_map_phys,
-    page::PageFlags,
-    MemoryManagementArch, PhysAddr, VirtAddr,
+    allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, no_init::pseudo_map_phys,
+    page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
 };
 
 lazy_static! {
@@ -42,7 +39,7 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
     let mut vaddr = VirtAddr::new(vaddr);
     let mut paddr = PhysAddr::new(paddr);
     let count = PageFrameCount::new(page_align_up(size) / MMArch::PAGE_SIZE);
-    kdebug!("rs_map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
+    // kdebug!("rs_map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
 
     let mut page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
     if flags & PAGE_U_S as usize != 0 {
@@ -68,13 +65,13 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
 
 #[no_mangle]
 pub unsafe extern "C" fn kzalloc(size: usize, _gfp: gfp_t) -> usize {
-    kdebug!("kzalloc: size: {size}");
+    // kdebug!("kzalloc: size: {size}");
     return do_kmalloc(size, true);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn kmalloc(size: usize, _gfp: gfp_t) -> usize {
-    kdebug!("kmalloc: size: {size}");
+    // kdebug!("kmalloc: size: {size}");
     // 由于C代码不规范，因此都全部清空
     return do_kmalloc(size, true);
 }

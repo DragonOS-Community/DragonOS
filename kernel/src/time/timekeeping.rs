@@ -155,7 +155,7 @@ pub fn timekeeper_init() {
 ///
 /// * 'TimeSpec' - 时间戳
 pub fn getnstimeofday() -> TimeSpec {
-    kdebug!("enter getnstimeofday");
+    // kdebug!("enter getnstimeofday");
 
     // let mut nsecs: u64 = 0;0
     let mut _xtime = TimeSpec {

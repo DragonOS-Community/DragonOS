@@ -174,7 +174,6 @@ void smp_ap_start()
     barrier();
     current_pcb->state = PROC_RUNNING;
     current_pcb->flags = PF_KTHREAD;
-    current_pcb->mm = &initial_mm;
     current_pcb->address_space = NULL;
     rs_smp_init_idle();
 

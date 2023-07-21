@@ -87,9 +87,6 @@ struct process_control_block
     // pcb的名字
     char name[PCB_NAME_LEN];
 
-    // 内存空间分布结构体， 记录内存页表和程序段信息
-    struct mm_struct *mm;
-
     // 进程切换时保存的状态信息
     struct thread_struct *thread;
 

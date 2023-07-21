@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::{
     arch::MMArch,
-    include::bindings::bindings::{mm_struct, process_control_block, PAGE_OFFSET},
+    include::bindings::bindings::{process_control_block, PAGE_OFFSET},
     syscall::SystemError,
 };
 
@@ -628,6 +628,4 @@ pub fn verify_area(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
 unsafe impl Send for process_control_block {}
 unsafe impl Sync for process_control_block {}
 
-unsafe impl Send for mm_struct {}
-unsafe impl Sync for mm_struct {}
 // ====== 重构内存管理后，请删除这几行 END =======

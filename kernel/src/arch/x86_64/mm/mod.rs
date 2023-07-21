@@ -268,11 +268,8 @@ impl X86_64MMArch {
             // NO_EXECUTE_ENABLE是false，那么就设置xd_reserved为true
             kdebug!("NO_EXECUTE_ENABLE is false, set XD_RESERVED to true");
             XD_RESERVED.store(true, Ordering::Relaxed);
-            kdebug!("11efer.contains(EferFlags::NO_EXECUTE_ENABLE)={}, XD_RESERVED={}", efer.contains(EferFlags::NO_EXECUTE_ENABLE), XD_RESERVED.load(Ordering::Relaxed));
         }
         compiler_fence(Ordering::SeqCst);
-
-        kdebug!("efer.contains(EferFlags::NO_EXECUTE_ENABLE)={}, XD_RESERVED={}", efer.contains(EferFlags::NO_EXECUTE_ENABLE), XD_RESERVED.load(Ordering::Relaxed));
     }
 
     /// 判断XD标志位是否被保留
@@ -307,15 +304,13 @@ pub fn mm_init() {
         c_uart_send_str(0x3f8, "mm_init err\n\0".as_ptr());
         panic!("mm_init() can only be called once");
     }
-    c_uart_send_str(0x3f8, "mm_init2\n\0".as_ptr());
+
     unsafe { X86_64MMArch::init() };
-    c_uart_send_str(0x3f8, "mm_init3\n\0".as_ptr());
     kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
     kdebug!("phys[0]=virt[0x{:x}]", unsafe {
         MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
     });
 
-    c_uart_send_str(0x3f8, "mm_init4\n\0".as_ptr());
     // 初始化内存管理器
     unsafe { allocator_init() };
     // enable mmio
@@ -328,11 +323,7 @@ unsafe fn allocator_init() {
     let virt_offset = BOOTSTRAP_MM_INFO.unwrap().start_brk;
     let phy_offset =
         unsafe { MMArch::virt_2_phys(VirtAddr::new(page_align_up(virt_offset))) }.unwrap();
-    kdebug!(
-        "virt_offset: {:#x}, phy_offset: {:?}",
-        virt_offset,
-        phy_offset
-    );
+
     kdebug!("PhysArea[0..10] = {:?}", &PHYS_MEMORY_AREAS[0..10]);
     let mut bump_allocator =
         BumpAllocator::<X86_64MMArch>::new(&PHYS_MEMORY_AREAS, phy_offset.data());
@@ -377,14 +368,6 @@ unsafe fn allocator_init() {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
                 let flags = kernel_page_flags::<MMArch>(vaddr);
-                if paddr.data() >= 0x1fff0000 {
-                    kdebug!(
-                        "NOTICE: vaddr: {:?}, paddr: {:?}, flags: {:?}",
-                        vaddr,
-                        paddr,
-                        flags
-                    );
-                }
 
                 let flusher = mapper
                     .map_phys(vaddr, paddr, flags)
@@ -396,30 +379,22 @@ unsafe fn allocator_init() {
 
         // 添加低地址的映射（在smp完成初始化之前，需要使用低地址的映射.初始化之后需要取消这一段映射）
         LowAddressRemapping::remap_at_low_address(&mut mapper);
-
-        kdebug!(
-            "Successfully mapped all physical memory, table={:?}",
-            mapper.table().phys()
-        );
     }
     kdebug!(
         "After mapping all physical memory, DragonOS used: {} KB",
         bump_allocator.offset() / 1024
     );
 
-    kdebug!("bump offset = {:?}", bump_allocator.offset());
     // 初始化buddy_allocator
     let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
 
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
-    kdebug!("Successfully initialized buddy allocator");
+    kinfo!("Successfully initialized buddy allocator");
     // 关闭显示输出
     unsafe {
         disable_textui();
     }
-
-    kdebug!("To enable new page table");
     // make the new page table current
     {
         let mut binding = INNER_ALLOCATOR.lock();
@@ -434,9 +409,7 @@ unsafe fn allocator_init() {
         compiler_fence(Ordering::SeqCst);
         mapper.make_current();
         compiler_fence(Ordering::SeqCst);
-        c_uart_send_str(0x3f8, "make current ok\n\0".as_ptr());
         kdebug!("New page table enabled");
-        c_uart_send_str(0x3f8, "make current ok2\n\0".as_ptr());
     }
     kdebug!("Successfully enabled new page table");
     // 重置显示输出目标

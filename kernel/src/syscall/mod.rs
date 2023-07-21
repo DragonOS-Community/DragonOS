@@ -12,14 +12,14 @@ use crate::{
         syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::{mm_stat_t, pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
+    include::bindings::bindings::{pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
     io::SeekFrom,
     kinfo,
     libs::align::page_align_up,
     mm::{MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
     time::{
-        syscall::{PosixTimeZone, PosixTimeval, SYS_TIMEZONE},
+        syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
     },
 };
@@ -335,9 +335,8 @@ pub const SYS_NANOSLEEP: usize = 18;
 /// todo: 该系统调用与Linux不一致，将来需要删除该系统调用！！！ 删的时候记得改C版本的libc
 pub const SYS_CLOCK: usize = 19;
 pub const SYS_PIPE: usize = 20;
-
-/// todo: 该系统调用不是符合POSIX标准的，在将来需要删除！！！
-pub const SYS_MSTAT: usize = 21;
+/// 系统调用21曾经是SYS_MSTAT，但是现在已经废弃
+pub const __NOT_USED: usize = 21;
 pub const SYS_UNLINK_AT: usize = 22;
 pub const SYS_KILL: usize = 23;
 pub const SYS_SIGACTION: usize = 24;
@@ -649,18 +648,6 @@ impl Syscall {
                 }
             }
 
-            SYS_MSTAT => {
-                let dst = args[0] as *mut mm_stat_t;
-                if from_user
-                    && unsafe { !verify_area(dst as u64, core::mem::size_of::<mm_stat_t>() as u64) }
-                {
-                    Err(SystemError::EFAULT)
-                } else if dst.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::mstat(dst, from_user)
-                }
-            }
             SYS_UNLINK_AT => {
                 let dirfd = args[0] as i32;
                 let pathname = args[1] as *const c_char;
@@ -880,7 +867,7 @@ impl Syscall {
             }
             SYS_GETTIMEOFDAY => {
                 let timeval = args[0] as *mut PosixTimeval;
-                let timezone_ptr = args[1] as *const PosixTimeZone;
+                let timezone_ptr = args[1] as *mut PosixTimeZone;
                 let security_check = || {
                     if unsafe {
                         verify_area(timeval as u64, core::mem::size_of::<PosixTimeval>() as u64)
@@ -903,13 +890,8 @@ impl Syscall {
                 if r.is_err() {
                     Err(r.unwrap_err())
                 } else {
-                    let timezone = if !timezone_ptr.is_null() {
-                        &SYS_TIMEZONE
-                    } else {
-                        unsafe { timezone_ptr.as_ref().unwrap() }
-                    };
                     if !timeval.is_null() {
-                        Self::gettimeofday(timeval, timezone)
+                        Self::gettimeofday(timeval, timezone_ptr)
                     } else {
                         Err(SystemError::EFAULT)
                     }

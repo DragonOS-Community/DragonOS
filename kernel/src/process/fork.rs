@@ -11,7 +11,6 @@ use crate::{
         signal::{flush_signal_handlers, DEFAULT_SIGACTION},
         signal_types::{sigaction, sighand_struct, signal_struct, SigQueue},
     },
-    kdebug,
     libs::{
         atomic::atomic_set,
         ffi_convert::FFIBind2Rust,
@@ -149,7 +148,7 @@ pub extern "C" fn process_exit_sighand(pcb: *mut process_control_block) {
 ///
 /// - 如果当前进程没有用户地址空间，则panic
 pub fn copy_mm(clone_vm: bool, new_pcb: &mut process_control_block) -> Result<(), SystemError> {
-    kdebug!("copy_mm, clone_vm: {}", clone_vm);
+    // kdebug!("copy_mm, clone_vm: {}", clone_vm);
     let old_address_space = current_pcb()
         .address_space()
         .expect("copy_mm: Failed to get address space of current process.");

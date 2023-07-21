@@ -4,9 +4,7 @@ use alloc::sync::Arc;
 
 use crate::{
     arch::MMArch,
-    current_pcb,
-    include::bindings::bindings::mm_stat_t,
-    kdebug, kerror,
+    kerror,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
     syscall::{Syscall, SystemError},
@@ -67,41 +65,31 @@ bitflags! {
 
     }
 }
-extern "C" {
-    fn sys_do_mstat(dst: *mut mm_stat_t, from_user: bool) -> usize;
-}
+
 impl Syscall {
     pub fn brk(new_addr: VirtAddr) -> Result<VirtAddr, SystemError> {
-        kdebug!("brk: new_addr={:?}", new_addr);
+        // kdebug!("brk: new_addr={:?}", new_addr);
         let address_space = AddressSpace::current()?;
         let mut address_space = address_space.write();
 
         unsafe {
-            address_space.set_brk(VirtAddr::new(page_align_up(new_addr.data()))).ok();
+            address_space
+                .set_brk(VirtAddr::new(page_align_up(new_addr.data())))
+                .ok();
 
             return Ok(address_space.sbrk(0).unwrap());
         }
     }
 
     pub fn sbrk(incr: isize) -> Result<VirtAddr, SystemError> {
-        kdebug!("pid:{}, sbrk: incr={}", current_pcb().pid, incr);
+        // kdebug!("pid:{}, sbrk: incr={}", current_pcb().pid, incr);
+
         let address_space = AddressSpace::current()?;
         let mut address_space = address_space.write();
         let r = unsafe { address_space.sbrk(incr) };
-        kdebug!("pid:{}, sbrk: r={:?}", current_pcb().pid, r);
-        return r;
-    }
 
-    /// 获取内存统计信息
-    ///
-    /// TODO: 该函数不是符合POSIX标准的，在将来需要删除！
-    pub fn mstat(dst: *mut mm_stat_t, from_user: bool) -> Result<usize, SystemError> {
-        let ret = unsafe { sys_do_mstat(dst, from_user) };
-        if (ret as isize) < 0 {
-            return Err(SystemError::from_posix_errno(-(ret as isize) as i32)
-                .expect("mstat: Invalid errno"));
-        }
-        return Ok(ret);
+        // kdebug!("pid:{}, sbrk: r={:?}", current_pcb().pid, r);
+        return r;
     }
 
     /// ## mmap系统调用

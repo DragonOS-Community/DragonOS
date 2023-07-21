@@ -10,7 +10,6 @@ use crate::{
         pt_regs, set_system_trap_gate, CLONE_FS, CLONE_SIGNAL, CLONE_VM, USER_CS, USER_DS,
     },
     ipc::signal::sys_rt_sigreturn,
-    kdebug, kinfo,
     mm::{ucontext::AddressSpace, verify_area, VirtAddr},
     process::exec::{load_binary_file, ExecParam, ExecParamFlags},
     syscall::{
@@ -82,7 +81,7 @@ pub extern "C" fn syscall_handler(regs: &mut pt_regs) -> () {
                 syscall_return!(SystemError::EFAULT.to_posix_errno() as u64, regs);
             } else {
                 unsafe {
-                    kdebug!("syscall: execve\n");
+                    // kdebug!("syscall: execve\n");
                     syscall_return!(
                         rs_do_execve(
                             path_ptr as *const u8,
@@ -119,7 +118,7 @@ pub extern "C" fn syscall_handler(regs: &mut pt_regs) -> () {
 
 /// 系统调用初始化
 pub fn arch_syscall_init() -> Result<(), SystemError> {
-    kinfo!("arch_syscall_init\n");
+    // kinfo!("arch_syscall_init\n");
     unsafe { set_system_trap_gate(0x80, 0, syscall_int as *mut c_void) }; // 系统调用门
     return Ok(());
 }
@@ -135,9 +134,6 @@ pub unsafe extern "C" fn rs_do_execve(
         return SystemError::EINVAL.to_posix_errno() as usize;
     }
 
-    kinfo!("path: {:p}\n", path);
-    kinfo!("argv: {:p}\n", argv);
-    kinfo!("envp: {:p}\n", envp);
     let x = || {
         let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
@@ -152,7 +148,13 @@ pub unsafe extern "C" fn rs_do_execve(
 
     return tmp_rs_execve(path, argv, envp, regs)
         .map(|_| 0)
-        .unwrap_or_else(|e| e.to_posix_errno() as usize);
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to execve, pid: {} error: {:?}",
+                current_pcb().pid,
+                e
+            )
+        });
 }
 
 /// 执行第一个用户进程的函数（只应该被调用一次）
@@ -164,7 +166,7 @@ pub extern "C" fn rs_exec_init_process(regs: &mut pt_regs) -> usize {
     let argv = vec![String::from("/bin/shell.elf")];
     let envp = vec![String::from("PATH=/bin")];
     let r = tmp_rs_execve(path, argv, envp, regs);
-    kdebug!("rs_exec_init_process: r: {:?}\n", r);
+    // kdebug!("rs_exec_init_process: r: {:?}\n", r);
     return r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize);
 }
 
@@ -178,12 +180,12 @@ fn tmp_rs_execve(
     envp: Vec<String>,
     regs: &mut pt_regs,
 ) -> Result<(), SystemError> {
-    kdebug!(
-        "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
-        path,
-        argv,
-        envp
-    );
+    // kdebug!(
+    //     "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
+    //     path,
+    //     argv,
+    //     envp
+    // );
     // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
@@ -193,7 +195,7 @@ fn tmp_rs_execve(
         current_pcb().drop_address_space();
     }
     // 创建新的地址空间并设置为当前地址空间
-    let address_space = AddressSpace::new(true)?;
+    let address_space = AddressSpace::new(true).expect("Failed to create new address space");
     unsafe {
         current_pcb().set_address_space(address_space.clone());
     }
@@ -201,30 +203,19 @@ fn tmp_rs_execve(
         AddressSpace::is_current(&address_space),
         "Failed to set address space"
     );
-    kdebug!("Switch to new address space");
-    // 切换到新的用户地址空间
-    // unsafe {
-    //     MMArch::set_table(
-    //         crate::mm::PageTableKind::User,
-    //         address_space.read().user_mapper.utable.table().phys(),
-    //     )
-    // };
+    // kdebug!("Switch to new address space");
 
-    unsafe { address_space.write().user_mapper.utable.make_current() };
+    // 切换到新的用户地址空间
+    unsafe { address_space.read().user_mapper.utable.make_current() };
 
     drop(old_address_space);
     drop(irq_guard);
-    kdebug!("to load binary file");
+    // kdebug!("to load binary file");
     let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
     // 加载可执行文件
-    let load_result = load_binary_file(&mut param).unwrap_or_else(|e| {
-        panic!(
-            "Failed to load binary file: {:?}, path: {:?}",
-            e,
-            path
-        )
-    });
-    kdebug!("load binary file done");
+    let load_result = load_binary_file(&mut param)
+        .unwrap_or_else(|e| panic!("Failed to load binary file: {:?}, path: {:?}", e, path));
+    // kdebug!("load binary file done");
 
     param.init_info_mut().args = argv;
     param.init_info_mut().envs = envp;
@@ -243,7 +234,7 @@ fn tmp_rs_execve(
             .expect("Failed to push proc_init_info to user stack")
     };
 
-    kdebug!("write proc_init_info to user stack done");
+    // kdebug!("write proc_init_info to user stack done");
 
     // （兼容旧版libc）把argv的指针写到寄存器内
     // TODO: 改写旧版libc，不再需要这个兼容
@@ -263,11 +254,11 @@ fn tmp_rs_execve(
     regs.rflags = 0x200;
     regs.rax = 1;
 
-    kdebug!("regs: {:?}\n", regs);
+    // kdebug!("regs: {:?}\n", regs);
 
-    kdebug!(
-        "tmp_rs_execve: done, load_result.entry_point()={:?}",
-        load_result.entry_point()
-    );
+    // kdebug!(
+    //     "tmp_rs_execve: done, load_result.entry_point()={:?}",
+    //     load_result.entry_point()
+    // );
     return Ok(());
 }

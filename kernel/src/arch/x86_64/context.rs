@@ -24,7 +24,7 @@ pub fn switch_process(
     });
     unsafe {
         // 加载页表
-        new_address_space.write().user_mapper.utable.make_current();
+        new_address_space.read().user_mapper.utable.make_current();
         switch_proc(prev, next);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

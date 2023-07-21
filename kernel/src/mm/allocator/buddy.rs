@@ -70,8 +70,9 @@ pub struct BuddyAllocator<A> {
 
 impl<A: MemoryManagementArch> BuddyAllocator<A> {
     const BUDDY_ENTRIES: usize =
-        (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
     // 定义一个变量记录buddy表的大小
+        (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
+    
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
         let initial_free_pages = bump_allocator.usage().free();
         kdebug!("Free pages before init buddy: {:?}", initial_free_pages);

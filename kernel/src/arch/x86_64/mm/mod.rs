@@ -1,5 +1,5 @@
 pub mod barrier;
-pub mod frame;
+
 use alloc::vec::Vec;
 use hashbrown::HashSet;
 use x86::time::rdtsc;
@@ -43,8 +43,8 @@ static mut PHYS_MEMORY_AREAS: [PhysMemoryArea; 512] = [PhysMemoryArea {
     size: 0,
 }; 512];
 
-/// 初始的CR3寄存器的值，用于存储系统启动时内核的页表的位置
-static mut INITIAL_CR3_VALUE: usize = 0;
+/// 初始的CR3寄存器的值，用于内存管理初始化时，创建的第一个内核页表的位置
+static mut INITIAL_CR3_VALUE: PhysAddr = PhysAddr::new(0);
 
 /// 内核的第一个页表在pml4中的索引
 /// 顶级页表的[256, 512)项是内核的页表
@@ -189,10 +189,10 @@ impl MemoryManagementArch for X86_64MMArch {
         return virt.is_canonical();
     }
 
-    /// 获取系统的初始页表（初始CR3的值）
+    /// 获取内存管理初始化时，创建的第一个内核页表的地址
     fn initial_page_table() -> PhysAddr {
         unsafe {
-            return PhysAddr::new(INITIAL_CR3_VALUE);
+            return INITIAL_CR3_VALUE;
         }
     }
 
@@ -379,6 +379,10 @@ unsafe fn allocator_init() {
 
         // 添加低地址的映射（在smp完成初始化之前，需要使用低地址的映射.初始化之后需要取消这一段映射）
         LowAddressRemapping::remap_at_low_address(&mut mapper);
+    }
+
+    unsafe {
+        INITIAL_CR3_VALUE = new_page_table;
     }
     kdebug!(
         "After mapping all physical memory, DragonOS used: {} KB",

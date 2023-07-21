@@ -452,7 +452,7 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// @brief 判断指定的虚拟地址是否正确（符合规范）
     fn virt_is_valid(virt: VirtAddr) -> bool;
 
-    /// @brief 获取系统启动时的初始页表的物理地址
+    /// 获取内存管理初始化时，创建的第一个内核页表的地址
     fn initial_page_table() -> PhysAddr;
 
     /// 初始化新的usermapper，为用户进程创建页表

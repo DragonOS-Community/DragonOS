@@ -648,7 +648,7 @@ impl PciRoot {
             //kdebug!("virtaddress={:#x},virtsize={:#x}",virtaddress,virtsize);
             let vaddr = VirtAddr::new(virtaddress as usize);
             let paddr = PhysAddr::new(self.physical_address_base as usize);
-            kdebug!("pci root: map: vaddr={vaddr:?}, paddr={paddr:?}, size={size}");
+            // kdebug!("pci root: map: vaddr={vaddr:?}, paddr={paddr:?}, size={size}");
             let page_flags = PageFlags::mmio_flags();
             let mut kernel_mapper = KernelMapper::lock();
             // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
@@ -1314,6 +1314,7 @@ impl Display for BarInfo {
 }
 // todo 增加对桥的bar的支持
 pub trait PciDeviceBar {}
+
 ///一个普通PCI设备（非桥）有6个BAR寄存器，PciStandardDeviceBar存储其全部信息
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PciStandardDeviceBar {

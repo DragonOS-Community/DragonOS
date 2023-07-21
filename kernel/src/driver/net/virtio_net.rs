@@ -149,7 +149,6 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut guard = self.inner.lock();
 
-        // kdebug!("VirtioNet: receive. recv queue info: {}", guard.get_queue_debug_info(true));
         match guard.receive() {
             Ok(buf) => Some((
                 VirtioNetToken::new(self.clone(), Some(buf)),

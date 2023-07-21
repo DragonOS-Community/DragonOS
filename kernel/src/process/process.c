@@ -55,7 +55,7 @@ extern uint64_t rs_exec_init_process(struct pt_regs *regs);
 #define INITIAL_PROC(proc)                                                                                           \
     {                                                                                                                \
         .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
-        .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
+        .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,                        \
         .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
         .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
         .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND, .address_space = NULL                               \
@@ -150,23 +150,6 @@ int process_open_exec_file(char *path)
 }
 
 /**
- * @brief 使当前进程去执行新的代码
- *
- * @param regs 当前进程的寄存器
- * @param path 可执行程序的路径
- * @param argv 参数列表
- * @param envp 环境变量
- * @return ul 错误码
- */
-#pragma GCC push_options
-#pragma GCC optimize("O0")
-ul do_execve(struct pt_regs *regs, char *path, char *argv[], char *envp[])
-{
-    return rs_do_execve(regs, path, argv, envp);
-}
-#pragma GCC pop_options
-
-/**
  * @brief 初始化实时进程rt_pcb
  *
  * @return 初始化后的进程
@@ -215,7 +198,7 @@ ul initial_kernel_thread(ul arg)
     io_mfence();
     // while (1)
     //     ;
-    
+
     // 准备切换到用户态
     struct pt_regs *regs;
 
@@ -360,7 +343,7 @@ void process_init()
 
     // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
     current_pcb->virtual_runtime = 0;
-    
+
     barrier();
     kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核线程
     barrier();
@@ -470,8 +453,6 @@ void process_exit_thread(struct process_control_block *pcb)
  */
 int process_release_pcb(struct process_control_block *pcb)
 {
-    // 释放进程的地址空间
-    process_exit_mm(pcb);
     if ((pcb->flags & PF_KTHREAD)) // 释放内核线程的worker private结构体
         free_kthread_struct(pcb);
 
@@ -483,6 +464,8 @@ int process_release_pcb(struct process_control_block *pcb)
     process_exit_signal(pcb);
     rs_process_exit_fpstate(pcb);
     rs_procfs_unregister_pid(pcb->pid);
+    // 释放进程的地址空间
+    process_exit_mm(pcb);
     // 释放当前pcb
     kfree(pcb);
     return 0;

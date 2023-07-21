@@ -37,7 +37,7 @@ void init_frame_buffer()
     video_frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
 
     rs_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
-    
+
     kinfo("VBE frame buffer successfully Re-mapped!");
 }
 

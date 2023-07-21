@@ -133,7 +133,8 @@ struct process_control_block
     // 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     // 该字段存储要被迁移到的目标处理器核心号
     uint32_t migrate_to;
-    void *fp_state; // Fpstate 用于用户态切换到内核态时保存浮点寄存器里面的值
+    // Fpstate 用于用户态切换到内核态时保存浮点寄存器里面的值
+    void *fp_state;
     // 指向进程的地址空间的arc指针.
     void *address_space;
 };

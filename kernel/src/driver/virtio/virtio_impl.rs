@@ -10,7 +10,6 @@ use crate::mm::{
     },
     MemoryManagementArch, PhysAddr, VirtAddr,
 };
-
 use core::ptr::NonNull;
 use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE};
 

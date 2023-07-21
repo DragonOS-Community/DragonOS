@@ -334,6 +334,7 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
 void process_init()
 {
     kinfo("Initializing process...");
+    // rs_test_buddy();
     io_mfence();
     rs_process_init();
     io_mfence();

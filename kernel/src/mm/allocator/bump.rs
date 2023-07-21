@@ -2,7 +2,6 @@
 /// @Date: 2023-03-27 06:54:08
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/bump.rs
 /// @Description: bump allocator线性分配器
-///
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea};
 use core::marker::PhantomData;

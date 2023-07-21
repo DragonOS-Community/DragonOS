@@ -133,7 +133,6 @@ impl InnerAddressSpace {
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
         };
-
         if create_stack {
             // kdebug!("to create user stack.");
             result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
@@ -1204,7 +1203,7 @@ impl UserStack {
             map_flags,
             false,
         )?;
-
+        // test_buddy();
         // 设置保护页只读
         prot_flags.remove(ProtFlags::PROT_WRITE);
         // kdebug!(

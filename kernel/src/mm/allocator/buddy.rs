@@ -3,7 +3,6 @@
 /// @Date: 2023-03-28 16:03:47
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/buddy.rs
 /// @Description: 伙伴分配器
-///
 use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
@@ -234,7 +233,6 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
         Some(allocator)
     }
-
     /// 获取第j个entry的虚拟地址，
     /// j从0开始计数
     pub fn entry_virt_addr(base_addr: PhysAddr, j: usize) -> VirtAddr {

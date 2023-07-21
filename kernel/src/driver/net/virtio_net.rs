@@ -147,9 +147,7 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut guard = self.inner.lock();
-
-        match guard.receive() {
+        match self.inner.lock().receive() {
             Ok(buf) => Some((
                 VirtioNetToken::new(self.clone(), Some(buf)),
                 VirtioNetToken::new(self.clone(), None),

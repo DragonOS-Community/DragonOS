@@ -41,7 +41,7 @@ impl InterruptArch for X86_64InterruptArch {
     fn is_irq_enabled() -> bool {
         let rflags: u64;
         unsafe {
-            asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
+            asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
         }
         return rflags & (1 << 9) != 0;
     }

@@ -30,7 +30,6 @@ pub mod user_access;
 #[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
 #[allow(dead_code, non_camel_case_types)]
 pub enum SystemError {
-    /// 操作不被允许 Operation not permitted.
     EPERM = 1,
     /// 没有指定的文件或目录 No such file or directory.
     ENOENT = 2,

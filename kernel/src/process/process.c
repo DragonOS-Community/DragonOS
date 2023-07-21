@@ -196,8 +196,6 @@ ul initial_kernel_thread(ul arg)
     io_mfence();
     __rust_demo_func();
     io_mfence();
-    // while (1)
-    //     ;
 
     // 准备切换到用户态
     struct pt_regs *regs;

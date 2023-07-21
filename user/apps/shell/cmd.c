@@ -520,6 +520,7 @@ int shell_cmd_exec(int argc, char **argv)
             waitpid(pid, &retval, 0);
         else
             printf("[1] %d\n", pid); // 输出子进程的pid
+        
         free(argv);
     }
 }

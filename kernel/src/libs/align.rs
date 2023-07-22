@@ -3,7 +3,7 @@
 
 use core::{alloc::GlobalAlloc, fmt::Debug, ptr::Unique};
 
-use crate::{syscall::SystemError, KERNEL_ALLOCATOR};
+use crate::{arch::MMArch, mm::MemoryManagementArch, syscall::SystemError, KERNEL_ALLOCATOR};
 
 /// # AlignedBox
 ///
@@ -112,3 +112,29 @@ impl<T: Clone + SafeForZero, const ALIGN: usize> Clone for AlignedBox<T, ALIGN> 
 pub unsafe trait SafeForZero {}
 
 unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}
+
+/// 将给定的地址按照页面大小，向上对齐。
+///
+/// 参数 `addr`：要对齐的地址。
+///
+/// 返回值：对齐后的地址。
+pub fn page_align_up(addr: usize) -> usize {
+    let page_size = MMArch::PAGE_SIZE;
+    return (addr + page_size - 1) & (!(page_size - 1));
+}
+
+/// ## 检查是否对齐
+///
+/// 检查给定的值是否对齐到给定的对齐要求。
+///
+/// ## 参数
+/// - `value`：要检查的值
+/// - `align`：对齐要求，必须是2的幂次方,且不为0，否则运行时panic
+///
+/// ## 返回值
+///
+/// 如果对齐则返回`true`，否则返回`false`
+pub fn check_aligned(value: usize, align: usize) -> bool {
+    assert!(align != 0 && align.is_power_of_two());
+    return value & (align - 1) == 0;
+}

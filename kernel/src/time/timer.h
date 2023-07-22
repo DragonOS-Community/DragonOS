@@ -13,3 +13,4 @@ extern uint64_t rs_timer_next_n_ms_jiffies(uint64_t expire_ms);
 extern int64_t rs_schedule_timeout(int64_t timeout);
 
 extern uint64_t rs_clock();
+extern void rs_jiffies_init();

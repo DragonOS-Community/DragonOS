@@ -26,7 +26,7 @@ void ahci_cpp_init(uint32_t *count_ahci_devices, struct pci_device_structure_hea
 
     // 映射ABAR
     uint32_t bar5 = gen_devs[0]->BAR5;
-    rs_map_phys(AHCI_MAPPING_BASE, (ul)(bar5)&PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE);
+    mm_map_phys_addr(AHCI_MAPPING_BASE, (ul)(bar5)&PAGE_2M_MASK, PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
 
     kinfo("ABAR mapped!");
 }

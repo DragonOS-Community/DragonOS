@@ -6,4 +6,3 @@
 
    kthread
    pcb
-   load_binary

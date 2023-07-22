@@ -8,7 +8,7 @@
  */
 void switch_proc(struct process_control_block *prev, struct process_control_block *proc)
 {
-    // process_switch_mm(proc);
+    process_switch_mm(proc);
     io_mfence();
     switch_to(prev, proc);
 }

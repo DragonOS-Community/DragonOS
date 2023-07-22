@@ -12,7 +12,7 @@ pub fn ia64_pci_get_arch_msi_message_address(processor: u16) -> u32 {
 /// @return MSI Message Address
 pub fn ia64_pci_get_arch_msi_message_data(
     vector: u16,
-    _processor: u16,
+    processor: u16,
     trigger: TriggerMode,
 ) -> u32 {
     match trigger {

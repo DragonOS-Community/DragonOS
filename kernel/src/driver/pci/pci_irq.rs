@@ -6,14 +6,16 @@ use core::ptr::NonNull;
 use alloc::ffi::CString;
 use alloc::vec::Vec;
 
-use super::pci::{PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError};
+use super::pci::{HeaderType, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError};
 use crate::arch::msi::{ia64_pci_get_arch_msi_message_address, ia64_pci_get_arch_msi_message_data};
 use crate::arch::{PciArch, TraitPciArch};
 use crate::include::bindings::bindings::{
     c_irq_install, c_irq_uninstall, pt_regs, ul, EAGAIN, EINVAL,
 };
-use crate::libs::volatile::{volread, volwrite, Volatile, VolatileReadable, VolatileWritable};
-
+use crate::libs::volatile::{
+    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
+};
+use crate::{kdebug, kerror, kinfo, kwarn};
 /// MSIX表的一项
 #[repr(C)]
 struct MsixEntry {
@@ -266,7 +268,7 @@ pub trait PciInterrupt: PciDeviceStructure {
         return Err(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq));
     }
     /// @brief 获取指定数量的中断号 todo 需要中断重构支持
-    fn irq_alloc(_num: u16) -> Option<Vec<u16>> {
+    fn irq_alloc(num: u16) -> Option<Vec<u16>> {
         None
     }
     /// @brief 进行PCI设备中断的安装

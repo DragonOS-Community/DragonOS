@@ -79,7 +79,7 @@ impl FpState {
 /// @brief 从用户态进入内核时，保存浮点寄存器，并关闭浮点功能
 pub fn fp_state_save(pcb: &mut process_control_block) {
     // 该过程中不允许中断
-    let rflags: usize = local_irq_save();
+    let rflags = local_irq_save();
 
     let fp: &mut FpState = if pcb.fp_state == null_mut() {
         let f = Box::leak(Box::new(FpState::default()));

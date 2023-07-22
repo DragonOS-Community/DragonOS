@@ -1,5 +1,7 @@
 #pragma once
 #include "mm.h"
 
-extern void mmio_create(uint32_t size, uint64_t vm_flagsu, uint64_t* res_vaddr, uint64_t* res_length);
+extern void mmio_buddy_init();
+extern void mmio_create();
 extern int mmio_release(int vaddr, int length);
+void mmio_init();

@@ -22,7 +22,7 @@
 #define VFS_DPT_MBR 0 // MBR分区表
 #define VFS_DPT_GPT 1 // GPT分区表
 
-#define VFS_MAX_PATHLEN 4096
+#define VFS_MAX_PATHLEN 1024
 
 /**
  * @brief inode的属性

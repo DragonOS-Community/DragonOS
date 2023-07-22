@@ -17,7 +17,7 @@ use crate::{
         InterruptArch,
     },
     include::bindings::bindings::{process_control_block, process_wakeup, PROC_RUNNING},
-    kdebug, kerror, kinfo,
+    kdebug, kerror,
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
@@ -105,6 +105,7 @@ impl Timer {
                 break;
             }
         }
+
         let mut temp_list: LinkedList<Arc<Timer>> = timer_list.split_off(split_pos);
         timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
         timer_list.append(&mut temp_list);
@@ -215,7 +216,7 @@ pub fn timer_init() {
     softirq_vectors()
         .register_softirq(SoftirqNumber::TIMER, do_timer_softirq)
         .expect("Failed to register timer softirq");
-    kinfo!("timer initialized successfully");
+    kdebug!("timer initiated successfully");
 }
 
 /// 计算接下来n毫秒对应的定时器时间片

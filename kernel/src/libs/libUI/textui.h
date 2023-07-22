@@ -181,7 +181,3 @@ uint32_t __textui_get_current_window_id();
  * @return int
  */
 int textui_init();
-
-void enable_textui();
-
-void disable_textui();

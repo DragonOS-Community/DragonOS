@@ -96,7 +96,7 @@ static __always_inline int __msix_map_table(struct pci_device_structure_header_t
     // pci_dev->msix_mmio_vaddr, bar, pci_dev->msix_offset, pci_dev->msix_table_size, pci_dev->msix_mmio_size);
 
     // 将msix table映射到页表
-    rs_map_phys(pci_dev->msix_mmio_vaddr, bar, pci_dev->msix_mmio_size, PAGE_KERNEL_PAGE);
+    mm_map(&initial_mm, pci_dev->msix_mmio_vaddr, pci_dev->msix_mmio_size, bar);
     return 0;
 }
 

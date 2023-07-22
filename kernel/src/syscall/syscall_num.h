@@ -30,6 +30,7 @@
 #define SYS_CLOCK 19     // 获取当前cpu时间
 #define SYS_PIPE 20      // 创建管道
 
+#define SYS_MSTAT 21        // 获取系统的内存状态信息
 #define SYS_UNLINK_AT 22    // 删除文件夹/删除文件链接
 #define SYS_KILL 23         // kill一个进程(向这个进程发出信号)
 #define SYS_SIGACTION 24    // 设置进程的信号处理动作
@@ -40,20 +41,18 @@
 #define SYS_DUP2 29
 #define SYS_SOCKET 30 // 创建一个socket
 
-#define SYS_SETSOCKOPT 31 // 设置socket的选项
-#define SYS_GETSOCKOPT 32 // 获取socket的选项
-#define SYS_CONNECT 33    // 连接到一个socket
-#define SYS_BIND 34       // 绑定一个socket
-#define SYS_SENDTO 35     // 向一个socket发送数据
-#define SYS_RECVFROM 36   // 从一个socket接收数据
-#define SYS_RECVMSG 37    // 从一个socket接收消息
-#define SYS_LISTEN 38     // 监听一个socket
-#define SYS_SHUTDOWN 39   // 关闭socket
-#define SYS_ACCEPT 40     // 接受一个socket连接
-
-#define SYS_GETSOCKNAME 41  // 获取socket的名字
-#define SYS_GETPEERNAME 42  // 获取socket的对端名字
+#define SYS_SETSOCKOPT 31  // 设置socket的选项
+#define SYS_GETSOCKOPT 32  // 获取socket的选项
+#define SYS_CONNECT 33     // 连接到一个socket
+#define SYS_BIND 34        // 绑定一个socket
+#define SYS_SENDTO 35      // 向一个socket发送数据
+#define SYS_RECVFROM 36    // 从一个socket接收数据
+#define SYS_RECVMSG 37     // 从一个socket接收消息
+#define SYS_LISTEN 38      // 监听一个socket
+#define SYS_SHUTDOWN 39    // 关闭socket
+#define SYS_ACCEPT 40      // 接受一个socket连接
+#define SYS_GETSOCKNAME 41 // 获取socket的名字
+#define SYS_GETPEERNAME 42 // 获取socket的对端名字
 #define SYS_GETTIMEOFDAY 43 // 获取当前时间
-#define SYS_MMAP 44         // 内存映射
-#define SYS_MUNMAP 45       // 内存解除映射
-#define SYS_MPROTECT 46     // 内存保护
+
+#define SYS_AHCI_END_REQ 255 // AHCI DMA请求结束end_request的系统调用

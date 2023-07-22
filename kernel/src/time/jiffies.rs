@@ -3,7 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{kerror, kinfo, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{kdebug, libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
@@ -89,13 +89,9 @@ pub fn jiffies_init() {
     //注册jiffies
     let jiffies = clocksource_default_clock() as Arc<dyn Clocksource>;
     match jiffies.register() {
-        Ok(_) => {
-            kinfo!("jiffies_init sccessfully");
-        }
-        Err(_) => {
-            kerror!("jiffies_init failed, no default clock running");
-        }
-    };
+        Ok(_) => kdebug!("jiffies_init sccessfully"),
+        Err(_) => kdebug!("jiffies_init failed, no default clock running"),
+    }
 }
 
 #[no_mangle]

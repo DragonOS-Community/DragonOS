@@ -32,7 +32,6 @@
 #include <common/unistd.h>
 #include <driver/disk/ahci/ahci.h>
 #include <driver/disk/ahci/ahci_rust.h>
-#include <driver/multiboot2/multiboot2.h>
 #include <driver/pci/pci.h>
 #include <driver/video/video.h>
 #include <driver/virtio/virtio.h>

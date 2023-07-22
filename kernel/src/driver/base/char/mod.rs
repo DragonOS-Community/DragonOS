@@ -71,7 +71,7 @@ impl CharDeviceStruct {
     ///             name: 字符设备名
     ///             char: 字符设备实例
     /// @return: 实例
-    /// 
+    ///
     #[allow(dead_code)]
     pub fn new(dev_t: DeviceNumber, minorct: usize, name: &'static str) -> Self {
         Self {
@@ -84,7 +84,7 @@ impl CharDeviceStruct {
     /// @brief: 获取起始次设备号
     /// @parameter: None
     /// @return: 起始设备号
-    /// 
+    ///
     #[allow(dead_code)]
     pub fn device_number(&self) -> DeviceNumber {
         self.dev_t
@@ -93,7 +93,7 @@ impl CharDeviceStruct {
     /// @brief: 获取起始次设备号
     /// @parameter: None
     /// @return: 起始设备号
-    /// 
+    ///
     #[allow(dead_code)]
     pub fn base_minor(&self) -> usize {
         self.dev_t.minor()
@@ -122,7 +122,7 @@ impl CharDevOps {
 
     /// @brief: 动态获取主设备号
     /// @parameter: None
-    /// @return: 如果成功，返回主设备号，否则，返回错误码 
+    /// @return: 如果成功，返回主设备号，否则，返回错误码
     #[allow(dead_code)]
     fn find_dynamic_major() -> Result<usize, SystemError> {
         let chardevs = CHARDEVS.0.lock();
@@ -171,7 +171,7 @@ impl CharDevOps {
     /// @parameter: baseminor: 主设备号
     ///             count: 次设备号数量
     ///             name: 字符设备名
-    /// @return: 如果注册成功，返回，否则，返回false 
+    /// @return: 如果注册成功，返回，否则，返回false
     #[allow(dead_code)]
     pub fn alloc_chardev_region(
         baseminor: usize,

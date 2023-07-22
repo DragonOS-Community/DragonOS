@@ -12,7 +12,6 @@
 
 - Home Page  **[DragonOS.org](https://dragonos.org)**
 - Documentation  **[docs.DragonOS.org](https://docs.dragonos.org)**
-- **To learn about development dynamics and development tasks, please visit DragonOS's zulip community:** [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
 - BBS  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
 - Software mirror website **[mirrors.DragonOS.org](https://mirrors.DragonOS.org)**
 - QQ group **115763565**
@@ -32,7 +31,7 @@
 
 ## How to join DragonOS ?
 
-&emsp;&emsp;If you are willing to join us, you can visit DragonOS's zulip community, learn about development dynamics and development tasks: [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
+&emsp;&emsp;If you are willing to join us, you can check the project panel of the GitHub repo, select the recently planned functions, and improve them.
 
 &emsp;&emsp;Or, you can also bring your ideas, discuss with community members, and create some new functions for DragonOS.
 
@@ -42,8 +41,9 @@
 
 &emsp;&emsp;Or join our development exchange QQ group: **115763565**
 
-&emsp;&emsp;For the discussion of formal issues, we recommend that you use the official language to post on the corresponding section of **[DragonOS's zulip community](https://DragonOS.zulipchat.com)**. Or you can post questions under the issue of this repository.
+&emsp;&emsp;For the discussion of formal issues, we suggest that they be discussed in the forum [BBS.Dragonos.org](https://bbs.dragonos.org/) In the corresponding section of the, use formal language to post for discussion. Or ask questions under the issue of the warehouse.
 
+&emsp;&emsp;While posting, you can forward the post to the communication QQ group, which can make the communication of problems more efficient and facilitate the archiving of problems.
 
 ## List of contributors
 
@@ -58,7 +58,7 @@ Maintainer longjin's Email：longjin@DragonOS.org
 
 ## Reward
 
-&emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit **[Sponsor - DragonOS](https://dragonos.org/?page_id=37)** , so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
+&emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit ** [Sponsor - DragonOS](https://dragonos.org/?page_id=37) ** , so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
 
 ### Where will the sponsorship funds be used?
 

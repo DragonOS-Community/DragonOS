@@ -625,7 +625,7 @@ pub fn clocksource_resume() {
         match ele.resume() {
             Ok(_) => continue,
             Err(_) => {
-                kdebug!("clocksource {:?} resume failed", data.name);
+                kdebug!("clocksource {:?} resume failed", data.name)
             }
         }
     }
@@ -641,7 +641,7 @@ pub fn clocksource_suspend() {
         match ele.suspend() {
             Ok(_) => continue,
             Err(_) => {
-                kdebug!("clocksource {:?} suspend failed", data.name);
+                kdebug!("clocksource {:?} suspend failed", data.name)
             }
         }
     }

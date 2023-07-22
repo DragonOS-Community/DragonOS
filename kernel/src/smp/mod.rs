@@ -1,11 +1,9 @@
 use crate::{
-    arch::{asm::current::current_pcb, interrupt::ipi::send_ipi},
+    arch::interrupt::ipi::send_ipi,
     exception::ipi::{IpiKind, IpiTarget},
-    mm::INITIAL_PROCESS_ADDRESS_SPACE,
     syscall::SystemError,
 };
 
-pub mod c_adapter;
 pub mod core;
 
 pub fn kick_cpu(cpu_id: usize) -> Result<(), SystemError> {
@@ -15,7 +13,9 @@ pub fn kick_cpu(cpu_id: usize) -> Result<(), SystemError> {
     return Ok(());
 }
 
-/// 初始化AP核的idle进程
-pub unsafe fn init_smp_idle_process() {
-    current_pcb().set_address_space(INITIAL_PROCESS_ADDRESS_SPACE());
+#[no_mangle]
+pub extern "C" fn rs_kick_cpu(cpu_id: usize) -> usize {
+    return kick_cpu(cpu_id)
+        .map(|_| 0usize)
+        .unwrap_or_else(|e| e.to_posix_errno() as usize);
 }

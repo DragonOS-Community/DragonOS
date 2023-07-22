@@ -1,5 +1,3 @@
-use alloc::{collections::BTreeMap, string::String, sync::Arc};
-
 use crate::{
     filesystem::{
         sysfs::{
@@ -11,6 +9,7 @@ use crate::{
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
+use alloc::{collections::BTreeMap, string::String, sync::Arc};
 use core::{any::Any, fmt::Debug};
 
 pub mod bus;

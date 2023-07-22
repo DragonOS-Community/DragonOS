@@ -46,7 +46,6 @@ pub fn softirq_init() -> Result<(), SystemError> {
             cpu_pending[i as usize] = VecStatus::default();
         }
     }
-    kinfo!("Softirq initialized.");
     return Ok(());
 }
 

@@ -1,6 +1,9 @@
 use crate::{
-    arch::{asm::current::current_pcb, context::switch_process, CurrentIrqArch},
-    exception::InterruptArch,
+    arch::{
+        asm::current::current_pcb,
+        context::switch_process,
+        interrupt::{cli, sti},
+    },
     syscall::{Syscall, SystemError},
 };
 
@@ -11,8 +14,7 @@ impl Syscall {
     /// 请注意，该系统调用不能由ring3的程序发起
     #[inline(always)]
     pub fn sched(from_user: bool) -> Result<usize, SystemError> {
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
+        cli();
         // 进行权限校验，拒绝用户态发起调度
         if from_user {
             return Err(SystemError::EPERM);
@@ -23,7 +25,7 @@ impl Syscall {
         if pcb.is_some() {
             switch_process(current_pcb(), pcb.unwrap());
         }
-        drop(irq_guard);
+        sti();
         return Ok(0);
     }
 }

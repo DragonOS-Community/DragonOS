@@ -1,5 +1,9 @@
 use super::{LockedSysFSInode, SYS_BUS_INODE};
-use crate::{filesystem::vfs::IndexNode, kdebug, syscall::SystemError};
+use crate::{
+    filesystem::vfs::IndexNode,
+    kdebug,
+    syscall::SystemError,
+};
 use alloc::sync::Arc;
 
 /// @brief: 注册bus，在sys/bus下生成文件夹
@@ -54,15 +58,20 @@ pub fn sys_bus_init(
 /// @parameter bus_name: 总线名
 ///            name: 设备名
 /// @return: 操作成功，返回device inode，操作失败，返回错误码
-pub fn bus_driver_register(bus_name: &str, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+pub fn bus_driver_register(
+    bus_name: &str,
+    name: &str,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
     match SYS_BUS_INODE().find(bus_name) {
         Ok(platform) => match platform.find("drivers") {
-            Ok(device) => device
-                .as_any_ref()
-                .downcast_ref::<LockedSysFSInode>()
-                .ok_or(SystemError::E2BIG)
-                .unwrap()
-                .add_dir(name),
+            Ok(device) => {
+                device
+                    .as_any_ref()
+                    .downcast_ref::<LockedSysFSInode>()
+                    .ok_or(SystemError::E2BIG)
+                    .unwrap()
+                    .add_dir(name)
+            }
             Err(_) => return Err(SystemError::EXDEV),
         },
         Err(_) => return Err(SystemError::EXDEV),
@@ -73,15 +82,20 @@ pub fn bus_driver_register(bus_name: &str, name: &str) -> Result<Arc<dyn IndexNo
 /// @parameter bus_name: 总线名
 ///            name: 驱动名
 /// @return: 操作成功，返回drivers inode，操作失败，返回错误码
-pub fn bus_device_register(bus_name: &str, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+pub fn bus_device_register(
+    bus_name: &str,
+    name: &str,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
     match SYS_BUS_INODE().find(bus_name) {
         Ok(platform) => match platform.find("devices") {
-            Ok(device) => device
-                .as_any_ref()
-                .downcast_ref::<LockedSysFSInode>()
-                .ok_or(SystemError::E2BIG)
-                .unwrap()
-                .add_dir(name),
+            Ok(device) => {
+                device
+                    .as_any_ref()
+                    .downcast_ref::<LockedSysFSInode>()
+                    .ok_or(SystemError::E2BIG)
+                    .unwrap()
+                    .add_dir(name)
+            }
             Err(_) => return Err(SystemError::EXDEV),
         },
         Err(_) => return Err(SystemError::EXDEV),

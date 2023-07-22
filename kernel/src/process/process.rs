@@ -1,13 +1,12 @@
 use core::{
     ffi::c_void,
-    mem::ManuallyDrop,
     ptr::{null_mut, read_volatile, write_volatile},
 };
 
 use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
-    arch::asm::current::current_pcb,
+    arch::{asm::current::current_pcb, fpu::FpState},
     filesystem::vfs::{
         file::{File, FileDescriptorVec, FileMode},
         FileType, ROOT_INODE,
@@ -17,7 +16,6 @@ use crate::{
         PROC_UNINTERRUPTIBLE,
     },
     libs::casting::DowncastArc,
-    mm::ucontext::AddressSpace,
     net::socket::SocketInode,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
@@ -313,41 +311,94 @@ impl process_control_block {
             .expect("Not a socket inode");
         return Some(socket);
     }
+}
 
-    /// 释放pcb中存储的地址空间的指针
-    pub unsafe fn drop_address_space(&mut self) {
-        let p = self.address_space as *const AddressSpace;
-        if p.is_null() {
-            return;
-        }
-        let p: Arc<AddressSpace> = Arc::from_raw(p);
-        drop(p);
-        self.address_space = null_mut();
-    }
+// =========== 导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们  BEGIN ============
 
-    /// 设置pcb中存储的地址空间的指针
-    ///
-    /// ## panic
-    /// 如果当前pcb已经有地址空间，那么panic
-    pub unsafe fn set_address_space(&mut self, address_space: Arc<AddressSpace>) {
-        assert!(self.address_space.is_null(), "Address space already set");
-        self.address_space = Arc::into_raw(address_space) as *mut c_void;
-    }
-
-    /// 获取当前进程的地址空间的指针
-    pub fn address_space(&self) -> Option<Arc<AddressSpace>> {
-        let ptr = self.address_space as *const AddressSpace;
-        if ptr.is_null() {
-            return None;
-        }
-        // 为了防止pcb中的指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
-        let arc_wrapper = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
-
-        let result = Arc::clone(&arc_wrapper);
-        return Some(result);
+/// @brief 初始化当前进程的文件描述符数组
+/// 请注意，如果当前进程已经有文件描述符数组，那么本操作将被禁止
+#[no_mangle]
+pub extern "C" fn process_init_files() -> i32 {
+    let r = current_pcb().init_files();
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
     }
 }
 
+/// @brief 拷贝当前进程的文件描述符信息
+///
+/// @param clone_flags 克隆标志位
+/// @param pcb 新的进程的pcb
+#[no_mangle]
+pub extern "C" fn process_copy_files(
+    clone_flags: u64,
+    from: &'static process_control_block,
+) -> i32 {
+    let r = current_pcb().copy_files(clone_flags, from);
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
+    }
+}
+
+/// @brief 回收进程的文件描述符数组
+///
+/// @param pcb 要被回收的进程的pcb
+///
+/// @return i32
+#[no_mangle]
+pub extern "C" fn process_exit_files(pcb: &'static mut process_control_block) -> i32 {
+    let r: Result<(), SystemError> = pcb.exit_files();
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
+    }
+}
+
+/// @brief 复制当前进程的浮点状态
+#[allow(dead_code)]
+#[no_mangle]
+pub extern "C" fn rs_dup_fpstate() -> *mut c_void {
+    // 如果当前进程没有浮点状态，那么就返回一个默认的浮点状态
+    if current_pcb().fp_state == null_mut() {
+        return Box::leak(Box::new(FpState::default())) as *mut FpState as usize as *mut c_void;
+    } else {
+        // 如果当前进程有浮点状态，那么就复制一个新的浮点状态
+        let state = current_pcb().fp_state as usize as *mut FpState;
+        unsafe {
+            let s = state.as_ref().unwrap();
+            let state: &mut FpState = Box::leak(Box::new(s.clone()));
+
+            return state as *mut FpState as usize as *mut c_void;
+        }
+    }
+}
+
+/// @brief 释放进程的浮点状态所占用的内存
+#[no_mangle]
+pub extern "C" fn rs_process_exit_fpstate(pcb: &'static mut process_control_block) {
+    if pcb.fp_state != null_mut() {
+        let state = pcb.fp_state as usize as *mut FpState;
+        unsafe {
+            drop(Box::from_raw(state));
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rs_init_stdio() -> i32 {
+    let r = init_stdio();
+    if r.is_ok() {
+        return 0;
+    } else {
+        return r.unwrap_err().to_posix_errno();
+    }
+}
+// =========== 以上为导出到C的函数，在将来，进程管理模块被完全重构之后，需要删掉他们 END ============
 
 /// @brief 初始化pid=1的进程的stdio
 pub fn init_stdio() -> Result<(), SystemError> {

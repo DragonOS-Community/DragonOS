@@ -21,9 +21,6 @@ static struct textui_private_info_t __private_info = {0};
 static struct List __windows_list;
 static spinlock_t change_lock;
 
-// 用于标记是否允许输出到屏幕
-static atomic_t __put_window_enable_flag = {1};
-
 /**
  * @brief 初始化window对象
  *
@@ -72,7 +69,7 @@ static int __textui_init_window(struct textui_window_t *window, uint8_t flags, u
 int textui_install_handler(struct scm_buffer_info_t *buf)
 {
     // return printk_init(buf);
-    c_uart_send_str(COM1, "textui_install_handler\n");
+    c_uart_send_str(COM1, "textui_install_handler");
     return 0;
 }
 
@@ -84,14 +81,11 @@ int textui_uninstall_handler(void *args)
 int textui_enable_handler(void *args)
 {
     c_uart_send_str(COM1, "textui_enable_handler\n");
-    atomic_cmpxchg(&__put_window_enable_flag, 0, 1);
     return 0;
 }
 
 int textui_disable_handler(void *args)
 {
-    c_uart_send_str(COM1, "textui_disable_handler\n");
-    atomic_set(&__put_window_enable_flag, 0);
     return 0;
 }
 
@@ -221,13 +215,6 @@ int textui_putchar_window(struct textui_window_t *window, uint16_t character, ui
     // uint64_t rflags = 0; // 加锁后rflags存储到这里
     spin_lock_no_preempt(&window->lock);
     c_uart_send(COM1, character);
-    // 如果禁止输出，直接返回
-    if(atomic_read(&__put_window_enable_flag) == 0)
-    {
-        spin_unlock_no_preempt(&window->lock);
-        return 0;
-    }
-
     if (unlikely(character == '\n'))
     {
         // 换行时还需要输出\r
@@ -358,15 +345,4 @@ int textui_init()
 
     c_uart_send_str(COM1, "text ui initialized\n");
     return 0;
-}
-
-
-void enable_textui()
-{
-    scm_framework_enable(&textui_framework);
-}
-
-void disable_textui()
-{
-    scm_framework_disable(&textui_framework);
 }

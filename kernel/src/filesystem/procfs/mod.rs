@@ -10,7 +10,6 @@ use alloc::{
 };
 
 use crate::{
-    arch::asm::current::current_pcb,
     filesystem::vfs::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
@@ -169,15 +168,13 @@ impl ProcFSInode {
                 .to_owned(),
         );
 
-        let binding = current_pcb().address_space().unwrap();
-        let address_space_guard = binding.read();
-        // todo: 当前进程运行过程中占用内存的峰值
-        let hiwater_vm: u64 = 0;
-        // 进程代码段的大小
-        let text = (address_space_guard.end_code - address_space_guard.start_code) / 1024;
+        // 当前进程运行过程中占用内存的峰值
+        let hiwater_vm: u64 =
+            unsafe { *(*pcb.mm).vmas }.vm_end - unsafe { *(*pcb.mm).vmas }.vm_start;
         // 进程数据段的大小
-        let data = (address_space_guard.end_data - address_space_guard.start_data) / 1024;
-        drop(address_space_guard);
+        let text: u64 = unsafe { *pcb.mm }.code_addr_end - unsafe { *pcb.mm }.code_addr_start;
+        // 进程代码的大小
+        let data: u64 = unsafe { *pcb.mm }.data_addr_end - unsafe { *pcb.mm }.data_addr_start;
 
         pdata.append(
             &mut format!("\nVmPeak:\t{} kB", hiwater_vm)

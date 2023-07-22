@@ -2,7 +2,7 @@ use super::super::base::device::Device;
 use crate::{
     driver::base::{
         char::CharDevice,
-        device::{driver::Driver, DeviceState, DeviceType, IdTable, KObject},
+    device::{driver::Driver, DeviceState, DeviceType, IdTable, KObject},
         platform::{
             self, platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
         },

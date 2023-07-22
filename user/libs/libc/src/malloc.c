@@ -156,7 +156,6 @@ static int malloc_enlarge(int64_t size)
     // 在新分配的内存的底部放置header
     // printf("managed addr = %#018lx\n", brk_managed_addr);
     malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)brk_managed_addr;
-    memset(new_ck, 0, sizeof(malloc_mem_chunk_t));
     new_ck->length = brk_max_addr - brk_managed_addr;
     // printf("new_ck->start_addr=%#018lx\tbrk_max_addr=%#018lx\tbrk_managed_addr=%#018lx\n", (uint64_t)new_ck, brk_max_addr, brk_managed_addr);
     new_ck->prev = NULL;

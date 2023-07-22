@@ -22,9 +22,6 @@ smoltcp = { git = "https://github.com/DragonOS-Community/smoltcp.git", rev = "90
 num-traits = { git = "https://github.com/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
 num = { version = "0.4.0", default-features = false }
 num-derive = "0.3"
-# 一个no_std的hashmap、hashset
-hashbrown = "0.13.2"
-elf = { version = "0.7.2", default-features = false }
 
 # 构建时依赖项
 [build-dependencies]
@@ -36,9 +33,5 @@ version = "1.4.0"
 # 由于在no_std环境，而lazy_static依赖了spin库，因此需要指定其使用no_std
 features = ["spin_no_std"]
 
-
-# The release profile, used for `cargo build --release`
-[profile.release]
-debug = false
 
 

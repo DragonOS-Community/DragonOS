@@ -5,7 +5,7 @@ use x86_64::align_up;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kdebug, kinfo,
+    kdebug,
     libs::rwlock::RwLock,
     time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
 };
@@ -118,7 +118,6 @@ impl Timekeeper {
 
         timekeeper.cycle_interval = CycleNum(temp);
         timekeeper.xtime_interval = temp * clock_data.mult as u64;
-        // 这里可能存在下界溢出问题，debug模式下会报错panic
         timekeeper.xtime_remainder = (ntpinterval - timekeeper.xtime_interval) as i64;
         timekeeper.raw_interval = (timekeeper.xtime_interval >> clock_data.shift) as i64;
         timekeeper.xtime_nsec = 0;
@@ -155,7 +154,7 @@ pub fn timekeeper_init() {
 ///
 /// * 'TimeSpec' - 时间戳
 pub fn getnstimeofday() -> TimeSpec {
-    // kdebug!("enter getnstimeofday");
+    kdebug!("enter getnstimeofday");
 
     // let mut nsecs: u64 = 0;0
     let mut _xtime = TimeSpec {
@@ -202,7 +201,6 @@ pub fn do_gettimeofday() -> PosixTimeval {
 
 /// # 初始化timekeeping模块
 pub fn timekeeping_init() {
-    kinfo!("Initializing timekeeping module...");
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     timekeeper_init();
 
@@ -231,7 +229,7 @@ pub fn timekeeping_init() {
     __ADDED_SEC.store(0, Ordering::SeqCst);
 
     drop(irq_guard);
-    kinfo!("timekeeping_init successfully");
+    kdebug!("timekeeping_init successfully");
 }
 
 /// # 使用当前时钟源增加wall time

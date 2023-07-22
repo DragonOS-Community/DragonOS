@@ -116,5 +116,3 @@ int scm_enable_double_buffer();
  * @return int 返回码
  */
 int scm_framework_enable(struct scm_ui_framework_t *ui);
-
-int scm_framework_disable(struct scm_ui_framework_t *ui);

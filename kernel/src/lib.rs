@@ -1,18 +1,13 @@
 #![no_std] // <1>
 #![no_main] // <1>
 #![feature(alloc_error_handler)]
-#![feature(allocator_api)]
-#![feature(arbitrary_self_types)]
 #![feature(const_mut_refs)]
-#![feature(core_intrinsics)]
+#![feature(core_intrinsics)] // <2>
 #![feature(c_void_variant)]
-#![feature(drain_filter)]
+#![feature(drain_filter)] // 允许Vec的drain_filter特性
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]
-#![feature(slice_ptr_get)]
-#![feature(vec_into_raw_parts)]
-
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -42,7 +37,6 @@ mod time;
 extern crate alloc;
 #[macro_use]
 extern crate bitflags;
-extern crate elf;
 #[macro_use]
 extern crate lazy_static;
 extern crate num;
@@ -50,10 +44,11 @@ extern crate num;
 extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
+
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
-use crate::mm::allocator::kernel_allocator::KernelAllocator;
+use mm::allocator::KernelAllocator;
 
 // <3>
 use crate::{
@@ -64,7 +59,7 @@ use crate::{
 
 // 声明全局的slab分配器
 #[cfg_attr(not(test), global_allocator)]
-pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
+pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator {};
 
 /// 全局的panic处理函数
 #[panic_handler]

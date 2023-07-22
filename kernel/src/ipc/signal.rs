@@ -133,7 +133,7 @@ fn signal_send_sig_info(
     // 信号符合要求，可以发送
 
     let mut retval = Err(SystemError::ESRCH);
-    let mut flags: usize = 0;
+    let mut flags: u64 = 0;
     // 如果上锁成功，则发送信号
     if !lock_process_sighand(target_pcb, &mut flags).is_none() {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -153,7 +153,7 @@ fn signal_send_sig_info(
 /// @return 指向sighand_struct的可变引用
 fn lock_process_sighand<'a>(
     pcb: &'a mut process_control_block,
-    flags: &mut usize,
+    flags: &mut u64,
 ) -> Option<&'a mut sighand_struct> {
     // kdebug!("lock_process_sighand");
 
@@ -175,10 +175,10 @@ fn lock_process_sighand<'a>(
 /// @brief 对pcb的sighand结构体中的siglock进行放锁，并恢复之前存储的rflags
 /// @param pcb 目标pcb
 /// @param flags 用来保存rflags的变量，将这个值恢复到rflags寄存器中
-fn unlock_process_sighand(pcb: &mut process_control_block, flags: usize) {
+fn unlock_process_sighand(pcb: &mut process_control_block, flags: u64) {
     let lock = unsafe { &mut (*pcb.sighand).siglock };
 
-    spin_unlock_irqrestore(lock, flags);
+    spin_unlock_irqrestore(lock, &flags);
 }
 
 /// @brief 判断是否需要强制发送信号，然后发送信号

@@ -19,15 +19,15 @@ pub trait InterruptArch: Send + Sync {
 
 #[derive(Debug, Clone, Copy)]
 pub struct IrqFlags {
-    flags: usize,
+    flags: u64,
 }
 
 impl IrqFlags {
-    pub fn new(flags: usize) -> Self {
+    pub fn new(flags: u64) -> Self {
         IrqFlags { flags }
     }
 
-    pub fn flags(&self) -> usize {
+    pub fn flags(&self) -> u64 {
         self.flags
     }
 }

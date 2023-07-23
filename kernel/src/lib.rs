@@ -12,6 +12,7 @@
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
+#![feature(new_uninit)]
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]

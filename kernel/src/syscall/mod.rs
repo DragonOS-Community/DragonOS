@@ -295,6 +295,8 @@ pub enum SystemError {
     EOWNERDEAD = 129,
     /// 状态不可恢复 State not recoverable.
     ENOTRECOVERABLE = 130,
+    // VMX on 虚拟化开启指令出错
+    EVMXONFailed = 131,
 }
 
 impl SystemError {
@@ -365,6 +367,7 @@ pub const SYS_GETTIMEOFDAY: usize = 43;
 pub const SYS_MMAP: usize = 44;
 pub const SYS_MUNMAP: usize = 45;
 pub const SYS_MPROTECT: usize = 46;
+pub const SYS_IOCTL: usize = 47;
 
 #[derive(Debug)]
 pub struct Syscall;

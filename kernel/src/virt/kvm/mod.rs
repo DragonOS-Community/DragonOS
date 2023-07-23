@@ -5,8 +5,10 @@ use crate::kdebug;
 use crate::filesystem::devfs::{DevFS, DeviceINode, devfs_register};
 pub use self::kvm_dev::LockedKvmInode;
 use crate::syscall::SystemError;
+use vcpu::VcpuData;
 
 mod kvm_dev;
+mod vcpu;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
 
@@ -148,8 +150,10 @@ pub extern "C" fn kvm_init() {
     // if r.is_err() {
     //     panic!("Failed to register /dev/kvm");
     // }
+    let vcpu = VcpuData::new().expect("Cannot create VcpuData");
     has_intel_vmx_support().expect("No Intel VMX support");
     enable_vmx_operation().expect("Cannot enable vmx operation");
+    
     devfs_register("kvm", LockedKvmInode::new())
         .expect("Failed to register /dev/kvm");
 }

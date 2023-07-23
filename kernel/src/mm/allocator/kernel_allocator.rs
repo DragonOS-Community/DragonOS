@@ -5,7 +5,7 @@ use crate::{
 };
 
 use core::{
-    alloc::{AllocError, GlobalAlloc, Layout},
+    alloc::{AllocError, GlobalAlloc, Allocator, Layout},
     intrinsics::unlikely,
     ptr::NonNull,
 };
@@ -91,6 +91,33 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         self.local_dealloc(ptr, layout);
+    }
+}
+
+/// 为内核slab分配器实现Allocator特性
+unsafe impl Allocator for KernelAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let memory = unsafe {self.local_alloc(layout)};
+        if memory.is_null() {
+            Err(AllocError)
+        } else {
+            let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
+            Ok(unsafe { NonNull::new_unchecked(slice) })
+        }
+    }
+
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let memory = unsafe {self.local_alloc_zeroed(layout)};
+        if memory.is_null() {
+            Err(AllocError)
+        } else {
+            let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
+            Ok(unsafe { NonNull::new_unchecked(slice) })
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.local_dealloc(ptr.cast().as_ptr(), layout);
     }
 }
 

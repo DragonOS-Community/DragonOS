@@ -1,7 +1,7 @@
 use super::device::{
     bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
     driver::Driver,
-    Device, DeviceError, DeviceState, DeviceType, IdTable,
+    Device, DeviceError, DeviceState, DeviceType, IdTable, KObject,
 };
 use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{
@@ -94,7 +94,7 @@ impl LockedPlatformBusDriver {
     /// @return: 注册成功，返回Ok(()),，注册失败，返回BusError类型
     #[allow(dead_code)]
     fn register_platform_driver(&self, driver: Arc<dyn PlatformDriver>) -> Result<(), DeviceError> {
-        let id_table = driver.get_id_table();
+        let id_table = driver.id_table();
 
         let drivers = &mut self.0.lock().drivers;
         // 如果存在同类型的驱动，返回错误
@@ -112,7 +112,7 @@ impl LockedPlatformBusDriver {
     #[allow(dead_code)]
     #[inline]
     fn unregister_platform_driver(&mut self, driver: Arc<dyn PlatformDriver>) {
-        let id_table = driver.get_id_table();
+        let id_table = driver.id_table();
         self.0.lock().drivers.remove(&id_table);
     }
 
@@ -124,7 +124,7 @@ impl LockedPlatformBusDriver {
         &mut self,
         device: Arc<dyn PlatformDevice>,
     ) -> Result<(), DeviceError> {
-        let id_table = device.get_id_table();
+        let id_table = device.id_table();
 
         let devices = &mut self.0.lock().devices;
         if devices.contains_key(&id_table) {
@@ -141,7 +141,7 @@ impl LockedPlatformBusDriver {
     #[inline]
     #[allow(dead_code)]
     fn unregister_platform_device(&mut self, device: Arc<dyn PlatformDevice>) {
-        let id_table = device.get_id_table();
+        let id_table = device.id_table();
         self.0.lock().devices.remove(&id_table);
     }
 
@@ -155,8 +155,8 @@ impl LockedPlatformBusDriver {
 
         for (_dev_id_table, device) in devices.iter() {
             if device
-                .get_compatible_table()
-                .matches(&driver.get_compatible_table())
+                .compatible_table()
+                .matches(&driver.compatible_table())
             {
                 if !device.is_initialized() {
                     // 设备未初始化，调用驱动probe函数
@@ -186,8 +186,8 @@ impl LockedPlatformBusDriver {
         let drivers = &mut self.0.lock().drivers;
         for (_drv_id_table, driver) in drivers.into_iter() {
             if driver
-                .get_compatible_table()
-                .matches(&device.get_compatible_table())
+                .compatible_table()
+                .matches(&device.compatible_table())
             {
                 match driver.probe(device.clone()) {
                     Ok(_driver) => {
@@ -234,7 +234,7 @@ impl Driver for LockedPlatformBusDriver {
     }
 
     #[inline]
-    fn get_id_table(&self) -> IdTable {
+    fn id_table(&self) -> IdTable {
         IdTable::new("PlatformBusDriver", 0)
     }
 
@@ -262,6 +262,8 @@ impl BusDriver for LockedPlatformBusDriver {
     }
 }
 
+impl KObject for LockedPlatformBusDriver {}
+
 #[derive(Debug)]
 pub struct LockedPlatform(SpinLock<Platform>);
 
@@ -278,7 +280,7 @@ impl LockedPlatform {
     /// @return: platform总线匹配表
     #[inline]
     #[allow(dead_code)]
-    fn get_compatible_table(&self) -> CompatibleTable {
+    fn compatible_table(&self) -> CompatibleTable {
         CompatibleTable::new(vec!["platform"])
     }
 
@@ -350,13 +352,13 @@ impl Platform {
 impl Device for LockedPlatform {
     #[inline]
     #[allow(dead_code)]
-    fn get_type(&self) -> DeviceType {
+    fn dev_type(&self) -> DeviceType {
         return DeviceType::Bus;
     }
 
     #[inline]
     #[allow(dead_code)]
-    fn get_id_table(&self) -> IdTable {
+    fn id_table(&self) -> IdTable {
         IdTable::new("platform", 0)
     }
 
@@ -370,10 +372,16 @@ impl Device for LockedPlatform {
     fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         return self.0.lock().sys_info.clone();
     }
+
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+        self
+    }
 }
 
 /// @brief: 为Platform实现Bus trait，platform总线是一种总线设备
 impl Bus for LockedPlatform {}
+
+impl KObject for LockedPlatform {}
 
 /// @brief: 初始化platform总线
 /// @parameter: None

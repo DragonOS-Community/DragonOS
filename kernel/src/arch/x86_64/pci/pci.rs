@@ -50,6 +50,10 @@ impl TraitPciArch for X86_64PciArch {
         unsafe {
             acpi_iter_SDT(Some(acpi_get_MCFG), data_point as *mut usize as *mut c_void);
         };
+        // 防止无PCIE的机器找不到MCFG Table导致的错误
+        if data == 0 {
+            return Err(PciError::McfgTableNotFound);
+        }
         //kdebug!("{}",data);
         //loop{}
         let head = NonNull::new(data as *mut acpi_system_description_table_header_t).unwrap();

@@ -138,6 +138,8 @@ impl SysFS {
         }
         // 初始化platform总线
         crate::driver::base::platform::platform_bus_init().expect("platform bus init failed");
+        // 初始化串口
+        crate::driver::uart::uart::uart_init().expect("initilize uart error");
         return sysfs;
     }
 }

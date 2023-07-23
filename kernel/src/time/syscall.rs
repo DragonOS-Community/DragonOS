@@ -4,7 +4,6 @@ use core::{
 };
 
 use crate::{
-    kdebug,
     syscall::{Syscall, SystemError},
     time::{sleep::nanosleep, TimeSpec},
 };
@@ -79,10 +78,10 @@ impl Syscall {
 
     pub fn gettimeofday(
         tv: *mut PosixTimeval,
-        _timezone: &PosixTimeZone,
+        timezone: *mut PosixTimeZone,
     ) -> Result<usize, SystemError> {
         // TODO; 处理时区信息
-        kdebug!("enter sys_do_gettimeofday");
+        // kdebug!("enter sys_do_gettimeofday");
         if tv == null_mut() {
             return Err(SystemError::EFAULT);
         }
@@ -91,7 +90,13 @@ impl Syscall {
             (*tv).tv_sec = posix_time.tv_sec;
             (*tv).tv_usec = posix_time.tv_usec;
         }
-        kdebug!("exit sys_do_gettimeofday");
+
+        if !timezone.is_null() {
+            unsafe {
+                *timezone = SYS_TIMEZONE;
+            }
+        }
+        // kdebug!("exit sys_do_gettimeofday");
         return Ok(0);
     }
 }

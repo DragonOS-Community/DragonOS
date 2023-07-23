@@ -22,7 +22,6 @@ smoltcp = { git = "https://github.com/DragonOS-Community/smoltcp.git", rev = "90
 num-traits = { git = "https://github.com/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
 num = { version = "0.4.0", default-features = false }
 num-derive = "0.3"
-raw-cpuid = "11.0.1"
 
 # 构建时依赖项
 [build-dependencies]

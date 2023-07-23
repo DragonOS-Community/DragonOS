@@ -6,8 +6,6 @@ use alloc::boxed::Box;
 use alloc::alloc::Global;
 use crate::mm::virt_2_phys;
 use crate::syscall::SystemError;
-use core::ptr;
-
 
 // KERNEL_ALLOCATOR
 pub const PAGE_SIZE: usize = 0x1000;
@@ -20,29 +18,26 @@ pub struct VmxonRegion {
 
 pub struct VcpuData {
     /// The virtual and physical address of the Vmxon naturally aligned 4-KByte region of memory
-    pub vmxon_region: Box<VmxonRegion>,
+    pub vmxon_region: Box<VmxonRegion,KernelAllocator>,
     pub vmxon_region_physical_address: u64,
 }
 
 impl VcpuData {
     pub fn new() -> Result<Box<Self>, SystemError> {
-        kdebug!("[+] VcpuData::new\n");
         let instance = Self {
             // try_new_zeroed_in 创建一个具有未初始化内容的新 Box，使用提供的分配器中的 0 字节填充内存，如果分配失败，则返回错误
             // assume_init 由调用者负责确保值确实处于初始化状态
-            vmxon_region: unsafe {
-                let mut b = Box::new_uninit();
-                unsafe { ptr::write_bytes(b.as_mut_ptr(), 0, 0x1000) };
-                let boxed_array: Box<VmxonRegion> = unsafe { b.assume_init() };
-                boxed_array
+            vmxon_region: unsafe { 
+                match Box::try_new_zeroed_in(KernelAllocator) {
+                    Ok(zero) => zero.assume_init(),
+                    Err(_) => panic!("Try new zeroed fail!"),
+                }
             },
             vmxon_region_physical_address: 0,
         };
 
-        printk_color!(GREEN, BLACK, "[+] instance!\n");
         let mut instance = Box::new(instance);
-                
-        kdebug!("[+] init_vmxon_region");
+        printk_color!(GREEN, BLACK, "[+] init_vmxon_region\n");
         instance.init_vmxon_region()?;
         Ok(instance)
     }

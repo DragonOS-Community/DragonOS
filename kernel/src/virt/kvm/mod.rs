@@ -150,9 +150,9 @@ pub extern "C" fn kvm_init() {
     // if r.is_err() {
     //     panic!("Failed to register /dev/kvm");
     // }
-    let vcpu = VcpuData::new().expect("Cannot create VcpuData");
     has_intel_vmx_support().expect("No Intel VMX support");
     enable_vmx_operation().expect("Cannot enable vmx operation");
+    let vcpu = VcpuData::new().expect("Cannot create VcpuData");
     
     devfs_register("kvm", LockedKvmInode::new())
         .expect("Failed to register /dev/kvm");

@@ -187,14 +187,16 @@ void system_initialize()
     HPET_enable();
 
     io_mfence();
+    
+    kvm_init();
+
+    io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 
     apic_timer_init();
     io_mfence();
 
-    io_mfence();
-    kvm_init();
-    io_mfence();
+    
 
     // 这里不能删除，否则在O1会报错
     // while (1)

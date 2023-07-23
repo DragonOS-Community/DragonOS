@@ -95,6 +95,7 @@ fn set_cr4_bits() {
     unsafe { controlregs::cr4_write(cr4) };
 }
 
+
 // struct Kvm {
 //     sys_fd: u32,	/* For system ioctls(), i.e. /dev/kvm */
 // 	vm_fd: u32,  	/* For VM ioctls() */

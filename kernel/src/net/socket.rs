@@ -92,7 +92,7 @@ impl PortManager {
             let mut listen_table_guard = match socket_type {
                 SocketType::UdpSocket => self.udp_port_table.lock(),
                 SocketType::TcpSocket => self.tcp_port_table.lock(),
-                SocketType::RawSocket => todo!(),
+                SocketType::RawSocket => panic!("RawSocket cann't bind a port"),
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
@@ -108,7 +108,7 @@ impl PortManager {
         let mut listen_table_guard = match socket_type {
             SocketType::UdpSocket => self.udp_port_table.lock(),
             SocketType::TcpSocket => self.tcp_port_table.lock(),
-            SocketType::RawSocket => todo!(),
+            SocketType::RawSocket => panic!("RawSocket cann't bind a port"),
         };
         listen_table_guard.remove(&port);
         drop(listen_table_guard);

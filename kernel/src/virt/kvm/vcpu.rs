@@ -13,6 +13,7 @@ use crate::mm::MemoryManagementArch;
 use crate::mm::{VirtAddr};
 use crate::syscall::SystemError;
 use crate::virt::kvm::hypervisor::Hypervisor;
+use crate::virt::kvm::vmcs::VMCSRegion;
 
 // KERNEL_ALLOCATOR
 pub const PAGE_SIZE: usize = 0x1000;
@@ -23,18 +24,15 @@ pub struct VmxonRegion {
     pub data: [u8; PAGE_SIZE - 4],
 }
 
-#[repr(C, align(4096))]
-pub struct VMCSRegion {
-    pub revision_id: u32,
-    pub abort_indicator: u32, 
-    pub data: [u8; PAGE_SIZE - 8],
-}
 
 pub struct VcpuData {
     /// The virtual and physical address of the Vmxon naturally aligned 4-KByte region of memory
     pub vmxon_region: Box<VmxonRegion>,
     pub vmxon_region_physical_address: u64,  // vmxon需要该地址
     /// The virtual and physical address of the Vmcs naturally aligned 4-KByte region of memory
+    /// holds the complete CPU state of both the host and the guest.
+    /// includes the segment registers, GDT, IDT, TR, various MSR’s
+    /// and control field structures for handling exit and entry operations
     pub vmcs_region: Box<VMCSRegion>,
     pub vmcs_region_physical_address: u64,  // vmptrld, vmclear需要该地址
 }

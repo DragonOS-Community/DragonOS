@@ -14,6 +14,7 @@ use hypervisor::Hypervisor;
 mod kvm_dev;
 mod vcpu;
 mod hypervisor;
+mod vmcs;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
 

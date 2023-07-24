@@ -5,7 +5,8 @@ use crate::kdebug;
 use crate::filesystem::devfs::{DevFS, DeviceINode, devfs_register};
 pub use self::kvm_dev::LockedKvmInode;
 use crate::syscall::SystemError;
-use vcpu::VcpuData;
+use vcpu::{VcpuData, Vcpu};
+use alloc::vec::Vec;
 
 mod kvm_dev;
 mod vcpu;
@@ -98,13 +99,13 @@ fn set_cr4_bits() {
 }
 
 
-// struct Kvm {
-//     sys_fd: u32,	/* For system ioctls(), i.e. /dev/kvm */
+struct Hypervisor {
+    sys_fd: u32,	/* For system ioctls(), i.e. /dev/kvm */
 // 	vm_fd: u32,  	/* For VM ioctls() */
 //     timerid: u32,   /* Posix timer for interrupts */
 
-//     nr_vcpus: u32,  /* Number of cpus to run */
-//     vcpu: Box<[kvm_vcpu]>,
+    nr_vcpus: u32,  /* Number of cpus to run */
+    vcpu: Vec<Vcpu>,
 
 //     mem_slots: u32, /* for KVM_SET_USER_MEMORY_REGION */
 //     ram_size: u64,  /* Guest memory size, in bytes */
@@ -114,7 +115,7 @@ fn set_cr4_bits() {
 //     // mem_banks: Box<[kvm_mem_bank]>,
 
 //     vm_state: u32,
-// }
+}
 
 // struct Kvm_vcpu {
 //     kvm: Arc<Kvm>,		/* parent KVM */

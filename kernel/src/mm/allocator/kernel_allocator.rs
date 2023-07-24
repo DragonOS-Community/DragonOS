@@ -95,31 +95,31 @@ unsafe impl GlobalAlloc for KernelAllocator {
 }
 
 /// 为内核slab分配器实现Allocator特性
-unsafe impl Allocator for KernelAllocator {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let memory = unsafe {self.local_alloc(layout)};
-        if memory.is_null() {
-            Err(AllocError)
-        } else {
-            let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
-            Ok(unsafe { NonNull::new_unchecked(slice) })
-        }
-    }
+// unsafe impl Allocator for KernelAllocator {
+//     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+//         let memory = unsafe {self.local_alloc(layout)};
+//         if memory.is_null() {
+//             Err(AllocError)
+//         } else {
+//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
+//             Ok(unsafe { NonNull::new_unchecked(slice) })
+//         }
+//     }
 
-    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let memory = unsafe {self.local_alloc_zeroed(layout)};
-        if memory.is_null() {
-            Err(AllocError)
-        } else {
-            let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
-            Ok(unsafe { NonNull::new_unchecked(slice) })
-        }
-    }
+//     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+//         let memory = unsafe {self.local_alloc_zeroed(layout)};
+//         if memory.is_null() {
+//             Err(AllocError)
+//         } else {
+//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
+//             Ok(unsafe { NonNull::new_unchecked(slice) })
+//         }
+//     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        self.local_dealloc(ptr.cast().as_ptr(), layout);
-    }
-}
+//     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+//         self.local_dealloc(ptr.cast().as_ptr(), layout);
+//     }
+// }
 
 /// 内存分配错误处理函数
 #[alloc_error_handler]

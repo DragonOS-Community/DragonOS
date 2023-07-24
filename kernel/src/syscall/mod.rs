@@ -297,6 +297,8 @@ pub enum SystemError {
     ENOTRECOVERABLE = 130,
     // VMX on 虚拟化开启指令出错
     EVMXONFailed = 131,
+    // VMX off 虚拟化开启指令出错
+    EVMXOFFFailed = 132,
 }
 
 impl SystemError {

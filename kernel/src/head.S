@@ -255,7 +255,7 @@ ENTRY(_start64)
     movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
 	rdmsr
 	bt	$8,	%rax
-	jnc	load_cr3
+	jnc	load_apu_cr3
 
     // 2. 设置临时页表
     // 最高级
@@ -263,13 +263,39 @@ ENTRY(_start64)
     mov $__PDPTE, %ebx
     or $0x3, %ebx
     mov %ebx, 0(%eax)
-    mov %ebx, 256(%eax)
+
+    mov $__PML4E, %eax
+    // 加256个表项, 映射高地址
+    add $2048, %eax
+    mov %ebx, 0(%eax)
 
     // 次级
     mov $__PDPTE, %eax
     mov $__PDE, %ebx
     or $0x3, %ebx
     mov %ebx, 0(%eax)
+
+    // 次低级
+    mov $__PDE, %eax
+    mov $50, %ecx
+    mov $__PT_S, %ebx
+    or $0x3, %ebx
+.fill_pde_64:
+    mov %ebx, 0(%eax)
+    add $0x1000, %ebx
+    add $8, %eax
+    loop .fill_pde_64
+
+    // 最低级
+    // 循环 512*50=25600 次，填满50页
+    mov $25600, %ecx
+    mov $__PT_S, %eax
+    mov $0x3, %ebx
+.fill_pt_64:
+    mov %ebx, 0(%eax)
+    add $0x1000, %ebx
+    add $8, %eax
+    loop .fill_pt_64
 
 
 // ==== 加载CR3寄存器
@@ -279,7 +305,20 @@ load_cr3:
     movq $__PML4E, %rax //设置页目录基地址
     
     movq %rax, %cr3
-    
+    jmp to_switch_seg
+
+load_apu_cr3:
+    // 由于内存管理模块重置了页表，因此ap核心初始化的时候，需要使用新的内核页表。
+    // 这个页表的值由smp模块设置到__APU_START_CR3变量中
+
+    // 加载__APU_START_CR3中的值
+    movq $__APU_START_CR3, %rax
+    movq 0(%rax), %rax
+    movq %rax, %cr3
+    jmp to_switch_seg
+
+to_switch_seg:
+
     movq switch_seg(%rip), %rax
     // 由于ljmp和lcall在GAS中不受支持，因此我们需要先伪造函数调用现场，通过lret的方式，给它跳转过去。才能更新cs寄存器
     // 实在是太妙了！Amazing！
@@ -481,73 +520,23 @@ ENTRY(head_stack_start)
 
 // 初始化页表
 .align 0x1000 //设置为4k对齐
-//.org 0x1000 //设置页表位置为内核执行头程序的0x1000处
-
 __PML4E:
-    .quad 0x103007 // 用户访问，可读写，已存在， 地址在31~12位
-    .fill	255,8,0
-	.quad 0x103003
-	.fill	255,8,0
-
-.org	0x2000
-
+    .skip 0x1000
 __PDPTE:
+	.skip 0x1000
 
-	.quad	0x104003 // 用户访问，可读写，已存在
-	.fill	511,8,0
-
-.org	0x3000
-
+// 三级页表
 __PDE:
+    .skip 0x1000
 
-	.quad	0x000083    // 用户访问，可读写，已存在
-	.quad	0x200083
-	.quad	0x400083
-	.quad	0x600083
-	.quad	0x800083
-    .quad	0xa00083
-	.quad	0xc00083
-	.quad	0xe00083
-	.quad	0x1000083
-	.quad	0x1200083
-	.quad	0x1400083
-	.quad	0x1600083
-	.quad	0x1800083
-	.quad	0x1a00083
-	.quad	0x1c00083
-	.quad	0x1e00083
-	.quad	0x2000083
-	.quad	0x2200083
-	.quad	0x2400083
-	.quad	0x2600083
-	.quad	0x2800083
-	.quad	0x2a00083
-	.quad	0x2c00083
-	.quad	0x2e00083
-	.quad	0x3000083
-	.quad	0x3200083
-	.quad	0x3400083
-	.quad	0x3600083
+// 预留50个四级页表，总共表示100M的内存空间。这50个页表占用200KB的空间
+__PT_S:
+    .skip 0x32000
 
 
-	.quad	0xe0000083		/*虚拟地址0x 3000000 初始情况下，帧缓冲区映射到这里*/ 
-	.quad	0xe0200083
-	.quad	0xe0400083
-	.quad	0xe0600083		/*0x1000000*/
-	.quad	0xe0800083
-	.quad	0xe0a00083
-	.quad	0xe0c00083
-	.quad	0xe0e00083
-    .quad	0xe1000083
-    .quad	0xe1200083
-    .quad	0xe1400083
-    .quad	0xe1600083
-    .quad	0xe1800083
-    .quad	0xe1a00083
-    .quad	0xe1c00083
-    .quad	0xe1e00083
-	.fill	468,8,0
-
+.global __APU_START_CR3
+__APU_START_CR3:
+    .quad 0
 
 // GDT表
 

@@ -594,7 +594,9 @@ static char *write_float_point_num(char *str, double num, int field_width, int p
 int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...)
 {
     uint64_t rflags;
+    io_mfence();
     spin_lock_irqsave(&__printk_lock, rflags);
+    io_mfence();
     va_list args;
     va_start(args, fmt);
     char buf[4096]; // vsprintf()的缓冲区
@@ -610,7 +612,9 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
         // 输出
         textui_putchar(current, FRcolor, BKcolor);
     }
+    io_mfence();
     spin_unlock_irqrestore(&__printk_lock, rflags);
+    io_mfence();
     return i;
 }
 

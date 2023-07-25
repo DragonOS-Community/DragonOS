@@ -1,20 +1,21 @@
 use core::{
-    intrinsics::unlikely,
-    mem::ManuallyDrop,
-    sync::atomic::{AtomicUsize, Ordering},
+    ptr::null_mut,
+    sync::atomic::{compiler_fence, Ordering, AtomicUsize}, intrinsics::unlikely, mem::ManuallyDrop,
 };
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{sync::Arc, boxed::Box};
 
 use crate::{
-    arch::{fpu::FpState, process::ArchPCBInfo},
-    filesystem::vfs::file::FileDescriptorVec,
-    ipc::signal_types::{sighand_struct, signal_struct, sigpending, sigset_t, SignalNumber},
-    libs::{align::AlignedBox, rwlock::RwLock},
-    sched::SchedPolicy,
-    syscall::SystemError,
+    arch::{asm::current::current_pcb, fpu::FpState, process::ArchPCBInfo},
+    kdebug,
+    mm::{
+        set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, INITIAL_PROCESS_ADDRESS_SPACE,
+    }, libs::{align::AlignedBox, rwlock::RwLock}, syscall::SystemError, filesystem::vfs::file::FileDescriptorVec, ipc::signal_types::{signal_struct, sighand_struct, sigset_t, sigpending, SignalNumber}, sched::SchedPolicy,
 };
 
+pub mod abi;
+pub mod c_adapter;
+pub mod exec;
 pub mod fork;
 pub mod initial_proc;
 pub mod pid;
@@ -177,4 +178,19 @@ impl Drop for KernelStack {
             unsafe { Arc::from_raw(self.stack.as_ptr() as *const ProcessControlBlock) };
         drop(pcb_ptr);
     }
+}
+pub fn process_init() {
+    unsafe {
+        compiler_fence(Ordering::SeqCst);
+        current_pcb().address_space = null_mut();
+        kdebug!("To create address space for INIT process.");
+        // test_buddy();
+        set_INITIAL_PROCESS_ADDRESS_SPACE(
+            AddressSpace::new(true).expect("Failed to create address space for INIT process."),
+        );
+        kdebug!("INIT process address space created.");
+        compiler_fence(Ordering::SeqCst);
+        current_pcb().set_address_space(INITIAL_PROCESS_ADDRESS_SPACE());
+        compiler_fence(Ordering::SeqCst);
+    };
 }

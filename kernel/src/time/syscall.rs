@@ -1,8 +1,39 @@
-use core::ptr::null_mut;
+use core::{
+    ffi::{c_int, c_longlong},
+    ptr::null_mut,
+};
 
 use crate::{
     syscall::{Syscall, SystemError},
     time::{sleep::nanosleep, TimeSpec},
+};
+
+use super::timekeeping::do_gettimeofday;
+
+pub type PosixTimeT = c_longlong;
+pub type PosixSusecondsT = c_int;
+
+#[repr(C)]
+#[derive(Default, Debug)]
+pub struct PosixTimeval {
+    pub tv_sec: PosixTimeT,
+    pub tv_usec: PosixSusecondsT,
+}
+
+#[repr(C)]
+#[derive(Default, Debug)]
+/// 当前时区信息
+pub struct PosixTimeZone {
+    /// 格林尼治相对于当前时区相差的分钟数
+    pub tz_minuteswest: c_int,
+    /// DST矫正时差
+    pub tz_dsttime: c_int,
+}
+
+/// 系统时区 暂时写定为东八区
+pub const SYS_TIMEZONE: PosixTimeZone = PosixTimeZone {
+    tz_minuteswest: -480,
+    tz_dsttime: 0,
 };
 
 impl Syscall {
@@ -43,5 +74,29 @@ impl Syscall {
     /// todo: 该系统调用与Linux不一致，将来需要删除该系统调用！！！ 删的时候记得改C版本的libc
     pub fn clock() -> Result<usize, SystemError> {
         return Ok(super::timer::clock() as usize);
+    }
+
+    pub fn gettimeofday(
+        tv: *mut PosixTimeval,
+        timezone: *mut PosixTimeZone,
+    ) -> Result<usize, SystemError> {
+        // TODO; 处理时区信息
+        // kdebug!("enter sys_do_gettimeofday");
+        if tv == null_mut() {
+            return Err(SystemError::EFAULT);
+        }
+        let posix_time = do_gettimeofday();
+        unsafe {
+            (*tv).tv_sec = posix_time.tv_sec;
+            (*tv).tv_usec = posix_time.tv_usec;
+        }
+
+        if !timezone.is_null() {
+            unsafe {
+                *timezone = SYS_TIMEZONE;
+            }
+        }
+        // kdebug!("exit sys_do_gettimeofday");
+        return Ok(0);
     }
 }

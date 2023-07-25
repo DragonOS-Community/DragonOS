@@ -20,6 +20,61 @@ lazy_static! {
     pub static ref DEVICE_MANAGER: Arc<LockedDeviceManager> = Arc::new(LockedDeviceManager::new());
 }
 
+pub trait KObject: Any + Send + Sync + Debug {}
+
+/// @brief: 设备号实例
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DeviceNumber(usize);
+
+impl Default for DeviceNumber {
+    fn default() -> Self {
+        DeviceNumber(0)
+    }
+}
+
+impl From<usize> for DeviceNumber {
+    fn from(dev_t: usize) -> Self {
+        DeviceNumber(dev_t)
+    }
+}
+
+impl Into<usize> for DeviceNumber {
+    fn into(self) -> usize {
+        self.0
+    }
+}
+
+impl DeviceNumber {
+    /// @brief: 设备号创建
+    /// @parameter: dev_t: 设备号
+    /// @return: 设备号实例
+    pub fn new(dev_t: usize) -> DeviceNumber {
+        Self(dev_t)
+    }
+
+    /// @brief: 获取主设备号
+    /// @parameter: none
+    /// @return: 主设备号
+    pub fn major(&self) -> usize {
+        (self.0 >> 20) & 0xfff
+    }
+
+    /// @brief: 获取次设备号
+    /// @parameter: none
+    /// @return: 次设备号
+    pub fn minor(&self) -> usize {
+        self.0 & 0xfffff
+    }
+}
+
+/// @brief: 根据主次设备号创建设备号实例
+/// @parameter: major: 主设备号
+///             minor: 次设备号
+/// @return: 设备号实例
+pub fn mkdev(major: usize, minor: usize) -> DeviceNumber {
+    DeviceNumber(((major & 0xfff) << 20) | (minor & 0xfffff))
+}
+
 /// @brief: 设备类型
 #[allow(dead_code)]
 #[derive(Debug, Eq, PartialEq)]
@@ -112,16 +167,21 @@ impl From<DeviceState> for u32 {
 }
 
 /// @brief: 所有设备都应该实现该trait
-pub trait Device: Any + Send + Sync + Debug {
+pub trait Device: KObject {
+    /// @brief: 本函数用于实现动态转换
+    /// @parameter: None
+    /// @return: any
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
+
     /// @brief: 获取设备类型
     /// @parameter: None
     /// @return: 实现该trait的设备所属类型
-    fn get_type(&self) -> DeviceType;
+    fn dev_type(&self) -> DeviceType;
 
     /// @brief: 获取设备标识
     /// @parameter: None
     /// @return: 该设备唯一标识
-    fn get_id_table(&self) -> IdTable;
+    fn id_table(&self) -> IdTable;
 
     /// @brief: 设置sysfs info
     /// @parameter: None
@@ -208,8 +268,8 @@ impl DeviceManager {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
-    DEVICE_MANAGER.add_device(device.get_id_table(), device.clone());
-    match sys_device_register(&device.get_id_table().to_name()) {
+    DEVICE_MANAGER.add_device(device.id_table(), device.clone());
+    match sys_device_register(&device.id_table().to_name()) {
         Ok(sys_info) => {
             device.set_sys_info(Some(sys_info));
             return Ok(());
@@ -222,8 +282,8 @@ pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_unregister<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
-    DEVICE_MANAGER.add_device(device.get_id_table(), device.clone());
-    match sys_device_unregister(&device.get_id_table().to_name()) {
+    DEVICE_MANAGER.add_device(device.id_table(), device.clone());
+    match sys_device_unregister(&device.id_table().to_name()) {
         Ok(_) => {
             device.set_sys_info(None);
             return Ok(());

@@ -35,11 +35,9 @@ use crate::{
 use super::signal_types::{
     si_code_val, sig_is_member, sigaction, sigaction__union_u, sigcontext, sigframe,
     sighand_struct, siginfo, signal_struct, sigpending, sigset_clear, sigset_del, sigset_delmask,
-    sigset_equal, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS,
-    SA_FLAG_DFL, SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, _NSIG_U64_CNT,
+    sigset_equal, sigset_t, SigQueue, SignalNumber, MAX_SIG_NUM, SA_ALL_FLAGS, SA_FLAG_DFL,
+    SA_FLAG_IGN, SA_FLAG_IMMUTABLE, SA_FLAG_RESTORER, STACK_ALIGN, _NSIG_U64_CNT,
 };
-
-
 
 /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
 pub static DEFAULT_SIGACTION: sigaction = sigaction {
@@ -135,7 +133,7 @@ fn signal_send_sig_info(
     // 信号符合要求，可以发送
 
     let mut retval = Err(SystemError::ESRCH);
-    let mut flags: u64 = 0;
+    let mut flags: usize = 0;
     // 如果上锁成功，则发送信号
     if !lock_process_sighand(target_pcb, &mut flags).is_none() {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -155,7 +153,7 @@ fn signal_send_sig_info(
 /// @return 指向sighand_struct的可变引用
 fn lock_process_sighand<'a>(
     pcb: &'a mut process_control_block,
-    flags: &mut u64,
+    flags: &mut usize,
 ) -> Option<&'a mut sighand_struct> {
     // kdebug!("lock_process_sighand");
 
@@ -177,10 +175,10 @@ fn lock_process_sighand<'a>(
 /// @brief 对pcb的sighand结构体中的siglock进行放锁，并恢复之前存储的rflags
 /// @param pcb 目标pcb
 /// @param flags 用来保存rflags的变量，将这个值恢复到rflags寄存器中
-fn unlock_process_sighand(pcb: &mut process_control_block, flags: u64) {
+fn unlock_process_sighand(pcb: &mut process_control_block, flags: usize) {
     let lock = unsafe { &mut (*pcb.sighand).siglock };
 
-    spin_unlock_irqrestore(lock, &flags);
+    spin_unlock_irqrestore(lock, flags);
 }
 
 /// @brief 判断是否需要强制发送信号，然后发送信号

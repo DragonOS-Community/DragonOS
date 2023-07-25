@@ -6,23 +6,30 @@ use core::{
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
-    arch::cpu::cpu_reset,
+    arch::{cpu::cpu_reset, MMArch},
     filesystem::vfs::{
         file::FileMode,
         syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::{mm_stat_t, pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
-    io::SeekFrom, kinfo,
+    include::bindings::bindings::{pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
+    io::SeekFrom,
+    kinfo,
+    libs::align::page_align_up,
+    mm::{MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    time::TimeSpec,
+    time::{
+        syscall::{PosixTimeZone, PosixTimeval},
+        TimeSpec,
+    },
 };
+
+pub mod user_access;
 
 #[repr(i32)]
 #[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
 #[allow(dead_code, non_camel_case_types)]
 pub enum SystemError {
-    /// 操作不被允许 Operation not permitted.
     EPERM = 1,
     /// 没有指定的文件或目录 No such file or directory.
     ENOENT = 2,
@@ -327,9 +334,8 @@ pub const SYS_NANOSLEEP: usize = 18;
 /// todo: 该系统调用与Linux不一致，将来需要删除该系统调用！！！ 删的时候记得改C版本的libc
 pub const SYS_CLOCK: usize = 19;
 pub const SYS_PIPE: usize = 20;
-
-/// todo: 该系统调用不是符合POSIX标准的，在将来需要删除！！！
-pub const SYS_MSTAT: usize = 21;
+/// 系统调用21曾经是SYS_MSTAT，但是现在已经废弃
+pub const __NOT_USED: usize = 21;
 pub const SYS_UNLINK_AT: usize = 22;
 pub const SYS_KILL: usize = 23;
 pub const SYS_SIGACTION: usize = 24;
@@ -353,6 +359,10 @@ pub const SYS_ACCEPT: usize = 40;
 
 pub const SYS_GETSOCKNAME: usize = 41;
 pub const SYS_GETPEERNAME: usize = 42;
+pub const SYS_GETTIMEOFDAY: usize = 43;
+pub const SYS_MMAP: usize = 44;
+pub const SYS_MUNMAP: usize = 45;
+pub const SYS_MPROTECT: usize = 46;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -380,7 +390,7 @@ impl Syscall {
         return crate::arch::syscall::arch_syscall_init();
     }
     /// @brief 系统调用分发器，用于分发系统调用。
-    /// 
+    ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
     pub fn handle(syscall_num: usize, args: &[usize], from_user: bool) -> usize {
@@ -468,13 +478,13 @@ impl Syscall {
             }
 
             SYS_BRK => {
-                let new_brk = args[0];
-                Self::brk(new_brk)
+                let new_brk = VirtAddr::new(args[0]);
+                Self::brk(new_brk).map(|vaddr| vaddr.data())
             }
 
             SYS_SBRK => {
                 let increment = args[0] as isize;
-                Self::sbrk(increment)
+                Self::sbrk(increment).map(|vaddr| vaddr.data())
             }
 
             SYS_REBOOT => Self::reboot(),
@@ -637,18 +647,6 @@ impl Syscall {
                 }
             }
 
-            SYS_MSTAT => {
-                let dst = args[0] as *mut mm_stat_t;
-                if from_user
-                    && unsafe { !verify_area(dst as u64, core::mem::size_of::<mm_stat_t>() as u64) }
-                {
-                    Err(SystemError::EFAULT)
-                } else if dst.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::mstat(dst, from_user)
-                }
-            }
             SYS_UNLINK_AT => {
                 let dirfd = args[0] as i32;
                 let pathname = args[1] as *const c_char;
@@ -866,6 +864,74 @@ impl Syscall {
             SYS_GETPEERNAME => {
                 Self::getpeername(args[0], args[1] as *mut SockAddr, args[2] as *mut u32)
             }
+            SYS_GETTIMEOFDAY => {
+                let timeval = args[0] as *mut PosixTimeval;
+                let timezone_ptr = args[1] as *mut PosixTimeZone;
+                let security_check = || {
+                    if unsafe {
+                        verify_area(timeval as u64, core::mem::size_of::<PosixTimeval>() as u64)
+                    } == false
+                    {
+                        return Err(SystemError::EFAULT);
+                    }
+                    if unsafe {
+                        verify_area(
+                            timezone_ptr as u64,
+                            core::mem::size_of::<PosixTimeZone>() as u64,
+                        )
+                    } == false
+                    {
+                        return Err(SystemError::EFAULT);
+                    }
+                    return Ok(());
+                };
+                let r = security_check();
+                if r.is_err() {
+                    Err(r.unwrap_err())
+                } else {
+                    if !timeval.is_null() {
+                        Self::gettimeofday(timeval, timezone_ptr)
+                    } else {
+                        Err(SystemError::EFAULT)
+                    }
+                }
+            }
+            SYS_MMAP => {
+                let len = page_align_up(args[1]);
+                if unsafe { !verify_area(args[0] as u64, len as u64) } {
+                    Err(SystemError::EFAULT)
+                } else {
+                    Self::mmap(
+                        VirtAddr::new(args[0]),
+                        len,
+                        args[2],
+                        args[3],
+                        args[4] as i32,
+                        args[5],
+                    )
+                }
+            }
+            SYS_MUNMAP => {
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & MMArch::PAGE_SIZE != 0 {
+                    // The addr argument is not a multiple of the page size
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::munmap(VirtAddr::new(addr), len)
+                }
+            }
+            SYS_MPROTECT => {
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & MMArch::PAGE_SIZE != 0 {
+                    // The addr argument is not a multiple of the page size
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::mprotect(VirtAddr::new(addr), len, args[2])
+                }
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

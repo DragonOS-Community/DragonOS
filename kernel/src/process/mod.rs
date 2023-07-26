@@ -22,10 +22,14 @@ pub mod pid;
 pub mod preempt;
 pub mod process;
 pub mod syscall;
+pub mod kthread;
+pub mod wait_queue;
+
+const PCB_NAME_LEN: usize = 16;
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-#[derive(Debug)]
+#[derive(Debug,PartialEq)]
 pub enum ProcessState {
     /// The process is running on a CPU or in a run queue.
     Runnable,
@@ -39,7 +43,7 @@ pub enum ProcessState {
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }
-
+  
 bitflags! {
     /// pcb的标志位
     pub struct ProcessFlags: usize {
@@ -78,6 +82,10 @@ pub struct InnerProcessControlBlock {
     pub ppid: Pid,
     /// 当前进程所在的cpu
     pub on_cpu: usize,
+    /// 标志位
+    pub flags:ProcessFlags,
+    /* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
+    pub worker_private: Option<*mut ()>,
     /// 当前进程的自旋锁持有计数
     pub preempt_count: AtomicUsize,
     /// 当前进程的状态
@@ -99,6 +107,7 @@ pub struct InnerProcessControlBlock {
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
     pub migrate_to: u32,
+
 
     // 信号相关的字段。由于信号机制实现的不是很好，因此这里使用了裸指针来避免所有权问题。
     // TODO：重构信号机制。

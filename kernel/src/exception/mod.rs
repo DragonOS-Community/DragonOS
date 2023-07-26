@@ -1,5 +1,6 @@
 use crate::arch::CurrentIrqArch;
 
+pub mod ipi;
 pub mod softirq;
 
 /// @brief 中断相关的操作
@@ -18,15 +19,15 @@ pub trait InterruptArch: Send + Sync {
 
 #[derive(Debug, Clone, Copy)]
 pub struct IrqFlags {
-    flags: u64,
+    flags: usize,
 }
 
 impl IrqFlags {
-    pub fn new(flags: u64) -> Self {
+    pub fn new(flags: usize) -> Self {
         IrqFlags { flags }
     }
 
-    pub fn flags(&self) -> u64 {
+    pub fn flags(&self) -> usize {
         self.flags
     }
 }

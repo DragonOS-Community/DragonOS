@@ -43,7 +43,7 @@ install_ubuntu_debian_pkg()
         gnupg \
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
-        gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables
+        gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config
 
     if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."

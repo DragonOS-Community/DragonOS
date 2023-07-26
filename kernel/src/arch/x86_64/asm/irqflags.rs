@@ -1,18 +1,19 @@
-use core::{arch::asm, ptr::read_volatile};
+use core::arch::asm;
 
 #[inline]
-pub fn local_irq_save(flags: &mut u64) {
+pub fn local_irq_save() -> usize {
+    let x: usize;
+    // x86_64::registers::rflags::
     unsafe {
-        asm!("pushfq", "pop rax", "mov rax, {0}", "cli", out(reg)(*flags),);
+        asm!("pushfq; pop {}; cli", out(reg) x, options(nomem, preserves_flags));
     }
+    x
 }
 
 #[inline]
-pub fn local_irq_restore(flags: &u64) {
-    let x = unsafe { read_volatile(flags) };
-
+// 恢复先前保存的rflags的值x
+pub fn local_irq_restore(x: usize) {
     unsafe {
-        asm!("push r15",
-            "popfq", in("r15")(x));
+        asm!("push {}; popfq", in(reg) x, options(nomem, preserves_flags));
     }
 }

@@ -79,8 +79,7 @@ impl FpState {
 /// @brief 从用户态进入内核时，保存浮点寄存器，并关闭浮点功能
 pub fn fp_state_save(pcb: &mut process_control_block) {
     // 该过程中不允许中断
-    let mut rflags: u64 = 0;
-    local_irq_save(&mut rflags);
+    let rflags: usize = local_irq_save();
 
     let fp: &mut FpState = if pcb.fp_state == null_mut() {
         let f = Box::leak(Box::new(FpState::default()));
@@ -112,14 +111,13 @@ pub fn fp_state_save(pcb: &mut process_control_block) {
                                 "mov cr4, rax" */
         )
     }
-    local_irq_restore(&rflags);
+    local_irq_restore(rflags);
 }
 
 /// @brief 从内核态返回用户态时，恢复浮点寄存器，并开启浮点功能
 pub fn fp_state_restore(pcb: &mut process_control_block) {
     // 该过程中不允许中断
-    let mut rflags: u64 = 0;
-    local_irq_save(&mut rflags);
+    let rflags = local_irq_save();
 
     if pcb.fp_state == null_mut() {
         panic!("fp_state_restore: fp_state is null. pid={}", pcb.pid);
@@ -143,5 +141,5 @@ pub fn fp_state_restore(pcb: &mut process_control_block) {
     fp.restore();
     fp.clear();
 
-    local_irq_restore(&rflags);
+    local_irq_restore(rflags);
 }

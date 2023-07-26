@@ -1,11 +1,9 @@
 #pragma once
-
 /**
- * 系统调用说明
- * 1    printf
+ * 请注意！！！由于系统调用模块已经使用Rust重构，当修改系统调用号时，需要同时修改syscall_num.h和syscall/mod.rs中的系统调用号
+ * 并且以syscall/mod.rs中的为准！！！
  *
- *
- * 255  AHCI end_request
+ * TODO：在完成系统的重构后，删除syscall_num.h
  *
  */
 
@@ -32,7 +30,6 @@
 #define SYS_CLOCK 19     // 获取当前cpu时间
 #define SYS_PIPE 20      // 创建管道
 
-#define SYS_MSTAT 21        // 获取系统的内存状态信息
 #define SYS_UNLINK_AT 22    // 删除文件夹/删除文件链接
 #define SYS_KILL 23         // kill一个进程(向这个进程发出信号)
 #define SYS_SIGACTION 24    // 设置进程的信号处理动作
@@ -53,7 +50,10 @@
 #define SYS_LISTEN 38     // 监听一个socket
 #define SYS_SHUTDOWN 39   // 关闭socket
 #define SYS_ACCEPT 40     // 接受一个socket连接
-#define SYS_GETSOCKNAME 41 // 获取socket的名字
-#define SYS_GETPEERNAME 42 // 获取socket的对端名字
 
-#define SYS_AHCI_END_REQ 255 // AHCI DMA请求结束end_request的系统调用
+#define SYS_GETSOCKNAME 41  // 获取socket的名字
+#define SYS_GETPEERNAME 42  // 获取socket的对端名字
+#define SYS_GETTIMEOFDAY 43 // 获取当前时间
+#define SYS_MMAP 44         // 内存映射
+#define SYS_MUNMAP 45       // 内存解除映射
+#define SYS_MPROTECT 46     // 内存保护

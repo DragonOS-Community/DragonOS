@@ -16,5 +16,5 @@ pub trait PlatformDriver: Driver {
     /// @brief: 获取驱动匹配表
     /// @parameter: None
     /// @return: 驱动匹配表
-    fn get_compatible_table(&self) -> CompatibleTable;
+    fn compatible_table(&self) -> CompatibleTable;
 }

@@ -11,7 +11,7 @@ bitflags! {
     pub struct ModeType: u32 {
         /// 掩码
         const S_IFMT = 0o0_170_000;
-
+        /// 文件类型
         const S_IFSOCK = 0o140000;
         const S_IFLNK = 0o120000;
         const S_IFREG = 0o100000;
@@ -23,16 +23,17 @@ bitflags! {
         const S_ISUID = 0o004000;
         const S_ISGID = 0o002000;
         const S_ISVTX = 0o001000;
-
+        /// 文件用户权限
         const S_IRWXU = 0o0700;
         const S_IRUSR = 0o0400;
-        const S_IWUSER = 0o0100;
-
+        const S_IWUSR = 0o0200;
+        const S_IXUSR = 0o0100;
+        /// 文件组权限
         const S_IRWXG = 0o0070;
         const S_IRGRP = 0o0040;
         const S_IWGRP = 0o0020;
         const S_IXGRP = 0o0010;
-
+        /// 文件其他用户权限
         const S_IRWXO = 0o0007;
         const S_IROTH = 0o0004;
         const S_IWOTH = 0o0002;
@@ -41,25 +42,39 @@ bitflags! {
 }
 
 #[repr(C)]
+/// # 文件信息结构体
 pub struct PosixKstat {
+    /// 硬件设备ID
     dev_id: u64,
+    /// inode号
     inode: u64,
+    /// 硬链接数
     nlink: u64,
+    /// 文件权限
     mode: ModeType,
+    /// 所有者用户ID
     uid: i32,
+    /// 所有者组ID
     gid: i32,
+    /// 设备ID
     rdev: i64,
+    /// 文件大小
     size: i64,
+    /// 文件系统块大小
     blcok_size: i64,
+    /// 分配的512B块数
     blocks: u64,
-
+    /// 最后访问时间
     atime: TimeSpec,
+    /// 最后修改时间
     mtime: TimeSpec,
+    /// 最后状态变化时间
     ctime: TimeSpec,
+    /// 用于填充结构体大小的空白数据
     pub _pad: [i8; 24],
 }
-impl Default for PosixKstat {
-    fn default() -> Self {
+impl PosixKstat {
+    fn new() -> Self {
         Self {
             inode: 0,
             dev_id: 0,
@@ -90,32 +105,30 @@ impl Default for PosixKstat {
 impl Syscall {
     pub fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
         let cur = current_pcb();
-        kdebug!("kfd = {:?}", fd);
         match cur.get_file_ref_by_fd(fd) {
             Some(file) => {
-                kdebug!("file is gotten");
-                let mut kstat = PosixKstat::default();
-
+                let mut kstat = PosixKstat::new();
+                // 获取文件信息
                 match file.metadata() {
-                    Ok(matedata) => {
-                        kstat.size = matedata.size as i64;
-                        kstat.dev_id = matedata.dev_id as u64;
-                        kstat.inode = matedata.inode_id as u64;
-                        kstat.blcok_size = matedata.blk_size as i64;
-                        kstat.blocks = matedata.blocks as u64;
+                    Ok(metadata) => {
+                        kstat.size = metadata.size as i64;
+                        kstat.dev_id = metadata.dev_id as u64;
+                        kstat.inode = metadata.inode_id as u64;
+                        kstat.blcok_size = metadata.blk_size as i64;
+                        kstat.blocks = metadata.blocks as u64;
 
-                        kstat.atime.tv_sec = matedata.atime.tv_sec;
-                        kstat.atime.tv_nsec = matedata.atime.tv_nsec;
-                        kstat.mtime.tv_sec = matedata.mtime.tv_sec;
-                        kstat.mtime.tv_nsec = matedata.mtime.tv_nsec;
-                        kstat.ctime.tv_sec = matedata.ctime.tv_sec;
-                        kstat.ctime.tv_nsec = matedata.ctime.tv_nsec;
+                        kstat.atime.tv_sec = metadata.atime.tv_sec;
+                        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
+                        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
+                        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
+                        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
+                        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
 
-                        kstat.nlink = matedata.nlinks as u64;
-                        kstat.uid = matedata.uid as i32;
-                        kstat.gid = matedata.gid as i32;
-                        kstat.rdev = matedata.raw_dev as i64;
-                        kstat.mode.bits = matedata.mode;
+                        kstat.nlink = metadata.nlinks as u64;
+                        kstat.uid = metadata.uid as i32;
+                        kstat.gid = metadata.gid as i32;
+                        kstat.rdev = metadata.raw_dev as i64;
+                        kstat.mode.bits = metadata.mode;
                         match file.file_type() {
                             FileType::File => kstat.mode.insert(ModeType::S_IFMT),
                             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
@@ -125,30 +138,6 @@ impl Syscall {
                             FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
                             FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
                         }
-                        kdebug!(
-                            "kstat\ndev_id = {:?}\ninode = {:?}\nnlink = {:?}\n
-                            mode = {:?}\nuid = {:?}\ngid = {:?}\nrdev = {:?}\n
-                            size = {:?}\nblcok_size = {:?}\nblocks = {:?}\n
-                            atime.sec = {:?} nsec = {:?}\n
-                            mtime.sec = {:?} nsec = {:?}\n
-                            ctime.sec = {:?} nsec = {:?}\n",
-                            kstat.dev_id,
-                            kstat.inode,
-                            kstat.nlink,
-                            kstat.mode,
-                            kstat.uid,
-                            kstat.gid,
-                            kstat.rdev,
-                            kstat.size,
-                            kstat.blcok_size,
-                            kstat.blocks,
-                            kstat.atime.tv_sec,
-                            kstat.atime.tv_nsec,
-                            kstat.mtime.tv_sec,
-                            kstat.mtime.tv_nsec,
-                            kstat.ctime.tv_sec,
-                            kstat.ctime.tv_nsec,
-                        );
                     }
                     Err(e) => return Err(e),
                 }
@@ -169,34 +158,7 @@ impl Syscall {
                 }
                 unsafe {
                     *usr_kstat = kstat;
-                    kdebug!("usr_kstat = {:p}", usr_kstat);
                 }
-                // unsafe {
-                //     kdebug!(
-                //         "(*usr_kstat)\ndev_id = {:?}\ninode = {:?}\nnlink = {:?}\n
-                //             mode = {:?}\nuid = {:?}\ngid = {:?}\nrdev = {:?}\n
-                //             size = {:?}\nblcok_size = {:?}\nblocks = {:?}\n
-                //             atime.sec = {:?} nsec = {:?}\n
-                //             mtime.sec = {:?} nsec = {:?}\n
-                //             ctime.sec = {:?} nsec = {:?}\n",
-                //         (*usr_kstat).dev_id,
-                //         (*usr_kstat).inode,
-                //         (*usr_kstat).nlink,
-                //         (*usr_kstat).mode,
-                //         (*usr_kstat).uid,
-                //         (*usr_kstat).gid,
-                //         (*usr_kstat).rdev,
-                //         (*usr_kstat).size,
-                //         (*usr_kstat).blcok_size,
-                //         (*usr_kstat).blocks,
-                //         (*usr_kstat).atime.tv_sec,
-                //         (*usr_kstat).atime.tv_nsec,
-                //         (*usr_kstat).mtime.tv_sec,
-                //         (*usr_kstat).mtime.tv_nsec,
-                //         (*usr_kstat).ctime.tv_sec,
-                //         (*usr_kstat).ctime.tv_nsec,
-                //     );
-                // }
                 return Ok(0);
             }
             Err(e) => return Err(e),

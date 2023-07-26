@@ -54,6 +54,7 @@
 #define SYS_GETSOCKNAME 41  // 获取socket的名字
 #define SYS_GETPEERNAME 42  // 获取socket的对端名字
 #define SYS_GETTIMEOFDAY 43 // 获取当前时间
-#define SYS_FSTAT 44        // 根据文件描述符获取文件信息
+
+#define SYS_FSTAT 47        // 根据文件描述符获取文件信息
 
 #define SYS_AHCI_END_REQ 255 // AHCI DMA请求结束end_request的系统调用

@@ -5,7 +5,7 @@ use crate::{
 };
 
 use core::{
-    alloc::{AllocError, GlobalAlloc, Allocator, Layout},
+    alloc::{AllocError, GlobalAlloc, Layout},
     intrinsics::unlikely,
     ptr::NonNull,
 };

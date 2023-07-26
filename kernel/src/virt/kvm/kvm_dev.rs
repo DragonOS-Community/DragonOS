@@ -1,14 +1,13 @@
 use crate::kdebug;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
-    core::{generate_inode_id, ROOT_INODE},
+    core::{generate_inode_id},
     file::FileMode,
-    FileSystem, FilePrivateData, FileType, FsInfo, IndexNode, Metadata, PollStatus,
+    FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
     make_rawdev,
 };
 use crate::{
-    kerror,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::spinlock::{SpinLock},
     syscall::SystemError,
     time::TimeSpec
 };

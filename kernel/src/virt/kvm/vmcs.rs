@@ -11,7 +11,7 @@ pub struct VMCSRegion {
     data: [u8; PAGE_SIZE - 8],
 }
 
-/// (Intel Manual: 25.11.2 VMREAD, VMWRITE, and Encodings of VMCS Fields) 
+// (Intel Manual: 25.11.2 VMREAD, VMWRITE, and Encodings of VMCS Fields) 
 #[derive(FromPrimitive)]
 enum VmcsAccessType {
     FULL = 0,
@@ -35,14 +35,15 @@ enum VmcsWidth {
 }
 
 #[derive(FromPrimitive)]
-/// (Intel Manual: APPENDIX B FIELD ENCODING IN VMCS)
-enum VmcsFields {
-    /// [CONTROL] fields
-    /// 16-bit control fields
+#[allow(non_camel_case_types)]
+// (Intel Manual: APPENDIX B FIELD ENCODING IN VMCS)
+pub enum VmcsFields {
+    // [CONTROL] fields
+    // 16-bit control fields
     CTRL_VIRT_PROC_ID = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT16, 0) as isize,
     CTRL_POSTED_INTR_N_VECTOR = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT16, 1) as isize,
     CTRL_EPTP_INDEX = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT16, 2) as isize,
-    /// 64-bit control fields
+    // 64-bit control fields
     CTRL_IO_BITMAP_A_ADDR = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT64, 0) as isize,
     CTRL_IO_BITMAP_B_ADDR = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT64, 1) as isize,
     CTRL_MSR_BITMAP_ADDR = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT64, 2) as isize, // control whether RDMSR or WRMSR cause VM exit
@@ -68,7 +69,7 @@ enum VmcsFields {
     CTRL_XSS_EXITING_BITMAP = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT64, 22) as isize,
     CTRL_ENCLS_EXITING_BITMAP = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT64, 23) as isize,
     CTRL_TSC_MULTIPLIER = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT64, 25) as isize,
-    /// 32-bit control fields
+    // 32-bit control fields
     CTRL_PIN_BASED_VM_EXEC_CTRLS = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT32, 0) as isize, // control async event handling (i.e. interrupts)
     CTRL_PRIMARY_PROCESSOR_VM_EXEC_CTRLS = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT32, 1) as isize, // control sync event handling (i.e. instruction exits)
     CTRL_EXPECTION_BITMAP = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT32, 2) as isize, // bitmap to control exceptions that cause a VM exit
@@ -87,7 +88,7 @@ enum VmcsFields {
     CTRL_SECONDARY_PROCESSOR_VM_EXEC_CTRLS = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT32, 15) as isize,
     CTRL_PLE_GAP = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT32, 16) as isize,
     CTRL_PLE_WINDOW = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::BIT32, 17) as isize,
-    /// natural control fields
+    // natural control fields
     CTRL_CR0_GUEST_HOST_MASK = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::NATURAL, 0) as isize, // control executions of insts that access cr0
     CTRL_CR4_GUEST_HOST_MASK = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::NATURAL, 1) as isize,
     CTRL_CR0_READ_SHADOW = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::NATURAL, 2) as isize, // control executions of insts that access cr0
@@ -97,11 +98,11 @@ enum VmcsFields {
     CTRL_CR3_TARGET_VALUE_2 = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::NATURAL, 6) as isize,
     CTRL_CR3_TARGET_VALUE_3 = encode_vmcs_field_full(VmcsType::CONTROL, VmcsWidth::NATURAL, 7) as isize,
 
-    /// [VMEXIT] fields read-only
-    /// No 16-bit vmexit fields
-    /// 64-bit vmexit fields
+    // [VMEXIT] fields read-only
+    // No 16-bit vmexit fields
+    // 64-bit vmexit fields
     VMEXIT_GUEST_PHY_ADDR = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::BIT64, 0) as isize,
-    /// 32-bit vmexit fields
+    // 32-bit vmexit fields
     VMEXIT_INSTR_ERR = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::BIT32, 0) as isize,
     VMEXIT_EXIT_REASON = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::BIT32, 1) as isize,
     VMEXIT_INT_INFO = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::BIT32, 2) as isize,
@@ -110,7 +111,7 @@ enum VmcsFields {
     VMEXIT_IDT_VECTOR_ERR_CODE = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::BIT32, 5) as isize,
     VMEXIT_INSTR_LEN = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::BIT32, 6) as isize,
     VMEXIT_INSTR_INFO = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::BIT32, 7) as isize,
-    /// natural vmexit fields
+    // natural vmexit fields
     VMEXIT_QUALIFICATION = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::NATURAL, 0) as isize,
     VMEXIT_IO_RCX = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::NATURAL, 1) as isize,
     VMEXIT_IO_RSX = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::NATURAL, 2) as isize,
@@ -118,8 +119,8 @@ enum VmcsFields {
     VMEXIT_IO_RIP = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::NATURAL, 4) as isize,
     VMEXIT_GUEST_LINEAR_ADDR = encode_vmcs_field_full(VmcsType::VMEXIT, VmcsWidth::NATURAL, 5) as isize,
 
-    /// [GUEST] fields
-    /// 16-bit guest fields
+    // [GUEST] fields
+    // 16-bit guest fields
     GUEST_ES_SELECTOR = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT16, 0) as isize,
     GUEST_CS_SELECTOR = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT16, 1) as isize,
     GUEST_SS_SELECTOR = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT16, 2) as isize,
@@ -130,7 +131,7 @@ enum VmcsFields {
     GUEST_TR_SELECTOR = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT16, 7) as isize,
     GUEST_INTR_STATUS = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT16, 8) as isize,
     GUEST_PML_INDEX = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT16, 9) as isize,
-    /// 64-bit guest fields
+    // 64-bit guest fields
     GUEST_VMCS_LINK_PTR = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT64, 0) as isize,
     GUEST_DEBUGCTL = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT64, 1) as isize,
     GUEST_PAT = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT64, 2) as isize,
@@ -140,7 +141,7 @@ enum VmcsFields {
     GUEST_PDPTE1 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT64, 6) as isize,
     GUEST_PDPTE2 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT64, 7) as isize,
     GUEST_PDPTE3 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT64, 8) as isize,
-    /// 32-bit guest fields
+    // 32-bit guest fields
     GUEST_ES_LIMIT = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 0) as isize,
     GUEST_CS_LIMIT = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 1) as isize,
     GUEST_SS_LIMIT = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 2) as isize,
@@ -164,7 +165,7 @@ enum VmcsFields {
     GUEST_SMBASE = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 20) as isize,
     GUEST_SYSENTER_CS = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 21) as isize,
     GUEST_VMX_PREEMPT_TIMER_VALUE = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 22) as isize,
-    /// natural guest fields
+    // natural guest fields
     GUEST_CR0 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 0) as isize,
     GUEST_CR3 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 1) as isize,
     GUEST_CR4 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 2) as isize,
@@ -186,8 +187,8 @@ enum VmcsFields {
     GUEST_SYSENTER_ESP = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 18) as isize,
     GUEST_SYSENTER_EIP = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 19) as isize,
 
-    /// [HOST] fields
-    /// host 16 bit fields
+    // [HOST] fields
+    // host 16 bit fields
     HOST_ES_SELECTOR = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT16, 0) as isize,
     HOST_CS_SELECTOR = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT16, 1) as isize,
     HOST_SS_SELECTOR = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT16, 2) as isize,
@@ -195,13 +196,13 @@ enum VmcsFields {
     HOST_FS_SELECTOR = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT16, 4) as isize,
     HOST_GS_SELECTOR = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT16, 5) as isize,
     HOST_TR_SELECTOR = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT16, 6) as isize,
-    /// host 64 bit fields
+    // host 64 bit fields
     HOST_PAT = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT64, 0) as isize,
     HOST_EFER = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT64, 1) as isize,
     HOST_PERF_GLOBAL_CTRL = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT64, 2) as isize,
-    /// host 32 bit fields
+    // host 32 bit fields
     HOST_SYSENTER_CS = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::BIT32, 0) as isize,
-    /// host natural fields
+    // host natural fields
     HOST_CR0 = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::NATURAL, 0) as isize,
     HOST_CR3 = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::NATURAL, 1) as isize,
     HOST_CR4 = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::NATURAL, 2) as isize,
@@ -216,9 +217,10 @@ enum VmcsFields {
     HOST_RIP = encode_vmcs_field_full(VmcsType::HOST, VmcsWidth::NATURAL, 11) as isize,
 }
 
-/// (Intel Manual: 25.6 VM-EXECUTION CONTROL FIELDS)
+// (Intel Manual: 25.6 VM-EXECUTION CONTROL FIELDS)
 bitflags! {
-    /// (Intel Manual: 25.6.1 Pin-Based VM-Execution Controls)
+    // (Intel Manual: 25.6.1 Pin-Based VM-Execution Controls)
+    #[allow(non_camel_case_types)]
     pub struct VmxPinBasedExecuteCtrl: u32 {
         const EXTERNAL_INTERRUPT_EXITING = 1 << 0; // external interrupts cause VM exits
         const NMI_EXITING = 1 << 3; // non-maskable interrupts (NMIs) cause VM exits.
@@ -227,7 +229,8 @@ bitflags! {
         const PROCESS_POSTED_INTERRUPTS = 1 << 7; // he processor treats interrupts with the posted-interrupt notification vector
     }
 
-    /// (Intel Manual: 25.6.2 Processor-Based VM-Execution Controls)
+    // (Intel Manual: 25.6.2 Processor-Based VM-Execution Controls)
+    #[allow(non_camel_case_types)]
     pub struct VmxPrimaryProcessBasedExecuteCtrl: u32{
         const INTERRUPT_WINDOW_EXITING = 1 << 2; // VM exits on interrupt window RFLAGS.IF = 1
         const USE_TSC_OFFSETTING = 1 << 3; // TSC offsetting is enabled
@@ -252,7 +255,7 @@ bitflags! {
         const ACTIVATE_SECONDARY_CONTROLS = 1 << 31;
     }
 
-    /// (Intel Manual: 25.6.2 Processor-Based VM-Execution Controls)
+    // (Intel Manual: 25.6.2 Processor-Based VM-Execution Controls)
     pub struct VmxSecondaryProcessBasedExecuteCtrl: u32{
         const VIRT_APIC_ACCESS = 1 << 0;
         const ENABLE_EPT = 1 << 1;
@@ -287,7 +290,8 @@ bitflags! {
         const INST_TIMEOUT = 1 << 31;
     }
 
-    /// (Intel Manual: 25.7.1 VM-Exit Controls)
+    // (Intel Manual: 25.7.1 VM-Exit Controls)
+    #[allow(non_camel_case_types)]
     pub struct VmxPrimaryExitCtrl: u32 {
         const SAVE_DBG_CTRLS = 1 << 2;
         const HOST_ADDR_SPACE_SIZE = 1 << 9; // determines if a virtual processor will be in 64-bit mode after a VM exit
@@ -309,7 +313,8 @@ bitflags! {
         const ACTIVATE_SECONDARY_CONTROLS = 1 << 31;
     }
 
-    /// (Intel Manual: 25.8.1 VM-Entry Controls)
+    // (Intel Manual: 25.8.1 VM-Entry Controls)
+    #[allow(non_camel_case_types)]
     pub struct VmxEntryCtrl: u32 {
         const LOAD_DBG_CTRLS = 1 << 2;
         const IA32E_MODE_GUEST = 1 << 9;
@@ -354,4 +359,10 @@ fn decode_vmcs_field(field: u32) -> (VmcsAccessType, VmcsType, VmcsWidth, u16){
         FromPrimitive::from_u32((field>>13) & 0x3).unwrap(), 
         ((field>>1) & 0x1ff) as u16
     )
+}
+
+impl VMCSRegion{
+    fn init(){
+
+    }
 }

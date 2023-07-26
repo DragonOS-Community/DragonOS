@@ -1,13 +1,9 @@
-use core::arch::x86_64;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use x86::{controlregs, msr};
 
 use crate::kdebug;
-use crate::filesystem::devfs::{DevFS, DeviceINode, devfs_register};
+use crate::filesystem::devfs::{devfs_register};
 pub use self::kvm_dev::LockedKvmInode;
-use crate::syscall::SystemError;
-use vcpu::{VcpuData, Vcpu};
+use vcpu::{Vcpu};
 use hypervisor::Hypervisor;
 
 
@@ -15,6 +11,7 @@ mod kvm_dev;
 mod vcpu;
 mod hypervisor;
 mod vmcs;
+mod vmx_asm_wrapper;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
 

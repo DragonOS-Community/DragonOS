@@ -44,7 +44,7 @@ pub extern "C" fn process_copy_sighand(clone_flags: u64, pcb: *mut process_contr
     // kdebug!("DEFAULT_SIGACTION.sa_flags={}", DEFAULT_SIGACTION.sa_flags);
 
     // 拷贝sigaction
-    let mut flags: u64 = 0;
+    let mut flags: usize = 0;
 
     spin_lock_irqsave(unsafe { &mut (*current_pcb().sighand).siglock }, &mut flags);
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -64,7 +64,7 @@ pub extern "C" fn process_copy_sighand(clone_flags: u64, pcb: *mut process_contr
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    spin_unlock_irqrestore(unsafe { &mut (*current_pcb().sighand).siglock }, &flags);
+    spin_unlock_irqrestore(unsafe { &mut (*current_pcb().sighand).siglock }, flags);
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
@@ -130,4 +130,40 @@ pub extern "C" fn process_exit_sighand(pcb: *mut process_control_block) {
         drop(sig);
         (*pcb).signal = 0 as *mut crate::include::bindings::bindings::signal_struct;
     }
+}
+
+/// 拷贝进程的地址空间
+///
+/// ## 参数
+///
+/// - `clone_vm`: 是否与父进程共享地址空间。true表示共享
+/// - `new_pcb`: 新进程的pcb
+///
+/// ## 返回值
+///
+/// - 成功：返回Ok(())
+/// - 失败：返回Err(SystemError)
+///
+/// ## Panic
+///
+/// - 如果当前进程没有用户地址空间，则panic
+pub fn copy_mm(clone_vm: bool, new_pcb: &mut process_control_block) -> Result<(), SystemError> {
+    // kdebug!("copy_mm, clone_vm: {}", clone_vm);
+    let old_address_space = current_pcb()
+        .address_space()
+        .expect("copy_mm: Failed to get address space of current process.");
+
+    if clone_vm {
+        unsafe { new_pcb.set_address_space(old_address_space) };
+        return Ok(());
+    }
+
+    let new_address_space = old_address_space.write().try_clone().unwrap_or_else(|e| {
+        panic!(
+            "copy_mm: Failed to clone address space of current process, current pid: [{}], new pid: [{}]. Error: {:?}",
+            current_pcb().pid, new_pcb.pid, e
+        )
+    });
+    unsafe { new_pcb.set_address_space(new_address_space) };
+    return Ok(());
 }

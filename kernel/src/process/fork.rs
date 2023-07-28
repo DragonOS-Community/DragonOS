@@ -101,7 +101,7 @@ pub extern "C" fn process_copy_signal(clone_flags: u64, pcb: *mut process_contro
     unsafe {
         (*pcb).sig_pending.signal = 0;
         (*pcb).sig_pending.sigqueue =
-            Box::leak(Box::new(SigQueue::default())) as *mut SigQueue as *mut c_void;
+            Box::leak(Box::new(SigQueue::new(None))) as *mut SigQueue as *mut c_void;
     }
     return 0;
 }

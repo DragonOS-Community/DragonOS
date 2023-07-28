@@ -247,7 +247,7 @@ fn __send_signal_locked(
         }
 
         let sq: &mut SigQueue = SigQueue::from_c_void(current_pcb().sig_pending.sigqueue);
-        sq.q.push(q);
+        sq.push(q);
         complete_signal(sig, pcb, pt);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -547,9 +547,7 @@ fn recalc_sigpending() {
 /// @param pending 信号的排队等待标志
 /// @return siginfo 信号的信息
 fn collect_signal(sig: SignalNumber, pending: &mut sigpending) -> siginfo {
-    let (info, still_pending) = unsafe { pending.queue.as_mut() }
-        .unwrap()
-        .find_and_delete(sig);
+    let (info, still_pending) = pending.queue.find_and_delete(sig);
 
     // 如果没有仍在等待的信号，则清除pending位
     if !still_pending {

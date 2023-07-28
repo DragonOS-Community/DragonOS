@@ -4,7 +4,6 @@
 pub enum IpiKind {
     KickCpu,
     FlushTLB,
-    StartUp,
 }
 
 /// IPI投递目标

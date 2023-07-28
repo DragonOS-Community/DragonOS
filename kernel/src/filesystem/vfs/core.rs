@@ -228,7 +228,7 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
     return Ok(0);
 }
 
-/// @breif 删除文件夹
+/// @brief 删除文件夹
 pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
     // 文件名过长
     if path.len() > PAGE_4K_SIZE as usize {

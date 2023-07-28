@@ -348,7 +348,6 @@ impl process_control_block {
     }
 }
 
-
 /// @brief 初始化pid=1的进程的stdio
 pub fn init_stdio() -> Result<(), SystemError> {
     if current_pcb().pid != 1 {

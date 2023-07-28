@@ -26,6 +26,7 @@ lazy_static! {
     /// TODO: 优化这里，自己实现SocketSet！！！现在这样的话，不管全局有多少个网卡，每个时间点都只会有1个进程能够访问socket
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     pub static ref SOCKET_WAITQUEUE: WaitQueue = WaitQueue::INIT;
+    /// 端口管理器
     pub static ref PORT_MANAGER: PortManager = PortManager::new();
 }
 
@@ -33,20 +34,20 @@ lazy_static! {
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    pub tcp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    tcp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
     // UDP 端口记录表
-    pub udp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    udp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
 }
 
 impl PortManager {
     pub fn new() -> Self {
-        Self { 
+        return Self {
             tcp_port_table: SpinLock::new(HashMap::new()),
             udp_port_table: SpinLock::new(HashMap::new()),
-        }
+        };
     }
 
-    /// @breif 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
+    /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
     pub fn get_ephemeral_port(&self, socket_type: SocketType) -> Result<u16, SystemError> {
         // TODO selects non-conflict high port
 
@@ -81,13 +82,18 @@ impl PortManager {
             }
             remaining -= 1;
         }
-        Err(SystemError::EADDRINUSE)
+        return Err(SystemError::EADDRINUSE);
     }
 
-    /// @breif 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
+    /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
     ///
     /// TODO: 增加支持端口复用的逻辑
-    pub fn get_port(&self, socket_type: SocketType, port: u16, handle: Arc<GlobalSocketHandle>) -> Result<(), SystemError> {
+    pub fn get_port(
+        &self,
+        socket_type: SocketType,
+        port: u16,
+        handle: Arc<GlobalSocketHandle>,
+    ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
                 SocketType::UdpSocket => self.udp_port_table.lock(),
@@ -100,10 +106,10 @@ impl PortManager {
             };
             drop(listen_table_guard);
         }
-        Ok(())
+        return Ok(());
     }
 
-    /// @breif 在对应的端口记录表中将端口和 socket 解绑
+    /// @brief 在对应的端口记录表中将端口和 socket 解绑
     pub fn unbind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
         let mut listen_table_guard = match socket_type {
             SocketType::UdpSocket => self.udp_port_table.lock(),
@@ -112,7 +118,7 @@ impl PortManager {
         };
         listen_table_guard.remove(&port);
         drop(listen_table_guard);
-        Ok(())
+        return Ok(());
     }
 }
 
@@ -127,8 +133,8 @@ pub const SOL_SOCKET: u8 = 1;
 pub struct GlobalSocketHandle(SocketHandle);
 
 impl GlobalSocketHandle {
-    pub fn new(handle: SocketHandle) -> Self {
-        Self(handle)
+    pub fn new(handle: SocketHandle) -> Arc<Self> {
+        return Arc::new(Self(handle));
     }
 }
 
@@ -194,11 +200,11 @@ impl SocketMetadata {
     fn new(
         socket_type: SocketType,
         send_buf_size: usize,
-        recv_buf_size: usize, 
+        recv_buf_size: usize,
         metadata_buf_size: usize,
         options: SocketOptions,
     ) -> Self {
-        Self { 
+        Self {
             socket_type,
             send_buf_size,
             recv_buf_size,
@@ -254,7 +260,8 @@ impl RawSocket {
         );
 
         // 把socket添加到socket集合中，并得到socket的句柄
-        let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
+        let handle: Arc<GlobalSocketHandle> =
+            GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
 
         let metadata = SocketMetadata::new(
             SocketType::RawSocket,
@@ -430,7 +437,8 @@ impl UdpSocket {
         let socket = udp::Socket::new(tx_buffer, rx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
-        let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
+        let handle: Arc<GlobalSocketHandle> =
+            GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
 
         let metadata = SocketMetadata::new(
             SocketType::UdpSocket,
@@ -651,7 +659,8 @@ impl TcpSocket {
         let socket = tcp::Socket::new(tx_buffer, rx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
-        let handle: Arc<GlobalSocketHandle> = Arc::new(GlobalSocketHandle::new(SOCKET_SET.lock().add(socket)));
+        let handle: Arc<GlobalSocketHandle> =
+            GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
 
         let metadata = SocketMetadata::new(
             SocketType::TcpSocket,
@@ -919,7 +928,7 @@ impl Socket for TcpSocket {
 
                     // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
                     // 因此需要再为当前的socket分配一个新的handle
-                    let new_handle = Arc::new(GlobalSocketHandle::new(sockets.add(tcp_socket)));
+                    let new_handle = GlobalSocketHandle::new(sockets.add(tcp_socket));
                     let old_handle = ::core::mem::replace(&mut self.handle, new_handle);
 
                     let metadata = SocketMetadata {

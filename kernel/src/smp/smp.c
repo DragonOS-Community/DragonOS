@@ -50,7 +50,7 @@ void smp_init()
     io_mfence();
 
     io_mfence();
-    rs_ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, 0x00);
+    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, 0x00);
 
     kdebug("total_processor_num=%d", total_processor_num);
     // 注册接收kick_cpu功能的处理函数。（向量号200）
@@ -115,10 +115,10 @@ void smp_init()
         io_mfence();
 
         // 连续发送两次start-up IPI
-        rs_ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
                      proc_local_apic_structs[i]->local_apic_id);
         io_mfence();
-        rs_ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
+        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
                      proc_local_apic_structs[i]->local_apic_id);
     }
     io_mfence();

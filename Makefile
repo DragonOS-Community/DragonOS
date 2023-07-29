@@ -61,14 +61,24 @@ clean:
 		cd .. ;\
 	done
 
+.PHONY: ECHO
+ECHO:
+	@echo "$@"
+
 cppcheck-xml: 
 	cppcheck kernel user --platform=unix64 --std=c11 -I user/libs/ -I=kernel/ --force -j $(NPROCS) --xml 2> cppcheck.xml
 
 cppcheck:
 	cppcheck kernel user --platform=unix64 --std=c11 -I user/libs/ -I=kernel/ --force -j $(NPROCS)
 
+docs: ECHO
+	bash -c "cd docs && make html && cd .."
+
+clean-docs:
+	bash -c "cd docs && make clean && cd .."
+
 gdb:
-	gdb -n -x tools/.gdbinit
+	rust-gdb -n -x tools/.gdbinit
 
 # 写入磁盘镜像
 write_diskimage:

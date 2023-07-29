@@ -32,6 +32,9 @@ void print_copyright()
     printf(" If you find any problems during use, please visit:\n");
     put_string("    https://bbs.DragonOS.org\n", COLOR_ORANGE, COLOR_BLACK);
     printf("\n");
+    printf(" Join our development community:\n");
+    put_string("    https://DragonOS.zulipchat.com\n", COLOR_ORANGE, COLOR_BLACK);
+    printf("\n");
 }
 
 int main()

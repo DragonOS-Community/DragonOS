@@ -196,11 +196,11 @@ void mm_init()
     memory_management_struct.zones_struct_len = (memory_management_struct.count_zones * sizeof(struct Zone) + sizeof(ul) - 1) & (~(sizeof(ul) - 1));
 
     ZONE_DMA_INDEX = 0;
-    ZONE_NORMAL_INDEX = memory_management_struct.count_zones;
+    ZONE_NORMAL_INDEX = memory_management_struct.count_zones ;
     ZONE_UNMAPPED_INDEX = 0;
 
-    // kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
-    //   设置内存页管理结构的地址，预留了一段空间，防止内存越界。
+    //kdebug("ZONE_DMA_INDEX=%d\tZONE_NORMAL_INDEX=%d\tZONE_UNMAPPED_INDEX=%d", ZONE_DMA_INDEX, ZONE_NORMAL_INDEX, ZONE_UNMAPPED_INDEX);
+    //  设置内存页管理结构的地址，预留了一段空间，防止内存越界。
     memory_management_struct.end_of_struct = (ul)((ul)memory_management_struct.zones_struct + memory_management_struct.zones_struct_len + sizeof(long) * 32) & (~(sizeof(long) - 1));
 
     // 初始化内存管理单元结构所占的物理页的结构体
@@ -249,6 +249,8 @@ void mm_init()
     initial_mm.stack_start = _stack_start;
     initial_mm.vmas = NULL;
 
+    
+    
     mmio_init();
 }
 
@@ -323,8 +325,6 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
 
     for (int i = zone_start; i < zone_end; ++i)
     {
-        
-        
         if ((memory_management_struct.zones_struct + i)->count_pages_free < num)
             continue;
 
@@ -336,8 +336,6 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
         ul tmp = 64 - page_start % 64;
         for (ul j = page_start; j < page_end; j += ((j % 64) ? tmp : 64))
         {
-            // kdebug("jjjjjjjjjjjjj");
-
             // 按照bmp中的每一个元素进行查找
             // 先将p定位到bmp的起始元素
             ul *p = memory_management_struct.bmp + (j >> 6);
@@ -346,10 +344,9 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
             ul tmp_num = ((1UL << num) - 1);
             for (ul k = shift; k < 64; ++k)
             {
-                // kdebug("kkkkkkkkkkkkkkk");
-
                 // 寻找连续num个空页
                 if (!((k ? ((*p >> k) | (*(p + 1) << (64 - k))) : *p) & tmp_num))
+
                 {
                     ul start_page_num = j + k - shift; // 计算得到要开始获取的内存页的页号
                     for (ul l = 0; l < num; ++l)
@@ -370,7 +367,7 @@ struct Page *alloc_pages(unsigned int zone_select, int num, ul flags)
             }
         }
     }
-    kBUG("Cannot alloc page, ZONE=%d \tnums=%d, mm_total_2M_pages=%d", zone_select, num, mm_total_2M_pages);
+    kBUG("Cannot alloc page, ZONE=%d\tnums=%d, mm_total_2M_pages=%d", zone_select, num, mm_total_2M_pages);
     return NULL;
 }
 
@@ -473,12 +470,10 @@ void free_pages(struct Page *page, int number)
 void page_table_init()
 {
     kinfo("Re-Initializing page table...");
-    scm_disable_put_to_window();
     ul *global_CR3 = get_CR3();
 
     int js = 0;
     ul *tmp_addr;
-
     for (int i = 0; i < memory_management_struct.count_zones; ++i)
     {
         struct Zone *z = memory_management_struct.zones_struct + i;
@@ -496,8 +491,9 @@ void page_table_init()
         }
     }
 
+    
     barrier();
-    // ========= 在IDLE进程的顶层页表中添加对内核地址空间的映射 =====================
+        // ========= 在IDLE进程的顶层页表中添加对内核地址空间的映射 =====================
 
     // 由于IDLE进程的顶层页表的高地址部分会被后续进程所复制，为了使所有进程能够共享相同的内核空间，
     //  因此需要先在IDLE进程的顶层页表内映射二级页表
@@ -519,8 +515,7 @@ void page_table_init()
     }
     barrier();
     flush_tlb();
-    // kinfo("Page table Initialized. Affects:%d", js);
-    // c_uart_send_str(COM1, "\nscm_enable_double\n\0".as_ptr());
+    kinfo("Page table Initialized. Affects:%d", js);
 }
 
 /**

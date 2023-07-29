@@ -346,3 +346,59 @@
 //     c_uart_send_str(COM1, "text ui initialized\n");
 //     return 0;
 // }
+
+
+// void enable_textui()
+// {
+
+//     return textui_putchar_window(__private_info.default_window, character, FRcolor, BKcolor);
+// }
+
+// void disable_textui()
+// {
+//     spin_init(&change_lock);
+
+//     spin_init(&__window_id_lock);
+//     __window_max_id = 0;
+//     list_init(&__windows_list);
+//     memset(&textui_framework, 0, sizeof(struct scm_ui_framework_t));
+//     memset(&__private_info, 0, sizeof(struct textui_private_info_t));
+
+//     io_mfence();
+//     char name[] = "textUI";
+//     strcpy(textui_framework.name, name);
+
+//     textui_framework.ui_ops = &textui_ops;
+//     textui_framework.type = 0;
+
+//     // 注册框架到屏幕管理器
+//     int retval = scm_register(&textui_framework);
+//     if (retval != 0)
+//     {
+//         c_uart_send_str(COM1, "text ui init failed\n");
+//         while (1)
+//             pause();
+//     }
+
+//     uint16_t chars_per_vline = textui_framework.buf->width / TEXTUI_CHAR_WIDTH;
+//     uint16_t total_vlines = textui_framework.buf->height / TEXTUI_CHAR_HEIGHT;
+//     int cnt = chars_per_vline * total_vlines;
+
+//     struct textui_vline_chromatic_t *vl_ptr = __initial_vlines;
+//     struct textui_char_chromatic_t *ch_ptr = __initial_chars;
+
+//     // 初始化虚拟行
+//     for (int i = 0; i < total_vlines; ++i)
+//     {
+//         __textui_init_vline((vl_ptr + i), (ch_ptr + i * chars_per_vline));
+//     }
+
+//     // 初始化窗口 
+//     __textui_init_window((&__initial_window), TEXTUI_WF_CHROMATIC, total_vlines, __initial_vlines, chars_per_vline);
+//     __private_info.current_window = &__initial_window;
+//     __private_info.default_window = &__initial_window;
+//     __private_info.actual_line = textui_framework.buf->height / TEXTUI_CHAR_HEIGHT;
+
+//     c_uart_send_str(COM1, "text ui initialized\n");
+//     return 0;
+// }

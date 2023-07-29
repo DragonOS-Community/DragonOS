@@ -70,7 +70,8 @@ pid_t fork(void)
  *
  * @return int 如果失败返回负数
  */
-int pipe(int fd[2]){
+int pipe(int fd[2])
+{
     return (int)syscall_invoke(SYS_PIPE, fd, 0, 0, 0, 0, 0, 0, 0);
 }
 /**
@@ -95,7 +96,8 @@ pid_t vfork(void)
 uint64_t brk(uint64_t end_brk)
 {
     uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0, 0, 0);
-    if (x < end_brk){
+    if (x < end_brk)
+    {
         errno = -ENOMEM;
         return -1;
     }

@@ -21,10 +21,21 @@ char *shell_current_path = NULL;
  *
  */
 struct built_in_cmd_t shell_cmds[] = {
-    {"cd", shell_cmd_cd},         {"cat", shell_cmd_cat},     {"exec", shell_cmd_exec},   {"ls", shell_cmd_ls},
-    {"mkdir", shell_cmd_mkdir},   {"pwd", shell_cmd_pwd},     {"rm", shell_cmd_rm},       {"rmdir", shell_cmd_rmdir},
-    {"reboot", shell_cmd_reboot}, {"touch", shell_cmd_touch}, {"about", shell_cmd_about}, {"free", shell_cmd_free},
-    {"help", shell_help},         {"pipe", shell_pipe_test},  {"kill", shell_cmd_kill},
+    {"cd", shell_cmd_cd},
+    {"cat", shell_cmd_cat},
+    {"exec", shell_cmd_exec},
+    {"ls", shell_cmd_ls},
+    {"mkdir", shell_cmd_mkdir},
+    {"pwd", shell_cmd_pwd},
+    {"rm", shell_cmd_rm},
+    {"rmdir", shell_cmd_rmdir},
+    {"reboot", shell_cmd_reboot},
+    {"touch", shell_cmd_touch},
+    {"about", shell_cmd_about},
+    {"free", shell_cmd_free},
+    {"help", shell_help},
+    {"pipe", shell_pipe_test},
+    {"kill", shell_cmd_kill},
 
 };
 // 总共的内建命令数量
@@ -614,7 +625,7 @@ int parse_command(char *buf, int *argc, char ***argv)
     while (index < INPUT_BUFFER_SIZE && buf[index] == ' ')
         ++index;
     // 如果去除前导空格后第一项为0x00，则归为空命令
-    if(!buf[index])
+    if (!buf[index])
         return -1;
 
     // 计算参数数量
@@ -626,12 +637,12 @@ int parse_command(char *buf, int *argc, char ***argv)
         if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
             ++(*argc);
     }
-    
+
     // printf("\nargc=%d\n", *argc);
 
     // 为指向每个指令的指针分配空间
-    *argv = (char **)malloc(sizeof(char **) * (*argc));
-    memset(*argv, 0, sizeof(char **) * (*argc));
+    *argv = (char **)malloc(sizeof(char **) * (*argc + 1));
+    memset(*argv, 0, sizeof(char **) * (*argc + 1));
     // 将每个命令都单独提取出来
     for (int i = 0; i < *argc && index < INPUT_BUFFER_SIZE; ++i)
     {

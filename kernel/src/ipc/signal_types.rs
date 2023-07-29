@@ -111,6 +111,17 @@ pub struct sigaction {
     pub sa_restorer: __sigrestorer_t,
 }
 
+impl PartialEq for sigaction {
+    fn eq(&self, other: &Self) -> bool {
+        unsafe {
+            self._u._sa_handler == other._u._sa_handler
+                && self.sa_flags == other.sa_flags
+                && self.sa_mask == other.sa_mask
+                && self.sa_restorer == other.sa_restorer
+        }
+    }
+}
+
 impl Default for sigaction {
     fn default() -> Self {
         Self {

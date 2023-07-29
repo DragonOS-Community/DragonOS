@@ -4,20 +4,19 @@ use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     format,
-    string::{String, ToString},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
 
 use crate::{
-    arch::asm::current::current_pcb,
     filesystem::vfs::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
     },
-    include::bindings::bindings::{pid_t, process_find_pcb_by_pid},
     kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
+    process::{Pid, ProcessManager},
     syscall::SystemError,
     time::TimeSpec,
 };
@@ -52,7 +51,7 @@ impl From<u8> for ProcFileType {
 #[derive(Debug)]
 pub struct InodeInfo {
     ///进程的pid
-    pid: i64,
+    pid: Pid,
     ///文件类型
     ftype: ProcFileType,
     //其他需要传入的信息在此定义
@@ -116,11 +115,11 @@ impl ProcFSInode {
     ///
     fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 获取该pid对应的pcb结构体
-        let pid: &i64 = &self.fdata.pid;
-        let pcb = unsafe { process_find_pcb_by_pid(*pid).as_mut() };
+        let pid = self.fdata.pid;
+        let pcb = ProcessManager::find(pid);
         let pcb = if pcb.is_none() {
             kerror!(
-                "ProcFS: Cannot find pcb for pid {} when opening its 'status' file.",
+                "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
                 pid
             );
             return Err(SystemError::ESRCH);
@@ -129,47 +128,50 @@ impl ProcFSInode {
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
-        // ！！！！！由于目前有bug，不能获取到pcb的name，因此暂时用'Unknown'代替
-        let tmp_name: Vec<u8> = "Unknown".as_bytes().to_vec();
-        // kdebug!("pcb.name={:?}", pcb.name);
-        // let mut tmp_name: Vec<u8> = Vec::with_capacity(pcb.name.len());
-        // for val in pcb.name.iter() {
-        //     tmp_name.push(*val as u8);
-        // }
 
         pdata.append(
-            &mut format!(
-                "Name:\t{}",
-                String::from_utf8(tmp_name).unwrap_or("NULL".to_string())
-            )
-            .as_bytes()
-            .to_owned(),
-        );
-        pdata.append(&mut format!("\nstate:\t{}", pcb.state).as_bytes().to_owned());
-        pdata.append(&mut format!("\npid:\t{}", pcb.pid).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\nPpid:\t{}", unsafe { *pcb.parent_pcb }.pid)
-                .as_bytes()
-                .to_owned(),
-        );
-        pdata.append(&mut format!("\ncpu_id:\t{}", pcb.cpu_id).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npriority:\t{}", pcb.priority)
-                .as_bytes()
-                .to_owned(),
-        );
-        pdata.append(
-            &mut format!("\npreempt:\t{}", pcb.preempt_count)
-                .as_bytes()
-                .to_owned(),
-        );
-        pdata.append(
-            &mut format!("\nvrtime:\t{}", pcb.virtual_runtime)
+            &mut format!("Name:\t{}", pcb.basic().name())
                 .as_bytes()
                 .to_owned(),
         );
 
-        let binding = current_pcb().address_space().unwrap();
+        let sched_info_guard = pcb.sched_info();
+        let state = sched_info_guard.state();
+        let cpu_id = sched_info_guard
+            .on_cpu()
+            .map(|cpu| cpu as i32)
+            .unwrap_or(-1);
+
+        let priority = sched_info_guard.priority();
+        let vrtime = sched_info_guard.virtual_runtime();
+
+        drop(sched_info_guard);
+
+        pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\nPid:\t{}", pcb.basic().pid().into())
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\nPpid:\t{}", pcb.basic().ppid().into())
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\npriority:\t{}", priority.data())
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\npreempt:\t{}", pcb.preempt_count())
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
+
+        let binding = pcb.basic().user_vm().unwrap();
         let address_space_guard = binding.read();
         // todo: 当前进程运行过程中占用内存的峰值
         let hiwater_vm: u64 = 0;
@@ -260,7 +262,7 @@ impl ProcFS {
                 },
                 fs: Weak::default(),
                 fdata: InodeInfo {
-                    pid: 0,
+                    pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
             })));
@@ -280,7 +282,7 @@ impl ProcFS {
 
     /// @brief 进程注册函数
     /// @usage 在进程中调用并创建进程对应文件
-    pub fn register_pid(&self, pid: i64) -> Result<(), SystemError> {
+    pub fn register_pid(&self, pid: Pid) -> Result<(), SystemError> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
@@ -302,11 +304,11 @@ impl ProcFS {
 
     /// @brief 解除进程注册
     ///
-    pub fn unregister_pid(&self, pid: i64) -> Result<(), SystemError> {
+    pub fn unregister_pid(&self, pid: Pid) -> Result<(), SystemError> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
-        let pid_dir: Arc<dyn IndexNode> = proc.find(&format!("{}", pid))?;
+        let pid_dir: Arc<dyn IndexNode> = proc.find(&pid.to_string())?;
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
 
@@ -314,7 +316,7 @@ impl ProcFS {
         // let pf= pid_dir.find("status").expect("Cannot find status");
 
         // 删除进程文件夹
-        proc.unlink(&format!("{}", pid))?;
+        proc.unlink(&pid.to_string())?;
 
         return Ok(());
     }
@@ -511,7 +513,7 @@ impl IndexNode for LockedProcFSInode {
                 },
                 fs: inode.fs.clone(),
                 fdata: InodeInfo {
-                    pid: 0,
+                    pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
             })));
@@ -654,18 +656,8 @@ impl IndexNode for LockedProcFSInode {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn rs_procfs_register_pid(pid: pid_t) -> u64 {
-    let r = procfs_register_pid(pid);
-    if r.is_ok() {
-        return 0;
-    } else {
-        return r.unwrap_err() as u64;
-    }
-}
-
 /// @brief 向procfs注册进程
-pub fn procfs_register_pid(pid: pid_t) -> Result<(), SystemError> {
+pub fn procfs_register_pid(pid: Pid) -> Result<(), SystemError> {
     let procfs_inode = ROOT_INODE().find("proc")?;
 
     let procfs_inode = procfs_inode
@@ -680,18 +672,8 @@ pub fn procfs_register_pid(pid: pid_t) -> Result<(), SystemError> {
     return Ok(());
 }
 
-#[no_mangle]
-pub extern "C" fn rs_procfs_unregister_pid(pid: pid_t) -> u64 {
-    let r = procfs_unregister_pid(pid);
-    if r.is_ok() {
-        return 0;
-    } else {
-        return r.unwrap_err() as u64;
-    }
-}
-
 /// @brief 在ProcFS中,解除进程的注册
-pub fn procfs_unregister_pid(pid: pid_t) -> Result<(), SystemError> {
+pub fn procfs_unregister_pid(pid: Pid) -> Result<(), SystemError> {
     // 获取procfs实例
     let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE().find("proc")?;
 

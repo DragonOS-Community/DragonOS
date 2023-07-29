@@ -1,22 +1,38 @@
 use core::{
+    hash::{Hash, Hasher},
     intrinsics::unlikely,
     mem::ManuallyDrop,
     ptr::null_mut,
-    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
 };
 
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+};
+use hashbrown::HashMap;
 
 use crate::{
     arch::{asm::current::current_pcb, fpu::FpState, process::ArchPCBInfo},
-    filesystem::vfs::file::FileDescriptorVec,
+    filesystem::vfs::{
+        file::{File, FileDescriptorVec},
+        FileType,
+    },
     ipc::signal_types::{sighand_struct, signal_struct, sigpending, sigset_t, SignalNumber},
     kdebug,
-    libs::{align::AlignedBox, rwlock::{RwLock, RwLockReadGuard}, spinlock::{SpinLock, SpinLockGuard}},
-    mm::{
-        set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, INITIAL_PROCESS_ADDRESS_SPACE,
+    libs::{
+        align::AlignedBox,
+        casting::DowncastArc,
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        spinlock::{SpinLock, SpinLockGuard},
     },
-    sched::SchedPolicy,
+    mm::{
+        set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr,
+        INITIAL_PROCESS_ADDRESS_SPACE,
+    },
+    net::socket::SocketInode,
+    sched::{SchedPolicy, SchedPriority},
     syscall::SystemError,
 };
 
@@ -32,7 +48,79 @@ pub mod preempt;
 pub mod process;
 pub mod syscall;
 
+/// 系统中所有进程的pcb
+static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
+
+#[derive(Debug)]
+pub struct ProcessManager;
+
+impl ProcessManager {
+    fn init() {
+        static INIT_FLAG: AtomicBool = AtomicBool::new(false);
+        if INIT_FLAG
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            ALL_PROCESS.lock().replace(HashMap::new());
+        } else {
+            panic!("ProcessManager has been initialized!");
+        }
+    }
+
+    /// 获取当前进程的pcb
+    pub fn current_pcb() -> Arc<ProcessControlBlock> {
+        return ProcessControlBlock::arch_current_pcb();
+    }
+
+    /// 根据pid获取进程的pcb
+    ///
+    /// ## 参数
+    ///
+    /// - `pid` : 进程的pid
+    ///
+    /// ## 返回值
+    ///
+    /// 如果找到了对应的进程，那么返回该进程的pcb，否则返回None
+    pub fn find(pid: Pid) -> Option<Arc<ProcessControlBlock>> {
+        return ALL_PROCESS.lock().as_ref()?.get(&pid).cloned();
+    }
+
+    /// 向系统中添加一个进程的pcb
+    ///
+    /// ## 参数
+    ///
+    /// - `pcb` : 进程的pcb
+    ///
+    /// ## 返回值
+    ///
+    /// 无
+    pub fn add_pcb(pcb: Arc<ProcessControlBlock>) {
+        ALL_PROCESS
+            .lock()
+            .as_mut()
+            .unwrap()
+            .insert(pcb.basic().pid(), pcb.clone());
+    }
+
+    /// 唤醒一个进程
+    pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        todo!()
+    }
+}
+
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
+
+impl Hash for Pid {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl Pid {
+    pub fn to_string(&self) -> String {
+        self.0.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
@@ -80,9 +168,6 @@ pub struct ProcessControlBlock {
     flags: SpinLock<ProcessFlags>,
     signal: RwLock<ProcessSignalInfo>,
 
-    /// 浮点寄存器的状态
-    fp_state: SpinLock<Option<FpState>>,
-
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
 
@@ -93,21 +178,29 @@ pub struct ProcessControlBlock {
 }
 
 impl ProcessControlBlock {
+    /// Generate a new pcb.
+    ///
+    /// ## 参数
+    ///
+    /// - `name` : 进程的名字
+    /// - `kstack` : 进程的内核栈
+    ///
+    /// ## 返回值
+    ///
+    /// 返回一个新的pcb
     pub fn new(name: String, kstack: KernelStack) -> Arc<Self> {
         let basic_info = ProcessBasicInfo::new(Self::generate_pid(), Pid(0), Pid(0), name, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
         let signal = ProcessSignalInfo::new();
-        let fp_state = SpinLock::new(None);
         let sched_info = ProcessSchedulerInfo::new(None);
-        let arch_info = SpinLock::new(ArchPCBInfo::new());
+        let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
 
         let pcb = Self {
             basic: basic_info,
             preempt_count,
             flags,
             signal,
-            fp_state,
             kernel_stack: RwLock::new(kstack),
             sched_info,
             arch_info,
@@ -120,11 +213,6 @@ impl ProcessControlBlock {
         return pcb;
     }
 
-    /// 获取当前进程的pcb
-    pub fn current_pcb() -> Arc<Self>{
-        return Self::arch_current_pcb();
-    }
-
     /// 生成一个新的pid
     fn generate_pid() -> Pid {
         static NEXT_PID: AtomicPid = AtomicPid::new(Pid(1));
@@ -135,7 +223,7 @@ impl ProcessControlBlock {
     pub fn preempt_count(&self) -> usize {
         return self.preempt_count.load(Ordering::SeqCst);
     }
-    
+
     /// 增加当前进程的锁持有计数
     pub fn preempt_disable(&self) {
         self.preempt_count.fetch_add(1, Ordering::SeqCst);
@@ -146,19 +234,80 @@ impl ProcessControlBlock {
         self.preempt_count.fetch_sub(1, Ordering::SeqCst);
     }
 
-    pub fn flags(&self) -> SpinLockGuard<ProcessFlags>{
+    pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {
         return self.flags.lock();
     }
 
-    pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo>{
+    pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
         return self.basic.read();
     }
 
     pub fn set_name(&self, name: String) {
         self.basic.write().set_name(name);
     }
-    
 
+    pub fn basic_mut(&self) -> RwLockWriteGuard<ProcessBasicInfo> {
+        return self.basic.write();
+    }
+
+    pub fn signal(&self) -> RwLockReadGuard<ProcessSignalInfo> {
+        return self.signal.read();
+    }
+
+    pub fn signal_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
+        return self.signal.write();
+    }
+
+    pub fn arch_info(&self) -> SpinLockGuard<ArchPCBInfo> {
+        return self.arch_info.lock();
+    }
+
+    pub fn kernel_stack(&self) -> RwLockReadGuard<KernelStack> {
+        return self.kernel_stack.read();
+    }
+
+    pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<KernelStack> {
+        return self.kernel_stack.write();
+    }
+
+    pub fn sched_info(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
+        return self.sched_info.read();
+    }
+
+    pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
+        return self.sched_info.write();
+    }
+
+    /// 获取文件描述符表的Arc指针
+    #[inline(always)]
+    pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
+        return self.basic.read().fd_table().unwrap();
+    }
+
+    /// 根据文件描述符序号，获取socket对象的Arc指针
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    ///
+    /// ## 返回值
+    ///
+    /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
+    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let f = fd_table_guard.get_file_ref_by_fd(fd)?;
+
+        if f.file_type() != FileType::Socket {
+            return None;
+        }
+        let socket: Arc<SocketInode> = f
+            .inode()
+            .downcast_arc::<SocketInode>()
+            .expect("Not a socket inode");
+        return Some(socket);
+    }
 }
 
 /// 进程的基本信息
@@ -190,13 +339,14 @@ impl ProcessBasicInfo {
         name: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
+        let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
             pid,
             pgid,
             ppid,
             name,
             user_vm,
-            fd_table: None,
+            fd_table: Some(fd_table),
         });
     }
 
@@ -249,6 +399,8 @@ pub struct ProcessSchedulerInfo {
     state: ProcessState,
     /// 进程的调度策略
     sched_policy: SchedPolicy,
+    /// 进程的调度优先级
+    priority: SchedPriority,
     /// 当前进程的虚拟运行时间
     virtual_runtime: isize,
     /// 由实时调度器管理的时间片
@@ -264,6 +416,7 @@ impl ProcessSchedulerInfo {
             sched_policy: SchedPolicy::CFS,
             virtual_runtime: 0,
             rt_time_slice: 0,
+            priority: SchedPriority::new(100).unwrap(),
         });
     }
 
@@ -289,6 +442,22 @@ impl ProcessSchedulerInfo {
 
     fn set_state(&mut self, state: ProcessState) {
         self.state = state;
+    }
+
+    pub fn policy(&self) -> SchedPolicy {
+        return self.sched_policy;
+    }
+
+    pub fn virtual_runtime(&self) -> isize {
+        return self.virtual_runtime;
+    }
+
+    pub fn rt_time_slice(&self) -> isize {
+        return self.rt_time_slice;
+    }
+
+    pub fn priority(&self) -> SchedPriority {
+        return self.priority;
     }
 }
 
@@ -331,8 +500,13 @@ impl KernelStack {
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)
-    pub fn start_address(&self) -> usize {
-        self.stack.as_ptr() as usize
+    pub fn start_address(&self) -> VirtAddr {
+        return VirtAddr::new(self.stack.as_ptr() as usize);
+    }
+
+    /// 返回内核栈的结束虚拟地址(高地址)(不包含该地址)
+    pub fn stack_max_address(&self) -> VirtAddr {
+        return VirtAddr::new(self.stack.as_ptr() as usize + Self::SIZE);
     }
 
     pub unsafe fn set_pcb(&mut self, pcb: Arc<ProcessControlBlock>) -> Result<(), SystemError> {
@@ -376,6 +550,8 @@ impl Drop for KernelStack {
 }
 
 pub fn process_init() {
+    ProcessManager::init();
+
     unsafe {
         compiler_fence(Ordering::SeqCst);
         current_pcb().address_space = null_mut();

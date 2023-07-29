@@ -39,6 +39,11 @@ macro_rules! int_like {
             pub const fn from(x: $backing_type) -> Self {
                 $new_type_name(x)
             }
+
+            #[allow(dead_code)]
+            pub const fn new(x: $backing_type) -> Self {
+                Self::from(x)
+            }
         }
     };
 

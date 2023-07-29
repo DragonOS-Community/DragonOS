@@ -6,6 +6,7 @@ use crate::{
     include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
     io::SeekFrom,
     kerror,
+    process::ProcessManager,
     syscall::{Syscall, SystemError},
 };
 
@@ -82,7 +83,11 @@ impl Syscall {
         }
 
         // 把文件对象存入pcb
-        return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+        return ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(file, None)
+            .map(|fd| fd as usize);
     }
 
     /// @brief 关闭文件
@@ -91,7 +96,10 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn close(fd: usize) -> Result<usize, SystemError> {
-        return current_pcb().drop_fd(fd as i32).map(|_| 0);
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+
+        return fd_table_guard.drop_fd(fd as i32).map(|_| 0);
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -102,7 +110,10 @@ impl Syscall {
     /// @return Ok(usize) 成功读取的数据的字节数
     /// @return Err(SystemError) 读取失败，返回posix错误码
     pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+
+        let file: Option<&mut File> = fd_table_guard.get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
         }
@@ -119,7 +130,10 @@ impl Syscall {
     /// @return Ok(usize) 成功写入的数据的字节数
     /// @return Err(SystemError) 写入失败，返回posix错误码
     pub fn write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
-        let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+
+        let file: Option<&mut File> = fd_table_guard.get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
         }
@@ -136,7 +150,9 @@ impl Syscall {
     /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
     /// @return Err(SystemError) 调整失败，返回posix错误码
     pub fn lseek(fd: i32, seek: SeekFrom) -> Result<usize, SystemError> {
-        let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+        let file: Option<&mut File> = fd_table_guard.get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
         }
@@ -209,7 +225,9 @@ impl Syscall {
         }
 
         // 获取fd
-        let file: &mut File = match current_pcb().get_file_mut_by_fd(fd) {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+        let file: &mut File = match fd_table_guard.get_file_mut_by_fd(fd) {
             None => {
                 return Err(SystemError::EBADF);
             }
@@ -270,25 +288,17 @@ impl Syscall {
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
     pub fn dup(oldfd: i32) -> Result<usize, SystemError> {
-        if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
-            // 获得当前文件描述符数组
-            // 确认oldfd是否有效
-            if FileDescriptorVec::validate_fd(oldfd) {
-                if let Some(file) = &fds.fds[oldfd as usize] {
-                    // 尝试获取对应的文件结构体
-                    let file_cp: Box<File> = file.try_clone().ok_or(SystemError::EBADF)?;
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
 
-                    // 申请文件描述符，并把文件对象存入其中
-                    let res = current_pcb().alloc_fd(*file_cp, None).map(|x| x as usize);
-                    return res;
-                }
-                // oldfd对应的文件不存在
-                return Err(SystemError::EBADF);
-            }
-            return Err(SystemError::EBADF);
-        } else {
-            return Err(SystemError::EMFILE);
-        }
+        let old_file = fd_table_guard
+            .get_file_ref_by_fd(oldfd)
+            .ok_or(SystemError::EBADF)?;
+
+        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
+        // 申请文件描述符，并把文件对象存入其中
+        let res = fd_table_guard.alloc_fd(new_file, None).map(|x| x as usize);
+        return res;
     }
 
     /// 根据提供的文件描述符的fd，和指定新fd，复制对应的文件结构体，
@@ -305,43 +315,36 @@ impl Syscall {
     /// - 成功：新文件描述符
     /// - 失败：错误码
     pub fn dup2(oldfd: i32, newfd: i32) -> Result<usize, SystemError> {
-        if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
-            // 获得当前文件描述符数组
-            if FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd) {
-                //确认oldfd, newid是否有效
-                if oldfd == newfd {
-                    // 若oldfd与newfd相等
-                    return Ok(newfd as usize);
-                }
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
 
-                if let Some(file) = &fds.fds[oldfd as usize] {
-                    if fds.fds[newfd as usize].is_some() {
-                        // close newfd
-                        if let Err(_) = current_pcb().drop_fd(newfd) {
-                            // An I/O error occurred while attempting to close fildes2.
-                            return Err(SystemError::EIO);
-                        }
-                    }
+        // 确认oldfd, newid是否有效
+        if !(FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd)) {
+            return Err(SystemError::EBADF);
+        }
 
-                    // 尝试获取对应的文件结构体
-                    let file_cp = file.try_clone();
-                    if file_cp.is_none() {
-                        return Err(SystemError::EBADF);
-                    }
-                    // 申请文件描述符，并把文件对象存入其中
-                    let res = current_pcb()
-                        .alloc_fd(*file_cp.unwrap(), Some(newfd))
-                        .map(|x| x as usize);
-
-                    return res;
-                }
-                return Err(SystemError::EBADF);
-            } else {
-                return Err(SystemError::EBADF);
+        if oldfd == newfd {
+            // 若oldfd与newfd相等
+            return Ok(newfd as usize);
+        }
+        let new_exists = fd_table_guard.get_file_ref_by_fd(newfd).is_some();
+        if new_exists {
+            // close newfd
+            if let Err(_) = fd_table_guard.drop_fd(newfd) {
+                // An I/O error occurred while attempting to close fildes2.
+                return Err(SystemError::EIO);
             }
         }
-        // 从pcb获取文件描述符数组失败
-        return Err(SystemError::EMFILE);
+
+        let old_file = fd_table_guard
+            .get_file_ref_by_fd(oldfd)
+            .ok_or(SystemError::EBADF)?;
+        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
+        // 申请文件描述符，并把文件对象存入其中
+        let res = fd_table_guard
+            .alloc_fd(new_file, Some(newfd))
+            .map(|x| x as usize);
+        return res;
     }
 }
 

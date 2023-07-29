@@ -34,16 +34,10 @@ void init_frame_buffer()
 {
     kinfo("Re-mapping VBE frame buffer...");
 
-    uint64_t global_CR3 = (uint64_t)get_CR3();
-
-    struct multiboot_tag_framebuffer_info_t info;
-    int reserved;
-
     video_frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
-    mm_map_proc_page_table(global_CR3, true, video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr,
-                           video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true, false);
 
-    flush_tlb();
+    rs_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
+
     kinfo("VBE frame buffer successfully Re-mapped!");
 }
 
@@ -119,7 +113,6 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
         // 启用屏幕刷新软中断
         rs_register_softirq_video();
         rs_raise_softirq(VIDEO_REFRESH_SIRQ);
-
     }
     return 0;
 }
@@ -189,8 +182,10 @@ int video_init()
         video_frame_buffer_info.width * video_frame_buffer_info.height * ((video_frame_buffer_info.bit_depth + 7) / 8);
     // 先临时映射到该地址，稍后再重新映射
     video_frame_buffer_info.vaddr = 0xffff800003000000;
-    mm_map_phys_addr(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size,
-                     PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+    char init_text1[] = "Video driver to map.\n";
+    for (int i = 0; i < sizeof(init_text1) - 1; ++i)
+        c_uart_send(COM1, init_text1[i]);
+    rs_pseudo_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size);
 
     io_mfence();
     char init_text2[] = "Video driver initialized.\n";

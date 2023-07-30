@@ -111,6 +111,17 @@ pub struct sigaction {
     pub sa_restorer: __sigrestorer_t,
 }
 
+impl PartialEq for sigaction {
+    fn eq(&self, other: &Self) -> bool {
+        unsafe {
+            self._u._sa_handler == other._u._sa_handler
+                && self.sa_flags == other.sa_flags
+                && self.sa_mask == other.sa_mask
+                && self.sa_restorer == other.sa_restorer
+        }
+    }
+}
+
 impl Default for sigaction {
     fn default() -> Self {
         Self {
@@ -246,12 +257,20 @@ impl Default for sighand_struct {
 /**
  * @brief 正在等待的信号的标志位
  */
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct sigpending {
     pub signal: sigset_t,
     /// 信号队列
-    pub queue: *mut SigQueue,
+    pub queue: SigQueue,
+}
+
+impl sigpending {
+    pub fn new() -> Self {
+        Self {
+            signal: 0,
+            queue: SigQueue::new(None),
+        }
+    }
 }
 
 /// siginfo中的si_code的可选值
@@ -293,7 +312,7 @@ impl si_code_val {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq)]
 #[repr(i32)]
 pub enum SignalNumber {
     INVALID = 0,
@@ -464,17 +483,22 @@ impl FFIBind2Rust<crate::include::bindings::bindings::sigaction> for sigaction {
 }
 
 /// @brief 进程接收到的信号的队列
+#[derive(Debug, Clone)]
 pub struct SigQueue {
-    pub q: Vec<siginfo>,
+    q: Vec<siginfo>,
 }
 
 #[allow(dead_code)]
 impl SigQueue {
     /// @brief 初始化一个新的信号队列
-    pub fn new(capacity: usize) -> Self {
-        SigQueue {
+    pub fn new(capacity: Option<usize>) -> Self {
+        let capacity = match capacity {
+            Some(x) => x,
+            None => 16,
+        };
+        return Self {
             q: Vec::with_capacity(capacity),
-        }
+        };
     }
 
     /// @brief 在信号队列中寻找第一个满足要求的siginfo, 并返回它的引用
@@ -552,13 +576,9 @@ impl SigQueue {
         let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
         return sq;
     }
-}
 
-impl Default for SigQueue {
-    fn default() -> Self {
-        Self {
-            q: Default::default(),
-        }
+    pub fn push(&mut self, info: siginfo) {
+        self.q.push(info);
     }
 }
 

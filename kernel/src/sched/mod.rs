@@ -20,7 +20,7 @@ pub struct SchedPriority(i32);
 
 impl SchedPriority {
     const MIN: i32 = 0;
-    const MAX: i32 = 100;
+    const MAX: i32 = 139;
 
     /// 创建一个新的调度优先级
     pub const fn new(priority: i32) -> Option<Self> {
@@ -34,6 +34,10 @@ impl SchedPriority {
     /// 校验优先级是否合法
     pub const fn validate(priority: i32) -> bool {
         priority >= Self::MIN && priority <= Self::MAX
+    }
+
+    pub fn data(&self) -> i32 {
+        self.0
     }
 }
 

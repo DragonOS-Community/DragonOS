@@ -1,17 +1,42 @@
 use core::{
+    hash::{Hash, Hasher},
+    intrinsics::unlikely,
+    mem::ManuallyDrop,
     ptr::null_mut,
-    sync::atomic::{compiler_fence, Ordering, AtomicUsize}, intrinsics::unlikely, mem::ManuallyDrop,
+    sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
 };
 
-use alloc::{sync::Arc, boxed::Box};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+};
+use hashbrown::HashMap;
 
 use crate::{
     arch::{asm::current::current_pcb, fpu::FpState, process::ArchPCBInfo},
+    filesystem::vfs::{
+        file::{File, FileDescriptorVec},
+        FileType,
+    },
+    ipc::signal_types::{sighand_struct, signal_struct, sigpending, sigset_t, SignalNumber},
     kdebug,
+    libs::{
+        align::AlignedBox,
+        casting::DowncastArc,
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     mm::{
-        set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, INITIAL_PROCESS_ADDRESS_SPACE,
-    }, libs::{align::AlignedBox, rwlock::RwLock}, syscall::SystemError, filesystem::vfs::file::FileDescriptorVec, ipc::signal_types::{signal_struct, sighand_struct, sigset_t, sigpending, SignalNumber}, sched::SchedPolicy,
+        set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr,
+        INITIAL_PROCESS_ADDRESS_SPACE,
+    },
+    net::socket::SocketInode,
+    sched::{SchedPolicy, SchedPriority},
+    syscall::SystemError,
 };
+
+use self::initial_proc::{INITIAL_SIGHAND, INITIAL_SIGNALS};
 
 pub mod abi;
 pub mod c_adapter;
@@ -27,9 +52,81 @@ pub mod wait_queue;
 
 const PCB_NAME_LEN: usize = 16;
 
+/// 系统中所有进程的pcb
+static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
+
+#[derive(Debug)]
+pub struct ProcessManager;
+
+impl ProcessManager {
+    fn init() {
+        static INIT_FLAG: AtomicBool = AtomicBool::new(false);
+        if INIT_FLAG
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            ALL_PROCESS.lock().replace(HashMap::new());
+        } else {
+            panic!("ProcessManager has been initialized!");
+        }
+    }
+
+    /// 获取当前进程的pcb
+    pub fn current_pcb() -> Arc<ProcessControlBlock> {
+        return ProcessControlBlock::arch_current_pcb();
+    }
+
+    /// 根据pid获取进程的pcb
+    ///
+    /// ## 参数
+    ///
+    /// - `pid` : 进程的pid
+    ///
+    /// ## 返回值
+    ///
+    /// 如果找到了对应的进程，那么返回该进程的pcb，否则返回None
+    pub fn find(pid: Pid) -> Option<Arc<ProcessControlBlock>> {
+        return ALL_PROCESS.lock().as_ref()?.get(&pid).cloned();
+    }
+
+    /// 向系统中添加一个进程的pcb
+    ///
+    /// ## 参数
+    ///
+    /// - `pcb` : 进程的pcb
+    ///
+    /// ## 返回值
+    ///
+    /// 无
+    pub fn add_pcb(pcb: Arc<ProcessControlBlock>) {
+        ALL_PROCESS
+            .lock()
+            .as_mut()
+            .unwrap()
+            .insert(pcb.basic().pid(), pcb.clone());
+    }
+
+    /// 唤醒一个进程
+    pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        todo!()
+    }
+}
+
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-#[derive(Debug,PartialEq)]
+impl Hash for Pid {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl Pid {
+    pub fn to_string(&self) -> String {
+        self.0.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     /// The process is running on a CPU or in a run queue.
     Runnable,
@@ -68,65 +165,327 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct ProcessControlBlock {
-    inner: RwLock<InnerProcessControlBlock>,
+    basic: RwLock<ProcessBasicInfo>,
+    /// 当前进程的自旋锁持有计数
+    preempt_count: AtomicUsize,
+
+    flags: SpinLock<ProcessFlags>,
+    signal: RwLock<ProcessSignalInfo>,
+
+    /// 进程的内核栈
+    kernel_stack: RwLock<KernelStack>,
+
+    /// 与调度相关的信息
+    sched_info: RwLock<ProcessSchedulerInfo>,
+    /// 与处理器架构相关的信息
+    arch_info: SpinLock<ArchPCBInfo>,
 }
 
-// https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/proc-types.h?r=64aea4b3
+impl ProcessControlBlock {
+    /// Generate a new pcb.
+    ///
+    /// ## 参数
+    ///
+    /// - `name` : 进程的名字
+    /// - `kstack` : 进程的内核栈
+    ///
+    /// ## 返回值
+    ///
+    /// 返回一个新的pcb
+    pub fn new(name: String, kstack: KernelStack) -> Arc<Self> {
+        let basic_info = ProcessBasicInfo::new(Self::generate_pid(), Pid(0), Pid(0), name, None);
+        let preempt_count = AtomicUsize::new(0);
+        let flags = SpinLock::new(ProcessFlags::empty());
+        let signal = ProcessSignalInfo::new();
+        let sched_info = ProcessSchedulerInfo::new(None);
+        let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
+
+        let pcb = Self {
+            basic: basic_info,
+            preempt_count,
+            flags,
+            signal,
+            kernel_stack: RwLock::new(kstack),
+            sched_info,
+            arch_info,
+        };
+
+        let pcb = Arc::new(pcb);
+
+        unsafe { pcb.kernel_stack.write().set_pcb(Arc::clone(&pcb)).unwrap() };
+
+        return pcb;
+    }
+
+    /// 生成一个新的pid
+    fn generate_pid() -> Pid {
+        static NEXT_PID: AtomicPid = AtomicPid::new(Pid(1));
+        return NEXT_PID.fetch_add(Pid(1), Ordering::SeqCst);
+    }
+
+    /// 返回当前进程的锁持有计数
+    pub fn preempt_count(&self) -> usize {
+        return self.preempt_count.load(Ordering::SeqCst);
+    }
+
+    /// 增加当前进程的锁持有计数
+    pub fn preempt_disable(&self) {
+        self.preempt_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 减少当前进程的锁持有计数
+    pub fn preempt_enable(&self) {
+        self.preempt_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {
+        return self.flags.lock();
+    }
+
+    pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
+        return self.basic.read();
+    }
+
+    pub fn set_name(&self, name: String) {
+        self.basic.write().set_name(name);
+    }
+
+    pub fn basic_mut(&self) -> RwLockWriteGuard<ProcessBasicInfo> {
+        return self.basic.write();
+    }
+
+    pub fn signal(&self) -> RwLockReadGuard<ProcessSignalInfo> {
+        return self.signal.read();
+    }
+
+    pub fn signal_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
+        return self.signal.write();
+    }
+
+    pub fn arch_info(&self) -> SpinLockGuard<ArchPCBInfo> {
+        return self.arch_info.lock();
+    }
+
+    pub fn kernel_stack(&self) -> RwLockReadGuard<KernelStack> {
+        return self.kernel_stack.read();
+    }
+
+    pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<KernelStack> {
+        return self.kernel_stack.write();
+    }
+
+    pub fn sched_info(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
+        return self.sched_info.read();
+    }
+
+    pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
+        return self.sched_info.write();
+    }
+
+    /// 获取文件描述符表的Arc指针
+    #[inline(always)]
+    pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
+        return self.basic.read().fd_table().unwrap();
+    }
+
+    /// 根据文件描述符序号，获取socket对象的Arc指针
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    ///
+    /// ## 返回值
+    ///
+    /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
+    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let f = fd_table_guard.get_file_ref_by_fd(fd)?;
+
+        if f.file_type() != FileType::Socket {
+            return None;
+        }
+        let socket: Arc<SocketInode> = f
+            .inode()
+            .downcast_arc::<SocketInode>()
+            .expect("Not a socket inode");
+        return Some(socket);
+    }
+}
+
+/// 进程的基本信息
+///
+/// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
 #[derive(Debug)]
-pub struct InnerProcessControlBlock {
+pub struct ProcessBasicInfo {
     /// 当前进程的pid
-    pub pid: Pid,
+    pid: Pid,
     /// 当前进程的进程组id
-    pub pgid: Pid,
+    pgid: Pid,
     /// 当前进程的父进程的pid
-    pub ppid: Pid,
-    /// 当前进程所在的cpu
-    pub on_cpu: usize,
-    /// 标志位
-    pub flags:ProcessFlags,
-    /* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
-    pub worker_private: Option<*mut ()>,
-    /// 当前进程的自旋锁持有计数
-    pub preempt_count: AtomicUsize,
-    /// 当前进程的状态
-    pub state: ProcessState,
-    /// 进程的调度策略
-    pub sched_policy: SchedPolicy,
-    /// 当前进程的虚拟运行时间
-    pub virtual_runtime: isize,
-    /// 由实时调度器管理的时间片
-    pub rt_time_slice: isize,
+    ppid: Pid,
     /// 进程的名字
-    pub name: Arc<RwLock<Box<str>>>,
-    /// 与处理器架构相关的信息
-    pub arch: ArchPCBInfo,
-    /// 进程的内核栈
-    pub kernel_stack: Option<KernelStack>,
+    name: String,
+
+    /// 用户地址空间
+    user_vm: Option<Arc<AddressSpace>>,
+
     /// 文件描述符表
-    pub fd_table: Arc<RwLock<FileDescriptorVec>>,
+    fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+}
+
+impl ProcessBasicInfo {
+    pub fn new(
+        pid: Pid,
+        pgid: Pid,
+        ppid: Pid,
+        name: String,
+        user_vm: Option<Arc<AddressSpace>>,
+    ) -> RwLock<Self> {
+        let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
+        return RwLock::new(Self {
+            pid,
+            pgid,
+            ppid,
+            name,
+            user_vm,
+            fd_table: Some(fd_table),
+        });
+    }
+
+    pub fn pid(&self) -> Pid {
+        return self.pid;
+    }
+
+    pub fn pgid(&self) -> Pid {
+        return self.pgid;
+    }
+
+    pub fn ppid(&self) -> Pid {
+        return self.ppid;
+    }
+
+    pub fn name(&self) -> &str {
+        return &self.name;
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    pub fn user_vm(&self) -> Option<Arc<AddressSpace>> {
+        return self.user_vm.clone();
+    }
+
+    pub fn set_user_vm(&mut self, user_vm: Option<Arc<AddressSpace>>) {
+        self.user_vm = user_vm;
+    }
+
+    pub fn fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+        return self.fd_table.clone();
+    }
+
+    pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
+        self.fd_table = fd_table;
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessSchedulerInfo {
+    /// 当前进程所在的cpu
+    on_cpu: Option<u32>,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    pub migrate_to: u32,
+    migrate_to: Option<u32>,
 
-
-    // 信号相关的字段。由于信号机制实现的不是很好，因此这里使用了裸指针来避免所有权问题。
-    // TODO：重构信号机制。
-    pub signal: *mut signal_struct,
-    pub sighand: *mut sighand_struct,
-    pub sig_blocked: sigset_t,
-    pub sig_pending: sigpending,
-
-    /// 浮点寄存器的状态
-    pub fp_state: Option<FpState>,
-    // todo: 待内存管理完成后，增加地址空间相关的字段
+    /// 当前进程的状态
+    state: ProcessState,
+    /// 进程的调度策略
+    sched_policy: SchedPolicy,
+    /// 进程的调度优先级
+    priority: SchedPriority,
+    /// 当前进程的虚拟运行时间
+    virtual_runtime: isize,
+    /// 由实时调度器管理的时间片
+    rt_time_slice: isize,
 }
 
-impl InnerProcessControlBlock {}
+impl ProcessSchedulerInfo {
+    pub fn new(on_cpu: Option<u32>) -> RwLock<Self> {
+        return RwLock::new(Self {
+            on_cpu,
+            migrate_to: None,
+            state: ProcessState::Blocked(false),
+            sched_policy: SchedPolicy::CFS,
+            virtual_runtime: 0,
+            rt_time_slice: 0,
+            priority: SchedPriority::new(100).unwrap(),
+        });
+    }
 
-/// 生成一个新的pid
-pub fn generate_pid() -> Pid {
-    static NEXT_PID: AtomicPid = AtomicPid::new(Pid(1));
-    return NEXT_PID.fetch_add(Pid(1), Ordering::SeqCst);
+    pub fn on_cpu(&self) -> Option<u32> {
+        return self.on_cpu;
+    }
+
+    pub fn set_on_cpu(&mut self, on_cpu: Option<u32>) {
+        self.on_cpu = on_cpu;
+    }
+
+    pub fn migrate_to(&self) -> Option<u32> {
+        return self.migrate_to;
+    }
+
+    pub fn set_migrate_to(&mut self, migrate_to: Option<u32>) {
+        self.migrate_to = migrate_to;
+    }
+
+    pub fn state(&self) -> ProcessState {
+        return self.state;
+    }
+
+    fn set_state(&mut self, state: ProcessState) {
+        self.state = state;
+    }
+
+    pub fn policy(&self) -> SchedPolicy {
+        return self.sched_policy;
+    }
+
+    pub fn virtual_runtime(&self) -> isize {
+        return self.virtual_runtime;
+    }
+
+    pub fn rt_time_slice(&self) -> isize {
+        return self.rt_time_slice;
+    }
+
+    pub fn priority(&self) -> SchedPriority {
+        return self.priority;
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessSignalInfo {
+    // 信号相关的字段。由于信号机制实现的不是很好，这里写的真的非常丑陋。
+    // TODO：重构信号机制，并重写这里的代码
+    pub signal: signal_struct,
+    pub sighand: sighand_struct,
+    pub sig_blocked: sigset_t,
+    pub sig_pending: sigpending,
+}
+
+impl ProcessSignalInfo {
+    pub fn new() -> RwLock<Self> {
+        unsafe {
+            return RwLock::new(Self {
+                signal: INITIAL_SIGNALS.clone(),
+                sighand: INITIAL_SIGHAND.clone(),
+                sig_blocked: 0,
+                sig_pending: sigpending::new(),
+            });
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -145,8 +504,13 @@ impl KernelStack {
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)
-    pub fn start_address(&self) -> usize {
-        self.stack.as_ptr() as usize
+    pub fn start_address(&self) -> VirtAddr {
+        return VirtAddr::new(self.stack.as_ptr() as usize);
+    }
+
+    /// 返回内核栈的结束虚拟地址(高地址)(不包含该地址)
+    pub fn stack_max_address(&self) -> VirtAddr {
+        return VirtAddr::new(self.stack.as_ptr() as usize + Self::SIZE);
     }
 
     pub unsafe fn set_pcb(&mut self, pcb: Arc<ProcessControlBlock>) -> Result<(), SystemError> {
@@ -188,7 +552,10 @@ impl Drop for KernelStack {
         drop(pcb_ptr);
     }
 }
+
 pub fn process_init() {
+    ProcessManager::init();
+
     unsafe {
         compiler_fence(Ordering::SeqCst);
         current_pcb().address_space = null_mut();

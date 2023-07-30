@@ -19,6 +19,7 @@ use crate::{
     libs::casting::DowncastArc,
     mm::ucontext::AddressSpace,
     net::socket::SocketInode,
+    process::ProcessManager,
     sched::core::{cpu_executing, sched_enqueue},
     smp::core::{smp_get_processor_id, smp_send_reschedule},
     syscall::SystemError,
@@ -118,166 +119,6 @@ pub fn process_is_executing(pcb: *const process_control_block) -> bool {
 }
 
 impl process_control_block {
-    /// @brief 初始化进程PCB的文件描述符数组。
-    /// 请注意，如果当前进程已经有文件描述符数组，那么本操作将被禁止
-    pub fn init_files(&mut self) -> Result<(), SystemError> {
-        if self.fds != null_mut() {
-            // 这个操作不被允许，否则会产生内存泄露。
-            // 原因是，C的pcb里面，文件描述符数组的生命周期是static的，如果继续执行，会产生内存泄露的问题。
-            return Err(SystemError::EPERM);
-        }
-        let fd_vec: &mut FileDescriptorVec = Box::leak(FileDescriptorVec::new());
-        self.fds = fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
-        return Ok(());
-    }
-
-    /// @brief 拷贝进程的文件描述符
-    ///
-    /// @param clone_flags 进程fork的克隆标志位
-    /// @param from 源pcb。从它里面拷贝文件描述符
-    ///
-    /// @return Ok(()) 拷贝成功
-    /// @return Err(SystemError) 拷贝失败，错误码
-    pub fn copy_files(
-        &mut self,
-        clone_flags: u64,
-        from: &'static process_control_block,
-    ) -> Result<(), SystemError> {
-        // 不拷贝父进程的文件描述符
-        if clone_flags & CLONE_FS as u64 != 0 {
-            // 由于拷贝pcb的时候，直接copy的指针，因此这里置为空
-            self.fds = null_mut();
-            self.init_files()?;
-            return Ok(());
-        }
-        // 获取源pcb的文件描述符数组的引用
-        let old_fds: &mut FileDescriptorVec = if let Some(o_fds) = FileDescriptorVec::from_pcb(from)
-        {
-            o_fds
-        } else {
-            return self.init_files();
-        };
-
-        // 拷贝文件描述符数组
-        let new_fd_vec: &mut FileDescriptorVec = Box::leak(old_fds.clone());
-
-        self.fds = new_fd_vec as *mut FileDescriptorVec as usize as *mut c_void;
-
-        return Ok(());
-    }
-
-    /// @brief 释放文件描述符数组。本函数会drop掉整个文件描述符数组，并把pcb的fds字段设置为空指针。
-    pub fn exit_files(&mut self) -> Result<(), SystemError> {
-        if self.fds.is_null() {
-            return Ok(());
-        }
-
-        let old_fds: Box<FileDescriptorVec> =
-            unsafe { Box::from_raw(self.fds as *mut FileDescriptorVec) };
-        drop(old_fds);
-        self.fds = null_mut();
-        return Ok(());
-    }
-
-    /// @brief 申请文件描述符，并把文件对象存入其中。
-    ///
-    /// @param file 要存放的文件对象
-    /// @param fd 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
-    ///
-    /// @return Ok(i32) 申请到的文件描述符编号
-    /// @return Err(SystemError) 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
-        // 获取pcb的文件描述符数组的引用
-        let fds: &mut FileDescriptorVec =
-            if let Some(f) = FileDescriptorVec::from_pcb(current_pcb()) {
-                f
-            } else {
-                // 如果进程还没有初始化文件描述符数组，那就初始化它
-                self.init_files().ok();
-                let r: Option<&mut FileDescriptorVec> = FileDescriptorVec::from_pcb(current_pcb());
-                if r.is_none() {
-                    drop(file);
-                    // 初始化失败
-                    return Err(SystemError::EFAULT);
-                }
-                r.unwrap()
-            };
-
-        if fd.is_some() {
-            // 指定了要申请的文件描述符编号
-            let new_fd = fd.unwrap();
-            let x = &mut fds.fds[new_fd as usize];
-            if x.is_none() {
-                *x = Some(Box::new(file));
-                return Ok(new_fd);
-            } else {
-                return Err(SystemError::EBADF);
-            }
-        } else {
-            // 寻找空闲的文件描述符
-            let mut cnt = 0;
-            for x in fds.fds.iter_mut() {
-                if x.is_none() {
-                    *x = Some(Box::new(file));
-                    return Ok(cnt);
-                }
-                cnt += 1;
-            }
-            return Err(SystemError::ENFILE);
-        }
-    }
-
-    /// @brief 根据文件描述符序号，获取文件结构体的可变引用
-    ///
-    /// @param fd 文件描述符序号
-    ///
-    /// @return Option(&mut File) 文件对象的可变引用
-    pub fn get_file_mut_by_fd(&self, fd: i32) -> Option<&mut File> {
-        if !FileDescriptorVec::validate_fd(fd) {
-            return None;
-        }
-        let r: &mut FileDescriptorVec = FileDescriptorVec::from_pcb(current_pcb()).unwrap();
-        return r.fds[fd as usize].as_deref_mut();
-    }
-
-    /// @brief 根据文件描述符序号，获取文件结构体的不可变引用
-    ///
-    /// @param fd 文件描述符序号
-    ///
-    /// @return Option(&File) 文件对象的不可变引用
-    #[allow(dead_code)]
-    pub fn get_file_ref_by_fd(&self, fd: i32) -> Option<&File> {
-        if !FileDescriptorVec::validate_fd(fd) {
-            return None;
-        }
-        let r: &mut FileDescriptorVec = FileDescriptorVec::from_pcb(current_pcb()).unwrap();
-        return r.fds[fd as usize].as_deref();
-    }
-
-    /// @brief 释放文件描述符，同时关闭文件。
-    ///
-    /// @param fd 文件描述符序号
-    pub fn drop_fd(&self, fd: i32) -> Result<(), SystemError> {
-        // 判断文件描述符的数字是否超过限制
-        if !FileDescriptorVec::validate_fd(fd) {
-            return Err(SystemError::EBADF);
-        }
-        let r: &mut FileDescriptorVec = FileDescriptorVec::from_pcb(current_pcb()).unwrap();
-
-        let f: Option<&File> = r.fds[fd as usize].as_deref();
-        if f.is_none() {
-            // 如果文件描述符不存在，报错
-            return Err(SystemError::EBADF);
-        }
-        // 释放文件
-        drop(f);
-
-        // 把文件描述符数组对应位置设置为空
-        r.fds[fd as usize] = None;
-
-        return Ok(());
-    }
-
     /// @brief 标记当前pcb已经由其他机制进行管理，调度器将不会将他加入队列(且进程可以被信号打断)
     /// 当我们要把一个进程，交给其他机制管理时，那么就应该调用本函数。
     ///
@@ -294,24 +135,6 @@ impl process_control_block {
     #[allow(dead_code)]
     pub unsafe fn mark_sleep_uninterruptible(&mut self) {
         self.state = PROC_UNINTERRUPTIBLE as u64;
-    }
-
-    /// @brief 根据文件描述符序号，获取socket对象的可变引用
-    ///
-    /// @param fd 文件描述符序号
-    ///
-    /// @return Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
-    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
-        let f = self.get_file_mut_by_fd(fd)?;
-
-        if f.file_type() != FileType::Socket {
-            return None;
-        }
-        let socket: Arc<SocketInode> = f
-            .inode()
-            .downcast_arc::<SocketInode>()
-            .expect("Not a socket inode");
-        return Some(socket);
     }
 
     /// 释放pcb中存储的地址空间的指针
@@ -348,7 +171,6 @@ impl process_control_block {
     }
 }
 
-
 /// @brief 初始化pid=1的进程的stdio
 pub fn init_stdio() -> Result<(), SystemError> {
     if current_pcb().pid != 1 {
@@ -367,8 +189,29 @@ pub fn init_stdio() -> Result<(), SystemError> {
     /*
        按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
     */
-    assert_eq!(current_pcb().alloc_fd(stdin, None).unwrap(), 0);
-    assert_eq!(current_pcb().alloc_fd(stdout, None).unwrap(), 1);
-    assert_eq!(current_pcb().alloc_fd(stderr, None).unwrap(), 2);
+    assert_eq!(
+        ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(stdin, None)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(stdout, None)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(stderr, None)
+            .unwrap(),
+        2
+    );
     return Ok(());
 }

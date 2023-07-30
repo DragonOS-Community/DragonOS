@@ -40,6 +40,6 @@ pub extern "C" fn initial_proc_init_signal(pcb: *mut process_control_block) {
     unsafe {
         (*pcb).sig_pending.signal = 0;
         (*pcb).sig_pending.sigqueue =
-            Box::leak(Box::new(SigQueue::default())) as *mut SigQueue as *mut c_void;
+            Box::leak(Box::new(SigQueue::new(None))) as *mut SigQueue as *mut c_void;
     }
 }

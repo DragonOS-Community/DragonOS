@@ -8,6 +8,7 @@ use crate::{
     filesystem::vfs::file::{File, FileMode},
     include::bindings::bindings::{pid_t, verify_area, NULL},
     kwarn,
+    process::ProcessManager,
     syscall::{Syscall, SystemError},
 };
 
@@ -31,9 +32,13 @@ impl Syscall {
         let pipe_ptr = LockedPipeInode::new();
         let read_file = File::new(pipe_ptr.clone(), FileMode::O_RDONLY)?;
         let write_file = File::new(pipe_ptr.clone(), FileMode::O_WRONLY)?;
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
 
-        let read_fd = current_pcb().alloc_fd(read_file, None)?;
-        let write_fd = current_pcb().alloc_fd(write_file, None)?;
+        let read_fd = fd_table_guard.alloc_fd(read_file, None)?;
+        let write_fd = fd_table_guard.alloc_fd(write_file, None)?;
+
+        drop(fd_table_guard);
 
         fd[0] = read_fd;
         fd[1] = write_fd;

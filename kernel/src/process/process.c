@@ -46,7 +46,7 @@ extern void process_exit_signal(struct process_control_block *pcb);
 extern void initial_proc_init_signal(struct process_control_block *pcb);
 extern void rs_process_exit_fpstate(struct process_control_block *pcb);
 extern void rs_drop_address_space(struct process_control_block *pcb);
-extern int process_init_files();
+
 extern int rs_init_stdio();
 extern uint64_t rs_do_execve(const char *filename, const char *const argv[], const char *const envp[], struct pt_regs *regs);
 extern uint64_t rs_exec_init_process(struct pt_regs *regs);

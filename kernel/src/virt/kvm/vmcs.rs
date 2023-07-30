@@ -5,6 +5,7 @@ use bitflags::bitflags;
 pub const PAGE_SIZE: usize = 0x1000;
 
 #[repr(C, align(4096))]
+#[derive(Clone)]
 pub struct VMCSRegion {
     pub revision_id: u32,
     pub abort_indicator: u32, 

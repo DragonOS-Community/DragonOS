@@ -302,6 +302,7 @@ pub enum SystemError {
     // VMX VMWRITE 写入虚拟化VMCS内存出错
     EVMWRITEFailed = 133,
     EVMREADFailed = 134,
+    EVMPRTLDFailed = 135,
 }
 
 impl SystemError {

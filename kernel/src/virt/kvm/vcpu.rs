@@ -12,7 +12,8 @@ use core::alloc::{Allocator, Layout};
 use core::ptr::NonNull;
 use core::arch::asm;
 use core::ptr;
-use crate::mm::virt_2_phys;
+use core::slice;
+use crate::mm::{virt_2_phys, phys_2_virt};
 
 use crate::arch::MMArch;
 use crate::mm::MemoryManagementArch;
@@ -24,7 +25,7 @@ use crate::virt::kvm::vmcs::{VMCSRegion, VmcsFields,
     VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl
 };
 use crate::virt::kvm::vmx_asm_wrapper::{
-    vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmlaunch
+    vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmlaunch, vmx_vmptrld, vmx_vmclear
 };
 
 // KERNEL_ALLOCATOR
@@ -133,13 +134,12 @@ impl VcpuData {
         let vaddr = VirtAddr::new(self.vmcs_region.as_ref() as *const _ as _);
         self.vmcs_region_physical_address =  unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64};
         // virt_2_phys(self.vmxon_region.as_ref() as *const _ as _) as u64;
-
+        
         if self.vmcs_region_physical_address == 0 {
             return Err(SystemError::EFAULT);
         }
-        kdebug!("[+] VMCS Region Virtual Address: {:p}", self.vmcs_region);
-        kdebug!("[+] VMCS Region Physical Addresss: 0x{:x}", self.vmcs_region_physical_address);
-
+        kdebug!("[+] VMCS Region Virtual Address: {:?}", vaddr);
+        kdebug!("[+] VMCS Region Physical Address1: 0x{:x}", self.vmcs_region_physical_address);
         self.vmcs_region.revision_id = get_vmcs_revision_id();
         Ok(())
     }
@@ -175,15 +175,19 @@ impl Vcpu {
 
         vmxon(self.data.vmxon_region_physical_address)?;
         kdebug!("[+] VMXON successful!");
+        vmx_vmclear(self.data.vmcs_region_physical_address)?;
+        vmx_vmptrld(self.data.vmcs_region_physical_address)?;
+        kdebug!("[+] VMPTRLD successful!");
         self.vmcs_init().expect("vncs_init fail");
         kdebug!("[+] VMCS init!");
         let vmx_err = vmx_vmread(VmcsFields::CTRL_VM_ENTRY_CTRLS as u32);
         kdebug!("vmx_vmread: {:?}",vmx_err);
         match vmx_vmlaunch() {
             Ok(_) => {},
-            Err(_) => {
-                let vmx_err = vmx_vmread(VmcsFields::VMEXIT_INSTR_ERR as u32);
+            Err(e) => {
+                let vmx_err = vmx_vmread(VmcsFields::VMEXIT_INSTR_ERR as u32).unwrap();
                 kdebug!("vmlaunch failed: {:?}",vmx_err);
+                return Err(e);
             },
         }
         Ok(())
@@ -320,6 +324,7 @@ impl Vcpu {
 
         Ok(())
     }
+    
     pub fn vmcs_init_host(&self) -> Result<(), SystemError>{
         vmx_vmwrite(
             VmcsFields::HOST_CR0 as u32, 
@@ -333,44 +338,32 @@ impl Vcpu {
             VmcsFields::HOST_CR4 as u32, 
             unsafe{ controlregs::cr4().bits().try_into().unwrap() }
         )?;
-        vmx_vmwrite(VmcsFields::HOST_RSP as u32, self.hypervisor.stack.as_ptr() as u64)?;
-        vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
 
-        // fast entry into the kernel
-        vmx_vmwrite(VmcsFields::HOST_SYSENTER_ESP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_ESP)})?;
-        vmx_vmwrite(VmcsFields::HOST_SYSENTER_EIP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_EIP)})?;
-        vmx_vmwrite(VmcsFields::HOST_SYSENTER_CS as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_CS)})?;
 
+        vmx_vmwrite(VmcsFields::HOST_ES_SELECTOR as u32, (segmentation::es().bits() ).into())?;
+        vmx_vmwrite(VmcsFields::HOST_CS_SELECTOR as u32, (segmentation::cs().bits() ).into())?;
+        vmx_vmwrite(VmcsFields::HOST_SS_SELECTOR as u32, (segmentation::ss().bits() ).into())?;
+        vmx_vmwrite(VmcsFields::HOST_DS_SELECTOR as u32, (segmentation::ds().bits() ).into())?;
+        vmx_vmwrite(VmcsFields::HOST_FS_SELECTOR as u32, (segmentation::fs().bits() ).into())?;
+        vmx_vmwrite(VmcsFields::HOST_GS_SELECTOR as u32, (segmentation::gs().bits() ).into())?;
+        vmx_vmwrite(VmcsFields::HOST_TR_SELECTOR as u32, unsafe{ (x86::task::tr().bits() ).into() })?;
         vmx_vmwrite(VmcsFields::HOST_FS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_FS_BASE)})?;
         vmx_vmwrite(VmcsFields::HOST_GS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_GS_BASE)})?;
-        
-        vmx_vmwrite(VmcsFields::HOST_CS_SELECTOR as u32, (segmentation::cs().bits() & !7).into())?;
-        vmx_vmwrite(VmcsFields::HOST_SS_SELECTOR as u32, (segmentation::ss().bits() & !7).into())?;
-        vmx_vmwrite(VmcsFields::HOST_DS_SELECTOR as u32, (segmentation::ds().bits() & !7).into())?;
-        vmx_vmwrite(VmcsFields::HOST_ES_SELECTOR as u32, (segmentation::es().bits() & !7).into())?;
-        vmx_vmwrite(VmcsFields::HOST_FS_SELECTOR as u32, (segmentation::fs().bits() & !7).into())?;
-        vmx_vmwrite(VmcsFields::HOST_GS_SELECTOR as u32, (segmentation::gs().bits() & !7).into())?;
-        vmx_vmwrite(VmcsFields::HOST_TR_SELECTOR as u32, unsafe{ (x86::task::tr().bits() & !7).into() })?;
 
+        let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+        unsafe {x86::dtables::sgdt(&mut pseudo_descriptpr);};
         // FIXME
         vmx_vmwrite(
             VmcsFields::HOST_TR_BASE as u32, 
             get_segment_base(
-                unsafe{
-                    let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-                    x86::dtables::sgdt(&mut pseudo_descriptpr);
-                    pseudo_descriptpr.base
-                },
+                pseudo_descriptpr.base,
+                pseudo_descriptpr.limit,
                 unsafe{ x86::task::tr().bits().into() }
             )
         )?;
         vmx_vmwrite(
             VmcsFields::HOST_GDTR_BASE as u32, 
-            unsafe{
-                let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-                x86::dtables::sgdt(&mut pseudo_descriptpr);
-                pseudo_descriptpr.base.to_bits() as u64
-            }
+            pseudo_descriptpr.base.to_bits() as u64
         )?;
         vmx_vmwrite(
             VmcsFields::HOST_IDTR_BASE as u32, 
@@ -381,12 +374,20 @@ impl Vcpu {
             }
         )?;
 
+        // fast entry into the kernel
+        vmx_vmwrite(VmcsFields::HOST_SYSENTER_ESP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_ESP)})?;
+        vmx_vmwrite(VmcsFields::HOST_SYSENTER_EIP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_EIP)})?;
+        vmx_vmwrite(VmcsFields::HOST_SYSENTER_CS as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_CS)})?;
+
+        vmx_vmwrite(VmcsFields::HOST_RSP as u32, self.hypervisor.stack.as_ptr() as u64)?;
+        vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
+        self.vmcs_init_host_debug();
         Ok(())
     }
     // Intel SDM Volume 3C Chapter 25.3 “Organization of VMCS Data”
     pub fn vmcs_init(&self) -> Result<(), SystemError> {
-        self.vmcs_init_guest()?;
-        self.vmcs_init_host()?;
+        vmx_vmwrite(VmcsFields::CTRL_PIN_BASED_VM_EXEC_CTRLS as u32, adjust_vmx_pinbased_controls() as u64)?;
+
         vmx_vmwrite(VmcsFields::CTRL_MSR_BITMAP_ADDR as u32, self.data.msr_bitmap_physical_address)?;
         vmx_vmwrite(
             VmcsFields::CTRL_CR0_READ_SHADOW as u32, 
@@ -398,30 +399,32 @@ impl Vcpu {
         )?;
         vmx_vmwrite(VmcsFields::CTRL_VM_ENTRY_CTRLS as u32, adjust_vmx_entry_controls() as u64)?;
         vmx_vmwrite(VmcsFields::CTRL_PRIMARY_VM_EXIT_CTRLS as u32, adjust_vmx_exit_controls() as u64)?;
-        vmx_vmwrite(VmcsFields::CTRL_PIN_BASED_VM_EXEC_CTRLS as u32, adjust_vmx_pinbased_controls() as u64)?;
         vmx_vmwrite(VmcsFields::CTRL_PRIMARY_PROCESSOR_VM_EXEC_CTRLS as u32, adjust_vmx_primary_process_exec_controls() as u64)?;
         vmx_vmwrite(VmcsFields::CTRL_SECONDARY_PROCESSOR_VM_EXEC_CTRLS as u32, adjust_vmx_secondary_process_exec_controls() as u64)?;
 
         vmx_vmwrite(VmcsFields::GUEST_TR_BASE as u32, 0x0 as u64)?;
-
+        self.vmcs_init_guest()?;
+        self.vmcs_init_host()?;
 
         Ok(())
     }
 }
 
-pub fn get_segment_base(gdt_base: *const u64, segment_selector: u16) -> u64{
+pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u16) -> u64{
 	let table = segment_selector & 0x0004; // get table indicator in selector
-    let index = (segment_selector & 0xFFF8) as usize; // get index in selector
+    let index = (segment_selector >> 3) as usize; // get index in selector
     if table==0 && index==0 {
         return 0;
     }
-    let descriptor_table = ptr::slice_from_raw_parts(gdt_base, 8);
-    let descriptor = unsafe {(*descriptor_table)[index] };
+    let descriptor_table = unsafe {slice::from_raw_parts(gdt_base, gdt_size.into())};
+    let descriptor = descriptor_table[index] ;
+    
     let base_high = (descriptor & 0xFF00_0000_0000_0000) >> 32;
     let base_mid = (descriptor & 0x0000_00FF_0000_0000) >> 16;
-    let base_low = descriptor & 0x0000_0000_FFFF_0000 >> 16;
+    let base_low = (descriptor & 0x0000_0000_FFFF_0000) >> 16;
     let segment_base = (base_high | base_mid | base_low) & 0xFFFFFFFF;
-    return segment_base;
+    kdebug!("segment_base={:x}", phys_2_virt(segment_base.try_into().unwrap()));
+    return phys_2_virt(segment_base.try_into().unwrap()).try_into().unwrap();
 }
 
 // FIXME: may have bug
@@ -444,7 +447,7 @@ pub fn read_segment_access_rights(segement_selector: u16) -> u32{
 }
 pub fn adjust_vmx_controls(ctl_min:u32, ctl_opt:u32, msr:u32, result: &mut u32){
     let vmx_msr_low:u32 = unsafe {(msr::rdmsr(msr) & 0x0000_0000_FFFF_FFFF) as u32};
-    let vmx_msr_high:u32 = unsafe {(msr::rdmsr(msr) & 0xFFFF_FFFF_0000_0000) as u32};
+    let vmx_msr_high:u32 = unsafe {(msr::rdmsr(msr) >> 32) as u32};
     let mut ctl: u32 = ctl_min | ctl_opt;
     ctl &= vmx_msr_high; /* bit == 0 in high word ==> must be zero */
     ctl |= vmx_msr_low;  /* bit == 1 in low word  ==> must be one  */

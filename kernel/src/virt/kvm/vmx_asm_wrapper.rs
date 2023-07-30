@@ -43,9 +43,26 @@ pub fn vmx_vmread(vmcs_field: u32) -> Result<u64, SystemError> {
     }
 }
 
+pub fn vmx_vmptrld(vmcs_pa: u64)-> Result<(), SystemError> {
+    match unsafe { x86::bits64::vmx::vmptrld(vmcs_pa) } {
+        Ok(_) => Ok(()),
+        Err(_) => Err(SystemError::EVMPRTLDFailed),
+    }
+}
+
 pub fn vmx_vmlaunch()-> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmlaunch() } {
         Ok(_) => Ok(()),
-        Err(_) => Err(SystemError::EVMREADFailed),
+        Err(e) => {
+            kdebug!("vmx_launch fail: {:?}", e);
+            Err(SystemError::EVMREADFailed)
+        },
+    }
+}
+
+pub fn vmx_vmclear(vmcs_pa: u64)-> Result<(), SystemError> {
+    match unsafe { x86::bits64::vmx::vmclear(vmcs_pa) } {
+        Ok(_) => Ok(()),
+        Err(_) => Err(SystemError::EVMPRTLDFailed),
     }
 }

@@ -1,5 +1,12 @@
+pub mod align;
 pub mod atomic;
+pub mod casting;
+pub mod elf;
 pub mod ffi_convert;
+#[macro_use]
+pub mod int_like;
+pub mod keyboard_parser;
+pub mod lazy_init;
 pub mod list;
 pub mod lockref;
 pub mod mutex;
@@ -13,6 +20,4 @@ pub mod spinlock;
 pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;
-pub mod keyboard_parser;
-pub mod lazy_init;
 pub mod wait_queue;

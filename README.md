@@ -1,5 +1,9 @@
 # DragonOS
 
+## 打造完全自主可控的数字化未来！
+
+--- 
+
 **Languages** 中文|[English](README_EN.md)
 
 &nbsp;
@@ -17,6 +21,8 @@
 - 项目官网  **[DragonOS.org](https://dragonos.org)**
 
 - 项目文档  **[docs.DragonOS.org](https://docs.dragonos.org)**
+
+- **了解开发动态、开发任务，请访问DragonOS的zulip社群**： [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
 
 - 开源论坛  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
 
@@ -42,9 +48,9 @@
 
 ## 如何加入？
 
-&emsp;&emsp;如果你愿意加入我们，你可以查看GitHub仓库的Project面板，选择近期已规划的功能，对他们进行完善。
+&emsp;&emsp;如果你愿意加入我们，你可以访问DragonOS的zulip社群，了解开发动态、开发任务： [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
 
-&emsp;&emsp;或者，你也可以带着你的创意与想法，和社区的小伙伴一起讨论，为DragonOS创造一些新的功能。
+&emsp;&emsp;你也可以带着你的创意与想法，和社区的小伙伴一起讨论，为DragonOS创造一些新的功能。
 
 ## 如何与社区建立联系？
 
@@ -52,9 +58,8 @@
 
 &emsp;&emsp;或者是加入我们的开发交流QQ群：**115763565**
 
-&emsp;&emsp;对于正式问题的讨论，我们建议在论坛[bbs.DragonOS.org](https://bbs.dragonos.org/)上的对应板块，使用正式的语言发帖讨论。亦或者是在本仓库的issue下提出问题。
+&emsp;&emsp;对于正式问题的讨论，我们建议在 **[DragonOS的zulip社群](https://DragonOS.zulipchat.com)** 上的对应板块，使用正式的语言发帖讨论。亦或者是在本仓库的issue下提出问题。
 
-&emsp;&emsp;在发帖的同时，可以把帖子转发到交流QQ群，这样能使得问题的交流更加高效，也便于问题的归档。
 
 ## 贡献者名单
 
@@ -68,7 +73,7 @@
 
 ## 赞助
 
-&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是它的发展离不开资金的支持，如果您愿意的话，可以通过 ** [赞助 - DragonOS](https://dragonos.org/?page_id=37) ** ，从而促进这个项目的发展。所有的赞助者的名单都会被公示。您的每一分赞助，都会为DragonOS的发展作出贡献！
+&emsp;&emsp;DragonOS是一个公益性质的开源项目，但是它的发展离不开资金的支持，如果您愿意的话，可以通过 **[赞助 - DragonOS](https://dragonos.org/?page_id=37)** ，从而促进这个项目的发展。所有的赞助者的名单都会被公示。您的每一分赞助，都会为DragonOS的发展作出贡献！
 
 ### 赞助的资金都会被用到哪里？
 
@@ -94,6 +99,7 @@
 - David Wen
 - [Seele.Clover](https://github.com/seeleclover)
 - [FindWangHao](https://github.com/FindWangHao)
+- [ferchiel](https://github.com/ferchiel)
 - 叶锦毅
 - 林
 - Albert

@@ -1,7 +1,7 @@
 use crate::arch::TraitPciArch;
 use crate::driver::acpi::acpi::mcfg_find_segment;
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PciError, PciRoot, SegmentGroupNumber, PORT_PCI_CONFIG_ADDRESS,
+    BusDeviceFunction, PciAddr, PciError, PciRoot, SegmentGroupNumber, PORT_PCI_CONFIG_ADDRESS,
     PORT_PCI_CONFIG_DATA,
 };
 use crate::include::bindings::bindings::{
@@ -40,8 +40,8 @@ impl TraitPciArch for X86_64PciArch {
         }
     }
 
-    fn address_pci_to_address_memory(address: usize) -> Result<usize, PciError> {
-        Ok(address)
+    fn address_pci_to_physical(pci_address: PciAddr) -> usize {
+        return pci_address.data();
     }
 
     fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {
@@ -50,6 +50,10 @@ impl TraitPciArch for X86_64PciArch {
         unsafe {
             acpi_iter_SDT(Some(acpi_get_MCFG), data_point as *mut usize as *mut c_void);
         };
+        // 防止无PCIE的机器找不到MCFG Table导致的错误
+        if data == 0 {
+            return Err(PciError::McfgTableNotFound);
+        }
         //kdebug!("{}",data);
         //loop{}
         let head = NonNull::new(data as *mut acpi_system_description_table_header_t).unwrap();

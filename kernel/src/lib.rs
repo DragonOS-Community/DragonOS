@@ -1,11 +1,18 @@
 #![no_std] // <1>
 #![no_main] // <1>
-#![feature(const_mut_refs)]
-#![feature(core_intrinsics)] // <2>
 #![feature(alloc_error_handler)]
-#![feature(panic_info_message)]
-#![feature(drain_filter)] // 允许Vec的drain_filter特性
+#![feature(allocator_api)]
+#![feature(arbitrary_self_types)]
+#![feature(const_mut_refs)]
+#![feature(core_intrinsics)]
 #![feature(c_void_variant)]
+#![feature(drain_filter)]
+#![feature(panic_info_message)]
+#![feature(ptr_internals)]
+#![feature(trait_upcasting)]
+#![feature(slice_ptr_get)]
+#![feature(vec_into_raw_parts)]
+
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -35,6 +42,7 @@ mod time;
 extern crate alloc;
 #[macro_use]
 extern crate bitflags;
+extern crate elf;
 #[macro_use]
 extern crate lazy_static;
 extern crate num;
@@ -42,11 +50,10 @@ extern crate num;
 extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
-
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
-use mm::allocator::KernelAllocator;
+use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 // <3>
 use crate::{
@@ -57,7 +64,7 @@ use crate::{
 
 // 声明全局的slab分配器
 #[cfg_attr(not(test), global_allocator)]
-pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator {};
+pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 /// 全局的panic处理函数
 #[panic_handler]
@@ -99,6 +106,9 @@ pub fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
     printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
-    net_init().expect("Failed to init network");
+    let r = net_init();
+    if r.is_err() {
+        kwarn!("net_init() failed: {:?}", r.err().unwrap());
+    }
     return 0;
 }

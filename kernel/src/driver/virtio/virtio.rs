@@ -9,7 +9,6 @@ use crate::libs::rwlock::RwLockWriteGuard;
 use crate::{kdebug, kerror, kwarn};
 use alloc::{boxed::Box, collections::LinkedList};
 use virtio_drivers::transport::{DeviceType, Transport};
-
 const NETWORK_CLASS: u8 = 0x2;
 const ETHERNET_SUBCLASS: u8 = 0x0;
 

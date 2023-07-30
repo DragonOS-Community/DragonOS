@@ -1,0 +1,28 @@
+{
+  "name": "test_bind",
+  "version": "0.1.0",
+  "description": "一个简单的test bind",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_bind"
+      }
+    }
+  },
+  "depends": [
+    {
+      "name": "relibc",
+      "version": "0.1.0"
+    }
+  ],
+  "build": {
+    "build_command": "make"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": []
+}

@@ -1,4 +1,4 @@
-use core::{ptr::null_mut, sync::atomic::compiler_fence};
+use core::sync::atomic::compiler_fence;
 
 use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
 
@@ -14,8 +14,7 @@ use crate::{
 use super::core::{sched_enqueue, Scheduler};
 
 /// 声明全局的rt调度器实例
-
-pub static mut RT_SCHEDULER_PTR: *mut SchedulerRT = null_mut();
+pub static mut RT_SCHEDULER_PTR: Option<Box<SchedulerRT>> = None;
 
 /// @brief 获取rt调度器实例的可变引用
 #[inline]
@@ -26,14 +25,13 @@ pub fn __get_rt_scheduler() -> &'static mut SchedulerRT {
 /// @brief 初始化rt调度器
 pub unsafe fn sched_rt_init() {
     kdebug!("rt scheduler init");
-    if RT_SCHEDULER_PTR.is_null() {
-        RT_SCHEDULER_PTR = Box::leak(Box::new(SchedulerRT::new()));
+    if RT_SCHEDULER_PTR.is_none() {
+        RT_SCHEDULER_PTR = Some(Box::new(SchedulerRT::new()));
     } else {
         kBUG!("Try to init RT Scheduler twice.");
         panic!("Try to init RT Scheduler twice.");
     }
 }
-
 /// @brief RT队列（per-cpu的）
 #[derive(Debug)]
 struct RTQueue {
@@ -52,22 +50,22 @@ impl RTQueue {
     }
     /// @brief 将pcb加入队列
     pub fn enqueue(&mut self, pcb: &'static mut process_control_block) {
-        let mut rflags = 0u64;
+        let mut rflags = 0usize;
         self.lock.lock_irqsave(&mut rflags);
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.pid == 0 {
-            self.lock.unlock_irqrestore(&rflags);
+            self.lock.unlock_irqrestore(rflags);
             return;
         }
         self.queue.push_back(pcb);
-        self.lock.unlock_irqrestore(&rflags);
+        self.lock.unlock_irqrestore(rflags);
     }
 
     /// @brief 将pcb从调度队列头部取出,若队列为空，则返回None
     pub fn dequeue(&mut self) -> Option<&'static mut process_control_block> {
         let res: Option<&'static mut process_control_block>;
-        let mut rflags = 0u64;
+        let mut rflags = 0usize;
         self.lock.lock_irqsave(&mut rflags);
         if self.queue.len() > 0 {
             // 队列不为空，返回下一个要执行的pcb
@@ -76,20 +74,20 @@ impl RTQueue {
             // 如果队列为空，则返回None
             res = None;
         }
-        self.lock.unlock_irqrestore(&rflags);
+        self.lock.unlock_irqrestore(rflags);
         return res;
     }
     pub fn enqueue_front(&mut self, pcb: &'static mut process_control_block) {
-        let mut rflags = 0u64;
+        let mut rflags = 0usize;
         self.lock.lock_irqsave(&mut rflags);
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.pid == 0 {
-            self.lock.unlock_irqrestore(&rflags);
+            self.lock.unlock_irqrestore(rflags);
             return;
         }
         self.queue.push_front(pcb);
-        self.lock.unlock_irqrestore(&rflags);
+        self.lock.unlock_irqrestore(rflags);
     }
     pub fn get_rt_queue_size(&mut self) -> usize {
         return self.queue.len();

@@ -46,6 +46,7 @@ pub fn softirq_init() -> Result<(), SystemError> {
             cpu_pending[i as usize] = VecStatus::default();
         }
     }
+    kinfo!("Softirq initialized.");
     return Ok(());
 }
 
@@ -225,18 +226,17 @@ impl Softirq {
     }
 
     pub fn raise_softirq(&self, softirq_num: SoftirqNumber) {
-        let mut flags = 0;
-        local_irq_save(&mut flags);
+        let flags = local_irq_save();
         let processor_id = smp_get_processor_id() as usize;
 
         cpu_pending(processor_id).insert(VecStatus::from(softirq_num));
 
         compiler_fence(Ordering::SeqCst);
 
-        local_irq_restore(&flags);
+        local_irq_restore(flags);
         // kdebug!("raise_softirq exited");
     }
-    pub fn clear_softirq_pending(&self, softirq_num: SoftirqNumber) {
+    pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber) {
         compiler_fence(Ordering::SeqCst);
         cpu_pending(smp_get_processor_id() as usize).remove(VecStatus::from(softirq_num));
         compiler_fence(Ordering::SeqCst);
@@ -261,5 +261,7 @@ pub extern "C" fn rs_do_softirq() {
 
 #[no_mangle]
 pub extern "C" fn rs_clear_softirq_pending(softirq_num: u32) {
-    softirq_vectors().clear_softirq_pending(SoftirqNumber::from(softirq_num as u64));
+    unsafe {
+        softirq_vectors().clear_softirq_pending(SoftirqNumber::from(softirq_num as u64));
+    }
 }

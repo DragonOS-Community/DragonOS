@@ -15,8 +15,7 @@ use crate::{
 use super::core::{sched_enqueue, Scheduler};
 
 /// 声明全局的cfs调度器实例
-
-pub static mut CFS_SCHEDULER_PTR: *mut SchedulerCFS = null_mut();
+pub static mut CFS_SCHEDULER_PTR: Option<Box<SchedulerCFS>> = None;
 
 /// @brief 获取cfs调度器实例的可变引用
 #[inline]
@@ -26,8 +25,8 @@ pub fn __get_cfs_scheduler() -> &'static mut SchedulerCFS {
 
 /// @brief 初始化cfs调度器
 pub unsafe fn sched_cfs_init() {
-    if CFS_SCHEDULER_PTR.is_null() {
-        CFS_SCHEDULER_PTR = Box::leak(Box::new(SchedulerCFS::new()));
+    if CFS_SCHEDULER_PTR.is_none() {
+        CFS_SCHEDULER_PTR = Some(Box::new(SchedulerCFS::new()));
     } else {
         kBUG!("Try to init CFS Scheduler twice.");
         panic!("Try to init CFS Scheduler twice.");
@@ -37,7 +36,7 @@ pub unsafe fn sched_cfs_init() {
 /// @brief CFS队列（per-cpu的）
 #[derive(Debug)]
 struct CFSQueue {
-    /// 当前cpu上执行的进程，剩余的时间片
+    /// 当前cpu上执行的进程剩余的时间片
     cpu_exec_proc_jiffies: i64,
     /// 队列的锁
     lock: RawSpinlock,
@@ -59,24 +58,24 @@ impl CFSQueue {
 
     /// @brief 将pcb加入队列
     pub fn enqueue(&mut self, pcb: &'static mut process_control_block) {
-        let mut rflags = 0u64;
+        let mut rflags = 0usize;
         self.lock.lock_irqsave(&mut rflags);
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.pid == 0 {
-            self.lock.unlock_irqrestore(&rflags);
+            self.lock.unlock_irqrestore(rflags);
             return;
         }
 
         self.queue.insert(pcb.virtual_runtime, pcb);
 
-        self.lock.unlock_irqrestore(&rflags);
+        self.lock.unlock_irqrestore(rflags);
     }
 
     /// @brief 将pcb从调度队列中弹出,若队列为空，则返回IDLE进程的pcb
     pub fn dequeue(&mut self) -> &'static mut process_control_block {
         let res: &'static mut process_control_block;
-        let mut rflags = 0u64;
+        let mut rflags = 0usize;
         self.lock.lock_irqsave(&mut rflags);
         if !self.queue.is_empty() {
             // 队列不为空，返回下一个要执行的pcb
@@ -85,7 +84,7 @@ impl CFSQueue {
             // 如果队列为空，则返回IDLE进程的pcb
             res = unsafe { self.idle_pcb.as_mut().unwrap() };
         }
-        self.lock.unlock_irqrestore(&rflags);
+        self.lock.unlock_irqrestore(rflags);
         return res;
     }
 
@@ -100,7 +99,7 @@ impl CFSQueue {
         }
     }
     /// 获取运行队列的长度
-    pub fn get_cfs_queue_size(&mut self) -> usize {
+    fn get_cfs_queue_size(&mut self) -> usize {
         return self.queue.len();
     }
 }

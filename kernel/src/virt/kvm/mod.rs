@@ -58,8 +58,8 @@ pub extern "C" fn kvm_init() {
     let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
     let host_stack = vec![0xCC; GUEST_STACK_SIZE];
 
-    let hypervisor = Hypervisor::new(1, 1, host_stack.as_ptr() as u64).expect("Cannot create hypervisor");
-    let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
+    let hypervisor = Hypervisor::new(1, 1, (host_stack.as_ptr() as u64) + VMM_STACK_SIZE  as u64).expect("Cannot create hypervisor");
+    let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
     vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
 
     devfs_register("kvm", LockedKvmInode::new())
@@ -69,8 +69,8 @@ pub extern "C" fn kvm_init() {
 #[no_mangle]
 fn guest_code(){
     kdebug!("guest code");
-    unsafe {asm!("cpuid");}
     while true {
+        unsafe {asm!("cpuid");}
         unsafe {asm!("nop")};
     }
 }

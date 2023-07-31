@@ -12,13 +12,13 @@ use core::{
     intrinsics::unlikely,
     ops::{Add, AddAssign, Deref, DerefMut, Sub},
     ptr::copy_nonoverlapping,
-    sync::atomic::{AtomicI32, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 use thingbuf::mpsc;
 
 use super::{
     screen_manager::{
-        scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
+        scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata, scm_disable_put_to_window,
     },
     textui_no_alloc::no_init_textui_putchar_window,
 };
@@ -66,10 +66,9 @@ pub const TEXTUI_CHAR_WIDTH: u32 = 8;
 
 pub const TEXTUI_CHAR_HEIGHT: u32 = 16;
 
-pub static mut TEST_IS_INIT: bool = false;
+pub static mut TESTUI_IS_INIT: bool = false;
 
-/// 因为只在未初始化textui之前而其他模块使用的内存将要到达48M时到在初始化textui时才为false,所以只会修改两次，应该不需加锁
-pub static mut ENABLE_PUT_TO_WINDOW: bool = true; 
+pub static ENABLE_PUT_TO_WINDOW: AtomicBool = AtomicBool::new(true);
 
 /// 利用mpsc实现当前窗口
 
@@ -256,18 +255,6 @@ pub struct TextuiCharChromatic {
     bkcolor: FontColor, // rgb
 }
 
-// pub fn set_textui_buf_vaddr(vaddr: usize) {
-//     // *TEXTUI_BUF_VADDR.write() = vaddr;
-//     TEXTUI_BUF_VADDR.store(vaddr, Ordering::SeqCst);
-// }
-// pub fn set_textui_buf_size(size: usize) {
-//     // *TEXTUI_BUF_SIZE.write() = size;
-//     TEXTUI_BUF_SIZE.store(size, Ordering::SeqCst);
-// }
-// pub fn set_textui_buf_width(width: u32) {
-//     // *TEXTUI_BUF_WIDTH.write() = width;
-//     TEXTUI_BUF_WIDTH.store(width, Ordering::SeqCst);
-// }
 #[derive(Debug)]
 pub struct TextuiBuf<'a>(&'a mut [u32]);
 
@@ -276,8 +263,10 @@ impl TextuiBuf<'_> {
         TextuiBuf(buf)
     }
     pub fn get_buf_from_vaddr(vaddr: usize, len: usize) -> TextuiBuf<'static> {
+        // 这里mm未初始化时不能使用from_raw_parts_mut方法,会卡住，所以暂时只能用裸指针
         let new_buf: &mut [u32] =
             unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u32, len) };
+
         let buf: TextuiBuf<'_> = TextuiBuf::new(new_buf);
         return buf;
     }
@@ -344,13 +333,10 @@ impl TextuiCharChromatic {
 
         let mut count = TextuiBuf::get_start_index_by_lineid_lineindex(lineid, lineindex);
 
-        // let buf=TEXTUI_BUF.lock();
-        // let vaddr = *TEXTUI_BUF_VADDR.read();
-        // let vaddr = TEXTUI_BUF_VADDR.load(Ordering::SeqCst);
         let vaddr = textui_framework().metadata.buf_info.vaddr();
-        // let len = *TEXTUI_BUF_SIZE.read();
-        // let len = TEXTUI_BUF_SIZE.load(Ordering::SeqCst);
+
         let len = textui_framework().metadata.buf_info.buf_size_about_u32() as usize;
+
         let mut buf = TextuiBuf::get_buf_from_vaddr(vaddr, len);
         // 在缓冲区画出一个字体，每个字体有TEXTUI_CHAR_HEIGHT行，TEXTUI_CHAR_WIDTH列个像素点
         for i in 0..TEXTUI_CHAR_HEIGHT {
@@ -367,6 +353,7 @@ impl TextuiCharChromatic {
             }
             count = TextuiBuf::get_index_of_next_line(start);
         }
+
         return Ok(0);
     }
 
@@ -390,18 +377,44 @@ impl TextuiCharChromatic {
         for i in 0..TEXTUI_CHAR_HEIGHT {
             // 计算出帧缓冲区每一行打印的起始位置的地址（起始位置+（y+i）*缓冲区的宽度+x）
 
-            let mut addr: *mut u32 = (fb as u32
-                + unsafe { video_frame_buffer_info.width } * 4 * (y as u32 + i)
-                + 4 * x as u32) as *mut u32;
+            let mut addr: *mut u32 = (fb
+                + unsafe { video_frame_buffer_info.width } as u64 * 4 * (y as u64 + i as u64)
+                + 4 * x as u64) as *mut u32;
+            // let mut addr: *mut u32 = (fb as u32
+            //     + unsafe { video_frame_buffer_info.width } * 4 *(y as u32 + i)
+            //     + 4 * x as u32) as *mut u32;
 
             testbit = 1 << (TEXTUI_CHAR_WIDTH + 1);
+
             for _j in 0..TEXTUI_CHAR_WIDTH {
                 //从左往右逐个测试相应位
                 testbit >>= 1;
                 if (font[i as usize] & testbit as u8) != 0 {
                     unsafe { *addr = self.frcolor.into() }; // 字，显示前景色
+                                                            // test
+                    if lineid.0 == 20 && lineindex.0 == 6 {
+                        c_uart_send_str(
+                            UartPort::COM1.to_u16(),
+                            "\ntext ui initialized3333333333333\n\0".as_ptr(),
+                        );
+                    }
                 } else {
+                    // test
+                    // if lineid.0 == 20 && lineindex.0 == 6 {
+                    //     // assert!(addr==0xffffa00003000000);
+                    //     c_uart_send_str(
+                    //         UartPort::COM1.to_u16(),
+                    //         "\ntext ui initialized555555555555555555555555\n\0".as_ptr(),
+                    //     );
+                    //     // kinfo!("video:{:018X} vaddr:{:018X}",unsafe{fb},addr);
+
+                    // }
                     unsafe { *addr = self.bkcolor.into() }; // 背景色
+                                                            // if lineid.0 == 20 && lineindex.0 == 6 {
+                                                            //     // assert!(addr==0xffffa00003000000);
+                                                            //     kinfo!("vaddr:{:?}",addr);
+
+                    // }
                 }
 
                 unsafe {
@@ -487,7 +500,7 @@ impl TextuiWindow {
     /// -flags 标志位
     /// -vlines_num 虚拟行的总数
     /// -chars_num 每行最大的字符数
-    
+
     pub fn new(flags: WindowFlag, vlines_num: i32, chars_num: i32) -> Self {
         let mut initial_vlines = Vec::new();
 
@@ -508,7 +521,6 @@ impl TextuiWindow {
         }
     }
 
-
     /// 刷新某个窗口的缓冲区的某个虚拟行的连续n个字符对象
     /// ## 参数
     /// - window 窗口结构体
@@ -522,7 +534,6 @@ impl TextuiWindow {
         start: LineIndex,
         count: i32,
     ) -> Result<i32, SystemError> {
-
         let actual_line_sum = textui_framework().actual_line.load(Ordering::SeqCst);
 
         // 判断虚拟行参数是否合法
@@ -696,6 +707,7 @@ impl TextuiWindow {
         character: u8,
         frcolor: FontColor,
         bkcolor: FontColor,
+        is_enable_window: bool,
     ) -> Result<i32, SystemError> {
         let actual_line_sum = textui_framework().actual_line.load(Ordering::SeqCst);
 
@@ -712,89 +724,96 @@ impl TextuiWindow {
         if character == b'\n' {
             // 换行时还需要输出\r
             c_uart_send(UartPort::COM1.to_u16(), b'\r');
-            self.textui_new_line()?;
-
+            if is_enable_window == true {
+                self.textui_new_line()?;
+            }
             return Ok(0);
         }
         // 输出制表符
         else if character == b'\t' {
-            if let TextuiVline::Chromatic(vline) =
-                &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
-            {
-                //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
-                let mut space_to_print = 8 - <LineIndex as Into<usize>>::into(vline.index) % 8;
-                while space_to_print > 0 {
-                    self.true_textui_putchar_window(b' ', frcolor, bkcolor)?;
-                    space_to_print -= 1;
+            if is_enable_window == true {
+                if let TextuiVline::Chromatic(vline) =
+                    &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                {
+                    //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
+                    let mut space_to_print = 8 - <LineIndex as Into<usize>>::into(vline.index) % 8;
+                    while space_to_print > 0 {
+                        self.true_textui_putchar_window(b' ', frcolor, bkcolor)?;
+                        space_to_print -= 1;
+                    }
                 }
             }
         }
         // 字符 '\x08' 代表 ASCII 码中的退格字符。它在输出中的作用是将光标向左移动一个位置，并在该位置上输出后续的字符，从而实现字符的删除或替换。
         else if character == b'\x08' {
-            let mut tmp = LineIndex(0);
-            if let TextuiVline::Chromatic(vline) =
-                &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
-            {
-
-                vline.index = vline.index - 1;
-                tmp = vline.index;
-            }
-            if <LineIndex as Into<i32>>::into(tmp) >= 0 {
+            if is_enable_window == true {
+                let mut tmp = LineIndex(0);
                 if let TextuiVline::Chromatic(vline) =
                     &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
                 {
-                    if let Some(v_char) = vline.chars.get_mut(<LineIndex as Into<usize>>::into(tmp))
-                    {
-                        v_char.c = b' ';
-
-                        v_char.bkcolor = bkcolor;
-                    }
+                    vline.index = vline.index - 1;
+                    tmp = vline.index;
                 }
-                return self.textui_refresh_characters(self.vline_operating, tmp, 1);
-            }
-            // 需要向上缩一行
-            if <LineIndex as Into<i32>>::into(tmp) < 0 {
-                // 当前行为空,需要重新刷新
-                if let TextuiVline::Chromatic(vline) =
-                    &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
-                {
-                    vline.index = LineIndex::new(0);
-                    for i in 0..self.chars_per_line {
-                        if let Some(v_char) = vline.chars.get_mut(i as usize) {
-                            v_char.c = 0;
-                            v_char.frcolor = FontColor::BLACK;
-                            v_char.bkcolor = FontColor::BLACK;
+                if <LineIndex as Into<i32>>::into(tmp) >= 0 {
+                    if let TextuiVline::Chromatic(vline) =
+                        &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                    {
+                        if let Some(v_char) =
+                            vline.chars.get_mut(<LineIndex as Into<usize>>::into(tmp))
+                        {
+                            v_char.c = b' ';
+
+                            v_char.bkcolor = bkcolor;
                         }
                     }
+                    return self.textui_refresh_characters(self.vline_operating, tmp, 1);
                 }
-                // 上缩一行
-                self.vline_operating = self.vline_operating - 1;
-                if self.vline_operating.data() < 0 {
-                    self.vline_operating = LineId(self.vline_sum - 1);
-                }
-
-                // 考虑是否向上滚动（在top_vline上退格）
-                if self.vlines_used > actual_line_sum {
-                    self.top_vline = self.top_vline - 1;
-                    if <LineId as Into<i32>>::into(self.top_vline) < 0 {
-                        self.top_vline = LineId(self.vline_sum - 1);
+                // 需要向上缩一行
+                if <LineIndex as Into<i32>>::into(tmp) < 0 {
+                    // 当前行为空,需要重新刷新
+                    if let TextuiVline::Chromatic(vline) =
+                        &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                    {
+                        vline.index = LineIndex::new(0);
+                        for i in 0..self.chars_per_line {
+                            if let Some(v_char) = vline.chars.get_mut(i as usize) {
+                                v_char.c = 0;
+                                v_char.frcolor = FontColor::BLACK;
+                                v_char.bkcolor = FontColor::BLACK;
+                            }
+                        }
                     }
+                    // 上缩一行
+                    self.vline_operating = self.vline_operating - 1;
+                    if self.vline_operating.data() < 0 {
+                        self.vline_operating = LineId(self.vline_sum - 1);
+                    }
+
+                    // 考虑是否向上滚动（在top_vline上退格）
+                    if self.vlines_used > actual_line_sum {
+                        self.top_vline = self.top_vline - 1;
+                        if <LineId as Into<i32>>::into(self.top_vline) < 0 {
+                            self.top_vline = LineId(self.vline_sum - 1);
+                        }
+                    }
+                    //因为上缩一行所以显示在屏幕中的虚拟行少一
+                    self.vlines_used -= 1;
+                    self.textui_refresh_vlines(self.top_vline, actual_line_sum)?;
                 }
-                //因为上缩一行所以显示在屏幕中的虚拟行少一
-                self.vlines_used -= 1;
-                self.textui_refresh_vlines(self.top_vline, actual_line_sum)?;
             }
         } else {
             // 输出其他字符
             c_uart_send(UartPort::COM1.to_u16(), character);
-            if let TextuiVline::Chromatic(vline) =
-                &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
-            {
-                if !vline.index.check(self.chars_per_line) {
-                    self.textui_new_line()?;
-                }
+            if is_enable_window == true {
+                if let TextuiVline::Chromatic(vline) =
+                    &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                {
+                    if !vline.index.check(self.chars_per_line) {
+                        self.textui_new_line()?;
+                    }
 
-                return self.true_textui_putchar_window(character, frcolor, bkcolor);
+                    return self.true_textui_putchar_window(character, frcolor, bkcolor);
+                }
             }
         }
 
@@ -887,17 +906,17 @@ impl ScmUiFramework for &mut TextUiFramework {
     }
     // 启用ui框架的回调函数
     fn enable(&self) -> Result<i32, SystemError> {
-        unsafe { ENABLE_PUT_TO_WINDOW = true };
+        ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
         return Ok(0);
     }
     // 禁用ui框架的回调函数
     fn disable(&self) -> Result<i32, SystemError> {
-        unsafe { ENABLE_PUT_TO_WINDOW = false };
+        ENABLE_PUT_TO_WINDOW.store(false, Ordering::SeqCst);
+
         return Ok(0);
     }
     // 改变ui框架的帧缓冲区的回调函数
     fn change(&self, buf: ScmBufferInfo) -> Result<i32, SystemError> {
-
         let src = self.metadata.buf_info.vaddr() as *const u8;
         let dst = buf.vaddr() as *mut u8;
         let count = self.metadata.buf_info.buf_size_about_u8() as usize;
@@ -908,7 +927,7 @@ impl ScmUiFramework for &mut TextUiFramework {
     }
     ///  获取ScmUiFramework的元数据
     ///  ## 返回值
-    /// 
+    ///
     ///  -成功：Ok(ScmUiFramework的元数据)
     ///  -失败：Err(错误码)
     fn metadata(&self) -> Result<ScmUiFrameworkMetadata, SystemError> {
@@ -942,7 +961,7 @@ impl DerefMut for TextUiFramework {
 #[no_mangle]
 pub extern "C" fn textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
     let result;
-    if unsafe { TEST_IS_INIT } {
+    if unsafe { TESTUI_IS_INIT } {
         result = textui_framework()
             .current_window
             .lock()
@@ -950,6 +969,7 @@ pub extern "C" fn textui_putchar(character: u8, fr_color: u32, bk_color: u32) ->
                 character,
                 FontColor::from(fr_color),
                 FontColor::from(bk_color),
+                ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
             )
             .unwrap_or_else(|e| e.to_posix_errno());
     } else {
@@ -958,7 +978,7 @@ pub extern "C" fn textui_putchar(character: u8, fr_color: u32, bk_color: u32) ->
             character,
             FontColor::from(fr_color),
             FontColor::from(bk_color),
-            unsafe { ENABLE_PUT_TO_WINDOW },
+            ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
         )
         .unwrap_or_else(|e| e.to_posix_errno());
     }
@@ -970,7 +990,6 @@ pub extern "C" fn textui_putchar(character: u8, fr_color: u32, bk_color: u32) ->
     }
     return result;
 }
-
 
 /// 初始化text ui框架
 
@@ -1010,13 +1029,15 @@ fn textui_init() -> Result<i32, SystemError> {
         .lock()
         .push_back(textui_framework.current_window.clone());
 
-    unsafe { TEST_IS_INIT = true };
+    unsafe { TESTUI_IS_INIT = true };
 
     scm_register(Arc::new(textui_framework))?;
-    
+
     c_uart_send_str(
         UartPort::COM1.to_u16(),
         "\ntext ui initialized\n\0".as_ptr(),
     );
+    scm_disable_put_to_window();
+
     return Ok(0);
 }

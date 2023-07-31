@@ -2,7 +2,7 @@
 #include <common/glib.h>
 #include <stdbool.h>
 #include <libs/libUI/screen_manager.h>
-struct scm_buffer_info_t video_frame_buffer_info = {0};
+extern struct scm_buffer_info_t video_frame_buffer_info;
 /**
  * @brief 重新初始化显示驱动，需先低级初始化才能高级初始化
  * @param level 初始化等级
@@ -21,9 +21,9 @@ int video_init();
 
 /**
  * @brief 设置帧缓冲区刷新目标
- * 
- * @param buf 
- * @return int 
+ *
+ * @param buf
+ * @return int
  */
 // int video_set_refresh_target(struct scm_buffer_info_t *buf);
 int video_set_refresh_target(struct scm_buffer_info_t buf);

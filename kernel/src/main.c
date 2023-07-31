@@ -102,15 +102,9 @@ void system_initialize()
     // 对显示模块进行低级初始化，不启用double buffer
 
     io_mfence();
-
     scm_reinit();
-
-
     rs_textui_init();
-    // kinfo("vaddr:%d", video_frame_buffer_info.vaddr);
-    // while (1);
-
-    scm_enable_put_to_window();
+    // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;

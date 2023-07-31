@@ -1,17 +1,17 @@
-#include "textui.h"
-#include <driver/uart/uart.h>
-#include <common/errno.h>
-#include "screen_manager.h"
+// #include "textui.h"
+// #include <driver/uart/uart.h>
+// #include <common/errno.h>
+// #include "screen_manager.h"
 
-#define WHITE 0x00ffffff  //白
-#define BLACK 0x00000000  //黑
-#define RED 0x00ff0000    //红
-#define ORANGE 0x00ff8000 //橙
-#define YELLOW 0x00ffff00 //黄
-#define GREEN 0x0000ff00  //绿
-#define BLUE 0x000000ff   //蓝
-#define INDIGO 0x0000ffff //靛
-#define PURPLE 0x008000ff //紫
+// #define WHITE 0x00ffffff  //白
+// #define BLACK 0x00000000  //黑
+// #define RED 0x00ff0000    //红
+// #define ORANGE 0x00ff8000 //橙
+// #define YELLOW 0x00ffff00 //黄
+// #define GREEN 0x0000ff00  //绿
+// #define BLUE 0x000000ff   //蓝
+// #define INDIGO 0x0000ffff //靛
+// #define PURPLE 0x008000ff //紫
 
 // // 根据rgb计算出最终的颜色值
 // #define calculate_color(r, g, b) ((((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff)) & 0x00ffffff)

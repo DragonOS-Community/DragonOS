@@ -1,32 +1,24 @@
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering}
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use alloc::{
-    collections::LinkedList,
-    string::String,
-    sync::Arc,
-};
+use alloc::{collections::LinkedList, string::String, sync::Arc};
 
 use crate::{
     driver::uart::uart::{c_uart_send_str, UartPort},
     include::bindings::bindings::{
-        alloc_pages, scm_buffer_info_t, video_frame_buffer_info,
-        video_reinitialize, video_set_refresh_target, Page, PAGE_2M_SIZE, ZONE_NORMAL,
+        scm_buffer_info_t, video_frame_buffer_info, video_reinitialize, video_set_refresh_target,
     },
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::{phys_2_virt, PAGE_2M_ALIGN},
+    mm::{c_adapter::kzalloc, VirtAddr},
     syscall::SystemError,
 };
 
-use super::{
-    textui::ENABLE_PUT_TO_WINDOW,
-    textui_no_alloc::textui_init_no_alloc,
-};
-
 use lazy_static::lazy_static;
+
+use super::textui_no_alloc::textui_init_no_alloc;
 
 lazy_static! {
     /// 全局的UI框架列表
@@ -34,7 +26,7 @@ lazy_static! {
         SpinLock::new(LinkedList::new());
     /// 当前在使用的UI框架
     pub static ref CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
-    
+
 }
 
 /// 是否启用双缓冲
@@ -64,29 +56,10 @@ pub struct ScmBufferInfo {
     height: u32,      // 帧缓冲区高度（pixel或lines）
     size: u32,        // 帧缓冲区大小（bytes）
     bit_depth: u32,   // 像素点位深度
-    vaddr: usize,     // 指向帧缓冲区的指针(用于video里面的scm_buffer_info_t)
+    vaddr: VirtAddr,     // 指向帧缓冲区的指针(用于video里面的scm_buffer_info_t)
     flags: ScmBfFlag, // 帧缓冲区标志位
 }
 
-fn alloc_pages_for_video_frame_buffer_info_size() -> Result<*mut Page, SystemError> {
-    let p: *mut Page = unsafe {
-        alloc_pages(
-            ZONE_NORMAL,
-            (PAGE_2M_ALIGN(video_frame_buffer_info.size) / PAGE_2M_SIZE) as i32,
-            0,
-        )
-    };
-    if p.is_null() {
-        return Err(SystemError::ENOMEM);
-    }
-    return Ok(p);
-}
-
-fn vaddr_of_double_buf() -> Result<usize, SystemError> {
-    let p = alloc_pages_for_video_frame_buffer_info_size()?;
-    let vaddr = phys_2_virt(((unsafe { *p }).addr_phys) as usize);
-    return Ok(vaddr);
-}
 
 impl ScmBufferInfo {
     /// 创建新的帧缓冲区信息
@@ -105,17 +78,17 @@ impl ScmBufferInfo {
             //创建双缓冲区
             let mut frame_buffer_info: ScmBufferInfo =
                 ScmBufferInfo::from(unsafe { &video_frame_buffer_info });
+
             frame_buffer_info.flags = buf_type;
 
-            frame_buffer_info.vaddr = vaddr_of_double_buf()?;
-            // println!("vaddr:{}", frame_buffer_info.vaddr);
+            frame_buffer_info.vaddr = VirtAddr::new(unsafe { kzalloc(video_frame_buffer_info.size as usize, 0) });
 
             return Ok(frame_buffer_info);
         }
     }
 
     pub fn vaddr(&self) -> usize {
-        self.vaddr
+        self.vaddr.data()
     }
     pub fn buf_size_about_u8(&self) -> u32 {
         self.size
@@ -138,7 +111,7 @@ impl From<&scm_buffer_info_t> for ScmBufferInfo {
             height: value.height,
             size: value.size,
             bit_depth: value.bit_depth,
-            vaddr: value.vaddr as usize,
+            vaddr: VirtAddr::new(value.vaddr as usize),
             flags: ScmBfFlag::from_bits_truncate(value.flags as u8),
         }
     }
@@ -150,7 +123,7 @@ impl Into<scm_buffer_info_t> for ScmBufferInfo {
             height: self.height,
             size: self.size,
             bit_depth: self.bit_depth,
-            vaddr: self.vaddr as u64,
+            vaddr: self.vaddr.data() as u64,
             flags: self.flags.bits as u64,
         }
     }
@@ -237,7 +210,7 @@ pub extern "C" fn scm_init() {
 
 /// 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
 /// ## 参数
-/// 
+///
 /// - framework 要启动的ui框架
 
 pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
@@ -245,11 +218,10 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
 
     let metadata = framework.metadata()?;
 
-    if metadata.buf_info.vaddr == 0 {
+    if metadata.buf_info.vaddr.data() == 0 {
         return Err(SystemError::EINVAL);
     }
     let mut current_framework = CURRENT_FRAMEWORK.write();
-
 
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == true {
         let buf: scm_buffer_info_t = metadata.buf_info.into();
@@ -266,7 +238,7 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
     return Ok(0);
 }
 /// 向屏幕管理器注册UI框架
-/// 
+///
 /// ## 参数
 /// - framework 框架结构体
 
@@ -277,12 +249,10 @@ pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemErr
     // 调用ui框架的回调函数以安装ui框架，并将其激活
     framework.install()?;
 
-
     // 如果当前还没有框架获得了屏幕的控制权，就让其拿去
     if CURRENT_FRAMEWORK.read().is_none() {
         return scm_framework_enable(framework);
     }
-
     return Ok(0);
 }
 
@@ -314,7 +284,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
 
     // 创建双缓冲区
     let buf_info = ScmBufferInfo::new(ScmBfFlag::SCM_BF_DB | ScmBfFlag::SCM_BF_PIXEL)?;
-   
+
     CURRENT_FRAMEWORK
         .write()
         .as_ref()
@@ -329,9 +299,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
     }
     // 通知显示驱动，启动双缓冲
     unsafe { video_reinitialize(true) };
-    // renew_buf(buf_info.vaddr(), buf_info.buf_height());
-    // println!("vaddr:{:#018x}",buf_info.get_vaddr());
-    // loop{}
+
     return Ok(0);
 }
 /// 允许往窗口打印信息
@@ -339,7 +307,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
 pub extern "C" fn scm_enable_put_to_window() {
     // mm之前要继续往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
-        unsafe { ENABLE_PUT_TO_WINDOW = true };
+        super::textui::ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
     } else {
         let r = CURRENT_FRAMEWORK
             .write()
@@ -360,7 +328,9 @@ pub extern "C" fn scm_enable_put_to_window() {
 pub extern "C" fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
-        unsafe { ENABLE_PUT_TO_WINDOW = false };
+        super::textui::ENABLE_PUT_TO_WINDOW.store(false, Ordering::SeqCst);
+        assert!(super::textui::ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst)==false);
+
     } else {
         let r = CURRENT_FRAMEWORK
             .write()
@@ -387,10 +357,13 @@ pub extern "C" fn scm_reinit() -> i32 {
 }
 fn true_scm_reinit() -> Result<i32, SystemError> {
     unsafe { video_reinitialize(false) };
+
     // 遍历当前所有使用帧缓冲区的框架，更新地址
     for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
         framework.change(unsafe { ScmBufferInfo::from(&video_frame_buffer_info) })?;
     }
-    // unsafe { scm_enable_put_to_window() };
+
+    scm_enable_put_to_window();
+
     return Ok(0);
 }

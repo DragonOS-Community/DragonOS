@@ -65,10 +65,10 @@ pub fn virt_2_phys(addr: usize) -> usize {
     addr - PAGE_OFFSET as usize
 }
 /// @brief 将addr按照x的上边界对齐
-#[inline(always)]
-pub fn PAGE_2M_ALIGN(addr:u32)-> u32{
-    (addr + PAGE_2M_SIZE - 1)& PAGE_2M_MASK as u32
-}
+// #[inline(always)]
+// pub fn PAGE_2M_ALIGN(addr:u32)-> u32{
+//     (addr + PAGE_2M_SIZE - 1)& PAGE_2M_MASK as u32
+// }
 /// @brief 将物理地址转换为内核空间的虚拟地址
 #[inline(always)]
 pub fn phys_2_virt(addr: usize) -> usize {

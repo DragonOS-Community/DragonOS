@@ -65,7 +65,10 @@ pub extern "C" fn kvm_init() {
 
 #[no_mangle]
 fn guest_code(){
-    unsafe {asm!("hlt")};
+    kdebug!("guest code");
+    while true {
+        unsafe {asm!("nop")};
+    }
 }
 // fn kvm_dev_ioctl_create_vm(data: usize) {
 //     let kvm: Arc<Kvm> = Arc::new(Kvm(

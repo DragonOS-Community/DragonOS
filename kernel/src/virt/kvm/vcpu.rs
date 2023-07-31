@@ -204,6 +204,77 @@ impl Vcpu {
     }
 
     pub fn vmcs_init_guest(&self) -> Result<(), SystemError>{
+        // segment field initialization
+        vmx_vmwrite(VmcsFields::GUEST_ES_SELECTOR as u32, segmentation::es().bits().into())?;
+        vmx_vmwrite(VmcsFields::GUEST_CS_SELECTOR as u32, segmentation::cs().bits().into())?;
+        vmx_vmwrite(VmcsFields::GUEST_SS_SELECTOR as u32, segmentation::ss().bits().into())?;
+        vmx_vmwrite(VmcsFields::GUEST_DS_SELECTOR as u32, segmentation::ds().bits().into())?;
+        vmx_vmwrite(VmcsFields::GUEST_FS_SELECTOR as u32, segmentation::fs().bits().into())?;
+        vmx_vmwrite(VmcsFields::GUEST_GS_SELECTOR as u32, segmentation::gs().bits().into())?;
+        vmx_vmwrite(VmcsFields::GUEST_LDTR_SELECTOR as u32, 0)?;
+        vmx_vmwrite(VmcsFields::GUEST_TR_SELECTOR as u32, unsafe{ x86::task::tr().bits().into() })?;
+        vmx_vmwrite(VmcsFields::GUEST_INTR_STATUS as u32, 0)?;
+        vmx_vmwrite(VmcsFields::GUEST_PML_INDEX as u32, 0)?;
+
+        vmx_vmwrite(VmcsFields::GUEST_VMCS_LINK_PTR as u32, u64::MAX)?;
+        vmx_vmwrite(VmcsFields::GUEST_DEBUGCTL as u32, 0)?;
+
+        vmx_vmwrite(VmcsFields::GUEST_CS_LIMIT as u32,  u64::MAX)?;
+        vmx_vmwrite(VmcsFields::GUEST_SS_LIMIT as u32,  u64::MAX)?;
+        vmx_vmwrite(VmcsFields::GUEST_DS_LIMIT as u32,  u64::MAX)?;
+        vmx_vmwrite(VmcsFields::GUEST_ES_LIMIT as u32,  u64::MAX)?;
+        vmx_vmwrite(VmcsFields::GUEST_FS_LIMIT as u32,  u64::MAX)?;
+        vmx_vmwrite(VmcsFields::GUEST_GS_LIMIT as u32,  u64::MAX)?;
+        vmx_vmwrite(VmcsFields::GUEST_TR_LIMIT as u32, 0x67 as u64)?;
+        vmx_vmwrite(VmcsFields::GUEST_LDTR_LIMIT as u32, u64::MAX )?;
+        vmx_vmwrite(
+            VmcsFields::GUEST_GDTR_LIMIT as u32, 
+            unsafe{
+                let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+                x86::dtables::sgdt(&mut pseudo_descriptpr);
+                pseudo_descriptpr.limit.into()
+            }
+        )?;
+        vmx_vmwrite(
+            VmcsFields::GUEST_IDTR_LIMIT as u32, 
+            unsafe{
+                let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+                x86::dtables::sidt(&mut pseudo_descriptpr);
+                pseudo_descriptpr.limit.into()
+            }
+        )?;
+
+        vmx_vmwrite(VmcsFields::GUEST_ES_ACCESS_RIGHTS as u32, 
+            if vmx_vmread(VmcsFields::GUEST_ES_SELECTOR as u32).unwrap() == 0 {0x10000}  else{ 0xc093} );
+        vmx_vmwrite(VmcsFields::GUEST_CS_ACCESS_RIGHTS as u32, 0xa09b);
+        vmx_vmwrite(VmcsFields::GUEST_SS_ACCESS_RIGHTS as u32, 0xc093);
+        vmx_vmwrite(VmcsFields::GUEST_DS_ACCESS_RIGHTS as u32,
+            if vmx_vmread(VmcsFields::GUEST_DS_SELECTOR as u32).unwrap() == 0 {0x10000}  else{0xc093});
+        vmx_vmwrite(VmcsFields::GUEST_FS_ACCESS_RIGHTS as u32,
+            if vmx_vmread(VmcsFields::GUEST_FS_SELECTOR as u32).unwrap() == 0 {0x10000}  else{0xc093});
+        vmx_vmwrite(VmcsFields::GUEST_GS_ACCESS_RIGHTS as u32,
+            if vmx_vmread(VmcsFields::GUEST_GS_SELECTOR as u32).unwrap() == 0 {0x10000}  else{0xc093});
+        vmx_vmwrite(VmcsFields::GUEST_LDTR_ACCESS_RIGHTS as u32, 0x10000);
+        vmx_vmwrite(VmcsFields::GUEST_TR_ACCESS_RIGHTS as u32, 0x8b);
+        vmx_vmwrite(VmcsFields::GUEST_INTERRUPTIBILITY_STATE as u32, 0);
+        vmx_vmwrite(VmcsFields::GUEST_ACTIVITY_STATE as u32, 0);
+        vmx_vmwrite(VmcsFields::GUEST_SYSENTER_CS as u32, vmx_vmread(VmcsFields::HOST_SYSENTER_CS as u32).unwrap());
+        vmx_vmwrite(VmcsFields::GUEST_VMX_PREEMPT_TIMER_VALUE as u32, 0);
+
+        vmx_vmwrite(VmcsFields::GUEST_ES_BASE as u32, 0);
+        vmx_vmwrite(VmcsFields::GUEST_CS_BASE as u32, 0);
+        vmx_vmwrite(VmcsFields::GUEST_SS_BASE as u32, 0);
+        vmx_vmwrite(VmcsFields::GUEST_DS_BASE as u32, 0);
+        vmx_vmwrite(VmcsFields::GUEST_FS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_FS_BASE as u32)})?;
+        vmx_vmwrite(VmcsFields::GUEST_GS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_GS_BASE as u32)})?;
+        vmx_vmwrite(VmcsFields::GUEST_LDTR_BASE as u32, 0);
+        vmx_vmwrite(VmcsFields::GUEST_TR_BASE as u32, vmx_vmread(VmcsFields::HOST_TR_BASE as u32).unwrap());
+        vmx_vmwrite(VmcsFields::GUEST_GDTR_BASE as u32, vmx_vmread(VmcsFields::HOST_GDTR_BASE as u32).unwrap());
+        vmx_vmwrite(VmcsFields::GUEST_IDTR_BASE as u32, vmx_vmread(VmcsFields::HOST_IDTR_BASE as u32).unwrap());
+        vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, 2);
+        vmx_vmwrite(VmcsFields::GUEST_SYSENTER_ESP as u32, vmx_vmread(VmcsFields::HOST_SYSENTER_ESP as u32).unwrap());
+        vmx_vmwrite(VmcsFields::GUEST_SYSENTER_EIP as u32, vmx_vmread(VmcsFields::HOST_SYSENTER_EIP as u32).unwrap());
+
         vmx_vmwrite(
             VmcsFields::GUEST_CR0 as u32, 
             unsafe{ controlregs::cr0().bits().try_into().unwrap() }
@@ -223,104 +294,9 @@ impl Vcpu {
         vmx_vmwrite(VmcsFields::GUEST_RSP as u32, self.data.guest_rsp as u64)?;
         vmx_vmwrite(VmcsFields::GUEST_RIP as u32, self.data.guest_rip as u64)?;
 
-        vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, x86::bits64::rflags::read().bits())?;
+        // vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, x86::bits64::rflags::read().bits())?;
         vmx_vmwrite(VmcsFields::GUEST_DEBUGCTL as u32, unsafe {msr::rdmsr(msr::IA32_DEBUGCTL)})?;
 
-        // fast entry into the kernel
-        vmx_vmwrite(VmcsFields::GUEST_SYSENTER_ESP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_ESP)})?;
-        vmx_vmwrite(VmcsFields::GUEST_SYSENTER_EIP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_EIP)})?;
-        vmx_vmwrite(VmcsFields::GUEST_SYSENTER_CS as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_CS)})?;
-
-        vmx_vmwrite(VmcsFields::GUEST_VMCS_LINK_PTR as u32, u64::MAX)?;
-
-        vmx_vmwrite(VmcsFields::GUEST_FS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_FS_BASE)})?;
-        vmx_vmwrite(VmcsFields::GUEST_GS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_GS_BASE)})?;
-        
-        // segment field initialization
-        vmx_vmwrite(VmcsFields::GUEST_CS_SELECTOR as u32, segmentation::cs().bits().into())?;
-        vmx_vmwrite(VmcsFields::GUEST_SS_SELECTOR as u32, segmentation::ss().bits().into())?;
-        vmx_vmwrite(VmcsFields::GUEST_DS_SELECTOR as u32, segmentation::ds().bits().into())?;
-        vmx_vmwrite(VmcsFields::GUEST_ES_SELECTOR as u32, segmentation::es().bits().into())?;
-        vmx_vmwrite(VmcsFields::GUEST_FS_SELECTOR as u32, segmentation::fs().bits().into())?;
-        vmx_vmwrite(VmcsFields::GUEST_GS_SELECTOR as u32, segmentation::gs().bits().into())?;
-        vmx_vmwrite(VmcsFields::GUEST_LDTR_SELECTOR as u32, unsafe{ x86::dtables::ldtr().bits().into() })?;
-        vmx_vmwrite(VmcsFields::GUEST_TR_SELECTOR as u32, unsafe{ x86::task::tr().bits().into() })?;
-        vmx_vmwrite(VmcsFields::GUEST_CS_LIMIT as u32, 0x0000_ffff as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_SS_LIMIT as u32, 0x0000_ffff as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_DS_LIMIT as u32, 0x0000_ffff as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_ES_LIMIT as u32, 0x0000_ffff as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_FS_LIMIT as u32, 0x0000_ffff as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_GS_LIMIT as u32, 0x0000_ffff as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_TR_LIMIT as u32, 0x0000_ffff as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_LDTR_LIMIT as u32, 0x0000_ffff as u64)?;
-
-        vmx_vmwrite(
-            VmcsFields::GUEST_GDTR_LIMIT as u32, 
-            unsafe{
-                let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-                x86::dtables::sgdt(&mut pseudo_descriptpr);
-                pseudo_descriptpr.limit.into()
-            }
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_IDTR_LIMIT as u32, 
-            unsafe{
-                let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-                x86::dtables::sidt(&mut pseudo_descriptpr);
-                pseudo_descriptpr.limit.into()
-            }
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_GDTR_BASE as u32, 
-            unsafe{
-                let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-                x86::dtables::sgdt(&mut pseudo_descriptpr);
-                pseudo_descriptpr.base.to_bits() as u64
-            }
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_IDTR_BASE as u32, 
-            unsafe{
-                let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-                x86::dtables::sidt(&mut pseudo_descriptpr);
-                pseudo_descriptpr.base.to_bits() as u64
-            }
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_CS_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(segmentation::cs().bits().into()) as u64
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_SS_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(segmentation::cs().bits().into()) as u64
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_DS_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(segmentation::ds().bits().into()) as u64
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_ES_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(segmentation::es().bits().into()) as u64
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_FS_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(segmentation::fs().bits().into()) as u64
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_GS_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(segmentation::gs().bits().into()) as u64
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_LDTR_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(unsafe{ x86::dtables::ldtr().bits().into() }) as u64
-        )?;
-        vmx_vmwrite(
-            VmcsFields::GUEST_TR_ACCESS_RIGHTS as u32, 
-            read_segment_access_rights(unsafe{ x86::task::tr().bits().into() }) as u64
-        )?;
-        // FIXME: need to update, set 0 here
-        vmx_vmwrite(VmcsFields::GUEST_LDTR_BASE as u32, 0x0 as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_TR_BASE as u32, 0x0 as u64)?;
 
         Ok(())
     }
@@ -402,9 +378,8 @@ impl Vcpu {
         vmx_vmwrite(VmcsFields::CTRL_SECONDARY_PROCESSOR_VM_EXEC_CTRLS as u32, adjust_vmx_secondary_process_exec_controls() as u64)?;
 
         vmx_vmwrite(VmcsFields::GUEST_TR_BASE as u32, 0x0 as u64)?;
-        self.vmcs_init_guest()?;
         self.vmcs_init_host()?;
-
+        self.vmcs_init_guest()?;
         Ok(())
     }
 }
@@ -596,3 +571,4 @@ fn set_cr4_bits() {
 
     unsafe { controlregs::cr4_write(cr4) };
 }
+

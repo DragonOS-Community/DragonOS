@@ -60,4 +60,3 @@
 
 #define SYS_FSTAT 47        // 根据文件描述符获取文件信息
 
-#define SYS_AHCI_END_REQ 255 // AHCI DMA请求结束end_request的系统调用

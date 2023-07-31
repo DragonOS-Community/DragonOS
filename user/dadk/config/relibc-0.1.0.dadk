@@ -4,7 +4,7 @@
   "description": "从GitHub克隆最新的relibc来编译",
   "task_type": {
     "BuildFromSource": {
-     "Git": {
+      "Git": {
         "url": "https://github.com/DragonOS-Community/relibc.git",
         "branch": "dragonos-relibc",
         "revision": null

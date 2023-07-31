@@ -103,7 +103,7 @@ impl PosixKstat {
     }
 }
 impl Syscall {
-    pub fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
+    fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
         let cur = current_pcb();
         match cur.get_file_ref_by_fd(fd) {
             Some(file) => {

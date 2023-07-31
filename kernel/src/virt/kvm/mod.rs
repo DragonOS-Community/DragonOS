@@ -16,6 +16,7 @@ mod vmx_asm_wrapper;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
 pub const GUEST_STACK_SIZE:usize = 64;
+pub const VMM_STACK_SIZE:usize = 0x1000 * 6;
 
 
 
@@ -55,7 +56,9 @@ pub extern "C" fn kvm_init() {
     //     panic!("Failed to register /dev/kvm");
     // }
     let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
-    let hypervisor = Hypervisor::new(1, 1).expect("Cannot create hypervisor");
+    let host_stack = vec![0xCC; GUEST_STACK_SIZE];
+
+    let hypervisor = Hypervisor::new(1, 1, host_stack.as_ptr() as u64).expect("Cannot create hypervisor");
     let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
     vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
 
@@ -66,6 +69,7 @@ pub extern "C" fn kvm_init() {
 #[no_mangle]
 fn guest_code(){
     kdebug!("guest code");
+    unsafe {asm!("cpuid");}
     while true {
         unsafe {asm!("nop")};
     }

@@ -5,13 +5,12 @@ use crate::syscall::SystemError;
 use crate::virt::kvm::Vcpu;
 use core::arch::asm;
 use crate::{kdebug};
-pub const VMM_STACK_SIZE:usize = 0x1000 * 6;
 
 pub struct Hypervisor {
     sys_fd: u32,	/* For system ioctls(), i.e. /dev/kvm */
     nr_vcpus: u32,  /* Number of cpus to run */
     vcpu: Vec<Vcpu>,
-    pub stack: Vec<u8>,
+    pub host_stack: u64,
 
 // 	vm_fd: u32,  	/* For VM ioctls() */
 //     timerid: u32,   /* Posix timer for interrupts */
@@ -26,18 +25,17 @@ pub struct Hypervisor {
 }
 
 impl Hypervisor {
-    pub fn new(sys_fd:u32, nr_vcpus: u32) -> Result<Box<Self>, SystemError> {
+    pub fn new(sys_fd:u32, nr_vcpus: u32, host_stack: u64) -> Result<Box<Self>, SystemError> {
         let mut vcpu = Vec::new();
         // for i in 0..nr_vcpus {
         //     vcpu.push(Vcpu::new(i, Arc::new(hypervisor))?);
         // }
         // Allocate stack for vm-exit handlers and fill it with garbage data
-        let stack = vec![0xCC; VMM_STACK_SIZE];
         let instance = Self {
             sys_fd,
             nr_vcpus,
             vcpu,
-            stack,
+            host_stack,
         };
         let mut instance = Box::new(instance);
         Ok(instance)
@@ -89,37 +87,42 @@ unsafe fn restore_rpg(){
     );
 }
 
+#[no_mangle]
 pub unsafe fn vmx_return(){
-    save_rpg();
-    // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
-    asm!(
-        "sub     rsp, 68h",
-        "movaps  xmmword ptr [rsp +  0h], xmm0",
-        "movaps  xmmword ptr [rsp + 10h], xmm1",
-        "movaps  xmmword ptr [rsp + 20h], xmm2",
-        "movaps  xmmword ptr [rsp + 30h], xmm3",
-        "movaps  xmmword ptr [rsp + 40h], xmm4",
-        "movaps  xmmword ptr [rsp + 50h], xmm5",
+    kdebug!("vmx_return!");
+    while true {
+        unsafe {asm!("nop")};
+    }
+    // save_rpg();
+    // // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
+    // asm!(
+    //     "sub     rsp, 68h",
+    //     "movaps  xmmword ptr [rsp +  0h], xmm0",
+    //     "movaps  xmmword ptr [rsp + 10h], xmm1",
+    //     "movaps  xmmword ptr [rsp + 20h], xmm2",
+    //     "movaps  xmmword ptr [rsp + 30h], xmm3",
+    //     "movaps  xmmword ptr [rsp + 40h], xmm4",
+    //     "movaps  xmmword ptr [rsp + 50h], xmm5",
 
-        "mov     rcx, rsp",
-        "sub     rsp, 20h",
-        "call vmexit_handler",
+    //     "mov     rcx, rsp",
+    //     "sub     rsp, 20h",
+    //     "call vmexit_handler",
 
-        "add     rsp, 20h",
-        "movaps  xmm0, xmmword ptr [rsp +  0h]",
-        "movaps  xmm1, xmmword ptr [rsp + 10h]",
-        "movaps  xmm2, xmmword ptr [rsp + 20h]",
-        "movaps  xmm3, xmmword ptr [rsp + 30h]",
-        "movaps  xmm4, xmmword ptr [rsp + 40h]",
-        "movaps  xmm5, xmmword ptr [rsp + 50h]",
-        "add     rsp, 68h",
+    //     "add     rsp, 20h",
+    //     "movaps  xmm0, xmmword ptr [rsp +  0h]",
+    //     "movaps  xmm1, xmmword ptr [rsp + 10h]",
+    //     "movaps  xmm2, xmmword ptr [rsp + 20h]",
+    //     "movaps  xmm3, xmmword ptr [rsp + 30h]",
+    //     "movaps  xmm4, xmmword ptr [rsp + 40h]",
+    //     "movaps  xmm5, xmmword ptr [rsp + 50h]",
+    //     "add     rsp, 68h",
 
         
-    );
-    restore_rpg();
-    asm!(
-        "vmresume"
-    );
+    // );
+    // restore_rpg();
+    // asm!(
+    //     "vmresume"
+    // );
 }
 
 #[no_mangle]

@@ -165,7 +165,7 @@ pub enum VmcsFields {
     GUEST_ACTIVITY_STATE = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 19) as isize,
     GUEST_SMBASE = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 20) as isize,
     GUEST_SYSENTER_CS = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 21) as isize,
-    GUEST_VMX_PREEMPT_TIMER_VALUE = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 22) as isize,
+    GUEST_VMX_PREEMPT_TIMER_VALUE = 0x482E as isize,
     // natural guest fields
     GUEST_CR0 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 0) as isize,
     GUEST_CR3 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 1) as isize,

@@ -1,7 +1,7 @@
 use crate::syscall::SystemError;
 use x86;
 use crate::{kdebug};
-
+use crate::virt::kvm::vmcs::{ VmcsFields};
 /// Enable VMX operation.
 pub fn vmxon(vmxon_pa: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmxon(vmxon_pa) } {
@@ -27,6 +27,7 @@ pub fn vmx_vmwrite(vmcs_field: u32, value: u64) -> Result<(), SystemError> {
         Ok(_) => Ok(()),
         Err(e) => {
             kdebug!("vmx_write fail: {:?}", e);
+            kdebug!("vmcs_field: {:x}", vmcs_field);
             Err(SystemError::EVMWRITEFailed)
         },
     }

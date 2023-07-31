@@ -48,7 +48,7 @@ pub mod preempt;
 pub mod process;
 pub mod syscall;
 
-const PCB_NAME_LEN: usize = 16;
+
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);

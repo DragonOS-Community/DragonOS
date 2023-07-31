@@ -18,7 +18,7 @@ use thingbuf::mpsc;
 
 use super::{
     screen_manager::{
-        scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata, scm_disable_put_to_window,
+        scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
     },
     textui_no_alloc::no_init_textui_putchar_window,
 };
@@ -1037,7 +1037,6 @@ fn textui_init() -> Result<i32, SystemError> {
         UartPort::COM1.to_u16(),
         "\ntext ui initialized\n\0".as_ptr(),
     );
-    scm_disable_put_to_window();
 
     return Ok(0);
 }

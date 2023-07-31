@@ -896,7 +896,7 @@ impl Syscall {
                 if r.is_err() {
                     Err(r.unwrap_err())
                 } else {
-                    let timezone = if !timezone_ptr.is_null() {
+                    let timezone = if timezone_ptr.is_null() {
                         &SYS_TIMEZONE
                     } else {
                         unsafe { timezone_ptr.as_ref().unwrap() }

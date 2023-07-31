@@ -47,8 +47,6 @@ pub mod pid;
 pub mod preempt;
 pub mod process;
 pub mod syscall;
-pub mod kthread;
-pub mod wait_queue;
 
 const PCB_NAME_LEN: usize = 16;
 
@@ -179,7 +177,6 @@ pub struct ProcessControlBlock {
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
-
 }
 
 impl ProcessControlBlock {
@@ -378,13 +375,19 @@ impl ProcessBasicInfo {
     }
 
     pub fn set_name(&mut self, name: String) {
-        self.name = name;
+        return self.name = name;
     }
 
-    pub fn get_work_path(&self) -> String {
-        self.cwd.clone()
+    pub fn get_path(&self) -> String {
+        return self.cwd.clone();
     }
-    
+    pub fn set_path(&mut self, path: String) {
+        return self.cwd = path;
+    } 
+    pub fn append_to_path(&mut self, additional: &str) {
+        return self.cwd.push_str(additional);
+    }
+
     pub fn user_vm(&self) -> Option<Arc<AddressSpace>> {
         return self.user_vm.clone();
     }

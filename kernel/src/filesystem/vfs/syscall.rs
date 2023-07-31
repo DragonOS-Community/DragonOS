@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec,string::String};
 
 use crate::{
     arch::asm::current::current_pcb,
@@ -184,6 +184,7 @@ impl Syscall {
     /// ENAMETOOLONG |        路径过长        
     pub fn chdir(dest_path: &str) -> Result<usize, SystemError> {
         // Copy path to kernel space to avoid some security issues
+        let proc = ProcessManager::current_pcb();
         let path: Box<&str> = Box::new(dest_path);
         let inode = match ROOT_INODE().lookup(&path) {
             Err(e) => {
@@ -200,6 +201,31 @@ impl Syscall {
             }
             Ok(i) => {
                 if let FileType::Dir = i.file_type {
+                    if path.len() > 0 {
+                        let cwd = match path.as_bytes()[0] {
+                            b'/' => String::from("/"),
+                            _ => proc.basic().get_path(),
+                        };
+                        let mut cwd_vec: Vec<_> = cwd.split("/").filter(|&x| x != "").collect();
+                        let path_split = path.split("/").filter(|&x| x != "");
+                        for seg in path_split {
+                            if seg == ".." {
+                                cwd_vec.pop();
+                            } else if seg == "." {
+                                // 当前目录
+                            } else {
+                                cwd_vec.push(seg);
+                            }
+                        }
+                        proc.basic().set_path(String::from(""));
+                        for seg in cwd_vec {
+                            proc.basic().append_to_path("/");
+                            proc.basic().append_to_path(seg);
+                        }
+                        if proc.basic().get_path() == "" {
+                            proc.basic().set_path(String::from("/"));
+                        }
+                    }
                     return Ok(0);
                 } else {
                     return Err(SystemError::ENOTDIR);
@@ -214,15 +240,20 @@ impl Syscall {
     /// @param size 缓冲区的大小
     /// 
     /// @return 成功，返回的指针指向包含工作目录路径的字符串
-    /// 
+    /// @return 错误，没有足够的空间
     pub fn getcwd(buf: &mut [u8], size: usize) -> Result<usize, SystemError> {
         let proc = ProcessManager::current_pcb();
-        let cwd= proc.basic().get_work_path();
-        if cwd.len() >= size{
-            
+        let cwd= proc.basic().get_path();
+ 
+        let cwd_bytes = cwd.as_bytes();
+        let cwd_len = cwd_bytes.len();
+        if cwd_len + 1 > size {
+            return Err(SystemError::ENOMEM);
         }
-
-        Ok(buf.as_ptr() as usize)
+        buf[..cwd_len].copy_from_slice(cwd_bytes);
+        buf[cwd_len] = 0;
+    
+        return Ok(buf.as_ptr() as usize);
     }
 
     /// @brief 获取目录中的数据

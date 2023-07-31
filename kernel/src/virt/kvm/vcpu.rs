@@ -50,8 +50,8 @@ pub struct VcpuData {
     pub vmcs_region_physical_address: u64,  // vmptrld, vmclear需要该地址
     pub msr_bitmap: NonNull<[u8]>,
     pub msr_bitmap_physical_address: u64,
-    pub guest_rsp: u32,
-    pub guest_rip: u32,
+    pub guest_rsp: u64,
+    pub guest_rip: u64,
 
 }
 
@@ -63,7 +63,7 @@ pub struct Vcpu {
 }
 
 impl VcpuData {
-    pub fn new() -> Result<Box<Self>, SystemError> {
+    pub fn new(guest_rsp:u64, guest_rip:u64) -> Result<Box<Self>, SystemError> {
         let instance = Self {
             // try_new_zeroed_in 创建一个具有未初始化内容的新 Box，使用提供的分配器中的 0 字节填充内存，如果分配失败，则返回错误
             // assume_init 由调用者负责确保值确实处于初始化状态
@@ -87,8 +87,8 @@ impl VcpuData {
                 Global.allocate_zeroed(Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE)).unwrap()
             },
             msr_bitmap_physical_address: 0, 
-            guest_rsp: 0,
-            guest_rip: 0,   
+            guest_rsp: guest_rsp,
+            guest_rip: guest_rip,   
         };
 
         let mut instance = Box::new(instance);
@@ -146,11 +146,11 @@ impl VcpuData {
 }
 
 impl Vcpu {
-    pub fn new(index: u32, hypervisor: Arc<Hypervisor>) -> Result<Self, SystemError> {
+    pub fn new(index: u32, hypervisor: Arc<Hypervisor>, guest_rsp: u64, guest_rip: u64) -> Result<Self, SystemError> {
         kdebug!("Creating processor {}", index);
         Ok (Self {
             index,
-            data: VcpuData::new()?, 
+            data: VcpuData::new(guest_rsp, guest_rip)?, 
             hypervisor: hypervisor,
         })
     }
@@ -324,7 +324,7 @@ impl Vcpu {
 
         Ok(())
     }
-    
+
     pub fn vmcs_init_host(&self) -> Result<(), SystemError>{
         vmx_vmwrite(
             VmcsFields::HOST_CR0 as u32, 
@@ -381,7 +381,6 @@ impl Vcpu {
 
         vmx_vmwrite(VmcsFields::HOST_RSP as u32, self.hypervisor.stack.as_ptr() as u64)?;
         vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
-        self.vmcs_init_host_debug();
         Ok(())
     }
     // Intel SDM Volume 3C Chapter 25.3 “Organization of VMCS Data”

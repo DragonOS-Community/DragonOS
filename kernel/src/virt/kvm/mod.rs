@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use core::arch::asm;
 
 use crate::kdebug;
 use crate::filesystem::devfs::{devfs_register};
@@ -14,7 +15,7 @@ mod vmcs;
 mod vmx_asm_wrapper;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
-
+pub const GUEST_STACK_SIZE:usize = 64;
 
 
 
@@ -53,14 +54,19 @@ pub extern "C" fn kvm_init() {
     // if r.is_err() {
     //     panic!("Failed to register /dev/kvm");
     // }
+    let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
     let hypervisor = Hypervisor::new(1, 1).expect("Cannot create hypervisor");
-    let vcpu = Vcpu::new(1, Arc::new(*hypervisor)).expect("Cannot create VcpuData");
+    let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
     vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
 
     devfs_register("kvm", LockedKvmInode::new())
         .expect("Failed to register /dev/kvm");
 }
 
+#[no_mangle]
+fn guest_code(){
+    unsafe {asm!("hlt")};
+}
 // fn kvm_dev_ioctl_create_vm(data: usize) {
 //     let kvm: Arc<Kvm> = Arc::new(Kvm(
 //         sys_fd::-1,

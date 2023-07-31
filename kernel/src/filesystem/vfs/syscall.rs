@@ -208,6 +208,23 @@ impl Syscall {
         }
     }
 
+    /// @brief 获取当前进程的工作目录路径
+    /// 
+    /// @param buf 指向缓冲区的指针
+    /// @param size 缓冲区的大小
+    /// 
+    /// @return 成功，返回的指针指向包含工作目录路径的字符串
+    /// 
+    pub fn getcwd(buf: &mut [u8], size: usize) -> Result<usize, SystemError> {
+        let proc = ProcessManager::current_pcb();
+        let cwd= proc.basic().get_work_path();
+        if cwd.len() >= size{
+            
+        }
+
+        Ok(buf.as_ptr() as usize)
+    }
+
     /// @brief 获取目录中的数据
     ///
     /// TODO: 这个函数的语义与Linux不一致，需要修改！！！

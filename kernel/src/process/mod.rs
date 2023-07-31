@@ -47,6 +47,10 @@ pub mod pid;
 pub mod preempt;
 pub mod process;
 pub mod syscall;
+pub mod kthread;
+pub mod wait_queue;
+
+const PCB_NAME_LEN: usize = 16;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
@@ -136,7 +140,7 @@ pub enum ProcessState {
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }
-
+  
 bitflags! {
     /// pcb的标志位
     pub struct ProcessFlags: usize {
@@ -175,6 +179,7 @@ pub struct ProcessControlBlock {
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
+
 }
 
 impl ProcessControlBlock {
@@ -324,11 +329,15 @@ pub struct ProcessBasicInfo {
     /// 进程的名字
     name: String,
 
+    /// 当前进程的工作目录
+    cwd: String,
+
     /// 用户地址空间
     user_vm: Option<Arc<AddressSpace>>,
 
     /// 文件描述符表
     fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+
 }
 
 impl ProcessBasicInfo {
@@ -337,6 +346,7 @@ impl ProcessBasicInfo {
         pgid: Pid,
         ppid: Pid,
         name: String,
+        cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
         let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
@@ -345,6 +355,7 @@ impl ProcessBasicInfo {
             pgid,
             ppid,
             name,
+            cwd,
             user_vm,
             fd_table: Some(fd_table),
         });
@@ -370,6 +381,10 @@ impl ProcessBasicInfo {
         self.name = name;
     }
 
+    pub fn get_work_path(&self) -> String {
+        self.cwd.clone()
+    }
+    
     pub fn user_vm(&self) -> Option<Arc<AddressSpace>> {
         return self.user_vm.clone();
     }

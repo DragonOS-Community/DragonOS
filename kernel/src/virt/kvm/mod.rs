@@ -16,7 +16,7 @@ mod vmx_asm_wrapper;
 mod vmexit;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
-pub const GUEST_STACK_SIZE:usize = 64;
+pub const GUEST_STACK_SIZE:usize = 1024;
 pub const VMM_STACK_SIZE:usize = 0x1000 * 6;
 
 
@@ -76,6 +76,7 @@ fn guest_code(){
             "mov rcx, 0",
             "cpuid"
         );}
+        kdebug!("guest code");
         unsafe {asm!("nop")};
     }
 }

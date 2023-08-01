@@ -77,11 +77,10 @@ pub fn vmexit_cpuid_handler(guest_cpu_context: &mut GuestCpuContext) -> Result<(
     let rcx = guest_cpu_context.rcx;
     let rdx = guest_cpu_context.rdx;
     let rbx = guest_cpu_context.rbx;
-    // kdebug!("rax={:x}, rcx={:x}", guest_cpu_context.rax, guest_cpu_context.rcx);
-    // cpuid!(rax, rcx);
-    // unsafe{asm!("mov {}, rax", out(reg) guest_cpu_context.rax)};
-    // unsafe{asm!("mov {}, rcx", out(reg) guest_cpu_context.rcx)};
-    // unsafe{asm!("mov {}, rdx", out(reg) guest_cpu_context.rdx)};
-    // unsafe{asm!("mov {}, rbx", out(reg) guest_cpu_context.rbx)};
+    cpuid!(rax, rcx);
+    unsafe{asm!("mov {}, rax", out(reg) guest_cpu_context.rax)};
+    unsafe{asm!("mov {}, rcx", out(reg) guest_cpu_context.rcx)};
+    unsafe{asm!("mov {}, rdx", out(reg) guest_cpu_context.rdx)};
+    unsafe{asm!("mov {}, rbx", out(reg) guest_cpu_context.rbx)};
     Ok(())
 }

@@ -111,11 +111,11 @@ pub struct GuestCpuContext{
 }
 
 #[no_mangle]
-pub unsafe fn vmx_return(){
+pub extern "C" fn vmx_return(){
     kdebug!("vmx_return!");
-    save_rpg();
+    unsafe {save_rpg()};
     // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
-    asm!(
+    unsafe {asm!(
         // "sub     rsp, 68h",
         // "movaps  xmmword ptr [rsp +  0h], xmm0",
     //     "movaps  xmmword ptr [rsp + 10h], xmm1",
@@ -124,7 +124,7 @@ pub unsafe fn vmx_return(){
     //     "movaps  xmmword ptr [rsp + 40h], xmm4",
     //     "movaps  xmmword ptr [rsp + 50h], xmm5",
 
-        "mov     rcx, rsp",
+        "mov     rdi, rsp",
         "sub     rsp, 20h",
         "call vmexit_handler",
 
@@ -136,23 +136,20 @@ pub unsafe fn vmx_return(){
     //     "movaps  xmm4, xmmword ptr [rsp + 40h]",
     //     "movaps  xmm5, xmmword ptr [rsp + 50h]",
     //     "add     rsp, 68h",
-    );
+    clobber_abi("C"),
+    )};
 
-    restore_rpg();
-    asm!(
+    unsafe{restore_rpg()};
+    unsafe{asm!(
         "vmresume"
-    );
+    )};
 }
 
 #[no_mangle]
-fn vmexit_handler(){
+extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
     kdebug!("vmexit handler!");
-
-    let mut guest_cpu_context_ptr: *const GuestCpuContext;
-    unsafe{asm!("mov {}, rcx", out(reg) guest_cpu_context_ptr)};
-    let mut guest_cpu_context = unsafe { &*guest_cpu_context_ptr };
-    // kdebug!("rax={:x}, rcx={:x}", guest_cpu_context.rax, guest_cpu_context.rcx);
-
+    let mut guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
+    kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
 
     let exit_reason = vmx_vmread(VmcsFields::VMEXIT_EXIT_REASON as u32).unwrap() as u32;
     let exit_basic_reason = exit_reason & 0x0000_ffff;
@@ -171,7 +168,7 @@ fn vmexit_handler(){
         },
         VmxExitReason::CPUID => {
             kdebug!("vmexit handler: cpuid instruction!");
-            // vmexit_cpuid_handler(guest_cpu_context);
+            vmexit_cpuid_handler(guest_cpu_context);
             adjust_rip(guest_rip).unwrap();
         },
         VmxExitReason::RDMSR => {

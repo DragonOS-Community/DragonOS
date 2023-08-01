@@ -71,7 +71,11 @@ pub extern "C" fn kvm_init() {
 fn guest_code(){
     kdebug!("guest code");
     while true {
-        unsafe {asm!("cpuid");}
+        unsafe {asm!(
+            "mov rax, 0",
+            "mov rcx, 0",
+            "cpuid"
+        );}
         unsafe {asm!("nop")};
     }
 }

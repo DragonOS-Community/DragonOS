@@ -13,6 +13,7 @@ mod vcpu;
 mod hypervisor;
 mod vmcs;
 mod vmx_asm_wrapper;
+mod vmexit;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
 pub const GUEST_STACK_SIZE:usize = 64;

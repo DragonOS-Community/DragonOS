@@ -189,7 +189,14 @@ impl ProcessControlBlock {
     ///
     /// 返回一个新的pcb
     pub fn new(name: String, kstack: KernelStack) -> Arc<Self> {
-        let basic_info = ProcessBasicInfo::new(Self::generate_pid(), Pid(0), Pid(0), name, None);
+        let basic_info = ProcessBasicInfo::new(
+            Self::generate_pid(),
+            Pid(0),
+            Pid(0),
+            name,
+            "/".to_string(),
+            None,
+        );
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
         let signal = ProcessSignalInfo::new();

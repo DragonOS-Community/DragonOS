@@ -15,7 +15,6 @@ pub extern "C" fn rs_process_init() {
     process_init();
 }
 
-
 #[no_mangle]
 pub extern "C" fn rs_init_stdio() -> i32 {
     let r = init_stdio();

@@ -74,12 +74,8 @@ impl Syscall {
             let current_pcb = ProcessManager::current_pcb();
             pid = current_pcb.basic().pid();
         }
-        let theproc = ProcessManager::find(pid);
-        if let Some(theproc) = theproc {
-            return Ok(theproc.basic().pgid());
-        } else {
-            return Err(SystemError::ESRCH);
-        }
+        let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        return Ok(target_proc.basic().pgid());
     }
     /// @brief 获取当前进程的父进程id
 

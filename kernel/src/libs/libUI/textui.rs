@@ -14,7 +14,7 @@ use core::{
     ptr::copy_nonoverlapping,
     sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
-use thingbuf::mpsc;
+
 
 use super::{
     screen_manager::{
@@ -22,11 +22,9 @@ use super::{
     },
     textui_no_alloc::no_init_textui_putchar_window,
 };
-use lazy_static::lazy_static;
 
-lazy_static! {
-    pub static ref WINDOW_MPSC: WindowMpsc = WindowMpsc::new();
-}
+
+
 /// 声明全局的TEXTUI_FRAMEWORK
 pub static mut TEXTUI_FRAMEWORK: Option<Box<TextUiFramework>> = None;
 /// 获取TEXTUI_FRAMEWORK的可变实例
@@ -70,21 +68,8 @@ pub static mut TESTUI_IS_INIT: bool = false;
 
 pub static ENABLE_PUT_TO_WINDOW: AtomicBool = AtomicBool::new(true);
 
-/// 利用mpsc实现当前窗口
 
-pub struct WindowMpsc {
-    receiver: mpsc::Receiver<TextuiWindow>,
-    sender: mpsc::Sender<TextuiWindow>,
-}
 
-impl WindowMpsc {
-    pub const MPSC_BUF_SIZE: usize = 512;
-    fn new() -> Self {
-        // let window = &TEXTUI_PRIVATE_INFO.lock().current_window;
-        let (sender, receiver) = mpsc::channel::<TextuiWindow>(Self::MPSC_BUF_SIZE);
-        WindowMpsc { receiver, sender }
-    }
-}
 
 /**
  * @brief 黑白字符对象
@@ -473,9 +458,11 @@ impl WindowId {
         return WindowId(MAX_ID.fetch_add(1, Ordering::SeqCst));
     }
 }
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct TextuiWindow {
     // 虚拟行是个循环表，头和尾相接
+    
     id: WindowId,
     // 虚拟行总数
     vline_sum: i32,

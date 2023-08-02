@@ -33,7 +33,7 @@ lazy_static! {
 pub static SCM_DOUBLE_BUFFER_ENABLED: AtomicBool = AtomicBool::new(false);
 
 bitflags! {
-  pub struct ScmBfFlag:u8{
+  pub struct ScmBfFlag:u8 {
     // 帧缓冲区标志位
        const SCM_BF_FB = 1 << 0; // 当前buffer是设备显存中的帧缓冲区
        const SCM_BF_DB = 1 << 1; // 当前buffer是双缓冲

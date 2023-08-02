@@ -381,9 +381,6 @@ impl ProcessBasicInfo {
     pub fn set_path(&mut self, path: String) {
         return self.cwd = path;
     }
-    pub fn append_to_path(&mut self, additional: &str) {
-        return self.cwd.push_str(additional);
-    }
 
     pub fn user_vm(&self) -> Option<Arc<AddressSpace>> {
         return self.user_vm.clone();

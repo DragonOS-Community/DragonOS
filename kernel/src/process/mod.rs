@@ -48,8 +48,6 @@ pub mod preempt;
 pub mod process;
 pub mod syscall;
 
-
-
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
 
@@ -138,7 +136,7 @@ pub enum ProcessState {
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }
-  
+
 bitflags! {
     /// pcb的标志位
     pub struct ProcessFlags: usize {
@@ -334,7 +332,6 @@ pub struct ProcessBasicInfo {
 
     /// 文件描述符表
     fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
-
 }
 
 impl ProcessBasicInfo {
@@ -375,15 +372,15 @@ impl ProcessBasicInfo {
     }
 
     pub fn set_name(&mut self, name: String) {
-        return self.name = name;
+        self.name = name;
     }
 
-    pub fn get_path(&self) -> String {
+    pub fn path(&self) -> String {
         return self.cwd.clone();
     }
     pub fn set_path(&mut self, path: String) {
         return self.cwd = path;
-    } 
+    }
     pub fn append_to_path(&mut self, additional: &str) {
         return self.cwd.push_str(additional);
     }

@@ -189,7 +189,14 @@ impl ProcessControlBlock {
     ///
     /// 返回一个新的pcb
     pub fn new(name: String, kstack: KernelStack) -> Arc<Self> {
-        let basic_info = ProcessBasicInfo::new(Self::generate_pid(), Pid(0), Pid(0), name, None);
+        let basic_info = ProcessBasicInfo::new(
+            Self::generate_pid(),
+            Pid(0),
+            Pid(0),
+            name,
+            "/".to_string(),
+            None,
+        );
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
         let signal = ProcessSignalInfo::new();
@@ -324,6 +331,9 @@ pub struct ProcessBasicInfo {
     /// 进程的名字
     name: String,
 
+    /// 当前进程的工作目录
+    cwd: String,
+
     /// 用户地址空间
     user_vm: Option<Arc<AddressSpace>>,
 
@@ -337,6 +347,7 @@ impl ProcessBasicInfo {
         pgid: Pid,
         ppid: Pid,
         name: String,
+        cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
         let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
@@ -345,6 +356,7 @@ impl ProcessBasicInfo {
             pgid,
             ppid,
             name,
+            cwd,
             user_vm,
             fd_table: Some(fd_table),
         });
@@ -368,6 +380,13 @@ impl ProcessBasicInfo {
 
     pub fn set_name(&mut self, name: String) {
         self.name = name;
+    }
+
+    pub fn path(&self) -> String {
+        return self.cwd.clone();
+    }
+    pub fn set_path(&mut self, path: String) {
+        return self.cwd = path;
     }
 
     pub fn user_vm(&self) -> Option<Arc<AddressSpace>> {

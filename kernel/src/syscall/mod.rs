@@ -18,6 +18,7 @@ use crate::{
     libs::align::page_align_up,
     mm::{MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
+    process::Pid,
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
@@ -364,6 +365,10 @@ pub const SYS_MMAP: usize = 44;
 pub const SYS_MUNMAP: usize = 45;
 pub const SYS_MPROTECT: usize = 46;
 
+pub const SYS_GETCWD: usize = 48;
+pub const SYS_GETPPID: usize = 49;
+pub const SYS_GETPGID: usize = 50;
+
 #[derive(Debug)]
 pub struct Syscall;
 
@@ -507,7 +512,7 @@ impl Syscall {
                     let dest_path: &str = dest_path.to_str().map_err(|_| SystemError::EINVAL)?;
                     if dest_path.len() == 0 {
                         return Err(SystemError::EINVAL);
-                    } else if dest_path.len() > PAGE_4K_SIZE as usize {
+                    } else if dest_path.len() > MAX_PATHLEN as usize {
                         return Err(SystemError::ENAMETOOLONG);
                     }
 
@@ -693,7 +698,7 @@ impl Syscall {
                 todo!()
             }
 
-            SYS_GETPID => Self::getpid(),
+            SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => Self::sched(from_user),
             SYS_DUP => {
@@ -931,6 +936,28 @@ impl Syscall {
                     Self::mprotect(VirtAddr::new(addr), len, args[2])
                 }
             }
+
+            SYS_GETCWD => {
+                let buf = args[0] as *mut u8;
+                let size = args[1] as usize;
+                let security_check = || {
+                    if unsafe { verify_area(buf as u64, size as u64) } == false {
+                        return Err(SystemError::EFAULT);
+                    }
+                    return Ok(());
+                };
+                let r = security_check();
+                if r.is_err() {
+                    Err(r.unwrap_err())
+                } else {
+                    let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
+                    Self::getcwd(buf).map(|ptr| ptr.data())
+                }
+            }
+
+            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pid| pid.into()),
+
+            SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

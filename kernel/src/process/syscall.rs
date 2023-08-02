@@ -3,7 +3,6 @@ use core::ffi::{c_int, c_void};
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::{pid_t, process_do_exit},
-    kdebug,
     syscall::{Syscall, SystemError},
 };
 

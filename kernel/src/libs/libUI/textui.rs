@@ -15,7 +15,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 
-
 use super::{
     screen_manager::{
         scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
@@ -23,41 +22,8 @@ use super::{
     textui_no_alloc::no_init_textui_putchar_window,
 };
 
-
-
 /// 声明全局的TEXTUI_FRAMEWORK
-pub static mut TEXTUI_FRAMEWORK: Option<Box<TextUiFramework>> = None;
-/// 获取TEXTUI_FRAMEWORK的可变实例
-pub fn textui_framework() -> &'static mut TextUiFramework {
-    return unsafe { TEXTUI_FRAMEWORK.as_mut().unwrap() };
-}
-/// 初始化TEXTUI_FRAMEWORK
-pub unsafe fn textui_framwork_init() {
-    if TEXTUI_FRAMEWORK.is_none() {
-        kinfo!("textuiframework init");
-        TEXTUI_FRAMEWORK = Some(Box::new(TextUiFramework::new(
-            Arc::new(SpinLock::new(TextuiWindow::new(
-                WindowFlag::TEXTUI_IS_CHROMATIC,
-                0,
-                0,
-            ))),
-            Arc::new(SpinLock::new(TextuiWindow::new(
-                WindowFlag::TEXTUI_IS_CHROMATIC,
-                0,
-                0,
-            ))),
-        )));
-    } else {
-        kBUG!("Try to init TEXTUI_FRAMEWORK twice!");
-    }
-}
-// window标志位
-bitflags! {
-    pub struct WindowFlag: u8 {
-        // 采用彩色字符
-        const TEXTUI_IS_CHROMATIC = 1 << 0;
-    }
-}
+static mut __TEXTUI_FRAMEWORK: Option<Box<TextUiFramework>> = None;
 
 /// 每个字符的宽度和高度（像素）
 pub const TEXTUI_CHAR_WIDTH: u32 = 8;
@@ -68,7 +34,37 @@ pub static mut TESTUI_IS_INIT: bool = false;
 
 pub static ENABLE_PUT_TO_WINDOW: AtomicBool = AtomicBool::new(true);
 
-
+/// 获取TEXTUI_FRAMEWORK的可变实例
+pub fn textui_framework() -> &'static mut TextUiFramework {
+    return unsafe { __TEXTUI_FRAMEWORK.as_mut().unwrap() };
+}
+/// 初始化TEXTUI_FRAMEWORK
+pub unsafe fn textui_framwork_init() {
+    if __TEXTUI_FRAMEWORK.is_none() {
+        kinfo!("textuiframework init");
+        __TEXTUI_FRAMEWORK = Some(Box::new(TextUiFramework::new(
+            Arc::new(SpinLock::new(TextuiWindow::new(
+                WindowFlag::TEXTUI_CHROMATIC,
+                0,
+                0,
+            ))),
+            Arc::new(SpinLock::new(TextuiWindow::new(
+                WindowFlag::TEXTUI_CHROMATIC,
+                0,
+                0,
+            ))),
+        )));
+    } else {
+        panic!("Try to init TEXTUI_FRAMEWORK twice!");
+    }
+}
+// window标志位
+bitflags! {
+    pub struct WindowFlag: u8 {
+        // 采用彩色字符
+        const TEXTUI_CHROMATIC = 1 << 0;
+    }
+}
 
 
 /**
@@ -462,7 +458,6 @@ impl WindowId {
 #[derive(Clone, Debug)]
 pub struct TextuiWindow {
     // 虚拟行是个循环表，头和尾相接
-    
     id: WindowId,
     // 虚拟行总数
     vline_sum: i32,
@@ -539,7 +534,7 @@ impl TextuiWindow {
         }
 
         // 将此窗口的某个虚拟行的连续n个字符对象往缓存区写入
-        if self.flags.contains(WindowFlag::TEXTUI_IS_CHROMATIC) {
+        if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             let vline = &mut self.vlines[<LineId as Into<usize>>::into(vline_id)];
             let mut i = 0;
             let mut index = start;
@@ -565,7 +560,7 @@ impl TextuiWindow {
     /// - vline_id 虚拟行号
 
     fn textui_refresh_vline(&mut self, vline_id: LineId) -> Result<i32, SystemError> {
-        if self.flags.contains(WindowFlag::TEXTUI_IS_CHROMATIC) {
+        if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return self.textui_refresh_characters(
                 vline_id,
                 LineIndex::new(0),
@@ -653,7 +648,7 @@ impl TextuiWindow {
         bkcolor: FontColor,
     ) -> Result<i32, SystemError> {
         // 启用彩色字符
-        if self.flags.contains(WindowFlag::TEXTUI_IS_CHROMATIC) {
+        if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             let mut line_index = LineIndex::new(0); //操作的列号
             if let TextuiVline::Chromatic(vline) =
                 &mut (self.vlines[<LineId as Into<usize>>::into(self.vline_operating)])
@@ -703,7 +698,7 @@ impl TextuiWindow {
             return Ok(0);
         }
         // 暂不支持纯文本窗口
-        if !self.flags.contains(WindowFlag::TEXTUI_IS_CHROMATIC) {
+        if !self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return Ok(0);
         }
 
@@ -811,7 +806,7 @@ impl Default for TextuiWindow {
     fn default() -> Self {
         TextuiWindow {
             id: WindowId(0),
-            flags: WindowFlag::TEXTUI_IS_CHROMATIC,
+            flags: WindowFlag::TEXTUI_CHROMATIC,
             vline_sum: 0,
             vlines_used: 1,
             top_vline: LineId::new(0),
@@ -1001,7 +996,7 @@ fn textui_init() -> Result<i32, SystemError> {
     let chars_num = (textui_framework.metadata.buf_info.buf_width() / TEXTUI_CHAR_WIDTH) as usize;
 
     let initial_window = TextuiWindow::new(
-        WindowFlag::TEXTUI_IS_CHROMATIC,
+        WindowFlag::TEXTUI_CHROMATIC,
         vlines_num as i32,
         chars_num as i32,
     );

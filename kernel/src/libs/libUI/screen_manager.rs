@@ -56,10 +56,9 @@ pub struct ScmBufferInfo {
     height: u32,      // 帧缓冲区高度（pixel或lines）
     size: u32,        // 帧缓冲区大小（bytes）
     bit_depth: u32,   // 像素点位深度
-    vaddr: VirtAddr,     // 指向帧缓冲区的指针(用于video里面的scm_buffer_info_t)
+    vaddr: VirtAddr,  // 指向帧缓冲区的指针(用于video里面的scm_buffer_info_t)
     flags: ScmBfFlag, // 帧缓冲区标志位
 }
-
 
 impl ScmBufferInfo {
     /// 创建新的帧缓冲区信息
@@ -81,7 +80,8 @@ impl ScmBufferInfo {
 
             frame_buffer_info.flags = buf_type;
 
-            frame_buffer_info.vaddr = VirtAddr::new(unsafe { kzalloc(video_frame_buffer_info.size as usize, 0) });
+            frame_buffer_info.vaddr =
+                VirtAddr::new(unsafe { kzalloc(video_frame_buffer_info.size as usize, 0) });
 
             return Ok(frame_buffer_info);
         }
@@ -329,8 +329,7 @@ pub extern "C" fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
         super::textui::ENABLE_PUT_TO_WINDOW.store(false, Ordering::SeqCst);
-        assert!(super::textui::ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst)==false);
-
+        assert!(super::textui::ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst) == false);
     } else {
         let r = CURRENT_FRAMEWORK
             .write()

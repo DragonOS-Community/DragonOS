@@ -32,9 +32,9 @@
 
 //     // Map the page table with specific permissions
 //     mm_map_proc_page_table(
-//         global_CR3, true, 
+//         global_CR3, true,
 //         video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr,
-//         video_frame_buffer_info.size, 
+//         video_frame_buffer_info.size,
 //         PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false, true, false
 //     );
 

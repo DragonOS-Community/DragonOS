@@ -155,5 +155,30 @@ impl AtomicNotifierChain {
 /// @brief 可阻塞的通知链，使用 RwLock 进行同步
 pub struct BlockingNotifierChain(RwLock<NotifierChain>);
 
+impl BlockingNotifierChain {
+    pub fn new() -> Self {
+        Self(RwLock::new(NotifierChain::new()))
+    }
+
+    pub fn register(
+        &mut self,
+        block: Arc<NotifierBlock>,
+        unique_priority: bool,
+    ) -> Result<(), SystemError> {
+        let mut notifier_chain_guard = self.0.write();
+        return notifier_chain_guard.register(block, unique_priority);
+    }
+
+    pub fn unregister(&mut self, block: Arc<NotifierBlock>) -> Result<(), SystemError> {
+        let mut notifier_chain_guard = self.0.write();
+        return notifier_chain_guard.unregister(block);
+    }
+
+    pub fn call_chain(&self, val: u64, v: *mut c_void, nr_to_call: i32, nr_calls: *mut i32) -> i32 {
+        let notifier_chain_guard = self.0.read();
+        return notifier_chain_guard.call_chain(val, v, nr_to_call, nr_calls);
+    }
+}
+
 /// @brief 原始的通知链，由调用者自行考虑同步
 pub struct RawNotifierChain(NotifierChain);

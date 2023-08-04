@@ -71,17 +71,22 @@ impl<T> NotifierChain<T> {
     }
 
     /// @brief 通知链进行事件通知
-    /// @param nr_to_call 回调函数次数，如果该参数小于 0，则忽略
+    /// @param nr_to_call 回调函数次数
     /// @return (最后一次回调函数的返回值，回调次数)
     // TODO: 增加 NOTIFIER_STOP_MASK 相关功能
     // TODO: 未考虑 nr_to_call 相关操作
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: i32) -> (i32, usize) {
+    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
         let mut ret: i32 = 0;
         let mut nr_calls: usize = 0;
+        let mut count = 0;
 
         for b in self.0.iter() {
+            if nr_to_call.is_some_and(|x| x <= count) {
+                break;
+            }
             ret = b.notifier_call(action, data);
             nr_calls += 1;
+            count += 1;
         }
         return (ret, nr_calls);
     }
@@ -109,7 +114,7 @@ impl<T> AtomicNotifierChain<T> {
         return notifier_chain_guard.unregister(block);
     }
 
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: i32) -> (i32, usize) {
+    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
         let notifier_chain_guard = self.0.lock();
         return notifier_chain_guard.call_chain(action, data, nr_to_call);
     }
@@ -138,7 +143,7 @@ impl<T> BlockingNotifierChain<T> {
         return notifier_chain_guard.unregister(block);
     }
 
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: i32) -> (i32, usize) {
+    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
         let notifier_chain_guard = self.0.read();
         return notifier_chain_guard.call_chain(action, data, nr_to_call);
     }
@@ -164,7 +169,7 @@ impl<T> RawNotifierChain<T> {
         return self.0.unregister(block);
     }
 
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: i32) -> (i32, usize) {
+    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
         return self.0.call_chain(action, data, nr_to_call);
     }
 }

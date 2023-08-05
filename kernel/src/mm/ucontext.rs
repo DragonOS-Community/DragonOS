@@ -1118,7 +1118,8 @@ impl VMA {
         // kdebug!("VMA::zeroed: flusher dropped");
 
         // 清空这些内存
-        let virt_iter: VirtPageFrameIter = VirtPageFrameIter::new(destination, destination.add(page_count));
+        let virt_iter: VirtPageFrameIter =
+            VirtPageFrameIter::new(destination, destination.add(page_count));
         for frame in virt_iter {
             let paddr = mapper.translate(frame.virt_address()).unwrap().0;
 

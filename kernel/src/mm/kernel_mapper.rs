@@ -1,9 +1,10 @@
 use super::{page::PageFlags, PageTableKind, PhysAddr, VirtAddr};
 use crate::{
     arch::{
-        asm::irqflags::{local_irq_restore, local_irq_save},
         mm::{LockedFrameAllocator, PageMapper},
+        CurrentIrqArch,
     },
+    exception::InterruptArch,
     libs::align::page_align_up,
     mm::allocator::page_frame::PageFrameCount,
     mm::{MMArch, MemoryManagementArch},
@@ -126,12 +127,12 @@ impl KernelMapper {
 impl Drop for KernelMapper {
     fn drop(&mut self) {
         // 为了防止fetch_sub和store之间，由于中断，导致store错误清除了owner，导致错误，因此需要关中断。
-        let flags = local_irq_save();
+        let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let prev_count = KERNEL_MAPPER_LOCK_COUNT.fetch_sub(1, Ordering::Relaxed);
         if prev_count == 1 {
             KERNEL_MAPPER_LOCK_OWNER.store(KERNEL_MAPPER_NO_PROCESSOR, Ordering::Release);
         }
-        local_irq_restore(flags);
+        drop(guard);
         compiler_fence(Ordering::Release);
     }
 }

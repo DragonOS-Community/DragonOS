@@ -24,7 +24,8 @@ int main()
     printf("Test kvm running...\n");
     printf("Open /dev/kvm\n");
     int kvm_fd = open("/dev/kvm", O_RDWR|O_CLOEXEC);
-    int vmfd = ioctl(kvm_fd, 0xdeadbeef, 0);
-
+    int vmfd = ioctl(kvm_fd, 0x01, 0);
+    ioctl(vmfd, 0xdeadbeef, 0);
+    printf("vmfd=%d\n", vmfd);
     return 0;
 }

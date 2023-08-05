@@ -13,8 +13,7 @@ use crate::{
     time::TimeSpec,
     arch::KVMArch,
 };
-use super::{Hypervisor};
-use crate::virt::kvm::vm_dev::LockedVmInode;
+use super::Hypervisor;
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -27,37 +26,34 @@ pub const KVM_API_VERSION:u32 = 12;
 pub const GUEST_STACK_SIZE:usize = 1024;
 pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 
-// use crate::virt::kvm::kvm_dev_ioctl_create_vm;
 /*
- * ioctls for /dev/kvm fds:
+ * ioctls for /dev/vm fds:
  */
-pub const KVM_GET_API_VERSION: u32 = 0x00;
-pub const KVM_CREATE_VM: u32 = 0x01;
-pub const KVM_CHECK_EXTENSION: u32 = 0x03;
-pub const KVM_GET_VCPU_MMAP_SIZE: u32 = 0x04; // Get size for mmap(vcpu_fd) in bytes
-pub const KVM_TRACE_ENABLE: u32 = 0x05;
-pub const KVM_TRACE_PAUSE: u32 = 0x06;
-pub const KVM_TRACE_DISABLE: u32 = 0x07;
 
+//  #[derive(Debug)]
+//  pub struct InodeInfo {
+//     kvm: Arc<Hypervisor>,
+//  }
  
 #[derive(Debug)]
-pub struct KvmInode {
+pub struct VmInode {
     /// uuid 暂时不知道有什么用（x
     // uuid: Uuid,
     /// 指向自身的弱引用
-    self_ref: Weak<LockedKvmInode>,
+    self_ref: Weak<LockedVmInode>,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<DevFS>,
     /// INode 元数据
     metadata: Metadata,
+    // fdata: InodeInfo,
 }
 
 #[derive(Debug)]
-pub struct LockedKvmInode(SpinLock<KvmInode>);
+pub struct LockedVmInode(SpinLock<VmInode>);
 
-impl LockedKvmInode {
+impl LockedVmInode {
     pub fn new() -> Arc<Self> {
-        let inode = KvmInode {
+        let inode = VmInode {
             self_ref: Weak::default(),
             fs: Weak::default(),
             metadata: Metadata {
@@ -76,28 +72,26 @@ impl LockedKvmInode {
                 gid: 0,
                 raw_dev: make_rawdev(1, 4), // 这里用来作为device number
             },
+            // fdata: InodeInfo {
+            //     kvm: kvm,
+            // },
         };
 
-        let result = Arc::new(LockedKvmInode(SpinLock::new(inode)));
+        let result = Arc::new(LockedVmInode(SpinLock::new(inode)));
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         return result;
     }
 }
 
-impl DeviceINode for LockedKvmInode {
-    fn set_fs(&self, fs: Weak<DevFS>) {
-        self.0.lock().fs = fs;
-    }
-}
 
-impl IndexNode for LockedKvmInode {
+impl IndexNode for LockedVmInode {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        kdebug!("file private data:{:?}",_data);
+        kdebug!("file private data:{:?}", _data);
         return Ok(())
     }
 
@@ -143,24 +137,12 @@ impl IndexNode for LockedKvmInode {
     fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
-                kdebug!("kvm ioctl");
+                kdebug!("kvm_vm ioctl");
                 Ok(0)
-            }
-            KVM_GET_API_VERSION => {
-                Ok(KVM_API_VERSION as usize)
-            }
-            KVM_CREATE_VM => {
-                kdebug!("kvm KVM_CREATE_VM");
-                let host_stack = vec![0xCC; HOST_STACK_SIZE];
-                let hypervisor: Box<Hypervisor> = Hypervisor::new(1, 0, (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64)?;
-                kvm_dev_ioctl_create_vm(data)
-            }
-            KVM_CHECK_EXTENSION | KVM_GET_VCPU_MMAP_SIZE |
-            KVM_TRACE_ENABLE | KVM_TRACE_PAUSE | KVM_TRACE_DISABLE => {
-                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
-            }
+            },
             _ => {
-                KVMArch::kvm_arch_dev_ioctl(cmd,data)
+                kdebug!("kvm_vm ioctl");
+                Ok(usize::MAX)
             },
         }
     }
@@ -185,12 +167,5 @@ impl IndexNode for LockedKvmInode {
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
-}
-
-pub fn kvm_dev_ioctl_create_vm(vmtype: usize) -> Result<usize, SystemError> {
-    let vm_inode = LockedVmInode::new();
-    let mut file: File = File::new(vm_inode, FileMode::O_RDWR)?;
-    return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
-    // let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
 }
 

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::{
     kwarn,
     libs::{rwlock::RwLock, spinlock::SpinLock},

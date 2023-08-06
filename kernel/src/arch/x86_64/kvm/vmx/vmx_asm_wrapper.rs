@@ -1,7 +1,7 @@
 use crate::syscall::SystemError;
 use x86;
 use crate::{kdebug};
-use crate::virt::kvm::vmcs::{ VmcsFields};
+use super::vmcs::{ VmcsFields};
 /// Enable VMX operation.
 pub fn vmxon(vmxon_pa: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmxon(vmxon_pa) } {

@@ -1,5 +1,6 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc};
 use core::arch::asm;
+use core::ptr::null_mut;
 
 use crate::kdebug;
 use crate::filesystem::devfs::{devfs_register};
@@ -7,22 +8,29 @@ use self::kvm_dev::LockedKvmInode;
 use vcpu::{Vcpu};
 use hypervisor::Hypervisor;
 use crate::arch::KVMArch;
+use crate::libs::mutex::Mutex;
+use alloc::boxed::Box;
 
 mod kvm_dev;
 mod vm_dev;
-mod vcpu;
-mod hypervisor;
-mod vmcs;
-mod vmx_asm_wrapper;
-mod vmexit;
+mod vcpu_dev;
+pub mod vcpu;
+pub mod hypervisor;
 
 pub const KVM_MAX_VCPUS:u32 = 255;
 pub const GUEST_STACK_SIZE:usize = 1024;
 pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 
+static mut __KVM: *mut Arc<Mutex<Hypervisor>> = null_mut();
 
-
-
+/// @brief 获取全局的根节点
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn KVM() -> &'static Arc<Mutex<Hypervisor>> {
+    unsafe {
+        return __KVM.as_ref().unwrap();
+    }
+}
 // struct Kvm_vcpu {
 //     kvm: Arc<Kvm>,		/* parent KVM */
 //     cpu_id: u32,        /* CPU id */

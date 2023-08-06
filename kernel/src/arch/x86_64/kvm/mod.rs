@@ -5,6 +5,14 @@ use crate::{
     syscall::SystemError,
 };
 
+use alloc::sync::Arc;
+use crate::virt::kvm::GUEST_STACK_SIZE;
+use crate::virt::kvm::KVM;
+use self::vmx::vcpu::VmxVcpu;
+use crate::virt::kvm::vcpu::Vcpu;
+use alloc::boxed::Box;
+mod vmx;
+
 pub struct X86_64KVMArch;
 
 impl X86_64KVMArch{
@@ -41,4 +49,20 @@ impl X86_64KVMArch{
             }
         }
     }
+
+    pub fn kvm_arch_vcpu_create(id:u32) -> Result<Box<dyn Vcpu>, SystemError> {
+        let mut current_kvm = KVM();
+        let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
+        let mut vcpu = Box::new(
+            VmxVcpu::new(
+                id, 
+                current_kvm.clone(), 
+                guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64, 
+                current_kvm.lock().mem_slots
+            ).unwrap()
+        );
+        return Ok(vcpu);
+    }
+    
+    
 }

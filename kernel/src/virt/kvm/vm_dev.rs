@@ -13,6 +13,8 @@ use crate::{
     time::TimeSpec,
     arch::KVMArch,
 };
+use crate::virt::kvm::{KVM};
+use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use super::Hypervisor;
 use alloc::{
     string::String,
@@ -29,6 +31,12 @@ pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 /*
  * ioctls for /dev/vm fds:
  */
+pub const KVM_CREATE_VCPU: u32 = 0x00;
+pub const KVM_SET_USER_MEMORY_REGION: u32 = 0x01;
+pub const KVM_GET_DIRTY_LOG: u32 = 0x02;
+pub const KVM_IRQFD: u32 = 0x03;
+pub const KVM_IOEVENTFD: u32 = 0x04;
+pub const KVM_IRQ_LINE_STATUS: u32 = 0x05;
 
 //  #[derive(Debug)]
 //  pub struct InodeInfo {
@@ -140,6 +148,15 @@ impl IndexNode for LockedVmInode {
                 kdebug!("kvm_vm ioctl");
                 Ok(0)
             },
+            KVM_CREATE_VCPU => {
+                kvm_vm_ioctl_create_vcpu(KVM().lock().nr_vcpus)
+            },
+            KVM_SET_USER_MEMORY_REGION => {
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            },
+            KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS=> {
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            }
             _ => {
                 kdebug!("kvm_vm ioctl");
                 Ok(usize::MAX)
@@ -169,3 +186,13 @@ impl IndexNode for LockedVmInode {
     }
 }
 
+fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
+    let vcpu = KVMArch::kvm_arch_vcpu_create(id);
+
+    KVM().lock().vcpu.push(vcpu.unwrap());
+    KVM().lock().nr_vcpus += 1;
+
+    let vcpu_inode = LockedVcpuInode::new();
+    let mut file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;
+    return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+}

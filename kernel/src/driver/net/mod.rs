@@ -9,6 +9,8 @@ use crate::{libs::spinlock::SpinLock, syscall::SystemError};
 use super::Driver;
 
 pub mod virtio_net;
+pub mod e1000e;
+mod dma;
 
 pub trait NetDriver: Driver {
     /// @brief 获取网卡的MAC地址

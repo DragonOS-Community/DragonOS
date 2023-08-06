@@ -18,6 +18,7 @@
 #include <debug/traceback/traceback.h>
 #include <driver/disk/ahci/ahci.h>
 #include <driver/video/video.h>
+#include <driver/net/e1000e.h>
 #include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <ktest/ktest.h>
@@ -185,6 +186,7 @@ ul initial_kernel_thread(ul arg)
     ahci_init();
     mount_root_fs();
     io_mfence();
+    rs_e1000e_init();
     rs_virtio_probe();
     io_mfence();
 

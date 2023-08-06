@@ -12,7 +12,7 @@ output_dir=$(ROOT_PATH)/bin/user
 CFLAGS := $(GLOBAL_CFLAGS) -I $(shell pwd)/libs -I $(shell pwd)/libs/libc/src/include -I $(shell pwd)/libs/libc/src/include/export
 current_CFLAGS := $(CFLAGS)
 
-DADK_VERSION = $(shell dadk -V | awk 'END {print $2}')
+DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
 MIN_DADK_VERSION = 0.1.2
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
@@ -37,9 +37,10 @@ ifeq ("$(DADK_VERSION)", "")
 	@echo "Auto installing dadk..."
 	CC=gcc AS=as AR=ar LD=ld OBJCOPY=objcopy NM=nm cargo install dadk
 else
+# 如果DADK版本过低，则自动更新
 	@echo "dadk version $(DADK_VERSION) installed"
 # 如果DADK版本过低，则自动更新
-ifeq ($(shell printf '%s\n' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V | head -n1), $(MIN_DADK_VERSION))
+ifneq ($(shell printf '%s\n%s' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V | head -n1), $(MIN_DADK_VERSION))
 	@echo "dadk version is too low, please update to $(MIN_DADK_VERSION) or higher version"
 	@echo "Updating dadk..."
 	CC=gcc AS=as AR=ar LD=ld OBJCOPY=objcopy NM=nm cargo install dadk || (echo "dadk update failed" && exit 1)

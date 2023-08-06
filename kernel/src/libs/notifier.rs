@@ -74,7 +74,6 @@ impl<T> NotifierChain<T> {
     /// @param nr_to_call 回调函数次数
     /// @return (最后一次回调函数的返回值，回调次数)
     // TODO: 增加 NOTIFIER_STOP_MASK 相关功能
-    // TODO: 未考虑 nr_to_call 相关操作
     pub fn call_chain(
         &self,
         action: u64,

@@ -12,4 +12,5 @@
    atomic
    data_structures
    casting
+   notifier_chain
    softirq

@@ -29,6 +29,7 @@
    kernel/debug/index
    kernel/ktest/index
    kernel/cpu_arch/index
+   kernel/notifier_chain/index
 
 
 .. toctree::

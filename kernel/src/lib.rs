@@ -33,7 +33,6 @@ mod io;
 mod ipc;
 mod mm;
 mod net;
-mod notifier;
 mod process;
 mod sched;
 mod smp;

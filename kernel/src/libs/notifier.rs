@@ -8,7 +8,7 @@ use alloc::{sync::Arc, vec::Vec};
 /// @brief 通知链节点
 pub trait NotifierBlock<T> {
     /// @brief 通知链中注册的回调函数类型
-    fn notifier_call(&self, action: u64, data: &T) -> i32;
+    fn notifier_call(&self, action: u64, data: Option<&T>) -> i32;
     /// @brief 通知链节点的优先级
     fn priority(&self) -> i32;
 }
@@ -75,18 +75,21 @@ impl<T> NotifierChain<T> {
     /// @return (最后一次回调函数的返回值，回调次数)
     // TODO: 增加 NOTIFIER_STOP_MASK 相关功能
     // TODO: 未考虑 nr_to_call 相关操作
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
+    pub fn call_chain(
+        &self,
+        action: u64,
+        data: Option<&T>,
+        nr_to_call: Option<usize>,
+    ) -> (i32, usize) {
         let mut ret: i32 = 0;
         let mut nr_calls: usize = 0;
-        let mut count = 0;
 
         for b in self.0.iter() {
-            if nr_to_call.is_some_and(|x| x <= count) {
+            if nr_to_call.is_some_and(|x| nr_calls >= x) {
                 break;
             }
             ret = b.notifier_call(action, data);
             nr_calls += 1;
-            count += 1;
         }
         return (ret, nr_calls);
     }
@@ -100,13 +103,17 @@ impl<T> AtomicNotifierChain<T> {
         Self(SpinLock::new(NotifierChain::<T>::new()))
     }
 
-    pub fn register(
+    pub fn register(&mut self, block: Arc<dyn NotifierBlock<T>>) -> Result<(), SystemError> {
+        let mut notifier_chain_guard = self.0.lock();
+        return notifier_chain_guard.register(block, false);
+    }
+
+    pub fn register_unique_prio(
         &mut self,
         block: Arc<dyn NotifierBlock<T>>,
-        unique_priority: bool,
     ) -> Result<(), SystemError> {
         let mut notifier_chain_guard = self.0.lock();
-        return notifier_chain_guard.register(block, unique_priority);
+        return notifier_chain_guard.register(block, true);
     }
 
     pub fn unregister(&mut self, block: Arc<dyn NotifierBlock<T>>) -> Result<(), SystemError> {
@@ -114,7 +121,12 @@ impl<T> AtomicNotifierChain<T> {
         return notifier_chain_guard.unregister(block);
     }
 
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
+    pub fn call_chain(
+        &self,
+        action: u64,
+        data: Option<&T>,
+        nr_to_call: Option<usize>,
+    ) -> (i32, usize) {
         let notifier_chain_guard = self.0.lock();
         return notifier_chain_guard.call_chain(action, data, nr_to_call);
     }
@@ -129,13 +141,17 @@ impl<T> BlockingNotifierChain<T> {
         Self(RwLock::new(NotifierChain::<T>::new()))
     }
 
-    pub fn register(
+    pub fn register(&mut self, block: Arc<dyn NotifierBlock<T>>) -> Result<(), SystemError> {
+        let mut notifier_chain_guard = self.0.write();
+        return notifier_chain_guard.register(block, false);
+    }
+
+    pub fn register_unique_prio(
         &mut self,
         block: Arc<dyn NotifierBlock<T>>,
-        unique_priority: bool,
     ) -> Result<(), SystemError> {
         let mut notifier_chain_guard = self.0.write();
-        return notifier_chain_guard.register(block, unique_priority);
+        return notifier_chain_guard.register(block, true);
     }
 
     pub fn unregister(&mut self, block: Arc<dyn NotifierBlock<T>>) -> Result<(), SystemError> {
@@ -143,7 +159,12 @@ impl<T> BlockingNotifierChain<T> {
         return notifier_chain_guard.unregister(block);
     }
 
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
+    pub fn call_chain(
+        &self,
+        action: u64,
+        data: Option<&T>,
+        nr_to_call: Option<usize>,
+    ) -> (i32, usize) {
         let notifier_chain_guard = self.0.read();
         return notifier_chain_guard.call_chain(action, data, nr_to_call);
     }
@@ -157,19 +178,20 @@ impl<T> RawNotifierChain<T> {
         Self(NotifierChain::<T>::new())
     }
 
-    pub fn register(
-        &mut self,
-        block: Arc<dyn NotifierBlock<T>>,
-        unique_priority: bool,
-    ) -> Result<(), SystemError> {
-        return self.0.register(block, unique_priority);
+    pub fn register(&mut self, block: Arc<dyn NotifierBlock<T>>) -> Result<(), SystemError> {
+        return self.0.register(block, false);
     }
 
     pub fn unregister(&mut self, block: Arc<dyn NotifierBlock<T>>) -> Result<(), SystemError> {
         return self.0.unregister(block);
     }
 
-    pub fn call_chain(&self, action: u64, data: &T, nr_to_call: Option<i32>) -> (i32, usize) {
+    pub fn call_chain(
+        &self,
+        action: u64,
+        data: Option<&T>,
+        nr_to_call: Option<usize>,
+    ) -> (i32, usize) {
         return self.0.call_chain(action, data, nr_to_call);
     }
 }

@@ -1,4 +1,5 @@
 use crate::kdebug;
+use crate::virt::kvm::KVM;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::{generate_inode_id},
@@ -22,6 +23,7 @@ use alloc::{
 };
 
 pub const KVM_API_VERSION:u32 = 12;
+pub const KVM_RUN: u32 = 0x00;
 
 pub const GUEST_STACK_SIZE:usize = 1024;
 pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
@@ -146,6 +148,12 @@ impl IndexNode for LockedVcpuInode {
                 kdebug!("kvm_cpu ioctl");
                 Ok(0)
             },
+            KVM_RUN =>{
+                kdebug!("kvm_cpu ioctl");
+                let vcpu = &KVM().lock().vcpu[0];
+                vcpu.virtualize_cpu();
+                Ok(0)
+            }
             _ => {
                 kdebug!("kvm_cpu ioctl");
                 Ok(usize::MAX)

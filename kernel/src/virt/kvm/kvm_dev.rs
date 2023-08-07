@@ -15,6 +15,7 @@ use crate::{
 };
 use crate::virt::kvm::guest_code;
 use crate::libs::mutex::Mutex;
+// use crate::virt::kvm::{host_stack};
 use super::{Hypervisor};
 use crate::virt::kvm::vm_dev::LockedVmInode;
 use alloc::{
@@ -29,6 +30,7 @@ pub const KVM_API_VERSION:u32 = 12;
 
 pub const GUEST_STACK_SIZE:usize = 1024;
 pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
+
 
 // use crate::virt::kvm::kvm_dev_ioctl_create_vm;
 /*
@@ -154,12 +156,12 @@ impl IndexNode for LockedKvmInode {
             }
             KVM_CREATE_VM => {
                 kdebug!("kvm KVM_CREATE_VM");
-                let host_stack = vec![0xCC; HOST_STACK_SIZE];
                 let kvm = Box::leak(Box::new(
                     Arc::new(Mutex::new(Hypervisor::new(
                         1, 
                         0, 
-                        (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64,
+                        0,
+                        // unsafe {(host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64},
                         guest_code as *const () as u64,
                     ).unwrap()
                     ))

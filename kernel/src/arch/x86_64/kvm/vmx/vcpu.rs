@@ -7,13 +7,9 @@ use crate::{kdebug, printk_color, GREEN, BLACK};
 use alloc::boxed::Box;
 use alloc::alloc::Global;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::alloc::{Allocator, Layout};
-use core::ptr::NonNull;
 use core::arch::asm;
-use core::ptr;
 use core::slice;
-use crate::mm::{virt_2_phys, phys_2_virt};
+use crate::mm::{ phys_2_virt};
 use crate::libs::mutex::Mutex;
 use crate::arch::MMArch;
 use crate::mm::MemoryManagementArch;
@@ -29,6 +25,7 @@ use super::vmcs::{VMCSRegion, VmcsFields,
 use super::vmx_asm_wrapper::{
     vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmlaunch, vmx_vmptrld, vmx_vmclear
 };
+// use crate::virt::kvm::{KVM};
 
 // KERNEL_ALLOCATOR
 pub const PAGE_SIZE: usize = 0x1000;
@@ -66,6 +63,7 @@ pub struct VmxVcpu {
     index: u32,
     data: Box<VcpuData>, 
     hypervisor: Arc<Mutex<Hypervisor>>,		/* parent KVM */
+    host_rsp: u64,
 }
 
 impl VcpuData {
@@ -154,12 +152,13 @@ impl VcpuData {
 
 
 impl VmxVcpu {
-    pub fn new(index: u32, hypervisor: Arc<Mutex<Hypervisor>>, guest_rsp: u64, guest_rip: u64) -> Result<Self, SystemError> {
+    pub fn new(index: u32, hypervisor: Arc<Mutex<Hypervisor>>, host_rsp: u64, guest_rsp: u64, guest_rip: u64) -> Result<Self, SystemError> {
         kdebug!("Creating processor {}", index);
         Ok (Self {
             index,
             data: VcpuData::new(guest_rsp, guest_rip)?, 
             hypervisor: hypervisor,
+            host_rsp: host_rsp,
         })
     }
 
@@ -253,6 +252,8 @@ impl VmxVcpu {
         )?;
         vmx_vmwrite(VmcsFields::GUEST_RSP as u32, self.data.guest_rsp as u64)?;
         vmx_vmwrite(VmcsFields::GUEST_RIP as u32, self.data.guest_rip as u64)?;
+        kdebug!("vmcs init guest rip: {:#x}", self.data.guest_rip as u64);
+        kdebug!("vmcs init guest rsp: {:#x}", self.data.guest_rsp as u64);
 
         // vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, x86::bits64::rflags::read().bits())?;
         vmx_vmwrite(VmcsFields::GUEST_DEBUGCTL as u32, unsafe {msr::rdmsr(msr::IA32_DEBUGCTL)})?;
@@ -313,8 +314,11 @@ impl VmxVcpu {
         vmx_vmwrite(VmcsFields::HOST_SYSENTER_EIP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_EIP)})?;
         vmx_vmwrite(VmcsFields::HOST_SYSENTER_CS as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_CS)})?;
 
-        vmx_vmwrite(VmcsFields::HOST_RSP as u32, self.hypervisor.lock().host_stack as u64)?;
+        vmx_vmwrite(VmcsFields::HOST_RSP as u32, self.host_rsp as u64)?;
         vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
+        kdebug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
+        kdebug!("vmcs init host rsp: {:#x}", self.host_rsp as u64);
+        
         Ok(())
     }
     // Intel SDM Volume 3C Chapter 25.3 “Organization of VMCS Data”
@@ -403,8 +407,9 @@ pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u
     let base_mid = (descriptor & 0x0000_00FF_0000_0000) >> 16;
     let base_low = (descriptor & 0x0000_0000_FFFF_0000) >> 16;
     let segment_base = (base_high | base_mid | base_low) & 0xFFFFFFFF;
+    let virtaddr = phys_2_virt(segment_base.try_into().unwrap()).try_into().unwrap();
     kdebug!("segment_base={:x}", phys_2_virt(segment_base.try_into().unwrap()));
-    return phys_2_virt(segment_base.try_into().unwrap()).try_into().unwrap();
+    return virtaddr;
 }
 
 // FIXME: may have bug

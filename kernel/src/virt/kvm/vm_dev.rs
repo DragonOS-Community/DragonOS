@@ -15,7 +15,8 @@ use crate::{
 };
 use crate::virt::kvm::{KVM};
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
-use super::Hypervisor;
+use crate::virt::kvm::hypervisor::KvmUserspaceMemoryRegion;
+use super::{Hypervisor};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -42,7 +43,10 @@ pub const KVM_IRQ_LINE_STATUS: u32 = 0x05;
 //  pub struct InodeInfo {
 //     kvm: Arc<Hypervisor>,
 //  }
- 
+extern "C" {
+    fn memcpy(dst: *mut u8, src: *const u8, num: u64) -> *const u8;
+} 
+
 #[derive(Debug)]
 pub struct VmInode {
     /// uuid 暂时不知道有什么用（x
@@ -149,10 +153,21 @@ impl IndexNode for LockedVmInode {
                 Ok(0)
             },
             KVM_CREATE_VCPU => {
-                kvm_vm_ioctl_create_vcpu(KVM().lock().nr_vcpus)
+                kdebug!("kvm_vcpu ioctl KVM_CREATE_VCPU");
+                kvm_vm_ioctl_create_vcpu()
             },
             KVM_SET_USER_MEMORY_REGION => {
-                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+                kdebug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
+                let kvm_mem_region = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
+                kdebug!("slot={}, flag={}, guest_phys_addr={}, userspace_addr={:x}",
+                    kvm_mem_region.slot,
+                    kvm_mem_region.flags,
+                    kvm_mem_region.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
+                    kvm_mem_region.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
+                );
+                let mut kvm_mem_region = kvm_mem_region.clone();
+                KVM().lock().set_user_memory_region(&kvm_mem_region);
+                Ok(0)
             },
             KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS=> {
                 Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -186,8 +201,8 @@ impl IndexNode for LockedVmInode {
     }
 }
 
-fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
-    let vcpu = KVMArch::kvm_arch_vcpu_create(id);
+fn kvm_vm_ioctl_create_vcpu() -> Result<usize, SystemError>{
+    let vcpu = KVMArch::kvm_arch_vcpu_create(KVM().lock().nr_vcpus);
 
     KVM().lock().vcpu.push(vcpu.unwrap());
     KVM().lock().nr_vcpus += 1;

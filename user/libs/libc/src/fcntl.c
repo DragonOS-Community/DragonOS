@@ -22,7 +22,7 @@ int open(const char *path, int options, ...)
  * @param ...
  * @return int 成功返回0
  */
-int ioctl(int fd, int cmd, ...)
+int ioctl(int fd, int cmd, uint64_t data, ...)
 {
-    return syscall_invoke(SYS_IOCTL, fd, cmd, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_IOCTL, fd, cmd, data, 0, 0, 0, 0, 0);
 }

@@ -14,6 +14,8 @@
 extern  "C"  { 
 
 #endif
+#include <stdint.h>
+
 #define O_RDONLY 00000000  // Open Read-only
 #define O_WRONLY 00000001  // Open Write-only
 #define O_RDWR 00000002    // Open read/write
@@ -80,7 +82,7 @@ int open(const char * path, int options, ...);
  * @param ...
  * @return int 成功返回0
  */
-int ioctl(int fd, int cmd, ...);
+int ioctl(int fd, int cmd, uint64_t data, ...);
 
 #if defined(__cplusplus) 
 }  /* extern "C" */ 

@@ -24,6 +24,16 @@ pub struct Hypervisor {
 //     vm_state: u32,
 }
 
+#[repr(C)]
+pub struct KvmUserspaceMemoryRegion {
+    pub slot: u32,
+    pub flags: u32,
+    pub guest_phys_addr: u64,
+    pub memory_size: u64,
+    pub userspace_addr: u64,
+}
+
+
 impl Hypervisor {
     pub fn new(sys_fd:u32, nr_vcpus: u32, host_stack: u64, mem_slots: u64) -> Result<Self, SystemError> {
         let mut vcpu = Vec::new();
@@ -41,6 +51,9 @@ impl Hypervisor {
         Ok(instance)
     }
 
+    pub fn set_user_memory_region(&mut self, kvm_mem_region: &KvmUserspaceMemoryRegion){
+        self.mem_slots = kvm_mem_region.userspace_addr as u64;
+    }
     // pub fn virtualize_cpu(&self) -> Result<(), SystemError> {
     //     let mut vcpu = self.vcpu[0].lock();
     //     vcpu.virtualize_cpu();

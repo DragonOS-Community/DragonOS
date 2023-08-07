@@ -7,6 +7,7 @@ use crate::filesystem::devfs::{devfs_register};
 use self::kvm_dev::LockedKvmInode;
 use vcpu::{Vcpu};
 use hypervisor::Hypervisor;
+use crate::arch::x86_64::kvm::vmx::vcpu::VmxVcpu;
 use crate::arch::KVMArch;
 use crate::libs::mutex::Mutex;
 use alloc::boxed::Box;
@@ -77,18 +78,17 @@ pub extern "C" fn kvm_init() {
     // if r.is_err() {
     //     panic!("Failed to register /dev/kvm");
     // }
-    // let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
-    // let host_stack = vec![0xCC; HOST_STACK_SIZE];
-
-    // let hypervisor = Hypervisor::new(1, 1, (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64).expect("Cannot create hypervisor");
-    // let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
-    // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
-
-    
+    let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
+    let host_stack = vec![0xCC; HOST_STACK_SIZE];
+    let guest_rsp = unsafe{guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64};
+    let host_rsp = unsafe {(host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64};
+    let hypervisor = Hypervisor::new(1, 1, host_rsp, 0).expect("Cannot create hypervisor");
+    let vcpu = VmxVcpu::new(1, Arc::new(Mutex::new(hypervisor)), host_rsp, guest_rsp,  guest_code as *const () as u64).expect("Cannot create VcpuData");
+    vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
 }
 
 #[no_mangle]
-fn guest_code(){
+pub extern "C" fn guest_code(){
     kdebug!("guest code");
     while true {
         unsafe {asm!(
@@ -100,9 +100,3 @@ fn guest_code(){
         unsafe {asm!("nop")};
     }
 }
-// fn kvm_dev_ioctl_create_vm(data: usize) {
-//     let kvm: Arc<Kvm> = Arc::new(Kvm(
-//         sys_fd::-1,
-//         vm_fd::-1,
-//     ));
-// }

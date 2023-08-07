@@ -64,7 +64,7 @@ QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -nic user,model=virtio-net-pci,hostfwd=tcp::12580-:12580 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
 # E1000E
-QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -nic user,model=e1000e,hostfwd=tcp::12580-:12580 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
+QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,model=e1000 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
 
 QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d -monitor ${QEMU_MONITOR} -d ${qemu_trace_std} "
 

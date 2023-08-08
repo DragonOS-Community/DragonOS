@@ -48,14 +48,17 @@ ifneq ($(shell printf '%s\n%s' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V
 endif
 endif
 
+.PHONY: dadk_run
 dadk_run: install_dadk
 	mkdir -p $(DADK_CACHE_DIR)
 # 之所以在这里临时设置ARCH为空，是因为如果要设置这个环境变量，应当在DADK的配置文件中设置
 	ARCH= dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot build
 	ARCH= dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot install
 
+.PHONY: dadk_clean
 dadk_clean: install_dadk
-	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean
+	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean src
+	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean target
 
 $(user_sub_dirs): ECHO sys_api_lib 
 
@@ -99,6 +102,7 @@ sys_api_lib: sys_api_lib_stage_1
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/include/export/* $(OLD_LIBC_INSTALL_PATH)/include/)
 	$(shell cp -r $(ROOT_PATH)/user/libs/libc/src/arch/x86_64/c*.o $(OLD_LIBC_INSTALL_PATH)/lib/)
 
+.PHONY: clean
 clean: 
 	rm -rf $(GARBAGE)
 	$(MAKE) dadk_clean

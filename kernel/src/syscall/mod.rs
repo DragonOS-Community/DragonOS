@@ -9,6 +9,7 @@ use crate::{
     arch::{cpu::cpu_reset, MMArch},
     filesystem::syscall::PosixKstat,
     filesystem::vfs::{
+        fcntl::FcntlCommand,
         file::FileMode,
         syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
@@ -363,9 +364,18 @@ pub const SYS_GETPEERNAME: usize = 42;
 pub const SYS_GETTIMEOFDAY: usize = 43;
 pub const SYS_MMAP: usize = 44;
 pub const SYS_MUNMAP: usize = 45;
-pub const SYS_MPROTECT: usize = 46;
 
+pub const SYS_MPROTECT: usize = 46;
 pub const SYS_FSTAT: usize = 47;
+#[allow(dead_code)]
+pub const SYS_GETCWD: usize = 48;
+#[allow(dead_code)]
+pub const SYS_GETPPID: usize = 49;
+#[allow(dead_code)]
+pub const SYS_GETPGID: usize = 50;
+
+pub const SYS_FCNTL: usize = 51;
+pub const SYS_FTRUNCATE: usize = 52;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -413,7 +423,7 @@ impl Syscall {
 
                     Self::open(path, open_flags)
                 };
-                // kdebug!("open: {:?}, res: {:?}", path, res);
+
                 res
             }
             SYS_CLOSE => {
@@ -433,9 +443,10 @@ impl Syscall {
                     let buf: &mut [u8] = unsafe {
                         core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
                     };
+
                     Self::read(fd, buf)
                 };
-
+                // kdebug!("sys read, fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
             SYS_WRITE => {
@@ -451,8 +462,11 @@ impl Syscall {
                     let buf: &[u8] = unsafe {
                         core::slice::from_raw_parts::<'static, u8>(buf_vaddr as *const u8, len)
                     };
+
                     Self::write(fd, buf)
                 };
+
+                // kdebug!("sys write, fd: {}, len: {}, res: {:?}", fd, len, res);
 
                 res
             }
@@ -476,6 +490,7 @@ impl Syscall {
                     let w = w.unwrap();
                     Self::lseek(fd, w)
                 };
+                // kdebug!("sys lseek, fd: {}, offset: {}, whence: {}, res: {:?}", fd, offset, whence, res);
 
                 res
             }
@@ -674,6 +689,7 @@ impl Syscall {
                     if pathname.is_err() {
                         Err(pathname.unwrap_err())
                     } else {
+                        // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
                         Self::unlinkat(dirfd, pathname.unwrap(), flags)
                     }
                 }
@@ -950,6 +966,29 @@ impl Syscall {
                     Ok(_) => Self::fstat(fd, kstat),
                     Err(e) => Err(e),
                 }
+            }
+
+            SYS_FCNTL => {
+                let fd = args[0] as i32;
+                let cmd: Option<FcntlCommand> =
+                    <FcntlCommand as FromPrimitive>::from_u32(args[1] as u32);
+                let arg = args[2] as i32;
+                let res = if let Some(cmd) = cmd {
+                    Self::fcntl(fd, cmd, arg)
+                } else {
+                    Err(SystemError::EINVAL)
+                };
+
+                // kdebug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
+                res
+            }
+
+            SYS_FTRUNCATE => {
+                let fd = args[0] as i32;
+                let len = args[1] as usize;
+                let res = Self::ftruncate(fd, len);
+                // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
+                res
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

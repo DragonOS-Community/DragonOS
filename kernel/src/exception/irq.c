@@ -14,7 +14,48 @@
 #include <common/string.h>
 #include <mm/slab.h>
 extern void ignore_int();
-extern int rs_apic_init();
+extern int rs_apic_init(){    
+    // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
+    for (int i = 32; i <= 55; ++i)
+        set_intr_gate(i, 0, interrupt_table[i - 32]);
+
+    // 设置local apic中断门
+    for (int i = 150; i < 160; ++i)
+        set_intr_gate(i, 0, local_apic_interrupt_table[i - 150]);
+
+    //  屏蔽类8259A芯片
+    io_out8(0x21, 0xff);
+
+    io_out8(0xa1, 0xff);
+
+    // 写入8259A pic的EOI位
+    io_out8(0x20, 0x20);
+    io_out8(0xa0, 0x20);
+
+    kdebug("8259A Masked.");
+
+    // enable IMCR
+    io_out8(0x22, 0x70);
+    io_out8(0x23, 0x01);
+
+    apic_local_apic_init();
+
+    apic_io_apic_init();
+
+    // get RCBA address
+    io_out32(0xcf8, 0x8000f8f0);
+    uint32_t RCBA_phys = io_in32(0xcfc);
+
+    // 获取RCBA寄存器的地址
+    if (RCBA_phys > 0xfec00000 && RCBA_phys < 0xfee00000)
+        RCBA_vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + RCBA_phys;
+    else
+    {
+        RCBA_vaddr = 0;
+        kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
+    }
+    sti();
+    return 0;};
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -254,7 +295,7 @@ void irq_init()
 #else
 
     memset((void *)interrupt_desc, 0, sizeof(irq_desc_t) * IRQ_NUM);
-    apic_init();
+    // apic_init();
     rs_apic_init();
 
 #endif

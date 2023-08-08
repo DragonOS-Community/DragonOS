@@ -2,7 +2,6 @@
 #include <common/cpu.h>
 #include <common/kprint.h>
 #include <common/spinlock.h>
-#include <driver/interrupt/apic/apic.h>
 #include <exception/gate.h>
 #include <mm/slab.h>
 #include <process/process.h>
@@ -10,7 +9,6 @@
 #include <process/preempt.h>
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
-#include <driver/interrupt/apic/apic.h>
 #include "ipi.h"
 
 static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
@@ -31,7 +29,7 @@ void smp_init()
     spin_init(&multi_core_starting_lock); // 初始化多核启动锁
     ul tmp_vaddr[MAX_SUPPORTED_PROCESSOR_NUM] = {0};
 
-    apic_get_ics(ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC, tmp_vaddr, &total_processor_num);
+    rs_apic_get_ics(ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC, tmp_vaddr, &total_processor_num);
 
     // kdebug("processor num=%d", total_processor_num);
     for (int i = 0; i < total_processor_num; ++i)

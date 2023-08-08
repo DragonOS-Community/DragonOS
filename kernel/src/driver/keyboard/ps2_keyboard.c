@@ -169,19 +169,19 @@ void ps2_keyboard_init()
 
     // ======== 初始化中断RTE entry ==========
 
-    entry.vector = PS2_KEYBOARD_INTR_VECTOR; // 设置中断向量号
-    entry.deliver_mode = IO_APIC_FIXED;      // 投递模式：混合
-    entry.dest_mode = DEST_PHYSICAL;         // 物理模式投递中断
-    entry.deliver_status = IDLE;
-    entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
-    entry.polarity = POLARITY_HIGH;    // 高电平触发
-    entry.remote_IRR = IRR_RESET;
-    entry.mask = MASKED;
-    entry.reserved = 0;
+    // entry.vector = PS2_KEYBOARD_INTR_VECTOR; // 设置中断向量号
+    // entry.deliver_mode = IO_APIC_FIXED;      // 投递模式：混合
+    // entry.dest_mode = DEST_PHYSICAL;         // 物理模式投递中断
+    // entry.deliver_status = IDLE;
+    // entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
+    // entry.polarity = POLARITY_HIGH;    // 高电平触发
+    // entry.remote_IRR = IRR_RESET;
+    // entry.mask = MASKED;
+    // entry.reserved = 0;
 
-    entry.destination.physical.reserved1 = 0;
-    entry.destination.physical.reserved2 = 0;
-    entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
+    // entry.destination.physical.reserved1 = 0;
+    // entry.destination.physical.reserved2 = 0;
+    // entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
 
     // ======== 初始化键盘控制器，写入配置值 =========
     wait_ps2_keyboard_write();

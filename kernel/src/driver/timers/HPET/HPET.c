@@ -2,7 +2,6 @@
 #include <common/kprint.h>
 #include <common/compiler.h>
 #include <mm/mm.h>
-#include <driver/interrupt/apic/apic.h>
 #include <exception/softirq.h>
 #include <time/timer.h>
 #include <process/process.h>

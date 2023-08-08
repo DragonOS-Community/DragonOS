@@ -6,6 +6,7 @@ pub mod apic_timer;
 pub mod ioapic;
 pub mod x2apic;
 pub mod xapic;
+pub mod new_timer;
 
 pub trait LocalAPIC {
     /// @brief 判断当前处理器是否支持这个类型的apic

@@ -6,6 +6,7 @@ ifeq ($(PIC), _INTR_8259A_)
 pic.o: 8259A/8259A.c
 	$(CC) $(CFLAGS) -c 8259A/8259A.c -o pic.o
 else
+
 pic.o: apic/apic.c apic_timer.o
 	$(CC) $(CFLAGS) -c apic/apic.c -o pic.o
 

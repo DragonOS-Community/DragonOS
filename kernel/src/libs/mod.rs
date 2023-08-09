@@ -22,3 +22,4 @@ pub mod vec_cursor;
 pub mod volatile;
 pub mod notifier;
 pub mod wait_queue;
+pub mod userbuffer;

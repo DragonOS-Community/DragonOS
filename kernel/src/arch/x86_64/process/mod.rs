@@ -10,6 +10,8 @@ use crate::{
 
 use super::{fpu::FpState, interrupt::TrapFrame};
 
+pub mod syscall;
+
 extern "C" {
     /// 内核线程引导函数
     fn kernel_thread_func();
@@ -19,6 +21,7 @@ extern "C" {
 
 /// PCB中与架构相关的信息
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ArchPCBInfo {
     rflags: usize,
     rbx: usize,

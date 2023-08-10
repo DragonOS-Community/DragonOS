@@ -112,6 +112,6 @@ uint64_t c_sys_wait4(pid_t pid, int *status, int options, void *rusage)
         *status = child_proc->exit_code;
     // copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
 
-    process_release_pcb(child_proc);
+    // process_release_pcb(child_proc);
     return 0;
 }

@@ -4,6 +4,7 @@ pub mod context;
 pub mod cpu;
 pub mod fpu;
 pub mod interrupt;
+pub mod ipc;
 pub mod libs;
 pub mod mm;
 pub mod msi;

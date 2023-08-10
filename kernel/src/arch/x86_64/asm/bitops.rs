@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use core::arch::x86_64::_popcnt64;
 
 /// @brief ffz - 寻找u64中的第一个0所在的位（从第0位开始寻找）

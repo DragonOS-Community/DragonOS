@@ -1,10 +1,10 @@
 use super::vmx_asm_wrapper::{
-    vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmlaunch, vmx_vmptrld, vmx_vmclear
+   vmx_vmwrite, vmx_vmread
 };
 use crate::syscall::SystemError;
 use x86::cpuid::cpuid;
 use core::arch::asm;
-use crate::{kdebug};
+use crate::kdebug;
 use super::vmcs::{VmcsFields, VmxExitReason};
 
 #[derive(FromPrimitive)]
@@ -67,15 +67,15 @@ pub fn vmexit_vmx_instruction_executed() -> Result<(), SystemError>{
     vmx_vmwrite(VmcsFields::CTRL_VM_ENTRY_INTR_INFO_FIELD as u32, interrupt_info as u64)?;
     vmx_vmwrite(VmcsFields::CTRL_VM_ENTRY_INSTR_LEN as u32, 0)?;
     let rflags:u64 = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap() | 0x0001_0000; // set RF flags
-    vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, rflags);
+    vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, rflags)?;
     Ok(())
 }
 
 pub fn vmexit_cpuid_handler(guest_cpu_context: &mut GuestCpuContext) -> Result<(), SystemError>{
     let rax = guest_cpu_context.rax;
     let rcx = guest_cpu_context.rcx;
-    let rdx = guest_cpu_context.rdx;
-    let rbx = guest_cpu_context.rbx;
+    // let rdx = guest_cpu_context.rdx;
+    // let rbx = guest_cpu_context.rbx;
     cpuid!(rax, rcx);
     unsafe{asm!("mov {}, rax", out(reg) guest_cpu_context.rax)};
     unsafe{asm!("mov {}, rcx", out(reg) guest_cpu_context.rcx)};
@@ -181,7 +181,7 @@ pub extern "C" fn vmx_return(){
 #[no_mangle]
 extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
     kdebug!("vmexit handler!");
-    let mut guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
+    let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
     kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
 
     let exit_reason = vmx_vmread(VmcsFields::VMEXIT_EXIT_REASON as u32).unwrap() as u32;

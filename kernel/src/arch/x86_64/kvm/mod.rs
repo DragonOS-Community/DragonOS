@@ -40,7 +40,7 @@ impl X86_64KVMArch{
     }
 
 
-    pub fn kvm_arch_dev_ioctl(cmd: u32, arg: usize) -> Result<usize, SystemError> {
+    pub fn kvm_arch_dev_ioctl(cmd: u32, _arg: usize) -> Result<usize, SystemError> {
         match cmd {
             _ => {
                 kerror!("unknown kvm ioctl cmd: {}", cmd);
@@ -50,11 +50,11 @@ impl X86_64KVMArch{
     }
 
     pub fn kvm_arch_vcpu_create(id:u32) -> Result<Box<dyn Vcpu>, SystemError> {
-        let mut current_kvm = KVM();
+        let current_kvm = KVM();
         let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
         let host_stack = vec![0xCC; HOST_STACK_SIZE];
         kdebug!("guest rip: {:x?}", current_kvm.lock().mem_slots);
-        let mut vcpu = Box::new(
+        let vcpu = Box::new(
             VmxVcpu::new(
                 id, 
                 current_kvm.clone(), 

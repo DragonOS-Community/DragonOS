@@ -1,6 +1,6 @@
 use crate::syscall::SystemError;
 use x86;
-use crate::{kdebug};
+use crate::kdebug;
 /// Enable VMX operation.
 pub fn vmxon(vmxon_pa: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmxon(vmxon_pa) } {
@@ -55,7 +55,7 @@ pub fn vmx_vmlaunch()-> Result<(), SystemError> {
         Ok(_) => Ok(()),
         Err(e) => {
             kdebug!("vmx_launch fail: {:?}", e);
-            Err(SystemError::EVMREADFailed)
+            Err(SystemError::EVMLAUNCHFailed)
         },
     }
 }

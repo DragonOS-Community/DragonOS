@@ -499,8 +499,3 @@ fn decode_vmcs_field(field: u32) -> (VmcsAccessType, VmcsType, VmcsWidth, u16){
     )
 }
 
-impl VMCSRegion{
-    fn init(){
-
-    }
-}

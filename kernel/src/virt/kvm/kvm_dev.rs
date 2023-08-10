@@ -1,14 +1,14 @@
 use crate::kdebug;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
-    core::{generate_inode_id},
+    core::generate_inode_id,
     file::{File, FileMode},
     FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
-    make_rawdev, ROOT_INODE
+    make_rawdev
 };
 use crate::{
     arch::asm::current::current_pcb,
-    libs::spinlock::{SpinLock},
+    libs::spinlock::SpinLock,
     syscall::SystemError,
     time::TimeSpec,
     arch::KVMArch,
@@ -16,7 +16,7 @@ use crate::{
 use crate::virt::kvm::guest_code;
 use crate::libs::mutex::Mutex;
 // use crate::virt::kvm::{host_stack};
-use super::{Hypervisor};
+use super::Hypervisor;
 use crate::virt::kvm::vm_dev::LockedVmInode;
 use alloc::{
     string::String,
@@ -27,9 +27,6 @@ use alloc::{
 use crate::virt::kvm::__KVM;
 
 pub const KVM_API_VERSION:u32 = 12;
-
-pub const GUEST_STACK_SIZE:usize = 1024;
-pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 
 
 // use crate::virt::kvm::kvm_dev_ioctl_create_vm;
@@ -162,7 +159,7 @@ impl IndexNode for LockedKvmInode {
                         0, 
                         0,
                         // unsafe {(host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64},
-                        guest_code as *const () as u64,
+                        // guest_code as *const () as u64,
                     ).unwrap()
                     ))
                 ));
@@ -182,8 +179,8 @@ impl IndexNode for LockedKvmInode {
     fn read_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -193,17 +190,17 @@ impl IndexNode for LockedKvmInode {
     fn write_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &[u8],
+        _len: usize,
+        _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 }
 
-pub fn kvm_dev_ioctl_create_vm(vmtype: usize) -> Result<usize, SystemError> {
+pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
     let vm_inode = LockedVmInode::new();
-    let mut file: File = File::new(vm_inode, FileMode::O_RDWR)?;
+    let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
     return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
     // let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
 }

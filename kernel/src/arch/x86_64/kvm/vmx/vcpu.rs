@@ -9,17 +9,16 @@ use alloc::alloc::Global;
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::slice;
-use crate::mm::{ phys_2_virt};
 use crate::libs::mutex::Mutex;
 use crate::arch::MMArch;
 use crate::mm::MemoryManagementArch;
-use crate::mm::{VirtAddr};
+use crate::mm::{VirtAddr, phys_2_virt};
 use crate::syscall::SystemError;
-use crate::virt::kvm::hypervisor::{Hypervisor};
-use crate::virt::kvm::vcpu::{Vcpu};
+use crate::virt::kvm::hypervisor::Hypervisor;
+use crate::virt::kvm::vcpu::Vcpu;
 use super::vmexit::vmx_return;
 use super::vmcs::{VMCSRegion, VmcsFields, 
-    VmxEntryCtrl, VmxPrimaryExitCtrl, VmxPinBasedExecuteCtrl,
+    VmxEntryCtrl, VmxPrimaryExitCtrl,
     VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl
 };
 use super::vmx_asm_wrapper::{
@@ -377,7 +376,7 @@ impl Vcpu for VmxVcpu {
             Ok(_) => {},
             Err(e) => {
                 let vmx_err = vmx_vmread(VmcsFields::VMEXIT_INSTR_ERR as u32).unwrap();
-                kdebug!("vmlaunch failed: {:?}",vmx_err);
+                kdebug!("vmlaunch failed: {:?}", vmx_err);
                 return Err(e);
             },
         }

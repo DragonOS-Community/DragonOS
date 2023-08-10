@@ -1,33 +1,30 @@
 use crate::kdebug;
-use crate::filesystem::devfs::{DevFS, DeviceINode};
+use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
-    core::{generate_inode_id},
+    core::generate_inode_id,
     file::{File, FileMode},
     FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
-    make_rawdev, ROOT_INODE
+    make_rawdev,
 };
 use crate::{
     arch::asm::current::current_pcb,
-    libs::spinlock::{SpinLock},
+    libs::spinlock::SpinLock,
     syscall::SystemError,
     time::TimeSpec,
     arch::KVMArch,
 };
-use crate::virt::kvm::{KVM};
+use crate::virt::kvm::KVM;
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use crate::virt::kvm::hypervisor::KvmUserspaceMemoryRegion;
-use super::{Hypervisor};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
-    boxed::Box,
 };
 
-pub const KVM_API_VERSION:u32 = 12;
-
-pub const GUEST_STACK_SIZE:usize = 1024;
-pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
+// pub const KVM_API_VERSION:u32 = 12;
+// pub const GUEST_STACK_SIZE:usize = 1024;
+// pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 
 /*
  * ioctls for /dev/vm fds:
@@ -43,9 +40,6 @@ pub const KVM_IRQ_LINE_STATUS: u32 = 0x05;
 //  pub struct InodeInfo {
 //     kvm: Arc<Hypervisor>,
 //  }
-extern "C" {
-    fn memcpy(dst: *mut u8, src: *const u8, num: u64) -> *const u8;
-} 
 
 #[derive(Debug)]
 pub struct VmInode {
@@ -165,7 +159,7 @@ impl IndexNode for LockedVmInode {
                     kvm_mem_region.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
                     kvm_mem_region.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
                 );
-                let mut kvm_mem_region = kvm_mem_region.clone();
+                let kvm_mem_region = kvm_mem_region.clone();
                 KVM().lock().set_user_memory_region(&kvm_mem_region);
                 Ok(0)
             },
@@ -182,8 +176,8 @@ impl IndexNode for LockedVmInode {
     fn read_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -193,8 +187,8 @@ impl IndexNode for LockedVmInode {
     fn write_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &[u8],
+        _len: usize,
+        _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -202,12 +196,12 @@ impl IndexNode for LockedVmInode {
 }
 
 fn kvm_vm_ioctl_create_vcpu() -> Result<usize, SystemError>{
-    let vcpu = KVMArch::kvm_arch_vcpu_create(KVM().lock().nr_vcpus);
+    let vcpu = KVMArch::kvm_arch_vcpu_create(0);
 
     KVM().lock().vcpu.push(vcpu.unwrap());
     KVM().lock().nr_vcpus += 1;
 
     let vcpu_inode = LockedVcpuInode::new();
-    let mut file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;
+    let file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;
     return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
 }

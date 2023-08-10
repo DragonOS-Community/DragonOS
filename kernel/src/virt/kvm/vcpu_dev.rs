@@ -1,42 +1,42 @@
+use crate::arch::kvm::vmx::vcpu::VmxVcpu;
 use crate::kdebug;
-use crate::virt::kvm::KVM;
-use crate::filesystem::devfs::{DevFS, DeviceINode};
+use crate::libs::mutex::Mutex;
+use crate::virt::kvm::hypervisor::Hypervisor;
+use crate::virt::kvm::vcpu::Vcpu;
+use crate::virt::kvm::{KVM, HOST_STACK_SIZE, GUEST_STACK_SIZE, guest_code};
+use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
-    core::{generate_inode_id},
-    file::{File, FileMode},
+    core::generate_inode_id,
+    file::FileMode,
     FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
-    make_rawdev, ROOT_INODE
+    make_rawdev
 };
 use crate::{
-    arch::asm::current::current_pcb,
-    libs::spinlock::{SpinLock},
+    libs::spinlock::SpinLock,
     syscall::SystemError,
     time::TimeSpec,
-    arch::KVMArch,
 };
-use super::Hypervisor;
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
-    boxed::Box,
 };
 
-pub const KVM_API_VERSION:u32 = 12;
+// pub const KVM_API_VERSION:u32 = 12;
 pub const KVM_RUN: u32 = 0x00;
 
-pub const GUEST_STACK_SIZE:usize = 1024;
-pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
+// pub const GUEST_STACK_SIZE:usize = 1024;
+// pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 
 /*
  * ioctls for /dev/vm fds:
  */
-pub const KVM_CREATE_VCPU: u32 = 0x00;
-pub const KVM_SET_USER_MEMORY_REGION: u32 = 0x01;
-pub const KVM_GET_DIRTY_LOG: u32 = 0x02;
-pub const KVM_IRQFD: u32 = 0x03;
-pub const KVM_IOEVENTFD: u32 = 0x04;
-pub const KVM_IRQ_LINE_STATUS: u32 = 0x05;
+// pub const KVM_CREATE_VCPU: u32 = 0x00;
+// pub const KVM_SET_USER_MEMORY_REGION: u32 = 0x01;
+// pub const KVM_GET_DIRTY_LOG: u32 = 0x02;
+// pub const KVM_IRQFD: u32 = 0x03;
+// pub const KVM_IOEVENTFD: u32 = 0x04;
+// pub const KVM_IRQ_LINE_STATUS: u32 = 0x05;
 
 //  #[derive(Debug)]
 //  pub struct InodeInfo {
@@ -142,7 +142,7 @@ impl IndexNode for LockedVcpuInode {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
+    fn ioctl(&self, cmd: u32, _data: usize) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
                 kdebug!("kvm_cpu ioctl");
@@ -151,7 +151,14 @@ impl IndexNode for LockedVcpuInode {
             KVM_RUN =>{
                 kdebug!("kvm_cpu ioctl");
                 let vcpu = &KVM().lock().vcpu[0];
-                vcpu.virtualize_cpu();
+                // let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
+                // let host_stack = vec![0xCC; HOST_STACK_SIZE];
+                // let guest_rsp = guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64;
+                // let host_rsp = (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64;
+                // let hypervisor = Hypervisor::new(1, host_rsp, 0).expect("Cannot create hypervisor");
+                // let vcpu = VmxVcpu::new(1, Arc::new(Mutex::new(hypervisor)), host_rsp, guest_rsp,  guest_code as *const () as u64).expect("Cannot create VcpuData");
+                // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
+                vcpu.virtualize_cpu()?;
                 Ok(0)
             }
             _ => {
@@ -164,8 +171,8 @@ impl IndexNode for LockedVcpuInode {
     fn read_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -175,8 +182,8 @@ impl IndexNode for LockedVcpuInode {
     fn write_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &[u8],
+        _len: usize,
+        _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)

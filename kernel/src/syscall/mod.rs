@@ -303,6 +303,7 @@ pub enum SystemError {
     EVMWRITEFailed = 133,
     EVMREADFailed = 134,
     EVMPRTLDFailed = 135,
+    EVMLAUNCHFailed = 136,
 }
 
 impl SystemError {

@@ -27,7 +27,6 @@ use crate::{
 
 use super::preempt::{preempt_disable, preempt_enable};
 
-
 /// @brief 尝试唤醒指定的进程。
 /// 本函数的行为：If (@_state & @pcb->state) @pcb->state = TASK_RUNNING.
 ///

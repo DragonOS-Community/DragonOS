@@ -3,11 +3,18 @@ use alloc::{string::String, vec::Vec};
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch},
     exception::InterruptArch,
-    process::{fork::CloneFlags, ProcessManager, exec::{ExecParam, load_binary_file, ExecParamFlags}},
+    filesystem::vfs::MAX_PATHLEN,
+    include::bindings::bindings::{USER_CS, USER_DS},
+    mm::ucontext::AddressSpace,
+    process::{
+        exec::{load_binary_file, ExecParam, ExecParamFlags},
+        fork::CloneFlags,
+        ProcessManager,
+    },
     syscall::{
         user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
         Syscall, SystemError,
-    }, filesystem::vfs::MAX_PATHLEN, mm::ucontext::AddressSpace, include::bindings::bindings::{USER_CS, USER_DS},
+    },
 };
 
 impl Syscall {

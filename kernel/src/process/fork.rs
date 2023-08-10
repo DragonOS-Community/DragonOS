@@ -28,7 +28,10 @@ bitflags! {
 }
 
 impl ProcessManager {
-    pub fn fork(current_trapframe: &mut TrapFrame, clone_flags: CloneFlags) -> Result<Pid, SystemError> {
+    pub fn fork(
+        current_trapframe: &mut TrapFrame,
+        clone_flags: CloneFlags,
+    ) -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         let new_kstack = KernelStack::new()?;
         let name = current_pcb.basic().name().to_string();

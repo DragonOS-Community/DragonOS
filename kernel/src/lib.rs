@@ -7,6 +7,7 @@
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(drain_filter)]
+#![feature(is_some_and)]
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]

@@ -70,11 +70,11 @@ impl IndexNode for LockedZeroInode {
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        return Ok(());
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

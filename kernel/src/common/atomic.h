@@ -102,6 +102,6 @@ inline void atomic_clear_mask(atomic_t *ato, long mask)
 // cmpxchgq 比较并交换
 inline long atomic_cmpxchg(atomic_t *ato, long oldval, long newval)
 {
-    bool success = arch_try_cmpxchg(&ato->value, &oldval, &newval);
+    bool success = arch_try_cmpxchg(&ato->value, &oldval, newval);
     return success ? oldval : newval;
 }

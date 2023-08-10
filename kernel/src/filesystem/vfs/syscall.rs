@@ -1,5 +1,4 @@
 use alloc::{
-    boxed::Box,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -10,6 +9,7 @@ use crate::{
     include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
     io::SeekFrom,
     kerror,
+    libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
     syscall::{Syscall, SystemError},
@@ -17,6 +17,7 @@ use crate::{
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
+    fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
     Dirent, FileType, IndexNode, ROOT_INODE,
@@ -35,6 +36,7 @@ impl Syscall {
     ///
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
+        // kdebug!("open: path: {}, mode: {:?}", path, mode);
         // 文件名过长
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -364,7 +366,14 @@ impl Syscall {
     pub fn dup2(oldfd: i32, newfd: i32) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
+        return Self::do_dup2(oldfd, newfd, &mut fd_table_guard);
+    }
 
+    fn do_dup2(
+        oldfd: i32,
+        newfd: i32,
+        fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
+    ) -> Result<usize, SystemError> {
         // 确认oldfd, newid是否有效
         if !(FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd)) {
             return Err(SystemError::EBADF);
@@ -392,6 +401,120 @@ impl Syscall {
             .alloc_fd(new_file, Some(newfd))
             .map(|x| x as usize);
         return res;
+    }
+
+    /// # fcntl
+    ///
+    /// ## 参数
+    ///
+    /// - `fd`：文件描述符
+    /// - `cmd`：命令
+    /// - `arg`：参数
+    pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
+        match cmd {
+            FcntlCommand::DupFd => {
+                if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
+                    return Err(SystemError::EBADF);
+                }
+                let arg = arg as usize;
+                for i in arg..FileDescriptorVec::PROCESS_MAX_FD {
+                    let binding = ProcessManager::current_pcb().fd_table();
+                    let mut fd_table_guard = binding.write();
+                    if fd_table_guard.get_file_ref_by_fd(fd).is_none() {
+                        return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
+                    }
+                }
+                return Err(SystemError::EMFILE);
+            }
+            FcntlCommand::GetFd => {
+                // Get file descriptor flags.
+                let binding = ProcessManager::current_pcb().fd_table();
+                let fd_table_guard = binding.read();
+                if let Some(file) = fd_table_guard.get_file_ref_by_fd(fd) {
+                    if file.close_on_exec() {
+                        return Ok(FD_CLOEXEC as usize);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+            FcntlCommand::SetFd => {
+                // Set file descriptor flags.
+                let binding = ProcessManager::current_pcb().fd_table();
+                let mut fd_table_guard = binding.write();
+
+                if let Some(file) = fd_table_guard.get_file_mut_by_fd(fd) {
+                    let arg = arg as u32;
+                    if arg & FD_CLOEXEC != 0 {
+                        file.set_close_on_exec(true);
+                    } else {
+                        file.set_close_on_exec(false);
+                    }
+                    return Ok(0);
+                }
+                return Err(SystemError::EBADF);
+            }
+
+            FcntlCommand::GetFlags => {
+                // Get file status flags.
+                let binding = ProcessManager::current_pcb().fd_table();
+                let fd_table_guard = binding.read();
+
+                if let Some(file) = fd_table_guard.get_file_ref_by_fd(fd) {
+                    return Ok(file.mode().bits() as usize);
+                }
+
+                return Err(SystemError::EBADF);
+            }
+            FcntlCommand::SetFlags => {
+                // Set file status flags.
+                let binding = ProcessManager::current_pcb().fd_table();
+                let mut fd_table_guard = binding.write();
+
+                if let Some(file) = fd_table_guard.get_file_mut_by_fd(fd) {
+                    let arg = arg as u32;
+                    let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
+                    file.set_mode(mode)?;
+                    return Ok(0);
+                }
+
+                return Err(SystemError::EBADF);
+            }
+            _ => {
+                // TODO: unimplemented
+                // 未实现的命令，返回0，不报错。
+
+                // kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                return Ok(0);
+            }
+        }
+    }
+
+    /// # ftruncate
+    ///
+    /// ## 描述
+    ///
+    /// 改变文件大小.
+    /// 如果文件大小大于原来的大小，那么文件的内容将会被扩展到指定的大小，新的空间将会用0填充.
+    /// 如果文件大小小于原来的大小，那么文件的内容将会被截断到指定的大小.
+    ///
+    /// ## 参数
+    ///
+    /// - `fd`：文件描述符
+    /// - `len`：文件大小
+    ///
+    /// ## 返回值
+    ///
+    /// 如果成功，返回0，否则返回错误码.
+    pub fn ftruncate(fd: i32, len: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        if let Some(file) = fd_table_guard.get_file_ref_by_fd(fd) {
+            let r = file.ftruncate(len).map(|_| 0);
+            return r;
+        }
+
+        return Err(SystemError::EBADF);
     }
 }
 

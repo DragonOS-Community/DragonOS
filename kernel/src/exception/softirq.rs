@@ -10,13 +10,12 @@ use alloc::{boxed::Box, sync::Arc};
 use num_traits::FromPrimitive;
 
 use crate::{
+    arch::CurrentIrqArch,
     arch::{
-        asm::{
-            current::current_pcb,
-            irqflags::{local_irq_restore, local_irq_save},
-        },
+        asm::current::current_pcb,
         interrupt::{cli, sti},
     },
+    exception::InterruptArch,
     include::bindings::bindings::MAX_CPU_NUM,
     kdebug, kinfo,
     libs::rwlock::RwLock,
@@ -226,14 +225,14 @@ impl Softirq {
     }
 
     pub fn raise_softirq(&self, softirq_num: SoftirqNumber) {
-        let flags = local_irq_save();
+        let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let processor_id = smp_get_processor_id() as usize;
 
         cpu_pending(processor_id).insert(VecStatus::from(softirq_num));
 
         compiler_fence(Ordering::SeqCst);
 
-        local_irq_restore(flags);
+        drop(guard);
         // kdebug!("raise_softirq exited");
     }
     pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber) {

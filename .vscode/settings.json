@@ -175,7 +175,8 @@
         "net.h": "c",
         "lz4.h": "c",
         "cmd_test.h": "c",
-        "cmpxchg.h": "c"
+        "cmpxchg.h": "c",
+        "mman.h": "c"
     },
     "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",

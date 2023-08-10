@@ -33,7 +33,7 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
  *
  * 请注意，该宏会创建一个内核线程，并将其设置为停止状态
  */
-#define kthread_create(thread_fn, data, name_fmt, arg...)                                                              \
+#define kthread_create(thread_fn, data, name_fmt, arg...) \
     kthread_create_on_node(thread_fn, data, NUMA_NO_NODE, name_fmt, ##arg)
 
 /**
@@ -44,12 +44,20 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
  * @param name_fmt printf-style format string for the thread name
  * @param arg name_fmt的参数
  */
-#define kthread_run(thread_fn, data, name_fmt, ...)                                                          \
-    ({                                                                                                       \
-        struct process_control_block *__kt = kthread_create(thread_fn, data, name_fmt, ##__VA_ARGS__); \
-        if (!IS_ERR(__kt))                                                                                   \
-            process_wakeup(__kt);                                                                            \
-        __kt;                                                                                                \
+// #define kthread_run(thread_fn, data, name_fmt, ...)                                                          \
+//     ({                                                                                                       \
+//         struct process_control_block *__kt = kthread_create(thread_fn, data, name_fmt, ##__VA_ARGS__); \
+//         if (!IS_ERR(__kt))                                                                                   \
+//             process_wakeup(__kt);                                                                            \
+//         __kt;                                                                                                \
+//     })
+
+#define kthread_run(thread_fn, data, name_fmt, ...)       \
+    ({                                                    \
+        kerror("Failed to run kthread, todo: fix this."); \
+        while (1)                                         \
+            ;                                             \
+        NULL;   \
     })
 
 /**
@@ -59,16 +67,23 @@ struct process_control_block *kthread_create_on_node(int (*thread_fn)(void *data
  * @param data 传递给 thread_fn 的参数数据
  * @param name_fmt printf-style format string for the thread name
  * @param arg name_fmt的参数
- */
-#define kthread_run_rt(thread_fn, data, name_fmt, ...)                                                                 \
-    ({                                                                                                                 \
-        struct process_control_block *__kt = kthread_create(thread_fn, data, name_fmt, ##__VA_ARGS__);                 \
-        __kt = process_init_rt_pcb(__kt);                                                                              \
-        if (!IS_ERR(__kt))                                                                                             \
-        {                                                                                                              \
-            process_wakeup(__kt);                                                                                      \
-        }                                                                                                              \
-        __kt;                                                                                                          \
+//  */
+// #define kthread_run_rt(thread_fn, data, name_fmt, ...)                                                 \
+//     ({                                                                                                 \
+//         struct process_control_block *__kt = kthread_create(thread_fn, data, name_fmt, ##__VA_ARGS__); \
+//         __kt = process_init_rt_pcb(__kt);                                                              \
+//         if (!IS_ERR(__kt))                                                                             \
+//         {                                                                                              \
+//             process_wakeup(__kt);                                                                      \
+//         }                                                                                              \
+//         __kt;                                                                                          \
+//     })
+
+#define kthread_run_rt(thread_fn, data, name_fmt, ...)       \
+    ({                                                    \
+        kerror("Failed to kthread_run_rt, todo: fix this."); \
+        while (1)                                         \
+            ;                                             \
     })
 
 /**

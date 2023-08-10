@@ -7,19 +7,14 @@ use core::{
 };
 
 use alloc::{
-    boxed::Box,
     string::{String, ToString},
     sync::Arc,
 };
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{asm::current::current_pcb, fpu::FpState, process::ArchPCBInfo},
-    filesystem::vfs::{
-        file::{File, FileDescriptorVec},
-        FileType,
-    },
-    ipc::signal_types::{sighand_struct, signal_struct, sigpending, sigset_t, SignalNumber},
+    arch::{asm::current::current_pcb, process::ArchPCBInfo},
+    filesystem::vfs::{file::FileDescriptorVec, FileType},
     kdebug,
     libs::{
         align::AlignedBox,
@@ -36,13 +31,10 @@ use crate::{
     syscall::SystemError,
 };
 
-use self::initial_proc::{INITIAL_SIGHAND, INITIAL_SIGNALS};
-
 pub mod abi;
 pub mod c_adapter;
 pub mod exec;
 pub mod fork;
-pub mod initial_proc;
 pub mod pid;
 pub mod preempt;
 pub mod process;
@@ -106,6 +98,17 @@ impl ProcessManager {
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         todo!()
     }
+
+    /// 退出进程，回收资源
+    ///
+    /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246
+    pub fn exit(exit_code: usize) -> ! {
+        todo!()
+    }
+
+    pub unsafe fn release(pid: Pid) {
+        ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
+    }
 }
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
@@ -132,7 +135,7 @@ pub enum ProcessState {
     /// - 如果该bool为false,那么，这个进程必须被显式的唤醒，才能重新进入Runnable状态。
     Blocked(bool),
     /// 进程被信号终止
-    Stopped(SignalNumber),
+    // Stopped(SignalNumber),
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }
@@ -166,7 +169,6 @@ pub struct ProcessControlBlock {
     preempt_count: AtomicUsize,
 
     flags: SpinLock<ProcessFlags>,
-    signal: RwLock<ProcessSignalInfo>,
 
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
@@ -199,7 +201,7 @@ impl ProcessControlBlock {
         );
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
-        let signal = ProcessSignalInfo::new();
+
         let sched_info = ProcessSchedulerInfo::new(None);
         let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
 
@@ -207,7 +209,6 @@ impl ProcessControlBlock {
             basic: basic_info,
             preempt_count,
             flags,
-            signal,
             kernel_stack: RwLock::new(kstack),
             sched_info,
             arch_info,
@@ -257,14 +258,6 @@ impl ProcessControlBlock {
         return self.basic.write();
     }
 
-    pub fn signal(&self) -> RwLockReadGuard<ProcessSignalInfo> {
-        return self.signal.read();
-    }
-
-    pub fn signal_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
-        return self.signal.write();
-    }
-
     pub fn arch_info(&self) -> SpinLockGuard<ArchPCBInfo> {
         return self.arch_info.lock();
     }
@@ -284,7 +277,7 @@ impl ProcessControlBlock {
     pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write();
     }
-    
+
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
@@ -393,7 +386,7 @@ impl ProcessBasicInfo {
         return self.user_vm.clone();
     }
 
-    pub fn set_user_vm(&mut self, user_vm: Option<Arc<AddressSpace>>) {
+    pub unsafe fn set_user_vm(&mut self, user_vm: Option<Arc<AddressSpace>>) {
         self.user_vm = user_vm;
     }
 
@@ -477,29 +470,6 @@ impl ProcessSchedulerInfo {
 
     pub fn priority(&self) -> SchedPriority {
         return self.priority;
-    }
-}
-
-#[derive(Debug)]
-pub struct ProcessSignalInfo {
-    // 信号相关的字段。由于信号机制实现的不是很好，这里写的真的非常丑陋。
-    // TODO：重构信号机制，并重写这里的代码
-    pub signal: signal_struct,
-    pub sighand: sighand_struct,
-    pub sig_blocked: sigset_t,
-    pub sig_pending: sigpending,
-}
-
-impl ProcessSignalInfo {
-    pub fn new() -> RwLock<Self> {
-        unsafe {
-            return RwLock::new(Self {
-                signal: INITIAL_SIGNALS.clone(),
-                sighand: INITIAL_SIGHAND.clone(),
-                sig_blocked: 0,
-                sig_pending: sigpending::new(),
-            });
-        }
     }
 }
 

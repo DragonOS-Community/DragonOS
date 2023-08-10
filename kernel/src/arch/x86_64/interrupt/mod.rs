@@ -126,4 +126,13 @@ impl TrapFrame {
     pub fn set_return_value(&mut self, value: usize) {
         self.rax = value as u64;
     }
+
+    /// 判断当前中断是否来自用户模式
+    pub fn from_user(&self) -> bool {
+        if (self.cs & 0x3) != 0 {
+            return true;
+        } else {
+            return false;
+        }
+    }
 }

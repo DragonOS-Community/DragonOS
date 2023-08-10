@@ -23,6 +23,7 @@ use crate::{
         rwlock::{RwLock, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::ProcessManager,
     syscall::SystemError,
 };
 
@@ -64,10 +65,12 @@ impl AddressSpace {
 
     /// 从pcb中获取当前进程的地址空间结构体的Arc指针
     pub fn current() -> Result<Arc<AddressSpace>, SystemError> {
-        let result = current_pcb()
-            .address_space()
+        let vm = ProcessManager::current_pcb()
+            .basic()
+            .user_vm()
             .expect("Current process has no address space");
-        return Ok(result);
+
+        return Ok(vm);
     }
 
     /// 判断某个地址空间是否为当前进程的地址空间

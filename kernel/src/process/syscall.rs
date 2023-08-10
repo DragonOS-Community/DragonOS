@@ -1,36 +1,45 @@
 use core::ffi::{c_int, c_void};
 
-use super::{Pid, ProcessControlBlock, ProcessManager, ALL_PROCESS};
+use alloc::{string::String, vec::Vec};
+
+use super::{Pid, ProcessManager};
 use crate::{
-    arch::asm::current::current_pcb,
-    include::bindings::bindings::{pid_t, process_do_exit, ESRCH},
-    syscall::{Syscall, SystemError},
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::MAX_PATHLEN,
+    include::bindings::bindings::{pid_t, process_do_exit},
+    syscall::{
+        user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
+        Syscall, SystemError,
+    },
 };
 extern "C" {
     fn c_sys_wait4(pid: pid_t, wstatus: *mut c_int, options: c_int, rusage: *mut c_void) -> c_int;
 }
 
 impl Syscall {
-    #[allow(dead_code)]
-    pub fn fork(&self) -> Result<usize, SystemError> {
-        // 由于进程管理未完成重构，fork调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
-        todo!()
-    }
-
-    #[allow(dead_code)]
-    pub fn vfork(&self) -> Result<usize, SystemError> {
-        // 由于进程管理未完成重构，vfork调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
-        todo!()
-    }
-
-    #[allow(dead_code)]
     pub fn execve(
-        _path: *const c_void,
-        _argv: *const *const c_void,
-        _envp: *const *const c_void,
-    ) -> Result<usize, SystemError> {
-        // 由于进程管理未完成重构，execve调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
-        todo!()
+        path: *const u8,
+        argv: *const *const u8,
+        envp: *const *const u8,
+        frame: &mut TrapFrame,
+    ) -> Result<(), SystemError> {
+        if path.is_null() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let x = || {
+            let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+            let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
+            let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
+            Ok((path, argv, envp))
+        };
+        let r: Result<(String, Vec<String>, Vec<String>), SystemError> = x();
+        if let Err(e) = r {
+            panic!("Failed to execve: {:?}", e);
+        }
+        let (path, argv, envp) = r.unwrap();
+
+        return Self::do_execve(path, argv, envp, frame);
     }
 
     pub fn wait4(

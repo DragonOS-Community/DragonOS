@@ -38,8 +38,6 @@ extern void kernel_thread_func(void);
 extern void rs_procfs_unregister_pid(uint64_t);
 
 ul _stack_start; // initial proc的栈基地址（虚拟地址）
-extern struct signal_struct INITIAL_SIGNALS;
-extern struct sighand_struct INITIAL_SIGHAND;
 
 extern void process_exit_sighand(struct process_control_block *pcb);
 extern void process_exit_signal(struct process_control_block *pcb);
@@ -48,18 +46,7 @@ extern void rs_process_exit_fpstate(struct process_control_block *pcb);
 extern void rs_drop_address_space(struct process_control_block *pcb);
 
 extern int rs_init_stdio();
-extern uint64_t rs_do_execve(const char *filename, const char *const argv[], const char *const envp[], struct pt_regs *regs);
 extern uint64_t rs_exec_init_process(struct pt_regs *regs);
-
-// 设置初始进程的PCB
-#define INITIAL_PROC(proc)                                                                                           \
-    {                                                                                                                \
-        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
-        .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,                        \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
-        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
-        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND, .address_space = NULL                               \
-    }
 
 struct thread_struct initial_thread = {
     .rbp = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),
@@ -73,28 +60,12 @@ struct thread_struct initial_thread = {
 
 // 初始化 初始进程的union ，并将其链接到.data.init_proc段内
 union proc_union initial_proc_union
-    __attribute__((__section__(".data.init_proc_union"))) = {INITIAL_PROC(initial_proc_union.pcb)};
+    __attribute__((__section__(".data.init_proc_union"))) = {0};
 
 struct process_control_block *initial_proc[MAX_CPU_NUM] = {&initial_proc_union.pcb, 0};
 
 // 为每个核心初始化初始进程的tss
 struct tss_struct initial_tss[MAX_CPU_NUM] = {[0 ... MAX_CPU_NUM - 1] = INITIAL_TSS};
-
-/**
- * @brief 回收进程的所有文件描述符
- *
- * @param pcb 要被回收的进程的pcb
- * @return uint64_t
- */
-extern int process_exit_files(struct process_control_block *pcb);
-
-/**
- * @brief 释放进程的页表
- *
- * @param pcb 要被释放页表的进程
- * @return uint64_t
- */
-uint64_t process_exit_mm(struct process_control_block *pcb);
 
 /**
  * @brief 切换进程
@@ -228,134 +199,13 @@ ul initial_kernel_thread(ul arg)
     return 1;
 }
 #pragma GCC pop_options
-/**
- * @brief 当子进程退出后向父进程发送通知
- *
- */
-void process_exit_notify()
-{
-    wait_queue_wakeup(&current_pcb->parent_pcb->wait_child_proc_exit, PROC_INTERRUPTIBLE);
-}
 
-/**
- * @brief 进程退出时执行的函数
- *
- * @param code 返回码
- * @return ul
- */
 ul process_do_exit(ul code)
 {
-    // kinfo("process exiting..., code is %ld.", (long)code);
-    cli();
-    struct process_control_block *pcb = current_pcb;
-
-    // 进程退出时释放资源
-    process_exit_files(pcb);
-    process_exit_thread(pcb);
-    // todo: 可否在这里释放内存结构体？（在判断共享页引用问题之后）
-
-    pcb->state = PROC_ZOMBIE;
-    pcb->exit_code = code;
-    sti();
-
-    process_exit_notify();
-    sched();
-
+    kerror("Todo: remove process_do_exit");
     while (1)
-        pause();
+        ;
 }
-
-/**
- * @brief 初始化内核进程
- *
- * @param fn 目标程序的地址
- * @param arg 向目标程序传入的参数
- * @param flags
- * @return int
- */
-
-pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
-{
-    struct pt_regs regs;
-    barrier();
-    memset(&regs, 0, sizeof(regs));
-    barrier();
-    // 在rbx寄存器中保存进程的入口地址
-    regs.rbx = (ul)fn;
-    // 在rdx寄存器中保存传入的参数
-    regs.rdx = (ul)arg;
-    barrier();
-    regs.ds = KERNEL_DS;
-    barrier();
-    regs.es = KERNEL_DS;
-    barrier();
-    regs.cs = KERNEL_CS;
-    barrier();
-    regs.ss = KERNEL_DS;
-    barrier();
-
-    // 置位中断使能标志位
-    regs.rflags = (1 << 9);
-    barrier();
-    // rip寄存器指向内核线程的引导程序
-    regs.rip = (ul)kernel_thread_func;
-    barrier();
-    // kdebug("kernel_thread_func=%#018lx", kernel_thread_func);
-    // kdebug("&kernel_thread_func=%#018lx", &kernel_thread_func);
-    // kdebug("1111\tregs.rip = %#018lx", regs.rip);
-    return do_fork(&regs, flags | CLONE_VM, 0, 0);
-}
-
-/**
- * @brief 初始化进程模块
- * ☆前置条件：已完成系统调用模块的初始化
- */
-#pragma GCC push_options
-#pragma GCC optimize("O0")
-void process_init()
-{
-    kinfo("Initializing process...");
-    // rs_test_buddy();
-    io_mfence();
-    rs_process_init();
-    io_mfence();
-
-    initial_tss[proc_current_cpu_id].rsp0 = initial_thread.rbp;
-
-    // 初始化pid的写锁
-
-    spin_init(&process_global_pid_write_lock);
-
-    // 初始化进程的循环链表
-    list_init(&initial_proc_union.pcb.list);
-    wait_queue_init(&initial_proc_union.pcb.wait_child_proc_exit, NULL);
-
-    io_mfence();
-    // 初始化init进程的signal相关的信息
-    initial_proc_init_signal(current_pcb);
-    kdebug("Initial process to init files");
-    io_mfence();
-    process_init_files();
-    kdebug("Initial process init files ok");
-    io_mfence();
-
-    // 临时设置IDLE进程的的虚拟运行时间为0，防止下面的这些内核线程的虚拟运行时间出错
-    current_pcb->virtual_runtime = 0;
-
-    barrier();
-    kernel_thread(initial_kernel_thread, 10, CLONE_FS | CLONE_SIGNAL); // 初始化内核线程
-    barrier();
-    kthread_mechanism_init(); // 初始化kthread机制
-    barrier();
-
-    initial_proc_union.pcb.state = PROC_RUNNING;
-    initial_proc_union.pcb.preempt_count = 0;
-    initial_proc_union.pcb.cpu_id = 0;
-    initial_proc_union.pcb.virtual_runtime = (1UL << 60);
-    // 将IDLE进程的虚拟运行时间设置为一个很大的数值
-    current_pcb->virtual_runtime = (1UL << 60);
-}
-#pragma GCC pop_options
 
 /**
  * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL
@@ -407,65 +257,10 @@ int process_wakeup(struct process_control_block *pcb)
  */
 int process_wakeup_immediately(struct process_control_block *pcb)
 {
-    if (pcb->state & PROC_RUNNING)
-        return 0;
-    int retval = process_wakeup(pcb);
-    if (retval != 0)
-        return retval;
-    // 将当前进程标志为需要调度，缩短新进程被wakeup的时间
-    current_pcb->flags |= PF_NEED_SCHED;
+    kerror("FIXME: process_wakeup_immediately");
+    while (1)
+        ;
 
-    if (pcb->cpu_id == current_pcb->cpu_id)
-        sched();
-    else
-        rs_kick_cpu(pcb->cpu_id);
-    return 0;
-}
-
-/**
- * @brief 释放进程的页表
- *
- * @param pcb 要被释放页表的进程
- * @return uint64_t
- */
-uint64_t process_exit_mm(struct process_control_block *pcb)
-{
-    rs_drop_address_space(pcb);
-    return 0;
-}
-
-/**
- * @brief todo: 回收线程结构体
- *
- * @param pcb
- */
-void process_exit_thread(struct process_control_block *pcb)
-{
-}
-
-/**
- * @brief 释放pcb
- *
- * @param pcb 要被释放的pcb
- * @return int
- */
-int process_release_pcb(struct process_control_block *pcb)
-{
-    if ((pcb->flags & PF_KTHREAD)) // 释放内核线程的worker private结构体
-        free_kthread_struct(pcb);
-
-    // 将pcb从pcb链表中移除
-    // todo: 对相关的pcb加锁
-    pcb->prev_pcb->next_pcb = pcb->next_pcb;
-    pcb->next_pcb->prev_pcb = pcb->prev_pcb;
-    process_exit_sighand(pcb);
-    process_exit_signal(pcb);
-    rs_process_exit_fpstate(pcb);
-    rs_procfs_unregister_pid(pcb->pid);
-    // 释放进程的地址空间
-    process_exit_mm(pcb);
-    // 释放当前pcb
-    kfree(pcb);
     return 0;
 }
 
@@ -483,13 +278,3 @@ static void __set_pcb_name(struct process_control_block *pcb, const char *pcb_na
     // spin_unlock(&pcb->alloc_lock);
 }
 
-/**
- * @brief 给pcb设置名字
- *
- * @param pcb 需要设置名字的pcb
- * @param pcb_name 保存名字的char数组
- */
-void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name)
-{
-    __set_pcb_name(pcb, pcb_name);
-}

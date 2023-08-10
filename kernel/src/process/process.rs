@@ -27,17 +27,6 @@ use crate::{
 
 use super::preempt::{preempt_disable, preempt_enable};
 
-/// 判断进程是否已经停止
-#[no_mangle]
-pub extern "C" fn process_is_stopped(pcb: *const process_control_block) -> bool {
-    let state: u64 = unsafe { read_volatile(&(*pcb).state) } as u64;
-    if (state & (PROC_STOPPED as u64)) != 0 {
-        return true;
-    } else {
-        return false;
-    }
-}
-
 /// @brief 尝试唤醒指定的进程。
 /// 本函数的行为：If (@_state & @pcb->state) @pcb->state = TASK_RUNNING.
 ///

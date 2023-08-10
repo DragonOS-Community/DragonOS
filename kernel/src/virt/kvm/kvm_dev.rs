@@ -198,6 +198,7 @@ impl IndexNode for LockedKvmInode {
     }
 }
 
+#[no_mangle]
 pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
     let vm_inode = LockedVmInode::new();
     let file: File = File::new(vm_inode, FileMode::O_RDWR)?;

@@ -180,9 +180,9 @@ pub extern "C" fn vmx_return(){
 
 #[no_mangle]
 extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
-    kdebug!("vmexit handler!");
     let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
     kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
+    kdebug!("vmexit handler!");
 
     let exit_reason = vmx_vmread(VmcsFields::VMEXIT_EXIT_REASON as u32).unwrap() as u32;
     let exit_basic_reason = exit_reason & 0x0000_ffff;
@@ -223,6 +223,7 @@ extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
     }
 }
 
+#[no_mangle]
 fn adjust_rip(rip: u64) -> Result<(), SystemError> {
     let instruction_length = vmx_vmread(VmcsFields::VMEXIT_INSTR_LEN as u32)?;
     vmx_vmwrite(VmcsFields::GUEST_RIP as u32, rip + instruction_length)?;

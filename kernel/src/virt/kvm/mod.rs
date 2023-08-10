@@ -77,13 +77,13 @@ pub extern "C" fn kvm_init() {
     // if r.is_err() {
     //     panic!("Failed to register /dev/kvm");
     // }
-    let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
-    let host_stack = vec![0xCC; HOST_STACK_SIZE];
-    let guest_rsp = guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64;
-    let host_rsp = (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64;
-    kdebug!("guest rsp: {:x}", guest_rsp);
-    kdebug!("guest rip: {:x}", guest_code as *const () as u64);
-    kdebug!("host rsp: {:x}", host_rsp);
+    // let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
+    // let host_stack = vec![0xCC; HOST_STACK_SIZE];
+    // let guest_rsp = guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64;
+    // let host_rsp = (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64;
+    // kdebug!("guest rsp: {:x}", guest_rsp);
+    // kdebug!("guest rip: {:x}", guest_code as *const () as u64);
+    // kdebug!("host rsp: {:x}", host_rsp);
     // let hypervisor = Hypervisor::new(1, host_rsp, 0).expect("Cannot create hypervisor");
     // let vcpu = VmxVcpu::new(1, Arc::new(Mutex::new(hypervisor)), host_rsp, guest_rsp,  guest_code as *const () as u64).expect("Cannot create VcpuData");
     // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");

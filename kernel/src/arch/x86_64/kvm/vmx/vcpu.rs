@@ -274,15 +274,17 @@ impl VmxVcpu {
             VmcsFields::HOST_CR4 as u32, 
             unsafe{ controlregs::cr4().bits().try_into().unwrap() }
         )?;
-        vmx_vmwrite(VmcsFields::HOST_ES_SELECTOR as u32, (segmentation::es().bits() ).into())?;
-        vmx_vmwrite(VmcsFields::HOST_CS_SELECTOR as u32, (segmentation::cs().bits() ).into())?;
-        vmx_vmwrite(VmcsFields::HOST_SS_SELECTOR as u32, (segmentation::ss().bits() ).into())?;
-        vmx_vmwrite(VmcsFields::HOST_DS_SELECTOR as u32, (segmentation::ds().bits() ).into())?;
-        vmx_vmwrite(VmcsFields::HOST_FS_SELECTOR as u32, (segmentation::fs().bits() ).into())?;
-        vmx_vmwrite(VmcsFields::HOST_GS_SELECTOR as u32, (segmentation::gs().bits() ).into())?;
-        vmx_vmwrite(VmcsFields::HOST_TR_SELECTOR as u32, unsafe{ (x86::task::tr().bits() ).into() })?;
+        vmx_vmwrite(VmcsFields::HOST_ES_SELECTOR as u32, (segmentation::es().bits() & (!0x07) ).into())?;
+        vmx_vmwrite(VmcsFields::HOST_CS_SELECTOR as u32, (segmentation::cs().bits() & (!0x07)).into())?;
+        vmx_vmwrite(VmcsFields::HOST_SS_SELECTOR as u32, (segmentation::ss().bits() & (!0x07)).into())?;
+        vmx_vmwrite(VmcsFields::HOST_DS_SELECTOR as u32, (segmentation::ds().bits() & (!0x07)).into())?;
+        vmx_vmwrite(VmcsFields::HOST_FS_SELECTOR as u32, (segmentation::fs().bits() & (!0x07)).into())?;
+        vmx_vmwrite(VmcsFields::HOST_GS_SELECTOR as u32, (segmentation::gs().bits() & (!0x07)).into())?;
+        vmx_vmwrite(VmcsFields::HOST_TR_SELECTOR as u32, unsafe{ (x86::task::tr().bits() & (!0x07)).into() })?;
         vmx_vmwrite(VmcsFields::HOST_FS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_FS_BASE)})?;
         vmx_vmwrite(VmcsFields::HOST_GS_BASE as u32, unsafe {msr::rdmsr(msr::IA32_GS_BASE)})?;
+
+        
 
         let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
         unsafe {x86::dtables::sgdt(&mut pseudo_descriptpr);};
@@ -372,6 +374,11 @@ impl Vcpu for VmxVcpu {
         kdebug!("[+] VMCS init!");
         let vmx_err = vmx_vmread(VmcsFields::CTRL_VM_ENTRY_CTRLS as u32);
         kdebug!("vmx_vmread: {:?}",vmx_err);
+        // kdebug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
+        // kdebug!("vmcs init host rsp: {:#x}", x86::bits64::registers::rsp());
+        // vmx_vmwrite(VmcsFields::HOST_RSP as u32, x86::bits64::registers::rsp())?;
+        // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
+        
         match vmx_vmlaunch() {
             Ok(_) => {},
             Err(e) => {

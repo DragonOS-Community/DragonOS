@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 use core::arch::asm;
 use core::ptr::null_mut;
 
+use crate::arch::kvm::guest_code;
 use crate::kdebug;
 use crate::filesystem::devfs::devfs_register;
 use self::kvm_dev::LockedKvmInode;
@@ -89,14 +90,4 @@ pub extern "C" fn kvm_init() {
     // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
 }
 
-#[no_mangle]
-pub extern "C" fn guest_code(){
-    loop {
-        unsafe {asm!(
-            "mov rax, 0",
-            "mov rcx, 0",
-            "cpuid"
-        );}
-        unsafe {asm!("nop")};
-    }
-}
+

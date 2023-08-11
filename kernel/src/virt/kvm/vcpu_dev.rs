@@ -3,7 +3,7 @@ use crate::kdebug;
 use crate::libs::mutex::Mutex;
 use crate::virt::kvm::hypervisor::Hypervisor;
 use crate::virt::kvm::vcpu::Vcpu;
-use crate::virt::kvm::{KVM, HOST_STACK_SIZE, GUEST_STACK_SIZE, guest_code};
+use crate::virt::kvm::{KVM, HOST_STACK_SIZE, GUEST_STACK_SIZE, };
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,

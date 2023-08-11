@@ -3,13 +3,15 @@ use alloc::vec::Vec;
 
 use crate::syscall::SystemError;
 use crate::virt::kvm::Vcpu;
+
+use super::HOST_STACK_SIZE;
 // use crate::kdebug;
 
 pub struct Hypervisor {
     // sys_fd: u32,	/* For system ioctls(), i.e. /dev/kvm */
     pub nr_vcpus: u32,  /* Number of cpus to run */
     pub vcpu: Vec<Box<dyn Vcpu>>,
-    pub host_stack: u64,
+    pub host_stack: Vec<u8>,
     pub mem_slots: u64,
     // 	vm_fd: u32,  	/* For VM ioctls() */
 //     timerid: u32,   /* Posix timer for interrupts */
@@ -45,7 +47,7 @@ impl Hypervisor {
         let instance = Self {
             nr_vcpus,
             vcpu,
-            host_stack,
+            host_stack: vec![0xCC; HOST_STACK_SIZE],
             mem_slots,
         };
         Ok(instance)

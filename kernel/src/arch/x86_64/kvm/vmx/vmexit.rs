@@ -149,45 +149,45 @@ pub extern "C" fn vmx_return(){
     unsafe {save_rpg()};
     // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
     unsafe {asm!(
-        "sub     rsp, 60h",
-        "movaps  xmmword ptr [rsp +  0h], xmm0",
-        "movaps  xmmword ptr [rsp + 10h], xmm1",
-        "movaps  xmmword ptr [rsp + 20h], xmm2",
-        "movaps  xmmword ptr [rsp + 30h], xmm3",
-        "movaps  xmmword ptr [rsp + 40h], xmm4",
-        "movaps  xmmword ptr [rsp + 50h], xmm5",
+        // "sub     rsp, 60h",
+        // "movaps  xmmword ptr [rsp +  0h], xmm0",
+        // "movaps  xmmword ptr [rsp + 10h], xmm1",
+        // "movaps  xmmword ptr [rsp + 20h], xmm2",
+        // "movaps  xmmword ptr [rsp + 30h], xmm3",
+        // "movaps  xmmword ptr [rsp + 40h], xmm4",
+        // "movaps  xmmword ptr [rsp + 50h], xmm5",
 
         "mov     rdi, rsp",
         "sub     rsp, 20h",
         "call vmexit_handler",
-
         "add     rsp, 20h",
-        "movaps  xmm0, xmmword ptr [rsp +  0h]",
-        "movaps  xmm1, xmmword ptr [rsp + 10h]",
-        "movaps  xmm2, xmmword ptr [rsp + 20h]",
-        "movaps  xmm3, xmmword ptr [rsp + 30h]",
-        "movaps  xmm4, xmmword ptr [rsp + 40h]",
-        "movaps  xmm5, xmmword ptr [rsp + 50h]",
-        "add     rsp, 60h",
+
+        // "movaps  xmm0, xmmword ptr [rsp +  0h]",
+        // "movaps  xmm1, xmmword ptr [rsp + 10h]",
+        // "movaps  xmm2, xmmword ptr [rsp + 20h]",
+        // "movaps  xmm3, xmmword ptr [rsp + 30h]",
+        // "movaps  xmm4, xmmword ptr [rsp + 40h]",
+        // "movaps  xmm5, xmmword ptr [rsp + 50h]",
+        // "add     rsp, 60h",
     clobber_abi("C"),
     )};
-
     unsafe{restore_rpg()};
     unsafe{asm!(
-        "vmresume"
+        "vmresume",
     )};
 }
 
 #[no_mangle]
 extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
-    let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
-    kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
+    // let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
+    // kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
     kdebug!("vmexit handler!");
 
     let exit_reason = vmx_vmread(VmcsFields::VMEXIT_EXIT_REASON as u32).unwrap() as u32;
     let exit_basic_reason = exit_reason & 0x0000_ffff;
     let guest_rip = vmx_vmread(VmcsFields::GUEST_RIP as u32).unwrap();
     let guest_rsp = vmx_vmread(VmcsFields::GUEST_RSP as u32).unwrap();
+    kdebug!("guest_rip={:x}", guest_rip);
     let guest_rflags = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap();
 
     match VmxExitReason::from(exit_basic_reason as i32) {
@@ -203,6 +203,7 @@ extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
             kdebug!("vmexit handler: cpuid instruction!");
             // vmexit_cpuid_handler(guest_cpu_context);
             adjust_rip(guest_rip).unwrap();
+            
         },
         VmxExitReason::RDMSR => {
             kdebug!("vmexit handler: rdmsr instruction!");
@@ -217,8 +218,9 @@ extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
             adjust_rip(guest_rip).unwrap();
         },
         _ => {
-            kdebug!("vmexit handler: unhandled vmexit reason!");
-            panic!();
+            kdebug!("vmexit handler: unhandled vmexit reason: {}!", exit_basic_reason);
+            adjust_rip(guest_rip).unwrap();
+            // panic!();
         }
     }
 }

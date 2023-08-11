@@ -1,10 +1,12 @@
+use core::arch::asm;
+
 use raw_cpuid::CpuId;
 use crate::{
     kerror, kdebug,
     // libs::spinlock::{SpinLock, SpinLockGuard},
     syscall::SystemError,
 };
-use crate::virt::kvm::guest_code;
+// use crate::virt::kvm::guest_code;
 use crate::virt::kvm::{HOST_STACK_SIZE, GUEST_STACK_SIZE};
 use crate::virt::kvm::KVM;
 use self::vmx::vcpu::VmxVcpu;
@@ -66,4 +68,18 @@ impl X86_64KVMArch{
     }
     
     
+}
+
+#[no_mangle]
+pub extern "C" fn guest_code(){
+    kdebug!("guest_code");
+    loop {
+        unsafe {asm!(
+            "mov rax, 0",
+            "mov rcx, 0",
+            "cpuid"
+        );}
+        unsafe {asm!("nop")};
+        kdebug!("guest_code");
+    }
 }

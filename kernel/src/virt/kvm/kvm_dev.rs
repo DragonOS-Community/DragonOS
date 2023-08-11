@@ -13,7 +13,6 @@ use crate::{
     time::TimeSpec,
     arch::KVMArch,
 };
-use crate::virt::kvm::guest_code;
 use crate::libs::mutex::Mutex;
 // use crate::virt::kvm::{host_stack};
 use super::Hypervisor;
@@ -159,7 +158,6 @@ impl IndexNode for LockedKvmInode {
                         0, 
                         0,
                         // unsafe {(host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64},
-                        // guest_code as *const () as u64,
                     ).unwrap()
                     ))
                 ));
@@ -203,6 +201,5 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
     let vm_inode = LockedVmInode::new();
     let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
     return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
-    // let vcpu = Vcpu::new(1, Arc::new(*hypervisor), guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64,  guest_code as *const () as u64).expect("Cannot create VcpuData");
 }
 

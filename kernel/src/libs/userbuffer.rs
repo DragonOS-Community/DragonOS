@@ -82,4 +82,8 @@ impl<T: core::marker::Copy> UserBufferWriter<T> {
         dst.copy_from_slice(&src);
         return Ok(src.len());
     }
+
+    pub fn get_buffer(&self) -> &mut [T] {
+        unsafe { core::slice::from_raw_parts_mut(self.addr, self.len) }
+    }
 }

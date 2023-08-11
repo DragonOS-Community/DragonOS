@@ -53,7 +53,6 @@ impl X86_64KVMArch{
         let current_kvm = KVM();
         let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
         let host_stack = vec![0xCC; HOST_STACK_SIZE];
-        kdebug!("guest rip: {:x?}", current_kvm.lock().mem_slots);
         let vcpu = Box::new(
             VmxVcpu::new(
                 id, 

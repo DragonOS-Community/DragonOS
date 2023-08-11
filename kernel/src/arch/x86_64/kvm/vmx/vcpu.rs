@@ -1,8 +1,10 @@
+use alloc::vec::Vec;
 use x86::{
     controlregs, msr, segmentation
 };
 use raw_cpuid::CpuId;
 use x86;
+use crate::virt::kvm::GUEST_STACK_SIZE;
 use crate::{kdebug, printk_color, GREEN, BLACK};
 use alloc::boxed::Box;
 use alloc::alloc::Global;
@@ -63,6 +65,7 @@ pub struct VmxVcpu {
     data: Box<VcpuData>, 
     hypervisor: Arc<Mutex<Hypervisor>>,		/* parent KVM */
     host_rsp: u64,
+    guest_stack: Vec<u8>,
 }
 
 impl VcpuData {
@@ -158,6 +161,7 @@ impl VmxVcpu {
             data: VcpuData::new(guest_rsp, guest_rip)?, 
             hypervisor: hypervisor,
             host_rsp: host_rsp,
+            guest_stack: vec![0xCC; GUEST_STACK_SIZE],
         })
     }
 
@@ -250,9 +254,9 @@ impl VmxVcpu {
             unsafe{ x86::debugregs::dr7().0 as u64 }
         )?;
         vmx_vmwrite(VmcsFields::GUEST_RSP as u32, self.data.guest_rsp as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_RIP as u32, self.data.guest_rip as u64)?;
+        vmx_vmwrite(VmcsFields::GUEST_RIP as u32, self.guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64)?;
         kdebug!("vmcs init guest rip: {:#x}", self.data.guest_rip as u64);
-        kdebug!("vmcs init guest rsp: {:#x}", self.data.guest_rsp as u64);
+        kdebug!("vmcs init guest rsp: {:#x}", self.guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64);
 
         // vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, x86::bits64::rflags::read().bits())?;
         vmx_vmwrite(VmcsFields::GUEST_DEBUGCTL as u32, unsafe {msr::rdmsr(msr::IA32_DEBUGCTL)})?;
@@ -315,7 +319,6 @@ impl VmxVcpu {
         vmx_vmwrite(VmcsFields::HOST_SYSENTER_EIP as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_EIP)})?;
         vmx_vmwrite(VmcsFields::HOST_SYSENTER_CS as u32, unsafe {msr::rdmsr(msr::IA32_SYSENTER_CS)})?;
 
-        vmx_vmwrite(VmcsFields::HOST_RSP as u32, self.host_rsp as u64)?;
         vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
         kdebug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
         kdebug!("vmcs init host rsp: {:#x}", self.host_rsp as u64);
@@ -378,6 +381,7 @@ impl Vcpu for VmxVcpu {
         // kdebug!("vmcs init host rsp: {:#x}", x86::bits64::registers::rsp());
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32, x86::bits64::registers::rsp())?;
         // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
+        vmx_vmwrite(VmcsFields::HOST_RSP as u32,  x86::bits64::registers::rsp())?;
         
         match vmx_vmlaunch() {
             Ok(_) => {},

@@ -91,14 +91,12 @@ pub extern "C" fn kvm_init() {
 
 #[no_mangle]
 pub extern "C" fn guest_code(){
-    kdebug!("guest code");
     loop {
         unsafe {asm!(
             "mov rax, 0",
             "mov rcx, 0",
             "cpuid"
         );}
-        kdebug!("guest code");
         unsafe {asm!("nop")};
     }
 }

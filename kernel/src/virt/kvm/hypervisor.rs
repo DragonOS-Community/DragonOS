@@ -11,7 +11,7 @@ pub struct Hypervisor {
     pub vcpu: Vec<Box<dyn Vcpu>>,
     pub host_stack: u64,
     pub mem_slots: u64,
-// 	vm_fd: u32,  	/* For VM ioctls() */
+    // 	vm_fd: u32,  	/* For VM ioctls() */
 //     timerid: u32,   /* Posix timer for interrupts */
 //     mem_slots: u32, /* for KVM_SET_USER_MEMORY_REGION */
 //     ram_size: u64,  /* Guest memory size, in bytes */

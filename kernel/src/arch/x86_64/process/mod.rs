@@ -1,6 +1,7 @@
 use core::{intrinsics::unlikely, mem::ManuallyDrop};
 
 use alloc::sync::Arc;
+use x86::current::segmentation::swapgs;
 
 use crate::{
     mm::VirtAddr,
@@ -94,6 +95,39 @@ impl ArchPCBInfo {
         self.rsp += core::mem::size_of::<usize>();
         value
     }
+
+    pub fn save_fp_state(&mut self) {
+        if self.fp_state.is_none() {
+            self.fp_state = Some(FpState::new());
+        }
+
+        self.fp_state.as_mut().unwrap().save();
+    }
+
+    pub fn restore_fp_state(&mut self) {
+        if self.fp_state.is_none() {
+            panic!("fp_state is none");
+        }
+
+        self.fp_state.as_mut().unwrap().restore();
+    }
+
+    pub unsafe fn save_fsbase(&mut self) {
+        self.fsbase = x86::current::segmentation::rdfsbase() as usize;
+    }
+
+    pub unsafe fn save_gsbase(&mut self) {
+        self.gsbase = x86::current::segmentation::rdgsbase() as usize;
+    }
+
+    pub fn fsbase(&self) -> usize {
+        self.fsbase
+    }
+
+    pub fn gsbase(&self) -> usize {
+        self.gsbase
+    }
+
 }
 
 impl ProcessControlBlock {
@@ -165,4 +199,27 @@ impl ProcessManager {
 
         return Ok(());
     }
+
+    pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
+        // 保存浮点寄存器
+        prev.arch_info().save_fp_state();
+
+        // 切换fsbase
+        prev.arch_info().save_fsbase();
+        x86::msr::wrmsr(x86::msr::IA32_FS_BASE, next.arch_info().fsbase as u64);
+
+        // 切换gsbase
+        prev.arch_info().save_gsbase();
+        x86::msr::wrmsr(x86::msr::IA32_KERNEL_GSBASE, next.arch_info().gsbase as u64);
+
+        // 切换地址空间
+        let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
+        next_addr_space.read().user_mapper.utable.make_current();
+
+        // 切换内核栈
+        todo!("switch kernel stack");
+    }
 }
+
+
+// unsafe extern "sysv64" fn switch_to_inner(prev: &mut )

@@ -109,6 +109,8 @@ impl ProcessManager {
     pub unsafe fn release(pid: Pid) {
         ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
     }
+
+
 }
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);

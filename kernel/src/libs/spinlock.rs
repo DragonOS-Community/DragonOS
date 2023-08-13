@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use core::cell::UnsafeCell;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::ptr::read_volatile;
 
@@ -107,6 +108,11 @@ impl RawSpinlock {
         self.0.store(false, Ordering::Release);
     }
 
+    /// 解锁，但是不更改preempt count
+    unsafe fn unlock_no_preempt(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
     /// @brief 放锁并开中断
     pub fn unlock_irq(&self) {
         self.unlock();
@@ -170,6 +176,24 @@ pub struct SpinLockGuard<'a, T: 'a> {
     flag: usize,
 }
 
+impl<'a, T: 'a> SpinLockGuard<'a, T> {
+    /// 泄露自旋锁的守卫，返回一个可变的引用
+    ///
+    ///  ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    #[inline]
+    pub unsafe fn leak(this: Self) -> &'a mut T {
+        // Use ManuallyDrop to avoid stacked-borrow invalidation
+        let this = ManuallyDrop::new(this);
+        // We know statically that only we are referencing data
+        unsafe { &mut *this.lock.data.get() }
+    }
+}
+
 /// 向编译器保证，SpinLock在线程之间是安全的.
 /// 其中要求类型T实现了Send这个Trait
 unsafe impl<T> Sync for SpinLock<T> where T: Send {}
@@ -222,6 +246,16 @@ impl<T> SpinLock<T> {
             });
         }
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+
+    /// 强制解锁，并且不更改preempt count
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致preempt count不正确，因此必须小心的手动维护好preempt count。
+    /// 如非必要，请不要使用这个函数。
+    pub unsafe fn force_unlock(&self) {
+        self.lock.unlock_no_preempt();
     }
 }
 

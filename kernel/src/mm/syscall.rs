@@ -78,7 +78,7 @@ impl Syscall {
         if new_addr == address_space.brk {
             return Ok(address_space.brk);
         }
-        
+
         unsafe {
             address_space
                 .set_brk(VirtAddr::new(page_align_up(new_addr.data())))

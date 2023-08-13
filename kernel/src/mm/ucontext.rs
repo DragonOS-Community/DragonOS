@@ -842,6 +842,8 @@ impl LockedVMA {
     }
 
     pub fn unmap(&self, mapper: &mut PageMapper, mut flusher: impl Flusher<MMArch>) {
+        // todo: 如果当前vma与文件相关，完善文件相关的逻辑
+
         let mut guard = self.lock();
         assert!(guard.mapped);
         for page in guard.region.pages() {
@@ -1116,7 +1118,8 @@ impl VMA {
         // kdebug!("VMA::zeroed: flusher dropped");
 
         // 清空这些内存
-        let virt_iter = VirtPageFrameIter::new(destination, destination.add(page_count));
+        let virt_iter: VirtPageFrameIter =
+            VirtPageFrameIter::new(destination, destination.add(page_count));
         for frame in virt_iter {
             let paddr = mapper.translate(frame.virt_address()).unwrap().0;
 

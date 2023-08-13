@@ -70,11 +70,11 @@ impl IndexNode for LockedNullInode {
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        return Ok(());
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -109,19 +109,11 @@ impl IndexNode for LockedNullInode {
     fn read_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-
-        for i in 0..len {
-            buf[i] = 0;
-        }
-
-        return Ok(len);
+        return Ok(0);
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写

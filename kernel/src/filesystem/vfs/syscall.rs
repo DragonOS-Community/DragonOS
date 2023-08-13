@@ -12,6 +12,7 @@ use crate::{
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
+    fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
     Dirent, FileType, IndexNode, ROOT_INODE,
@@ -125,6 +126,7 @@ impl Syscall {
     ///
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
+        // kdebug!("open: path: {}, mode: {:?}", path, mode);
         // 文件名过长
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -178,7 +180,9 @@ impl Syscall {
         }
 
         // 把文件对象存入pcb
-        return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+        let r = current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+        // kdebug!("open: fd: {:?}", r);
+        return r;
     }
 
     /// @brief 关闭文件
@@ -187,6 +191,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn close(fd: usize) -> Result<usize, SystemError> {
+        // kdebug!("syscall::close: fd: {}", fd);
         return current_pcb().drop_fd(fd as i32).map(|_| 0);
     }
 
@@ -198,6 +203,7 @@ impl Syscall {
     /// @return Ok(usize) 成功读取的数据的字节数
     /// @return Err(SystemError) 读取失败，返回posix错误码
     pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // kdebug!("syscall::read: fd: {}, len={}", fd, buf.len());
         let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
@@ -215,6 +221,7 @@ impl Syscall {
     /// @return Ok(usize) 成功写入的数据的字节数
     /// @return Err(SystemError) 写入失败，返回posix错误码
     pub fn write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
+        // kdebug!("syscall::write: fd: {}, len={}", fd, buf.len());
         let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
@@ -232,6 +239,7 @@ impl Syscall {
     /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
     /// @return Err(SystemError) 调整失败，返回posix错误码
     pub fn lseek(fd: i32, seek: SeekFrom) -> Result<usize, SystemError> {
+        // kdebug!("syscall::lseek: fd: {}, seek={:?}", fd, seek);
         let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
@@ -499,6 +507,129 @@ impl Syscall {
             }
             Err(e) => return Err(e),
         }
+    }
+
+    /// # fcntl
+    ///
+    /// ## 参数
+    ///
+    /// - `fd`：文件描述符
+    /// - `cmd`：命令
+    /// - `arg`：参数
+    pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
+        match cmd {
+            FcntlCommand::DupFd => {
+                if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
+                    return Err(SystemError::EBADF);
+                }
+                let arg = arg as usize;
+                for i in arg..FileDescriptorVec::PROCESS_MAX_FD {
+                    if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                        if fds.fds[i as usize].is_none() {
+                            return Self::dup2(fd, i as i32);
+                        }
+                    }
+                }
+                return Err(SystemError::EMFILE);
+            }
+            FcntlCommand::GetFd => {
+                // Get file descriptor flags.
+
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &fds.fds[fd as usize] {
+                            if file.close_on_exec() {
+                                return Ok(FD_CLOEXEC as usize);
+                            }
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+            FcntlCommand::SetFd => {
+                // Set file descriptor flags.
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &mut fds.fds[fd as usize] {
+                            let arg = arg as u32;
+                            if arg & FD_CLOEXEC != 0 {
+                                file.set_close_on_exec(true);
+                            } else {
+                                file.set_close_on_exec(false);
+                            }
+                            return Ok(0);
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+
+            FcntlCommand::GetFlags => {
+                // Get file status flags.
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &fds.fds[fd as usize] {
+                            return Ok(file.mode().bits() as usize);
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+            FcntlCommand::SetFlags => {
+                // Set file status flags.
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &mut fds.fds[fd as usize] {
+                            let arg = arg as u32;
+                            let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
+                            file.set_mode(mode)?;
+                            return Ok(0);
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+            _ => {
+                // TODO: unimplemented
+                // 未实现的命令，返回0，不报错。
+
+                // kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                return Ok(0);
+            }
+        }
+    }
+
+    /// # ftruncate
+    ///
+    /// ## 描述
+    ///
+    /// 改变文件大小.
+    /// 如果文件大小大于原来的大小，那么文件的内容将会被扩展到指定的大小，新的空间将会用0填充.
+    /// 如果文件大小小于原来的大小，那么文件的内容将会被截断到指定的大小.
+    ///
+    /// ## 参数
+    ///
+    /// - `fd`：文件描述符
+    /// - `len`：文件大小
+    ///
+    /// ## 返回值
+    ///
+    /// 如果成功，返回0，否则返回错误码.
+    pub fn ftruncate(fd: i32, len: usize) -> Result<usize, SystemError> {
+        if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+            if FileDescriptorVec::validate_fd(fd) {
+                if let Some(file) = &mut fds.fds[fd as usize] {
+                    let r = file.ftruncate(len).map(|_| 0);
+                    return r;
+                }
+                return Err(SystemError::EBADF);
+            }
+        }
+        return Err(SystemError::EBADF);
     }
 }
 

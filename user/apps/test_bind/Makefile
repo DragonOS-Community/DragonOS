@@ -3,10 +3,10 @@ LD=ld
 OBJCOPY=objcopy
 # 修改这里，把它改为你的relibc的sysroot路径
 RELIBC_OPT=$(DADK_BUILD_CACHE_DIR_RELIBC_0_1_0)
-CFLAGS=-I $(RELIBC_OPT)/include
+CFLAGS=-I $(RELIBC_OPT)/include -D__dragonos__
 
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
-output_dir=$(DADK_BUILD_CACHE_DIR_HTTP_SERVER_0_1_0)
+output_dir=$(DADK_BUILD_CACHE_DIR_TEST_BIND_0_1_0)
 
 LIBC_OBJS:=$(shell find $(RELIBC_OPT)/lib -name "*.o" | sort )
 LIBC_OBJS+=$(RELIBC_OPT)/lib/libc.a

@@ -72,6 +72,13 @@ impl Syscall {
         let address_space = AddressSpace::current()?;
         let mut address_space = address_space.write();
 
+        if new_addr < address_space.brk_start || new_addr >= MMArch::USER_END_VADDR {
+            return Ok(address_space.brk);
+        }
+        if new_addr == address_space.brk {
+            return Ok(address_space.brk);
+        }
+
         unsafe {
             address_space
                 .set_brk(VirtAddr::new(page_align_up(new_addr.data())))

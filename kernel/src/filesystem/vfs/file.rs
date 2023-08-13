@@ -132,6 +132,12 @@ impl File {
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
+
+        // 如果文件指针已经超过了文件大小，则返回0
+        if self.offset > self.inode.metadata()?.size as usize {
+            return Ok(0);
+        }
+
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;
@@ -151,6 +157,12 @@ impl File {
         self.writeable()?;
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
+        }
+
+        // 如果文件指针已经超过了文件大小，则需要扩展文件大小
+        let file_size = self.inode.metadata()?.size as usize;
+        if self.offset > file_size {
+            self.inode.resize(self.offset)?;
         }
         let len = self
             .inode
@@ -197,8 +209,9 @@ impl File {
                 return Err(SystemError::EINVAL);
             }
         }
-
-        if pos < 0 || pos > self.metadata()?.size {
+        // 根据linux man page, lseek允许超出文件末尾，并且不改变文件大小
+        // 当pos超出文件末尾时，read返回0。直到开始写入数据时，才会改变文件大小
+        if pos < 0 {
             return Err(SystemError::EOVERFLOW);
         }
         self.offset = pos as usize;
@@ -300,6 +313,53 @@ impl File {
     #[inline]
     pub fn file_type(&self) -> FileType {
         return self.file_type;
+    }
+
+    /// @brief 获取文件的打开模式
+    #[inline]
+    pub fn mode(&self) -> FileMode {
+        return self.mode;
+    }
+
+    /// 获取文件是否在execve时关闭
+    #[inline]
+    pub fn close_on_exec(&self) -> bool {
+        return self.mode.contains(FileMode::O_CLOEXEC);
+    }
+
+    /// 设置文件是否在execve时关闭
+    #[inline]
+    pub fn set_close_on_exec(&mut self, close_on_exec: bool) {
+        if close_on_exec {
+            self.mode.insert(FileMode::O_CLOEXEC);
+        } else {
+            self.mode.remove(FileMode::O_CLOEXEC);
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: FileMode) -> Result<(), SystemError> {
+        // todo: 是否需要调用inode的open方法，以更新private data（假如它与mode有关的话）?
+        // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
+
+        // 直接修改文件的打开模式
+        self.mode = mode;
+        return Ok(());
+    }
+
+    /// @brief 重新设置文件的大小
+    ///
+    /// 如果文件大小增加，则文件内容不变，但是文件的空洞部分会被填充为0
+    /// 如果文件大小减小，则文件内容会被截断
+    ///
+    /// @return 成功：Ok()
+    ///         失败：Err(错误码)
+    pub fn ftruncate(&mut self, len: usize) -> Result<(), SystemError> {
+        // 如果文件不可写，返回错误
+        self.writeable()?;
+
+        // 调用inode的truncate方法
+        self.inode.resize(len)?;
+        return Ok(());
     }
 }
 

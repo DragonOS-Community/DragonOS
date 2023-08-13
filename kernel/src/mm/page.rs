@@ -9,7 +9,7 @@ use core::{
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    kerror, kwarn,
+    kerror,
 };
 
 use super::{

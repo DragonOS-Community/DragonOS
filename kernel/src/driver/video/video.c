@@ -33,10 +33,10 @@ static spinlock_t daemon_refresh_lock;
 void init_frame_buffer()
 {
     kinfo("Re-mapping VBE frame buffer...");
-    
+
     video_frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + FRAME_BUFFER_MAPPING_OFFSET;
     rs_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
-   
+
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     kinfo("VBE frame buffer successfully Re-mapped!");
 }
@@ -56,7 +56,6 @@ int video_refresh_daemon(void *unused)
         if (rs_clock() >= video_refresh_expire_jiffies)
         {
 
-            // if (likely(_video_refresh_target != NULL))
             if (likely(video_refresh_target.size != 0))
             {
                 spin_lock(&daemon_refresh_lock);
@@ -83,7 +82,6 @@ int video_refresh_daemon(void *unused)
 
 uint64_t get_video_refresh_target_vaddr()
 {
-    // barrier();
     return video_refresh_target.vaddr;
 }
 /**
@@ -136,7 +134,7 @@ int video_reinitialize(bool level) // 这个函数会在main.c调用, 保证 vid
  * @param buf
  * @return int
  */
-// int video_set_refresh_target(struct scm_buffer_info_t *_buf)
+
 int video_set_refresh_target(struct scm_buffer_info_t buf)
 {
 
@@ -156,7 +154,6 @@ int video_set_refresh_target(struct scm_buffer_info_t buf)
 
     rs_register_softirq_video();
     kdebug("register softirq video done");
-    // rs_raise_softirq(VIDEO_REFRESH_SIRQ);
 }
 
 /**

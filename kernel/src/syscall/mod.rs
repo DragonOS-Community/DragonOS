@@ -7,10 +7,9 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, MMArch},
-    filesystem::syscall::PosixKstat,
     filesystem::vfs::{
         file::FileMode,
-        syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
     include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
@@ -945,7 +944,6 @@ impl Syscall {
                 let kstat = args[1] as *mut PosixKstat;
                 let vaddr = VirtAddr::new(kstat as usize);
                 // FIXME 由于c中的verify_area与rust中的verify_area重名，所以在引入时加了前缀区分
-                // TODO 应该将用了c版本的verify_area都改为rust的verify_area
                 match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
                     Ok(_) => Self::fstat(fd, kstat),
                     Err(e) => Err(e),

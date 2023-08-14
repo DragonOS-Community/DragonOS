@@ -10,7 +10,7 @@ use crate::{
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
-        syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET, PosixKstat},
+        syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
     include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},

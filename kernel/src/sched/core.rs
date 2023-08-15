@@ -170,12 +170,6 @@ pub extern "C" fn sched_update_jiffies() {
     }
 }
 
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn sched_set_cpu_idle(cpu_id: usize, pcb: *mut process_control_block) {
-    __get_cfs_scheduler().set_cpu_idle(cpu_id, pcb);
-}
-
 /// @brief 设置进程需要等待迁移到另一个cpu核心。
 /// 当进程被重新加入队列时，将会更新其cpu_id,并加入正确的队列
 ///

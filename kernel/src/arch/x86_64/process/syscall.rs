@@ -3,7 +3,6 @@ use alloc::{string::String, vec::Vec};
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch},
     exception::InterruptArch,
-    filesystem::vfs::MAX_PATHLEN,
     include::bindings::bindings::{USER_CS, USER_DS},
     mm::ucontext::AddressSpace,
     process::{
@@ -11,10 +10,7 @@ use crate::{
         fork::CloneFlags,
         ProcessManager,
     },
-    syscall::{
-        user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
-        Syscall, SystemError,
-    },
+    syscall::{Syscall, SystemError},
 };
 
 impl Syscall {

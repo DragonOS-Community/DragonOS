@@ -16,7 +16,7 @@ use alloc::{
 use hashbrown::HashSet;
 
 use crate::{
-    arch::{asm::current::current_pcb, mm::PageMapper, CurrentIrqArch, MMArch},
+    arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     libs::{
         align::page_align_up,

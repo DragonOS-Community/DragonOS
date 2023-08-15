@@ -3,11 +3,13 @@
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
+#![feature(asm_const)]
 #![feature(const_mut_refs)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(drain_filter)]
 #![feature(is_some_and)]
+#![feature(naked_functions)]
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]
@@ -46,6 +48,7 @@ extern crate bitflags;
 extern crate elf;
 #[macro_use]
 extern crate lazy_static;
+extern crate memoffset;
 extern crate num;
 #[macro_use]
 extern crate num_derive;

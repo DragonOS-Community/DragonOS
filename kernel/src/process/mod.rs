@@ -23,7 +23,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{
-        set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr,
+        percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr,
         INITIAL_PROCESS_ADDRESS_SPACE,
     },
     net::socket::SocketInode,
@@ -43,6 +43,23 @@ pub mod syscall;
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
 
+pub static mut SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
+
+#[derive(Debug)]
+pub struct SwitchResult {
+    pub prev_pcb: Option<Arc<ProcessControlBlock>>,
+    pub next_pcb: Option<Arc<ProcessControlBlock>>,
+}
+
+impl SwitchResult {
+    pub fn new() -> Self {
+        Self {
+            prev_pcb: None,
+            next_pcb: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProcessManager;
 
@@ -54,6 +71,7 @@ impl ProcessManager {
             .is_ok()
         {
             ALL_PROCESS.lock().replace(HashMap::new());
+            Self::arch_init();
         } else {
             panic!("ProcessManager has been initialized!");
         }
@@ -109,6 +127,33 @@ impl ProcessManager {
     pub unsafe fn release(pid: Pid) {
         ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
     }
+
+    /// 上下文切换完成后的钩子函数
+    unsafe fn switch_finish_hook() {
+        let prev_pcb = SWITCH_RESULT
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .prev_pcb
+            .take()
+            .expect("prev_pcb is None");
+        let next_pcb = SWITCH_RESULT
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .next_pcb
+            .take()
+            .expect("next_pcb is None");
+
+        // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
+        prev_pcb.arch_info.force_unlock();
+        next_pcb.arch_info.force_unlock();
+    }
+}
+
+/// 上下文切换完成后的钩子函数
+pub unsafe extern "C" fn switch_finish_hook() {
+    ProcessManager::switch_finish_hook();
 }
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);

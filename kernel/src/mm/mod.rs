@@ -23,7 +23,6 @@ use self::{
 
 pub mod allocator;
 pub mod c_adapter;
-pub mod gfp;
 pub mod kernel_mapper;
 pub mod mmio_buddy;
 pub mod no_init;

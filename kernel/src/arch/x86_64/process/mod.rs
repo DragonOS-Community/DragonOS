@@ -1,11 +1,19 @@
-use core::{intrinsics::unlikely, mem::ManuallyDrop};
+use core::{arch::asm, intrinsics::unlikely, mem::ManuallyDrop};
 
-use alloc::sync::Arc;
-use x86::current::segmentation::swapgs;
+use alloc::{sync::Arc, vec::Vec};
+
+use memoffset::offset_of;
 
 use crate::{
-    mm::VirtAddr,
-    process::{fork::CloneFlags, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager},
+    libs::spinlock::SpinLockGuard,
+    mm::{
+        percpu::{PerCpu, PerCpuVar},
+        VirtAddr,
+    },
+    process::{
+        fork::CloneFlags, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
+        SwitchResult, SWITCH_RESULT,
+    },
     syscall::SystemError,
 };
 
@@ -127,7 +135,6 @@ impl ArchPCBInfo {
     pub fn gsbase(&self) -> usize {
         self.gsbase
     }
-
 }
 
 impl ProcessControlBlock {
@@ -153,6 +160,18 @@ impl ProcessControlBlock {
 }
 
 impl ProcessManager {
+    pub fn arch_init() {
+        {
+            // 初始化进程切换结果 per cpu变量
+            let mut switch_res_vec: Vec<SwitchResult> = Vec::new();
+            for _ in 0..PerCpu::MAX_CPU_NUM {
+                switch_res_vec.push(SwitchResult::new());
+            }
+            unsafe {
+                SWITCH_RESULT = Some(PerCpuVar::new(switch_res_vec).unwrap());
+            }
+        }
+    }
     /// fork的过程中复制线程
     ///
     /// 由于这个过程与具体的架构相关，所以放在这里
@@ -200,9 +219,17 @@ impl ProcessManager {
         return Ok(());
     }
 
+    /// 切换进程
+    ///
+    /// ## 参数
+    ///
+    /// - `prev`：上一个进程的pcb
+    /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         // 保存浮点寄存器
         prev.arch_info().save_fp_state();
+        // 切换浮点寄存器
+        next.arch_info().restore_fp_state();
 
         // 切换fsbase
         prev.arch_info().save_fsbase();
@@ -217,9 +244,83 @@ impl ProcessManager {
         next_addr_space.read().user_mapper.utable.make_current();
 
         // 切换内核栈
-        todo!("switch kernel stack");
+
+        // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
+        let next_arch = SpinLockGuard::leak(next.arch_info());
+        let prev_arch = SpinLockGuard::leak(prev.arch_info());
+        // 恢复当前的 preempt count*2
+        ProcessManager::current_pcb().preempt_enable();
+        ProcessManager::current_pcb().preempt_enable();
+        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
+        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(next.clone());
+
+        switch_to_inner(prev_arch, next_arch);
     }
 }
 
+/// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
+#[naked]
+unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut ArchPCBInfo) {
+    asm!(
+        // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
+        //
+        // - the current parameters are passed in the registers `rdi`, `rsi`,
+        // - we can modify scratch registers, e.g. rax
+        // - we cannot change callee-preserved registers arbitrarily, e.g. rbx, which is why we
+        //   store them here in the first place.
+        concat!("
+        // Save old registers, and load new ones
+        mov [rdi + {off_rbx}], rbx
+        mov rbx, [rsi + {off_rbx}]
 
-// unsafe extern "sysv64" fn switch_to_inner(prev: &mut )
+        mov [rdi + {off_r12}], r12
+        mov r12, [rsi + {off_r12}]
+
+        mov [rdi + {off_r13}], r13
+        mov r13, [rsi + {off_r13}]
+
+        mov [rdi + {off_r14}], r14
+        mov r14, [rsi + {off_r14}]
+
+        mov [rdi + {off_r15}], r15
+        mov r15, [rsi + {off_r15}]
+
+        mov [rdi + {off_rbp}], rbp
+        mov rbp, [rsi + {off_rbp}]
+
+        mov [rdi + {off_rsp}], rsp
+        mov rsp, [rsi + {off_rsp}]
+
+        // push RFLAGS (can only be modified via stack)
+        pushfq
+        // pop RFLAGS into `self.rflags`
+        pop QWORD PTR [rdi + {off_rflags}]
+
+        // push `next.rflags`
+        push QWORD PTR [rsi + {off_rflags}]
+        // pop into RFLAGS
+        popfq
+
+        // When we return, we cannot even guarantee that the return address on the stack, points to
+        // the calling function. Thus, we have to execute this Rust hook by
+        // ourselves, which will unlock the contexts before the later switch.
+
+        // Note that switch_finish_hook will be responsible for executing `ret`.
+        jmp {switch_hook}
+
+        "),
+
+        off_rflags = const(offset_of!(ArchPCBInfo, rflags)),
+
+        off_rbx = const(offset_of!(ArchPCBInfo, rbx)),
+        off_r12 = const(offset_of!(ArchPCBInfo, r12)),
+        off_r13 = const(offset_of!(ArchPCBInfo, r13)),
+        off_r14 = const(offset_of!(ArchPCBInfo, r14)),
+        off_rbp = const(offset_of!(ArchPCBInfo, rbp)),
+        off_rsp = const(offset_of!(ArchPCBInfo, rsp)),
+        off_r15 = const(offset_of!(ArchPCBInfo, r15)),
+
+        switch_hook = sym crate::process::switch_finish_hook,
+        options(noreturn),
+    );
+}

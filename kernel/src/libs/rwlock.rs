@@ -292,12 +292,19 @@ impl<T> From<T> for RwLock<T> {
 }
 
 impl<'rwlock, T> RwLockReadGuard<'rwlock, T> {
+    /// @brief 释放守卫,获得保护的值的不可变引用
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
     #[allow(dead_code)]
     #[inline]
-    /// @brief 释放守卫,获得保护的值的不可变引用
-    pub fn leak(this: Self) -> &'rwlock T {
-        let Self { data, .. } = this;
-        return unsafe { &*data };
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
+        let this = ManuallyDrop::new(this);
+        return unsafe { &*this.data };
     }
 }
 
@@ -363,9 +370,16 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
     #[allow(dead_code)]
     #[inline]
-    /// @brief 返回内部数据的引用,消除锁
-    pub fn leak(this: Self) -> &'rwlock T {
-        let this = ManuallyDrop::new(this);
+    /// @brief 返回内部数据的引用,消除守卫
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
+        let this: ManuallyDrop<RwLockUpgradableGuard<'_, T>> = ManuallyDrop::new(this);
 
         unsafe { &*this.data }
     }
@@ -374,8 +388,15 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
-    /// @brief 返回内部数据的引用,消除锁
-    pub fn leak(this: Self) -> &'rwlock T {
+    /// @brief 返回内部数据的引用,消除守卫
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
         let this = ManuallyDrop::new(this);
 
         return unsafe { &*this.data };

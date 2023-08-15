@@ -109,18 +109,6 @@ void process_switch_fsgs(uint64_t fs, uint64_t gs)
 }
 
 /**
- * @brief 打开要执行的程序文件
- *
- * @param path
- * @return int 文件描述符编号
- */
-int process_open_exec_file(char *path)
-{
-    int fd = enter_syscall_int(SYS_OPEN, (uint64_t)path, O_RDONLY, 0, 0, 0, 0, 0, 0);
-    return fd;
-}
-
-/**
  * @brief 初始化实时进程rt_pcb
  *
  * @return 初始化后的进程

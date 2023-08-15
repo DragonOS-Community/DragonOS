@@ -5,27 +5,14 @@ use crate::{
     arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     include::bindings::bindings::{
-        process_control_block, process_wakeup, wait_queue_head_t, PROC_INTERRUPTIBLE,
-        PROC_UNINTERRUPTIBLE,
+        process_control_block, process_wakeup, PROC_INTERRUPTIBLE, PROC_UNINTERRUPTIBLE,
     },
 };
 
 use super::{
-    list::list_init,
     mutex::MutexGuard,
     spinlock::{SpinLock, SpinLockGuard},
 };
-
-impl Default for wait_queue_head_t {
-    fn default() -> Self {
-        let mut x = Self {
-            wait_list: Default::default(),
-            lock: Default::default(),
-        };
-        list_init(&mut x.wait_list);
-        return x;
-    }
-}
 
 #[derive(Debug)]
 struct InnerWaitQueue {

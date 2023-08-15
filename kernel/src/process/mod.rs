@@ -27,7 +27,8 @@ use crate::{
         INITIAL_PROCESS_ADDRESS_SPACE,
     },
     net::socket::SocketInode,
-    sched::{SchedPolicy, SchedPriority},
+    sched::{core::CPU_EXECUTING, SchedPolicy, SchedPriority},
+    smp::core::smp_send_reschedule,
     syscall::SystemError,
 };
 
@@ -36,7 +37,6 @@ pub mod c_adapter;
 pub mod exec;
 pub mod fork;
 pub mod pid;
-pub mod preempt;
 pub mod process;
 pub mod syscall;
 
@@ -148,6 +148,24 @@ impl ProcessManager {
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
         prev_pcb.arch_info.force_unlock();
         next_pcb.arch_info.force_unlock();
+    }
+
+    /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态
+    ///
+    /// ## 参数
+    ///
+    /// - `pcb` : 进程的pcb
+    pub fn kick(pcb: &Arc<ProcessControlBlock>) {
+        ProcessManager::current_pcb().preempt_disable();
+        let cpu_id = pcb.sched_info().on_cpu();
+
+        if let Some(cpu_id) = cpu_id {
+            if pcb.basic().pid() == CPU_EXECUTING[cpu_id as usize].load(Ordering::SeqCst) {
+                smp_send_reschedule(cpu_id);
+            }
+        }
+
+        ProcessManager::current_pcb().preempt_enable();
     }
 }
 

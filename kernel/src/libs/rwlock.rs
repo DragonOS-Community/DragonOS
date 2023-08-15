@@ -7,10 +7,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::{
-    process::preempt::{preempt_disable, preempt_enable},
-    syscall::SystemError,
-};
+use crate::{process::ProcessManager, syscall::SystemError};
 
 ///RwLock读写锁
 
@@ -113,10 +110,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获取READER守卫
     pub fn try_read(&self) -> Option<RwLockReadGuard<T>> {
-        preempt_disable();
+        ProcessManager::current_pcb().preempt_disable();
         let r = self.inner_try_read();
         if r.is_none() {
-            preempt_enable();
+            ProcessManager::current_pcb().preempt_enable();
         }
         return r;
     }
@@ -177,10 +174,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得WRITER守卫
     pub fn try_write(&self) -> Option<RwLockWriteGuard<T>> {
-        preempt_disable();
+        ProcessManager::current_pcb().preempt_disable();
         let r = self.inner_try_write();
         if r.is_none() {
-            preempt_enable();
+            ProcessManager::current_pcb().preempt_enable();
         }
 
         return r;
@@ -220,10 +217,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得UPGRADER守卫
     pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
-        preempt_disable();
+        ProcessManager::current_pcb().preempt_disable();
         let r = self.inner_try_upgradeable_read();
         if r.is_none() {
-            preempt_enable();
+            ProcessManager::current_pcb().preempt_enable();
         }
 
         return r;
@@ -477,7 +474,7 @@ impl<'rwlock, T> Drop for RwLockReadGuard<'rwlock, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
-        preempt_enable();
+        ProcessManager::current_pcb().preempt_enable();
     }
 }
 
@@ -488,7 +485,7 @@ impl<'rwlock, T> Drop for RwLockUpgradableGuard<'rwlock, T> {
             UPGRADED
         );
         self.inner.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
-        preempt_enable();
+        ProcessManager::current_pcb().preempt_enable();
         //这里为啥要AcqRel? Release应该就行了?
     }
 }
@@ -500,6 +497,6 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
 
-        preempt_enable();
+        ProcessManager::current_pcb().preempt_enable();
     }
 }

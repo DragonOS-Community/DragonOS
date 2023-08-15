@@ -1,5 +1,7 @@
 use core::sync::atomic::compiler_fence;
 
+use alloc::vec::Vec;
+
 use crate::{
     arch::asm::current::current_pcb,
     include::bindings::bindings::smp_get_total_cpu,
@@ -8,24 +10,25 @@ use crate::{
         SCHED_NORMAL, SCHED_RR,
     },
     kinfo,
-    process::process::process_cpu,
+    mm::percpu::PerCpu,
+    process::{AtomicPid, Pid},
     syscall::SystemError,
 };
 
 use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
 
-/// @brief 获取指定的cpu上正在执行的进程的pcb
-#[inline]
-pub fn cpu_executing(cpu_id: u32) -> &'static mut process_control_block {
-    // todo: 引入per_cpu之后，该函数真正执行“返回指定的cpu上正在执行的pcb”的功能
-
-    if cpu_id == process_cpu(current_pcb()) {
-        return current_pcb();
-    } else {
-        todo!()
-    }
+lazy_static! {
+    /// 记录每个cpu上正在执行的进程的pid
+    pub static ref CPU_EXECUTING: Vec<AtomicPid> = {
+        let mut v = Vec::new();
+        for _ in 0..PerCpu::MAX_CPU_NUM {
+            v.push(AtomicPid::new(Pid::new(0)));
+        }
+        v
+    };
 }
+
 // 获取某个cpu的负载情况，返回当前负载，cpu_id 是获取负载的cpu的id
 // TODO:将获取负载情况调整为最近一段时间运行进程的数量
 pub fn get_cpu_loads(cpu_id: u32) -> u32 {

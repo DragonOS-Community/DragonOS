@@ -170,7 +170,6 @@ pub extern "C" fn sched_update_jiffies() {
     }
 }
 
-
 /// @brief 设置进程需要等待迁移到另一个cpu核心。
 /// 当进程被重新加入队列时，将会更新其cpu_id,并加入正确的队列
 ///

@@ -28,7 +28,7 @@ use crate::{
     },
     net::socket::SocketInode,
     sched::{core::CPU_EXECUTING, SchedPolicy, SchedPriority},
-    smp::core::smp_send_reschedule,
+    smp::kick_cpu,
     syscall::SystemError,
 };
 
@@ -36,6 +36,7 @@ pub mod abi;
 pub mod c_adapter;
 pub mod exec;
 pub mod fork;
+pub mod idle;
 pub mod pid;
 pub mod process;
 pub mod syscall;
@@ -68,13 +69,25 @@ impl ProcessManager {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
         if INIT_FLAG
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+            .is_err()
         {
-            ALL_PROCESS.lock().replace(HashMap::new());
-            Self::arch_init();
-        } else {
             panic!("ProcessManager has been initialized!");
         }
+
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            kdebug!("To create address space for INIT process.");
+            // test_buddy();
+            set_INITIAL_PROCESS_ADDRESS_SPACE(
+                AddressSpace::new(true).expect("Failed to create address space for INIT process."),
+            );
+            kdebug!("INIT process address space created.");
+            compiler_fence(Ordering::SeqCst);
+        };
+
+        ALL_PROCESS.lock().replace(HashMap::new());
+        Self::arch_init();
+        Self::init_idle();
     }
 
     /// 获取当前进程的pcb
@@ -160,8 +173,10 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            if pcb.basic().pid() == CPU_EXECUTING[cpu_id as usize].load(Ordering::SeqCst) {
-                smp_send_reschedule(cpu_id);
+            let cpu_id = cpu_id as usize;
+
+            if pcb.basic().pid() == CPU_EXECUTING[cpu_id].load(Ordering::SeqCst) {
+                kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
 
@@ -254,14 +269,25 @@ impl ProcessControlBlock {
     ///
     /// 返回一个新的pcb
     pub fn new(name: String, kstack: KernelStack) -> Arc<Self> {
-        let basic_info = ProcessBasicInfo::new(
-            Self::generate_pid(),
-            Pid(0),
-            Pid(0),
-            name,
-            "/".to_string(),
-            None,
-        );
+        return Self::do_create_pcb(name, kstack, false);
+    }
+
+    /// 创建一个新的idle进程
+    ///
+    /// 请注意，这个函数只能在进程管理初始化的时候调用。
+    pub fn new_idle(cpu_id: u32, kstack: KernelStack) -> Arc<Self> {
+        let name = format!("idle-{}", cpu_id);
+        return Self::do_create_pcb(name, kstack, true);
+    }
+
+    fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
+        let pid = if is_idle {
+            Pid(0)
+        } else {
+            Self::generate_pid()
+        };
+
+        let basic_info = ProcessBasicInfo::new(pid, Pid(0), Pid(0), name, "/".to_string(), None);
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
 
@@ -538,7 +564,9 @@ impl ProcessSchedulerInfo {
 
 #[derive(Debug)]
 pub struct KernelStack {
-    stack: AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>,
+    stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
+    /// 标记该内核栈是否可以被释放
+    can_be_freed: bool,
 }
 
 impl KernelStack {
@@ -547,18 +575,39 @@ impl KernelStack {
 
     pub fn new() -> Result<Self, SystemError> {
         return Ok(Self {
-            stack: AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
+            stack: Some(
+                AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
+            ),
+            can_be_freed: true,
+        });
+    }
+
+    /// 根据已有的空间，构造一个内核栈结构体
+    ///
+    /// 仅仅用于BSP启动时，为idle进程构造内核栈。其他时候使用这个函数，很可能造成错误！
+    pub unsafe fn from_existed(base: VirtAddr) -> Result<Self, SystemError> {
+        if base.is_null() || base.check_aligned(Self::ALIGN) == false {
+            return Err(SystemError::EFAULT);
+        }
+
+        return Ok(Self {
+            stack: Some(
+                AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
+                    base.data() as *mut [u8; KernelStack::SIZE],
+                ),
+            ),
+            can_be_freed: false,
         });
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)
     pub fn start_address(&self) -> VirtAddr {
-        return VirtAddr::new(self.stack.as_ptr() as usize);
+        return VirtAddr::new(self.stack.as_ref().unwrap().as_ptr() as usize);
     }
 
     /// 返回内核栈的结束虚拟地址(高地址)(不包含该地址)
     pub fn stack_max_address(&self) -> VirtAddr {
-        return VirtAddr::new(self.stack.as_ptr() as usize + Self::SIZE);
+        return VirtAddr::new(self.stack.as_ref().unwrap().as_ptr() as usize + Self::SIZE);
     }
 
     pub unsafe fn set_pcb(&mut self, pcb: Arc<ProcessControlBlock>) -> Result<(), SystemError> {
@@ -570,7 +619,7 @@ impl KernelStack {
         }
         // 将pcb的地址放到内核栈的最低地址处
         unsafe {
-            *(self.stack.as_ptr() as *mut *const ProcessControlBlock) = p;
+            *(self.stack.as_ref().unwrap().as_ptr() as *mut *const ProcessControlBlock) = p;
         }
 
         return Ok(());
@@ -579,7 +628,7 @@ impl KernelStack {
     /// 返回指向当前内核栈pcb的Arc指针
     pub unsafe fn pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         // 从内核栈的最低地址处取出pcb的地址
-        let p = self.stack.as_ptr() as *const ProcessControlBlock;
+        let p = self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock;
         if unlikely(p.is_null()) {
             return None;
         }
@@ -595,26 +644,18 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let pcb_ptr: Arc<ProcessControlBlock> =
-            unsafe { Arc::from_raw(self.stack.as_ptr() as *const ProcessControlBlock) };
+        let pcb_ptr: Arc<ProcessControlBlock> = unsafe {
+            Arc::from_raw(self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock)
+        };
         drop(pcb_ptr);
+        // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
+        if !self.can_be_freed {
+            let bx = self.stack.take();
+            core::mem::forget(bx);
+        }
     }
 }
 
 pub fn process_init() {
     ProcessManager::init();
-
-    unsafe {
-        compiler_fence(Ordering::SeqCst);
-        current_pcb().address_space = null_mut();
-        kdebug!("To create address space for INIT process.");
-        // test_buddy();
-        set_INITIAL_PROCESS_ADDRESS_SPACE(
-            AddressSpace::new(true).expect("Failed to create address space for INIT process."),
-        );
-        kdebug!("INIT process address space created.");
-        compiler_fence(Ordering::SeqCst);
-        current_pcb().set_address_space(INITIAL_PROCESS_ADDRESS_SPACE());
-        compiler_fence(Ordering::SeqCst);
-    };
 }

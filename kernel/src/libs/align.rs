@@ -57,6 +57,12 @@ impl<T, const ALIGN: usize> AlignedBox<T, ALIGN> {
             });
         }
     }
+
+    pub unsafe fn new_unchecked(ptr: *mut T) -> Self {
+        return AlignedBox {
+            inner: Unique::new_unchecked(ptr),
+        };
+    }
 }
 
 impl<T, const ALIGN: usize> Debug for AlignedBox<T, ALIGN> {

@@ -23,7 +23,8 @@ static uint32_t total_processor_num = 0;
 static int current_starting_cpu = 0;
 
 static int num_cpu_started = 1;
-extern void rs_smp_init_idle();
+
+extern uint64_t rs_get_idle_stack_top(uint32_t cpu_id);
 
 // 在head.S中定义的，APU启动时，要加载的页表
 // 由于内存管理模块初始化的时候，重置了页表，因此我们要把当前的页表传给APU
@@ -99,18 +100,12 @@ void smp_init()
         current_starting_cpu = proc_local_apic_structs[i]->ACPI_Processor_UID;
         io_mfence();
         // 为每个AP处理器分配栈空间
-        cpu_core_info[current_starting_cpu].stack_start = (uint64_t)kmalloc(STACK_SIZE, 0) + STACK_SIZE;
+        cpu_core_info[current_starting_cpu].stack_start = (uint64_t)rs_get_idle_stack_top(current_starting_cpu);
         cpu_core_info[current_starting_cpu].ist_stack_start = (uint64_t)(kmalloc(STACK_SIZE, 0)) + STACK_SIZE;
         io_mfence();
-        memset((void *)cpu_core_info[current_starting_cpu].stack_start - STACK_SIZE, 0, STACK_SIZE);
+
         memset((void *)cpu_core_info[current_starting_cpu].ist_stack_start - STACK_SIZE, 0, STACK_SIZE);
         io_mfence();
-
-        // 设置ap处理器的中断栈及内核栈中的cpu_id
-        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].stack_start - STACK_SIZE))->cpu_id =
-            proc_local_apic_structs[i]->local_apic_id;
-        ((struct process_control_block *)(cpu_core_info[current_starting_cpu].ist_stack_start - STACK_SIZE))->cpu_id =
-            proc_local_apic_structs[i]->local_apic_id;
 
         cpu_core_info[current_starting_cpu].tss_vaddr = (uint64_t)&initial_tss[current_starting_cpu];
 
@@ -144,7 +139,6 @@ void smp_init()
 
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
     rs_unmap_at_low_addr();
-    kdebug("init proc's preempt_count=%ld", current_pcb->preempt_count);
     kinfo("Successfully cleaned page table remapping!\n");
 }
 
@@ -169,38 +163,14 @@ void smp_ap_start()
     apic_init_ap_core_local_apic();
 
     // ============ 为ap处理器初始化IDLE进程 =============
-    memset(current_pcb, 0, sizeof(struct process_control_block));
 
-    barrier();
-    current_pcb->state = PROC_RUNNING;
-    current_pcb->flags = PF_KTHREAD;
-    current_pcb->address_space = NULL;
-    rs_smp_init_idle();
-
-    list_init(&current_pcb->list);
-    current_pcb->addr_limit = KERNEL_BASE_LINEAR_ADDR;
-    current_pcb->priority = 2;
-    current_pcb->virtual_runtime = 0;
-
-    current_pcb->thread = (struct thread_struct *)(current_pcb + 1); // 将线程结构体放置在pcb后方
-    current_pcb->thread->rbp = cpu_core_info[current_starting_cpu].stack_start;
-    current_pcb->thread->rsp = cpu_core_info[current_starting_cpu].stack_start;
-    current_pcb->thread->fs = KERNEL_DS;
-    current_pcb->thread->gs = KERNEL_DS;
-    current_pcb->cpu_id = current_starting_cpu;
-
-    initial_proc[proc_current_cpu_id] = current_pcb;
     barrier();
     load_TR(10 + current_starting_cpu * 2);
-    current_pcb->preempt_count = 0;
-
-    sched_set_cpu_idle(current_starting_cpu, current_pcb);
 
     io_mfence();
-    spin_unlock(&multi_core_starting_lock);
-    preempt_disable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，需要手动恢复preempt count
+    spin_unlock_no_preempt(&multi_core_starting_lock);
+
     io_mfence();
-    current_pcb->flags |= PF_NEED_SCHED;
 
     apic_timer_ap_core_init();
     sti();

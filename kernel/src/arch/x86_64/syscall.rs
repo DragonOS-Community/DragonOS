@@ -1,27 +1,13 @@
-use core::{ffi::c_void, panic};
+use core::ffi::c_void;
 
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
 
 use crate::{
-    arch::{asm::current::current_pcb, CurrentIrqArch},
-    exception::InterruptArch,
-    filesystem::vfs::MAX_PATHLEN,
-    include::bindings::bindings::{
-        pt_regs, set_system_trap_gate, CLONE_FS, CLONE_SIGNAL, CLONE_VM, USER_CS, USER_DS,
-    },
-    mm::{ucontext::AddressSpace, verify_area, VirtAddr},
-    process::{
-        exec::{load_binary_file, ExecParam, ExecParamFlags},
-        fork::CloneFlags,
-        ProcessManager,
-    },
-    syscall::{
-        user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
-        Syscall, SystemError, SYS_EXECVE, SYS_FORK, SYS_RT_SIGRETURN, SYS_VFORK,
-    },
+    include::bindings::bindings::set_system_trap_gate,
+    syscall::{Syscall, SystemError, SYS_FORK, SYS_RT_SIGRETURN, SYS_VFORK},
 };
 
-use super::{asm::ptrace::user_mode, interrupt::TrapFrame, mm::barrier::mfence};
+use super::{interrupt::TrapFrame, mm::barrier::mfence};
 
 extern "C" {
     fn syscall_int();

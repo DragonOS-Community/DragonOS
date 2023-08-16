@@ -19,7 +19,9 @@ cd DragonOS
 ```
 
 :::{warning}
-DragonOS的源代码托管在Github上，但是，由于Github在国内的访问速度较慢，因此，我们建议您在github上绑定您的电脑的**ssh公钥**，
+DragonOS的源代码托管在Github上，但是，由于Github在国内的访问速度较慢。可能出现克隆失败的情况，这时只要重试即可。
+
+当然，我们建议您在github上绑定您的电脑的**ssh公钥**，
 然后通过以下命令来克隆代码，防止频繁出现git clone、pull、push失败的情况。
 
 ```shell

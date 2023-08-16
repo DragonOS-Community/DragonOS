@@ -1,7 +1,6 @@
 #pragma once
 
 #include <asm/current.h>
-#include <common/gfp.h>
 #include <common/glib.h>
 #include <mm/mm-types.h>
 #include <process/process.h>
@@ -46,14 +45,6 @@ extern uint64_t rs_unmap_at_low_addr();
 #define IO_APIC_MAPPING_OFFSET 0xfec00000UL
 #define LOCAL_APIC_MAPPING_OFFSET 0xfee00000UL
 #define AHCI_MAPPING_OFFSET 0xff200000UL // AHCI 映射偏移量,之后使用了4M的地址
-
-// ===== 内存区域属性 =====
-// DMA区域
-#define ZONE_DMA (1 << 0)
-// 已在页表中映射的区域
-#define ZONE_NORMAL (1 << 1)
-// 未在页表中映射的区域
-#define ZONE_UNMAPPED_IN_PGT (1 << 2)
 
 // ===== 页面属性 =====
 // 页面在页表中已被映射 mapped=1 unmapped=0

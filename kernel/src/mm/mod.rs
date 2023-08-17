@@ -23,11 +23,11 @@ use self::{
 
 pub mod allocator;
 pub mod c_adapter;
-pub mod gfp;
 pub mod kernel_mapper;
 pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
+pub mod percpu;
 pub mod syscall;
 pub mod ucontext;
 

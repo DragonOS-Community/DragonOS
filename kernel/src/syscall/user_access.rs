@@ -175,10 +175,7 @@ impl<'a> UserBufferReader<'a> {
     ///
     /// @return 返回用户空间数据的切片(对单个结构体就返回长度为一的切片)
     ///
-    pub fn read_from_user<T>(&self, offset: usize) -> Result<&[T], SystemError>
-    where
-        [u8; core::mem::size_of::<T>()]:,
-    {
+    pub fn read_from_user<T>(&self, offset: usize) -> Result<&[T], SystemError> {
         match self.convert_with_offset(&self.buffer, offset) {
             Err(e) => return Err(e),
             Ok(data) => return Ok(data),
@@ -194,10 +191,7 @@ impl<'a> UserBufferReader<'a> {
         &self,
         dst: &mut [T],
         offset: usize,
-    ) -> Result<usize, SystemError>
-    where
-        [u8; core::mem::size_of::<T>()]:,
-    {
+    ) -> Result<usize, SystemError> {
         match self.convert_with_offset(&self.buffer, offset) {
             Err(e) => return Err(e),
             Ok(data) => {
@@ -207,10 +201,7 @@ impl<'a> UserBufferReader<'a> {
         return Ok(dst.len());
     }
 
-    fn convert_with_offset<T>(&self, src: &'a [u8], offset: usize) -> Result<&'a [T], SystemError>
-    where
-        [u8; core::mem::size_of::<T>()]:,
-    {
+    fn convert_with_offset<T>(&self, src: &'a [u8], offset: usize) -> Result<&'a [T], SystemError> {
         if offset >= src.len() {
             return Err(SystemError::EINVAL);
         }
@@ -218,12 +209,6 @@ impl<'a> UserBufferReader<'a> {
         if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
             return Err(SystemError::EINVAL);
         }
-        // let size :usize= core::mem::size_of::<T>();
-        //     let chunks = src.chunks_exact(size);
-        //     self.data = chunks.map(|chunk| {
-        //     let array: [u8;core::mem::size_of::<T>()] = chunk.try_into().unwrap();
-        //     unsafe{core::mem::transmute_copy::<[u8;core::mem::size_of::<T>()],T>(&array)}
-        // }).collect();
         let (prefix, chunks, suffix) = unsafe { byte_buffer.align_to::<T>() };
         if !prefix.is_empty() || !suffix.is_empty() {
             return Err(SystemError::EINVAL);
@@ -266,10 +251,7 @@ impl<'a> UserBufferWriter<'a> {
         &'a mut self,
         data: &'a [T],
         offset: usize,
-    ) -> Result<(), SystemError>
-    where
-        [u8; core::mem::size_of::<T>()]:,
-    {
+    ) -> Result<(), SystemError> {
         match Self::convert_with_offset(self.buffer, offset) {
             Err(e) => Err(e),
             Ok(dst) => {
@@ -288,10 +270,7 @@ impl<'a> UserBufferWriter<'a> {
         &'a mut self,
         src: &'a [T],
         offset: usize,
-    ) -> Result<usize, SystemError>
-    where
-        [u8; core::mem::size_of::<T>()]:,
-    {
+    ) -> Result<usize, SystemError> {
         match Self::convert_with_offset(self.buffer, offset) {
             Err(_) => return Err(SystemError::EINVAL),
             Ok(dst) => {
@@ -301,20 +280,17 @@ impl<'a> UserBufferWriter<'a> {
         }
     }
 
-    pub fn get_buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError>
-    where
-        [u8; core::mem::size_of::<T>()]:,
-    {
+    pub fn get_buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError> {
         match Self::convert_with_offset(self.buffer, offset) {
             Err(_) => return Err(SystemError::EINVAL),
             Ok(buffer) => return Ok(buffer),
         }
     }
 
-    fn convert_with_offset<T>(src: &'a mut [u8], offset: usize) -> Result<&'a mut [T], SystemError>
-    where
-        [u8; core::mem::size_of::<T>()]:,
-    {
+    fn convert_with_offset<T>(
+        src: &'a mut [u8],
+        offset: usize,
+    ) -> Result<&'a mut [T], SystemError> {
         if offset >= src.len() {
             return Err(SystemError::EINVAL);
         }
@@ -322,12 +298,6 @@ impl<'a> UserBufferWriter<'a> {
         if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
             return Err(SystemError::EINVAL);
         }
-        // let size :usize= core::mem::size_of::<T>();
-        //     let chunks = src.chunks_exact(size);
-        //     self.data = chunks.map(|chunk| {
-        //     let array: [u8;core::mem::size_of::<T>()] = chunk.try_into().unwrap();
-        //     unsafe{core::mem::transmute_copy::<[u8;core::mem::size_of::<T>()],T>(&array)}
-        // }).collect();
         let (prefix, chunks, suffix) = unsafe { byte_buffer.align_to_mut::<T>() };
         if !prefix.is_empty() || !suffix.is_empty() {
             return Err(SystemError::EINVAL);

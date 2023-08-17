@@ -8,7 +8,7 @@
 
 社区公共邮箱：contact@DragonOS.org
 
-DragonOS社区负责人: longjin
+DragonOS社区负责人: 龙进
 
 工作邮箱: longjin@DragonOS.org
 
@@ -27,7 +27,7 @@ DragonOS是一个开源项目，我们欢迎任何形式的赞助和捐赠，您
 您可以通过以下方式赞助和捐赠：
 
 - 访问DragonOS官网 https://DragonOS.org ，点击页面右上角的“赞助”按钮，进行捐赠
-- 联系社区负责人，沟通具体的赞助方式等。
+- 联系社区负责人，沟通具体的赞助方式等。联系方式：longjin@dragonos.org
 
 财务及捐赠信息公开
 -------------------------

@@ -25,6 +25,8 @@ use crate::{
     },
 };
 
+use self::user_access::UserBufferWriter;
+
 pub mod user_access;
 
 #[repr(i32)]
@@ -651,17 +653,17 @@ impl Syscall {
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
                 let pipefd = args[0] as *mut c_int;
-                let virt_pipefd = VirtAddr::new(pipefd as usize);
-                if from_user
-                    && verify_area(virt_pipefd, core::mem::size_of::<[c_int; 2]>() as usize)
-                        .is_err()
-                {
-                    Err(SystemError::EFAULT)
-                } else if pipefd.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let pipefd = unsafe { core::slice::from_raw_parts_mut(pipefd, 2) };
-                    Self::pipe(pipefd)
+
+                match UserBufferWriter::new(pipefd,core::mem::size_of::<[c_int; 2]>() as usize,from_user){
+                    Err(e)=>Err(e),
+                    Ok(mut user_buffer)=>
+                    {
+                        match user_buffer.get_buffer::<i32>(0)
+                        {
+                            Err(e)=>Err(e),
+                            Ok(pipefd)=>Self::pipe(pipefd)
+                        }
+                    }
                 }
             }
 

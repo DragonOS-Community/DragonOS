@@ -21,5 +21,4 @@ pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;
 pub mod notifier;
-pub mod userbuffer;
 pub mod wait_queue;

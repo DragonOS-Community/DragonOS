@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use alloc::{collections::LinkedList, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::LinkedList, string::String, sync::Arc, boxed::Box};
 
 use crate::{
     driver::uart::uart::{c_uart_send_str, UartPort},
@@ -51,7 +51,7 @@ pub enum ScmFramworkType {
 #[derive(Debug)]
 pub enum ScmBuffer {
     DeviceBuffer(Option<VirtAddr>),
-    DoubleBuffer(Option<Vec<u32>>),
+    DoubleBuffer(Option<Box<[u32]>>),
 }
 #[derive(Debug)]
 pub struct ScmBufferInfo {
@@ -106,13 +106,12 @@ impl ScmBufferInfo {
                 ScmBufferInfo::from(unsafe { &video_frame_buffer_info });
 
             frame_buffer_info.flags = buf_type;
+            // 这里还是改成使用box来存储数组，如果直接用vec存储，在multiboot2_iter那里会报错，不知为何
+            frame_buffer_info.buf = ScmBuffer::DoubleBuffer(Some(
+                Box::new(vec![0; unsafe { (video_frame_buffer_info.size/4) as usize }])
+                    .into_boxed_slice(),
+            ));
 
-            frame_buffer_info.buf = ScmBuffer::DoubleBuffer(Some(vec![
-                0;
-                unsafe {
-                    (video_frame_buffer_info.size / 4) as usize
-                }
-            ]));
             return Ok(frame_buffer_info);
         }
     }

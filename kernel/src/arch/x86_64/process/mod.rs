@@ -19,7 +19,9 @@ use crate::{
 
 use super::{fpu::FpState, interrupt::TrapFrame};
 
+pub mod kthread;
 pub mod syscall;
+mod table;
 
 extern "C" {
     /// 内核线程引导函数

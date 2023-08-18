@@ -32,7 +32,7 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn kill(pid: Pid, sig: c_int) -> Result<usize, SystemError> {
+    pub fn kill(_pid: Pid, _sig: c_int) -> Result<usize, SystemError> {
         // todo: 由于进程管理重构，目前删除了signal功能，将来重新实现它。
         return Err(SystemError::ENOSYS);
     }
@@ -46,9 +46,9 @@ impl Syscall {
     /// @return int 错误码
     #[no_mangle]
     pub fn sigaction(
-        sig: c_int,
-        act: usize,
-        old_act: usize,
+        _sig: c_int,
+        _act: usize,
+        _old_act: usize,
         _from_user: bool,
     ) -> Result<usize, SystemError> {
         // todo: 由于进程管理重构，目前删除了signal功能，将来重新实现它。

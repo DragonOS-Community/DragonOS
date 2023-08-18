@@ -9,7 +9,7 @@ use core::{
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    kerror,
+    kerror, kwarn,
 };
 
 use super::{
@@ -582,9 +582,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             if table.level() == 0 {
                 // todo: 检查是否已经映射
                 // 现在不检查的原因是，刚刚启动系统时，内核会映射一些页。
-                // if table.entry_mapped(i)? == true {
-                //     kwarn!("Page {:?} already mapped", virt);
-                // }
+                if table.entry_mapped(i)? == true {
+                    kwarn!("Page {:?} already mapped", virt);
+                }
                 // kdebug!("Mapping {:?} to {:?}, i = {i}, entry={:?}, flags={:?}", virt, phys, entry, flags);
                 compiler_fence(Ordering::SeqCst);
                 table.set_entry(i, entry);

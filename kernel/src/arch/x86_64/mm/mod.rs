@@ -396,10 +396,8 @@ unsafe fn allocator_init() {
     unsafe { set_inner_allocator(buddy_allocator) };
     kinfo!("Successfully initialized buddy allocator");
     // 关闭显示输出
-    // unsafe {
-    //     disable_textui();
-    // }
     scm_disable_put_to_window();
+    
     // make the new page table current
     {
         let mut binding = INNER_ALLOCATOR.lock();
@@ -417,17 +415,7 @@ unsafe fn allocator_init() {
         kdebug!("New page table enabled");
     }
     kdebug!("Successfully enabled new page table");
-    // // 重置显示输出目标
-    // unsafe {
-    //     video_reinitialize(false);
-    // }
-
-    // // 打开显示输出
-    // // unsafe {
-    // //     enable_textui();
-    // // }
-    // scm_enable_put_to_window();
-    kdebug!("Text UI enabled");
+    
 }
 
 #[no_mangle]

@@ -193,12 +193,13 @@ int video_init()
 
     video_frame_buffer_info.size =
         video_frame_buffer_info.width * video_frame_buffer_info.height * ((video_frame_buffer_info.bit_depth + 7) / 8);
-    // 先临时映射到该地址，稍后再重新映射
-    video_frame_buffer_info.vaddr = 0xffff800003000000;
+    // 先临时映射到50M的位置，稍后再重新映射
+    video_frame_buffer_info.vaddr = 0xffff800003200000;
 
     char init_text1[] = "Video driver to map.\n";
     for (int i = 0; i < sizeof(init_text1) - 1; ++i)
         c_uart_send(COM1, init_text1[i]);
+    
     rs_pseudo_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size);
 
     io_mfence();

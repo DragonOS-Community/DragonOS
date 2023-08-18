@@ -7,6 +7,7 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     sync::Arc,
 };
@@ -15,6 +16,7 @@ use hashbrown::HashMap;
 use crate::{
     arch::{asm::current::current_pcb, process::ArchPCBInfo},
     filesystem::vfs::{file::FileDescriptorVec, FileType},
+    include::bindings::bindings::CLONE_SIGNAL,
     kdebug,
     libs::{
         align::AlignedBox,
@@ -27,16 +29,25 @@ use crate::{
         INITIAL_PROCESS_ADDRESS_SPACE,
     },
     net::socket::SocketInode,
+    process::{
+        fork::CloneFlags,
+        init::initial_kernel_thread,
+        kthread::{KernelThreadClosure, KernelThreadCreateInfo, KernelThreadMechanism},
+    },
     sched::{core::CPU_EXECUTING, SchedPolicy, SchedPriority},
     smp::kick_cpu,
     syscall::SystemError,
 };
+
+use self::kthread::WorkerPrivate;
 
 pub mod abi;
 pub mod c_adapter;
 pub mod exec;
 pub mod fork;
 pub mod idle;
+pub mod init;
+pub mod kthread;
 pub mod pid;
 pub mod process;
 pub mod syscall;
@@ -88,6 +99,21 @@ impl ProcessManager {
         ALL_PROCESS.lock().replace(HashMap::new());
         Self::arch_init();
         Self::init_idle();
+
+        KernelThreadMechanism::init();
+
+        // 初始化第一个内核线程
+        {
+            let create_info = KernelThreadCreateInfo::new(
+                KernelThreadClosure::EmptyClosure((Box::new(initial_kernel_thread), ())),
+                "init".to_string(),
+            );
+            KernelThreadMechanism::__inner_create(
+                &create_info,
+                CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGNAL,
+            )
+            .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
+        }
     }
 
     /// 获取当前进程的pcb
@@ -127,6 +153,11 @@ impl ProcessManager {
 
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    /// 标志当前进程永久睡眠，移出调度队列
+    pub fn sleep() -> Result<(), SystemError> {
         todo!()
     }
 
@@ -247,7 +278,7 @@ pub struct ProcessControlBlock {
     preempt_count: AtomicUsize,
 
     flags: SpinLock<ProcessFlags>,
-
+    worker_private: SpinLock<Option<WorkerPrivate>>,
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
 
@@ -299,6 +330,7 @@ impl ProcessControlBlock {
             preempt_count,
             flags,
             kernel_stack: RwLock::new(kstack),
+            worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
         };
@@ -365,6 +397,10 @@ impl ProcessControlBlock {
 
     pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write();
+    }
+
+    pub fn worker_private(&self) -> SpinLockGuard<Option<WorkerPrivate>> {
+        return self.worker_private.lock();
     }
 
     /// 获取文件描述符表的Arc指针

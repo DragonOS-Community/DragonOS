@@ -5,7 +5,10 @@ use crate::{
     process::ProcessFlags, syscall::SystemError,
 };
 
-use super::{KernelStack, Pid, ProcessControlBlock, ProcessManager};
+use super::{
+    kthread::{KernelThreadPcbPrivate, WorkerPrivate},
+    KernelStack, Pid, ProcessControlBlock, ProcessManager,
+};
 
 bitflags! {
     /// 进程克隆标志
@@ -39,7 +42,7 @@ impl ProcessManager {
 
         // 为内核线程设置worker private字段。（也许由内核线程机制去做会更好？）
         if current_pcb.flags().contains(ProcessFlags::KTHREAD) {
-            unimplemented!("fork: need to set worker private for new process");
+            *pcb.worker_private() = Some(WorkerPrivate::KernelThread(KernelThreadPcbPrivate::new()))
         }
 
         // todo: 维护父子进程关系
@@ -172,9 +175,9 @@ impl ProcessManager {
 
     #[allow(dead_code)]
     fn copy_sighand(
-        clone_flags: &CloneFlags,
-        current_pcb: &Arc<ProcessControlBlock>,
-        new_pcb: &Arc<ProcessControlBlock>,
+        _clone_flags: &CloneFlags,
+        _current_pcb: &Arc<ProcessControlBlock>,
+        _new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
         // todo: 由于信号原来写的太烂，移植到新的进程管理的话，需要改动很多。因此决定重写。这里先空着
         return Ok(());

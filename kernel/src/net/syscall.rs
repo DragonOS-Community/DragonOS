@@ -5,7 +5,6 @@ use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
 
 use crate::{
-    arch::asm::current::current_pcb,
     filesystem::vfs::{
         file::{File, FileMode},
         syscall::{IoVec, IoVecs},

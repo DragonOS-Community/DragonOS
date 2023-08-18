@@ -7,10 +7,12 @@ use crate::{
     io::SeekFrom,
     kerror,
     syscall::{Syscall, SystemError},
+    time::TimeSpec,
 };
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
+    fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
     Dirent, FileType, IndexNode, ROOT_INODE,
@@ -21,6 +23,102 @@ pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
 pub const SEEK_MAX: u32 = 3;
 
+bitflags! {
+    /// 文件类型和权限
+    pub struct ModeType: u32 {
+        /// 掩码
+        const S_IFMT = 0o0_170_000;
+        /// 文件类型
+        const S_IFSOCK = 0o140000;
+        const S_IFLNK = 0o120000;
+        const S_IFREG = 0o100000;
+        const S_IFBLK = 0o060000;
+        const S_IFDIR = 0o040000;
+        const S_IFCHR = 0o020000;
+        const S_IFIFO = 0o010000;
+
+        const S_ISUID = 0o004000;
+        const S_ISGID = 0o002000;
+        const S_ISVTX = 0o001000;
+        /// 文件用户权限
+        const S_IRWXU = 0o0700;
+        const S_IRUSR = 0o0400;
+        const S_IWUSR = 0o0200;
+        const S_IXUSR = 0o0100;
+        /// 文件组权限
+        const S_IRWXG = 0o0070;
+        const S_IRGRP = 0o0040;
+        const S_IWGRP = 0o0020;
+        const S_IXGRP = 0o0010;
+        /// 文件其他用户权限
+        const S_IRWXO = 0o0007;
+        const S_IROTH = 0o0004;
+        const S_IWOTH = 0o0002;
+        const S_IXOTH = 0o0001;
+    }
+}
+
+#[repr(C)]
+/// # 文件信息结构体
+pub struct PosixKstat {
+    /// 硬件设备ID
+    dev_id: u64,
+    /// inode号
+    inode: u64,
+    /// 硬链接数
+    nlink: u64,
+    /// 文件权限
+    mode: ModeType,
+    /// 所有者用户ID
+    uid: i32,
+    /// 所有者组ID
+    gid: i32,
+    /// 设备ID
+    rdev: i64,
+    /// 文件大小
+    size: i64,
+    /// 文件系统块大小
+    blcok_size: i64,
+    /// 分配的512B块数
+    blocks: u64,
+    /// 最后访问时间
+    atime: TimeSpec,
+    /// 最后修改时间
+    mtime: TimeSpec,
+    /// 最后状态变化时间
+    ctime: TimeSpec,
+    /// 用于填充结构体大小的空白数据
+    pub _pad: [i8; 24],
+}
+impl PosixKstat {
+    fn new() -> Self {
+        Self {
+            inode: 0,
+            dev_id: 0,
+            mode: ModeType { bits: 0 },
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            atime: TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            mtime: TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            ctime: TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            blcok_size: 0,
+            blocks: 0,
+            _pad: Default::default(),
+        }
+    }
+}
 impl Syscall {
     /// @brief 为当前进程打开一个文件
     ///
@@ -29,6 +127,7 @@ impl Syscall {
     ///
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
+        // kdebug!("open: path: {}, mode: {:?}", path, mode);
         // 文件名过长
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -82,7 +181,9 @@ impl Syscall {
         }
 
         // 把文件对象存入pcb
-        return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+        let r = current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+        // kdebug!("open: fd: {:?}", r);
+        return r;
     }
 
     /// @brief 关闭文件
@@ -91,6 +192,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn close(fd: usize) -> Result<usize, SystemError> {
+        // kdebug!("syscall::close: fd: {}", fd);
         return current_pcb().drop_fd(fd as i32).map(|_| 0);
     }
 
@@ -102,6 +204,7 @@ impl Syscall {
     /// @return Ok(usize) 成功读取的数据的字节数
     /// @return Err(SystemError) 读取失败，返回posix错误码
     pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // kdebug!("syscall::read: fd: {}, len={}", fd, buf.len());
         let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
@@ -119,6 +222,7 @@ impl Syscall {
     /// @return Ok(usize) 成功写入的数据的字节数
     /// @return Err(SystemError) 写入失败，返回posix错误码
     pub fn write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
+        // kdebug!("syscall::write: fd: {}, len={}", fd, buf.len());
         let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
@@ -136,6 +240,7 @@ impl Syscall {
     /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
     /// @return Err(SystemError) 调整失败，返回posix错误码
     pub fn lseek(fd: i32, seek: SeekFrom) -> Result<usize, SystemError> {
+        // kdebug!("syscall::lseek: fd: {}, seek={:?}", fd, seek);
         let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
@@ -342,6 +447,189 @@ impl Syscall {
         }
         // 从pcb获取文件描述符数组失败
         return Err(SystemError::EMFILE);
+    }
+
+    /// # fcntl
+    ///
+    /// ## 参数
+    ///
+    /// - `fd`：文件描述符
+    /// - `cmd`：命令
+    /// - `arg`：参数
+    pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
+        match cmd {
+            FcntlCommand::DupFd => {
+                if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
+                    return Err(SystemError::EBADF);
+                }
+                let arg = arg as usize;
+                for i in arg..FileDescriptorVec::PROCESS_MAX_FD {
+                    if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                        if fds.fds[i as usize].is_none() {
+                            return Self::dup2(fd, i as i32);
+                        }
+                    }
+                }
+                return Err(SystemError::EMFILE);
+            }
+            FcntlCommand::GetFd => {
+                // Get file descriptor flags.
+
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &fds.fds[fd as usize] {
+                            if file.close_on_exec() {
+                                return Ok(FD_CLOEXEC as usize);
+                            }
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+            FcntlCommand::SetFd => {
+                // Set file descriptor flags.
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &mut fds.fds[fd as usize] {
+                            let arg = arg as u32;
+                            if arg & FD_CLOEXEC != 0 {
+                                file.set_close_on_exec(true);
+                            } else {
+                                file.set_close_on_exec(false);
+                            }
+                            return Ok(0);
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+
+            FcntlCommand::GetFlags => {
+                // Get file status flags.
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &fds.fds[fd as usize] {
+                            return Ok(file.mode().bits() as usize);
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+            FcntlCommand::SetFlags => {
+                // Set file status flags.
+                if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+                    if FileDescriptorVec::validate_fd(fd) {
+                        if let Some(file) = &mut fds.fds[fd as usize] {
+                            let arg = arg as u32;
+                            let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
+                            file.set_mode(mode)?;
+                            return Ok(0);
+                        }
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                return Err(SystemError::EBADF);
+            }
+            _ => {
+                // TODO: unimplemented
+                // 未实现的命令，返回0，不报错。
+
+                // kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                return Ok(0);
+            }
+        }
+    }
+
+    /// # ftruncate
+    ///
+    /// ## 描述
+    ///
+    /// 改变文件大小.
+    /// 如果文件大小大于原来的大小，那么文件的内容将会被扩展到指定的大小，新的空间将会用0填充.
+    /// 如果文件大小小于原来的大小，那么文件的内容将会被截断到指定的大小.
+    ///
+    /// ## 参数
+    ///
+    /// - `fd`：文件描述符
+    /// - `len`：文件大小
+    ///
+    /// ## 返回值
+    ///
+    /// 如果成功，返回0，否则返回错误码.
+    pub fn ftruncate(fd: i32, len: usize) -> Result<usize, SystemError> {
+        if let Some(fds) = FileDescriptorVec::from_pcb(current_pcb()) {
+            if FileDescriptorVec::validate_fd(fd) {
+                if let Some(file) = &mut fds.fds[fd as usize] {
+                    let r = file.ftruncate(len).map(|_| 0);
+                    return r;
+                }
+                return Err(SystemError::EBADF);
+            }
+        }
+        return Err(SystemError::EBADF);
+    }
+    fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
+        let cur = current_pcb();
+        match cur.get_file_ref_by_fd(fd) {
+            Some(file) => {
+                let mut kstat = PosixKstat::new();
+                // 获取文件信息
+                match file.metadata() {
+                    Ok(metadata) => {
+                        kstat.size = metadata.size as i64;
+                        kstat.dev_id = metadata.dev_id as u64;
+                        kstat.inode = metadata.inode_id as u64;
+                        kstat.blcok_size = metadata.blk_size as i64;
+                        kstat.blocks = metadata.blocks as u64;
+
+                        kstat.atime.tv_sec = metadata.atime.tv_sec;
+                        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
+                        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
+                        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
+                        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
+                        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
+
+                        kstat.nlink = metadata.nlinks as u64;
+                        kstat.uid = metadata.uid as i32;
+                        kstat.gid = metadata.gid as i32;
+                        kstat.rdev = metadata.raw_dev as i64;
+                        kstat.mode.bits = metadata.mode;
+                        match file.file_type() {
+                            FileType::File => kstat.mode.insert(ModeType::S_IFMT),
+                            FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
+                            FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
+                            FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
+                            FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
+                            FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
+                            FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                return Ok(kstat);
+            }
+            None => {
+                return Err(SystemError::EINVAL);
+            }
+        }
+    }
+    pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        match Self::do_fstat(fd) {
+            Ok(kstat) => {
+                if usr_kstat.is_null() {
+                    return Err(SystemError::EFAULT);
+                }
+                unsafe {
+                    *usr_kstat = kstat;
+                }
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 

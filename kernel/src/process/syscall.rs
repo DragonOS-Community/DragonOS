@@ -41,8 +41,9 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let ret = unsafe { c_sys_wait4(pid, wstatus, options, rusage) };
         if (ret as isize) < 0 {
-            return Err(SystemError::from_posix_errno(-(ret as isize) as i32)
-                .expect("wait4: Invalid errno"));
+            return Err(
+                SystemError::from_posix_errno((ret as isize) as i32).expect("wait4: Invalid errno")
+            );
         }
         return Ok(ret as usize);
     }

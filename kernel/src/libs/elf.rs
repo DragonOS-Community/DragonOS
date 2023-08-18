@@ -93,7 +93,6 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
-        // kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
@@ -177,9 +176,7 @@ impl ElfLoader {
         let beginning_page_offset = self.elf_page_offset(addr_to_map);
         addr_to_map = self.elf_page_start(addr_to_map);
         // 计算要映射的内存的大小
-        let map_size = phent.p_filesz as usize
-            + self.elf_page_offset(VirtAddr::new(phent.p_vaddr as usize))
-            + beginning_page_offset;
+        let map_size = phent.p_filesz as usize + beginning_page_offset;
         let map_size = self.elf_page_align_up(VirtAddr::new(map_size)).data();
         // 当前段在文件中的大小
         let seg_in_file_size = phent.p_filesz as usize;

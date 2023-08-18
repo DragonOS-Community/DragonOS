@@ -1,0 +1,28 @@
+{
+  "name": "test_sqlite3",
+  "version": "3.42.0",
+  "description": "测试sqlite3",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_sqlite3"
+      }
+    }
+  },
+  "depends": [
+    {
+      "name": "relibc",
+      "version": "0.1.0"
+    }
+  ],
+  "build": {
+    "build_command": "make download_sqlite3 && make -j $(nproc)"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": []
+}

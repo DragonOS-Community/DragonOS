@@ -315,8 +315,6 @@ pub fn mm_init() {
     unsafe { allocator_init() };
     // enable mmio
     mmio_init();
-    // 启用printk的alloc选项
-    PrintkWriter.enable_alloc();
 }
 
 unsafe fn allocator_init() {

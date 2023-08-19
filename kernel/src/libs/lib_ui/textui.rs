@@ -29,7 +29,7 @@ pub const TEXTUI_CHAR_WIDTH: u32 = 8;
 
 pub const TEXTUI_CHAR_HEIGHT: u32 = 16;
 
-pub static mut TESTUI_IS_INIT: bool = false;
+pub static mut TEXTUI_IS_INIT: bool = false;
 
 pub static ENABLE_PUT_TO_WINDOW: AtomicBool = AtomicBool::new(true);
 
@@ -203,6 +203,10 @@ impl FontColor {
     pub const GREEN: FontColor = FontColor::new(0, 0xff, 0);
     pub const WHITE: FontColor = FontColor::new(0xff, 0xff, 0xff);
     pub const BLACK: FontColor = FontColor::new(0, 0, 0);
+    pub const YELLOW: FontColor = FontColor::new(0xff, 0xff, 0);
+    pub const ORANGE: FontColor = FontColor::new(0xff, 0x80, 0);
+    pub const INDIGO: FontColor = FontColor::new(0x00, 0xff, 0xff);
+    pub const PURPLE: FontColor = FontColor::new(0x80, 0x00, 0xff);
 
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         let val = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
@@ -914,7 +918,7 @@ pub fn textui_putchar(
     fr_color: FontColor,
     bk_color: FontColor,
 ) -> Result<(), SystemError> {
-    if unsafe { TESTUI_IS_INIT } {
+    if unsafe { TEXTUI_IS_INIT } {
         return textui_framework()
             .current_window
             .lock()
@@ -950,7 +954,7 @@ fn textui_init() -> Result<i32, SystemError> {
     unsafe { textui_framwork_init() };
     let textui_framework = textui_framework();
 
-    unsafe { TESTUI_IS_INIT = true };
+    unsafe { TEXTUI_IS_INIT = true };
 
     scm_register(Arc::new(textui_framework))?;
 

@@ -1,7 +1,7 @@
 use core::mem::size_of;
 
 const FD_SET_SIZE: usize = 1024;
-const FD_SET_IDX_MASK: usize = size_of::<u8>();
+const FD_SET_IDX_MASK: usize = 8 * size_of::<u8>();
 const FD_SET_BIT_MASK: usize = FD_SET_IDX_MASK - 1;
 const FD_SET_BTYES: usize = (FD_SET_SIZE + FD_SET_BIT_MASK) / FD_SET_IDX_MASK;
 

@@ -4,33 +4,9 @@
 作者: 周瀚杰 <2625553453@qq.com>
 :::
 &emsp;&emsp;屏幕管理器用来管理控制所有ui框架，所有框架都必须先在屏幕管理器中注册才可使用，然后scm控制当前是哪个ui框架在使用
-## 主要数据结构或trait
-### ScmBufferInfo
-&emsp;&emsp;用于储存scm中的ui框架中的帧缓冲区中的信息，定义如下：
-```rust
-#[derive(Debug, Clone)]
-pub struct ScmBufferInfo {
-    width: u32,       // 帧缓冲区宽度（pixel或columns）
-    height: u32,      // 帧缓冲区高度（pixel或lines）
-    size: u32,        // 帧缓冲区大小（bytes）
-    bit_depth: u32,   // 像素点位深度
-    vaddr: usize,     // 指向帧缓冲区的指针
-    flags: ScmBfFlag, // 帧缓冲区标志位
-}
-```
-### ScmUiFrameworkMetadata
-&emsp;&emsp;用于储存scm中的ui框架具体信息，定义如下：
-```rust
-#[derive(Debug, Clone)]
-pub struct ScmUiFrameworkMetadata {
-    pub id: ScmUiFrameworkId,
-    pub name: String,
-    pub f_type: ScmFramworkType,
-    pub buf_info: ScmBufferInfo,
-    pub is_enable: bool,//是否为scm中当前使用的ui框架
-    pub window_max_id: u32,
-}
-```
+
+## traits
+
 ### ScmUiFramework
 &emsp;&emsp;每个要注册到scm中的ui框架都必须实现这个trait中的方法，具体定义如下：
 ```rust

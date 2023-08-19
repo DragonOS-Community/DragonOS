@@ -9,7 +9,7 @@
  * @param BKcolor 背景色（RGB）
  * @return int
  */
-extern int textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor);
+extern int rs_textui_putchar(uint16_t character, uint32_t FRcolor, uint32_t BKcolor);
 
 /**
  * @brief 初始化text ui框架

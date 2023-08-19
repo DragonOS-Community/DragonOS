@@ -1,7 +1,7 @@
 #pragma once
 #include <common/glib.h>
 #include <stdbool.h>
-#include <libs/libUI/screen_manager.h>
+#include <libs/lib_ui/screen_manager.h>
 extern struct scm_buffer_info_t video_frame_buffer_info;
 /**
  * @brief 重新初始化显示驱动，需先低级初始化才能高级初始化

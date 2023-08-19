@@ -7,7 +7,7 @@ pub mod ffi_convert;
 pub mod int_like;
 pub mod keyboard_parser;
 pub mod lazy_init;
-pub mod libUI;
+pub mod lib_ui;
 pub mod list;
 pub mod lockref;
 pub mod mutex;

@@ -10,7 +10,7 @@ use crate::include::bindings::bindings::{
     multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
 };
 use crate::libs::align::page_align_up;
-use crate::libs::libUI::screen_manager::scm_disable_put_to_window;
+use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 
@@ -397,7 +397,7 @@ unsafe fn allocator_init() {
     kinfo!("Successfully initialized buddy allocator");
     // 关闭显示输出
     scm_disable_put_to_window();
-    
+
     // make the new page table current
     {
         let mut binding = INNER_ALLOCATOR.lock();
@@ -415,7 +415,6 @@ unsafe fn allocator_init() {
         kdebug!("New page table enabled");
     }
     kdebug!("Successfully enabled new page table");
-    
 }
 
 #[no_mangle]

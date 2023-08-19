@@ -1,8 +1,8 @@
 use crate::{
     driver::uart::uart::{c_uart_send, c_uart_send_str, UartPort},
-    include::bindings::bindings::{font_ascii, video_frame_buffer_info},
+    include::bindings::bindings::video_frame_buffer_info,
     kinfo,
-    libs::spinlock::SpinLock,
+    libs::{lib_ui::font::FONT_8x16, spinlock::SpinLock},
     syscall::SystemError,
 };
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};
@@ -240,7 +240,7 @@ impl Into<u64> for FontColor {
 
 #[derive(Clone, Debug, Copy)]
 pub struct TextuiCharChromatic {
-    c: u8,
+    c: Option<char>,
 
     // 前景色
     frcolor: FontColor, // rgb
@@ -282,8 +282,13 @@ impl TextuiBuf<'_> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct Font([u8; 16]);
 impl Font {
-    pub fn get_font(index: usize) -> Font {
-        Self(unsafe { font_ascii[index] })
+    #[inline]
+    pub fn get_font(character: char) -> Font {
+        let x = FONT_8x16.char_map(character);
+
+        let mut data = [0u8; 16];
+        data.copy_from_slice(x);
+        return Font(data);
     }
     pub fn is_frcolor(&self, height: usize, width: usize) -> bool {
         let w = self.0[height];
@@ -293,7 +298,7 @@ impl Font {
 }
 
 impl TextuiCharChromatic {
-    pub fn new(c: u8, frcolor: FontColor, bkcolor: FontColor) -> Self {
+    pub fn new(c: Option<char>, frcolor: FontColor, bkcolor: FontColor) -> Self {
         TextuiCharChromatic {
             c,
             frcolor,
@@ -311,7 +316,8 @@ impl TextuiCharChromatic {
         lineindex: LineIndex,
     ) -> Result<i32, SystemError> {
         // 找到要渲染的字符的像素点数据
-        let font: Font = Font::get_font(self.c as usize);
+
+        let font: Font = Font::get_font(self.c.unwrap_or(' '));
 
         let mut count = TextuiBuf::get_start_index_by_lineid_lineindex(lineid, lineindex);
 
@@ -337,7 +343,7 @@ impl TextuiCharChromatic {
 
     pub fn no_init_textui_render_chromatic(&self, lineid: LineId, lineindex: LineIndex) {
         // 找到要渲染的字符的像素点数据
-        let font = unsafe { font_ascii }[self.c as usize];
+        let font = Font::get_font(self.c.unwrap_or(' '));
 
         //   x 左上角列像素点位置
         //   y 左上角行像素点位置
@@ -364,7 +370,7 @@ impl TextuiCharChromatic {
             for _j in 0..TEXTUI_CHAR_WIDTH {
                 //从左往右逐个测试相应位
                 testbit >>= 1;
-                if (font[i as usize] & testbit as u8) != 0 {
+                if (font.0[i as usize] & testbit as u8) != 0 {
                     unsafe { *addr = self.frcolor.into() }; // 字，显示前景色
                 } else {
                     unsafe { *addr = self.bkcolor.into() }; // 背景色
@@ -401,7 +407,7 @@ impl TextuiVlineChromatic {
 
         for _ in 0..char_num {
             r.chars.push(TextuiCharChromatic::new(
-                0,
+                None,
                 FontColor::BLACK,
                 FontColor::BLACK,
             ));
@@ -487,7 +493,7 @@ impl TextuiWindow {
         vline_id: LineId,
         start: LineIndex,
         count: i32,
-    ) -> Result<i32, SystemError> {
+    ) -> Result<(), SystemError> {
         let actual_line_sum = textui_framework().actual_line.load(Ordering::SeqCst);
 
         // 判断虚拟行参数是否合法
@@ -522,7 +528,7 @@ impl TextuiWindow {
             }
         }
 
-        return Ok(0);
+        return Ok(());
     }
 
     /// 重新渲染某个窗口的某个虚拟行
@@ -531,7 +537,7 @@ impl TextuiWindow {
     /// - window 窗口结构体
     /// - vline_id 虚拟行号
 
-    fn textui_refresh_vline(&mut self, vline_id: LineId) -> Result<i32, SystemError> {
+    fn textui_refresh_vline(&mut self, vline_id: LineId) -> Result<(), SystemError> {
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return self.textui_refresh_characters(
                 vline_id,
@@ -539,7 +545,7 @@ impl TextuiWindow {
                 self.chars_per_line,
             );
         } else {
-            //todo支持纯文本字符
+            //todo支持纯文本字符()
             todo!();
         }
     }
@@ -582,7 +588,7 @@ impl TextuiWindow {
         {
             for i in 0..self.chars_per_line {
                 if let Some(v_char) = vline.chars.get_mut(i as usize) {
-                    v_char.c = 0;
+                    v_char.c = None;
                     v_char.frcolor = FontColor::BLACK;
                     v_char.bkcolor = FontColor::BLACK;
                 }
@@ -615,10 +621,10 @@ impl TextuiWindow {
 
     fn true_textui_putchar_window(
         &mut self,
-        character: u8,
+        character: char,
         frcolor: FontColor,
         bkcolor: FontColor,
-    ) -> Result<i32, SystemError> {
+    ) -> Result<(), SystemError> {
         // 启用彩色字符
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             let mut line_index = LineIndex::new(0); //操作的列号
@@ -628,7 +634,7 @@ impl TextuiWindow {
                 let index = <LineIndex as Into<usize>>::into(vline.index);
 
                 if let Some(v_char) = vline.chars.get_mut(index) {
-                    v_char.c = character;
+                    v_char.c = Some(character);
                     v_char.frcolor = frcolor;
                     v_char.bkcolor = bkcolor;
                 }
@@ -646,7 +652,7 @@ impl TextuiWindow {
             // todo: 支持纯文本字符
             todo!();
         }
-        return Ok(0);
+        return Ok(());
     }
     /// 根据输入的一个字符在窗口上输出
     /// ## 参数
@@ -658,33 +664,38 @@ impl TextuiWindow {
 
     fn textui_putchar_window(
         &mut self,
-        character: u8,
+        character: char,
         frcolor: FontColor,
         bkcolor: FontColor,
         is_enable_window: bool,
-    ) -> Result<i32, SystemError> {
+    ) -> Result<(), SystemError> {
         let actual_line_sum = textui_framework().actual_line.load(Ordering::SeqCst);
 
         //字符'\0'代表ASCII码表中的空字符,表示字符串的结尾
-        if unlikely(character == b'\0') {
-            return Ok(0);
+        if unlikely(character == '\0') {
+            return Ok(());
         }
+
+        if unlikely(character == '\r') {
+            return Ok(());
+        }
+
         // 暂不支持纯文本窗口
         if !self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
-            return Ok(0);
+            return Ok(());
         }
 
         //进行换行操作
-        if character == b'\n' {
+        if character == '\n' {
             // 换行时还需要输出\r
             c_uart_send(UartPort::COM1.to_u16(), b'\r');
             if is_enable_window == true {
                 self.textui_new_line()?;
             }
-            return Ok(0);
+            return Ok(());
         }
         // 输出制表符
-        else if character == b'\t' {
+        else if character == '\t' {
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =
                     &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
@@ -692,14 +703,14 @@ impl TextuiWindow {
                     //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
                     let mut space_to_print = 8 - <LineIndex as Into<usize>>::into(vline.index) % 8;
                     while space_to_print > 0 {
-                        self.true_textui_putchar_window(b' ', frcolor, bkcolor)?;
+                        self.true_textui_putchar_window(' ', frcolor, bkcolor)?;
                         space_to_print -= 1;
                     }
                 }
             }
         }
         // 字符 '\x08' 代表 ASCII 码中的退格字符。它在输出中的作用是将光标向左移动一个位置，并在该位置上输出后续的字符，从而实现字符的删除或替换。
-        else if character == b'\x08' {
+        else if character == '\x08' {
             if is_enable_window == true {
                 let mut tmp = LineIndex(0);
                 if let TextuiVline::Chromatic(vline) =
@@ -715,7 +726,7 @@ impl TextuiWindow {
                         if let Some(v_char) =
                             vline.chars.get_mut(<LineIndex as Into<usize>>::into(tmp))
                         {
-                            v_char.c = b' ';
+                            v_char.c = Some(' ');
 
                             v_char.bkcolor = bkcolor;
                         }
@@ -731,7 +742,7 @@ impl TextuiWindow {
                         vline.index = LineIndex::new(0);
                         for i in 0..self.chars_per_line {
                             if let Some(v_char) = vline.chars.get_mut(i as usize) {
-                                v_char.c = 0;
+                                v_char.c = None;
                                 v_char.frcolor = FontColor::BLACK;
                                 v_char.bkcolor = FontColor::BLACK;
                             }
@@ -757,7 +768,9 @@ impl TextuiWindow {
             }
         } else {
             // 输出其他字符
-            c_uart_send(UartPort::COM1.to_u16(), character);
+
+            c_uart_send(UartPort::COM1.to_u16(), character as u8);
+
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =
                     &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
@@ -771,7 +784,7 @@ impl TextuiWindow {
             }
         }
 
-        return Ok(0);
+        return Ok(());
     }
 }
 impl Default for TextuiWindow {
@@ -862,6 +875,23 @@ impl ScmUiFramework for &mut TextUiFramework {
     }
 }
 
+/// Mapping from characters to glyph indices.
+pub trait GlyphMapping: Sync {
+    /// Maps a character to a glyph index.
+    ///
+    /// If `c` isn't included in the font the index of a suitable replacement glyph is returned.
+    fn index(&self, c: char) -> usize;
+}
+
+impl<F> GlyphMapping for F
+where
+    F: Sync + Fn(char) -> usize,
+{
+    fn index(&self, c: char) -> usize {
+        self(c)
+    }
+}
+
 /// 在默认窗口上输出一个字符
 /// ## 参数
 /// - character 字符
@@ -869,36 +899,40 @@ impl ScmUiFramework for &mut TextUiFramework {
 /// - BKcolor 背景色（RGB）
 
 #[no_mangle]
-pub extern "C" fn textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
-    let result;
+pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
+    return textui_putchar(
+        character as char,
+        FontColor::from(fr_color),
+        FontColor::from(bk_color),
+    )
+    .map(|_| 0)
+    .unwrap_or_else(|e| e.to_posix_errno());
+}
+
+pub fn textui_putchar(
+    character: char,
+    fr_color: FontColor,
+    bk_color: FontColor,
+) -> Result<(), SystemError> {
     if unsafe { TESTUI_IS_INIT } {
-        result = textui_framework()
+        return textui_framework()
             .current_window
             .lock()
             .textui_putchar_window(
                 character,
-                FontColor::from(fr_color),
-                FontColor::from(bk_color),
+                fr_color,
+                bk_color,
                 ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
-            )
-            .unwrap_or_else(|e| e.to_posix_errno());
+            );
     } else {
         //未初始化暴力输出
-        result = no_init_textui_putchar_window(
+        return no_init_textui_putchar_window(
             character,
-            FontColor::from(fr_color),
-            FontColor::from(bk_color),
+            fr_color,
+            bk_color,
             ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
-        )
-        .unwrap_or_else(|e| e.to_posix_errno());
-    }
-    if result.is_negative() {
-        c_uart_send_str(
-            UartPort::COM1.to_u16(),
-            "textui putchar failed.\n\0".as_ptr(),
         );
     }
-    return result;
 }
 
 /// 初始化text ui框架

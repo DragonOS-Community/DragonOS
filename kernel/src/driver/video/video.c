@@ -199,7 +199,7 @@ int video_init()
     char init_text1[] = "Video driver to map.\n";
     for (int i = 0; i < sizeof(init_text1) - 1; ++i)
         c_uart_send(COM1, init_text1[i]);
-    
+
     rs_pseudo_map_phys(video_frame_buffer_info.vaddr, __fb_info.framebuffer_addr, video_frame_buffer_info.size);
 
     io_mfence();

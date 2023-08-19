@@ -38,7 +38,7 @@
 #include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
-#include <libs/libUI/textui.h>
+#include <libs/lib_ui/textui.h>
 #include <mm/mm-types.h>
 #include <mm/mm.h>
 #include <mm/mmio.h>

@@ -14,8 +14,8 @@
 #include "smp/smp.h"
 #include "syscall/syscall.h"
 #include <exception/softirq.h>
-#include <libs/libUI/screen_manager.h>
-#include <libs/libUI/textui.h>
+#include <libs/lib_ui/screen_manager.h>
+#include <libs/lib_ui/textui.h>
 #include <sched/sched.h>
 #include <smp/ipi.h>
 
@@ -71,10 +71,10 @@ void reload_idt()
 void system_initialize()
 {
     c_uart_init(COM1, 115200);
+
     video_init();
+
     scm_init();
-    textui_init();
-    kinfo("Kernel Starting...");
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 
@@ -92,7 +92,6 @@ void system_initialize()
 
     // 初始化中断描述符表
     sys_vector_init();
-
     //  初始化内存管理单元
     // mm_init();
     rs_mm_init();
@@ -101,8 +100,12 @@ void system_initialize()
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
     // 对显示模块进行低级初始化，不启用double buffer
-    scm_reinit();
 
+    io_mfence();
+    scm_reinit();
+    rs_textui_init();
+    // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
+    io_mfence();
     // =========== 重新设置initial_tss[0]的ist
     uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
     ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;

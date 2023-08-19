@@ -287,8 +287,8 @@ ENTRY(_start64)
     loop .fill_pde_64
 
     // 最低级
-    // 循环 512*50=25600 次，填满50页
-    mov $25600, %ecx
+    // 循环 512*25=12800 次，填满25页，共50M
+    mov $12800, %ecx
     mov $__PT_S, %eax
     mov $0x3, %ebx
 .fill_pt_64:
@@ -296,6 +296,14 @@ ENTRY(_start64)
     add $0x1000, %ebx
     add $8, %eax
     loop .fill_pt_64
+
+    // 50-100M填0，共25个页表
+    mov $12800, %ecx
+.fill_pt_64_2:
+    mov $0, 0(%eax)
+    add $8, %eax
+    loop .fill_pt_64_2
+
 
 
 // ==== 加载CR3寄存器

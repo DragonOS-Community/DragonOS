@@ -7,10 +7,10 @@ use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::uart::uart::c_uart_send_str;
 use crate::include::bindings::bindings::{
-    disable_textui, enable_textui, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
-    video_reinitialize,
+    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
 };
 use crate::libs::align::page_align_up;
+use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 
@@ -315,8 +315,6 @@ pub fn mm_init() {
     unsafe { allocator_init() };
     // enable mmio
     mmio_init();
-    // 启用printk的alloc选项
-    PrintkWriter.enable_alloc();
 }
 
 unsafe fn allocator_init() {
@@ -396,9 +394,8 @@ unsafe fn allocator_init() {
     unsafe { set_inner_allocator(buddy_allocator) };
     kinfo!("Successfully initialized buddy allocator");
     // 关闭显示输出
-    unsafe {
-        disable_textui();
-    }
+    scm_disable_put_to_window();
+
     // make the new page table current
     {
         let mut binding = INNER_ALLOCATOR.lock();
@@ -416,16 +413,6 @@ unsafe fn allocator_init() {
         kdebug!("New page table enabled");
     }
     kdebug!("Successfully enabled new page table");
-    // 重置显示输出目标
-    unsafe {
-        video_reinitialize(false);
-    }
-
-    // 打开显示输出
-    unsafe {
-        enable_textui();
-    }
-    kdebug!("Text UI enabled");
 }
 
 #[no_mangle]

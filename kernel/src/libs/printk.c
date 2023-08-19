@@ -5,7 +5,7 @@
 #include <common/printk.h>
 
 #include <common/spinlock.h>
-#include <libs/libUI/textui.h>
+#include <libs/lib_ui/textui.h>
 #include <mm/mm.h>
 
 #include <common/math.h>
@@ -610,7 +610,7 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
     {
         current = *(buf + i);
         // 输出
-        textui_putchar(current, FRcolor, BKcolor);
+        rs_textui_putchar(current, FRcolor, BKcolor);
     }
     io_mfence();
     spin_unlock_irqrestore(&__printk_lock, rflags);

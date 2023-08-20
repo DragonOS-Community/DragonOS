@@ -589,8 +589,16 @@ impl ProcessSchedulerInfo {
         return self.virtual_runtime;
     }
 
+    pub fn set_virtual_runtime(&mut self, virtual_runtime: isize) {
+        self.virtual_runtime = virtual_runtime;
+    }
+
     pub fn rt_time_slice(&self) -> isize {
         return self.rt_time_slice;
+    }
+
+    pub fn set_rt_time_slice(&mut self, rt_time_slice: isize) {
+        self.rt_time_slice = rt_time_slice;
     }
 
     pub fn priority(&self) -> SchedPriority {

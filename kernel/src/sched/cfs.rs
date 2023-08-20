@@ -1,14 +1,13 @@
-use core::{ptr::null_mut, sync::atomic::compiler_fence};
+use core::sync::atomic::compiler_fence;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::current::current_pcb,
-    include::bindings::bindings::{
-        initial_proc_union, process_control_block, MAX_CPU_NUM, PF_NEED_SCHED, PROC_RUNNING,
-    },
+    arch::cpu::current_cpu_id,
+    include::bindings::bindings::MAX_CPU_NUM,
     kBUG,
     libs::{rbtree::RBTree, spinlock::RawSpinlock},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     smp::core::smp_get_processor_id,
 };
 
@@ -41,13 +40,13 @@ struct CFSQueue {
     /// 队列的锁
     lock: RawSpinlock,
     /// 进程的队列
-    queue: RBTree<i64, &'static mut process_control_block>,
+    queue: RBTree<i64, Arc<ProcessControlBlock>>,
     /// 当前核心的队列专属的IDLE进程的pcb
-    idle_pcb: *mut process_control_block,
+    idle_pcb: Arc<ProcessControlBlock>,
 }
 
 impl CFSQueue {
-    pub fn new(idle_pcb: *mut process_control_block) -> CFSQueue {
+    pub fn new(idle_pcb: Arc<ProcessControlBlock>) -> CFSQueue {
         CFSQueue {
             cpu_exec_proc_jiffies: 0,
             lock: RawSpinlock::INIT,
@@ -57,24 +56,25 @@ impl CFSQueue {
     }
 
     /// @brief 将pcb加入队列
-    pub fn enqueue(&mut self, pcb: &'static mut process_control_block) {
+    pub fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
         let mut rflags = 0usize;
         self.lock.lock_irqsave(&mut rflags);
 
         // 如果进程是IDLE进程，那么就不加入队列
-        if pcb.pid == 0 {
+        if pcb.basic().pid().into() == 0 {
             self.lock.unlock_irqrestore(rflags);
             return;
         }
 
-        self.queue.insert(pcb.virtual_runtime, pcb);
+        self.queue
+            .insert(pcb.sched_info().virtual_runtime() as i64, pcb.clone());
 
         self.lock.unlock_irqrestore(rflags);
     }
 
     /// @brief 将pcb从调度队列中弹出,若队列为空，则返回IDLE进程的pcb
-    pub fn dequeue(&mut self) -> &'static mut process_control_block {
-        let res: &'static mut process_control_block;
+    pub fn dequeue(&mut self) -> Arc<ProcessControlBlock> {
+        let res: Arc<ProcessControlBlock>;
         let mut rflags = 0usize;
         self.lock.lock_irqsave(&mut rflags);
         if !self.queue.is_empty() {
@@ -82,7 +82,7 @@ impl CFSQueue {
             res = self.queue.pop_first().unwrap().1;
         } else {
             // 如果队列为空，则返回IDLE进程的pcb
-            res = unsafe { self.idle_pcb.as_mut().unwrap() };
+            res = self.idle_pcb.clone();
         }
         self.lock.unlock_irqrestore(rflags);
         return res;
@@ -93,7 +93,14 @@ impl CFSQueue {
     /// @return Option<i64> 如果队列不为空，那么返回队列中，最小的虚拟运行时间；否则返回None
     pub fn min_vruntime(&self) -> Option<i64> {
         if !self.queue.is_empty() {
-            return Some(self.queue.get_first().unwrap().1.virtual_runtime);
+            return Some(
+                self.queue
+                    .get_first()
+                    .unwrap()
+                    .1
+                    .sched_info()
+                    .virtual_runtime() as i64,
+            );
         } else {
             return None;
         }
@@ -117,14 +124,13 @@ impl SchedulerCFS {
             cpu_queue: Default::default(),
         };
 
-        // 为每个cpu核心创建队列
-        for _ in 0..MAX_CPU_NUM {
+        // 为每个cpu核心创建队列，进程重构后可以直接初始化Idle_pcb？
+        for i in 0..MAX_CPU_NUM {
+            let idle_pcb = ProcessManager::idle_pcb()[i as usize].clone();
             result
                 .cpu_queue
-                .push(Box::leak(Box::new(CFSQueue::new(null_mut()))));
+                .push(Box::leak(Box::new(CFSQueue::new(idle_pcb))));
         }
-        // 设置cpu0的pcb
-        result.cpu_queue[0].idle_pcb = unsafe { &mut initial_proc_union.pcb };
 
         return result;
     }
@@ -140,7 +146,11 @@ impl SchedulerCFS {
 
     /// @brief 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间
     pub fn timer_update_jiffies(&mut self) {
-        let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_pcb().cpu_id as usize];
+        let current_cpu_queue: &mut CFSQueue = self.cpu_queue[ProcessManager::current_pcb()
+            .sched_info()
+            .on_cpu()
+            .unwrap_or(current_cpu_id())
+            as usize];
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
         // 更新进程的剩余可执行时间
@@ -148,26 +158,32 @@ impl SchedulerCFS {
         current_cpu_queue.cpu_exec_proc_jiffies -= 1;
         // 时间片耗尽，标记需要被调度
         if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
-            current_pcb().flags |= PF_NEED_SCHED as u64;
+            ProcessManager::current_pcb()
+                .flags()
+                .insert(ProcessFlags::NEED_SCHEDULE);
         }
         current_cpu_queue.lock.unlock();
 
         // 更新当前进程的虚拟运行时间
-        current_pcb().virtual_runtime += 1;
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_virtual_runtime(ProcessManager::current_pcb().sched_info().virtual_runtime() + 1);
     }
 
     /// @brief 将进程加入cpu的cfs调度队列，并且重设其虚拟运行时间为当前队列的最小值
-    pub fn enqueue_reset_vruntime(&mut self, pcb: &'static mut process_control_block) {
-        let cpu_queue = &mut self.cpu_queue[pcb.cpu_id as usize];
+    pub fn enqueue_reset_vruntime(&mut self, pcb: Arc<ProcessControlBlock>) {
+        let cpu_queue =
+            &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()) as usize];
         if cpu_queue.queue.len() > 0 {
-            pcb.virtual_runtime = cpu_queue.min_vruntime().unwrap();
+            pcb.sched_info_mut()
+                .set_virtual_runtime(cpu_queue.min_vruntime().unwrap() as isize)
         }
 
         cpu_queue.enqueue(pcb);
     }
 
     /// @brief 设置cpu的队列的IDLE进程的pcb
-    pub fn set_cpu_idle(&mut self, cpu_id: usize, pcb: *mut process_control_block) {
+    pub fn set_cpu_idle(&mut self, cpu_id: usize, pcb: Arc<ProcessControlBlock>) {
         // kdebug!("set cpu idle: id={}", cpu_id);
         self.cpu_queue[cpu_id].idle_pcb = pcb;
     }
@@ -180,31 +196,42 @@ impl SchedulerCFS {
 impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
-    fn sched(&mut self) -> Option<&'static mut process_control_block> {
-        current_pcb().flags &= !(PF_NEED_SCHED as u64);
+    fn sched(&mut self) -> Option<Arc<ProcessControlBlock>> {
+        ProcessManager::current_pcb()
+            .flags()
+            .remove(ProcessFlags::NEED_SCHEDULE);
 
         let current_cpu_id = smp_get_processor_id() as usize;
 
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
 
-        let proc: &'static mut process_control_block = current_cpu_queue.dequeue();
+        let proc: Arc<ProcessControlBlock> = current_cpu_queue.dequeue();
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果当前不是running态，或者当前进程的虚拟运行时间大于等于下一个进程的，那就需要切换。
-        if (current_pcb().state & (PROC_RUNNING as u64)) == 0
-            || current_pcb().virtual_runtime >= proc.virtual_runtime
+        if !matches!(
+            ProcessManager::current_pcb().sched_info().state(),
+            ProcessState::Runnable
+        ) || ProcessManager::current_pcb().sched_info().virtual_runtime()
+            >= proc.sched_info().virtual_runtime()
         {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
-            if current_pcb().state & (PROC_RUNNING as u64) != 0 {
-                sched_enqueue(current_pcb(), false);
+            if matches!(
+                ProcessManager::current_pcb().sched_info().state(),
+                ProcessState::Runnable
+            ) {
+                sched_enqueue(ProcessManager::current_pcb(), false);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 设置进程可以执行的时间
             if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
-                SchedulerCFS::update_cpu_exec_proc_jiffies(proc.priority, current_cpu_queue);
+                SchedulerCFS::update_cpu_exec_proc_jiffies(
+                    proc.sched_info().priority().data() as i64,
+                    current_cpu_queue,
+                );
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -216,7 +243,10 @@ impl Scheduler for SchedulerCFS {
             // 设置进程可以执行的时间
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
-                SchedulerCFS::update_cpu_exec_proc_jiffies(proc.priority, current_cpu_queue);
+                SchedulerCFS::update_cpu_exec_proc_jiffies(
+                    proc.sched_info().priority().data() as i64,
+                    current_cpu_queue,
+                );
                 // kdebug!("cpu:{:?}",current_cpu_id);
             }
 
@@ -229,8 +259,9 @@ impl Scheduler for SchedulerCFS {
         return None;
     }
 
-    fn enqueue(&mut self, pcb: &'static mut process_control_block) {
-        let cpu_queue = &mut self.cpu_queue[pcb.cpu_id as usize];
+    fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
+        let cpu_queue =
+            &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()) as usize];
         cpu_queue.enqueue(pcb);
     }
 }

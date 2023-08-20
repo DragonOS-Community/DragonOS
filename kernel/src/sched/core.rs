@@ -1,22 +1,24 @@
 use core::sync::atomic::compiler_fence;
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::current::current_pcb,
+    arch::{asm::current::current_pcb, cpu::current_cpu_id},
     include::bindings::bindings::smp_get_total_cpu,
     include::bindings::bindings::{
-        process_control_block, MAX_CPU_NUM, PF_NEED_MIGRATE, PROC_RUNNING, SCHED_FIFO,
-        SCHED_NORMAL, SCHED_RR,
+        process_control_block, MAX_CPU_NUM, PF_NEED_MIGRATE, SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
     },
     kinfo,
     mm::percpu::PerCpu,
-    process::{AtomicPid, Pid},
+    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags},
     syscall::SystemError,
 };
 
-use super::cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler};
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
+use super::{
+    cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler},
+    SchedPolicy,
+};
 
 lazy_static! {
     /// 记录每个cpu上正在执行的进程的pid
@@ -42,13 +44,13 @@ pub fn get_cpu_loads(cpu_id: u32) -> u32 {
     return (len_rt + len_cfs) as u32;
 }
 // 负载均衡
-pub fn loads_balance(pcb: &mut process_control_block) {
+pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
     // 对pcb的迁移情况进行调整
     // 获取总的CPU数量
     let cpu_num = unsafe { smp_get_total_cpu() };
     // 获取当前负载最小的CPU的id
-    let mut min_loads_cpu_id = pcb.cpu_id;
-    let mut min_loads = get_cpu_loads(pcb.cpu_id);
+    let mut min_loads_cpu_id = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+    let mut min_loads = get_cpu_loads(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()));
     for cpu_id in 0..cpu_num {
         let tmp_cpu_loads = get_cpu_loads(cpu_id);
         if min_loads - tmp_cpu_loads > 0 {
@@ -59,29 +61,31 @@ pub fn loads_balance(pcb: &mut process_control_block) {
 
     // 将当前pcb迁移到负载最小的CPU
     // 如果当前pcb的PF_NEED_MIGRATE已经置位，则不进行迁移操作
-    if (min_loads_cpu_id != pcb.cpu_id) && (pcb.flags & (PF_NEED_MIGRATE as u64)) == 0 {
+    if (min_loads_cpu_id != pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()))
+        && pcb.flags().contains(ProcessFlags::NEED_MIGRATE)
+    {
         // sched_migrate_process(pcb, min_loads_cpu_id as usize);
-        pcb.flags |= PF_NEED_MIGRATE as u64;
-        pcb.migrate_to = min_loads_cpu_id;
+        pcb.flags().insert(ProcessFlags::NEED_MIGRATE);
+        pcb.sched_info_mut().set_migrate_to(Some(min_loads_cpu_id));
         // kdebug!("set migrating, pcb:{:?}", pcb);
     }
 }
 /// @brief 具体的调度器应当实现的trait
 pub trait Scheduler {
     /// @brief 使用该调度器发起调度的时候，要调用的函数
-    fn sched(&mut self) -> Option<&'static mut process_control_block>;
+    fn sched(&mut self) -> Option<Arc<ProcessControlBlock>>;
 
     /// @brief 将pcb加入这个调度器的调度队列
-    fn enqueue(&mut self, pcb: &'static mut process_control_block);
+    fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>);
 }
 
-pub fn do_sched() -> Option<&'static mut process_control_block> {
+pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    let next: &'static mut process_control_block;
+    let next: Arc<ProcessControlBlock>;
     match rt_scheduler.pick_next_task_rt(current_pcb().cpu_id) {
         Some(p) => {
             next = p;
@@ -97,46 +101,89 @@ pub fn do_sched() -> Option<&'static mut process_control_block> {
     }
 }
 
+// c版本代码
+// /// @brief 将进程加入调度队列
+// ///
+// /// @param pcb 要被加入队列的pcb
+// /// @param reset_time 是否重置虚拟运行时间
+// #[allow(dead_code)]
+// #[no_mangle]
+// pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut reset_time: bool) {
+//     compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+//     // 调度器不处理running位为0的进程
+//     if pcb.state & (PROC_RUNNING as u64) == 0 {
+//         return;
+//     }
+//     let cfs_scheduler = __get_cfs_scheduler();
+//     let rt_scheduler = __get_rt_scheduler();
+
+//     // 除了IDLE以外的进程，都进行负载均衡
+//     if pcb.pid > 0 {
+//         loads_balance(pcb);
+//     }
+//     compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+//     if (pcb.flags & (PF_NEED_MIGRATE as u64)) != 0 {
+//         // kdebug!("migrating pcb:{:?}", pcb);
+//         pcb.flags &= !(PF_NEED_MIGRATE as u64);
+//         pcb.cpu_id = pcb.migrate_to;
+//         reset_time = true;
+//     }
+//     compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+//     if pcb.policy == SCHED_NORMAL {
+//         if reset_time {
+//             cfs_scheduler.enqueue_reset_vruntime(pcb);
+//         } else {
+//             cfs_scheduler.enqueue(pcb);
+//         }
+//     } else if pcb.policy == SCHED_FIFO || pcb.policy == SCHED_RR {
+//         rt_scheduler.enqueue(pcb);
+//     } else {
+//         panic!("This policy is not supported at this time");
+//     }
+// }
+
 /// @brief 将进程加入调度队列
 ///
 /// @param pcb 要被加入队列的pcb
 /// @param reset_time 是否重置虚拟运行时间
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut reset_time: bool) {
+pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    // 调度器不处理running位为0的进程
-    if pcb.state & (PROC_RUNNING as u64) == 0 {
-        return;
-    }
+    // 调度器不处理running位为0的进程，pcb重构后处理？
+    // if pcb.state & (PROC_RUNNING as u64) == 0 {
+    //     return;
+    // }
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
 
     // 除了IDLE以外的进程，都进行负载均衡
-    if pcb.pid > 0 {
-        loads_balance(pcb);
+    if pcb.basic().pid().into() > 0 {
+        loads_balance(pcb.clone());
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    if (pcb.flags & (PF_NEED_MIGRATE as u64)) != 0 {
+    if pcb.flags().contains(ProcessFlags::NEED_MIGRATE) {
         // kdebug!("migrating pcb:{:?}", pcb);
-        pcb.flags &= !(PF_NEED_MIGRATE as u64);
-        pcb.cpu_id = pcb.migrate_to;
+        pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
+        pcb.sched_info_mut()
+            .set_on_cpu(pcb.sched_info().migrate_to());
         reset_time = true;
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    if pcb.policy == SCHED_NORMAL {
-        if reset_time {
-            cfs_scheduler.enqueue_reset_vruntime(pcb);
-        } else {
-            cfs_scheduler.enqueue(pcb);
+    match pcb.sched_info().policy() {
+        SchedPolicy::CFS => {
+            if reset_time {
+                cfs_scheduler.enqueue_reset_vruntime(pcb.clone());
+            } else {
+                cfs_scheduler.enqueue(pcb.clone());
+            }
         }
-    } else if pcb.policy == SCHED_FIFO || pcb.policy == SCHED_RR {
-        rt_scheduler.enqueue(pcb);
-    } else {
-        panic!("This policy is not supported at this time");
+        SchedPolicy::FIFO => rt_scheduler.enqueue(pcb.clone()),
+        SchedPolicy::RR => rt_scheduler.enqueue(pcb.clone()),
     }
 }
 

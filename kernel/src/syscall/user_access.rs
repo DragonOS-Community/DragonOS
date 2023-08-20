@@ -147,13 +147,11 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
 #[derive(Debug)]
 pub struct UserBufferWriter<'a> {
     buffer: &'a mut [u8],
-    len: usize,
 }
 
 #[derive(Debug)]
 pub struct UserBufferReader<'a> {
     buffer: &'a [u8],
-    len: usize,
 }
 
 impl<'a> UserBufferReader<'a> {
@@ -169,8 +167,7 @@ impl<'a> UserBufferReader<'a> {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
-            buffer: unsafe { core::slice::from_raw_parts(addr as *const u8, len) },
-            len,
+            buffer: unsafe { core::slice::from_raw_parts(addr as *const u8, len) }
         });
     }
 
@@ -294,8 +291,7 @@ impl<'a> UserBufferWriter<'a> {
         return Ok(Self {
             buffer: unsafe {
                 core::slice::from_raw_parts_mut(addr as *mut u8, len * core::mem::size_of::<U>())
-            },
-            len,
+            }
         });
     }
 
@@ -378,11 +374,9 @@ impl<'a> UserBufferWriter<'a> {
         }
     }
 
-    pub fn get_buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError> {
-        match Self::convert_with_offset(self.buffer, offset) {
-            Err(_) => return Err(SystemError::EINVAL),
-            Ok(buffer) => return Ok(buffer),
-        }
+    pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError> {
+        Ok(Self::convert_with_offset::<T>(self.buffer, offset).map_err(|e|SystemError::EINVAL)?)
+
     }
 
     fn convert_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut [T], SystemError> {

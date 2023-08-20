@@ -653,18 +653,18 @@ impl Syscall {
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
                 let pipefd = args[0] as *mut c_int;
-
                 match UserBufferWriter::new(
                     pipefd,
                     core::mem::size_of::<[c_int; 2]>() as usize,
                     from_user,
                 ) {
                     Err(e) => Err(e),
-                    Ok(mut user_buffer) => match user_buffer.get_buffer::<i32>(0) {
+                    Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
                         Err(e) => Err(e),
                         Ok(pipefd) => Self::pipe(pipefd),
                     },
                 }
+
             }
 
             SYS_UNLINK_AT => {
@@ -862,7 +862,7 @@ impl Syscall {
                 ) {
                     Err(e) => Err(e),
                     Ok(mut user_buffer_writer) => {
-                        match user_buffer_writer.get_buffer::<crate::net::syscall::MsgHdr>(0) {
+                        match user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0) {
                             Err(e) => Err(e),
                             Ok(buffer) => {
                                 let msg = &mut buffer[0];

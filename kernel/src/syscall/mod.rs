@@ -25,6 +25,8 @@ use crate::{
     },
 };
 
+use self::user_access::UserBufferWriter;
+
 pub mod user_access;
 
 #[repr(i32)]
@@ -651,18 +653,18 @@ impl Syscall {
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
                 let pipefd = args[0] as *mut c_int;
-                let virt_pipefd = VirtAddr::new(pipefd as usize);
-                if from_user
-                    && verify_area(virt_pipefd, core::mem::size_of::<[c_int; 2]>() as usize)
-                        .is_err()
-                {
-                    Err(SystemError::EFAULT)
-                } else if pipefd.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let pipefd = unsafe { core::slice::from_raw_parts_mut(pipefd, 2) };
-                    Self::pipe(pipefd)
+                match UserBufferWriter::new(
+                    pipefd,
+                    core::mem::size_of::<[c_int; 2]>() as usize,
+                    from_user,
+                ) {
+                    Err(e) => Err(e),
+                    Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
+                        Err(e) => Err(e),
+                        Ok(pipefd) => Self::pipe(pipefd),
+                    },
                 }
+
             }
 
             SYS_UNLINK_AT => {
@@ -853,27 +855,21 @@ impl Syscall {
             SYS_RECVMSG => {
                 let msg = args[1] as *mut crate::net::syscall::MsgHdr;
                 let flags = args[2] as u32;
-                let virt_msg = VirtAddr::new(msg as usize);
-                let security_check = || {
-                    // 验证msg的地址是否合法
-                    if verify_area(
-                        virt_msg,
-                        core::mem::size_of::<crate::net::syscall::MsgHdr>() as usize,
-                    )
-                    .is_err()
-                    {
-                        // 地址空间超出了用户空间的范围，不合法
-                        return Err(SystemError::EFAULT);
+                match UserBufferWriter::new(
+                    msg,
+                    core::mem::size_of::<crate::net::syscall::MsgHdr>(),
+                    true,
+                ) {
+                    Err(e) => Err(e),
+                    Ok(mut user_buffer_writer) => {
+                        match user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0) {
+                            Err(e) => Err(e),
+                            Ok(buffer) => {
+                                let msg = &mut buffer[0];
+                                Self::recvmsg(args[0], msg, flags)
+                            }
+                        }
                     }
-                    let msg = unsafe { msg.as_mut() }.ok_or(SystemError::EFAULT)?;
-                    return Ok(msg);
-                };
-                let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    let msg = r.unwrap();
-                    Self::recvmsg(args[0], msg, flags)
                 }
             }
 
@@ -889,32 +885,23 @@ impl Syscall {
             SYS_GETTIMEOFDAY => {
                 let timeval = args[0] as *mut PosixTimeval;
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
-                let virt_timeval = VirtAddr::new(timeval as usize);
-                let virt_timezone_ptr = VirtAddr::new(timezone_ptr as usize);
-                let security_check = || {
-                    if verify_area(virt_timeval, core::mem::size_of::<PosixTimeval>() as usize)
-                        .is_err()
-                    {
-                        return Err(SystemError::EFAULT);
-                    }
-                    if verify_area(
-                        virt_timezone_ptr,
-                        core::mem::size_of::<PosixTimeZone>() as usize,
-                    )
-                    .is_err()
-                    {
-                        return Err(SystemError::EFAULT);
-                    }
-                    return Ok(());
-                };
-                let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    if !timeval.is_null() {
-                        Self::gettimeofday(timeval, timezone_ptr)
-                    } else {
-                        Err(SystemError::EFAULT)
+                match UserBufferWriter::new(timeval, core::mem::size_of::<PosixTimeval>(), true) {
+                    Err(e) => Err(e),
+                    Ok(_) => {
+                        match UserBufferWriter::new(
+                            timezone_ptr,
+                            core::mem::size_of::<PosixTimeZone>(),
+                            true,
+                        ) {
+                            Err(e) => Err(e),
+                            Ok(_) => {
+                                if !timeval.is_null() {
+                                    Self::gettimeofday(timeval, timezone_ptr)
+                                } else {
+                                    Err(SystemError::EFAULT)
+                                }
+                            }
+                        }
                     }
                 }
             }

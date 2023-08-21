@@ -136,11 +136,7 @@ impl SchedulerCFS {
 
     /// @brief 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间
     pub fn timer_update_jiffies(&mut self) {
-        let current_cpu_queue: &mut CFSQueue = self.cpu_queue[ProcessManager::current_pcb()
-            .sched_info()
-            .on_cpu()
-            .unwrap_or(current_cpu_id())
-            as usize];
+        let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id() as usize];
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
         // 更新进程的剩余可执行时间

@@ -10,7 +10,7 @@ use crate::{
     },
     kinfo,
     mm::percpu::PerCpu,
-    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags},
+    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
     syscall::SystemError,
 };
 
@@ -49,8 +49,8 @@ pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
     // 获取总的CPU数量
     let cpu_num = unsafe { smp_get_total_cpu() };
     // 获取当前负载最小的CPU的id
-    let mut min_loads_cpu_id = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-    let mut min_loads = get_cpu_loads(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()));
+    let mut min_loads_cpu_id = current_cpu_id();
+    let mut min_loads = get_cpu_loads(current_cpu_id());
     for cpu_id in 0..cpu_num {
         let tmp_cpu_loads = get_cpu_loads(cpu_id);
         if min_loads - tmp_cpu_loads > 0 {
@@ -59,12 +59,13 @@ pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
         }
     }
 
+    let pcb_cpu = pcb.sched_info().on_cpu();
     // 将当前pcb迁移到负载最小的CPU
     // 如果当前pcb的PF_NEED_MIGRATE已经置位，则不进行迁移操作
-    if (min_loads_cpu_id != pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()))
-        && pcb.flags().contains(ProcessFlags::NEED_MIGRATE)
+    if pcb_cpu.is_none()
+        || (min_loads_cpu_id != pcb_cpu.unwrap()
+            && !pcb.flags().contains(ProcessFlags::NEED_MIGRATE))
     {
-        // sched_migrate_process(pcb, min_loads_cpu_id as usize);
         pcb.flags().insert(ProcessFlags::NEED_MIGRATE);
         pcb.sched_info_mut().set_migrate_to(Some(min_loads_cpu_id));
         // kdebug!("set migrating, pcb:{:?}", pcb);
@@ -86,7 +87,7 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     let next: Arc<ProcessControlBlock>;
-    match rt_scheduler.pick_next_task_rt(current_pcb().cpu_id) {
+    match rt_scheduler.pick_next_task_rt(current_cpu_id()) {
         Some(p) => {
             next = p;
             // kdebug!("next pcb is {}",next.pid);
@@ -130,7 +131,6 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     if pcb.basic().pid().into() > 0 {
         loads_balance(pcb.clone());
     }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     if pcb.flags().contains(ProcessFlags::NEED_MIGRATE) {
         // kdebug!("migrating pcb:{:?}", pcb);
@@ -139,7 +139,8 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
             .set_on_cpu(pcb.sched_info().migrate_to());
         reset_time = true;
     }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+    assert!(pcb.sched_info().on_cpu().is_some());
 
     match pcb.sched_info().policy() {
         SchedPolicy::CFS => {
@@ -149,8 +150,7 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
                 cfs_scheduler.enqueue(pcb.clone());
             }
         }
-        SchedPolicy::FIFO => rt_scheduler.enqueue(pcb.clone()),
-        SchedPolicy::RR => rt_scheduler.enqueue(pcb.clone()),
+        SchedPolicy::FIFO | SchedPolicy::RR => rt_scheduler.enqueue(pcb.clone()),
     }
 }
 
@@ -171,36 +171,13 @@ pub extern "C" fn sched_init() {
 #[allow(dead_code)]
 #[no_mangle]
 pub extern "C" fn sched_update_jiffies() {
-    match current_pcb().policy {
-        SCHED_NORMAL => {
+    let policy = ProcessManager::current_pcb().sched_info().policy();
+    match policy {
+        SchedPolicy::CFS => {
             __get_cfs_scheduler().timer_update_jiffies();
         }
-        SCHED_FIFO | SCHED_RR => {
-            current_pcb().rt_time_slice -= 1;
-        }
-        _ => {
-            todo!()
+        SchedPolicy::FIFO | SchedPolicy::RR => {
+            __get_rt_scheduler().timer_update_jiffies();
         }
     }
-}
-
-/// @brief 设置进程需要等待迁移到另一个cpu核心。
-/// 当进程被重新加入队列时，将会更新其cpu_id,并加入正确的队列
-///
-/// @return i32 成功返回0,否则返回posix错误码
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn sched_migrate_process(
-    pcb: &'static mut process_control_block,
-    target: usize,
-) -> i32 {
-    if target > MAX_CPU_NUM.try_into().unwrap() {
-        // panic!("sched_migrate_process: target > MAX_CPU_NUM");
-        return SystemError::EINVAL.to_posix_errno();
-    }
-
-    pcb.flags |= PF_NEED_MIGRATE as u64;
-    pcb.migrate_to = target as u32;
-    // kdebug!("pid:{} migrate to cpu:{}", pcb.pid, target);
-    return 0;
 }

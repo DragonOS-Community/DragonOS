@@ -3,7 +3,7 @@ use core::{
     intrinsics::unlikely,
     mem::ManuallyDrop,
     ptr::null_mut,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -539,9 +539,9 @@ pub struct ProcessSchedulerInfo {
     /// 进程的调度优先级
     priority: SchedPriority,
     /// 当前进程的虚拟运行时间
-    virtual_runtime: isize,
+    virtual_runtime: AtomicIsize,
     /// 由实时调度器管理的时间片
-    rt_time_slice: isize,
+    rt_time_slice: AtomicIsize,
 }
 
 impl ProcessSchedulerInfo {
@@ -551,8 +551,8 @@ impl ProcessSchedulerInfo {
             migrate_to: None,
             state: ProcessState::Blocked(false),
             sched_policy: SchedPolicy::CFS,
-            virtual_runtime: 0,
-            rt_time_slice: 0,
+            virtual_runtime: AtomicIsize::new(0),
+            rt_time_slice: AtomicIsize::new(0),
             priority: SchedPriority::new(100).unwrap(),
         });
     }
@@ -586,19 +586,27 @@ impl ProcessSchedulerInfo {
     }
 
     pub fn virtual_runtime(&self) -> isize {
-        return self.virtual_runtime;
+        return self.virtual_runtime.load(Ordering::SeqCst);
     }
 
-    pub fn set_virtual_runtime(&mut self, virtual_runtime: isize) {
-        self.virtual_runtime = virtual_runtime;
+    pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
+        self.virtual_runtime
+            .store(virtual_runtime, Ordering::SeqCst);
+    }
+    pub fn increase_virtual_runtime(&self, delta: isize) {
+        self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
     }
 
     pub fn rt_time_slice(&self) -> isize {
-        return self.rt_time_slice;
+        return self.rt_time_slice.load(Ordering::SeqCst);
     }
 
-    pub fn set_rt_time_slice(&mut self, rt_time_slice: isize) {
-        self.rt_time_slice = rt_time_slice;
+    pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
+        self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
+    }
+
+    pub fn increase_rt_time_slice(&self, delta: isize) {
+        self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
     }
 
     pub fn priority(&self) -> SchedPriority {

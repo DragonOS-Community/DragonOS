@@ -93,8 +93,8 @@ pub struct SchedulerRT {
 }
 
 impl SchedulerRT {
-    const RR_TIMESLICE: i64 = 100;
-    const MAX_RT_PRIO: i64 = 100;
+    const RR_TIMESLICE: isize = 100;
+    const MAX_RT_PRIO: isize = 100;
 
     pub fn new() -> SchedulerRT {
         // 暂时手动指定核心数目
@@ -151,9 +151,16 @@ impl SchedulerRT {
     }
 
     pub fn enqueue_front(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let cpu_id = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()) as usize;
+        let cpu_id = current_cpu_id() as usize;
         let priority = pcb.sched_info().priority().data() as usize;
+
         self.cpu_queue[cpu_id][priority].enqueue_front(pcb);
+    }
+
+    pub fn timer_update_jiffies(&self) {
+        ProcessManager::current_pcb()
+            .sched_info()
+            .increase_rt_time_slice(-1);
     }
 }
 
@@ -165,10 +172,7 @@ impl Scheduler for SchedulerRT {
             .flags()
             .remove(ProcessFlags::NEED_SCHEDULE);
         // 正常流程下，这里一定是会pick到next的pcb的，如果是None的话，要抛出错误
-        let cpu_id = ProcessManager::current_pcb()
-            .sched_info()
-            .on_cpu()
-            .unwrap_or(current_cpu_id());
+        let cpu_id = current_cpu_id();
         let proc: Arc<ProcessControlBlock> =
             self.pick_next_task_rt(cpu_id).expect("No RT process found");
         let priority = proc.sched_info().priority();
@@ -197,7 +201,7 @@ impl Scheduler for SchedulerRT {
                 {
                     // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
                     if proc.sched_info().rt_time_slice() <= 0 {
-                        proc.sched_info_mut()
+                        proc.sched_info()
                             .set_rt_time_slice(SchedulerRT::RR_TIMESLICE as isize);
                         proc.flags().insert(ProcessFlags::NEED_SCHEDULE);
                         sched_enqueue(proc, false);
@@ -221,21 +225,9 @@ impl Scheduler for SchedulerRT {
     }
 
     fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let cpu_id = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-        let cpu_queue =
-            &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()) as usize];
-        cpu_queue[cpu_id as usize].enqueue(pcb);
-        // // 获取当前时间
-        // let time = unsafe { _rdtsc() };
-        // let freq = unsafe { Cpu_tsc_freq };
-        // // kdebug!("this is timeeeeeeer {},freq is {}, {}", time, freq, cpu_id);
-        // // 将当前时间加入负载记录队列
-        // self.load_list[cpu_id as usize].push_back(time);
-        // // 如果队首元素与当前时间差超过设定值，则移除队首元素
-        // while self.load_list[cpu_id as usize].len() > 1
-        //     && (time - *self.load_list[cpu_id as usize].front().unwrap() > 10000000000)
-        // {
-        //     self.load_list[cpu_id as usize].pop_front();
-        // }
+        let cpu_id = pcb.sched_info().on_cpu().unwrap();
+        let cpu_queue = &mut self.cpu_queue[cpu_id as usize];
+        let priority = pcb.sched_info().priority().data() as usize;
+        cpu_queue[priority].enqueue(pcb);
     }
 }

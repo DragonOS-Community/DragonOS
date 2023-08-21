@@ -156,18 +156,17 @@ impl SchedulerCFS {
 
         // 更新当前进程的虚拟运行时间
         ProcessManager::current_pcb()
-            .sched_info_mut()
-            .set_virtual_runtime(ProcessManager::current_pcb().sched_info().virtual_runtime() + 1);
+            .sched_info()
+            .increase_virtual_runtime(1);
     }
 
     /// @brief 将进程加入cpu的cfs调度队列，并且重设其虚拟运行时间为当前队列的最小值
     pub fn enqueue_reset_vruntime(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let cpu_queue =
-            &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()) as usize];
+        let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
         let queue = cpu_queue.locked_queue.lock();
         if queue.len() > 0 {
-            pcb.sched_info_mut()
-                .set_virtual_runtime(CFSQueue::min_vruntime(&queue).unwrap() as isize)
+            pcb.sched_info()
+                .set_virtual_runtime(CFSQueue::min_vruntime(&queue).unwrap_or(0) as isize)
         }
         drop(queue);
         cpu_queue.enqueue(pcb);
@@ -252,8 +251,7 @@ impl Scheduler for SchedulerCFS {
     }
 
     fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let cpu_queue =
-            &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()) as usize];
+        let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
         cpu_queue.enqueue(pcb);
     }
 }

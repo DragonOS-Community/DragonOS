@@ -154,6 +154,7 @@ pub struct UserBufferReader<'a> {
     buffer: &'a [u8],
 }
 
+#[allow(dead_code)]
 impl<'a> UserBufferReader<'a> {
     /// 构造一个指向用户空间位置的BufferReader，为了兼容类似传入 *const u8 的情况，使用单独的泛型来进行初始化
     ///
@@ -167,7 +168,7 @@ impl<'a> UserBufferReader<'a> {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
-            buffer: unsafe { core::slice::from_raw_parts(addr as *const u8, len) }
+            buffer: unsafe { core::slice::from_raw_parts(addr as *const u8, len) },
         });
     }
 
@@ -177,10 +178,7 @@ impl<'a> UserBufferReader<'a> {
     /// @return 返回用户空间数据的切片(对单个结构体就返回长度为一的切片)
     ///
     pub fn read_from_user<T>(&self, offset: usize) -> Result<&[T], SystemError> {
-        match self.convert_with_offset(&self.buffer, offset) {
-            Err(e) => return Err(e),
-            Ok(data) => return Ok(data),
-        }
+        return self.convert_with_offset(&self.buffer, offset);
     }
     /// 从用户空间读取一个指定偏移量的数据(到变量中)
     ///
@@ -188,10 +186,7 @@ impl<'a> UserBufferReader<'a> {
     /// @return 返回用户空间数据的引用
     ///    
     pub fn read_one_from_user<T>(&self, offset: usize) -> Result<&T, SystemError> {
-        match self.convert_one_with_offset(&self.buffer, offset) {
-            Err(e) => Err(e),
-            Ok(data) => Ok(data),
-        }
+        return self.convert_one_with_offset(&self.buffer, offset);
     }
 
     /// 从用户空间拷贝数据(到指定地址中)
@@ -204,12 +199,8 @@ impl<'a> UserBufferReader<'a> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        match self.convert_with_offset(&self.buffer, offset) {
-            Err(e) => return Err(e),
-            Ok(data) => {
-                dst.copy_from_slice(data);
-            }
-        }
+        let data = self.convert_with_offset(&self.buffer, offset)?;
+        dst.copy_from_slice(data);
         return Ok(dst.len());
     }
 
@@ -223,13 +214,9 @@ impl<'a> UserBufferReader<'a> {
         dst: &mut T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        match self.convert_one_with_offset::<T>(&self.buffer, offset) {
-            Err(e) => return Err(e),
-            Ok(data) => {
-                dst.clone_from(data);
-                return Ok(());
-            }
-        }
+        let data = self.convert_one_with_offset::<T>(&self.buffer, offset)?;
+        dst.clone_from(data);
+        return Ok(());
     }
 
     fn convert_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&[T], SystemError> {
@@ -237,13 +224,10 @@ impl<'a> UserBufferReader<'a> {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &[u8] = &src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
+        if byte_buffer.len() % core::mem::size_of::<T>() != 0 || byte_buffer.is_empty() {
             return Err(SystemError::EINVAL);
         }
-        // let (prefix, chunks, suffix) = unsafe { byte_buffer.align_to::<T>() };
-        // if !prefix.is_empty() || !suffix.is_empty() {
-        //     return Err(SystemError::EINVAL);
-        // }
+
         let chunks = unsafe {
             from_raw_parts(
                 byte_buffer.as_ptr() as *const T,
@@ -254,23 +238,18 @@ impl<'a> UserBufferReader<'a> {
     }
 
     fn convert_one_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&T, SystemError> {
-        if offset >= src.len() {
+        if offset + core::mem::size_of::<T>() > src.len() {
             return Err(SystemError::EINVAL);
         }
-        let byte_buffer: &[u8] = &src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
-            return Err(SystemError::EINVAL);
-        }
-        // let (prefix, chunks, suffix) = unsafe { byte_buffer.align_to::<T>() };
-        // if !prefix.is_empty() || !suffix.is_empty() {
-        //     return Err(SystemError::EINVAL);
-        // }
+        let byte_buffer: &[u8] = &src[offset..offset + core::mem::size_of::<T>()];
+
         let chunks = unsafe { from_raw_parts(byte_buffer.as_ptr() as *const T, 1) };
         let data = &chunks[0];
         return Ok(data);
     }
 }
 
+#[allow(dead_code)]
 impl<'a> UserBufferWriter<'a> {
     /// 构造一个指向用户空间位置的BufferWriter
     ///
@@ -291,47 +270,8 @@ impl<'a> UserBufferWriter<'a> {
         return Ok(Self {
             buffer: unsafe {
                 core::slice::from_raw_parts_mut(addr as *mut u8, len * core::mem::size_of::<U>())
-            }
+            },
         });
-    }
-
-    /// 从结构体写入数据到用户空间
-    ///
-    /// @param data 要写入的数据(如果是单个对象，也封装成只有一个元素的切片)
-    /// @return Result<(), SystemError>
-    ///
-    pub fn write_to_user<T: core::marker::Copy>(
-        &mut self,
-        data: &[T],
-        offset: usize,
-    ) -> Result<(), SystemError> {
-        match Self::convert_with_offset(self.buffer, offset) {
-            Err(e) => Err(e),
-            Ok(dst) => {
-                dst.copy_from_slice(data);
-                return Ok(());
-            }
-        }
-    }
-
-    /// 从结构体写入单个数据到用户空间
-    ///
-    /// @param data 要写入的数据
-    /// @param offset 在UserBuffer中的字节偏移量
-    /// @return Result<(), SystemError>
-    ///
-    pub fn write_one_to_user<T: core::marker::Copy>(
-        &'a mut self,
-        data: &T,
-        offset: usize,
-    ) -> Result<(), SystemError> {
-        match Self::convert_one_with_offset::<T>(self.buffer, offset) {
-            Err(e) => Err(e),
-            Ok(dst) => {
-                dst.clone_from(data);
-                return Ok(());
-            }
-        }
     }
 
     /// 从指定地址写入数据到用户空间
@@ -345,13 +285,9 @@ impl<'a> UserBufferWriter<'a> {
         src: &'a [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        match Self::convert_with_offset(self.buffer, offset) {
-            Err(_) => return Err(SystemError::EINVAL),
-            Ok(dst) => {
-                dst.copy_from_slice(&src);
-                return Ok(src.len());
-            }
-        }
+        let dst = Self::convert_with_offset(self.buffer, offset)?;
+        dst.copy_from_slice(&src);
+        return Ok(src.len());
     }
 
     /// 从指定地址写入一个数据到用户空间
@@ -365,18 +301,13 @@ impl<'a> UserBufferWriter<'a> {
         src: &'a T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        match Self::convert_one_with_offset::<T>(self.buffer, offset) {
-            Err(_) => return Err(SystemError::EINVAL),
-            Ok(dst) => {
-                dst.clone_from(src);
-                return Ok(());
-            }
-        }
+        let dst = Self::convert_one_with_offset::<T>(self.buffer, offset)?;
+        dst.clone_from(src);
+        return Ok(());
     }
 
     pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError> {
-        Ok(Self::convert_with_offset::<T>(self.buffer, offset).map_err(|e|SystemError::EINVAL)?)
-
+        Ok(Self::convert_with_offset::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)?)
     }
 
     fn convert_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut [T], SystemError> {
@@ -384,13 +315,10 @@ impl<'a> UserBufferWriter<'a> {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &mut [u8] = &mut src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
+        if byte_buffer.len() % core::mem::size_of::<T>() != 0 || byte_buffer.is_empty() {
             return Err(SystemError::EINVAL);
         }
-        // let (prefix, chunks, suffix) = unsafe { byte_buffer.align_to_mut::<T>() };
-        // if !prefix.is_empty() || !suffix.is_empty() {
-        //     return Err(SystemError::EINVAL);
-        // }
+
         let chunks = unsafe {
             from_raw_parts_mut(
                 byte_buffer.as_mut_ptr() as *mut T,
@@ -399,18 +327,13 @@ impl<'a> UserBufferWriter<'a> {
         };
         return Ok(chunks);
     }
+    
     fn convert_one_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut T, SystemError> {
-        if offset >= src.len() {
+        if offset + core::mem::size_of::<T>() > src.len() {
             return Err(SystemError::EINVAL);
         }
-        let byte_buffer: &mut [u8] = &mut src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
-            return Err(SystemError::EINVAL);
-        }
-        // let (prefix, chunks, suffix) = unsafe { byte_buffer.align_to_mut::<T>() };
-        // if !prefix.is_empty() || !suffix.is_empty() {
-        //     return Err(SystemError::EINVAL);
-        // }
+        let byte_buffer: &mut [u8] = &mut src[offset..offset + core::mem::size_of::<T>()];
+
         let chunks = unsafe { from_raw_parts_mut(byte_buffer.as_mut_ptr() as *mut T, 1) };
         let data = &mut chunks[0];
         return Ok(data);

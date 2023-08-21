@@ -1,12 +1,11 @@
 use crate::{
     arch::asm::current::current_pcb,
+    filesystem::vfs::PollStatus,
     include::bindings::bindings::PROC_MAX_FD_NUM,
     mm::{verify_area, VirtAddr},
     syscall::{Syscall, SystemError},
     time::TimeSpec,
 };
-
-use super::vfs::PollStatus;
 
 const FD_SET_SIZE: usize = 1024;
 const FD_SET_IDX_MASK: usize = 8 * core::mem::size_of::<u64>();
@@ -98,7 +97,7 @@ impl FdSetBits {
         };
 
         let vaddr = VirtAddr::new(usr_addr as usize);
-        verify_area(vaddr, core::mem::size_of::<FdSet>()).map_err(|_| SystemError::EINVAL)?;
+        verify_area(vaddr, core::mem::size_of::<FdSet>())?;
         if !src.is_null() {
             unsafe {
                 core::ptr::copy(src, dst, 1);
@@ -115,9 +114,12 @@ impl FdSetBits {
         outp: *const FdSet,
         exp: *const FdSet,
     ) -> Result<(), SystemError> {
-        Self::copy_fd_set(inp, &mut self.lis_in as *mut FdSet, CopyFdSetOp::FromUser)?;
-        Self::copy_fd_set(outp, &mut self.lis_out as *mut FdSet, CopyFdSetOp::FromUser)?;
-        Self::copy_fd_set(exp, &mut self.lis_ex as *mut FdSet, CopyFdSetOp::FromUser)?;
+        Self::copy_fd_set(inp, &mut self.lis_in as *mut FdSet, CopyFdSetOp::FromUser)
+            .map_err(|_| SystemError::EINVAL)?;
+        Self::copy_fd_set(outp, &mut self.lis_out as *mut FdSet, CopyFdSetOp::FromUser)
+            .map_err(|_| SystemError::EINVAL)?;
+        Self::copy_fd_set(exp, &mut self.lis_ex as *mut FdSet, CopyFdSetOp::FromUser)
+            .map_err(|_| SystemError::EINVAL)?;
         return Ok(());
     }
 
@@ -137,14 +139,28 @@ impl FdSetBits {
 }
 
 impl Syscall {
+    // @brief 系统调用 select 的入口函数
+    ///
+    /// @param n 最大的文件描述符+1
+    // TODO: 将时间复制到内核，增加超时机制
+    pub fn select(
+        n: i32,
+        read_fds: *mut FdSet,
+        write_fds: *mut FdSet,
+        except_fds: *mut FdSet,
+        end_time: TimeSpec,
+    ) -> Result<usize, SystemError> {
+        return Self::core_select(n, read_fds, write_fds, except_fds, None);
+    }
+
     /// @ brief 将用户态的 fd_set 复制到内核空间，在调用 do_select 处理完成后，将获取的 fd_set 复制回用户空间
     ///
-    /// @param n 最大的文件描述符
+    /// @param n 最大的文件描述符+1
     fn core_select(
         mut n: i32,
-        inp: *mut FdSet,
-        outp: *mut FdSet,
-        exp: *mut FdSet,
+        read_fds: *mut FdSet,
+        write_fds: *mut FdSet,
+        except_fds: *mut FdSet,
         end_time: Option<TimeSpec>,
     ) -> Result<usize, SystemError> {
         if n < 0 {
@@ -160,11 +176,11 @@ impl Syscall {
 
         let mut fds = FdSetBits::new();
         // 复制用户的 fd_set 到内核
-        fds.get_fd_sets(n, inp, outp, exp)?;
+        fds.get_fd_sets(n, read_fds, write_fds, except_fds)?;
         // 进入 do_select 处理
         Self::do_select(n, &mut fds, end_time)?;
         // 将结果的 fd_set 复制回用户空间
-        fds.set_fd_sets(n, inp, outp, exp)?;
+        fds.set_fd_sets(n, read_fds, write_fds, except_fds)?;
 
         return Ok(0);
     }
@@ -176,7 +192,7 @@ impl Syscall {
         mut n: i32,
         fds: &mut FdSetBits,
         end_time: Option<TimeSpec>,
-    ) -> Result<i32, SystemError> {
+    ) -> Result<usize, SystemError> {
         // TODO: 如果当前进程已打开的文件描述符表检查目前打开的最大 fd，并修正传入的最大文件描述符数 n
 
         let mut retval = 0;

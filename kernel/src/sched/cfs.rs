@@ -6,7 +6,10 @@ use crate::{
     arch::cpu::current_cpu_id,
     include::bindings::bindings::MAX_CPU_NUM,
     kBUG,
-    libs::{rbtree::RBTree, spinlock::RawSpinlock},
+    libs::{
+        rbtree::RBTree,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     smp::core::smp_get_processor_id,
 };
@@ -37,10 +40,8 @@ pub unsafe fn sched_cfs_init() {
 struct CFSQueue {
     /// 当前cpu上执行的进程剩余的时间片
     cpu_exec_proc_jiffies: i64,
-    /// 队列的锁
-    lock: RawSpinlock,
-    /// 进程的队列
-    queue: RBTree<i64, Arc<ProcessControlBlock>>,
+    /// 自旋锁保护的队列
+    locked_queue: SpinLock<RBTree<i64, Arc<ProcessControlBlock>>>,
     /// 当前核心的队列专属的IDLE进程的pcb
     idle_pcb: Arc<ProcessControlBlock>,
 }
@@ -49,65 +50,54 @@ impl CFSQueue {
     pub fn new(idle_pcb: Arc<ProcessControlBlock>) -> CFSQueue {
         CFSQueue {
             cpu_exec_proc_jiffies: 0,
-            lock: RawSpinlock::INIT,
-            queue: RBTree::new(),
+            locked_queue: SpinLock::new(RBTree::new()),
             idle_pcb: idle_pcb,
         }
     }
 
     /// @brief 将pcb加入队列
     pub fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let mut rflags = 0usize;
-        self.lock.lock_irqsave(&mut rflags);
+        let mut queue = self.locked_queue.lock_irqsave();
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.basic().pid().into() == 0 {
-            self.lock.unlock_irqrestore(rflags);
             return;
         }
 
-        self.queue
-            .insert(pcb.sched_info().virtual_runtime() as i64, pcb.clone());
-
-        self.lock.unlock_irqrestore(rflags);
+        queue.insert(pcb.sched_info().virtual_runtime() as i64, pcb.clone());
     }
 
     /// @brief 将pcb从调度队列中弹出,若队列为空，则返回IDLE进程的pcb
     pub fn dequeue(&mut self) -> Arc<ProcessControlBlock> {
         let res: Arc<ProcessControlBlock>;
-        let mut rflags = 0usize;
-        self.lock.lock_irqsave(&mut rflags);
-        if !self.queue.is_empty() {
+        let mut queue = self.locked_queue.lock_irqsave();
+        if !queue.is_empty() {
             // 队列不为空，返回下一个要执行的pcb
-            res = self.queue.pop_first().unwrap().1;
+            res = queue.pop_first().unwrap().1;
         } else {
             // 如果队列为空，则返回IDLE进程的pcb
             res = self.idle_pcb.clone();
         }
-        self.lock.unlock_irqrestore(rflags);
         return res;
     }
 
     /// @brief 获取cfs队列的最小运行时间
     ///
     /// @return Option<i64> 如果队列不为空，那么返回队列中，最小的虚拟运行时间；否则返回None
-    pub fn min_vruntime(&self) -> Option<i64> {
-        if !self.queue.is_empty() {
-            return Some(
-                self.queue
-                    .get_first()
-                    .unwrap()
-                    .1
-                    .sched_info()
-                    .virtual_runtime() as i64,
-            );
+    pub fn min_vruntime(
+        queue: &SpinLockGuard<RBTree<i64, Arc<ProcessControlBlock>>>,
+    ) -> Option<i64> {
+        if !queue.is_empty() {
+            return Some(queue.get_first().unwrap().1.sched_info().virtual_runtime() as i64);
         } else {
             return None;
         }
     }
     /// 获取运行队列的长度
-    fn get_cfs_queue_size(&mut self) -> usize {
-        return self.queue.len();
+    pub fn get_cfs_queue_size(
+        queue: &SpinLockGuard<RBTree<i64, Arc<ProcessControlBlock>>>,
+    ) -> usize {
+        return queue.len();
     }
 }
 
@@ -154,7 +144,7 @@ impl SchedulerCFS {
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
         // 更新进程的剩余可执行时间
-        current_cpu_queue.lock.lock();
+        let queue = current_cpu_queue.locked_queue.lock();
         current_cpu_queue.cpu_exec_proc_jiffies -= 1;
         // 时间片耗尽，标记需要被调度
         if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
@@ -162,7 +152,7 @@ impl SchedulerCFS {
                 .flags()
                 .insert(ProcessFlags::NEED_SCHEDULE);
         }
-        current_cpu_queue.lock.unlock();
+        drop(queue);
 
         // 更新当前进程的虚拟运行时间
         ProcessManager::current_pcb()
@@ -174,11 +164,12 @@ impl SchedulerCFS {
     pub fn enqueue_reset_vruntime(&mut self, pcb: Arc<ProcessControlBlock>) {
         let cpu_queue =
             &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()) as usize];
-        if cpu_queue.queue.len() > 0 {
+        let queue = cpu_queue.locked_queue.lock();
+        if queue.len() > 0 {
             pcb.sched_info_mut()
-                .set_virtual_runtime(cpu_queue.min_vruntime().unwrap() as isize)
+                .set_virtual_runtime(CFSQueue::min_vruntime(&queue).unwrap() as isize)
         }
-
+        drop(queue);
         cpu_queue.enqueue(pcb);
     }
 
@@ -189,7 +180,8 @@ impl SchedulerCFS {
     }
     /// 获取某个cpu的运行队列中的进程数
     pub fn get_cfs_queue_len(&mut self, cpu_id: u32) -> usize {
-        return self.cpu_queue[cpu_id as usize].get_cfs_queue_size();
+        let queue = self.cpu_queue[cpu_id as usize].locked_queue.lock();
+        return CFSQueue::get_cfs_queue_size(&queue);
     }
 }
 

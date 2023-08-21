@@ -106,44 +106,11 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
 // ///
 // /// @param pcb 要被加入队列的pcb
 // /// @param reset_time 是否重置虚拟运行时间
-// #[allow(dead_code)]
-// #[no_mangle]
-// pub extern "C" fn sched_enqueue(pcb: &'static mut process_control_block, mut reset_time: bool) {
-//     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-//     // 调度器不处理running位为0的进程
-//     if pcb.state & (PROC_RUNNING as u64) == 0 {
-//         return;
-//     }
-//     let cfs_scheduler = __get_cfs_scheduler();
-//     let rt_scheduler = __get_rt_scheduler();
-
-//     // 除了IDLE以外的进程，都进行负载均衡
-//     if pcb.pid > 0 {
-//         loads_balance(pcb);
-//     }
-//     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-//     if (pcb.flags & (PF_NEED_MIGRATE as u64)) != 0 {
-//         // kdebug!("migrating pcb:{:?}", pcb);
-//         pcb.flags &= !(PF_NEED_MIGRATE as u64);
-//         pcb.cpu_id = pcb.migrate_to;
-//         reset_time = true;
-//     }
-//     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-//     if pcb.policy == SCHED_NORMAL {
-//         if reset_time {
-//             cfs_scheduler.enqueue_reset_vruntime(pcb);
-//         } else {
-//             cfs_scheduler.enqueue(pcb);
-//         }
-//     } else if pcb.policy == SCHED_FIFO || pcb.policy == SCHED_RR {
-//         rt_scheduler.enqueue(pcb);
-//     } else {
-//         panic!("This policy is not supported at this time");
-//     }
-// }
+#[allow(dead_code)]
+#[no_mangle]
+pub extern "C" fn sched_enqueue_old(pcb: &'static mut process_control_block, mut reset_time: bool) {
+    panic!("derived method")
+}
 
 /// @brief 将进程加入调度队列
 ///

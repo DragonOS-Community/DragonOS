@@ -6,7 +6,7 @@ use crate::{
     arch::cpu::current_cpu_id,
     include::bindings::bindings::MAX_CPU_NUM,
     kBUG, kdebug,
-    libs::spinlock::RawSpinlock,
+    libs::spinlock::SpinLock,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
 };
 
@@ -37,62 +37,52 @@ pub unsafe fn sched_rt_init() {
 /// @brief RT队列（per-cpu的）
 #[derive(Debug)]
 struct RTQueue {
-    /// 队列的锁
-    lock: RawSpinlock,
-    /// 存储进程的双向队列
-    queue: LinkedList<Arc<ProcessControlBlock>>,
+    /// 加锁保护的存储进程的双向队列
+    locked_queue: SpinLock<LinkedList<Arc<ProcessControlBlock>>>,
 }
 
 impl RTQueue {
     pub fn new() -> RTQueue {
         RTQueue {
-            queue: LinkedList::new(),
-            lock: RawSpinlock::INIT,
+            locked_queue: SpinLock::new(LinkedList::new()),
         }
     }
     /// @brief 将pcb加入队列
     pub fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let mut rflags = 0usize;
-        self.lock.lock_irqsave(&mut rflags);
+        let mut queue = self.locked_queue.lock_irqsave();
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.basic().pid().into() == 0 {
-            self.lock.unlock_irqrestore(rflags);
             return;
         }
-        self.queue.push_back(pcb);
-        self.lock.unlock_irqrestore(rflags);
+        queue.push_back(pcb);
     }
 
     /// @brief 将pcb从调度队列头部取出,若队列为空，则返回None
     pub fn dequeue(&mut self) -> Option<Arc<ProcessControlBlock>> {
         let res: Option<Arc<ProcessControlBlock>>;
-        let mut rflags = 0usize;
-        self.lock.lock_irqsave(&mut rflags);
-        if self.queue.len() > 0 {
+        let mut queue = self.locked_queue.lock_irqsave();
+        if queue.len() > 0 {
             // 队列不为空，返回下一个要执行的pcb
-            res = Some(self.queue.pop_front().unwrap());
+            res = Some(queue.pop_front().unwrap());
         } else {
             // 如果队列为空，则返回None
             res = None;
         }
-        self.lock.unlock_irqrestore(rflags);
         return res;
     }
     pub fn enqueue_front(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let mut rflags = 0usize;
-        self.lock.lock_irqsave(&mut rflags);
+        let mut queue = self.locked_queue.lock_irqsave();
 
         // 如果进程是IDLE进程，那么就不加入队列
         if pcb.basic().pid().into() == 0 {
-            self.lock.unlock_irqrestore(rflags);
             return;
         }
-        self.queue.push_front(pcb);
-        self.lock.unlock_irqrestore(rflags);
+        queue.push_front(pcb);
     }
     pub fn get_rt_queue_size(&mut self) -> usize {
-        return self.queue.len();
+        let queue = self.locked_queue.lock();
+        return queue.len();
     }
 }
 

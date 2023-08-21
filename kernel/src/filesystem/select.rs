@@ -63,6 +63,14 @@ impl FdSet {
     }
 }
 
+#[repr(C)]
+/// @ brief poll() 使用的文件描述符数组
+pub struct PollFd {
+    fd: i32,
+    events: PollStatus,
+    revents: PollStatus,
+}
+
 enum CopyFdSetOp {
     FromUser,
     ToUser,

@@ -213,28 +213,30 @@ impl Syscall {
     // @brief 系统调用 select 的入口函数
     ///
     /// @param n 最大的文件描述符+1
+    /// @param read_fds 监听的 read 事件文件描述符集合
+    /// @param write_fds 监听的 read 事件文件描述符集合
+    /// @param error_fds 监听的 read 事件文件描述符集合
+    /// @param end_time 超时时间
     ///
-    // TODO: 将时间复制到内核，增加超时机制
+    // TODO: 将时间拷贝到内核，增加超时机制
     pub fn select(
         n: i32,
         read_fds: *mut FdSet,
         write_fds: *mut FdSet,
-        except_fds: *mut FdSet,
-        end_time: TimeSpec,
+        error_fds: *mut FdSet,
+        end_time: *const TimeSpec,
     ) -> Result<usize, SystemError> {
-        return Self::core_select(n, read_fds, write_fds, except_fds, None);
+        return Self::core_select(n, read_fds, write_fds, error_fds, None);
     }
 
     /// @ brief 将用户态的 fd_set 复制到内核空间，在调用 do_select 处理完成后，将获取的 fd_set 复制回用户空间
-    ///
-    /// @param n 最大的文件描述符+1
     ///
     /// TODO: 增加超时判断逻辑
     fn core_select(
         mut n: i32,
         read_fds: *mut FdSet,
         write_fds: *mut FdSet,
-        except_fds: *mut FdSet,
+        error_fds: *mut FdSet,
         end_time: Option<TimeSpec>,
     ) -> Result<usize, SystemError> {
         if n < 0 {
@@ -333,6 +335,21 @@ impl Syscall {
             }
         }
         return Ok(count);
+    }
+
+    // @brief 系统调用 poll 的入口函数
+    ///
+    /// @param ufds 结构体 pollfd 数组地址
+    /// @param nfds 结构体 pollfd 数组的长度
+    /// @param end_time 超时时间
+    ///
+    // TODO: 将时间拷贝到内核，增加超时机制
+    pub fn poll(
+        ufds: *mut PollFd,
+        nfds: usize,
+        end_time: *const TimeSpec,
+    ) -> Result<usize, SystemError> {
+        return Self::core_poll(ufds, nfds, None);
     }
 
     /// @ brief 将用户态的 pollfd 数组复制到内核空间，在调用 do_poll 处理完成后，将获取的 pollfd 数组复制回用户空间

@@ -368,7 +368,7 @@ impl Syscall {
         let mut count = 0;
         loop {
             for pollfd in poll_list.0.iter_mut() {
-                if let Ok(_) = Self::do_pollfd(pollfd) {
+                if Self::do_pollfd(pollfd) != PollStatus::empty() {
                     count += 1;
                 }
             }
@@ -382,7 +382,20 @@ impl Syscall {
     /// @brief 根据监听的事件去更新 pollfd 中的响应事件
     ///
     /// TODO: 使用等待队列实现
-    fn do_pollfd(pollfd: &mut PollFd) -> Result<PollStatus, SystemError> {
-        todo!()
+    fn do_pollfd(pollfd: &mut PollFd) -> PollStatus {
+        let fd = pollfd.fd;
+
+        // 调用设备驱动的 poll
+        let cur = current_pcb();
+        let mask = match cur.get_file_ref_by_fd(fd) {
+            Some(file) => match file.inode().poll() {
+                Ok(status) => status,
+                _ => PollStatus::empty(),
+            },
+            _ => PollStatus::empty(),
+        };
+        pollfd.revents = mask & pollfd.events;
+
+        return pollfd.revents;
     }
 }

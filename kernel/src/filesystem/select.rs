@@ -68,75 +68,91 @@ impl FdSet {
 #[repr(C)]
 /// @ brief poll() 使用的文件描述符结构体
 pub struct PollFd {
-    fd: i32,
-    events: PollStatus,
-    revents: PollStatus,
+    fd: i32,                   // 文件描述符
+    listen_events: PollStatus, // 监听的事件
+    result_events: PollStatus, // 响应的事件
 }
 
 impl PollFd {
     pub fn new(fd: i32, events: PollStatus) -> Self {
         Self {
             fd,
-            events,
-            revents: PollStatus::empty(),
+            listen_events: events,
+            result_events: PollStatus::empty(),
         }
-    }
-
-    fn set_revents(&mut self, mask: PollStatus) {
-        self.revents = mask;
     }
 }
 
 // TODO: 使用更加节省空间的设计
 struct FdSetBits {
-    lis_in: FdSet,
-    lis_out: FdSet,
-    lis_ex: FdSet,
-    res_in: FdSet,
-    res_out: FdSet,
-    res_ex: FdSet,
+    listen_read: FdSet,
+    listen_write: FdSet,
+    listen_error: FdSet,
+    result_read: FdSet,
+    result_write: FdSet,
+    result_error: FdSet,
 }
 
 impl FdSetBits {
     pub fn new() -> Self {
         Self {
-            lis_in: FdSet::new(),
-            lis_out: FdSet::new(),
-            lis_ex: FdSet::new(),
-            res_in: FdSet::new(),
-            res_out: FdSet::new(),
-            res_ex: FdSet::new(),
+            listen_read: FdSet::new(),
+            listen_write: FdSet::new(),
+            listen_error: FdSet::new(),
+            result_read: FdSet::new(),
+            result_write: FdSet::new(),
+            result_error: FdSet::new(),
         }
     }
 
     /// @brief 从用户空间拷贝 fd_set 到内核空间
     pub fn get_fd_sets(
         &mut self,
-        n: i32,
-        inp: *const FdSet,
-        outp: *const FdSet,
-        exp: *const FdSet,
+        _n: i32,
+        read_fds: *const FdSet,
+        write_fds: *const FdSet,
+        error_fds: *const FdSet,
     ) -> Result<(), SystemError> {
-        copy_fd_set(inp, &mut self.lis_in as *mut FdSet, CopyOp::FromUser)
-            .map_err(|_| SystemError::EINVAL)?;
-        copy_fd_set(outp, &mut self.lis_out as *mut FdSet, CopyOp::FromUser)
-            .map_err(|_| SystemError::EINVAL)?;
-        copy_fd_set(exp, &mut self.lis_ex as *mut FdSet, CopyOp::FromUser)
-            .map_err(|_| SystemError::EINVAL)?;
+        copy_fd_set(
+            read_fds,
+            &mut self.listen_read as *mut FdSet,
+            CopyOp::FromUser,
+        )
+        .map_err(|_| SystemError::EINVAL)?;
+        copy_fd_set(
+            write_fds,
+            &mut self.listen_write as *mut FdSet,
+            CopyOp::FromUser,
+        )
+        .map_err(|_| SystemError::EINVAL)?;
+        copy_fd_set(
+            error_fds,
+            &mut self.listen_error as *mut FdSet,
+            CopyOp::FromUser,
+        )
+        .map_err(|_| SystemError::EINVAL)?;
         return Ok(());
     }
 
     /// @brief 从内核空间拷贝 fd_set 到用户空间
     pub fn set_fd_sets(
         &self,
-        n: i32,
-        inp: *mut FdSet,
-        outp: *mut FdSet,
-        exp: *mut FdSet,
+        _n: i32,
+        read_fds: *mut FdSet,
+        write_fds: *mut FdSet,
+        error_fds: *mut FdSet,
     ) -> Result<(), SystemError> {
-        copy_fd_set(&self.res_in as *const FdSet, inp, CopyOp::ToUser)?;
-        copy_fd_set(&self.res_out as *const FdSet, outp, CopyOp::ToUser)?;
-        copy_fd_set(&self.res_ex as *const FdSet, exp, CopyOp::ToUser)?;
+        copy_fd_set(&self.result_read as *const FdSet, read_fds, CopyOp::ToUser)?;
+        copy_fd_set(
+            &self.result_write as *const FdSet,
+            write_fds,
+            CopyOp::ToUser,
+        )?;
+        copy_fd_set(
+            &self.result_error as *const FdSet,
+            error_fds,
+            CopyOp::ToUser,
+        )?;
         return Ok(());
     }
 }
@@ -252,11 +268,11 @@ impl Syscall {
 
         let mut fds = FdSetBits::new();
         // 拷贝参数的 fd_set 到内核空间
-        fds.get_fd_sets(n, read_fds, write_fds, except_fds)?;
+        fds.get_fd_sets(n, read_fds, write_fds, error_fds)?;
         // 进入 do_select 处理
         let retval = Self::do_select(n, &mut fds, end_time)?;
         // 将结果的 fd_set 拷贝回用户空间
-        fds.set_fd_sets(n, read_fds, write_fds, except_fds)?;
+        fds.set_fd_sets(n, read_fds, write_fds, error_fds)?;
 
         return Ok(retval);
     }
@@ -281,9 +297,9 @@ impl Syscall {
                 }
 
                 // 先以 64 位宽进行扫描，加快速度
-                let in_bits = fds.lis_in.0[i];
-                let out_bits = fds.lis_out.0[i];
-                let ex_bits = fds.lis_ex.0[i];
+                let in_bits = fds.listen_read.0[i];
+                let out_bits = fds.listen_write.0[i];
+                let ex_bits = fds.listen_error.0[i];
                 let all_bits = in_bits | out_bits | ex_bits;
                 if all_bits == 0 {
                     fd += FD_SET_BIT_MASK as i32;
@@ -313,16 +329,16 @@ impl Syscall {
                         _ => PollStatus::empty(),
                     };
 
-                    if mask.contains(PollStatus::READ) && fds.lis_in.contains_fd(fd) {
-                        fds.res_in.set_fd(fd);
+                    if mask.contains(PollStatus::READ) && fds.listen_read.contains_fd(fd) {
+                        fds.result_read.set_fd(fd);
                         count += 1;
                     }
-                    if mask.contains(PollStatus::WRITE) && fds.lis_out.contains_fd(fd) {
-                        fds.res_out.set_fd(fd);
+                    if mask.contains(PollStatus::WRITE) && fds.listen_write.contains_fd(fd) {
+                        fds.result_write.set_fd(fd);
                         count += 1;
                     }
-                    if mask.contains(PollStatus::ERROR) && fds.lis_ex.contains_fd(fd) {
-                        fds.res_ex.set_fd(fd);
+                    if mask.contains(PollStatus::ERROR) && fds.listen_error.contains_fd(fd) {
+                        fds.result_error.set_fd(fd);
                         count += 1;
                     }
 
@@ -411,8 +427,8 @@ impl Syscall {
             },
             _ => PollStatus::empty(),
         };
-        pollfd.revents = mask & pollfd.events;
+        pollfd.result_events = mask & pollfd.listen_events;
 
-        return pollfd.revents;
+        return pollfd.result_events;
     }
 }

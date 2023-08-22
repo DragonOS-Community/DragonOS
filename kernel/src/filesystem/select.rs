@@ -270,7 +270,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // TODO: 如果当前进程已打开的文件描述符表检查目前打开的最大 fd，并修正传入的最大文件描述符数 n
 
-        let mut retval = 0;
+        let mut count = 0;
         loop {
             let mut fd = 0; // 文件描述符
             for i in 0..FD_SET_LONGS {
@@ -301,36 +301,38 @@ impl Syscall {
                         continue;
                     }
 
-                    let mut mask: PollStatus = PollStatus::empty();
+                    // 调用设备驱动的 poll
                     let cur = current_pcb();
-                    if let Some(file) = cur.get_file_ref_by_fd(fd) {
-                        mask = match file.inode().poll() {
+                    let mask = match cur.get_file_ref_by_fd(fd) {
+                        Some(file) => match file.inode().poll() {
                             Ok(status) => status,
-                            Err(_) => PollStatus::empty(),
-                        }
-                    }
+                            _ => PollStatus::empty(),
+                        },
+                        _ => PollStatus::empty(),
+                    };
 
                     if mask.contains(PollStatus::READ) && fds.lis_in.contains_fd(fd) {
                         fds.res_in.set_fd(fd);
-                        retval += 1;
+                        count += 1;
                     }
                     if mask.contains(PollStatus::WRITE) && fds.lis_out.contains_fd(fd) {
                         fds.res_out.set_fd(fd);
-                        retval += 1;
+                        count += 1;
                     }
                     if mask.contains(PollStatus::ERROR) && fds.lis_ex.contains_fd(fd) {
                         fds.res_ex.set_fd(fd);
-                        retval += 1;
+                        count += 1;
                     }
 
                     fd += 1;
                 }
             }
-            if retval != 0 {
+
+            if count > 0 {
                 break;
             }
         }
-        return Ok(retval);
+        return Ok(count);
     }
 
     /// @ brief 将用户态的 pollfd 数组复制到内核空间，在调用 do_poll 处理完成后，将获取的 pollfd 数组复制回用户空间
@@ -363,6 +365,24 @@ impl Syscall {
     /// TODO: 增加超时判断逻辑
     /// TODO: 使用等待队列实现
     fn do_poll(poll_list: &mut PollList, end_time: Option<TimeSpec>) -> Result<usize, SystemError> {
-        Ok(0)
+        let mut count = 0;
+        loop {
+            for pollfd in poll_list.0.iter_mut() {
+                if let Ok(_) = Self::do_pollfd(pollfd) {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                break;
+            }
+        }
+        return Ok(count);
+    }
+
+    /// @brief 根据监听的事件去更新 pollfd 中的响应事件
+    ///
+    /// TODO: 使用等待队列实现
+    fn do_pollfd(pollfd: &mut PollFd) -> Result<PollStatus, SystemError> {
+        todo!()
     }
 }

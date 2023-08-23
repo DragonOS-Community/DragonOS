@@ -2,7 +2,6 @@ use core::{
     hash::{Hash, Hasher},
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    ptr::null_mut,
     sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -14,20 +13,20 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{asm::current::current_pcb, process::ArchPCBInfo},
-    filesystem::vfs::{file::FileDescriptorVec, FileType},
-    include::bindings::bindings::CLONE_SIGNAL,
-    kdebug,
+    arch::{
+        interrupt::{cli, sti},
+        process::ArchPCBInfo,
+        sched::sched,
+    },
+    filesystem::{vfs::{file::FileDescriptorVec, FileType}, procfs::procfs_unregister_pid},
+    kdebug, kinfo,
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{
-        percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr,
-        INITIAL_PROCESS_ADDRESS_SPACE,
-    },
+    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     process::{
         fork::CloneFlags,
@@ -74,7 +73,7 @@ impl SwitchResult {
 
 #[derive(Debug)]
 pub struct ProcessManager;
-
+#[allow(dead_code)]
 impl ProcessManager {
     fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
@@ -160,16 +159,38 @@ impl ProcessManager {
     pub fn sleep() -> Result<(), SystemError> {
         todo!()
     }
-
+    /// 当子进程退出后向父进程发送通知
+    pub fn exit_notify() {}
     /// 退出进程，回收资源
     ///
     /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246
     pub fn exit(exit_code: usize) -> ! {
-        todo!()
+        cli();
+        let pcb = ProcessManager::current_pcb();
+        pcb.sched_info
+            .write()
+            .set_state(ProcessState::Exited(exit_code));
+        drop(pcb);
+        kinfo!("sti()");
+        sti();
+        kinfo!("exit_notify()");
+        ProcessManager::exit_notify();
+        kinfo!("sched()");
+        sched();
+        loop {}
     }
 
     pub unsafe fn release(pid: Pid) {
-        ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
+        let pcb = ProcessManager::find(pid);
+        if !pcb.is_none() {
+            let pcb = pcb.unwrap();
+            // 判断该pcb是否在全局没有任何引用
+            let weak_ref = Arc::downgrade(&pcb);
+            if weak_ref.strong_count() <= 1 {
+                drop(pcb);
+                ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
+            }
+        }
     }
 
     /// 上下文切换完成后的钩子函数
@@ -409,6 +430,13 @@ impl ProcessControlBlock {
         return self.basic.read().fd_table().unwrap();
     }
 
+    /// 释放文件描述符数组
+    pub fn exit_files(&self) {
+        self.basic.write().exit_files();
+    }
+
+    /// 回收线程结构体
+    pub fn exit_thread(&self) {}
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
     /// ## 参数
@@ -435,6 +463,16 @@ impl ProcessControlBlock {
     }
 }
 
+impl Drop for ProcessControlBlock {
+    fn drop(&mut self) {
+        // 在ProcFS中,解除进程的注册
+        procfs_unregister_pid(self.basic().pid()).unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
+        // 释放资源
+        self.exit_files();
+        self.exit_thread();
+    }
+
+}
 /// 进程的基本信息
 ///
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
@@ -521,6 +559,18 @@ impl ProcessBasicInfo {
 
     pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
         self.fd_table = fd_table;
+    }
+    /// 释放文件描述符数组。本函数会drop掉整个文件描述符数组，并把pcb的fds字段设置为空。
+    fn exit_files(&mut self) -> Result<(), SystemError> {
+        if self.fd_table().is_none() {
+            return Ok(());
+        }
+        self.fd_table().unwrap().write().drop_fds();
+        // let old_fds = self.fd_table().unwrap().write().;
+        // old_fds.drop_fds();
+        // drop(old_fds);
+        self.fd_table = None;
+        return Ok(());
     }
 }
 
@@ -680,10 +730,12 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let pcb_ptr: Arc<ProcessControlBlock> = unsafe {
-            Arc::from_raw(self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock)
-        };
-        drop(pcb_ptr);
+        if !self.stack.is_none() {
+            let pcb_ptr: Arc<ProcessControlBlock> = unsafe {
+                Arc::from_raw(self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock)
+            };
+            drop(pcb_ptr);
+        }
         // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
         if !self.can_be_freed {
             let bx = self.stack.take();
@@ -694,4 +746,8 @@ impl Drop for KernelStack {
 
 pub fn process_init() {
     ProcessManager::init();
+}
+#[no_mangle]
+pub extern "C" fn process_do_exit(exit_code: usize) -> usize {
+    ProcessManager::exit(exit_code);
 }

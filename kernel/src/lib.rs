@@ -59,6 +59,7 @@ extern crate x86;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
+use crate::process::ProcessManager;
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
@@ -99,11 +100,12 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    println!("Current PCB:\n\t{:?}", current_pcb());
-    unsafe {
-        process_do_exit(u64::MAX);
-    };
-    loop {}
+    println!(
+        "Current PCB:\n\t{:?}",
+        *(ProcessManager::current_pcb().basic())
+    );
+
+    ProcessManager::exit(usize::MAX);
 }
 
 /// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数

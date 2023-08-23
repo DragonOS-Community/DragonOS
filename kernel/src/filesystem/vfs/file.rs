@@ -523,4 +523,11 @@ impl FileDescriptorVec {
 
         return Ok(());
     }
+
+    /// 释放文件描述符数组
+    pub fn drop_fds(&mut self) {
+        for i in 0..self.fds.len() {
+            self.fds[i] = None;
+        }
+    }
 }

@@ -188,12 +188,7 @@ ul initial_kernel_thread(ul arg)
 }
 #pragma GCC pop_options
 
-ul process_do_exit(ul code)
-{
-    kerror("Todo: remove process_do_exit");
-    while (1)
-        ;
-}
+
 
 /**
  * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL

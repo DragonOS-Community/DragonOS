@@ -14,7 +14,7 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{asm::current::current_pcb, process::ArchPCBInfo},
+    arch::process::ArchPCBInfo,
     filesystem::vfs::{file::FileDescriptorVec, FileType},
     include::bindings::bindings::CLONE_SIGNAL,
     kdebug,
@@ -34,7 +34,10 @@ use crate::{
         init::initial_kernel_thread,
         kthread::{KernelThreadClosure, KernelThreadCreateInfo, KernelThreadMechanism},
     },
-    sched::{core::CPU_EXECUTING, SchedPolicy, SchedPriority},
+    sched::{
+        core::{sched_enqueue, CPU_EXECUTING},
+        SchedPolicy, SchedPriority,
+    },
     smp::kick_cpu,
     syscall::SystemError,
 };
@@ -577,7 +580,7 @@ impl ProcessSchedulerInfo {
         return self.state;
     }
 
-    fn set_state(&mut self, state: ProcessState) {
+    pub fn set_state(&mut self, state: ProcessState) {
         self.state = state;
     }
 
@@ -710,4 +713,23 @@ impl Drop for KernelStack {
 
 pub fn process_init() {
     ProcessManager::init();
+}
+
+pub fn process_wakeup(pcb: Arc<ProcessControlBlock>) {
+    // c版本代码
+    // BUG_ON(pcb == NULL);
+    // if (pcb == NULL)
+    //     return -EINVAL;
+    // // 如果pcb正在调度队列中，则不重复加入调度队列
+    // if (pcb->state & PROC_RUNNING)
+    //     return 0;
+
+    // pcb->state |= PROC_RUNNING;
+    // sched_enqueue_old(pcb, true);
+    // return 0;
+
+    if pcb.sched_info().state() != ProcessState::Runnable {
+        pcb.sched_info_mut().set_state(ProcessState::Runnable);
+        sched_enqueue(pcb, true);
+    }
 }

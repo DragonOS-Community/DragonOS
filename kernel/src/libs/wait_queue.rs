@@ -1,12 +1,10 @@
 #![allow(dead_code)]
-use alloc::{collections::LinkedList, vec::Vec};
+use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
+    arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
-    include::bindings::bindings::{
-        process_control_block, process_wakeup, PROC_INTERRUPTIBLE, PROC_UNINTERRUPTIBLE,
-    },
+    process::{process_wakeup, ProcessControlBlock, ProcessManager, ProcessState},
 };
 
 use super::{
@@ -17,7 +15,7 @@ use super::{
 #[derive(Debug)]
 struct InnerWaitQueue {
     /// 等待队列的链表
-    wait_list: LinkedList<&'static mut process_control_block>,
+    wait_list: LinkedList<Arc<ProcessControlBlock>>,
 }
 
 /// 被自旋锁保护的等待队列
@@ -30,10 +28,11 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_INTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(crate::process::ProcessState::Blocked(true));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(guard);
-
         sched();
     }
 
@@ -43,8 +42,10 @@ impl WaitQueue {
         F: FnOnce(),
     {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_INTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(crate::process::ProcessState::Blocked(true));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         f();
         drop(guard);
         sched();
@@ -68,15 +69,19 @@ impl WaitQueue {
         // 安全检查：确保当前处于中断禁止状态
         assert!(CurrentIrqArch::is_irq_enabled() == false);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_INTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(crate::process::ProcessState::Blocked(true));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(guard);
     }
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断
     pub fn sleep_uninterruptible(&self) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_UNINTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(crate::process::ProcessState::Blocked(false));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(guard);
         sched();
     }
@@ -85,8 +90,10 @@ impl WaitQueue {
     /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
     pub fn sleep_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_INTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(crate::process::ProcessState::Blocked(true));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
         sched();
@@ -96,8 +103,10 @@ impl WaitQueue {
     /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
     pub fn sleep_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_INTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(crate::process::ProcessState::Blocked(true));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
         sched();
@@ -107,8 +116,10 @@ impl WaitQueue {
     /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
     pub fn sleep_uninterruptible_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_UNINTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(ProcessState::Blocked(false));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
         sched();
@@ -118,8 +129,10 @@ impl WaitQueue {
     /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
     pub fn sleep_uninterruptible_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
-        current_pcb().state = PROC_UNINTERRUPTIBLE as u64;
-        guard.wait_list.push_back(current_pcb());
+        ProcessManager::current_pcb()
+            .sched_info_mut()
+            .set_state(crate::process::ProcessState::Blocked(false));
+        guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
         sched();
@@ -128,51 +141,52 @@ impl WaitQueue {
     /// @brief 唤醒在队列中等待的第一个进程。
     /// 如果这个进程的state与给定的state进行and操作之后，结果不为0,则唤醒它。
     ///
-    /// @param state 用于判断的state，如果队列中第一个进程的state与它进行and操作之后，结果不为0,则唤醒这个进程。
+    /// @param state 用于判断的state，如果队列第一个进程与这个state相同，或者为None(表示不进行这个判断)，则唤醒这个进程。
     ///
     /// @return true 成功唤醒进程
     /// @return false 没有唤醒进程
-    pub fn wakeup(&self, state: u64) -> bool {
+    pub fn wakeup(&self, state: Option<ProcessState>) -> bool {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         // 如果队列为空，则返回
         if guard.wait_list.is_empty() {
             return false;
         }
-
         // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
-        if (guard.wait_list.front().unwrap().state & state) != 0 {
-            let to_wakeup = guard.wait_list.pop_front().unwrap();
-            unsafe {
-                process_wakeup(to_wakeup);
+        if let Some(state) = state {
+            if guard.wait_list.front().unwrap().sched_info().state() != state {
+                return false;
             }
-            return true;
-        } else {
-            return false;
         }
+        let to_wakeup = guard.wait_list.pop_front().unwrap();
+        unsafe {
+            process_wakeup(to_wakeup);
+        }
+        return true;
     }
 
     /// @brief 唤醒在队列中，符合条件的所有进程。
     ///
-    /// @param state 用于判断的state，如果队列中第一个进程的state与它进行and操作之后，结果不为0,则唤醒这个进程。
-    pub fn wakeup_all(&self, state: u64) {
+    /// @param state 用于判断的state，如果一个进程与这个state相同，或者为None(表示不进行这个判断)，则唤醒这个进程。
+    pub fn wakeup_all(&self, state: Option<ProcessState>) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
         // 如果队列为空，则返回
         if guard.wait_list.is_empty() {
             return;
         }
 
-        let mut to_push_back: Vec<&mut process_control_block> = Vec::new();
+        let mut to_push_back: Vec<Arc<ProcessControlBlock>> = Vec::new();
         // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
         while let Some(to_wakeup) = guard.wait_list.pop_front() {
-            if (to_wakeup.state & state) != 0 {
-                unsafe {
-                    process_wakeup(to_wakeup);
+            if let Some(state) = state {
+                if to_wakeup.sched_info().state() != state {
+                    unsafe {
+                        process_wakeup(to_wakeup);
+                    }
+                    continue;
                 }
-            } else {
-                to_push_back.push(to_wakeup);
             }
+            to_push_back.push(to_wakeup);
         }
-
         for to_wakeup in to_push_back {
             guard.wait_list.push_back(to_wakeup);
         }

@@ -241,4 +241,6 @@ make run-docker
 
 :::{note}
 如果您需要在vnc中运行DragonOS，请在上述命令后加上`-vnc`后缀。如：`make run-vnc`
+
+qemu虚拟机将在5900端口监听vnc连接。您可以使用vnc viewer或者Remmina连接至qemu虚拟机。
 :::

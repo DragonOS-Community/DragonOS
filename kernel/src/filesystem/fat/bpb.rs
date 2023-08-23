@@ -2,7 +2,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
+    filesystem::vfs::io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kerror,
     libs::vec_cursor::VecCursor,
     syscall::SystemError,

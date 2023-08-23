@@ -7,6 +7,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, MMArch},
+    filesystem::vfs::io::SeekFrom,
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
@@ -14,7 +15,6 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
-    io::SeekFrom,
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
@@ -664,7 +664,6 @@ impl Syscall {
                         Ok(pipefd) => Self::pipe(pipefd),
                     },
                 }
-
             }
 
             SYS_UNLINK_AT => {

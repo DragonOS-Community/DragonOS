@@ -3,10 +3,10 @@ pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
-use crate::io::device::BlockDevice;
+use crate::filesystem::vfs::io::device::BlockDevice;
 // 依赖的rust工具包
 use crate::filesystem::devfs::devfs_register;
-use crate::io::disk_info::BLK_GF_AHCI;
+use crate::filesystem::vfs::io::disk_info::BLK_GF_AHCI;
 use crate::kerror;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::virt_2_phys;

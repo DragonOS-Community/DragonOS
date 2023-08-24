@@ -299,7 +299,7 @@ impl KernelThreadMechanism {
                 list = KTHREAD_CREATE_LIST.lock();
             }
             drop(list);
-            ProcessManager::sleep().ok();
+            ProcessManager::sleep(true).ok();
         }
     }
 }

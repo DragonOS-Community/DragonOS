@@ -156,8 +156,12 @@ impl ProcessManager {
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         if pcb.sched_info().state() != ProcessState::Runnable {
-            sched_enqueue(pcb.clone(), true);
-            return Ok(());
+            let mut writer = pcb.sched_info_mut();
+            if writer.state() != ProcessState::Runnable {
+                writer.set_state(ProcessState::Runnable);
+                sched_enqueue(pcb.clone(), true);
+                return Ok(());
+            }
         }
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
@@ -609,7 +613,7 @@ impl ProcessSchedulerInfo {
         return self.state;
     }
 
-    pub fn set_state(&mut self, state: ProcessState) {
+    fn set_state(&mut self, state: ProcessState) {
         self.state = state;
     }
 

@@ -116,14 +116,11 @@ pub extern "C" fn sched_enqueue_old(pcb: &'static mut process_control_block, mut
 /// @param reset_time 是否重置虚拟运行时间
 pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-    let mut writer = pcb.sched_info_mut();
-    if writer.state() != ProcessState::Runnable {
-        writer.set_state(ProcessState::Runnable);
+    if pcb.sched_info().state() != ProcessState::Runnable {
+        return;
     }
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
-
     // 除了IDLE以外的进程，都进行负载均衡
     if pcb.basic().pid().into() > 0 {
         loads_balance(pcb.clone());

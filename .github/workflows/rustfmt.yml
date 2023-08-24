@@ -10,7 +10,7 @@ jobs:
     fmt:
         name: Rustfmt
         runs-on: ubuntu-latest
-
+        needs: [ensure-toolchain]
         steps:
             - uses: actions/checkout@v3
             

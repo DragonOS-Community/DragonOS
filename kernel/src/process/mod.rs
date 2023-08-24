@@ -160,7 +160,7 @@ impl ProcessManager {
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
-    pub fn sleep() -> Result<(), SystemError> {
+    pub fn sleep(interruptable:bool) -> Result<(), SystemError> {
         todo!()
     }
 
@@ -580,7 +580,7 @@ impl ProcessSchedulerInfo {
         return self.state;
     }
 
-    pub fn set_state(&mut self, state: ProcessState) {
+    fn set_state(&mut self, state: ProcessState) {
         self.state = state;
     }
 
@@ -715,21 +715,3 @@ pub fn process_init() {
     ProcessManager::init();
 }
 
-pub fn process_wakeup(pcb: Arc<ProcessControlBlock>) {
-    // c版本代码
-    // BUG_ON(pcb == NULL);
-    // if (pcb == NULL)
-    //     return -EINVAL;
-    // // 如果pcb正在调度队列中，则不重复加入调度队列
-    // if (pcb->state & PROC_RUNNING)
-    //     return 0;
-
-    // pcb->state |= PROC_RUNNING;
-    // sched_enqueue_old(pcb, true);
-    // return 0;
-
-    if pcb.sched_info().state() != ProcessState::Runnable {
-        pcb.sched_info_mut().set_state(ProcessState::Runnable);
-        sched_enqueue(pcb, true);
-    }
-}

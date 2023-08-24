@@ -327,7 +327,7 @@ impl<'a> UserBufferWriter<'a> {
         };
         return Ok(chunks);
     }
-    
+
     fn convert_one_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut T, SystemError> {
         if offset + core::mem::size_of::<T>() > src.len() {
             return Err(SystemError::EINVAL);

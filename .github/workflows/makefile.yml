@@ -34,7 +34,7 @@ jobs:
       uses: actions/cache@v3
       env:
           cache-name: cache-build-tools
-          dadk_version: 0.1.1
+          dadk_version: 0.1.2
       with:
         path: |
           ~/.cargo

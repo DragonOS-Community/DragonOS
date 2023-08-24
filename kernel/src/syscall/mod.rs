@@ -664,7 +664,6 @@ impl Syscall {
                         Ok(pipefd) => Self::pipe(pipefd),
                     },
                 }
-
             }
 
             SYS_UNLINK_AT => {

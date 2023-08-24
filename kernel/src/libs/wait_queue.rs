@@ -142,9 +142,7 @@ impl WaitQueue {
             }
         }
         let to_wakeup = guard.wait_list.pop_front().unwrap();
-        unsafe {
-            ProcessManager::wakeup(&to_wakeup);
-        }
+        ProcessManager::wakeup(&to_wakeup);
         return true;
     }
 

@@ -18,6 +18,30 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+
+    - name: Cache DragonOS GCC
+      id: cache-dragonos-gcc
+      uses: actions/cache@v3
+      env:
+          cache-name: cache-dragonos-gcc
+      with:
+        path: |
+          ~/opt
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
+    
+    - name: Cache build tools
+      id: cache-build-tools
+      uses: actions/cache@v3
+      env:
+          cache-name: cache-build-tools
+          dadk_version: 0.1.2
+      with:
+        path: |
+          ~/.cargo
+          ~/.rustup
+          ~/.bashrc
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}
+      
     
     - name: build the DragonOS
       run: bash -c "source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "

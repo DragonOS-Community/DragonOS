@@ -3,32 +3,24 @@ name: Rust format check
 on: [push, pull_request]
 
 jobs:
+    # ensure the toolchain is cached
+    ensure-toolchain:
+        uses: ./.github/workflows/cache-toolchain.yml
+  
     fmt:
         name: Rustfmt
         runs-on: ubuntu-latest
+
         steps:
-            - uses: actions/checkout@v2
+            - uses: actions/checkout@v3
             
-            - name: Cache toolchain
-              id: cache-toolchain
-              uses: actions/cache@v3
-              env:
-                  cache-name: cache-toolchain
-              with:
-                path: |
-                  ~/.cargo
-                  ~/.rustup
-                  ~/.bashrc
-                key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('.github/workflows/rustfmt.yml') }}
-          
-            - if: ${{ steps.cache-toolchain.outputs.cache-hit != 'true' }}
-              name: Install nightly-2023-01-21
-              uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: nightly-2023-01-21
-                  override: true
-                  components: rustfmt, clippy
-            
+            # 准备 bindings.rs
+            # 由于 bindings.rs 是在 build.rs 中生成的，而这里为了方便，直接 touch 一个空文件
+            - name: prepare bindings
+              run: |
+                    touch kernel/src/include/bindings/bindings.rs
+                    touch user/libs/libc/src/include/internal/bindings/bindings.rs
+
             - name: Check format
               uses: actions-rs/cargo@v1
               with:

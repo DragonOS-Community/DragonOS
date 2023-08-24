@@ -7,7 +7,12 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::{process::ProcessManager, syscall::SystemError};
+use crate::{
+    arch::{asm::irqflags::local_irq_save, CurrentIrqArch},
+    exception::{InterruptArch, IrqFlagsGuard},
+    process::ProcessManager,
+    syscall::SystemError,
+};
 
 ///RwLock读写锁
 
@@ -208,6 +213,23 @@ impl<T> RwLock<T> {
         loop {
             match self.try_write() {
                 Some(guard) => return guard,
+                None => spin_loop(),
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+
+    
+    /// @brief 获取WRITER守卫并关中断
+    pub fn write_irqsave(&self) -> (RwLockWriteGuard<T>, IrqFlagsGuard) {
+        loop {
+            match self.try_write() {
+                Some(guard) => {
+                    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                    return (guard, irq_guard);
+                }
                 None => spin_loop(),
             }
         }

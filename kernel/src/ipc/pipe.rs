@@ -5,8 +5,8 @@ use crate::{
         core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
         PollStatus,
     },
-    include::bindings::bindings::PROC_INTERRUPTIBLE,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    process::ProcessState,
     syscall::SystemError,
     time::TimeSpec,
 };
@@ -87,7 +87,9 @@ impl IndexNode for LockedPipeInode {
 
         //如果管道里面没有数据，则唤醒写端，
         while inode.valid_cnt == 0 {
-            inode.write_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
+            inode
+                .write_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
 
             // 在读等待队列中睡眠，并释放锁
             unsafe {
@@ -126,7 +128,9 @@ impl IndexNode for LockedPipeInode {
         inode.valid_cnt -= num as i32;
 
         //读完后解锁并唤醒等待在写等待队列中的进程
-        inode.write_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
+        inode
+            .write_wait_queue
+            .wakeup(Some(ProcessState::Blocked(true)));
         //返回读取的字节数
         return Ok(num);
     }
@@ -169,7 +173,9 @@ impl IndexNode for LockedPipeInode {
 
         while len + inode.valid_cnt as usize > PIPE_BUFF_SIZE {
             // 唤醒读端
-            inode.read_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
+            inode
+                .read_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
             // 解锁并睡眠
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
@@ -197,7 +203,9 @@ impl IndexNode for LockedPipeInode {
         inode.valid_cnt += len as i32;
 
         // 读完后解锁并唤醒等待在读等待队列中的进程
-        inode.read_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
+        inode
+            .read_wait_queue
+            .wakeup(Some(ProcessState::Blocked(true)));
         // 返回写入的字节数
         return Ok(len);
     }

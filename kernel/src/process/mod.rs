@@ -155,11 +155,15 @@ impl ProcessManager {
 
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        todo!()
+        if pcb.sched_info().state() != ProcessState::Runnable {
+            sched_enqueue(pcb.clone(), true);
+            return Ok(());
+        }
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
-    pub fn sleep() -> Result<(), SystemError> {
+    pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
         todo!()
     }
 

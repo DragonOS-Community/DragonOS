@@ -224,8 +224,8 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 获取WRITER守卫并关中断
     pub fn write_irqsave(&self) -> RwLockWriteGuard<T> {
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         loop {
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             match self.try_write() {
                 Some(mut guard) => {
                     guard.irq_guard = Some(irq_guard);

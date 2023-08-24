@@ -520,10 +520,7 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
         self.inner
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
-        if let Some(_) = self.irq_guard {
-            // 自动 drop 包含的 irq_guard，恢复中断
-            self.irq_guard = None;
-        }
+        self.irq_guard.take();
         ProcessManager::current_pcb().preempt_enable();
     }
 }

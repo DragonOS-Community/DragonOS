@@ -20,6 +20,7 @@ jobs:
               run: |
                     touch kernel/src/include/bindings/bindings.rs
                     touch user/libs/libc/src/include/internal/bindings/bindings.rs
+                    rustup component add rustfmt
 
             - name: Check format
               uses: actions-rs/cargo@v1

@@ -160,7 +160,7 @@ impl ProcessManager {
             sched_enqueue(pcb.clone(), true);
             return Ok(());
         }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     /// 标志当前进程永久睡眠，移出调度队列

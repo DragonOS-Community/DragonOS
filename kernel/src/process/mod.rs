@@ -160,7 +160,7 @@ impl ProcessManager {
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
-    pub fn sleep(interruptable:bool) -> Result<(), SystemError> {
+    pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
         todo!()
     }
 
@@ -714,4 +714,3 @@ impl Drop for KernelStack {
 pub fn process_init() {
     ProcessManager::init();
 }
-

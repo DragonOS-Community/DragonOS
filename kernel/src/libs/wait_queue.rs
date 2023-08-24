@@ -4,7 +4,7 @@ use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
-    process::{ ProcessControlBlock, ProcessManager, ProcessState},
+    process::{ProcessControlBlock, ProcessManager, ProcessState},
 };
 
 use super::{
@@ -163,7 +163,7 @@ impl WaitQueue {
         while let Some(to_wakeup) = guard.wait_list.pop_front() {
             if let Some(state) = state {
                 if to_wakeup.sched_info().state() != state {
-                        ProcessManager::wakeup(&to_wakeup);
+                    ProcessManager::wakeup(&to_wakeup);
                     continue;
                 }
             }

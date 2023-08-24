@@ -3,10 +3,9 @@ use core::sync::atomic::compiler_fence;
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    arch:: cpu::current_cpu_id,
-    include::bindings::bindings::smp_get_total_cpu,
+    arch::cpu::current_cpu_id,
     include::bindings::bindings::process_control_block,
-    
+    include::bindings::bindings::smp_get_total_cpu,
     kinfo,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
@@ -117,8 +116,7 @@ pub extern "C" fn sched_enqueue_old(pcb: &'static mut process_control_block, mut
 /// @param reset_time 是否重置虚拟运行时间
 pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    if pcb.sched_info().state() != ProcessState::Runnable
-    {
+    if pcb.sched_info().state() != ProcessState::Runnable {
         return;
     }
     let cfs_scheduler = __get_cfs_scheduler();
@@ -132,8 +130,7 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     if pcb.flags().contains(ProcessFlags::NEED_MIGRATE) {
         // kdebug!("migrating pcb:{:?}", pcb);
         pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
-        pcb.sched_info()
-            .set_on_cpu(pcb.sched_info().migrate_to());
+        pcb.sched_info().set_on_cpu(pcb.sched_info().migrate_to());
         reset_time = true;
     }
 

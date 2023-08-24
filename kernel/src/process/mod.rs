@@ -2,8 +2,7 @@ use core::{
     hash::{Hash, Hasher},
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    ptr::null_mut,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -14,7 +13,7 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{process::ArchPCBInfo, cpu},
+    arch::{cpu, process::ArchPCBInfo},
     filesystem::vfs::{file::FileDescriptorVec, FileType},
     include::bindings::bindings::CLONE_SIGNAL,
     kdebug,
@@ -39,7 +38,7 @@ use crate::{
         SchedPolicy, SchedPriority,
     },
     smp::kick_cpu,
-    syscall::SystemError, exception::IrqFlagsGuard,
+    syscall::SystemError,
 };
 
 use self::kthread::WorkerPrivate;
@@ -398,23 +397,11 @@ impl ProcessControlBlock {
         return self.sched_info.read();
     }
 
-    /// @brief 获取对sched_info的写锁(关中断)
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// 
-    ///
-    /// // 获取写锁和 irq_guard
-    /// let (sched_info,irq_guard) = pcb.sched_info_mut;
-    /// // do something 
-    /// sched_info.set_state(state);
-    /// // 销毁读锁和guard，销毁guard时，会恢复之前的中断状态
-    /// drop(sched_info)
-    /// drop(irq_guard);
-    ///
-    /// ```
-    pub fn sched_info_mut(&self) -> (RwLockWriteGuard<ProcessSchedulerInfo>,IrqFlagsGuard) {
+    pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
+        return self.sched_info.write();
+    }
+
+    pub fn sched_info_mut_irqsave(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write_irqsave();
     }
 
@@ -546,10 +533,10 @@ impl ProcessBasicInfo {
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
     /// 当前进程所在的cpu
-    on_cpu: AtomicIsize,
+    on_cpu: AtomicI32,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    migrate_to: AtomicIsize,
+    migrate_to: AtomicI32,
 
     /// 当前进程的状态
     state: ProcessState,
@@ -565,13 +552,13 @@ pub struct ProcessSchedulerInfo {
 
 impl ProcessSchedulerInfo {
     pub fn new(on_cpu: Option<u32>) -> RwLock<Self> {
-        let cpu_id = match on_cpu{
-            Some(cpu_id)=> cpu_id as isize,
-            None=>-1,
+        let cpu_id = match on_cpu {
+            Some(cpu_id) => cpu_id as i32,
+            None => -1,
         };
         return RwLock::new(Self {
-            on_cpu: AtomicIsize::new(cpu_id),
-            migrate_to: AtomicIsize::new(-1),
+            on_cpu: AtomicI32::new(cpu_id),
+            migrate_to: AtomicI32::new(-1),
             state: ProcessState::Blocked(false),
             sched_policy: SchedPolicy::CFS,
             virtual_runtime: AtomicIsize::new(0),
@@ -582,31 +569,36 @@ impl ProcessSchedulerInfo {
 
     pub fn on_cpu(&self) -> Option<u32> {
         let on_cpu = self.on_cpu.load(Ordering::SeqCst);
-        if  on_cpu== -1{
+        if on_cpu == -1 {
             return None;
-        }else{return Some(on_cpu as u32)}
+        } else {
+            return Some(on_cpu as u32);
+        }
     }
 
     pub fn set_on_cpu(&self, on_cpu: Option<u32>) {
-        if let Some(cpu_id) = on_cpu{
-            self.on_cpu.store(cpu_id as isize , Ordering::SeqCst);
-        }
-        else{
+        if let Some(cpu_id) = on_cpu {
+            self.on_cpu.store(cpu_id as i32, Ordering::SeqCst);
+        } else {
             self.on_cpu.store(-1, Ordering::SeqCst);
         }
     }
 
     pub fn migrate_to(&self) -> Option<u32> {
         let migrate_to = self.migrate_to.load(Ordering::SeqCst);
-        if migrate_to==-1{
+        if migrate_to == -1 {
             return None;
-        }else{return Some(migrate_to as u32)}
+        } else {
+            return Some(migrate_to as u32);
+        }
     }
 
     pub fn set_migrate_to(&self, migrate_to: Option<u32>) {
-        if let Some(data) = migrate_to{
-            self.migrate_to.store(data as isize, Ordering::SeqCst);
-        }else{self.migrate_to.store(-1, Ordering::SeqCst)}
+        if let Some(data) = migrate_to {
+            self.migrate_to.store(data as i32, Ordering::SeqCst);
+        } else {
+            self.migrate_to.store(-1, Ordering::SeqCst)
+        }
     }
 
     pub fn state(&self) -> ProcessState {
@@ -762,10 +754,8 @@ pub fn process_wakeup(pcb: Arc<ProcessControlBlock>) {
     // return 0;
 
     if pcb.sched_info().state() != ProcessState::Runnable {
-        let (mut sched_info,irq_guard) = pcb.sched_info_mut();
-        sched_info.set_state(ProcessState::Runnable);
-        drop(sched_info);
-        drop(irq_guard);
+        pcb.sched_info_mut_irqsave()
+            .set_state(ProcessState::Runnable);
         sched_enqueue(pcb, true);
     }
 }

@@ -8,7 +8,7 @@ use core::{
 };
 
 use crate::{
-    arch::{asm::irqflags::local_irq_save, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlagsGuard},
     process::ProcessManager,
     syscall::SystemError,
@@ -61,6 +61,7 @@ pub struct RwLockUpgradableGuard<'a, T: 'a> {
 pub struct RwLockWriteGuard<'a, T: 'a> {
     data: *mut T,
     inner: &'a RwLock<T>,
+    irq_guard: Option<IrqFlagsGuard>,
 }
 
 unsafe impl<T: Send> Send for RwLock<T> {}
@@ -200,6 +201,7 @@ impl<T> RwLock<T> {
             return Some(RwLockWriteGuard {
                 data: unsafe { &mut *self.data.get() },
                 inner: self,
+                irq_guard: None,
             });
         } else {
             return None;
@@ -220,15 +222,14 @@ impl<T> RwLock<T> {
 
     #[allow(dead_code)]
     #[inline]
-
-    
     /// @brief 获取WRITER守卫并关中断
-    pub fn write_irqsave(&self) -> (RwLockWriteGuard<T>, IrqFlagsGuard) {
+    pub fn write_irqsave(&self) -> RwLockWriteGuard<T> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         loop {
             match self.try_write() {
-                Some(guard) => {
-                    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-                    return (guard, irq_guard);
+                Some(mut guard) => {
+                    guard.irq_guard = Some(irq_guard);
+                    return guard;
                 }
                 None => spin_loop(),
             }
@@ -348,6 +349,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
             Ok(RwLockWriteGuard {
                 data: unsafe { &mut *inner.data.get() },
                 inner,
+                irq_guard: None,
             })
         } else {
             Err(self)
@@ -518,7 +520,10 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
         self.inner
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
-
+        if let Some(_) = self.irq_guard {
+            // 自动 drop 包含的 irq_guard，恢复中断
+            self.irq_guard = None;
+        }
         ProcessManager::current_pcb().preempt_enable();
     }
 }

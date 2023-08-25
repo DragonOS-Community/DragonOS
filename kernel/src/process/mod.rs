@@ -18,8 +18,13 @@ use crate::{
         interrupt::{cli, sti},
         process::ArchPCBInfo,
         sched::sched,
+        CurrentIrqArch,
     },
-    filesystem::{vfs::{file::FileDescriptorVec, FileType}, procfs::procfs_unregister_pid},
+    exception::InterruptArch,
+    filesystem::{
+        procfs::procfs_unregister_pid,
+        vfs::{file::FileDescriptorVec, FileType},
+    },
     kdebug, kinfo,
     libs::{
         align::AlignedBox,
@@ -74,7 +79,6 @@ impl SwitchResult {
 
 #[derive(Debug)]
 pub struct ProcessManager;
-#[allow(dead_code)]
 impl ProcessManager {
     fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
@@ -153,7 +157,17 @@ impl ProcessManager {
 
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        todo!()
+        //如果没有该进程则报错
+        if ProcessManager::find(pcb.basic().pid()).is_none() {
+            return Err(SystemError::EINVAL);
+        }
+        // 如果pcb正在调度队列中，则不重复加入调度队列
+        if pcb.sched_info.read().state() == ProcessState::Runnable {
+            return Ok(());
+        }
+        pcb.sched_info.write().set_state(ProcessState::Runnable);
+
+        return Ok(());
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
@@ -161,22 +175,19 @@ impl ProcessManager {
         todo!()
     }
     /// 当子进程退出后向父进程发送通知
-    pub fn exit_notify() {}
+    fn exit_notify() {}
     /// 退出进程，回收资源
     ///
     /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246
     pub fn exit(exit_code: usize) -> ! {
-        cli();
+        unsafe { CurrentIrqArch::interrupt_disable() };
         let pcb = ProcessManager::current_pcb();
         pcb.sched_info
             .write()
             .set_state(ProcessState::Exited(exit_code));
         drop(pcb);
-        kinfo!("sti()");
-        sti();
-        kinfo!("exit_notify()");
+        unsafe { CurrentIrqArch::interrupt_enable() };
         ProcessManager::exit_notify();
-        kinfo!("sched()");
         sched();
         loop {}
     }
@@ -190,6 +201,8 @@ impl ProcessManager {
             if weak_ref.strong_count() <= 1 {
                 drop(pcb);
                 ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
+            } else {
+                panic!("pcb is still referenced");
             }
         }
     }
@@ -431,13 +444,6 @@ impl ProcessControlBlock {
         return self.basic.read().fd_table().unwrap();
     }
 
-    /// 释放文件描述符数组
-    pub fn exit_files(&self) {
-        self.basic.write().exit_files();
-    }
-
-    /// 回收线程结构体
-    pub fn exit_thread(&self) {}
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
     /// ## 参数
@@ -467,12 +473,10 @@ impl ProcessControlBlock {
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         // 在ProcFS中,解除进程的注册
-        procfs_unregister_pid(self.basic().pid()).unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
+        procfs_unregister_pid(self.basic().pid())
+            .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
         // 释放资源
-        self.exit_files();
-        self.exit_thread();
     }
-
 }
 /// 进程的基本信息
 ///
@@ -560,18 +564,6 @@ impl ProcessBasicInfo {
 
     pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
         self.fd_table = fd_table;
-    }
-    /// 释放文件描述符数组。本函数会drop掉整个文件描述符数组，并把pcb的fds字段设置为空。
-    fn exit_files(&mut self) -> Result<(), SystemError> {
-        if self.fd_table().is_none() {
-            return Ok(());
-        }
-        self.fd_table().unwrap().write().drop_fds();
-        // let old_fds = self.fd_table().unwrap().write().;
-        // old_fds.drop_fds();
-        // drop(old_fds);
-        self.fd_table = None;
-        return Ok(());
     }
 }
 

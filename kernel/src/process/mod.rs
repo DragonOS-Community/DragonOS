@@ -39,7 +39,10 @@ use crate::{
         init::initial_kernel_thread,
         kthread::{KernelThreadClosure, KernelThreadCreateInfo, KernelThreadMechanism},
     },
-    sched::{core::CPU_EXECUTING, SchedPolicy, SchedPriority},
+    sched::{
+        core::{sched_enqueue, CPU_EXECUTING},
+        SchedPolicy, SchedPriority,
+    },
     smp::kick_cpu,
     syscall::SystemError,
 };
@@ -157,21 +160,15 @@ impl ProcessManager {
 
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        //如果没有该进程则报错
-        if ProcessManager::find(pcb.basic().pid()).is_none() {
-            return Err(SystemError::EINVAL);
-        }
-        // 如果pcb正在调度队列中，则不重复加入调度队列
-        if pcb.sched_info.read().state() == ProcessState::Runnable {
+        if pcb.sched_info().state() != ProcessState::Runnable {
+            sched_enqueue(pcb.clone(), true);
             return Ok(());
         }
-        pcb.sched_info.write().set_state(ProcessState::Runnable);
-
-        return Ok(());
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
-    pub fn sleep() -> Result<(), SystemError> {
+    pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
         todo!()
     }
     /// 当子进程退出后向父进程发送通知

@@ -95,7 +95,7 @@ sys_api_lib: sys_api_lib_stage_1
 	mkdir -p $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp
 	mkdir -p $(OLD_LIBC_INSTALL_PATH)/include
 	mkdir -p $(OLD_LIBC_INSTALL_PATH)/lib
-	$(AR) x $(ROOT_PATH)/target/x86_64-unknown-none/release/liblibc.a --output=$(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp 
+	$(AR) x libs/libc/target/x86_64-unknown-none/release/liblibc.a --output=$(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp 
 	$(AR) crvs $(OLD_LIBC_INSTALL_PATH)/lib/libc.a $(shell find ./libs/* -name "*.o") $(shell find $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp/* -name "*.o")
 	rm -rf $(ROOT_PATH)/bin/tmp/user/sys_api_lib_build_tmp
 # $(shell find ./libs/* -name "*.o" | xargs -I {} cp {} $(ROOT_PATH)/bin/sysroot/usr/lib/)

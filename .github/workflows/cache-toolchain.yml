@@ -1,0 +1,55 @@
+name: Reusable workflow example
+
+on: workflow_call
+
+jobs:
+    build:
+
+        runs-on: ubuntu-latest
+    
+        steps:
+        - uses: actions/checkout@v3
+        
+        - name: Cache DragonOS GCC
+          id: cache-dragonos-gcc
+          uses: actions/cache@v3
+          env:
+              cache-name: cache-dragonos-gcc
+          with:
+            path: |
+              ~/opt
+            key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
+        
+        - if: ${{ steps.cache-dragonos-gcc.outputs.cache-hit != 'true' }}
+          name: build dragonos-gcc
+          continue-on-error: true
+          run: bash tools/build_gcc_toolchain.sh -f
+        
+        - name: Cache build tools
+          id: cache-build-tools
+          uses: actions/cache@v3
+          env:
+              cache-name: cache-build-tools
+              dadk_version: 0.1.2
+          with:
+            path: |
+              ~/.cargo
+              ~/.rustup
+              ~/.bashrc
+            key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}
+        
+        - if: ${{ steps.cache-build-tools.outputs.cache-hit != 'true' }}
+          name: Install toolchain
+          continue-on-error: true
+          run:  | 
+            sudo sh -c "apt update && apt install -y llvm-dev libclang-dev clang gcc-multilib libssl-dev pkg-config"
+            cargo install cargo-binutils
+            rustup toolchain install nightly
+            rustup default nightly
+            rustup component add rust-src
+            rustup component add llvm-tools-preview
+            rustup target add x86_64-unknown-none
+            rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+            rustup component add rustfmt
+            cargo install dadk --version 0.1.2
+        

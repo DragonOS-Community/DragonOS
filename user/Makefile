@@ -112,4 +112,8 @@ clean:
 		cd $$subdir && $(MAKE) clean;\
 		cd .. ;\
 	done
-	
+
+.PHONY: fmt
+fmt:
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) -C libs
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) -C apps

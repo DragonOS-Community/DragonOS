@@ -2,8 +2,7 @@ use core::{
     hash::{Hash, Hasher},
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    ptr::null_mut,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -14,7 +13,7 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::process::ArchPCBInfo,
+    arch::{cpu, process::ArchPCBInfo},
     filesystem::vfs::{file::FileDescriptorVec, FileType},
     include::bindings::bindings::CLONE_SIGNAL,
     kdebug,
@@ -157,8 +156,12 @@ impl ProcessManager {
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         if pcb.sched_info().state() != ProcessState::Runnable {
-            sched_enqueue(pcb.clone(), true);
-            return Ok(());
+            let mut writer = pcb.sched_info_mut();
+            if writer.state() != ProcessState::Runnable {
+                writer.set_state(ProcessState::Runnable);
+                sched_enqueue(pcb.clone(), true);
+                return Ok(());
+            }
         }
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
@@ -406,6 +409,10 @@ impl ProcessControlBlock {
         return self.sched_info.write();
     }
 
+    pub fn sched_info_mut_irqsave(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
+        return self.sched_info.write_irqsave();
+    }
+
     pub fn worker_private(&self) -> SpinLockGuard<Option<WorkerPrivate>> {
         return self.worker_private.lock();
     }
@@ -534,10 +541,10 @@ impl ProcessBasicInfo {
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
     /// 当前进程所在的cpu
-    on_cpu: Option<u32>,
+    on_cpu: AtomicI32,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    migrate_to: Option<u32>,
+    migrate_to: AtomicI32,
 
     /// 当前进程的状态
     state: ProcessState,
@@ -553,9 +560,13 @@ pub struct ProcessSchedulerInfo {
 
 impl ProcessSchedulerInfo {
     pub fn new(on_cpu: Option<u32>) -> RwLock<Self> {
+        let cpu_id = match on_cpu {
+            Some(cpu_id) => cpu_id as i32,
+            None => -1,
+        };
         return RwLock::new(Self {
-            on_cpu,
-            migrate_to: None,
+            on_cpu: AtomicI32::new(cpu_id),
+            migrate_to: AtomicI32::new(-1),
             state: ProcessState::Blocked(false),
             sched_policy: SchedPolicy::CFS,
             virtual_runtime: AtomicIsize::new(0),
@@ -565,19 +576,37 @@ impl ProcessSchedulerInfo {
     }
 
     pub fn on_cpu(&self) -> Option<u32> {
-        return self.on_cpu;
+        let on_cpu = self.on_cpu.load(Ordering::SeqCst);
+        if on_cpu == -1 {
+            return None;
+        } else {
+            return Some(on_cpu as u32);
+        }
     }
 
-    pub fn set_on_cpu(&mut self, on_cpu: Option<u32>) {
-        self.on_cpu = on_cpu;
+    pub fn set_on_cpu(&self, on_cpu: Option<u32>) {
+        if let Some(cpu_id) = on_cpu {
+            self.on_cpu.store(cpu_id as i32, Ordering::SeqCst);
+        } else {
+            self.on_cpu.store(-1, Ordering::SeqCst);
+        }
     }
 
     pub fn migrate_to(&self) -> Option<u32> {
-        return self.migrate_to;
+        let migrate_to = self.migrate_to.load(Ordering::SeqCst);
+        if migrate_to == -1 {
+            return None;
+        } else {
+            return Some(migrate_to as u32);
+        }
     }
 
-    pub fn set_migrate_to(&mut self, migrate_to: Option<u32>) {
-        self.migrate_to = migrate_to;
+    pub fn set_migrate_to(&self, migrate_to: Option<u32>) {
+        if let Some(data) = migrate_to {
+            self.migrate_to.store(data as i32, Ordering::SeqCst);
+        } else {
+            self.migrate_to.store(-1, Ordering::SeqCst)
+        }
     }
 
     pub fn state(&self) -> ProcessState {

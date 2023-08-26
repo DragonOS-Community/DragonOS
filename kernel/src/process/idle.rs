@@ -54,8 +54,7 @@ impl ProcessManager {
             };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
-            idle_pcb.sched_info_mut().set_on_cpu(Some(i as u32));
-
+            idle_pcb.sched_info().set_on_cpu(Some(i as u32));
             v.push(idle_pcb);
         }
 

@@ -177,13 +177,14 @@ impl ProcessManager {
     ///
     /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246
     pub fn exit(exit_code: usize) -> ! {
-        unsafe { CurrentIrqArch::interrupt_disable() };
+        // 关中断
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
         pcb.sched_info
             .write()
             .set_state(ProcessState::Exited(exit_code));
         drop(pcb);
-        unsafe { CurrentIrqArch::interrupt_enable() };
+        drop(irq_guard);
         ProcessManager::exit_notify();
         sched();
         loop {}
@@ -199,6 +200,7 @@ impl ProcessManager {
                 drop(pcb);
                 ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
             } else {
+                // 如果不为1就panic
                 panic!("pcb is still referenced");
             }
         }

@@ -17,3 +17,8 @@ clean:
 		cd $$subdir && $(MAKE) clean;\
 		cd .. ;\
 	done
+
+.PHONY: clean
+fmt:
+	@echo "格式化代码: user/libs"
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) -C libc fmt

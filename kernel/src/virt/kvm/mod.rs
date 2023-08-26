@@ -17,6 +17,7 @@ mod vm_dev;
 mod vcpu_dev;
 pub mod vcpu;
 pub mod hypervisor;
+pub mod host_mem;
 
 // pub const KVM_MAX_VCPUS:u32 = 255;
 pub const GUEST_STACK_SIZE:usize = 1024;

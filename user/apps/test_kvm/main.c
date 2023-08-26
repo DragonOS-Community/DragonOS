@@ -22,11 +22,13 @@
 #define KVM_SET_USER_MEMORY_REGION 0x01
 
 struct kvm_userspace_memory_region {
-    uint32_t slot;
+    uint32_t slot; // 要在哪个slot上注册内存区间
+    // flags有两个取值，KVM_MEM_LOG_DIRTY_PAGES和KVM_MEM_READONLY，用来指示kvm针对这段内存应该做的事情。
+    // KVM_MEM_LOG_DIRTY_PAGES用来开启内存脏页，KVM_MEM_READONLY用来开启内存只读。
     uint32_t flags;
-    uint64_t guest_phys_addr;
-    uint64_t memory_size;
-    uint64_t userspace_addr;
+    uint64_t guest_phys_addr; // 虚机内存区间起始物理地址
+    uint64_t memory_size;     // 虚机内存区间大小
+    uint64_t userspace_addr;  // 虚机内存区间对应的主机虚拟地址
 };
 
 // int guest_code(){

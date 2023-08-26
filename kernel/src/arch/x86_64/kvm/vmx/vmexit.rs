@@ -149,26 +149,26 @@ pub extern "C" fn vmx_return(){
     unsafe {save_rpg()};
     // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
     unsafe {asm!(
-        // "sub     rsp, 60h",
-        // "movaps  xmmword ptr [rsp +  0h], xmm0",
-        // "movaps  xmmword ptr [rsp + 10h], xmm1",
-        // "movaps  xmmword ptr [rsp + 20h], xmm2",
-        // "movaps  xmmword ptr [rsp + 30h], xmm3",
-        // "movaps  xmmword ptr [rsp + 40h], xmm4",
-        // "movaps  xmmword ptr [rsp + 50h], xmm5",
+        "sub     rsp, 60h",
+        "movaps  xmmword ptr [rsp +  0h], xmm0",
+        "movaps  xmmword ptr [rsp + 10h], xmm1",
+        "movaps  xmmword ptr [rsp + 20h], xmm2",
+        "movaps  xmmword ptr [rsp + 30h], xmm3",
+        "movaps  xmmword ptr [rsp + 40h], xmm4",
+        "movaps  xmmword ptr [rsp + 50h], xmm5",
 
         "mov     rdi, rsp",
         "sub     rsp, 20h",
         "call vmexit_handler",
         "add     rsp, 20h",
 
-        // "movaps  xmm0, xmmword ptr [rsp +  0h]",
-        // "movaps  xmm1, xmmword ptr [rsp + 10h]",
-        // "movaps  xmm2, xmmword ptr [rsp + 20h]",
-        // "movaps  xmm3, xmmword ptr [rsp + 30h]",
-        // "movaps  xmm4, xmmword ptr [rsp + 40h]",
-        // "movaps  xmm5, xmmword ptr [rsp + 50h]",
-        // "add     rsp, 60h",
+        "movaps  xmm0, xmmword ptr [rsp +  0h]",
+        "movaps  xmm1, xmmword ptr [rsp + 10h]",
+        "movaps  xmm2, xmmword ptr [rsp + 20h]",
+        "movaps  xmm3, xmmword ptr [rsp + 30h]",
+        "movaps  xmm4, xmmword ptr [rsp + 40h]",
+        "movaps  xmm5, xmmword ptr [rsp + 50h]",
+        "add     rsp, 60h",
     clobber_abi("C"),
     )};
     unsafe{restore_rpg()};

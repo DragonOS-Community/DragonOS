@@ -378,8 +378,8 @@ impl Vcpu for VmxVcpu {
         // kdebug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
         // kdebug!("vmcs init host rsp: {:#x}", x86::bits64::registers::rsp());
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32, x86::bits64::registers::rsp())?;
-        vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
-        vmx_vmwrite(VmcsFields::HOST_RSP as u32,  x86::bits64::registers::rsp())?;
+        // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
+        // vmx_vmwrite(VmcsFields::HOST_RSP as u32,  x86::bits64::registers::rsp())?;
         
         match vmx_vmlaunch() {
             Ok(_) => {},

@@ -631,7 +631,6 @@ impl Syscall {
             Err(e) => return Err(e),
         }
     }
-
 }
 
 #[repr(C)]

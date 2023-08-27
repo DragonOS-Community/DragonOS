@@ -143,19 +143,34 @@ impl LocalAPIC for XApic {
 
             // 定时器从 lapic[TICR] 开始按总线频率反复倒计时，然后发出中断。
             // 如果需要更精确的时间保持，TICR 应该使用外部时间源进行校准。
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV.into(), X1);
+            self.write(
+                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV.into(),
+                X1,
+            );
             self.write(
                 LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER.into(),
                 PERIODIC | (T_IRQ0 + IRQ_TIMER),
             );
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_INITIAL_COUNT_REG.into(), 10000000);
+            self.write(
+                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_INITIAL_COUNT_REG.into(),
+                10000000,
+            );
 
             // 禁用逻辑中断线
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0.into(), MASKED);
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1.into(), MASKED);
+            self.write(
+                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0.into(),
+                MASKED,
+            );
+            self.write(
+                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1.into(),
+                MASKED,
+            );
 
             // 禁用支持性能计数器溢出中断的机器
-            if (self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16 & 0xFF) >= 4 {
+            if (self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16
+                & 0xFF)
+                >= 4
+            {
                 self.write(PCINT, MASKED);
             }
 
@@ -173,9 +188,17 @@ impl LocalAPIC for XApic {
             self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
 
             // 发送 Init Level De-Assert 信号以同步仲裁ID
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(), 0);
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(), BCAST | INIT | LEVEL);
-            while self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0 {}
+            self.write(
+                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
+                0,
+            );
+            self.write(
+                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
+                BCAST | INIT | LEVEL,
+            );
+            while self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS
+                != 0
+            {}
 
             // 启用 APIC 上的中断（但不在处理器上启用）
             self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_TPR.into(), 0);

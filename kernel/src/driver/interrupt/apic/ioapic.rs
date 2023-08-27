@@ -71,14 +71,14 @@ impl IoApic {
         dest_logic: bool,
         mut mask: bool,
     ) {
-        //重定向表从 REG_TABLE 开始，使用两个寄存器来配置每个中断。 
-        //一对中的第一个（低位）寄存器包含配置位。32bit 
-        //第二个（高）寄存器包含一个位掩码，告诉哪些 CPU 可以服务该中断。
-        // level_triggered：如果为真，表示中断触发方式为电平触发（level-triggered），则将RedirectionEntry::LEVEL标志位设置在flags中。
-        // active_high：如果为假，表示中断的极性为低电平有效（active-low），则将RedirectionEntry::ACTIVELOW标志位设置在flags中。
-        // dest_logic：如果为真，表示中断目标为逻辑模式（logical mode），则将RedirectionEntry::LOGICAL标志位设置在flags中。
-        // !(0x20..=0xef).contains(&vector)：判断中断向量号（vector）是否在范围0x20到0xef之外，如果是，则表示中断无效，将mask标志位设置为真。
-        // mask：如果为真，表示中断被屏蔽（masked），将RedirectionEntry::DISABLED标志位设置在flags中。
+        // 重定向表从 REG_TABLE 开始，使用两个寄存器来配置每个中断。
+        // 一对中的第一个（低位）寄存器包含配置位。32bit
+        // 第二个（高）寄存器包含一个位掩码，告诉哪些 CPU 可以服务该中断。
+        //  level_triggered：如果为真，表示中断触发方式为电平触发（level-triggered），则将RedirectionEntry::LEVEL标志位设置在flags中。
+        //  active_high：如果为假，表示中断的极性为低电平有效（active-low），则将RedirectionEntry::ACTIVELOW标志位设置在flags中。
+        //  dest_logic：如果为真，表示中断目标为逻辑模式（logical mode），则将RedirectionEntry::LOGICAL标志位设置在flags中。
+        //  !(0x20..=0xef).contains(&vector)：判断中断向量号（vector）是否在范围0x20到0xef之外，如果是，则表示中断无效，将mask标志位设置为真。
+        //  mask：如果为真，表示中断被屏蔽（masked），将RedirectionEntry::DISABLED标志位设置在flags中。
         let mut flags = RedirectionEntry::NONE;
         if level_triggered {
             flags |= RedirectionEntry::LEVEL;

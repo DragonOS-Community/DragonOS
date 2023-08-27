@@ -1,12 +1,12 @@
 use x86::time::rdtsc;
 // use x86::cpuid::CpuId
-use x86::msr::{rdmsr, wrmsr};
-use ::core::arch::asm;
-use crate::kerror;
+use crate::arch::CurrentIrqArch;
 use crate::driver::interrupt::apic::xapic::XApic;
 use crate::exception::InterruptArch;
-use crate::arch::CurrentIrqArch;
+use crate::kerror;
+use ::core::arch::asm;
 pub use drop;
+use x86::msr::{rdmsr, wrmsr};
 
 // pub enum ApicTimerMode {
 //     OneShot {
@@ -24,14 +24,13 @@ pub use drop;
 //     pub fn start_timer(&self, duration: u64) {
 //         match self {
 //             ApicTimerMode::OneShot { enabled } => {
-                
+
 //             }
 //             ApicTimerMode::Periodic { enabled } => {
-                
+
 //             }
 //             ApicTimerMode::TSCDeadline { enabled } => {
-                
-               
+
 //             }
 //         }
 //     }
@@ -107,7 +106,7 @@ impl LocalApicTimer {
             .overflowing_add((self.frequency as u64 / 1000) * ms as u64)
     }
 
-    /// 重置下一次中断的计时器截止时间 
+    /// 重置下一次中断的计时器截止时间
     ///
     /// 此函数是从中断处理程序调用的。
     /// Set [`Self::reload_value`] += TIMER_INTERVAL
@@ -122,13 +121,13 @@ impl LocalApicTimer {
                 let old_value = self.reload_value;
                 self.reload_value = reload_value;
                 drop(irq_guard);
-            let current = unsafe { rdtsc() };
-            if overflowed {
-                (old_value > current) && (self.reload_value <= current)
-            } else {
-                self.reload_value <= current
+                let current = unsafe { rdtsc() };
+                if overflowed {
+                    (old_value > current) && (self.reload_value <= current)
+                } else {
+                    self.reload_value <= current
+                }
             }
-        }
         } else {
             false
         }
@@ -152,11 +151,7 @@ impl LocalApicTimer {
     /// 它是否能够得到TSC的频率，以及它是否是不变的。
     /// 之后，此函数设置寄存器以启用它。
     /// 如果启用，则当前值将永久为零。
-    pub fn enable_deadline_mode(
-        &mut self,
-        vector: u16,
-        local_apic_manager: &mut XApic,
-    ) -> bool {
+    pub fn enable_deadline_mode(&mut self, vector: u16, local_apic_manager: &mut XApic) -> bool {
         if !self.is_deadline_mode_supported() {
             return false;
         }
@@ -173,14 +168,14 @@ impl LocalApicTimer {
             return false;
         }
 
-        unsafe { 
+        unsafe {
             let irq_guard = CurrentIrqArch::save_and_disable_irq();
 
-            self.frequency = (( rdmsr(0xce) as usize >> 8) & 0xff) * 100 * 1000000;
+            self.frequency = ((rdmsr(0xce) as usize >> 8) & 0xff) * 100 * 1000000;
             /* Frequency = MSRS(0xCE)[15:8] * 100MHz
              * 2.12 MSRS IN THE 3RD GENERATION INTEL(R) CORE(TM) PROCESSOR FAMILY
              * (BASED ON INTEL® MICROARCHITECTURE CODE NAME IVY BRIDGE) Intel SDM Vol.4 2-198 */
-             /* TODO */
+            /* TODO */
             if self.frequency == 0 {
                 drop(irq_guard);
                 kerror!("Cannot get the frequency of TSC.");
@@ -191,10 +186,10 @@ impl LocalApicTimer {
                 //LvtTimer,
                 0x32,
                 (0b101 << 16) | (vector as u32),
-        );
-        self.is_deadline_mode_enabled = true;
-        drop(irq_guard);
-        return true;
+            );
+            self.is_deadline_mode_enabled = true;
+            drop(irq_guard);
+            return true;
         }
     }
 
@@ -202,95 +197,103 @@ impl LocalApicTimer {
     ///
     /// interval_ms 表示触发中断的间隔时间
     /// local_apic 是 XApic 的实例，用于读写 Local APIC 寄存器
-    pub fn enable_periodic_mode(&mut self, interval_ms: u64, local_apic: &mut XApic, vector: u16) -> bool {
+    pub fn enable_periodic_mode(
+        &mut self,
+        interval_ms: u64,
+        local_apic: &mut XApic,
+        vector: u16,
+    ) -> bool {
         if self.is_periodic_mode_enabled || self.frequency == 0 {
             return false;
         }
-        unsafe{
-        let irq_guard = CurrentIrqArch::save_and_disable_irq();
+        unsafe {
+            let irq_guard = CurrentIrqArch::save_and_disable_irq();
 
-        local_apic.write(0x3e, 0b1011);
-        // TimerDivide 0x3e
-        local_apic.write(0x32, (0b001 << 16) | vector as u32); 
-        /*Masked*/
-        // LvtTimer 0x32
+            local_apic.write(0x3e, 0b1011);
+            // TimerDivide 0x3e
+            local_apic.write(0x32, (0b001 << 16) | vector as u32);
+            /*Masked*/
+            // LvtTimer 0x32
 
-        // 设置Periodic模式的重载值
-        self.periodic_interval = (self.frequency / 1000) as u64 * interval_ms;
-        local_apic.write(
-            //TimerInitialCount,
-            0x38,
-            self.periodic_interval as u32,
-        );
+            // 设置Periodic模式的重载值
+            self.periodic_interval = (self.frequency / 1000) as u64 * interval_ms;
+            local_apic.write(
+                //TimerInitialCount,
+                0x38,
+                self.periodic_interval as u32,
+            );
 
-        self.is_periodic_mode_enabled = true;
+            self.is_periodic_mode_enabled = true;
 
-        drop(irq_guard);
-        true
-    }
+            drop(irq_guard);
+            true
+        }
     }
 
     /// 设置oneshot模式
     ///
     /// interval_ms 表示触发中断的间隔时间
     /// local_apic 是 XApic 的实例，用于读写 Local APIC 寄存器
-    pub fn enable_oneshot_mode(&mut self, interval_ms: u64, local_apic: &mut XApic, vector: u32) -> bool {
+    pub fn enable_oneshot_mode(
+        &mut self,
+        interval_ms: u64,
+        local_apic: &mut XApic,
+        vector: u32,
+    ) -> bool {
         if self.is_oneshot_mode_enabled || self.frequency == 0 {
             return false;
         }
-        unsafe{
-        let irq_guard = CurrentIrqArch::save_and_disable_irq();
-        
-        local_apic.write(0x3e, 0b1011);
-        // TimerDivide 0x3e
-        local_apic.write(0x32, (0b001 << 16) | vector as u32); /*Masked*/
-        // LvtTimer 0x32
+        unsafe {
+            let irq_guard = CurrentIrqArch::save_and_disable_irq();
 
-        // 设置单次触发模式的重载值
-        self.oneshot_interval = (self.frequency / 1000) as u64 * interval_ms;
-        self.oneshot_triggered = false;
-        self.is_oneshot_mode_enabled = true;
-
-        drop(irq_guard);
-        true
-        }
-    }
-
-      /// 启动定时器中断
-    pub fn start_interrupt_oneshot(&mut self, local_apic: &mut XApic) -> bool {
-        unsafe{
-        let irq_guard = CurrentIrqArch::save_and_disable_irq();
-        if self.is_interrupt_enabled || self.frequency == 0 {
-            drop(irq_guard);
-            return false;
-        }
-    
-
-        if self.is_oneshot_mode_enabled {
-            let mut lvt = local_apic.read(0x32);
+            local_apic.write(0x3e, 0b1011);
+            // TimerDivide 0x3e
+            local_apic.write(0x32, (0b001 << 16) | vector as u32); /*Masked*/
             // LvtTimer 0x32
-            lvt &= !(0b111 << 16);
-            lvt |= 0b01 << 17;
-            local_apic.write(0x32, lvt);
-            // LvtTimer 0x32
-            
+
             // 设置单次触发模式的重载值
-            local_apic.write(
-                //TimerInitialCount,
-                0x38,
-                self.oneshot_interval as u32,
-            );
-
+            self.oneshot_interval = (self.frequency / 1000) as u64 * interval_ms;
             self.oneshot_triggered = false;
-        } 
+            self.is_oneshot_mode_enabled = true;
 
-        self.is_interrupt_enabled = true;
-        drop(irq_guard);
-        true
-    }
+            drop(irq_guard);
+            true
+        }
     }
 
-    
+    /// 启动定时器中断
+    pub fn start_interrupt_oneshot(&mut self, local_apic: &mut XApic) -> bool {
+        unsafe {
+            let irq_guard = CurrentIrqArch::save_and_disable_irq();
+            if self.is_interrupt_enabled || self.frequency == 0 {
+                drop(irq_guard);
+                return false;
+            }
+
+            if self.is_oneshot_mode_enabled {
+                let mut lvt = local_apic.read(0x32);
+                // LvtTimer 0x32
+                lvt &= !(0b111 << 16);
+                lvt |= 0b01 << 17;
+                local_apic.write(0x32, lvt);
+                // LvtTimer 0x32
+
+                // 设置单次触发模式的重载值
+                local_apic.write(
+                    //TimerInitialCount,
+                    0x38,
+                    self.oneshot_interval as u32,
+                );
+
+                self.oneshot_triggered = false;
+            }
+
+            self.is_interrupt_enabled = true;
+            drop(irq_guard);
+            true
+        }
+    }
+
     /// 设置定时器的中断。
     ///
     /// 此功能调用其他计时器来计算计时器的频率。
@@ -311,19 +314,19 @@ impl LocalApicTimer {
         if self.frequency != 0 {
             return false;
         }
-        unsafe{
-        let irq_guard = CurrentIrqArch::save_and_disable_irq();
+        unsafe {
+            let irq_guard = CurrentIrqArch::save_and_disable_irq();
 
-        local_apic.write(0x3e, 0b1011); //TimerDivide 0x3e
-        local_apic.write(0x32, (0b001 << 16) | vector as u32); /*LvtTimer Masked*/
-        self.reload_value = u32::MAX as u64;
-        local_apic.write(0x38, u32::MAX); //TimerInitialCount 0x38
-        timer.busy_wait_ms(50);
-        let end = local_apic.read(0x39); //TimerCurrentCount 0x39
-        let difference = self.get_difference(u32::MAX as usize, end as usize);
-        self.frequency = difference * 20;
-        drop(irq_guard);
-        return true;
+            local_apic.write(0x3e, 0b1011); //TimerDivide 0x3e
+            local_apic.write(0x32, (0b001 << 16) | vector as u32); /*LvtTimer Masked*/
+            self.reload_value = u32::MAX as u64;
+            local_apic.write(0x38, u32::MAX); //TimerInitialCount 0x38
+            timer.busy_wait_ms(50);
+            let end = local_apic.read(0x39); //TimerCurrentCount 0x39
+            let difference = self.get_difference(u32::MAX as usize, end as usize);
+            self.frequency = difference * 20;
+            drop(irq_guard);
+            return true;
         }
     }
 
@@ -332,33 +335,33 @@ impl LocalApicTimer {
     /// 在调用之前确保已设置中断。
     /// 目前，该函数将1000ms设置为间隔，是可变的
     pub fn start_interrupt_deadline(&mut self, local_apic: &mut XApic) -> bool {
-        unsafe{
-        let irq_guard = CurrentIrqArch::save_and_disable_irq();
-        if self.is_interrupt_enabled || self.frequency == 0 {
-            drop(irq_guard);
-            return false;
-        }
+        unsafe {
+            let irq_guard = CurrentIrqArch::save_and_disable_irq();
+            if self.is_interrupt_enabled || self.frequency == 0 {
+                drop(irq_guard);
+                return false;
+            }
 
-        if self.is_deadline_mode_enabled {
-            let mut lvt = local_apic.read(0x32);// LvtTimer寄存器0x32
-            lvt &= !(0b1 << 16);
-            local_apic.write(0x32, lvt); //LvtTimer寄存器0x32
-            self.reload_value = unsafe { rdtsc() };
-            self.reload_value = self
-                .calculate_next_reload_value(10) // TIMER_INTERVAL_MS值设置为10
-                .0;
-            self.write_deadline();
-        } else {
-            let mut lvt = local_apic.read(0x32);// LvtTimer
-            lvt &= !(0b111 << 16);
-            lvt |= 0b01 << 17;
-            local_apic.write(0x32, lvt);// LvtTimer
-            self.set_interval(10, local_apic); // TIMER_INTERVAL_MS
+            if self.is_deadline_mode_enabled {
+                let mut lvt = local_apic.read(0x32); // LvtTimer寄存器0x32
+                lvt &= !(0b1 << 16);
+                local_apic.write(0x32, lvt); //LvtTimer寄存器0x32
+                self.reload_value = unsafe { rdtsc() };
+                self.reload_value = self
+                    .calculate_next_reload_value(10) // TIMER_INTERVAL_MS值设置为10
+                    .0;
+                self.write_deadline();
+            } else {
+                let mut lvt = local_apic.read(0x32); // LvtTimer
+                lvt &= !(0b111 << 16);
+                lvt |= 0b01 << 17;
+                local_apic.write(0x32, lvt); // LvtTimer
+                self.set_interval(10, local_apic); // TIMER_INTERVAL_MS
+            }
+            self.is_interrupt_enabled = true;
+            drop(irq_guard);
+            return true;
         }
-        self.is_interrupt_enabled = true;
-        drop(irq_guard);
-        return true;
-    }
     }
 
     ///设置间隔模式的重载值
@@ -371,12 +374,9 @@ impl LocalApicTimer {
             return false;
         }
         self.reload_value = (self.frequency / 1000) as u64 * interval_ms;
-        unsafe{
-        local_apic.write(
-            0x38,
-            self.reload_value as u32,
-        );
-    }
+        unsafe {
+            local_apic.write(0x38, self.reload_value as u32);
+        }
         return true;
     }
 }
@@ -385,12 +385,12 @@ impl LocalApicTimer {
     fn get_count(&self) -> usize {
         if self.is_periodic_mode_enabled {
             let current_count = false;
-            let remaining_count = self.get_difference(self.periodic_interval as usize, current_count as usize);
+            let remaining_count =
+                self.get_difference(self.periodic_interval as usize, current_count as usize);
             remaining_count
         } else if self.is_deadline_mode_enabled {
             unsafe { rdtsc() as usize }
-        } 
-        else{
+        } else {
             0
         }
     }

@@ -165,11 +165,21 @@ impl ProcessManager {
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
-    pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
-        todo!()
+    pub unsafe fn sleep(interruptable: bool) -> Result<(), SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut writer = pcb.sched_info_mut();
+        if writer.state() != ProcessState::Exited(0) {
+            writer.set_state(ProcessState::Blocked(interruptable));
+            sched();
+            return Ok(());
+        }
+        return Err(SystemError::EINTR);
     }
+
     /// 当子进程退出后向父进程发送通知
-    fn exit_notify() {}
+    fn exit_notify() {
+        todo!("exit_notify");
+    }
     /// 退出进程，回收资源
     ///
     /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246

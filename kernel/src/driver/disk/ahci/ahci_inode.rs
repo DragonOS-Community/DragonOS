@@ -1,10 +1,10 @@
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::io::device::BlockDevice;
 use crate::filesystem::vfs::{
     core::generate_inode_id, make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode,
     Metadata, PollStatus,
 };
-use crate::io::device::BlockDevice;
 use crate::syscall::SystemError;
 use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{

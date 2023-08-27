@@ -154,19 +154,28 @@ impl ProcessManager {
 
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        if pcb.sched_info().state() != ProcessState::Runnable {
+        let state = pcb.sched_info().state();
+        if state.is_blocked() {
             let mut writer = pcb.sched_info_mut();
-            if writer.state() != ProcessState::Runnable {
+            let state = writer.state();
+            if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
                 sched_enqueue(pcb.clone(), true);
                 return Ok(());
+            } else if state.is_exited() {
+                return Err(SystemError::EINVAL);
+            } else {
+                return Ok(());
             }
+        } else if state.is_exited() {
+            return Err(SystemError::EINVAL);
+        } else {
+            return Ok(());
         }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
-    pub unsafe fn sleep(interruptable: bool) -> Result<(), SystemError> {
+    pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
         let pcb = ProcessManager::current_pcb();
         let mut writer = pcb.sched_info_mut();
         if writer.state() != ProcessState::Exited(0) {
@@ -289,6 +298,23 @@ pub enum ProcessState {
     // Stopped(SignalNumber),
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
+}
+
+impl ProcessState {
+    #[inline(always)]
+    pub fn is_runnable(&self) -> bool {
+        return matches!(self, ProcessState::Runnable);
+    }
+
+    #[inline(always)]
+    pub fn is_blocked(&self) -> bool {
+        return matches!(self, ProcessState::Blocked(_));
+    }
+
+    #[inline(always)]
+    pub fn is_exited(&self) -> bool {
+        return matches!(self, ProcessState::Exited(_));
+    }
 }
 
 bitflags! {

@@ -1,10 +1,7 @@
 use super::transport_pci::PciTransport;
 use super::virtio_impl::HalImpl;
 use crate::driver::net::virtio_net::virtio_net;
-use crate::driver::pci::pci::PciDeviceStructureGeneralDevice;
-use crate::driver::pci::pci::{
-    get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
-};
+use crate::driver::pci::pci::{ PciDeviceStructureGeneralDevice, get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST};
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::{kdebug, kerror, kwarn};
 use alloc::{boxed::Box, collections::LinkedList};

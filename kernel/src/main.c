@@ -27,7 +27,6 @@
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
-#include "driver/pci/pci.h"
 #include <driver/timers/HPET/HPET.h>
 #include <driver/uart/uart.h>
 #include <driver/video/video.h>
@@ -164,8 +163,6 @@ void system_initialize()
 
     ps2_keyboard_init();
     io_mfence();
-
-    pci_init();
 
     rs_pci_init();
 

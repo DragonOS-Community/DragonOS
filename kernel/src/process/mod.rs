@@ -14,6 +14,7 @@ use hashbrown::HashMap;
 
 use crate::{
     arch::{process::ArchPCBInfo, sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
@@ -37,7 +38,7 @@ use crate::{
         SchedPolicy, SchedPriority,
     },
     smp::kick_cpu,
-    syscall::SystemError, exception::InterruptArch,
+    syscall::SystemError,
 };
 
 use self::kthread::WorkerPrivate;

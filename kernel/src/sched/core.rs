@@ -3,15 +3,12 @@ use core::sync::atomic::compiler_fence;
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    arch::{asm::current::current_pcb, cpu::current_cpu_id},
+    arch::cpu::current_cpu_id,
+    include::bindings::bindings::process_control_block,
     include::bindings::bindings::smp_get_total_cpu,
-    include::bindings::bindings::{
-        process_control_block, MAX_CPU_NUM, PF_NEED_MIGRATE, SCHED_FIFO, SCHED_NORMAL, SCHED_RR,
-    },
     kinfo,
     mm::percpu::PerCpu,
-    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
-    syscall::SystemError,
+    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
@@ -67,7 +64,7 @@ pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
             && !pcb.flags().contains(ProcessFlags::NEED_MIGRATE))
     {
         pcb.flags().insert(ProcessFlags::NEED_MIGRATE);
-        pcb.sched_info_mut().set_migrate_to(Some(min_loads_cpu_id));
+        pcb.sched_info().set_migrate_to(Some(min_loads_cpu_id));
         // kdebug!("set migrating, pcb:{:?}", pcb);
     }
 }
@@ -119,14 +116,11 @@ pub extern "C" fn sched_enqueue_old(pcb: &'static mut process_control_block, mut
 /// @param reset_time 是否重置虚拟运行时间
 pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-    // 调度器不处理running位为0的进程，pcb重构后处理？
-    // if pcb.state & (PROC_RUNNING as u64) == 0 {
-    //     return;
-    // }
+    if pcb.sched_info().state() != ProcessState::Runnable {
+        return;
+    }
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
-
     // 除了IDLE以外的进程，都进行负载均衡
     if pcb.basic().pid().into() > 0 {
         loads_balance(pcb.clone());
@@ -135,8 +129,7 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     if pcb.flags().contains(ProcessFlags::NEED_MIGRATE) {
         // kdebug!("migrating pcb:{:?}", pcb);
         pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
-        pcb.sched_info_mut()
-            .set_on_cpu(pcb.sched_info().migrate_to());
+        pcb.sched_info().set_on_cpu(pcb.sched_info().migrate_to());
         reset_time = true;
     }
 

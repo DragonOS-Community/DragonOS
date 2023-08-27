@@ -1,5 +1,5 @@
 use crate::{
-    arch::{asm::current::current_pcb, context::switch_process, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     process::ProcessManager,
     syscall::{Syscall, SystemError},

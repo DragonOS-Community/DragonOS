@@ -7,7 +7,12 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::{process::ProcessManager, syscall::SystemError};
+use crate::{
+    arch::CurrentIrqArch,
+    exception::{InterruptArch, IrqFlagsGuard},
+    process::ProcessManager,
+    syscall::SystemError,
+};
 
 ///RwLock读写锁
 
@@ -56,6 +61,7 @@ pub struct RwLockUpgradableGuard<'a, T: 'a> {
 pub struct RwLockWriteGuard<'a, T: 'a> {
     data: *mut T,
     inner: &'a RwLock<T>,
+    irq_guard: Option<IrqFlagsGuard>,
 }
 
 unsafe impl<T: Send> Send for RwLock<T> {}
@@ -195,6 +201,7 @@ impl<T> RwLock<T> {
             return Some(RwLockWriteGuard {
                 data: unsafe { &mut *self.data.get() },
                 inner: self,
+                irq_guard: None,
             });
         } else {
             return None;
@@ -208,6 +215,22 @@ impl<T> RwLock<T> {
         loop {
             match self.try_write() {
                 Some(guard) => return guard,
+                None => spin_loop(),
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    /// @brief 获取WRITER守卫并关中断
+    pub fn write_irqsave(&self) -> RwLockWriteGuard<T> {
+        loop {
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            match self.try_write() {
+                Some(mut guard) => {
+                    guard.irq_guard = Some(irq_guard);
+                    return guard;
+                }
                 None => spin_loop(),
             }
         }
@@ -326,6 +349,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
             Ok(RwLockWriteGuard {
                 data: unsafe { &mut *inner.data.get() },
                 inner,
+                irq_guard: None,
             })
         } else {
             Err(self)
@@ -496,7 +520,7 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
         self.inner
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
-
+        self.irq_guard.take();
         ProcessManager::current_pcb().preempt_enable();
     }
 }

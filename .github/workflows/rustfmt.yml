@@ -34,7 +34,5 @@ jobs:
                     printf "\n" >> user/libs/libc/src/include/internal/bindings/bindings.rs
             
             - name: Check format
-              uses: actions-rs/cargo@v1
-              with:
-                  command: fmt
-                  args: --all -- --check
+              run: |
+                    FMT_CHECK=1 make fmt

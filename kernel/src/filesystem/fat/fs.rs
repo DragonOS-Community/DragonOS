@@ -350,6 +350,10 @@ impl FATFileSystem {
     /// @return Err(SystemError) 错误码
     pub fn get_fat_entry(&self, cluster: Cluster) -> Result<FATEntry, SystemError> {
         let current_cluster = cluster.cluster_num;
+        if current_cluster < 2 {
+            // 0号簇和1号簇是保留簇，不允许用户使用
+            return Err(SystemError::EINVAL);
+        }
 
         let fat_type: FATType = self.bpb.fat_type;
         // 获取FAT表的起始扇区（相对分区起始扇区的偏移量）
@@ -1459,6 +1463,44 @@ impl IndexNode for LockedFATInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
+    }
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+        let old_size = guard.metadata.size as usize;
+
+        match &mut guard.inode_type {
+            FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
+                // 如果新的长度和旧的长度相同，那么就直接返回
+                if len == old_size {
+                    return Ok(());
+                } else if len > old_size {
+                    // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut remain_size = len - old_size;
+                    let buf_size = remain_size;
+                    // let buf_size = core::cmp::min(remain_size, 512 * 1024);
+                    buf.resize(buf_size, 0);
+
+                    let mut offset = old_size;
+                    while remain_size > 0 {
+                        let write_size = core::cmp::min(remain_size, buf_size);
+                        file.write(fs, &buf[0..write_size], offset as u64)?;
+                        remain_size -= write_size;
+                        offset += write_size;
+                    }
+                } else {
+                    file.truncate(fs, len as u64)?;
+                }
+                guard.update_metadata();
+                return Ok(());
+            }
+            FATDirEntry::Dir(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        }
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {

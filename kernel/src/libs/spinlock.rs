@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use core::cell::UnsafeCell;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::ptr::read_volatile;
 
@@ -7,14 +8,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::asm::irqflags::{local_irq_restore, local_irq_save};
 use crate::arch::interrupt::{cli, sti};
+
 use crate::include::bindings::bindings::{spin_lock, spin_unlock, spinlock_t};
 use crate::process::preempt::{preempt_disable, preempt_enable};
 use crate::syscall::SystemError;
 
 /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
 #[inline]
-pub fn spin_lock_irqsave(lock: *mut spinlock_t, flags: &mut u64) {
-    *flags = local_irq_save() as u64;
+pub fn spin_lock_irqsave(lock: *mut spinlock_t, flags: &mut usize) {
+    *flags = local_irq_save();
     unsafe {
         spin_lock(lock);
     }
@@ -22,12 +24,11 @@ pub fn spin_lock_irqsave(lock: *mut spinlock_t, flags: &mut u64) {
 
 /// @brief 恢复rflags以及中断状态并解锁自旋锁
 #[inline]
-pub fn spin_unlock_irqrestore(lock: *mut spinlock_t, flags: &u64) {
+pub fn spin_unlock_irqrestore(lock: *mut spinlock_t, flags: usize) {
     unsafe {
         spin_unlock(lock);
     }
-    // kdebug!("123");
-    local_irq_restore(*flags as usize);
+    local_irq_restore(flags);
 }
 
 /// 判断一个自旋锁是否已经被加锁
@@ -108,6 +109,11 @@ impl RawSpinlock {
         self.0.store(false, Ordering::Release);
     }
 
+    /// 解锁，但是不更改preempt count
+    unsafe fn unlock_no_preempt(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
     /// @brief 放锁并开中断
     pub fn unlock_irq(&self) {
         self.unlock();
@@ -129,30 +135,29 @@ impl RawSpinlock {
     }
 
     /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
-    pub fn lock_irqsave(&self, flags: &mut u64) {
-        *flags = local_irq_save() as u64;
+    pub fn lock_irqsave(&self, flags: &mut usize) {
+        *flags = local_irq_save();
         self.lock();
     }
 
     /// @brief 恢复rflags以及中断状态并解锁自旋锁
-    pub fn unlock_irqrestore(&self, flags: &u64) {
+    pub fn unlock_irqrestore(&self, flags: usize) {
         self.unlock();
-        local_irq_restore(*flags as usize);
+        local_irq_restore(flags);
     }
 
     /// @brief 尝试保存中断状态到flags中，关闭中断，并对自旋锁加锁
     /// @return 加锁成功->true
     ///         加锁失败->false
     #[inline(always)]
-    pub fn try_lock_irqsave(&self, flags: &mut u64) -> bool {
-        *flags = local_irq_save() as u64;
+    pub fn try_lock_irqsave(&self, flags: &mut usize) -> bool {
+        *flags = local_irq_save();
         if self.try_lock() {
             return true;
         }
-        local_irq_restore(*flags as usize);
+        local_irq_restore(*flags);
         return false;
     }
-
 }
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///
@@ -169,7 +174,25 @@ pub struct SpinLock<T> {
 #[derive(Debug)]
 pub struct SpinLockGuard<'a, T: 'a> {
     lock: &'a SpinLock<T>,
-    flag: u64,
+    flag: usize,
+}
+
+impl<'a, T: 'a> SpinLockGuard<'a, T> {
+    /// 泄露自旋锁的守卫，返回一个可变的引用
+    ///
+    ///  ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    #[inline]
+    pub unsafe fn leak(this: Self) -> &'a mut T {
+        // Use ManuallyDrop to avoid stacked-borrow invalidation
+        let this = ManuallyDrop::new(this);
+        // We know statically that only we are referencing data
+        unsafe { &mut *this.lock.data.get() }
+    }
 }
 
 /// 向编译器保证，SpinLock在线程之间是安全的.
@@ -195,7 +218,8 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<T> {
-        let mut flags: u64 = 0;
+        let mut flags: usize = 0;
+
         self.lock.lock_irqsave(&mut flags);
         // 加锁成功，返回一个守卫
         return SpinLockGuard {
@@ -215,7 +239,7 @@ impl<T> SpinLock<T> {
     }
 
     pub fn try_lock_irqsave(&self) -> Result<SpinLockGuard<T>, SystemError> {
-        let mut flags: u64 = 0;
+        let mut flags: usize = 0;
         if self.lock.try_lock_irqsave(&mut flags) {
             return Ok(SpinLockGuard {
                 lock: self,
@@ -223,6 +247,16 @@ impl<T> SpinLock<T> {
             });
         }
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+
+    /// 强制解锁，并且不更改preempt count
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致preempt count不正确，因此必须小心的手动维护好preempt count。
+    /// 如非必要，请不要使用这个函数。
+    pub unsafe fn force_unlock(&self) {
+        self.lock.unlock_no_preempt();
     }
 }
 
@@ -246,7 +280,7 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         if self.flag != 0 {
-            self.lock.lock.unlock_irqrestore(&self.flag);
+            self.lock.lock.unlock_irqrestore(self.flag);
         } else {
             self.lock.lock.unlock();
         }

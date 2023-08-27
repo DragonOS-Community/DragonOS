@@ -19,29 +19,29 @@ CHANGE_SOURCE=0
 FORCE=0
 SAVE_CACHE=0
 while true; do
-	if [ ! -n "$1" ]; then
-		break
-	fi
-	case "$1" in
+    if [ ! -n "$1" ]; then
+        break
+    fi
+    case "$1" in
         "-save-cache")
             SAVE_CACHE=1
-        ;;
-		"-rebuild")	
-			echo "清除${INSTALL_POS}目录下的所有信息"
+            ;;
+        "-rebuild")
+            echo "清除${INSTALL_POS}目录下的所有信息"
             rm -rf "${INSTALL_POS}"
-		;; 
-		"-kb")
-			KEEP_BINUTILS=1
-		;;
-		"-kg")
-			KEEP_GCC=1
-		;;
+            ;;
+        "-kb")
+            KEEP_BINUTILS=1
+            ;;
+        "-kg")
+            KEEP_GCC=1
+            ;;
         "-cs")
             CHANGE_SOURCE=1
-        ;;
+            ;;
         "-f")
             FORCE=1
-        ;;
+            ;;
         "-help")
             echo "脚本选项如下:"
             echo "-save-cache: 保留最后的下载压缩包"
@@ -50,12 +50,12 @@ while true; do
             echo "-kb(keep-binutils): 您确保binutils已被编译安装, 本次调用脚本不重复编译安装binutils. 如果没有安装，脚本仍然会自动安装."
             echo "-cs(change source): 如果包含该选项, 使用清华源下载gcc和binutils. 否则默认官方源."
             echo "-f(force): 如果包含该选项, 可以强制使用root权限安装在/root/目录下."
-		;;
-		*)
-			echo "不认识参数$1"
-		;;
-	esac
-	shift 1
+            ;;
+        *)
+            echo "不认识参数$1"
+            ;;
+    esac
+    shift 1
 done
 
 # check: Don't install the gcc-toolchain in /root/*
@@ -74,16 +74,26 @@ fi
 # install prerequisited
 # 注意texinfo和binutils的版本是否匹配
 # 注意gmp/mpc/mpfr和gcc/g++的版本是否匹配
-sudo apt-get install -y \
-    g++ \
-    gcc \
-    make \
-    texinfo \
-    libgmp3-dev \
-    libmpc-dev \
-    libmpfr-dev \
-    flex \
-    wget
+echo "Start installing prerequisited packages"
+case `cat /etc/os-release | grep '^NAME=' | cut -d'"' -f2` in
+    "Debian"* | "Ubuntu"*)
+        sudo apt-get install -y \
+            g++ \
+            gcc \
+            make \
+            texinfo \
+            libgmp3-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            flex \
+            wget
+        ;;
+    "Arch"*)
+        sudo pacman -S --needed --noconfirm gcc make flex wget texinfo libmpc gmp mpfr
+        ;;
+    *)
+        ;;
+esac
 
 # build the workspace
 mkdir $HOME/opt
@@ -95,8 +105,8 @@ cd $INSTALL_POS
 # compile binutils
 BIN_UTILS="binutils-2.38"
 BIN_UTILS_TAR="${BIN_UTILS}.tar.gz"
-if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin/ -name ${TARGET_AS})" ]] || [ KEEP_BINUTILS -ne 1 ]; then
-    if [ KEEP_BINUTILS -eq 1 ]; then
+if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin/ -name ${TARGET_AS})" ]] || [ ${KEEP_BINUTILS} -ne 1 ]; then
+    if [ ${KEEP_BINUTILS} -eq 1 ]; then
         echo -e "\033[35m 没有检测到 ${TARGET_LD} 或 没有检测到 ${TARGET_AS}, -kb参数无效 \033[0m"
         echo -e "\033[35m 开始安装binutils \033[0m"
         sleep 1s
@@ -104,7 +114,7 @@ if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin
     if [ ! -d "$BIN_UTILS" ]; then
         if [ ! -f "$BIN_UTILS_TAR" ]; then
             echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数-cs, 即: bash build_gcc_toolchain.sh -cs  \033[0m "
-            if [ CHANGE_SOURCE ]; then
+            if [ ${CHANGE_SOURCE} -eq 1 ]; then
                 # 国内源
                 wget "https://mirrors.ustc.edu.cn/gnu/binutils/${BIN_UTILS_TAR}" -P "$INSTALL_POS"
             else
@@ -126,8 +136,8 @@ fi
 # compile GCC
 GCC_FILE="gcc-11.3.0"
 GCC_FILE_TAR="${GCC_FILE}.tar.gz"
-if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ KEEP_GCC -ne 1 ]; then
-    if [ KEEP_GCC -eq 1 ]; then
+if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ ${KEEP_GCC} -ne 1 ]; then
+    if [ $KEEP_GCC -eq 1 ]; then
         echo -e "\033[35m 没有检测到 $TARGET_GCC, -kg参数无效 \033[0m"
         echo -e "\033[35m 开始安装binutils \033[0m"
         sleep 1s
@@ -135,7 +145,7 @@ if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ KEEP_GCC -ne 1 ]; the
     if [ ! -d "$GCC_FILE" ]; then
         if [ ! -f "$GCC_FILE_TAR" ]; then
                 echo -e "\033[33m [提醒] 如果使用的是国外源, 下载时间可能偏久. 如果需要使用清华源, 请以输入参数-cs, 即: bash build_gcc_toolchain.sh -cs  \033[0m "
-                if [ CHANGE_SOURCE ]; then
+                if [ ${CHANGE_SOURCE} -eq 1 ]; then
                     # 国内源
                     wget "https://mirrors.ustc.edu.cn/gnu/gcc/${GCC_FILE}/${GCC_FILE_TAR}" -P "$INSTALL_POS"
                 else

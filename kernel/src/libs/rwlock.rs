@@ -7,7 +7,10 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::syscall::SystemError;
+use crate::{
+    process::preempt::{preempt_disable, preempt_enable},
+    syscall::SystemError,
+};
 
 ///RwLock读写锁
 
@@ -110,6 +113,15 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获取READER守卫
     pub fn try_read(&self) -> Option<RwLockReadGuard<T>> {
+        preempt_disable();
+        let r = self.inner_try_read();
+        if r.is_none() {
+            preempt_enable();
+        }
+        return r;
+    }
+
+    fn inner_try_read(&self) -> Option<RwLockReadGuard<T>> {
         let reader_value = self.current_reader();
         //得到自增后的reader_value, 包括了尝试获得READER守卫的进程
         let value;
@@ -165,6 +177,18 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得WRITER守卫
     pub fn try_write(&self) -> Option<RwLockWriteGuard<T>> {
+        preempt_disable();
+        let r = self.inner_try_write();
+        if r.is_none() {
+            preempt_enable();
+        }
+
+        return r;
+    } //当架构为arm时,有些代码需要作出调整compare_exchange=>compare_exchange_weak
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(dead_code)]
+    fn inner_try_write(&self) -> Option<RwLockWriteGuard<T>> {
         let res: bool = self
             .lock
             .compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
@@ -178,7 +202,7 @@ impl<T> RwLock<T> {
         } else {
             return None;
         }
-    } //当架构为arm时,有些代码需要作出调整compare_exchange=>compare_exchange_weak
+    }
 
     #[allow(dead_code)]
     #[inline]
@@ -196,8 +220,18 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得UPGRADER守卫
     pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
-        //获得UPGRADER守卫不需要查看读者位
-        //如果获得读者锁失败,不需要撤回fetch_or的原子操作
+        preempt_disable();
+        let r = self.inner_try_upgradeable_read();
+        if r.is_none() {
+            preempt_enable();
+        }
+
+        return r;
+    }
+
+    fn inner_try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
+        // 获得UPGRADER守卫不需要查看读者位
+        // 如果获得读者锁失败,不需要撤回fetch_or的原子操作
         if self.lock.fetch_or(UPGRADED, Ordering::Acquire) & (WRITER | UPGRADED) == 0 {
             return Some(RwLockUpgradableGuard {
                 inner: self,
@@ -258,12 +292,19 @@ impl<T> From<T> for RwLock<T> {
 }
 
 impl<'rwlock, T> RwLockReadGuard<'rwlock, T> {
+    /// @brief 释放守卫,获得保护的值的不可变引用
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
     #[allow(dead_code)]
     #[inline]
-    /// @brief 释放守卫,获得保护的值的不可变引用
-    pub fn leak(this: Self) -> &'rwlock T {
-        let Self { data, .. } = this;
-        return unsafe { &*data };
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
+        let this = ManuallyDrop::new(this);
+        return unsafe { &*this.data };
     }
 }
 
@@ -318,7 +359,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
         let inner: &RwLock<T> = self.inner;
 
-        //自动移去UPGRADED比特位
+        // 自动移去UPGRADED比特位
         mem::drop(self);
 
         RwLockReadGuard {
@@ -329,9 +370,16 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
     #[allow(dead_code)]
     #[inline]
-    /// @brief 返回内部数据的引用,消除锁
-    pub fn leak(this: Self) -> &'rwlock T {
-        let this = ManuallyDrop::new(this);
+    /// @brief 返回内部数据的引用,消除守卫
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
+        let this: ManuallyDrop<RwLockUpgradableGuard<'_, T>> = ManuallyDrop::new(this);
 
         unsafe { &*this.data }
     }
@@ -340,8 +388,15 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
-    /// @brief 返回内部数据的引用,消除锁
-    pub fn leak(this: Self) -> &'rwlock T {
+    /// @brief 返回内部数据的引用,消除守卫
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
         let this = ManuallyDrop::new(this);
 
         return unsafe { &*this.data };
@@ -422,6 +477,7 @@ impl<'rwlock, T> Drop for RwLockReadGuard<'rwlock, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
+        preempt_enable();
     }
 }
 
@@ -432,6 +488,7 @@ impl<'rwlock, T> Drop for RwLockUpgradableGuard<'rwlock, T> {
             UPGRADED
         );
         self.inner.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
+        preempt_enable();
         //这里为啥要AcqRel? Release应该就行了?
     }
 }
@@ -442,5 +499,7 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
         self.inner
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+
+        preempt_enable();
     }
 }

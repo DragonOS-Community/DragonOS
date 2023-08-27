@@ -81,7 +81,7 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
     /// @brief: 同步磁盘信息，把所有的dirty数据写回硬盘 - 待实现
     fn sync(&self) -> Result<(), SystemError>;
 
-    /// @breif: 每个块设备都必须固定自己块大小，而且该块大小必须是2的幂次
+    /// @brief: 每个块设备都必须固定自己块大小，而且该块大小必须是2的幂次
     /// @return: 返回一个固定量，硬编码(编程的时候固定的常量).
     fn blk_size_log2(&self) -> u8;
 

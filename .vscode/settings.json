@@ -4,7 +4,6 @@
         "stdbool.h": "c",
         "printk.h": "c",
         "stdarg.h": "c",
-        "font.h": "c",
         "trap.h": "c",
         "gate.h": "c",
         "process.h": "c",
@@ -174,7 +173,9 @@
         "sleep.h": "c",
         "net.h": "c",
         "lz4.h": "c",
-        "cmd_test.h": "c"
+        "cmd_test.h": "c",
+        "cmpxchg.h": "c",
+        "mman.h": "c"
     },
     "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",

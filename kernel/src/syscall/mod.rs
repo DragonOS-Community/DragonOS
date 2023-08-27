@@ -6,21 +6,28 @@ use core::{
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
-    arch::cpu::cpu_reset,
+    arch::{cpu::cpu_reset, MMArch},
     filesystem::vfs::{
+        fcntl::FcntlCommand,
         file::FileMode,
-        syscall::{SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::{mm_stat_t, pid_t, verify_area, PAGE_2M_SIZE, PAGE_4K_SIZE},
+    include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
     io::SeekFrom,
     kinfo,
+    libs::align::page_align_up,
+    mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
     time::{
-        syscall::{PosixTimeZone, PosixTimeval, SYS_TIMEZONE},
+        syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
     },
 };
+
+use self::user_access::UserBufferWriter;
+
+pub mod user_access;
 
 #[repr(i32)]
 #[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
@@ -331,9 +338,8 @@ pub const SYS_NANOSLEEP: usize = 18;
 /// todo: 该系统调用与Linux不一致，将来需要删除该系统调用！！！ 删的时候记得改C版本的libc
 pub const SYS_CLOCK: usize = 19;
 pub const SYS_PIPE: usize = 20;
-
-/// todo: 该系统调用不是符合POSIX标准的，在将来需要删除！！！
-pub const SYS_MSTAT: usize = 21;
+/// 系统调用21曾经是SYS_MSTAT，但是现在已经废弃
+pub const __NOT_USED: usize = 21;
 pub const SYS_UNLINK_AT: usize = 22;
 pub const SYS_KILL: usize = 23;
 pub const SYS_SIGACTION: usize = 24;
@@ -358,6 +364,20 @@ pub const SYS_ACCEPT: usize = 40;
 pub const SYS_GETSOCKNAME: usize = 41;
 pub const SYS_GETPEERNAME: usize = 42;
 pub const SYS_GETTIMEOFDAY: usize = 43;
+pub const SYS_MMAP: usize = 44;
+pub const SYS_MUNMAP: usize = 45;
+
+pub const SYS_MPROTECT: usize = 46;
+pub const SYS_FSTAT: usize = 47;
+#[allow(dead_code)]
+pub const SYS_GETCWD: usize = 48;
+#[allow(dead_code)]
+pub const SYS_GETPPID: usize = 49;
+#[allow(dead_code)]
+pub const SYS_GETPGID: usize = 50;
+
+pub const SYS_FCNTL: usize = 51;
+pub const SYS_FTRUNCATE: usize = 52;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -405,7 +425,6 @@ impl Syscall {
 
                     Self::open(path, open_flags)
                 };
-                // kdebug!("open: {:?}, res: {:?}", path, res);
                 res
             }
             SYS_CLOSE => {
@@ -416,35 +435,39 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-
+                let virt_addr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if from_user && unsafe { !verify_area(buf_vaddr as u64, len as u64) } {
+                let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
                     Err(SystemError::EPERM)
                 } else {
                     let buf: &mut [u8] = unsafe {
                         core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
                     };
+
                     Self::read(fd, buf)
                 };
-
+                // kdebug!("sys read, fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
             SYS_WRITE => {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-
+                let virt_addr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if from_user && unsafe { !verify_area(buf_vaddr as u64, len as u64) } {
+                let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
                     Err(SystemError::EPERM)
                 } else {
                     let buf: &[u8] = unsafe {
                         core::slice::from_raw_parts::<'static, u8>(buf_vaddr as *const u8, len)
                     };
+
                     Self::write(fd, buf)
                 };
+
+                // kdebug!("sys write, fd: {}, len: {}, res: {:?}", fd, len, res);
 
                 res
             }
@@ -468,18 +491,19 @@ impl Syscall {
                     let w = w.unwrap();
                     Self::lseek(fd, w)
                 };
+                // kdebug!("sys lseek, fd: {}, offset: {}, whence: {}, res: {:?}", fd, offset, whence, res);
 
                 res
             }
 
             SYS_BRK => {
-                let new_brk = args[0];
-                Self::brk(new_brk)
+                let new_brk = VirtAddr::new(args[0]);
+                Self::brk(new_brk).map(|vaddr| vaddr.data())
             }
 
             SYS_SBRK => {
                 let increment = args[0] as isize;
-                Self::sbrk(increment)
+                Self::sbrk(increment).map(|vaddr| vaddr.data())
             }
 
             SYS_REBOOT => Self::reboot(),
@@ -491,10 +515,10 @@ impl Syscall {
                         return Err(SystemError::EFAULT);
                     }
                     let path_ptr = arg0 as *const c_char;
+                    let virt_addr = VirtAddr::new(path_ptr as usize);
                     // 权限校验
                     if path_ptr.is_null()
-                        || (from_user
-                            && unsafe { !verify_area(path_ptr as u64, PAGE_2M_SIZE as u64) })
+                        || (from_user && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
                     {
                         return Err(SystemError::EINVAL);
                     }
@@ -521,9 +545,9 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-
+                let virt_addr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if from_user && unsafe { !verify_area(buf_vaddr as u64, len as u64) } {
+                let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
                     Err(SystemError::EPERM)
                 } else if buf_vaddr == 0 {
@@ -542,12 +566,14 @@ impl Syscall {
                 let path_ptr = args[0];
                 let argv_ptr = args[1];
                 let env_ptr = args[2];
-
+                let virt_path_ptr = VirtAddr::new(path_ptr);
+                let virt_argv_ptr = VirtAddr::new(argv_ptr);
+                let virt_env_ptr = VirtAddr::new(env_ptr);
                 // 权限校验
                 if from_user
-                    && (unsafe { !verify_area(path_ptr as u64, PAGE_4K_SIZE as u64) }
-                        || unsafe { !verify_area(argv_ptr as u64, PAGE_4K_SIZE as u64) })
-                    || unsafe { !verify_area(env_ptr as u64, PAGE_4K_SIZE as u64) }
+                    && (verify_area(virt_path_ptr, PAGE_4K_SIZE as usize).is_err()
+                        || verify_area(virt_argv_ptr, PAGE_4K_SIZE as usize).is_err())
+                    || verify_area(virt_env_ptr, PAGE_4K_SIZE as usize).is_err()
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -563,13 +589,13 @@ impl Syscall {
                 let wstatus = args[1] as *mut c_int;
                 let options = args[2] as c_int;
                 let rusage = args[3] as *mut c_void;
-
+                let virt_wstatus = VirtAddr::new(wstatus as usize);
+                let virt_rusage = VirtAddr::new(rusage as usize);
                 // 权限校验
                 // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
                 if from_user
-                    && (unsafe {
-                        !verify_area(wstatus as u64, core::mem::size_of::<c_int>() as u64)
-                    } || unsafe { !verify_area(rusage as u64, PAGE_4K_SIZE as u64) })
+                    && (verify_area(virt_wstatus, core::mem::size_of::<c_int>() as usize).is_err()
+                        || verify_area(virt_rusage, PAGE_4K_SIZE as usize).is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -584,11 +610,10 @@ impl Syscall {
             SYS_MKDIR => {
                 let path_ptr = args[0] as *const c_char;
                 let mode = args[1];
-
+                let virt_path_ptr = VirtAddr::new(path_ptr as usize);
                 let security_check = || {
                     if path_ptr.is_null()
-                        || (from_user
-                            && unsafe { !verify_area(path_ptr as u64, PAGE_2M_SIZE as u64) })
+                        || (from_user && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
                     {
                         return Err(SystemError::EINVAL);
                     }
@@ -612,12 +637,12 @@ impl Syscall {
             SYS_NANOSLEEP => {
                 let req = args[0] as *const TimeSpec;
                 let rem = args[1] as *mut TimeSpec;
+                let virt_req = VirtAddr::new(req as usize);
+                let virt_rem = VirtAddr::new(rem as usize);
                 if from_user
-                    && (unsafe {
-                        !verify_area(req as u64, core::mem::size_of::<TimeSpec>() as u64)
-                    } || unsafe {
-                        !verify_area(rem as u64, core::mem::size_of::<TimeSpec>() as u64)
-                    })
+                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>() as usize).is_err()
+                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>() as usize)
+                            .is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -628,37 +653,25 @@ impl Syscall {
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
                 let pipefd = args[0] as *mut c_int;
-                if from_user
-                    && unsafe {
-                        !verify_area(pipefd as u64, core::mem::size_of::<[c_int; 2]>() as u64)
-                    }
-                {
-                    Err(SystemError::EFAULT)
-                } else if pipefd.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let pipefd = unsafe { core::slice::from_raw_parts_mut(pipefd, 2) };
-                    Self::pipe(pipefd)
+                match UserBufferWriter::new(
+                    pipefd,
+                    core::mem::size_of::<[c_int; 2]>() as usize,
+                    from_user,
+                ) {
+                    Err(e) => Err(e),
+                    Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
+                        Err(e) => Err(e),
+                        Ok(pipefd) => Self::pipe(pipefd),
+                    },
                 }
             }
 
-            SYS_MSTAT => {
-                let dst = args[0] as *mut mm_stat_t;
-                if from_user
-                    && unsafe { !verify_area(dst as u64, core::mem::size_of::<mm_stat_t>() as u64) }
-                {
-                    Err(SystemError::EFAULT)
-                } else if dst.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::mstat(dst, from_user)
-                }
-            }
             SYS_UNLINK_AT => {
                 let dirfd = args[0] as i32;
                 let pathname = args[1] as *const c_char;
                 let flags = args[2] as u32;
-                if from_user && unsafe { !verify_area(pathname as u64, PAGE_4K_SIZE as u64) } {
+                let virt_pathname = VirtAddr::new(pathname as usize);
+                if from_user && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err() {
                     Err(SystemError::EFAULT)
                 } else if pathname.is_null() {
                     Err(SystemError::EFAULT)
@@ -676,6 +689,7 @@ impl Syscall {
                     if pathname.is_err() {
                         Err(pathname.unwrap_err())
                     } else {
+                        // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
                         Self::unlinkat(dirfd, pathname.unwrap(), flags)
                     }
                 }
@@ -717,8 +731,9 @@ impl Syscall {
             SYS_SETSOCKOPT => {
                 let optval = args[3] as *const u8;
                 let optlen = args[4] as usize;
+                let virt_optval = VirtAddr::new(optval as usize);
                 // 验证optval的地址是否合法
-                if unsafe { verify_area(optval as u64, optlen as u64) } == false {
+                if verify_area(virt_optval, optlen as usize).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -729,18 +744,17 @@ impl Syscall {
             SYS_GETSOCKOPT => {
                 let optval = args[3] as *mut u8;
                 let optlen = args[4] as *mut usize;
-
+                let virt_optval = VirtAddr::new(optval as usize);
+                let virt_optlen = VirtAddr::new(optlen as usize);
                 let security_check = || {
                     // 验证optval的地址是否合法
-                    if unsafe { verify_area(optval as u64, PAGE_4K_SIZE as u64) } == false {
+                    if verify_area(virt_optval, PAGE_4K_SIZE as usize).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
 
                     // 验证optlen的地址是否合法
-                    if unsafe { verify_area(optlen as u64, core::mem::size_of::<u32>() as u64) }
-                        == false
-                    {
+                    if verify_area(virt_optlen, core::mem::size_of::<u32>() as usize).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -757,8 +771,9 @@ impl Syscall {
             SYS_CONNECT => {
                 let addr = args[1] as *const SockAddr;
                 let addrlen = args[2] as usize;
+                let virt_addr = VirtAddr::new(addr as usize);
                 // 验证addr的地址是否合法
-                if unsafe { verify_area(addr as u64, addrlen as u64) } == false {
+                if verify_area(virt_addr, addrlen as usize).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -768,8 +783,9 @@ impl Syscall {
             SYS_BIND => {
                 let addr = args[1] as *const SockAddr;
                 let addrlen = args[2] as usize;
+                let virt_addr = VirtAddr::new(addr as usize);
                 // 验证addr的地址是否合法
-                if unsafe { verify_area(addr as u64, addrlen as u64) } == false {
+                if verify_area(virt_addr, addrlen as usize).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -783,11 +799,13 @@ impl Syscall {
                 let flags = args[3] as u32;
                 let addr = args[4] as *const SockAddr;
                 let addrlen = args[5] as usize;
+                let virt_buf = VirtAddr::new(buf as usize);
+                let virt_addr = VirtAddr::new(addr as usize);
                 // 验证buf的地址是否合法
-                if unsafe { verify_area(buf as u64, len as u64) } == false {
+                if verify_area(virt_buf, len as usize).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
-                } else if unsafe { verify_area(addr as u64, addrlen as u64) } == false {
+                } else if verify_area(virt_addr, addrlen as usize).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -802,25 +820,23 @@ impl Syscall {
                 let flags = args[3] as u32;
                 let addr = args[4] as *mut SockAddr;
                 let addrlen = args[5] as *mut usize;
-
+                let virt_buf = VirtAddr::new(buf as usize);
+                let virt_addrlen = VirtAddr::new(addrlen as usize);
+                let virt_addr = VirtAddr::new(addr as usize);
                 let security_check = || {
                     // 验证buf的地址是否合法
-                    if unsafe { verify_area(buf as u64, len as u64) } == false {
+                    if verify_area(virt_buf, len as usize).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
 
                     // 验证addrlen的地址是否合法
-                    if unsafe { verify_area(addrlen as u64, core::mem::size_of::<u32>() as u64) }
-                        == false
-                    {
+                    if verify_area(virt_addrlen, core::mem::size_of::<u32>() as usize).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
 
-                    if unsafe { verify_area(addr as u64, core::mem::size_of::<SockAddr>() as u64) }
-                        == false
-                    {
+                    if verify_area(virt_addr, core::mem::size_of::<SockAddr>() as usize).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -838,27 +854,21 @@ impl Syscall {
             SYS_RECVMSG => {
                 let msg = args[1] as *mut crate::net::syscall::MsgHdr;
                 let flags = args[2] as u32;
-                let security_check = || {
-                    // 验证msg的地址是否合法
-                    if unsafe {
-                        verify_area(
-                            msg as u64,
-                            core::mem::size_of::<crate::net::syscall::MsgHdr>() as u64,
-                        )
-                    } == false
-                    {
-                        // 地址空间超出了用户空间的范围，不合法
-                        return Err(SystemError::EFAULT);
+                match UserBufferWriter::new(
+                    msg,
+                    core::mem::size_of::<crate::net::syscall::MsgHdr>(),
+                    true,
+                ) {
+                    Err(e) => Err(e),
+                    Ok(mut user_buffer_writer) => {
+                        match user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0) {
+                            Err(e) => Err(e),
+                            Ok(buffer) => {
+                                let msg = &mut buffer[0];
+                                Self::recvmsg(args[0], msg, flags)
+                            }
+                        }
                     }
-                    let msg = unsafe { msg.as_mut() }.ok_or(SystemError::EFAULT)?;
-                    return Ok(msg);
-                };
-                let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    let msg = r.unwrap();
-                    Self::recvmsg(args[0], msg, flags)
                 }
             }
 
@@ -873,41 +883,99 @@ impl Syscall {
             }
             SYS_GETTIMEOFDAY => {
                 let timeval = args[0] as *mut PosixTimeval;
-                let timezone_ptr = args[1] as *const PosixTimeZone;
-                let security_check = || {
-                    if unsafe {
-                        verify_area(timeval as u64, core::mem::size_of::<PosixTimeval>() as u64)
-                    } == false
-                    {
-                        return Err(SystemError::EFAULT);
-                    }
-                    if unsafe {
-                        verify_area(
-                            timezone_ptr as u64,
-                            core::mem::size_of::<PosixTimeZone>() as u64,
-                        )
-                    } == false
-                    {
-                        return Err(SystemError::EFAULT);
-                    }
-                    return Ok(());
-                };
-                let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    let timezone = if !timezone_ptr.is_null() {
-                        &SYS_TIMEZONE
-                    } else {
-                        unsafe { timezone_ptr.as_ref().unwrap() }
-                    };
-                    if !timeval.is_null() {
-                        Self::gettimeofday(timeval, timezone)
-                    } else {
-                        Err(SystemError::EFAULT)
+                let timezone_ptr = args[1] as *mut PosixTimeZone;
+                match UserBufferWriter::new(timeval, core::mem::size_of::<PosixTimeval>(), true) {
+                    Err(e) => Err(e),
+                    Ok(_) => {
+                        match UserBufferWriter::new(
+                            timezone_ptr,
+                            core::mem::size_of::<PosixTimeZone>(),
+                            true,
+                        ) {
+                            Err(e) => Err(e),
+                            Ok(_) => {
+                                if !timeval.is_null() {
+                                    Self::gettimeofday(timeval, timezone_ptr)
+                                } else {
+                                    Err(SystemError::EFAULT)
+                                }
+                            }
+                        }
                     }
                 }
             }
+            SYS_MMAP => {
+                let len = page_align_up(args[1]);
+                let virt_addr = VirtAddr::new(args[0] as usize);
+                if verify_area(virt_addr, len as usize).is_err() {
+                    Err(SystemError::EFAULT)
+                } else {
+                    Self::mmap(
+                        VirtAddr::new(args[0]),
+                        len,
+                        args[2],
+                        args[3],
+                        args[4] as i32,
+                        args[5],
+                    )
+                }
+            }
+            SYS_MUNMAP => {
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & MMArch::PAGE_SIZE != 0 {
+                    // The addr argument is not a multiple of the page size
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::munmap(VirtAddr::new(addr), len)
+                }
+            }
+            SYS_MPROTECT => {
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & MMArch::PAGE_SIZE != 0 {
+                    // The addr argument is not a multiple of the page size
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::mprotect(VirtAddr::new(addr), len, args[2])
+                }
+            }
+
+            SYS_FSTAT => {
+                let fd = args[0] as i32;
+                let kstat = args[1] as *mut PosixKstat;
+                let vaddr = VirtAddr::new(kstat as usize);
+                // FIXME 由于c中的verify_area与rust中的verify_area重名，所以在引入时加了前缀区分
+                // TODO 应该将用了c版本的verify_area都改为rust的verify_area
+                match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
+                    Ok(_) => Self::fstat(fd, kstat),
+                    Err(e) => Err(e),
+                }
+            }
+
+            SYS_FCNTL => {
+                let fd = args[0] as i32;
+                let cmd: Option<FcntlCommand> =
+                    <FcntlCommand as FromPrimitive>::from_u32(args[1] as u32);
+                let arg = args[2] as i32;
+                let res = if let Some(cmd) = cmd {
+                    Self::fcntl(fd, cmd, arg)
+                } else {
+                    Err(SystemError::EINVAL)
+                };
+
+                // kdebug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
+                res
+            }
+
+            SYS_FTRUNCATE => {
+                let fd = args[0] as i32;
+                let len = args[1] as usize;
+                let res = Self::ftruncate(fd, len);
+                // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
+                res
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

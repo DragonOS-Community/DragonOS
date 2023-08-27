@@ -91,8 +91,8 @@ void apic_io_apic_init()
 
     // kdebug("(ul)apic_ioapic_map.virtual_index_addr=%#018lx", (ul)apic_ioapic_map.virtual_index_addr);
     // 填写页表，完成地址映射
-    mm_map_phys_addr((ul)apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE,
-                     PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+    rs_map_phys((ul)apic_ioapic_map.virtual_index_addr, apic_ioapic_map.addr_phys, PAGE_2M_SIZE,
+                PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
 
     // 设置IO APIC ID 为0x0f000000
     *apic_ioapic_map.virtual_index_addr = 0x00;
@@ -285,8 +285,8 @@ void apic_local_apic_init()
     kdebug("BSP's IA32_APIC_BASE=%#018lx", ia32_apic_base);
     // kdebug("apic base=%#018lx", (ia32_apic_base & 0x1FFFFFFFFFF000));
     // 映射Local APIC 寄存器地址
-    mm_map_phys_addr(APIC_LOCAL_APIC_VIRT_BASE_ADDR, (ia32_apic_base & 0x1FFFFFFFFFFFFF), PAGE_2M_SIZE,
-                     PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD, false);
+    // todo: 
+    rs_map_phys(APIC_LOCAL_APIC_VIRT_BASE_ADDR, (ia32_apic_base & 0x1FFFFFFFFFF000), PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
     uint a, b, c, d;
 
     cpu_cpuid(1, 0, &a, &b, &c, &d);
@@ -333,7 +333,7 @@ void apic_local_apic_init()
 
     // 检测是否成功启用xAPIC和x2APIC
     if ((eax & 0xc00) == 0xc00)
-        kinfo("xAPIC & x2APIC enabled!");
+        kinfo("xAPIC & x2APIC enabled!\n");
     else if ((eax & 0x800) == 0x800)
         kinfo("Only xAPIC enabled!");
     else
@@ -364,6 +364,7 @@ void apic_local_apic_init()
  */
 int apic_init()
 {
+    kinfo("Initializing APIC...");
     // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
     for (int i = 32; i <= 55; ++i)
         set_intr_gate(i, 0, interrupt_table[i - 32]);
@@ -403,6 +404,7 @@ int apic_init()
         RCBA_vaddr = 0;
         kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
     }
+    kinfo("APIC initialized.");
     sti();
     return 0;
 }

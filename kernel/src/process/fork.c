@@ -10,6 +10,7 @@ extern void kernel_thread_func(void);
 extern uint64_t rs_procfs_register_pid(uint64_t);
 extern uint64_t rs_procfs_unregister_pid(uint64_t);
 extern void *rs_dup_fpstate();
+extern uint64_t rs_process_copy_mm(bool clone_vm, struct process_control_block *new_pcb);
 
 extern int process_copy_files(uint64_t clone_flags, struct process_control_block *pcb);
 int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb);
@@ -137,6 +138,9 @@ unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned 
 
     // 创建对应procfs文件
     rs_procfs_register_pid(tsk->pid);
+    // kdebug("Fork ok. pid: %d\n", tsk->pid);
+    // 唤醒进程
+    process_wakeup(tsk);
 
     // 唤醒进程
     process_wakeup(tsk);
@@ -185,88 +189,9 @@ int process_copy_flags(uint64_t clone_flags, struct process_control_block *pcb)
  */
 int process_copy_mm(uint64_t clone_flags, struct process_control_block *pcb)
 {
-    int retval = 0;
-    // 与父进程共享内存空间
-    if (clone_flags & CLONE_VM)
-    {
-        pcb->mm = current_pcb->mm;
-
-        return retval;
-    }
-
-    // 分配新的内存空间分布结构体
-    struct mm_struct *new_mms = (struct mm_struct *)kmalloc(sizeof(struct mm_struct), 0);
-    memset(new_mms, 0, sizeof(struct mm_struct));
-
-    memcpy(new_mms, current_pcb->mm, sizeof(struct mm_struct));
-    new_mms->vmas = NULL;
-    pcb->mm = new_mms;
-
-    // 分配顶层页表, 并设置顶层页表的物理地址
-    new_mms->pgd = (pml4t_t *)virt_2_phys(kmalloc(PAGE_4K_SIZE, 0));
-    // 由于高2K部分为内核空间，在接下来需要覆盖其数据，因此不用清零
-    memset(phys_2_virt(new_mms->pgd), 0, PAGE_4K_SIZE / 2);
-
-    // 拷贝内核空间的页表指针
-    memcpy(phys_2_virt(new_mms->pgd) + 256, phys_2_virt(initial_proc[proc_current_cpu_id]->mm->pgd) + 256,
-           PAGE_4K_SIZE / 2);
-
-    uint64_t *current_pgd = (uint64_t *)phys_2_virt(current_pcb->mm->pgd);
-
-    uint64_t *new_pml4t = (uint64_t *)phys_2_virt(new_mms->pgd);
-
-    // 拷贝用户空间的vma
-    struct vm_area_struct *vma = current_pcb->mm->vmas;
-    while (vma != NULL)
-    {
-        if (vma->vm_end > USER_MAX_LINEAR_ADDR || vma->vm_flags & VM_DONTCOPY)
-        {
-            vma = vma->vm_next;
-            continue;
-        }
-
-        int64_t vma_size = vma->vm_end - vma->vm_start;
-        // kdebug("vma_size=%ld, vm_start=%#018lx", vma_size, vma->vm_start);
-        if (vma_size > PAGE_2M_SIZE / 2)
-        {
-            int page_to_alloc = (PAGE_2M_ALIGN(vma_size)) >> PAGE_2M_SHIFT;
-            for (int i = 0; i < page_to_alloc; ++i)
-            {
-                uint64_t pa = alloc_pages(ZONE_NORMAL, 1, PAGE_PGT_MAPPED)->addr_phys;
-
-                struct vm_area_struct *new_vma = NULL;
-                int ret = mm_create_vma(new_mms, vma->vm_start + i * PAGE_2M_SIZE, PAGE_2M_SIZE, vma->vm_flags,
-                                        vma->vm_ops, &new_vma);
-                // 防止内存泄露
-                if (unlikely(ret == -EEXIST))
-                    free_pages(Phy_to_2M_Page(pa), 1);
-                else
-                    mm_map_vma(new_vma, pa, 0, PAGE_2M_SIZE);
-
-                memcpy((void *)phys_2_virt(pa), (void *)(vma->vm_start + i * PAGE_2M_SIZE),
-                       (vma_size >= PAGE_2M_SIZE) ? PAGE_2M_SIZE : vma_size);
-                vma_size -= PAGE_2M_SIZE;
-            }
-        }
-        else
-        {
-            uint64_t map_size = PAGE_4K_ALIGN(vma_size);
-            uint64_t va = (uint64_t)kmalloc(map_size, 0);
-
-            struct vm_area_struct *new_vma = NULL;
-            int ret = mm_create_vma(new_mms, vma->vm_start, map_size, vma->vm_flags, vma->vm_ops, &new_vma);
-            // 防止内存泄露
-            if (unlikely(ret == -EEXIST))
-                kfree((void *)va);
-            else
-                mm_map_vma(new_vma, virt_2_phys(va), 0, map_size);
-
-            memcpy((void *)va, (void *)vma->vm_start, vma_size);
-        }
-        vma = vma->vm_next;
-    }
-
-    return retval;
+    pcb->address_space = NULL;
+    bool clone_vm = (clone_flags & CLONE_VM);
+    return (int)rs_process_copy_mm(clone_vm, pcb);
 }
 
 /**

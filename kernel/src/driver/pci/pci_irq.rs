@@ -506,10 +506,9 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let vaddr = msix_bar
                         .virtual_address()
                         .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?
-                        as usize
                         + msix_table_offset as usize
                         + msg.irq_common_message.irq_index as usize * size_of::<MsixEntry>();
-                    let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                    let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
                         volwrite!(msix_entry, msg_data, msg_data);
@@ -622,10 +621,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         let vaddr = msix_bar
                             .virtual_address()
                             .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))
-                            .unwrap() as usize
+                            .unwrap()
                             + msix_table_offset as usize
                             + index as usize * size_of::<MsixEntry>();
-                        let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                        let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                         unsafe {
                             volwrite!(msix_entry, vector_control, 0);
                             volwrite!(msix_entry, msg_data, 0);
@@ -747,10 +746,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
                         .unwrap();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
-                    let vaddr = msix_bar.virtual_address().unwrap() as usize
+                    let vaddr = msix_bar.virtual_address().unwrap()
                         + msix_table_offset as usize
                         + irq_index as usize * size_of::<MsixEntry>();
-                    let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                    let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     unsafe {
                         volwrite!(msix_entry, vector_control, 1);
                     }
@@ -867,10 +866,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
                         .unwrap();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
-                    let vaddr = msix_bar.virtual_address().unwrap() as usize
+                    let vaddr = msix_bar.virtual_address().unwrap()
                         + msix_table_offset as usize
                         + irq_index as usize * size_of::<MsixEntry>();
-                    let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                    let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
                     }
@@ -981,10 +980,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
                         .unwrap();
                     let pending_bar = pcistandardbar.get_bar(pending_table_bar).unwrap();
-                    let vaddr = pending_bar.virtual_address().unwrap() as usize
+                    let vaddr = pending_bar.virtual_address().unwrap()
                         + pending_table_offset as usize
                         + (irq_index as usize / 64) * size_of::<PendingEntry>();
-                    let pending_entry = NonNull::new(vaddr as *mut PendingEntry).unwrap();
+                    let pending_entry = NonNull::new(vaddr.data() as *mut PendingEntry).unwrap();
                     let pending_entry = unsafe { volread!(pending_entry, entry) };
                     return Ok(pending_entry & (1 << (irq_index as u64 % 64)) != 0);
                 }

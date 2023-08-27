@@ -8,6 +8,7 @@ use crate::driver::pci::pci::{
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
+use crate::mm::VirtAddr;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -18,7 +19,6 @@ use virtio_drivers::{
     Error, Hal, PhysAddr,
 };
 
-type VirtAddr = usize;
 /// The PCI vendor ID for VirtIO devices.
 /// PCI Virtio设备的vendor ID
 const VIRTIO_VENDOR_ID: u16 = 0x1af4;
@@ -437,7 +437,7 @@ impl Display for VirtioPciError {
             Self::BarOffsetOutOfRange => write!(f, "Capability offset greater than BAR length."),
             Self::Misaligned { vaddr, alignment } => write!(
                 f,
-                "Virtual address {:#018x} was not aligned to a {} byte boundary as expected.",
+                "Virtual address {:?} was not aligned to a {} byte boundary as expected.",
                 vaddr, alignment
             ),
             Self::BarGetVaddrFailed => write!(f, "Get bar virtaddress failed"),
@@ -475,15 +475,15 @@ fn get_bar_region<T>(
     //kdebug!("Chossed bar ={},used={}",struct_info.bar,struct_info.offset + struct_info.length);
     let vaddr = (bar_info
         .virtual_address()
-        .ok_or(VirtioPciError::BarGetVaddrFailed)?) as usize
+        .ok_or(VirtioPciError::BarGetVaddrFailed)?)
         + struct_info.offset as usize;
-    if vaddr % align_of::<T>() != 0 {
+    if vaddr.data() % align_of::<T>() != 0 {
         return Err(VirtioPciError::Misaligned {
             vaddr,
             alignment: align_of::<T>(),
         });
     }
-    let vaddr = NonNull::new(vaddr as *mut u8).unwrap();
+    let vaddr = NonNull::new(vaddr.data() as *mut u8).unwrap();
     Ok(vaddr.cast())
 }
 

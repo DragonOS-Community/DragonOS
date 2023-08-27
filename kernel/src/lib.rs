@@ -63,7 +63,7 @@ use crate::process::ProcessManager;
 // <3>
 use crate::{
     arch::asm::current::current_pcb,
-    include::bindings::bindings::{process_do_exit, BLACK, GREEN},
+    include::bindings::bindings::{BLACK, GREEN},
     net::net_core::net_init,
 };
 

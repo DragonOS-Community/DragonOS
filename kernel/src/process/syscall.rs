@@ -63,8 +63,6 @@ impl Syscall {
     ///
     /// - status: 退出状态
     pub fn exit(status: usize) -> ! {
-        // unsafe { process_do_exit(status as u64) };
-        // loop {}
         ProcessManager::exit(status);
     }
 

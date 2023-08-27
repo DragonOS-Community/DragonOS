@@ -103,7 +103,7 @@ int process_wakeup_immediately(struct process_control_block *pcb);
  * @param code 返回码
  * @return ul
  */
-ul process_do_exit(ul code);
+extern ul process_do_exit(ul code);
 
 /**
  * @brief 当子进程退出后向父进程发送通知

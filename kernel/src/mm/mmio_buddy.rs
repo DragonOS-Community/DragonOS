@@ -11,9 +11,10 @@ use crate::{kerror, kinfo, kwarn};
 use alloc::{collections::LinkedList, vec::Vec};
 use core::mem;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
-use super::VirtAddr;
+use super::page::PageFlags;
+use super::{PhysAddr, VirtAddr};
 
 // 最大的伙伴块的幂
 const MMIO_BUDDY_MAX_EXP: u32 = PAGE_1G_SHIFT;
@@ -474,20 +475,14 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(SystemError) 失败返回错误码
-    pub fn create_mmio(
-        &self,
-        size: usize,
-        _vm_flags: vm_flags_t,
-        res_vaddr: *mut u64,
-        res_length: *mut u64,
-    ) -> Result<i32, SystemError> {
+    pub fn create_mmio(&self, size: usize) -> Result<MMIOSpaceGuard, SystemError> {
         if size > PAGE_1G_SIZE || size == 0 {
             return Err(SystemError::EPERM);
         }
-        let retval: i32 = 0;
         // 计算前导0
         #[cfg(target_arch = "x86_64")]
         let mut size_exp: u32 = 63 - size.leading_zeros();
+
         // 记录最终申请的空间大小
         let mut new_size = size;
         // 对齐要申请的空间大小
@@ -502,21 +497,15 @@ impl MmioBuddyMemPool {
         }
         match self.mmio_buddy_query_addr_region(size_exp) {
             Ok(region) => {
-                // todo: 是否需要创建vma？或者用新重写的机制去做？
-                // kdebug!(
-                //     "create_mmio: vaddr = {:?}, length = {}",
-                //     region.vaddr,
-                //     new_size
-                // );
-                unsafe { *res_vaddr = region.vaddr.data() as u64 };
-                unsafe { *res_length = new_size as u64 };
+                let space_guard =
+                    unsafe { MMIOSpaceGuard::from_raw(region.vaddr, new_size, false) };
+                return Ok(space_guard);
             }
             Err(_) => {
                 kerror!("failed to create mmio. pid = {:?}", current_pcb().pid);
                 return Err(SystemError::ENOMEM);
             }
         }
-        return Ok(retval);
     }
 
     /// @brief 取消mmio的映射并将地址空间归还到buddy中
@@ -528,7 +517,7 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(SystemError) 失败返回错误码
-    pub fn release_mmio(&self, vaddr: VirtAddr, length: usize) -> Result<i32, SystemError> {
+    fn release_mmio(&self, vaddr: VirtAddr, length: usize) -> Result<i32, SystemError> {
         assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
         assert!(length & (MMArch::PAGE_SIZE - 1) == 0);
         if vaddr < self.pool_start_addr
@@ -553,7 +542,7 @@ impl MmioBuddyMemPool {
                 kernel_mapper
                     .as_mut()
                     .unwrap()
-                    .unmap(vaddr + i * MMArch::PAGE_SIZE, true)
+                    .unmap_phys(vaddr + i * MMArch::PAGE_SIZE, true)
             };
         }
 
@@ -614,6 +603,88 @@ fn exp2index(exp: u32) -> usize {
     return (exp - 12) as usize;
 }
 
+#[derive(Debug)]
+pub struct MMIOSpaceGuard {
+    vaddr: VirtAddr,
+    size: usize,
+    mapped: AtomicBool,
+}
+
+impl MMIOSpaceGuard {
+    pub unsafe fn from_raw(vaddr: VirtAddr, size: usize, mapped: bool) -> Self {
+        // check size
+        assert!(
+            size & (MMArch::PAGE_SIZE - 1) == 0,
+            "MMIO space size must be page aligned"
+        );
+        assert!(size.is_power_of_two(), "MMIO space size must be power of 2");
+        assert!(
+            vaddr.check_aligned(size),
+            "MMIO space vaddr must be aligned with size"
+        );
+        assert!(
+            vaddr.data() >= MMIO_BASE.data() && vaddr.data() + size <= MMIO_TOP.data(),
+            "MMIO space must be in MMIO region"
+        );
+
+        // 人工创建的MMIO空间，认为已经映射
+        MMIOSpaceGuard {
+            vaddr,
+            size,
+            mapped: AtomicBool::new(mapped),
+        }
+    }
+
+    pub fn vaddr(&self) -> VirtAddr {
+        self.vaddr
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// 将物理地址填写到虚拟地址空间中
+    ///
+    /// ## Safety
+    ///
+    /// 传入的物理地址【一定要是设备的物理地址】。
+    /// 如果物理地址是从内存分配器中分配的，那么会造成内存泄露。因为mmio_release的时候，只取消映射，不会释放内存。
+    pub unsafe fn map_phys<Arch: MemoryManagementArch>(
+        &self,
+        paddr: PhysAddr,
+        length: usize,
+    ) -> bool {
+        if length > self.size {
+            return false;
+        }
+
+        let check = self
+            .mapped
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        if check.is_err() {
+            return false;
+        }
+
+        let flags = PageFlags::mmio_flags();
+        let mut kernel_mapper = KernelMapper::lock();
+        let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
+        if r.is_err() {
+            return false;
+        }
+        return true;
+    }
+}
+
+impl Drop for MMIOSpaceGuard {
+    fn drop(&mut self) {
+        let _ = mmio_pool()
+            .release_mmio(self.vaddr, self.size)
+            .unwrap_or_else(|err| {
+                panic!("MMIO release failed: self: {self:?}, err msg: {:?}", err);
+            });
+    }
+}
+
 pub fn mmio_init() {
     kdebug!("Initializing MMIO buddy memory pool...");
     // 初始化mmio内存池
@@ -635,18 +706,23 @@ pub fn mmio_init() {
 ///
 /// @return int 错误码
 #[no_mangle]
-pub extern "C" fn mmio_create(
+pub unsafe extern "C" fn mmio_create(
     size: u32,
-    vm_flags: vm_flags_t,
+    _vm_flags: vm_flags_t,
     res_vaddr: *mut u64,
     res_length: *mut u64,
 ) -> i32 {
     // kdebug!("mmio_create");
-    if let Err(err) = mmio_pool().create_mmio(size as usize, vm_flags, res_vaddr, res_length) {
-        return err.to_posix_errno();
-    } else {
-        return 0;
+    let r = mmio_pool().create_mmio(size as usize);
+    if r.is_err() {
+        return r.unwrap_err().to_posix_errno();
     }
+    let space_guard = r.unwrap();
+    *res_vaddr = space_guard.vaddr().data() as u64;
+    *res_length = space_guard.size() as u64;
+    // 由于space_guard drop的时候会自动释放内存，所以这里要忽略它的释放
+    core::mem::forget(space_guard);
+    return 0;
 }
 
 /// @brief 取消mmio的映射并将地址空间归还到buddy中
@@ -659,7 +735,7 @@ pub extern "C" fn mmio_create(
 ///
 /// @return Err(i32) 失败返回错误码
 #[no_mangle]
-pub extern "C" fn mmio_release(vaddr: u64, length: u64) -> i32 {
+pub unsafe extern "C" fn mmio_release(vaddr: u64, length: u64) -> i32 {
     return mmio_pool()
         .release_mmio(VirtAddr::new(vaddr as usize), length as usize)
         .unwrap_or_else(|err| err.to_posix_errno());

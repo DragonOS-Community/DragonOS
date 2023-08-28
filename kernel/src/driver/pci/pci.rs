@@ -2,14 +2,15 @@
 // 目前仅支持单主桥单Segment
 
 use super::pci_irq::{IrqType, PciIrqError};
-use crate::arch::{PciArch, TraitPciArch};
-use crate::include::bindings::bindings::{PAGE_2M_SIZE, VM_DONTCOPY, VM_IO};
+use crate::arch::{MMArch, PciArch, TraitPciArch};
+use crate::include::bindings::bindings::PAGE_2M_SIZE;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::mmio_buddy::mmio_pool;
-use crate::mm::page::PageFlags;
+
+use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
+
 use crate::mm::{PhysAddr, VirtAddr};
 use crate::{kdebug, kerror, kinfo, kwarn};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
 use bitflags::bitflags;
@@ -592,13 +593,13 @@ impl PciDeviceStructure for PciDeviceStructurePciToCardbusBridge {
 }
 
 /// 代表一个PCI segement greoup.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PciRoot {
-    pub physical_address_base: u64,                //物理地址，acpi获取
-    pub mmio_base: Option<*mut u32>,               //映射后的虚拟地址，为方便访问数据这里转化成指针
+    pub physical_address_base: PhysAddr,         //物理地址，acpi获取
+    pub mmio_guard: Option<Arc<MMIOSpaceGuard>>, //映射后的虚拟地址，为方便访问数据这里转化成指针
     pub segement_group_number: SegmentGroupNumber, //segement greoup的id
-    pub bus_begin: u8,                             //该分组中的最小bus
-    pub bus_end: u8,                               //该分组中的最大bus
+    pub bus_begin: u8,                           //该分组中的最小bus
+    pub bus_end: u8,                             //该分组中的最大bus
 }
 ///线程间共享需要，该结构体只需要在初始化时写入数据，无需读写锁保证线程安全
 unsafe impl Send for PciRoot {}
@@ -608,8 +609,8 @@ impl Display for PciRoot {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
                 f,
-                "PCI Root with segement:{}, bus begin at {}, bus end at {}, physical address at {:#x},mapped at {:#x}",
-                self.segement_group_number, self.bus_begin, self.bus_end, self.physical_address_base, self.mmio_base.unwrap() as usize
+                "PCI Root with segement:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
+                self.segement_group_number, self.bus_begin, self.bus_end, self.physical_address_base, self.mmio_guard
             )
     }
 }
@@ -628,36 +629,18 @@ impl PciRoot {
         //kdebug!("bus_begin={},bus_end={}", self.bus_begin,self.bus_end);
         let bus_number = (self.bus_end - self.bus_begin) as u32 + 1;
         let bus_number_double = (bus_number - 1) / 2 + 1; //一个bus占据1MB空间，计算全部bus占据空间相对于2MB空间的个数
-        let mut virtaddress: u64 = 0;
-        let vaddr_ptr = &mut virtaddress as *mut u64;
-        let mut virtsize: u64 = 0;
-        let virtsize_ptr = &mut virtsize as *mut u64;
-        let size = bus_number_double * PAGE_2M_SIZE;
-        unsafe {
-            if let Err(_) = mmio_pool().create_mmio(
-                size as usize,
-                (VM_IO | VM_DONTCOPY) as u64,
-                vaddr_ptr,
-                virtsize_ptr,
-            ) {
-                kerror!("Create mmio failed when initing ecam");
-                return Err(PciError::CreateMmioError);
-            };
 
-            //kdebug!("virtaddress={:#x},virtsize={:#x}",virtaddress,virtsize);
-            let vaddr = VirtAddr::new(virtaddress as usize);
-            let paddr = PhysAddr::new(self.physical_address_base as usize);
-            // kdebug!("pci root: map: vaddr={vaddr:?}, paddr={paddr:?}, size={size}");
-            let page_flags = PageFlags::mmio_flags();
-            let mut kernel_mapper = KernelMapper::lock();
-            // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
-            assert!(kernel_mapper
-                .map_phys_with_size(vaddr, paddr, size as usize, page_flags, true)
-                .is_ok());
-            drop(kernel_mapper);
+        let size = (bus_number_double as usize) * (PAGE_2M_SIZE as usize);
+        unsafe {
+            let space_guard = mmio_pool()
+                .create_mmio(size as usize)
+                .map_err(|_| PciError::CreateMmioError)?;
+            let space_guard = Arc::new(space_guard);
+            self.mmio_guard = Some(space_guard.clone());
+
+            assert!(space_guard.map_phys::<MMArch>(self.physical_address_base, size));
         }
-        self.mmio_base = Some(virtaddress as *mut u32);
-        Ok(0)
+        return Ok(0);
     }
     /// @brief 获得要操作的寄存器相对于mmio_offset的偏移量
     /// @param bus_device_function 在同一个group中pci设备的唯一标识符
@@ -681,7 +664,9 @@ impl PciRoot {
         let address = self.cam_offset(bus_device_function, register_offset);
         unsafe {
             // Right shift to convert from byte offset to word offset.
-            (self.mmio_base.unwrap().add((address >> 2) as usize)).read_volatile()
+            ((self.mmio_guard.as_ref().unwrap().vaddr().data() as *mut u32)
+                .add((address >> 2) as usize))
+            .read_volatile()
         }
     }
 
@@ -700,7 +685,9 @@ impl PciRoot {
         // resulting pointer is within the MMIO range of the CAM.
         unsafe {
             // Right shift to convert from byte offset to word offset.
-            (self.mmio_base.unwrap().add((address >> 2) as usize)).write_volatile(data)
+            ((self.mmio_guard.as_ref().unwrap().vaddr().data() as *mut u32)
+                .add((address >> 2) as usize))
+            .write_volatile(data)
         }
     }
     /// @brief 返回迭代器，遍历pcie设备的external_capabilities
@@ -1106,7 +1093,7 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
 pub extern "C" fn rs_pci_init() {
     pci_init();
     if PCI_ROOT_0.is_some() {
-        kdebug!("{}", PCI_ROOT_0.unwrap());
+        kdebug!("{}", PCI_ROOT_0.as_ref().unwrap());
         //以下为ecam的读取寄存器值测试，经测试可正常读取
         // let bus_device_function = BusDeviceFunction {
         //     bus: 0,
@@ -1237,7 +1224,7 @@ impl TryFrom<u8> for MemoryBarType {
 
 /// Information about a PCI Base Address Register.
 /// BAR的三种类型 Memory/IO/Unused
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum BarInfo {
     /// The BAR is for a memory region.
     Memory {
@@ -1251,7 +1238,7 @@ pub enum BarInfo {
         /// The size of the BAR in bytes.
         size: u32,
         /// The virtaddress for a memory bar(mapped).
-        virtaddress: u64,
+        mmio_guard: Arc<MMIOSpaceGuard>,
     },
     /// The BAR is for an I/O region.
     IO {
@@ -1279,9 +1266,9 @@ impl BarInfo {
     ///@brief 得到某个bar的virtaddress(前提是他的类型为Memory Bar)
     ///@param self
     ///@return Option<(u64) 是Memory Bar返回映射的虚拟地址，不是则返回None
-    pub fn virtual_address(&self) -> Option<u64> {
-        if let Self::Memory { virtaddress, .. } = self {
-            Some(*virtaddress)
+    pub fn virtual_address(&self) -> Option<VirtAddr> {
+        if let Self::Memory { mmio_guard, .. } = self {
+            Some(mmio_guard.vaddr())
         } else {
             None
         }
@@ -1296,11 +1283,11 @@ impl Display for BarInfo {
                 prefetchable,
                 address,
                 size,
-                virtaddress,
+                mmio_guard,
             } => write!(
                 f,
-                "Memory space at {:#010x}, size {}, type {:?}, prefetchable {},mapped at {:#x}",
-                address, size, address_type, prefetchable, virtaddress
+                "Memory space at {:#010x}, size {}, type {:?}, prefetchable {}, mmio_guard: {:?}",
+                address, size, address_type, prefetchable, mmio_guard
             ),
             Self::IO { address, size } => {
                 write!(f, "I/O space at {:#010x}, size {}", address, size)
@@ -1315,7 +1302,7 @@ impl Display for BarInfo {
 pub trait PciDeviceBar {}
 
 ///一个普通PCI设备（非桥）有6个BAR寄存器，PciStandardDeviceBar存储其全部信息
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PciStandardDeviceBar {
     bar0: BarInfo,
     bar1: BarInfo,
@@ -1378,7 +1365,6 @@ pub fn pci_bar_init(
             continue;
         }
         let bar_info;
-        let mut virtaddress: u64 = 0;
         let bar_orig = PciArch::read_config(&bus_device_function, BAR0_OFFSET + 4 * bar_index);
         PciArch::write_config(
             &bus_device_function,
@@ -1414,45 +1400,27 @@ pub fn pci_bar_init(
                 bar_index_ignore = bar_index + 1; //下个bar跳过，因为64位的memory bar覆盖了两个bar
             }
             let pci_address = PciAddr::new(address as usize);
-            address = PciArch::address_pci_to_physical(pci_address) as u64; //PCI总线域物理地址转换为存储器域物理地址
+            let paddr = PciArch::address_pci_to_physical(pci_address); //PCI总线域物理地址转换为存储器域物理地址
+
+            let space_guard: Arc<MMIOSpaceGuard>;
             unsafe {
-                let vaddr_ptr = &mut virtaddress as *mut u64;
-                let mut virtsize: u64 = 0;
-                let virtsize_ptr = &mut virtsize as *mut u64;
-
                 let size_want = size as usize;
-
-                if let Err(_) = mmio_pool().create_mmio(
-                    size_want,
-                    (VM_IO | VM_DONTCOPY) as u64,
-                    vaddr_ptr,
-                    virtsize_ptr,
-                ) {
-                    kerror!("Create mmio failed when initing pci bar");
-                    return Err(PciError::CreateMmioError);
-                };
-                //kdebug!("virtaddress={:#x},virtsize={:#x}",virtaddress,virtsize);
-                let vaddr = VirtAddr::new(virtaddress as usize);
-                let paddr = PhysAddr::new(address as usize);
-                let page_flags = PageFlags::new()
-                    .set_write(true)
-                    .set_execute(true)
-                    .set_page_cache_disable(true)
-                    .set_page_write_through(true);
-                kdebug!("Pci bar init: vaddr={vaddr:?}, paddr={paddr:?}, size_want={size_want}, page_flags={page_flags:?}");
-                let mut kernel_mapper = KernelMapper::lock();
-                // todo: 添加错误处理代码。因为内核映射器可能是只读的，所以可能会出错
-                assert!(kernel_mapper
-                    .map_phys_with_size(vaddr, paddr, size_want, page_flags, true)
-                    .is_ok());
-                drop(kernel_mapper);
+                let tmp = mmio_pool()
+                    .create_mmio(size_want)
+                    .map_err(|_| PciError::CreateMmioError)?;
+                space_guard = Arc::new(tmp);
+                kdebug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
+                assert!(
+                    space_guard.map_phys::<MMArch>(paddr, size_want),
+                    "pci_bar_init: map_phys failed"
+                );
             }
             bar_info = BarInfo::Memory {
                 address_type,
                 prefetchable,
                 address,
                 size,
-                virtaddress,
+                mmio_guard: space_guard,
             };
         }
         match bar_index {

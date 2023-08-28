@@ -93,8 +93,8 @@ pub fn ahci_rust_init() -> Result<(), SystemError> {
         // 最后把这个引用列表放入到全局列表
         let mut hba_mem_list = LOCKED_HBA_MEM_LIST.lock();
         //这里两次unsafe转引用规避rust只能有一个可变引用的检查，提高运行速度
-        let hba_mem = unsafe { (virtaddr as *mut HbaMem).as_mut().unwrap() };
-        hba_mem_list.push(unsafe { (virtaddr as *mut HbaMem).as_mut().unwrap() });
+        let hba_mem = unsafe { (virtaddr.data() as *mut HbaMem).as_mut().unwrap() };
+        hba_mem_list.push(unsafe { (virtaddr.data() as *mut HbaMem).as_mut().unwrap() });
         let pi = volatile_read!(hba_mem.pi);
         let hba_mem_index = hba_mem_list.len() - 1;
         drop(hba_mem_list);

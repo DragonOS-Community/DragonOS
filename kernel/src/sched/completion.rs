@@ -21,17 +21,6 @@ impl Completion {
         }
     }
 
-    pub fn complete(&self) {
-        let mut inner = self.inner.lock_irqsave();
-        inner.complete()
-    }
-
-    /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
-    pub fn complete_all(&mut self) {
-        let mut inner = self.inner.lock_irqsave();
-        inner.complete_all()
-    }
-
     /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
     ///
     /// @param timeout 非负整数
@@ -98,18 +87,55 @@ impl Completion {
         self.do_wait_for_common(timeout, true)
     }
 
+    /// @brief 唤醒一个wait_queue中的节点
+    pub fn complete(&self) {
+        let mut inner = self.inner.lock_irqsave();
+        if inner.done != COMPLETE_ALL {
+            inner.done += 1;
+        }
+        inner.wait_queue.wakeup(None);
+        // 脱离生命周期，自动释放guard
+    }
+
+    /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
+    pub fn complete_all(&mut self) {
+        let mut inner = self.inner.lock_irqsave();
+        inner.done = COMPLETE_ALL;
+        inner.wait_queue.wakeup_all(None);
+        // 脱离生命周期，自动释放guard
+    }
+
     /// @brief @brief 尝试获取completion的一个done！如果您在wait之前加上这个函数作为判断，说不定会加快运行速度。
     ///
     /// @return true - 表示不需要wait_for_completion，并且已经获取到了一个completion(即返回true意味着done已经被 减1 )
     /// @return false - 表示当前done=0，您需要进入等待，即wait_for_completion
     pub fn try_wait_for_completion(&mut self) -> bool {
         let mut inner = self.inner.lock_irqsave();
-        inner.try_wait_for_completion()
+        if inner.done == 0 {
+            return false;
+        }
+
+        if inner.done != 0 {
+            return false;
+        } else if inner.done != COMPLETE_ALL {
+            inner.done -= 1;
+        }
+        return true;
+        // 脱离生命周期，自动释放guard
     }
+
     // @brief 测试一个completion是否有waiter。（即done是不是等于0）
     pub fn completion_done(&self) -> bool {
         let inner = self.inner.lock_irqsave();
-        inner.completion_done()
+        if inner.done == 0 {
+            return false;
+        }
+
+        if inner.done == 0 {
+            return false;
+        }
+        return true;
+        // 脱离生命周期，自动释放guard
     }
 }
 #[derive(Debug)]
@@ -124,49 +150,5 @@ impl InnerCompletion {
             done: 0,
             wait_queue: WaitQueue::INIT,
         }
-    }
-    /// @brief 唤醒一个wait_queue中的节点
-    pub fn complete(&mut self) {
-        if self.done != COMPLETE_ALL {
-            self.done += 1;
-        }
-        self.wait_queue.wakeup(None);
-    }
-
-    /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
-    pub fn complete_all(&mut self) {
-        self.done = COMPLETE_ALL;
-        self.wait_queue.wakeup_all(None);
-    }
-
-    /// @brief @brief 尝试获取completion的一个done！如果您在wait之前加上这个函数作为判断，说不定会加快运行速度。
-    ///
-    /// @return true - 表示不需要wait_for_completion，并且已经获取到了一个completion(即返回true意味着done已经被 减1 )
-    /// @return false - 表示当前done=0，您需要进入等待，即wait_for_completion
-    pub fn try_wait_for_completion(&mut self) -> bool {
-        if self.done == 0 {
-            return false;
-        }
-
-        if self.done != 0 {
-            return false;
-        } else if self.done != COMPLETE_ALL {
-            self.done -= 1;
-        }
-
-        return true;
-    }
-
-    // @brief 测试一个completion是否有waiter。（即done是不是等于0）
-    pub fn completion_done(&self) -> bool {
-        if self.done == 0 {
-            return false;
-        }
-
-        if self.done == 0 {
-            return false;
-        }
-        return true;
-        // 脱离生命周期，自动释放guard
     }
 }

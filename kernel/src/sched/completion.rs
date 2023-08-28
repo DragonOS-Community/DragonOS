@@ -1,54 +1,54 @@
 use crate::{
-    arch::asm::irqflags::{local_irq_restore, local_irq_save},
+    arch::{
+        asm::irqflags::{local_irq_restore, local_irq_save},
+        CurrentIrqArch,
+    },
+    exception::InterruptArch,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     syscall::SystemError,
     time::timer::schedule_timeout,
 };
 
-// void completion_init(struct completion *x);
-// void complete(struct completion *x);
-// void complete_all(struct completion *x);
-// void wait_for_completion(struct completion *x);
-// long wait_for_completion_timeout(struct completion *x, long timeout);
-// void wait_for_completion_interruptible(struct completion *x);
-// long wait_for_completion_interruptible_timeout(struct completion *x, long timeout);
-// void wait_for_multicompletion(struct completion x[], int n);
-// bool try_wait_for_completion(struct completion *x);
-// bool completion_done(struct completion *x);
-// struct completion *completion_alloc();
-
 const COMPLETE_ALL: u32 = core::u32::MAX;
 const MAX_TIMEOUT: i64 = core::i64::MAX;
 
 #[derive(Debug)]
-struct Completion {
-    done: u32,
-    wait_queue: SpinLock<WaitQueue>,
+pub struct Completion {
+    inner: SpinLock<InnerCompletion>,
 }
 
 impl Completion {
     pub const fn new() -> Self {
         Self {
+            inner: SpinLock::new(InnerCompletion::new()),
+        }
+    }
+}
+#[derive(Debug)]
+pub struct InnerCompletion {
+    done: u32,
+    wait_queue: WaitQueue,
+}
+
+impl InnerCompletion {
+    pub const fn new() -> Self {
+        Self {
             done: 0,
-            wait_queue: SpinLock::new(WaitQueue::INIT),
+            wait_queue: WaitQueue::INIT,
         }
     }
     /// @brief 唤醒一个wait_queue中的节点
     pub fn complete(&mut self) {
-        let queue = self.wait_queue.lock_irqsave();
         if self.done != COMPLETE_ALL {
             self.done += 1;
         }
-        queue.wakeup(None);
-        drop(queue);
+        self.wait_queue.wakeup(None);
     }
 
     /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
     pub fn complete_all(&mut self) {
-        let queue = self.wait_queue.lock_irqsave();
         self.done = COMPLETE_ALL;
-        queue.wakeup_all(None);
-        drop(queue);
+        self.wait_queue.wakeup_all(None);
     }
 
     /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
@@ -61,8 +61,8 @@ impl Completion {
         mut timeout: i64,
         interuptible: bool,
     ) -> Result<i64, SystemError> {
-        let mut flags = local_irq_save();
-        let queue = self.wait_queue.lock();
+        let mut irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
         if self.done == 0 {
             //loop break 类似 do while 保证进行一次信号检测
             loop {
@@ -71,28 +71,28 @@ impl Completion {
                 // timeout = -ERESTARTSYS;
                 // break;
                 //}
-                local_irq_restore(flags);
+                drop(irq_guard);
                 if interuptible {
-                    queue.sleep();
+                    self.wait_queue.sleep();
                 } else {
-                    queue.sleep_uninterruptible();
+                    self.wait_queue.sleep_uninterruptible();
                 }
                 timeout = schedule_timeout(timeout)?;
-                flags = local_irq_save();
+                irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
                 if self.done != 0 || timeout <= 0 {
                     break;
                 }
             }
-            queue.wakeup(None);
+            self.wait_queue.wakeup(None);
             if self.done > 0 {
-                local_irq_restore(flags);
+                drop(irq_guard);
                 return Ok(timeout);
             }
         }
         if self.done > 0 && self.done != COMPLETE_ALL {
             self.done -= 1;
         }
-        local_irq_restore(flags);
+        drop(irq_guard);
         return Ok(if timeout > 0 { timeout } else { 1 });
     }
 
@@ -128,13 +128,13 @@ impl Completion {
         if self.done == 0 {
             return false;
         }
-        let guard = self.wait_queue.lock_irqsave();
+
         if self.done != 0 {
             return false;
         } else if self.done != COMPLETE_ALL {
             self.done -= 1;
         }
-        drop(guard);
+
         return true;
     }
 
@@ -143,7 +143,7 @@ impl Completion {
         if self.done == 0 {
             return false;
         }
-        let _guard = self.wait_queue.lock();
+
         if self.done == 0 {
             return false;
         }

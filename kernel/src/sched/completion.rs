@@ -37,11 +37,7 @@ impl Completion {
     /// @param timeout 非负整数
     /// @param interuptible 设置进程是否能被打断
     /// @return 返回剩余时间或者SystemError
-    fn do_wait_for_common(
-        & self,
-        mut timeout: i64,
-        interuptible: bool,
-    ) -> Result<i64, SystemError> {
+    fn do_wait_for_common(&self, mut timeout: i64, interuptible: bool) -> Result<i64, SystemError> {
         let mut inner = self.inner.lock_irqsave();
 
         if inner.done == 0 {
@@ -52,12 +48,13 @@ impl Completion {
                 // timeout = -ERESTARTSYS;
                 // break;
                 //}
-                // drop(inner);
+
                 if interuptible {
-                    inner.wait_queue.sleep();
+                    unsafe { inner.wait_queue.sleep_without_schedule() };
                 } else {
-                    inner.wait_queue.sleep_uninterruptible();
+                    unsafe { inner.wait_queue.sleep_without_schedule_uninterruptible() };
                 }
+                drop(inner);
                 timeout = schedule_timeout(timeout)?;
                 inner = self.inner.lock_irqsave();
                 if inner.done != 0 || timeout <= 0 {
@@ -101,7 +98,6 @@ impl Completion {
         self.do_wait_for_common(timeout, true)
     }
 
-
     /// @brief @brief 尝试获取completion的一个done！如果您在wait之前加上这个函数作为判断，说不定会加快运行速度。
     ///
     /// @return true - 表示不需要wait_for_completion，并且已经获取到了一个completion(即返回true意味着done已经被 减1 )
@@ -142,7 +138,6 @@ impl InnerCompletion {
         self.done = COMPLETE_ALL;
         self.wait_queue.wakeup_all(None);
     }
-
 
     /// @brief @brief 尝试获取completion的一个done！如果您在wait之前加上这个函数作为判断，说不定会加快运行速度。
     ///

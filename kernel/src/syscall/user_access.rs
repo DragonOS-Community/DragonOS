@@ -261,7 +261,7 @@ impl<'a> UserBufferWriter<'a> {
         if from_user
             && verify_area(
                 VirtAddr::new(addr as usize),
-                (len * core::mem::size_of::<U>()) as usize,
+                len,
             )
             .is_err()
         {
@@ -269,7 +269,7 @@ impl<'a> UserBufferWriter<'a> {
         }
         return Ok(Self {
             buffer: unsafe {
-                core::slice::from_raw_parts_mut(addr as *mut u8, len * core::mem::size_of::<U>())
+                core::slice::from_raw_parts_mut(addr as *mut u8, len)
             },
         });
     }

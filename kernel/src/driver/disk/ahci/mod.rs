@@ -6,8 +6,7 @@ pub mod hba;
 use crate::filesystem::vfs::io::device::BlockDevice;
 // 依赖的rust工具包
 use crate::driver::pci::pci::{
-    get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice,
-    PCI_DEVICE_LINKEDLIST,
+    get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
 use crate::filesystem::devfs::devfs_register;
 use crate::filesystem::vfs::io::disk_info::BLK_GF_AHCI;
@@ -103,7 +102,7 @@ pub fn ahci_rust_init() -> Result<(), SystemError> {
         let mut id = 0;
         for j in 0..32 {
             if (pi >> j) & 1 > 0 {
-                let mut hba_mem_list = LOCKED_HBA_MEM_LIST.lock();
+                let hba_mem_list = LOCKED_HBA_MEM_LIST.lock();
                 let hba_mem_port = &mut hba_mem.ports[j];
                 let tp = hba_mem_port.check_type();
                 match tp {
@@ -175,23 +174,20 @@ pub fn disks() -> Vec<Arc<LockedAhciDisk>> {
 
 /// @brief: 通过 name 获取 disk
 pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, SystemError> {
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let disks_list: SpinLockGuard<Vec<Arc<LockedAhciDisk>>> = LOCKED_DISKS_LIST.lock();
-    for i in 0..disks_list.len() {
-        if disks_list[i].0.lock().name == name {
-            return Ok(disks_list[i].clone());
-        }
-    }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return Err(SystemError::ENXIO);
+    let result = disks_list
+        .iter()
+        .find(|x| x.0.lock().name == name)
+        .ok_or(SystemError::ENXIO)?
+        .clone();
+    return Ok(result);
 }
 
 /// @brief: 通过 ctrl_num 和 port_num 获取 port
-pub fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
     let list: SpinLockGuard<Vec<&mut HbaMem>> = LOCKED_HBA_MEM_LIST.lock();
     let port: &HbaPort = &list[ctrl_num as usize].ports[port_num as usize];
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
     return unsafe { (port as *const HbaPort as *mut HbaPort).as_mut().unwrap() };
 }
 

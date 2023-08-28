@@ -81,8 +81,7 @@ impl Syscall {
         timezone: *mut PosixTimeZone,
     ) -> Result<usize, SystemError> {
         // TODO; 处理时区信息
-        // kdebug!("enter sys_do_gettimeofday");
-        if tv == null_mut() {
+        if tv.is_null() {
             return Err(SystemError::EFAULT);
         }
         let mut tv_buf =

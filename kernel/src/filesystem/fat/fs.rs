@@ -9,12 +9,12 @@ use alloc::{
 };
 
 use crate::{
+    filesystem::vfs::io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
-    io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},

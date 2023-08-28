@@ -4,7 +4,7 @@ use core::mem::size_of;
 
 use alloc::vec::Vec;
 
-use crate::{io::SeekFrom, syscall::SystemError};
+use crate::{filesystem::vfs::io::SeekFrom, syscall::SystemError};
 
 /// @brief 本模块用于为数组提供游标的功能，以简化其操作。
 #[derive(Debug)]

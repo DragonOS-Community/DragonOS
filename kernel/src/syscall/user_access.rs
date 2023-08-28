@@ -258,19 +258,11 @@ impl<'a> UserBufferWriter<'a> {
     /// @return 构造成功返回UserbufferWriter实例，否则返回错误码
     ///
     pub fn new<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
-        if from_user
-            && verify_area(
-                VirtAddr::new(addr as usize),
-                (len * core::mem::size_of::<U>()) as usize,
-            )
-            .is_err()
-        {
+        if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
-            buffer: unsafe {
-                core::slice::from_raw_parts_mut(addr as *mut u8, len * core::mem::size_of::<U>())
-            },
+            buffer: unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) },
         });
     }
 

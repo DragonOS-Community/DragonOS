@@ -2,7 +2,7 @@
 use core::{cmp::min, intrinsics::unlikely};
 
 use crate::{
-    io::{device::LBA_SIZE, SeekFrom},
+    filesystem::vfs::io::{device::LBA_SIZE, SeekFrom},
     kwarn,
     libs::vec_cursor::VecCursor,
     syscall::SystemError,

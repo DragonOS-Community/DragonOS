@@ -3,11 +3,15 @@ pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
-use crate::io::device::BlockDevice;
+use crate::filesystem::vfs::io::device::BlockDevice;
 // 依赖的rust工具包
+use crate::driver::pci::pci::{
+    get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
+};
 use crate::filesystem::devfs::devfs_register;
-use crate::io::disk_info::BLK_GF_AHCI;
+use crate::filesystem::vfs::io::disk_info::BLK_GF_AHCI;
 use crate::kerror;
+use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::virt_2_phys;
 use crate::syscall::SystemError;
@@ -20,20 +24,22 @@ use crate::{
     kdebug,
 };
 use ahci_inode::LockedAhciInode;
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use alloc::{format, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::compiler_fence;
-
-// 依赖的C结构体/常量
-use crate::include::bindings::bindings::{
-    ahci_cpp_init, pci_device_structure_general_device_t, pci_device_structure_header_t,
-    AHCI_MAPPING_BASE, MAX_AHCI_DEVICES, PAGE_2M_MASK,
+use alloc::{
+    boxed::Box,
+    collections::LinkedList,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
 };
+use core::sync::atomic::compiler_fence;
 
 // 仅module内可见 全局数据区  hbr_port, disks
 static LOCKED_HBA_MEM_LIST: SpinLock<Vec<&mut HbaMem>> = SpinLock::new(Vec::new());
 static LOCKED_DISKS_LIST: SpinLock<Vec<Arc<LockedAhciDisk>>> = SpinLock::new(Vec::new());
+
+const AHCI_CLASS: u8 = 0x1;
+const AHCI_SUBCLASS: u8 = 0x6;
 
 /* TFES - Task File Error Status */
 #[allow(non_upper_case_globals)]
@@ -48,53 +54,57 @@ pub extern "C" fn ahci_init() -> i32 {
         return r.unwrap_err().to_posix_errno();
     }
 }
+
+/// @brief 寻找所有的ahci设备
+/// @param list 链表的写锁
+/// @return Result<Vec<&'a mut Box<dyn PciDeviceStructure>>, SystemError>   成功则返回包含所有ahci设备结构体的可变引用的链表，失败则返回err
+fn ahci_device_search<'a>(
+    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
+) -> Result<Vec<&'a mut Box<dyn PciDeviceStructure>>, SystemError> {
+    let result = get_pci_device_structure_mut(list, AHCI_CLASS, AHCI_SUBCLASS);
+
+    if result.is_empty() {
+        return Err(SystemError::ENODEV);
+    }
+    kdebug!("{}", result.len());
+    Ok(result)
+}
+
 /// @brief: 初始化 ahci
 pub fn ahci_rust_init() -> Result<(), SystemError> {
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-    let mut ahci_dev_counts: u32 = 0;
-    let mut ahci_devs: [*mut pci_device_structure_header_t; MAX_AHCI_DEVICES as usize] =
-        [0 as *mut pci_device_structure_header_t; MAX_AHCI_DEVICES as usize];
-    let mut gen_devs: [*mut pci_device_structure_general_device_t; MAX_AHCI_DEVICES as usize] =
-        [0 as *mut pci_device_structure_general_device_t; MAX_AHCI_DEVICES as usize];
-
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    unsafe {
-        // 单线程 init， 所以写 ahci_devs 全局变量不会出错？
-        ahci_cpp_init(
-            (&mut ahci_dev_counts) as *mut u32,
-            (&mut ahci_devs) as *mut *mut pci_device_structure_header_t,
-            (&mut gen_devs) as *mut *mut pci_device_structure_general_device_t,
-        );
-    }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
+    let mut list = PCI_DEVICE_LINKEDLIST.write();
+    let ahci_device = ahci_device_search(&mut list)?;
     // 全局数据 - 列表
     let mut disks_list = LOCKED_DISKS_LIST.lock();
 
-    for i in 0..(ahci_dev_counts as usize) {
+    for device in ahci_device {
+        let standard_device = device.as_standard_device_mut().unwrap();
+        standard_device.bar_ioremap();
         // 对于每一个ahci控制器分配一块空间 (目前slab algorithm最大支持1MB)
         let ahci_port_base_vaddr =
             Box::leak(Box::new([0u8; (1 << 20) as usize])) as *mut u8 as usize;
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        // 获取全局引用 : 计算 HBA_MEM 的虚拟地址 依赖于C的宏定义 cal_HBA_MEM_VIRT_ADDR
-        let virt_addr = AHCI_MAPPING_BASE as usize + unsafe { (*gen_devs[i]).BAR5 as usize }
-            - (unsafe { (*gen_devs[0]).BAR5 as usize } & PAGE_2M_MASK as usize);
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
+        let virtaddr = standard_device
+            .bar()
+            .ok_or(SystemError::EACCES)?
+            .get_bar(5)
+            .or(Err(SystemError::EACCES))?
+            .virtual_address()
+            .unwrap();
         // 最后把这个引用列表放入到全局列表
         let mut hba_mem_list = LOCKED_HBA_MEM_LIST.lock();
-        hba_mem_list.push(unsafe { (virt_addr as *mut HbaMem).as_mut().unwrap() });
-        let pi = volatile_read!(hba_mem_list[i].pi);
+        //这里两次unsafe转引用规避rust只能有一个可变引用的检查，提高运行速度
+        let hba_mem = unsafe { (virtaddr.data() as *mut HbaMem).as_mut().unwrap() };
+        hba_mem_list.push(unsafe { (virtaddr.data() as *mut HbaMem).as_mut().unwrap() });
+        let pi = volatile_read!(hba_mem.pi);
+        let hba_mem_index = hba_mem_list.len() - 1;
         drop(hba_mem_list);
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
         // 初始化所有的port
         let mut id = 0;
         for j in 0..32 {
             if (pi >> j) & 1 > 0 {
-                let mut hba_mem_list = LOCKED_HBA_MEM_LIST.lock();
-                let tp = hba_mem_list[i].ports[j].check_type();
+                let hba_mem_list = LOCKED_HBA_MEM_LIST.lock();
+                let hba_mem_port = &mut hba_mem.ports[j];
+                let tp = hba_mem_port.check_type();
                 match tp {
                     HbaPortType::None => {
                         kdebug!("<ahci_rust_init> Find a None type Disk.");
@@ -108,7 +118,6 @@ pub fn ahci_rust_init() -> Result<(), SystemError> {
                         // 计算地址
                         let fb = virt_2_phys(ahci_port_base_vaddr + (32 << 10) + (j << 8));
                         let clb = virt_2_phys(ahci_port_base_vaddr + (j << 10));
-                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
                         let ctbas = (0..32)
                             .map(|x| {
                                 virt_2_phys(
@@ -118,17 +127,14 @@ pub fn ahci_rust_init() -> Result<(), SystemError> {
                             .collect::<Vec<_>>();
 
                         // 初始化 port
-                        hba_mem_list[i].ports[j].init(clb as u64, fb as u64, &ctbas);
-
-                        // 释放锁
+                        hba_mem_port.init(clb as u64, fb as u64, &ctbas);
                         drop(hba_mem_list);
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
                         // 创建 disk
                         disks_list.push(LockedAhciDisk::new(
                             format!("ahci_disk_{}", id),
                             BLK_GF_AHCI,
-                            i as u8,
+                            hba_mem_index as u8,
                             j as u8,
                         )?);
                         id += 1; // ID 从0开始
@@ -144,7 +150,7 @@ pub fn ahci_rust_init() -> Result<(), SystemError> {
                             kerror!(
                                 "Ahci_{} ctrl = {}, port = {} failed to register, error code = {:?}",
                                 id,
-                                i,
+                                hba_mem_index as u8,
                                 j,
                                 err
                             );
@@ -168,23 +174,20 @@ pub fn disks() -> Vec<Arc<LockedAhciDisk>> {
 
 /// @brief: 通过 name 获取 disk
 pub fn get_disks_by_name(name: String) -> Result<Arc<LockedAhciDisk>, SystemError> {
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let disks_list: SpinLockGuard<Vec<Arc<LockedAhciDisk>>> = LOCKED_DISKS_LIST.lock();
-    for i in 0..disks_list.len() {
-        if disks_list[i].0.lock().name == name {
-            return Ok(disks_list[i].clone());
-        }
-    }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return Err(SystemError::ENXIO);
+    let result = disks_list
+        .iter()
+        .find(|x| x.0.lock().name == name)
+        .ok_or(SystemError::ENXIO)?
+        .clone();
+    return Ok(result);
 }
 
 /// @brief: 通过 ctrl_num 和 port_num 获取 port
-pub fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
     let list: SpinLockGuard<Vec<&mut HbaMem>> = LOCKED_HBA_MEM_LIST.lock();
     let port: &HbaPort = &list[ctrl_num as usize].ports[port_num as usize];
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
     return unsafe { (port as *const HbaPort as *mut HbaPort).as_mut().unwrap() };
 }
 

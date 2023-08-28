@@ -7,6 +7,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, MMArch},
+    filesystem::vfs::io::SeekFrom,
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
@@ -14,7 +15,6 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
-    io::SeekFrom,
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
@@ -435,7 +435,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr = VirtAddr::new(buf_vaddr);
+                let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
                 let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
@@ -545,7 +545,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr = VirtAddr::new(buf_vaddr);
+                let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
                 let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
@@ -653,11 +653,7 @@ impl Syscall {
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
                 let pipefd = args[0] as *mut c_int;
-                match UserBufferWriter::new(
-                    pipefd,
-                    core::mem::size_of::<[c_int; 2]>() as usize,
-                    from_user,
-                ) {
+                match UserBufferWriter::new(pipefd, core::mem::size_of::<[c_int; 2]>(), from_user) {
                     Err(e) => Err(e),
                     Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
                         Err(e) => Err(e),
@@ -884,25 +880,7 @@ impl Syscall {
             SYS_GETTIMEOFDAY => {
                 let timeval = args[0] as *mut PosixTimeval;
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
-                match UserBufferWriter::new(timeval, core::mem::size_of::<PosixTimeval>(), true) {
-                    Err(e) => Err(e),
-                    Ok(_) => {
-                        match UserBufferWriter::new(
-                            timezone_ptr,
-                            core::mem::size_of::<PosixTimeZone>(),
-                            true,
-                        ) {
-                            Err(e) => Err(e),
-                            Ok(_) => {
-                                if !timeval.is_null() {
-                                    Self::gettimeofday(timeval, timezone_ptr)
-                                } else {
-                                    Err(SystemError::EFAULT)
-                                }
-                            }
-                        }
-                    }
-                }
+                Self::gettimeofday(timeval, timezone_ptr)
             }
             SYS_MMAP => {
                 let len = page_align_up(args[1]);

@@ -152,6 +152,20 @@ impl core::ops::AddAssign<PhysAddr> for PhysAddr {
     }
 }
 
+impl core::ops::BitOrAssign<usize> for PhysAddr {
+    #[inline(always)]
+    fn bitor_assign(&mut self, rhs: usize) {
+        self.0 |= rhs;
+    }
+}
+
+impl core::ops::BitOrAssign<PhysAddr> for PhysAddr {
+    #[inline(always)]
+    fn bitor_assign(&mut self, rhs: PhysAddr) {
+        self.0 |= rhs.0;
+    }
+}
+
 impl core::ops::Sub<usize> for PhysAddr {
     type Output = Self;
 

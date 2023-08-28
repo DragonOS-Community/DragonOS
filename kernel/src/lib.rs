@@ -29,7 +29,6 @@ mod include;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
 mod filesystem;
-mod io;
 mod ipc;
 mod mm;
 mod net;

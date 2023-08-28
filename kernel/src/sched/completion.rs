@@ -1,6 +1,4 @@
 use crate::{
-    arch::CurrentIrqArch,
-    exception::InterruptArch,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     syscall::SystemError,
     time::timer::schedule_timeout,

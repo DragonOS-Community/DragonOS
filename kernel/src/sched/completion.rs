@@ -3,10 +3,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::{
     arch::{
         asm::irqflags::{local_irq_restore, local_irq_save},
-        CurrentIrqArch,
     },
-    exception::InterruptArch,
-    libs::wait_queue::WaitQueue,
+    libs::{wait_queue::WaitQueue, spinlock::SpinLock},
     syscall::SystemError,
     time::timer::schedule_timeout,
 };
@@ -29,32 +27,33 @@ const MAX_TIMEOUT: i64 = core::i64::MAX;
 #[derive(Debug)]
 struct Completion {
     done: AtomicU32,
-    wait_queue: WaitQueue,
+    wait_queue: SpinLock<WaitQueue>,
+
 }
 
 impl Completion {
     pub const fn new() -> Self {
         Self {
             done: AtomicU32::new(0),
-            wait_queue: WaitQueue::INIT,
+            wait_queue: SpinLock::new(WaitQueue::INIT),
         }
     }
     /// @brief 唤醒一个wait_queue中的节点
     pub fn complete(&self) {
-        let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let queue = self.wait_queue.lock_irqsave();
         if self.done.load(Ordering::SeqCst) != COMPLETE_ALL {
             self.done.fetch_add(1, Ordering::SeqCst);
         }
-        self.wait_queue.wakeup(None);
-        drop(guard);
+        queue.wakeup(None);
+        drop(queue);
     }
 
     /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
     pub fn complete_all(&self) {
-        let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let queue = self.wait_queue.lock_irqsave();
         self.done.store(COMPLETE_ALL, Ordering::SeqCst);
-        self.wait_queue.wakeup_all(None);
-        drop(guard);
+        queue.wakeup_all(None);
+        drop(queue);
     }
 
     /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
@@ -64,6 +63,7 @@ impl Completion {
     /// @return 返回剩余时间或者SystemError
     fn do_wait_for_common(&self, mut timeout: i64, interuptible: bool) -> Result<i64, SystemError> {
         let mut flags = local_irq_save();
+        let queue = self.wait_queue.lock();
         if self.done.load(Ordering::SeqCst) != 0 {
             //loop break 类似 do while 保证进行一次信号检测
             loop {
@@ -74,9 +74,9 @@ impl Completion {
                 //}
                 local_irq_restore(flags);
                 if interuptible {
-                    self.wait_queue.sleep();
+                    queue.sleep();
                 } else {
-                    self.wait_queue.sleep_uninterruptible();
+                    queue.sleep_uninterruptible();
                 }
                 //TODO 考虑是否真的需要SystemError
                 timeout = schedule_timeout(timeout)?;
@@ -85,8 +85,9 @@ impl Completion {
                     break;
                 }
             }
-            self.wait_queue.wakeup(None);
+            queue.wakeup(None);
             if self.done.load(Ordering::SeqCst) > 0 {
+                local_irq_restore(flags);
                 return Ok(timeout);
             }
         }
@@ -94,6 +95,7 @@ impl Completion {
         {
             self.done.fetch_sub(1, Ordering::SeqCst);
         }
+        local_irq_restore(flags);
         return Ok(if timeout > 0 { timeout } else { 1 });
     }
 
@@ -121,11 +123,15 @@ impl Completion {
         self.do_wait_for_common(timeout, true)
     }
 
+    /// @brief @brief 尝试获取completion的一个done！如果您在wait之前加上这个函数作为判断，说不定会加快运行速度。
+    /// 
+    /// @return true - 表示不需要wait_for_completion，并且已经获取到了一个completion(即返回true意味着done已经被 减1 )
+    /// @return false - 表示当前done=0，您需要进入等待，即wait_for_completion
     pub fn try_wait_for_completion(&self) -> bool {
         if self.done.load(Ordering::SeqCst) == 0 {
             return false;
         }
-        let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let guard = self.wait_queue.lock_irqsave();
         if self.done.load(Ordering::SeqCst) != 0 {
             return false;
         } else if self.done.load(Ordering::SeqCst) != COMPLETE_ALL {
@@ -134,4 +140,19 @@ impl Completion {
         drop(guard);
         return true;
     }
+
+    // @brief 测试一个completion是否有waiter。（即done是不是等于0）
+    pub fn completion_done(&self)->bool{
+        if self.done.load(Ordering::SeqCst)==0{
+            return false;
+        }
+        let _guard = self.wait_queue.lock();
+        if self.done.load(Ordering::SeqCst)==0 {
+            return false;
+        }
+        return true
+        // 脱离生命周期，自动释放guard
+    }
+
+
 }

@@ -1,8 +1,10 @@
-
-all: ps2_keyboard.o
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
+.PHONY: all
 
-ps2_keyboard.o: ps2_keyboard.c
-	$(CC) $(CFLAGS) -c ps2_keyboard.c -o ps2_keyboard.o
+all: $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@

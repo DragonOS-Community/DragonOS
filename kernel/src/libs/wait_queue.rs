@@ -238,9 +238,3 @@ pub extern "C" fn rs_waitqueue_wakeup(wait_queue: *mut WaitQueue, state: u64) {
         }
     }
 }
-
-#[no_mangle]
-pub extern "C" fn get_wait_list(wait_queue: *mut WaitQueue) -> LinkedList<Arc<ProcessControlBlock>> {
-    let inner = self.0.lock().unwrap();
-    inner.wait_list.clone()
-}

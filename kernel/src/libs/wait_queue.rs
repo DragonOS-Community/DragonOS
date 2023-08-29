@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloc::{collections::LinkedList, sync::Arc, vec::Vec,boxed::Box};
+use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
@@ -202,7 +202,6 @@ impl InnerWaitQueue {
         wait_list: LinkedList::new(),
     };
 }
-
 
 // ======== 以下为对C的接口 ========
 #[no_mangle]

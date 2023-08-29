@@ -317,6 +317,17 @@ impl ProcessState {
     }
 }
 
+impl From<u64> for ProcessState {
+    fn from(value: u64) -> Self {
+        match value {
+            0 => ProcessState::Runnable,
+            1 => ProcessState::Blocked(true),
+            2 => ProcessState::Blocked(false),
+            _ => ProcessState::Exited(value as usize),
+        }
+    }
+}
+
 bitflags! {
     /// pcb的标志位
     pub struct ProcessFlags: usize {
@@ -515,6 +526,12 @@ impl Drop for ProcessControlBlock {
         // 释放资源
     }
 }
+// ======== 以下为对C的接口 ========
+#[no_mangle]
+pub extern "C" fn process_control_block_init() -> *mut process_control_block {
+    ProcessControlBlock::new(name, kstack)
+}
+
 /// 进程的基本信息
 ///
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
@@ -815,6 +832,7 @@ impl Drop for KernelStack {
 pub fn process_init() {
     ProcessManager::init();
 }
+
 #[no_mangle]
 pub extern "C" fn process_do_exit(exit_code: usize) -> usize {
     ProcessManager::exit(exit_code);

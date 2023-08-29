@@ -17,3 +17,7 @@ pub fn current_pcb() -> &'static mut process_control_block {
 
     ret.unwrap()
 }
+
+
+//==========以下是对C的接口===========
+extern "C" 

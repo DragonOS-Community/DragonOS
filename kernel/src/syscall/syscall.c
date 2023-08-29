@@ -10,6 +10,7 @@
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
+#include<common/wait_queue.h>
 // 导出系统调用入口函数，定义在entry.S中
 extern void syscall_int(void);
 
@@ -105,7 +106,7 @@ uint64_t c_sys_wait4(pid_t pid, int *status, int options, void *rusage)
     // BUG: 这里存在问题，由于未对进程管理模块加锁，因此可能会出现子进程退出后，父进程还在等待的情况
     // （子进程退出后，process_exit_notify消息丢失）
     while (child_proc->state != PROC_ZOMBIE)
-        wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
+        rs_wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
 
     // 拷贝子进程的返回码
     if (likely(status != NULL))

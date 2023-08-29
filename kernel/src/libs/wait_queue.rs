@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
+use alloc::{collections::LinkedList, sync::Arc, vec::Vec,boxed::Box};
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
@@ -201,4 +201,41 @@ impl InnerWaitQueue {
     pub const INIT: InnerWaitQueue = InnerWaitQueue {
         wait_list: LinkedList::new(),
     };
+}
+
+
+// ======== 以下为对C的接口 ========
+#[no_mangle]
+pub extern "C" fn rs_waitqueue_init() -> *mut WaitQueue {
+    Box::into_raw(Box::new(WaitQueue::INIT))
+}
+
+#[no_mangle]
+pub extern "C" fn rs_waitqueue_sleep_on(wait_queue: *mut WaitQueue) {
+    unsafe {
+        if !wait_queue.is_null() {
+            let wait_queue = &*wait_queue;
+            wait_queue.sleep_uninterruptible();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rs_waitqueue_sleep_on_interriptible(wait_queue: *mut WaitQueue) {
+    unsafe {
+        if !wait_queue.is_null() {
+            let wait_queue = &*wait_queue;
+            wait_queue.sleep();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rs_waitqueue_wakeup(wait_queue: *mut WaitQueue, state: u64) {
+    unsafe {
+        if !wait_queue.is_null() {
+            let wait_queue = &*wait_queue;
+            wait_queue.wakeup(Some(state.into()));
+        }
+    }
 }

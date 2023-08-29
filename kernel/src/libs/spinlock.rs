@@ -1,63 +1,14 @@
 #![allow(dead_code)]
 use core::cell::UnsafeCell;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
-use core::ptr::read_volatile;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::asm::irqflags::{local_irq_restore, local_irq_save};
 use crate::arch::interrupt::{cli, sti};
-use crate::include::bindings::bindings::{spin_lock, spin_unlock, spinlock_t};
-use crate::process::preempt::{preempt_disable, preempt_enable};
+use crate::process::ProcessManager;
 use crate::syscall::SystemError;
-
-/// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
-#[inline]
-pub fn spin_lock_irqsave(lock: *mut spinlock_t, flags: &mut usize) {
-    *flags = local_irq_save();
-    unsafe {
-        spin_lock(lock);
-    }
-}
-
-/// @brief 恢复rflags以及中断状态并解锁自旋锁
-#[inline]
-pub fn spin_unlock_irqrestore(lock: *mut spinlock_t, flags: usize) {
-    unsafe {
-        spin_unlock(lock);
-    }
-    local_irq_restore(flags);
-}
-
-/// 判断一个自旋锁是否已经被加锁
-#[inline]
-pub fn spin_is_locked(lock: &spinlock_t) -> bool {
-    let val = unsafe { read_volatile(&lock.lock as *const i8) };
-
-    return if val == 0 { true } else { false };
-}
-
-impl Default for spinlock_t {
-    fn default() -> Self {
-        Self { lock: 1 }
-    }
-}
-
-/// @brief 关闭中断并加锁
-pub fn spin_lock_irq(lock: *mut spinlock_t) {
-    cli();
-    unsafe {
-        spin_lock(lock);
-    }
-}
-
-/// @brief 解锁并开中断
-pub fn spin_unlock_irq(lock: *mut spinlock_t) {
-    unsafe {
-        spin_unlock(lock);
-    }
-    sti();
-}
 
 /// 原始的Spinlock（自旋锁）
 /// 请注意，这个自旋锁和C的不兼容。
@@ -86,7 +37,7 @@ impl RawSpinlock {
     ///         加锁失败->false
     pub fn try_lock(&self) -> bool {
         // 先增加自旋锁持有计数
-        preempt_disable();
+        ProcessManager::current_pcb().preempt_disable();
 
         let res = self
             .0
@@ -95,7 +46,7 @@ impl RawSpinlock {
 
         // 如果加锁失败恢复自旋锁持有计数
         if res == false {
-            preempt_enable();
+            ProcessManager::current_pcb().preempt_enable();
         }
         return res;
     }
@@ -103,7 +54,12 @@ impl RawSpinlock {
     /// @brief 解锁
     pub fn unlock(&self) {
         // 减少自旋锁持有计数
-        preempt_enable();
+        ProcessManager::current_pcb().preempt_enable();
+        self.0.store(false, Ordering::Release);
+    }
+
+    /// 解锁，但是不更改preempt count
+    unsafe fn unlock_no_preempt(&self) {
         self.0.store(false, Ordering::Release);
     }
 
@@ -170,6 +126,24 @@ pub struct SpinLockGuard<'a, T: 'a> {
     flag: usize,
 }
 
+impl<'a, T: 'a> SpinLockGuard<'a, T> {
+    /// 泄露自旋锁的守卫，返回一个可变的引用
+    ///
+    ///  ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    #[inline]
+    pub unsafe fn leak(this: Self) -> &'a mut T {
+        // Use ManuallyDrop to avoid stacked-borrow invalidation
+        let this = ManuallyDrop::new(this);
+        // We know statically that only we are referencing data
+        unsafe { &mut *this.lock.data.get() }
+    }
+}
+
 /// 向编译器保证，SpinLock在线程之间是安全的.
 /// 其中要求类型T实现了Send这个Trait
 unsafe impl<T> Sync for SpinLock<T> where T: Send {}
@@ -222,6 +196,16 @@ impl<T> SpinLock<T> {
             });
         }
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+
+    /// 强制解锁，并且不更改preempt count
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致preempt count不正确，因此必须小心的手动维护好preempt count。
+    /// 如非必要，请不要使用这个函数。
+    pub unsafe fn force_unlock(&self) {
+        self.lock.unlock_no_preempt();
     }
 }
 

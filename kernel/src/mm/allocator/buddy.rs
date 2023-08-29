@@ -7,7 +7,7 @@ use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
-use crate::{kdebug, kerror, kwarn};
+use crate::{kdebug, kwarn};
 use core::cmp::{max, min};
 use core::fmt::Debug;
 use core::intrinsics::{likely, unlikely};
@@ -70,9 +70,9 @@ pub struct BuddyAllocator<A> {
 
 impl<A: MemoryManagementArch> BuddyAllocator<A> {
     const BUDDY_ENTRIES: usize =
-    // 定义一个变量记录buddy表的大小
+        // 定义一个变量记录buddy表的大小
         (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
-    
+
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
         let initial_free_pages = bump_allocator.usage().free();
         kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
@@ -207,7 +207,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         assert!(remain_bytes < (1 << MAX_ORDER - 1));
 
         for i in (MIN_ORDER..MAX_ORDER).rev() {
-            if remain_bytes & (1 << i) != 0 {
+            if remain_bytes >= (1 << i) {
+                assert!(paddr & ((1 << i) - 1) == 0);
                 let page_list_paddr: PhysAddr = free_area[Self::order2index(i as u8)];
                 let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
 
@@ -281,8 +282,6 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             let mut page_list_addr = self.free_area[Self::order2index(spec_order)];
             let mut page_list: PageList<A> = Self::read_page(page_list_addr);
 
-            // kdebug!("page_list={page_list:?}");
-
             // 循环删除头部的空闲链表页
             while page_list.entry_num == 0 {
                 let next_page_list_addr = page_list.next_page;
@@ -315,8 +314,15 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                         page_list.entry_num - 1,
                     ))
                 };
+                // 清除该entry
+                unsafe {
+                    A::write(
+                        Self::entry_virt_addr(page_list_addr, page_list.entry_num - 1),
+                        PhysAddr::new(0),
+                    )
+                };
                 if entry.is_null() {
-                    kerror!(
+                    panic!(
                         "entry is null, entry={:?}, order={}, entry_num = {}",
                         entry,
                         spec_order,
@@ -324,6 +330,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     );
                 }
                 // kdebug!("entry={entry:?}");
+
                 // 更新page_list的entry_num
                 page_list.entry_num -= 1;
                 let tmp_current_entry_num = page_list.entry_num;
@@ -344,7 +351,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
                 // 检测entry 是否对齐
                 if !entry.check_aligned(1 << spec_order) {
-                    panic!("entry={:?} is not aligned, spec_order={spec_order}, page_list.entry_num={}", entry,tmp_current_entry_num);
+                    panic!("entry={:?} is not aligned, spec_order={spec_order}, page_list.entry_num={}", entry, tmp_current_entry_num);
                 }
                 return Some(entry);
             }

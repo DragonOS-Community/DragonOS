@@ -61,3 +61,78 @@ impl InterruptArch for X86_64InterruptArch {
         compiler_fence(Ordering::SeqCst);
     }
 }
+
+/// 中断栈帧结构体
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TrapFrame {
+    pub r15: ::core::ffi::c_ulong,
+    pub r14: ::core::ffi::c_ulong,
+    pub r13: ::core::ffi::c_ulong,
+    pub r12: ::core::ffi::c_ulong,
+    pub r11: ::core::ffi::c_ulong,
+    pub r10: ::core::ffi::c_ulong,
+    pub r9: ::core::ffi::c_ulong,
+    pub r8: ::core::ffi::c_ulong,
+    pub rbx: ::core::ffi::c_ulong,
+    pub rcx: ::core::ffi::c_ulong,
+    pub rdx: ::core::ffi::c_ulong,
+    pub rsi: ::core::ffi::c_ulong,
+    pub rdi: ::core::ffi::c_ulong,
+    pub rbp: ::core::ffi::c_ulong,
+    pub ds: ::core::ffi::c_ulong,
+    pub es: ::core::ffi::c_ulong,
+    pub rax: ::core::ffi::c_ulong,
+    pub func: ::core::ffi::c_ulong,
+    pub errcode: ::core::ffi::c_ulong,
+    pub rip: ::core::ffi::c_ulong,
+    pub cs: ::core::ffi::c_ulong,
+    pub rflags: ::core::ffi::c_ulong,
+    pub rsp: ::core::ffi::c_ulong,
+    pub ss: ::core::ffi::c_ulong,
+}
+
+impl TrapFrame {
+    pub fn new() -> Self {
+        Self {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            ds: 0,
+            es: 0,
+            rax: 0,
+            func: 0,
+            errcode: 0,
+            rip: 0,
+            cs: 0,
+            rflags: 0,
+            rsp: 0,
+            ss: 0,
+        }
+    }
+
+    /// 设置中断栈帧返回值
+    pub fn set_return_value(&mut self, value: usize) {
+        self.rax = value as u64;
+    }
+
+    /// 判断当前中断是否来自用户模式
+    pub fn from_user(&self) -> bool {
+        if (self.cs & 0x3) != 0 {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}

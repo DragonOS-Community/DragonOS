@@ -1,12 +1,13 @@
 use core::arch::asm;
 
-use super::asm::current::current_pcb;
+use x86::cpuid::{cpuid, CpuIdResult};
 
 /// @brief 获取当前cpu的apic id
 #[inline]
 pub fn current_cpu_id() -> u32 {
-    // TODO: apic重构后，使用apic id来设置这里
-    current_pcb().cpu_id as u32
+    let cpuid_res: CpuIdResult = cpuid!(0x1);
+    let cpu_id = (cpuid_res.ebx >> 24) & 0xff;
+    return cpu_id;
 }
 
 /// @brief 通过pause指令，让cpu休息一会儿。降低空转功耗

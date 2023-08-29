@@ -22,9 +22,6 @@
 
 #include "proc-types.h"
 
-extern void process_exit_thread(struct process_control_block *pcb);
-extern int process_exit_files(struct process_control_block *pcb);
-
 /**
  * @brief 任务状态段结构体
  *
@@ -77,18 +74,6 @@ extern int process_exit_files(struct process_control_block *pcb);
 void process_init();
 
 /**
- * @brief fork当前进程
- *
- * @param regs 新的寄存器值
- * @param clone_flags 克隆标志
- * @param stack_start 堆栈开始地址
- * @param stack_size 堆栈大小
- * @return unsigned long
- */
-unsigned long do_fork(struct pt_regs *regs, unsigned long clone_flags, unsigned long stack_start,
-                      unsigned long stack_size);
-
-/**
  * @brief 根据pid获取进程的pcb。存在对应的pcb时，返回对应的pcb的指针，否则返回NULL
  * 当进程管理模块拥有pcblist_lock之后，调用本函数之前，应当对其加锁
  * @param pid
@@ -113,20 +98,12 @@ int process_wakeup(struct process_control_block *pcb);
 int process_wakeup_immediately(struct process_control_block *pcb);
 
 /**
- * @brief 释放进程的页表
- *
- * @param pcb 要被释放页表的进程
- * @return uint64_t
- */
-uint64_t process_exit_mm(struct process_control_block *pcb);
-
-/**
  * @brief 进程退出时执行的函数
  *
  * @param code 返回码
  * @return ul
  */
-ul process_do_exit(ul code);
+extern ul process_do_exit(ul code);
 
 /**
  * @brief 当子进程退出后向父进程发送通知
@@ -143,25 +120,11 @@ void process_exit_notify();
  * @return int
  */
 
-pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags);
+pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags){
+    kerror("FIXME: kernel_thread not implemented\n");
+    while(1);
+}
 
-int process_fd_alloc(struct vfs_file_t *file);
-
-int process_release_pcb(struct process_control_block *pcb);
-
-/**
- * @brief 切换页表
- * @param prev 前一个进程的pcb
- * @param next 下一个进程的pcb
- *
- */
-#define process_switch_mm(next_pcb)                                    \
-    do                                                                 \
-    {                                                                  \
-        asm volatile("movq %0, %%cr3	\n\t" ::"r"(next_pcb->mm->pgd) \
-                     : "memory");                                      \
-    } while (0)
-// flush_tlb();
 
 // 获取当前cpu id
 #define proc_current_cpu_id (current_pcb->cpu_id)
@@ -175,25 +138,6 @@ extern struct mm_struct initial_mm;
 extern struct thread_struct initial_thread;
 extern union proc_union initial_proc_union;
 extern struct process_control_block *initial_proc[MAX_CPU_NUM];
-
-/**
- * @brief 给pcb设置名字
- *
- * @param pcb 需要设置名字的pcb
- * @param pcb_name 保存名字的char数组
- */
-void process_set_pcb_name(struct process_control_block *pcb, const char *pcb_name);
-
-/**
- * @brief 判断进程是否已经停止
- *
- * hint: 本函数在rust中实现，请参考rust版本的注释
- *
- * @param pcb 目标pcb
- * @return true
- * @return false
- */
-extern bool process_is_stopped(struct process_control_block *pcb);
 
 /**
  * @brief 尝试唤醒指定的进程。

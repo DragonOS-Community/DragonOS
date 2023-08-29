@@ -1,6 +1,7 @@
 use crate::{
-    arch::{asm::current::current_pcb, context::switch_process, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
+    process::ProcessManager,
     syscall::{Syscall, SystemError},
 };
 
@@ -21,7 +22,7 @@ impl Syscall {
         let pcb = do_sched();
 
         if pcb.is_some() {
-            switch_process(current_pcb(), pcb.unwrap());
+            unsafe { ProcessManager::switch_process(ProcessManager::current_pcb(), pcb.unwrap()) };
         }
         drop(irq_guard);
         return Ok(0);

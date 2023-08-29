@@ -16,13 +16,14 @@ use alloc::{
 use hashbrown::HashSet;
 
 use crate::{
-    arch::{asm::current::current_pcb, mm::PageMapper, CurrentIrqArch, MMArch},
+    arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     libs::{
         align::page_align_up,
         rwlock::{RwLock, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::ProcessManager,
     syscall::SystemError,
 };
 
@@ -64,10 +65,12 @@ impl AddressSpace {
 
     /// 从pcb中获取当前进程的地址空间结构体的Arc指针
     pub fn current() -> Result<Arc<AddressSpace>, SystemError> {
-        let result = current_pcb()
-            .address_space()
+        let vm = ProcessManager::current_pcb()
+            .basic()
+            .user_vm()
             .expect("Current process has no address space");
-        return Ok(result);
+
+        return Ok(vm);
     }
 
     /// 判断某个地址空间是否为当前进程的地址空间
@@ -842,6 +845,8 @@ impl LockedVMA {
     }
 
     pub fn unmap(&self, mapper: &mut PageMapper, mut flusher: impl Flusher<MMArch>) {
+        // todo: 如果当前vma与文件相关，完善文件相关的逻辑
+
         let mut guard = self.lock();
         assert!(guard.mapped);
         for page in guard.region.pages() {
@@ -1116,7 +1121,8 @@ impl VMA {
         // kdebug!("VMA::zeroed: flusher dropped");
 
         // 清空这些内存
-        let virt_iter = VirtPageFrameIter::new(destination, destination.add(page_count));
+        let virt_iter: VirtPageFrameIter =
+            VirtPageFrameIter::new(destination, destination.add(page_count));
         for frame in virt_iter {
             let paddr = mapper.translate(frame.virt_address()).unwrap().0;
 

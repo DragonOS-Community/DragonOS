@@ -9,9 +9,10 @@ use core::{
 
 use alloc::boxed::Box;
 
-use crate::include::bindings::bindings::process_control_block;
+use crate::{exception::InterruptArch, include::bindings::bindings::process_control_block};
 
-use super::asm::irqflags::{local_irq_restore, local_irq_save};
+use crate::arch::CurrentIrqArch;
+
 /// https://www.felixcloutier.com/x86/fxsave#tbl-3-47
 #[repr(C, align(16))]
 #[derive(Debug, Copy, Clone)]
@@ -79,7 +80,7 @@ impl FpState {
 /// @brief 从用户态进入内核时，保存浮点寄存器，并关闭浮点功能
 pub fn fp_state_save(pcb: &mut process_control_block) {
     // 该过程中不允许中断
-    let rflags: usize = local_irq_save();
+    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     let fp: &mut FpState = if pcb.fp_state == null_mut() {
         let f = Box::leak(Box::new(FpState::default()));
@@ -111,13 +112,13 @@ pub fn fp_state_save(pcb: &mut process_control_block) {
                                 "mov cr4, rax" */
         )
     }
-    local_irq_restore(rflags);
+    drop(guard);
 }
 
 /// @brief 从内核态返回用户态时，恢复浮点寄存器，并开启浮点功能
 pub fn fp_state_restore(pcb: &mut process_control_block) {
     // 该过程中不允许中断
-    let rflags = local_irq_save();
+    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     if pcb.fp_state == null_mut() {
         panic!("fp_state_restore: fp_state is null. pid={}", pcb.pid);
@@ -141,5 +142,5 @@ pub fn fp_state_restore(pcb: &mut process_control_block) {
     fp.restore();
     fp.clear();
 
-    local_irq_restore(rflags);
+    drop(guard);
 }

@@ -391,7 +391,6 @@ unsafe fn allocator_init() {
 
     // 初始化buddy_allocator
     let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
-
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
     kinfo!("Successfully initialized buddy allocator");
@@ -610,10 +609,10 @@ impl LowAddressRemapping {
         assert!(mapper.as_mut().is_some());
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
-            let flusher = mapper
+            let (_, _, flusher) = mapper
                 .as_mut()
                 .unwrap()
-                .unmap(vaddr, true)
+                .unmap_phys(vaddr, true)
                 .expect("Failed to unmap frame");
             if flush == false {
                 flusher.ignore();

@@ -39,6 +39,11 @@ macro_rules! int_like {
             pub const fn from(x: $backing_type) -> Self {
                 $new_type_name(x)
             }
+
+            #[allow(dead_code)]
+            pub const fn new(x: $backing_type) -> Self {
+                Self::from(x)
+            }
         }
     };
 
@@ -111,6 +116,14 @@ macro_rules! int_like {
                     Ok(result) => Ok($new_type_name::from(result)),
                     Err(result) => Err($new_type_name::from(result)),
                 }
+            }
+            #[allow(dead_code)]
+            pub fn fetch_add(
+                &self,
+                val: $new_type_name,
+                order: ::core::sync::atomic::Ordering,
+            ) -> $new_type_name {
+                $new_type_name::from(self.container.fetch_add(val.into(), order))
             }
         }
     };

@@ -8,7 +8,9 @@ use core::{
 };
 
 use crate::{
-    process::preempt::{preempt_disable, preempt_enable},
+    arch::CurrentIrqArch,
+    exception::{InterruptArch, IrqFlagsGuard},
+    process::ProcessManager,
     syscall::SystemError,
 };
 
@@ -59,6 +61,7 @@ pub struct RwLockUpgradableGuard<'a, T: 'a> {
 pub struct RwLockWriteGuard<'a, T: 'a> {
     data: *mut T,
     inner: &'a RwLock<T>,
+    irq_guard: Option<IrqFlagsGuard>,
 }
 
 unsafe impl<T: Send> Send for RwLock<T> {}
@@ -113,10 +116,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获取READER守卫
     pub fn try_read(&self) -> Option<RwLockReadGuard<T>> {
-        preempt_disable();
+        ProcessManager::current_pcb().preempt_disable();
         let r = self.inner_try_read();
         if r.is_none() {
-            preempt_enable();
+            ProcessManager::current_pcb().preempt_enable();
         }
         return r;
     }
@@ -177,10 +180,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得WRITER守卫
     pub fn try_write(&self) -> Option<RwLockWriteGuard<T>> {
-        preempt_disable();
+        ProcessManager::current_pcb().preempt_disable();
         let r = self.inner_try_write();
         if r.is_none() {
-            preempt_enable();
+            ProcessManager::current_pcb().preempt_enable();
         }
 
         return r;
@@ -198,6 +201,7 @@ impl<T> RwLock<T> {
             return Some(RwLockWriteGuard {
                 data: unsafe { &mut *self.data.get() },
                 inner: self,
+                irq_guard: None,
             });
         } else {
             return None;
@@ -218,12 +222,28 @@ impl<T> RwLock<T> {
 
     #[allow(dead_code)]
     #[inline]
+    /// @brief 获取WRITER守卫并关中断
+    pub fn write_irqsave(&self) -> RwLockWriteGuard<T> {
+        loop {
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            match self.try_write() {
+                Some(mut guard) => {
+                    guard.irq_guard = Some(irq_guard);
+                    return guard;
+                }
+                None => spin_loop(),
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
     /// @brief 尝试获得UPGRADER守卫
     pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
-        preempt_disable();
+        ProcessManager::current_pcb().preempt_disable();
         let r = self.inner_try_upgradeable_read();
         if r.is_none() {
-            preempt_enable();
+            ProcessManager::current_pcb().preempt_enable();
         }
 
         return r;
@@ -292,12 +312,19 @@ impl<T> From<T> for RwLock<T> {
 }
 
 impl<'rwlock, T> RwLockReadGuard<'rwlock, T> {
+    /// @brief 释放守卫,获得保护的值的不可变引用
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
     #[allow(dead_code)]
     #[inline]
-    /// @brief 释放守卫,获得保护的值的不可变引用
-    pub fn leak(this: Self) -> &'rwlock T {
-        let Self { data, .. } = this;
-        return unsafe { &*data };
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
+        let this = ManuallyDrop::new(this);
+        return unsafe { &*this.data };
     }
 }
 
@@ -322,6 +349,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
             Ok(RwLockWriteGuard {
                 data: unsafe { &mut *inner.data.get() },
                 inner,
+                irq_guard: None,
             })
         } else {
             Err(self)
@@ -363,9 +391,16 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
     #[allow(dead_code)]
     #[inline]
-    /// @brief 返回内部数据的引用,消除锁
-    pub fn leak(this: Self) -> &'rwlock T {
-        let this = ManuallyDrop::new(this);
+    /// @brief 返回内部数据的引用,消除守卫
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
+        let this: ManuallyDrop<RwLockUpgradableGuard<'_, T>> = ManuallyDrop::new(this);
 
         unsafe { &*this.data }
     }
@@ -374,8 +409,15 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
-    /// @brief 返回内部数据的引用,消除锁
-    pub fn leak(this: Self) -> &'rwlock T {
+    /// @brief 返回内部数据的引用,消除守卫
+    ///
+    /// ## Safety
+    ///
+    /// 由于这样做可能导致守卫在另一个线程中被释放，从而导致pcb的preempt count不正确，
+    /// 因此必须小心的手动维护好preempt count。
+    ///
+    /// 并且，leak还可能导致锁的状态不正确。因此请仔细考虑是否真的需要使用这个函数。
+    pub unsafe fn leak(this: Self) -> &'rwlock T {
         let this = ManuallyDrop::new(this);
 
         return unsafe { &*this.data };
@@ -456,7 +498,7 @@ impl<'rwlock, T> Drop for RwLockReadGuard<'rwlock, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
-        preempt_enable();
+        ProcessManager::current_pcb().preempt_enable();
     }
 }
 
@@ -467,7 +509,7 @@ impl<'rwlock, T> Drop for RwLockUpgradableGuard<'rwlock, T> {
             UPGRADED
         );
         self.inner.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
-        preempt_enable();
+        ProcessManager::current_pcb().preempt_enable();
         //这里为啥要AcqRel? Release应该就行了?
     }
 }
@@ -478,7 +520,7 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
         self.inner
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
-
-        preempt_enable();
+        self.irq_guard.take();
+        ProcessManager::current_pcb().preempt_enable();
     }
 }

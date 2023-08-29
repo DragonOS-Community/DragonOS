@@ -150,7 +150,7 @@ void system_initialize()
     // 因此必须在进程管理模块初始化完毕后再初始化smp。
     io_mfence();
 
-    process_init();
+    rs_process_init();
 
     io_mfence();
     rs_clocksource_boot_finish();

@@ -290,10 +290,9 @@ pub extern "C" fn current_pcb_flags() -> u64 {
     return ProcessManager::current_pcb().flags;
 }
 #[no_mangle]
-pub extern "C" fn current_pcb_virtual_runtime() -> i64{
+pub extern "C" fn current_pcb_virtual_runtime() -> i64 {
     return ProcessManager::current_pcb().sched_info().virtual_runtime;
 }
-
 
 /// 上下文切换完成后的钩子函数
 pub unsafe extern "C" fn switch_finish_hook() {
@@ -555,7 +554,6 @@ impl Drop for ProcessControlBlock {
         // 释放资源
     }
 }
-
 
 /// 进程的基本信息
 ///

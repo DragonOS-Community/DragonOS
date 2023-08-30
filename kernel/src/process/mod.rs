@@ -266,6 +266,35 @@ impl ProcessManager {
     }
 }
 
+//=======以下为对C的接口========
+//C语言中还有使用current_pcb->thread->rbp
+
+#[no_mangle]
+pub extern "C" fn current_pcb_state() -> u64 {
+    return ProcessManager::current_pcb().sched_info().state;
+}
+#[no_mangle]
+pub extern "C" fn current_pcb_cpu_id() -> u32 {
+    return ProcessManager::current_pcb().sched_info().on_cpu;
+}
+#[no_mangle]
+pub extern "C" fn current_pcb_pid() -> i64 {
+    return ProcessManager::current_pcb().basic().pid;
+}
+#[no_mangle]
+pub extern "C" fn current_pcb_preempt_count() -> i32 {
+    return ProcessManager::current_pcb().preempt_count;
+}
+#[no_mangle]
+pub extern "C" fn current_pcb_flags() -> u64 {
+    return ProcessManager::current_pcb().flags;
+}
+#[no_mangle]
+pub extern "C" fn current_pcb_virtual_runtime() -> i64{
+    return ProcessManager::current_pcb().sched_info().virtual_runtime;
+}
+
+
 /// 上下文切换完成后的钩子函数
 pub unsafe extern "C" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
@@ -526,11 +555,7 @@ impl Drop for ProcessControlBlock {
         // 释放资源
     }
 }
-// ======== 以下为对C的接口 ========
-#[no_mangle]
-pub extern "C" fn process_control_block_init() -> *mut process_control_block {
-    ProcessControlBlock::new(name, kstack)
-}
+
 
 /// 进程的基本信息
 ///

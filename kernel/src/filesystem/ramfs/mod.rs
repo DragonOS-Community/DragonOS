@@ -114,7 +114,7 @@ impl RamFS {
 }
 
 impl IndexNode for LockedRamFSInode {
-    fn truncate(&self, _len: usize) -> Result<(), SystemError> {
+    fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
 
         //如果是文件夹，则报错
@@ -123,8 +123,8 @@ impl IndexNode for LockedRamFSInode {
         }
 
         //当前文件长度大于_len才进行截断，否则不操作
-        if inode.data.len() > _len {
-            inode.data.resize(_len, 0);
+        if inode.data.len() > len {
+            inode.data.resize(len, 0);
         }
         return Ok(());
     }
@@ -133,7 +133,11 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &super::vfs::file::FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: &mut FilePrivateData,
+        _mode: &super::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 

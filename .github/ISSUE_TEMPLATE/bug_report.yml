@@ -5,10 +5,6 @@ labels: bug
 assignees: fslongjin
 
 body: 
-   - type: markdown 
-     id: bug-info 
-     attributes: 
-       value: "## Bug Infomation" 
    - type: textarea 
      id: bug-main 
      validations: 

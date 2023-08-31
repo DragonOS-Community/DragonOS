@@ -156,7 +156,7 @@ impl IndexNode for LockedKvmInode {
                     Arc::new(Mutex::new(Hypervisor::new(
                         1, 
                         0, 
-                        0,
+                        8,
                         // unsafe {(host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64},
                     ).unwrap()
                     ))

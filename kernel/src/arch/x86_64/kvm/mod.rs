@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 use raw_cpuid::CpuId;
+use crate::virt::kvm::host_mem::{KvmMemorySlot, KvmUserspaceMemoryRegion, KvmMemoryChange};
 use crate::{
     kerror, kdebug,
     // libs::spinlock::{SpinLock, SpinLockGuard},
@@ -67,7 +68,17 @@ impl X86_64KVMArch{
         return Ok(vcpu);
     }
     
-    
+    pub fn kvm_arch_create_memslot(slot: &mut KvmMemorySlot, npages: u64) {
+
+    }
+
+    pub fn kvm_arch_commit_memory_region(
+        mem: &KvmUserspaceMemoryRegion, 
+        new_slot: &KvmMemorySlot, 
+        old_slot: &KvmMemorySlot,
+        change: KvmMemoryChange) {
+        
+    }
 }
 
 #[no_mangle]

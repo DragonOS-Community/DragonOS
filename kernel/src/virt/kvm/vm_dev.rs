@@ -6,6 +6,7 @@ use crate::filesystem::vfs::{
     FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
     make_rawdev,
 };
+use crate::syscall::user_access::copy_from_user;
 use crate::{
     arch::asm::current::current_pcb,
     libs::spinlock::SpinLock,
@@ -15,12 +16,13 @@ use crate::{
 };
 use crate::virt::kvm::KVM;
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
-use crate::virt::kvm::hypervisor::KvmUserspaceMemoryRegion;
+use crate::virt::kvm::host_mem::KvmUserspaceMemoryRegion;
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use crate::mm::VirtAddr;
 
 // pub const KVM_API_VERSION:u32 = 12;
 // pub const GUEST_STACK_SIZE:usize = 1024;
@@ -152,15 +154,24 @@ impl IndexNode for LockedVmInode {
             },
             KVM_SET_USER_MEMORY_REGION => {
                 kdebug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
-                let kvm_mem_region = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
-                kdebug!("slot={}, flag={}, guest_phys_addr={}, userspace_addr={:x}",
-                    kvm_mem_region.slot,
-                    kvm_mem_region.flags,
-                    kvm_mem_region.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
-                    kvm_mem_region.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
+                let mut kvm_userspace_mem: KvmUserspaceMemoryRegion = Default::default();// = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
+                unsafe {
+                    copy_from_user(
+                        core::slice::from_raw_parts_mut(
+                            (&mut kvm_userspace_mem as *mut _ )as *mut u8, 
+                            core::mem::size_of::<KvmUserspaceMemoryRegion>()
+                        ), 
+                        VirtAddr::new(data)
+                    )?;
+                }
+                kdebug!("slot={}, flag={}, memory_size={:x}, guest_phys_addr={}, userspace_addr={:x}",
+                    kvm_userspace_mem.slot,
+                    kvm_userspace_mem.flags,
+                    kvm_userspace_mem.memory_size,
+                    kvm_userspace_mem.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
+                    kvm_userspace_mem.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
                 );
-                let kvm_mem_region = kvm_mem_region.clone();
-                KVM().lock().set_user_memory_region(&kvm_mem_region);
+                KVM().lock().set_user_memory_region(&kvm_userspace_mem);
                 Ok(0)
             },
             KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS=> {

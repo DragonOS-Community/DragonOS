@@ -14,7 +14,7 @@ body:
       description: "清晰而简明地描述问题是什么。例如：我总是感到沮丧，因为[...]"
 
   - type: textarea 
-     id: feature-solution 
+    id: feature-solution 
      validations: 
        required: true 
      attributes:

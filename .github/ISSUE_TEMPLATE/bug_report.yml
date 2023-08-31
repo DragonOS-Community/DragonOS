@@ -23,8 +23,8 @@ body:
      attributes: 
        label: "请填写您的电脑的信息" 
        description: "- 操作系统及版本：[例如，Ubuntu 22.04]
-- DragonOS版本：[版本号或git提交哈希值]
-- DADK版本：[通过`dadk --version`获取]
+- DragonOS版本：[版本号或git提交哈希值] \
+- DADK版本：[通过`dadk --version`获取] \
 - Rust版本：[在DragonOS目录下使用`rustc --version`获取]" 
    - type: textarea 
      id: bug-step 

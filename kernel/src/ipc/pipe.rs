@@ -12,7 +12,14 @@ use crate::{
 };
 
 use alloc::sync::{Arc, Weak};
-
+bitflags! {
+  pub struct PipeFlag:u8 {
+    // 管道标志位
+    const NORMAL=0;//  0：默认行为，创建一个阻塞管道。与使用 pipe 函数创建的管道行为一致。
+    const  O_NONBLOCK = 1 << 0; // 创建一个非阻塞管道
+    const O_CLOEXEC = 1 << 1; // 在执行 exec 调用时关闭管道文件描述符。
+   }
+}
 /// 我们设定pipe_buff的总大小为1024字节
 const PIPE_BUFF_SIZE: usize = 1024;
 
@@ -32,10 +39,11 @@ pub struct InnerPipeInode {
     data: [u8; PIPE_BUFF_SIZE],
     /// INode 元数据
     metadata: Metadata,
+    flags: PipeFlag,
 }
 
 impl LockedPipeInode {
-    pub fn new() -> Arc<Self> {
+    pub fn new(flags: PipeFlag) -> Arc<Self> {
         let inner = InnerPipeInode {
             self_ref: Weak::default(),
             valid_cnt: 0,
@@ -61,6 +69,7 @@ impl LockedPipeInode {
                 gid: 0,
                 raw_dev: 0,
             },
+            flags,
         };
         let result = Arc::new(Self(SpinLock::new(inner)));
         let mut guard = result.0.lock();
@@ -88,8 +97,12 @@ impl IndexNode for LockedPipeInode {
         //如果管道里面没有数据，则唤醒写端，
         while inode.valid_cnt == 0 {
             inode.write_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
-
-            // 在读等待队列中睡眠，并释放锁
+            // 如果为非阻塞管道，直接返回错误
+            if inode.flags.contains(PipeFlag::O_NONBLOCK) {
+                drop(inode);
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            // 否则在读等待队列中睡眠，并释放锁
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
                 inode.read_wait_queue.sleep_without_schedule();
@@ -170,6 +183,11 @@ impl IndexNode for LockedPipeInode {
         while len + inode.valid_cnt as usize > PIPE_BUFF_SIZE {
             // 唤醒读端
             inode.read_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
+            // 如果为非阻塞管道，直接返回错误
+            if inode.flags.contains(PipeFlag::O_NONBLOCK) {
+                drop(inode);
+                return Err(SystemError::ENOMEM);
+            }
             // 解锁并睡眠
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();

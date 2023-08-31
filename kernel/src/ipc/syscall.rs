@@ -5,14 +5,14 @@ use core::{
 
 use crate::{
     arch::asm::current::current_pcb,
-    filesystem::vfs::file::{File, FileMode},
+    filesystem::vfs::{file::{File, FileMode}, fcntl::{self, FcntlCommand, FD_CLOEXEC}},
     include::bindings::bindings::{pid_t, verify_area, NULL},
     kwarn,
     syscall::{Syscall, SystemError},
 };
 
 use super::{
-    pipe::LockedPipeInode,
+    pipe::{LockedPipeInode, PipeFlag},
     signal::{signal_kill_something_info, DEFAULT_SIGACTION, DEFAULT_SIGACTION_IGNORE},
     signal_types::{
         SignalNumber, __siginfo_union, __siginfo_union_data, si_code_val, sigaction,
@@ -28,7 +28,7 @@ impl Syscall {
     ///
     /// - `fd`: 用于返回文件描述符的数组
     pub fn pipe(fd: &mut [i32]) -> Result<usize, SystemError> {
-        let pipe_ptr = LockedPipeInode::new();
+        let pipe_ptr = LockedPipeInode::new(PipeFlag::NORMAL);
         let read_file = File::new(pipe_ptr.clone(), FileMode::O_RDONLY)?;
         let write_file = File::new(pipe_ptr.clone(), FileMode::O_WRONLY)?;
 
@@ -41,6 +41,28 @@ impl Syscall {
         return Ok(0);
     }
 
+    /// # 创建带参数的匿名管道
+    ///
+    /// ## 参数
+    ///
+    /// - `fd`: 用于返回文件描述符的数组
+    /// - `flags`:设置管道的参数
+    pub fn pipe2(fd: &mut [i32],flags:PipeFlag) -> Result<usize, SystemError> {
+        let pipe_ptr = LockedPipeInode::new(flags);
+        let read_file = File::new(pipe_ptr.clone(), FileMode::O_RDONLY)?;
+        let write_file = File::new(pipe_ptr.clone(), FileMode::O_WRONLY)?;
+
+        let read_fd = current_pcb().alloc_fd(read_file, None)?;
+        let write_fd = current_pcb().alloc_fd(write_file, None)?;
+        if flags.contains(PipeFlag::O_CLOEXEC){
+            Syscall::fcntl(read_fd, FcntlCommand::SetFd, FD_CLOEXEC as i32)?;
+            Syscall::fcntl(write_fd, FcntlCommand::SetFd, FD_CLOEXEC as i32)?;
+        }
+        fd[0] = read_fd;
+        fd[1] = write_fd;
+
+        return Ok(0);
+    }
     pub fn kill(pid: pid_t, sig: c_int) -> Result<usize, SystemError> {
         let sig = SignalNumber::from(sig);
         if sig == SignalNumber::INVALID {

@@ -81,3 +81,40 @@ int shell_pipe_test(int argc, char **argv)
     }
     return 0;
 }
+void test_pipe2(int flags) {
+    int pipe_fds[2];
+    int result = pipe2(pipe_fds, flags);
+    if (result == -1) {
+        printf("pipe2 failed");
+        return;
+    }
+
+    int read_fd = pipe_fds[0];
+    int write_fd = pipe_fds[1];
+
+    printf("Pipe created with read_fd=%d and write_fd=%d\n", read_fd, write_fd);
+
+    // Write data to the pipe
+    const char* message = "Hello, pipe!";
+    ssize_t bytes_written = write(write_fd, message, strlen(message));
+    if (bytes_written == -1) {
+        printf("Write failed");
+        return;
+    }
+
+    printf("Data written to the pipe: %s\n", message);
+
+    // Read data from the pipe
+    char buffer[1024];
+    ssize_t bytes_read = read(read_fd, buffer, sizeof(buffer));
+    if (bytes_read == -1) {
+        printf("Read failed");
+        return;
+    }
+
+    buffer[bytes_read] = '\0';
+    printf("Data read from the pipe: %s\n", buffer);
+
+    close(read_fd);
+    close(write_fd);
+}

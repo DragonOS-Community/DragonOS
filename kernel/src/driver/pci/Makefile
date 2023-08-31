@@ -1,9 +1,11 @@
-
-all: pci_irq.o
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
-	
-pci_irq.o: pci_irq.c
-	$(CC) $(CFLAGS) -c pci_irq.c -o pci_irq.o
+.PHONY: all
+
+all: $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 	

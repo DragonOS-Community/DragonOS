@@ -15,7 +15,7 @@ body:
 
   - type: textarea 
     id: feature-solution 
-     validations: 
+    validations: 
        required: true 
      attributes:
        label: "描述您想要的解决方案"

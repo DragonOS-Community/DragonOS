@@ -16,7 +16,7 @@ body:
     id: feature-solution 
     validations: 
        required: true 
-     attributes:
+    attributes:
        label: "描述您想要的解决方案"
        description: "清晰而简明地描述您希望发生什么。"
 

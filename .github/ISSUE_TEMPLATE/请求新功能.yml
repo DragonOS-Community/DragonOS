@@ -4,7 +4,7 @@ title: ''
 labels: enhancement
 assignees: fslongjin
 
- - type: textarea
+  - type: textarea
     id: feature-main
     validations:
       required: true

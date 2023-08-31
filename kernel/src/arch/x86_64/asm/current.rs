@@ -17,31 +17,3 @@ pub fn current_pcb() -> &'static mut process_control_block {
 
     ret.unwrap()
 }
-
-//=======以下为对C的接口========
-//C语言中还有使用current_pcb->thread->rbp
-
-#[no_mangle]
-pub extern "C" fn current_pcb_state() -> u64 {
-    return current_pcb().state;
-}
-#[no_mangle]
-pub extern "C" fn current_pcb_cpu_id() -> u32 {
-    return current_pcb().cpu_id;
-}
-#[no_mangle]
-pub extern "C" fn current_pcb_pid() -> i64 {
-    return current_pcb().pid;
-}
-#[no_mangle]
-pub extern "C" fn current_pcb_preempt_count() -> i32 {
-    return current_pcb().preempt_count;
-}
-#[no_mangle]
-pub extern "C" fn current_pcb_flags() -> u64 {
-    return current_pcb().flags;
-}
-#[no_mangle]
-pub extern "C" fn current_pcb_virtual_runtime() -> i64{
-    return current_pcb().virtual_runtime;
-}

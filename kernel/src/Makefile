@@ -44,11 +44,8 @@ all: kernel
 	
 	@dbg='debug';for x in $$dbg; do \
 		cd $$x;\
-		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)";\
+		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)"||exit 1;\
 		cd ..;\
-		if [ "$$?" != "0" ]; then\
-            exit $$?;\
-        fi;\
 	done
 	
 	

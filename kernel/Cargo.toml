@@ -26,6 +26,7 @@ num-derive = "0.3"
 # 一个no_std的hashmap、hashset
 hashbrown = "0.13.2"
 elf = { version = "0.7.2", default-features = false }
+atomic_enum = "0.2.0"
 
 # 构建时依赖项
 [build-dependencies]

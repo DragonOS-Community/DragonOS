@@ -18,7 +18,7 @@
 #include <debug/traceback/traceback.h>
 #include <driver/disk/ahci/ahci.h>
 #include <driver/video/video.h>
-#include <driver/net/e1000e.h>
+#include <driver/net/e1000e/e1000e.h>
 #include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <ktest/ktest.h>

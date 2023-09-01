@@ -40,7 +40,7 @@ install_ubuntu_debian_pkg()
     sudo "$1" install -y \
         ca-certificates \
         curl \
-		unzip \
+        unzip \
         gnupg \
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \

@@ -15,6 +15,10 @@
 #pragma GCC optimize("O0")
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
+extern uint32_t rs_current_pcb_preempt_count();
+extern uint32_t rs_current_pcb_pid();
+extern uint32_t rs_current_pcb_flags();
+
 
 static bool flag_support_apic = false;
 static bool flag_support_x2apic = false;
@@ -465,13 +469,13 @@ void do_IRQ(struct pt_regs *rsp, ul number)
 
     // kdebug("after softirq");
     // 检测当前进程是否持有自旋锁，若持有自旋锁，则不进行抢占式的进程调度
-    if (current_pcb->preempt_count > 0)
+    if (rs_current_pcb_preempt_count() > 0)
         return;
-    else if (current_pcb->preempt_count < 0)
-        kBUG("current_pcb->preempt_count<0! pid=%d", current_pcb->pid); // should not be here
+    else if (rs_current_pcb_preempt_count() < 0)
+        kBUG("current_pcb->preempt_count<0! pid=%d", rs_current_pcb_pid()); // should not be here
 
     // 检测当前进程是否可被调度
-    if (current_pcb->flags & PF_NEED_SCHED && number == APIC_TIMER_IRQ_NUM)
+    if (rs_current_pcb_flags() & PF_NEED_SCHED && number == APIC_TIMER_IRQ_NUM)
     {
         io_mfence();
         sched();

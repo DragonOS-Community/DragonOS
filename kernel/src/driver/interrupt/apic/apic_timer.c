@@ -4,6 +4,8 @@
 #include <process/process.h>
 #include <sched/sched.h>
 
+extern int rs_current_pcb_cpuid();
+
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
 uint64_t apic_timer_ticks_result = 0;
@@ -108,12 +110,12 @@ void apic_timer_init()
             hlt();
     }
     spin_lock(&apic_timer_init_lock);
-    kinfo("Initializing apic timer for cpu %d", proc_current_cpu_id);
+    kinfo("Initializing apic timer for cpu %d", rs_current_pcb_cpuid());
     io_mfence();
     irq_register(APIC_TIMER_IRQ_NUM, &apic_timer_ticks_result, &apic_timer_handler, 0, &apic_timer_intr_controller,
                  "apic timer");
     io_mfence();
-    if (proc_current_cpu_id == 0)
+    if (rs_current_pcb_cpuid() == 0)
     {
         bsp_initialized = true;
     }

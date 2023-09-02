@@ -23,7 +23,7 @@ static struct multiboot_tag_framebuffer_info_t __fb_info;
 static struct scm_buffer_info_t *video_refresh_target = NULL;
 static struct process_control_block *video_daemon_pcb = NULL;
 static spinlock_t daemon_refresh_lock;
-
+static void* video_daemon_pcb=NULL;
 #define REFRESH_INTERVAL 15UL // 启动刷新帧缓冲区任务的时间间隔
 
 /**

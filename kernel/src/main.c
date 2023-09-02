@@ -38,6 +38,8 @@
 extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
+extern void rs_current_pcb_set_cpuid(unsigned int oncpu);
+extern void rs_current_pcb_set_preempt_count(unsigned int num);
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -126,8 +128,8 @@ void system_initialize()
     // softirq_init();
     rs_softirq_init();
 
-    current_pcb->cpu_id = 0;
-    current_pcb->preempt_count = 0;
+    rs_current_pcb_set_cpuid(0);
+    rs_current_pcb_set_preempt_count(0);
 
     syscall_init();
     io_mfence();

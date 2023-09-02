@@ -28,6 +28,7 @@ extern uint64_t Cpu_tsc_freq; // 导出自cpu.c
 
 extern struct rtc_time_t rtc_now; // 导出全局墙上时钟
 
+extern uint32_t rs_current_pcb_pid();
 enum
 {
     GCAP_ID = 0x00,

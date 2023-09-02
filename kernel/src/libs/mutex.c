@@ -1,7 +1,12 @@
 #include <common/mutex.h>
 #include <mm/slab.h>
 #include <sched/sched.h>
+#include <common/current_pcb_compat.h>>
 
+extern void rs_current_pcb_set_state(uint32_t state);
+extern uint32_t rs_current_pcb_flags();
+extern rs_current_pcb_set_flags(uint32_t new_flags);
+extern void* rs_get_current_pcb();
 /**
  * @brief 初始化互斥量
  *
@@ -16,8 +21,9 @@ void mutex_init(mutex_t *lock)
 
 static void __mutex_sleep()
 {
-    current_pcb->state = PROC_UNINTERRUPTIBLE;
-    current_pcb->flags |= PF_NEED_SCHED;
+    rs_current_pcb_set_state(PROC_UNINTERRUPTIBLE);
+    uint32_t flags = rs_current_pcb_flags();
+    rs_current_pcb_set_flags(flags|= PF_NEED_SCHED);
     sched();
 }
 
@@ -46,7 +52,7 @@ void mutex_lock(mutex_t *lock)
                 return;
             }
             // memset(waiter, 0, sizeof(struct mutex_waiter_t));
-            waiter->pcb = current_pcb;
+            waiter->pcb = rs_get_current_pcb();
             list_init(&waiter->list);
             list_append(&lock->wait_list, &waiter->list);
 

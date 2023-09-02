@@ -48,6 +48,7 @@ impl Syscall {
         options: c_int,
         rusage: *mut c_void,
     ) -> Result<usize, SystemError> {
+        // TODO 将c_sys_wait4使用rust实现
         let ret = unsafe { c_sys_wait4(pid, wstatus, options, rusage) };
         if (ret as isize) < 0 {
             return Err(

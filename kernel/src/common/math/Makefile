@@ -1,14 +1,10 @@
-
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
-all: fabs.o round.o pow.o
+.PHONY: all
 
-fabs.o: fabs.c
-	$(CC) $(CFLAGS) -c fabs.c -o fabs.o
+all: $(OBJ)
 
-round.o: round.c
-	$(CC) $(CFLAGS) -c round.c -o round.o
-
-pow.o: pow.c
-	$(CC) $(CFLAGS) -c pow.c -o pow.o
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@

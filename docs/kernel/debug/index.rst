@@ -8,3 +8,4 @@
    :caption: 目录
 
    traceback
+   debug-kernel-with-gdb

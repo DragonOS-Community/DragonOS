@@ -8,12 +8,12 @@ use core::{
 use alloc::{
     boxed::Box,
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{cpu, process::ArchPCBInfo},
+    arch::{asm::current::current_pcb, cpu, process::ArchPCBInfo},
     filesystem::vfs::{file::FileDescriptorVec, FileType},
     include::bindings::bindings::CLONE_SIGNAL,
     kdebug,
@@ -223,6 +223,55 @@ impl ProcessManager {
 
         ProcessManager::current_pcb().preempt_enable();
     }
+
+    /// 创建进程时,将进程加入到其父进程的子进程链表中
+    ///
+    /// ## 参数
+    ///
+    /// - `pcb` : 当前进程
+    pub fn add_child(pcb: &Arc<ProcessControlBlock>) {
+        let childen = &pcb.parent_pcb.read().upgrade().clone().unwrap().children;
+        childen.write().insert(pcb.basic().pid(), pcb.clone());
+    }
+
+    /// 子进程退出时,将子进程从父进程的子进程链表中移除
+    ///
+    /// ## 参数
+    ///
+    /// -‵pcb‵ : 要被移除的子进程
+    pub fn rm_from_parent(pcb: &Arc<ProcessControlBlock>) {
+        let childen = &pcb.parent_pcb.read().upgrade().clone().unwrap().children;
+        childen.write().remove(&pcb.basic().pid());
+    }
+
+    /// 退出进程时,让初始进程收养所有子进程
+    ///
+    /// ## 参数
+    ///
+    /// -`pcb` : 要退出的进程
+    pub fn adopte_childen(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let childen = &pcb.parent_pcb.read().upgrade().clone().unwrap().children;
+        match ProcessManager::find(Pid(1)) {
+            Some(init_pcb) => {
+                let mut init_childen = init_pcb.children.write();
+                for child in childen.read().iter() {
+                    // 子进程的父进程改为1号进程
+                    child
+                        .1
+                        .parent_pcb
+                        .write()
+                        .upgrade()
+                        .replace(init_pcb.clone());
+                    // 1号进程收养子进程
+                    init_childen.insert(*child.0, child.1.clone());
+                }
+                childen.write().clear();
+                Ok(())
+            }
+            // FIXME 没有找到1号进程返回什么错误码
+            _ => Err(SystemError::ECHILD),
+        }
+    }
 }
 
 /// 上下文切换完成后的钩子函数
@@ -296,6 +345,12 @@ pub struct ProcessControlBlock {
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
+
+    /// 父进程指针
+    parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+
+    /// 子进程链表
+    children: RwLock<HashMap<Pid, Arc<ProcessControlBlock>>>,
 }
 
 impl ProcessControlBlock {
@@ -327,14 +382,16 @@ impl ProcessControlBlock {
         } else {
             Self::generate_pid()
         };
-
-        let basic_info = ProcessBasicInfo::new(pid, Pid(0), Pid(0), name, "/".to_string(), None);
+        let ppid = current_pcb().pid;
+        let basic_info =
+            ProcessBasicInfo::new(pid, Pid(0), Pid(ppid as usize), name, "/".to_string(), None);
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
 
         let sched_info = ProcessSchedulerInfo::new(None);
         let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
 
+        let ppcb = ProcessManager::find(Pid(ppid as usize)).unwrap();
         let pcb = Self {
             basic: basic_info,
             preempt_count,
@@ -343,6 +400,8 @@ impl ProcessControlBlock {
             worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
+            parent_pcb: RwLock::new(Arc::downgrade(&ppcb)),
+            children: RwLock::new(HashMap::new()),
         };
 
         let pcb = Arc::new(pcb);

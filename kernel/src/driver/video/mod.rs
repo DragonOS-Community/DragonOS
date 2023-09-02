@@ -174,7 +174,7 @@ impl VideoRefreshManager{
      *
      * @return int
      */
-    pub unsafe extern "C" fn video_init(&mut self) -> ::core::ffi::c_int {
+    pub unsafe fn video_init(&mut self) -> ::core::ffi::c_int {
         let mut _reserved: u32 = 0;
         //从multiboot2中读取帧缓冲区信息至fb_info
         multiboot2_iter(

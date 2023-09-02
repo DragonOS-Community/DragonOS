@@ -6,7 +6,7 @@ use super::{Pid, ProcessManager};
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::MAX_PATHLEN,
-    include::bindings::bindings::{pid_t, process_do_exit},
+    include::bindings::bindings::pid_t,
     syscall::{
         user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
         Syscall, SystemError,
@@ -64,8 +64,7 @@ impl Syscall {
     ///
     /// - status: 退出状态
     pub fn exit(status: usize) -> ! {
-        unsafe { process_do_exit(status as u64) };
-        loop {}
+        ProcessManager::exit(status);
     }
 
     /// @brief 获取当前进程的pid

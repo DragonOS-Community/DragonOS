@@ -34,7 +34,8 @@ impl ProcessManager {
 
         for i in 0..PerCpu::MAX_CPU_NUM {
             let kstack = if unlikely(i == 0) {
-                let stack_ptr = VirtAddr::new(Self::stack_ptr().data() & (!KernelStack::ALIGN - 1));
+                let stack_ptr =
+                    VirtAddr::new(Self::stack_ptr().data() & (!(KernelStack::ALIGN - 1)));
                 // 初始化bsp的idle进程
                 unsafe { KernelStack::from_existed(stack_ptr) }
                     .expect("Failed to create kernel stack struct for BSP.")

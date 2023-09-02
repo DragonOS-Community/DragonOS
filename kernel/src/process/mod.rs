@@ -13,9 +13,12 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{asm::current::current_pcb, cpu, process::ArchPCBInfo},
-    filesystem::vfs::{file::FileDescriptorVec, FileType},
-    include::bindings::bindings::CLONE_SIGNAL,
+    arch::{asm::current::current_pcb, process::ArchPCBInfo, sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
+    filesystem::{
+        procfs::procfs_unregister_pid,
+        vfs::{file::FileDescriptorVec, FileType},
+    },
     kdebug,
     libs::{
         align::AlignedBox,
@@ -23,10 +26,7 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{
-        percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr,
-        INITIAL_PROCESS_ADDRESS_SPACE,
-    },
+    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     process::{
         fork::CloneFlags,
@@ -76,7 +76,6 @@ impl SwitchResult {
 
 #[derive(Debug)]
 pub struct ProcessManager;
-
 impl ProcessManager {
     fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
@@ -155,31 +154,73 @@ impl ProcessManager {
 
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        if pcb.sched_info().state() != ProcessState::Runnable {
+        let state = pcb.sched_info().state();
+        if state.is_blocked() {
             let mut writer = pcb.sched_info_mut();
-            if writer.state() != ProcessState::Runnable {
+            let state = writer.state();
+            if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
                 sched_enqueue(pcb.clone(), true);
                 return Ok(());
+            } else if state.is_exited() {
+                return Err(SystemError::EINVAL);
+            } else {
+                return Ok(());
             }
+        } else if state.is_exited() {
+            return Err(SystemError::EINVAL);
+        } else {
+            return Ok(());
         }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
     /// 标志当前进程永久睡眠，移出调度队列
     pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
-        todo!()
+        let pcb = ProcessManager::current_pcb();
+        let mut writer = pcb.sched_info_mut();
+        if writer.state() != ProcessState::Exited(0) {
+            writer.set_state(ProcessState::Blocked(interruptable));
+            sched();
+            return Ok(());
+        }
+        return Err(SystemError::EINTR);
     }
 
+    /// 当子进程退出后向父进程发送通知
+    fn exit_notify() {
+        todo!("exit_notify");
+    }
     /// 退出进程，回收资源
     ///
     /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246
     pub fn exit(exit_code: usize) -> ! {
-        todo!()
+        // 关中断
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let pcb = ProcessManager::current_pcb();
+        pcb.sched_info
+            .write()
+            .set_state(ProcessState::Exited(exit_code));
+        drop(pcb);
+        drop(irq_guard);
+        ProcessManager::exit_notify();
+        sched();
+        loop {}
     }
 
     pub unsafe fn release(pid: Pid) {
-        ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
+        let pcb = ProcessManager::find(pid);
+        if !pcb.is_none() {
+            let pcb = pcb.unwrap();
+            // 判断该pcb是否在全局没有任何引用
+            let weak_ref = Arc::downgrade(&pcb);
+            if weak_ref.strong_count() <= 1 {
+                drop(pcb);
+                ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
+            } else {
+                // 如果不为1就panic
+                panic!("pcb is still referenced");
+            }
+        }
     }
 
     /// 上下文切换完成后的钩子函数
@@ -306,6 +347,23 @@ pub enum ProcessState {
     // Stopped(SignalNumber),
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
+}
+
+impl ProcessState {
+    #[inline(always)]
+    pub fn is_runnable(&self) -> bool {
+        return matches!(self, ProcessState::Runnable);
+    }
+
+    #[inline(always)]
+    pub fn is_blocked(&self) -> bool {
+        return matches!(self, ProcessState::Blocked(_));
+    }
+
+    #[inline(always)]
+    pub fn is_exited(&self) -> bool {
+        return matches!(self, ProcessState::Exited(_));
+    }
 }
 
 bitflags! {
@@ -508,6 +566,14 @@ impl ProcessControlBlock {
     }
 }
 
+impl Drop for ProcessControlBlock {
+    fn drop(&mut self) {
+        // 在ProcFS中,解除进程的注册
+        procfs_unregister_pid(self.basic().pid())
+            .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
+        // 释放资源
+    }
+}
 /// 进程的基本信息
 ///
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
@@ -791,10 +857,12 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let pcb_ptr: Arc<ProcessControlBlock> = unsafe {
-            Arc::from_raw(self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock)
-        };
-        drop(pcb_ptr);
+        if !self.stack.is_none() {
+            let pcb_ptr: Arc<ProcessControlBlock> = unsafe {
+                Arc::from_raw(self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock)
+            };
+            drop(pcb_ptr);
+        }
         // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
         if !self.can_be_freed {
             let bx = self.stack.take();
@@ -805,4 +873,8 @@ impl Drop for KernelStack {
 
 pub fn process_init() {
     ProcessManager::init();
+}
+#[no_mangle]
+pub extern "C" fn process_do_exit(exit_code: usize) -> usize {
+    ProcessManager::exit(exit_code);
 }

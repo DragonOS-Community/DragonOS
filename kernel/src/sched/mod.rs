@@ -1,4 +1,5 @@
 pub mod cfs;
+pub mod completion;
 pub mod core;
 pub mod rt;
 pub mod syscall;

@@ -10,6 +10,7 @@ use crate::{
 
 use super::uart::uart::{c_uart_send_str,UartPort::COM1};
 
+///管理显示刷新变量的结构体
 struct VideoRefreshManager{
     frame_buffer_info: scm_buffer_info_t,
     fb_info: multiboot_tag_framebuffer_info_t,
@@ -18,6 +19,7 @@ struct VideoRefreshManager{
     refresh_lock: SpinLock<bool>,
 }
 
+//显示刷新的全局管理者
 static mut MANAGER: VideoRefreshManager = VideoRefreshManager{
     frame_buffer_info: scm_buffer_info_t{
         width : 0,

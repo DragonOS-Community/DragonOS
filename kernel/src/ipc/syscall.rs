@@ -5,7 +5,7 @@ use core::{
 
 use crate::{
     arch::asm::current::current_pcb,
-    filesystem::vfs::{file::{File, FileMode}, fcntl::{self, FcntlCommand, FD_CLOEXEC}},
+    filesystem::vfs::{file::{File, FileMode}, fcntl::{FcntlCommand, FD_CLOEXEC}},
     include::bindings::bindings::{pid_t, verify_area, NULL},
     kwarn,
     syscall::{Syscall, SystemError},

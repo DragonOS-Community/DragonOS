@@ -79,7 +79,7 @@ int pipe(int fd[2])
  *
  * @return int 如果失败返回负数
  */
-int pipe2(int fd[2],int flags)
+int pipe2(int fd[2], int flags)
 {
     return (int)syscall_invoke(SYS_PIPE, fd, flags, 0, 0, 0, 0, 0, 0);
 }

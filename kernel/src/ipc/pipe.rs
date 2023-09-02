@@ -13,11 +13,12 @@ use crate::{
 
 use alloc::sync::{Arc, Weak};
 bitflags! {
-  pub struct PipeFlag:u8 {
+  pub struct PipeFlag:u32 {
     // 管道标志位
     const NORMAL=0;//  0：默认行为，创建一个阻塞管道。与使用 pipe 函数创建的管道行为一致。
-    const  O_NONBLOCK = 1 << 0; // 创建一个非阻塞管道
-    const O_CLOEXEC = 1 << 1; // 在执行 exec 调用时关闭管道文件描述符。
+    // 设为fcntl里面的定义的数，方便C里面调用
+    const  O_NONBLOCK = 2048; // 创建一个非阻塞管道
+    const O_CLOEXEC = 524288; // 在执行 exec 调用时关闭管道文件描述符。
    }
 }
 /// 我们设定pipe_buff的总大小为1024字节

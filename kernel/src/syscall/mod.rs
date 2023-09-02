@@ -15,6 +15,7 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
+    ipc::pipe::PipeFlag,
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
@@ -22,7 +23,7 @@ use crate::{
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
-    }, ipc::pipe::PipeFlag, 
+    },
 };
 
 use self::user_access::UserBufferWriter;
@@ -653,29 +654,36 @@ impl Syscall {
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
                 let pipefd = args[0] as *mut c_int;
-                let flags=args[1];
-                if flags==0 {
-                    match UserBufferWriter::new(pipefd, core::mem::size_of::<[c_int; 2]>(), from_user) {
+                let flags = args[1];
+                if flags == 0 {
+                    match UserBufferWriter::new(
+                        pipefd,
+                        core::mem::size_of::<[c_int; 2]>(),
+                        from_user,
+                    ) {
                         Err(e) => Err(e),
                         Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
                             Err(e) => Err(e),
                             Ok(pipefd) => Self::pipe(pipefd),
                         },
                     }
-                }else{
-                    let flags=PipeFlag::from_bits_truncate(flags as u8); 
-                    if flags.contains(PipeFlag::O_NONBLOCK)||flags.contains(PipeFlag::O_CLOEXEC) {
-                        match UserBufferWriter::new(pipefd, core::mem::size_of::<[c_int; 2]>(), from_user) {
+                } else {
+                    let flags = PipeFlag::from_bits_truncate(flags as u32);
+                    if flags.contains(PipeFlag::O_NONBLOCK) || flags.contains(PipeFlag::O_CLOEXEC) {
+                        match UserBufferWriter::new(
+                            pipefd,
+                            core::mem::size_of::<[c_int; 2]>(),
+                            from_user,
+                        ) {
                             Err(e) => Err(e),
                             Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
                                 Err(e) => Err(e),
-                                Ok(pipefd) => Self::pipe2(pipefd,flags),
-                            }
+                                Ok(pipefd) => Self::pipe2(pipefd, flags),
+                            },
                         }
-                    }else{
+                    } else {
                         Err(SystemError::EINVAL)
                     }
-
                 }
             }
 

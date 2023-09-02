@@ -104,7 +104,7 @@ impl VideoRefreshManager{
      * @brief VBE帧缓存区的地址重新映射
      * 将帧缓存区映射到地址SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE处
      */
-    pub fn init_frame_buffer(&mut self) {
+    fn init_frame_buffer(&mut self) {
         kinfo!("Re-mapping VBE frame buffer...");
         unsafe { 
             self.frame_buffer_info.vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as u64 + FRAME_BUFFER_MAPPING_OFFSET as u64;
@@ -147,7 +147,7 @@ impl VideoRefreshManager{
      * true ->高级初始化：增加double buffer的支持
      * @return int
      */
-    fn video_reinitialize(&mut self,level: bool) -> i32{
+    pub fn video_reinitialize(&mut self,level: bool) -> i32{
         if !level {
             self.init_frame_buffer();
         }else {

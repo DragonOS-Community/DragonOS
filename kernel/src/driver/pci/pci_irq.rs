@@ -124,15 +124,15 @@ pub trait PciInterrupt: PciDeviceStructure {
             if let Some(cap_offset) = self.msix_capability_offset() {
                 let data =
                     PciArch::read_config(&self.common_header().bus_device_function, cap_offset);
-                let irq_max_num = ((data >> 16) & 0x07ff) as u16;
+                let irq_max_num = ((data >> 16) & 0x7ff) as u16 + 1;
                 let data =
                     PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 4);
-                let msix_table_bar = (data & 0x01) as u8;
-                let msix_table_offset = data & 0xfffe;
+                let msix_table_bar = (data & 0x07) as u8;
+                let msix_table_offset = data & (!0x07);
                 let data =
                     PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 8);
-                let pending_table_bar = (data & 0x01) as u8;
-                let pending_table_offset = data & 0xfffe;
+                let pending_table_bar = (data & 0x07) as u8;
+                let pending_table_offset = data & (!0x07);
                 *self.irq_type_mut()? = IrqType::Msix {
                     msix_table_bar,
                     msix_table_offset,
@@ -510,6 +510,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                         + msix_table_offset as usize
                         + msg.irq_common_message.irq_index as usize * size_of::<MsixEntry>();
                     let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
+                    kdebug!("msg_data: {:?}, msix_addr: {:?}", msg_data, msg_address);
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
                         volwrite!(msix_entry, msg_data, msg_data);

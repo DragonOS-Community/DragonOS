@@ -129,7 +129,7 @@ impl PciTransport {
         device.bar_ioremap().unwrap()?;
         device.enable_master();
         let standard_device = device.as_standard_device_mut().unwrap();
-        // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号，范围是0-128，150-200。不能与其他中断重复
+        // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号。不能与其他中断重复
         let irq_vector = standard_device.irq_vector_mut().unwrap();
         irq_vector.push(VIRTIO_RECV_VECTOR);
         standard_device

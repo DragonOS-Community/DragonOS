@@ -16,7 +16,7 @@ pub fn ia64_pci_get_arch_msi_message_data(
     trigger: TriggerMode,
 ) -> u32 {
     match trigger {
-        TriggerMode::EdgeTrigger => vector as u32,
+        TriggerMode::EdgeTrigger => vector as u32 ,
         TriggerMode::AssertHigh => vector as u32 | 1 << 15 | 1 << 14,
         TriggerMode::AssertLow => vector as u32 | 1 << 15,
     }

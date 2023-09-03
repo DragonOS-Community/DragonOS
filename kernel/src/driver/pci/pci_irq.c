@@ -2,6 +2,9 @@
 #include "exception/irq.h"
 #include <common/errno.h>
 #include <common/kprint.h>
+#include "common/string.h"
+#include "mm/slab.h"
+
 // 现在pci设备的中断由自己进行控制，这些不执行内容的函数是为了适配旧的中断处理机制
 void pci_irq_enable(ul irq_num)
 {
@@ -11,7 +14,7 @@ void pci_irq_disable(ul irq_num)
 {
     
 }
-void pci_irq_install(ul irq_num)
+ul pci_irq_install(ul, void*)
 {
     
 }
@@ -43,7 +46,8 @@ uint16_t c_irq_install(ul irq_num,void (*pci_irq_handler)(ul irq_num, ul paramet
         return EAGAIN;
     }
 
-    hardware_intr_controller* pci_interrupt_controller = kmalloc(sizeof(hardware_intr_controller),0);
+    hardware_intr_controller* pci_interrupt_controller =
+        (hardware_intr_controller*)kmalloc(sizeof(hardware_intr_controller), 0);
     if (pci_interrupt_controller) {
         pci_interrupt_controller->enable = pci_irq_enable;
         pci_interrupt_controller->disable = pci_irq_disable;

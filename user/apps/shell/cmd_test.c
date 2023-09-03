@@ -103,7 +103,7 @@ int shell_pipe2_test(int argc, char **argv)
     {                 // 子进程
         close(fd[1]); // 关闭管道的写端
         for (i = 0; i < 10; i++)
-        { // 循环三次
+        {
             char buf[buf_SIZE] = {0};
             n = read(fd[0], buf, buf_SIZE); // 从管道的读端读取一条消息
             if (n > 0)
@@ -133,12 +133,12 @@ int shell_pipe2_test(int argc, char **argv)
     {                 // 父进程
         close(fd[0]); // 关闭管道的读端
         for (i = 0; i < 100; i++)
-        { // 循环三次
+        {
             char *msg = "hello world";
             if (i < 99 & i > 0)
             {
                 msg = "how are you";
-                usleep(1000);
+                // usleep(1000);
             }
             if (i == 99)
             {

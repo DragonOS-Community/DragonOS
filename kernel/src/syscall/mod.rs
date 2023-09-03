@@ -15,7 +15,6 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
-    ipc::pipe::PipeFlag,
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
@@ -653,34 +652,17 @@ impl Syscall {
 
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
-                let pipefd = args[0] as *mut c_int;
-                let flags = args[1];
-                if flags == 0 {
-                    match UserBufferWriter::new(
-                        pipefd,
-                        core::mem::size_of::<[c_int; 2]>(),
-                        from_user,
-                    ) {
-                        Err(e) => Err(e),
-                        Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
-                            Err(e) => Err(e),
-                            Ok(pipefd) => Self::pipe(pipefd),
-                        },
-                    }
+                let pipefd: *mut i32 = args[0] as *mut c_int;
+                let arg1 = args[1];
+                if pipefd.is_null() {
+                    Err(SystemError::EFAULT)
                 } else {
-                    let flags = PipeFlag::from_bits_truncate(flags as u32);
-                    if flags.contains(PipeFlag::O_NONBLOCK) || flags.contains(PipeFlag::O_CLOEXEC) {
-                        match UserBufferWriter::new(
-                            pipefd,
-                            core::mem::size_of::<[c_int; 2]>(),
-                            from_user,
-                        ) {
-                            Err(e) => Err(e),
-                            Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
-                                Err(e) => Err(e),
-                                Ok(pipefd) => Self::pipe2(pipefd, flags),
-                            },
-                        }
+                    let flags = FileMode::from_bits_truncate(arg1 as u32);
+                    if flags.contains(FileMode::O_NONBLOCK)
+                        || flags.contains(FileMode::O_CLOEXEC)
+                        || flags.contains(FileMode::O_RDONLY)
+                    {
+                        Self::pipe2(pipefd, flags)
                     } else {
                         Err(SystemError::EINVAL)
                     }

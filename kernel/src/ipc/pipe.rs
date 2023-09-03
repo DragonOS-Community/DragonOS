@@ -2,8 +2,8 @@ use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     filesystem::vfs::{
-        core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
-        PollStatus,
+        core::generate_inode_id, file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode,
+        Metadata, PollStatus,
     },
     include::bindings::bindings::PROC_INTERRUPTIBLE,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
@@ -40,11 +40,11 @@ pub struct InnerPipeInode {
     data: [u8; PIPE_BUFF_SIZE],
     /// INode 元数据
     metadata: Metadata,
-    flags: PipeFlag,
+    flags: FileMode,
 }
 
 impl LockedPipeInode {
-    pub fn new(flags: PipeFlag) -> Arc<Self> {
+    pub fn new(flags: FileMode) -> Arc<Self> {
         let inner = InnerPipeInode {
             self_ref: Weak::default(),
             valid_cnt: 0,
@@ -99,7 +99,7 @@ impl IndexNode for LockedPipeInode {
         while inode.valid_cnt == 0 {
             inode.write_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
             // 如果为非阻塞管道，直接返回错误
-            if inode.flags.contains(PipeFlag::O_NONBLOCK) {
+            if inode.flags.contains(FileMode::O_NONBLOCK) {
                 drop(inode);
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
@@ -185,7 +185,7 @@ impl IndexNode for LockedPipeInode {
             // 唤醒读端
             inode.read_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
             // 如果为非阻塞管道，直接返回错误
-            if inode.flags.contains(PipeFlag::O_NONBLOCK) {
+            if inode.flags.contains(FileMode::O_NONBLOCK) {
                 drop(inode);
                 return Err(SystemError::ENOMEM);
             }

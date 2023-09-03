@@ -4,21 +4,14 @@
 #include <mm/slab.h>
 #include <common/printk.h>
 #include <filesystem/vfs/VFS.h>
-#include <common/wait_queue.h>
 #include <common/spinlock.h>
 #include <common/kfifo.h>
-
 
 // 键盘输入缓冲区
 static struct kfifo_t kb_buf;
 
-// 缓冲区等待队列
-static void* ps2_keyboard_waitqueue;
-   
-
 extern void ps2_keyboard_register(struct vfs_file_operations_t *);
-extern void ps2_keyboard_parse_keycode(uint8_t input); 
-     
+extern void ps2_keyboard_parse_keycode(uint8_t input);
 
 // 缓冲区读写锁
 static spinlock_t ps2_kb_buf_rw_lock;
@@ -105,8 +98,8 @@ long ps2_keyboard_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *filp,
 long ps2_keyboard_read(struct vfs_file_t *filp, char *buf, int64_t count, long *position)
 {
     // 缓冲区为空则等待
-    if (kfifo_empty(&kb_buf)){
-        rs_waitqueue_sleep_on(&ps2_keyboard_waitqueue);}
+    while (kfifo_empty(&kb_buf))
+        ;
 
     count = (count > kb_buf.size) ? kb_buf.size : count;
     return kfifo_out(&kb_buf, buf, count);
@@ -149,15 +142,6 @@ void ps2_keyboard_handler(ul irq_num, ul buf_vaddr, struct pt_regs *regs)
 {
     unsigned char x = io_in8(PORT_PS2_KEYBOARD_DATA);
     ps2_keyboard_parse_keycode((uint8_t)x);
-    uint8_t count = kfifo_in((struct kfifo_t *)buf_vaddr, &x, sizeof(unsigned char));
-    // if (count == 0)
-    // {
-    //     kwarn("ps2 keyboard buffer full.");
-    //     return;
-    // }
-
-    rs_waitqueue_wakeup(&ps2_keyboard_waitqueue, PROC_UNINTERRUPTIBLE);
-    
 }
 /**
  * @brief 初始化键盘驱动程序的函数
@@ -199,7 +183,7 @@ void ps2_keyboard_init()
         for (int j = 0; j < 1000; ++j)
             nop();
 
-    void* ps2_keyboard_waitqueue = rs_waitqueue_init();
+    void *ps2_keyboard_waitqueue = rs_waitqueue_init();
 
     // 初始化键盘缓冲区的读写锁
     spin_init(&ps2_kb_buf_rw_lock);
@@ -223,5 +207,4 @@ void ps2_keyboard_exit()
 {
     irq_unregister(PS2_KEYBOARD_INTR_VECTOR);
     kfifo_free_alloc(&kb_buf);
-
 }

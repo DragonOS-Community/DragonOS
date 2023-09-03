@@ -2,7 +2,6 @@
 
 #include <DragonOS/signal.h>
 #include <common/compiler.h>
-#include <common/completion.h>
 #include <common/elf.h>
 #include <common/kprint.h>
 #include <common/kthread.h>
@@ -17,7 +16,6 @@
 #include <debug/bug.h>
 #include <debug/traceback/traceback.h>
 #include <driver/disk/ahci/ahci.h>
-#include <driver/video/video.h>
 #include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <ktest/ktest.h>

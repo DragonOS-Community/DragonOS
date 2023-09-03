@@ -293,17 +293,22 @@ impl TimerFunction for VideoRefreshExecutor {
  * true ->高级初始化：增加double buffer的支持
  * @return int
  */
+#[no_mangle]
 pub unsafe extern "C" fn video_reinitialize(level: bool) -> i32 {
     let manager = manager();
     return manager.video_reinitialize(level);
 }
 
-/**
- * @brief 设置帧缓冲区刷新目标
- *
- * @param buf
- * @return int
- */
+/// 设置帧缓冲区刷新目标
+///
+/// ## Parameters
+///
+/// * `buf` - 刷新目标
+///
+/// ## Return
+///
+/// * `int` - 0
+#[no_mangle]
 pub unsafe extern "C" fn video_set_refresh_target(
     buf: *mut scm_buffer_info_t,
 ) -> ::core::ffi::c_int {
@@ -311,11 +316,9 @@ pub unsafe extern "C" fn video_set_refresh_target(
     return manager.video_set_refresh_target(buf);
 }
 
-/**
- * @brief 初始化显示驱动
- *
- * @return int
- */
-pub unsafe extern "C" fn video_init() -> Result<(), SystemError> {
-    return VideoRefreshManager::video_init();
+#[no_mangle]
+pub unsafe extern "C" fn rs_video_init() -> i32 {
+    return VideoRefreshManager::video_init()
+        .map(|_| 0)
+        .unwrap_or_else(|e| e.to_posix_errno());
 }

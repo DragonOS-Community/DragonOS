@@ -30,7 +30,6 @@
 #include "driver/pci/pci.h"
 #include <driver/timers/HPET/HPET.h>
 #include <driver/uart/uart.h>
-#include <driver/video/video.h>
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
@@ -38,6 +37,7 @@
 extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
+extern int rs_video_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -126,8 +126,8 @@ void system_initialize()
     // softirq_init();
     rs_softirq_init();
 
-    //set_cpuid(0);
-    //set_preempt_count(0);
+    // set_cpuid(0);
+    // set_preempt_count(0);
 
     syscall_init();
     io_mfence();

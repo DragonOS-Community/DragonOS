@@ -3,7 +3,6 @@
 #include "ptrace.h"
 #include <DragonOS/signal.h>
 #include <DragonOS/stdint.h>
-#include <common/wait_queue.h>
 
 // 进程最大可拥有的文件描述符数量
 #define PROC_MAX_FD_NUM 16
@@ -117,7 +116,6 @@ struct process_control_block
 
     int32_t exit_code;                      // 进程退出时的返回码
     uint32_t policy;                        // 进程调度策略标志位
-    wait_queue_node_t wait_child_proc_exit; // 子进程退出等待队列
 
     /* PF_kTHREAD  | PF_IO_WORKER 的进程，worker_private不为NULL*/
     void *worker_private;

@@ -538,26 +538,16 @@ impl ProcessControlBlock {
     /// ## 参数
     ///
     /// -`pcb` : 要退出的进程
-    fn adopte_childen(&self) -> Result<(), SystemError> {
+    fn adopt_childen(&self) -> Result<(), SystemError> {
         match ProcessManager::find(Pid(1)) {
             Some(init_pcb) => {
-                let childen_guard = self.children.read();
+                let mut childen_guard = self.children.write();
                 let mut init_childen_guard = init_pcb.children.write();
 
-                for child in childen_guard.iter() {
-                    // 子进程的父进程改为1号进程
-                    child
-                        .1
-                        .parent_pcb
-                        .write()
-                        .upgrade()
-                        .replace(init_pcb.clone());
-                    // 1号进程收养子进程
-                    init_childen_guard.insert(*child.0, child.1.clone());
-                }
-                drop(childen_guard);
+                childen_guard.drain().for_each(|(pid, child)| {
+                    init_childen_guard.insert(pid, child);
+                });
 
-                self.children.write().clear();
                 return Ok(());
             }
             // FIXME 没有找到1号进程返回什么错误码
@@ -573,7 +563,7 @@ impl Drop for ProcessControlBlock {
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
         // 让INIT进程收养所有子进程
         if self.basic().pid() != Pid(1) {
-            self.adopte_childen()
+            self.adopt_childen()
                 .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"));
         }
         if let Some(ppcb) = self.parent_pcb.read().upgrade() {

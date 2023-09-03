@@ -11,7 +11,6 @@
 #pragma once
 
 #include <common/blk_types.h>
-#include <common/completion.h>
 #include <common/crc16.h>
 #include <common/crc32.h>
 #include <common/crc64.h>
@@ -34,7 +33,6 @@
 #include <driver/disk/ahci/ahci_rust.h>
 #include <driver/multiboot2/multiboot2.h>
 #include <driver/pci/pci.h>
-#include <driver/video/video.h>
 #include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <include/DragonOS/refcount.h>

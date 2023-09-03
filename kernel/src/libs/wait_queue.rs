@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},

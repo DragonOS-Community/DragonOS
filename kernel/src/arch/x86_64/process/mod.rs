@@ -95,6 +95,10 @@ impl ArchPCBInfo {
         self.rbp = stack_base.data();
     }
 
+    pub fn rbp(&self) -> usize {
+        self.rbp
+    }
+
     pub unsafe fn push_to_stack(&mut self, value: usize) {
         self.rsp -= core::mem::size_of::<usize>();
         *(self.rsp as *mut usize) = value;

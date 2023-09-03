@@ -2,6 +2,8 @@
 #include <common/printk.h>
 #include <process/process.h>
 
+extern int rs_current_pcb_pid();
+extern int64_t rs_current_pcb_thread_rbp();
 static int lookup_kallsyms(uint64_t addr, int level)
 {
     const char *str = (const char *)&kallsyms_names;
@@ -36,7 +38,7 @@ void traceback(struct pt_regs *regs)
     // 先检验是否为用户态出错，若为用户态出错，则直接返回
     if (verify_area(regs->rbp, 0))
     {
-        printk_color(YELLOW, BLACK, "Kernel traceback: Fault in userland. pid=%ld, rbp=%#018lx\n", current_pcb->pid, regs->rbp);
+        printk_color(YELLOW, BLACK, "Kernel traceback: Fault in userland. pid=%ld, rbp=%#018lx\n", rs_current_pcb_pid(), regs->rbp);
         return;
     }
 
@@ -56,7 +58,7 @@ void traceback(struct pt_regs *regs)
 
         // 当前栈帧的rbp的地址大于等于内核栈的rbp的时候，表明调用栈已经到头了，追踪结束。
         // 当前rbp的地址为用户空间时，直接退出
-        if((uint64_t)(rbp) >= current_pcb->thread->rbp || ((uint64_t)rbp<regs->rsp))
+        if((uint64_t)(rbp) >= rs_current_pcb_thread_rbp() || ((uint64_t)rbp<regs->rsp))
             break;
 
         printk_color(ORANGE, BLACK, "rbp:%#018lx,*rbp:%#018lx\n", rbp, *rbp);

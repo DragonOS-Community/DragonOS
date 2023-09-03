@@ -6,9 +6,9 @@ use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::uart::uart::c_uart_send_str;
+use crate::driver::video::video_reinitialize;
 use crate::include::bindings::bindings::{
     disable_textui, enable_textui, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
-    video_reinitialize,
 };
 use crate::libs::align::page_align_up;
 use crate::libs::printk::PrintkWriter;

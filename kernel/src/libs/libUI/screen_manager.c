@@ -4,7 +4,6 @@
 #include <common/string.h>
 #include <driver/multiboot2/multiboot2.h>
 #include <driver/uart/uart.h>
-#include <driver/video/video.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
 

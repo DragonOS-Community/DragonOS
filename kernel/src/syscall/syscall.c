@@ -10,7 +10,6 @@
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
-#include<common/wait_queue.h>
 // 导出系统调用入口函数，定义在entry.S中
 extern void syscall_int(void);
 

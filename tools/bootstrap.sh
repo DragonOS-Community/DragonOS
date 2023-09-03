@@ -40,6 +40,7 @@ install_ubuntu_debian_pkg()
     sudo "$1" install -y \
         ca-certificates \
         curl \
+        unzip \
         gnupg \
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
@@ -139,9 +140,10 @@ rustInstall() {
         rustup toolchain install nightly
         rustup default nightly
         rustup component add rust-src
+		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
         rustup component add llvm-tools-preview
 		rustup target add x86_64-unknown-none
-		cargo install dadk
+		
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi
 }
@@ -204,6 +206,9 @@ else
     	printf "\e[31;1mFatal error: \e[0;31mUnsupported platform, please open an issue\[0m" || exit 1
 	fi
 fi
+
+# 安装dadk
+cargo install dadk || exit 1
 
 # 创建磁盘镜像
 bash create_hdd_image.sh

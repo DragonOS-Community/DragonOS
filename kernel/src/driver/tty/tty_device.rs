@@ -9,9 +9,11 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
     },
-    include::bindings::bindings::{textui_putchar, BLACK, WHITE},
     kerror,
-    libs::rwlock::RwLock,
+    libs::{
+        lib_ui::textui::{textui_putchar, FontColor},
+        rwlock::RwLock,
+    },
     syscall::SystemError,
 };
 
@@ -255,10 +257,9 @@ impl IndexNode for TtyDevice {
                 break;
             }
             // 输出到屏幕
-            unsafe {
-                for x in buf {
-                    textui_putchar(x as u16, WHITE, BLACK);
-                }
+
+            for x in buf {
+                textui_putchar(x as char, FontColor::WHITE, FontColor::BLACK).ok();
             }
         }
         return Ok(());

@@ -6,6 +6,7 @@
 ..  toctree::
     :maxdepth: 1
 
+    V0.1.x/V0.1.8
     V0.1.x/V0.1.7
     V0.1.x/V0.1.6
     V0.1.x/V0.1.5

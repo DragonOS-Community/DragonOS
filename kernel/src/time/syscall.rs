@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    syscall::{Syscall, SystemError},
+    syscall::{user_access::UserBufferWriter, Syscall, SystemError},
     time::{sleep::nanosleep, TimeSpec},
 };
 
@@ -14,14 +14,14 @@ pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
 
 #[repr(C)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct PosixTimeval {
     pub tv_sec: PosixTimeT,
     pub tv_usec: PosixSusecondsT,
 }
 
 #[repr(C)]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Copy, Clone)]
 /// 当前时区信息
 pub struct PosixTimeZone {
     /// 格林尼治相对于当前时区相差的分钟数
@@ -81,22 +81,30 @@ impl Syscall {
         timezone: *mut PosixTimeZone,
     ) -> Result<usize, SystemError> {
         // TODO; 处理时区信息
-        // kdebug!("enter sys_do_gettimeofday");
-        if tv == null_mut() {
+        if tv.is_null() {
             return Err(SystemError::EFAULT);
         }
+        let mut tv_buf =
+            UserBufferWriter::new::<PosixTimeval>(tv, core::mem::size_of::<PosixTimeval>(), true)?;
+
+        let tz_buf = if timezone.is_null() {
+            None
+        } else {
+            Some(UserBufferWriter::new::<PosixTimeZone>(
+                timezone,
+                core::mem::size_of::<PosixTimeZone>(),
+                true,
+            )?)
+        };
+
         let posix_time = do_gettimeofday();
-        unsafe {
-            (*tv).tv_sec = posix_time.tv_sec;
-            (*tv).tv_usec = posix_time.tv_usec;
+
+        tv_buf.copy_one_to_user(&posix_time, 0)?;
+
+        if let Some(mut tz_buf) = tz_buf {
+            tz_buf.copy_one_to_user(&SYS_TIMEZONE, 0)?;
         }
 
-        if !timezone.is_null() {
-            unsafe {
-                *timezone = SYS_TIMEZONE;
-            }
-        }
-        // kdebug!("exit sys_do_gettimeofday");
         return Ok(0);
     }
 }

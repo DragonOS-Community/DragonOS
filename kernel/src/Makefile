@@ -17,8 +17,7 @@ export ASFLAGS := --64
 LD_LIST := head.o
 
 
-kernel_subdirs := common driver process debug arch exception smp sched syscall ktest libs io time
-	
+kernel_subdirs := common driver process debug arch exception smp sched syscall ktest libs time
 
 
 head.o: head.S
@@ -44,11 +43,8 @@ all: kernel
 	
 	@dbg='debug';for x in $$dbg; do \
 		cd $$x;\
-		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)";\
+		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)"||exit 1;\
 		cd ..;\
-		if [ "$$?" != "0" ]; then\
-            exit $$?;\
-        fi;\
 	done
 	
 	

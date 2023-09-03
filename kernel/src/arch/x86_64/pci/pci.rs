@@ -7,6 +7,7 @@ use crate::driver::pci::pci::{
 use crate::include::bindings::bindings::{
     acpi_get_MCFG, acpi_iter_SDT, acpi_system_description_table_header_t, io_in32, io_out32,
 };
+use crate::mm::PhysAddr;
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -40,8 +41,8 @@ impl TraitPciArch for X86_64PciArch {
         }
     }
 
-    fn address_pci_to_physical(pci_address: PciAddr) -> usize {
-        return pci_address.data();
+    fn address_pci_to_physical(pci_address: PciAddr) -> PhysAddr {
+        return PhysAddr::new(pci_address.data());
     }
 
     fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {
@@ -61,8 +62,10 @@ impl TraitPciArch for X86_64PciArch {
         for segmentgroupconfiguration in outcome {
             if segmentgroupconfiguration.segement_group_number == segement {
                 return Ok(PciRoot {
-                    physical_address_base: segmentgroupconfiguration.base_address,
-                    mmio_base: None,
+                    physical_address_base: PhysAddr::new(
+                        segmentgroupconfiguration.base_address as usize,
+                    ),
+                    mmio_guard: None,
                     segement_group_number: segement,
                     bus_begin: segmentgroupconfiguration.bus_begin,
                     bus_end: segmentgroupconfiguration.bus_end,

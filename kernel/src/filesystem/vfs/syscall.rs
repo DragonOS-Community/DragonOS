@@ -6,8 +6,8 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::file::FileDescriptorVec,
+    filesystem::vfs::io::SeekFrom,
     include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
-    io::SeekFrom,
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,

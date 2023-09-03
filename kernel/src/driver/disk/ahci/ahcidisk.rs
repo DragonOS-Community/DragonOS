@@ -1,8 +1,8 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
 use crate::filesystem::mbr::MbrDiskPartionTable;
+use crate::filesystem::vfs::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 use crate::include::bindings::bindings::verify_area;
-use crate::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::mm::phys_2_virt;
@@ -52,8 +52,8 @@ impl Debug for AhciDisk {
 impl AhciDisk {
     fn read_at(
         &self,
-        lba_id_start: crate::io::device::BlockId, // 起始lba编号
-        count: usize,                             // 读取lba的数量
+        lba_id_start: crate::filesystem::vfs::io::device::BlockId, // 起始lba编号
+        count: usize,                                              // 读取lba的数量
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -211,7 +211,7 @@ impl AhciDisk {
 
     fn write_at(
         &self,
-        lba_id_start: crate::io::device::BlockId,
+        lba_id_start: crate::filesystem::vfs::io::device::BlockId,
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
@@ -449,7 +449,7 @@ impl BlockDevice for LockedAhciDisk {
     #[inline]
     fn read_at(
         &self,
-        lba_id_start: crate::io::device::BlockId,
+        lba_id_start: crate::filesystem::vfs::io::device::BlockId,
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
@@ -463,7 +463,7 @@ impl BlockDevice for LockedAhciDisk {
     #[inline]
     fn write_at(
         &self,
-        lba_id_start: crate::io::device::BlockId,
+        lba_id_start: crate::filesystem::vfs::io::device::BlockId,
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
@@ -475,7 +475,7 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     #[inline]
-    fn device(&self) -> Arc<dyn crate::io::device::Device> {
+    fn device(&self) -> Arc<dyn crate::filesystem::vfs::io::device::Device> {
         return self.0.lock().self_ref.upgrade().unwrap();
     }
 

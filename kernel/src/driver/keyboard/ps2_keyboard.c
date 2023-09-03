@@ -183,7 +183,6 @@ void ps2_keyboard_init()
         for (int j = 0; j < 1000; ++j)
             nop();
 
-    void *ps2_keyboard_waitqueue = rs_waitqueue_init();
 
     // 初始化键盘缓冲区的读写锁
     spin_init(&ps2_kb_buf_rw_lock);

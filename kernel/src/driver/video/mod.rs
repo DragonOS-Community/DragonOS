@@ -1,4 +1,5 @@
 use core::{
+    cell::RefCell,
     ffi::{c_uint, c_void},
     intrinsics::unlikely,
     mem::MaybeUninit,
@@ -6,17 +7,22 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
     arch::MMArch,
     include::bindings::bindings::{
         multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
-        scm_buffer_info_t, FRAME_BUFFER_MAPPING_OFFSET, SCM_BF_FB, SCM_BF_PIXEL, SCM_BF_TEXT,
+        scm_buffer_info_t, FRAME_BUFFER_MAPPING_OFFSET, SCM_BF_FB,
         SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE,
     },
     kinfo,
-    libs::{align::page_align_up, rwlock::RwLock},
+    libs::{
+        align::page_align_up,
+        lib_ui::screen_manager::{ScmBuffer, ScmBufferFlag, ScmBufferInfo},
+        rwlock::{RwLock, RwLockReadGuard},
+        spinlock::SpinLock,
+    },
     mm::{
         allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper,
         no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
@@ -29,7 +35,7 @@ use super::uart::uart::{c_uart_send_str, UartPort::COM1};
 
 static mut __MAMAGER: Option<VideoRefreshManager> = None;
 
-fn manager() -> &'static VideoRefreshManager {
+pub fn video_refresh_manager() -> &'static VideoRefreshManager {
     return unsafe {
         &__MAMAGER
             .as_ref()
@@ -38,10 +44,10 @@ fn manager() -> &'static VideoRefreshManager {
 }
 
 ///管理显示刷新变量的结构体
-struct VideoRefreshManager {
-    frame_buffer_info: RwLock<scm_buffer_info_t>,
+pub struct VideoRefreshManager {
+    device_buffer: RwLock<ScmBufferInfo>,
     fb_info: multiboot_tag_framebuffer_info_t,
-    refresh_target: RwLock<Option<*mut scm_buffer_info_t>>,
+    refresh_target: RwLock<Option<Arc<SpinLock<Box<[u32]>>>>>,
     running: AtomicBool,
 }
 
@@ -90,27 +96,27 @@ impl VideoRefreshManager {
      */
     fn init_frame_buffer(&self) {
         kinfo!("Re-mapping VBE frame buffer...");
+        let buf_vaddr = VirtAddr::new(
+            SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize + FRAME_BUFFER_MAPPING_OFFSET as usize,
+        );
+
+        let mut frame_buffer_info_graud = self.device_buffer.write();
+        if let ScmBuffer::DeviceBuffer(vaddr) = &mut (frame_buffer_info_graud).buf {
+            *vaddr = buf_vaddr;
+        }
+
+        // 地址映射
+        let mut paddr = PhysAddr::new(self.fb_info.framebuffer_addr as usize);
+        let count = PageFrameCount::new(
+            page_align_up(frame_buffer_info_graud.buf_size()) / MMArch::PAGE_SIZE,
+        );
+        let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
+
+        let mut kernel_mapper = KernelMapper::lock();
+        let mut kernel_mapper = kernel_mapper.as_mut();
+        assert!(kernel_mapper.is_some());
+        let mut vaddr = buf_vaddr;
         unsafe {
-            let mut frame_buffer_info_graud = self.frame_buffer_info.write();
-            (*frame_buffer_info_graud).vaddr =
-                SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as u64 + FRAME_BUFFER_MAPPING_OFFSET as u64;
-
-            //地址映射
-            let mut vaddr = VirtAddr::new((*frame_buffer_info_graud).vaddr as usize);
-            let mut paddr = PhysAddr::new(self.fb_info.framebuffer_addr as usize);
-            let count = PageFrameCount::new(
-                page_align_up((*frame_buffer_info_graud).size as usize) / MMArch::PAGE_SIZE,
-            );
-            let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
-
-            // 不需要这三行代码，因为不用设置 PAGE_U_S
-            // if flags & PAGE_U_S as usize != 0 {
-            //     page_flags = page_flags.set_user(true);
-            // }
-
-            let mut kernel_mapper = KernelMapper::lock();
-            let mut kernel_mapper = kernel_mapper.as_mut();
-            assert!(kernel_mapper.is_some());
             for _ in 0..count.data() {
                 let flusher = kernel_mapper
                     .as_mut()
@@ -122,7 +128,8 @@ impl VideoRefreshManager {
                 vaddr += MMArch::PAGE_SIZE;
                 paddr += MMArch::PAGE_SIZE;
             }
-        };
+        }
+
         kinfo!("VBE frame buffer successfully Re-mapped!");
     }
 
@@ -133,14 +140,14 @@ impl VideoRefreshManager {
      * true ->高级初始化：增加double buffer的支持
      * @return int
      */
-    pub fn video_reinitialize(&self, level: bool) -> i32 {
+    pub fn video_reinitialize(&self, level: bool) -> Result<(), SystemError> {
         if !level {
             self.init_frame_buffer();
         } else {
-            //开启屏幕计时刷新
+            // 开启屏幕计时刷新
             assert!(self.run_video_refresh());
         }
-        return 0;
+        return Ok(());
     }
 
     /**
@@ -149,13 +156,23 @@ impl VideoRefreshManager {
      * @param buf
      * @return int
      */
-    pub unsafe fn video_set_refresh_target(
-        &self,
-        buf: *mut scm_buffer_info_t,
-    ) -> ::core::ffi::c_int {
-        let mut refresh_target = self.refresh_target.write();
-        *refresh_target = Some(buf);
-        return 0;
+    pub fn set_refresh_target(&self, buf_info: &ScmBufferInfo) -> Result<(), SystemError> {
+        let mut refresh_target = self.refresh_target.write_irqsave();
+        if let ScmBuffer::DoubleBuffer(double_buffer) = &buf_info.buf {
+            *refresh_target = Some(double_buffer.clone());
+            return Ok(());
+        }
+        return Err(SystemError::EINVAL);
+    }
+
+    pub fn refresh_target(&self) -> RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u32]>>>>> {
+        let x = self.refresh_target.read();
+
+        return x;
+    }
+
+    pub fn device_buffer(&self) -> RwLockReadGuard<'_, ScmBufferInfo> {
+        return self.device_buffer.read();
     }
 
     /**
@@ -185,51 +202,46 @@ impl VideoRefreshManager {
         fb_info.assume_init();
         let fb_info: multiboot_tag_framebuffer_info_t = core::mem::transmute(fb_info);
 
-        let mut frame_buffer_info = scm_buffer_info_t {
-            width: 0,
-            height: 0,
-            size: 0,
-            bit_depth: 0,
-            vaddr: 0,
-            flags: 0,
-        };
+        let width = fb_info.framebuffer_width;
+        let height = fb_info.framebuffer_height;
+
         //初始化帧缓冲区信息结构体
-        if fb_info.framebuffer_type == 2 {
+        let (bit_depth, flags) = if fb_info.framebuffer_type == 2 {
             //当type=2时,width与height用字符数表示,故depth=8
-            frame_buffer_info.bit_depth = 8;
-            frame_buffer_info.flags |= SCM_BF_TEXT as u64;
+
+            (8u32, ScmBufferFlag::SCM_BF_TEXT | ScmBufferFlag::SCM_BF_FB)
         } else {
             //否则为图像模式,depth应参照帧缓冲区信息里面的每个像素的位数
-            frame_buffer_info.bit_depth = fb_info.framebuffer_bpp as u32;
-            frame_buffer_info.flags |= SCM_BF_PIXEL as u64;
-        }
+            (
+                fb_info.framebuffer_bpp as u32,
+                ScmBufferFlag::SCM_BF_PIXEL | ScmBufferFlag::SCM_BF_FB,
+            )
+        };
 
-        //初始化宽高
-        frame_buffer_info.width = fb_info.framebuffer_width;
-        frame_buffer_info.height = fb_info.framebuffer_height;
+        let buf_vaddr = VirtAddr::new(0xffff800003000000);
+        let device_buffer = ScmBufferInfo::new_device_buffer(
+            width,
+            height,
+            width * height * ((bit_depth + 7) / 8),
+            bit_depth,
+            flags,
+            buf_vaddr,
+        )
+        .unwrap();
 
-        frame_buffer_info.flags |= SCM_BF_FB as u64;
-
-        //初始化size
-        frame_buffer_info.size = frame_buffer_info.width
-            * frame_buffer_info.height
-            * ((frame_buffer_info.bit_depth + 7) / 8);
-
-        // 先临时映射到该地址，稍后再重新映射
-        frame_buffer_info.vaddr = 0xffff800003000000;
         let init_text = "Video driver to map.\n";
         c_uart_send_str(COM1 as u16, init_text.as_ptr());
 
         //地址映射
-        let vaddr = VirtAddr::new(frame_buffer_info.vaddr as usize);
         let paddr = PhysAddr::new(fb_info.framebuffer_addr as usize);
-        let count =
-            PageFrameCount::new(page_align_up(frame_buffer_info.size as usize) / MMArch::PAGE_SIZE);
-        pseudo_map_phys(vaddr, paddr, count);
+        let count = PageFrameCount::new(
+            page_align_up(device_buffer.buf_size() as usize) / MMArch::PAGE_SIZE,
+        );
+        pseudo_map_phys(buf_vaddr, paddr, count);
 
         let result = Self {
             fb_info,
-            frame_buffer_info: RwLock::new(frame_buffer_info),
+            device_buffer: RwLock::new(device_buffer),
             refresh_target: RwLock::new(None),
             running: AtomicBool::new(false),
         };
@@ -258,62 +270,47 @@ impl TimerFunction for VideoRefreshExecutor {
      * @return Ok(())
      */
     fn run(&mut self) -> Result<(), SystemError> {
-        //获得Manager
-        let manager = manager();
-        let refresh_target = manager.refresh_target.read();
-        //进行刷新
-        unsafe {
-            if unlikely(refresh_target.is_none()) {
-                //若帧缓冲区信息结构体中虚拟地址已经被初始化，则进行数据拷贝
-                if manager.frame_buffer_info.read().vaddr != 0 {
-                    //拷贝
-                    copy_nonoverlapping(
-                        manager.frame_buffer_info.read().vaddr as *const u64,
-                        (*refresh_target.clone().unwrap()).vaddr as *mut u64,
-                        (*refresh_target.clone().unwrap()).size as usize,
-                    );
-                }
-            }
+        // 获得Manager
+        let manager = video_refresh_manager();
 
+        let start_next_refresh = || {
             //判断是否还需要刷新，若需要则继续分配下一次计时任务，否则不分配
             if manager.running.load(Ordering::Acquire) {
                 let timer = Timer::new(VideoRefreshExecutor::new(), 10 * REFRESH_INTERVAL);
                 //将新一次定时任务加入队列
                 timer.activate();
             }
+        };
+
+        let mut refresh_target: Option<RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u32]>>>>>> =
+            None;
+        for i in 0..10 {
+            let g = manager.refresh_target.try_read();
+            if g.is_none() {
+                if i == 9 {
+                    start_next_refresh();
+                    return Ok(());
+                }
+                continue;
+            }
+            refresh_target = Some(g.unwrap());
+            break;
         }
+
+        let refresh_target = refresh_target.unwrap();
+
+        if let ScmBuffer::DeviceBuffer(vaddr) = manager.device_buffer().buf {
+            let p = vaddr.as_ptr() as *mut u8;
+            unsafe {
+                p.copy_from_nonoverlapping(
+                    refresh_target.as_ref().unwrap().lock_irqsave().as_mut_ptr() as *mut u8,
+                    manager.device_buffer().buf_size() as usize,
+                )
+            }
+        }
+
         return Ok(());
     }
-}
-
-/**
- * @brief 初始化显示模块，需先低级初始化才能高级初始化
- * @param level 初始化等级
- * false -> 低级初始化：不使用double buffer
- * true ->高级初始化：增加double buffer的支持
- * @return int
- */
-#[no_mangle]
-pub unsafe extern "C" fn video_reinitialize(level: bool) -> i32 {
-    let manager = manager();
-    return manager.video_reinitialize(level);
-}
-
-/// 设置帧缓冲区刷新目标
-///
-/// ## Parameters
-///
-/// * `buf` - 刷新目标
-///
-/// ## Return
-///
-/// * `int` - 0
-#[no_mangle]
-pub unsafe extern "C" fn video_set_refresh_target(
-    buf: *mut scm_buffer_info_t,
-) -> ::core::ffi::c_int {
-    let manager = manager();
-    return manager.video_set_refresh_target(buf);
 }
 
 #[no_mangle]

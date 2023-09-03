@@ -689,6 +689,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ///
     /// ## 返回值
     /// 如果取消成功，返回刷新器，否则返回None
+    #[allow(dead_code)]
     pub unsafe fn unmap(&mut self, virt: VirtAddr, unmap_parents: bool) -> Option<PageFlush<Arch>> {
         let (paddr, _, flusher) = self.unmap_phys(virt, unmap_parents)?;
         self.frame_allocator.free_one(paddr);

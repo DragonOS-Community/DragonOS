@@ -31,7 +31,6 @@ mod include;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
 mod filesystem;
-mod io;
 mod ipc;
 mod mm;
 mod net;
@@ -57,6 +56,7 @@ extern crate thingbuf;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
+use crate::libs::lib_ui::textui::FontColor;
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;
@@ -67,7 +67,7 @@ use crate::{
     net::net_core::net_init,
 };
 
-// 声明全局的slab分配器
+// 声明全局的分配器
 #[cfg_attr(not(test), global_allocator)]
 pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
@@ -108,7 +108,7 @@ pub fn panic(info: &PanicInfo) -> ! {
 /// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数
 #[no_mangle]
 pub extern "C" fn __rust_demo_func() -> i32 {
-    printk_color!(GREEN, BLACK, "__rust_demo_func()\n");
+    printk_color!(FontColor::GREEN, FontColor::BLACK, "__rust_demo_func()\n");
     let r = net_init();
     if r.is_err() {
         kwarn!("net_init() failed: {:?}", r.err().unwrap());

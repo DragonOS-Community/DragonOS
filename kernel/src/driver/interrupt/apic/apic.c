@@ -330,7 +330,7 @@ void apic_local_apic_init()
 
     // 检测是否成功启用xAPIC和x2APIC
     if ((eax & 0xc00) == 0xc00)
-        kinfo("xAPIC & x2APIC enabled!");
+        kinfo("xAPIC & x2APIC enabled!\n");
     else if ((eax & 0x800) == 0x800)
         kinfo("Only xAPIC enabled!");
     else

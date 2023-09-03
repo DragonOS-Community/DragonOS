@@ -4,10 +4,10 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb, driver::tty::TtyFilePrivateData,
-    filesystem::procfs::ProcfsFilePrivateData, io::SeekFrom, kerror, syscall::SystemError,
+    filesystem::procfs::ProcfsFilePrivateData, kerror, syscall::SystemError,
 };
 
-use super::{Dirent, FileType, IndexNode, Metadata};
+use super::{Dirent, FileType, IndexNode, Metadata, io::SeekFrom};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]

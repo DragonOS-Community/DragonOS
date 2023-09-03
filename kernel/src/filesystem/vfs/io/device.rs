@@ -1,5 +1,5 @@
 /// 引入Module
-use crate::syscall::SystemError;
+use crate::{syscall::SystemError, driver::base::device::{DeviceType, IdTable}, filesystem::vfs::IndexNode};
 use alloc::{sync::Arc, vec::Vec};
 use core::{any::Any, fmt::Debug};
 
@@ -45,6 +45,30 @@ pub trait Device: Any + Send + Sync + Debug {
     fn sync(&self) -> Result<(), SystemError>;
 
     // TODO: 待实现 open, close
+
+
+    fn as_any_ref(& self) -> & dyn core::any::Any {
+        self
+    }
+    /// @brief: 获取设备类型
+    /// @parameter: None
+    /// @return: 实现该trait的设备所属类型
+    fn dev_type(&self) -> DeviceType;
+
+    /// @brief: 获取设备标识
+    /// @parameter: None
+    /// @return: 该设备唯一标识
+    fn id_table(&self) -> IdTable;
+
+    /// @brief: 设置sysfs info
+    /// @parameter: None
+    /// @return: 该设备唯一标识
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>);
+
+    /// @brief: 获取设备的sys information
+    /// @parameter id_table: 设备标识符，用于唯一标识该设备
+    /// @return: 设备实例
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>>;
 }
 
 /// @brief 块设备应该实现的操作

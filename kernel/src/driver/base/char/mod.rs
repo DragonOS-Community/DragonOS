@@ -2,7 +2,7 @@ use super::{
     device::{mkdev, DeviceNumber, KObject},
     map::{kobj_map, kobj_unmap, LockedKObjMap},
 };
-use crate::{filesystem::vfs::IndexNode, kerror, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{filesystem::vfs::{IndexNode, io::device::Device}, kerror, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{sync::Arc, vec::Vec};
 use core::cmp::Ordering;
 
@@ -24,17 +24,7 @@ lazy_static! {
     pub static ref CDEVMAP: Arc<LockedKObjMap> = Arc::new(LockedKObjMap::default());
 }
 
-pub trait CharDevice: KObject {
-    /// @brief: 打开设备
-    /// @parameter: file: devfs inode
-    /// @return: 打开成功，返回OK(())，失败，返回错误代码
-    fn open(&self, file: Arc<dyn IndexNode>) -> Result<(), SystemError>;
-
-    /// @brief: 关闭设备
-    /// @parameter: file: devfs inode
-    /// @return: 关闭成功，返回OK(())，失败，返回错误代码
-    fn close(&self, file: Arc<dyn IndexNode>) -> Result<(), SystemError>;
-}
+pub trait CharDevice: Device {}
 
 // 管理字符设备号的map(加锁)
 pub struct LockedChrDevs(SpinLock<ChrDevs>);

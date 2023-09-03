@@ -1,9 +1,9 @@
 use super::device::{
     bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
     driver::Driver,
-    Device, DeviceError, DeviceState, DeviceType, IdTable, KObject,
+     DeviceError, DeviceState, DeviceType, IdTable, KObject,
 };
-use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{filesystem::vfs::{IndexNode, io::device::Device}, libs::spinlock::SpinLock, syscall::SystemError};
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -373,8 +373,20 @@ impl Device for LockedPlatform {
         return self.0.lock().sys_info.clone();
     }
 
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+    fn as_any_ref(& self) -> & dyn core::any::Any {
         self
+    }
+
+    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn sync(&self) -> Result<(), SystemError> {
+        todo!()
     }
 }
 

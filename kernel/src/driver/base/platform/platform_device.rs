@@ -1,5 +1,7 @@
+use crate::filesystem::vfs::io::device::Device;
+
 use super::{
-    super::device::{Device, DeviceState},
+    super::device::DeviceState,
     platform_driver::PlatformDriver,
     CompatibleTable,
 };

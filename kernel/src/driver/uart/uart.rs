@@ -1,4 +1,3 @@
-use super::super::base::device::Device;
 use crate::{
     driver::base::{
         char::CharDevice,
@@ -9,7 +8,7 @@ use crate::{
     },
     filesystem::{
         sysfs::bus::{bus_device_register, bus_driver_register},
-        vfs::IndexNode,
+        vfs::{IndexNode, io::device::Device},
     },
     include::bindings::bindings::{io_in8, io_out8},
     libs::spinlock::SpinLock,
@@ -169,6 +168,18 @@ impl Device for LockedUart {
 
     fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
         self
+    }
+
+    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn sync(&self) -> Result<(), SystemError> {
+        todo!()
     }
 }
 

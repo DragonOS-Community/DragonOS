@@ -95,7 +95,7 @@ impl ArchPCBInfo {
         self.rbp = stack_base.data();
     }
 
-    pub fn get_rbp(&self) -> usize {
+    pub fn rbp(&self) -> usize {
         self.rbp
     }
 

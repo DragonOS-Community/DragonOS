@@ -9,7 +9,7 @@ use core::{
 use alloc::{
     boxed::Box,
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use hashbrown::HashMap;
 
@@ -355,6 +355,12 @@ pub struct ProcessControlBlock {
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
+
+    /// 父进程指针
+    parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+
+    /// 子进程链表
+    children: RwLock<HashMap<Pid, Arc<ProcessControlBlock>>>,
 }
 
 impl ProcessControlBlock {
@@ -381,18 +387,26 @@ impl ProcessControlBlock {
     }
 
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let pid = if is_idle {
-            Pid(0)
+        let (pid, ppid, cwd) = if is_idle {
+            (Pid(0), Pid(0), "/".to_string())
         } else {
-            Self::generate_pid()
+            (
+                Self::generate_pid(),
+                ProcessManager::current_pcb().basic().pid(),
+                ProcessManager::current_pcb().basic().cwd(),
+            )
         };
 
-        let basic_info = ProcessBasicInfo::new(pid, Pid(0), Pid(0), name, "/".to_string(), None);
+        let basic_info = ProcessBasicInfo::new(pid, Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
 
         let sched_info = ProcessSchedulerInfo::new(None);
         let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
+
+        let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
+            .map(|p| Arc::downgrade(&p))
+            .unwrap_or_else(|| Weak::new());
 
         let pcb = Self {
             basic: basic_info,
@@ -402,11 +416,24 @@ impl ProcessControlBlock {
             worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
+            parent_pcb: RwLock::new(ppcb),
+            children: RwLock::new(HashMap::new()),
         };
 
         let pcb = Arc::new(pcb);
 
+        // 设置进程的arc指针到内核栈的最低地址处
         unsafe { pcb.kernel_stack.write().set_pcb(Arc::clone(&pcb)).unwrap() };
+
+        // 将当前pcb加入父进程的子进程哈希表中
+        if pcb.basic().pid() != Pid(0) {
+            if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
+                let mut children = ppcb_arc.children.write();
+                children.insert(pcb.basic().pid(), pcb.clone());
+            } else {
+                panic!("parent pcb is None");
+            }
+        }
 
         return pcb;
     }
@@ -509,6 +536,28 @@ impl ProcessControlBlock {
             .expect("Not a socket inode");
         return Some(socket);
     }
+
+    /// 退出进程时,让初始进程收养所有子进程
+    ///
+    /// ## 参数
+    ///
+    /// -`pcb` : 要退出的进程
+    fn adopt_childen(&self) -> Result<(), SystemError> {
+        match ProcessManager::find(Pid(1)) {
+            Some(init_pcb) => {
+                let mut childen_guard = self.children.write();
+                let mut init_childen_guard = init_pcb.children.write();
+
+                childen_guard.drain().for_each(|(pid, child)| {
+                    init_childen_guard.insert(pid, child);
+                });
+
+                return Ok(());
+            }
+            // FIXME 没有找到1号进程返回什么错误码
+            _ => Err(SystemError::ECHILD),
+        }
+    }
 }
 
 impl Drop for ProcessControlBlock {
@@ -516,7 +565,16 @@ impl Drop for ProcessControlBlock {
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.basic().pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
-        // 释放资源
+        // 让INIT进程收养所有子进程
+        if self.basic().pid() != Pid(1) {
+            self.adopt_childen()
+                .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"));
+        }
+        if let Some(ppcb) = self.parent_pcb.read().upgrade() {
+            ppcb.children.write().remove(&self.basic().pid());
+        }
+
+        unsafe { ProcessManager::release(self.basic().pid()) };
     }
 }
 
@@ -585,10 +643,10 @@ impl ProcessBasicInfo {
         self.name = name;
     }
 
-    pub fn path(&self) -> String {
+    pub fn cwd(&self) -> String {
         return self.cwd.clone();
     }
-    pub fn set_path(&mut self, path: String) {
+    pub fn set_cwd(&mut self, path: String) {
         return self.cwd = path;
     }
 

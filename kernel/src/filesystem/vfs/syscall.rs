@@ -294,7 +294,7 @@ impl Syscall {
         if path.len() > 0 {
             let cwd = match path.as_bytes()[0] {
                 b'/' => String::from("/"),
-                _ => proc.basic().path(),
+                _ => proc.basic().cwd(),
             };
             let mut cwd_vec: Vec<_> = cwd.split("/").filter(|&x| x != "").collect();
             let path_split = path.split("/").filter(|&x| x != "");
@@ -325,7 +325,7 @@ impl Syscall {
         };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
-            proc.basic_mut().set_path(String::from(new_path));
+            proc.basic_mut().set_cwd(String::from(new_path));
             return Ok(0);
         } else {
             return Err(SystemError::ENOTDIR);
@@ -341,7 +341,7 @@ impl Syscall {
     /// @return 错误，没有足够的空间
     pub fn getcwd(buf: &mut [u8]) -> Result<VirtAddr, SystemError> {
         let proc = ProcessManager::current_pcb();
-        let cwd = proc.basic().path();
+        let cwd = proc.basic().cwd();
 
         let cwd_bytes = cwd.as_bytes();
         let cwd_len = cwd_bytes.len();

@@ -31,11 +31,12 @@ impl TimerFunction for NetWorkPollFunc {
 pub fn net_init() -> Result<(), SystemError> {
     dhcp_query()?;
     // Init poll timer function
-    let next_time = next_n_ms_timer_jiffies(5);
-    let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
-    timer.activate();
+    // let next_time = next_n_ms_timer_jiffies(5);
+    // let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
+    // timer.activate();
     return Ok(());
 }
+
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DRIVERS.write();
 
@@ -160,4 +161,24 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 
     // 尝试次数用完，返回错误
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+}
+
+/// 对ifaces进行轮询。
+///
+/// @return 轮询成功，返回Ok(())
+/// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
+/// @return 没有网卡，返回SystemError::ENODEV
+pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
+        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+        if guard.len() == 0 {
+            kwarn!("poll_ifaces: No net driver found!");
+            // 没有网卡，返回错误
+            return Err(SystemError::ENODEV);
+        }
+        let mut sockets = SOCKET_SET.try_lock()?;
+        for (_, iface) in guard.iter() {
+            iface.poll(&mut sockets).ok();
+        }
+        SOCKET_WAITQUEUE.wakeup_all((-1i64) as u64);
+        return Ok(());
 }

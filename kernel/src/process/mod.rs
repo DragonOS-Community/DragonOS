@@ -13,7 +13,7 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{asm::current::current_pcb, process::ArchPCBInfo, sched::sched, CurrentIrqArch},
+    arch::{process::ArchPCBInfo, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,
@@ -264,55 +264,6 @@ impl ProcessManager {
 
         ProcessManager::current_pcb().preempt_enable();
     }
-
-    /// 创建进程时,将进程加入到其父进程的子进程链表中
-    ///
-    /// ## 参数
-    ///
-    /// - `pcb` : 当前进程
-    pub fn add_child(pcb: &Arc<ProcessControlBlock>) {
-        let childen = &pcb.parent_pcb.read().upgrade().clone().unwrap().children;
-        childen.write().insert(pcb.basic().pid(), pcb.clone());
-    }
-
-    /// 子进程退出时,将子进程从父进程的子进程链表中移除
-    ///
-    /// ## 参数
-    ///
-    /// -‵pcb‵ : 要被移除的子进程
-    pub fn rm_from_parent(pcb: &Arc<ProcessControlBlock>) {
-        let childen = &pcb.parent_pcb.read().upgrade().clone().unwrap().children;
-        childen.write().remove(&pcb.basic().pid());
-    }
-
-    /// 退出进程时,让初始进程收养所有子进程
-    ///
-    /// ## 参数
-    ///
-    /// -`pcb` : 要退出的进程
-    pub fn adopte_childen(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        let childen = &pcb.parent_pcb.read().upgrade().clone().unwrap().children;
-        match ProcessManager::find(Pid(1)) {
-            Some(init_pcb) => {
-                let mut init_childen = init_pcb.children.write();
-                for child in childen.read().iter() {
-                    // 子进程的父进程改为1号进程
-                    child
-                        .1
-                        .parent_pcb
-                        .write()
-                        .upgrade()
-                        .replace(init_pcb.clone());
-                    // 1号进程收养子进程
-                    init_childen.insert(*child.0, child.1.clone());
-                }
-                childen.write().clear();
-                Ok(())
-            }
-            // FIXME 没有找到1号进程返回什么错误码
-            _ => Err(SystemError::ECHILD),
-        }
-    }
 }
 
 /// 上下文切换完成后的钩子函数
@@ -435,21 +386,26 @@ impl ProcessControlBlock {
     }
 
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let pid = if is_idle {
-            Pid(0)
+        let (pid, ppid) = if is_idle {
+            (Pid(0), Pid(0))
         } else {
-            Self::generate_pid()
+            (
+                Self::generate_pid(),
+                ProcessManager::current_pcb().basic().pid(),
+            )
         };
-        let ppid = current_pcb().pid;
-        let basic_info =
-            ProcessBasicInfo::new(pid, Pid(0), Pid(ppid as usize), name, "/".to_string(), None);
+
+        let basic_info = ProcessBasicInfo::new(pid, Pid(0), ppid, name, "/".to_string(), None);
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
 
         let sched_info = ProcessSchedulerInfo::new(None);
         let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
 
-        let ppcb = ProcessManager::find(Pid(ppid as usize)).unwrap();
+        let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
+            .map(|p| Arc::downgrade(&p))
+            .unwrap_or_else(|| Weak::new());
+
         let pcb = Self {
             basic: basic_info,
             preempt_count,
@@ -458,13 +414,24 @@ impl ProcessControlBlock {
             worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
-            parent_pcb: RwLock::new(Arc::downgrade(&ppcb)),
+            parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(HashMap::new()),
         };
 
         let pcb = Arc::new(pcb);
 
+        // 设置进程的arc指针到内核栈的最低地址处
         unsafe { pcb.kernel_stack.write().set_pcb(Arc::clone(&pcb)).unwrap() };
+
+        // 将当前pcb加入父进程的子进程哈希表中
+        if pcb.basic().pid() != Pid(0) {
+            if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
+                let mut children = ppcb_arc.children.write();
+                children.insert(pcb.basic().pid(), pcb.clone());
+            } else {
+                panic!("parent pcb is None");
+            }
+        }
 
         return pcb;
     }
@@ -564,6 +531,38 @@ impl ProcessControlBlock {
             .expect("Not a socket inode");
         return Some(socket);
     }
+
+    /// 退出进程时,让初始进程收养所有子进程
+    ///
+    /// ## 参数
+    ///
+    /// -`pcb` : 要退出的进程
+    fn adopte_childen(&self) -> Result<(), SystemError> {
+        match ProcessManager::find(Pid(1)) {
+            Some(init_pcb) => {
+                let childen_guard = self.children.read();
+                let mut init_childen_guard = init_pcb.children.write();
+
+                for child in childen_guard.iter() {
+                    // 子进程的父进程改为1号进程
+                    child
+                        .1
+                        .parent_pcb
+                        .write()
+                        .upgrade()
+                        .replace(init_pcb.clone());
+                    // 1号进程收养子进程
+                    init_childen_guard.insert(*child.0, child.1.clone());
+                }
+                drop(childen_guard);
+
+                self.children.write().clear();
+                return Ok(());
+            }
+            // FIXME 没有找到1号进程返回什么错误码
+            _ => Err(SystemError::ECHILD),
+        }
+    }
 }
 
 impl Drop for ProcessControlBlock {
@@ -571,7 +570,16 @@ impl Drop for ProcessControlBlock {
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.basic().pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
-        // 释放资源
+        // 让INIT进程收养所有子进程
+        if self.basic().pid() != Pid(1) {
+            self.adopte_childen()
+                .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"));
+        }
+        if let Some(ppcb) = self.parent_pcb.read().upgrade() {
+            ppcb.children.write().remove(&self.basic().pid());
+        }
+
+        unsafe { ProcessManager::release(self.basic().pid()) };
     }
 }
 /// 进程的基本信息

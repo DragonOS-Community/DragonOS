@@ -64,13 +64,12 @@ $(user_sub_dirs): ECHO sys_api_lib
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
 
-app: $(user_sub_dirs)
-	$(MAKE) dadk_run 
+app: $(user_sub_dirs) dadk_run
 
-all: install_dadk app
 
-	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
-	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)
+all: make_output_dir
+
+	$(MAKE) app
 
 	@echo 用户态程序编译完成
 

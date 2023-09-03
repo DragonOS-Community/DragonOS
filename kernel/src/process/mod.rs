@@ -267,63 +267,6 @@ impl ProcessManager {
     }
 }
 
-//=======以下为对C的接口========
-//C语言中还有使用current_pcb->thread->rbp
-
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_state() -> u32 {
-    return ProcessManager::current_pcb().sched_info().state();
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_set_state(state: u32) {
-    return ProcessManager::current_pcb().sched_info().set_state(state);
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_set_cpuid(on_cpu: u32) {
-    ProcessManager::current_pcb()
-        .sched_info()
-        .set_on_cpu(Some(on_cpu));
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_cpuid() -> u32 {
-    return ProcessManager::current_pcb().sched_info().on_cpu();
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_pid() -> i32 {
-    return ProcessManager::current_pcb().basic().pid();
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_set_preempt_count(num: u32) {
-    ProcessManager::current_pcb().set_preempt_count(num);
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_preempt_count() -> u32 {
-    return ProcessManager::current_pcb().preempt_count();
-}
-
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_flags() -> u32 {
-    return ProcessManager::current_pcb().flags();
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_set_flags(new_flags: u32) {
-    ProcessManager::current_pcb().set_flags(new_flags);
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_virtual_runtime() -> i32 {
-    return ProcessManager::current_pcb().sched_info().virtual_runtime();
-}
-#[no_mangle]
-pub extern "C" fn rs_current_pcb_thread_rbp() -> i64 {
-    return ProcessManager::current_pcb().arch_info().get_rbp();
-}
-
-#[no_mangle]
-pub extern "C" fn rs_get_current_pcb() -> *mut libc::c_void {
-    let pcb_ptr = Box::into_raw(Box::new(ProcessManager::current_pcb())) as *mut libc::c_void;
-    return pcb_ptr;
-}
-
 /// 上下文切换完成后的钩子函数
 pub unsafe extern "C" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
@@ -372,17 +315,6 @@ impl ProcessState {
     #[inline(always)]
     pub fn is_exited(&self) -> bool {
         return matches!(self, ProcessState::Exited(_));
-    }
-}
-
-impl From<u64> for ProcessState {
-    fn from(value: u64) -> Self {
-        match value {
-            0 => ProcessState::Runnable,
-            1 => ProcessState::Blocked(true),
-            2 => ProcessState::Blocked(false),
-            _ => ProcessState::Exited(value as usize),
-        }
     }
 }
 
@@ -489,10 +421,7 @@ impl ProcessControlBlock {
     pub fn preempt_count(&self) -> usize {
         return self.preempt_count.load(Ordering::SeqCst);
     }
-    /// 返回当前进程的锁持有计数
-    pub fn set_preempt_count(&self, num: u32) {
-        return self.preempt_count.store(num, Ordering::Relaxed);
-    }
+
     /// 增加当前进程的锁持有计数
     pub fn preempt_disable(&self) {
         self.preempt_count.fetch_add(1, Ordering::SeqCst);

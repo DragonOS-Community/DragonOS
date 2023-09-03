@@ -7,6 +7,7 @@ use crate::driver::pci::pci::{
 
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
 use crate::include::bindings::bindings::pt_regs;
+use crate::kdebug;
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
@@ -59,7 +60,7 @@ const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
 /// Virtio设备接收中断的设备号
-const VIRTIO_RECV_VECTOR: u16 = 100;
+const VIRTIO_RECV_VECTOR: u16 = 56;
 /// Virtio设备接收中断的设备号的表项号
 const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
 // 接收的queue
@@ -101,6 +102,7 @@ pub struct PciTransport {
 }
 
 unsafe extern "C" fn virtio_irq_hander(irq_num: u64, irq_paramer: u64, regs: *mut pt_regs) {
+    kdebug!("12345");
     poll_ifaces_try_lock_onetime();
 }
 

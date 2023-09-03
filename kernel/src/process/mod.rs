@@ -462,10 +462,7 @@ impl ProcessControlBlock {
     pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {
         return self.flags.lock();
     }
-    pub fn set_flags(&self, new_flags: ProcessFlags) {
-        let mut flags = self.flags.lock();
-        *flags = new_flags;
-    }
+
     pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
         return self.basic.read();
     }

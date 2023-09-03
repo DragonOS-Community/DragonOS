@@ -386,16 +386,17 @@ impl ProcessControlBlock {
     }
 
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let (pid, ppid) = if is_idle {
-            (Pid(0), Pid(0))
+        let (pid, ppid, cwd) = if is_idle {
+            (Pid(0), Pid(0), "/".to_string())
         } else {
             (
                 Self::generate_pid(),
                 ProcessManager::current_pcb().basic().pid(),
+                ProcessManager::current_pcb().basic().cwd(),
             )
         };
 
-        let basic_info = ProcessBasicInfo::new(pid, Pid(0), ppid, name, "/".to_string(), None);
+        let basic_info = ProcessBasicInfo::new(pid, Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
 
@@ -647,10 +648,10 @@ impl ProcessBasicInfo {
         self.name = name;
     }
 
-    pub fn path(&self) -> String {
+    pub fn cwd(&self) -> String {
         return self.cwd.clone();
     }
-    pub fn set_path(&mut self, path: String) {
+    pub fn set_cwd(&mut self, path: String) {
         return self.cwd = path;
     }
 

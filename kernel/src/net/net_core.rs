@@ -54,12 +54,12 @@ fn dhcp_query() -> Result<(), SystemError> {
     dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(10)));
 
     let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
-    let dhcp_handle = sockets.add(dhcp_socket);
+    let dhcp_handle = SOCKET_SET.lock().add(dhcp_socket);
 
     const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
         kdebug!("DHCP try round: {}", i);
-        let _flag = net_face.poll(&mut sockets);
+        let _flag = net_face.poll(&mut SOCKET_SET.lock());
         let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
         // kdebug!("event = {event:?} !!!");
 

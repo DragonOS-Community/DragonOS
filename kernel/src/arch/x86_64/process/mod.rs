@@ -182,7 +182,7 @@ impl ProcessManager {
     ///
     /// 由于这个过程与具体的架构相关，所以放在这里
     pub fn copy_thread(
-        clone_flags: &CloneFlags,
+        _clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
         current_trapframe: &TrapFrame,

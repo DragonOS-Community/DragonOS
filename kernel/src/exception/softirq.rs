@@ -10,15 +10,13 @@ use alloc::{boxed::Box, sync::Arc};
 use num_traits::FromPrimitive;
 
 use crate::{
+    arch::interrupt::{cli, sti},
     arch::CurrentIrqArch,
-    arch::{
-        asm::current::current_pcb,
-        interrupt::{cli, sti},
-    },
     exception::InterruptArch,
     include::bindings::bindings::MAX_CPU_NUM,
     kdebug, kinfo,
     libs::rwlock::RwLock,
+    process::ProcessManager,
     smp::core::smp_get_processor_id,
     syscall::SystemError,
     time::timer::clock,
@@ -193,17 +191,17 @@ impl Softirq {
                         continue;
                     }
 
-                    let prev_count = current_pcb().preempt_count;
+                    let prev_count: usize = ProcessManager::current_pcb().preempt_count();
 
                     softirq_func.as_ref().unwrap().run();
-                    if unlikely(prev_count != current_pcb().preempt_count) {
+                    if unlikely(prev_count != ProcessManager::current_pcb().preempt_count()) {
                         kdebug!(
                             "entered softirq {:?} with preempt_count {:?},exited with {:?}",
                             i,
                             prev_count,
-                            current_pcb().preempt_count
+                            ProcessManager::current_pcb().preempt_count()
                         );
-                        current_pcb().preempt_count = prev_count;
+                        unsafe { ProcessManager::current_pcb().set_preempt_count(prev_count) };
                     }
                 }
             }

@@ -53,18 +53,18 @@ impl Default for FpState {
     }
 }
 impl FpState {
-    #[allow(dead_code)]
+
     pub fn new() -> Self {
         assert!(core::mem::size_of::<Self>() == 512);
         return Self::default();
     }
-    #[allow(dead_code)]
+
     pub fn save(&mut self) {
         unsafe {
             _fxsave64(self as *mut FpState as *mut u8);
         }
     }
-    #[allow(dead_code)]
+
     pub fn restore(&self) {
         unsafe {
             _fxrstor64(self as *const FpState as *const u8);

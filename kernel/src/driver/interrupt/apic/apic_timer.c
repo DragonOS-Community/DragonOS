@@ -120,5 +120,4 @@ void apic_timer_init()
         bsp_initialized = true;
     }
     spin_unlock(&apic_timer_init_lock);
-    // kinfo("Successfully initialized apic timer for cpu %d", proc_current_cpu_id);
 }

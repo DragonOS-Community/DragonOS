@@ -37,7 +37,7 @@ impl RawSpinlock {
     ///         加锁失败->false
     pub fn try_lock(&self) -> bool {
         // 先增加自旋锁持有计数
-        ProcessManager::current_pcb().preempt_disable();
+        ProcessManager::preempt_disable();
 
         let res = self
             .0
@@ -46,7 +46,7 @@ impl RawSpinlock {
 
         // 如果加锁失败恢复自旋锁持有计数
         if res == false {
-            ProcessManager::current_pcb().preempt_enable();
+            ProcessManager::preempt_enable();
         }
         return res;
     }
@@ -54,7 +54,7 @@ impl RawSpinlock {
     /// @brief 解锁
     pub fn unlock(&self) {
         // 减少自旋锁持有计数
-        ProcessManager::current_pcb().preempt_enable();
+        ProcessManager::preempt_enable();
         self.0.store(false, Ordering::Release);
     }
 

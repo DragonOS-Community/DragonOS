@@ -218,7 +218,7 @@ impl VideoRefreshManager {
             )
         };
 
-        let buf_vaddr = VirtAddr::new(0xffff800003000000);
+        let buf_vaddr = VirtAddr::new(0xffff800003200000);
         let device_buffer = ScmBufferInfo::new_device_buffer(
             width,
             height,
@@ -229,7 +229,7 @@ impl VideoRefreshManager {
         )
         .unwrap();
 
-        let init_text = "Video driver to map.\n";
+        let init_text = "Video driver to map.\n\0";
         c_uart_send_str(COM1 as u16, init_text.as_ptr());
 
         //地址映射
@@ -248,7 +248,7 @@ impl VideoRefreshManager {
 
         __MAMAGER = Some(result);
 
-        let init_text = "Video driver initialized.\n";
+        let init_text = "Video driver initialized.\n\0";
         c_uart_send_str(COM1 as u16, init_text.as_ptr());
         return Ok(());
     }

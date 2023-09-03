@@ -3,11 +3,11 @@ use core::mem::MaybeUninit;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::current::current_pcb, driver::tty::TtyFilePrivateData,
-    filesystem::procfs::ProcfsFilePrivateData, kerror, syscall::SystemError,
+    driver::tty::TtyFilePrivateData, filesystem::procfs::ProcfsFilePrivateData, kerror,
+    syscall::SystemError, process::ProcessManager,
 };
 
-use super::{Dirent, FileType, IndexNode, Metadata, io::SeekFrom};
+use super::{io::SeekFrom, Dirent, FileType, IndexNode, Metadata};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -368,8 +368,8 @@ impl Drop for File {
         // 打印错误信息
         if r.is_err() {
             kerror!(
-                "pid: {} failed to close file: {:?}, errno={:?}",
-                current_pcb().pid,
+                "pid: {:?} failed to close file: {:?}, errno={:?}",
+                ProcessManager::current_pcb().basic().pid(),
                 self,
                 r.unwrap_err()
             );

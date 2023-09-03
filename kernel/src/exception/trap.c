@@ -15,7 +15,7 @@ void do_divide_error(struct pt_regs *regs, unsigned long error_code)
 {
     // kerror("do_divide_error(0)");
     kerror("do_divide_error(0),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\t pid=%d\n", error_code,
-           regs->rsp, regs->rip, proc_current_cpu_id,  rs_current_pcb_pid());
+           regs->rsp, regs->rip, rs_current_cpu_id(),  rs_current_pcb_pid());
     traceback(regs);
     
     process_do_exit(-1);

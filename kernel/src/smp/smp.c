@@ -95,7 +95,7 @@ void smp_init()
         // continue;
         io_mfence();
         spin_lock(&multi_core_starting_lock);
-        preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt
+        rs_preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt
                           // count
         current_starting_cpu = proc_local_apic_structs[i]->ACPI_Processor_UID;
         io_mfence();
@@ -184,7 +184,7 @@ void smp_ap_start()
 
     while (1)
     {
-        printk_color(BLACK, WHITE, "CPU:%d IDLE process.\n", proc_current_cpu_id);
+        printk_color(BLACK, WHITE, "CPU:%d IDLE process.\n", rs_current_cpu_id());
     }
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();

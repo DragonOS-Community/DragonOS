@@ -34,6 +34,7 @@ mod filesystem;
 mod ipc;
 mod mm;
 mod net;
+#[macro_use]
 mod process;
 mod sched;
 mod smp;
@@ -61,11 +62,7 @@ use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;
 // <3>
-use crate::{
-    arch::asm::current::current_pcb,
-    include::bindings::bindings::{BLACK, GREEN},
-    net::net_core::net_init,
-};
+use crate::net::net_core::net_init;
 
 // 声明全局的分配器
 #[cfg_attr(not(test), global_allocator)]

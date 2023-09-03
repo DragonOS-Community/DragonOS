@@ -11,7 +11,7 @@ use atomic_enum::atomic_enum;
 use crate::{
     libs::spinlock::SpinLock,
     process::{ProcessManager, ProcessState},
-    syscall::SystemError,
+    syscall::SystemError, arch::{CurrentIrqArch, sched::sched}, exception::InterruptArch,
 };
 
 use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
@@ -299,7 +299,11 @@ impl KernelThreadMechanism {
                 list = KTHREAD_CREATE_LIST.lock();
             }
             drop(list);
-            ProcessManager::sleep(true).ok();
+            
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            ProcessManager::mark_sleep(true).ok();
+            drop(irq_guard);
+            sched();
         }
     }
 }

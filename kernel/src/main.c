@@ -72,7 +72,6 @@ void system_initialize()
     c_uart_init(COM1, 115200);
 
     rs_video_init();
-
     scm_init();
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
@@ -103,6 +102,7 @@ void system_initialize()
     io_mfence();
     scm_reinit();
     rs_textui_init();
+    while(1);
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
     // =========== 重新设置initial_tss[0]的ist

@@ -1,7 +1,7 @@
 use core::{
     ffi::c_void,
     hash::{Hash, Hasher},
-    intrinsics::unlikely,
+    intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
     sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering},
 };
@@ -51,7 +51,6 @@ pub mod fork;
 pub mod idle;
 pub mod init;
 pub mod kthread;
-pub mod pid;
 pub mod process;
 pub mod syscall;
 
@@ -59,6 +58,9 @@ pub mod syscall;
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
 
 pub static mut SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
+
+/// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
+static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 
 #[derive(Debug)]
 pub struct SwitchResult {
@@ -116,11 +118,31 @@ impl ProcessManager {
             )
             .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
         }
+
+        unsafe {
+            __PROCESS_MANAGEMENT_INIT_DONE = true;
+        }
     }
 
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
         return ProcessControlBlock::arch_current_pcb();
+    }
+
+    /// 增加当前进程的锁持有计数
+    #[inline(always)]
+    pub fn preempt_disable() {
+        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
+            ProcessManager::current_pcb().preempt_disable();
+        }
+    }
+
+    /// 减少当前进程的锁持有计数
+    #[inline(always)]
+    pub fn preempt_enable() {
+        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
+            ProcessManager::current_pcb().preempt_enable();
+        }
     }
 
     /// 根据pid获取进程的pcb
@@ -175,13 +197,25 @@ impl ProcessManager {
         }
     }
 
-    /// 标志当前进程永久睡眠，移出调度队列
-    pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
+    /// 标志当前进程永久睡眠，但是发起调度的工作，应该由调用者完成
+    ///
+    /// ## 注意
+    ///
+    /// - 进入当前函数之前，不能持有sched_info的锁
+    /// - 进入当前函数之前，必须关闭中断
+    pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
+        assert_eq!(
+            CurrentIrqArch::is_irq_enabled(),
+            false,
+            "interrupt must be disabled before enter ProcessManager::mark_sleep()"
+        );
+
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info_mut();
+        let mut writer = pcb.sched_info_mut_irqsave();
         if writer.state() != ProcessState::Exited(0) {
             writer.set_state(ProcessState::Blocked(interruptable));
-            sched();
+            drop(writer);
+
             return Ok(());
         }
         return Err(SystemError::EINTR);
@@ -457,6 +491,10 @@ impl ProcessControlBlock {
     /// 减少当前进程的锁持有计数
     pub fn preempt_enable(&self) {
         self.preempt_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub unsafe fn set_preempt_count(&self, count: usize) {
+        self.preempt_count.store(count, Ordering::SeqCst);
     }
 
     pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {

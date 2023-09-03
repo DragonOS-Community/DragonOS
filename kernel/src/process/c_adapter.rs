@@ -52,3 +52,13 @@ pub extern "C" fn rs_current_pcb_flags() -> u32 {
 pub extern "C" fn rs_current_pcb_thread_rbp() -> u64 {
     return ProcessManager::current_pcb().arch_info().rbp() as u64;
 }
+
+#[no_mangle]
+pub extern "C" fn rs_preempt_disable() {
+    return ProcessManager::preempt_disable();
+}
+
+#[no_mangle]
+pub extern "C" fn rs_preempt_enable() {
+    return ProcessManager::preempt_enable();
+}

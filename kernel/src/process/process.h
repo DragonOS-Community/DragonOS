@@ -124,9 +124,7 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags){
     while(1);
 }
 
-
-// 获取当前cpu id
-#define proc_current_cpu_id (current_pcb->cpu_id)
+extern int rs_current_cpu_id();
 
 extern unsigned long head_stack_start; // 导出内核层栈基地址（定义在head.S）
 extern ul _stack_start;

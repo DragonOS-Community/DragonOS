@@ -78,6 +78,10 @@ pub trait Scheduler {
 }
 
 pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
+    // 当前进程持有锁，不切换，避免死锁
+    if ProcessManager::current_pcb().preempt_count() != 0 {
+        return None;
+    }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();

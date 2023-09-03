@@ -13,7 +13,7 @@ use crate::{
             kernel_thread_bootstrap_stage2, KernelThreadClosure, KernelThreadCreateInfo,
             KernelThreadMechanism,
         },
-        Pid, ProcessFlags, ProcessManager,
+        Pid, ProcessManager,
     },
     syscall::SystemError,
 };

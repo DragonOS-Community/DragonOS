@@ -5,6 +5,7 @@ use core::{
 };
 
 use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
+use virtio_drivers::device;
 
 use crate::{
     driver::{
@@ -75,14 +76,17 @@ impl ScmBufferInfo {
     /// ## 返回值
     ///
     /// - `Result<Self, SystemError>` 创建成功返回新的帧缓冲区结构体，创建失败返回错误码
-    pub fn new(buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
+    pub fn new(mut buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
         if unlikely(SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == false) {
-            panic!("double buffer is not enabled");
+            let mut device_buffer = video_refresh_manager().device_buffer().clone();
+            buf_type.remove(ScmBufferFlag::SCM_BF_DB);
+            device_buffer.flags = buf_type;
+            return Ok(device_buffer);
         } else {
             let device_buffer_guard = video_refresh_manager().device_buffer();
 
             let buf_space: Arc<SpinLock<Box<[u32]>>> = Arc::new(SpinLock::new(
-                vec![0u32; unsafe { (device_buffer_guard.size / 4) as usize }].into_boxed_slice(),
+                vec![0u32; (device_buffer_guard.size / 4) as usize].into_boxed_slice(),
             ));
 
             assert!(buf_type.contains(ScmBufferFlag::SCM_BF_DB));
@@ -432,7 +436,9 @@ pub extern "C" fn scm_reinit() -> i32 {
     return r;
 }
 fn true_scm_reinit() -> Result<i32, SystemError> {
-    video_refresh_manager().video_reinitialize(false);
+    video_refresh_manager()
+        .video_reinitialize(false)
+        .expect("video reinitialize failed");
 
     // 遍历当前所有使用帧缓冲区的框架，更新地址
     let device_buffer = video_refresh_manager().device_buffer().clone();

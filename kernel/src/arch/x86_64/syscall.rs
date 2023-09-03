@@ -35,8 +35,6 @@ pub extern "C" fn syscall_handler(frame: &mut TrapFrame) -> () {
         frame.r15 as usize,
     ];
     mfence();
-    mfence();
-    let from_user = frame.from_user();
 
     // 由于进程管理未完成重构，有些系统调用需要在这里临时处理，以后这里的特殊处理要删掉。
     match syscall_num {

@@ -3,10 +3,10 @@ use core::{arch::x86_64::_rdtsc, hint::spin_loop};
 use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
-    arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
+    arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
-    syscall::SystemError,
+    syscall::SystemError, process::ProcessManager,
 };
 
 use super::{
@@ -39,7 +39,7 @@ pub fn nanosleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
         });
     }
     // 创建定时器
-    let handler: Box<WakeUpHelper> = WakeUpHelper::new(current_pcb());
+    let handler: Box<WakeUpHelper> = WakeUpHelper::new(ProcessManager::current_pcb());
     let timer: Arc<Timer> = Timer::new(
         handler,
         next_n_us_timer_jiffies((sleep_time.tv_nsec / 1000) as u64),
@@ -47,10 +47,9 @@ pub fn nanosleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
 
     let irq_guard: crate::exception::IrqFlagsGuard =
         unsafe { CurrentIrqArch::save_and_disable_irq() };
+    ProcessManager::mark_sleep(true).ok();
     timer.activate();
-    unsafe {
-        current_pcb().mark_sleep_interruptible();
-    }
+    
     drop(irq_guard);
 
     sched();

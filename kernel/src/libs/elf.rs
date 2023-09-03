@@ -9,7 +9,6 @@ use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader};
 
 use crate::{
     arch::MMArch,
-    current_pcb,
     filesystem::vfs::io::SeekFrom,
     kerror,
     libs::align::page_align_up,
@@ -21,7 +20,7 @@ use crate::{
     },
     process::{
         abi::AtType,
-        exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
+        exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam}, ProcessManager,
     },
     syscall::{
         user_access::{clear_user, copy_to_user},
@@ -192,8 +191,8 @@ impl ElfLoader {
         let map_err_handler = |err: SystemError| {
             if err == SystemError::EEXIST {
                 kerror!(
-                    "Pid: {}, elf segment at {:p} overlaps with existing mapping",
-                    current_pcb().pid,
+                    "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
+                    ProcessManager::current_pcb().basic().pid(),
                     addr_to_map.as_ptr::<u8>()
                 );
             }

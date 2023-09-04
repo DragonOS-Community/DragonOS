@@ -109,8 +109,8 @@ impl DriverManager {
 /// @brief: 驱动注册
 /// @parameter: name: 驱动名
 /// @return: 操作成功，返回()，操作失败，返回错误码
-pub fn driver_register<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
-    DRIVER_MANAGER.add_driver(driver.id_table()?, driver);
+pub fn driver_register(driver: Arc<dyn Driver>) -> Result<(), DriverError> {
+    DRIVER_MANAGER.add_driver(driver.id_table(), driver);
     return Ok(());
 }
 
@@ -118,7 +118,7 @@ pub fn driver_register<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
 /// @parameter: name: 驱动名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 #[allow(dead_code)]
-pub fn driver_unregister<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
-    DRIVER_MANAGER.add_driver(driver.id_table()?, driver);
+pub fn driver_unregister(driver: Arc<dyn Driver>) -> Result<(), DriverError> {
+    DRIVER_MANAGER.add_driver(driver.id_table(), driver);
     return Ok(());
 }

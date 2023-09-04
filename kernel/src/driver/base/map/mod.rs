@@ -3,7 +3,7 @@ use core::cmp::Ordering;
 use super::{
     char::CharDevice,
     device::{
-        mkdev, DeviceError, DeviceNumber, IdTable, KObject, BLOCKDEVS, CHARDEVS, DEVICE_MANAGER,
+        mkdev, DeviceNumber, IdTable, KObject, BLOCKDEVS, CHARDEVS, DEVICE_MANAGER,
         DEVMAP,
     },
 };
@@ -11,7 +11,7 @@ use crate::{
     filesystem::vfs::io::device::BlockDevice, kerror, libs::spinlock::SpinLock,
     syscall::SystemError,
 };
-use alloc::{collections::BTreeMap, string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap,sync::Arc, vec::Vec};
 
 const KOBJMAP_HASH_SIZE: usize = 255;
 const DEV_MAJOR_HASH_SIZE: usize = 255;
@@ -24,9 +24,6 @@ const DEV_MAJOR_DYN_END: usize = 234;
 const DEV_MAJOR_DYN_EXT_START: usize = 511;
 const DEV_MAJOR_DYN_EXT_END: usize = 384;
 
-lazy_static! {
-    pub static ref DEV_NAME_MANAGER: DevNameAllocator = DevNameAllocator::new();
-}
 /// @brief: 字符设备与块设备管理结构体
 #[derive(Debug, Clone)]
 struct Probe(Arc<dyn KObject>);
@@ -532,8 +529,8 @@ impl CharDevOps {
         if Into::<usize>::into(id_table.device_number()) == 0 {
             kerror!("Device number can't be 0!\n");
         }
-        DEVICE_MANAGER.add_device(id_table, cdev);
-        kobj_map(DEVMAP.clone(), id_table.device_number(), range, cdev)
+        DEVICE_MANAGER.add_device(id_table.clone(), cdev.clone());
+        kobj_map(DEVMAP.clone(), id_table.device_number(), range, cdev.clone())
     }
 
     /// @brief: 字符设备注销
@@ -545,71 +542,4 @@ impl CharDevOps {
         DEVICE_MANAGER.remove_device(&id_table);
         kobj_unmap(DEVMAP.clone(), id_table.device_number(), range);
     }
-}
-
-pub struct InnerDevNameAllocator {
-    dev_name: BTreeMap<String, Vec<String>>,
-}
-
-impl InnerDevNameAllocator {
-    fn new() -> Self {
-        Self {
-            dev_name: BTreeMap::new(),
-        }
-    }
-}
-
-pub struct DevNameAllocator(SpinLock<InnerDevNameAllocator>);
-
-impl DevNameAllocator {
-    fn new() -> DevNameAllocator {
-        Self(SpinLock::new(InnerDevNameAllocator::new()))
-    }
-}
-
-impl DevNameAllocator {
-    /// 初始化一系列唯一的设备名，例如tty0-tty1..-tty63
-    ///
-    /// ## 参数
-    ///
-    /// - `name`：设备基本名，例如 tty
-    /// - `range`：可连续命名数量，例如可以从 0-63 即64个
-    ///
-    /// ## 返回值
-    ///
-    /// - 成功：Ok()
-    /// - 失败：错误码
-    pub fn initialize_device(&self, name: String, range: u32) -> Result<(), DeviceError> {
-        let mut allocator = self.0.lock();
-        if !allocator.dev_name.contains_key(&name) || range > 512 {
-            return Err(DeviceError::InitializeFailed);
-        }
-        let mut temp: Vec<String> = Vec::new();
-        for i in 0..range {
-            temp.push(name.clone().push_str(format!("{:?}",i).as_str()));
-        }
-        allocator.dev_name.insert(name, temp);
-        return Ok(());
-    }
-    /// 获取唯一的设备名，例如tty0-tty1..-tty63
-    ///
-    /// ## 参数
-    ///
-    /// - `name`：设备基本名，例如 tty
-    ///
-    /// ## 返回值
-    ///
-    /// - 成功：完整的设备名，如 tty0
-    /// - 失败：错误码
-    pub fn retrieve_name(&self, name: String) -> Result<String, DeviceError> {
-        let mut allocator = self.0.lock();
-        let mut free_vec: Option<Vec<u32>> = allocator.dev_name.get(&name);
-        if let None = free_vec {
-            return Err(DeviceError::InitializeFailed);
-        }
-        let name = name.push_str(free_vec.unwrap().pop());
-    }
-    //linux 中似乎不会回收设备名，只是在用完的时候一直加。暂时不启用
-    // pub fn restore_name(&self, name: String) -> Result<(), DeviceError> {
-    // }
 }

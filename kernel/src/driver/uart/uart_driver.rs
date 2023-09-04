@@ -15,7 +15,7 @@ use super::uart_device::LockedUart;
 
 #[derive(Debug)]
 pub struct InnerUartDriver {
-    id_table: Option<IdTable>,
+    id_table: IdTable,
 }
 
 #[derive(Debug)]
@@ -23,17 +23,19 @@ pub struct UartDriver(SpinLock<InnerUartDriver>);
 
 impl Default for UartDriver {
     fn default() -> Self {
-        Self(SpinLock::new(InnerUartDriver { id_table: None }))
+        Self(SpinLock::new(InnerUartDriver {
+            id_table: IdTable::default(),
+        }))
     }
 }
 
 impl Driver for UartDriver {
     fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
-        if let Some(compatible_table) = data.compatible_table() {
-            if compatible_table.matches(&CompatibleTable::new(vec!["uart"])) {
-                return Ok(());
-            }
+        let compatible_table = data.compatible_table();
+        if compatible_table.matches(&CompatibleTable::new(vec!["uart"])) {
+            return Ok(());
         }
+
         return Err(DriverError::ProbeError);
     }
 
@@ -42,26 +44,23 @@ impl Driver for UartDriver {
         data: DevicePrivateData,
         resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
-        if let Some(compatible_table) = data.compatible_table() {
-            if compatible_table.matches(&CompatibleTable::new(vec!["uart"])) {
-                let device = LockedUart::default();
-                DEVICE_MANAGER.add_device(data.id_table().clone(), Arc::new(device));
-                CharDevOps::cdev_add(Arc::new(device), data.id_table().clone(), 1);
-            }
+        let compatible_table = data.compatible_table();
+        if compatible_table.matches(&CompatibleTable::new(vec!["uart"])) {
+            let device = LockedUart::default();
+            let arc_device = Arc::new(device);
+            DEVICE_MANAGER.add_device(data.id_table().clone(), arc_device.clone());
+            CharDevOps::cdev_add(arc_device.clone(), data.id_table().clone(), 1);
         }
+
         return Err(DriverError::ProbeError);
     }
 
-    fn id_table(&self) -> Result<IdTable, DriverError> {
+    fn id_table(&self) -> IdTable {
         let driver = self.0.lock();
-        if self.0.lock().id_table.is_none() {
-            return Err(DriverError::UnInitialized);
-        } else {
-            return Ok(driver.id_table.unwrap().clone());
-        }
+        return driver.id_table.clone();
     }
 
-    fn as_any_ref(&self) -> &dyn core::any::Any {
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
         return self;
     }
 }

@@ -369,7 +369,7 @@ impl TypeOneFSMState {
     #[inline(always)]
     fn emit(tty: &Arc<dyn TtyDevice>, ch: u8) {
         // 发送到tty
-        tty.input(&[ch]).ok();
+        tty.write_at(0, 1, &[ch]).ok();
     }
 
     /// @brief 处理Prtsc按下事件

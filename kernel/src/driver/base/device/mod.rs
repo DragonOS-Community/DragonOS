@@ -50,7 +50,7 @@ pub trait Device: KObject {
     /// @brief: 获取设备标识
     /// @parameter: None
     /// @return: 该设备唯一标识
-    fn id_table(&self) -> Result<IdTable, DeviceError> {
+    fn id_table(&self) -> IdTable {
         unimplemented!();
     }
 
@@ -67,23 +67,51 @@ pub trait Device: KObject {
     fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         unimplemented!();
     }
+
 }
 
 // 暂定是不可修改的，在初始化的时候就要确定。以后可能会包括例如硬件中断包含的信息
 #[derive(Debug, Clone)]
 pub struct DevicePrivateData {
     id_table: IdTable,
-    resource: DeviceResource,
-    compatible_table: Option<CompatibleTable>,
+    resource: Option<DeviceResource>,
+    compatible_table: CompatibleTable,
+    state: DeviceState,
 }
 
 impl DevicePrivateData {
-    pub fn compatible_table(&self) -> &Option<CompatibleTable> {
-        return &self.compatible_table;
+    pub fn new(
+        id_table: IdTable,
+        resource: Option<DeviceResource>,
+        compatible_table: CompatibleTable,
+        state: DeviceState,
+    ) -> Self {
+        Self {
+            id_table,
+            resource,
+            compatible_table,
+            state,
+        }
     }
 
     pub fn id_table(&self) -> &IdTable {
         &self.id_table
+    }
+
+    pub fn state(&self) -> DeviceState {
+        self.state
+    }
+
+    pub fn resource(&self) -> Option<&DeviceResource> {
+        self.resource.as_ref()
+    }
+
+    pub fn compatible_table(&self) -> &CompatibleTable {
+        &self.compatible_table
+    }
+
+    pub fn set_state(&mut self, state: DeviceState) {
+        self.state = state;
     }
 }
 
@@ -193,6 +221,12 @@ impl IdTable {
 
     pub fn device_number(&self) -> DeviceNumber {
         return self.1;
+    }
+}
+
+impl Default for IdTable {
+    fn default() -> Self {
+        IdTable("unknown", DeviceNumber::new(0))
     }
 }
 
@@ -329,8 +363,8 @@ impl DeviceManager {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
-    DEVICE_MANAGER.add_device(device.id_table()?, device.clone());
-    match sys_device_register(&device.id_table()?.to_name()) {
+    DEVICE_MANAGER.add_device(device.id_table(), device.clone());
+    match sys_device_register(&device.id_table().to_name()) {
         Ok(sys_info) => {
             device.set_sys_info(Some(sys_info));
             return Ok(());
@@ -343,8 +377,8 @@ pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_unregister<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
-    DEVICE_MANAGER.add_device(device.id_table()?, device.clone());
-    match sys_device_unregister(&(device.id_table()?).to_name()) {
+    DEVICE_MANAGER.add_device(device.id_table(), device.clone());
+    match sys_device_unregister(&device.id_table().to_name()) {
         Ok(_) => {
             device.set_sys_info(None);
             return Ok(());

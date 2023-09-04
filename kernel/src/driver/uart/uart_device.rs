@@ -109,16 +109,22 @@ struct UartRegister {
 // @brief 串口设备结构体
 #[derive(Debug)]
 pub struct Uart {
-    id_table: Option<IdTable>,
-    state: DeviceState, // 设备状态
+    private_data: DevicePrivateData, // 设备状态
     sys_info: Option<Arc<dyn IndexNode>>,
 }
 
 impl Default for Uart {
     fn default() -> Self {
         Self {
-            id_table: None,
-            state: DeviceState::NotInitialized,
+            private_data: DevicePrivateData::new(
+                IdTable::new(
+                    "uart",
+                    DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
+                ),
+                None,
+                CompatibleTable::new(vec!["uart"]),
+                DeviceState::NotInitialized,
+            ),
             sys_info: None,
         }
     }
@@ -138,7 +144,7 @@ impl KObject for LockedUart {}
 
 impl PlatformDevice for LockedUart {
     fn is_initialized(&self) -> bool {
-        let state = self.0.lock().state;
+        let state = self.0.lock().private_data.state();
         match state {
             DeviceState::Initialized => true,
             _ => false,
@@ -146,20 +152,20 @@ impl PlatformDevice for LockedUart {
     }
 
     fn set_state(&self, set_state: DeviceState) {
-        let state = &mut self.0.lock().state;
-        *state = set_state;
+        self.0.lock().private_data.set_state(set_state);
+    }
+
+    fn compatible_table(&self) -> CompatibleTable {
+        return self.0.lock().private_data.compatible_table().clone();
     }
 }
 
 impl Device for LockedUart {
-    fn id_table(&self) -> Result<IdTable, DeviceError> {
-        if self.0.lock().id_table.is_some() {
-            return Ok(IdTable::new(
-                "uart",
-                DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
-            ));
-        }
-        return Err(DeviceError::InitializeFailed);
+    fn id_table(&self) -> IdTable {
+        return IdTable::new(
+            "uart",
+            DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
+        );
     }
 
     fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
@@ -244,8 +250,8 @@ impl Driver for LockedUartDriver {
         self
     }
 
-    fn id_table(&self) -> Result<IdTable, DriverError> {
-        return Ok(IdTable::new("uart_driver", DeviceNumber::new(0)));
+    fn id_table(&self) -> IdTable {
+        return IdTable::new("uart_driver", DeviceNumber::new(0));
     }
 
     fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
@@ -257,10 +263,9 @@ impl Driver for LockedUartDriver {
     }
 
     fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
-        if let Some(table) = data.compatible_table() {
-            if table.matches(&CompatibleTable::new(vec!["uart"])) {
-                return Ok(());
-            }
+        let table = data.compatible_table();
+        if table.matches(&CompatibleTable::new(vec!["uart"])) {
+            return Ok(());
         }
         return Err(DriverError::ProbeError);
     }
@@ -286,7 +291,11 @@ impl LockedUartDriver {
     }
 }
 
-impl PlatformDriver for LockedUartDriver {}
+impl PlatformDriver for LockedUartDriver {
+    fn compatible_table(&self) -> CompatibleTable {
+        return CompatibleTable::new(vec!["uart"]);
+    }
+}
 
 impl UartDriver {
     /// @brief 创建串口驱动
@@ -495,7 +504,6 @@ pub fn uart_init() -> Result<(), SystemError> {
         "platform:0",
         &UART_DEV
             .id_table()
-            .map_err(|e| SystemError::ENODEV)?
             .to_name(),
     )
     .expect("uart device register error");
@@ -504,7 +512,6 @@ pub fn uart_init() -> Result<(), SystemError> {
         "platform:0",
         &UART_DRV
             .id_table()
-            .map_err(|e| SystemError::ENODEV)?
             .to_name(),
     )
     .expect("uart driver register error");

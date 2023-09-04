@@ -21,15 +21,16 @@ use self::base::{
     platform::CompatibleTable,
 };
 pub trait Driver: Sync + Send + Debug {
-    fn as_any_ref(&self) -> &dyn core::any::Any;
+    fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
 
     //对于不需要匹配，在系统初始化的时候就生成的设备，例如 PlatformBus 就不需要匹配表
 
     /// @brief: 获取驱动匹配表
     /// @parameter: None
     /// @return: 驱动匹配表
-    fn compatible_table(&self) -> Result<CompatibleTable, DriverError> {
-        Err(DriverError::UnsupportedOperation)
+    fn compatible_table(&self) -> CompatibleTable{
+        //TODO 要完善每个 CompatibleTable ，将来要把这个默认实现删除
+        return CompatibleTable::new(vec!["unknown"]);
     }
 
     /// @brief 添加可支持的设备
@@ -54,7 +55,7 @@ pub trait Driver: Sync + Send + Debug {
     /// @brief: 获取驱动标识符
     /// @parameter: None
     /// @return: 该驱动驱动唯一标识符
-    fn id_table(&self) -> Result<IdTable, DriverError>;
+    fn id_table(&self) -> IdTable;
 
     // 考虑到很多驱动并不需要存储在系统中，只需要当工具人就可以了，因此 SysINode 是可选的
     /// @brief: 设置驱动的sys information

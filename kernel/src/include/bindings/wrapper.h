@@ -19,7 +19,6 @@
 #include <common/glib.h>
 #include <common/idr.h>
 #include <common/kfifo.h>
-#include <common/kthread.h>
 #include <common/list.h>
 #include <common/lz4.h>
 #include <common/printk.h>

@@ -4,8 +4,6 @@
 #include <process/process.h>
 #include <sched/sched.h>
 
-extern int rs_current_pcb_cpuid();
-
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
 uint64_t apic_timer_ticks_result = 0;

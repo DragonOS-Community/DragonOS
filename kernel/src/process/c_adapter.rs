@@ -19,8 +19,6 @@ pub extern "C" fn rs_get_idle_stack_top(cpu_id: u32) -> usize {
         .data();
 }
 
-//=======以下为对C的接口========
-
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_cpuid() -> u32 {
     return ProcessManager::current_pcb()
@@ -56,4 +54,9 @@ pub extern "C" fn rs_preempt_disable() {
 #[no_mangle]
 pub extern "C" fn rs_preempt_enable() {
     return ProcessManager::preempt_enable();
+}
+
+#[no_mangle]
+pub extern "C" fn rs_process_do_exit(exit_code: usize) -> usize {
+    ProcessManager::exit(exit_code);
 }

@@ -933,8 +933,3 @@ impl Drop for KernelStack {
 pub fn process_init() {
     ProcessManager::init();
 }
-
-#[no_mangle]
-pub extern "C" fn process_do_exit(exit_code: usize) -> usize {
-    ProcessManager::exit(exit_code);
-}

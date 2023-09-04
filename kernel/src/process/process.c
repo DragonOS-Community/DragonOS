@@ -4,7 +4,6 @@
 #include <common/compiler.h>
 #include <common/elf.h>
 #include <common/kprint.h>
-#include <common/kthread.h>
 #include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>

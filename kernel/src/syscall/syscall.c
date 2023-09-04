@@ -1,7 +1,6 @@
 #include "syscall.h"
 #include <common/errno.h>
 #include <common/fcntl.h>
-#include <common/kthread.h>
 #include <common/string.h>
 #include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
@@ -12,13 +11,6 @@
 #include <time/sleep.h>
 // 导出系统调用入口函数，定义在entry.S中
 extern void syscall_int(void);
-
-/**
- * @brief 重新定义为：把系统调用函数加入系统调用表
- * @param syscall_num 系统调用号
- * @param symbol 系统调用处理函数
- */
-#define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
 
 /**
  * @brief 通过中断进入系统调用

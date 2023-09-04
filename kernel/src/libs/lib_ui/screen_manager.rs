@@ -325,20 +325,8 @@ pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemErr
     return Ok(0);
 }
 
-/// 允许双缓冲区
-#[no_mangle]
-pub extern "C" fn scm_enable_double_buffer() -> i32 {
-    let r = true_scm_enable_double_buffer().unwrap_or_else(|e| e.to_posix_errno());
-    if r.is_negative() {
-        c_uart_send_str(
-            UartPort::COM1.to_u16(),
-            "scm enable double buffer fail.\n\0".as_ptr(),
-        );
-    }
-
-    return r;
-}
-fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
+/// 屏幕管理器启用双缓冲区
+pub fn scm_enable_double_buffer() -> Result<i32, SystemError> {
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) {
         // 已经开启了双缓冲区了, 直接退出
         return Ok(0);
@@ -351,7 +339,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
     drop(scm_list);
     SCM_DOUBLE_BUFFER_ENABLED.store(true, Ordering::SeqCst);
     // 创建双缓冲区
-    let mut buf_info = ScmBufferInfo::new(ScmBufferFlag::SCM_BF_DB | ScmBufferFlag::SCM_BF_PIXEL)?;
+    let buf_info = ScmBufferInfo::new(ScmBufferFlag::SCM_BF_DB | ScmBufferFlag::SCM_BF_PIXEL)?;
 
     // 设置定时刷新的对象
     video_refresh_manager()

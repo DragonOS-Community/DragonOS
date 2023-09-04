@@ -213,11 +213,23 @@ impl ProcessManager {
 
     /// 当子进程退出后向父进程发送通知
     fn exit_notify() {
-        todo!("exit_notify");
+        let current = ProcessManager::current_pcb();
+        // 让INIT进程收养所有子进程
+        if current.pid() != Pid(1) {
+            unsafe {
+                current
+                    .adopt_childen()
+                    .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
+            };
+            // todo: 当信号机制重写后，这里需要向父进程发送SIGCHLD信号
+        }
     }
-    /// 退出进程，回收资源
+
+    /// 退出当前进程
     ///
-    /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246
+    /// ## 参数
+    ///
+    /// - `exit_code` : 进程的退出码
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -226,8 +238,8 @@ impl ProcessManager {
             .write()
             .set_state(ProcessState::Exited(exit_code));
         drop(pcb);
-        drop(irq_guard);
         ProcessManager::exit_notify();
+        drop(irq_guard);
         sched();
         loop {}
     }
@@ -250,7 +262,7 @@ impl ProcessManager {
 
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
-        kdebug!("switch_finish_hook");
+        // kdebug!("switch_finish_hook");
         let prev_pcb = SWITCH_RESULT
             .as_mut()
             .unwrap()
@@ -523,6 +535,11 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn arch_info_irqsave(&self) -> SpinLockGuard<ArchPCBInfo> {
+        return self.arch_info.lock_irqsave();
+    }
+
+    #[inline(always)]
     pub fn kernel_stack(&self) -> RwLockReadGuard<KernelStack> {
         return self.kernel_stack.read();
     }
@@ -588,12 +605,8 @@ impl ProcessControlBlock {
         return Some(socket);
     }
 
-    /// 退出进程时,让初始进程收养所有子进程
-    ///
-    /// ## 参数
-    ///
-    /// -`pcb` : 要退出的进程
-    fn adopt_childen(&self) -> Result<(), SystemError> {
+    /// 当前进程退出时,让初始进程收养所有子进程
+    unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
         match ProcessManager::find(Pid(1)) {
             Some(init_pcb) => {
                 let mut childen_guard = self.children.write();
@@ -616,11 +629,7 @@ impl Drop for ProcessControlBlock {
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
-        // 让INIT进程收养所有子进程
-        if self.pid() != Pid(1) {
-            self.adopt_childen()
-                .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"));
-        }
+
         if let Some(ppcb) = self.parent_pcb.read().upgrade() {
             ppcb.children.write().remove(&self.pid());
         }

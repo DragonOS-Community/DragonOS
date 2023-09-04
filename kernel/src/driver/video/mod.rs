@@ -51,7 +51,7 @@ pub struct VideoRefreshManager {
     running: AtomicBool,
 }
 
-const REFRESH_INTERVAL: u64 = 15;
+const REFRESH_INTERVAL: u64 = 30;
 
 impl VideoRefreshManager {
     /**
@@ -64,7 +64,7 @@ impl VideoRefreshManager {
 
         //设置成功则开始任务，否则直接返回false
         if res {
-            //第一次将expire_jiffies设置小一点，使得这次刷新尽快开始，后续的刷新将按照REFRESH_INTERVAL * 10的间隔进行
+            //第一次将expire_jiffies设置小一点，使得这次刷新尽快开始，后续的刷新将按照REFRESH_INTERVAL间隔进行
             let timer = Timer::new(VideoRefreshExecutor::new(), 1);
             //将新一次定时任务加入队列
             timer.activate();
@@ -76,13 +76,13 @@ impl VideoRefreshManager {
      * @brief 停止定时刷新
      */
     pub fn stop_video_refresh(&self) {
-        self.running.store(false, Ordering::Release);
+        self.running.store(false, Ordering::SeqCst);
     }
 
     fn set_run(&self) -> bool {
         let res = self
             .running
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed);
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
         if res.is_ok() {
             return true;
         } else {
@@ -260,7 +260,7 @@ struct VideoRefreshExecutor;
 
 impl VideoRefreshExecutor {
     fn new() -> Box<VideoRefreshExecutor> {
-        return Box::<VideoRefreshExecutor>::new(VideoRefreshExecutor);
+        return Box::new(VideoRefreshExecutor);
     }
 }
 
@@ -275,8 +275,8 @@ impl TimerFunction for VideoRefreshExecutor {
 
         let start_next_refresh = || {
             //判断是否还需要刷新，若需要则继续分配下一次计时任务，否则不分配
-            if manager.running.load(Ordering::Acquire) {
-                let timer = Timer::new(VideoRefreshExecutor::new(), 10 * REFRESH_INTERVAL);
+            if manager.running.load(Ordering::SeqCst) {
+                let timer = Timer::new(VideoRefreshExecutor::new(), REFRESH_INTERVAL);
                 //将新一次定时任务加入队列
                 timer.activate();
             }
@@ -284,7 +284,7 @@ impl TimerFunction for VideoRefreshExecutor {
 
         let mut refresh_target: Option<RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u32]>>>>>> =
             None;
-        for i in 0..10 {
+        for i in 0..2 {
             let g = manager.refresh_target.try_read();
             if g.is_none() {
                 if i == 9 {
@@ -301,13 +301,27 @@ impl TimerFunction for VideoRefreshExecutor {
 
         if let ScmBuffer::DeviceBuffer(vaddr) = manager.device_buffer().buf {
             let p = vaddr.as_ptr() as *mut u8;
+            let mut target_guard = None;
+            for _ in 0..2 {
+                if let Ok(guard) = refresh_target.as_ref().unwrap().try_lock_irqsave() {
+                    target_guard = Some(guard);
+                    break;
+                }
+            }
+            if target_guard.is_none() {
+                start_next_refresh();
+                return Ok(());
+            }
+            let mut target_guard = target_guard.unwrap();
             unsafe {
                 p.copy_from_nonoverlapping(
-                    refresh_target.as_ref().unwrap().lock_irqsave().as_mut_ptr() as *mut u8,
+                    target_guard.as_mut_ptr() as *mut u8,
                     manager.device_buffer().buf_size() as usize,
                 )
             }
         }
+
+        start_next_refresh();
 
         return Ok(());
     }

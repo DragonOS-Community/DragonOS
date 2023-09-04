@@ -1,4 +1,4 @@
-use super::{kthread::kthread_init, process::init_stdio, process_init, ProcessManager};
+use super::{kthread::kthread_init, process::stdio_init, process_init, ProcessManager};
 
 #[no_mangle]
 pub extern "C" fn rs_process_init() {
@@ -8,16 +8,6 @@ pub extern "C" fn rs_process_init() {
 #[no_mangle]
 pub extern "C" fn rs_kthread_init() {
     kthread_init();
-}
-
-#[no_mangle]
-pub extern "C" fn rs_init_stdio() -> i32 {
-    let r = init_stdio();
-    if r.is_ok() {
-        return 0;
-    } else {
-        return r.unwrap_err().to_posix_errno();
-    }
 }
 
 /// 临时用于获取空闲进程的栈顶的函数，这个函数是为了旧的smp模块的初始化而写在这的
@@ -55,7 +45,7 @@ pub extern "C" fn rs_current_pcb_flags() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_thread_rbp() -> u64 {
-    return ProcessManager::current_pcb().arch_info().rbp() as u64;
+    return ProcessManager::current_pcb().arch_info_irqsave().rbp() as u64;
 }
 
 #[no_mangle]

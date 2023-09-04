@@ -6,9 +6,7 @@ use crate::{
     arch::{
         interrupt::TrapFrame,
         process::table::{KERNEL_CS, KERNEL_DS},
-        CurrentIrqArch,
     },
-    exception::InterruptArch,
     process::{
         fork::CloneFlags,
         kthread::{

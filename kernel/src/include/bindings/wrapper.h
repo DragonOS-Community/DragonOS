@@ -30,7 +30,6 @@
 #include <common/unistd.h>
 #include <driver/disk/ahci/ahci.h>
 #include <driver/multiboot2/multiboot2.h>
-#include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>

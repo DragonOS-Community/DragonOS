@@ -28,8 +28,6 @@ pub mod syscall;
 mod table;
 
 extern "C" {
-    /// 内核线程引导函数
-    fn kernel_thread_func();
     /// 从中断返回
     fn ret_from_intr();
 }
@@ -219,11 +217,11 @@ impl ProcessManager {
             *trap_frame_ptr = child_trapframe;
         }
 
-        new_arch_guard.fsbase = current_pcb.arch_info().fsbase;
-        new_arch_guard.gsbase = current_pcb.arch_info().gsbase;
+        new_arch_guard.fsbase = current_pcb.arch_info_irqsave().fsbase;
+        new_arch_guard.gsbase = current_pcb.arch_info_irqsave().gsbase;
 
         // 拷贝浮点寄存器的状态
-        if let Some(fp_state) = current_pcb.arch_info().fp_state.as_ref() {
+        if let Some(fp_state) = current_pcb.arch_info_irqsave().fp_state.as_ref() {
             new_arch_guard.fp_state = Some(*fp_state);
         }
 
@@ -271,14 +269,12 @@ impl ProcessManager {
         let prev_arch = SpinLockGuard::leak(prev.arch_info());
 
         prev_arch.rip = switch_back as usize;
-        kdebug!("prev_arch: {:?}", prev_arch);
-        kdebug!("next_arch: {:?}", next_arch);
 
         // 恢复当前的 preempt count*2
         ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
+        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev.clone());
         SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(next.clone());
 
         switch_to_inner(prev_arch, next_arch);
     }
@@ -331,8 +327,7 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         popfq
 
         // push next rip to stack
-        mov rax, [rsi + {off_rip}]
-        push rax
+        push QWORD PTR [rsi + {off_rip}]
 
 
         // When we return, we cannot even guarantee that the return address on the stack, points to
@@ -367,7 +362,6 @@ unsafe extern "sysv64" fn switch_back() {
         "
         pop rax
         pop rbp
-        ret
         "
     ))
 }

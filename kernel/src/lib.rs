@@ -98,17 +98,5 @@ pub fn panic(info: &PanicInfo) -> ! {
     }
 
     println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
-    loop {}
     ProcessManager::exit(usize::MAX);
-}
-
-/// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数
-#[no_mangle]
-pub extern "C" fn __rust_demo_func() -> i32 {
-    printk_color!(FontColor::GREEN, FontColor::BLACK, "__rust_demo_func()\n");
-    let r = net_init();
-    if r.is_err() {
-        kwarn!("net_init() failed: {:?}", r.err().unwrap());
-    }
-    return 0;
 }

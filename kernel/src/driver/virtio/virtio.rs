@@ -18,12 +18,6 @@ enum VirtioError {
     NetDeviceNotFound,
 }
 
-/// @brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）（for c）
-#[no_mangle]
-pub extern "C" fn rs_virtio_probe() {
-    virtio_probe();
-}
-
 ///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
 pub fn virtio_probe() {
     let mut list = PCI_DEVICE_LINKEDLIST.write();

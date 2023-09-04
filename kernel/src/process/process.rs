@@ -8,7 +8,7 @@ use crate::{
 };
 
 /// @brief 初始化pid=1的进程的stdio
-pub fn init_stdio() -> Result<(), SystemError> {
+pub fn stdio_init() -> Result<(), SystemError> {
     if ProcessManager::current_pcb().pid() != Pid(1) {
         return Err(SystemError::EPERM);
     }

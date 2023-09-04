@@ -16,7 +16,6 @@
 #include <debug/bug.h>
 #include <debug/traceback/traceback.h>
 #include <driver/disk/ahci/ahci.h>
-#include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <ktest/ktest.h>
 #include <mm/mmio.h>

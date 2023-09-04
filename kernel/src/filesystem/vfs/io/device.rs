@@ -1,5 +1,9 @@
 /// 引入Module
-use crate::{syscall::SystemError, driver::base::device::{DeviceType, IdTable}, filesystem::vfs::IndexNode};
+use crate::{
+    driver::base::device::{Device, DeviceError, DeviceType, IdTable, KObject},
+    filesystem::vfs::IndexNode,
+    syscall::SystemError,
+};
 use alloc::{sync::Arc, vec::Vec};
 use core::{any::Any, fmt::Debug};
 
@@ -17,62 +21,12 @@ use super::disk_info::Partition;
 pub type BlockId = usize;
 
 /// 定义常量
-const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1 << 12.
+pub const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1 << 12.
 /// 在DragonOS中，我们认为磁盘的每个LBA大小均为512字节。（注意，文件系统的1个扇区可能事实上是多个LBA）
 pub const LBA_SIZE: usize = 512;
 
-/// @brief 设备应该实现的操作
-/// @usage Device::read_at()
-pub trait Device: Any + Send + Sync + Debug {
-    /// Notice buffer对应设备按字节划分，使用u8类型
-    /// Notice offset应该从0开始计数
-
-    /// @brief: 从设备的第offset个字节开始，读取len个byte，存放到buf中
-    /// @parameter offset: 起始字节偏移量
-    /// @parameter len: 读取字节的数量
-    /// @parameter buf: 目标数组
-    /// @return: 如果操作成功，返回操作的长度(单位是字节)；否则返回错误码；如果操作异常，但是并没有检查出什么错误，将返回已操作的长度
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
-
-    /// @brief: 从设备的第offset个字节开始，把buf数组的len个byte，写入到设备中
-    /// @parameter offset: 起始字节偏移量
-    /// @parameter len: 读取字节的数量
-    /// @parameter buf: 目标数组
-    /// @return: 如果操作成功，返回操作的长度(单位是字节)；否则返回错误码；如果操作异常，但是并没有检查出什么错误，将返回已操作的长度
-    fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError>;
-
-    /// @brief: 同步信息，把所有的dirty数据写回设备 - 待实现
-    fn sync(&self) -> Result<(), SystemError>;
-
-    // TODO: 待实现 open, close
-
-
-    fn as_any_ref(& self) -> & dyn core::any::Any {
-        self
-    }
-    /// @brief: 获取设备类型
-    /// @parameter: None
-    /// @return: 实现该trait的设备所属类型
-    fn dev_type(&self) -> DeviceType;
-
-    /// @brief: 获取设备标识
-    /// @parameter: None
-    /// @return: 该设备唯一标识
-    fn id_table(&self) -> IdTable;
-
-    /// @brief: 设置sysfs info
-    /// @parameter: None
-    /// @return: 该设备唯一标识
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>);
-
-    /// @brief: 获取设备的sys information
-    /// @parameter id_table: 设备标识符，用于唯一标识该设备
-    /// @return: 设备实例
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>>;
-}
-
 /// @brief 块设备应该实现的操作
-pub trait BlockDevice: Any + Send + Sync + Debug {
+pub trait BlockDevice: Device {
     /// @brief: 在块设备中，从第lba_id_start个块开始，读取count个块数据，存放到buf中
     ///
     /// @parameter lba_id_start: 起始块
@@ -125,86 +79,6 @@ pub trait BlockDevice: Any + Send + Sync + Debug {
 
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
-}
-
-/// 对于所有<块设备>自动实现 Device Trait 的 read_at 和 write_at 函数
-impl<T: BlockDevice> Device for T {
-    // 读取设备操作，读取设备内部 [offset, offset + buf.len) 区间内的字符，存放到 buf 中
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        if len > buf.len() {
-            return Err(SystemError::E2BIG);
-        }
-
-        let iter = BlockIter::new_multiblock(offset, offset + len, self.blk_size_log2());
-        let multi = iter.multiblock;
-
-        // 枚举每一个range
-        for range in iter {
-            let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
-            let buf_end = range.origin_end() - offset;
-            let buf_slice = &mut buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
-            let full = multi && range.is_multi() || !multi && range.is_full();
-
-            if full {
-                // 调用 BlockDevice::read_at() 直接把引用传进去，不是把整个数组move进去
-                BlockDevice::read_at(self, range.lba_start, count, buf_slice)?;
-            } else {
-                // 判断块的长度不能超过最大值
-                if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
-                    return Err(SystemError::E2BIG);
-                }
-
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
-                BlockDevice::read_at(self, range.lba_start, 1, &mut temp[..])?;
-                // 把数据从临时buffer复制到目标buffer
-                buf_slice.copy_from_slice(&temp[range.begin..range.end]);
-            }
-        }
-        return Ok(len);
-    }
-
-    /// 写入设备操作，把 buf 的数据写入到设备内部 [offset, offset + len) 区间内
-    fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        // assert!(len <= buf.len());
-        if len > buf.len() {
-            return Err(SystemError::E2BIG);
-        }
-
-        let iter = BlockIter::new_multiblock(offset, offset + len, self.blk_size_log2());
-        let multi = iter.multiblock;
-
-        for range in iter {
-            let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
-            let buf_end = range.origin_end() - offset;
-            let buf_slice = &buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
-            let full = multi && range.is_multi() || !multi && range.is_full();
-
-            if full {
-                BlockDevice::write_at(self, range.lba_start, count, buf_slice)?;
-            } else {
-                if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
-                    return Err(SystemError::E2BIG);
-                }
-
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
-                // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
-                BlockDevice::read_at(self, range.lba_start, 1, &mut temp[..])?;
-                // 把数据从临时buffer复制到目标buffer
-                temp[range.begin..range.end].copy_from_slice(&buf_slice);
-                BlockDevice::write_at(self, range.lba_start, 1, &temp[..])?;
-            }
-        }
-        return Ok(len);
-    }
-
-    /// 数据同步
-    fn sync(&self) -> Result<(), SystemError> {
-        BlockDevice::sync(self)
-    }
 }
 
 /// @brief 块设备的迭代器

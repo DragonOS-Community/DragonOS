@@ -1,9 +1,12 @@
 use super::device::{
     bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
-    driver::Driver,
-     DeviceError, DeviceState, DeviceType, IdTable, KObject,
+    driver::DriverError,
+    Device, DeviceError, DeviceNumber, DevicePrivateData, DeviceResource, DeviceState, DeviceType,
+    IdTable, KObject,
 };
-use crate::{filesystem::vfs::{IndexNode, io::device::Device}, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{
+    driver::Driver, filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError,
+};
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -19,7 +22,7 @@ pub mod platform_driver;
 /// @brief: platform总线匹配表
 ///         总线上的设备和驱动都存在一份匹配表
 ///         根据匹配表条目是否匹配来辨识设备和驱动能否进行匹配
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompatibleTable(BTreeSet<&'static str>);
 
 /// @brief: 匹配表操作方法集
@@ -44,6 +47,10 @@ impl CompatibleTable {
             }
         }
         return false;
+    }
+
+    pub fn add_device(&self, device: &CompatibleTable) {
+        self.0.append(device);
     }
 }
 
@@ -94,7 +101,9 @@ impl LockedPlatformBusDriver {
     /// @return: 注册成功，返回Ok(()),，注册失败，返回BusError类型
     #[allow(dead_code)]
     fn register_platform_driver(&self, driver: Arc<dyn PlatformDriver>) -> Result<(), DeviceError> {
-        let id_table = driver.id_table();
+        let id_table = driver
+            .id_table()
+            .map_err(|e| DeviceError::InitializeFailed)?;
 
         let drivers = &mut self.0.lock().drivers;
         // 如果存在同类型的驱动，返回错误
@@ -111,9 +120,15 @@ impl LockedPlatformBusDriver {
     /// @return: None
     #[allow(dead_code)]
     #[inline]
-    fn unregister_platform_driver(&mut self, driver: Arc<dyn PlatformDriver>) {
-        let id_table = driver.id_table();
+    fn unregister_platform_driver(
+        &mut self,
+        driver: Arc<dyn PlatformDriver>,
+    ) -> Result<(), DeviceError> {
+        let id_table = driver
+            .id_table()
+            .map_err(|e| DeviceError::UnInitializedDevice)?;
         self.0.lock().drivers.remove(&id_table);
+        return Ok(());
     }
 
     /// @brief: 注册platform类型设备
@@ -124,7 +139,7 @@ impl LockedPlatformBusDriver {
         &mut self,
         device: Arc<dyn PlatformDevice>,
     ) -> Result<(), DeviceError> {
-        let id_table = device.id_table();
+        let id_table = device.id_table()?;
 
         let devices = &mut self.0.lock().devices;
         if devices.contains_key(&id_table) {
@@ -141,7 +156,7 @@ impl LockedPlatformBusDriver {
     #[inline]
     #[allow(dead_code)]
     fn unregister_platform_device(&mut self, device: Arc<dyn PlatformDevice>) {
-        let id_table = device.id_table();
+        let id_table = device.id_table()?;
         self.0.lock().devices.remove(&id_table);
     }
 
@@ -234,8 +249,8 @@ impl Driver for LockedPlatformBusDriver {
     }
 
     #[inline]
-    fn id_table(&self) -> IdTable {
-        IdTable::new("PlatformBusDriver", 0)
+    fn id_table(&self) -> Result<IdTable, DriverError> {
+        Ok(IdTable::new("PlatformBusDriver", DeviceNumber::new(0)))
     }
 
     #[inline]
@@ -248,6 +263,18 @@ impl Driver for LockedPlatformBusDriver {
     #[allow(dead_code)]
     fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
         self.0.lock().sys_info = sys_info;
+    }
+
+    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
+        todo!()
+    }
+
+    fn load(
+        &self,
+        data: DevicePrivateData,
+        resource: Option<DeviceResource>,
+    ) -> Result<Arc<dyn Device>, DriverError> {
+        todo!()
     }
 }
 
@@ -373,20 +400,8 @@ impl Device for LockedPlatform {
         return self.0.lock().sys_info.clone();
     }
 
-    fn as_any_ref(& self) -> & dyn core::any::Any {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
         self
-    }
-
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        todo!()
-    }
-
-    fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        todo!()
-    }
-
-    fn sync(&self) -> Result<(), SystemError> {
-        todo!()
     }
 }
 

@@ -130,7 +130,7 @@ impl FATFile {
 
             //  从磁盘上读取数据
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_offset;
-            let r = fs.partition.disk().device().read_at(
+            let r = fs.partition.disk().read_at(
                 offset as usize,
                 end_len,
                 &mut buf[start..start + end_len],
@@ -198,7 +198,7 @@ impl FATFile {
             // 计算本次写入位置在磁盘上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
             // 写入磁盘
-            let w: usize = fs.partition.disk().device().write_at(
+            let w: usize = fs.partition.disk().write_at(
                 offset as usize,
                 end_len,
                 &buf[start..start + end_len],
@@ -326,11 +326,9 @@ impl FATFile {
         }
 
         let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
-        fs.partition.disk().device().write_at(
-            range_start as usize,
-            zeroes.len(),
-            zeroes.as_slice(),
-        )?;
+        fs.partition
+            .disk()
+            .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
         return Ok(());
     }
 

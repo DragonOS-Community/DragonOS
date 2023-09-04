@@ -5,7 +5,7 @@ use hashbrown::HashSet;
 use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
-use crate::driver::uart::uart::c_uart_send_str;
+use crate::driver::uart::uart_device::c_uart_send_str;
 use crate::include::bindings::bindings::{
     multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
 };

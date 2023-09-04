@@ -1,20 +1,30 @@
 use crate::{
-    driver::base::{
-        char::CharDevice,
-        device::{driver::Driver, DeviceState, DeviceType, IdTable, KObject},
-        platform::{
-            self, platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
+    driver::{
+        base::{
+            char::CharDevice,
+            device::{
+                driver::DriverError, Device, DeviceError, DeviceNumber, DevicePrivateData,
+                DeviceResource, DeviceState, DeviceType, IdTable, KObject,
+            },
+            platform::{
+                platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
+            },
         },
+        tty::{tty_device::TtyDevice, TtyError, TtyState},
+        Driver,
     },
     filesystem::{
         sysfs::bus::{bus_device_register, bus_driver_register},
-        vfs::{IndexNode, io::device::Device},
+        vfs::IndexNode,
     },
     include::bindings::bindings::{io_in8, io_out8},
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
-use alloc::sync::Arc;
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+};
 use core::{char, intrinsics::offset, str};
 
 const UART_SUCCESS: i32 = 0;
@@ -99,17 +109,17 @@ struct UartRegister {
 // @brief 串口设备结构体
 #[derive(Debug)]
 pub struct Uart {
+    id_table: Option<IdTable>,
     state: DeviceState, // 设备状态
     sys_info: Option<Arc<dyn IndexNode>>,
-    driver: Option<Arc<dyn PlatformDriver>>,
 }
 
 impl Default for Uart {
     fn default() -> Self {
         Self {
+            id_table: None,
             state: DeviceState::NotInitialized,
             sys_info: None,
-            driver: None,
         }
     }
 }
@@ -127,10 +137,6 @@ impl Default for LockedUart {
 impl KObject for LockedUart {}
 
 impl PlatformDevice for LockedUart {
-    fn compatible_table(&self) -> platform::CompatibleTable {
-        platform::CompatibleTable::new(vec!["uart"])
-    }
-
     fn is_initialized(&self) -> bool {
         let state = self.0.lock().state;
         match state {
@@ -143,15 +149,17 @@ impl PlatformDevice for LockedUart {
         let state = &mut self.0.lock().state;
         *state = set_state;
     }
-
-    fn set_driver(&self, driver: Option<Arc<dyn PlatformDriver>>) {
-        self.0.lock().driver = driver;
-    }
 }
 
 impl Device for LockedUart {
-    fn id_table(&self) -> IdTable {
-        IdTable::new("uart", 0)
+    fn id_table(&self) -> Result<IdTable, DeviceError> {
+        if self.0.lock().id_table.is_some() {
+            return Ok(IdTable::new(
+                "uart",
+                DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
+            ));
+        }
+        return Err(DeviceError::InitializeFailed);
     }
 
     fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
@@ -166,10 +174,12 @@ impl Device for LockedUart {
         DeviceType::Serial
     }
 
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
+}
 
+impl CharDevice for LockedUart {
     fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         todo!()
     }
@@ -183,10 +193,21 @@ impl Device for LockedUart {
     }
 }
 
+impl TtyDevice for LockedUart {
+    fn ioctl(&self, cmd: String) -> Result<(), DeviceError> {
+        //TODO 补充详细信息
+        Err(DeviceError::UnsupportedOperation)
+    }
+    fn state(&self) -> Result<TtyState, TtyError> {
+        todo!()
+    }
+}
+
 // @brief 串口驱动结构体
 #[repr(C)]
 #[derive(Debug)]
 pub struct UartDriver {
+    id_table: IdTable,
     port: UartPort,
     baud_rate: u32,
     sys_info: Option<Arc<dyn IndexNode>>,
@@ -195,6 +216,10 @@ pub struct UartDriver {
 impl Default for UartDriver {
     fn default() -> Self {
         Self {
+            id_table: IdTable::new(
+                "ttyS",
+                DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
+            ),
             port: UartPort::COM1,
             baud_rate: 115200,
             sys_info: None,
@@ -215,12 +240,12 @@ impl Default for LockedUartDriver {
 impl KObject for LockedUartDriver {}
 
 impl Driver for LockedUartDriver {
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
-    fn id_table(&self) -> IdTable {
-        return IdTable::new("uart_driver", 0);
+    fn id_table(&self) -> Result<IdTable, DriverError> {
+        return Ok(IdTable::new("uart_driver", DeviceNumber::new(0)));
     }
 
     fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
@@ -230,15 +255,22 @@ impl Driver for LockedUartDriver {
     fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         return self.0.lock().sys_info.clone();
     }
-}
 
-impl CharDevice for LockedUartDriver {
-    fn open(&self, _file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
-        return Ok(());
+    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
+        if let Some(table) = data.compatible_table() {
+            if table.matches(&CompatibleTable::new(vec!["uart"])) {
+                return Ok(());
+            }
+        }
+        return Err(DriverError::ProbeError);
     }
 
-    fn close(&self, _file: Arc<dyn IndexNode>) -> Result<(), crate::syscall::SystemError> {
-        return Ok(());
+    fn load(
+        &self,
+        data: DevicePrivateData,
+        resource: Option<DeviceResource>,
+    ) -> Result<Arc<dyn Device>, DriverError> {
+        todo!()
     }
 }
 
@@ -254,18 +286,7 @@ impl LockedUartDriver {
     }
 }
 
-impl PlatformDriver for LockedUartDriver {
-    fn probe(
-        &self,
-        _device: Arc<dyn PlatformDevice>,
-    ) -> Result<(), crate::driver::base::device::driver::DriverError> {
-        return Ok(());
-    }
-
-    fn compatible_table(&self) -> platform::CompatibleTable {
-        return CompatibleTable::new(vec!["uart"]);
-    }
-}
+impl PlatformDriver for LockedUartDriver {}
 
 impl UartDriver {
     /// @brief 创建串口驱动
@@ -276,6 +297,10 @@ impl UartDriver {
     #[allow(dead_code)]
     pub fn new(port: UartPort, baud_rate: u32, sys_info: Option<Arc<dyn IndexNode>>) -> Self {
         Self {
+            id_table: IdTable::new(
+                "ttyS",
+                DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
+            ),
             port,
             baud_rate,
             sys_info,
@@ -466,13 +491,24 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
 /// @param none
 /// @return 初始化成功，返回(),失败，返回错误码
 pub fn uart_init() -> Result<(), SystemError> {
-    let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().to_name())
-        .expect("uart device register error");
+    let device_inode = bus_device_register(
+        "platform:0",
+        &UART_DEV
+            .id_table()
+            .map_err(|e| SystemError::ENODEV)?
+            .to_name(),
+    )
+    .expect("uart device register error");
     UART_DEV.set_sys_info(Some(device_inode));
-    let driver_inode = bus_driver_register("platform:0", &UART_DRV.id_table().to_name())
-        .expect("uart driver register error");
+    let driver_inode = bus_driver_register(
+        "platform:0",
+        &UART_DRV
+            .id_table()
+            .map_err(|e| SystemError::ENODEV)?
+            .to_name(),
+    )
+    .expect("uart driver register error");
     UART_DRV.set_sys_info(Some(driver_inode));
-    UART_DEV.set_driver(Some(UART_DRV.clone()));
     UART_DEV.set_state(DeviceState::Initialized);
     return Ok(());
 }

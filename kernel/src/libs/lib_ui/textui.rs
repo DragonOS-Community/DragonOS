@@ -1,5 +1,5 @@
 use crate::{
-    driver::uart::uart::{c_uart_send, c_uart_send_str, UartPort},
+    driver::uart::uart_device::{c_uart_send, c_uart_send_str, UartPort},
     include::bindings::bindings::video_frame_buffer_info,
     kinfo,
     libs::{lib_ui::font::FONT_8x16, spinlock::SpinLock},

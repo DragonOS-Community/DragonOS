@@ -9,7 +9,11 @@ use smoltcp::{phy, wire};
 use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use crate::{
-    driver::{virtio::virtio_impl::HalImpl, Driver},
+    driver::{
+        base::device::{driver::DriverError, Device, DevicePrivateData, DeviceResource, IdTable},
+        virtio::virtio_impl::HalImpl,
+        Driver,
+    },
     kerror, kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
@@ -239,6 +243,22 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
 impl<T: Transport> Driver for VirtioInterface<T> {
     fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
         self
+    }
+
+    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
+        todo!()
+    }
+
+    fn load(
+        &self,
+        data: DevicePrivateData,
+        resource: Option<DeviceResource>,
+    ) -> Result<Arc<dyn Device>, DriverError> {
+        todo!()
+    }
+
+    fn id_table(&self) -> Result<IdTable, DriverError> {
+        todo!()
     }
 }
 

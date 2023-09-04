@@ -1174,7 +1174,6 @@ impl FATFileSystem {
         let offset: usize = self.cluster_bytes_offset(cluster) as usize;
         self.partition
             .disk()
-            .device()
             .write_at(offset, zeros.len(), zeros.as_slice())?;
         return Ok(());
     }

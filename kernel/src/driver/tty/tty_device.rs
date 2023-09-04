@@ -1,23 +1,11 @@
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-};
+use alloc::{collections::BTreeMap, string::String, sync::Arc};
 
 use crate::{
-    filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
-    },
-    kerror,
-    libs::{
-        lib_ui::textui::{textui_putchar, FontColor},
-        rwlock::RwLock,
-    },
-    syscall::SystemError, driver::base::char::CharDevice,
+    driver::base::{char::CharDevice, device::DeviceError},
+    libs::rwlock::RwLock,
 };
 
-use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
+use super::{TtyError, TtyState};
 
 lazy_static! {
     /// 所有TTY设备的B树。用于根据名字，找到Arc<TtyDevice>
@@ -25,11 +13,14 @@ lazy_static! {
     pub static ref TTY_DEVICES: RwLock<BTreeMap<String, Arc<dyn TtyDevice>>> = RwLock::new(BTreeMap::new());
 }
 
+pub trait TtyDevice: CharDevice {
+    // 暂时用来表示和tty设备交互的接口，以后还会更改
+    fn ioctl(&self, cmd: String) -> Result<(), DeviceError> {
+        Err(DeviceError::UnsupportedOperation)
+    }
 
-pub trait TtyDevice : CharDevice+DeviceINode{}
-
-
-
+    fn state(&self) -> Result<TtyState, TtyError>;
+}
 
 // /// @brief TTY设备
 // #[derive(Debug)]

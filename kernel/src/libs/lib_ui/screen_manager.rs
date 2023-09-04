@@ -7,7 +7,7 @@ use core::{
 use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
 
 use crate::{
-    driver::uart::uart::{c_uart_send_str, UartPort},
+    driver::uart::uart_device::{c_uart_send_str, UartPort},
     include::bindings::bindings::{
         scm_buffer_info_t, video_frame_buffer_info, video_reinitialize, video_set_refresh_target,
     },

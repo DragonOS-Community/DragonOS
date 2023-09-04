@@ -3,7 +3,7 @@ use core::mem::MaybeUninit;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::current::current_pcb, driver::tty::TtyFilePrivateData,
+    arch::asm::current::current_pcb, driver::base::device::DevicePrivateData,
     filesystem::procfs::ProcfsFilePrivateData, filesystem::vfs::io::SeekFrom,
     include::bindings::bindings::process_control_block, kerror, syscall::SystemError,
 };
@@ -16,7 +16,7 @@ pub enum FilePrivateData {
     /// procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
     /// Tty设备的私有信息
-    Tty(TtyFilePrivateData),
+    DevFS(DevicePrivateData),
     /// 不需要文件私有信息
     Unused,
 }

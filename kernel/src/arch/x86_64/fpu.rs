@@ -53,7 +53,6 @@ impl Default for FpState {
     }
 }
 impl FpState {
-
     pub fn new() -> Self {
         assert!(core::mem::size_of::<Self>() == 512);
         return Self::default();

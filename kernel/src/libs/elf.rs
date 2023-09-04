@@ -20,7 +20,8 @@ use crate::{
     },
     process::{
         abi::AtType,
-        exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam}, ProcessManager,
+        exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
+        ProcessManager,
     },
     syscall::{
         user_access::{clear_user, copy_to_user},

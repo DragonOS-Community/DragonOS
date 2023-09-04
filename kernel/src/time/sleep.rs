@@ -6,7 +6,8 @@ use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
-    syscall::SystemError, process::ProcessManager,
+    process::ProcessManager,
+    syscall::SystemError,
 };
 
 use super::{
@@ -49,7 +50,7 @@ pub fn nanosleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
         unsafe { CurrentIrqArch::save_and_disable_irq() };
     ProcessManager::mark_sleep(true).ok();
     timer.activate();
-    
+
     drop(irq_guard);
 
     sched();

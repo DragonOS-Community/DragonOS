@@ -502,7 +502,10 @@ impl MmioBuddyMemPool {
                 return Ok(space_guard);
             }
             Err(_) => {
-                kerror!("failed to create mmio. pid = {:?}", ProcessManager::current_pcb().pid());
+                kerror!(
+                    "failed to create mmio. pid = {:?}",
+                    ProcessManager::current_pcb().pid()
+                );
                 return Err(SystemError::ENOMEM);
             }
         }

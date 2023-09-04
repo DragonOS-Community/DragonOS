@@ -4,7 +4,7 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     driver::tty::TtyFilePrivateData, filesystem::procfs::ProcfsFilePrivateData, kerror,
-    syscall::SystemError, process::ProcessManager,
+    process::ProcessManager, syscall::SystemError,
 };
 
 use super::{io::SeekFrom, Dirent, FileType, IndexNode, Metadata};

@@ -369,7 +369,7 @@ impl Drop for File {
         if r.is_err() {
             kerror!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
-                ProcessManager::current_pcb().basic().pid(),
+                ProcessManager::current_pcb().pid(),
                 self,
                 r.unwrap_err()
             );

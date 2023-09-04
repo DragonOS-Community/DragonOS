@@ -204,7 +204,7 @@ impl WaitQueue {
             if let Some(state) = state {
                 if to_wakeup.sched_info().state() == state {
                     ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
-                        kerror!("wakeup pid: {:?} error: {:?}", to_wakeup.basic().pid(), e);
+                        kerror!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
                     });
                     continue;
                 }

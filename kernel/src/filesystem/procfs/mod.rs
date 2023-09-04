@@ -149,7 +149,7 @@ impl ProcFSInode {
 
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
         pdata.append(
-            &mut format!("\nPid:\t{}", pcb.basic().pid().into())
+            &mut format!("\nPid:\t{}", pcb.pid().into())
                 .as_bytes()
                 .to_owned(),
         );

@@ -126,7 +126,7 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
     // 除了IDLE以外的进程，都进行负载均衡
-    if pcb.basic().pid().into() > 0 {
+    if pcb.pid().into() > 0 {
         loads_balance(pcb.clone());
     }
 

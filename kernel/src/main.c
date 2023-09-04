@@ -37,6 +37,7 @@ extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
 extern int rs_video_init();
+extern void rs_kthread_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -102,34 +103,31 @@ void system_initialize()
     io_mfence();
     scm_reinit();
     rs_textui_init();
-    while(1);
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
-    // =========== 重新设置initial_tss[0]的ist
-    uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
-    ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
+    // // =========== 重新设置initial_tss[0]的ist
+    // uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
+    // ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
 
-    initial_tss[0].ist1 = (ul)ptr;
-    initial_tss[0].ist2 = (ul)ptr;
-    initial_tss[0].ist3 = (ul)ptr;
-    initial_tss[0].ist4 = (ul)ptr;
-    initial_tss[0].ist5 = (ul)ptr;
-    initial_tss[0].ist6 = (ul)ptr;
-    initial_tss[0].ist7 = (ul)ptr;
-    // ===========================
+    // initial_tss[0].ist1 = (ul)ptr;
+    // initial_tss[0].ist2 = (ul)ptr;
+    // initial_tss[0].ist3 = (ul)ptr;
+    // initial_tss[0].ist4 = (ul)ptr;
+    // initial_tss[0].ist5 = (ul)ptr;
+    // initial_tss[0].ist6 = (ul)ptr;
+    // initial_tss[0].ist7 = (ul)ptr;
+    // // ===========================
 
     acpi_init();
     io_mfence();
-    sched_init();
-    io_mfence();
-    // 初始化中断模块
     irq_init();
+    rs_process_init();
+    sched_init();
 
-    // softirq_init();
+    sti();
+    io_mfence();
+
     rs_softirq_init();
-
-    // set_cpuid(0);
-    // set_preempt_count(0);
 
     syscall_init();
     io_mfence();
@@ -146,13 +144,9 @@ void system_initialize()
     io_mfence();
     vfs_init();
     rs_tty_init();
-    io_mfence();
-    // 由于进程管理模块依赖于文件系统，因此必须在文件系统初始化完毕后再初始化进程管理模块
-    // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，
-    // 因此必须在进程管理模块初始化完毕后再初始化smp。
-    io_mfence();
 
-    rs_process_init();
+    rs_kthread_init();
+    io_mfence();
 
     io_mfence();
     rs_clocksource_boot_finish();
@@ -169,12 +163,13 @@ void system_initialize()
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
+
     io_mfence();
 
     HPET_init();
-
     io_mfence();
     HPET_measure_freq();
+
     io_mfence();
     // current_pcb->preempt_count = 0;
     // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());

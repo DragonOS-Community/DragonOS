@@ -192,7 +192,7 @@ impl ElfLoader {
             if err == SystemError::EEXIST {
                 kerror!(
                     "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
-                    ProcessManager::current_pcb().basic().pid(),
+                    ProcessManager::current_pcb().pid(),
                     addr_to_map.as_ptr::<u8>()
                 );
             }

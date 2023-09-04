@@ -16,7 +16,6 @@ use crate::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
-    include::bindings::bindings::PROC_RUNNING,
     kdebug, kerror, kinfo,
     libs::spinlock::SpinLock,
     process::{ProcessControlBlock, ProcessManager},
@@ -246,10 +245,12 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
         timeout += TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
-        let timer = Timer::new(WakeUpHelper::new(ProcessManager::current_pcb()), timeout as u64);
+        let timer = Timer::new(
+            WakeUpHelper::new(ProcessManager::current_pcb()),
+            timeout as u64,
+        );
         ProcessManager::mark_sleep(true).ok();
         timer.activate();
-        
 
         drop(irq_guard);
 

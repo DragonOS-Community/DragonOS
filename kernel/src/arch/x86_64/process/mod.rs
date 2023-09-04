@@ -3,8 +3,10 @@ use core::{arch::asm, intrinsics::unlikely, mem::ManuallyDrop};
 use alloc::{sync::Arc, vec::Vec};
 
 use memoffset::offset_of;
+use x86::controlregs::Cr4;
 
 use crate::{
+    kdebug,
     libs::spinlock::SpinLockGuard,
     mm::{
         percpu::{PerCpu, PerCpuVar},
@@ -16,6 +18,8 @@ use crate::{
     },
     syscall::SystemError,
 };
+
+use self::kthread::kernel_thread_bootstrap_stage1;
 
 use super::{fpu::FpState, interrupt::TrapFrame};
 
@@ -119,19 +123,27 @@ impl ArchPCBInfo {
     }
 
     pub fn restore_fp_state(&mut self) {
-        if self.fp_state.is_none() {
-            panic!("fp_state is none");
+        if unlikely(self.fp_state.is_none()) {
+            return;
         }
 
         self.fp_state.as_mut().unwrap().restore();
     }
 
     pub unsafe fn save_fsbase(&mut self) {
-        self.fsbase = x86::current::segmentation::rdfsbase() as usize;
+        if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
+            self.fsbase = x86::current::segmentation::rdfsbase() as usize;
+        } else {
+            self.fsbase = 0;
+        }
     }
 
     pub unsafe fn save_gsbase(&mut self) {
-        self.gsbase = x86::current::segmentation::rdgsbase() as usize;
+        if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
+            self.gsbase = x86::current::segmentation::rdgsbase() as usize;
+        } else {
+            self.gsbase = 0;
+        }
     }
 
     pub fn fsbase(&self) -> usize {
@@ -150,14 +162,14 @@ impl ProcessControlBlock {
         let ptr = VirtAddr::new(x86::current::registers::rsp() as usize);
         let stack_base = VirtAddr::new(ptr.data() & (!(KernelStack::ALIGN - 1)));
         // 从内核栈的最低地址处取出pcb的地址
-        let p = stack_base.data() as *const ProcessControlBlock;
-        if unlikely(p.is_null()) {
+        let p = stack_base.data() as *const *const ProcessControlBlock;
+        if unlikely((unsafe { *p }).is_null()) {
             panic!("current_pcb is null");
         }
         unsafe {
             // 为了防止内核栈的pcb指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
             let arc_wrapper: ManuallyDrop<Arc<ProcessControlBlock>> =
-                ManuallyDrop::new(Arc::from_raw(p));
+                ManuallyDrop::new(Arc::from_raw(*p));
 
             let new_arc: Arc<ProcessControlBlock> = Arc::clone(&arc_wrapper);
             return new_arc;
@@ -216,8 +228,11 @@ impl ProcessManager {
         }
 
         // 设置返回地址（子进程开始执行的指令地址）
+
         if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
-            new_arch_guard.rip = kernel_thread_func as usize;
+            let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
+
+            new_arch_guard.rip = kthread_bootstrap_stage1_func_addr;
         } else {
             new_arch_guard.rip = ret_from_intr as usize;
         }
@@ -254,6 +269,11 @@ impl ProcessManager {
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
         let next_arch = SpinLockGuard::leak(next.arch_info());
         let prev_arch = SpinLockGuard::leak(prev.arch_info());
+
+        prev_arch.rip = switch_back as usize;
+        kdebug!("prev_arch: {:?}", prev_arch);
+        kdebug!("next_arch: {:?}", next_arch);
+
         // 恢复当前的 preempt count*2
         ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
@@ -291,6 +311,9 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         mov [rdi + {off_r15}], r15
         mov r15, [rsi + {off_r15}]
 
+        push rbp
+        push rax
+
         mov [rdi + {off_rbp}], rbp
         mov rbp, [rsi + {off_rbp}]
 
@@ -307,13 +330,17 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         // pop into RFLAGS
         popfq
 
+        // push next rip to stack
+        mov rax, [rsi + {off_rip}]
+        push rax
+
+
         // When we return, we cannot even guarantee that the return address on the stack, points to
         // the calling function. Thus, we have to execute this Rust hook by
         // ourselves, which will unlock the contexts before the later switch.
 
         // Note that switch_finish_hook will be responsible for executing `ret`.
         jmp {switch_hook}
-
         "),
 
         off_rflags = const(offset_of!(ArchPCBInfo, rflags)),
@@ -325,8 +352,22 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         off_rbp = const(offset_of!(ArchPCBInfo, rbp)),
         off_rsp = const(offset_of!(ArchPCBInfo, rsp)),
         off_r15 = const(offset_of!(ArchPCBInfo, r15)),
+        off_rip = const(offset_of!(ArchPCBInfo, rip)),
 
         switch_hook = sym crate::process::switch_finish_hook,
         options(noreturn),
     );
+}
+
+/// 从`switch_to_inner`返回后，执行这个函数
+///
+/// 也就是说，当进程再次被调度时，会从这里开始执行
+unsafe extern "sysv64" fn switch_back() {
+    asm!(concat!(
+        "
+        pop rax
+        pop rbp
+        ret
+        "
+    ))
 }

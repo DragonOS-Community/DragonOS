@@ -60,7 +60,7 @@ impl CFSQueue {
         let mut queue = self.locked_queue.lock_irqsave();
 
         // 如果进程是IDLE进程，那么就不加入队列
-        if pcb.basic().pid().into() == 0 {
+        if pcb.pid().into() == 0 {
             return;
         }
 

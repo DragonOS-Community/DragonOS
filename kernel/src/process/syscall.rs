@@ -70,7 +70,7 @@ impl Syscall {
     /// @brief 获取当前进程的pid
     pub fn getpid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.basic().pid());
+        return Ok(current_pcb.pid());
     }
 
     /// @brief 获取指定进程的pgid
@@ -82,7 +82,7 @@ impl Syscall {
     pub fn getpgid(mut pid: Pid) -> Result<Pid, SystemError> {
         if pid == Pid(0) {
             let current_pcb = ProcessManager::current_pcb();
-            pid = current_pcb.basic().pid();
+            pid = current_pcb.pid();
         }
         let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
         return Ok(target_proc.basic().pgid());

@@ -1,5 +1,3 @@
-use core::{ffi::c_void, mem::ManuallyDrop, ptr::null_mut};
-
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
@@ -11,7 +9,7 @@ use crate::{
 
 /// @brief 初始化pid=1的进程的stdio
 pub fn init_stdio() -> Result<(), SystemError> {
-    if ProcessManager::current_pcb().basic().pid() != Pid(1) {
+    if ProcessManager::current_pcb().pid() != Pid(1) {
         return Err(SystemError::EPERM);
     }
     let tty_inode = ROOT_INODE()

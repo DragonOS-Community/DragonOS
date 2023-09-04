@@ -6,7 +6,9 @@ use crate::{
     arch::{
         interrupt::TrapFrame,
         process::table::{KERNEL_CS, KERNEL_DS},
+        CurrentIrqArch,
     },
+    exception::InterruptArch,
     process::{
         fork::CloneFlags,
         kthread::{
@@ -39,9 +41,12 @@ impl KernelThreadMechanism {
 
         // 使能中断
         frame.rflags |= 1 << 9;
-        frame.rip = &kernel_thread_bootstrap_stage1 as *const _ as u64;
 
-        return ProcessManager::fork(&mut frame, clone_flags);
+        frame.rip = kernel_thread_bootstrap_stage1 as usize as u64;
+
+        let pid = ProcessManager::fork(&mut frame, clone_flags)?;
+
+        return Ok(pid);
     }
 }
 
@@ -51,10 +56,11 @@ impl KernelThreadMechanism {
 ///
 /// 跳转之后，指向Box<KernelThreadClosure>的指针将传入到stage2的函数
 #[naked]
-unsafe extern "sysv64" fn kernel_thread_bootstrap_stage1() {
+pub unsafe extern "sysv64" fn kernel_thread_bootstrap_stage1() {
     asm!(
         concat!(
             "
+
             pop r15
             pop r14
             pop r13

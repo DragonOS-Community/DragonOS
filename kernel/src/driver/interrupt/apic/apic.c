@@ -361,6 +361,7 @@ void apic_local_apic_init()
  */
 int apic_init()
 {
+    cli();
     kinfo("Initializing APIC...");
     // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
     for (int i = 32; i <= 55; ++i)
@@ -402,7 +403,7 @@ int apic_init()
         kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
     }
     kinfo("APIC initialized.");
-    sti();
+    // sti();
     return 0;
 }
 /**

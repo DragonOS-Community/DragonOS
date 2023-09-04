@@ -1,8 +1,13 @@
-use super::{process::init_stdio, process_init, ProcessManager};
+use super::{kthread::kthread_init, process::init_stdio, process_init, ProcessManager};
 
 #[no_mangle]
 pub extern "C" fn rs_process_init() {
     process_init();
+}
+
+#[no_mangle]
+pub extern "C" fn rs_kthread_init() {
+    kthread_init();
 }
 
 #[no_mangle]
@@ -35,7 +40,7 @@ pub extern "C" fn rs_current_pcb_cpuid() -> u32 {
 }
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_pid() -> u32 {
-    return ProcessManager::current_pcb().basic().pid().0 as u32;
+    return ProcessManager::current_pcb().pid().0 as u32;
 }
 
 #[no_mangle]

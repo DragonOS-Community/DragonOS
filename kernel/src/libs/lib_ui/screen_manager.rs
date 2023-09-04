@@ -5,31 +5,25 @@ use core::{
 };
 
 use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
-use virtio_drivers::device;
 
 use crate::{
     driver::{
         uart::uart::{c_uart_send_str, UartPort},
         video::video_refresh_manager,
     },
-    include::bindings::bindings::scm_buffer_info_t,
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::VirtAddr,
     syscall::SystemError,
 };
 
-use lazy_static::lazy_static;
-
 use super::textui_no_alloc::textui_init_no_alloc;
 
-lazy_static! {
-    /// 全局的UI框架列表
-    pub static ref SCM_FRAMEWORK_LIST: SpinLock<LinkedList<Arc<dyn ScmUiFramework>>> =
-        SpinLock::new(LinkedList::new());
-    /// 当前在使用的UI框架
-    pub static ref CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
+/// 全局的UI框架列表
+pub static SCM_FRAMEWORK_LIST: SpinLock<LinkedList<Arc<dyn ScmUiFramework>>> =
+    SpinLock::new(LinkedList::new());
 
-}
+/// 当前在使用的UI框架
+pub static CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
 
 /// 是否启用双缓冲
 pub static SCM_DOUBLE_BUFFER_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -80,6 +74,7 @@ impl ScmBufferInfo {
         if unlikely(SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == false) {
             let mut device_buffer = video_refresh_manager().device_buffer().clone();
             buf_type.remove(ScmBufferFlag::SCM_BF_DB);
+            buf_type.insert(ScmBufferFlag::SCM_BF_FB);
             device_buffer.flags = buf_type;
             return Ok(device_buffer);
         } else {
@@ -386,7 +381,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
 /// 允许往窗口打印信息
 #[no_mangle]
 pub fn scm_enable_put_to_window() {
-    // mm之前要继续往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
+    // mm之前要继续往窗口打印信息时，因为没有动态内存分配(textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
         super::textui::ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
     } else {

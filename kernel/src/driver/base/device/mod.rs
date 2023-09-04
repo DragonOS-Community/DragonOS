@@ -18,6 +18,7 @@ use super::platform::CompatibleTable;
 
 pub mod bus;
 pub mod driver;
+pub mod init;
 
 lazy_static! {
     pub static ref DEVICE_MANAGER: Arc<LockedDeviceManager> = Arc::new(LockedDeviceManager::new());

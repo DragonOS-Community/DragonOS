@@ -1,7 +1,6 @@
 use alloc::string::String;
 
 pub mod tty_device;
-pub mod tty_driver;
 
 bitflags! {
     pub struct TtyState: u32{

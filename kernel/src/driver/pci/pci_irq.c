@@ -2,6 +2,9 @@
 #include "exception/irq.h"
 #include <common/errno.h>
 #include <common/kprint.h>
+#include "common/string.h"
+#include "mm/slab.h"
+
 // 现在pci设备的中断由自己进行控制，这些不执行内容的函数是为了适配旧的中断处理机制
 void pci_irq_enable(ul irq_num)
 {
@@ -11,7 +14,7 @@ void pci_irq_disable(ul irq_num)
 {
     
 }
-void pci_irq_install(ul irq_num)
+ul pci_irq_install(ul, void*)
 {
     
 }
@@ -42,14 +45,18 @@ uint16_t c_irq_install(ul irq_num,void (*pci_irq_handler)(ul irq_num, ul paramet
     {
         return EAGAIN;
     }
-    hardware_intr_controller* pci_interrupt_controller = kmalloc(sizeof(hardware_intr_controller),0);
-    pci_interrupt_controller->enable = pci_irq_enable;
-    pci_interrupt_controller->disable = pci_irq_disable;
-    pci_interrupt_controller->install= pci_irq_install;
-    pci_interrupt_controller->uninstall= pci_irq_uninstall;
-    if(pci_irq_ack)
+
+    hardware_intr_controller* pci_interrupt_controller =
+        (hardware_intr_controller*)kmalloc(sizeof(hardware_intr_controller), 0);
+    if (pci_interrupt_controller) {
+        pci_interrupt_controller->enable = pci_irq_enable;
+        pci_interrupt_controller->disable = pci_irq_disable;
+        pci_interrupt_controller->install = pci_irq_install;
+        pci_interrupt_controller->uninstall = pci_irq_uninstall;
         pci_interrupt_controller->ack = pci_irq_ack;
-    int namelen = sizeof(strlen(irq_name) + 1);
+        p->controller = pci_interrupt_controller;
+    }
+    size_t namelen = strlen(irq_name) + 1;
     p->irq_name = (char *)kmalloc(namelen, 0);
     memset(p->irq_name, 0, namelen);
     strncpy(p->irq_name, irq_name, namelen);
@@ -73,12 +80,12 @@ void c_irq_uninstall(ul irq_num)
     {
         kerror("irq install for pci irq: invalid irq num: %ld.", irq_num);
     }
-    if(p->irq_name!=NULL)
+    if(p->irq_name != NULL)
     {
         kfree(p->irq_name);
         p->irq_name = NULL;
     }
-    if(p->controller!=NULL)
+    if(p->controller != NULL)
     {
         kfree(p->controller);
         p->controller = NULL;

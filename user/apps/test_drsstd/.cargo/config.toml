@@ -1,0 +1,8 @@
+[build]
+target = "x86_64-unknown-dragonos"
+
+[target.'cfg(target_os = "dragonos")']
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "link-arg=-no-pie",
+]

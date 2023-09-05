@@ -1,0 +1,19 @@
+[package]
+name = "test_drsstd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "test_drsstd"
+path = "src/main.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+drstd = {git = "https://github.com/DragonOS-Community/dragonos-rs-std.git" }
+
+[profile.release]
+panic = 'abort'
+
+[profile.dev]
+panic = 'abort'

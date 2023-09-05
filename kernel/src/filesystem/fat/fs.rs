@@ -15,13 +15,13 @@ use crate::{
         file::{FileMode, FilePrivateData},
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
-    kerror,
+    kdebug, kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
     syscall::SystemError,
-    time::TimeSpec, kdebug,
+    time::TimeSpec,
 };
 
 use super::{
@@ -1174,7 +1174,7 @@ impl FATFileSystem {
         let offset: usize = self.cluster_bytes_offset(cluster) as usize;
         self.partition
             .disk()
-            .write_at(offset, zeros.len(), zeros.as_slice())?;
+            .write_at_bytes(offset, zeros.len(), zeros.as_slice())?;
         return Ok(());
     }
 }

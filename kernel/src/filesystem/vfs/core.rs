@@ -7,7 +7,7 @@ use core::{
 use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
-    driver::{disk::ahci::{self}, uart::uart_device::{self, uart_init}, base::platform::platform_bus_init},
+    driver::{disk::ahci::{self}, uart::uart_device::{self, uart_init}, base::{platform::platform_bus_init, block::disk_info::Partition}},
     filesystem::{
         devfs::DevFS,
         fat::fs::FATFileSystem,
@@ -129,14 +129,14 @@ fn do_migrate(
     let mountpoint = if r.is_err() {
         new_root_inode
             .create(mountpoint_name, FileType::Dir, 0o777)
-            .expect(format!("Failed to create '/{mountpoint_name}'").as_str())
+            .expect(format!("Failed to create '/{mountpoint_name}' in migrating").as_str())
     } else {
         r.unwrap()
     };
     // 迁移挂载点
     mountpoint
         .mount(fs.inner_filesystem())
-        .expect(format!("Failed to migrate {mountpoint_name}").as_str());
+        .expect(format!("Failed to migrate {mountpoint_name} ").as_str());
     return Ok(());
 }
 
@@ -180,7 +180,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
 #[no_mangle]
 pub extern "C" fn mount_root_fs() -> i32 {
     kinfo!("Try to mount FAT32 as root fs...");
-    let partiton: Arc<crate::filesystem::vfs::io::disk_info::Partition> =
+    let partiton: Arc<Partition> =
         ahci::get_disks_by_name("ahci_disk_0".to_string())
             .unwrap()
             .0

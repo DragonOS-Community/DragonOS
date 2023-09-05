@@ -3,7 +3,6 @@ use core::{fmt::Debug, ptr::null};
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    filesystem::vfs::io::SeekFrom,
     filesystem::vfs::{
         file::{File, FileMode},
         ROOT_INODE,
@@ -13,7 +12,7 @@ use crate::{
         ucontext::{AddressSpace, UserStack},
         VirtAddr,
     },
-    syscall::SystemError,
+    syscall::SystemError, driver::base::block::SeekFrom,
 };
 
 /// 系统支持的所有二进制文件加载器的列表

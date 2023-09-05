@@ -9,7 +9,7 @@ use alloc::{
 };
 
 use crate::{
-    filesystem::vfs::io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
+    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
@@ -21,7 +21,7 @@ use crate::{
         vec_cursor::VecCursor,
     },
     syscall::SystemError,
-    time::TimeSpec,
+    time::TimeSpec, kdebug,
 };
 
 use super::{
@@ -1424,7 +1424,7 @@ impl IndexNode for LockedFATInode {
         _mode: u32,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
-
+        kdebug!("-----------in FATINode Create()----------------");
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 

@@ -1,9 +1,12 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
+use crate::driver::base::block::block_device::{
+    BlockDevice, BlockId, BlockIter, BLK_SIZE_LOG2_LIMIT,
+};
+use crate::driver::base::block::disk_info::Partition;
+use crate::driver::base::block::SeekFrom;
 use crate::driver::base::device::{Device, DeviceType, KObject};
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
 use crate::filesystem::mbr::MbrDiskPartionTable;
-use crate::filesystem::vfs::io::device::{BlockIter, BLK_SIZE_LOG2_LIMIT};
-use crate::filesystem::vfs::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 use crate::include::bindings::bindings::verify_area;
 
 use crate::kdebug;
@@ -55,8 +58,8 @@ impl Debug for AhciDisk {
 impl AhciDisk {
     fn read_at(
         &self,
-        lba_id_start: crate::filesystem::vfs::io::device::BlockId, // 起始lba编号
-        count: usize,                                              // 读取lba的数量
+        lba_id_start: BlockId, // 起始lba编号
+        count: usize,          // 读取lba的数量
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -214,7 +217,7 @@ impl AhciDisk {
 
     fn write_at(
         &self,
-        lba_id_start: crate::filesystem::vfs::io::device::BlockId,
+        lba_id_start: BlockId,
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
@@ -408,14 +411,13 @@ impl LockedAhciDisk {
         let mut buf: Vec<u8> = Vec::new();
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
-        self.read_at(0, 1, &mut buf)?;
-
+        BlockDevice::read_at(self, 0, 1, &mut buf)?;
         // 创建 Cursor 用于按字节读取
         let mut cursor = VecCursor::new(buf);
         cursor.seek(SeekFrom::SeekCurrent(446))?;
 
         for i in 0..4 {
-            // kdebug!("infomation of partition {}:\n", i);
+            kdebug!("infomation of partition {}:\n", i);
 
             table.dpte[i].flags = cursor.read_u8()?;
             table.dpte[i].starting_head = cursor.read_u8()?;
@@ -426,7 +428,7 @@ impl LockedAhciDisk {
             table.dpte[i].starting_lba = cursor.read_u32()?;
             table.dpte[i].total_sectors = cursor.read_u32()?;
 
-            // kdebug!("dpte[i] = {:?}", table.dpte[i]);
+            kdebug!("dpte[i] = {:?}", table.dpte[i]);
         }
         table.bs_trailsig = cursor.read_u16()?;
         // kdebug!("bs_trailsig = {}", unsafe {
@@ -456,84 +458,6 @@ impl BlockDevice for LockedAhciDisk {
         9
     }
 
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        if len > buf.len() {
-            return Err(SystemError::E2BIG);
-        }
-
-        let iter = BlockIter::new_multiblock(offset, offset + len, self.blk_size_log2());
-        let multi = iter.multiblock;
-
-        // 枚举每一个range
-        for range in iter {
-            let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
-            let buf_end = range.origin_end() - offset;
-            let buf_slice = &mut buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
-            let full = multi && range.is_multi() || !multi && range.is_full();
-
-            if full {
-                // 调用 BlockDevice::read_at() 直接把引用传进去，不是把整个数组move进去
-                self.0.lock().read_at(range.lba_start, count, buf)?;
-            } else {
-                // 判断块的长度不能超过最大值
-                if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
-                    return Err(SystemError::E2BIG);
-                }
-
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
-                self.0.lock().read_at(range.lba_start, 1, &mut temp[..])?;
-
-                // 把数据从临时buffer复制到目标buffer
-                buf_slice.copy_from_slice(&temp[range.begin..range.end]);
-            }
-        }
-        return Ok(len);
-
-        // kdebug!(
-        //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
-        //     self.0
-        // );
-    }
-
-    #[inline]
-    fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        // assert!(len <= buf.len());
-        if len > buf.len() {
-            return Err(SystemError::E2BIG);
-        }
-
-        let iter = BlockIter::new_multiblock(offset, offset + len, self.blk_size_log2());
-        let multi = iter.multiblock;
-
-        for range in iter {
-            let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
-            let buf_end = range.origin_end() - offset;
-            let buf_slice = &buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
-            let full = multi && range.is_multi() || !multi && range.is_full();
-
-            if full {
-                self.0.lock().write_at(range.lba_start, count, buf_slice)?;
-            } else {
-                if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
-                    return Err(SystemError::E2BIG);
-                }
-
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
-                // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
-                self.0.lock().write_at(range.lba_start, 1, &mut temp[..])?;
-                // 把数据从临时buffer复制到目标buffer
-                temp[range.begin..range.end].copy_from_slice(&buf_slice);
-                self.0.lock().write_at(range.lba_start, 1, &temp[..])?;
-            }
-        }
-        return Ok(len);
-        //self.0.lock().write_at(lba_id_start, count, buf)
-    }
-
     fn sync(&self) -> Result<(), SystemError> {
         return self.0.lock().sync();
     }
@@ -549,5 +473,25 @@ impl BlockDevice for LockedAhciDisk {
 
     fn partitions(&self) -> Vec<Arc<Partition>> {
         return self.0.lock().partitions.clone();
+    }
+
+    #[inline]
+    fn read_at(
+        &self,
+        lba_id_start: BlockId, // 起始lba编号
+        count: usize,          // 读取lba的数量
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.0.lock().read_at(lba_id_start, count, buf)
+    }
+
+    #[inline]
+    fn write_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.0.lock().write_at(lba_id_start, count, buf)
     }
 }

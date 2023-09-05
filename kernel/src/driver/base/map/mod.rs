@@ -5,10 +5,10 @@ use super::{
     device::{
         mkdev, DeviceNumber, IdTable, KObject, BLOCKDEVS, CHARDEVS, DEVICE_MANAGER,
         DEVMAP,
-    },
+    }, block::block_device::BlockDevice,
 };
 use crate::{
-    filesystem::vfs::io::device::BlockDevice, kerror, libs::spinlock::SpinLock,
+     kerror, libs::spinlock::SpinLock,
     syscall::SystemError,
 };
 use alloc::{collections::BTreeMap,sync::Arc, vec::Vec};

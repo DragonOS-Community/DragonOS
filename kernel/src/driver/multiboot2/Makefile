@@ -1,7 +1,10 @@
-
-all: multiboot2.o
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
-multiboot2.o: multiboot2.c
-	$(CC) $(CFLAGS) -c multiboot2.c -o multiboot2.o
+.PHONY: all
+
+all: $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@

@@ -1,8 +1,10 @@
-
-all: acpi.o
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
+.PHONY: all
 
-acpi.o: acpi.c
-	$(CC) $(CFLAGS) -c acpi.c -o acpi.o
+all: $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@

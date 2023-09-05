@@ -1,7 +1,10 @@
-
-all: ata.o 
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
-ata.o: ata.c
-	$(CC) $(CFLAGS) -c ata.c -o ata.o
+.PHONY: all
+
+all: $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@

@@ -1,8 +1,10 @@
-
-all: video.o
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
+.PHONY: all
 
-video.o: video.c
-	$(CC) $(CFLAGS) -c video.c -o video.o
+all: $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@

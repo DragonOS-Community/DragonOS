@@ -10,13 +10,16 @@ use crate::{
                 platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
             },
         },
-        tty::{tty_device::TtyDevice, TtyError, TtyState},
+        tty::{tty_device::TtyDevice, TtyError},
         Driver,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        sysfs::bus::{bus_device_register, bus_driver_register},
-        vfs::{FilePrivateData, FileSystem, IndexNode, PollStatus, ROOT_INODE},
+        sysfs::{
+            bus::{bus_device_register, bus_driver_register},
+            devices::sys_device_register,
+        },
+        vfs::{FilePrivateData, FileSystem, IndexNode, PollStatus},
     },
     include::bindings::bindings::{io_in8, io_out8},
     libs::spinlock::SpinLock,
@@ -207,15 +210,15 @@ impl CharDevice for LockedUart {
     }
 }
 
-impl TtyDevice for LockedUart {
-    fn ioctl(&self, cmd: String) -> Result<(), DeviceError> {
-        //TODO 补充详细信息
-        Err(DeviceError::UnsupportedOperation)
-    }
-    fn state(&self) -> Result<TtyState, TtyError> {
-        todo!()
-    }
-}
+// impl TtyDevice for LockedUart {
+//     fn ioctl(&self, cmd: String) -> Result<(), DeviceError> {
+//         //TODO 补充详细信息
+//         Err(DeviceError::UnsupportedOperation)
+//     }
+//     fn state(&self) -> Result<TtyState, TtyError> {
+//         todo!()
+//     }
+// }
 
 impl IndexNode for LockedUart {
     fn read_at(
@@ -249,7 +252,7 @@ impl IndexNode for LockedUart {
             .fs
             .clone()
             .upgrade()
-            .expect("DevFS is not initialized inside Uart Device")
+            .expect("DevFS is not initialized inside Uart Device");
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -556,7 +559,7 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
 /// @param none
 /// @return 初始化成功，返回(),失败，返回错误码
 pub fn uart_init() -> Result<(), SystemError> {
-    LockedUart::uart_init(&UartPort::COM1, 115200).map(|e| SystemError::ENODEV);
+    LockedUart::uart_init(&UartPort::COM1, 115200).map_err(|_| SystemError::ENODEV)?;
     let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().to_name())
         .expect("uart device register error");
     UART_DEV.set_sys_info(Some(device_inode));

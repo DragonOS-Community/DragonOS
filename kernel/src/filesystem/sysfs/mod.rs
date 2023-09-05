@@ -136,10 +136,7 @@ impl SysFS {
             },
             Err(_) => panic!("SysFS: Failed to create /sys/fs"),
         }
-        // 初始化platform总线
-        crate::driver::base::platform::platform_bus_init().expect("platform bus init failed");
-        // 初始化串口
-        crate::driver::uart::uart_device::uart_init().expect("initilize uart error");
+
         return sysfs;
     }
 }

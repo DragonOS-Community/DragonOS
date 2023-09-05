@@ -6,6 +6,7 @@ use crate::filesystem::vfs::io::device::{BlockIter, BLK_SIZE_LOG2_LIMIT};
 use crate::filesystem::vfs::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 use crate::include::bindings::bindings::verify_area;
 
+use crate::kdebug;
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::mm::phys_2_virt;
 use crate::syscall::SystemError;
@@ -394,7 +395,6 @@ impl LockedAhciDisk {
                 ));
             }
         }
-
         result.0.lock().partitions = part_s;
         result.0.lock().self_ref = weak_this;
         return Ok(result);

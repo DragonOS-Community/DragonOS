@@ -35,6 +35,7 @@
 #include <driver/interrupt/apic/apic_timer.h>
 
 extern int device_init();
+ extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
 
@@ -142,10 +143,9 @@ void system_initialize()
 
     rs_jiffies_init();
     io_mfence();
-
-    io_mfence();
     vfs_init();
     device_init();
+    rs_tty_init();
     io_mfence();
     // 由于进程管理模块依赖于文件系统，因此必须在文件系统初始化完毕后再初始化进程管理模块
     // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，

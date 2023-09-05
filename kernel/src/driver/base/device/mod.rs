@@ -217,7 +217,7 @@ impl IdTable {
     /// @parameter None
     /// @return: 设备名
     pub fn to_name(&self) -> String {
-        return format!("{}:{:?}", self.0, self.1);
+        return format!("{}:{:?}", self.0, self.1.0);
     }
 
     pub fn device_number(&self) -> DeviceNumber {

@@ -1,5 +1,7 @@
 use crate::{driver::uart::uart_device::uart_init, syscall::SystemError};
 
+
+#[no_mangle]
 pub extern "C" fn device_init() -> i32{
     let result = uart_device_init();
     if result.is_err(){

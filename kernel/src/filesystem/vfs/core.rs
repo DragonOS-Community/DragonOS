@@ -7,17 +7,17 @@ use core::{
 use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
-    driver::disk::ahci::{self},
+    driver::{disk::ahci::{self}, uart::uart_device::{self, uart_init}, base::platform::platform_bus_init},
     filesystem::{
         devfs::DevFS,
         fat::fs::FATFileSystem,
         procfs::ProcFS,
         ramfs::RamFS,
-        sysfs::SysFS,
+        sysfs::{bus::sys_bus_init, SysFS, SYS_BUS_INODE, SYS_DEVICES_INODE},
         vfs::{mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::PAGE_4K_SIZE,
-    kerror, kinfo,
+    kdebug, kerror, kinfo,
     syscall::SystemError,
 };
 
@@ -65,6 +65,7 @@ pub extern "C" fn vfs_init() -> i32 {
     root_inode
         .create("sys", FileType::Dir, 0o777)
         .expect("Failed to create /sys");
+    kdebug!("dir in root:{:?}", root_inode.list());
 
     // // 创建procfs实例
     let procfs: Arc<ProcFS> = ProcFS::new();
@@ -89,6 +90,7 @@ pub extern "C" fn vfs_init() -> i32 {
 
     // 创建 sysfs 实例
     let sysfs: Arc<SysFS> = SysFS::new();
+
     // sysfs 挂载
     let _t = root_inode
         .find("sys")
@@ -101,6 +103,16 @@ pub extern "C" fn vfs_init() -> i32 {
     if root_inode.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
+    // 初始化platform总线
+    platform_bus_init().expect("platform bus init failed");
+
+
+    let _result = sys_bus_init(&SYS_BUS_INODE()).map_err(|e| return e.to_posix_errno());
+    
+    kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
+    
+
+
     return 0;
 }
 

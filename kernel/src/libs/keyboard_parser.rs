@@ -28,12 +28,12 @@ pub enum KeyFlag {
 pub struct TypeOneFSM {
     status: ScanCodeStatus,
     current_state: TypeOneFSMState,
-    tty: Arc<dyn TtyDevice>,
+    tty: Arc<TtyDevice>,
 }
 
 impl TypeOneFSM {
     #[allow(dead_code)]
-    pub fn new(tty: Arc<dyn TtyDevice>) -> Self {
+    pub fn new(tty: Arc<TtyDevice>) -> Self {
         Self {
             status: ScanCodeStatus::new(),
             current_state: TypeOneFSMState::Start,
@@ -73,7 +73,7 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<dyn TtyDevice>,
+        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         // kdebug!("the code is {:#x}\n", scancode);
         match self {
@@ -103,7 +103,7 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<dyn TtyDevice>,
+        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         //kdebug!("in handle_start the code is {:#x}\n",scancode);
         match scancode {
@@ -125,7 +125,7 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<dyn TtyDevice>,
+        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         static PAUSE_BREAK_SCAN_CODE: [u8; 6] = [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5];
         let i = match self {
@@ -150,7 +150,7 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<dyn TtyDevice>,
+        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         //0xE0
         match scancode {
@@ -292,7 +292,7 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<dyn TtyDevice>,
+        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         // 判断按键是被按下还是抬起
         let flag_make = if (scancode & (TYPE1_KEYCODE_FLAG_BREAK as u8)) > 0 {
@@ -367,9 +367,9 @@ impl TypeOneFSMState {
     }
 
     #[inline(always)]
-    fn emit(tty: &Arc<dyn TtyDevice>, ch: u8) {
+    fn emit(tty: &Arc<TtyDevice>, ch: u8) {
         // 发送到tty
-        tty.write_at(0, 1, &[ch]).ok();
+        tty.input(&[ch]).ok();
     }
 
     /// @brief 处理Prtsc按下事件
@@ -377,7 +377,7 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<dyn TtyDevice>,
+        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         static PRTSC_SCAN_CODE: [u8; 4] = [0xe0, 0x2a, 0xe0, 0x37];
         let i = match self {
@@ -405,7 +405,7 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<dyn TtyDevice>,
+        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         static PRTSC_SCAN_CODE: [u8; 4] = [0xe0, 0xb7, 0xe0, 0xaa];
         let i = match self {

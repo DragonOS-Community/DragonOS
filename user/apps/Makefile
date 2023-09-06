@@ -1,8 +1,11 @@
-
+rust_apps_dirs := test_drsstd
 user_apps_sub_dirs=shell about test_signal
 
 ECHO:
 	@echo "$@"
+
+$(rust_apps_dirs): ECHO
+	$(MAKE) -C $@ fmt
 
 $(user_apps_sub_dirs): ECHO
 
@@ -11,5 +14,5 @@ $(user_apps_sub_dirs): ECHO
 all: $(user_apps_sub_dirs)
 
 .PHONY: clean
-fmt:
+fmt: $(rust_apps_dirs)
 	@echo "格式化代码: user/apps"

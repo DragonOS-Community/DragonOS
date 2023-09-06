@@ -10,7 +10,7 @@ path = "src/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-drstd = {git = "https://github.com/DragonOS-Community/dragonos-rs-std.git" }
+drstd = {git = "https://git.mirrors.dragonos.org/DragonOS-Community/drstd.git", revision = "507ea70e05"}
 
 [profile.release]
 panic = 'abort'

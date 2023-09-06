@@ -8,7 +8,7 @@ use crate::driver::pci::pci::{
     PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,PCI_DEVICE_LINKEDLIST, get_pci_device_structure_mut,
 };
 use crate::libs::volatile::{Volatile, VolatileReadable, VolatileWritable, ReadOnly, WriteOnly};
-use crate::{kdebug, kerror, kwarn, kinfo};
+use crate::{kdebug, kinfo};
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
 use super::e1000e_driver::e1000e_driver_init;
 
@@ -110,40 +110,29 @@ impl E1000EDevice{
         let pcie_regs: NonNull<PCIeRegs> = get_register_ptr(vaddress, E1000E_PCIE_REGS_OFFSET);
         let ra_regs: NonNull<ReceiveAddressRegs> = get_register_ptr(vaddress, E1000E_RECEIVE_ADDRESS_REGS_OFFSET);
         unsafe{
-
-            let status = volread!(general_regs, status);
             let ctrl = volread!(general_regs, ctrl);
-            kdebug!("STATUS:{status}, CTRL:{ctrl}");
-
             // 关闭中断
             volwrite!(interrupt_regs, imc, 0xffffffff);
-
             //SW RESET
-            let ctrl_val = ctrl | E1000E_CTRL_RST;
-            volwrite!(general_regs, ctrl, ctrl_val);
+            volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_RST);
             compiler_fence(Ordering::AcqRel);
-
             // 关闭中断
             volwrite!(interrupt_regs, imc, 0xffffffff);
-
             let mut gcr = volread!(pcie_regs, gcr);
             gcr = gcr | (1 << 22);
             volwrite!(pcie_regs, gcr, gcr);
-
             compiler_fence(Ordering::AcqRel);
-
             // PHY Initialization
             // MAC/PHY Link Setup
-            let mut ctrl = volread!(general_regs, ctrl);
-            ctrl = ctrl | E1000E_CTRL_SLU;
-            volwrite!(general_regs, ctrl, ctrl);
-
-            let status = volread!(general_regs, status);
+            let ctrl = volread!(general_regs, ctrl);
+            volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_SLU);
+        }
+            let status = unsafe { volread!(general_regs, status) };
             kdebug!("Status: {status:#X}");
 
             // 读取设备的mac地址
-            let ral = volread!(ra_regs, ral0);
-            let rah = volread!(ra_regs, rah0);
+            let ral = unsafe { volread!(ra_regs, ral0) };
+            let rah = unsafe { volread!(ra_regs, rah0) };
             let mut mac: [u8; 6] = [0x00; 6];
             for i in 0..4{
                 mac[i] = ((ral & (0xff << (i * 8))) >> (i * 8)) as u8;
@@ -152,34 +141,44 @@ impl E1000EDevice{
                 mac[i + 4] = ((rah & (0xff << (i * 8))) >> (i * 8)) as u8
             }
             // 初始化receive和transimit descriptor环形队列
-            let (recv_ring_pa, recv_ring_va) = dma_alloc(1);
-            let (trans_ring_pa, trans_ring_va) = dma_alloc(1);
+            let (recv_ring_pa, recv_ring_va) = dma_alloc(E1000E_DMA_PAGES);
+            let (trans_ring_pa, trans_ring_va) = dma_alloc(E1000E_DMA_PAGES);
             let recv_ring_length = PAGE_SIZE / size_of::<E1000ERecvDesc>();
             let trans_ring_length = PAGE_SIZE / size_of::<E1000ETransDesc>();
 
-            let recv_desc_ring = from_raw_parts_mut::<E1000ERecvDesc
-            >(recv_ring_va.as_ptr().cast(), recv_ring_length);
-            let trans_desc_ring = from_raw_parts_mut::<E1000ETransDesc>(trans_ring_va.as_ptr().cast(), trans_ring_length);
+            let recv_desc_ring = unsafe{ from_raw_parts_mut::<E1000ERecvDesc
+            >(recv_ring_va.as_ptr().cast(), recv_ring_length) };
+            let trans_desc_ring = unsafe{ from_raw_parts_mut::<E1000ETransDesc>(trans_ring_va.as_ptr().cast(), trans_ring_length) };
 
             // 初始化receive和transmit packet的缓冲区，元素表示packet的虚拟地址，为了确保内存一致性，所有的buffer都在驱动初始化程序中分配dma内存页
             let mut recv_buffers: Vec<NonNull<u8>> = Vec::with_capacity(recv_ring_length);
             let mut trans_buffers: Vec<NonNull<u8>> = Vec::with_capacity(trans_ring_length); 
+
+            // Receive buffers of appropriate size should be allocated and pointers to these buffers should be stored in the descriptor ring.
+            for i in 0..recv_ring_length{
+                let (buffer_pa, buffer_va) = dma_alloc(E1000E_DMA_PAGES);
+                recv_desc_ring[i].addr = buffer_pa as u64;
+                recv_desc_ring[i].status = 0;
+                recv_buffers.push(buffer_va);
+            }
+            // Same as receive buffers
+            for i in 0..trans_ring_length{
+                let (buffer_pa, buffer_va) = dma_alloc(E1000E_DMA_PAGES);
+                trans_desc_ring[i].addr = buffer_pa as u64;
+                //trans_desc_ring[i].status = 0;
+                trans_buffers.push(buffer_va);
+            }
 
             // Receive Initialization
             // 初始化MTA，遍历0x05200-0x053FC中每个寄存器，写入0，一共128个寄存器
             let mut mta_adress = vaddress + E1000E_MTA_REGS_START_OFFSET;
             while mta_adress != vaddress + E1000E_MTA_REGS_END_OFFSET{
                 let mta: NonNull<MTARegs> = get_register_ptr(mta_adress, 0);
-                volwrite!(mta, mta, 0);
+                unsafe{ volwrite!(mta, mta, 0) };
                 mta_adress = mta_adress + 4;
             }
-            // Receive buffers of appropriate size should be allocated and pointers to these buffers should be stored in the descriptor ring.
-            for i in 0..recv_ring_length{
-                let (buffer_pa, buffer_va) = dma_alloc(1);
-                recv_desc_ring[i].addr = buffer_pa as u64;
-                recv_desc_ring[i].status = 0;
-                recv_buffers.push(buffer_va);
-            }
+            // 连续的寄存器读-写操作，放在同一个unsafe块中
+            unsafe{
             // Program the descriptor base address with the address of the region.
             volwrite!(receive_regs, rdbal0, (recv_ring_pa) as u32);
             volwrite!(receive_regs, rdbah0, (recv_ring_pa >> 32) as u32);
@@ -194,18 +193,12 @@ impl E1000EDevice{
             volwrite!(rctl_regs, rctl, E1000E_RCTL_EN | E1000E_RCTL_BAM | E1000E_RCTL_BSIZE_4K | E1000E_RCTL_BSEX | E1000E_RCTL_SECRC);
 
             // Enable receive interrupts
-            let mut ims = volread!(interrupt_regs, ims);
-            ims = ims | E1000E_IMS_LSC | E1000E_IMS_RXO | E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0;
-            volwrite!(interrupt_regs, ims, ims);
+            let ims = volread!(interrupt_regs, ims);
+            // ims = ims | E1000E_IMS_LSC | E1000E_IMS_RXO | E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0;
+            volwrite!(interrupt_regs, ims, ims | E1000E_IMS_LSC | E1000E_IMS_RXO | E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0);
 
             // Transmit Initialization
-            // 
-            for i in 0..trans_ring_length{
-                let (buffer_pa, buffer_va) = dma_alloc(1);
-                trans_desc_ring[i].addr = buffer_pa as u64;
-                //trans_desc_ring[i].status = 0;
-                trans_buffers.push(buffer_va);
-            }
+
             // Program the TXDCTL register with the desired TX descriptor write-back policy
             volwrite!(transimit_regs, txdctl, E1000E_TXDCTL_WTHRESH | E1000E_TXDCTL_GRAN);
             // Program the descriptor base address with the address of the region
@@ -220,74 +213,67 @@ impl E1000EDevice{
             volwrite!(tctl_regs, tipg, E1000E_TIPG_IPGT | E1000E_TIPG_IPGR1 | E1000E_TIPG_IPGR2);
             // Program the TCTL register.
             volwrite!(tctl_regs, tctl, E1000E_TCTL_EN | E1000E_TCTL_PSP | E1000E_TCTL_CT_VAL | E1000E_TCTL_COLD_VAL);
-            return Ok(E1000EDevice{
-                general_regs,
-                interrupt_regs,
-                rctl_regs,
-                receive_regs,
-                tctl_regs,
-                transimit_regs,
-                pcie_regs,
-                recv_desc_ring,
-                trans_desc_ring,
-                recv_ring_pa,
-                trans_ring_pa,
-                recv_buffers,
-                trans_buffers,
-                mac,
-                first_trans: true,
-            });
         }
-        // 开始网卡初始化流程
+        return Ok(E1000EDevice{
+            general_regs,
+            interrupt_regs,
+            rctl_regs,
+            receive_regs,
+            tctl_regs,
+            transimit_regs,
+            pcie_regs,
+            recv_desc_ring,
+            trans_desc_ring,
+            recv_ring_pa,
+            trans_ring_pa,
+            recv_buffers,
+            trans_buffers,
+            mac,
+            first_trans: true,
+        });
 
     }
     pub fn e1000e_receive(&mut self) -> Option<Vec<u8>>{
-        unsafe{
-            let mut rdt = volread!(self.receive_regs, rdt0) as usize;
-            let index = (rdt + 1) % self.recv_desc_ring.len();
-            let desc = &mut self.recv_desc_ring[index];
-            if (desc.status & E1000E_RXD_STATUS_DD) == 0 {
-                return None;
-            }
-            let buffer = from_raw_parts(self.recv_buffers[index].as_ptr() as *const u8, desc.len as usize);
-            rdt = index;
-            volwrite!(self.receive_regs, rdt0, rdt as u32);
-            kdebug!("e1000e: receive packet");
-            return Some(buffer.to_vec());
+        let mut rdt = unsafe { volread!(self.receive_regs, rdt0) } as usize;
+        let index = (rdt + 1) % self.recv_desc_ring.len();
+        let desc = &mut self.recv_desc_ring[index];
+        if (desc.status & E1000E_RXD_STATUS_DD) == 0 {
+            return None;
         }
+        let buffer = unsafe { from_raw_parts(self.recv_buffers[index].as_ptr() as *const u8, desc.len as usize) };
+        rdt = index;
+        unsafe { volwrite!(self.receive_regs, rdt0, rdt as u32) };
+        kdebug!("e1000e: receive packet");
+        return Some(buffer.to_vec());
     }
 
     pub fn e1000e_can_transmit(&self) -> bool{
-        unsafe{
-            let tdt = volread!(self.transimit_regs, tdt0) as usize;
-            //kdebug!("e1000e: tdt:{tdt}");
-            let index = tdt % self.trans_desc_ring.len();
-            let desc = &self.trans_desc_ring[index];
-            if (desc.status & E1000E_TXD_STATUS_DD) == 0 {
-                // 不知道为什么，e1000e设备没有在descriptor中回写status，所以这个函数不会返回false
-                kdebug!("dd!!");
-            }
-            true
+        let tdt = unsafe { volread!(self.transimit_regs, tdt0) } as usize;
+        //kdebug!("e1000e: tdt:{tdt}");
+        let index = tdt % self.trans_desc_ring.len();
+        let desc = &self.trans_desc_ring[index];
+        if (desc.status & E1000E_TXD_STATUS_DD) == 0 {
+            // 不知道为什么，e1000e设备没有在descriptor中回写status，所以这个函数不会返回false
+            kdebug!("dd!!");
         }
+        true
     }
 
     pub fn e1000e_transmit(&mut self, packet: &[u8]){
-        unsafe{
-            let mut tdt = volread!(self.transimit_regs, tdt0) as usize;
-            let index = tdt % self.trans_desc_ring.len();
-            let desc = &mut self.trans_desc_ring[index];
-            // Copy data from packet to transmit buffer
-            kdebug!("addr:{:#x}", self.trans_buffers[index].as_ptr() as u64);
-            let buffer = from_raw_parts_mut(self.trans_buffers[index].as_ptr(), packet.len());
-            buffer.copy_from_slice(packet);
-            // Set the transmit descriptor
-            desc.len = packet.len() as u16;
-            //desc.status = 0;
-            desc.cmd = E1000E_TXD_CMD_EOP | E1000E_TXD_CMD_RS | E1000E_TXD_CMD_IFCS;
-            tdt = (tdt + 1) % self.trans_desc_ring.len();
-            volwrite!(self.transimit_regs, tdt0, tdt as u32);
-            self.first_trans = false;
-        }   
+        let mut tdt = unsafe{ volread!(self.transimit_regs, tdt0) } as usize;
+        let index = tdt % self.trans_desc_ring.len();
+        let desc = &mut self.trans_desc_ring[index];
+        // Copy data from packet to transmit buffer
+        kdebug!("addr:{:#x}", self.trans_buffers[index].as_ptr() as u64);
+        let buffer = unsafe{ from_raw_parts_mut(self.trans_buffers[index].as_ptr(),packet.len()) };
+        buffer.copy_from_slice(packet);
+        // Set the transmit descriptor
+        desc.len = packet.len() as u16;
+        //desc.status = 0;
+        desc.cmd = E1000E_TXD_CMD_EOP | E1000E_TXD_CMD_RS | E1000E_TXD_CMD_IFCS;
+        tdt = (tdt + 1) % self.trans_desc_ring.len();
+        unsafe{ volwrite!(self.transimit_regs, tdt0, tdt as u32) };
+        self.first_trans = false; 
     }
     pub fn mac_address(&self) -> [u8; 6]{
         return self.mac;
@@ -302,14 +288,14 @@ impl Drop for E1000EDevice{
         let trans_ring_length = PAGE_SIZE / size_of::<E1000ETransDesc>();
         unsafe{
             for i in 0..recv_ring_length{
-                dma_dealloc(self.recv_desc_ring[i].addr as usize, self.recv_buffers[i], 1);
+                dma_dealloc(self.recv_desc_ring[i].addr as usize, self.recv_buffers[i], E1000E_DMA_PAGES);
             }
             for i in 0..trans_ring_length{
-                dma_dealloc(self.trans_desc_ring[i].addr as usize, self.trans_buffers[i], 1);
+                dma_dealloc(self.trans_desc_ring[i].addr as usize, self.trans_buffers[i], E1000E_DMA_PAGES);
             }
             // 释放descriptor ring
-            dma_dealloc(self.recv_ring_pa, NonNull::new(self.recv_desc_ring).unwrap().cast(), 1);
-            dma_dealloc(self.trans_ring_pa, NonNull::new(self.trans_desc_ring).unwrap().cast(), 1);
+            dma_dealloc(self.recv_ring_pa, NonNull::new(self.recv_desc_ring).unwrap().cast(), E1000E_DMA_PAGES);
+            dma_dealloc(self.trans_ring_pa, NonNull::new(self.trans_desc_ring).unwrap().cast(), E1000E_DMA_PAGES);
         }
 
         
@@ -473,13 +459,6 @@ const E1000E_IMS_RXO: u32 = 1 << 6;
 const E1000E_IMS_RXT0: u32 = 1 << 7;
 const E1000E_IMS_RXQ0: u32 = 1 << 20;
 
-// MDIC
-const E1000E_MDIC_OP_W: u32 = 1 << 26;
-const E1000E_MDIC_OP_R: u32 = 1 << 27;
-const E1000E_MDIC_READY: u32 = 1 << 28;
-const E1000E_MDIC_INTERRUPT: u32 = 1 << 29;
-const E1000E_MDIC_ERROR: u32 = 1 << 30;
-
 // RCTL
 const E1000E_RCTL_EN: u32 = 1 << 1;
 const E1000E_RCTL_BAM: u32 = 1 << 15;
@@ -532,73 +511,7 @@ impl From<PciError> for E1000EPciError {
     }
 }
 
-// 用于读写PHY内部寄存器MDI方法，因为驱动还不支持手动设置参数，暂时不需要使用
-enum MDIError{
-    // MDIC bit 30 is set to 1b by hardware when it fails to complete an MDI read 
-    MDIReadFailed,
-    // MDIC bit 28 is set to 1b by hardware at the end of the MDI transaction
-    MDINotReady,
-    // PHY register address is too large
-    MDIRegAddrOutOfRange,
-    // Write data is too large
-    MDIWriteDataOutOfRange,
-}
 
 fn get_register_ptr<T>(vaddr: u64, offset: u64) -> NonNull<T>{
     NonNull::new((vaddr + offset) as *mut T).unwrap()
-}
-
-unsafe fn mdi_write(regs: NonNull<GeneralRegs>, reg_addr: u32, data: u32) -> Result<(), MDIError>{
-    let mut mdic = volread!(regs, mdic);
-    if (data >> 16) != 0 {
-        return Err(MDIError::MDIWriteDataOutOfRange);
-    }
-    if (reg_addr >> 5) != 0{
-        return Err(MDIError::MDIRegAddrOutOfRange);
-    }
-    if (mdic & E1000E_MDIC_READY) == 0{
-        return Err(MDIError::MDINotReady);
-    }
-    // clear the ready bit
-    mdic = mdic & (!E1000E_MDIC_READY);
-    // clear the error bit
-    mdic = mdic & (!E1000E_MDIC_ERROR);
-    // clear the data and regaddr field
-    mdic = (mdic >> 21) << 21;
-    // set the regaddr field
-    mdic = mdic | (reg_addr << 16);
-    // set the data field
-    mdic = mdic | data;
-    // set the op field
-    mdic = mdic | E1000E_MDIC_OP_W;
-
-    volwrite!(regs, mdic, mdic);
-    // wait 64 microseconds for the command to complete
-    return Ok(());
-}
-
-unsafe fn mdi_read(regs: NonNull<GeneralRegs>, reg_addr: u32) -> Result<u16, MDIError>{
-    let mut mdic = volread!(regs, mdic);
-    if (mdic & E1000E_MDIC_READY) == 0{
-        return Err(MDIError::MDINotReady);
-    }
-    // clear the ready bit
-    mdic = mdic & (!E1000E_MDIC_READY);
-    // clear the error bit
-    mdic = mdic & (!E1000E_MDIC_ERROR);
-    // clear the data and regaddr field
-    mdic = (mdic >> 21) << 21;
-    // set the regaddr field
-    mdic = mdic | (reg_addr << 16);
-    // set the op field
-    mdic = mdic | E1000E_MDIC_OP_R;
-
-    volwrite!(regs, mdic, mdic);
-    // wait 64 microseconds for the command to complete
-    mdic = volread!(regs, mdic);
-    if (mdic & E1000E_MDIC_ERROR) == 0{
-        return Err(MDIError::MDIReadFailed);
-    }
-    let data = (mdic & 0xffff) as u16;
-    return Ok(data)
 }

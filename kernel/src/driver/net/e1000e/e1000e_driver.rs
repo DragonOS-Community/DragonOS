@@ -110,7 +110,6 @@ impl Device for E1000EDriver{
     fn receive(&mut self, _timestamp: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         match self.inner.lock().e1000e_receive(){
             Some(buffer) => {
-                kdebug!("get");
                 Some((
                 E1000ERxToken(buffer), 
                 E1000ETxToken{driver: self.clone()}
@@ -125,7 +124,6 @@ impl Device for E1000EDriver{
         match self.inner.lock().e1000e_can_transmit(){
             true => Some(E1000ETxToken{driver: self.clone()}),
             false => {
-                kdebug!("cannot trans now");
                 None
             }
         } 

@@ -29,25 +29,28 @@ impl Syscall {
     /// - `fd`: 用于返回文件描述符的数组
     /// - `flags`:设置管道的参数
     pub fn pipe2(fd: *mut i32, flags: FileMode) -> Result<usize, SystemError> {
-        let pipe_ptr = LockedPipeInode::new(flags);
-        let mut read_file = File::new(pipe_ptr.clone(), FileMode::O_RDONLY)?;
-        let mut write_file = File::new(pipe_ptr.clone(), FileMode::O_WRONLY)?;
-        if flags.contains(FileMode::O_CLOEXEC) {
-            read_file.set_close_on_exec(true);
-            write_file.set_close_on_exec(true);
-        }
-        let read_fd = current_pcb().alloc_fd(read_file, None)?;
-        let write_fd = current_pcb().alloc_fd(write_file, None)?;
-        match UserBufferWriter::new(fd, core::mem::size_of::<[c_int; 2]>(), true) {
-            Err(e) => Err(e),
-            Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
-                Err(e) => Err(e),
-                Ok(fd) => {
-                    fd[0] = read_fd;
-                    fd[1] = write_fd;
-                    Ok(0)
-                }
-            },
+        if flags.contains(FileMode::O_NONBLOCK)
+            || flags.contains(FileMode::O_CLOEXEC)
+            || flags.contains(FileMode::O_RDONLY)
+        {
+            let mut user_buffer =
+                UserBufferWriter::new(fd, core::mem::size_of::<[c_int; 2]>(), true)?;
+            let fd = user_buffer.buffer::<i32>(0)?;
+            let pipe_ptr = LockedPipeInode::new(flags);
+            let mut read_file = File::new(pipe_ptr.clone(), FileMode::O_RDONLY)?;
+            let mut write_file = File::new(pipe_ptr.clone(), FileMode::O_WRONLY)?;
+            if flags.contains(FileMode::O_CLOEXEC) {
+                read_file.set_close_on_exec(true);
+                write_file.set_close_on_exec(true);
+            }
+            let read_fd = current_pcb().alloc_fd(read_file, None)?;
+            let write_fd = current_pcb().alloc_fd(write_file, None)?;
+
+            fd[0] = read_fd;
+            fd[1] = write_fd;
+            Ok(0)
+        } else {
+            Err(SystemError::EINVAL)
         }
     }
     pub fn kill(pid: pid_t, sig: c_int) -> Result<usize, SystemError> {

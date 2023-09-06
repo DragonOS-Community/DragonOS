@@ -658,14 +658,7 @@ impl Syscall {
                     Err(SystemError::EFAULT)
                 } else {
                     let flags = FileMode::from_bits_truncate(arg1 as u32);
-                    if flags.contains(FileMode::O_NONBLOCK)
-                        || flags.contains(FileMode::O_CLOEXEC)
-                        || flags.contains(FileMode::O_RDONLY)
-                    {
-                        Self::pipe2(pipefd, flags)
-                    } else {
-                        Err(SystemError::EINVAL)
-                    }
+                    Self::pipe2(pipefd, flags)
                 }
             }
 

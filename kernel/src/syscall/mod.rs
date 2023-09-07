@@ -304,6 +304,7 @@ pub enum SystemError {
     EVMREADFailed = 134,
     EVMPRTLDFailed = 135,
     EVMLAUNCHFailed = 136,
+    KVM_HVA_ERR_BAD = 137,
 }
 
 impl SystemError {

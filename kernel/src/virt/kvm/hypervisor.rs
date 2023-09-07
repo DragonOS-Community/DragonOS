@@ -20,6 +20,7 @@ pub struct Hypervisor {
     pub host_stack: Vec<u8>,
     pub mem_slots_num: u64,
     pub memslots: [KvmMemorySlots; KVM_ADDRESS_SPACE_NUM],
+    pub arch: KVMArch,
     // 	vm_fd: u32,  	/* For VM ioctls() */
 //     timerid: u32,   /* Posix timer for interrupts */
 //     mem_slots: u32, /* for KVM_SET_USER_MEMORY_REGION */
@@ -151,7 +152,7 @@ impl Hypervisor {
             self.memslots[as_id as usize].memslots[id as usize] = new_slot;
             self.memslots[as_id as usize].used_slots += 1;
             // KVMArch::kvm_arch_create_memslot(&mut new_slot, npages);
-            kvm_arch_commit_memory_region(&new_slot, change)?;
+            KVMArch::kvm_arch_commit_memory_region(mem, &new_slot, old_slot, change)?;
         }
         // TODO--KvmMemoryChange::Delete & Move
         

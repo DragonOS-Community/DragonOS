@@ -34,6 +34,9 @@ use core::mem::{self};
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
+use super::kvm::vmx::vmcs::VmcsFields;
+use super::kvm::vmx::vmx_asm_wrapper::vmx_vmread;
+
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
@@ -169,12 +172,22 @@ impl MemoryManagementArch for X86_64MMArch {
     }
 
     /// @brief 获取顶级页表的物理地址
-    unsafe fn table(_table_kind: PageTableKind) -> PhysAddr {
-        let paddr: usize;
-        compiler_fence(Ordering::SeqCst);
-        asm!("mov {}, cr3", out(reg) paddr, options(nomem, nostack, preserves_flags));
-        compiler_fence(Ordering::SeqCst);
-        return PhysAddr::new(paddr);
+    unsafe fn table(table_kind: PageTableKind) -> PhysAddr {
+        match table_kind {
+            PageTableKind::Kernel | PageTableKind::User=> {
+                let paddr: usize;
+                compiler_fence(Ordering::SeqCst);
+                asm!("mov {}, cr3", out(reg) paddr, options(nomem, nostack, preserves_flags));
+                compiler_fence(Ordering::SeqCst);
+                return PhysAddr::new(paddr);
+            }
+            PageTableKind::EPT => {
+                let eptp = vmx_vmread(VmcsFields::CTRL_EPTP_PTR as u32)
+                                    .expect("Failed to read eptp");
+                return PhysAddr::new(eptp as usize);
+            }
+        }
+        
     }
 
     /// @brief 设置顶级页表的物理地址到处理器中

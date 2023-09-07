@@ -4,6 +4,7 @@ use x86::{
 };
 use raw_cpuid::CpuId;
 use x86;
+use crate::arch::mm::LockedFrameAllocator;
 use crate::virt::kvm::{GUEST_STACK_SIZE, HOST_STACK_SIZE};
 use crate::{kdebug, printk_color, GREEN, BLACK};
 use alloc::boxed::Box;
@@ -13,11 +14,12 @@ use core::arch::asm;
 use core::slice;
 use crate::libs::mutex::Mutex;
 use crate::arch::MMArch;
-use crate::mm::MemoryManagementArch;
+use crate::mm::{MemoryManagementArch, PageTableKind};
 use crate::mm::{VirtAddr, phys_2_virt};
 use crate::syscall::SystemError;
 use crate::virt::kvm::hypervisor::Hypervisor;
 use crate::virt::kvm::vcpu::Vcpu;
+use super::mmu::{KvmMmu, KvmMmuMemoryCache};
 use super::vmexit::vmx_return;
 use super::vmcs::{VMCSRegion, VmcsFields, 
     VmxEntryCtrl, VmxPrimaryExitCtrl,
@@ -66,6 +68,21 @@ pub struct VmxVcpu {
     hypervisor: Arc<Mutex<Hypervisor>>,		/* parent KVM */
     host_stack: Vec<u8>,
     guest_stack: Vec<u8>,
+    /*
+	 * Paging state of the vcpu
+	 *
+	 * If the vcpu runs in guest mode with two level paging this still saves
+	 * the paging mode of the l1 guest. This context is always used to
+	 * handle faults.
+	 */
+     pub mmu: KvmMmu,
+     // 用于分配 pte_list_desc ，它是反向映射链表 parent_ptes 的链表项，在 mmu_set_spte => rmap_add => pte_list_add 中分配
+    //  mmu_pte_list_desc_cache: KvmMmuMemoryCache,
+     //  用于分配 page ，作为 kvm_mmu_page.spt
+    //  mmu_page_cache: KvmMmuMemoryCache,
+     // // 用于分配 kvm_mmu_page ，作为页表页
+     pub mmu_page_header_cache: KvmMmuMemoryCache,
+
 }
 
 impl VcpuData {
@@ -162,6 +179,7 @@ impl VmxVcpu {
             hypervisor: hypervisor,
             host_stack: vec![0xCC; HOST_STACK_SIZE],
             guest_stack: vec![0xCC; GUEST_STACK_SIZE],
+            mmu: Default::default(),
         })
     }
 
@@ -380,7 +398,8 @@ impl Vcpu for VmxVcpu {
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32, x86::bits64::registers::rsp())?;
         // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32,  x86::bits64::registers::rsp())?;
-        
+        self.kvm_mmu_load();
+
         match vmx_vmlaunch() {
             Ok(_) => {},
             Err(e) => {
@@ -400,6 +419,22 @@ impl Vcpu for VmxVcpu {
     /// Gets the index of the current logical/virtual processor
     fn id(&self) -> u32 {
         self.index
+    }
+}
+
+impl VmxVcpu {
+    fn kvm_mmu_load(&self) -> Result<(), SystemError> {
+        // 申请并创建新的页表
+        let mut mapper: crate::mm::page::PageMapper<MMArch, &mut LockedFrameAllocator<MMArch>> = unsafe {
+            crate::mm::page::PageMapper::<MMArch, _>::create(
+                PageTableKind::EPT,
+                LockedFrameAllocator,
+            )
+            .ok_or(SystemError::ENOMEM)?
+        };
+        let ept_root_hpa = mapper.table().phys();
+        self.mmu.set_tdp_eptp(ept_root_hpa);
+        return Ok(());
     }
 }
 pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u16) -> u64{

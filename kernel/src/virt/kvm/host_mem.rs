@@ -1,3 +1,8 @@
+use crate::{arch::{kvm::vmx::vcpu::PAGE_SIZE, MMArch}, syscall::SystemError, mm::{VirtAddr, kernel_mapper::KernelMapper, page::PageFlags}};
+
+use super::{vcpu::Vcpu, KVM};
+
+
 /*
  * Address types:
  *
@@ -16,6 +21,17 @@ pub const KVM_ADDRESS_SPACE_NUM:usize = 2;
 pub const KVM_MEM_LOG_DIRTY_PAGES:u32 = 1 << 0;
 pub const KVM_MEM_READONLY:u32 = 1 << 1;
 pub const KVM_MEM_MAX_NR_PAGES :u32 = (1 << 31) -1;
+
+/*
+ * The bit 16 ~ bit 31 of kvm_memory_region::flags are internally used
+ * in kvm, other bits are visible for userspace which are defined in
+ * include/linux/kvm_h.
+ */
+pub const  KVM_MEMSLOT_INVALID:u32 = (1 << 16);
+pub const  KVM_MEMSLOT_INCOHERENT:u32 = (1 << 17);
+
+pub const KVM_PERMILLE_MMU_PAGES: u32 = 20; //  the proportion of MMU pages required per thousand (out of 1000) memory pages.
+pub const KVM_MIN_ALLOC_MMU_PAGES: u32 = 64;
 
 pub const PAGE_SHIFT:u32 = 12;
 #[repr(C)]
@@ -66,3 +82,79 @@ impl Default for KvmUserspaceMemoryRegion {
     }
 }
 
+pub fn kvm_vcpu_memslots(vcpu: &mut dyn Vcpu) -> &mut KvmMemorySlots{
+    let kvm = KVM();
+    let as_id = vcpu.as_id;
+    return &mut kvm.memslots[as_id];
+}
+
+fn __gfn_to_memslot(slots: &mut KvmMemorySlots, gfn: u64) -> Option<&KvmMemorySlot>{
+    // TODO: 使用二分查找的方式优化
+    for i in 0..slots.used_slots {
+        let memslot = &slots.memslots[i as usize];
+        if gfn >= memslot.base_gfn && gfn < memslot.base_gfn + memslot.npages {
+            return Some(memslot);
+        }
+    }
+    return None;
+}
+
+fn __gfn_to_hva(slot: &KvmMemorySlot, gfn: u64) -> u64{
+    return slot.userspace_addr + (gfn-slot.base_gfn) * PAGE_SIZE;
+}
+fn __gfn_to_hva_many(slot: &KvmMemorySlot, gfn: u64, nr_pages: &mut u64, write: bool) -> Result<u64, SystemError>{
+    if !slot || slot.flags & KVM_MEMSLOT_INVALID {
+        return Err(SystemError::KVM_HVA_ERR_BAD);
+    }
+    
+    if (slot.flags & KVM_MEM_READONLY) && write {
+        return Err(SystemError::KVM_HVA_ERR_BAD);
+    }
+    
+    if nr_pages {
+        *nr_pages = slot.npages - (gfn - slot.base_gfn);
+    }
+    return Ok(__gfn_to_hva(slot, gfn));
+}
+
+/* From Linux kernel
+ * Pin guest page in memory and return its pfn.
+ * @addr: host virtual address which maps memory to the guest
+ * @atomic: whether this function can sleep
+ * @async: whether this function need to wait IO complete if the
+ *         host page is not in the memory
+ * @write_fault: whether we should get a writable host page
+ * @writable: whether it allows to map a writable host page for !@write_fault
+ *
+ * The function will map a writable host page for these two cases:
+ * 1): @write_fault = true
+ * 2): @write_fault = false && @writable, @writable will tell the caller
+ *     whether the mapping is writable.
+ */
+// 计算 HVA 对应的 pfn，同时确保该物理页在内存中
+// host端虚拟地址到物理地址的转换，有两种方式，hva_to_pfn_fast、hva_to_pfn_slow
+// 正确性待验证
+fn hva_to_pfn(addr: u64, atomic: bool, writable: &mut bool) -> Result<u64, SystemError>{
+    // let hpa = MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() as u64;
+    let hva = VirtAddr::new(addr);
+    let mapper = KernelMapper::lock();
+    if let Some(hpa) = mapper.translate(hva){
+        return Ok(hpa >> PAGE_SHIFT);
+    }
+    unsafe{
+        mapper.map(hva, PageFlags::mmio_flags())?;
+    }
+    let hpa = mapper.translate(hva)?;
+    return Ok(hpa >> PAGE_SHIFT);
+}
+
+pub fn __gfn_to_pfn(slot: &KvmMemorySlot, gfn: u64, atomic: bool, write: bool, writable: &mut bool) -> Result<u64, SystemError>{
+    let addr = __gfn_to_hva_many(slot, gfn, None, write)?;
+    let pfn = hva_to_pfn(addr, atomic, writable)?;
+    return Ok(pfn);
+}
+
+
+pub fn kvm_vcpu_gfn_to_memslot(vcpu: &mut dyn Vcpu, gfn: u64) ->Option<&KvmMemorySlot>{
+    return __gfn_to_memslot(kvm_vcpu_memslots(vcpu), gfn);    
+}

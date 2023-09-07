@@ -1,5 +1,6 @@
 use core::arch::asm;
 
+use alloc::collections::LinkedList;
 use raw_cpuid::CpuId;
 use crate::virt::kvm::host_mem::{KvmMemorySlot, KvmUserspaceMemoryRegion, KvmMemoryChange};
 use crate::{
@@ -10,12 +11,26 @@ use crate::{
 // use crate::virt::kvm::guest_code;
 use crate::virt::kvm::{HOST_STACK_SIZE, GUEST_STACK_SIZE};
 use crate::virt::kvm::KVM;
+use self::vmx::mmu::{kvm_mmu_calculate_mmu_pages, KvmMmuPage};
 use self::vmx::vcpu::VmxVcpu;
 use crate::virt::kvm::vcpu::Vcpu;
 use alloc::boxed::Box;
 pub mod vmx;
 
-pub struct X86_64KVMArch;
+pub const KVM_MMU_HASH_SHIFT: u32 = 10;
+pub const KVM_NUM_MMU_PAGES: u32 = 1 << KVM_MMU_HASH_SHIFT;
+pub const KVM_NR_MEM_OBJS:u32 = 40;
+
+pub struct X86_64KVMArch {
+    n_used_mmu_pages: u32,
+    n_requested_mmu_pages: u32, 
+    n_max_mmu_pages: u32,
+    mmu_valid_gen: u64,
+    // mmu_page_hash:[],
+    active_mmu_pages: LinkedList<KvmMmuPage>, // 所有分配的mmu page都挂到active_mmu_pages上
+    zapped_obsolete_pages: LinkedList<KvmMmuPage>, // 释放的mmu page都挂到zapped_obsolete_pages上,一个全局的invalid_list
+}
+
 
 impl X86_64KVMArch{
     /// @brief 查看CPU是否支持虚拟化
@@ -68,6 +83,11 @@ impl X86_64KVMArch{
         return Ok(vcpu);
     }
     
+    pub fn kvm_arch_vcpu_setup(vcpu: &mut dyn Vcpu) -> Result<(), SystemError> {
+        // TODO: kvm_vcpu_mtrr_init(vcpu);
+        kvm_mmu_setup(vcpu);
+        Ok(())
+    }
     pub fn kvm_arch_create_memslot(slot: &mut KvmMemorySlot, npages: u64) {
 
     }
@@ -77,7 +97,14 @@ impl X86_64KVMArch{
         new_slot: &KvmMemorySlot, 
         old_slot: &KvmMemorySlot,
         change: KvmMemoryChange) {
-        
+            let kvm = KVM();
+            let mut num_mmu_pages = 0;
+            if !kvm.arch.n_requested_mmu_pages {
+		        num_mmu_pages = kvm_mmu_calculate_mmu_pages();
+            }
+            if num_mmu_pages {
+                kvm_mmu_change_mmu_pages(num_mmu_pages);
+            }
     }
 }
 

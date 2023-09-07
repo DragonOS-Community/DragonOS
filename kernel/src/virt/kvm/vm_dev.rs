@@ -150,7 +150,7 @@ impl IndexNode for LockedVmInode {
             },
             KVM_CREATE_VCPU => {
                 kdebug!("kvm_vcpu ioctl KVM_CREATE_VCPU");
-                kvm_vm_ioctl_create_vcpu()
+                kvm_vm_ioctl_create_vcpu(data)
             },
             KVM_SET_USER_MEMORY_REGION => {
                 kdebug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
@@ -206,8 +206,9 @@ impl IndexNode for LockedVmInode {
     }
 }
 
-fn kvm_vm_ioctl_create_vcpu() -> Result<usize, SystemError>{
+fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
     let vcpu = KVMArch::kvm_arch_vcpu_create(0);
+    KVMArch::kvm_arch_vcpu_setup(&vcpu.unwrap());
 
     KVM().lock().vcpu.push(vcpu.unwrap());
     KVM().lock().nr_vcpus += 1;

@@ -4,7 +4,7 @@ use alloc::{string::String, vec::Vec};
 
 use super::{Pid, ProcessManager, ProcessState};
 use crate::{
-    arch::{asm::current::current_pcb, interrupt::TrapFrame},
+    arch::interrupt::TrapFrame,
     filesystem::vfs::MAX_PATHLEN,
     include::bindings::bindings::pid_t,
     syscall::{
@@ -12,9 +12,7 @@ use crate::{
         Syscall, SystemError,
     },
 };
-extern "C" {
-    fn c_sys_wait4(pid: pid_t, wstatus: *mut c_int, options: c_int, rusage: *mut c_void) -> c_int;
-}
+
 
 impl Syscall {
     pub fn execve(

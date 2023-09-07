@@ -73,17 +73,4 @@ ul do_put_string(char *s, uint32_t front_color, uint32_t background_color)
     return 0;
 }
 
-/**
- * @brief 等待进程退出
- *
- * @param pid 目标进程id
- * @param status 返回的状态信息
- * @param options 等待选项
- * @param rusage
- * @return uint64_t
- */
-uint64_t c_sys_wait4(pid_t pid, int *status, int options, void *rusage)
-{
 
-    return 0;
-}

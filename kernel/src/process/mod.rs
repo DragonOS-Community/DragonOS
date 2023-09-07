@@ -577,7 +577,6 @@ impl Drop for ProcessControlBlock {
         unsafe { ProcessManager::release(self.basic().pid()) };
     }
 }
-
 /// 进程的基本信息
 ///
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。

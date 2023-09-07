@@ -587,7 +587,7 @@ impl Syscall {
             }
             SYS_WAIT4 => {
                 let pid = args[0] as pid_t;
-                let wstatus = args[1] as *mut c_int;
+                let wstatus = args[1] as *mut i32;
                 let options = args[2] as c_int;
                 let rusage = args[3] as *mut c_void;
                 let virt_wstatus = VirtAddr::new(wstatus as usize);

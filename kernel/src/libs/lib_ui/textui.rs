@@ -272,7 +272,9 @@ impl TextuiBuf<'_> {
         match &buf.buf {
             ScmBuffer::DeviceBuffer(vaddr) => {
                 return TextuiBuf {
-                    buf: Some(unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len) }),
+                    buf: Some(unsafe {
+                        core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len)
+                    }),
                     guard: None,
                 };
             }
@@ -395,13 +397,12 @@ impl TextuiCharChromatic {
 
         let buf_width = video_refresh_manager().device_buffer().width();
         // 找到输入缓冲区的起始地址位置
-        let buf_start = if let ScmBuffer::DeviceBuffer(vaddr) =
-            video_refresh_manager().device_buffer().buf
-        {
-            vaddr
-        } else {
-            panic!("device buffer is not init");
-        };
+        let buf_start =
+            if let ScmBuffer::DeviceBuffer(vaddr) = video_refresh_manager().device_buffer().buf {
+                vaddr
+            } else {
+                panic!("device buffer is not init");
+            };
 
         let mut testbit: u32; // 用来测试特定行的某列是背景还是字体本身
 
@@ -905,11 +906,10 @@ impl ScmUiFramework for &mut TextUiFramework {
     }
     // 改变ui框架的帧缓冲区的回调函数
     fn change(&self, buf_info: ScmBufferInfo) -> Result<i32, SystemError> {
-
         let old_buf = textui_framework().metadata.buf_info();
-        
+
         textui_framework().metadata.set_buf_info(buf_info);
-        
+
         let mut new_buf = textui_framework().metadata.buf_info();
 
         new_buf.copy_from_nonoverlapping(&old_buf);

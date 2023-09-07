@@ -24,7 +24,8 @@ use crate::{
         align::AlignedBox,
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::{SpinLock, SpinLockGuard}, wait_queue::WaitQueue,
+        spinlock::{SpinLock, SpinLockGuard},
+        wait_queue::WaitQueue,
     },
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
@@ -363,7 +364,7 @@ pub struct ProcessControlBlock {
     children: RwLock<HashMap<Pid, Arc<ProcessControlBlock>>>,
 
     /// 等待队列
-    wait_queue: WaitQueue
+    wait_queue: WaitQueue,
 }
 
 impl ProcessControlBlock {
@@ -421,7 +422,7 @@ impl ProcessControlBlock {
             arch_info,
             parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(HashMap::new()),
-            wait_queue:WaitQueue::INIT,
+            wait_queue: WaitQueue::INIT,
         };
 
         let pcb = Arc::new(pcb);

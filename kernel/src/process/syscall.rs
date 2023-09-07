@@ -8,11 +8,10 @@ use crate::{
     filesystem::vfs::MAX_PATHLEN,
     include::bindings::bindings::pid_t,
     syscall::{
-        user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
+        user_access::{check_and_clone_cstr, check_and_clone_cstr_array, UserBufferWriter, UserBufferReader},
         Syscall, SystemError,
     },
 };
-
 
 impl Syscall {
     pub fn execve(
@@ -42,10 +41,16 @@ impl Syscall {
 
     pub fn wait4(
         pid: pid_t,
-        wstatus: *mut c_int,
+        wstatus: *mut i32,
         options: i32,
-        _rusage: *mut c_void,
+        rusage: *mut c_void,
     ) -> Result<usize, SystemError> {
+        let mut _rusage_buf =
+            UserBufferReader::new::<c_void>(rusage, core::mem::size_of::<c_void>(), true)?;
+
+        let mut wstatus_buf =
+            UserBufferWriter::new::<i32>(wstatus, core::mem::size_of::<i32>(), true)?;
+
         // 暂时不支持options选项
         if options != 0 {
             return Err(SystemError::EINVAL);
@@ -75,11 +80,10 @@ impl Syscall {
             // 等待任意子进程
             rd_childen.iter().for_each(|x| x.1.wait_queue.sleep());
         }
-
         // 获取退出码
         if let ProcessState::Exited(status) = child_proc.unwrap().sched_info().state() {
             if !wstatus.is_null() {
-                unsafe { *wstatus = status as i32 };
+                wstatus_buf.copy_one_to_user(&status, 0)?;
             }
         }
 

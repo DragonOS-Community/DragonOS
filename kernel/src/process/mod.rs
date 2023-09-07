@@ -1,5 +1,4 @@
 use core::{
-    ffi::c_void,
     hash::{Hash, Hasher},
     intrinsics::unlikely,
     mem::ManuallyDrop,
@@ -25,7 +24,7 @@ use crate::{
         align::AlignedBox,
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::{SpinLock, SpinLockGuard},
+        spinlock::{SpinLock, SpinLockGuard}, wait_queue::WaitQueue,
     },
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
@@ -201,6 +200,7 @@ impl ProcessManager {
         pcb.sched_info
             .write()
             .set_state(ProcessState::Exited(exit_code));
+        pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
         drop(pcb);
         drop(irq_guard);
         ProcessManager::exit_notify();
@@ -361,6 +361,9 @@ pub struct ProcessControlBlock {
 
     /// 子进程链表
     children: RwLock<HashMap<Pid, Arc<ProcessControlBlock>>>,
+
+    /// 等待队列
+    wait_queue: WaitQueue
 }
 
 impl ProcessControlBlock {
@@ -418,6 +421,7 @@ impl ProcessControlBlock {
             arch_info,
             parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(HashMap::new()),
+            wait_queue:WaitQueue::INIT,
         };
 
         let pcb = Arc::new(pcb);
@@ -551,7 +555,6 @@ impl ProcessControlBlock {
 
                 return Ok(());
             }
-            // FIXME 没有找到1号进程返回什么错误码
             _ => Err(SystemError::ECHILD),
         }
     }

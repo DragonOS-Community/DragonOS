@@ -2,9 +2,9 @@ use core::ffi::{c_int, c_void};
 
 use alloc::{string::String, vec::Vec};
 
-use super::{Pid, ProcessManager};
+use super::{Pid, ProcessManager, ProcessState};
 use crate::{
-    arch::interrupt::TrapFrame,
+    arch::{asm::current::current_pcb, interrupt::TrapFrame},
     filesystem::vfs::MAX_PATHLEN,
     include::bindings::bindings::pid_t,
     syscall::{
@@ -45,17 +45,48 @@ impl Syscall {
     pub fn wait4(
         pid: pid_t,
         wstatus: *mut c_int,
-        options: c_int,
-        rusage: *mut c_void,
+        options: i32,
+        _rusage: *mut c_void,
     ) -> Result<usize, SystemError> {
-        // TODO 将c_sys_wait4使用rust实现
-        let ret = unsafe { c_sys_wait4(pid, wstatus, options, rusage) };
-        if (ret as isize) < 0 {
-            return Err(
-                SystemError::from_posix_errno((ret as isize) as i32).expect("wait4: Invalid errno")
-            );
+        // 暂时不支持options选项
+        if options != 0 {
+            return Err(SystemError::EINVAL);
         }
-        return Ok(ret as usize);
+
+        let cur_pcb = ProcessManager::current_pcb();
+        let rd_childen = cur_pcb.children.read();
+        let child_proc = rd_childen.get(&Pid(pid as usize));
+        // 判断是否是子进程
+        if child_proc.is_none() {
+            return Err(SystemError::ECHILD);
+        }
+        let child_pcb = child_proc.unwrap();
+
+        if pid > 0 {
+            // 等待指定进程
+            child_pcb.wait_queue.sleep();
+        } else if pid < -1 {
+            // TODO 判断是否pgid == -pid（等待指定组任意进程）
+            // 暂时不支持
+            return Err(SystemError::EINVAL);
+        } else if pid == 0 {
+            // TODO 判断是否pgid == current_pgid（等待当前组任意进程）
+            // 暂时不支持
+            return Err(SystemError::EINVAL);
+        } else {
+            // 等待任意子进程
+            rd_childen.iter().for_each(|x| x.1.wait_queue.sleep());
+        }
+
+        // 获取退出码
+        if let ProcessState::Exited(status) = child_proc.unwrap().sched_info().state() {
+            if !wstatus.is_null() {
+                unsafe { *wstatus = status as i32 };
+            }
+        }
+
+        drop(child_pcb);
+        return Ok(0);
     }
 
     /// # 退出进程

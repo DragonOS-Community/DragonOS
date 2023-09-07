@@ -7,7 +7,11 @@ use core::{
 use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
-    driver::{disk::ahci::{self}, uart::uart_device::{self, uart_init}, base::{platform::platform_bus_init, block::disk_info::Partition}},
+    driver::{
+        base::{block::disk_info::Partition, platform::platform_bus_init},
+        disk::ahci::{self},
+        uart::uart_device::{self, uart_init},
+    },
     filesystem::{
         devfs::DevFS,
         fat::fs::FATFileSystem,
@@ -106,12 +110,9 @@ pub extern "C" fn vfs_init() -> i32 {
     // 初始化platform总线
     platform_bus_init().expect("platform bus init failed");
 
-
     let _result = sys_bus_init(&SYS_BUS_INODE()).map_err(|e| return e.to_posix_errno());
-    
-    kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
-    
 
+    kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
 
     return 0;
 }
@@ -180,13 +181,12 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
 #[no_mangle]
 pub extern "C" fn mount_root_fs() -> i32 {
     kinfo!("Try to mount FAT32 as root fs...");
-    let partiton: Arc<Partition> =
-        ahci::get_disks_by_name("ahci_disk_0".to_string())
-            .unwrap()
-            .0
-            .lock()
-            .partitions[0]
-            .clone();
+    let partiton: Arc<Partition> = ahci::get_disks_by_name("ahci_disk_0".to_string())
+        .unwrap()
+        .0
+        .lock()
+        .partitions[0]
+        .clone();
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
     if fatfs.is_err() {

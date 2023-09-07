@@ -28,7 +28,7 @@ pub trait Driver: Sync + Send + Debug {
     /// @brief: 获取驱动匹配表
     /// @parameter: None
     /// @return: 驱动匹配表
-    fn compatible_table(&self) -> CompatibleTable{
+    fn compatible_table(&self) -> CompatibleTable {
         //TODO 要完善每个 CompatibleTable ，将来要把这个默认实现删除
         return CompatibleTable::new(vec!["unknown"]);
     }

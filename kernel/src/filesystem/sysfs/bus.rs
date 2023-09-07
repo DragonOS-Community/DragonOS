@@ -84,6 +84,6 @@ pub fn bus_device_register(bus_name: &str, name: &str) -> Result<Arc<dyn IndexNo
                 .add_dir(name),
             Err(_) => return Err(SystemError::EXDEV),
         },
-        Err(_) => return Err(SystemError::EFAULT),
+        Err(_) => return Err(SystemError::EXDEV),
     }
 }

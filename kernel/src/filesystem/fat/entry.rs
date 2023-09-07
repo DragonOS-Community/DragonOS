@@ -591,7 +591,6 @@ impl FATDir {
     }
 
     pub fn create_dir(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATDir, SystemError> {
-        
         let r: Result<FATDirEntryOrShortName, SystemError> =
             self.check_existence(name, Some(true), fs.clone());
         // kdebug!("check existence ok");

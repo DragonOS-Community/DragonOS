@@ -1,17 +1,12 @@
 use core::cmp::Ordering;
 
 use super::{
+    block::block_device::BlockDevice,
     char::CharDevice,
-    device::{
-        mkdev, DeviceNumber, IdTable, KObject, BLOCKDEVS, CHARDEVS, DEVICE_MANAGER,
-        DEVMAP,
-    }, block::block_device::BlockDevice,
+    device::{mkdev, DeviceNumber, IdTable, KObject, BLOCKDEVS, CHARDEVS, DEVICE_MANAGER, DEVMAP},
 };
-use crate::{
-     kerror, libs::spinlock::SpinLock,
-    syscall::SystemError,
-};
-use alloc::{collections::BTreeMap,sync::Arc, vec::Vec};
+use crate::{kerror, libs::spinlock::SpinLock, syscall::SystemError};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
 const KOBJMAP_HASH_SIZE: usize = 255;
 const DEV_MAJOR_HASH_SIZE: usize = 255;
@@ -530,7 +525,12 @@ impl CharDevOps {
             kerror!("Device number can't be 0!\n");
         }
         DEVICE_MANAGER.add_device(id_table.clone(), cdev.clone());
-        kobj_map(DEVMAP.clone(), id_table.device_number(), range, cdev.clone())
+        kobj_map(
+            DEVMAP.clone(),
+            id_table.device_number(),
+            range,
+            cdev.clone(),
+        )
     }
 
     /// @brief: 字符设备注销

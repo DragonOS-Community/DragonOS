@@ -10,6 +10,7 @@ use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader};
 use crate::{
     arch::MMArch,
     current_pcb,
+    driver::base::block::SeekFrom,
     kerror,
     libs::align::page_align_up,
     mm::{
@@ -25,7 +26,7 @@ use crate::{
     syscall::{
         user_access::{clear_user, copy_to_user},
         SystemError,
-    }, driver::base::block::SeekFrom,
+    },
 };
 
 use super::rwlock::RwLockWriteGuard;

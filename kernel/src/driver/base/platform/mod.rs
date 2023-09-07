@@ -403,7 +403,6 @@ impl Device for LockedPlatform {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
-
 }
 
 /// @brief: 为Platform实现Bus trait，platform总线是一种总线设备

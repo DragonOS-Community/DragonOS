@@ -7,6 +7,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, MMArch},
+    driver::base::block::SeekFrom,
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
@@ -21,7 +22,7 @@ use crate::{
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
-    }, driver::base::block::SeekFrom,
+    },
 };
 
 use self::user_access::UserBufferWriter;

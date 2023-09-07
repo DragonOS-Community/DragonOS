@@ -4,7 +4,10 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     arch::asm::current::current_pcb,
-    driver::{base::{device::DevicePrivateData, block::SeekFrom}, tty::TtyFilePrivateData},
+    driver::{
+        base::{block::SeekFrom, device::DevicePrivateData},
+        tty::TtyFilePrivateData,
+    },
     filesystem::procfs::ProcfsFilePrivateData,
     include::bindings::bindings::process_control_block,
     kerror,

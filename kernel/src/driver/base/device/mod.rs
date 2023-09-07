@@ -68,7 +68,6 @@ pub trait Device: KObject {
     fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
         unimplemented!();
     }
-
 }
 
 // 暂定是不可修改的，在初始化的时候就要确定。以后可能会包括例如硬件中断包含的信息
@@ -217,7 +216,7 @@ impl IdTable {
     /// @parameter None
     /// @return: 设备名
     pub fn to_name(&self) -> String {
-        return format!("{}:{:?}", self.0, self.1.0);
+        return format!("{}:{:?}", self.0, self.1 .0);
     }
 
     pub fn device_number(&self) -> DeviceNumber {
@@ -387,6 +386,3 @@ pub fn device_unregister<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
         Err(_) => Err(DeviceError::RegisterError),
     }
 }
-
-// 初始化一些在内核启动时会初始化的设备
-pub fn device_init() {}

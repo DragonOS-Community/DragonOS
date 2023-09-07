@@ -257,7 +257,7 @@ impl<T: Transport> Driver for VirtioInterface<T> {
         todo!()
     }
 
-    fn id_table(&self) ->IdTable {
+    fn id_table(&self) -> IdTable {
         todo!()
     }
 }

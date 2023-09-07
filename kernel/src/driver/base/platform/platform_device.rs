@@ -5,7 +5,6 @@ use super::{super::device::DeviceState, CompatibleTable};
 /// @brief: 实现该trait的设备实例应挂载在platform总线上，
 ///         同时应该实现Device trait
 pub trait PlatformDevice: Device {
-    
     fn compatible_table(&self) -> CompatibleTable;
     /// @brief: 判断设备是否初始化
     /// @parameter: None

@@ -19,9 +19,10 @@ use crate::{
             bus::{bus_device_register, bus_driver_register},
             devices::sys_device_register,
         },
-        vfs::{FilePrivateData, FileSystem, IndexNode, PollStatus},
+        vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus},
     },
     include::bindings::bindings::{io_in8, io_out8},
+    kdebug, kinfo,
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
@@ -30,7 +31,13 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, char, intrinsics::offset, str};
+use core::{
+    any::Any,
+    char,
+    ffi::{c_int, c_uchar},
+    intrinsics::offset,
+    str::{self, from_utf8},
+};
 
 const UART_SUCCESS: i32 = 0;
 const E_UART_BITS_RATE_ERROR: i32 = 1;
@@ -119,10 +126,13 @@ pub struct Uart {
     fs: Weak<DevFS>, // 文件系统
     port: UartPort,
     baud_rate: u32,
+    metadata: Metadata,
 }
 
 impl Default for Uart {
     fn default() -> Self {
+        let mut metadata = Metadata::default();
+        metadata.file_type = FileType::CharDevice;
         Self {
             private_data: DevicePrivateData::new(
                 IdTable::new(
@@ -137,6 +147,7 @@ impl Default for Uart {
             fs: Weak::default(),
             port: UartPort::COM1,
             baud_rate: 115200,
+            metadata,
         }
     }
 }
@@ -197,12 +208,30 @@ impl Device for LockedUart {
 }
 
 impl CharDevice for LockedUart {
-    fn read_at(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        todo!()
+    fn read_at(&self, _offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let device = self.0.lock();
+        if len > buf.len() {
+            return Err(SystemError::E2BIG);
+        }
+        kinfo!("------len:  {:?}", len);
+        for i in 0..len {
+            buf[i] = Self::uart_read_byte(&device.port) as u8;
+            kinfo!("------buf[{:?}] = {:?}", i, buf[i]);
+        }
+        return Ok(len);
     }
 
-    fn write_at(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        todo!()
+    fn write_at(&self, _offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let device = self.0.lock();
+        if len > buf.len() {
+            return Err(SystemError::E2BIG);
+        }
+        Self::uart_send(
+            &device.port,
+            from_utf8(&buf[0..len]).map_err(|_| SystemError::EIO)?,
+        );
+
+        return Ok(len);
     }
 
     fn sync(&self) -> Result<(), SystemError> {
@@ -261,6 +290,113 @@ impl IndexNode for LockedUart {
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
         todo!()
+    }
+
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        return Ok(self.0.lock().metadata.clone());
+    }
+
+    fn open(
+        &self,
+        _data: &mut FilePrivateData,
+        _mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Ok(());
+    }
+
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Ok(());
+    }
+
+    fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Ok(self.0.lock().metadata = _metadata.clone());
+    }
+    fn create(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: u32,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-EOPNOTSUPP_OR_ENOTSUP)的返回值
+        return self.create_with_data(name, file_type, mode, 0);
+    }
+
+    fn create_with_data(
+        &self,
+        _name: &str,
+        _file_type: FileType,
+        _mode: u32,
+        _data: usize,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn unlink(&self, _name: &str) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn move_(
+        &self,
+        _old_name: &str,
+        _target: &Arc<dyn IndexNode>,
+        _new_name: &str,
+    ) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn get_entry_name(&self, _ino: crate::filesystem::vfs::InodeId) -> Result<String, SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn get_entry_name_and_metadata(
+        &self,
+        ino: crate::filesystem::vfs::InodeId,
+    ) -> Result<(String, Metadata), SystemError> {
+        // 如果有条件，请在文件系统中使用高效的方式实现本接口，而不是依赖这个低效率的默认实现。
+        let name = self.get_entry_name(ino)?;
+        let entry = self.find(&name)?;
+        return Ok((name, entry.metadata()?));
+    }
+
+    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn mount(
+        &self,
+        _fs: Arc<dyn FileSystem>,
+    ) -> Result<Arc<crate::filesystem::vfs::MountFS>, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn truncate(&self, _len: usize) -> Result<(), SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn sync(&self) -> Result<(), SystemError> {
+        return Ok(());
     }
 }
 
@@ -342,13 +478,12 @@ impl LockedUart {
     #[allow(dead_code)]
     fn uart_send(uart_port: &UartPort, s: &str) {
         let port = uart_port.to_u16();
-        while Self::is_transmit_empty(port) == false {
-            for c in s.bytes() {
-                unsafe {
-                    io_out8(port, c);
-                }
+        while Self::is_transmit_empty(port) == false {} //TODO:pause
+        for c in s.bytes() {
+            unsafe {
+                io_out8(port, c);
             }
-        } //TODO:pause
+        }
     }
 
     /// @brief 串口接收一个字节
@@ -358,7 +493,7 @@ impl LockedUart {
     fn uart_read_byte(uart_port: &UartPort) -> char {
         let port = uart_port.to_u16();
         while Self::serial_received(port) == false {} //TODO:pause
-        unsafe { io_in8(port) as char }
+        return unsafe { io_in8(port) as char };
     }
 
     #[allow(dead_code)]

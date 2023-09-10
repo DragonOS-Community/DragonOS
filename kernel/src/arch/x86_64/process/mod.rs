@@ -363,14 +363,14 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         mov rsp, [rsi + {off_rsp}]
 
         // // push RFLAGS (can only be modified via stack)
-        // pushfq
+        pushfq
         // // pop RFLAGS into `self.rflags`
-        // pop QWORD PTR [rdi + {off_rflags}]
+        pop QWORD PTR [rdi + {off_rflags}]
 
         // // push `next.rflags`
-        // push QWORD PTR [rsi + {off_rflags}]
+        push QWORD PTR [rsi + {off_rflags}]
         // // pop into RFLAGS
-        // popfq
+        popfq
 
         // push next rip to stack
         push QWORD PTR [rsi + {off_rip}]

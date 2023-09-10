@@ -44,3 +44,4 @@
 #include <time/sleep.h>
 #include <driver/pci/pci_irq.h>
 #include <common/errno.h>
+#include <common/cpu.h>

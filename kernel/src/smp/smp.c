@@ -136,8 +136,7 @@ void smp_ap_start_stage2()
     io_mfence();
     ++num_cpu_started;
     io_mfence();
-    while (1)
-        ;
+
     apic_init_ap_core_local_apic();
 
     // ============ 为ap处理器初始化IDLE进程 =============

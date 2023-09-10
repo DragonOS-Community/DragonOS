@@ -162,8 +162,6 @@ void system_initialize()
     io_mfence();
     smp_init();
 
-    while(1);
-
     io_mfence();
 
     HPET_init();

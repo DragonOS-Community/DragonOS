@@ -219,6 +219,10 @@ impl IdTable {
         return format!("{}:{:?}", self.0, self.1 .0);
     }
 
+    pub fn name(&self) -> String {
+        return self.name().clone();
+    }
+
     pub fn device_number(&self) -> DeviceNumber {
         return self.1;
     }

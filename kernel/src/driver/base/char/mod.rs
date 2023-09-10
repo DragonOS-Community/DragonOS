@@ -2,8 +2,6 @@ use crate::syscall::SystemError;
 
 use super::device::Device;
 
-pub mod stdio;
-
 pub trait CharDevice: Device {
     /// Notice buffer对应设备按字节划分，使用u8类型
     /// Notice offset应该从0开始计数

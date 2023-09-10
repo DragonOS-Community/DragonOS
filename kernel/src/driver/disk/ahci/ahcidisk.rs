@@ -1,7 +1,5 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
-use crate::driver::base::block::block_device::{
-    BlockDevice, BlockId, BlockIter, BLK_SIZE_LOG2_LIMIT,
-};
+use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::SeekFrom;
 use crate::driver::base::device::{Device, DeviceType, KObject};

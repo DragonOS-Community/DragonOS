@@ -10,14 +10,13 @@ use crate::{
     driver::{
         base::{block::disk_info::Partition, platform::platform_bus_init},
         disk::ahci::{self},
-        uart::uart_device::{self, uart_init},
     },
     filesystem::{
         devfs::DevFS,
         fat::fs::FATFileSystem,
         procfs::ProcFS,
         ramfs::RamFS,
-        sysfs::{bus::sys_bus_init, SysFS, SYS_BUS_INODE, SYS_DEVICES_INODE},
+        sysfs::{bus::sys_bus_init, SysFS, SYS_BUS_INODE},
         vfs::{mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::PAGE_4K_SIZE,

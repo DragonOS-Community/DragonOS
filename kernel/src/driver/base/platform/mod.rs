@@ -1,8 +1,8 @@
 use super::device::{
     bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
     driver::DriverError,
-    Device, DeviceError, DeviceNumber, DevicePrivateData, DeviceResource, DeviceState, DeviceType,
-    IdTable, KObject,
+    Device, DeviceError, DeviceNumber, DevicePrivateData, DeviceResource, DeviceType, IdTable,
+    KObject,
 };
 use crate::{
     driver::Driver, filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError,
@@ -159,63 +159,6 @@ impl LockedPlatformBusDriver {
         let id_table = device.id_table();
         self.0.lock().devices.remove(&id_table);
     }
-
-    // /// @brief: 匹配platform类型驱动
-    // /// @parameter driver: platform类型驱动
-    // /// @return: 如果匹配成功，返回成功驱动的设备数，否则，返回BusError类型
-    // #[allow(dead_code)]
-    // fn driver_match_device(&self, driver: Arc<dyn PlatformDriver>) -> Result<i32, DeviceError> {
-    //     let mut num = 0;
-    //     let devices = &self.0.lock().devices;
-
-    //     for (_dev_id_table, device) in devices.iter() {
-    //         if device
-    //             .compatible_table()
-    //             .matches(&driver.compatible_table())
-    //         {
-    //             if !device.is_initialized() {
-    //                 // 设备未初始化，调用驱动probe函数
-    //                 match driver.probe(device.clone()) {
-    //                     Ok(()) => {
-    //                         num = num + 1;
-    //                         device.set_state(DeviceState::Initialized)
-    //                     }
-    //                     // 可以驱动很多设备，一个设备初始化出错即返回
-    //                     Err(_) => return Err(DeviceError::InitializeFailed),
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     if num == 0 {
-    //         return Err(DeviceError::NoDeviceForDriver);
-    //     } else {
-    //         return Ok(num);
-    //     }
-    // }
-
-    // /// @brief: 匹配platform上的设备
-    // /// @parameter driver: platform类型设备
-    // /// @return: 如果匹配成功，返回Ok(())，否则，返回BusError类型
-    // #[allow(dead_code)]
-    // fn device_match_driver(&self, device: Arc<dyn PlatformDevice>) -> Result<(), DeviceError> {
-    //     let drivers = &mut self.0.lock().drivers;
-    //     for (_drv_id_table, driver) in drivers.into_iter() {
-    //         if driver
-    //             .compatible_table()
-    //             .matches(device.compatible_table())
-    //         {
-    //             match driver.probe(device.clone()) {
-    //                 Ok(_driver) => {
-    //                     // 将设备状态置为已初始化
-    //                     device.set_state(DeviceState::Initialized);
-    //                     return Ok(());
-    //                 }
-    //                 Err(_) => return Err(DeviceError::InitializeFailed),
-    //             }
-    //         }
-    //     }
-    //     return Err(DeviceError::NoDriverForDevice);
-    // }
 }
 
 /// @brief: platform总线驱动

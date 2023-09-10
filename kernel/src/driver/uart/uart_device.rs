@@ -10,19 +10,15 @@ use crate::{
                 platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
             },
         },
-        tty::{tty_device::TtyDevice, TtyError},
         Driver,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        sysfs::{
-            bus::{bus_device_register, bus_driver_register},
-            devices::sys_device_register,
-        },
+        sysfs::bus::{bus_device_register, bus_driver_register},
         vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus},
     },
     include::bindings::bindings::{io_in8, io_out8},
-    kdebug, kinfo,
+    kinfo,
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
@@ -34,7 +30,6 @@ use alloc::{
 use core::{
     any::Any,
     char,
-    ffi::{c_int, c_uchar},
     intrinsics::offset,
     str::{self, from_utf8},
 };

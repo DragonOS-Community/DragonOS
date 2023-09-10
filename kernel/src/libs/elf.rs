@@ -26,7 +26,7 @@ use crate::{
     syscall::{
         user_access::{clear_user, copy_to_user},
         SystemError,
-    },
+    }, kdebug,
 };
 
 use super::rwlock::RwLockWriteGuard;
@@ -93,6 +93,7 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
+        kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,

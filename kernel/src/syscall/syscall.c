@@ -2,7 +2,6 @@
 #include <common/errno.h>
 #include <common/fcntl.h>
 #include <common/string.h>
-#include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
 #include <exception/irq.h>
 #include <filesystem/vfs/VFS.h>

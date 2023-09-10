@@ -32,10 +32,10 @@ impl KernelThreadMechanism {
 
         let mut frame = TrapFrame::new();
         frame.rbx = closure as *mut KernelThreadClosure as u64;
-        frame.ds = KERNEL_DS as u64;
-        frame.es = KERNEL_DS as u64;
-        frame.cs = KERNEL_CS as u64;
-        frame.ss = KERNEL_DS as u64;
+        frame.ds = KERNEL_DS.bits() as u64;
+        frame.es = KERNEL_DS.bits() as u64;
+        frame.cs = KERNEL_CS.bits() as u64;
+        frame.ss = KERNEL_DS.bits() as u64;
 
         // 使能中断
         frame.rflags |= 1 << 9;

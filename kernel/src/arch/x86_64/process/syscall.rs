@@ -1,9 +1,13 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    arch::{interrupt::TrapFrame, CurrentIrqArch},
+    arch::{
+        interrupt::TrapFrame,
+        process::table::{USER_CS, USER_DS},
+        CurrentIrqArch,
+    },
     exception::InterruptArch,
-    include::bindings::bindings::{USER_CS, USER_DS},
+    kdebug,
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
@@ -32,15 +36,16 @@ impl Syscall {
         envp: Vec<String>,
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        // kdebug!(
-        //     "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
-        //     path,
-        //     argv,
-        //     envp
-        // );
+        kdebug!(
+            "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
+            path,
+            argv,
+            envp
+        );
         // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
+        kdebug!("tmp_rs_execve: current pid: {:?}", pcb.pid());
         let mut basic_info = pcb.basic_mut();
         // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
         let old_address_space = basic_info.user_vm();
@@ -54,6 +59,8 @@ impl Syscall {
         unsafe {
             basic_info.set_user_vm(Some(address_space.clone()));
         }
+        // 查看新的地址空间结构体的地址
+        kdebug!("new address space: {:p}", address_space.as_ref());
         // to avoid deadlock
         drop(basic_info);
 
@@ -70,11 +77,12 @@ impl Syscall {
         drop(irq_guard);
         // kdebug!("to load binary file");
         let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
+
         // 加载可执行文件
         let load_result = load_binary_file(&mut param)
             .unwrap_or_else(|e| panic!("Failed to load binary file: {:?}, path: {:?}", e, path));
         // kdebug!("load binary file done");
-
+        kdebug!("argv: {:?}, envp: {:?}", argv, envp);
         param.init_info_mut().args = argv;
         param.init_info_mut().envs = envp;
 
@@ -105,9 +113,9 @@ impl Syscall {
         regs.rbp = user_sp.data() as u64;
         regs.rip = load_result.entry_point().data() as u64;
 
-        regs.cs = USER_CS as u64 | 3;
-        regs.ds = USER_DS as u64 | 3;
-        regs.ss = USER_DS as u64 | 3;
+        regs.cs = USER_CS.bits() as u64;
+        regs.ds = USER_DS.bits() as u64;
+        regs.ss = USER_DS.bits() as u64;
         regs.es = 0;
         regs.rflags = 0x200;
         regs.rax = 1;

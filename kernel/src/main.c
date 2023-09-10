@@ -45,6 +45,7 @@ ul bsp_idt_size, bsp_gdt_size;
 #pragma GCC optimize("O0")
 struct gdtr gdtp;
 struct idtr idtp;
+ul _stack_start;
 void reload_gdt()
 {
 
@@ -80,14 +81,10 @@ void system_initialize()
     _stack_start = head_stack_start; // 保存init proc的栈基地址（由于之后取消了地址重映射，因此必须在这里重新保存）
     kdebug("_stack_start=%#018lx", _stack_start);
 
-    load_TR(10); // 加载TR寄存器
-    set_tss64((uint *)&initial_tss[0], _stack_start, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
-              tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
+    set_current_core_tss(_stack_start, 0);
+    load_current_core_tss();
 
     cpu_core_info[0].stack_start = _stack_start;
-    cpu_core_info[0].tss_vaddr = (uint64_t)&initial_tss[0];
-    // kdebug("cpu_core_info[0].tss_vaddr=%#018lx", cpu_core_info[0].tss_vaddr);
-    // kdebug("cpu_core_info[0].stack_start%#018lx", cpu_core_info[0].stack_start);
 
     // 初始化中断描述符表
     sys_vector_init();
@@ -103,6 +100,7 @@ void system_initialize()
     io_mfence();
     scm_reinit();
     rs_textui_init();
+
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
     // // =========== 重新设置initial_tss[0]的ist
@@ -164,6 +162,8 @@ void system_initialize()
     io_mfence();
     smp_init();
 
+    while(1);
+
     io_mfence();
 
     HPET_init();
@@ -185,6 +185,8 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
+    while (1)
+        ;
 }
 
 // 操作系统内核从这里开始执行
@@ -200,9 +202,6 @@ void Start_Kernel(void)
                          : "=r"(mb2_info), "=r"(mb2_magic), "=r"(bsp_gdt_size), "=r"(bsp_idt_size)::"memory");
     reload_gdt();
     reload_idt();
-
-    // 重新设置TSS描述符
-    set_tss_descriptor(10, (void *)(&initial_tss[0]));
 
     mb2_info &= 0xffffffff;
     mb2_magic &= 0xffffffff;

@@ -202,7 +202,7 @@ void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 // 14 #PF 页故障
 void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 {
-
+    cli();
     unsigned long cr2 = 0;
 
     __asm__ __volatile__("movq	%%cr2,	%0" : "=r"(cr2)::"memory");
@@ -234,6 +234,7 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
     printk_color(RED, BLACK, "CR2:%#018lx\n", cr2);
 
     traceback(regs);
+    sti();
     rs_process_do_exit(-1);
     // current_pcb->state = PROC_STOPPED;
     // sched();

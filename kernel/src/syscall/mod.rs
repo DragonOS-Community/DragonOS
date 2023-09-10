@@ -501,7 +501,7 @@ impl Syscall {
 
             SYS_SBRK => {
                 let increment = args[0] as isize;
-                Self::sbrk(increment).map(|vaddr| vaddr.data())
+                Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
             }
 
             SYS_REBOOT => Self::reboot(),

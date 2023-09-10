@@ -1,11 +1,17 @@
-use core::{arch::asm, intrinsics::unlikely, mem::ManuallyDrop};
+use core::{
+    arch::asm,
+    intrinsics::unlikely,
+    mem::{size_of, ManuallyDrop},
+    sync::atomic::{compiler_fence, Ordering},
+};
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use memoffset::offset_of;
-use x86::controlregs::Cr4;
+use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
+    exception::InterruptArch,
     kdebug,
     libs::spinlock::SpinLockGuard,
     mm::{
@@ -16,16 +22,21 @@ use crate::{
         fork::CloneFlags, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
         SwitchResult, SWITCH_RESULT,
     },
-    syscall::SystemError,
+    syscall::{Syscall, SystemError}, arch::process::table::TSSManager,
 };
 
-use self::kthread::kernel_thread_bootstrap_stage1;
+use self::{
+    kthread::kernel_thread_bootstrap_stage1,
+    table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
+};
 
-use super::{fpu::FpState, interrupt::TrapFrame};
+use super::{fpu::FpState, interrupt::TrapFrame, CurrentIrqArch};
 
 pub mod kthread;
 pub mod syscall;
-mod table;
+pub mod table;
+mod c_adapter;
+
 
 extern "C" {
     /// 从中断返回
@@ -33,7 +44,7 @@ extern "C" {
 }
 
 /// PCB中与架构相关的信息
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ArchPCBInfo {
     rflags: usize,
@@ -48,6 +59,8 @@ pub struct ArchPCBInfo {
     cr2: usize,
     fsbase: usize,
     gsbase: usize,
+    fs: u16,
+    gs: u16,
 
     /// 浮点寄存器的状态
     fp_state: Option<FpState>,
@@ -77,6 +90,8 @@ impl ArchPCBInfo {
             cr2: 0,
             fsbase: 0,
             gsbase: 0,
+            fs: KERNEL_DS.bits(),
+            gs: KERNEL_DS.bits(),
             fp_state: None,
         };
 
@@ -205,6 +220,8 @@ impl ProcessManager {
         // 设置子进程的栈基址（开始执行中断返回流程时的栈基址）
         let mut new_arch_guard = new_pcb.arch_info();
         let kernel_stack_guard = new_pcb.kernel_stack();
+
+        // 设置子进程在内核态开始执行时的rsp、rbp
         new_arch_guard.set_stack_base(kernel_stack_guard.stack_max_address());
 
         let trap_frame_vaddr: VirtAddr =
@@ -217,8 +234,13 @@ impl ProcessManager {
             *trap_frame_ptr = child_trapframe;
         }
 
-        new_arch_guard.fsbase = current_pcb.arch_info_irqsave().fsbase;
-        new_arch_guard.gsbase = current_pcb.arch_info_irqsave().gsbase;
+        let current_arch_guard = current_pcb.arch_info_irqsave();
+        new_arch_guard.fsbase = current_arch_guard.fsbase;
+        new_arch_guard.gsbase = current_arch_guard.gsbase;
+        new_arch_guard.fs = current_arch_guard.fs;
+        new_arch_guard.gs = current_arch_guard.gs;
+        new_arch_guard.fp_state = current_arch_guard.fp_state.clone();
+        drop(current_arch_guard);
 
         // 拷贝浮点寄存器的状态
         if let Some(fp_state) = current_pcb.arch_info_irqsave().fp_state.as_ref() {
@@ -245,6 +267,13 @@ impl ProcessManager {
     /// - `prev`：上一个进程的pcb
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
+        let irq_enabled = CurrentIrqArch::is_irq_enabled();
+        // kdebug!(
+        //     "switch_process(): prev: {:?}, next: {:?}, irq_enabled: {}",
+        //     prev.pid(),
+        //     next.pid(),
+        //     irq_enabled
+        // );
         // 保存浮点寄存器
         prev.arch_info().save_fp_state();
         // 切换浮点寄存器
@@ -260,8 +289,15 @@ impl ProcessManager {
 
         // 切换地址空间
         let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
-        next_addr_space.read().user_mapper.utable.make_current();
+        compiler_fence(Ordering::SeqCst);
 
+        // kdebug!(
+        //     "current_address_space: {:p}, next_address_space: {:p}",
+        //     Arc::as_ptr(&prev.basic().user_vm().unwrap()),
+        //     Arc::as_ptr(&next_addr_space)
+        // );
+        next_addr_space.read().user_mapper.utable.make_current();
+        compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
@@ -276,6 +312,12 @@ impl ProcessManager {
         SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev.clone());
         SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
 
+
+        // 切换tss
+        TSSManager::current_tss().set_rsp(x86::Ring::Ring0, next.kernel_stack().stack_max_address().data() as u64);
+        // kdebug!("switch tss ok");
+
+        // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
     }
 }
@@ -307,6 +349,10 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         mov [rdi + {off_r15}], r15
         mov r15, [rsi + {off_r15}]
 
+        // switch segment registers (这些寄存器只能通过接下来的switch_hook的return来切换)
+        mov [rdi + {off_fs}], fs
+        mov [rdi + {off_gs}], gs
+
         push rbp
         push rax
 
@@ -316,15 +362,15 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         mov [rdi + {off_rsp}], rsp
         mov rsp, [rsi + {off_rsp}]
 
-        // push RFLAGS (can only be modified via stack)
-        pushfq
-        // pop RFLAGS into `self.rflags`
-        pop QWORD PTR [rdi + {off_rflags}]
+        // // push RFLAGS (can only be modified via stack)
+        // pushfq
+        // // pop RFLAGS into `self.rflags`
+        // pop QWORD PTR [rdi + {off_rflags}]
 
-        // push `next.rflags`
-        push QWORD PTR [rsi + {off_rflags}]
-        // pop into RFLAGS
-        popfq
+        // // push `next.rflags`
+        // push QWORD PTR [rsi + {off_rflags}]
+        // // pop into RFLAGS
+        // popfq
 
         // push next rip to stack
         push QWORD PTR [rsi + {off_rip}]
@@ -348,6 +394,8 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         off_rsp = const(offset_of!(ArchPCBInfo, rsp)),
         off_r15 = const(offset_of!(ArchPCBInfo, r15)),
         off_rip = const(offset_of!(ArchPCBInfo, rip)),
+        off_fs = const(offset_of!(ArchPCBInfo, fs)),
+        off_gs = const(offset_of!(ArchPCBInfo, gs)),
 
         switch_hook = sym crate::process::switch_finish_hook,
         options(noreturn),
@@ -357,6 +405,7 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
 /// 从`switch_to_inner`返回后，执行这个函数
 ///
 /// 也就是说，当进程再次被调度时，会从这里开始执行
+#[inline(never)]
 unsafe extern "sysv64" fn switch_back() {
     asm!(concat!(
         "
@@ -364,4 +413,83 @@ unsafe extern "sysv64" fn switch_back() {
         pop rbp
         "
     ))
+}
+
+pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {
+    // 以下代码不能发生中断
+    CurrentIrqArch::interrupt_disable();
+
+    let current_pcb = ProcessManager::current_pcb();
+    let trap_frame_vaddr = VirtAddr::new(
+        current_pcb.kernel_stack().stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
+    );
+    // kdebug!("trap_frame_vaddr: {:?}", trap_frame_vaddr);
+    let new_rip = VirtAddr::new(ret_from_intr as usize);
+
+    assert!(
+        (x86::current::registers::rsp() as usize) < trap_frame_vaddr.data(),
+        "arch_switch_to_user(): current_rsp >= fake trap 
+        frame vaddr, this may cause some illegal access to memory! 
+        rsp: {:#x}, trap_frame_vaddr: {:#x}",
+        x86::current::registers::rsp() as usize,
+        trap_frame_vaddr.data()
+    );
+
+    let mut arch_guard = current_pcb.arch_info_irqsave();
+    arch_guard.rsp = trap_frame_vaddr.data();
+
+    arch_guard.fs = USER_DS.bits();
+    arch_guard.gs = USER_DS.bits();
+
+    switch_fs_and_gs(
+        SegmentSelector::from_bits_truncate(arch_guard.fs),
+        SegmentSelector::from_bits_truncate(arch_guard.gs),
+    );
+    arch_guard.rip = new_rip.data();
+
+    drop(arch_guard);
+
+    // 删除kthread的标志
+    current_pcb.flags().remove(ProcessFlags::KTHREAD);
+    current_pcb.worker_private().take();
+
+    let mut trap_frame = TrapFrame::new();
+
+    compiler_fence(Ordering::SeqCst);
+    Syscall::do_execve(path, argv, envp, &mut trap_frame).unwrap_or_else(|e| {
+        panic!(
+            "arch_switch_to_user(): pid: {pid:?}, Failed to execve: , error: {e:?}",
+            pid = current_pcb.pid(),
+            e = e
+        );
+    });
+    compiler_fence(Ordering::SeqCst);
+
+    // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
+
+    drop(current_pcb);
+
+    compiler_fence(Ordering::SeqCst);
+    ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());
+    compiler_fence(Ordering::SeqCst);
+
+    unreachable!();
+}
+
+/// 由于需要依赖ret来切换到用户态，所以不能inline
+#[inline(never)]
+unsafe extern "sysv64" fn ready_to_switch_to_user(
+    trap_frame: TrapFrame,
+    trapframe_vaddr: usize,
+    new_rip: usize,
+) -> ! {
+    *(trapframe_vaddr as *mut TrapFrame) = trap_frame;
+    asm!(
+        "mov rsp, {trapframe_vaddr}",
+        "push {new_rip}",
+        "ret",
+        trapframe_vaddr = in(reg) trapframe_vaddr,
+        new_rip = in(reg) new_rip
+    );
+    unreachable!()
 }

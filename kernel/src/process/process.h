@@ -17,8 +17,6 @@
 #include <mm/mm-types.h>
 #include <syscall/syscall.h>
 
-#include <asm/current.h>
-
 #include "proc-types.h"
 
 /**
@@ -51,10 +49,10 @@ extern unsigned long head_stack_start; // 导出内核层栈基地址（定义�
 extern ul _stack_start;
 extern void ret_from_intr(void); // 导出从中断返回的函数（定义在entry.S）
 
-extern struct tss_struct initial_tss[MAX_CPU_NUM];
-
 extern uint32_t rs_current_pcb_cpuid();
 extern uint32_t rs_current_pcb_pid();
 extern uint32_t rs_current_pcb_preempt_count();
 extern uint32_t rs_current_pcb_flags();
 extern int64_t rs_current_pcb_thread_rbp();
+
+#define PF_NEED_SCHED (1UL << 1)

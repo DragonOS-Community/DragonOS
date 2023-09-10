@@ -1,6 +1,9 @@
 //! 这个文件内放置初始内核线程的代码。
 
+use alloc::string::String;
+
 use crate::{
+    arch::process::arch_switch_to_user,
     driver::{disk::ahci::ahci_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
     kdebug, kerror,
@@ -9,6 +12,7 @@ use crate::{
 };
 
 pub fn initial_kernel_thread() -> i32 {
+
     KernelThreadMechanism::init_stage2();
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
@@ -26,5 +30,16 @@ pub fn initial_kernel_thread() -> i32 {
 
     kdebug!("initial kernel thread done.");
 
+    switch_to_user();
+
     loop {}
+}
+
+/// 切换到用户态
+fn switch_to_user() {
+    let path = String::from("/bin/shell.elf");
+    let argv = vec![String::from("/bin/shell.elf")];
+    let envp = vec![String::from("PATH=/bin")];
+
+    unsafe { arch_switch_to_user(path, argv, envp) };
 }

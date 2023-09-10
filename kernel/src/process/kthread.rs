@@ -14,7 +14,7 @@ use crate::{
     kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
-    syscall::SystemError,
+    syscall::SystemError, kdebug,
 };
 
 use super::{
@@ -303,6 +303,7 @@ impl KernelThreadMechanism {
     /// A daemon thread which creates other kernel threads
     fn kthread_daemon() -> i32 {
         let current_pcb = ProcessManager::current_pcb();
+        kdebug!("kthread_daemon: pid: {:?}", current_pcb.pid());
         {
             // 初始化worker_private
             let mut worker_private_guard = current_pcb.worker_private();

@@ -18,6 +18,7 @@ use hashbrown::HashSet;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
+    kdebug,
     libs::{
         align::page_align_up,
         rwlock::{RwLock, RwLockWriteGuard},
@@ -236,6 +237,10 @@ impl InnerAddressSpace {
     /// - `prot_flags`：保护标志
     /// - `map_flags`：映射标志
     /// - `round_to_min`：是否将`start_vaddr`对齐到`mmap_min`，如果为`true`，则当`start_vaddr`不为0时，会对齐到`mmap_min`，否则仅向下对齐到页边界
+    ///
+    /// ## 返回
+    ///
+    /// 返回映射的起始虚拟页帧
     pub fn map_anonymous(
         &mut self,
         start_vaddr: VirtAddr,
@@ -335,11 +340,11 @@ impl InnerAddressSpace {
         compiler_fence(Ordering::SeqCst);
         let (mut active, mut inactive);
         let flusher = if self.is_current() {
-            // kdebug!("mmap: current ucontext");
+            kdebug!("mmap: current ucontext");
             active = PageFlushAll::new();
             &mut active as &mut dyn Flusher<MMArch>
         } else {
-            // kdebug!("mmap: not current ucontext");
+            kdebug!("mmap: not current ucontext");
             inactive = InactiveFlusher::new();
             &mut inactive as &mut dyn Flusher<MMArch>
         };
@@ -508,13 +513,13 @@ impl InnerAddressSpace {
         }
 
         let old_brk = self.brk;
-        // kdebug!("set_brk: old_brk: {:?}, new_brk: {:?}", old_brk, new_brk);
+        kdebug!("set_brk: old_brk: {:?}, new_brk: {:?}", old_brk, new_brk);
         if new_brk > self.brk {
             let len = new_brk - self.brk;
             let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
             let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
-            self.map_anonymous(old_brk, len, prot_flags, map_flags, true)?
-                .virt_address();
+            self.map_anonymous(old_brk, len, prot_flags, map_flags, true)?;
+
             self.brk = new_brk;
             return Ok(old_brk);
         } else {

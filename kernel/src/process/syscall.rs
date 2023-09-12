@@ -2,7 +2,7 @@ use core::ffi::{c_int, c_void};
 
 use alloc::{string::String, vec::Vec};
 
-use super::{Pid, ProcessManager, fork::CloneFlags};
+use super::{fork::CloneFlags, Pid, ProcessManager};
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::MAX_PATHLEN,
@@ -21,7 +21,11 @@ extern "C" {
 impl Syscall {
     pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let r = ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into());
-        kdebug!("fork: r={:?}", r);
+        kdebug!(
+            "fork: r={:?}, current_pid={:?}\n",
+            r,
+            ProcessManager::current_pcb().pid()
+        );
         r
     }
 
@@ -32,7 +36,7 @@ impl Syscall {
         )
         .map(|pid| pid.into())
     }
-    
+
     pub fn execve(
         path: *const u8,
         argv: *const *const u8,

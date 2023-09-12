@@ -1,13 +1,15 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::{sync::Arc, vec::Vec};
+use x86::current;
 
 use crate::{
     arch::cpu::current_cpu_id,
     include::bindings::bindings::smp_get_total_cpu,
-    kinfo,
+    kdebug, kinfo,
     mm::percpu::PerCpu,
-    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState}, kdebug, smp::core::smp_get_processor_id,
+    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    smp::core::smp_get_processor_id,
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
@@ -77,6 +79,15 @@ pub trait Scheduler {
 }
 
 pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
+    // let current_pcb = ProcessManager::current_pcb();
+    //     if ProcessManager::find(Pid::new(3)).is_some() {
+    //         kdebug!(
+    //             "do_sched: pid {:?} is running, preempt_count: {}",
+    //             current_pcb.pid(),
+    //             current_pcb.preempt_count()
+    //         );
+    //     }
+
     // 当前进程持有锁，不切换，避免死锁
     if ProcessManager::current_pcb().preempt_count() != 0 {
         return None;
@@ -90,7 +101,6 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     match rt_scheduler.pick_next_task_rt(current_cpu_id()) {
         Some(p) => {
             next = p;
-            // kdebug!("next pcb is {}",next.pid);
             // 将pick的进程放回原处
             rt_scheduler.enqueue_front(next);
 
@@ -127,7 +137,11 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
 
     assert!(pcb.sched_info().on_cpu().is_some());
     if pcb.pid() >= Pid::new(3) {
-        kdebug!("enqueue about: cpu:{:?},proc:{:?}", smp_get_processor_id(), pcb);
+        kdebug!(
+            "enqueue about: cpu:{:?},proc:{:?}",
+            smp_get_processor_id(),
+            pcb
+        );
     }
     match pcb.sched_info().policy() {
         SchedPolicy::CFS => {

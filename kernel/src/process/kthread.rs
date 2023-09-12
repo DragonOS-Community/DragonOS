@@ -148,6 +148,10 @@ impl KernelThreadCreateInfo {
     pub fn take_closure(&self) -> Option<Box<KernelThreadClosure>> {
         return self.closure.lock().take();
     }
+
+    pub fn name(&self) -> &String {
+        &self.name
+    }
 }
 
 pub struct KernelThreadMechanism;

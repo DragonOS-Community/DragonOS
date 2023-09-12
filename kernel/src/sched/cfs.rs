@@ -5,7 +5,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use crate::{
     arch::cpu::current_cpu_id,
     include::bindings::bindings::MAX_CPU_NUM,
-    kBUG, kdebug,
+    kBUG, kdebug, kerror,
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
@@ -199,10 +199,7 @@ impl Scheduler for SchedulerCFS {
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
 
         let proc: Arc<ProcessControlBlock> = current_cpu_queue.dequeue();
-        if proc.pid() >= Pid::new(3) {
-            kdebug!("dequeue about: cpu:{:?},proc:{:?}", current_cpu_id, proc);
-        }
-        assert!(proc.pid() != ProcessManager::current_pcb().pid());
+
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果当前不是running态，或者当前进程的虚拟运行时间大于等于下一个进程的，那就需要切换。
         if (ProcessManager::current_pcb().sched_info().state() != ProcessState::Runnable)
@@ -225,9 +222,9 @@ impl Scheduler for SchedulerCFS {
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            if proc.pid() >= Pid::new(3) {
-                kdebug!("to run about: cpu:{:?},proc:{:?}", current_cpu_id, proc);
-            }
+            // if proc.pid() >= Pid::new(3) {
+            //     kdebug!("to run about: cpu:{:?},proc:{:?}", current_cpu_id, proc);
+            // }
             return Some(proc);
         } else {
             // 不进行切换
@@ -236,7 +233,7 @@ impl Scheduler for SchedulerCFS {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
-                    proc.sched_info().priority(),
+                    ProcessManager::current_pcb().sched_info().priority(),
                     current_cpu_queue,
                 );
                 // kdebug!("cpu:{:?}",current_cpu_id);

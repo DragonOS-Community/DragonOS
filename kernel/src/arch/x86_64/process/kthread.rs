@@ -43,6 +43,9 @@ impl KernelThreadMechanism {
         frame.rip = kernel_thread_bootstrap_stage1 as usize as u64;
 
         let pid = ProcessManager::fork(&mut frame, clone_flags)?;
+        ProcessManager::find(pid)
+            .unwrap()
+            .set_name(info.name().clone());
 
         return Ok(pid);
     }

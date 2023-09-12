@@ -1,8 +1,8 @@
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid, libs::rwlock::RwLock,
-    process::ProcessFlags, syscall::SystemError, kdebug,
+    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid, kdebug,
+    libs::rwlock::RwLock, process::ProcessFlags, syscall::SystemError,
 };
 
 use super::{

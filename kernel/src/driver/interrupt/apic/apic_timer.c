@@ -107,7 +107,8 @@ void apic_timer_init()
         while (1)
             hlt();
     }
-    spin_lock(&apic_timer_init_lock);
+    uint64_t flags = 0;
+    spin_lock_irqsave(&apic_timer_init_lock, flags);
     kinfo("Initializing apic timer for cpu %d", rs_current_pcb_cpuid());
     io_mfence();
     irq_register(APIC_TIMER_IRQ_NUM, &apic_timer_ticks_result, &apic_timer_handler, 0, &apic_timer_intr_controller,
@@ -117,5 +118,6 @@ void apic_timer_init()
     {
         bsp_initialized = true;
     }
-    spin_unlock(&apic_timer_init_lock);
+    kdebug("apic timer init done for cpu %d", rs_current_pcb_cpuid());
+    spin_unlock_irqrestore(&apic_timer_init_lock, flags);
 }

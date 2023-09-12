@@ -18,8 +18,6 @@ use crate::{
 };
 
 impl Syscall {
-
-
     pub fn do_execve(
         path: String,
         argv: Vec<String>,

@@ -41,6 +41,6 @@ features = ["spin_no_std"]
 
 # The release profile, used for `cargo build --release`
 [profile.release]
-debug = true
+debug = false
 
 

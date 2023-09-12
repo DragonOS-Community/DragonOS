@@ -53,9 +53,8 @@ impl TSSManager {
     /// 加载当前CPU的TSS
     pub unsafe fn load_tr() {
         let index = (10 + smp_get_processor_id() * 2) as u16;
-        kdebug!("load tr: index: {}", index);
         let selector = SegmentSelector::new(index, Ring::Ring0);
-        kdebug!("load tr: {:?}", selector);
+
         // todo: 在初始化的时候设置tss即可
         Self::set_tss_descriptor(
             index,

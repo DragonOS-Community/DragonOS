@@ -1,10 +1,10 @@
 use core::mem::MaybeUninit;
 
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec, rc::Rc};
+use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     driver::tty::TtyFilePrivateData, filesystem::procfs::ProcfsFilePrivateData, kerror,
-    process::ProcessManager, syscall::SystemError, libs::spinlock::SpinLock,
+    libs::spinlock::SpinLock, process::ProcessManager, syscall::SystemError,
 };
 
 use super::{io::SeekFrom, Dirent, FileType, IndexNode, Metadata};
@@ -389,8 +389,8 @@ impl FileDescriptorVec {
 
     pub fn new() -> FileDescriptorVec {
         // 先声明一个未初始化的数组
-        let mut data: [MaybeUninit<Option<Arc<SpinLock<File>>>>; FileDescriptorVec::PROCESS_MAX_FD] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+        let mut data: [MaybeUninit<Option<Arc<SpinLock<File>>>>;
+            FileDescriptorVec::PROCESS_MAX_FD] = unsafe { MaybeUninit::uninit().assume_init() };
 
         // 逐个把每个元素初始化为None
         for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
@@ -398,7 +398,10 @@ impl FileDescriptorVec {
         }
         // 由于一切都初始化完毕，因此将未初始化的类型强制转换为已经初始化的类型
         let data: [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD] = unsafe {
-            core::mem::transmute::<_, [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD]>(data)
+            core::mem::transmute::<
+                _,
+                [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD],
+            >(data)
         };
 
         // 初始化文件描述符数组结构体

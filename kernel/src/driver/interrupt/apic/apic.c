@@ -471,11 +471,6 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     // 检测当前进程是否持有自旋锁，若持有自旋锁，则不进行抢占式的进程调度
     if (rs_current_pcb_preempt_count() > 0)
     {
-        if (number == APIC_TIMER_IRQ_NUM && rs_current_pcb_pid() == 1)
-        {
-
-            rs_uart_send_preempt_count();
-        }
         return;
     }
     else if (rs_current_pcb_preempt_count() < 0)
@@ -484,10 +479,6 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     // 检测当前进程是否可被调度
     if ((rs_current_pcb_flags() & PF_NEED_SCHED) && number == APIC_TIMER_IRQ_NUM)
     {
-        if (number == APIC_TIMER_IRQ_NUM && rs_current_pcb_pid() == 1)
-        {
-            c_uart_send_str(COM1, "!!!!!!!!!!!!timer interrupt, preempt==0\n");
-        }
         io_mfence();
         sched();
     }

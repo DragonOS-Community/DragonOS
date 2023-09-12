@@ -174,7 +174,7 @@ impl ProcessManager {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);
-                kdebug!("wakeup: sched_enqueue: pid: {:?}", pcb.pid());
+
                 sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_exited() {

@@ -21,12 +21,7 @@ extern "C" {
 impl Syscall {
     pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let r = ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into());
-        kdebug!(
-            "fork: r={:?}, current_pid={:?}\n",
-            r,
-            ProcessManager::current_pcb().pid()
-        );
-        r
+        return r;
     }
 
     pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {

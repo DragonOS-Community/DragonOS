@@ -33,7 +33,7 @@ impl Syscall {
         // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
-        kdebug!("tmp_rs_execve: current pid: {:?}", pcb.pid());
+
         let mut basic_info = pcb.basic_mut();
         // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
         let old_address_space = basic_info.user_vm();
@@ -47,8 +47,7 @@ impl Syscall {
         unsafe {
             basic_info.set_user_vm(Some(address_space.clone()));
         }
-        // 查看新的地址空间结构体的地址
-        kdebug!("new address space: {:p}", address_space.as_ref());
+
         // to avoid deadlock
         drop(basic_info);
 

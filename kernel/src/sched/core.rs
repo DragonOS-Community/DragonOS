@@ -79,15 +79,6 @@ pub trait Scheduler {
 }
 
 pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
-    // let current_pcb = ProcessManager::current_pcb();
-    //     if ProcessManager::find(Pid::new(3)).is_some() {
-    //         kdebug!(
-    //             "do_sched: pid {:?} is running, preempt_count: {}",
-    //             current_pcb.pid(),
-    //             current_pcb.preempt_count()
-    //         );
-    //     }
-
     // 当前进程持有锁，不切换，避免死锁
     if ProcessManager::current_pcb().preempt_count() != 0 {
         return None;
@@ -136,13 +127,7 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     }
 
     assert!(pcb.sched_info().on_cpu().is_some());
-    if pcb.pid() >= Pid::new(3) {
-        kdebug!(
-            "enqueue about: cpu:{:?},proc:{:?}",
-            smp_get_processor_id(),
-            pcb
-        );
-    }
+
     match pcb.sched_info().policy() {
         SchedPolicy::CFS => {
             if reset_time {

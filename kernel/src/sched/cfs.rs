@@ -222,9 +222,7 @@ impl Scheduler for SchedulerCFS {
             }
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            // if proc.pid() >= Pid::new(3) {
-            //     kdebug!("to run about: cpu:{:?},proc:{:?}", current_cpu_id, proc);
-            // }
+
             return Some(proc);
         } else {
             // 不进行切换

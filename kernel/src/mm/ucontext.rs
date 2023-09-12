@@ -340,11 +340,9 @@ impl InnerAddressSpace {
         compiler_fence(Ordering::SeqCst);
         let (mut active, mut inactive);
         let flusher = if self.is_current() {
-            kdebug!("mmap: current ucontext");
             active = PageFlushAll::new();
             &mut active as &mut dyn Flusher<MMArch>
         } else {
-            kdebug!("mmap: not current ucontext");
             inactive = InactiveFlusher::new();
             &mut inactive as &mut dyn Flusher<MMArch>
         };
@@ -513,7 +511,7 @@ impl InnerAddressSpace {
         }
 
         let old_brk = self.brk;
-        kdebug!("set_brk: old_brk: {:?}, new_brk: {:?}", old_brk, new_brk);
+
         if new_brk > self.brk {
             let len = new_brk - self.brk;
             let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;

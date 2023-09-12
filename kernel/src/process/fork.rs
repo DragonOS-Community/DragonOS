@@ -94,7 +94,7 @@ impl ProcessManager {
                 e
             )
         });
-        kdebug!("fork ok: state: {:?}", pcb.sched_info().state());
+
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",

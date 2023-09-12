@@ -240,7 +240,7 @@ impl Syscall {
         drop(fd_table_guard);
         let file = file.unwrap();
 
-        return file.lock().read(buf.len(), buf);
+        return file.lock_no_preempt().read(buf.len(), buf);
     }
 
     /// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
@@ -646,7 +646,7 @@ impl Syscall {
 
         return Err(SystemError::EBADF);
     }
-    
+
     fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();

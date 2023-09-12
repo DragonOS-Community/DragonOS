@@ -12,7 +12,6 @@ use crate::{
 };
 
 pub fn initial_kernel_thread() -> i32 {
-
     KernelThreadMechanism::init_stage2();
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");

@@ -11,10 +11,10 @@ use atomic_enum::atomic_enum;
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
-    kinfo,
+    kdebug, kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
-    syscall::SystemError, kdebug,
+    syscall::SystemError,
 };
 
 use super::{

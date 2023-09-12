@@ -1,7 +1,6 @@
 use crate::{
     arch::interrupt::ipi::send_ipi,
     exception::ipi::{IpiKind, IpiTarget},
-    mm::INITIAL_PROCESS_ADDRESS_SPACE,
     syscall::SystemError,
 };
 

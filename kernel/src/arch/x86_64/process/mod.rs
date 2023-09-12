@@ -11,6 +11,7 @@ use memoffset::offset_of;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
+    arch::process::table::TSSManager,
     exception::InterruptArch,
     kdebug,
     libs::spinlock::SpinLockGuard,
@@ -22,7 +23,7 @@ use crate::{
         fork::CloneFlags, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
         SwitchResult, SWITCH_RESULT,
     },
-    syscall::{Syscall, SystemError}, arch::process::table::TSSManager,
+    syscall::{Syscall, SystemError},
 };
 
 use self::{
@@ -32,11 +33,10 @@ use self::{
 
 use super::{fpu::FpState, interrupt::TrapFrame, CurrentIrqArch};
 
+mod c_adapter;
 pub mod kthread;
 pub mod syscall;
 pub mod table;
-mod c_adapter;
-
 
 extern "C" {
     /// 从中断返回
@@ -312,9 +312,11 @@ impl ProcessManager {
         SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev.clone());
         SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
 
-
         // 切换tss
-        TSSManager::current_tss().set_rsp(x86::Ring::Ring0, next.kernel_stack().stack_max_address().data() as u64);
+        TSSManager::current_tss().set_rsp(
+            x86::Ring::Ring0,
+            next.kernel_stack().stack_max_address().data() as u64,
+        );
         // kdebug!("switch tss ok");
 
         // 正式切换上下文

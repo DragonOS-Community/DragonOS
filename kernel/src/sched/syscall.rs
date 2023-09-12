@@ -2,7 +2,7 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     process::ProcessManager,
-    syscall::{Syscall, SystemError},
+    syscall::{Syscall, SystemError}, kdebug,
 };
 
 use super::core::do_sched;
@@ -12,6 +12,7 @@ impl Syscall {
     /// 请注意，该系统调用不能由ring3的程序发起
     #[inline(always)]
     pub fn sched(from_user: bool) -> Result<usize, SystemError> {
+        
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
         // 进行权限校验，拒绝用户态发起调度

@@ -3,8 +3,9 @@ use core::{arch::asm, hint::spin_loop, sync::atomic::compiler_fence};
 use memoffset::offset_of;
 
 use crate::{
-    arch::process::table::TSSManager, exception::InterruptArch, kdebug, process::ProcessManager,
-    smp::core::smp_get_processor_id, include::bindings::bindings::cpu_core_info,
+    arch::process::table::TSSManager, exception::InterruptArch,
+    include::bindings::bindings::cpu_core_info, kdebug, process::ProcessManager,
+    smp::core::smp_get_processor_id,
 };
 
 use super::CurrentIrqArch;

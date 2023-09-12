@@ -10,6 +10,7 @@ use alloc::{
     boxed::Box,
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use hashbrown::HashMap;
 
@@ -173,6 +174,7 @@ impl ProcessManager {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);
+                kdebug!("wakeup: sched_enqueue: pid: {:?}", pcb.pid());
                 sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_exited() {
@@ -621,6 +623,16 @@ impl ProcessControlBlock {
             // FIXME 没有找到1号进程返回什么错误码
             _ => Err(SystemError::ECHILD),
         }
+    }
+
+    /// 生成进程的名字
+    pub fn generate_name(_program_path: &str, args: &Vec<String>) -> String {
+        let mut name = "".to_string();
+        for arg in args {
+            name.push_str(arg);
+            name.push(' ');
+        }
+        return name;
     }
 }
 

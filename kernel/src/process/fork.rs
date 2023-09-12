@@ -2,7 +2,7 @@ use alloc::{string::ToString, sync::Arc};
 
 use crate::{
     arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid, libs::rwlock::RwLock,
-    process::ProcessFlags, syscall::SystemError,
+    process::ProcessFlags, syscall::SystemError, kdebug,
 };
 
 use super::{
@@ -39,7 +39,7 @@ impl ProcessManager {
         let new_kstack = KernelStack::new()?;
         let name = current_pcb.basic().name().to_string();
         let pcb = ProcessControlBlock::new(name, new_kstack);
-        
+
         // 克隆架构相关信息
         *pcb.arch_info() = current_pcb.arch_info().clone();
 
@@ -94,7 +94,7 @@ impl ProcessManager {
                 e
             )
         });
-
+        kdebug!("fork ok: state: {:?}", pcb.sched_info().state());
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",

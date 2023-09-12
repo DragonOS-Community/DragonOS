@@ -7,7 +7,7 @@ use crate::{
     include::bindings::bindings::smp_get_total_cpu,
     kinfo,
     mm::percpu::PerCpu,
-    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState}, kdebug, smp::core::smp_get_processor_id,
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
@@ -41,36 +41,31 @@ pub fn get_cpu_loads(cpu_id: u32) -> u32 {
 }
 // 负载均衡
 pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
-    let pcb_cpu = pcb.sched_info().on_cpu();
-    if pcb_cpu.is_none(){
-        pcb.flags().insert(ProcessFlags::NEED_MIGRATE);
-        pcb.sched_info().set_migrate_to(Some(0));
-    }
     // 对pcb的迁移情况进行调整
     // 获取总的CPU数量
-    // let cpu_num = unsafe { smp_get_total_cpu() };
-    // // 获取当前负载最小的CPU的id
-    // let mut min_loads_cpu_id = current_cpu_id();
-    // let mut min_loads = get_cpu_loads(current_cpu_id());
-    // for cpu_id in 0..cpu_num {
-    //     let tmp_cpu_loads = get_cpu_loads(cpu_id);
-    //     if min_loads - tmp_cpu_loads > 0 {
-    //         min_loads_cpu_id = cpu_id;
-    //         min_loads = tmp_cpu_loads;
-    //     }
-    // }
+    let cpu_num = unsafe { smp_get_total_cpu() };
+    // 获取当前负载最小的CPU的id
+    let mut min_loads_cpu_id = current_cpu_id();
+    let mut min_loads = get_cpu_loads(current_cpu_id());
+    for cpu_id in 0..cpu_num {
+        let tmp_cpu_loads = get_cpu_loads(cpu_id);
+        if min_loads - tmp_cpu_loads > 0 {
+            min_loads_cpu_id = cpu_id;
+            min_loads = tmp_cpu_loads;
+        }
+    }
 
-    // let pcb_cpu = pcb.sched_info().on_cpu();
-    // // 将当前pcb迁移到负载最小的CPU
-    // // 如果当前pcb的PF_NEED_MIGRATE已经置位，则不进行迁移操作
-    // if pcb_cpu.is_none()
-    //     || (min_loads_cpu_id != pcb_cpu.unwrap()
-    //         && !pcb.flags().contains(ProcessFlags::NEED_MIGRATE))
-    // {
-    //     pcb.flags().insert(ProcessFlags::NEED_MIGRATE);
-    //     pcb.sched_info().set_migrate_to(Some(min_loads_cpu_id));
-    //     // kdebug!("set migrating, pcb:{:?}", pcb);
-    // }
+    let pcb_cpu = pcb.sched_info().on_cpu();
+    // 将当前pcb迁移到负载最小的CPU
+    // 如果当前pcb的PF_NEED_MIGRATE已经置位，则不进行迁移操作
+    if pcb_cpu.is_none()
+        || (min_loads_cpu_id != pcb_cpu.unwrap()
+            && !pcb.flags().contains(ProcessFlags::NEED_MIGRATE))
+    {
+        pcb.flags().insert(ProcessFlags::NEED_MIGRATE);
+        pcb.sched_info().set_migrate_to(Some(min_loads_cpu_id));
+        // kdebug!("set migrating, pcb:{:?}", pcb);
+    }
 }
 /// @brief 具体的调度器应当实现的trait
 pub trait Scheduler {
@@ -131,7 +126,9 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     }
 
     assert!(pcb.sched_info().on_cpu().is_some());
-
+    if pcb.pid() >= Pid::new(3) {
+        kdebug!("enqueue about: cpu:{:?},proc:{:?}", smp_get_processor_id(), pcb);
+    }
     match pcb.sched_info().policy() {
         SchedPolicy::CFS => {
             if reset_time {

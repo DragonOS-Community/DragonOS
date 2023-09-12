@@ -18,17 +18,7 @@ use crate::{
 };
 
 impl Syscall {
-    pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
-    }
 
-    pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        ProcessManager::fork(
-            frame,
-            CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
-        )
-        .map(|pid| pid.into())
-    }
 
     pub fn do_execve(
         path: String,

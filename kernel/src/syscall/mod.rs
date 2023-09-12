@@ -494,6 +494,9 @@ impl Syscall {
                 res
             }
 
+            SYS_FORK => Self::fork(frame),
+            SYS_VFORK => Self::vfork(frame),
+
             SYS_BRK => {
                 let new_brk = VirtAddr::new(args[0]);
                 Self::brk(new_brk).map(|vaddr| vaddr.data())

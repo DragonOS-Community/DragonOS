@@ -159,6 +159,18 @@ impl ArchPCBInfo {
         }
     }
 
+    pub unsafe fn restore_fsbase(&mut self) {
+        if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
+            x86::current::segmentation::wrfsbase(self.fsbase as u64);
+        }
+    }
+
+    pub unsafe fn restore_gsbase(&mut self) {
+        if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
+            x86::current::segmentation::wrgsbase(self.gsbase as u64);
+        }
+    }
+
     pub fn fsbase(&self) -> usize {
         self.fsbase
     }
@@ -267,13 +279,8 @@ impl ProcessManager {
     /// - `prev`：上一个进程的pcb
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
-        let irq_enabled = CurrentIrqArch::is_irq_enabled();
-        // kdebug!(
-        //     "switch_process(): prev: {:?}, next: {:?}, irq_enabled: {}",
-        //     prev.pid(),
-        //     next.pid(),
-        //     irq_enabled
-        // );
+        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        
         // 保存浮点寄存器
         prev.arch_info().save_fp_state();
         // 切换浮点寄存器
@@ -281,21 +288,16 @@ impl ProcessManager {
 
         // 切换fsbase
         prev.arch_info().save_fsbase();
-        x86::msr::wrmsr(x86::msr::IA32_FS_BASE, next.arch_info().fsbase as u64);
+        next.arch_info().restore_fsbase();
 
         // 切换gsbase
         prev.arch_info().save_gsbase();
-        x86::msr::wrmsr(x86::msr::IA32_KERNEL_GSBASE, next.arch_info().gsbase as u64);
+        next.arch_info().restore_gsbase();
 
         // 切换地址空间
         let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
         compiler_fence(Ordering::SeqCst);
 
-        // kdebug!(
-        //     "current_address_space: {:p}, next_address_space: {:p}",
-        //     Arc::as_ptr(&prev.basic().user_vm().unwrap()),
-        //     Arc::as_ptr(&next_addr_space)
-        // );
         next_addr_space.read().user_mapper.utable.make_current();
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈

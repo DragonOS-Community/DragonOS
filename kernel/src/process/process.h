@@ -20,22 +20,6 @@
 #include "proc-types.h"
 
 /**
- * @brief 任务状态段结构体
- *
- */
-
-// 设置初始进程的tss
-#define INITIAL_TSS                                                                                                   \
-    {                                                                                                                 \
-        .reserved0 = 0, .rsp0 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),                             \
-        .rsp1 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)),                                             \
-        .rsp2 = (ul)(initial_proc_union.stack + STACK_SIZE / sizeof(ul)), .reserved1 = 0, .ist1 = 0xffff800000007c00, \
-        .ist2 = 0xffff800000007c00, .ist3 = 0xffff800000007c00, .ist4 = 0xffff800000007c00,                           \
-        .ist5 = 0xffff800000007c00, .ist6 = 0xffff800000007c00, .ist7 = 0xffff800000007c00, .reserved2 = 0,           \
-        .reserved3 = 0, .io_map_base_addr = 0                                                                         \
-    }
-
-/**
  * @brief 进程退出时执行的函数
  *
  * @param code 返回码

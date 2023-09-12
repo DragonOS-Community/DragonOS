@@ -3,7 +3,6 @@
 
 void __arch_spin_lock(spinlock_t *lock)
 {
-    rs_preempt_disable();
     __asm__ __volatile__("1:    \n\t"
                          "lock decb %0   \n\t" // 尝试-1
                          "jns 3f    \n\t"      // 加锁成功，跳转到步骤3
@@ -14,6 +13,7 @@ void __arch_spin_lock(spinlock_t *lock)
                          "jmp 1b    \n\t" // 尝试加锁
                          "3:"
                          : "=m"(lock->lock)::"memory");
+    rs_preempt_disable();
 }
 
 void __arch_spin_unlock(spinlock_t *lock)

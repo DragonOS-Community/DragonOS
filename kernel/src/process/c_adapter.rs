@@ -1,6 +1,4 @@
-use crate::driver::uart::uart::{c_uart_send_str, UartDriver};
-
-use super::{kthread::kthread_init, process::stdio_init, process_init, ProcessManager};
+use super::{kthread::kthread_init, process_init, ProcessManager};
 
 #[no_mangle]
 pub extern "C" fn rs_process_init() {

@@ -895,8 +895,7 @@ impl KernelStack {
     pub unsafe fn set_pcb(&mut self, pcb: Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         // 将一个Arc<ProcessControlBlock>放到内核栈的最低地址处
         let p: *const ProcessControlBlock = Arc::into_raw(pcb);
-        let stack_bottom_ptr =
-            self.stack.as_ref().unwrap().as_ptr() as *mut *const ProcessControlBlock;
+        let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
         if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {

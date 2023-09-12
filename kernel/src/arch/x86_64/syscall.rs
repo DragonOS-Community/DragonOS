@@ -38,19 +38,9 @@ pub extern "C" fn syscall_handler(frame: &mut TrapFrame) -> () {
 
     // 由于进程管理未完成重构，有些系统调用需要在这里临时处理，以后这里的特殊处理要删掉。
     match syscall_num {
-        SYS_FORK | SYS_VFORK => {
-            syscall_return!(
-                Syscall::fork(frame).unwrap_or_else(|e| e.to_posix_errno() as usize),
-                frame
-            )
-        }
-
         SYS_RT_SIGRETURN => {
             syscall_return!(SystemError::ENOSYS.to_posix_errno() as usize, frame);
         }
-        // SYS_SCHED => {
-        //     syscall_return!(sched(from_user) as u64, regs);
-        // }
         _ => {}
     }
     syscall_return!(Syscall::handle(syscall_num, &args, frame) as u64, frame);

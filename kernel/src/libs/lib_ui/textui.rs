@@ -86,19 +86,12 @@ pub unsafe fn textui_framwork_init() {
 
         scm_register(textui_framework()).expect("register textui framework failed");
         kdebug!("textui framework init success");
-        kdebug!(
-            "ENABLE_PUT_TO_WINDOW: {:?}",
-            ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst)
-        );
+
         c_uart_send_str(
             UartPort::COM1.to_u16(),
             "\ntext ui initialized\n\0".as_ptr(),
         );
         unsafe { TEXTUI_IS_INIT = true };
-        kdebug!(
-            "ENABLE_PUT_TO_WINDOW: {:?}",
-            ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst)
-        );
     } else {
         panic!("Try to init TEXTUI_FRAMEWORK twice!");
     }

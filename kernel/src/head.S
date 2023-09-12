@@ -485,6 +485,9 @@ go_to_ignore_int:
 ENTRY(head_stack_start)
     .quad initial_proc_union + 32768
 
+.align 32768
+initial_proc_union:
+    .fill 32768, 1, 0
 
 // 初始化页表
 .align 0x1000 //设置为4k对齐

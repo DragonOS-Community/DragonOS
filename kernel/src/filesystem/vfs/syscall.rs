@@ -134,13 +134,7 @@ impl Syscall {
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
-        kdebug!(
-            "open: path: {}, mode: {:?}, pid: {:?}, preempt count: {}",
-            path,
-            mode,
-            ProcessManager::current_pcb().pid(),
-            ProcessManager::current_pcb().preempt_count()
-        );
+
         // 文件名过长
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -199,13 +193,7 @@ impl Syscall {
             .write()
             .alloc_fd(file, None)
             .map(|fd| fd as usize);
-        kdebug!(
-            "open ok: path: {}, mode: {:?}, pid: {:?}, preempt count: {}",
-            path,
-            mode,
-            ProcessManager::current_pcb().pid(),
-            ProcessManager::current_pcb().preempt_count()
-        );
+
         return r;
     }
 

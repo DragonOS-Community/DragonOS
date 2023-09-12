@@ -102,18 +102,6 @@ void system_initialize()
 
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
-    // // =========== 重新设置initial_tss[0]的ist
-    // uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
-    // ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
-
-    // initial_tss[0].ist1 = (ul)ptr;
-    // initial_tss[0].ist2 = (ul)ptr;
-    // initial_tss[0].ist3 = (ul)ptr;
-    // initial_tss[0].ist4 = (ul)ptr;
-    // initial_tss[0].ist5 = (ul)ptr;
-    // initial_tss[0].ist6 = (ul)ptr;
-    // initial_tss[0].ist7 = (ul)ptr;
-    // // ===========================
 
     acpi_init();
     io_mfence();

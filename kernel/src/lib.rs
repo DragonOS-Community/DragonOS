@@ -34,7 +34,6 @@ mod filesystem;
 mod ipc;
 mod mm;
 mod net;
-#[macro_use]
 mod process;
 mod sched;
 mod smp;

@@ -88,7 +88,7 @@ impl PortManager {
     /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
     ///
     /// TODO: 增加支持端口复用的逻辑
-    pub fn get_port(
+    pub fn bind_port(
         &self,
         socket_type: SocketType,
         port: u16,
@@ -458,7 +458,7 @@ impl UdpSocket {
     fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(ip)) = endpoint {
             // 检测端口是否已被占用
-            PORT_MANAGER.get_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
 
             let bind_res = if ip.addr.is_unspecified() {
                 socket.bind(ip.port)
@@ -813,7 +813,7 @@ impl Socket for TcpSocket {
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             // 检测端口是否被占用
-            PORT_MANAGER.get_port(self.metadata.socket_type, temp_port, self.handle.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port, self.handle.clone())?;
 
             // kdebug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDriver> = NET_DRIVERS.write().get(&0).unwrap().clone();
@@ -887,7 +887,7 @@ impl Socket for TcpSocket {
             }
 
             // 检测端口是否已被占用
-            PORT_MANAGER.get_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
@@ -937,7 +937,7 @@ impl Socket for TcpSocket {
                     // 更新端口与 handle 的绑定
                     if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
                         PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?;
-                        PORT_MANAGER.get_port(
+                        PORT_MANAGER.bind_port(
                             self.metadata.socket_type,
                             ip.port,
                             new_handle.clone(),

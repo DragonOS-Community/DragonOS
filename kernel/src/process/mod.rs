@@ -251,8 +251,7 @@ impl ProcessManager {
         if !pcb.is_none() {
             let pcb = pcb.unwrap();
             // 判断该pcb是否在全局没有任何引用
-            let weak_ref = Arc::downgrade(&pcb);
-            if weak_ref.strong_count() <= 1 {
+            if Arc::strong_count(&pcb) <= 1 {
                 drop(pcb);
                 ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
             } else {
@@ -595,12 +594,14 @@ impl ProcessControlBlock {
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
-        let f = fd_table_guard.get_file_ref_by_fd(fd)?;
+        let f = fd_table_guard.get_file_by_fd(fd)?;
+        drop(fd_table_guard);
 
-        if f.file_type() != FileType::Socket {
+        let guard = f.lock();
+        if guard.file_type() != FileType::Socket {
             return None;
         }
-        let socket: Arc<SocketInode> = f
+        let socket: Arc<SocketInode> = guard
             .inode()
             .downcast_arc::<SocketInode>()
             .expect("Not a socket inode");

@@ -1,10 +1,10 @@
 use core::mem::MaybeUninit;
 
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec, rc::Rc};
 
 use crate::{
     driver::tty::TtyFilePrivateData, filesystem::procfs::ProcfsFilePrivateData, kerror,
-    process::ProcessManager, syscall::SystemError,
+    process::ProcessManager, syscall::SystemError, libs::spinlock::SpinLock,
 };
 
 use super::{io::SeekFrom, Dirent, FileType, IndexNode, Metadata};
@@ -381,7 +381,7 @@ impl Drop for File {
 #[derive(Debug)]
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
-    fds: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD],
+    fds: [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD],
 }
 
 impl FileDescriptorVec {
@@ -389,7 +389,7 @@ impl FileDescriptorVec {
 
     pub fn new() -> FileDescriptorVec {
         // 先声明一个未初始化的数组
-        let mut data: [MaybeUninit<Option<Box<File>>>; FileDescriptorVec::PROCESS_MAX_FD] =
+        let mut data: [MaybeUninit<Option<Arc<SpinLock<File>>>>; FileDescriptorVec::PROCESS_MAX_FD] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
         // 逐个把每个元素初始化为None
@@ -397,8 +397,8 @@ impl FileDescriptorVec {
             data[i] = MaybeUninit::new(None);
         }
         // 由于一切都初始化完毕，因此将未初始化的类型强制转换为已经初始化的类型
-        let data: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD] = unsafe {
-            core::mem::transmute::<_, [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD]>(data)
+        let data: [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD] = unsafe {
+            core::mem::transmute::<_, [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD]>(data)
         };
 
         // 初始化文件描述符数组结构体
@@ -412,8 +412,8 @@ impl FileDescriptorVec {
         let mut res = FileDescriptorVec::new();
         for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
             if let Some(file) = &self.fds[i] {
-                if let Some(file) = file.try_clone() {
-                    res.fds[i] = Some(Box::new(file));
+                if let Some(file) = file.lock().try_clone() {
+                    res.fds[i] = Some(Arc::new(SpinLock::new(file)));
                 }
             }
         }
@@ -451,7 +451,7 @@ impl FileDescriptorVec {
             let new_fd = fd.unwrap();
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
-                *x = Some(Box::new(file));
+                *x = Some(Arc::new(SpinLock::new(file)));
                 return Ok(new_fd);
             } else {
                 return Err(SystemError::EBADF);
@@ -460,7 +460,7 @@ impl FileDescriptorVec {
             // 没有指定要申请的文件描述符编号
             for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
                 if self.fds[i].is_none() {
-                    self.fds[i] = Some(Box::new(file));
+                    self.fds[i] = Some(Arc::new(SpinLock::new(file)));
                     return Ok(i as i32);
                 }
             }
@@ -468,37 +468,16 @@ impl FileDescriptorVec {
         }
     }
 
-    /// 根据文件描述符序号，获取文件结构体的可变引用
+    /// 根据文件描述符序号，获取文件结构体的Arc指针
     ///
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
-    ///
-    /// ## 返回
-    ///
-    /// 返回Option(&mut File) 文件对象的可变引用
-    pub fn get_file_mut_by_fd(&mut self, fd: i32) -> Option<&mut File> {
+    pub fn get_file_by_fd(&self, fd: i32) -> Option<Arc<SpinLock<File>>> {
         if !FileDescriptorVec::validate_fd(fd) {
             return None;
         }
-        return self.fds[fd as usize].as_deref_mut();
-    }
-
-    /// 根据文件描述符序号，获取文件结构体的不可变引用
-    ///
-    /// ## 参数
-    ///
-    /// - `fd` 文件描述符序号
-    ///
-    /// ## 返回
-    ///
-    /// 返回Option(&mut File) 文件对象的不可变引用
-    #[allow(dead_code)]
-    pub fn get_file_ref_by_fd(&self, fd: i32) -> Option<&File> {
-        if !FileDescriptorVec::validate_fd(fd) {
-            return None;
-        }
-        return self.fds[fd as usize].as_deref();
+        return self.fds[fd as usize].clone();
     }
 
     /// 释放文件描述符，同时关闭文件。
@@ -512,15 +491,15 @@ impl FileDescriptorVec {
             return Err(SystemError::EBADF);
         }
 
-        let f = self.get_file_ref_by_fd(fd);
+        let f = self.get_file_by_fd(fd);
         if f.is_none() {
             // 如果文件描述符不存在，报错
             return Err(SystemError::EBADF);
         }
 
         // 把文件描述符数组对应位置设置为空
-        self.fds[fd as usize] = None;
-
+        let file = self.fds[fd as usize].take().unwrap();
+        assert!(Arc::strong_count(&file) == 1);
         return Ok(());
     }
 }

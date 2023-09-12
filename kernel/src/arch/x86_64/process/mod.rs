@@ -1,7 +1,7 @@
 use core::{
     arch::asm,
     intrinsics::unlikely,
-    mem::{size_of, ManuallyDrop},
+    mem::ManuallyDrop,
     sync::atomic::{compiler_fence, Ordering},
 };
 

@@ -22,7 +22,6 @@
 #include <filesystem/vfs/VFS.h>
 
 #include "driver/acpi/acpi.h"
-#include "driver/disk/ahci/ahci.h"
 #include "driver/disk/ata.h"
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
@@ -175,7 +174,7 @@ void system_initialize()
     // 启用double buffer
     // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
-
+    cli();
     HPET_enable();
 
     io_mfence();
@@ -183,6 +182,7 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
+    sti();
     while (1)
         ;
 }

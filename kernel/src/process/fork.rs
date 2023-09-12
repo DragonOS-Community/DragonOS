@@ -41,7 +41,7 @@ impl ProcessManager {
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
         // 克隆架构相关信息
-        *pcb.arch_info() = current_pcb.arch_info().clone();
+        *pcb.arch_info() = current_pcb.arch_info_irqsave().clone();
 
         // 为内核线程设置worker private字段。（也许由内核线程机制去做会更好？）
         if current_pcb.flags().contains(ProcessFlags::KTHREAD) {

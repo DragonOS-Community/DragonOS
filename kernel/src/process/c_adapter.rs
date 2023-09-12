@@ -1,3 +1,5 @@
+use crate::driver::uart::uart::{c_uart_send_str, UartDriver};
+
 use super::{kthread::kthread_init, process::stdio_init, process_init, ProcessManager};
 
 #[no_mangle]
@@ -34,6 +36,11 @@ pub extern "C" fn rs_current_pcb_pid() -> u32 {
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_preempt_count() -> u32 {
     return ProcessManager::current_pcb().preempt_count() as u32;
+}
+
+#[no_mangle]
+pub extern "C" fn rs_uart_send_preempt_count() {
+    c_uart_send_str(0x3f8, format!("preempt_count: {}\n\0", ProcessManager::current_pcb().preempt_count()).as_ptr())
 }
 
 #[no_mangle]

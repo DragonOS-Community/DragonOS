@@ -20,8 +20,27 @@ export OBJCOPY=objcopy
 if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
 	exit 0
 fi
-#仅支持Ubuntu/Debain下的自动安装
-if ! hash 2>/dev/null apt-get; then
+#仅支持Ubuntu/Debain, Arch下的自动安装
+supported_package_manager="apt-get pacman"
+packages=("make binutils bison gcc gettext flex bison automake autoconf wget" \
+          "make binutils bison gcc gettext flex bison automake autoconf wget")
+update_options=("update" \
+                "-Sy")
+install_options=("install -y" \
+                 "-S --needed --noconfirm")
+found_pm=0
+pm_index=0
+for pm in ${supported_package_manager}; do
+    if hash 2>/dev/null ${pm}; then
+        found_pm=1
+        break
+    fi
+    let pm_index=$pm_index+1
+done
+if [ ${found_pm} = "1" ]; then
+	echo "found package manager: ${pm}"
+else
+	echo "找不到任何支持的包管理器: ${supported_package_manager}"
 	echo "脚本暂不支持对该系统下grub的安装，请手动完成"
 	exit 0
 fi
@@ -35,17 +54,8 @@ fi
 
 tar xvf grub-2.06.tar.xz
 #安装对应依赖
-sudo apt-get update
-sudo apt-get install -y \
-	make 	\
-  	binutils \
-  	bison 	\
-  	gcc 	\
-  	gettext \
-	flex	\
-	bison	\
-	automake	\
-	autoconf	
+sudo ${pm} ${update_options[$pm_index]}
+sudo ${pm} ${install_options[$pm_index]} ${packages[$pm_index]}
 	
 cd grub-2.06
 echo "开始安装grub2.06"

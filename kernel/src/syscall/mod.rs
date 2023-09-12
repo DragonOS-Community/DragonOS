@@ -652,13 +652,13 @@ impl Syscall {
 
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
-                let pipefd = args[0] as *mut c_int;
-                match UserBufferWriter::new(pipefd, core::mem::size_of::<[c_int; 2]>(), from_user) {
-                    Err(e) => Err(e),
-                    Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
-                        Err(e) => Err(e),
-                        Ok(pipefd) => Self::pipe(pipefd),
-                    },
+                let pipefd: *mut i32 = args[0] as *mut c_int;
+                let arg1 = args[1];
+                if pipefd.is_null() {
+                    Err(SystemError::EFAULT)
+                } else {
+                    let flags = FileMode::from_bits_truncate(arg1 as u32);
+                    Self::pipe2(pipefd, flags)
                 }
             }
 

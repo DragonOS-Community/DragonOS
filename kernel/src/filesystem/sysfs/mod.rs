@@ -3,7 +3,13 @@ use super::vfs::{
     PollStatus,
 };
 use crate::{
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    driver::base::platform::platform_bus_init,
+    filesystem::{sysfs::bus::sys_bus_init, vfs::ROOT_INODE},
+    kdebug, kinfo,
+    libs::{
+        once::Once,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     syscall::SystemError,
     time::TimeSpec,
 };
@@ -442,4 +448,34 @@ impl SysFSInode {
             fs: Weak::default(),
         };
     }
+}
+
+pub fn sysfs_init() -> Result<(), SystemError> {
+    static INIT: Once = Once::new();
+    let mut result = None;
+    INIT.call_once(|| {
+        kinfo!("Initializing SysFS...");
+        // 创建 sysfs 实例
+        let sysfs: Arc<SysFS> = SysFS::new();
+
+        // sysfs 挂载
+        let _t = ROOT_INODE()
+            .find("sys")
+            .expect("Cannot find /sys")
+            .mount(sysfs)
+            .expect("Failed to mount sysfs");
+        kinfo!("SysFS mounted.");
+
+        // 初始化platform总线
+        platform_bus_init().expect("platform bus init failed");
+
+        sys_bus_init(&SYS_BUS_INODE()).unwrap_or_else(|err| {
+            panic!("sys_bus_init failed: {:?}", err);
+        });
+
+        kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
+        result = Some(Ok(()));
+    });
+
+    return result.unwrap();
 }

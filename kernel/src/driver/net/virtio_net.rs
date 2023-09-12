@@ -245,7 +245,7 @@ impl<T: Transport> Driver for VirtioInterface<T> {
         self
     }
 
-    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
+    fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError> {
         todo!()
     }
 

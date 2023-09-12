@@ -8,7 +8,7 @@ use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
     driver::{
-        base::{block::disk_info::Partition, platform::platform_bus_init},
+        base::block::disk_info::Partition,
         disk::ahci::{self},
     },
     filesystem::{
@@ -16,7 +16,7 @@ use crate::{
         fat::fs::FATFileSystem,
         procfs::ProcFS,
         ramfs::RamFS,
-        sysfs::{bus::sys_bus_init, SysFS, SYS_BUS_INODE},
+        sysfs::sysfs_init,
         vfs::{mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::PAGE_4K_SIZE,
@@ -91,28 +91,12 @@ pub extern "C" fn vfs_init() -> i32 {
         .expect("Failed to mount devfs");
     kinfo!("DevFS mounted.");
 
-    // 创建 sysfs 实例
-    let sysfs: Arc<SysFS> = SysFS::new();
-
-    // sysfs 挂载
-    let _t = root_inode
-        .find("sys")
-        .expect("Cannot find /sys")
-        .mount(sysfs)
-        .expect("Failed to mount sysfs");
-    kinfo!("SysFS mounted.");
+    sysfs_init().expect("Failed to initialize sysfs");
 
     let root_inode = ROOT_INODE().list().expect("VFS init failed");
     if root_inode.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
-    // 初始化platform总线
-    platform_bus_init().expect("platform bus init failed");
-
-    let _result = sys_bus_init(&SYS_BUS_INODE()).map_err(|e| return e.to_posix_errno());
-
-    kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
-
     return 0;
 }
 

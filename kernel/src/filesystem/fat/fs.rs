@@ -1424,7 +1424,6 @@ impl IndexNode for LockedFATInode {
         _mode: u32,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
-        kdebug!("-----------in FATINode Create()----------------");
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 

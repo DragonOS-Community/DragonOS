@@ -13,6 +13,10 @@ use crate::{
 
 use super::uart_device::LockedUart;
 
+lazy_static! {
+    pub static ref UART_COMPAT_TABLE: CompatibleTable = CompatibleTable::new(vec!["uart"]);
+}
+
 #[derive(Debug)]
 pub struct InnerUartDriver {
     id_table: IdTable,
@@ -29,10 +33,11 @@ impl Default for UartDriver {
     }
 }
 
+
 impl Driver for UartDriver {
-    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
+    fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError> {
         let compatible_table = data.compatible_table();
-        if compatible_table.matches(&CompatibleTable::new(vec!["uart"])) {
+        if compatible_table.matches(&UART_COMPAT_TABLE) {
             return Ok(());
         }
 
@@ -42,10 +47,10 @@ impl Driver for UartDriver {
     fn load(
         &self,
         data: DevicePrivateData,
-        resource: Option<DeviceResource>,
+        _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
         let compatible_table = data.compatible_table();
-        if compatible_table.matches(&CompatibleTable::new(vec!["uart"])) {
+        if compatible_table.matches(&UART_COMPAT_TABLE) {
             let device = LockedUart::default();
             let arc_device = Arc::new(device);
             DEVICE_MANAGER.add_device(data.id_table().clone(), arc_device.clone());

@@ -353,12 +353,12 @@ impl BlockDeviceOps {
         DEVICE_MANAGER.add_device(id_table, bdev.device())
     }
 
-    /// @brief: 字符设备注销
+    /// @brief: block设备注销
     /// @parameter: dev_t: 字符设备号
     ///             range: 次设备号范围
     /// @return: none
     #[allow(dead_code)]
-    pub fn bdev_del(dev_t: DeviceNumber, range: usize) {}
+    pub fn bdev_del(_devnum: DeviceNumber, _range: usize) {}
 }
 
 /// @brief 字符设备框架函数集

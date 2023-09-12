@@ -610,11 +610,11 @@ impl FATDir {
                 LongDirEntry::validate_long_name(name)?;
                 // 目标目录项
                 let mut short_entry = ShortDirEntry::default();
-                kdebug!("to allocate cluster");
+
                 let first_cluster: Cluster = fs.allocate_cluster(None)?;
                 short_entry.set_first_cluster(first_cluster);
 
-                kdebug!("to create dot");
+
                 // === 接下来在子目录中创建'.'目录项和'..'目录项
                 let mut offset = 0;
                 // '.'目录项
@@ -630,7 +630,6 @@ impl FATDir {
                 // 偏移量加上一个目录项的长度
                 offset += FATRawDirEntry::DIR_ENTRY_LEN;
 
-                kdebug!("to create dot dot");
                 // '..'目录项
                 let mut dot_dot_entry = ShortDirEntry::default();
                 dot_dot_entry.name = ShortNameGenerator::new("..").generate().unwrap();

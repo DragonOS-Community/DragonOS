@@ -58,7 +58,7 @@ pub trait Device: KObject {
     /// @brief: 设置sysfs info
     /// @parameter: None
     /// @return: 该设备唯一标识
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
+    fn set_sys_info(&self, _sys_info: Option<Arc<dyn IndexNode>>) {
         unimplemented!();
     }
 
@@ -71,6 +71,7 @@ pub trait Device: KObject {
 }
 
 // 暂定是不可修改的，在初始化的时候就要确定。以后可能会包括例如硬件中断包含的信息
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DevicePrivateData {
     id_table: IdTable,
@@ -102,6 +103,7 @@ impl DevicePrivateData {
         self.state
     }
 
+    #[allow(dead_code)]
     pub fn resource(&self) -> Option<&DeviceResource> {
         self.resource.as_ref()
     }
@@ -215,12 +217,8 @@ impl IdTable {
     /// @brief: 将设备标识符转换成name
     /// @parameter None
     /// @return: 设备名
-    pub fn to_name(&self) -> String {
-        return format!("{}:{:?}", self.0, self.1 .0);
-    }
-
     pub fn name(&self) -> String {
-        return self.name().clone();
+        return format!("{}:{:?}", self.0, self.1 .0);
     }
 
     pub fn device_number(&self) -> DeviceNumber {
@@ -244,12 +242,13 @@ pub enum DeviceState {
 }
 
 /// @brief: 设备错误类型
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone)]
 pub enum DeviceError {
     DriverExists,         // 设备已存在
     DeviceExists,         // 驱动已存在
     InitializeFailed,     // 初始化错误
-    UnInitializedDevice,  // 未初始化的设备
+    NotInitialized,       // 未初始化的设备
     NoDeviceForDriver,    // 没有合适的设备匹配驱动
     NoDriverForDevice,    // 没有合适的驱动匹配设备
     RegisterError,        // 注册失败
@@ -262,7 +261,7 @@ impl Into<SystemError> for DeviceError {
             DeviceError::DriverExists => SystemError::EEXIST,
             DeviceError::DeviceExists => SystemError::EEXIST,
             DeviceError::InitializeFailed => SystemError::EIO,
-            DeviceError::UnInitializedDevice => SystemError::ENODEV,
+            DeviceError::NotInitialized => SystemError::ENODEV,
             DeviceError::NoDeviceForDriver => SystemError::ENODEV,
             DeviceError::NoDriverForDevice => SystemError::ENODEV,
             DeviceError::RegisterError => SystemError::EIO,
@@ -368,7 +367,7 @@ impl DeviceManager {
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
     DEVICE_MANAGER.add_device(device.id_table(), device.clone());
-    match sys_device_register(&device.id_table().to_name()) {
+    match sys_device_register(&device.id_table().name()) {
         Ok(sys_info) => {
             device.set_sys_info(Some(sys_info));
             return Ok(());
@@ -382,7 +381,7 @@ pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_unregister<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
     DEVICE_MANAGER.add_device(device.id_table(), device.clone());
-    match sys_device_unregister(&device.id_table().to_name()) {
+    match sys_device_unregister(&device.id_table().name()) {
         Ok(_) => {
             device.set_sys_info(None);
             return Ok(());

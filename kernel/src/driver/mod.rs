@@ -35,13 +35,13 @@ pub trait Driver: Sync + Send + Debug {
 
     /// @brief 添加可支持的设备
     /// @parameter: device 新增的匹配项
-    fn append_compatible_table(&self, device: &CompatibleTable) -> Result<(), DriverError> {
+    fn append_compatible_table(&self, _device: &CompatibleTable) -> Result<(), DriverError> {
         Err(DriverError::UnsupportedOperation)
     }
 
     /// @brief 探测设备
     /// @param data 设备初始拥有的基本信息
-    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError>;
+    fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError>;
 
     /// @brief 加载设备，包括检查资源可用性，和注册到相应的管理器中。
     /// @param data 设备初始拥有的信息

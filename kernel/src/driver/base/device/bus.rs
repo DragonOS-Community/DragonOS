@@ -177,7 +177,7 @@ impl LockedBusManager {
 /// @return: 成功:()   失败:DeviceError
 pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
     BUS_MANAGER.add_bus(bus.id_table(), bus.clone());
-    match sys_bus_register(&bus.id_table().to_name()) {
+    match sys_bus_register(&bus.id_table().name()) {
         Ok(inode) => {
             let _ = sys_bus_init(&inode);
             return device_register(bus);

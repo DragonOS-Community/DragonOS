@@ -41,16 +41,12 @@ impl CompatibleTable {
     /// @return: 如果匹配成功，返回true，否则，返回false
     #[allow(dead_code)]
     pub fn matches(&self, other: &CompatibleTable) -> bool {
-        for id in &self.0 {
-            if other.0.contains(id) {
-                return true;
-            }
-        }
-        return false;
+        self.0.intersection(&other.0).next().is_some()
     }
 
     /// @brief: 添加一组匹配条目
     /// @param:
+    #[allow(dead_code)]
     pub fn add_device(&mut self, devices: Vec<&'static str>) {
         for str in devices {
             self.0.insert(str);
@@ -208,14 +204,14 @@ impl Driver for LockedPlatformBusDriver {
         self.0.lock().sys_info = sys_info;
     }
 
-    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
+    fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
         todo!()
     }
 
     fn load(
         &self,
-        data: DevicePrivateData,
-        resource: Option<DeviceResource>,
+        _data: DevicePrivateData,
+        _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
         todo!()
     }

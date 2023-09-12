@@ -1,21 +1,16 @@
-use crate::{
-    driver::uart::uart_device::uart_init,
-    filesystem::vfs::file::{File, FileMode},
-    kinfo,
-    syscall::{Syscall, SystemError},
-};
-
-use super::{CHARDEVS, DEVICE_MANAGER};
+use crate::{driver::uart::uart_device::uart_init, kinfo, syscall::SystemError};
 
 #[no_mangle]
-pub extern "C" fn device_init() -> i32 {
-    let result = uart_device_init();
-    if result.is_err() {
-        return result.unwrap_err().to_posix_errno();
-    }
-    return 0;
+pub extern "C" fn rs_device_init() -> i32 {
+    let result = device_init()
+        .map(|_| 0)
+        .unwrap_or_else(|e| e.to_posix_errno());
+
+    return result;
 }
 
-fn uart_device_init() -> Result<(), SystemError> {
-    return uart_init();
+pub fn device_init() -> Result<(), SystemError> {
+    uart_init()?;
+    kinfo!("device init success");
+    return Ok(());
 }

@@ -548,7 +548,7 @@ impl Driver for LockedUartDriver {
         return self.0.lock().sys_info.clone();
     }
 
-    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
+    fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError> {
         let table = data.compatible_table();
         if table.matches(&CompatibleTable::new(vec!["uart"])) {
             return Ok(());
@@ -690,14 +690,14 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
 /// @return 初始化成功，返回(),失败，返回错误码
 pub fn uart_init() -> Result<(), SystemError> {
     LockedUart::uart_init(&UartPort::COM1, 115200).map_err(|_| SystemError::ENODEV)?;
-    let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().to_name())
+    let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().name())
         .expect("uart device register error");
     UART_DEV.set_sys_info(Some(device_inode));
-    let driver_inode = bus_driver_register("platform:0", &UART_DRV.id_table().to_name())
+    let driver_inode = bus_driver_register("platform:0", &UART_DRV.id_table().name())
         .expect("uart driver register error");
     UART_DRV.set_sys_info(Some(driver_inode));
     UART_DEV.set_state(DeviceState::Initialized);
-    devfs_register(&UART_DEV.id_table().to_name(), UART_DEV.clone())?;
+    devfs_register(&UART_DEV.id_table().name(), UART_DEV.clone())?;
     DEVICE_MANAGER.add_device(UART_DEV.id_table().clone(), UART_DEV.clone());
     return Ok(());
 }

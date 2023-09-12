@@ -12,15 +12,7 @@ use crate::{
 };
 
 use alloc::sync::{Arc, Weak};
-bitflags! {
-  pub struct PipeFlag:u32 {
-    // 管道标志位
-    const NORMAL=0;//  0：默认行为，创建一个阻塞管道。与使用 pipe 函数创建的管道行为一致。
-    // 设为fcntl里面的定义的数，方便C里面调用
-    const  O_NONBLOCK = 2048; // 创建一个非阻塞管道
-    const O_CLOEXEC = 524288; // 在执行 exec 调用时关闭管道文件描述符。
-   }
-}
+
 /// 我们设定pipe_buff的总大小为1024字节
 const PIPE_BUFF_SIZE: usize = 1024;
 
@@ -57,7 +49,7 @@ impl LockedPipeInode {
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
-                size: 0,
+                size: PIPE_BUFF_SIZE as i64,
                 blk_size: 0,
                 blocks: 0,
                 atime: TimeSpec::default(),
@@ -95,7 +87,7 @@ impl IndexNode for LockedPipeInode {
         // 加锁
         let mut inode = self.0.lock();
 
-        //如果管道里面没有数据，则唤醒写端，
+        // 如果管道里面没有数据，则唤醒写端，
         while inode.valid_cnt == 0 {
             inode.write_wait_queue.wakeup(PROC_INTERRUPTIBLE.into());
             // 如果为非阻塞管道，直接返回错误

@@ -1,5 +1,4 @@
 use core::{
-    ffi::c_void,
     hash::{Hash, Hasher},
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
@@ -27,6 +26,7 @@ use crate::{
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
+        wait_queue::WaitQueue,
     },
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
@@ -206,6 +206,7 @@ impl ProcessManager {
         let mut writer = pcb.sched_info_mut_irqsave();
         if writer.state() != ProcessState::Exited(0) {
             writer.set_state(ProcessState::Blocked(interruptable));
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
 
             return Ok(());
@@ -239,6 +240,7 @@ impl ProcessManager {
         pcb.sched_info
             .write()
             .set_state(ProcessState::Exited(exit_code));
+        pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
         drop(pcb);
         ProcessManager::exit_notify();
         drop(irq_guard);
@@ -402,6 +404,9 @@ pub struct ProcessControlBlock {
 
     /// 子进程链表
     children: RwLock<HashMap<Pid, Arc<ProcessControlBlock>>>,
+
+    /// 等待队列
+    wait_queue: WaitQueue,
 }
 
 impl ProcessControlBlock {
@@ -460,6 +465,7 @@ impl ProcessControlBlock {
             arch_info,
             parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(HashMap::new()),
+            wait_queue: WaitQueue::INIT,
         };
 
         let pcb = Arc::new(pcb);
@@ -621,7 +627,6 @@ impl ProcessControlBlock {
 
                 return Ok(());
             }
-            // FIXME 没有找到1号进程返回什么错误码
             _ => Err(SystemError::ECHILD),
         }
     }
@@ -650,7 +655,6 @@ impl Drop for ProcessControlBlock {
         unsafe { ProcessManager::release(self.pid()) };
     }
 }
-
 /// 进程的基本信息
 ///
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。

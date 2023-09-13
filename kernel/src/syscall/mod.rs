@@ -589,22 +589,13 @@ impl Syscall {
                 }
             }
             SYS_WAIT4 => {
-                let pid = args[0] as pid_t;
-                let wstatus = args[1] as *mut c_int;
+                let pid = args[0] as i64;
+                let wstatus = args[1] as *mut i32;
                 let options = args[2] as c_int;
                 let rusage = args[3] as *mut c_void;
-                let virt_wstatus = VirtAddr::new(wstatus as usize);
-                let virt_rusage = VirtAddr::new(rusage as usize);
                 // 权限校验
                 // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                if frame.from_user()
-                    && (verify_area(virt_wstatus, core::mem::size_of::<c_int>() as usize).is_err()
-                        || verify_area(virt_rusage, PAGE_4K_SIZE as usize).is_err())
-                {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::wait4(pid, wstatus, options, rusage)
-                }
+                Self::wait4(pid, wstatus, options, rusage)
             }
 
             SYS_EXIT => {

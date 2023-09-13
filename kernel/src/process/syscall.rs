@@ -1,22 +1,21 @@
-use core::ffi::{c_int, c_void};
+use core::ffi::c_void;
 
 use alloc::{string::String, vec::Vec};
 
-use super::{fork::CloneFlags, Pid, ProcessManager};
+use super::{fork::CloneFlags, Pid, ProcessManager, ProcessState};
 use crate::{
-    arch::interrupt::TrapFrame,
+    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
     filesystem::vfs::MAX_PATHLEN,
-    include::bindings::bindings::pid_t,
     kdebug,
     process::ProcessControlBlock,
     syscall::{
-        user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
+        user_access::{
+            check_and_clone_cstr, check_and_clone_cstr_array, UserBufferReader, UserBufferWriter,
+        },
         Syscall, SystemError,
     },
 };
-extern "C" {
-    fn c_sys_wait4(pid: pid_t, wstatus: *mut c_int, options: c_int, rusage: *mut c_void) -> c_int;
-}
 
 impl Syscall {
     pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
@@ -67,19 +66,65 @@ impl Syscall {
     }
 
     pub fn wait4(
-        pid: pid_t,
-        wstatus: *mut c_int,
-        options: c_int,
+        pid: i64,
+        wstatus: *mut i32,
+        options: i32,
         rusage: *mut c_void,
     ) -> Result<usize, SystemError> {
-        // TODO 将c_sys_wait4使用rust实现
-        let ret = unsafe { c_sys_wait4(pid, wstatus, options, rusage) };
-        if (ret as isize) < 0 {
-            return Err(
-                SystemError::from_posix_errno((ret as isize) as i32).expect("wait4: Invalid errno")
-            );
+        let mut _rusage_buf =
+            UserBufferReader::new::<c_void>(rusage, core::mem::size_of::<c_void>(), true)?;
+
+        let mut wstatus_buf =
+            UserBufferWriter::new::<i32>(wstatus, core::mem::size_of::<i32>(), true)?;
+
+        // 暂时不支持options选项
+        if options != 0 {
+            return Err(SystemError::EINVAL);
         }
-        return Ok(ret as usize);
+
+        let cur_pcb = ProcessManager::current_pcb();
+        let rd_childen = cur_pcb.children.read();
+
+        if pid > 0 {
+            let pid = Pid(pid as usize);
+            let child_pcb = rd_childen.get(&pid).ok_or(SystemError::ECHILD)?.clone();
+            drop(rd_childen);
+
+            // 获取退出码
+            if let ProcessState::Exited(status) = child_pcb.sched_info().state() {
+                if !wstatus.is_null() {
+                    wstatus_buf.copy_one_to_user(&status, 0)?;
+                }
+                return Ok(pid.into());
+            }
+            // 等待指定进程
+            child_pcb.wait_queue.sleep();
+        } else if pid < -1 {
+            // TODO 判断是否pgid == -pid（等待指定组任意进程）
+            // 暂时不支持
+            return Err(SystemError::EINVAL);
+        } else if pid == 0 {
+            // TODO 判断是否pgid == current_pgid（等待当前组任意进程）
+            // 暂时不支持
+            return Err(SystemError::EINVAL);
+        } else {
+            // 等待任意子进程(这两)
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            for (pid, pcb) in rd_childen.iter() {
+                if pcb.sched_info().state().is_exited() {
+                    if !wstatus.is_null() {
+                        wstatus_buf.copy_one_to_user(&0, 0)?;
+                    }
+                    return Ok(pid.clone().into());
+                } else {
+                    unsafe { pcb.wait_queue.sleep_without_schedule() };
+                }
+            }
+            drop(irq_guard);
+            sched();
+        }
+
+        return Ok(0);
     }
 
     /// # 退出进程

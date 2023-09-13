@@ -11,10 +11,10 @@ use crate::{
     },
     kerror,
     libs::{
-        lib_ui::textui::{textui_putchar, FontColor},
+        lib_ui::{textui::{textui_putchar, FontColor}, termios::{Winsize, Termios}},
         rwlock::RwLock,
     },
-    syscall::SystemError,
+    syscall::SystemError, kinfo,
 };
 
 use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
@@ -34,6 +34,10 @@ pub struct TtyDevice {
     fs: RwLock<Weak<DevFS>>,
     /// TTY设备私有信息
     private_data: RwLock<TtyDevicePrivateData>,
+    /// 终端窗口大小(主要用于终端模拟器)
+    winsize:RwLock<Winsize>,
+    /// 终端窗口属性
+    termios: RwLock<Termios>,
 }
 
 #[derive(Debug)]
@@ -51,6 +55,8 @@ impl TtyDevice {
             core: TtyCore::new(),
             fs: RwLock::new(Weak::default()),
             private_data: TtyDevicePrivateData::new(name),
+            winsize: RwLock::new(Winsize::new(0, 0, 0, 0)),
+            termios: RwLock::new(Termios::default()),
         });
         // 默认开启输入回显
         result.core.enable_echo();
@@ -263,6 +269,49 @@ impl IndexNode for TtyDevice {
             }
         }
         return Ok(());
+    }
+    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
+        let cmd = cmd as usize;
+         match cmd {
+            //  TIOCGPGRP => {
+            //      // TODO: check the pointer?
+            //      let argp = data as *mut i32; // pid_t
+            //      unsafe { *argp = *self.foreground_pgid.read() };
+            //      Ok(0)
+            //  }
+            //  TIOCSPGRP => {
+            //      let fpgid = unsafe { *(data as *const i32) };
+            //      *self.foreground_pgid.write() = fpgid;
+            //      info!("tty: set foreground process group to {}", fpgid);
+            //      Ok(0)
+            //  }
+             TIOCGWINSZ => {
+                 let winsize = data as *mut Winsize;
+                 unsafe {
+                     *winsize = *self.winsize.read();
+                 }
+                 Ok(0)
+             }
+             TCGETS => {
+                 let termois = data as *mut Termios;
+                 unsafe {
+                     *termois = *self.termios.read();
+                 }
+                 let lflag = self.termios.read().lflag;
+                 kinfo!("get lfags: {:?}", lflag);
+                 Ok(0)
+             }
+             TCSETS => {
+                 let termois = data as *const Termios;
+                 unsafe {
+                     *self.termios.write() = *termois;
+                 }
+                 let lflag = self.termios.read().lflag;
+                 kinfo!("set lfags: {:?}", lflag);
+                 Ok(0)
+             }
+             _ => Err(SystemError::EBADRQC),
+         } 
     }
 }
 

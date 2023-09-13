@@ -40,7 +40,7 @@ pub fn textui_framework() -> &'static mut TextUiFramework {
 /// 初始化TEXTUI_FRAMEWORK
 pub unsafe fn textui_framwork_init() {
     if __TEXTUI_FRAMEWORK.is_none() {
-        kinfo!("textuiframework init");
+        kinfo!("textui framework init");
         let metadata = ScmUiFrameworkMetadata::new("TextUI".to_string(), ScmFramworkType::Text);
         // 为textui框架生成第一个窗口
         let vlines_num = (metadata.buf_info().buf_height() / TEXTUI_CHAR_HEIGHT) as usize;
@@ -320,7 +320,9 @@ impl TextuiCharChromatic {
         lineindex: LineIndex,
     ) -> Result<i32, SystemError> {
         // 找到要渲染的字符的像素点数据
-
+        if self.c==Some('\n'){
+            return Ok(0);
+        }
         let font: Font = Font::get_font(self.c.unwrap_or(' '));
 
         let mut count = TextuiBuf::get_start_index_by_lineid_lineindex(lineid, lineindex);
@@ -487,7 +489,6 @@ impl TextuiWindow {
 
     /// 刷新某个窗口的缓冲区的某个虚拟行的连续n个字符对象
     /// ## 参数
-    /// - window 窗口结构体
     /// - vline_id 要刷新的虚拟行号
     /// - start 起始字符号
     /// - count 要刷新的字符数量
@@ -646,6 +647,13 @@ impl TextuiWindow {
                 vline.index = vline.index + 1;
             }
 
+            //存储换行符后进行换行操作
+            if character == '\n' {
+                // 换行时还需要输出\r
+                c_uart_send(UartPort::COM1.to_u16(), b'\r');
+                self.textui_new_line()?;
+                return Ok(());
+            }
             self.textui_refresh_characters(self.vline_operating, line_index, 1)?;
 
             // 加入光标后，因为会识别光标，所以需超过该行最大字符数才能创建新行
@@ -688,16 +696,15 @@ impl TextuiWindow {
         if !self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return Ok(());
         }
-
-        //进行换行操作
-        if character == '\n' {
-            // 换行时还需要输出\r
-            c_uart_send(UartPort::COM1.to_u16(), b'\r');
-            if is_enable_window == true {
-                self.textui_new_line()?;
-            }
-            return Ok(());
-        }
+        // //进行换行操作
+        // if character == '\n' {
+        //     // 换行时还需要输出\r
+        //     c_uart_send(UartPort::COM1.to_u16(), b'\r');
+        //     if is_enable_window == true {
+        //         self.textui_new_line()?;
+        //     }
+        //     return Ok(());
+        // }
         // 输出制表符
         else if character == '\t' {
             if is_enable_window == true {
@@ -772,8 +779,9 @@ impl TextuiWindow {
             }
         } else {
             // 输出其他字符
-
-            c_uart_send(UartPort::COM1.to_u16(), character as u8);
+            if character != '\n' {
+                c_uart_send(UartPort::COM1.to_u16(), character as u8);
+            }
 
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =

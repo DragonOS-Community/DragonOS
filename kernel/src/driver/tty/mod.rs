@@ -10,6 +10,8 @@ use thingbuf::mpsc::{
 use crate::libs::rwlock::RwLock;
 
 pub mod tty_device;
+pub mod tty_ioctl;
+
 
 bitflags! {
     pub struct TtyCoreState: u32{

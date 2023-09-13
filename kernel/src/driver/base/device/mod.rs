@@ -125,8 +125,8 @@ impl Default for DeviceResource {
 }
 
 /// @brief: 设备号实例
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct DeviceNumber(usize);
+
+int_like!(DeviceNumber, usize);
 
 impl Default for DeviceNumber {
     fn default() -> Self {
@@ -143,6 +143,12 @@ impl From<usize> for DeviceNumber {
 impl Into<usize> for DeviceNumber {
     fn into(self) -> usize {
         self.0
+    }
+}
+
+impl core::hash::Hash for DeviceNumber {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
     }
 }
 

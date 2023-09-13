@@ -203,7 +203,7 @@ impl Device for LockedUart {
 }
 
 impl CharDevice for LockedUart {
-    fn read_at(&self, _offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let device = self.0.lock();
         if len > buf.len() {
             return Err(SystemError::E2BIG);
@@ -216,7 +216,7 @@ impl CharDevice for LockedUart {
         return Ok(len);
     }
 
-    fn write_at(&self, _offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+    fn write(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let device = self.0.lock();
         if len > buf.len() {
             return Err(SystemError::E2BIG);
@@ -247,22 +247,22 @@ impl CharDevice for LockedUart {
 impl IndexNode for LockedUart {
     fn read_at(
         &self,
-        offset: usize,
+        _offset: usize,
         len: usize,
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        CharDevice::read_at(self, offset, len, buf)
+        CharDevice::read(self, len, buf)
     }
 
     fn write_at(
         &self,
-        offset: usize,
+        _offset: usize,
         len: usize,
         buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        CharDevice::write_at(self, offset, len, buf)
+        CharDevice::write(self, len, buf)
     }
 
     fn poll(&self) -> Result<PollStatus, SystemError> {

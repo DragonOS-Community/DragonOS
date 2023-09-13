@@ -260,6 +260,14 @@ impl<T: Transport> Driver for VirtioInterface<T> {
     fn id_table(&self) -> IdTable {
         todo!()
     }
+
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+        todo!()
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
+        todo!()
+    }
 }
 
 impl<T: Transport> NetDriver for VirtioInterface<T> {

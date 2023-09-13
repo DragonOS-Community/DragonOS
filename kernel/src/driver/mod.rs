@@ -61,12 +61,10 @@ pub trait Driver: Sync + Send + Debug {
     /// @brief: 设置驱动的sys information
     /// @parameter id_table: 驱动标识符，用于唯一标识该驱动
     /// @return: 驱动实例
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {}
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>);
 
     /// @brief: 获取驱动的sys information
     /// @parameter id_table: 驱动标识符，用于唯一标识该驱动
     /// @return: 驱动实例
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
-        return None;
-    }
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>>;
 }

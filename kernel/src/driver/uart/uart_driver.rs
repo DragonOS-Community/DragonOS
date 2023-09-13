@@ -67,4 +67,12 @@ impl Driver for UartDriver {
     fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
         return self;
     }
+
+    fn set_sys_info(&self, sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+        todo!()
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
+        todo!()
+    }
 }

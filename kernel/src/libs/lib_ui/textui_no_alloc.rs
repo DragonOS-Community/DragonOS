@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    driver::uart::uart::{c_uart_send, UartPort},
+    driver::uart::uart_device::{c_uart_send, UartPort},
     include::bindings::bindings::video_frame_buffer_info,
     syscall::SystemError,
 };

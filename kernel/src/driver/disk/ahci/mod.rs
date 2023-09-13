@@ -3,13 +3,13 @@ pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
-use crate::filesystem::vfs::io::device::BlockDevice;
+use crate::driver::base::block::block_device::BlockDevice;
+use crate::driver::base::block::disk_info::BLK_GF_AHCI;
 // 依赖的rust工具包
 use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
 use crate::filesystem::devfs::devfs_register;
-use crate::filesystem::vfs::io::disk_info::BLK_GF_AHCI;
 use crate::kerror;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};

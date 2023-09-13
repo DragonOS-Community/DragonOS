@@ -3,7 +3,6 @@
 pub mod core;
 pub mod fcntl;
 pub mod file;
-pub mod io;
 pub mod mount;
 pub mod syscall;
 mod utils;

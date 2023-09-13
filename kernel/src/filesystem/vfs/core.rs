@@ -7,17 +7,20 @@ use core::{
 use alloc::{boxed::Box, format, string::ToString, sync::Arc};
 
 use crate::{
-    driver::disk::ahci::{self},
+    driver::{
+        base::block::disk_info::Partition,
+        disk::ahci::{self},
+    },
     filesystem::{
-        devfs::DevFS,
+        devfs::devfs_init,
         fat::fs::FATFileSystem,
-        procfs::ProcFS,
+        procfs::procfs_init,
         ramfs::RamFS,
-        sysfs::SysFS,
+        sysfs::sysfs_init,
         vfs::{mount::MountFS, FileSystem, FileType},
     },
     include::bindings::bindings::PAGE_4K_SIZE,
-    kerror, kinfo,
+    kdebug, kerror, kinfo,
     syscall::SystemError,
 };
 
@@ -65,37 +68,13 @@ pub extern "C" fn vfs_init() -> i32 {
     root_inode
         .create("sys", FileType::Dir, 0o777)
         .expect("Failed to create /sys");
+    kdebug!("dir in root:{:?}", root_inode.list());
 
-    // // 创建procfs实例
-    let procfs: Arc<ProcFS> = ProcFS::new();
+    procfs_init().expect("Failed to initialize procfs");
 
-    // procfs挂载
-    let _t = root_inode
-        .find("proc")
-        .expect("Cannot find /proc")
-        .mount(procfs)
-        .expect("Failed to mount procfs.");
-    kinfo!("ProcFS mounted.");
+    devfs_init().expect("Failed to initialize devfs");
 
-    // 创建 devfs 实例
-    let devfs: Arc<DevFS> = DevFS::new();
-    // devfs 挂载
-    let _t = root_inode
-        .find("dev")
-        .expect("Cannot find /dev")
-        .mount(devfs)
-        .expect("Failed to mount devfs");
-    kinfo!("DevFS mounted.");
-
-    // 创建 sysfs 实例
-    let sysfs: Arc<SysFS> = SysFS::new();
-    // sysfs 挂载
-    let _t = root_inode
-        .find("sys")
-        .expect("Cannot find /sys")
-        .mount(sysfs)
-        .expect("Failed to mount sysfs");
-    kinfo!("SysFS mounted.");
+    sysfs_init().expect("Failed to initialize sysfs");
 
     let root_inode = ROOT_INODE().list().expect("VFS init failed");
     if root_inode.len() > 0 {
@@ -117,14 +96,14 @@ fn do_migrate(
     let mountpoint = if r.is_err() {
         new_root_inode
             .create(mountpoint_name, FileType::Dir, 0o777)
-            .expect(format!("Failed to create '/{mountpoint_name}'").as_str())
+            .expect(format!("Failed to create '/{mountpoint_name}' in migrating").as_str())
     } else {
         r.unwrap()
     };
     // 迁移挂载点
     mountpoint
         .mount(fs.inner_filesystem())
-        .expect(format!("Failed to migrate {mountpoint_name}").as_str());
+        .expect(format!("Failed to migrate {mountpoint_name} ").as_str());
     return Ok(());
 }
 
@@ -168,13 +147,12 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
 #[no_mangle]
 pub extern "C" fn mount_root_fs() -> i32 {
     kinfo!("Try to mount FAT32 as root fs...");
-    let partiton: Arc<crate::filesystem::vfs::io::disk_info::Partition> =
-        ahci::get_disks_by_name("ahci_disk_0".to_string())
-            .unwrap()
-            .0
-            .lock()
-            .partitions[0]
-            .clone();
+    let partiton: Arc<Partition> = ahci::get_disks_by_name("ahci_disk_0".to_string())
+        .unwrap()
+        .0
+        .lock()
+        .partitions[0]
+        .clone();
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
     if fatfs.is_err() {

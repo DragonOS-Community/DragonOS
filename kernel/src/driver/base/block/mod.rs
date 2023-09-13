@@ -1,5 +1,4 @@
-pub mod block;
-pub mod device;
+pub mod block_device;
 pub mod disk_info;
 
 #[derive(Debug)]

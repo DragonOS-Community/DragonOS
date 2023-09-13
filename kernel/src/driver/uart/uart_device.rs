@@ -23,7 +23,7 @@ use crate::{
     syscall::SystemError,
 };
 use alloc::{
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -131,7 +131,7 @@ impl Default for Uart {
         Self {
             private_data: DevicePrivateData::new(
                 IdTable::new(
-                    "uart",
+                    "uart".to_string(),
                     DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
                 ),
                 None,
@@ -180,7 +180,7 @@ impl PlatformDevice for LockedUart {
 impl Device for LockedUart {
     fn id_table(&self) -> IdTable {
         return IdTable::new(
-            "uart",
+            "uart".to_string(),
             DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
         );
     }
@@ -510,7 +510,7 @@ impl Default for UartDriver {
     fn default() -> Self {
         Self {
             id_table: IdTable::new(
-                "ttyS",
+                "ttyS".to_string(),
                 DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
             ),
 
@@ -537,7 +537,7 @@ impl Driver for LockedUartDriver {
     }
 
     fn id_table(&self) -> IdTable {
-        return IdTable::new("uart_driver", DeviceNumber::new(0));
+        return IdTable::new("uart_driver".to_string(), DeviceNumber::new(0));
     }
 
     fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
@@ -567,12 +567,10 @@ impl Driver for LockedUartDriver {
 
 impl LockedUartDriver {
     /// @brief 创建串口驱动
-    /// @param port 端口号
-    ///        baud_rate 波特率
-    ///        sys_info: sys文件系统inode
+    /// @param sys_info: sys文件系统inode
     /// @return  
     #[allow(dead_code)]
-    pub fn new(port: UartPort, baud_rate: u32, sys_info: Option<Arc<dyn IndexNode>>) -> Self {
+    pub fn new(sys_info: Option<Arc<dyn IndexNode>>) -> Self {
         Self(SpinLock::new(UartDriver::new(sys_info)))
     }
 }
@@ -585,15 +583,13 @@ impl PlatformDriver for LockedUartDriver {
 
 impl UartDriver {
     /// @brief 创建串口驱动
-    /// @param port 端口号
-    ///        baud_rate 波特率
-    ///        sys_info: sys文件系统inode
+    /// @param sys_info: sys文件系统inode
     /// @return 返回串口驱动
     #[allow(dead_code)]
     pub fn new(sys_info: Option<Arc<dyn IndexNode>>) -> Self {
         Self {
             id_table: IdTable::new(
-                "ttyS",
+                "ttyS".to_string(),
                 DeviceNumber::new(DeviceNumber::from_major_minor(4, 64)),
             ),
             sys_info,

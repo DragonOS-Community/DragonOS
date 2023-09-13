@@ -9,6 +9,7 @@ use crate::{
 };
 use alloc::{
     collections::{BTreeMap, BTreeSet},
+    string::ToString,
     sync::Arc,
     vec::Vec,
 };
@@ -189,7 +190,7 @@ impl Driver for LockedPlatformBusDriver {
 
     #[inline]
     fn id_table(&self) -> IdTable {
-        return IdTable::new("PlatformBusDriver", DeviceNumber::new(0));
+        return IdTable::new("PlatformBusDriver".to_string(), DeviceNumber::new(0));
     }
 
     #[inline]
@@ -325,7 +326,7 @@ impl Device for LockedPlatform {
     #[inline]
     #[allow(dead_code)]
     fn id_table(&self) -> IdTable {
-        IdTable::new("platform", DeviceNumber::new(0))
+        IdTable::new("platform".to_string(), DeviceNumber::new(0))
     }
 
     #[inline]
@@ -356,7 +357,7 @@ pub fn platform_bus_init() -> Result<(), SystemError> {
     let platform_driver: Arc<LockedPlatformBusDriver> = Arc::new(LockedPlatformBusDriver::new());
     let platform_device: Arc<LockedPlatform> =
         Arc::new(LockedPlatform::new(DevicePrivateData::new(
-            IdTable::new("platform", DeviceNumber::new(0)),
+            IdTable::new("platform".to_string(), DeviceNumber::new(0)),
             None,
             CompatibleTable::new(vec!["platform"]),
             BusState::NotInitialized.into(),

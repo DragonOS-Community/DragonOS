@@ -443,6 +443,22 @@ impl Device for LockedAhciDisk {
     fn dev_type(&self) -> DeviceType {
         return DeviceType::Block;
     }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        return self;
+    }
+
+    fn id_table(&self) -> crate::driver::base::device::IdTable {
+        todo!()
+    }
+
+    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+        todo!()
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
+        todo!()
+    }
 }
 
 impl BlockDevice for LockedAhciDisk {

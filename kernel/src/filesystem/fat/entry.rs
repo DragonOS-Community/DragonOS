@@ -614,7 +614,6 @@ impl FATDir {
                 let first_cluster: Cluster = fs.allocate_cluster(None)?;
                 short_entry.set_first_cluster(first_cluster);
 
-
                 // === 接下来在子目录中创建'.'目录项和'..'目录项
                 let mut offset = 0;
                 // '.'目录项

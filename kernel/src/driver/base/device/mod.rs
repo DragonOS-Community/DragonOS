@@ -1,4 +1,8 @@
-use alloc::{collections::BTreeMap, string::String, sync::Arc};
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::Arc,
+};
 
 use crate::{
     driver::base::map::{LockedDevsMap, LockedKObjMap},
@@ -40,9 +44,7 @@ pub trait KObject: Any + Send + Sync + Debug {}
 /// @usage Device::read_at()
 pub trait Device: KObject {
     // TODO: 待实现 open, close
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        unimplemented!();
-    }
+    fn as_any_ref(&self) -> &dyn core::any::Any;
     /// @brief: 获取设备类型
     /// @parameter: None
     /// @return: 实现该trait的设备所属类型
@@ -51,23 +53,17 @@ pub trait Device: KObject {
     /// @brief: 获取设备标识
     /// @parameter: None
     /// @return: 该设备唯一标识
-    fn id_table(&self) -> IdTable {
-        unimplemented!();
-    }
+    fn id_table(&self) -> IdTable;
 
     /// @brief: 设置sysfs info
     /// @parameter: None
     /// @return: 该设备唯一标识
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn IndexNode>>) {
-        unimplemented!();
-    }
+    fn set_sys_info(&self, _sys_info: Option<Arc<dyn IndexNode>>);
 
     /// @brief: 获取设备的sys information
     /// @parameter id_table: 设备标识符，用于唯一标识该设备
     /// @return: 设备实例
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
-        unimplemented!();
-    }
+    fn sys_info(&self) -> Option<Arc<dyn IndexNode>>;
 }
 
 // 暂定是不可修改的，在初始化的时候就要确定。以后可能会包括例如硬件中断包含的信息
@@ -202,7 +198,7 @@ pub enum DeviceType {
 
 /// @brief: 设备标识符类型
 #[derive(Debug, Clone, Hash, PartialOrd, PartialEq, Ord, Eq)]
-pub struct IdTable(&'static str, DeviceNumber);
+pub struct IdTable(String, DeviceNumber);
 
 /// @brief: 设备标识符操作方法集
 impl IdTable {
@@ -210,7 +206,7 @@ impl IdTable {
     /// @parameter name: 设备名
     /// @parameter id: 设备id
     /// @return: 设备标识符
-    pub fn new(name: &'static str, id: DeviceNumber) -> IdTable {
+    pub fn new(name: String, id: DeviceNumber) -> IdTable {
         Self(name, id)
     }
 
@@ -228,7 +224,7 @@ impl IdTable {
 
 impl Default for IdTable {
     fn default() -> Self {
-        IdTable("unknown", DeviceNumber::new(0))
+        IdTable("unknown".to_string(), DeviceNumber::new(0))
     }
 }
 

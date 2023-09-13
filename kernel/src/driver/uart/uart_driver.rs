@@ -33,7 +33,6 @@ impl Default for UartDriver {
     }
 }
 
-
 impl Driver for UartDriver {
     fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError> {
         let compatible_table = data.compatible_table();

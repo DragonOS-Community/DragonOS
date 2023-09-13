@@ -9,15 +9,16 @@ use core::{
 };
 use crate::{libs::spinlock::SpinLock, driver::{Driver, net::NetDriver}, syscall::SystemError, time::Instant, net::{generate_iface_id, NET_DRIVERS}, kinfo, kdebug};
 
-use super::e1000e::E1000EDevice;
+use super::e1000e::{E1000EDevice, E1000EBuffer};
 
 
-pub struct E1000ERxToken(Vec<u8>);
+pub struct E1000ERxToken(E1000EBuffer);
 pub struct E1000ETxToken{
     driver :E1000EDriver
 }
 pub struct E1000EDriver{
     pub inner: Arc<SpinLock<E1000EDevice>>,
+    // pkt_buffer: 
 }
 
 /// @brief 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
@@ -60,7 +61,9 @@ impl RxToken for E1000ERxToken{
     fn consume<R, F>(mut self, f: F) -> R
         where
             F: FnOnce(&mut [u8]) -> R {
-        f(&mut self.0)
+        let result = f(&mut self.0.as_mut_slice());
+        self.0.free_buffer();
+        return result;
     }
 }
 
@@ -68,11 +71,14 @@ impl TxToken for E1000ETxToken{
     fn consume<R, F>(self, len: usize, f: F) -> R
         where
             F: FnOnce(&mut [u8]) -> R {
-        let mut buffer = [0u8; 4096];
-        let result = f(&mut buffer[..len]);
+        // let mut buffer = [0u8; 4096];
+        // let result = f(&mut buffer[..len]);
+        // let mut device = self.driver.inner.lock();
+        // device.e1000e_transmit(&mut buffer);
+        let mut buffer = E1000EBuffer::new(4096);
+        let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
-        device.e1000e_transmit(&buffer);
-
+        device.e1000e_transmit(buffer);
         return result;
     }
 }

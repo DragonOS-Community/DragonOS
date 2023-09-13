@@ -124,8 +124,6 @@ impl Default for DeviceResource {
     }
 }
 
-/// @brief: 设备号实例
-
 int_like!(DeviceNumber, usize);
 
 impl Default for DeviceNumber {

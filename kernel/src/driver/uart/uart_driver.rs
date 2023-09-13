@@ -48,6 +48,9 @@ impl Driver for UartDriver {
         data: DevicePrivateData,
         _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
+        if let Some(device) = DEVICE_MANAGER.get_device(data.id_table()) {
+            return Ok(device.clone());
+        }
         let compatible_table = data.compatible_table();
         if compatible_table.matches(&UART_COMPAT_TABLE) {
             let device = LockedUart::default();
@@ -68,7 +71,7 @@ impl Driver for UartDriver {
         return self;
     }
 
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
         todo!()
     }
 

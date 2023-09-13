@@ -1,5 +1,3 @@
-use alloc::vec::Vec;
-
 use crate::driver::{base::device::DevicePrivateData, Driver};
 
 use super::{super::device::driver::DriverError, CompatibleTable};

@@ -128,6 +128,7 @@ impl Default for Uart {
     fn default() -> Self {
         let mut metadata = Metadata::default();
         metadata.file_type = FileType::CharDevice;
+        c_uart_init(UartPort::COM1.to_u16(), 115200);
         Self {
             private_data: DevicePrivateData::new(
                 IdTable::new(
@@ -558,8 +559,8 @@ impl Driver for LockedUartDriver {
 
     fn load(
         &self,
-        data: DevicePrivateData,
-        resource: Option<DeviceResource>,
+        _data: DevicePrivateData,
+        _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
         return Err(DriverError::UnsupportedOperation);
     }
@@ -685,7 +686,10 @@ pub extern "C" fn c_uart_init(port: u16, baud_rate: u32) -> i32 {
 /// @param none
 /// @return 初始化成功，返回(),失败，返回错误码
 pub fn uart_init() -> Result<(), SystemError> {
-    LockedUart::uart_init(&UartPort::COM1, 115200).map_err(|_| SystemError::ENODEV)?;
+    // 以后设备管理初始化完善后不应该出现这种代码，应该在 Driver load 一个设备，即返回设备实例之前就完成设备的 init ，不应该用 lazy_init 在设备上
+    let dev = UART_DEV.0.lock();
+    LockedUart::uart_init(&dev.port, dev.baud_rate).map_err(|_| SystemError::ENODEV)?;
+    drop(dev);
     let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().name())
         .expect("uart device register error");
     UART_DEV.set_sys_info(Some(device_inode));

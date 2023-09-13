@@ -245,14 +245,14 @@ impl<T: Transport> Driver for VirtioInterface<T> {
         self
     }
 
-    fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError> {
+    fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
         todo!()
     }
 
     fn load(
         &self,
-        data: DevicePrivateData,
-        resource: Option<DeviceResource>,
+        _data: DevicePrivateData,
+        _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
         todo!()
     }
@@ -261,7 +261,7 @@ impl<T: Transport> Driver for VirtioInterface<T> {
         todo!()
     }
 
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
         todo!()
     }
 

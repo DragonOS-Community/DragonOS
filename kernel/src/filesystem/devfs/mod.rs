@@ -8,8 +8,11 @@ use super::vfs::{
     FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
 };
 use crate::{
-    kerror,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    kerror, kinfo,
+    libs::{
+        once::Once,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     syscall::SystemError,
     time::TimeSpec,
 };
@@ -528,4 +531,24 @@ pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), 
 #[allow(dead_code)]
 pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
     return devfs_exact_ref!().unregister_device(name, device);
+}
+
+pub fn devfs_init() -> Result<(), SystemError> {
+    static INIT: Once = Once::new();
+    let mut result = None;
+    INIT.call_once(|| {
+        kinfo!("Initializing ProcFS...");
+        // 创建 devfs 实例
+        let devfs: Arc<DevFS> = DevFS::new();
+        // devfs 挂载
+        let _t = ROOT_INODE()
+            .find("dev")
+            .expect("Cannot find /dev")
+            .mount(devfs)
+            .expect("Failed to mount devfs");
+        kinfo!("DevFS mounted.");
+        result = Some(Ok(()));
+    });
+
+    return result.unwrap();
 }

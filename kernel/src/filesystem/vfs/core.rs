@@ -12,9 +12,9 @@ use crate::{
         disk::ahci::{self},
     },
     filesystem::{
-        devfs::DevFS,
+        devfs::devfs_init,
         fat::fs::FATFileSystem,
-        procfs::ProcFS,
+        procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
         vfs::{mount::MountFS, FileSystem, FileType},
@@ -70,26 +70,9 @@ pub extern "C" fn vfs_init() -> i32 {
         .expect("Failed to create /sys");
     kdebug!("dir in root:{:?}", root_inode.list());
 
-    // // 创建procfs实例
-    let procfs: Arc<ProcFS> = ProcFS::new();
+    procfs_init().expect("Failed to initialize procfs");
 
-    // procfs挂载
-    let _t = root_inode
-        .find("proc")
-        .expect("Cannot find /proc")
-        .mount(procfs)
-        .expect("Failed to mount procfs.");
-    kinfo!("ProcFS mounted.");
-
-    // 创建 devfs 实例
-    let devfs: Arc<DevFS> = DevFS::new();
-    // devfs 挂载
-    let _t = root_inode
-        .find("dev")
-        .expect("Cannot find /dev")
-        .mount(devfs)
-        .expect("Failed to mount devfs");
-    kinfo!("DevFS mounted.");
+    devfs_init().expect("Failed to initialize devfs");
 
     sysfs_init().expect("Failed to initialize sysfs");
 

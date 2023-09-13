@@ -15,7 +15,7 @@ use crate::{
         file::{FileMode, FilePrivateData},
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
-    kdebug, kerror,
+    kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,

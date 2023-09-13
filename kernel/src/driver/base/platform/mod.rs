@@ -296,7 +296,7 @@ impl LockedPlatform {
 /// @brief: platform总线
 #[derive(Debug, Clone)]
 pub struct Platform {
-    data: DevicePrivateData,
+    _data: DevicePrivateData,
     state: BusState,                      // 总线状态
     sys_info: Option<Arc<dyn IndexNode>>, // 总线sys information
 }
@@ -306,9 +306,9 @@ impl Platform {
     /// @brief: 创建一个platform总线实例
     /// @parameter: None
     /// @return: platform总线实例
-    pub fn new(data: DevicePrivateData) -> Self {
+    pub fn new(_data: DevicePrivateData) -> Self {
         Self {
-            data,
+            _data,
             state: BusState::NotInitialized,
             sys_info: Option::None,
         }

@@ -3,7 +3,7 @@ use core::{cmp::min, intrinsics::unlikely};
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
-    kdebug, kwarn,
+    kwarn,
     libs::vec_cursor::VecCursor,
     syscall::SystemError,
 };

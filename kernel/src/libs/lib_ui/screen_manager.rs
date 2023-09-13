@@ -8,7 +8,7 @@ use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
 
 use crate::{
     driver::{
-        uart::uart::{c_uart_send_str, UartPort},
+        uart::uart_device::{c_uart_send_str, UartPort},
         video::video_refresh_manager,
     },
     libs::{rwlock::RwLock, spinlock::SpinLock},
@@ -352,7 +352,6 @@ pub fn scm_enable_double_buffer() -> Result<i32, SystemError> {
         .as_ref()
         .unwrap()
         .change(buf_info)?;
-
     // 遍历当前所有使用帧缓冲区的框架，更新为双缓冲区
     for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
         if !(*framework).metadata()?.buf_info.is_double_buffer() {

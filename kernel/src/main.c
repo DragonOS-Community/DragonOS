@@ -32,7 +32,8 @@
 
 #include <driver/interrupt/apic/apic_timer.h>
 
-extern int rs_tty_init();
+extern int rs_device_init();
+ extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
 extern int rs_video_init();
@@ -125,9 +126,8 @@ void system_initialize()
 
     rs_jiffies_init();
     io_mfence();
-
-    io_mfence();
     vfs_init();
+    rs_device_init();
     rs_tty_init();
 
     rs_kthread_init();

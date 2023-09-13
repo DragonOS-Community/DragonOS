@@ -1,9 +1,13 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
+use crate::driver::base::block::block_device::{BlockDevice, BlockId};
+use crate::driver::base::block::disk_info::Partition;
+use crate::driver::base::block::SeekFrom;
+use crate::driver::base::device::{Device, DeviceType, KObject};
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
 use crate::filesystem::mbr::MbrDiskPartionTable;
-use crate::filesystem::vfs::io::{device::BlockDevice, disk_info::Partition, SeekFrom};
 use crate::include::bindings::bindings::verify_area;
 
+use crate::kdebug;
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::mm::phys_2_virt;
 use crate::syscall::SystemError;
@@ -52,8 +56,8 @@ impl Debug for AhciDisk {
 impl AhciDisk {
     fn read_at(
         &self,
-        lba_id_start: crate::filesystem::vfs::io::device::BlockId, // 起始lba编号
-        count: usize,                                              // 读取lba的数量
+        lba_id_start: BlockId, // 起始lba编号
+        count: usize,          // 读取lba的数量
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -211,7 +215,7 @@ impl AhciDisk {
 
     fn write_at(
         &self,
-        lba_id_start: crate::filesystem::vfs::io::device::BlockId,
+        lba_id_start: BlockId,
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
@@ -392,7 +396,6 @@ impl LockedAhciDisk {
                 ));
             }
         }
-
         result.0.lock().partitions = part_s;
         result.0.lock().self_ref = weak_this;
         return Ok(result);
@@ -406,14 +409,13 @@ impl LockedAhciDisk {
         let mut buf: Vec<u8> = Vec::new();
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
-        self.read_at(0, 1, &mut buf)?;
-
+        BlockDevice::read_at(self, 0, 1, &mut buf)?;
         // 创建 Cursor 用于按字节读取
         let mut cursor = VecCursor::new(buf);
         cursor.seek(SeekFrom::SeekCurrent(446))?;
 
         for i in 0..4 {
-            // kdebug!("infomation of partition {}:\n", i);
+            kdebug!("infomation of partition {}:\n", i);
 
             table.dpte[i].flags = cursor.read_u8()?;
             table.dpte[i].starting_head = cursor.read_u8()?;
@@ -424,7 +426,7 @@ impl LockedAhciDisk {
             table.dpte[i].starting_lba = cursor.read_u32()?;
             table.dpte[i].total_sectors = cursor.read_u32()?;
 
-            // kdebug!("dpte[i] = {:?}", table.dpte[i]);
+            kdebug!("dpte[i] = {:?}", table.dpte[i]);
         }
         table.bs_trailsig = cursor.read_u16()?;
         // kdebug!("bs_trailsig = {}", unsafe {
@@ -432,6 +434,30 @@ impl LockedAhciDisk {
         // });
 
         return Ok(table);
+    }
+}
+
+impl KObject for LockedAhciDisk {}
+
+impl Device for LockedAhciDisk {
+    fn dev_type(&self) -> DeviceType {
+        return DeviceType::Block;
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        return self;
+    }
+
+    fn id_table(&self) -> crate::driver::base::device::IdTable {
+        todo!()
+    }
+
+    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+        todo!()
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
+        todo!()
     }
 }
 
@@ -446,36 +472,12 @@ impl BlockDevice for LockedAhciDisk {
         9
     }
 
-    #[inline]
-    fn read_at(
-        &self,
-        lba_id_start: crate::filesystem::vfs::io::device::BlockId,
-        count: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        // kdebug!(
-        //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
-        //     self.0
-        // );
-        return self.0.lock().read_at(lba_id_start, count, buf);
-    }
-
-    #[inline]
-    fn write_at(
-        &self,
-        lba_id_start: crate::filesystem::vfs::io::device::BlockId,
-        count: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        self.0.lock().write_at(lba_id_start, count, buf)
-    }
-
     fn sync(&self) -> Result<(), SystemError> {
         return self.0.lock().sync();
     }
 
     #[inline]
-    fn device(&self) -> Arc<dyn crate::filesystem::vfs::io::device::Device> {
+    fn device(&self) -> Arc<dyn Device> {
         return self.0.lock().self_ref.upgrade().unwrap();
     }
 
@@ -485,5 +487,25 @@ impl BlockDevice for LockedAhciDisk {
 
     fn partitions(&self) -> Vec<Arc<Partition>> {
         return self.0.lock().partitions.clone();
+    }
+
+    #[inline]
+    fn read_at(
+        &self,
+        lba_id_start: BlockId, // 起始lba编号
+        count: usize,          // 读取lba的数量
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.0.lock().read_at(lba_id_start, count, buf)
+    }
+
+    #[inline]
+    fn write_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.0.lock().write_at(lba_id_start, count, buf)
     }
 }

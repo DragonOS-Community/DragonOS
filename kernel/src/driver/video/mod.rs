@@ -8,6 +8,8 @@ use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
     arch::MMArch,
+    driver::uart::uart_device::c_uart_send_str,
+    driver::uart::uart_device::UartPort::COM1,
     include::bindings::bindings::{
         multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
         FRAME_BUFFER_MAPPING_OFFSET, SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE,
@@ -26,8 +28,6 @@ use crate::{
     syscall::SystemError,
     time::timer::{Timer, TimerFunction},
 };
-
-use super::uart::uart::{c_uart_send_str, UartPort::COM1};
 
 static mut __MAMAGER: Option<VideoRefreshManager> = None;
 

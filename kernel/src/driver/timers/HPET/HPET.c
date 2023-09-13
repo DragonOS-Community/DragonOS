@@ -27,6 +27,7 @@ static uint64_t test_tsc_end = 0;
 extern uint64_t Cpu_tsc_freq; // 导出自cpu.c
 
 extern struct rtc_time_t rtc_now; // 导出全局墙上时钟
+extern uint64_t rs_update_timer_jiffies(uint64_t);
 
 extern uint32_t rs_current_pcb_pid();
 enum

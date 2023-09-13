@@ -14,8 +14,11 @@ use crate::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
     },
-    kerror,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    kerror, kinfo,
+    libs::{
+        once::Once,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     process::{Pid, ProcessManager},
     syscall::SystemError,
     time::TimeSpec,
@@ -690,4 +693,25 @@ pub fn procfs_unregister_pid(pid: Pid) -> Result<(), SystemError> {
 
     // 调用解除注册函数
     return procfs.unregister_pid(pid);
+}
+
+pub fn procfs_init() -> Result<(), SystemError> {
+    static INIT: Once = Once::new();
+    let mut result = None;
+    INIT.call_once(|| {
+        kinfo!("Initializing ProcFS...");
+        // 创建 sysfs 实例
+        let procfs: Arc<ProcFS> = ProcFS::new();
+
+        // sysfs 挂载
+        let _t = ROOT_INODE()
+            .find("proc")
+            .expect("Cannot find /proc")
+            .mount(procfs)
+            .expect("Failed to mount proc");
+        kinfo!("ProcFS mounted.");
+        result = Some(Ok(()));
+    });
+
+    return result.unwrap();
 }

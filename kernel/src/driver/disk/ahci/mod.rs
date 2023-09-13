@@ -3,13 +3,13 @@ pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
-use crate::filesystem::vfs::io::device::BlockDevice;
+use crate::driver::base::block::block_device::BlockDevice;
+use crate::driver::base::block::disk_info::BLK_GF_AHCI;
 // 依赖的rust工具包
 use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
 use crate::filesystem::devfs::devfs_register;
-use crate::filesystem::vfs::io::disk_info::BLK_GF_AHCI;
 use crate::kerror;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
@@ -60,7 +60,7 @@ fn ahci_device_search<'a>(
     return Ok(result);
 }
 
-/// 初始化 ahci
+/// @brief: 初始化 ahci
 pub fn ahci_init() -> Result<(), SystemError> {
     let mut list = PCI_DEVICE_LINKEDLIST.write();
     let ahci_device = ahci_device_search(&mut list)?;

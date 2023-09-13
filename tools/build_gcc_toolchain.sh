@@ -89,7 +89,9 @@ case `cat /etc/os-release | grep '^NAME=' | cut -d'"' -f2` in
             wget
         ;;
     "Arch"*)
-        sudo pacman -S --needed --noconfirm gcc make flex wget texinfo libmpc gmp mpfr
+        sudo pacman -S --needed --noconfirm \
+            gcc make flex wget texinfo libmpc gmp mpfr \
+            diffutils pkgconf which unzip
         ;;
     *)
         ;;

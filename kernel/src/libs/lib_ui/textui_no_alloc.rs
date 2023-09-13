@@ -5,7 +5,7 @@ use core::{
 
 use crate::{
     driver::{
-        uart::uart::{c_uart_send, UartPort},
+        uart::uart_device::{c_uart_send, UartPort},
         video::video_refresh_manager,
     },
     syscall::SystemError,

@@ -60,8 +60,6 @@ use crate::libs::lib_ui::textui::FontColor;
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;
-// <3>
-use crate::net::net_core::net_init;
 
 // 声明全局的分配器
 #[cfg_attr(not(test), global_allocator)]

@@ -1,6 +1,6 @@
 use crate::{
     driver::{
-        uart::uart::{c_uart_send, c_uart_send_str, UartPort},
+        uart::uart_device::{c_uart_send, c_uart_send_str, UartPort},
         video::video_refresh_manager,
     },
     kdebug, kinfo,
@@ -9,7 +9,6 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    println,
     syscall::SystemError,
 };
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};

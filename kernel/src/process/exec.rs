@@ -3,7 +3,7 @@ use core::{fmt::Debug, ptr::null};
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    filesystem::vfs::io::SeekFrom,
+    driver::base::block::SeekFrom,
     filesystem::vfs::{
         file::{File, FileMode},
         ROOT_INODE,

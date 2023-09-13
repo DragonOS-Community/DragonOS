@@ -3,18 +3,27 @@ use core::mem::MaybeUninit;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    driver::tty::TtyFilePrivateData, filesystem::procfs::ProcfsFilePrivateData, kerror,
-    libs::spinlock::SpinLock, process::ProcessManager, syscall::SystemError,
+    driver::{
+        base::{block::SeekFrom, device::DevicePrivateData},
+        tty::TtyFilePrivateData,
+    },
+    filesystem::procfs::ProcfsFilePrivateData,
+    kerror,
+    libs::spinlock::SpinLock,
+    process::ProcessManager,
+    syscall::SystemError,
 };
 
-use super::{io::SeekFrom, Dirent, FileType, IndexNode, Metadata};
+use super::{Dirent, FileType, IndexNode, Metadata};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 pub enum FilePrivateData {
     /// procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
-    /// Tty设备的私有信息
+    /// 设备文件的私有信息
+    DevFS(DevicePrivateData),
+    /// tty设备文件的私有信息
     Tty(TtyFilePrivateData),
     /// 不需要文件私有信息
     Unused,

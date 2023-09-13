@@ -7,14 +7,14 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
+    driver::base::block::SeekFrom,
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
-        io::SeekFrom,
         syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
+    include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
@@ -648,17 +648,13 @@ impl Syscall {
 
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
-                let pipefd = args[0] as *mut c_int;
-                match UserBufferWriter::new(
-                    pipefd,
-                    core::mem::size_of::<[c_int; 2]>(),
-                    frame.from_user(),
-                ) {
-                    Err(e) => Err(e),
-                    Ok(mut user_buffer) => match user_buffer.buffer::<i32>(0) {
-                        Err(e) => Err(e),
-                        Ok(pipefd) => Self::pipe(pipefd),
-                    },
+                let pipefd: *mut i32 = args[0] as *mut c_int;
+                let arg1 = args[1];
+                if pipefd.is_null() {
+                    Err(SystemError::EFAULT)
+                } else {
+                    let flags = FileMode::from_bits_truncate(arg1 as u32);
+                    Self::pipe2(pipefd, flags)
                 }
             }
 

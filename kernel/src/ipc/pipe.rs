@@ -2,8 +2,8 @@ use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     filesystem::vfs::{
-        core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
-        PollStatus,
+        core::generate_inode_id, file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode,
+        Metadata, PollStatus,
     },
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     process::ProcessState,
@@ -32,10 +32,11 @@ pub struct InnerPipeInode {
     data: [u8; PIPE_BUFF_SIZE],
     /// INode 元数据
     metadata: Metadata,
+    flags: FileMode,
 }
 
 impl LockedPipeInode {
-    pub fn new() -> Arc<Self> {
+    pub fn new(flags: FileMode) -> Arc<Self> {
         let inner = InnerPipeInode {
             self_ref: Weak::default(),
             valid_cnt: 0,
@@ -48,7 +49,7 @@ impl LockedPipeInode {
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
-                size: 0,
+                size: PIPE_BUFF_SIZE as i64,
                 blk_size: 0,
                 blocks: 0,
                 atime: TimeSpec::default(),
@@ -61,6 +62,7 @@ impl LockedPipeInode {
                 gid: 0,
                 raw_dev: 0,
             },
+            flags,
         };
         let result = Arc::new(Self(SpinLock::new(inner)));
         let mut guard = result.0.lock();
@@ -85,13 +87,19 @@ impl IndexNode for LockedPipeInode {
         // 加锁
         let mut inode = self.0.lock();
 
-        //如果管道里面没有数据，则唤醒写端，
+        // 如果管道里面没有数据，则唤醒写端，
         while inode.valid_cnt == 0 {
             inode
                 .write_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
 
-            // 在读等待队列中睡眠，并释放锁
+            // 如果为非阻塞管道，直接返回错误
+            if inode.flags.contains(FileMode::O_NONBLOCK) {
+                drop(inode);
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            // 否则在读等待队列中睡眠，并释放锁
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
                 inode.read_wait_queue.sleep_without_schedule();
@@ -176,6 +184,13 @@ impl IndexNode for LockedPipeInode {
             inode
                 .read_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
+
+            // 如果为非阻塞管道，直接返回错误
+            if inode.flags.contains(FileMode::O_NONBLOCK) {
+                drop(inode);
+                return Err(SystemError::ENOMEM);
+            }
+
             // 解锁并睡眠
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();

@@ -1,6 +1,6 @@
 use core::mem::MaybeUninit;
 
-use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     driver::tty::TtyFilePrivateData, filesystem::procfs::ProcfsFilePrivateData, kerror,

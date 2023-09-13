@@ -4,7 +4,7 @@ use alloc::string::String;
 
 use crate::{
     include::bindings::bindings::set_system_trap_gate,
-    syscall::{Syscall, SystemError, SYS_FORK, SYS_RT_SIGRETURN, SYS_VFORK},
+    syscall::{Syscall, SystemError, SYS_RT_SIGRETURN},
 };
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};

@@ -156,12 +156,6 @@ void system_initialize()
     HPET_measure_freq();
 
     io_mfence();
-    // current_pcb->preempt_count = 0;
-    // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
-
-    // 启用double buffer
-    // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
-    io_mfence();
     cli();
     HPET_enable();
 

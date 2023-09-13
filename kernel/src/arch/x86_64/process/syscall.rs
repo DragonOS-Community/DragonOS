@@ -11,7 +11,6 @@ use crate::{
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
-        fork::CloneFlags,
         ProcessManager,
     },
     syscall::{Syscall, SystemError},

@@ -366,8 +366,8 @@ pub fn scm_enable_double_buffer() -> Result<i32, SystemError> {
 
     return Ok(0);
 }
+
 /// 允许往窗口打印信息
-#[no_mangle]
 pub fn scm_enable_put_to_window() {
     // mm之前要继续往窗口打印信息时，因为没有动态内存分配(textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
@@ -388,7 +388,6 @@ pub fn scm_enable_put_to_window() {
     }
 }
 /// 禁止往窗口打印信息
-#[no_mangle]
 pub fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {

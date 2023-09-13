@@ -146,13 +146,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let new_root_inode = Box::leak(Box::new(new_fs.root_inode()));
 
     // 把上述文件系统,迁移到新的文件系统下
-    kdebug!("Migrating /proc...");
     do_migrate(new_root_inode.clone(), "proc", proc)?;
-    kdebug!("Migrating /dev...");
     do_migrate(new_root_inode.clone(), "dev", dev)?;
-    kdebug!("Migrating /sys...");
     do_migrate(new_root_inode.clone(), "sys", sys)?;
-    kdebug!("Migrating / done!");
 
     unsafe {
         // drop旧的Root inode

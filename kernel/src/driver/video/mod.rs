@@ -1,9 +1,6 @@
 use core::{
-    cell::RefCell,
     ffi::{c_uint, c_void},
-    intrinsics::unlikely,
     mem::MaybeUninit,
-    ptr::copy_nonoverlapping,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -13,8 +10,7 @@ use crate::{
     arch::MMArch,
     include::bindings::bindings::{
         multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
-        scm_buffer_info_t, FRAME_BUFFER_MAPPING_OFFSET, SCM_BF_FB,
-        SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE,
+        FRAME_BUFFER_MAPPING_OFFSET, SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE,
     },
     kinfo,
     libs::{
@@ -72,9 +68,8 @@ impl VideoRefreshManager {
         return res;
     }
 
-    /**
-     * @brief 停止定时刷新
-     */
+    /// 停止定时刷新
+    #[allow(dead_code)]
     pub fn stop_video_refresh(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
@@ -284,10 +279,11 @@ impl TimerFunction for VideoRefreshExecutor {
 
         let mut refresh_target: Option<RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u32]>>>>>> =
             None;
-        for i in 0..2 {
+        const TRY_TIMES: i32 = 2;
+        for i in 0..TRY_TIMES {
             let g = manager.refresh_target.try_read();
             if g.is_none() {
-                if i == 9 {
+                if i == TRY_TIMES - 1 {
                     start_next_refresh();
                     return Ok(());
                 }

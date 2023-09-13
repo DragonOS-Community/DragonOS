@@ -1,10 +1,6 @@
-use core::mem::MaybeUninit;
-
 use x86::{current::task::TaskStateSegment, segmentation::SegmentSelector, Ring};
 
 use crate::{
-    kdebug,
-    libs::spinlock::SpinLock,
     mm::{percpu::PerCpu, VirtAddr},
     smp::core::smp_get_processor_id,
 };

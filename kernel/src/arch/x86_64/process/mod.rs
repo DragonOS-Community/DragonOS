@@ -66,6 +66,7 @@ pub struct ArchPCBInfo {
     fp_state: Option<FpState>,
 }
 
+#[allow(dead_code)]
 impl ArchPCBInfo {
     /// 创建一个新的ArchPCBInfo
     ///
@@ -252,12 +253,12 @@ impl ProcessManager {
         new_arch_guard.fs = current_arch_guard.fs;
         new_arch_guard.gs = current_arch_guard.gs;
         new_arch_guard.fp_state = current_arch_guard.fp_state.clone();
-        drop(current_arch_guard);
 
         // 拷贝浮点寄存器的状态
-        if let Some(fp_state) = current_pcb.arch_info_irqsave().fp_state.as_ref() {
+        if let Some(fp_state) = current_arch_guard.fp_state.as_ref() {
             new_arch_guard.fp_state = Some(*fp_state);
         }
+        drop(current_arch_guard);
 
         // 设置返回地址（子进程开始执行的指令地址）
 
@@ -280,7 +281,7 @@ impl ProcessManager {
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         assert!(CurrentIrqArch::is_irq_enabled() == false);
-        
+
         // 保存浮点寄存器
         prev.arch_info().save_fp_state();
         // 切换浮点寄存器
@@ -475,9 +476,6 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
 
     compiler_fence(Ordering::SeqCst);
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());
-    compiler_fence(Ordering::SeqCst);
-
-    unreachable!();
 }
 
 /// 由于需要依赖ret来切换到用户态，所以不能inline

@@ -11,24 +11,19 @@ use crate::{
         uart::uart::{c_uart_send_str, UartPort},
         video::video_refresh_manager,
     },
-    include::bindings::bindings::scm_buffer_info_t,
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::VirtAddr,
     syscall::SystemError,
 };
 
-use lazy_static::lazy_static;
-
 use super::textui_no_alloc::textui_init_no_alloc;
 
-lazy_static! {
-    /// 全局的UI框架列表
-    pub static ref SCM_FRAMEWORK_LIST: SpinLock<LinkedList<Arc<dyn ScmUiFramework>>> =
-        SpinLock::new(LinkedList::new());
-    /// 当前在使用的UI框架
-    pub static ref CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
+/// 全局的UI框架列表
+pub static SCM_FRAMEWORK_LIST: SpinLock<LinkedList<Arc<dyn ScmUiFramework>>> =
+    SpinLock::new(LinkedList::new());
 
-}
+/// 当前在使用的UI框架
+pub static CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
 
 /// 是否启用双缓冲
 pub static SCM_DOUBLE_BUFFER_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -75,14 +70,18 @@ impl ScmBufferInfo {
     /// ## 返回值
     ///
     /// - `Result<Self, SystemError>` 创建成功返回新的帧缓冲区结构体，创建失败返回错误码
-    pub fn new(buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
+    pub fn new(mut buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
         if unlikely(SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == false) {
-            panic!("double buffer is not enabled");
+            let mut device_buffer = video_refresh_manager().device_buffer().clone();
+            buf_type.remove(ScmBufferFlag::SCM_BF_DB);
+            buf_type.insert(ScmBufferFlag::SCM_BF_FB);
+            device_buffer.flags = buf_type;
+            return Ok(device_buffer);
         } else {
             let device_buffer_guard = video_refresh_manager().device_buffer();
 
             let buf_space: Arc<SpinLock<Box<[u32]>>> = Arc::new(SpinLock::new(
-                vec![0u32; unsafe { (device_buffer_guard.size / 4) as usize }].into_boxed_slice(),
+                vec![0u32; (device_buffer_guard.size / 4) as usize].into_boxed_slice(),
             ));
 
             assert!(buf_type.contains(ScmBufferFlag::SCM_BF_DB));
@@ -326,20 +325,8 @@ pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemErr
     return Ok(0);
 }
 
-/// 允许双缓冲区
-#[no_mangle]
-pub extern "C" fn scm_enable_double_buffer() -> i32 {
-    let r = true_scm_enable_double_buffer().unwrap_or_else(|e| e.to_posix_errno());
-    if r.is_negative() {
-        c_uart_send_str(
-            UartPort::COM1.to_u16(),
-            "scm enable double buffer fail.\n\0".as_ptr(),
-        );
-    }
-
-    return r;
-}
-fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
+/// 屏幕管理器启用双缓冲区
+pub fn scm_enable_double_buffer() -> Result<i32, SystemError> {
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) {
         // 已经开启了双缓冲区了, 直接退出
         return Ok(0);
@@ -352,7 +339,7 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
     drop(scm_list);
     SCM_DOUBLE_BUFFER_ENABLED.store(true, Ordering::SeqCst);
     // 创建双缓冲区
-    let mut buf_info = ScmBufferInfo::new(ScmBufferFlag::SCM_BF_DB | ScmBufferFlag::SCM_BF_PIXEL)?;
+    let buf_info = ScmBufferInfo::new(ScmBufferFlag::SCM_BF_DB | ScmBufferFlag::SCM_BF_PIXEL)?;
 
     // 设置定时刷新的对象
     video_refresh_manager()
@@ -379,10 +366,10 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
 
     return Ok(0);
 }
+
 /// 允许往窗口打印信息
-#[no_mangle]
 pub fn scm_enable_put_to_window() {
-    // mm之前要继续往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
+    // mm之前要继续往窗口打印信息时，因为没有动态内存分配(textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
         super::textui::ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
     } else {
@@ -401,7 +388,6 @@ pub fn scm_enable_put_to_window() {
     }
 }
 /// 禁止往窗口打印信息
-#[no_mangle]
 pub fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
@@ -432,7 +418,9 @@ pub extern "C" fn scm_reinit() -> i32 {
     return r;
 }
 fn true_scm_reinit() -> Result<i32, SystemError> {
-    video_refresh_manager().video_reinitialize(false);
+    video_refresh_manager()
+        .video_reinitialize(false)
+        .expect("video reinitialize failed");
 
     // 遍历当前所有使用帧缓冲区的框架，更新地址
     let device_buffer = video_refresh_manager().device_buffer().clone();

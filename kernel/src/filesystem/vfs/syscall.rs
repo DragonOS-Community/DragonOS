@@ -8,7 +8,7 @@ use crate::{
     filesystem::vfs::file::FileDescriptorVec,
     filesystem::vfs::io::SeekFrom,
     include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
-    kerror,
+    kdebug, kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
@@ -134,6 +134,7 @@ impl Syscall {
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
+
         // 文件名过长
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -187,11 +188,13 @@ impl Syscall {
         }
 
         // 把文件对象存入pcb
-        return ProcessManager::current_pcb()
+        let r = ProcessManager::current_pcb()
             .fd_table()
             .write()
             .alloc_fd(file, None)
             .map(|fd| fd as usize);
+
+        return r;
     }
 
     /// @brief 关闭文件
@@ -215,15 +218,17 @@ impl Syscall {
     /// @return Err(SystemError) 读取失败，返回posix错误码
     pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
+        let fd_table_guard = binding.read();
 
-        let file: Option<&mut File> = fd_table_guard.get_file_mut_by_fd(fd);
+        let file = fd_table_guard.get_file_by_fd(fd);
         if file.is_none() {
             return Err(SystemError::EBADF);
         }
-        let file: &mut File = file.unwrap();
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let file = file.unwrap();
 
-        return file.read(buf.len(), buf);
+        return file.lock_no_preempt().read(buf.len(), buf);
     }
 
     /// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
@@ -235,15 +240,15 @@ impl Syscall {
     /// @return Err(SystemError) 写入失败，返回posix错误码
     pub fn write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
+        let fd_table_guard = binding.read();
 
-        let file: Option<&mut File> = fd_table_guard.get_file_mut_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        let file: &mut File = file.unwrap();
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
 
-        return file.write(buf.len(), buf);
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        return file.lock_no_preempt().write(buf.len(), buf);
     }
 
     /// @brief 调整文件操作指针的位置
@@ -255,13 +260,14 @@ impl Syscall {
     /// @return Err(SystemError) 调整失败，返回posix错误码
     pub fn lseek(fd: i32, seek: SeekFrom) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let file: Option<&mut File> = fd_table_guard.get_file_mut_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        let file: &mut File = file.unwrap();
-        return file.lseek(seek);
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        return file.lock_no_preempt().lseek(seek);
     }
 
     /// @brief 切换工作目录
@@ -372,16 +378,14 @@ impl Syscall {
 
         // 获取fd
         let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let file: &mut File = match fd_table_guard.get_file_mut_by_fd(fd) {
-            None => {
-                return Err(SystemError::EBADF);
-            }
-            Some(file) => file,
-        };
-        // kdebug!("file={file:?}");
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
 
-        return file.readdir(dirent).map(|x| x as usize);
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        return file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
     }
 
     /// @brief 创建文件夹
@@ -438,10 +442,13 @@ impl Syscall {
         let mut fd_table_guard = binding.write();
 
         let old_file = fd_table_guard
-            .get_file_ref_by_fd(oldfd)
+            .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
 
-        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
+        let new_file = old_file
+            .lock_no_preempt()
+            .try_clone()
+            .ok_or(SystemError::EBADF)?;
         // 申请文件描述符，并把文件对象存入其中
         let res = fd_table_guard.alloc_fd(new_file, None).map(|x| x as usize);
         return res;
@@ -480,7 +487,7 @@ impl Syscall {
             // 若oldfd与newfd相等
             return Ok(newfd as usize);
         }
-        let new_exists = fd_table_guard.get_file_ref_by_fd(newfd).is_some();
+        let new_exists = fd_table_guard.get_file_by_fd(newfd).is_some();
         if new_exists {
             // close newfd
             if let Err(_) = fd_table_guard.drop_fd(newfd) {
@@ -490,9 +497,12 @@ impl Syscall {
         }
 
         let old_file = fd_table_guard
-            .get_file_ref_by_fd(oldfd)
+            .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
-        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
+        let new_file = old_file
+            .lock_no_preempt()
+            .try_clone()
+            .ok_or(SystemError::EBADF)?;
         // 申请文件描述符，并把文件对象存入其中
         let res = fd_table_guard
             .alloc_fd(new_file, Some(newfd))
@@ -517,7 +527,7 @@ impl Syscall {
                 for i in arg..FileDescriptorVec::PROCESS_MAX_FD {
                     let binding = ProcessManager::current_pcb().fd_table();
                     let mut fd_table_guard = binding.write();
-                    if fd_table_guard.get_file_ref_by_fd(fd).is_none() {
+                    if fd_table_guard.get_file_by_fd(fd).is_none() {
                         return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
                     }
                 }
@@ -527,8 +537,11 @@ impl Syscall {
                 // Get file descriptor flags.
                 let binding = ProcessManager::current_pcb().fd_table();
                 let fd_table_guard = binding.read();
-                if let Some(file) = fd_table_guard.get_file_ref_by_fd(fd) {
-                    if file.close_on_exec() {
+                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
+                    // drop guard 以避免无法调度的问题
+                    drop(fd_table_guard);
+
+                    if file.lock().close_on_exec() {
                         return Ok(FD_CLOEXEC as usize);
                     }
                 }
@@ -537,14 +550,16 @@ impl Syscall {
             FcntlCommand::SetFd => {
                 // Set file descriptor flags.
                 let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
+                let fd_table_guard = binding.write();
 
-                if let Some(file) = fd_table_guard.get_file_mut_by_fd(fd) {
+                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
+                    // drop guard 以避免无法调度的问题
+                    drop(fd_table_guard);
                     let arg = arg as u32;
                     if arg & FD_CLOEXEC != 0 {
-                        file.set_close_on_exec(true);
+                        file.lock().set_close_on_exec(true);
                     } else {
-                        file.set_close_on_exec(false);
+                        file.lock().set_close_on_exec(false);
                     }
                     return Ok(0);
                 }
@@ -556,8 +571,10 @@ impl Syscall {
                 let binding = ProcessManager::current_pcb().fd_table();
                 let fd_table_guard = binding.read();
 
-                if let Some(file) = fd_table_guard.get_file_ref_by_fd(fd) {
-                    return Ok(file.mode().bits() as usize);
+                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
+                    // drop guard 以避免无法调度的问题
+                    drop(fd_table_guard);
+                    return Ok(file.lock_no_preempt().mode().bits() as usize);
                 }
 
                 return Err(SystemError::EBADF);
@@ -565,12 +582,14 @@ impl Syscall {
             FcntlCommand::SetFlags => {
                 // Set file status flags.
                 let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
+                let fd_table_guard = binding.write();
 
-                if let Some(file) = fd_table_guard.get_file_mut_by_fd(fd) {
+                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     let arg = arg as u32;
                     let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
-                    file.set_mode(mode)?;
+                    // drop guard 以避免无法调度的问题
+                    drop(fd_table_guard);
+                    file.lock_no_preempt().set_mode(mode)?;
                     return Ok(0);
                 }
 
@@ -606,76 +625,70 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
-        if let Some(file) = fd_table_guard.get_file_ref_by_fd(fd) {
-            let r = file.ftruncate(len).map(|_| 0);
+        if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
+            // drop guard 以避免无法调度的问题
+            drop(fd_table_guard);
+            let r = file.lock_no_preempt().ftruncate(len).map(|_| 0);
             return r;
         }
 
         return Err(SystemError::EBADF);
     }
+
     fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
-        match fd_table_guard.get_file_ref_by_fd(fd) {
-            Some(file) => {
-                let mut kstat = PosixKstat::new();
-                // 获取文件信息
-                match file.metadata() {
-                    Ok(metadata) => {
-                        kstat.size = metadata.size as i64;
-                        kstat.dev_id = metadata.dev_id as u64;
-                        kstat.inode = metadata.inode_id as u64;
-                        kstat.blcok_size = metadata.blk_size as i64;
-                        kstat.blocks = metadata.blocks as u64;
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
 
-                        kstat.atime.tv_sec = metadata.atime.tv_sec;
-                        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
-                        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
-                        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
-                        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
-                        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
+        let mut kstat = PosixKstat::new();
+        // 获取文件信息
+        let metadata = file.lock().metadata()?;
+        kstat.size = metadata.size as i64;
+        kstat.dev_id = metadata.dev_id as u64;
+        kstat.inode = metadata.inode_id as u64;
+        kstat.blcok_size = metadata.blk_size as i64;
+        kstat.blocks = metadata.blocks as u64;
 
-                        kstat.nlink = metadata.nlinks as u64;
-                        kstat.uid = metadata.uid as i32;
-                        kstat.gid = metadata.gid as i32;
-                        kstat.rdev = metadata.raw_dev as i64;
-                        kstat.mode.bits = metadata.mode;
-                        match file.file_type() {
-                            FileType::File => kstat.mode.insert(ModeType::S_IFMT),
-                            FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
-                            FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
-                            FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
-                            FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
-                            FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
-                            FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
+        kstat.atime.tv_sec = metadata.atime.tv_sec;
+        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
+        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
+        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
+        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
+        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
 
-                return Ok(kstat);
-            }
-            None => {
-                return Err(SystemError::EINVAL);
-            }
+        kstat.nlink = metadata.nlinks as u64;
+        kstat.uid = metadata.uid as i32;
+        kstat.gid = metadata.gid as i32;
+        kstat.rdev = metadata.raw_dev as i64;
+        kstat.mode.bits = metadata.mode;
+        match file.lock().file_type() {
+            FileType::File => kstat.mode.insert(ModeType::S_IFMT),
+            FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
+            FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
+            FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
+            FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
+            FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
+            FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
         }
+
+        return Ok(kstat);
     }
+
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        match Self::do_fstat(fd) {
-            Ok(kstat) => {
-                if usr_kstat.is_null() {
-                    return Err(SystemError::EFAULT);
-                }
-                unsafe {
-                    *usr_kstat = kstat;
-                }
-                return Ok(0);
-            }
-            Err(e) => return Err(e),
+        let kstat = Self::do_fstat(fd)?;
+        if usr_kstat.is_null() {
+            return Err(SystemError::EFAULT);
         }
+        unsafe {
+            *usr_kstat = kstat;
+        }
+        return Ok(0);
     }
 }
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {

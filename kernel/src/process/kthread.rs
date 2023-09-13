@@ -9,12 +9,17 @@ use alloc::{
 use atomic_enum::atomic_enum;
 
 use crate::{
-    libs::spinlock::SpinLock,
+    arch::{sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
+    kdebug, kinfo,
+    libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
     syscall::SystemError,
 };
 
-use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
+use super::{
+    fork::CloneFlags, init::initial_kernel_thread, Pid, ProcessControlBlock, ProcessFlags,
+};
 
 /// 内核线程的创建任务列表
 static KTHREAD_CREATE_LIST: SpinLock<LinkedList<Arc<KernelThreadCreateInfo>>> =
@@ -143,13 +148,52 @@ impl KernelThreadCreateInfo {
     pub fn take_closure(&self) -> Option<Box<KernelThreadClosure>> {
         return self.closure.lock().take();
     }
+
+    pub fn name(&self) -> &String {
+        &self.name
+    }
 }
 
 pub struct KernelThreadMechanism;
 
 impl KernelThreadMechanism {
-    pub fn init() {
-        {
+    pub fn init_stage1() {
+        kinfo!("Initializing kernel thread mechanism stage1...");
+
+        // 初始化第一个内核线程
+
+        let create_info = KernelThreadCreateInfo::new(
+            KernelThreadClosure::EmptyClosure((Box::new(initial_kernel_thread), ())),
+            "init".to_string(),
+        );
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        // 由于当前是pid=0的idle进程,而__inner_create要求当前是kthread,所以先临时设置为kthread
+        ProcessManager::current_pcb()
+            .flags
+            .lock()
+            .insert(ProcessFlags::KTHREAD);
+
+        KernelThreadMechanism::__inner_create(
+            &create_info,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGNAL,
+        )
+        .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
+
+        ProcessManager::current_pcb()
+            .flags
+            .lock()
+            .remove(ProcessFlags::KTHREAD);
+        drop(irq_guard);
+        kinfo!("Initializing kernel thread mechanism stage1 complete");
+    }
+
+    pub fn init_stage2() {
+        assert!(ProcessManager::current_pcb()
+            .flags()
+            .contains(ProcessFlags::KTHREAD));
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            kinfo!("Initializing kernel thread mechanism stage2...");
             // 初始化kthreadd
             let closure = KernelThreadClosure::EmptyClosure((Box::new(Self::kthread_daemon), ()));
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
@@ -161,7 +205,8 @@ impl KernelThreadMechanism {
             unsafe {
                 KTHREAD_DAEMON_PCB.replace(pcb);
             }
-        }
+            kinfo!("Initializing kernel thread mechanism stage2 complete");
+        });
     }
 
     /// 创建一个新的内核线程
@@ -202,7 +247,7 @@ impl KernelThreadMechanism {
         assert!(
             worker_private.is_some(),
             "kthread stop: worker_private is none, pid: {:?}",
-            pcb.basic().pid()
+            pcb.pid()
         );
         worker_private
             .as_mut()
@@ -248,7 +293,7 @@ impl KernelThreadMechanism {
         assert!(
             worker_private.is_some(),
             "kthread should_stop: worker_private is none, pid: {:?}",
-            pcb.basic().pid()
+            pcb.pid()
         );
         return worker_private
             .as_ref()
@@ -262,13 +307,10 @@ impl KernelThreadMechanism {
     /// A daemon thread which creates other kernel threads
     fn kthread_daemon() -> i32 {
         let current_pcb = ProcessManager::current_pcb();
+        kdebug!("kthread_daemon: pid: {:?}", current_pcb.pid());
         {
             // 初始化worker_private
             let mut worker_private_guard = current_pcb.worker_private();
-            assert!(
-                worker_private_guard.is_none(),
-                "kthread daemon: initial worker_private is not none"
-            );
             let worker_private = WorkerPrivate::KernelThread(KernelThreadPcbPrivate::new());
             *worker_private_guard = Some(worker_private);
         }
@@ -299,7 +341,11 @@ impl KernelThreadMechanism {
                 list = KTHREAD_CREATE_LIST.lock();
             }
             drop(list);
-            ProcessManager::sleep(true).ok();
+
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            ProcessManager::mark_sleep(true).ok();
+            drop(irq_guard);
+            sched();
         }
     }
 }
@@ -315,4 +361,11 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *mut KernelThreadCl
     let closure = Box::from_raw(ptr);
     let retval = closure.run() as usize;
     ProcessManager::exit(retval);
+}
+
+pub fn kthread_init() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        KernelThreadMechanism::init_stage1();
+    });
 }

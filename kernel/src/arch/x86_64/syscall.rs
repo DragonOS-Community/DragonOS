@@ -4,7 +4,7 @@ use alloc::string::String;
 
 use crate::{
     include::bindings::bindings::set_system_trap_gate,
-    syscall::{Syscall, SystemError, SYS_FORK, SYS_RT_SIGRETURN, SYS_VFORK},
+    syscall::{Syscall, SystemError, SYS_RT_SIGRETURN},
 };
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
@@ -35,24 +35,12 @@ pub extern "C" fn syscall_handler(frame: &mut TrapFrame) -> () {
         frame.r15 as usize,
     ];
     mfence();
-    mfence();
-    let from_user = frame.from_user();
 
     // 由于进程管理未完成重构，有些系统调用需要在这里临时处理，以后这里的特殊处理要删掉。
     match syscall_num {
-        SYS_FORK | SYS_VFORK => {
-            syscall_return!(
-                Syscall::fork(frame).unwrap_or_else(|e| e.to_posix_errno() as usize),
-                frame
-            )
-        }
-
         SYS_RT_SIGRETURN => {
             syscall_return!(SystemError::ENOSYS.to_posix_errno() as usize, frame);
         }
-        // SYS_SCHED => {
-        //     syscall_return!(sched(from_user) as u64, regs);
-        // }
         _ => {}
     }
     syscall_return!(Syscall::handle(syscall_num, &args, frame) as u64, frame);

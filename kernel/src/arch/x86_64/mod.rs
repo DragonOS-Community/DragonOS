@@ -11,6 +11,7 @@ pub mod pci;
 pub mod process;
 pub mod rand;
 pub mod sched;
+pub mod smp;
 pub mod syscall;
 
 pub use self::pci::pci::X86_64PciArch as PciArch;

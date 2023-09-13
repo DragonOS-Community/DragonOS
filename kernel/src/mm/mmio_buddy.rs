@@ -1,8 +1,8 @@
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::kernel_mapper::KernelMapper;
+use crate::process::ProcessManager;
 use crate::syscall::SystemError;
 use crate::{
-    arch::asm::current::current_pcb,
     include::bindings::bindings::{vm_flags_t, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE},
     kdebug,
     mm::{MMArch, MemoryManagementArch},
@@ -502,7 +502,10 @@ impl MmioBuddyMemPool {
                 return Ok(space_guard);
             }
             Err(_) => {
-                kerror!("failed to create mmio. pid = {:?}", current_pcb().pid);
+                kerror!(
+                    "failed to create mmio. pid = {:?}",
+                    ProcessManager::current_pcb().pid()
+                );
                 return Err(SystemError::ENOMEM);
             }
         }

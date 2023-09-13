@@ -1,14 +1,15 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::{sync::Arc, vec::Vec};
+use x86::current;
 
 use crate::{
     arch::cpu::current_cpu_id,
-    include::bindings::bindings::process_control_block,
     include::bindings::bindings::smp_get_total_cpu,
-    kinfo,
+    kdebug, kinfo,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    smp::core::smp_get_processor_id,
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
@@ -78,6 +79,10 @@ pub trait Scheduler {
 }
 
 pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
+    // 当前进程持有锁，不切换，避免死锁
+    if ProcessManager::current_pcb().preempt_count() != 0 {
+        return None;
+    }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
@@ -87,7 +92,6 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     match rt_scheduler.pick_next_task_rt(current_cpu_id()) {
         Some(p) => {
             next = p;
-            // kdebug!("next pcb is {}",next.pid);
             // 将pick的进程放回原处
             rt_scheduler.enqueue_front(next);
 
@@ -97,17 +101,6 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
             return cfs_scheduler.sched();
         }
     }
-}
-
-// c版本代码
-// /// @brief 将进程加入调度队列
-// ///
-// /// @param pcb 要被加入队列的pcb
-// /// @param reset_time 是否重置虚拟运行时间
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn sched_enqueue_old(pcb: &'static mut process_control_block, mut reset_time: bool) {
-    panic!("derived method")
 }
 
 /// @brief 将进程加入调度队列
@@ -122,7 +115,7 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
     // 除了IDLE以外的进程，都进行负载均衡
-    if pcb.basic().pid().into() > 0 {
+    if pcb.pid().into() > 0 {
         loads_balance(pcb.clone());
     }
 

@@ -1,15 +1,13 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::{sync::Arc, vec::Vec};
-use x86::current;
 
 use crate::{
     arch::cpu::current_cpu_id,
     include::bindings::bindings::smp_get_total_cpu,
-    kdebug, kinfo,
+    kinfo,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
-    smp::core::smp_get_processor_id,
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};

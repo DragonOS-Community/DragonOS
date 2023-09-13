@@ -6,7 +6,6 @@ use core::{
 };
 
 use alloc::{
-    boxed::Box,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -30,11 +29,6 @@ use crate::{
     },
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
-    process::{
-        fork::CloneFlags,
-        init::initial_kernel_thread,
-        kthread::{KernelThreadClosure, KernelThreadCreateInfo, KernelThreadMechanism},
-    },
     sched::{
         core::{sched_enqueue, CPU_EXECUTING},
         SchedPolicy, SchedPriority,
@@ -291,6 +285,7 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `pcb` : 进程的pcb
+    #[allow(dead_code)]
     pub fn kick(pcb: &Arc<ProcessControlBlock>) {
         ProcessManager::current_pcb().preempt_disable();
         let cpu_id = pcb.sched_info().on_cpu();
@@ -341,6 +336,7 @@ pub enum ProcessState {
     Exited(usize),
 }
 
+#[allow(dead_code)]
 impl ProcessState {
     #[inline(always)]
     pub fn is_runnable(&self) -> bool {
@@ -552,6 +548,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<KernelStack> {
         return self.kernel_stack.write();
     }
@@ -914,6 +911,7 @@ impl KernelStack {
     }
 
     /// 返回指向当前内核栈pcb的Arc指针
+    #[allow(dead_code)]
     pub unsafe fn pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         // 从内核栈的最低地址处取出pcb的地址
         let p = self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock;

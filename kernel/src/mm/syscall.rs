@@ -4,10 +4,9 @@ use alloc::sync::Arc;
 
 use crate::{
     arch::MMArch,
-    kdebug, kerror,
+    kerror,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
-    process::ProcessManager,
     syscall::{Syscall, SystemError},
 };
 

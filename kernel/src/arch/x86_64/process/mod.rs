@@ -13,7 +13,6 @@ use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
-    kdebug,
     libs::spinlock::SpinLockGuard,
     mm::{
         percpu::{PerCpu, PerCpuVar},

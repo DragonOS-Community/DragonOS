@@ -60,6 +60,7 @@ pub struct ScmBufferInfo {
     flags: ScmBufferFlag, // 帧缓冲区标志位
 }
 
+#[allow(dead_code)]
 impl ScmBufferInfo {
     /// 创建新的帧缓冲区信息
     ///
@@ -159,7 +160,7 @@ impl ScmBufferInfo {
         match &self.buf {
             ScmBuffer::DeviceBuffer(vaddr) => {
                 let len = self.buf_size() / core::mem::size_of::<u32>();
-                let mut self_buf_guard =
+                let self_buf_guard =
                     unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len) };
                 match &src.buf {
                     ScmBuffer::DeviceBuffer(vaddr) => {
@@ -326,6 +327,7 @@ pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemErr
 }
 
 /// 屏幕管理器启用双缓冲区
+#[allow(dead_code)]
 pub fn scm_enable_double_buffer() -> Result<i32, SystemError> {
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) {
         // 已经开启了双缓冲区了, 直接退出

@@ -18,7 +18,6 @@ use hashbrown::HashSet;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    kdebug,
     libs::{
         align::page_align_up,
         rwlock::{RwLock, RwLockWriteGuard},

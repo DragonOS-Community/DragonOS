@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::{
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     syscall::SystemError,

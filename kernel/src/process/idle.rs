@@ -6,7 +6,6 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    kdebug,
     mm::{percpu::PerCpu, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
     smp::core::smp_get_processor_id,

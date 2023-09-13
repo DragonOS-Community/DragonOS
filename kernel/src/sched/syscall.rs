@@ -1,8 +1,7 @@
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kdebug,
-    process::{Pid, ProcessManager},
+    process::ProcessManager,
     syscall::{Syscall, SystemError},
 };
 

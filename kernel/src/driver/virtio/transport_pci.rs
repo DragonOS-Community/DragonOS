@@ -77,7 +77,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
-    bus_device_function: BusDeviceFunction,
+    _bus_device_function: BusDeviceFunction,
     /// The common configuration structure within some BAR.
     common_cfg: NonNull<CommonCfg>,
     /// The start of the queue notification region within some BAR.
@@ -182,7 +182,7 @@ impl PciTransport {
         };
         Ok(Self {
             device_type,
-            bus_device_function,
+            _bus_device_function: bus_device_function,
             common_cfg,
             notify_region,
             notify_off_multiplier,

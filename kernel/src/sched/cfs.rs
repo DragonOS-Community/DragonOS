@@ -3,14 +3,13 @@ use core::sync::atomic::compiler_fence;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::cpu::current_cpu_id,
     include::bindings::bindings::MAX_CPU_NUM,
-    kBUG, kdebug, kerror,
+    kBUG,
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    process::{Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     smp::core::smp_get_processor_id,
 };
 
@@ -175,6 +174,7 @@ impl SchedulerCFS {
     }
 
     /// @brief 设置cpu的队列的IDLE进程的pcb
+    #[allow(dead_code)]
     pub fn set_cpu_idle(&mut self, cpu_id: usize, pcb: Arc<ProcessControlBlock>) {
         // kdebug!("set cpu idle: id={}", cpu_id);
         self.cpu_queue[cpu_id].idle_pcb = pcb;

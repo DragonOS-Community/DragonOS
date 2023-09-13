@@ -56,7 +56,6 @@ extern crate thingbuf;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
-use crate::libs::lib_ui::textui::FontColor;
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;

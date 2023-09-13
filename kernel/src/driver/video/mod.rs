@@ -160,6 +160,7 @@ impl VideoRefreshManager {
         return Err(SystemError::EINVAL);
     }
 
+    #[allow(dead_code)]
     pub fn refresh_target(&self) -> RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u32]>>>>> {
         let x = self.refresh_target.read();
 

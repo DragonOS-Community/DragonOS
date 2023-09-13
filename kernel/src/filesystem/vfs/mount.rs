@@ -8,10 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, kdebug, libs::spinlock::SpinLock,
-    syscall::SystemError,
-};
+use crate::{libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::{file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode, InodeId};
 

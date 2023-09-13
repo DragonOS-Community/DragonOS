@@ -2,7 +2,6 @@ use core::ffi::c_int;
 
 use crate::{
     filesystem::vfs::file::{File, FileMode},
-    kwarn,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };

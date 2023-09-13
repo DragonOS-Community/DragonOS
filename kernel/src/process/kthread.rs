@@ -32,6 +32,7 @@ pub enum WorkerPrivate {
     KernelThread(KernelThreadPcbPrivate),
 }
 
+#[allow(dead_code)]
 impl WorkerPrivate {
     pub fn kernel_thread(&self) -> Option<&KernelThreadPcbPrivate> {
         match self {
@@ -59,6 +60,7 @@ pub struct KernelThreadPcbPrivate {
     flags: KernelThreadFlags,
 }
 
+#[allow(dead_code)]
 impl KernelThreadPcbPrivate {
     pub fn new() -> Self {
         Self {
@@ -80,6 +82,7 @@ impl KernelThreadPcbPrivate {
 /// 元组的第一个元素是闭包，第二个元素是闭包的参数对象
 ///
 /// 对于非原始类型的参数，需要使用Box包装
+#[allow(dead_code)]
 pub enum KernelThreadClosure {
     UsizeClosure((Box<dyn Fn(usize) -> i32 + Send + Sync>, usize)),
     EmptyClosure((Box<dyn Fn() -> i32 + Send + Sync>, ())),
@@ -90,7 +93,7 @@ impl KernelThreadClosure {
     pub fn run(self) -> i32 {
         match self {
             Self::UsizeClosure((func, arg)) => func(arg),
-            Self::EmptyClosure((func, arg)) => func(),
+            Self::EmptyClosure((func, _arg)) => func(),
         }
     }
 }
@@ -113,6 +116,7 @@ pub enum KernelThreadCreateStatus {
     ErrorOccured,
 }
 
+#[allow(dead_code)]
 impl KernelThreadCreateInfo {
     pub fn new(func: KernelThreadClosure, name: String) -> Arc<Self> {
         Arc::new(Self {
@@ -219,6 +223,7 @@ impl KernelThreadMechanism {
     /// ## 返回值
     ///
     /// - Some(Arc<ProcessControlBlock>) 创建成功，返回新创建的内核线程的PCB
+    #[allow(dead_code)]
     pub fn create(func: KernelThreadClosure, name: String) -> Option<Arc<ProcessControlBlock>> {
         let info = KernelThreadCreateInfo::new(func, name);
         while unsafe { KTHREAD_DAEMON_PCB.is_none() } {
@@ -238,6 +243,7 @@ impl KernelThreadMechanism {
     /// ## 返回值
     ///
     /// - Ok(i32) 目标内核线程的退出码
+    #[allow(dead_code)]
     pub fn stop(pcb: &Arc<ProcessControlBlock>) -> Result<usize, SystemError> {
         if !pcb.flags().contains(ProcessFlags::KTHREAD) {
             panic!("Cannt stop a non-kthread process");
@@ -284,6 +290,7 @@ impl KernelThreadMechanism {
     /// ## Panic
     ///
     /// 如果目标内核线程的数据检查失败，会panic
+    #[allow(dead_code)]
     pub fn should_stop(pcb: &Arc<ProcessControlBlock>) -> bool {
         if !pcb.flags().contains(ProcessFlags::KTHREAD) {
             return false;

@@ -8,7 +8,6 @@ pub mod int_like;
 pub mod keyboard_parser;
 pub mod lazy_init;
 pub mod lib_ui;
-pub mod lockref;
 pub mod mutex;
 pub mod notifier;
 pub mod once;

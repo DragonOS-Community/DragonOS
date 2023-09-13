@@ -2,11 +2,13 @@ use core::ffi::{c_int, c_void};
 
 use alloc::{string::String, vec::Vec};
 
-use super::{Pid, ProcessManager};
+use super::{fork::CloneFlags, Pid, ProcessManager};
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::MAX_PATHLEN,
     include::bindings::bindings::pid_t,
+    kdebug,
+    process::ProcessControlBlock,
     syscall::{
         user_access::{check_and_clone_cstr, check_and_clone_cstr_array},
         Syscall, SystemError,
@@ -17,12 +19,31 @@ extern "C" {
 }
 
 impl Syscall {
+    pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        let r = ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into());
+        return r;
+    }
+
+    pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        ProcessManager::fork(
+            frame,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
+        )
+        .map(|pid| pid.into())
+    }
+
     pub fn execve(
         path: *const u8,
         argv: *const *const u8,
         envp: *const *const u8,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
+        kdebug!(
+            "execve path: {:?}, argv: {:?}, envp: {:?}\n",
+            path,
+            argv,
+            envp
+        );
         if path.is_null() {
             return Err(SystemError::EINVAL);
         }
@@ -38,6 +59,9 @@ impl Syscall {
             panic!("Failed to execve: {:?}", e);
         }
         let (path, argv, envp) = r.unwrap();
+        ProcessManager::current_pcb()
+            .basic_mut()
+            .set_name(ProcessControlBlock::generate_name(&path, &argv));
 
         return Self::do_execve(path, argv, envp, frame);
     }
@@ -70,7 +94,7 @@ impl Syscall {
     /// @brief 获取当前进程的pid
     pub fn getpid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.basic().pid());
+        return Ok(current_pcb.pid());
     }
 
     /// @brief 获取指定进程的pgid
@@ -82,7 +106,7 @@ impl Syscall {
     pub fn getpgid(mut pid: Pid) -> Result<Pid, SystemError> {
         if pid == Pid(0) {
             let current_pcb = ProcessManager::current_pcb();
-            pid = current_pcb.basic().pid();
+            pid = current_pcb.pid();
         }
         let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
         return Ok(target_proc.basic().pgid());

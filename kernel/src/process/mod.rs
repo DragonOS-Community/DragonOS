@@ -1,7 +1,7 @@
 use core::{
     ffi::c_void,
     hash::{Hash, Hasher},
-    intrinsics::unlikely,
+    intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
     sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering},
 };
@@ -10,6 +10,7 @@ use alloc::{
     boxed::Box,
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use hashbrown::HashMap;
 
@@ -20,7 +21,7 @@ use crate::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
-    kdebug,
+    kdebug, kinfo,
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
@@ -51,7 +52,6 @@ pub mod fork;
 pub mod idle;
 pub mod init;
 pub mod kthread;
-pub mod pid;
 pub mod process;
 pub mod syscall;
 
@@ -59,6 +59,9 @@ pub mod syscall;
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
 
 pub static mut SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
+
+/// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
+static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 
 #[derive(Debug)]
 pub struct SwitchResult {
@@ -100,27 +103,35 @@ impl ProcessManager {
 
         ALL_PROCESS.lock().replace(HashMap::new());
         Self::arch_init();
+        kdebug!("process arch init done.");
         Self::init_idle();
+        kdebug!("process idle init done.");
 
-        KernelThreadMechanism::init();
-
-        // 初始化第一个内核线程
-        {
-            let create_info = KernelThreadCreateInfo::new(
-                KernelThreadClosure::EmptyClosure((Box::new(initial_kernel_thread), ())),
-                "init".to_string(),
-            );
-            KernelThreadMechanism::__inner_create(
-                &create_info,
-                CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGNAL,
-            )
-            .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
+        unsafe {
+            __PROCESS_MANAGEMENT_INIT_DONE = true;
         }
+        kinfo!("Process Manager initialized.");
     }
 
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
         return ProcessControlBlock::arch_current_pcb();
+    }
+
+    /// 增加当前进程的锁持有计数
+    #[inline(always)]
+    pub fn preempt_disable() {
+        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
+            ProcessManager::current_pcb().preempt_disable();
+        }
+    }
+
+    /// 减少当前进程的锁持有计数
+    #[inline(always)]
+    pub fn preempt_enable() {
+        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
+            ProcessManager::current_pcb().preempt_enable();
+        }
     }
 
     /// 根据pid获取进程的pcb
@@ -150,7 +161,7 @@ impl ProcessManager {
             .lock()
             .as_mut()
             .unwrap()
-            .insert(pcb.basic().pid(), pcb.clone());
+            .insert(pcb.pid(), pcb.clone());
     }
 
     /// 唤醒一个进程
@@ -161,6 +172,9 @@ impl ProcessManager {
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
+                // avoid deadlock
+                drop(writer);
+
                 sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_exited() {
@@ -175,13 +189,25 @@ impl ProcessManager {
         }
     }
 
-    /// 标志当前进程永久睡眠，移出调度队列
-    pub fn sleep(interruptable: bool) -> Result<(), SystemError> {
+    /// 标志当前进程永久睡眠，但是发起调度的工作，应该由调用者完成
+    ///
+    /// ## 注意
+    ///
+    /// - 进入当前函数之前，不能持有sched_info的锁
+    /// - 进入当前函数之前，必须关闭中断
+    pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
+        assert_eq!(
+            CurrentIrqArch::is_irq_enabled(),
+            false,
+            "interrupt must be disabled before enter ProcessManager::mark_sleep()"
+        );
+
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info_mut();
+        let mut writer = pcb.sched_info_mut_irqsave();
         if writer.state() != ProcessState::Exited(0) {
             writer.set_state(ProcessState::Blocked(interruptable));
-            sched();
+            drop(writer);
+
             return Ok(());
         }
         return Err(SystemError::EINTR);
@@ -189,11 +215,23 @@ impl ProcessManager {
 
     /// 当子进程退出后向父进程发送通知
     fn exit_notify() {
-        todo!("exit_notify");
+        let current = ProcessManager::current_pcb();
+        // 让INIT进程收养所有子进程
+        if current.pid() != Pid(1) {
+            unsafe {
+                current
+                    .adopt_childen()
+                    .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
+            };
+            // todo: 当信号机制重写后，这里需要向父进程发送SIGCHLD信号
+        }
     }
-    /// 退出进程，回收资源
+
+    /// 退出当前进程
     ///
-    /// 功能参考 https://opengrok.ringotek.cn/xref/DragonOS/kernel/src/process/process.c?r=40fe15e0953f989ccfeb74826d61621d43dea6bb&mo=7649&fi=246#246
+    /// ## 参数
+    ///
+    /// - `exit_code` : 进程的退出码
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -202,8 +240,8 @@ impl ProcessManager {
             .write()
             .set_state(ProcessState::Exited(exit_code));
         drop(pcb);
-        drop(irq_guard);
         ProcessManager::exit_notify();
+        drop(irq_guard);
         sched();
         loop {}
     }
@@ -213,8 +251,7 @@ impl ProcessManager {
         if !pcb.is_none() {
             let pcb = pcb.unwrap();
             // 判断该pcb是否在全局没有任何引用
-            let weak_ref = Arc::downgrade(&pcb);
-            if weak_ref.strong_count() <= 1 {
+            if Arc::strong_count(&pcb) <= 1 {
                 drop(pcb);
                 ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
             } else {
@@ -226,6 +263,7 @@ impl ProcessManager {
 
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
+        // kdebug!("switch_finish_hook");
         let prev_pcb = SWITCH_RESULT
             .as_mut()
             .unwrap()
@@ -258,7 +296,7 @@ impl ProcessManager {
         if let Some(cpu_id) = cpu_id {
             let cpu_id = cpu_id as usize;
 
-            if pcb.basic().pid() == CPU_EXECUTING[cpu_id].load(Ordering::SeqCst) {
+            if pcb.pid() == CPU_EXECUTING[cpu_id].load(Ordering::SeqCst) {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
@@ -267,8 +305,8 @@ impl ProcessManager {
     }
 }
 
-/// 上下文切换完成后的钩子函数
-pub unsafe extern "C" fn switch_finish_hook() {
+/// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
+pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 
@@ -342,6 +380,9 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct ProcessControlBlock {
+    /// 当前进程的pid
+    pid: Pid,
+
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
@@ -392,12 +433,12 @@ impl ProcessControlBlock {
         } else {
             (
                 Self::generate_pid(),
-                ProcessManager::current_pcb().basic().pid(),
+                ProcessManager::current_pcb().pid(),
                 ProcessManager::current_pcb().basic().cwd(),
             )
         };
 
-        let basic_info = ProcessBasicInfo::new(pid, Pid(0), ppid, name, cwd, None);
+        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
 
@@ -409,6 +450,7 @@ impl ProcessControlBlock {
             .unwrap_or_else(|| Weak::new());
 
         let pcb = Self {
+            pid,
             basic: basic_info,
             preempt_count,
             flags,
@@ -426,10 +468,10 @@ impl ProcessControlBlock {
         unsafe { pcb.kernel_stack.write().set_pcb(Arc::clone(&pcb)).unwrap() };
 
         // 将当前pcb加入父进程的子进程哈希表中
-        if pcb.basic().pid() != Pid(0) {
+        if pcb.pid() > Pid(1) {
             if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
                 let mut children = ppcb_arc.children.write();
-                children.insert(pcb.basic().pid(), pcb.clone());
+                children.insert(pcb.pid(), pcb.clone());
             } else {
                 panic!("parent pcb is None");
             }
@@ -439,68 +481,98 @@ impl ProcessControlBlock {
     }
 
     /// 生成一个新的pid
+    #[inline(always)]
     fn generate_pid() -> Pid {
         static NEXT_PID: AtomicPid = AtomicPid::new(Pid(1));
         return NEXT_PID.fetch_add(Pid(1), Ordering::SeqCst);
     }
 
     /// 返回当前进程的锁持有计数
+    #[inline(always)]
     pub fn preempt_count(&self) -> usize {
         return self.preempt_count.load(Ordering::SeqCst);
     }
 
     /// 增加当前进程的锁持有计数
+    #[inline(always)]
     pub fn preempt_disable(&self) {
         self.preempt_count.fetch_add(1, Ordering::SeqCst);
     }
 
     /// 减少当前进程的锁持有计数
+    #[inline(always)]
     pub fn preempt_enable(&self) {
         self.preempt_count.fetch_sub(1, Ordering::SeqCst);
     }
 
+    #[inline(always)]
+    pub unsafe fn set_preempt_count(&self, count: usize) {
+        self.preempt_count.store(count, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
     pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {
         return self.flags.lock();
     }
 
+    #[inline(always)]
     pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
         return self.basic.read();
     }
 
+    #[inline(always)]
     pub fn set_name(&self, name: String) {
         self.basic.write().set_name(name);
     }
 
+    #[inline(always)]
     pub fn basic_mut(&self) -> RwLockWriteGuard<ProcessBasicInfo> {
         return self.basic.write();
     }
 
+    #[inline(always)]
     pub fn arch_info(&self) -> SpinLockGuard<ArchPCBInfo> {
         return self.arch_info.lock();
     }
 
+    #[inline(always)]
+    pub fn arch_info_irqsave(&self) -> SpinLockGuard<ArchPCBInfo> {
+        return self.arch_info.lock_irqsave();
+    }
+
+    #[inline(always)]
     pub fn kernel_stack(&self) -> RwLockReadGuard<KernelStack> {
         return self.kernel_stack.read();
     }
 
+    #[inline(always)]
     pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<KernelStack> {
         return self.kernel_stack.write();
     }
 
+    #[inline(always)]
     pub fn sched_info(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
         return self.sched_info.read();
     }
 
+    #[inline(always)]
     pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write();
     }
 
+    #[inline(always)]
     pub fn sched_info_mut_irqsave(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write_irqsave();
     }
 
+    #[inline(always)]
     pub fn worker_private(&self) -> SpinLockGuard<Option<WorkerPrivate>> {
         return self.worker_private.lock();
+    }
+
+    #[inline(always)]
+    pub fn pid(&self) -> Pid {
+        return self.pid;
     }
 
     /// 获取文件描述符表的Arc指针
@@ -522,24 +594,22 @@ impl ProcessControlBlock {
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
-        let f = fd_table_guard.get_file_ref_by_fd(fd)?;
+        let f = fd_table_guard.get_file_by_fd(fd)?;
+        drop(fd_table_guard);
 
-        if f.file_type() != FileType::Socket {
+        let guard = f.lock();
+        if guard.file_type() != FileType::Socket {
             return None;
         }
-        let socket: Arc<SocketInode> = f
+        let socket: Arc<SocketInode> = guard
             .inode()
             .downcast_arc::<SocketInode>()
             .expect("Not a socket inode");
         return Some(socket);
     }
 
-    /// 退出进程时,让初始进程收养所有子进程
-    ///
-    /// ## 参数
-    ///
-    /// -`pcb` : 要退出的进程
-    fn adopt_childen(&self) -> Result<(), SystemError> {
+    /// 当前进程退出时,让初始进程收养所有子进程
+    unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
         match ProcessManager::find(Pid(1)) {
             Some(init_pcb) => {
                 let mut childen_guard = self.children.write();
@@ -555,23 +625,29 @@ impl ProcessControlBlock {
             _ => Err(SystemError::ECHILD),
         }
     }
+
+    /// 生成进程的名字
+    pub fn generate_name(_program_path: &str, args: &Vec<String>) -> String {
+        let mut name = "".to_string();
+        for arg in args {
+            name.push_str(arg);
+            name.push(' ');
+        }
+        return name;
+    }
 }
 
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         // 在ProcFS中,解除进程的注册
-        procfs_unregister_pid(self.basic().pid())
+        procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
-        // 让INIT进程收养所有子进程
-        if self.basic().pid() != Pid(1) {
-            self.adopt_childen()
-                .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"));
-        }
+
         if let Some(ppcb) = self.parent_pcb.read().upgrade() {
-            ppcb.children.write().remove(&self.basic().pid());
+            ppcb.children.write().remove(&self.pid());
         }
 
-        unsafe { ProcessManager::release(self.basic().pid()) };
+        unsafe { ProcessManager::release(self.pid()) };
     }
 }
 
@@ -580,8 +656,6 @@ impl Drop for ProcessControlBlock {
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
 #[derive(Debug)]
 pub struct ProcessBasicInfo {
-    /// 当前进程的pid
-    pid: Pid,
     /// 当前进程的进程组id
     pgid: Pid,
     /// 当前进程的父进程的pid
@@ -601,7 +675,6 @@ pub struct ProcessBasicInfo {
 
 impl ProcessBasicInfo {
     pub fn new(
-        pid: Pid,
         pgid: Pid,
         ppid: Pid,
         name: String,
@@ -610,7 +683,6 @@ impl ProcessBasicInfo {
     ) -> RwLock<Self> {
         let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
-            pid,
             pgid,
             ppid,
             name,
@@ -618,10 +690,6 @@ impl ProcessBasicInfo {
             user_vm,
             fd_table: Some(fd_table),
         });
-    }
-
-    pub fn pid(&self) -> Pid {
-        return self.pid;
     }
 
     pub fn pgid(&self) -> Pid {
@@ -827,13 +895,15 @@ impl KernelStack {
     pub unsafe fn set_pcb(&mut self, pcb: Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         // 将一个Arc<ProcessControlBlock>放到内核栈的最低地址处
         let p: *const ProcessControlBlock = Arc::into_raw(pcb);
+        let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;
+
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
-        if unlikely(!p.is_null()) {
+        if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {
             return Err(SystemError::EPERM);
         }
         // 将pcb的地址放到内核栈的最低地址处
         unsafe {
-            *(self.stack.as_ref().unwrap().as_ptr() as *mut *const ProcessControlBlock) = p;
+            *stack_bottom_ptr = p;
         }
 
         return Ok(());
@@ -874,9 +944,4 @@ impl Drop for KernelStack {
 
 pub fn process_init() {
     ProcessManager::init();
-}
-
-#[no_mangle]
-pub extern "C" fn process_do_exit(exit_code: usize) -> usize {
-    ProcessManager::exit(exit_code);
 }

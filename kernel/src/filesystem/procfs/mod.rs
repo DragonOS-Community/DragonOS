@@ -149,7 +149,7 @@ impl ProcFSInode {
 
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
         pdata.append(
-            &mut format!("\nPid:\t{}", pcb.basic().pid().into())
+            &mut format!("\nPid:\t{}", pcb.pid().into())
                 .as_bytes()
                 .to_owned(),
         );
@@ -187,7 +187,12 @@ impl ProcFSInode {
                 .to_owned(),
         );
         pdata.append(&mut format!("\nVmData:\t{} kB", data).as_bytes().to_owned());
-        pdata.append(&mut format!("\nVmExe:\t{} kB\n", text).as_bytes().to_owned());
+        pdata.append(&mut format!("\nVmExe:\t{} kB", text).as_bytes().to_owned());
+        pdata.append(
+            &mut format!("\nflags: {:?}\n", pcb.flags().clone())
+                .as_bytes()
+                .to_owned(),
+        );
 
         // 去除多余的\0
         self.trim_string(pdata);

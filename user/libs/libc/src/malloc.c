@@ -23,6 +23,9 @@
 #define PAGE_4K_ALIGN(addr) (((unsigned long)(addr) + PAGE_4K_SIZE - 1) & PAGE_4K_MASK)
 #define PAGE_2M_ALIGN(addr) (((unsigned long)(addr) + PAGE_2M_SIZE - 1) & PAGE_2M_MASK)
 
+#define ALIGN_UP16(x) (((x) + 15) & ~15)
+#define PAGE_ALIGN_UP(x) (((x) + PAGE_4K_SIZE - 1) & PAGE_4K_MASK)
+
 /**
  * @brief 显式链表的结点
  *
@@ -134,14 +137,14 @@ static int malloc_enlarge(int64_t size)
         brk_base_addr = sbrk(0);
         // printf("brk_base_addr=%#018lx\n", brk_base_addr);
         brk_managed_addr = brk_base_addr;
-        brk_max_addr = brk_base_addr;
+        brk_max_addr = sbrk(0);
     }
 
     int64_t free_space = brk_max_addr - brk_managed_addr;
     // printf("size=%ld\tfree_space=%ld\n", size, free_space);
     if (free_space < size) // 现有堆空间不足
     {
-        if (sbrk(size - free_space) != (void *)(-1))
+        if (sbrk(PAGE_ALIGN_UP(size - free_space)) != (void *)(-1))
             brk_max_addr = sbrk((0));
         else
         {
@@ -154,7 +157,6 @@ static int malloc_enlarge(int64_t size)
 
     // 扩展管理的堆空间
     // 在新分配的内存的底部放置header
-    // printf("managed addr = %#018lx\n", brk_managed_addr);
     malloc_mem_chunk_t *new_ck = (malloc_mem_chunk_t *)brk_managed_addr;
     memset(new_ck, 0, sizeof(malloc_mem_chunk_t));
     new_ck->length = brk_max_addr - brk_managed_addr;
@@ -292,12 +294,11 @@ void *malloc(ssize_t size)
         // 找到了合适的块
         if (ck)
             goto found;
-        
+
         // printf("before enlarge\n");
         // 找不到合适的块，扩容堆区域
         if (malloc_enlarge(size) == -ENOMEM)
             return (void *)-ENOMEM; // 内存不足
-        
 
         malloc_merge_free_chunk(); // 扩容后运行合并，否则会导致碎片
 

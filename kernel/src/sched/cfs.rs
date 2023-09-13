@@ -5,16 +5,19 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use crate::{
     arch::cpu::current_cpu_id,
     include::bindings::bindings::MAX_CPU_NUM,
-    kBUG,
+    kBUG, kdebug, kerror,
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     smp::core::smp_get_processor_id,
 };
 
-use super::core::{sched_enqueue, Scheduler};
+use super::{
+    core::{sched_enqueue, Scheduler},
+    SchedPriority,
+};
 
 /// 声明全局的cfs调度器实例
 pub static mut CFS_SCHEDULER_PTR: Option<Box<SchedulerCFS>> = None;
@@ -60,7 +63,7 @@ impl CFSQueue {
         let mut queue = self.locked_queue.lock_irqsave();
 
         // 如果进程是IDLE进程，那么就不加入队列
-        if pcb.basic().pid().into() == 0 {
+        if pcb.pid().into() == 0 {
             return;
         }
 
@@ -127,7 +130,10 @@ impl SchedulerCFS {
 
     /// @brief 更新这个cpu上，这个进程的可执行时间。
     #[inline]
-    fn update_cpu_exec_proc_jiffies(_priority: i64, cfs_queue: &mut CFSQueue) -> &mut CFSQueue {
+    fn update_cpu_exec_proc_jiffies(
+        _priority: SchedPriority,
+        cfs_queue: &mut CFSQueue,
+    ) -> &mut CFSQueue {
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置分配给进程的可执行时间
         cfs_queue.cpu_exec_proc_jiffies = 10;
 
@@ -136,7 +142,7 @@ impl SchedulerCFS {
 
     /// @brief 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间
     pub fn timer_update_jiffies(&mut self) {
-        let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id() as usize];
+        let current_cpu_queue: &mut CFSQueue = self.cpu_queue[smp_get_processor_id() as usize];
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
         // 更新进程的剩余可执行时间
@@ -196,27 +202,21 @@ impl Scheduler for SchedulerCFS {
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果当前不是running态，或者当前进程的虚拟运行时间大于等于下一个进程的，那就需要切换。
-        if !matches!(
-            ProcessManager::current_pcb().sched_info().state(),
-            ProcessState::Runnable
-        ) || ProcessManager::current_pcb().sched_info().virtual_runtime()
-            >= proc.sched_info().virtual_runtime()
+        if (ProcessManager::current_pcb().sched_info().state() != ProcessState::Runnable)
+            || (ProcessManager::current_pcb().sched_info().virtual_runtime()
+                >= proc.sched_info().virtual_runtime())
         {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
-            if matches!(
-                ProcessManager::current_pcb().sched_info().state(),
-                ProcessState::Runnable
-            ) {
+            if ProcessManager::current_pcb().sched_info().state() == ProcessState::Runnable {
                 sched_enqueue(ProcessManager::current_pcb(), false);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
-
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 设置进程可以执行的时间
             if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
-                    proc.sched_info().priority().data() as i64,
+                    proc.sched_info().priority(),
                     current_cpu_queue,
                 );
             }
@@ -231,7 +231,7 @@ impl Scheduler for SchedulerCFS {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
-                    proc.sched_info().priority().data() as i64,
+                    ProcessManager::current_pcb().sched_info().priority(),
                     current_cpu_queue,
                 );
                 // kdebug!("cpu:{:?}",current_cpu_id);
@@ -248,6 +248,7 @@ impl Scheduler for SchedulerCFS {
 
     fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
         let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
+
         cpu_queue.enqueue(pcb);
     }
 }

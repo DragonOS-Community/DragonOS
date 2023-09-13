@@ -10,6 +10,7 @@
 #include <smp/ipi.h>
 #include <driver/interrupt/apic/apic_timer.h>
 #include <common/spinlock.h>
+#include <process/preempt.h>
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -107,6 +108,7 @@ void HPET_measure_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
  */
 void HPET_measure_freq()
 {
+    rs_preempt_disable();
     kinfo("Measuring local APIC timer's frequency...");
     const uint64_t interval = APIC_TIMER_INTERVAL; // 测量给定时间内的计数
     struct apic_IO_APIC_RTE_entry entry;
@@ -163,6 +165,8 @@ void HPET_measure_freq()
     Cpu_tsc_freq = (test_tsc_end - test_tsc_start) * (1000UL / interval);
 
     kinfo("TSC frequency: %ldMHz", Cpu_tsc_freq / 1000000);
+
+    rs_preempt_enable();
 }
 
 /**

@@ -116,10 +116,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获取READER守卫
     pub fn try_read(&self) -> Option<RwLockReadGuard<T>> {
-        ProcessManager::current_pcb().preempt_disable();
+        ProcessManager::preempt_disable();
         let r = self.inner_try_read();
         if r.is_none() {
-            ProcessManager::current_pcb().preempt_enable();
+            ProcessManager::preempt_enable();
         }
         return r;
     }
@@ -180,10 +180,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得WRITER守卫
     pub fn try_write(&self) -> Option<RwLockWriteGuard<T>> {
-        ProcessManager::current_pcb().preempt_disable();
+        ProcessManager::preempt_disable();
         let r = self.inner_try_write();
         if r.is_none() {
-            ProcessManager::current_pcb().preempt_enable();
+            ProcessManager::preempt_enable();
         }
 
         return r;
@@ -240,10 +240,10 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 尝试获得UPGRADER守卫
     pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
-        ProcessManager::current_pcb().preempt_disable();
+        ProcessManager::preempt_disable();
         let r = self.inner_try_upgradeable_read();
         if r.is_none() {
-            ProcessManager::current_pcb().preempt_enable();
+            ProcessManager::preempt_enable();
         }
 
         return r;
@@ -498,7 +498,7 @@ impl<'rwlock, T> Drop for RwLockReadGuard<'rwlock, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
-        ProcessManager::current_pcb().preempt_enable();
+        ProcessManager::preempt_enable();
     }
 }
 
@@ -509,7 +509,7 @@ impl<'rwlock, T> Drop for RwLockUpgradableGuard<'rwlock, T> {
             UPGRADED
         );
         self.inner.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
-        ProcessManager::current_pcb().preempt_enable();
+        ProcessManager::preempt_enable();
         //这里为啥要AcqRel? Release应该就行了?
     }
 }
@@ -521,6 +521,6 @@ impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
         self.irq_guard.take();
-        ProcessManager::current_pcb().preempt_enable();
+        ProcessManager::preempt_enable();
     }
 }

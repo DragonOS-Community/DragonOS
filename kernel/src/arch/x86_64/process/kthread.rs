@@ -13,7 +13,7 @@ use crate::{
             kernel_thread_bootstrap_stage2, KernelThreadClosure, KernelThreadCreateInfo,
             KernelThreadMechanism,
         },
-        Pid, ProcessFlags, ProcessManager,
+        Pid, ProcessManager,
     },
     syscall::SystemError,
 };
@@ -32,16 +32,22 @@ impl KernelThreadMechanism {
 
         let mut frame = TrapFrame::new();
         frame.rbx = closure as *mut KernelThreadClosure as u64;
-        frame.ds = KERNEL_DS as u64;
-        frame.es = KERNEL_DS as u64;
-        frame.cs = KERNEL_CS as u64;
-        frame.ss = KERNEL_DS as u64;
+        frame.ds = KERNEL_DS.bits() as u64;
+        frame.es = KERNEL_DS.bits() as u64;
+        frame.cs = KERNEL_CS.bits() as u64;
+        frame.ss = KERNEL_DS.bits() as u64;
 
         // 使能中断
         frame.rflags |= 1 << 9;
-        frame.rip = &kernel_thread_bootstrap_stage1 as *const _ as u64;
 
-        return ProcessManager::fork(&mut frame, clone_flags);
+        frame.rip = kernel_thread_bootstrap_stage1 as usize as u64;
+
+        let pid = ProcessManager::fork(&mut frame, clone_flags)?;
+        ProcessManager::find(pid)
+            .unwrap()
+            .set_name(info.name().clone());
+
+        return Ok(pid);
     }
 }
 
@@ -51,10 +57,11 @@ impl KernelThreadMechanism {
 ///
 /// 跳转之后，指向Box<KernelThreadClosure>的指针将传入到stage2的函数
 #[naked]
-unsafe extern "sysv64" fn kernel_thread_bootstrap_stage1() {
+pub(super) unsafe extern "sysv64" fn kernel_thread_bootstrap_stage1() {
     asm!(
         concat!(
             "
+
             pop r15
             pop r14
             pop r13

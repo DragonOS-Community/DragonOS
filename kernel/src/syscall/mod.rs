@@ -494,6 +494,9 @@ impl Syscall {
                 res
             }
 
+            SYS_FORK => Self::fork(frame),
+            SYS_VFORK => Self::vfork(frame),
+
             SYS_BRK => {
                 let new_brk = VirtAddr::new(args[0]);
                 Self::brk(new_brk).map(|vaddr| vaddr.data())
@@ -501,7 +504,7 @@ impl Syscall {
 
             SYS_SBRK => {
                 let increment = args[0] as isize;
-                Self::sbrk(increment).map(|vaddr| vaddr.data())
+                Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
             }
 
             SYS_REBOOT => Self::reboot(),

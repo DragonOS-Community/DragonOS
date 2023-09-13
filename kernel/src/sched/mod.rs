@@ -5,6 +5,7 @@ pub mod rt;
 pub mod syscall;
 
 /// 调度策略
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedPolicy {
     /// 完全公平调度

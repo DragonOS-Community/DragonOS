@@ -51,7 +51,7 @@ impl Semaphore {
                 //如果唤醒失败,打印错误信息
                 kdebug!(
                     "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
-                    ProcessManager::current_pcb().basic().pid().into(),
+                    ProcessManager::current_pcb().pid().into(),
                     self
                 );
             }

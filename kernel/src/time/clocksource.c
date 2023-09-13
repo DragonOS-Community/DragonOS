@@ -1,5 +1,5 @@
 #include "clocksource.h"
-#include <common/kthread.h>
+#include <common/kprint.h>
 
 void run_watchdog_kthread()
 {

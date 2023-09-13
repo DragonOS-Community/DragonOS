@@ -22,7 +22,6 @@
 #include <filesystem/vfs/VFS.h>
 
 #include "driver/acpi/acpi.h"
-#include "driver/disk/ahci/ahci.h"
 #include "driver/disk/ata.h"
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
@@ -37,6 +36,7 @@ extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
 extern int rs_video_init();
+extern void rs_kthread_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -44,6 +44,7 @@ ul bsp_idt_size, bsp_gdt_size;
 #pragma GCC optimize("O0")
 struct gdtr gdtp;
 struct idtr idtp;
+ul _stack_start;
 void reload_gdt()
 {
 
@@ -72,7 +73,6 @@ void system_initialize()
     c_uart_init(COM1, 115200);
 
     rs_video_init();
-
     scm_init();
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
@@ -80,14 +80,10 @@ void system_initialize()
     _stack_start = head_stack_start; // 保存init proc的栈基地址（由于之后取消了地址重映射，因此必须在这里重新保存）
     kdebug("_stack_start=%#018lx", _stack_start);
 
-    load_TR(10); // 加载TR寄存器
-    set_tss64((uint *)&initial_tss[0], _stack_start, _stack_start, _stack_start, tss_item_addr, tss_item_addr,
-              tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr, tss_item_addr);
+    set_current_core_tss(_stack_start, 0);
+    load_current_core_tss();
 
     cpu_core_info[0].stack_start = _stack_start;
-    cpu_core_info[0].tss_vaddr = (uint64_t)&initial_tss[0];
-    // kdebug("cpu_core_info[0].tss_vaddr=%#018lx", cpu_core_info[0].tss_vaddr);
-    // kdebug("cpu_core_info[0].stack_start%#018lx", cpu_core_info[0].stack_start);
 
     // 初始化中断描述符表
     sys_vector_init();
@@ -103,33 +99,20 @@ void system_initialize()
     io_mfence();
     scm_reinit();
     rs_textui_init();
+
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
-    // =========== 重新设置initial_tss[0]的ist
-    uchar *ptr = (uchar *)kzalloc(STACK_SIZE, 0) + STACK_SIZE;
-    ((struct process_control_block *)(ptr - STACK_SIZE))->cpu_id = 0;
-
-    initial_tss[0].ist1 = (ul)ptr;
-    initial_tss[0].ist2 = (ul)ptr;
-    initial_tss[0].ist3 = (ul)ptr;
-    initial_tss[0].ist4 = (ul)ptr;
-    initial_tss[0].ist5 = (ul)ptr;
-    initial_tss[0].ist6 = (ul)ptr;
-    initial_tss[0].ist7 = (ul)ptr;
-    // ===========================
 
     acpi_init();
     io_mfence();
-    sched_init();
-    io_mfence();
-    // 初始化中断模块
     irq_init();
+    rs_process_init();
+    sched_init();
 
-    // softirq_init();
+    sti();
+    io_mfence();
+
     rs_softirq_init();
-
-    // set_cpuid(0);
-    // set_preempt_count(0);
 
     syscall_init();
     io_mfence();
@@ -146,13 +129,9 @@ void system_initialize()
     io_mfence();
     vfs_init();
     rs_tty_init();
-    io_mfence();
-    // 由于进程管理模块依赖于文件系统，因此必须在文件系统初始化完毕后再初始化进程管理模块
-    // 并且，因为smp的IDLE进程的初始化依赖于进程管理模块，
-    // 因此必须在进程管理模块初始化完毕后再初始化smp。
-    io_mfence();
 
-    rs_process_init();
+    rs_kthread_init();
+    io_mfence();
 
     io_mfence();
     rs_clocksource_boot_finish();
@@ -169,20 +148,15 @@ void system_initialize()
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
+
     io_mfence();
 
     HPET_init();
-
     io_mfence();
     HPET_measure_freq();
-    io_mfence();
-    // current_pcb->preempt_count = 0;
-    // kdebug("cpu_get_core_crysral_freq()=%ld", cpu_get_core_crysral_freq());
 
-    // 启用double buffer
-    // scm_enable_double_buffer();  // 因为时序问题, 该函数调用被移到 initial_kernel_thread
     io_mfence();
-
+    cli();
     HPET_enable();
 
     io_mfence();
@@ -190,6 +164,9 @@ void system_initialize()
 
     apic_timer_init();
     io_mfence();
+    sti();
+    while (1)
+        ;
 }
 
 // 操作系统内核从这里开始执行
@@ -205,9 +182,6 @@ void Start_Kernel(void)
                          : "=r"(mb2_info), "=r"(mb2_magic), "=r"(bsp_gdt_size), "=r"(bsp_idt_size)::"memory");
     reload_gdt();
     reload_idt();
-
-    // 重新设置TSS描述符
-    set_tss_descriptor(10, (void *)(&initial_tss[0]));
 
     mb2_info &= 0xffffffff;
     mb2_magic &= 0xffffffff;

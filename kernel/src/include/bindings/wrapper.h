@@ -19,7 +19,6 @@
 #include <common/glib.h>
 #include <common/idr.h>
 #include <common/kfifo.h>
-#include <common/kthread.h>
 #include <common/list.h>
 #include <common/lz4.h>
 #include <common/printk.h>
@@ -28,9 +27,7 @@
 #include <common/string.h>
 #include <common/time.h>
 #include <common/unistd.h>
-#include <driver/disk/ahci/ahci.h>
 #include <driver/multiboot2/multiboot2.h>
-#include <driver/virtio/virtio.h>
 #include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
 #include <include/DragonOS/signal.h>
@@ -46,3 +43,4 @@
 #include <time/sleep.h>
 #include <driver/pci/pci_irq.h>
 #include <common/errno.h>
+#include <common/cpu.h>

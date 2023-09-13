@@ -3,11 +3,13 @@ use crate::{
         uart::uart::{c_uart_send, c_uart_send_str, UartPort},
         video::video_refresh_manager,
     },
-    kinfo,
+    kdebug, kinfo,
     libs::{
         lib_ui::font::FONT_8x16,
+        rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    println,
     syscall::SystemError,
 };
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};
@@ -28,7 +30,7 @@ use super::{
 };
 
 /// 声明全局的TEXTUI_FRAMEWORK
-static mut __TEXTUI_FRAMEWORK: Option<Box<TextUiFramework>> = None;
+static mut __TEXTUI_FRAMEWORK: Option<Arc<TextUiFramework>> = None;
 
 /// 每个字符的宽度和高度（像素）
 pub const TEXTUI_CHAR_WIDTH: u32 = 8;
@@ -40,14 +42,21 @@ pub static mut TEXTUI_IS_INIT: bool = false;
 pub static ENABLE_PUT_TO_WINDOW: AtomicBool = AtomicBool::new(true);
 
 /// 获取TEXTUI_FRAMEWORK的可变实例
-pub fn textui_framework() -> &'static mut TextUiFramework {
-    return unsafe { __TEXTUI_FRAMEWORK.as_mut().unwrap() };
+pub fn textui_framework() -> Arc<TextUiFramework> {
+    unsafe {
+        return __TEXTUI_FRAMEWORK
+            .as_ref()
+            .expect("Textui framework has not been initialized yet!")
+            .clone();
+    }
 }
+
 /// 初始化TEXTUI_FRAMEWORK
 pub unsafe fn textui_framwork_init() {
     if __TEXTUI_FRAMEWORK.is_none() {
         kinfo!("textuiframework init");
         let metadata = ScmUiFrameworkMetadata::new("TextUI".to_string(), ScmFramworkType::Text);
+        kdebug!("textui metadata: {:?}", metadata);
         // 为textui框架生成第一个窗口
         let vlines_num = (metadata.buf_info().height() / TEXTUI_CHAR_HEIGHT) as usize;
 
@@ -68,12 +77,21 @@ pub unsafe fn textui_framwork_init() {
             Arc::new(SpinLock::new(LinkedList::new()));
         window_list.lock().push_back(current_window.clone());
 
-        __TEXTUI_FRAMEWORK = Some(Box::new(TextUiFramework::new(
+        __TEXTUI_FRAMEWORK = Some(Arc::new(TextUiFramework::new(
             metadata,
             window_list,
             current_window,
             default_window,
         )));
+
+        scm_register(textui_framework()).expect("register textui framework failed");
+        kdebug!("textui framework init success");
+
+        c_uart_send_str(
+            UartPort::COM1.to_u16(),
+            "\ntext ui initialized\n\0".as_ptr(),
+        );
+        unsafe { TEXTUI_IS_INIT = true };
     } else {
         panic!("Try to init TEXTUI_FRAMEWORK twice!");
     }
@@ -272,13 +290,15 @@ impl TextuiBuf<'_> {
         match &buf.buf {
             ScmBuffer::DeviceBuffer(vaddr) => {
                 return TextuiBuf {
-                    buf: Some(unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len) }),
+                    buf: Some(unsafe {
+                        core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len)
+                    }),
                     guard: None,
                 };
             }
 
             ScmBuffer::DoubleBuffer(double_buffer) => {
-                let mut guard: SpinLockGuard<'_, Box<[u32]>> = double_buffer.lock();
+                let guard: SpinLockGuard<'_, Box<[u32]>> = double_buffer.lock();
 
                 return TextuiBuf {
                     buf: None,
@@ -300,10 +320,10 @@ impl TextuiBuf<'_> {
         buf[index] = color;
     }
     pub fn get_index_of_next_line(now_index: usize) -> usize {
-        textui_framework().metadata.buf_info().width() as usize + now_index
+        textui_framework().metadata.read().buf_info().width() as usize + now_index
     }
     pub fn get_index_by_x_y(x: usize, y: usize) -> usize {
-        textui_framework().metadata.buf_info().width() as usize * y + x
+        textui_framework().metadata.read().buf_info().width() as usize * y + x
     }
     pub fn get_start_index_by_lineid_lineindex(lineid: LineId, lineindex: LineIndex) -> usize {
         //   x 左上角列像素点位置
@@ -360,8 +380,10 @@ impl TextuiCharChromatic {
 
         let mut count = TextuiBuf::get_start_index_by_lineid_lineindex(lineid, lineindex);
 
-        let mut binding = textui_framework().metadata.buf_info();
-        let mut buf = TextuiBuf::new(&mut binding);
+        let mut _binding = textui_framework().metadata.read().buf_info();
+
+        let mut buf = TextuiBuf::new(&mut _binding);
+
         // 在缓冲区画出一个字体，每个字体有TEXTUI_CHAR_HEIGHT行，TEXTUI_CHAR_WIDTH列个像素点
         for i in 0..TEXTUI_CHAR_HEIGHT {
             let start = count;
@@ -395,13 +417,12 @@ impl TextuiCharChromatic {
 
         let buf_width = video_refresh_manager().device_buffer().width();
         // 找到输入缓冲区的起始地址位置
-        let buf_start = if let ScmBuffer::DeviceBuffer(vaddr) =
-            video_refresh_manager().device_buffer().buf
-        {
-            vaddr
-        } else {
-            panic!("device buffer is not init");
-        };
+        let buf_start =
+            if let ScmBuffer::DeviceBuffer(vaddr) = video_refresh_manager().device_buffer().buf {
+                vaddr
+            } else {
+                panic!("device buffer is not init");
+            };
 
         let mut testbit: u32; // 用来测试特定行的某列是背景还是字体本身
 
@@ -852,7 +873,7 @@ impl Default for TextuiWindow {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct TextUiFramework {
-    metadata: ScmUiFrameworkMetadata,
+    metadata: RwLock<ScmUiFrameworkMetadata>,
     window_list: Arc<SpinLock<LinkedList<Arc<SpinLock<TextuiWindow>>>>>,
     actual_line: AtomicI32, // 真实行的数量（textui的帧缓冲区能容纳的内容的行数）
     current_window: Arc<SpinLock<TextuiWindow>>, // 当前的主窗口
@@ -869,7 +890,7 @@ impl TextUiFramework {
         let actual_line =
             AtomicI32::new((&metadata.buf_info().height() / TEXTUI_CHAR_HEIGHT) as i32);
         let inner = TextUiFramework {
-            metadata,
+            metadata: RwLock::new(metadata),
             window_list,
             actual_line,
             current_window,
@@ -879,7 +900,7 @@ impl TextUiFramework {
     }
 }
 
-impl ScmUiFramework for &mut TextUiFramework {
+impl ScmUiFramework for TextUiFramework {
     // 安装ui框架的回调函数
     fn install(&self) -> Result<i32, SystemError> {
         c_uart_send_str(
@@ -905,14 +926,16 @@ impl ScmUiFramework for &mut TextUiFramework {
     }
     // 改变ui框架的帧缓冲区的回调函数
     fn change(&self, buf_info: ScmBufferInfo) -> Result<i32, SystemError> {
+        let old_buf = textui_framework().metadata.read().buf_info();
 
-        let old_buf = textui_framework().metadata.buf_info();
-        
-        textui_framework().metadata.set_buf_info(buf_info);
-        
-        let mut new_buf = textui_framework().metadata.buf_info();
+        textui_framework().metadata.write().set_buf_info(buf_info);
+
+        let mut new_buf = textui_framework().metadata.read().buf_info();
 
         new_buf.copy_from_nonoverlapping(&old_buf);
+        kdebug!("textui change buf_info: old: {:?}", old_buf);
+        kdebug!("textui change buf_info: new: {:?}", new_buf);
+
         return Ok(0);
     }
     ///  获取ScmUiFramework的元数据
@@ -921,7 +944,7 @@ impl ScmUiFramework for &mut TextUiFramework {
     ///  -成功：Ok(ScmUiFramework的元数据)
     ///  -失败：Err(错误码)
     fn metadata(&self) -> Result<ScmUiFrameworkMetadata, SystemError> {
-        let metadata = self.metadata.clone();
+        let metadata = self.metadata.read().clone();
 
         return Ok(metadata);
     }
@@ -1000,16 +1023,6 @@ pub extern "C" fn rs_textui_init() -> i32 {
 
 fn textui_init() -> Result<i32, SystemError> {
     unsafe { textui_framwork_init() };
-    let textui_framework = textui_framework();
-
-    unsafe { TEXTUI_IS_INIT = true };
-
-    scm_register(Arc::new(textui_framework))?;
-
-    c_uart_send_str(
-        UartPort::COM1.to_u16(),
-        "\ntext ui initialized\n\0".as_ptr(),
-    );
 
     return Ok(0);
 }

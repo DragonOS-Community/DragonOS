@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 
 use crate::{
     arch::{
@@ -9,10 +9,7 @@ use crate::{
     },
     process::{
         fork::CloneFlags,
-        kthread::{
-            kernel_thread_bootstrap_stage2, KernelThreadClosure, KernelThreadCreateInfo,
-            KernelThreadMechanism,
-        },
+        kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
         Pid, ProcessManager,
     },
     syscall::SystemError,
@@ -28,10 +25,12 @@ impl KernelThreadMechanism {
         info: &Arc<KernelThreadCreateInfo>,
         clone_flags: CloneFlags,
     ) -> Result<Pid, SystemError> {
-        let closure: &mut KernelThreadClosure = Box::leak(info.take_closure().unwrap());
+        // WARNING: If create failed, we must drop the info manually or it will cause memory leak. (refcount will not decrease when create failed)
+        let create_info: *const KernelThreadCreateInfo =
+            KernelThreadCreateInfo::generate_unsafe_arc_ptr(info.clone());
 
         let mut frame = TrapFrame::new();
-        frame.rbx = closure as *mut KernelThreadClosure as u64;
+        frame.rbx = create_info as usize as u64;
         frame.ds = KERNEL_DS.bits() as u64;
         frame.es = KERNEL_DS.bits() as u64;
         frame.cs = KERNEL_CS.bits() as u64;
@@ -42,7 +41,12 @@ impl KernelThreadMechanism {
 
         frame.rip = kernel_thread_bootstrap_stage1 as usize as u64;
 
-        let pid = ProcessManager::fork(&mut frame, clone_flags)?;
+        // fork失败的话，子线程不会执行。否则将导致内存安全问题。
+        let pid = ProcessManager::fork(&mut frame, clone_flags).map_err(|e| {
+            unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
+            e
+        })?;
+
         ProcessManager::find(pid)
             .unwrap()
             .set_name(info.name().clone());

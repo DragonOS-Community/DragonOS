@@ -1,10 +1,13 @@
-use core::{hint::spin_loop, sync::atomic::Ordering};
+use core::{
+    hint::spin_loop,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use alloc::{
     boxed::Box,
     collections::LinkedList,
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use atomic_enum::atomic_enum;
 
@@ -106,6 +109,9 @@ pub struct KernelThreadCreateInfo {
     /// 是否已经完成创建 todo:使用comletion机制优化这里
     created: AtomicKernelThreadCreateStatus,
     result_pcb: SpinLock<Option<Arc<ProcessControlBlock>>>,
+    /// 不安全的Arc引用计数，当内核线程创建失败时，需要减少这个计数
+    has_unsafe_arc_instance: AtomicBool,
+    self_ref: Weak<Self>,
 }
 
 #[atomic_enum]
@@ -119,12 +125,22 @@ pub enum KernelThreadCreateStatus {
 #[allow(dead_code)]
 impl KernelThreadCreateInfo {
     pub fn new(func: KernelThreadClosure, name: String) -> Arc<Self> {
-        Arc::new(Self {
+        let result = Arc::new(Self {
             closure: SpinLock::new(Some(Box::new(func))),
             name,
             created: AtomicKernelThreadCreateStatus::new(KernelThreadCreateStatus::NotCreated),
             result_pcb: SpinLock::new(None),
-        })
+            has_unsafe_arc_instance: AtomicBool::new(false),
+            self_ref: Weak::new(),
+        });
+        let tmp = result.clone();
+        unsafe {
+            let tmp = Arc::into_raw(tmp) as *mut Self;
+            (*tmp).self_ref = Arc::downgrade(&result);
+            Arc::from_raw(tmp);
+        }
+
+        return result;
     }
 
     /// 创建者调用这函数，等待创建完成后，获取创建结果
@@ -143,6 +159,12 @@ impl KernelThreadCreateInfo {
                     spin_loop();
                 }
                 KernelThreadCreateStatus::ErrorOccured => {
+                    // 创建失败，减少不安全的Arc引用计数
+                    let to_delete = self.has_unsafe_arc_instance.swap(false, Ordering::SeqCst);
+                    if to_delete {
+                        let self_ref = self.self_ref.upgrade().unwrap();
+                        unsafe { Arc::decrement_strong_count(&self_ref) };
+                    }
                     return None;
                 }
             }
@@ -155,6 +177,37 @@ impl KernelThreadCreateInfo {
 
     pub fn name(&self) -> &String {
         &self.name
+    }
+
+    pub unsafe fn set_create_ok(&self, pcb: Arc<ProcessControlBlock>) {
+        // todo: 使用completion机制优化这里
+        self.result_pcb.lock().replace(pcb);
+        self.created
+            .store(KernelThreadCreateStatus::Created, Ordering::SeqCst);
+    }
+
+    /// 生成一个不安全的Arc指针（用于创建内核线程时传递参数）
+    pub fn generate_unsafe_arc_ptr(self: Arc<Self>) -> *const Self {
+        assert!(
+            self.has_unsafe_arc_instance
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            "Cannot generate unsafe arc ptr when there is already one."
+        );
+        let ptr = Arc::into_raw(self);
+        return ptr;
+    }
+
+    pub unsafe fn parse_unsafe_arc_ptr(ptr: *const Self) -> Arc<Self> {
+        let arc = Arc::from_raw(ptr);
+        assert!(
+            arc.has_unsafe_arc_instance
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            "Cannot parse unsafe arc ptr when there is no one."
+        );
+        assert!(Arc::strong_count(&arc) > 0);
+        return arc;
     }
 }
 
@@ -234,6 +287,27 @@ impl KernelThreadMechanism {
         ProcessManager::wakeup(unsafe { KTHREAD_DAEMON_PCB.as_ref().unwrap() })
             .expect("Failed to wakeup kthread daemon");
         return info.poll_result();
+    }
+
+    /// 创建并运行一个新的内核线程
+    ///
+    /// ## 参数
+    ///
+    /// - func: 内核线程的入口函数、传入参数
+    /// - name: 内核线程的名字
+    ///
+    /// ## 返回值
+    ///
+    /// - Some(Arc<ProcessControlBlock>) 创建成功，返回新创建的内核线程的PCB
+    #[allow(dead_code)]
+    pub fn create_and_run(
+        func: KernelThreadClosure,
+        name: String,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        let pcb = Self::create(func, name)?;
+        ProcessManager::wakeup(&pcb)
+            .expect(format!("Failed to wakeup kthread: {:?}", pcb.pid()).as_str());
+        return Some(pcb);
     }
 
     /// 停止一个内核线程
@@ -334,17 +408,11 @@ impl KernelThreadMechanism {
                 let result: Result<Pid, SystemError> =
                     Self::__inner_create(&info, CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL);
 
-                if let Ok(pid) = result {
-                    // 创建成功
-                    info.created
-                        .store(KernelThreadCreateStatus::Created, Ordering::SeqCst);
-                    let pcb = ProcessManager::find(pid).unwrap();
-                    info.result_pcb.lock().replace(pcb);
-                } else {
+                if result.is_err() {
                     // 创建失败
                     info.created
                         .store(KernelThreadCreateStatus::ErrorOccured, Ordering::SeqCst);
-                }
+                };
                 list = KTHREAD_CREATE_LIST.lock();
             }
             drop(list);
@@ -363,11 +431,25 @@ impl KernelThreadMechanism {
 ///
 /// ## 参数
 ///
-/// - ptr: 传入的参数，是一个指向`Box<KernelThreadClosure>`的指针
-pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *mut KernelThreadClosure) -> ! {
-    let closure = Box::from_raw(ptr);
-    let retval = closure.run() as usize;
-    ProcessManager::exit(retval);
+/// - ptr: 传入的参数，是一个指向`Arc<KernelThreadCreateInfo>`的指针
+pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThreadCreateInfo) -> ! {
+    let info = KernelThreadCreateInfo::parse_unsafe_arc_ptr(ptr);
+
+    let closure: Box<KernelThreadClosure> = info.take_closure().unwrap();
+    info.set_create_ok(ProcessManager::current_pcb());
+    drop(info);
+
+    let irq_guard = CurrentIrqArch::save_and_disable_irq();
+    ProcessManager::mark_sleep(true).expect("Failed to mark sleep");
+    drop(irq_guard);
+
+    let mut retval = SystemError::EINTR.to_posix_errno();
+
+    if !KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
+        retval = closure.run();
+    }
+
+    ProcessManager::exit(retval as usize);
 }
 
 pub fn kthread_init() {

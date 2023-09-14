@@ -31,6 +31,21 @@ bitflags! {
 }
 
 impl ProcessManager {
+    /// 创建一个新进程
+    ///
+    /// ## 参数
+    ///
+    /// - `current_trapframe`: 当前进程的trapframe
+    /// - `clone_flags`: 进程克隆标志
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功：返回新进程的pid
+    /// - 失败：返回Err(SystemError)，fork失败的话，子线程不会执行。
+    ///
+    /// ## Safety
+    ///
+    /// - fork失败的话，子线程不会执行。
     pub fn fork(
         current_trapframe: &mut TrapFrame,
         clone_flags: CloneFlags,

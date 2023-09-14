@@ -7,7 +7,6 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    kdebug,
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
@@ -23,12 +22,12 @@ impl Syscall {
         envp: Vec<String>,
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        kdebug!(
-            "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
-            path,
-            argv,
-            envp
-        );
+        // kdebug!(
+        //     "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
+        //     path,
+        //     argv,
+        //     envp
+        // );
         // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
@@ -68,7 +67,7 @@ impl Syscall {
         let load_result = load_binary_file(&mut param)
             .unwrap_or_else(|e| panic!("Failed to load binary file: {:?}, path: {:?}", e, path));
         // kdebug!("load binary file done");
-        kdebug!("argv: {:?}, envp: {:?}", argv, envp);
+        // kdebug!("argv: {:?}, envp: {:?}", argv, envp);
         param.init_info_mut().args = argv;
         param.init_info_mut().envs = envp;
 

@@ -82,7 +82,7 @@ void system_initialize()
     kdebug("_stack_start=%#018lx", _stack_start);
 
     set_current_core_tss(_stack_start, 0);
-    load_current_core_tss();
+    rs_load_current_core_tss();
 
     cpu_core_info[0].stack_start = _stack_start;
 

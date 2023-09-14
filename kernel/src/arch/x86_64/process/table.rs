@@ -51,7 +51,6 @@ impl TSSManager {
         let index = (10 + smp_get_processor_id() * 2) as u16;
         let selector = SegmentSelector::new(index, Ring::Ring0);
 
-        // todo: 在初始化的时候设置tss即可
         Self::set_tss_descriptor(
             index,
             VirtAddr::new(Self::current_tss() as *mut TaskStateSegment as usize),

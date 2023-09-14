@@ -48,8 +48,6 @@ impl ProcessManager {
             *pcb.worker_private() = Some(WorkerPrivate::KernelThread(KernelThreadPcbPrivate::new()))
         }
 
-        // todo: 维护父子进程关系
-
         // 拷贝标志位
         ProcessManager::copy_flags(&clone_flags, &pcb).unwrap_or_else(|e| {
             panic!(

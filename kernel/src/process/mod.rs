@@ -291,9 +291,9 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            let cpu_id = cpu_id as usize;
+            let cpu_id = cpu_id;
 
-            if pcb.pid() == CPU_EXECUTING[cpu_id].load(Ordering::SeqCst) {
+            if pcb.pid() == CPU_EXECUTING.get(cpu_id) {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }

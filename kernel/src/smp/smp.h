@@ -20,4 +20,4 @@ extern int64_t rs_kick_cpu(uint32_t cpu_id);
 uint32_t smp_get_total_cpu();
 
 extern void set_current_core_tss(uint64_t stack_start, uint64_t ist0);
-extern void load_current_core_tss();
+extern void rs_load_current_core_tss();

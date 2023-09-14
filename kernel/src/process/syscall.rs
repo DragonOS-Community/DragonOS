@@ -7,7 +7,6 @@ use crate::{
     arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     filesystem::vfs::MAX_PATHLEN,
-    kdebug,
     process::ProcessControlBlock,
     syscall::{
         user_access::{
@@ -37,12 +36,12 @@ impl Syscall {
         envp: *const *const u8,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        kdebug!(
-            "execve path: {:?}, argv: {:?}, envp: {:?}\n",
-            path,
-            argv,
-            envp
-        );
+        // kdebug!(
+        //     "execve path: {:?}, argv: {:?}, envp: {:?}\n",
+        //     path,
+        //     argv,
+        //     envp
+        // );
         if path.is_null() {
             return Err(SystemError::EINVAL);
         }

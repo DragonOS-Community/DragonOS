@@ -1,7 +1,7 @@
 use super::{core::smp_get_processor_id, kick_cpu};
 
 #[no_mangle]
-pub extern "C" fn rs_kick_cpu(cpu_id: usize) -> usize {
+pub extern "C" fn rs_kick_cpu(cpu_id: u32) -> usize {
     return kick_cpu(cpu_id)
         .map(|_| 0usize)
         .unwrap_or_else(|e| e.to_posix_errno() as usize);

@@ -1,13 +1,13 @@
-use core::sync::atomic::compiler_fence;
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    arch::cpu::current_cpu_id,
     include::bindings::bindings::smp_get_total_cpu,
     kinfo,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    smp::core::smp_get_processor_id,
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
@@ -18,13 +18,32 @@ use super::{
 
 lazy_static! {
     /// 记录每个cpu上正在执行的进程的pid
-    pub static ref CPU_EXECUTING: Vec<AtomicPid> = {
-        let mut v = Vec::new();
+    pub static ref CPU_EXECUTING: CpuExecuting = CpuExecuting::new();
+}
+
+#[derive(Debug)]
+pub struct CpuExecuting {
+    data: Vec<AtomicPid>,
+}
+
+impl CpuExecuting {
+    pub fn new() -> Self {
+        let mut data = Vec::new();
         for _ in 0..PerCpu::MAX_CPU_NUM {
-            v.push(AtomicPid::new(Pid::new(0)));
+            data.push(AtomicPid::new(Pid::new(0)));
         }
-        v
-    };
+        Self { data }
+    }
+
+    #[inline(always)]
+    pub fn set(&self, cpu_id: u32, pid: Pid) {
+        self.data[cpu_id as usize].store(pid, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn get(&self, cpu_id: u32) -> Pid {
+        self.data[cpu_id as usize].load(Ordering::SeqCst)
+    }
 }
 
 // 获取某个cpu的负载情况，返回当前负载，cpu_id 是获取负载的cpu的id
@@ -45,8 +64,8 @@ pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
     // 获取总的CPU数量
     let cpu_num = unsafe { smp_get_total_cpu() };
     // 获取当前负载最小的CPU的id
-    let mut min_loads_cpu_id = current_cpu_id();
-    let mut min_loads = get_cpu_loads(current_cpu_id());
+    let mut min_loads_cpu_id = smp_get_processor_id();
+    let mut min_loads = get_cpu_loads(smp_get_processor_id());
     for cpu_id in 0..cpu_num {
         let tmp_cpu_loads = get_cpu_loads(cpu_id);
         if min_loads - tmp_cpu_loads > 0 {
@@ -87,7 +106,7 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     let next: Arc<ProcessControlBlock>;
-    match rt_scheduler.pick_next_task_rt(current_cpu_id()) {
+    match rt_scheduler.pick_next_task_rt(smp_get_processor_id()) {
         Some(p) => {
             next = p;
             // 将pick的进程放回原处

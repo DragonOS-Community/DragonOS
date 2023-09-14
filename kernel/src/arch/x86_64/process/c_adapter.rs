@@ -8,6 +8,6 @@ unsafe extern "C" fn set_current_core_tss(stack_start: usize, ist0: usize) {
 }
 
 #[no_mangle]
-unsafe fn load_current_core_tss() {
+unsafe extern "C" fn rs_load_current_core_tss() {
     TSSManager::load_tr();
 }

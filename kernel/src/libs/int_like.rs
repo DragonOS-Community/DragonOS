@@ -52,6 +52,7 @@ macro_rules! int_like {
 
         /// A mutable holder for T that can safely be shared among threads.
         /// Runtime equivalent to using `AtomicUsize`, just type-safer.
+        #[derive(Debug)]
         pub struct $new_atomic_type_name {
             container: $backing_atomic_type,
         }

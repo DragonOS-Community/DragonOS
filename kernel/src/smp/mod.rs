@@ -7,9 +7,9 @@ use crate::{
 pub mod c_adapter;
 pub mod core;
 
-pub fn kick_cpu(cpu_id: usize) -> Result<(), SystemError> {
+pub fn kick_cpu(cpu_id: u32) -> Result<(), SystemError> {
     // todo: 增加对cpu_id的有效性检查
 
-    send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu_id));
+    send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu_id as usize));
     return Ok(());
 }

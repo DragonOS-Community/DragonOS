@@ -42,9 +42,3 @@ impl SchedPriority {
         self.0
     }
 }
-
-impl Into<i32> for SchedPriority {
-    fn into(self) -> i32 {
-        self.0
-    }
-}

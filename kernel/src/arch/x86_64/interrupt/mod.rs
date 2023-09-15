@@ -43,7 +43,7 @@ impl InterruptArch for X86_64InterruptArch {
         unsafe {
             asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
         }
-        return rflags & (1 << 9) != 0;
+        return (rflags & (1 << 9)) != 0;
     }
 
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard {

@@ -112,6 +112,8 @@ pub struct KernelThreadCreateInfo {
     /// 不安全的Arc引用计数，当内核线程创建失败时，需要减少这个计数
     has_unsafe_arc_instance: AtomicBool,
     self_ref: Weak<Self>,
+    /// 如果该值为true在进入bootstrap stage2之后，就会进入睡眠状态
+    to_mark_sleep: AtomicBool,
 }
 
 #[atomic_enum]
@@ -132,6 +134,7 @@ impl KernelThreadCreateInfo {
             result_pcb: SpinLock::new(None),
             has_unsafe_arc_instance: AtomicBool::new(false),
             self_ref: Weak::new(),
+            to_mark_sleep: AtomicBool::new(true),
         });
         let tmp = result.clone();
         unsafe {
@@ -209,12 +212,35 @@ impl KernelThreadCreateInfo {
         assert!(Arc::strong_count(&arc) > 0);
         return arc;
     }
+
+    /// 设置是否在进入bootstrap stage2之后，就进入睡眠状态
+    ///
+    /// ## 参数
+    ///
+    /// - to_mark_sleep: 是否在进入bootstrap stage2之后，就进入睡眠状态
+    ///
+    /// ## 返回值
+    /// 如果已经创建完成，返回EINVAL
+    pub fn set_to_mark_sleep(&self, to_mark_sleep: bool) -> Result<(), SystemError> {
+        let result_guard = self.result_pcb.lock();
+        if result_guard.is_some() {
+            // 已经创建完成，不需要设置
+            return Err(SystemError::EINVAL);
+        }
+        self.to_mark_sleep.store(to_mark_sleep, Ordering::SeqCst);
+        return Ok(());
+    }
+
+    pub fn to_mark_sleep(&self) -> bool {
+        self.to_mark_sleep.load(Ordering::SeqCst)
+    }
 }
 
 pub struct KernelThreadMechanism;
 
 impl KernelThreadMechanism {
     pub fn init_stage1() {
+        assert!(ProcessManager::current_pcb().pid() == Pid::new(0));
         kinfo!("Initializing kernel thread mechanism stage1...");
 
         // 初始化第一个内核线程
@@ -229,7 +255,9 @@ impl KernelThreadMechanism {
             .flags
             .lock()
             .insert(ProcessFlags::KTHREAD);
-
+        create_info
+            .set_to_mark_sleep(false)
+            .expect("Failed to set to_mark_sleep");
         KernelThreadMechanism::__inner_create(
             &create_info,
             CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGNAL,
@@ -259,6 +287,7 @@ impl KernelThreadMechanism {
                     .expect("Failed to create kthread daemon");
 
             let pcb = ProcessManager::find(kthreadd_pid).unwrap();
+            ProcessManager::wakeup(&pcb).expect("Failed to wakeup kthread daemon");
             unsafe {
                 KTHREAD_DAEMON_PCB.replace(pcb);
             }
@@ -437,11 +466,16 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
 
     let closure: Box<KernelThreadClosure> = info.take_closure().unwrap();
     info.set_create_ok(ProcessManager::current_pcb());
+    let to_mark_sleep = info.to_mark_sleep();
     drop(info);
 
-    let irq_guard = CurrentIrqArch::save_and_disable_irq();
-    ProcessManager::mark_sleep(true).expect("Failed to mark sleep");
-    drop(irq_guard);
+    if to_mark_sleep {
+        // 进入睡眠状态
+        let irq_guard = CurrentIrqArch::save_and_disable_irq();
+        ProcessManager::mark_sleep(true).expect("Failed to mark sleep");
+        drop(irq_guard);
+        sched();
+    }
 
     let mut retval = SystemError::EINTR.to_posix_errno();
 

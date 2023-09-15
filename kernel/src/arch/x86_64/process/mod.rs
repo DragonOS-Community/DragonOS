@@ -42,6 +42,19 @@ extern "C" {
     fn ret_from_intr();
 }
 
+#[allow(dead_code)]
+#[repr(align(32768))]
+union InitProcUnion {
+    /// 用于存放idle进程的内核栈
+    idle_stack: [u8; 32768],
+}
+
+#[link_section = ".data.init_proc_union"]
+#[no_mangle]
+static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
+    idle_stack: [0; 32768],
+};
+
 /// PCB中与架构相关的信息
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -321,6 +334,7 @@ impl ProcessManager {
         );
         // kdebug!("switch tss ok");
 
+        compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
     }

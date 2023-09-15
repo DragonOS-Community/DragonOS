@@ -3,6 +3,8 @@ use core::sync::atomic::compiler_fence;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use crate::{
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
     include::bindings::bindings::MAX_CPU_NUM,
     kBUG,
     libs::{
@@ -190,6 +192,8 @@ impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
     fn sched(&mut self) -> Option<Arc<ProcessControlBlock>> {
+        assert!(CurrentIrqArch::is_irq_enabled() == false);
+
         ProcessManager::current_pcb()
             .flags()
             .remove(ProcessFlags::NEED_SCHEDULE);

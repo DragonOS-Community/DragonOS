@@ -35,6 +35,7 @@ struct built_in_cmd_t shell_cmds[] = {
     {"free", shell_cmd_free},
     {"help", shell_help},
     {"pipe", shell_pipe_test},
+    {"pipe2", shell_pipe2_test},
     {"kill", shell_cmd_kill},
 
 };

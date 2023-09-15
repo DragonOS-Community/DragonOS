@@ -49,7 +49,7 @@ impl PortManager {
 
     /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
     pub fn get_ephemeral_port(&self, socket_type: SocketType) -> Result<u16, SystemError> {
-        // TODO selects non-conflict high port
+        // TODO: selects non-conflict high port
 
         static mut EPHEMERAL_PORT: u16 = 0;
         unsafe {
@@ -74,7 +74,7 @@ impl PortManager {
             let listen_table_guard = match socket_type {
                 SocketType::UdpSocket => self.udp_port_table.lock(),
                 SocketType::TcpSocket => self.tcp_port_table.lock(),
-                SocketType::RawSocket => todo!(),
+                SocketType::RawSocket => panic!("RawSocket cann't get a port"),
             };
             if let None = listen_table_guard.get(&port) {
                 drop(listen_table_guard);
@@ -88,7 +88,7 @@ impl PortManager {
     /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
     ///
     /// TODO: 增加支持端口复用的逻辑
-    pub fn get_port(
+    pub fn bind_port(
         &self,
         socket_type: SocketType,
         port: u16,
@@ -458,7 +458,7 @@ impl UdpSocket {
     fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(ip)) = endpoint {
             // 检测端口是否已被占用
-            PORT_MANAGER.get_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
 
             let bind_res = if ip.addr.is_unspecified() {
                 socket.bind(ip.port)
@@ -812,6 +812,9 @@ impl Socket for TcpSocket {
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
+            // 检测端口是否被占用
+            PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port, self.handle.clone())?;
+
             // kdebug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDriver> = NET_DRIVERS.write().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
@@ -884,7 +887,7 @@ impl Socket for TcpSocket {
             }
 
             // 检测端口是否已被占用
-            PORT_MANAGER.get_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
@@ -929,15 +932,25 @@ impl Socket for TcpSocket {
                     // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
                     // 因此需要再为当前的socket分配一个新的handle
                     let new_handle = GlobalSocketHandle::new(sockets.add(tcp_socket));
-                    let old_handle = ::core::mem::replace(&mut self.handle, new_handle);
+                    let old_handle = ::core::mem::replace(&mut self.handle, new_handle.clone());
 
-                    let metadata = SocketMetadata {
-                        socket_type: SocketType::TcpSocket,
-                        send_buf_size: Self::DEFAULT_RX_BUF_SIZE,
-                        recv_buf_size: Self::DEFAULT_TX_BUF_SIZE,
-                        metadata_buf_size: Self::DEFAULT_METADATA_BUF_SIZE,
-                        options: self.metadata.options,
-                    };
+                    // 更新端口与 handle 的绑定
+                    if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
+                        PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?;
+                        PORT_MANAGER.bind_port(
+                            self.metadata.socket_type,
+                            ip.port,
+                            new_handle.clone(),
+                        )?;
+                    }
+
+                    let metadata = SocketMetadata::new(
+                        SocketType::TcpSocket,
+                        Self::DEFAULT_RX_BUF_SIZE,
+                        Self::DEFAULT_TX_BUF_SIZE,
+                        Self::DEFAULT_METADATA_BUF_SIZE,
+                        self.metadata.options,
+                    );
 
                     Box::new(TcpSocket {
                         handle: old_handle,
@@ -1208,5 +1221,9 @@ impl IndexNode for SocketInode {
         };
 
         return Ok(meta);
+    }
+
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        return Ok(());
     }
 }

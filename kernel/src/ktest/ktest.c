@@ -10,5 +10,6 @@
  */
 pid_t ktest_start(int (*func)(void* arg), void* arg)
 {
-    return kernel_thread(func, arg, 0);
+    kerror("Fix me: ktest_start, to use new process management.");
+    while(1);
 }

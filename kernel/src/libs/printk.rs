@@ -30,7 +30,7 @@ macro_rules! printk_color {
 #[macro_export]
 macro_rules! kdebug {
     ($($arg:tt)*) => {
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)))
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
 
     }
 }
@@ -38,7 +38,7 @@ macro_rules! kdebug {
 #[macro_export]
 macro_rules! kinfo {
     ($($arg:tt)*) => {
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)))
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
     }
 }
 
@@ -46,7 +46,7 @@ macro_rules! kinfo {
 macro_rules! kwarn {
     ($($arg:tt)*) => {
         $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::YELLOW, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ WARN ] ");
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)));
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
 }
 
@@ -54,7 +54,7 @@ macro_rules! kwarn {
 macro_rules! kerror {
     ($($arg:tt)*) => {
         $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::RED, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ ERROR ] ");
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)));
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
 }
 
@@ -62,7 +62,7 @@ macro_rules! kerror {
 macro_rules! kBUG {
     ($($arg:tt)*) => {
         $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::RED, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ BUG ] ");
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t{}\n", file!(), line!(),format_args!($($arg)*)));
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
 }
 

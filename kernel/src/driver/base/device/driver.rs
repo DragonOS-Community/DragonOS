@@ -1,5 +1,7 @@
-use super::{IdTable, KObject};
-use crate::{filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError};
+use super::IdTable;
+use crate::{
+    driver::Driver, filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError,
+};
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::fmt::Debug;
 
@@ -11,40 +13,23 @@ lazy_static! {
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DriverError {
-    ProbeError,
-    RegisterError,
+    ProbeError,            // 探测设备失败(该驱动不能初始化这个设备)
+    RegisterError,         // 设备注册失败
+    AllocateResourceError, // 获取设备所需资源失败
+    UnsupportedOperation,  // 不支持的操作
+    UnInitialized,         // 未初始化
 }
 
 impl Into<SystemError> for DriverError {
     fn into(self) -> SystemError {
         match self {
-            DriverError::ProbeError => SystemError::EIO,
-            DriverError::RegisterError => SystemError::EIO,
+            DriverError::ProbeError => SystemError::ENODEV,
+            DriverError::RegisterError => SystemError::ENODEV,
+            DriverError::AllocateResourceError => SystemError::EIO,
+            DriverError::UnsupportedOperation => SystemError::EIO,
+            DriverError::UnInitialized => SystemError::ENODEV,
         }
     }
-}
-
-/// @brief: 所有驱动驱动都应该实现该trait
-pub trait Driver: KObject {
-    /// @brief: 本函数用于实现动态转换
-    /// @parameter: None
-    /// @return: any
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
-
-    /// @brief: 获取驱动驱动标识符
-    /// @parameter: None
-    /// @return: 该驱动驱动唯一标识符
-    fn id_table(&self) -> IdTable;
-
-    /// @brief: 设置驱动的sys information
-    /// @parameter id_table: 驱动标识符，用于唯一标识该驱动
-    /// @return: 驱动实例
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>);
-
-    /// @brief: 获取驱动的sys information
-    /// @parameter id_table: 驱动标识符，用于唯一标识该驱动
-    /// @return: 驱动实例
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>>;
 }
 
 /// @brief: 驱动管理器(锁)
@@ -111,7 +96,7 @@ pub struct DriverManager {
 impl DriverManager {
     /// @brief: 创建一个新的设备管理器
     /// @parameter: None
-    /// @return: DeviceManager实体
+    /// @return: Manager实体
     #[inline]
     fn new() -> DriverManager {
         DriverManager {
@@ -124,7 +109,7 @@ impl DriverManager {
 /// @brief: 驱动注册
 /// @parameter: name: 驱动名
 /// @return: 操作成功，返回()，操作失败，返回错误码
-pub fn driver_register<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
+pub fn driver_register(driver: Arc<dyn Driver>) -> Result<(), DriverError> {
     DRIVER_MANAGER.add_driver(driver.id_table(), driver);
     return Ok(());
 }
@@ -133,7 +118,7 @@ pub fn driver_register<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
 /// @parameter: name: 驱动名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 #[allow(dead_code)]
-pub fn driver_unregister<T: Driver>(driver: Arc<T>) -> Result<(), DriverError> {
+pub fn driver_unregister(driver: Arc<dyn Driver>) -> Result<(), DriverError> {
     DRIVER_MANAGER.add_driver(driver.id_table(), driver);
     return Ok(());
 }

@@ -75,6 +75,15 @@ int pipe(int fd[2])
     return (int)syscall_invoke(SYS_PIPE, fd, 0, 0, 0, 0, 0, 0, 0);
 }
 /**
+ * @brief 调用带参数的匿名管道
+ *
+ * @return int 如果失败返回负数
+ */
+int pipe2(int fd[2], int flags)
+{
+    return (int)syscall_invoke(SYS_PIPE, fd, flags, 0, 0, 0, 0, 0, 0);
+}
+/**
  * @brief fork当前进程，但是与父进程共享VM、flags、fd
  *
  * @return pid_t

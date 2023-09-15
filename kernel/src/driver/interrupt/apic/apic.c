@@ -6,7 +6,7 @@
 #include <common/printk.h>
 #include <driver/acpi/acpi.h>
 #include <exception/gate.h>
-
+#include <driver/uart/uart.h>
 #include <exception/softirq.h>
 #include <process/process.h>
 #include <sched/sched.h>
@@ -15,6 +15,9 @@
 #pragma GCC optimize("O0")
 // 导出定义在irq.c中的中段门表
 extern void (*interrupt_table[24])(void);
+extern uint32_t rs_current_pcb_preempt_count();
+extern uint32_t rs_current_pcb_pid();
+extern uint32_t rs_current_pcb_flags();
 
 uint rs_apic_get_ics(const uint type, ul ret_vaddr[], uint *total){
     return 0;
@@ -285,7 +288,7 @@ void apic_local_apic_init()
     kdebug("BSP's IA32_APIC_BASE=%#018lx", ia32_apic_base);
     // kdebug("apic base=%#018lx", (ia32_apic_base & 0x1FFFFFFFFFF000));
     // 映射Local APIC 寄存器地址
-    // todo: 
+    // todo:
     rs_map_phys(APIC_LOCAL_APIC_VIRT_BASE_ADDR, (ia32_apic_base & 0x1FFFFFFFFFF000), PAGE_2M_SIZE, PAGE_KERNEL_PAGE | PAGE_PWT | PAGE_PCD);
     uint a, b, c, d;
 
@@ -364,6 +367,7 @@ void apic_local_apic_init()
  */
 int apic_init()
 {
+    cli();
     kinfo("Initializing APIC...");
     // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
     for (int i = 32; i <= 55; ++i)
@@ -405,7 +409,7 @@ int apic_init()
         kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
     }
     kinfo("APIC initialized.");
-    sti();
+    // sti();
     return 0;
 }
 /**
@@ -472,13 +476,15 @@ void do_IRQ(struct pt_regs *rsp, ul number)
 
     // kdebug("after softirq");
     // 检测当前进程是否持有自旋锁，若持有自旋锁，则不进行抢占式的进程调度
-    if (current_pcb->preempt_count > 0)
+    if (rs_current_pcb_preempt_count() > 0)
+    {
         return;
-    else if (current_pcb->preempt_count < 0)
-        kBUG("current_pcb->preempt_count<0! pid=%d", current_pcb->pid); // should not be here
+    }
+    else if (rs_current_pcb_preempt_count() < 0)
+        kBUG("current_pcb->preempt_count<0! pid=%d", rs_current_pcb_pid()); // should not be here
 
     // 检测当前进程是否可被调度
-    if (current_pcb->flags & PF_NEED_SCHED && number == APIC_TIMER_IRQ_NUM)
+    if ((rs_current_pcb_flags() & PF_NEED_SCHED) && number == APIC_TIMER_IRQ_NUM)
     {
         io_mfence();
         sched();

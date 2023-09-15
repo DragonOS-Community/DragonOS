@@ -1,169 +1,21 @@
 #![allow(dead_code)]
 use core::cell::UnsafeCell;
+use core::hint::spin_loop;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
-use core::ptr::read_volatile;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::asm::irqflags::{local_irq_restore, local_irq_save};
-use crate::arch::interrupt::{cli, sti};
-
-use crate::include::bindings::bindings::{spin_lock, spin_unlock, spinlock_t};
-use crate::process::preempt::{preempt_disable, preempt_enable};
+use crate::arch::CurrentIrqArch;
+use crate::exception::{InterruptArch, IrqFlagsGuard};
+use crate::process::ProcessManager;
 use crate::syscall::SystemError;
 
-/// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
-#[inline]
-pub fn spin_lock_irqsave(lock: *mut spinlock_t, flags: &mut usize) {
-    *flags = local_irq_save();
-    unsafe {
-        spin_lock(lock);
-    }
-}
-
-/// @brief 恢复rflags以及中断状态并解锁自旋锁
-#[inline]
-pub fn spin_unlock_irqrestore(lock: *mut spinlock_t, flags: usize) {
-    unsafe {
-        spin_unlock(lock);
-    }
-    local_irq_restore(flags);
-}
-
-/// 判断一个自旋锁是否已经被加锁
-#[inline]
-pub fn spin_is_locked(lock: &spinlock_t) -> bool {
-    let val = unsafe { read_volatile(&lock.lock as *const i8) };
-
-    return if val == 0 { true } else { false };
-}
-
-impl Default for spinlock_t {
-    fn default() -> Self {
-        Self { lock: 1 }
-    }
-}
-
-/// @brief 关闭中断并加锁
-pub fn spin_lock_irq(lock: *mut spinlock_t) {
-    cli();
-    unsafe {
-        spin_lock(lock);
-    }
-}
-
-/// @brief 解锁并开中断
-pub fn spin_unlock_irq(lock: *mut spinlock_t) {
-    unsafe {
-        spin_unlock(lock);
-    }
-    sti();
-}
-
-/// 原始的Spinlock（自旋锁）
-/// 请注意，这个自旋锁和C的不兼容。
-///
-/// @param self.0 这个AtomicBool的值为false时，表示没有被加锁。当它为true时，表示自旋锁已经被上锁。
-#[derive(Debug)]
-pub struct RawSpinlock(AtomicBool);
-
-impl RawSpinlock {
-    /// @brief 初始化自旋锁
-    pub const INIT: RawSpinlock = RawSpinlock(AtomicBool::new(false));
-
-    /// @brief 加锁
-    pub fn lock(&self) {
-        while !self.try_lock() {}
-    }
-
-    /// @brief 关中断并加锁
-    pub fn lock_irq(&self) {
-        cli();
-        self.lock();
-    }
-
-    /// @brief 尝试加锁
-    /// @return 加锁成功->true
-    ///         加锁失败->false
-    pub fn try_lock(&self) -> bool {
-        // 先增加自旋锁持有计数
-        preempt_disable();
-
-        let res = self
-            .0
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok();
-
-        // 如果加锁失败恢复自旋锁持有计数
-        if res == false {
-            preempt_enable();
-        }
-        return res;
-    }
-
-    /// @brief 解锁
-    pub fn unlock(&self) {
-        // 减少自旋锁持有计数
-        preempt_enable();
-        self.0.store(false, Ordering::Release);
-    }
-
-    /// 解锁，但是不更改preempt count
-    unsafe fn unlock_no_preempt(&self) {
-        self.0.store(false, Ordering::Release);
-    }
-
-    /// @brief 放锁并开中断
-    pub fn unlock_irq(&self) {
-        self.unlock();
-        sti();
-    }
-
-    /// @brief 判断自旋锁是否被上锁
-    ///
-    /// @return true 自旋锁被上锁
-    /// @return false 自旋锁处于解锁状态
-    pub fn is_locked(&self) -> bool {
-        return self.0.load(Ordering::Relaxed).into();
-    }
-
-    /// @brief 强制设置自旋锁的状态
-    /// 请注意，这样操作可能会带来未知的风险。因此它是unsafe的。（尽管从Rust语言本身来说，它是safe的）
-    pub unsafe fn set_value(&mut self, value: bool) {
-        self.0.store(value, Ordering::SeqCst);
-    }
-
-    /// @brief 保存中断状态到flags中，关闭中断，并对自旋锁加锁
-    pub fn lock_irqsave(&self, flags: &mut usize) {
-        *flags = local_irq_save();
-        self.lock();
-    }
-
-    /// @brief 恢复rflags以及中断状态并解锁自旋锁
-    pub fn unlock_irqrestore(&self, flags: usize) {
-        self.unlock();
-        local_irq_restore(flags);
-    }
-
-    /// @brief 尝试保存中断状态到flags中，关闭中断，并对自旋锁加锁
-    /// @return 加锁成功->true
-    ///         加锁失败->false
-    #[inline(always)]
-    pub fn try_lock_irqsave(&self, flags: &mut usize) -> bool {
-        *flags = local_irq_save();
-        if self.try_lock() {
-            return true;
-        }
-        local_irq_restore(*flags);
-        return false;
-    }
-}
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///
 #[derive(Debug)]
 pub struct SpinLock<T> {
-    lock: RawSpinlock,
+    lock: AtomicBool,
     /// 自旋锁保护的数据
     data: UnsafeCell<T>,
 }
@@ -174,7 +26,8 @@ pub struct SpinLock<T> {
 #[derive(Debug)]
 pub struct SpinLockGuard<'a, T: 'a> {
     lock: &'a SpinLock<T>,
-    flag: usize,
+    irq_flag: Option<IrqFlagsGuard>,
+    flags: SpinLockGuardFlags,
 }
 
 impl<'a, T: 'a> SpinLockGuard<'a, T> {
@@ -193,6 +46,12 @@ impl<'a, T: 'a> SpinLockGuard<'a, T> {
         // We know statically that only we are referencing data
         unsafe { &mut *this.lock.data.get() }
     }
+
+    fn unlock_no_preempt(&self) {
+        unsafe {
+            self.lock.force_unlock();
+        }
+    }
 }
 
 /// 向编译器保证，SpinLock在线程之间是安全的.
@@ -202,48 +61,89 @@ unsafe impl<T> Sync for SpinLock<T> where T: Send {}
 impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
         return Self {
-            lock: RawSpinlock::INIT,
+            lock: AtomicBool::new(false),
             data: UnsafeCell::new(value),
         };
     }
 
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<T> {
-        self.lock.lock();
-        // 加锁成功，返回一个守卫
-        return SpinLockGuard {
-            lock: self,
-            flag: 0,
-        };
+        loop {
+            let res = self.try_lock();
+            if res.is_ok() {
+                return res.unwrap();
+            }
+            spin_loop();
+        }
+    }
+
+    /// 加锁，但是不更改preempt count
+    #[inline(always)]
+    pub fn lock_no_preempt(&self) -> SpinLockGuard<T> {
+        loop {
+            if let Ok(guard) = self.try_lock_no_preempt() {
+                return guard;
+            }
+            spin_loop();
+        }
     }
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<T> {
-        let mut flags: usize = 0;
-
-        self.lock.lock_irqsave(&mut flags);
-        // 加锁成功，返回一个守卫
-        return SpinLockGuard {
-            lock: self,
-            flag: flags,
-        };
+        loop {
+            if let Ok(guard) = self.try_lock_irqsave() {
+                return guard;
+            }
+            spin_loop();
+        }
     }
 
     pub fn try_lock(&self) -> Result<SpinLockGuard<T>, SystemError> {
-        if self.lock.try_lock() {
+        // 先增加自旋锁持有计数
+        ProcessManager::preempt_disable();
+
+        if self.inner_try_lock() {
             return Ok(SpinLockGuard {
                 lock: self,
-                flag: 0,
+                irq_flag: None,
+                flags: SpinLockGuardFlags::empty(),
             });
         }
+
+        // 如果加锁失败恢复自旋锁持有计数
+        ProcessManager::preempt_enable();
+
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
+    fn inner_try_lock(&self) -> bool {
+        let res = self
+            .lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok();
+        return res;
+    }
+
     pub fn try_lock_irqsave(&self) -> Result<SpinLockGuard<T>, SystemError> {
-        let mut flags: usize = 0;
-        if self.lock.try_lock_irqsave(&mut flags) {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
+        if self.inner_try_lock() {
             return Ok(SpinLockGuard {
                 lock: self,
-                flag: flags,
+                irq_flag: Some(irq_guard),
+                flags: SpinLockGuardFlags::empty(),
+            });
+        }
+        ProcessManager::preempt_enable();
+        drop(irq_guard);
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+
+    pub fn try_lock_no_preempt(&self) -> Result<SpinLockGuard<T>, SystemError> {
+        if self.inner_try_lock() {
+            return Ok(SpinLockGuard {
+                lock: self,
+                irq_flag: None,
+                flags: SpinLockGuardFlags::NO_PREEMPT,
             });
         }
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -256,7 +156,12 @@ impl<T> SpinLock<T> {
     /// 由于这样做可能导致preempt count不正确，因此必须小心的手动维护好preempt count。
     /// 如非必要，请不要使用这个函数。
     pub unsafe fn force_unlock(&self) {
-        self.lock.unlock_no_preempt();
+        self.lock.store(false, Ordering::Release);
+    }
+
+    fn unlock(&self) {
+        self.lock.store(false, Ordering::Release);
+        ProcessManager::preempt_enable();
     }
 }
 
@@ -279,10 +184,19 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 /// @brief 为SpinLockGuard实现Drop方法，那么，一旦守卫的生命周期结束，就会自动释放自旋锁，避免了忘记放锁的情况
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        if self.flag != 0 {
-            self.lock.lock.unlock_irqrestore(self.flag);
+        if self.flags.contains(SpinLockGuardFlags::NO_PREEMPT) {
+            self.unlock_no_preempt();
         } else {
-            self.lock.lock.unlock();
+            self.lock.unlock();
         }
+        // restore irq
+        self.irq_flag.take();
+    }
+}
+
+bitflags! {
+    struct SpinLockGuardFlags: u8 {
+        /// 守卫是由“*no_preempt”方法获得的
+        const NO_PREEMPT = (1<<0);
     }
 }

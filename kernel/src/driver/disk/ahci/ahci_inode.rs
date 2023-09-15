@@ -1,6 +1,6 @@
+use crate::driver::base::block::block_device::BlockDevice;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::file::FileMode;
-use crate::filesystem::vfs::io::device::BlockDevice;
 use crate::filesystem::vfs::{
     core::generate_inode_id, make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode,
     Metadata, PollStatus,
@@ -124,7 +124,7 @@ impl IndexNode for LockedAhciInode {
         }
 
         if let FilePrivateData::Unused = data {
-            return self.0.lock().disk.read_at(offset, len, buf);
+            return self.0.lock().disk.read_at_bytes(offset, len, buf);
         }
 
         return Err(SystemError::EINVAL);
@@ -143,7 +143,7 @@ impl IndexNode for LockedAhciInode {
         }
 
         if let FilePrivateData::Unused = data {
-            return self.0.lock().disk.write_at(offset, len, buf);
+            return self.0.lock().disk.write_at_bytes(offset, len, buf);
         }
 
         return Err(SystemError::EINVAL);

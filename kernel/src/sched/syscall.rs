@@ -23,8 +23,13 @@ impl Syscall {
         let pcb = do_sched();
 
         if pcb.is_some() {
-            CPU_EXECUTING.set(smp_get_processor_id(), pcb.as_ref().unwrap().pid());
-            unsafe { ProcessManager::switch_process(ProcessManager::current_pcb(), pcb.unwrap()) };
+            let next_pcb = pcb.unwrap();
+            let current_pcb = ProcessManager::current_pcb();
+
+            if current_pcb.pid() != next_pcb.pid() {
+                CPU_EXECUTING.set(smp_get_processor_id(), next_pcb.pid());
+                unsafe { ProcessManager::switch_process(current_pcb, next_pcb) };
+            }
         }
         drop(irq_guard);
         return Ok(0);

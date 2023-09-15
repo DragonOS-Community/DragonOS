@@ -160,6 +160,7 @@ impl ProcessManager {
 
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
         if state.is_blocked() {
             let mut writer = pcb.sched_info_mut();

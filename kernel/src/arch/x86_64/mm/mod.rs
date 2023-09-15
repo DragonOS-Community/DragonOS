@@ -389,7 +389,6 @@ unsafe fn allocator_init() {
 
     // 初始化buddy_allocator
     let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
-
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
     kinfo!("Successfully initialized buddy allocator");

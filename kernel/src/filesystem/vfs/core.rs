@@ -144,8 +144,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
-#[no_mangle]
-pub extern "C" fn mount_root_fs() -> i32 {
+pub fn mount_root_fs() -> Result<(), SystemError> {
     kinfo!("Try to mount FAT32 as root fs...");
     let partiton: Arc<Partition> = ahci::get_disks_by_name("ahci_disk_0".to_string())
         .unwrap()
@@ -174,7 +173,7 @@ pub extern "C" fn mount_root_fs() -> i32 {
     }
     kinfo!("Successfully migrate rootfs to FAT32!");
 
-    return 0;
+    return Ok(());
 }
 
 /// @brief 创建文件/文件夹

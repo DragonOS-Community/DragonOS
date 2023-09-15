@@ -1,6 +1,5 @@
 #pragma once
 
-#include <asm/current.h>
 #include <common/glib.h>
 #include <mm/mm-types.h>
 #include <process/process.h>

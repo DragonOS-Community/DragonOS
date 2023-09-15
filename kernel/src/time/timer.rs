@@ -11,14 +11,14 @@ use alloc::{
 };
 
 use crate::{
-    arch::{asm::current::current_pcb, sched::sched, CurrentIrqArch},
+    arch::{sched::sched, CurrentIrqArch},
     exception::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
-    include::bindings::bindings::{process_control_block, process_wakeup, PROC_RUNNING},
     kdebug, kerror, kinfo,
     libs::spinlock::SpinLock,
+    process::{ProcessControlBlock, ProcessManager},
     syscall::SystemError,
 };
 
@@ -40,20 +40,18 @@ pub trait TimerFunction: Send + Sync + Debug {
 #[derive(Debug)]
 /// WakeUpHelper函数对应的结构体
 pub struct WakeUpHelper {
-    pcb: &'static mut process_control_block,
+    pcb: Arc<ProcessControlBlock>,
 }
 
 impl WakeUpHelper {
-    pub fn new(pcb: &'static mut process_control_block) -> Box<WakeUpHelper> {
+    pub fn new(pcb: Arc<ProcessControlBlock>) -> Box<WakeUpHelper> {
         return Box::new(WakeUpHelper { pcb });
     }
 }
 
 impl TimerFunction for WakeUpHelper {
     fn run(&mut self) -> Result<(), SystemError> {
-        unsafe {
-            process_wakeup(self.pcb);
-        }
+        ProcessManager::wakeup(&self.pcb).ok();
         return Ok(());
     }
 }
@@ -247,9 +245,12 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
         timeout += TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
-        let timer = Timer::new(WakeUpHelper::new(current_pcb()), timeout as u64);
+        let timer = Timer::new(
+            WakeUpHelper::new(ProcessManager::current_pcb()),
+            timeout as u64,
+        );
+        ProcessManager::mark_sleep(true).ok();
         timer.activate();
-        current_pcb().state &= (!PROC_RUNNING) as u64;
 
         drop(irq_guard);
 

@@ -151,13 +151,6 @@ impl core::hash::Hash for DeviceNumber {
 }
 
 impl DeviceNumber {
-    /// @brief: 设备号创建
-    /// @parameter: dev_t: 设备号
-    /// @return: 设备号实例
-    pub fn new(dev_t: usize) -> DeviceNumber {
-        Self(dev_t)
-    }
-
     /// @brief: 获取主设备号
     /// @parameter: none
     /// @return: 主设备号

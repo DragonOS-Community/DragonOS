@@ -47,7 +47,7 @@ impl E1000EDriverWrapper {
 
 impl Debug for E1000EDriverWrapper {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VirtioNICDriver").finish()
+        f.debug_struct("E1000ENICDriver").finish()
     }
 }
 

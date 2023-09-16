@@ -18,7 +18,21 @@ const PAGE_SIZE: usize = 4096;
 const NETWORK_CLASS: u8 = 0x2;
 const ETHERNET_SUBCLASS: u8 = 0x0;
 // e1000e系列网卡的device id列表，来源：https://admin.pci-ids.ucw.cz/read/PC/8086
-const E1000E_DEVICE_ID: [u16; 3] = [0x10d3, 0x10cc, 0x10cd];
+const E1000E_DEVICE_ID: [u16; 14] = [0x10d3, // 8574L, qemu default
+                                    0x10cc, // 82567LM-2 
+                                    0x10cd, // 82567LF-2
+                                    0x105f, // 82571EB 
+                                    0x1060, // 82571EB 
+                                    0x107f, // 82572EI
+                                    0x109a, // 82573L
+                                    0x10ea, // 82577LM
+                                    0x10eb, // 82577LC
+                                    0x10ef, // 82578DM
+                                    0x10f0, // 82578DC
+                                    0x1502, // 82579LM
+                                    0x1503, // 82579V
+                                    0x150c, // 82583V
+                                    ];
 
 // e1000e网卡与BAR有关的常量
 // BAR0空间大小(128KB)
@@ -126,7 +140,6 @@ impl E1000EBuffer{
     // 释放buffer内部的dma_pages，需要小心使用
     pub fn free_buffer(self) -> (){
         if self.length != 0{
-            kdebug!("buffer free!");
             unsafe{ dma_dealloc(self.paddr, self.buffer, E1000E_DMA_PAGES) };
         }
     }
@@ -174,7 +187,6 @@ impl E1000EDevice{
     // 从PCI标准设备进行驱动初始化
     // init the device for PCI standard device struct
     pub fn new(device: &mut PciDeviceStructureGeneralDevice) -> Result<Self, E1000EPciError> {
-        kdebug!("Initializiing...");
         // 从BAR0获取我们需要的寄存器
         // Build registers sturcts from BAR0
         device.bar_ioremap().unwrap()?;
@@ -372,7 +384,7 @@ impl E1000EDevice{
         buffer.set_length(desc.len as usize);
         rdt = index;
         unsafe { volwrite!(self.receive_regs, rdt0, rdt as u32) };
-        kdebug!("e1000e: receive packet");
+        // kdebug!("e1000e: receive packet");
         return Some(buffer);
     }
 
@@ -381,7 +393,7 @@ impl E1000EDevice{
         let index = tdt % self.trans_desc_ring.len();
         let desc = &self.trans_desc_ring[index];
         if (desc.status & E1000E_TXD_STATUS_DD) == 0 {
-            kdebug!("dd!!");
+            // kdebug!("dd!!");
             return false;
         }
         true
@@ -514,7 +526,7 @@ pub extern "C" fn rs_e1000e_init(){
 
 pub fn e1000e_init() -> (){
     match e1000e_probe(){
-        Ok(code) => kinfo!("Successfully init e1000e driver!"),
+        Ok(code) => kinfo!("Successfully init e1000e device!"),
         Err(error) => kinfo!("Error occurred!")
     }
 }
@@ -525,16 +537,15 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError>{
     if result.is_empty(){
         return Ok(0);
     }
-    kdebug!("Successfully get list");
     for device in result{
         let standard_device = device.as_standard_device_mut().unwrap();
         let header = &standard_device.common_header;
-        if header.vendor_id == 0x8086{
-            // if header.device_id == 0x108b || header.device_id == 0x108c || header.device_id == 0x109A{
-            kdebug!("Detected e1000e PCI device with device id {}", header.device_id);
-            // }
-            let e1000e = E1000EDevice::new(standard_device)?;
-            e1000e_driver_init(e1000e);
+        if header.vendor_id == 0x8086{ // intel
+            if E1000E_DEVICE_ID.contains(&header.device_id){
+                kdebug!("Detected e1000e PCI device with device id {:#x}", header.device_id);
+                let e1000e = E1000EDevice::new(standard_device)?;
+                e1000e_driver_init(e1000e);
+            }
         }
     }
 

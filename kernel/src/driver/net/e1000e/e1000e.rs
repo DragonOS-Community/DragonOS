@@ -132,6 +132,11 @@ impl E1000EBuffer{
     }
 }
 
+// 中断处理函数，等待主线同步
+// unsafe extern "C" fn e1000e_irq_hander(irq_num: u64, irq_paramer: u64, regs: *mut pt_regs) {
+//     poll_ifaces_try_lock_onetime();
+// }
+
 pub struct E1000EDevice{
     // 设备寄存器
     // device registers
@@ -190,6 +195,7 @@ impl E1000EDevice{
         let irq_vector = device.irq_vector_mut().unwrap();
         irq_vector.push(E1000E_RECV_VECTOR);
         device.irq_init(IRQ::PCI_IRQ_MSIX).expect("IRQ Init Failed");
+        // 等待主线的中断部分更新
         // let msg = IrqMsg{
         //     irq_common_message: IrqCommonMsg{
         //         irq_index: 0,

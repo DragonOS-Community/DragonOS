@@ -1,6 +1,6 @@
 //这个文件的绝大部分内容是copy virtio_net.rs的，考虑到所有的驱动都要用操作系统提供的协议栈，我觉得可以把这些内容抽象出来
 
-use alloc::{vec::Vec, sync::Arc, string::String};
+use alloc::{sync::Arc, string::String};
 use smoltcp::{phy::{RxToken, TxToken, Device}, wire};
 use core::{
     cell::UnsafeCell,
@@ -114,7 +114,7 @@ impl Device for E1000EDriver{
     type TxToken<'a> = E1000ETxToken;
 
     fn receive(&mut self, _timestamp: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        match self.inner.lock().e1000e_receive(){
+        match self.inner.lock().e1000e_receive2(){
             Some(buffer) => {
                 Some((
                 E1000ERxToken(buffer), 

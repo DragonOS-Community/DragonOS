@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 
+use crate::driver::base::char::CharDevOps;
 use crate::driver::base::device::{Device, DeviceResource, DEVICE_MANAGER};
-use crate::driver::base::map::CharDevOps;
 use crate::driver::base::platform::CompatibleTable;
 use crate::{
     driver::{

@@ -191,7 +191,7 @@ pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
 /// @return: 成功:()   失败:DeviceError
 #[allow(dead_code)]
 pub fn bus_unregister<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
-    BUS_MANAGER.add_bus(bus.id_table(), bus.clone());
+    BUS_MANAGER.remove_bus(&bus.id_table());
     return device_unregister(bus);
 }
 
@@ -208,6 +208,6 @@ pub fn bus_driver_register(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverE
 /// @return: 成功:()   失败:DeviceError
 #[allow(dead_code)]
 pub fn bus_driver_unregister(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverError> {
-    BUS_MANAGER.add_driver(bus_driver.id_table(), bus_driver.clone());
+    BUS_MANAGER.remove_bus_driver(&bus_driver.id_table());
     return driver_unregister(bus_driver);
 }

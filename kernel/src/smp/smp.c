@@ -16,7 +16,6 @@ static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struc
 
 static spinlock_t multi_core_starting_lock = {1}; // 多核启动锁
 
-static struct acpi_Processor_Local_APIC_Structure_t *proc_local_apic_structs[MAX_SUPPORTED_PROCESSOR_NUM];
 static uint32_t total_processor_num = 0;
 static int current_starting_cpu = 0;
 
@@ -29,6 +28,16 @@ extern uint64_t rs_get_idle_stack_top(uint32_t cpu_id);
 // 由于内存管理模块初始化的时候，重置了页表，因此我们要把当前的页表传给APU
 extern uint64_t __APU_START_CR3;
 
+struct X86CpuInfo
+{
+    uint32_t apic_id;
+    uint32_t core_id;
+    char can_boot;
+};
+
+extern uint64_t rs_smp_get_cpus(struct X86CpuInfo *res);
+static struct X86CpuInfo __cpu_info[MAX_SUPPORTED_PROCESSOR_NUM] = {0};
+
 // kick cpu 功能所使用的中断向量号
 #define KICK_CPU_IRQ_NUM 0xc8
 #define FLUSH_TLB_IRQ_NUM 0xc9
@@ -39,16 +48,8 @@ void smp_init()
     // 设置多核启动时，要加载的页表
     __APU_START_CR3 = (uint64_t)get_CR3();
 
-    ul tmp_vaddr[MAX_SUPPORTED_PROCESSOR_NUM] = {0};
-
-    rs_apic_get_ics(ACPI_ICS_TYPE_PROCESSOR_LOCAL_APIC, tmp_vaddr, &total_processor_num);
-
     // kdebug("processor num=%d", total_processor_num);
-    for (int i = 0; i < total_processor_num; ++i)
-    {
-        io_mfence();
-        proc_local_apic_structs[i] = (struct acpi_Processor_Local_APIC_Structure_t *)(tmp_vaddr[i]);
-    }
+    total_processor_num = rs_smp_get_cpus(__cpu_info);
 
     // 将引导程序复制到物理地址0x20000处
     memcpy((unsigned char *)phys_2_virt(0x20000), _apu_boot_start,
@@ -76,18 +77,18 @@ void smp_init()
         io_mfence();
 
         // 跳过BSP
-        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, flags=%#010lx", i,
-               proc_local_apic_structs[i]->ACPI_Processor_UID, proc_local_apic_structs[i]->local_apic_id,
-               proc_local_apic_structs[i]->flags);
-        if (proc_local_apic_structs[i]->local_apic_id == 0)
+        kdebug("[core %d] acpi processor UID=%d, APIC ID=%d, can_boot=%d", i,
+               __cpu_info[i].core_id, __cpu_info[i].apic_id,
+               __cpu_info[i].can_boot);
+        if (__cpu_info[i].apic_id == 0)
         {
             // --total_processor_num;
             continue;
         }
-        if (!((proc_local_apic_structs[i]->flags & 0x1) || (proc_local_apic_structs[i]->flags & 0x2)))
+        if (__cpu_info[i].can_boot == false)
         {
             // --total_processor_num;
-            kdebug("processor %d cannot be enabled.", proc_local_apic_structs[i]->ACPI_Processor_UID);
+            kdebug("processor %d cannot be enabled.",  __cpu_info[i].core_id);
             continue;
         }
         ++core_to_start;
@@ -96,7 +97,7 @@ void smp_init()
         spin_lock(&multi_core_starting_lock);
         rs_preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt
                              // count
-        current_starting_cpu = proc_local_apic_structs[i]->ACPI_Processor_UID;
+        current_starting_cpu =  __cpu_info[i].core_id;
         io_mfence();
         // 为每个AP处理器分配栈空间
         cpu_core_info[current_starting_cpu].stack_start = (uint64_t)rs_get_idle_stack_top(current_starting_cpu);
@@ -106,10 +107,10 @@ void smp_init()
         // kdebug("core %d, to send start up", current_starting_cpu);
         // 连续发送两次start-up IPI
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
-                     proc_local_apic_structs[i]->local_apic_id);
+                      __cpu_info[i].apic_id);
         io_mfence();
         ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
-                     proc_local_apic_structs[i]->local_apic_id);
+                      __cpu_info[i].apic_id);
         // kdebug("core %d, send start up ok", current_starting_cpu);
     }
     io_mfence();
@@ -135,7 +136,8 @@ void smp_ap_start_stage2()
     io_mfence();
     ++num_cpu_started;
     io_mfence();
-
+    while (1)
+        ;
     apic_init_ap_core_local_apic();
 
     // ============ 为ap处理器初始化IDLE进程 =============

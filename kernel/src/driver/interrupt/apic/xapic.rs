@@ -1,5 +1,10 @@
 use core::ptr::{read_volatile, write_volatile};
 
+use crate::{
+    libs::lazy_init::Lazy,
+    mm::{percpu::PerCpuVar, VirtAddr},
+};
+
 use super::{LVTRegister, LocalAPIC, LVT};
 
 /// TODO：统一变量
@@ -74,24 +79,27 @@ impl Into<u32> for LocalApicOffset {
     }
 }
 
+/// per-cpu的xAPIC的MMIO空间起始地址
+static XAPIC_INSTANCES: Lazy<PerCpuVar<Option<XApic>>> = PerCpuVar::define_lazy();
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct XApic {
     /// 当前xAPIC的MMIO空间起始地址。注意，每个CPU都有自己的xAPIC，所以这个地址是每个CPU都不一样的。
-    map_vaddr: usize,
+    map_vaddr: VirtAddr,
 }
 
 impl XApic {
     /// 读取指定寄存器的值
     #[allow(dead_code)]
     pub unsafe fn read(&self, reg: u32) -> u32 {
-        read_volatile((self.map_vaddr + reg as usize) as *const u32)
+        read_volatile((self.map_vaddr.data() + reg as usize) as *const u32)
     }
 
     /// 将指定的值写入寄存器
     #[allow(dead_code)]
     pub unsafe fn write(&mut self, reg: u32, value: u32) {
-        write_volatile((self.map_vaddr + reg as usize) as *mut u32, value);
+        write_volatile((self.map_vaddr.data() + reg as usize) as *mut u32, value);
         self.read(0x20); // 等待写操作完成，通过读取进行同步
     }
 }
@@ -99,7 +107,7 @@ impl XApic {
 impl XApic {
     /// 创建新的XAPIC实例
     #[allow(dead_code)]
-    pub unsafe fn new(addr: usize) -> Self {
+    pub unsafe fn new(addr: VirtAddr) -> Self {
         XApic { map_vaddr: addr }
     }
 }
@@ -215,8 +223,25 @@ impl LocalAPIC for XApic {
     }
 
     /// 获取版本号
-    fn version(&self) -> u32 {
-        unsafe { self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) }
+    fn version(&self) -> u8 {
+        unsafe {
+            (self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) & 0xff) as u8
+        }
+    }
+
+    fn support_eoi_broadcast_suppression(&self) -> bool {
+        unsafe {
+            ((self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 24) & 1)
+                == 1
+        }
+    }
+
+    fn max_lvt_entry(&self) -> u8 {
+        unsafe {
+            ((self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16) & 0xff)
+                as u8
+                + 1
+        }
     }
 
     /// 获取ID
@@ -225,9 +250,23 @@ impl LocalAPIC for XApic {
     }
 
     /// 设置LVT寄存器的值
-    fn set_lvt(&mut self, register: LVTRegister, lvt: LVT) {
+    fn set_lvt(&mut self, lvt: LVT) {
         unsafe {
-            self.write(register.into(), lvt.data);
+            self.write(lvt.register().into(), lvt.data);
         }
+    }
+
+    fn mask_all_lvt(&mut self) {
+        // self.set_lvt(LVT::new(LVTRegister::CMCI, LVT::MASKED).unwrap());
+        self.set_lvt(LVT::new(LVTRegister::Timer, LVT::MASKED).unwrap());
+        self.set_lvt(LVT::new(LVTRegister::Thermal, LVT::MASKED).unwrap());
+        self.set_lvt(LVT::new(LVTRegister::PerformanceMonitor, LVT::MASKED).unwrap());
+        self.set_lvt(LVT::new(LVTRegister::LINT0, LVT::MASKED).unwrap());
+        self.set_lvt(LVT::new(LVTRegister::LINT1, LVT::MASKED).unwrap());
+        self.set_lvt(LVT::new(LVTRegister::ErrorReg, LVT::MASKED).unwrap());
+    }
+
+    fn write_icr(icr: x86::apic::Icr) {
+        todo!("xapic: write_icr");
     }
 }

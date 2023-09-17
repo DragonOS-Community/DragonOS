@@ -1,4 +1,15 @@
-use crate::{kdebug, syscall::SystemError};
+use core::sync::atomic::Ordering;
+
+use atomic_enum::atomic_enum;
+use x86::apic::Icr;
+
+use crate::{
+    driver::interrupt::apic::{ioapic::ioapic_init, x2apic::X2Apic, xapic::XApic},
+    kdebug, kinfo,
+    libs::once::Once,
+    smp::core::smp_get_processor_id,
+    syscall::SystemError,
+};
 
 use self::apic_timer::ApicTimerMode;
 
@@ -7,6 +18,17 @@ pub mod ioapic;
 pub mod new_timer;
 pub mod x2apic;
 pub mod xapic;
+
+/// 当前启用的APIC类型
+#[atomic_enum]
+#[derive(PartialEq, Eq)]
+pub enum LocalApicEnableType {
+    XApic,
+    X2Apic,
+}
+
+static LOCAL_APIC_ENABLE_TYPE: AtomicLocalApicEnableType =
+    AtomicLocalApicEnableType::new(LocalApicEnableType::XApic);
 
 pub trait LocalAPIC {
     /// @brief 判断当前处理器是否支持这个类型的apic
@@ -25,7 +47,13 @@ pub trait LocalAPIC {
     fn send_eoi(&mut self);
 
     /// @brief 获取APIC版本号
-    fn version(&self) -> u32;
+    fn version(&self) -> u8;
+
+    /// @brief 判断当前处理器是否支持EOI广播抑制
+    fn support_eoi_broadcast_suppression(&self) -> bool;
+
+    /// 获取最多支持的LVT寄存器数量
+    fn max_lvt_entry(&self) -> u8;
 
     /// @brief 获取当前处理器的APIC ID
     fn id(&self) -> u32;
@@ -34,7 +62,12 @@ pub trait LocalAPIC {
     ///
     /// @param register 寄存器
     /// @param lvt 要被设置成的值
-    fn set_lvt(&mut self, register: LVTRegister, lvt: LVT);
+    fn set_lvt(&mut self, lvt: LVT);
+
+    fn mask_all_lvt(&mut self);
+
+    /// 写入ICR寄存器
+    fn write_icr(icr: Icr);
 }
 
 /// @brief 所有LVT寄存器的枚举类型
@@ -46,31 +79,31 @@ pub enum LVTRegister {
     ///
     /// 如果支持CMCI功能，那么，当修正的机器错误超过阈值时，Local APIC通过CMCI寄存器的配置，
     /// 向处理器核心投递中断消息
-    CMCI = 0x02F0,
+    CMCI = 0x82f,
     /// 定时器寄存器
     ///
     /// 当APIC定时器产生中断信号时，Local APIC通过定时器寄存器的设置，向处理器投递中断消息
-    Timer = 0x0320,
+    Timer = 0x832,
     /// 温度传感器寄存器
     ///
     /// 当处理器内部的温度传感器产生中断请求信号时，Local APIC会通过温度传感器寄存器的设置，
     /// 向处理器投递中断消息。
-    Thermal = 0x0330,
+    Thermal = 0x833,
     /// 性能监控计数器寄存器
     ///
     /// 当性能检测计数器寄存器溢出，产生中断请求时，Local APIC将会根据这个寄存器的配置，
     /// 向处理器投递中断消息
-    PerformanceMonitor = 0x0340,
+    PerformanceMonitor = 0x834,
     /// 当处理器的LINT0引脚接收到中断请求信号时，Local APIC会根据这个寄存器的配置，
     /// 向处理器投递中断消息
-    LINT0 = 0x0350,
+    LINT0 = 0x835,
     /// 当处理器的LINT0引脚接收到中断请求信号时，Local APIC会根据这个寄存器的配置，
     /// 向处理器投递中断消息
-    LINT1 = 0x0360,
+    LINT1 = 0x836,
     /// 错误寄存器
     ///
     /// 当APIC检测到内部错误而产生中断请求信号时，它将会通过错误寄存器的设置，向处理器投递中断消息
-    ErrorReg = 0x0370,
+    ErrorReg = 0x837,
 }
 
 impl Into<u32> for LVTRegister {
@@ -86,6 +119,9 @@ pub struct LVT {
 }
 
 impl LVT {
+    /// 当第16位为1时，表示屏蔽中断
+    pub const MASKED: u32 = 1 << 16;
+
     pub fn new(register: LVTRegister, data: u32) -> Option<Self> {
         // vector: u8, mode: DeliveryMode, status: DeliveryStatus
         let mut result = Self { register, data: 0 };
@@ -382,8 +418,9 @@ pub enum TriggerMode {
     Level = 1,
 }
 
+/// 初始化bsp处理器的apic
 #[no_mangle]
-pub extern "C" fn rs_apic_init() -> i32 {
+pub extern "C" fn rs_apic_init_bsp() -> i32 {
     let r = apic_init();
     if r.is_ok() {
         return 0;
@@ -394,7 +431,60 @@ pub extern "C" fn rs_apic_init() -> i32 {
 
 /// @brief 初始化apic
 pub fn apic_init() -> Result<(), i32> {
-    kdebug!("Support xAPIC?.. {}", xapic::XApic::support());
-    kdebug!("Support x2APIC?.. {}", x2apic::X2Apic::support());
+    static INIT: Once = Once::new();
+    assert!(!INIT.is_completed());
+
+    INIT.call_once(|| {
+        kdebug!("Support xAPIC?.. {}", XApic::support());
+        kdebug!("Support x2APIC?.. {}", X2Apic::support());
+
+        if X2Apic::support() && X2Apic.init_current_cpu() {
+            LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::X2Apic, Ordering::SeqCst);
+            kinfo!("x2APIC initialized for bsp");
+        } else {
+            todo!("init xAPIC for bsp");
+            LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::XApic, Ordering::SeqCst);
+        }
+
+        ioapic_init();
+        kinfo!("Apic initialized.");
+    });
+
     return Ok(());
+}
+
+#[no_mangle]
+pub extern "C" fn rs_apic_init_ap() -> i32 {
+    let r = apic_init_ap_core()
+        .map(|_| 0)
+        .unwrap_or_else(|e| e.to_posix_errno());
+    return r;
+}
+
+/// 初始化ap核心的local apic
+pub fn apic_init_ap_core() -> Result<(), SystemError> {
+    if X2Apic::support() && X2Apic.init_current_cpu() {
+        kinfo!("x2APIC initialized for cpu {}", smp_get_processor_id());
+    } else {
+        todo!("init xApic for ap core {}", smp_get_processor_id());
+    }
+
+    return Ok(());
+}
+
+/// 写入ICR寄存器
+pub unsafe fn apic_write_icr(icr: Icr) {
+    match LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) {
+        LocalApicEnableType::XApic => {
+            XApic::write_icr(icr);
+        }
+        LocalApicEnableType::X2Apic => {
+            X2Apic::write_icr(icr);
+        }
+    }
+}
+
+/// x2apic是否启用
+pub fn x2apic_enabled() -> bool {
+    return LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic;
 }

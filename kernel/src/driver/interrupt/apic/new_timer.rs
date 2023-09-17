@@ -1,10 +1,9 @@
-use x86::time::rdtsc;
+use x86::{cpuid::cpuid, time::rdtsc};
 // use x86::cpuid::CpuId
 use crate::arch::CurrentIrqArch;
 use crate::driver::interrupt::apic::xapic::XApic;
 use crate::exception::InterruptArch;
 use crate::kerror;
-use ::core::arch::asm;
 pub use drop;
 use x86::msr::{rdmsr, wrmsr};
 
@@ -36,21 +35,6 @@ use x86::msr::{rdmsr, wrmsr};
 //     }
 // }
 
-// match TODO
-#[inline(always)]
-pub unsafe fn cpuid(eax: &mut u32, ebx: &mut u32, ecx: &mut u32, edx: &mut u32) {
-    /* EBX is used internally by LLVM */
-    asm!(
-        "   xchg rdi, rbx
-            cpuid
-            xchg rdi, rbx
-        ",
-        inout("eax") * eax,
-        inout("ecx") * ecx,
-        out("rdi") * ebx,
-        out("edx") * edx
-    );
-}
 pub struct LocalApicTimer {
     is_deadline_mode_enabled: bool,
     frequency: usize,
@@ -93,12 +77,8 @@ impl LocalApicTimer {
     /// 此函数调用cpuid，请避免多次调用此函数。
     /// 如果支持TSC-Deadline模式，则除非TSC为常数，否则不会启用该模式。
     pub fn is_deadline_mode_supported(&self) -> bool {
-        let mut eax = 1u32;
-        let mut ebx = 0u32;
-        let mut ecx = 0u32;
-        let mut edx = 0u32;
-        unsafe { cpuid(&mut eax, &mut ebx, &mut ecx, &mut edx) };
-        ecx & (1 << 24) != 0
+        let res = cpuid!(1);
+        return (res.ecx & (1 << 24)) != 0;
     }
 
     fn calculate_next_reload_value(&self, ms: u64) -> (u64, bool) {
@@ -121,7 +101,7 @@ impl LocalApicTimer {
                 let old_value = self.reload_value;
                 self.reload_value = reload_value;
                 drop(irq_guard);
-                let current = unsafe { rdtsc() };
+                let current = rdtsc();
                 if overflowed {
                     (old_value > current) && (self.reload_value <= current)
                 } else {
@@ -156,13 +136,10 @@ impl LocalApicTimer {
             return false;
         }
         let is_invariant_tsc = unsafe {
-            let mut eax = 0x80000007u32;
-            let mut ebx = 0;
-            let mut edx = 0;
-            let mut ecx = 0;
-            cpuid(&mut eax, &mut ebx, &mut ecx, &mut edx);
-            (edx & (1 << 8)) != 0
+            let res = cpuid!(0x80000007);
+            (res.edx & (1 << 8)) != 0
         };
+
         if !is_invariant_tsc {
             kerror!("TSC is not invariant.");
             return false;
@@ -226,7 +203,7 @@ impl LocalApicTimer {
             self.is_periodic_mode_enabled = true;
 
             drop(irq_guard);
-            true
+            return true;
         }
     }
 
@@ -346,7 +323,7 @@ impl LocalApicTimer {
                 let mut lvt = local_apic.read(0x32); // LvtTimer寄存器0x32
                 lvt &= !(0b1 << 16);
                 local_apic.write(0x32, lvt); //LvtTimer寄存器0x32
-                self.reload_value = unsafe { rdtsc() };
+                self.reload_value = rdtsc();
                 self.reload_value = self
                     .calculate_next_reload_value(10) // TIMER_INTERVAL_MS值设置为10
                     .0;

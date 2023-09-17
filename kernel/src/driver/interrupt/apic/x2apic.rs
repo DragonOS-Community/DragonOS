@@ -2,7 +2,8 @@ use x86::msr::{
     rdmsr, wrmsr, IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_SIVR,
     IA32_X2APIC_VERSION,
 };
-// 调用了msr库，较完备
+
+use crate::{kdebug, kinfo};
 
 use super::{LVTRegister, LocalAPIC, LVT};
 
@@ -25,8 +26,39 @@ impl LocalAPIC for X2Apic {
                 IA32_APIC_BASE.into(),
                 rdmsr(IA32_APIC_BASE.into()) | 1 << 10,
             );
-            // 设置中断向量寄存器
-            wrmsr(IA32_X2APIC_SIVR.into(), 0x100);
+
+            assert!(
+                (rdmsr(IA32_APIC_BASE.into()) & 0xc00) == 0xc00,
+                "x2APIC enable failed."
+            );
+
+            // 设置Spurious-Interrupt Vector Register
+            {
+                let val = if self.support_eoi_broadcast_suppression() {
+                    (1 << 12) | (1 << 8)
+                } else {
+                    1 << 8
+                };
+
+                wrmsr(IA32_X2APIC_SIVR.into(), val);
+
+                assert!(
+                    (rdmsr(IA32_X2APIC_SIVR.into()) & 0x100) == 0x100,
+                    "x2APIC software enable failed."
+                );
+                kinfo!("x2APIC software enabled.");
+
+                if self.support_eoi_broadcast_suppression() {
+                    assert!(
+                        (rdmsr(IA32_X2APIC_SIVR.into()) & 0x1000) == 0x1000,
+                        "x2APIC EOI broadcast suppression enable failed."
+                    );
+                    kinfo!("x2APIC EOI broadcast suppression enabled.");
+                }
+            }
+            kdebug!("x2apic: to mask all lvt");
+            self.mask_all_lvt();
+            kdebug!("x2apic: all lvt masked");
         }
         true
     }
@@ -39,8 +71,16 @@ impl LocalAPIC for X2Apic {
     }
 
     /// 获取 x2APIC 版本
-    fn version(&self) -> u32 {
-        unsafe { rdmsr(IA32_X2APIC_VERSION.into()) as u32 }
+    fn version(&self) -> u8 {
+        unsafe { (rdmsr(IA32_X2APIC_VERSION.into()) & 0xff) as u8 }
+    }
+
+    fn support_eoi_broadcast_suppression(&self) -> bool {
+        unsafe { ((rdmsr(IA32_X2APIC_VERSION.into()) >> 24) & 1) == 1 }
+    }
+
+    fn max_lvt_entry(&self) -> u8 {
+        unsafe { ((rdmsr(IA32_X2APIC_VERSION.into()) >> 16) & 0xff) as u8 + 1 }
     }
 
     /// 获取 x2APIC 的 APIC ID
@@ -49,9 +89,38 @@ impl LocalAPIC for X2Apic {
     }
 
     /// 设置 Local Vector Table (LVT) 寄存器
-    fn set_lvt(&mut self, register: LVTRegister, lvt: LVT) {
+    fn set_lvt(&mut self, lvt: LVT) {
         unsafe {
-            wrmsr(register.into(), lvt.data as u64);
+            wrmsr(lvt.register().into(), lvt.data as u64);
         }
+    }
+
+    fn mask_all_lvt(&mut self) {
+        // self.set_lvt(LVT::new(LVTRegister::CMCI, LVT::MASKED).unwrap());
+        let cpuid = raw_cpuid::CpuId::new();
+        // cpuid.get_performance_monitoring_info();
+        self.set_lvt(LVT::new(LVTRegister::Timer, LVT::MASKED).unwrap());
+        kdebug!("x2apic: timer masked");
+        if cpuid.get_thermal_power_info().is_some() {
+            self.set_lvt(LVT::new(LVTRegister::Thermal, LVT::MASKED).unwrap());
+        }
+        kdebug!("x2apic: thermal masked");
+        if cpuid.get_performance_monitoring_info().is_some() {
+            self.set_lvt(LVT::new(LVTRegister::PerformanceMonitor, LVT::MASKED).unwrap());
+        }
+
+        kdebug!("x2apic: performance monitor masked");
+
+        self.set_lvt(LVT::new(LVTRegister::LINT0, LVT::MASKED).unwrap());
+        self.set_lvt(LVT::new(LVTRegister::LINT1, LVT::MASKED).unwrap());
+
+        kdebug!("x2apic: lint masked");
+        self.set_lvt(LVT::new(LVTRegister::ErrorReg, LVT::MASKED).unwrap());
+
+        kdebug!("x2apic: error masked");
+    }
+
+    fn write_icr(icr: x86::apic::Icr) {
+        unsafe { wrmsr(0x830, ((icr.upper() as u64) << 32) | icr.lower() as u64) };
     }
 }

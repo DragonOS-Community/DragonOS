@@ -1,10 +1,29 @@
 use bit_field::BitField;
 use bitflags::bitflags;
 
+use crate::{
+    include::bindings::bindings::ioapic_get_base_paddr,
+    kdebug, kinfo,
+    libs::once::Once,
+    mm::{
+        mmio_buddy::{mmio_pool, MMIOSpaceGuard, MmioBuddyMemPool},
+        PhysAddr, VirtAddr,
+    },
+};
+
+static mut __IOAPIC: Option<IoApic> = None;
+
+#[allow(non_snake_case)]
+fn IOAPIC() -> &'static mut IoApic {
+    unsafe { __IOAPIC.as_mut().unwrap() }
+}
+
 #[allow(dead_code)]
 pub struct IoApic {
     reg: *mut u32,
     data: *mut u32,
+    phys_base: PhysAddr,
+    mmio_guard: MMIOSpaceGuard,
 }
 
 impl IoApic {
@@ -13,17 +32,50 @@ impl IoApic {
     /// # Safety
     ///
     /// You must provide a valid address.
-    pub unsafe fn new(addr: usize) -> Self {
-        IoApic {
-            reg: addr as *mut u32,
-            data: (addr + 0x10) as *mut u32,
-        }
+    pub unsafe fn new() -> Self {
+        static INIT_STATE: Once = Once::new();
+        assert!(!INIT_STATE.is_completed());
+
+        let mut result: Option<IoApic> = None;
+        INIT_STATE.call_once(|| {
+            kinfo!("Initializing ioapic...");
+            let phys_base = PhysAddr::new(unsafe { ioapic_get_base_paddr() } as usize);
+            let mmio_guard = mmio_pool()
+                .create_mmio(0x1000)
+                .expect("IoApic::new(): failed to create mmio");
+            assert!(
+                mmio_guard.map_phys(phys_base, 0x1000).is_ok(),
+                "IoApic::new(): failed to map phys"
+            );
+            kdebug!("Ioapic map ok");
+            let reg = mmio_guard.vaddr();
+
+            result = Some(IoApic {
+                reg: reg.data() as *mut u32,
+                data: (reg + 0x10).data() as *mut u32,
+                phys_base,
+                mmio_guard,
+            });
+            kdebug!("to mask all RTE");
+            // 屏蔽所有的RTE
+            let res_mut = result.as_mut().unwrap();
+            for i in 0..res_mut.supported_interrupts() {
+                res_mut.write_rte(i, 0x20 + i, RedirectionEntry::DISABLED, 0);
+            }
+            kdebug!("Ioapic init ok");
+        });
+
+        assert!(
+            result.is_some(),
+            "Failed to init ioapic, maybe this is a double initialization bug?"
+        );
+        return result.unwrap();
     }
 
     pub fn disable_all(&mut self) {
         // Mark all interrupts edge-triggered, active high, disabled,
         // and not routed to any CPUs.
-        for i in 0..=self.maxintr() {
+        for i in 0..self.supported_interrupts() {
             self.disable(i);
         }
     }
@@ -41,26 +93,25 @@ impl IoApic {
         self.data.write_volatile(data);
     }
 
-    fn write_irq(&mut self, irq: u8, vector: u8, flags: RedirectionEntry, dest: u8) {
+    fn write_rte(&mut self, rte_index: u8, vector: u8, flags: RedirectionEntry, dest: u8) {
         unsafe {
-            self.write(REG_TABLE + 2 * irq, vector as u32 | flags.bits());
-            self.write(REG_TABLE + 2 * irq + 1, (dest as u32) << 24);
+            self.write(REG_TABLE + 2 * rte_index, vector as u32 | flags.bits());
+            self.write(REG_TABLE + 2 * rte_index + 1, (dest as u32) << 24);
         }
     }
 
+    /// 标记中断边沿触发、高电平有效、
+    /// 启用并路由到给定的 cpunum，即是是该 cpu 的 APIC ID（不是cpuid）
     pub fn enable(&mut self, irq: u8, cpunum: u8) {
-        // 标记中断边沿触发、高电平有效、
-        // 启用并路由到给定的 cpunum，即是是该 cpu 的 APIC ID（不是cpuid）
         let vector = self.irq_vector(irq);
-        self.write_irq(irq, vector, RedirectionEntry::NONE, cpunum);
+        self.write_rte(irq, vector, RedirectionEntry::NONE, cpunum);
     }
 
     pub fn disable(&mut self, irq: u8) {
         let vector = self.irq_vector(irq);
-        self.write_irq(irq, vector, RedirectionEntry::DISABLED, 0);
+        self.write_rte(irq, vector, RedirectionEntry::DISABLED, 0);
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn config(
         &mut self,
         irq_offset: u8,
@@ -95,7 +146,7 @@ impl IoApic {
         if mask {
             flags |= RedirectionEntry::DISABLED;
         }
-        self.write_irq(irq_offset, vector, flags, dest)
+        self.write_rte(irq_offset, vector, flags, dest)
     }
 
     pub fn irq_vector(&mut self, irq: u8) -> u8 {
@@ -120,19 +171,16 @@ impl IoApic {
     pub fn version(&mut self) -> u8 {
         unsafe { self.read(REG_VER).get_bits(0..8) as u8 }
     }
-    // 获取range指定的位范围； 注意，索引 0 是最低有效位，而索引 length() - 1 是最高有效位。元素总个数
-    pub fn maxintr(&mut self) -> u8 {
-        unsafe { self.read(REG_VER).get_bits(16..24) as u8 }
+
+    /// Number of supported interrupts by this IO APIC.
+    ///
+    /// Max Redirection Entry = "how many IRQs can this I/O APIC handle - 1"
+    /// The -1 is silly so we add one back to it.
+    pub fn supported_interrupts(&mut self) -> u8 {
+        unsafe { (self.read(REG_VER).get_bits(16..24) + 1) as u8 }
     }
 }
 
-/// Default physical address of IO APIC
-/// 设置IO APIC ID 为0x0f000000
-/// *apic_ioapic_map.virtual_index_addr = 0x00;
-/// io_mfence();
-/// *apic_ioapic_map.virtual_data_addr = 0x0f000000;
-/// io_mfence();
-pub const IOAPIC_ADDR: u32 = 0x0f000000;
 /// Register index: ID
 const REG_ID: u8 = 0x00;
 /// 获取IO APIC Version
@@ -158,4 +206,13 @@ bitflags! {
         /// None
         const NONE		= 0x00000000;
     }
+}
+
+pub fn ioapic_init() {
+    kinfo!("Initializing ioapic...");
+    let ioapic = unsafe { IoApic::new() };
+    unsafe {
+        __IOAPIC = Some(ioapic);
+    }
+    kinfo!("IO Apic initialized.");
 }

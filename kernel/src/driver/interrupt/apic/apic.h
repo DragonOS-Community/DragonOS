@@ -301,7 +301,6 @@ int apic_init();
  * @return uint
  */
 uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total);
-uint rs_apic_get_ics(const uint type, ul ret_vaddr[], uint *total);
 
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num);
@@ -332,6 +331,4 @@ void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, u
                          uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID);
 
 uint32_t apic_get_local_apic_id();
-void apic_write_icr(uint64_t value);
-bool apic_x2apic_enabled();
 #pragma GCC pop_options

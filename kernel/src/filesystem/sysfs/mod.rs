@@ -14,13 +14,11 @@ use crate::{
     time::TimeSpec,
 };
 use alloc::{
-    boxed::Box,
     collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::ptr::null_mut;
 
 pub mod bus;
 pub mod class;
@@ -29,10 +27,10 @@ pub mod fs;
 
 const SYSFS_MAX_NAMELEN: usize = 64;
 
-static mut __SYS_DEVICES_INODE: *mut Arc<dyn IndexNode> = null_mut();
-static mut __SYS_BUS_INODE: *mut Arc<dyn IndexNode> = null_mut();
-static mut __SYS_CLASS_INODE: *mut Arc<dyn IndexNode> = null_mut();
-static mut __SYS_FS_INODE: *mut Arc<dyn IndexNode> = null_mut();
+static mut __SYS_DEVICES_INODE: Option<Arc<dyn IndexNode>> = None;
+static mut __SYS_BUS_INODE: Option<Arc<dyn IndexNode>> = None;
+static mut __SYS_CLASS_INODE: Option<Arc<dyn IndexNode>> = None;
+static mut __SYS_FS_INODE: Option<Arc<dyn IndexNode>> = None;
 
 /// @brief 获取全局的sys/devices节点
 #[inline(always)]
@@ -117,28 +115,28 @@ impl SysFS {
         let root: &Arc<LockedSysFSInode> = &sysfs.root_inode;
         match root.add_dir("devices") {
             Ok(devices) => unsafe {
-                __SYS_DEVICES_INODE = Box::leak(Box::new(devices));
+                __SYS_DEVICES_INODE = Some(devices);
             },
             Err(_) => panic!("SysFS: Failed to create /sys/devices"),
         }
 
         match root.add_dir("bus") {
             Ok(bus) => unsafe {
-                __SYS_BUS_INODE = Box::leak(Box::new(bus));
+                __SYS_BUS_INODE = Some(bus);
             },
             Err(_) => panic!("SysFS: Failed to create /sys/bus"),
         }
 
         match root.add_dir("class") {
             Ok(class) => unsafe {
-                __SYS_CLASS_INODE = Box::leak(Box::new(class));
+                __SYS_CLASS_INODE = Some(class);
             },
             Err(_) => panic!("SysFS: Failed to create /sys/class"),
         }
 
         match root.add_dir("fs") {
             Ok(fs) => unsafe {
-                __SYS_FS_INODE = Box::leak(Box::new(fs));
+                __SYS_FS_INODE = Some(fs);
             },
             Err(_) => panic!("SysFS: Failed to create /sys/fs"),
         }
@@ -154,6 +152,14 @@ pub struct LockedSysFSInode(SpinLock<SysFSInode>);
 impl IndexNode for LockedSysFSInode {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
+    }
+
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        return Ok(());
+    }
+
+    fn truncate(&self, _len: usize) -> Result<(), SystemError> {
+        return Ok(());
     }
 
     fn open(

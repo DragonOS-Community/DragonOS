@@ -502,11 +502,7 @@ impl FileDescriptorVec {
             return Err(SystemError::EBADF);
         }
 
-        let f = self.get_file_by_fd(fd);
-        if f.is_none() {
-            // 如果文件描述符不存在，报错
-            return Err(SystemError::EBADF);
-        }
+        self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();

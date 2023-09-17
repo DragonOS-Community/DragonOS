@@ -3,7 +3,7 @@ use crate::include::bindings::bindings::acpi_system_description_table_header_t;
 use core::ptr::{slice_from_raw_parts_mut, NonNull};
 // MCFG表中的Segement配置部分，开始位置为44+16*n
 #[repr(C, packed)]
-pub struct Segement_Configuration_Space {
+pub struct SegementConfigurationSpace {
     pub base_address: u64,
     pub segement_group_number: SegmentGroupNumber,
     pub bus_begin: u8,
@@ -16,7 +16,7 @@ pub struct Segement_Configuration_Space {
 /// @return NonNull<[Segement_Configuration_Space]>
 pub fn mcfg_find_segment(
     head: NonNull<acpi_system_description_table_header_t>,
-) -> NonNull<[Segement_Configuration_Space]> {
+) -> NonNull<[SegementConfigurationSpace]> {
     let table_length = unsafe { (*head.as_ptr()).Length };
     let number_of_segments = ((table_length - 44) / 16) as u16;
     NonNull::new(slice_from_raw_parts_mut(

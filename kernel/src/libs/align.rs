@@ -129,6 +129,11 @@ pub fn page_align_up(addr: usize) -> usize {
     return (addr + page_size - 1) & (!(page_size - 1));
 }
 
+pub fn page_align_down(addr: usize) -> usize {
+    let page_size = MMArch::PAGE_SIZE;
+    return addr & (!(page_size - 1));
+}
+
 /// ## 检查是否对齐
 ///
 /// 检查给定的值是否对齐到给定的对齐要求。

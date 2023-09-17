@@ -1,10 +1,9 @@
 use core::{
     hint::spin_loop,
-    ptr::null_mut,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::{boxed::Box, format, string::ToString, sync::Arc};
+use alloc::{format, string::ToString, sync::Arc};
 
 use crate::{
     driver::{
@@ -36,7 +35,7 @@ pub fn generate_inode_id() -> InodeId {
     return INO.fetch_add(1, Ordering::SeqCst);
 }
 
-static mut __ROOT_INODE: *mut Arc<dyn IndexNode> = null_mut();
+static mut __ROOT_INODE: Option<Arc<dyn IndexNode>> = None;
 
 /// @brief 获取全局的根节点
 #[inline(always)]
@@ -52,10 +51,10 @@ pub extern "C" fn vfs_init() -> i32 {
     // 使用Ramfs作为默认的根文件系统
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
-    let root_inode = Box::leak(Box::new(mount_fs.root_inode()));
+    let root_inode = mount_fs.root_inode();
 
     unsafe {
-        __ROOT_INODE = root_inode;
+        __ROOT_INODE = Some(root_inode.clone());
     }
 
     // 创建文件夹
@@ -76,8 +75,8 @@ pub extern "C" fn vfs_init() -> i32 {
 
     sysfs_init().expect("Failed to initialize sysfs");
 
-    let root_inode = ROOT_INODE().list().expect("VFS init failed");
-    if root_inode.len() > 0 {
+    let root_entries = ROOT_INODE().list().expect("VFS init failed");
+    if root_entries.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
     return 0;
@@ -122,21 +121,19 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
-    let new_root_inode = Box::leak(Box::new(new_fs.root_inode()));
+    let new_root_inode = new_fs.root_inode();
 
     // 把上述文件系统,迁移到新的文件系统下
     do_migrate(new_root_inode.clone(), "proc", proc)?;
     do_migrate(new_root_inode.clone(), "dev", dev)?;
     do_migrate(new_root_inode.clone(), "sys", sys)?;
-
     unsafe {
         // drop旧的Root inode
-        let old_root_inode: Box<Arc<dyn IndexNode>> = Box::from_raw(__ROOT_INODE);
-        __ROOT_INODE = null_mut();
+        let old_root_inode = __ROOT_INODE.take().unwrap();
         drop(old_root_inode);
 
         // 设置全局的新的ROOT Inode
-        __ROOT_INODE = new_root_inode;
+        __ROOT_INODE = Some(new_root_inode);
     }
 
     kinfo!("VFS: Migrate filesystems done!");

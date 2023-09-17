@@ -2,7 +2,7 @@
 // 目前仅支持单主桥单Segment
 
 use super::pci_irq::{IrqType, PciIrqError};
-use crate::arch::{MMArch, PciArch, TraitPciArch};
+use crate::arch::{PciArch, TraitPciArch};
 use crate::include::bindings::bindings::PAGE_2M_SIZE;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -638,7 +638,9 @@ impl PciRoot {
             let space_guard = Arc::new(space_guard);
             self.mmio_guard = Some(space_guard.clone());
 
-            assert!(space_guard.map_phys::<MMArch>(self.physical_address_base, size));
+            assert!(space_guard
+                .map_phys(self.physical_address_base, size)
+                .is_ok());
         }
         return Ok(0);
     }
@@ -1411,7 +1413,7 @@ pub fn pci_bar_init(
                 space_guard = Arc::new(tmp);
                 kdebug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
                 assert!(
-                    space_guard.map_phys::<MMArch>(paddr, size_want),
+                    space_guard.map_phys(paddr, size_want).is_ok(),
                     "pci_bar_init: map_phys failed"
                 );
             }

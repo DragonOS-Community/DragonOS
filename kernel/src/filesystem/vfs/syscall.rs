@@ -784,9 +784,7 @@ impl IoVecs {
         let mut buf: Vec<u8> = Vec::with_capacity(total_len);
 
         if set_len {
-            unsafe {
-                buf.set_len(total_len);
-            }
+            buf.resize(total_len, 0);
         }
         return buf;
     }

@@ -5,6 +5,8 @@
 #include <mm/mm.h>
 #include <mm/mmio.h>
 
+extern void rs_acpi_init(uint64_t rsdp_paddr);
+
 #define acpi_get_RSDT_entry_vaddr(phys_addr) (acpi_description_header_base + (phys_addr)-acpi_RSDT_entry_phys_base) // 获取RSDT entry的虚拟地址
 // #define acpi_get_XSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_XSDT_entry_phys_base) // 获取XSDT entry的虚拟地址
 
@@ -137,6 +139,8 @@ void acpi_init()
 
     multiboot2_iter(multiboot2_get_acpi_new_RSDP, &new_acpi, &reserved);
     rsdpv2 = &(new_acpi.rsdp);
+
+    rs_acpi_init((uint64_t)rsdpv1);
 
     uint64_t paddr = 0;
     // An ACPI-compatible OS must use the XSDT if present

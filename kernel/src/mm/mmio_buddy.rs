@@ -30,8 +30,8 @@ const PAGE_1G_SIZE: usize = 1 << 30;
 
 static mut __MMIO_POOL: Option<MmioBuddyMemPool> = None;
 
-pub fn mmio_pool() -> &'static mut MmioBuddyMemPool {
-    unsafe { __MMIO_POOL.as_mut().unwrap() }
+pub fn mmio_pool() -> &'static MmioBuddyMemPool {
+    unsafe { __MMIO_POOL.as_ref().unwrap() }
 }
 
 pub enum MmioResult {
@@ -482,7 +482,7 @@ impl MmioBuddyMemPool {
         // 计算前导0
         #[cfg(target_arch = "x86_64")]
         let mut size_exp: u32 = 63 - size.leading_zeros();
-
+        // kdebug!("create_mmio: size_exp: {}", size_exp);
         // 记录最终申请的空间大小
         let mut new_size = size;
         // 对齐要申请的空间大小
@@ -542,14 +542,26 @@ impl MmioBuddyMemPool {
 
         for i in 0..page_count {
             unsafe {
-                kernel_mapper
+                let x: Option<(
+                    PhysAddr,
+                    PageFlags<MMArch>,
+                    crate::mm::page::PageFlush<MMArch>,
+                )> = kernel_mapper
                     .as_mut()
                     .unwrap()
-                    .unmap_phys(vaddr + i * MMArch::PAGE_SIZE, true)
+                    .unmap_phys(vaddr + i * MMArch::PAGE_SIZE, false);
+                if let Some((_, _, flush)) = x {
+                    flush.flush();
+                }
             };
         }
 
-        // todo: 归还到buddy
+        // 归还到buddy
+        mmio_pool()
+            .give_back_block(vaddr, length.trailing_zeros() as u32)
+            .unwrap_or_else(|err| {
+                panic!("MMIO release failed: self: {self:?}, err msg: {:?}", err);
+            });
 
         return Ok(0);
     }
@@ -652,29 +664,27 @@ impl MMIOSpaceGuard {
     ///
     /// 传入的物理地址【一定要是设备的物理地址】。
     /// 如果物理地址是从内存分配器中分配的，那么会造成内存泄露。因为mmio_release的时候，只取消映射，不会释放内存。
-    pub unsafe fn map_phys<Arch: MemoryManagementArch>(
-        &self,
-        paddr: PhysAddr,
-        length: usize,
-    ) -> bool {
+    pub unsafe fn map_phys(&self, paddr: PhysAddr, length: usize) -> Result<(), SystemError> {
         if length > self.size {
-            return false;
+            return Err(SystemError::EINVAL);
         }
 
         let check = self
             .mapped
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
         if check.is_err() {
-            return false;
+            return Err(SystemError::EINVAL);
         }
 
         let flags = PageFlags::mmio_flags();
         let mut kernel_mapper = KernelMapper::lock();
         let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
-        if r.is_err() {
-            return false;
-        }
-        return true;
+        return r;
+    }
+
+    /// 泄露一个MMIO space guard，不会释放映射的空间
+    pub unsafe fn leak(self) {
+        core::mem::forget(self);
     }
 }
 

@@ -258,10 +258,13 @@ impl IndexNode for TtyDevice {
             }
             // 输出到屏幕
 
-            for x in buf {
-                textui_putchar(x as char, FontColor::WHITE, FontColor::BLACK).ok();
+            for x in 0..len {
+                textui_putchar(buf[x] as char, FontColor::WHITE, FontColor::BLACK).ok();
             }
         }
+        return Ok(());
+    }
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
         return Ok(());
     }
 }

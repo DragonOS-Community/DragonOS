@@ -1,5 +1,5 @@
 use crate::arch::TraitPciArch;
-use crate::driver::acpi::acpi::mcfg_find_segment;
+use crate::driver::acpi::old::mcfg_find_segment;
 use crate::driver::pci::pci::{
     BusDeviceFunction, PciAddr, PciError, PciRoot, SegmentGroupNumber, PORT_PCI_CONFIG_ADDRESS,
     PORT_PCI_CONFIG_DATA,

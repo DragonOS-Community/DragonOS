@@ -1,4 +1,6 @@
-use super::{kthread::kthread_init, process_init, ProcessManager};
+use crate::smp::core::smp_get_processor_id;
+
+use super::{kthread::kthread_init, process_init, ProcessManager, __PROCESS_MANAGEMENT_INIT_DONE};
 
 #[no_mangle]
 pub extern "C" fn rs_process_init() {
@@ -21,14 +23,15 @@ pub extern "C" fn rs_get_idle_stack_top(cpu_id: u32) -> usize {
 
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_cpuid() -> u32 {
-    return ProcessManager::current_pcb()
-        .sched_info()
-        .on_cpu()
-        .unwrap_or(u32::MAX);
+    return smp_get_processor_id();
 }
+
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_pid() -> u32 {
-    return ProcessManager::current_pcb().pid().0 as u32;
+    if unsafe { __PROCESS_MANAGEMENT_INIT_DONE } {
+        return ProcessManager::current_pcb().pid().0 as u32;
+    }
+    return 0;
 }
 
 #[no_mangle]

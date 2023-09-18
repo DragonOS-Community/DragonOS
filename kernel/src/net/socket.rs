@@ -10,7 +10,7 @@ use smoltcp::{
 use crate::{
     arch::rand::rand,
     driver::net::NetDriver,
-    filesystem::vfs::{FileType, IndexNode, Metadata, PollStatus},
+    filesystem::vfs::{syscall::ModeType, FileType, IndexNode, Metadata, PollStatus},
     kerror, kwarn,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -1215,7 +1215,7 @@ impl IndexNode for SocketInode {
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         let meta = Metadata {
-            mode: 0o777,
+            mode: ModeType::from_bits_truncate(0o755),
             file_type: FileType::Socket,
             ..Default::default()
         };

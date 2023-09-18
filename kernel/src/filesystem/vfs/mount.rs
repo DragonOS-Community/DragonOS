@@ -10,7 +10,9 @@ use alloc::{
 
 use crate::{libs::spinlock::SpinLock, syscall::SystemError};
 
-use super::{file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode, InodeId};
+use super::{
+    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+};
 
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
@@ -141,7 +143,7 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Ok(MountFSInode {
@@ -213,7 +215,7 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Ok(MountFSInode {
             inner_inode: self.inner_inode.create(name, file_type, mode)?,

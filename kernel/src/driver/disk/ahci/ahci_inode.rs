@@ -1,6 +1,7 @@
 use crate::driver::base::block::block_device::BlockDevice;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode,
     Metadata, PollStatus,
@@ -49,7 +50,7 @@ impl LockedAhciInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::BlockDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

@@ -7,7 +7,10 @@ use alloc::{
 use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
+        vfs::{
+            file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
+            ROOT_INODE,
+        },
     },
     kerror,
     libs::{
@@ -271,7 +274,7 @@ impl IndexNode for TtyDevice {
 
 impl TtyDevicePrivateData {
     pub fn new(name: &str) -> RwLock<Self> {
-        let mut metadata = Metadata::new(FileType::CharDevice, 0o755);
+        let mut metadata = Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755));
         metadata.size = TtyCore::STDIN_BUF_SIZE as i64;
         return RwLock::new(TtyDevicePrivateData {
             name: name.to_string(),

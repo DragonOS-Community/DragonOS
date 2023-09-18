@@ -31,6 +31,7 @@ pub const SEEK_MAX: u32 = 3;
 
 bitflags! {
     /// 文件类型和权限
+    #[repr(C)]
     pub struct ModeType: u32 {
         /// 掩码
         const S_IFMT = 0o0_170_000;
@@ -154,8 +155,11 @@ impl Syscall {
                 let parent_inode: Arc<dyn IndexNode> =
                     ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
                 // 创建文件
-                let inode: Arc<dyn IndexNode> =
-                    parent_inode.create(filename, FileType::File, 0o777)?;
+                let inode: Arc<dyn IndexNode> = parent_inode.create(
+                    filename,
+                    FileType::File,
+                    ModeType::from_bits_truncate(0o755),
+                )?;
                 inode
             } else {
                 // 不需要创建文件，因此返回错误码
@@ -649,7 +653,7 @@ impl Syscall {
         let metadata = file.lock().metadata()?;
         kstat.size = metadata.size as i64;
         kstat.dev_id = metadata.dev_id as u64;
-        kstat.inode = metadata.inode_id as u64;
+        kstat.inode = metadata.inode_id.into() as u64;
         kstat.blcok_size = metadata.blk_size as i64;
         kstat.blocks = metadata.blocks as u64;
 
@@ -664,7 +668,7 @@ impl Syscall {
         kstat.uid = metadata.uid as i32;
         kstat.gid = metadata.gid as i32;
         kstat.rdev = metadata.raw_dev as i64;
-        kstat.mode.bits = metadata.mode;
+        kstat.mode = metadata.mode;
         match file.lock().file_type() {
             FileType::File => kstat.mode.insert(ModeType::S_IFMT),
             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),

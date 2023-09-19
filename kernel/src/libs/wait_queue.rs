@@ -5,7 +5,7 @@ use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     kerror,
-    process::{ProcessControlBlock, ProcessManager, ProcessState},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
 };
 
 use super::{
@@ -171,7 +171,7 @@ impl WaitQueue {
     ///
     /// @return true 成功唤醒进程
     /// @return false 没有唤醒进程
-    pub fn wakeup(&self, state: Option<ProcessState>) -> bool {
+    pub fn wakeup(&self, state: Option<ProcessFlags>) -> bool {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         // 如果队列为空，则返回
         if guard.wait_list.is_empty() {
@@ -179,7 +179,7 @@ impl WaitQueue {
         }
         // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
         if let Some(state) = state {
-            if guard.wait_list.front().unwrap().sched_info().state() != state {
+            if guard.wait_list.front().unwrap().flags().contains(state) {
                 return false;
             }
         }
@@ -191,7 +191,7 @@ impl WaitQueue {
     /// @brief 唤醒在队列中，符合条件的所有进程。
     ///
     /// @param state 用于判断的state，如果一个进程与这个state相同，或者为None(表示不进行这个判断)，则唤醒这个进程。
-    pub fn wakeup_all(&self, state: Option<ProcessState>) {
+    pub fn wakeup_all(&self, state: Option<ProcessFlags>) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
         // 如果队列为空，则返回
         if guard.wait_list.is_empty() {
@@ -202,7 +202,7 @@ impl WaitQueue {
         // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
         while let Some(to_wakeup) = guard.wait_list.pop_front() {
             if let Some(state) = state {
-                if to_wakeup.sched_info().state() == state {
+                if to_wakeup.flags().contains(state) {
                     ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
                         kerror!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
                     });

@@ -19,6 +19,7 @@ use crate::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
+    ipc::signal_types::{SigHandler, SigPending, SigSet, SignalStruct},
     kdebug, kinfo,
     libs::{
         align::AlignedBox,
@@ -48,6 +49,7 @@ pub mod init;
 pub mod kthread;
 pub mod process;
 pub mod syscall;
+pub mod pid;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
@@ -395,6 +397,8 @@ pub struct ProcessControlBlock {
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
+    /// 与信号处理相关的信息(无锁)
+    sig_info: ProcessSignalInfo,
 
     /// 父进程指针
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
@@ -460,6 +464,7 @@ impl ProcessControlBlock {
             worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
+            sig_info: ProcessSignalInfo::default(),
             parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(HashMap::new()),
             wait_queue: WaitQueue::INIT,
@@ -638,6 +643,15 @@ impl ProcessControlBlock {
         }
         return name;
     }
+
+    pub fn sig_info(&self) -> &ProcessSignalInfo {
+        &self.sig_info
+    }
+
+    pub fn sig_info_mut(&mut self) -> &mut ProcessSignalInfo {
+        &mut self.sig_info
+    }
+
 }
 
 impl Drop for ProcessControlBlock {
@@ -947,4 +961,43 @@ impl Drop for KernelStack {
 
 pub fn process_init() {
     ProcessManager::init();
+}
+
+#[derive(Debug)]
+pub struct ProcessSignalInfo {
+    sig_struct: Arc<SpinLock<SignalStruct>>,
+    sig_set: SigSet,
+    sig_pedding: SigPending,
+}
+
+impl ProcessSignalInfo {
+    pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
+        self.sig_struct.lock()
+    }
+
+    pub fn sig_set(&self) -> SigSet {
+        self.sig_set
+    }
+
+    pub fn sig_pedding(&self) -> &SigPending {
+        &self.sig_pedding
+    }
+
+    pub fn sig_pedding_mut(&mut self) -> &mut SigPending {
+        &mut self.sig_pedding
+    }
+
+    pub fn sig_set_mut(&mut self) -> &mut SigSet {
+        &mut self.sig_set
+    }
+}
+
+impl Default for ProcessSignalInfo {
+    fn default() -> Self {
+        Self {
+            sig_struct: Arc::new(SpinLock::new(SignalStruct::default())),
+            sig_set: SigSet::empty(),
+            sig_pedding: SigPending::default(),
+        }
+    }
 }

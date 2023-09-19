@@ -14,7 +14,7 @@ use crate::{
     syscall::SystemError,
 };
 
-use super::{Dirent, FileType, IndexNode, Metadata};
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -185,7 +185,7 @@ impl File {
     }
 
     /// @brief 根据inode号获取子目录项的名字
-    pub fn get_entry_name(&self, ino: usize) -> Result<String, SystemError> {
+    pub fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         return self.inode.get_entry_name(ino);
     }
 
@@ -276,7 +276,7 @@ impl File {
         let name_bytes: &[u8] = name.as_bytes();
 
         self.offset += 1;
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id as u64;
+        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
         dirent.d_off = 0;
         dirent.d_reclen = 0;
         dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;

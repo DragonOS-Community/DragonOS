@@ -26,6 +26,7 @@ use crate::{
 
 use super::vfs::{
     file::{FileMode, FilePrivateData},
+    syscall::ModeType,
     FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
 };
 
@@ -262,7 +263,7 @@ impl ProcFS {
                     mtime: TimeSpec::default(),
                     ctime: TimeSpec::default(),
                     file_type: FileType::Dir,
-                    mode: 0o777,
+                    mode: ModeType::from_bits_truncate(0o777),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -294,10 +295,18 @@ impl ProcFS {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
-        let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
+        let _pf: Arc<dyn IndexNode> = proc.create(
+            &pid.to_string(),
+            FileType::Dir,
+            ModeType::from_bits_truncate(0o777),
+        )?;
         // 创建相关文件
         // status文件
-        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0o777)?;
+        let binding: Arc<dyn IndexNode> = _pf.create(
+            "status",
+            FileType::File,
+            ModeType::from_bits_truncate(0o777),
+        )?;
         let _sf: &LockedProcFSInode = binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
@@ -482,7 +491,7 @@ impl IndexNode for LockedProcFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
@@ -623,7 +632,7 @@ impl IndexNode for LockedProcFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -636,14 +645,25 @@ impl IndexNode for LockedProcFSInode {
                 let mut key: Vec<String> = inode
                     .children
                     .keys()
-                    .filter(|k| inode.children.get(*k).unwrap().0.lock().metadata.inode_id == ino)
+                    .filter(|k| {
+                        inode
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .0
+                            .lock()
+                            .metadata
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                         0=>{return Err(SystemError::ENOENT);}
                         1=>{return Ok(key.remove(0));}
-                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                     }
             }
         }

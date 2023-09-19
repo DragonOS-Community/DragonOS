@@ -6,7 +6,10 @@ use crate::{
     driver::tty::tty_device::TTY_DEVICES,
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{core::generate_inode_id, file::FileMode, FileType, IndexNode, Metadata, PollStatus},
+        vfs::{
+            core::generate_inode_id, file::FileMode, syscall::ModeType, FileType, IndexNode,
+            Metadata, PollStatus,
+        },
     },
     include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t},
     libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
@@ -59,7 +62,7 @@ impl LockedPS2KeyBoardInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

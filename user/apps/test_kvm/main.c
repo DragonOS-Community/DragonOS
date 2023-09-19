@@ -19,7 +19,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#define KVM_CREATE_VCPU 0x00
 #define KVM_SET_USER_MEMORY_REGION 0x01
+
+#define KVM_RUN 0x00
 
 struct kvm_userspace_memory_region {
     uint32_t slot; // 要在哪个slot上注册内存区间
@@ -53,7 +56,7 @@ int main()
     printf("vmfd=%d\n", vmfd);
 
     uint8_t code[] = "\xB0\x61\xBA\x17\x02\xEE\xB0\n\xEE\xF4";
-    size_t mem_size = 0x40000000; // size of user memory you want to assign
+    size_t mem_size = 0x4000; // size of user memory you want to assign
     printf("code=%p\n", code);
     struct kvm_userspace_memory_region region = {
         .slot = 0,
@@ -64,9 +67,9 @@ int main()
     };
     ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &region);
 
-    int vcpufd = ioctl(vmfd, 0x00, 0);
+    int vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, 0);
     printf("vcpufd=%d\n", vcpufd);
-    ioctl(vcpufd, 0x00, 0);
+    ioctl(vcpufd, KVM_RUN, 0);
 
     return 0;
 }

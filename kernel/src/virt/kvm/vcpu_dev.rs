@@ -1,9 +1,5 @@
-use crate::arch::kvm::vmx::vcpu::VmxVcpu;
 use crate::kdebug;
-use crate::libs::mutex::Mutex;
-use crate::virt::kvm::hypervisor::Hypervisor;
-use crate::virt::kvm::vcpu::Vcpu;
-use crate::virt::kvm::{KVM, HOST_STACK_SIZE, GUEST_STACK_SIZE, };
+use crate::virt::kvm::KVM;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
@@ -21,6 +17,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use crate::virt::kvm::vcpu::Vcpu;
 
 // pub const KVM_API_VERSION:u32 = 12;
 pub const KVM_RUN: u32 = 0x00;
@@ -158,7 +155,7 @@ impl IndexNode for LockedVcpuInode {
                 // let hypervisor = Hypervisor::new(1, host_rsp, 0).expect("Cannot create hypervisor");
                 // let vcpu = VmxVcpu::new(1, Arc::new(Mutex::new(hypervisor)), host_rsp, guest_rsp,  guest_code as *const () as u64).expect("Cannot create VcpuData");
                 // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
-                vcpu.virtualize_cpu()?;
+                (*vcpu.lock()).virtualize_cpu()?;
                 Ok(0)
             }
             _ => {

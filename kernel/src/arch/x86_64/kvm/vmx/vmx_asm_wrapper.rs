@@ -1,4 +1,4 @@
-use crate::{syscall::SystemError};
+use crate::syscall::SystemError;
 use x86;
 use super::vmcs::VmcsFields;
 use crate::kdebug;
@@ -62,9 +62,9 @@ pub fn vmx_vmlaunch()-> Result<(), SystemError> {
             "push    rdx",
             "push    rsi",
             "push    rdi",
-            "vmwrite {0}, rsp",
+            "vmwrite {0:r}, rsp",
             "lea rax, 1f[rip]",
-            "vmwrite {1}, rax",
+            "vmwrite {1:r}, rax",
             "vmlaunch",
             "1:",
             "pop    rdi",

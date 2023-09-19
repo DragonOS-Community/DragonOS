@@ -4,7 +4,7 @@ use x86::{
 };
 use raw_cpuid::CpuId;
 use x86;
-use crate::arch::mm::LockedFrameAllocator;
+use crate::arch::mm::{LockedFrameAllocator, PageMapper};
 use crate::virt::kvm::{GUEST_STACK_SIZE, HOST_STACK_SIZE};
 use crate::{kdebug, printk_color, GREEN, BLACK};
 use alloc::boxed::Box;
@@ -19,8 +19,8 @@ use crate::mm::{VirtAddr, phys_2_virt};
 use crate::syscall::SystemError;
 use crate::virt::kvm::hypervisor::Hypervisor;
 use crate::virt::kvm::vcpu::Vcpu;
-use super::mmu::{KvmMmu, KvmMmuMemoryCache};
-use super::vmexit::vmx_return;
+use crate::arch::x86_64::mm::X86_64MMArch;
+use super::mmu::KvmMmu;
 use super::vmcs::{VMCSRegion, VmcsFields, 
     VmxEntryCtrl, VmxPrimaryExitCtrl,
     VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl
@@ -58,7 +58,6 @@ pub struct VcpuData {
     pub msr_bitmap_physical_address: u64,
     pub guest_rsp: u64,
     pub guest_rip: u64,
-
 }
 
 pub struct VmxVcpu {
@@ -81,7 +80,7 @@ pub struct VmxVcpu {
      //  用于分配 page ，作为 kvm_mmu_page.spt
     //  mmu_page_cache: KvmMmuMemoryCache,
      // // 用于分配 kvm_mmu_page ，作为页表页
-     pub mmu_page_header_cache: KvmMmuMemoryCache,
+    //  pub mmu_page_header_cache: KvmMmuMemoryCache,
 
 }
 
@@ -171,7 +170,7 @@ impl VcpuData {
 
 
 impl VmxVcpu {
-    pub fn new(index: u32, hypervisor: Arc<Mutex<Hypervisor>>, host_rsp: u64, guest_rsp: u64, guest_rip: u64) -> Result<Self, SystemError> {
+    pub fn new(index: u32, hypervisor: Arc<Mutex<Hypervisor>>, _host_rsp: u64, guest_rsp: u64, guest_rip: u64) -> Result<Self, SystemError> {
         kdebug!("Creating processor {}", index);
         Ok (Self {
             index,
@@ -424,16 +423,16 @@ impl Vcpu for VmxVcpu {
 
 impl VmxVcpu {
     fn kvm_mmu_load(&self) -> Result<(), SystemError> {
+        kdebug!("kvm_mmu_load!");
         // 申请并创建新的页表
-        let mut mapper: crate::mm::page::PageMapper<MMArch, &mut LockedFrameAllocator<MMArch>> = unsafe {
-            crate::mm::page::PageMapper::<MMArch, _>::create(
-                PageTableKind::EPT,
-                LockedFrameAllocator,
-            )
-            .ok_or(SystemError::ENOMEM)?
+        let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::EPT, LockedFrameAllocator)
+                .ok_or(SystemError::ENOMEM)?
         };
+
         let ept_root_hpa = mapper.table().phys();
-        self.mmu.set_tdp_eptp(ept_root_hpa);
+        let set_eptp_fn = self.mmu.set_eptp.unwrap();
+        set_eptp_fn(ept_root_hpa.data() as u64);
         return Ok(());
     }
 }
@@ -529,7 +528,8 @@ pub fn adjust_vmx_secondary_process_exec_controls() -> u32 {
         0,
         VmxSecondaryProcessBasedExecuteCtrl::ENABLE_RDTSCP.bits() | 
         VmxSecondaryProcessBasedExecuteCtrl::ENABLE_XSAVES_XRSTORS.bits() |
-        VmxSecondaryProcessBasedExecuteCtrl::ENABLE_INVPCID.bits(),
+        VmxSecondaryProcessBasedExecuteCtrl::ENABLE_INVPCID.bits() |
+        VmxSecondaryProcessBasedExecuteCtrl::ENABLE_EPT.bits(),
         msr::IA32_VMX_PROCBASED_CTLS2,  
         &mut controls
     );

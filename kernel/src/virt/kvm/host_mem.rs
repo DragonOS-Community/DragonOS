@@ -1,5 +1,5 @@
-use crate::{arch::{kvm::vmx::vcpu::PAGE_SIZE, MMArch}, syscall::SystemError, mm::{VirtAddr, kernel_mapper::KernelMapper, page::PageFlags}};
 
+use crate::{syscall::SystemError, mm::{VirtAddr, kernel_mapper::KernelMapper, page::PageFlags}};
 use super::{vcpu::Vcpu, KVM};
 
 
@@ -27,13 +27,16 @@ pub const KVM_MEM_MAX_NR_PAGES :u32 = (1 << 31) -1;
  * in kvm, other bits are visible for userspace which are defined in
  * include/linux/kvm_h.
  */
-pub const  KVM_MEMSLOT_INVALID:u32 = (1 << 16);
-pub const  KVM_MEMSLOT_INCOHERENT:u32 = (1 << 17);
+pub const  KVM_MEMSLOT_INVALID:u32 = 1 << 16;
+pub const  KVM_MEMSLOT_INCOHERENT:u32 = 1 << 17;
 
 pub const KVM_PERMILLE_MMU_PAGES: u32 = 20; //  the proportion of MMU pages required per thousand (out of 1000) memory pages.
 pub const KVM_MIN_ALLOC_MMU_PAGES: u32 = 64;
 
 pub const PAGE_SHIFT:u32 = 12;
+pub const PAGE_SIZE:u32 = 1 << PAGE_SHIFT;
+pub const PAGE_MASK:u32 = !(PAGE_SIZE -1);
+
 #[repr(C)]
 /// 通过这个结构可以将虚拟机的物理地址对应到用户进程的虚拟地址
 /// 用来表示虚拟机的一段物理内存
@@ -47,27 +50,31 @@ pub struct KvmUserspaceMemoryRegion {
     pub userspace_addr: u64,  // 虚机内存区间对应的主机虚拟地址
 }
 
+#[derive(Default, Clone, Copy)]
 pub struct KvmMemorySlot{
     pub base_gfn: u64, // 虚机内存区间起始物理页框号
     pub npages: u64,   // 虚机内存区间页数，即内存区间的大小
     // 用来记录虚机内存区间的脏页信息，每个bit对应一个页，如果bit为1，表示对应的页是脏页，如果bit为0，表示对应的页是干净页。
-    pub dirty_bitmap: *mut u8, 
+    // pub dirty_bitmap: *mut u8, 
 	// unsigned long *rmap[KVM_NR_PAGE_SIZES]; 反向映射相关的结构, 创建EPT页表项时就记录GPA对应的页表项地址(GPA-->页表项地址)，暂时不需要
     pub userspace_addr: u64,  // 虚机内存区间对应的主机虚拟地址
     pub flags: u32,    // 虚机内存区间属性
     pub id: u16,       // 虚机内存区间id
 }
 
+#[derive(Default, Clone, Copy)]
 pub struct KvmMemorySlots{
     pub memslots: [KvmMemorySlot; KVM_MEM_SLOTS_NUM as usize], // 虚机内存区间数组
     pub used_slots: u32, // 已经使用的slot数量
 }
 
+#[derive(PartialEq, Eq)]
 pub enum KvmMemoryChange{
     Create,
     Delete,
 	Move,
 	FlagsOnly,
+    Invalid,
 }
 
 impl Default for KvmUserspaceMemoryRegion {
@@ -82,16 +89,16 @@ impl Default for KvmUserspaceMemoryRegion {
     }
 }
 
-pub fn kvm_vcpu_memslots(vcpu: &mut dyn Vcpu) -> &mut KvmMemorySlots{
+pub fn kvm_vcpu_memslots(_vcpu: &mut dyn Vcpu) -> KvmMemorySlots{
     let kvm = KVM();
-    let as_id = vcpu.as_id;
-    return &mut kvm.memslots[as_id];
+    let as_id = 0;
+    return kvm.lock().memslots[as_id];
 }
 
-fn __gfn_to_memslot(slots: &mut KvmMemorySlots, gfn: u64) -> Option<&KvmMemorySlot>{
+fn __gfn_to_memslot(slots: KvmMemorySlots, gfn: u64) -> Option<KvmMemorySlot>{
     // TODO: 使用二分查找的方式优化
     for i in 0..slots.used_slots {
-        let memslot = &slots.memslots[i as usize];
+        let memslot = slots.memslots[i as usize];
         if gfn >= memslot.base_gfn && gfn < memslot.base_gfn + memslot.npages {
             return Some(memslot);
         }
@@ -99,19 +106,22 @@ fn __gfn_to_memslot(slots: &mut KvmMemorySlots, gfn: u64) -> Option<&KvmMemorySl
     return None;
 }
 
-fn __gfn_to_hva(slot: &KvmMemorySlot, gfn: u64) -> u64{
-    return slot.userspace_addr + (gfn-slot.base_gfn) * PAGE_SIZE;
+fn __gfn_to_hva(slot: KvmMemorySlot, gfn: u64) -> u64{
+    return slot.userspace_addr + (gfn-slot.base_gfn) * (PAGE_SIZE as u64);
 }
-fn __gfn_to_hva_many(slot: &KvmMemorySlot, gfn: u64, nr_pages: &mut u64, write: bool) -> Result<u64, SystemError>{
-    if !slot || slot.flags & KVM_MEMSLOT_INVALID {
+fn __gfn_to_hva_many(slot: Option<KvmMemorySlot>, gfn: u64, nr_pages: Option<&mut u64>, write: bool) -> Result<u64, SystemError>{
+    if slot.is_none() {
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
-    
-    if (slot.flags & KVM_MEM_READONLY) && write {
+    let slot = slot.unwrap();
+    if slot.flags & KVM_MEMSLOT_INVALID != 0 || 
+        (slot.flags & KVM_MEM_READONLY != 0) && write {
         return Err(SystemError::KVM_HVA_ERR_BAD);
+
     }
     
-    if nr_pages {
+    if nr_pages.is_some() {
+        let nr_pages = nr_pages.unwrap();
         *nr_pages = slot.npages - (gfn - slot.base_gfn);
     }
     return Ok(__gfn_to_hva(slot, gfn));
@@ -134,27 +144,29 @@ fn __gfn_to_hva_many(slot: &KvmMemorySlot, gfn: u64, nr_pages: &mut u64, write: 
 // 计算 HVA 对应的 pfn，同时确保该物理页在内存中
 // host端虚拟地址到物理地址的转换，有两种方式，hva_to_pfn_fast、hva_to_pfn_slow
 // 正确性待验证
-fn hva_to_pfn(addr: u64, atomic: bool, writable: &mut bool) -> Result<u64, SystemError>{
+fn hva_to_pfn(addr: u64, _atomic: bool, _writable: &mut bool) -> Result<u64, SystemError>{
     // let hpa = MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() as u64;
-    let hva = VirtAddr::new(addr);
-    let mapper = KernelMapper::lock();
-    if let Some(hpa) = mapper.translate(hva){
-        return Ok(hpa >> PAGE_SHIFT);
+    let hva = VirtAddr::new(addr as usize);
+    let mut mapper = KernelMapper::lock();
+    let mapper = mapper.as_mut().unwrap();
+    if let Some((hpa, _)) = mapper.translate(hva){
+        return Ok(hpa.data() as u64 >> PAGE_SHIFT);
     }
     unsafe{
-        mapper.map(hva, PageFlags::mmio_flags())?;
+        mapper.map(hva, PageFlags::mmio_flags());
     }
-    let hpa = mapper.translate(hva)?;
-    return Ok(hpa >> PAGE_SHIFT);
+    let (hpa, _) = mapper.translate(hva).unwrap();
+    return Ok(hpa.data() as u64 >> PAGE_SHIFT);
 }
 
-pub fn __gfn_to_pfn(slot: &KvmMemorySlot, gfn: u64, atomic: bool, write: bool, writable: &mut bool) -> Result<u64, SystemError>{
-    let addr = __gfn_to_hva_many(slot, gfn, None, write)?;
+pub fn __gfn_to_pfn(slot: Option<KvmMemorySlot>, gfn: u64, atomic: bool, write: bool, writable: &mut bool) -> Result<u64, SystemError>{
+    let mut nr_pages = 0;
+    let addr = __gfn_to_hva_many(slot, gfn, Some(&mut nr_pages), write)?;
     let pfn = hva_to_pfn(addr, atomic, writable)?;
     return Ok(pfn);
 }
 
 
-pub fn kvm_vcpu_gfn_to_memslot(vcpu: &mut dyn Vcpu, gfn: u64) ->Option<&KvmMemorySlot>{
+pub fn kvm_vcpu_gfn_to_memslot(vcpu: &mut dyn Vcpu, gfn: u64) ->Option<KvmMemorySlot>{
     return __gfn_to_memslot(kvm_vcpu_memslots(vcpu), gfn);    
 }

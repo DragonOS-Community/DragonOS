@@ -1,14 +1,10 @@
 use alloc::sync::Arc;
-use core::arch::asm;
 use core::ptr::null_mut;
 
-use crate::arch::kvm::guest_code;
 use crate::kdebug;
 use crate::filesystem::devfs::devfs_register;
 use self::kvm_dev::LockedKvmInode;
-use vcpu::Vcpu;
 use hypervisor::Hypervisor;
-use crate::arch::x86_64::kvm::vmx::vcpu::VmxVcpu;
 use crate::arch::KVMArch;
 use crate::libs::mutex::Mutex;
 

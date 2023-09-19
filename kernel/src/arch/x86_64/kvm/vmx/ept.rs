@@ -6,12 +6,10 @@ use x86::msr;
 use crate::arch::MMArch;
 use crate::arch::mm::PageMapper;
 use crate::mm::page::PageFlags;
-use crate::mm::{PhysAddr, VirtAddr, PageTableKind};
+use crate::mm::{PhysAddr, PageTableKind, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
-use crate::virt::kvm::host_mem::PAGE_SHIFT;
 use crate::{syscall::SystemError, arch::mm::LockedFrameAllocator};
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
-use super::mmu::PT64_ROOT_LEVEL;
 use super::vcpu::PAGE_SIZE;
 
 pub const PT64_LEVEL_BITS: u64 = 9;
@@ -270,7 +268,7 @@ fn initializeEptp(num_pages: usize) -> Result<*mut EPTP, SystemError>{
 
 
 /// Check if MTRR is supported
-fn check_ept_features() -> Result<(), SystemError> {
+pub fn check_ept_features() -> Result<(), SystemError> {
     const MTRR_ENABLE_BIT: u64 = 1 << 11;
     let ia32_mtrr_def_type = unsafe { msr::rdmsr(msr::IA32_MTRR_DEF_TYPE) };
     if (ia32_mtrr_def_type & MTRR_ENABLE_BIT) == 0 {
@@ -280,6 +278,10 @@ fn check_ept_features() -> Result<(), SystemError> {
     Ok(())
 }
 
+pub fn ept_build_mtrr_map() -> Result<(), SystemError> {
+    let ia32_mtrr_cap = unsafe { msr::rdmsr(msr::IA32_MTRRCAP) };
+    Ok(())
+}
 /// 标志当前没有处理器持有内核映射器的锁
 /// 之所以需要这个标志，是因为AtomicUsize::new(0)会把0当作一个处理器的id
 const EPT_MAPPER_NO_PROCESSOR: usize = !0;
@@ -352,7 +354,7 @@ impl EptMapper {
         if self.readonly {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
-        self.mapper.map_phys(gpa, hpa, flags).unwrap();
+        self.mapper.map_phys(VirtAddr::new(gpa as usize), PhysAddr::new(hpa as usize), flags).unwrap();
         return Ok(());
     }
 

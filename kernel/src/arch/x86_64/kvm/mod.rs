@@ -1,7 +1,10 @@
 use core::arch::asm;
 
+use alloc::boxed::Box;
 use alloc::collections::LinkedList;
+use alloc::sync::Arc;
 use raw_cpuid::CpuId;
+use crate::libs::mutex::Mutex;
 use crate::virt::kvm::host_mem::{KvmMemorySlot, KvmUserspaceMemoryRegion, KvmMemoryChange};
 use crate::{
     kerror, kdebug,
@@ -11,16 +14,15 @@ use crate::{
 // use crate::virt::kvm::guest_code;
 use crate::virt::kvm::{HOST_STACK_SIZE, GUEST_STACK_SIZE};
 use crate::virt::kvm::KVM;
-use self::vmx::mmu::{kvm_mmu_calculate_mmu_pages, KvmMmuPage};
+use self::vmx::mmu::{kvm_mmu_calculate_mmu_pages, KvmMmuPage, kvm_mmu_setup, kvm_vcpu_mtrr_init};
 use self::vmx::vcpu::VmxVcpu;
-use crate::virt::kvm::vcpu::Vcpu;
-use alloc::boxed::Box;
 pub mod vmx;
 
 pub const KVM_MMU_HASH_SHIFT: u32 = 10;
 pub const KVM_NUM_MMU_PAGES: u32 = 1 << KVM_MMU_HASH_SHIFT;
 pub const KVM_NR_MEM_OBJS:u32 = 40;
 
+#[derive(Default)]
 pub struct X86_64KVMArch {
     n_used_mmu_pages: u32,
     n_requested_mmu_pages: u32, 
@@ -67,43 +69,46 @@ impl X86_64KVMArch{
         }
     }
 
-    pub fn kvm_arch_vcpu_create(id:u32) -> Result<Box<dyn Vcpu>, SystemError> {
+    pub fn kvm_arch_vcpu_create(id:u32) -> Result<Arc<Mutex<Box<VmxVcpu>>>, SystemError> {
         let current_kvm = KVM();
         let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
         let host_stack = vec![0xCC; HOST_STACK_SIZE];
-        let vcpu = Box::new(
+        // let guest_rip = current_kvm.lock().memslots[0].memslots[0].userspace_addr;
+        let vcpu = Arc::new(Mutex::new(Box::new(
             VmxVcpu::new(
                 id, 
                 current_kvm.clone(), 
                 (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64,
                 guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64, 
                 guest_code as *const () as u64
+                // guest_rip,
             ).unwrap()
-        );
+        )));
         return Ok(vcpu);
     }
     
-    pub fn kvm_arch_vcpu_setup(vcpu: &mut dyn Vcpu) -> Result<(), SystemError> {
+    pub fn kvm_arch_vcpu_setup(vcpu: &Mutex<Box<VmxVcpu>>) -> Result<(), SystemError> {
         // TODO: kvm_vcpu_mtrr_init(vcpu);
+        kvm_vcpu_mtrr_init(vcpu)?;
         kvm_mmu_setup(vcpu);
         Ok(())
     }
-    pub fn kvm_arch_create_memslot(slot: &mut KvmMemorySlot, npages: u64) {
+    pub fn kvm_arch_create_memslot(_slot: &mut KvmMemorySlot, _npages: u64) {
 
     }
 
     pub fn kvm_arch_commit_memory_region(
-        mem: &KvmUserspaceMemoryRegion, 
-        new_slot: &KvmMemorySlot, 
-        old_slot: &KvmMemorySlot,
-        change: KvmMemoryChange) {
+        _mem: &KvmUserspaceMemoryRegion, 
+        _new_slot: &KvmMemorySlot,
+        _old_slot: &KvmMemorySlot,
+        _change: KvmMemoryChange) {
             let kvm = KVM();
             let mut num_mmu_pages = 0;
-            if !kvm.arch.n_requested_mmu_pages {
+            if kvm.lock().arch.n_requested_mmu_pages == 0{
 		        num_mmu_pages = kvm_mmu_calculate_mmu_pages();
             }
-            if num_mmu_pages {
-                kvm_mmu_change_mmu_pages(num_mmu_pages);
+            if num_mmu_pages != 0 {
+                // kvm_mmu_change_mmu_pages(num_mmu_pages);
             }
     }
 }

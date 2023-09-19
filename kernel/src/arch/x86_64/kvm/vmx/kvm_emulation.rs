@@ -1,4 +1,4 @@
-pub struct x86_exception {
+pub struct X86Exception {
 	vector: u8,
 	error_code_valid: bool,
 	error_code: u16,

@@ -150,7 +150,7 @@ impl IndexNode for LockedVmInode {
             },
             KVM_CREATE_VCPU => {
                 kdebug!("kvm_vcpu ioctl KVM_CREATE_VCPU");
-                kvm_vm_ioctl_create_vcpu(data)
+                kvm_vm_ioctl_create_vcpu(data as u32)
             },
             KVM_SET_USER_MEMORY_REGION => {
                 kdebug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
@@ -171,7 +171,7 @@ impl IndexNode for LockedVmInode {
                     kvm_userspace_mem.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
                     kvm_userspace_mem.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
                 );
-                KVM().lock().set_user_memory_region(&kvm_userspace_mem);
+                KVM().lock().set_user_memory_region(&kvm_userspace_mem)?;
                 Ok(0)
             },
             KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS=> {
@@ -206,11 +206,11 @@ impl IndexNode for LockedVmInode {
     }
 }
 
-fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
-    let vcpu = KVMArch::kvm_arch_vcpu_create(0);
-    KVMArch::kvm_arch_vcpu_setup(&vcpu.unwrap());
+fn kvm_vm_ioctl_create_vcpu(_id: u32) -> Result<usize, SystemError>{
+    let vcpu = KVMArch::kvm_arch_vcpu_create(0).unwrap();
+    KVMArch::kvm_arch_vcpu_setup(vcpu.as_ref());
 
-    KVM().lock().vcpu.push(vcpu.unwrap());
+    KVM().lock().vcpu.push(vcpu);
     KVM().lock().nr_vcpus += 1;
 
     let vcpu_inode = LockedVcpuInode::new();

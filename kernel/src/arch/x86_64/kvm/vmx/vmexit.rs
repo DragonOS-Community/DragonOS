@@ -1,8 +1,8 @@
 use super::vmx_asm_wrapper::{
    vmx_vmwrite, vmx_vmread
 };
-use crate::syscall::SystemError;
-use x86::cpuid::cpuid;
+use crate::{syscall::SystemError, virt::kvm::KVM};
+use x86::{cpuid::cpuid, vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL};
 use core::arch::asm;
 use crate::kdebug;
 use super::vmcs::{VmcsFields, VmxExitReason};
@@ -178,7 +178,7 @@ pub extern "C" fn vmx_return(){
 }
 
 #[no_mangle]
-extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
+extern "C" fn vmexit_handler(_guest_cpu_context_ptr: *mut GuestCpuContext){
     // let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
     // kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
     kdebug!("vmexit handler!");
@@ -186,9 +186,9 @@ extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
     let exit_reason = vmx_vmread(VmcsFields::VMEXIT_EXIT_REASON as u32).unwrap() as u32;
     let exit_basic_reason = exit_reason & 0x0000_ffff;
     let guest_rip = vmx_vmread(VmcsFields::GUEST_RIP as u32).unwrap();
-    let guest_rsp = vmx_vmread(VmcsFields::GUEST_RSP as u32).unwrap();
+    // let guest_rsp = vmx_vmread(VmcsFields::GUEST_RSP as u32).unwrap();
     kdebug!("guest_rip={:x}", guest_rip);
-    let guest_rflags = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap();
+    let _guest_rflags = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap();
 
     match VmxExitReason::from(exit_basic_reason as i32) {
         VmxExitReason::VMCALL | VmxExitReason::VMCLEAR | VmxExitReason::VMLAUNCH | 
@@ -217,6 +217,22 @@ extern "C" fn vmexit_handler(guest_cpu_context_ptr: *mut GuestCpuContext){
             kdebug!("vmexit handler: triple fault!");
             adjust_rip(guest_rip).unwrap();
         },
+        VmxExitReason::EPT_VIOLATION => {
+            kdebug!("vmexit handler: ept violation!");
+            let gpa = vmx_vmread(GUEST_PHYSICAL_ADDR_FULL as u32).unwrap();
+            let exit_qualification = vmx_vmread(VmcsFields::VMEXIT_QUALIFICATION as u32).unwrap();
+            /* It is a write fault? */
+            let mut error_code = exit_qualification & (1 << 1);
+            /* It is a fetch fault? */
+            error_code |= (exit_qualification << 2) & (1 << 4);
+            /* ept page table is present? */
+            error_code |= (exit_qualification >> 3) & (1 << 0);
+            let kvm = KVM();
+            let vcpu = &KVM().lock().vcpu[0];
+            let kvm_ept_page_fault = (*vcpu.lock()).mmu.page_fault.unwrap();
+            // kvm_ept_page_fault();
+
+        }
         _ => {
             kdebug!("vmexit handler: unhandled vmexit reason: {}!", exit_basic_reason);
             adjust_rip(guest_rip).unwrap();

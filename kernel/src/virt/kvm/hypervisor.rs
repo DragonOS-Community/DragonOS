@@ -1,9 +1,11 @@
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::KVMArch;
+use crate::arch::kvm::vmx::vcpu::VmxVcpu;
+use crate::libs::mutex::Mutex;
 use crate::syscall::SystemError;
-use crate::virt::kvm::Vcpu;
 
 use super::HOST_STACK_SIZE;
 use super::host_mem::{KvmUserspaceMemoryRegion, KVM_MEM_LOG_DIRTY_PAGES,KVM_ADDRESS_SPACE_NUM, KVM_MEM_SLOTS_NUM,
@@ -14,9 +16,8 @@ use crate::arch::kvm::vmx::vmcs::PAGE_SIZE;
 // use crate::kdebug;
 
 pub struct Hypervisor {
-    // sys_fd: u32,	/* For system ioctls(), i.e. /dev/kvm */
     pub nr_vcpus: u32,  /* Number of cpus to run */
-    pub vcpu: Vec<Box<dyn Vcpu>>,
+    pub vcpu: Vec<Arc<Mutex<Box<VmxVcpu>>>>,
     pub host_stack: Vec<u8>,
     pub mem_slots_num: u64,
     pub memslots: [KvmMemorySlots; KVM_ADDRESS_SPACE_NUM],
@@ -34,7 +35,7 @@ pub struct Hypervisor {
 }
 
 impl Hypervisor {
-    pub fn new(nr_vcpus: u32, host_stack: u64, mem_slots_num: u64) -> Result<Self, SystemError> {
+    pub fn new(nr_vcpus: u32, _host_stack: u64, mem_slots_num: u64) -> Result<Self, SystemError> {
         let vcpu = Vec::new();
         // for i in 0..nr_vcpus {
         //     vcpu.push(Vcpu::new(i, Arc::new(hypervisor))?);
@@ -45,7 +46,8 @@ impl Hypervisor {
             vcpu,
             host_stack: vec![0xCC; HOST_STACK_SIZE],
             mem_slots_num,
-            memslots: [Vec::new();KVM_ADDRESS_SPACE_NUM],
+            memslots: [KvmMemorySlots::default();KVM_ADDRESS_SPACE_NUM],
+            arch: Default::default(),
         };
         Ok(instance)
     }
@@ -57,7 +59,7 @@ impl Hypervisor {
         let as_id = mem.slot >> 16;    // address space id
 
         // 检查slot是否合法
-        if mem.slot as usize >= self.mem_slots as usize {
+        if mem.slot as usize >= self.mem_slots_num as usize {
             return Err(SystemError::EINVAL);
         }
         // 检查flags是否合法
@@ -67,12 +69,13 @@ impl Hypervisor {
             return Err(SystemError::EINVAL);
         }
         // 检查地址空间是否合法
-        if as_id >= KVM_ADDRESS_SPACE_NUM || id >= KVM_MEM_SLOTS_NUM {
+        if as_id >= (KVM_ADDRESS_SPACE_NUM as u32) || id >= KVM_MEM_SLOTS_NUM as u16 {
             return Err(SystemError::EINVAL);
         }
         if mem.memory_size < 0 {
             return Err(SystemError::EINVAL);
         }
+
         let slot = &self.memslots[as_id as usize].memslots[id as usize];
         let base_gfn = mem.guest_phys_addr >> PAGE_SHIFT;
         let npages = mem.memory_size >> PAGE_SHIFT;
@@ -82,10 +85,10 @@ impl Hypervisor {
         let change: KvmMemoryChange;
 
         let old_slot = slot;
-        let new_slot = KvmMemorySlot{
+        let mut new_slot = KvmMemorySlot{
             base_gfn, // 虚机内存区间起始物理页框号
             npages,   // 虚机内存区间页数，即内存区间的大小
-            dirty_bitmap: old_slot.dirty_bitmap, 
+            // dirty_bitmap: old_slot.dirty_bitmap, 
             userspace_addr: old_slot.userspace_addr,  // 虚机内存区间对应的主机虚拟地址
             flags: mem.flags,    // 虚机内存区间属性
             id,       // 虚机内存区间id
@@ -93,7 +96,7 @@ impl Hypervisor {
         
 
         // 判断新memoryslot的类型
-        if npages { //映射内存有大小，不是删除内存条
+        if npages != 0 { //映射内存有大小，不是删除内存条
             if old_slot.npages == 0 { //内存槽号没有虚拟内存条，意味内存新创建
                 change = KvmMemoryChange::Create;
             }
@@ -101,7 +104,7 @@ impl Hypervisor {
                 // 检查内存条是否可以修改
                 if mem.userspace_addr != old_slot.userspace_addr ||
                     npages !=old_slot.npages ||
-                    new_slot.flags ^ old_slot.flags & KVM_MEM_READONLY {
+                    (new_slot.flags ^ old_slot.flags & KVM_MEM_READONLY) != 0 {
                     return Err(SystemError::EINVAL);
                 }
                 if new_slot.base_gfn != old_slot.base_gfn { //guest地址不同，内存条平移
@@ -126,7 +129,7 @@ impl Hypervisor {
             // 检查内存区域是否重叠
             for i in 0..KVM_MEM_SLOTS_NUM {
                 let memslot = &self.memslots[as_id as usize].memslots[i as usize];
-                if memslot.id == id || memslot.id >=KVM_USER_MEM_SLOTS {
+                if memslot.id == id || memslot.id as u32 >=KVM_USER_MEM_SLOTS {
                     continue;
                 }
                 // 当前已有的slot与new在guest物理地址上有交集
@@ -137,26 +140,26 @@ impl Hypervisor {
         }
 
         if !(new_slot.flags & KVM_MEM_LOG_DIRTY_PAGES != 0) {
-            new_slot.dirty_bitmap = 0;
+            // new_slot.dirty_bitmap = 0;
         }
 
         // 根据flags的值，决定是否创建内存脏页
-        if (new_slot.flags & KVM_MEM_LOG_DIRTY_PAGES) && new_slot.dirty_bitmap == 0 {
-            let type_size = core::mem::size_of::<u64>() as u64;
-            let dirty_bytes = 2 * ((new_slot.npages+type_size-1) / type_size) / 8;
-            new_slot.dirty_bitmap = Box::new(vec![0; dirty_bytes as u8]);
-        }
+        // if (new_slot.flags & KVM_MEM_LOG_DIRTY_PAGES)!=0 && new_slot.dirty_bitmap == 0 {
+        //     let type_size = core::mem::size_of::<u64>() as u64;
+        //     let dirty_bytes = 2 * ((new_slot.npages+type_size-1) / type_size) / 8;
+            // new_slot.dirty_bitmap = Box::new(vec![0; dirty_bytes as u8]);
+        // }
 
         if change == KvmMemoryChange::Create {
             new_slot.userspace_addr = mem.userspace_addr;
-            self.memslots[as_id as usize].memslots[id as usize] = new_slot;
+            let mut memslots = self.memslots[as_id as usize].memslots.clone();
+            memslots[id as usize] = new_slot;
+            self.memslots[as_id as usize].memslots = memslots;
             self.memslots[as_id as usize].used_slots += 1;
             // KVMArch::kvm_arch_create_memslot(&mut new_slot, npages);
-            KVMArch::kvm_arch_commit_memory_region(mem, &new_slot, old_slot, change)?;
+            // KVMArch::kvm_arch_commit_memory_region(mem, &new_slot, old_slot, change);
         }
         // TODO--KvmMemoryChange::Delete & Move
-        
-
         Ok(())
 
 

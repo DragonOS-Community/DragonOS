@@ -13,6 +13,7 @@ use crate::{
     filesystem::vfs::{
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
+        syscall::ModeType,
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
     kerror,
@@ -189,7 +190,7 @@ impl LockedFATInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: file_type,
-                mode: 0o777,
+                mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -308,7 +309,7 @@ impl FATFileSystem {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: 0o777,
+                mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -1421,7 +1422,7 @@ impl IndexNode for LockedFATInode {
         &self,
         name: &str,
         file_type: FileType,
-        _mode: u32,
+        _mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
@@ -1627,7 +1628,7 @@ impl IndexNode for LockedFATInode {
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -1640,14 +1641,24 @@ impl IndexNode for LockedFATInode {
                 let mut key: Vec<String> = guard
                     .children
                     .keys()
-                    .filter(|k| guard.children.get(*k).unwrap().metadata().unwrap().inode_id == ino)
+                    .filter(|k| {
+                        guard
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .metadata()
+                            .unwrap()
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
-                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
+                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
                 }
             }
         }

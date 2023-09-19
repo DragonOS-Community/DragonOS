@@ -7,20 +7,20 @@ pub mod mount;
 pub mod syscall;
 mod utils;
 
-use ::core::{any::Any, fmt::Debug};
+use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec};
 
-use self::{core::generate_inode_id, file::FileMode};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: usize = 1024;
 
-/// 定义inode号的类型为usize
-pub type InodeId = usize;
+// 定义inode号
+int_like!(InodeId, AtomicInodeId, usize, AtomicUsize);
 
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +185,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-EOPNOTSUPP_OR_ENOTSUP)的返回值
         return self.create_with_data(name, file_type, mode, 0);
@@ -204,7 +204,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         &self,
         _name: &str,
         _file_type: FileType,
-        _mode: u32,
+        _mode: ModeType,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
@@ -477,7 +477,7 @@ pub struct Metadata {
     pub file_type: FileType,
 
     /// 权限
-    pub mode: u32,
+    pub mode: ModeType,
 
     /// 硬链接的数量
     pub nlinks: usize,
@@ -496,7 +496,7 @@ impl Default for Metadata {
     fn default() -> Self {
         return Self {
             dev_id: 0,
-            inode_id: 0,
+            inode_id: InodeId::new(0),
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -504,7 +504,7 @@ impl Default for Metadata {
             mtime: TimeSpec::default(),
             ctime: TimeSpec::default(),
             file_type: FileType::File,
-            mode: 0,
+            mode: ModeType::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -551,7 +551,7 @@ pub struct Dirent {
 }
 
 impl Metadata {
-    pub fn new(file_type: FileType, mode: u32) -> Self {
+    pub fn new(file_type: FileType, mode: ModeType) -> Self {
         Metadata {
             dev_id: 0,
             inode_id: generate_inode_id(),

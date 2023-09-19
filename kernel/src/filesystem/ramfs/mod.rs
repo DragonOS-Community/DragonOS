@@ -15,7 +15,8 @@ use crate::{
 };
 
 use super::vfs::{
-    file::FilePrivateData, FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
+    file::FilePrivateData, syscall::ModeType, FileSystem, FsInfo, IndexNode, InodeId, Metadata,
+    PollStatus,
 };
 
 /// RamFS的inode名称的最大长度
@@ -90,7 +91,7 @@ impl RamFS {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: 0o777,
+                mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -258,7 +259,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
@@ -425,7 +426,7 @@ impl IndexNode for LockedRamFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -438,14 +439,25 @@ impl IndexNode for LockedRamFSInode {
                 let mut key: Vec<String> = inode
                     .children
                     .keys()
-                    .filter(|k| inode.children.get(*k).unwrap().0.lock().metadata.inode_id == ino)
+                    .filter(|k| {
+                        inode
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .0
+                            .lock()
+                            .metadata
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
-                    _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                 }
             }
         }

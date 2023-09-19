@@ -1,5 +1,6 @@
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::make_rawdev;
+use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
 };
@@ -43,7 +44,7 @@ impl LockedNullInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

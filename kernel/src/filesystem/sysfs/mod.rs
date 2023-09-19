@@ -1,9 +1,13 @@
+use core::fmt::Debug;
+
+use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
+
 use super::vfs::{
-    core::generate_inode_id, file::FileMode, FileSystem, FileType, FsInfo, IndexNode, Metadata,
-    PollStatus,
+    core::generate_inode_id, file::FileMode, syscall::ModeType, FileSystem, FileType, FsInfo,
+    IndexNode, Metadata, PollStatus,
 };
 use crate::{
-    driver::base::platform::platform_bus_init,
+    driver::base::{device::KObject, platform::platform_bus_init},
     filesystem::{sysfs::bus::sys_bus_init, vfs::ROOT_INODE},
     kdebug, kinfo,
     libs::{
@@ -23,6 +27,8 @@ use alloc::{
 pub mod bus;
 pub mod class;
 pub mod devices;
+mod dir;
+mod file;
 pub mod fs;
 
 const SYSFS_MAX_NAMELEN: usize = 64;
@@ -98,7 +104,7 @@ impl SysFS {
         let root: Arc<LockedSysFSInode> = Arc::new(LockedSysFSInode(SpinLock::new(
             // /sys 的权限设置为 读+执行，root 可以读写
             // root 的 parent 是空指针
-            SysFSInode::new(FileType::Dir, 0o755 as u32, 0),
+            SysFSInode::new(FileType::Dir, ModeType::from_bits_truncate(0o755), 0),
         )));
 
         let sysfs: Arc<SysFS> = Arc::new(SysFS { root_inode: root });
@@ -220,7 +226,7 @@ impl IndexNode for LockedSysFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -233,14 +239,24 @@ impl IndexNode for LockedSysFSInode {
                 let mut key: Vec<String> = inode
                     .children
                     .keys()
-                    .filter(|k| inode.children.get(*k).unwrap().metadata().unwrap().inode_id == ino)
+                    .filter(|k| {
+                        inode
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .metadata()
+                            .unwrap()
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
-                    _ => panic!("Sysfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    _ => panic!("Sysfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                 }
             }
         }
@@ -294,17 +310,17 @@ impl LockedSysFSInode {
     fn do_create_with_data(
         &self,
         mut guard: SpinLockGuard<SysFSInode>,
-        _name: &str,
-        _file_type: FileType,
-        _mode: u32,
-        _data: usize,
+        name: &str,
+        file_type: FileType,
+        mode: ModeType,
+        data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
         // 如果有重名的，则返回
-        if guard.children.contains_key(_name) {
+        if guard.children.contains_key(name) {
             return Err(SystemError::EEXIST);
         }
 
@@ -322,12 +338,12 @@ impl LockedSysFSInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: _file_type,
-                mode: _mode,
+                file_type,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: _data,
+                raw_dev: data,
             },
             fs: guard.fs.clone(),
         })));
@@ -336,7 +352,7 @@ impl LockedSysFSInode {
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        guard.children.insert(String::from(_name), result.clone());
+        guard.children.insert(String::from(name), result.clone());
         return Ok(result);
     }
 
@@ -352,7 +368,13 @@ impl LockedSysFSInode {
             return Err(SystemError::EEXIST);
         }
 
-        match self.do_create_with_data(guard, name, FileType::Dir, 0o755 as u32, 0) {
+        match self.do_create_with_data(
+            guard,
+            name,
+            FileType::Dir,
+            ModeType::from_bits_truncate(0o755),
+            0,
+        ) {
             Ok(inode) => return Ok(inode),
             Err(err) => {
                 return Err(err);
@@ -421,14 +443,14 @@ pub struct SysFSInode {
 }
 
 impl SysFSInode {
-    pub fn new(dev_type_: FileType, mode_: u32, data_: usize) -> Self {
-        return Self::new_with_parent(Weak::default(), dev_type_, mode_, data_);
+    pub fn new(file_type: FileType, mode: ModeType, data_: usize) -> Self {
+        return Self::new_with_parent(Weak::default(), file_type, mode, data_);
     }
 
     pub fn new_with_parent(
         parent: Weak<LockedSysFSInode>,
-        dev_type_: FileType,
-        mode_: u32,
+        file_type: FileType,
+        mode: ModeType,
         data_: usize,
     ) -> Self {
         return SysFSInode {
@@ -444,8 +466,8 @@ impl SysFSInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: dev_type_, // 文件夹
-                mode: mode_,
+                file_type,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -484,4 +506,25 @@ pub fn sysfs_init() -> Result<(), SystemError> {
     });
 
     return result.unwrap();
+}
+
+/// SysFS在KernFS的inode中的私有信息
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum SysFSKernPrivateData {
+    Dir(SysKernDirPriv),
+    File(SysKernFilePriv),
+}
+
+/// sysfs文件目录的属性组
+pub trait AttributeGroup: Debug + Send + Sync {
+    fn name(&self) -> &str;
+    fn attrs(&self) -> &[&'static dyn Attribute];
+    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> bool;
+}
+
+/// sysfs文件的属性
+pub trait Attribute: Debug + Send + Sync {
+    fn name(&self) -> &str;
+    fn mode(&self) -> ModeType;
 }

@@ -5,8 +5,8 @@ use alloc::sync::Arc;
 use crate::{
     include::bindings::bindings::{pt_regs, SA_FLAG_DFL},
     ipc::signal_types::{SigFlags, SigSet, SigactionType},
-    kwarn,
-    process::{Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    kdebug, kwarn,
+    process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     syscall::SystemError,
 };
 
@@ -73,7 +73,7 @@ fn signal_kill_proc_info(
     // println!("Target pcb = {:?}", pcb.as_ref().unwrap());
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // step3: 调用signal_send_sig_info函数，发送信息
-    retval = signal_send_sig_info(sig, info, pcb.unwrap(), PidType::Pid);
+    retval = signal_send_sig_info(sig, info, pcb.unwrap(), PidType::PID);
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // step4: 解锁
     return retval;

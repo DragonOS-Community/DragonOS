@@ -47,9 +47,9 @@ pub mod fork;
 pub mod idle;
 pub mod init;
 pub mod kthread;
+pub mod pid;
 pub mod process;
 pub mod syscall;
-pub mod pid;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
@@ -168,6 +168,35 @@ impl ProcessManager {
             let mut writer = pcb.sched_info_mut();
             let state = writer.state();
             if state.is_blocked() {
+                writer.set_state(ProcessState::Runnable);
+                // avoid deadlock
+                drop(writer);
+
+                sched_enqueue(pcb.clone(), true);
+                return Ok(());
+            } else if state.is_exited() {
+                return Err(SystemError::EINVAL);
+            } else {
+                return Ok(());
+            }
+        } else if state.is_exited() {
+            return Err(SystemError::EINVAL);
+        } else {
+            return Ok(());
+        }
+    }
+
+    /// 唤醒一个进程
+    pub fn wakeup_state(
+        pcb: &Arc<ProcessControlBlock>,
+        state: ProcessFlags,
+    ) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let state = pcb.sched_info().state();
+        if state.is_blocked() {
+            let mut writer = pcb.sched_info_mut();
+            let state = writer.state();
+            if state.is_blocked() && pcb.flags().contains(state) {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);
@@ -397,8 +426,8 @@ pub struct ProcessControlBlock {
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
-    /// 与信号处理相关的信息(无锁)
-    sig_info: ProcessSignalInfo,
+    /// 与信号处理相关的信息
+    sig_info: RwLock<ProcessSignalInfo>,
 
     /// 父进程指针
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
@@ -464,7 +493,7 @@ impl ProcessControlBlock {
             worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
-            sig_info: ProcessSignalInfo::default(),
+            sig_info: RwLock::new(ProcessSignalInfo::default()),
             parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(HashMap::new()),
             wait_queue: WaitQueue::INIT,
@@ -644,14 +673,13 @@ impl ProcessControlBlock {
         return name;
     }
 
-    pub fn sig_info(&self) -> &ProcessSignalInfo {
-        &self.sig_info
+    pub fn sig_info(&self) -> RwLockReadGuard<ProcessSignalInfo> {
+        self.sig_info.read()
     }
 
-    pub fn sig_info_mut(&mut self) -> &mut ProcessSignalInfo {
-        &mut self.sig_info
+    pub fn sig_info_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
+        self.sig_info.write()
     }
-
 }
 
 impl Drop for ProcessControlBlock {

@@ -1,9 +1,7 @@
 #include "syscall.h"
 #include <common/errno.h>
 #include <common/fcntl.h>
-#include <common/kthread.h>
 #include <common/string.h>
-#include <driver/disk/ahci/ahci.h>
 #include <exception/gate.h>
 #include <exception/irq.h>
 #include <filesystem/vfs/VFS.h>
@@ -12,13 +10,6 @@
 #include <time/sleep.h>
 // 导出系统调用入口函数，定义在entry.S中
 extern void syscall_int(void);
-
-/**
- * @brief 重新定义为：把系统调用函数加入系统调用表
- * @param syscall_num 系统调用号
- * @param symbol 系统调用处理函数
- */
-#define SYSCALL_COMMON(syscall_num, symbol) [syscall_num] = symbol,
 
 /**
  * @brief 通过中断进入系统调用
@@ -73,45 +64,4 @@ ul do_put_string(char *s, uint32_t front_color, uint32_t background_color)
     return 0;
 }
 
-/**
- * @brief 等待进程退出
- *
- * @param pid 目标进程id
- * @param status 返回的状态信息
- * @param options 等待选项
- * @param rusage
- * @return uint64_t
- */
-uint64_t c_sys_wait4(pid_t pid, int *status, int options, void *rusage)
-{
 
-    struct process_control_block *proc = NULL;
-    struct process_control_block *child_proc = NULL;
-
-    // 查找pid为指定值的进程
-    // ps: 这里判断子进程的方法没有按照posix 2008来写。
-    // todo: 根据进程树判断是否为当前进程的子进程
-    // todo: 当进程管理模块拥有pcblist_lock之后，调用之前，应当对其加锁
-    child_proc = process_find_pcb_by_pid(pid);
-
-    if (child_proc == NULL)
-        return -ECHILD;
-
-    // 暂时不支持options选项，该值目前必须为0
-    if (options != 0)
-        return -EINVAL;
-
-    // 如果子进程没有退出，则等待其退出
-    // BUG: 这里存在问题，由于未对进程管理模块加锁，因此可能会出现子进程退出后，父进程还在等待的情况
-    // （子进程退出后，process_exit_notify消息丢失）
-    while (child_proc->state != PROC_ZOMBIE)
-        wait_queue_sleep_on_interriptible(&current_pcb->wait_child_proc_exit);
-
-    // 拷贝子进程的返回码
-    if (likely(status != NULL))
-        *status = child_proc->exit_code;
-    // copy_to_user(status, (void*)child_proc->exit_code, sizeof(int));
-
-    process_release_pcb(child_proc);
-    return 0;
-}

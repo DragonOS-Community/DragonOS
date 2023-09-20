@@ -1,8 +1,10 @@
-
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
 CFLAGS += -I .
 
+.PHONY: all
 
-all: syscall.o
+all: $(OBJ)
 
-syscall.o: syscall.c
-	$(CC) $(CFLAGS) -c syscall.c -o syscall.o
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@

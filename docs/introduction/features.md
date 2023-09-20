@@ -90,6 +90,7 @@
 - [x] 屏幕管理器
 - [x] textui框架
 - [x] CRC函数库
+- [x] 通知链
 
 ### 系统调用
 
@@ -144,3 +145,4 @@
 - [x] mpfr 4.1.1 [https://github.com/DragonOS-Community/mpfr](https://github.com/DragonOS-Community/mpfr)
 - [x] mpc 1.2.1 [https://github.com/DragonOS-Community/mpc](https://github.com/DragonOS-Community/mpc)
 - [x] relibc [https://github.com/DragonOS-Community/relibc](https://github.com/DragonOS-Community/relibc)
+- [x] sqlite3

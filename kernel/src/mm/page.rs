@@ -689,6 +689,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ///
     /// ## 返回值
     /// 如果取消成功，返回刷新器，否则返回None
+    #[allow(dead_code)]
     pub unsafe fn unmap(&mut self, virt: VirtAddr, unmap_parents: bool) -> Option<PageFlush<Arch>> {
         let (paddr, _, flusher) = self.unmap_phys(virt, unmap_parents)?;
         self.frame_allocator.free_one(paddr);
@@ -802,7 +803,7 @@ impl<Arch, F: Debug> Debug for PageMapper<Arch, F> {
 }
 
 /// 页表刷新器的trait
-pub trait Flusher<Arch> {
+pub trait Flusher<Arch: MemoryManagementArch> {
     /// 取消对指定的page flusher的刷新
     fn consume(&mut self, flush: PageFlush<Arch>);
 }
@@ -810,7 +811,7 @@ pub trait Flusher<Arch> {
 /// 用于刷新某个虚拟地址的刷新器。这个刷新器一经产生，就必须调用flush()方法，
 /// 否则会造成对页表的更改被忽略，这是不安全的
 #[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
-pub struct PageFlush<Arch> {
+pub struct PageFlush<Arch: MemoryManagementArch> {
     virt: VirtAddr,
     phantom: PhantomData<Arch>,
 }
@@ -830,6 +831,14 @@ impl<Arch: MemoryManagementArch> PageFlush<Arch> {
     /// 忽略掉这个刷新器
     pub unsafe fn ignore(self) {
         mem::forget(self);
+    }
+}
+
+impl<Arch: MemoryManagementArch> Drop for PageFlush<Arch> {
+    fn drop(&mut self) {
+        unsafe {
+            MMArch::invalidate_page(self.virt);
+        }
     }
 }
 

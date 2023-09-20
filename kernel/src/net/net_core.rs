@@ -126,7 +126,7 @@ pub fn poll_ifaces() {
     for (_, iface) in guard.iter() {
         iface.poll(&mut sockets).ok();
     }
-    SOCKET_WAITQUEUE.wakeup_all((-1i64) as u64);
+    SOCKET_WAITQUEUE.wakeup_all(None);
 }
 
 /// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。
@@ -154,7 +154,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         for (_, iface) in guard.iter() {
             iface.poll(&mut sockets).ok();
         }
-        SOCKET_WAITQUEUE.wakeup_all((-1i64) as u64);
+        SOCKET_WAITQUEUE.wakeup_all(None);
         return Ok(());
     }
 

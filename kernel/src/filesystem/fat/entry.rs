@@ -1,17 +1,16 @@
 #![allow(dead_code)]
-use core::cmp::min;
+use core::{cmp::min, intrinsics::unlikely};
 
+use crate::{
+    driver::base::block::{block_device::LBA_SIZE, SeekFrom},
+    kwarn,
+    libs::vec_cursor::VecCursor,
+    syscall::SystemError,
+};
 use alloc::{
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
-};
-
-use crate::{
-    io::{device::LBA_SIZE, SeekFrom},
-    kwarn,
-    libs::vec_cursor::VecCursor,
-    syscall::SystemError,
 };
 
 use super::{
@@ -131,7 +130,7 @@ impl FATFile {
 
             //  从磁盘上读取数据
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_offset;
-            let r = fs.partition.disk().device().read_at(
+            let r = fs.partition.disk().read_at_bytes(
                 offset as usize,
                 end_len,
                 &mut buf[start..start + end_len],
@@ -166,7 +165,6 @@ impl FATFile {
 
         // 要写入的第一个簇的簇号
         let start_cluster_num = offset / fs.bytes_per_cluster();
-
         // 获取要写入的第一个簇
         let mut current_cluster: Cluster = if let Some(c) =
             fs.get_cluster_by_relative(self.first_cluster, start_cluster_num as usize)
@@ -200,7 +198,7 @@ impl FATFile {
             // 计算本次写入位置在磁盘上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
             // 写入磁盘
-            let w: usize = fs.partition.disk().device().write_at(
+            let w: usize = fs.partition.disk().write_at(
                 offset as usize,
                 end_len,
                 &buf[start..start + end_len],
@@ -239,21 +237,25 @@ impl FATFile {
             return Ok(());
         }
 
+        // 计算文件的最后一个簇中有多少空闲空间
+        let in_cluster_offset = self.size() % fs.bytes_per_cluster();
+        let mut bytes_remain_in_cluster = if in_cluster_offset == 0 {
+            0
+        } else {
+            fs.bytes_per_cluster() - in_cluster_offset
+        };
+
+        // 计算还需要申请多少空间
+        let extra_bytes = min((offset + len) - self.size(), MAX_FILE_SIZE - self.size());
+
         // 如果文件大小为0,证明它还没有分配簇，因此分配一个簇给它
         if self.size() == 0 {
             // first_cluster应当为0,否则将产生空间泄露的错误
             assert_eq!(self.first_cluster, Cluster::default());
             self.first_cluster = fs.allocate_cluster(None)?;
             self.short_dir_entry.set_first_cluster(self.first_cluster);
+            bytes_remain_in_cluster = fs.bytes_per_cluster();
         }
-
-        // 计算文件的最后一个簇中有多少空闲空间
-
-        let in_cluster_offset = self.size() % fs.bytes_per_cluster();
-        let bytes_remain_in_cluster = fs.bytes_per_cluster() - in_cluster_offset;
-
-        // 计算还需要申请多少空间
-        let extra_bytes = min((offset + len) - self.size(), MAX_FILE_SIZE - self.size());
 
         // 如果还需要更多的簇
         if bytes_remain_in_cluster < extra_bytes {
@@ -324,11 +326,9 @@ impl FATFile {
         }
 
         let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
-        fs.partition.disk().device().write_at(
-            range_start as usize,
-            zeroes.len(),
-            zeroes.as_slice(),
-        )?;
+        fs.partition
+            .disk()
+            .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
         return Ok(());
     }
 
@@ -343,17 +343,24 @@ impl FATFile {
             return Ok(());
         }
 
-        let new_last_cluster = new_size / fs.bytes_per_cluster();
+        let new_last_cluster = (new_size + fs.bytes_per_cluster() - 1) / fs.bytes_per_cluster();
         if let Some(begin_delete) =
-            fs.get_cluster_by_relative(self.first_cluster, (new_last_cluster + 1) as usize)
+            fs.get_cluster_by_relative(self.first_cluster, new_last_cluster as usize)
         {
-            fs.deallocate_cluster(begin_delete)?;
+            fs.deallocate_cluster_chain(begin_delete)?;
         };
+
+        if new_size == 0 {
+            assert!(new_last_cluster == 0);
+            self.short_dir_entry.set_first_cluster(Cluster::new(0));
+            self.first_cluster = Cluster::new(0);
+        }
 
         self.set_size(new_size as u32);
         // 计算短目录项在磁盘内的字节偏移量
         let short_entry_offset = fs.cluster_bytes_offset((self.loc.1).0) + (self.loc.1).1;
         self.short_dir_entry.flush(fs, short_entry_offset)?;
+
         return Ok(());
     }
 }
@@ -603,11 +610,10 @@ impl FATDir {
                 LongDirEntry::validate_long_name(name)?;
                 // 目标目录项
                 let mut short_entry = ShortDirEntry::default();
-                // kdebug!("to allocate cluster");
+
                 let first_cluster: Cluster = fs.allocate_cluster(None)?;
                 short_entry.set_first_cluster(first_cluster);
 
-                // kdebug!("to create dot");
                 // === 接下来在子目录中创建'.'目录项和'..'目录项
                 let mut offset = 0;
                 // '.'目录项
@@ -623,7 +629,6 @@ impl FATDir {
                 // 偏移量加上一个目录项的长度
                 offset += FATRawDirEntry::DIR_ENTRY_LEN;
 
-                // kdebug!("to create dot dot");
                 // '..'目录项
                 let mut dot_dot_entry = ShortDirEntry::default();
                 dot_dot_entry.name = ShortNameGenerator::new("..").generate().unwrap();
@@ -1406,6 +1411,10 @@ impl FATDirIter {
     /// @return Err(错误码) 可能出现了内部错误，或者是磁盘错误等。具体原因看错误码。
     fn get_dir_entry(&mut self) -> Result<(Cluster, u64, Option<FATDirEntry>), SystemError> {
         loop {
+            if unlikely(self.current_cluster.cluster_num < 2) {
+                return Ok((self.current_cluster, self.offset, None));
+            }
+
             // 如果当前簇已经被读完，那么尝试获取下一个簇
             if self.offset >= self.fs.bytes_per_cluster() && !self.is_root {
                 match self.fs.get_fat_entry(self.current_cluster)? {

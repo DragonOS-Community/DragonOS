@@ -1,111 +1,35 @@
+use alloc::sync::Arc;
+
+use crate::{kerror, syscall::SystemError};
+
 use super::{
-    device::{mkdev, DeviceNumber, KObject},
-    map::{kobj_map, kobj_unmap, LockedKObjMap},
+    device::{mkdev, Device, DeviceNumber, IdTable, CHARDEVS, DEVICE_MANAGER, DEVMAP},
+    map::{
+        kobj_map, kobj_unmap, DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END,
+        DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX, MINOR_MASK,
+    },
 };
-use crate::{filesystem::vfs::IndexNode, kerror, libs::spinlock::SpinLock, syscall::SystemError};
-use alloc::{sync::Arc, vec::Vec};
-use core::cmp::Ordering;
 
-const CHARDEV_MAJOR_HASH_SIZE: usize = 255;
-const CHARDEV_MAJOR_MAX: usize = 512;
-const MINOR_BITS: usize = 20;
-const MINOR_MASK: usize = 1 << MINOR_BITS - 1;
-/* Marks the bottom of the first segment of free char majors */
-const CHARDEV_MAJOR_DYN_END: usize = 234;
-/* Marks the top and bottom of the second segment of free char majors */
-const CHARDEV_MAJOR_DYN_EXT_START: usize = 511;
-const CHARDEV_MAJOR_DYN_EXT_END: usize = 384;
+pub trait CharDevice: Device {
+    /// Notice buffer对应设备按字节划分，使用u8类型
+    /// Notice offset应该从0开始计数
 
-lazy_static! {
-    // 全局字符设备号管理实例
-    pub static ref CHARDEVS: Arc<LockedChrDevs> = Arc::new(LockedChrDevs::default());
+    /// @brief: 从设备的第offset个字节开始，读取len个byte，存放到buf中
+    /// @parameter offset: 起始字节偏移量
+    /// @parameter len: 读取字节的数量
+    /// @parameter buf: 目标数组
+    /// @return: 如果操作成功，返回操作的长度(单位是字节)；否则返回错误码；如果操作异常，但是并没有检查出什么错误，将返回已操作的长度
+    fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
 
-    // 全局字符设备管理实例
-    pub static ref CDEVMAP: Arc<LockedKObjMap> = Arc::new(LockedKObjMap::default());
-}
+    /// @brief: 从设备的第offset个字节开始，把buf数组的len个byte，写入到设备中
+    /// @parameter offset: 起始字节偏移量
+    /// @parameter len: 读取字节的数量
+    /// @parameter buf: 目标数组
+    /// @return: 如果操作成功，返回操作的长度(单位是字节)；否则返回错误码；如果操作异常，但是并没有检查出什么错误，将返回已操作的长度
+    fn write(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError>;
 
-pub trait CharDevice: KObject {
-    /// @brief: 打开设备
-    /// @parameter: file: devfs inode
-    /// @return: 打开成功，返回OK(())，失败，返回错误代码
-    fn open(&self, file: Arc<dyn IndexNode>) -> Result<(), SystemError>;
-
-    /// @brief: 关闭设备
-    /// @parameter: file: devfs inode
-    /// @return: 关闭成功，返回OK(())，失败，返回错误代码
-    fn close(&self, file: Arc<dyn IndexNode>) -> Result<(), SystemError>;
-}
-
-// 管理字符设备号的map(加锁)
-pub struct LockedChrDevs(SpinLock<ChrDevs>);
-
-impl Default for LockedChrDevs {
-    fn default() -> Self {
-        LockedChrDevs(SpinLock::new(ChrDevs::default()))
-    }
-}
-
-// 管理字符设备号的map
-#[derive(Debug)]
-struct ChrDevs(Vec<Vec<CharDeviceStruct>>);
-
-impl Default for ChrDevs {
-    fn default() -> Self {
-        ChrDevs(vec![Vec::new(); CHARDEV_MAJOR_HASH_SIZE])
-    }
-}
-
-// 字符设备在系统中的实例，devfs通过该结构与实际字符设备进行联系
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct CharDeviceStruct {
-    dev_t: DeviceNumber, //起始设备号
-    minorct: usize,      // 次设备号数量
-    name: &'static str,  //字符设备名
-}
-
-impl CharDeviceStruct {
-    /// @brief: 创建实例
-    /// @parameter: dev_t: 设备号
-    ///             minorct: 次设备号数量
-    ///             name: 字符设备名
-    ///             char: 字符设备实例
-    /// @return: 实例
-    ///
-    #[allow(dead_code)]
-    pub fn new(dev_t: DeviceNumber, minorct: usize, name: &'static str) -> Self {
-        Self {
-            dev_t,
-            minorct,
-            name,
-        }
-    }
-
-    /// @brief: 获取起始次设备号
-    /// @parameter: None
-    /// @return: 起始设备号
-    ///
-    #[allow(dead_code)]
-    pub fn device_number(&self) -> DeviceNumber {
-        self.dev_t
-    }
-
-    /// @brief: 获取起始次设备号
-    /// @parameter: None
-    /// @return: 起始设备号
-    ///
-    #[allow(dead_code)]
-    pub fn base_minor(&self) -> usize {
-        self.dev_t.minor()
-    }
-
-    /// @brief: 获取次设备号数量
-    /// @parameter: None
-    /// @return: 次设备号数量
-    #[allow(dead_code)]
-    pub fn minorct(&self) -> usize {
-        self.minorct
-    }
+    /// @brief: 同步信息，把所有的dirty数据写回设备 - 待实现
+    fn sync(&self) -> Result<(), SystemError>;
 }
 
 /// @brief 字符设备框架函数集
@@ -117,7 +41,7 @@ impl CharDevOps {
     /// @return: 返回下标
     #[allow(dead_code)]
     fn major_to_index(major: usize) -> usize {
-        return major % CHARDEV_MAJOR_HASH_SIZE;
+        return major % DEV_MAJOR_HASH_SIZE;
     }
 
     /// @brief: 动态获取主设备号
@@ -125,18 +49,18 @@ impl CharDevOps {
     /// @return: 如果成功，返回主设备号，否则，返回错误码
     #[allow(dead_code)]
     fn find_dynamic_major() -> Result<usize, SystemError> {
-        let chardevs = CHARDEVS.0.lock();
+        let chardevs = CHARDEVS.lock();
         // 寻找主设备号为234～255的设备
-        for index in (CHARDEV_MAJOR_DYN_END..CHARDEV_MAJOR_HASH_SIZE).rev() {
-            if let Some(item) = chardevs.0.get(index) {
+        for index in (DEV_MAJOR_DYN_END..DEV_MAJOR_HASH_SIZE).rev() {
+            if let Some(item) = chardevs.get(index) {
                 if item.is_empty() {
                     return Ok(index); // 返回可用的主设备号
                 }
             }
         }
         // 寻找主设备号在384～511的设备
-        for index in (CHARDEV_MAJOR_DYN_EXT_END + 1..CHARDEV_MAJOR_DYN_EXT_START + 1).rev() {
-            if let Some(chardevss) = chardevs.0.get(Self::major_to_index(index)) {
+        for index in (DEV_MAJOR_DYN_EXT_END + 1..DEV_MAJOR_DYN_EXT_START + 1).rev() {
+            if let Some(chardevss) = chardevs.get(Self::major_to_index(index)) {
                 let mut flag = true;
                 for item in chardevss {
                     if item.device_number().major() == index {
@@ -168,7 +92,7 @@ impl CharDevOps {
     }
 
     /// @brief: 注册设备号，该函数自动分配主设备号
-    /// @parameter: baseminor: 主设备号
+    /// @parameter: baseminor: 次设备号
     ///             count: 次设备号数量
     ///             name: 字符设备名
     /// @return: 如果注册成功，返回，否则，返回false
@@ -193,33 +117,33 @@ impl CharDevOps {
     ) -> Result<DeviceNumber, SystemError> {
         let mut major = device_number.major();
         let baseminor = device_number.minor();
-        if major >= CHARDEV_MAJOR_MAX {
+        if major >= DEV_MAJOR_MAX {
             kerror!(
-                "CHARDEV {} major requested {} is greater than the maximum {}\n",
+                "DEV {} major requested {} is greater than the maximum {}\n",
                 name,
                 major,
-                CHARDEV_MAJOR_MAX - 1
+                DEV_MAJOR_MAX - 1
             );
         }
         if minorct > MINOR_MASK + 1 - baseminor {
-            kerror!("CHARDEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
+            kerror!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
                 name, baseminor, baseminor + minorct - 1, 0, MINOR_MASK);
         }
-        let chardev = CharDeviceStruct::new(mkdev(major, baseminor), minorct, name);
+        let chardev = DeviceStruct::new(mkdev(major, baseminor), minorct, name);
         if major == 0 {
             // 如果主设备号为0,则自动分配主设备号
             major = Self::find_dynamic_major().expect("Find synamic major error.\n");
         }
-        if let Some(items) = CHARDEVS.0.lock().0.get_mut(Self::major_to_index(major)) {
+        if let Some(items) = CHARDEVS.lock().get_mut(Self::major_to_index(major)) {
             let mut insert_index: usize = 0;
             for (index, item) in items.iter().enumerate() {
                 insert_index = index;
                 match item.device_number().major().cmp(&major) {
-                    Ordering::Less => continue,
-                    Ordering::Greater => {
+                    core::cmp::Ordering::Less => continue,
+                    core::cmp::Ordering::Greater => {
                         break; // 大于则向后插入
                     }
-                    Ordering::Equal => {
+                    core::cmp::Ordering::Equal => {
                         if item.device_number().minor() + item.minorct() <= baseminor {
                             continue; // 下一个主设备号大于或者次设备号大于被插入的次设备号最大值
                         }
@@ -245,9 +169,7 @@ impl CharDevOps {
         minorct: usize,
     ) -> Result<(), SystemError> {
         if let Some(items) = CHARDEVS
-            .0
             .lock()
-            .0
             .get_mut(Self::major_to_index(device_number.major()))
         {
             for (index, item) in items.iter().enumerate() {
@@ -267,11 +189,17 @@ impl CharDevOps {
     ///             range: 次设备号范围
     /// @return: none
     #[allow(dead_code)]
-    pub fn cdev_add(cdev: Arc<dyn CharDevice>, dev_t: DeviceNumber, range: usize) {
-        if Into::<usize>::into(dev_t) == 0 {
+    pub fn cdev_add(cdev: Arc<dyn CharDevice>, id_table: IdTable, range: usize) {
+        if Into::<usize>::into(id_table.device_number()) == 0 {
             kerror!("Device number can't be 0!\n");
         }
-        kobj_map(CDEVMAP.clone(), dev_t, range, cdev);
+        DEVICE_MANAGER.add_device(id_table.clone(), cdev.clone());
+        kobj_map(
+            DEVMAP.clone(),
+            id_table.device_number(),
+            range,
+            cdev.clone(),
+        )
     }
 
     /// @brief: 字符设备注销
@@ -279,7 +207,8 @@ impl CharDevOps {
     ///             range: 次设备号范围
     /// @return: none
     #[allow(dead_code)]
-    pub fn cdev_del(dev_t: DeviceNumber, range: usize) {
-        kobj_unmap(CDEVMAP.clone(), dev_t, range);
+    pub fn cdev_del(id_table: IdTable, range: usize) {
+        DEVICE_MANAGER.remove_device(&id_table);
+        kobj_unmap(DEVMAP.clone(), id_table.device_number(), range);
     }
 }

@@ -11,8 +11,8 @@
 #pragma once
 #include <arch/x86_64/include/asm/cmpxchg.h>
 
-#define atomic_read(atomic)	((atomic)->value)   // 读取原子变量
-#define atomic_set(atomic,val)	(((atomic)->value) = (val)) // 设置原子变量的初始值
+#define atomic_read(atomic) ((atomic)->value)               // 读取原子变量
+#define atomic_set(atomic, val) (((atomic)->value) = (val)) // 设置原子变量的初始值
 
 typedef struct
 {

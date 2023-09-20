@@ -287,8 +287,8 @@ ENTRY(_start64)
     loop .fill_pde_64
 
     // 最低级
-    // 循环 512*50=25600 次，填满50页
-    mov $25600, %ecx
+    // 循环 512*25=12800 次，填满25页，共50M
+    mov $12800, %ecx
     mov $__PT_S, %eax
     mov $0x3, %ebx
 .fill_pt_64:
@@ -296,6 +296,14 @@ ENTRY(_start64)
     add $0x1000, %ebx
     add $8, %eax
     loop .fill_pt_64
+
+    // 50-100M填0，共25个页表
+    mov $12800, %ecx
+.fill_pt_64_2:
+    mov $0, 0(%eax)
+    add $8, %eax
+    loop .fill_pt_64_2
+
 
 
 // ==== 加载CR3寄存器
@@ -393,45 +401,6 @@ repeat_set_idt:
     dec %rcx
     jne repeat_set_idt
 
-SetUp_TSS64:
-    // == 设置64位的任务状态段表 ===
-    //rdx保存高8B， rax保存低8B
-    leaq TSS64_Table(%rip), %rdx    // 获取定义在process.c中的initial_tss[0]的地址
-
-    movq $0xffff800000000000, %r8
-    addq %r8, %rdx
-
-    xorq %rax, %rax
-    xorq %rcx, %rcx
-
-    // 设置TSS描述符的47：40位为1000 1001
-    movq $0x89, %rax
-    shlq $40, %rax
-
-    // 设置段基地址31:24
-    movl %edx, %ecx
-    shrl $24, %ecx
-    shlq $56, %rcx
-    addq %rcx, %rax
-
-    xorq %rcx, %rcx
-
-    // 设置段基地址23:00
-    movl %edx, %ecx
-    andl $0xffffff, %ecx // 清空ecx的中有效值的高8位（也就是上面已经赋值了的）
-    shlq $16, %rcx
-    addq %rcx, %rax
-
-    addq $103, %rax // 设置段长度
-
-    leaq GDT_Table(%rip), %rdi
-    movq %rax, 80(%rdi) // 把低八B存储到GDT第10项
-    shrq $32, %rdx
-    movq %rdx, 88(%rdi) // 高8B存到GDT第11项
-
-    // 装载任务状态段寄存器(已改为在main.c中使用load_TR宏进行装载)
-    // mov $0x50, %ax // 设置起始地址为80
-    // ltr %ax
     
     //now enable SSE and the like
     movq %cr0, %rax
@@ -442,7 +411,6 @@ SetUp_TSS64:
     or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
     movq %rax, %cr4
 
-    
 
     movq	go_to_kernel(%rip),	%rax		/* movq address */
 	pushq	$0x08
@@ -513,10 +481,8 @@ m_ignore_int:
 go_to_ignore_int:
     .quad ignore_int_handler
 
-
 ENTRY(head_stack_start)
-    .quad initial_proc_union + 32768
-
+    .quad BSP_IDLE_STACK_SPACE + 32768
 
 // 初始化页表
 .align 0x1000 //设置为4k对齐
@@ -583,12 +549,7 @@ IDT_POINTER64:
 IDT_LIMIT64: .word IDT_END - IDT_Table - 1
 IDT_BASE64: .quad IDT_Table + 0xffff800000000000
 
-// 64位的TSS表
-.global TSS64_Table
 
-TSS64_Table:
-    .fill 13, 8, 0
-TSS64_END:
 
 .section .bootstrap.data
 mb2_magic: .quad 0

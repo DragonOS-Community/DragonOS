@@ -19,7 +19,9 @@ cd DragonOS
 ```
 
 :::{warning}
-DragonOS的源代码托管在Github上，但是，由于Github在国内的访问速度较慢，因此，我们建议您在github上绑定您的电脑的**ssh公钥**，
+DragonOS的源代码托管在Github上，但是，由于Github在国内的访问速度较慢。可能出现克隆失败的情况，这时只要重试即可。
+
+当然，我们建议您在github上绑定您的电脑的**ssh公钥**，
 然后通过以下命令来克隆代码，防止频繁出现git clone、pull、push失败的情况。
 
 ```shell
@@ -82,6 +84,7 @@ bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依�
 - lsb-release
 - git
 - dosfstools
+- unzip
 - Rust以及其工具链
 
 **请留意，若您的Linux系统是在虚拟机中运行的，还请您在您的VMware/Virtual Box虚拟机的处理器设置选项卡中，开启Intel VT-x或AMD-V选项，否则，DragonOS将无法运行。**
@@ -236,7 +239,10 @@ make run-docker
 - 清理编译产生的文件: `make clean`
 - 编译文档: `make docs` （需要手动安装sphinx以及docs下的`requirements.txt`中的依赖）
 - 清理文档: `make clean-docs`
+- 格式化代码: `make fmt`
 
 :::{note}
 如果您需要在vnc中运行DragonOS，请在上述命令后加上`-vnc`后缀。如：`make run-vnc`
+
+qemu虚拟机将在5900端口监听vnc连接。您可以使用vnc viewer或者Remmina连接至qemu虚拟机。
 :::

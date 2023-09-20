@@ -5,5 +5,4 @@
    :maxdepth: 1
 
    kthread
-   pcb
    load_binary

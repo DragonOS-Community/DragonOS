@@ -1,6 +1,5 @@
 #include "multiboot2.h"
 
-
 #include <common/glib.h>
 #include <common/kprint.h>
 uintptr_t multiboot2_boot_info_addr;
@@ -11,8 +10,7 @@ bool multiboot2_init(void)
 {
     uintptr_t *addr = (uintptr_t *)multiboot2_boot_info_addr;
     if (multiboot2_magic != MULTIBOOT2_BOOTLOADER_MAGIC)
-        ;
-    return false;
+        return false;
     // addr+0 处保存了大小
     multiboot2_boot_info_size = *(unsigned int *)addr;
     return true;
@@ -24,7 +22,7 @@ void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned i
 
     uintptr_t addr = multiboot2_boot_info_addr;
     // 接下来的第8字节开始，为 tag 信息
-    struct iter_data_t *tag = (struct iter_data_t *)((void*)addr + 8);
+    struct iter_data_t *tag = (struct iter_data_t *)((void *)addr + 8);
     for (; tag->type != MULTIBOOT_TAG_TYPE_END;
          tag = (struct iter_data_t *)((uint8_t *)tag + ALIGN(tag->size, 8)))
     {

@@ -152,16 +152,6 @@ impl IndexNode for LockedKvmInode {
             }
             KVM_CREATE_VM => {
                 kdebug!("kvm KVM_CREATE_VM");
-                let kvm = Box::leak(Box::new(
-                    Arc::new(Mutex::new(Hypervisor::new(
-                        1, 
-                        0, 
-                        8,
-                        // unsafe {(host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64},
-                    ).unwrap()
-                    ))
-                ));
-                unsafe {__KVM = kvm;}
                 kvm_dev_ioctl_create_vm(data)
             }
             KVM_CHECK_EXTENSION | KVM_GET_VCPU_MMAP_SIZE |
@@ -198,6 +188,15 @@ impl IndexNode for LockedKvmInode {
 
 #[no_mangle]
 pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
+    let kvm = Box::leak(Box::new(
+        Arc::new(Mutex::new(Hypervisor::new(
+            0, 
+            0, 
+        ).unwrap()
+        ))
+    ));
+    unsafe {__KVM = kvm;}
+    // 创建vm文件，返回文件描述符
     let vm_inode = LockedVmInode::new();
     let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
     return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);

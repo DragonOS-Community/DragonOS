@@ -1,7 +1,4 @@
 use core::arch::asm;
-
-use alloc::boxed::Box;
-use alloc::collections::LinkedList;
 use alloc::sync::Arc;
 use raw_cpuid::CpuId;
 use crate::libs::mutex::Mutex;
@@ -12,9 +9,8 @@ use crate::{
     syscall::SystemError,
 };
 // use crate::virt::kvm::guest_code;
-use crate::virt::kvm::{HOST_STACK_SIZE, GUEST_STACK_SIZE};
 use crate::virt::kvm::KVM;
-use self::vmx::mmu::{kvm_mmu_calculate_mmu_pages, KvmMmuPage, kvm_mmu_setup, kvm_vcpu_mtrr_init};
+use self::vmx::mmu::{kvm_mmu_calculate_mmu_pages, kvm_vcpu_mtrr_init};
 use self::vmx::vcpu::VmxVcpu;
 pub mod vmx;
 
@@ -24,13 +20,13 @@ pub const KVM_NR_MEM_OBJS:u32 = 40;
 
 #[derive(Default)]
 pub struct X86_64KVMArch {
-    n_used_mmu_pages: u32,
-    n_requested_mmu_pages: u32, 
-    n_max_mmu_pages: u32,
-    mmu_valid_gen: u64,
-    // mmu_page_hash:[],
-    active_mmu_pages: LinkedList<KvmMmuPage>, // 所有分配的mmu page都挂到active_mmu_pages上
-    zapped_obsolete_pages: LinkedList<KvmMmuPage>, // 释放的mmu page都挂到zapped_obsolete_pages上,一个全局的invalid_list
+    // n_used_mmu_pages: u32,
+    // n_requested_mmu_pages: u32, 
+    // n_max_mmu_pages: u32,
+    // mmu_valid_gen: u64,
+    // // mmu_page_hash:[],
+    // active_mmu_pages: LinkedList<KvmMmuPage>, // 所有分配的mmu page都挂到active_mmu_pages上
+    // zapped_obsolete_pages: LinkedList<KvmMmuPage>, // 释放的mmu page都挂到zapped_obsolete_pages上,一个全局的invalid_list
 }
 
 
@@ -69,30 +65,18 @@ impl X86_64KVMArch{
         }
     }
 
-    pub fn kvm_arch_vcpu_create(id:u32) -> Result<Arc<Mutex<Box<VmxVcpu>>>, SystemError> {
-        let current_kvm = KVM();
-        let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
-        let host_stack = vec![0xCC; HOST_STACK_SIZE];
+    pub fn kvm_arch_vcpu_create(id: u32) -> Result<Arc<Mutex<VmxVcpu>>, SystemError> {
         // let guest_rip = current_kvm.lock().memslots[0].memslots[0].userspace_addr;
-        let vcpu = Arc::new(Mutex::new(Box::new(
-            VmxVcpu::new(
-                id, 
-                current_kvm.clone(), 
-                (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64,
-                guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64, 
-                guest_code as *const () as u64
-                // guest_rip,
-            ).unwrap()
-        )));
-        return Ok(vcpu);
+        let vcpu = VmxVcpu::new(id, KVM().clone()).unwrap();
+        return Ok(Arc::new(Mutex::new(vcpu)));
     }
     
-    pub fn kvm_arch_vcpu_setup(vcpu: &Mutex<Box<VmxVcpu>>) -> Result<(), SystemError> {
-        // TODO: kvm_vcpu_mtrr_init(vcpu);
+    pub fn kvm_arch_vcpu_setup(vcpu: &Mutex<VmxVcpu>) -> Result<(), SystemError> {
         kvm_vcpu_mtrr_init(vcpu)?;
-        kvm_mmu_setup(vcpu);
+        // kvm_mmu_setup(vcpu);
         Ok(())
     }
+
     pub fn kvm_arch_create_memslot(_slot: &mut KvmMemorySlot, _npages: u64) {
 
     }
@@ -102,14 +86,14 @@ impl X86_64KVMArch{
         _new_slot: &KvmMemorySlot,
         _old_slot: &KvmMemorySlot,
         _change: KvmMemoryChange) {
-            let kvm = KVM();
-            let mut num_mmu_pages = 0;
-            if kvm.lock().arch.n_requested_mmu_pages == 0{
-		        num_mmu_pages = kvm_mmu_calculate_mmu_pages();
-            }
-            if num_mmu_pages != 0 {
-                // kvm_mmu_change_mmu_pages(num_mmu_pages);
-            }
+            // let kvm = KVM();
+            // let mut num_mmu_pages = 0;
+            // if kvm.lock().arch.n_requested_mmu_pages == 0{
+		    //     num_mmu_pages = kvm_mmu_calculate_mmu_pages();
+            // }
+            // if num_mmu_pages != 0 {
+            //     // kvm_mmu_change_mmu_pages(num_mmu_pages);
+            // }
     }
 }
 

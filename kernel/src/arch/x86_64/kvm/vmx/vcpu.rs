@@ -1,11 +1,11 @@
-use alloc::vec::Vec;
 use x86::{
     controlregs, msr, segmentation
 };
 use raw_cpuid::CpuId;
 use x86;
+use crate::arch::kvm::vmx::mmu::KvmMmu;
 use crate::arch::mm::{LockedFrameAllocator, PageMapper};
-use crate::virt::kvm::{GUEST_STACK_SIZE, HOST_STACK_SIZE};
+use crate::virt::kvm::GUEST_STACK_SIZE;
 use crate::{kdebug, printk_color, GREEN, BLACK};
 use alloc::boxed::Box;
 use alloc::alloc::Global;
@@ -20,7 +20,7 @@ use crate::syscall::SystemError;
 use crate::virt::kvm::hypervisor::Hypervisor;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::arch::x86_64::mm::X86_64MMArch;
-use super::mmu::KvmMmu;
+use super::mmu::KvmMmuEpt;
 use super::vmcs::{VMCSRegion, VmcsFields, 
     VmxEntryCtrl, VmxPrimaryExitCtrl,
     VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl
@@ -32,6 +32,7 @@ use super::vmx_asm_wrapper::{
 
 // KERNEL_ALLOCATOR
 pub const PAGE_SIZE: usize = 0x1000;
+pub const NR_VCPU_REGS: usize = 16;
 
 #[repr(C, align(4096))]
 pub struct VmxonRegion {
@@ -56,130 +57,88 @@ pub struct VcpuData {
     pub vmcs_region_physical_address: u64,  // vmptrld, vmclear需要该地址
     pub msr_bitmap: Box<MSRBitmap>,
     pub msr_bitmap_physical_address: u64,
-    pub guest_rsp: u64,
-    pub guest_rip: u64,
+}
+
+pub struct VcpuContextFrame{
+    regs: [usize; NR_VCPU_REGS], // 通用寄存器
+}
+
+
+pub enum VcpuState {
+    VcpuInv = 0,
+    VcpuPend = 1,
+    VcpuAct = 2,
 }
 
 pub struct VmxVcpu {
-    /// The index of the processor.
-    index: u32,
-    data: Box<VcpuData>, 
-    hypervisor: Arc<Mutex<Hypervisor>>,		/* parent KVM */
-    host_stack: Vec<u8>,
-    guest_stack: Vec<u8>,
-    /*
-	 * Paging state of the vcpu
-	 *
-	 * If the vcpu runs in guest mode with two level paging this still saves
-	 * the paging mode of the l1 guest. This context is always used to
-	 * handle faults.
-	 */
-     pub mmu: KvmMmu,
-     // 用于分配 pte_list_desc ，它是反向映射链表 parent_ptes 的链表项，在 mmu_set_spte => rmap_add => pte_list_add 中分配
-    //  mmu_pte_list_desc_cache: KvmMmuMemoryCache,
-     //  用于分配 page ，作为 kvm_mmu_page.spt
-    //  mmu_page_cache: KvmMmuMemoryCache,
-     // // 用于分配 kvm_mmu_page ，作为页表页
-    //  pub mmu_page_header_cache: KvmMmuMemoryCache,
-
+    pub vcpu_id: u32,
+    pub vcpu_ctx: VcpuContextFrame, // 保存vcpu切换时的上下文，如通用寄存器等
+    pub vcpu_state: VcpuState, // vcpu当前运行状态
+    pub mmu: KvmMmuEpt,    // vcpu的内存管理单元
+    pub data: VcpuData, // vcpu的数据
+    pub hypervisor: Arc<Mutex<Hypervisor>>, // parent KVM
 }
 
 impl VcpuData {
-    pub fn new(guest_rsp:u64, guest_rip:u64) -> Result<Box<Self>, SystemError> {
-        let instance = Self {
-            // try_new_zeroed_in 创建一个具有未初始化内容的新 Box，使用提供的分配器中的 0 字节填充内存，如果分配失败，则返回错误
-            // assume_init 由调用者负责确保值确实处于初始化状态
-            vmxon_region: unsafe { 
-                match Box::try_new_zeroed_in(Global) {
-                    Ok(zero) => zero.assume_init(),
-                    Err(_) => panic!("Try new zeroed fail!"),
-                }
+    pub fn alloc() -> Result<Self, SystemError> {
+        let vmxon_region = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
+        let vmcs_region = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
+        let msr_bitmap = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
+        let mut instance = Self {
+            // Allocate a naturally aligned 4-KByte VMXON region of memory to enable VMX operation (Intel Manual: 25.11.5 VMXON Region)
+            vmxon_region,
+            // FIXME: virt_2_phys的转换正确性存疑
+            vmxon_region_physical_address: {
+                let vaddr = VirtAddr::new(vmxon_region.as_ref() as *const _ as _);
+                unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
             },
-            vmxon_region_physical_address: 0,
-            vmcs_region: unsafe { 
-                match Box::try_new_zeroed_in(Global) {
-                    Ok(zero) => zero.assume_init(),
-                    Err(_) => panic!("Try new zeroed fail!"),
-                }
+            // Allocate a naturally aligned 4-KByte VMCS region of memory 
+            vmcs_region,
+            vmcs_region_physical_address: {
+                let vaddr = VirtAddr::new(vmcs_region.as_ref() as *const _ as _);
+                unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
             },
-            // Software references a specific VMCS by using the 64-bit physical address of the region; 
-            // such an address is called a VMCS pointer
-            vmcs_region_physical_address: 0,
-            msr_bitmap: unsafe { 
-                match Box::try_new_zeroed_in(Global) {
-                    Ok(zero) => zero.assume_init(),
-                    Err(_) => panic!("Try new zeroed fail!"),
-                }
+            msr_bitmap,
+            msr_bitmap_physical_address: {
+                let vaddr = VirtAddr::new(msr_bitmap.as_ref() as *const _ as _);
+                unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
             },
-            msr_bitmap_physical_address: 0, 
-            guest_rsp: guest_rsp,
-            guest_rip: guest_rip,   
         };
-
-        let mut instance = Box::new(instance);
-        printk_color!(GREEN, BLACK, "[+] init_vmxon_region\n");
-        instance.init_vmxon_region()?;
-        instance.init_vmcs_region(0,0,0)?;
+        printk_color!(GREEN, BLACK, "[+] init_region\n");
+        instance.init_region()?;
         Ok(instance)
     }
 
-    pub fn init_msr_bitmap(&mut self) -> Result<(), SystemError> {
-        let vaddr = VirtAddr::new(self.msr_bitmap.as_ref() as *const _ as _);
-        self.msr_bitmap_physical_address =  unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64};
-        if self.msr_bitmap_physical_address == 0 {
-            return Err(SystemError::EFAULT);
-        }
-        Ok(())
-    }
-
-    // Allocate a naturally aligned 4-KByte VMXON region of memory to enable VMX operation
-    // (Intel Manual: 25.11.5 VMXON Region)
-    pub fn init_vmxon_region(&mut self) -> Result<(), SystemError> {
-        // FIXME: virt_2_phys的转换正确性存疑
-        let vaddr = VirtAddr::new(self.vmxon_region.as_ref() as *const _ as _);
-        self.vmxon_region_physical_address =  unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64};
-        // virt_2_phys(self.vmxon_region.as_ref() as *const _ as _) as u64;
-
-        if self.vmxon_region_physical_address == 0 {
-            return Err(SystemError::EFAULT);
-        }
-
+    pub fn init_region(&mut self) -> Result<(), SystemError> {
+        // Get the Virtual Machine Control Structure revision identifier (VMCS revision ID) 
+        // (Intel Manual: 25.11.5 VMXON Region)
+        let revision_id = unsafe { (msr::rdmsr(msr::IA32_VMX_BASIC) as u32) & 0x7FFF_FFFF };
         kdebug!("[+] VMXON Region Virtual Address: {:p}", self.vmxon_region);
         kdebug!("[+] VMXON Region Physical Addresss: 0x{:x}", self.vmxon_region_physical_address);
-
-        self.vmxon_region.revision_id = get_vmcs_revision_id();
-        // self.vmxon_region.as_mut().revision_id.set_bit(31, false);
-
-        Ok(())
-    }
-
-    pub fn init_vmcs_region(&mut self, _guest_rsp: u32, _guest_rip:u32, _is_pt_allowed: u32) -> Result<(), SystemError> {
-        let vaddr = VirtAddr::new(self.vmcs_region.as_ref() as *const _ as _);
-        self.vmcs_region_physical_address =  unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64};
-        // virt_2_phys(self.vmxon_region.as_ref() as *const _ as _) as u64;
-        
-        if self.vmcs_region_physical_address == 0 {
-            return Err(SystemError::EFAULT);
-        }
-        kdebug!("[+] VMCS Region Virtual Address: {:?}", vaddr);
+        kdebug!("[+] VMCS Region Virtual Address: {:p}", self.vmcs_region);
         kdebug!("[+] VMCS Region Physical Address1: 0x{:x}", self.vmcs_region_physical_address);
-        self.vmcs_region.revision_id = get_vmcs_revision_id();
-        Ok(())
+        self.vmxon_region.revision_id = revision_id;
+        self.vmcs_region.revision_id = revision_id;
+        return Ok(());
     }
+
 }
 
 
 impl VmxVcpu {
-    pub fn new(index: u32, hypervisor: Arc<Mutex<Hypervisor>>, _host_rsp: u64, guest_rsp: u64, guest_rip: u64) -> Result<Self, SystemError> {
-        kdebug!("Creating processor {}", index);
-        Ok (Self {
-            index,
-            data: VcpuData::new(guest_rsp, guest_rip)?, 
-            hypervisor: hypervisor,
-            host_stack: vec![0xCC; HOST_STACK_SIZE],
-            guest_stack: vec![0xCC; GUEST_STACK_SIZE],
-            mmu: Default::default(),
-        })
+    pub fn new(vcpu_id: u32, hypervisor: Arc<Mutex<Hypervisor>>) -> Result<Self, SystemError> {
+        kdebug!("Creating processor {}", vcpu_id);
+        let instance = Self {
+            vcpu_id,
+            vcpu_ctx: VcpuContextFrame{
+                regs: [0; NR_VCPU_REGS],
+            },
+            vcpu_state: VcpuState::VcpuInv,
+            mmu: KvmMmuEpt::default(),
+            data: VcpuData::alloc()?, 
+            hypervisor: hypervisor.clone(),
+        };
+        Ok(instance)
     }
 
     pub fn vmcs_init_guest(&self) -> Result<(), SystemError>{
@@ -364,6 +323,19 @@ impl VmxVcpu {
         self.vmcs_init_guest()?;
         Ok(())
     }
+
+    fn kvm_mmu_load(&self) -> Result<(), SystemError> {
+        kdebug!("kvm_mmu_load!");
+        // 申请并创建新的页表
+        let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::EPT, LockedFrameAllocator)
+                .ok_or(SystemError::ENOMEM)?
+        };
+
+        let ept_root_hpa = mapper.table().phys();
+        self.mmu.set_eptp(ept_root_hpa.data() as u64);
+        return Ok(());
+    }
 }
 
 impl Vcpu for VmxVcpu {
@@ -417,25 +389,11 @@ impl Vcpu for VmxVcpu {
 
     /// Gets the index of the current logical/virtual processor
     fn id(&self) -> u32 {
-        self.index
+        self.vcpu_id
     }
 }
 
-impl VmxVcpu {
-    fn kvm_mmu_load(&self) -> Result<(), SystemError> {
-        kdebug!("kvm_mmu_load!");
-        // 申请并创建新的页表
-        let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
-            PageMapper::create(PageTableKind::EPT, LockedFrameAllocator)
-                .ok_or(SystemError::ENOMEM)?
-        };
 
-        let ept_root_hpa = mapper.table().phys();
-        let set_eptp_fn = self.mmu.set_eptp.unwrap();
-        set_eptp_fn(ept_root_hpa.data() as u64);
-        return Ok(());
-    }
-}
 pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u16) -> u64{
 	let table = segment_selector & 0x0004; // get table indicator in selector
     let index = (segment_selector >> 3) as usize; // get index in selector
@@ -535,11 +493,8 @@ pub fn adjust_vmx_secondary_process_exec_controls() -> u32 {
     );
     return controls;
 }
-/// Get the Virtual Machine Control Structure revision identifier (VMCS revision ID) 
-// (Intel Manual: 25.11.5 VMXON Region)
-pub fn get_vmcs_revision_id() -> u32 {
-    unsafe { (msr::rdmsr(msr::IA32_VMX_BASIC) as u32) & 0x7FFF_FFFF }
-}
+
+
 
 /// Check to see if CPU is Intel (“GenuineIntel”).
 /// Check processor supports for Virtual Machine Extension (VMX) technology 

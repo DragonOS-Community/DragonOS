@@ -274,7 +274,6 @@ pub fn check_ept_features() -> Result<(), SystemError> {
     if (ia32_mtrr_def_type & MTRR_ENABLE_BIT) == 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-
     Ok(())
 }
 

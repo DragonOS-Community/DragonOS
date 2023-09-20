@@ -6,6 +6,7 @@ use x86::{cpuid::cpuid, vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL};
 use core::arch::asm;
 use crate::kdebug;
 use super::vmcs::{VmcsFields, VmxExitReason};
+use crate::arch::x86_64::kvm::vmx::mmu::KvmMmu;
 
 #[derive(FromPrimitive)]
 #[allow(non_camel_case_types)]
@@ -228,10 +229,9 @@ extern "C" fn vmexit_handler(_guest_cpu_context_ptr: *mut GuestCpuContext){
             /* ept page table is present? */
             error_code |= (exit_qualification >> 3) & (1 << 0);
             let kvm = KVM();
-            let vcpu = &KVM().lock().vcpu[0];
-            let kvm_ept_page_fault = (*vcpu.lock()).mmu.page_fault.unwrap();
+            let vcpu = KVM().lock().vcpu[0].lock();
+            vcpu.mmu.page_fault(&mut (*vcpu), gpa, error_code as u32, false).unwrap();
             // kvm_ept_page_fault();
-
         }
         _ => {
             kdebug!("vmexit handler: unhandled vmexit reason: {}!", exit_basic_reason);

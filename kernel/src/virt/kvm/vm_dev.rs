@@ -154,7 +154,7 @@ impl IndexNode for LockedVmInode {
             },
             KVM_SET_USER_MEMORY_REGION => {
                 kdebug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
-                let mut kvm_userspace_mem: KvmUserspaceMemoryRegion = Default::default();// = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
+                let mut kvm_userspace_mem = KvmUserspaceMemoryRegion::default();// = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
                 unsafe {
                     copy_from_user(
                         core::slice::from_raw_parts_mut(
@@ -206,12 +206,13 @@ impl IndexNode for LockedVmInode {
     }
 }
 
-fn kvm_vm_ioctl_create_vcpu(_id: u32) -> Result<usize, SystemError>{
-    let vcpu = KVMArch::kvm_arch_vcpu_create(0).unwrap();
+fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
+    let vcpu = KVMArch::kvm_arch_vcpu_create(id).unwrap();
     KVMArch::kvm_arch_vcpu_setup(vcpu.as_ref());
 
-    KVM().lock().vcpu.push(vcpu);
-    KVM().lock().nr_vcpus += 1;
+    let mut kvm = KVM().lock();
+    kvm.vcpu.push(vcpu);
+    kvm.nr_vcpus += 1;
 
     let vcpu_inode = LockedVcpuInode::new();
     let file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;

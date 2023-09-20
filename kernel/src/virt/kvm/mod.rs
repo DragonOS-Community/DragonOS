@@ -21,7 +21,7 @@ pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 
 static mut __KVM: *mut Arc<Mutex<Hypervisor>> = null_mut();
 
-/// @brief 获取全局的根节点
+/// @brief 获取全局的KVM
 #[inline(always)]
 #[allow(non_snake_case)]
 pub fn KVM() -> &'static Arc<Mutex<Hypervisor>> {
@@ -29,32 +29,6 @@ pub fn KVM() -> &'static Arc<Mutex<Hypervisor>> {
         return __KVM.as_ref().unwrap();
     }
 }
-// struct Kvm_vcpu {
-//     kvm: Arc<Kvm>,		/* parent KVM */
-//     cpu_id: u32,        /* CPU id */
-//     vcpu_fd: u32,       /* For VCPU ioctls() */
-// 	pthread_t: thread,		/* VCPU thread */
-
-// 	kvm_run: Arc<Kvm_run>,
-// 	// struct kvm_cpu_task	*task;
-    
-// 	struct kvm_regs		regs;
-// 	struct kvm_sregs	sregs;
-// 	struct kvm_fpu		fpu;
-
-// 	struct kvm_msrs		*msrs;		/* dynamically allocated */
-
-//     // vcpu states
-// 	is_running: u8, 
-// 	paused: u8, 
-// 	needs_nmi: u8,
-
-// 	struct kvm_coalesced_mmio_ring	*ring;
-// };
-
-// struct kvm_arch{
-
-// }
 
 #[no_mangle]
 pub extern "C" fn kvm_init() {

@@ -16,26 +16,18 @@ use crate::arch::kvm::vmx::vmcs::PAGE_SIZE;
 // use crate::kdebug;
 
 pub struct Hypervisor {
+    // vcpu config
     pub nr_vcpus: u32,  /* Number of cpus to run */
-    pub vcpu: Vec<Arc<Mutex<Box<VmxVcpu>>>>,
-    pub host_stack: Vec<u8>,
-    pub mem_slots_num: u64,
+    pub vcpu: Vec<Arc<Mutex<VmxVcpu>>>,
+    // memory config
+    pub nr_mem_slots: u32, /* Number of memory slots in each address space */
     pub memslots: [KvmMemorySlots; KVM_ADDRESS_SPACE_NUM],
+    // arch related config
     pub arch: KVMArch,
-    // 	vm_fd: u32,  	/* For VM ioctls() */
-//     timerid: u32,   /* Posix timer for interrupts */
-//     mem_slots: u32, /* for KVM_SET_USER_MEMORY_REGION */
-//     ram_size: u64,  /* Guest memory size, in bytes */
-//     ram_start: *u64,
-//     ram_pagesize: u64,
-//     mem_banks_lock: SpinLock<()>,
-//     // mem_banks: Box<[kvm_mem_bank]>,
-
-//     vm_state: u32,
 }
 
 impl Hypervisor {
-    pub fn new(nr_vcpus: u32, _host_stack: u64, mem_slots_num: u64) -> Result<Self, SystemError> {
+    pub fn new(nr_vcpus: u32, nr_mem_slots: u32) -> Result<Self, SystemError> {
         let vcpu = Vec::new();
         // for i in 0..nr_vcpus {
         //     vcpu.push(Vcpu::new(i, Arc::new(hypervisor))?);
@@ -44,8 +36,7 @@ impl Hypervisor {
         let instance = Self {
             nr_vcpus,
             vcpu,
-            host_stack: vec![0xCC; HOST_STACK_SIZE],
-            mem_slots_num,
+            nr_mem_slots,
             memslots: [KvmMemorySlots::default();KVM_ADDRESS_SPACE_NUM],
             arch: Default::default(),
         };
@@ -59,7 +50,7 @@ impl Hypervisor {
         let as_id = mem.slot >> 16;    // address space id
 
         // 检查slot是否合法
-        if mem.slot as usize >= self.mem_slots_num as usize {
+        if mem.slot as usize >= self.nr_mem_slots as usize {
             return Err(SystemError::EINVAL);
         }
         // 检查flags是否合法
@@ -175,10 +166,5 @@ impl Hypervisor {
     }
 
     
-
-    // pub fn virtualize_cpu(&self) -> Result<(), SystemError> {
-    //     let mut vcpu = self.vcpu[0].lock();
-    //     vcpu.virtualize_cpu();
-    // }
 }
 

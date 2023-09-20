@@ -54,12 +54,12 @@ pub struct KvmUserspaceMemoryRegion {
 pub struct KvmMemorySlot{
     pub base_gfn: u64, // 虚机内存区间起始物理页框号
     pub npages: u64,   // 虚机内存区间页数，即内存区间的大小
-    // 用来记录虚机内存区间的脏页信息，每个bit对应一个页，如果bit为1，表示对应的页是脏页，如果bit为0，表示对应的页是干净页。
-    // pub dirty_bitmap: *mut u8, 
-	// unsigned long *rmap[KVM_NR_PAGE_SIZES]; 反向映射相关的结构, 创建EPT页表项时就记录GPA对应的页表项地址(GPA-->页表项地址)，暂时不需要
     pub userspace_addr: u64,  // 虚机内存区间对应的主机虚拟地址
     pub flags: u32,    // 虚机内存区间属性
     pub id: u16,       // 虚机内存区间id
+    // 用来记录虚机内存区间的脏页信息，每个bit对应一个页，如果bit为1，表示对应的页是脏页，如果bit为0，表示对应的页是干净页。
+    // pub dirty_bitmap: *mut u8, 
+	// unsigned long *rmap[KVM_NR_PAGE_SIZES]; 反向映射相关的结构, 创建EPT页表项时就记录GPA对应的页表项地址(GPA-->页表项地址)，暂时不需要
 }
 
 #[derive(Default, Clone, Copy)]

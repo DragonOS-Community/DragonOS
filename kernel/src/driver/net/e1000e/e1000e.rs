@@ -200,7 +200,7 @@ impl E1000EDevice{
         if size != E1000E_BAR_REG_SIZE{
             return Err(E1000EPciError::UnexpectedBarSize);
         }
-        let vaddress = bar0.virtual_address().ok_or(E1000EPciError::BarGetVaddrFailed)?;
+        let vaddress = bar0.virtual_address().ok_or(E1000EPciError::BarGetVaddrFailed)?.data() as u64;
         
         // 初始化msix中断
         // initialize msi-x interupt

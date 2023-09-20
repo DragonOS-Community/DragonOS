@@ -1,13 +1,13 @@
 //这个文件的绝大部分内容是copy virtio_net.rs的，考虑到所有的驱动都要用操作系统提供的协议栈，我觉得可以把这些内容抽象出来
 
 use alloc::{sync::Arc, string::String};
-use smoltcp::{phy::{RxToken, TxToken, Device}, wire};
+use smoltcp::{phy, wire};
 use core::{
     cell::UnsafeCell,
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
-use crate::{libs::spinlock::SpinLock, driver::{Driver, net::NetDriver}, syscall::SystemError, time::Instant, net::{generate_iface_id, NET_DRIVERS}, kinfo, kdebug};
+use crate::{libs::spinlock::SpinLock, driver::{Driver, net::NetDriver, base::device::{DevicePrivateData, DeviceResource, driver::DriverError, IdTable, Device}}, syscall::SystemError, time::Instant, net::{generate_iface_id, NET_DRIVERS}, kinfo, kdebug};
 
 use super::e1000e::{E1000EDevice, E1000EBuffer};
 
@@ -57,7 +57,7 @@ pub struct E1000EInterface{
     iface: SpinLock<smoltcp::iface::Interface>,
     name: String,
 }
-impl RxToken for E1000ERxToken{
+impl phy::RxToken for E1000ERxToken{
     fn consume<R, F>(mut self, f: F) -> R
         where
             F: FnOnce(&mut [u8]) -> R {
@@ -67,7 +67,7 @@ impl RxToken for E1000ERxToken{
     }
 }
 
-impl TxToken for E1000ETxToken{
+impl phy::TxToken for E1000ETxToken{
     fn consume<R, F>(self, len: usize, f: F) -> R
         where
             F: FnOnce(&mut [u8]) -> R {
@@ -109,7 +109,7 @@ impl Clone for E1000EDriver{
     }
 }
 
-impl Device for E1000EDriver{
+impl phy::Device for E1000EDriver{
     type RxToken<'a> = E1000ERxToken;
     type TxToken<'a> = E1000ETxToken;
 
@@ -189,6 +189,38 @@ impl Debug for E1000EInterface {
 impl Driver for E1000EInterface {
     fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
         self
+    }
+    fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
+        todo!()
+    }
+
+    fn load(
+        &self,
+        _data: DevicePrivateData,
+        _resource: Option<DeviceResource>,
+    ) -> Result<Arc<dyn Device>, DriverError> {
+        todo!()
+    }
+
+    fn id_table(&self) -> IdTable {
+        todo!()
+    }
+
+    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+        todo!()
+    }
+
+    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
+        todo!()
+    }
+
+    fn compatible_table(&self) -> crate::driver::base::platform::CompatibleTable {
+        //TODO 要完善每个 CompatibleTable ，将来要把这个默认实现删除
+        return crate::driver::base::platform::CompatibleTable::new(vec!["unknown"]);
+    }
+
+    fn append_compatible_table(&self, _device: &crate::driver::base::platform::CompatibleTable) -> Result<(), DriverError> {
+        Err(DriverError::UnsupportedOperation)
     }
 }
 

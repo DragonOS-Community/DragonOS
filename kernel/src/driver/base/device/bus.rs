@@ -1,9 +1,10 @@
 use super::{
     device_register, device_unregister,
-    driver::{driver_register, driver_unregister, Driver, DriverError},
+    driver::{driver_register, driver_unregister, DriverError},
     Device, DeviceError, DeviceState, IdTable,
 };
 use crate::{
+    driver::Driver,
     filesystem::{
         sysfs::{
             bus::{sys_bus_init, sys_bus_register},
@@ -176,7 +177,7 @@ impl LockedBusManager {
 /// @return: 成功:()   失败:DeviceError
 pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
     BUS_MANAGER.add_bus(bus.id_table(), bus.clone());
-    match sys_bus_register(&bus.id_table().to_name()) {
+    match sys_bus_register(&bus.id_table().name()) {
         Ok(inode) => {
             let _ = sys_bus_init(&inode);
             return device_register(bus);
@@ -190,14 +191,14 @@ pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
 /// @return: 成功:()   失败:DeviceError
 #[allow(dead_code)]
 pub fn bus_unregister<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
-    BUS_MANAGER.add_bus(bus.id_table(), bus.clone());
+    BUS_MANAGER.remove_bus(&bus.id_table());
     return device_unregister(bus);
 }
 
 /// @brief: 总线驱动注册，将总线驱动加入全局总线管理器中
 /// @parameter bus: Bus设备驱动实体
 /// @return: 成功:()   失败:DeviceError
-pub fn bus_driver_register<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), DriverError> {
+pub fn bus_driver_register(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverError> {
     BUS_MANAGER.add_driver(bus_driver.id_table(), bus_driver.clone());
     return driver_register(bus_driver);
 }
@@ -206,7 +207,7 @@ pub fn bus_driver_register<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), Drive
 /// @parameter bus: Bus设备驱动实体
 /// @return: 成功:()   失败:DeviceError
 #[allow(dead_code)]
-pub fn bus_driver_unregister<T: BusDriver>(bus_driver: Arc<T>) -> Result<(), DriverError> {
-    BUS_MANAGER.add_driver(bus_driver.id_table(), bus_driver.clone());
+pub fn bus_driver_unregister(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverError> {
+    BUS_MANAGER.remove_bus_driver(&bus_driver.id_table());
     return driver_unregister(bus_driver);
 }

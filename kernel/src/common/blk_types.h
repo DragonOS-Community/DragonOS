@@ -2,8 +2,6 @@
 
 #include <DragonOS/stdint.h>
 #include <common/glib.h>
-#include <common/mutex.h>
-#include <common/semaphore.h>
 
 #define BLK_TYPE_AHCI 0
 
@@ -83,5 +81,4 @@ struct blk_gendisk
     struct block_device *partition;            // 磁盘分区数组
     const struct block_device_operation *fops; // 磁盘操作
     void *private_data;
-    mutex_t open_mutex; // open()/close()操作的互斥锁
 };

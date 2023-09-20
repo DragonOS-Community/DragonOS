@@ -358,10 +358,3 @@ Values in this inclusive range are reserved for OS-specific semantics.
 
 
 // --> end ========== program header =========
-
-/**
- * @brief 校验是否为ELF文件
- * 
- * @param ehdr 
- */
-bool elf_check(void * ehdr);

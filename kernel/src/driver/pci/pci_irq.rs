@@ -504,7 +504,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?;
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
-                    let vaddr = msix_bar
+                    let vaddr: crate::mm::VirtAddr = msix_bar
                         .virtual_address()
                         .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?
                         + msix_table_offset as usize

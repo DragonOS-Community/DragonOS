@@ -3,11 +3,13 @@
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
+#![feature(asm_const)]
 #![feature(const_mut_refs)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(drain_filter)]
 #![feature(is_some_and)]
+#![feature(naked_functions)]
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]
@@ -45,6 +47,7 @@ extern crate bitflags;
 extern crate elf;
 #[macro_use]
 extern crate lazy_static;
+extern crate memoffset;
 extern crate num;
 #[macro_use]
 extern crate num_derive;
@@ -53,14 +56,9 @@ extern crate thingbuf;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
-use crate::libs::lib_ui::textui::FontColor;
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
-// <3>
-use crate::{
-    arch::asm::current::current_pcb, include::bindings::bindings::process_do_exit,
-    net::net_core::net_init,
-};
+use crate::process::ProcessManager;
 
 // 声明全局的分配器
 #[cfg_attr(not(test), global_allocator)]
@@ -95,20 +93,6 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    println!("Current PCB:\n\t{:?}", current_pcb());
-    unsafe {
-        process_do_exit(u64::MAX);
-    };
-    loop {}
-}
-
-/// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数
-#[no_mangle]
-pub extern "C" fn __rust_demo_func() -> i32 {
-    printk_color!(FontColor::GREEN, FontColor::BLACK, "__rust_demo_func()\n");
-    let r = net_init();
-    if r.is_err() {
-        kwarn!("net_init() failed: {:?}", r.err().unwrap());
-    }
-    return 0;
+    println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
+    ProcessManager::exit(usize::MAX);
 }

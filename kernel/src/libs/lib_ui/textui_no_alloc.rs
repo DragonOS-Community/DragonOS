@@ -4,8 +4,10 @@ use core::{
 };
 
 use crate::{
-    driver::uart::uart::{c_uart_send, UartPort},
-    include::bindings::bindings::video_frame_buffer_info,
+    driver::{
+        uart::uart_device::{c_uart_send, UartPort},
+        video::video_refresh_manager,
+    },
     syscall::SystemError,
 };
 
@@ -21,15 +23,11 @@ pub static NO_ALLOC_OPERATIONS_INDEX: AtomicI32 = AtomicI32::new(0);
 
 /// 当系统刚启动的时候，由于内存管理未初始化，而texiui需要动态内存分配。因此只能暂时暴力往屏幕（video_frame_buffer_info）输出信息
 pub fn textui_init_no_alloc() {
-    TRUE_LINE_NUM.store(
-        unsafe { (video_frame_buffer_info.height / TEXTUI_CHAR_HEIGHT) as i32 },
-        Ordering::SeqCst,
-    );
+    let height = video_refresh_manager().device_buffer().height();
+    let width = video_refresh_manager().device_buffer().width();
+    TRUE_LINE_NUM.store((height / TEXTUI_CHAR_HEIGHT) as i32, Ordering::SeqCst);
 
-    CHAR_PER_LINE.store(
-        unsafe { (video_frame_buffer_info.width / TEXTUI_CHAR_WIDTH) as i32 },
-        Ordering::SeqCst,
-    );
+    CHAR_PER_LINE.store((width / TEXTUI_CHAR_WIDTH) as i32, Ordering::SeqCst);
 }
 
 pub fn no_init_textui_putchar_window(

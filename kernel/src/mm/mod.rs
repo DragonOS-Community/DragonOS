@@ -1,10 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::{
-    arch::MMArch,
-    include::bindings::bindings::{process_control_block, PAGE_OFFSET},
-    syscall::SystemError,
-};
+use crate::{arch::MMArch, include::bindings::bindings::PAGE_OFFSET, syscall::SystemError};
 
 use core::{
     cmp,
@@ -637,9 +633,3 @@ pub fn verify_area(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
 
     return Ok(());
 }
-// ====== 重构内存管理、进程管理后，请删除这几行 BEGIN ======
-//BUG pcb问题
-unsafe impl Send for process_control_block {}
-unsafe impl Sync for process_control_block {}
-
-// ====== 重构内存管理后，请删除这几行 END =======

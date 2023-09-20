@@ -25,9 +25,13 @@ SECTIONS
 	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
 	{
 		_text = .;
-		
+
+		/* any files' .text */
 		*(.text)
-		
+
+		/* any files' .text.*, for example: rust .text._ZN* */
+		*(.text.*)
+
 		_etext = .;
 	}
 	. = ALIGN(32768);

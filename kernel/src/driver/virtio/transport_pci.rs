@@ -89,7 +89,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
-    bus_device_function: BusDeviceFunction,
+    _bus_device_function: BusDeviceFunction,
     /// The common configuration structure within some BAR.
     common_cfg: NonNull<CommonCfg>,
     /// The start of the queue notification region within some BAR.
@@ -223,7 +223,7 @@ impl PciTransport {
         };
         Ok(Self {
             device_type,
-            bus_device_function,
+            _bus_device_function: bus_device_function,
             common_cfg,
             notify_region,
             notify_off_multiplier,
@@ -317,7 +317,6 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_device, device_area as u64);
             if queue == QUEUE_RECEIVE {
                 volwrite!(self.common_cfg, queue_msix_vector, VIRTIO_RECV_VECTOR_INDEX);
-                compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 let vector = volread!(self.common_cfg, queue_msix_vector);
                 if vector != VIRTIO_RECV_VECTOR_INDEX {
                     panic!("Vector set failed");

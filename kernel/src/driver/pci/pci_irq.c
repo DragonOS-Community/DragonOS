@@ -2,7 +2,9 @@
 #include "exception/irq.h"
 #include <common/errno.h>
 #include <common/kprint.h>
-#include <mm/slab.h>
+#include "common/string.h"
+#include "mm/slab.h"
+
 // 现在pci设备的中断由自己进行控制，这些不执行内容的函数是为了适配旧的中断处理机制
 void pci_irq_enable(ul irq_num)
 {
@@ -10,7 +12,7 @@ void pci_irq_enable(ul irq_num)
 void pci_irq_disable(ul irq_num)
 {
 }
-void pci_irq_install(ul irq_num)
+ul pci_irq_install(ul, void*)
 {
 }
 void pci_irq_uninstall(ul irq_num)
@@ -26,6 +28,7 @@ uint16_t c_irq_install(ul irq_num, void (*pci_irq_handler)(ul irq_num, ul parame
 {
     // 由于为I/O APIC分配的中断向量号是从32开始的，因此要减去32才是对应的interrupt_desc的元素
     irq_desc_t *p = NULL;
+    hardware_intr_controller *pci_interrupt_controller = NULL;
     if (irq_num >= 32 && irq_num < 0x80)
         p = &interrupt_desc[irq_num - 32];
     else if (irq_num >= 150 && irq_num < 200)
@@ -39,7 +42,6 @@ uint16_t c_irq_install(ul irq_num, void (*pci_irq_handler)(ul irq_num, ul parame
     {
         return EAGAIN;
     }
-    hardware_intr_controller *pci_interrupt_controller = NULL;
     pci_interrupt_controller = kmalloc(sizeof(hardware_intr_controller), 0);
     if (pci_interrupt_controller)
     {

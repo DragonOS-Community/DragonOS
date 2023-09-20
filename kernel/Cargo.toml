@@ -25,7 +25,10 @@ num-derive = "0.3"
 # 一个no_std的hashmap、hashset
 hashbrown = "0.13.2"
 elf = { version = "0.7.2", default-features = false }
+memoffset = "0.9.0"
 atomic_enum = "0.2.0"
+raw-cpuid = "11.0.1"
+acpi = "5.0.0"
 
 # 构建时依赖项
 [build-dependencies]

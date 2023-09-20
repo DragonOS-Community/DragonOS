@@ -89,13 +89,11 @@ impl Syscall {
     }
 
     pub fn sbrk(incr: isize) -> Result<VirtAddr, SystemError> {
-        // kdebug!("pid:{}, sbrk: incr={}", current_pcb().pid, incr);
-
         let address_space = AddressSpace::current()?;
+        assert!(address_space.read().user_mapper.utable.is_current());
         let mut address_space = address_space.write();
         let r = unsafe { address_space.sbrk(incr) };
 
-        // kdebug!("pid:{}, sbrk: r={:?}", current_pcb().pid, r);
         return r;
     }
 

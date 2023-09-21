@@ -186,17 +186,17 @@ impl ProcessManager {
         }
     }
 
-    /// 唤醒一个进程
+    /// 如果进程满足条件，则唤醒该进程
     pub fn wakeup_state(
         pcb: &Arc<ProcessControlBlock>,
-        state: ProcessFlags,
+        flags: ProcessFlags,
     ) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
         if state.is_blocked() {
             let mut writer = pcb.sched_info_mut();
             let state = writer.state();
-            if state.is_blocked() && pcb.flags().contains(state) {
+            if state.is_blocked() && pcb.flags().contains(flags) {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);
@@ -426,8 +426,10 @@ pub struct ProcessControlBlock {
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
-    /// 与信号处理相关的信息
+    /// 与信号处理相关的信息(似乎可以是无锁的)
     sig_info: RwLock<ProcessSignalInfo>,
+    /// 信号处理结构体
+    sig_struct: SpinLock<SignalStruct>,
 
     /// 父进程指针
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
@@ -494,6 +496,7 @@ impl ProcessControlBlock {
             sched_info,
             arch_info,
             sig_info: RwLock::new(ProcessSignalInfo::default()),
+            sig_struct: SpinLock::new(SignalStruct::default()),
             parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(HashMap::new()),
             wait_queue: WaitQueue::INIT,
@@ -679,6 +682,14 @@ impl ProcessControlBlock {
 
     pub fn sig_info_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
         self.sig_info.write()
+    }
+
+    pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
+        self.sig_struct.lock()
+    }
+
+    pub fn sig_struct_irq(&self) -> SpinLockGuard<SignalStruct> {
+        self.sig_struct.lock_irqsave()
     }
 }
 
@@ -993,18 +1004,13 @@ pub fn process_init() {
 
 #[derive(Debug)]
 pub struct ProcessSignalInfo {
-    sig_struct: Arc<SpinLock<SignalStruct>>,
-    sig_set: SigSet,
+    sig_block: SigSet,
     sig_pedding: SigPending,
 }
 
 impl ProcessSignalInfo {
-    pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
-        self.sig_struct.lock()
-    }
-
-    pub fn sig_set(&self) -> SigSet {
-        self.sig_set
+    pub fn sig_block(&self) -> SigSet {
+        self.sig_block
     }
 
     pub fn sig_pedding(&self) -> &SigPending {
@@ -1015,16 +1021,15 @@ impl ProcessSignalInfo {
         &mut self.sig_pedding
     }
 
-    pub fn sig_set_mut(&mut self) -> &mut SigSet {
-        &mut self.sig_set
+    pub fn sig_block_mut(&mut self) -> &mut SigSet {
+        &mut self.sig_block
     }
 }
 
 impl Default for ProcessSignalInfo {
     fn default() -> Self {
         Self {
-            sig_struct: Arc::new(SpinLock::new(SignalStruct::default())),
-            sig_set: SigSet::empty(),
+            sig_block: SigSet::empty(),
             sig_pedding: SigPending::default(),
         }
     }

@@ -156,6 +156,13 @@ impl ArchPCBInfo {
         self.fp_state.as_mut().unwrap().restore();
     }
 
+    pub fn clear_fp_state(&mut self) {
+        if unlikely(self.fp_state.is_none()) {
+            return;
+        }
+
+        self.fp_state.as_mut().unwrap().clear();
+    }
     pub unsafe fn save_fsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.fsbase = x86::current::segmentation::rdfsbase() as usize;
@@ -190,6 +197,10 @@ impl ArchPCBInfo {
 
     pub fn gsbase(&self) -> usize {
         self.gsbase
+    }
+
+    pub fn cr2_mut(&mut self) -> &mut usize {
+        &mut self.cr2
     }
 }
 

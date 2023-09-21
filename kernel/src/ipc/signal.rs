@@ -1,18 +1,20 @@
-use core::sync::atomic::compiler_fence;
+use core::{mem::size_of, sync::atomic::compiler_fence};
 
 use alloc::sync::Arc;
 
 use crate::{
-    include::bindings::bindings::{pt_regs, SA_FLAG_DFL},
+    arch::{asm::bitops::ffz, interrupt::TrapFrame},
+    include::bindings::bindings::{pt_regs, SA_FLAG_DFL, SA_FLAG_IGN},
     ipc::signal_types::{SigFlags, SigSet, SigactionType},
-    kdebug, kwarn,
+    kdebug, kerror, kwarn,
+    libs::spinlock::SpinLockGuard,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
-    syscall::SystemError,
+    syscall::{user_access::UserBufferWriter, SystemError},
 };
 
 use super::signal_types::{
-    SigCode, SigInfo, SigPending, SigQueue, SigType, Sigaction, SignalNumber, SignalStruct,
-    MAX_SIG_NUM,
+    SigCode, SigContext, SigFrame, SigHandler, SigInfo, SigPending, SigQueue, SigType, Sigaction,
+    SignalNumber, SignalStruct, MAX_SIG_NUM,
 };
 
 lazy_static! {
@@ -128,15 +130,16 @@ fn send_signal(
     // 是否强制发送信号
     let mut force_send = false;
     // signal的信息为空
-    if info.is_none() {
-        // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
+
+    if let Some(ref x) = info {
+        force_send = x.code() == (SigCode::SI_KERNEL as i32);
     } else {
-        force_send = info.unwrap().code() == (SigCode::SI_KERNEL as i32);
+        // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
     }
 
     // kdebug!("force send={}", force_send);
 
-    let _pending: &mut SigPending = pcb.sig_info().sig_pedding_mut();
+    let _pending = pcb.sig_info_mut().sig_pedding_mut();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // 如果是kill或者目标pcb是内核线程，则无需获取sigqueue，直接发送信号即可
     if sig == SignalNumber::SIGKILL || pcb.flags().contains(ProcessFlags::KTHREAD) {
@@ -147,7 +150,7 @@ fn send_signal(
         match info {
             Some(x) => {
                 // 已经显式指定了siginfo，则直接使用它。
-                q = x.clone();
+                q = (*x).clone();
             }
             None => {
                 // 不需要显示指定siginfo，因此设置为默认值
@@ -156,11 +159,13 @@ fn send_signal(
             }
         }
 
-        let sq: &mut SigQueue = ProcessManager::current_pcb()
+        ProcessManager::current_pcb()
             .sig_info_mut()
             .sig_pedding_mut()
-            .queue_mut();
-        sq.q.push(q);
+            .queue_mut()
+            .q
+            .push(q);
+
         complete_signal(sig, pcb, pt);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -186,13 +191,13 @@ fn complete_signal(sig: SignalNumber, pcb: Arc<ProcessControlBlock>, pt: PidType
     // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
     //      todo: 当引入进程组的概念后，需要完善这里，使得它能寻找一个目标进程来唤醒，接着执行信号处理的操作。
 
-    let _signal = pcb.sig_info_mut().sig_struct();
+    // let _signal = pcb.sig_struct();
 
     let mut _target: Option<Arc<ProcessControlBlock>> = None;
 
     // 判断目标进程是否想接收这个信号
-    if wants_signal(sig, pcb) {
-        _target = Some(pcb);
+    if wants_signal(sig, pcb.clone()) {
+        _target = Some(pcb.clone());
     } else if pt == PidType::PID {
         /*
          * There is just one thread and it does not need to be woken.
@@ -212,7 +217,7 @@ fn complete_signal(sig: SignalNumber, pcb: Arc<ProcessControlBlock>, pt: PidType
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // todo: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
     if _target.is_some() {
-        signal_wake_up(pcb, sig == SignalNumber::SIGKILL);
+        signal_wake_up(pcb.clone(), sig == SignalNumber::SIGKILL);
     }
 }
 
@@ -222,7 +227,7 @@ fn complete_signal(sig: SignalNumber, pcb: Arc<ProcessControlBlock>, pt: PidType
 #[inline]
 fn wants_signal(sig: SignalNumber, pcb: Arc<ProcessControlBlock>) -> bool {
     // 如果改进程屏蔽了这个signal，则不能接收
-    if pcb.sig_info().sig_set().contains(sig.into()) {
+    if pcb.sig_info().sig_block().contains(sig.into()) {
         return false;
     }
 
@@ -255,7 +260,7 @@ fn wants_signal(sig: SignalNumber, pcb: Arc<ProcessControlBlock>) -> bool {
 #[allow(dead_code)]
 #[inline]
 fn sig_fatal(pcb: Arc<ProcessControlBlock>, sig: SignalNumber) -> bool {
-    let action = pcb.sig_info().sig_struct().handler.0[sig as usize - 1].action();
+    let action = pcb.sig_struct().handler.0[sig as usize - 1].action();
     // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
     match action {
         SigactionType::SaHandler(handler) => handler.is_none(),
@@ -268,7 +273,7 @@ fn sig_fatal(pcb: Arc<ProcessControlBlock>, sig: SignalNumber) -> bool {
 #[inline]
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // kdebug!("signal_wake_up");
-    let mut state: ProcessFlags;
+    let mut state: ProcessFlags = ProcessFlags::empty();
     if fatal {
         state = ProcessFlags::WAKEKILL;
     }
@@ -280,106 +285,74 @@ fn signal_wake_up_state(pcb: Arc<ProcessControlBlock>, state: ProcessFlags) {
     // todo: 设置线程结构体的标志位为TIF_SIGPENDING
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
-    if !process_wake_up_state(pcb, state | (PROC_INTERRUPTIBLE as u64)) {
-        process_kick(pcb);
+    if ProcessManager::wakeup_state(&pcb, state).is_ok() {
+        ProcessManager::kick(&pcb);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
-/// @brief 信号处理函数。该函数在进程退出内核态的时候会被调用，且调用前会关闭中断。
-#[no_mangle]
-pub extern "C" fn do_signal(regs: &mut pt_regs) {
-    // 检查sigpending是否为0
-    if current_pcb().sig_pending.signal == 0 || (!user_mode(regs)) {
-        // 若没有正在等待处理的信号，或者将要返回到的是内核态，则启用中断，然后返回
-        sti();
-        return;
-    }
-
-    // 做完上面的检查后，开中断
-    sti();
-
-    let oldset = current_pcb().sig_blocked;
-    loop {
-        let (sig_number, info, ka) = get_signal_to_deliver(regs.clone());
-        // 所有的信号都处理完了
-        if sig_number == SignalNumber::INVALID {
-            return;
-        }
-        kdebug!(
-            "To handle signal [{}] for pid:{}",
-            sig_number as i32,
-            current_pcb().pid
-        );
-        let res = handle_signal(sig_number, ka.unwrap(), &info.unwrap(), &oldset, regs);
-        if res.is_err() {
-            kerror!(
-                "Error occurred when handling signal: {}, pid={}, errcode={:?}",
-                sig_number as i32,
-                current_pcb().pid,
-                res.unwrap_err()
-            );
-        }
-    }
-}
-
 /// @brief 获取要被发送的信号的signumber, SigInfo, 以及对应的sigaction结构体
-fn get_signal_to_deliver(
-    _regs: pt_regs,
-) -> (SignalNumber, Option<SigInfo>, Option<Arc<Sigaction>>) {
+pub fn get_signal_to_deliver(
+    frame: &TrapFrame,
+) -> (
+    SignalNumber,
+    Option<SigInfo>,
+    Option<&'static mut Sigaction>,
+) {
     let mut info: Option<SigInfo>;
     let ka: Option<&mut Sigaction>;
     let mut sig_number;
-    let sighand: &mut sighand_struct;
+    let pcb = ProcessManager::current_pcb();
+    let mut guard = pcb.sig_struct_irq();
+    let sighand = &mut guard.handler.clone();
 
-    {
-        let _tmp = sighand_struct::convert_mut(current_pcb().sighand);
-        if let Some(i) = _tmp {
-            sighand = i;
-        } else {
-            panic!("Sighand is NULL! pid={}", current_pcb().pid);
-        }
-    }
-
-    spin_lock_irq(&mut sighand.siglock);
     loop {
         (sig_number, info) =
-            dequeue_signal(SigSet::convert_mut(&mut current_pcb().sig_blocked).unwrap());
+            dequeue_signal(&mut ProcessManager::current_pcb().sig_info_mut().sig_block_mut());
 
         // 如果信号非法，则直接返回
         if sig_number == SignalNumber::INVALID {
-            spin_unlock_irq(unsafe { (&mut (*current_pcb().sighand).siglock) as *mut spinlock_t });
+            drop(guard);
             return (sig_number, None, None);
         }
-
+        let tmp_ka: &mut Sigaction;
         // 获取指向sigaction结构体的引用
-        let hand = sighand_struct::convert_mut(current_pcb().sighand).unwrap();
+        let hand = Arc::as_ptr(&guard.handler) as *mut SigHandler;
         // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
-        let tmp_ka = &mut hand.action[sig_number as usize - 1];
+        unsafe {
+            let r = hand.as_mut();
+            if r.is_none() {
+                panic!("error converting *mut SigHandler to &mut SigHandler");
+            }
+            tmp_ka = &mut r.unwrap().0[sig_number as usize - 1];
+        }
 
         // 如果当前动作是忽略这个信号，则不管它了。
-        if (tmp_ka.sa_flags & SA_FLAG_IGN) != 0 {
+        if tmp_ka.flags().contains(SigFlags::SA_FLAG_IGN) {
             continue;
-        } else if (tmp_ka.sa_flags & SA_FLAG_DFL) == 0 {
+        } else if !tmp_ka.flags().contains(SigFlags::SA_FLAG_IGN) {
             // 当前不采用默认的信号处理函数
             ka = Some(tmp_ka);
             break;
         }
         kdebug!(
-            "Use default handler to handle signal [{}] for pid {}",
+            "Use default handler to handle signal [{}] for pid {:?}",
             sig_number as i32,
-            current_pcb().pid
+            ProcessManager::current_pcb().pid()
         );
         // ===== 经过上面的判断，如果能走到这一步，就意味着我们采用默认的信号处理函数来处理这个信号 =====
-        spin_unlock_irq(&mut sighand.siglock);
+        drop(guard);
         // 标记当前进程由于信号而退出
-        current_pcb().flags |= PF_SIGNALED as u64;
+        ProcessManager::current_pcb()
+            .flags()
+            .insert(ProcessFlags::SIGNALED);
 
+        assert!(info.is_some());
         // 执行进程的退出动作
-        unsafe { process_do_exit(info.unwrap()._sinfo.data.si_signo as u64) };
+        ProcessManager::exit(info.unwrap().sig_no() as usize);
         /* NOT REACHED 这部分代码将不会到达 */
     }
-    spin_unlock_irq(&mut sighand.siglock);
+    drop(guard);
     return (sig_number, info, ka);
 }
 
@@ -389,7 +362,7 @@ fn dequeue_signal(sig_mask: &mut SigSet) -> (SignalNumber, Option<SigInfo>) {
     // kdebug!("dequeue signal");
     // 获取下一个要处理的信号的编号
     let sig = next_signal(
-        SigPending::convert_ref(&(current_pcb().sig_pending)).unwrap(),
+        &ProcessManager::current_pcb().sig_info().sig_pedding(),
         sig_mask,
     );
 
@@ -398,7 +371,9 @@ fn dequeue_signal(sig_mask: &mut SigSet) -> (SignalNumber, Option<SigInfo>) {
         // 如果下一个要处理的信号是合法的，则收集其siginfo
         info = Some(collect_signal(
             sig,
-            SigPending::convert_mut(&mut current_pcb().sig_pending).unwrap(),
+            ProcessManager::current_pcb()
+                .sig_info_mut()
+                .sig_pedding_mut(),
         ));
     } else {
         info = None;
@@ -417,18 +392,18 @@ fn dequeue_signal(sig_mask: &mut SigSet) -> (SignalNumber, Option<SigInfo>) {
 fn next_signal(pending: &SigPending, sig_mask: &SigSet) -> SignalNumber {
     let mut sig = SignalNumber::INVALID;
 
-    let s = pending.signal;
+    let s = pending.signal();
     let m = *sig_mask;
 
     // 获取第一个待处理的信号的号码
-    let x = s & (!m);
-    if x != 0 {
-        sig = SignalNumber::from(ffz(!x) + 1);
+    let x = s.intersection(m.complement());
+    if x.bits() != 0 {
+        sig = SignalNumber::from(ffz(x.complement().bits()) + 1);
         return sig;
     }
 
-    // 暂时只支持64种信号信号
-    assert_eq!(_NSIG_U64_CNT, 1);
+    // 暂时只支持64种信号
+    assert_eq!(crate::ipc::signal_types::_NSIG_U64_CNT, 1);
 
     return sig;
 }
@@ -444,216 +419,21 @@ fn recalc_sigpending() {
 /// @param pending 信号的排队等待标志
 /// @return SigInfo 信号的信息
 fn collect_signal(sig: SignalNumber, pending: &mut SigPending) -> SigInfo {
-    let (info, still_pending) = unsafe { pending.queue.as_mut() }
-        .unwrap()
-        .find_and_delete(sig);
+    let (info, still_pending) = pending.queue_mut().find_and_delete(sig);
 
     // 如果没有仍在等待的信号，则清除pending位
     if !still_pending {
-        sigset_del(&mut pending.signal, sig);
+        pending.signal_mut().remove(sig.into());
     }
 
     if info.is_some() {
         return info.unwrap();
     } else {
         // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-        let mut ret = SigInfo::new(sig, 0, si_code_val::SI_USER);
-        ret._sinfo.data._sifields._kill._pid = 0;
+        let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER);
+        ret.set_sig_type(SigType::Kill(Pid::new(0)));
         return ret;
     }
-}
-
-/// @brief 真正发送signal，执行自定义的处理函数
-///
-/// @param sig 信号number
-/// @param ka 信号响应动作
-/// @param info 信号信息
-/// @param oldset
-/// @param regs 之前的系统调用将要返回的时候，要弹出的栈帧的拷贝
-///
-/// @return Result<0,SystemError> 若Error, 则返回错误码,否则返回Ok(0)
-fn handle_signal(
-    sig: SignalNumber,
-    ka: &mut Sigaction,
-    info: &SigInfo,
-    oldset: &SigSet,
-    regs: &mut pt_regs,
-) -> Result<i32, SystemError> {
-    // 设置栈帧
-    let retval = setup_frame(sig, ka, info, oldset, regs);
-    if retval.is_err() {
-        return retval;
-    }
-    return Ok(0);
-}
-
-/// @brief 在用户栈上开辟一块空间，并且把内核栈的栈帧以及需要在用户态执行的代码给保存进去。
-///
-/// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
-fn setup_frame(
-    sig: SignalNumber,
-    ka: &mut Sigaction,
-    info: &SigInfo,
-    oldset: &SigSet,
-    regs: &mut pt_regs,
-) -> Result<i32, SystemError> {
-    let mut err = 0;
-    let frame: *mut sigframe = get_stack(ka, &regs, size_of::<sigframe>());
-    // kdebug!("frame=0x{:016x}", frame as usize);
-    // 要求这个frame的地址位于用户空间，因此进行校验
-    let access_check_ok = unsafe { verify_area(frame as u64, size_of::<sigframe>() as u64) };
-    if !access_check_ok {
-        // 如果地址区域位于内核空间，则直接报错
-        // todo: 生成一个sigsegv
-        kerror!("In setup frame: access check failed");
-        return Err(SystemError::EPERM);
-    }
-
-    unsafe {
-        (*frame).arg0 = sig as u64;
-        (*frame).arg1 = &((*frame).info) as *const SigInfo as usize;
-        (*frame).arg2 = &((*frame).context) as *const sigcontext as usize;
-        (*frame).handler = ka._u._sa_handler as usize as *mut c_void;
-    }
-
-    // 将当前进程的fp_state拷贝到用户栈
-    if current_pcb().fp_state != null_mut() {
-        unsafe {
-            let fp_state: &mut FpState = (current_pcb().fp_state as usize as *mut FpState)
-                .as_mut()
-                .unwrap();
-            (*frame).context.sc_stack.fpstate = *fp_state;
-            // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
-            fp_state.clear();
-        }
-    }
-    // 将siginfo拷贝到用户栈
-    err |= copy_siginfo_to_user(unsafe { &mut (*frame).info }, info).unwrap_or(1);
-
-    // todo: 拷贝处理程序备用栈的地址、大小、ss_flags
-
-    err |= setup_sigcontext(unsafe { &mut (*frame).context }, oldset, &regs).unwrap_or(1);
-
-    // 为了与Linux的兼容性，64位程序必须由用户自行指定restorer
-    if ka.sa_flags & SA_FLAG_RESTORER != 0 {
-        unsafe {
-            (*frame).ret_code_ptr = ka.sa_restorer as usize as *mut c_void;
-        }
-    } else {
-        kerror!(
-            "pid-{} forgot to set SA_FLAG_RESTORER for signal {}",
-            current_pcb().pid,
-            sig as i32
-        );
-        err = 1;
-    }
-    if err != 0 {
-        // todo: 在这里生成一个sigsegv,然后core dump
-        //临时解决方案：退出当前进程
-        unsafe {
-            process_do_exit(1);
-        }
-    }
-    // 传入信号处理函数的第一个参数
-    regs.rdi = sig as u64;
-    regs.rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
-    regs.rsp = frame as u64;
-    regs.rip = unsafe { ka._u._sa_handler };
-
-    // todo: 传入新版的sa_sigaction的处理函数的第三个参数
-
-    // 如果handler位于内核空间
-    if regs.rip >= USER_MAX_LINEAR_ADDR {
-        // 如果当前是SIGSEGV,则采用默认函数处理
-        if sig == SignalNumber::SIGSEGV {
-            ka.sa_flags |= SA_FLAG_DFL;
-        }
-
-        // 将rip设置为0
-        regs.rip = 0;
-    }
-
-    // 设置cs和ds寄存器
-    regs.cs = (USER_CS | 0x3) as u64;
-    regs.ds = (USER_DS | 0x3) as u64;
-
-    return if err == 0 {
-        Ok(0)
-    } else {
-        Err(SystemError::EPERM)
-    };
-}
-
-#[inline(always)]
-fn get_stack(_ka: &Sigaction, regs: &pt_regs, size: usize) -> *mut sigframe {
-    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小
-    let mut rsp: usize = (regs.rsp as usize) - 128 - size;
-    // 按照要求进行对齐
-    rsp &= (-(STACK_ALIGN as i64)) as usize;
-    return rsp as *mut sigframe;
-}
-
-/// @brief 将siginfo结构体拷贝到用户栈
-fn copy_siginfo_to_user(to: *mut SigInfo, from: &SigInfo) -> Result<i32, SystemError> {
-    // 验证目标地址是否为用户空间
-    if unsafe { !verify_area(to as u64, size_of::<SigInfo>() as u64) } {
-        // 如果目标地址空间不为用户空间，则直接返回错误码 -EPERM
-        return Err(SystemError::EPERM);
-    }
-
-    let retval: Result<i32, SystemError> = Ok(0);
-
-    // todo: 将这里按照si_code的类型来分别拷贝不同的信息。
-    // 这里参考linux-2.6.39  网址： http://opengrok.ringotek.cn/xref/linux-2.6.39/arch/ia64/kernel/signal.c#137
-
-    unsafe {
-        (*to)._sinfo.data._sifields._kill._pid = from._sinfo.data._sifields._kill._pid;
-    }
-
-    return retval;
-}
-
-/// @brief 设置目标的sigcontext
-///
-/// @param context 要被设置的目标sigcontext
-/// @param mask 要被暂存的信号mask标志位
-/// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
-fn setup_sigcontext(
-    context: &mut sigcontext,
-    mask: &SigSet,
-    regs: &pt_regs,
-) -> Result<i32, SystemError> {
-    let current_thread = current_pcb().thread;
-
-    context.oldmask = *mask;
-    context.regs = regs.clone();
-    context.trap_num = unsafe { (*current_thread).trap_num };
-    context.err_code = unsafe { (*current_thread).err_code };
-    context.cr2 = unsafe { (*current_thread).cr2 };
-    return Ok(0);
-}
-
-/// @brief 将指定的sigcontext恢复到当前进程的内核栈帧中,并将当前线程结构体的几个参数进行恢复
-///
-/// @param context 要被恢复的context
-/// @param regs 目标栈帧（也就是把context恢复到这个栈帧中）
-///
-/// @return bool true -> 成功恢复
-///              false -> 执行失败
-fn restore_sigcontext(context: *const sigcontext, regs: &mut pt_regs) -> bool {
-    let mut current_thread = current_pcb().thread;
-    unsafe {
-        *regs = (*context).regs;
-
-        (*current_thread).trap_num = (*context).trap_num;
-        (*current_thread).cr2 = (*context).cr2;
-        (*current_thread).err_code = (*context).err_code;
-
-        // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
-        *(current_pcb().fp_state as usize as *mut FpState) = (*context).sc_stack.fpstate;
-    }
-
-    return true;
 }
 
 /// @brief 刷新指定进程的sighand的sigaction，将满足条件的sigaction恢复为Default
@@ -661,19 +441,30 @@ fn restore_sigcontext(context: *const sigcontext, regs: &mut pt_regs) -> bool {
 ///
 /// @param pcb 要被刷新的pcb
 /// @param force_default 是否强制将sigaction恢复成默认状态
-pub fn flush_signal_handlers(pcb: *mut process_control_block, force_default: bool) {
+pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    let action = unsafe { &mut (*(*pcb).sighand).action };
+    let hand = Arc::as_ptr(&pcb.sig_struct().handler) as *mut SigHandler;
+    // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
+    let action: &mut [Sigaction; MAX_SIG_NUM as usize];
+    unsafe {
+        let r = hand.as_mut();
+        if r.is_none() {
+            panic!("error converting *mut SigHandler to &mut SigHandler");
+        }
+        action = &mut r.unwrap().0;
+    }
+
     for ka in action.iter_mut() {
-        if force_default || (ka.sa_flags != SA_FLAG_IGN) {
-            ka.sa_flags = SA_FLAG_DFL;
-            ka._u._sa_handler = None;
+        if force_default || !ka.flags().contains(SigFlags::SA_FLAG_IGN) {
+            ka.flags().insert(SigFlags::SA_FLAG_DFL);
+            ka.set_action(SigactionType::SaHandler(None));
         }
         // 清除flags中，除了DFL和IGN以外的所有标志
-        ka.sa_flags &= SA_FLAG_DFL | SA_FLAG_IGN;
-        ka.sa_restorer = None;
-        sigset_clear(&mut ka.sa_mask);
+
+        *ka.flags_mut() &= SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN;
+        ka.set_restorer(None);
+        ka.mask_mut().remove(SigSet::all());
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -684,17 +475,23 @@ pub fn do_sigaction(
     act: Option<&mut Sigaction>,
     old_act: Option<&mut Sigaction>,
 ) -> Result<(), SystemError> {
-    let pcb = current_pcb();
-
+    if sig == SignalNumber::INVALID {
+        return Err(SystemError::EINVAL);
+    }
+    let pcb = ProcessManager::current_pcb();
     // 指向当前信号的action的引用
-    let action =
-        Sigaction::convert_mut(unsafe { &mut (*(pcb.sighand)).action[(sig as usize) - 1] })
-            .unwrap();
+    let action: &mut Sigaction;
+    let hand = Arc::as_ptr(&pcb.sig_struct().handler) as *mut SigHandler;
+    // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
+    unsafe {
+        let r = hand.as_mut();
+        if r.is_none() {
+            panic!("error converting *mut SigHandler to &mut SigHandler");
+        }
+        action = &mut r.unwrap().0[sig as usize - 1];
+    }
 
-    spin_lock_irq(unsafe { &mut (*(pcb.sighand)).siglock });
-
-    if (action.sa_flags & SA_FLAG_IMMUTABLE) != 0 {
-        spin_unlock_irq(unsafe { &mut (*(pcb.sighand)).siglock });
+    if action.flags().contains(SigFlags::SA_FLAG_IMMUTABLE) {
         return Err(SystemError::EINVAL);
     }
 
@@ -714,7 +511,7 @@ pub fn do_sigaction(
     let act = {
         if act.is_some() {
             let ac = act.unwrap();
-            ac.sa_flags &= SA_ALL_FLAGS;
+            *ac.flags_mut() &= SigFlags::SA_FLAG_ALL;
             Some(ac)
         } else {
             None
@@ -722,20 +519,18 @@ pub fn do_sigaction(
     };
 
     if old_act.is_some() {
-        old_act.unwrap().sa_flags &= SA_ALL_FLAGS;
+        *old_act.unwrap().flags_mut() &= SigFlags::SA_FLAG_ALL;
     }
 
     if act.is_some() {
         let ac = act.unwrap();
         // 将act.sa_mask的SIGKILL SIGSTOP的屏蔽清除
-        sigset_delmask(
-            &mut ac.sa_mask,
-            sigmask(SignalNumber::SIGKILL) | sigmask(SignalNumber::SIGSTOP),
+        ac.mask_mut().remove(
+            SigSet::from(SignalNumber::SIGKILL.into()) | SigSet::from(SignalNumber::SIGSTOP.into()),
         );
 
         // 将新的sigaction拷贝到进程的action中
         *action = *ac;
-
         /*
         * 根据POSIX 3.3.1.3规定：
         * 1.不管一个信号是否被阻塞，只要将其设置SIG_IGN，如果当前已经存在了正在pending的信号，那么就把这个信号忽略。
@@ -743,77 +538,41 @@ pub fn do_sigaction(
         * 2.不管一个信号是否被阻塞，只要将其设置SIG_DFL，如果当前已经存在了正在pending的信号，
               并且对这个信号的默认处理方式是忽略它，那么就会把pending的信号忽略。
         */
-        if action.ignored(sig) {
-            let mut mask: SigSet = 0;
-            sigset_clear(&mut mask);
-            sigset_add(&mut mask, sig);
-            let sq: &mut SigQueue = SigQueue::from_c_void(pcb.sig_pending.sigqueue);
-            sq.flush_by_mask(&mask);
+        if action.ignore(sig) {
+            let mut mask: SigSet = SigSet::from_bits_truncate(0);
+            mask.insert(sig.into());
+            pcb.sig_info_mut()
+                .sig_pedding_mut()
+                .queue_mut()
+                .flush_by_mask(&mask);
 
             // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
         }
     }
 
-    spin_unlock_irq(unsafe { &mut (*(pcb.sighand)).siglock });
     return Ok(());
 }
 
-/// @brief 对于给定的signal number，将u64中对应的位进行置位
-pub fn sigmask(sig: SignalNumber) -> u64 {
-    // 减1的原因是，sigset的第0位表示信号1
-    return 1u64 << ((sig as i32) - 1);
-}
-
-pub fn sys_rt_sigreturn(regs: &mut pt_regs) -> u64 {
-    let frame = regs.rsp as usize as *mut sigframe;
-
-    // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
-    if unsafe { !verify_area(frame as u64, size_of::<sigframe>() as u64) } {
-        // todo：这里改为生成一个sigsegv
-        // 退出进程
-        unsafe {
-            process_do_exit(SignalNumber::SIGSEGV as u64);
-        }
-    }
-
-    let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
-    set_current_sig_blocked(&mut sigmask);
-
-    // 从用户栈恢复sigcontext
-    if restore_sigcontext(unsafe { &mut (*frame).context }, regs) == false {
-        // todo：这里改为生成一个sigsegv
-        // 退出进程
-        unsafe {
-            process_do_exit(SignalNumber::SIGSEGV as u64);
-        }
-    }
-
-    // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
-    return regs.rax;
-}
-
-fn set_current_sig_blocked(new_set: &mut SigSet) {
-    sigset_delmask(
-        new_set,
-        sigmask(SignalNumber::SIGKILL) | sigmask(SignalNumber::SIGSTOP),
+pub fn set_current_sig_blocked(new_set: &mut SigSet) {
+    new_set.remove(
+        SigSet::from(SignalNumber::SIGKILL.into()) | SigSet::from(SignalNumber::SIGSTOP.into()),
     );
 
-    let mut pcb = current_pcb();
+    let pcb = ProcessManager::current_pcb();
 
     /*
         如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
         请注意，一个进程的sig_blocked字段不能被其他进程修改！
     */
-    if sigset_equal(&pcb.sig_blocked, new_set) {
+    if pcb.sig_info().sig_block().eq(new_set) {
         return;
     }
 
-    let lock: &mut spinlock_t = &mut sighand_struct::convert_mut(pcb.sighand).unwrap().siglock;
-    spin_lock_irq(lock);
+    let guard = pcb.sig_struct_irq();
     // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
 
     // 设置当前进程的sig blocked
-    pcb.sig_blocked = *new_set;
+    *pcb.sig_info_mut().sig_block_mut() = *new_set;
     recalc_sigpending();
-    spin_unlock_irq(lock);
+    drop(guard);
 }

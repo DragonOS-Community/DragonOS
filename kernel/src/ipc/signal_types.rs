@@ -1,4 +1,4 @@
-use core::{ffi::c_void, sync::atomic::AtomicI64};
+use core::{cell::Cell, ffi::c_void, sync::atomic::AtomicI64};
 
 use alloc::{sync::Arc, vec::Vec};
 
@@ -24,8 +24,6 @@ pub type __sigrestorer_t = __sigrestorer_fn_t;
 pub const MAX_SIG_NUM: i32 = 64;
 /// sigset所占用的u64的数量（改动这个值的时候请同步到signal.h)
 pub const _NSIG_U64_CNT: i32 = MAX_SIG_NUM / 64;
-/// 信号处理的栈的栈指针的最小对齐数量
-pub const STACK_ALIGN: u64 = 16;
 
 /// 用户态程序传入的SIG_DFL的值
 pub const USER_SIG_DFL: u64 = 0;
@@ -102,6 +100,23 @@ impl From<usize> for SignalNumber {
     }
 }
 
+impl Into<usize> for SignalNumber {
+    fn into(self) -> usize {
+        self as usize
+    }
+}
+
+impl From<i32> for SignalNumber {
+    fn from(value: i32) -> Self {
+        if value < 0 {
+            kerror!("Try to convert an invalid number to SignalNumber");
+            return SignalNumber::INVALID;
+        } else {
+            return Self::from(value as usize);
+        }
+    }
+}
+
 impl Into<SigSet> for SignalNumber {
     fn into(self) -> SigSet {
         SigSet {
@@ -161,6 +176,7 @@ bitflags! {
         const SA_FLAG_IGN = 1 << 1; // 当前sigaction表示忽略信号的动作
         const SA_FLAG_RESTORER = 1 << 2; // 当前sigaction具有用户指定的restorer
         const SA_FLAG_IMMUTABLE = 1 << 3; // 当前sigaction不可被更改
+        const SA_FLAG_ALL = Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_IGN.bits()|Self::SA_FLAG_IMMUTABLE.bits()|Self::SA_FLAG_RESTORER.bits();
     }
 
     /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，SignalNumber-1才是sigset_t中对应的位
@@ -173,7 +189,7 @@ bitflags! {
 #[derive(Debug)]
 pub struct SignalStruct {
     pub cnt: AtomicI64,
-    pub handler: SigHandler,
+    pub handler: Arc<SigHandler>,
 }
 
 impl Default for SignalStruct {
@@ -201,13 +217,6 @@ pub enum SigactionType {
 
 /// 信号处理结构体
 ///
-/// ## 参数
-///
-/// - `kstack`：内核栈的引用，如果为None，则不会设置rsp和rbp。如果为Some，则会设置rsp和rbp为内核栈的最高地址。
-///
-/// ## 返回值
-///
-/// 返回一个新的ArchPCBInfo
 #[derive(Debug, Copy, Clone)]
 pub struct Sigaction {
     action: SigactionType,
@@ -253,6 +262,34 @@ impl Sigaction {
     pub fn action(&self) -> SigactionType {
         self.action
     }
+
+    pub fn flags(&self) -> SigFlags {
+        self.flags
+    }
+
+    pub fn restorer(&self) -> Option<u64> {
+        self.restorer
+    }
+
+    pub fn flags_mut(&mut self) -> &mut SigFlags {
+        &mut self.flags
+    }
+
+    pub fn set_action(&mut self, action: SigactionType) {
+        self.action = action;
+    }
+
+    pub fn mask(&self) -> SigSet {
+        self.mask
+    }
+
+    pub fn mask_mut(&mut self) -> &mut SigSet {
+        &mut self.mask
+    }
+
+    pub fn set_restorer(&mut self, restorer: Option<__sigrestorer_t>) {
+        self.restorer = restorer;
+    }
 }
 
 /// 用户态传入的sigaction结构体（符合posix规范）
@@ -270,6 +307,8 @@ pub struct UserSigaction {
  * siginfo中，根据signal的来源不同，该info中对应了不同的数据./=
  * 请注意，该info最大占用16字节
  */
+
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {
     sig_no: i32,
@@ -322,6 +361,8 @@ impl SigInfo {
     }
 }
 
+/// 在获取SigHandler的外部就获取到了锁，所以这里是不会有任何竞争的，只是处于内部可变性的需求
+/// 才使用了SpinLock，这里并不会带来太多的性能开销
 #[derive(Debug)]
 pub struct SigHandler(pub [Sigaction; MAX_SIG_NUM as usize]);
 
@@ -331,14 +372,6 @@ impl Default for SigHandler {
     }
 }
 
-#[derive(Debug)]
-pub struct LockedSigHandler(pub Arc<SpinLock<SigHandler>>);
-
-impl Default for LockedSigHandler {
-    fn default() -> Self {
-        LockedSigHandler(Arc::new(SpinLock::new(SigHandler::default())))
-    }
-}
 #[derive(Debug)]
 pub struct SigPending {
     signal: SigSet,
@@ -394,12 +427,11 @@ pub struct SigContext {
     /// sigcontext的标志位
     pub sc_flags: u64,
     pub sc_stack: SigStack, // 信号处理程序备用栈信息
-    // TODO 是否要换成 TrapFrame
-    pub regs: TrapFrame, // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
-    pub trap_num: u64,   // 用来保存线程结构体中的trap_num字段
-    pub oldmask: u64,    // 暂存的执行信号处理函数之前的，被设置block的信号
+    pub frame: TrapFrame,   // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
+    // pub trap_num: u64,    // 用来保存线程结构体中的trap_num字段
+    pub oldmask: SigSet, // 暂存的执行信号处理函数之前的，被设置block的信号
     pub cr2: u64,        // 用来保存线程结构体中的cr2字段
-    pub err_code: u64,   // 用来保存线程结构体中的err_code字段
+    // pub err_code: u64,    // 用来保存线程结构体中的err_code字段
     // todo: 支持x87浮点处理器后，在这里增加浮点处理器的状态结构体指针
     pub reserved_for_x87_state: u64,
     pub reserved: [u64; 8],

@@ -10,7 +10,7 @@ use crate::{
 };
 // use crate::virt::kvm::guest_code;
 use crate::virt::kvm::KVM;
-use self::vmx::mmu::{kvm_mmu_calculate_mmu_pages, kvm_vcpu_mtrr_init};
+use self::vmx::mmu::kvm_vcpu_mtrr_init;
 use self::vmx::vcpu::VmxVcpu;
 pub mod vmx;
 

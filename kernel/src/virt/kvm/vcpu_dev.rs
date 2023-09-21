@@ -1,4 +1,7 @@
+use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
 use crate::kdebug;
+use crate::mm::VirtAddr;
+use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::KVM;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
@@ -21,6 +24,9 @@ use crate::virt::kvm::vcpu::Vcpu;
 
 // pub const KVM_API_VERSION:u32 = 12;
 pub const KVM_RUN: u32 = 0x00;
+pub const KVM_GET_REGS: u32 = 0x01;
+pub const KVM_SET_REGS: u32 = 0x02;
+
 
 // pub const GUEST_STACK_SIZE:usize = 1024;
 // pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
@@ -139,7 +145,7 @@ impl IndexNode for LockedVcpuInode {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn ioctl(&self, cmd: u32, _data: usize) -> Result<usize, SystemError> {
+    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
                 kdebug!("kvm_cpu ioctl");
@@ -147,7 +153,6 @@ impl IndexNode for LockedVcpuInode {
             },
             KVM_RUN =>{
                 kdebug!("kvm_cpu ioctl");
-                let vcpu = &KVM().lock().vcpu[0];
                 // let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
                 // let host_stack = vec![0xCC; HOST_STACK_SIZE];
                 // let guest_rsp = guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64;
@@ -155,7 +160,30 @@ impl IndexNode for LockedVcpuInode {
                 // let hypervisor = Hypervisor::new(1, host_rsp, 0).expect("Cannot create hypervisor");
                 // let vcpu = VmxVcpu::new(1, Arc::new(Mutex::new(hypervisor)), host_rsp, guest_rsp,  guest_code as *const () as u64).expect("Cannot create VcpuData");
                 // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
-                (*vcpu.lock()).virtualize_cpu()?;
+                let vcpu = &KVM().lock().vcpu[0];
+                (*vcpu).lock().virtualize_cpu()?;
+                Ok(0)
+            }
+            KVM_SET_REGS => {
+                let mut kvm_regs = VcpuContextFrame::default();
+                unsafe {
+                    copy_from_user(
+                        core::slice::from_raw_parts_mut(
+                            (&mut kvm_regs as *mut _ )as *mut u8, 
+                            core::mem::size_of::<VcpuContextFrame>()
+                        ), 
+                        VirtAddr::new(data)
+                    )?;
+                }
+                kdebug!("rip={:x}, rflags={:x}, rsp={:x}, rax={:x}",
+                    kvm_regs.rip,
+                    kvm_regs.rflags,
+                    kvm_regs.regs[6],
+                    kvm_regs.regs[0],  
+                );
+                let vcpu = &KVM().lock().vcpu[0];
+                (*vcpu).lock().set_regs(kvm_regs)?;
+
                 Ok(0)
             }
             _ => {

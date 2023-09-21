@@ -148,30 +148,31 @@ pub struct GuestCpuContext{
 pub extern "C" fn vmx_return(){
     kdebug!("vmx_return!");
     unsafe {save_rpg()};
+    vmexit_handler();
     // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
-    unsafe {asm!(
-        "sub     rsp, 60h",
-        "movaps  xmmword ptr [rsp +  0h], xmm0",
-        "movaps  xmmword ptr [rsp + 10h], xmm1",
-        "movaps  xmmword ptr [rsp + 20h], xmm2",
-        "movaps  xmmword ptr [rsp + 30h], xmm3",
-        "movaps  xmmword ptr [rsp + 40h], xmm4",
-        "movaps  xmmword ptr [rsp + 50h], xmm5",
+    // unsafe {asm!(
+    //     "sub     rsp, 60h",
+    //     "movaps  xmmword ptr [rsp +  0h], xmm0",
+    //     "movaps  xmmword ptr [rsp + 10h], xmm1",
+    //     "movaps  xmmword ptr [rsp + 20h], xmm2",
+    //     "movaps  xmmword ptr [rsp + 30h], xmm3",
+    //     "movaps  xmmword ptr [rsp + 40h], xmm4",
+    //     "movaps  xmmword ptr [rsp + 50h], xmm5",
 
-        "mov     rdi, rsp",
-        "sub     rsp, 20h",
-        "call vmexit_handler",
-        "add     rsp, 20h",
+    //     "mov     rdi, rsp",
+    //     "sub     rsp, 20h",
+    //     "call vmexit_handler",
+    //     "add     rsp, 20h",
 
-        "movaps  xmm0, xmmword ptr [rsp +  0h]",
-        "movaps  xmm1, xmmword ptr [rsp + 10h]",
-        "movaps  xmm2, xmmword ptr [rsp + 20h]",
-        "movaps  xmm3, xmmword ptr [rsp + 30h]",
-        "movaps  xmm4, xmmword ptr [rsp + 40h]",
-        "movaps  xmm5, xmmword ptr [rsp + 50h]",
-        "add     rsp, 60h",
-    clobber_abi("C"),
-    )};
+    //     "movaps  xmm0, xmmword ptr [rsp +  0h]",
+    //     "movaps  xmm1, xmmword ptr [rsp + 10h]",
+    //     "movaps  xmm2, xmmword ptr [rsp + 20h]",
+    //     "movaps  xmm3, xmmword ptr [rsp + 30h]",
+    //     "movaps  xmm4, xmmword ptr [rsp + 40h]",
+    //     "movaps  xmm5, xmmword ptr [rsp + 50h]",
+    //     "add     rsp, 60h",
+    // clobber_abi("C"),
+    // )};
     unsafe{restore_rpg()};
     unsafe{asm!(
         "vmresume",
@@ -179,7 +180,7 @@ pub extern "C" fn vmx_return(){
 }
 
 #[no_mangle]
-extern "C" fn vmexit_handler(_guest_cpu_context_ptr: *mut GuestCpuContext){
+extern "C" fn vmexit_handler(){
     // let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
     // kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
     kdebug!("vmexit handler!");
@@ -228,9 +229,9 @@ extern "C" fn vmexit_handler(_guest_cpu_context_ptr: *mut GuestCpuContext){
             error_code |= (exit_qualification << 2) & (1 << 4);
             /* ept page table is present? */
             error_code |= (exit_qualification >> 3) & (1 << 0);
-            let kvm = KVM();
-            let vcpu = KVM().lock().vcpu[0].lock();
-            vcpu.mmu.page_fault(&mut (*vcpu), gpa, error_code as u32, false).unwrap();
+            let kvm = KVM().lock();
+            let mut vcpu = kvm.vcpu[0].lock();
+            // vcpu.mmu.page_fault(& (*vcpu), gpa, error_code as u32, false).unwrap();
             // kvm_ept_page_fault();
         }
         _ => {

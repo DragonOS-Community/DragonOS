@@ -3,6 +3,7 @@ use x86::{
 };
 use raw_cpuid::CpuId;
 use x86;
+use crate::arch::kvm::vmx::VcpuRegIndex;
 use crate::arch::kvm::vmx::mmu::KvmMmu;
 use crate::arch::mm::{LockedFrameAllocator, PageMapper};
 use crate::virt::kvm::GUEST_STACK_SIZE;
@@ -25,6 +26,7 @@ use super::vmcs::{VMCSRegion, VmcsFields,
     VmxEntryCtrl, VmxPrimaryExitCtrl,
     VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl
 };
+use super::vmexit::vmx_return;
 use super::vmx_asm_wrapper::{
     vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmlaunch, vmx_vmptrld, vmx_vmclear
 };
@@ -59,8 +61,12 @@ pub struct VcpuData {
     pub msr_bitmap_physical_address: u64,
 }
 
+#[derive(Default)]
+#[repr(C)]
 pub struct VcpuContextFrame{
-    regs: [usize; NR_VCPU_REGS], // 通用寄存器
+    pub regs: [usize; NR_VCPU_REGS], // 通用寄存器
+    pub rip: usize,
+    pub rflags: usize,
 }
 
 
@@ -81,28 +87,32 @@ pub struct VmxVcpu {
 
 impl VcpuData {
     pub fn alloc() -> Result<Self, SystemError> {
-        let vmxon_region = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
-        let vmcs_region = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
-        let msr_bitmap = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
+        let vmxon_region: Box<VmxonRegion> = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
+        let vmcs_region:Box<VMCSRegion> = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
+        let msr_bitmap: Box<MSRBitmap> = unsafe { Box::try_new_zeroed_in(Global).expect("Try new zeroed fail!").assume_init() };
+        // FIXME: virt_2_phys的转换正确性存疑
+        let vmxon_region_physical_address = {
+            let vaddr = VirtAddr::new(vmxon_region.as_ref() as *const _ as _);
+            unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
+        };
+        let vmcs_region_physical_address = {
+            let vaddr = VirtAddr::new(vmcs_region.as_ref() as *const _ as _);
+            unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
+        };
+        let msr_bitmap_physical_address = {
+            let vaddr = VirtAddr::new(msr_bitmap.as_ref() as *const _ as _);
+            unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
+        };
+
         let mut instance = Self {
             // Allocate a naturally aligned 4-KByte VMXON region of memory to enable VMX operation (Intel Manual: 25.11.5 VMXON Region)
             vmxon_region,
-            // FIXME: virt_2_phys的转换正确性存疑
-            vmxon_region_physical_address: {
-                let vaddr = VirtAddr::new(vmxon_region.as_ref() as *const _ as _);
-                unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
-            },
+            vmxon_region_physical_address,
             // Allocate a naturally aligned 4-KByte VMCS region of memory 
             vmcs_region,
-            vmcs_region_physical_address: {
-                let vaddr = VirtAddr::new(vmcs_region.as_ref() as *const _ as _);
-                unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
-            },
+            vmcs_region_physical_address,
             msr_bitmap,
-            msr_bitmap_physical_address: {
-                let vaddr = VirtAddr::new(msr_bitmap.as_ref() as *const _ as _);
-                unsafe {MMArch::virt_2_phys(vaddr).unwrap().data() as u64}
-            },
+            msr_bitmap_physical_address,
         };
         printk_color!(GREEN, BLACK, "[+] init_region\n");
         instance.init_region()?;
@@ -132,6 +142,8 @@ impl VmxVcpu {
             vcpu_id,
             vcpu_ctx: VcpuContextFrame{
                 regs: [0; NR_VCPU_REGS],
+                rip: 0,
+                rflags: 0,
             },
             vcpu_state: VcpuState::VcpuInv,
             mmu: KvmMmuEpt::default(),
@@ -230,10 +242,10 @@ impl VmxVcpu {
             VmcsFields::GUEST_DR7 as u32, 
             unsafe{ x86::debugregs::dr7().0 as u64 }
         )?;
-        vmx_vmwrite(VmcsFields::GUEST_RSP as u32, self.guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64)?;
-        vmx_vmwrite(VmcsFields::GUEST_RIP as u32, self.data.guest_rip as u64)?;
-        kdebug!("vmcs init guest rip: {:#x}", self.data.guest_rip as u64);
-        kdebug!("vmcs init guest rsp: {:#x}", self.guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64);
+        vmx_vmwrite(VmcsFields::GUEST_RSP as u32, self.vcpu_ctx.regs[VcpuRegIndex::Rsp as usize] as u64)?;
+        vmx_vmwrite(VmcsFields::GUEST_RIP as u32, self.vcpu_ctx.rip as u64)?;
+        kdebug!("vmcs init guest rip: {:#x}", self.vcpu_ctx.rip as u64);
+        kdebug!("vmcs init guest rsp: {:#x}", self.vcpu_ctx.regs[VcpuRegIndex::Rsp as usize] as u64);
 
         // vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, x86::bits64::rflags::read().bits())?;
         vmx_vmwrite(VmcsFields::GUEST_DEBUGCTL as u32, unsafe {msr::rdmsr(msr::IA32_DEBUGCTL)})?;
@@ -334,8 +346,16 @@ impl VmxVcpu {
 
         let ept_root_hpa = mapper.table().phys();
         self.mmu.set_eptp(ept_root_hpa.data() as u64);
+        kdebug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
+
         return Ok(());
     }
+
+    pub fn set_regs(&mut self, regs: VcpuContextFrame) -> Result<(), SystemError> {
+        self.vcpu_ctx = regs;
+        Ok(())
+    }
+
 }
 
 impl Vcpu for VmxVcpu {
@@ -369,7 +389,7 @@ impl Vcpu for VmxVcpu {
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32, x86::bits64::registers::rsp())?;
         // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32,  x86::bits64::registers::rsp())?;
-        self.kvm_mmu_load();
+        self.kvm_mmu_load()?;
 
         match vmx_vmlaunch() {
             Ok(_) => {},

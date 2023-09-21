@@ -23,6 +23,8 @@
 #define KVM_SET_USER_MEMORY_REGION 0x01
 
 #define KVM_RUN 0x00
+#define KVM_GET_REGS 0x01
+#define KVM_SET_REGS 0x02
 
 struct kvm_userspace_memory_region {
     uint32_t slot; // 要在哪个slot上注册内存区间
@@ -32,6 +34,15 @@ struct kvm_userspace_memory_region {
     uint64_t guest_phys_addr; // 虚机内存区间起始物理地址
     uint64_t memory_size;     // 虚机内存区间大小
     uint64_t userspace_addr;  // 虚机内存区间对应的主机虚拟地址
+};
+
+struct kvm_regs {
+	/* out (KVM_GET_REGS) / in (KVM_SET_REGS) */
+	uint64_t rax, rbx, rcx, rdx;
+	uint64_t rsi, rdi, rsp, rbp;
+	uint64_t r8,  r9,  r10, r11;
+	uint64_t r12, r13, r14, r15;
+	uint64_t rip, rflags;
 };
 
 // int guest_code(){
@@ -69,6 +80,14 @@ int main()
 
     int vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, 0);
     printf("vcpufd=%d\n", vcpufd);
+    int user_entry = 0x0;
+
+    struct kvm_regs regs = {0};
+    regs.rip = user_entry;
+    regs.rsp = 0x3000; // stack address
+    regs.rflags = 0x2; // in x86 the 0x2 bit should always be set
+    ioctl(vcpufd, KVM_SET_REGS, &regs); // set registers
+
     ioctl(vcpufd, KVM_RUN, 0);
 
     return 0;

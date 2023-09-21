@@ -6,6 +6,8 @@ pub mod ept;
 pub mod mmu;
 pub mod kvm_emulation;
 
+
+#[allow(dead_code)]
 pub enum VcpuRegIndex {
 	Rax = 0,
 	Rbx = 1,

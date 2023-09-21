@@ -1,24 +1,21 @@
 use core::arch::asm;
 use alloc::sync::Arc;
 use raw_cpuid::CpuId;
+use crate::arch::kvm::vmx::vmcs::VmcsFields;
+use crate::arch::kvm::vmx::vmx_asm_wrapper::{vmx_vmlaunch, vmx_vmread};
 use crate::libs::mutex::Mutex;
-use crate::virt::kvm::host_mem::{KvmMemorySlot, KvmUserspaceMemoryRegion, KvmMemoryChange};
+use crate::virt::kvm::vm;
 use crate::{
     kerror, kdebug,
     // libs::spinlock::{SpinLock, SpinLockGuard},
     syscall::SystemError,
 };
 // use crate::virt::kvm::guest_code;
-use crate::virt::kvm::KVM;
-use self::vmx::mmu::kvm_vcpu_mtrr_init;
+use self::vmx::mmu::{kvm_vcpu_mtrr_init, kvm_mmu_setup};
 use self::vmx::vcpu::VmxVcpu;
 pub mod vmx;
 
-pub const KVM_MMU_HASH_SHIFT: u32 = 10;
-pub const KVM_NUM_MMU_PAGES: u32 = 1 << KVM_MMU_HASH_SHIFT;
-pub const KVM_NR_MEM_OBJS:u32 = 40;
-
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct X86_64KVMArch {
     // n_used_mmu_pages: u32,
     // n_requested_mmu_pages: u32, 
@@ -67,34 +64,45 @@ impl X86_64KVMArch{
 
     pub fn kvm_arch_vcpu_create(id: u32) -> Result<Arc<Mutex<VmxVcpu>>, SystemError> {
         // let guest_rip = current_kvm.lock().memslots[0].memslots[0].userspace_addr;
-        let vcpu = VmxVcpu::new(id, KVM().clone()).unwrap();
+        let vcpu = VmxVcpu::new(id, vm(0).unwrap()).unwrap();
         return Ok(Arc::new(Mutex::new(vcpu)));
     }
     
     pub fn kvm_arch_vcpu_setup(vcpu: &Mutex<VmxVcpu>) -> Result<(), SystemError> {
         kvm_vcpu_mtrr_init(vcpu)?;
-        // kvm_mmu_setup(vcpu);
+        kvm_mmu_setup(vcpu);
         Ok(())
     }
-
-    pub fn kvm_arch_create_memslot(_slot: &mut KvmMemorySlot, _npages: u64) {
-
+    pub fn kvm_arch_vcpu_ioctl_run(_vcpu: &Mutex<VmxVcpu>) -> Result<(), SystemError> {
+        match vmx_vmlaunch() {
+            Ok(_) => {},
+            Err(e) => {
+                let vmx_err = vmx_vmread(VmcsFields::VMEXIT_INSTR_ERR as u32).unwrap();
+                kdebug!("vmlaunch failed: {:?}", vmx_err);
+                return Err(e);
+            },
+        }
+        Ok(())
     }
+    
+    // pub fn kvm_arch_create_memslot(_slot: &mut KvmMemorySlot, _npages: u64) {
 
-    pub fn kvm_arch_commit_memory_region(
-        _mem: &KvmUserspaceMemoryRegion, 
-        _new_slot: &KvmMemorySlot,
-        _old_slot: &KvmMemorySlot,
-        _change: KvmMemoryChange) {
-            // let kvm = KVM();
-            // let mut num_mmu_pages = 0;
-            // if kvm.lock().arch.n_requested_mmu_pages == 0{
-		    //     num_mmu_pages = kvm_mmu_calculate_mmu_pages();
-            // }
-            // if num_mmu_pages != 0 {
-            //     // kvm_mmu_change_mmu_pages(num_mmu_pages);
-            // }
-    }
+    // }
+
+    // pub fn kvm_arch_commit_memory_region(
+    //     _mem: &KvmUserspaceMemoryRegion, 
+    //     _new_slot: &KvmMemorySlot,
+    //     _old_slot: &KvmMemorySlot,
+    //     _change: KvmMemoryChange) {
+    //         // let kvm = KVM();
+    //         // let mut num_mmu_pages = 0;
+    //         // if kvm.lock().arch.n_requested_mmu_pages == 0{
+	// 	    //     num_mmu_pages = kvm_mmu_calculate_mmu_pages();
+    //         // }
+    //         // if num_mmu_pages != 0 {
+    //         //     // kvm_mmu_change_mmu_pages(num_mmu_pages);
+    //         // }
+    // }
 }
 
 #[no_mangle]

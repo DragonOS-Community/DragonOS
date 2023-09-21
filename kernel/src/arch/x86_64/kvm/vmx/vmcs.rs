@@ -1,11 +1,10 @@
 use num_derive::FromPrimitive;    
-use num_traits::FromPrimitive;
 use bitflags::bitflags;
 
 pub const PAGE_SIZE: usize = 0x1000;
 
 #[repr(C, align(4096))]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VMCSRegion {
     pub revision_id: u32,
     pub abort_indicator: u32, 
@@ -491,11 +490,11 @@ const fn encode_vmcs_field_full(
     encode_vmcs_field(VmcsAccessType::FULL, vmcs_type, vmcs_width, index)
 }
 
-fn decode_vmcs_field(field: u32) -> (VmcsAccessType, VmcsType, VmcsWidth, u16){
-    (FromPrimitive::from_u32(field & 1).unwrap() ,
-        FromPrimitive::from_u32((field>>10) & 0x3).unwrap(), 
-        FromPrimitive::from_u32((field>>13) & 0x3).unwrap(), 
-        ((field>>1) & 0x1ff) as u16
-    )
-}
+// fn decode_vmcs_field(field: u32) -> (VmcsAccessType, VmcsType, VmcsWidth, u16){
+//     (FromPrimitive::from_u32(field & 1).unwrap() ,
+//         FromPrimitive::from_u32((field>>10) & 0x3).unwrap(), 
+//         FromPrimitive::from_u32((field>>13) & 0x3).unwrap(), 
+//         ((field>>1) & 0x1ff) as u16
+//     )
+// }
 

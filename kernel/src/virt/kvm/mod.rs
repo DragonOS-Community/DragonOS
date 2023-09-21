@@ -1,10 +1,8 @@
-use alloc::sync::Arc;
-use core::ptr::null_mut;
-
+use alloc::vec::Vec;
 use crate::kdebug;
 use crate::filesystem::devfs::devfs_register;
 use self::kvm_dev::LockedKvmInode;
-use hypervisor::Hypervisor;
+use vm::Vm;
 use crate::arch::KVMArch;
 use crate::libs::mutex::Mutex;
 
@@ -12,22 +10,46 @@ mod kvm_dev;
 mod vm_dev;
 mod vcpu_dev;
 pub mod vcpu;
-pub mod hypervisor;
+pub mod vm;
 pub mod host_mem;
 
 // pub const KVM_MAX_VCPUS:u32 = 255;
-pub const GUEST_STACK_SIZE:usize = 1024;
-pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
+// pub const GUEST_STACK_SIZE:usize = 1024;
+// pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
 
-static mut __KVM: *mut Arc<Mutex<Hypervisor>> = null_mut();
+/// @brief 获取全局的VM list
+pub static VM_LIST: Mutex<Vec<Vm>> = Mutex::new(Vec::new());
 
-/// @brief 获取全局的KVM
-#[inline(always)]
-#[allow(non_snake_case)]
-pub fn KVM() -> &'static Arc<Mutex<Hypervisor>> {
-    unsafe {
-        return __KVM.as_ref().unwrap();
+pub fn push_vm(id: usize) -> Result<(), ()> {
+    let mut vm_list = VM_LIST.lock();
+    if vm_list.iter().any(|x| x.id == id) {
+        kdebug!("push_vm: vm {} already exists", id);
+        Err(())
+    } else {
+        vm_list.push(Vm::new(id).unwrap());
+        Ok(())
     }
+}
+
+pub fn remove_vm(id: usize) -> Vm {
+    let mut vm_list = VM_LIST.lock();
+    match vm_list.iter().position(|x| x.id == id) {
+        None => {
+            panic!("VM[{}] not exist in VM LIST", id);
+        }
+        Some(idx) => vm_list.remove(idx),
+    }
+}
+
+pub fn update_vm(id: usize, new_vm: Vm){
+    remove_vm(id);
+    let mut vm_list = VM_LIST.lock();
+    vm_list.push(new_vm);
+}
+
+pub fn vm(id: usize) -> Option<Vm> {
+    let vm_list = VM_LIST.lock();
+    vm_list.iter().find(|&x| x.id == id).cloned()
 }
 
 #[no_mangle]

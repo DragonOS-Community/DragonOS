@@ -3,32 +3,26 @@ use x86::{
 };
 use raw_cpuid::CpuId;
 use x86;
+use crate::virt::kvm::vm::Vm;
 use crate::arch::kvm::vmx::VcpuRegIndex;
 use crate::arch::kvm::vmx::mmu::KvmMmu;
 use crate::arch::mm::{LockedFrameAllocator, PageMapper};
-use crate::virt::kvm::GUEST_STACK_SIZE;
 use crate::{kdebug, printk_color, GREEN, BLACK};
 use alloc::boxed::Box;
 use alloc::alloc::Global;
-use alloc::sync::Arc;
-use core::arch::asm;
 use core::slice;
-use crate::libs::mutex::Mutex;
 use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, PageTableKind};
 use crate::mm::{VirtAddr, phys_2_virt};
 use crate::syscall::SystemError;
-use crate::virt::kvm::hypervisor::Hypervisor;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::arch::x86_64::mm::X86_64MMArch;
-use super::mmu::KvmMmuEpt;
 use super::vmcs::{VMCSRegion, VmcsFields, 
     VmxEntryCtrl, VmxPrimaryExitCtrl,
     VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl
 };
-use super::vmexit::vmx_return;
 use super::vmx_asm_wrapper::{
-    vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmlaunch, vmx_vmptrld, vmx_vmclear
+    vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmptrld, vmx_vmclear
 };
 // use crate::virt::kvm::{KVM};
 
@@ -37,16 +31,19 @@ pub const PAGE_SIZE: usize = 0x1000;
 pub const NR_VCPU_REGS: usize = 16;
 
 #[repr(C, align(4096))]
+#[derive(Debug)]
 pub struct VmxonRegion {
     pub revision_id: u32,
     pub data: [u8; PAGE_SIZE - 4],
 }
 
 #[repr(C, align(4096))]
+#[derive(Debug)]
 pub struct MSRBitmap {
     pub data: [u8; PAGE_SIZE],
 }
 
+#[derive(Debug)]
 pub struct VcpuData {
     /// The virtual and physical address of the Vmxon naturally aligned 4-KByte region of memory
     pub vmxon_region: Box<VmxonRegion>,
@@ -61,7 +58,7 @@ pub struct VcpuData {
     pub msr_bitmap_physical_address: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 #[repr(C)]
 pub struct VcpuContextFrame{
     pub regs: [usize; NR_VCPU_REGS], // 通用寄存器
@@ -69,20 +66,22 @@ pub struct VcpuContextFrame{
     pub rflags: usize,
 }
 
-
+#[derive(Debug)]
+#[allow(dead_code)]
 pub enum VcpuState {
     VcpuInv = 0,
     VcpuPend = 1,
     VcpuAct = 2,
 }
 
+#[derive(Debug)]
 pub struct VmxVcpu {
     pub vcpu_id: u32,
     pub vcpu_ctx: VcpuContextFrame, // 保存vcpu切换时的上下文，如通用寄存器等
     pub vcpu_state: VcpuState, // vcpu当前运行状态
-    pub mmu: KvmMmuEpt,    // vcpu的内存管理单元
+    pub mmu: KvmMmu,    // vcpu的内存管理单元
     pub data: VcpuData, // vcpu的数据
-    pub hypervisor: Arc<Mutex<Hypervisor>>, // parent KVM
+    pub parent_vm: Vm, // parent KVM
 }
 
 impl VcpuData {
@@ -136,7 +135,7 @@ impl VcpuData {
 
 
 impl VmxVcpu {
-    pub fn new(vcpu_id: u32, hypervisor: Arc<Mutex<Hypervisor>>) -> Result<Self, SystemError> {
+    pub fn new(vcpu_id: u32, parent_vm: Vm) -> Result<Self, SystemError> {
         kdebug!("Creating processor {}", vcpu_id);
         let instance = Self {
             vcpu_id,
@@ -146,9 +145,9 @@ impl VmxVcpu {
                 rflags: 0,
             },
             vcpu_state: VcpuState::VcpuInv,
-            mmu: KvmMmuEpt::default(),
+            mmu: KvmMmu::default(),
             data: VcpuData::alloc()?, 
-            hypervisor: hypervisor.clone(),
+            parent_vm,
         };
         Ok(instance)
     }
@@ -254,6 +253,7 @@ impl VmxVcpu {
         Ok(())
     }
 
+    #[allow(deprecated)]
     pub fn vmcs_init_host(&self) -> Result<(), SystemError>{
         vmx_vmwrite(
             VmcsFields::HOST_CR0 as u32, 
@@ -345,7 +345,8 @@ impl VmxVcpu {
         };
 
         let ept_root_hpa = mapper.table().phys();
-        self.mmu.set_eptp(ept_root_hpa.data() as u64);
+        let set_eptp_fn = self.mmu.set_eptp.unwrap();
+        set_eptp_fn(ept_root_hpa.data() as u64)?;
         kdebug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
 
         return Ok(());
@@ -390,15 +391,6 @@ impl Vcpu for VmxVcpu {
         // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32,  x86::bits64::registers::rsp())?;
         self.kvm_mmu_load()?;
-
-        match vmx_vmlaunch() {
-            Ok(_) => {},
-            Err(e) => {
-                let vmx_err = vmx_vmread(VmcsFields::VMEXIT_INSTR_ERR as u32).unwrap();
-                kdebug!("vmlaunch failed: {:?}", vmx_err);
-                return Err(e);
-            },
-        }
         Ok(())
     }
 
@@ -433,23 +425,23 @@ pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u
 }
 
 // FIXME: may have bug
-pub fn read_segment_access_rights(segement_selector: u16) -> u32{
-    let table = segement_selector & 0x0004; // get table indicator in selector
-    let index = segement_selector & 0xFFF8; // get index in selector
-    let mut flag: u16;
-    if table==0 && index==0 {
-        return 0;
-    }
-    unsafe{
-        asm!(
-            "lar {0:r}, rcx",
-            "mov {1:r}, {0:r}",
-            in(reg) segement_selector,
-            out(reg) flag,
-        );
-    }
-    return (flag >> 8) as u32;
-}
+// pub fn read_segment_access_rights(segement_selector: u16) -> u32{
+//     let table = segement_selector & 0x0004; // get table indicator in selector
+//     let index = segement_selector & 0xFFF8; // get index in selector
+//     let mut flag: u16;
+//     if table==0 && index==0 {
+//         return 0;
+//     }
+//     unsafe{
+//         asm!(
+//             "lar {0:r}, rcx",
+//             "mov {1:r}, {0:r}",
+//             in(reg) segement_selector,
+//             out(reg) flag,
+//         );
+//     }
+//     return (flag >> 8) as u32;
+// }
 pub fn adjust_vmx_controls(ctl_min:u32, ctl_opt:u32, msr:u32, result: &mut u32){
     let vmx_msr_low:u32 = unsafe {(msr::rdmsr(msr) & 0x0000_0000_FFFF_FFFF) as u32};
     let vmx_msr_high:u32 = unsafe {(msr::rdmsr(msr) >> 32) as u32};

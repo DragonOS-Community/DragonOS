@@ -1,6 +1,6 @@
 
 use crate::{syscall::SystemError, mm::{VirtAddr, kernel_mapper::KernelMapper, page::PageFlags}};
-use super::{vcpu::Vcpu, KVM};
+use super::{vcpu::Vcpu, vm};
 
 
 /*
@@ -28,10 +28,10 @@ pub const KVM_MEM_MAX_NR_PAGES :u32 = (1 << 31) -1;
  * include/linux/kvm_h.
  */
 pub const  KVM_MEMSLOT_INVALID:u32 = 1 << 16;
-pub const  KVM_MEMSLOT_INCOHERENT:u32 = 1 << 17;
+// pub const  KVM_MEMSLOT_INCOHERENT:u32 = 1 << 17;
 
-pub const KVM_PERMILLE_MMU_PAGES: u32 = 20; //  the proportion of MMU pages required per thousand (out of 1000) memory pages.
-pub const KVM_MIN_ALLOC_MMU_PAGES: u32 = 64;
+// pub const KVM_PERMILLE_MMU_PAGES: u32 = 20; //  the proportion of MMU pages required per thousand (out of 1000) memory pages.
+// pub const KVM_MIN_ALLOC_MMU_PAGES: u32 = 64;
 
 pub const PAGE_SHIFT:u32 = 12;
 pub const PAGE_SIZE:u32 = 1 << PAGE_SHIFT;
@@ -50,7 +50,7 @@ pub struct KvmUserspaceMemoryRegion {
     pub userspace_addr: u64,  // 虚机内存区间对应的主机虚拟地址
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct KvmMemorySlot{
     pub base_gfn: u64, // 虚机内存区间起始物理页框号
     pub npages: u64,   // 虚机内存区间页数，即内存区间的大小
@@ -62,7 +62,7 @@ pub struct KvmMemorySlot{
 	// unsigned long *rmap[KVM_NR_PAGE_SIZES]; 反向映射相关的结构, 创建EPT页表项时就记录GPA对应的页表项地址(GPA-->页表项地址)，暂时不需要
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct KvmMemorySlots{
     pub memslots: [KvmMemorySlot; KVM_MEM_SLOTS_NUM as usize], // 虚机内存区间数组
     pub used_slots: u32, // 已经使用的slot数量
@@ -74,7 +74,6 @@ pub enum KvmMemoryChange{
     Delete,
 	Move,
 	FlagsOnly,
-    Invalid,
 }
 
 impl Default for KvmUserspaceMemoryRegion {
@@ -90,9 +89,9 @@ impl Default for KvmUserspaceMemoryRegion {
 }
 
 pub fn kvm_vcpu_memslots(_vcpu: &mut dyn Vcpu) -> KvmMemorySlots{
-    let kvm = KVM();
+    let kvm = vm(0).unwrap();
     let as_id = 0;
-    return kvm.lock().memslots[as_id];
+    return kvm.memslots[as_id];
 }
 
 fn __gfn_to_memslot(slots: KvmMemorySlots, gfn: u64) -> Option<KvmMemorySlot>{

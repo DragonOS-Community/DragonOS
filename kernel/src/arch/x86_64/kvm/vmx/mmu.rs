@@ -1,21 +1,14 @@
-use alloc::boxed::Box;
 use bitfield_struct::bitfield;
 use crate::{
-    virt::kvm::{
-        KVM, 
+    virt::kvm:: 
         host_mem::{
-            KVM_ADDRESS_SPACE_NUM, 
-            KVM_MEM_SLOTS_NUM, 
-            KVM_PERMILLE_MMU_PAGES, 
-            KVM_MIN_ALLOC_MMU_PAGES, 
             PAGE_SHIFT, 
             kvm_vcpu_gfn_to_memslot, 
             __gfn_to_pfn, PAGE_MASK
-        }
-    }, 
+        }, 
     syscall::SystemError, 
     arch::kvm::vmx::ept::EptMapper, 
-    mm::{page::PageFlags, syscall::ProtFlags}, libs::mutex::Mutex
+    mm::{page::PageFlags, syscall::ProtFlags}, libs::mutex::Mutex, kdebug
 };
 
 use super::{
@@ -25,20 +18,19 @@ use super::{
         vmx_vmwrite
     }, 
     vmcs::VmcsFields, 
-    kvm_emulation::X86Exception, ept::check_ept_features
+    ept::check_ept_features
 };
-use super::super::KVM_NR_MEM_OBJS;
 use crate::arch::kvm::vmx::mmu::VmcsFields::CTRL_EPTP_PTR;
 
-pub const PT64_ROOT_LEVEL: u32 = 4;
-pub const PT32_ROOT_LEVEL: u32 = 2;
-pub const PT32E_ROOT_LEVEL: u32 = 3;
+// pub const PT64_ROOT_LEVEL: u32 = 4;
+// pub const PT32_ROOT_LEVEL: u32 = 2;
+// pub const PT32E_ROOT_LEVEL: u32 = 3;
 
-pub struct KvmMmuPage{
-    gfn: u64, // 管理地址范围的起始地址对应的 gfn
-    role: KvmMmuPageRole, // 基本信息，包括硬件特性和所属层级等
-    // spt: *mut u64, // spt: shadow page table,指向 struct page 的地址，其包含了所有页表项 (pte)。同时 page->private 会指向该 kvm_mmu_page
-}
+// pub struct KvmMmuPage{
+//     gfn: u64, // 管理地址范围的起始地址对应的 gfn
+//     role: KvmMmuPageRole, // 基本信息，包括硬件特性和所属层级等
+//     // spt: *mut u64, // spt: shadow page table,指向 struct page 的地址，其包含了所有页表项 (pte)。同时 page->private 会指向该 kvm_mmu_page
+// }
 
 #[bitfield(u32)]
 pub struct KvmMmuPageRole{
@@ -63,91 +55,96 @@ pub struct KvmMmuPageRole{
 
 //  We don't want allocation failures within the mmu code, so we preallocate
 // enough memory for a single page fault in a cache.
-pub struct KvmMmuMemoryCache {
-    num_objs: u32,
-    objs: [*mut u8; KVM_NR_MEM_OBJS as usize],
-}
-
-pub trait KvmMmu {
-    fn get_cr3 (&self, vcpu: &VmxVcpu) -> u64;
-    // fn get_pdptr(&self, vcpu: & VmxVcpu, index:u32) -> u64;
-    fn set_eptp(&self, eptp: u64);
-
-    fn page_fault (&self, vcpu: &mut VmxVcpu, gpa: u64, error_code: u32, prefault: bool) -> Result<(), SystemError>;
-    // fn inject_page_fault(&self, vcpu: &mut VmxVcpu, fault: &X86Exception);
-
-    // fn gva_to_gpa(&self, vcpu: &mut VmxVcpu, gva: u64, access: u32, exception: &X86Exception) -> u64;
-    // fn translate_gpa(&self, vcpu: &mut VmxVcpu, gpa: u64, access: u32, exception: &X86Exception) -> u64;
-    // fn sync_page(&self, vcpu: &mut VmxVcpu, page: &mut KvmMmuPage);
-    // fn invlpg(&self, vcpu: &mut VmxVcpu, gva: u64);
-    // fn update_pte(&self, vcpu: &mut VmxVcpu, sp: &KvmMmuPage, spte: u64, pte: u64);
-
-}
+// pub struct KvmMmuMemoryCache {
+//     num_objs: u32,
+//     objs: [*mut u8; KVM_NR_MEM_OBJS as usize],
+// }
 
 #[derive(Default)]
-pub struct KvmMmuEpt{
+pub struct KvmMmu {
     root_hpa: u64,
     root_level: u32,
     base_role: KvmMmuPageRole,
     // ...还有一些变量不知道用来做什么
+
+    get_cr3: Option<fn(& VmxVcpu) -> u64>,
+    pub set_eptp: Option<fn(u64) -> Result<(), SystemError>>,
+    pub page_fault: Option<fn(vcpu: &mut VmxVcpu, gpa: u64, error_code: u32, prefault: bool) -> Result<(), SystemError>>,
+    
+    // get_pdptr: Option<fn(& VmxVcpu, index:u32) -> u64>, // Page Directory Pointer Table Register?暂时不知道和CR3的区别是什么
+    // inject_page_fault: Option<fn(&mut VmxVcpu, fault: &X86Exception)>,
+    // gva_to_gpa: Option<fn(&mut VmxVcpu, gva: u64, access: u32, exception: &X86Exception) -> u64>,
+    // translate_gpa: Option<fn(&mut VmxVcpu, gpa: u64, access: u32, exception: &X86Exception) -> u64>,
+    // sync_page: Option<fn(&mut VmxVcpu, &mut KvmMmuPage)>,
+    // invlpg: Option<fn(&mut VmxVcpu, gva: u64)>, // invalid entry
+    // update_pte: Option<fn(&mut VmxVcpu, sp: &KvmMmuPage, spte: u64, pte: u64)>,
 }
 
-impl KvmMmu for KvmMmuEpt {
-    fn get_cr3(&self, _vcpu: &VmxVcpu) -> u64 {
-        let guest_cr3 = vmx_vmread(VmcsFields::GUEST_CR3 as u32)
-            .expect("Failed to read eptp");
-        return guest_cr3;
+impl core::fmt::Debug for KvmMmu {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KvmMmu").field("root_hpa", &self.root_hpa)
+            .field("root_level", &self.root_level)
+            .field("base_role", &self.base_role)
+            .finish()
     }
-    
-    fn set_eptp(&self, root_hpa: u64) {
-        // 设置权限位，目前是写死的，可读可写可执行
-        //  EPT paging-structure memory type: Uncacheable
-        let mut eptp = 0x0 as u64;
-        // This value is 1 less than the EPT page-walk length.  3 means 4-level paging.
-        eptp |= 0x3 << 3;
-        eptp |= root_hpa & (PAGE_MASK as u64);
-        vmx_vmwrite(CTRL_EPTP_PTR as u32, eptp);
-    }
+}
 
-    fn page_fault(&self, vcpu: &mut VmxVcpu, gpa: u64, error_code: u32, prefault: bool) -> Result<(), SystemError> {
-        let gfn = gpa >> PAGE_SHIFT; // 物理地址右移12位得到物理页框号(相对于虚拟机而言)
-        // 分配缓存池，为了避免在运行时分配空间失败，这里提前分配/填充足额的空间
-        mmu_topup_memory_caches(vcpu)?; 
-        // TODO：获取gfn使用的level，处理hugepage的问题
-        let level = 1; // 4KB page
-        // TODO: 快速处理由读写操作引起violation，即present同时有写权限的非mmio page fault
-        // fast_page_fault(vcpu, gpa, level, error_code)
-        // gfn->pfn
-        let mut map_writable = false;
-        let write = error_code & ((1 as u32) << 1);
-        let pfn = mmu_gfn_to_pfn_fast(vcpu, gpa, prefault, gfn, write==0, &mut map_writable)?;
-        // direct map就是映射ept页表的过程
-        __direct_map(vcpu, gpa,write, map_writable,
-            level, gfn, pfn, prefault)?;
-        Ok(())
-    }
+fn tdp_get_cr3(_vcpu: &VmxVcpu) -> u64 {
+    let guest_cr3 = vmx_vmread(VmcsFields::GUEST_CR3 as u32)
+        .expect("Failed to read eptp");
+    return guest_cr3;
+}
+
+fn tdp_set_eptp(root_hpa: u64) -> Result<(), SystemError> {
+    // 设置权限位，目前是写死的，可读可写可执行
+    //  EPT paging-structure memory type: Uncacheable
+    let mut eptp = 0x0 as u64;
+    // This value is 1 less than the EPT page-walk length.  3 means 4-level paging.
+    eptp |= 0x3 << 3;
+    eptp |= root_hpa & (PAGE_MASK as u64);
+    vmx_vmwrite(CTRL_EPTP_PTR as u32, eptp)?;
+    Ok(())
+}
+
+fn tdp_page_fault(vcpu: &mut VmxVcpu, gpa: u64, error_code: u32, prefault: bool) -> Result<(), SystemError> {
+    kdebug!("tdp_page_fault");
+    let gfn = gpa >> PAGE_SHIFT; // 物理地址右移12位得到物理页框号(相对于虚拟机而言)
+    // 分配缓存池，为了避免在运行时分配空间失败，这里提前分配/填充足额的空间
+    mmu_topup_memory_caches(vcpu)?; 
+    // TODO：获取gfn使用的level，处理hugepage的问题
+    let level = 1; // 4KB page
+    // TODO: 快速处理由读写操作引起violation，即present同时有写权限的非mmio page fault
+    // fast_page_fault(vcpu, gpa, level, error_code)
+    // gfn->pfn
+    let mut map_writable = false;
+    let write = error_code & ((1 as u32) << 1);
+    let pfn = mmu_gfn_to_pfn_fast(vcpu, gpa, prefault, gfn, write==0, &mut map_writable)?;
+    // direct map就是映射ept页表的过程
+    __direct_map(vcpu, gpa,write, map_writable,
+        level, gfn, pfn, prefault)?;
+    Ok(())
 }
 
 /*
  * Caculate mmu pages needed for kvm.
  */
-pub fn kvm_mmu_calculate_mmu_pages() -> u32 {
-	let mut nr_mmu_pages:u32;
-    let mut nr_pages = 0;
+// pub fn kvm_mmu_calculate_mmu_pages() -> u32 {
+// 	let mut nr_mmu_pages:u32;
+//     let mut nr_pages = 0;
        
-    let kvm = KVM();
-    for as_id in 0..KVM_ADDRESS_SPACE_NUM {
-        let slots = kvm.lock().memslots[as_id];
-        for i in 0..KVM_MEM_SLOTS_NUM {
-            let memslot = slots.memslots[i as usize];
-            nr_pages += memslot.npages;
-        }
-    }
+//     let kvm = vm(0).unwrap();
+//     for as_id in 0..KVM_ADDRESS_SPACE_NUM {
+//         let slots = kvm.memslots[as_id];
+//         for i in 0..KVM_MEM_SLOTS_NUM {
+//             let memslot = slots.memslots[i as usize];
+//             nr_pages += memslot.npages;
+//         }
+//     }
 	
-	nr_mmu_pages = (nr_pages as u32)* KVM_PERMILLE_MMU_PAGES / 1000;
-	nr_mmu_pages = nr_mmu_pages.max(KVM_MIN_ALLOC_MMU_PAGES);
-	return nr_mmu_pages;
-}
+// 	nr_mmu_pages = (nr_pages as u32)* KVM_PERMILLE_MMU_PAGES / 1000;
+// 	nr_mmu_pages = nr_mmu_pages.max(KVM_MIN_ALLOC_MMU_PAGES);
+// 	return nr_mmu_pages;
+// }
 
 // pub fn kvm_mmu_change_mmu_pages(mut goal_nr_mmu_pages: u32){
 //     let kvm = KVM();
@@ -165,22 +162,25 @@ pub fn kvm_mmu_calculate_mmu_pages() -> u32 {
 //     kvm.lock().arch.n_max_mmu_pages = goal_nr_mmu_pages;
 // }
 
-pub fn prepare_zap_oldest_mmu_page() -> bool {
-    return false;
-}
-
-// pub fn kvm_mmu_setup(vcpu: &Mutex<VmxVcpu>) {
-//     // TODO: init_kvm_softmmu(vcpu), init_kvm_nested_mmu(vcpu)
-//     init_kvm_tdp_mmu(vcpu);
+// pub fn prepare_zap_oldest_mmu_page() -> bool {
+//     return false;
 // }
 
-pub fn kvm_vcpu_mtrr_init(vcpu: &Mutex<VmxVcpu>) -> Result<(), SystemError> {
+pub fn kvm_mmu_setup(vcpu: &Mutex<VmxVcpu>) {
+    // TODO: init_kvm_softmmu(vcpu), init_kvm_nested_mmu(vcpu)
+    init_kvm_tdp_mmu(vcpu);
+}
+
+pub fn kvm_vcpu_mtrr_init(_vcpu: &Mutex<VmxVcpu>) -> Result<(), SystemError> {
     check_ept_features()?;
     Ok(())
 }
 
-// pub fn init_kvm_tdp_mmu(vcpu: &Mutex<VmxVcpu>){
-//     let context = &mut vcpu.lock().mmu;
+pub fn init_kvm_tdp_mmu(vcpu: &Mutex<VmxVcpu>){
+    let context = &mut vcpu.lock().mmu;
+    context.page_fault = Some(tdp_page_fault);
+    context.get_cr3 = Some(tdp_get_cr3);
+    context.set_eptp = Some(tdp_set_eptp);
 	// context.inject_page_fault = kvm_inject_page_fault; TODO: inject_page_fault
 	// context.invlpg = nonpaging_invlpg;
 	// context.sync_page = nonpaging_sync_page;
@@ -201,7 +201,7 @@ pub fn kvm_vcpu_mtrr_init(vcpu: &Mutex<VmxVcpu>) -> Result<(), SystemError> {
     //     context.gva_to_gpa = paging32_gva_to_gpa;
     //     context.root_level = PT32_ROOT_LEVEL;
     // }
-// }
+}
 
 
 pub fn __direct_map(vcpu: &mut VmxVcpu, gpa: u64, _write: u32,

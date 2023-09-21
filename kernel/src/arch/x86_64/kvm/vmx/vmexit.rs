@@ -1,12 +1,11 @@
 use super::vmx_asm_wrapper::{
    vmx_vmwrite, vmx_vmread
 };
-use crate::{syscall::SystemError, virt::kvm::KVM};
-use x86::{cpuid::cpuid, vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL};
+use crate::{syscall::SystemError, virt::kvm::vm};
+use x86::vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL;
 use core::arch::asm;
 use crate::kdebug;
 use super::vmcs::{VmcsFields, VmxExitReason};
-use crate::arch::x86_64::kvm::vmx::mmu::KvmMmu;
 
 #[derive(FromPrimitive)]
 #[allow(non_camel_case_types)]
@@ -72,18 +71,18 @@ pub fn vmexit_vmx_instruction_executed() -> Result<(), SystemError>{
     Ok(())
 }
 
-pub fn vmexit_cpuid_handler(guest_cpu_context: &mut GuestCpuContext) -> Result<(), SystemError>{
-    let rax = guest_cpu_context.rax;
-    let rcx = guest_cpu_context.rcx;
-    // let rdx = guest_cpu_context.rdx;
-    // let rbx = guest_cpu_context.rbx;
-    cpuid!(rax, rcx);
-    unsafe{asm!("mov {}, rax", out(reg) guest_cpu_context.rax)};
-    unsafe{asm!("mov {}, rcx", out(reg) guest_cpu_context.rcx)};
-    unsafe{asm!("mov {}, rdx", out(reg) guest_cpu_context.rdx)};
-    unsafe{asm!("mov {}, rbx", out(reg) guest_cpu_context.rbx)};
-    Ok(())
-}
+// pub fn vmexit_cpuid_handler(guest_cpu_context: &mut GuestCpuContext) -> Result<(), SystemError>{
+//     let rax = guest_cpu_context.rax;
+//     let rcx = guest_cpu_context.rcx;
+//     // let rdx = guest_cpu_context.rdx;
+//     // let rbx = guest_cpu_context.rbx;
+//     cpuid!(rax, rcx);
+//     unsafe{asm!("mov {}, rax", out(reg) guest_cpu_context.rax)};
+//     unsafe{asm!("mov {}, rcx", out(reg) guest_cpu_context.rcx)};
+//     unsafe{asm!("mov {}, rdx", out(reg) guest_cpu_context.rdx)};
+//     unsafe{asm!("mov {}, rbx", out(reg) guest_cpu_context.rbx)};
+//     Ok(())
+// }
 
 unsafe fn save_rpg(){
     asm!(
@@ -126,6 +125,7 @@ unsafe fn restore_rpg(){
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 pub struct GuestCpuContext{
     pub r15: u64,
     pub r14: u64,
@@ -199,7 +199,7 @@ extern "C" fn vmexit_handler(){
         VmxExitReason::VMXON | VmxExitReason::VMFUNC | VmxExitReason::INVEPT | 
         VmxExitReason::INVVPID => {
             kdebug!("vmexit handler: vmx instruction!");
-            vmexit_vmx_instruction_executed();
+            vmexit_vmx_instruction_executed().expect("previledge instruction handle error");
         },
         VmxExitReason::CPUID => {
             kdebug!("vmexit handler: cpuid instruction!");
@@ -219,7 +219,7 @@ extern "C" fn vmexit_handler(){
             kdebug!("vmexit handler: triple fault!");
             adjust_rip(guest_rip).unwrap();
         },
-        VmxExitReason::EPT_VIOLATION => {
+        VmxExitReason::EPT_VIOLATION | VmxExitReason::EXCEPTION_OR_NMI=> {
             kdebug!("vmexit handler: ept violation!");
             let gpa = vmx_vmread(GUEST_PHYSICAL_ADDR_FULL as u32).unwrap();
             let exit_qualification = vmx_vmread(VmcsFields::VMEXIT_QUALIFICATION as u32).unwrap();
@@ -229,10 +229,12 @@ extern "C" fn vmexit_handler(){
             error_code |= (exit_qualification << 2) & (1 << 4);
             /* ept page table is present? */
             error_code |= (exit_qualification >> 3) & (1 << 0);
-            let kvm = KVM().lock();
-            let mut vcpu = kvm.vcpu[0].lock();
-            // vcpu.mmu.page_fault(& (*vcpu), gpa, error_code as u32, false).unwrap();
-            // kvm_ept_page_fault();
+
+            let kvm = vm(0).unwrap();
+            let vcpu = kvm.vcpu[0].clone();
+            // Use the data
+            let kvm_ept_page_fault = vcpu.lock().mmu.page_fault.unwrap();
+            kvm_ept_page_fault(&mut (*vcpu.lock()), gpa, error_code as u32, false).expect("ept page fault error");
         }
         _ => {
             kdebug!("vmexit handler: unhandled vmexit reason: {}!", exit_basic_reason);

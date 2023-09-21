@@ -7,6 +7,8 @@ use crate::filesystem::vfs::{
     make_rawdev,
 };
 use crate::syscall::user_access::copy_from_user;
+use crate::virt::kvm::update_vm;
+use crate::virt::kvm::vm;
 use crate::{
     arch::asm::current::current_pcb,
     libs::spinlock::SpinLock,
@@ -14,7 +16,6 @@ use crate::{
     time::TimeSpec,
     arch::KVMArch,
 };
-use crate::virt::kvm::KVM;
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use crate::virt::kvm::host_mem::KvmUserspaceMemoryRegion;
 use alloc::{
@@ -171,7 +172,9 @@ impl IndexNode for LockedVmInode {
                     kvm_userspace_mem.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
                     kvm_userspace_mem.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
                 );
-                KVM().lock().set_user_memory_region(&kvm_userspace_mem)?;
+                let mut current_vm = vm(0).unwrap();
+                current_vm.set_user_memory_region(&kvm_userspace_mem)?;
+                update_vm(0, current_vm);
                 Ok(0)
             },
             KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS=> {
@@ -208,11 +211,12 @@ impl IndexNode for LockedVmInode {
 
 fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
     let vcpu = KVMArch::kvm_arch_vcpu_create(id).unwrap();
-    KVMArch::kvm_arch_vcpu_setup(vcpu.as_ref());
+    KVMArch::kvm_arch_vcpu_setup(vcpu.as_ref())?;
 
-    let mut kvm = KVM().lock();
-    kvm.vcpu.push(vcpu);
-    kvm.nr_vcpus += 1;
+    let mut current_vm = vm(0).unwrap();    
+    current_vm.vcpu.push(vcpu);
+    current_vm.nr_vcpus += 1;
+    update_vm(0, current_vm);
 
     let vcpu_inode = LockedVcpuInode::new();
     let file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;

@@ -13,17 +13,14 @@ use crate::{
     time::TimeSpec,
     arch::KVMArch,
 };
-use crate::libs::mutex::Mutex;
 // use crate::virt::kvm::{host_stack};
-use super::Hypervisor;
+use super::push_vm;
 use crate::virt::kvm::vm_dev::LockedVmInode;
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
-    boxed::Box,
 };
-use crate::virt::kvm::__KVM;
 
 pub const KVM_API_VERSION:u32 = 12;
 
@@ -188,14 +185,8 @@ impl IndexNode for LockedKvmInode {
 
 #[no_mangle]
 pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
-    let kvm = Box::leak(Box::new(
-        Arc::new(Mutex::new(Hypervisor::new(
-            0, 
-            0, 
-        ).unwrap()
-        ))
-    ));
-    unsafe {__KVM = kvm;}
+    push_vm(0).expect("need a valid vm!");
+
     // 创建vm文件，返回文件描述符
     let vm_inode = LockedVmInode::new();
     let file: File = File::new(vm_inode, FileMode::O_RDWR)?;

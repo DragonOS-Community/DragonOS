@@ -1,13 +1,11 @@
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-
 use crate::arch::KVMArch;
 use crate::arch::kvm::vmx::vcpu::VmxVcpu;
 use crate::libs::mutex::Mutex;
 use crate::syscall::SystemError;
 
-use super::HOST_STACK_SIZE;
+// use super::HOST_STACK_SIZE;
 use super::host_mem::{KvmUserspaceMemoryRegion, KVM_MEM_LOG_DIRTY_PAGES,KVM_ADDRESS_SPACE_NUM, KVM_MEM_SLOTS_NUM,
     KvmMemorySlots, KvmMemorySlot, 
     PAGE_SHIFT, KVM_MEM_MAX_NR_PAGES, KvmMemoryChange, KVM_MEM_READONLY, KVM_USER_MEM_SLOTS,
@@ -15,7 +13,9 @@ use super::host_mem::{KvmUserspaceMemoryRegion, KVM_MEM_LOG_DIRTY_PAGES,KVM_ADDR
 use crate::arch::kvm::vmx::vmcs::PAGE_SIZE;
 // use crate::kdebug;
 
-pub struct Hypervisor {
+#[derive(Debug, Clone)]
+pub struct Vm {
+    pub id: usize,
     // vcpu config
     pub nr_vcpus: u32,  /* Number of cpus to run */
     pub vcpu: Vec<Arc<Mutex<VmxVcpu>>>,
@@ -26,17 +26,15 @@ pub struct Hypervisor {
     pub arch: KVMArch,
 }
 
-impl Hypervisor {
-    pub fn new(nr_vcpus: u32, nr_mem_slots: u32) -> Result<Self, SystemError> {
+impl Vm {
+    pub fn new(id: usize) -> Result<Self, SystemError> {
         let vcpu = Vec::new();
-        // for i in 0..nr_vcpus {
-        //     vcpu.push(Vcpu::new(i, Arc::new(hypervisor))?);
-        // }
         // Allocate stack for vm-exit handlers and fill it with garbage data
         let instance = Self {
-            nr_vcpus,
+            id,
+            nr_vcpus: 0,
             vcpu,
-            nr_mem_slots,
+            nr_mem_slots: 0,
             memslots: [KvmMemorySlots::default();KVM_ADDRESS_SPACE_NUM],
             arch: Default::default(),
         };
@@ -63,9 +61,9 @@ impl Hypervisor {
         if as_id >= (KVM_ADDRESS_SPACE_NUM as u32) || id >= KVM_MEM_SLOTS_NUM as u16 {
             return Err(SystemError::EINVAL);
         }
-        if mem.memory_size < 0 {
-            return Err(SystemError::EINVAL);
-        }
+        // if mem.memory_size < 0 {
+        //     return Err(SystemError::EINVAL);
+        // }
 
         let slot = &self.memslots[as_id as usize].memslots[id as usize];
         let base_gfn = mem.guest_phys_addr >> PAGE_SHIFT;

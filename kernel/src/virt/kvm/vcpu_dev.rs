@@ -1,8 +1,8 @@
+use crate::arch::KVMArch;
 use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
 use crate::kdebug;
 use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
-use crate::virt::kvm::KVM;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
@@ -10,6 +10,7 @@ use crate::filesystem::vfs::{
     FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
     make_rawdev
 };
+use crate::virt::kvm::vm;
 use crate::{
     libs::spinlock::SpinLock,
     syscall::SystemError,
@@ -24,7 +25,7 @@ use crate::virt::kvm::vcpu::Vcpu;
 
 // pub const KVM_API_VERSION:u32 = 12;
 pub const KVM_RUN: u32 = 0x00;
-pub const KVM_GET_REGS: u32 = 0x01;
+// pub const KVM_GET_REGS: u32 = 0x01;
 pub const KVM_SET_REGS: u32 = 0x02;
 
 
@@ -160,8 +161,9 @@ impl IndexNode for LockedVcpuInode {
                 // let hypervisor = Hypervisor::new(1, host_rsp, 0).expect("Cannot create hypervisor");
                 // let vcpu = VmxVcpu::new(1, Arc::new(Mutex::new(hypervisor)), host_rsp, guest_rsp,  guest_code as *const () as u64).expect("Cannot create VcpuData");
                 // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");
-                let vcpu = &KVM().lock().vcpu[0];
-                (*vcpu).lock().virtualize_cpu()?;
+                let vcpu = vm(0).unwrap().vcpu[0].clone();
+                vcpu.lock().virtualize_cpu()?;
+                KVMArch::kvm_arch_vcpu_ioctl_run(vcpu.as_ref())?;
                 Ok(0)
             }
             KVM_SET_REGS => {
@@ -181,8 +183,9 @@ impl IndexNode for LockedVcpuInode {
                     kvm_regs.regs[6],
                     kvm_regs.regs[0],  
                 );
-                let vcpu = &KVM().lock().vcpu[0];
-                (*vcpu).lock().set_regs(kvm_regs)?;
+
+                let vcpu = vm(0).unwrap().vcpu[0].clone();
+                vcpu.lock().set_regs(kvm_regs)?;
 
                 Ok(0)
             }

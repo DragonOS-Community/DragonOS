@@ -14,7 +14,6 @@ use crate::libs::volatile::{
 use crate::mm::VirtAddr;
 use crate::net::net_core::poll_ifaces_try_lock_onetime;
 use alloc::ffi::CString;
-use core::sync::atomic::compiler_fence;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -101,9 +100,9 @@ pub struct PciTransport {
     config_space: Option<NonNull<[u32]>>,
 }
 
-unsafe extern "C" fn virtio_irq_hander(irq_num: u64, irq_paramer: u64, regs: *mut pt_regs) {
-    kdebug!("12345");
-    poll_ifaces_try_lock_onetime();
+unsafe extern "C" fn virtio_irq_hander(_irq_num: u64, _irq_paramer: u64, _regs: *mut pt_regs) {
+    // kdebug!("12345");
+    poll_ifaces_try_lock_onetime().ok();
 }
 
 impl PciTransport {

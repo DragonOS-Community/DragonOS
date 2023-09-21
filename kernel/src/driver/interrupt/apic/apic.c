@@ -363,7 +363,7 @@ int apic_init()
     cli();
     kinfo("Initializing APIC...");
     // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
-    for (int i = 32; i <= 55; ++i)
+    for (int i = 32; i <= 56; ++i)
         set_intr_gate(i, 0, interrupt_table[i - 32]);
 
     // 设置local apic中断门

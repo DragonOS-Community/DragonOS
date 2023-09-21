@@ -53,15 +53,14 @@ fn dhcp_query() -> Result<(), SystemError> {
     // IMPORTANT: This should be removed in production.
     dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(10)));
 
-    let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
     let dhcp_handle = SOCKET_SET.lock().add(dhcp_socket);
 
     const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
         kdebug!("DHCP try round: {}", i);
-        let _flag = net_face.poll(&mut SOCKET_SET.lock());
-        let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
-        // kdebug!("event = {event:?} !!!");
+        net_face.poll(&mut SOCKET_SET.lock()).ok();
+        let mut binding = SOCKET_SET.lock();
+        let event = binding.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
 
         match event {
             None => {}
@@ -169,16 +168,16 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
 /// @return 没有网卡，返回SystemError::ENODEV
 pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
-        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
-        if guard.len() == 0 {
-            kwarn!("poll_ifaces: No net driver found!");
-            // 没有网卡，返回错误
-            return Err(SystemError::ENODEV);
-        }
-        let mut sockets = SOCKET_SET.try_lock()?;
-        for (_, iface) in guard.iter() {
-            iface.poll(&mut sockets).ok();
-        }
-        SOCKET_WAITQUEUE.wakeup_all(None);
-        return Ok(());
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+    if guard.len() == 0 {
+        kwarn!("poll_ifaces: No net driver found!");
+        // 没有网卡，返回错误
+        return Err(SystemError::ENODEV);
+    }
+    let mut sockets = SOCKET_SET.try_lock()?;
+    for (_, iface) in guard.iter() {
+        iface.poll(&mut sockets).ok();
+    }
+    SOCKET_WAITQUEUE.wakeup_all(None);
+    return Ok(());
 }

@@ -42,7 +42,7 @@ uint16_t c_irq_install(ul irq_num, void (*pci_irq_handler)(ul irq_num, ul parame
     {
         return EAGAIN;
     }
-    pci_interrupt_controller = kmalloc(sizeof(hardware_intr_controller), 0);
+    pci_interrupt_controller = kzalloc(sizeof(hardware_intr_controller), 0);
     if (pci_interrupt_controller)
     {
         pci_interrupt_controller->enable = pci_irq_enable;
@@ -57,7 +57,7 @@ uint16_t c_irq_install(ul irq_num, void (*pci_irq_handler)(ul irq_num, ul parame
         return EAGAIN;
     }
     size_t namelen = strlen(irq_name) + 1;
-    p->irq_name = (char *)kmalloc(namelen, 0);
+    p->irq_name = (char *)kzalloc(namelen, 0);
     memset(p->irq_name, 0, namelen);
     strncpy(p->irq_name, irq_name, namelen);
     p->parameter = parameter;

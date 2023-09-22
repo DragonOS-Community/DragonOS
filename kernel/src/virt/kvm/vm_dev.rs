@@ -165,13 +165,14 @@ impl IndexNode for LockedVmInode {
                         VirtAddr::new(data)
                     )?;
                 }
-                kdebug!("slot={}, flag={}, memory_size={:x}, guest_phys_addr={}, userspace_addr={:x}",
+                kdebug!("slot={}, flag={}, memory_size={:x}, guest_phys_addr={}, userspace_addr={}",
                     kvm_userspace_mem.slot,
                     kvm_userspace_mem.flags,
                     kvm_userspace_mem.memory_size,
                     kvm_userspace_mem.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
                     kvm_userspace_mem.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
                 );
+                
                 let mut current_vm = vm(0).unwrap();
                 current_vm.set_user_memory_region(&kvm_userspace_mem)?;
                 update_vm(0, current_vm);

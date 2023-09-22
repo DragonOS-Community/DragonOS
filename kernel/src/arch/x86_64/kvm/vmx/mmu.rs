@@ -62,12 +62,12 @@ pub struct KvmMmuPageRole{
 
 #[derive(Default)]
 pub struct KvmMmu {
-    root_hpa: u64,
-    root_level: u32,
-    base_role: KvmMmuPageRole,
+    pub root_hpa: u64,
+    pub root_level: u32,
+    pub base_role: KvmMmuPageRole,
     // ...还有一些变量不知道用来做什么
 
-    get_cr3: Option<fn(& VmxVcpu) -> u64>,
+    pub get_cr3: Option<fn(& VmxVcpu) -> u64>,
     pub set_eptp: Option<fn(u64) -> Result<(), SystemError>>,
     pub page_fault: Option<fn(vcpu: &mut VmxVcpu, gpa: u64, error_code: u32, prefault: bool) -> Result<(), SystemError>>,
     
@@ -208,6 +208,7 @@ pub fn __direct_map(vcpu: &mut VmxVcpu, gpa: u64, _write: u32,
     _map_writable: bool, _level: i32, _gfn: u64, pfn: u64,
     _prefault: bool) -> Result<u32, SystemError> 
 {
+    kdebug!("gpa={}, pfn={}, root_hpa={:x}", gpa, pfn, vcpu.mmu.root_hpa);
     // 判断vcpu.mmu.root_hpa是否有效
     if vcpu.mmu.root_hpa == 0 {
         return Err(SystemError::KVM_HVA_ERR_BAD);

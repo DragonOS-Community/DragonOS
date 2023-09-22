@@ -69,6 +69,8 @@ int main()
     uint8_t code[] = "\xB0\x61\xBA\x17\x02\xEE\xB0\n\xEE\xF4";
     size_t mem_size = 0x4000; // size of user memory you want to assign
     printf("code=%p\n", code);
+    // void *mem = mmap(0, mem_size, 0x7, -1, 0);
+    // memcpy(mem, code, sizeof(code));
     struct kvm_userspace_memory_region region = {
         .slot = 0,
         .flags = 0,

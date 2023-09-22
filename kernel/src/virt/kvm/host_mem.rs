@@ -1,5 +1,5 @@
 
-use crate::{syscall::SystemError, mm::{VirtAddr, kernel_mapper::KernelMapper, page::PageFlags}};
+use crate::{syscall::SystemError, mm::{VirtAddr, kernel_mapper::KernelMapper, page::PageFlags}, kdebug};
 use super::{vcpu::Vcpu, vm};
 
 
@@ -68,7 +68,7 @@ pub struct KvmMemorySlots{
     pub used_slots: u32, // 已经使用的slot数量
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum KvmMemoryChange{
     Create,
     Delete,
@@ -95,6 +95,7 @@ pub fn kvm_vcpu_memslots(_vcpu: &mut dyn Vcpu) -> KvmMemorySlots{
 }
 
 fn __gfn_to_memslot(slots: KvmMemorySlots, gfn: u64) -> Option<KvmMemorySlot>{
+    kdebug!("__gfn_to_memslot");
     // TODO: 使用二分查找的方式优化
     for i in 0..slots.used_slots {
         let memslot = slots.memslots[i as usize];
@@ -109,6 +110,7 @@ fn __gfn_to_hva(slot: KvmMemorySlot, gfn: u64) -> u64{
     return slot.userspace_addr + (gfn-slot.base_gfn) * (PAGE_SIZE as u64);
 }
 fn __gfn_to_hva_many(slot: Option<KvmMemorySlot>, gfn: u64, nr_pages: Option<&mut u64>, write: bool) -> Result<u64, SystemError>{
+    kdebug!("__gfn_to_hva_many");
     if slot.is_none() {
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
@@ -116,7 +118,6 @@ fn __gfn_to_hva_many(slot: Option<KvmMemorySlot>, gfn: u64, nr_pages: Option<&mu
     if slot.flags & KVM_MEMSLOT_INVALID != 0 || 
         (slot.flags & KVM_MEM_READONLY != 0) && write {
         return Err(SystemError::KVM_HVA_ERR_BAD);
-
     }
     
     if nr_pages.is_some() {
@@ -144,6 +145,11 @@ fn __gfn_to_hva_many(slot: Option<KvmMemorySlot>, gfn: u64, nr_pages: Option<&mu
 // host端虚拟地址到物理地址的转换，有两种方式，hva_to_pfn_fast、hva_to_pfn_slow
 // 正确性待验证
 fn hva_to_pfn(addr: u64, _atomic: bool, _writable: &mut bool) -> Result<u64, SystemError>{
+    kdebug!("hva_to_pfn");
+    unsafe {
+        let raw = addr as *const i32;
+        kdebug!("raw={:x}", *raw);
+    }
     // let hpa = MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() as u64;
     let hva = VirtAddr::new(addr as usize);
     let mut mapper = KernelMapper::lock();
@@ -159,9 +165,11 @@ fn hva_to_pfn(addr: u64, _atomic: bool, _writable: &mut bool) -> Result<u64, Sys
 }
 
 pub fn __gfn_to_pfn(slot: Option<KvmMemorySlot>, gfn: u64, atomic: bool, write: bool, writable: &mut bool) -> Result<u64, SystemError>{
+    kdebug!("__gfn_to_pfn");
     let mut nr_pages = 0;
     let addr = __gfn_to_hva_many(slot, gfn, Some(&mut nr_pages), write)?;
     let pfn = hva_to_pfn(addr, atomic, writable)?;
+    kdebug!("hva={}, pfn={}", addr, pfn);
     return Ok(pfn);
 }
 

@@ -336,7 +336,7 @@ impl VmxVcpu {
         Ok(())
     }
 
-    fn kvm_mmu_load(&self) -> Result<(), SystemError> {
+    fn kvm_mmu_load(&mut self) -> Result<(), SystemError> {
         kdebug!("kvm_mmu_load!");
         // 申请并创建新的页表
         let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
@@ -347,6 +347,7 @@ impl VmxVcpu {
         let ept_root_hpa = mapper.table().phys();
         let set_eptp_fn = self.mmu.set_eptp.unwrap();
         set_eptp_fn(ept_root_hpa.data() as u64)?;
+        self.mmu.root_hpa = ept_root_hpa.data() as u64;
         kdebug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
 
         return Ok(());
@@ -361,7 +362,7 @@ impl VmxVcpu {
 
 impl Vcpu for VmxVcpu {
     /// Virtualize the CPU
-    fn virtualize_cpu(&self) -> Result<(), SystemError> {
+    fn virtualize_cpu(&mut self) -> Result<(), SystemError> {
         match has_intel_vmx_support() {
             Ok(_) => { kdebug!("[+] CPU supports Intel VMX"); },
             Err(e) => {

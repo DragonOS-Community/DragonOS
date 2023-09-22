@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::arch::KVMArch;
+use crate::{arch::KVMArch, kdebug};
 use crate::arch::kvm::vmx::vcpu::VmxVcpu;
 use crate::libs::mutex::Mutex;
 use crate::syscall::SystemError;
@@ -34,7 +34,7 @@ impl Vm {
             id,
             nr_vcpus: 0,
             vcpu,
-            nr_mem_slots: 0,
+            nr_mem_slots: KVM_MEM_SLOTS_NUM,
             memslots: [KvmMemorySlots::default();KVM_ADDRESS_SPACE_NUM],
             arch: Default::default(),
         };
@@ -44,8 +44,10 @@ impl Vm {
 
     /// Allocate some memory and give it an address in the guest physical address space.
     pub fn set_user_memory_region(&mut self, mem: &KvmUserspaceMemoryRegion) -> Result<(), SystemError>{
+        kdebug!("set_user_memory_region");
         let id: u16 = mem.slot as u16;      // slot id
         let as_id = mem.slot >> 16;    // address space id
+        kdebug!("id={}, as_id={}", id, as_id);
 
         // 检查slot是否合法
         if mem.slot as usize >= self.nr_mem_slots as usize {
@@ -64,7 +66,6 @@ impl Vm {
         // if mem.memory_size < 0 {
         //     return Err(SystemError::EINVAL);
         // }
-
         let slot = &self.memslots[as_id as usize].memslots[id as usize];
         let base_gfn = mem.guest_phys_addr >> PAGE_SHIFT;
         let npages = mem.memory_size >> PAGE_SHIFT;
@@ -78,11 +79,10 @@ impl Vm {
             base_gfn, // 虚机内存区间起始物理页框号
             npages,   // 虚机内存区间页数，即内存区间的大小
             // dirty_bitmap: old_slot.dirty_bitmap, 
-            userspace_addr: old_slot.userspace_addr,  // 虚机内存区间对应的主机虚拟地址
+            userspace_addr: mem.userspace_addr,  // 虚机内存区间对应的主机虚拟地址
             flags: mem.flags,    // 虚机内存区间属性
             id,       // 虚机内存区间id
         };
-        
 
         // 判断新memoryslot的类型
         if npages != 0 { //映射内存有大小，不是删除内存条
@@ -138,7 +138,6 @@ impl Vm {
         //     let dirty_bytes = 2 * ((new_slot.npages+type_size-1) / type_size) / 8;
             // new_slot.dirty_bitmap = Box::new(vec![0; dirty_bytes as u8]);
         // }
-
         if change == KvmMemoryChange::Create {
             new_slot.userspace_addr = mem.userspace_addr;
             let mut memslots = self.memslots[as_id as usize].memslots.clone();

@@ -12,10 +12,7 @@ use crate::{
     include::bindings::bindings::USER_MAX_LINEAR_ADDR,
     ipc::{
         signal::{get_signal_to_deliver, set_current_sig_blocked},
-        signal_types::{
-            SigContext, SigFlags, SigFrame, SigInfo, SigSet, SigType, Sigaction, SigactionType,
-            SignalNumber,
-        },
+        signal_types::{SigContext, SigFrame, SigInfo, SigType, Sigaction, SigactionType},
     },
     kdebug, kerror,
     process::{Pid, ProcessManager},
@@ -26,8 +23,160 @@ use crate::{
 pub const _NSIG: usize = 64;
 /// 实时信号的最小值
 pub const SIGRTMIN: usize = 32;
+/// 实时信号的最大值
+pub const SIGRTMAX: usize = crate::arch::ipc::signal::_NSIG;
 /// 信号处理的栈的栈指针的最小对齐数量
 pub const STACK_ALIGN: u64 = 16;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub enum SignalNumber {
+    INVALID = 0,
+    SIGHUP = 1,
+    SIGINT,
+    SIGQUIT,
+    SIGILL,
+    SIGTRAP,
+    /// SIGABRT和SIGIOT共用这个号码
+    SIGABRT_OR_IOT,
+    SIGBUS,
+    SIGFPE,
+    SIGKILL,
+    SIGUSR1,
+
+    SIGSEGV = 11,
+    SIGUSR2,
+    SIGPIPE,
+    SIGALRM,
+    SIGTERM,
+    SIGSTKFLT,
+    SIGCHLD,
+    SIGCONT,
+    SIGSTOP,
+    SIGTSTP,
+
+    SIGTTIN = 21,
+    SIGTTOU,
+    SIGURG,
+    SIGXCPU,
+    SIGXFSZ,
+    SIGVTALRM,
+    SIGPROF,
+    SIGWINCH,
+    /// SIGIO和SIGPOLL共用这个号码
+    SIGIO_OR_POLL,
+    SIGPWR,
+
+    SIGSYS = 31,
+
+    SIGRTMIN = 32,
+    SIGRTMAX = crate::arch::ipc::signal::_NSIG,
+}
+
+/// 为SignalNumber实现判断相等的trait
+impl PartialEq for SignalNumber {
+    fn eq(&self, other: &SignalNumber) -> bool {
+        *self as usize == *other as usize
+    }
+}
+
+impl From<usize> for SignalNumber {
+    fn from(value: usize) -> Self {
+        if Self::valid_signal_number(value) {
+            let ret: SignalNumber = unsafe { core::mem::transmute(value) };
+            return ret;
+        } else {
+            kerror!("Try to convert an invalid number to SignalNumber");
+            return SignalNumber::INVALID;
+        }
+    }
+}
+
+impl Into<usize> for SignalNumber {
+    fn into(self) -> usize {
+        self as usize
+    }
+}
+
+impl From<i32> for SignalNumber {
+    fn from(value: i32) -> Self {
+        if value < 0 {
+            kerror!("Try to convert an invalid number to SignalNumber");
+            return SignalNumber::INVALID;
+        } else {
+            return Self::from(value as usize);
+        }
+    }
+}
+
+impl Into<SigSet> for SignalNumber {
+    fn into(self) -> SigSet {
+        SigSet {
+            bits: (self as usize - 1) as u64,
+        }
+    }
+}
+impl SignalNumber {
+    /// 判断一个数字是否为可用的信号
+    fn valid_signal_number(x: usize) -> bool {
+        return x <= SIGRTMAX;
+    }
+}
+
+/// siginfo中的si_code的可选值
+/// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
+#[allow(dead_code)]
+#[repr(i32)]
+pub enum SigCode {
+    /// sent by kill, sigsend, raise
+    SI_USER = 0,
+    /// sent by kernel from somewhere
+    SI_KERNEL = 0x80,
+    /// 通过sigqueue发送
+    SI_QUEUE = -1,
+    /// 定时器过期时发送
+    SI_TIMER = -2,
+    /// 当实时消息队列的状态发生改变时发送
+    SI_MESGQ = -3,
+    /// 当异步IO完成时发送
+    SI_ASYNCIO = -4,
+    /// sent by queued SIGIO
+    SI_SIGIO = -5,
+}
+
+impl SigCode {
+    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
+    #[allow(dead_code)]
+    pub fn from_i32(x: i32) -> SigCode {
+        match x {
+            0 => Self::SI_USER,
+            0x80 => Self::SI_KERNEL,
+            -1 => Self::SI_QUEUE,
+            -2 => Self::SI_TIMER,
+            -3 => Self::SI_MESGQ,
+            -4 => Self::SI_ASYNCIO,
+            -5 => Self::SI_SIGIO,
+            _ => panic!("signal code not valid"),
+        }
+    }
+}
+
+bitflags! {
+    #[derive(Default)]
+    pub struct SigFlags:u32{
+        const SA_FLAG_DFL= 1 << 0; // 当前sigaction表示系统默认的动作
+        const SA_FLAG_IGN = 1 << 1; // 当前sigaction表示忽略信号的动作
+        const SA_FLAG_RESTORER = 1 << 2; // 当前sigaction具有用户指定的restorer
+        const SA_FLAG_IMMUTABLE = 1 << 3; // 当前sigaction不可被更改
+        const SA_FLAG_ALL = Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_IGN.bits()|Self::SA_FLAG_IMMUTABLE.bits()|Self::SA_FLAG_RESTORER.bits();
+    }
+
+    /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，SignalNumber-1才是sigset_t中对应的位
+    #[derive(Default)]
+    pub struct SigSet:u64{
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
@@ -125,11 +274,10 @@ fn setup_frame(
         );
         return Err(SystemError::EINVAL);
     }
-    let user_buffer = r.unwrap();
 
     match ka.action() {
         SigactionType::SaHandler(handler) => {
-            if handler.is_none() {
+            if handler.is_sig_default() {
                 kerror!("In setup frame: handler is None");
                 return Err(SystemError::EINVAL);
             }
@@ -137,7 +285,7 @@ fn setup_frame(
                 (*frame).arg0 = sig as u64;
                 (*frame).arg1 = &((*frame).info) as *const SigInfo as usize;
                 (*frame).arg2 = &((*frame).context) as *const SigContext as usize;
-                (*frame).handler = handler.unwrap() as usize as *mut c_void;
+                (*frame).handler = Into::<usize>::into(handler) as usize as *mut c_void;
             }
         }
         SigactionType::SaSigaction(_) => {

@@ -3,9 +3,13 @@ use core::{mem::size_of, sync::atomic::compiler_fence};
 use alloc::sync::Arc;
 
 use crate::{
-    arch::{asm::bitops::ffz, interrupt::TrapFrame},
+    arch::{
+        asm::bitops::ffz,
+        interrupt::TrapFrame,
+        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber},
+    },
     include::bindings::bindings::{pt_regs, SA_FLAG_DFL, SA_FLAG_IGN},
-    ipc::signal_types::{SigFlags, SigSet, SigactionType},
+    ipc::signal_types::SigactionType,
     kdebug, kerror, kwarn,
     libs::spinlock::SpinLockGuard,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
@@ -13,15 +17,15 @@ use crate::{
 };
 
 use super::signal_types::{
-    SigCode, SigContext, SigFrame, SigHandler, SigInfo, SigPending, SigQueue, SigType, Sigaction,
-    SignalNumber, SignalStruct, MAX_SIG_NUM,
+    SaHandlerType, SigContext, SigFrame, SigHandStruct, SigInfo, SigPending, SigQueue, SigType,
+    Sigaction, SignalStruct, MAX_SIG_NUM,
 };
 
 lazy_static! {
     /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
      #[allow(dead_code)]
     pub static ref DEFAULT_SIGACTION: Sigaction = Sigaction::new(
-    SigactionType::SaHandler(None),
+    SigactionType::SaHandler(SaHandlerType::SigDefault),
      SigFlags::SA_FLAG_DFL,
     SigSet::from_bits(0).unwrap(),
      None,
@@ -30,7 +34,7 @@ lazy_static! {
 /// 默认的“忽略信号”的sigaction
 #[allow(dead_code)]
 pub static ref DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction::new(
-    SigactionType::SaHandler(None),
+    SigactionType::SaHandler(SaHandlerType::SigDefault),
      SigFlags::SA_FLAG_IGN,
     SigSet::from_bits(0).unwrap(),
      None,
@@ -263,7 +267,7 @@ fn sig_fatal(pcb: Arc<ProcessControlBlock>, sig: SignalNumber) -> bool {
     let action = pcb.sig_struct().handler.0[sig as usize - 1].action();
     // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
     match action {
-        SigactionType::SaHandler(handler) => handler.is_none(),
+        SigactionType::SaHandler(handler) => handler.is_sig_default(),
         SigactionType::SaSigaction(sigaction) => sigaction.is_none(),
     }
 
@@ -308,7 +312,7 @@ pub fn get_signal_to_deliver(
 
     loop {
         (sig_number, info) =
-            dequeue_signal(&mut ProcessManager::current_pcb().sig_info_mut().sig_block_mut());
+            dequeue_signal(ProcessManager::current_pcb().sig_info_mut().sig_block_mut());
 
         // 如果信号非法，则直接返回
         if sig_number == SignalNumber::INVALID {
@@ -317,12 +321,12 @@ pub fn get_signal_to_deliver(
         }
         let tmp_ka: &mut Sigaction;
         // 获取指向sigaction结构体的引用
-        let hand = Arc::as_ptr(&guard.handler) as *mut SigHandler;
+        let hand = Arc::as_ptr(&guard.handler) as *mut SigHandStruct;
         // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
         unsafe {
             let r = hand.as_mut();
             if r.is_none() {
-                panic!("error converting *mut SigHandler to &mut SigHandler");
+                panic!("error converting *mut SigHandStruct to &mut SigHandStruct");
             }
             tmp_ka = &mut r.unwrap().0[sig_number as usize - 1];
         }
@@ -444,13 +448,13 @@ fn collect_signal(sig: SignalNumber, pending: &mut SigPending) -> SigInfo {
 pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    let hand = Arc::as_ptr(&pcb.sig_struct().handler) as *mut SigHandler;
+    let hand = Arc::as_ptr(&pcb.sig_struct().handler) as *mut SigHandStruct;
     // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
     let action: &mut [Sigaction; MAX_SIG_NUM as usize];
     unsafe {
         let r = hand.as_mut();
         if r.is_none() {
-            panic!("error converting *mut SigHandler to &mut SigHandler");
+            panic!("error converting *mut SigHandStruct to &mut SigHandStruct");
         }
         action = &mut r.unwrap().0;
     }
@@ -458,7 +462,7 @@ pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool)
     for ka in action.iter_mut() {
         if force_default || !ka.flags().contains(SigFlags::SA_FLAG_IGN) {
             ka.flags().insert(SigFlags::SA_FLAG_DFL);
-            ka.set_action(SigactionType::SaHandler(None));
+            ka.set_action(SigactionType::SaHandler(SaHandlerType::SigDefault));
         }
         // 清除flags中，除了DFL和IGN以外的所有标志
 
@@ -481,12 +485,12 @@ pub fn do_sigaction(
     let pcb = ProcessManager::current_pcb();
     // 指向当前信号的action的引用
     let action: &mut Sigaction;
-    let hand = Arc::as_ptr(&pcb.sig_struct().handler) as *mut SigHandler;
+    let hand = Arc::as_ptr(&pcb.sig_struct().handler) as *mut SigHandStruct;
     // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
     unsafe {
         let r = hand.as_mut();
         if r.is_none() {
-            panic!("error converting *mut SigHandler to &mut SigHandler");
+            panic!("error converting *mut SigHandStruct to &mut SigHandStruct");
         }
         action = &mut r.unwrap().0[sig as usize - 1];
     }

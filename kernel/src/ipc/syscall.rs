@@ -4,6 +4,7 @@ use core::{
 };
 
 use crate::{
+    arch::ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber},
     filesystem::vfs::{file::{File, FileMode}, FilePrivateData},
     kerror, kwarn,
     process::{Pid, ProcessManager},
@@ -14,8 +15,8 @@ use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
     signal::{signal_kill_something_info, DEFAULT_SIGACTION, DEFAULT_SIGACTION_IGNORE},
     signal_types::{
-        SigCode, SigFlags, SigInfo, SigSet, SigType, Sigaction, SigactionType, SignalNumber,
-        UserSigaction, USER_SIG_DFL, USER_SIG_IGN,
+        SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
+        USER_SIG_ERR, USER_SIG_IGN,
     },
 };
 
@@ -131,7 +132,9 @@ impl Syscall {
                     // 从用户空间获得sigaction结构体
                     // TODO mask是default还是用户空间传入
                     new_ka = Sigaction::new(
-                        SigactionType::SaHandler(Some(unsafe { (*act).handler as u64 })),
+                        SigactionType::SaHandler(SaHandlerType::SigCustomized(unsafe {
+                            (*act).handler as u64
+                        })),
                         unsafe { (*act).flags },
                         SigSet::default(),
                         unsafe { Some((*act).restorer as u64) },
@@ -187,11 +190,14 @@ impl Syscall {
             } else {
                 sah = match old_ka.action() {
                     SigactionType::SaHandler(handler) => {
-                        if handler.is_none() {
-                            kerror!("Null handler.Assigned a default SIGHANDLER");
-                            USER_SIG_DFL
+                        if let SaHandlerType::SigCustomized(hand) = handler {
+                            hand
+                        } else if handler.is_sig_ignore() {
+                            USER_SIG_IGN
+                        } else if handler.is_sig_error() {
+                            USER_SIG_ERR
                         } else {
-                            handler.unwrap()
+                            USER_SIG_DFL
                         }
                     }
                     SigactionType::SaSigaction(_) => {

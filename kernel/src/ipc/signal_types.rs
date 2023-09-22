@@ -1,9 +1,17 @@
-use core::{cell::Cell, ffi::c_void, sync::atomic::AtomicI64};
+use core::{
+    cell::Cell,
+    ffi::{c_int, c_void},
+    sync::atomic::AtomicI64,
+};
 
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    arch::{fpu::FpState, interrupt::TrapFrame},
+    arch::{
+        fpu::FpState,
+        interrupt::TrapFrame,
+        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber},
+    },
     include::bindings::bindings::siginfo,
     kerror,
     libs::{
@@ -29,167 +37,14 @@ pub const _NSIG_U64_CNT: i32 = MAX_SIG_NUM / 64;
 pub const USER_SIG_DFL: u64 = 0;
 /// 用户态程序传入的SIG_IGN的值
 pub const USER_SIG_IGN: u64 = 1;
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-#[repr(usize)]
-pub enum SignalNumber {
-    INVALID = 0,
-    SIGHUP = 1,
-    SIGINT,
-    SIGQUIT,
-    SIGILL,
-    SIGTRAP,
-    /// SIGABRT和SIGIOT共用这个号码
-    SIGABRT_OR_IOT,
-    SIGBUS,
-    SIGFPE,
-    SIGKILL,
-    SIGUSR1,
-
-    SIGSEGV = 11,
-    SIGUSR2,
-    SIGPIPE,
-    SIGALRM,
-    SIGTERM,
-    SIGSTKFLT,
-    SIGCHLD,
-    SIGCONT,
-    SIGSTOP,
-    SIGTSTP,
-
-    SIGTTIN = 21,
-    SIGTTOU,
-    SIGURG,
-    SIGXCPU,
-    SIGXFSZ,
-    SIGVTALRM,
-    SIGPROF,
-    SIGWINCH,
-    /// SIGIO和SIGPOLL共用这个号码
-    SIGIO_OR_POLL,
-    SIGPWR,
-
-    SIGSYS = 31,
-
-    SIGRTMIN = 32,
-    SIGRTMAX = crate::arch::ipc::signal::_NSIG,
-}
-
-#[allow(dead_code)]
-pub const SIGRTMIN: usize = 32;
-#[allow(dead_code)]
-pub const SIGRTMAX: usize = crate::arch::ipc::signal::_NSIG;
-
-/// 为SignalNumber实现判断相等的trait
-impl PartialEq for SignalNumber {
-    fn eq(&self, other: &SignalNumber) -> bool {
-        *self as usize == *other as usize
-    }
-}
-
-impl From<usize> for SignalNumber {
-    fn from(value: usize) -> Self {
-        if Self::valid_signal_number(value) {
-            let ret: SignalNumber = unsafe { core::mem::transmute(value) };
-            return ret;
-        } else {
-            kerror!("Try to convert an invalid number to SignalNumber");
-            return SignalNumber::INVALID;
-        }
-    }
-}
-
-impl Into<usize> for SignalNumber {
-    fn into(self) -> usize {
-        self as usize
-    }
-}
-
-impl From<i32> for SignalNumber {
-    fn from(value: i32) -> Self {
-        if value < 0 {
-            kerror!("Try to convert an invalid number to SignalNumber");
-            return SignalNumber::INVALID;
-        } else {
-            return Self::from(value as usize);
-        }
-    }
-}
-
-impl Into<SigSet> for SignalNumber {
-    fn into(self) -> SigSet {
-        SigSet {
-            bits: (self as usize - 1) as u64,
-        }
-    }
-}
-impl SignalNumber {
-    /// 判断一个数字是否为可用的信号
-    fn valid_signal_number(x: usize) -> bool {
-        return x <= SIGRTMAX;
-    }
-}
-
-/// siginfo中的si_code的可选值
-/// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
-#[allow(dead_code)]
-#[repr(i32)]
-pub enum SigCode {
-    /// sent by kill, sigsend, raise
-    SI_USER = 0,
-    /// sent by kernel from somewhere
-    SI_KERNEL = 0x80,
-    /// 通过sigqueue发送
-    SI_QUEUE = -1,
-    /// 定时器过期时发送
-    SI_TIMER = -2,
-    /// 当实时消息队列的状态发生改变时发送
-    SI_MESGQ = -3,
-    /// 当异步IO完成时发送
-    SI_ASYNCIO = -4,
-    /// sent by queued SIGIO
-    SI_SIGIO = -5,
-}
-
-impl SigCode {
-    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
-    #[allow(dead_code)]
-    pub fn from_i32(x: i32) -> SigCode {
-        match x {
-            0 => Self::SI_USER,
-            0x80 => Self::SI_KERNEL,
-            -1 => Self::SI_QUEUE,
-            -2 => Self::SI_TIMER,
-            -3 => Self::SI_MESGQ,
-            -4 => Self::SI_ASYNCIO,
-            -5 => Self::SI_SIGIO,
-            _ => panic!("signal code not valid"),
-        }
-    }
-}
-
-bitflags! {
-    #[derive(Default)]
-    pub struct SigFlags:u32{
-        const SA_FLAG_DFL= 1 << 0; // 当前sigaction表示系统默认的动作
-        const SA_FLAG_IGN = 1 << 1; // 当前sigaction表示忽略信号的动作
-        const SA_FLAG_RESTORER = 1 << 2; // 当前sigaction具有用户指定的restorer
-        const SA_FLAG_IMMUTABLE = 1 << 3; // 当前sigaction不可被更改
-        const SA_FLAG_ALL = Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_IGN.bits()|Self::SA_FLAG_IMMUTABLE.bits()|Self::SA_FLAG_RESTORER.bits();
-    }
-
-    /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，SignalNumber-1才是sigset_t中对应的位
-    #[derive(Default)]
-    pub struct SigSet:u64{
-    }
-}
+/// 用户态程序传入的SIG_ERR的值
+pub const USER_SIG_ERR: u64 = 2;
 
 /// SignalStruct 在 pcb 中加锁
 #[derive(Debug)]
 pub struct SignalStruct {
     pub cnt: AtomicI64,
-    pub handler: Arc<SigHandler>,
+    pub handler: Arc<SigHandStruct>,
 }
 
 impl Default for SignalStruct {
@@ -203,7 +58,7 @@ impl Default for SignalStruct {
 
 #[derive(Debug, Copy, Clone)]
 pub enum SigactionType {
-    SaHandler(Option<__sighandler_t>),
+    SaHandler(SaHandlerType),
     SaSigaction(
         Option<
             unsafe extern "C" fn(
@@ -213,6 +68,69 @@ pub enum SigactionType {
             ),
         >,
     ),
+}
+
+impl SigactionType {
+    /// Returns `true` if the sigaction type is [`SaHandler`].
+    ///
+    /// [`SaHandler`]: SigactionType::SaHandler
+    #[must_use]
+    pub fn is_sa_handler(&self) -> bool {
+        matches!(self, Self::SaHandler(..))
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum SaHandlerType {
+    SigError,
+    SigDefault,
+    SigIgnore,
+    SigCustomized(__sighandler_t),
+}
+
+impl Into<usize> for SaHandlerType {
+    fn into(self) -> usize {
+        match self {
+            Self::SigError => 2 as usize,
+            Self::SigIgnore => 1 as usize,
+            Self::SigDefault => 0 as usize,
+            Self::SigCustomized(handler) => handler as usize,
+        }
+    }
+}
+
+impl SaHandlerType {
+    /// Returns `true` if the sa handler type is [`SigCustomized`].
+    ///
+    /// [`SigCustomized`]: SaHandlerType::SigCustomized
+    #[must_use]
+    pub fn is_sig_customized(&self) -> bool {
+        matches!(self, Self::SigCustomized(..))
+    }
+
+    /// Returns `true` if the sa handler type is [`SigDefault`].
+    ///
+    /// [`SigDefault`]: SaHandlerType::SigDefault
+    #[must_use]
+    pub fn is_sig_default(&self) -> bool {
+        matches!(self, Self::SigDefault)
+    }
+
+    /// Returns `true` if the sa handler type is [`SigIgnore`].
+    ///
+    /// [`SigIgnore`]: SaHandlerType::SigIgnore
+    #[must_use]
+    pub fn is_sig_ignore(&self) -> bool {
+        matches!(self, Self::SigIgnore)
+    }
+
+    /// Returns `true` if the sa handler type is [`SigError`].
+    ///
+    /// [`SigError`]: SaHandlerType::SigError
+    #[must_use]
+    pub fn is_sig_error(&self) -> bool {
+        matches!(self, Self::SigError)
+    }
 }
 
 /// 信号处理结构体
@@ -229,7 +147,7 @@ pub struct Sigaction {
 impl Default for Sigaction {
     fn default() -> Self {
         Self {
-            action: SigactionType::SaHandler(None),
+            action: SigactionType::SaHandler(SaHandlerType::SigDefault),
             flags: Default::default(),
             mask: Default::default(),
             restorer: Default::default(),
@@ -242,7 +160,12 @@ impl Sigaction {
         if self.flags.contains(SigFlags::SA_FLAG_IGN) {
             return true;
         }
-        // todo: 增加对sa_flags为SA_FLAG_DFL,但是默认处理函数为忽略的情况的判断
+        //a_flags为SA_FLAG_DFL,但是默认处理函数为忽略的情况的判断
+        if self.flags().contains(SigFlags::SA_FLAG_DFL) {
+            if let SigactionType::SaHandler(SaHandlerType::SigIgnore) = self.action {
+                return true;
+            }
+        }
         return false;
     }
     pub fn new(
@@ -367,14 +290,14 @@ impl SigInfo {
     }
 }
 
-/// 在获取SigHandler的外部就获取到了锁，所以这里是不会有任何竞争的，只是处于内部可变性的需求
+/// 在获取SigHandStruct的外部就获取到了锁，所以这里是不会有任何竞争的，只是处于内部可变性的需求
 /// 才使用了SpinLock，这里并不会带来太多的性能开销
 #[derive(Debug)]
-pub struct SigHandler(pub [Sigaction; MAX_SIG_NUM as usize]);
+pub struct SigHandStruct(pub [Sigaction; MAX_SIG_NUM as usize]);
 
-impl Default for SigHandler {
+impl Default for SigHandStruct {
     fn default() -> Self {
-        SigHandler([Sigaction::default(); MAX_SIG_NUM as usize])
+        SigHandStruct([Sigaction::default(); MAX_SIG_NUM as usize])
     }
 }
 
@@ -618,7 +541,7 @@ impl FFIBind2Rust<crate::include::bindings::bindings::sigpending> for SigPending
 /// @brief 将给定的来自bindgen的sighand_struct解析为Rust的signal.rs中定义的sighand_struct的引用
 ///
 /// 这么做的主要原因在于，由于PCB是通过bindgen生成的FFI，因此pcb中的结构体类型都是bindgen自动生成的，会导致无法自定义功能的问题。
-impl FFIBind2Rust<crate::include::bindings::bindings::sighand_struct> for SigHandler {
+impl FFIBind2Rust<crate::include::bindings::bindings::sighand_struct> for SigHandStruct {
     fn convert_mut(
         src: *mut crate::include::bindings::bindings::sighand_struct,
     ) -> Option<&'static mut Self> {

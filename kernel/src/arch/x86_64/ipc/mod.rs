@@ -3,6 +3,6 @@ pub mod signal;
 use super::interrupt::TrapFrame;
 
 use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, ipc::signal_types::SignalNumber,
+    arch::CurrentIrqArch, exception::InterruptArch, 
     process::ProcessManager,
 };

@@ -13,13 +13,13 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{process::ArchPCBInfo, sched::sched, CurrentIrqArch},
+    arch::{ipc::signal::SigSet, process::ArchPCBInfo, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
-    ipc::signal_types::{SigHandler, SigPending, SigSet, SignalStruct},
+    ipc::signal_types::{SigPending, SignalStruct},
     kdebug, kinfo,
     libs::{
         align::AlignedBox,

@@ -155,7 +155,7 @@ impl VmxVcpu {
     pub fn vmcs_init_guest(&self) -> Result<(), SystemError>{
         // segment field initialization
         vmx_vmwrite(VmcsFields::GUEST_ES_SELECTOR as u32, (segmentation::es().bits() ).into())?;
-        vmx_vmwrite(VmcsFields::GUEST_CS_SELECTOR as u32, (segmentation::cs().bits() ).into())?;
+        vmx_vmwrite(VmcsFields::GUEST_CS_SELECTOR as u32, 0)?;
         vmx_vmwrite(VmcsFields::GUEST_SS_SELECTOR as u32, (segmentation::ss().bits() ).into())?;
         vmx_vmwrite(VmcsFields::GUEST_DS_SELECTOR as u32, (segmentation::ds().bits() ).into())?;
         vmx_vmwrite(VmcsFields::GUEST_FS_SELECTOR as u32, (segmentation::fs().bits() & (!0x07)).into())?;
@@ -227,11 +227,11 @@ impl VmxVcpu {
 
         vmx_vmwrite(
             VmcsFields::GUEST_CR0 as u32, 
-            unsafe{ controlregs::cr0().bits().try_into().unwrap() }
+            unsafe{ ((controlregs::cr0().bits() | 0x1) & 0x7FFF_FFFF )as u64}
         )?;
         vmx_vmwrite(
             VmcsFields::GUEST_CR3 as u32, 
-            unsafe{ controlregs::cr3() }
+            0
         )?;
         vmx_vmwrite(
             VmcsFields::GUEST_CR4 as u32, 
@@ -315,6 +315,10 @@ impl VmxVcpu {
     }
     // Intel SDM Volume 3C Chapter 25.3 “Organization of VMCS Data”
     pub fn vmcs_init(&self) -> Result<(), SystemError> {
+        vmx_vmwrite(VmcsFields::CTRL_PAGE_FAULT_ERR_CODE_MASK as u32, 0)?;
+        vmx_vmwrite(VmcsFields::CTRL_PAGE_FAULT_ERR_CODE_MATCH as u32, 0)?;
+        vmx_vmwrite(VmcsFields::CTRL_CR3_TARGET_COUNT as u32, 0)?;
+
         vmx_vmwrite(VmcsFields::CTRL_PIN_BASED_VM_EXEC_CTRLS as u32, adjust_vmx_pinbased_controls() as u64)?;
 
         vmx_vmwrite(VmcsFields::CTRL_MSR_BITMAP_ADDR as u32, self.data.msr_bitmap_physical_address)?;
@@ -445,7 +449,7 @@ pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u
 // }
 pub fn adjust_vmx_controls(ctl_min:u32, ctl_opt:u32, msr:u32, result: &mut u32){
     let vmx_msr_low:u32 = unsafe {(msr::rdmsr(msr) & 0x0000_0000_FFFF_FFFF) as u32};
-    let vmx_msr_high:u32 = unsafe {(msr::rdmsr(msr) >> 32) as u32};
+    let vmx_msr_high:u32 = unsafe {(msr::rdmsr(msr) << 32) as u32};
     let mut ctl: u32 = ctl_min | ctl_opt;
     ctl &= vmx_msr_high; /* bit == 0 in high word ==> must be zero */
     ctl |= vmx_msr_low;  /* bit == 1 in low word  ==> must be one  */

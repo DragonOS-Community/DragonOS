@@ -45,18 +45,18 @@ struct kvm_regs {
 	uint64_t rip, rflags;
 };
 
-// int guest_code(){
-//     while (1)
-//     {
-//         printf("guest code\n");
-//         __asm__ __volatile__ (
-//             "mov %rax, 0\n\t"
-//             "mov %rcx, 0\n\t"
-//             "cpuid\n\t"
-//         );
-//     }
-//     return 0;
-// }
+int guest_code(){
+    while (1)
+    {
+        // printf("guest code\n");
+        __asm__ __volatile__ (
+            "mov %rax, 0\n\t"
+            "mov %rcx, 0\n\t"
+            "cpuid\n\t"
+        );
+    }
+    return 0;
+}
 
 int main()
 {
@@ -66,7 +66,14 @@ int main()
     int vmfd = ioctl(kvm_fd, 0x01, 0);
     printf("vmfd=%d\n", vmfd);
 
-    uint8_t code[] = "\xB0\x61\xBA\x17\x02\xEE\xB0\n\xEE\xF4";
+    /*
+         __asm__ __volatile__ (
+            "mov %rax, 0\n\t"
+            "mov %rcx, 0\n\t"
+            "cpuid\n\t"
+        ); 
+    */
+    uint8_t code[] = "\x48\x89\x04\x25\x00\x00\x00\x00\x48\x89\x0c\x25\x00\x00\x00\x00\x0f\xa2";
     size_t mem_size = 0x4000; // size of user memory you want to assign
     printf("code=%p\n", code);
     // void *mem = mmap(0, mem_size, 0x7, -1, 0);

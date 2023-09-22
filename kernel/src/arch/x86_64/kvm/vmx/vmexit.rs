@@ -219,7 +219,7 @@ extern "C" fn vmexit_handler(){
             kdebug!("vmexit handler: triple fault!");
             adjust_rip(guest_rip).unwrap();
         },
-        VmxExitReason::EPT_VIOLATION | VmxExitReason::EXCEPTION_OR_NMI=> {
+        VmxExitReason::EPT_VIOLATION=> {
             kdebug!("vmexit handler: ept violation!");
             let gpa = vmx_vmread(GUEST_PHYSICAL_ADDR_FULL as u32).unwrap();
             let exit_qualification = vmx_vmread(VmcsFields::VMEXIT_QUALIFICATION as u32).unwrap();

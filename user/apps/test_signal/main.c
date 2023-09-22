@@ -42,9 +42,10 @@ int main()
 
     while (1)
     {
+        handler(SIGKILL);
         if ((clock() - last) / CLOCKS_PER_SEC >= 1)
         {
-            // printf("Test signal running\n");
+             printf("Test signal running\n");
             last = clock();
         }
         if (handle_ok)

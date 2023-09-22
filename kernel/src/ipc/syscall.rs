@@ -1,15 +1,23 @@
-use core::ffi::c_int;
+use core::{
+    ffi::{c_int, c_void},
+    sync::atomic::compiler_fence,
+};
 
 use crate::{
-    filesystem::vfs::{
-        file::{File, FileMode},
-        FilePrivateData,
-    },
+    filesystem::vfs::{file::{File, FileMode}, FilePrivateData},
+    kerror, kwarn,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
 
-use super::pipe::{LockedPipeInode, PipeFsPrivateData};
+use super::{
+    pipe::{LockedPipeInode, PipeFsPrivateData},
+    signal::{signal_kill_something_info, DEFAULT_SIGACTION, DEFAULT_SIGACTION_IGNORE},
+    signal_types::{
+        SigCode, SigFlags, SigInfo, SigSet, SigType, Sigaction, SigactionType, SignalNumber,
+        UserSigaction, USER_SIG_DFL, USER_SIG_IGN,
+    },
+};
 
 impl Syscall {
     /// # 创建带参数的匿名管道
@@ -52,9 +60,24 @@ impl Syscall {
         }
     }
 
-    pub fn kill(_pid: Pid, _sig: c_int) -> Result<usize, SystemError> {
-        // todo: 由于进程管理重构，目前删除了signal功能，将来重新实现它。
-        return Err(SystemError::ENOSYS);
+    pub fn kill(pid: Pid, sig: c_int) -> Result<usize, SystemError> {
+        let sig = SignalNumber::from(sig);
+        if sig == SignalNumber::INVALID {
+            // 传入的signal数值不合法
+            kwarn!("Not a valid signal number");
+            return Err(SystemError::EINVAL);
+        }
+
+        // 初始化signal info
+        let mut info = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(pid));
+
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        let retval = signal_kill_something_info(sig, Some(&mut info), pid).map(|x| x as usize);
+
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        return retval;
     }
 
     /// @brief 用户程序用于设置信号处理动作的函数（遵循posix2008）
@@ -66,12 +89,128 @@ impl Syscall {
     /// @return int 错误码
     #[no_mangle]
     pub fn sigaction(
-        _sig: c_int,
-        _act: usize,
-        _old_act: usize,
-        _from_user: bool,
+        sig: c_int,
+        act: usize,
+        old_act: usize,
+        from_user: bool,
     ) -> Result<usize, SystemError> {
-        // todo: 由于进程管理重构，目前删除了signal功能，将来重新实现它。
-        return Err(SystemError::ENOSYS);
+        // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
+        let act = act as *mut UserSigaction;
+        let mut old_act = old_act as *mut UserSigaction;
+        let mut new_ka: Sigaction = Default::default();
+        let mut old_ka: Sigaction = Default::default();
+
+        // 如果传入的，新的sigaction不为空
+        if !act.is_null() {
+            // 如果参数的范围不在用户空间，则返回错误
+            let r = UserBufferWriter::new(act, core::mem::size_of::<Sigaction>(), from_user);
+            if r.is_err() {
+                return Err(SystemError::EFAULT);
+            }
+            let mask: SigSet = unsafe { (*act).mask };
+            let input_sighandler = unsafe { (*act).handler as u64 };
+            // kdebug!("_input_sah={}", _input_sah);
+            match input_sighandler {
+                USER_SIG_DFL | USER_SIG_IGN => {
+                    if input_sighandler == USER_SIG_DFL {
+                        new_ka = *DEFAULT_SIGACTION;
+                        *new_ka.flags_mut() = (unsafe { (*act).flags }
+                            & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
+                            | SigFlags::SA_FLAG_DFL;
+                    } else {
+                        new_ka = *DEFAULT_SIGACTION_IGNORE;
+                        *new_ka.flags_mut() = (unsafe { (*act).flags }
+                            & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
+                            | SigFlags::SA_FLAG_IGN;
+                    }
+
+                    let sar = unsafe { (*act).handler };
+                    new_ka.set_restorer(Some(sar as u64));
+                }
+                _ => {
+                    // 从用户空间获得sigaction结构体
+                    // TODO mask是default还是用户空间传入
+                    new_ka = Sigaction::new(
+                        SigactionType::SaHandler(Some(unsafe { (*act).handler as u64 })),
+                        unsafe { (*act).flags },
+                        SigSet::default(),
+                        unsafe { Some((*act).restorer as u64) },
+                    );
+                }
+            }
+            // kdebug!("new_ka={:?}", new_ka);
+            // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
+            if new_ka.restorer().is_some() {
+                new_ka.flags_mut().insert(SigFlags::SA_FLAG_RESTORER);
+            } else {
+                kwarn!(
+                "pid:{:?}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {}.",
+                ProcessManager::current_pcb().pid(),
+                sig
+            );
+            }
+            *new_ka.mask_mut() = mask;
+        }
+
+        let sig = SignalNumber::from(sig as i32);
+        // 如果给出的信号值不合法
+        if sig == SignalNumber::INVALID {
+            return Err(SystemError::EINVAL);
+        }
+
+        let retval = super::signal::do_sigaction(
+            sig,
+            if act.is_null() {
+                None
+            } else {
+                Some(&mut new_ka)
+            },
+            if old_act.is_null() {
+                None
+            } else {
+                Some(&mut old_ka)
+            },
+        );
+
+        // 将原本的sigaction拷贝到用户程序指定的地址
+        if (retval == Ok(())) && (!old_act.is_null()) {
+            let r = UserBufferWriter::new(old_act, core::mem::size_of::<Sigaction>(), from_user);
+            if r.is_err() {
+                return Err(SystemError::EFAULT);
+            }
+            // ！！！！！！！！！！todo: 检查这里old_ka的mask，是否为SIG_IGN SIG_DFL,如果是，则将_sa_handler字段替换为对应的值
+            let sah: u64;
+            if old_ka.flags().contains(SigFlags::SA_FLAG_DFL) {
+                sah = USER_SIG_DFL;
+            } else if old_ka.flags().contains(SigFlags::SA_FLAG_IGN) {
+                sah = USER_SIG_IGN;
+            } else {
+                sah = match old_ka.action() {
+                    SigactionType::SaHandler(handler) => {
+                        if handler.is_none() {
+                            kerror!("Null handler.Assigned a default SIGHANDLER");
+                            USER_SIG_DFL
+                        } else {
+                            handler.unwrap()
+                        }
+                    }
+                    SigactionType::SaSigaction(_) => {
+                        kerror!("unsupported type: SaSigaction");
+                        USER_SIG_DFL
+                    }
+                }
+            }
+            unsafe {
+                (*old_act).handler = sah as *mut c_void;
+                (*old_act).flags = old_ka.flags();
+                (*old_act).mask = old_ka.mask();
+                if old_ka.restorer().is_some() {
+                    (*old_act).restorer = old_ka.restorer().unwrap() as *mut c_void;
+                } else {
+                    kerror!("Saving old SIGACTION restorer failed: Null pointer of restorer");
+                }
+            }
+        }
+        return retval.map(|_| 0);
     }
 }

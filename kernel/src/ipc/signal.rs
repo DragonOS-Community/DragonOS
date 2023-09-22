@@ -20,7 +20,7 @@ use super::signal_types::{
 lazy_static! {
     /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
      #[allow(dead_code)]
-    static ref DEFAULT_SIGACTION: Sigaction = Sigaction::new(
+    pub static ref DEFAULT_SIGACTION: Sigaction = Sigaction::new(
     SigactionType::SaHandler(None),
      SigFlags::SA_FLAG_DFL,
     SigSet::from_bits(0).unwrap(),
@@ -29,7 +29,7 @@ lazy_static! {
 
 /// 默认的“忽略信号”的sigaction
 #[allow(dead_code)]
-static ref DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction::new(
+pub static ref DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction::new(
     SigactionType::SaHandler(None),
      SigFlags::SA_FLAG_IGN,
     SigSet::from_bits(0).unwrap(),
@@ -154,7 +154,7 @@ fn send_signal(
             }
             None => {
                 // 不需要显示指定siginfo，因此设置为默认值
-                q = SigInfo::new(sig, 0, SigCode::SI_USER);
+                q = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(Pid::from(0)));
                 q.set_sig_type(SigType::Kill(ProcessManager::current_pcb().pid()));
             }
         }
@@ -430,7 +430,7 @@ fn collect_signal(sig: SignalNumber, pending: &mut SigPending) -> SigInfo {
         return info.unwrap();
     } else {
         // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-        let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER);
+        let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(Pid::from(0)));
         ret.set_sig_type(SigType::Kill(Pid::new(0)));
         return ret;
     }

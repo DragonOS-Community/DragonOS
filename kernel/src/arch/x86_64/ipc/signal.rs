@@ -262,7 +262,7 @@ fn copy_siginfo_to_user(to: *mut SigInfo, from: &SigInfo) -> Result<i32, SystemE
     // 验证目标地址是否为用户空间
     let mut user_buffer = UserBufferWriter::new(to, size_of::<SigInfo>(), true)?;
 
-    let retval: Result<i32, SystemError> = Ok(0);
+    let mut retval: Result<i32, SystemError> = Ok(0);
 
     // todo: 将这里按照si_code的类型来分别拷贝不同的信息。
     // 这里参考linux-2.6.39  网址： http://opengrok.ringotek.cn/xref/linux-2.6.39/arch/ia64/kernel/signal.c#137
@@ -278,8 +278,11 @@ fn copy_siginfo_to_user(to: *mut SigInfo, from: &SigInfo) -> Result<i32, SystemE
     let pid = match from.sig_type() {
         SigType::Kill(pid) => pid,
     };
-    user_buffer.copy_one_to_user::<Pid>(&pid, size_of::<i32>() * 3 + size_of::<u32>());
-
+    let r = user_buffer.copy_one_to_user::<Pid>(&pid, size_of::<i32>() * 3 + size_of::<u32>());
+    if r.is_err() {
+        kerror!("Can not copy siginfo struct to user stack");
+        retval = Err(r.unwrap_err());
+    }
     return retval;
 }
 

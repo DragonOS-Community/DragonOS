@@ -296,11 +296,11 @@ impl Sigaction {
 /// 请注意，我们会在sys_sigaction函数里面将其转换成内核使用的sigaction结构体
 #[derive(Debug)]
 pub struct UserSigaction {
-    handler: *mut core::ffi::c_void,
-    sigaction: *mut core::ffi::c_void,
-    mask: SigSet,
-    flags: SigFlags,
-    restorer: *mut core::ffi::c_void,
+    pub handler: *mut core::ffi::c_void,
+    pub sigaction: *mut core::ffi::c_void,
+    pub mask: SigSet,
+    pub flags: SigFlags,
+    pub restorer: *mut core::ffi::c_void,
 }
 
 /**
@@ -350,13 +350,19 @@ pub enum SigType {
 }
 
 impl SigInfo {
-    pub fn new(sig: SignalNumber, sig_errno: i32, sig_code: SigCode) -> Self {
+    pub fn new(
+        sig: SignalNumber,
+        sig_errno: i32,
+        sig_code: SigCode,
+        reserved: u32,
+        sig_type: SigType,
+    ) -> Self {
         Self {
             sig_no: sig as i32,
             code: sig_code as i32,
             errno: sig_errno,
-            reserved: 0,
-            sig_type: SigType::Kill(Pid::new(0)),
+            reserved,
+            sig_type,
         }
     }
 }

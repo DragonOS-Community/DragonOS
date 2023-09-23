@@ -6,7 +6,7 @@ use crate::{
     arch::{
         asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber},
+        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber, _NSIG},
     },
     include::bindings::bindings::{pt_regs, SA_FLAG_DFL, SA_FLAG_IGN},
     ipc::signal_types::SigactionType,
@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::signal_types::{
-    SaHandlerType, SigContext, SigFrame, SigHandStruct, SigInfo, SigPending, SigQueue, SigType,
-    Sigaction, SignalStruct, MAX_SIG_NUM,
+    SaHandlerType, SigHandStruct, SigInfo, SigPending, SigQueue, SigType, Sigaction, SignalStruct,
+    MAX_SIG_NUM,
 };
 
 lazy_static! {
@@ -85,16 +85,6 @@ fn signal_kill_proc_info(
     return retval;
 }
 
-/// @brief 验证信号的值是否在范围内
-#[inline]
-fn verify_signal(sig: SignalNumber) -> bool {
-    return if (sig as i32) <= MAX_SIG_NUM {
-        true
-    } else {
-        false
-    };
-}
-
 /// @brief 在发送信号给指定的进程前，做一些权限检查. 检查是否有权限发送
 /// @param sig 要发送的信号
 /// @param info 要发送的信息
@@ -107,12 +97,11 @@ fn signal_send_sig_info(
 ) -> Result<i32, SystemError> {
     // kdebug!("signal_send_sig_info");
     // 检查sig是否符合要求，如果不符合要求，则退出。
-    if !verify_signal(sig) {
+    if !sig.is_valid() {
         return Err(SystemError::EINVAL);
     }
     // 信号符合要求，可以发送
     let mut retval = Err(SystemError::ESRCH);
-    let mut flags: usize = 0;
     // 如果上锁成功，则发送信号
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // 发送信号
@@ -136,7 +125,7 @@ fn send_signal(
     // signal的信息为空
 
     if let Some(ref x) = info {
-        force_send = x.code() == (SigCode::SI_KERNEL as i32);
+        force_send = matches!(x.sig_code(), SigCode::SI_KERNEL);
     } else {
         // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
     }
@@ -307,8 +296,7 @@ pub fn get_signal_to_deliver(
     let ka: Option<&mut Sigaction>;
     let mut sig_number;
     let pcb = ProcessManager::current_pcb();
-    let mut guard = pcb.sig_struct_irq();
-    let sighand = &mut guard.handler.clone();
+    let guard = pcb.sig_struct_irq();
 
     loop {
         (sig_number, info) =
@@ -320,7 +308,7 @@ pub fn get_signal_to_deliver(
             return (sig_number, None, None);
         }
         let tmp_ka: &mut Sigaction;
-        // 获取指向sigaction结构体的引用
+
         let hand = Arc::as_ptr(&guard.handler) as *mut SigHandStruct;
         // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
         unsafe {
@@ -328,6 +316,7 @@ pub fn get_signal_to_deliver(
             if r.is_none() {
                 panic!("error converting *mut SigHandStruct to &mut SigHandStruct");
             }
+            // 获取指向sigaction结构体的引用
             tmp_ka = &mut r.unwrap().0[sig_number as usize - 1];
         }
 
@@ -365,20 +354,20 @@ pub fn get_signal_to_deliver(
 fn dequeue_signal(sig_mask: &mut SigSet) -> (SignalNumber, Option<SigInfo>) {
     // kdebug!("dequeue signal");
     // 获取下一个要处理的信号的编号
-    let sig = next_signal(
-        &ProcessManager::current_pcb().sig_info().sig_pedding(),
-        sig_mask,
-    );
+    let sig = ProcessManager::current_pcb()
+        .sig_info()
+        .sig_pedding()
+        .next_signal(sig_mask);
 
     let info: Option<SigInfo>;
     if sig != SignalNumber::INVALID {
         // 如果下一个要处理的信号是合法的，则收集其siginfo
-        info = Some(collect_signal(
-            sig,
+        info = Some(
             ProcessManager::current_pcb()
                 .sig_info_mut()
-                .sig_pedding_mut(),
-        ));
+                .sig_pedding_mut()
+                .collect_signal(sig),
+        );
     } else {
         info = None;
     }
@@ -388,56 +377,9 @@ fn dequeue_signal(sig_mask: &mut SigSet) -> (SignalNumber, Option<SigInfo>) {
     return (sig, info);
 }
 
-/// @brief 获取下一个要处理的信号（sig number越小的信号，优先级越高）
-///
-/// @param pending 等待处理的信号
-/// @param sig_mask 屏蔽了的信号
-/// @return i32 下一个要处理的信号的number. 如果为0,则无效
-fn next_signal(pending: &SigPending, sig_mask: &SigSet) -> SignalNumber {
-    let mut sig = SignalNumber::INVALID;
-
-    let s = pending.signal();
-    let m = *sig_mask;
-
-    // 获取第一个待处理的信号的号码
-    let x = s.intersection(m.complement());
-    if x.bits() != 0 {
-        sig = SignalNumber::from(ffz(x.complement().bits()) + 1);
-        return sig;
-    }
-
-    // 暂时只支持64种信号
-    assert_eq!(crate::ipc::signal_types::_NSIG_U64_CNT, 1);
-
-    return sig;
-}
-
 /// @brief 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位
 fn recalc_sigpending() {
     // todo:
-}
-
-/// @brief 收集信号的信息
-///
-/// @param sig 要收集的信号的信息
-/// @param pending 信号的排队等待标志
-/// @return SigInfo 信号的信息
-fn collect_signal(sig: SignalNumber, pending: &mut SigPending) -> SigInfo {
-    let (info, still_pending) = pending.queue_mut().find_and_delete(sig);
-
-    // 如果没有仍在等待的信号，则清除pending位
-    if !still_pending {
-        pending.signal_mut().remove(sig.into());
-    }
-
-    if info.is_some() {
-        return info.unwrap();
-    } else {
-        // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-        let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(Pid::from(0)));
-        ret.set_sig_type(SigType::Kill(Pid::new(0)));
-        return ret;
-    }
 }
 
 /// @brief 刷新指定进程的sighand的sigaction，将满足条件的sigaction恢复为Default

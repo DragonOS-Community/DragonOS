@@ -1,6 +1,7 @@
 use core::{
     cell::Cell,
     ffi::{c_int, c_void},
+    mem::size_of,
     sync::atomic::AtomicI64,
 };
 
@@ -8,9 +9,10 @@ use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     arch::{
+        asm::bitops::ffz,
         fpu::FpState,
         interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber},
+        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber, _NSIG},
     },
     include::bindings::bindings::siginfo,
     kerror,
@@ -19,6 +21,7 @@ use crate::{
         spinlock::SpinLock,
     },
     process::Pid,
+    syscall::{user_access::UserBufferWriter, SystemError},
 };
 
 /// 存储信号处理函数的地址(来自用户态)
@@ -28,10 +31,7 @@ pub type __sighandler_t = __signalfn_t;
 pub type __sigrestorer_fn_t = u64;
 pub type __sigrestorer_t = __sigrestorer_fn_t;
 
-/// 最大的信号数量（改动这个值的时候请同步到signal.h)
-pub const MAX_SIG_NUM: i32 = 64;
-/// sigset所占用的u64的数量（改动这个值的时候请同步到signal.h)
-pub const _NSIG_U64_CNT: i32 = MAX_SIG_NUM / 64;
+pub const MAX_SIG_NUM: usize = _NSIG;
 
 /// 用户态程序传入的SIG_DFL的值
 pub const USER_SIG_DFL: u64 = 0;
@@ -39,6 +39,36 @@ pub const USER_SIG_DFL: u64 = 0;
 pub const USER_SIG_IGN: u64 = 1;
 /// 用户态程序传入的SIG_ERR的值
 pub const USER_SIG_ERR: u64 = 2;
+
+// 因为 Rust 编译器不能在常量声明中正确识别级联的 "|" 运算符(experimental feature： https://github.com/rust-lang/rust/issues/67792)，因此
+// 暂时只能通过这种方法来声明这些常量
+pub const SIG_KERNEL_ONLY_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGSTOP)
+    .union(SignalNumber::into_sigset(SignalNumber::SIGKILL));
+
+pub const SIG_KERNEL_STOP_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGSTOP)
+    .union(SignalNumber::into_sigset(SignalNumber::SIGTSTP))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGTTIN))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGTTOU));
+
+pub const SIG_KERNEL_COREDUMP_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGQUIT)
+    .union(SignalNumber::into_sigset(SignalNumber::SIGILL))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGTRAP))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGABRT_OR_IOT))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGFPE))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGSEGV))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGBUS))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGSYS))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGXCPU))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGXFSZ));
+
+pub const SIG_KERNEL_IGNORE_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGCONT)
+    .union(SignalNumber::into_sigset(SignalNumber::SIGFPE))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGSEGV))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGBUS))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGTRAP))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGCHLD))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGIO_OR_POLL))
+    .union(SignalNumber::into_sigset(SignalNumber::SIGSYS));
 
 /// SignalStruct 在 pcb 中加锁
 #[derive(Debug)]
@@ -100,14 +130,6 @@ impl Into<usize> for SaHandlerType {
 }
 
 impl SaHandlerType {
-    /// Returns `true` if the sa handler type is [`SigCustomized`].
-    ///
-    /// [`SigCustomized`]: SaHandlerType::SigCustomized
-    #[must_use]
-    pub fn is_sig_customized(&self) -> bool {
-        matches!(self, Self::SigCustomized(..))
-    }
-
     /// Returns `true` if the sa handler type is [`SigDefault`].
     ///
     /// [`SigDefault`]: SaHandlerType::SigDefault
@@ -160,7 +182,7 @@ impl Sigaction {
         if self.flags.contains(SigFlags::SA_FLAG_IGN) {
             return true;
         }
-        //a_flags为SA_FLAG_DFL,但是默认处理函数为忽略的情况的判断
+        //sa_flags为SA_FLAG_DFL,但是默认处理函数为忽略的情况的判断
         if self.flags().contains(SigFlags::SA_FLAG_DFL) {
             if let SigactionType::SaHandler(SaHandlerType::SigIgnore) = self.action {
                 return true;
@@ -235,7 +257,7 @@ pub struct UserSigaction {
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {
     sig_no: i32,
-    code: i32,
+    sig_code: SigCode,
     errno: i32,
     reserved: u32,
     sig_type: SigType,
@@ -246,8 +268,8 @@ impl SigInfo {
         self.sig_no
     }
 
-    pub fn code(&self) -> i32 {
-        self.code
+    pub fn sig_code(&self) -> SigCode {
+        self.sig_code
     }
 
     pub fn errno(&self) -> i32 {
@@ -264,6 +286,26 @@ impl SigInfo {
 
     pub fn set_sig_type(&mut self, sig_type: SigType) {
         self.sig_type = sig_type;
+    }
+    /// @brief 将siginfo结构体拷贝到用户栈
+    /// ## 参数
+    ///
+    /// `to` 用户空间指针
+    ///
+    /// ## 注意
+    ///
+    /// 该函数对应Linux中的https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#3323
+    /// Linux还提供了 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#3383 用来实现
+    /// kernel_siginfo 保存到 用户的 compact_siginfo 的功能，但是我们系统内还暂时没有对这两种
+    /// siginfo做区分，因此暂时不需要第二个函数
+    pub fn copy_siginfo_to_user(&self, to: *mut SigInfo) -> Result<i32, SystemError> {
+        // 验证目标地址是否为用户空间
+        let mut user_buffer = UserBufferWriter::new(to, size_of::<SigInfo>(), true)?;
+
+        let mut retval: Result<i32, SystemError> = Ok(0);
+
+        user_buffer.copy_one_to_user(self, 0)?;
+        return retval;
     }
 }
 
@@ -282,7 +324,7 @@ impl SigInfo {
     ) -> Self {
         Self {
             sig_no: sig as i32,
-            code: sig_code as i32,
+            sig_code,
             errno: sig_errno,
             reserved,
             sig_type,
@@ -332,47 +374,51 @@ impl SigPending {
     pub fn signal_mut(&mut self) -> &mut SigSet {
         &mut self.signal
     }
-}
+    /// @brief 获取下一个要处理的信号（sig number越小的信号，优先级越高）
+    ///
+    /// @param pending 等待处理的信号
+    /// @param sig_mask 屏蔽了的信号
+    /// @return i32 下一个要处理的信号的number. 如果为0,则无效
+    pub fn next_signal(&self, sig_mask: &SigSet) -> SignalNumber {
+        let mut sig = SignalNumber::INVALID;
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SigFrame {
-    /// 指向restorer的地址的指针。（该变量必须放在sigframe的第一位，因为这样才能在handler返回的时候，跳转到对应的代码，执行sigreturn)
-    pub ret_code_ptr: *mut core::ffi::c_void,
-    /// signum
-    pub arg0: u64,
-    /// siginfo pointer
-    pub arg1: usize,
-    /// sigcontext pointer
-    pub arg2: usize,
+        let s = self.signal();
+        let m = *sig_mask;
 
-    pub handler: *mut c_void,
-    pub info: SigInfo,
-    pub context: SigContext,
-}
+        // 获取第一个待处理的信号的号码
+        let x = s.intersection(m.complement());
+        if x.bits() != 0 {
+            sig = SignalNumber::from(ffz(x.complement().bits()) + 1);
+            return sig;
+        }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SigContext {
-    /// sigcontext的标志位
-    pub sc_flags: u64,
-    pub sc_stack: SigStack, // 信号处理程序备用栈信息
-    pub frame: TrapFrame,   // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
-    // pub trap_num: u64,    // 用来保存线程结构体中的trap_num字段
-    pub oldmask: SigSet, // 暂存的执行信号处理函数之前的，被设置block的信号
-    pub cr2: u64,        // 用来保存线程结构体中的cr2字段
-    // pub err_code: u64,    // 用来保存线程结构体中的err_code字段
-    // todo: 支持x87浮点处理器后，在这里增加浮点处理器的状态结构体指针
-    pub reserved_for_x87_state: u64,
-    pub reserved: [u64; 8],
-}
+        // 暂时只支持64种信号
+        assert_eq!(_NSIG, 64);
 
-/// @brief 信号处理备用栈的信息
-#[derive(Debug, Clone, Copy)]
-pub struct SigStack {
-    pub sp: *mut c_void,
-    pub flags: u32,
-    pub size: u32,
-    pub fpstate: FpState,
+        return sig;
+    }
+    /// @brief 收集信号的信息
+    ///
+    /// @param sig 要收集的信号的信息
+    /// @param pending 信号的排队等待标志
+    /// @return SigInfo 信号的信息
+    pub fn collect_signal(&mut self, sig: SignalNumber) -> SigInfo {
+        let (info, still_pending) = self.queue_mut().find_and_delete(sig);
+
+        // 如果没有仍在等待的信号，则清除pending位
+        if !still_pending {
+            self.signal_mut().remove(sig.into());
+        }
+
+        if info.is_some() {
+            return info.unwrap();
+        } else {
+            // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
+            let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(Pid::from(0)));
+            ret.set_sig_type(SigType::Kill(Pid::new(0)));
+            return ret;
+        }
+    }
 }
 
 /// @brief 进程接收到的信号的队列

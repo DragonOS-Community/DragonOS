@@ -1,9 +1,10 @@
-use core::{ffi::c_void, mem::size_of};
+use core::{ffi::c_void, mem::size_of, ops::BitOr};
 
 use alloc::sync::Arc;
 
 use crate::{
     arch::{
+        fpu::FpState,
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         CurrentIrqArch,
@@ -12,7 +13,7 @@ use crate::{
     include::bindings::bindings::USER_MAX_LINEAR_ADDR,
     ipc::{
         signal::{get_signal_to_deliver, set_current_sig_blocked},
-        signal_types::{SigContext, SigFrame, SigInfo, SigType, Sigaction, SigactionType},
+        signal_types::{SigInfo, SigType, Sigaction, SigactionType, MAX_SIG_NUM},
     },
     kdebug, kerror,
     process::{Pid, ProcessManager},
@@ -83,7 +84,7 @@ impl PartialEq for SignalNumber {
 
 impl From<usize> for SignalNumber {
     fn from(value: usize) -> Self {
-        if Self::valid_signal_number(value) {
+        if value <= MAX_SIG_NUM {
             let ret: SignalNumber = unsafe { core::mem::transmute(value) };
             return ret;
         } else {
@@ -112,21 +113,25 @@ impl From<i32> for SignalNumber {
 
 impl Into<SigSet> for SignalNumber {
     fn into(self) -> SigSet {
-        SigSet {
-            bits: (self as usize - 1) as u64,
-        }
+        self.into_sigset()
     }
 }
 impl SignalNumber {
     /// 判断一个数字是否为可用的信号
-    fn valid_signal_number(x: usize) -> bool {
-        return x <= SIGRTMAX;
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        return (*self) as usize <= SIGRTMAX;
+    }
+
+    /// const convertor between `SignalNumber` and `SigSet`
+    pub const fn into_sigset(self) -> SigSet {
+        SigSet::from_bits_truncate((self as usize - 1) as u64)
     }
 }
 
 /// siginfo中的si_code的可选值
 /// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
-#[allow(dead_code)]
+#[derive(Copy, Debug, Clone)]
 #[repr(i32)]
 pub enum SigCode {
     /// sent by kill, sigsend, raise
@@ -176,6 +181,89 @@ bitflags! {
     #[derive(Default)]
     pub struct SigSet:u64{
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SigFrame {
+    /// 指向restorer的地址的指针。（该变量必须放在sigframe的第一位，因为这样才能在handler返回的时候，跳转到对应的代码，执行sigreturn)
+    pub ret_code_ptr: *mut core::ffi::c_void,
+    /// signum
+    pub arg0: u64,
+    /// siginfo pointer
+    pub arg1: usize,
+    /// sigcontext pointer
+    pub arg2: usize,
+
+    pub handler: *mut c_void,
+    pub info: SigInfo,
+    pub context: SigContext,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SigContext {
+    /// sigcontext的标志位
+    pub sc_flags: u64,
+    pub sc_stack: SigStack, // 信号处理程序备用栈信息
+    pub frame: TrapFrame,   // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
+    // pub trap_num: u64,    // 用来保存线程结构体中的trap_num字段
+    pub oldmask: SigSet, // 暂存的执行信号处理函数之前的，被设置block的信号
+    pub cr2: u64,        // 用来保存线程结构体中的cr2字段
+    // pub err_code: u64,    // 用来保存线程结构体中的err_code字段
+    // todo: 支持x87浮点处理器后，在这里增加浮点处理器的状态结构体指针
+    pub reserved_for_x87_state: u64,
+    pub reserved: [u64; 8],
+}
+
+impl SigContext {
+    /// @brief 设置目标的sigcontext
+    ///
+    /// @param context 要被设置的目标sigcontext
+    /// @param mask 要被暂存的信号mask标志位
+    /// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
+    pub fn setup_sigcontext(
+        &mut self,
+        mask: &SigSet,
+        frame: &TrapFrame,
+    ) -> Result<i32, SystemError> {
+        //TODO 引入线程后补上
+        // let current_thread = ProcessManager::current_pcb().thread;
+
+        self.oldmask = *mask;
+        self.frame = frame.clone();
+        // context.trap_num = unsafe { (*current_thread).trap_num };
+        // context.err_code = unsafe { (*current_thread).err_code };
+        // context.cr2 = unsafe { (*current_thread).cr2 };
+        return Ok(0);
+    }
+
+    /// @brief 将指定的sigcontext恢复到当前进程的内核栈帧中,并将当前线程结构体的几个参数进行恢复
+    ///
+    /// @param context 要被恢复的context
+    /// @param regs 目标栈帧（也就是把context恢复到这个栈帧中）
+    ///
+    /// @return bool true -> 成功恢复
+    ///              false -> 执行失败
+    pub fn restore_sigcontext(&self, frame: &mut TrapFrame) -> bool {
+        let guard = ProcessManager::current_pcb();
+        let mut arch_info = guard.arch_info();
+        *frame = self.frame;
+
+        // (*current_thread).trap_num = (*context).trap_num;
+        *arch_info.cr2_mut() = self.cr2 as usize;
+        // (*current_thread).err_code = (*context).err_code;
+        // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
+        ProcessManager::current_pcb().arch_info().restore_fp_state();
+        return true;
+    }
+}
+/// @brief 信号处理备用栈的信息
+#[derive(Debug, Clone, Copy)]
+pub struct SigStack {
+    pub sp: *mut c_void,
+    pub flags: u32,
+    pub size: u32,
+    pub fpstate: FpState,
 }
 
 #[no_mangle]
@@ -301,11 +389,18 @@ fn setup_frame(
     ProcessManager::current_pcb().arch_info().clear_fp_state();
 
     // 将siginfo拷贝到用户栈
-    err |= copy_siginfo_to_user(unsafe { &mut (*frame).info }, info).unwrap_or(1);
+    err |= info
+        .copy_siginfo_to_user(&mut unsafe { (*frame).info })
+        .unwrap_or(1);
 
     // todo: 拷贝处理程序备用栈的地址、大小、ss_flags
 
-    err |= setup_sigcontext(unsafe { &mut (*frame).context }, oldset, &trap_frame).unwrap_or(1);
+    err |= unsafe {
+        (*frame)
+            .context
+            .setup_sigcontext(oldset, &trap_frame)
+            .unwrap_or(1)
+    };
 
     // 为了与Linux的兼容性，64位程序必须由用户自行指定restorer
     if ka.flags().contains(SigFlags::SA_FLAG_RESTORER) {
@@ -355,83 +450,14 @@ fn setup_frame(
     };
 }
 
-/// @brief 设置目标的sigcontext
-///
-/// @param context 要被设置的目标sigcontext
-/// @param mask 要被暂存的信号mask标志位
-/// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
-fn setup_sigcontext(
-    context: &mut SigContext,
-    mask: &SigSet,
-    frame: &TrapFrame,
-) -> Result<i32, SystemError> {
-    //TODO 引入线程后补上
-    // let current_thread = ProcessManager::current_pcb().thread;
-
-    context.oldmask = *mask;
-    context.frame = frame.clone();
-    // context.trap_num = unsafe { (*current_thread).trap_num };
-    // context.err_code = unsafe { (*current_thread).err_code };
-    // context.cr2 = unsafe { (*current_thread).cr2 };
-    return Ok(0);
-}
-
-/// @brief 将指定的sigcontext恢复到当前进程的内核栈帧中,并将当前线程结构体的几个参数进行恢复
-///
-/// @param context 要被恢复的context
-/// @param regs 目标栈帧（也就是把context恢复到这个栈帧中）
-///
-/// @return bool true -> 成功恢复
-///              false -> 执行失败
-fn restore_sigcontext(context: &SigContext, frame: &mut TrapFrame) -> bool {
-    let guard = ProcessManager::current_pcb();
-    let mut arch_info = guard.arch_info();
-    *frame = (*context).frame;
-
-    // (*current_thread).trap_num = (*context).trap_num;
-    *arch_info.cr2_mut() = (*context).cr2 as usize;
-    // (*current_thread).err_code = (*context).err_code;
-    // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
-    ProcessManager::current_pcb().arch_info().restore_fp_state();
-    return true;
-}
-
 #[inline(always)]
 fn get_stack(_ka: &Sigaction, frame: &TrapFrame, size: usize) -> *mut SigFrame {
-    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小
+    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小，在 linux 中会根据 Sigaction 中的一个flag 的值来确定是否使用
+    // pcb中的 signal 处理程序备用堆栈 信号处理程序备用堆栈的地址
     let mut rsp: usize = (frame.rsp as usize) - 128 - size;
     // 按照要求进行对齐
     rsp &= (-(STACK_ALIGN as i64)) as usize;
     return rsp as *mut SigFrame;
-}
-
-/// @brief 将siginfo结构体拷贝到用户栈
-fn copy_siginfo_to_user(to: *mut SigInfo, from: &SigInfo) -> Result<i32, SystemError> {
-    // 验证目标地址是否为用户空间
-    let mut user_buffer = UserBufferWriter::new(to, size_of::<SigInfo>(), true)?;
-
-    let mut retval: Result<i32, SystemError> = Ok(0);
-
-    // todo: 将这里按照si_code的类型来分别拷贝不同的信息。
-    // 这里参考linux-2.6.39  网址： http://opengrok.ringotek.cn/xref/linux-2.6.39/arch/ia64/kernel/signal.c#137
-
-    //     pub struct SigInfo {
-    //     sig_no: i32,
-    //     code: i32,
-    //     errno: i32,
-    //     reserved: u32,
-    //     sig_type: SigType,
-    // }
-    // 因此下面的偏移量就是 i32+i32+i32+u32
-    let pid = match from.sig_type() {
-        SigType::Kill(pid) => pid,
-    };
-    let r = user_buffer.copy_one_to_user::<Pid>(&pid, size_of::<i32>() * 3 + size_of::<u32>());
-    if r.is_err() {
-        kerror!("Can not copy siginfo struct to user stack");
-        retval = Err(r.unwrap_err());
-    }
-    return retval;
 }
 
 pub fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
@@ -448,7 +474,7 @@ pub fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
     set_current_sig_blocked(&mut sigmask);
 
     // 从用户栈恢复sigcontext
-    if restore_sigcontext(unsafe { &mut (*frame).context }, trap_frame) == false {
+    if unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) == false {
         // todo：这里改为生成一个sigsegv
         // 退出进程
         ProcessManager::exit(SignalNumber::SIGSEGV as usize);

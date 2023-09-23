@@ -1,25 +1,19 @@
-use core::{mem::size_of, sync::atomic::compiler_fence};
+use core::sync::atomic::compiler_fence;
 
 use alloc::sync::Arc;
 
 use crate::{
     arch::{
-        asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber, _NSIG},
+        ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     },
-    include::bindings::bindings::{pt_regs, SA_FLAG_DFL, SA_FLAG_IGN},
     ipc::signal_types::SigactionType,
-    kdebug, kerror, kwarn,
-    libs::spinlock::SpinLockGuard,
-    process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
-    syscall::{user_access::UserBufferWriter, SystemError},
+    kdebug, kwarn,
+    process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
+    syscall::SystemError,
 };
 
-use super::signal_types::{
-    SaHandlerType, SigHandStruct, SigInfo, SigPending, SigQueue, SigType, Sigaction, SignalStruct,
-    MAX_SIG_NUM,
-};
+use super::signal_types::{SaHandlerType, SigHandStruct, SigInfo, SigType, Sigaction, MAX_SIG_NUM};
 
 lazy_static! {
     /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
@@ -40,227 +34,238 @@ pub static ref DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction::new(
      None,
     );
 
+
+
 }
-/// 通过kill的方式向目标进程发送信号
-/// @param sig 要发送的信号
-/// @param info 要发送的信息
-/// @param pid 进程id（目前只支持pid>0)
-pub fn signal_kill_something_info(
-    sig: SignalNumber,
-    info: Option<&mut SigInfo>,
-    pid: Pid,
-) -> Result<i32, SystemError> {
-    // 暂时不支持特殊的kill操作
-    if pid.le(&Pid::from(0)) {
-        kwarn!("Kill operation not support: pid={:?}", pid);
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+
+impl Signal {
+    /// 通过kill的方式向目标进程发送信号
+    /// @param sig 要发送的信号
+    /// @param info 要发送的信息
+    /// @param pid 进程id（目前只支持pid>0)
+    pub fn signal_kill_something_info(
+        self,
+        info: Option<&mut SigInfo>,
+        pid: Pid,
+    ) -> Result<i32, SystemError> {
+        // 暂时不支持特殊的kill操作
+        if pid.le(&Pid::from(0)) {
+            kwarn!("Kill operation not support: pid={:?}", pid);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        // kill单个进程
+        return self.signal_kill_proc_info(info, pid);
     }
-    // kill单个进程
-    return signal_kill_proc_info(sig, info, pid);
-}
 
-fn signal_kill_proc_info(
-    sig: SignalNumber,
-    info: Option<&mut SigInfo>,
-    pid: Pid,
-) -> Result<i32, SystemError> {
-    let mut retval = Err(SystemError::ESRCH);
+    fn signal_kill_proc_info(
+        self,
+        info: Option<&mut SigInfo>,
+        pid: Pid,
+    ) -> Result<i32, SystemError> {
+        let mut retval = Err(SystemError::ESRCH);
 
-    // step1: 当进程管理模块拥有pcblist_lock之后，对其加锁
+        // step1: 当进程管理模块拥有pcblist_lock之后，对其加锁
 
-    // step2: 根据pid找到pcb
-    let pcb = ProcessManager::find(pid);
+        // step2: 根据pid找到pcb
+        let pcb = ProcessManager::find(pid);
 
-    if pcb.is_none() {
-        kwarn!("No such process.");
+        if pcb.is_none() {
+            kwarn!("No such process.");
+            return retval;
+        }
+
+        // println!("Target pcb = {:?}", pcb.as_ref().unwrap());
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // step3: 调用signal_send_sig_info函数，发送信息
+        retval = self.signal_send_sig_info(info, pcb.unwrap(), PidType::PID);
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // step4: 解锁
         return retval;
     }
 
-    // println!("Target pcb = {:?}", pcb.as_ref().unwrap());
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // step3: 调用signal_send_sig_info函数，发送信息
-    retval = signal_send_sig_info(sig, info, pcb.unwrap(), PidType::PID);
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // step4: 解锁
-    return retval;
-}
-
-/// @brief 在发送信号给指定的进程前，做一些权限检查. 检查是否有权限发送
-/// @param sig 要发送的信号
-/// @param info 要发送的信息
-/// @param target_pcb 信号的接收者
-fn signal_send_sig_info(
-    sig: SignalNumber,
-    info: Option<&mut SigInfo>,
-    target_pcb: Arc<ProcessControlBlock>,
-    pt: PidType,
-) -> Result<i32, SystemError> {
-    // kdebug!("signal_send_sig_info");
-    // 检查sig是否符合要求，如果不符合要求，则退出。
-    if !sig.is_valid() {
-        return Err(SystemError::EINVAL);
-    }
-    // 信号符合要求，可以发送
-    let mut retval = Err(SystemError::ESRCH);
-    // 如果上锁成功，则发送信号
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // 发送信号
-    retval = send_signal(sig, info, target_pcb, pt);
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return retval;
-}
-
-/// @brief 判断是否需要强制发送信号，然后发送信号
-/// 进入函数后加锁
-///
-/// @return SystemError 错误码
-fn send_signal(
-    sig: SignalNumber,
-    info: Option<&mut SigInfo>,
-    pcb: Arc<ProcessControlBlock>,
-    pt: PidType,
-) -> Result<i32, SystemError> {
-    // 是否强制发送信号
-    let mut force_send = false;
-    // signal的信息为空
-
-    if let Some(ref x) = info {
-        force_send = matches!(x.sig_code(), SigCode::SI_KERNEL);
-    } else {
-        // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
+    /// @brief 在发送信号给指定的进程前，做一些权限检查. 检查是否有权限发送
+    /// @param sig 要发送的信号
+    /// @param info 要发送的信息
+    /// @param target_pcb 信号的接收者
+    fn signal_send_sig_info(
+        self,
+        info: Option<&mut SigInfo>,
+        target_pcb: Arc<ProcessControlBlock>,
+        pt: PidType,
+    ) -> Result<i32, SystemError> {
+        // kdebug!("signal_send_sig_info");
+        // 检查sig是否符合要求，如果不符合要求，则退出。
+        if !self.is_valid() {
+            return Err(SystemError::EINVAL);
+        }
+        // 信号符合要求，可以发送
+        let mut retval = Err(SystemError::ESRCH);
+        // 如果上锁成功，则发送信号
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // 发送信号
+        retval = self.send_signal(info, target_pcb, pt);
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        return retval;
     }
 
-    // kdebug!("force send={}", force_send);
+    /// @brief 判断是否需要强制发送信号，然后发送信号
+    /// 进入函数后加锁
+    ///
+    /// @return SystemError 错误码
+    fn send_signal(
+        self,
+        info: Option<&mut SigInfo>,
+        pcb: Arc<ProcessControlBlock>,
+        pt: PidType,
+    ) -> Result<i32, SystemError> {
+        // 是否强制发送信号
+        let mut force_send = false;
+        // signal的信息为空
 
-    let _pending = pcb.sig_info_mut().sig_pedding_mut();
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // 如果是kill或者目标pcb是内核线程，则无需获取sigqueue，直接发送信号即可
-    if sig == SignalNumber::SIGKILL || pcb.flags().contains(ProcessFlags::KTHREAD) {
-        complete_signal(sig, pcb, pt);
-    } else {
-        // 如果是其他信号，则加入到sigqueue内，然后complete_signal
-        let mut q: SigInfo;
-        match info {
-            Some(x) => {
-                // 已经显式指定了siginfo，则直接使用它。
-                q = (*x).clone();
-            }
-            None => {
-                // 不需要显示指定siginfo，因此设置为默认值
-                q = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(Pid::from(0)));
-                q.set_sig_type(SigType::Kill(ProcessManager::current_pcb().pid()));
-            }
+        if let Some(ref x) = info {
+            force_send = matches!(x.sig_code(), SigCode::SI_KERNEL);
+        } else {
+            // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
         }
 
-        ProcessManager::current_pcb()
-            .sig_info_mut()
+        // kdebug!("force send={}", force_send);
+
+        let _pending = pcb.sig_info_mut().sig_pedding_mut();
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // 如果是kill或者目标pcb是内核线程，则无需获取sigqueue，直接发送信号即可
+        if self == Signal::SIGKILL || pcb.flags().contains(ProcessFlags::KTHREAD) {
+            self.complete_signal(pcb, pt);
+        } else {
+            // 如果是其他信号，则加入到sigqueue内，然后complete_signal
+            let mut q: SigInfo;
+            match info {
+                Some(x) => {
+                    // 已经显式指定了siginfo，则直接使用它。
+                    q = (*x).clone();
+                }
+                None => {
+                    // 不需要显示指定siginfo，因此设置为默认值
+                    q = SigInfo::new(
+                        self.clone(),
+                        0,
+                        SigCode::SI_USER,
+                        0,
+                        SigType::Kill(Pid::from(0)),
+                    );
+                    q.set_sig_type(SigType::Kill(ProcessManager::current_pcb().pid()));
+                }
+            }
+
+            ProcessManager::current_pcb()
+                .sig_info_mut()
+                .sig_pedding_mut()
+                .queue_mut()
+                .q
+                .push(q);
+
+            self.complete_signal(pcb, pt);
+        }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        return Ok(0);
+    }
+
+    /// @brief 将信号添加到目标进程的sig_pending。在引入进程组后，本函数还将负责把信号传递给整个进程组。
+    ///
+    /// @param sig 信号
+    /// @param pcb 目标pcb
+    /// @param pt siginfo结构体中，pid字段代表的含义
+    fn complete_signal(self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
+        // kdebug!("complete_signal");
+
+        // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
+        // 将这个信号加到目标进程的sig_pending中
+        pcb.sig_info_mut()
             .sig_pedding_mut()
-            .queue_mut()
-            .q
-            .push(q);
+            .signal_mut()
+            .insert(self.into());
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // ===== 寻找需要wakeup的目标进程 =====
+        // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
+        //      todo: 当引入进程组的概念后，需要完善这里，使得它能寻找一个目标进程来唤醒，接着执行信号处理的操作。
 
-        complete_signal(sig, pcb, pt);
-    }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    return Ok(0);
-}
+        // let _signal = pcb.sig_struct();
 
-/// @brief 将信号添加到目标进程的sig_pending。在引入进程组后，本函数还将负责把信号传递给整个进程组。
-///
-/// @param sig 信号
-/// @param pcb 目标pcb
-/// @param pt siginfo结构体中，pid字段代表的含义
-fn complete_signal(sig: SignalNumber, pcb: Arc<ProcessControlBlock>, pt: PidType) {
-    // kdebug!("complete_signal");
+        let mut _target: Option<Arc<ProcessControlBlock>> = None;
 
-    // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
-    // 将这个信号加到目标进程的sig_pending中
-    pcb.sig_info_mut()
-        .sig_pedding_mut()
-        .signal_mut()
-        .insert(sig.into());
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // ===== 寻找需要wakeup的目标进程 =====
-    // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
-    //      todo: 当引入进程组的概念后，需要完善这里，使得它能寻找一个目标进程来唤醒，接着执行信号处理的操作。
+        // 判断目标进程是否想接收这个信号
+        if self.wants_signal(pcb.clone()) {
+            _target = Some(pcb.clone());
+        } else if pt == PidType::PID {
+            /*
+             * There is just one thread and it does not need to be woken.
+             * It will dequeue unblocked signals before it runs again.
+             */
+            return;
+        } else {
+            /*
+             * Otherwise try to find a suitable thread.
+             * 由于目前每个进程只有1个线程，因此当前情况可以返回。信号队列的dequeue操作不需要考虑同步阻塞的问题。
+             */
+            return;
+        }
 
-    // let _signal = pcb.sig_struct();
-
-    let mut _target: Option<Arc<ProcessControlBlock>> = None;
-
-    // 判断目标进程是否想接收这个信号
-    if wants_signal(sig, pcb.clone()) {
-        _target = Some(pcb.clone());
-    } else if pt == PidType::PID {
-        /*
-         * There is just one thread and it does not need to be woken.
-         * It will dequeue unblocked signals before it runs again.
-         */
-        return;
-    } else {
-        /*
-         * Otherwise try to find a suitable thread.
-         * 由于目前每个进程只有1个线程，因此当前情况可以返回。信号队列的dequeue操作不需要考虑同步阻塞的问题。
-         */
-        return;
+        // todo:引入进程组后，在这里挑选一个进程来唤醒，让它执行相应的操作。
+        // todo!();
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // todo: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
+        if _target.is_some() {
+            signal_wake_up(pcb.clone(), self == Signal::SIGKILL);
+        }
     }
 
-    // todo:引入进程组后，在这里挑选一个进程来唤醒，让它执行相应的操作。
-    // todo!();
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // todo: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
-    if _target.is_some() {
-        signal_wake_up(pcb.clone(), sig == SignalNumber::SIGKILL);
-    }
-}
+    /// @brief 本函数用于检测指定的进程是否想要接收SIG这个信号。
+    /// 当我们对于进程组中的所有进程都运行了这个检查之后，我们将可以找到组内愿意接收信号的进程。
+    /// 这么做是为了防止我们把信号发送给了一个正在或已经退出的进程，或者是不响应该信号的进程。
+    #[inline]
+    fn wants_signal(self, pcb: Arc<ProcessControlBlock>) -> bool {
+        // 如果改进程屏蔽了这个signal，则不能接收
+        if pcb.sig_info().sig_block().contains(self.into()) {
+            return false;
+        }
 
-/// @brief 本函数用于检测指定的进程是否想要接收SIG这个信号。
-/// 当我们对于进程组中的所有进程都运行了这个检查之后，我们将可以找到组内愿意接收信号的进程。
-/// 这么做是为了防止我们把信号发送给了一个正在或已经退出的进程，或者是不响应该信号的进程。
-#[inline]
-fn wants_signal(sig: SignalNumber, pcb: Arc<ProcessControlBlock>) -> bool {
-    // 如果改进程屏蔽了这个signal，则不能接收
-    if pcb.sig_info().sig_block().contains(sig.into()) {
-        return false;
-    }
+        // 如果进程正在退出，则不能接收信号
+        if pcb.flags().contains(ProcessFlags::EXITING) {
+            return false;
+        }
 
-    // 如果进程正在退出，则不能接收信号
-    if pcb.flags().contains(ProcessFlags::EXITING) {
-        return false;
-    }
+        if self == Signal::SIGKILL {
+            return true;
+        }
 
-    if sig == SignalNumber::SIGKILL {
-        return true;
-    }
+        if pcb.sched_info().state().is_blocked() {
+            return false;
+        }
 
-    if pcb.sched_info().state().is_blocked() {
-        return false;
-    }
+        // todo: 检查目标进程是否正在一个cpu上执行，如果是，则返回true，否则继续检查下一项
 
-    // todo: 检查目标进程是否正在一个cpu上执行，如果是，则返回true，否则继续检查下一项
-
-    // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
-    if pcb.sig_info().sig_pedding().signal().bits() == 0 {
-        assert!(pcb.sig_info().sig_pedding().queue().q.is_empty());
-        return true;
-    } else {
-        return false;
-    }
-}
-
-/// @brief 判断signal的处理是否可能使得整个进程组退出
-/// @return true 可能会导致退出（不一定）
-#[allow(dead_code)]
-#[inline]
-fn sig_fatal(pcb: Arc<ProcessControlBlock>, sig: SignalNumber) -> bool {
-    let action = pcb.sig_struct().handler.0[sig as usize - 1].action();
-    // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
-    match action {
-        SigactionType::SaHandler(handler) => handler.is_sig_default(),
-        SigactionType::SaSigaction(sigaction) => sigaction.is_none(),
+        // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
+        if pcb.sig_info().sig_pedding().signal().bits() == 0 {
+            assert!(pcb.sig_info().sig_pedding().queue().q.is_empty());
+            return true;
+        } else {
+            return false;
+        }
     }
 
-    // todo: 参照linux的sig_fatal实现完整功能
+    /// @brief 判断signal的处理是否可能使得整个进程组退出
+    /// @return true 可能会导致退出（不一定）
+    #[allow(dead_code)]
+    #[inline]
+    fn sig_fatal(self, pcb: Arc<ProcessControlBlock>) -> bool {
+        let action = pcb.sig_struct().handler.0[self as usize - 1].action();
+        // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
+        match action {
+            SigactionType::SaHandler(handler) => handler.is_sig_default(),
+            SigactionType::SaSigaction(sigaction) => sigaction.is_none(),
+        }
+
+        // todo: 参照linux的sig_fatal实现完整功能
+    }
 }
 
 #[inline]
@@ -286,12 +291,8 @@ fn signal_wake_up_state(pcb: Arc<ProcessControlBlock>, state: ProcessFlags) {
 
 /// @brief 获取要被发送的信号的signumber, SigInfo, 以及对应的sigaction结构体
 pub fn get_signal_to_deliver(
-    frame: &TrapFrame,
-) -> (
-    SignalNumber,
-    Option<SigInfo>,
-    Option<&'static mut Sigaction>,
-) {
+    _frame: &TrapFrame,
+) -> (Signal, Option<SigInfo>, Option<&'static mut Sigaction>) {
     let mut info: Option<SigInfo>;
     let ka: Option<&mut Sigaction>;
     let mut sig_number;
@@ -303,7 +304,7 @@ pub fn get_signal_to_deliver(
             dequeue_signal(ProcessManager::current_pcb().sig_info_mut().sig_block_mut());
 
         // 如果信号非法，则直接返回
-        if sig_number == SignalNumber::INVALID {
+        if sig_number == Signal::INVALID {
             drop(guard);
             return (sig_number, None, None);
         }
@@ -351,7 +352,7 @@ pub fn get_signal_to_deliver(
 
 /// @brief 从当前进程的sigpending中取出下一个待处理的signal，并返回给调用者。（调用者应当处理这个信号）
 /// 请注意，进入本函数前，当前进程应当持有current_pcb().sighand.siglock
-fn dequeue_signal(sig_mask: &mut SigSet) -> (SignalNumber, Option<SigInfo>) {
+fn dequeue_signal(sig_mask: &mut SigSet) -> (Signal, Option<SigInfo>) {
     // kdebug!("dequeue signal");
     // 获取下一个要处理的信号的编号
     let sig = ProcessManager::current_pcb()
@@ -360,7 +361,7 @@ fn dequeue_signal(sig_mask: &mut SigSet) -> (SignalNumber, Option<SigInfo>) {
         .next_signal(sig_mask);
 
     let info: Option<SigInfo>;
-    if sig != SignalNumber::INVALID {
+    if sig != Signal::INVALID {
         // 如果下一个要处理的信号是合法的，则收集其siginfo
         info = Some(
             ProcessManager::current_pcb()
@@ -417,11 +418,11 @@ pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool)
 }
 
 pub fn do_sigaction(
-    sig: SignalNumber,
+    sig: Signal,
     act: Option<&mut Sigaction>,
     old_act: Option<&mut Sigaction>,
 ) -> Result<(), SystemError> {
-    if sig == SignalNumber::INVALID {
+    if sig == Signal::INVALID {
         return Err(SystemError::EINVAL);
     }
     let pcb = ProcessManager::current_pcb();
@@ -471,9 +472,8 @@ pub fn do_sigaction(
     if act.is_some() {
         let ac = act.unwrap();
         // 将act.sa_mask的SIGKILL SIGSTOP的屏蔽清除
-        ac.mask_mut().remove(
-            SigSet::from(SignalNumber::SIGKILL.into()) | SigSet::from(SignalNumber::SIGSTOP.into()),
-        );
+        ac.mask_mut()
+            .remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
 
         // 将新的sigaction拷贝到进程的action中
         *action = *ac;
@@ -500,9 +500,7 @@ pub fn do_sigaction(
 }
 
 pub fn set_current_sig_blocked(new_set: &mut SigSet) {
-    new_set.remove(
-        SigSet::from(SignalNumber::SIGKILL.into()) | SigSet::from(SignalNumber::SIGSTOP.into()),
-    );
+    new_set.remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
 
     let pcb = ProcessManager::current_pcb();
 

@@ -4,8 +4,11 @@ use core::{
 };
 
 use crate::{
-    arch::ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber},
-    filesystem::vfs::{file::{File, FileMode}, FilePrivateData},
+    arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
+    filesystem::vfs::{
+        file::{File, FileMode},
+        FilePrivateData,
+    },
     kerror, kwarn,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
@@ -13,7 +16,7 @@ use crate::{
 
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
-    signal::{signal_kill_something_info, DEFAULT_SIGACTION, DEFAULT_SIGACTION_IGNORE},
+    signal::{DEFAULT_SIGACTION, DEFAULT_SIGACTION_IGNORE},
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -62,8 +65,8 @@ impl Syscall {
     }
 
     pub fn kill(pid: Pid, sig: c_int) -> Result<usize, SystemError> {
-        let sig = SignalNumber::from(sig);
-        if sig == SignalNumber::INVALID {
+        let sig = Signal::from(sig);
+        if sig == Signal::INVALID {
             // 传入的signal数值不合法
             kwarn!("Not a valid signal number");
             return Err(SystemError::EINVAL);
@@ -74,7 +77,9 @@ impl Syscall {
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        let retval = signal_kill_something_info(sig, Some(&mut info), pid).map(|x| x as usize);
+        let retval = sig
+            .signal_kill_something_info(Some(&mut info), pid)
+            .map(|x| x as usize);
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -155,9 +160,9 @@ impl Syscall {
             *new_ka.mask_mut() = mask;
         }
 
-        let sig = SignalNumber::from(sig as i32);
+        let sig = Signal::from(sig as i32);
         // 如果给出的信号值不合法
-        if sig == SignalNumber::INVALID {
+        if sig == Signal::INVALID {
             return Err(SystemError::EINVAL);
         }
 

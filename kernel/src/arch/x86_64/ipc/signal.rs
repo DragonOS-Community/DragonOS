@@ -1,6 +1,4 @@
-use core::{ffi::c_void, mem::size_of, ops::BitOr};
-
-use alloc::sync::Arc;
+use core::{ffi::c_void, mem::size_of};
 
 use crate::{
     arch::{
@@ -13,10 +11,10 @@ use crate::{
     include::bindings::bindings::USER_MAX_LINEAR_ADDR,
     ipc::{
         signal::{get_signal_to_deliver, set_current_sig_blocked},
-        signal_types::{SigInfo, SigType, Sigaction, SigactionType, MAX_SIG_NUM},
+        signal_types::{SigInfo, Sigaction, SigactionType, MAX_SIG_NUM},
     },
     kdebug, kerror,
-    process::{Pid, ProcessManager},
+    process::ProcessManager,
     syscall::{user_access::UserBufferWriter, SystemError},
 };
 
@@ -32,7 +30,7 @@ pub const STACK_ALIGN: u64 = 16;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 #[repr(usize)]
-pub enum SignalNumber {
+pub enum Signal {
     INVALID = 0,
     SIGHUP = 1,
     SIGINT,
@@ -75,55 +73,55 @@ pub enum SignalNumber {
     SIGRTMAX = crate::arch::ipc::signal::_NSIG,
 }
 
-/// 为SignalNumber实现判断相等的trait
-impl PartialEq for SignalNumber {
-    fn eq(&self, other: &SignalNumber) -> bool {
+/// 为Signal实现判断相等的trait
+impl PartialEq for Signal {
+    fn eq(&self, other: &Signal) -> bool {
         *self as usize == *other as usize
     }
 }
 
-impl From<usize> for SignalNumber {
+impl From<usize> for Signal {
     fn from(value: usize) -> Self {
         if value <= MAX_SIG_NUM {
-            let ret: SignalNumber = unsafe { core::mem::transmute(value) };
+            let ret: Signal = unsafe { core::mem::transmute(value) };
             return ret;
         } else {
-            kerror!("Try to convert an invalid number to SignalNumber");
-            return SignalNumber::INVALID;
+            kerror!("Try to convert an invalid number to Signal");
+            return Signal::INVALID;
         }
     }
 }
 
-impl Into<usize> for SignalNumber {
+impl Into<usize> for Signal {
     fn into(self) -> usize {
         self as usize
     }
 }
 
-impl From<i32> for SignalNumber {
+impl From<i32> for Signal {
     fn from(value: i32) -> Self {
         if value < 0 {
-            kerror!("Try to convert an invalid number to SignalNumber");
-            return SignalNumber::INVALID;
+            kerror!("Try to convert an invalid number to Signal");
+            return Signal::INVALID;
         } else {
             return Self::from(value as usize);
         }
     }
 }
 
-impl Into<SigSet> for SignalNumber {
+impl Into<SigSet> for Signal {
     fn into(self) -> SigSet {
         self.into_sigset()
     }
 }
-impl SignalNumber {
+impl Signal {
     /// 判断一个数字是否为可用的信号
     #[inline]
     pub fn is_valid(&self) -> bool {
         return (*self) as usize <= SIGRTMAX;
     }
 
-    /// const convertor between `SignalNumber` and `SigSet`
+    /// const convertor between `Signal` and `SigSet`
     pub const fn into_sigset(self) -> SigSet {
         SigSet::from_bits_truncate((self as usize - 1) as u64)
     }
@@ -177,7 +175,7 @@ bitflags! {
         const SA_FLAG_ALL = Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_IGN.bits()|Self::SA_FLAG_IMMUTABLE.bits()|Self::SA_FLAG_RESTORER.bits();
     }
 
-    /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，SignalNumber-1才是sigset_t中对应的位
+    /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，Signal-1才是sigset_t中对应的位
     #[derive(Default)]
     pub struct SigSet:u64{
     }
@@ -289,7 +287,7 @@ pub unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
     loop {
         let (sig_number, info, ka) = get_signal_to_deliver(&frame.clone());
         // 所有的信号都处理完了
-        if sig_number == SignalNumber::INVALID {
+        if sig_number == Signal::INVALID {
             return;
         }
         kdebug!(
@@ -320,7 +318,7 @@ pub unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
 ///
 /// @return Result<0,SystemError> 若Error, 则返回错误码,否则返回Ok(0)
 fn handle_signal(
-    sig: SignalNumber,
+    sig: Signal,
     ka: &mut Sigaction,
     info: &SigInfo,
     oldset: &SigSet,
@@ -338,7 +336,7 @@ fn handle_signal(
 ///
 /// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
 fn setup_frame(
-    sig: SignalNumber,
+    sig: Signal,
     ka: &mut Sigaction,
     info: &SigInfo,
     oldset: &SigSet,
@@ -432,7 +430,7 @@ fn setup_frame(
     // 如果handler位于内核空间
     if trap_frame.rip >= USER_MAX_LINEAR_ADDR {
         // 如果当前是SIGSEGV,则采用默认函数处理
-        if sig == SignalNumber::SIGSEGV {
+        if sig == Signal::SIGSEGV {
             ka.flags_mut().insert(SigFlags::SA_FLAG_DFL);
         }
 
@@ -467,7 +465,7 @@ pub fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
     if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
         // todo：这里改为生成一个sigsegv
         // 退出进程
-        ProcessManager::exit(SignalNumber::SIGSEGV as usize);
+        ProcessManager::exit(Signal::SIGSEGV as usize);
     }
 
     let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
@@ -477,7 +475,7 @@ pub fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
     if unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) == false {
         // todo：这里改为生成一个sigsegv
         // 退出进程
-        ProcessManager::exit(SignalNumber::SIGSEGV as usize);
+        ProcessManager::exit(Signal::SIGSEGV as usize);
     }
 
     // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值

@@ -363,7 +363,7 @@ pub enum ProcessState {
     /// - 如果该bool为false,那么，这个进程必须被显式的唤醒，才能重新进入Runnable状态。
     Blocked(bool),
     /// 进程被信号终止
-    // Stopped(SignalNumber),
+    // Stopped(Signal),
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }

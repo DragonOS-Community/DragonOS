@@ -1,25 +1,14 @@
-use core::{
-    cell::Cell,
-    ffi::{c_int, c_void},
-    mem::size_of,
-    sync::atomic::AtomicI64,
-};
+use core::{ffi::c_void, mem::size_of, sync::atomic::AtomicI64};
 
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     arch::{
         asm::bitops::ffz,
-        fpu::FpState,
-        interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, SignalNumber, _NSIG},
+        ipc::signal::{SigCode, SigFlags, SigSet, Signal, _NSIG},
     },
     include::bindings::bindings::siginfo,
-    kerror,
-    libs::{
-        ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref},
-        spinlock::SpinLock,
-    },
+    libs::ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref},
     process::Pid,
     syscall::{user_access::UserBufferWriter, SystemError},
 };
@@ -42,33 +31,33 @@ pub const USER_SIG_ERR: u64 = 2;
 
 // 因为 Rust 编译器不能在常量声明中正确识别级联的 "|" 运算符(experimental feature： https://github.com/rust-lang/rust/issues/67792)，因此
 // 暂时只能通过这种方法来声明这些常量
-pub const SIG_KERNEL_ONLY_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGSTOP)
-    .union(SignalNumber::into_sigset(SignalNumber::SIGKILL));
+pub const SIG_KERNEL_ONLY_MASK: SigSet =
+    Signal::into_sigset(Signal::SIGSTOP).union(Signal::into_sigset(Signal::SIGKILL));
 
-pub const SIG_KERNEL_STOP_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGSTOP)
-    .union(SignalNumber::into_sigset(SignalNumber::SIGTSTP))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGTTIN))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGTTOU));
+pub const SIG_KERNEL_STOP_MASK: SigSet = Signal::into_sigset(Signal::SIGSTOP)
+    .union(Signal::into_sigset(Signal::SIGTSTP))
+    .union(Signal::into_sigset(Signal::SIGTTIN))
+    .union(Signal::into_sigset(Signal::SIGTTOU));
 
-pub const SIG_KERNEL_COREDUMP_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGQUIT)
-    .union(SignalNumber::into_sigset(SignalNumber::SIGILL))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGTRAP))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGABRT_OR_IOT))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGFPE))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGSEGV))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGBUS))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGSYS))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGXCPU))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGXFSZ));
+pub const SIG_KERNEL_COREDUMP_MASK: SigSet = Signal::into_sigset(Signal::SIGQUIT)
+    .union(Signal::into_sigset(Signal::SIGILL))
+    .union(Signal::into_sigset(Signal::SIGTRAP))
+    .union(Signal::into_sigset(Signal::SIGABRT_OR_IOT))
+    .union(Signal::into_sigset(Signal::SIGFPE))
+    .union(Signal::into_sigset(Signal::SIGSEGV))
+    .union(Signal::into_sigset(Signal::SIGBUS))
+    .union(Signal::into_sigset(Signal::SIGSYS))
+    .union(Signal::into_sigset(Signal::SIGXCPU))
+    .union(Signal::into_sigset(Signal::SIGXFSZ));
 
-pub const SIG_KERNEL_IGNORE_MASK: SigSet = SignalNumber::into_sigset(SignalNumber::SIGCONT)
-    .union(SignalNumber::into_sigset(SignalNumber::SIGFPE))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGSEGV))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGBUS))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGTRAP))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGCHLD))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGIO_OR_POLL))
-    .union(SignalNumber::into_sigset(SignalNumber::SIGSYS));
+pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
+    .union(Signal::into_sigset(Signal::SIGFPE))
+    .union(Signal::into_sigset(Signal::SIGSEGV))
+    .union(Signal::into_sigset(Signal::SIGBUS))
+    .union(Signal::into_sigset(Signal::SIGTRAP))
+    .union(Signal::into_sigset(Signal::SIGCHLD))
+    .union(Signal::into_sigset(Signal::SIGIO_OR_POLL))
+    .union(Signal::into_sigset(Signal::SIGSYS));
 
 /// SignalStruct 在 pcb 中加锁
 #[derive(Debug)]
@@ -178,7 +167,7 @@ impl Default for Sigaction {
 }
 
 impl Sigaction {
-    pub fn ignore(&self, sig: SignalNumber) -> bool {
+    pub fn ignore(&self, _sig: Signal) -> bool {
         if self.flags.contains(SigFlags::SA_FLAG_IGN) {
             return true;
         }
@@ -302,7 +291,7 @@ impl SigInfo {
         // 验证目标地址是否为用户空间
         let mut user_buffer = UserBufferWriter::new(to, size_of::<SigInfo>(), true)?;
 
-        let mut retval: Result<i32, SystemError> = Ok(0);
+        let retval: Result<i32, SystemError> = Ok(0);
 
         user_buffer.copy_one_to_user(self, 0)?;
         return retval;
@@ -316,7 +305,7 @@ pub enum SigType {
 
 impl SigInfo {
     pub fn new(
-        sig: SignalNumber,
+        sig: Signal,
         sig_errno: i32,
         sig_code: SigCode,
         reserved: u32,
@@ -379,8 +368,8 @@ impl SigPending {
     /// @param pending 等待处理的信号
     /// @param sig_mask 屏蔽了的信号
     /// @return i32 下一个要处理的信号的number. 如果为0,则无效
-    pub fn next_signal(&self, sig_mask: &SigSet) -> SignalNumber {
-        let mut sig = SignalNumber::INVALID;
+    pub fn next_signal(&self, sig_mask: &SigSet) -> Signal {
+        let mut sig = Signal::INVALID;
 
         let s = self.signal();
         let m = *sig_mask;
@@ -388,7 +377,7 @@ impl SigPending {
         // 获取第一个待处理的信号的号码
         let x = s.intersection(m.complement());
         if x.bits() != 0 {
-            sig = SignalNumber::from(ffz(x.complement().bits()) + 1);
+            sig = Signal::from(ffz(x.complement().bits()) + 1);
             return sig;
         }
 
@@ -402,7 +391,7 @@ impl SigPending {
     /// @param sig 要收集的信号的信息
     /// @param pending 信号的排队等待标志
     /// @return SigInfo 信号的信息
-    pub fn collect_signal(&mut self, sig: SignalNumber) -> SigInfo {
+    pub fn collect_signal(&mut self, sig: Signal) -> SigInfo {
         let (info, still_pending) = self.queue_mut().find_and_delete(sig);
 
         // 如果没有仍在等待的信号，则清除pending位
@@ -439,7 +428,7 @@ impl SigQueue {
     /// @brief 在信号队列中寻找第一个满足要求的siginfo, 并返回它的引用
     ///
     /// @return (第一个满足要求的siginfo的引用; 是否有多个满足条件的siginfo)
-    pub fn find(&self, sig: SignalNumber) -> (Option<&SigInfo>, bool) {
+    pub fn find(&self, sig: Signal) -> (Option<&SigInfo>, bool) {
         // 是否存在多个满足条件的siginfo
         let mut still_pending = false;
         let mut info: Option<&SigInfo> = None;
@@ -460,7 +449,7 @@ impl SigQueue {
     /// @brief 在信号队列中寻找第一个满足要求的siginfo, 并将其从队列中删除，然后返回这个siginfo
     ///
     /// @return (第一个满足要求的siginfo; 从队列中删除前是否有多个满足条件的siginfo)
-    pub fn find_and_delete(&mut self, sig: SignalNumber) -> (Option<SigInfo>, bool) {
+    pub fn find_and_delete(&mut self, sig: Signal) -> (Option<SigInfo>, bool) {
         // 是否存在多个满足条件的siginfo
         let mut still_pending = false;
         let mut first = true; // 标记变量，记录当前是否已经筛选出了一个元素

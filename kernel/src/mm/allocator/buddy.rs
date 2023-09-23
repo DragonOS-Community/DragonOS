@@ -65,6 +65,10 @@ impl<A> PageList<A> {
 pub struct BuddyAllocator<A> {
     // 存放每个阶的空闲“链表”的头部地址
     free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize],
+    /// 总可用页数
+    total_page_num: usize,
+    /// 已用页数
+    used_page_num: usize,
     phantom: PhantomData<A>,
 }
 
@@ -227,9 +231,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         assert!(remain_bytes == 0);
         assert!(paddr == initial_bump_offset + pages_to_buddy.data() * A::PAGE_SIZE);
 
-        // Self::print_free_area(free_area);
         let allocator = Self {
             free_area,
+            total_page_num: pages_to_buddy.data(),
+            used_page_num: 0,
             phantom: PhantomData,
         };
 
@@ -353,11 +358,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 if !entry.check_aligned(1 << spec_order) {
                     panic!("entry={:?} is not aligned, spec_order={spec_order}, page_list.entry_num={}", entry, tmp_current_entry_num);
                 }
+                self.used_page_num += 1 << Self::order2index(spec_order);
                 return Some(entry);
             }
             return None;
         };
-
+        kdebug!("alloc {} order", order);
         let result: Option<PhysAddr> = alloc_in_specific_order(order as u8);
         // kdebug!("result={:?}", result);
         if result.is_some() {

@@ -1,0 +1,29 @@
+{
+  "name": "DragonReach",
+  "version": "0.1.0",
+  "description": "init程序",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url" : "https://git.mirrors.dragonos.org/DragonOS-Community/DragonReach.git",
+        "revision": "e0798339d6"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install TARGET=$ROOT_PATH/user/target.json"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "envs": [    
+    {
+      "key": "TARGET",
+      "value": "x86_64-unknown-dragonos"
+    }
+  ]
+}

@@ -12,15 +12,16 @@ use crate::arch::{PciArch, TraitPciArch};
 use crate::include::bindings::bindings::{
     c_irq_install, c_irq_uninstall, pt_regs, ul, EAGAIN, EINVAL,
 };
+use crate::kdebug;
 use crate::libs::volatile::{volread, volwrite, Volatile, VolatileReadable, VolatileWritable};
 
 /// MSIX表的一项
 #[repr(C)]
 struct MsixEntry {
-    vector_control: Volatile<u32>,
-    msg_data: Volatile<u32>,
-    msg_upper_addr: Volatile<u32>,
     msg_addr: Volatile<u32>,
+    msg_upper_addr: Volatile<u32>,
+    msg_data: Volatile<u32>,
+    vector_control: Volatile<u32>,
 }
 /// Pending表的一项
 #[repr(C)]
@@ -66,17 +67,17 @@ pub enum IrqType {
 // PCI设备install中断时需要传递的参数
 #[derive(Clone, Debug)]
 pub struct IrqMsg {
-    irq_common_message: IrqCommonMsg,
-    irq_specific_message: IrqSpecificMsg,
+    pub irq_common_message: IrqCommonMsg,
+    pub irq_specific_message: IrqSpecificMsg,
 }
 // PCI设备install中断时需要传递的共同参数
 #[derive(Clone, Debug)]
 pub struct IrqCommonMsg {
-    irq_index: u16,     //要install的中断号在PCI设备中的irq_vector的index
-    irq_name: CString,  //中断名字
-    irq_parameter: u16, //中断额外参数，可传入中断处理函数
-    irq_hander: unsafe extern "C" fn(irq_num: ul, parameter: ul, regs: *mut pt_regs), // 中断处理函数
-    irq_ack: Option<unsafe extern "C" fn(irq_num: ul)>, // 中断的ack，可为None,若为None则中断处理中会正常通知中断结束，不为None则调用传入的函数进行回复
+    pub irq_index: u16,     //要install的中断号在PCI设备中的irq_vector的index
+    pub irq_name: CString,  //中断名字
+    pub irq_parameter: u16, //中断额外参数，可传入中断处理函数
+    pub irq_hander: unsafe extern "C" fn(irq_num: ul, parameter: ul, regs: *mut pt_regs), // 中断处理函数
+    pub irq_ack: Option<unsafe extern "C" fn(irq_num: ul)>, // 中断的ack，可为None,若为None则中断处理中会正常通知中断结束，不为None则调用传入的函数进行回复
 }
 // PCI设备install中断时需要传递的特有参数，Msi代表MSI与MSIX
 #[derive(Clone, Debug)]
@@ -88,7 +89,7 @@ pub enum IrqSpecificMsg {
     },
 }
 impl IrqSpecificMsg {
-    fn msi_default() -> Self {
+    pub fn msi_default() -> Self {
         IrqSpecificMsg::Msi {
             processor: 0,
             trigger_mode: TriggerMode::EdgeTrigger,
@@ -122,16 +123,16 @@ pub trait PciInterrupt: PciDeviceStructure {
         if flag.contains(IRQ::PCI_IRQ_MSIX) {
             if let Some(cap_offset) = self.msix_capability_offset() {
                 let data =
-                    PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 4);
-                let irq_max_num = ((data >> 16) & 0x07ff) as u16;
+                    PciArch::read_config(&self.common_header().bus_device_function, cap_offset);
+                let irq_max_num = ((data >> 16) & 0x7ff) as u16 + 1;
                 let data =
                     PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 4);
-                let msix_table_bar = (data & 0x01) as u8;
-                let msix_table_offset = data & 0xfffe;
+                let msix_table_bar = (data & 0x07) as u8;
+                let msix_table_offset = data & (!0x07);
                 let data =
                     PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 8);
-                let pending_table_bar = (data & 0x01) as u8;
-                let pending_table_offset = data & 0xfffe;
+                let pending_table_bar = (data & 0x07) as u8;
+                let pending_table_offset = data & (!0x07);
                 *self.irq_type_mut()? = IrqType::Msix {
                     msix_table_bar,
                     msix_table_offset,
@@ -503,13 +504,13 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?;
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
-                    let vaddr = msix_bar
+                    let vaddr: crate::mm::VirtAddr = msix_bar
                         .virtual_address()
                         .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?
-                        as usize
                         + msix_table_offset as usize
                         + msg.irq_common_message.irq_index as usize * size_of::<MsixEntry>();
-                    let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                    let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
+                    kdebug!("msg_data: {:?}, msix_addr: {:?}", msg_data, msg_address);
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
                         volwrite!(msix_entry, msg_data, msg_data);
@@ -622,10 +623,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         let vaddr = msix_bar
                             .virtual_address()
                             .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))
-                            .unwrap() as usize
+                            .unwrap()
                             + msix_table_offset as usize
                             + index as usize * size_of::<MsixEntry>();
-                        let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                        let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                         unsafe {
                             volwrite!(msix_entry, vector_control, 0);
                             volwrite!(msix_entry, msg_data, 0);
@@ -747,10 +748,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
                         .unwrap();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
-                    let vaddr = msix_bar.virtual_address().unwrap() as usize
+                    let vaddr = msix_bar.virtual_address().unwrap()
                         + msix_table_offset as usize
                         + irq_index as usize * size_of::<MsixEntry>();
-                    let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                    let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     unsafe {
                         volwrite!(msix_entry, vector_control, 1);
                     }
@@ -867,10 +868,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
                         .unwrap();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
-                    let vaddr = msix_bar.virtual_address().unwrap() as usize
+                    let vaddr = msix_bar.virtual_address().unwrap()
                         + msix_table_offset as usize
                         + irq_index as usize * size_of::<MsixEntry>();
-                    let msix_entry = NonNull::new(vaddr as *mut MsixEntry).unwrap();
+                    let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
                     }
@@ -981,10 +982,10 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
                         .unwrap();
                     let pending_bar = pcistandardbar.get_bar(pending_table_bar).unwrap();
-                    let vaddr = pending_bar.virtual_address().unwrap() as usize
+                    let vaddr = pending_bar.virtual_address().unwrap()
                         + pending_table_offset as usize
                         + (irq_index as usize / 64) * size_of::<PendingEntry>();
-                    let pending_entry = NonNull::new(vaddr as *mut PendingEntry).unwrap();
+                    let pending_entry = NonNull::new(vaddr.data() as *mut PendingEntry).unwrap();
                     let pending_entry = unsafe { volread!(pending_entry, entry) };
                     return Ok(pending_entry & (1 << (irq_index as u64 % 64)) != 0);
                 }

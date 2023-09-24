@@ -1,5 +1,6 @@
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::make_rawdev;
+use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
 };
@@ -43,7 +44,7 @@ impl LockedNullInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -70,11 +71,11 @@ impl IndexNode for LockedNullInode {
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        return Ok(());
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -109,19 +110,11 @@ impl IndexNode for LockedNullInode {
     fn read_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-
-        for i in 0..len {
-            buf[i] = 0;
-        }
-
-        return Ok(len);
+        return Ok(0);
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写

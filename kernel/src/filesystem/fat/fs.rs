@@ -9,12 +9,13 @@ use alloc::{
 };
 
 use crate::{
+    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
+        syscall::ModeType,
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
-    io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -189,7 +190,7 @@ impl LockedFATInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: file_type,
-                mode: 0o777,
+                mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -308,7 +309,7 @@ impl FATFileSystem {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: 0o777,
+                mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -350,6 +351,10 @@ impl FATFileSystem {
     /// @return Err(SystemError) 错误码
     pub fn get_fat_entry(&self, cluster: Cluster) -> Result<FATEntry, SystemError> {
         let current_cluster = cluster.cluster_num;
+        if current_cluster < 2 {
+            // 0号簇和1号簇是保留簇，不允许用户使用
+            return Err(SystemError::EINVAL);
+        }
 
         let fat_type: FATType = self.bpb.fat_type;
         // 获取FAT表的起始扇区（相对分区起始扇区的偏移量）
@@ -1170,8 +1175,7 @@ impl FATFileSystem {
         let offset: usize = self.cluster_bytes_offset(cluster) as usize;
         self.partition
             .disk()
-            .device()
-            .write_at(offset, zeros.len(), zeros.as_slice())?;
+            .write_at_bytes(offset, zeros.len(), zeros.as_slice())?;
         return Ok(());
     }
 }
@@ -1418,10 +1422,9 @@ impl IndexNode for LockedFATInode {
         &self,
         name: &str,
         file_type: FileType,
-        _mode: u32,
+        _mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
-
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
@@ -1459,6 +1462,44 @@ impl IndexNode for LockedFATInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
+    }
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+        let old_size = guard.metadata.size as usize;
+
+        match &mut guard.inode_type {
+            FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
+                // 如果新的长度和旧的长度相同，那么就直接返回
+                if len == old_size {
+                    return Ok(());
+                } else if len > old_size {
+                    // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut remain_size = len - old_size;
+                    let buf_size = remain_size;
+                    // let buf_size = core::cmp::min(remain_size, 512 * 1024);
+                    buf.resize(buf_size, 0);
+
+                    let mut offset = old_size;
+                    while remain_size > 0 {
+                        let write_size = core::cmp::min(remain_size, buf_size);
+                        file.write(fs, &buf[0..write_size], offset as u64)?;
+                        remain_size -= write_size;
+                        offset += write_size;
+                    }
+                } else {
+                    file.truncate(fs, len as u64)?;
+                }
+                guard.update_metadata();
+                return Ok(());
+            }
+            FATDirEntry::Dir(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        }
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -1587,7 +1628,7 @@ impl IndexNode for LockedFATInode {
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -1600,14 +1641,24 @@ impl IndexNode for LockedFATInode {
                 let mut key: Vec<String> = guard
                     .children
                     .keys()
-                    .filter(|k| guard.children.get(*k).unwrap().metadata().unwrap().inode_id == ino)
+                    .filter(|k| {
+                        guard
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .metadata()
+                            .unwrap()
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
-                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
+                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
                 }
             }
         }

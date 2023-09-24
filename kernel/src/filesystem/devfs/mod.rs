@@ -5,11 +5,15 @@ pub mod zero_dev;
 use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
+    syscall::ModeType,
     FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
 };
 use crate::{
-    kerror,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    kerror, kinfo,
+    libs::{
+        once::Once,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     syscall::SystemError,
     time::TimeSpec,
 };
@@ -52,7 +56,7 @@ impl DevFS {
         let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
             // /dev 的权限设置为 读+执行，root 可以读写
             // root 的 parent 是空指针
-            DevFSInode::new(FileType::Dir, 0o755 as u32, 0),
+            DevFSInode::new(FileType::Dir, ModeType::from_bits_truncate(0o755), 0),
         )));
 
         let devfs: Arc<DevFS> = Arc::new(DevFS { root_inode: root });
@@ -106,7 +110,11 @@ impl DevFS {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
                 if let Err(_) = dev_root_inode.find("char") {
-                    dev_root_inode.create("char", FileType::Dir, 0o755)?;
+                    dev_root_inode.create(
+                        "char",
+                        FileType::Dir,
+                        ModeType::from_bits_truncate(0o755),
+                    )?;
                 }
 
                 let any_char_inode = dev_root_inode.find("char")?;
@@ -125,7 +133,11 @@ impl DevFS {
             }
             FileType::BlockDevice => {
                 if let Err(_) = dev_root_inode.find("block") {
-                    dev_root_inode.create("block", FileType::Dir, 0o755)?;
+                    dev_root_inode.create(
+                        "block",
+                        FileType::Dir,
+                        ModeType::from_bits_truncate(0o755),
+                    )?;
                 }
 
                 let any_block_inode = dev_root_inode.find("block")?;
@@ -209,14 +221,14 @@ pub struct DevFSInode {
 }
 
 impl DevFSInode {
-    pub fn new(dev_type_: FileType, mode_: u32, data_: usize) -> Self {
-        return Self::new_with_parent(Weak::default(), dev_type_, mode_, data_);
+    pub fn new(dev_type_: FileType, mode: ModeType, data_: usize) -> Self {
+        return Self::new_with_parent(Weak::default(), dev_type_, mode, data_);
     }
 
     pub fn new_with_parent(
         parent: Weak<LockedDevFSInode>,
         dev_type_: FileType,
-        mode_: u32,
+        mode: ModeType,
         data_: usize,
     ) -> Self {
         return DevFSInode {
@@ -233,7 +245,7 @@ impl DevFSInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: dev_type_, // 文件夹
-                mode: mode_,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -252,7 +264,13 @@ impl LockedDevFSInode {
             return Err(SystemError::EEXIST);
         }
 
-        match self.do_create_with_data(guard, name, FileType::Dir, 0o755 as u32, 0) {
+        match self.do_create_with_data(
+            guard,
+            name,
+            FileType::Dir,
+            ModeType::from_bits_truncate(0o755),
+            0,
+        ) {
             Ok(inode) => inode,
             Err(err) => {
                 return Err(err);
@@ -288,17 +306,17 @@ impl LockedDevFSInode {
     fn do_create_with_data(
         &self,
         mut guard: SpinLockGuard<DevFSInode>,
-        _name: &str,
-        _file_type: FileType,
-        _mode: u32,
-        _data: usize,
+        name: &str,
+        file_type: FileType,
+        mode: ModeType,
+        data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
         // 如果有重名的，则返回
-        if guard.children.contains_key(_name) {
+        if guard.children.contains_key(name) {
             return Err(SystemError::EEXIST);
         }
 
@@ -316,12 +334,12 @@ impl LockedDevFSInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: _file_type,
-                mode: _mode,
+                file_type,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: _data,
+                raw_dev: data,
             },
             fs: guard.fs.clone(),
         })));
@@ -330,7 +348,7 @@ impl LockedDevFSInode {
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        guard.children.insert(String::from(_name), result.clone());
+        guard.children.insert(String::from(name), result.clone());
         return Ok(result);
     }
 }
@@ -356,7 +374,7 @@ impl IndexNode for LockedDevFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
@@ -396,7 +414,7 @@ impl IndexNode for LockedDevFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -409,14 +427,24 @@ impl IndexNode for LockedDevFSInode {
                 let mut key: Vec<String> = inode
                     .children
                     .keys()
-                    .filter(|k| inode.children.get(*k).unwrap().metadata().unwrap().inode_id == ino)
+                    .filter(|k| {
+                        inode
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .metadata()
+                            .unwrap()
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
-                    _ => panic!("Devfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    _ => panic!("Devfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                 }
             }
         }
@@ -528,4 +556,24 @@ pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), 
 #[allow(dead_code)]
 pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
     return devfs_exact_ref!().unregister_device(name, device);
+}
+
+pub fn devfs_init() -> Result<(), SystemError> {
+    static INIT: Once = Once::new();
+    let mut result = None;
+    INIT.call_once(|| {
+        kinfo!("Initializing ProcFS...");
+        // 创建 devfs 实例
+        let devfs: Arc<DevFS> = DevFS::new();
+        // devfs 挂载
+        let _t = ROOT_INODE()
+            .find("dev")
+            .expect("Cannot find /dev")
+            .mount(devfs)
+            .expect("Failed to mount devfs");
+        kinfo!("DevFS mounted.");
+        result = Some(Ok(()));
+    });
+
+    return result.unwrap();
 }

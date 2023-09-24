@@ -16,28 +16,24 @@
 #define is_digit(c) ((c) >= '0' && (c) <= '9') // 用来判断是否是数字的宏
 
 // 字体颜色的宏定义
-#define WHITE 0x00ffffff  //白
-#define BLACK 0x00000000  //黑
-#define RED 0x00ff0000    //红
-#define ORANGE 0x00ff8000 //橙
-#define YELLOW 0x00ffff00 //黄
-#define GREEN 0x0000ff00  //绿
-#define BLUE 0x000000ff   //蓝
-#define INDIGO 0x0000ffff //靛
-#define PURPLE 0x008000ff //紫
+#define WHITE 0x00ffffff  // 白
+#define BLACK 0x00000000  // 黑
+#define RED 0x00ff0000    // 红
+#define ORANGE 0x00ff8000 // 橙
+#define YELLOW 0x00ffff00 // 黄
+#define GREEN 0x0000ff00  // 绿
+#define BLUE 0x000000ff   // 蓝
+#define INDIGO 0x0000ffff // 靛
+#define PURPLE 0x008000ff // 紫
 
 // 异常的宏定义
 #define EPOS_OVERFLOW 1 // 坐标溢出
 #define EFB_MISMATCH 2  // 帧缓冲区与指定的屏幕大小不匹配
 #define EUNSUPPORTED 3  // 当前操作暂不被支持
 
-#include "font.h"
 #include "glib.h"
-#include <libs/libUI/screen_manager.h>
+#include <libs/lib_ui/screen_manager.h>
 #include <stdarg.h>
-
-extern unsigned char font_ascii[256][16]; //导出ascii字体的bitmap（8*16大小） ps:位于font.h中
-
 
 /**
  * @brief 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中

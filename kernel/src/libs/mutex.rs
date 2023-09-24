@@ -3,14 +3,13 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-use alloc::collections::LinkedList;
+use alloc::{collections::LinkedList, sync::Arc};
 
 use crate::{
-    arch::{asm::current::current_pcb, sched::sched},
-    include::bindings::bindings::{
-        pid_t, process_control_block, process_wakeup, PROC_INTERRUPTIBLE, PROC_RUNNING,
-    },
+    arch::{sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
+    process::{Pid, ProcessControlBlock, ProcessManager},
     syscall::SystemError,
 };
 
@@ -21,7 +20,7 @@ struct MutexInner {
     /// 当前Mutex是否已经被上锁(上锁时，为true)
     is_locked: bool,
     /// 等待获得这个锁的进程的链表
-    wait_list: LinkedList<&'static mut process_control_block>,
+    wait_list: LinkedList<Arc<ProcessControlBlock>>,
 }
 
 /// @brief Mutex互斥量结构体
@@ -50,7 +49,7 @@ impl<T> Mutex<T> {
             data: UnsafeCell::new(value),
             inner: SpinLock::new(MutexInner {
                 is_locked: false,
-                wait_list: LinkedList::<&'static mut process_control_block>::new(),
+                wait_list: LinkedList::new(),
             }),
         };
     }
@@ -65,8 +64,9 @@ impl<T> Mutex<T> {
             // 当前mutex已经上锁
             if inner.is_locked {
                 // 检查当前进程是否处于等待队列中,如果不在，就加到等待队列内
-                if self.check_pid_in_wait_list(&inner, current_pcb().pid) == false {
-                    inner.wait_list.push_back(current_pcb());
+                if self.check_pid_in_wait_list(&inner, ProcessManager::current_pcb().pid()) == false
+                {
+                    inner.wait_list.push_back(ProcessManager::current_pcb());
                 }
 
                 // 加到等待唤醒的队列，然后睡眠
@@ -104,8 +104,9 @@ impl<T> Mutex<T> {
 
     /// @brief Mutex内部的睡眠函数
     fn __sleep(&self) {
-        current_pcb().state &= !(PROC_RUNNING as u64);
-        current_pcb().state |= PROC_INTERRUPTIBLE as u64;
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::mark_sleep(true).ok();
+        drop(irq_guard);
         sched();
     }
 
@@ -123,19 +124,17 @@ impl<T> Mutex<T> {
         }
 
         // wait_list不为空，则获取下一个要被唤醒的进程的pcb
-        let to_wakeup: &mut process_control_block = inner.wait_list.pop_front().unwrap();
+        let to_wakeup: Arc<ProcessControlBlock> = inner.wait_list.pop_front().unwrap();
         drop(inner);
 
-        unsafe {
-            process_wakeup(to_wakeup);
-        }
+        ProcessManager::wakeup(&to_wakeup).ok();
     }
 
     /// @brief 检查进程是否在该mutex的等待队列内
     #[inline]
-    fn check_pid_in_wait_list(&self, inner: &MutexInner, pid: pid_t) -> bool {
+    fn check_pid_in_wait_list(&self, inner: &MutexInner, pid: Pid) -> bool {
         for p in inner.wait_list.iter() {
-            if p.pid == pid {
+            if p.pid() == pid {
                 // 在等待队列内
                 return true;
             }

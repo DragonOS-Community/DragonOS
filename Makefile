@@ -36,6 +36,16 @@ export NM=$(DragonOS_GCC)/x86_64-elf-nm
 export AR=$(DragonOS_GCC)/x86_64-elf-ar
 export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
+# 检查是否需要进行fmt --check
+# 解析命令行参数  
+FMT_CHECK?=0
+
+ifeq ($(FMT_CHECK), 1)
+	FMT_CHECK=--check
+else
+	FMT_CHECK=
+endif
+
 
 .PHONY: all 
 all: kernel user
@@ -142,6 +152,11 @@ run-docker:
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
 
+fmt:
+	@echo "格式化代码" 
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C kernel
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C user
+	
 help:
 	@echo "编译:"
 	@echo "  make all -j <n>       - 本地编译，不运行,n为要用于编译的CPU核心数"

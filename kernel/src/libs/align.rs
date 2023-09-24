@@ -57,6 +57,12 @@ impl<T, const ALIGN: usize> AlignedBox<T, ALIGN> {
             });
         }
     }
+
+    pub unsafe fn new_unchecked(ptr: *mut T) -> Self {
+        return AlignedBox {
+            inner: Unique::new_unchecked(ptr),
+        };
+    }
 }
 
 impl<T, const ALIGN: usize> Debug for AlignedBox<T, ALIGN> {
@@ -121,6 +127,11 @@ unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}
 pub fn page_align_up(addr: usize) -> usize {
     let page_size = MMArch::PAGE_SIZE;
     return (addr + page_size - 1) & (!(page_size - 1));
+}
+
+pub fn page_align_down(addr: usize) -> usize {
+    let page_size = MMArch::PAGE_SIZE;
+    return addr & (!(page_size - 1));
 }
 
 /// ## 检查是否对齐

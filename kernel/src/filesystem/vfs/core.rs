@@ -1,23 +1,22 @@
-use core::{
-    hint::spin_loop,
-    ptr::null_mut,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::{boxed::Box, format, string::ToString, sync::Arc};
+use alloc::{format, string::ToString, sync::Arc};
 
 use crate::{
-    driver::disk::ahci::{self},
+    driver::{
+        base::block::disk_info::Partition,
+        disk::ahci::{self},
+    },
     filesystem::{
-        devfs::DevFS,
+        devfs::devfs_init,
         fat::fs::FATFileSystem,
-        procfs::ProcFS,
+        procfs::procfs_init,
         ramfs::RamFS,
-        sysfs::SysFS,
-        vfs::{mount::MountFS, FileSystem, FileType},
+        sysfs::sysfs_init,
+        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
     include::bindings::bindings::PAGE_4K_SIZE,
-    kerror, kinfo,
+    kdebug, kerror, kinfo,
     syscall::SystemError,
 };
 
@@ -29,11 +28,11 @@ use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
 /// [0]: 对应'.'目录项
 /// [1]: 对应'..'目录项
 pub fn generate_inode_id() -> InodeId {
-    static INO: AtomicUsize = AtomicUsize::new(1);
-    return INO.fetch_add(1, Ordering::SeqCst);
+    static INO: AtomicInodeId = AtomicInodeId::new(InodeId::new(1));
+    return INO.fetch_add(InodeId::new(1), Ordering::SeqCst);
 }
 
-static mut __ROOT_INODE: *mut Arc<dyn IndexNode> = null_mut();
+static mut __ROOT_INODE: Option<Arc<dyn IndexNode>> = None;
 
 /// @brief 获取全局的根节点
 #[inline(always)]
@@ -49,56 +48,32 @@ pub extern "C" fn vfs_init() -> i32 {
     // 使用Ramfs作为默认的根文件系统
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
-    let root_inode = Box::leak(Box::new(mount_fs.root_inode()));
+    let root_inode = mount_fs.root_inode();
 
     unsafe {
-        __ROOT_INODE = root_inode;
+        __ROOT_INODE = Some(root_inode.clone());
     }
 
     // 创建文件夹
     root_inode
-        .create("proc", FileType::Dir, 0o777)
+        .create("proc", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /proc");
     root_inode
-        .create("dev", FileType::Dir, 0o777)
+        .create("dev", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /dev");
     root_inode
-        .create("sys", FileType::Dir, 0o777)
+        .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /sys");
+    kdebug!("dir in root:{:?}", root_inode.list());
 
-    // // 创建procfs实例
-    let procfs: Arc<ProcFS> = ProcFS::new();
+    procfs_init().expect("Failed to initialize procfs");
 
-    // procfs挂载
-    let _t = root_inode
-        .find("proc")
-        .expect("Cannot find /proc")
-        .mount(procfs)
-        .expect("Failed to mount procfs.");
-    kinfo!("ProcFS mounted.");
+    devfs_init().expect("Failed to initialize devfs");
 
-    // 创建 devfs 实例
-    let devfs: Arc<DevFS> = DevFS::new();
-    // devfs 挂载
-    let _t = root_inode
-        .find("dev")
-        .expect("Cannot find /dev")
-        .mount(devfs)
-        .expect("Failed to mount devfs");
-    kinfo!("DevFS mounted.");
+    sysfs_init().expect("Failed to initialize sysfs");
 
-    // 创建 sysfs 实例
-    let sysfs: Arc<SysFS> = SysFS::new();
-    // sysfs 挂载
-    let _t = root_inode
-        .find("sys")
-        .expect("Cannot find /sys")
-        .mount(sysfs)
-        .expect("Failed to mount sysfs");
-    kinfo!("SysFS mounted.");
-
-    let root_inode = ROOT_INODE().list().expect("VFS init failed");
-    if root_inode.len() > 0 {
+    let root_entries = ROOT_INODE().list().expect("VFS init failed");
+    if root_entries.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
     return 0;
@@ -116,15 +91,19 @@ fn do_migrate(
     let r = new_root_inode.find(mountpoint_name);
     let mountpoint = if r.is_err() {
         new_root_inode
-            .create(mountpoint_name, FileType::Dir, 0o777)
-            .expect(format!("Failed to create '/{mountpoint_name}'").as_str())
+            .create(
+                mountpoint_name,
+                FileType::Dir,
+                ModeType::from_bits_truncate(0o755),
+            )
+            .expect(format!("Failed to create '/{mountpoint_name}' in migrating").as_str())
     } else {
         r.unwrap()
     };
     // 迁移挂载点
     mountpoint
         .mount(fs.inner_filesystem())
-        .expect(format!("Failed to migrate {mountpoint_name}").as_str());
+        .expect(format!("Failed to migrate {mountpoint_name} ").as_str());
     return Ok(());
 }
 
@@ -143,21 +122,19 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
-    let new_root_inode = Box::leak(Box::new(new_fs.root_inode()));
+    let new_root_inode = new_fs.root_inode();
 
     // 把上述文件系统,迁移到新的文件系统下
     do_migrate(new_root_inode.clone(), "proc", proc)?;
     do_migrate(new_root_inode.clone(), "dev", dev)?;
     do_migrate(new_root_inode.clone(), "sys", sys)?;
-
     unsafe {
         // drop旧的Root inode
-        let old_root_inode: Box<Arc<dyn IndexNode>> = Box::from_raw(__ROOT_INODE);
-        __ROOT_INODE = null_mut();
+        let old_root_inode = __ROOT_INODE.take().unwrap();
         drop(old_root_inode);
 
         // 设置全局的新的ROOT Inode
-        __ROOT_INODE = new_root_inode;
+        __ROOT_INODE = Some(new_root_inode);
     }
 
     kinfo!("VFS: Migrate filesystems done!");
@@ -165,16 +142,14 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
-#[no_mangle]
-pub extern "C" fn mount_root_fs() -> i32 {
+pub fn mount_root_fs() -> Result<(), SystemError> {
     kinfo!("Try to mount FAT32 as root fs...");
-    let partiton: Arc<crate::io::disk_info::Partition> =
-        ahci::get_disks_by_name("ahci_disk_0".to_string())
-            .unwrap()
-            .0
-            .lock()
-            .partitions[0]
-            .clone();
+    let partiton: Arc<Partition> = ahci::get_disks_by_name("ahci_disk_0".to_string())
+        .unwrap()
+        .0
+        .lock()
+        .partitions[0]
+        .clone();
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
     if fatfs.is_err() {
@@ -196,7 +171,7 @@ pub extern "C" fn mount_root_fs() -> i32 {
     }
     kinfo!("Successfully migrate rootfs to FAT32!");
 
-    return 0;
+    return Ok(());
 }
 
 /// @brief 创建文件/文件夹
@@ -217,8 +192,11 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
             let parent_inode: Arc<dyn IndexNode> =
                 ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件夹
-            let _create_inode: Arc<dyn IndexNode> =
-                parent_inode.create(filename, FileType::Dir, 0o777)?;
+            let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
+                filename,
+                FileType::Dir,
+                ModeType::from_bits_truncate(0o755),
+            )?;
         } else {
             // 不需要创建文件，因此返回错误码
             return Err(errno);
@@ -228,7 +206,7 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
     return Ok(0);
 }
 
-/// @breif 删除文件夹
+/// @brief 删除文件夹
 pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
     // 文件名过长
     if path.len() > PAGE_4K_SIZE as usize {

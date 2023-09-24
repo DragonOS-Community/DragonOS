@@ -51,22 +51,26 @@ int read_symbol(FILE *filp, struct kernel_symbol_entry_t *entry)
 {
     // 本函数假设nm命令输出的结果中，每行最大512字节
     char str[512] = {0};
-    int retval = fscanf(filp, "%llx %c %510s\n", &entry->vaddr, &entry->type, str);
+    char* s = fgets(str, sizeof(str), filp);
+    if (s != str) {
+        return -1;
+    }
+
+    char symbol_name[512] = {0};
+    int retval = sscanf(str, "%llx %c %512c", &entry->vaddr, &entry->type, symbol_name);
 
     // 如果当前行不符合要求
-    if (retval != 3)
-    {
-        if (retval != EOF)
-        {
-            // 如果不是输入流的结尾，说明该行不符合要求，将其过滤
-            fgets(str, 512, filp);
-        }
-
+    if (retval != 3) {
         return -1;
     }
     // malloc一块内存，然后把str的内容拷贝进去，接着修改symbol指针
-    entry->symbol = strdup(str);
-    entry->symbol_length = strlen(str) + 1; // +1的原因是.asciz指令会在字符串末尾自动添加结束符\0
+    size_t len = strlen(symbol_name);
+    if (len >= 1 && symbol_name[len - 1] == '\n') {
+        symbol_name[len - 1] = '\0';
+        len--;
+    }
+    entry->symbol = strdup(symbol_name);
+    entry->symbol_length = len + 1; // +1的原因是.asciz指令会在字符串末尾自动添加结束符\0
     return 0;
 }
 
@@ -96,10 +100,12 @@ void read_map(FILE *filp)
     // 查找符号表中的text和etext标签
     for (uint64_t i = 0; i < entry_count; ++i)
     {
-        if (strcmp(symbol_table[i].symbol, "_text")==0)
+        if (text_vaddr == 0ULL && strcmp(symbol_table[i].symbol, "_text") == 0)
             text_vaddr = symbol_table[i].vaddr;
-        if (strcmp(symbol_table[i].symbol, "_etext")==0)
+        if (etext_vaddr == 0ULL && strcmp(symbol_table[i].symbol, "_etext") == 0)
             etext_vaddr = symbol_table[i].vaddr;
+        if (text_vaddr != 0ULL && etext_vaddr != 0ULL)
+            break;
     }
 }
 

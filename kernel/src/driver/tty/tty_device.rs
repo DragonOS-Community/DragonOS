@@ -7,11 +7,16 @@ use alloc::{
 use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
+        vfs::{
+            file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
+            ROOT_INODE,
+        },
     },
-    include::bindings::bindings::{textui_putchar, BLACK, WHITE},
     kerror,
-    libs::rwlock::RwLock,
+    libs::{
+        lib_ui::textui::{textui_putchar, FontColor},
+        rwlock::RwLock,
+    },
     syscall::SystemError,
 };
 
@@ -255,19 +260,21 @@ impl IndexNode for TtyDevice {
                 break;
             }
             // 输出到屏幕
-            unsafe {
-                for x in buf {
-                    textui_putchar(x as u16, WHITE, BLACK);
-                }
+
+            for x in 0..len {
+                textui_putchar(buf[x] as char, FontColor::WHITE, FontColor::BLACK).ok();
             }
         }
+        return Ok(());
+    }
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
         return Ok(());
     }
 }
 
 impl TtyDevicePrivateData {
     pub fn new(name: &str) -> RwLock<Self> {
-        let mut metadata = Metadata::new(FileType::CharDevice, 0o755);
+        let mut metadata = Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755));
         metadata.size = TtyCore::STDIN_BUF_SIZE as i64;
         return RwLock::new(TtyDevicePrivateData {
             name: name.to_string(),

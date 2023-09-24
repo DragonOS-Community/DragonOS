@@ -5,9 +5,15 @@ use crate::driver::pci::pci::{
     PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
+use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
+use crate::include::bindings::bindings::pt_regs;
+use crate::kdebug;
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
+use crate::mm::VirtAddr;
+use crate::net::net_core::poll_ifaces_try_lock_onetime;
+use alloc::ffi::CString;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -18,7 +24,6 @@ use virtio_drivers::{
     Error, Hal, PhysAddr,
 };
 
-type VirtAddr = usize;
 /// The PCI vendor ID for VirtIO devices.
 /// PCI Virtio设备的vendor ID
 const VIRTIO_VENDOR_ID: u16 = 0x1af4;
@@ -53,6 +58,12 @@ const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 /// Device specific configuration.
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
+/// Virtio设备接收中断的设备号
+const VIRTIO_RECV_VECTOR: u16 = 56;
+/// Virtio设备接收中断的设备号的表项号
+const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
+// 接收的queue
+const QUEUE_RECEIVE: u16 = 0;
 ///@brief device id 转换为设备类型
 ///@param pci_device_id，device_id
 ///@return DeviceType 对应的设备类型
@@ -77,7 +88,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
-    bus_device_function: BusDeviceFunction,
+    _bus_device_function: BusDeviceFunction,
     /// The common configuration structure within some BAR.
     common_cfg: NonNull<CommonCfg>,
     /// The start of the queue notification region within some BAR.
@@ -87,6 +98,11 @@ pub struct PciTransport {
     isr_status: NonNull<Volatile<u8>>,
     /// The VirtIO device-specific configuration within some BAR.
     config_space: Option<NonNull<[u32]>>,
+}
+
+unsafe extern "C" fn virtio_irq_hander(_irq_num: u64, _irq_paramer: u64, _regs: *mut pt_regs) {
+    // kdebug!("12345");
+    poll_ifaces_try_lock_onetime().ok();
 }
 
 impl PciTransport {
@@ -111,6 +127,30 @@ impl PciTransport {
         let mut device_cfg = None;
         device.bar_ioremap().unwrap()?;
         device.enable_master();
+        let standard_device = device.as_standard_device_mut().unwrap();
+        // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号。不能与其他中断重复
+        let irq_vector = standard_device.irq_vector_mut().unwrap();
+        irq_vector.push(VIRTIO_RECV_VECTOR);
+        standard_device
+            .irq_init(IRQ::PCI_IRQ_MSIX)
+            .expect("IRQ init failed");
+        // 中断相关信息
+        let msg = IrqMsg {
+            irq_common_message: IrqCommonMsg {
+                irq_index: 0,
+                irq_name: CString::new(
+                    "Virtio_Recv_
+                IRQ",
+                )
+                .expect("CString::new failed"),
+                irq_parameter: 0,
+                irq_hander: virtio_irq_hander,
+                irq_ack: None,
+            },
+            irq_specific_message: IrqSpecificMsg::msi_default(),
+        };
+        standard_device.irq_install(msg)?;
+        standard_device.irq_enable(true)?;
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
         for capability in device.capabilities().unwrap() {
             if capability.id != PCI_CAP_ID_VNDR {
@@ -182,7 +222,7 @@ impl PciTransport {
         };
         Ok(Self {
             device_type,
-            bus_device_function,
+            _bus_device_function: bus_device_function,
             common_cfg,
             notify_region,
             notify_off_multiplier,
@@ -268,16 +308,19 @@ impl Transport for PciTransport {
     ) {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
-        // kdebug!("queue_select={}",queue);
-        // kdebug!("queue_size={}",size as u16);
-        // kdebug!("queue_desc={:#x}",descriptors as u64);
-        // kdebug!("driver_area={:#x}",driver_area);
         unsafe {
             volwrite!(self.common_cfg, queue_select, queue);
             volwrite!(self.common_cfg, queue_size, size as u16);
             volwrite!(self.common_cfg, queue_desc, descriptors as u64);
             volwrite!(self.common_cfg, queue_driver, driver_area as u64);
             volwrite!(self.common_cfg, queue_device, device_area as u64);
+            if queue == QUEUE_RECEIVE {
+                volwrite!(self.common_cfg, queue_msix_vector, VIRTIO_RECV_VECTOR_INDEX);
+                let vector = volread!(self.common_cfg, queue_msix_vector);
+                if vector != VIRTIO_RECV_VECTOR_INDEX {
+                    panic!("Vector set failed");
+                }
+            }
             volwrite!(self.common_cfg, queue_enable, 1);
         }
     }
@@ -437,7 +480,7 @@ impl Display for VirtioPciError {
             Self::BarOffsetOutOfRange => write!(f, "Capability offset greater than BAR length."),
             Self::Misaligned { vaddr, alignment } => write!(
                 f,
-                "Virtual address {:#018x} was not aligned to a {} byte boundary as expected.",
+                "Virtual address {:?} was not aligned to a {} byte boundary as expected.",
                 vaddr, alignment
             ),
             Self::BarGetVaddrFailed => write!(f, "Get bar virtaddress failed"),
@@ -475,15 +518,15 @@ fn get_bar_region<T>(
     //kdebug!("Chossed bar ={},used={}",struct_info.bar,struct_info.offset + struct_info.length);
     let vaddr = (bar_info
         .virtual_address()
-        .ok_or(VirtioPciError::BarGetVaddrFailed)?) as usize
+        .ok_or(VirtioPciError::BarGetVaddrFailed)?)
         + struct_info.offset as usize;
-    if vaddr % align_of::<T>() != 0 {
+    if vaddr.data() % align_of::<T>() != 0 {
         return Err(VirtioPciError::Misaligned {
             vaddr,
             alignment: align_of::<T>(),
         });
     }
-    let vaddr = NonNull::new(vaddr as *mut u8).unwrap();
+    let vaddr = NonNull::new(vaddr.data() as *mut u8).unwrap();
     Ok(vaddr.cast())
 }
 

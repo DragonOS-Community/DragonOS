@@ -13,7 +13,6 @@
 #include <common/list.h>
 #include <common/spinlock.h>
 #include <common/sys/types.h>
-#include <common/wait_queue.h>
 
 // 系统最大支持的信号数量
 #define MAX_SIG_NUM 64

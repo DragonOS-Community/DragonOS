@@ -406,7 +406,11 @@ impl Syscall {
     ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
-    pub fn handle(syscall_num: usize, args: &[usize], frame: &mut TrapFrame) -> Result<usize,SystemError> {
+    pub fn handle(
+        syscall_num: usize,
+        args: &[usize],
+        frame: &mut TrapFrame,
+    ) -> Result<usize, SystemError> {
         let r = match syscall_num {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
@@ -435,15 +439,16 @@ impl Syscall {
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let from_user = frame.from_user();
-                let user_buf = match UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)
-                {
-                    Err(e) => Err(e),
-                    Ok(user_buffer_writer) => user_buffer_writer.buffer::<u8>(0),
+                let mut user_buffer_writer =
+                    match UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user) {
+                        Err(e) => return Err(e),
+                        Ok(writer) => writer,
+                    };
+                let user_buf = match user_buffer_writer.buffer(0) {
+                    Err(e) => return Err(e),
+                    Ok(writer) => writer,
                 };
-                let res = match user_buf {
-                    Err(e) => Err(e),
-                    Ok(buf) => Self::read(fd, buf),
-                };
+                let res = Self::read(fd, user_buf);
                 res
             }
             SYS_WRITE => {
@@ -451,15 +456,16 @@ impl Syscall {
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let from_user = frame.from_user();
-                let user_buf =
+                let user_buffer_reader =
                     match UserBufferReader::new(buf_vaddr as *const u8, len, from_user) {
-                        Err(e) => Err(e),
-                        Ok(user_buffer_read) => user_buffer_read.read_from_user(0),
+                        Err(e) => return Err(e),
+                        Ok(reader) => reader,
                     };
-                let res = match user_buf {
-                    Err(e) => Err(e),
-                    Ok(buf) => Self::write(fd, buf),
+                let user_buf = match user_buffer_reader.read_from_user(0) {
+                    Err(e) => return Err(e),
+                    Ok(buf) => buf,
                 };
+                let res = Self::write(fd, user_buf);
                 res
             }
 
@@ -963,7 +969,7 @@ impl Syscall {
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
-        }; 
+        };
         return r;
     }
 

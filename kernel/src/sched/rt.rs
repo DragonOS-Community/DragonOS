@@ -224,7 +224,7 @@ impl Scheduler for SchedulerRT {
         return None;
     }
 
-    fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
+    fn enqueue_pcb(&mut self, pcb: Arc<ProcessControlBlock>) {
         let cpu_id = pcb.sched_info().on_cpu().unwrap();
         let cpu_queue = &mut self.cpu_queue[cpu_id as usize];
         let priority = pcb.sched_info().priority().data() as usize;

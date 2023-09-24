@@ -6,11 +6,11 @@ use crate::{
     include::bindings::bindings::smp_get_total_cpu,
     kinfo,
     mm::percpu::PerCpu,
-    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, SchedEntity},
     smp::core::smp_get_processor_id,
 };
 
-use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
+use super::{rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler}, cfs::CFSQueue};
 use super::{
     cfs::{sched_cfs_init, SchedulerCFS, __get_cfs_scheduler},
     SchedPolicy,
@@ -92,7 +92,7 @@ pub trait Scheduler {
     fn sched(&mut self) -> Option<Arc<ProcessControlBlock>>;
 
     /// @brief 将pcb加入这个调度器的调度队列
-    fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>);
+    fn enqueue_pcb(&mut self, pcb: Arc<ProcessControlBlock>);
 }
 
 pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
@@ -155,6 +155,14 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
         }
         SchedPolicy::FIFO | SchedPolicy::RR => rt_scheduler.enqueue(pcb.clone()),
     }
+}
+
+///! 这里仅涉及添加task se，且确定为cfs，不涉及group se
+///!  CFS_SCHEDULER_PTR: Option<Box<SchedulerCFS>>是不是需要修改，现在已经每个进程组一个SchedulerCFS
+pub fn cfs_sched_enqueue(pcb: Arc<ProcessControlBlock> , mut reset_time: bool) {
+    let mytg = pcb.basic().tg();
+    let cpu_queue:Vec<&mut CFSQueue> = mytg.cfs().get_cpu_queue();
+    cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize].enqueue(pcb.se());
 }
 
 /// @brief 初始化进程调度器模块

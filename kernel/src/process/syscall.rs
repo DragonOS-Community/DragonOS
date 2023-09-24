@@ -1,13 +1,13 @@
 use core::ffi::c_void;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, vec::Vec,sync::Arc};
 
 use super::{fork::CloneFlags, Pid, ProcessManager, ProcessState};
 use crate::{
     arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     filesystem::vfs::MAX_PATHLEN,
-    process::ProcessControlBlock,
+    process::{ProcessControlBlock,TaskGroup,PROCESS_GROUP_MANAGER},
     syscall::{
         user_access::{
             check_and_clone_cstr, check_and_clone_cstr_array, UserBufferReader, UserBufferWriter,
@@ -155,6 +155,56 @@ impl Syscall {
         let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
         return Ok(target_proc.basic().pgid());
     }
+    ////! todo 错误处理    
+    ///!   init_group_se()
+    pub fn setpgid(pid:Pid,pgid:Pid) -> Result<(),SystemError>{
+        if pid == Pid(0) {
+            let current_pcb = ProcessManager::current_pcb();
+            pid = current_pcb.basic().pid();
+        }
+        let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        if pgid == 0 {
+            let pgid = pid;
+            PROCESS_GROUP_MANAGER.add_process(pid, pid);
+            let ptg:Arc<TaskGroup> = PROCESS_GROUP_MANAGER.find(pid);
+            
+            let ntg=TaskGroup::new(ptg);
+            // 将当前TaskGroup加入父进程组的子进程哈希表中
+            
+            if let Some(ppcb_arc) = ntg.parent_tg.read().upgrade() {
+            let mut children = ppcb_arc.children.write();
+                children.insert(pgid, ntg.clone());
+            } else {
+                panic!("parent tg is None");
+            }
+            target_proc.basic().set_pgid(pgid);
+            target_proc.basic().set_tg(Some(ntg));
+            
+            TaskGroup::add_tg(pid, ntg);
+        }else{
+            let old_pgid = target_proc.basic().pgid();
+            let ornewtg:bool=PROCESS_GROUP_MANAGER.set_pgid_by_pid(pid, pgid, old_pgid);
+            if ornewtg ==true {
+                let ptg:Arc<TaskGroup> = PROCESS_GROUP_MANAGER.find(old_pgid);
+                let ntg = TaskGroup::new(ptg);
+                if let Some(ppcb_arc) = ntg.parent_tg.read().upgrade() {
+                    let mut children = ppcb_arc.children.write();
+                        children.insert(pgid, ntg.clone());
+                    } else {
+                        panic!("parent tg is None");
+                    }
+                TaskGroup::add_tg(pgid, ntg);
+                target_proc.basic().set_pgid(pgid);
+                target_proc.basic().set_tg(Some(ntg));
+            } else {
+                target_proc.basic().set_pgid(pgid);
+                let ntg:Arc<TaskGroup> = PROCESS_GROUP_MANAGER.find(pgid);
+                target_proc.basic().set_tg(Some(ntg));
+            }
+        }
+        Ok(())
+    }
+    
     /// @brief 获取当前进程的父进程id
 
     /// 若为initproc则ppid设置为0   

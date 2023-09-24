@@ -9,6 +9,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
+    collections::BTreeMap,
 };
 use hashbrown::HashMap;
 
@@ -30,11 +31,13 @@ use crate::{
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     sched::{
-        core::{sched_enqueue, CPU_EXECUTING},
+        core::{sched_enqueue, CPU_EXECUTING, enqueue_se},
         SchedPolicy, SchedPriority,
+        cfs::{SchedulerCFS,CFSQueue}
     },
     smp::kick_cpu,
     syscall::SystemError,
+    include::bindings::bindings::MAX_CPU_NUM,
 };
 
 use self::kthread::WorkerPrivate;
@@ -51,7 +54,8 @@ pub mod syscall;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
-
+///系统中所有进程组的TaskGroup
+static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pid, Arc<TaskGroup>>>> = SpinLock::new(None);
 pub static mut SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
@@ -439,8 +443,9 @@ impl ProcessControlBlock {
                 ProcessManager::current_pcb().basic().cwd(),
             )
         };
-
-        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
+        let pgid = ProcessManager::current_pcb().basic().pgid();
+        let tg:Arc<TaskGroup> = ProcessManager::current_pcb().basic().tg();
+        let basic_info = ProcessBasicInfo::new(pgid, ppid, name, cwd, None,Some(tg));
         let preempt_count = AtomicUsize::new(0);
         let flags = SpinLock::new(ProcessFlags::empty());
 
@@ -673,6 +678,9 @@ pub struct ProcessBasicInfo {
 
     /// 文件描述符表
     fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+
+    /// 所在的进程组tg
+    sched_tg:Option<Arc<TaskGroup>>,
 }
 
 impl ProcessBasicInfo {
@@ -682,6 +690,7 @@ impl ProcessBasicInfo {
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
+        sched_tg:Option<Arc<TaskGroup>>
     ) -> RwLock<Self> {
         let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
@@ -691,11 +700,16 @@ impl ProcessBasicInfo {
             cwd,
             user_vm,
             fd_table: Some(fd_table),
+            sched_tg:Some(sched_tg),
         });
     }
 
     pub fn pgid(&self) -> Pid {
         return self.pgid;
+    }
+
+    pub fn set_pgid(&self,npgid:Pid) -> Pid {
+        self.pgid = npgid;
     }
 
     pub fn ppid(&self) -> Pid {
@@ -732,6 +746,14 @@ impl ProcessBasicInfo {
     pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
         self.fd_table = fd_table;
     }
+
+    pub fn set_tg(&mut self, tg:Option<Arc<TaskGroup>>){
+        self.sched_tg = tg;
+    }
+
+    pub fn tg(&self) -> Option<Arc<TaskGroup>>{
+        return self.sched_tg.clone();
+    }
 }
 
 #[derive(Debug)]
@@ -752,6 +774,8 @@ pub struct ProcessSchedulerInfo {
     virtual_runtime: AtomicIsize,
     /// 由实时调度器管理的时间片
     rt_time_slice: AtomicIsize,
+    //调度实体      
+    se:Option<Arc<SchedEntity>>
 }
 
 impl ProcessSchedulerInfo {
@@ -768,6 +792,7 @@ impl ProcessSchedulerInfo {
             virtual_runtime: AtomicIsize::new(0),
             rt_time_slice: AtomicIsize::new(0),
             priority: SchedPriority::new(100).unwrap(),
+            se:Some(Arc::new(SchedEntity::new())),
         });
     }
 
@@ -843,6 +868,10 @@ impl ProcessSchedulerInfo {
 
     pub fn priority(&self) -> SchedPriority {
         return self.priority;
+    }
+    
+    pub fn se(&self) -> Option<Arc<SchedEntity>>{
+        return self.se.clone();
     }
 }
 
@@ -947,4 +976,197 @@ impl Drop for KernelStack {
 
 pub fn process_init() {
     ProcessManager::init();
+}
+
+#[derive(Debug)]
+pub struct SchedEntity {
+    ///如果是进程它将对应一个pcb
+    pcb: Option<Arc<ProcessControlBlock>>,
+    /// 进程的调度优先级
+    priority: SchedPriority,
+    //parent:SchedEntity,
+    /// 当前进程的虚拟运行时间
+    virtual_runtime: AtomicIsize,
+    cfs_rq:SpinLock<Option<CFSQueue>>,
+    ///是否判断是否有进程组
+    my_q: SpinLock<Option<CFSQueue>>,       
+}
+///! CFSQueue 需要处理
+///! parent 当为task se 指向进程组
+///!        当为group se 指向父进程组
+
+
+
+impl SchedEntity{
+    pub fn new() -> RwLock<Self> {
+
+        return RwLock::new(Self {
+            pcb: None,
+            virtual_runtime: AtomicIsize::new(0),
+            priority: SchedPriority::new(100).unwrap(),
+            my_q: None,
+            cfs_rq:None
+        });
+    }       
+    pub fn virtual_runtime(&self) -> isize {
+        return self.virtual_runtime.load(Ordering::SeqCst);
+    }
+
+    pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
+        self.virtual_runtime
+            .store(virtual_runtime, Ordering::SeqCst);
+    }
+
+    fn set_cfs_rq(&self, cfs_rq: Option<CFSQueue>) {
+        self.cfs_rq.lock().replace(cfs_rq);
+    }
+
+    fn cfs_rq(&self) ->  SpinLockGuard<Option<CFSQueue>> {
+        return self.cfs_rq.lock();
+    }
+
+    fn set_my_q (&self, my_q: Option<CFSQueue>) {
+        self.my_q.lock().replace(my_q);
+    }
+    
+    pub fn group_cfs_rq(&self) -> SpinLockGuard<Option<CFSQueue>> {
+        return self.my_q.lock();
+    }
+
+    pub fn priority(&self) -> SchedPriority { 
+        return self.priority;
+    }
+
+    pub fn set_pcb(&mut self,pcb:Option<Arc<ProcessControlBlock>>){
+        self.pcb = pcb;
+    }
+    
+    pub fn pcb(&self) -> Option<Arc<ProcessControlBlock>>{
+        return self.pcb.as_ref();
+    }
+
+}
+#[derive(Debug)]
+struct TaskGroup {
+    se: Vec<Arc<SchedEntity>>,  // 调度实体(每个CPU分配一个)
+    cfs: SchedulerCFS,  // 完全公平调度运行队列(每个CPU分配一个)
+    /// 父进程指针
+    parent_tg: RwLock<Weak<TaskGroup>>,
+    /// 子进程组链表
+    children: RwLock<HashMap<Pid, Arc<TaskGroup>>>,
+}
+ 
+     
+
+impl TaskGroup{
+
+    pub fn new(ptg:Arc<TaskGroup>) -> Arc<Self> {
+
+        return Arc::new(Self {
+            cfs:SchedulerCFS::new(),
+            se: for i in 0..MAX_CPU_NUM {
+                Arc::new(SchedEntity::new())
+            },
+            parent_tg: RwLock::new(ptg),
+            children: RwLock::new(HashMap::new()),
+        });
+
+    }
+    /// ! 在创建新的进程组时，应该将se的cfsrq指向父进程组的cfsrq，cfsrq[cpu]
+    /// !   同时my_q应指向本进程组创建的cfsrq
+    /// !根进程组的创建时机  struct task_group root_task_group;
+    /// ! 创建好关系之后 ，group se 和时task se 加到对应的cfs_rq
+    pub fn init_group_se(&self , ptg:Arc<TaskGroup>,ntg:Arc<TaskGroup>){
+        let cfs_queue= ptg.cfs.get_cpu_queue();
+        let ncfs_queue = ntg.cfs.get_cpu_queue();
+        for cpu in 0..MAX_CPU_NUM {
+           if let Some(per_se) = self.se.get(cpu){
+                per_se.set_cfs_rq(cfs_queue[cpu]);
+                per_se.set_my_q(ncfs_queue[cpu]);
+                ntg.cfs.enqueue_group_se(per_se,cpu);
+           }
+            
+        }
+           
+    }
+
+    pub fn add_tg(pgid:Pid,tg: Arc<TaskGroup>) {
+        ALL_PROCESS_GROUP
+            .lock()
+            .as_mut()
+            .unwrap()
+            .insert(pgid, tg.clone());
+    }
+
+    pub fn cfs(&self) -> SchedulerCFS {
+        return self.cfs;
+    }
+
+}
+
+
+
+pub static PROCESS_GROUP_MANAGER: ProcessGroupManager = ProcessGroupManager::new();
+
+pub struct ProcessGroupManager(pub SpinLock<BTreeMap<Pid, Vec<Pid>>>);
+
+
+
+impl ProcessGroupManager {
+    pub const fn new() -> Self {    
+        Self(SpinLock::new(BTreeMap::new()))
+    } 
+
+    /// 根据pgid获取进程组的tg
+    ///
+    /// ## 参数
+    /// - `pgid` : 进程的pgid
+    ///
+    /// ## 返回值
+    /// 如果找到了对应的进程组，那么返回该进程组，否则返回None
+    pub fn find(pgid: Pid) -> Option<Arc<TaskGroup>> {
+        return ALL_PROCESS_GROUP.lock().as_ref()?.get(&pgid).cloned();
+    }
+
+    pub fn add_process(&self, pgid: Pid, pid: Pid) {
+        let mut inner = self.0.lock();
+        let vec = inner.get(&pgid);
+        let mut vec = vec.cloned().unwrap();
+        vec.push(pid);
+        inner.insert(pgid, vec);
+    }
+
+
+
+    pub fn add_group(&self, pgid: Pid) {
+        let mut inner = self.0.lock();
+        let mut vec: Vec<Pid> = Vec::new();
+        if pgid != Pid(0){   //? 不清楚
+            vec.push(pgid);
+        }
+        inner.insert(pgid, vec);
+    }
+    
+    
+    pub fn get_group_by_pgid(&self, pgid: Pid) -> Vec<Pid> {
+        self.0.lock().get(&pgid).cloned().unwrap()
+    }
+
+    ///return ornewtg
+    pub fn set_pgid_by_pid(&self, pid: Pid, new_pgid: Pid, old_pgid: Pid) -> bool {
+        let mut inner = self.0.lock();
+        let old_group_vec = inner.get_mut(&old_pgid).unwrap();
+        old_group_vec.retain(|&x| x != pid);
+        let new_group_vec = inner.get_mut(&new_pgid);
+        if let Some(new_group_vec) = new_group_vec {
+            new_group_vec.push(pid);
+            return false;
+        } else {
+            let new_group: Vec<Pid> = vec![new_pgid];
+            // let mut new_group = Vec::new();
+            // new_group.push(new_pgid);
+            inner.insert(new_pgid, new_group);
+            return true;
+        }
+    }
 }

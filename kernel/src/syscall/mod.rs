@@ -376,6 +376,7 @@ pub const SYS_GETPGID: usize = 50;
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
 
+pub const SYS_SETPGID: usize = 53;
 #[derive(Debug)]
 pub struct Syscall;
 
@@ -932,6 +933,8 @@ impl Syscall {
             }
 
             SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pid| pid.into()),
+
+            SYS_SETPGID => Self::setpgid(args[0],args[1]),
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
             SYS_FSTAT => {

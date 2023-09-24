@@ -54,7 +54,9 @@ impl ProcessManager {
         let new_kstack = KernelStack::new()?;
         let name = current_pcb.basic().name().to_string();
         let pcb = ProcessControlBlock::new(name, new_kstack);
-
+        let mut se=pcb.sched_info().se();
+        se.set_pcb(pcb);
+        
         // 克隆架构相关信息
         *pcb.arch_info() = current_pcb.arch_info_irqsave().clone();
 

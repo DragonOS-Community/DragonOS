@@ -11,7 +11,7 @@ use crate::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, SchedEntity,TaskGroup},
     smp::core::smp_get_processor_id,
 };
 
@@ -22,6 +22,9 @@ use super::{
 
 /// 声明全局的cfs调度器实例
 pub static mut CFS_SCHEDULER_PTR: Option<Box<SchedulerCFS>> = None;
+
+///!1111
+///pub static mut CFS_SCHEDULER_MANAGER: Vec<Option<Box<SchedulerCFS>>> = None;
 
 /// @brief 获取cfs调度器实例的可变引用
 #[inline]
@@ -41,11 +44,11 @@ pub unsafe fn sched_cfs_init() {
 
 /// @brief CFS队列（per-cpu的）
 #[derive(Debug)]
-struct CFSQueue {
+pub struct CFSQueue {
     /// 当前cpu上执行的进程剩余的时间片
     cpu_exec_proc_jiffies: i64,
     /// 自旋锁保护的队列
-    locked_queue: SpinLock<RBTree<i64, Arc<ProcessControlBlock>>>,
+    locked_queue: SpinLock<RBTree<i64, Arc<SchedEntity>>>,
     /// 当前核心的队列专属的IDLE进程的pcb
     idle_pcb: Arc<ProcessControlBlock>,
 }
@@ -71,6 +74,12 @@ impl CFSQueue {
         queue.insert(pcb.sched_info().virtual_runtime() as i64, pcb.clone());
     }
 
+    /// @brief 将se加入队列
+    pub fn enqueue_se(&mut self, se: Arc<SchedEntity>) {
+        let mut queue = self.locked_queue.lock_irqsave();
+        queue.insert(se.virtual_runtime() as i64, se.clone());
+    }
+
     /// @brief 将pcb从调度队列中弹出,若队列为空，则返回IDLE进程的pcb
     pub fn dequeue(&mut self) -> Arc<ProcessControlBlock> {
         let res: Arc<ProcessControlBlock>;
@@ -82,6 +91,17 @@ impl CFSQueue {
             // 如果队列为空，则返回IDLE进程的pcb
             res = self.idle_pcb.clone();
         }
+        return res;
+    }
+    /// @brief 将pcb从调度队列中弹出
+    /// !没有考虑idle_pcb
+    pub fn dequeue_se(&mut self) -> Arc<SchedEntity> {
+        let res: Arc<ProcessControlBlock>;
+        let mut queue = self.locked_queue.lock_irqsave();
+        if !queue.is_empty() {
+            // 队列不为空，返回下一个要执行的task se
+            res = queue.pop_first().unwrap().1;
+        } 
         return res;
     }
 
@@ -127,6 +147,10 @@ impl SchedulerCFS {
         }
 
         return result;
+    }
+
+    pub fn get_cpu_queue(&self) -> Vec<&'static mut CFSQueue> {
+        return self.cpu_queue;
     }
 
     /// @brief 更新这个cpu上，这个进程的可执行时间。
@@ -175,6 +199,21 @@ impl SchedulerCFS {
         cpu_queue.enqueue(pcb);
     }
 
+    ///@brief 将某进程的se添加到cfsqueue
+    /// ! 应该将pcb的se添加到自己进程组下的Scheduler 的cfsqueue[cpu]中
+    pub fn enqueue_se(&mut self , pcb: Arc<ProcessControlBlock>) {
+        let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
+        cpu_queue.enqueue_se(pcb.se());
+    }
+
+
+    ///@brief 在进程组创建时就将某进程组的se添加到cfsqueue
+    pub fn enqueue_group_se(&mut self , tg_se: Arc<SchedEntity>,cpu:usize) {
+        let cpu_queue = &mut self.cpu_queue[cpu];
+        cpu_queue.enqueue_se(tg_se);
+    }
+
+
     /// @brief 设置cpu的队列的IDLE进程的pcb
     #[allow(dead_code)]
     pub fn set_cpu_idle(&mut self, cpu_id: usize, pcb: Arc<ProcessControlBlock>) {
@@ -186,11 +225,13 @@ impl SchedulerCFS {
         let queue = self.cpu_queue[cpu_id as usize].locked_queue.lock();
         return CFSQueue::get_cfs_queue_size(&queue);
     }
+
 }
 
 impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
+    ///! 返回 se
     fn sched(&mut self) -> Option<Arc<ProcessControlBlock>> {
         assert!(CurrentIrqArch::is_irq_enabled() == false);
 
@@ -202,9 +243,25 @@ impl Scheduler for SchedulerCFS {
 
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
 
-        let proc: Arc<ProcessControlBlock> = current_cpu_queue.dequeue();
-
+        
+        //let proc: Arc<ProcessControlBlock> = current_cpu_queue.dequeue();
+        let se:Arc<SchedEntity> = current_cpu_queue.dequeue_se();
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
+ 
+        ///! se中的调度信息的设置
+        
+        let mut cfs_queue: Option<CFSQueue> = None;
+        while let Some(_) = current_cpu_queue.dequeue() {
+            if cfs_queue.is_none() {
+                break; // 当 cfs_queue 为空时即选到了要调度的进程，则退出循环
+            }
+            // 如果最优可运行实体是一个进程组
+            cfs_queue = se.group_cfs_rq(); // 更新 cfs_queue 的值
+        }
+        
+
+        let final_cpu_queue: &mut CFSQueue = cfs_queue[current_cpu_id];
+        let proc: Arc<ProcessControlBlock> = se.pcb();
         // 如果当前不是running态，或者当前进程的虚拟运行时间大于等于下一个进程的，那就需要切换。
         if (ProcessManager::current_pcb().sched_info().state() != ProcessState::Runnable)
             || (ProcessManager::current_pcb().sched_info().virtual_runtime()
@@ -217,8 +274,10 @@ impl Scheduler for SchedulerCFS {
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
             // 设置进程可以执行的时间
-            if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
+            //if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
+            if final_cpu_queue.cpu_exec_proc_jiffies <= 0 {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
                     proc.sched_info().priority(),
                     current_cpu_queue,
@@ -227,16 +286,18 @@ impl Scheduler for SchedulerCFS {
 
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-            return Some(proc);
+            return Some(se);
         } else {
             // 不进行切换
 
             // 设置进程可以执行的时间
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
+            //if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
+            if final_cpu_queue.cpu_exec_proc_jiffies <= 0 {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
                     ProcessManager::current_pcb().sched_info().priority(),
-                    current_cpu_queue,
+                    //current_cpu_queue,
+                    final_cpu_queue
                 );
                 // kdebug!("cpu:{:?}",current_cpu_id);
             }
@@ -250,7 +311,7 @@ impl Scheduler for SchedulerCFS {
         return None;
     }
 
-    fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
+    fn enqueue_pcb(&mut self, pcb: Arc<ProcessControlBlock>) {
         let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
 
         cpu_queue.enqueue(pcb);

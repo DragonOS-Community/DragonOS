@@ -11,7 +11,9 @@ use crate::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, SchedEntity,TaskGroup},
+    process::{
+        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, SchedEntity, TaskGroup,
+    },
     smp::core::smp_get_processor_id,
 };
 
@@ -101,7 +103,7 @@ impl CFSQueue {
         if !queue.is_empty() {
             // 队列不为空，返回下一个要执行的task se
             res = queue.pop_first().unwrap().1;
-        } 
+        }
         return res;
     }
 
@@ -201,18 +203,16 @@ impl SchedulerCFS {
 
     ///@brief 将某进程的se添加到cfsqueue
     /// ! 应该将pcb的se添加到自己进程组下的Scheduler 的cfsqueue[cpu]中
-    pub fn enqueue_se(&mut self , pcb: Arc<ProcessControlBlock>) {
+    pub fn enqueue_se(&mut self, pcb: Arc<ProcessControlBlock>) {
         let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
         cpu_queue.enqueue_se(pcb.se());
     }
 
-
     ///@brief 在进程组创建时就将某进程组的se添加到cfsqueue
-    pub fn enqueue_group_se(&mut self , tg_se: Arc<SchedEntity>,cpu:usize) {
+    pub fn enqueue_group_se(&mut self, tg_se: Arc<SchedEntity>, cpu: usize) {
         let cpu_queue = &mut self.cpu_queue[cpu];
         cpu_queue.enqueue_se(tg_se);
     }
-
 
     /// @brief 设置cpu的队列的IDLE进程的pcb
     #[allow(dead_code)]
@@ -225,7 +225,6 @@ impl SchedulerCFS {
         let queue = self.cpu_queue[cpu_id as usize].locked_queue.lock();
         return CFSQueue::get_cfs_queue_size(&queue);
     }
-
 }
 
 impl Scheduler for SchedulerCFS {
@@ -243,13 +242,11 @@ impl Scheduler for SchedulerCFS {
 
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
 
-        
         //let proc: Arc<ProcessControlBlock> = current_cpu_queue.dequeue();
-        let se:Arc<SchedEntity> = current_cpu_queue.dequeue_se();
+        let se: Arc<SchedEntity> = current_cpu_queue.dequeue_se();
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
- 
+
         ///! se中的调度信息的设置
-        
         let mut cfs_queue: Option<CFSQueue> = None;
         while let Some(_) = current_cpu_queue.dequeue() {
             if cfs_queue.is_none() {
@@ -258,7 +255,6 @@ impl Scheduler for SchedulerCFS {
             // 如果最优可运行实体是一个进程组
             cfs_queue = se.group_cfs_rq(); // 更新 cfs_queue 的值
         }
-        
 
         let final_cpu_queue: &mut CFSQueue = cfs_queue[current_cpu_id];
         let proc: Arc<ProcessControlBlock> = se.pcb();
@@ -297,7 +293,7 @@ impl Scheduler for SchedulerCFS {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
                     ProcessManager::current_pcb().sched_info().priority(),
                     //current_cpu_queue,
-                    final_cpu_queue
+                    final_cpu_queue,
                 );
                 // kdebug!("cpu:{:?}",current_cpu_id);
             }

@@ -934,7 +934,7 @@ impl Syscall {
 
             SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pid| pid.into()),
 
-            SYS_SETPGID => Self::setpgid(args[0],args[1]),
+            SYS_SETPGID => Self::setpgid(args[0], args[1]),
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
             SYS_FSTAT => {

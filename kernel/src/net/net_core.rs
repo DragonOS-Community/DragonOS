@@ -162,12 +162,13 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
 
-/// 对ifaces进行轮询。
+/// 对指定iface只尝试进行进行一次poll，使用传入的网卡驱动的名字作为关键词
 ///
+/// @input net_driver_name_key 驱动名字中的关键字
 /// @return 轮询成功，返回Ok(())
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
 /// @return 没有网卡，返回SystemError::ENODEV
-pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
+pub fn poll_ifaces_try_lock_onetime(net_driver_name_key: &str) -> Result<(), SystemError> {
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
     if guard.len() == 0 {
         kwarn!("poll_ifaces: No net driver found!");
@@ -176,8 +177,12 @@ pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
     }
     let mut sockets = SOCKET_SET.try_lock()?;
     for (_, iface) in guard.iter() {
-        iface.poll(&mut sockets).ok();
+        if iface.name().contains(net_driver_name_key) {
+            iface.poll(&mut sockets).ok();
+            SOCKET_WAITQUEUE.wakeup_all(None);
+            return Ok(());
+        }
     }
-    SOCKET_WAITQUEUE.wakeup_all(None);
-    return Ok(());
+    // 没有网卡，返回错误
+    return Err(SystemError::ENODEV);
 }

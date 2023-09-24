@@ -104,7 +104,7 @@ impl<T: Transport> VirtioInterface<T> {
             driver,
             iface_id,
             iface: SpinLock::new(iface),
-            name: format!("eth{}", iface_id),
+            name: format!("virtio-eth{}", iface_id),
         });
 
         return result;

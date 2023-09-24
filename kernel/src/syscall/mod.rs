@@ -406,7 +406,7 @@ impl Syscall {
     ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
-    pub fn handle(syscall_num: usize, args: &[usize], frame: &mut TrapFrame) -> SystemError {
+    pub fn handle(syscall_num: usize, args: &[usize], frame: &mut TrapFrame) -> Result<usize,SystemError> {
         let r = match syscall_num {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
@@ -435,7 +435,7 @@ impl Syscall {
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let from_user = frame.from_user();
-                let mut user_buf = match UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)
+                let user_buf = match UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)
                 {
                     Err(e) => Err(e),
                     Ok(user_buffer_writer) => user_buffer_writer.buffer::<u8>(0),
@@ -451,7 +451,7 @@ impl Syscall {
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let from_user = frame.from_user();
-                let mut user_buf =
+                let user_buf =
                     match UserBufferReader::new(buf_vaddr as *const u8, len, from_user) {
                         Err(e) => Err(e),
                         Ok(user_buffer_read) => user_buffer_read.read_from_user(0),
@@ -963,9 +963,7 @@ impl Syscall {
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
-        };
-
-        let r = r.unwrap_or_else(|e| e.to_posix_errno() as usize);
+        }; 
         return r;
     }
 

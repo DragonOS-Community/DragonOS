@@ -28,7 +28,7 @@ pub const SIGRTMAX: usize = crate::arch::ipc::signal::_NSIG;
 pub const STACK_ALIGN: u64 = 16;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq)]
 #[repr(usize)]
 pub enum Signal {
     INVALID = 0,
@@ -124,6 +124,17 @@ impl Signal {
     /// const convertor between `Signal` and `SigSet`
     pub const fn into_sigset(self) -> SigSet {
         SigSet::from_bits_truncate((self as usize - 1) as u64)
+    }
+
+    /// 判断一个信号是不是实时信号
+    ///
+    /// ## 返回值
+    ///
+    /// - `true` 这个信号是实时信号
+    /// - `false` 这个信号不是实时信号
+    #[inline]
+    pub fn is_rt_signal(&self) -> bool {
+        return (*self) as usize >= SIGRTMIN;
     }
 }
 

@@ -9,7 +9,7 @@ use crate::{
     },
     include::bindings::bindings::siginfo,
     libs::ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref},
-    process::Pid,
+    process::{Pid, ProcessControlBlock},
     syscall::{user_access::UserBufferWriter, SystemError},
 };
 
@@ -167,7 +167,17 @@ impl Default for Sigaction {
 }
 
 impl Sigaction {
-    pub fn ignore(&self, _sig: Signal) -> bool {
+    /// 判断传入的信号是否被忽略
+    ///
+    /// ## 参数
+    ///
+    /// - `sig` 传入的信号
+    ///
+    /// ## 返回值
+    ///
+    /// - `true` 被忽略
+    /// - `false`未被忽略
+    pub fn ignore(&self, sig: Signal) -> bool {
         if self.flags.contains(SigFlags::SA_FLAG_IGN) {
             return true;
         }
@@ -375,9 +385,9 @@ impl SigPending {
         let m = *sig_mask;
 
         // 获取第一个待处理的信号的号码
-        let x = s.intersection(m.complement());
-        if x.bits() != 0 {
-            sig = Signal::from(ffz(x.complement().bits()) + 1);
+        let x = s & (!m);
+        if s.bits() != 0 {
+            sig = Signal::from(ffz(s.complement().bits()) + 1);
             return sig;
         }
 
@@ -406,6 +416,41 @@ impl SigPending {
             let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(Pid::from(0)));
             ret.set_sig_type(SigType::Kill(Pid::new(0)));
             return ret;
+        }
+    }
+
+    /// @brief 从当前进程的sigpending中取出下一个待处理的signal，并返回给调用者。（调用者应当处理这个信号）
+    /// 请注意，进入本函数前，当前进程应当持有current_pcb().sighand.siglock
+    pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        // kdebug!("dequeue signal");
+        // 获取下一个要处理的信号的编号
+        let sig = self.next_signal(sig_mask);
+
+        let info: Option<SigInfo>;
+        if sig != Signal::INVALID {
+            // 如果下一个要处理的信号是合法的，则收集其siginfo
+            info = Some(self.collect_signal(sig));
+        } else {
+            info = None;
+        }
+
+        // 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位
+        // recalc_sigpending();
+        return (sig, info);
+    }
+    /// @brief 从sigpending中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
+    pub fn flush_by_mask(&mut self, mask: &SigSet) {
+        // 定义过滤器，从sigqueue中删除mask中被置位的信号
+        let filter = |x: &mut SigInfo| {
+            if mask.contains(SigSet::from_bits_truncate(x.sig_no as u64)) {
+                return true;
+            }
+            return false;
+        };
+        let filter_result: Vec<SigInfo> = self.queue.q.drain_filter(filter).collect();
+        // 回收这些siginfo
+        for x in filter_result {
+            drop(x)
         }
     }
 }
@@ -474,23 +519,6 @@ impl SigQueue {
         assert!(filter_result.len() <= 1);
 
         return (filter_result.pop(), still_pending);
-    }
-
-    /// @brief 从sigqueue中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
-    pub fn flush_by_mask(&mut self, mask: &SigSet) {
-        // 定义过滤器，从sigqueue中删除mask中被置位的信号
-        let filter = |x: &mut SigInfo| {
-            if mask.contains(SigSet::from_bits_truncate(x.sig_no as u64)) {
-                return true;
-            }
-
-            return false;
-        };
-        let filter_result: Vec<SigInfo> = self.q.drain_filter(filter).collect();
-        // 回收这些siginfo
-        for x in filter_result {
-            drop(x)
-        }
     }
 
     /// @brief 从C的void*指针转换为static生命周期的可变引用

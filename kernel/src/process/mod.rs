@@ -13,13 +13,18 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    arch::{ipc::signal::SigSet, process::ArchPCBInfo, sched::sched, CurrentIrqArch},
+    arch::{
+        ipc::signal::{SigSet, Signal},
+        process::ArchPCBInfo,
+        sched::sched,
+        CurrentIrqArch,
+    },
     exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
-    ipc::signal_types::{SigPending, SignalStruct},
+    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
     kdebug, kinfo,
     libs::{
         align::AlignedBox,
@@ -189,14 +194,14 @@ impl ProcessManager {
     /// 如果进程满足条件，则唤醒该进程
     pub fn wakeup_state(
         pcb: &Arc<ProcessControlBlock>,
-        flags: ProcessFlags,
+        flags: ProcessState,
     ) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
-        if state.is_blocked() {
+        if matches!(state, flags) {
             let mut writer = pcb.sched_info_mut();
             let state = writer.state();
-            if state.is_blocked() && pcb.flags().contains(flags) {
+            if matches!(state, flags) {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);
@@ -212,6 +217,35 @@ impl ProcessManager {
             return Err(SystemError::EINVAL);
         } else {
             return Ok(());
+        }
+    }
+
+    pub fn wakeup_flags(
+        pcb: &Arc<ProcessControlBlock>,
+        flags: ProcessFlags,
+    ) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let state = pcb.sched_info().state();
+        if state.is_exited() {
+            return Err(SystemError::EINVAL);
+        } else if state.is_runnable() {
+            return Ok(());
+        } else {
+            let mut writer = pcb.sched_info_mut();
+            let state = writer.state();
+            if state.is_exited() {
+                return Err(SystemError::EINVAL);
+            } else if state.is_runnable() {
+                return Ok(());
+            } else if pcb.flags().contains(flags) {
+                writer.set_state(ProcessState::Runnable);
+                // avoid deadlock
+                drop(writer);
+                sched_enqueue(pcb.clone(), true);
+                return Ok(());
+            } else {
+                return Err(SystemError::EINVAL);
+            }
         }
     }
 
@@ -363,7 +397,7 @@ pub enum ProcessState {
     /// - 如果该bool为false,那么，这个进程必须被显式的唤醒，才能重新进入Runnable状态。
     Blocked(bool),
     /// 进程被信号终止
-    // Stopped(Signal),
+    Stopped,
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }
@@ -383,6 +417,14 @@ impl ProcessState {
     #[inline(always)]
     pub fn is_exited(&self) -> bool {
         return matches!(self, ProcessState::Exited(_));
+    }
+
+    /// Returns `true` if the process state is [`Stopped`].
+    ///
+    /// [`Stopped`]: ProcessState::Stopped
+    #[inline(always)]
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, ProcessState::Stopped)
     }
 }
 
@@ -1005,7 +1047,10 @@ pub fn process_init() {
 #[derive(Debug)]
 pub struct ProcessSignalInfo {
     sig_block: SigSet,
+    // sig_pedding 中存储当前线程要处理的信号
     sig_pedding: SigPending,
+    // sig_shared_pedding 中存储当前进程要处理的信号
+    sig_received_pedding: SigPending,
 }
 
 impl ProcessSignalInfo {
@@ -1024,6 +1069,28 @@ impl ProcessSignalInfo {
     pub fn sig_block_mut(&mut self) -> &mut SigSet {
         &mut self.sig_block
     }
+
+    pub fn sig_received_pedding_mut(&mut self) -> &mut SigPending {
+        &mut self.sig_received_pedding
+    }
+
+    pub fn sig_received_pedding(&self) -> &SigPending {
+        &self.sig_received_pedding
+    }
+
+    /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
+    ///
+    /// ## 参数
+    ///
+    /// - `sig_mask` 被忽略掉的信号
+    ///
+    pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        if let Some(_) = self.sig_pedding.dequeue_signal(sig_mask).1 {
+            return self.sig_pedding.dequeue_signal(sig_mask);
+        } else {
+            return self.sig_received_pedding.dequeue_signal(sig_mask);
+        }
+    }
 }
 
 impl Default for ProcessSignalInfo {
@@ -1031,6 +1098,7 @@ impl Default for ProcessSignalInfo {
         Self {
             sig_block: SigSet::empty(),
             sig_pedding: SigPending::default(),
+            sig_received_pedding: SigPending::default(),
         }
     }
 }

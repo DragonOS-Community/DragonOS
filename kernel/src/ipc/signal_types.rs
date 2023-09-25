@@ -177,7 +177,7 @@ impl Sigaction {
     ///
     /// - `true` 被忽略
     /// - `false`未被忽略
-    pub fn ignore(&self, sig: Signal) -> bool {
+    pub fn ignore(&self, _sig: Signal) -> bool {
         if self.flags.contains(SigFlags::SA_FLAG_IGN) {
             return true;
         }
@@ -258,7 +258,6 @@ pub struct SigInfo {
     sig_no: i32,
     sig_code: SigCode,
     errno: i32,
-    reserved: u32,
     sig_type: SigType,
 }
 
@@ -273,10 +272,6 @@ impl SigInfo {
 
     pub fn errno(&self) -> i32 {
         self.errno
-    }
-
-    pub fn reserved(&self) -> u32 {
-        self.reserved
     }
 
     pub fn sig_type(&self) -> SigType {
@@ -311,21 +306,21 @@ impl SigInfo {
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
     Kill(Pid),
+    // 后续完善下列中的具体字段
+    // Timer,
+    // Rt,
+    // SigChild,
+    // SigFault,
+    // SigPoll,
+    // SigSys,
 }
 
 impl SigInfo {
-    pub fn new(
-        sig: Signal,
-        sig_errno: i32,
-        sig_code: SigCode,
-        reserved: u32,
-        sig_type: SigType,
-    ) -> Self {
+    pub fn new(sig: Signal, sig_errno: i32, sig_code: SigCode, sig_type: SigType) -> Self {
         Self {
             sig_no: sig as i32,
             sig_code,
             errno: sig_errno,
-            reserved,
             sig_type,
         }
     }
@@ -413,7 +408,7 @@ impl SigPending {
             return info.unwrap();
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(Pid::from(0)));
+            let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, SigType::Kill(Pid::from(0)));
             ret.set_sig_type(SigType::Kill(Pid::new(0)));
             return ret;
         }

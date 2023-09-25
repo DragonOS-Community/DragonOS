@@ -46,7 +46,7 @@ impl Signal {
     /// @param info 要发送的信息
     /// @param pid 进程id（目前只支持pid>0)
     pub fn signal_kill_something_info(
-        self,
+        &self,
         info: Option<&mut SigInfo>,
         pid: Pid,
     ) -> Result<i32, SystemError> {
@@ -60,7 +60,7 @@ impl Signal {
     }
 
     fn signal_kill_proc_info(
-        self,
+        &self,
         info: Option<&mut SigInfo>,
         pid: Pid,
     ) -> Result<i32, SystemError> {
@@ -90,7 +90,7 @@ impl Signal {
     /// @param info 要发送的信息
     /// @param target_pcb 信号的接收者
     fn signal_send_sig_info(
-        self,
+        &self,
         info: Option<&mut SigInfo>,
         target_pcb: Arc<ProcessControlBlock>,
         pt: PidType,
@@ -115,7 +115,7 @@ impl Signal {
     ///
     /// @return SystemError 错误码
     fn send_signal(
-        self,
+        &self,
         info: Option<&mut SigInfo>,
         pcb: Arc<ProcessControlBlock>,
         pt: PidType,
@@ -136,22 +136,20 @@ impl Signal {
         }
         // kdebug!("force send={}", force_send);
         let pcb_info = pcb.sig_info();
-
-        let _pending = if matches!(pt, PidType::PID) {
-            pcb_info.sig_received_pedding()
+        let pending = if matches!(pt, PidType::PID) {
+            pcb_info.sig_received_pending()
         } else {
-            pcb_info.sig_pedding()
+            pcb_info.sig_pending()
         };
-
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果是kill或者目标pcb是内核线程，则无需获取sigqueue，直接发送信号即可
-        if self == Signal::SIGKILL || pcb.flags().contains(ProcessFlags::KTHREAD) {
+        if *self == Signal::SIGKILL || pcb.flags().contains(ProcessFlags::KTHREAD) {
+            //避免死锁
+            drop(pcb_info);
             self.complete_signal(pcb.clone(), pt);
         }
         // 如果不是实时信号的话，同一时刻信号队列里只会有一个待处理的信号，如果重复接收就不做处理
-        else if !self.is_rt_signal()
-            && pcb.sig_info().sig_pedding().queue().find(self).0.is_some()
-        {
+        else if !self.is_rt_signal() && pending.queue().find(self.clone()).0.is_some() {
             return Ok(0);
         } else {
             // TODO signalfd_notify 完善 signalfd 机制
@@ -167,7 +165,6 @@ impl Signal {
                         self.clone(),
                         0,
                         SigCode::SI_USER,
-                        0,
                         SigType::Kill(ProcessManager::current_pcb().pid()),
                     )
                 }
@@ -175,14 +172,12 @@ impl Signal {
 
             ProcessManager::current_pcb()
                 .sig_info_mut()
-                .sig_pedding_mut()
+                .sig_pending_mut()
                 .queue_mut()
                 .q
                 .push(new_sig_info);
 
-            if pt == PidType::PGID || pt == PidType::SID {
-                
-            }
+            if pt == PidType::PGID || pt == PidType::SID {}
             self.complete_signal(pcb.clone(), pt);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -194,15 +189,25 @@ impl Signal {
     /// @param sig 信号
     /// @param pcb 目标pcb
     /// @param pt siginfo结构体中，pid字段代表的含义
-    fn complete_signal(self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
+    fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
         // kdebug!("complete_signal");
-
+        kdebug!(
+            "trying to complete:{:?},after into:{:?}",
+            self,
+            Into::<SigSet>::into(self.clone())
+        );
         // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
         // 将这个信号加到目标进程的sig_pending中
         pcb.sig_info_mut()
-            .sig_pedding_mut()
+            .sig_pending_mut()
             .signal_mut()
-            .insert(self.into());
+            .insert(self.clone().into());
+        kdebug!(
+            "-------completed signal:{:?},queue:{:?},pending:{:?}",
+            self,
+            pcb.sig_info().sig_pending().queue().q,
+            pcb.sig_info().sig_pending().signal(),
+        );
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // ===== 寻找需要wakeup的目标进程 =====
         // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
@@ -234,7 +239,7 @@ impl Signal {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // todo: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
         if _target.is_some() {
-            signal_wake_up(pcb.clone(), self == Signal::SIGKILL);
+            signal_wake_up(pcb.clone(), *self == Signal::SIGKILL);
         }
     }
 
@@ -242,9 +247,9 @@ impl Signal {
     /// 当我们对于进程组中的所有进程都运行了这个检查之后，我们将可以找到组内愿意接收信号的进程。
     /// 这么做是为了防止我们把信号发送给了一个正在或已经退出的进程，或者是不响应该信号的进程。
     #[inline]
-    fn wants_signal(self, pcb: Arc<ProcessControlBlock>) -> bool {
+    fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
         // 如果改进程屏蔽了这个signal，则不能接收
-        if pcb.sig_info().sig_block().contains(self.into()) {
+        if pcb.sig_info().sig_block().contains(self.clone().into()) {
             return false;
         }
 
@@ -253,7 +258,7 @@ impl Signal {
             return false;
         }
 
-        if self == Signal::SIGKILL {
+        if *self == Signal::SIGKILL {
             return true;
         }
 
@@ -264,8 +269,8 @@ impl Signal {
         // todo: 检查目标进程是否正在一个cpu上执行，如果是，则返回true，否则继续检查下一项
 
         // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
-        if pcb.sig_info().sig_pedding().signal().bits() == 0 {
-            assert!(pcb.sig_info().sig_pedding().queue().q.is_empty());
+        if pcb.sig_info().sig_pending().signal().bits() == 0 {
+            assert!(pcb.sig_info().sig_pending().queue().q.is_empty());
             return true;
         } else {
             return false;
@@ -276,8 +281,8 @@ impl Signal {
     /// @return true 可能会导致退出（不一定）
     #[allow(dead_code)]
     #[inline]
-    fn sig_fatal(self, pcb: Arc<ProcessControlBlock>) -> bool {
-        let action = pcb.sig_struct().handler.0[self as usize - 1].action();
+    fn sig_fatal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
+        let action = pcb.sig_struct().handler.0[self.clone() as usize - 1].action();
         // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
         match action {
             SigactionType::SaHandler(handler) => handler.is_sig_default(),
@@ -299,34 +304,31 @@ impl Signal {
     /// - `true` 能够发送信号
     ///
     /// - `false` 不能发送信号
-    fn prepare_sianal(self, pcb: Arc<ProcessControlBlock>, _force: bool) -> bool {
-        // 一个被阻塞了的信号肯定是要被处理的，完善 prepare_signal 后放到那里，这里的 pcb 参数就可以删掉了
-        if pcb.sig_info().sig_block().contains(self.into_sigset()) {
-            return false;
-        }
-
-        if pcb.sig_struct().handler.0[self as usize - 1].ignore(self) {
-            return false;
-        }
+    fn prepare_sianal(&self, pcb: Arc<ProcessControlBlock>, _force: bool) -> bool {
         let flush: SigSet;
         if !(self.into_sigset() & SIG_KERNEL_STOP_MASK).is_empty() {
             flush = Signal::SIGCONT.into_sigset();
             pcb.sig_info_mut()
-                .sig_received_pedding_mut()
+                .sig_received_pending_mut()
                 .flush_by_mask(&flush);
             // TODO 对每个子线程 flush mask
-        } else if self == Signal::SIGCONT {
+        } else if *self == Signal::SIGCONT {
             flush = SIG_KERNEL_STOP_MASK;
             assert!(!flush.is_empty());
             pcb.sig_info_mut()
-                .sig_received_pedding_mut()
+                .sig_received_pending_mut()
                 .flush_by_mask(&flush);
             let _r = ProcessManager::wakeup_state(&pcb, ProcessState::Stopped);
             // TODO 对每个子线程 flush mask
             // 这里需要补充一段逻辑，详见https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#952
         }
 
-        return true;
+        // 一个被阻塞了的信号肯定是要被处理的
+        if pcb.sig_info().sig_block().contains(self.into_sigset()) {
+            return true;
+        }
+
+        return !pcb.sig_struct().handler.0[self.clone() as usize - 1].ignore(self.clone());
 
         //TODO 仿照 linux 中的prepare signal完善逻辑，linux 中还会根据例如当前进程状态(Existing)进行判断，现在的信号能否发出就只是根据 ignored 来判断
     }
@@ -524,7 +526,7 @@ pub fn do_sigaction(
         if action.ignore(sig) {
             let mut mask: SigSet = SigSet::from_bits_truncate(0);
             mask.insert(sig.into());
-            pcb.sig_info_mut().sig_pedding_mut().flush_by_mask(&mask);
+            pcb.sig_info_mut().sig_pending_mut().flush_by_mask(&mask);
 
             // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
         }

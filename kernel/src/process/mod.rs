@@ -1047,10 +1047,10 @@ pub fn process_init() {
 #[derive(Debug)]
 pub struct ProcessSignalInfo {
     sig_block: SigSet,
-    // sig_pedding 中存储当前线程要处理的信号
-    sig_pedding: SigPending,
-    // sig_shared_pedding 中存储当前进程要处理的信号
-    sig_received_pedding: SigPending,
+    // sig_pending 中存储当前线程要处理的信号
+    sig_pending: SigPending,
+    // sig_shared_pending 中存储当前进程要处理的信号
+    sig_received_pending: SigPending,
 }
 
 impl ProcessSignalInfo {
@@ -1058,24 +1058,24 @@ impl ProcessSignalInfo {
         self.sig_block
     }
 
-    pub fn sig_pedding(&self) -> &SigPending {
-        &self.sig_pedding
+    pub fn sig_pending(&self) -> &SigPending {
+        &self.sig_pending
     }
 
-    pub fn sig_pedding_mut(&mut self) -> &mut SigPending {
-        &mut self.sig_pedding
+    pub fn sig_pending_mut(&mut self) -> &mut SigPending {
+        &mut self.sig_pending
     }
 
     pub fn sig_block_mut(&mut self) -> &mut SigSet {
         &mut self.sig_block
     }
 
-    pub fn sig_received_pedding_mut(&mut self) -> &mut SigPending {
-        &mut self.sig_received_pedding
+    pub fn sig_received_pending_mut(&mut self) -> &mut SigPending {
+        &mut self.sig_received_pending
     }
 
-    pub fn sig_received_pedding(&self) -> &SigPending {
-        &self.sig_received_pedding
+    pub fn sig_received_pending(&self) -> &SigPending {
+        &self.sig_received_pending
     }
 
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
@@ -1085,10 +1085,10 @@ impl ProcessSignalInfo {
     /// - `sig_mask` 被忽略掉的信号
     ///
     pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
-        if let Some(_) = self.sig_pedding.dequeue_signal(sig_mask).1 {
-            return self.sig_pedding.dequeue_signal(sig_mask);
+        if let Some(_) = self.sig_pending.dequeue_signal(sig_mask).1 {
+            return self.sig_pending.dequeue_signal(sig_mask);
         } else {
-            return self.sig_received_pedding.dequeue_signal(sig_mask);
+            return self.sig_received_pending.dequeue_signal(sig_mask);
         }
     }
 }
@@ -1097,8 +1097,8 @@ impl Default for ProcessSignalInfo {
     fn default() -> Self {
         Self {
             sig_block: SigSet::empty(),
-            sig_pedding: SigPending::default(),
-            sig_received_pedding: SigPending::default(),
+            sig_pending: SigPending::default(),
+            sig_received_pending: SigPending::default(),
         }
     }
 }

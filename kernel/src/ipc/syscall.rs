@@ -5,11 +5,8 @@ use core::{
 
 use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
-    filesystem::vfs::{
-        file::{File, FileMode},
-        FilePrivateData,
-    },
-    kerror, kwarn,
+    filesystem::vfs::{file::{File, FileMode}, FilePrivateData},
+    kdebug, kerror, kwarn,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
@@ -73,7 +70,7 @@ impl Syscall {
         }
 
         // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::SI_USER, 0, SigType::Kill(pid));
+        let mut info = SigInfo::new(sig, 0, SigCode::SI_USER, SigType::Kill(pid));
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -136,6 +133,8 @@ impl Syscall {
                 _ => {
                     // 从用户空间获得sigaction结构体
                     // TODO mask是default还是用户空间传入
+                    kdebug!("--receiving function:{:?}", unsafe { (*act).handler }
+                        as u64);
                     new_ka = Sigaction::new(
                         SigactionType::SaHandler(SaHandlerType::SigCustomized(unsafe {
                             (*act).handler as u64

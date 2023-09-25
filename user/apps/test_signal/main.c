@@ -42,16 +42,17 @@ int main()
 
     while (1)
     {
-        handler(SIGKILL);
-        if ((clock() - last) / CLOCKS_PER_SEC >= 1)
+        // handler(SIGKILL);
+        if ((clock() - last) / CLOCKS_PER_SEC >= 5)
         {
-             printf("Test signal running\n");
+            printf("Test signal running\n");
+            raise(SIGKILL);
             last = clock();
         }
         if (handle_ok)
         {
             printf("Handle OK!\n");
-            handle_ok = false;
+            // handle_ok = false;
         }
     }
 

@@ -11,7 +11,7 @@ use crate::{
     include::bindings::bindings::USER_MAX_LINEAR_ADDR,
     ipc::{
         signal::{get_signal_to_deliver, set_current_sig_blocked},
-        signal_types::{SigInfo, Sigaction, SigactionType, MAX_SIG_NUM},
+        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, MAX_SIG_NUM},
     },
     kdebug, kerror,
     process::ProcessManager,
@@ -111,7 +111,9 @@ impl From<i32> for Signal {
 
 impl Into<SigSet> for Signal {
     fn into(self) -> SigSet {
-        self.into_sigset()
+        SigSet {
+            bits: (1 << (self as usize - 1) as u64),
+        }
     }
 }
 impl Signal {
@@ -123,7 +125,9 @@ impl Signal {
 
     /// const convertor between `Signal` and `SigSet`
     pub const fn into_sigset(self) -> SigSet {
-        SigSet::from_bits_truncate((self as usize - 1) as u64)
+        SigSet {
+            bits: (1 << (self as usize - 1) as u64),
+        }
     }
 
     /// 判断一个信号是不是实时信号
@@ -280,7 +284,7 @@ pub unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
     // 检查sigpending是否为0
     if ProcessManager::current_pcb()
         .sig_info()
-        .sig_pedding()
+        .sig_pending()
         .signal()
         .bits()
         == 0
@@ -335,6 +339,7 @@ fn handle_signal(
     oldset: &SigSet,
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
+    kdebug!("handling signal :{:?}", sig);
     // 设置栈帧
     let retval = setup_frame(sig, ka, info, oldset, frame);
     if retval.is_err() {
@@ -373,18 +378,21 @@ fn setup_frame(
     }
 
     match ka.action() {
-        SigactionType::SaHandler(handler) => {
-            if handler.is_sig_default() {
+        SigactionType::SaHandler(handler_type) => match handler_type {
+            SaHandlerType::SigDefault => {
                 kerror!("In setup frame: handler is None");
                 return Err(SystemError::EINVAL);
             }
-            unsafe {
+            SaHandlerType::SigCustomized(handler) => unsafe {
                 (*frame).arg0 = sig as u64;
                 (*frame).arg1 = &((*frame).info) as *const SigInfo as usize;
                 (*frame).arg2 = &((*frame).context) as *const SigContext as usize;
-                (*frame).handler = Into::<usize>::into(handler) as usize as *mut c_void;
+                (*frame).handler = handler as usize as *mut c_void;
+            },
+            _ => {
+                return Err(SystemError::EINVAL);
             }
-        }
+        },
         SigactionType::SaSigaction(_) => {
             //TODO 这里应该是可以恢复的栈的，等后续来做
             kerror!("trying to recover from sigaction type instead of handler");

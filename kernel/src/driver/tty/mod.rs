@@ -1,4 +1,4 @@
-use core::intrinsics::unlikely;
+use core::{intrinsics::unlikely, sync::atomic::AtomicU8};
 
 use alloc::string::String;
 
@@ -7,7 +7,13 @@ use thingbuf::mpsc::{
     errors::{TryRecvError, TrySendError},
 };
 
-use crate::libs::rwlock::RwLock;
+use crate::{
+    arch::ipc::signal::{SigCode, Signal},
+    ipc::signal_types::{SigInfo, SigType},
+    kdebug,
+    libs::rwlock::RwLock,
+    process::{Pid, ProcessManager},
+};
 
 pub mod tty_device;
 
@@ -55,7 +61,8 @@ struct TtyCore {
     /// 输出的mpsc队列输入输出端
     output_rx: mpsc::Receiver<u8>,
     output_tx: mpsc::Sender<u8>,
-
+    // 前台进程,以后改成前台进程组
+    front_job: Option<Pid>,
     /// tty核心的状态
     state: RwLock<TtyCoreState>,
 }
@@ -71,6 +78,8 @@ pub enum TtyError {
     Closed,
     /// End of file(已经读取的字符数，包含eof)
     EOF(usize),
+    /// 接收到信号终止
+    Stopped(usize),
     Unknown(String),
 }
 
@@ -90,6 +99,7 @@ impl TtyCore {
             stdin_tx,
             output_rx,
             output_tx,
+            front_job: None,
             state,
         };
     }
@@ -103,7 +113,6 @@ impl TtyCore {
     /// @return Ok(成功传送的字节数)
     /// @return Err(TtyError) 内部错误信息
     pub fn input(&self, buf: &[u8], block: bool) -> Result<usize, TtyError> {
-        // TODO: 在这里考虑增加对信号发送的处理
         let val = self.write_stdin(buf, block)?;
         // 如果开启了输入回显，那么就写一份到输出缓冲区
         if self.echo_enabled() {
@@ -278,11 +287,24 @@ impl TtyCore {
                     _ => return Err(TtyError::Unknown(format!("{e:?}"))),
                 }
             } else {
+                // TODO: 在这里考虑增加对信号发送的处理
+                if buf[cnt] == 3 {
+                    let pid = ProcessManager::current_pcb().pid();
+                    Signal::SIGKILL.signal_kill_something_info(
+                        Some(&mut SigInfo::new(
+                            Signal::SIGKILL,
+                            0,
+                            SigCode::SI_USER,
+                            SigType::Kill(pid),
+                        )),
+                        pid,
+                    );
+                    return Err(TtyError::Stopped(cnt));
+                }
                 *r.unwrap() = buf[cnt];
                 cnt += 1;
             }
         }
-
         return Ok(cnt);
     }
 

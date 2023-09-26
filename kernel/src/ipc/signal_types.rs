@@ -381,8 +381,8 @@ impl SigPending {
 
         // 获取第一个待处理的信号的号码
         let x = s & (!m);
-        if s.bits() != 0 {
-            sig = Signal::from(ffz(s.complement().bits()) + 1);
+        if x.bits() != 0 {
+            sig = Signal::from(ffz(x.complement().bits()) + 1);
             return sig;
         }
 

@@ -1085,8 +1085,10 @@ impl ProcessSignalInfo {
     /// - `sig_mask` 被忽略掉的信号
     ///
     pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
-        if let Some(_) = self.sig_pending.dequeue_signal(sig_mask).1 {
-            return self.sig_pending.dequeue_signal(sig_mask);
+        kdebug!("--sigpending--:{:?},mask:{:?}", self.sig_pending , sig_mask);
+        let res = self.sig_pending.dequeue_signal(sig_mask);
+        if let Some(_) = res.1 {
+            return res;
         } else {
             return self.sig_received_pending.dequeue_signal(sig_mask);
         }

@@ -1276,13 +1276,6 @@ impl BarInfo {
         }
     }
 
-    pub fn io_addr(&self) -> Option<(u32, u32)>{
-        if let Self::IO { address, size } = self {
-            Some((*address, *size))
-        } else {
-            None
-        }
-    }
 }
 ///实现BarInfo的Display trait，自定义输出
 impl Display for BarInfo {

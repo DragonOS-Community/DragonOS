@@ -124,7 +124,7 @@ pub trait PciInterrupt: PciDeviceStructure {
             if let Some(cap_offset) = self.msix_capability_offset() {
                 let data =
                     PciArch::read_config(&self.common_header().bus_device_function, cap_offset);
-                let irq_max_num = ((data >> 16) & 0x7ff) as u16 + 1;
+                let irq_max_num = ((data >> 16) & 0x7ff) as u16 + 2;
                 let data =
                     PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 4);
                 let msix_table_bar = (data & 0x07) as u8;

@@ -8,8 +8,10 @@ use alloc::vec::Vec;
 use crate::driver::pci::pci::{
     PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,PCI_DEVICE_LINKEDLIST, get_pci_device_structure_mut,
 };
-use crate::driver::pci::pci_irq::{PciInterrupt, IRQ, IrqMsg, IrqCommonMsg, IrqSpecificMsg};
+use crate::driver::pci::pci_irq::{PciInterrupt, IRQ, IrqMsg, IrqCommonMsg, IrqSpecificMsg, IrqType};
+use crate::include::bindings::bindings::pt_regs;
 use crate::libs::volatile::{Volatile, VolatileReadable, VolatileWritable, ReadOnly, WriteOnly};
+use crate::net::net_core::poll_ifaces_try_lock_onetime;
 use crate::{kdebug, kinfo};
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
 use super::e1000e_driver::e1000e_driver_init;
@@ -145,10 +147,12 @@ impl E1000EBuffer{
     }
 }
 
-// 中断处理函数，等待主线同步
-// unsafe extern "C" fn e1000e_irq_hander(irq_num: u64, irq_paramer: u64, regs: *mut pt_regs) {
-//     poll_ifaces_try_lock_onetime();
-// }
+// 中断处理函数, 调用协议栈的poll函数，未来可能会用napi来替换这里
+// Interrupt handler
+unsafe extern "C" fn e1000e_irq_handler(irq_num: u64, irq_paramer: u64, regs: *mut pt_regs) {
+    // kdebug!("12345!"); // make sure we can receive interrupt
+    poll_ifaces_try_lock_onetime().ok();
+}
 
 pub struct E1000EDevice{
     // 设备寄存器
@@ -176,6 +180,7 @@ pub struct E1000EDevice{
     first_trans: bool,
     // napi队列，用于存放在中断关闭期间通过轮询收取的buffer
     // the napi queue is designed to save buffer/packet when the interrupt is close
+    // NOTE: this feature is not completely implemented and not used in the current version
     napi_buffers: Vec<E1000EBuffer>, 
     napi_buffer_head: usize,
     napi_buffer_tail: usize,
@@ -202,26 +207,26 @@ impl E1000EDevice{
         }
         let vaddress = bar0.virtual_address().ok_or(E1000EPciError::BarGetVaddrFailed)?.data() as u64;
         
-        // 初始化msix中断
-        // initialize msi-x interupt
+        // 初始化msi中断
+        // initialize msi interupt
         let irq_vector = device.irq_vector_mut().unwrap();
         irq_vector.push(E1000E_RECV_VECTOR);
-        device.irq_init(IRQ::PCI_IRQ_MSIX).expect("IRQ Init Failed");
-        // 等待主线的中断部分更新
-        // let msg = IrqMsg{
-        //     irq_common_message: IrqCommonMsg{
-        //         irq_index: 0,
-        //         irq_name: CString::new(
-        //             "E1000E_Recv_IRQ",
-        //         ).expect("CString new failed"),
-        //         irq_parameter: 0,
-        //         irq_handler: e1000e_irq_handler,
-        //         irq_ack: None,
-        //     },
-        //     irq_specific_message: IrqSpecificMsg::msi_deafult() ,
-        // };
-        // device.irq_install(msg)?;
-        // device.irq_enable(true)?;
+        device.irq_init(IRQ::PCI_IRQ_MSI).expect("IRQ Init Failed");
+        let msg = IrqMsg{
+            irq_common_message: IrqCommonMsg{
+                irq_index: 0,
+                irq_name: CString::new(
+                    "E1000E_Recv_IRQ",
+                ).expect("CString new failed"),
+                irq_parameter: 0,
+                irq_hander: e1000e_irq_handler,
+                irq_ack: None,
+            },
+            irq_specific_message: IrqSpecificMsg::msi_default() ,
+        };
+        device.irq_install(msg)?;
+        device.irq_enable(true)?;
+
         let general_regs: NonNull<GeneralRegs> = get_register_ptr(vaddress, E1000E_GENERAL_REGS_OFFSET);
         let interrupt_regs: NonNull<InterruptRegs> = get_register_ptr(vaddress, E1000E_INTERRRUPT_REGS_OFFSET);
         let rctl_regs: NonNull<ReceiveCtrlRegs> = get_register_ptr(vaddress, E1000E_RECEIVE_CTRL_REG_OFFSET);
@@ -233,13 +238,17 @@ impl E1000EDevice{
         // 开始设备初始化 14.3
         // Initialization Sequence 
         unsafe{
-            let ctrl = volread!(general_regs, ctrl);
+            let mut ctrl = volread!(general_regs, ctrl);
             // 关闭中断
             // close the interrupt
             volwrite!(interrupt_regs, imc, 0xffffffff);
             //SW RESET
             volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_RST);
             compiler_fence(Ordering::AcqRel);
+            // PHY RESET
+            ctrl = volread!(general_regs, ctrl);
+            volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_PHY_RST);
+            volwrite!(general_regs, ctrl, ctrl);
             // 关闭中断
             // close the interrupt
             volwrite!(interrupt_regs, imc, 0xffffffff);
@@ -249,7 +258,8 @@ impl E1000EDevice{
             compiler_fence(Ordering::AcqRel);
             // PHY Initialization 14.8.1
             // MAC/PHY Link Setup 14.8.2
-            let ctrl = volread!(general_regs, ctrl);
+            ctrl = volread!(general_regs, ctrl);
+            ctrl &= !(E1000E_CTRL_FRCSPD | E1000E_CTRL_FRCDPLX);
             volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_SLU);
         }
             let status = unsafe { volread!(general_regs, status) };
@@ -323,12 +333,7 @@ impl E1000EDevice{
             // 设置控制寄存器的相关功能 14.6.1
             // Set the receive control register
             volwrite!(rctl_regs, rctl, E1000E_RCTL_EN | E1000E_RCTL_BAM | E1000E_RCTL_BSIZE_4K | E1000E_RCTL_BSEX | E1000E_RCTL_SECRC);
-            // 开启收包相关的中断
-            // Enable receive interrupts
-            let ims = volread!(interrupt_regs, ims);
-            // ims = ims | E1000E_IMS_LSC | E1000E_IMS_RXO | E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0;
-            volwrite!(interrupt_regs, ims, ims | E1000E_IMS_LSC | E1000E_IMS_RXO | E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0);
-
+  
             // Transmit Initialization 14.7
             // 开启发包descriptor的回写功能
             // Program the TXDCTL register with the desired TX descriptor write-back policy
@@ -346,6 +351,14 @@ impl E1000EDevice{
             volwrite!(tctl_regs, tipg, E1000E_TIPG_IPGT | E1000E_TIPG_IPGR1 | E1000E_TIPG_IPGR2);
             // Program the TCTL register.
             volwrite!(tctl_regs, tctl, E1000E_TCTL_EN | E1000E_TCTL_PSP | E1000E_TCTL_CT_VAL | E1000E_TCTL_COLD_VAL);
+
+            let icr = volread!(interrupt_regs, icr);
+            volwrite!(interrupt_regs, icr, icr);
+            // 开启收包相关的中断
+            // Enable receive interrupts
+            let mut ims = volread!(interrupt_regs, ims);
+            ims = E1000E_IMS_LSC | E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0 | E1000E_IMS_OTHER;
+            volwrite!(interrupt_regs, ims, ims);
         }
         return Ok(E1000EDevice{
             general_regs,
@@ -371,6 +384,7 @@ impl E1000EDevice{
 
     }
     pub fn e1000e_receive(&mut self) -> Option<E1000EBuffer>{
+        self.e1000e_intr();
         let mut rdt = unsafe { volread!(self.receive_regs, rdt0) } as usize;
         let index = (rdt + 1) % self.recv_desc_ring.len();
         let desc = &mut self.recv_desc_ring[index];
@@ -393,7 +407,6 @@ impl E1000EDevice{
         let index = tdt % self.trans_desc_ring.len();
         let desc = &self.trans_desc_ring[index];
         if (desc.status & E1000E_TXD_STATUS_DD) == 0 {
-            // kdebug!("dd!!");
             return false;
         }
         true
@@ -429,6 +442,7 @@ impl E1000EDevice{
 
     // 切换是否接受分组到达的中断
     // change whether the receive timer interrupt is enabled
+    // Note: this method is not completely implemented and not used in the current version
     pub fn e1000e_intr_set(&mut self, state: bool){
         let mut ims = unsafe{volread!(self.interrupt_regs, ims)};
         match state{
@@ -438,8 +452,9 @@ impl E1000EDevice{
         unsafe { volwrite!(self.interrupt_regs, ims, ims) };
     }
 
-    // 实现了一部分napi机制的收包函数
+    // 实现了一部分napi机制的收包函数, 现在还没有投入使用
     // This method is a partial implementation of napi (New API) techniques
+    // Note: this method is not completely implemented and not used in the current version
     pub fn e1000e_receive2(&mut self) -> Option<E1000EBuffer>{
         // 向设备表明我们已经接受到了之前的中断
         // Tell e1000e we have received the interrupt
@@ -651,9 +666,12 @@ const E1000E_MTA_REGS_END_OFFSET: u64 = 0x053fc;
 // 寄存器的特定位
 //CTRL
 const E1000E_CTRL_SLU: u32 = 1 << 6;
+const E1000E_CTRL_FRCSPD: u32 = 1 << 11;
+const E1000E_CTRL_FRCDPLX: u32 = 1 << 12;
 const E1000E_CTRL_RST: u32 = 1 << 26; 
 const E1000E_CTRL_RFCE: u32 = 1 << 27;
 const E1000E_CTRL_TFCE: u32 = 1 << 28;
+const E1000E_CTRL_PHY_RST: u32 = 1 << 31;
 
 // IMS
 const E1000E_IMS_LSC: u32 = 1 << 2;
@@ -661,6 +679,7 @@ const E1000E_IMS_RXDMT0: u32 = 1 << 4;
 const E1000E_IMS_RXO: u32 = 1 << 6;
 const E1000E_IMS_RXT0: u32 = 1 << 7;
 const E1000E_IMS_RXQ0: u32 = 1 << 20;
+const E1000E_IMS_OTHER: u32 = 1 << 24; // qemu use this bit to set msi-x interrupt
 
 // RCTL
 const E1000E_RCTL_EN: u32 = 1 << 1;

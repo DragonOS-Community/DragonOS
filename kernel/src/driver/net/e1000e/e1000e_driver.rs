@@ -18,7 +18,6 @@ pub struct E1000ETxToken{
 }
 pub struct E1000EDriver{
     pub inner: Arc<SpinLock<E1000EDevice>>,
-    // pkt_buffer: 
 }
 
 /// @brief 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
@@ -71,10 +70,6 @@ impl phy::TxToken for E1000ETxToken{
     fn consume<R, F>(self, len: usize, f: F) -> R
         where
             F: FnOnce(&mut [u8]) -> R {
-        // let mut buffer = [0u8; 4096];
-        // let result = f(&mut buffer[..len]);
-        // let mut device = self.driver.inner.lock();
-        // device.e1000e_transmit(&mut buffer);
         let mut buffer = E1000EBuffer::new(4096);
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
@@ -114,7 +109,7 @@ impl phy::Device for E1000EDriver{
     type TxToken<'a> = E1000ETxToken;
 
     fn receive(&mut self, _timestamp: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        match self.inner.lock().e1000e_receive2(){
+        match self.inner.lock().e1000e_receive(){
             Some(buffer) => {
                 Some((
                 E1000ERxToken(buffer), 
@@ -135,11 +130,12 @@ impl phy::Device for E1000EDriver{
         } 
     }
 
-    // 临时测试用
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
         // 网卡的最大传输单元. 请与IP层的MTU进行区分。这个值应当是网卡的最大传输单元，而不是IP层的MTU。
-        caps.max_transmission_unit = 2000;
+        // The maximum size of the received packet is limited by the 82574 hardware to 1536 bytes. Packets larger then 1536 bytes are silently discarded. Any packet smaller than 1536 bytes is processed by the 82574.
+        // 82574l manual pp205
+        caps.max_transmission_unit = 1536;
         /*
            Maximum burst size, in terms of MTU.
            The network device is unable to send or receive bursts large than the value returned by this function.
@@ -264,9 +260,6 @@ impl NetDriver for E1000EInterface {
         let timestamp: smoltcp::time::Instant = Instant::now().into();
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
-        // todo: notify!!!
-        //
-        // kdebug!("e1000e Interface poll:{poll_res}");
         if poll_res {
             return Ok(());
         }
@@ -277,9 +270,6 @@ impl NetDriver for E1000EInterface {
     fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
         return &self.iface;
     }
-    // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
-    //     return self;
-    // }
 }
 
 pub fn e1000e_driver_init(device: E1000EDevice){

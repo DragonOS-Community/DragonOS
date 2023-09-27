@@ -12,7 +12,7 @@
   },
   "depends": [],
   "build": {
-    "build_command": "make install TARGET=$ROOT_PATH/user/target.json"
+    "build_command": "make install TARGET=$ROOT_PATH/user/dadk/target/x86_64-unknown-dragonos.json"
   },
   "clean": {
     "clean_command": "make clean"

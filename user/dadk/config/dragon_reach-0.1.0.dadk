@@ -6,13 +6,13 @@
     "BuildFromSource": {
       "Git": {
         "url" : "https://git.mirrors.dragonos.org/DragonOS-Community/DragonReach.git",
-        "revision": "846d2a7cb9"
+        "revision": "4aac1004fa"
       }
     }
   },
   "depends": [],
   "build": {
-    "build_command": "make install TARGET=$ROOT_PATH/user/dadk/target/x86_64-unknown-dragonos.json"
+    "build_command": "make install"
   },
   "clean": {
     "clean_command": "make clean"
@@ -23,7 +23,7 @@
   "envs": [    
     {
       "key": "TARGET",
-      "value": "x86_64-unknown-dragonos"
+      "value": "${ROOT_PATH}/user/dadk/target/x86_64-unknown-dragonos.json"
     }
   ]
 }

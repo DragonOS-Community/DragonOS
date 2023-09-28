@@ -78,7 +78,6 @@ make_output_dir: ECHO
 	mkdir -p $(ROOT_PATH)/bin/tmp/user
 	mkdir -p $(ROOT_PATH)/bin/sysroot/usr/include
 	mkdir -p $(ROOT_PATH)/bin/sysroot/usr/lib
-	mkdir -p $(ROOT_PATH)/bin/sysroot/etc/reach/system
 
 	$(shell if [ ! -e $(tmp_output_dir) ];then mkdir -p $(tmp_output_dir); fi)
 	$(shell if [ ! -e $(output_dir) ];then mkdir -p $(output_dir); fi)

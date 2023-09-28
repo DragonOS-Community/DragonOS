@@ -6,7 +6,7 @@
     "BuildFromSource": {
       "Git": {
         "url" : "https://git.mirrors.dragonos.org/DragonOS-Community/DragonReach.git",
-        "revision": "b40b6b4d2f"
+        "revision": "846d2a7cb9"
       }
     }
   },
@@ -18,7 +18,7 @@
     "clean_command": "make clean"
   },
   "install": {
-    "in_dragonos_path": "/bin"
+    "in_dragonos_path": "/"
   },
   "envs": [    
     {

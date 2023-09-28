@@ -562,7 +562,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing ProcFS...");
+        kinfo!("Initializing DevFS...");
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载

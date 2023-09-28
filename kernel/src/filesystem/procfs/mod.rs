@@ -770,10 +770,10 @@ pub fn procfs_init() -> Result<(), SystemError> {
     let mut result = None;
     INIT.call_once(|| {
         kinfo!("Initializing ProcFS...");
-        // 创建 sysfs 实例
+        // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
 
-        // sysfs 挂载
+        // procfs 挂载
         let _t = ROOT_INODE()
             .find("proc")
             .expect("Cannot find /proc")

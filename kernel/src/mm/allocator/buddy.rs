@@ -65,10 +65,8 @@ impl<A> PageList<A> {
 pub struct BuddyAllocator<A> {
     // 存放每个阶的空闲“链表”的头部地址
     free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize],
-    /// 总可用页数
-    total_page_num: usize,
-    /// 已用页数
-    used_page_num: usize,
+    /// 总页数
+    total: PageFrameCount,
     phantom: PhantomData<A>,
 }
 
@@ -233,8 +231,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
         let allocator = Self {
             free_area,
-            total_page_num: pages_to_buddy.data(),
-            used_page_num: 0,
+            total: pages_to_buddy,
             phantom: PhantomData,
         };
 
@@ -358,12 +355,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 if !entry.check_aligned(1 << spec_order) {
                     panic!("entry={:?} is not aligned, spec_order={spec_order}, page_list.entry_num={}", entry, tmp_current_entry_num);
                 }
-                self.used_page_num += 1 << Self::order2index(spec_order);
                 return Some(entry);
             }
             return None;
         };
-        kdebug!("alloc {} order", order);
         let result: Option<PhysAddr> = alloc_in_specific_order(order as u8);
         // kdebug!("result={:?}", result);
         if result.is_some() {
@@ -668,7 +663,19 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
     }
 
     unsafe fn usage(&self) -> PageFrameUsage {
-        todo!("BuddyAllocator::usage")
+        let mut free_page_num: usize = 0;
+        for index in 0..(MAX_ORDER - MIN_ORDER) {
+            let mut pagelist: PageList<A> = Self::read_page(self.free_area[index]);
+            loop {
+                free_page_num += pagelist.entry_num << index;
+                if pagelist.next_page.is_null() {
+                    break;
+                }
+                pagelist = Self::read_page(pagelist.next_page);
+            }
+        }
+        let free = PageFrameCount::new(free_page_num);
+        PageFrameUsage::new(self.total - free, self.total)
     }
 }
 

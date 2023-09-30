@@ -277,8 +277,6 @@ impl File {
 
         self.offset += 1;
         dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
-        dirent.d_off = 0;
-        dirent.d_reclen = 0;
         dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
         // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
         unsafe {
@@ -289,8 +287,13 @@ impl File {
         }
 
         // 计算dirent结构体的大小
-        return Ok((name_bytes.len() + ::core::mem::size_of::<Dirent>()
-            - ::core::mem::size_of_val(&dirent.d_name)) as u64);
+        let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()
+            - ::core::mem::size_of_val(&dirent.d_name)) as u64;
+
+        dirent.d_reclen = size as u16;
+        dirent.d_off += dirent.d_reclen as i64;
+
+        return Ok(size);
     }
 
     pub fn inode(&self) -> Arc<dyn IndexNode> {

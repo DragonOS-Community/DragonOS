@@ -182,12 +182,12 @@ impl ProcessManager {
             let new_fd_table = current_pcb.basic().fd_table().unwrap().read().clone();
             let new_fd_table = Arc::new(RwLock::new(new_fd_table));
             new_pcb.basic_mut().set_fd_table(Some(new_fd_table));
+        } else {
+            // 如果共享文件描述符表，则直接拷贝指针
+            new_pcb
+                .basic_mut()
+                .set_fd_table(current_pcb.basic().fd_table().clone());
         }
-
-        // 如果共享文件描述符表，则直接拷贝指针
-        new_pcb
-            .basic_mut()
-            .set_fd_table(current_pcb.basic().fd_table().clone());
 
         return Ok(());
     }

@@ -7,7 +7,7 @@ use crate::driver::pci::pci::{
 
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
 use crate::include::bindings::bindings::pt_regs;
-use crate::kdebug;
+
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };

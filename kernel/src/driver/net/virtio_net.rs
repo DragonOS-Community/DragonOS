@@ -241,10 +241,6 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
 }
 
 impl<T: Transport> Driver for VirtioInterface<T> {
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
-        self
-    }
-
     fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
         todo!()
     }
@@ -258,14 +254,6 @@ impl<T: Transport> Driver for VirtioInterface<T> {
     }
 
     fn id_table(&self) -> IdTable {
-        todo!()
-    }
-
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
-        todo!()
-    }
-
-    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
         todo!()
     }
 }

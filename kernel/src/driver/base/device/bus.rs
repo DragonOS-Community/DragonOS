@@ -1,10 +1,13 @@
 use super::{
-    device_register, device_unregister,
+    device_kset, device_register, device_unregister,
     driver::{driver_register, driver_unregister, DriverError},
     Device, DeviceError, DeviceState, IdTable,
 };
 use crate::{
-    driver::Driver,
+    driver::{
+        base::{kobject::KObject, kset::KSet},
+        Driver,
+    },
     filesystem::{
         sysfs::{
             bus::{sys_bus_init, sys_bus_register},
@@ -13,13 +16,29 @@ use crate::{
         vfs::IndexNode,
     },
     libs::spinlock::SpinLock,
+    syscall::SystemError,
 };
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, string::ToString, sync::Arc};
 use core::fmt::Debug;
 use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref BUS_MANAGER: Arc<LockedBusManager> = Arc::new(LockedBusManager::new());
+}
+
+/// `/sys/bus`的kset
+static mut BUS_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/devices/system`的kset
+static mut DEVICES_SYSTEM_KSET_INSTANCE: Option<Arc<KSet>> = None;
+
+#[inline(always)]
+pub fn bus_kset() -> Arc<KSet> {
+    unsafe { BUS_KSET_INSTANCE.clone().unwrap() }
+}
+
+#[inline(always)]
+pub fn devices_system_kset() -> Arc<KSet> {
+    unsafe { DEVICES_SYSTEM_KSET_INSTANCE.clone().unwrap() }
 }
 
 /// @brief: 总线状态
@@ -210,4 +229,23 @@ pub fn bus_driver_register(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverE
 pub fn bus_driver_unregister(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverError> {
     BUS_MANAGER.remove_bus_driver(&bus_driver.id_table());
     return driver_unregister(bus_driver);
+}
+
+pub fn buses_init() -> Result<(), SystemError> {
+    let bus_kset = KSet::new("bus".to_string());
+    bus_kset.register(None).expect("bus kset register failed");
+    unsafe {
+        BUS_KSET_INSTANCE = Some(bus_kset);
+    }
+
+    // 初始化 /sys/devices/system
+    {
+        let devices_system_kset = KSet::new("system".to_string());
+        let parent = device_kset() as Arc<dyn KObject>;
+        devices_system_kset.set_parent(Some(Arc::downgrade(&parent)));
+        devices_system_kset
+            .register(Some(device_kset()))
+            .expect("devices system kset register failed");
+    }
+    return Ok(());
 }

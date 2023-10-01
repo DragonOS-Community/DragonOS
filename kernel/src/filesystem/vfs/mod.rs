@@ -526,6 +526,12 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn as_any_ref(&self) -> &dyn Any;
 }
 
+impl DowncastArc for dyn FileSystem {
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
+        self
+    }
+}
+
 #[derive(Debug)]
 pub struct FsInfo {
     /// 文件系统所在的块设备的id

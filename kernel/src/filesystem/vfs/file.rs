@@ -268,7 +268,7 @@ impl File {
         let sub_inode: Arc<dyn IndexNode> = match inode.find(&name) {
             Ok(i) => i,
             Err(e) => {
-                kerror!("Readdir error: Failed to find sub inode, file={self:?}");
+                kerror!("Readdir error: Failed to find sub inode:{name:?}, file={self:?}, error={e:?}");
                 return Err(e);
             }
         };

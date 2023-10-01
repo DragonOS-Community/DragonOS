@@ -2,12 +2,16 @@ use super::{_port, hba::HbaCmdTable, virt_2_phys};
 use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::SeekFrom;
-use crate::driver::base::device::{Device, DeviceType, KObject};
+use crate::driver::base::device::{Device, DeviceType};
+use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
+use crate::driver::base::kset::KSet;
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
+use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 use crate::include::bindings::bindings::verify_area;
 
 use crate::kdebug;
+use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::mm::phys_2_virt;
 use crate::syscall::SystemError;
@@ -431,26 +435,66 @@ impl LockedAhciDisk {
     }
 }
 
-impl KObject for LockedAhciDisk {}
+impl KObject for LockedAhciDisk {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        todo!()
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn name(&self) -> alloc::string::String {
+        todo!()
+    }
+
+    fn set_name(&self, name: alloc::string::String) {
+        todo!()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        todo!()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        todo!()
+    }
+}
 
 impl Device for LockedAhciDisk {
     fn dev_type(&self) -> DeviceType {
         return DeviceType::Block;
     }
 
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        return self;
-    }
-
     fn id_table(&self) -> crate::driver::base::device::IdTable {
-        todo!()
-    }
-
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
-        todo!()
-    }
-
-    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
         todo!()
     }
 }

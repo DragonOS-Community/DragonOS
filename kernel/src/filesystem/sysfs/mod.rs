@@ -2,15 +2,19 @@ use core::fmt::Debug;
 
 use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
 
-use super::vfs::{
-    core::generate_inode_id, file::FileMode, syscall::ModeType, FileSystem, FileType, FsInfo,
-    IndexNode, Metadata, PollStatus,
+use super::{
+    kernfs::{callback::KernInodePrivateData, KernFS, KernFSInode, KernInodeType},
+    vfs::{
+        core::generate_inode_id, file::FileMode, syscall::ModeType, FileSystem, FileType, FsInfo,
+        IndexNode, Metadata, PollStatus,
+    },
 };
 use crate::{
-    driver::base::{device::KObject, platform::platform_bus_init},
+    driver::base::{kobject::KObject, platform::platform_bus_init},
     filesystem::{sysfs::bus::sys_bus_init, vfs::ROOT_INODE},
-    kdebug, kinfo,
+    kdebug, kinfo, kwarn,
     libs::{
+        casting::DowncastArc,
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -30,6 +34,7 @@ pub mod devices;
 mod dir;
 mod file;
 pub mod fs;
+mod group;
 
 const SYSFS_MAX_NAMELEN: usize = 64;
 
@@ -37,6 +42,16 @@ static mut __SYS_DEVICES_INODE: Option<Arc<dyn IndexNode>> = None;
 static mut __SYS_BUS_INODE: Option<Arc<dyn IndexNode>> = None;
 static mut __SYS_CLASS_INODE: Option<Arc<dyn IndexNode>> = None;
 static mut __SYS_FS_INODE: Option<Arc<dyn IndexNode>> = None;
+
+/// 全局的sysfs实例
+pub(self) static mut SYSFS_INSTANCE: Option<SysFS> = None;
+
+#[inline(always)]
+pub fn sysfs_instance() -> &'static SysFS {
+    unsafe {
+        return &SYSFS_INSTANCE.as_ref().unwrap();
+    }
+}
 
 /// @brief 获取全局的sys/devices节点
 #[inline(always)]
@@ -76,12 +91,12 @@ pub fn SYS_FS_INODE() -> Arc<dyn IndexNode> {
 
 /// @brief dev文件系统
 #[derive(Debug)]
-pub struct SysFS {
+pub struct OldSysFS {
     // 文件系统根节点
     root_inode: Arc<LockedSysFSInode>,
 }
 
-impl FileSystem for SysFS {
+impl FileSystem for OldSysFS {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
@@ -98,7 +113,7 @@ impl FileSystem for SysFS {
     }
 }
 
-impl SysFS {
+impl OldSysFS {
     pub fn new() -> Arc<Self> {
         // 初始化root inode
         let root: Arc<LockedSysFSInode> = Arc::new(LockedSysFSInode(SpinLock::new(
@@ -107,7 +122,7 @@ impl SysFS {
             SysFSInode::new(FileType::Dir, ModeType::from_bits_truncate(0o755), 0),
         )));
 
-        let sysfs: Arc<SysFS> = Arc::new(SysFS { root_inode: root });
+        let sysfs: Arc<OldSysFS> = Arc::new(OldSysFS { root_inode: root });
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<SysFSInode> = sysfs.root_inode.0.lock();
@@ -437,7 +452,7 @@ pub struct SysFSInode {
     /// 子Inode的B树
     children: BTreeMap<String, Arc<dyn IndexNode>>,
     /// 指向inode所在的文件系统对象的指针
-    fs: Weak<SysFS>,
+    fs: Weak<OldSysFS>,
     /// INode 元数据
     metadata: Metadata,
 }
@@ -483,25 +498,28 @@ pub fn sysfs_init() -> Result<(), SystemError> {
     let mut result = None;
     INIT.call_once(|| {
         kinfo!("Initializing SysFS...");
+
         // 创建 sysfs 实例
-        let sysfs: Arc<SysFS> = SysFS::new();
+        // let sysfs: Arc<OldSysFS> = OldSysFS::new();
+        let sysfs = SysFS::new();
+        unsafe { SYSFS_INSTANCE = Some(sysfs) };
 
         // sysfs 挂载
         let _t = ROOT_INODE()
             .find("sys")
             .expect("Cannot find /sys")
-            .mount(sysfs)
+            .mount(sysfs_instance().fs().clone())
             .expect("Failed to mount sysfs");
         kinfo!("SysFS mounted.");
 
-        // 初始化platform总线
-        platform_bus_init().expect("platform bus init failed");
+        // // 初始化platform总线
+        // platform_bus_init().expect("platform bus init failed");
 
-        sys_bus_init(&SYS_BUS_INODE()).unwrap_or_else(|err| {
-            panic!("sys_bus_init failed: {:?}", err);
-        });
+        // sys_bus_init(&SYS_BUS_INODE()).unwrap_or_else(|err| {
+        //     panic!("sys_bus_init failed: {:?}", err);
+        // });
 
-        kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
+        // kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
         result = Some(Ok(()));
     });
 
@@ -518,13 +536,92 @@ pub enum SysFSKernPrivateData {
 
 /// sysfs文件目录的属性组
 pub trait AttributeGroup: Debug + Send + Sync {
-    fn name(&self) -> &str;
+    /// 属性组的名称
+    ///
+    /// 如果属性组的名称为None，则所有的属性都会被添加到父目录下，而不是创建一个新的目录
+    fn name(&self) -> Option<&str>;
+    /// 属性组的属性列表
     fn attrs(&self) -> &[&'static dyn Attribute];
-    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> bool;
+
+    /// 属性在当前属性组内的权限（该方法可选）
+    ///
+    /// 如果返回None，则使用Attribute的mode()方法返回的权限
+    ///
+    /// 如果返回Some，则使用返回的权限。
+    /// 如果要标识属性不可见，则返回Some(ModeType::empty())
+    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> Option<ModeType>;
 }
 
 /// sysfs文件的属性
 pub trait Attribute: Debug + Send + Sync {
     fn name(&self) -> &str;
     fn mode(&self) -> ModeType;
+    
+    fn support(&self) -> SysFSOpsSupport;
+    
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+}
+
+pub trait SysFSOps {
+    /// 获取当前文件的支持的操作
+    fn support(&self, attr:&dyn Attribute) -> SysFSOpsSupport;
+
+    fn show(
+        &self,
+        kobj: Arc<dyn KObject>,
+        attr: &dyn Attribute,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError>;
+
+    fn store(
+        &self,
+        kobj: Arc<dyn KObject>,
+        attr: &dyn Attribute,
+        buf: &[u8],
+    ) -> Result<usize, SystemError>;
+}
+
+bitflags! {
+    pub struct SysFSOpsSupport: u8{
+        const SHOW = 1 << 0;
+        const STORE = 1 << 1;
+    }
+}
+
+#[derive(Debug)]
+pub struct SysFS {
+    root_inode: Arc<KernFSInode>,
+    kernfs: Arc<KernFS>,
+}
+
+impl SysFS {
+    pub fn new() -> Self {
+        let kernfs: Arc<KernFS> = KernFS::new();
+
+        let root_inode: Arc<KernFSInode> = kernfs.root_inode().downcast_arc().unwrap();
+
+        let sysfs = SysFS { root_inode, kernfs };
+
+        return sysfs;
+    }
+
+    pub fn root_inode(&self) -> &Arc<KernFSInode> {
+        return &self.root_inode;
+    }
+
+    pub fn fs(&self) -> &Arc<KernFS> {
+        return &self.kernfs;
+    }
+
+    /// 警告：重复的sysfs entry
+    pub(self) fn warn_duplicate(&self, parent: &Arc<KernFSInode>, name: &str) {
+        let path = self.kernfs_path(parent);
+        kwarn!("duplicate sysfs entry: {path}/{name}");
+    }
 }

@@ -1,6 +1,9 @@
 use core::ops::{Deref, DerefMut};
 
-use super::device::{mkdev, DeviceNumber, KObject};
+use super::{
+    device::{mkdev, DeviceNumber},
+    kobject::KObject,
+};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 

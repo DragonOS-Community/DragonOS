@@ -1,16 +1,25 @@
-use super::device::{
-    bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
-    driver::DriverError,
-    Device, DeviceError, DeviceNumber, DevicePrivateData, DeviceResource, DeviceType, IdTable,
-    KObject,
+use super::{
+    device::{
+        bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
+        driver::DriverError,
+        Device, DeviceError, DeviceNumber, DevicePrivateData, DeviceResource, DeviceType, IdTable,
+    },
+    kobject::{KObjType, KObject, KObjectState},
+    kset::KSet,
 };
 use crate::{
-    driver::Driver, filesystem::vfs::IndexNode, libs::spinlock::SpinLock, syscall::SystemError,
+    driver::Driver,
+    filesystem::{kernfs::KernFSInode, vfs::IndexNode},
+    libs::{
+        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
+    syscall::SystemError,
 };
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     string::ToString,
-    sync::Arc,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use core::fmt::Debug;
@@ -184,25 +193,8 @@ impl PlatformBusDriver {
 /// @brief: 为PlatformBusDriver实现Driver trait
 impl Driver for LockedPlatformBusDriver {
     #[inline]
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    #[inline]
     fn id_table(&self) -> IdTable {
         return IdTable::new("PlatformBusDriver".to_string(), DeviceNumber::new(0));
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
-        return self.0.lock().sys_info.clone();
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
-        self.0.lock().sys_info = sys_info;
     }
 
     fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
@@ -229,7 +221,59 @@ impl BusDriver for LockedPlatformBusDriver {
     }
 }
 
-impl KObject for LockedPlatformBusDriver {}
+impl KObject for LockedPlatformBusDriver {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        todo!()
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn name(&self) -> alloc::string::String {
+        todo!()
+    }
+
+    fn set_name(&self, name: alloc::string::String) {
+        todo!()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        todo!()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        todo!()
+    }
+}
 
 #[derive(Debug)]
 pub struct LockedPlatform(SpinLock<Platform>);
@@ -238,8 +282,8 @@ impl LockedPlatform {
     /// @brief: 创建一个加锁的platform总线实例
     /// @parameter: None
     /// @return: platform总线实例
-    pub fn new(data: DevicePrivateData) -> LockedPlatform {
-        LockedPlatform(SpinLock::new(Platform::new(data)))
+    pub fn new(data: DevicePrivateData, parent: Weak<dyn KObject>) -> LockedPlatform {
+        LockedPlatform(SpinLock::new(Platform::new(data, parent)))
     }
 
     /// @brief: 获取总线的匹配表
@@ -296,9 +340,11 @@ impl LockedPlatform {
 /// @brief: platform总线
 #[derive(Debug, Clone)]
 pub struct Platform {
-    _data: DevicePrivateData,
-    state: BusState,                      // 总线状态
-    sys_info: Option<Arc<dyn IndexNode>>, // 总线sys information
+    data: DevicePrivateData,
+    state: BusState,           // 总线状态
+    parent: Weak<dyn KObject>, // 总线的父对象
+
+    kernfs_inode: Option<Arc<KernFSInode>>,
 }
 
 /// @brief: platform方法集
@@ -306,12 +352,67 @@ impl Platform {
     /// @brief: 创建一个platform总线实例
     /// @parameter: None
     /// @return: platform总线实例
-    pub fn new(_data: DevicePrivateData) -> Self {
+    pub fn new(data: DevicePrivateData, parent: Weak<dyn KObject>) -> Self {
         Self {
-            _data,
+            data,
             state: BusState::NotInitialized,
-            sys_info: Option::None,
+            parent,
+            kernfs_inode: None,
         }
+    }
+}
+
+impl KObject for LockedPlatform {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        Some(self.0.lock().parent.clone())
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        self.0.lock().kernfs_inode.clone()
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.0.lock().kernfs_inode = inode;
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        None
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        None
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<super::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<super::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: super::kobject::KObjectState) {
+        todo!()
+    }
+
+    fn name(&self) -> alloc::string::String {
+        todo!()
+    }
+
+    fn set_name(&self, name: alloc::string::String) {
+        todo!()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        todo!()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        todo!()
     }
 }
 
@@ -328,44 +429,28 @@ impl Device for LockedPlatform {
     fn id_table(&self) -> IdTable {
         IdTable::new("platform".to_string(), DeviceNumber::new(0))
     }
-
-    #[inline]
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
-        self.0.lock().sys_info = sys_info;
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
-        return self.0.lock().sys_info.clone();
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
 }
 
 /// @brief: 为Platform实现Bus trait，platform总线是一种总线设备
 impl Bus for LockedPlatform {}
-
-impl KObject for LockedPlatform {}
 
 /// @brief: 初始化platform总线
 /// @parameter: None
 /// @return: None
 pub fn platform_bus_init() -> Result<(), SystemError> {
     let platform_driver: Arc<LockedPlatformBusDriver> = Arc::new(LockedPlatformBusDriver::new());
-    let platform_device: Arc<LockedPlatform> =
-        Arc::new(LockedPlatform::new(DevicePrivateData::new(
-            IdTable::new("platform".to_string(), DeviceNumber::new(0)),
-            None,
-            CompatibleTable::new(vec!["platform"]),
-            BusState::NotInitialized.into(),
-        )));
-    bus_register(platform_device.clone()).map_err(|e| e.into())?;
-    platform_device.set_state(BusState::Initialized);
-    //platform_device.set_driver(Some(platform_driver.clone()));
-    bus_driver_register(platform_driver.clone()).map_err(|e| e.into())?;
+    todo!();
+    // let platform_device: Arc<LockedPlatform> =
+    //     Arc::new(LockedPlatform::new(DevicePrivateData::new(
+    //         IdTable::new("platform".to_string(), DeviceNumber::new(0)),
+    //         None,
+    //         CompatibleTable::new(vec!["platform"]),
+    //         BusState::NotInitialized.into(),
+    //     )));
+    // bus_register(platform_device.clone()).map_err(|e| e.into())?;
+    // platform_device.set_state(BusState::Initialized);
+    // //platform_device.set_driver(Some(platform_driver.clone()));
+    // bus_driver_register(platform_driver.clone()).map_err(|e| e.into())?;
 
     return Ok(());
 }

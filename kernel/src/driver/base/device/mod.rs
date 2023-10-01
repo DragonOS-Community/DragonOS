@@ -16,9 +16,9 @@ use crate::{
     libs::spinlock::SpinLock,
     syscall::SystemError,
 };
-use core::{any::Any, fmt::Debug};
+use core::fmt::Debug;
 
-use super::platform::CompatibleTable;
+use super::{kobject::KObject, kset::KSet, platform::CompatibleTable};
 
 pub mod bus;
 pub mod driver;
@@ -27,6 +27,7 @@ pub mod init;
 lazy_static! {
     pub static ref DEVICE_MANAGER: Arc<LockedDeviceManager> = Arc::new(LockedDeviceManager::new());
 }
+
 lazy_static! {
     // 全局字符设备号管理实例
     pub static ref CHARDEVS: Arc<LockedDevsMap> = Arc::new(LockedDevsMap::default());
@@ -39,12 +40,42 @@ lazy_static! {
 
 }
 
-pub trait KObject: Any + Send + Sync + Debug {}
+
+/// `/sys/devices` 的 kset 实例
+static mut DEVICES_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/dev` 的 kset 实例
+static mut DEV_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/dev/block` 的 kset 实例
+static mut DEV_BLOCK_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/dev/char` 的 kset 实例
+static mut DEV_CHAR_KSET_INSTANCE: Option<Arc<KSet>> = None;
+
+#[inline(always)]
+pub(super) fn device_kset() -> Arc<KSet> {
+    unsafe { DEVICES_KSET_INSTANCE.as_ref().unwrap().clone() }
+}
+
+#[inline(always)]
+pub(super) fn dev_kset() -> Arc<KSet> {
+    unsafe { DEV_KSET_INSTANCE.as_ref().unwrap().clone() }
+}
+
+#[inline(always)]
+pub(super) fn dev_block_kset() -> Arc<KSet> {
+    unsafe { DEV_BLOCK_KSET_INSTANCE.as_ref().unwrap().clone() }
+}
+
+#[inline(always)]
+pub(self) fn dev_char_kset() -> Arc<KSet> {
+    unsafe { DEV_CHAR_KSET_INSTANCE.as_ref().unwrap().clone() }
+}
+
+
 /// @brief 设备应该实现的操作
 /// @usage Device::read_at()
 pub trait Device: KObject {
     // TODO: 待实现 open, close
-    fn as_any_ref(&self) -> &dyn core::any::Any;
+
     /// @brief: 获取设备类型
     /// @parameter: None
     /// @return: 实现该trait的设备所属类型
@@ -54,16 +85,6 @@ pub trait Device: KObject {
     /// @parameter: None
     /// @return: 该设备唯一标识
     fn id_table(&self) -> IdTable;
-
-    /// @brief: 设置sysfs info
-    /// @parameter: None
-    /// @return: 该设备唯一标识
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn IndexNode>>);
-
-    /// @brief: 获取设备的sys information
-    /// @parameter id_table: 设备标识符，用于唯一标识该设备
-    /// @return: 设备实例
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>>;
 }
 
 // 暂定是不可修改的，在初始化的时候就要确定。以后可能会包括例如硬件中断包含的信息
@@ -360,25 +381,27 @@ impl DeviceManager {
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
     DEVICE_MANAGER.add_device(device.id_table(), device.clone());
-    match sys_device_register(&device.id_table().name()) {
-        Ok(sys_info) => {
-            device.set_sys_info(Some(sys_info));
-            return Ok(());
-        }
-        Err(_) => Err(DeviceError::RegisterError),
-    }
+    // match sys_device_register(&device.id_table().name()) {
+    //     Ok(sys_info) => {
+    //         device.set_inode(Some(sys_info));
+    //         return Ok(());
+    //     }
+    //     Err(_) => Err(DeviceError::RegisterError),
+    // }
+    todo!("device_register")
 }
 
 /// @brief: 设备卸载
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_unregister<T: Device>(device: Arc<T>) -> Result<(), DeviceError> {
-    DEVICE_MANAGER.add_device(device.id_table(), device.clone());
-    match sys_device_unregister(&device.id_table().name()) {
-        Ok(_) => {
-            device.set_sys_info(None);
-            return Ok(());
-        }
-        Err(_) => Err(DeviceError::RegisterError),
-    }
+    // DEVICE_MANAGER.add_device(device.id_table(), device.clone());
+    // match sys_device_unregister(&device.id_table().name()) {
+    //     Ok(_) => {
+    //         device.set_inode(None);
+    //         return Ok(());
+    //     }
+    //     Err(_) => Err(DeviceError::RegisterError),
+    // }
+    todo!("device_unregister")
 }

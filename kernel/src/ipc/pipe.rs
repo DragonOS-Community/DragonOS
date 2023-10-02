@@ -98,7 +98,7 @@ impl IndexNode for LockedPipeInode {
         let mode: FileMode;
         if let FilePrivateData::Pipefs(pdata) = data {
             mode = pdata.mode;
-        }else {
+        } else {
             return Err(SystemError::EBADF);
         }
 
@@ -185,7 +185,7 @@ impl IndexNode for LockedPipeInode {
         if mode.contains(FileMode::O_WRONLY) {
             guard.writer += 1;
         }
-        
+
         // 设置mode
         *data = FilePrivateData::Pipefs(PipeFsPrivateData { mode: *mode });
 
@@ -204,7 +204,7 @@ impl IndexNode for LockedPipeInode {
         let mode: FileMode;
         if let FilePrivateData::Pipefs(pipe_data) = data {
             mode = pipe_data.mode;
-        }else{
+        } else {
             return Err(SystemError::EBADF);
         }
         let mut guard = self.0.lock();
@@ -247,7 +247,7 @@ impl IndexNode for LockedPipeInode {
         let mode: FileMode;
         if let FilePrivateData::Pipefs(pdata) = data {
             mode = pdata.mode;
-        }else {
+        } else {
             return Err(SystemError::EBADF);
         }
 

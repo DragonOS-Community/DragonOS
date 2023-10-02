@@ -8,10 +8,11 @@ use crate::{
         tty::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
+    ipc::pipe::PipeFsPrivateData,
     kerror,
     libs::spinlock::SpinLock,
     process::ProcessManager,
-    syscall::SystemError, ipc::pipe::PipeFsPrivateData,
+    syscall::SystemError,
 };
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata};

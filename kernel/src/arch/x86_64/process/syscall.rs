@@ -7,12 +7,13 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
+    filesystem::vfs::file::{FileDescriptorVec, FileMode},
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
         ProcessManager,
     },
-    syscall::{Syscall, SystemError}, filesystem::vfs::file::{FileDescriptorVec, FileMode},
+    syscall::{Syscall, SystemError},
 };
 
 impl Syscall {
@@ -126,7 +127,7 @@ impl Syscall {
         for fd in close_fds {
             fd_table.drop_fd(fd as i32)?;
         }
-        
+
         return Ok(());
     }
 }

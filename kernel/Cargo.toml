@@ -5,8 +5,12 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+
 [lib]
 crate-type = ["staticlib"]
+
+[workspace]
+members = [ "src/libs/intertrait" ]
 
 # 运行时依赖项
 [dependencies]
@@ -29,6 +33,7 @@ atomic_enum = "0.2.0"
 raw-cpuid = "11.0.1"
 acpi = "5.0.0"
 intertrait = { path = "src/libs/intertrait" }
+linkme = "0.2"
 
 # 构建时依赖项
 [build-dependencies]

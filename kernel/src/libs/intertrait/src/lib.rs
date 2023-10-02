@@ -56,11 +56,16 @@
 //! [`cast`]: ./cast/index.html
 //! [`Any`]: https://doc.rust-lang.org/std/any/trait.Any.html
 //! [`Arc`]: https://doc.rust-lang.org/std/sync/struct.Arc.html
-#![no_std]
+
+#![cfg_attr(target_os = "none", no_std)]
+
 extern crate alloc;
 extern crate core;
 
-use core::any::{Any, TypeId};
+use core::{
+    any::{Any, TypeId},
+    marker::{Send, Sync},
+};
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -95,7 +100,7 @@ pub static CASTERS: [fn() -> (TypeId, BoxedCaster)] = [..];
 /// A `HashMap` mapping `TypeId` of a [`Caster<T>`] to an instance of it.
 ///
 /// [`Caster<T>`]: ./struct.Caster.html
-#[cfg(std)]
+#[cfg(not(target_os = "none"))]
 static CASTER_MAP: once_cell::sync::Lazy<HashMap<(TypeId, TypeId), BoxedCaster, BuildFastHasher>> =
     once_cell::sync::Lazy::new(|| {
         CASTERS
@@ -107,20 +112,28 @@ static CASTER_MAP: once_cell::sync::Lazy<HashMap<(TypeId, TypeId), BoxedCaster, 
             .collect()
     });
 
-#[cfg(not(std))]
+/// CasterMap
+///
+/// key.0: type_id of source
+/// key.1: type_id of target
+///
+/// value: A BoxedCaster which can cast source to target
+#[cfg(target_os = "none")]
 static mut CASTER_MAP: Option<HashMap<(TypeId, TypeId), BoxedCaster, BuildFastHasher>> = None;
 
-#[cfg(not(std))]
+#[cfg(target_os = "none")]
 pub fn caster_map() -> &'static HashMap<(TypeId, TypeId), BoxedCaster, BuildFastHasher> {
-    return unsafe { CASTER_MAP.as_ref().unwrap_or_else(|| {
-        panic!("intertrait_caster_map() must be called after CASTER_MAP is initialized")
-    }) };
+    return unsafe {
+        CASTER_MAP.as_ref().unwrap_or_else(|| {
+            panic!("intertrait_caster_map() must be called after CASTER_MAP is initialized")
+        })
+    };
 }
 
 /// Initializes the global [`CASTER_MAP`] with [`CASTERS`].
 ///
 /// no_std环境下，需要手动调用此函数初始化CASTER_MAP
-#[cfg(not(std))]
+#[cfg(target_os = "none")]
 pub fn init_caster_map() {
     use core::sync::atomic::AtomicBool;
 
@@ -214,15 +227,21 @@ impl<T: ?Sized + 'static> Caster<T> {
 }
 
 /// Returns a `Caster<S, T>` from a concrete type `S` to a trait `T` implemented by it.
+///
+/// ## 参数
+///
+/// - type_id: 源类型的type_id
+///
+/// T: 目标trait
 fn caster<T: ?Sized + 'static>(type_id: TypeId) -> Option<&'static Caster<T>> {
-    #[cfg(std)]
+    #[cfg(not(target_os = "none"))]
     {
         CASTER_MAP
             .get(&(type_id, TypeId::of::<Caster<T>>()))
             .and_then(|caster| caster.downcast_ref::<Caster<T>>())
     }
 
-    #[cfg(not(std))]
+    #[cfg(target_os = "none")]
     {
         caster_map()
             .get(&(type_id, TypeId::of::<Caster<T>>()))

@@ -12,17 +12,16 @@ categories = ["rust-patterns"]
 keywords = ["trait", "cast", "any"]
 include = ["src/**/*", "Cargo.toml", "LICENSE-*", "README.md"]
 
+
 [dependencies]
 linkme = "0.2"
 hashbrown = "0.13.2"
 intertrait-macros = { version = "=0.2.2", path = "macros" }
 
-[target.'cfg(std)'.dependencies]
+[target.'cfg(not(target_os = "none"))'.dependencies]
 once_cell = "1.4"
 
 [dev-dependencies]
 trybuild = "1.0"
 doc-comment = "0.3"
 
-[workspace]
-members = ["macros"]

@@ -38,6 +38,7 @@ extern void rs_softirq_init();
 extern void rs_mm_init();
 extern int rs_video_init();
 extern void rs_kthread_init();
+extern void rs_init_intertrait();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -101,6 +102,7 @@ void system_initialize()
     scm_reinit();
     rs_textui_init();
 
+    rs_init_intertrait();
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
 

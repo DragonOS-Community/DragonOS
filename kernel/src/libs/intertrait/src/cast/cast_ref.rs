@@ -64,17 +64,18 @@ pub trait CastRef {
 impl<S: ?Sized + CastFrom> CastRef for S {
     fn cast<T: ?Sized + 'static>(&self) -> Option<&T> {
         let any = self.ref_any();
+        // 获取从 self 到 T 的转换器，如果不存在则返回 None
         let caster = caster::<T>(any.type_id())?;
         (caster.cast_ref)(any).into()
     }
 
-    #[cfg(std)]
+    #[cfg(not(target_os = "none"))]
     fn impls<T: ?Sized + 'static>(&self) -> bool {
         use crate::CASTER_MAP;
         CASTER_MAP.contains_key(&(self.type_id(), TypeId::of::<Caster<T>>()))
     }
 
-    #[cfg(not(std))]
+    #[cfg(target_os = "none")]
     fn impls<T: ?Sized + 'static>(&self) -> bool {
         use crate::caster_map;
 

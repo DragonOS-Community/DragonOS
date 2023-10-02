@@ -1,5 +1,3 @@
-
-
 use hashbrown::HashSet;
 use syn::bracketed;
 use syn::parse::{Parse, ParseStream, Result};

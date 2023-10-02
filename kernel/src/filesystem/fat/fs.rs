@@ -1670,19 +1670,6 @@ impl IndexNode for LockedFATInode {
         }
     }
 
-    fn mknod(&self, filename: &str, mode: ModeType) -> Result<(), SystemError> {
-        // TODO: 目前先用一个FILE类型的inode套壳
-        let inode = self.create(filename, FileType::File, mode)?;
-
-        if mode.contains(ModeType::S_IFIFO) {
-            inode.set_special_nod(LockedPipeInode::new())?;
-        } else {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-
-        return Ok(());
-    }
-
     fn special_nod(&self) -> Option<Arc<dyn IndexNode>> {
         self.0.lock().special_nod.clone()
     }

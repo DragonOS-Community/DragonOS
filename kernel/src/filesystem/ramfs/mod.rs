@@ -52,6 +52,8 @@ pub struct RamFSInode {
     metadata: Metadata,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<RamFS>,
+    /// 特殊文件节点
+    special_nod: Option<Arc<dyn IndexNode>>,
 }
 
 impl FileSystem for RamFS {
@@ -98,6 +100,7 @@ impl RamFS {
                 raw_dev: 0,
             },
             fs: Weak::default(),
+            special_nod: None,
         })));
 
         let result: Arc<RamFS> = Arc::new(RamFS { root_inode: root });
@@ -296,6 +299,7 @@ impl IndexNode for LockedRamFSInode {
                 raw_dev: data,
             },
             fs: inode.fs.clone(),
+            special_nod: None,
         })));
 
         // 初始化inode的自引用的weak指针
@@ -475,5 +479,14 @@ impl IndexNode for LockedRamFSInode {
         keys.append(&mut self.0.lock().children.keys().cloned().collect());
 
         return Ok(keys);
+    }
+
+    fn special_nod(&self) -> Option<Arc<dyn IndexNode>> {
+        return self.0.lock().special_nod.clone();
+    }
+
+    fn set_special_nod(&self, nod: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        self.0.lock().special_nod = Some(nod);
+        return Ok(());
     }
 }

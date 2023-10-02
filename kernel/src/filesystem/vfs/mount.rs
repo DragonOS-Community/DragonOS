@@ -348,6 +348,21 @@ impl IndexNode for MountFSInode {
             .insert(metadata.inode_id, new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
+
+    #[inline]
+    fn mknod(&self, filename: &str, mode: ModeType) -> Result<(), SystemError> {
+        self.inner_inode.mknod(filename, mode)
+    }
+
+    #[inline]
+    fn special_nod(&self) -> Option<Arc<dyn IndexNode>> {
+        self.inner_inode.special_nod()
+    }
+
+    #[inline]
+    fn set_special_nod(&self, nod: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        self.inner_inode.set_special_nod(nod)
+    }
 }
 
 impl FileSystem for MountFS {

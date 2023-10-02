@@ -115,6 +115,11 @@ impl File {
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
     pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, SystemError> {
+        let mut inode = inode;
+        if inode.special_nod().is_some() {
+            inode = inode.special_nod().unwrap();
+        }
+
         let file_type: FileType = inode.metadata()?.file_type;
         let mut f = File {
             inode,

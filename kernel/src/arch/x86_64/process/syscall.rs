@@ -12,7 +12,7 @@ use crate::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
         ProcessManager,
     },
-    syscall::{Syscall, SystemError},
+    syscall::{Syscall, SystemError}, filesystem::vfs::file::{FileDescriptorVec, FileMode},
 };
 
 impl Syscall {
@@ -111,6 +111,22 @@ impl Syscall {
         //     "tmp_rs_execve: done, load_result.entry_point()={:?}",
         //     load_result.entry_point()
         // );
+
+        // 关闭设置了O_CLOEXEC的文件描述符
+        let binding = pcb.fd_table();
+        let mut fdt = binding.write();
+        let mut v = Vec::new();
+        for fd in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            if let Some(file) = fdt.get_file_by_fd(fd as i32) {
+                if file.lock().mode().contains(FileMode::O_CLOEXEC) {
+                    v.push(fd);
+                }
+            }
+        }
+        for fd in v{
+            fdt.drop_fd(fd as i32)?;
+        }
+        
         return Ok(());
     }
 }

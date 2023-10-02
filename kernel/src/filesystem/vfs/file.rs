@@ -11,7 +11,7 @@ use crate::{
     kerror,
     libs::spinlock::SpinLock,
     process::ProcessManager,
-    syscall::SystemError,
+    syscall::SystemError, ipc::pipe::PipeFsPrivateData,
 };
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata};
@@ -19,6 +19,8 @@ use super::{Dirent, FileType, IndexNode, InodeId, Metadata};
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 pub enum FilePrivateData {
+    /// 管道文件私有信息
+    Pipefs(PipeFsPrivateData),
     /// procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
     /// 设备文件的私有信息

@@ -181,5 +181,5 @@
     "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.linkedProjects": [
         "./kernel/Cargo.toml"
-    ]
+    ],
 }

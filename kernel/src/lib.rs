@@ -1,4 +1,3 @@
-#![no_std] // <1>
 #![no_main] // <1>
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
@@ -15,6 +14,11 @@
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
+#![cfg_attr(target_os = "none", no_std)]
+
+#[cfg(test)]
+#[macro_use]
+extern crate std;
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
@@ -31,6 +35,7 @@ mod include;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
 mod filesystem;
+mod init;
 mod ipc;
 mod mm;
 mod net;
@@ -53,6 +58,8 @@ extern crate num;
 extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
+#[macro_use]
+extern crate intertrait;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
@@ -65,6 +72,7 @@ use crate::process::ProcessManager;
 pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 /// 全局的panic处理函数
+#[cfg(target_os = "none")]
 #[panic_handler]
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {

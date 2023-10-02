@@ -2,7 +2,7 @@
 name = "intertrait"
 version = "0.2.2"
 authors = ["CodeChain Team <hi@codechain.io>"]
-license = "MIT OR Apache-2.0"
+license = "GPLv2(for code modified by dragonos) MIT OR Apache-2.0"
 description = "Allow for inter-trait casting"
 edition = "2018"
 repository = "https://github.com/CodeChain-io/intertrait"

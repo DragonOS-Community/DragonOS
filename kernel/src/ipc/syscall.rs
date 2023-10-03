@@ -1,12 +1,15 @@
 use core::ffi::c_int;
 
 use crate::{
-    filesystem::vfs::file::{File, FileMode},
+    filesystem::vfs::{
+        file::{File, FileMode},
+        FilePrivateData,
+    },
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
 
-use super::pipe::LockedPipeInode;
+use super::pipe::{LockedPipeInode, PipeFsPrivateData};
 
 impl Syscall {
     /// # 创建带参数的匿名管道
@@ -23,9 +26,13 @@ impl Syscall {
             let mut user_buffer =
                 UserBufferWriter::new(fd, core::mem::size_of::<[c_int; 2]>(), true)?;
             let fd = user_buffer.buffer::<i32>(0)?;
-            let pipe_ptr = LockedPipeInode::new(flags);
+            let pipe_ptr = LockedPipeInode::new();
             let mut read_file = File::new(pipe_ptr.clone(), FileMode::O_RDONLY)?;
+            read_file.private_data =
+                FilePrivateData::Pipefs(PipeFsPrivateData::new(FileMode::O_RDONLY));
             let mut write_file = File::new(pipe_ptr.clone(), FileMode::O_WRONLY)?;
+            write_file.private_data =
+                FilePrivateData::Pipefs(PipeFsPrivateData::new(FileMode::O_WRONLY));
             if flags.contains(FileMode::O_CLOEXEC) {
                 read_file.set_close_on_exec(true);
                 write_file.set_close_on_exec(true);

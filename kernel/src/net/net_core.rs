@@ -162,7 +162,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
 
-/// 对ifaces进行轮询。
+/// 对ifaces进行轮询，最多对SOCKET_SET尝试一次加锁。
 ///
 /// @return 轮询成功，返回Ok(())
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK

@@ -1335,7 +1335,7 @@ impl Display for PciStandardDeviceBar {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "\r\nBar0:{}\r\n Bar1:{}\r\n Bar2:{}\r\n Bar3:{}\r\nBar4:{}\r\nBar5:{}",
+            "\r\nBar0:{}\r\nBar1:{}\r\nBar2:{}\r\nBar3:{}\r\nBar4:{}\r\nBar5:{}",
             self.bar0, self.bar1, self.bar2, self.bar3, self.bar4, self.bar5
         )
     }
@@ -1411,7 +1411,7 @@ pub fn pci_bar_init(
                     .create_mmio(size_want)
                     .map_err(|_| PciError::CreateMmioError)?;
                 space_guard = Arc::new(tmp);
-                kdebug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
+                //kdebug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
                 assert!(
                     space_guard.map_phys(paddr, size_want).is_ok(),
                     "pci_bar_init: map_phys failed"
@@ -1447,7 +1447,7 @@ pub fn pci_bar_init(
             _ => {}
         }
     }
-    kdebug!("pci_device_bar:{}", device_bar);
+    //kdebug!("pci_device_bar:{}", device_bar);
     return Ok(device_bar);
 }
 

@@ -61,7 +61,13 @@ impl Syscall {
             .basic_mut()
             .set_name(ProcessControlBlock::generate_name(&path, &argv));
 
-        return Self::do_execve(path, argv, envp, frame);
+        Self::do_execve(path, argv, envp, frame)?;
+
+        // 关闭设置了O_CLOEXEC的文件描述符
+        let fd_table = ProcessManager::current_pcb().fd_table();
+        fd_table.write().close_on_exec();
+
+        return Ok(());
     }
 
     pub fn wait4(

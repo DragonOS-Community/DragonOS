@@ -162,9 +162,8 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
 
-/// 对指定iface只尝试进行进行一次poll，使用传入的网卡驱动的名字作为关键词
+/// 对ifaces进行轮询，最多对SOCKET_SET尝试一次加锁。
 ///
-/// @input net_driver_name_key 驱动名字中的关键字
 /// @return 轮询成功，返回Ok(())
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
 /// @return 没有网卡，返回SystemError::ENODEV

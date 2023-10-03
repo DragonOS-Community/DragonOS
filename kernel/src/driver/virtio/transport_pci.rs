@@ -100,7 +100,7 @@ pub struct PciTransport {
 
 unsafe extern "C" fn virtio_irq_hander(_irq_num: u64, _irq_paramer: u64, _regs: *mut pt_regs) {
     // kdebug!("12345");
-    poll_ifaces_try_lock_onetime("virtio").ok();
+    poll_ifaces_try_lock_onetime().ok();
 }
 
 impl PciTransport {

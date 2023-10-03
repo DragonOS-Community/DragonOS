@@ -11,6 +11,7 @@ pub mod lib_ui;
 pub mod mutex;
 pub mod notifier;
 pub mod once;
+#[macro_use]
 pub mod printk;
 pub mod rbtree;
 #[macro_use]

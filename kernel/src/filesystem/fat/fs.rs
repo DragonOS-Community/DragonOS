@@ -16,7 +16,6 @@ use crate::{
         syscall::ModeType,
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
-    ipc::pipe::LockedPipeInode,
     kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},

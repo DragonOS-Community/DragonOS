@@ -12,7 +12,7 @@ use crate::arch::{PciArch, TraitPciArch};
 use crate::include::bindings::bindings::{
     c_irq_install, c_irq_uninstall, pt_regs, ul, EAGAIN, EINVAL,
 };
-use crate::kdebug;
+
 use crate::libs::volatile::{volread, volwrite, Volatile, VolatileReadable, VolatileWritable};
 
 /// MSIX表的一项
@@ -23,11 +23,13 @@ struct MsixEntry {
     msg_data: Volatile<u32>,
     vector_control: Volatile<u32>,
 }
+
 /// Pending表的一项
 #[repr(C)]
 struct PendingEntry {
     entry: Volatile<u64>,
 }
+
 /// PCI设备中断错误
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PciIrqError {
@@ -44,6 +46,7 @@ pub enum PciIrqError {
     MaskNotSupported,
     IrqNotInited,
 }
+
 /// PCI设备的中断类型
 #[derive(Copy, Clone, Debug)]
 pub enum IrqType {
@@ -64,21 +67,42 @@ pub enum IrqType {
     Legacy,
     Unused,
 }
+
 // PCI设备install中断时需要传递的参数
 #[derive(Clone, Debug)]
 pub struct IrqMsg {
     pub irq_common_message: IrqCommonMsg,
     pub irq_specific_message: IrqSpecificMsg,
 }
+
 // PCI设备install中断时需要传递的共同参数
 #[derive(Clone, Debug)]
 pub struct IrqCommonMsg {
-    pub irq_index: u16,     //要install的中断号在PCI设备中的irq_vector的index
-    pub irq_name: CString,  //中断名字
-    pub irq_parameter: u16, //中断额外参数，可传入中断处理函数
-    pub irq_hander: unsafe extern "C" fn(irq_num: ul, parameter: ul, regs: *mut pt_regs), // 中断处理函数
-    pub irq_ack: Option<unsafe extern "C" fn(irq_num: ul)>, // 中断的ack，可为None,若为None则中断处理中会正常通知中断结束，不为None则调用传入的函数进行回复
+    irq_index: u16,     //要install的中断号在PCI设备中的irq_vector的index
+    irq_name: CString,  //中断名字
+    irq_parameter: u16, //中断额外参数，可传入中断处理函数
+    irq_hander: unsafe extern "C" fn(irq_num: ul, parameter: ul, regs: *mut pt_regs), // 中断处理函数
+    irq_ack: Option<unsafe extern "C" fn(irq_num: ul)>, // 中断的ack，可为None,若为None则中断处理中会正常通知中断结束，不为None则调用传入的函数进行回复
 }
+
+impl IrqCommonMsg {
+    pub fn init_from(
+        irq_index: u16,
+        irq_name: &str,
+        irq_parameter: u16,
+        irq_hander: unsafe extern "C" fn(irq_num: ul, parameter: ul, regs: *mut pt_regs),
+        irq_ack: Option<unsafe extern "C" fn(irq_num: ul)>,
+    ) -> Self {
+        IrqCommonMsg {
+            irq_index,
+            irq_name: CString::new(irq_name).expect("CString::new failed"),
+            irq_parameter,
+            irq_hander,
+            irq_ack,
+        }
+    }
+}
+
 // PCI设备install中断时需要传递的特有参数，Msi代表MSI与MSIX
 #[derive(Clone, Debug)]
 pub enum IrqSpecificMsg {
@@ -96,6 +120,7 @@ impl IrqSpecificMsg {
         }
     }
 }
+
 // 申请中断的触发模式，MSI默认为边沿触发
 #[derive(Copy, Clone, Debug)]
 pub enum TriggerMode {
@@ -103,6 +128,7 @@ pub enum TriggerMode {
     AssertHigh,
     AssertLow,
 }
+
 bitflags! {
     /// 设备中断类型，使用bitflag使得中断类型的选择更多元化
     pub struct IRQ: u8{
@@ -112,6 +138,7 @@ bitflags! {
         const PCI_IRQ_ALL_TYPES=IRQ::PCI_IRQ_LEGACY.bits|IRQ::PCI_IRQ_MSI.bits|IRQ::PCI_IRQ_MSIX.bits;
     }
 }
+
 /// PciDeviceStructure的子trait，使用继承以直接使用PciDeviceStructure里的接口
 pub trait PciInterrupt: PciDeviceStructure {
     /// @brief PCI设备调用该函数选择中断类型
@@ -510,7 +537,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                         + msix_table_offset as usize
                         + msg.irq_common_message.irq_index as usize * size_of::<MsixEntry>();
                     let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
-                    kdebug!("msg_data: {:?}, msix_addr: {:?}", msg_data, msg_address);
+                    // 这里的操作并不适用于所有架构，需要再优化，msg_upper_data并不一定为0
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
                         volwrite!(msix_entry, msg_data, msg_data);

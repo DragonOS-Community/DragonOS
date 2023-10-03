@@ -521,4 +521,54 @@ impl FileDescriptorVec {
         assert!(Arc::strong_count(&file) == 1);
         return Ok(());
     }
+
+    pub fn iter(&self) -> FileDescriptorIterator {
+        return FileDescriptorIterator::new(self);
+    }
+
+    pub fn close_on_exec(&mut self) {
+        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            if let Some(file) = &self.fds[i] {
+                let to_drop = file.lock().close_on_exec();
+                if to_drop {
+                    let r = self.drop_fd(i as i32);
+                    if let Err(r) = r {
+                        kerror!(
+                            "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
+                            ProcessManager::current_pcb().pid(),
+                            i,
+                            r
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FileDescriptorIterator<'a> {
+    fds: &'a FileDescriptorVec,
+    index: usize,
+}
+
+impl<'a> FileDescriptorIterator<'a> {
+    pub fn new(fds: &'a FileDescriptorVec) -> Self {
+        return Self { fds, index: 0 };
+    }
+}
+
+impl<'a> Iterator for FileDescriptorIterator<'a> {
+    type Item = (i32, Arc<SpinLock<File>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < FileDescriptorVec::PROCESS_MAX_FD {
+            let fd = self.index as i32;
+            self.index += 1;
+            if let Some(file) = self.fds.get_file_by_fd(fd) {
+                return Some((fd, file));
+            }
+        }
+        return None;
+    }
 }

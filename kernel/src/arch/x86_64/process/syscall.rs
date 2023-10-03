@@ -113,21 +113,6 @@ impl Syscall {
         //     load_result.entry_point()
         // );
 
-        // 关闭设置了O_CLOEXEC的文件描述符
-        let fd_table = pcb.fd_table();
-        let mut fd_table = fd_table.write();
-        let mut close_fds = Vec::new();
-        for fd in 0..FileDescriptorVec::PROCESS_MAX_FD {
-            if let Some(file) = fd_table.get_file_by_fd(fd as i32) {
-                if file.lock().mode().contains(FileMode::O_CLOEXEC) {
-                    close_fds.push(fd);
-                }
-            }
-        }
-        for fd in close_fds {
-            fd_table.drop_fd(fd as i32)?;
-        }
-
         return Ok(());
     }
 }

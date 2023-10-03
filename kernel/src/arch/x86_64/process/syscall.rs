@@ -7,7 +7,6 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    filesystem::vfs::file::{FileDescriptorVec, FileMode},
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},

@@ -8,6 +8,7 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, _NSIG},
     },
     include::bindings::bindings::siginfo,
+    kdebug,
     libs::ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref},
     process::{Pid, ProcessControlBlock},
     syscall::{user_access::UserBufferWriter, SystemError},
@@ -326,8 +327,6 @@ impl SigInfo {
     }
 }
 
-/// 在获取SigHandStruct的外部就获取到了锁，所以这里是不会有任何竞争的，只是处于内部可变性的需求
-/// 才使用了SpinLock，这里并不会带来太多的性能开销
 #[derive(Debug)]
 pub struct SigHandStruct(pub [Sigaction; MAX_SIG_NUM as usize]);
 
@@ -378,7 +377,7 @@ impl SigPending {
 
         let s = self.signal();
         let m = *sig_mask;
-
+        m.is_empty();
         // 获取第一个待处理的信号的号码
         let x = s & (!m);
         if x.bits() != 0 {

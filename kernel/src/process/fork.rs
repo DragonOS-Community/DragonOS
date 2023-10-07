@@ -1,8 +1,18 @@
+use core::sync::atomic::compiler_fence;
+
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid, libs::rwlock::RwLock,
-    process::ProcessFlags, syscall::SystemError,
+    arch::interrupt::TrapFrame,
+    filesystem::procfs::procfs_register_pid,
+    ipc::{
+        signal::flush_signal_handlers,
+        signal_types::{SigHandStruct, Sigaction},
+    },
+    kdebug, kerror,
+    libs::rwlock::RwLock,
+    process::ProcessFlags,
+    syscall::SystemError,
 };
 
 use super::{
@@ -83,6 +93,13 @@ impl ProcessManager {
         ProcessManager::copy_files(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
+        ProcessManager::copy_sighand(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy sighands from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
             )
         });
@@ -194,11 +211,77 @@ impl ProcessManager {
 
     #[allow(dead_code)]
     fn copy_sighand(
-        _clone_flags: &CloneFlags,
-        _current_pcb: &Arc<ProcessControlBlock>,
-        _new_pcb: &Arc<ProcessControlBlock>,
+        clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // todo: 由于信号原来写的太烂，移植到新的进程管理的话，需要改动很多。因此决定重写。这里先空着
+        kdebug!("process_copy_sighand");
+
+        // 因为在信号处理里面，我们没有使用内部可变的锁来保护 Arc 的只读特性，而是通过裸指针绕过了这个规则
+        // 所以不能跨进程直接复制 Arc 指针，只能重新创建一个实例
+        let sig_hand_struct: Arc<SigHandStruct> = Arc::new(SigHandStruct::default());
+
+        new_pcb.sig_struct().handler = sig_hand_struct;
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
+        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+            flush_signal_handlers(new_pcb.clone(), false);
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
+            let new_sig_hand_struct: &mut SigHandStruct;
+            let sig_hand_struct_ptr =
+                Arc::as_ptr(&new_pcb.sig_struct_irq().handler) as *mut SigHandStruct;
+            unsafe {
+                let r = sig_hand_struct_ptr.as_mut();
+                if r.is_none() {
+                    kerror!(
+                        "error to copy sig action since the convertion from raw pointer failed"
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+                new_sig_hand_struct = r.unwrap();
+            }
+            let current_sig_hand_struct = current_pcb.sig_struct();
+            for (index, action) in new_sig_hand_struct.0.iter_mut().enumerate() {
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                (*action) = current_sig_hand_struct.handler.0[index].clone();
+                compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        // // kdebug!("DEFAULT_SIGACTION.sa_flags={}", DEFAULT_SIGACTION.sa_flags);
+
+        // // 拷贝sigaction
+        // let mut flags: usize = 0;
+
+        // spin_lock_irqsave(unsafe { &mut (*current_pcb().sighand).siglock }, &mut flags);
+        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        // for (index, x) in unsafe { (*current_pcb().sighand).action }
+        //     .iter()
+        //     .enumerate()
+        // {
+        //     compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        //     if !(x as *const crate::include::bindings::bindings::sigaction).is_null() {
+        //         sig.action[index] =
+        //             *sigaction::convert_ref(x as *const crate::include::bindings::bindings::sigaction)
+        //                 .unwrap();
+        //     } else {
+        //         sig.action[index] = DEFAULT_SIGACTION;
+        //     }
+        // }
+        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        // spin_unlock_irqrestore(unsafe { &mut (*current_pcb().sighand).siglock }, flags);
+        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        // return 0;
         return Ok(());
     }
 }

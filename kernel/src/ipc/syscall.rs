@@ -114,19 +114,21 @@ impl Syscall {
             let input_sighandler = unsafe { (*act).handler as u64 };
             // kdebug!("_input_sah={}", _input_sah);
             match input_sighandler {
-                USER_SIG_DFL | USER_SIG_IGN => {
-                    if input_sighandler == USER_SIG_DFL {
-                        new_ka = *DEFAULT_SIGACTION;
-                        *new_ka.flags_mut() = (unsafe { (*act).flags }
-                            & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
-                            | SigFlags::SA_FLAG_DFL;
-                    } else {
-                        new_ka = *DEFAULT_SIGACTION_IGNORE;
-                        *new_ka.flags_mut() = (unsafe { (*act).flags }
-                            & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
-                            | SigFlags::SA_FLAG_IGN;
-                    }
+                USER_SIG_DFL => {
+                    new_ka = *DEFAULT_SIGACTION;
+                    *new_ka.flags_mut() = (unsafe { (*act).flags }
+                        & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
+                        | SigFlags::SA_FLAG_DFL;
 
+                    let sar = unsafe { (*act).handler };
+                    new_ka.set_restorer(Some(sar as u64));
+                }
+
+                USER_SIG_IGN => {
+                    new_ka = *DEFAULT_SIGACTION_IGNORE;
+                    *new_ka.flags_mut() = (unsafe { (*act).flags }
+                        & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
+                        | SigFlags::SA_FLAG_IGN;
                     let sar = unsafe { (*act).handler };
                     new_ka.set_restorer(Some(sar as u64));
                 }

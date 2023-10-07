@@ -30,7 +30,7 @@ lazy_static! {
 /// 默认的“忽略信号”的sigaction
 #[allow(dead_code)]
 pub static ref DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction::new(
-    SigactionType::SaHandler(SaHandlerType::SigDefault),
+    SigactionType::SaHandler(SaHandlerType::SigIgnore),
      SigFlags::SA_FLAG_IGN,
     SigSet::from_bits(0).unwrap(),
      None,
@@ -170,8 +170,7 @@ impl Signal {
                 }
             };
 
-            ProcessManager::current_pcb()
-                .sig_info_mut()
+            pcb.sig_info_mut()
                 .sig_pending_mut()
                 .queue_mut()
                 .q
@@ -361,7 +360,7 @@ pub fn get_signal_to_deliver(
 ) -> (Signal, Option<SigInfo>, Option<&'static mut Sigaction>) {
     let mut info: Option<SigInfo>;
     let ka: Option<&mut Sigaction>;
-    let mut sig_number;
+    let mut sig_number: Signal;
     let pcb = ProcessManager::current_pcb();
     let guard = pcb.sig_struct_irq();
     let reader = pcb.sig_info();
@@ -369,7 +368,6 @@ pub fn get_signal_to_deliver(
     drop(reader);
     loop {
         (sig_number, info) = pcb.sig_info_mut().dequeue_signal(&sig_block);
-
         // 如果信号非法，则直接返回
         if sig_number == Signal::INVALID {
             drop(guard);

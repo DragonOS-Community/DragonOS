@@ -51,8 +51,9 @@ int read_symbol(FILE *filp, struct kernel_symbol_entry_t *entry)
 {
     // 本函数假设nm命令输出的结果中，每行最大512字节
     char str[512] = {0};
-    char* s = fgets(str, sizeof(str), filp);
-    if (s != str) {
+    char *s = fgets(str, sizeof(str), filp);
+    if (s != str)
+    {
         return -1;
     }
 
@@ -60,14 +61,28 @@ int read_symbol(FILE *filp, struct kernel_symbol_entry_t *entry)
     int retval = sscanf(str, "%llx %c %512c", &entry->vaddr, &entry->type, symbol_name);
 
     // 如果当前行不符合要求
-    if (retval != 3) {
+    if (retval != 3)
+    {
         return -1;
     }
     // malloc一块内存，然后把str的内容拷贝进去，接着修改symbol指针
     size_t len = strlen(symbol_name);
-    if (len >= 1 && symbol_name[len - 1] == '\n') {
+    if (len >= 1 && symbol_name[len - 1] == '\n')
+    {
         symbol_name[len - 1] = '\0';
         len--;
+    }
+    // 转义双引号
+    for (int i = 0; i < len; i++)
+    {
+        if (symbol_name[i] == '"')
+        {
+            char temp[len - i];
+            memcpy(temp, symbol_name + i, len - i);
+            symbol_name[i] = '\\';
+            memcpy(symbol_name + i + 1, temp, len - i);
+            i++;
+        }
     }
     entry->symbol = strdup(symbol_name);
     entry->symbol_length = len + 1; // +1的原因是.asciz指令会在字符串末尾自动添加结束符\0
@@ -191,12 +206,11 @@ void generate_result()
 
         // 输出符号名称
         printf("\t.asciz\t\"%s\"\n", symbol_table[i].symbol);
-        
+
         last_vaddr = symbol_table[i].vaddr;
     }
 
     putchar('\n');
-    
 }
 int main(int argc, char **argv)
 {

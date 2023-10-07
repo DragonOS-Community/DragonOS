@@ -5,7 +5,10 @@ use core::{
 
 use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
-    filesystem::vfs::{file::{File, FileMode}, FilePrivateData},
+    filesystem::vfs::{
+        file::{File, FileMode},
+        FilePrivateData,
+    },
     kdebug, kerror, kwarn,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
@@ -102,7 +105,7 @@ impl Syscall {
         let mut old_act = old_act as *mut UserSigaction;
         let mut new_ka: Sigaction = Default::default();
         let mut old_ka: Sigaction = Default::default();
-
+        kdebug!("--act--:{:?}", unsafe { *act });
         // 如果传入的，新的sigaction不为空
         if !act.is_null() {
             // 如果参数的范围不在用户空间，则返回错误
@@ -112,7 +115,7 @@ impl Syscall {
             }
             let mask: SigSet = unsafe { (*act).mask };
             let input_sighandler = unsafe { (*act).handler as u64 };
-            // kdebug!("_input_sah={}", _input_sah);
+            kdebug!("_input_sah={}", input_sighandler);
             match input_sighandler {
                 USER_SIG_DFL => {
                     new_ka = *DEFAULT_SIGACTION;
@@ -120,7 +123,7 @@ impl Syscall {
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
                         | SigFlags::SA_FLAG_DFL;
 
-                    let sar = unsafe { (*act).handler };
+                    let sar = unsafe { (*act).restorer };
                     new_ka.set_restorer(Some(sar as u64));
                 }
 
@@ -129,7 +132,7 @@ impl Syscall {
                     *new_ka.flags_mut() = (unsafe { (*act).flags }
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
                         | SigFlags::SA_FLAG_IGN;
-                    let sar = unsafe { (*act).handler };
+                    let sar = unsafe { (*act).restorer };
                     new_ka.set_restorer(Some(sar as u64));
                 }
                 _ => {
@@ -147,6 +150,8 @@ impl Syscall {
                     );
                 }
             }
+
+            // TODO 如果为空，赋默认值？
             // kdebug!("new_ka={:?}", new_ka);
             // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
             if new_ka.restorer().is_some() {

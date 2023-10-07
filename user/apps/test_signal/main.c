@@ -43,7 +43,7 @@ int main()
     while (1)
     {
         // handler(SIGKILL);
-        if ((clock() - last) / CLOCKS_PER_SEC >= 5)
+        if ((clock() - last) / CLOCKS_PER_SEC >= 2)
         {
             printf("Test signal running\n");
             raise(SIGKILL);

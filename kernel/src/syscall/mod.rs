@@ -7,7 +7,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
@@ -375,7 +375,7 @@ pub const SYS_GETPGID: usize = 50;
 
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
-pub const SYS_MKFIFO: usize = 53;
+pub const SYS_MKNOD: usize = 53;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -970,7 +970,7 @@ impl Syscall {
                 res
             }
 
-            SYS_MKFIFO => {
+            SYS_MKNOD => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
                 let res = if path.is_err() {
@@ -978,9 +978,10 @@ impl Syscall {
                 } else {
                     let path: &str = path.unwrap();
                     let flags = args[1];
+                    let dev_t = args[2];
                     let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
 
-                    Self::mkfifo(path, flags | ModeType::S_IFIFO)
+                    Self::mknod(path, flags | ModeType::S_IFIFO, DeviceNumber::new(dev_t))
                 };
 
                 res

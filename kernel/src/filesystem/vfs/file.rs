@@ -15,7 +15,7 @@ use crate::{
     syscall::SystemError,
 };
 
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata};
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -116,11 +116,16 @@ impl File {
     /// @param mode 文件的打开模式
     pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, SystemError> {
         let mut inode = inode;
-        if inode.special_nod().is_some() {
-            inode = inode.special_nod().unwrap();
+        let file_type = inode.metadata()?.file_type;
+        match file_type {
+            FileType::Pipe => {
+                if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
+                    inode = pipe_inode;
+                }
+            }
+            _ => {}
         }
 
-        let file_type: FileType = inode.metadata()?.file_type;
         let mut f = File {
             inode,
             offset: 0,

@@ -5,7 +5,7 @@ use alloc::{
 };
 
 use crate::{
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
     include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
     kerror,
@@ -690,6 +690,29 @@ impl Syscall {
         unsafe {
             *usr_kstat = kstat;
         }
+        return Ok(0);
+    }
+
+    pub fn mknod(path: &str, mode: ModeType, dev_t: DeviceNumber) -> Result<usize, SystemError> {
+        // 文件名过长
+        if path.len() > PAGE_4K_SIZE as usize {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+
+        if inode.is_ok() {
+            return Err(SystemError::EEXIST);
+        }
+
+        let mut path_split: core::str::RSplitN<&str> = path.trim_matches('/').rsplitn(2, "/");
+        let filename = path_split.next().unwrap_or("");
+        let parent_path = path_split.next();
+        // 查找父目录
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+        // 创建nod
+        parent_inode.mknod(filename, mode, dev_t)?;
+
         return Ok(0);
     }
 }

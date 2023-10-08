@@ -3,7 +3,6 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::slice;
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
@@ -440,14 +439,9 @@ impl Syscall {
                 let len = args[2];
                 let from_user = frame.from_user();
                 let mut user_buffer_writer =
-                    match UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user) {
-                        Err(e) => return Err(e),
-                        Ok(writer) => writer,
-                    };
-                let user_buf = match user_buffer_writer.buffer(0) {
-                    Err(e) => return Err(e),
-                    Ok(writer) => writer,
-                };
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
+
+                let user_buf = user_buffer_writer.buffer(0)?;
                 let res = Self::read(fd, user_buf);
                 res
             }
@@ -457,14 +451,9 @@ impl Syscall {
                 let len = args[2];
                 let from_user = frame.from_user();
                 let user_buffer_reader =
-                    match UserBufferReader::new(buf_vaddr as *const u8, len, from_user) {
-                        Err(e) => return Err(e),
-                        Ok(reader) => reader,
-                    };
-                let user_buf = match user_buffer_reader.read_from_user(0) {
-                    Err(e) => return Err(e),
-                    Ok(buf) => buf,
-                };
+                    UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
+
+                let user_buf = user_buffer_reader.read_from_user(0)?;
                 let res = Self::write(fd, user_buf);
                 res
             }
@@ -480,17 +469,9 @@ impl Syscall {
                     SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
                     SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
                     _ => Err(SystemError::EINVAL),
-                };
+                }?;
 
-                let res = if w.is_err() {
-                    Err(w.unwrap_err())
-                } else {
-                    let w = w.unwrap();
-                    Self::lseek(fd, w)
-                };
-                // kdebug!("sys lseek, fd: {}, offset: {}, whence: {}, res: {:?}", fd, offset, whence, res);
-
-                res
+                Self::lseek(fd, w)
             }
 
             SYS_FORK => Self::fork(frame),
@@ -534,12 +515,8 @@ impl Syscall {
                     return Ok(dest_path);
                 };
 
-                let r: Result<&str, SystemError> = chdir_check(args[0]);
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    Self::chdir(r.unwrap())
-                }
+                let r = chdir_check(args[0])?;
+                Self::chdir(r)
             }
 
             SYS_GET_DENTS => {

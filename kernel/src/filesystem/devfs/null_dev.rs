@@ -131,12 +131,4 @@ impl IndexNode for LockedNullInode {
 
         Ok(len)
     }
-
-    fn special_nod(&self) -> Option<Arc<dyn IndexNode>> {
-        return None;
-    }
-
-    fn set_special_nod(&self, _nod: Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
 }

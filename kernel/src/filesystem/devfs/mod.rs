@@ -518,14 +518,6 @@ impl IndexNode for LockedDevFSInode {
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
-
-    fn special_nod(&self) -> Option<Arc<dyn IndexNode>> {
-        return None;
-    }
-
-    fn set_special_nod(&self, _nod: Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
 }
 
 /// @brief 所有的设备INode都需要额外实现这个trait
@@ -570,7 +562,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing ProcFS...");
+        kinfo!("Initializing DevFS...");
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载

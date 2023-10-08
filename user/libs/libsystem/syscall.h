@@ -26,7 +26,8 @@
 #define SYS_CLOCK 19     // 获取当前cpu时间
 #define SYS_PIPE 20
 
-#define SYS_MSTAT 21        // 获取系统的内存状态信息
+// 现在已经废弃
+// #define SYS_MSTAT 21        // 获取系统的内存状态信息
 #define SYS_UNLINK_AT 22    // 删除文件夹/删除文件链接
 #define SYS_KILL 23         // kill一个进程(向这个进程发出信号)
 #define SYS_SIGACTION 24    // 设置进程的信号处理动作

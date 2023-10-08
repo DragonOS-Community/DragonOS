@@ -7,21 +7,21 @@ extern  "C"  {
 #endif
 
 void *memset(void *dst, unsigned char C, uint64_t size);
+
 /**
- * @brief 获取字符串的大小
+ * @brief 获取字符串的长度
  *
  * @param s 字符串
- * @return size_t 大小
+ * @return size_t 长度
  */
 size_t strlen(const char *s);
 
 /*
-        比较字符串 FirstPart and SecondPart
-        FirstPart = SecondPart =>  0
-        FirstPart > SecondPart =>  1
-        FirstPart < SecondPart => -1
+    比较字符串 FirstPart and SecondPart
+    FirstPart = SecondPart =>  0
+    FirstPart > SecondPart =>  1
+    FirstPart < SecondPart => -1
 */
-
 int strcmp(const char *FirstPart, const char *SecondPart);
 
 /**
@@ -32,7 +32,7 @@ int strcmp(const char *FirstPart, const char *SecondPart);
  * @param Count 字节数
  * @return char*
  */
-char *strncpy(char *dst, const char *src, size_t Count);
+char *strncpy(char *dst, const char *src, size_t count);
 
 /**
  * @brief 拷贝整个字符串
@@ -81,6 +81,72 @@ static void *memcpy(void *dst, const void *src, long Num)
                          : "memory");
     return dst;
 }
+
+/**
+ * @brief 分割字符串
+ *
+ * @param str 要被分解成一组小字符串的字符串
+ * @param delim 包含分隔符的字符串
+ * @return 分割结果
+ */
+char *strtok(char *str, const char *delim);
+
+/**
+ * @brief 分割字符串
+ *
+ * @param str 要被分解成一组小字符串的字符串
+ * @param delim 包含分隔符的字符串
+ * @param saveptr 用于存储当前操作的字符串
+ * @return 分割结果
+ */
+char *strtok_r(char *str, const char *delim, char **saveptr);
+
+//! 以下函数没有经过检验，不确保正常工作
+
+/**
+ * @brief 检索字符串 str1 中第一个不在字符串 str2 中出现的字符下标
+ *
+ * @param str1 被检索的字符串
+ * @param str2 进行匹配的字符列表
+ * @return str1 中第一个不在字符串 str2 中出现的字符下标
+ */
+size_t strspn(const char *str1, const char *str2);
+
+/**
+ * @brief 检索字符串 str1 开头连续有几个字符都不含字符串 str2 中的字符
+ *
+ * @param str1 被检索的字符串
+ * @param str2 进行匹配的字符列表
+ * @return str1 开头连续都不含字符串 str2 中字符的字符数
+ */
+size_t strcspn(const char *str1, const char *str2);
+
+/**
+ * @brief 检索字符串 str1 中第一个匹配字符串 str2 中字符的字符
+ *
+ * @param str1 被检索的字符串
+ * @param str2 进行匹配的字符列表
+ * @return str1 中第一个匹配字符串 str2 中字符的指针，如果未找到字符则返回 NULL
+ */
+char *strpbrk(const char *str1, const char *str2);
+
+/**
+ * @brief 在字符串中查找第一次出现的字符
+ *
+ * @param str 被查找的字符串
+ * @param c 要查找的字符
+ * @return 指向找到的字符的指针，如果未找到该字符则返回 NULL
+ */
+char *strchr(const char *str, int c);
+
+/**
+ * @brief 在字符串中查找最后一次出现的字符
+ *
+ * @param str 被查找的字符串
+ * @param c 要查找的字符
+ * @return 指向找到的字符的指针，如果未找到该字符则返回 NULL
+ */
+char *strrchr(const char *str, int c);
 
 #if defined(__cplusplus) 
 }  /* extern "C" */ 

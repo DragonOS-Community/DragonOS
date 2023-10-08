@@ -12,7 +12,11 @@ use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    ipc::pipe::LockedPipeInode, libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec,
+    driver::base::{block::block_device::BlockDevice, char::CharDevice, device::DeviceNumber},
+    ipc::pipe::LockedPipeInode,
+    libs::casting::DowncastArc,
+    syscall::SystemError,
+    time::TimeSpec,
 };
 
 use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
@@ -41,6 +45,16 @@ pub enum FileType {
     SymLink,
     /// 套接字
     Socket,
+}
+
+#[derive(Debug, Clone)]
+pub enum SpecialNodeData {
+    /// 管道文件
+    Pipe(Arc<LockedPipeInode>),
+    /// 字符设备
+    CharDevice(Arc<dyn CharDevice>),
+    /// 块设备
+    BlockDevice(Arc<dyn BlockDevice>),
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -344,27 +358,19 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// ## 创建一个特殊文件节点
     /// - _filename: 文件名
     /// - _mode: 权限信息
-    fn mknod(&self, filename: &str, mode: ModeType) -> Result<(), SystemError> {
-        // TODO: 目前先用一个FILE类型的inode套壳
-        let inode = self.create(filename, FileType::File, mode)?;
-
-        if mode.contains(ModeType::S_IFIFO) {
-            inode.set_special_nod(LockedPipeInode::new())?;
-        } else {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-
-        return Ok(());
+    fn mknod(
+        &self,
+        _filename: &str,
+        _mode: ModeType,
+        _dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    /// ## 获取文件节点
-    /// - 若该inode是一个特殊文件节点，则返回Some(Arc<dyn IndexNode>),否则返回None
-    fn special_nod(&self) -> Option<Arc<dyn IndexNode>>;
-
-    /// ## 设置该inode为特殊文件节点
-    /// - _nod: 指向的特殊文件节点
-    /// - 若未实现则返回错误
-    fn set_special_nod(&self, _nod: Arc<dyn IndexNode>) -> Result<(), SystemError>;
+    /// ## 返回特殊文件的inode
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        None
+    }
 }
 
 impl DowncastArc for dyn IndexNode {

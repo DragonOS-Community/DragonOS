@@ -320,7 +320,7 @@ int shell_cmd_cat(int argc, char **argv)
     char *file_path = get_target_filepath(argv[1], &path_len);
 
     // 打开文件
-    int fd = open(file_path, 0);
+    int fd = open(file_path, O_RDONLY);
     if (fd <= 0)
     {
         printf("ERROR: Cannot open file: %s, fd=%d\n", file_path, fd);
@@ -598,13 +598,13 @@ int shell_cmd_free(int argc, char **argv)
     printf("Mem:\t");
     if (argc == 1) // 按照kb显示
     {
-        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 10, mst.used >> 10, mst.free >> 10, mst.shared >> 10,
-               mst.cache_used >> 10, mst.available >> 10);
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total, mst.used, mst.free, mst.shared,
+               mst.cache_used, mst.available);
     }
     else // 按照MB显示
     {
-        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 20, mst.used >> 20, mst.free >> 20, mst.shared >> 20,
-               mst.cache_used >> 20, mst.available >> 20);
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 10, mst.used >> 10, mst.free >> 10, mst.shared >> 10,
+               mst.cache_used >> 10, mst.available >> 10);
     }
 
 done:;

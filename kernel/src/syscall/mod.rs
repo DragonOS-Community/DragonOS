@@ -6,7 +6,7 @@ use core::{
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
-    arch::{cpu::cpu_reset, interrupt::TrapFrame, mm::LockedFrameAllocator, MMArch},
+    arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
     driver::base::block::SeekFrom,
     filesystem::vfs::{
         fcntl::FcntlCommand,
@@ -15,7 +15,7 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
-    kdebug, kinfo,
+    kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
@@ -417,38 +417,23 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 } else {
                     let path: &str = path.unwrap();
-                    kdebug!(
-                        "before open, path: {path}, used: {}",
-                        LockedFrameAllocator.get_usage().used().data()
-                    );
+
                     let flags = args[1];
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
                     Self::open(path, open_flags)
                 };
-                kdebug!(
-                    "after open, res: {:?}, used: {}",
-                    res,
-                    LockedFrameAllocator.get_usage().used().data()
-                );
+
                 res
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                kdebug!(
-                    "before close, fd: {fd}, used: {}",
-                    LockedFrameAllocator.get_usage().used().data()
-                );
+
                 let res = Self::close(fd);
-                kdebug!(
-                    "after close, res: {:?}, used: {}",
-                    res,
-                    LockedFrameAllocator.get_usage().used().data()
-                );
+
                 res
             }
             SYS_READ => {
                 let fd = args[0] as i32;
-                // kdebug!("before read, fd: {fd}, used: {}", LockedFrameAllocator.get_usage().used().data());
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
@@ -464,7 +449,6 @@ impl Syscall {
                     Self::read(fd, buf)
                 };
                 // kdebug!("sys read, fd: {}, len: {}, res: {:?}", fd, len, res);
-                // kdebug!("after read, res: {:?}, used: {}", res, LockedFrameAllocator.get_usage().used().data());
                 res
             }
             SYS_WRITE => {
@@ -564,10 +548,7 @@ impl Syscall {
 
             SYS_GET_DENTS => {
                 let fd = args[0] as i32;
-                kdebug!(
-                    "before get_dents, fd: {fd}, used: {}",
-                    LockedFrameAllocator.get_usage().used().data()
-                );
+
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
@@ -583,11 +564,7 @@ impl Syscall {
                     };
                     Self::getdents(fd, buf)
                 };
-                kdebug!(
-                    "after get_dents, res: {:?}, used: {}",
-                    res,
-                    LockedFrameAllocator.get_usage().used().data()
-                );
+
                 res
             }
 

@@ -5,11 +5,10 @@ use alloc::{
 };
 
 use crate::{
-    arch::mm::LockedFrameAllocator,
     driver::base::block::SeekFrom,
     filesystem::vfs::file::FileDescriptorVec,
     include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
-    kdebug, kerror,
+    kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
@@ -141,15 +140,9 @@ impl Syscall {
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
-        kdebug!(
-            "before lookup, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
-        kdebug!(
-            "after lookup, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         let inode: Arc<dyn IndexNode> = if inode.is_err() {
             let errno = inode.unwrap_err();
             // 文件不存在，且需要创建
@@ -191,15 +184,9 @@ impl Syscall {
         }
 
         // 创建文件对象
-        kdebug!(
-            "before create file, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         let mut file: File = File::new(inode, mode)?;
-        kdebug!(
-            "after create file, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         // 打开模式为“追加”
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
@@ -211,10 +198,7 @@ impl Syscall {
             .write()
             .alloc_fd(file, None)
             .map(|fd| fd as usize);
-        kdebug!(
-            "after save file to pcb, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         return r;
     }
 
@@ -226,15 +210,9 @@ impl Syscall {
     pub fn close(fd: usize) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-        kdebug!(
-            "before drop fd, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
-        kdebug!(
-            "after drop fd, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         return res;
     }
 
@@ -414,15 +392,9 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        kdebug!(
-            "before readdir, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         let res = file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
-        kdebug!(
-            "after readdir, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         return res;
     }
 

@@ -3,13 +3,12 @@ use core::mem::MaybeUninit;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::mm::LockedFrameAllocator,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
-    kdebug, kerror,
+    kerror,
     libs::spinlock::SpinLock,
     process::ProcessManager,
     syscall::SystemError,
@@ -258,10 +257,6 @@ impl File {
         if self.offset == 0 {
             self.readdir_subdirs_name = inode.list()?;
             self.readdir_subdirs_name.sort();
-            kdebug!(
-                "after list and sort subdirs_name, used: {}",
-                LockedFrameAllocator.get_usage().used().data()
-            );
         }
         // kdebug!("sub_entries={sub_entries:?}");
         if self.readdir_subdirs_name.is_empty() {
@@ -289,10 +284,6 @@ impl File {
                 ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len());
             buf.copy_from_slice(name_bytes);
         }
-        kdebug!(
-            "after copy name_bytes to buf, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
 
         // 计算dirent结构体的大小
         let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()
@@ -384,16 +375,6 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        kdebug!(
-            "before frop file, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
-        // drop(self.readdir_subdirs_name.as_mut_ptr());
-        kdebug!(
-            "is_empty: {}, capacity: {}",
-            self.readdir_subdirs_name.is_empty(),
-            self.readdir_subdirs_name.capacity()
-        );
         let r: Result<(), SystemError> = self.inode.close(&mut self.private_data);
         // 打印错误信息
         if r.is_err() {
@@ -404,10 +385,6 @@ impl Drop for File {
                 r.unwrap_err()
             );
         }
-        kdebug!(
-            "after frop file, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
     }
 }
 
@@ -529,16 +506,10 @@ impl FileDescriptorVec {
         }
 
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
-        kdebug!(
-            "after get_file_by_id, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
-        kdebug!(
-            "after take file, used: {}",
-            LockedFrameAllocator.get_usage().used().data()
-        );
+
         assert!(Arc::strong_count(&file) == 1);
         return Ok(());
     }

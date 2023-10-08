@@ -11,7 +11,7 @@ use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec};
+use crate::{libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec, kdebug, arch::mm::LockedFrameAllocator};
 
 use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
@@ -375,6 +375,10 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        kdebug!(
+            "before lookup {path}, used: {}",
+            LockedFrameAllocator.get_usage().used().data()
+        );
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -391,6 +395,10 @@ impl dyn IndexNode {
 
         // 逐级查找文件
         while !rest_path.is_empty() {
+            kdebug!(
+                "before lookup rest_path={rest_path}, used: {}",
+                LockedFrameAllocator.get_usage().used().data()
+            );
             // 当前这一级不是文件夹
             if result.metadata()?.file_type != FileType::Dir {
                 return Err(SystemError::ENOTDIR);
@@ -416,9 +424,15 @@ impl dyn IndexNode {
             if name.is_empty() {
                 continue;
             }
-
+            kdebug!(
+                "before find name={name}, used: {}",
+                LockedFrameAllocator.get_usage().used().data()
+            );
             let inode = result.find(&name)?;
-
+            kdebug!(
+                "after find name={name}, used: {}",
+                LockedFrameAllocator.get_usage().used().data()
+            );
             // 处理符号链接的问题
             if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
@@ -436,6 +450,10 @@ impl dyn IndexNode {
             } else {
                 result = inode;
             }
+            kdebug!(
+                "after lookup rest_path={rest_path}, used: {}",
+                LockedFrameAllocator.get_usage().used().data()
+            );
         }
 
         return Ok(result);

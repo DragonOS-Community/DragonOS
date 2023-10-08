@@ -63,11 +63,11 @@ impl MountFS {
         let weak: Weak<MountFS> = Arc::downgrade(&mount_fs);
 
         // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
-        let ptr: *mut MountFS = Arc::into_raw(mount_fs) as *mut Self;
+        let ptr: *mut MountFS = mount_fs.as_ref() as *const Self as *mut Self;
         unsafe {
             (*ptr).self_ref = weak;
             // 返回初始化好的MountFS对象
-            return Arc::from_raw(ptr);
+            return mount_fs;
         }
     }
 
@@ -97,7 +97,7 @@ impl MountFSInode {
         let weak: Weak<MountFSInode> = Arc::downgrade(&inode);
         // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
         compiler_fence(Ordering::SeqCst);
-        let ptr: *mut MountFSInode = Arc::into_raw(inode.clone()) as *mut Self;
+        let ptr: *mut MountFSInode = inode.as_ref() as *const Self as *mut Self;
         compiler_fence(Ordering::SeqCst);
         unsafe {
             (*ptr).self_ref = weak;

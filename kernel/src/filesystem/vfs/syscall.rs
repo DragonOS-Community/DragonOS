@@ -141,8 +141,15 @@ impl Syscall {
         if path.len() > PAGE_4K_SIZE as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
-
+        kdebug!(
+            "before lookup, used: {}",
+            LockedFrameAllocator.get_usage().used().data()
+        );
         let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        kdebug!(
+            "after lookup, used: {}",
+            LockedFrameAllocator.get_usage().used().data()
+        );
         let inode: Arc<dyn IndexNode> = if inode.is_err() {
             let errno = inode.unwrap_err();
             // 文件不存在，且需要创建

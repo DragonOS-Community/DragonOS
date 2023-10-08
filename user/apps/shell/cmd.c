@@ -508,7 +508,12 @@ int shell_cmd_exec(int argc, char **argv)
         char *file_path = get_target_filepath(argv[1], &path_len);
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
 
-        execv(file_path, argv);
+        char **real_argv;
+        if (argc > 2)
+        {
+            real_argv = &argv[2];
+        }
+        execv(file_path, real_argv);
         // printf("after execv, path=%s, argc=%d\n", file_path, argc);
         free(argv);
         free(file_path);

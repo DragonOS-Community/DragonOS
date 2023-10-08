@@ -7,11 +7,11 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
-        syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
     include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
@@ -375,6 +375,7 @@ pub const SYS_GETPGID: usize = 50;
 
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
+pub const SYS_MKNOD: usize = 53;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -971,6 +972,14 @@ impl Syscall {
                 let res = Self::ftruncate(fd, len);
                 // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
+            }
+
+            SYS_MKNOD => {
+                let path = args[0];
+                let flags = args[1];
+                let dev_t = args[2];
+                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
+                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

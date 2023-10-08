@@ -8,7 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
@@ -347,6 +347,26 @@ impl IndexNode for MountFSInode {
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
         return Ok(new_mount_fs);
+    }
+
+    #[inline]
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: ModeType,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Ok(MountFSInode {
+            inner_inode: self.inner_inode.mknod(filename, mode, dev_t)?,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: Weak::default(),
+        }
+        .wrap());
+    }
+
+    #[inline]
+    fn special_node(&self) -> Option<super::SpecialNodeData> {
+        self.inner_inode.special_node()
     }
 }
 

@@ -9,7 +9,7 @@ use crate::{
         file::{File, FileMode},
         FilePrivateData,
     },
-    kdebug, kerror, kwarn,
+    kerror, kwarn,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
@@ -78,7 +78,7 @@ impl Syscall {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         let retval = sig
-            .signal_kill_something_info(Some(&mut info), pid)
+            .send_signal_info(Some(&mut info), pid)
             .map(|x| x as usize);
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);

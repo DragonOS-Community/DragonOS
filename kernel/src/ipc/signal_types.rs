@@ -9,18 +9,15 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, _NSIG},
     },
     include::bindings::bindings::siginfo,
-    kdebug,
     libs::ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref},
-    process::{Pid, ProcessControlBlock},
+    process::Pid,
     syscall::{user_access::UserBufferWriter, SystemError},
 };
 
 /// 存储信号处理函数的地址(来自用户态)
-pub type __signalfn_t = u64;
-pub type __sighandler_t = __signalfn_t;
+pub type UserSighandler = u64;
 /// 存储信号处理恢复函数的地址(来自用户态)
-pub type __sigrestorer_fn_t = u64;
-pub type __sigrestorer_t = __sigrestorer_fn_t;
+pub type UserSigrestorer = u64;
 
 pub const MAX_SIG_NUM: usize = _NSIG;
 
@@ -33,6 +30,7 @@ pub const USER_SIG_ERR: u64 = 2;
 
 // 因为 Rust 编译器不能在常量声明中正确识别级联的 "|" 运算符(experimental feature： https://github.com/rust-lang/rust/issues/67792)，因此
 // 暂时只能通过这种方法来声明这些常量
+#[allow(dead_code)]
 pub const SIG_KERNEL_ONLY_MASK: SigSet =
     Signal::into_sigset(Signal::SIGSTOP).union(Signal::into_sigset(Signal::SIGKILL));
 
@@ -40,7 +38,7 @@ pub const SIG_KERNEL_STOP_MASK: SigSet = Signal::into_sigset(Signal::SIGSTOP)
     .union(Signal::into_sigset(Signal::SIGTSTP))
     .union(Signal::into_sigset(Signal::SIGTTIN))
     .union(Signal::into_sigset(Signal::SIGTTOU));
-
+#[allow(dead_code)]
 pub const SIG_KERNEL_COREDUMP_MASK: SigSet = Signal::into_sigset(Signal::SIGQUIT)
     .union(Signal::into_sigset(Signal::SIGILL))
     .union(Signal::into_sigset(Signal::SIGTRAP))
@@ -51,7 +49,7 @@ pub const SIG_KERNEL_COREDUMP_MASK: SigSet = Signal::into_sigset(Signal::SIGQUIT
     .union(Signal::into_sigset(Signal::SIGSYS))
     .union(Signal::into_sigset(Signal::SIGXCPU))
     .union(Signal::into_sigset(Signal::SIGXFSZ));
-
+#[allow(dead_code)]
 pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
     .union(Signal::into_sigset(Signal::SIGFPE))
     .union(Signal::into_sigset(Signal::SIGSEGV))
@@ -78,6 +76,7 @@ impl Default for SignalStruct {
 }
 
 #[derive(Debug, Copy, Clone)]
+#[allow(dead_code)]
 pub enum SigactionType {
     SaHandler(SaHandlerType),
     SaSigaction(
@@ -88,25 +87,16 @@ pub enum SigactionType {
                 arg1: *mut ::core::ffi::c_void,
             ),
         >,
-    ),
-}
-
-impl SigactionType {
-    /// Returns `true` if the sigaction type is [`SaHandler`].
-    ///
-    /// [`SaHandler`]: SigactionType::SaHandler
-    #[must_use]
-    pub fn is_sa_handler(&self) -> bool {
-        matches!(self, Self::SaHandler(..))
-    }
+    ), // 暂时没有用上
 }
 
 #[derive(Debug, Copy, Clone)]
+#[allow(dead_code)]
 pub enum SaHandlerType {
-    SigError,
+    SigError, // 暂时没有用上
     SigDefault,
     SigIgnore,
-    SigCustomized(__sighandler_t),
+    SigCustomized(UserSighandler),
 }
 
 impl Into<usize> for SaHandlerType {
@@ -154,7 +144,7 @@ pub struct Sigaction {
     flags: SigFlags,
     mask: SigSet, // 为了可扩展性而设置的sa_mask
     /// 信号处理函数执行结束后，将会跳转到这个函数内进行执行，然后执行sigreturn系统调用
-    restorer: Option<__sigrestorer_t>,
+    restorer: Option<UserSigrestorer>,
 }
 
 impl Default for Sigaction {
@@ -195,7 +185,7 @@ impl Sigaction {
         action: SigactionType,
         flags: SigFlags,
         mask: SigSet,
-        restorer: Option<__sigrestorer_t>,
+        restorer: Option<UserSigrestorer>,
     ) -> Self {
         Self {
             action,
@@ -233,7 +223,7 @@ impl Sigaction {
         &mut self.mask
     }
 
-    pub fn set_restorer(&mut self, restorer: Option<__sigrestorer_t>) {
+    pub fn set_restorer(&mut self, restorer: Option<UserSigrestorer>) {
         self.restorer = restorer;
     }
 }
@@ -271,14 +261,6 @@ impl SigInfo {
 
     pub fn sig_code(&self) -> SigCode {
         self.sig_code
-    }
-
-    pub fn errno(&self) -> i32 {
-        self.errno
-    }
-
-    pub fn sig_type(&self) -> SigType {
-        self.sig_type
     }
 
     pub fn set_sig_type(&mut self, sig_type: SigType) {

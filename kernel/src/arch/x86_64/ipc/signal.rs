@@ -34,6 +34,7 @@ pub const STACK_ALIGN: u64 = 16;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq)]
 #[repr(usize)]
+#[allow(non_camel_case_types)]
 pub enum Signal {
     INVALID = 0,
     SIGHUP = 1,
@@ -150,6 +151,7 @@ impl Signal {
 /// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
 #[derive(Copy, Debug, Clone)]
 #[repr(i32)]
+#[allow(non_camel_case_types)]
 pub enum SigCode {
     /// sent by kill, sigsend, raise
     SI_USER = 0,

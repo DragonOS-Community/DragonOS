@@ -5,10 +5,7 @@ use alloc::{string::ToString, sync::Arc};
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::procfs::procfs_register_pid,
-    ipc::{
-        signal::flush_signal_handlers,
-        signal_types::{SigHandStruct, Sigaction},
-    },
+    ipc::{signal::flush_signal_handlers, signal_types::SigHandStruct},
     kdebug, kerror,
     libs::rwlock::RwLock,
     process::ProcessFlags,

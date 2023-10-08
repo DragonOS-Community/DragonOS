@@ -3,7 +3,7 @@ use core::ffi::c_void;
 use alloc::string::String;
 
 use crate::{
-    arch::ipc::signal::{self, X86_64SignalArch},
+    arch::ipc::signal::X86_64SignalArch,
     include::bindings::bindings::set_system_trap_gate,
     ipc::signal_types::SignalArch,
     syscall::{Syscall, SystemError, SYS_RT_SIGRETURN},

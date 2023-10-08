@@ -1,4 +1,4 @@
-use core::{intrinsics::unlikely, sync::atomic::AtomicU8};
+use core::intrinsics::unlikely;
 
 use alloc::string::String;
 
@@ -7,13 +7,7 @@ use thingbuf::mpsc::{
     errors::{TryRecvError, TrySendError},
 };
 
-use crate::{
-    arch::ipc::signal::{SigCode, Signal},
-    ipc::signal_types::{SigInfo, SigType},
-    kdebug,
-    libs::rwlock::RwLock,
-    process::{Pid, ProcessManager},
-};
+use crate::libs::rwlock::RwLock;
 
 pub mod tty_device;
 
@@ -62,7 +56,7 @@ struct TtyCore {
     output_rx: mpsc::Receiver<u8>,
     output_tx: mpsc::Sender<u8>,
     // 前台进程,以后改成前台进程组
-    front_job: Option<Pid>,
+    // front_job: Option<Pid>,
     /// tty核心的状态
     state: RwLock<TtyCoreState>,
 }
@@ -99,7 +93,6 @@ impl TtyCore {
             stdin_tx,
             output_rx,
             output_tx,
-            front_job: None,
             state,
         };
     }
@@ -288,19 +281,19 @@ impl TtyCore {
                 }
             } else {
                 // TODO: 在这里考虑增加对信号发送的处理
-                if buf[cnt] == 3 {
-                    let pid = ProcessManager::current_pcb().pid();
-                    Signal::SIGKILL.signal_kill_something_info(
-                        Some(&mut SigInfo::new(
-                            Signal::SIGKILL,
-                            0,
-                            SigCode::SI_USER,
-                            SigType::Kill(pid),
-                        )),
-                        pid,
-                    );
-                    return Err(TtyError::Stopped(cnt));
-                }
+                // if buf[cnt] == 3 {
+                //     let pid = ProcessManager::current_pcb().pid();
+                //     Signal::SIGKILL.send_signal_info(
+                //         Some(&mut SigInfo::new(
+                //             Signal::SIGKILL,
+                //             0,
+                //             SigCode::SI_USER,
+                //             SigType::Kill(pid),
+                //         )),
+                //         pid,
+                //     );
+                //     return Err(TtyError::Stopped(cnt));
+                // }
                 *r.unwrap() = buf[cnt];
                 cnt += 1;
             }

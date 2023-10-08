@@ -198,10 +198,10 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
-        if matches!(state, flags) {
+        if state == flags {
             let mut writer = pcb.sched_info_mut();
             let state = writer.state();
-            if matches!(state, flags) {
+            if state == flags {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);

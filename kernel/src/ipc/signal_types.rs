@@ -5,6 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::{
     arch::{
         asm::bitops::ffz,
+        interrupt::TrapFrame,
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, _NSIG},
     },
     include::bindings::bindings::siginfo,
@@ -624,4 +625,18 @@ impl FFIBind2Rust<crate::include::bindings::bindings::sigaction> for Sigaction {
     ) -> Option<&'static Self> {
         return __convert_ref(src);
     }
+}
+
+///
+/// 定义了不同架构下实现 Signal 要实现的接口
+///
+pub trait SignalArch {
+    /// 信号处理函数
+    ///
+    /// ## 参数
+    ///
+    /// - `frame` 中断栈帧
+    unsafe fn do_signal(frame: &mut TrapFrame);
+
+    fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
 }

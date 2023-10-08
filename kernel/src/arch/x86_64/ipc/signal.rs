@@ -15,7 +15,7 @@ use crate::{
     include::bindings::bindings::USER_MAX_LINEAR_ADDR,
     ipc::{
         signal::{get_signal_to_deliver, set_current_sig_blocked},
-        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, MAX_SIG_NUM},
+        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, MAX_SIG_NUM},
     },
     kdebug, kerror,
     process::ProcessManager,
@@ -318,42 +318,74 @@ pub struct SigStack {
     pub fpstate: FpState,
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
-    // 检查sigpending是否为0
-    if ProcessManager::current_pcb()
-        .sig_info()
-        .sig_pending()
-        .signal()
-        .bits()
-        == 0
-        || !frame.from_user()
-    {
-        // 若没有正在等待处理的信号，或者将要返回到的是内核态，则启用中断，然后返回
-        CurrentIrqArch::interrupt_enable();
-        return;
-    }
+pub struct X86_64SignalArch;
 
-    // 做完上面的检查后，开中断
-    CurrentIrqArch::interrupt_enable();
-
-    let oldset = ProcessManager::current_pcb().sig_info().sig_block();
-    loop {
-        let (sig_number, info, ka) = get_signal_to_deliver(&frame.clone());
-        // 所有的信号都处理完了
-        if sig_number == Signal::INVALID {
+impl SignalArch for X86_64SignalArch {
+    #[no_mangle]
+    unsafe fn do_signal(frame: &mut TrapFrame) {
+        // 检查sigpending是否为0
+        if ProcessManager::current_pcb()
+            .sig_info()
+            .sig_pending()
+            .signal()
+            .bits()
+            == 0
+            || !frame.from_user()
+        {
+            // 若没有正在等待处理的信号，或者将要返回到的是内核态，则启用中断，然后返回
+            CurrentIrqArch::interrupt_enable();
             return;
         }
-        assert!(ka.is_some());
-        let res: Result<i32, SystemError> = handle_signal(sig_number, ka.unwrap(), &info.unwrap(), &oldset, frame);
-        if res.is_err() {
-            kerror!(
-                "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
-                sig_number as i32,
-                ProcessManager::current_pcb().pid(),
-                res.unwrap_err()
-            );
+
+        // 做完上面的检查后，开中断
+        CurrentIrqArch::interrupt_enable();
+
+        let oldset = ProcessManager::current_pcb().sig_info().sig_block();
+        loop {
+            let (sig_number, info, ka) = get_signal_to_deliver(&frame.clone());
+            // 所有的信号都处理完了
+            if sig_number == Signal::INVALID {
+                return;
+            }
+            assert!(ka.is_some());
+            let res: Result<i32, SystemError> =
+                handle_signal(sig_number, ka.unwrap(), &info.unwrap(), &oldset, frame);
+            if res.is_err() {
+                kerror!(
+                    "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
+                    sig_number as i32,
+                    ProcessManager::current_pcb().pid(),
+                    res.unwrap_err()
+                );
+            }
         }
+    }
+
+    #[no_mangle]
+    fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
+        assert!(CurrentIrqArch::is_irq_enabled());
+        let frame = (trap_frame.rsp as usize) as *mut SigFrame;
+
+        // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
+        if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
+            kerror!("rsp doesn't from user level");
+            // todo：这里改为生成一个sigsegv
+            // 退出进程
+            ProcessManager::exit(Signal::SIGSEGV as usize);
+        }
+
+        let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
+        set_current_sig_blocked(&mut sigmask);
+        // 从用户栈恢复sigcontext
+        if unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) == false {
+            kdebug!("unable to restore sigcontext");
+            // todo：这里改为生成一个sigsegv
+            // 退出进程
+            ProcessManager::exit(Signal::SIGSEGV as usize);
+        }
+
+        // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
+        return trap_frame.rax;
     }
 }
 
@@ -510,32 +542,4 @@ fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
     // 按照要求进行对齐
     rsp &= (-(STACK_ALIGN as i64)) as usize;
     return rsp as *mut SigFrame;
-}
-
-
-#[no_mangle]
-pub fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
-    assert!(CurrentIrqArch::is_irq_enabled());
-    let frame = (trap_frame.rsp as usize ) as *mut SigFrame;
-
-    // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
-    if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
-        kerror!("rsp doesn't from user level");
-        // todo：这里改为生成一个sigsegv
-        // 退出进程
-        ProcessManager::exit(Signal::SIGSEGV as usize);
-    }
-
-    let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
-    set_current_sig_blocked(&mut sigmask);
-    // 从用户栈恢复sigcontext
-    if unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) == false {
-        kdebug!("unable to restore sigcontext");
-        // todo：这里改为生成一个sigsegv
-        // 退出进程
-        ProcessManager::exit(Signal::SIGSEGV as usize);
-    }
-
-    // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
-    return trap_frame.rax;
 }

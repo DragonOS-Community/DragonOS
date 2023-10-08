@@ -717,9 +717,8 @@ impl Syscall {
             return Err(SystemError::EEXIST);
         }
 
-        let mut path_split: core::str::RSplitN<&str> = path.trim_matches('/').rsplitn(2, "/");
-        let filename = path_split.next().unwrap_or("");
-        let parent_path = path_split.next();
+        let (filename, parent_path) = rsplit_path(path);
+
         // 查找父目录
         let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
         // 创建nod

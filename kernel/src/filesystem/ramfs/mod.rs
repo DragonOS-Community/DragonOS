@@ -514,14 +514,14 @@ impl IndexNode for LockedRamFSInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: FileType::Dir,
-                mode: ModeType::from_bits_truncate(0o777),
+                file_type: FileType::Pipe,
+                mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: 0,
             },
-            fs: Weak::default(),
+            fs: inode.fs.clone(),
             special_node: None,
         })));
 

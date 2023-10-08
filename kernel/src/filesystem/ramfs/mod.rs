@@ -515,7 +515,7 @@ impl IndexNode for LockedRamFSInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::Pipe,
-                mode: ModeType::from_bits_truncate(0o666),
+                mode: mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

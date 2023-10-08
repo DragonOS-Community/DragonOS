@@ -417,9 +417,9 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 } else {
                     let path: &str = path.unwrap();
+
                     let flags = args[1];
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-
                     Self::open(path, open_flags)
                 };
 
@@ -427,7 +427,10 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                Self::close(fd)
+
+                let res = Self::close(fd);
+
+                res
             }
             SYS_READ => {
                 let fd = args[0] as i32;
@@ -545,6 +548,7 @@ impl Syscall {
 
             SYS_GET_DENTS => {
                 let fd = args[0] as i32;
+
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);

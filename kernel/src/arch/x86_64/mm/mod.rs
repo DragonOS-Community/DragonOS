@@ -14,7 +14,7 @@ use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 
-use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
+use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::mmio_buddy::mmio_init;
 use crate::{
     arch::MMArch,
@@ -512,10 +512,7 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(
-        &mut self,
-        count: crate::mm::allocator::page_frame::PageFrameCount,
-    ) -> Option<(PhysAddr, PageFrameCount)> {
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);
         } else {
@@ -523,19 +520,25 @@ impl FrameAllocator for LockedFrameAllocator {
         }
     }
 
-    unsafe fn free(
-        &mut self,
-        address: crate::mm::PhysAddr,
-        count: crate::mm::allocator::page_frame::PageFrameCount,
-    ) {
+    unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
         assert!(count.data().is_power_of_two());
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.free(address, count);
         }
     }
 
-    unsafe fn usage(&self) -> crate::mm::allocator::page_frame::PageFrameUsage {
-        todo!()
+    unsafe fn usage(&self) -> PageFrameUsage {
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+            return allocator.usage();
+        } else {
+            panic!("usage error");
+        }
+    }
+}
+
+impl LockedFrameAllocator {
+    pub fn get_usage(&self) -> PageFrameUsage {
+        unsafe { self.usage() }
     }
 }
 

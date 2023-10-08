@@ -184,6 +184,7 @@ impl Syscall {
         }
 
         // 创建文件对象
+
         let mut file: File = File::new(inode, mode)?;
 
         // 打开模式为“追加”
@@ -210,7 +211,9 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        return fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+        let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+
+        return res;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -389,7 +392,10 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        return file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        let res = file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        return res;
     }
 
     /// @brief 创建文件夹

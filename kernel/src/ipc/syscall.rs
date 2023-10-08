@@ -1,14 +1,10 @@
 use core::ffi::c_int;
 
-use alloc::sync::Arc;
-
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
-        syscall::ModeType,
-        FilePrivateData, IndexNode, ROOT_INODE,
+        FilePrivateData,
     },
-    include::bindings::bindings::PAGE_4K_SIZE,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
@@ -54,29 +50,6 @@ impl Syscall {
         } else {
             Err(SystemError::EINVAL)
         }
-    }
-
-    pub fn mkfifo(path: &str, mode: ModeType) -> Result<usize, SystemError> {
-        // 文件名过长
-        if path.len() > PAGE_4K_SIZE as usize {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
-
-        if inode.is_ok() {
-            return Err(SystemError::EEXIST);
-        }
-
-        let mut path_split: core::str::RSplitN<&str> = path.trim_matches('/').rsplitn(2, "/");
-        let filename = path_split.next().unwrap_or("");
-        let parent_path = path_split.next();
-        // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-        // 创建管道
-        parent_inode.mknod(filename, mode | ModeType::S_IFIFO)?;
-
-        return Ok(0);
     }
 
     pub fn kill(_pid: Pid, _sig: c_int) -> Result<usize, SystemError> {

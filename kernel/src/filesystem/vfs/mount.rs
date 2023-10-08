@@ -356,7 +356,12 @@ impl IndexNode for MountFSInode {
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.inner_inode.mknod(filename, mode, dev_t)
+        return Ok(MountFSInode {
+            inner_inode: self.inner_inode.mknod(filename, mode, dev_t)?,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: Weak::default(),
+        }
+        .wrap());
     }
 
     #[inline]

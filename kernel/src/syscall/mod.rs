@@ -971,20 +971,11 @@ impl Syscall {
             }
 
             SYS_MKNOD => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-                    let flags = args[1];
-                    let dev_t = args[2];
-                    let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-
-                    Self::mknod(path, flags | ModeType::S_IFIFO, DeviceNumber::new(dev_t))
-                };
-
-                res
+                let path = args[0];
+                let flags = args[1];
+                let dev_t = args[2];
+                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
+                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

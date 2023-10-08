@@ -1,14 +1,6 @@
 name: Rust format check
 
-on:
-  workflow_run:
-    workflows: [Build Check]
-    types:
-      - completed
-  
-  push:
-
-  pull_request:
+on: [push, pull_request]
 
 jobs:
     # ensure the toolchain is cached

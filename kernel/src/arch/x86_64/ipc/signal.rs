@@ -247,13 +247,6 @@ pub struct SigFrame {
     // pub pedding: u64,
     /// 指向restorer的地址的指针。（该变量必须放在sigframe的第一位，因为这样才能在handler返回的时候，跳转到对应的代码，执行sigreturn)
     pub ret_code_ptr: *mut core::ffi::c_void,
-    /// signum
-    pub arg0: u64,
-    /// siginfo pointer
-    pub arg1: usize,
-    /// sigcontext pointer
-    pub arg2: usize,
-
     pub handler: *mut c_void,
     pub info: SigInfo,
     pub context: SigContext,
@@ -312,7 +305,7 @@ impl SigContext {
         *arch_info.cr2_mut() = self.cr2 as usize;
         // (*current_thread).err_code = (*context).err_code;
         // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
-        ProcessManager::current_pcb().arch_info().restore_fp_state();
+        arch_info.restore_fp_state();
         return true;
     }
 }
@@ -351,13 +344,8 @@ pub unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
         if sig_number == Signal::INVALID {
             return;
         }
-        kdebug!(
-            "To handle signal [{}] for pid:{:?}",
-            sig_number as i32,
-            ProcessManager::current_pcb().pid(),
-        );
         assert!(ka.is_some());
-        let res = handle_signal(sig_number, ka.unwrap(), &info.unwrap(), &oldset, frame);
+        let res: Result<i32, SystemError> = handle_signal(sig_number, ka.unwrap(), &info.unwrap(), &oldset, frame);
         if res.is_err() {
             kerror!(
                 "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
@@ -385,7 +373,6 @@ fn handle_signal(
     oldset: &SigSet,
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
-    kdebug!("handling signal :{:?}", sig);
     // 设置栈帧
     let retval = setup_frame(sig, ka, info, oldset, frame);
     if retval.is_err() {
@@ -424,28 +411,24 @@ fn setup_frame(
         return Err(SystemError::EINVAL);
     }
 
-    kdebug!("-----action:{:?}", ka);
     match ka.action() {
         SigactionType::SaHandler(handler_type) => match handler_type {
-            SaHandlerType::SigDefault => unsafe {
-                (*frame).arg0 = sig as u64;
-                (*frame).arg1 = &((*frame).info) as *const SigInfo as usize;
-                (*frame).arg2 = &((*frame).context) as *const SigContext as usize;
+            SaHandlerType::SigDefault => {
                 // TODO 内核提供信号默认处理函数？还是像linux一样在Libc中提供
-                // (*frame).handler = handler as usize as *mut c_void;
-            },
+                //(*frame).handler = handler as usize as *mut c_void;
+            }
             SaHandlerType::SigCustomized(handler) => unsafe {
-                (*frame).arg0 = sig as u64;
-                (*frame).arg1 = &((*frame).info) as *const SigInfo as usize;
-                (*frame).arg2 = &((*frame).context) as *const SigContext as usize;
                 (*frame).handler = handler as usize as *mut c_void;
             },
+            SaHandlerType::SigIgnore => {
+                //TODO 忽略这个信号
+            }
             _ => {
                 return Err(SystemError::EINVAL);
             }
         },
         SigactionType::SaSigaction(_) => {
-            //TODO 这里应该是可以恢复的栈的，等后续来做
+            //TODO 这里应该是可以恢复栈的，等后续来做
             kerror!("trying to recover from sigaction type instead of handler");
             return Err(SystemError::EINVAL);
         }
@@ -482,7 +465,6 @@ fn setup_frame(
         );
         err = 1;
     }
-    kdebug!("sigframe:{:?}", unsafe { *frame });
     compiler_fence(Ordering::SeqCst);
     if err != 0 {
         // todo: 在这里生成一个sigsegv,然后core dump
@@ -530,11 +512,15 @@ fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
     return rsp as *mut SigFrame;
 }
 
+
+#[no_mangle]
 pub fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
-    let frame = (trap_frame.rsp as usize - 8) as *mut SigFrame;
+    assert!(CurrentIrqArch::is_irq_enabled());
+    let frame = (trap_frame.rsp as usize ) as *mut SigFrame;
 
     // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
     if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
+        kerror!("rsp doesn't from user level");
         // todo：这里改为生成一个sigsegv
         // 退出进程
         ProcessManager::exit(Signal::SIGSEGV as usize);
@@ -542,16 +528,13 @@ pub fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
 
     let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
     set_current_sig_blocked(&mut sigmask);
-    kdebug!("--stored frame to be recovered:{:?}", unsafe {
-        (*frame)
-    });
     // 从用户栈恢复sigcontext
     if unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) == false {
+        kdebug!("unable to restore sigcontext");
         // todo：这里改为生成一个sigsegv
         // 退出进程
         ProcessManager::exit(Signal::SIGSEGV as usize);
     }
-    kdebug!("after restore:{:?}", frame);
 
     // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
     return trap_frame.rax;

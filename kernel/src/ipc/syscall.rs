@@ -105,7 +105,6 @@ impl Syscall {
         let mut old_act = old_act as *mut UserSigaction;
         let mut new_ka: Sigaction = Default::default();
         let mut old_ka: Sigaction = Default::default();
-        kdebug!("--act--:{:?}", unsafe { *act });
         // 如果传入的，新的sigaction不为空
         if !act.is_null() {
             // 如果参数的范围不在用户空间，则返回错误
@@ -115,7 +114,6 @@ impl Syscall {
             }
             let mask: SigSet = unsafe { (*act).mask };
             let input_sighandler = unsafe { (*act).handler as u64 };
-            kdebug!("_input_sah={}", input_sighandler);
             match input_sighandler {
                 USER_SIG_DFL => {
                     new_ka = *DEFAULT_SIGACTION;
@@ -138,8 +136,6 @@ impl Syscall {
                 _ => {
                     // 从用户空间获得sigaction结构体
                     // TODO mask是default还是用户空间传入
-                    kdebug!("--receiving function:{:?}", unsafe { (*act).handler }
-                        as u64);
                     new_ka = Sigaction::new(
                         SigactionType::SaHandler(SaHandlerType::SigCustomized(unsafe {
                             (*act).handler as u64

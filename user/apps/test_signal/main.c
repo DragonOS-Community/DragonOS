@@ -52,7 +52,7 @@ int main()
         if (handle_ok)
         {
             printf("Handle OK!\n");
-            // handle_ok = false;
+            handle_ok = false;
         }
     }
 

@@ -190,23 +190,12 @@ impl Signal {
     /// @param pt siginfo结构体中，pid字段代表的含义
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
         // kdebug!("complete_signal");
-        kdebug!(
-            "trying to complete:{:?},after into:{:?}",
-            self,
-            Into::<SigSet>::into(self.clone())
-        );
         // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
         // 将这个信号加到目标进程的sig_pending中
         pcb.sig_info_mut()
             .sig_pending_mut()
             .signal_mut()
             .insert(self.clone().into());
-        kdebug!(
-            "-------completed signal:{:?},queue:{:?},pending:{:?}",
-            self,
-            pcb.sig_info().sig_pending().queue().q,
-            pcb.sig_info().sig_pending().signal(),
-        );
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // ===== 寻找需要wakeup的目标进程 =====
         // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。

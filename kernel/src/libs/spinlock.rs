@@ -26,6 +26,7 @@ pub struct SpinLock<T> {
 #[derive(Debug)]
 pub struct SpinLockGuard<'a, T: 'a> {
     lock: &'a SpinLock<T>,
+    data: *mut T,
     irq_flag: Option<IrqFlagsGuard>,
     flags: SpinLockGuardFlags,
 }
@@ -104,6 +105,7 @@ impl<T> SpinLock<T> {
         if self.inner_try_lock() {
             return Ok(SpinLockGuard {
                 lock: self,
+                data: unsafe { &mut *self.data.get() },
                 irq_flag: None,
                 flags: SpinLockGuardFlags::empty(),
             });
@@ -118,7 +120,7 @@ impl<T> SpinLock<T> {
     fn inner_try_lock(&self) -> bool {
         let res = self
             .lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
         return res;
     }
@@ -129,6 +131,7 @@ impl<T> SpinLock<T> {
         if self.inner_try_lock() {
             return Ok(SpinLockGuard {
                 lock: self,
+                data: unsafe { &mut *self.data.get() },
                 irq_flag: Some(irq_guard),
                 flags: SpinLockGuardFlags::empty(),
             });
@@ -142,6 +145,7 @@ impl<T> SpinLock<T> {
         if self.inner_try_lock() {
             return Ok(SpinLockGuard {
                 lock: self,
+                data: unsafe { &mut *self.data.get() },
                 irq_flag: None,
                 flags: SpinLockGuardFlags::NO_PREEMPT,
             });
@@ -156,11 +160,11 @@ impl<T> SpinLock<T> {
     /// 由于这样做可能导致preempt count不正确，因此必须小心的手动维护好preempt count。
     /// 如非必要，请不要使用这个函数。
     pub unsafe fn force_unlock(&self) {
-        self.lock.store(false, Ordering::Release);
+        self.lock.store(false, Ordering::SeqCst);
     }
 
     fn unlock(&self) {
-        self.lock.store(false, Ordering::Release);
+        self.lock.store(false, Ordering::SeqCst);
         ProcessManager::preempt_enable();
     }
 }
@@ -170,14 +174,14 @@ impl<T> Deref for SpinLockGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        return unsafe { &*self.lock.data.get() };
+        return unsafe { &*self.data };
     }
 }
 
 /// 实现DerefMut trait，支持通过获取SpinLockGuard来获取临界区数据的可变引用
 impl<T> DerefMut for SpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        return unsafe { &mut *self.lock.data.get() };
+        return unsafe { &mut *self.data };
     }
 }
 

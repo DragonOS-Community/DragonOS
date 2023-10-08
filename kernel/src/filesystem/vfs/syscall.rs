@@ -31,6 +31,7 @@ pub const SEEK_MAX: u32 = 3;
 
 bitflags! {
     /// 文件类型和权限
+    #[repr(C)]
     pub struct ModeType: u32 {
         /// 掩码
         const S_IFMT = 0o0_170_000;
@@ -154,8 +155,11 @@ impl Syscall {
                 let parent_inode: Arc<dyn IndexNode> =
                     ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
                 // 创建文件
-                let inode: Arc<dyn IndexNode> =
-                    parent_inode.create(filename, FileType::File, 0o777)?;
+                let inode: Arc<dyn IndexNode> = parent_inode.create(
+                    filename,
+                    FileType::File,
+                    ModeType::from_bits_truncate(0o755),
+                )?;
                 inode
             } else {
                 // 不需要创建文件，因此返回错误码
@@ -180,6 +184,7 @@ impl Syscall {
         }
 
         // 创建文件对象
+
         let mut file: File = File::new(inode, mode)?;
 
         // 打开模式为“追加”
@@ -206,7 +211,9 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        return fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+        let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+
+        return res;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -385,7 +392,10 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        return file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        let res = file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        return res;
     }
 
     /// @brief 创建文件夹
@@ -649,7 +659,7 @@ impl Syscall {
         let metadata = file.lock().metadata()?;
         kstat.size = metadata.size as i64;
         kstat.dev_id = metadata.dev_id as u64;
-        kstat.inode = metadata.inode_id as u64;
+        kstat.inode = metadata.inode_id.into() as u64;
         kstat.blcok_size = metadata.blk_size as i64;
         kstat.blocks = metadata.blocks as u64;
 
@@ -664,7 +674,7 @@ impl Syscall {
         kstat.uid = metadata.uid as i32;
         kstat.gid = metadata.gid as i32;
         kstat.rdev = metadata.raw_dev as i64;
-        kstat.mode.bits = metadata.mode;
+        kstat.mode = metadata.mode;
         match file.lock().file_type() {
             FileType::File => kstat.mode.insert(ModeType::S_IFMT),
             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
@@ -784,9 +794,7 @@ impl IoVecs {
         let mut buf: Vec<u8> = Vec::with_capacity(total_len);
 
         if set_len {
-            unsafe {
-                buf.set_len(total_len);
-            }
+            buf.resize(total_len, 0);
         }
         return buf;
     }

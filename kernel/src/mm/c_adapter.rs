@@ -76,16 +76,8 @@ pub unsafe extern "C" fn kmalloc(size: usize, _gfp: gfp_t) -> usize {
     return do_kmalloc(size, true);
 }
 
-fn do_kmalloc(size: usize, zero: bool) -> usize {
-    let space: Vec<u8> = if zero {
-        vec![0u8; size]
-    } else {
-        let mut v = Vec::with_capacity(size);
-        unsafe {
-            v.set_len(size);
-        }
-        v
-    };
+fn do_kmalloc(size: usize, _zero: bool) -> usize {
+    let space: Vec<u8> = vec![0u8; size];
 
     assert!(space.len() == size);
     let (ptr, len, cap) = space.into_raw_parts();
@@ -100,7 +92,7 @@ fn do_kmalloc(size: usize, zero: bool) -> usize {
                 drop(Vec::from_raw_parts(vaddr.data() as *mut u8, len, cap));
             }
             panic!(
-                "do_kmalloc: vaddr {:?} already exists in C Allocation Map, query size: {size}, zero: {zero}",
+                "do_kmalloc: vaddr {:?} already exists in C Allocation Map, query size: {size}, zero: {_zero}",
                 vaddr
             );
         }

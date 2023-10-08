@@ -5,10 +5,13 @@ use crate::driver::pci::pci::{
     PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
+use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
+use crate::include::bindings::bindings::pt_regs;
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
 use crate::mm::VirtAddr;
+use crate::net::net_core::poll_ifaces_try_lock_onetime;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -53,6 +56,12 @@ const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 /// Device specific configuration.
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
+/// Virtio设备接收中断的设备号
+const VIRTIO_RECV_VECTOR: u16 = 56;
+/// Virtio设备接收中断的设备号的表项号
+const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
+// 接收的queue号
+const QUEUE_RECEIVE: u16 = 0;
 ///@brief device id 转换为设备类型
 ///@param pci_device_id，device_id
 ///@return DeviceType 对应的设备类型
@@ -89,6 +98,11 @@ pub struct PciTransport {
     config_space: Option<NonNull<[u32]>>,
 }
 
+unsafe extern "C" fn virtio_irq_hander(_irq_num: u64, _irq_paramer: u64, _regs: *mut pt_regs) {
+    // kdebug!("12345");
+    poll_ifaces_try_lock_onetime().ok();
+}
+
 impl PciTransport {
     /// Construct a new PCI VirtIO device driver for the given device function on the given PCI
     /// root controller.
@@ -111,6 +125,26 @@ impl PciTransport {
         let mut device_cfg = None;
         device.bar_ioremap().unwrap()?;
         device.enable_master();
+        let standard_device = device.as_standard_device_mut().unwrap();
+        // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号。不能与其他中断重复
+        let irq_vector = standard_device.irq_vector_mut().unwrap();
+        irq_vector.push(VIRTIO_RECV_VECTOR);
+        standard_device
+            .irq_init(IRQ::PCI_IRQ_MSIX)
+            .expect("IRQ init failed");
+        // 中断相关信息
+        let msg = IrqMsg {
+            irq_common_message: IrqCommonMsg::init_from(
+                0,
+                "Virtio_Recv_IRQ",
+                0,
+                virtio_irq_hander,
+                None,
+            ),
+            irq_specific_message: IrqSpecificMsg::msi_default(),
+        };
+        standard_device.irq_install(msg)?;
+        standard_device.irq_enable(true)?;
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
         for capability in device.capabilities().unwrap() {
             if capability.id != PCI_CAP_ID_VNDR {
@@ -268,16 +302,20 @@ impl Transport for PciTransport {
     ) {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
-        // kdebug!("queue_select={}",queue);
-        // kdebug!("queue_size={}",size as u16);
-        // kdebug!("queue_desc={:#x}",descriptors as u64);
-        // kdebug!("driver_area={:#x}",driver_area);
         unsafe {
             volwrite!(self.common_cfg, queue_select, queue);
             volwrite!(self.common_cfg, queue_size, size as u16);
             volwrite!(self.common_cfg, queue_desc, descriptors as u64);
             volwrite!(self.common_cfg, queue_driver, driver_area as u64);
             volwrite!(self.common_cfg, queue_device, device_area as u64);
+            // 这里设置队列中断对应的中断项
+            if queue == QUEUE_RECEIVE {
+                volwrite!(self.common_cfg, queue_msix_vector, VIRTIO_RECV_VECTOR_INDEX);
+                let vector = volread!(self.common_cfg, queue_msix_vector);
+                if vector != VIRTIO_RECV_VECTOR_INDEX {
+                    panic!("Vector set failed");
+                }
+            }
             volwrite!(self.common_cfg, queue_enable, 1);
         }
     }

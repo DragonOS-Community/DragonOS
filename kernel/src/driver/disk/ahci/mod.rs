@@ -70,7 +70,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
     for device in ahci_device {
         let standard_device = device.as_standard_device_mut().unwrap();
         standard_device.bar_ioremap();
-        // 对于每一个ahci控制器分配一块空间 (目前slab algorithm最大支持1MB)
+        // 对于每一个ahci控制器分配一块空间
         let ahci_port_base_vaddr =
             Box::leak(Box::new([0u8; (1 << 20) as usize])) as *mut u8 as usize;
         let virtaddr = standard_device

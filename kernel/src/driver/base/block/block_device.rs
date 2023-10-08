@@ -1,5 +1,15 @@
 /// 引入Module
-use crate::{driver::base::device::Device, syscall::SystemError};
+use crate::{
+    driver::base::{
+        device::{mkdev, Device, DeviceNumber, IdTable, BLOCKDEVS, DEVICE_MANAGER},
+        map::{
+            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX, MINOR_MASK,
+        },
+    },
+    kerror,
+    syscall::SystemError,
+};
 use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 
@@ -305,5 +315,179 @@ pub trait BlockDevice: Device {
         //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
         //     self.0
         // );
+    }
+}
+
+/// @brief 块设备框架函数集
+pub struct BlockDeviceOps;
+
+impl BlockDeviceOps {
+    /// @brief: 主设备号转下标
+    /// @parameter: major: 主设备号
+    /// @return: 返回下标
+    #[allow(dead_code)]
+    fn major_to_index(major: usize) -> usize {
+        return major % DEV_MAJOR_HASH_SIZE;
+    }
+
+    /// @brief: 动态获取主设备号
+    /// @parameter: None
+    /// @return: 如果成功，返回主设备号，否则，返回错误码
+    #[allow(dead_code)]
+    fn find_dynamic_major() -> Result<usize, SystemError> {
+        let blockdevs = BLOCKDEVS.lock();
+        // 寻找主设备号为234～255的设备
+        for index in (DEV_MAJOR_DYN_END..DEV_MAJOR_HASH_SIZE).rev() {
+            if let Some(item) = blockdevs.get(index) {
+                if item.is_empty() {
+                    return Ok(index); // 返回可用的主设备号
+                }
+            }
+        }
+        // 寻找主设备号在384～511的设备
+        for index in (DEV_MAJOR_DYN_EXT_END + 1..DEV_MAJOR_DYN_EXT_START + 1).rev() {
+            if let Some(blockdevss) = blockdevs.get(Self::major_to_index(index)) {
+                let mut flag = true;
+                for item in blockdevss {
+                    if item.device_number().major() == index {
+                        flag = false;
+                        break;
+                    }
+                }
+                if flag {
+                    // 如果数组中不存在主设备号等于index的设备
+                    return Ok(index); // 返回可用的主设备号
+                }
+            }
+        }
+        return Err(SystemError::EBUSY);
+    }
+
+    /// @brief: 注册设备号，该函数需要指定主设备号
+    /// @parameter: from: 主设备号
+    ///             count: 次设备号数量
+    ///             name: 字符设备名
+    /// @return: 如果注册成功，返回设备号，否则，返回错误码
+    #[allow(dead_code)]
+    pub fn register_blockdev_region(
+        from: DeviceNumber,
+        count: usize,
+        name: &'static str,
+    ) -> Result<DeviceNumber, SystemError> {
+        Self::__register_blockdev_region(from, count, name)
+    }
+
+    /// @brief: 注册设备号，该函数自动分配主设备号
+    /// @parameter: baseminor: 主设备号
+    ///             count: 次设备号数量
+    ///             name: 字符设备名
+    /// @return: 如果注册成功，返回，否则，返回false
+    #[allow(dead_code)]
+    pub fn alloc_blockdev_region(
+        baseminor: usize,
+        count: usize,
+        name: &'static str,
+    ) -> Result<DeviceNumber, SystemError> {
+        Self::__register_blockdev_region(mkdev(0, baseminor), count, name)
+    }
+
+    /// @brief: 注册设备号
+    /// @parameter: device_number: 设备号，主设备号如果为0，则动态分配
+    ///             minorct: 次设备号数量
+    ///             name: 字符设备名
+    /// @return: 如果注册成功，返回设备号，否则，返回错误码
+    fn __register_blockdev_region(
+        device_number: DeviceNumber,
+        minorct: usize,
+        name: &'static str,
+    ) -> Result<DeviceNumber, SystemError> {
+        let mut major = device_number.major();
+        let baseminor = device_number.minor();
+        if major >= DEV_MAJOR_MAX {
+            kerror!(
+                "DEV {} major requested {} is greater than the maximum {}\n",
+                name,
+                major,
+                DEV_MAJOR_MAX - 1
+            );
+        }
+        if minorct > MINOR_MASK + 1 - baseminor {
+            kerror!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
+                name, baseminor, baseminor + minorct - 1, 0, MINOR_MASK);
+        }
+        let blockdev = DeviceStruct::new(mkdev(major, baseminor), minorct, name);
+        if major == 0 {
+            // 如果主设备号为0,则自动分配主设备号
+            major = Self::find_dynamic_major().expect("Find synamic major error.\n");
+        }
+        if let Some(items) = BLOCKDEVS.lock().get_mut(Self::major_to_index(major)) {
+            let mut insert_index: usize = 0;
+            for (index, item) in items.iter().enumerate() {
+                insert_index = index;
+                match item.device_number().major().cmp(&major) {
+                    core::cmp::Ordering::Less => continue,
+                    core::cmp::Ordering::Greater => {
+                        break; // 大于则向后插入
+                    }
+                    core::cmp::Ordering::Equal => {
+                        if item.device_number().minor() + item.minorct() <= baseminor {
+                            continue; // 下一个主设备号大于或者次设备号大于被插入的次设备号最大值
+                        }
+                        if item.base_minor() >= baseminor + minorct {
+                            break; // 在此处插入
+                        }
+                        return Err(SystemError::EBUSY); // 存在重合的次设备号
+                    }
+                }
+            }
+            items.insert(insert_index, blockdev);
+        }
+        return Ok(mkdev(major, baseminor));
+    }
+
+    /// @brief: 注销设备号
+    /// @parameter: major: 主设备号，如果为0，动态分配
+    ///             baseminor: 起始次设备号
+    ///             minorct: 次设备号数量
+    /// @return: 如果注销成功，返回()，否则，返回错误码
+    fn __unregister_blockdev_region(
+        device_number: DeviceNumber,
+        minorct: usize,
+    ) -> Result<(), SystemError> {
+        if let Some(items) = BLOCKDEVS
+            .lock()
+            .get_mut(Self::major_to_index(device_number.major()))
+        {
+            for (index, item) in items.iter().enumerate() {
+                if item.device_number() == device_number && item.minorct() == minorct {
+                    // 设备号和数量都相等
+                    items.remove(index);
+                    return Ok(());
+                }
+            }
+        }
+        return Err(SystemError::EBUSY);
+    }
+
+    /// @brief: 块设备注册
+    /// @parameter: cdev: 字符设备实例
+    ///             dev_t: 字符设备号
+    ///             range: 次设备号范围
+    /// @return: none
+    #[allow(dead_code)]
+    pub fn bdev_add(bdev: Arc<dyn BlockDevice>, id_table: IdTable) {
+        if Into::<usize>::into(id_table.device_number()) == 0 {
+            kerror!("Device number can't be 0!\n");
+        }
+        DEVICE_MANAGER.add_device(id_table, bdev.device())
+    }
+
+    /// @brief: block设备注销
+    /// @parameter: dev_t: 字符设备号
+    ///             range: 次设备号范围
+    /// @return: none
+    #[allow(dead_code)]
+    pub fn bdev_del(_devnum: DeviceNumber, _range: usize) {
+        unimplemented!();
     }
 }

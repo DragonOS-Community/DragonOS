@@ -36,9 +36,9 @@ pub fn initial_kernel_thread() -> i32 {
 
 /// 切换到用户态
 fn switch_to_user() {
-    let path = String::from("/bin/shell.elf");
-    let argv = vec![String::from("/bin/shell.elf")];
-    let envp = vec![String::from("PATH=/bin")];
+    let path = String::from("/bin/DragonReach");
+    let argv = vec![String::from("/bin/DragonReach")];
+    let envp = vec![String::from("PATH=/")];
 
     unsafe { arch_switch_to_user(path, argv, envp) };
 }

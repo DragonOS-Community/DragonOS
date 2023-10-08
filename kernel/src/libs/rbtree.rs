@@ -1416,10 +1416,12 @@ impl<K: Ord, V> RBTree<K, V> {
     }
 }
 
+#[cfg(test)]
 mod tests {
 
     #[test]
     fn test_insert() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         assert_eq!(m.len(), 0);
         m.insert(1, 2);
@@ -1435,6 +1437,7 @@ mod tests {
 
     #[test]
     fn test_replace() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         assert_eq!(m.len(), 0);
         m.insert(2, 4);
@@ -1446,6 +1449,7 @@ mod tests {
 
     #[test]
     fn test_clone() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         assert_eq!(m.len(), 0);
         m.insert(1, 2);
@@ -1461,12 +1465,14 @@ mod tests {
 
     #[test]
     fn test_empty_remove() {
+        use crate::libs::rbtree::RBTree;
         let mut m: RBTree<isize, bool> = RBTree::new();
         assert_eq!(m.remove(&0), None);
     }
 
     #[test]
     fn test_empty_iter() {
+        use crate::libs::rbtree::RBTree;
         let mut m: RBTree<isize, bool> = RBTree::new();
         assert_eq!(m.iter().next(), None);
         assert_eq!(m.iter_mut().next(), None);
@@ -1477,6 +1483,7 @@ mod tests {
 
     #[test]
     fn test_lots_of_insertions() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
 
         // Try this a few times to make sure we never screw up the hashmap's
@@ -1540,6 +1547,7 @@ mod tests {
 
     #[test]
     fn test_find_mut() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         m.insert(1, 12);
         m.insert(2, 8);
@@ -1554,6 +1562,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         m.insert(1, 2);
         assert_eq!(*m.get(&1).unwrap(), 2);
@@ -1571,6 +1580,7 @@ mod tests {
 
     #[test]
     fn test_is_empty() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         m.insert(1, 2);
         assert!(!m.is_empty());
@@ -1580,6 +1590,7 @@ mod tests {
 
     #[test]
     fn test_pop() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         m.insert(2, 4);
         m.insert(1, 2);
@@ -1595,6 +1606,7 @@ mod tests {
 
     #[test]
     fn test_iterate() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         for i in 0..32 {
             m.insert(i, i * 2);
@@ -1612,6 +1624,7 @@ mod tests {
 
     #[test]
     fn test_keys() {
+        use crate::libs::rbtree::RBTree;
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
         let map: RBTree<_, _> = vec.into_iter().collect();
         let keys: Vec<_> = map.keys().cloned().collect();
@@ -1623,6 +1636,7 @@ mod tests {
 
     #[test]
     fn test_values() {
+        use crate::libs::rbtree::RBTree;
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
         let map: RBTree<_, _> = vec.into_iter().collect();
         let values: Vec<_> = map.values().cloned().collect();
@@ -1634,6 +1648,7 @@ mod tests {
 
     #[test]
     fn test_values_mut() {
+        use crate::libs::rbtree::RBTree;
         let vec = vec![(1, 1), (2, 2), (3, 3)];
         let mut map: RBTree<_, _> = vec.into_iter().collect();
         for value in map.values_mut() {
@@ -1648,6 +1663,7 @@ mod tests {
 
     #[test]
     fn test_find() {
+        use crate::libs::rbtree::RBTree;
         let mut m = RBTree::new();
         assert!(m.get(&1).is_none());
         m.insert(1, 2);
@@ -1659,6 +1675,7 @@ mod tests {
 
     #[test]
     fn test_eq() {
+        use crate::libs::rbtree::RBTree;
         let mut m1 = RBTree::new();
         m1.insert(1, 2);
         m1.insert(2, 3);
@@ -1677,6 +1694,7 @@ mod tests {
 
     #[test]
     fn test_show() {
+        use crate::libs::rbtree::RBTree;
         let mut map = RBTree::new();
         let empty: RBTree<i32, i32> = RBTree::new();
 
@@ -1691,6 +1709,7 @@ mod tests {
 
     #[test]
     fn test_from_iter() {
+        use crate::libs::rbtree::RBTree;
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
         let map: RBTree<_, _> = xs.iter().cloned().collect();
@@ -1702,6 +1721,7 @@ mod tests {
 
     #[test]
     fn test_size_hint() {
+        use crate::libs::rbtree::RBTree;
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
         let map: RBTree<_, _> = xs.iter().cloned().collect();
@@ -1715,6 +1735,7 @@ mod tests {
 
     #[test]
     fn test_iter_len() {
+        use crate::libs::rbtree::RBTree;
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
         let map: RBTree<_, _> = xs.iter().cloned().collect();
@@ -1728,6 +1749,7 @@ mod tests {
 
     #[test]
     fn test_mut_size_hint() {
+        use crate::libs::rbtree::RBTree;
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
         let mut map: RBTree<_, _> = xs.iter().cloned().collect();
@@ -1741,6 +1763,7 @@ mod tests {
 
     #[test]
     fn test_iter_mut_len() {
+        use crate::libs::rbtree::RBTree;
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
         let mut map: RBTree<_, _> = xs.iter().cloned().collect();
@@ -1754,6 +1777,7 @@ mod tests {
 
     #[test]
     fn test_index() {
+        use crate::libs::rbtree::RBTree;
         let mut map = RBTree::new();
 
         map.insert(1, 2);
@@ -1766,6 +1790,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_index_nonexistent() {
+        use crate::libs::rbtree::RBTree;
         let mut map = RBTree::new();
 
         map.insert(1, 2);
@@ -1777,6 +1802,7 @@ mod tests {
 
     #[test]
     fn test_extend_iter() {
+        use crate::libs::rbtree::RBTree;
         let mut a = RBTree::new();
         a.insert(1, "one");
         let mut b = RBTree::new();

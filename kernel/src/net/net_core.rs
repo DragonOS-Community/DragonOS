@@ -31,11 +31,12 @@ impl TimerFunction for NetWorkPollFunc {
 pub fn net_init() -> Result<(), SystemError> {
     dhcp_query()?;
     // Init poll timer function
-    let next_time = next_n_ms_timer_jiffies(5);
-    let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
-    timer.activate();
+    // let next_time = next_n_ms_timer_jiffies(5);
+    // let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
+    // timer.activate();
     return Ok(());
 }
+
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DRIVERS.write();
 
@@ -52,15 +53,14 @@ fn dhcp_query() -> Result<(), SystemError> {
     // IMPORTANT: This should be removed in production.
     dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(10)));
 
-    let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
-    let dhcp_handle = sockets.add(dhcp_socket);
+    let dhcp_handle = SOCKET_SET.lock().add(dhcp_socket);
 
     const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
         kdebug!("DHCP try round: {}", i);
-        let _flag = net_face.poll(&mut sockets);
-        let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
-        // kdebug!("event = {event:?} !!!");
+        net_face.poll(&mut SOCKET_SET.lock()).ok();
+        let mut binding = SOCKET_SET.lock();
+        let event = binding.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
 
         match event {
             None => {}
@@ -160,4 +160,24 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 
     // 尝试次数用完，返回错误
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+}
+
+/// 对ifaces进行轮询，最多对SOCKET_SET尝试一次加锁。
+///
+/// @return 轮询成功，返回Ok(())
+/// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
+/// @return 没有网卡，返回SystemError::ENODEV
+pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+    if guard.len() == 0 {
+        kwarn!("poll_ifaces: No net driver found!");
+        // 没有网卡，返回错误
+        return Err(SystemError::ENODEV);
+    }
+    let mut sockets = SOCKET_SET.try_lock()?;
+    for (_, iface) in guard.iter() {
+        iface.poll(&mut sockets).ok();
+    }
+    SOCKET_WAITQUEUE.wakeup_all(None);
+    return Ok(());
 }

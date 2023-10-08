@@ -15,7 +15,10 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         sysfs::bus::{bus_device_register, bus_driver_register},
-        vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus},
+        vfs::{
+            syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+            PollStatus,
+        },
     },
     include::bindings::bindings::{io_in8, io_out8},
     kinfo,
@@ -314,7 +317,7 @@ impl IndexNode for LockedUart {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-EOPNOTSUPP_OR_ENOTSUP)的返回值
         return self.create_with_data(name, file_type, mode, 0);
@@ -324,7 +327,7 @@ impl IndexNode for LockedUart {
         &self,
         _name: &str,
         _file_type: FileType,
-        _mode: u32,
+        _mode: ModeType,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”

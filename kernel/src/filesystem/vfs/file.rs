@@ -8,17 +8,20 @@ use crate::{
         tty::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
+    ipc::pipe::PipeFsPrivateData,
     kerror,
     libs::spinlock::SpinLock,
     process::ProcessManager,
     syscall::SystemError,
 };
 
-use super::{Dirent, FileType, IndexNode, Metadata};
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 pub enum FilePrivateData {
+    /// 管道文件私有信息
+    Pipefs(PipeFsPrivateData),
     /// procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
     /// 设备文件的私有信息
@@ -185,7 +188,7 @@ impl File {
     }
 
     /// @brief 根据inode号获取子目录项的名字
-    pub fn get_entry_name(&self, ino: usize) -> Result<String, SystemError> {
+    pub fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         return self.inode.get_entry_name(ino);
     }
 
@@ -258,7 +261,6 @@ impl File {
             self.readdir_subdirs_name = inode.list()?;
             self.readdir_subdirs_name.sort();
         }
-
         // kdebug!("sub_entries={sub_entries:?}");
         if self.readdir_subdirs_name.is_empty() {
             self.offset = 0;
@@ -276,9 +278,7 @@ impl File {
         let name_bytes: &[u8] = name.as_bytes();
 
         self.offset += 1;
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id as u64;
-        dirent.d_off = 0;
-        dirent.d_reclen = 0;
+        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
         dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
         // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
         unsafe {
@@ -289,8 +289,13 @@ impl File {
         }
 
         // 计算dirent结构体的大小
-        return Ok((name_bytes.len() + ::core::mem::size_of::<Dirent>()
-            - ::core::mem::size_of_val(&dirent.d_name)) as u64);
+        let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()
+            - ::core::mem::size_of_val(&dirent.d_name)) as u64;
+
+        dirent.d_reclen = size as u16;
+        dirent.d_off += dirent.d_reclen as i64;
+
+        return Ok(size);
     }
 
     pub fn inode(&self) -> Arc<dyn IndexNode> {
@@ -507,7 +512,58 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
+
         assert!(Arc::strong_count(&file) == 1);
         return Ok(());
+    }
+
+    pub fn iter(&self) -> FileDescriptorIterator {
+        return FileDescriptorIterator::new(self);
+    }
+
+    pub fn close_on_exec(&mut self) {
+        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            if let Some(file) = &self.fds[i] {
+                let to_drop = file.lock().close_on_exec();
+                if to_drop {
+                    let r = self.drop_fd(i as i32);
+                    if let Err(r) = r {
+                        kerror!(
+                            "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
+                            ProcessManager::current_pcb().pid(),
+                            i,
+                            r
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FileDescriptorIterator<'a> {
+    fds: &'a FileDescriptorVec,
+    index: usize,
+}
+
+impl<'a> FileDescriptorIterator<'a> {
+    pub fn new(fds: &'a FileDescriptorVec) -> Self {
+        return Self { fds, index: 0 };
+    }
+}
+
+impl<'a> Iterator for FileDescriptorIterator<'a> {
+    type Item = (i32, Arc<SpinLock<File>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < FileDescriptorVec::PROCESS_MAX_FD {
+            let fd = self.index as i32;
+            self.index += 1;
+            if let Some(file) = self.fds.get_file_by_fd(fd) {
+                return Some((fd, file));
+            }
+        }
+        return None;
     }
 }

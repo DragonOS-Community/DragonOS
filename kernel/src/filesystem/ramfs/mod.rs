@@ -1,4 +1,5 @@
 use core::any::Any;
+use core::intrinsics::unlikely;
 
 use alloc::{
     collections::BTreeMap,
@@ -9,6 +10,7 @@ use alloc::{
 
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
+    ipc::pipe::LockedPipeInode,
     libs::spinlock::{SpinLock, SpinLockGuard},
     syscall::SystemError,
     time::TimeSpec,
@@ -16,7 +18,7 @@ use crate::{
 
 use super::vfs::{
     file::FilePrivateData, syscall::ModeType, FileSystem, FsInfo, IndexNode, InodeId, Metadata,
-    PollStatus,
+    PollStatus, SpecialNodeData,
 };
 
 /// RamFS的inode名称的最大长度
@@ -52,8 +54,8 @@ pub struct RamFSInode {
     metadata: Metadata,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<RamFS>,
-    /// 特殊文件节点
-    special_nod: Option<Arc<dyn IndexNode>>,
+    /// 指向特殊节点
+    special_node: Option<SpecialNodeData>,
 }
 
 impl FileSystem for RamFS {
@@ -100,7 +102,7 @@ impl RamFS {
                 raw_dev: 0,
             },
             fs: Weak::default(),
-            special_nod: None,
+            special_node: None,
         })));
 
         let result: Arc<RamFS> = Arc::new(RamFS { root_inode: root });
@@ -299,7 +301,7 @@ impl IndexNode for LockedRamFSInode {
                 raw_dev: data,
             },
             fs: inode.fs.clone(),
-            special_nod: None,
+            special_node: None,
         })));
 
         // 初始化inode的自引用的weak指针
@@ -481,12 +483,71 @@ impl IndexNode for LockedRamFSInode {
         return Ok(keys);
     }
 
-    fn special_nod(&self) -> Option<Arc<dyn IndexNode>> {
-        return self.0.lock().special_nod.clone();
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: ModeType,
+        _dev_t: crate::driver::base::device::DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // 判断需要创建的类型
+        if unlikely(mode.contains(ModeType::S_IFREG)) {
+            // 普通文件
+            return Ok(self.create(filename, FileType::File, mode)?);
+        }
+
+        let nod = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
+            parent: inode.self_ref.clone(),
+            self_ref: Weak::default(),
+            children: BTreeMap::new(),
+            data: Vec::new(),
+            metadata: Metadata {
+                dev_id: 0,
+                inode_id: generate_inode_id(),
+                size: 0,
+                blk_size: 0,
+                blocks: 0,
+                atime: TimeSpec::default(),
+                mtime: TimeSpec::default(),
+                ctime: TimeSpec::default(),
+                file_type: FileType::Pipe,
+                mode: mode,
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                raw_dev: 0,
+            },
+            fs: inode.fs.clone(),
+            special_node: None,
+        })));
+
+        nod.0.lock().self_ref = Arc::downgrade(&nod);
+
+        if mode.contains(ModeType::S_IFIFO) {
+            nod.0.lock().metadata.file_type = FileType::Pipe;
+            // 创建pipe文件
+            let pipe_inode = LockedPipeInode::new();
+            // 设置special_node
+            nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
+        } else if mode.contains(ModeType::S_IFBLK) {
+            nod.0.lock().metadata.file_type = FileType::BlockDevice;
+            unimplemented!()
+        } else if mode.contains(ModeType::S_IFCHR) {
+            nod.0.lock().metadata.file_type = FileType::CharDevice;
+            unimplemented!()
+        }
+
+        inode
+            .children
+            .insert(String::from(filename).to_uppercase(), nod.clone());
+        Ok(nod)
     }
 
-    fn set_special_nod(&self, nod: Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        self.0.lock().special_nod = Some(nod);
-        return Ok(());
+    fn special_node(&self) -> Option<super::vfs::SpecialNodeData> {
+        return self.0.lock().special_node.clone();
     }
 }

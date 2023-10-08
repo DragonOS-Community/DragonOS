@@ -7,7 +7,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
@@ -375,7 +375,7 @@ pub const SYS_GETPGID: usize = 50;
 
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
-pub const SYS_MKFIFO: usize = 53;
+pub const SYS_MKNOD: usize = 53;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -418,9 +418,9 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 } else {
                     let path: &str = path.unwrap();
+
                     let flags = args[1];
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-
                     Self::open(path, open_flags)
                 };
 
@@ -428,7 +428,10 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                Self::close(fd)
+
+                let res = Self::close(fd);
+
+                res
             }
             SYS_READ => {
                 let fd = args[0] as i32;
@@ -546,6 +549,7 @@ impl Syscall {
 
             SYS_GET_DENTS => {
                 let fd = args[0] as i32;
+
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
@@ -970,20 +974,12 @@ impl Syscall {
                 res
             }
 
-            SYS_MKFIFO => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-                    let flags = args[1];
-                    let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-
-                    Self::mkfifo(path, flags | ModeType::S_IFIFO)
-                };
-
-                res
+            SYS_MKNOD => {
+                let path = args[0];
+                let flags = args[1];
+                let dev_t = args[2];
+                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
+                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

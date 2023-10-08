@@ -1,3 +1,5 @@
+use core::ffi::CStr;
+
 use alloc::{
     string::{String, ToString},
     sync::Arc,
@@ -5,14 +7,14 @@ use alloc::{
 };
 
 use crate::{
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
-    include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
+    include::bindings::bindings::{verify_area, AT_REMOVEDIR, PROC_MAX_FD_NUM},
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{Syscall, SystemError},
+    syscall::{user_access::UserBufferReader, Syscall, SystemError},
     time::TimeSpec,
 };
 
@@ -21,7 +23,7 @@ use super::{
     fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
-    Dirent, FileType, IndexNode, ROOT_INODE,
+    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE,
 };
 
 pub const SEEK_SET: u32 = 0;
@@ -137,7 +139,7 @@ impl Syscall {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
 
         // 文件名过长
-        if path.len() > PAGE_4K_SIZE as usize {
+        if path.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
 
@@ -184,6 +186,7 @@ impl Syscall {
         }
 
         // 创建文件对象
+
         let mut file: File = File::new(inode, mode)?;
 
         // 打开模式为“追加”
@@ -210,7 +213,9 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        return fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+        let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+
+        return res;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -389,7 +394,10 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        return file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        let res = file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        return res;
     }
 
     /// @brief 创建文件夹
@@ -690,6 +698,38 @@ impl Syscall {
         unsafe {
             *usr_kstat = kstat;
         }
+        return Ok(0);
+    }
+
+    pub fn mknod(
+        path_ptr: *const i8,
+        mode: ModeType,
+        dev_t: DeviceNumber,
+    ) -> Result<usize, SystemError> {
+        // 安全检验
+        let len = unsafe { CStr::from_ptr(path_ptr).to_bytes().len() };
+        let user_buffer = UserBufferReader::new(path_ptr, len, true)?;
+        let buf = user_buffer.read_from_user::<u8>(0)?;
+        let path = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+
+        // 文件名过长
+        if path.len() > MAX_PATHLEN as usize {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+
+        if inode.is_ok() {
+            return Err(SystemError::EEXIST);
+        }
+
+        let (filename, parent_path) = rsplit_path(path);
+
+        // 查找父目录
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+        // 创建nod
+        parent_inode.mknod(filename, mode, dev_t)?;
+
         return Ok(0);
     }
 }

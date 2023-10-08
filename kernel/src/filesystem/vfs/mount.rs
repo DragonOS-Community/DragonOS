@@ -8,7 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
-use crate::{libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
@@ -63,11 +63,11 @@ impl MountFS {
         let weak: Weak<MountFS> = Arc::downgrade(&mount_fs);
 
         // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
-        let ptr: *mut MountFS = Arc::into_raw(mount_fs) as *mut Self;
+        let ptr: *mut MountFS = mount_fs.as_ref() as *const Self as *mut Self;
         unsafe {
             (*ptr).self_ref = weak;
             // 返回初始化好的MountFS对象
-            return Arc::from_raw(ptr);
+            return mount_fs;
         }
     }
 
@@ -97,7 +97,7 @@ impl MountFSInode {
         let weak: Weak<MountFSInode> = Arc::downgrade(&inode);
         // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
         compiler_fence(Ordering::SeqCst);
-        let ptr: *mut MountFSInode = Arc::into_raw(inode.clone()) as *mut Self;
+        let ptr: *mut MountFSInode = inode.as_ref() as *const Self as *mut Self;
         compiler_fence(Ordering::SeqCst);
         unsafe {
             (*ptr).self_ref = weak;
@@ -350,18 +350,23 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn mknod(&self, filename: &str, mode: ModeType) -> Result<(), SystemError> {
-        self.inner_inode.mknod(filename, mode)
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: ModeType,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Ok(MountFSInode {
+            inner_inode: self.inner_inode.mknod(filename, mode, dev_t)?,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: Weak::default(),
+        }
+        .wrap());
     }
 
     #[inline]
-    fn special_nod(&self) -> Option<Arc<dyn IndexNode>> {
-        self.inner_inode.special_nod()
-    }
-
-    #[inline]
-    fn set_special_nod(&self, nod: Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        self.inner_inode.set_special_nod(nod)
+    fn special_node(&self) -> Option<super::SpecialNodeData> {
+        self.inner_inode.special_node()
     }
 }
 

@@ -21,6 +21,7 @@ use crate::{
     process::ProcessManager,
     syscall::{user_access::UserBufferWriter, SystemError},
 };
+use alloc::boxed::Box;
 
 /// 最大支持的信号数量
 pub const _NSIG: usize = 64;
@@ -365,6 +366,7 @@ impl SignalArch for X86_64SignalArch {
 
     #[no_mangle]
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
+        kdebug!("--executing sigreturn");
         assert!(CurrentIrqArch::is_irq_enabled());
         let frame = (trap_frame.rsp as usize) as *mut SigFrame;
 
@@ -436,7 +438,7 @@ fn setup_frame(
         kerror!("In setup frame: access check failed");
         return Err(SystemError::EPERM);
     }
-    compiler_fence(Ordering::SeqCst);
+
     if ka.restorer().is_none() {
         kerror!(
             "restorer in process:{:?} is not defined",
@@ -449,11 +451,28 @@ fn setup_frame(
         SigactionType::SaHandler(handler_type) => match handler_type {
             SaHandlerType::SigDefault => {
                 // TODO 内核提供信号默认处理函数？还是像linux一样在Libc中提供
-                //(*frame).handler = handler as usize as *mut c_void;
+                unsafe {
+                    let default_handler: *mut c_void = sig_default_handler(sig);
+                    (*frame).handler = default_handler;
+                };
             }
-            SaHandlerType::SigCustomized(handler) => unsafe {
-                (*frame).handler = handler as usize as *mut c_void;
-            },
+            SaHandlerType::SigCustomized(handler) => {
+                // 如果handler位于内核空间
+                if handler >= USER_MAX_LINEAR_ADDR {
+                    // 如果当前是SIGSEGV,则采用默认函数处理
+                    if sig == Signal::SIGSEGV {
+                        ka.flags_mut().insert(SigFlags::SA_FLAG_DFL);
+                        unsafe {
+                            (*frame).handler = sig_default_handler(sig);
+                        };
+                    } else {
+                        //将 handler 设置为0
+                        unsafe { (*frame).handler = 0 as usize as *mut c_void };
+                    }
+                } else {
+                    unsafe { (*frame).handler = handler as usize as *mut c_void };
+                }
+            }
             SaHandlerType::SigIgnore => {
                 //TODO 忽略这个信号
             }
@@ -467,7 +486,6 @@ fn setup_frame(
             return Err(SystemError::EINVAL);
         }
     }
-    compiler_fence(Ordering::SeqCst);
     // 将当前进程的fp_state拷贝到用户栈
     ProcessManager::current_pcb().arch_info().save_fp_state();
     // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
@@ -499,32 +517,27 @@ fn setup_frame(
         );
         err = 1;
     }
-    compiler_fence(Ordering::SeqCst);
+
     if err != 0 {
         // todo: 在这里生成一个sigsegv,然后core dump
         //临时解决方案：退出当前进程
         kerror!("failed copy signal info  to user stack");
         ProcessManager::exit(1);
     }
-    compiler_fence(Ordering::SeqCst);
-    // 传入信号处理函数的第一个参数
-    trap_frame.rdi = sig as u64;
-    trap_frame.rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
-    trap_frame.rsp = frame as u64;
-    trap_frame.rip = unsafe { (*frame).handler as u64 };
-    compiler_fence(Ordering::SeqCst);
-    // todo: 传入新版的sa_sigaction的处理函数的第三个参数
-    // 如果handler位于内核空间
-    if trap_frame.rip >= USER_MAX_LINEAR_ADDR {
-        // 如果当前是SIGSEGV,则采用默认函数处理
-        if sig == Signal::SIGSEGV {
-            ka.flags_mut().insert(SigFlags::SA_FLAG_DFL);
-        }
+    kdebug!("---- default fucntion:{:?}", unsafe { (*frame).handler });
 
-        //将rip设置为0
-        trap_frame.rip = 0;
-    }
-    compiler_fence(Ordering::SeqCst);
+    // 传入信号处理函数的第一个参数
+    (*trap_frame).rdi = sig as u64;
+    (*trap_frame).rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
+    (*trap_frame).rsp = frame as u64;
+    (*trap_frame).rip = unsafe { (*frame).handler as u64 };
+    kdebug!("----trap_frame to be exec:{:?}", trap_frame);
+    kdebug!(
+        "---- default fucntion:{:?},--as u64:{:?}",
+        unsafe { (*frame).handler },
+        unsafe { (*frame).handler } as u64
+    );
+
     // 设置cs和ds寄存器
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
     trap_frame.ds = (USER_DS.bits() | 0x3) as u64;
@@ -544,4 +557,80 @@ fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
     // 按照要求进行对齐
     rsp &= (-(STACK_ALIGN as i64)) as usize;
     return rsp as *mut SigFrame;
+}
+
+/// 信号默认处理函数——终止进程
+#[no_mangle]
+extern "C" fn sig_terminate(sig: Signal) {
+    // kdebug!("executing sig_terminate");
+    ProcessManager::exit(sig as usize);
+}
+
+/// 信号默认处理函数——终止进程并生成 core dump
+#[no_mangle]
+extern "C" fn sig_terminate_dump(sig: Signal) {
+    ProcessManager::exit(sig as usize);
+    // TODO 生成 coredump 文件
+}
+
+/// 信号默认处理函数——暂停进程并生成 core dump
+#[no_mangle]
+extern "C" fn sig_stop(sig: Signal) {
+    todo!();
+    // TODO 暂停进程
+}
+
+/// 信号默认处理函数——忽略
+#[no_mangle]
+extern "C" fn sig_ignore(_sig: Signal) {
+    return;
+}
+
+/// 信号默认处理函数——忽略
+#[no_mangle]
+extern "C" fn sig_continue(_sig: Signal) {
+    todo!();
+    // TODO 继续进程
+}
+
+/// 分发默认处理函数
+#[no_mangle]
+unsafe fn sig_default_handler(sig: Signal) -> *mut c_void {
+    let ret = match sig {
+        Signal::INVALID => todo!(),
+        Signal::SIGHUP => sig_terminate,
+        Signal::SIGINT => sig_terminate,
+        Signal::SIGQUIT => sig_terminate_dump,
+        Signal::SIGILL => sig_terminate_dump,
+        Signal::SIGTRAP => sig_terminate_dump,
+        Signal::SIGABRT_OR_IOT => sig_terminate_dump,
+        Signal::SIGBUS => sig_terminate_dump,
+        Signal::SIGFPE => sig_terminate_dump,
+        Signal::SIGKILL => sig_terminate,
+        Signal::SIGUSR1 => sig_terminate,
+        Signal::SIGSEGV => sig_terminate_dump,
+        Signal::SIGUSR2 => sig_terminate,
+        Signal::SIGPIPE => sig_terminate,
+        Signal::SIGALRM => sig_terminate,
+        Signal::SIGTERM => sig_terminate,
+        Signal::SIGSTKFLT => sig_terminate,
+        Signal::SIGCHLD => sig_ignore,
+        Signal::SIGCONT => sig_continue,
+        Signal::SIGSTOP => sig_stop,
+        Signal::SIGTSTP => sig_stop,
+        Signal::SIGTTIN => sig_stop,
+        Signal::SIGTTOU => sig_stop,
+        Signal::SIGURG => sig_ignore,
+        Signal::SIGXCPU => sig_terminate_dump,
+        Signal::SIGXFSZ => sig_terminate_dump,
+        Signal::SIGVTALRM => sig_terminate,
+        Signal::SIGPROF => sig_terminate,
+        Signal::SIGWINCH => sig_ignore,
+        Signal::SIGIO_OR_POLL => sig_terminate,
+        Signal::SIGPWR => sig_terminate,
+        Signal::SIGSYS => sig_terminate,
+        Signal::SIGRTMIN => sig_terminate,
+        Signal::SIGRTMAX => sig_terminate,
+    };
+    return ret as *mut c_void;
 }

@@ -25,11 +25,12 @@
 #include <unistd.h>
 
 bool handle_ok = false;
-
+int count = 0;
 void handler(int sig)
 {
     printf("handle %d\n", sig);
     handle_ok = true;
+    count ++;
 }
 
 int main()
@@ -53,6 +54,9 @@ int main()
         {
             printf("Handle OK!\n");
             handle_ok = false;
+        }
+        if (count >0){
+            signal(SIGKILL, SIG_DFL);
         }
     }
 

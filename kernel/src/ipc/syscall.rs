@@ -101,7 +101,7 @@ impl Syscall {
         from_user: bool,
     ) -> Result<usize, SystemError> {
         // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
-        let act = act as *mut UserSigaction;
+        let act: *mut UserSigaction = act as *mut UserSigaction;
         let mut old_act = old_act as *mut UserSigaction;
         let mut new_ka: Sigaction = Default::default();
         let mut old_ka: Sigaction = Default::default();
@@ -120,9 +120,7 @@ impl Syscall {
                     *new_ka.flags_mut() = (unsafe { (*act).flags }
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
                         | SigFlags::SA_FLAG_DFL;
-
-                    let sar = unsafe { (*act).restorer };
-                    new_ka.set_restorer(Some(sar as u64));
+                    new_ka.set_restorer(Some(unsafe { (*act).restorer } as u64));
                 }
 
                 USER_SIG_IGN => {
@@ -130,8 +128,7 @@ impl Syscall {
                     *new_ka.flags_mut() = (unsafe { (*act).flags }
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
                         | SigFlags::SA_FLAG_IGN;
-                    let sar = unsafe { (*act).restorer };
-                    new_ka.set_restorer(Some(sar as u64));
+                    new_ka.set_restorer(Some(unsafe { (*act).restorer } as u64));
                 }
                 _ => {
                     // 从用户空间获得sigaction结构体

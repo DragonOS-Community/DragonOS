@@ -1,7 +1,7 @@
 /// 引入Module
 use crate::{
     driver::base::{
-        device::{mkdev, Device, DeviceNumber, IdTable, BLOCKDEVS, device_manager, DeviceError},
+        device::{device_manager, mkdev, Device, DeviceError, DeviceNumber, IdTable, BLOCKDEVS},
         map::{
             DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
             DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX, MINOR_MASK,

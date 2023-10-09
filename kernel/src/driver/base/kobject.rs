@@ -21,7 +21,7 @@ use crate::{
 
 use super::kset::KSet;
 
-pub trait KObject: Any + Send + Sync + Debug + CastFromSync{
+pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn core::any::Any;
 
     /// 设置当前kobject对应的sysfs inode(类型为KernFSInode)

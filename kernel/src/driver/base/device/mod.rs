@@ -603,7 +603,7 @@ impl DeviceManager {
     }
 
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
-    pub fn device_links_force_bind(&self, dev:&Arc<dyn Device>){
+    pub fn device_links_force_bind(&self, dev: &Arc<dyn Device>) {
         todo!("device_links_force_bind")
     }
 }

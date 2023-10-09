@@ -81,7 +81,7 @@ impl CompatibleTable {
 /// @brief: 初始化platform总线
 /// @parameter: None
 /// @return: None
-/// 
+///
 /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_bus_init#1511
 pub fn platform_bus_init() -> Result<(), SystemError> {
     let platform_driver: Arc<LockedPlatformBusDriver> = Arc::new(LockedPlatformBusDriver::new());

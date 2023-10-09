@@ -1,5 +1,5 @@
 use alloc::{
-    string::{ToString, String},
+    string::{String, ToString},
     sync::{Arc, Weak},
 };
 

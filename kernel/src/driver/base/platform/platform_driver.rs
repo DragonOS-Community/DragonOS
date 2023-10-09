@@ -1,8 +1,29 @@
-use alloc::{sync::{Arc, Weak}, collections::BTreeMap, string::ToString};
+use alloc::{
+    collections::BTreeMap,
+    string::ToString,
+    sync::{Arc, Weak},
+};
 
-use crate::{driver::{base::{device::{DevicePrivateData, IdTable, DeviceError, DeviceNumber, DeviceResource, Device, bus::BusDriver}, kobject::{KObject, KObjType, KObjectState}, kset::KSet}, Driver}, libs::{spinlock::SpinLock, rwlock::{RwLockReadGuard, RwLockWriteGuard}}, filesystem::{vfs::IndexNode, kernfs::KernFSInode}};
+use crate::{
+    driver::{
+        base::{
+            device::{
+                bus::BusDriver, Device, DeviceError, DeviceNumber, DevicePrivateData,
+                DeviceResource, IdTable,
+            },
+            kobject::{KObjType, KObject, KObjectState},
+            kset::KSet,
+        },
+        Driver,
+    },
+    filesystem::{kernfs::KernFSInode, vfs::IndexNode},
+    libs::{
+        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
+};
 
-use super::{super::device::driver::DriverError, CompatibleTable, platform_device::PlatformDevice};
+use super::{super::device::driver::DriverError, platform_device::PlatformDevice, CompatibleTable};
 
 lazy_static! {
     static ref PLATFORM_COMPAT_TABLE: CompatibleTable = CompatibleTable::new(vec!["platform"]);
@@ -21,7 +42,6 @@ pub trait PlatformDriver: Driver {
         }
     }
 }
-
 
 #[derive(Debug)]
 pub struct LockedPlatformBusDriver(SpinLock<PlatformBusDriver>);

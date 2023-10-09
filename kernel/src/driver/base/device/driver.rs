@@ -26,7 +26,6 @@ impl Into<SystemError> for DriverError {
     }
 }
 
-
 #[inline(always)]
 pub fn driver_manager() -> &'static DriverManager {
     &DriverManager

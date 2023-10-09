@@ -4,7 +4,8 @@ use super::{
     class::classes_init,
     device::{bus::buses_init, init::devices_init},
     firmware::firmware_init,
-    hypervisor::hypervisor_init, platform::platform_bus_init,
+    hypervisor::hypervisor_init,
+    platform::platform_bus_init,
 };
 
 pub(super) fn driver_init() -> Result<(), SystemError> {

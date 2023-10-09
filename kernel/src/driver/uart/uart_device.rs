@@ -3,8 +3,8 @@ use crate::{
         base::{
             char::CharDevice,
             device::{
-                driver::DriverError, Device, DeviceError, DeviceNumber, DevicePrivateData,
-                DeviceResource, DeviceState, DeviceType, IdTable, bus::Bus,
+                bus::Bus, driver::DriverError, Device, DeviceError, DeviceNumber,
+                DevicePrivateData, DeviceResource, DeviceState, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectState},
             kset::KSet,

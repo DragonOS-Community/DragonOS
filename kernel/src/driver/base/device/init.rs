@@ -4,7 +4,8 @@ use crate::{
     driver::{
         base::{
             device::{
-                sys_dev_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
+                sys_dev_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER,
+                DEV_KSET_INSTANCE,
             },
             kobject::{KObject, KObjectManager},
             kset::KSet,

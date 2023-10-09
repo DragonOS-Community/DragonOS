@@ -142,7 +142,7 @@ impl dyn Bus {
     ///
     /// - `matcher` - 匹配器
     /// - `data` - 传给匹配器的数据
-    pub fn find_device<T:Copy>(
+    pub fn find_device<T: Copy>(
         &self,
         matcher: &dyn DeviceMatcher<T>,
         data: T,
@@ -232,7 +232,11 @@ impl BusManager {
         self.remove_file(bus, &BusAttrDriversProbe);
     }
 
-    fn create_file(&self, bus: &Arc<dyn Bus>, attr: &'static dyn Attribute) -> Result<(), SystemError> {
+    fn create_file(
+        &self,
+        bus: &Arc<dyn Bus>,
+        attr: &'static dyn Attribute,
+    ) -> Result<(), SystemError> {
         let bus_kobj = bus.subsystem().subsys() as Arc<dyn KObject>;
         return sysfs_instance().create_file(&bus_kobj, attr);
     }

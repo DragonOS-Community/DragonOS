@@ -4,6 +4,8 @@ use alloc::{
     vec::Vec,
 };
 
+use core::hash::Hash;
+
 use crate::{
     filesystem::{
         kernfs::KernFSInode,
@@ -31,6 +33,21 @@ pub struct KSet {
     self_ref: Weak<KSet>,
 }
 
+impl Hash for KSet {
+    fn hash<H: ~const core::hash::Hasher>(&self, state: &mut H) {
+        self.self_ref.as_ptr().hash(state);
+        self.inner.read().name.hash(state);
+    }
+}
+
+impl core::cmp::Eq for KSet {}
+
+impl core::cmp::PartialEq for KSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.self_ref.as_ptr() == other.self_ref.as_ptr()
+    }
+}
+
 impl KSet {
     pub fn new(name: String) -> Arc<Self> {
         let r = Self {
@@ -51,6 +68,26 @@ impl KSet {
         return r;
     }
 
+    /// 创建一个kset，并且设置它的父亲为parent_kobj。然后把这个kset注册到sysfs
+    ///
+    /// ## 参数
+    ///
+    /// - name: kset的名字
+    /// - parent_kobj: 父亲kobject
+    /// - join_kset: 如果不为None，那么这个kset会加入到join_kset中
+    pub fn new_and_add(
+        name: String,
+        parent_kobj: Option<Arc<dyn KObject>>,
+        join_kset: Option<Arc<KSet>>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let kset = KSet::new(name);
+        if let Some(parent_kobj) = parent_kobj {
+            kset.set_parent(Some(Arc::downgrade(&parent_kobj)));
+        }
+        kset.register(join_kset)?;
+        return Ok(kset);
+    }
+
     pub fn register(&self, join_kset: Option<Arc<KSet>>) -> Result<(), SystemError> {
         return KObjectManager::add_kobj(self.self_ref.upgrade().unwrap(), join_kset);
         // todo: 引入uevent之后，发送uevent
@@ -64,7 +101,6 @@ impl KSet {
     ///
     /// 这个kobject的kset必须是None，否则会panic
     pub fn join(&self, kobj: &Arc<dyn KObject>) {
-        kdebug!("join kset: kobj.kset() = {:?}", kobj.kset());
         assert!(kobj.kset().is_none());
         kobj.set_kset(self.self_ref.upgrade());
         self.kobjects.write().push(Arc::downgrade(&kobj));
@@ -93,8 +129,8 @@ impl KSet {
         kobjects.drain_filter(|x| x.upgrade().is_none());
     }
 
-    pub fn parent_kset(&self) -> Option<Arc<KSet>> {
-        return self.parent_data.read().kset.clone();
+    pub fn as_kobject(&self) -> Arc<dyn KObject> {
+        return self.self_ref.upgrade().unwrap();
     }
 }
 

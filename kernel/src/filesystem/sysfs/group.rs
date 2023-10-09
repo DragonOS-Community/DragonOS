@@ -6,7 +6,7 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
-        sysfs::{dir::SysKernDirPriv, SysFSKernPrivateData},
+        sysfs::{dir::SysKernDirPriv, sysfs_instance, SysFSKernPrivateData},
         vfs::{syscall::ModeType, IndexNode},
     },
     kwarn,
@@ -21,7 +21,7 @@ impl SysFS {
     pub fn create_groups(
         &self,
         kobj: &Arc<dyn KObject>,
-        groups: &'static [&'static dyn AttributeGroup],
+        groups: &[&'static dyn AttributeGroup],
     ) -> Result<(), SystemError> {
         return self.do_create_groups(kobj, groups, false);
     }
@@ -29,7 +29,7 @@ impl SysFS {
     fn do_create_groups(
         &self,
         kobj: &Arc<dyn KObject>,
-        groups: &'static [&'static dyn AttributeGroup],
+        groups: &[&'static dyn AttributeGroup],
         update: bool,
     ) -> Result<(), SystemError> {
         for i in 0..groups.len() {
@@ -138,6 +138,16 @@ impl SysFS {
         return Ok(());
     }
 
+    /// 创建属性组的文件
+    ///
+    /// ## 参数
+    ///
+    /// - `parent` - 属性组的父文件夹
+    /// - `kobj` - 属性组所属的kobject
+    /// - `group` - 属性组
+    /// - `update` - 当前是否正在更新属性
+    ///
+    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/group.c#34
     fn group_create_files(
         &self,
         parent: Arc<KernFSInode>,
@@ -145,7 +155,7 @@ impl SysFS {
         group: &'static dyn AttributeGroup,
         update: bool,
     ) -> Result<(), SystemError> {
-        // https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/group.c#34
+        let mut e = Ok(());
         for attr in group.attrs() {
             let mut mode = attr.mode();
 
@@ -170,9 +180,18 @@ impl SysFS {
             }
 
             mode = ModeType::from_bits_truncate(mode.bits() & 0o644);
+            e = sysfs_instance().add_file_with_mode(&parent, *attr, mode);
+            if e.is_err() {
+                break;
+            }
         }
 
-        todo!()
+        if let Err(e) = e {
+            self.group_remove_files(&parent, group);
+            return Err(e);
+        }
+
+        return Ok(());
     }
 
     fn group_remove_files(&self, parent: &Arc<KernFSInode>, group: &'static dyn AttributeGroup) {

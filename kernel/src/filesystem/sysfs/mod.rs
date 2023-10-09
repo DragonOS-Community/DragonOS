@@ -35,6 +35,7 @@ mod dir;
 mod file;
 pub mod fs;
 mod group;
+mod symlink;
 
 const SYSFS_MAX_NAMELEN: usize = 64;
 
@@ -556,9 +557,9 @@ pub trait AttributeGroup: Debug + Send + Sync {
 pub trait Attribute: Debug + Send + Sync {
     fn name(&self) -> &str;
     fn mode(&self) -> ModeType;
-    
+
     fn support(&self) -> SysFSOpsSupport;
-    
+
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -570,7 +571,9 @@ pub trait Attribute: Debug + Send + Sync {
 
 pub trait SysFSOps {
     /// 获取当前文件的支持的操作
-    fn support(&self, attr:&dyn Attribute) -> SysFSOpsSupport;
+    fn support(&self, attr: &dyn Attribute) -> SysFSOpsSupport {
+        return attr.support();
+    }
 
     fn show(
         &self,

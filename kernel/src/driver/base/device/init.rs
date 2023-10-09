@@ -3,13 +3,14 @@ use alloc::{string::ToString, sync::Arc};
 use crate::{
     driver::{
         base::{
-            device::{dev_kset, DEVICES_KSET_INSTANCE, DEV_KSET_INSTANCE},
+            device::{
+                sys_dev_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
+            },
             kobject::{KObject, KObjectManager},
             kset::KSet,
         },
         uart::uart_device::uart_init,
     },
-    filesystem::sysfs::sysfs_instance,
     kdebug, kinfo,
     syscall::SystemError,
 };
@@ -20,7 +21,6 @@ pub fn device_init() -> Result<(), SystemError> {
     return Ok(());
 }
 
-
 pub fn devices_init() -> Result<(), SystemError> {
     // 创建 `/sys/devices` 目录
     {
@@ -30,7 +30,9 @@ pub fn devices_init() -> Result<(), SystemError> {
             .expect("register devices kset failed");
 
         unsafe {
-            DEVICES_KSET_INSTANCE = Some(devices_kset);
+            DEVICES_KSET_INSTANCE = Some(devices_kset.clone());
+            // 初始化全局设备管理器
+            DEVICE_MANAGER = Some(DeviceManager::new(devices_kset));
         }
     }
 
@@ -46,7 +48,7 @@ pub fn devices_init() -> Result<(), SystemError> {
     // 创建 `/sys/dev/block` 目录
     {
         kdebug!("create /sys/dev/block");
-        let dev_kset = dev_kset();
+        let dev_kset = sys_dev_kset();
         let dev_block_kset = KSet::new("block".to_string());
         let parent = dev_kset.clone() as Arc<dyn KObject>;
         dev_block_kset.set_parent(Some(Arc::downgrade(&parent)));
@@ -59,7 +61,7 @@ pub fn devices_init() -> Result<(), SystemError> {
     // 创建 `/sys/dev/char` 目录
     {
         kdebug!("create /sys/dev/char");
-        let dev_kset = dev_kset();
+        let dev_kset = sys_dev_kset();
         let dev_char_kset = KSet::new("char".to_string());
         let parent = dev_kset.clone() as Arc<dyn KObject>;
         dev_char_kset.set_parent(Some(Arc::downgrade(&parent)));

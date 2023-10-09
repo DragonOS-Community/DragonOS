@@ -4,7 +4,7 @@ use crate::{
             char::CharDevice,
             device::{
                 driver::DriverError, Device, DeviceError, DeviceNumber, DevicePrivateData,
-                DeviceResource, DeviceState, DeviceType, IdTable, DEVICE_MANAGER,
+                DeviceResource, DeviceState, DeviceType, IdTable, bus::Bus,
             },
             kobject::{KObjType, KObject, KObjectState},
             kset::KSet,
@@ -249,6 +249,22 @@ impl Device for LockedUart {
 
     fn dev_type(&self) -> DeviceType {
         DeviceType::Serial
+    }
+
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
+        todo!("LockedUart::bus()")
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        todo!("LockedUart::driver()")
+    }
+
+    fn is_dead(&self) -> bool {
+        false
+    }
+
+    fn set_driver(&self, driver: Option<Arc<dyn Driver>>) {
+        todo!("LockedUart::set_driver()")
     }
 }
 

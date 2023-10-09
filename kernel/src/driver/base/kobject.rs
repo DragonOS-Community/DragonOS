@@ -4,6 +4,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
+use intertrait::CastFromSync;
 
 use crate::{
     filesystem::{
@@ -11,13 +12,16 @@ use crate::{
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
     },
     kerror,
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::{
+        casting::DowncastArc,
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    },
     syscall::SystemError,
 };
 
 use super::kset::KSet;
 
-pub trait KObject: Any + Send + Sync + Debug {
+pub trait KObject: Any + Send + Sync + Debug + CastFromSync{
     fn as_any_ref(&self) -> &dyn core::any::Any;
 
     /// 设置当前kobject对应的sysfs inode(类型为KernFSInode)
@@ -28,11 +32,13 @@ pub trait KObject: Any + Send + Sync + Debug {
 
     fn parent(&self) -> Option<Weak<dyn KObject>>;
 
+    /// 设置当前kobject的parent kobject（不一定与kset相同）
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>);
 
     /// 当前kobject属于哪个kset
     fn kset(&self) -> Option<Arc<KSet>>;
 
+    /// 设置当前kobject所属的kset
     fn set_kset(&self, kset: Option<Arc<KSet>>);
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType>;
@@ -58,7 +64,14 @@ impl dyn KObject {
     }
 }
 
+impl DowncastArc for dyn KObject {
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
+        self
+    }
+}
+
 pub trait KObjType: Debug {
+    fn release(&self, kobj: Arc<dyn KObject>) {}
     fn sysfs_ops(&self) -> Option<&dyn SysFSOps>;
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]>;

@@ -1,7 +1,7 @@
 /// 引入Module
 use crate::{
     driver::base::{
-        device::{mkdev, Device, DeviceNumber, IdTable, BLOCKDEVS, DEVICE_MANAGER},
+        device::{mkdev, Device, DeviceNumber, IdTable, BLOCKDEVS, device_manager, DeviceError},
         map::{
             DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
             DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX, MINOR_MASK,
@@ -475,11 +475,12 @@ impl BlockDeviceOps {
     ///             range: 次设备号范围
     /// @return: none
     #[allow(dead_code)]
-    pub fn bdev_add(bdev: Arc<dyn BlockDevice>, id_table: IdTable) {
+    pub fn bdev_add(bdev: Arc<dyn BlockDevice>, id_table: IdTable) -> Result<(), DeviceError> {
         if Into::<usize>::into(id_table.device_number()) == 0 {
             kerror!("Device number can't be 0!\n");
         }
-        DEVICE_MANAGER.add_device(id_table, bdev.device())
+        todo!("bdev_add")
+        // return device_manager().add_device(bdev.id_table(), bdev.device());
     }
 
     /// @brief: block设备注销

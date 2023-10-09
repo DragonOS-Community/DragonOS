@@ -1,4 +1,4 @@
-use core::ops::BitAnd;
+use core::{intrinsics::unlikely, ops::BitAnd};
 
 use alloc::{string::ToString, sync::Arc};
 
@@ -38,8 +38,23 @@ impl SysKernFilePriv {
 }
 
 impl SysFS {
+    /// 为指定的kobject创建一个属性文件
+    ///
+    /// ## 参数
+    ///
+    /// - `kobj` 要创建属性文件的kobject
+    /// - `attr` 属性
+    pub fn create_file(
+        &self,
+        kobj: &Arc<dyn KObject>,
+        attr: &'static dyn Attribute,
+    ) -> Result<(), SystemError> {
+        let inode = kobj.inode().ok_or(SystemError::EINVAL)?;
+        return self.add_file_with_mode(&inode, attr, attr.mode());
+    }
+
     // https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/file.c?fi=sysfs_add_file_mode_ns#271
-    pub(super) fn add_file(
+    pub(super) fn add_file_with_mode(
         &self,
         parent: &Arc<KernFSInode>,
         attr: &'static dyn Attribute,
@@ -93,6 +108,29 @@ impl SysFS {
             return Err(e);
         }
         return Ok(());
+    }
+
+    /// 在sysfs中删除某个kobject的属性文件
+    ///
+    /// 如果属性文件不存在，则发出一个警告
+    /// 
+    /// ## 参数
+    ///
+    /// - `kobj` 要删除属性文件的kobject
+    /// - `attr` 属性
+    pub fn remove_file(&self, kobj: &Arc<dyn KObject>, attr: &'static dyn Attribute) {
+        let parent = kobj.inode();
+
+        if let Some(parent) = parent {
+            let r = parent.remove(attr.name());
+            if unlikely(r.is_err()) {
+                kwarn!(
+                    "failed to remove file '{}' from '{}'",
+                    attr.name(),
+                    kobj.name()
+                );
+            }
+        }
     }
 }
 

@@ -8,7 +8,7 @@ use super::kset::KSet;
 static mut HYPERVISOR_KSET_INSTANCE: Option<Arc<KSet>> = None;
 
 #[inline(always)]
-pub fn hypervisor_kset() -> Arc<KSet> {
+pub fn sys_hypervisor_kset() -> Arc<KSet> {
     unsafe { HYPERVISOR_KSET_INSTANCE.clone().unwrap() }
 }
 

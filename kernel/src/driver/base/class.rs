@@ -8,7 +8,7 @@ use super::kset::KSet;
 static mut CLASS_KSET_INSTANCE: Option<Arc<KSet>> = None;
 
 #[inline(always)]
-pub fn class_kset() -> Arc<KSet> {
+pub fn sys_class_kset() -> Arc<KSet> {
     unsafe { CLASS_KSET_INSTANCE.clone().unwrap() }
 }
 

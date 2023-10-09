@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 
 use crate::driver::base::char::CharDevOps;
-use crate::driver::base::device::{Device, DeviceResource, DEVICE_MANAGER};
+use crate::driver::base::device::{Device, DeviceResource, device_manager};
 use crate::driver::base::platform::CompatibleTable;
 use crate::{
     driver::{
@@ -48,14 +48,14 @@ impl Driver for UartDriver {
         data: DevicePrivateData,
         _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
-        if let Some(device) = DEVICE_MANAGER.get_device(data.id_table()) {
+        if let Some(device) = device_manager().get_device(data.id_table()) {
             return Ok(device.clone());
         }
         let compatible_table = data.compatible_table();
         if compatible_table.matches(&UART_COMPAT_TABLE) {
             let device = LockedUart::default();
             let arc_device = Arc::new(device);
-            DEVICE_MANAGER.add_device(data.id_table().clone(), arc_device.clone());
+            device_manager().add_device(data.id_table().clone(), arc_device.clone());
             CharDevOps::cdev_add(arc_device.clone(), data.id_table().clone(), 1);
         }
 

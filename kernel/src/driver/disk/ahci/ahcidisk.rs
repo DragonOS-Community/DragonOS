@@ -2,10 +2,12 @@ use super::{_port, hba::HbaCmdTable, virt_2_phys};
 use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::SeekFrom;
-use crate::driver::base::device::{Device, DeviceType};
+use crate::driver::base::device::bus::Bus;
+use crate::driver::base::device::{Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
 use crate::driver::base::kset::KSet;
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
+use crate::driver::Driver;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 use crate::include::bindings::bindings::verify_area;
@@ -494,8 +496,24 @@ impl Device for LockedAhciDisk {
         return DeviceType::Block;
     }
 
-    fn id_table(&self) -> crate::driver::base::device::IdTable {
+    fn id_table(&self) -> IdTable {
         todo!()
+    }
+
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
+        todo!("LockedAhciDisk::bus()")
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        todo!("LockedAhciDisk::driver()")
+    }
+
+    fn is_dead(&self) -> bool {
+        false
+    }
+
+    fn set_driver(&self, driver: Option<Arc<dyn Driver>>) {
+        todo!("LockedAhciDisk::set_driver()")
     }
 }
 

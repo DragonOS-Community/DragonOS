@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use crate::{kerror, syscall::SystemError};
 
 use super::{
-    device::{mkdev, Device, DeviceNumber, IdTable, CHARDEVS, DEVICE_MANAGER, DEVMAP},
+    device::{mkdev, Device, DeviceNumber, IdTable, CHARDEVS, DEVMAP, device_manager, DeviceError},
     map::{
         kobj_map, kobj_unmap, DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END,
         DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX, MINOR_MASK,
@@ -189,17 +189,19 @@ impl CharDevOps {
     ///             range: 次设备号范围
     /// @return: none
     #[allow(dead_code)]
-    pub fn cdev_add(cdev: Arc<dyn CharDevice>, id_table: IdTable, range: usize) {
+    pub fn cdev_add(cdev: Arc<dyn CharDevice>, id_table: IdTable, range: usize)-> Result<(), SystemError> {
         if Into::<usize>::into(id_table.device_number()) == 0 {
             kerror!("Device number can't be 0!\n");
         }
-        DEVICE_MANAGER.add_device(id_table.clone(), cdev.clone());
+        device_manager().add_device(id_table.clone(), cdev.clone())?;
         kobj_map(
             DEVMAP.clone(),
             id_table.device_number(),
             range,
             cdev.clone(),
-        )
+        );
+
+        return Ok(());
     }
 
     /// @brief: 字符设备注销
@@ -208,7 +210,7 @@ impl CharDevOps {
     /// @return: none
     #[allow(dead_code)]
     pub fn cdev_del(id_table: IdTable, range: usize) {
-        DEVICE_MANAGER.remove_device(&id_table);
+        device_manager().remove_device(&id_table);
         kobj_unmap(DEVMAP.clone(), id_table.device_number(), range);
     }
 }

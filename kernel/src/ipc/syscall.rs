@@ -116,6 +116,7 @@ impl Syscall {
             let input_sighandler = unsafe { (*act).handler as u64 };
             match input_sighandler {
                 USER_SIG_DFL => {
+                    kdebug!("sending a dfl signal");
                     new_ka = *DEFAULT_SIGACTION;
                     *new_ka.flags_mut() = (unsafe { (*act).flags }
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))

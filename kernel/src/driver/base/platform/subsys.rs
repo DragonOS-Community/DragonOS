@@ -59,7 +59,7 @@ impl AttributeGroup for PlatformDeviceAttrGroup {
         return &[];
     }
 
-    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> Option<ModeType> {
+    fn is_visible(&self, _kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> Option<ModeType> {
         return Some(attr.mode());
     }
 }

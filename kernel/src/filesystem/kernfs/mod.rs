@@ -539,6 +539,7 @@ impl KernFSInode {
     }
 
     /// 删除当前的inode（包括其自身、子目录和子文件）
+    #[allow(dead_code)]
     pub fn remove_inode_include_self(&self) {
         let parent = self.parent();
         if let Some(parent) = parent {

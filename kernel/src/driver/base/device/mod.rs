@@ -1,5 +1,4 @@
 use alloc::{
-    collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
 };
@@ -15,7 +14,6 @@ use crate::{
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
-    libs::spinlock::SpinLock,
     syscall::SystemError,
 };
 use core::fmt::Debug;
@@ -35,11 +33,11 @@ pub mod dd;
 pub mod driver;
 pub mod init;
 
-static mut DEVICE_MANAGER: Option<Arc<DeviceManager>> = None;
+static mut DEVICE_MANAGER: Option<DeviceManager> = None;
 
 #[inline(always)]
-pub fn device_manager() -> Arc<DeviceManager> {
-    unsafe { DEVICE_MANAGER.as_ref().unwrap().clone() }
+pub fn device_manager() -> &'static DeviceManager {
+    unsafe { DEVICE_MANAGER.as_ref().unwrap() }
 }
 
 lazy_static! {
@@ -74,6 +72,7 @@ pub(super) fn sys_dev_kset() -> Arc<KSet> {
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 pub(super) fn sys_dev_block_kset() -> Arc<KSet> {
     unsafe { DEV_BLOCK_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
@@ -402,22 +401,15 @@ impl SysFSOps for DeviceSysFSOps {
 
 /// @brief Device管理器
 #[derive(Debug)]
-pub struct DeviceManager {
-    devices: SpinLock<BTreeMap<IdTable, Arc<dyn Device>>>, // 所有设备
-    kset: Arc<KSet>,                                       // 设备kset
-}
+pub struct DeviceManager;
 
 impl DeviceManager {
     /// @brief: 创建一个新的设备管理器
     /// @parameter: None
     /// @return: DeviceManager实体
     #[inline]
-    fn new(kset: Arc<KSet>) -> Arc<DeviceManager> {
-        let ret = Arc::new(DeviceManager {
-            devices: SpinLock::new(BTreeMap::new()),
-            kset,
-        });
-        return ret;
+    const fn new() -> DeviceManager {
+        return Self;
     }
 
     /// @brief: 添加设备
@@ -430,11 +422,7 @@ impl DeviceManager {
     /// todo: 完善错误处理逻辑：如果添加失败，需要将之前添加的内容全部回滚
     #[inline]
     #[allow(dead_code)]
-    pub fn add_device(
-        &self,
-        id_table: IdTable,
-        device: Arc<dyn Device>,
-    ) -> Result<(), SystemError> {
+    pub fn add_device(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
         // todo: 引入class后，在这里处理与parent相关的逻辑
 
         KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>, None).map_err(|e| {
@@ -473,7 +461,7 @@ impl DeviceManager {
     /// @return: None
     #[inline]
     #[allow(dead_code)]
-    pub fn remove_device(&self, id_table: &IdTable) {
+    pub fn remove_device(&self, _id_table: &IdTable) {
         todo!()
     }
 
@@ -482,9 +470,8 @@ impl DeviceManager {
     /// @return: 设备实例
     #[inline]
     #[allow(dead_code)]
-    pub fn get_device(&self, id_table: &IdTable) -> Option<Arc<dyn Device>> {
-        let mut guard = self.devices.lock();
-        guard.get(id_table).cloned()
+    pub fn find_device_by_idtable(&self, _id_table: &IdTable) -> Option<Arc<dyn Device>> {
+        todo!("find_device_by_idtable")
     }
 
     fn device_platform_notify(&self, dev: &Arc<dyn Device>) {
@@ -492,7 +479,7 @@ impl DeviceManager {
         software_node_notify(dev);
     }
 
-    fn add_class_symlinks(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+    fn add_class_symlinks(&self, _dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         // todo: 引入class后，在这里处理与class相关的逻辑
         // https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c#3224
 
@@ -584,6 +571,7 @@ impl DeviceManager {
     }
 
     /// Delete symlink for device in `/sys/dev` or `/sys/class/<class_name>`
+    #[allow(dead_code)]
     fn remove_sys_dev_entry(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let kobj = self.device_to_dev_kobj(dev);
         let name = dev.id_table().name();
@@ -613,7 +601,7 @@ impl DeviceManager {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), SystemError> {
-    return device_manager().add_device(device.id_table(), device);
+    return device_manager().add_device(device);
 }
 
 /// @brief: 设备卸载

@@ -105,18 +105,21 @@ impl Driver for UartDriver {
         data: DevicePrivateData,
         _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
-        if let Some(device) = device_manager().get_device(data.id_table()) {
+        if let Some(device) = device_manager().find_device_by_idtable(data.id_table()) {
             return Ok(device.clone());
         }
         let compatible_table = data.compatible_table();
         if compatible_table.matches(&UART_COMPAT_TABLE) {
             let device = LockedUart::default();
             let arc_device = Arc::new(device);
-            device_manager().add_device(data.id_table().clone(), arc_device.clone());
-            CharDevOps::cdev_add(arc_device.clone(), data.id_table().clone(), 1);
+            device_manager()
+                .add_device(arc_device.clone())
+                .map_err(|_| DriverError::RegisterError)?;
+            CharDevOps::cdev_add(arc_device.clone(), data.id_table().clone(), 1)
+                .map_err(|_| DriverError::RegisterError)?;
         }
 
-        return Err(DriverError::ProbeError);
+        return Err(DriverError::RegisterError);
     }
 
     fn id_table(&self) -> IdTable {

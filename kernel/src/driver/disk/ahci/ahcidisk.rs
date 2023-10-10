@@ -458,7 +458,7 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+    fn set_inode(&self, _inode: Option<Arc<KernFSInode>>) {
         todo!()
     }
 
@@ -478,15 +478,15 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn set_name(&self, name: alloc::string::String) {
+    fn set_name(&self, _name: alloc::string::String) {
         todo!()
     }
 
-    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+    fn set_kset(&self, _kset: Option<Arc<KSet>>) {
         todo!()
     }
 
-    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+    fn set_parent(&self, _parent: Option<Weak<dyn KObject>>) {
         todo!()
     }
 }
@@ -512,7 +512,7 @@ impl Device for LockedAhciDisk {
         false
     }
 
-    fn set_driver(&self, driver: Option<Arc<dyn Driver>>) {
+    fn set_driver(&self, _driver: Option<Arc<dyn Driver>>) {
         todo!("LockedAhciDisk::set_driver()")
     }
 }

@@ -1,11 +1,6 @@
-use super::{
-    driver::DriverError, sys_devices_kset, Device, DeviceMatchName, DeviceMatcher, DeviceState,
-};
+use super::{sys_devices_kset, Device, DeviceMatchName, DeviceMatcher, DeviceState};
 use crate::{
-    driver::{
-        base::{device::device_manager, kobject::KObject, kset::KSet, subsys::SubSysPrivate},
-        Driver,
-    },
+    driver::base::{device::device_manager, kobject::KObject, kset::KSet, subsys::SubSysPrivate},
     filesystem::{
         sysfs::{file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
@@ -33,6 +28,7 @@ pub fn sys_bus_kset() -> Arc<KSet> {
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn sys_devices_system_kset() -> Arc<KSet> {
     unsafe { DEVICES_SYSTEM_KSET_INSTANCE.clone().unwrap() }
 }
@@ -81,14 +77,6 @@ impl From<BusState> for DeviceState {
             BusState::UnDefined => DeviceState::UnDefined,
         }
     }
-}
-
-/// @brief: 总线驱动trait，所有总线驱动都应实现该trait
-pub trait BusDriver: Driver {
-    /// @brief: 判断总线是否为空
-    /// @parameter: None
-    /// @return: 如果总线上设备和驱动的数量都为0，则返回true，否则，返回false
-    fn is_empty(&self) -> bool;
 }
 
 /// 总线子系统的trait，所有总线都应实现该trait
@@ -185,6 +173,8 @@ impl BusManager {
     /// the devices and drivers that belong to the subsystem.
     ///
     /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_register#783
+    /// 
+    /// todo: 增加错误处理逻辑
     pub fn register(&self, bus: Arc<dyn Bus>) -> Result<(), SystemError> {
         bus.subsystem().set_bus(Arc::downgrade(&bus));
 
@@ -209,7 +199,7 @@ impl BusManager {
         return Ok(());
     }
 
-    pub fn unregister(&self, bus: Arc<dyn Bus>) -> Result<(), SystemError> {
+    pub fn unregister(&self, _bus: Arc<dyn Bus>) -> Result<(), SystemError> {
         todo!("bus_unregister")
     }
 
@@ -223,6 +213,7 @@ impl BusManager {
         return r;
     }
 
+    #[allow(dead_code)]
     fn remove_probe_files(&self, bus: &Arc<dyn Bus>) {
         self.remove_file(bus, &BusAttrDriversAutoprobe);
         self.remove_file(bus, &BusAttrDriversProbe);
@@ -264,6 +255,7 @@ impl BusManager {
     /// ## 参数
     ///
     /// - `bus` - bus实例
+    #[allow(dead_code)]
     pub fn rescan_devices(&self, bus: &Arc<dyn Bus>) -> Result<(), SystemError> {
         for dev in bus.subsystem().devices().read().iter() {
             let dev = dev.upgrade();
@@ -298,6 +290,7 @@ impl BusManager {
     /// - `matcher` - 匹配器
     /// - `data` - 传给匹配器的数据
     #[inline]
+    #[allow(dead_code)]
     pub fn find_device<T: Copy>(
         &self,
         bus: &Arc<dyn Bus>,
@@ -340,21 +333,6 @@ pub fn bus_register(bus: Arc<dyn Bus>) -> Result<(), SystemError> {
 #[allow(dead_code)]
 pub fn bus_unregister(bus: Arc<dyn Bus>) -> Result<(), SystemError> {
     return bus_manager().unregister(bus);
-}
-
-/// @brief: 总线驱动注册，将总线驱动加入全局总线管理器中
-/// @parameter bus: Bus设备驱动实体
-/// @return: 成功:()   失败:DeviceError
-pub fn bus_driver_register(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverError> {
-    todo!("bus_driver_register")
-}
-
-/// @brief: 总线驱动注销，将总线从全局总线管理器中删除
-/// @parameter bus: Bus设备驱动实体
-/// @return: 成功:()   失败:DeviceError
-#[allow(dead_code)]
-pub fn bus_driver_unregister(bus_driver: Arc<dyn BusDriver>) -> Result<(), DriverError> {
-    todo!("bus_driver_unregister")
 }
 
 pub fn buses_init() -> Result<(), SystemError> {
@@ -400,7 +378,7 @@ pub fn buses_init() -> Result<(), SystemError> {
 pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
     let bus = dev.bus();
     if let Some(bus) = bus {
-        device_manager().add_groups(dev, bus.dev_groups());
+        device_manager().add_groups(dev, bus.dev_groups())?;
         // todo: 增加符号链接
         todo!("bus_add_device")
     }
@@ -476,7 +454,22 @@ impl Attribute for BusAttrDriversAutoprobe {
 
     /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#231
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
-        todo!("BusAttrDriversAutoprobe::store()")
+        if buf.len() == 0 {
+            return Ok(0);
+        }
+
+        let kset: Arc<KSet> = kobj.arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+        let bus = bus_manager()
+            .get_bus_by_kset(&kset)
+            .ok_or(SystemError::EINVAL)?;
+
+        if buf[0] == '0' as u8 {
+            bus.subsystem().set_drivers_autoprobe(false);
+        } else {
+            bus.subsystem().set_drivers_autoprobe(true);
+        }
+
+        return Ok(buf.len());
     }
 
     /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#226

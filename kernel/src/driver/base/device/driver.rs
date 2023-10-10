@@ -1,5 +1,5 @@
 use super::Device;
-use crate::{driver::Driver, syscall::SystemError};
+use crate::syscall::SystemError;
 use alloc::sync::Arc;
 use core::fmt::Debug;
 
@@ -37,22 +37,7 @@ pub struct DriverManager;
 
 impl DriverManager {
     /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#434
-    pub fn driver_sysfs_add(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+    pub fn driver_sysfs_add(&self, _dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!("DriverManager::driver_sysfs_add()");
     }
-}
-
-/// @brief: 驱动注册
-/// @parameter: name: 驱动名
-/// @return: 操作成功，返回()，操作失败，返回错误码
-pub fn driver_register(driver: Arc<dyn Driver>) -> Result<(), DriverError> {
-    todo!("driver_register()");
-}
-
-/// @brief: 驱动卸载
-/// @parameter: name: 驱动名
-/// @return: 操作成功，返回()，操作失败，返回错误码
-#[allow(dead_code)]
-pub fn driver_unregister(driver: Arc<dyn Driver>) -> Result<(), DriverError> {
-    todo!("driver_unregister()");
 }

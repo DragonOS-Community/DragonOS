@@ -3,21 +3,12 @@ use self::{platform_device::PlatformBusDevice, subsys::PlatformBus};
 use super::{
     device::{
         bus::{bus_register, Bus, BusState},
-        device_unregister, sys_devices_kset, DeviceNumber, DevicePrivateData, DeviceType, IdTable,
+        device_unregister, sys_devices_kset, DeviceNumber, DevicePrivateData, IdTable,
     },
     kobject::KObject,
-    kset::KSet,
 };
-use crate::{
-    driver::base::{device::device_register, platform::platform_driver::LockedPlatformBusDriver},
-    syscall::SystemError,
-};
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    string::ToString,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use crate::{driver::base::device::device_register, syscall::SystemError};
+use alloc::{collections::BTreeSet, string::ToString, sync::Arc, vec::Vec};
 use core::fmt::Debug;
 
 pub mod platform_device;
@@ -78,8 +69,6 @@ impl CompatibleTable {
 ///
 /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_bus_init#1511
 pub fn platform_bus_init() -> Result<(), SystemError> {
-    let platform_driver: Arc<LockedPlatformBusDriver> = Arc::new(LockedPlatformBusDriver::new());
-
     let platform_device: Arc<PlatformBusDevice> = PlatformBusDevice::new(
         DevicePrivateData::new(
             IdTable::new("platform".to_string(), DeviceNumber::new(0)),

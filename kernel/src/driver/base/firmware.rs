@@ -8,6 +8,7 @@ use super::kset::KSet;
 static mut FIRMWARE_KSET_INSTANCE: Option<Arc<KSet>> = None;
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn sys_firmware_kset() -> Arc<KSet> {
     unsafe { FIRMWARE_KSET_INSTANCE.clone().unwrap() }
 }

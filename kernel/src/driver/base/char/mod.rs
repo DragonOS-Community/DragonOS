@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use crate::{kerror, syscall::SystemError};
 
 use super::{
-    device::{device_manager, mkdev, Device, DeviceError, DeviceNumber, IdTable, CHARDEVS, DEVMAP},
+    device::{device_manager, mkdev, Device, DeviceNumber, IdTable, CHARDEVS, DEVMAP},
     map::{
         kobj_map, kobj_unmap, DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END,
         DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX, MINOR_MASK,
@@ -197,7 +197,7 @@ impl CharDevOps {
         if Into::<usize>::into(id_table.device_number()) == 0 {
             kerror!("Device number can't be 0!\n");
         }
-        device_manager().add_device(id_table.clone(), cdev.clone())?;
+        device_manager().add_device(cdev.clone())?;
         kobj_map(
             DEVMAP.clone(),
             id_table.device_number(),

@@ -17,7 +17,6 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
-        sysfs::bus::{bus_device_register, bus_driver_register},
         vfs::{
             syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
             PollStatus,

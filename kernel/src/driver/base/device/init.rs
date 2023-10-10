@@ -7,7 +7,7 @@ use crate::{
                 sys_dev_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER,
                 DEV_KSET_INSTANCE,
             },
-            kobject::{KObject, KObjectManager},
+            kobject::KObject,
             kset::KSet,
         },
         uart::uart_device::uart_init,
@@ -31,9 +31,9 @@ pub fn devices_init() -> Result<(), SystemError> {
             .expect("register devices kset failed");
 
         unsafe {
-            DEVICES_KSET_INSTANCE = Some(devices_kset.clone());
+            DEVICES_KSET_INSTANCE = Some(devices_kset);
             // 初始化全局设备管理器
-            DEVICE_MANAGER = Some(DeviceManager::new(devices_kset));
+            DEVICE_MANAGER = Some(DeviceManager::new());
         }
     }
 

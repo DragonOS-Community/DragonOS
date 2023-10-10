@@ -102,8 +102,8 @@ impl DeviceManager {
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#899
     fn do_device_attach_driver(
         &self,
-        driver: &Arc<dyn Driver>,
-        data: &mut DeviceAttachData,
+        _driver: &Arc<dyn Driver>,
+        _data: &mut DeviceAttachData,
     ) -> Result<(), SystemError> {
         todo!("do_device_attach_driver")
     }
@@ -157,13 +157,14 @@ impl DeviceManager {
     }
 
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#393
-    fn driver_bound(&self, dev: &Arc<dyn Device>) {
+    fn driver_bound(&self, _dev: &Arc<dyn Device>) {
         todo!("driver_bound")
     }
 }
 
 /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#866
 #[derive(Debug)]
+#[allow(dead_code)]
 struct DeviceAttachData {
     dev: Arc<dyn Device>,
 
@@ -201,6 +202,8 @@ impl DeviceAttachData {
         }
     }
 
+    #[allow(dead_code)]
+    #[inline(always)]
     fn set_have_async(&mut self) {
         self.have_async = true;
     }

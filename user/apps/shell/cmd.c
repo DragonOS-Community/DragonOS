@@ -339,9 +339,11 @@ int shell_cmd_cat(int argc, char **argv)
         int l = read(fd, buf, 511);
         if (l < 0)
         {
-            printf("ERROR: Cannot read file: %s\n", file_path);
+            printf("ERROR: Cannot read file: %s, errno = %d\n", file_path, errno);
             return -1;
         }
+        if (l == 0)
+            break;
         buf[l] = '\0';
 
         file_size -= l;

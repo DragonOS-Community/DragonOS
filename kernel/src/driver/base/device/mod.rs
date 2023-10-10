@@ -377,6 +377,7 @@ impl KObjType for DeviceKObjType {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct DeviceSysFSOps;
 
 impl SysFSOps for DeviceSysFSOps {

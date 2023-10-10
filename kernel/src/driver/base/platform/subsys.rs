@@ -4,7 +4,7 @@ use alloc::{
 };
 
 use crate::{
-    driver::base::{device::bus::Bus, kobject::KObject, SubSysPrivate},
+    driver::base::{device::bus::Bus, kobject::KObject, subsys::SubSysPrivate},
     filesystem::{
         sysfs::{Attribute, AttributeGroup},
         vfs::syscall::ModeType,
@@ -19,7 +19,7 @@ pub struct PlatformBus {
 impl PlatformBus {
     pub fn new() -> Arc<Self> {
         let w: Weak<Self> = Weak::new();
-        let private = SubSysPrivate::new("platform".to_string(), w);
+        let private = SubSysPrivate::new("platform".to_string(), w, &[]);
         let bus = Arc::new(Self { private });
         bus.subsystem()
             .set_bus(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>)));

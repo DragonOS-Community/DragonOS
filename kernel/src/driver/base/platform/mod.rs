@@ -2,20 +2,14 @@ use self::{platform_device::PlatformBusDevice, subsys::PlatformBus};
 
 use super::{
     device::{
-        bus::{bus_driver_register, bus_register, Bus, BusDriver, BusState},
-        device_unregister,
-        driver::DriverError,
-        sys_devices_kset, Device, DeviceError, DeviceNumber, DevicePrivateData, DeviceResource,
-        DeviceType, IdTable,
+        bus::{bus_register, Bus, BusState},
+        device_unregister, sys_devices_kset, DeviceNumber, DevicePrivateData, DeviceType, IdTable,
     },
     kobject::KObject,
     kset::KSet,
 };
 use crate::{
-    driver::{
-        base::{device::device_register, platform::platform_driver::LockedPlatformBusDriver},
-        Driver,
-    },
+    driver::base::{device::device_register, platform::platform_driver::LockedPlatformBusDriver},
     syscall::SystemError,
 };
 use alloc::{
@@ -93,12 +87,14 @@ pub fn platform_bus_init() -> Result<(), SystemError> {
             CompatibleTable::new(vec!["platform"]),
             BusState::NotInitialized.into(),
         ),
-        Arc::downgrade(&(sys_devices_kset() as Arc<dyn KObject>)),
+        Some(Arc::downgrade(&(sys_devices_kset() as Arc<dyn KObject>))),
     );
     unsafe { PLATFORM_DEVICE = Some(platform_device.clone()) };
+    // 注册到/sys/devices下
     device_register(platform_device.clone())?;
 
     let paltform_bus = PlatformBus::new();
+    // 注册到/sys/bus下
     let r = bus_register(paltform_bus.clone() as Arc<dyn Bus>);
     if r.is_err() {
         device_unregister(platform_device.clone());

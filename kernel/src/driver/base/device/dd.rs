@@ -29,6 +29,10 @@ impl DeviceManager {
         return self.do_device_attach(dev, false);
     }
 
+    pub fn device_initial_probe(&self, dev: &Arc<dyn Device>) -> Result<bool, SystemError> {
+        return self.do_device_attach(dev, true);
+    }
+
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#978
     fn do_device_attach(
         &self,
@@ -60,7 +64,7 @@ impl DeviceManager {
             let bus = dev.bus().ok_or(SystemError::EINVAL)?;
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
             let mut flag = true;
-            for driver in bus.subsystem().drivers.read().iter() {
+            for driver in bus.subsystem().drivers().read().iter() {
                 if let Some(driver) = driver.upgrade() {
                     let r = self.do_device_attach_driver(&driver, &mut data);
                     if unlikely(r.is_err()) {

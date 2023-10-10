@@ -71,7 +71,7 @@ impl DowncastArc for dyn KObject {
 }
 
 pub trait KObjType: Debug {
-    fn release(&self, kobj: Arc<dyn KObject>) {}
+    fn release(&self, _kobj: Arc<dyn KObject>) {}
     fn sysfs_ops(&self) -> Option<&dyn SysFSOps>;
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]>;
@@ -111,6 +111,7 @@ pub trait KObjectAttribute: Attribute {
     fn store(&self, kobj: &dyn KObject, buf: &[u8]) -> Result<usize, SystemError>;
 }
 
+#[derive(Debug)]
 pub struct KObjectSysFSOps;
 
 impl SysFSOps for KObjectSysFSOps {

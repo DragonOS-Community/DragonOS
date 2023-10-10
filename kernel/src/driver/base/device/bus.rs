@@ -1,26 +1,16 @@
 use super::{
-    device_register, device_unregister,
-    driver::{driver_register, driver_unregister, DriverError},
-    sys_devices_kset, Device, DeviceError, DeviceMatchName, DeviceMatcher, DeviceState, IdTable,
+    driver::DriverError, sys_devices_kset, Device, DeviceMatchName, DeviceMatcher, DeviceState,
 };
 use crate::{
     driver::{
-        base::{
-            device::{device_manager, DeviceManager},
-            kobject::KObject,
-            kset::KSet,
-            SubSysPrivate,
-        },
+        base::{device::device_manager, kobject::KObject, kset::KSet, subsys::SubSysPrivate},
         Driver,
     },
     filesystem::{
-        sysfs::{
-            bus::{sys_bus_init, sys_bus_register},
-            sysfs_instance, Attribute, AttributeGroup, SysFSOpsSupport, SYS_BUS_INODE,
-        },
-        vfs::{syscall::ModeType, IndexNode},
+        sysfs::{file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOpsSupport},
+        vfs::syscall::ModeType,
     },
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::rwlock::RwLock,
     syscall::SystemError,
 };
 use alloc::{
@@ -148,7 +138,7 @@ impl dyn Bus {
         data: T,
     ) -> Option<Arc<dyn Device>> {
         let subsys = self.subsystem();
-        let guard = subsys.devices.read();
+        let guard = subsys.devices().read();
         for dev in guard.iter() {
             let dev = dev.upgrade();
             if let Some(dev) = dev {
@@ -178,6 +168,12 @@ pub struct BusManager {
 }
 
 impl BusManager {
+    pub fn new() -> Self {
+        return Self {
+            kset_bus_map: RwLock::new(HashMap::new()),
+        };
+    }
+
     ///
     /// bus_register - register a driver-core subsystem
     ///
@@ -196,7 +192,7 @@ impl BusManager {
         subsys_kset.set_name(bus.name());
         bus.subsystem().set_drivers_autoprobe(true);
 
-        subsys_kset.register(Some(sys_bus_kset()));
+        subsys_kset.register(Some(sys_bus_kset()))?;
 
         let devices_kset =
             KSet::new_and_add("devices".to_string(), None, Some(subsys_kset.clone()))?;
@@ -269,13 +265,46 @@ impl BusManager {
     ///
     /// - `bus` - bus实例
     pub fn rescan_devices(&self, bus: &Arc<dyn Bus>) -> Result<(), SystemError> {
-        for dev in bus.subsystem().devices.read().iter() {
+        for dev in bus.subsystem().devices().read().iter() {
             let dev = dev.upgrade();
             if let Some(dev) = dev {
                 rescan_devices_helper(dev)?;
             }
         }
         return Ok(());
+    }
+
+    /// 为新设备探测驱动
+    ///
+    /// Automatically probe for a driver if the bus allows it.
+    pub fn probe_device(&self, dev: &Arc<dyn Device>) {
+        let bus = dev.bus();
+        if bus.is_none() {
+            return;
+        }
+        let bus = bus.unwrap();
+        if bus.subsystem().drivers_autoprobe() {
+            device_manager().device_initial_probe(dev).ok();
+        }
+        for interface in bus.subsystem().interfaces() {
+            interface.add_device(dev).ok();
+        }
+    }
+
+    /// 在bus上,根据条件寻找一个特定的设备
+    ///
+    /// ## 参数
+    ///
+    /// - `matcher` - 匹配器
+    /// - `data` - 传给匹配器的数据
+    #[inline]
+    pub fn find_device<T: Copy>(
+        &self,
+        bus: &Arc<dyn Bus>,
+        matcher: &dyn DeviceMatcher<T>,
+        data: T,
+    ) -> Option<Arc<dyn Device>> {
+        return bus.find_device(matcher, data);
     }
 }
 
@@ -344,6 +373,14 @@ pub fn buses_init() -> Result<(), SystemError> {
             .register(Some(sys_devices_kset()))
             .expect("devices system kset register failed");
     }
+
+    // 初始化总线管理器
+    {
+        let bus_manager = BusManager::new();
+        unsafe {
+            BUS_MANAGER_INSTANCE = Some(bus_manager);
+        }
+    }
     return Ok(());
 }
 
@@ -380,7 +417,7 @@ pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
 ///
 /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
 pub fn bus_probe_device(dev: &Arc<dyn Device>) {
-    todo!("bus_probe_device")
+    bus_manager().probe_device(dev);
 }
 
 #[derive(Debug)]
@@ -444,10 +481,20 @@ impl Attribute for BusAttrDriversAutoprobe {
 
     /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#226
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        todo!("BusAttrDriversAutoprobe::show()")
+        let kset: Arc<KSet> = kobj.arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+        let bus = bus_manager()
+            .get_bus_by_kset(&kset)
+            .ok_or(SystemError::EINVAL)?;
+        let val = if bus.subsystem().drivers_autoprobe() {
+            1
+        } else {
+            0
+        };
+        return sysfs_emit_str(buf, format!("{val}\n").as_str());
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum BusNotifyEvent {
     /// 一个设备被添加到总线上

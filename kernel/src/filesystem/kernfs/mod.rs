@@ -305,6 +305,7 @@ impl IndexNode for KernFSInode {
         }
 
         if self.callback.is_none() {
+            kwarn!("kernfs: callback is none");
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
@@ -409,8 +410,14 @@ impl KernFSInode {
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
+        let size = if file_type == KernInodeType::File {
+            4096
+        } else {
+            0
+        };
+
         let metadata = Metadata {
-            size: 0,
+            size,
             mode,
             uid: 0,
             gid: 0,
@@ -430,7 +437,7 @@ impl KernFSInode {
             Some(self.self_ref.upgrade().unwrap()),
             name.clone(),
             metadata,
-            KernInodeType::Dir,
+            file_type,
             private_data,
             callback,
         );

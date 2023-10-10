@@ -1,6 +1,9 @@
 use core::{intrinsics::unlikely, ops::BitAnd};
 
-use alloc::{string::ToString, sync::Arc};
+use alloc::{
+    string::ToString,
+    sync::{Arc, Weak},
+};
 
 use crate::{
     driver::base::kobject::KObject,
@@ -9,7 +12,7 @@ use crate::{
             callback::{KernCallbackData, KernFSCallback, KernInodePrivateData},
             KernFSInode,
         },
-        sysfs::SysFSOpsSupport,
+        sysfs::{SysFSOps, SysFSOpsSupport},
         vfs::{syscall::ModeType, PollStatus},
     },
     kwarn,
@@ -21,19 +24,37 @@ use super::{Attribute, SysFS, SysFSKernPrivateData};
 #[derive(Debug)]
 pub struct SysKernFilePriv {
     attribute: Option<&'static dyn Attribute>,
+    /// 当前文件对应的kobject
+    kobj: Weak<dyn KObject>,
     // todo: 增加bin attribute,它和attribute二选一，只能有一个为Some
 }
 
 impl SysKernFilePriv {
-    pub fn new(attribute: Option<&'static dyn Attribute>) -> Self {
+    pub fn new(kobj: &Arc<dyn KObject>, attribute: Option<&'static dyn Attribute>) -> Self {
         if attribute.is_none() {
             panic!("attribute can't be None");
         }
-        return Self { attribute };
+        let kobj = Arc::downgrade(kobj);
+        return Self { kobj, attribute };
     }
 
+    #[inline]
     pub fn attribute(&self) -> Option<&'static dyn Attribute> {
         self.attribute
+    }
+
+    pub fn callback_read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let attribute = self.attribute.ok_or(SystemError::EINVAL)?;
+        // 当前文件所指向的kobject已经被释放
+        let kobj = self.kobj.upgrade().expect("kobj is None");
+        return attribute.show(kobj, buf);
+    }
+
+    pub fn callback_write(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        let attribute = self.attribute.ok_or(SystemError::EINVAL)?;
+        // 当前文件所指向的kobject已经被释放
+        let kobj = self.kobj.upgrade().expect("kobj is None");
+        return attribute.store(kobj, buf);
     }
 }
 
@@ -71,7 +92,7 @@ impl SysFS {
         }
         drop(x);
 
-        let sysfs_ops = kobj.kobj_type().unwrap().sysfs_ops().ok_or_else(|| {
+        let sysfs_ops: &dyn SysFSOps = kobj.kobj_type().unwrap().sysfs_ops().ok_or_else(|| {
             kwarn!("missing sysfs attribute operations for kobject: {kobj:?}");
             SystemError::EINVAL
         })?;
@@ -79,6 +100,7 @@ impl SysFS {
         // assume that all sysfs ops are preallocated.
 
         let sys_support = sysfs_ops.support(attr);
+
         let kern_callback: &'static dyn KernFSCallback;
         if sys_support.contains(SysFSOpsSupport::SHOW)
             && sys_support.contains(SysFSOpsSupport::STORE)
@@ -92,7 +114,7 @@ impl SysFS {
             kern_callback = &PreallocKFOpsEmpty;
         }
 
-        let sys_priv = SysFSKernPrivateData::File(SysKernFilePriv::new(Some(attr)));
+        let sys_priv = SysFSKernPrivateData::File(SysKernFilePriv::new(&kobj, Some(attr)));
         let r = parent.add_file(
             attr.name().to_string(),
             mode.bitand(ModeType::from_bits_truncate(0o777)),
@@ -138,7 +160,7 @@ impl SysFS {
 struct PreallocKFOpsRW;
 
 impl KernFSCallback for PreallocKFOpsRW {
-    fn open(&self, data: KernCallbackData) -> Result<(), SystemError> {
+    fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -148,7 +170,7 @@ impl KernFSCallback for PreallocKFOpsRW {
         buf: &mut [u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        todo!("PreallocKFOpsRW::read")
+        return data.callback_read(buf, offset);
     }
 
     fn write(
@@ -157,11 +179,11 @@ impl KernFSCallback for PreallocKFOpsRW {
         buf: &[u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        todo!("PreallocKFOpsRW::write")
+        return data.callback_write(buf, offset);
     }
 
     #[inline]
-    fn poll(&self, data: KernCallbackData) -> Result<PollStatus, SystemError> {
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
         return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 }
@@ -170,7 +192,7 @@ impl KernFSCallback for PreallocKFOpsRW {
 struct PreallocKFOpsReadOnly;
 
 impl KernFSCallback for PreallocKFOpsReadOnly {
-    fn open(&self, data: KernCallbackData) -> Result<(), SystemError> {
+    fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -180,20 +202,20 @@ impl KernFSCallback for PreallocKFOpsReadOnly {
         buf: &mut [u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        todo!("PreallocKFOpsReadOnly::read")
+        return data.callback_read(buf, offset);
     }
 
     fn write(
         &self,
-        data: KernCallbackData,
-        buf: &[u8],
-        offset: usize,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EPERM);
     }
 
     #[inline]
-    fn poll(&self, data: KernCallbackData) -> Result<PollStatus, SystemError> {
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
         return Ok(PollStatus::READ);
     }
 }
@@ -202,15 +224,15 @@ impl KernFSCallback for PreallocKFOpsReadOnly {
 struct PreallocKFOpsWriteOnly;
 
 impl KernFSCallback for PreallocKFOpsWriteOnly {
-    fn open(&self, data: KernCallbackData) -> Result<(), SystemError> {
+    fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }
 
     fn read(
         &self,
-        data: KernCallbackData,
-        buf: &mut [u8],
-        offset: usize,
+        _data: KernCallbackData,
+        _buf: &mut [u8],
+        _offset: usize,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EPERM);
     }
@@ -221,11 +243,11 @@ impl KernFSCallback for PreallocKFOpsWriteOnly {
         buf: &[u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        todo!("PreallocKFOpsWriteOnly::write")
+        return data.callback_write(buf, offset);
     }
 
     #[inline]
-    fn poll(&self, data: KernCallbackData) -> Result<PollStatus, SystemError> {
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
         return Ok(PollStatus::WRITE);
     }
 }
@@ -234,30 +256,42 @@ impl KernFSCallback for PreallocKFOpsWriteOnly {
 struct PreallocKFOpsEmpty;
 
 impl KernFSCallback for PreallocKFOpsEmpty {
-    fn open(&self, data: KernCallbackData) -> Result<(), SystemError> {
+    fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }
 
     fn read(
         &self,
-        data: KernCallbackData,
-        buf: &mut [u8],
-        offset: usize,
+        _data: KernCallbackData,
+        _buf: &mut [u8],
+        _offset: usize,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EPERM);
     }
 
     fn write(
         &self,
-        data: KernCallbackData,
-        buf: &[u8],
-        offset: usize,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EPERM);
     }
 
     #[inline]
-    fn poll(&self, data: KernCallbackData) -> Result<PollStatus, SystemError> {
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
         return Ok(PollStatus::empty());
     }
+}
+
+pub fn sysfs_emit_str(buf: &mut [u8], s: &str) -> Result<usize, SystemError> {
+    let len;
+    if buf.len() > s.len() {
+        len = s.len();
+    } else {
+        len = buf.len() - 1;
+    }
+    buf[..len].copy_from_slice(&s.as_bytes()[..len]);
+    buf[len] = b'\0';
+    return Ok(len);
 }

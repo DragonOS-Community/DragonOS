@@ -16,9 +16,10 @@ use alloc::sync::Arc;
 
 use self::base::{
     device::{driver::DriverError, Device, DevicePrivateData, DeviceResource, IdTable},
+    kobject::KObject,
     platform::CompatibleTable,
 };
-pub trait Driver: Sync + Send + Debug {
+pub trait Driver: Sync + Send + Debug + KObject {
     /// @brief: 获取驱动匹配表
     /// @parameter: None
     /// @return: 驱动匹配表

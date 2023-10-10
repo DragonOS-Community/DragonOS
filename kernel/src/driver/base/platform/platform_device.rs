@@ -10,16 +10,12 @@ use crate::{
                 bus::{Bus, BusState},
                 Device, DeviceNumber, DevicePrivateData, DeviceType, IdTable,
             },
-            kobject::{KObjType, KObject, KObjectState},
+            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         Driver,
     },
-    filesystem::{
-        kernfs::KernFSInode,
-        sysfs::{Attribute, AttributeGroup},
-        vfs::syscall::ModeType,
-    },
+    filesystem::kernfs::KernFSInode,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
@@ -46,16 +42,21 @@ pub trait PlatformDevice: Device {
 #[derive(Debug)]
 #[cast_to([sync] Device)]
 pub struct PlatformBusDevice {
-    inner: SpinLock<InnerPlatform>,
+    inner: SpinLock<InnerPlatformBusDevice>,
+    kobj_state: LockedKObjectState,
 }
 
 impl PlatformBusDevice {
     /// @brief: 创建一个加锁的platform总线实例
     /// @parameter: None
     /// @return: platform总线实例
-    pub fn new(data: DevicePrivateData, parent: Weak<dyn KObject>) -> Arc<PlatformBusDevice> {
+    pub fn new(
+        data: DevicePrivateData,
+        parent: Option<Weak<dyn KObject>>,
+    ) -> Arc<PlatformBusDevice> {
         return Arc::new(PlatformBusDevice {
-            inner: SpinLock::new(InnerPlatform::new(data, parent)),
+            inner: SpinLock::new(InnerPlatformBusDevice::new(data, parent)),
+            kobj_state: LockedKObjectState::new(KObjectState::empty()),
         });
     }
 
@@ -112,11 +113,11 @@ impl PlatformBusDevice {
 
 /// @brief: platform总线
 #[derive(Debug, Clone)]
-pub struct InnerPlatform {
+pub struct InnerPlatformBusDevice {
     name: String,
     data: DevicePrivateData,
-    state: BusState,           // 总线状态
-    parent: Weak<dyn KObject>, // 总线的父对象
+    state: BusState,                   // 总线状态
+    parent: Option<Weak<dyn KObject>>, // 总线的父对象
 
     kernfs_inode: Option<Arc<KernFSInode>>,
     /// 当前设备挂载到的总线
@@ -126,11 +127,11 @@ pub struct InnerPlatform {
 }
 
 /// @brief: platform方法集
-impl InnerPlatform {
+impl InnerPlatformBusDevice {
     /// @brief: 创建一个platform总线实例
     /// @parameter: None
     /// @return: platform总线实例
-    pub fn new(data: DevicePrivateData, parent: Weak<dyn KObject>) -> Self {
+    pub fn new(data: DevicePrivateData, parent: Option<Weak<dyn KObject>>) -> Self {
         Self {
             data,
             name: "platform".to_string(),
@@ -149,7 +150,7 @@ impl KObject for PlatformBusDevice {
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        Some(self.inner.lock().parent.clone())
+        self.inner.lock().parent.clone()
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
@@ -169,15 +170,15 @@ impl KObject for PlatformBusDevice {
     }
 
     fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
-        todo!()
+        self.kobj_state.read()
     }
 
     fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
-        todo!()
+        self.kobj_state.write()
     }
 
-    fn set_kobj_state(&self, _state: KObjectState) {
-        todo!()
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.kobj_state.write() = state;
     }
 
     fn name(&self) -> String {
@@ -193,7 +194,7 @@ impl KObject for PlatformBusDevice {
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        todo!()
+        self.inner.lock().parent = parent;
     }
 }
 

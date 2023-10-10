@@ -31,11 +31,11 @@ use alloc::{
 pub mod bus;
 pub mod class;
 pub mod devices;
-mod dir;
-mod file;
+pub mod dir;
+pub mod file;
 pub mod fs;
-mod group;
-mod symlink;
+pub mod group;
+pub mod symlink;
 
 const SYSFS_MAX_NAMELEN: usize = 64;
 
@@ -535,6 +535,41 @@ pub enum SysFSKernPrivateData {
     File(SysKernFilePriv),
 }
 
+impl SysFSKernPrivateData {
+    #[inline(always)]
+    pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
+        match self {
+            SysFSKernPrivateData::File(file) => {
+                let len = file.callback_read(buf)?;
+                if offset > 0 {
+                    if len <= offset {
+                        return Ok(0);
+                    }
+                    let len = len - offset;
+                    buf.copy_within(offset..offset + len, 0);
+                    buf[len] = 0;
+                }
+                return Ok(len);
+            }
+            _ => {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn callback_write(&self, buf: &[u8], _offset: usize) -> Result<usize, SystemError> {
+        match self {
+            SysFSKernPrivateData::File(file) => {
+                return file.callback_write(buf);
+            }
+            _ => {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+        }
+    }
+}
+
 /// sysfs文件目录的属性组
 pub trait AttributeGroup: Debug + Send + Sync {
     /// 属性组的名称
@@ -569,7 +604,7 @@ pub trait Attribute: Debug + Send + Sync {
     }
 }
 
-pub trait SysFSOps {
+pub trait SysFSOps: Debug {
     /// 获取当前文件的支持的操作
     fn support(&self, attr: &dyn Attribute) -> SysFSOpsSupport {
         return attr.support();

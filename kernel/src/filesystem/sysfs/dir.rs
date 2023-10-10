@@ -11,11 +11,10 @@ use crate::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
         vfs::syscall::ModeType,
     },
-    kwarn,
     syscall::SystemError,
 };
 
-use super::{AttributeGroup, SysFS, SysFSKernPrivateData};
+use super::{SysFS, SysFSKernPrivateData};
 
 #[derive(Debug)]
 pub struct SysKernDirPriv {

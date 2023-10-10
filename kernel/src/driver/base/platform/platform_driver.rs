@@ -1,6 +1,6 @@
 use crate::driver::{base::device::DevicePrivateData, Driver};
 
-use super::{super::device::driver::DriverError, platform_device::PlatformDevice, CompatibleTable};
+use super::{super::device::driver::DriverError, CompatibleTable};
 
 lazy_static! {
     static ref PLATFORM_COMPAT_TABLE: CompatibleTable = CompatibleTable::new(vec!["platform"]);

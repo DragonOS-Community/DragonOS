@@ -12,13 +12,13 @@ impl SysFS {
     /// - `kobj`: 要创建符号链接的kobject
     /// - `target`: 符号链接的目标（在目标目录下创建）
     /// - `name`: 符号链接的名称
-    /// 
+    ///
     /// 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#89
     pub fn create_link(
         &self,
-        kobj: &Arc<dyn KObject>,
-        target: &Arc<dyn KObject>,
-        name: String,
+        _kobj: &Arc<dyn KObject>,
+        _target: &Arc<dyn KObject>,
+        _name: String,
     ) -> Result<(), SystemError> {
         todo!("sysfs create link")
     }
@@ -29,10 +29,10 @@ impl SysFS {
     ///
     /// - `kobj`: 要删除符号链接的kobject（符号链接所在目录）
     /// - `name`: 符号链接的名称
-    /// 
-    /// 
+    ///
+    ///
     /// 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#143
-    pub fn remove_link(&self, kobj: &Arc<dyn KObject>, name: String) -> Result<(), SystemError> {
+    pub fn remove_link(&self, _kobj: &Arc<dyn KObject>, _name: String) -> Result<(), SystemError> {
         todo!("sysfs remove link")
     }
 }

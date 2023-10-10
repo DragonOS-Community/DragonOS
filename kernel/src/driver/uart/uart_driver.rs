@@ -38,7 +38,7 @@ impl KObject for UartDriver {
         self
     }
 
-    fn set_inode(&self, inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+    fn set_inode(&self, _inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
         todo!()
     }
 
@@ -50,7 +50,7 @@ impl KObject for UartDriver {
         todo!()
     }
 
-    fn set_parent(&self, parent: Option<alloc::sync::Weak<dyn KObject>>) {
+    fn set_parent(&self, _parent: Option<alloc::sync::Weak<dyn KObject>>) {
         todo!()
     }
 
@@ -58,7 +58,7 @@ impl KObject for UartDriver {
         todo!()
     }
 
-    fn set_kset(&self, kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+    fn set_kset(&self, _kset: Option<Arc<crate::driver::base::kset::KSet>>) {
         todo!()
     }
 
@@ -70,7 +70,7 @@ impl KObject for UartDriver {
         todo!()
     }
 
-    fn set_name(&self, name: alloc::string::String) {
+    fn set_name(&self, _name: alloc::string::String) {
         todo!()
     }
 
@@ -86,7 +86,7 @@ impl KObject for UartDriver {
         todo!()
     }
 
-    fn set_kobj_state(&self, state: crate::driver::base::kobject::KObjectState) {
+    fn set_kobj_state(&self, _state: crate::driver::base::kobject::KObjectState) {
         todo!()
     }
 }

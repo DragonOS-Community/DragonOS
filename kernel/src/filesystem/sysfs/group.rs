@@ -194,7 +194,7 @@ impl SysFS {
         return Ok(());
     }
 
-    fn group_remove_files(&self, parent: &Arc<KernFSInode>, group: &'static dyn AttributeGroup) {
+    fn group_remove_files(&self, _parent: &Arc<KernFSInode>, _group: &'static dyn AttributeGroup) {
         todo!("group_remove_files")
     }
 }

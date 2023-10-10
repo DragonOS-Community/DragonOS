@@ -38,6 +38,7 @@ impl SysKernFilePriv {
         return Self { kobj, attribute };
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn attribute(&self) -> Option<&'static dyn Attribute> {
         self.attribute

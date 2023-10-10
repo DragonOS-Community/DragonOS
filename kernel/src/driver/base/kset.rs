@@ -11,7 +11,6 @@ use crate::{
         kernfs::KernFSInode,
         sysfs::{AttributeGroup, SysFSOps},
     },
-    kdebug,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     syscall::SystemError,
 };
@@ -124,6 +123,7 @@ impl KSet {
     }
 
     /// 清除所有已经被释放的kobject
+    #[allow(dead_code)]
     pub fn cleanup_weak(&self) {
         let mut kobjects = self.kobjects.write();
         kobjects.drain_filter(|x| x.upgrade().is_none());

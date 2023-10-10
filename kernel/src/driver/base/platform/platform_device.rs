@@ -86,6 +86,7 @@ impl PlatformBusDevice {
     /// @parameter set_state: 总线状态BusState
     /// @return: None
     #[inline]
+    #[allow(dead_code)]
     fn set_state(&self, set_state: BusState) {
         let state = &mut self.inner.lock().state;
         *state = set_state;
@@ -112,6 +113,7 @@ impl PlatformBusDevice {
 }
 
 /// @brief: platform总线
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InnerPlatformBusDevice {
     name: String,
@@ -189,7 +191,7 @@ impl KObject for PlatformBusDevice {
         self.inner.lock().name = name;
     }
 
-    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+    fn set_kset(&self, _kset: Option<Arc<KSet>>) {
         todo!()
     }
 

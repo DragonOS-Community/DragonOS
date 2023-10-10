@@ -585,14 +585,14 @@ impl DeviceManager {
     /// ## 参数
     ///
     /// - `dev`: 设备
-    fn device_to_dev_kobj(&self, dev: &Arc<dyn Device>) -> Arc<dyn KObject> {
+    fn device_to_dev_kobj(&self, _dev: &Arc<dyn Device>) -> Arc<dyn KObject> {
         // todo: 处理class的逻辑
         let kobj = sys_dev_char_kset().as_kobject();
         return kobj;
     }
 
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
-    pub fn device_links_force_bind(&self, dev: &Arc<dyn Device>) {
+    pub fn device_links_force_bind(&self, _dev: &Arc<dyn Device>) {
         todo!("device_links_force_bind")
     }
 }
@@ -607,7 +607,7 @@ pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), SystemError> {
 /// @brief: 设备卸载
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
-pub fn device_unregister<T: Device>(device: Arc<T>) {
+pub fn device_unregister<T: Device>(_device: Arc<T>) {
     // DEVICE_MANAGER.add_device(device.id_table(), device.clone());
     // match sys_device_unregister(&device.id_table().name()) {
     //     Ok(_) => {
@@ -633,7 +633,7 @@ impl Attribute for DeviceAttrDev {
         "dev"
     }
 
-    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn show(&self, kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
             kerror!(
                 "Intertrait casting not implemented for kobj: {}",

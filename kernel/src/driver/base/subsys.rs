@@ -80,6 +80,8 @@ impl SubSysPrivate {
         return self.subsys.clone();
     }
 
+    #[inline]
+    #[allow(dead_code)]
     pub fn bus(&self) -> Weak<dyn Bus> {
         return self.bus.lock().clone();
     }
@@ -105,14 +107,20 @@ impl SubSysPrivate {
             .store(drivers_autoprobe, Ordering::SeqCst);
     }
 
+    #[allow(dead_code)]
+    #[inline]
     pub fn devices_kset(&self) -> Option<Arc<KSet>> {
         return self.ksets.read().devices_kset.clone();
     }
 
+    #[allow(dead_code)]
+    #[inline]
     pub fn set_devices_kset(&self, devices_kset: Arc<KSet>) {
         self.ksets.write().devices_kset = Some(devices_kset);
     }
 
+    #[allow(dead_code)]
+    #[inline]
     pub fn drivers_kset(&self) -> Option<Arc<KSet>> {
         return self.ksets.read().drivers_kset.clone();
     }

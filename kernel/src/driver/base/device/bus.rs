@@ -173,7 +173,7 @@ impl BusManager {
     /// the devices and drivers that belong to the subsystem.
     ///
     /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_register#783
-    /// 
+    ///
     /// todo: 增加错误处理逻辑
     pub fn register(&self, bus: Arc<dyn Bus>) -> Result<(), SystemError> {
         bus.subsystem().set_bus(Arc::downgrade(&bus));

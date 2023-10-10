@@ -4,7 +4,7 @@ use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
 
 use super::{
     kernfs::{KernFS, KernFSInode},
-    vfs::{syscall::ModeType, FileSystem, IndexNode},
+    vfs::{syscall::ModeType, FileSystem},
 };
 use crate::{
     driver::base::kobject::KObject,
@@ -19,8 +19,6 @@ pub mod dir;
 pub mod file;
 pub mod group;
 pub mod symlink;
-
-const SYSFS_MAX_NAMELEN: usize = 64;
 
 /// 全局的sysfs实例
 pub(self) static mut SYSFS_INSTANCE: Option<SysFS> = None;
@@ -126,11 +124,11 @@ pub trait Attribute: Debug + Send + Sync {
 
     fn support(&self) -> SysFSOpsSupport;
 
-    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
+    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 }

@@ -7,13 +7,11 @@ use crate::driver::pci::pci::{
 
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
 use crate::include::bindings::bindings::pt_regs;
-
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
 use crate::mm::VirtAddr;
 use crate::net::net_core::poll_ifaces_try_lock_onetime;
-use alloc::ffi::CString;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -62,7 +60,7 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 const VIRTIO_RECV_VECTOR: u16 = 56;
 /// Virtio设备接收中断的设备号的表项号
 const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
-// 接收的queue
+// 接收的queue号
 const QUEUE_RECEIVE: u16 = 0;
 ///@brief device id 转换为设备类型
 ///@param pci_device_id，device_id
@@ -136,17 +134,13 @@ impl PciTransport {
             .expect("IRQ init failed");
         // 中断相关信息
         let msg = IrqMsg {
-            irq_common_message: IrqCommonMsg {
-                irq_index: 0,
-                irq_name: CString::new(
-                    "Virtio_Recv_
-                IRQ",
-                )
-                .expect("CString::new failed"),
-                irq_parameter: 0,
-                irq_hander: virtio_irq_hander,
-                irq_ack: None,
-            },
+            irq_common_message: IrqCommonMsg::init_from(
+                0,
+                "Virtio_Recv_IRQ",
+                0,
+                virtio_irq_hander,
+                None,
+            ),
             irq_specific_message: IrqSpecificMsg::msi_default(),
         };
         standard_device.irq_install(msg)?;
@@ -314,6 +308,7 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_desc, descriptors as u64);
             volwrite!(self.common_cfg, queue_driver, driver_area as u64);
             volwrite!(self.common_cfg, queue_device, device_area as u64);
+            // 这里设置队列中断对应的中断项
             if queue == QUEUE_RECEIVE {
                 volwrite!(self.common_cfg, queue_msix_vector, VIRTIO_RECV_VECTOR_INDEX);
                 let vector = volread!(self.common_cfg, queue_msix_vector);

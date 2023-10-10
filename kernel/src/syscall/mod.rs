@@ -7,11 +7,11 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
-        syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
     include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-use self::user_access::UserBufferWriter;
+use self::user_access::{UserBufferReader, UserBufferWriter};
 
 pub mod user_access;
 
@@ -375,6 +375,7 @@ pub const SYS_GETPGID: usize = 50;
 
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
+pub const SYS_MKNOD: usize = 53;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -405,7 +406,11 @@ impl Syscall {
     ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
-    pub fn handle(syscall_num: usize, args: &[usize], frame: &mut TrapFrame) -> usize {
+    pub fn handle(
+        syscall_num: usize,
+        args: &[usize],
+        frame: &mut TrapFrame,
+    ) -> Result<usize, SystemError> {
         let r = match syscall_num {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
@@ -417,9 +422,9 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 } else {
                     let path: &str = path.unwrap();
+
                     let flags = args[1];
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-
                     Self::open(path, open_flags)
                 };
 
@@ -427,46 +432,33 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                Self::close(fd)
+
+                let res = Self::close(fd);
+
+                res
             }
             SYS_READ => {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.from_user() && verify_area(virt_addr, len as usize).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else {
-                    let buf: &mut [u8] = unsafe {
-                        core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
-                    };
+                let from_user = frame.from_user();
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
-                    Self::read(fd, buf)
-                };
-                // kdebug!("sys read, fd: {}, len: {}, res: {:?}", fd, len, res);
+                let user_buf = user_buffer_writer.buffer(0)?;
+                let res = Self::read(fd, user_buf);
                 res
             }
             SYS_WRITE => {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.from_user() && verify_area(virt_addr, len as usize).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else {
-                    let buf: &[u8] = unsafe {
-                        core::slice::from_raw_parts::<'static, u8>(buf_vaddr as *const u8, len)
-                    };
+                let from_user = frame.from_user();
+                let user_buffer_reader =
+                    UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
 
-                    Self::write(fd, buf)
-                };
-
-                // kdebug!("sys write, fd: {}, len: {}, res: {:?}", fd, len, res);
-
+                let user_buf = user_buffer_reader.read_from_user(0)?;
+                let res = Self::write(fd, user_buf);
                 res
             }
 
@@ -481,17 +473,9 @@ impl Syscall {
                     SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
                     SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
                     _ => Err(SystemError::EINVAL),
-                };
+                }?;
 
-                let res = if w.is_err() {
-                    Err(w.unwrap_err())
-                } else {
-                    let w = w.unwrap();
-                    Self::lseek(fd, w)
-                };
-                // kdebug!("sys lseek, fd: {}, offset: {}, whence: {}, res: {:?}", fd, offset, whence, res);
-
-                res
+                Self::lseek(fd, w)
             }
 
             SYS_FORK => Self::fork(frame),
@@ -535,16 +519,13 @@ impl Syscall {
                     return Ok(dest_path);
                 };
 
-                let r: Result<&str, SystemError> = chdir_check(args[0]);
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    Self::chdir(r.unwrap())
-                }
+                let r = chdir_check(args[0])?;
+                Self::chdir(r)
             }
 
             SYS_GET_DENTS => {
                 let fd = args[0] as i32;
+
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
@@ -969,10 +950,16 @@ impl Syscall {
                 res
             }
 
+            SYS_MKNOD => {
+                let path = args[0];
+                let flags = args[1];
+                let dev_t = args[2];
+                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
+                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
-
-        let r = r.unwrap_or_else(|e| e.to_posix_errno() as usize);
         return r;
     }
 

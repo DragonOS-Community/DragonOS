@@ -630,8 +630,8 @@ impl ProcessControlBlock {
     }
 
     /// 生成进程的名字
-    pub fn generate_name(_program_path: &str, args: &Vec<String>) -> String {
-        let mut name = "".to_string();
+    pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
+        let mut name = program_path.to_string();
         for arg in args {
             name.push_str(arg);
             name.push(' ');

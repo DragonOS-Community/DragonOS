@@ -64,6 +64,19 @@ bitflags! {
         const S_IROTH = 0o0004;
         const S_IWOTH = 0o0002;
         const S_IXOTH = 0o0001;
+
+        /// 0o777
+        const S_IRWXUGO = Self::S_IRWXU.bits | Self::S_IRWXG.bits | Self::S_IRWXO.bits;
+        /// 0o7777
+        const S_IALLUGO = Self::S_ISUID.bits | Self::S_ISGID.bits | Self::S_ISVTX.bits| Self::S_IRWXUGO.bits;
+        /// 0o444
+        const S_IRUGO = Self::S_IRUSR.bits | Self::S_IRGRP.bits | Self::S_IROTH.bits;
+        /// 0o222
+        const S_IWUGO = Self::S_IWUSR.bits | Self::S_IWGRP.bits | Self::S_IWOTH.bits;
+        /// 0o111
+        const S_IXUGO = Self::S_IXUSR.bits | Self::S_IXGRP.bits | Self::S_IXOTH.bits;
+
+
     }
 }
 

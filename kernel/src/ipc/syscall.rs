@@ -116,19 +116,19 @@ impl Syscall {
             let input_sighandler = unsafe { (*act).handler as u64 };
             match input_sighandler {
                 USER_SIG_DFL => {
-                    new_ka = *DEFAULT_SIGACTION;
+                    new_ka = (*DEFAULT_SIGACTION).clone();
                     *new_ka.flags_mut() = (unsafe { (*act).flags }
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
                         | SigFlags::SA_FLAG_DFL;
-                    new_ka.set_restorer(Some(unsafe { (*act).restorer } as u64));
+                    new_ka.set_restorer(None);
                 }
 
                 USER_SIG_IGN => {
-                    new_ka = *DEFAULT_SIGACTION_IGNORE;
+                    new_ka = (*DEFAULT_SIGACTION_IGNORE).clone();
                     *new_ka.flags_mut() = (unsafe { (*act).flags }
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
                         | SigFlags::SA_FLAG_IGN;
-                    new_ka.set_restorer(Some(unsafe { (*act).restorer } as u64));
+                    new_ka.set_restorer(None);
                 }
                 _ => {
                     // 从用户空间获得sigaction结构体

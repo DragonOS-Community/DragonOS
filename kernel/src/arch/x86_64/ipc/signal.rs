@@ -1,4 +1,8 @@
-use core::{ffi::c_void, mem::size_of};
+use core::{
+    ffi::c_void,
+    mem::size_of,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use crate::{
     arch::{
@@ -14,7 +18,7 @@ use crate::{
         signal::{get_signal_to_deliver, set_current_sig_blocked},
         signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, MAX_SIG_NUM},
     },
-    kerror,
+    kdebug, kerror,
     process::ProcessManager,
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
@@ -370,7 +374,6 @@ impl SignalArch for X86_64SignalArch {
             let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
                 .map_err(|e| e.to_posix_errno());
         }
-
         let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
         set_current_sig_blocked(&mut sigmask);
         // 从用户栈恢复sigcontext
@@ -380,6 +383,8 @@ impl SignalArch for X86_64SignalArch {
                 .map_err(|e| e.to_posix_errno());
             // 如果这里返回 err 值的话会丢失上一个系统调用的返回值
         }
+        let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
+            .map_err(|e| e.to_posix_errno());
         // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
         return trap_frame.rax;
     }
@@ -436,14 +441,6 @@ fn setup_frame(
         return Err(SystemError::EPERM);
     }
 
-    if sigaction.restorer().is_none() {
-        kerror!(
-            "restorer in process:{:?} is not defined",
-            ProcessManager::current_pcb().pid()
-        );
-        return Err(SystemError::EINVAL);
-    }
-
     // 将siginfo拷贝到用户栈
     info.copy_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut SigInfo })
         .map_err(|e| -> SystemError {
@@ -469,25 +466,7 @@ fn setup_frame(
             })?
     };
 
-    // 为了与Linux的兼容性，64位程序必须由用户自行指定restorer
-    if sigaction.flags().contains(SigFlags::SA_FLAG_RESTORER) {
-        unsafe {
-            // 在开头检验过sigaction.restorer是否为空了，实际上libc会保证 restorer始终不为空
-            (*frame).ret_code_ptr = sigaction.restorer().unwrap() as usize as *mut c_void;
-        }
-    } else {
-        kerror!(
-            "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
-            ProcessManager::current_pcb().pid(),
-            sig as i32
-        );
-        let r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32);
-        if r.is_err() {
-            kerror!("In setup_sigcontext: generate SIGSEGV signal failed");
-        }
-        return Err(SystemError::EINVAL);
-    }
-
+    kdebug!("sigaction:{:?}", sigaction);
     match sigaction.action() {
         SigactionType::SaHandler(handler_type) => match handler_type {
             SaHandlerType::SigDefault => {
@@ -508,6 +487,35 @@ fn setup_frame(
                         return Err(SystemError::EINVAL);
                     }
                 } else {
+                    // 为了与Linux的兼容性，64位程序必须由用户自行指定restorer
+                    if sigaction.flags().contains(SigFlags::SA_FLAG_RESTORER) {
+                        unsafe {
+                            // 在开头检验过sigaction.restorer是否为空了，实际上libc会保证 restorer始终不为空
+                            (*frame).ret_code_ptr =
+                                sigaction.restorer().unwrap() as usize as *mut c_void;
+                        }
+                    } else {
+                        kerror!(
+                            "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
+                            ProcessManager::current_pcb().pid(),
+                            sig as i32
+                        );
+                        let r = Syscall::kill(
+                            ProcessManager::current_pcb().pid(),
+                            Signal::SIGSEGV as i32,
+                        );
+                        if r.is_err() {
+                            kerror!("In setup_sigcontext: generate SIGSEGV signal failed");
+                        }
+                        return Err(SystemError::EINVAL);
+                    }
+                    if sigaction.restorer().is_none() {
+                        kerror!(
+                            "restorer in process:{:?} is not defined",
+                            ProcessManager::current_pcb().pid()
+                        );
+                        return Err(SystemError::EINVAL);
+                    }
                     unsafe { (*frame).handler = handler as usize as *mut c_void };
                 }
             }

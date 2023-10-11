@@ -137,7 +137,7 @@ impl Signal {
                     )
                 }
             };
-
+            drop(pcb_info);
             pcb.sig_info_mut()
                 .sig_pending_mut()
                 .queue_mut()
@@ -345,27 +345,32 @@ pub fn get_signal_to_deliver(
         // 如果当前动作是忽略这个信号，则不管它了。
         if tmp_ka.flags().contains(SigFlags::SA_FLAG_IGN) {
             continue;
-        } else if !tmp_ka.flags().contains(SigFlags::SA_FLAG_IGN) {
-            // 当前不采用默认的信号处理函数
+        } else if tmp_ka.flags().contains(SigFlags::SA_FLAG_DFL) {
+            (*tmp_ka) = Sigaction::default();
+            ka = Some(tmp_ka);
+            // kdebug!(
+            //     "Use default handler to handle signal [{}] for pid {:?}",
+            //     sig_number as i32,
+            //     ProcessManager::current_pcb().pid()
+            // );
+            break;
+        } else {
+            //如果不是忽略和默认处理，就使用传入的 Sigaction
             ka = Some(tmp_ka);
             break;
         }
-        kdebug!(
-            "Use default handler to handle signal [{}] for pid {:?}",
-            sig_number as i32,
-            ProcessManager::current_pcb().pid()
-        );
-        // ===== 经过上面的判断，如果能走到这一步，就意味着我们采用默认的信号处理函数来处理这个信号 =====
-        drop(guard);
-        // 标记当前进程由于信号而退出
-        ProcessManager::current_pcb()
-            .flags()
-            .insert(ProcessFlags::SIGNALED);
 
-        assert!(info.is_some());
-        // 执行进程的退出动作
-        ProcessManager::exit(info.unwrap().sig_no() as usize);
-        /* NOT REACHED 这部分代码将不会到达 */
+        // // ===== 经过上面的判断，如果能走到这一步，就意味着我们采用默认的信号处理函数来处理这个信号 =====
+        // drop(guard);
+        // // 标记当前进程由于信号而退出
+        // ProcessManager::current_pcb()
+        //     .flags()
+        //     .insert(ProcessFlags::SIGNALED);
+
+        // assert!(info.is_some());
+        // // 执行进程的退出动作
+        // ProcessManager::exit(info.unwrap().sig_no() as usize);
+        // /* NOT REACHED 这部分代码将不会到达 */
     }
     drop(guard);
     return (sig_number, info, ka);

@@ -64,10 +64,46 @@ impl<'a> KernCallbackData<'a> {
     pub fn private_data_mut(&mut self) -> &mut Option<KernInodePrivateData> {
         return &mut self.private_data;
     }
+
+    pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
+        let private_data = self.private_data();
+        if let Some(private_data) = private_data {
+            return private_data.callback_read(buf, offset);
+        }
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
+        let private_data = self.private_data();
+        if let Some(private_data) = private_data {
+            return private_data.callback_write(buf, offset);
+        }
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
 }
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum KernInodePrivateData {
     SysFS(SysFSKernPrivateData),
+}
+
+impl KernInodePrivateData {
+    #[inline(always)]
+    pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
+        match self {
+            KernInodePrivateData::SysFS(private_data) => {
+                return private_data.callback_read(buf, offset);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
+        match self {
+            KernInodePrivateData::SysFS(private_data) => {
+                return private_data.callback_write(buf, offset);
+            }
+        }
+    }
 }

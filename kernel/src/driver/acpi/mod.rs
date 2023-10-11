@@ -15,6 +15,7 @@ use crate::{
 };
 
 mod c_adapter;
+pub mod glue;
 pub mod old;
 
 extern crate acpi;

@@ -11,7 +11,13 @@ use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec};
+use crate::{
+    driver::base::{block::block_device::BlockDevice, char::CharDevice, device::DeviceNumber},
+    ipc::pipe::LockedPipeInode,
+    libs::casting::DowncastArc,
+    syscall::SystemError,
+    time::TimeSpec,
+};
 
 use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
@@ -39,6 +45,16 @@ pub enum FileType {
     SymLink,
     /// 套接字
     Socket,
+}
+
+#[derive(Debug, Clone)]
+pub enum SpecialNodeData {
+    /// 管道文件
+    Pipe(Arc<LockedPipeInode>),
+    /// 字符设备
+    CharDevice(Arc<dyn CharDevice>),
+    /// 块设备
+    BlockDevice(Arc<dyn BlockDevice>),
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -338,6 +354,23 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     fn sync(&self) -> Result<(), SystemError> {
         return Ok(());
     }
+
+    /// ## 创建一个特殊文件节点
+    /// - _filename: 文件名
+    /// - _mode: 权限信息
+    fn mknod(
+        &self,
+        _filename: &str,
+        _mode: ModeType,
+        _dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    /// ## 返回特殊文件的inode
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        None
+    }
 }
 
 impl DowncastArc for dyn IndexNode {
@@ -524,6 +557,12 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+}
+
+impl DowncastArc for dyn FileSystem {
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
+        self
+    }
 }
 
 #[derive(Debug)]

@@ -8,8 +8,7 @@ use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
     arch::MMArch,
-    driver::uart::uart_device::c_uart_send_str,
-    driver::uart::uart_device::UartPort::COM1,
+    driver::tty::serial::serial8250::send_to_default_serial8250_port,
     include::bindings::bindings::{
         multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
         FRAME_BUFFER_MAPPING_OFFSET, SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE,
@@ -226,7 +225,7 @@ impl VideoRefreshManager {
         .unwrap();
 
         let init_text = "Video driver to map.\n\0";
-        c_uart_send_str(COM1 as u16, init_text.as_ptr());
+        send_to_default_serial8250_port(init_text.as_bytes());
 
         //地址映射
         let paddr = PhysAddr::new(fb_info.framebuffer_addr as usize);
@@ -245,7 +244,7 @@ impl VideoRefreshManager {
         __MAMAGER = Some(result);
 
         let init_text = "Video driver initialized.\n\0";
-        c_uart_send_str(COM1 as u16, init_text.as_ptr());
+        send_to_default_serial8250_port(init_text.as_bytes());
         return Ok(());
     }
 }

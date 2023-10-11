@@ -245,19 +245,31 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
 }
 
 impl<T: Transport + 'static> Driver for VirtioInterface<T> {
-    fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
+    fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!()
     }
 
-    fn load(
-        &self,
-        _data: DevicePrivateData,
-        _resource: Option<DeviceResource>,
-    ) -> Result<Arc<dyn Device>, DriverError> {
+    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn sync_state(&self, device: &Arc<dyn Device>) {
+        todo!()
+    }
+
+    fn shutdown(&self, device: &Arc<dyn Device>) {
+        todo!()
+    }
+
+    fn resume(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!()
     }
 
     fn id_table(&self) -> IdTable {
+        todo!()
+    }
+
+    fn devices(&self) -> alloc::vec::Vec<Arc<dyn Device>> {
         todo!()
     }
 }

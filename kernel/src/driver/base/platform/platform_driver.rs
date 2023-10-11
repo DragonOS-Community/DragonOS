@@ -1,6 +1,11 @@
-use crate::driver::{base::device::DevicePrivateData, Driver};
+use alloc::sync::Arc;
 
-use super::{super::device::driver::DriverError, CompatibleTable};
+use crate::{
+    driver::{base::device::DevicePrivateData, Driver},
+    syscall::SystemError,
+};
+
+use super::{super::device::driver::DriverError, platform_device::PlatformDevice, CompatibleTable};
 
 lazy_static! {
     static ref PLATFORM_COMPAT_TABLE: CompatibleTable = CompatibleTable::new(vec!["platform"]);
@@ -8,14 +13,26 @@ lazy_static! {
 /// @brief: 实现该trait的设备驱动实例应挂载在platform总线上，
 ///         同时应该实现Driver trait
 pub trait PlatformDriver: Driver {
-    fn compatible_table(&self) -> CompatibleTable;
-    /// @brief 探测设备
-    /// @param data 设备初始拥有的基本信息
-    fn probe(&self, data: DevicePrivateData) -> Result<(), DriverError> {
-        if data.compatible_table().matches(&PLATFORM_COMPAT_TABLE) {
-            return Ok(());
-        } else {
-            return Err(DriverError::UnsupportedOperation);
-        }
+    fn probe(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
+    fn remove(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
+    fn shutdown(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
+    fn suspend(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
+    fn resume(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
+}
+
+#[inline(always)]
+pub fn platform_driver_manager() -> &'static PlatformDriverManager {
+    &PlatformDriverManager
+}
+
+#[derive(Debug)]
+pub struct PlatformDriverManager;
+
+impl PlatformDriverManager {
+    /// 注册平台设备驱动
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=__platform_driver_register#861
+    pub fn register(&self, driver: Arc<dyn PlatformDriver>) -> Result<(), SystemError> {
+        todo!()
     }
 }

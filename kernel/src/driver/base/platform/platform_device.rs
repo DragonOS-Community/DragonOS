@@ -20,13 +20,30 @@ use crate::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
+    syscall::SystemError,
 };
 
 use super::{super::device::DeviceState, CompatibleTable};
 
+#[inline(always)]
+pub fn platform_device_manager() -> &'static PlatformDeviceManager {
+    &PlatformDeviceManager
+}
+
 /// @brief: 实现该trait的设备实例应挂载在platform总线上，
 ///         同时应该实现Device trait
 pub trait PlatformDevice: Device {
+    fn name(&self) -> &str;
+    /// 返回平台设备id，以及这个id是否是自动生成的
+    fn pdev_id(&self) -> Option<(i32, bool)> {
+        None
+    }
+
+    /// 设置平台设备id
+    fn set_pdev_id(&self, id: i32);
+    /// 设置id是否为自动分配
+    fn set_pdev_id_auto(&self, id_auto: bool);
+
     fn compatible_table(&self) -> CompatibleTable;
     /// @brief: 判断设备是否初始化
     /// @parameter: None
@@ -37,6 +54,18 @@ pub trait PlatformDevice: Device {
     /// @parameter set_state: 设备状态
     /// @return: None
     fn set_state(&self, set_state: DeviceState);
+}
+
+#[derive(Debug)]
+pub struct PlatformDeviceManager;
+
+impl PlatformDeviceManager {
+    /// platform_device_add - add a platform device to device hierarchy
+    ///
+    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_device_add#656
+    pub fn device_add(&self, pdev: Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
+        todo!()
+    }
 }
 
 #[derive(Debug)]

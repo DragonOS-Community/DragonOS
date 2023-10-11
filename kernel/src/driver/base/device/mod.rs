@@ -595,6 +595,14 @@ impl DeviceManager {
     pub fn device_links_force_bind(&self, _dev: &Arc<dyn Device>) {
         todo!("device_links_force_bind")
     }
+
+    /// 把device对象的一些结构进行默认初始化
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_initialize#2976
+    pub fn device_default_initialize(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        dev.set_kset(Some(sys_devices_kset()));
+        return Ok(());
+    }
 }
 
 /// @brief: 设备注册

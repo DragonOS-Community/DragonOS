@@ -273,7 +273,7 @@ impl PageFrameUsage {
     }
     // @brief 获取空闲的页帧数量
     pub fn free(&self) -> PageFrameCount {
-        return PageFrameCount(self.total.0 - self.used.0);
+        return self.total - self.used;
     }
     // @brief 获取总的页帧数量
     pub fn total(&self) -> PageFrameCount {

@@ -3,9 +3,11 @@ use crate::{
         base::{
             char::CharDevice,
             device::{
-                driver::DriverError, Device, DeviceError, DeviceNumber, DevicePrivateData,
-                DeviceResource, DeviceState, DeviceType, IdTable, KObject, DEVICE_MANAGER,
+                bus::Bus, driver::DriverError, Device, DeviceError, DeviceNumber,
+                DevicePrivateData, DeviceResource, DeviceState, DeviceType, IdTable,
             },
+            kobject::{KObjType, KObject, KObjectState},
+            kset::KSet,
             platform::{
                 platform_device::PlatformDevice, platform_driver::PlatformDriver, CompatibleTable,
             },
@@ -14,7 +16,7 @@ use crate::{
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        sysfs::bus::{bus_device_register, bus_driver_register},
+        kernfs::KernFSInode,
         vfs::{
             syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
             PollStatus,
@@ -22,7 +24,10 @@ use crate::{
     },
     include::bindings::bindings::{io_in8, io_out8},
     kinfo,
-    libs::spinlock::SpinLock,
+    libs::{
+        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
     syscall::SystemError,
 };
 use alloc::{
@@ -120,8 +125,7 @@ struct UartRegister {
 #[derive(Debug)]
 pub struct Uart {
     private_data: DevicePrivateData, // 设备状态
-    sys_info: Option<Arc<dyn IndexNode>>,
-    fs: Weak<DevFS>, // 文件系统
+    fs: Weak<DevFS>,                 // 文件系统
     port: UartPort,
     baud_rate: u32,
     metadata: Metadata,
@@ -142,7 +146,6 @@ impl Default for Uart {
                 CompatibleTable::new(vec!["uart"]),
                 DeviceState::NotInitialized,
             ),
-            sys_info: None,
             fs: Weak::default(),
             port: UartPort::COM1,
             baud_rate: 115200,
@@ -161,7 +164,59 @@ impl Default for LockedUart {
     }
 }
 
-impl KObject for LockedUart {}
+impl KObject for LockedUart {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_inode(&self, _inode: Option<Arc<KernFSInode>>) {
+        todo!()
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn name(&self) -> alloc::string::String {
+        todo!()
+    }
+
+    fn set_name(&self, _name: alloc::string::String) {
+        todo!()
+    }
+
+    fn set_kset(&self, _kset: Option<Arc<KSet>>) {
+        todo!()
+    }
+
+    fn set_parent(&self, _parent: Option<Weak<dyn KObject>>) {
+        todo!()
+    }
+}
 
 impl PlatformDevice for LockedUart {
     fn is_initialized(&self) -> bool {
@@ -189,20 +244,24 @@ impl Device for LockedUart {
         );
     }
 
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
-        self.0.lock().sys_info = sys_info;
-    }
-
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
-        self.0.lock().sys_info.clone()
-    }
-
     fn dev_type(&self) -> DeviceType {
         DeviceType::Serial
     }
 
-    fn as_any_ref(&self) -> &dyn Any {
-        self
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
+        todo!("LockedUart::bus()")
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        todo!("LockedUart::driver()")
+    }
+
+    fn is_dead(&self) -> bool {
+        false
+    }
+
+    fn set_driver(&self, _driver: Option<Arc<dyn Driver>>) {
+        todo!("LockedUart::set_driver()")
     }
 }
 
@@ -533,23 +592,63 @@ impl Default for LockedUartDriver {
     }
 }
 
-impl KObject for LockedUartDriver {}
-
-impl Driver for LockedUartDriver {
-    fn as_any_ref(&self) -> &dyn Any {
+impl KObject for LockedUartDriver {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_inode(&self, _inode: Option<Arc<KernFSInode>>) {
+        todo!()
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn name(&self) -> alloc::string::String {
+        todo!()
+    }
+
+    fn set_name(&self, _name: alloc::string::String) {
+        todo!()
+    }
+
+    fn set_kset(&self, _kset: Option<Arc<KSet>>) {
+        todo!()
+    }
+
+    fn set_parent(&self, _parent: Option<Weak<dyn KObject>>) {
+        todo!()
+    }
+}
+
+impl Driver for LockedUartDriver {
     fn id_table(&self) -> IdTable {
         return IdTable::new("uart_driver".to_string(), DeviceNumber::new(0));
-    }
-
-    fn set_sys_info(&self, sys_info: Option<Arc<dyn IndexNode>>) {
-        self.0.lock().sys_info = sys_info;
-    }
-
-    fn sys_info(&self) -> Option<Arc<dyn IndexNode>> {
-        return self.0.lock().sys_info.clone();
     }
 
     fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError> {
@@ -693,14 +792,14 @@ pub fn uart_init() -> Result<(), SystemError> {
     let dev = UART_DEV.0.lock();
     LockedUart::uart_init(&dev.port, dev.baud_rate).map_err(|_| SystemError::ENODEV)?;
     drop(dev);
-    let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().name())
-        .expect("uart device register error");
-    UART_DEV.set_sys_info(Some(device_inode));
-    let driver_inode = bus_driver_register("platform:0", &UART_DRV.id_table().name())
-        .expect("uart driver register error");
-    UART_DRV.set_sys_info(Some(driver_inode));
+    // let device_inode = bus_device_register("platform:0", &UART_DEV.id_table().name())
+    //     .expect("uart device register error");
+    // UART_DEV.set_sys_info(Some(device_inode));
+    // let driver_inode = bus_driver_register("platform:0", &UART_DRV.id_table().name())
+    //     .expect("uart driver register error");
+    // UART_DRV.set_sys_info(Some(driver_inode));
     UART_DEV.set_state(DeviceState::Initialized);
     devfs_register(&UART_DEV.id_table().name(), UART_DEV.clone())?;
-    DEVICE_MANAGER.add_device(UART_DEV.id_table().clone(), UART_DEV.clone());
+    // DEVICE_MANAGER.add_device(UART_DEV.id_table().clone(), UART_DEV.clone());
     return Ok(());
 }

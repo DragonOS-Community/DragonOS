@@ -10,7 +10,10 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use crate::{
     driver::{
-        base::device::{driver::DriverError, Device, DevicePrivateData, DeviceResource, IdTable},
+        base::{
+            device::{driver::DriverError, Device, DevicePrivateData, DeviceResource, IdTable},
+            kobject::KObject,
+        },
         virtio::virtio_impl::HalImpl,
         Driver,
     },
@@ -231,20 +234,17 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac_address());
     let driver: VirtioNICDriver<T> = VirtioNICDriver::new(driver_net);
     let iface = VirtioInterface::new(driver);
+    let name = iface.name.clone();
     // 将网卡的接口信息注册到全局的网卡接口信息表中
     NET_DRIVERS.write().insert(iface.nic_id(), iface.clone());
     kinfo!(
         "Virtio-net driver init successfully!\tNetDevID: [{}], MAC: [{}]",
-        iface.name(),
+        name,
         mac
     );
 }
 
-impl<T: Transport> Driver for VirtioInterface<T> {
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
-        self
-    }
-
+impl<T: Transport + 'static> Driver for VirtioInterface<T> {
     fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
         todo!()
     }
@@ -260,17 +260,9 @@ impl<T: Transport> Driver for VirtioInterface<T> {
     fn id_table(&self) -> IdTable {
         todo!()
     }
-
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
-        todo!()
-    }
-
-    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
-        todo!()
-    }
 }
 
-impl<T: Transport> NetDriver for VirtioInterface<T> {
+impl<T: Transport + 'static> NetDriver for VirtioInterface<T> {
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac: [u8; 6] = self.driver.inner.lock().mac_address();
         return smoltcp::wire::EthernetAddress::from_bytes(&mac);
@@ -325,6 +317,64 @@ impl<T: Transport> NetDriver for VirtioInterface<T> {
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
     //     return self;
     // }
+}
+
+impl<T: Transport + 'static> KObject for VirtioInterface<T> {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn set_inode(&self, _inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+        todo!()
+    }
+
+    fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_parent(&self, _parent: Option<alloc::sync::Weak<dyn KObject>>) {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
+        todo!()
+    }
+
+    fn set_kset(&self, _kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
+        todo!()
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&self, _name: String) {
+        todo!()
+    }
+
+    fn kobj_state(
+        &self,
+    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(
+        &self,
+    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: crate::driver::base::kobject::KObjectState) {
+        todo!()
+    }
 }
 
 // 向编译器保证，VirtioNICDriver在线程之间是安全的.

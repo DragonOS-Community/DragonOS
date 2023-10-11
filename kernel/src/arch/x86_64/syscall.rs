@@ -45,7 +45,11 @@ pub extern "C" fn syscall_handler(frame: &mut TrapFrame) -> () {
         }
         _ => {}
     }
-    syscall_return!(Syscall::handle(syscall_num, &args, frame) as u64, frame);
+    syscall_return!(
+        Syscall::handle(syscall_num, &args, frame).unwrap_or_else(|e| e.to_posix_errno() as usize)
+            as u64,
+        frame
+    );
 }
 
 /// 系统调用初始化

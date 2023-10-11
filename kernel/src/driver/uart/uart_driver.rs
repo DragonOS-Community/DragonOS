@@ -1,7 +1,8 @@
 use alloc::sync::Arc;
 
 use crate::driver::base::char::CharDevOps;
-use crate::driver::base::device::{Device, DeviceResource, DEVICE_MANAGER};
+use crate::driver::base::device::{device_manager, Device, DeviceResource};
+use crate::driver::base::kobject::KObject;
 use crate::driver::base::platform::CompatibleTable;
 use crate::{
     driver::{
@@ -32,7 +33,63 @@ impl Default for UartDriver {
         }))
     }
 }
+impl KObject for UartDriver {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
 
+    fn set_inode(&self, _inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+        todo!()
+    }
+
+    fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_parent(&self, _parent: Option<alloc::sync::Weak<dyn KObject>>) {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
+        todo!()
+    }
+
+    fn set_kset(&self, _kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
+        todo!()
+    }
+
+    fn name(&self) -> alloc::string::String {
+        todo!()
+    }
+
+    fn set_name(&self, _name: alloc::string::String) {
+        todo!()
+    }
+
+    fn kobj_state(
+        &self,
+    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(
+        &self,
+    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: crate::driver::base::kobject::KObjectState) {
+        todo!()
+    }
+}
 impl Driver for UartDriver {
     fn probe(&self, data: &DevicePrivateData) -> Result<(), DriverError> {
         let compatible_table = data.compatible_table();
@@ -48,34 +105,25 @@ impl Driver for UartDriver {
         data: DevicePrivateData,
         _resource: Option<DeviceResource>,
     ) -> Result<Arc<dyn Device>, DriverError> {
-        if let Some(device) = DEVICE_MANAGER.get_device(data.id_table()) {
+        if let Some(device) = device_manager().find_device_by_idtable(data.id_table()) {
             return Ok(device.clone());
         }
         let compatible_table = data.compatible_table();
         if compatible_table.matches(&UART_COMPAT_TABLE) {
             let device = LockedUart::default();
             let arc_device = Arc::new(device);
-            DEVICE_MANAGER.add_device(data.id_table().clone(), arc_device.clone());
-            CharDevOps::cdev_add(arc_device.clone(), data.id_table().clone(), 1);
+            device_manager()
+                .add_device(arc_device.clone())
+                .map_err(|_| DriverError::RegisterError)?;
+            CharDevOps::cdev_add(arc_device.clone(), data.id_table().clone(), 1)
+                .map_err(|_| DriverError::RegisterError)?;
         }
 
-        return Err(DriverError::ProbeError);
+        return Err(DriverError::RegisterError);
     }
 
     fn id_table(&self) -> IdTable {
         let driver = self.0.lock();
         return driver.id_table.clone();
-    }
-
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
-        return self;
-    }
-
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
-        todo!()
-    }
-
-    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
-        todo!()
     }
 }

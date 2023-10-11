@@ -8,7 +8,7 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     },
     ipc::signal_types::SigactionType,
-    kdebug, kwarn,
+    kwarn,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
     syscall::SystemError,
 };
@@ -54,7 +54,12 @@ impl Signal {
         pid: Pid,
     ) -> Result<i32, SystemError> {
         // TODO:暂时不支持特殊的信号操作，待引入进程组后补充
-        if pid.le(&Pid::from(0)) {
+        // 如果 pid 大于 0，那么会发送信号给 pid 指定的进程
+        // 如果 pid 等于 0，那么会发送信号给与调用进程同组的每个进程，包括调用进程自身
+        // 如果 pid 小于 -1，那么会向组 ID 等于该 pid 绝对值的进程组内所有下属进程发送信号。向一个进程组的所有进程发送信号在 shell 作业控制中有特殊有途
+        // 如果 pid 等于 -1，那么信号的发送范围是：调用进程有权将信号发往的每个目标进程，除去 init（进程 ID 为 1）和调用进程自身。如果特权级进程发起这一调用，那么会发送信号给系统中的所有进程，上述两个进程除外。显而易见，有时也将这种信号发送方式称之为广播信号
+        // 如果并无进程与指定的 pid 相匹配，那么 kill() 调用失败，同时将 errno 置为 ESRCH（“查无此进程”）
+        if pid.lt(&Pid::from(0)) {
             kwarn!("Kill operation not support: pid={:?}", pid);
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
@@ -359,18 +364,6 @@ pub fn get_signal_to_deliver(
             ka = Some(tmp_ka);
             break;
         }
-
-        // // ===== 经过上面的判断，如果能走到这一步，就意味着我们采用默认的信号处理函数来处理这个信号 =====
-        // drop(guard);
-        // // 标记当前进程由于信号而退出
-        // ProcessManager::current_pcb()
-        //     .flags()
-        //     .insert(ProcessFlags::SIGNALED);
-
-        // assert!(info.is_some());
-        // // 执行进程的退出动作
-        // ProcessManager::exit(info.unwrap().sig_no() as usize);
-        // /* NOT REACHED 这部分代码将不会到达 */
     }
     drop(guard);
     return (sig_number, info, ka);
@@ -485,7 +478,6 @@ pub fn do_sigaction(
             let mut mask: SigSet = SigSet::from_bits_truncate(0);
             mask.insert(sig.into());
             pcb.sig_info_mut().sig_pending_mut().flush_by_mask(&mask);
-
             // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
         }
     }

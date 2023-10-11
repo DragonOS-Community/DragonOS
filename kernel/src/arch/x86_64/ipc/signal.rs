@@ -1,8 +1,4 @@
-use core::{
-    ffi::c_void,
-    mem::size_of,
-    sync::atomic::{compiler_fence, Ordering},
-};
+use core::{ffi::c_void, mem::size_of};
 
 use crate::{
     arch::{

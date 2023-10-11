@@ -251,34 +251,6 @@ impl ProcessManager {
             }
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-        // // kdebug!("DEFAULT_SIGACTION.sa_flags={}", DEFAULT_SIGACTION.sa_flags);
-
-        // // 拷贝sigaction
-        // let mut flags: usize = 0;
-
-        // spin_lock_irqsave(unsafe { &mut (*current_pcb().sighand).siglock }, &mut flags);
-        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-        // for (index, x) in unsafe { (*current_pcb().sighand).action }
-        //     .iter()
-        //     .enumerate()
-        // {
-        //     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        //     if !(x as *const crate::include::bindings::bindings::sigaction).is_null() {
-        //         sig.action[index] =
-        //             *sigaction::convert_ref(x as *const crate::include::bindings::bindings::sigaction)
-        //                 .unwrap();
-        //     } else {
-        //         sig.action[index] = DEFAULT_SIGACTION;
-        //     }
-        // }
-        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-        // spin_unlock_irqrestore(unsafe { &mut (*current_pcb().sighand).siglock }, flags);
-        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-        // return 0;
         return Ok(());
     }
 }

@@ -9,7 +9,6 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, _NSIG},
     },
     include::bindings::bindings::siginfo,
-    libs::ffi_convert::{FFIBind2Rust, __convert_mut, __convert_ref},
     process::Pid,
     syscall::{user_access::UserBufferWriter, SystemError},
 };
@@ -156,7 +155,7 @@ impl Default for Sigaction {
 }
 
 impl Sigaction {
-    /// 判断传入的信号是否被忽略
+    /// 判断传入的信号是否被忽略，包括了 flag 位为 Ignore 和默认处理函数为 Ignore 的情况
     ///
     /// ## 参数
     ///
@@ -252,10 +251,6 @@ pub struct SigInfo {
 }
 
 impl SigInfo {
-    pub fn sig_no(&self) -> i32 {
-        self.sig_no
-    }
-
     pub fn sig_code(&self) -> SigCode {
         self.sig_code
     }
@@ -509,100 +504,6 @@ impl Default for SigQueue {
         Self {
             q: Default::default(),
         }
-    }
-}
-
-/// @brief 将给定的signal_struct解析为Rust的signal.rs中定义的signal_struct的引用
-///
-/// 这么做的主要原因在于，由于PCB是通过bindgen生成的FFI，因此pcb中的结构体类型都是bindgen自动生成的
-impl FFIBind2Rust<crate::include::bindings::bindings::signal_struct> for SignalStruct {
-    fn convert_mut(
-        src: *mut crate::include::bindings::bindings::signal_struct,
-    ) -> Option<&'static mut Self> {
-        return __convert_mut(src);
-    }
-    fn convert_ref(
-        src: *const crate::include::bindings::bindings::signal_struct,
-    ) -> Option<&'static Self> {
-        return __convert_ref(src);
-    }
-}
-
-/// @brief 将给定的siginfo解析为Rust的signal.rs中定义的siginfo的引用
-///
-/// 这么做的主要原因在于，由于PCB是通过bindgen生成的FFI，因此pcb中的结构体类型都是bindgen自动生成的
-impl FFIBind2Rust<crate::include::bindings::bindings::siginfo> for SigInfo {
-    fn convert_mut(
-        src: *mut crate::include::bindings::bindings::siginfo,
-    ) -> Option<&'static mut Self> {
-        return __convert_mut(src);
-    }
-    fn convert_ref(
-        src: *const crate::include::bindings::bindings::siginfo,
-    ) -> Option<&'static Self> {
-        return __convert_ref(src);
-    }
-}
-
-/// @brief 将给定的sigset_t解析为Rust的signal.rs中定义的sigset_t的引用
-///
-/// 这么做的主要原因在于，由于PCB是通过bindgen生成的FFI，因此pcb中的结构体类型都是bindgen自动生成的
-impl FFIBind2Rust<crate::include::bindings::bindings::sigset_t> for SigSet {
-    fn convert_mut(
-        src: *mut crate::include::bindings::bindings::sigset_t,
-    ) -> Option<&'static mut Self> {
-        return __convert_mut(src);
-    }
-    fn convert_ref(
-        src: *const crate::include::bindings::bindings::sigset_t,
-    ) -> Option<&'static Self> {
-        return __convert_ref(src);
-    }
-}
-
-/// @brief 将给定的sigpending解析为Rust的signal.rs中定义的sigpending的引用
-///
-/// 这么做的主要原因在于，由于PCB是通过bindgen生成的FFI，因此pcb中的结构体类型都是bindgen自动生成的
-impl FFIBind2Rust<crate::include::bindings::bindings::sigpending> for SigPending {
-    fn convert_mut(
-        src: *mut crate::include::bindings::bindings::sigpending,
-    ) -> Option<&'static mut Self> {
-        return __convert_mut(src);
-    }
-    fn convert_ref(
-        src: *const crate::include::bindings::bindings::sigpending,
-    ) -> Option<&'static Self> {
-        return __convert_ref(src);
-    }
-}
-
-/// @brief 将给定的来自bindgen的sighand_struct解析为Rust的signal.rs中定义的sighand_struct的引用
-///
-/// 这么做的主要原因在于，由于PCB是通过bindgen生成的FFI，因此pcb中的结构体类型都是bindgen自动生成的，会导致无法自定义功能的问题。
-impl FFIBind2Rust<crate::include::bindings::bindings::sighand_struct> for SigHandStruct {
-    fn convert_mut(
-        src: *mut crate::include::bindings::bindings::sighand_struct,
-    ) -> Option<&'static mut Self> {
-        return __convert_mut(src);
-    }
-    fn convert_ref(
-        src: *const crate::include::bindings::bindings::sighand_struct,
-    ) -> Option<&'static Self> {
-        return __convert_ref(src);
-    }
-}
-
-/// @brief 将给定的来自bindgen的sigaction解析为Rust的signal.rs中定义的sigaction的引用
-impl FFIBind2Rust<crate::include::bindings::bindings::sigaction> for Sigaction {
-    fn convert_mut(
-        src: *mut crate::include::bindings::bindings::sigaction,
-    ) -> Option<&'static mut Self> {
-        return __convert_mut(src);
-    }
-    fn convert_ref(
-        src: *const crate::include::bindings::bindings::sigaction,
-    ) -> Option<&'static Self> {
-        return __convert_ref(src);
     }
 }
 

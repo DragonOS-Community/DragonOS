@@ -116,7 +116,6 @@ impl Syscall {
             let input_sighandler = unsafe { (*act).handler as u64 };
             match input_sighandler {
                 USER_SIG_DFL => {
-                    kdebug!("sending a dfl signal");
                     new_ka = *DEFAULT_SIGACTION;
                     *new_ka.flags_mut() = (unsafe { (*act).flags }
                         & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
@@ -186,7 +185,6 @@ impl Syscall {
             if r.is_err() {
                 return Err(SystemError::EFAULT);
             }
-            // ！！！！！！！！！！todo: 检查这里old_ka的mask，是否为SIG_IGN SIG_DFL,如果是，则将_sa_handler字段替换为对应的值
             let sah: u64;
             if old_ka.flags().contains(SigFlags::SA_FLAG_DFL) {
                 sah = USER_SIG_DFL;

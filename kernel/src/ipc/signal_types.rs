@@ -114,7 +114,6 @@ impl SaHandlerType {
     /// Returns `true` if the sa handler type is [`SigDefault`].
     ///
     /// [`SigDefault`]: SaHandlerType::SigDefault
-    #[must_use]
     pub fn is_sig_default(&self) -> bool {
         matches!(self, Self::SigDefault)
     }
@@ -122,7 +121,6 @@ impl SaHandlerType {
     /// Returns `true` if the sa handler type is [`SigIgnore`].
     ///
     /// [`SigIgnore`]: SaHandlerType::SigIgnore
-    #[must_use]
     pub fn is_sig_ignore(&self) -> bool {
         matches!(self, Self::SigIgnore)
     }
@@ -130,7 +128,6 @@ impl SaHandlerType {
     /// Returns `true` if the sa handler type is [`SigError`].
     ///
     /// [`SigError`]: SaHandlerType::SigError
-    #[must_use]
     pub fn is_sig_error(&self) -> bool {
         matches!(self, Self::SigError)
     }

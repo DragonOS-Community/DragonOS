@@ -191,61 +191,29 @@ impl ProcessManager {
         }
     }
 
-    /// 如果进程满足条件，则唤醒该进程
-    pub fn wakeup_state(
-        pcb: &Arc<ProcessControlBlock>,
-        flags: ProcessState,
-    ) -> Result<(), SystemError> {
+    /// 唤醒暂停的进程
+    pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
-        if state == flags {
+        if let ProcessState::Stopped = state {
             let mut writer = pcb.sched_info_mut();
             let state = writer.state();
-            if state == flags {
+            if let ProcessState::Stopped = state {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);
 
                 sched_enqueue(pcb.clone(), true);
                 return Ok(());
-            } else if state.is_exited() {
-                return Err(SystemError::EINVAL);
-            } else {
+            } else if state.is_runnable() {
                 return Ok(());
+            } else {
+                return Err(SystemError::EINVAL);
             }
-        } else if state.is_exited() {
-            return Err(SystemError::EINVAL);
-        } else {
-            return Ok(());
-        }
-    }
-
-    pub fn wakeup_flags(
-        pcb: &Arc<ProcessControlBlock>,
-        flags: ProcessFlags,
-    ) -> Result<(), SystemError> {
-        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().state();
-        if state.is_exited() {
-            return Err(SystemError::EINVAL);
         } else if state.is_runnable() {
             return Ok(());
         } else {
-            let mut writer = pcb.sched_info_mut();
-            let state = writer.state();
-            if state.is_exited() {
-                return Err(SystemError::EINVAL);
-            } else if state.is_runnable() {
-                return Ok(());
-            } else if pcb.flags().contains(flags) {
-                writer.set_state(ProcessState::Runnable);
-                // avoid deadlock
-                drop(writer);
-                sched_enqueue(pcb.clone(), true);
-                return Ok(());
-            } else {
-                return Err(SystemError::EINVAL);
-            }
+            return Err(SystemError::EINVAL);
         }
     }
 
@@ -274,6 +242,30 @@ impl ProcessManager {
         return Err(SystemError::EINTR);
     }
 
+    /// 标志当前进程为停止状态，但是发起调度的工作，应该由调用者完成
+    ///
+    /// ## 注意
+    ///
+    /// - 进入当前函数之前，不能持有sched_info的锁
+    /// - 进入当前函数之前，必须关闭中断
+    pub fn mark_stop() -> Result<(), SystemError> {
+        assert_eq!(
+            CurrentIrqArch::is_irq_enabled(),
+            false,
+            "interrupt must be disabled before enter ProcessManager::mark_sleep()"
+        );
+
+        let pcb = ProcessManager::current_pcb();
+        let mut writer = pcb.sched_info_mut_irqsave();
+        if writer.state() != ProcessState::Exited(0) {
+            writer.set_state(ProcessState::Stopped);
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            drop(writer);
+
+            return Ok(());
+        }
+        return Err(SystemError::EINTR);
+    }
     /// 当子进程退出后向父进程发送通知
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
@@ -1049,8 +1041,8 @@ pub struct ProcessSignalInfo {
     sig_block: SigSet,
     // sig_pending 中存储当前线程要处理的信号
     sig_pending: SigPending,
-    // sig_shared_pending 中存储当前进程要处理的信号
-    sig_received_pending: SigPending,
+    // sig_shared_pending 中存储当前线程所属进程要处理的信号
+    sig_shared_pending: SigPending,
 }
 
 impl ProcessSignalInfo {
@@ -1070,12 +1062,12 @@ impl ProcessSignalInfo {
         &mut self.sig_block
     }
 
-    pub fn sig_received_pending_mut(&mut self) -> &mut SigPending {
-        &mut self.sig_received_pending
+    pub fn sig_shared_pending_mut(&mut self) -> &mut SigPending {
+        &mut self.sig_shared_pending
     }
 
-    pub fn sig_received_pending(&self) -> &SigPending {
-        &self.sig_received_pending
+    pub fn sig_shared_pending(&self) -> &SigPending {
+        &self.sig_shared_pending
     }
 
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
@@ -1089,7 +1081,7 @@ impl ProcessSignalInfo {
         if res.0 != Signal::INVALID {
             return res;
         } else {
-            return self.sig_received_pending.dequeue_signal(sig_mask);
+            return self.sig_shared_pending.dequeue_signal(sig_mask);
         }
     }
 }
@@ -1099,7 +1091,7 @@ impl Default for ProcessSignalInfo {
         Self {
             sig_block: SigSet::empty(),
             sig_pending: SigPending::default(),
-            sig_received_pending: SigPending::default(),
+            sig_shared_pending: SigPending::default(),
         }
     }
 }

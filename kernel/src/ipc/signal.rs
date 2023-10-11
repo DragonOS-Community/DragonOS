@@ -9,7 +9,7 @@ use crate::{
     },
     ipc::signal_types::SigactionType,
     kdebug, kwarn,
-    process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
     syscall::SystemError,
 };
 
@@ -53,7 +53,7 @@ impl Signal {
         info: Option<&mut SigInfo>,
         pid: Pid,
     ) -> Result<i32, SystemError> {
-        // 暂时不支持特殊的信号操作
+        // TODO:暂时不支持特殊的信号操作，待引入进程组后补充
         if pid.le(&Pid::from(0)) {
             kwarn!("Kill operation not support: pid={:?}", pid);
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -63,10 +63,7 @@ impl Signal {
         if !self.is_valid() {
             return Err(SystemError::EINVAL);
         }
-        // send 单个进程
         let mut retval = Err(SystemError::ESRCH);
-
-        //根据pid找到pcb
         let pcb = ProcessManager::find(pid);
 
         if pcb.is_none() {
@@ -74,10 +71,6 @@ impl Signal {
             return retval;
         }
         // println!("Target pcb = {:?}", pcb.as_ref().unwrap());
-
-        // 信号符合要求，可以发送
-
-        // 如果上锁成功，则发送信号
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 发送信号
         retval = self.send_signal(info, pcb.unwrap(), PidType::PID);
@@ -99,8 +92,8 @@ impl Signal {
         let mut force_send = false;
         // signal的信息为空
 
-        if let Some(ref x) = info {
-            force_send = matches!(x.sig_code(), SigCode::SI_KERNEL);
+        if let Some(ref siginfo) = info {
+            force_send = matches!(siginfo.sig_code(), SigCode::SI_KERNEL);
         } else {
             // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
             //详见 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
@@ -112,7 +105,7 @@ impl Signal {
         // kdebug!("force send={}", force_send);
         let pcb_info = pcb.sig_info();
         let pending = if matches!(pt, PidType::PID) {
-            pcb_info.sig_received_pending()
+            pcb_info.sig_shared_pending()
         } else {
             pcb_info.sig_pending()
         };
@@ -130,9 +123,9 @@ impl Signal {
             // TODO signalfd_notify 完善 signalfd 机制
             // 如果是其他信号，则加入到sigqueue内，然后complete_signal
             let new_sig_info = match info {
-                Some(x) => {
+                Some(siginfo) => {
                     // 已经显式指定了siginfo，则直接使用它。
-                    (*x).clone()
+                    (*siginfo).clone()
                 }
                 None => {
                     // 不需要显示指定siginfo，因此设置为默认值
@@ -197,9 +190,9 @@ impl Signal {
             return;
         }
 
-        // todo:引入进程组后，在这里挑选一个进程来唤醒，让它执行相应的操作。
+        // TODO:引入进程组后，在这里挑选一个进程来唤醒，让它执行相应的操作。
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        // todo: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
+        // TODO: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
         if _target.is_some() {
             signal_wake_up(pcb.clone(), *self == Signal::SIGKILL);
         }
@@ -271,16 +264,16 @@ impl Signal {
         if !(self.into_sigset() & SIG_KERNEL_STOP_MASK).is_empty() {
             flush = Signal::SIGCONT.into_sigset();
             pcb.sig_info_mut()
-                .sig_received_pending_mut()
+                .sig_shared_pending_mut()
                 .flush_by_mask(&flush);
             // TODO 对每个子线程 flush mask
         } else if *self == Signal::SIGCONT {
             flush = SIG_KERNEL_STOP_MASK;
             assert!(!flush.is_empty());
             pcb.sig_info_mut()
-                .sig_received_pending_mut()
+                .sig_shared_pending_mut()
                 .flush_by_mask(&flush);
-            let _r = ProcessManager::wakeup_state(&pcb, ProcessState::Stopped);
+            let _r = ProcessManager::wakeup_stop(&pcb);
             // TODO 对每个子线程 flush mask
             // 这里需要补充一段逻辑，详见https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#952
         }
@@ -296,23 +289,23 @@ impl Signal {
     }
 }
 
+/// 需要保证调用时已经对 sig_struct 上锁
 #[inline]
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
+    // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
+    // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // kdebug!("signal_wake_up");
-    let mut state: ProcessFlags = ProcessFlags::empty();
-    if fatal {
-        state = ProcessFlags::WAKEKILL;
-    }
-    signal_wake_up_state(pcb, state);
-}
-
-/// 需要保证调用时已经对 sig_struct 上锁
-fn signal_wake_up_state(pcb: Arc<ProcessControlBlock>, state: ProcessFlags) {
-    // todo: 设置线程结构体的标志位为TIF_SIGPENDING
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
-    if ProcessManager::wakeup_flags(&pcb, state).is_ok() {
+    let r = ProcessManager::wakeup_stop(&pcb);
+    if r.is_ok() {
         ProcessManager::kick(&pcb);
+    } else {
+        if fatal {
+            let _r = ProcessManager::wakeup(&pcb).map(|_| {
+                ProcessManager::kick(&pcb);
+            });
+        }
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
@@ -442,8 +435,7 @@ pub fn do_sigaction(
         return Err(SystemError::EINVAL);
     }
 
-    // 如果需要保存原有的sigaction
-    // 写的这么恶心，还得感谢rust的所有权系统...old_act的所有权被传入了这个闭包之后，必须要把所有权返回给外面。（也许是我不会用才导致写的这么丑，但是它确实能跑）
+    // 保存原有的 sigaction
     let old_act: Option<&mut Sigaction> = {
         if old_act.is_some() {
             let oa = old_act.unwrap();

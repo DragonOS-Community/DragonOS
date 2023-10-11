@@ -1,14 +1,11 @@
-use core::{
-    ffi::c_void,
-    mem::size_of,
-    sync::atomic::{compiler_fence, Ordering},
-};
+use core::{ffi::c_void, mem::size_of};
 
 use crate::{
     arch::{
         fpu::FpState,
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
+        sched::sched,
         CurrentIrqArch,
     },
     exception::InterruptArch,
@@ -17,11 +14,10 @@ use crate::{
         signal::{get_signal_to_deliver, set_current_sig_blocked},
         signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, MAX_SIG_NUM},
     },
-    kdebug, kerror,
+    kerror,
     process::ProcessManager,
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
-use alloc::boxed::Box;
 
 /// 最大支持的信号数量
 pub const _NSIG: usize = 64;
@@ -366,28 +362,24 @@ impl SignalArch for X86_64SignalArch {
 
     #[no_mangle]
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
-        kdebug!("--executing sigreturn");
-        assert!(CurrentIrqArch::is_irq_enabled());
         let frame = (trap_frame.rsp as usize) as *mut SigFrame;
 
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
         if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
             kerror!("rsp doesn't from user level");
-            // todo：这里改为生成一个sigsegv
-            // 退出进程
-            ProcessManager::exit(Signal::SIGSEGV as usize);
+            let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
+                .map_err(|e| e.to_posix_errno());
         }
 
         let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
         set_current_sig_blocked(&mut sigmask);
         // 从用户栈恢复sigcontext
-        if unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) == false {
-            kdebug!("unable to restore sigcontext");
-            // todo：这里改为生成一个sigsegv
-            // 退出进程
-            ProcessManager::exit(Signal::SIGSEGV as usize);
+        if !unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) {
+            kerror!("unable to restore sigcontext");
+            let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
+                .map_err(|e| e.to_posix_errno());
+            // 如果这里返回 err 值的话会丢失上一个系统调用的返回值
         }
-
         // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
         return trap_frame.rax;
     }
@@ -404,14 +396,15 @@ impl SignalArch for X86_64SignalArch {
 /// @return Result<0,SystemError> 若Error, 则返回错误码,否则返回Ok(0)
 fn handle_signal(
     sig: Signal,
-    ka: &mut Sigaction,
+    sigaction: &mut Sigaction,
     info: &SigInfo,
     oldset: &SigSet,
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
     // TODO 这里要补充一段逻辑，好像是为了保证引入线程之后的地址空间不会出问题。详见https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/mips/kernel/signal.c#830
+
     // 设置栈帧
-    let retval = setup_frame(sig, ka, info, oldset, frame);
+    let retval = setup_frame(sig, sigaction, info, oldset, frame);
     if retval.is_err() {
         return retval;
     }
@@ -537,10 +530,10 @@ fn setup_frame(
     ProcessManager::current_pcb().arch_info().clear_fp_state();
 
     // 传入信号处理函数的第一个参数
-    (*trap_frame).rdi = sig as u64;
-    (*trap_frame).rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
-    (*trap_frame).rsp = frame as u64;
-    (*trap_frame).rip = unsafe { (*frame).handler as u64 };
+    trap_frame.rdi = sig as u64;
+    trap_frame.rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
+    trap_frame.rsp = frame as u64;
+    trap_frame.rip = unsafe { (*frame).handler as u64 };
 
     // 设置cs和ds寄存器
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
@@ -551,8 +544,10 @@ fn setup_frame(
 
 #[inline(always)]
 fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
-    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小，在 linux 中会根据 Sigaction 中的一个flag 的值来确定是否使用
-    // pcb中的 signal 处理程序备用堆栈
+    // TODO:在 linux 中会根据 Sigaction 中的一个flag 的值来确定是否使用pcb中的 signal 处理程序备用堆栈，现在的
+    // pcb中也没有这个备用堆栈
+
+    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小
     let mut rsp: usize = (frame.rsp as usize) - 128 - size;
     // 按照要求进行对齐
     rsp &= (-(STACK_ALIGN as i64)) as usize;
@@ -571,21 +566,37 @@ fn sig_terminate_dump(sig: Signal) {
 }
 
 /// 信号默认处理函数——暂停进程
-fn sig_stop(_sig: Signal) {
-    todo!();
+fn sig_stop(sig: Signal) {
+    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    ProcessManager::mark_stop().unwrap_or_else(|e| {
+        kerror!(
+            "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
+            e,
+            ProcessManager::current_pcb(),
+            sig
+        );
+    });
+    drop(guard);
+    sched();
     // TODO 暂停进程
 }
 /// 信号默认处理函数——继续进程
-fn sig_continue(_sig: Signal) {
-    todo!();
-    // TODO 继续进程
+fn sig_continue(sig: Signal) {
+    ProcessManager::wakeup_stop(&ProcessManager::current_pcb()).unwrap_or_else(|_| {
+        kerror!(
+            "Failed to wake up process pid = {:?} with signal :{:?}",
+            ProcessManager::current_pcb().pid(),
+            sig
+        );
+    });
 }
 /// 信号默认处理函数——忽略
 fn sig_ignore(_sig: Signal) {
     return;
 }
 
-/// 分发默认处理函数
+/// 分发默认处理函数，只要调用了这个默认处理函数，就不会进入到后面伪造栈帧的环节，会直接在
+/// 执行完处理函数之后返回，也不会调用 sig_return 恢复栈帧
 #[no_mangle]
 fn sig_default_handler(sig: Signal) {
     match sig {

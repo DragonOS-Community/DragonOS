@@ -383,8 +383,6 @@ impl SignalArch for X86_64SignalArch {
                 .map_err(|e| e.to_posix_errno());
             // 如果这里返回 err 值的话会丢失上一个系统调用的返回值
         }
-        let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
-            .map_err(|e| e.to_posix_errno());
         // 由于系统调用的返回值会被系统调用模块被存放在rax寄存器，因此，为了还原原来的那个系统调用的返回值，我们需要在这里返回恢复后的rax的值
         return trap_frame.rax;
     }

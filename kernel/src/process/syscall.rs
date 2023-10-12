@@ -1,12 +1,16 @@
 use core::ffi::c_void;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
-use super::{abi::WaitOption, fork::CloneFlags, Pid, ProcessManager, ProcessState};
+use super::{abi::WaitOption, fork::CloneFlags, KernelStack, Pid, ProcessManager, ProcessState};
 use crate::{
     arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
-    filesystem::vfs::MAX_PATHLEN,
+    filesystem::{procfs::procfs_register_pid, vfs::MAX_PATHLEN},
+    mm::VirtAddr,
     process::ProcessControlBlock,
     syscall::{
         user_access::{
@@ -199,5 +203,80 @@ impl Syscall {
     pub fn getppid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         return Ok(current_pcb.basic().ppid());
+    }
+
+    pub fn clone(
+        current_trapframe: &mut TrapFrame,
+        flags: CloneFlags,
+        child_stack: usize,
+        parent_tid: usize,
+        child_tid: usize,
+        tls: usize,
+    ) -> Result<usize, SystemError> {
+        //
+
+        if flags.contains(CloneFlags::CLONE_PIDFD)
+            && flags.contains(CloneFlags::CLONE_PARENT_SETTID)
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let current_pcb = ProcessManager::current_pcb();
+        let new_kstack = KernelStack::new()?;
+        let name = current_pcb.basic().name().to_string();
+        let pcb = ProcessControlBlock::new(name, new_kstack);
+
+        if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+            // TODO: 设置childtid
+        }
+
+        if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+            // TODO: 清除childtid
+        }
+
+        // 克隆pcb
+        ProcessManager::copy_process(&flags, &current_pcb, &pcb, current_trapframe)?;
+
+        // 设置用户栈
+        unsafe {
+            pcb.basic_mut()
+                .user_vm()
+                .expect("No user_vm found")
+                .write()
+                .user_stack_mut()
+                .expect("No user stack found")
+                .set_sp(VirtAddr::new(child_stack))
+        };
+
+        if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+            // TODO: 设置parenttid
+            todo!()
+        }
+
+        ProcessManager::add_pcb(pcb.clone());
+
+        // 向procfs注册进程
+        procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to register pid to procfs, pid: [{:?}]. Error: {:?}",
+                pcb.pid(),
+                e
+            )
+        });
+
+        ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
+                pcb.pid(),
+                e
+            )
+        });
+
+        if flags.contains(CloneFlags::CLONE_VFORK) {
+            // TODO: 等待子进程接收或者exec;
+            todo!()
+        }
+
+        return Ok(pcb.pid().0);
     }
 }

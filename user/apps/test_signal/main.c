@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
-
+#include <stdbool.h>
 bool handle_ok = false;
 int count = 0;
 void handler(int sig)

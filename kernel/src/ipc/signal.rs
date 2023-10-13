@@ -413,6 +413,8 @@ pub fn do_sigaction(
     act: Option<&mut Sigaction>,
     old_act: Option<&mut Sigaction>,
 ) -> Result<(), SystemError> {
+    kdebug!("input of do_sigaction:{:?}", act);
+    kdebug!("input old sigaction:{:?}", old_act);
     if sig == Signal::INVALID {
         return Err(SystemError::EINVAL);
     }
@@ -433,17 +435,18 @@ pub fn do_sigaction(
         return Err(SystemError::EINVAL);
     }
 
+
     // 保存原有的 sigaction
     let old_act: Option<&mut Sigaction> = {
         if old_act.is_some() {
             let oa = old_act.unwrap();
-            *(oa) = *action;
+            *(oa) = (*action).clone();
             Some(oa)
         } else {
             None
         }
     };
-
+    kdebug!("input old sigaction2:{:?}", old_act);
     // 清除所有的脏的sa_flags位（也就是清除那些未使用的）
     let act = {
         if act.is_some() {
@@ -455,9 +458,9 @@ pub fn do_sigaction(
         }
     };
 
-    if old_act.is_some() {
-        *old_act.unwrap().flags_mut() &= SigFlags::SA_FLAG_ALL;
-    }
+    // if old_act.is_some() {
+    //     *old_act.unwrap().flags_mut() &= SigFlags::SA_FLAG_ALL;
+    // }
 
     if act.is_some() {
         let ac = act.unwrap();
@@ -481,6 +484,7 @@ pub fn do_sigaction(
             // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
         }
     }
+    kdebug!("input old sigaction3:{:?}", old_act);
     return Ok(());
 }
 

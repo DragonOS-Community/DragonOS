@@ -86,22 +86,26 @@ impl Syscall {
         return retval;
     }
 
-    /// @brief 用户程序用于设置信号处理动作的函数（遵循posix2008）
+    /// 通用信号注册函数
     ///
-    /// @param regs->r8 signumber 信号的编号
-    /// @param regs->r9 act 新的，将要被设置的sigaction
-    /// @param regs->r10 oact 返回给用户的原本的sigaction（内核将原本的sigaction的值拷贝给这个地址）
+    /// ## 参数
+    ///
+    /// - `sig` 信号的值
+    /// - `act` 用户空间传入的 Sigaction 指针
+    /// - `old_act` 用户空间传入的用来保存旧 Sigaction 的指针
+    /// - `from_user` 用来标识这个函数调用是否来自用户空间
     ///
     /// @return int 错误码
     #[no_mangle]
     pub fn sigaction(
         sig: c_int,
-        act: usize,
+        new_act: usize,
         old_act: usize,
         from_user: bool,
     ) -> Result<usize, SystemError> {
         // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
-        let act: *mut UserSigaction = act as *mut UserSigaction;
+        let act: *mut UserSigaction = new_act as *mut UserSigaction;
+        unsafe { kdebug!("sigaction: sig={}, act={:?}", sig, *act,) };
         let mut old_act = old_act as *mut UserSigaction;
         let mut new_ka: Sigaction = Default::default();
         let mut old_ka: Sigaction = Default::default();
@@ -185,6 +189,7 @@ impl Syscall {
             if r.is_err() {
                 return Err(SystemError::EFAULT);
             }
+
             let sah: u64;
             if old_ka.flags().contains(SigFlags::SA_FLAG_DFL) {
                 sah = USER_SIG_DFL;
@@ -209,6 +214,7 @@ impl Syscall {
                     }
                 }
             }
+
             unsafe {
                 (*old_act).handler = sah as *mut c_void;
                 (*old_act).flags = old_ka.flags();

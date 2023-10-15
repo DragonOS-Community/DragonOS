@@ -35,6 +35,7 @@ mod include;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
 mod filesystem;
+mod futex;
 mod init;
 mod ipc;
 mod mm;

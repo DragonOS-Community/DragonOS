@@ -375,6 +375,11 @@ pub const SYS_GETPGID: usize = 50;
 
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
+pub const SYS_MKNOD: usize = 53;
+
+pub const SYS_CLONE: usize = 54;
+
+pub const SYS_FUTEX: usize = 55;
 
 #[derive(Debug)]
 pub struct Syscall;

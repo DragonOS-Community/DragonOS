@@ -236,3 +236,8 @@ int dup2(int ofd, int nfd)
 {
     return syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0, 0, 0);
 }
+
+char *getcwd(char* buf, size_t size)
+{
+    return syscall_invoke(SYS_GETCWD, buf, size, 0, 0, 0, 0, 0, 0);
+}

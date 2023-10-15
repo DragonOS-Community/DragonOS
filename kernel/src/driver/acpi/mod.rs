@@ -14,6 +14,7 @@ use crate::{
     },
 };
 
+pub mod bus;
 mod c_adapter;
 pub mod glue;
 pub mod old;
@@ -21,6 +22,11 @@ pub mod old;
 extern crate acpi;
 
 static mut __ACPI_TABLE: Option<acpi::AcpiTables<AcpiHandlerImpl>> = None;
+
+#[inline(always)]
+pub fn acpi_manager() -> &'static AcpiManager {
+    &AcpiManager
+}
 
 #[derive(Debug)]
 pub struct AcpiManager;

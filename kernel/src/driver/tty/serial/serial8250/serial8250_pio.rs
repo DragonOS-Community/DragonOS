@@ -5,16 +5,34 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use alloc::sync::{Arc, Weak};
+
 use crate::{
     arch::{io::PortIOArch, CurrentPortIOArch},
     driver::tty::serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
+    libs::rwlock::RwLock,
     syscall::SystemError,
 };
 
-use super::Serial8250Port;
+use super::{Serial8250ISADevices, Serial8250ISADriver, Serial8250Manager, Serial8250Port};
 
 static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
     [None, None, None, None, None, None, None, None];
+
+impl Serial8250Manager {
+    pub(super) fn bind_pio_ports(
+        &self,
+        uart_driver: &Arc<Serial8250ISADriver>,
+        devs: &Arc<Serial8250ISADevices>,
+    ) {
+        for i in 0..8 {
+            if let Some(port) = unsafe { PIO_PORTS[i].as_ref() } {
+                port.set_device(Some(devs));
+                self.uart_add_one_port(uart_driver, port).ok();
+            }
+        }
+    }
+}
 
 macro_rules! init_port {
     ($port_num:expr, $baudrate:expr) => {
@@ -55,15 +73,17 @@ pub struct Serial8250PIOPort {
     iobase: Serial8250PortBase,
     baudrate: AtomicBaudRate,
     initialized: AtomicBool,
+    inner: RwLock<Serial8250PIOPortInner>,
 }
 
 impl Serial8250PIOPort {
     const SERIAL8250PIO_MAX_BAUD_RATE: BaudRate = BaudRate::new(115200);
-    pub const fn new(iobase: Serial8250PortBase, baudrate: BaudRate) -> Result<Self, SystemError> {
+    pub fn new(iobase: Serial8250PortBase, baudrate: BaudRate) -> Result<Self, SystemError> {
         let r = Self {
             iobase,
             baudrate: AtomicBaudRate::new(baudrate),
             initialized: AtomicBool::new(false),
+            inner: RwLock::new(Serial8250PIOPortInner::new()),
         };
 
         if let Err(e) = r.check_baudrate(&baudrate) {
@@ -167,7 +187,15 @@ impl Serial8250PIOPort {
     }
 }
 
-impl Serial8250Port for Serial8250PIOPort {}
+impl Serial8250Port for Serial8250PIOPort {
+    fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
+        self.inner.read().device()
+    }
+
+    fn set_device(&self, device: Option<&Arc<Serial8250ISADevices>>) {
+        self.inner.write().set_device(device);
+    }
+}
 
 impl UartPort for Serial8250PIOPort {
     fn serial_in(&self, offset: u32) -> u32 {
@@ -217,6 +245,31 @@ impl UartPort for Serial8250PIOPort {
 
     fn handle_irq(&self) -> Result<(), SystemError> {
         todo!("serial8250_pio::handle_irq")
+    }
+}
+
+#[derive(Debug)]
+struct Serial8250PIOPortInner {
+    /// 当前端口绑定的设备
+    ///
+    /// ps: 存储weak以避免循环引用
+    device: Option<Weak<Serial8250ISADevices>>,
+}
+
+impl Serial8250PIOPortInner {
+    pub const fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
+        if let Some(device) = self.device.as_ref() {
+            return device.upgrade();
+        }
+        return None;
+    }
+
+    fn set_device(&mut self, device: Option<&Arc<Serial8250ISADevices>>) {
+        self.device = device.map(|d| Arc::downgrade(d));
     }
 }
 

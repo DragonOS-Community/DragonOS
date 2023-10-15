@@ -50,6 +50,8 @@
 #define SYS_GETSOCKNAME 41 // 获取socket的名字
 #define SYS_GETPEERNAME 42 // 获取socket的对端名字
 
+#define SYS_GETCWD 48
+
 /**
  * @brief 用户态系统调用函数
  *

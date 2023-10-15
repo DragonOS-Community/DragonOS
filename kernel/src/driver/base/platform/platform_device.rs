@@ -2,18 +2,18 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use ida::IdAllocator;
 
 use crate::{
-    driver::{
-        base::{
-            device::{
-                bus::{Bus, BusState},
-                Device, DeviceNumber, DevicePrivateData, DeviceType, IdTable,
-            },
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
-            kset::KSet,
+    driver::base::{
+        device::{
+            bus::{Bus, BusState},
+            device_manager,
+            driver::Driver,
+            Device, DeviceNumber, DevicePrivateData, DeviceType, IdTable,
         },
-        Driver,
+        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kset::KSet,
     },
     filesystem::kernfs::KernFSInode,
     libs::{
@@ -23,20 +23,36 @@ use crate::{
     syscall::SystemError,
 };
 
-use super::{super::device::DeviceState, CompatibleTable};
+use super::{super::device::DeviceState, platform_bus, platform_bus_device, CompatibleTable};
+
+/// 平台设备id分配器
+static PLATFORM_DEVID_IDA: IdAllocator = IdAllocator::new(i32::MAX as usize);
 
 #[inline(always)]
 pub fn platform_device_manager() -> &'static PlatformDeviceManager {
     &PlatformDeviceManager
 }
 
+/// 没有平台设备id
+pub const PLATFORM_DEVID_NONE: i32 = -1;
+/// 请求自动分配这个平台设备id
+pub const PLATFORM_DEVID_AUTO: i32 = -2;
+
 /// @brief: 实现该trait的设备实例应挂载在platform总线上，
 ///         同时应该实现Device trait
+///
+/// ## 注意
+///
+/// 应当在所有实现这个trait的结构体上方，添加 `#[cast_to([sync] PlatformDriver)]`，
+/// 否则运行时将报错“该对象不是PlatformDriver”
 pub trait PlatformDevice: Device {
-    fn name(&self) -> &str;
+    fn pdev_name(&self) -> &str;
     /// 返回平台设备id，以及这个id是否是自动生成的
-    fn pdev_id(&self) -> Option<(i32, bool)> {
-        None
+    ///
+    /// 请注意，如果当前设备还没有id，应该返回
+    /// (PLATFORM_DEVID_NONE, false)
+    fn pdev_id(&self) -> (i32, bool) {
+        (PLATFORM_DEVID_NONE, false)
     }
 
     /// 设置平台设备id
@@ -61,10 +77,46 @@ pub struct PlatformDeviceManager;
 
 impl PlatformDeviceManager {
     /// platform_device_add - add a platform device to device hierarchy
-    ///
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_device_add#656
     pub fn device_add(&self, pdev: Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        todo!()
+        if pdev.parent().is_none() {
+            pdev.set_parent(Some(Arc::downgrade(
+                &(platform_bus_device() as Arc<dyn KObject>),
+            )));
+        }
+
+        pdev.set_bus(Some(platform_bus() as Arc<dyn Bus>));
+
+        let id = pdev.pdev_id().0;
+        match id {
+            PLATFORM_DEVID_NONE => {
+                pdev.set_name(format!("{}", pdev.pdev_name()));
+            }
+            PLATFORM_DEVID_AUTO => {
+                let id = PLATFORM_DEVID_IDA.alloc().ok_or(SystemError::EOVERFLOW)?;
+                pdev.set_pdev_id(id as i32);
+                pdev.set_pdev_id_auto(true);
+                pdev.set_name(format!("{}.{}.auto", pdev.pdev_name(), pdev.pdev_id().0));
+            }
+            _ => {
+                pdev.set_name(format!("{}.{}", pdev.pdev_name(), id));
+            }
+        }
+
+        // todo: 插入资源： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_device_add#691
+        let r = device_manager().add_device(pdev.clone() as Arc<dyn Device>);
+        if r.is_ok() {
+            pdev.set_state(DeviceState::Initialized);
+            return Ok(()); // success
+        } else {
+            // failed
+            let pdevid = pdev.pdev_id();
+            if pdevid.1 {
+                PLATFORM_DEVID_IDA.free(pdevid.0 as usize);
+                pdev.set_pdev_id(PLATFORM_DEVID_AUTO);
+            }
+
+            return r;
+        }
     }
 }
 
@@ -85,7 +137,7 @@ impl PlatformBusDevice {
     ) -> Arc<PlatformBusDevice> {
         return Arc::new(PlatformBusDevice {
             inner: SpinLock::new(InnerPlatformBusDevice::new(data, parent)),
-            kobj_state: LockedKObjectState::new(KObjectState::empty()),
+            kobj_state: LockedKObjectState::new(None),
         });
     }
 
@@ -130,18 +182,8 @@ impl PlatformBusDevice {
         let state = self.inner.lock().state;
         return state;
     }
-
-    // /// @brief:
-    // /// @parameter: None
-    // /// @return: 总线状态
-    // #[inline]
-    // #[allow(dead_code)]
-    // fn set_driver(&self, driver: Option<Arc<LockedPlatformBusDriver>>) {
-    //     self.0.lock().driver = driver;
-    // }
 }
 
-/// @brief: platform总线
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InnerPlatformBusDevice {
@@ -154,14 +196,10 @@ pub struct InnerPlatformBusDevice {
     /// 当前设备挂载到的总线
     bus: Option<Arc<dyn Bus>>,
     /// 当前设备已经匹配的驱动
-    driver: Option<Arc<dyn Driver>>,
+    driver: Option<Weak<dyn Driver>>,
 }
 
-/// @brief: platform方法集
 impl InnerPlatformBusDevice {
-    /// @brief: 创建一个platform总线实例
-    /// @parameter: None
-    /// @return: platform总线实例
     pub fn new(data: DevicePrivateData, parent: Option<Weak<dyn KObject>>) -> Self {
         Self {
             data,
@@ -194,6 +232,10 @@ impl KObject for PlatformBusDevice {
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
         None
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        todo!("platform_bus_device::set_kobj_type")
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
@@ -247,8 +289,12 @@ impl Device for PlatformBusDevice {
         self.inner.lock().bus.clone()
     }
 
+    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+        self.inner.lock().bus = bus;
+    }
+
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.lock().driver.clone()
+        self.inner.lock().driver.clone()?.upgrade()
     }
 
     #[inline]
@@ -256,7 +302,19 @@ impl Device for PlatformBusDevice {
         false
     }
 
-    fn set_driver(&self, driver: Option<Arc<dyn Driver>>) {
+    fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
         self.inner.lock().driver = driver;
+    }
+
+    fn can_match(&self) -> bool {
+        todo!()
+    }
+
+    fn set_can_match(&self, can_match: bool) {
+        todo!()
+    }
+
+    fn state_synced(&self) -> bool {
+        todo!()
     }
 }

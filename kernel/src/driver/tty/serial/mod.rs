@@ -1,6 +1,10 @@
 use core::{fmt::Debug, sync::atomic::AtomicU32};
 
+use alloc::sync::Arc;
+
 use crate::{driver::base::device::DeviceNumber, mm::VirtAddr, syscall::SystemError};
+
+use self::serial8250::serial8250_manager;
 
 use super::tty_driver::TtyDriver;
 
@@ -9,8 +13,8 @@ pub mod serial8250;
 pub trait UartDriver: Debug + Send + Sync + TtyDriver {
     fn device_number(&self) -> DeviceNumber;
 
-    /// 获取设备数量
-    fn devs_num(&self) -> i32;
+    /// 获取最大的设备数量
+    fn max_devs_num(&self) -> i32;
 
     // todo: 获取指向console的指针（在我们系统里面，将来可能是改进后的Textui Window）
 }
@@ -37,3 +41,30 @@ pub trait UartPort {
 
 int_like!(BaudRate, AtomicBaudRate, u32, AtomicU32);
 int_like!(DivisorFraction, u32);
+
+#[inline(always)]
+pub(super) fn uart_manager() -> &'static UartManager {
+    &UartManager
+}
+
+#[derive(Debug)]
+pub(super) struct UartManager;
+
+impl UartManager {
+    /// todo: 把uart设备注册到tty层
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_register_driver#2720
+    pub fn register_driver(&self, driver: &Arc<dyn UartDriver>) -> Result<(), SystemError> {
+        todo!("UartManager::register_driver")
+    }
+}
+
+pub fn serial_early_init() -> Result<(), SystemError> {
+    serial8250_manager().early_init()?;
+    return Ok(());
+}
+
+pub(super) fn serial_init() -> Result<(), SystemError> {
+    serial8250_manager().init()?;
+    return Ok(());
+}

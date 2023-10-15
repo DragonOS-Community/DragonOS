@@ -181,16 +181,15 @@ int shell_cmd_cd(int argc, char **argv)
         if (ec == 0)
         {
             // 获取新的路径字符串
-            char *new_path = (char *)malloc(dest_len + 2);
-            memset(new_path, 0, dest_len + 2);
-            strncpy(new_path, argv[1], dest_len);
+            char *new_path = (char *)malloc(4096);
+            memset(new_path, 0, 4096);
+            getcwd(new_path, 4096);
 
             // 释放原有的路径字符串的内存空间
             free(shell_current_path);
 
             shell_current_path = new_path;
 
-            shell_current_path[dest_len] = '\0';
             return 0;
         }
         else
@@ -216,7 +215,7 @@ int shell_cmd_cd(int argc, char **argv)
 
         // 拼接出新的字符串
         char *new_path = (char *)malloc(new_len + 2);
-        memset(new_path, 0, sizeof(new_path));
+        memset(new_path, 0, new_len);
         strncpy(new_path, shell_current_path, current_dir_len);
 
         if (current_dir_len > 1)
@@ -225,10 +224,13 @@ int shell_cmd_cd(int argc, char **argv)
         int x = chdir(new_path);
         if (x == 0) // 成功切换目录
         {
+            free(new_path);
             free(shell_current_path);
-            // printf("new_path=%s, newlen= %d\n", new_path, new_len);
-            new_path[new_len + 1] = '\0';
-            shell_current_path = new_path;
+
+            char * pwd = malloc(4096);
+            memset(pwd, 0, 4096);
+            getcwd(pwd, 4096);
+            shell_current_path = pwd;
             goto done;
         }
         else

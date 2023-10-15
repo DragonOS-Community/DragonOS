@@ -43,6 +43,8 @@ pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType>;
 
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>);
+
     fn name(&self) -> String;
 
     fn set_name(&self, name: String);
@@ -70,7 +72,7 @@ impl DowncastArc for dyn KObject {
     }
 }
 
-pub trait KObjType: Debug {
+pub trait KObjType: Debug + Send + Sync {
     fn release(&self, _kobj: Arc<dyn KObject>) {}
     fn sysfs_ops(&self) -> Option<&dyn SysFSOps>;
 
@@ -91,7 +93,8 @@ bitflags! {
 pub struct LockedKObjectState(RwLock<KObjectState>);
 
 impl LockedKObjectState {
-    pub const fn new(state: KObjectState) -> LockedKObjectState {
+    pub fn new(state: Option<KObjectState>) -> LockedKObjectState {
+        let state = state.unwrap_or(KObjectState::empty());
         LockedKObjectState(RwLock::new(state))
     }
 }

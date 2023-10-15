@@ -1,18 +1,31 @@
 use alloc::sync::Arc;
 
 use crate::{
-    driver::{base::device::DevicePrivateData, Driver},
+    driver::base::device::{
+        bus::Bus,
+        driver::{driver_manager, Driver},
+        DevicePrivateData,
+    },
     syscall::SystemError,
 };
 
-use super::{super::device::driver::DriverError, platform_device::PlatformDevice, CompatibleTable};
+use super::{platform_bus, platform_device::PlatformDevice, CompatibleTable};
 
 lazy_static! {
     static ref PLATFORM_COMPAT_TABLE: CompatibleTable = CompatibleTable::new(vec!["platform"]);
 }
 /// @brief: 实现该trait的设备驱动实例应挂载在platform总线上，
 ///         同时应该实现Driver trait
+///
+/// ## 注意
+///
+/// 应当在所有实现这个trait的结构体上方，添加 `#[cast_to([sync] PlatformDriver)]`，
+/// 否则运行时将报错“该对象不是PlatformDriver”
 pub trait PlatformDriver: Driver {
+    /// 检测设备是否能绑定到这个驱动
+    ///
+    /// 如果能，则把设备的driver指向这个驱动。
+    /// 请注意，这个函数不应该把driver加入驱动的devices列表，相关工作会在外部的函数里面处理。
     fn probe(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
     fn remove(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
     fn shutdown(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
@@ -33,6 +46,13 @@ impl PlatformDriverManager {
     ///
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=__platform_driver_register#861
     pub fn register(&self, driver: Arc<dyn PlatformDriver>) -> Result<(), SystemError> {
-        todo!()
+        driver.set_bus(Some(platform_bus() as Arc<dyn Bus>));
+        return driver_manager().register(driver as Arc<dyn Driver>);
+    }
+
+    /// 卸载平台设备驱动
+    #[allow(dead_code)]
+    pub fn unregister(&self, driver: &Arc<dyn PlatformDriver>) {
+        driver_manager().unregister(&(driver.clone() as Arc<dyn Driver>));
     }
 }

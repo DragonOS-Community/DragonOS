@@ -11,11 +11,14 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 use crate::{
     driver::{
         base::{
-            device::{driver::DriverError, Device, DevicePrivateData, DeviceResource, IdTable},
-            kobject::KObject,
+            device::{
+                bus::Bus,
+                driver::{Driver, DriverError},
+                Device, DevicePrivateData, DeviceResource, IdTable,
+            },
+            kobject::{KObjType, KObject, KObjectState},
         },
         virtio::virtio_impl::HalImpl,
-        Driver,
     },
     kerror, kinfo,
     libs::spinlock::SpinLock,
@@ -245,31 +248,27 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
 }
 
 impl<T: Transport + 'static> Driver for VirtioInterface<T> {
-    fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+    fn id_table(&self) -> Option<IdTable> {
         todo!()
     }
 
-    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+    fn add_device(&self, device: Arc<dyn Device>) {
         todo!()
     }
 
-    fn sync_state(&self, device: &Arc<dyn Device>) {
-        todo!()
-    }
-
-    fn shutdown(&self, device: &Arc<dyn Device>) {
-        todo!()
-    }
-
-    fn resume(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!()
-    }
-
-    fn id_table(&self) -> IdTable {
+    fn delete_device(&self, device: &Arc<dyn Device>) {
         todo!()
     }
 
     fn devices(&self) -> alloc::vec::Vec<Arc<dyn Device>> {
+        todo!()
+    }
+
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
+        todo!()
+    }
+
+    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
         todo!()
     }
 }
@@ -384,7 +383,11 @@ impl<T: Transport + 'static> KObject for VirtioInterface<T> {
         todo!()
     }
 
-    fn set_kobj_state(&self, _state: crate::driver::base::kobject::KObjectState) {
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
         todo!()
     }
 }

@@ -34,6 +34,7 @@ raw-cpuid = "11.0.1"
 acpi = "5.0.0"
 intertrait = { path = "src/libs/intertrait" }
 linkme = "0.2"
+ida = { path = "src/libs/ida"}
 
 # 构建时依赖项
 [build-dependencies]
@@ -48,6 +49,6 @@ features = ["spin_no_std"]
 
 # The release profile, used for `cargo build --release`
 [profile.release]
-debug = false
+debug = true
 
 

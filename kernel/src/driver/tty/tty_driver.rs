@@ -2,7 +2,7 @@ use core::fmt::Debug;
 
 use alloc::sync::Arc;
 
-use crate::driver::Driver;
+use crate::driver::base::device::driver::Driver;
 
 use super::tty_device::TtyDevice;
 

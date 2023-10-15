@@ -52,7 +52,7 @@ impl KSet {
         let r = Self {
             kobjects: RwLock::new(Vec::new()),
             inner: RwLock::new(InnerKSet::new(name)),
-            kobj_state: LockedKObjectState::new(KObjectState::empty()),
+            kobj_state: LockedKObjectState::new(None),
             parent_data: RwLock::new(KSetParentData::new(None, None)),
             self_ref: Weak::default(),
         };
@@ -165,6 +165,10 @@ impl KObject for KSet {
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
         Some(&KSetKObjType)
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        todo!("KSet::set_kobj_type")
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {

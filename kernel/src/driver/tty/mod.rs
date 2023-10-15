@@ -9,6 +9,7 @@ use thingbuf::mpsc::{
 
 use crate::libs::rwlock::RwLock;
 
+pub mod init;
 pub mod serial;
 pub mod tty_device;
 pub mod tty_driver;

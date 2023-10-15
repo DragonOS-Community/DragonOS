@@ -1,10 +1,26 @@
 use core::intrinsics::unlikely;
 
-use alloc::sync::Arc;
+use alloc::{string::ToString, sync::Arc};
+use intertrait::cast::CastArc;
 
-use crate::{driver::Driver, syscall::SystemError};
+use crate::{
+    driver::base::kobject::KObject,
+    filesystem::{
+        sysfs::{file::sysfs_emit_str, sysfs_instance, Attribute, SysFSOpsSupport},
+        vfs::syscall::ModeType,
+    },
+    libs::wait_queue::WaitQueue,
+    syscall::SystemError,
+};
 
-use super::{bus::BusNotifyEvent, driver::driver_manager, Device, DeviceManager};
+use super::{
+    bus::BusNotifyEvent,
+    device_manager,
+    driver::{driver_manager, Driver, DriverManager},
+    Device, DeviceManager,
+};
+
+static PROBE_WAIT_QUEUE: WaitQueue = WaitQueue::INIT;
 
 impl DeviceManager {
     /// 尝试把一个设备与一个驱动匹配
@@ -40,7 +56,8 @@ impl DeviceManager {
         allow_async: bool,
     ) -> Result<bool, SystemError> {
         if unlikely(allow_async) {
-            todo!("do_device_attach: allow_async")
+            // todo!("do_device_attach: allow_async")
+            kwarn!("do_device_attach: allow_async is true, but currently not supported");
         }
         if dev.is_dead() {
             return Ok(false);
@@ -64,7 +81,7 @@ impl DeviceManager {
             let bus = dev.bus().ok_or(SystemError::EINVAL)?;
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
             let mut flag = true;
-            for driver in bus.subsystem().drivers().read().iter() {
+            for driver in bus.subsystem().drivers().iter() {
                 if let Some(driver) = driver.upgrade() {
                     let r = self.do_device_attach_driver(&driver, &mut data);
                     if unlikely(r.is_err()) {
@@ -142,7 +159,7 @@ impl DeviceManager {
         let r = driver_manager().driver_sysfs_add(dev);
         if let Err(e) = r {
             self.device_links_force_bind(dev);
-            self.driver_bound(dev);
+            driver_manager().driver_bound(dev);
             return Err(e);
         } else {
             if let Some(bus) = dev.bus() {
@@ -156,9 +173,10 @@ impl DeviceManager {
         return r;
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#393
-    fn driver_bound(&self, _dev: &Arc<dyn Device>) {
-        todo!("driver_bound")
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#528
+    fn unbind_cleanup(&self, dev: &Arc<dyn Device>) {
+        dev.set_driver(None);
+        // todo: 添加更多操作，清理数据
     }
 }
 
@@ -206,5 +224,370 @@ impl DeviceAttachData {
     #[inline(always)]
     fn set_have_async(&mut self) {
         self.have_async = true;
+    }
+}
+
+impl DriverManager {
+    /// 尝试把驱动绑定到现有的设备上
+    ///
+    /// 这个函数会遍历驱动现有的全部设备，然后尝试把他们匹配。
+    /// 一旦有一个设备匹配成功，就会返回，并且设备的driver字段会被设置。
+    pub fn driver_attach(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
+        let bus = driver.bus().ok_or(SystemError::EINVAL)?;
+        for dev in bus.subsystem().devices().iter() {
+            if let Some(dev) = dev.upgrade() {
+                if self.do_driver_attach(&dev, &driver) {
+                    // 匹配成功
+                    return Ok(());
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#1134
+    fn do_driver_attach(&self, device: &Arc<dyn Device>, driver: &Arc<dyn Driver>) -> bool {
+        let r = self.match_device(driver, device).unwrap_or(false);
+        if r == false {
+            // 不匹配
+            return false;
+        }
+
+        if driver.allows_async_probing() {
+            unimplemented!(
+                "do_driver_attach: probe driver '{}' asynchronously",
+                driver.name()
+            );
+        }
+
+        if self.probe_device(driver, device).is_err() {
+            return false;
+        }
+
+        return true;
+    }
+
+    #[inline(always)]
+    pub fn match_device(
+        &self,
+        driver: &Arc<dyn Driver>,
+        device: &Arc<dyn Device>,
+    ) -> Result<bool, SystemError> {
+        return driver.bus().unwrap().match_device(device, driver);
+    }
+
+    /// 尝试把设备和驱动绑定在一起
+    ///
+    ///
+    /// ## 返回
+    ///
+    /// - Ok(): 绑定成功
+    /// - Err(ENODEV): 设备未注册
+    /// - Err(EBUSY): 设备已经绑定到驱动上
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#802
+    fn probe_device(
+        &self,
+        driver: &Arc<dyn Driver>,
+        device: &Arc<dyn Device>,
+    ) -> Result<(), SystemError> {
+        let r = self.do_probe_device(driver, device);
+        PROBE_WAIT_QUEUE.wakeup_all(None);
+        return r;
+    }
+
+    fn do_probe_device(
+        &self,
+        driver: &Arc<dyn Driver>,
+        device: &Arc<dyn Device>,
+    ) -> Result<(), SystemError> {
+        if device.is_dead() || (!device.is_registered()) {
+            return Err(SystemError::ENODEV);
+        }
+        if device.driver().is_some() {
+            return Err(SystemError::EBUSY);
+        }
+
+        device.set_can_match(true);
+
+        self.really_probe(driver, device)?;
+
+        return Ok(());
+    }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#584
+    fn really_probe(
+        &self,
+        driver: &Arc<dyn Driver>,
+        device: &Arc<dyn Device>,
+    ) -> Result<(), SystemError> {
+        let bind_failed = || {
+            device_manager().unbind_cleanup(device);
+        };
+
+        let sysfs_failed = || {
+            if let Some(bus) = device.bus() {
+                bus.subsystem().bus_notifier().call_chain(
+                    BusNotifyEvent::DriverNotBound,
+                    Some(device),
+                    None,
+                );
+            }
+        };
+
+        let probe_failed = || {
+            self.remove_from_sysfs(device);
+        };
+
+        let dev_groups_failed = || {
+            device_manager().remove(device);
+        };
+
+        device.set_driver(Some(Arc::downgrade(driver)));
+
+        self.add_to_sysfs(device).map_err(|e| {
+            kerror!(
+                "really_probe: add_to_sysfs failed, dev: '{}', err: {:?}",
+                device.name(),
+                e
+            );
+            sysfs_failed();
+            bind_failed();
+            e
+        })?;
+
+        self.call_driver_probe(device, driver).map_err(|e| {
+            kerror!(
+                "really_probe: call_driver_probe failed, dev: '{}', err: {:?}",
+                device.name(),
+                e
+            );
+
+            probe_failed();
+            sysfs_failed();
+            bind_failed();
+            e
+        })?;
+
+        device_manager()
+            .add_groups(device, driver.dev_groups())
+            .map_err(|e| {
+                kerror!(
+                    "really_probe: add_groups failed, dev: '{}', err: {:?}",
+                    device.name(),
+                    e
+                );
+                dev_groups_failed();
+                probe_failed();
+                sysfs_failed();
+                bind_failed();
+                e
+            })?;
+
+        // 我们假设所有的设备都有sync_state这个属性。如果没有的话，也创建属性文件。
+        device_manager()
+            .create_file(device, &DeviceAttrStateSynced)
+            .map_err(|e| {
+                kerror!(
+                    "really_probe: create_file failed, dev: '{}', err: {:?}",
+                    device.name(),
+                    e
+                );
+                dev_groups_failed();
+                probe_failed();
+                sysfs_failed();
+                bind_failed();
+                e
+            })?;
+
+        self.driver_bound(device);
+
+        return Ok(());
+    }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#434
+    fn add_to_sysfs(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let driver = device.driver().ok_or(SystemError::EINVAL)?;
+
+        if let Some(bus) = device.bus() {
+            bus.subsystem().bus_notifier().call_chain(
+                BusNotifyEvent::BindDriver,
+                Some(&device),
+                None,
+            );
+        }
+
+        let driver_kobj = driver.clone() as Arc<dyn KObject>;
+        let device_kobj = device.clone() as Arc<dyn KObject>;
+
+        sysfs_instance().create_link(Some(&driver_kobj), &device_kobj, device.name())?;
+
+        let fail_rm_dev_link = || {
+            sysfs_instance().remove_link(&driver_kobj, device.name());
+        };
+
+        sysfs_instance()
+            .create_link(Some(&device_kobj), &driver_kobj, "driver".to_string())
+            .map_err(|e| {
+                fail_rm_dev_link();
+                e
+            })?;
+
+        device_manager()
+            .create_file(device, &DeviceAttrCoredump)
+            .map_err(|e| {
+                sysfs_instance().remove_link(&device_kobj, "driver".to_string());
+                fail_rm_dev_link();
+                e
+            })?;
+
+        return Ok(());
+    }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#469
+    fn remove_from_sysfs(&self, _device: &Arc<dyn Device>) {
+        todo!("remove_from_sysfs")
+    }
+
+    fn call_driver_probe(
+        &self,
+        device: &Arc<dyn Device>,
+        driver: &Arc<dyn Driver>,
+    ) -> Result<(), SystemError> {
+        let bus = device.bus().ok_or(SystemError::EINVAL)?;
+        let r = bus.probe(device);
+        if r == Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) {
+            kerror!(
+                "call_driver_probe: bus.probe() failed, dev: '{}', err: {:?}",
+                device.name(),
+                r
+            );
+            return r;
+        }
+
+        if r.is_ok() {
+            return Ok(());
+        }
+
+        let err = r.unwrap_err();
+        match err {
+            SystemError::ENODEV | SystemError::ENXIO => {
+                kdebug!(
+                    "driver'{}': probe of {} rejects match {:?}",
+                    driver.name(),
+                    device.name(),
+                    err
+                );
+            }
+
+            _ => {
+                kwarn!(
+                    "driver'{}': probe of {} failed with error {:?}",
+                    driver.name(),
+                    device.name(),
+                    err
+                );
+            }
+        }
+
+        return Err(err);
+    }
+
+    /// 当设备被成功探测，进行了'设备->驱动'绑定后，调用这个函数，完成'驱动->设备'的绑定
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#393
+    fn driver_bound(&self, device: &Arc<dyn Device>) {
+        if self.driver_is_bound(device) {
+            kwarn!("driver_bound: device '{}' is already bound.", device.name());
+            return;
+        }
+
+        let driver = device.driver().unwrap();
+        driver.add_device(device.clone());
+
+        if let Some(bus) = device.bus() {
+            bus.subsystem().bus_notifier().call_chain(
+                BusNotifyEvent::BoundDriver,
+                Some(device),
+                None,
+            );
+        }
+
+        // todo: 发送kobj bind的uevent
+    }
+
+    fn driver_is_bound(&self, device: &Arc<dyn Device>) -> bool {
+        if let Some(driver) = device.driver() {
+            if driver.find_device_by_name(&device.name()).is_some() {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+/// 设备文件夹下的`dev`文件的属性
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceAttrStateSynced;
+
+impl Attribute for DeviceAttrStateSynced {
+    fn mode(&self) -> ModeType {
+        // 0o444
+        return ModeType::S_IRUGO;
+    }
+
+    fn name(&self) -> &str {
+        "state_synced"
+    }
+
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
+            kerror!(
+                "Intertrait casting not implemented for kobj: {}",
+                kobj.name()
+            );
+            SystemError::EOPNOTSUPP_OR_ENOTSUP
+        })?;
+
+        let val = dev.state_synced();
+        let val = if val { 1 } else { 0 };
+        return sysfs_emit_str(buf, format!("{}\n", val).as_str());
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::SHOW
+    }
+}
+
+#[derive(Debug)]
+struct DeviceAttrCoredump;
+
+impl Attribute for DeviceAttrCoredump {
+    fn name(&self) -> &str {
+        "coredump"
+    }
+
+    fn mode(&self) -> ModeType {
+        ModeType::from_bits_truncate(0o200)
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::STORE
+    }
+
+    fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
+        let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
+            kerror!(
+                "Intertrait casting not implemented for kobj: {}",
+                kobj.name()
+            );
+            SystemError::EOPNOTSUPP_OR_ENOTSUP
+        })?;
+
+        let drv = dev.driver().ok_or(SystemError::EINVAL)?;
+        drv.coredump(&dev)?;
+
+        return Ok(buf.len());
     }
 }

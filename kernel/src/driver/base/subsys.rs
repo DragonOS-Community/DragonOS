@@ -10,14 +10,18 @@ use alloc::{
 };
 
 use crate::{
-    driver::Driver,
-    libs::{notifier::AtomicNotifierChain, rwlock::RwLock, spinlock::SpinLock},
+    libs::{
+        notifier::AtomicNotifierChain,
+        rwlock::{RwLock, RwLockReadGuard},
+        spinlock::SpinLock,
+    },
     syscall::SystemError,
 };
 
 use super::{
     device::{
         bus::{Bus, BusNotifyEvent},
+        driver::Driver,
         Device,
     },
     kset::KSet,
@@ -90,12 +94,12 @@ impl SubSysPrivate {
         *self.bus.lock() = bus;
     }
 
-    pub fn devices(&self) -> &RwLock<Vec<Weak<dyn Device>>> {
-        return &self.devices;
+    pub fn devices(&self) -> RwLockReadGuard<Vec<Weak<dyn Device>>> {
+        return self.devices.read();
     }
 
-    pub fn drivers(&self) -> &RwLock<Vec<Weak<dyn Driver>>> {
-        return &self.drivers;
+    pub fn drivers(&self) -> RwLockReadGuard<Vec<Weak<dyn Driver>>> {
+        return self.drivers.read();
     }
 
     pub fn drivers_autoprobe(&self) -> bool {
@@ -135,6 +139,44 @@ impl SubSysPrivate {
 
     pub fn interfaces(&self) -> &'static [&'static dyn SubSysInterface] {
         return self.interfaces;
+    }
+
+    pub fn add_driver_to_vec(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
+        let mut drivers = self.drivers.write();
+        let driver_weak = Arc::downgrade(driver);
+        if drivers.iter().any(|d| d.ptr_eq(&driver_weak)) {
+            return Err(SystemError::EEXIST);
+        }
+        drivers.push(driver_weak);
+        return Ok(());
+    }
+
+    pub fn remove_driver_from_vec(&self, driver: &Arc<dyn Driver>) {
+        let mut drivers = self.drivers.write();
+        let driver_weak = Arc::downgrade(driver);
+        let index = drivers.iter().position(|d| d.ptr_eq(&driver_weak));
+        if let Some(index) = index {
+            drivers.remove(index);
+        }
+    }
+
+    pub fn add_device_to_vec(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let mut devices = self.devices.write();
+        let device_weak = Arc::downgrade(device);
+        if devices.iter().any(|d| d.ptr_eq(&device_weak)) {
+            return Err(SystemError::EEXIST);
+        }
+        devices.push(device_weak);
+        return Ok(());
+    }
+
+    pub fn remove_device_from_vec(&self, device: &Arc<dyn Device>) {
+        let mut devices = self.devices.write();
+        let device_weak = Arc::downgrade(device);
+        let index = devices.iter().position(|d| d.ptr_eq(&device_weak));
+        if let Some(index) = index {
+            devices.remove(index);
+        }
     }
 }
 

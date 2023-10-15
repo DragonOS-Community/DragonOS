@@ -175,7 +175,7 @@ void do_stack_segment_fault(struct pt_regs *regs, unsigned long error_code)
 // 13 #GP 通用保护性异常
 void do_general_protection(struct pt_regs *regs, unsigned long error_code)
 {
-
+    
     kerror("do_general_protection(13),\tError Code:%#18lx,\tRSP:%#18lx,\tRIP:%#18lx\t CPU:%d\tpid=%ld\n", error_code,
            regs->rsp, regs->rip, rs_current_pcb_cpuid(), rs_current_pcb_pid());
     if (error_code & 0x01)

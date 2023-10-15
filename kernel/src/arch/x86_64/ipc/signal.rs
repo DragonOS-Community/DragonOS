@@ -261,8 +261,7 @@ pub struct SigContext {
     pub oldmask: SigSet, // 暂存的执行信号处理函数之前的，被设置block的信号
     pub cr2: u64,        // 用来保存线程结构体中的cr2字段
     // pub err_code: u64,    // 用来保存线程结构体中的err_code字段
-    // todo: 支持x87浮点处理器后，在这里增加浮点处理器的状态结构体指针
-    pub reserved_for_x87_state: u64,
+    pub reserved_for_x87_state: Option<FpState>,
     pub reserved: [u64; 8],
 }
 
@@ -285,6 +284,8 @@ impl SigContext {
         // context.trap_num = unsafe { (*current_thread).trap_num };
         // context.err_code = unsafe { (*current_thread).err_code };
         // context.cr2 = unsafe { (*current_thread).cr2 };
+        self.reserved_for_x87_state = ProcessManager::current_pcb().arch_info().fp_state();
+        kdebug!("1:{:?}", self.reserved_for_x87_state);
         return Ok(0);
     }
 
@@ -295,7 +296,7 @@ impl SigContext {
     ///
     /// @return bool true -> 成功恢复
     ///              false -> 执行失败
-    pub fn restore_sigcontext(&self, frame: &mut TrapFrame) -> bool {
+    pub fn restore_sigcontext(&mut self, frame: &mut TrapFrame) -> bool {
         let guard = ProcessManager::current_pcb();
         let mut arch_info = guard.arch_info();
         (*frame) = self.frame.clone();
@@ -304,6 +305,8 @@ impl SigContext {
         *arch_info.cr2_mut() = self.cr2 as usize;
         // (*current_thread).err_code = (*context).err_code;
         // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
+        *arch_info.fp_state_mut() = self.reserved_for_x87_state.clone();
+        kdebug!("1:{:?}", self.reserved_for_x87_state);
         arch_info.restore_fp_state();
         return true;
     }
@@ -451,7 +454,7 @@ fn setup_frame(
         (*frame)
             .context
             .setup_sigcontext(oldset, &trap_frame)
-            .map_err(|e| -> SystemError {
+            .map_err(|e: SystemError| -> SystemError {
                 let r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32);
                 if r.is_err() {
                     kerror!("In setup_sigcontext: generate SIGSEGV signal failed");
@@ -526,10 +529,9 @@ fn setup_frame(
             return Err(SystemError::EINVAL);
         }
     }
-    // 将当前进程的fp_state拷贝到用户栈
-    ProcessManager::current_pcb().arch_info().save_fp_state();
     // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
     ProcessManager::current_pcb().arch_info().clear_fp_state();
+    // CR0=80000013 CR2=0000000000000000 CR3=000000001fde3000 CR4=00000620
 
     // 传入信号处理函数的第一个参数
     trap_frame.rdi = sig as u64;

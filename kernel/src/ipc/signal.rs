@@ -435,7 +435,6 @@ pub fn do_sigaction(
         return Err(SystemError::EINVAL);
     }
 
-
     // 保存原有的 sigaction
     let old_act: Option<&mut Sigaction> = {
         if old_act.is_some() {

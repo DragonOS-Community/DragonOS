@@ -221,8 +221,6 @@ impl Syscall {
                 (*old_act).mask = old_ka.mask();
                 if old_ka.restorer().is_some() {
                     (*old_act).restorer = old_ka.restorer().unwrap() as *mut c_void;
-                } else {
-                    kerror!("Saving old SIGACTION restorer failed: Null pointer of restorer");
                 }
             }
         }

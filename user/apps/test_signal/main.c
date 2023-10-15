@@ -35,21 +35,15 @@ void handler(int sig)
 
 int main()
 {
-    printf("Test signal running...\n");
     signal(SIGKILL, &handler);
     printf("registered.\n");
 
-    clock_t last = clock();
 
     while (1)
     {
         // handler(SIGKILL);
-        if ((clock() - last) / CLOCKS_PER_SEC >= 2)
-        {
             printf("Test signal running\n");
             raise(SIGKILL);
-            last = clock();
-        }
         if (handle_ok)
         {
             printf("Handle OK!\n");

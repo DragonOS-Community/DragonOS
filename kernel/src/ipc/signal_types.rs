@@ -230,7 +230,6 @@ impl Sigaction {
 #[derive(Debug, Clone, Copy)]
 pub struct UserSigaction {
     pub handler: *mut core::ffi::c_void,
-    pub sigaction: *mut core::ffi::c_void,
     pub mask: SigSet,
     pub flags: SigFlags,
     pub restorer: *mut core::ffi::c_void,

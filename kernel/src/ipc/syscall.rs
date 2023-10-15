@@ -183,9 +183,10 @@ impl Syscall {
             },
         );
 
-        // 将原本的sigaction拷贝到用户程序指定的地址
+        //
         if (retval == Ok(())) && (!old_act.is_null()) {
-            let r = UserBufferWriter::new(old_act, core::mem::size_of::<Sigaction>(), from_user);
+            let r =
+                UserBufferWriter::new(old_act, core::mem::size_of::<UserSigaction>(), from_user);
             if r.is_err() {
                 return Err(SystemError::EFAULT);
             }

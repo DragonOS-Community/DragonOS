@@ -240,7 +240,7 @@ bitflags! {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct SigFrame {
     // pub pedding: u64,
@@ -365,6 +365,7 @@ impl SignalArch for X86_64SignalArch {
 
     #[no_mangle]
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
+        kdebug!("--sigreturning");
         let frame = (trap_frame.rsp as usize) as *mut SigFrame;
 
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
@@ -406,11 +407,8 @@ fn handle_signal(
     // TODO 这里要补充一段逻辑，好像是为了保证引入线程之后的地址空间不会出问题。详见https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/mips/kernel/signal.c#830
 
     // 设置栈帧
-    let retval = setup_frame(sig, sigaction, info, oldset, frame);
-    if retval.is_err() {
-        return retval;
-    }
-    return Ok(0);
+
+    return setup_frame(sig, sigaction, info, oldset, frame);
 }
 
 /// @brief 在用户栈上开辟一块空间，并且把内核栈的栈帧以及需要在用户态执行的代码给保存进去。
@@ -543,6 +541,11 @@ fn setup_frame(
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
     trap_frame.ds = (USER_DS.bits() | 0x3) as u64;
 
+    // 禁用中断
+    // trap_frame.rflags &= !(0x200);
+
+    kdebug!("trap_frame: {trap_frame:?}");
+
     return Ok(0);
 }
 
@@ -551,10 +554,11 @@ fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
     // TODO:在 linux 中会根据 Sigaction 中的一个flag 的值来确定是否使用pcb中的 signal 处理程序备用堆栈，现在的
     // pcb中也没有这个备用堆栈
 
-    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小
+    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小 并且16字节对齐
     let mut rsp: usize = (frame.rsp as usize) - 128 - size;
     // 按照要求进行对齐
-    rsp &= (-(STACK_ALIGN as i64)) as usize;
+    rsp &= (!(STACK_ALIGN - 1)) as usize;
+    // rsp &= (!(STACK_ALIGN - 1)) as usize;
     return rsp as *mut SigFrame;
 }
 

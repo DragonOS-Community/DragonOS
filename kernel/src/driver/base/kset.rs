@@ -167,7 +167,7 @@ impl KObject for KSet {
         Some(&KSetKObjType)
     }
 
-    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
         todo!("KSet::set_kobj_type")
     }
 

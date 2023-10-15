@@ -234,7 +234,7 @@ impl KObject for PlatformBusDevice {
         None
     }
 
-    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
         todo!("platform_bus_device::set_kobj_type")
     }
 
@@ -310,7 +310,7 @@ impl Device for PlatformBusDevice {
         todo!()
     }
 
-    fn set_can_match(&self, can_match: bool) {
+    fn set_can_match(&self, _can_match: bool) {
         todo!()
     }
 

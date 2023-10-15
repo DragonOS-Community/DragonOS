@@ -74,19 +74,19 @@ impl Bus for PlatformBus {
         return pdrv.probe(&pdev);
     }
 
-    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!()
     }
 
-    fn sync_state(&self, device: &Arc<dyn Device>) {
+    fn sync_state(&self, _device: &Arc<dyn Device>) {
         todo!()
     }
 
-    fn shutdown(&self, device: &Arc<dyn Device>) {
+    fn shutdown(&self, _device: &Arc<dyn Device>) {
         todo!()
     }
 
-    fn resume(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+    fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!()
     }
 

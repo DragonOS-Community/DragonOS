@@ -491,7 +491,7 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
         todo!()
     }
 }
@@ -509,7 +509,7 @@ impl Device for LockedAhciDisk {
         todo!("LockedAhciDisk::bus()")
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
         todo!("LockedAhciDisk::set_bus()")
     }
 
@@ -529,7 +529,7 @@ impl Device for LockedAhciDisk {
         todo!()
     }
 
-    fn set_can_match(&self, can_match: bool) {
+    fn set_can_match(&self, _can_match: bool) {
         todo!()
     }
 

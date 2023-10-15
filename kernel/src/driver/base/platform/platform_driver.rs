@@ -4,16 +4,12 @@ use crate::{
     driver::base::device::{
         bus::Bus,
         driver::{driver_manager, Driver},
-        DevicePrivateData,
     },
     syscall::SystemError,
 };
 
-use super::{platform_bus, platform_device::PlatformDevice, CompatibleTable};
+use super::{platform_bus, platform_device::PlatformDevice};
 
-lazy_static! {
-    static ref PLATFORM_COMPAT_TABLE: CompatibleTable = CompatibleTable::new(vec!["platform"]);
-}
 /// @brief: 实现该trait的设备驱动实例应挂载在platform总线上，
 ///         同时应该实现Driver trait
 ///

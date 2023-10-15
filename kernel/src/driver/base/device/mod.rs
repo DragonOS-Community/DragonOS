@@ -29,7 +29,6 @@ use self::{
 use super::{
     kobject::{KObjType, KObject, KObjectManager, KObjectState},
     kset::KSet,
-    platform::CompatibleTable,
     swnode::software_node_notify,
 };
 
@@ -162,24 +161,13 @@ impl dyn Device {
 #[derive(Debug, Clone)]
 pub struct DevicePrivateData {
     id_table: IdTable,
-    resource: Option<DeviceResource>,
-    compatible_table: CompatibleTable,
     state: DeviceState,
 }
 
+#[allow(dead_code)]
 impl DevicePrivateData {
-    pub fn new(
-        id_table: IdTable,
-        resource: Option<DeviceResource>,
-        compatible_table: CompatibleTable,
-        state: DeviceState,
-    ) -> Self {
-        Self {
-            id_table,
-            resource,
-            compatible_table,
-            state,
-        }
+    pub fn new(id_table: IdTable, state: DeviceState) -> Self {
+        Self { id_table, state }
     }
 
     pub fn id_table(&self) -> &IdTable {
@@ -190,28 +178,8 @@ impl DevicePrivateData {
         self.state
     }
 
-    #[allow(dead_code)]
-    pub fn resource(&self) -> Option<&DeviceResource> {
-        self.resource.as_ref()
-    }
-
-    pub fn compatible_table(&self) -> &CompatibleTable {
-        &self.compatible_table
-    }
-
     pub fn set_state(&mut self, state: DeviceState) {
         self.state = state;
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceResource {
-    //可能会用来保存例如 IRQ PWM 内存地址等需要申请的资源，将来由资源管理器+Framework框架进行管理。
-}
-
-impl Default for DeviceResource {
-    fn default() -> Self {
-        return Self {};
     }
 }
 
@@ -256,6 +224,8 @@ impl DeviceNumber {
         self.0 & 0xff
     }
 
+    #[inline]
+    #[allow(dead_code)]
     pub fn from_major_minor(major: usize, minor: usize) -> usize {
         ((major & 0xffffff) << 8) | (minor & 0xff)
     }
@@ -497,7 +467,7 @@ impl DeviceManager {
     }
 
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
-    fn remove(&self, dev: &Arc<dyn Device>) {
+    fn remove(&self, _dev: &Arc<dyn Device>) {
         todo!("DeviceManager::remove")
     }
 
@@ -641,14 +611,14 @@ impl DeviceManager {
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=29885&fi=1100#1100
     pub fn device_driver_attach(
         &self,
-        driver: &Arc<dyn Driver>,
-        dev: &Arc<dyn Device>,
+        _driver: &Arc<dyn Driver>,
+        _dev: &Arc<dyn Device>,
     ) -> Result<(), SystemError> {
         todo!("device_driver_attach")
     }
 
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
-    pub fn device_driver_detach(&self, dev: &Arc<dyn Device>) {
+    pub fn device_driver_detach(&self, _dev: &Arc<dyn Device>) {
         todo!("device_driver_detach")
     }
 }

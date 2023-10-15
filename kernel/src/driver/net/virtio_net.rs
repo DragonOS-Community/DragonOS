@@ -11,11 +11,7 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 use crate::{
     driver::{
         base::{
-            device::{
-                bus::Bus,
-                driver::{Driver, DriverError},
-                Device, DevicePrivateData, DeviceResource, IdTable,
-            },
+            device::{bus::Bus, driver::Driver, Device, IdTable},
             kobject::{KObjType, KObject, KObjectState},
         },
         virtio::virtio_impl::HalImpl,
@@ -252,11 +248,11 @@ impl<T: Transport + 'static> Driver for VirtioInterface<T> {
         todo!()
     }
 
-    fn add_device(&self, device: Arc<dyn Device>) {
+    fn add_device(&self, _device: Arc<dyn Device>) {
         todo!()
     }
 
-    fn delete_device(&self, device: &Arc<dyn Device>) {
+    fn delete_device(&self, _device: &Arc<dyn Device>) {
         todo!()
     }
 
@@ -268,7 +264,7 @@ impl<T: Transport + 'static> Driver for VirtioInterface<T> {
         todo!()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
         todo!()
     }
 }
@@ -387,7 +383,7 @@ impl<T: Transport + 'static> KObject for VirtioInterface<T> {
         todo!()
     }
 
-    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
         todo!()
     }
 }

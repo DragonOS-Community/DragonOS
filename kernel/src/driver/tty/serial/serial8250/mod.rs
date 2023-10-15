@@ -8,7 +8,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use intertrait::cast::CastArc;
 
 use crate::{
     driver::{
@@ -44,11 +43,13 @@ static mut SERIAL8250_ISA_DEVICES: Option<Arc<Serial8250ISADevices>> = None;
 static mut SERIAL8250_ISA_DRIVER: Option<Arc<Serial8250ISADriver>> = None;
 
 #[inline(always)]
+#[allow(dead_code)]
 fn serial8250_isa_devices() -> &'static Arc<Serial8250ISADevices> {
     unsafe { SERIAL8250_ISA_DEVICES.as_ref().unwrap() }
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 fn serial8250_isa_driver() -> &'static Arc<Serial8250ISADriver> {
     unsafe { SERIAL8250_ISA_DRIVER.as_ref().unwrap() }
 }
@@ -84,12 +85,11 @@ impl Serial8250Manager {
         unsafe {
             SERIAL8250_ISA_DRIVER = Some(serial8250_isa_driver.clone());
         }
-
         // todo: 把端口绑定到isa_dev、 isa_driver上
-        // self.register_ports(&serial8250_isa_driver, &serial8250_isa_dev);
+        self.register_ports(&serial8250_isa_driver, &serial8250_isa_dev);
 
         // todo: 把驱动注册到uart层、tty层
-        // uart_manager().register_driver(&(serial8250_isa_driver.clone() as Arc<dyn UartDriver>))?;
+        uart_manager().register_driver(&(serial8250_isa_driver.clone() as Arc<dyn UartDriver>))?;
 
         // 注册isa设备到platform总线
         platform_device_manager()
@@ -124,10 +124,11 @@ impl Serial8250Manager {
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_add_one_port#3048
     pub(self) fn uart_add_one_port(
         &self,
-        uart_driver: &Arc<Serial8250ISADriver>,
-        port: &dyn UartPort,
+        _uart_driver: &Arc<Serial8250ISADriver>,
+        _port: &dyn UartPort,
     ) -> Result<(), SystemError> {
-        todo!("Serial8250Manager::uart_add_one_port")
+        return Ok(());
+        // todo!("Serial8250Manager::uart_add_one_port")
     }
 }
 
@@ -275,7 +276,7 @@ impl KObject for Serial8250ISADevices {
         Some(&DeviceKObjType)
     }
 
-    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
         todo!()
     }
 
@@ -435,19 +436,19 @@ impl PlatformDriver for Serial8250ISADriver {
         return Ok(());
     }
 
-    fn remove(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
+    fn remove(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
         todo!()
     }
 
-    fn shutdown(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
+    fn shutdown(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
         todo!()
     }
 
-    fn suspend(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
+    fn suspend(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
         todo!()
     }
 
-    fn resume(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
+    fn resume(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
         todo!()
     }
 }

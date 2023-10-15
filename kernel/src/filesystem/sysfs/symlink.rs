@@ -93,6 +93,7 @@ impl SysFS {
     /// - `inode`: 目录inode，在这个目录下创建符号链接
     /// - `target`: object we're pointing to.
     /// - `name`: 符号链接的名称
+    #[allow(dead_code)]
     pub(super) fn create_link_sd(
         &self,
         inode: &Arc<KernFSInode>,

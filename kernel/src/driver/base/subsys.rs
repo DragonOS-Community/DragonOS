@@ -170,6 +170,7 @@ impl SubSysPrivate {
         return Ok(());
     }
 
+    #[allow(dead_code)]
     pub fn remove_device_from_vec(&self, device: &Arc<dyn Device>) {
         let mut devices = self.devices.write();
         let device_weak = Arc::downgrade(device);

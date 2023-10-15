@@ -147,6 +147,7 @@ impl Serial8250PIOPort {
         return Ok(());
     }
 
+    #[allow(dead_code)]
     fn serial_received(&self) -> bool {
         if self.serial_in(5) & 1 != 0 {
             true
@@ -179,6 +180,7 @@ impl Serial8250PIOPort {
     }
 
     /// 读取一个字节
+    #[allow(dead_code)]
     fn read_one_byte(&self) -> u8 {
         while self.serial_received() == false {
             spin_loop();

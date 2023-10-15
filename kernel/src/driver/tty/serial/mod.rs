@@ -43,6 +43,7 @@ int_like!(BaudRate, AtomicBaudRate, u32, AtomicU32);
 int_like!(DivisorFraction, u32);
 
 #[inline(always)]
+#[allow(dead_code)]
 pub(super) fn uart_manager() -> &'static UartManager {
     &UartManager
 }
@@ -54,8 +55,8 @@ impl UartManager {
     /// todo: 把uart设备注册到tty层
     ///
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_register_driver#2720
-    pub fn register_driver(&self, driver: &Arc<dyn UartDriver>) -> Result<(), SystemError> {
-        todo!("UartManager::register_driver")
+    pub fn register_driver(&self, _driver: &Arc<dyn UartDriver>) -> Result<(), SystemError> {
+        return Ok(());
     }
 }
 

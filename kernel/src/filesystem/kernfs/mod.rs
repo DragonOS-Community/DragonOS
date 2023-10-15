@@ -591,6 +591,7 @@ impl KernFSInode {
         return self.private_data.lock();
     }
 
+    #[allow(dead_code)]
     pub fn symlink_target(&self) -> Option<Arc<KernFSInode>> {
         return self.inner.read().symlink_target.as_ref()?.upgrade();
     }

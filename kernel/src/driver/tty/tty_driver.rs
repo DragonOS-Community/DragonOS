@@ -26,6 +26,7 @@ pub trait TtyDriver: Debug + Send + Sync + Driver {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct TtyDriverMetadata {
     ///  name of the driver used in /proc/tty
     driver_name: &'static str,

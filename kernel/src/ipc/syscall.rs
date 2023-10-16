@@ -108,7 +108,7 @@ impl Syscall {
         unsafe { kdebug!("sigaction: sig={}, act={:?}", sig, *act,) };
         let mut old_act = old_act as *mut UserSigaction;
         let mut new_ka: Sigaction = Default::default();
-        let mut old_ka: Sigaction = Default::default();
+        let mut old_sigaction: Sigaction = Default::default();
         // 如果传入的，新的sigaction不为空
         if !act.is_null() {
             // 如果参数的范围不在用户空间，则返回错误
@@ -121,17 +121,14 @@ impl Syscall {
             match input_sighandler {
                 USER_SIG_DFL => {
                     new_ka = (*DEFAULT_SIGACTION).clone();
-                    *new_ka.flags_mut() = (unsafe { (*act).flags }
-                        & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
-                        | SigFlags::SA_FLAG_DFL;
+                    *new_ka.flags_mut() = unsafe { (*act).flags };
                     new_ka.set_restorer(None);
                 }
 
                 USER_SIG_IGN => {
                     new_ka = (*DEFAULT_SIGACTION_IGNORE).clone();
-                    *new_ka.flags_mut() = (unsafe { (*act).flags }
-                        & (!(SigFlags::SA_FLAG_DFL | SigFlags::SA_FLAG_IGN)))
-                        | SigFlags::SA_FLAG_IGN;
+                    *new_ka.flags_mut() = unsafe { (*act).flags };
+
                     new_ka.set_restorer(None);
                 }
                 _ => {
@@ -152,13 +149,14 @@ impl Syscall {
             // kdebug!("new_ka={:?}", new_ka);
             // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
             if new_ka.restorer().is_some() {
-                new_ka.flags_mut().insert(SigFlags::SA_FLAG_RESTORER);
-            } else {
-                kwarn!(
+                new_ka.flags_mut().insert(SigFlags::SA_RESTORER);
+            } else if new_ka.action().is_customized() {
+                kerror!(
                 "pid:{:?}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {}.",
                 ProcessManager::current_pcb().pid(),
                 sig
             );
+                return Err(SystemError::EINVAL);
             }
             *new_ka.mask_mut() = mask;
         }
@@ -179,7 +177,7 @@ impl Syscall {
             if old_act.is_null() {
                 None
             } else {
-                Some(&mut old_ka)
+                Some(&mut old_sigaction)
             },
         );
 
@@ -191,37 +189,31 @@ impl Syscall {
                 return Err(SystemError::EFAULT);
             }
 
-            let sah: u64;
-            if old_ka.flags().contains(SigFlags::SA_FLAG_DFL) {
-                sah = USER_SIG_DFL;
-            } else if old_ka.flags().contains(SigFlags::SA_FLAG_IGN) {
-                sah = USER_SIG_IGN;
-            } else {
-                sah = match old_ka.action() {
-                    SigactionType::SaHandler(handler) => {
-                        if let SaHandlerType::SigCustomized(hand) = handler {
-                            hand
-                        } else if handler.is_sig_ignore() {
-                            USER_SIG_IGN
-                        } else if handler.is_sig_error() {
-                            USER_SIG_ERR
-                        } else {
-                            USER_SIG_DFL
-                        }
-                    }
-                    SigactionType::SaSigaction(_) => {
-                        kerror!("unsupported type: SaSigaction");
+            let sigaction_handler: u64;
+            sigaction_handler = match old_sigaction.action() {
+                SigactionType::SaHandler(handler) => {
+                    if let SaHandlerType::SigCustomized(hand) = handler {
+                        hand
+                    } else if handler.is_sig_ignore() {
+                        USER_SIG_IGN
+                    } else if handler.is_sig_error() {
+                        USER_SIG_ERR
+                    } else {
                         USER_SIG_DFL
                     }
                 }
-            }
+                SigactionType::SaSigaction(_) => {
+                    kerror!("unsupported type: SaSigaction");
+                    USER_SIG_DFL
+                }
+            };
 
             unsafe {
-                (*old_act).handler = sah as *mut c_void;
-                (*old_act).flags = old_ka.flags();
-                (*old_act).mask = old_ka.mask();
-                if old_ka.restorer().is_some() {
-                    (*old_act).restorer = old_ka.restorer().unwrap() as *mut c_void;
+                (*old_act).handler = sigaction_handler as *mut c_void;
+                (*old_act).flags = old_sigaction.flags();
+                (*old_act).mask = old_sigaction.mask();
+                if old_sigaction.restorer().is_some() {
+                    (*old_act).restorer = old_sigaction.restorer().unwrap() as *mut c_void;
                 }
             }
         }

@@ -1,6 +1,6 @@
 use core::{ffi::c_void, mem::size_of, sync::atomic::AtomicI64};
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     arch::{
@@ -28,7 +28,7 @@ pub const USER_SIG_IGN: u64 = 1;
 pub const USER_SIG_ERR: u64 = 2;
 
 // 因为 Rust 编译器不能在常量声明中正确识别级联的 "|" 运算符(experimental feature： https://github.com/rust-lang/rust/issues/67792)，因此
-// 暂时只能通过这种方法来声明这些常量
+// 暂时只能通过这种方法来声明这些常量，这些常量暂时没有全部用到，但是都出现在 linux 的判断逻辑中，所以都保留下来了
 #[allow(dead_code)]
 pub const SIG_KERNEL_ONLY_MASK: SigSet =
     Signal::into_sigset(Signal::SIGSTOP).union(Signal::into_sigset(Signal::SIGKILL));
@@ -62,14 +62,16 @@ pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
 #[derive(Debug)]
 pub struct SignalStruct {
     pub cnt: AtomicI64,
-    pub handler: Arc<SigHandStruct>,
+    /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
+    /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
+    pub handlers: [Sigaction; MAX_SIG_NUM as usize],
 }
 
 impl Default for SignalStruct {
     fn default() -> Self {
         Self {
             cnt: Default::default(),
-            handler: Default::default(),
+            handlers: [Sigaction::default(); MAX_SIG_NUM as usize],
         }
     }
 }
@@ -87,6 +89,21 @@ pub enum SigactionType {
             ),
         >,
     ), // 暂时没有用上
+}
+
+impl SigactionType {
+    /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigIgnore)`].
+    ///
+    /// [`SigIgnore`]: SaHandlerType::SigIgnore
+    pub fn is_ignore(&self) -> bool {
+        return matches!(self, Self::SaHandler(SaHandlerType::SigIgnore));
+    }
+    /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigCustomized(_))`].
+    ///
+    /// [`SigCustomized`]: SaHandlerType::SigCustomized(_)
+    pub fn is_customized(&self) -> bool {
+        return matches!(self, Self::SaHandler(SaHandlerType::SigCustomized(_)));
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -155,7 +172,7 @@ impl Default for Sigaction {
 }
 
 impl Sigaction {
-    /// 判断传入的信号是否被忽略，包括了 flag 位为 Ignore 和默认处理函数为 Ignore 的情况
+    /// 判断传入的信号是否被忽略
     ///
     /// ## 参数
     ///
@@ -165,17 +182,8 @@ impl Sigaction {
     ///
     /// - `true` 被忽略
     /// - `false`未被忽略
-    pub fn ignore(&self, _sig: Signal) -> bool {
-        if self.flags.contains(SigFlags::SA_FLAG_IGN) {
-            return true;
-        }
-        //sa_flags为SA_FLAG_DFL,但是默认处理函数为忽略的情况的判断
-        if self.flags().contains(SigFlags::SA_FLAG_DFL) {
-            if let SigactionType::SaHandler(SaHandlerType::SigIgnore) = self.action {
-                return true;
-            }
-        }
-        return false;
+    pub fn is_ignore(&self) -> bool {
+        return self.action.is_ignore();
     }
     pub fn new(
         action: SigactionType,
@@ -230,9 +238,9 @@ impl Sigaction {
 #[derive(Debug, Clone, Copy)]
 pub struct UserSigaction {
     pub handler: *mut core::ffi::c_void,
-    pub mask: SigSet,
     pub flags: SigFlags,
     pub restorer: *mut core::ffi::c_void,
+    pub mask: SigSet,
 }
 
 /**
@@ -299,15 +307,6 @@ impl SigInfo {
             errno: sig_errno,
             sig_type,
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct SigHandStruct(pub [Sigaction; MAX_SIG_NUM as usize]);
-
-impl Default for SigHandStruct {
-    fn default() -> Self {
-        SigHandStruct([Sigaction::default(); MAX_SIG_NUM as usize])
     }
 }
 

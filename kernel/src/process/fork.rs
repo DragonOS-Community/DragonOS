@@ -5,7 +5,10 @@ use alloc::{string::ToString, sync::Arc};
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::procfs::procfs_register_pid,
-    ipc::{signal::flush_signal_handlers, signal_types::SigHandStruct},
+    ipc::{
+        signal::flush_signal_handlers,
+        signal_types::{Sigaction, MAX_SIG_NUM},
+    },
     kdebug, kerror,
     libs::rwlock::RwLock,
     process::ProcessFlags,
@@ -214,11 +217,6 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         kdebug!("process_copy_sighand");
 
-        // 因为在信号处理里面，我们没有使用内部可变的锁来保护 Arc 的只读特性，而是通过裸指针绕过了这个规则
-        // 所以不能跨进程直接复制 Arc 指针，只能重新创建一个实例
-        let sig_hand_struct: Arc<SigHandStruct> = Arc::new(SigHandStruct::default());
-
-        new_pcb.sig_struct().handler = sig_hand_struct;
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
         if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
@@ -230,25 +228,7 @@ impl ProcessManager {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            let new_sig_hand_struct: &mut SigHandStruct;
-            let sig_hand_struct_ptr =
-                Arc::as_ptr(&new_pcb.sig_struct_irq().handler) as *mut SigHandStruct;
-            unsafe {
-                let r = sig_hand_struct_ptr.as_mut();
-                if r.is_none() {
-                    kerror!(
-                        "error to copy sig action since the convertion from raw pointer failed"
-                    );
-                    return Err(SystemError::EINVAL);
-                }
-                new_sig_hand_struct = r.unwrap();
-            }
-            let current_sig_hand_struct = current_pcb.sig_struct();
-            for (index, action) in new_sig_hand_struct.0.iter_mut().enumerate() {
-                compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                (*action) = current_sig_hand_struct.handler.0[index].clone();
-                compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            }
+            (*new_pcb.sig_struct()).handlers = current_pcb.sig_struct().handlers.clone();
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         return Ok(());

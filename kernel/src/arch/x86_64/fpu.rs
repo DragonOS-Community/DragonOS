@@ -68,14 +68,7 @@ impl FpState {
     /// 清空浮点寄存器
     #[allow(dead_code)]
     pub fn clear(&mut self) {
-        kdebug!("before restore: fp={self:?}");
         *self = Self::default();
-        kdebug!("before assignment: fp={self:?}");
-        compiler_fence(Ordering::SeqCst);
-        //         XMM00=0000000000000000 0000000000000000 XMM01=0000000000000400 00007000000015e0
-        // XMM02=00000000200d3c98 00007000000000a0 XMM03=0000000000000000 0000000000000000
         self.restore();
-        kdebug!("after restore: fp={self:?}");
-        kdebug!("restore ok");
     }
 }

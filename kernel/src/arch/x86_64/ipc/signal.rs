@@ -11,7 +11,7 @@ use crate::{
     exception::InterruptArch,
     include::bindings::bindings::USER_MAX_LINEAR_ADDR,
     ipc::{
-        signal::{get_signal_to_deliver, set_current_sig_blocked},
+        signal::set_current_sig_blocked,
         signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, MAX_SIG_NUM},
     },
     kdebug, kerror,
@@ -184,13 +184,18 @@ impl SigCode {
 }
 
 bitflags! {
+    #[repr(C,align(8))]
     #[derive(Default)]
     pub struct SigFlags:u32{
-        const SA_FLAG_DFL= 1 << 0; // 当前sigaction表示系统默认的动作
-        const SA_FLAG_IGN = 1 << 1; // 当前sigaction表示忽略信号的动作
-        const SA_FLAG_RESTORER = 1 << 2; // 当前sigaction具有用户指定的restorer
-        const SA_FLAG_IMMUTABLE = 1 << 3; // 当前sigaction不可被更改
-        const SA_FLAG_ALL = Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_DFL.bits()|Self::SA_FLAG_IGN.bits()|Self::SA_FLAG_IMMUTABLE.bits()|Self::SA_FLAG_RESTORER.bits();
+        const SA_NOCLDSTOP =  1;
+        const SA_NOCLDWAIT = 2;
+        const SA_SIGINFO   = 4;
+        const SA_ONSTACK   = 0x08000000;
+        const SA_RESTART   = 0x10000000;
+        const SA_NODEFER  = 0x40000000;
+        const SA_RESETHAND = 0x80000000;
+        const SA_RESTORER   =0x04000000;
+        const SA_ALL = Self::SA_NOCLDSTOP.bits()|Self::SA_NOCLDWAIT.bits()|Self::SA_NODEFER.bits()|Self::SA_ONSTACK.bits()|Self::SA_RESETHAND.bits()|Self::SA_RESTART.bits()|Self::SA_SIGINFO.bits()|Self::SA_RESTORER.bits();
     }
 
     /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，Signal-1才是sigset_t中对应的位
@@ -251,6 +256,7 @@ pub struct SigFrame {
     pub context: SigContext,
 }
 
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct SigContext {
     /// sigcontext的标志位
@@ -285,7 +291,6 @@ impl SigContext {
         // context.err_code = unsafe { (*current_thread).err_code };
         // context.cr2 = unsafe { (*current_thread).cr2 };
         self.reserved_for_x87_state = ProcessManager::current_pcb().arch_info().fp_state();
-        kdebug!("1:{:?}", self.reserved_for_x87_state);
         return Ok(0);
     }
 
@@ -300,13 +305,12 @@ impl SigContext {
         let guard = ProcessManager::current_pcb();
         let mut arch_info = guard.arch_info();
         (*frame) = self.frame.clone();
-
+        kdebug!("restored frame:{:?}", frame);
         // (*current_thread).trap_num = (*context).trap_num;
         *arch_info.cr2_mut() = self.cr2 as usize;
         // (*current_thread).err_code = (*context).err_code;
         // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
         *arch_info.fp_state_mut() = self.reserved_for_x87_state.clone();
-        kdebug!("1:{:?}", self.reserved_for_x87_state);
         arch_info.restore_fp_state();
         return true;
     }
@@ -341,31 +345,67 @@ impl SignalArch for X86_64SignalArch {
 
         // 做完上面的检查后，开中断
         CurrentIrqArch::interrupt_enable();
-
-        let oldset = ProcessManager::current_pcb().sig_info().sig_block();
+        let pcb = ProcessManager::current_pcb();
+        let sig_guard = pcb.sig_struct();
+        let mut sig_number: Signal;
+        let mut info: Option<SigInfo>;
+        let sigaction: Option<&mut Sigaction>;
+        let mut tmp_ka: Sigaction;
+        let reader = pcb.sig_info();
+        let sig_block: SigSet = reader.sig_block().clone();
+        drop(reader);
         loop {
-            let (sig_number, info, ka) = get_signal_to_deliver(&frame.clone());
-            // 所有的信号都处理完了
+            (sig_number, info) = pcb.sig_info_mut().dequeue_signal(&sig_block);
+            // 如果信号非法，则直接返回
             if sig_number == Signal::INVALID {
                 return;
             }
-            assert!(ka.is_some());
-            let res: Result<i32, SystemError> =
-                handle_signal(sig_number, ka.unwrap(), &info.unwrap(), &oldset, frame);
-            if res.is_err() {
-                kerror!(
-                    "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
-                    sig_number as i32,
-                    ProcessManager::current_pcb().pid(),
-                    res.unwrap_err()
-                );
+
+            tmp_ka = sig_guard.handlers[sig_number as usize - 1];
+            match tmp_ka.action() {
+                SigactionType::SaHandler(action_type) => match action_type {
+                    SaHandlerType::SigError => {
+                        kerror!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
+                        return;
+                    }
+                    SaHandlerType::SigDefault => {
+                        tmp_ka = Sigaction::default();
+                        sigaction = Some(&mut tmp_ka);
+                        break;
+                    }
+                    SaHandlerType::SigIgnore => continue,
+                    SaHandlerType::SigCustomized(_) => {
+                        sigaction = Some(&mut tmp_ka);
+                        break;
+                    }
+                },
+                SigactionType::SaSigaction(_) => todo!(),
             }
+            // 如果当前动作是忽略这个信号，就继续循环。
+        }
+        // 所有的信号都处理完了
+        assert!(sigaction.is_some());
+        let oldset = ProcessManager::current_pcb().sig_info().sig_block();
+        let res: Result<i32, SystemError> = handle_signal(
+            sig_number,
+            sigaction.unwrap(),
+            &info.unwrap(),
+            &oldset,
+            frame,
+        );
+        if res.is_err() {
+            kerror!(
+                "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
+                sig_number as i32,
+                ProcessManager::current_pcb().pid(),
+                res.unwrap_err()
+            );
         }
     }
 
     #[no_mangle]
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
-        kdebug!("--sigreturning");
+        kdebug!("trap_frame in sigreturn:{:?}", trap_frame);
         let frame = (trap_frame.rsp as usize) as *mut SigFrame;
 
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
@@ -391,7 +431,7 @@ impl SignalArch for X86_64SignalArch {
 /// @brief 真正发送signal，执行自定义的处理函数
 ///
 /// @param sig 信号number
-/// @param ka 信号响应动作
+/// @param sigaction 信号响应动作
 /// @param info 信号信息
 /// @param oldset
 /// @param regs 之前的系统调用将要返回的时候，要弹出的栈帧的拷贝
@@ -407,7 +447,6 @@ fn handle_signal(
     // TODO 这里要补充一段逻辑，好像是为了保证引入线程之后的地址空间不会出问题。详见https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/mips/kernel/signal.c#830
 
     // 设置栈帧
-
     return setup_frame(sig, sigaction, info, oldset, frame);
 }
 
@@ -421,6 +460,68 @@ fn setup_frame(
     oldset: &SigSet,
     trap_frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
+    let ret_code_ptr: *mut c_void;
+    let temp_handler: *mut c_void;
+    match sigaction.action() {
+        SigactionType::SaHandler(handler_type) => match handler_type {
+            SaHandlerType::SigDefault => {
+                sig_default_handler(sig);
+                return Ok(0);
+            }
+            SaHandlerType::SigCustomized(handler) => {
+                // 如果handler位于内核空间
+                if handler >= USER_MAX_LINEAR_ADDR {
+                    // 如果当前是SIGSEGV,则采用默认函数处理
+                    if sig == Signal::SIGSEGV {
+                        sig_default_handler(sig);
+                        return Ok(0);
+                    } else {
+                        kerror!("attempting  to execute a signal handler from kernel");
+                        sig_default_handler(sig);
+                        return Err(SystemError::EINVAL);
+                    }
+                } else {
+                    // 为了与Linux的兼容性，64位程序必须由用户自行指定restorer
+                    if sigaction.flags().contains(SigFlags::SA_RESTORER) {
+                        ret_code_ptr = sigaction.restorer().unwrap() as usize as *mut c_void;
+                    } else {
+                        kerror!(
+                            "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
+                            ProcessManager::current_pcb().pid(),
+                            sig as i32
+                        );
+                        let r = Syscall::kill(
+                            ProcessManager::current_pcb().pid(),
+                            Signal::SIGSEGV as i32,
+                        );
+                        if r.is_err() {
+                            kerror!("In setup_sigcontext: generate SIGSEGV signal failed");
+                        }
+                        return Err(SystemError::EINVAL);
+                    }
+                    if sigaction.restorer().is_none() {
+                        kerror!(
+                            "restorer in process:{:?} is not defined",
+                            ProcessManager::current_pcb().pid()
+                        );
+                        return Err(SystemError::EINVAL);
+                    }
+                    temp_handler = handler as usize as *mut c_void;
+                }
+            }
+            SaHandlerType::SigIgnore => {
+                return Ok(0);
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        },
+        SigactionType::SaSigaction(_) => {
+            //TODO 这里应该是可以恢复栈的，等后续来做
+            kerror!("trying to recover from sigaction type instead of handler");
+            return Err(SystemError::EINVAL);
+        }
+    }
     let frame: *mut SigFrame = get_stack(&trap_frame, size_of::<SigFrame>());
     // kdebug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
@@ -461,90 +562,26 @@ fn setup_frame(
             })?
     };
 
-    kdebug!("sigaction:{:?}", sigaction);
-    match sigaction.action() {
-        SigactionType::SaHandler(handler_type) => match handler_type {
-            SaHandlerType::SigDefault => {
-                sig_default_handler(sig);
-                return Ok(0);
-            }
-            SaHandlerType::SigCustomized(handler) => {
-                // 如果handler位于内核空间
-                if handler >= USER_MAX_LINEAR_ADDR {
-                    // 如果当前是SIGSEGV,则采用默认函数处理
-                    if sig == Signal::SIGSEGV {
-                        sigaction.flags_mut().insert(SigFlags::SA_FLAG_DFL);
-                        sig_default_handler(sig);
-                        return Ok(0);
-                    } else {
-                        kerror!("attempting  to execute a signal handler from kernel");
-                        sig_default_handler(sig);
-                        return Err(SystemError::EINVAL);
-                    }
-                } else {
-                    // 为了与Linux的兼容性，64位程序必须由用户自行指定restorer
-                    if sigaction.flags().contains(SigFlags::SA_FLAG_RESTORER) {
-                        unsafe {
-                            // 在开头检验过sigaction.restorer是否为空了，实际上libc会保证 restorer始终不为空
-                            (*frame).ret_code_ptr =
-                                sigaction.restorer().unwrap() as usize as *mut c_void;
-                        }
-                    } else {
-                        kerror!(
-                            "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
-                            ProcessManager::current_pcb().pid(),
-                            sig as i32
-                        );
-                        let r = Syscall::kill(
-                            ProcessManager::current_pcb().pid(),
-                            Signal::SIGSEGV as i32,
-                        );
-                        if r.is_err() {
-                            kerror!("In setup_sigcontext: generate SIGSEGV signal failed");
-                        }
-                        return Err(SystemError::EINVAL);
-                    }
-                    if sigaction.restorer().is_none() {
-                        kerror!(
-                            "restorer in process:{:?} is not defined",
-                            ProcessManager::current_pcb().pid()
-                        );
-                        return Err(SystemError::EINVAL);
-                    }
-                    unsafe { (*frame).handler = handler as usize as *mut c_void };
-                }
-            }
-            SaHandlerType::SigIgnore => {
-                return Ok(0);
-            }
-            _ => {
-                return Err(SystemError::EINVAL);
-            }
-        },
-        SigactionType::SaSigaction(_) => {
-            //TODO 这里应该是可以恢复栈的，等后续来做
-            kerror!("trying to recover from sigaction type instead of handler");
-            return Err(SystemError::EINVAL);
-        }
-    }
     // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
     ProcessManager::current_pcb().arch_info().clear_fp_state();
-    // CR0=80000013 CR2=0000000000000000 CR3=000000001fde3000 CR4=00000620
+    unsafe {
+        // 在开头检验过sigaction.restorer是否为空了，实际上libc会保证 restorer始终不为空
+        (*frame).ret_code_ptr = ret_code_ptr;
+    }
 
+    unsafe { (*frame).handler = temp_handler };
     // 传入信号处理函数的第一个参数
     trap_frame.rdi = sig as u64;
     trap_frame.rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
     trap_frame.rsp = frame as u64;
     trap_frame.rip = unsafe { (*frame).handler as u64 };
-
+    kdebug!("trap_frame{:?}", trap_frame);
     // 设置cs和ds寄存器
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
     trap_frame.ds = (USER_DS.bits() | 0x3) as u64;
 
     // 禁用中断
     // trap_frame.rflags &= !(0x200);
-
-    kdebug!("trap_frame: {trap_frame:?}");
 
     return Ok(0);
 }

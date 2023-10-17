@@ -93,7 +93,7 @@ impl ProcessManager {
         let name = current_pcb.basic().name().to_string();
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
-        Self::copy_process(&clone_flags, &current_pcb, &pcb, current_trapframe)?;
+        Self::copy_process(&clone_flags, &current_pcb, &pcb, None, current_trapframe)?;
 
         ProcessManager::add_pcb(pcb.clone());
 
@@ -218,6 +218,7 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         pcb: &Arc<ProcessControlBlock>,
+        usp: Option<usize>,
         current_trapframe: &mut TrapFrame,
     ) -> Result<(), SystemError> {
         // 不允许与不同命名空间的进程共享根目录
@@ -303,7 +304,7 @@ impl ProcessManager {
         // todo: 拷贝信号相关数据
 
         // 拷贝线程
-        Self::copy_thread(&clone_flags, &current_pcb, &pcb, &current_trapframe).unwrap_or_else(|e| {
+        Self::copy_thread(&clone_flags, &current_pcb, &pcb, usp ,&current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e

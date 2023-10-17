@@ -235,6 +235,7 @@ impl ProcessManager {
         _clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
+        usp: Option<usize>,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let mut child_trapframe = current_trapframe.clone();
@@ -255,6 +256,10 @@ impl ProcessManager {
 
         // 拷贝栈帧
         unsafe {
+            if usp.is_some() {
+                child_trapframe.rbp = usp.unwrap() as u64 + 11*core::mem::size_of::<usize>() as u64;
+                child_trapframe.rsp = usp.unwrap() as u64;
+            }
             let trap_frame_ptr = trap_frame_vaddr.data() as *mut TrapFrame;
             *trap_frame_ptr = child_trapframe;
         }
@@ -276,7 +281,6 @@ impl ProcessManager {
 
         if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
             let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
-
             new_arch_guard.rip = kthread_bootstrap_stage1_func_addr;
         } else {
             new_arch_guard.rip = ret_from_intr as usize;

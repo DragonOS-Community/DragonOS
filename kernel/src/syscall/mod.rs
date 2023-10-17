@@ -379,6 +379,8 @@ pub const SYS_MKNOD: usize = 53;
 
 pub const SYS_CLONE: usize = 54;
 
+pub const SYS_FUTEX: usize = 55;
+
 #[derive(Debug)]
 pub struct Syscall;
 

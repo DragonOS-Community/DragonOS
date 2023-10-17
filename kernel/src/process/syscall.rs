@@ -213,8 +213,6 @@ impl Syscall {
         child_tid: usize,
         tls: usize,
     ) -> Result<usize, SystemError> {
-        //
-
         if flags.contains(CloneFlags::CLONE_PIDFD)
             && flags.contains(CloneFlags::CLONE_PARENT_SETTID)
         {
@@ -235,18 +233,30 @@ impl Syscall {
         }
 
         // 克隆pcb
-        ProcessManager::copy_process(&flags, &current_pcb, &pcb, current_trapframe)?;
+        ProcessManager::copy_process(
+            &flags,
+            &current_pcb,
+            &pcb,
+            Some(child_stack),
+            current_trapframe,
+        )?;
 
-        // 设置用户栈
-        unsafe {
-            pcb.basic_mut()
-                .user_vm()
-                .expect("No user_vm found")
-                .write()
-                .user_stack_mut()
-                .expect("No user stack found")
-                .set_sp(VirtAddr::new(child_stack))
-        };
+        let address_scope = pcb.basic_mut().user_vm().expect("No user_vm found");
+
+        // // 为进程建立新用户栈
+        // address_scope.new_user_stack(
+        //     VirtAddr::new(child_stack + 11 * core::mem::size_of::<usize>()),
+        //     UserStack::DEFAULT_USER_STACK_SIZE,
+        // )?;
+
+        // // 设置栈指针
+        // address_scope.set_user_stack_sp(VirtAddr::new(child_stack));
+
+        // // 获取栈帧
+        // pcb.arch_info().set_stack(VirtAddr::new(child_stack));
+        // pcb.arch_info().set_stack_base(VirtAddr::new(
+        //     child_stack
+        // ));
 
         if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
             // TODO: 设置parenttid

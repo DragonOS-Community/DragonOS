@@ -19,7 +19,7 @@ use crate::{
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    process::Pid,
+    process::{fork::CloneFlags, Pid},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
@@ -376,6 +376,10 @@ pub const SYS_GETPGID: usize = 50;
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
 pub const SYS_MKNOD: usize = 53;
+
+pub const SYS_CLONE: usize = 54;
+
+pub const SYS_FUTEX: usize = 55;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -957,6 +961,15 @@ impl Syscall {
                 let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
                 Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
             }
+
+            SYS_CLONE => Self::clone(
+                frame,
+                CloneFlags::from_bits_truncate(args[0] as u64),
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+            ),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

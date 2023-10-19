@@ -3,15 +3,8 @@ use core::sync::atomic::compiler_fence;
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame,
-    filesystem::procfs::procfs_register_pid,
-    ipc::{
-        signal::flush_signal_handlers,
-        signal_types::{Sigaction, MAX_SIG_NUM},
-    },
-    kdebug, kerror,
-    libs::rwlock::RwLock,
-    process::ProcessFlags,
+    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid,
+    ipc::signal::flush_signal_handlers, kdebug, libs::rwlock::RwLock, process::ProcessFlags,
     syscall::SystemError,
 };
 
@@ -97,14 +90,13 @@ impl ProcessManager {
             )
         });
 
+        //拷贝信号相关数据
         ProcessManager::copy_sighand(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighands from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
             )
         });
-
-        // todo: 拷贝信号相关数据
 
         // 拷贝线程
         ProcessManager::copy_thread(&clone_flags, &current_pcb, &pcb, &current_trapframe).unwrap_or_else(|e| {

@@ -593,8 +593,10 @@ fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
 
     // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小 并且16字节对齐
     let mut rsp: usize = (frame.rsp as usize) - 128 - size;
-    // 按照要求进行对齐
-    rsp &= (!(STACK_ALIGN - 1)) as usize;
+    // 按照要求进行对齐，别问为什么减8，不减8就是错的，可以看
+    // https://sourcegraph.com/github.com/torvalds/linux@dd72f9c7e512da377074d47d990564959b772643/-/blob/arch/x86/kernel/signal.c?L124
+    // 我猜测是跟x86汇编的某些弹栈行为有关系，它可能会出于某种原因递增 rsp
+    rsp &= (!(STACK_ALIGN - 1)) as usize - 8;
     // rsp &= (!(STACK_ALIGN - 1)) as usize;
     return rsp as *mut SigFrame;
 }

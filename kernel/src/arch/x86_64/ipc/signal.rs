@@ -385,7 +385,11 @@ impl SignalArch for X86_64SignalArch {
         }
         // 所有的信号都处理完了
         assert!(sigaction.is_some());
-        let oldset = ProcessManager::current_pcb().sig_info().sig_block();
+        let reader = pcb.sig_info();
+        let oldset = reader.sig_block().clone();
+        //避免死锁
+        drop(reader);
+        drop(sig_guard);
         let res: Result<i32, SystemError> = handle_signal(
             sig_number,
             sigaction.unwrap(),

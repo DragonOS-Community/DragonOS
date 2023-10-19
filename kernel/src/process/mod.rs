@@ -36,11 +36,12 @@ use crate::{
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     sched::{
+        cfs::__get_cfs_scheduler,
         core::{sched_enqueue, CPU_EXECUTING},
         SchedPolicy, SchedPriority,
     },
-    smp::kick_cpu,
-    syscall::SystemError,
+    smp::{core::smp_get_processor_id, kick_cpu},
+    syscall::{Syscall, SystemError},
 };
 
 use self::kthread::WorkerPrivate;
@@ -276,6 +277,19 @@ impl ProcessManager {
                     .adopt_childen()
                     .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
             };
+            let r = current.parent_pcb.read().upgrade();
+            if r.is_none() {
+                return;
+            }
+            let parent_pcb = r.unwrap();
+            let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
+            if r.is_err() {
+                kwarn!(
+                    "failed to send kill signal to {:?}'s parent pcb {:?}",
+                    current.pid(),
+                    parent_pcb.pid()
+                );
+            }
             // todo: 当信号机制重写后，这里需要向父进程发送SIGCHLD信号
         }
     }

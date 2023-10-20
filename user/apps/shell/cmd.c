@@ -14,8 +14,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define MAX_PATH_LEN 4096
+
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
+
 /**
  * @brief shell 内建函数的主命令与处理函数的映射表
  *
@@ -181,9 +184,12 @@ int shell_cmd_cd(int argc, char **argv)
         if (ec == 0)
         {
             // 获取新的路径字符串
-            char *new_path = (char *)malloc(4096);
-            memset(new_path, 0, 4096);
-            getcwd(new_path, 4096);
+            char *new_path = (char *)malloc(MAX_PATH_LEN);
+            if (new_path==NULL) {
+                goto fail;
+            }
+            memset(new_path, 0, MAX_PATH_LEN);
+            getcwd(new_path, MAX_PATH_LEN);
 
             // 释放原有的路径字符串的内存空间
             free(shell_current_path);
@@ -227,9 +233,12 @@ int shell_cmd_cd(int argc, char **argv)
             free(new_path);
             free(shell_current_path);
 
-            char * pwd = malloc(4096);
-            memset(pwd, 0, 4096);
-            getcwd(pwd, 4096);
+            char * pwd = malloc(MAX_PATH_LEN);
+            if (pwd==NULL) {
+                goto fail;
+            }
+            memset(pwd, 0, MAX_PATH_LEN);
+            getcwd(pwd, MAX_PATH_LEN);
             shell_current_path = pwd;
             goto done;
         }

@@ -20,7 +20,7 @@ use crate::{
     syscall::SystemError,
 };
 
-use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
+use super::{serial::serial_init, TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
 
 lazy_static! {
     /// 所有TTY设备的B树。用于根据名字，找到Arc<TtyDevice>
@@ -283,17 +283,6 @@ impl TtyDevicePrivateData {
     }
 }
 
-/// @brief 导出到C的tty初始化函数
-#[no_mangle]
-pub extern "C" fn rs_tty_init() -> i32 {
-    let r = tty_init();
-    if r.is_ok() {
-        return 0;
-    } else {
-        return r.unwrap_err().to_posix_errno();
-    }
-}
-
 /// @brief 初始化TTY设备
 pub fn tty_init() -> Result<(), SystemError> {
     let tty: Arc<TtyDevice> = TtyDevice::new("tty0");
@@ -322,5 +311,6 @@ pub fn tty_init() -> Result<(), SystemError> {
         return Err(devfs_root_inode.unwrap_err());
     }
 
+    serial_init()?;
     return Ok(());
 }

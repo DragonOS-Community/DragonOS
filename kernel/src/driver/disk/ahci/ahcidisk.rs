@@ -3,11 +3,12 @@ use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::SeekFrom;
 use crate::driver::base::device::bus::Bus;
+use crate::driver::base::device::driver::Driver;
 use crate::driver::base::device::{Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
 use crate::driver::base::kset::KSet;
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
-use crate::driver::Driver;
+
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 use crate::include::bindings::bindings::verify_area;
@@ -489,6 +490,10 @@ impl KObject for LockedAhciDisk {
     fn set_parent(&self, _parent: Option<Weak<dyn KObject>>) {
         todo!()
     }
+
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
+        todo!()
+    }
 }
 
 impl Device for LockedAhciDisk {
@@ -504,6 +509,10 @@ impl Device for LockedAhciDisk {
         todo!("LockedAhciDisk::bus()")
     }
 
+    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
+        todo!("LockedAhciDisk::set_bus()")
+    }
+
     fn driver(&self) -> Option<Arc<dyn Driver>> {
         todo!("LockedAhciDisk::driver()")
     }
@@ -512,8 +521,20 @@ impl Device for LockedAhciDisk {
         false
     }
 
-    fn set_driver(&self, _driver: Option<Arc<dyn Driver>>) {
+    fn set_driver(&self, _driver: Option<Weak<dyn Driver>>) {
         todo!("LockedAhciDisk::set_driver()")
+    }
+
+    fn can_match(&self) -> bool {
+        todo!()
+    }
+
+    fn set_can_match(&self, _can_match: bool) {
+        todo!()
+    }
+
+    fn state_synced(&self) -> bool {
+        todo!()
     }
 }
 

@@ -20,3 +20,5 @@ pub use self::pci::pci::X86_64PciArch as PciArch;
 pub use self::mm::X86_64MMArch as MMArch;
 
 pub use interrupt::X86_64InterruptArch as CurrentIrqArch;
+
+pub use crate::arch::asm::pio::X86_64PortIOArch as CurrentPortIOArch;

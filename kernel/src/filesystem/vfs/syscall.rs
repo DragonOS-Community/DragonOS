@@ -23,7 +23,7 @@ use super::{
     fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE,
+    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 pub const SEEK_SET: u32 = 0;
@@ -156,7 +156,8 @@ impl Syscall {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         let inode: Arc<dyn IndexNode> = if inode.is_err() {
             let errno = inode.unwrap_err();
@@ -344,13 +345,14 @@ impl Syscall {
                 new_path = String::from("/");
             }
         }
-        let inode = match ROOT_INODE().lookup(&new_path) {
-            Err(e) => {
-                kerror!("Change Directory Failed, Error = {:?}", e);
-                return Err(SystemError::ENOENT);
-            }
-            Ok(i) => i,
-        };
+        let inode =
+            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+                Err(e) => {
+                    kerror!("Change Directory Failed, Error = {:?}", e);
+                    return Err(SystemError::ENOENT);
+                }
+                Ok(i) => i,
+            };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(String::from(new_path));
@@ -730,7 +732,8 @@ impl Syscall {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
@@ -739,7 +742,8 @@ impl Syscall {
         let (filename, parent_path) = rsplit_path(path);
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
+            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         // 创建nod
         parent_inode.mknod(filename, mode, dev_t)?;
 

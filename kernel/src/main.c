@@ -27,18 +27,16 @@
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
 #include <driver/timers/HPET/HPET.h>
-#include <driver/uart/uart.h>
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
 
 extern int rs_driver_init();
- extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
-extern int rs_video_init();
 extern void rs_kthread_init();
 extern void rs_init_intertrait();
+extern void rs_init_before_mem_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -72,10 +70,8 @@ void reload_idt()
 // 初始化系统各模块
 void system_initialize()
 {
-    c_uart_init(COM1, 115200);
+    rs_init_before_mem_init();
 
-    rs_video_init();
-    scm_init();
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 
@@ -131,7 +127,6 @@ void system_initialize()
     vfs_init();
     
     rs_driver_init();
-    rs_tty_init();
 
     rs_kthread_init();
     io_mfence();

@@ -14,7 +14,6 @@ use crate::{
             ioctl::IoctlCmd,
             syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
             ROOT_INODE,
-        ,
         },
     },
     kerror, kinfo,

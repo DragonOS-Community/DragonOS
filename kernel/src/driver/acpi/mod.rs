@@ -1,56 +1,90 @@
 use core::{fmt::Debug, ptr::NonNull};
 
 use acpi::AcpiHandler;
+use alloc::{string::ToString, sync::Arc};
 
 use crate::{
+    driver::base::firmware::sys_firmware_kset,
     kinfo,
-    libs::{
-        align::{page_align_down, page_align_up},
-        once::Once,
-    },
+    libs::align::{page_align_down, page_align_up},
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr, VirtAddr,
     },
+    syscall::SystemError,
 };
+
+use super::base::kset::KSet;
+
+extern crate acpi;
 
 pub mod bus;
 mod c_adapter;
 pub mod glue;
 pub mod old;
-
-extern crate acpi;
+mod sysfs;
 
 static mut __ACPI_TABLE: Option<acpi::AcpiTables<AcpiHandlerImpl>> = None;
+/// `/sys/firmware/acpi`的kset
+static mut ACPI_KSET_INSTANCE: Option<Arc<KSet>> = None;
 
 #[inline(always)]
 pub fn acpi_manager() -> &'static AcpiManager {
     &AcpiManager
 }
 
+#[inline(always)]
+pub fn acpi_kset() -> Arc<KSet> {
+    unsafe { ACPI_KSET_INSTANCE.clone().unwrap() }
+}
+
 #[derive(Debug)]
 pub struct AcpiManager;
 
 impl AcpiManager {
-    pub fn init(rsdp_paddr: PhysAddr) {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            kinfo!("Initializing Acpi Manager...");
-            let acpi_table: acpi::AcpiTables<AcpiHandlerImpl> =
-                unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, rsdp_paddr.data()) }
-                    .unwrap_or_else(|e| {
-                        panic!("acpi_init(): failed to parse acpi tables, error: {:?}", e)
-                    });
+    /// 初始化ACPI
+    ///
+    /// ## 参数
+    ///
+    /// - `rsdp_paddr`: RSDP的物理地址
+    ///
+    ///
+    /// ## 参考资料
+    ///
+    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1390
+    pub fn init(&self, rsdp_paddr: PhysAddr) -> Result<(), SystemError> {
+        kinfo!("Initializing Acpi Manager...");
 
-            unsafe {
-                __ACPI_TABLE = Some(acpi_table);
-            }
-            kinfo!("Acpi Manager initialized.");
-        });
+        // 初始化`/sys/firmware/acpi`的kset
+        let kset = KSet::new("acpi".to_string());
+        kset.register(Some(sys_firmware_kset()))?;
+        unsafe {
+            ACPI_KSET_INSTANCE = Some(kset.clone());
+        }
+        self.map_tables(rsdp_paddr)?;
+        self.bus_init()?;
+        kinfo!("Acpi Manager initialized.");
+        return Ok(());
+    }
+
+    fn map_tables(&self, rsdp_paddr: PhysAddr) -> Result<(), SystemError> {
+        let acpi_table: acpi::AcpiTables<AcpiHandlerImpl> =
+            unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, rsdp_paddr.data()) }.map_err(
+                |e| {
+                    kerror!("acpi_init(): failed to parse acpi tables, error: {:?}", e);
+                    SystemError::ENOMEM
+                },
+            )?;
+
+        unsafe {
+            __ACPI_TABLE = Some(acpi_table);
+        }
+
+        return Ok(());
     }
 
     #[allow(dead_code)]
-    pub fn tables() -> Option<&'static acpi::AcpiTables<AcpiHandlerImpl>> {
+    pub fn tables(&self) -> Option<&'static acpi::AcpiTables<AcpiHandlerImpl>> {
         unsafe { __ACPI_TABLE.as_ref() }
     }
 }

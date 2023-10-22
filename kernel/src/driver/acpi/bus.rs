@@ -20,4 +20,10 @@ impl AcpiManager {
 
         return Ok(false);
     }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1286
+    pub(super) fn bus_init(&self) -> Result<(), SystemError> {
+        self.acpi_sysfs_init()?;
+        return Ok(());
+    }
 }

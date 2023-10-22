@@ -4,7 +4,7 @@ use crate::{
     mm::{MemoryManagementArch, VirtAddr},
 };
 
-use super::AcpiManager;
+use super::acpi_manager;
 
 static mut RSDP_TMP_BOX: Option<AlignedBox<[u8; 4096], 4096>> = None;
 
@@ -20,5 +20,5 @@ unsafe extern "C" fn rs_acpi_init(rsdp_vaddr: u64) {
     ))
     .unwrap();
 
-    AcpiManager::init(rsdp_paddr);
+    acpi_manager().init(rsdp_paddr).expect("rs_acpi_init(): failed to init acpi");
 }

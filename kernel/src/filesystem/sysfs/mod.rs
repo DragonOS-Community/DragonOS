@@ -69,15 +69,8 @@ impl SysFSKernPrivateData {
     pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
         match self {
             SysFSKernPrivateData::File(file) => {
-                let len = file.callback_read(buf)?;
-                if offset > 0 {
-                    if len <= offset {
-                        return Ok(0);
-                    }
-                    let len = len - offset;
-                    buf.copy_within(offset..offset + len, 0);
-                    buf[len] = 0;
-                }
+                let len = file.callback_read(buf, offset)?;
+                
                 return Ok(len);
             }
             _ => {
@@ -87,10 +80,10 @@ impl SysFSKernPrivateData {
     }
 
     #[inline(always)]
-    pub fn callback_write(&self, buf: &[u8], _offset: usize) -> Result<usize, SystemError> {
+    pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
         match self {
             SysFSKernPrivateData::File(file) => {
-                return file.callback_write(buf);
+                return file.callback_write(buf, offset);
             }
             _ => {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -114,7 +107,7 @@ pub trait AttributeGroup: Debug + Send + Sync {
     ///
     /// 如果返回Some，则使用返回的权限。
     /// 如果要标识属性不可见，则返回Some(ModeType::empty())
-    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> Option<ModeType>;
+    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &'static dyn Attribute) -> Option<ModeType>;
 }
 
 /// sysfs文件的属性
@@ -133,9 +126,38 @@ pub trait Attribute: Debug + Send + Sync {
     }
 }
 
+pub trait BinAttribute: Attribute {
+
+    fn support_battr(&self) -> SysFSOpsSupport;
+
+    fn write(
+        &self,
+        _kobj: Arc<dyn KObject>,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn read(
+        &self,
+        _kobj: Arc<dyn KObject>,
+        _buf: &mut [u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    fn size(&self) -> usize;
+}
+
 pub trait SysFSOps: Debug {
     /// 获取当前文件的支持的操作
     fn support(&self, attr: &dyn Attribute) -> SysFSOpsSupport {
+        return attr.support();
+    }
+
+    fn support_battr(&self, attr: &Arc<dyn BinAttribute>) -> SysFSOpsSupport {
         return attr.support();
     }
 
@@ -156,8 +178,12 @@ pub trait SysFSOps: Debug {
 
 bitflags! {
     pub struct SysFSOpsSupport: u8{
+        // === for attribute ===
         const SHOW = 1 << 0;
         const STORE = 1 << 1;
+        // === for bin attribute ===
+        const READ = 1 << 2;
+        const WRITE = 1 << 3;
     }
 }
 

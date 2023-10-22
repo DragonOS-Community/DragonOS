@@ -7,7 +7,7 @@ use hashbrown::HashMap;
 
 use crate::{
     arch::mm::LowAddressRemapping,
-    include::bindings::bindings::{gfp_t, PAGE_U_S, vm_flags_t},
+    include::bindings::bindings::{gfp_t, vm_flags_t, PAGE_U_S},
     kerror,
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::MMArch,
@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, no_init::pseudo_map_phys,
-    page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr, mmio_buddy::mmio_pool,
+    allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, mmio_buddy::mmio_pool,
+    no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
 };
 
 lazy_static! {
@@ -125,8 +125,6 @@ pub unsafe extern "C" fn rs_unmap_at_low_addr() -> usize {
     LowAddressRemapping::unmap_at_low_address(true);
     return 0;
 }
-
-
 
 /// @brief 创建一块mmio区域，并将vma绑定到initial_mm
 ///

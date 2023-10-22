@@ -20,5 +20,7 @@ unsafe extern "C" fn rs_acpi_init(rsdp_vaddr: u64) {
     ))
     .unwrap();
 
-    acpi_manager().init(rsdp_paddr).expect("rs_acpi_init(): failed to init acpi");
+    acpi_manager()
+        .init(rsdp_paddr)
+        .expect("rs_acpi_init(): failed to init acpi");
 }

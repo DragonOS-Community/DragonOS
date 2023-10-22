@@ -70,7 +70,7 @@ impl SysFSKernPrivateData {
         match self {
             SysFSKernPrivateData::File(file) => {
                 let len = file.callback_read(buf, offset)?;
-                
+
                 return Ok(len);
             }
             _ => {
@@ -127,7 +127,6 @@ pub trait Attribute: Debug + Send + Sync {
 }
 
 pub trait BinAttribute: Attribute {
-
     fn support_battr(&self) -> SysFSOpsSupport;
 
     fn write(

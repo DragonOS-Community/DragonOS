@@ -439,7 +439,7 @@ impl KernFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        return self.inner_create(name, KernInodeType::Dir, mode, private_data, callback);
+        return self.inner_create(name, KernInodeType::Dir, mode, 0, private_data, callback);
     }
 
     /// 在当前inode下增加文件
@@ -448,8 +448,10 @@ impl KernFSInode {
     ///
     /// - `name`：文件名称
     /// - `mode`：文件权限
+    /// - `size`：文件大小(如果不指定，则默认为4096)
     /// - `private_data`：文件私有数据
     /// - `callback`：文件回调函数
+    ///
     ///
     /// ## 返回值
     ///
@@ -461,6 +463,7 @@ impl KernFSInode {
         &self,
         name: String,
         mode: ModeType,
+        size: Option<usize>,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
@@ -468,7 +471,15 @@ impl KernFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        return self.inner_create(name, KernInodeType::File, mode, private_data, callback);
+        let size = size.unwrap_or(4096);
+        return self.inner_create(
+            name,
+            KernInodeType::File,
+            mode,
+            size,
+            private_data,
+            callback,
+        );
     }
 
     fn inner_create(
@@ -476,21 +487,19 @@ impl KernFSInode {
         name: String,
         file_type: KernInodeType,
         mode: ModeType,
+        mut size: usize,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
-        let size;
         match file_type {
             KernInodeType::Dir | KernInodeType::SymLink => {
                 size = 0;
             }
-            KernInodeType::File => {
-                size = 4096;
-            }
+            _ => {}
         }
 
         let metadata = Metadata {
-            size,
+            size: size as i64,
             mode,
             uid: 0,
             gid: 0,
@@ -570,6 +579,7 @@ impl KernFSInode {
             name,
             KernInodeType::SymLink,
             ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777),
+            0,
             None,
             None,
         )?;

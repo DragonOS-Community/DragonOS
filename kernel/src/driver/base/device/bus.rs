@@ -97,6 +97,7 @@ impl From<BusState> for DeviceState {
 /// https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/device/bus.h#84
 pub trait Bus: Debug + Send + Sync {
     fn name(&self) -> String;
+    /// Used for subsystems to enumerate devices like ("foo%u", dev->id).
     fn dev_name(&self) -> String;
     fn root_device(&self) -> Option<Arc<dyn Device>> {
         None

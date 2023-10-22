@@ -693,7 +693,7 @@ impl Syscall {
         kstat.rdev = metadata.raw_dev as i64;
         kstat.mode = metadata.mode;
         match file.lock().file_type() {
-            FileType::File => kstat.mode.insert(ModeType::S_IFMT),
+            FileType::File => kstat.mode.insert(ModeType::S_IFREG),
             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
             FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
             FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),

@@ -7,16 +7,13 @@ use alloc::{
 use core::hash::Hash;
 
 use crate::{
-    filesystem::{
-        kernfs::KernFSInode,
-        sysfs::{AttributeGroup, SysFSOps},
-    },
+    filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     syscall::SystemError,
 };
 
 use super::kobject::{
-    KObjType, KObject, KObjectManager, KObjectState, KObjectSysFSOps, LockedKObjectState,
+    DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,
 };
 
 #[derive(Debug)]
@@ -164,11 +161,11 @@ impl KObject for KSet {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        Some(&KSetKObjType)
+        self.inner.read().ktype
     }
 
-    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
-        todo!("KSet::set_kobj_type")
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.inner.write().ktype = ktype;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
@@ -208,6 +205,7 @@ impl KSetParentData {
 struct InnerKSet {
     kern_inode: Option<Arc<KernFSInode>>,
     name: String,
+    ktype: Option<&'static dyn KObjType>,
 }
 
 impl InnerKSet {
@@ -215,19 +213,7 @@ impl InnerKSet {
         Self {
             kern_inode: None,
             name,
+            ktype: Some(&DynamicKObjKType),
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct KSetKObjType;
-
-impl KObjType for KSetKObjType {
-    fn sysfs_ops(&self) -> Option<&dyn SysFSOps> {
-        Some(&KObjectSysFSOps)
-    }
-
-    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        None
     }
 }

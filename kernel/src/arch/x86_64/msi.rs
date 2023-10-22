@@ -3,7 +3,7 @@ use crate::driver::pci::pci_irq::TriggerMode;
 /// @param processor 目标CPU ID号
 /// @return MSI Message Address
 pub fn ia64_pci_get_arch_msi_message_address(processor: u16) -> u32 {
-    0xfee00000 as u32 | ((processor as u32) << 12)
+    0xfee00000 | ((processor as u32) << 12)
 }
 /// @brief 获得MSI Message Data
 /// @param vector 分配的中断向量号

@@ -1,10 +1,12 @@
 use crate::{
-    arch::{asm::current::current_pcb, context::switch_process, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
+    process::ProcessManager,
+    smp::core::smp_get_processor_id,
     syscall::{Syscall, SystemError},
 };
 
-use super::core::do_sched;
+use super::core::{do_sched, CPU_EXECUTING};
 
 impl Syscall {
     /// @brief 让系统立即运行调度器的系统调用
@@ -21,7 +23,13 @@ impl Syscall {
         let pcb = do_sched();
 
         if pcb.is_some() {
-            switch_process(current_pcb(), pcb.unwrap());
+            let next_pcb = pcb.unwrap();
+            let current_pcb = ProcessManager::current_pcb();
+
+            if current_pcb.pid() != next_pcb.pid() {
+                CPU_EXECUTING.set(smp_get_processor_id(), next_pcb.pid());
+                unsafe { ProcessManager::switch_process(current_pcb, next_pcb) };
+            }
         }
         drop(irq_guard);
         return Ok(0);

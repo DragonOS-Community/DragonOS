@@ -1,0 +1,5 @@
+error: #[cast_to(..)] can't be used on a generic type definition
+ --> tests/ui/on-generic-type.rs:6:12
+  |
+6 | struct Data<T: 'static> {
+  |            ^^^^^^^^^^^^

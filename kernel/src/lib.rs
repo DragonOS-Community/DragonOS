@@ -1,18 +1,26 @@
-#![no_std] // <1>
 #![no_main] // <1>
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
+#![feature(asm_const)]
 #![feature(const_mut_refs)]
+#![feature(const_trait_impl)]
+#![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(drain_filter)]
 #![feature(is_some_and)]
+#![feature(naked_functions)]
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
+#![cfg_attr(target_os = "none", no_std)]
+
+#[cfg(test)]
+#[macro_use]
+extern crate std;
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
@@ -29,6 +37,7 @@ mod include;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
 mod filesystem;
+mod init;
 mod ipc;
 mod mm;
 mod net;
@@ -45,28 +54,27 @@ extern crate bitflags;
 extern crate elf;
 #[macro_use]
 extern crate lazy_static;
+extern crate memoffset;
 extern crate num;
 #[macro_use]
 extern crate num_derive;
 extern crate smoltcp;
 extern crate thingbuf;
+#[macro_use]
+extern crate intertrait;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
 
-use crate::libs::lib_ui::textui::FontColor;
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
-// <3>
-use crate::{
-    arch::asm::current::current_pcb, include::bindings::bindings::process_do_exit,
-    net::net_core::net_init,
-};
+use crate::process::ProcessManager;
 
 // 声明全局的分配器
 #[cfg_attr(not(test), global_allocator)]
 pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 /// 全局的panic处理函数
+#[cfg(target_os = "none")]
 #[panic_handler]
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
@@ -95,20 +103,6 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    println!("Current PCB:\n\t{:?}", current_pcb());
-    unsafe {
-        process_do_exit(u64::MAX);
-    };
-    loop {}
-}
-
-/// 该函数用作测试，在process.c的initial_kernel_thread()中调用了此函数
-#[no_mangle]
-pub extern "C" fn __rust_demo_func() -> i32 {
-    printk_color!(FontColor::GREEN, FontColor::BLACK, "__rust_demo_func()\n");
-    let r = net_init();
-    if r.is_err() {
-        kwarn!("net_init() failed: {:?}", r.err().unwrap());
-    }
-    return 0;
+    println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
+    ProcessManager::exit(usize::MAX);
 }

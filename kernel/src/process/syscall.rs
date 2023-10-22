@@ -1,51 +1,167 @@
-use core::ffi::{c_int, c_void};
+use core::ffi::c_void;
 
+use alloc::{string::String, vec::Vec};
+
+use super::{abi::WaitOption, fork::CloneFlags, Pid, ProcessManager, ProcessState};
 use crate::{
-    arch::asm::current::current_pcb,
-    include::bindings::bindings::{pid_t, process_do_exit},
-    syscall::{Syscall, SystemError},
+    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
+    filesystem::vfs::MAX_PATHLEN,
+    process::ProcessControlBlock,
+    syscall::{
+        user_access::{
+            check_and_clone_cstr, check_and_clone_cstr_array, UserBufferReader, UserBufferWriter,
+        },
+        Syscall, SystemError,
+    },
 };
 
-extern "C" {
-    fn c_sys_wait4(pid: pid_t, wstatus: *mut c_int, options: c_int, rusage: *mut c_void) -> c_int;
-}
-
 impl Syscall {
-    #[allow(dead_code)]
-    pub fn fork(&self) -> Result<usize, SystemError> {
-        // 由于进程管理未完成重构，fork调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
-        todo!()
+    pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        let r = ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into());
+        return r;
     }
 
-    #[allow(dead_code)]
-    pub fn vfork(&self) -> Result<usize, SystemError> {
-        // 由于进程管理未完成重构，vfork调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
-        todo!()
+    pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        ProcessManager::fork(
+            frame,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
+        )
+        .map(|pid| pid.into())
     }
 
-    #[allow(dead_code)]
     pub fn execve(
-        _path: *const c_void,
-        _argv: *const *const c_void,
-        _envp: *const *const c_void,
-    ) -> Result<usize, SystemError> {
-        // 由于进程管理未完成重构，execve调用暂时在arch/x86_64/syscall.rs中调用，以后会移动到这里。
-        todo!()
+        path: *const u8,
+        argv: *const *const u8,
+        envp: *const *const u8,
+        frame: &mut TrapFrame,
+    ) -> Result<(), SystemError> {
+        // kdebug!(
+        //     "execve path: {:?}, argv: {:?}, envp: {:?}\n",
+        //     path,
+        //     argv,
+        //     envp
+        // );
+        if path.is_null() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let x = || {
+            let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+            let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
+            let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
+            Ok((path, argv, envp))
+        };
+        let r: Result<(String, Vec<String>, Vec<String>), SystemError> = x();
+        if let Err(e) = r {
+            panic!("Failed to execve: {:?}", e);
+        }
+        let (path, argv, envp) = r.unwrap();
+        ProcessManager::current_pcb()
+            .basic_mut()
+            .set_name(ProcessControlBlock::generate_name(&path, &argv));
+
+        Self::do_execve(path, argv, envp, frame)?;
+
+        // 关闭设置了O_CLOEXEC的文件描述符
+        let fd_table = ProcessManager::current_pcb().fd_table();
+        fd_table.write().close_on_exec();
+
+        return Ok(());
     }
 
     pub fn wait4(
-        pid: pid_t,
-        wstatus: *mut c_int,
-        options: c_int,
+        pid: i64,
+        wstatus: *mut i32,
+        options: i32,
         rusage: *mut c_void,
     ) -> Result<usize, SystemError> {
-        let ret = unsafe { c_sys_wait4(pid, wstatus, options, rusage) };
-        if (ret as isize) < 0 {
-            return Err(
-                SystemError::from_posix_errno((ret as isize) as i32).expect("wait4: Invalid errno")
-            );
+        let ret = WaitOption::from_bits(options as u32);
+        let options = match ret {
+            Some(options) => options,
+            None => {
+                return Err(SystemError::EINVAL);
+            }
+        };
+
+        let mut _rusage_buf =
+            UserBufferReader::new::<c_void>(rusage, core::mem::size_of::<c_void>(), true)?;
+
+        let mut wstatus_buf =
+            UserBufferWriter::new::<i32>(wstatus, core::mem::size_of::<i32>(), true)?;
+
+        let cur_pcb = ProcessManager::current_pcb();
+        let rd_childen = cur_pcb.children.read();
+
+        if pid > 0 {
+            let pid = Pid(pid as usize);
+            let child_pcb = rd_childen.get(&pid).ok_or(SystemError::ECHILD)?.clone();
+            drop(rd_childen);
+
+            loop {
+                // 获取退出码
+                match child_pcb.sched_info().state() {
+                    ProcessState::Runnable => {
+                        if options.contains(WaitOption::WNOHANG)
+                            || options.contains(WaitOption::WNOWAIT)
+                        {
+                            if !wstatus.is_null() {
+                                wstatus_buf.copy_one_to_user(&WaitOption::WCONTINUED.bits(), 0)?;
+                            }
+                            return Ok(0);
+                        }
+                    }
+                    ProcessState::Blocked(_) => {
+                        // 指定WUNTRACED则等待暂停的进程，不指定则返回0
+                        if !options.contains(WaitOption::WUNTRACED)
+                            || options.contains(WaitOption::WNOWAIT)
+                        {
+                            if !wstatus.is_null() {
+                                wstatus_buf.copy_one_to_user(&WaitOption::WSTOPPED.bits(), 0)?;
+                            }
+                            return Ok(0);
+                        }
+                    }
+                    ProcessState::Exited(status) => {
+                        if !wstatus.is_null() {
+                            wstatus_buf.copy_one_to_user(
+                                &(status | WaitOption::WEXITED.bits() as usize),
+                                0,
+                            )?;
+                        }
+                        return Ok(pid.into());
+                    }
+                };
+
+                // 等待指定进程
+                child_pcb.wait_queue.sleep();
+            }
+        } else if pid < -1 {
+            // TODO 判断是否pgid == -pid（等待指定组任意进程）
+            // 暂时不支持
+            return Err(SystemError::EINVAL);
+        } else if pid == 0 {
+            // TODO 判断是否pgid == current_pgid（等待当前组任意进程）
+            // 暂时不支持
+            return Err(SystemError::EINVAL);
+        } else {
+            // 等待任意子进程(这两)
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            for (pid, pcb) in rd_childen.iter() {
+                if pcb.sched_info().state().is_exited() {
+                    if !wstatus.is_null() {
+                        wstatus_buf.copy_one_to_user(&0, 0)?;
+                    }
+                    return Ok(pid.clone().into());
+                } else {
+                    unsafe { pcb.wait_queue.sleep_without_schedule() };
+                }
+            }
+            drop(irq_guard);
+            sched();
         }
-        return Ok(ret as usize);
+
+        return Ok(0);
     }
 
     /// # 退出进程
@@ -54,12 +170,34 @@ impl Syscall {
     ///
     /// - status: 退出状态
     pub fn exit(status: usize) -> ! {
-        unsafe { process_do_exit(status as u64) };
-        loop {}
+        ProcessManager::exit(status);
     }
 
-    /// # 获取进程ID
-    pub fn getpid() -> Result<usize, SystemError> {
-        return Ok(current_pcb().pid as usize);
+    /// @brief 获取当前进程的pid
+    pub fn getpid() -> Result<Pid, SystemError> {
+        let current_pcb = ProcessManager::current_pcb();
+        return Ok(current_pcb.pid());
+    }
+
+    /// @brief 获取指定进程的pgid
+    ///
+    /// @param pid 指定一个进程号
+    ///
+    /// @return 成功，指定进程的进程组id
+    /// @return 错误，不存在该进程
+    pub fn getpgid(mut pid: Pid) -> Result<Pid, SystemError> {
+        if pid == Pid(0) {
+            let current_pcb = ProcessManager::current_pcb();
+            pid = current_pcb.pid();
+        }
+        let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        return Ok(target_proc.basic().pgid());
+    }
+    /// @brief 获取当前进程的父进程id
+
+    /// 若为initproc则ppid设置为0   
+    pub fn getppid() -> Result<Pid, SystemError> {
+        let current_pcb = ProcessManager::current_pcb();
+        return Ok(current_pcb.basic().ppid());
     }
 }

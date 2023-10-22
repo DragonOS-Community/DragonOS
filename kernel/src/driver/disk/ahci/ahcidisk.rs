@@ -2,12 +2,19 @@ use super::{_port, hba::HbaCmdTable, virt_2_phys};
 use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::SeekFrom;
-use crate::driver::base::device::{Device, DeviceType, KObject};
+use crate::driver::base::device::bus::Bus;
+use crate::driver::base::device::driver::Driver;
+use crate::driver::base::device::{Device, DeviceType, IdTable};
+use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
+use crate::driver::base::kset::KSet;
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
+
+use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 use crate::include::bindings::bindings::verify_area;
 
 use crate::kdebug;
+use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::mm::phys_2_virt;
 use crate::syscall::SystemError;
@@ -23,7 +30,7 @@ use alloc::sync::Weak;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use core::fmt::Debug;
-use core::sync::atomic::compiler_fence;
+use core::sync::atomic::{compiler_fence, Ordering};
 use core::{mem::size_of, ptr::write_bytes};
 
 /// @brief: 只支持MBR分区格式的磁盘结构体
@@ -60,9 +67,10 @@ impl AhciDisk {
         count: usize,          // 读取lba的数量
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
+        assert!((buf.len() & 511) == 0);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
-        if count * 512 > buf.len() || check_length > u16::MAX as usize {
+        if count * 512 > buf.len() || check_length > 8 as usize {
             kerror!("ahci read: e2big");
             // 不可能的操作
             return Err(SystemError::E2BIG);
@@ -89,11 +97,7 @@ impl AhciDisk {
                 .unwrap()
         };
 
-        volatile_write_bit!(
-            cmdheader.cfl,
-            (1 << 5) - 1 as u8,
-            (size_of::<FisRegH2D>() / size_of::<u32>()) as u8
-        ); // Command FIS size
+        cmdheader.cfl = (size_of::<FisRegH2D>() / size_of::<u32>()) as u8;
 
         volatile_set_bit!(cmdheader.cfl, 1 << 6, false); //  Read/Write bit : Read from device
         volatile_write!(cmdheader.prdtl, check_length as u16); // PRDT entries count
@@ -109,10 +113,8 @@ impl AhciDisk {
             false
         };
         let mut kbuf = if user_buf {
-            let mut x: Vec<u8> = Vec::with_capacity(buf.len());
-            unsafe {
-                x.set_len(buf.len());
-            }
+            let mut x: Vec<u8> = Vec::new();
+            x.resize(buf.len(), 0);
             Some(x)
         } else {
             None
@@ -134,11 +136,12 @@ impl AhciDisk {
             // 清空整个table的旧数据
             write_bytes(cmdtbl, 0, 1);
         }
+        // kdebug!("cmdheader.prdtl={}", volatile_read!(cmdheader.prdtl));
 
         // 8K bytes (16 sectors) per PRDT
         for i in 0..((volatile_read!(cmdheader.prdtl) - 1) as usize) {
             volatile_write!(cmdtbl.prdt_entry[i].dba, virt_2_phys(buf_ptr) as u64);
-            volatile_write_bit!(cmdtbl.prdt_entry[i].dbc, (1 << 22) - 1, 8 * 1024 - 1); // 数据长度 prdt_entry.dbc
+            cmdtbl.prdt_entry[i].dbc = 8 * 1024 - 1;
             volatile_set_bit!(cmdtbl.prdt_entry[i].dbc, 1 << 31, true); // 允许中断 prdt_entry.i
             buf_ptr += 8 * 1024;
             tmp_count -= 16;
@@ -147,11 +150,8 @@ impl AhciDisk {
         // Last entry
         let las = (volatile_read!(cmdheader.prdtl) - 1) as usize;
         volatile_write!(cmdtbl.prdt_entry[las].dba, virt_2_phys(buf_ptr) as u64);
-        volatile_write_bit!(
-            cmdtbl.prdt_entry[las].dbc,
-            (1 << 22) - 1,
-            ((tmp_count << 9) - 1) as u32
-        ); // 数据长度
+        cmdtbl.prdt_entry[las].dbc = ((tmp_count << 9) - 1) as u32; // 数据长度
+
         volatile_set_bit!(cmdtbl.prdt_entry[las].dbc, 1 << 31, true); // 允许中断
 
         // 设置命令
@@ -219,9 +219,10 @@ impl AhciDisk {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
+        assert!((buf.len() & 511) == 0);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
-        if count * 512 > buf.len() || check_length > u16::MAX as usize {
+        if count * 512 > buf.len() || check_length > 8 as usize {
             // 不可能的操作
             return Err(SystemError::E2BIG);
         } else if count == 0 {
@@ -369,8 +370,6 @@ impl LockedAhciDisk {
         ctrl_num: u8,
         port_num: u8,
     ) -> Result<Arc<LockedAhciDisk>, SystemError> {
-        let mut part_s: Vec<Arc<Partition>> = Vec::new();
-
         // 构建磁盘结构体
         let result: Arc<LockedAhciDisk> = Arc::new(LockedAhciDisk(SpinLock::new(AhciDisk {
             name,
@@ -382,22 +381,24 @@ impl LockedAhciDisk {
         })));
 
         let table: MbrDiskPartionTable = result.read_mbr_table()?;
-        let weak_this: Weak<LockedAhciDisk> = Arc::downgrade(&result); // 获取this的弱指针
 
         // 求出有多少可用分区
         for i in 0..4 {
+            compiler_fence(Ordering::SeqCst);
             if table.dpte[i].part_type != 0 {
-                part_s.push(Partition::new(
+                let w = Arc::downgrade(&result);
+                result.0.lock().partitions.push(Partition::new(
                     table.dpte[i].starting_sector() as u64,
                     table.dpte[i].starting_lba as u64,
                     table.dpte[i].total_sectors as u64,
-                    weak_this.clone(),
+                    w,
                     i as u16,
                 ));
             }
         }
-        result.0.lock().partitions = part_s;
-        result.0.lock().self_ref = weak_this;
+
+        result.0.lock().self_ref = Arc::downgrade(&result);
+
         return Ok(result);
     }
 
@@ -409,7 +410,7 @@ impl LockedAhciDisk {
         let mut buf: Vec<u8> = Vec::new();
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
-        BlockDevice::read_at(self, 0, 1, &mut buf)?;
+        self.read_at(0, 1, &mut buf)?;
         // 创建 Cursor 用于按字节读取
         let mut cursor = VecCursor::new(buf);
         cursor.seek(SeekFrom::SeekCurrent(446))?;
@@ -437,26 +438,102 @@ impl LockedAhciDisk {
     }
 }
 
-impl KObject for LockedAhciDisk {}
+impl KObject for LockedAhciDisk {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_inode(&self, _inode: Option<Arc<KernFSInode>>) {
+        todo!()
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn name(&self) -> alloc::string::String {
+        todo!()
+    }
+
+    fn set_name(&self, _name: alloc::string::String) {
+        todo!()
+    }
+
+    fn set_kset(&self, _kset: Option<Arc<KSet>>) {
+        todo!()
+    }
+
+    fn set_parent(&self, _parent: Option<Weak<dyn KObject>>) {
+        todo!()
+    }
+
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
+        todo!()
+    }
+}
 
 impl Device for LockedAhciDisk {
     fn dev_type(&self) -> DeviceType {
         return DeviceType::Block;
     }
 
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        return self;
-    }
-
-    fn id_table(&self) -> crate::driver::base::device::IdTable {
+    fn id_table(&self) -> IdTable {
         todo!()
     }
 
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
+        todo!("LockedAhciDisk::bus()")
+    }
+
+    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
+        todo!("LockedAhciDisk::set_bus()")
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        todo!("LockedAhciDisk::driver()")
+    }
+
+    fn is_dead(&self) -> bool {
+        false
+    }
+
+    fn set_driver(&self, _driver: Option<Weak<dyn Driver>>) {
+        todo!("LockedAhciDisk::set_driver()")
+    }
+
+    fn can_match(&self) -> bool {
         todo!()
     }
 
-    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
+    fn set_can_match(&self, _can_match: bool) {
+        todo!()
+    }
+
+    fn state_synced(&self) -> bool {
         todo!()
     }
 }

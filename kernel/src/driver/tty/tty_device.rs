@@ -7,7 +7,10 @@ use alloc::{
 use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
+        vfs::{
+            file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
+            ROOT_INODE,
+        },
     },
     kerror,
     libs::{
@@ -17,7 +20,7 @@ use crate::{
     syscall::SystemError,
 };
 
-use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
+use super::{serial::serial_init, TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
 
 lazy_static! {
     /// 所有TTY设备的B树。用于根据名字，找到Arc<TtyDevice>
@@ -271,23 +274,12 @@ impl IndexNode for TtyDevice {
 
 impl TtyDevicePrivateData {
     pub fn new(name: &str) -> RwLock<Self> {
-        let mut metadata = Metadata::new(FileType::CharDevice, 0o755);
+        let mut metadata = Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755));
         metadata.size = TtyCore::STDIN_BUF_SIZE as i64;
         return RwLock::new(TtyDevicePrivateData {
             name: name.to_string(),
             metadata,
         });
-    }
-}
-
-/// @brief 导出到C的tty初始化函数
-#[no_mangle]
-pub extern "C" fn rs_tty_init() -> i32 {
-    let r = tty_init();
-    if r.is_ok() {
-        return 0;
-    } else {
-        return r.unwrap_err().to_posix_errno();
     }
 }
 
@@ -319,5 +311,6 @@ pub fn tty_init() -> Result<(), SystemError> {
         return Err(devfs_root_inode.unwrap_err());
     }
 
+    serial_init()?;
     return Ok(());
 }

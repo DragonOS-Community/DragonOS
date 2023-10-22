@@ -6,26 +6,27 @@ use core::{
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
-    arch::{cpu::cpu_reset, MMArch},
-    driver::base::block::SeekFrom,
+    arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
-        syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::{pid_t, PAGE_2M_SIZE, PAGE_4K_SIZE},
+    include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
+    process::Pid,
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
     },
 };
 
-use self::user_access::UserBufferWriter;
+use self::user_access::{UserBufferReader, UserBufferWriter};
 
 pub mod user_access;
 
@@ -368,15 +369,13 @@ pub const SYS_MUNMAP: usize = 45;
 
 pub const SYS_MPROTECT: usize = 46;
 pub const SYS_FSTAT: usize = 47;
-#[allow(dead_code)]
 pub const SYS_GETCWD: usize = 48;
-#[allow(dead_code)]
 pub const SYS_GETPPID: usize = 49;
-#[allow(dead_code)]
 pub const SYS_GETPGID: usize = 50;
 
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
+pub const SYS_MKNOD: usize = 53;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -407,7 +406,11 @@ impl Syscall {
     ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
-    pub fn handle(syscall_num: usize, args: &[usize], from_user: bool) -> usize {
+    pub fn handle(
+        syscall_num: usize,
+        args: &[usize],
+        frame: &mut TrapFrame,
+    ) -> Result<usize, SystemError> {
         let r = match syscall_num {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
@@ -419,9 +422,9 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 } else {
                     let path: &str = path.unwrap();
+
                     let flags = args[1];
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-
                     Self::open(path, open_flags)
                 };
 
@@ -429,46 +432,33 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                Self::close(fd)
+
+                let res = Self::close(fd);
+
+                res
             }
             SYS_READ => {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else {
-                    let buf: &mut [u8] = unsafe {
-                        core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
-                    };
+                let from_user = frame.from_user();
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
-                    Self::read(fd, buf)
-                };
-                // kdebug!("sys read, fd: {}, len: {}, res: {:?}", fd, len, res);
+                let user_buf = user_buffer_writer.buffer(0)?;
+                let res = Self::read(fd, user_buf);
                 res
             }
             SYS_WRITE => {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else {
-                    let buf: &[u8] = unsafe {
-                        core::slice::from_raw_parts::<'static, u8>(buf_vaddr as *const u8, len)
-                    };
+                let from_user = frame.from_user();
+                let user_buffer_reader =
+                    UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
 
-                    Self::write(fd, buf)
-                };
-
-                // kdebug!("sys write, fd: {}, len: {}, res: {:?}", fd, len, res);
-
+                let user_buf = user_buffer_reader.read_from_user(0)?;
+                let res = Self::write(fd, user_buf);
                 res
             }
 
@@ -483,18 +473,13 @@ impl Syscall {
                     SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
                     SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
                     _ => Err(SystemError::EINVAL),
-                };
+                }?;
 
-                let res = if w.is_err() {
-                    Err(w.unwrap_err())
-                } else {
-                    let w = w.unwrap();
-                    Self::lseek(fd, w)
-                };
-                // kdebug!("sys lseek, fd: {}, offset: {}, whence: {}, res: {:?}", fd, offset, whence, res);
-
-                res
+                Self::lseek(fd, w)
             }
+
+            SYS_FORK => Self::fork(frame),
+            SYS_VFORK => Self::vfork(frame),
 
             SYS_BRK => {
                 let new_brk = VirtAddr::new(args[0]);
@@ -503,7 +488,7 @@ impl Syscall {
 
             SYS_SBRK => {
                 let increment = args[0] as isize;
-                Self::sbrk(increment).map(|vaddr| vaddr.data())
+                Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
             }
 
             SYS_REBOOT => Self::reboot(),
@@ -518,7 +503,8 @@ impl Syscall {
                     let virt_addr = VirtAddr::new(path_ptr as usize);
                     // 权限校验
                     if path_ptr.is_null()
-                        || (from_user && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
+                        || (frame.from_user()
+                            && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
                     {
                         return Err(SystemError::EINVAL);
                     }
@@ -526,28 +512,25 @@ impl Syscall {
                     let dest_path: &str = dest_path.to_str().map_err(|_| SystemError::EINVAL)?;
                     if dest_path.len() == 0 {
                         return Err(SystemError::EINVAL);
-                    } else if dest_path.len() > PAGE_4K_SIZE as usize {
+                    } else if dest_path.len() > MAX_PATHLEN as usize {
                         return Err(SystemError::ENAMETOOLONG);
                     }
 
                     return Ok(dest_path);
                 };
 
-                let r: Result<&str, SystemError> = chdir_check(args[0]);
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    Self::chdir(r.unwrap())
-                }
+                let r = chdir_check(args[0])?;
+                Self::chdir(r)
             }
 
             SYS_GET_DENTS => {
                 let fd = args[0] as i32;
+
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if from_user && verify_area(virt_addr, len as usize).is_err() {
+                let res = if frame.from_user() && verify_area(virt_addr, len as usize).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
                     Err(SystemError::EPERM)
                 } else if buf_vaddr == 0 {
@@ -570,37 +553,30 @@ impl Syscall {
                 let virt_argv_ptr = VirtAddr::new(argv_ptr);
                 let virt_env_ptr = VirtAddr::new(env_ptr);
                 // 权限校验
-                if from_user
-                    && (verify_area(virt_path_ptr, PAGE_4K_SIZE as usize).is_err()
+                if frame.from_user()
+                    && (verify_area(virt_path_ptr, MAX_PATHLEN as usize).is_err()
                         || verify_area(virt_argv_ptr, PAGE_4K_SIZE as usize).is_err())
                     || verify_area(virt_env_ptr, PAGE_4K_SIZE as usize).is_err()
                 {
                     Err(SystemError::EFAULT)
                 } else {
                     Self::execve(
-                        path_ptr as *const c_void,
-                        argv_ptr as *const *const c_void,
-                        env_ptr as *const *const c_void,
+                        path_ptr as *const u8,
+                        argv_ptr as *const *const u8,
+                        env_ptr as *const *const u8,
+                        frame,
                     )
+                    .map(|_| 0)
                 }
             }
             SYS_WAIT4 => {
-                let pid = args[0] as pid_t;
-                let wstatus = args[1] as *mut c_int;
+                let pid = args[0] as i64;
+                let wstatus = args[1] as *mut i32;
                 let options = args[2] as c_int;
                 let rusage = args[3] as *mut c_void;
-                let virt_wstatus = VirtAddr::new(wstatus as usize);
-                let virt_rusage = VirtAddr::new(rusage as usize);
                 // 权限校验
                 // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                if from_user
-                    && (verify_area(virt_wstatus, core::mem::size_of::<c_int>() as usize).is_err()
-                        || verify_area(virt_rusage, PAGE_4K_SIZE as usize).is_err())
-                {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::wait4(pid, wstatus, options, rusage)
-                }
+                Self::wait4(pid, wstatus, options, rusage)
             }
 
             SYS_EXIT => {
@@ -613,7 +589,8 @@ impl Syscall {
                 let virt_path_ptr = VirtAddr::new(path_ptr as usize);
                 let security_check = || {
                     if path_ptr.is_null()
-                        || (from_user && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
+                        || (frame.from_user()
+                            && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
                     {
                         return Err(SystemError::EINVAL);
                     }
@@ -639,7 +616,7 @@ impl Syscall {
                 let rem = args[1] as *mut TimeSpec;
                 let virt_req = VirtAddr::new(req as usize);
                 let virt_rem = VirtAddr::new(rem as usize);
-                if from_user
+                if frame.from_user()
                     && (verify_area(virt_req, core::mem::size_of::<TimeSpec>() as usize).is_err()
                         || verify_area(virt_rem, core::mem::size_of::<TimeSpec>() as usize)
                             .is_err())
@@ -667,7 +644,7 @@ impl Syscall {
                 let pathname = args[1] as *const c_char;
                 let flags = args[2] as u32;
                 let virt_pathname = VirtAddr::new(pathname as usize);
-                if from_user && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err() {
+                if frame.from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err() {
                     Err(SystemError::EFAULT)
                 } else if pathname.is_null() {
                     Err(SystemError::EFAULT)
@@ -691,7 +668,7 @@ impl Syscall {
                 }
             }
             SYS_KILL => {
-                let pid = args[0] as pid_t;
+                let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
 
                 Self::kill(pid, sig)
@@ -701,7 +678,7 @@ impl Syscall {
                 let sig = args[0] as c_int;
                 let act = args[1];
                 let old_act = args[2];
-                Self::sigaction(sig, act, old_act, from_user)
+                Self::sigaction(sig, act, old_act, frame.from_user())
             }
 
             SYS_RT_SIGRETURN => {
@@ -710,9 +687,9 @@ impl Syscall {
                 todo!()
             }
 
-            SYS_GETPID => Self::getpid(),
+            SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
-            SYS_SCHED => Self::sched(from_user),
+            SYS_SCHED => Self::sched(frame.from_user()),
             SYS_DUP => {
                 let oldfd: i32 = args[0] as c_int;
                 Self::dup(oldfd)
@@ -919,6 +896,25 @@ impl Syscall {
                 }
             }
 
+            SYS_GETCWD => {
+                let buf = args[0] as *mut u8;
+                let size = args[1] as usize;
+                let security_check = || {
+                    verify_area(VirtAddr::new(buf as usize), size)?;
+                    return Ok(());
+                };
+                let r = security_check();
+                if r.is_err() {
+                    Err(r.unwrap_err())
+                } else {
+                    let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
+                    Self::getcwd(buf).map(|ptr| ptr.data())
+                }
+            }
+
+            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pid| pid.into()),
+
+            SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
             SYS_FSTAT => {
                 let fd = args[0] as i32;
                 let kstat = args[1] as *mut PosixKstat;
@@ -954,10 +950,16 @@ impl Syscall {
                 res
             }
 
+            SYS_MKNOD => {
+                let path = args[0];
+                let flags = args[1];
+                let dev_t = args[2];
+                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
+                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
-
-        let r = r.unwrap_or_else(|e| e.to_posix_errno() as usize);
         return r;
     }
 

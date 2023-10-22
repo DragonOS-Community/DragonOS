@@ -45,16 +45,6 @@ const AHCI_SUBCLASS: u8 = 0x6;
 #[allow(non_upper_case_globals)]
 pub const HBA_PxIS_TFES: u32 = 1 << 30;
 
-#[no_mangle]
-pub extern "C" fn ahci_init() -> i32 {
-    let r = ahci_rust_init();
-    if r.is_ok() {
-        return 0;
-    } else {
-        return r.unwrap_err().to_posix_errno();
-    }
-}
-
 /// @brief 寻找所有的ahci设备
 /// @param list 链表的写锁
 /// @return Result<Vec<&'a mut Box<dyn PciDeviceStructure>>, SystemError>   成功则返回包含所有ahci设备结构体的可变引用的链表，失败则返回err
@@ -66,12 +56,12 @@ fn ahci_device_search<'a>(
     if result.is_empty() {
         return Err(SystemError::ENODEV);
     }
-    kdebug!("{}", result.len());
-    Ok(result)
+
+    return Ok(result);
 }
 
 /// @brief: 初始化 ahci
-pub fn ahci_rust_init() -> Result<(), SystemError> {
+pub fn ahci_init() -> Result<(), SystemError> {
     let mut list = PCI_DEVICE_LINKEDLIST.write();
     let ahci_device = ahci_device_search(&mut list)?;
     // 全局数据 - 列表
@@ -80,7 +70,7 @@ pub fn ahci_rust_init() -> Result<(), SystemError> {
     for device in ahci_device {
         let standard_device = device.as_standard_device_mut().unwrap();
         standard_device.bar_ioremap();
-        // 对于每一个ahci控制器分配一块空间 (目前slab algorithm最大支持1MB)
+        // 对于每一个ahci控制器分配一块空间
         let ahci_port_base_vaddr =
             Box::leak(Box::new([0u8; (1 << 20) as usize])) as *mut u8 as usize;
         let virtaddr = standard_device
@@ -193,7 +183,7 @@ fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
 
 /// @brief: 测试函数
 pub fn __test_ahci() {
-    let _res = ahci_rust_init();
+    let _res = ahci_init();
     let disk: Arc<LockedAhciDisk> = get_disks_by_name("ahci_disk_0".to_string()).unwrap();
     #[deny(overflowing_literals)]
     let mut buf = [0u8; 3000usize];

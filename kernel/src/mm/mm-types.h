@@ -1,6 +1,5 @@
 #pragma once
 #include <common/glib.h>
-#include <common/semaphore.h>
 #include <common/spinlock.h>
 #include <common/atomic.h>
 

@@ -15,7 +15,6 @@
 #include <common/fcntl.h>
 #include <common/glib.h>
 #include <common/lockref.h>
-#include <common/user_namespace.h>
 #include <DragonOS/stdint.h>
 #include <mm/slab.h>
 

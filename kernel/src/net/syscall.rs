@@ -5,7 +5,6 @@ use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
 
 use crate::{
-    arch::asm::current::current_pcb,
     filesystem::vfs::{
         file::{File, FileMode},
         syscall::{IoVec, IoVecs},
@@ -13,6 +12,7 @@ use crate::{
     include::bindings::bindings::verify_area,
     libs::spinlock::SpinLockGuard,
     net::socket::{AddressFamily, SOL_SOCKET},
+    process::ProcessManager,
     syscall::{Syscall, SystemError},
 };
 
@@ -59,7 +59,11 @@ impl Syscall {
         let f = File::new(socketinode, FileMode::O_RDWR)?;
         // kdebug!("do_socket: f: {f:?}");
         // 把socket添加到当前进程的文件描述符表中
-        let fd = current_pcb().alloc_fd(f, None).map(|x| x as usize);
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+
+        let fd = fd_table_guard.alloc_fd(f, None).map(|x| x as usize);
+        drop(fd_table_guard);
         // kdebug!("do_socket: fd: {fd:?}");
         return fd;
     }
@@ -77,7 +81,7 @@ impl Syscall {
         optname: usize,
         optval: &[u8],
     ) -> Result<usize, SystemError> {
-        let socket_inode: Arc<SocketInode> = current_pcb()
+        let socket_inode: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         // 获取内层的socket（真正的数据）
@@ -103,7 +107,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 获取socket
         let optval = optval as *mut u32;
-        let binding: Arc<SocketInode> = current_pcb()
+        let binding: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = binding.inner();
@@ -166,7 +170,7 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn connect(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<usize, SystemError> {
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = socket.inner();
@@ -184,7 +188,7 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn bind(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<usize, SystemError> {
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = socket.inner();
@@ -214,7 +218,7 @@ impl Syscall {
             Some(SockAddr::to_endpoint(addr, addrlen)?)
         };
 
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = socket.inner();
@@ -237,7 +241,7 @@ impl Syscall {
         addr: *mut SockAddr,
         addrlen: *mut u32,
     ) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = socket.inner();
@@ -268,7 +272,7 @@ impl Syscall {
         // 检查每个缓冲区地址是否合法，生成iovecs
         let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = socket.inner();
@@ -297,7 +301,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn listen(fd: usize, backlog: usize) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = socket.inner();
@@ -312,7 +316,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn shutdown(fd: usize, how: usize) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = socket.inner();
@@ -328,7 +332,7 @@ impl Syscall {
     ///
     /// @return 成功返回新的文件描述符，失败返回错误码
     pub fn accept(fd: usize, addr: *mut SockAddr, addrlen: *mut u32) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         // kdebug!("accept: socket={:?}", socket);
@@ -340,7 +344,10 @@ impl Syscall {
         // kdebug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
         let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
-        let new_fd = current_pcb().alloc_fd(File::new(new_socket, FileMode::O_RDWR)?, None)?;
+        let new_fd = ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(File::new(new_socket, FileMode::O_RDWR)?, None)?;
         // kdebug!("accept: new_fd={}", new_fd);
         if !addr.is_null() {
             // kdebug!("accept: write remote_endpoint to user");
@@ -371,7 +378,7 @@ impl Syscall {
         if addr.is_null() {
             return Err(SystemError::EINVAL);
         }
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = socket.inner();
@@ -401,7 +408,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        let socket: Arc<SocketInode> = current_pcb()
+        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = socket.inner();

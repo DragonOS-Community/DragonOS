@@ -4,8 +4,9 @@ use core::{
 };
 
 use crate::{
-    driver::uart::uart_device::{c_uart_send, UartPort},
-    include::bindings::bindings::video_frame_buffer_info,
+    driver::{
+        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
+    },
     syscall::SystemError,
 };
 
@@ -21,15 +22,11 @@ pub static NO_ALLOC_OPERATIONS_INDEX: AtomicI32 = AtomicI32::new(0);
 
 /// 当系统刚启动的时候，由于内存管理未初始化，而texiui需要动态内存分配。因此只能暂时暴力往屏幕（video_frame_buffer_info）输出信息
 pub fn textui_init_no_alloc() {
-    TRUE_LINE_NUM.store(
-        unsafe { (video_frame_buffer_info.height / TEXTUI_CHAR_HEIGHT) as i32 },
-        Ordering::SeqCst,
-    );
+    let height = video_refresh_manager().device_buffer().height();
+    let width = video_refresh_manager().device_buffer().width();
+    TRUE_LINE_NUM.store((height / TEXTUI_CHAR_HEIGHT) as i32, Ordering::SeqCst);
 
-    CHAR_PER_LINE.store(
-        unsafe { (video_frame_buffer_info.width / TEXTUI_CHAR_WIDTH) as i32 },
-        Ordering::SeqCst,
-    );
+    CHAR_PER_LINE.store((width / TEXTUI_CHAR_WIDTH) as i32, Ordering::SeqCst);
 }
 
 pub fn no_init_textui_putchar_window(
@@ -45,13 +42,12 @@ pub fn no_init_textui_putchar_window(
     if unlikely(character == '\0') {
         return Ok(());
     }
-
-    c_uart_send(UartPort::COM1.to_u16(), character as u8);
+    send_to_default_serial8250_port(&[character as u8]);
 
     // 进行换行操作
     if unlikely(character == '\n') {
         // 换行时还需要输出\r
-        c_uart_send(UartPort::COM1.to_u16(), b'\r');
+        send_to_default_serial8250_port(&[b'\r']);
         if is_put_to_window == true {
             NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);
             NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);

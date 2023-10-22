@@ -3,7 +3,7 @@ use crate::{
     include::bindings::bindings::video_frame_buffer_info,
     kinfo,
     libs::{lib_ui::font::FONT_8x16, spinlock::SpinLock},
-    syscall::SystemError,
+    syscall::{Syscall, SystemError}, time::Duration,
 };
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};
 use alloc::{sync::Arc, vec::Vec};
@@ -18,6 +18,7 @@ use super::{
     screen_manager::{
         scm_register, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
     },
+    termios::Winsize,
     textui_no_alloc::no_init_textui_putchar_window,
 };
 
@@ -320,7 +321,7 @@ impl TextuiCharChromatic {
         lineindex: LineIndex,
     ) -> Result<i32, SystemError> {
         // 找到要渲染的字符的像素点数据
-        if self.c==Some('\n'){
+        if self.c == Some('\n') {
             return Ok(0);
         }
         let font: Font = Font::get_font(self.c.unwrap_or(' '));
@@ -440,11 +441,54 @@ impl WindowId {
 }
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
+pub struct Cursor {
+    x: LineIndex,
+    y: LineId,
+}
+impl Cursor {
+    pub fn new(x: i32, y: i32) -> Self {
+        let x = LineIndex::new(x);
+        let y = LineId::new(y);
+        return Cursor { x, y };
+    }
+    pub fn get_x(&self) -> LineIndex {
+        return self.x;
+    }
+    pub fn get_y(&self) -> LineId {
+        return self.y;
+    }
+    pub fn set_x(&mut self, x: i32) {
+        self.x = LineIndex::new(x);
+    }
+    pub fn set_y(&mut self, y: i32) {
+        self.y = LineId::new(y);
+    }
+    pub fn move_up(&mut self, n: i32) {
+        self.y = self.y - n;
+    }
+    pub fn move_down(&mut self, n: i32) {
+        self.y = self.y + n;
+    }
+    pub fn move_left(&mut self, n: i32) {
+        self.x = self.x - n;
+    }
+    pub fn move_right(&mut self, n: i32) {
+        self.x = self.x + n;
+    }
+    pub fn move_newline(&mut self, n: i32) {
+        self.y = self.y + n;
+        self.set_x(0);
+    }
+    pub fn reset(&mut self) {
+        self.set_x(0);
+        self.set_y(0);
+    }
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
 pub struct TextuiWindow {
     // 虚拟行是个循环表，头和尾相接
     id: WindowId,
-    // 虚拟行总数
-    vline_sum: i32,
     // 当前已经使用了的虚拟行总数（即在已经输入到缓冲区（之后显示在屏幕上）的虚拟行数量）
     vlines_used: i32,
     // 位于最顶上的那一个虚拟行的行号
@@ -452,11 +496,13 @@ pub struct TextuiWindow {
     // 储存虚拟行的数组
     vlines: Vec<TextuiVline>,
     // 正在操作的vline
-    vline_operating: LineId,
-    // 每行最大容纳的字符数
-    chars_per_line: i32,
+    // vline_operating: LineId,
     // 窗口flag
     flags: WindowFlag,
+    // 窗口大小
+    winsize: Winsize,
+    // 光标位置
+    cursor: Cursor,
 }
 
 impl TextuiWindow {
@@ -478,12 +524,19 @@ impl TextuiWindow {
         TextuiWindow {
             id: WindowId::new(),
             flags,
-            vline_sum: vlines_num,
+            // vline_sum: vlines_num,
             vlines_used: 1,
             top_vline: LineId::new(0),
             vlines: initial_vlines,
-            vline_operating: LineId::new(0),
-            chars_per_line: chars_num,
+            // vline_operating: LineId::new(0),
+            // chars_per_line: chars_num,
+            winsize: Winsize::new(
+                vlines_num,
+                chars_num,
+                vlines_num * TEXTUI_CHAR_HEIGHT as i32,
+                chars_num * TEXTUI_CHAR_WIDTH as i32,
+            ),
+            cursor: Cursor::new(0, 0),
         }
     }
 
@@ -503,8 +556,8 @@ impl TextuiWindow {
 
         // 判断虚拟行参数是否合法
         if unlikely(
-            !vline_id.check(self.vline_sum)
-                || (<LineIndex as Into<i32>>::into(start) + count) > self.chars_per_line,
+            !vline_id.check(self.winsize.row())
+                || (<LineIndex as Into<i32>>::into(start) + count) > self.winsize.col(),
         ) {
             return Err(SystemError::EINVAL);
         }
@@ -544,11 +597,7 @@ impl TextuiWindow {
 
     fn textui_refresh_vline(&mut self, vline_id: LineId) -> Result<(), SystemError> {
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
-            return self.textui_refresh_characters(
-                vline_id,
-                LineIndex::new(0),
-                self.chars_per_line,
-            );
+            return self.textui_refresh_characters(vline_id, LineIndex::new(0), self.winsize.col());
         } else {
             //todo支持纯文本字符()
             todo!();
@@ -559,7 +608,7 @@ impl TextuiWindow {
     fn textui_refresh_vlines(&mut self, start: LineId, count: i32) -> Result<i32, SystemError> {
         let mut refresh_count = count;
         for i in <LineId as Into<i32>>::into(start)
-            ..(self.vline_sum).min(<LineId as Into<i32>>::into(start) + count)
+            ..(self.winsize.row()).min(<LineId as Into<i32>>::into(start) + count)
         {
             self.textui_refresh_vline(LineId::new(i))?;
             refresh_count -= 1;
@@ -582,16 +631,17 @@ impl TextuiWindow {
     fn textui_new_line(&mut self) -> Result<i32, SystemError> {
         // todo: 支持在两个虚拟行之间插入一个新行
         let actual_line_sum = textui_framework().actual_line.load(Ordering::SeqCst);
-        self.vline_operating = self.vline_operating + 1;
+        // self.vline_operating = self.vline_operating + 1;
+        self.cursor.move_newline(1);
         //如果已经到了最大行数，则重新从0开始
-        if !self.vline_operating.check(self.vline_sum) {
-            self.vline_operating = LineId::new(0);
+        if !self.cursor.get_y().check(self.winsize.row()) {
+            self.cursor.reset();
         }
 
         if let TextuiVline::Chromatic(vline) =
-            &mut (self.vlines[<LineId as Into<usize>>::into(self.vline_operating)])
+            &mut (self.vlines[<LineId as Into<usize>>::into(self.cursor.get_y())])
         {
-            for i in 0..self.chars_per_line {
+            for i in 0..self.winsize.col() {
                 if let Some(v_char) = vline.chars.get_mut(i as usize) {
                     v_char.c = None;
                     v_char.frcolor = FontColor::BLACK;
@@ -599,13 +649,14 @@ impl TextuiWindow {
                 }
             }
             vline.index = LineIndex::new(0);
+            self.cursor.set_x(0);
         }
         // 当已经使用的虚拟行总数等于真实行总数时，说明窗口中已经显示的文本行数已经达到了窗口的最大容量。这时，如果继续在窗口中添加新的文本，就会导致文本溢出窗口而无法显示。因此，需要往下滚动屏幕来显示更多的文本。
 
         if self.vlines_used == actual_line_sum {
             self.top_vline = self.top_vline + 1;
 
-            if !self.top_vline.check(self.vline_sum) {
+            if !self.top_vline.check(self.winsize.row()) {
                 self.top_vline = LineId::new(0);
             }
 
@@ -634,7 +685,7 @@ impl TextuiWindow {
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             let mut line_index = LineIndex::new(0); //操作的列号
             if let TextuiVline::Chromatic(vline) =
-                &mut (self.vlines[<LineId as Into<usize>>::into(self.vline_operating)])
+                &mut (self.vlines[<LineId as Into<usize>>::into(self.cursor.get_y())])
             {
                 let index = <LineIndex as Into<usize>>::into(vline.index);
 
@@ -645,6 +696,7 @@ impl TextuiWindow {
                 }
                 line_index = vline.index;
                 vline.index = vline.index + 1;
+                self.cursor.move_right(1);
             }
 
             //存储换行符后进行换行操作
@@ -654,10 +706,10 @@ impl TextuiWindow {
                 self.textui_new_line()?;
                 return Ok(());
             }
-            self.textui_refresh_characters(self.vline_operating, line_index, 1)?;
+            self.textui_refresh_characters(self.cursor.get_y(), line_index, 1)?;
 
             // 加入光标后，因为会识别光标，所以需超过该行最大字符数才能创建新行
-            if !line_index.check(self.chars_per_line - 1) {
+            if !line_index.check(self.winsize.col() - 1) {
                 self.textui_new_line()?;
             }
         } else {
@@ -709,7 +761,7 @@ impl TextuiWindow {
         else if character == '\t' {
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =
-                    &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                    &self.vlines[<LineId as Into<usize>>::into(self.cursor.get_y())]
                 {
                     //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
                     let mut space_to_print = 8 - <LineIndex as Into<usize>>::into(vline.index) % 8;
@@ -725,14 +777,15 @@ impl TextuiWindow {
             if is_enable_window == true {
                 let mut tmp = LineIndex(0);
                 if let TextuiVline::Chromatic(vline) =
-                    &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                    &mut self.vlines[<LineId as Into<usize>>::into(self.cursor.get_y())]
                 {
                     vline.index = vline.index - 1;
+                    self.cursor.move_left(1);
                     tmp = vline.index;
                 }
                 if <LineIndex as Into<i32>>::into(tmp) >= 0 {
                     if let TextuiVline::Chromatic(vline) =
-                        &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                        &mut self.vlines[<LineId as Into<usize>>::into(self.cursor.get_y())]
                     {
                         if let Some(v_char) =
                             vline.chars.get_mut(<LineIndex as Into<usize>>::into(tmp))
@@ -742,16 +795,17 @@ impl TextuiWindow {
                             v_char.bkcolor = bkcolor;
                         }
                     }
-                    return self.textui_refresh_characters(self.vline_operating, tmp, 1);
+                    return self.textui_refresh_characters(self.cursor.get_y(), tmp, 1);
                 }
                 // 需要向上缩一行
                 if <LineIndex as Into<i32>>::into(tmp) < 0 {
                     // 当前行为空,需要重新刷新
                     if let TextuiVline::Chromatic(vline) =
-                        &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                        &mut self.vlines[<LineId as Into<usize>>::into(self.cursor.get_y())]
                     {
                         vline.index = LineIndex::new(0);
-                        for i in 0..self.chars_per_line {
+                        self.cursor.set_x(0);
+                        for i in 0..self.winsize.col() {
                             if let Some(v_char) = vline.chars.get_mut(i as usize) {
                                 v_char.c = None;
                                 v_char.frcolor = FontColor::BLACK;
@@ -760,16 +814,18 @@ impl TextuiWindow {
                         }
                     }
                     // 上缩一行
-                    self.vline_operating = self.vline_operating - 1;
-                    if self.vline_operating.data() < 0 {
-                        self.vline_operating = LineId(self.vline_sum - 1);
+                    // self.vline_operating = self.vline_operating - 1;
+                    self.cursor.move_newline(-1);
+                    if self.cursor.get_y().data() < 0 {
+                        // self.vline_operating = LineId(self.winsize.row() - 1);
+                        self.cursor.move_newline(self.winsize.row() - 1);
                     }
 
                     // 考虑是否向上滚动（在top_vline上退格）
                     if self.vlines_used > actual_line_sum {
                         self.top_vline = self.top_vline - 1;
                         if <LineId as Into<i32>>::into(self.top_vline) < 0 {
-                            self.top_vline = LineId(self.vline_sum - 1);
+                            self.top_vline = LineId(self.winsize.row() - 1);
                         }
                     }
                     //因为上缩一行所以显示在屏幕中的虚拟行少一
@@ -785,9 +841,9 @@ impl TextuiWindow {
 
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =
-                    &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+                    &self.vlines[<LineId as Into<usize>>::into(self.cursor.get_y())]
                 {
-                    if !vline.index.check(self.chars_per_line) {
+                    if !vline.index.check(self.winsize.col()) {
                         self.textui_new_line()?;
                     }
 
@@ -798,18 +854,46 @@ impl TextuiWindow {
 
         return Ok(());
     }
+    /// 窗口闪烁显示光标
+    pub fn show_cursor_window(&mut self) {
+        let mut duration = Duration::from_secs(1);
+        let handle = thread::spawn(move || {
+            loop {
+                self.textui_putchar_window('|', FontColor::WHITE, FontColor::BLACK, ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst));
+                std::thread::sleep(duration);
+      
+                cursor.move_left(1);
+                clear_line(&mut stdout, cursor.x());
+                stdout.flush().unwrap();
+                std::thread::sleep(duration);
+            }
+        });
+      
+        handle.join().unwrap();
+    }
+    /// 用户使用该函数通过方向键在任意位置进行输入字符
+    pub fn textui_putchar_window_for_user(
+        &mut self,
+        character: char,
+        frcolor: FontColor,
+        bkcolor: FontColor,
+        is_enable_window: bool,
+    ) {
+    }
 }
 impl Default for TextuiWindow {
     fn default() -> Self {
         TextuiWindow {
             id: WindowId(0),
             flags: WindowFlag::TEXTUI_CHROMATIC,
-            vline_sum: 0,
+            // winsize.row(): 0,
             vlines_used: 1,
             top_vline: LineId::new(0),
             vlines: Vec::new(),
-            vline_operating: LineId::new(0),
-            chars_per_line: 0,
+            // vline_operating: LineId::new(0),
+            // chars_per_line: 0,
+            winsize: Winsize::new(0, 0, 0, 0),
+            cursor: Cursor::new(0, 0),
         }
     }
 }

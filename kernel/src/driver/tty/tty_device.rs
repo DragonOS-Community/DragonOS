@@ -5,16 +5,24 @@ use alloc::{
 };
 
 use crate::{
+    driver::uart::uart::{c_uart_send_str, UartPort},
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE},
+        vfs::{
+            file::FileMode,
+            ioctl::IoctlCmd,
+            FilePrivateData, FileType, IndexNode, Metadata, ROOT_INODE,
+        },
     },
-    kerror,
+    kerror, kinfo,
     libs::{
-        lib_ui::{textui::{textui_putchar, FontColor}, termios::{Winsize, Termios}},
+        lib_ui::{
+            termios::{Lflag, Termios, Winsize},
+            textui::{textui_putchar, FontColor},
+        },
         rwlock::RwLock,
     },
-    syscall::SystemError, kinfo,
+    syscall::SystemError,
 };
 
 use super::{TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
@@ -35,7 +43,7 @@ pub struct TtyDevice {
     /// TTY设备私有信息
     private_data: RwLock<TtyDevicePrivateData>,
     /// 终端窗口大小(主要用于终端模拟器)
-    winsize:RwLock<Winsize>,
+    winsize: RwLock<Winsize>,
     /// 终端窗口属性
     termios: RwLock<Termios>,
 }
@@ -59,7 +67,15 @@ impl TtyDevice {
             termios: RwLock::new(Termios::default()),
         });
         // 默认开启输入回显
-        result.core.enable_echo();
+        // result.core.enable_echo();
+        let cmd=IoctlCmd::into(IoctlCmd::ENABLEECHO);
+        let r = result
+            .ioctl(cmd, 0)
+            .map(|_| 0)
+            .unwrap_or_else(|e| e.to_posix_errno());
+        if r.is_negative() {
+            c_uart_send_str(UartPort::COM1.to_u16(), "enable echo failed.\n\0".as_ptr());
+        }
         return result;
     }
 
@@ -263,7 +279,6 @@ impl IndexNode for TtyDevice {
                 break;
             }
             // 输出到屏幕
-
             for x in buf {
                 textui_putchar(x as char, FontColor::WHITE, FontColor::BLACK).ok();
             }
@@ -271,47 +286,40 @@ impl IndexNode for TtyDevice {
         return Ok(());
     }
     fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
-        let cmd = cmd as usize;
-         match cmd {
-            //  TIOCGPGRP => {
-            //      // TODO: check the pointer?
-            //      let argp = data as *mut i32; // pid_t
-            //      unsafe { *argp = *self.foreground_pgid.read() };
-            //      Ok(0)
-            //  }
-            //  TIOCSPGRP => {
-            //      let fpgid = unsafe { *(data as *const i32) };
-            //      *self.foreground_pgid.write() = fpgid;
-            //      info!("tty: set foreground process group to {}", fpgid);
-            //      Ok(0)
-            //  }
-             TIOCGWINSZ => {
-                 let winsize = data as *mut Winsize;
-                 unsafe {
-                     *winsize = *self.winsize.read();
-                 }
-                 Ok(0)
-             }
-             TCGETS => {
-                 let termois = data as *mut Termios;
-                 unsafe {
-                     *termois = *self.termios.read();
-                 }
-                 let lflag = self.termios.read().lflag;
-                 kinfo!("get lfags: {:?}", lflag);
-                 Ok(0)
-             }
-             TCSETS => {
-                 let termois = data as *const Termios;
-                 unsafe {
-                     *self.termios.write() = *termois;
-                 }
-                 let lflag = self.termios.read().lflag;
-                 kinfo!("set lfags: {:?}", lflag);
-                 Ok(0)
-             }
-             _ => Err(SystemError::EBADRQC),
-         } 
+        let cmd: IoctlCmd = IoctlCmd::from(cmd);
+        match cmd {
+            IoctlCmd::GETWINSZ => {
+                let winsize = data as *mut Winsize;
+                unsafe {
+                    *winsize = *self.winsize.read();
+                }
+                Ok(0)
+            },
+            IoctlCmd::SETWINSZ => {
+                let winsize = data as *const Winsize;
+                unsafe {
+                    *self.winsize.write() = *winsize;
+                }
+                Ok(0)
+            },
+            IoctlCmd::ENABLEECHO => {
+                let mut termios = self.termios.write();
+                let mut lflag = termios.lflag;
+                lflag |= Lflag::ECHO;
+                termios.lflag = lflag;
+                self.core.enable_echo();
+                Ok(0)
+            },
+            IoctlCmd::DISABLEECHO => {
+                let mut termios = self.termios.write();
+                let mut lflag = termios.lflag;
+                lflag |= !Lflag::ECHO;
+                termios.lflag = lflag;
+                self.core.disable_echo();
+                Ok(0)
+            },
+            _ => Err(SystemError::EBADRQC),
+        }
     }
 }
 

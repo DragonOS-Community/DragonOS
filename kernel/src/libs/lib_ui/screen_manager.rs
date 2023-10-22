@@ -7,27 +7,22 @@ use core::{
 use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
 
 use crate::{
-    driver::uart::uart::{c_uart_send_str, UartPort},
-    include::bindings::bindings::{
-        scm_buffer_info_t, video_frame_buffer_info, video_reinitialize, video_set_refresh_target,
+    driver::{
+        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
     },
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::VirtAddr,
     syscall::SystemError,
 };
 
-use lazy_static::lazy_static;
-
 use super::textui_no_alloc::textui_init_no_alloc;
 
-lazy_static! {
-    /// 全局的UI框架列表
-    pub static ref SCM_FRAMEWORK_LIST: SpinLock<LinkedList<Arc<dyn ScmUiFramework>>> =
-        SpinLock::new(LinkedList::new());
-    /// 当前在使用的UI框架
-    pub static ref CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
+/// 全局的UI框架列表
+pub static SCM_FRAMEWORK_LIST: SpinLock<LinkedList<Arc<dyn ScmUiFramework>>> =
+    SpinLock::new(LinkedList::new());
 
-}
+/// 当前在使用的UI框架
+pub static CURRENT_FRAMEWORK: RwLock<Option<Arc<dyn ScmUiFramework>>> = RwLock::new(None);
 
 /// 是否启用双缓冲
 pub static SCM_DOUBLE_BUFFER_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -48,12 +43,13 @@ pub enum ScmFramworkType {
     Gui,
     Unused,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ScmBuffer {
-    DeviceBuffer(Option<VirtAddr>),
-    DoubleBuffer(Option<Box<[u32]>>),
+    DeviceBuffer(VirtAddr),
+    DoubleBuffer(Arc<SpinLock<Box<[u32]>>>),
 }
-#[derive(Debug)]
+
+#[derive(Debug, Clone)]
 pub struct ScmBufferInfo {
     width: u32,     // 帧缓冲区宽度（pixel或columns）
     height: u32,    // 帧缓冲区高度（pixel或lines）
@@ -62,29 +58,8 @@ pub struct ScmBufferInfo {
     pub buf: ScmBuffer,
     flags: ScmBufferFlag, // 帧缓冲区标志位
 }
-impl Clone for ScmBufferInfo {
-    fn clone(&self) -> Self {
-        match self.buf {
-            ScmBuffer::DeviceBuffer(_) => ScmBufferInfo {
-                width: self.width,
-                height: self.height,
-                size: self.size,
-                bit_depth: self.bit_depth,
-                flags: self.flags,
-                buf: ScmBuffer::DeviceBuffer(Option::None),
-            },
-            ScmBuffer::DoubleBuffer(_) => ScmBufferInfo {
-                width: self.width,
-                height: self.height,
-                size: self.size,
-                bit_depth: self.bit_depth,
-                flags: self.flags,
-                buf: ScmBuffer::DoubleBuffer(Option::None),
-            },
-        }
-    }
-}
 
+#[allow(dead_code)]
 impl ScmBufferInfo {
     /// 创建新的帧缓冲区信息
     ///
@@ -95,78 +70,77 @@ impl ScmBufferInfo {
     /// ## 返回值
     ///
     /// - `Result<Self, SystemError>` 创建成功返回新的帧缓冲区结构体，创建失败返回错误码
-    pub fn new(buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
+    pub fn new(mut buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
         if unlikely(SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == false) {
-            let buf_info = ScmBufferInfo::from(unsafe { &video_frame_buffer_info });
-
-            return Ok(buf_info);
+            let mut device_buffer = video_refresh_manager().device_buffer().clone();
+            buf_type.remove(ScmBufferFlag::SCM_BF_DB);
+            buf_type.insert(ScmBufferFlag::SCM_BF_FB);
+            device_buffer.flags = buf_type;
+            return Ok(device_buffer);
         } else {
-            // 创建双缓冲区
-            let mut frame_buffer_info: ScmBufferInfo =
-                ScmBufferInfo::from(unsafe { &video_frame_buffer_info });
+            let device_buffer_guard = video_refresh_manager().device_buffer();
 
-            frame_buffer_info.flags = buf_type;
-            // 这里还是改成使用box来存储数组，如果直接用vec存储，在multiboot2_iter那里会报错，不知为何
-            frame_buffer_info.buf = ScmBuffer::DoubleBuffer(Some(
-                Box::new(vec![
-                    0;
-                    unsafe { (video_frame_buffer_info.size / 4) as usize }
-                ])
-                .into_boxed_slice(),
+            let buf_space: Arc<SpinLock<Box<[u32]>>> = Arc::new(SpinLock::new(
+                vec![0u32; (device_buffer_guard.size / 4) as usize].into_boxed_slice(),
             ));
 
-            return Ok(frame_buffer_info);
+            assert!(buf_type.contains(ScmBufferFlag::SCM_BF_DB));
+
+            assert_eq!(
+                device_buffer_guard.size as usize,
+                buf_space.lock().len() * core::mem::size_of::<u32>()
+            );
+
+            // 创建双缓冲区
+            let buffer = Self {
+                width: device_buffer_guard.width,
+                height: device_buffer_guard.height,
+                size: device_buffer_guard.size,
+                bit_depth: device_buffer_guard.bit_depth,
+                flags: buf_type,
+                buf: ScmBuffer::DoubleBuffer(buf_space),
+            };
+            drop(device_buffer_guard);
+
+            return Ok(buffer);
         }
     }
 
-    // 重构了video后可以删除
-    fn vaddr(&mut self) -> VirtAddr {
-        match &self.buf {
-            ScmBuffer::DeviceBuffer(vaddr) => {
-                if !vaddr.is_none() {
-                    vaddr.unwrap()
-                } else {
-                    return VirtAddr::new(0);
-                }
-            }
-            ScmBuffer::DoubleBuffer(buf) => {
-                if !buf.is_none() {
-                    let address = self.buf().as_ptr();
-                    VirtAddr::new(address as usize)
-                } else {
-                    return VirtAddr::new(0);
-                }
-            }
-        }
+    pub unsafe fn new_device_buffer(
+        width: u32,
+        height: u32,
+        size: u32,
+        bit_depth: u32,
+        buf_type: ScmBufferFlag,
+        vaddr: VirtAddr,
+    ) -> Result<Self, SystemError> {
+        let buffer = Self {
+            width,
+            height,
+            size,
+            bit_depth,
+            flags: buf_type,
+            buf: ScmBuffer::DeviceBuffer(vaddr),
+        };
+        return Ok(buffer);
     }
 
-    fn buf(&mut self) -> &mut [u32] {
-        let len = self.buf_size() / 4;
-        match &mut self.buf {
-            ScmBuffer::DoubleBuffer(buf) => match buf.as_mut() {
-                Some(buf) => buf,
-                None => panic!("Buffer is none"),
-            },
-            ScmBuffer::DeviceBuffer(vaddr) => match vaddr.as_mut() {
-                Some(vaddr) => {
-                    let buf: &mut [u32] = unsafe {
-                        core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len as usize)
-                    };
-                    return buf;
-                }
-                None => panic!("Buffer is none"),
-            },
-        }
+    pub fn buf_size(&self) -> usize {
+        self.size as usize
     }
-    pub fn buf_size(&self) -> u32 {
-        self.size
+
+    pub fn bit_depth(&self) -> u32 {
+        self.bit_depth
     }
-    pub fn buf_height(&self) -> u32 {
+
+    pub fn height(&self) -> u32 {
         self.height
     }
-    pub fn buf_width(&self) -> u32 {
+
+    pub fn width(&self) -> u32 {
         self.width
     }
+
     pub fn is_double_buffer(&self) -> bool {
         match &self.buf {
             ScmBuffer::DoubleBuffer(_) => true,
@@ -179,34 +153,46 @@ impl ScmBufferInfo {
             _ => false,
         }
     }
+
+    pub fn copy_from_nonoverlapping(&mut self, src: &ScmBufferInfo) {
+        assert!(self.buf_size() == src.buf_size());
+        match &self.buf {
+            ScmBuffer::DeviceBuffer(vaddr) => {
+                let len = self.buf_size() / core::mem::size_of::<u32>();
+                let self_buf_guard =
+                    unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len) };
+                match &src.buf {
+                    ScmBuffer::DeviceBuffer(vaddr) => {
+                        let src_buf_guard =
+                            unsafe { core::slice::from_raw_parts(vaddr.data() as *const u32, len) };
+                        self_buf_guard.copy_from_slice(src_buf_guard);
+                    }
+                    ScmBuffer::DoubleBuffer(double_buffer) => {
+                        let src_buf_guard = double_buffer.lock();
+                        self_buf_guard.copy_from_slice(src_buf_guard.as_ref());
+                    }
+                };
+            }
+
+            ScmBuffer::DoubleBuffer(double_buffer) => {
+                let mut double_buffer_guard = double_buffer.lock();
+                match &src.buf {
+                    ScmBuffer::DeviceBuffer(vaddr) => {
+                        let len = src.buf_size() / core::mem::size_of::<u32>();
+                        double_buffer_guard.as_mut().copy_from_slice(unsafe {
+                            core::slice::from_raw_parts(vaddr.data() as *const u32, len)
+                        });
+                    }
+                    ScmBuffer::DoubleBuffer(double_buffer) => {
+                        let x = double_buffer.lock();
+                        double_buffer_guard.as_mut().copy_from_slice(x.as_ref());
+                    }
+                };
+            }
+        }
+    }
 }
 
-// 重构了video后可以删除
-impl From<&scm_buffer_info_t> for ScmBufferInfo {
-    fn from(value: &scm_buffer_info_t) -> Self {
-        Self {
-            width: value.width,
-            height: value.height,
-            size: value.size,
-            bit_depth: value.bit_depth,
-            buf: ScmBuffer::DeviceBuffer(Some(VirtAddr::new(value.vaddr as usize))),
-            flags: ScmBufferFlag::from_bits_truncate(value.flags as u8),
-        }
-    }
-}
-impl Into<scm_buffer_info_t> for ScmBufferInfo {
-    fn into(mut self) -> scm_buffer_info_t {
-        let vaddr = self.vaddr();
-        scm_buffer_info_t {
-            width: self.width,
-            height: self.height,
-            size: self.size,
-            bit_depth: self.bit_depth,
-            vaddr: vaddr.data() as u64,
-            flags: self.flags.bits as u64,
-        }
-    }
-}
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct ScmUiFrameworkId(u32);
 
@@ -234,7 +220,10 @@ impl ScmUiFrameworkMetadata {
                     id: ScmUiFrameworkId::new(),
                     name,
                     framework_type: ScmFramworkType::Text,
-                    buf_info: ScmBufferInfo::new(ScmBufferFlag::SCM_BF_TEXT).unwrap(),
+                    buf_info: ScmBufferInfo::new(
+                        ScmBufferFlag::SCM_BF_TEXT | ScmBufferFlag::SCM_BF_DB,
+                    )
+                    .unwrap(),
                 };
 
                 return result;
@@ -248,22 +237,6 @@ impl ScmUiFrameworkMetadata {
     }
     pub fn set_buf_info(&mut self, buf_info: ScmBufferInfo) {
         self.buf_info = buf_info;
-    }
-    pub fn buf_is_none(&self) -> bool {
-        match &self.buf_info.buf {
-            ScmBuffer::DeviceBuffer(vaddr) => {
-                return vaddr.is_none();
-            }
-            ScmBuffer::DoubleBuffer(buf) => {
-                return buf.is_none();
-            }
-        }
-    }
-    pub fn buf(&mut self) -> &mut [u32] {
-        if self.buf_is_none() {
-            panic!("buf is none");
-        }
-        self.buf_info.buf()
     }
 }
 pub trait ScmUiFramework: Sync + Send + Debug {
@@ -301,13 +274,12 @@ pub trait ScmUiFramework: Sync + Send + Debug {
 /// ## 调用时机
 ///
 /// 该函数在内核启动的早期进行调用。调用时，内存管理模块尚未初始化。
-#[no_mangle]
-pub extern "C" fn scm_init() {
+pub fn scm_init() {
     SCM_DOUBLE_BUFFER_ENABLED.store(false, Ordering::SeqCst); // 禁用双缓冲
 
     textui_init_no_alloc();
 
-    c_uart_send_str(UartPort::COM1.to_u16(), "\nfinish_scm_init\n\0".as_ptr());
+    send_to_default_serial8250_port("\nfinish_scm_init\n\0".as_bytes());
 }
 
 /// 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
@@ -325,15 +297,10 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
     let mut current_framework = CURRENT_FRAMEWORK.write();
 
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == true {
-        let buf: scm_buffer_info_t = metadata.buf_info.into();
-        let retval = unsafe { video_set_refresh_target(buf) };
-        if retval == 0 {
-            framework.enable()?;
-        }
-    } else {
-        framework.enable()?;
+        video_refresh_manager().set_refresh_target(&metadata.buf_info)?;
     }
 
+    framework.enable()?;
     current_framework.replace(framework);
 
     return Ok(0);
@@ -357,20 +324,9 @@ pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemErr
     return Ok(0);
 }
 
-/// 允许双缓冲区
-#[no_mangle]
-pub extern "C" fn scm_enable_double_buffer() -> i32 {
-    let r = true_scm_enable_double_buffer().unwrap_or_else(|e| e.to_posix_errno());
-    if r.is_negative() {
-        c_uart_send_str(
-            UartPort::COM1.to_u16(),
-            "scm enable double buffer fail.\n\0".as_ptr(),
-        );
-    }
-
-    return r;
-}
-fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
+/// 屏幕管理器启用双缓冲区
+#[allow(dead_code)]
+pub fn scm_enable_double_buffer() -> Result<i32, SystemError> {
     if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) {
         // 已经开启了双缓冲区了, 直接退出
         return Ok(0);
@@ -383,17 +339,19 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
     drop(scm_list);
     SCM_DOUBLE_BUFFER_ENABLED.store(true, Ordering::SeqCst);
     // 创建双缓冲区
-    let mut buf_info = ScmBufferInfo::new(ScmBufferFlag::SCM_BF_DB | ScmBufferFlag::SCM_BF_PIXEL)?;
-    let mut refresh_target_buf: scm_buffer_info_t = buf_info.clone().into();
-    // 重构video后进行修改
-    refresh_target_buf.vaddr = buf_info.vaddr().data() as u64;
+    let buf_info = ScmBufferInfo::new(ScmBufferFlag::SCM_BF_DB | ScmBufferFlag::SCM_BF_PIXEL)?;
+
+    // 设置定时刷新的对象
+    video_refresh_manager()
+        .set_refresh_target(&buf_info)
+        .expect("set refresh target failed");
+
+    // 设置当前框架的帧缓冲区
     CURRENT_FRAMEWORK
         .write()
         .as_ref()
         .unwrap()
         .change(buf_info)?;
-    // 设置定时刷新的对象
-    unsafe { video_set_refresh_target(refresh_target_buf) };
     // 遍历当前所有使用帧缓冲区的框架，更新为双缓冲区
     for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
         if !(*framework).metadata()?.buf_info.is_double_buffer() {
@@ -403,14 +361,14 @@ fn true_scm_enable_double_buffer() -> Result<i32, SystemError> {
         }
     }
     // 通知显示驱动，启动双缓冲
-    unsafe { video_reinitialize(true) };
+    video_refresh_manager().video_reinitialize(true)?;
 
     return Ok(0);
 }
+
 /// 允许往窗口打印信息
-#[no_mangle]
 pub fn scm_enable_put_to_window() {
-    // mm之前要继续往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
+    // mm之前要继续往窗口打印信息时，因为没有动态内存分配(textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
         super::textui::ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
     } else {
@@ -421,15 +379,11 @@ pub fn scm_enable_put_to_window() {
             .enable()
             .unwrap_or_else(|e| e.to_posix_errno());
         if r.is_negative() {
-            c_uart_send_str(
-                UartPort::COM1.to_u16(),
-                "scm_enable_put_to_window() failed.\n\0".as_ptr(),
-            );
+            send_to_default_serial8250_port("scm_enable_put_to_window() failed.\n\0".as_bytes());
         }
     }
 }
 /// 禁止往窗口打印信息
-#[no_mangle]
 pub fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
@@ -443,10 +397,7 @@ pub fn scm_disable_put_to_window() {
             .disable()
             .unwrap_or_else(|e| e.to_posix_errno());
         if r.is_negative() {
-            c_uart_send_str(
-                UartPort::COM1.to_u16(),
-                "scm_disable_put_to_window() failed.\n\0".as_ptr(),
-            );
+            send_to_default_serial8250_port("scm_disable_put_to_window() failed.\n\0".as_bytes());
         }
     }
 }
@@ -455,17 +406,20 @@ pub fn scm_disable_put_to_window() {
 pub extern "C" fn scm_reinit() -> i32 {
     let r = true_scm_reinit().unwrap_or_else(|e| e.to_posix_errno());
     if r.is_negative() {
-        c_uart_send_str(UartPort::COM1.to_u16(), "scm reinit failed.\n\0".as_ptr());
+        send_to_default_serial8250_port("scm reinit failed.\n\0".as_bytes());
     }
     return r;
 }
 fn true_scm_reinit() -> Result<i32, SystemError> {
-    unsafe { video_reinitialize(false) };
+    video_refresh_manager()
+        .video_reinitialize(false)
+        .expect("video reinitialize failed");
 
     // 遍历当前所有使用帧缓冲区的框架，更新地址
+    let device_buffer = video_refresh_manager().device_buffer().clone();
     for framework in SCM_FRAMEWORK_LIST.lock().iter_mut() {
         if framework.metadata()?.buf_info().is_device_buffer() {
-            framework.change(unsafe { ScmBufferInfo::from(&video_frame_buffer_info) })?;
+            framework.change(device_buffer.clone())?;
         }
     }
 

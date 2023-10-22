@@ -95,6 +95,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
 }
 
 /// 内存分配错误处理函数
+#[cfg(target_os = "none")]
 #[alloc_error_handler]
 pub fn global_alloc_err_handler(layout: Layout) -> ! {
     panic!("global_alloc_error, layout: {:?}", layout);

@@ -5,7 +5,7 @@ use hashbrown::HashSet;
 use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
-use crate::driver::uart::uart::c_uart_send_str;
+use crate::driver::tty::serial::serial8250::send_to_default_serial8250_port;
 use crate::include::bindings::bindings::{
     multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
 };
@@ -14,7 +14,7 @@ use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 
-use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount};
+use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::mmio_buddy::mmio_init;
 use crate::{
     arch::MMArch,
@@ -148,7 +148,7 @@ impl MemoryManagementArch for X86_64MMArch {
         // 初始化物理内存区域(从multiboot2中获取)
         let areas_count =
             Self::init_memory_area_from_multiboot2().expect("init memory area failed");
-        c_uart_send_str(0x3f8, "x86 64 init end\n\0".as_ptr());
+        send_to_default_serial8250_port("x86 64 init end\n\0".as_bytes());
 
         return &PHYS_MEMORY_AREAS[0..areas_count];
     }
@@ -229,7 +229,7 @@ impl X86_64MMArch {
     unsafe fn init_memory_area_from_multiboot2() -> Result<usize, SystemError> {
         // 这个数组用来存放内存区域的信息（从C获取）
         let mut mb2_mem_info: [multiboot_mmap_entry_t; 512] = mem::zeroed();
-        c_uart_send_str(0x3f8, "init_memory_area_from_multiboot2 begin\n\0".as_ptr());
+        send_to_default_serial8250_port("init_memory_area_from_multiboot2 begin\n\0".as_bytes());
 
         let mut mb2_count: u32 = 0;
         multiboot2_iter(
@@ -237,7 +237,7 @@ impl X86_64MMArch {
             &mut mb2_mem_info as *mut [multiboot_mmap_entry_t; 512] as usize as *mut c_void,
             &mut mb2_count,
         );
-        c_uart_send_str(0x3f8, "init_memory_area_from_multiboot2 2\n\0".as_ptr());
+        send_to_default_serial8250_port("init_memory_area_from_multiboot2 2\n\0".as_bytes());
 
         let mb2_count = mb2_count as usize;
         let mut areas_count = 0usize;
@@ -255,7 +255,7 @@ impl X86_64MMArch {
                 areas_count += 1;
             }
         }
-        c_uart_send_str(0x3f8, "init_memory_area_from_multiboot2 end\n\0".as_ptr());
+        send_to_default_serial8250_port("init_memory_area_from_multiboot2 end\n\0".as_bytes());
         kinfo!("Total memory size: {} MB, total areas from multiboot2: {mb2_count}, valid areas: {areas_count}", total_mem_size / 1024 / 1024);
 
         return Ok(areas_count);
@@ -291,7 +291,7 @@ impl VirtAddr {
 
 /// @brief 初始化内存管理模块
 pub fn mm_init() {
-    c_uart_send_str(0x3f8, "mm_init\n\0".as_ptr());
+    send_to_default_serial8250_port("mm_init\n\0".as_bytes());
     PrintkWriter
         .write_fmt(format_args!("mm_init() called\n"))
         .unwrap();
@@ -301,7 +301,7 @@ pub fn mm_init() {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        c_uart_send_str(0x3f8, "mm_init err\n\0".as_ptr());
+        send_to_default_serial8250_port("mm_init err\n\0".as_bytes());
         panic!("mm_init() can only be called once");
     }
 
@@ -389,7 +389,6 @@ unsafe fn allocator_init() {
 
     // 初始化buddy_allocator
     let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
-
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
     kinfo!("Successfully initialized buddy allocator");
@@ -513,10 +512,7 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(
-        &mut self,
-        count: crate::mm::allocator::page_frame::PageFrameCount,
-    ) -> Option<(PhysAddr, PageFrameCount)> {
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);
         } else {
@@ -524,19 +520,25 @@ impl FrameAllocator for LockedFrameAllocator {
         }
     }
 
-    unsafe fn free(
-        &mut self,
-        address: crate::mm::PhysAddr,
-        count: crate::mm::allocator::page_frame::PageFrameCount,
-    ) {
+    unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
         assert!(count.data().is_power_of_two());
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.free(address, count);
         }
     }
 
-    unsafe fn usage(&self) -> crate::mm::allocator::page_frame::PageFrameUsage {
-        todo!()
+    unsafe fn usage(&self) -> PageFrameUsage {
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+            return allocator.usage();
+        } else {
+            panic!("usage error");
+        }
+    }
+}
+
+impl LockedFrameAllocator {
+    pub fn get_usage(&self) -> PageFrameUsage {
+        unsafe { self.usage() }
     }
 }
 

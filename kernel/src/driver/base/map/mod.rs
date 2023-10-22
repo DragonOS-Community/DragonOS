@@ -1,8 +1,22 @@
-use super::device::{mkdev, DeviceNumber, KObject};
-use crate::libs::spinlock::SpinLock;
+use core::ops::{Deref, DerefMut};
+
+use super::{
+    device::{mkdev, DeviceNumber},
+    kobject::KObject,
+};
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
 const KOBJMAP_HASH_SIZE: usize = 255;
+pub(crate) const DEV_MAJOR_HASH_SIZE: usize = 255;
+pub(crate) const DEV_MAJOR_MAX: usize = 512;
+pub(crate) const MINOR_BITS: usize = 20;
+pub(crate) const MINOR_MASK: usize = 1 << MINOR_BITS - 1;
+/* Marks the bottom of the first segment of free char majors */
+pub(crate) const DEV_MAJOR_DYN_END: usize = 234;
+/* Marks the top and bottom of the second segment of free char majors */
+pub(crate) const DEV_MAJOR_DYN_EXT_START: usize = 511;
+pub(crate) const DEV_MAJOR_DYN_EXT_END: usize = 384;
 
 /// @brief: 字符设备与块设备管理结构体
 #[derive(Debug, Clone)]
@@ -95,4 +109,97 @@ pub fn kobj_lookup(domain: Arc<LockedKObjMap>, dev_t: DeviceNumber) -> Option<Ar
         }
     }
     return None;
+}
+
+// 管理字符设备号的map(加锁)
+pub struct LockedDevsMap(SpinLock<DevsMap>);
+
+impl Default for LockedDevsMap {
+    fn default() -> Self {
+        LockedDevsMap(SpinLock::new(DevsMap::default()))
+    }
+}
+
+impl LockedDevsMap {
+    #[inline(always)]
+    pub fn lock(&self) -> SpinLockGuard<DevsMap> {
+        self.0.lock()
+    }
+}
+
+// 管理字符设备号的map
+#[derive(Debug)]
+pub struct DevsMap(Vec<Vec<DeviceStruct>>);
+
+impl Default for DevsMap {
+    fn default() -> Self {
+        DevsMap(vec![Vec::new(); DEV_MAJOR_HASH_SIZE])
+    }
+}
+
+impl Deref for DevsMap {
+    type Target = Vec<Vec<DeviceStruct>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for DevsMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// 字符设备在系统中的实例，devfs通过该结构与实际字符设备进行联系
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct DeviceStruct {
+    dev_t: DeviceNumber, //起始设备号
+    minorct: usize,      // 次设备号数量
+    name: &'static str,  //字符设备名
+}
+
+impl DeviceStruct {
+    /// @brief: 创建实例
+    /// @parameter: dev_t: 设备号
+    ///             minorct: 次设备号数量
+    ///             name: 字符设备名
+    ///             char: 字符设备实例
+    /// @return: 实例
+    ///
+    #[allow(dead_code)]
+    pub fn new(dev_t: DeviceNumber, minorct: usize, name: &'static str) -> Self {
+        Self {
+            dev_t,
+            minorct,
+            name,
+        }
+    }
+
+    /// @brief: 获取起始次设备号
+    /// @parameter: None
+    /// @return: 起始设备号
+    ///
+    #[allow(dead_code)]
+    pub fn device_number(&self) -> DeviceNumber {
+        self.dev_t
+    }
+
+    /// @brief: 获取起始次设备号
+    /// @parameter: None
+    /// @return: 起始设备号
+    ///
+    #[allow(dead_code)]
+    pub fn base_minor(&self) -> usize {
+        self.dev_t.minor()
+    }
+
+    /// @brief: 获取次设备号数量
+    /// @parameter: None
+    /// @return: 次设备号数量
+    #[allow(dead_code)]
+    pub fn minorct(&self) -> usize {
+        self.minorct
+    }
 }

@@ -6,7 +6,7 @@ use smoltcp::{
 
 use crate::{libs::spinlock::SpinLock, syscall::SystemError};
 
-use super::Driver;
+use super::base::device::driver::Driver;
 
 pub mod virtio_net;
 

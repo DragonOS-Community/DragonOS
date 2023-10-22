@@ -2,7 +2,7 @@
 use core::{cmp::min, intrinsics::unlikely};
 
 use crate::{
-    filesystem::vfs::io::{device::LBA_SIZE, SeekFrom},
+    driver::base::block::{block_device::LBA_SIZE, SeekFrom},
     kwarn,
     libs::vec_cursor::VecCursor,
     syscall::SystemError,
@@ -130,7 +130,7 @@ impl FATFile {
 
             //  从磁盘上读取数据
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_offset;
-            let r = fs.partition.disk().device().read_at(
+            let r = fs.partition.disk().read_at_bytes(
                 offset as usize,
                 end_len,
                 &mut buf[start..start + end_len],
@@ -198,7 +198,7 @@ impl FATFile {
             // 计算本次写入位置在磁盘上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
             // 写入磁盘
-            let w: usize = fs.partition.disk().device().write_at(
+            let w: usize = fs.partition.disk().write_at(
                 offset as usize,
                 end_len,
                 &buf[start..start + end_len],
@@ -326,11 +326,9 @@ impl FATFile {
         }
 
         let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
-        fs.partition.disk().device().write_at(
-            range_start as usize,
-            zeroes.len(),
-            zeroes.as_slice(),
-        )?;
+        fs.partition
+            .disk()
+            .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
         return Ok(());
     }
 
@@ -612,11 +610,10 @@ impl FATDir {
                 LongDirEntry::validate_long_name(name)?;
                 // 目标目录项
                 let mut short_entry = ShortDirEntry::default();
-                // kdebug!("to allocate cluster");
+
                 let first_cluster: Cluster = fs.allocate_cluster(None)?;
                 short_entry.set_first_cluster(first_cluster);
 
-                // kdebug!("to create dot");
                 // === 接下来在子目录中创建'.'目录项和'..'目录项
                 let mut offset = 0;
                 // '.'目录项
@@ -632,7 +629,6 @@ impl FATDir {
                 // 偏移量加上一个目录项的长度
                 offset += FATRawDirEntry::DIR_ENTRY_LEN;
 
-                // kdebug!("to create dot dot");
                 // '..'目录项
                 let mut dot_dot_entry = ShortDirEntry::default();
                 dot_dot_entry.name = ShortNameGenerator::new("..").generate().unwrap();

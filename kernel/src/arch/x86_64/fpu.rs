@@ -1,4 +1,9 @@
-use core::arch::x86_64::{_fxrstor64, _fxsave64};
+use core::{
+    arch::x86_64::{_fxrstor64, _fxsave64},
+    sync::atomic::{compiler_fence, Ordering},
+};
+
+use crate::kdebug;
 
 /// https://www.felixcloutier.com/x86/fxsave#tbl-3-47
 #[repr(C, align(16))]
@@ -60,9 +65,10 @@ impl FpState {
         }
     }
 
-    /// 清空fp_state
+    /// 清空浮点寄存器
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         *self = Self::default();
+        self.restore();
     }
 }

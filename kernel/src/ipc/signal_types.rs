@@ -1,0 +1,520 @@
+use core::{ffi::c_void, mem::size_of, sync::atomic::AtomicI64};
+
+use alloc::vec::Vec;
+
+use crate::{
+    arch::{
+        asm::bitops::ffz,
+        interrupt::TrapFrame,
+        ipc::signal::{SigCode, SigFlags, SigSet, Signal, _NSIG},
+    },
+    include::bindings::bindings::siginfo,
+    process::Pid,
+    syscall::{user_access::UserBufferWriter, SystemError},
+};
+
+/// 存储信号处理函数的地址(来自用户态)
+pub type UserSighandler = u64;
+/// 存储信号处理恢复函数的地址(来自用户态)
+pub type UserSigrestorer = u64;
+
+pub const MAX_SIG_NUM: usize = _NSIG;
+
+/// 用户态程序传入的SIG_DFL的值
+pub const USER_SIG_DFL: u64 = 0;
+/// 用户态程序传入的SIG_IGN的值
+pub const USER_SIG_IGN: u64 = 1;
+/// 用户态程序传入的SIG_ERR的值
+pub const USER_SIG_ERR: u64 = 2;
+
+// 因为 Rust 编译器不能在常量声明中正确识别级联的 "|" 运算符(experimental feature： https://github.com/rust-lang/rust/issues/67792)，因此
+// 暂时只能通过这种方法来声明这些常量，这些常量暂时没有全部用到，但是都出现在 linux 的判断逻辑中，所以都保留下来了
+#[allow(dead_code)]
+pub const SIG_KERNEL_ONLY_MASK: SigSet =
+    Signal::into_sigset(Signal::SIGSTOP).union(Signal::into_sigset(Signal::SIGKILL));
+
+pub const SIG_KERNEL_STOP_MASK: SigSet = Signal::into_sigset(Signal::SIGSTOP)
+    .union(Signal::into_sigset(Signal::SIGTSTP))
+    .union(Signal::into_sigset(Signal::SIGTTIN))
+    .union(Signal::into_sigset(Signal::SIGTTOU));
+#[allow(dead_code)]
+pub const SIG_KERNEL_COREDUMP_MASK: SigSet = Signal::into_sigset(Signal::SIGQUIT)
+    .union(Signal::into_sigset(Signal::SIGILL))
+    .union(Signal::into_sigset(Signal::SIGTRAP))
+    .union(Signal::into_sigset(Signal::SIGABRT_OR_IOT))
+    .union(Signal::into_sigset(Signal::SIGFPE))
+    .union(Signal::into_sigset(Signal::SIGSEGV))
+    .union(Signal::into_sigset(Signal::SIGBUS))
+    .union(Signal::into_sigset(Signal::SIGSYS))
+    .union(Signal::into_sigset(Signal::SIGXCPU))
+    .union(Signal::into_sigset(Signal::SIGXFSZ));
+#[allow(dead_code)]
+pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
+    .union(Signal::into_sigset(Signal::SIGFPE))
+    .union(Signal::into_sigset(Signal::SIGSEGV))
+    .union(Signal::into_sigset(Signal::SIGBUS))
+    .union(Signal::into_sigset(Signal::SIGTRAP))
+    .union(Signal::into_sigset(Signal::SIGCHLD))
+    .union(Signal::into_sigset(Signal::SIGIO_OR_POLL))
+    .union(Signal::into_sigset(Signal::SIGSYS));
+
+/// SignalStruct 在 pcb 中加锁
+#[derive(Debug)]
+pub struct SignalStruct {
+    pub cnt: AtomicI64,
+    /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
+    /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
+    pub handlers: [Sigaction; MAX_SIG_NUM as usize],
+}
+
+impl Default for SignalStruct {
+    fn default() -> Self {
+        Self {
+            cnt: Default::default(),
+            handlers: [Sigaction::default(); MAX_SIG_NUM as usize],
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[allow(dead_code)]
+pub enum SigactionType {
+    SaHandler(SaHandlerType),
+    SaSigaction(
+        Option<
+            unsafe extern "C" fn(
+                sig: ::core::ffi::c_int,
+                sinfo: *mut siginfo,
+                arg1: *mut ::core::ffi::c_void,
+            ),
+        >,
+    ), // 暂时没有用上
+}
+
+impl SigactionType {
+    /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigIgnore)`].
+    ///
+    /// [`SigIgnore`]: SaHandlerType::SigIgnore
+    pub fn is_ignore(&self) -> bool {
+        return matches!(self, Self::SaHandler(SaHandlerType::SigIgnore));
+    }
+    /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigCustomized(_))`].
+    ///
+    /// [`SigCustomized`]: SaHandlerType::SigCustomized(_)
+    pub fn is_customized(&self) -> bool {
+        return matches!(self, Self::SaHandler(SaHandlerType::SigCustomized(_)));
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[allow(dead_code)]
+pub enum SaHandlerType {
+    SigError, // 暂时没有用上
+    SigDefault,
+    SigIgnore,
+    SigCustomized(UserSighandler),
+}
+
+impl Into<usize> for SaHandlerType {
+    fn into(self) -> usize {
+        match self {
+            Self::SigError => 2 as usize,
+            Self::SigIgnore => 1 as usize,
+            Self::SigDefault => 0 as usize,
+            Self::SigCustomized(handler) => handler as usize,
+        }
+    }
+}
+
+impl SaHandlerType {
+    /// Returns `true` if the sa handler type is [`SigDefault`].
+    ///
+    /// [`SigDefault`]: SaHandlerType::SigDefault
+    pub fn is_sig_default(&self) -> bool {
+        matches!(self, Self::SigDefault)
+    }
+
+    /// Returns `true` if the sa handler type is [`SigIgnore`].
+    ///
+    /// [`SigIgnore`]: SaHandlerType::SigIgnore
+    pub fn is_sig_ignore(&self) -> bool {
+        matches!(self, Self::SigIgnore)
+    }
+
+    /// Returns `true` if the sa handler type is [`SigError`].
+    ///
+    /// [`SigError`]: SaHandlerType::SigError
+    pub fn is_sig_error(&self) -> bool {
+        matches!(self, Self::SigError)
+    }
+}
+
+/// 信号处理结构体
+///
+#[derive(Debug, Copy, Clone)]
+pub struct Sigaction {
+    action: SigactionType,
+    flags: SigFlags,
+    mask: SigSet, // 为了可扩展性而设置的sa_mask
+    /// 信号处理函数执行结束后，将会跳转到这个函数内进行执行，然后执行sigreturn系统调用
+    restorer: Option<UserSigrestorer>,
+}
+
+impl Default for Sigaction {
+    fn default() -> Self {
+        Self {
+            action: SigactionType::SaHandler(SaHandlerType::SigDefault),
+            flags: Default::default(),
+            mask: Default::default(),
+            restorer: Default::default(),
+        }
+    }
+}
+
+impl Sigaction {
+    /// 判断传入的信号是否被忽略
+    ///
+    /// ## 参数
+    ///
+    /// - `sig` 传入的信号
+    ///
+    /// ## 返回值
+    ///
+    /// - `true` 被忽略
+    /// - `false`未被忽略
+    pub fn is_ignore(&self) -> bool {
+        return self.action.is_ignore();
+    }
+    pub fn new(
+        action: SigactionType,
+        flags: SigFlags,
+        mask: SigSet,
+        restorer: Option<UserSigrestorer>,
+    ) -> Self {
+        Self {
+            action,
+            flags,
+            mask,
+            restorer,
+        }
+    }
+
+    pub fn action(&self) -> SigactionType {
+        self.action
+    }
+
+    pub fn flags(&self) -> SigFlags {
+        self.flags
+    }
+
+    pub fn restorer(&self) -> Option<u64> {
+        self.restorer
+    }
+
+    pub fn flags_mut(&mut self) -> &mut SigFlags {
+        &mut self.flags
+    }
+
+    pub fn set_action(&mut self, action: SigactionType) {
+        self.action = action;
+    }
+
+    pub fn mask(&self) -> SigSet {
+        self.mask
+    }
+
+    pub fn mask_mut(&mut self) -> &mut SigSet {
+        &mut self.mask
+    }
+
+    pub fn set_restorer(&mut self, restorer: Option<UserSigrestorer>) {
+        self.restorer = restorer;
+    }
+}
+
+/// 用户态传入的sigaction结构体（符合posix规范）
+/// 请注意，我们会在sys_sigaction函数里面将其转换成内核使用的sigaction结构体
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UserSigaction {
+    pub handler: *mut core::ffi::c_void,
+    pub flags: SigFlags,
+    pub restorer: *mut core::ffi::c_void,
+    pub mask: SigSet,
+}
+
+/**
+ * siginfo中，根据signal的来源不同，该info中对应了不同的数据./=
+ * 请注意，该info最大占用16字节
+ */
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct SigInfo {
+    sig_no: i32,
+    sig_code: SigCode,
+    errno: i32,
+    sig_type: SigType,
+}
+
+impl SigInfo {
+    pub fn sig_code(&self) -> SigCode {
+        self.sig_code
+    }
+
+    pub fn set_sig_type(&mut self, sig_type: SigType) {
+        self.sig_type = sig_type;
+    }
+    /// @brief 将siginfo结构体拷贝到用户栈
+    /// ## 参数
+    ///
+    /// `to` 用户空间指针
+    ///
+    /// ## 注意
+    ///
+    /// 该函数对应Linux中的https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#3323
+    /// Linux还提供了 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#3383 用来实现
+    /// kernel_siginfo 保存到 用户的 compact_siginfo 的功能，但是我们系统内还暂时没有对这两种
+    /// siginfo做区分，因此暂时不需要第二个函数
+    pub fn copy_siginfo_to_user(&self, to: *mut SigInfo) -> Result<i32, SystemError> {
+        // 验证目标地址是否为用户空间
+        let mut user_buffer = UserBufferWriter::new(to, size_of::<SigInfo>(), true)?;
+
+        let retval: Result<i32, SystemError> = Ok(0);
+
+        user_buffer.copy_one_to_user(self, 0)?;
+        return retval;
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum SigType {
+    Kill(Pid),
+    // 后续完善下列中的具体字段
+    // Timer,
+    // Rt,
+    // SigChild,
+    // SigFault,
+    // SigPoll,
+    // SigSys,
+}
+
+impl SigInfo {
+    pub fn new(sig: Signal, sig_errno: i32, sig_code: SigCode, sig_type: SigType) -> Self {
+        Self {
+            sig_no: sig as i32,
+            sig_code,
+            errno: sig_errno,
+            sig_type,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SigPending {
+    signal: SigSet,
+    queue: SigQueue,
+}
+
+impl Default for SigPending {
+    fn default() -> Self {
+        SigPending {
+            signal: SigSet::default(),
+            queue: SigQueue::default(),
+        }
+    }
+}
+
+impl SigPending {
+    pub fn signal(&self) -> SigSet {
+        self.signal
+    }
+
+    pub fn queue(&self) -> &SigQueue {
+        &self.queue
+    }
+
+    pub fn queue_mut(&mut self) -> &mut SigQueue {
+        &mut self.queue
+    }
+
+    pub fn signal_mut(&mut self) -> &mut SigSet {
+        &mut self.signal
+    }
+    /// @brief 获取下一个要处理的信号（sig number越小的信号，优先级越高）
+    ///
+    /// @param pending 等待处理的信号
+    /// @param sig_mask 屏蔽了的信号
+    /// @return i32 下一个要处理的信号的number. 如果为0,则无效
+    pub fn next_signal(&self, sig_mask: &SigSet) -> Signal {
+        let mut sig = Signal::INVALID;
+
+        let s = self.signal();
+        let m = *sig_mask;
+        m.is_empty();
+        // 获取第一个待处理的信号的号码
+        let x = s & (!m);
+        if x.bits() != 0 {
+            sig = Signal::from(ffz(x.complement().bits()) + 1);
+            return sig;
+        }
+
+        // 暂时只支持64种信号
+        assert_eq!(_NSIG, 64);
+
+        return sig;
+    }
+    /// @brief 收集信号的信息
+    ///
+    /// @param sig 要收集的信号的信息
+    /// @param pending 信号的排队等待标志
+    /// @return SigInfo 信号的信息
+    pub fn collect_signal(&mut self, sig: Signal) -> SigInfo {
+        let (info, still_pending) = self.queue_mut().find_and_delete(sig);
+
+        // 如果没有仍在等待的信号，则清除pending位
+        if !still_pending {
+            self.signal_mut().remove(sig.into());
+        }
+
+        if info.is_some() {
+            return info.unwrap();
+        } else {
+            // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
+            let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, SigType::Kill(Pid::from(0)));
+            ret.set_sig_type(SigType::Kill(Pid::new(0)));
+            return ret;
+        }
+    }
+
+    /// @brief 从当前进程的sigpending中取出下一个待处理的signal，并返回给调用者。（调用者应当处理这个信号）
+    /// 请注意，进入本函数前，当前进程应当持有current_pcb().sighand.siglock
+    pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        // kdebug!("dequeue signal");
+        // 获取下一个要处理的信号的编号
+        let sig = self.next_signal(sig_mask);
+
+        let info: Option<SigInfo>;
+        if sig != Signal::INVALID {
+            // 如果下一个要处理的信号是合法的，则收集其siginfo
+            info = Some(self.collect_signal(sig));
+        } else {
+            info = None;
+        }
+
+        // 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位
+        // recalc_sigpending();
+        return (sig, info);
+    }
+    /// @brief 从sigpending中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
+    pub fn flush_by_mask(&mut self, mask: &SigSet) {
+        // 定义过滤器，从sigqueue中删除mask中被置位的信号
+        let filter = |x: &mut SigInfo| {
+            if mask.contains(SigSet::from_bits_truncate(x.sig_no as u64)) {
+                return true;
+            }
+            return false;
+        };
+        let filter_result: Vec<SigInfo> = self.queue.q.drain_filter(filter).collect();
+        // 回收这些siginfo
+        for x in filter_result {
+            drop(x)
+        }
+    }
+}
+
+/// @brief 进程接收到的信号的队列
+#[derive(Debug, Clone)]
+pub struct SigQueue {
+    pub q: Vec<SigInfo>,
+}
+
+#[allow(dead_code)]
+impl SigQueue {
+    /// @brief 初始化一个新的信号队列
+    pub fn new(capacity: usize) -> Self {
+        SigQueue {
+            q: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// @brief 在信号队列中寻找第一个满足要求的siginfo, 并返回它的引用
+    ///
+    /// @return (第一个满足要求的siginfo的引用; 是否有多个满足条件的siginfo)
+    pub fn find(&self, sig: Signal) -> (Option<&SigInfo>, bool) {
+        // 是否存在多个满足条件的siginfo
+        let mut still_pending = false;
+        let mut info: Option<&SigInfo> = None;
+
+        for x in self.q.iter() {
+            if x.sig_no == sig as i32 {
+                if info.is_some() {
+                    still_pending = true;
+                    break;
+                } else {
+                    info = Some(x);
+                }
+            }
+        }
+        return (info, still_pending);
+    }
+
+    /// @brief 在信号队列中寻找第一个满足要求的siginfo, 并将其从队列中删除，然后返回这个siginfo
+    ///
+    /// @return (第一个满足要求的siginfo; 从队列中删除前是否有多个满足条件的siginfo)
+    pub fn find_and_delete(&mut self, sig: Signal) -> (Option<SigInfo>, bool) {
+        // 是否存在多个满足条件的siginfo
+        let mut still_pending = false;
+        let mut first = true; // 标记变量，记录当前是否已经筛选出了一个元素
+
+        let filter = |x: &mut SigInfo| {
+            if x.sig_no == sig as i32 {
+                if !first {
+                    // 如果之前已经筛选出了一个元素，则不把当前元素删除
+                    still_pending = true;
+                    return false;
+                } else {
+                    // 当前是第一个被筛选出来的元素
+                    first = false;
+                    return true;
+                }
+            }
+            return false;
+        };
+        // 从sigqueue中过滤出结果
+        let mut filter_result: Vec<SigInfo> = self.q.drain_filter(filter).collect();
+        // 筛选出的结果不能大于1个
+        assert!(filter_result.len() <= 1);
+
+        return (filter_result.pop(), still_pending);
+    }
+
+    /// @brief 从C的void*指针转换为static生命周期的可变引用
+    pub fn from_c_void(p: *mut c_void) -> &'static mut SigQueue {
+        let sq = p as *mut SigQueue;
+        let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
+        return sq;
+    }
+}
+
+impl Default for SigQueue {
+    fn default() -> Self {
+        Self {
+            q: Default::default(),
+        }
+    }
+}
+
+///
+/// 定义了不同架构下实现 Signal 要实现的接口
+///
+pub trait SignalArch {
+    /// 信号处理函数
+    ///
+    /// ## 参数
+    ///
+    /// - `frame` 中断栈帧
+    unsafe fn do_signal(frame: &mut TrapFrame);
+
+    fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
+}

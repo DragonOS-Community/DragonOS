@@ -15,7 +15,7 @@ use crate::{
         MAX_PATHLEN,
     },
     include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
-    kinfo,
+    kdebug, kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
@@ -670,7 +670,7 @@ impl Syscall {
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
-
+                kdebug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
             }
 

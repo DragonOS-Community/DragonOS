@@ -1,8 +1,11 @@
+use core::sync::atomic::compiler_fence;
+
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid, libs::rwlock::RwLock,
-    process::ProcessFlags, syscall::SystemError,
+    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid,
+    ipc::signal::flush_signal_handlers, kdebug, libs::rwlock::RwLock, process::ProcessFlags,
+    syscall::SystemError,
 };
 
 use super::{
@@ -87,7 +90,13 @@ impl ProcessManager {
             )
         });
 
-        // todo: 拷贝信号相关数据
+        //拷贝信号相关数据
+        ProcessManager::copy_sighand(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy sighands from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
 
         // 拷贝线程
         ProcessManager::copy_thread(&clone_flags, &current_pcb, &pcb, &current_trapframe).unwrap_or_else(|e| {
@@ -194,11 +203,26 @@ impl ProcessManager {
 
     #[allow(dead_code)]
     fn copy_sighand(
-        _clone_flags: &CloneFlags,
-        _current_pcb: &Arc<ProcessControlBlock>,
-        _new_pcb: &Arc<ProcessControlBlock>,
+        clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // todo: 由于信号原来写的太烂，移植到新的进程管理的话，需要改动很多。因此决定重写。这里先空着
+        kdebug!("process_copy_sighand");
+
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
+        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+            flush_signal_handlers(new_pcb.clone(), false);
+            compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
+            (*new_pcb.sig_struct()).handlers = current_pcb.sig_struct().handlers.clone();
+        }
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         return Ok(());
     }
 }

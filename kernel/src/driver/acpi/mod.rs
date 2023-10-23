@@ -1,6 +1,6 @@
 use core::{fmt::Debug, ptr::NonNull};
 
-use acpi::AcpiHandler;
+use acpi::{AcpiHandler, PlatformInfo};
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
@@ -86,6 +86,27 @@ impl AcpiManager {
     #[allow(dead_code)]
     pub fn tables(&self) -> Option<&'static acpi::AcpiTables<AcpiHandlerImpl>> {
         unsafe { __ACPI_TABLE.as_ref() }
+    }
+
+    /// 从acpi获取平台的信息
+    ///
+    /// 包括：
+    ///
+    /// - PowerProfile
+    /// - InterruptModel
+    /// - ProcessorInfo
+    /// - PmTimer
+    pub fn platform_info(&self) -> Option<PlatformInfo<'_, alloc::alloc::Global>> {
+        let r = self.tables()?.platform_info();
+        if let Err(ref e) = r {
+            kerror!(
+                "AcpiManager::platform_info(): failed to get platform info, error: {:?}",
+                e
+            );
+            return None;
+        }
+
+        return Some(r.unwrap());
     }
 }
 

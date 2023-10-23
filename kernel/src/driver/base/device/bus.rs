@@ -21,7 +21,7 @@ use crate::{
 };
 use alloc::{
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
@@ -48,6 +48,11 @@ pub fn sys_devices_system_kset() -> Arc<KSet> {
 #[inline(always)]
 pub fn bus_manager() -> &'static BusManager {
     unsafe { BUS_MANAGER_INSTANCE.as_ref().unwrap() }
+}
+
+#[inline(always)]
+pub fn subsystem_manager() -> &'static SubSystemManager {
+    &SubSystemManager
 }
 
 /// @brief: 总线状态
@@ -99,9 +104,11 @@ pub trait Bus: Debug + Send + Sync {
     fn name(&self) -> String;
     /// Used for subsystems to enumerate devices like ("foo%u", dev->id).
     fn dev_name(&self) -> String;
-    fn root_device(&self) -> Option<Arc<dyn Device>> {
+    fn root_device(&self) -> Option<Weak<dyn Device>> {
         None
     }
+
+    fn set_root_device(&self, _dev: Option<Weak<dyn Device>>) {}
 
     /// 总线上的设备的默认属性组
     fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
@@ -531,6 +538,9 @@ pub fn buses_init() -> Result<(), SystemError> {
         devices_system_kset
             .register(Some(sys_devices_kset()))
             .expect("devices system kset register failed");
+        unsafe {
+            DEVICES_SYSTEM_KSET_INSTANCE = Some(devices_system_kset);
+        }
     }
 
     // 初始化总线管理器
@@ -806,5 +816,56 @@ impl Attribute for DriverAttrBind {
     }
     fn support(&self) -> SysFSOpsSupport {
         SysFSOpsSupport::STORE
+    }
+}
+
+#[derive(Debug)]
+pub struct SubSystemManager;
+
+impl SubSystemManager {
+    /// 注册一个子系统，并在`/sys/bus`和指定的父级文件夹下创建子文件夹
+    ///
+    /// ## 参数
+    ///
+    /// - `subsys` - 子系统实例
+    /// - `fake_root_dev` - 该子系统的伪根设备
+    /// - `parent_of_root` - 该子系统的伪根设备的父级节点
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=subsys_system_register#1078
+    pub fn subsys_register(
+        &self,
+        subsys: &Arc<dyn Bus>,
+        fake_root_dev: &Arc<dyn Device>,
+        parent_of_root: &Arc<dyn KObject>,
+    ) -> Result<(), SystemError> {
+        bus_manager().register(subsys.clone())?;
+        fake_root_dev.set_name(subsys.name());
+        fake_root_dev.set_parent(Some(Arc::downgrade(parent_of_root)));
+
+        device_manager().register(fake_root_dev.clone())?;
+
+        subsys.set_root_device(Some(Arc::downgrade(fake_root_dev)));
+        return Ok(());
+    }
+
+    /// register a subsystem at /sys/devices/system/
+    /// 并且在/sys/bus和/sys/devices下创建文件夹
+    ///
+    /// All 'system' subsystems have a /sys/devices/system/<name> root device
+    /// with the name of the subsystem. The root device can carry subsystem-
+    /// wide attributes. All registered devices are below this single root
+    /// device and are named after the subsystem with a simple enumeration
+    /// number appended. The registered devices are not explicitly named;
+    /// only 'id' in the device needs to be set.
+    pub fn subsys_system_register(
+        &self,
+        subsys: &Arc<dyn Bus>,
+        fake_root_dev: &Arc<dyn Device>,
+    ) -> Result<(), SystemError> {
+        return self.subsys_register(
+            subsys,
+            fake_root_dev,
+            &(sys_devices_system_kset() as Arc<dyn KObject>),
+        );
     }
 }

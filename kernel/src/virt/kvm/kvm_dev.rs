@@ -1,4 +1,5 @@
-use crate::kdebug;
+use crate::process::ProcessManager;
+use crate::{kdebug, filesystem};
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
@@ -7,7 +8,6 @@ use crate::filesystem::vfs::{
     make_rawdev
 };
 use crate::{
-    arch::asm::current::current_pcb,
     libs::spinlock::SpinLock,
     syscall::SystemError,
     time::TimeSpec,
@@ -68,7 +68,7 @@ impl LockedKvmInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -190,6 +190,11 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
     // 创建vm文件，返回文件描述符
     let vm_inode = LockedVmInode::new();
     let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
-    return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+    let r = ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(file, None)
+            .map(|fd| fd as usize);
+    return r;
 }
 

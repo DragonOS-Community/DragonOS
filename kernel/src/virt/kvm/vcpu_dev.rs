@@ -1,6 +1,6 @@
 use crate::arch::KVMArch;
 use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
-use crate::kdebug;
+use crate::{kdebug, filesystem};
 use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
 use crate::filesystem::devfs::DevFS;
@@ -78,7 +78,7 @@ impl LockedVcpuInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

@@ -8,7 +8,7 @@ use crate::virt::kvm::vm::Vm;
 use crate::arch::kvm::vmx::{VcpuRegIndex, X86_CR0};
 use crate::arch::kvm::vmx::mmu::KvmMmu;
 use crate::arch::mm::{LockedFrameAllocator, PageMapper};
-use crate::{kdebug, printk_color, GREEN, BLACK};
+use crate::kdebug;
 use alloc::boxed::Box;
 use alloc::alloc::Global;
 use core::slice;
@@ -20,12 +20,12 @@ use crate::virt::kvm::vcpu::Vcpu;
 use crate::arch::x86_64::mm::X86_64MMArch;
 use super::vmcs::{VMCSRegion, VmcsFields, 
     VmxEntryCtrl, VmxPrimaryExitCtrl,
-    VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl, self
+    VmxPrimaryProcessBasedExecuteCtrl, VmxSecondaryProcessBasedExecuteCtrl
 };
 use super::vmx_asm_wrapper::{
     vmxon, vmxoff, vmx_vmwrite, vmx_vmread, vmx_vmptrld, vmx_vmclear
 };
-use crate::arch::kvm::vmx::seg::RMODE_TSS_SIZE;
+// use crate::arch::kvm::vmx::seg::RMODE_TSS_SIZE;
 // use crate::virt::kvm::{KVM};
 
 // KERNEL_ALLOCATOR
@@ -115,7 +115,7 @@ impl VcpuData {
             msr_bitmap,
             msr_bitmap_physical_address,
         };
-        printk_color!(GREEN, BLACK, "[+] init_region\n");
+        // printk_color!(GREEN, BLACK, "[+] init_region\n");
         instance.init_region()?;
         Ok(instance)
     }

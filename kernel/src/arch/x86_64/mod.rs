@@ -24,6 +24,3 @@ pub use interrupt::X86_64InterruptArch as CurrentIrqArch;
 
 pub use kvm::X86_64KVMArch as KVMArch;
 pub use crate::arch::asm::pio::X86_64PortIOArch as CurrentPortIOArch;
-
-
-pub use kvm::X86_64KVMArch as KVMArch;

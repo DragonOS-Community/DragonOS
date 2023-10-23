@@ -240,12 +240,17 @@ impl Syscall {
     /// @return Ok(usize) 成功返回0
     /// @return Err(SystemError) 读取失败，返回posix错误码
     pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
-        let file: Option<&mut File> = current_pcb().get_file_mut_by_fd(fd as i32);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        let file: &mut File = file.unwrap();
-        file.inode().ioctl(cmd, data)
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard
+            .get_file_by_fd(fd as i32)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let r = file.lock_no_preempt().inode().ioctl(cmd, data);
+        return r;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -716,6 +721,7 @@ impl Syscall {
             FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
             FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
             FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
+            FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
         }
 
         return Ok(kstat);

@@ -1,4 +1,5 @@
-use crate::kdebug;
+use crate::process::ProcessManager;
+use crate::{kdebug, filesystem};
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
@@ -10,7 +11,6 @@ use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::update_vm;
 use crate::virt::kvm::vm;
 use crate::{
-    arch::asm::current::current_pcb,
     libs::spinlock::SpinLock,
     syscall::SystemError,
     time::TimeSpec,
@@ -75,7 +75,7 @@ impl LockedVmInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -221,5 +221,10 @@ fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
 
     let vcpu_inode = LockedVcpuInode::new();
     let file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;
-    return current_pcb().alloc_fd(file, None).map(|fd| fd as usize);
+    let r = ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(file, None)
+            .map(|fd| fd as usize);
+    return r;
 }

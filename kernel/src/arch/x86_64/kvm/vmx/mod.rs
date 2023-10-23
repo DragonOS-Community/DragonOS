@@ -28,8 +28,8 @@ pub enum VcpuRegIndex {
 	R15 = 15,
 }
 
-
 bitflags! {
+	#[allow(non_camel_case_types)]
 	pub struct X86_CR0: u32{
 		const CR0_PE = 1 << 0; /* Protection Enable */
 		const CR0_MP = 1 << 1; /* Monitor Coprocessor */

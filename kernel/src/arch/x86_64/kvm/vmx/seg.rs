@@ -10,11 +10,11 @@ use crate::syscall::SystemError;
 
 use super::vmx_asm_wrapper::vmx_vmwrite;
 
-pub const TSS_IOPB_BASE_OFFSET: usize = 0x66;
-pub const TSS_BASE_SIZE: usize = 0x68;
-pub const TSS_IOPB_SIZE: usize = 65536 / 8;
-pub const TSS_REDIRECTION_SIZE: usize = 256 / 8;
-pub const RMODE_TSS_SIZE: usize = TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOPB_SIZE + 1;
+// pub const TSS_IOPB_BASE_OFFSET: usize = 0x66;
+// pub const TSS_BASE_SIZE: usize = 0x68;
+// pub const TSS_IOPB_SIZE: usize = 65536 / 8;
+// pub const TSS_REDIRECTION_SIZE: usize = 256 / 8;
+// pub const RMODE_TSS_SIZE: usize = TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOPB_SIZE + 1;
 
 #[derive(Debug)]
 pub struct KvmVmxSegmentField {

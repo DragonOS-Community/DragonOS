@@ -17,6 +17,7 @@ members = [ "src/libs/intertrait" ]
 x86 = "0.52.0"
 x86_64 = "0.14.10"
 bitflags = "1.3.2"
+bitfield-struct = "0.5.3"
 virtio-drivers = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
 # 一个无锁MPSC队列
 thingbuf = { version = "0.1.3", default-features = false, features = ["alloc"] }
@@ -28,7 +29,6 @@ num-derive = "0.3"
 # 一个no_std的hashmap、hashset
 hashbrown = "0.13.2"
 elf = { version = "0.7.2", default-features = false }
-raw-cpuid = "11.0.1"
 memoffset = "0.9.0"
 atomic_enum = "0.2.0"
 raw-cpuid = "11.0.1"

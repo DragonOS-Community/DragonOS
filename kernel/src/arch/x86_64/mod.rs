@@ -1,5 +1,7 @@
 #[macro_use]
 pub mod asm;
+mod acpi;
+mod c_adapter;
 pub mod cpu;
 pub mod fpu;
 pub mod interrupt;
@@ -11,6 +13,7 @@ pub mod pci;
 pub mod process;
 pub mod rand;
 pub mod sched;
+pub mod setup;
 pub mod smp;
 pub mod syscall;
 

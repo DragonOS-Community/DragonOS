@@ -3,10 +3,7 @@ use core::sync::atomic::compiler_fence;
 use alloc::sync::Arc;
 
 use crate::{
-    arch::{
-        interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, Signal},
-    },
+    arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     ipc::signal_types::SigactionType,
     kwarn,
     libs::spinlock::SpinLockGuard,

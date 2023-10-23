@@ -1,10 +1,8 @@
-use core::sync::atomic::compiler_fence;
-
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
     arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid,
-    ipc::signal::flush_signal_handlers, kdebug, libs::rwlock::RwLock, process::ProcessFlags,
+    ipc::signal::flush_signal_handlers, libs::rwlock::RwLock, process::ProcessFlags,
     syscall::SystemError,
 };
 

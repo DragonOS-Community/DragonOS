@@ -1,9 +1,4 @@
-use core::{
-    arch::x86_64::{_fxrstor64, _fxsave64},
-    sync::atomic::{compiler_fence, Ordering},
-};
-
-use crate::kdebug;
+use core::arch::x86_64::{_fxrstor64, _fxsave64};
 
 /// https://www.felixcloutier.com/x86/fxsave#tbl-3-47
 #[repr(C, align(16))]

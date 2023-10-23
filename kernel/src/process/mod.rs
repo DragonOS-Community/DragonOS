@@ -36,11 +36,10 @@ use crate::{
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     sched::{
-        cfs::__get_cfs_scheduler,
         core::{sched_enqueue, CPU_EXECUTING},
         SchedPolicy, SchedPriority,
     },
-    smp::{core::smp_get_processor_id, kick_cpu},
+    smp::kick_cpu,
     syscall::{Syscall, SystemError},
 };
 

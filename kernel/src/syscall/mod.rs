@@ -375,7 +375,16 @@ pub const SYS_GETTIMEOFDAY: usize = 43;
 pub const SYS_MMAP: usize = 44;
 pub const SYS_MUNMAP: usize = 45;
 pub const SYS_MPROTECT: usize = 46;
-pub const SYS_IOCTL: usize = 47;
+pub const SYS_FSTAT: usize = 47;
+pub const SYS_GETCWD: usize = 48;
+pub const SYS_GETPPID: usize = 49;
+pub const SYS_GETPGID: usize = 50;
+
+pub const SYS_FCNTL: usize = 51;
+pub const SYS_FTRUNCATE: usize = 52;
+pub const SYS_MKNOD: usize = 53;
+
+pub const SYS_IOCTL: usize = 54;
 
 #[derive(Debug)]
 pub struct Syscall;

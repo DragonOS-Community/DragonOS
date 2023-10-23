@@ -48,7 +48,7 @@
 #define SYS_ACCEPT 40     // 接受一个socket连接
 #define SYS_GETSOCKNAME 41 // 获取socket的名字
 #define SYS_GETPEERNAME 42 // 获取socket的对端名字
-#define SYS_IOCTL 47
+#define SYS_IOCTL 54
 
 /**
  * @brief 用户态系统调用函数

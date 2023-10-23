@@ -16,6 +16,12 @@
 #![feature(ptr_to_from_bits)]
 #![feature(concat_idents)]
 
+#![cfg_attr(target_os = "none", no_std)]
+
+#[cfg(test)]
+#[macro_use]
+extern crate std;
+
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]

@@ -1,8 +1,19 @@
-use super::{sys_devices_kset, Device, DeviceMatchName, DeviceMatcher, DeviceState};
+use super::{
+    driver::{Driver, DriverMatchName, DriverMatcher},
+    sys_devices_kset, Device, DeviceMatchName, DeviceMatcher, DeviceState,
+};
 use crate::{
-    driver::base::{device::device_manager, kobject::KObject, kset::KSet, subsys::SubSysPrivate},
+    driver::base::{
+        device::{device_manager, driver::driver_manager},
+        kobject::{KObjType, KObject, KObjectManager},
+        kset::KSet,
+        subsys::SubSysPrivate,
+    },
     filesystem::{
-        sysfs::{file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOpsSupport},
+        sysfs::{
+            file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
+            SysFSOpsSupport,
+        },
         vfs::syscall::ModeType,
     },
     libs::rwlock::RwLock,
@@ -14,6 +25,7 @@ use alloc::{
 };
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
+use intertrait::cast::CastArc;
 
 /// `/sys/bus`的kset
 static mut BUS_KSET_INSTANCE: Option<Arc<KSet>> = None;
@@ -85,6 +97,7 @@ impl From<BusState> for DeviceState {
 /// https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/device/bus.h#84
 pub trait Bus: Debug + Send + Sync {
     fn name(&self) -> String;
+    /// Used for subsystems to enumerate devices like ("foo%u", dev->id).
     fn dev_name(&self) -> String;
     fn root_device(&self) -> Option<Arc<dyn Device>> {
         None
@@ -104,6 +117,46 @@ pub trait Bus: Debug + Send + Sync {
     fn drv_groups(&self) -> &'static [&'static dyn AttributeGroup] {
         &[]
     }
+
+    /// 检查设备是否可以被总线绑定，如果可以，就绑定它们。
+    /// 绑定之后,device的driver字段会被设置为驱动实例。
+    ///
+    /// ## 参数
+    ///
+    /// - `device` - 设备实例
+    ///
+    /// ## 默认实现
+    ///
+    /// 如果总线不支持该操作，返回`SystemError::EOPNOTSUPP_OR_ENOTSUP`
+    fn probe(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError>;
+    fn sync_state(&self, _device: &Arc<dyn Device>) {}
+    fn shutdown(&self, _device: &Arc<dyn Device>);
+    fn suspend(&self, _device: &Arc<dyn Device>) {
+        // todo: implement suspend
+    }
+
+    fn resume(&self, device: &Arc<dyn Device>) -> Result<(), SystemError>;
+
+    /// match platform device to platform driver.
+    ///
+    /// ## 参数
+    ///
+    /// * `device` - platform device
+    /// * `driver` - platform driver
+    ///
+    /// ## 返回
+    ///
+    /// - `Ok(true)` - 匹配成功
+    /// - `Ok(false)` - 匹配失败
+    /// - `Err(_)` - 由于内部错误导致匹配失败
+    fn match_device(
+        &self,
+        device: &Arc<dyn Device>,
+        driver: &Arc<dyn Driver>,
+    ) -> Result<bool, SystemError>;
 
     fn subsystem(&self) -> &SubSysPrivate;
 
@@ -126,7 +179,7 @@ impl dyn Bus {
         data: T,
     ) -> Option<Arc<dyn Device>> {
         let subsys = self.subsystem();
-        let guard = subsys.devices().read();
+        let guard = subsys.devices();
         for dev in guard.iter() {
             let dev = dev.upgrade();
             if let Some(dev) = dev {
@@ -146,6 +199,35 @@ impl dyn Bus {
     pub fn find_device_by_name(&self, name: &str) -> Option<Arc<dyn Device>> {
         return self.find_device(&DeviceMatchName, name);
     }
+
+    /// 在bus上,根据条件寻找一个特定的驱动
+    ///
+    /// ## 参数
+    ///
+    /// - `matcher` - 匹配器
+    /// - `data` - 传给匹配器的数据
+    pub fn find_driver<T: Copy>(
+        &self,
+        matcher: &dyn DriverMatcher<T>,
+        data: T,
+    ) -> Option<Arc<dyn Driver>> {
+        let subsys = self.subsystem();
+        let guard = subsys.drivers();
+        for drv in guard.iter() {
+            let drv = drv.upgrade();
+            if let Some(drv) = drv {
+                if matcher.match_driver(&drv, data) {
+                    return Some(drv.clone());
+                }
+            }
+        }
+        return None;
+    }
+
+    /// 根据名称在bus上匹配驱动
+    pub fn find_driver_by_name(&self, name: &str) -> Option<Arc<dyn Driver>> {
+        return self.find_driver(&DriverMatchName, name);
+    }
 }
 
 /// @brief: 总线管理结构体
@@ -160,6 +242,94 @@ impl BusManager {
         return Self {
             kset_bus_map: RwLock::new(HashMap::new()),
         };
+    }
+
+    /// 把一个设备添加到总线上
+    ///
+    /// ## 描述
+    ///
+    /// - 添加一个设备的与bus相关的属性
+    /// - 在bus和设备文件夹下，创建软链接
+    /// - 把设备添加到它的总线的设备列表中
+    ///
+    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_device#441
+    ///
+    /// ## 参数
+    ///
+    /// - `dev` - 要被添加的设备
+    pub fn add_device(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let bus = dev.bus();
+        if let Some(bus) = bus {
+            device_manager().add_groups(dev, bus.dev_groups())?;
+
+            // 增加符号链接
+            let bus_devices_kset = bus
+                .subsystem()
+                .devices_kset()
+                .expect("bus devices kset is none, maybe bus is not registered");
+            let dev_kobj = dev.clone() as Arc<dyn KObject>;
+
+            sysfs_instance().create_link(
+                Some(&bus_devices_kset.as_kobject()),
+                &dev_kobj,
+                dev.name(),
+            )?;
+            sysfs_instance().create_link(
+                Some(&dev_kobj),
+                &(&bus.subsystem().subsys().as_kobject()),
+                "subsystem".to_string(),
+            )?;
+            bus.subsystem().add_device_to_vec(dev)?;
+        }
+        return Ok(());
+    }
+
+    /// 在总线上添加一个驱动
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_driver#590
+    pub fn add_driver(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
+        let bus = driver.bus().ok_or(SystemError::EINVAL)?;
+        kdebug!("bus '{}' add driver '{}'", bus.name(), driver.name());
+
+        driver.set_kobj_type(Some(&BusDriverKType));
+        let kobj = driver.clone() as Arc<dyn KObject>;
+        KObjectManager::add_kobj(kobj, bus.subsystem().drivers_kset())?;
+
+        bus.subsystem().add_driver_to_vec(driver)?;
+        if bus.subsystem().drivers_autoprobe() {
+            let r = driver_manager().driver_attach(driver);
+            if let Err(e) = r {
+                bus.subsystem().remove_driver_from_vec(driver);
+                return Err(e);
+            }
+        }
+
+        driver_manager()
+            .add_groups(driver, bus.drv_groups())
+            .or_else(|e| {
+                kerror!(
+                    "BusManager::add_driver: driver '{:?}' add_groups failed, err: '{:?}",
+                    driver.name(),
+                    e
+                );
+                Err(e)
+            })
+            .ok();
+
+        if !driver.suppress_bind_attrs() {
+            self.add_bind_files(driver)
+                .or_else(|e| {
+                    kerror!(
+                        "BusManager::add_driver: driver '{:?}' add_bind_files failed, err: '{:?}",
+                        driver.name(),
+                        e
+                    );
+                    Err(e)
+                })
+                .ok();
+        }
+
+        return Ok(());
     }
 
     ///
@@ -257,7 +427,7 @@ impl BusManager {
     /// - `bus` - bus实例
     #[allow(dead_code)]
     pub fn rescan_devices(&self, bus: &Arc<dyn Bus>) -> Result<(), SystemError> {
-        for dev in bus.subsystem().devices().read().iter() {
+        for dev in bus.subsystem().devices().iter() {
             let dev = dev.upgrade();
             if let Some(dev) = dev {
                 rescan_devices_helper(dev)?;
@@ -283,21 +453,32 @@ impl BusManager {
         }
     }
 
-    /// 在bus上,根据条件寻找一个特定的设备
+    /// 从总线上移除一个驱动
+    ///
+    /// Detach the driver from the devices it controls, and remove
+    /// it from its bus's list of drivers. Finally, we drop the reference
+    /// to the bus.
     ///
     /// ## 参数
     ///
-    /// - `matcher` - 匹配器
-    /// - `data` - 传给匹配器的数据
-    #[inline]
-    #[allow(dead_code)]
-    pub fn find_device<T: Copy>(
-        &self,
-        bus: &Arc<dyn Bus>,
-        matcher: &dyn DeviceMatcher<T>,
-        data: T,
-    ) -> Option<Arc<dyn Device>> {
-        return bus.find_device(matcher, data);
+    /// - `driver` - 驱动实例
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_remove_driver#666
+    pub fn remove_driver(&self, _driver: &Arc<dyn Driver>) {
+        todo!("BusManager::remove_driver")
+    }
+
+    fn add_bind_files(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
+        driver_manager().create_attr_file(driver, &DriverAttrUnbind)?;
+
+        driver_manager()
+            .create_attr_file(driver, &DriverAttrBind)
+            .map_err(|e| {
+                driver_manager().remove_attr_file(driver, &DriverAttrUnbind);
+                e
+            })?;
+
+        return Ok(());
     }
 }
 
@@ -376,13 +557,7 @@ pub fn buses_init() -> Result<(), SystemError> {
 ///
 /// - `dev` - 要被添加的设备
 pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-    let bus = dev.bus();
-    if let Some(bus) = bus {
-        device_manager().add_groups(dev, bus.dev_groups())?;
-        // todo: 增加符号链接
-        todo!("bus_add_device")
-    }
-    return Ok(());
+    return bus_manager().add_device(dev);
 }
 
 /// 自动为设备在总线上寻找可用的驱动程序
@@ -506,4 +681,130 @@ pub enum BusNotifyEvent {
     UnboundDriver,
     /// 驱动绑定失败
     DriverNotBound,
+}
+
+#[derive(Debug)]
+struct BusDriverKType;
+
+impl KObjType for BusDriverKType {
+    fn sysfs_ops(&self) -> Option<&dyn SysFSOps> {
+        Some(&BusDriverSysFSOps)
+    }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct BusDriverSysFSOps;
+
+impl SysFSOps for BusDriverSysFSOps {
+    #[inline]
+    fn show(
+        &self,
+        kobj: Arc<dyn KObject>,
+        attr: &dyn Attribute,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        attr.show(kobj, buf)
+    }
+
+    #[inline]
+    fn store(
+        &self,
+        kobj: Arc<dyn KObject>,
+        attr: &dyn Attribute,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        attr.store(kobj, buf)
+    }
+}
+
+#[derive(Debug)]
+struct DriverAttrUnbind;
+
+impl Attribute for DriverAttrUnbind {
+    fn mode(&self) -> ModeType {
+        ModeType::from_bits_truncate(0o200)
+    }
+
+    fn name(&self) -> &str {
+        "unbind"
+    }
+
+    fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
+        let driver = kobj.cast::<dyn Driver>().map_err(|kobj| {
+            kerror!(
+                "Intertrait casting not implemented for kobj: {}",
+                kobj.name()
+            );
+            SystemError::EOPNOTSUPP_OR_ENOTSUP
+        })?;
+
+        let bus = driver.bus().ok_or(SystemError::ENODEV)?;
+
+        let s = CStr::from_bytes_with_nul(buf)
+            .map_err(|_| SystemError::EINVAL)?
+            .to_str()
+            .map_err(|_| SystemError::EINVAL)?;
+        let dev = bus.find_device_by_name(s).ok_or(SystemError::ENODEV)?;
+        let p = dev.driver().ok_or(SystemError::ENODEV)?;
+        if Arc::ptr_eq(&p, &driver) {
+            device_manager().device_driver_detach(&dev);
+            return Ok(buf.len());
+        }
+        return Err(SystemError::ENODEV);
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::STORE
+    }
+}
+
+#[derive(Debug)]
+struct DriverAttrBind;
+
+impl Attribute for DriverAttrBind {
+    fn name(&self) -> &str {
+        "bind"
+    }
+
+    fn mode(&self) -> ModeType {
+        ModeType::from_bits_truncate(0o200)
+    }
+
+    /*
+     * Manually attach a device to a driver.
+     * Note: the driver must want to bind to the device,
+     * it is not possible to override the driver's id table.
+     */
+    fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
+        let driver = kobj.cast::<dyn Driver>().map_err(|kobj| {
+            kerror!(
+                "Intertrait casting not implemented for kobj: {}",
+                kobj.name()
+            );
+            SystemError::EOPNOTSUPP_OR_ENOTSUP
+        })?;
+
+        let bus = driver.bus().ok_or(SystemError::ENODEV)?;
+        let device = bus
+            .find_device_by_name(
+                CStr::from_bytes_with_nul(buf)
+                    .map_err(|_| SystemError::EINVAL)?
+                    .to_str()
+                    .map_err(|_| SystemError::EINVAL)?,
+            )
+            .ok_or(SystemError::ENODEV)?;
+
+        if driver_manager().match_device(&driver, &device)? {
+            device_manager().device_driver_attach(&driver, &device)?;
+            return Ok(buf.len());
+        }
+        return Err(SystemError::ENODEV);
+    }
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::STORE
+    }
 }

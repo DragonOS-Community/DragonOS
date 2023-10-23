@@ -78,6 +78,9 @@ pub const DT_SOCK: u16 = 12;
 pub const DT_WHT: u16 = 14;
 pub const DT_MAX: u16 = 16;
 
+/// vfs容许的最大的符号链接跳转次数
+pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 8;
+
 impl FileType {
     pub fn get_file_type_num(&self) -> u16 {
         return match self {

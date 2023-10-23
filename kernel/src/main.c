@@ -27,18 +27,16 @@
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
 #include <driver/timers/HPET/HPET.h>
-#include <driver/uart/uart.h>
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
 
 extern int rs_driver_init();
- extern int rs_tty_init();
 extern void rs_softirq_init();
 extern void rs_mm_init();
-extern int rs_video_init();
 extern void rs_kthread_init();
 extern void rs_init_intertrait();
+extern void rs_init_before_mem_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -72,10 +70,7 @@ void reload_idt()
 // 初始化系统各模块
 void system_initialize()
 {
-    c_uart_init(COM1, 115200);
-
-    rs_video_init();
-    scm_init();
+    rs_init_before_mem_init();
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 
@@ -86,13 +81,12 @@ void system_initialize()
     rs_load_current_core_tss();
 
     cpu_core_info[0].stack_start = _stack_start;
-
+    
     // 初始化中断描述符表
     sys_vector_init();
     //  初始化内存管理单元
     // mm_init();
     rs_mm_init();
-
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
@@ -105,7 +99,10 @@ void system_initialize()
     rs_init_intertrait();
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
-
+    vfs_init();
+    
+    rs_driver_init();
+    
     acpi_init();
     io_mfence();
     irq_init();
@@ -128,10 +125,7 @@ void system_initialize()
 
     rs_jiffies_init();
     io_mfence();
-    vfs_init();
     
-    rs_driver_init();
-    rs_tty_init();
 
     rs_kthread_init();
     io_mfence();
@@ -188,8 +182,7 @@ void Start_Kernel(void)
 
     mb2_info &= 0xffffffff;
     mb2_magic &= 0xffffffff;
-    multiboot2_magic = (uint)mb2_magic;
-    multiboot2_boot_info_addr = mb2_info + PAGE_OFFSET;
+    multiboot2_init(mb2_info, mb2_magic);
     io_mfence();
     system_initialize();
     io_mfence();

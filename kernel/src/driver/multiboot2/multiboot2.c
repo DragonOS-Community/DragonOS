@@ -1,40 +1,53 @@
 #include "multiboot2.h"
 
-
 #include <common/glib.h>
 #include <common/kprint.h>
-uintptr_t multiboot2_boot_info_addr;
-unsigned int multiboot2_magic;
+// uintptr_t multiboot2_boot_info_addr;
+// unsigned int multiboot2_magic;
 unsigned int multiboot2_boot_info_size;
 
-bool multiboot2_init(void)
+#define MBI_RAW_MAX_SIZE 409600
+// 由于启动时传递的mb2 info所在的地址,在内存管理初始化之后会被覆盖，所以需要将其拷贝到一个固定的位置
+static uint8_t mbi_raw[MBI_RAW_MAX_SIZE] = {0};
+bool multiboot2_init(uint64_t mb2_info_paddr, uint32_t mb2_magic)
 {
-    uintptr_t *addr = (uintptr_t *)multiboot2_boot_info_addr;
-    if (multiboot2_magic != MULTIBOOT2_BOOTLOADER_MAGIC)
-        ;
+  uint64_t vaddr = phys_2_virt(mb2_info_paddr);
+  if (mb2_magic != MULTIBOOT2_BOOTLOADER_MAGIC)
     return false;
-    // addr+0 处保存了大小
-    multiboot2_boot_info_size = *(unsigned int *)addr;
-    return true;
+  // vaddr+0 处保存了大小
+  multiboot2_boot_info_size = *(uint32_t *)vaddr;
+  if (multiboot2_boot_info_size > MBI_RAW_MAX_SIZE)
+    return false;
+
+  memcpy((void *)mbi_raw, (void *)vaddr, multiboot2_boot_info_size);
+  
+  return true;
 }
 
 void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned int *),
                      void *data, unsigned int *count)
 {
+  // kdebug("multiboot2_boot_info_addr=%#018lx", multiboot2_boot_info_addr);
 
-    uintptr_t addr = multiboot2_boot_info_addr;
-    // 接下来的第8字节开始，为 tag 信息
-    struct iter_data_t *tag = (struct iter_data_t *)((void*)addr + 8);
-    for (; tag->type != MULTIBOOT_TAG_TYPE_END;
-         tag = (struct iter_data_t *)((uint8_t *)tag + ALIGN(tag->size, 8)))
+  // uintptr_t addr = multiboot2_boot_info_addr;
+
+  // for(int i=0;i<8192;i++)
+  // {
+  //   mbi_raw[i] = ((uint8_t *)multiboot2_boot_info_addr)[i];
+  // }
+  uint8_t * addr = mbi_raw;
+  // 接下来的第8字节开始，为 tag 信息
+  struct iter_data_t *tag = (struct iter_data_t *)((void *)addr + 8);
+  for (; tag->type != MULTIBOOT_TAG_TYPE_END;
+       tag = (struct iter_data_t *)((uint8_t *)tag + ALIGN(tag->size, 8)))
+  {
+
+    if (_fun(tag, data, count) == true)
     {
-
-        if (_fun(tag, data, count) == true)
-        {
-            return;
-        }
+      return;
     }
-    return;
+  }
+  return;
 }
 
 // 读取 grub2 传递的物理内存信息，保存到 e820map_t 结构体中
@@ -57,21 +70,21 @@ void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned i
  */
 bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *data, unsigned int *count)
 {
-    if (_iter_data->type != MULTIBOOT_TAG_TYPE_MMAP)
-        return false;
+  if (_iter_data->type != MULTIBOOT_TAG_TYPE_MMAP)
+    return false;
 
-    struct multiboot_mmap_entry_t *resource = (struct multiboot_mmap_entry_t *)data;
-    struct multiboot_mmap_entry_t *mmap = ((struct multiboot_tag_mmap_t *)_iter_data)->entries;
-    *count = 0;
-    for (; (uint8_t *)mmap < (uint8_t *)_iter_data + _iter_data->size;
-         mmap = (struct multiboot_mmap_entry_t *)((uint8_t *)mmap + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size))
-    {
-        *resource = *mmap;
-        // 将指针进行增加
-        resource = (struct multiboot_mmap_entry_t *)((uint8_t *)resource + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size);
-        ++(*count);
-    }
-    return true;
+  struct multiboot_mmap_entry_t *resource = (struct multiboot_mmap_entry_t *)data;
+  struct multiboot_mmap_entry_t *mmap = ((struct multiboot_tag_mmap_t *)_iter_data)->entries;
+  *count = 0;
+  for (; (uint8_t *)mmap < (uint8_t *)_iter_data + _iter_data->size;
+       mmap = (struct multiboot_mmap_entry_t *)((uint8_t *)mmap + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size))
+  {
+    *resource = *mmap;
+    // 将指针进行增加
+    resource = (struct multiboot_mmap_entry_t *)((uint8_t *)resource + ((struct multiboot_tag_mmap_t *)_iter_data)->entry_size);
+    ++(*count);
+  }
+  return true;
 }
 
 /**
@@ -83,10 +96,10 @@ bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *data, uns
 bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
 
-    if (_iter_data->type != MULTIBOOT_TAG_TYPE_VBE)
-        return false;
-    *(struct multiboot_tag_vbe_t *)data = *(struct multiboot_tag_vbe_t *)_iter_data;
-    return true;
+  if (_iter_data->type != MULTIBOOT_TAG_TYPE_VBE)
+    return false;
+  *(struct multiboot_tag_vbe_t *)data = *(struct multiboot_tag_vbe_t *)_iter_data;
+  return true;
 }
 
 /**
@@ -97,10 +110,10 @@ bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, u
  */
 bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
-    if (_iter_data->type != MULTIBOOT_TAG_TYPE_FRAMEBUFFER)
-        return false;
-    *(struct multiboot_tag_framebuffer_info_t *)data = *(struct multiboot_tag_framebuffer_info_t *)_iter_data;
-    return true;
+  if (_iter_data->type != MULTIBOOT_TAG_TYPE_FRAMEBUFFER)
+    return false;
+  *(struct multiboot_tag_framebuffer_info_t *)data = *(struct multiboot_tag_framebuffer_info_t *)_iter_data;
+  return true;
 }
 
 /**
@@ -113,12 +126,12 @@ bool multiboot2_get_Framebuffer_info(const struct iter_data_t *_iter_data, void 
  */
 bool multiboot2_get_acpi_old_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
-    if (_iter_data->type != MULTIBOOT_TAG_TYPE_ACPI_OLD)
-        return false;
+  if (_iter_data->type != MULTIBOOT_TAG_TYPE_ACPI_OLD)
+    return false;
 
-    *(struct multiboot_tag_old_acpi_t *)data = *(struct multiboot_tag_old_acpi_t *)_iter_data;
+  *(struct multiboot_tag_old_acpi_t *)data = *(struct multiboot_tag_old_acpi_t *)_iter_data;
 
-    return true;
+  return true;
 }
 
 /**
@@ -131,8 +144,8 @@ bool multiboot2_get_acpi_old_RSDP(const struct iter_data_t *_iter_data, void *da
  */
 bool multiboot2_get_acpi_new_RSDP(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
 {
-    if (_iter_data->type != MULTIBOOT_TAG_TYPE_ACPI_NEW)
-        return false;
-    *(struct multiboot_tag_new_acpi_t *)data = *(struct multiboot_tag_new_acpi_t *)_iter_data;
-    return true;
+  if (_iter_data->type != MULTIBOOT_TAG_TYPE_ACPI_NEW)
+    return false;
+  *(struct multiboot_tag_new_acpi_t *)data = *(struct multiboot_tag_new_acpi_t *)_iter_data;
+  return true;
 }

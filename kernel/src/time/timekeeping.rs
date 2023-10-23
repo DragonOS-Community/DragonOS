@@ -142,7 +142,9 @@ impl Timekeeper {
     }
 }
 pub fn timekeeper() -> &'static Timekeeper {
-    return unsafe { __TIMEKEEPER.as_ref().unwrap() };
+    let r = unsafe { __TIMEKEEPER.as_ref().unwrap() };
+
+    return r;
 }
 
 pub fn timekeeper_init() {

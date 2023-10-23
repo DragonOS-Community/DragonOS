@@ -77,7 +77,7 @@ extern void __cmpxchg_wrong_size(void) __compiletime_error("Bad argument size fo
         likely(is_success);                                         \
     })
 
-#define arch_try_cmpxchg(ptr, old_ptr, new_ptr) \
-    __raw_try_cmpxchg((ptr), (old_ptr), (new_ptr), sizeof(*ptr))
+#define arch_try_cmpxchg(ptr, old_ptr, new) \
+    __raw_try_cmpxchg((ptr), (old_ptr), (new), sizeof(*ptr))
 
 bool __try_cmpxchg_q(uint64_t *ptr, uint64_t *old_ptr, uint64_t *new_ptr);

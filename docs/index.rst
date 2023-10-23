@@ -29,6 +29,7 @@
    kernel/debug/index
    kernel/ktest/index
    kernel/cpu_arch/index
+   kernel/libs/index
 
 
 .. toctree::

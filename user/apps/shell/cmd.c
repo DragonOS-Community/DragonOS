@@ -14,8 +14,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define MAX_PATH_LEN 4096
+
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
+
 /**
  * @brief shell 内建函数的主命令与处理函数的映射表
  *
@@ -35,6 +38,7 @@ struct built_in_cmd_t shell_cmds[] = {
     {"free", shell_cmd_free},
     {"help", shell_help},
     {"pipe", shell_pipe_test},
+    {"pipe2", shell_pipe2_test},
     {"kill", shell_cmd_kill},
 
 };
@@ -180,16 +184,18 @@ int shell_cmd_cd(int argc, char **argv)
         if (ec == 0)
         {
             // 获取新的路径字符串
-            char *new_path = (char *)malloc(dest_len + 2);
-            memset(new_path, 0, dest_len + 2);
-            strncpy(new_path, argv[1], dest_len);
+            char *new_path = (char *)malloc(MAX_PATH_LEN);
+            if (new_path==NULL) {
+                goto fail;
+            }
+            memset(new_path, 0, MAX_PATH_LEN);
+            getcwd(new_path, MAX_PATH_LEN);
 
             // 释放原有的路径字符串的内存空间
             free(shell_current_path);
 
             shell_current_path = new_path;
 
-            shell_current_path[dest_len] = '\0';
             return 0;
         }
         else
@@ -215,7 +221,7 @@ int shell_cmd_cd(int argc, char **argv)
 
         // 拼接出新的字符串
         char *new_path = (char *)malloc(new_len + 2);
-        memset(new_path, 0, sizeof(new_path));
+        memset(new_path, 0, new_len);
         strncpy(new_path, shell_current_path, current_dir_len);
 
         if (current_dir_len > 1)
@@ -224,10 +230,16 @@ int shell_cmd_cd(int argc, char **argv)
         int x = chdir(new_path);
         if (x == 0) // 成功切换目录
         {
+            free(new_path);
             free(shell_current_path);
-            // printf("new_path=%s, newlen= %d\n", new_path, new_len);
-            new_path[new_len + 1] = '\0';
-            shell_current_path = new_path;
+
+            char * pwd = malloc(MAX_PATH_LEN);
+            if (pwd==NULL) {
+                goto fail;
+            }
+            memset(pwd, 0, MAX_PATH_LEN);
+            getcwd(pwd, MAX_PATH_LEN);
+            shell_current_path = pwd;
             goto done;
         }
         else
@@ -319,7 +331,7 @@ int shell_cmd_cat(int argc, char **argv)
     char *file_path = get_target_filepath(argv[1], &path_len);
 
     // 打开文件
-    int fd = open(file_path, 0);
+    int fd = open(file_path, O_RDONLY);
     if (fd <= 0)
     {
         printf("ERROR: Cannot open file: %s, fd=%d\n", file_path, fd);
@@ -338,9 +350,11 @@ int shell_cmd_cat(int argc, char **argv)
         int l = read(fd, buf, 511);
         if (l < 0)
         {
-            printf("ERROR: Cannot read file: %s\n", file_path);
+            printf("ERROR: Cannot read file: %s, errno = %d\n", file_path, errno);
             return -1;
         }
+        if (l == 0)
+            break;
         buf[l] = '\0';
 
         file_size -= l;
@@ -506,7 +520,13 @@ int shell_cmd_exec(int argc, char **argv)
         int path_len = 0;
         char *file_path = get_target_filepath(argv[1], &path_len);
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
-        execv(file_path, argv);
+
+        char **real_argv;
+        if (argc > 2)
+        {
+            real_argv = &argv[2];
+        }
+        execv(file_path, real_argv);
         // printf("after execv, path=%s, argc=%d\n", file_path, argc);
         free(argv);
         free(file_path);
@@ -520,13 +540,14 @@ int shell_cmd_exec(int argc, char **argv)
             waitpid(pid, &retval, 0);
         else
             printf("[1] %d\n", pid); // 输出子进程的pid
-        
+
         free(argv);
     }
 }
 
 int shell_cmd_about(int argc, char **argv)
 {
+
     if (argv != NULL)
         free(argv);
     int aac = 0;
@@ -590,13 +611,13 @@ int shell_cmd_free(int argc, char **argv)
     printf("Mem:\t");
     if (argc == 1) // 按照kb显示
     {
-        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 10, mst.used >> 10, mst.free >> 10, mst.shared >> 10,
-               mst.cache_used >> 10, mst.available >> 10);
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total, mst.used, mst.free, mst.shared,
+               mst.cache_used, mst.available);
     }
     else // 按照MB显示
     {
-        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 20, mst.used >> 20, mst.free >> 20, mst.shared >> 20,
-               mst.cache_used >> 20, mst.available >> 20);
+        printf("%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t\n", mst.total >> 10, mst.used >> 10, mst.free >> 10, mst.shared >> 10,
+               mst.cache_used >> 10, mst.available >> 10);
     }
 
 done:;

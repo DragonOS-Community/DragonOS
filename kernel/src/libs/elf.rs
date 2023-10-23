@@ -9,8 +9,7 @@ use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader};
 
 use crate::{
     arch::MMArch,
-    current_pcb,
-    io::SeekFrom,
+    driver::base::block::SeekFrom,
     kerror,
     libs::align::page_align_up,
     mm::{
@@ -22,6 +21,7 @@ use crate::{
     process::{
         abi::AtType,
         exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
+        ProcessManager,
     },
     syscall::{
         user_access::{clear_user, copy_to_user},
@@ -93,7 +93,7 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
-        // kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
+
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
@@ -177,9 +177,7 @@ impl ElfLoader {
         let beginning_page_offset = self.elf_page_offset(addr_to_map);
         addr_to_map = self.elf_page_start(addr_to_map);
         // 计算要映射的内存的大小
-        let map_size = phent.p_filesz as usize
-            + self.elf_page_offset(VirtAddr::new(phent.p_vaddr as usize))
-            + beginning_page_offset;
+        let map_size = phent.p_filesz as usize + beginning_page_offset;
         let map_size = self.elf_page_align_up(VirtAddr::new(map_size)).data();
         // 当前段在文件中的大小
         let seg_in_file_size = phent.p_filesz as usize;
@@ -195,8 +193,8 @@ impl ElfLoader {
         let map_err_handler = |err: SystemError| {
             if err == SystemError::EEXIST {
                 kerror!(
-                    "Pid: {}, elf segment at {:p} overlaps with existing mapping",
-                    current_pcb().pid,
+                    "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
+                    ProcessManager::current_pcb().pid(),
                     addr_to_map.as_ptr::<u8>()
                 );
             }

@@ -1,13 +1,18 @@
-use core::any::Any;
+use core::{
+    any::Any,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
 
-use crate::{libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock, syscall::SystemError};
 
-use super::{file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode, InodeId};
+use super::{
+    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+};
 
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
@@ -58,11 +63,11 @@ impl MountFS {
         let weak: Weak<MountFS> = Arc::downgrade(&mount_fs);
 
         // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
-        let ptr: *mut MountFS = Arc::into_raw(mount_fs) as *mut Self;
+        let ptr: *mut MountFS = mount_fs.as_ref() as *const Self as *mut Self;
         unsafe {
             (*ptr).self_ref = weak;
             // 返回初始化好的MountFS对象
-            return Arc::from_raw(ptr);
+            return mount_fs;
         }
     }
 
@@ -91,12 +96,15 @@ impl MountFSInode {
         // 创建Weak指针
         let weak: Weak<MountFSInode> = Arc::downgrade(&inode);
         // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
-        let ptr: *mut MountFSInode = Arc::into_raw(inode) as *mut Self;
+        compiler_fence(Ordering::SeqCst);
+        let ptr: *mut MountFSInode = inode.as_ref() as *const Self as *mut Self;
+        compiler_fence(Ordering::SeqCst);
         unsafe {
             (*ptr).self_ref = weak;
+            compiler_fence(Ordering::SeqCst);
 
             // 返回初始化好的MountFSInode对象
-            return Arc::from_raw(ptr);
+            return inode;
         }
     }
 
@@ -135,12 +143,17 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self
-            .inner_inode
-            .create_with_data(name, file_type, mode, data);
+        return Ok(MountFSInode {
+            inner_inode: self
+                .inner_inode
+                .create_with_data(name, file_type, mode, data)?,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: Weak::default(),
+        }
+        .wrap());
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -202,7 +215,7 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Ok(MountFSInode {
             inner_inode: self.inner_inode.create(name, file_type, mode)?,
@@ -334,6 +347,26 @@ impl IndexNode for MountFSInode {
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
         return Ok(new_mount_fs);
+    }
+
+    #[inline]
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: ModeType,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Ok(MountFSInode {
+            inner_inode: self.inner_inode.mknod(filename, mode, dev_t)?,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: Weak::default(),
+        }
+        .wrap());
+    }
+
+    #[inline]
+    fn special_node(&self) -> Option<super::SpecialNodeData> {
+        self.inner_inode.special_node()
     }
 }
 

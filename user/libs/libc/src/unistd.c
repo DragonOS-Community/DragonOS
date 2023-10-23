@@ -75,6 +75,15 @@ int pipe(int fd[2])
     return (int)syscall_invoke(SYS_PIPE, fd, 0, 0, 0, 0, 0, 0, 0);
 }
 /**
+ * @brief 调用带参数的匿名管道
+ *
+ * @return int 如果失败返回负数
+ */
+int pipe2(int fd[2], int flags)
+{
+    return (int)syscall_invoke(SYS_PIPE, fd, flags, 0, 0, 0, 0, 0, 0);
+}
+/**
  * @brief fork当前进程，但是与父进程共享VM、flags、fd
  *
  * @return pid_t
@@ -155,6 +164,7 @@ int execv(const char *path, char *const argv[])
         errno = -ENOENT;
         return -1;
     }
+
     int retval = syscall_invoke(SYS_EXECVE, (uint64_t)path, (uint64_t)argv, 0, 0, 0, 0, 0, 0);
     if (retval != 0)
         return -1;
@@ -225,4 +235,9 @@ int dup(int fd)
 int dup2(int ofd, int nfd)
 {
     return syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0, 0, 0);
+}
+
+char *getcwd(char* buf, size_t size)
+{
+    return syscall_invoke(SYS_GETCWD, buf, size, 0, 0, 0, 0, 0, 0);
 }

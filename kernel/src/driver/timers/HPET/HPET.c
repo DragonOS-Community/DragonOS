@@ -8,9 +8,9 @@
 #include <process/process.h>
 #include <sched/sched.h>
 #include <smp/ipi.h>
-#include <driver/video/video.h>
 #include <driver/interrupt/apic/apic_timer.h>
 #include <common/spinlock.h>
+#include <process/preempt.h>
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -27,7 +27,9 @@ static uint64_t test_tsc_end = 0;
 extern uint64_t Cpu_tsc_freq; // 导出自cpu.c
 
 extern struct rtc_time_t rtc_now; // 导出全局墙上时钟
+extern uint64_t rs_update_timer_jiffies(uint64_t);
 
+extern uint32_t rs_current_pcb_pid();
 enum
 {
     GCAP_ID = 0x00,
@@ -79,17 +81,6 @@ void HPET_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
         if (rs_timer_get_first_expire() <= rs_clock())
             rs_raise_softirq(TIMER_SIRQ);
 
-        // 当时间到了，或进程发生切换时，刷新帧缓冲区
-        if (rs_clock() >= video_refresh_expire_jiffies || (video_last_refresh_pid != current_pcb->pid))
-        {
-            rs_raise_softirq(VIDEO_REFRESH_SIRQ);
-            // 超过130ms仍未刷新完成，则重新发起刷新(防止由于进程异常退出导致的屏幕无法刷新)
-            if (unlikely(rs_clock() >= (video_refresh_expire_jiffies + (1 << 17))))
-            {
-                video_refresh_expire_jiffies = rs_clock() + (1 << 20);
-                rs_clear_softirq_pending(VIDEO_REFRESH_SIRQ);
-            }
-        }
         break;
 
     default:
@@ -118,6 +109,7 @@ void HPET_measure_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
  */
 void HPET_measure_freq()
 {
+    rs_preempt_disable();
     kinfo("Measuring local APIC timer's frequency...");
     const uint64_t interval = APIC_TIMER_INTERVAL; // 测量给定时间内的计数
     struct apic_IO_APIC_RTE_entry entry;
@@ -174,6 +166,8 @@ void HPET_measure_freq()
     Cpu_tsc_freq = (test_tsc_end - test_tsc_start) * (1000UL / interval);
 
     kinfo("TSC frequency: %ldMHz", Cpu_tsc_freq / 1000000);
+
+    rs_preempt_enable();
 }
 
 /**

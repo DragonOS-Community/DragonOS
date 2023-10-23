@@ -103,7 +103,7 @@ pub struct HbaCmdTable {
     // 0x50
     _rsv: [u8; 48], // Reserved
     // 0x80
-    pub prdt_entry: [HbaPrdtEntry; 65535], // Physical region descriptor table entries, 0 ~ 65535, 需要注意不要越界
+    pub prdt_entry: [HbaPrdtEntry; 8], // Physical region descriptor table entries, 0 ~ 65535, 需要注意不要越界 这里设置8的原因是，目前CmdTable只预留了8个PRDT项的空间
 }
 
 /// HBA Command Header
@@ -218,7 +218,7 @@ impl HbaPort {
         // Command table size = 256*32 = 8K per port
         let mut cmdheaders = phys_2_virt(clb as usize) as *mut u64 as *mut HbaCmdHeader;
         for i in 0..32 as usize {
-            volatile_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0
+            volatile_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0（预留了8个PRDT项的空间）
             volatile_write!((*cmdheaders).ctba, ctbas[i]);
             // 这里限制了 prdtl <= 8, 所以一共用了256bytes，如果需要修改，可以修改这里
             compiler_fence(core::sync::atomic::Ordering::SeqCst);

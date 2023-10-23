@@ -1,10 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::{
-    arch::MMArch,
-    include::bindings::bindings::{process_control_block, PAGE_OFFSET},
-    syscall::SystemError,
-};
+use crate::{arch::MMArch, include::bindings::bindings::PAGE_OFFSET, syscall::SystemError};
 
 use core::{
     cmp,
@@ -23,11 +19,11 @@ use self::{
 
 pub mod allocator;
 pub mod c_adapter;
-pub mod gfp;
 pub mod kernel_mapper;
 pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
+pub mod percpu;
 pub mod syscall;
 pub mod ucontext;
 
@@ -151,6 +147,20 @@ impl core::ops::AddAssign<PhysAddr> for PhysAddr {
     #[inline(always)]
     fn add_assign(&mut self, rhs: PhysAddr) {
         self.0 += rhs.0;
+    }
+}
+
+impl core::ops::BitOrAssign<usize> for PhysAddr {
+    #[inline(always)]
+    fn bitor_assign(&mut self, rhs: usize) {
+        self.0 |= rhs;
+    }
+}
+
+impl core::ops::BitOrAssign<PhysAddr> for PhysAddr {
+    #[inline(always)]
+    fn bitor_assign(&mut self, rhs: PhysAddr) {
+        self.0 |= rhs.0;
     }
 }
 
@@ -627,9 +637,3 @@ pub fn verify_area(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
 
     return Ok(());
 }
-// ====== 重构内存管理、进程管理后，请删除这几行 BEGIN ======
-//BUG pcb问题
-unsafe impl Send for process_control_block {}
-unsafe impl Sync for process_control_block {}
-
-// ====== 重构内存管理后，请删除这几行 END =======

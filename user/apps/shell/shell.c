@@ -79,8 +79,12 @@ void main_loop(int kb_fd)
             strcpy(command_origin, input_buffer);
             int cmd_num = parse_command(input_buffer, &argc, &argv);
             printf("\n");
+          
+
             if (cmd_num >= 0)
                 shell_run_built_in_command(cmd_num, argc, argv);
+            
+            
         }
         else
             printf("\n");
@@ -209,7 +213,7 @@ int shell_readline(int fd, char *buf)
             return count;
         }
 
-        if (key && key != 0x50 && key != 0xc8)
+        if (key && key != 0xc8)
         {
             if (key == '\b')
             {

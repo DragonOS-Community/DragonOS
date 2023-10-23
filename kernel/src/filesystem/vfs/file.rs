@@ -1,21 +1,32 @@
 use core::mem::MaybeUninit;
 
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::asm::current::current_pcb, driver::tty::TtyFilePrivateData,
-    filesystem::procfs::ProcfsFilePrivateData, include::bindings::bindings::process_control_block,
-    io::SeekFrom, kerror, syscall::SystemError,
+    driver::{
+        base::{block::SeekFrom, device::DevicePrivateData},
+        tty::TtyFilePrivateData,
+    },
+    filesystem::procfs::ProcfsFilePrivateData,
+    ipc::pipe::PipeFsPrivateData,
+    kerror,
+    libs::spinlock::SpinLock,
+    process::ProcessManager,
+    syscall::SystemError,
 };
 
-use super::{Dirent, FileType, IndexNode, Metadata};
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 pub enum FilePrivateData {
+    /// 管道文件私有信息
+    Pipefs(PipeFsPrivateData),
     /// procfs文件私有信息
     Procfs(ProcfsFilePrivateData),
-    /// Tty设备的私有信息
+    /// 设备文件的私有信息
+    DevFS(DevicePrivateData),
+    /// tty设备文件的私有信息
     Tty(TtyFilePrivateData),
     /// 不需要文件私有信息
     Unused,
@@ -104,7 +115,17 @@ impl File {
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
     pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, SystemError> {
-        let file_type: FileType = inode.metadata()?.file_type;
+        let mut inode = inode;
+        let file_type = inode.metadata()?.file_type;
+        match file_type {
+            FileType::Pipe => {
+                if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
+                    inode = pipe_inode;
+                }
+            }
+            _ => {}
+        }
+
         let mut f = File {
             inode,
             offset: 0,
@@ -133,6 +154,12 @@ impl File {
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
+
+        // 如果文件指针已经超过了文件大小，则返回0
+        if self.offset > self.inode.metadata()?.size as usize {
+            return Ok(0);
+        }
+
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;
@@ -153,6 +180,12 @@ impl File {
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
+
+        // 如果文件指针已经超过了文件大小，则需要扩展文件大小
+        let file_size = self.inode.metadata()?.size as usize;
+        if self.offset > file_size {
+            self.inode.resize(self.offset)?;
+        }
         let len = self
             .inode
             .write_at(self.offset, len, buf, &mut self.private_data)?;
@@ -166,7 +199,7 @@ impl File {
     }
 
     /// @brief 根据inode号获取子目录项的名字
-    pub fn get_entry_name(&self, ino: usize) -> Result<String, SystemError> {
+    pub fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         return self.inode.get_entry_name(ino);
     }
 
@@ -198,8 +231,9 @@ impl File {
                 return Err(SystemError::EINVAL);
             }
         }
-
-        if pos < 0 || pos > self.metadata()?.size {
+        // 根据linux man page, lseek允许超出文件末尾，并且不改变文件大小
+        // 当pos超出文件末尾时，read返回0。直到开始写入数据时，才会改变文件大小
+        if pos < 0 {
             return Err(SystemError::EOVERFLOW);
         }
         self.offset = pos as usize;
@@ -238,7 +272,6 @@ impl File {
             self.readdir_subdirs_name = inode.list()?;
             self.readdir_subdirs_name.sort();
         }
-
         // kdebug!("sub_entries={sub_entries:?}");
         if self.readdir_subdirs_name.is_empty() {
             self.offset = 0;
@@ -248,7 +281,9 @@ impl File {
         let sub_inode: Arc<dyn IndexNode> = match inode.find(&name) {
             Ok(i) => i,
             Err(e) => {
-                kerror!("Readdir error: Failed to find sub inode, file={self:?}");
+                kerror!(
+                    "Readdir error: Failed to find sub inode:{name:?}, file={self:?}, error={e:?}"
+                );
                 return Err(e);
             }
         };
@@ -256,9 +291,7 @@ impl File {
         let name_bytes: &[u8] = name.as_bytes();
 
         self.offset += 1;
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id as u64;
-        dirent.d_off = 0;
-        dirent.d_reclen = 0;
+        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
         dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
         // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
         unsafe {
@@ -269,8 +302,13 @@ impl File {
         }
 
         // 计算dirent结构体的大小
-        return Ok((name_bytes.len() + ::core::mem::size_of::<Dirent>()
-            - ::core::mem::size_of_val(&dirent.d_name)) as u64);
+        let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()
+            - ::core::mem::size_of_val(&dirent.d_name)) as u64;
+
+        dirent.d_reclen = size as u16;
+        dirent.d_off += dirent.d_reclen as i64;
+
+        return Ok(size);
     }
 
     pub fn inode(&self) -> Arc<dyn IndexNode> {
@@ -279,16 +317,16 @@ impl File {
 
     /// @brief 尝试克隆一个文件
     ///
-    /// @return Option<Box<File>> 克隆后的文件结构体。如果克隆失败，返回None
-    pub fn try_clone(&self) -> Option<Box<File>> {
-        let mut res: Box<File> = Box::new(Self {
+    /// @return Option<File> 克隆后的文件结构体。如果克隆失败，返回None
+    pub fn try_clone(&self) -> Option<File> {
+        let mut res = Self {
             inode: self.inode.clone(),
             offset: self.offset.clone(),
             mode: self.mode.clone(),
             file_type: self.file_type.clone(),
             readdir_subdirs_name: self.readdir_subdirs_name.clone(),
             private_data: self.private_data.clone(),
-        });
+        };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         if self.inode.open(&mut res.private_data, &res.mode).is_err() {
             return None;
@@ -302,6 +340,53 @@ impl File {
     pub fn file_type(&self) -> FileType {
         return self.file_type;
     }
+
+    /// @brief 获取文件的打开模式
+    #[inline]
+    pub fn mode(&self) -> FileMode {
+        return self.mode;
+    }
+
+    /// 获取文件是否在execve时关闭
+    #[inline]
+    pub fn close_on_exec(&self) -> bool {
+        return self.mode.contains(FileMode::O_CLOEXEC);
+    }
+
+    /// 设置文件是否在execve时关闭
+    #[inline]
+    pub fn set_close_on_exec(&mut self, close_on_exec: bool) {
+        if close_on_exec {
+            self.mode.insert(FileMode::O_CLOEXEC);
+        } else {
+            self.mode.remove(FileMode::O_CLOEXEC);
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: FileMode) -> Result<(), SystemError> {
+        // todo: 是否需要调用inode的open方法，以更新private data（假如它与mode有关的话）?
+        // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
+
+        // 直接修改文件的打开模式
+        self.mode = mode;
+        return Ok(());
+    }
+
+    /// @brief 重新设置文件的大小
+    ///
+    /// 如果文件大小增加，则文件内容不变，但是文件的空洞部分会被填充为0
+    /// 如果文件大小减小，则文件内容会被截断
+    ///
+    /// @return 成功：Ok()
+    ///         失败：Err(错误码)
+    pub fn ftruncate(&self, len: usize) -> Result<(), SystemError> {
+        // 如果文件不可写，返回错误
+        self.writeable()?;
+
+        // 调用inode的truncate方法
+        self.inode.resize(len)?;
+        return Ok(());
+    }
 }
 
 impl Drop for File {
@@ -310,8 +395,8 @@ impl Drop for File {
         // 打印错误信息
         if r.is_err() {
             kerror!(
-                "pid: {} failed to close file: {:?}, errno={:?}",
-                current_pcb().pid,
+                "pid: {:?} failed to close file: {:?}, errno={:?}",
+                ProcessManager::current_pcb().pid(),
                 self,
                 r.unwrap_err()
             );
@@ -323,47 +408,46 @@ impl Drop for File {
 #[derive(Debug)]
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
-    pub fds: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD],
+    fds: [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD],
 }
 
 impl FileDescriptorVec {
     pub const PROCESS_MAX_FD: usize = 32;
 
-    pub fn new() -> Box<FileDescriptorVec> {
+    pub fn new() -> FileDescriptorVec {
         // 先声明一个未初始化的数组
-        let mut data: [MaybeUninit<Option<Box<File>>>; FileDescriptorVec::PROCESS_MAX_FD] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+        let mut data: [MaybeUninit<Option<Arc<SpinLock<File>>>>;
+            FileDescriptorVec::PROCESS_MAX_FD] = unsafe { MaybeUninit::uninit().assume_init() };
 
         // 逐个把每个元素初始化为None
         for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
             data[i] = MaybeUninit::new(None);
         }
         // 由于一切都初始化完毕，因此将未初始化的类型强制转换为已经初始化的类型
-        let data: [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD] = unsafe {
-            core::mem::transmute::<_, [Option<Box<File>>; FileDescriptorVec::PROCESS_MAX_FD]>(data)
+        let data: [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD] = unsafe {
+            core::mem::transmute::<
+                _,
+                [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD],
+            >(data)
         };
 
         // 初始化文件描述符数组结构体
-        return Box::new(FileDescriptorVec { fds: data });
+        return FileDescriptorVec { fds: data };
     }
 
     /// @brief 克隆一个文件描述符数组
     ///
-    /// @return Box<FileDescriptorVec> 克隆后的文件描述符数组
-    pub fn clone(&self) -> Box<FileDescriptorVec> {
-        let mut res: Box<FileDescriptorVec> = FileDescriptorVec::new();
+    /// @return FileDescriptorVec 克隆后的文件描述符数组
+    pub fn clone(&self) -> FileDescriptorVec {
+        let mut res = FileDescriptorVec::new();
         for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
             if let Some(file) = &self.fds[i] {
-                res.fds[i] = file.try_clone();
+                if let Some(file) = file.lock().try_clone() {
+                    res.fds[i] = Some(Arc::new(SpinLock::new(file)));
+                }
             }
         }
         return res;
-    }
-
-    /// @brief 从pcb的fds字段，获取文件描述符数组的可变引用
-    #[inline]
-    pub fn from_pcb(pcb: &'static process_control_block) -> Option<&'static mut FileDescriptorVec> {
-        return unsafe { (pcb.fds as usize as *mut FileDescriptorVec).as_mut() };
     }
 
     /// @brief 判断文件描述符序号是否合法
@@ -378,5 +462,121 @@ impl FileDescriptorVec {
         } else {
             return true;
         }
+    }
+
+    /// 申请文件描述符，并把文件对象存入其中。
+    ///
+    /// ## 参数
+    ///
+    /// - `file` 要存放的文件对象
+    /// - `fd` 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(i32)` 申请成功，返回申请到的文件描述符
+    /// - `Err(SystemError)` 申请失败，返回错误码，并且，file对象将被drop掉
+    pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
+        if fd.is_some() {
+            // 指定了要申请的文件描述符编号
+            let new_fd = fd.unwrap();
+            let x = &mut self.fds[new_fd as usize];
+            if x.is_none() {
+                *x = Some(Arc::new(SpinLock::new(file)));
+                return Ok(new_fd);
+            } else {
+                return Err(SystemError::EBADF);
+            }
+        } else {
+            // 没有指定要申请的文件描述符编号
+            for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+                if self.fds[i].is_none() {
+                    self.fds[i] = Some(Arc::new(SpinLock::new(file)));
+                    return Ok(i as i32);
+                }
+            }
+            return Err(SystemError::EMFILE);
+        }
+    }
+
+    /// 根据文件描述符序号，获取文件结构体的Arc指针
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    pub fn get_file_by_fd(&self, fd: i32) -> Option<Arc<SpinLock<File>>> {
+        if !FileDescriptorVec::validate_fd(fd) {
+            return None;
+        }
+        return self.fds[fd as usize].clone();
+    }
+
+    /// 释放文件描述符，同时关闭文件。
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
+        // 判断文件描述符的数字是否超过限制
+        if !FileDescriptorVec::validate_fd(fd) {
+            return Err(SystemError::EBADF);
+        }
+
+        self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
+
+        // 把文件描述符数组对应位置设置为空
+        let file = self.fds[fd as usize].take().unwrap();
+
+        assert!(Arc::strong_count(&file) == 1);
+        return Ok(());
+    }
+
+    pub fn iter(&self) -> FileDescriptorIterator {
+        return FileDescriptorIterator::new(self);
+    }
+
+    pub fn close_on_exec(&mut self) {
+        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            if let Some(file) = &self.fds[i] {
+                let to_drop = file.lock().close_on_exec();
+                if to_drop {
+                    let r = self.drop_fd(i as i32);
+                    if let Err(r) = r {
+                        kerror!(
+                            "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
+                            ProcessManager::current_pcb().pid(),
+                            i,
+                            r
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FileDescriptorIterator<'a> {
+    fds: &'a FileDescriptorVec,
+    index: usize,
+}
+
+impl<'a> FileDescriptorIterator<'a> {
+    pub fn new(fds: &'a FileDescriptorVec) -> Self {
+        return Self { fds, index: 0 };
+    }
+}
+
+impl<'a> Iterator for FileDescriptorIterator<'a> {
+    type Item = (i32, Arc<SpinLock<File>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < FileDescriptorVec::PROCESS_MAX_FD {
+            let fd = self.index as i32;
+            self.index += 1;
+            if let Some(file) = self.fds.get_file_by_fd(fd) {
+                return Some((fd, file));
+            }
+        }
+        return None;
     }
 }

@@ -11,8 +11,8 @@
 #pragma once
 #include <arch/x86_64/include/asm/cmpxchg.h>
 
-#define atomic_read(atomic)	((atomic)->value)   // 读取原子变量
-#define atomic_set(atomic,val)	(((atomic)->value) = (val)) // 设置原子变量的初始值
+#define atomic_read(atomic) ((atomic)->value)               // 读取原子变量
+#define atomic_set(atomic, val) (((atomic)->value) = (val)) // 设置原子变量的初始值
 
 typedef struct
 {
@@ -102,6 +102,6 @@ inline void atomic_clear_mask(atomic_t *ato, long mask)
 // cmpxchgq 比较并交换
 inline long atomic_cmpxchg(atomic_t *ato, long oldval, long newval)
 {
-    bool success = arch_try_cmpxchg(&ato->value, &oldval, &newval);
+    bool success = arch_try_cmpxchg(&ato->value, &oldval, newval);
     return success ? oldval : newval;
 }

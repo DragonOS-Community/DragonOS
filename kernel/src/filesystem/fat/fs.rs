@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
 
 use alloc::{
@@ -8,13 +9,16 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::filesystem::vfs::SpecialNodeData;
+use crate::ipc::pipe::LockedPipeInode;
 use crate::{
+    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
+        syscall::ModeType,
         FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
     },
-    io::{device::LBA_SIZE, disk_info::Partition, SeekFrom},
     kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -24,6 +28,7 @@ use crate::{
     time::TimeSpec,
 };
 
+use super::entry::FATFile;
 use super::{
     bpb::{BiosParameterBlock, FATType},
     entry::{FATDir, FATDirEntry, FATDirIter, FATEntry},
@@ -101,6 +106,9 @@ pub struct FATInode {
 
     /// 根据不同的Inode类型，创建不同的私有字段
     inode_type: FATDirEntry,
+
+    /// 若该节点是特殊文件节点，该字段则为真正的文件节点
+    special_node: Option<SpecialNodeData>,
 }
 
 impl FATInode {
@@ -189,12 +197,13 @@ impl LockedFATInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: file_type,
-                mode: 0o777,
+                mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: 0,
             },
+            special_node: None,
         })));
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
@@ -308,12 +317,13 @@ impl FATFileSystem {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: 0o777,
+                mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: 0,
             },
+            special_node: None,
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
@@ -350,6 +360,10 @@ impl FATFileSystem {
     /// @return Err(SystemError) 错误码
     pub fn get_fat_entry(&self, cluster: Cluster) -> Result<FATEntry, SystemError> {
         let current_cluster = cluster.cluster_num;
+        if current_cluster < 2 {
+            // 0号簇和1号簇是保留簇，不允许用户使用
+            return Err(SystemError::EINVAL);
+        }
 
         let fat_type: FATType = self.bpb.fat_type;
         // 获取FAT表的起始扇区（相对分区起始扇区的偏移量）
@@ -1170,8 +1184,7 @@ impl FATFileSystem {
         let offset: usize = self.cluster_bytes_offset(cluster) as usize;
         self.partition
             .disk()
-            .device()
-            .write_at(offset, zeros.len(), zeros.as_slice())?;
+            .write_at_bytes(offset, zeros.len(), zeros.as_slice())?;
         return Ok(());
     }
 }
@@ -1418,10 +1431,9 @@ impl IndexNode for LockedFATInode {
         &self,
         name: &str,
         file_type: FileType,
-        _mode: u32,
+        _mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
-
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
@@ -1459,6 +1471,44 @@ impl IndexNode for LockedFATInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
+    }
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+        let old_size = guard.metadata.size as usize;
+
+        match &mut guard.inode_type {
+            FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
+                // 如果新的长度和旧的长度相同，那么就直接返回
+                if len == old_size {
+                    return Ok(());
+                } else if len > old_size {
+                    // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut remain_size = len - old_size;
+                    let buf_size = remain_size;
+                    // let buf_size = core::cmp::min(remain_size, 512 * 1024);
+                    buf.resize(buf_size, 0);
+
+                    let mut offset = old_size;
+                    while remain_size > 0 {
+                        let write_size = core::cmp::min(remain_size, buf_size);
+                        file.write(fs, &buf[0..write_size], offset as u64)?;
+                        remain_size -= write_size;
+                        offset += write_size;
+                    }
+                } else {
+                    file.truncate(fs, len as u64)?;
+                }
+                guard.update_metadata();
+                return Ok(());
+            }
+            FATDirEntry::Dir(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            FATDirEntry::UnInit => {
+                kerror!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        }
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -1524,7 +1574,15 @@ impl IndexNode for LockedFATInode {
         // 对目标inode上锁，以防更改
         let target_guard: SpinLockGuard<FATInode> = target.0.lock();
         // 先从缓存删除
-        guard.children.remove(&name.to_uppercase());
+        let nod = guard.children.remove(&name.to_uppercase());
+
+        // 若删除缓存中为管道的文件，则不需要再到磁盘删除
+        if let Some(_) = nod {
+            let file_type = target_guard.metadata.file_type;
+            if file_type == FileType::Pipe {
+                return Ok(());
+            }
+        }
 
         let dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
@@ -1587,7 +1645,7 @@ impl IndexNode for LockedFATInode {
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -1600,17 +1658,74 @@ impl IndexNode for LockedFATInode {
                 let mut key: Vec<String> = guard
                     .children
                     .keys()
-                    .filter(|k| guard.children.get(*k).unwrap().metadata().unwrap().inode_id == ino)
+                    .filter(|k| {
+                        guard
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .metadata()
+                            .unwrap()
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
-                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
+                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
                 }
             }
         }
+    }
+
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: ModeType,
+        _dev_t: crate::driver::base::device::DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // 判断需要创建的类型
+        if unlikely(mode.contains(ModeType::S_IFREG)) {
+            // 普通文件
+            return Ok(self.create(filename, FileType::File, mode)?);
+        }
+
+        let nod = LockedFATInode::new(
+            inode.fs.upgrade().unwrap(),
+            inode.self_ref.clone(),
+            FATDirEntry::File(FATFile::default()),
+        );
+
+        if mode.contains(ModeType::S_IFIFO) {
+            nod.0.lock().metadata.file_type = FileType::Pipe;
+            // 创建pipe文件
+            let pipe_inode = LockedPipeInode::new();
+            // 设置special_node
+            nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
+        } else if mode.contains(ModeType::S_IFBLK) {
+            nod.0.lock().metadata.file_type = FileType::BlockDevice;
+            unimplemented!()
+        } else if mode.contains(ModeType::S_IFCHR) {
+            nod.0.lock().metadata.file_type = FileType::CharDevice;
+            unimplemented!()
+        }
+
+        inode
+            .children
+            .insert(String::from(filename).to_uppercase(), nod.clone());
+        Ok(nod)
+    }
+
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        self.0.lock().special_node.clone()
     }
 }
 

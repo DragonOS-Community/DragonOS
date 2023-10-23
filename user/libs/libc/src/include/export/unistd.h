@@ -120,11 +120,18 @@ int rm(const char * path);
  */
 void swab(void *restrict src, void *restrict dest, ssize_t nbytes);
 
+/**
+ * @brief   创建pipe
+ *  @param fildes  分别是读端fildes[0]和写端fildes[1]
+ */
+int pipe(int fildes[2]);
+
 pid_t getpid(void);
 
 int dup(int fd);
 
 int dup2(int ofd, int nfd);
+char *getcwd(char* buf, size_t size);
 
 #if defined(__cplusplus) 
 }  /* extern "C" */ 

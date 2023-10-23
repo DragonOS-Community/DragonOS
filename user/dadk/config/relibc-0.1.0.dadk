@@ -5,9 +5,8 @@
   "task_type": {
     "BuildFromSource": {
       "Git": {
-        "url": "https://github.com/DragonOS-Community/relibc.git",
-        "branch": "dragonos-relibc",
-        "revision": null
+        "url": "https://git.mirrors.dragonos.org/DragonOS-Community/relibc.git",
+        "revision": "66739c1b10"
       }
     }
   },

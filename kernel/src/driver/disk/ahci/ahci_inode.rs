@@ -1,10 +1,11 @@
+use crate::driver::base::block::block_device::BlockDevice;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode,
     Metadata, PollStatus,
 };
-use crate::io::device::BlockDevice;
 use crate::syscall::SystemError;
 use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
@@ -49,7 +50,7 @@ impl LockedAhciInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::BlockDevice, // 文件夹，block设备，char设备
-                mode: 0o666,
+                mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -124,7 +125,7 @@ impl IndexNode for LockedAhciInode {
         }
 
         if let FilePrivateData::Unused = data {
-            return self.0.lock().disk.read_at(offset, len, buf);
+            return self.0.lock().disk.read_at_bytes(offset, len, buf);
         }
 
         return Err(SystemError::EINVAL);
@@ -143,7 +144,7 @@ impl IndexNode for LockedAhciInode {
         }
 
         if let FilePrivateData::Unused = data {
-            return self.0.lock().disk.write_at(offset, len, buf);
+            return self.0.lock().disk.write_at_bytes(offset, len, buf);
         }
 
         return Err(SystemError::EINVAL);

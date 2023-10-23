@@ -14,6 +14,7 @@
 #![feature(vec_into_raw_parts)]
 #![feature(new_uninit)]
 #![feature(ptr_to_from_bits)]
+#![feature(concat_idents)]
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]

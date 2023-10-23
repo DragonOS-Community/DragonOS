@@ -5,6 +5,7 @@ pub mod vmcs;
 pub mod ept;
 pub mod mmu;
 pub mod kvm_emulation;
+pub mod seg;
 
 
 #[allow(dead_code)]
@@ -25,4 +26,21 @@ pub enum VcpuRegIndex {
 	R13 = 13,
 	R14 = 14,
 	R15 = 15,
+}
+
+
+bitflags! {
+	pub struct X86_CR0: u32{
+		const CR0_PE = 1 << 0; /* Protection Enable */
+		const CR0_MP = 1 << 1; /* Monitor Coprocessor */
+		const CR0_EM = 1 << 2; /* Emulation */
+		const CR0_TS = 1 << 3; /* Task Switched */
+		const CR0_ET = 1 << 4; /* Extension Type */
+		const CR0_NE = 1 << 5; /* Numeric Error */
+		const CR0_WP = 1 << 16; /* Write Protect */
+		const CR0_AM = 1 << 18; /* Alignment Mask */
+		const CR0_NW = 1 << 29; /* Not Write-through */
+		const CR0_CD = 1 << 30; /* Cache Disable */
+		const CR0_PG = 1 << 31; /* Paging */
+	}
 }

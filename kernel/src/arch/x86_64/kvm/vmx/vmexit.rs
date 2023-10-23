@@ -238,6 +238,14 @@ extern "C" fn vmexit_handler(){
         }
         _ => {
             kdebug!("vmexit handler: unhandled vmexit reason: {}!", exit_basic_reason);
+            
+            let info = vmx_vmread(VmcsFields::VMEXIT_INSTR_LEN as u32).unwrap() as u32;
+            kdebug!("vmexit handler: VMEXIT_INSTR_LEN: {}!", info);
+            let info = vmx_vmread(VmcsFields::VMEXIT_INSTR_INFO as u32).unwrap() as u32;
+            kdebug!("vmexit handler: VMEXIT_INSTR_INFO: {}!", info);
+            let info = vmx_vmread(VmcsFields::CTRL_EXPECTION_BITMAP as u32).unwrap() as u32;
+            kdebug!("vmexit handler: CTRL_EXPECTION_BITMAP: {}!", info);
+            
             adjust_rip(guest_rip).unwrap();
             // panic!();
         }

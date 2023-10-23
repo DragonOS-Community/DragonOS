@@ -73,7 +73,16 @@ int main()
             "cpuid\n\t"
         ); 
     */
-    uint8_t code[] = "\x48\x89\x04\x25\x00\x00\x00\x00\x48\x89\x0c\x25\x00\x00\x00\x00\x0f\xa2";
+    const uint8_t code[] = {
+        0xba, 0xf8, 0x03, /* mov $0x3f8, %dx */
+        0x00, 0xd8,       /* add %bl, %al */
+        0x04, '0',        /* add $'0', %al */
+        0xee,             /* out %al, (%dx) */
+        0xb0, '\n',       /* mov $'\n', %al */
+        0xee,             /* out %al, (%dx) */
+        0xf4,             /* hlt */
+    };
+
     size_t mem_size = 0x4000; // size of user memory you want to assign
     printf("code=%p\n", code);
     // void *mem = mmap(0, mem_size, 0x7, -1, 0);

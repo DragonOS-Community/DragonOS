@@ -207,22 +207,14 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        kdebug!("process_copy_sighand");
-
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
         if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
             flush_signal_handlers(new_pcb.clone(), false);
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
             (*new_pcb.sig_struct()).handlers = current_pcb.sig_struct().handlers.clone();
         }
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         return Ok(());
     }
 }

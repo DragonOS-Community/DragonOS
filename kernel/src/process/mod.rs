@@ -233,7 +233,7 @@ impl ProcessManager {
 
         let pcb = ProcessManager::current_pcb();
         let mut writer = pcb.sched_info_mut_irqsave();
-        if writer.state() != ProcessState::Exited(0) {
+        if !matches!(writer.state(), ProcessState::Exited(_)) {
             writer.set_state(ProcessState::Blocked(interruptable));
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
@@ -258,7 +258,7 @@ impl ProcessManager {
 
         let pcb = ProcessManager::current_pcb();
         let mut writer = pcb.sched_info_mut_irqsave();
-        if writer.state() != ProcessState::Exited(0) {
+        if !matches!(writer.state(), ProcessState::Exited(_)) {
             writer.set_state(ProcessState::Stopped);
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
@@ -1052,6 +1052,7 @@ pub fn process_init() {
 
 #[derive(Debug)]
 pub struct ProcessSignalInfo {
+    // 当前进程
     sig_block: SigSet,
     // sig_pending 中存储当前线程要处理的信号
     sig_pending: SigPending,
@@ -1060,8 +1061,8 @@ pub struct ProcessSignalInfo {
 }
 
 impl ProcessSignalInfo {
-    pub fn sig_block(&self) -> SigSet {
-        self.sig_block
+    pub fn sig_block(&self) -> &SigSet {
+        &self.sig_block
     }
 
     pub fn sig_pending(&self) -> &SigPending {

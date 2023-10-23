@@ -9,34 +9,14 @@ use crate::{
     },
     ipc::signal_types::SigactionType,
     kwarn,
+    libs::spinlock::SpinLockGuard,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
     syscall::SystemError,
 };
 
-use super::signal_types::{SaHandlerType, SigInfo, SigType, Sigaction, SIG_KERNEL_STOP_MASK};
-
-lazy_static! {
-    /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
-     #[allow(dead_code)]
-    pub static ref DEFAULT_SIGACTION: Sigaction = Sigaction::new(
-    SigactionType::SaHandler(SaHandlerType::SigDefault),
-     SigFlags::empty(),
-    SigSet::from_bits(0).unwrap(),
-     None,
-    );
-
-/// 默认的“忽略信号”的sigaction
-#[allow(dead_code)]
-pub static ref DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction::new(
-    SigactionType::SaHandler(SaHandlerType::SigIgnore),
-     SigFlags::empty(),
-    SigSet::from_bits(0).unwrap(),
-     None,
-    );
-
-
-
-}
+use super::signal_types::{
+    SaHandlerType, SigInfo, SigType, Sigaction, SignalStruct, SIG_KERNEL_STOP_MASK,
+};
 
 impl Signal {
     /// 向目标进程发送信号
@@ -96,7 +76,7 @@ impl Signal {
         // signal的信息为空
 
         if let Some(ref siginfo) = info {
-            force_send = matches!(siginfo.sig_code(), SigCode::SI_KERNEL);
+            force_send = matches!(siginfo.sig_code(), SigCode::Kernel);
         } else {
             // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
             //详见 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
@@ -135,7 +115,7 @@ impl Signal {
                     SigInfo::new(
                         self.clone(),
                         0,
-                        SigCode::SI_USER,
+                        SigCode::User,
                         SigType::Kill(ProcessManager::current_pcb().pid()),
                     )
                 }
@@ -197,7 +177,8 @@ impl Signal {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // TODO: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
         if _target.is_some() {
-            signal_wake_up(pcb.clone(), *self == Signal::SIGKILL);
+            let guard = pcb.sig_struct();
+            signal_wake_up(pcb.clone(), guard, *self == Signal::SIGKILL);
         }
     }
 
@@ -291,13 +272,18 @@ impl Signal {
     }
 }
 
-/// 需要保证调用时已经对 sig_struct 上锁
+/// 因收到信号而唤醒进程
+///
+/// ## 参数
+///
+/// - `pcb` 要唤醒的进程pcb
+/// - `_guard` 信号结构体锁守卫，来保证信号结构体已上锁
+/// - `fatal` 表明这个信号是不是致命的(会导致进程退出)
 #[inline]
-fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
+fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStruct>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // kdebug!("signal_wake_up");
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
     let r = ProcessManager::wakeup_stop(&pcb);
     if r.is_ok() {
@@ -309,7 +295,6 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
             });
         }
     }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// @brief 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位
@@ -339,7 +324,7 @@ pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool)
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
-pub fn do_sigaction(
+pub(super) fn do_sigaction(
     sig: Signal,
     act: Option<&mut Sigaction>,
     old_act: Option<&mut Sigaction>,
@@ -406,9 +391,14 @@ pub fn do_sigaction(
     return Ok(());
 }
 
+/// 设置当前进程的屏蔽信号 (sig_block)，待引入 [sigprocmask](https://man7.org/linux/man-pages/man2/sigprocmask.2.html) 系统调用后要删除这个散装函数
+///
+/// ## 参数
+///
+/// - `new_set` 新的屏蔽信号bitmap的值
 pub fn set_current_sig_blocked(new_set: &mut SigSet) {
     new_set.remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
-
+    //TODO 把这个散装函数用 sigsetops 替换掉
     let pcb = ProcessManager::current_pcb();
 
     /*

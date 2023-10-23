@@ -10,13 +10,13 @@ use crate::{
         FilePrivateData,
     },
     kerror, kwarn,
+    mm::VirtAddr,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
 
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
-    signal::{DEFAULT_SIGACTION, DEFAULT_SIGACTION_IGNORE},
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -73,7 +73,7 @@ impl Syscall {
         }
 
         // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::SI_USER, SigType::Kill(pid));
+        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -105,7 +105,6 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
         let act: *mut UserSigaction = new_act as *mut UserSigaction;
-        unsafe { kdebug!("sigaction: sig={}, act={:?}", sig, *act,) };
         let mut old_act = old_act as *mut UserSigaction;
         let mut new_ka: Sigaction = Default::default();
         let mut old_sigaction: Sigaction = Default::default();
@@ -120,13 +119,13 @@ impl Syscall {
             let input_sighandler = unsafe { (*act).handler as u64 };
             match input_sighandler {
                 USER_SIG_DFL => {
-                    new_ka = (*DEFAULT_SIGACTION).clone();
+                    new_ka = Sigaction::DEFAULT_SIGACTION.clone();
                     *new_ka.flags_mut() = unsafe { (*act).flags };
                     new_ka.set_restorer(None);
                 }
 
                 USER_SIG_IGN => {
-                    new_ka = (*DEFAULT_SIGACTION_IGNORE).clone();
+                    new_ka = Sigaction::DEFAULT_SIGACTION_IGNORE.clone();
                     *new_ka.flags_mut() = unsafe { (*act).flags };
 
                     new_ka.set_restorer(None);
@@ -136,11 +135,11 @@ impl Syscall {
                     // TODO mask是default还是用户空间传入
                     new_ka = Sigaction::new(
                         SigactionType::SaHandler(SaHandlerType::SigCustomized(unsafe {
-                            (*act).handler as u64
+                            VirtAddr::new((*act).handler as usize)
                         })),
                         unsafe { (*act).flags },
                         SigSet::default(),
-                        unsafe { Some((*act).restorer as u64) },
+                        unsafe { Some(VirtAddr::new((*act).restorer as usize)) },
                     );
                 }
             }
@@ -189,31 +188,31 @@ impl Syscall {
                 return Err(SystemError::EFAULT);
             }
 
-            let sigaction_handler: u64;
+            let sigaction_handler: VirtAddr;
             sigaction_handler = match old_sigaction.action() {
                 SigactionType::SaHandler(handler) => {
                     if let SaHandlerType::SigCustomized(hand) = handler {
                         hand
                     } else if handler.is_sig_ignore() {
-                        USER_SIG_IGN
+                        VirtAddr::new(USER_SIG_IGN as usize)
                     } else if handler.is_sig_error() {
-                        USER_SIG_ERR
+                        VirtAddr::new(USER_SIG_ERR as usize)
                     } else {
-                        USER_SIG_DFL
+                        VirtAddr::new(USER_SIG_DFL as usize)
                     }
                 }
                 SigactionType::SaSigaction(_) => {
                     kerror!("unsupported type: SaSigaction");
-                    USER_SIG_DFL
+                    VirtAddr::new(USER_SIG_DFL as usize)
                 }
             };
 
             unsafe {
-                (*old_act).handler = sigaction_handler as *mut c_void;
+                (*old_act).handler = sigaction_handler.data() as *mut c_void;
                 (*old_act).flags = old_sigaction.flags();
                 (*old_act).mask = old_sigaction.mask();
                 if old_sigaction.restorer().is_some() {
-                    (*old_act).restorer = old_sigaction.restorer().unwrap() as *mut c_void;
+                    (*old_act).restorer = old_sigaction.restorer().unwrap().data() as *mut c_void;
                 }
             }
         }

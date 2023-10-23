@@ -158,8 +158,8 @@ impl ArchPCBInfo {
     }
 
     /// 返回浮点寄存器结构体的副本
-    pub fn fp_state(&self) -> Option<FpState> {
-        self.fp_state.clone()
+    pub fn fp_state(&self) -> &Option<FpState> {
+        &self.fp_state
     }
 
     // 清空浮点寄存器

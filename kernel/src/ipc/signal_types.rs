@@ -6,19 +6,13 @@ use crate::{
     arch::{
         asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, Signal, _NSIG},
+        ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     include::bindings::bindings::siginfo,
+    mm::VirtAddr,
     process::Pid,
     syscall::{user_access::UserBufferWriter, SystemError},
 };
-
-/// 存储信号处理函数的地址(来自用户态)
-pub type UserSighandler = u64;
-/// 存储信号处理恢复函数的地址(来自用户态)
-pub type UserSigrestorer = u64;
-
-pub const MAX_SIG_NUM: usize = _NSIG;
 
 /// 用户态程序传入的SIG_DFL的值
 pub const USER_SIG_DFL: u64 = 0;
@@ -112,7 +106,7 @@ pub enum SaHandlerType {
     SigError, // 暂时没有用上
     SigDefault,
     SigIgnore,
-    SigCustomized(UserSighandler),
+    SigCustomized(VirtAddr),
 }
 
 impl Into<usize> for SaHandlerType {
@@ -121,7 +115,7 @@ impl Into<usize> for SaHandlerType {
             Self::SigError => 2 as usize,
             Self::SigIgnore => 1 as usize,
             Self::SigDefault => 0 as usize,
-            Self::SigCustomized(handler) => handler as usize,
+            Self::SigCustomized(handler) => handler.data(),
         }
     }
 }
@@ -157,7 +151,7 @@ pub struct Sigaction {
     flags: SigFlags,
     mask: SigSet, // 为了可扩展性而设置的sa_mask
     /// 信号处理函数执行结束后，将会跳转到这个函数内进行执行，然后执行sigreturn系统调用
-    restorer: Option<UserSigrestorer>,
+    restorer: Option<VirtAddr>,
 }
 
 impl Default for Sigaction {
@@ -189,7 +183,7 @@ impl Sigaction {
         action: SigactionType,
         flags: SigFlags,
         mask: SigSet,
-        restorer: Option<UserSigrestorer>,
+        restorer: Option<VirtAddr>,
     ) -> Self {
         Self {
             action,
@@ -207,7 +201,7 @@ impl Sigaction {
         self.flags
     }
 
-    pub fn restorer(&self) -> Option<u64> {
+    pub fn restorer(&self) -> Option<VirtAddr> {
         self.restorer
     }
 
@@ -227,9 +221,25 @@ impl Sigaction {
         &mut self.mask
     }
 
-    pub fn set_restorer(&mut self, restorer: Option<UserSigrestorer>) {
+    pub fn set_restorer(&mut self, restorer: Option<VirtAddr>) {
         self.restorer = restorer;
     }
+
+    /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
+    pub const DEFAULT_SIGACTION: Sigaction = Sigaction {
+        action: SigactionType::SaHandler(SaHandlerType::SigDefault),
+        flags: SigFlags::empty(),
+        mask: SigSet::from_bits_truncate(0),
+        restorer: None,
+    };
+
+    /// 默认的“忽略信号”的sigaction
+    pub const DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction {
+        action: SigactionType::SaHandler(SaHandlerType::SigIgnore),
+        flags: SigFlags::empty(),
+        mask: SigSet::from_bits_truncate(0),
+        restorer: None,
+    };
 }
 
 /// 用户态传入的sigaction结构体（符合posix规范）
@@ -360,7 +370,7 @@ impl SigPending {
         }
 
         // 暂时只支持64种信号
-        assert_eq!(_NSIG, 64);
+        assert_eq!(MAX_SIG_NUM, 64);
 
         return sig;
     }
@@ -381,7 +391,7 @@ impl SigPending {
             return info.unwrap();
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::SI_USER, SigType::Kill(Pid::from(0)));
+            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(Pid::from(0)));
             ret.set_sig_type(SigType::Kill(Pid::new(0)));
             return ret;
         }
@@ -514,7 +524,7 @@ pub trait SignalArch {
     /// ## 参数
     ///
     /// - `frame` 中断栈帧
-    unsafe fn do_signal(frame: &mut TrapFrame);
+    unsafe extern "C" fn do_signal(frame: &mut TrapFrame);
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
 }

@@ -6,28 +6,23 @@ use crate::{
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         sched::sched,
-        CurrentIrqArch,
+        CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
-    include::bindings::bindings::USER_MAX_LINEAR_ADDR,
     ipc::{
         signal::set_current_sig_blocked,
-        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, MAX_SIG_NUM},
+        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch},
     },
-    kdebug, kerror,
+    kerror,
+    mm::MemoryManagementArch,
     process::ProcessManager,
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
 
-/// 最大支持的信号数量
-pub const _NSIG: usize = 64;
-/// 实时信号的最小值
-pub const SIGRTMIN: usize = 32;
-/// 实时信号的最大值
-pub const SIGRTMAX: usize = crate::arch::ipc::signal::_NSIG;
 /// 信号处理的栈的栈指针的最小对齐数量
 pub const STACK_ALIGN: u64 = 16;
-
+/// 信号最大值
+pub const MAX_SIG_NUM: usize = 64;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq)]
 #[repr(usize)]
@@ -72,7 +67,7 @@ pub enum Signal {
     SIGSYS = 31,
 
     SIGRTMIN = 32,
-    SIGRTMAX = crate::arch::ipc::signal::_NSIG,
+    SIGRTMAX = 64,
 }
 
 /// 为Signal实现判断相等的trait
@@ -122,7 +117,7 @@ impl Signal {
     /// 判断一个数字是否为可用的信号
     #[inline]
     pub fn is_valid(&self) -> bool {
-        return (*self) as usize <= SIGRTMAX;
+        return (*self) as usize <= MAX_SIG_NUM;
     }
 
     /// const convertor between `Signal` and `SigSet`
@@ -140,7 +135,49 @@ impl Signal {
     /// - `false` 这个信号不是实时信号
     #[inline]
     pub fn is_rt_signal(&self) -> bool {
-        return (*self) as usize >= SIGRTMIN;
+        return (*self) as usize >= Signal::SIGRTMIN.into();
+    }
+
+    /// 调用信号的默认处理函数
+    pub fn handle_default(&self) {
+        match self {
+            Signal::INVALID => {
+                kerror!("attempting to handler an Invalid");
+            }
+            Signal::SIGHUP => sig_terminate(self.clone()),
+            Signal::SIGINT => sig_terminate(self.clone()),
+            Signal::SIGQUIT => sig_terminate_dump(self.clone()),
+            Signal::SIGILL => sig_terminate_dump(self.clone()),
+            Signal::SIGTRAP => sig_terminate_dump(self.clone()),
+            Signal::SIGABRT_OR_IOT => sig_terminate_dump(self.clone()),
+            Signal::SIGBUS => sig_terminate_dump(self.clone()),
+            Signal::SIGFPE => sig_terminate_dump(self.clone()),
+            Signal::SIGKILL => sig_terminate(self.clone()),
+            Signal::SIGUSR1 => sig_terminate(self.clone()),
+            Signal::SIGSEGV => sig_terminate_dump(self.clone()),
+            Signal::SIGUSR2 => sig_terminate(self.clone()),
+            Signal::SIGPIPE => sig_terminate(self.clone()),
+            Signal::SIGALRM => sig_terminate(self.clone()),
+            Signal::SIGTERM => sig_terminate(self.clone()),
+            Signal::SIGSTKFLT => sig_terminate(self.clone()),
+            Signal::SIGCHLD => sig_ignore(self.clone()),
+            Signal::SIGCONT => sig_continue(self.clone()),
+            Signal::SIGSTOP => sig_stop(self.clone()),
+            Signal::SIGTSTP => sig_stop(self.clone()),
+            Signal::SIGTTIN => sig_stop(self.clone()),
+            Signal::SIGTTOU => sig_stop(self.clone()),
+            Signal::SIGURG => sig_ignore(self.clone()),
+            Signal::SIGXCPU => sig_terminate_dump(self.clone()),
+            Signal::SIGXFSZ => sig_terminate_dump(self.clone()),
+            Signal::SIGVTALRM => sig_terminate(self.clone()),
+            Signal::SIGPROF => sig_terminate(self.clone()),
+            Signal::SIGWINCH => sig_ignore(self.clone()),
+            Signal::SIGIO_OR_POLL => sig_terminate(self.clone()),
+            Signal::SIGPWR => sig_terminate(self.clone()),
+            Signal::SIGSYS => sig_terminate(self.clone()),
+            Signal::SIGRTMIN => sig_terminate(self.clone()),
+            Signal::SIGRTMAX => sig_terminate(self.clone()),
+        }
     }
 }
 
@@ -148,22 +185,21 @@ impl Signal {
 /// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
 #[derive(Copy, Debug, Clone)]
 #[repr(i32)]
-#[allow(non_camel_case_types)]
 pub enum SigCode {
     /// sent by kill, sigsend, raise
-    SI_USER = 0,
+    User = 0,
     /// sent by kernel from somewhere
-    SI_KERNEL = 0x80,
+    Kernel = 0x80,
     /// 通过sigqueue发送
-    SI_QUEUE = -1,
+    Queue = -1,
     /// 定时器过期时发送
-    SI_TIMER = -2,
+    Timer = -2,
     /// 当实时消息队列的状态发生改变时发送
-    SI_MESGQ = -3,
+    Mesgq = -3,
     /// 当异步IO完成时发送
-    SI_ASYNCIO = -4,
+    AsyncIO = -4,
     /// sent by queued SIGIO
-    SI_SIGIO = -5,
+    SigIO = -5,
 }
 
 impl SigCode {
@@ -171,13 +207,13 @@ impl SigCode {
     #[allow(dead_code)]
     pub fn from_i32(x: i32) -> SigCode {
         match x {
-            0 => Self::SI_USER,
-            0x80 => Self::SI_KERNEL,
-            -1 => Self::SI_QUEUE,
-            -2 => Self::SI_TIMER,
-            -3 => Self::SI_MESGQ,
-            -4 => Self::SI_ASYNCIO,
-            -5 => Self::SI_SIGIO,
+            0 => Self::User,
+            0x80 => Self::Kernel,
+            -1 => Self::Queue,
+            -2 => Self::Timer,
+            -3 => Self::Mesgq,
+            -4 => Self::AsyncIO,
+            -5 => Self::SigIO,
             _ => panic!("signal code not valid"),
         }
     }
@@ -201,47 +237,42 @@ bitflags! {
     /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，Signal-1才是sigset_t中对应的位
     #[derive(Default)]
     pub struct SigSet:u64{
-
-    const SIGHUP = 1<<0;
-    const SIGINT= 1<<1;
-    const SIGQUIT = 1<<2;
-    const SIGILL= 1<<3;
-    const SIGTRAP=1<<4;
-     /// SIGABRT和SIGIOT共用这个号码
-    const SIGABRT_OR_IOT=1<<5;
-    const SIGBUS=1<<6;
-    const SIGFPE=1<<7;
-    const SIGKILL=1<<8;
-    const SIGUSR=1<<9;
-
-    const SIGSEGV = 1<<10;
-    const SIGUSR2=1<<11;
-    const SIGPIPE= 1<<12;
-    const SIGALRM=1<<13;
-    const SIGTERM=1<<14;
-    const SIGSTKFLT=1<<15;
-    const SIGCHLD=1<<16;
-    const SIGCONT=1<<17;
-    const SIGSTOP=1<<18;
-    const SIGTSTP=1<<19;
-
-    const SIGTTIN = 1<<20;
-    const SIGTTOU = 1<<21;
-    const SIGURG=1<<22;
-    const SIGXCPU=1<<23;
-    const SIGXFSZ=1<<24;
-    const SIGVTALRM = 1<<25;
-    const SIGPROF = 1<<26;
-    const SIGWINCH=1<<27;
-    /// SIGIO和SIGPOLL共用这个号码
-    const SIGIO_OR_POLL=1<<28;
-    const SIGPWR=1<<29;
-
-    const SIGSYS = 1<<30;
-
-    const SIGRTMIN = 1<<31;
-    // TODO 写上实时信号
-    const SIGRTMAX = 1<<crate::arch::ipc::signal::_NSIG-1;
+        const SIGHUP   =  1<<0;
+        const SIGINT   =  1<<1;
+        const SIGQUIT  =  1<<2;
+        const SIGILL   =  1<<3;
+        const SIGTRAP  =  1<<4;
+        /// SIGABRT和SIGIOT共用这个号码
+        const SIGABRT_OR_IOT    =    1<<5;
+        const SIGBUS   =  1<<6;
+        const SIGFPE   =  1<<7;
+        const SIGKILL  =  1<<8;
+        const SIGUSR   =  1<<9;
+        const SIGSEGV  =  1<<10;
+        const SIGUSR2  =  1<<11;
+        const SIGPIPE  =  1<<12;
+        const SIGALRM  =  1<<13;
+        const SIGTERM  =  1<<14;
+        const SIGSTKFLT=  1<<15;
+        const SIGCHLD  =  1<<16;
+        const SIGCONT  =  1<<17;
+        const SIGSTOP  =  1<<18;
+        const SIGTSTP  =  1<<19;
+        const SIGTTIN  =  1<<20;
+        const SIGTTOU  =  1<<21;
+        const SIGURG   =  1<<22;
+        const SIGXCPU  =  1<<23;
+        const SIGXFSZ  =  1<<24;
+        const SIGVTALRM=  1<<25;
+        const SIGPROF  =  1<<26;
+        const SIGWINCH =  1<<27;
+        /// SIGIO和SIGPOLL共用这个号码
+        const SIGIO_OR_POLL    =   1<<28;
+        const SIGPWR   =  1<<29;
+        const SIGSYS   =  1<<30;
+        const SIGRTMIN =  1<<31;
+        // TODO 写上实时信号
+        const SIGRTMAX =  1<<MAX_SIG_NUM-1;
     }
 }
 
@@ -272,11 +303,17 @@ pub struct SigContext {
 }
 
 impl SigContext {
-    /// @brief 设置目标的sigcontext
+    /// 设置sigcontext
     ///
-    /// @param context 要被设置的目标sigcontext
-    /// @param mask 要被暂存的信号mask标志位
-    /// @param regs 进入信号处理流程前，Restore all要弹出的内核栈栈帧
+    /// ## 参数
+    ///
+    /// - `mask` 要被暂存的信号mask标志位
+    /// - `regs` 进入信号处理流程前，Restore all要弹出的内核栈栈帧
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(0)`
+    /// - `Err(Systemerror)` (暂时不会返回错误)
     pub fn setup_sigcontext(
         &mut self,
         mask: &SigSet,
@@ -284,28 +321,32 @@ impl SigContext {
     ) -> Result<i32, SystemError> {
         //TODO 引入线程后补上
         // let current_thread = ProcessManager::current_pcb().thread;
-
+        let pcb = ProcessManager::current_pcb();
+        let mut archinfo_guard = pcb.arch_info();
         self.oldmask = *mask;
         self.frame = frame.clone();
         // context.trap_num = unsafe { (*current_thread).trap_num };
         // context.err_code = unsafe { (*current_thread).err_code };
         // context.cr2 = unsafe { (*current_thread).cr2 };
-        self.reserved_for_x87_state = ProcessManager::current_pcb().arch_info().fp_state();
+        self.reserved_for_x87_state = archinfo_guard.fp_state().clone();
+
+        // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
+        archinfo_guard.clear_fp_state();
         return Ok(0);
     }
 
-    /// @brief 将指定的sigcontext恢复到当前进程的内核栈帧中,并将当前线程结构体的几个参数进行恢复
+    /// 指定的sigcontext恢复到当前进程的内核栈帧中,并将当前线程结构体的几个参数进行恢复
     ///
-    /// @param self 要被恢复的context
-    /// @param frame 目标栈帧（也就是把context恢复到这个栈帧中）
+    /// ## 参数
+    /// - `frame` 目标栈帧（也就是把context恢复到这个栈帧中）
     ///
-    /// @return bool true -> 成功恢复
-    ///              false -> 执行失败
+    /// ##返回值
+    /// - `true` -> 成功恢复
+    /// - `false` -> 执行失败
     pub fn restore_sigcontext(&mut self, frame: &mut TrapFrame) -> bool {
         let guard = ProcessManager::current_pcb();
         let mut arch_info = guard.arch_info();
         (*frame) = self.frame.clone();
-        kdebug!("restored frame:{:?}", frame);
         // (*current_thread).trap_num = (*context).trap_num;
         *arch_info.cr2_mut() = self.cr2 as usize;
         // (*current_thread).err_code = (*context).err_code;
@@ -328,7 +369,7 @@ pub struct X86_64SignalArch;
 
 impl SignalArch for X86_64SignalArch {
     #[no_mangle]
-    unsafe fn do_signal(frame: &mut TrapFrame) {
+    unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
         // 检查sigpending是否为0
         if ProcessManager::current_pcb()
             .sig_info()
@@ -349,8 +390,7 @@ impl SignalArch for X86_64SignalArch {
         let sig_guard = pcb.sig_struct();
         let mut sig_number: Signal;
         let mut info: Option<SigInfo>;
-        let sigaction: Option<&mut Sigaction>;
-        let mut tmp_ka: Sigaction;
+        let mut sigaction: Sigaction;
         let reader = pcb.sig_info();
         let sig_block: SigSet = reader.sig_block().clone();
         drop(reader);
@@ -361,21 +401,19 @@ impl SignalArch for X86_64SignalArch {
                 return;
             }
 
-            tmp_ka = sig_guard.handlers[sig_number as usize - 1];
-            match tmp_ka.action() {
+            sigaction = sig_guard.handlers[sig_number as usize - 1];
+            match sigaction.action() {
                 SigactionType::SaHandler(action_type) => match action_type {
                     SaHandlerType::SigError => {
                         kerror!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
                         return;
                     }
                     SaHandlerType::SigDefault => {
-                        tmp_ka = Sigaction::default();
-                        sigaction = Some(&mut tmp_ka);
+                        sigaction = Sigaction::default();
                         break;
                     }
                     SaHandlerType::SigIgnore => continue,
                     SaHandlerType::SigCustomized(_) => {
-                        sigaction = Some(&mut tmp_ka);
                         break;
                     }
                 },
@@ -384,19 +422,13 @@ impl SignalArch for X86_64SignalArch {
             // 如果当前动作是忽略这个信号，就继续循环。
         }
         // 所有的信号都处理完了
-        assert!(sigaction.is_some());
         let reader = pcb.sig_info();
         let oldset = reader.sig_block().clone();
         //避免死锁
         drop(reader);
         drop(sig_guard);
-        let res: Result<i32, SystemError> = handle_signal(
-            sig_number,
-            sigaction.unwrap(),
-            &info.unwrap(),
-            &oldset,
-            frame,
-        );
+        let res: Result<i32, SystemError> =
+            handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
         if res.is_err() {
             kerror!(
                 "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
@@ -407,9 +439,7 @@ impl SignalArch for X86_64SignalArch {
         }
     }
 
-    #[no_mangle]
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
-        kdebug!("trap_frame in sigreturn:{:?}", trap_frame);
         let frame = (trap_frame.rsp as usize) as *mut SigFrame;
 
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
@@ -417,6 +447,7 @@ impl SignalArch for X86_64SignalArch {
             kerror!("rsp doesn't from user level");
             let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
                 .map_err(|e| e.to_posix_errno());
+            return trap_frame.rax;
         }
         let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
         set_current_sig_blocked(&mut sigmask);
@@ -469,25 +500,25 @@ fn setup_frame(
     match sigaction.action() {
         SigactionType::SaHandler(handler_type) => match handler_type {
             SaHandlerType::SigDefault => {
-                sig_default_handler(sig);
+                sig.handle_default();
                 return Ok(0);
             }
             SaHandlerType::SigCustomized(handler) => {
                 // 如果handler位于内核空间
-                if handler >= USER_MAX_LINEAR_ADDR {
+                if handler >= MMArch::USER_END_VADDR {
                     // 如果当前是SIGSEGV,则采用默认函数处理
                     if sig == Signal::SIGSEGV {
-                        sig_default_handler(sig);
+                        sig.handle_default();
                         return Ok(0);
                     } else {
                         kerror!("attempting  to execute a signal handler from kernel");
-                        sig_default_handler(sig);
+                        sig.handle_default();
                         return Err(SystemError::EINVAL);
                     }
                 } else {
                     // 为了与Linux的兼容性，64位程序必须由用户自行指定restorer
                     if sigaction.flags().contains(SigFlags::SA_RESTORER) {
-                        ret_code_ptr = sigaction.restorer().unwrap() as usize as *mut c_void;
+                        ret_code_ptr = sigaction.restorer().unwrap().data() as *mut c_void;
                     } else {
                         kerror!(
                             "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
@@ -510,7 +541,7 @@ fn setup_frame(
                         );
                         return Err(SystemError::EINVAL);
                     }
-                    temp_handler = handler as usize as *mut c_void;
+                    temp_handler = handler.data() as *mut c_void;
                 }
             }
             SaHandlerType::SigIgnore => {
@@ -538,7 +569,7 @@ fn setup_frame(
             kerror!("In setup frame: generate SIGSEGV signal failed");
         }
         kerror!("In setup frame: access check failed");
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EFAULT);
     }
 
     // 将siginfo拷贝到用户栈
@@ -566,8 +597,6 @@ fn setup_frame(
             })?
     };
 
-    // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
-    ProcessManager::current_pcb().arch_info().clear_fp_state();
     unsafe {
         // 在开头检验过sigaction.restorer是否为空了，实际上libc会保证 restorer始终不为空
         (*frame).ret_code_ptr = ret_code_ptr;
@@ -579,7 +608,6 @@ fn setup_frame(
     trap_frame.rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
     trap_frame.rsp = frame as u64;
     trap_frame.rip = unsafe { (*frame).handler as u64 };
-    kdebug!("trap_frame{:?}", trap_frame);
     // 设置cs和ds寄存器
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
     trap_frame.ds = (USER_DS.bits() | 0x3) as u64;
@@ -644,46 +672,4 @@ fn sig_continue(sig: Signal) {
 /// 信号默认处理函数——忽略
 fn sig_ignore(_sig: Signal) {
     return;
-}
-
-/// 分发默认处理函数，只要调用了这个默认处理函数，就不会进入到后面伪造栈帧的环节，会直接在
-/// 执行完处理函数之后返回，也不会调用 sig_return 恢复栈帧
-#[no_mangle]
-fn sig_default_handler(sig: Signal) {
-    match sig {
-        Signal::INVALID => panic!(),
-        Signal::SIGHUP => sig_terminate(sig),
-        Signal::SIGINT => sig_terminate(sig),
-        Signal::SIGQUIT => sig_terminate_dump(sig),
-        Signal::SIGILL => sig_terminate_dump(sig),
-        Signal::SIGTRAP => sig_terminate_dump(sig),
-        Signal::SIGABRT_OR_IOT => sig_terminate_dump(sig),
-        Signal::SIGBUS => sig_terminate_dump(sig),
-        Signal::SIGFPE => sig_terminate_dump(sig),
-        Signal::SIGKILL => sig_terminate(sig),
-        Signal::SIGUSR1 => sig_terminate(sig),
-        Signal::SIGSEGV => sig_terminate_dump(sig),
-        Signal::SIGUSR2 => sig_terminate(sig),
-        Signal::SIGPIPE => sig_terminate(sig),
-        Signal::SIGALRM => sig_terminate(sig),
-        Signal::SIGTERM => sig_terminate(sig),
-        Signal::SIGSTKFLT => sig_terminate(sig),
-        Signal::SIGCHLD => sig_ignore(sig),
-        Signal::SIGCONT => sig_continue(sig),
-        Signal::SIGSTOP => sig_stop(sig),
-        Signal::SIGTSTP => sig_stop(sig),
-        Signal::SIGTTIN => sig_stop(sig),
-        Signal::SIGTTOU => sig_stop(sig),
-        Signal::SIGURG => sig_ignore(sig),
-        Signal::SIGXCPU => sig_terminate_dump(sig),
-        Signal::SIGXFSZ => sig_terminate_dump(sig),
-        Signal::SIGVTALRM => sig_terminate(sig),
-        Signal::SIGPROF => sig_terminate(sig),
-        Signal::SIGWINCH => sig_ignore(sig),
-        Signal::SIGIO_OR_POLL => sig_terminate(sig),
-        Signal::SIGPWR => sig_terminate(sig),
-        Signal::SIGSYS => sig_terminate(sig),
-        Signal::SIGRTMIN => sig_terminate(sig),
-        Signal::SIGRTMAX => sig_terminate(sig),
-    }
 }

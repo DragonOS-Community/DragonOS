@@ -524,7 +524,7 @@ pub trait SignalArch {
     /// ## 参数
     ///
     /// - `frame` 中断栈帧
-    unsafe extern "C" fn do_signal(frame: &mut TrapFrame);
+    unsafe fn do_signal(frame: &mut TrapFrame);
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
 }

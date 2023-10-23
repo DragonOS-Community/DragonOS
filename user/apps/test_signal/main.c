@@ -30,7 +30,7 @@ void handler(int sig)
 {
     printf("handle %d\n", sig);
     handle_ok = true;
-    count ++;
+    count++;
 }
 
 int main()
@@ -38,18 +38,18 @@ int main()
     signal(SIGKILL, &handler);
     printf("registered.\n");
 
-
     while (1)
     {
         // handler(SIGKILL);
-            printf("Test signal running\n");
-            raise(SIGKILL);
+        printf("Test signal running\n");
+        raise(SIGKILL);
         if (handle_ok)
         {
             printf("Handle OK!\n");
             handle_ok = false;
         }
-        if (count >0){
+        if (count > 0)
+        {
             signal(SIGKILL, SIG_DFL);
         }
     }

@@ -365,11 +365,15 @@ pub struct SigStack {
     pub fpstate: FpState,
 }
 
+#[no_mangle]
+unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
+    X86_64SignalArch::do_signal(frame);
+}
+
 pub struct X86_64SignalArch;
 
 impl SignalArch for X86_64SignalArch {
-    #[no_mangle]
-    unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
+    unsafe fn do_signal(frame: &mut TrapFrame) {
         // 检查sigpending是否为0
         if ProcessManager::current_pcb()
             .sig_info()

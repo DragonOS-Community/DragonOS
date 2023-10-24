@@ -74,8 +74,6 @@ pub fn platform_bus_init() -> Result<(), SystemError> {
     let platform_device: Arc<PlatformBusDevice> = PlatformBusDevice::new(
         DevicePrivateData::new(
             IdTable::new("platform".to_string(), DeviceNumber::new(0)),
-            None,
-            CompatibleTable::new(vec!["platform"]),
             BusState::NotInitialized.into(),
         ),
         Some(Arc::downgrade(&(sys_devices_kset() as Arc<dyn KObject>))),

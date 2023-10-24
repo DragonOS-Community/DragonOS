@@ -111,7 +111,7 @@ impl Syscall {
                             return Ok(0);
                         }
                     }
-                    ProcessState::Blocked(_) => {
+                    ProcessState::Blocked(_) | ProcessState::Stopped => {
                         // 指定WUNTRACED则等待暂停的进程，不指定则返回0
                         if !options.contains(WaitOption::WUNTRACED)
                             || options.contains(WaitOption::WNOWAIT)

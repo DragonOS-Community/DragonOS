@@ -14,8 +14,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define MAX_PATH_LEN 4096
+
 // 当前工作目录（在main_loop中初始化）
 char *shell_current_path = NULL;
+
 /**
  * @brief shell 内建函数的主命令与处理函数的映射表
  *
@@ -181,16 +184,18 @@ int shell_cmd_cd(int argc, char **argv)
         if (ec == 0)
         {
             // 获取新的路径字符串
-            char *new_path = (char *)malloc(dest_len + 2);
-            memset(new_path, 0, dest_len + 2);
-            strncpy(new_path, argv[1], dest_len);
+            char *new_path = (char *)malloc(MAX_PATH_LEN);
+            if (new_path==NULL) {
+                goto fail;
+            }
+            memset(new_path, 0, MAX_PATH_LEN);
+            getcwd(new_path, MAX_PATH_LEN);
 
             // 释放原有的路径字符串的内存空间
             free(shell_current_path);
 
             shell_current_path = new_path;
 
-            shell_current_path[dest_len] = '\0';
             return 0;
         }
         else
@@ -216,7 +221,7 @@ int shell_cmd_cd(int argc, char **argv)
 
         // 拼接出新的字符串
         char *new_path = (char *)malloc(new_len + 2);
-        memset(new_path, 0, sizeof(new_path));
+        memset(new_path, 0, new_len);
         strncpy(new_path, shell_current_path, current_dir_len);
 
         if (current_dir_len > 1)
@@ -225,10 +230,16 @@ int shell_cmd_cd(int argc, char **argv)
         int x = chdir(new_path);
         if (x == 0) // 成功切换目录
         {
+            free(new_path);
             free(shell_current_path);
-            // printf("new_path=%s, newlen= %d\n", new_path, new_len);
-            new_path[new_len + 1] = '\0';
-            shell_current_path = new_path;
+
+            char * pwd = malloc(MAX_PATH_LEN);
+            if (pwd==NULL) {
+                goto fail;
+            }
+            memset(pwd, 0, MAX_PATH_LEN);
+            getcwd(pwd, MAX_PATH_LEN);
+            shell_current_path = pwd;
             goto done;
         }
         else
@@ -575,7 +586,7 @@ out:;
  */
 int shell_cmd_reboot(int argc, char **argv)
 {
-    return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
 }
 
 int shell_cmd_free(int argc, char **argv)

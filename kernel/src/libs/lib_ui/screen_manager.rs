@@ -8,8 +8,7 @@ use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
 
 use crate::{
     driver::{
-        uart::uart_device::{c_uart_send_str, UartPort},
-        video::video_refresh_manager,
+        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
     },
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::VirtAddr,
@@ -275,13 +274,12 @@ pub trait ScmUiFramework: Sync + Send + Debug {
 /// ## 调用时机
 ///
 /// 该函数在内核启动的早期进行调用。调用时，内存管理模块尚未初始化。
-#[no_mangle]
-pub extern "C" fn scm_init() {
+pub fn scm_init() {
     SCM_DOUBLE_BUFFER_ENABLED.store(false, Ordering::SeqCst); // 禁用双缓冲
 
     textui_init_no_alloc();
 
-    c_uart_send_str(UartPort::COM1.to_u16(), "\nfinish_scm_init\n\0".as_ptr());
+    send_to_default_serial8250_port("\nfinish_scm_init\n\0".as_bytes());
 }
 
 /// 启用某个ui框架，将它的帧缓冲区渲染到屏幕上
@@ -381,10 +379,7 @@ pub fn scm_enable_put_to_window() {
             .enable()
             .unwrap_or_else(|e| e.to_posix_errno());
         if r.is_negative() {
-            c_uart_send_str(
-                UartPort::COM1.to_u16(),
-                "scm_enable_put_to_window() failed.\n\0".as_ptr(),
-            );
+            send_to_default_serial8250_port("scm_enable_put_to_window() failed.\n\0".as_bytes());
         }
     }
 }
@@ -402,10 +397,7 @@ pub fn scm_disable_put_to_window() {
             .disable()
             .unwrap_or_else(|e| e.to_posix_errno());
         if r.is_negative() {
-            c_uart_send_str(
-                UartPort::COM1.to_u16(),
-                "scm_disable_put_to_window() failed.\n\0".as_ptr(),
-            );
+            send_to_default_serial8250_port("scm_disable_put_to_window() failed.\n\0".as_bytes());
         }
     }
 }
@@ -414,7 +406,7 @@ pub fn scm_disable_put_to_window() {
 pub extern "C" fn scm_reinit() -> i32 {
     let r = true_scm_reinit().unwrap_or_else(|e| e.to_posix_errno());
     if r.is_negative() {
-        c_uart_send_str(UartPort::COM1.to_u16(), "scm reinit failed.\n\0".as_ptr());
+        send_to_default_serial8250_port("scm reinit failed.\n\0".as_bytes());
     }
     return r;
 }

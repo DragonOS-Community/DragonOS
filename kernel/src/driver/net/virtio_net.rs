@@ -11,11 +11,10 @@ use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 use crate::{
     driver::{
         base::{
-            device::{driver::DriverError, Device, DevicePrivateData, DeviceResource, IdTable},
-            kobject::KObject,
+            device::{bus::Bus, driver::Driver, Device, IdTable},
+            kobject::{KObjType, KObject, KObjectState},
         },
         virtio::virtio_impl::HalImpl,
-        Driver,
     },
     kerror, kinfo,
     libs::spinlock::SpinLock,
@@ -245,19 +244,27 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
 }
 
 impl<T: Transport + 'static> Driver for VirtioInterface<T> {
-    fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
+    fn id_table(&self) -> Option<IdTable> {
         todo!()
     }
 
-    fn load(
-        &self,
-        _data: DevicePrivateData,
-        _resource: Option<DeviceResource>,
-    ) -> Result<Arc<dyn Device>, DriverError> {
+    fn add_device(&self, _device: Arc<dyn Device>) {
         todo!()
     }
 
-    fn id_table(&self) -> IdTable {
+    fn delete_device(&self, _device: &Arc<dyn Device>) {
+        todo!()
+    }
+
+    fn devices(&self) -> alloc::vec::Vec<Arc<dyn Device>> {
+        todo!()
+    }
+
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
+        todo!()
+    }
+
+    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
         todo!()
     }
 }
@@ -372,7 +379,11 @@ impl<T: Transport + 'static> KObject for VirtioInterface<T> {
         todo!()
     }
 
-    fn set_kobj_state(&self, _state: crate::driver::base::kobject::KObjectState) {
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
         todo!()
     }
 }

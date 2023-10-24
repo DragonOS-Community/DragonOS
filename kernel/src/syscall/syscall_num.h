@@ -22,6 +22,7 @@
 #define SYS_SIGACTION 13
 
 #define SYS_RT_SIGRETURN 15
+#define SYS_IOCTL 16
 
 #define SYS_DUP 32
 #define SYS_DUP2 33

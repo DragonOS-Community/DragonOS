@@ -27,14 +27,12 @@ macro_rules! syscall_return {
 pub extern "C" fn syscall_handler(frame: &mut TrapFrame) -> () {
     let syscall_num = frame.rax as usize;
     let args = [
+        frame.rdi as usize,
+        frame.rsi as usize,
+        frame.rdx as usize,
+        frame.r10 as usize,
         frame.r8 as usize,
         frame.r9 as usize,
-        frame.r10 as usize,
-        frame.r11 as usize,
-        frame.r12 as usize,
-        frame.r13 as usize,
-        frame.r14 as usize,
-        frame.r15 as usize,
     ];
     mfence();
 

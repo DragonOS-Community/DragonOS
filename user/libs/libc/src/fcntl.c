@@ -11,7 +11,7 @@
  */
 int open(const char *path, int options, ...)
 {
-    return syscall_invoke(SYS_OPEN, (uint64_t)path, options, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_OPEN, (uint64_t)path, options, 0, 0, 0, 0);
 }
 
 /**
@@ -24,5 +24,5 @@ int open(const char *path, int options, ...)
  */
 int ioctl(int fd, int cmd, uint64_t data, ...)
 {
-    return syscall_invoke(SYS_IOCTL, fd, cmd, data, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_IOCTL, fd, cmd, data, 0, 0, 0);
 }

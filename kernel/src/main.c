@@ -30,6 +30,7 @@
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
+#include <virt/kvm/kvm.h>
 
 extern int rs_driver_init();
 extern void rs_softirq_init();
@@ -157,6 +158,10 @@ void system_initialize()
     io_mfence();
     cli();
     HPET_enable();
+
+    io_mfence();
+    
+    kvm_init();
 
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行

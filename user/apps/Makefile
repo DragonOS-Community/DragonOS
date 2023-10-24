@@ -1,5 +1,5 @@
 
-user_apps_sub_dirs=shell about
+user_apps_sub_dirs=shell about test_kvm
 
 ECHO:
 	@echo "$@"

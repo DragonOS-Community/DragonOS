@@ -25,6 +25,7 @@ use super::{
     utils::rsplit_path,
     Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -207,7 +208,6 @@ impl Syscall {
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
         }
-
         // 把文件对象存入pcb
         let r = ProcessManager::current_pcb()
             .fd_table()
@@ -230,6 +230,27 @@ impl Syscall {
         let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
 
         return res;
+    }
+
+    /// @brief 发送命令到文件描述符对应的设备，
+    ///
+    /// @param fd 文件描述符编号
+    /// @param cmd 设备相关的请求类型
+    ///
+    /// @return Ok(usize) 成功返回0
+    /// @return Err(SystemError) 读取失败，返回posix错误码
+    pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard
+            .get_file_by_fd(fd as i32)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let r = file.lock_no_preempt().inode().ioctl(cmd, data);
+        return r;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -700,6 +721,7 @@ impl Syscall {
             FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
             FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
             FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
+            FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
         }
 
         return Ok(kstat);

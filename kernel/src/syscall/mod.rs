@@ -3,6 +3,8 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use crate::kdebug;
+
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
@@ -297,6 +299,16 @@ pub enum SystemError {
     EOWNERDEAD = 129,
     /// 状态不可恢复 State not recoverable.
     ENOTRECOVERABLE = 130,
+    // VMX on 虚拟化开启指令出错
+    EVMXONFailed = 131,
+    // VMX off 虚拟化关闭指令出错
+    EVMXOFFFailed = 132,
+    // VMX VMWRITE 写入虚拟化VMCS内存出错
+    EVMWRITEFailed = 133,
+    EVMREADFailed = 134,
+    EVMPRTLDFailed = 135,
+    EVMLAUNCHFailed = 136,
+    KVM_HVA_ERR_BAD = 137,
 }
 
 impl SystemError {
@@ -376,6 +388,8 @@ pub const SYS_GETPGID: usize = 50;
 pub const SYS_FCNTL: usize = 51;
 pub const SYS_FTRUNCATE: usize = 52;
 pub const SYS_MKNOD: usize = 53;
+
+pub const SYS_IOCTL: usize = 54;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -476,6 +490,13 @@ impl Syscall {
                 }?;
 
                 Self::lseek(fd, w)
+            }
+            SYS_IOCTL => {
+                kdebug!("SYS_IOCTL");
+                let fd = args[0];
+                let cmd = args[1];
+                let data = args[2];
+                Self::ioctl(fd, cmd as u32, data)
             }
 
             SYS_FORK => Self::fork(frame),

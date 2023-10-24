@@ -39,6 +39,8 @@ pub enum FileType {
     BlockDevice,
     /// 字符设备
     CharDevice,
+    /// kvm设备
+    KvmDevice,
     /// 管道文件
     Pipe,
     /// 符号链接
@@ -88,6 +90,7 @@ impl FileType {
             FileType::Dir => DT_DIR,
             FileType::BlockDevice => DT_BLK,
             FileType::CharDevice => DT_CHR,
+            FileType::KvmDevice => DT_CHR,
             FileType::Pipe => DT_FIFO,
             FileType::SymLink => DT_LNK,
             FileType::Socket => DT_SOCK,

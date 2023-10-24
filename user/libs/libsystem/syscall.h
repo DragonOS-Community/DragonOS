@@ -97,9 +97,6 @@
  * @param arg3
  * @param arg4
  * @param arg5
- * @param arg6
- * @param arg7
  * @return long
  */
-long syscall_invoke(uint64_t syscall_id, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
-                    uint64_t arg5, uint64_t arg6, uint64_t arg7);
+long syscall_invoke(uint64_t syscall_id, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5);

@@ -26,9 +26,6 @@
  * @brief MULTIBOOT2 接口抽象
  */
 
-extern unsigned int multiboot2_magic;
-extern uintptr_t multiboot2_boot_info_addr;
-
 /*  How many bytes from the start of the file we search for the header. */
 static const unsigned int MULTIBOOT_SEARCH = 32768;
 static const unsigned int MULTIBOOT_HEADER_ALIGN = 8;
@@ -416,7 +413,7 @@ struct iter_data_t
  * @return true            成功
  * @return false           失败
  */
-static bool multiboot2_init(void);
+bool multiboot2_init(uint64_t mb2_info_paddr, uint32_t mb2_magic);
 
 /**
  * @brief 迭代器

@@ -14,12 +14,14 @@ ARCH="x86_64"
 root_folder=$(dirname $(pwd))
 kernel="${root_folder}/bin/kernel/kernel.elf"
 boot_folder="${root_folder}/bin/disk_mount/boot"
+GRUB_INSTALL_PATH="${boot_folder}/grub"
 mount_folder="${root_folder}/bin/disk_mount"
 ARGS=`getopt -o p -l bios: -- "$@"`
 eval set -- "${ARGS}"
 #echo formatted parameters=[$@]
 echo "开始写入磁盘镜像..."
 
+INSTALL_GRUB_TO_IMAGE="1"
 
 # toolchain
 GRUB_ABS_PREFIX=/opt/dragonos-grub
@@ -81,7 +83,16 @@ bash mount_virt_disk.sh || exit 1
 LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
 echo $LOOP_DEVICE
 
-mkdir -p ${boot_folder}/grub
+# mkdir -p ${GRUB_INSTALL_PATH}
+
+# 检测grub文件夹是否存在
+if [ -d "${GRUB_INSTALL_PATH}" ]; then
+  echo "grub已安装"
+  INSTALL_GRUB_TO_IMAGE="0"
+else
+  mkdir -p ${GRUB_INSTALL_PATH}
+fi
+
 cp ${kernel} ${root_folder}/bin/disk_mount/boot
 # 拷贝用户程序到磁盘镜像
 mkdir -p ${root_folder}/bin/disk_mount/bin
@@ -107,27 +118,30 @@ cfg_content='set timeout=15
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
 fi
 
-case "$1" in
-    --bios) 
-        case "$2" in
-                uefi) #uefi
-                if [ ${ARCH} == "i386" ];then
-                	${GRUB_PATH_I386_EFI_INSTALL} --target=i386-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
-                elif [ ${ARCH} == "x86_64" ];then
-                	${GRUB_PATH_X86_64_EFI_INSTALL} --target=x86_64-efi --efi-directory=${mount_folder}  --boot-directory=${boot_folder}   --removable
-                fi
+if [ "${INSTALL_GRUB_TO_IMAGE}" = "1" ];then
+
+    case "$1" in
+        --bios) 
+            case "$2" in
+                    uefi) #uefi
+                    if [ ${ARCH} == "i386" ];then
+                        ${GRUB_PATH_I386_EFI_INSTALL} --target=i386-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
+                    elif [ ${ARCH} == "x86_64" ];then
+                        ${GRUB_PATH_X86_64_EFI_INSTALL} --target=x86_64-efi --efi-directory=${mount_folder}  --boot-directory=${boot_folder}   --removable
+                    fi
+                ;;
+                    legacy) #传统bios
+                        ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+                ;;
+            esac
             ;;
-                legacy) #传统bios
-            		${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
-            ;;
-        esac
+        *)
+        #传统bios
+        ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
         ;;
-    *)
-    #传统bios
-    ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
-    ;;
-           
-esac
+            
+    esac
+fi
 
 sync
 bash umount_virt_disk.sh

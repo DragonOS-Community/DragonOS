@@ -213,7 +213,7 @@ int shell_readline(int fd, char *buf)
             return count;
         }
 
-        if (key && key != 0x50 && key != 0xc8)
+        if (key && key != 0xc8)
         {
             if (key == '\b')
             {

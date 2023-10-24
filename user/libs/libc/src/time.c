@@ -12,7 +12,7 @@
  */
 int nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
 {
-    return syscall_invoke(SYS_NANOSLEEP, (uint64_t)rqtp, (uint64_t)rmtp, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_NANOSLEEP, (uint64_t)rqtp, (uint64_t)rmtp, 0, 0, 0, 0);
 }
 
 /**
@@ -33,10 +33,10 @@ int usleep(useconds_t usec)
 
 /**
  * @brief 获取系统当前cpu时间
- * 
- * @return clock_t 
+ *
+ * @return clock_t
  */
 clock_t clock()
 {
-    return (clock_t)syscall_invoke(SYS_CLOCK, 0,0,0,0,0,0,0,0);
+    return (clock_t)syscall_invoke(SYS_CLOCK, 0, 0, 0, 0, 0, 0);
 }

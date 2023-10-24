@@ -34,7 +34,14 @@ impl SysFS {
     ) -> Result<(), SystemError> {
         for i in 0..groups.len() {
             let group = groups[i];
+            if group.attrs().is_empty() {
+                continue;
+            }
             if let Err(e) = self.do_create_group(kobj, group, update) {
+                kerror!(
+                    "Failed to create group '{}', err={e:?}",
+                    group.name().unwrap_or("")
+                );
                 for j in (0..=i).rev() {
                     self.remove_group(kobj, groups[j]).ok();
                 }
@@ -96,6 +103,16 @@ impl SysFS {
         }
 
         return Ok(());
+    }
+
+    pub fn remove_groups(
+        &self,
+        kobj: &Arc<dyn KObject>,
+        groups: &'static [&'static dyn AttributeGroup],
+    ) {
+        for group in groups.iter() {
+            self.remove_group(kobj, *group).ok();
+        }
     }
 
     /// 从一个kobject中移除一个group
@@ -187,6 +204,10 @@ impl SysFS {
         }
 
         if let Err(e) = e {
+            kerror!(
+                "Failed to create sysfs files for group '{}', err={e:?}",
+                group.name().unwrap_or("")
+            );
             self.group_remove_files(&parent, group);
             return Err(e);
         }

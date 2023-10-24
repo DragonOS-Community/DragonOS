@@ -1,6 +1,6 @@
 use alloc::{
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use intertrait::cast::CastArc;
 
@@ -8,10 +8,12 @@ use crate::{
     driver::{
         acpi::glue::acpi_device_notify,
         base::map::{LockedDevsMap, LockedKObjMap},
-        Driver,
     },
     filesystem::{
-        sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
+        sysfs::{
+            file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
+            SysFSOpsSupport,
+        },
         vfs::syscall::ModeType,
     },
     syscall::SystemError,
@@ -19,12 +21,14 @@ use crate::{
 use core::fmt::Debug;
 use core::intrinsics::unlikely;
 
-use self::bus::{bus_add_device, bus_probe_device, Bus};
+use self::{
+    bus::{bus_add_device, bus_probe_device, Bus},
+    driver::Driver,
+};
 
 use super::{
-    kobject::{KObjType, KObject, KObjectManager},
+    kobject::{KObjType, KObject, KObjectManager, KObjectState},
     kset::KSet,
-    platform::CompatibleTable,
     swnode::software_node_notify,
 };
 
@@ -87,7 +91,7 @@ pub(self) fn sys_dev_char_kset() -> Arc<KSet> {
 /// ## 注意
 ///
 /// 由于设备驱动模型需要从Arc<dyn KObject>转换为Arc<dyn Device>，
-/// 因此，所有的实现了Device trait的结构体，都应该在结构体上方标注`#[[sync] Device]`，
+/// 因此，所有的实现了Device trait的结构体，都应该在结构体上方标注`#[cast_to([sync] Device)]`，
 ///
 /// 否则在释放设备资源的时候，会由于无法转换为Arc<dyn Device>而导致资源泄露，并且release回调函数也不会被调用。
 pub trait Device: KObject {
@@ -117,13 +121,39 @@ pub trait Device: KObject {
         return None;
     }
 
+    /// 设置当前设备所属的总线
+    ///
+    /// （一定要传入Arc，因为bus的subsysprivate里面存储的是Device的Weak指针）
+    fn set_bus(&self, bus: Option<Arc<dyn Bus>>);
+
     /// 返回已经与当前设备匹配好的驱动程序
     fn driver(&self) -> Option<Arc<dyn Driver>>;
 
-    fn set_driver(&self, driver: Option<Arc<dyn Driver>>);
+    fn set_driver(&self, driver: Option<Weak<dyn Driver>>);
 
     /// 当前设备是否已经挂掉了
     fn is_dead(&self) -> bool;
+
+    /// 当前设备是否处于可以被匹配的状态
+    ///
+    /// The device has matched with a driver at least once or it is in
+    /// a bus (like AMBA) which can't check for matching drivers until
+    /// other devices probe successfully.
+    fn can_match(&self) -> bool;
+
+    fn set_can_match(&self, can_match: bool);
+
+    /// The hardware state of this device has been synced to match
+    /// the software state of this device by calling the driver/bus
+    /// sync_state() callback.
+    fn state_synced(&self) -> bool;
+}
+
+impl dyn Device {
+    #[inline(always)]
+    pub fn is_registered(&self) -> bool {
+        self.kobj_state().contains(KObjectState::IN_SYSFS)
+    }
 }
 
 // 暂定是不可修改的，在初始化的时候就要确定。以后可能会包括例如硬件中断包含的信息
@@ -131,24 +161,13 @@ pub trait Device: KObject {
 #[derive(Debug, Clone)]
 pub struct DevicePrivateData {
     id_table: IdTable,
-    resource: Option<DeviceResource>,
-    compatible_table: CompatibleTable,
     state: DeviceState,
 }
 
+#[allow(dead_code)]
 impl DevicePrivateData {
-    pub fn new(
-        id_table: IdTable,
-        resource: Option<DeviceResource>,
-        compatible_table: CompatibleTable,
-        state: DeviceState,
-    ) -> Self {
-        Self {
-            id_table,
-            resource,
-            compatible_table,
-            state,
-        }
+    pub fn new(id_table: IdTable, state: DeviceState) -> Self {
+        Self { id_table, state }
     }
 
     pub fn id_table(&self) -> &IdTable {
@@ -159,28 +178,8 @@ impl DevicePrivateData {
         self.state
     }
 
-    #[allow(dead_code)]
-    pub fn resource(&self) -> Option<&DeviceResource> {
-        self.resource.as_ref()
-    }
-
-    pub fn compatible_table(&self) -> &CompatibleTable {
-        &self.compatible_table
-    }
-
     pub fn set_state(&mut self, state: DeviceState) {
         self.state = state;
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceResource {
-    //可能会用来保存例如 IRQ PWM 内存地址等需要申请的资源，将来由资源管理器+Framework框架进行管理。
-}
-
-impl Default for DeviceResource {
-    fn default() -> Self {
-        return Self {};
     }
 }
 
@@ -225,6 +224,8 @@ impl DeviceNumber {
         self.0 & 0xff
     }
 
+    #[inline]
+    #[allow(dead_code)]
     pub fn from_major_minor(major: usize, minor: usize) -> usize {
         ((major & 0xffffff) << 8) | (minor & 0xff)
     }
@@ -287,7 +288,7 @@ impl Default for IdTable {
 
 // 以现在的模型，设备在加载到系统中就是已经初始化的状态了，因此可以考虑把这个删掉
 /// @brief: 设备当前状态
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DeviceState {
     NotInitialized = 0,
     Initialized = 1,
@@ -412,6 +413,17 @@ impl DeviceManager {
         return Self;
     }
 
+    pub fn register(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
+        self.device_initialize(&device);
+        return self.add_device(device);
+    }
+
+    /// device_initialize - init device structure.
+    pub fn device_initialize(&self, device: &Arc<dyn Device>) {
+        device.set_kset(Some(sys_devices_kset()));
+        device.set_kobj_type(Some(&DeviceKObjType));
+    }
+
     /// @brief: 添加设备
     /// @parameter id_table: 总线标识符，用于唯一标识该总线
     /// @parameter dev: 设备实例
@@ -463,6 +475,11 @@ impl DeviceManager {
     #[allow(dead_code)]
     pub fn remove_device(&self, _id_table: &IdTable) {
         todo!()
+    }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
+    fn remove(&self, _dev: &Arc<dyn Device>) {
+        todo!("DeviceManager::remove")
     }
 
     /// @brief: 获取设备
@@ -521,10 +538,8 @@ impl DeviceManager {
         dev: &Arc<dyn Device>,
         attr_groups: &'static [&dyn AttributeGroup],
     ) -> Result<(), SystemError> {
-        let dev = dev.clone();
-        let binding = dev.arc_any();
-        let kobj: &Arc<dyn KObject> = binding.downcast_ref().unwrap();
-        return sysfs_instance().create_groups(kobj, attr_groups);
+        let kobj = dev.clone() as Arc<dyn KObject>;
+        return sysfs_instance().create_groups(&kobj, attr_groups);
     }
 
     /// 为设备在sysfs中创建属性文件
@@ -567,15 +582,15 @@ impl DeviceManager {
         let target_kobj = self.device_to_dev_kobj(dev);
         let name = dev.id_table().name();
         let current_kobj = dev.clone() as Arc<dyn KObject>;
-        return sysfs_instance().create_link(&current_kobj, &target_kobj, name);
+        return sysfs_instance().create_link(Some(&current_kobj), &target_kobj, name);
     }
 
     /// Delete symlink for device in `/sys/dev` or `/sys/class/<class_name>`
     #[allow(dead_code)]
-    fn remove_sys_dev_entry(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+    fn remove_sys_dev_entry(&self, dev: &Arc<dyn Device>) {
         let kobj = self.device_to_dev_kobj(dev);
         let name = dev.id_table().name();
-        return sysfs_instance().remove_link(&kobj, name);
+        sysfs_instance().remove_link(&kobj, name);
     }
 
     /// device_to_dev_kobj - select a /sys/dev/ directory for the device
@@ -595,13 +610,35 @@ impl DeviceManager {
     pub fn device_links_force_bind(&self, _dev: &Arc<dyn Device>) {
         todo!("device_links_force_bind")
     }
+
+    /// 把device对象的一些结构进行默认初始化
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_initialize#2976
+    pub fn device_default_initialize(&self, dev: &Arc<dyn Device>) {
+        dev.set_kset(Some(sys_devices_kset()));
+        return;
+    }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=29885&fi=1100#1100
+    pub fn device_driver_attach(
+        &self,
+        _driver: &Arc<dyn Driver>,
+        _dev: &Arc<dyn Device>,
+    ) -> Result<(), SystemError> {
+        todo!("device_driver_attach")
+    }
+
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
+    pub fn device_driver_detach(&self, _dev: &Arc<dyn Device>) {
+        todo!("device_driver_detach")
+    }
 }
 
 /// @brief: 设备注册
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), SystemError> {
-    return device_manager().add_device(device);
+    return device_manager().register(device);
 }
 
 /// @brief: 设备卸载
@@ -633,7 +670,7 @@ impl Attribute for DeviceAttrDev {
         "dev"
     }
 
-    fn show(&self, kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
             kerror!(
                 "Intertrait casting not implemented for kobj: {}",
@@ -642,7 +679,10 @@ impl Attribute for DeviceAttrDev {
             SystemError::EOPNOTSUPP_OR_ENOTSUP
         })?;
 
-        return Ok(dev.id_table().device_number().into());
+        let device_number = dev.id_table().device_number();
+        let s = format!("{}:{}\n", device_number.major(), device_number.minor());
+
+        return sysfs_emit_str(buf, &s);
     }
 
     fn support(&self) -> SysFSOpsSupport {

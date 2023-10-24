@@ -23,8 +23,9 @@ use super::{
     fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE,
+    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -156,7 +157,8 @@ impl Syscall {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         let inode: Arc<dyn IndexNode> = if inode.is_err() {
             let errno = inode.unwrap_err();
@@ -206,7 +208,6 @@ impl Syscall {
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
         }
-
         // 把文件对象存入pcb
         let r = ProcessManager::current_pcb()
             .fd_table()
@@ -229,6 +230,27 @@ impl Syscall {
         let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
 
         return res;
+    }
+
+    /// @brief 发送命令到文件描述符对应的设备，
+    ///
+    /// @param fd 文件描述符编号
+    /// @param cmd 设备相关的请求类型
+    ///
+    /// @return Ok(usize) 成功返回0
+    /// @return Err(SystemError) 读取失败，返回posix错误码
+    pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard
+            .get_file_by_fd(fd as i32)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let r = file.lock_no_preempt().inode().ioctl(cmd, data);
+        return r;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -344,13 +366,14 @@ impl Syscall {
                 new_path = String::from("/");
             }
         }
-        let inode = match ROOT_INODE().lookup(&new_path) {
-            Err(e) => {
-                kerror!("Change Directory Failed, Error = {:?}", e);
-                return Err(SystemError::ENOENT);
-            }
-            Ok(i) => i,
-        };
+        let inode =
+            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+                Err(e) => {
+                    kerror!("Change Directory Failed, Error = {:?}", e);
+                    return Err(SystemError::ENOENT);
+                }
+                Ok(i) => i,
+            };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(String::from(new_path));
@@ -691,13 +714,14 @@ impl Syscall {
         kstat.rdev = metadata.raw_dev as i64;
         kstat.mode = metadata.mode;
         match file.lock().file_type() {
-            FileType::File => kstat.mode.insert(ModeType::S_IFMT),
+            FileType::File => kstat.mode.insert(ModeType::S_IFREG),
             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
             FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
             FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
             FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
             FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
             FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
+            FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
         }
 
         return Ok(kstat);
@@ -730,7 +754,8 @@ impl Syscall {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
@@ -739,7 +764,8 @@ impl Syscall {
         let (filename, parent_path) = rsplit_path(path);
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
+            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         // 创建nod
         parent_inode.mknod(filename, mode, dev_t)?;
 

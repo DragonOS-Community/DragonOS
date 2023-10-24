@@ -39,6 +39,8 @@ pub enum FileType {
     BlockDevice,
     /// 字符设备
     CharDevice,
+    /// kvm设备
+    KvmDevice,
     /// 管道文件
     Pipe,
     /// 符号链接
@@ -78,6 +80,9 @@ pub const DT_SOCK: u16 = 12;
 pub const DT_WHT: u16 = 14;
 pub const DT_MAX: u16 = 16;
 
+/// vfs容许的最大的符号链接跳转次数
+pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 8;
+
 impl FileType {
     pub fn get_file_type_num(&self) -> u16 {
         return match self {
@@ -85,6 +90,7 @@ impl FileType {
             FileType::Dir => DT_DIR,
             FileType::BlockDevice => DT_BLK,
             FileType::CharDevice => DT_CHR,
+            FileType::KvmDevice => DT_CHR,
             FileType::Pipe => DT_FIFO,
             FileType::SymLink => DT_LNK,
             FileType::Socket => DT_SOCK,

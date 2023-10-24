@@ -23,34 +23,34 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
-
+#include <stdbool.h>
 bool handle_ok = false;
-
+int count = 0;
 void handler(int sig)
 {
     printf("handle %d\n", sig);
     handle_ok = true;
+    count++;
 }
 
 int main()
 {
-    printf("Test signal running...\n");
     signal(SIGKILL, &handler);
     printf("registered.\n");
 
-    clock_t last = clock();
-
     while (1)
     {
-        if ((clock() - last) / CLOCKS_PER_SEC >= 1)
-        {
-            // printf("Test signal running\n");
-            last = clock();
-        }
+        // handler(SIGKILL);
+        printf("Test signal running\n");
+        raise(SIGKILL);
         if (handle_ok)
         {
             printf("Handle OK!\n");
             handle_ok = false;
+        }
+        if (count > 0)
+        {
+            signal(SIGKILL, SIG_DFL);
         }
     }
 

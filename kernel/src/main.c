@@ -38,6 +38,7 @@ extern void rs_mm_init();
 extern void rs_kthread_init();
 extern void rs_init_intertrait();
 extern void rs_init_before_mem_init();
+extern int rs_setup_arch();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -82,7 +83,7 @@ void system_initialize()
     rs_load_current_core_tss();
 
     cpu_core_info[0].stack_start = _stack_start;
-    
+
     // 初始化中断描述符表
     sys_vector_init();
     //  初始化内存管理单元
@@ -101,10 +102,12 @@ void system_initialize()
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
     vfs_init();
-    
+
     rs_driver_init();
-    
+
     acpi_init();
+
+    rs_setup_arch();
     io_mfence();
     irq_init();
     rs_process_init();
@@ -126,7 +129,6 @@ void system_initialize()
 
     rs_jiffies_init();
     io_mfence();
-    
 
     rs_kthread_init();
     io_mfence();

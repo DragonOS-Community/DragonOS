@@ -3,7 +3,9 @@ use core::ffi::c_void;
 use alloc::string::String;
 
 use crate::{
+    arch::ipc::signal::X86_64SignalArch,
     include::bindings::bindings::set_system_trap_gate,
+    ipc::signal_types::SignalArch,
     syscall::{Syscall, SystemError, SYS_RT_SIGRETURN},
 };
 
@@ -39,7 +41,7 @@ pub extern "C" fn syscall_handler(frame: &mut TrapFrame) -> () {
     // 由于进程管理未完成重构，有些系统调用需要在这里临时处理，以后这里的特殊处理要删掉。
     match syscall_num {
         SYS_RT_SIGRETURN => {
-            syscall_return!(SystemError::ENOSYS.to_posix_errno() as usize, frame);
+            syscall_return!(X86_64SignalArch::sys_rt_sigreturn(frame) as usize, frame);
         }
         _ => {}
     }

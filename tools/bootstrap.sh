@@ -39,7 +39,7 @@ install_ubuntu_debian_pkg()
 	echo "正在安装所需的包..."
     sudo "$1" install -y \
         ca-certificates \
-        curl \
+        curl wget \
         unzip \
         gnupg \
         lsb-release \
@@ -48,13 +48,7 @@ install_ubuntu_debian_pkg()
 
     if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."
-        sudo mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        echo \
-            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-            $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo $1 update
-        sudo "$1" install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        sudo apt install docker.io docker-compose
     elif [ -z ${dockerInstall} ]; then
 		echo "您传入--no-docker参数生效, 安装docker步骤被跳过."
 	elif [ -n "$(which docker)" ]; then
@@ -139,6 +133,10 @@ rustInstall() {
         cargo install cargo-binutils
         rustup toolchain install nightly
         rustup default nightly
+		rustup toolchain install nightly-2023-01-21-x86_64-unknown-linux-gnu
+		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
+		rustup component add rust-src --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+		rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
         rustup component add rust-src
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
         rustup component add llvm-tools-preview
@@ -173,7 +171,6 @@ done
 
 ############ 开始执行 ###############
 banner 			# 开始横幅
-rustInstall     # 安装rust
 
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1
@@ -206,6 +203,8 @@ else
     	printf "\e[31;1mFatal error: \e[0;31mUnsupported platform, please open an issue\[0m" || exit 1
 	fi
 fi
+
+rustInstall     # 安装rust
 
 # 安装dadk
 cargo install dadk || exit 1

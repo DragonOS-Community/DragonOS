@@ -8,7 +8,6 @@ use crate::{
         interrupt::TrapFrame,
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
-    include::bindings::bindings::siginfo,
     mm::VirtAddr,
     process::Pid,
     syscall::{user_access::UserBufferWriter, SystemError},
@@ -78,7 +77,7 @@ pub enum SigactionType {
         Option<
             unsafe extern "C" fn(
                 sig: ::core::ffi::c_int,
-                sinfo: *mut siginfo,
+                sinfo: *mut SigInfo,
                 arg1: *mut ::core::ffi::c_void,
             ),
         >,

@@ -1,11 +1,27 @@
-use crate::arch::kvm::VmcsFields::{GUEST_CS_SELECTOR, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_ACCESS_RIGHTS};
-use crate::arch::kvm::VmcsFields::{GUEST_ES_SELECTOR, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_ACCESS_RIGHTS};
-use crate::arch::kvm::VmcsFields::{GUEST_SS_SELECTOR, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_ACCESS_RIGHTS};
-use crate::arch::kvm::VmcsFields::{GUEST_DS_SELECTOR, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_ACCESS_RIGHTS};
-use crate::arch::kvm::VmcsFields::{GUEST_FS_SELECTOR, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_ACCESS_RIGHTS};
-use crate::arch::kvm::VmcsFields::{GUEST_GS_SELECTOR, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_ACCESS_RIGHTS};
-use crate::arch::kvm::VmcsFields::{GUEST_TR_SELECTOR, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_ACCESS_RIGHTS};
-use crate::arch::kvm::VmcsFields::{GUEST_LDTR_SELECTOR, GUEST_LDTR_BASE, GUEST_LDTR_LIMIT, GUEST_LDTR_ACCESS_RIGHTS};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_CS_ACCESS_RIGHTS, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_SELECTOR,
+};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_DS_ACCESS_RIGHTS, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_SELECTOR,
+};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_ES_ACCESS_RIGHTS, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_SELECTOR,
+};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_FS_ACCESS_RIGHTS, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_SELECTOR,
+};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_GS_ACCESS_RIGHTS, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_SELECTOR,
+};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_LDTR_ACCESS_RIGHTS, GUEST_LDTR_BASE, GUEST_LDTR_LIMIT, GUEST_LDTR_SELECTOR,
+};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_SS_ACCESS_RIGHTS, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_SELECTOR,
+};
+use crate::arch::kvm::VmcsFields::{
+    GUEST_TR_ACCESS_RIGHTS, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_SELECTOR,
+};
 use crate::syscall::SystemError;
 
 use super::vmx_asm_wrapper::vmx_vmwrite;
@@ -18,15 +34,15 @@ use super::vmx_asm_wrapper::vmx_vmwrite;
 
 #[derive(Debug)]
 pub struct KvmVmxSegmentField {
-	selector: u32,
-	base: u32,
-	limit: u32,
-	access_rights: u32,
+    selector: u32,
+    base: u32,
+    limit: u32,
+    access_rights: u32,
 }
 
 macro_rules! VMX_SEGMENT_FIELD {
     ($struct_name: ident) => {
-        KvmVmxSegmentField{
+        KvmVmxSegmentField {
             selector: concat_idents!(GUEST_, $struct_name, _SELECTOR) as u32,
             base: concat_idents!(GUEST_, $struct_name, _BASE) as u32,
             limit: concat_idents!(GUEST_, $struct_name, _LIMIT) as u32,
@@ -43,7 +59,7 @@ pub enum Sreg {
     FS = 4,
     GS = 5,
     TR = 6,
-    LDTR = 7
+    LDTR = 7,
 }
 
 static KVM_VMX_SEGMENT_FIELDS: [KvmVmxSegmentField; 8] = [
@@ -57,7 +73,7 @@ static KVM_VMX_SEGMENT_FIELDS: [KvmVmxSegmentField; 8] = [
     VMX_SEGMENT_FIELD!(LDTR),
 ];
 
-pub fn seg_setup(seg: usize) -> Result<(), SystemError>{
+pub fn seg_setup(seg: usize) -> Result<(), SystemError> {
     let seg_field = &KVM_VMX_SEGMENT_FIELDS[seg];
     let mut access_rigt = 0x0093;
     if seg == Sreg::CS as usize {

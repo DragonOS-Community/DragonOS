@@ -1,18 +1,12 @@
-use crate::process::ProcessManager;
-use crate::{kdebug, filesystem};
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
     file::{File, FileMode},
-    FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
-    make_rawdev
+    make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
 };
-use crate::{
-    libs::spinlock::SpinLock,
-    syscall::SystemError,
-    time::TimeSpec,
-    arch::KVMArch,
-};
+use crate::process::ProcessManager;
+use crate::{arch::KVMArch, libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{filesystem, kdebug};
 // use crate::virt::kvm::{host_stack};
 use super::push_vm;
 use crate::virt::kvm::vm_dev::LockedVmInode;
@@ -22,8 +16,7 @@ use alloc::{
     vec::Vec,
 };
 
-pub const KVM_API_VERSION:u32 = 12;
-
+pub const KVM_API_VERSION: u32 = 12;
 
 // use crate::virt::kvm::kvm_dev_ioctl_create_vm;
 /*
@@ -36,7 +29,6 @@ pub const KVM_GET_VCPU_MMAP_SIZE: u32 = 0x04; // Get size for mmap(vcpu_fd) in b
 pub const KVM_TRACE_ENABLE: u32 = 0x05;
 pub const KVM_TRACE_PAUSE: u32 = 0x06;
 pub const KVM_TRACE_DISABLE: u32 = 0x07;
-
 
 #[derive(Debug)]
 pub struct KvmInode {
@@ -95,12 +87,12 @@ impl IndexNode for LockedKvmInode {
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        kdebug!("file private data:{:?}",_data);
-        return Ok(())
+        kdebug!("file private data:{:?}", _data);
+        return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        return Ok(())
+        return Ok(());
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -144,20 +136,17 @@ impl IndexNode for LockedKvmInode {
                 kdebug!("kvm ioctl");
                 Ok(0)
             }
-            KVM_GET_API_VERSION => {
-                Ok(KVM_API_VERSION as usize)
-            }
+            KVM_GET_API_VERSION => Ok(KVM_API_VERSION as usize),
             KVM_CREATE_VM => {
                 kdebug!("kvm KVM_CREATE_VM");
                 kvm_dev_ioctl_create_vm(data)
             }
-            KVM_CHECK_EXTENSION | KVM_GET_VCPU_MMAP_SIZE |
-            KVM_TRACE_ENABLE | KVM_TRACE_PAUSE | KVM_TRACE_DISABLE => {
-                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
-            }
-            _ => {
-                KVMArch::kvm_arch_dev_ioctl(cmd,data)
-            },
+            KVM_CHECK_EXTENSION
+            | KVM_GET_VCPU_MMAP_SIZE
+            | KVM_TRACE_ENABLE
+            | KVM_TRACE_PAUSE
+            | KVM_TRACE_DISABLE => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            _ => KVMArch::kvm_arch_dev_ioctl(cmd, data),
         }
     }
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -191,10 +180,9 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
     let vm_inode = LockedVmInode::new();
     let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
     let r = ProcessManager::current_pcb()
-            .fd_table()
-            .write()
-            .alloc_fd(file, None)
-            .map(|fd| fd as usize);
+        .fd_table()
+        .write()
+        .alloc_fd(file, None)
+        .map(|fd| fd as usize);
     return r;
 }
-

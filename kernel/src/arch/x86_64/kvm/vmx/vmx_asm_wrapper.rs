@@ -1,8 +1,8 @@
-use crate::syscall::SystemError;
-use x86;
 use super::vmcs::VmcsFields;
 use crate::kdebug;
+use crate::syscall::SystemError;
 use core::arch::asm;
+use x86;
 /// Enable VMX operation.
 pub fn vmxon(vmxon_pa: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmxon(vmxon_pa) } {
@@ -10,7 +10,7 @@ pub fn vmxon(vmxon_pa: u64) -> Result<(), SystemError> {
         Err(e) => {
             kdebug!("vmxon fail: {:?}", e);
             Err(SystemError::EVMXONFailed)
-        },
+        }
     }
 }
 
@@ -30,7 +30,7 @@ pub fn vmx_vmwrite(vmcs_field: u32, value: u64) -> Result<(), SystemError> {
             kdebug!("vmx_write fail: {:?}", e);
             kdebug!("vmcs_field: {:x}", vmcs_field);
             Err(SystemError::EVMWRITEFailed)
-        },
+        }
     }
 }
 
@@ -41,19 +41,19 @@ pub fn vmx_vmread(vmcs_field: u32) -> Result<u64, SystemError> {
         Err(e) => {
             kdebug!("vmx_read fail: {:?}", e);
             Err(SystemError::EVMREADFailed)
-        },
+        }
     }
 }
 
-pub fn vmx_vmptrld(vmcs_pa: u64)-> Result<(), SystemError> {
+pub fn vmx_vmptrld(vmcs_pa: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmptrld(vmcs_pa) } {
         Ok(_) => Ok(()),
         Err(_) => Err(SystemError::EVMPRTLDFailed),
     }
 }
 
-pub fn vmx_vmlaunch()-> Result<(), SystemError> {
-    let host_rsp= VmcsFields::HOST_RSP as u32;
+pub fn vmx_vmlaunch() -> Result<(), SystemError> {
+    let host_rsp = VmcsFields::HOST_RSP as u32;
     let host_rip = VmcsFields::HOST_RIP as u32;
     unsafe {
         asm!(
@@ -88,7 +88,7 @@ pub fn vmx_vmlaunch()-> Result<(), SystemError> {
     // }
 }
 
-pub fn vmx_vmclear(vmcs_pa: u64)-> Result<(), SystemError> {
+pub fn vmx_vmclear(vmcs_pa: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmclear(vmcs_pa) } {
         Ok(_) => Ok(()),
         Err(_) => Err(SystemError::EVMPRTLDFailed),

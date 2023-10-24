@@ -1,11 +1,11 @@
+use crate::arch::mm::PageMapper;
+use crate::arch::MMArch;
+use crate::mm::page::PageFlags;
+use crate::mm::{PageTableKind, PhysAddr, VirtAddr};
+use crate::smp::core::smp_get_processor_id;
+use crate::{arch::mm::LockedFrameAllocator, syscall::SystemError};
 use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 use x86::msr;
-use crate::arch::MMArch;
-use crate::arch::mm::PageMapper;
-use crate::mm::page::PageFlags;
-use crate::mm::{PhysAddr, PageTableKind, VirtAddr};
-use crate::smp::core::smp_get_processor_id;
-use crate::{syscall::SystemError, arch::mm::LockedFrameAllocator};
 
 /// Check if MTRR is supported
 pub fn check_ept_features() -> Result<(), SystemError> {
@@ -18,8 +18,8 @@ pub fn check_ept_features() -> Result<(), SystemError> {
 }
 
 // pub fn ept_build_mtrr_map() -> Result<(), SystemError> {
-    // let ia32_mtrr_cap = unsafe { msr::rdmsr(msr::IA32_MTRRCAP) };
-    // Ok(())
+// let ia32_mtrr_cap = unsafe { msr::rdmsr(msr::IA32_MTRRCAP) };
+// Ok(())
 // }
 
 /// 标志当前没有处理器持有内核映射器的锁
@@ -30,7 +30,7 @@ static EPT_MAPPER_LOCK_OWNER: AtomicUsize = AtomicUsize::new(EPT_MAPPER_NO_PROCE
 /// 内核映射器的锁计数器
 static EPT_MAPPER_LOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-pub struct EptMapper{
+pub struct EptMapper {
     /// EPT页表映射器
     mapper: PageMapper,
     /// 标记当前映射器是否为只读
@@ -72,7 +72,7 @@ impl EptMapper {
         let mapper = unsafe { PageMapper::current(PageTableKind::EPT, LockedFrameAllocator) };
         return Self::lock_cpu(cpuid, mapper);
     }
-    
+
     /// 映射guest physical addr(gpa)到指定的host physical addr(hpa)。
     ///
     /// ## 参数
@@ -94,7 +94,14 @@ impl EptMapper {
         if self.readonly {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
-        self.mapper.map_phys(VirtAddr::new(gpa as usize), PhysAddr::new(hpa as usize), flags).unwrap().flush();
+        self.mapper
+            .map_phys(
+                VirtAddr::new(gpa as usize),
+                PhysAddr::new(hpa as usize),
+                flags,
+            )
+            .unwrap()
+            .flush();
         return Ok(());
     }
 

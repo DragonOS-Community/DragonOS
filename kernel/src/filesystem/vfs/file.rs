@@ -136,7 +136,7 @@ impl File {
         };
         // kdebug!("inode:{:?}",f.inode);
         f.inode.open(&mut f.private_data, &mode)?;
-       
+
         return Ok(f);
     }
 

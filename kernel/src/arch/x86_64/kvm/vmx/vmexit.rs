@@ -1,16 +1,13 @@
-use super::vmx_asm_wrapper::{
-   vmx_vmwrite, vmx_vmread
-};
-use crate::{syscall::SystemError, virt::kvm::vm};
-use x86::vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL;
-use core::arch::asm;
-use crate::kdebug;
 use super::vmcs::{VmcsFields, VmxExitReason};
+use super::vmx_asm_wrapper::{vmx_vmread, vmx_vmwrite};
+use crate::kdebug;
+use crate::{syscall::SystemError, virt::kvm::vm};
+use core::arch::asm;
+use x86::vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL;
 
 #[derive(FromPrimitive)]
 #[allow(non_camel_case_types)]
-pub enum APICExceptionVectors 
-{
+pub enum APICExceptionVectors {
     EXCEPTION_DIVIDE_ERROR,
     EXCEPTION_DEBUG_BREAKPOINT,
     EXCEPTION_NMI,
@@ -42,7 +39,7 @@ pub enum APICExceptionVectors
     EXCEPTION_RESERVED9,
     EXCEPTION_RESERVED10,
     EXCEPTION_RESERVED11,
-    EXCEPTION_RESERVED12
+    EXCEPTION_RESERVED12,
 }
 
 #[derive(FromPrimitive)]
@@ -55,18 +52,21 @@ pub enum InterruptType {
     INTERRUPT_TYPE_SOFTWARE_INTERRUPT = 4,
     INTERRUPT_TYPE_PRIVILEGED_SOFTWARE_INTERRUPT = 5,
     INTERRUPT_TYPE_SOFTWARE_EXCEPTION = 6,
-    INTERRUPT_TYPE_OTHER_EVENT = 7
+    INTERRUPT_TYPE_OTHER_EVENT = 7,
 }
 
-pub fn vmexit_vmx_instruction_executed() -> Result<(), SystemError>{
+pub fn vmexit_vmx_instruction_executed() -> Result<(), SystemError> {
     let valid: u32 = 1;
-    let vector: u32 = APICExceptionVectors::EXCEPTION_UNDEFINED_OPCODE as  u32;
+    let vector: u32 = APICExceptionVectors::EXCEPTION_UNDEFINED_OPCODE as u32;
     let interrupt_type = InterruptType::INTERRUPT_TYPE_HARDWARE_EXCEPTION as u32;
     let deliver_code: u32 = 0;
     let interrupt_info = valid << 31 | interrupt_type << 8 | deliver_code << 11 | vector;
-    vmx_vmwrite(VmcsFields::CTRL_VM_ENTRY_INTR_INFO_FIELD as u32, interrupt_info as u64)?;
+    vmx_vmwrite(
+        VmcsFields::CTRL_VM_ENTRY_INTR_INFO_FIELD as u32,
+        interrupt_info as u64,
+    )?;
     vmx_vmwrite(VmcsFields::CTRL_VM_ENTRY_INSTR_LEN as u32, 0)?;
-    let rflags:u64 = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap() | 0x0001_0000; // set RF flags
+    let rflags: u64 = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap() | 0x0001_0000; // set RF flags
     vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, rflags)?;
     Ok(())
 }
@@ -84,7 +84,7 @@ pub fn vmexit_vmx_instruction_executed() -> Result<(), SystemError>{
 //     Ok(())
 // }
 
-unsafe fn save_rpg(){
+unsafe fn save_rpg() {
     asm!(
         "push    rax",
         "push    rcx",
@@ -104,7 +104,7 @@ unsafe fn save_rpg(){
     );
 }
 
-unsafe fn restore_rpg(){
+unsafe fn restore_rpg() {
     asm!(
         "pop    r15",
         "pop    r14",
@@ -126,7 +126,7 @@ unsafe fn restore_rpg(){
 
 #[repr(C)]
 #[allow(dead_code)]
-pub struct GuestCpuContext{
+pub struct GuestCpuContext {
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -145,9 +145,9 @@ pub struct GuestCpuContext{
 }
 
 #[no_mangle]
-pub extern "C" fn vmx_return(){
+pub extern "C" fn vmx_return() {
     kdebug!("vmx_return!");
-    unsafe {save_rpg()};
+    unsafe { save_rpg() };
     vmexit_handler();
     // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
     // unsafe {asm!(
@@ -173,14 +173,12 @@ pub extern "C" fn vmx_return(){
     //     "add     rsp, 60h",
     // clobber_abi("C"),
     // )};
-    unsafe{restore_rpg()};
-    unsafe{asm!(
-        "vmresume",
-    )};
+    unsafe { restore_rpg() };
+    unsafe { asm!("vmresume",) };
 }
 
 #[no_mangle]
-extern "C" fn vmexit_handler(){
+extern "C" fn vmexit_handler() {
     // let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
     // kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
     kdebug!("vmexit handler!");
@@ -193,33 +191,40 @@ extern "C" fn vmexit_handler(){
     let _guest_rflags = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap();
 
     match VmxExitReason::from(exit_basic_reason as i32) {
-        VmxExitReason::VMCALL | VmxExitReason::VMCLEAR | VmxExitReason::VMLAUNCH | 
-        VmxExitReason::VMPTRLD | VmxExitReason::VMPTRST | VmxExitReason::VMREAD | 
-        VmxExitReason::VMRESUME | VmxExitReason::VMWRITE | VmxExitReason::VMXOFF | 
-        VmxExitReason::VMXON | VmxExitReason::VMFUNC | VmxExitReason::INVEPT | 
-        VmxExitReason::INVVPID => {
+        VmxExitReason::VMCALL
+        | VmxExitReason::VMCLEAR
+        | VmxExitReason::VMLAUNCH
+        | VmxExitReason::VMPTRLD
+        | VmxExitReason::VMPTRST
+        | VmxExitReason::VMREAD
+        | VmxExitReason::VMRESUME
+        | VmxExitReason::VMWRITE
+        | VmxExitReason::VMXOFF
+        | VmxExitReason::VMXON
+        | VmxExitReason::VMFUNC
+        | VmxExitReason::INVEPT
+        | VmxExitReason::INVVPID => {
             kdebug!("vmexit handler: vmx instruction!");
             vmexit_vmx_instruction_executed().expect("previledge instruction handle error");
-        },
+        }
         VmxExitReason::CPUID => {
             kdebug!("vmexit handler: cpuid instruction!");
             // vmexit_cpuid_handler(guest_cpu_context);
             adjust_rip(guest_rip).unwrap();
-            
-        },
+        }
         VmxExitReason::RDMSR => {
             kdebug!("vmexit handler: rdmsr instruction!");
             adjust_rip(guest_rip).unwrap();
-        },
+        }
         VmxExitReason::WRMSR => {
             kdebug!("vmexit handler: wrmsr instruction!");
             adjust_rip(guest_rip).unwrap();
-        },
+        }
         VmxExitReason::TRIPLE_FAULT => {
             kdebug!("vmexit handler: triple fault!");
             adjust_rip(guest_rip).unwrap();
-        },
-        VmxExitReason::EPT_VIOLATION=> {
+        }
+        VmxExitReason::EPT_VIOLATION => {
             kdebug!("vmexit handler: ept violation!");
             let gpa = vmx_vmread(GUEST_PHYSICAL_ADDR_FULL as u32).unwrap();
             let exit_qualification = vmx_vmread(VmcsFields::VMEXIT_QUALIFICATION as u32).unwrap();
@@ -234,18 +239,22 @@ extern "C" fn vmexit_handler(){
             let vcpu = kvm.vcpu[0].clone();
             // Use the data
             let kvm_ept_page_fault = vcpu.lock().mmu.page_fault.unwrap();
-            kvm_ept_page_fault(&mut (*vcpu.lock()), gpa, error_code as u32, false).expect("ept page fault error");
+            kvm_ept_page_fault(&mut (*vcpu.lock()), gpa, error_code as u32, false)
+                .expect("ept page fault error");
         }
         _ => {
-            kdebug!("vmexit handler: unhandled vmexit reason: {}!", exit_basic_reason);
-            
+            kdebug!(
+                "vmexit handler: unhandled vmexit reason: {}!",
+                exit_basic_reason
+            );
+
             let info = vmx_vmread(VmcsFields::VMEXIT_INSTR_LEN as u32).unwrap() as u32;
             kdebug!("vmexit handler: VMEXIT_INSTR_LEN: {}!", info);
             let info = vmx_vmread(VmcsFields::VMEXIT_INSTR_INFO as u32).unwrap() as u32;
             kdebug!("vmexit handler: VMEXIT_INSTR_INFO: {}!", info);
             let info = vmx_vmread(VmcsFields::CTRL_EXPECTION_BITMAP as u32).unwrap() as u32;
             kdebug!("vmexit handler: CTRL_EXPECTION_BITMAP: {}!", info);
-            
+
             adjust_rip(guest_rip).unwrap();
             // panic!();
         }
@@ -258,4 +267,3 @@ fn adjust_rip(rip: u64) -> Result<(), SystemError> {
     vmx_vmwrite(VmcsFields::GUEST_RIP as u32, rip + instruction_length)?;
     Ok(())
 }
-

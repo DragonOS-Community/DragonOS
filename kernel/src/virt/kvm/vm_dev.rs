@@ -1,29 +1,23 @@
-use crate::process::ProcessManager;
-use crate::{kdebug, filesystem};
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
     file::{File, FileMode},
-    FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
-    make_rawdev,
+    make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
 };
+use crate::mm::VirtAddr;
+use crate::process::ProcessManager;
 use crate::syscall::user_access::copy_from_user;
-use crate::virt::kvm::update_vm;
-use crate::virt::kvm::vm;
-use crate::{
-    libs::spinlock::SpinLock,
-    syscall::SystemError,
-    time::TimeSpec,
-    arch::KVMArch,
-};
-use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use crate::virt::kvm::host_mem::KvmUserspaceMemoryRegion;
+use crate::virt::kvm::update_vm;
+use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
+use crate::virt::kvm::vm;
+use crate::{arch::KVMArch, libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{filesystem, kdebug};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
-use crate::mm::VirtAddr;
 
 // pub const KVM_API_VERSION:u32 = 12;
 // pub const GUEST_STACK_SIZE:usize = 1024;
@@ -93,7 +87,6 @@ impl LockedVmInode {
     }
 }
 
-
 impl IndexNode for LockedVmInode {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -101,11 +94,11 @@ impl IndexNode for LockedVmInode {
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
         kdebug!("file private data:{:?}", _data);
-        return Ok(())
+        return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        return Ok(())
+        return Ok(());
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -148,43 +141,44 @@ impl IndexNode for LockedVmInode {
             0xdeadbeef => {
                 kdebug!("kvm_vm ioctl");
                 Ok(0)
-            },
+            }
             KVM_CREATE_VCPU => {
                 kdebug!("kvm_vcpu ioctl KVM_CREATE_VCPU");
                 kvm_vm_ioctl_create_vcpu(data as u32)
-            },
+            }
             KVM_SET_USER_MEMORY_REGION => {
                 kdebug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
-                let mut kvm_userspace_mem = KvmUserspaceMemoryRegion::default();// = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
+                let mut kvm_userspace_mem = KvmUserspaceMemoryRegion::default(); // = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
                 unsafe {
                     copy_from_user(
                         core::slice::from_raw_parts_mut(
-                            (&mut kvm_userspace_mem as *mut _ )as *mut u8, 
-                            core::mem::size_of::<KvmUserspaceMemoryRegion>()
-                        ), 
-                        VirtAddr::new(data)
+                            (&mut kvm_userspace_mem as *mut _) as *mut u8,
+                            core::mem::size_of::<KvmUserspaceMemoryRegion>(),
+                        ),
+                        VirtAddr::new(data),
                     )?;
                 }
-                kdebug!("slot={}, flag={}, memory_size={:x}, guest_phys_addr={}, userspace_addr={}",
+                kdebug!(
+                    "slot={}, flag={}, memory_size={:x}, guest_phys_addr={}, userspace_addr={}",
                     kvm_userspace_mem.slot,
                     kvm_userspace_mem.flags,
                     kvm_userspace_mem.memory_size,
-                    kvm_userspace_mem.guest_phys_addr,  // starting at physical address guest_phys_addr (from the guest’s perspective)
-                    kvm_userspace_mem.userspace_addr    // using memory at linear address userspace_addr (from the host’s perspective)
+                    kvm_userspace_mem.guest_phys_addr, // starting at physical address guest_phys_addr (from the guest’s perspective)
+                    kvm_userspace_mem.userspace_addr // using memory at linear address userspace_addr (from the host’s perspective)
                 );
-                
+
                 let mut current_vm = vm(0).unwrap();
                 current_vm.set_user_memory_region(&kvm_userspace_mem)?;
                 update_vm(0, current_vm);
                 Ok(0)
-            },
-            KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS=> {
+            }
+            KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS => {
                 Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
             }
             _ => {
                 kdebug!("kvm_vm ioctl");
                 Ok(usize::MAX)
-            },
+            }
         }
     }
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -210,11 +204,11 @@ impl IndexNode for LockedVmInode {
     }
 }
 
-fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
+fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError> {
     let vcpu = KVMArch::kvm_arch_vcpu_create(id).unwrap();
     KVMArch::kvm_arch_vcpu_setup(vcpu.as_ref())?;
 
-    let mut current_vm = vm(0).unwrap();    
+    let mut current_vm = vm(0).unwrap();
     current_vm.vcpu.push(vcpu);
     current_vm.nr_vcpus += 1;
     update_vm(0, current_vm);
@@ -222,9 +216,9 @@ fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError>{
     let vcpu_inode = LockedVcpuInode::new();
     let file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;
     let r = ProcessManager::current_pcb()
-            .fd_table()
-            .write()
-            .alloc_fd(file, None)
-            .map(|fd| fd as usize);
+        .fd_table()
+        .write()
+        .alloc_fd(file, None)
+        .map(|fd| fd as usize);
     return r;
 }

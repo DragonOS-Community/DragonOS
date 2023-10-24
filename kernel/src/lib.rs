@@ -19,7 +19,6 @@
 #![feature(new_uninit)]
 #![feature(ptr_to_from_bits)]
 #![feature(concat_idents)]
-
 #![cfg_attr(target_os = "none", no_std)]
 
 #[cfg(test)]

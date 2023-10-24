@@ -1,33 +1,26 @@
-use crate::arch::KVMArch;
 use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
-use crate::{kdebug, filesystem};
-use crate::mm::VirtAddr;
-use crate::syscall::user_access::copy_from_user;
+use crate::arch::KVMArch;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
-    core::generate_inode_id,
-    file::FileMode,
-    FileSystem, FilePrivateData, FileType, IndexNode, Metadata, PollStatus,
-    make_rawdev
+    core::generate_inode_id, file::FileMode, make_rawdev, FilePrivateData, FileSystem, FileType,
+    IndexNode, Metadata, PollStatus,
 };
+use crate::mm::VirtAddr;
+use crate::syscall::user_access::copy_from_user;
+use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
-use crate::{
-    libs::spinlock::SpinLock,
-    syscall::SystemError,
-    time::TimeSpec,
-};
+use crate::{filesystem, kdebug};
+use crate::{libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
-use crate::virt::kvm::vcpu::Vcpu;
 
 // pub const KVM_API_VERSION:u32 = 12;
 pub const KVM_RUN: u32 = 0x00;
 // pub const KVM_GET_REGS: u32 = 0x01;
 pub const KVM_SET_REGS: u32 = 0x02;
-
 
 // pub const GUEST_STACK_SIZE:usize = 1024;
 // pub const HOST_STACK_SIZE:usize = 0x1000 * 6;
@@ -46,7 +39,7 @@ pub const KVM_SET_REGS: u32 = 0x02;
 //  pub struct InodeInfo {
 //     kvm: Arc<Hypervisor>,
 //  }
- 
+
 #[derive(Debug)]
 pub struct VcpuInode {
     /// uuid 暂时不知道有什么用（x
@@ -96,7 +89,6 @@ impl LockedVcpuInode {
     }
 }
 
-
 impl IndexNode for LockedVcpuInode {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -104,11 +96,11 @@ impl IndexNode for LockedVcpuInode {
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
         kdebug!("file private data:{:?}", _data);
-        return Ok(())
+        return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        return Ok(())
+        return Ok(());
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -151,8 +143,8 @@ impl IndexNode for LockedVcpuInode {
             0xdeadbeef => {
                 kdebug!("kvm_cpu ioctl");
                 Ok(0)
-            },
-            KVM_RUN =>{
+            }
+            KVM_RUN => {
                 kdebug!("kvm_cpu ioctl");
                 // let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
                 // let host_stack = vec![0xCC; HOST_STACK_SIZE];
@@ -171,17 +163,18 @@ impl IndexNode for LockedVcpuInode {
                 unsafe {
                     copy_from_user(
                         core::slice::from_raw_parts_mut(
-                            (&mut kvm_regs as *mut _ )as *mut u8, 
-                            core::mem::size_of::<VcpuContextFrame>()
-                        ), 
-                        VirtAddr::new(data)
+                            (&mut kvm_regs as *mut _) as *mut u8,
+                            core::mem::size_of::<VcpuContextFrame>(),
+                        ),
+                        VirtAddr::new(data),
                     )?;
                 }
-                kdebug!("rip={:x}, rflags={:x}, rsp={:x}, rax={:x}",
+                kdebug!(
+                    "rip={:x}, rflags={:x}, rsp={:x}, rax={:x}",
                     kvm_regs.rip,
                     kvm_regs.rflags,
                     kvm_regs.regs[6],
-                    kvm_regs.regs[0],  
+                    kvm_regs.regs[0],
                 );
 
                 let vcpu = vm(0).unwrap().vcpu[0].clone();
@@ -192,7 +185,7 @@ impl IndexNode for LockedVcpuInode {
             _ => {
                 kdebug!("kvm_cpu ioctl");
                 Ok(usize::MAX)
-            },
+            }
         }
     }
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -217,4 +210,3 @@ impl IndexNode for LockedVcpuInode {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 }
-

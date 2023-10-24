@@ -174,7 +174,7 @@ impl MemoryManagementArch for X86_64MMArch {
     /// @brief 获取顶级页表的物理地址
     unsafe fn table(table_kind: PageTableKind) -> PhysAddr {
         match table_kind {
-            PageTableKind::Kernel | PageTableKind::User=> {
+            PageTableKind::Kernel | PageTableKind::User => {
                 let paddr: usize;
                 compiler_fence(Ordering::SeqCst);
                 asm!("mov {}, cr3", out(reg) paddr, options(nomem, nostack, preserves_flags));
@@ -182,12 +182,11 @@ impl MemoryManagementArch for X86_64MMArch {
                 return PhysAddr::new(paddr);
             }
             PageTableKind::EPT => {
-                let eptp = vmx_vmread(VmcsFields::CTRL_EPTP_PTR as u32)
-                                    .expect("Failed to read eptp");
+                let eptp =
+                    vmx_vmread(VmcsFields::CTRL_EPTP_PTR as u32).expect("Failed to read eptp");
                 return PhysAddr::new(eptp as usize);
             }
         }
-        
     }
 
     /// @brief 设置顶级页表的物理地址到处理器中

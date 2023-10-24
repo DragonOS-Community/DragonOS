@@ -670,7 +670,7 @@ impl Syscall {
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
-
+                // kdebug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
             }
 

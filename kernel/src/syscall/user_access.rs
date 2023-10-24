@@ -286,7 +286,7 @@ impl<'a> UserBufferWriter<'a> {
     ///
     /// @param data 要写入的数据地址
     /// @param offset 在UserBuffer中的字节偏移量
-    /// @return 返回写入元素的数量
+    /// @return Ok/Err
     ///
     pub fn copy_one_to_user<T: core::marker::Copy>(
         &'a mut self,

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ptrace.h"
-#include <DragonOS/signal.h>
 #include <DragonOS/stdint.h>
 
 // 进程最大可拥有的文件描述符数量

@@ -423,8 +423,6 @@ pub const SYS_SBRK: usize = 100001;
 pub const SYS_CLOCK: usize = 100002;
 pub const SYS_SCHED: usize = 100003;
 
-pub const SYS_IOCTL: usize = 54;
-
 #[derive(Debug)]
 pub struct Syscall;
 

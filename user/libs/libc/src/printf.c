@@ -35,7 +35,7 @@ static int skip_and_atoi(const char **s)
  */
 int64_t put_string(char *str, uint64_t front_color, uint64_t bg_color)
 {
-    return syscall_invoke(SYS_PUT_STRING, (uint64_t)str, front_color, bg_color, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_PUT_STRING, (uint64_t)str, front_color, bg_color, 0, 0, 0);
 }
 
 int printf(const char *fmt, ...)

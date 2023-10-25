@@ -1,7 +1,6 @@
 use crate::{
     driver::{
-        uart::uart_device::{c_uart_send, c_uart_send_str, UartPort},
-        video::video_refresh_manager,
+        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
     },
     kdebug, kinfo,
     libs::{
@@ -86,10 +85,7 @@ pub unsafe fn textui_framwork_init() {
         scm_register(textui_framework()).expect("register textui framework failed");
         kdebug!("textui framework init success");
 
-        c_uart_send_str(
-            UartPort::COM1.to_u16(),
-            "\ntext ui initialized\n\0".as_ptr(),
-        );
+        send_to_default_serial8250_port("\ntext ui initialized\n\0".as_bytes());
         unsafe { TEXTUI_IS_INIT = true };
     } else {
         panic!("Try to init TEXTUI_FRAMEWORK twice!");
@@ -756,7 +752,7 @@ impl TextuiWindow {
         //进行换行操作
         if character == '\n' {
             // 换行时还需要输出\r
-            c_uart_send(UartPort::COM1.to_u16(), b'\r');
+            send_to_default_serial8250_port(&[b'\r']);
             if is_enable_window == true {
                 self.textui_new_line()?;
             }
@@ -837,7 +833,7 @@ impl TextuiWindow {
         } else {
             // 输出其他字符
 
-            c_uart_send(UartPort::COM1.to_u16(), character as u8);
+            send_to_default_serial8250_port(&[character as u8]);
 
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =
@@ -902,10 +898,7 @@ impl TextUiFramework {
 impl ScmUiFramework for TextUiFramework {
     // 安装ui框架的回调函数
     fn install(&self) -> Result<i32, SystemError> {
-        c_uart_send_str(
-            UartPort::COM1.to_u16(),
-            "\ntextui_install_handler\n\0".as_ptr(),
-        );
+        send_to_default_serial8250_port("\ntextui_install_handler\n\0".as_bytes());
         return Ok(0);
     }
     // 卸载ui框架的回调函数
@@ -1015,7 +1008,7 @@ pub fn textui_putchar(
 pub extern "C" fn rs_textui_init() -> i32 {
     let r = textui_init().unwrap_or_else(|e| e.to_posix_errno());
     if r.is_negative() {
-        c_uart_send_str(UartPort::COM1.to_u16(), "textui init failed.\n\0".as_ptr());
+        send_to_default_serial8250_port("textui init failed.\n\0".as_bytes());
     }
     return r;
 }

@@ -6,7 +6,6 @@
 #include <common/printk.h>
 #include <driver/acpi/acpi.h>
 #include <exception/gate.h>
-#include <driver/uart/uart.h>
 #include <exception/softirq.h>
 #include <process/process.h>
 #include <sched/sched.h>

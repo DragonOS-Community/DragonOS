@@ -5,14 +5,19 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+
 [lib]
 crate-type = ["staticlib"]
+
+[workspace]
+members = [ "src/libs/intertrait" ]
 
 # 运行时依赖项
 [dependencies]
 x86 = "0.52.0"
 x86_64 = "0.14.10"
 bitflags = "1.3.2"
+bitfield-struct = "0.5.3"
 virtio-drivers = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
 # 一个无锁MPSC队列
 thingbuf = { version = "0.1.3", default-features = false, features = ["alloc"] }
@@ -27,7 +32,10 @@ elf = { version = "0.7.2", default-features = false }
 memoffset = "0.9.0"
 atomic_enum = "0.2.0"
 raw-cpuid = "11.0.1"
-acpi = "5.0.0"
+acpi = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/acpi-rs.git", rev = "fb69243dcf" }
+intertrait = { path = "src/libs/intertrait" }
+linkme = "0.2"
+ida = { path = "src/libs/ida" }
 
 # 构建时依赖项
 [build-dependencies]
@@ -39,9 +47,12 @@ version = "1.4.0"
 # 由于在no_std环境，而lazy_static依赖了spin库，因此需要指定其使用no_std
 features = ["spin_no_std"]
 
+# The development profile, used for `cargo build`
+[profile.dev]
+# opt-level = 0  # Controls the --opt-level the compiler builds with
+debug = true   # Controls whether the compiler passes `-g`
 
 # The release profile, used for `cargo build --release`
 [profile.release]
 debug = false
-
 

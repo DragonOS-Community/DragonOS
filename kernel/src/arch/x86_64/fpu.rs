@@ -60,9 +60,10 @@ impl FpState {
         }
     }
 
-    /// 清空fp_state
+    /// 清空浮点寄存器
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         *self = Self::default();
+        self.restore();
     }
 }

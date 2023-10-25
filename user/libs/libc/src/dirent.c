@@ -56,7 +56,7 @@ int closedir(struct DIR *dirp)
 
 int64_t getdents(int fd, struct dirent *dirent, long count)
 {
-    return syscall_invoke(SYS_GET_DENTS, fd, (uint64_t)dirent, count, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_GET_DENTS, fd, (uint64_t)dirent, count, 0, 0, 0);
 }
 /**
  * @brief 从目录中读取数据

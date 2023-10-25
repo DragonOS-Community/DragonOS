@@ -5,6 +5,7 @@ int ktest_test_bitree(void* arg);
 int ktest_test_kfifo(void* arg);
 int ktest_test_mutex(void* arg);
 int ktest_test_idr(void* arg);
+int ktest_test_kvm(void* arg);
 
 /**
  * @brief 开启一个新的内核线程以进行测试

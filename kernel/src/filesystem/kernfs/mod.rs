@@ -1,4 +1,4 @@
-use core::{fmt::Debug, intrinsics::unlikely};
+use core::{cmp::min, fmt::Debug, intrinsics::unlikely};
 
 use alloc::{
     string::String,
@@ -8,7 +8,11 @@ use alloc::{
 use hashbrown::HashMap;
 
 use crate::{
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{
+        casting::DowncastArc,
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     syscall::SystemError,
     time::TimeSpec,
 };
@@ -60,7 +64,7 @@ impl KernFS {
                 (*ptr).self_ref = Arc::downgrade(&root_inode);
             }
         }
-        root_inode.inner.lock().parent = Arc::downgrade(&root_inode);
+        root_inode.inner.write().parent = Arc::downgrade(&root_inode);
         *root_inode.fs.write() = Arc::downgrade(&fs);
         return fs;
     }
@@ -83,9 +87,12 @@ impl KernFS {
             raw_dev: 0,
         };
         let root_inode = Arc::new(KernFSInode {
-            inner: SpinLock::new(InnerKernFSInode {
+            name: String::from(""),
+            inner: RwLock::new(InnerKernFSInode {
                 parent: Weak::new(),
                 metadata,
+                symlink_target: None,
+                symlink_target_absolute_path: None,
             }),
             self_ref: Weak::new(),
             fs: RwLock::new(Weak::new()),
@@ -101,7 +108,7 @@ impl KernFS {
 
 #[derive(Debug)]
 pub struct KernFSInode {
-    inner: SpinLock<InnerKernFSInode>,
+    inner: RwLock<InnerKernFSInode>,
     /// 指向当前Inode所属的文件系统的弱引用
     fs: RwLock<Weak<KernFS>>,
     /// 指向自身的弱引用
@@ -114,6 +121,8 @@ pub struct KernFSInode {
     children: SpinLock<HashMap<String, Arc<KernFSInode>>>,
     /// Inode类型
     inode_type: KernInodeType,
+    /// Inode名称
+    name: String,
 }
 
 #[derive(Debug)]
@@ -122,6 +131,9 @@ pub struct InnerKernFSInode {
 
     /// 当前inode的元数据
     metadata: Metadata,
+    /// 符号链接指向的inode（仅当inode_type为SymLink时有效）
+    symlink_target: Option<Weak<KernFSInode>>,
+    symlink_target_absolute_path: Option<String>,
 }
 
 impl IndexNode for KernFSInode {
@@ -144,7 +156,7 @@ impl IndexNode for KernFSInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        return Ok(self.inner.lock().metadata.clone());
+        return Ok(self.inner.read().metadata.clone());
     }
 
     fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
@@ -199,13 +211,29 @@ impl IndexNode for KernFSInode {
         if unlikely(self.inode_type != KernInodeType::Dir) {
             return Err(SystemError::ENOTDIR);
         }
-        let x: Arc<KernFSInode> = self
-            .children
-            .lock()
-            .get(name)
-            .cloned()
-            .ok_or(SystemError::ENOENT)?;
-        return Ok(x);
+        match name {
+            "" | "." => {
+                return Ok(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?);
+            }
+
+            ".." => {
+                return Ok(self
+                    .inner
+                    .read()
+                    .parent
+                    .upgrade()
+                    .ok_or(SystemError::ENOENT)?);
+            }
+            name => {
+                // 在子目录项中查找
+                return Ok(self
+                    .children
+                    .lock()
+                    .get(name)
+                    .ok_or(SystemError::ENOENT)?
+                    .clone());
+            }
+        }
     }
 
     fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
@@ -248,11 +276,21 @@ impl IndexNode for KernFSInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        let mut list = Vec::new();
-        for (name, _) in self.children.lock().iter() {
-            list.push(name.clone());
+        let info = self.metadata()?;
+        if info.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
         }
-        return Ok(list);
+
+        let mut keys: Vec<String> = Vec::new();
+        keys.push(String::from("."));
+        keys.push(String::from(".."));
+        self.children
+            .lock()
+            .keys()
+            .into_iter()
+            .for_each(|x| keys.push(x.clone()));
+
+        return Ok(keys);
     }
 
     fn poll(&self) -> Result<PollStatus, SystemError> {
@@ -267,11 +305,31 @@ impl IndexNode for KernFSInode {
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
+        if self.inode_type == KernInodeType::SymLink {
+            let inner = self.inner.read();
+            if offset >= inner.symlink_target_absolute_path.as_ref().unwrap().len() {
+                return Ok(0);
+            }
+            let len = min(len, buf.len());
+            let len = min(
+                len,
+                inner.symlink_target_absolute_path.as_ref().unwrap().len() - offset,
+            );
+            buf[0..len].copy_from_slice(
+                &inner
+                    .symlink_target_absolute_path
+                    .as_ref()
+                    .unwrap()
+                    .as_bytes()[offset..offset + len],
+            );
+            return Ok(len);
+        }
         if self.inode_type != KernInodeType::File {
             return Err(SystemError::EISDIR);
         }
 
         if self.callback.is_none() {
+            kwarn!("kernfs: callback is none");
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
@@ -310,6 +368,51 @@ impl IndexNode for KernFSInode {
 }
 
 impl KernFSInode {
+    pub fn new(
+        parent: Option<Arc<KernFSInode>>,
+        name: String,
+        mut metadata: Metadata,
+        inode_type: KernInodeType,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+    ) -> Arc<KernFSInode> {
+        metadata.file_type = inode_type.into();
+        let parent: Weak<KernFSInode> = parent.map(|x| Arc::downgrade(&x)).unwrap_or_default();
+
+        let inode = Arc::new(KernFSInode {
+            name,
+            inner: RwLock::new(InnerKernFSInode {
+                parent: parent.clone(),
+                metadata,
+                symlink_target: None,
+                symlink_target_absolute_path: None,
+            }),
+            self_ref: Weak::new(),
+            fs: RwLock::new(Weak::new()),
+            private_data: SpinLock::new(private_data),
+            callback,
+            children: SpinLock::new(HashMap::new()),
+            inode_type,
+        });
+
+        {
+            let ptr = inode.as_ref() as *const KernFSInode as *mut KernFSInode;
+            unsafe {
+                (*ptr).self_ref = Arc::downgrade(&inode);
+            }
+        }
+        if parent.strong_count() > 0 {
+            let kernfs = parent
+                .upgrade()
+                .unwrap()
+                .fs()
+                .downcast_arc::<KernFS>()
+                .expect("KernFSInode::new: parent is not a KernFS instance");
+            *inode.fs.write() = Arc::downgrade(&kernfs);
+        }
+        return inode;
+    }
+
     /// 在当前inode下增加子目录
     ///
     /// ## 参数
@@ -336,7 +439,7 @@ impl KernFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        return self.inner_create(name, KernInodeType::Dir, mode, private_data, callback);
+        return self.inner_create(name, KernInodeType::Dir, mode, 0, private_data, callback);
     }
 
     /// 在当前inode下增加文件
@@ -345,8 +448,10 @@ impl KernFSInode {
     ///
     /// - `name`：文件名称
     /// - `mode`：文件权限
+    /// - `size`：文件大小(如果不指定，则默认为4096)
     /// - `private_data`：文件私有数据
     /// - `callback`：文件回调函数
+    ///
     ///
     /// ## 返回值
     ///
@@ -358,6 +463,7 @@ impl KernFSInode {
         &self,
         name: String,
         mode: ModeType,
+        size: Option<usize>,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
@@ -365,7 +471,15 @@ impl KernFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        return self.inner_create(name, KernInodeType::File, mode, private_data, callback);
+        let size = size.unwrap_or(4096);
+        return self.inner_create(
+            name,
+            KernInodeType::File,
+            mode,
+            size,
+            private_data,
+            callback,
+        );
     }
 
     fn inner_create(
@@ -373,11 +487,19 @@ impl KernFSInode {
         name: String,
         file_type: KernInodeType,
         mode: ModeType,
+        mut size: usize,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
+        match file_type {
+            KernInodeType::Dir | KernInodeType::SymLink => {
+                size = 0;
+            }
+            _ => {}
+        }
+
         let metadata = Metadata {
-            size: 0,
+            size: size as i64,
             mode,
             uid: 0,
             gid: 0,
@@ -394,9 +516,10 @@ impl KernFSInode {
         };
 
         let new_inode: Arc<KernFSInode> = Self::new(
-            self.self_ref.upgrade().unwrap(),
+            Some(self.self_ref.upgrade().unwrap()),
+            name.clone(),
             metadata,
-            KernInodeType::Dir,
+            file_type,
             private_data,
             callback,
         );
@@ -434,46 +557,78 @@ impl KernFSInode {
         }
     }
 
-    pub(self) fn new(
-        parent: Arc<KernFSInode>,
-        metadata: Metadata,
-        inode_type: KernInodeType,
-        private_data: Option<KernInodePrivateData>,
-        callback: Option<&'static dyn KernFSCallback>,
-    ) -> Arc<KernFSInode> {
-        let inode = Arc::new(KernFSInode {
-            inner: SpinLock::new(InnerKernFSInode {
-                parent: Arc::downgrade(&parent),
-                metadata,
-            }),
-            self_ref: Weak::new(),
-            fs: RwLock::new(Weak::new()),
-            private_data: SpinLock::new(private_data),
-            callback,
-            children: SpinLock::new(HashMap::new()),
-            inode_type,
-        });
+    /// add_link - create a symlink in kernfs
+    ///
+    /// ## 参数
+    ///
+    /// - `parent`: directory to create the symlink in
+    /// - `name`: name of the symlink
+    /// - `target`: target node for the symlink to point to
+    ///
+    /// Returns the created node on success
+    ///
+    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/kernfs/symlink.c#25
+    pub fn add_link(
+        &self,
+        name: String,
+        target: &Arc<KernFSInode>,
+        target_absolute_path: String,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        // kdebug!("kernfs add link: name:{name}, target path={target_absolute_path}");
+        let inode = self.inner_create(
+            name,
+            KernInodeType::SymLink,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777),
+            0,
+            None,
+            None,
+        )?;
 
-        {
-            let ptr = inode.as_ref() as *const KernFSInode as *mut KernFSInode;
-            unsafe {
-                (*ptr).self_ref = Arc::downgrade(&inode);
-            }
+        inode.inner.write().symlink_target = Some(Arc::downgrade(target));
+        inode.inner.write().symlink_target_absolute_path = Some(target_absolute_path);
+        return Ok(inode);
+    }
+
+    pub fn name(&self) -> &str {
+        return &self.name;
+    }
+
+    pub fn parent(&self) -> Option<Arc<KernFSInode>> {
+        return self.inner.read().parent.upgrade();
+    }
+
+    pub fn private_data_mut(&self) -> SpinLockGuard<Option<KernInodePrivateData>> {
+        return self.private_data.lock();
+    }
+
+    #[allow(dead_code)]
+    pub fn symlink_target(&self) -> Option<Arc<KernFSInode>> {
+        return self.inner.read().symlink_target.as_ref()?.upgrade();
+    }
+
+    /// remove a kernfs_node recursively
+    pub fn remove_recursive(&self) {
+        let mut children = self.children.lock().drain().collect::<Vec<_>>();
+        while let Some((_, child)) = children.pop() {
+            children.append(&mut child.children.lock().drain().collect::<Vec<_>>());
         }
-        *inode.fs.write() = Arc::downgrade(
-            parent
-                .fs()
-                .as_any_ref()
-                .downcast_ref()
-                .expect("KernFSInode::new: parent is not a KernFS instance"),
-        );
-        return inode;
+    }
+
+    /// 删除当前的inode（包括其自身、子目录和子文件）
+    #[allow(dead_code)]
+    pub fn remove_inode_include_self(&self) {
+        let parent = self.parent();
+        if let Some(parent) = parent {
+            parent.children.lock().remove(self.name());
+        }
+        self.remove_recursive();
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(self) enum KernInodeType {
+pub enum KernInodeType {
     Dir,
     File,
+    SymLink,
 }
 
 impl Into<FileType> for KernInodeType {
@@ -481,6 +636,7 @@ impl Into<FileType> for KernInodeType {
         match self {
             KernInodeType::Dir => FileType::Dir,
             KernInodeType::File => FileType::File,
+            KernInodeType::SymLink => FileType::SymLink,
         }
     }
 }

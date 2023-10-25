@@ -1,3 +1,5 @@
+use core::ffi::CStr;
+
 use alloc::{
     string::{String, ToString},
     sync::Arc,
@@ -5,14 +7,14 @@ use alloc::{
 };
 
 use crate::{
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
-    include::bindings::bindings::{verify_area, AT_REMOVEDIR, PAGE_4K_SIZE, PROC_MAX_FD_NUM},
+    include::bindings::bindings::{verify_area, AT_REMOVEDIR, PROC_MAX_FD_NUM},
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{Syscall, SystemError},
+    syscall::{user_access::UserBufferReader, Syscall, SystemError},
     time::TimeSpec,
 };
 
@@ -21,8 +23,9 @@ use super::{
     fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
-    Dirent, FileType, IndexNode, ROOT_INODE,
+    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -62,6 +65,19 @@ bitflags! {
         const S_IROTH = 0o0004;
         const S_IWOTH = 0o0002;
         const S_IXOTH = 0o0001;
+
+        /// 0o777
+        const S_IRWXUGO = Self::S_IRWXU.bits | Self::S_IRWXG.bits | Self::S_IRWXO.bits;
+        /// 0o7777
+        const S_IALLUGO = Self::S_ISUID.bits | Self::S_ISGID.bits | Self::S_ISVTX.bits| Self::S_IRWXUGO.bits;
+        /// 0o444
+        const S_IRUGO = Self::S_IRUSR.bits | Self::S_IRGRP.bits | Self::S_IROTH.bits;
+        /// 0o222
+        const S_IWUGO = Self::S_IWUSR.bits | Self::S_IWGRP.bits | Self::S_IWOTH.bits;
+        /// 0o111
+        const S_IXUGO = Self::S_IXUSR.bits | Self::S_IXGRP.bits | Self::S_IXOTH.bits;
+
+
     }
 }
 
@@ -137,11 +153,12 @@ impl Syscall {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
 
         // 文件名过长
-        if path.len() > PAGE_4K_SIZE as usize {
+        if path.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         let inode: Arc<dyn IndexNode> = if inode.is_err() {
             let errno = inode.unwrap_err();
@@ -184,13 +201,13 @@ impl Syscall {
         }
 
         // 创建文件对象
+
         let mut file: File = File::new(inode, mode)?;
 
         // 打开模式为“追加”
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
         }
-
         // 把文件对象存入pcb
         let r = ProcessManager::current_pcb()
             .fd_table()
@@ -210,7 +227,30 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        return fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+        let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
+
+        return res;
+    }
+
+    /// @brief 发送命令到文件描述符对应的设备，
+    ///
+    /// @param fd 文件描述符编号
+    /// @param cmd 设备相关的请求类型
+    ///
+    /// @return Ok(usize) 成功返回0
+    /// @return Err(SystemError) 读取失败，返回posix错误码
+    pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard
+            .get_file_by_fd(fd as i32)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let r = file.lock_no_preempt().inode().ioctl(cmd, data);
+        return r;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -326,13 +366,14 @@ impl Syscall {
                 new_path = String::from("/");
             }
         }
-        let inode = match ROOT_INODE().lookup(&new_path) {
-            Err(e) => {
-                kerror!("Change Directory Failed, Error = {:?}", e);
-                return Err(SystemError::ENOENT);
-            }
-            Ok(i) => i,
-        };
+        let inode =
+            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+                Err(e) => {
+                    kerror!("Change Directory Failed, Error = {:?}", e);
+                    return Err(SystemError::ENOENT);
+                }
+                Ok(i) => i,
+            };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(String::from(new_path));
@@ -389,7 +430,10 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        return file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        let res = file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+
+        return res;
     }
 
     /// @brief 创建文件夹
@@ -670,13 +714,14 @@ impl Syscall {
         kstat.rdev = metadata.raw_dev as i64;
         kstat.mode = metadata.mode;
         match file.lock().file_type() {
-            FileType::File => kstat.mode.insert(ModeType::S_IFMT),
+            FileType::File => kstat.mode.insert(ModeType::S_IFREG),
             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
             FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
             FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
             FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
             FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
             FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
+            FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
         }
 
         return Ok(kstat);
@@ -690,6 +735,40 @@ impl Syscall {
         unsafe {
             *usr_kstat = kstat;
         }
+        return Ok(0);
+    }
+
+    pub fn mknod(
+        path_ptr: *const i8,
+        mode: ModeType,
+        dev_t: DeviceNumber,
+    ) -> Result<usize, SystemError> {
+        // 安全检验
+        let len = unsafe { CStr::from_ptr(path_ptr).to_bytes().len() };
+        let user_buffer = UserBufferReader::new(path_ptr, len, true)?;
+        let buf = user_buffer.read_from_user::<u8>(0)?;
+        let path = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+
+        // 文件名过长
+        if path.len() > MAX_PATHLEN as usize {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+
+        if inode.is_ok() {
+            return Err(SystemError::EEXIST);
+        }
+
+        let (filename, parent_path) = rsplit_path(path);
+
+        // 查找父目录
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
+            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        // 创建nod
+        parent_inode.mknod(filename, mode, dev_t)?;
+
         return Ok(0);
     }
 }

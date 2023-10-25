@@ -13,6 +13,7 @@ use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
+    kwarn,
     libs::spinlock::SpinLockGuard,
     mm::{
         percpu::{PerCpu, PerCpuVar},
@@ -156,6 +157,20 @@ impl ArchPCBInfo {
         self.fp_state.as_mut().unwrap().restore();
     }
 
+    /// 返回浮点寄存器结构体的副本
+    pub fn fp_state(&self) -> &Option<FpState> {
+        &self.fp_state
+    }
+
+    // 清空浮点寄存器
+    pub fn clear_fp_state(&mut self) {
+        if unlikely(self.fp_state.is_none()) {
+            kwarn!("fp_state is none");
+            return;
+        }
+
+        self.fp_state.as_mut().unwrap().clear();
+    }
     pub unsafe fn save_fsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.fsbase = x86::current::segmentation::rdfsbase() as usize;
@@ -190,6 +205,14 @@ impl ArchPCBInfo {
 
     pub fn gsbase(&self) -> usize {
         self.gsbase
+    }
+
+    pub fn cr2_mut(&mut self) -> &mut usize {
+        &mut self.cr2
+    }
+
+    pub fn fp_state_mut(&mut self) -> &mut Option<FpState> {
+        &mut self.fp_state
     }
 }
 

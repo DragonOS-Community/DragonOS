@@ -1,0 +1,5 @@
+error: Duplicated flag: sync
+ --> $DIR/duplicate-flags.rs:5:18
+  |
+5 | #[cast_to([sync, sync] Greet)]
+  |                  ^^^^

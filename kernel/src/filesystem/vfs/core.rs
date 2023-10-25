@@ -15,12 +15,11 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
-    include::bindings::bindings::PAGE_4K_SIZE,
     kdebug, kerror, kinfo,
     syscall::SystemError,
 };
 
-use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
+use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId, MAX_PATHLEN};
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -177,7 +176,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 /// @brief 创建文件/文件夹
 pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
     // 文件名过长
-    if path.len() > PAGE_4K_SIZE as usize {
+    if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
 
@@ -209,7 +208,7 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 /// @brief 删除文件夹
 pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
     // 文件名过长
-    if path.len() > PAGE_4K_SIZE as usize {
+    if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
 
@@ -245,7 +244,7 @@ pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
 /// @brief 删除文件
 pub fn do_unlink_at(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
     // 文件名过长
-    if path.len() > PAGE_4K_SIZE as usize {
+    if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
 

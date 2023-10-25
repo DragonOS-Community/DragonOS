@@ -137,14 +137,15 @@ void acpi_init()
     multiboot2_iter(multiboot2_get_acpi_old_RSDP, &old_acpi, &reserved);
     rsdpv1 = &(old_acpi.rsdp);
 
-    multiboot2_iter(multiboot2_get_acpi_new_RSDP, &new_acpi, &reserved);
-    rsdpv2 = &(new_acpi.rsdp);
-
+    // 这里有bug：当multiboot2不存在rsdpv2的时候，会导致错误
+    // multiboot2_iter(multiboot2_get_acpi_new_RSDP, &new_acpi, &reserved);
+    // rsdpv2 = &(new_acpi.rsdp);
+    rsdpv2 = NULL;
     rs_acpi_init((uint64_t)rsdpv1);
 
     uint64_t paddr = 0;
     // An ACPI-compatible OS must use the XSDT if present
-    if (rsdpv2->XsdtAddress != 0x00UL)
+    if (rsdpv2 && rsdpv2->XsdtAddress != 0x00UL)
     {
         // 不要删除这段注释（因为还不确定是代码的bug，还是真机的bug）
         /*
@@ -180,7 +181,7 @@ void acpi_init()
 
         // 申请mmio空间
         uint64_t size = 0;
-        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
+        rs_mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
 
         // 映射rsdt表
         paddr = (uint64_t)rsdt_phys_base;
@@ -199,7 +200,7 @@ void acpi_init()
         printk_color(ORANGE, BLACK, "RSDT Entry num=%d\n", acpi_RSDT_Entry_num);
 
         // 申请mmio空间
-        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_description_header_base, &size);
+        rs_mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_description_header_base, &size);
 
         // 映射所有的Entry的物理地址
         acpi_RSDT_entry_phys_base = ((ul)(rsdt->Entry)) & PAGE_2M_MASK;
@@ -219,7 +220,7 @@ void acpi_init()
         kdebug("rsdpv1->RsdtAddress=%#018lx", rsdpv1->RsdtAddress);
         // 申请mmio空间
         uint64_t size = 0;
-        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
+        rs_mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_rsdt_virt_addr_base, &size);
         // acpi_rsdt_virt_addr_base = 0xffffb00000000000UL;
         kdebug("ACPI: mmio created. acpi_rsdt_virt_addr_base = %#018lx,size= %#010lx", acpi_rsdt_virt_addr_base, size);
 
@@ -242,7 +243,7 @@ void acpi_init()
         printk_color(ORANGE, BLACK, "RSDT Entry num=%d\n", acpi_RSDT_Entry_num);
 
         // 申请mmio空间
-        mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_description_header_base, &size);
+        rs_mmio_create(PAGE_2M_SIZE, VM_IO | VM_DONTCOPY, &acpi_description_header_base, &size);
 
         // 映射所有的Entry的物理地址
         acpi_RSDT_entry_phys_base = ((ul)(rsdt->Entry)) & PAGE_2M_MASK;

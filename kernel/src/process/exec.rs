@@ -197,6 +197,7 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
 /// 程序初始化信息，这些信息会被压入用户栈中
 #[derive(Debug)]
 pub struct ProcInitInfo {
+    pub proc_name: String,
     pub args: Vec<String>,
     pub envs: Vec<String>,
     pub auxv: BTreeMap<u8, usize>,
@@ -205,6 +206,7 @@ pub struct ProcInitInfo {
 impl ProcInitInfo {
     pub fn new() -> Self {
         Self {
+            proc_name: String::new(),
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
@@ -222,7 +224,7 @@ impl ProcInitInfo {
         ustack: &mut UserStack,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
         // 先把程序的名称压入栈中
-        self.push_str(ustack, self.args[0].as_str())?;
+        self.push_str(ustack, &self.proc_name)?;
 
         // 然后把环境变量压入栈中
         let envps = self

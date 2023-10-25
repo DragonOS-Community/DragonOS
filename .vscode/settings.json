@@ -160,7 +160,6 @@
         "wait.h": "c",
         "__libc__.h": "c",
         "ctype.h": "c",
-        "signal.h": "c",
         "mmio.h": "c",
         "stdint-gcc.h": "c",
         "acpi.h": "c",
@@ -180,6 +179,7 @@
     "rust-analyzer.cargo.target": "x86_64-unknown-none",
     "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.linkedProjects": [
-        "./kernel/Cargo.toml"
-    ]
+        "./kernel/Cargo.toml",
+        "./kernel/src/libs/ida/Cargo.toml"
+    ],
 }

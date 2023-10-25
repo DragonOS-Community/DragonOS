@@ -3,15 +3,17 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use crate::kdebug;
+
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::block::SeekFrom,
+    driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
-        syscall::{PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
     },
     include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
@@ -26,7 +28,7 @@ use crate::{
     },
 };
 
-use self::user_access::UserBufferWriter;
+use self::user_access::{UserBufferReader, UserBufferWriter};
 
 pub mod user_access;
 
@@ -297,6 +299,16 @@ pub enum SystemError {
     EOWNERDEAD = 129,
     /// 状态不可恢复 State not recoverable.
     ENOTRECOVERABLE = 130,
+    // VMX on 虚拟化开启指令出错
+    EVMXONFailed = 131,
+    // VMX off 虚拟化关闭指令出错
+    EVMXOFFFailed = 132,
+    // VMX VMWRITE 写入虚拟化VMCS内存出错
+    EVMWRITEFailed = 133,
+    EVMREADFailed = 134,
+    EVMPRTLDFailed = 135,
+    EVMLAUNCHFailed = 136,
+    KVM_HVA_ERR_BAD = 137,
 }
 
 impl SystemError {
@@ -316,65 +328,112 @@ impl SystemError {
 }
 
 // 定义系统调用号
-pub const SYS_PUT_STRING: usize = 1;
+pub const SYS_READ: usize = 0;
+pub const SYS_WRITE: usize = 1;
 pub const SYS_OPEN: usize = 2;
 pub const SYS_CLOSE: usize = 3;
-pub const SYS_READ: usize = 4;
-pub const SYS_WRITE: usize = 5;
-pub const SYS_LSEEK: usize = 6;
-pub const SYS_FORK: usize = 7;
-pub const SYS_VFORK: usize = 8;
-pub const SYS_BRK: usize = 9;
-pub const SYS_SBRK: usize = 10;
+#[allow(dead_code)]
+pub const SYS_STAT: usize = 4;
+pub const SYS_FSTAT: usize = 5;
 
-pub const SYS_REBOOT: usize = 11;
-pub const SYS_CHDIR: usize = 12;
-pub const SYS_GET_DENTS: usize = 13;
-pub const SYS_EXECVE: usize = 14;
-pub const SYS_WAIT4: usize = 15;
-pub const SYS_EXIT: usize = 16;
-pub const SYS_MKDIR: usize = 17;
-pub const SYS_NANOSLEEP: usize = 18;
+#[allow(dead_code)]
+pub const SYS_POLL: usize = 7;
+pub const SYS_LSEEK: usize = 8;
+pub const SYS_MMAP: usize = 9;
+pub const SYS_MPROTECT: usize = 10;
+pub const SYS_MUNMAP: usize = 11;
+pub const SYS_BRK: usize = 12;
+pub const SYS_SIGACTION: usize = 13;
+#[allow(dead_code)]
+pub const SYS_RT_SIGPROCMASK: usize = 14;
+
+pub const SYS_RT_SIGRETURN: usize = 15;
+pub const SYS_IOCTL: usize = 16;
+
+#[allow(dead_code)]
+pub const SYS_WRITEV: usize = 20;
+
+pub const SYS_DUP: usize = 32;
+pub const SYS_DUP2: usize = 33;
+
+pub const SYS_NANOSLEEP: usize = 35;
+
+pub const SYS_GETPID: usize = 39;
+
+pub const SYS_SOCKET: usize = 41;
+pub const SYS_CONNECT: usize = 42;
+pub const SYS_ACCEPT: usize = 43;
+pub const SYS_SENDTO: usize = 44;
+pub const SYS_RECVFROM: usize = 45;
+
+pub const SYS_RECVMSG: usize = 47;
+pub const SYS_SHUTDOWN: usize = 48;
+pub const SYS_BIND: usize = 49;
+pub const SYS_LISTEN: usize = 50;
+pub const SYS_GETSOCKNAME: usize = 51;
+pub const SYS_GETPEERNAME: usize = 52;
+
+pub const SYS_SETSOCKOPT: usize = 54;
+pub const SYS_GETSOCKOPT: usize = 55;
+
+#[allow(dead_code)]
+pub const SYS_CLONE: usize = 56;
+pub const SYS_FORK: usize = 57;
+pub const SYS_VFORK: usize = 58;
+pub const SYS_EXECVE: usize = 59;
+pub const SYS_EXIT: usize = 60;
+pub const SYS_WAIT4: usize = 61;
+pub const SYS_KILL: usize = 62;
+
+pub const SYS_FCNTL: usize = 72;
+
+pub const SYS_FTRUNCATE: usize = 77;
+pub const SYS_GET_DENTS: usize = 78;
+
+pub const SYS_GETCWD: usize = 79;
+
+pub const SYS_CHDIR: usize = 80;
+
+pub const SYS_MKDIR: usize = 83;
+
+pub const SYS_GETTIMEOFDAY: usize = 96;
+
+#[allow(dead_code)]
+pub const SYS_SIGALTSTACK: usize = 131;
+
+#[allow(dead_code)]
+pub const SYS_ARCH_PRCTL: usize = 158;
+
+pub const SYS_REBOOT: usize = 169;
+
+pub const SYS_GETPPID: usize = 110;
+pub const SYS_GETPGID: usize = 121;
+
+pub const SYS_MKNOD: usize = 133;
+
+#[allow(dead_code)]
+pub const SYS_TKILL: usize = 200;
+
+#[allow(dead_code)]
+pub const SYS_FUTEX: usize = 202;
+
+pub const SYS_GET_DENTS_64: usize = 217;
+#[allow(dead_code)]
+pub const SYS_SET_TID_ADDR: usize = 218;
+
+pub const SYS_UNLINK_AT: usize = 263;
+
+pub const SYS_PIPE: usize = 293;
+
+#[allow(dead_code)]
+pub const SYS_GET_RANDOM: usize = 318;
+
+// 与linux不一致的调用，在linux基础上累加
+pub const SYS_PUT_STRING: usize = 100000;
+pub const SYS_SBRK: usize = 100001;
 /// todo: 该系统调用与Linux不一致，将来需要删除该系统调用！！！ 删的时候记得改C版本的libc
-pub const SYS_CLOCK: usize = 19;
-pub const SYS_PIPE: usize = 20;
-/// 系统调用21曾经是SYS_MSTAT，但是现在已经废弃
-pub const __NOT_USED: usize = 21;
-pub const SYS_UNLINK_AT: usize = 22;
-pub const SYS_KILL: usize = 23;
-pub const SYS_SIGACTION: usize = 24;
-pub const SYS_RT_SIGRETURN: usize = 25;
-pub const SYS_GETPID: usize = 26;
-pub const SYS_SCHED: usize = 27;
-pub const SYS_DUP: usize = 28;
-pub const SYS_DUP2: usize = 29;
-pub const SYS_SOCKET: usize = 30;
-
-pub const SYS_SETSOCKOPT: usize = 31;
-pub const SYS_GETSOCKOPT: usize = 32;
-pub const SYS_CONNECT: usize = 33;
-pub const SYS_BIND: usize = 34;
-pub const SYS_SENDTO: usize = 35;
-pub const SYS_RECVFROM: usize = 36;
-pub const SYS_RECVMSG: usize = 37;
-pub const SYS_LISTEN: usize = 38;
-pub const SYS_SHUTDOWN: usize = 39;
-pub const SYS_ACCEPT: usize = 40;
-
-pub const SYS_GETSOCKNAME: usize = 41;
-pub const SYS_GETPEERNAME: usize = 42;
-pub const SYS_GETTIMEOFDAY: usize = 43;
-pub const SYS_MMAP: usize = 44;
-pub const SYS_MUNMAP: usize = 45;
-
-pub const SYS_MPROTECT: usize = 46;
-pub const SYS_FSTAT: usize = 47;
-pub const SYS_GETCWD: usize = 48;
-pub const SYS_GETPPID: usize = 49;
-pub const SYS_GETPGID: usize = 50;
-
-pub const SYS_FCNTL: usize = 51;
-pub const SYS_FTRUNCATE: usize = 52;
+pub const SYS_CLOCK: usize = 100002;
+pub const SYS_SCHED: usize = 100003;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -405,7 +464,11 @@ impl Syscall {
     ///
     /// 这个函数内，需要根据系统调用号，调用对应的系统调用处理函数。
     /// 并且，对于用户态传入的指针参数，需要在本函数内进行越界检查，防止访问到内核空间。
-    pub fn handle(syscall_num: usize, args: &[usize], frame: &mut TrapFrame) -> usize {
+    pub fn handle(
+        syscall_num: usize,
+        args: &[usize],
+        frame: &mut TrapFrame,
+    ) -> Result<usize, SystemError> {
         let r = match syscall_num {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
@@ -417,9 +480,9 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 } else {
                     let path: &str = path.unwrap();
+
                     let flags = args[1];
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-
                     Self::open(path, open_flags)
                 };
 
@@ -427,46 +490,33 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                Self::close(fd)
+
+                let res = Self::close(fd);
+
+                res
             }
             SYS_READ => {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.from_user() && verify_area(virt_addr, len as usize).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else {
-                    let buf: &mut [u8] = unsafe {
-                        core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
-                    };
+                let from_user = frame.from_user();
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
-                    Self::read(fd, buf)
-                };
-                // kdebug!("sys read, fd: {}, len: {}, res: {:?}", fd, len, res);
+                let user_buf = user_buffer_writer.buffer(0)?;
+                let res = Self::read(fd, user_buf);
                 res
             }
             SYS_WRITE => {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let virt_addr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.from_user() && verify_area(virt_addr, len as usize).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else {
-                    let buf: &[u8] = unsafe {
-                        core::slice::from_raw_parts::<'static, u8>(buf_vaddr as *const u8, len)
-                    };
+                let from_user = frame.from_user();
+                let user_buffer_reader =
+                    UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
 
-                    Self::write(fd, buf)
-                };
-
-                // kdebug!("sys write, fd: {}, len: {}, res: {:?}", fd, len, res);
-
+                let user_buf = user_buffer_reader.read_from_user(0)?;
+                let res = Self::write(fd, user_buf);
                 res
             }
 
@@ -481,17 +531,16 @@ impl Syscall {
                     SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
                     SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
                     _ => Err(SystemError::EINVAL),
-                };
+                }?;
 
-                let res = if w.is_err() {
-                    Err(w.unwrap_err())
-                } else {
-                    let w = w.unwrap();
-                    Self::lseek(fd, w)
-                };
-                // kdebug!("sys lseek, fd: {}, offset: {}, whence: {}, res: {:?}", fd, offset, whence, res);
-
-                res
+                Self::lseek(fd, w)
+            }
+            SYS_IOCTL => {
+                kdebug!("SYS_IOCTL");
+                let fd = args[0];
+                let cmd = args[1];
+                let data = args[2];
+                Self::ioctl(fd, cmd as u32, data)
             }
 
             SYS_FORK => Self::fork(frame),
@@ -535,16 +584,13 @@ impl Syscall {
                     return Ok(dest_path);
                 };
 
-                let r: Result<&str, SystemError> = chdir_check(args[0]);
-                if r.is_err() {
-                    Err(r.unwrap_err())
-                } else {
-                    Self::chdir(r.unwrap())
-                }
+                let r = chdir_check(args[0])?;
+                Self::chdir(r)
             }
 
-            SYS_GET_DENTS => {
+            SYS_GET_DENTS | SYS_GET_DENTS_64 => {
                 let fd = args[0] as i32;
+
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
@@ -689,7 +735,7 @@ impl Syscall {
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
-
+                // kdebug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
             }
 
@@ -969,10 +1015,16 @@ impl Syscall {
                 res
             }
 
+            SYS_MKNOD => {
+                let path = args[0];
+                let flags = args[1];
+                let dev_t = args[2];
+                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
+                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
-
-        let r = r.unwrap_or_else(|e| e.to_posix_errno() as usize);
         return r;
     }
 

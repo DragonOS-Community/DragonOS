@@ -5,14 +5,13 @@
 
 #pragma once
 
-//引入对bool类型的支持
+// 引入对bool类型的支持
 #include <stdbool.h>
 #include <DragonOS/stdint.h>
 #include <common/stddef.h>
 #include <arch/arch.h>
 #include <common/compiler.h>
 #include <common/list.h>
-
 
 #include <asm/asm.h>
 
@@ -63,7 +62,6 @@ static __always_inline ul ALIGN(const ul addr, const ul _align)
 {
     return (ul)((addr + _align - 1) & (~(_align - 1)));
 }
-
 
 void *memset(void *dst, unsigned char C, ul size)
 {
@@ -189,7 +187,6 @@ void io_out32(unsigned short port, unsigned int value)
     __asm__ __volatile__("cld;rep;outsw;mfence;" ::"d"(port), "S"(buffer), "c"(nr) \
                          : "memory")
 
-
 /**
  * @brief 验证地址空间是否为用户地址空间
  *
@@ -245,7 +242,6 @@ static inline uint64_t copy_from_user(void *dst, void *src, uint64_t size)
  */
 static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
 {
-    uint64_t tmp0, tmp1;
     if (verify_area((uint64_t)src, size))
         return 0;
 
@@ -262,8 +258,8 @@ static inline uint64_t copy_to_user(void *dst, void *src, uint64_t size)
     //              : "=&c"(size), "=&D"(tmp0), "=&S"(tmp1)
     //              : "r"(size & 7), "0"(size >> 3), "1"(dst), "2"(src)
     //              : "memory");
-    memcpy(dst,src,size);
-    
+    memcpy(dst, src, size);
+
     return size;
 }
 
@@ -285,7 +281,6 @@ static __always_inline void __write8b(uint64_t vaddr, uint64_t value)
 {
     asm volatile("movq %%rdx, 0(%%rax)" ::"a"(vaddr), "d"(value)
                  : "memory");
-
 }
 
 /**
@@ -299,7 +294,6 @@ static __always_inline void __write4b(uint64_t vaddr, uint32_t value)
 {
     asm volatile("movl %%edx, 0(%%rax)" ::"a"(vaddr), "d"(value)
                  : "memory");
-
 }
 
 /**
@@ -338,7 +332,7 @@ static __always_inline uint32_t __read4b(uint64_t vaddr)
 
 /**
  * @brief 将数据从src搬运到dst，并能正确处理地址重叠的问题
- * 
+ *
  * @param dst 目标地址指针
  * @param src 源地址指针
  * @param size 大小

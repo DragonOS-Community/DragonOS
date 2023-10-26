@@ -404,14 +404,6 @@ impl Futex {
                 }),
             });
         }
-        return Ok(return Ok(FutexKey {
-            ptr: 0,
-            word: 0,
-            offset: offset as u32,
-            key: InnerFutexKey::Private(PrivateKey {
-                address: address as u64,
-            }),
-        }));
         // 未实现共享内存机制
         todo!("Shared memory not implemented");
     }

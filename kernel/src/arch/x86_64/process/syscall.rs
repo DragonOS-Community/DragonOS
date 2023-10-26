@@ -1,4 +1,5 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
+use x86::{segmentation::SegmentSelector, Ring};
 
 use crate::{
     arch::{
@@ -10,9 +11,9 @@ use crate::{
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
-        ProcessManager,
+        ProcessControlBlock, ProcessManager,
     },
-    syscall::{Syscall, SystemError},
+    syscall::{user_access::UserBufferWriter, Syscall, SystemError},
 };
 
 impl Syscall {
@@ -114,4 +115,69 @@ impl Syscall {
 
         return Ok(());
     }
+
+    pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        if let Err(SystemError::EINVAL) = Self::do_arch_prctl_64(&pcb, option, arg2, true) {
+            Self::do_arch_prctl_common(option, arg2)?;
+        }
+        Ok(0)
+    }
+
+    pub fn do_arch_prctl_64(
+        pcb: &Arc<ProcessControlBlock>,
+        option: usize,
+        arg2: usize,
+        from_user: bool,
+    ) -> Result<usize, SystemError> {
+        let mut arch_info = pcb.arch_info();
+        match option {
+            ARCH_GET_FS => {
+                unsafe { arch_info.save_fsbase() };
+                let mut writer = UserBufferWriter::new(
+                    arg2 as *mut usize,
+                    core::mem::size_of::<usize>(),
+                    from_user,
+                )?;
+                writer.copy_one_to_user(&arch_info.fsbase, 0)?;
+            }
+            ARCH_GET_GS => {
+                unsafe { arch_info.save_gsbase() };
+                let mut writer = UserBufferWriter::new(
+                    arg2 as *mut usize,
+                    core::mem::size_of::<usize>(),
+                    from_user,
+                )?;
+                writer.copy_one_to_user(&arch_info.gsbase, 0)?;
+            }
+            ARCH_SET_FS => {
+                arch_info.fsbase = arg2;
+                // 关中断
+                let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                unsafe { arch_info.restore_fsbase() }
+                drop(guard);
+            }
+            ARCH_SET_GS => {
+                arch_info.gsbase = arg2;
+                // 关中断
+                let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                unsafe { arch_info.restore_gsbase() }
+                drop(guard);
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Ok(0)
+    }
+
+    #[allow(dead_code)]
+    pub fn do_arch_prctl_common(option: usize, arg2: usize) -> Result<usize, SystemError> {
+        todo!();
+    }
 }
+
+pub const ARCH_SET_GS: usize = 0x1001;
+pub const ARCH_SET_FS: usize = 0x1002;
+pub const ARCH_GET_FS: usize = 0x1003;
+pub const ARCH_GET_GS: usize = 0x1004;

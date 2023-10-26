@@ -149,6 +149,11 @@ impl DevFS {
                 dev_block_inode.add_dev(name, device.clone())?;
                 device.set_fs(dev_block_inode.0.lock().fs.clone());
             }
+            FileType::KvmDevice => {
+                dev_root_inode
+                    .add_dev(name, device.clone())
+                    .expect("DevFS: Failed to register /dev/kvm");
+            }
             _ => {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }

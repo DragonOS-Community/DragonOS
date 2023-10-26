@@ -946,6 +946,8 @@ pub struct VMA {
     /// VMA所属的用户地址空间
     user_address_space: Option<Weak<AddressSpace>>,
     self_ref: Weak<LockedVMA>,
+
+    provider: Provider,
 }
 
 impl core::hash::Hash for VMA {
@@ -954,6 +956,17 @@ impl core::hash::Hash for VMA {
         self.flags.hash(state);
         self.mapped.hash(state);
     }
+}
+
+#[derive(Debug)]
+pub enum Provider {
+    Allocated { cow_file_ref: Option<GrantFileRef> }, // TODO:其他
+}
+
+#[derive(Debug)]
+pub struct GrantFileRef {
+    pub description: i32,
+    pub base_offset: usize,
 }
 
 #[allow(dead_code)]
@@ -974,6 +987,7 @@ impl VMA {
             mapped: self.mapped,
             user_address_space: self.user_address_space.clone(),
             self_ref: self.self_ref.clone(),
+            provider: Provider::Allocated { cow_file_ref: None },
         };
     }
 
@@ -1019,8 +1033,13 @@ impl VMA {
     ///
     /// - `prot_flags` 要检查的标志位
     pub fn can_have_flags(&self, prot_flags: ProtFlags) -> bool {
-        return (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
+        let is_downgrade = (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
             && (self.flags.has_execute() || !prot_flags.contains(ProtFlags::PROT_EXEC));
+
+        match self.provider {
+            Provider::Allocated { .. } => true,
+            _ => is_downgrade,
+        }
     }
 
     /// 把物理地址映射到虚拟地址
@@ -1070,6 +1089,7 @@ impl VMA {
             mapped: true,
             user_address_space: None,
             self_ref: Weak::default(),
+            provider: Provider::Allocated { cow_file_ref: None },
         });
         return Ok(r);
     }
@@ -1118,6 +1138,7 @@ impl VMA {
             mapped: true,
             user_address_space: None,
             self_ref: Weak::default(),
+            provider: Provider::Allocated { cow_file_ref: None },
         });
         drop(flusher);
         // kdebug!("VMA::zeroed: flusher dropped");

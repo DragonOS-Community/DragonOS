@@ -337,7 +337,7 @@ impl TypeOneFSMState {
             }
             _ => {
                 if flag_make == false {
-                    //kdebug!("in type3 ch is {:#x}\n",ch);
+                    // kdebug!("in type3 ch is {:#x}\n",ch);
                     key = KeyFlag::NoneFlag;
                 }
             }
@@ -359,8 +359,8 @@ impl TypeOneFSMState {
         }
 
         let ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
-
         if key != KeyFlag::NoneFlag {
+            // kdebug!("EMIT: ch is '{}', keyflag is {:?}\n", ch as char, key);
             Self::emit(tty, ch);
         }
         return TypeOneFSMState::Start;

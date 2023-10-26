@@ -7,6 +7,8 @@ use crate::{
     mm::PhysAddr,
 };
 
+pub mod io;
+
 /// TraitPciArch Pci架构相关函数，任何架构都应独立实现trait里的函数
 pub trait TraitPciArch {
     /// @brief 读取寄存器值，x86_64架构通过读取两个特定io端口实现

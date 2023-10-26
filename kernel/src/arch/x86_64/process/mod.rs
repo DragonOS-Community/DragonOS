@@ -8,25 +8,28 @@ use core::{
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use memoffset::offset_of;
-use x86::{controlregs::Cr4, segmentation::SegmentSelector};
+use x86::{controlregs::Cr4, segmentation::SegmentSelector, Ring};
 
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
+    kwarn,
     libs::spinlock::SpinLockGuard,
     mm::{
         percpu::{PerCpu, PerCpuVar},
         VirtAddr,
     },
     process::{
-        fork::CloneFlags, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
-        SwitchResult, SWITCH_RESULT,
+        fork::{CloneFlags, KernelCloneArgs},
+        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, SwitchResult,
+        SWITCH_RESULT,
     },
     syscall::{Syscall, SystemError},
 };
 
 use self::{
     kthread::kernel_thread_bootstrap_stage1,
+    syscall::ARCH_SET_FS,
     table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
 };
 
@@ -36,6 +39,9 @@ mod c_adapter;
 pub mod kthread;
 pub mod syscall;
 pub mod table;
+
+pub const IA32_FS_BASE: u32 = 0xC000_0100;
+pub const IA32_GS_BASE: u32 = 0xC000_0101;
 
 extern "C" {
     /// 从中断返回
@@ -71,8 +77,8 @@ pub struct ArchPCBInfo {
     cr2: usize,
     fsbase: usize,
     gsbase: usize,
-    fs: u16,
-    gs: u16,
+    fs: SegmentSelector,
+    gs: SegmentSelector,
 
     /// 浮点寄存器的状态
     fp_state: Option<FpState>,
@@ -103,8 +109,8 @@ impl ArchPCBInfo {
             cr2: 0,
             fsbase: 0,
             gsbase: 0,
-            fs: KERNEL_DS.bits(),
-            gs: KERNEL_DS.bits(),
+            fs: KERNEL_DS,
+            gs: KERNEL_DS,
             fp_state: None,
         };
 
@@ -156,11 +162,25 @@ impl ArchPCBInfo {
         self.fp_state.as_mut().unwrap().restore();
     }
 
+    /// 返回浮点寄存器结构体的副本
+    pub fn fp_state(&self) -> &Option<FpState> {
+        &self.fp_state
+    }
+
+    // 清空浮点寄存器
+    pub fn clear_fp_state(&mut self) {
+        if unlikely(self.fp_state.is_none()) {
+            kwarn!("fp_state is none");
+            return;
+        }
+
+        self.fp_state.as_mut().unwrap().clear();
+    }
     pub unsafe fn save_fsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.fsbase = x86::current::segmentation::rdfsbase() as usize;
         } else {
-            self.fsbase = 0;
+            self.fsbase = x86::msr::rdmsr(IA32_FS_BASE) as usize;
         }
     }
 
@@ -168,19 +188,23 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.gsbase = x86::current::segmentation::rdgsbase() as usize;
         } else {
-            self.gsbase = 0;
+            x86::msr::wrmsr(IA32_GS_BASE, self.gsbase as u64);
         }
     }
 
     pub unsafe fn restore_fsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrfsbase(self.fsbase as u64);
+        } else {
+            x86::msr::wrmsr(IA32_FS_BASE, self.fsbase as u64);
         }
     }
 
     pub unsafe fn restore_gsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrgsbase(self.gsbase as u64);
+        } else {
+            self.gsbase = x86::msr::rdmsr(IA32_GS_BASE) as usize;
         }
     }
 
@@ -190,6 +214,14 @@ impl ArchPCBInfo {
 
     pub fn gsbase(&self) -> usize {
         self.gsbase
+    }
+
+    pub fn cr2_mut(&mut self) -> &mut usize {
+        &mut self.cr2
+    }
+
+    pub fn fp_state_mut(&mut self) -> &mut Option<FpState> {
+        &mut self.fp_state
     }
 }
 
@@ -232,12 +264,12 @@ impl ProcessManager {
     ///
     /// 由于这个过程与具体的架构相关，所以放在这里
     pub fn copy_thread(
-        _clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
-        usp: Option<usize>,
+        clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
+        let clone_flags = clone_args.flags;
         let mut child_trapframe = current_trapframe.clone();
 
         // 子进程的返回值为0
@@ -256,9 +288,10 @@ impl ProcessManager {
 
         // 拷贝栈帧
         unsafe {
-            if usp.is_some() {
-                child_trapframe.rbp = usp.unwrap() as u64 + 11*core::mem::size_of::<usize>() as u64;
-                child_trapframe.rsp = usp.unwrap() as u64;
+            let usp = clone_args.stack;
+            if !usp.is_null() {
+                child_trapframe.rbp = usp.data() as u64 + 11 * core::mem::size_of::<usize>() as u64;
+                child_trapframe.rsp = usp.data() as u64;
             }
             let trap_frame_ptr = trap_frame_vaddr.data() as *mut TrapFrame;
             *trap_frame_ptr = child_trapframe;
@@ -276,6 +309,11 @@ impl ProcessManager {
             new_arch_guard.fp_state = Some(*fp_state);
         }
         drop(current_arch_guard);
+
+        // 设置tls
+        if clone_flags.contains(CloneFlags::CLONE_SETTLS) {
+            Syscall::do_arch_prctl_64(new_pcb, ARCH_SET_FS, clone_args.tls, true)?;
+        }
 
         // 设置返回地址（子进程开始执行的指令地址）
 
@@ -460,12 +498,12 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
     let mut arch_guard = current_pcb.arch_info_irqsave();
     arch_guard.rsp = trap_frame_vaddr.data();
 
-    arch_guard.fs = USER_DS.bits();
-    arch_guard.gs = USER_DS.bits();
+    arch_guard.fs = USER_DS;
+    arch_guard.gs = USER_DS;
 
     switch_fs_and_gs(
-        SegmentSelector::from_bits_truncate(arch_guard.fs),
-        SegmentSelector::from_bits_truncate(arch_guard.gs),
+        SegmentSelector::from_bits_truncate(arch_guard.fs.bits()),
+        SegmentSelector::from_bits_truncate(arch_guard.gs.bits()),
     );
     arch_guard.rip = new_rip.data();
 

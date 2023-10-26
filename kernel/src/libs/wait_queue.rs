@@ -201,16 +201,25 @@ impl WaitQueue {
         let mut to_push_back: Vec<Arc<ProcessControlBlock>> = Vec::new();
         // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
         while let Some(to_wakeup) = guard.wait_list.pop_front() {
+            let mut wake = false;
             if let Some(state) = state {
                 if to_wakeup.sched_info().state() == state {
-                    ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
-                        kerror!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
-                    });
-                    continue;
+                    wake = true;
                 }
+            } else {
+                wake = true;
             }
-            to_push_back.push(to_wakeup);
+
+            if wake {
+                ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
+                    kerror!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
+                });
+                continue;
+            } else {
+                to_push_back.push(to_wakeup);
+            }
         }
+
         for to_wakeup in to_push_back {
             guard.wait_list.push_back(to_wakeup);
         }

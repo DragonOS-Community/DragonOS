@@ -1,26 +1,16 @@
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    driver::{
-        base::{
-            device::{
-                sys_dev_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER,
-                DEV_KSET_INSTANCE,
-            },
-            kobject::KObject,
-            kset::KSet,
+    driver::base::{
+        device::{
+            sys_dev_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
         },
-        uart::uart_device::uart_init,
+        kobject::KObject,
+        kset::KSet,
     },
     kdebug, kinfo,
     syscall::SystemError,
 };
-
-pub fn device_init() -> Result<(), SystemError> {
-    uart_init()?;
-    kinfo!("device init success");
-    return Ok(());
-}
 
 pub fn devices_init() -> Result<(), SystemError> {
     // 创建 `/sys/devices` 目录
@@ -73,6 +63,6 @@ pub fn devices_init() -> Result<(), SystemError> {
     }
 
     kinfo!("devices init success");
-    device_init()?;
+
     return Ok(());
 }

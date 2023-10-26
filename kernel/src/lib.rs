@@ -5,6 +5,7 @@
 #![feature(asm_const)]
 #![feature(const_mut_refs)]
 #![feature(const_trait_impl)]
+#![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(drain_filter)]
@@ -15,6 +16,9 @@
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
+#![feature(new_uninit)]
+#![feature(ptr_to_from_bits)]
+#![feature(concat_idents)]
 #![cfg_attr(target_os = "none", no_std)]
 
 #[cfg(test)]
@@ -46,6 +50,7 @@ mod sched;
 mod smp;
 mod syscall;
 mod time;
+mod virt;
 
 #[macro_use]
 extern crate alloc;

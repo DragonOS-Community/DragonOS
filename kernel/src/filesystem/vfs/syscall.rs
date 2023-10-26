@@ -23,8 +23,9 @@ use super::{
     fcntl::{FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE,
+    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -150,13 +151,13 @@ impl Syscall {
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
-
         // 文件名过长
         if path.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         let inode: Arc<dyn IndexNode> = if inode.is_err() {
             let errno = inode.unwrap_err();
@@ -206,7 +207,6 @@ impl Syscall {
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
         }
-
         // 把文件对象存入pcb
         let r = ProcessManager::current_pcb()
             .fd_table()
@@ -229,6 +229,27 @@ impl Syscall {
         let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
 
         return res;
+    }
+
+    /// @brief 发送命令到文件描述符对应的设备，
+    ///
+    /// @param fd 文件描述符编号
+    /// @param cmd 设备相关的请求类型
+    ///
+    /// @return Ok(usize) 成功返回0
+    /// @return Err(SystemError) 读取失败，返回posix错误码
+    pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard
+            .get_file_by_fd(fd as i32)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let r = file.lock_no_preempt().inode().ioctl(cmd, data);
+        return r;
     }
 
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
@@ -344,13 +365,14 @@ impl Syscall {
                 new_path = String::from("/");
             }
         }
-        let inode = match ROOT_INODE().lookup(&new_path) {
-            Err(e) => {
-                kerror!("Change Directory Failed, Error = {:?}", e);
-                return Err(SystemError::ENOENT);
-            }
-            Ok(i) => i,
-        };
+        let inode =
+            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+                Err(e) => {
+                    kerror!("Change Directory Failed, Error = {:?}", e);
+                    return Err(SystemError::ENOENT);
+                }
+                Ok(i) => i,
+            };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(String::from(new_path));
@@ -395,6 +417,7 @@ impl Syscall {
             unsafe { (buf.as_mut_ptr() as *mut Dirent).as_mut() }.ok_or(SystemError::EFAULT)?;
 
         if fd < 0 || fd as u32 > PROC_MAX_FD_NUM {
+            crate::kdebug!("getdents ebadf fd: {fd}");
             return Err(SystemError::EBADF);
         }
 
@@ -691,6 +714,50 @@ impl Syscall {
         kstat.rdev = metadata.raw_dev as i64;
         kstat.mode = metadata.mode;
         match file.lock().file_type() {
+            FileType::File => kstat.mode.insert(ModeType::S_IFREG),
+            FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
+            FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
+            FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
+            FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
+            FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
+            FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
+            FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
+        }
+
+        return Ok(kstat);
+    }
+
+    fn do_stat(path: &str) -> Result<PosixKstat, SystemError> {
+        // 文件名过长
+        if path.len() > MAX_PATHLEN as usize {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let inode = ROOT_INODE().lookup(path)?;
+
+        let mut kstat = PosixKstat::new();
+        // 获取文件信息
+        let metadata = inode.metadata()?;
+        kstat.size = metadata.size as i64;
+        kstat.dev_id = metadata.dev_id as u64;
+        kstat.inode = metadata.inode_id.into() as u64;
+        kstat.blcok_size = metadata.blk_size as i64;
+        kstat.blocks = metadata.blocks as u64;
+
+        kstat.atime.tv_sec = metadata.atime.tv_sec;
+        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
+        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
+        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
+        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
+        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
+
+        kstat.nlink = metadata.nlinks as u64;
+        kstat.uid = metadata.uid as i32;
+        kstat.gid = metadata.gid as i32;
+        kstat.rdev = metadata.raw_dev as i64;
+        kstat.mode = metadata.mode;
+
+        match metadata.file_type {
             FileType::File => kstat.mode.insert(ModeType::S_IFMT),
             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
             FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
@@ -714,6 +781,17 @@ impl Syscall {
         return Ok(0);
     }
 
+    pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let kstat = Self::do_stat(path)?;
+        if user_kstat.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+        unsafe {
+            *user_kstat = kstat;
+        }
+        return Ok(0);
+    }
+
     pub fn mknod(
         path_ptr: *const i8,
         mode: ModeType,
@@ -730,7 +808,8 @@ impl Syscall {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> =
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
@@ -739,11 +818,34 @@ impl Syscall {
         let (filename, parent_path) = rsplit_path(path);
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
+            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         // 创建nod
         parent_inode.mknod(filename, mode, dev_t)?;
 
         return Ok(0);
+    }
+
+    pub fn writev(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
+        // IoVecs会进行用户态检验
+        let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, false) }?;
+
+        let data = iovecs.gather();
+
+        Self::write(fd, &data)
+    }
+
+    pub fn ioctl(fd: i32, request: u32, data: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let file = binding
+            .read()
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADFD)?;
+
+        let inode = file.lock().inode();
+        inode.ioctl(request, data)?;
+
+        Ok(0)
     }
 }
 #[repr(C)]

@@ -1,8 +1,9 @@
-use alloc::{string::ToString, sync::Arc};
+use alloc::{boxed::Box, string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid, libs::rwlock::RwLock,
-    process::ProcessFlags, syscall::SystemError,
+    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid,
+    ipc::signal::flush_signal_handlers, libs::rwlock::RwLock, process::ProcessFlags,
+    syscall::SystemError,
 };
 
 use super::{
@@ -68,6 +69,58 @@ bitflags! {
     }
 }
 
+/// 仅仅作为参数传递
+pub struct KernelCloneArgs {
+    pub flags: CloneFlags,
+
+    // 下列属性均来自用户空间
+    pub pidfd: VirtAddr,
+    pub child_tid: VirtAddr,
+    pub parent_tid: VirtAddr,
+    pub set_tid: VirtAddr,
+
+    pub exit_signal: i32,
+
+    pub stack: VirtAddr,
+    // clone3用到
+    pub stack_size: usize,
+    pub tls: usize,
+
+    pub set_tid_size: usize,
+    pub cgroup: i32,
+
+    pub io_thread: bool,
+    pub kthread: bool,
+    pub idle: bool,
+    pub func: Option<Box<dyn Fn(VirtAddr)>>,
+    pub fn_arg: VirtAddr,
+    // cgrp 和 cset?
+}
+
+impl KernelCloneArgs {
+    pub fn new() -> Self {
+        let null_addr = VirtAddr::new(0);
+        Self {
+            flags: unsafe { CloneFlags::from_bits_unchecked(0) },
+            pidfd: null_addr,
+            child_tid: null_addr,
+            parent_tid: null_addr,
+            set_tid: null_addr,
+            exit_signal: 0,
+            stack: null_addr,
+            stack_size: 0,
+            tls: 0,
+            set_tid_size: 0,
+            cgroup: 0,
+            io_thread: false,
+            kthread: false,
+            idle: false,
+            func: None,
+            fn_arg: null_addr,
+        }
+    }
+}
+
 impl ProcessManager {
     /// 创建一个新进程
     ///
@@ -93,7 +146,9 @@ impl ProcessManager {
         let name = current_pcb.basic().name().to_string();
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
-        Self::copy_process(&clone_flags, &current_pcb, &pcb, None, current_trapframe)?;
+        let mut args = KernelCloneArgs::new();
+        args.flags = clone_flags;
+        Self::copy_process(&current_pcb, &pcb, args, current_trapframe)?;
 
         ProcessManager::add_pcb(pcb.clone());
 
@@ -192,11 +247,18 @@ impl ProcessManager {
 
     #[allow(dead_code)]
     fn copy_sighand(
-        _clone_flags: &CloneFlags,
-        _current_pcb: &Arc<ProcessControlBlock>,
-        _new_pcb: &Arc<ProcessControlBlock>,
+        clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // todo: 由于信号原来写的太烂，移植到新的进程管理的话，需要改动很多。因此决定重写。这里先空着
+        // // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
+        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            flush_signal_handlers(new_pcb.clone(), false);
+        }
+
+        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
+            (*new_pcb.sig_struct()).handlers = current_pcb.sig_struct().handlers.clone();
+        }
         return Ok(());
     }
 
@@ -215,15 +277,15 @@ impl ProcessManager {
     /// ## return
     /// - 发生错误时返回Err(SystemError)
     pub fn copy_process(
-        clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         pcb: &Arc<ProcessControlBlock>,
-        usp: Option<usize>,
+        clone_args: KernelCloneArgs,
         current_trapframe: &mut TrapFrame,
     ) -> Result<(), SystemError> {
+        let clone_flags = clone_args.flags;
         // 不允许与不同命名空间的进程共享根目录
-        if (*clone_flags == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
-            || *clone_flags == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
+        if (clone_flags == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
+            || clone_flags == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
         {
             return Err(SystemError::EINVAL);
         }
@@ -277,6 +339,14 @@ impl ProcessManager {
                 Some(WorkerPrivate::KernelThread(KernelThreadPcbPrivate::new()));
         }
 
+        if clone_flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+            pcb.thread.write().clear_child_tid = clone_args.child_tid;
+        }
+
+        if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+            pcb.thread.write().set_child_tid = clone_args.child_tid;
+        }
+
         // 拷贝标志位
         Self::copy_flags(&clone_flags, &pcb).unwrap_or_else(|e| {
             panic!(
@@ -304,7 +374,7 @@ impl ProcessManager {
         // todo: 拷贝信号相关数据
 
         // 拷贝线程
-        Self::copy_thread(&clone_flags, &current_pcb, &pcb, usp ,&current_trapframe).unwrap_or_else(|e| {
+        Self::copy_thread(&current_pcb, &pcb, clone_args,&current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e

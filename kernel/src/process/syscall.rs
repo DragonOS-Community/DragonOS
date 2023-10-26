@@ -5,11 +5,16 @@ use alloc::{
     vec::Vec,
 };
 
-use super::{abi::WaitOption, fork::CloneFlags, KernelStack, Pid, ProcessManager, ProcessState};
+use super::{
+    abi::WaitOption,
+    fork::{CloneFlags, KernelCloneArgs},
+    KernelStack, Pid, ProcessManager, ProcessState,
+};
 use crate::{
     arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     filesystem::{procfs::procfs_register_pid, vfs::MAX_PATHLEN},
+    include::bindings::bindings::verify_area,
     mm::VirtAddr,
     process::ProcessControlBlock,
     syscall::{
@@ -115,7 +120,7 @@ impl Syscall {
                             return Ok(0);
                         }
                     }
-                    ProcessState::Blocked(_) => {
+                    ProcessState::Blocked(_) | ProcessState::Stopped => {
                         // 指定WUNTRACED则等待暂停的进程，不指定则返回0
                         if !options.contains(WaitOption::WUNTRACED)
                             || options.contains(WaitOption::WNOWAIT)
@@ -213,6 +218,13 @@ impl Syscall {
         child_tid: usize,
         tls: usize,
     ) -> Result<usize, SystemError> {
+        let mut clone_args = KernelCloneArgs::new();
+        clone_args.flags = flags;
+        clone_args.stack = VirtAddr::new(child_stack);
+        clone_args.parent_tid = VirtAddr::new(parent_tid);
+        clone_args.child_tid = VirtAddr::new(child_tid);
+        clone_args.tls = tls;
+
         if flags.contains(CloneFlags::CLONE_PIDFD)
             && flags.contains(CloneFlags::CLONE_PARENT_SETTID)
         {
@@ -233,15 +245,9 @@ impl Syscall {
         }
 
         // 克隆pcb
-        ProcessManager::copy_process(
-            &flags,
-            &current_pcb,
-            &pcb,
-            Some(child_stack),
-            current_trapframe,
-        )?;
+        ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;
 
-        let address_scope = pcb.basic_mut().user_vm().expect("No user_vm found");
+        // let address_scope = pcb.basic_mut().user_vm().expect("No user_vm found");
 
         // // 为进程建立新用户栈
         // address_scope.new_user_stack(
@@ -288,5 +294,16 @@ impl Syscall {
         }
 
         return Ok(pcb.pid().0);
+    }
+
+    /// 设置线程地址
+    pub fn set_tid_address(ptr: usize) -> Result<usize, SystemError> {
+        if !unsafe { verify_area(ptr as u64, core::mem::size_of::<i32>() as u64) } {
+            return Err(SystemError::EFAULT);
+        }
+
+        let pcb = ProcessManager::current_pcb();
+        pcb.thread.write().clear_child_tid = VirtAddr::new(ptr);
+        Ok(pcb.pid.0)
     }
 }

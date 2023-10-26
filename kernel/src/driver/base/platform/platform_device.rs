@@ -197,6 +197,9 @@ pub struct InnerPlatformBusDevice {
     bus: Option<Arc<dyn Bus>>,
     /// 当前设备已经匹配的驱动
     driver: Option<Weak<dyn Driver>>,
+
+    ktype: Option<&'static dyn KObjType>,
+    kset: Option<Arc<KSet>>,
 }
 
 impl InnerPlatformBusDevice {
@@ -209,6 +212,8 @@ impl InnerPlatformBusDevice {
             kernfs_inode: None,
             bus: None,
             driver: None,
+            ktype: None,
+            kset: None,
         }
     }
 }
@@ -231,15 +236,15 @@ impl KObject for PlatformBusDevice {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        None
+        self.inner.lock().ktype.clone()
     }
 
-    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
-        todo!("platform_bus_device::set_kobj_type")
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.inner.lock().ktype = ktype;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        None
+        self.inner.lock().kset.clone()
     }
 
     fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
@@ -262,8 +267,8 @@ impl KObject for PlatformBusDevice {
         self.inner.lock().name = name;
     }
 
-    fn set_kset(&self, _kset: Option<Arc<KSet>>) {
-        todo!()
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.inner.lock().kset = kset;
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {

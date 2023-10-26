@@ -3,7 +3,7 @@ use crate::mm::kernel_mapper::KernelMapper;
 use crate::process::ProcessManager;
 use crate::syscall::SystemError;
 use crate::{
-    include::bindings::bindings::{vm_flags_t, PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE},
+    include::bindings::bindings::{PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE},
     kdebug,
     mm::{MMArch, MemoryManagementArch},
 };
@@ -520,7 +520,7 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 成功返回0
     ///
     /// @return Err(SystemError) 失败返回错误码
-    fn release_mmio(&self, vaddr: VirtAddr, length: usize) -> Result<i32, SystemError> {
+    pub fn release_mmio(&self, vaddr: VirtAddr, length: usize) -> Result<i32, SystemError> {
         assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
         assert!(length & (MMArch::PAGE_SIZE - 1) == 0);
         if vaddr < self.pool_start_addr
@@ -706,50 +706,4 @@ pub fn mmio_init() {
     }
 
     kinfo!("MMIO buddy memory pool init done");
-}
-/// @brief 创建一块mmio区域，并将vma绑定到initial_mm
-///
-/// @param size mmio区域的大小（字节）
-///
-/// @param vm_flags 要把vma设置成的标志
-///
-/// @param res_vaddr 返回值-分配得到的虚拟地址
-///
-/// @param res_length 返回值-分配的虚拟地址空间长度
-///
-/// @return int 错误码
-#[no_mangle]
-pub unsafe extern "C" fn mmio_create(
-    size: u32,
-    _vm_flags: vm_flags_t,
-    res_vaddr: *mut u64,
-    res_length: *mut u64,
-) -> i32 {
-    // kdebug!("mmio_create");
-    let r = mmio_pool().create_mmio(size as usize);
-    if r.is_err() {
-        return r.unwrap_err().to_posix_errno();
-    }
-    let space_guard = r.unwrap();
-    *res_vaddr = space_guard.vaddr().data() as u64;
-    *res_length = space_guard.size() as u64;
-    // 由于space_guard drop的时候会自动释放内存，所以这里要忽略它的释放
-    core::mem::forget(space_guard);
-    return 0;
-}
-
-/// @brief 取消mmio的映射并将地址空间归还到buddy中
-///
-/// @param vaddr 起始的虚拟地址
-///
-/// @param length 要归还的地址空间的长度
-///
-/// @return Ok(i32) 成功返回0
-///
-/// @return Err(i32) 失败返回错误码
-#[no_mangle]
-pub unsafe extern "C" fn mmio_release(vaddr: u64, length: u64) -> i32 {
-    return mmio_pool()
-        .release_mmio(VirtAddr::new(vaddr as usize), length as usize)
-        .unwrap_or_else(|err| err.to_posix_errno());
 }

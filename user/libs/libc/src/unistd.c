@@ -14,7 +14,7 @@
  */
 int close(int fd)
 {
-    return syscall_invoke(SYS_CLOSE, fd, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 }
 
 /**
@@ -27,7 +27,7 @@ int close(int fd)
  */
 ssize_t read(int fd, void *buf, size_t count)
 {
-    return (ssize_t)syscall_invoke(SYS_READ, fd, (uint64_t)buf, count, 0, 0, 0, 0, 0);
+    return (ssize_t)syscall_invoke(SYS_READ, fd, (uint64_t)buf, count, 0, 0, 0);
 }
 
 /**
@@ -40,7 +40,7 @@ ssize_t read(int fd, void *buf, size_t count)
  */
 ssize_t write(int fd, void const *buf, size_t count)
 {
-    return (ssize_t)syscall_invoke(SYS_WRITE, fd, (uint64_t)buf, count, 0, 0, 0, 0, 0);
+    return (ssize_t)syscall_invoke(SYS_WRITE, fd, (uint64_t)buf, count, 0, 0, 0);
 }
 
 /**
@@ -53,7 +53,7 @@ ssize_t write(int fd, void const *buf, size_t count)
  */
 off_t lseek(int fd, off_t offset, int whence)
 {
-    return (off_t)syscall_invoke(SYS_LSEEK, fd, offset, whence, 0, 0, 0, 0, 0);
+    return (off_t)syscall_invoke(SYS_LSEEK, fd, offset, whence, 0, 0, 0);
 }
 
 /**
@@ -63,7 +63,7 @@ off_t lseek(int fd, off_t offset, int whence)
  */
 pid_t fork(void)
 {
-    return (pid_t)syscall_invoke(SYS_FORK, 0, 0, 0, 0, 0, 0, 0, 0);
+    return (pid_t)syscall_invoke(SYS_FORK, 0, 0, 0, 0, 0, 0);
 }
 /**
  * @brief 调用匿名管道
@@ -72,7 +72,7 @@ pid_t fork(void)
  */
 int pipe(int fd[2])
 {
-    return (int)syscall_invoke(SYS_PIPE, fd, 0, 0, 0, 0, 0, 0, 0);
+    return (int)syscall_invoke(SYS_PIPE, fd, 0, 0, 0, 0, 0);
 }
 /**
  * @brief 调用带参数的匿名管道
@@ -81,7 +81,7 @@ int pipe(int fd[2])
  */
 int pipe2(int fd[2], int flags)
 {
-    return (int)syscall_invoke(SYS_PIPE, fd, flags, 0, 0, 0, 0, 0, 0);
+    return (int)syscall_invoke(SYS_PIPE, fd, flags, 0, 0, 0, 0);
 }
 /**
  * @brief fork当前进程，但是与父进程共享VM、flags、fd
@@ -90,7 +90,7 @@ int pipe2(int fd[2], int flags)
  */
 pid_t vfork(void)
 {
-    return (pid_t)syscall_invoke(SYS_VFORK, 0, 0, 0, 0, 0, 0, 0, 0);
+    return (pid_t)syscall_invoke(SYS_VFORK, 0, 0, 0, 0, 0, 0);
 }
 
 /**
@@ -104,7 +104,7 @@ pid_t vfork(void)
  */
 uint64_t brk(uint64_t end_brk)
 {
-    uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0, 0, 0);
+    uint64_t x = (uint64_t)syscall_invoke(SYS_BRK, (uint64_t)end_brk, 0, 0, 0, 0, 0);
     if (x < end_brk)
     {
         errno = -ENOMEM;
@@ -121,7 +121,7 @@ uint64_t brk(uint64_t end_brk)
  */
 void *sbrk(int64_t increment)
 {
-    void *retval = (void *)syscall_invoke(SYS_SBRK, (uint64_t)increment, 0, 0, 0, 0, 0, 0, 0);
+    void *retval = (void *)syscall_invoke(SYS_SBRK, (uint64_t)increment, 0, 0, 0, 0, 0);
     if (retval == (void *)-ENOMEM)
         return (void *)(-1);
     else
@@ -146,7 +146,7 @@ int64_t chdir(char *dest_path)
     }
     else
     {
-        return syscall_invoke(SYS_CHDIR, (uint64_t)dest_path, 0, 0, 0, 0, 0, 0, 0);
+        return syscall_invoke(SYS_CHDIR, (uint64_t)dest_path, 0, 0, 0, 0, 0);
     }
 }
 
@@ -165,7 +165,7 @@ int execv(const char *path, char *const argv[])
         return -1;
     }
 
-    int retval = syscall_invoke(SYS_EXECVE, (uint64_t)path, (uint64_t)argv, 0, 0, 0, 0, 0, 0);
+    int retval = syscall_invoke(SYS_EXECVE, (uint64_t)path, (uint64_t)argv, 0, 0, 0, 0);
     if (retval != 0)
         return -1;
     else
@@ -180,7 +180,7 @@ int execv(const char *path, char *const argv[])
  */
 int rmdir(const char *path)
 {
-    return syscall_invoke(SYS_UNLINK_AT, 0, (uint64_t)path, AT_REMOVEDIR, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_UNLINK_AT, 0, (uint64_t)path, AT_REMOVEDIR, 0, 0, 0);
 }
 
 /**
@@ -191,7 +191,7 @@ int rmdir(const char *path)
  */
 int rm(const char *path)
 {
-    return syscall_invoke(SYS_UNLINK_AT, 0, (uint64_t)path, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_UNLINK_AT, 0, (uint64_t)path, 0, 0, 0, 0);
 }
 
 /**
@@ -224,20 +224,20 @@ void swab(void *restrict src, void *restrict dest, ssize_t nbytes)
  */
 pid_t getpid(void)
 {
-    return syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_GETPID, 0, 0, 0, 0, 0, 0);
 }
 
 int dup(int fd)
 {
-    return syscall_invoke(SYS_DUP, fd, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_DUP, fd, 0, 0, 0, 0, 0);
 }
 
 int dup2(int ofd, int nfd)
 {
-    return syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_DUP2, ofd, nfd, 0, 0, 0, 0);
 }
 
-char *getcwd(char* buf, size_t size)
+char *getcwd(char *buf, size_t size)
 {
-    return syscall_invoke(SYS_GETCWD, buf, size, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_GETCWD, buf, size, 0, 0, 0, 0);
 }

@@ -40,7 +40,7 @@ int signal(int signum, __sighandler_t handler)
  */
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
-    return syscall_invoke(SYS_SIGACTION, (uint64_t)signum, (uint64_t)act, (uint64_t)oldact, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_SIGACTION, (uint64_t)signum, (uint64_t)act, (uint64_t)oldact, 0, 0, 0);
 }
 
 /**
@@ -63,5 +63,5 @@ int raise(int sig)
  */
 int kill(pid_t pid, int sig)
 {
-    syscall_invoke(SYS_KILL, pid, sig, 0, 0, 0, 0, 0, 0);
+    syscall_invoke(SYS_KILL, pid, sig, 0, 0, 0, 0);
 }

@@ -30,6 +30,7 @@
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
+#include <virt/kvm/kvm.h>
 
 extern int rs_driver_init();
 extern void rs_softirq_init();
@@ -37,6 +38,7 @@ extern void rs_mm_init();
 extern void rs_kthread_init();
 extern void rs_init_intertrait();
 extern void rs_init_before_mem_init();
+extern int rs_setup_arch();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -71,7 +73,6 @@ void reload_idt()
 void system_initialize()
 {
     rs_init_before_mem_init();
-
     // 重新加载gdt和idt
     ul tss_item_addr = (ul)phys_2_virt(0x7c00);
 
@@ -88,7 +89,6 @@ void system_initialize()
     //  初始化内存管理单元
     // mm_init();
     rs_mm_init();
-
     // 内存管理单元初始化完毕后，需要立即重新初始化显示驱动。
     // 原因是，系统启动初期，framebuffer被映射到48M地址处，
     // mm初始化完毕后，若不重新初始化显示驱动，将会导致错误的数据写入内存，从而造成其他模块崩溃
@@ -101,8 +101,13 @@ void system_initialize()
     rs_init_intertrait();
     // kinfo("vaddr:%#018lx", video_frame_buffer_info.vaddr);
     io_mfence();
+    vfs_init();
+
+    rs_driver_init();
 
     acpi_init();
+
+    rs_setup_arch();
     io_mfence();
     irq_init();
     rs_process_init();
@@ -124,9 +129,6 @@ void system_initialize()
 
     rs_jiffies_init();
     io_mfence();
-    vfs_init();
-    
-    rs_driver_init();
 
     rs_kthread_init();
     io_mfence();
@@ -158,6 +160,10 @@ void system_initialize()
     HPET_enable();
 
     io_mfence();
+    
+    kvm_init();
+
+    io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 
     apic_timer_init();
@@ -183,8 +189,7 @@ void Start_Kernel(void)
 
     mb2_info &= 0xffffffff;
     mb2_magic &= 0xffffffff;
-    multiboot2_magic = (uint)mb2_magic;
-    multiboot2_boot_info_addr = mb2_info + PAGE_OFFSET;
+    multiboot2_init(mb2_info, mb2_magic);
     io_mfence();
     system_initialize();
     io_mfence();

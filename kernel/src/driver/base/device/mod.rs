@@ -413,6 +413,17 @@ impl DeviceManager {
         return Self;
     }
 
+    pub fn register(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
+        self.device_initialize(&device);
+        return self.add_device(device);
+    }
+
+    /// device_initialize - init device structure.
+    pub fn device_initialize(&self, device: &Arc<dyn Device>) {
+        device.set_kset(Some(sys_devices_kset()));
+        device.set_kobj_type(Some(&DeviceKObjType));
+    }
+
     /// @brief: 添加设备
     /// @parameter id_table: 总线标识符，用于唯一标识该总线
     /// @parameter dev: 设备实例
@@ -627,7 +638,7 @@ impl DeviceManager {
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
 pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), SystemError> {
-    return device_manager().add_device(device);
+    return device_manager().register(device);
 }
 
 /// @brief: 设备卸载

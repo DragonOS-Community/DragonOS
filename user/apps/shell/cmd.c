@@ -586,7 +586,7 @@ out:;
  */
 int shell_cmd_reboot(int argc, char **argv)
 {
-    return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
 }
 
 int shell_cmd_free(int argc, char **argv)

@@ -4,6 +4,7 @@ mod acpi;
 mod c_adapter;
 pub mod cpu;
 pub mod fpu;
+pub mod futex;
 pub mod interrupt;
 pub mod ipc;
 pub mod kvm;
@@ -17,7 +18,6 @@ pub mod sched;
 pub mod setup;
 pub mod smp;
 pub mod syscall;
-pub mod futex;
 
 pub use self::pci::pci::X86_64PciArch as PciArch;
 

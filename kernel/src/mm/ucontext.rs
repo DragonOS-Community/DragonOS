@@ -1038,7 +1038,7 @@ impl VMA {
 
         match self.provider {
             Provider::Allocated { .. } => true,
-            
+
             #[allow(unreachable_patterns)]
             _ => is_downgrade,
         }

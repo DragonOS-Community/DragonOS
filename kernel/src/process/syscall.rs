@@ -212,7 +212,7 @@ impl Syscall {
 
     pub fn clone(
         current_trapframe: &mut TrapFrame,
-        clone_args: KernelCloneArgs
+        clone_args: KernelCloneArgs,
     ) -> Result<usize, SystemError> {
         let flags = clone_args.flags;
         if flags.contains(CloneFlags::CLONE_PIDFD)

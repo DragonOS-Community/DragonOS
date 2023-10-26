@@ -1,12 +1,8 @@
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame,
-    filesystem::procfs::procfs_register_pid,
-    ipc::signal::flush_signal_handlers,
-    libs::rwlock::RwLock,
-    mm::VirtAddr,
-    process::ProcessFlags,
+    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid,
+    ipc::signal::flush_signal_handlers, libs::rwlock::RwLock, mm::VirtAddr, process::ProcessFlags,
     syscall::SystemError,
 };
 

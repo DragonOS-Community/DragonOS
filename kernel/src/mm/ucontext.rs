@@ -706,7 +706,7 @@ impl UserMappings {
     /// 请注意，在调用本函数之前，必须先确定region所在范围内没有VMA。
     fn reserve_hole(&mut self, region: &VirtRegion) {
         let prev_hole: Option<(&VirtAddr, &mut usize)> =
-            self.vm_holes.range_mut(..region.start()).next_back();
+            self.vm_holes.range_mut(..=region.start()).next_back();
 
         if let Some((prev_hole_vaddr, prev_hole_size)) = prev_hole {
             let prev_hole_end = prev_hole_vaddr.add(*prev_hole_size);
@@ -1038,6 +1038,8 @@ impl VMA {
 
         match self.provider {
             Provider::Allocated { .. } => true,
+            
+            #[allow(unreachable_patterns)]
             _ => is_downgrade,
         }
     }

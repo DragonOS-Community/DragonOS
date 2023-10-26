@@ -1,5 +1,4 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use x86::{segmentation::SegmentSelector, Ring};
 
 use crate::{
     arch::{
@@ -116,6 +115,7 @@ impl Syscall {
         return Ok(());
     }
 
+    /// ## 用于控制和查询与体系结构相关的进程特定选项
     pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         if let Err(SystemError::EINVAL) = Self::do_arch_prctl_64(&pcb, option, arg2, true) {
@@ -124,6 +124,7 @@ impl Syscall {
         Ok(0)
     }
 
+    /// ## 64位下控制fs/gs base寄存器的方法
     pub fn do_arch_prctl_64(
         pcb: &Arc<ProcessControlBlock>,
         option: usize,
@@ -152,17 +153,22 @@ impl Syscall {
             }
             ARCH_SET_FS => {
                 arch_info.fsbase = arg2;
-                // 关中断
-                let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-                unsafe { arch_info.restore_fsbase() }
-                drop(guard);
+                // 如果是当前进程则直接写入寄存器
+                if pcb.pid() == ProcessManager::current_pcb().pid() {
+                    // 关中断
+                    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                    unsafe { arch_info.restore_fsbase() }
+                    drop(guard);
+                }
             }
             ARCH_SET_GS => {
                 arch_info.gsbase = arg2;
-                // 关中断
-                let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-                unsafe { arch_info.restore_gsbase() }
-                drop(guard);
+                if pcb.pid() == ProcessManager::current_pcb().pid() {
+                    // 关中断
+                    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                    unsafe { arch_info.restore_gsbase() }
+                    drop(guard);
+                }
             }
             _ => {
                 return Err(SystemError::EINVAL);
@@ -172,7 +178,7 @@ impl Syscall {
     }
 
     #[allow(dead_code)]
-    pub fn do_arch_prctl_common(option: usize, arg2: usize) -> Result<usize, SystemError> {
+    pub fn do_arch_prctl_common(_option: usize, _arg2: usize) -> Result<usize, SystemError> {
         todo!();
     }
 }

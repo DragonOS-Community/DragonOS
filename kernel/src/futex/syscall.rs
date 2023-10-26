@@ -10,7 +10,7 @@ impl Syscall {
         uaddr: *const u32,
         operation: u32,
         val: u32,
-        timeout: usize,
+        timeout: *const TimeSpec,
         uaddr2: *const u32,
         val2: u32,
         val3: u32,
@@ -32,16 +32,10 @@ impl Syscall {
 
         match cmd {
             FUTEX_WAIT => {
-                return Futex::futex_wait(
-                    uaddr,
-                    flags,
-                    val,
-                    timeout as *const TimeSpec,
-                    FUTEX_BITSET_MATCH_ANY,
-                );
+                return Futex::futex_wait(uaddr, flags, val, timeout, FUTEX_BITSET_MATCH_ANY);
             }
             FUTEX_WAIT_BITSET => {
-                return Futex::futex_wait(uaddr, flags, val, timeout as *const TimeSpec, val3);
+                return Futex::futex_wait(uaddr, flags, val, timeout, val3);
             }
             FUTEX_WAKE => {
                 return Futex::futex_wake(uaddr, flags, val, FUTEX_BITSET_MATCH_ANY);
@@ -72,7 +66,14 @@ impl Syscall {
                 );
             }
             FUTEX_WAKE_OP => {
-                todo!()
+                return Futex::futex_wake_op(
+                    uaddr,
+                    flags,
+                    uaddr2,
+                    val as i32,
+                    val2 as i32,
+                    val3 as i32,
+                );
             }
             FUTEX_LOCK_PI => {
                 todo!()

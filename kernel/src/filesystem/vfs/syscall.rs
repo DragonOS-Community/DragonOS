@@ -765,6 +765,7 @@ impl Syscall {
             FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
             FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
             FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
+            FileType::KvmDevice => todo!(),
         }
 
         return Ok(kstat);
@@ -833,19 +834,6 @@ impl Syscall {
         let data = iovecs.gather();
 
         Self::write(fd, &data)
-    }
-
-    pub fn ioctl(fd: i32, request: u32, data: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let file = binding
-            .read()
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADFD)?;
-
-        let inode = file.lock().inode();
-        inode.ioctl(request, data)?;
-
-        Ok(0)
     }
 }
 #[repr(C)]

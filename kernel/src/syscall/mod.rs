@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::kdebug;
+use crate::{arch::rand::GRandFlags, process::fork::KernelCloneArgs};
 
 use num_traits::{FromPrimitive, ToPrimitive};
 
@@ -372,7 +372,7 @@ pub const SYS_BIND: usize = 49;
 pub const SYS_LISTEN: usize = 50;
 pub const SYS_GETSOCKNAME: usize = 51;
 pub const SYS_GETPEERNAME: usize = 52;
-
+pub const SYS_SOCKET_PAIR: usize = 53;
 pub const SYS_SETSOCKOPT: usize = 54;
 pub const SYS_GETSOCKOPT: usize = 55;
 
@@ -434,10 +434,6 @@ pub const SYS_SBRK: usize = 100001;
 /// todo: 该系统调用与Linux不一致，将来需要删除该系统调用！！！ 删的时候记得改C版本的libc
 pub const SYS_CLOCK: usize = 100002;
 pub const SYS_SCHED: usize = 100003;
-
-pub const SYS_CLONE: usize = 54;
-
-pub const SYS_FUTEX: usize = 55;
 
 #[derive(Debug)]
 pub struct Syscall;
@@ -540,7 +536,6 @@ impl Syscall {
                 Self::lseek(fd, w)
             }
             SYS_IOCTL => {
-                kdebug!("SYS_IOCTL");
                 let fd = args[0];
                 let cmd = args[1];
                 let data = args[2];
@@ -947,7 +942,7 @@ impl Syscall {
             SYS_MUNMAP => {
                 let addr = args[0];
                 let len = page_align_up(args[1]);
-                if addr & MMArch::PAGE_SIZE != 0 {
+                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
                     // The addr argument is not a multiple of the page size
                     Err(SystemError::EINVAL)
                 } else {
@@ -957,14 +952,11 @@ impl Syscall {
             SYS_MPROTECT => {
                 let addr = args[0];
                 let len = page_align_up(args[1]);
-                crate::kdebug!("mprotect : addr:{addr}");
                 if addr & (MMArch::PAGE_SIZE - 1) != 0 {
                     // The addr argument is not a multiple of the page size
                     Err(SystemError::EINVAL)
                 } else {
-                    let r = Self::mprotect(VirtAddr::new(addr), len, args[2]);
-                    crate::kdebug!("mprotect:{r:?}");
-                    r
+                    Self::mprotect(VirtAddr::new(addr), len, args[2])
                 }
             }
 
@@ -1030,22 +1022,43 @@ impl Syscall {
                 Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
             }
 
-            SYS_CLONE => Self::clone(
-                frame,
-                CloneFlags::from_bits_truncate(args[0] as u64),
-                args[1],
-                args[2],
-                args[3],
-                args[4],
-            ),
+            SYS_CLONE => {
+                let mut clone_args = KernelCloneArgs::new();
+                clone_args.flags = CloneFlags::from_bits_truncate(args[0] as u64);
+                clone_args.stack = VirtAddr::new(args[1]);
+                clone_args.parent_tid = VirtAddr::new(args[2]);
+                clone_args.child_tid = VirtAddr::new(args[3]);
+                clone_args.tls = args[4];
+                Self::clone(frame, clone_args)
+            }
+
+            SYS_FUTEX => {
+                let uaddr = args[0] as *const u32;
+                let operation = args[1] as u32;
+                let val = args[2] as u32;
+                let utime = args[3];
+                let uaddr2 = args[4] as *const u32;
+                let val3 = args[5] as u32;
+
+                let mut timespec: *mut TimeSpec = core::ptr::null::<TimeSpec>() as *mut TimeSpec;
+                if utime != 0 && (operation & crate::futex::constant::FLAGS_HAS_TIMEOUT) != 0 {
+                    let reader = UserBufferReader::new(
+                        utime as *const TimeSpec,
+                        core::mem::size_of::<TimeSpec>(),
+                        true,
+                    )?;
+
+                    reader.copy_one_from_user(&mut timespec, 0)?;
+                }
+
+                Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
+            }
 
             SYS_WRITEV => Self::writev(args[0] as i32, args[1], args[2]),
 
             SYS_ARCH_PRCTL => Self::arch_prctl(args[0], args[1]),
 
             SYS_SET_TID_ADDR => Self::set_tid_address(args[0]),
-
-            SYS_IOCTL => Self::ioctl(args[0] as i32, args[1] as u32, args[2] as usize),
 
             SYS_STAT => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
@@ -1065,35 +1078,29 @@ impl Syscall {
                 res
             }
 
-            // 目前为了适配musl-libc,先这样写着
-            SYS_POLL => {
-                crate::kdebug!("syscall SYS_POLL");
-                Ok(0)
-            }
-
-            SYS_RT_SIGPROCMASK => {
-                crate::kdebug!("syscall SYS_RT_SIGPROCMASK");
-                Ok(0)
-            }
-
-            SYS_TKILL => {
-                crate::kdebug!("syscall SYS_TKILL");
-                Ok(0)
-            }
-
-            SYS_SIGALTSTACK => {
-                crate::kdebug!("syscall SYS_SIGALTSTACK");
-                Ok(0)
-            }
-
+            // 目前为了适配musl-libc,以下系统调用先这样写着
             SYS_GET_RANDOM => {
-                crate::kdebug!("syscall SYS_GET_RANDOM");
-                Ok(0)
+                let flags = GRandFlags::from_bits(args[2] as u8).ok_or(SystemError::EINVAL)?;
+                Self::get_random(args[0] as *mut u8, args[1], flags)
             }
+
+            SYS_SOCKET_PAIR => {
+                unimplemented!()
+            }
+
+            SYS_POLL => Ok(0),
+
+            SYS_RT_SIGPROCMASK => Ok(0),
+
+            SYS_TKILL => Ok(0),
+
+            SYS_SIGALTSTACK => Ok(0),
 
             999 => {
+                let pid = crate::process::ProcessManager::current_pcb().pid();
                 crate::kdebug!(
-                    "SYS_TEST:arg1:{},arg2:{},arg3:{},arg4:{}",
+                    "SYS_TEST: pid:{} arg1:{},arg2:{},arg3:{},arg4:{}",
+                    pid.data(),
                     args[0],
                     args[1],
                     args[2],

@@ -8,7 +8,7 @@ use crate::{
     exception::InterruptArch,
     include::bindings::bindings::verify_area,
     libs::spinlock::SpinLock,
-    mm::MemoryManagementArch,
+    mm::{MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessManager},
     syscall::{user_access::UserBufferReader, SystemError},
     time::{
@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-use super::constant::FLAGS_SHARED;
+use super::constant::*;
 
 lazy_static! {
     pub(super) static ref FUTEX_DATA: SpinLock<HashMap<FutexKey, LockedFutexHashBucket>> =
@@ -115,6 +115,7 @@ pub enum FutexAccess {
     FutexWrite,
 }
 
+#[allow(dead_code)]
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
 /// ### 用于定位内核唯一的futex
 pub enum InnerFutexKey {
@@ -145,6 +146,7 @@ pub struct PrivateKey {
 }
 
 impl Futex {
+    /// ### 让当前进程在指定futex上等待直到futex_writ显式唤醒
     pub fn futex_wait(
         uaddr: *const u32,
         flags: u32,
@@ -254,6 +256,7 @@ impl Futex {
         Ok(0)
     }
 
+    // ### 唤醒指定futex上挂起的最多nr_wake个进程
     pub fn futex_wake(
         uaddr: *const u32,
         flags: u32,
@@ -280,6 +283,7 @@ impl Futex {
         Ok(bucket_guard.wake_up(key, Some(bitset), nr_wake)?)
     }
 
+    /// ### 唤醒制定uaddr1上的最多nr_wake个进程，然后将uaddr1最多nr_requeue个进程移动到uaddr2绑定的futex上
     pub fn futex_requeue(
         uaddr1: *const u32,
         flags: u32,
@@ -352,6 +356,7 @@ impl Futex {
         }
     }
 
+    /// ### 唤醒futex上的进程的同时进行一些操作
     pub fn futex_wake_op(
         uaddr1: *const u32,
         flags: u32,
@@ -365,16 +370,33 @@ impl Futex {
             Futex::get_futex_key(uaddr2, flags & FLAGS_SHARED != 0, FutexAccess::FutexWrite)?;
 
         let binding = FUTEX_DATA.lock();
-        let bucket1 = binding.get(&key1).ok_or(SystemError::EINVAL)?;
-        let bucket2 = binding.get(&key2).ok_or(SystemError::EINVAL)?;
+        let mut bucket1 = binding.get(&key1).ok_or(SystemError::EINVAL)?.0.lock();
+        let mut bucket2 = binding.get(&key2).ok_or(SystemError::EINVAL)?.0.lock();
+        let mut wake_count = 0;
 
-        Ok(0)
+        // 唤醒uaddr1中的进程
+        wake_count += bucket1.wake_up(key1, None, nr_wake as u32)?;
+
+        match Self::futex_atomic_op_inuser(op as u32, uaddr2) {
+            Ok(ret) => {
+                // 操作成功则唤醒uaddr2中的进程
+                if ret {
+                    wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
+                }
+            }
+            Err(e) => {
+                // TODO:retry?
+                return Err(e);
+            }
+        }
+
+        Ok(wake_count)
     }
 
     fn get_futex_key(
         uaddr: *const u32,
         fshared: bool,
-        access: FutexAccess,
+        _access: FutexAccess,
     ) -> Result<FutexKey, SystemError> {
         let mut address = uaddr as u64;
 
@@ -405,6 +427,68 @@ impl Futex {
             });
         }
         // 未实现共享内存机制
-        todo!("Shared memory not implemented");
+        // todo!("Shared memory not implemented");
+        // TODO: 目前这样写可能会出现意料之外的错误
+        crate::kwarn!("Shared memory not implemented,generate futex key using default method");
+        return Ok(FutexKey {
+            ptr: 0,
+            word: 0,
+            offset: offset as u32,
+            key: InnerFutexKey::Private(PrivateKey {
+                address: address as u64,
+            }),
+        });
+    }
+
+    pub fn futex_atomic_op_inuser(encoded_op: u32, uaddr: *const u32) -> Result<bool, SystemError> {
+        let op = (encoded_op & 0x70000000) >> 28;
+        let cmp = (encoded_op & 0x0f000000) >> 24;
+
+        let sign_extend32 = |value: u32, index: i32| {
+            let shift = (31 - index) as u8;
+            return (value << shift) >> shift;
+        };
+
+        let mut oparg = sign_extend32((encoded_op & 0x00fff000) >> 12, 11);
+        let cmparg = sign_extend32(encoded_op & 0x00000fff, 11);
+
+        if encoded_op & (FUTEX_OP_OPARG_SHIFT << 28) != 0 {
+            if oparg > 31 {
+                kwarn!(
+                    "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
+                    ProcessManager::current_pcb().pid().data(),
+                    oparg
+                );
+
+                oparg &= 31;
+            }
+        }
+
+        // TODO: 这个汇编似乎是有问题的，目前不好测试
+        let old_val = Self::arch_futex_atomic_op_inuser(op, oparg, VirtAddr::new(uaddr as usize))?;
+
+        match cmp {
+            FUTEX_OP_CMP_EQ => {
+                return Ok(cmparg == old_val);
+            }
+            FUTEX_OP_CMP_NE => {
+                return Ok(cmparg != old_val);
+            }
+            FUTEX_OP_CMP_LT => {
+                return Ok(cmparg < old_val);
+            }
+            FUTEX_OP_CMP_LE => {
+                return Ok(cmparg <= old_val);
+            }
+            FUTEX_OP_CMP_GE => {
+                return Ok(cmparg >= old_val);
+            }
+            FUTEX_OP_CMP_GT => {
+                return Ok(cmparg > old_val);
+            }
+            _ => {
+                return Err(SystemError::ENOSYS);
+            }
+        }
     }
 }

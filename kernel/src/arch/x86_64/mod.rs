@@ -17,6 +17,7 @@ pub mod sched;
 pub mod setup;
 pub mod smp;
 pub mod syscall;
+pub mod futex;
 
 pub use self::pci::pci::X86_64PciArch as PciArch;
 

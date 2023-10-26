@@ -212,19 +212,9 @@ impl Syscall {
 
     pub fn clone(
         current_trapframe: &mut TrapFrame,
-        flags: CloneFlags,
-        child_stack: usize,
-        parent_tid: usize,
-        child_tid: usize,
-        tls: usize,
+        clone_args: KernelCloneArgs
     ) -> Result<usize, SystemError> {
-        let mut clone_args = KernelCloneArgs::new();
-        clone_args.flags = flags;
-        clone_args.stack = VirtAddr::new(child_stack);
-        clone_args.parent_tid = VirtAddr::new(parent_tid);
-        clone_args.child_tid = VirtAddr::new(child_tid);
-        clone_args.tls = tls;
-
+        let flags = clone_args.flags;
         if flags.contains(CloneFlags::CLONE_PIDFD)
             && flags.contains(CloneFlags::CLONE_PARENT_SETTID)
         {
@@ -236,38 +226,8 @@ impl Syscall {
         let name = current_pcb.basic().name().to_string();
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
-        if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-            // TODO: 设置childtid
-        }
-
-        if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
-            // TODO: 清除childtid
-        }
-
         // 克隆pcb
         ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;
-
-        // let address_scope = pcb.basic_mut().user_vm().expect("No user_vm found");
-
-        // // 为进程建立新用户栈
-        // address_scope.new_user_stack(
-        //     VirtAddr::new(child_stack + 11 * core::mem::size_of::<usize>()),
-        //     UserStack::DEFAULT_USER_STACK_SIZE,
-        // )?;
-
-        // // 设置栈指针
-        // address_scope.set_user_stack_sp(VirtAddr::new(child_stack));
-
-        // // 获取栈帧
-        // pcb.arch_info().set_stack(VirtAddr::new(child_stack));
-        // pcb.arch_info().set_stack_base(VirtAddr::new(
-        //     child_stack
-        // ));
-
-        if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-            // TODO: 设置parenttid
-            todo!()
-        }
 
         ProcessManager::add_pcb(pcb.clone());
 
@@ -289,8 +249,8 @@ impl Syscall {
         });
 
         if flags.contains(CloneFlags::CLONE_VFORK) {
-            // TODO: 等待子进程接收或者exec;
-            todo!()
+            // 等待子进程结束或者exec;
+            pcb.wait_queue.sleep();
         }
 
         return Ok(pcb.pid().0);

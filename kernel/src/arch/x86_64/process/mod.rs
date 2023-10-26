@@ -8,7 +8,7 @@ use core::{
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use memoffset::offset_of;
-use x86::{controlregs::Cr4, segmentation::SegmentSelector, Ring};
+use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
     arch::process::table::TSSManager,
@@ -188,7 +188,7 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.gsbase = x86::current::segmentation::rdgsbase() as usize;
         } else {
-            x86::msr::wrmsr(IA32_GS_BASE, self.gsbase as u64);
+            self.gsbase = x86::msr::rdmsr(IA32_GS_BASE) as usize;
         }
     }
 
@@ -204,7 +204,7 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrgsbase(self.gsbase as u64);
         } else {
-            self.gsbase = x86::msr::rdmsr(IA32_GS_BASE) as usize;
+            x86::msr::wrmsr(IA32_GS_BASE, self.gsbase as u64);
         }
     }
 
@@ -310,18 +310,18 @@ impl ProcessManager {
         }
         drop(current_arch_guard);
 
-        // 设置tls
-        if clone_flags.contains(CloneFlags::CLONE_SETTLS) {
-            Syscall::do_arch_prctl_64(new_pcb, ARCH_SET_FS, clone_args.tls, true)?;
-        }
-
         // 设置返回地址（子进程开始执行的指令地址）
-
         if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
             let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
             new_arch_guard.rip = kthread_bootstrap_stage1_func_addr;
         } else {
             new_arch_guard.rip = ret_from_intr as usize;
+        }
+
+        // 设置tls
+        if clone_flags.contains(CloneFlags::CLONE_SETTLS) {
+            drop(new_arch_guard);
+            Syscall::do_arch_prctl_64(new_pcb, ARCH_SET_FS, clone_args.tls, true)?;
         }
 
         return Ok(());

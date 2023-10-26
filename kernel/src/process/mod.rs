@@ -40,7 +40,7 @@ use crate::{
         SchedPolicy, SchedPriority,
     },
     smp::kick_cpu,
-    syscall::{Syscall, SystemError},
+    syscall::{Syscall, SystemError, user_access::clear_user},
 };
 
 use self::kthread::WorkerPrivate;

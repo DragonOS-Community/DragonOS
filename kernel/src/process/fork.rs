@@ -1,8 +1,12 @@
-use alloc::{boxed::Box, string::ToString, sync::Arc};
+use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid,
-    ipc::signal::flush_signal_handlers, libs::rwlock::RwLock, process::ProcessFlags,
+    arch::interrupt::TrapFrame,
+    filesystem::procfs::procfs_register_pid,
+    ipc::signal::flush_signal_handlers,
+    libs::rwlock::RwLock,
+    mm::VirtAddr,
+    process::ProcessFlags,
     syscall::SystemError,
 };
 
@@ -38,7 +42,7 @@ bitflags! {
         const CLONE_SYSVSEM = 0x00040000;
         /// 设置其线程本地存储
         const CLONE_SETTLS = 0x00080000;
-        /// 设置其父进程中的子进程线程 ID
+        /// 设置partent_tid地址为子进程线程 ID
         const CLONE_PARENT_SETTID = 0x00100000;
         /// 在子进程中设置一个清除线程 ID 的用户空间地址
         const CLONE_CHILD_CLEARTID = 0x00200000;
@@ -69,7 +73,12 @@ bitflags! {
     }
 }
 
+/// ## clone与clone3系统调用的参数载体
+///
+/// 因为这两个系统调用的参数很多，所以有这样一个载体更灵活
+///
 /// 仅仅作为参数传递
+#[derive(Debug, Clone, Copy)]
 pub struct KernelCloneArgs {
     pub flags: CloneFlags,
 
@@ -92,7 +101,7 @@ pub struct KernelCloneArgs {
     pub io_thread: bool,
     pub kthread: bool,
     pub idle: bool,
-    pub func: Option<Box<dyn Fn(VirtAddr)>>,
+    pub func: VirtAddr,
     pub fn_arg: VirtAddr,
     // cgrp 和 cset?
 }
@@ -115,7 +124,7 @@ impl KernelCloneArgs {
             io_thread: false,
             kthread: false,
             idle: false,
-            func: None,
+            func: null_addr,
             fn_arg: null_addr,
         }
     }
@@ -339,12 +348,28 @@ impl ProcessManager {
                 Some(WorkerPrivate::KernelThread(KernelThreadPcbPrivate::new()));
         }
 
+        // 设置clear_child_tid，在线程结束时将其置0以通知父进程
         if clone_flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
             pcb.thread.write().clear_child_tid = clone_args.child_tid;
         }
 
+        // 设置child_tid，意味着子线程能够知道自己的id
         if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
             pcb.thread.write().set_child_tid = clone_args.child_tid;
+        }
+
+        // 将子进程/线程的id存储在用户态传进的地址中
+        if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+            // TODO: 这里注释掉的代码是正确的，但是目前futex尚不完善
+            // 这里不注释掉futex会使用共享内存，应该是pthread的行为，尚不明确
+
+            // let mut writer = UserBufferWriter::new(
+            //     clone_args.parent_tid.data() as *mut i32,
+            //     core::mem::size_of::<i32>(),
+            //     true,
+            // )?;
+
+            // writer.copy_one_to_user(&(pcb.pid().0 as i32), 0)?;
         }
 
         // 拷贝标志位

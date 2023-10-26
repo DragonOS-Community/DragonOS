@@ -1,13 +1,21 @@
 extern crate bindgen;
+extern crate cc;
 // use ::std::env;
 
 use std::path::PathBuf;
+
+use cc::Build;
 
 fn main() {
     // Tell cargo to look for shared libraries in the specified directory
     println!("cargo:rustc-link-search=src");
     println!("cargo:rerun-if-changed=src/include/bindings/wrapper.h");
 
+    generate_bindings();
+    CFilesBuilder::build();
+}
+
+fn generate_bindings() {
     // let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_path = PathBuf::from(String::from("src/include/bindings/"));
 
@@ -43,5 +51,60 @@ fn main() {
         bindings
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
+    }
+}
+
+/// 构建项目的c文件
+struct CFilesBuilder;
+
+impl CFilesBuilder {
+    fn build() {
+        let mut c = cc::Build::new();
+        Self::setup_global_flags(&mut c);
+        Self::setup_defines(&mut c);
+        Self::setup_global_include_dir(&mut c);
+        Self::setup_files(&mut c);
+        c.compile("dragonos_kernel_cfiles");
+    }
+
+    fn setup_global_flags(c: &mut Build) {
+        c.flag("-mcmodel=large")
+            .flag("-fno-builtin")
+            .flag("-nostdlib")
+            .flag("-fno-stack-protector")
+            .flag("-fno-pie")
+            .flag("-Wno-expansion-to-defined")
+            .flag("-Wno-unused-parameter")
+            .flag("-m64")
+            .flag("-O1");
+    }
+
+    fn setup_defines(c: &mut Build) {
+        if let Ok(k) = std::env::var("EMULATOR") {
+            c.define("EMULATOR", Some(k.as_str()));
+        } else {
+            c.define("EMULATOR", "__NO_EMULATION__");
+        }
+
+        {
+            #[cfg(target_arch = "x86_64")]
+            c.define("__x86_64__", None);
+        }
+
+        c.define("PIC", "_INTR_APIC_");
+    }
+
+    fn setup_global_include_dir(c: &mut Build) {
+        c.include("src/include");
+        c.include("src");
+        c.include(".");
+
+        #[cfg(target_arch = "x86_64")]
+        c.include("src/arch/x86_64/include");
+    }
+
+    /// 设置需要编译的文件
+    fn setup_files(c: &mut Build) {
+        c.file("src/arch/x86_64/driver/hpet.c");
     }
 }

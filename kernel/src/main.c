@@ -26,7 +26,6 @@
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
-#include <driver/timers/HPET/HPET.h>
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>

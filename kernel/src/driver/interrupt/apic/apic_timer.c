@@ -64,7 +64,12 @@ uint64_t apic_timer_install(ul irq_num, void *arg)
     // 设置初始计数
 
     uint64_t cpu_khz = rs_tsc_get_cpu_khz();
-    uint64_t init_cnt = cpu_khz * APIC_TIMER_INTERVAL / APIC_TIMER_DIVISOR;
+    // 疑惑：这里使用khz吗？
+    // 我觉得应该是hz，但是由于旧的代码是测量出initcnt的，而不是计算的
+    // 然后我发现使用hz会导致计算出来的initcnt太大，导致系统卡顿，而khz的却能跑
+    // TODO： 这里需要进一步研究
+    uint64_t init_cnt = cpu_khz * APIC_TIMER_INTERVAL / (1000 * APIC_TIMER_DIVISOR);
+    kdebug("cpu_khz: %ld, init_cnt: %ld", cpu_khz, init_cnt);
     apic_timer_set_init_cnt(init_cnt);
     io_mfence();
     // 填写LVT

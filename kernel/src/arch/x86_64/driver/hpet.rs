@@ -13,6 +13,7 @@ use crate::{
         acpi::acpi_manager,
         timers::hpet::{HpetRegisters, HpetTimerRegisters},
     },
+    exception::softirq::{softirq_vectors, SoftirqNumber},
     kdebug, kerror, kinfo,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -23,6 +24,7 @@ use crate::{
         PhysAddr,
     },
     syscall::SystemError,
+    time::timer::{clock, timer_get_first_expire, update_timer_jiffies},
 };
 
 extern "C" {
@@ -218,6 +220,19 @@ impl Hpet {
         drop(regs);
         drop(inner_guard);
         return period;
+    }
+
+    /// 处理HPET的中断
+    pub(super) fn handle_irq(&self, timer_num: u32) {
+        if timer_num == 0 {
+            update_timer_jiffies(Self::HPET0_INTERVAL_USEC);
+
+            if let Ok(first_expire) = timer_get_first_expire() {
+                if first_expire <= clock() {
+                    softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+                }
+            }
+        }
     }
 }
 

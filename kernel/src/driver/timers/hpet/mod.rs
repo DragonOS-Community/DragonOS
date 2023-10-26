@@ -47,16 +47,18 @@ impl HpetRegisters {
         volwrite!(p, main_counter_value, value);
     }
 
+    #[allow(dead_code)]
     pub fn general_config(&self) -> u64 {
         let p = NonNull::new(self as *const HpetRegisters as *mut HpetRegisters).unwrap();
         unsafe { volread!(p, general_config) }
     }
-
+    
     pub unsafe fn write_general_config(&mut self, value: u64) {
         let p = NonNull::new(self as *const HpetRegisters as *mut HpetRegisters).unwrap();
         volwrite!(p, general_config, value);
     }
-
+    
+    #[allow(dead_code)]
     pub fn general_intr_status(&self) -> u64 {
         let p = NonNull::new(self as *const HpetRegisters as *mut HpetRegisters).unwrap();
         unsafe { volread!(p, general_intr_status) }

@@ -5,18 +5,14 @@ use alloc::{
 };
 
 use crate::{
-    driver::uart::uart::{c_uart_send_str, UartPort},
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
-            
-            file::FileMode,
-            ioctl::IoctlCmd,
-            syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
-            ROOT_INODE,
+            file::FileMode, ioctl::IoctlCmd, syscall::ModeType, FilePrivateData, FileType,
+            IndexNode, Metadata, ROOT_INODE,
         },
     },
-    kerror, kinfo,
+    kerror,
     libs::{
         lib_ui::{
             termios::{Lflag, Termios, Winsize},
@@ -27,7 +23,10 @@ use crate::{
     syscall::SystemError,
 };
 
-use super::{serial::serial_init, TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
+use super::{
+    serial::{serial8250::send_to_default_serial8250_port, serial_init},
+    TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData,
+};
 
 lazy_static! {
     /// 所有TTY设备的B树。用于根据名字，找到Arc<TtyDevice>
@@ -70,13 +69,13 @@ impl TtyDevice {
         });
         // 默认开启输入回显
         // result.core.enable_echo();
-        let cmd=IoctlCmd::into(IoctlCmd::ENABLEECHO);
+        let cmd = IoctlCmd::into(IoctlCmd::ENABLEECHO);
         let r = result
             .ioctl(cmd, 0)
             .map(|_| 0)
             .unwrap_or_else(|e| e.to_posix_errno());
         if r.is_negative() {
-            c_uart_send_str(UartPort::COM1.to_u16(), "enable echo failed.\n\0".as_ptr());
+            send_to_default_serial8250_port("enable echo failed.".as_bytes());
         }
         return result;
     }
@@ -297,14 +296,14 @@ impl IndexNode for TtyDevice {
                     *winsize = *self.winsize.read();
                 }
                 Ok(0)
-            },
+            }
             IoctlCmd::SETWINSZ => {
                 let winsize = data as *const Winsize;
                 unsafe {
                     *self.winsize.write() = *winsize;
                 }
                 Ok(0)
-            },
+            }
             IoctlCmd::ENABLEECHO => {
                 let mut termios = self.termios.write();
                 let mut lflag = termios.lflag;
@@ -312,7 +311,7 @@ impl IndexNode for TtyDevice {
                 termios.lflag = lflag;
                 self.core.enable_echo();
                 Ok(0)
-            },
+            }
             IoctlCmd::DISABLEECHO => {
                 let mut termios = self.termios.write();
                 let mut lflag = termios.lflag;
@@ -320,7 +319,7 @@ impl IndexNode for TtyDevice {
                 termios.lflag = lflag;
                 self.core.disable_echo();
                 Ok(0)
-            },
+            }
             _ => Err(SystemError::EBADRQC),
         }
     }

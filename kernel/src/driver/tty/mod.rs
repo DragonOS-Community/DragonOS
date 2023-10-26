@@ -13,6 +13,7 @@ pub mod init;
 // pub mod serial;
 pub mod tty_device;
 pub mod tty_ioctl;
+pub mod serial;
 
 pub mod tty_driver;
 

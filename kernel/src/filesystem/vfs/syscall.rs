@@ -417,7 +417,6 @@ impl Syscall {
             unsafe { (buf.as_mut_ptr() as *mut Dirent).as_mut() }.ok_or(SystemError::EFAULT)?;
 
         if fd < 0 || fd as u32 > PROC_MAX_FD_NUM {
-            crate::kdebug!("getdents ebadf fd: {fd}");
             return Err(SystemError::EBADF);
         }
 

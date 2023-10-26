@@ -1,8 +1,4 @@
-use crate::{
-    futex::futex::Futex,
-    mm::VirtAddr,
-    syscall::SystemError,
-};
+use crate::{futex::futex::Futex, mm::VirtAddr, syscall::SystemError};
 
 impl Futex {
     /// ### 对futex进行操作

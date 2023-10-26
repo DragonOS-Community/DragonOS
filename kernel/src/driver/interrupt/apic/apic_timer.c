@@ -11,6 +11,9 @@ static spinlock_t apic_timer_init_lock = {1};
 // bsp 是否已经完成apic时钟初始化
 static bool bsp_initialized = false;
 
+extern uint64_t rs_get_cycles();
+extern uint64_t rs_tsc_get_cpu_khz();
+
 /**
  * @brief 初始化AP核的apic时钟
  *
@@ -59,7 +62,15 @@ uint64_t apic_timer_install(ul irq_num, void *arg)
     io_mfence();
 
     // 设置初始计数
-    apic_timer_set_init_cnt(*(uint64_t *)arg);
+
+    uint64_t cpu_khz = rs_tsc_get_cpu_khz();
+    // 疑惑：这里使用khz吗？
+    // 我觉得应该是hz，但是由于旧的代码是测量出initcnt的，而不是计算的
+    // 然后我发现使用hz会导致计算出来的initcnt太大，导致系统卡顿，而khz的却能跑
+    // TODO： 这里需要进一步研究
+    uint64_t init_cnt = cpu_khz * APIC_TIMER_INTERVAL / (1000 * APIC_TIMER_DIVISOR);
+    kdebug("cpu_khz: %ld, init_cnt: %ld", cpu_khz, init_cnt);
+    apic_timer_set_init_cnt(init_cnt);
     io_mfence();
     // 填写LVT
     apic_timer_set_LVT(APIC_TIMER_IRQ_NUM, 1, APIC_LVT_Timer_Periodic);
@@ -101,17 +112,11 @@ void apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 void apic_timer_init()
 {
 
-    if (apic_timer_ticks_result == 0)
-    {
-        kBUG("APIC timer ticks in 5ms is equal to ZERO!");
-        while (1)
-            hlt();
-    }
     uint64_t flags = 0;
     spin_lock_irqsave(&apic_timer_init_lock, flags);
     kinfo("Initializing apic timer for cpu %d", rs_current_pcb_cpuid());
     io_mfence();
-    irq_register(APIC_TIMER_IRQ_NUM, &apic_timer_ticks_result, &apic_timer_handler, 0, &apic_timer_intr_controller,
+    irq_register(APIC_TIMER_IRQ_NUM, NULL, &apic_timer_handler, 0, &apic_timer_intr_controller,
                  "apic timer");
     io_mfence();
     if (rs_current_pcb_cpuid() == 0)

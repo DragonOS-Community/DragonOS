@@ -1096,19 +1096,6 @@ impl Syscall {
 
             SYS_SIGALTSTACK => Ok(0),
 
-            999 => {
-                let pid = crate::process::ProcessManager::current_pcb().pid();
-                crate::kdebug!(
-                    "SYS_TEST: pid:{} arg1:{},arg2:{},arg3:{},arg4:{}",
-                    pid.data(),
-                    args[0],
-                    args[1],
-                    args[2],
-                    args[3]
-                );
-                Ok(0)
-            }
-
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
         return r;

@@ -3,6 +3,7 @@ pub mod asm;
 mod acpi;
 mod c_adapter;
 pub mod cpu;
+pub mod driver;
 pub mod fpu;
 pub mod interrupt;
 pub mod ipc;
@@ -17,6 +18,7 @@ pub mod sched;
 pub mod setup;
 pub mod smp;
 pub mod syscall;
+pub mod time;
 
 pub use self::pci::pci::X86_64PciArch as PciArch;
 
@@ -29,3 +31,4 @@ pub use crate::arch::asm::pio::X86_64PortIOArch as CurrentPortIOArch;
 pub use kvm::X86_64KVMArch as KVMArch;
 
 pub use crate::arch::ipc::signal::X86_64SignalArch as CurrentSignalArch;
+pub use crate::arch::time::X86_64TimeArch as CurrentTimeArch;

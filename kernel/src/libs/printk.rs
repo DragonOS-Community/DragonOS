@@ -1,6 +1,6 @@
 use core::fmt::{self, Write};
 
-use super::lib_ui::textui::{textui_putchar, FontColor};
+use super::lib_ui::textui::{textui_putstr, FontColor};
 
 #[macro_export]
 macro_rules! print {
@@ -77,15 +77,11 @@ impl PrintkWriter {
     /// 并输出白底黑字
     /// @param str: 要写入的字符
     pub fn __write_string(&mut self, s: &str) {
-        for c in s.chars() {
-            textui_putchar(c, FontColor::WHITE, FontColor::BLACK).ok();
-        }
+        textui_putstr(s, FontColor::WHITE, FontColor::BLACK).ok();
     }
 
     pub fn __write_string_color(&self, fr_color: FontColor, bk_color: FontColor, s: &str) {
-        for c in s.chars() {
-            textui_putchar(c, fr_color, bk_color).ok();
-        }
+        textui_putstr(s, fr_color, bk_color).ok();
     }
 }
 

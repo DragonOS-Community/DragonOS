@@ -11,6 +11,9 @@ static spinlock_t apic_timer_init_lock = {1};
 // bsp 是否已经完成apic时钟初始化
 static bool bsp_initialized = false;
 
+extern uint64_t rs_get_cycles();
+extern uint64_t rs_tsc_get_cpu_khz();
+
 /**
  * @brief 初始化AP核的apic时钟
  *
@@ -59,7 +62,10 @@ uint64_t apic_timer_install(ul irq_num, void *arg)
     io_mfence();
 
     // 设置初始计数
-    apic_timer_set_init_cnt(*(uint64_t *)arg);
+
+    uint64_t cpu_khz = rs_tsc_get_cpu_khz();
+    uint64_t init_cnt = cpu_khz * APIC_TIMER_INTERVAL / APIC_TIMER_DIVISOR;
+    apic_timer_set_init_cnt(init_cnt);
     io_mfence();
     // 填写LVT
     apic_timer_set_LVT(APIC_TIMER_IRQ_NUM, 1, APIC_LVT_Timer_Periodic);
@@ -101,17 +107,11 @@ void apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
 void apic_timer_init()
 {
 
-    if (apic_timer_ticks_result == 0)
-    {
-        kBUG("APIC timer ticks in 5ms is equal to ZERO!");
-        while (1)
-            hlt();
-    }
     uint64_t flags = 0;
     spin_lock_irqsave(&apic_timer_init_lock, flags);
     kinfo("Initializing apic timer for cpu %d", rs_current_pcb_cpuid());
     io_mfence();
-    irq_register(APIC_TIMER_IRQ_NUM, &apic_timer_ticks_result, &apic_timer_handler, 0, &apic_timer_intr_controller,
+    irq_register(APIC_TIMER_IRQ_NUM, NULL, &apic_timer_handler, 0, &apic_timer_intr_controller,
                  "apic timer");
     io_mfence();
     if (rs_current_pcb_cpuid() == 0)

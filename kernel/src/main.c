@@ -39,6 +39,9 @@ extern void rs_kthread_init();
 extern void rs_init_intertrait();
 extern void rs_init_before_mem_init();
 extern int rs_setup_arch();
+extern int rs_hpet_init();
+extern int rs_hpet_enable();
+extern int rs_tsc_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -150,17 +153,13 @@ void system_initialize()
     smp_init();
 
     io_mfence();
-
-    HPET_init();
-    io_mfence();
-    HPET_measure_freq();
-
-    io_mfence();
     cli();
-    HPET_enable();
+    rs_hpet_init();
+    rs_hpet_enable();
+    rs_tsc_init();
 
     io_mfence();
-    
+
     kvm_init();
 
     io_mfence();

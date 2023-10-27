@@ -1,13 +1,12 @@
 // 参考手册: PCIe* GbE Controllers Open Source Software Developer’s Manual
 // Refernce: PCIe* GbE Controllers Open Source Software Developer’s Manual
 
-
 use alloc::vec::Vec;
+use core::intrinsics::unlikely;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
-use core::intrinsics::unlikely;
 
 use super::e1000e_driver::e1000e_driver_init;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
@@ -15,9 +14,7 @@ use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PCI_DEVICE_LINKEDLIST,
 };
-use crate::driver::pci::pci_irq::{
-    IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ,
-};
+use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
 use crate::include::bindings::bindings::pt_regs;
 use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
 use crate::net::net_core::poll_ifaces_try_lock_onetime;
@@ -60,7 +57,6 @@ const E1000E_RECV_VECTOR: u16 = 57;
 
 // napi队列中暂时存储的buffer个数
 const E1000E_RECV_NAPI: usize = 1024;
-
 
 // 收/发包的描述符结构 pp.24 Table 3-1
 #[repr(C)]
@@ -286,13 +282,14 @@ impl E1000EDevice {
         // Read mac address
         let ral = unsafe { volread!(ra_regs, ral0) };
         let rah = unsafe { volread!(ra_regs, rah0) };
-        let mut mac: [u8; 6] = [0x00; 6];
-        for i in 0..4 {
-            mac[i] = ((ral & (0xff << (i * 8))) >> (i * 8)) as u8;
-        }
-        for i in 0..2 {
-            mac[i + 4] = ((rah & (0xff << (i * 8))) >> (i * 8)) as u8
-        }
+        let mac: [u8; 6] = [
+            ((ral >> 0) & 0xFF) as u8,
+            ((ral >> 8) & 0xFF) as u8,
+            ((ral >> 16) & 0xFF) as u8,
+            ((ral >> 24) & 0xFF) as u8,
+            ((rah >> 0) & 0xFF) as u8,
+            ((rah >> 8) & 0xFF) as u8,
+        ];
         // 初始化receive和transimit descriptor环形队列
         // initialize receive and transimit desciptor ring
         let (recv_ring_pa, recv_ring_va) = dma_alloc(E1000E_DMA_PAGES);

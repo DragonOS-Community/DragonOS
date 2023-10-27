@@ -4,7 +4,6 @@ mod acpi;
 mod c_adapter;
 pub mod cpu;
 pub mod fpu;
-pub mod futex;
 pub mod interrupt;
 pub mod ipc;
 pub mod kvm;

@@ -1,4 +1,5 @@
 use crate::{
+    mm::VirtAddr,
     syscall::{Syscall, SystemError},
     time::TimeSpec,
 };
@@ -7,43 +8,47 @@ use super::{constant::*, futex::Futex};
 
 impl Syscall {
     pub fn do_futex(
-        uaddr: *const u32,
-        operation: u32,
+        uaddr: VirtAddr,
+        operation: FutexFlag,
         val: u32,
-        timeout: *const TimeSpec,
-        uaddr2: *const u32,
+        timeout: Option<TimeSpec>,
+        uaddr2: VirtAddr,
         val2: u32,
         val3: u32,
     ) -> Result<usize, SystemError> {
-        let cmd = operation & FUTEX_CMD_MASK;
+        let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
+            .ok_or(SystemError::ENOSYS)?;
 
-        let mut flags = 0;
+        let mut flags = FutexFlag::FLAGS_MATCH_NONE;
 
-        if operation & FUTEX_PRIVATE_FLAG == 0 {
-            flags = FLAGS_SHARED;
+        if !operation.contains(FutexFlag::FUTEX_PRIVATE_FLAG) {
+            flags.insert(FutexFlag::FLAGS_SHARED);
         }
 
-        if operation & FUTEX_CLOCK_REALTIME != 0 {
-            flags = FLAGS_CLOCKRT;
-            if cmd != FUTEX_WAIT_BITSET && cmd != FUTEX_WAIT_REQUEUE_PI && cmd != FUTEX_LOCK_PI2 {
+        if operation.contains(FutexFlag::FUTEX_CLOCK_REALTIME) {
+            flags.insert(FutexFlag::FLAGS_CLOCKRT);
+            if cmd != FutexArg::FUTEX_WAIT_BITSET
+                && cmd != FutexArg::FUTEX_WAIT_REQUEUE_PI
+                && cmd != FutexArg::FUTEX_LOCK_PI2
+            {
                 return Err(SystemError::ENOSYS);
             }
         }
 
         match cmd {
-            FUTEX_WAIT => {
+            FutexArg::FUTEX_WAIT => {
                 return Futex::futex_wait(uaddr, flags, val, timeout, FUTEX_BITSET_MATCH_ANY);
             }
-            FUTEX_WAIT_BITSET => {
+            FutexArg::FUTEX_WAIT_BITSET => {
                 return Futex::futex_wait(uaddr, flags, val, timeout, val3);
             }
-            FUTEX_WAKE => {
+            FutexArg::FUTEX_WAKE => {
                 return Futex::futex_wake(uaddr, flags, val, FUTEX_BITSET_MATCH_ANY);
             }
-            FUTEX_WAKE_BITSET => {
+            FutexArg::FUTEX_WAKE_BITSET => {
                 return Futex::futex_wake(uaddr, flags, val, val3);
             }
-            FUTEX_REQUEUE => {
+            FutexArg::FUTEX_REQUEUE => {
                 return Futex::futex_requeue(
                     uaddr,
                     flags,
@@ -54,7 +59,7 @@ impl Syscall {
                     false,
                 );
             }
-            FUTEX_CMP_REQUEUE => {
+            FutexArg::FUTEX_CMP_REQUEUE => {
                 return Futex::futex_requeue(
                     uaddr,
                     flags,
@@ -65,7 +70,7 @@ impl Syscall {
                     false,
                 );
             }
-            FUTEX_WAKE_OP => {
+            FutexArg::FUTEX_WAKE_OP => {
                 return Futex::futex_wake_op(
                     uaddr,
                     flags,
@@ -75,22 +80,22 @@ impl Syscall {
                     val3 as i32,
                 );
             }
-            FUTEX_LOCK_PI => {
+            FutexArg::FUTEX_LOCK_PI => {
                 todo!()
             }
-            FUTEX_LOCK_PI2 => {
+            FutexArg::FUTEX_LOCK_PI2 => {
                 todo!()
             }
-            FUTEX_UNLOCK_PI => {
+            FutexArg::FUTEX_UNLOCK_PI => {
                 todo!()
             }
-            FUTEX_TRYLOCK_PI => {
+            FutexArg::FUTEX_TRYLOCK_PI => {
                 todo!()
             }
-            FUTEX_WAIT_REQUEUE_PI => {
+            FutexArg::FUTEX_WAIT_REQUEUE_PI => {
                 todo!()
             }
-            FUTEX_CMP_REQUEUE_PI => {
+            FutexArg::FUTEX_CMP_REQUEUE_PI => {
                 todo!()
             }
             _ => {

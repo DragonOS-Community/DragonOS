@@ -36,6 +36,7 @@ use crate::{
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     sched::{
+        completion::Completion,
         core::{sched_enqueue, CPU_EXECUTING},
         SchedPolicy, SchedPriority,
     },
@@ -252,7 +253,7 @@ impl ProcessManager {
         assert_eq!(
             CurrentIrqArch::is_irq_enabled(),
             false,
-            "interrupt must be disabled before enter ProcessManager::mark_sleep()"
+            "interrupt must be disabled before enter ProcessManager::mark_slop()"
         );
 
         let pcb = ProcessManager::current_pcb();
@@ -306,9 +307,23 @@ impl ProcessManager {
             .write()
             .set_state(ProcessState::Exited(exit_code));
         pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+
+        // 进行进程退出后的工作
+        // 这块应该是有release方法完成的，但是目前有一个引用不知道在哪未释放
+        let thread = pcb.thread.write();
+        if let Some(addr) = thread.set_child_tid {
+            unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
+        }
+
+        if let Some(addr) = thread.clear_child_tid {
+            unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
+        }
+        drop(thread);
+
         drop(pcb);
         ProcessManager::exit_notify();
         drop(irq_guard);
+
         sched();
         loop {}
     }
@@ -482,7 +497,7 @@ pub struct ProcessControlBlock {
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
-    children: RwLock<HashMap<Pid, Arc<ProcessControlBlock>>>,
+    children: RwLock<Vec<Pid>>,
 
     /// 等待队列
     wait_queue: WaitQueue,
@@ -548,7 +563,7 @@ impl ProcessControlBlock {
             sig_info: RwLock::new(ProcessSignalInfo::default()),
             sig_struct: SpinLock::new(SignalStruct::default()),
             parent_pcb: RwLock::new(ppcb),
-            children: RwLock::new(HashMap::new()),
+            children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::INIT,
             thread: RwLock::new(ThreadInfo::new()),
         };
@@ -556,13 +571,18 @@ impl ProcessControlBlock {
         let pcb = Arc::new(pcb);
 
         // 设置进程的arc指针到内核栈的最低地址处
-        unsafe { pcb.kernel_stack.write().set_pcb(Arc::clone(&pcb)).unwrap() };
+        unsafe {
+            pcb.kernel_stack
+                .write()
+                .set_pcb(Arc::downgrade(&pcb))
+                .unwrap()
+        };
 
         // 将当前pcb加入父进程的子进程哈希表中
         if pcb.pid() > Pid(1) {
             if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
                 let mut children = ppcb_arc.children.write();
-                children.insert(pcb.pid(), pcb.clone());
+                children.push(pcb.pid());
             } else {
                 panic!("parent pcb is None");
             }
@@ -704,11 +724,11 @@ impl ProcessControlBlock {
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
         match ProcessManager::find(Pid(1)) {
             Some(init_pcb) => {
-                let mut childen_guard = self.children.write();
+                let childen_guard = self.children.write();
                 let mut init_childen_guard = init_pcb.children.write();
 
-                childen_guard.drain().for_each(|(pid, child)| {
-                    init_childen_guard.insert(pid, child);
+                childen_guard.iter().for_each(|pid| {
+                    init_childen_guard.push(*pid);
                 });
 
                 return Ok(());
@@ -747,14 +767,17 @@ impl ProcessControlBlock {
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         // 处理线程信息
-        let mut thread = self.thread.write();
+        let thread = self.thread.write();
 
         // 将user_tid_addr置0
-        if thread.clear_child_tid.is_null() {
-            let _ = unsafe { clear_user(thread.clear_child_tid, core::mem::size_of::<i32>()) };
+        if thread.clear_child_tid.is_some() {
+            let _ =
+                unsafe { clear_user(thread.clear_child_tid.unwrap(), core::mem::size_of::<i32>()) };
+        }
 
-            // Once
-            thread.clear_child_tid = VirtAddr::new(0);
+        // 如果是vfork出来的进程，则需要处理completion
+        if thread.vfork_done.is_some() {
+            thread.vfork_done.as_ref().unwrap().complete_all();
         }
 
         // 在ProcFS中,解除进程的注册
@@ -762,10 +785,8 @@ impl Drop for ProcessControlBlock {
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
 
         if let Some(ppcb) = self.parent_pcb.read().upgrade() {
-            ppcb.children.write().remove(&self.pid());
+            ppcb.children.write().drain_filter(|pid| *pid == self.pid());
         }
-
-        unsafe { ProcessManager::release(self.pid()) };
     }
 }
 
@@ -773,15 +794,18 @@ impl Drop for ProcessControlBlock {
 #[derive(Debug)]
 pub struct ThreadInfo {
     // 来自用户空间记录用户线程id的地址，在该线程结束时将该地址置0以通知父进程
-    clear_child_tid: VirtAddr,
-    set_child_tid: VirtAddr,
+    clear_child_tid: Option<VirtAddr>,
+    set_child_tid: Option<VirtAddr>,
+
+    vfork_done: Option<Arc<Completion>>,
 }
 
 impl ThreadInfo {
     pub fn new() -> Self {
         Self {
-            clear_child_tid: VirtAddr::new(0),
-            set_child_tid: VirtAddr::new(0),
+            clear_child_tid: None,
+            set_child_tid: None,
+            vfork_done: None,
         }
     }
 }
@@ -1027,9 +1051,9 @@ impl KernelStack {
         return VirtAddr::new(self.stack.as_ref().unwrap().as_ptr() as usize + Self::SIZE);
     }
 
-    pub unsafe fn set_pcb(&mut self, pcb: Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+    pub unsafe fn set_pcb(&mut self, pcb: Weak<ProcessControlBlock>) -> Result<(), SystemError> {
         // 将一个Arc<ProcessControlBlock>放到内核栈的最低地址处
-        let p: *const ProcessControlBlock = Arc::into_raw(pcb);
+        let p: *const ProcessControlBlock = pcb.as_ptr();
         let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误

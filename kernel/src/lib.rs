@@ -20,6 +20,7 @@
 #![feature(ptr_to_from_bits)]
 #![feature(concat_idents)]
 #![cfg_attr(target_os = "none", no_std)]
+#![feature(atomic_mut_ptr)]
 
 #[cfg(test)]
 #[macro_use]
@@ -40,7 +41,6 @@ mod include;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
 mod filesystem;
-mod futex;
 mod init;
 mod ipc;
 mod mm;

@@ -2,6 +2,7 @@ use core::ffi::c_void;
 
 use alloc::{
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 
@@ -17,6 +18,7 @@ use crate::{
     include::bindings::bindings::verify_area,
     mm::VirtAddr,
     process::ProcessControlBlock,
+    sched::completion::Completion,
     syscall::{
         user_access::{
             check_and_clone_cstr, check_and_clone_cstr_array, UserBufferReader, UserBufferWriter,
@@ -104,7 +106,7 @@ impl Syscall {
 
         if pid > 0 {
             let pid = Pid(pid as usize);
-            let child_pcb = rd_childen.get(&pid).ok_or(SystemError::ECHILD)?.clone();
+            let child_pcb = ProcessManager::find(pid).ok_or(SystemError::ECHILD)?;
             drop(rd_childen);
 
             loop {
@@ -138,6 +140,7 @@ impl Syscall {
                                 0,
                             )?;
                         }
+                        unsafe { ProcessManager::release(pid) };
                         return Ok(pid.into());
                     }
                 };
@@ -156,7 +159,8 @@ impl Syscall {
         } else {
             // 等待任意子进程(这两)
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            for (pid, pcb) in rd_childen.iter() {
+            for pid in rd_childen.iter() {
+                let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
                 if pcb.sched_info().state().is_exited() {
                     if !wstatus.is_null() {
                         wstatus_buf.copy_one_to_user(&0, 0)?;
@@ -215,6 +219,9 @@ impl Syscall {
         clone_args: KernelCloneArgs,
     ) -> Result<usize, SystemError> {
         let flags = clone_args.flags;
+
+        let vfork = Arc::new(Completion::new());
+
         if flags.contains(CloneFlags::CLONE_PIDFD)
             && flags.contains(CloneFlags::CLONE_PARENT_SETTID)
         {
@@ -225,10 +232,8 @@ impl Syscall {
         let new_kstack = KernelStack::new()?;
         let name = current_pcb.basic().name().to_string();
         let pcb = ProcessControlBlock::new(name, new_kstack);
-
         // 克隆pcb
         ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;
-
         ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
@@ -240,6 +245,17 @@ impl Syscall {
             )
         });
 
+        if flags.contains(CloneFlags::CLONE_VFORK) {
+            pcb.thread.write().vfork_done = Some(vfork.clone());
+        }
+
+        if pcb.thread.read().set_child_tid.is_some() {
+            let addr = pcb.thread.read().set_child_tid.unwrap();
+            let mut writer =
+                UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
+            writer.copy_one_to_user(&(pcb.pid().data() as i32), 0)?;
+        }
+
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
@@ -250,7 +266,7 @@ impl Syscall {
 
         if flags.contains(CloneFlags::CLONE_VFORK) {
             // 等待子进程结束或者exec;
-            pcb.wait_queue.sleep();
+            vfork.wait_for_completion_interruptible()?;
         }
 
         return Ok(pcb.pid().0);
@@ -263,7 +279,7 @@ impl Syscall {
         }
 
         let pcb = ProcessManager::current_pcb();
-        pcb.thread.write().clear_child_tid = VirtAddr::new(ptr);
+        pcb.thread.write().clear_child_tid = Some(VirtAddr::new(ptr));
         Ok(pcb.pid.0)
     }
 }

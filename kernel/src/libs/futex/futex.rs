@@ -1,14 +1,16 @@
-use core::intrinsics::likely;
-
-use alloc::{collections::LinkedList, sync::Arc};
+use alloc::{
+    collections::LinkedList,
+    sync::{Arc, Weak},
+};
+use core::hash::{Hash, Hasher};
+use core::{cell::RefCell, intrinsics::likely, sync::atomic::AtomicU64};
 use hashbrown::HashMap;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    include::bindings::bindings::verify_area,
-    libs::spinlock::SpinLock,
-    mm::{MemoryManagementArch, VirtAddr},
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessManager},
     syscall::{user_access::UserBufferReader, SystemError},
     time::{
@@ -19,14 +21,19 @@ use crate::{
 
 use super::constant::*;
 
-lazy_static! {
-    pub(super) static ref FUTEX_DATA: SpinLock<HashMap<FutexKey, LockedFutexHashBucket>> =
-        SpinLock::new(HashMap::new());
+static mut FUTEX_DATA: Option<FutexData> = None;
+
+pub struct FutexData {
+    data: SpinLock<HashMap<FutexKey, RefCell<FutexHashBucket>>>,
+}
+
+impl FutexData {
+    pub fn get_futex_map() -> SpinLockGuard<'static, HashMap<FutexKey, RefCell<FutexHashBucket>>> {
+        unsafe { FUTEX_DATA.as_ref().unwrap().data.lock() }
+    }
 }
 
 pub struct Futex;
-
-pub struct LockedFutexHashBucket(SpinLock<FutexHashBucket>);
 
 // 对于同一个futex的进程或线程将会在这个bucket等待
 pub struct FutexHashBucket {
@@ -39,7 +46,7 @@ impl FutexHashBucket {
     pub fn contains(&self, futex_q: &FutexObj) -> bool {
         self.chain
             .iter()
-            .filter(|x| x.pcb.pid() == futex_q.pcb.pid() && x.key == futex_q.key)
+            .filter(|x| futex_q.pcb.ptr_eq(&x.pcb) && x.key == futex_q.key)
             .count()
             != 0
     }
@@ -83,7 +90,9 @@ impl FutexHashBucket {
                 }
 
                 // 唤醒
-                ProcessManager::wakeup(&futex_q.pcb)?;
+                if futex_q.pcb.upgrade().is_some() {
+                    ProcessManager::wakeup(&futex_q.pcb.upgrade().unwrap())?;
+                }
 
                 // 判断唤醒数
                 count += 1;
@@ -101,10 +110,15 @@ impl FutexHashBucket {
         }
         Ok(count as usize)
     }
+
+    /// 将FutexObj从bucket中删除
+    pub fn remove(&mut self, futex: Arc<FutexObj>) {
+        self.chain.drain_filter(|x| x.key == futex.key);
+    }
 }
 
 pub struct FutexObj {
-    pcb: Arc<ProcessControlBlock>,
+    pcb: Weak<ProcessControlBlock>,
     key: FutexKey,
     bitset: u32,
     // TODO: 优先级继承
@@ -116,14 +130,14 @@ pub enum FutexAccess {
 }
 
 #[allow(dead_code)]
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
 /// ### 用于定位内核唯一的futex
 pub enum InnerFutexKey {
     Shared(SharedKey),
     Private(PrivateKey),
 }
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct FutexKey {
     ptr: u64,
     word: u64,
@@ -132,26 +146,60 @@ pub struct FutexKey {
 }
 
 /// 不同进程间通过文件共享futex变量，表明该变量在文件中的位置
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct SharedKey {
     i_seq: u64,
     page_offset: u64,
 }
 
 /// 同一进程的不同线程共享futex变量，表明该变量在进程地址空间中的位置
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Clone, Debug)]
 pub struct PrivateKey {
+    // 所在的地址空间
+    address_space: Option<Weak<AddressSpace>>,
     // 表示所在页面的初始地址
     address: u64,
 }
 
+impl Hash for PrivateKey {
+    fn hash<H: ~const Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+    }
+}
+
+impl Eq for PrivateKey {}
+
+impl PartialEq for PrivateKey {
+    fn eq(&self, other: &Self) -> bool {
+        if self.address_space.is_none() && other.address_space.is_none() {
+            return self.address == other.address;
+        } else {
+            return self
+                .address_space
+                .as_ref()
+                .unwrap_or(&Weak::default())
+                .ptr_eq(&other.address_space.as_ref().unwrap_or(&Weak::default()))
+                && self.address == other.address;
+        }
+    }
+}
+
 impl Futex {
+    /// ### 初始化FUTEX_DATA
+    pub fn init() {
+        unsafe {
+            FUTEX_DATA = Some(FutexData {
+                data: SpinLock::new(HashMap::new()),
+            })
+        };
+    }
+
     /// ### 让当前进程在指定futex上等待直到futex_writ显式唤醒
     pub fn futex_wait(
-        uaddr: *const u32,
-        flags: u32,
+        uaddr: VirtAddr,
+        flags: FutexFlag,
         val: u32,
-        abs_time: *const TimeSpec,
+        abs_time: Option<TimeSpec>,
         bitset: u32,
     ) -> Result<usize, SystemError> {
         if bitset == 0 {
@@ -159,28 +207,34 @@ impl Futex {
         }
 
         // 获取全局hash表的key值
-        let key = Self::get_futex_key(uaddr, flags & FLAGS_SHARED != 0, FutexAccess::FutexRead)?;
-        let mut binding = FUTEX_DATA.lock();
+        let key = Self::get_futex_key(
+            uaddr,
+            flags.contains(FutexFlag::FLAGS_SHARED),
+            FutexAccess::FutexRead,
+        )?;
+
+        let mut binding = FutexData::get_futex_map();
         let bucket = binding.get(&key);
         let bucket = match bucket {
             Some(bucket) => bucket,
             None => {
-                let bucket = LockedFutexHashBucket(SpinLock::new(FutexHashBucket {
+                let bucket = RefCell::new(FutexHashBucket {
                     chain: LinkedList::new(),
-                }));
-                binding.insert(key, bucket);
+                });
+                binding.insert(key.clone(), bucket);
                 binding.get(&key).unwrap()
             }
         };
 
         // 使用UserBuffer读取futex
-        let user_reader = UserBufferReader::new(uaddr, 4, true)?;
+        let user_reader =
+            UserBufferReader::new(uaddr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
 
         // 从用户空间读取到futex的val
         let mut uval = 0;
 
         // 对bucket上锁，避免在读之前futex值被更改
-        let mut bucket_guard = bucket.0.lock();
+        let mut bucket_mut = bucket.borrow_mut();
 
         // 读取
         // 这里只尝试一种方式去读取用户空间，与linux不太一致
@@ -195,12 +249,8 @@ impl Futex {
         let pcb = ProcessManager::current_pcb();
         // 创建超时计时器任务
         let mut timer = None;
-        if !abs_time.is_null() {
-            // 校验地址
-            let buffer_reader =
-                UserBufferReader::new(abs_time, core::mem::size_of::<TimeSpec>(), true)?;
-
-            let time = buffer_reader.read_one_from_user::<TimeSpec>(0)?;
+        if !abs_time.is_none() {
+            let time = abs_time.unwrap();
 
             let wakeup_helper = WakeUpHelper::new(pcb.clone());
 
@@ -214,26 +264,30 @@ impl Futex {
             timer = Some(wake_up);
         }
 
-        let futex_q = Arc::new(FutexObj { pcb, key, bitset });
-
+        let futex_q = Arc::new(FutexObj {
+            pcb: Arc::downgrade(&pcb),
+            key,
+            bitset,
+        });
         // 满足条件则将当前进程在该bucket上挂起
-        bucket_guard.sleep(futex_q.clone())?;
+        bucket_mut.sleep(futex_q.clone())?;
 
         // 被唤醒后的检查
 
         // 如果该pcb不在链表里面了，就证明是正常的Wake操作
-        if !bucket_guard.contains(&futex_q) {
+        if !bucket_mut.contains(&futex_q) {
             // 取消定时器任务
             if timer.is_some() {
                 timer.unwrap().cancel();
             }
-
             return Ok(0);
         }
 
         // 如果是超时唤醒，则返回错误
         if timer.is_some() {
             if timer.clone().unwrap().timeout() {
+                bucket_mut.remove(futex_q);
+
                 return Err(SystemError::ETIMEDOUT);
             }
         }
@@ -258,8 +312,8 @@ impl Futex {
 
     // ### 唤醒指定futex上挂起的最多nr_wake个进程
     pub fn futex_wake(
-        uaddr: *const u32,
-        flags: u32,
+        uaddr: VirtAddr,
+        flags: FutexFlag,
         nr_wake: u32,
         bitset: u32,
     ) -> Result<usize, SystemError> {
@@ -268,26 +322,29 @@ impl Futex {
         }
 
         // 获取futex_key,并且判断地址空间合法性
-        let key = Self::get_futex_key(uaddr, flags & FLAGS_SHARED != 0, FutexAccess::FutexRead)?;
-        let binding = FUTEX_DATA.lock();
+        let key = Self::get_futex_key(
+            uaddr,
+            flags.contains(FutexFlag::FLAGS_SHARED),
+            FutexAccess::FutexRead,
+        )?;
+        let binding = FutexData::get_futex_map();
         let bucket = binding.get(&key).ok_or(SystemError::EINVAL)?;
 
-        let mut bucket_guard = bucket.0.lock();
+        let mut bucket_mut = bucket.borrow_mut();
 
         // 确保后面的唤醒操作是有意义的
-        if bucket_guard.chain.len() == 0 {
+        if bucket_mut.chain.len() == 0 {
             return Ok(0);
         }
-
         // 从队列中唤醒
-        Ok(bucket_guard.wake_up(key, Some(bitset), nr_wake)?)
+        Ok(bucket_mut.wake_up(key, Some(bitset), nr_wake)?)
     }
 
     /// ### 唤醒制定uaddr1上的最多nr_wake个进程，然后将uaddr1最多nr_requeue个进程移动到uaddr2绑定的futex上
     pub fn futex_requeue(
-        uaddr1: *const u32,
-        flags: u32,
-        uaddr2: *const u32,
+        uaddr1: VirtAddr,
+        flags: FutexFlag,
+        uaddr2: VirtAddr,
         nr_wake: i32,
         nr_requeue: i32,
         cmpval: Option<u32>,
@@ -302,8 +359,12 @@ impl Futex {
             return Err(SystemError::ENOSYS);
         }
 
-        let key1 = Self::get_futex_key(uaddr1, flags & FLAGS_SHARED != 0, FutexAccess::FutexRead)?;
-        let key2 = Self::get_futex_key(uaddr2, flags & FLAGS_SHARED != 0, {
+        let key1 = Self::get_futex_key(
+            uaddr1,
+            flags.contains(FutexFlag::FLAGS_SHARED),
+            FutexAccess::FutexRead,
+        )?;
+        let key2 = Self::get_futex_key(uaddr2, flags.contains(FutexFlag::FLAGS_SHARED), {
             match requeue_pi {
                 true => FutexAccess::FutexWrite,
                 false => FutexAccess::FutexRead,
@@ -314,12 +375,13 @@ impl Futex {
             return Err(SystemError::EINVAL);
         }
 
-        let binding = FUTEX_DATA.lock();
+        let binding = FutexData::get_futex_map();
         let bucket1 = binding.get(&key1).ok_or(SystemError::EINVAL)?;
         let bucket2 = binding.get(&key2).ok_or(SystemError::EINVAL)?;
 
         if likely(!cmpval.is_none()) {
-            let uval_reader = UserBufferReader::new(uaddr1, core::mem::size_of::<u32>(), true)?;
+            let uval_reader =
+                UserBufferReader::new(uaddr1.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
             let curval = uval_reader.read_one_from_user::<u32>(0)?;
 
             // 判断是否满足条件
@@ -329,19 +391,19 @@ impl Futex {
         }
 
         // 对bucket上锁
-        let mut bucket_guard_1 = bucket1.0.lock();
-        let mut bucket_guard_2 = bucket2.0.lock();
+        let mut bucket_1_mut = bucket1.borrow_mut();
+        let mut bucket_2_mut = bucket2.borrow_mut();
 
         if !requeue_pi {
             // 唤醒nr_wake个进程
-            let ret = bucket_guard_1.wake_up(key1, None, nr_wake as u32)?;
+            let ret = bucket_1_mut.wake_up(key1, None, nr_wake as u32)?;
 
             // 将bucket1中最多nr_requeue个任务转移到bucket2
             for _ in 0..nr_requeue {
-                let futex_q = bucket_guard_1.chain.pop_front();
+                let futex_q = bucket_1_mut.chain.pop_front();
                 match futex_q {
                     Some(futex_q) => {
-                        bucket_guard_2.chain.push_back(futex_q);
+                        bucket_2_mut.chain.push_back(futex_q);
                     }
                     None => {
                         break;
@@ -358,20 +420,27 @@ impl Futex {
 
     /// ### 唤醒futex上的进程的同时进行一些操作
     pub fn futex_wake_op(
-        uaddr1: *const u32,
-        flags: u32,
-        uaddr2: *const u32,
+        uaddr1: VirtAddr,
+        flags: FutexFlag,
+        uaddr2: VirtAddr,
         nr_wake: i32,
         nr_wake2: i32,
         op: i32,
     ) -> Result<usize, SystemError> {
-        let key1 = Futex::get_futex_key(uaddr1, flags & FLAGS_SHARED != 0, FutexAccess::FutexRead)?;
-        let key2 =
-            Futex::get_futex_key(uaddr2, flags & FLAGS_SHARED != 0, FutexAccess::FutexWrite)?;
+        let key1 = Futex::get_futex_key(
+            uaddr1,
+            flags.contains(FutexFlag::FLAGS_SHARED),
+            FutexAccess::FutexRead,
+        )?;
+        let key2 = Futex::get_futex_key(
+            uaddr2,
+            flags.contains(FutexFlag::FLAGS_SHARED),
+            FutexAccess::FutexWrite,
+        )?;
 
-        let binding = FUTEX_DATA.lock();
-        let mut bucket1 = binding.get(&key1).ok_or(SystemError::EINVAL)?.0.lock();
-        let mut bucket2 = binding.get(&key2).ok_or(SystemError::EINVAL)?.0.lock();
+        let binding = FutexData::get_futex_map();
+        let mut bucket1 = binding.get(&key1).ok_or(SystemError::EINVAL)?.borrow_mut();
+        let mut bucket2 = binding.get(&key2).ok_or(SystemError::EINVAL)?.borrow_mut();
         let mut wake_count = 0;
 
         // 唤醒uaddr1中的进程
@@ -394,26 +463,21 @@ impl Futex {
     }
 
     fn get_futex_key(
-        uaddr: *const u32,
+        uaddr: VirtAddr,
         fshared: bool,
         _access: FutexAccess,
     ) -> Result<FutexKey, SystemError> {
-        let mut address = uaddr as u64;
+        let mut address = uaddr.data();
 
         // 计算相对页的偏移量
-        let offset = address % MMArch::PAGE_SIZE as u64;
+        let offset = address & (MMArch::PAGE_SIZE - 1);
         // 判断内存对齐
-        if !(uaddr as usize & (core::mem::size_of::<u32>() - 1) == 0) {
+        if !(uaddr.data() & (core::mem::size_of::<u32>() - 1) == 0) {
             return Err(SystemError::EINVAL);
         }
 
         // 目前address指向所在页面的起始地址
         address -= offset;
-
-        // 判断地址空间的可访问性
-        if !unsafe { verify_area(uaddr as u64, core::mem::size_of::<u32>() as u64) } {
-            return Err(SystemError::EFAULT);
-        }
 
         // 若不是进程间共享的futex，则返回Private
         if !fshared {
@@ -423,26 +487,32 @@ impl Futex {
                 offset: offset as u32,
                 key: InnerFutexKey::Private(PrivateKey {
                     address: address as u64,
+                    address_space: None,
                 }),
             });
         }
-        // 未实现共享内存机制
-        // todo!("Shared memory not implemented");
-        // TODO: 目前这样写可能会出现意料之外的错误
-        crate::kwarn!("Shared memory not implemented,generate futex key using default method");
+
+        // 获取到地址所在地址空间
+        let address_space = AddressSpace::current()?;
+        // TODO： 判断是否为匿名映射，是匿名映射才返回PrivateKey
         return Ok(FutexKey {
             ptr: 0,
             word: 0,
             offset: offset as u32,
             key: InnerFutexKey::Private(PrivateKey {
                 address: address as u64,
+                address_space: Some(Arc::downgrade(&address_space)),
             }),
         });
+
+        // 未实现共享内存机制,贡献内存部分应该通过inode构建SharedKey
+        // todo!("Shared memory not implemented");
     }
 
-    pub fn futex_atomic_op_inuser(encoded_op: u32, uaddr: *const u32) -> Result<bool, SystemError> {
-        let op = (encoded_op & 0x70000000) >> 28;
-        let cmp = (encoded_op & 0x0f000000) >> 24;
+    pub fn futex_atomic_op_inuser(encoded_op: u32, uaddr: VirtAddr) -> Result<bool, SystemError> {
+        let op = FutexOP::from_bits((encoded_op & 0x70000000) >> 28).ok_or(SystemError::ENOSYS)?;
+        let cmp =
+            FutexOpCMP::from_bits((encoded_op & 0x0f000000) >> 24).ok_or(SystemError::ENOSYS)?;
 
         let sign_extend32 = |value: u32, index: i32| {
             let shift = (31 - index) as u8;
@@ -452,7 +522,7 @@ impl Futex {
         let mut oparg = sign_extend32((encoded_op & 0x00fff000) >> 12, 11);
         let cmparg = sign_extend32(encoded_op & 0x00000fff, 11);
 
-        if encoded_op & (FUTEX_OP_OPARG_SHIFT << 28) != 0 {
+        if encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0 {
             if oparg > 31 {
                 kwarn!(
                     "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
@@ -465,25 +535,25 @@ impl Futex {
         }
 
         // TODO: 这个汇编似乎是有问题的，目前不好测试
-        let old_val = Self::arch_futex_atomic_op_inuser(op, oparg, VirtAddr::new(uaddr as usize))?;
+        let old_val = Self::arch_futex_atomic_op_inuser(op, oparg, uaddr)?;
 
         match cmp {
-            FUTEX_OP_CMP_EQ => {
+            FutexOpCMP::FUTEX_OP_CMP_EQ => {
                 return Ok(cmparg == old_val);
             }
-            FUTEX_OP_CMP_NE => {
+            FutexOpCMP::FUTEX_OP_CMP_NE => {
                 return Ok(cmparg != old_val);
             }
-            FUTEX_OP_CMP_LT => {
+            FutexOpCMP::FUTEX_OP_CMP_LT => {
                 return Ok(cmparg < old_val);
             }
-            FUTEX_OP_CMP_LE => {
+            FutexOpCMP::FUTEX_OP_CMP_LE => {
                 return Ok(cmparg <= old_val);
             }
-            FUTEX_OP_CMP_GE => {
+            FutexOpCMP::FUTEX_OP_CMP_GE => {
                 return Ok(cmparg >= old_val);
             }
-            FUTEX_OP_CMP_GT => {
+            FutexOpCMP::FUTEX_OP_CMP_GT => {
                 return Ok(cmparg > old_val);
             }
             _ => {
@@ -491,4 +561,54 @@ impl Futex {
             }
         }
     }
+
+    /// ### 对futex进行操作
+    ///
+    /// 进入该方法会关闭中断保证修改的原子性，所以进入该方法前应确保中断锁已释放
+    ///
+    /// ### return uaddr原来的值
+    #[allow(unused_assignments)]
+    pub fn arch_futex_atomic_op_inuser(
+        op: FutexOP,
+        oparg: u32,
+        uaddr: VirtAddr,
+    ) -> Result<u32, SystemError> {
+        let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        let reader =
+            UserBufferReader::new(uaddr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
+
+        let oldval = reader.read_one_from_user::<u32>(0)?;
+
+        let atomic_addr = AtomicU64::new(uaddr.data() as u64);
+        // 这个指针是指向指针的指针
+        let ptr = atomic_addr.as_mut_ptr();
+        match op {
+            FutexOP::FUTEX_OP_SET => unsafe {
+                *((*ptr) as *mut u32) = oparg;
+            },
+            FutexOP::FUTEX_OP_ADD => unsafe {
+                *((*ptr) as *mut u32) += oparg;
+            },
+            FutexOP::FUTEX_OP_OR => unsafe {
+                *((*ptr) as *mut u32) |= oparg;
+            },
+            FutexOP::FUTEX_OP_ANDN => unsafe {
+                *((*ptr) as *mut u32) &= oparg;
+            },
+            FutexOP::FUTEX_OP_XOR => unsafe {
+                *((*ptr) as *mut u32) ^= oparg;
+            },
+            _ => return Err(SystemError::ENOSYS),
+        }
+
+        drop(guard);
+
+        Ok(*oldval)
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn rs_futex_init() {
+    Futex::init();
 }

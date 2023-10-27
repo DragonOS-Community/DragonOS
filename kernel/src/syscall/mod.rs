@@ -3,7 +3,10 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::{arch::rand::GRandFlags, process::fork::KernelCloneArgs};
+use crate::{
+    libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    process::fork::KernelCloneArgs,
+};
 
 use num_traits::{FromPrimitive, ToPrimitive};
 
@@ -1023,32 +1026,42 @@ impl Syscall {
             }
 
             SYS_CLONE => {
+                let parent_tid = VirtAddr::new(args[2]);
+                let child_tid = VirtAddr::new(args[3]);
+
+                // 地址校验
+                verify_area(parent_tid, core::mem::size_of::<i32>())?;
+                verify_area(child_tid, core::mem::size_of::<i32>())?;
+
                 let mut clone_args = KernelCloneArgs::new();
                 clone_args.flags = CloneFlags::from_bits_truncate(args[0] as u64);
-                clone_args.stack = VirtAddr::new(args[1]);
-                clone_args.parent_tid = VirtAddr::new(args[2]);
-                clone_args.child_tid = VirtAddr::new(args[3]);
+                clone_args.stack = args[1];
+                clone_args.parent_tid = parent_tid;
+                clone_args.child_tid = child_tid;
                 clone_args.tls = args[4];
                 Self::clone(frame, clone_args)
             }
 
             SYS_FUTEX => {
-                let uaddr = args[0] as *const u32;
-                let operation = args[1] as u32;
+                let uaddr = VirtAddr::new(args[0]);
+                let operation = FutexFlag::from_bits(args[1] as u32).ok_or(SystemError::ENOSYS)?;
                 let val = args[2] as u32;
                 let utime = args[3];
-                let uaddr2 = args[4] as *const u32;
+                let uaddr2 = VirtAddr::new(args[4]);
                 let val3 = args[5] as u32;
 
-                let mut timespec: *mut TimeSpec = core::ptr::null::<TimeSpec>() as *mut TimeSpec;
-                if utime != 0 && (operation & crate::futex::constant::FLAGS_HAS_TIMEOUT) != 0 {
+                verify_area(uaddr, core::mem::size_of::<u32>())?;
+                verify_area(uaddr2, core::mem::size_of::<u32>())?;
+
+                let mut timespec = None;
+                if utime != 0 && operation.contains(FutexFlag::FLAGS_HAS_TIMEOUT) {
                     let reader = UserBufferReader::new(
                         utime as *const TimeSpec,
                         core::mem::size_of::<TimeSpec>(),
                         true,
                     )?;
 
-                    reader.copy_one_from_user(&mut timespec, 0)?;
+                    timespec = Some(reader.read_one_from_user::<TimeSpec>(0)?.clone());
                 }
 
                 Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
@@ -1088,13 +1101,25 @@ impl Syscall {
                 unimplemented!()
             }
 
-            SYS_POLL => Ok(0),
+            SYS_POLL => {
+                kwarn!("SYS_POLL has not yet been implemented");
+                Ok(0)
+            }
 
-            SYS_RT_SIGPROCMASK => Ok(0),
+            SYS_RT_SIGPROCMASK => {
+                kwarn!("SYS_RT_SIGPROCMASK has not yet been implemented");
+                Ok(0)
+            }
 
-            SYS_TKILL => Ok(0),
+            SYS_TKILL => {
+                kwarn!("SYS_TKILL has not yet been implemented");
+                Ok(0)
+            }
 
-            SYS_SIGALTSTACK => Ok(0),
+            SYS_SIGALTSTACK => {
+                kwarn!("SYS_SIGALTSTACK has not yet been implemented");
+                Ok(0)
+            }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

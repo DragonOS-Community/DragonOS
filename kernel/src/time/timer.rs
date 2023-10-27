@@ -72,7 +72,7 @@ impl Timer {
             expire_jiffies,
             timer_func,
             self_ref: Weak::default(),
-            timeout: false,
+            triggered: false,
         })));
 
         result.0.lock().self_ref = Arc::downgrade(&result);
@@ -114,7 +114,7 @@ impl Timer {
     #[inline]
     fn run(&self) {
         let mut timer = self.0.lock();
-        timer.timeout = true;
+        timer.triggered = true;
         let r = timer.timer_func.run();
         if unlikely(r.is_err()) {
             kerror!(
@@ -126,7 +126,7 @@ impl Timer {
 
     /// ## 判断定时器是否已经触发
     pub fn timeout(&self) -> bool {
-        self.0.lock().timeout
+        self.0.lock().triggered
     }
 
     /// ## 取消定时器任务
@@ -148,7 +148,7 @@ pub struct InnerTimer {
     /// self_ref
     self_ref: Weak<Timer>,
     /// 判断该计时器是否触发
-    timeout: bool,
+    triggered: bool,
 }
 
 #[derive(Debug)]

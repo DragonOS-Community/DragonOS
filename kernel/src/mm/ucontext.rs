@@ -958,15 +958,10 @@ impl core::hash::Hash for VMA {
     }
 }
 
+/// 描述不同类型的内存提供者或资源
 #[derive(Debug)]
 pub enum Provider {
-    Allocated { cow_file_ref: Option<GrantFileRef> }, // TODO:其他
-}
-
-#[derive(Debug)]
-pub struct GrantFileRef {
-    pub description: i32,
-    pub base_offset: usize,
+    Allocated, // TODO:其他
 }
 
 #[allow(dead_code)]
@@ -987,7 +982,7 @@ impl VMA {
             mapped: self.mapped,
             user_address_space: self.user_address_space.clone(),
             self_ref: self.self_ref.clone(),
-            provider: Provider::Allocated { cow_file_ref: None },
+            provider: Provider::Allocated,
         };
     }
 
@@ -1091,7 +1086,7 @@ impl VMA {
             mapped: true,
             user_address_space: None,
             self_ref: Weak::default(),
-            provider: Provider::Allocated { cow_file_ref: None },
+            provider: Provider::Allocated,
         });
         return Ok(r);
     }
@@ -1140,7 +1135,7 @@ impl VMA {
             mapped: true,
             user_address_space: None,
             self_ref: Weak::default(),
-            provider: Provider::Allocated { cow_file_ref: None },
+            provider: Provider::Allocated,
         });
         drop(flusher);
         // kdebug!("VMA::zeroed: flusher dropped");

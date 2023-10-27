@@ -39,6 +39,7 @@ extern void rs_kthread_init();
 extern void rs_init_intertrait();
 extern void rs_init_before_mem_init();
 extern int rs_setup_arch();
+extern void rs_futex_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -162,6 +163,8 @@ void system_initialize()
     io_mfence();
     
     kvm_init();
+
+    rs_futex_init();
 
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行

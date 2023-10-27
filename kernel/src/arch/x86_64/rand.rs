@@ -2,7 +2,10 @@ use core::arch::x86_64::_rdtsc;
 
 use alloc::vec::Vec;
 
-use crate::syscall::{user_access::UserBufferWriter, Syscall, SystemError};
+use crate::{
+    libs::rand::GRandFlags,
+    syscall::{user_access::UserBufferWriter, Syscall, SystemError},
+};
 
 pub fn rand() -> usize {
     return unsafe { (_rdtsc() * _rdtsc() + 998244353_u64 * _rdtsc()) as usize };
@@ -31,13 +34,5 @@ impl Syscall {
 
         writer.copy_to_user(&ret, 0)?;
         Ok(len)
-    }
-}
-
-bitflags! {
-    pub struct GRandFlags: u8{
-        const GRND_NONBLOCK = 0x0001;
-        const GRND_RANDOM = 0x0002;
-        const GRND_INSECURE = 0x0004;
     }
 }

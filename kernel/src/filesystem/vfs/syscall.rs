@@ -727,47 +727,10 @@ impl Syscall {
     }
 
     fn do_stat(path: &str) -> Result<PosixKstat, SystemError> {
-        // 文件名过长
-        if path.len() > MAX_PATHLEN as usize {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        let inode = ROOT_INODE().lookup(path)?;
-
-        let mut kstat = PosixKstat::new();
-        // 获取文件信息
-        let metadata = inode.metadata()?;
-        kstat.size = metadata.size as i64;
-        kstat.dev_id = metadata.dev_id as u64;
-        kstat.inode = metadata.inode_id.into() as u64;
-        kstat.blcok_size = metadata.blk_size as i64;
-        kstat.blocks = metadata.blocks as u64;
-
-        kstat.atime.tv_sec = metadata.atime.tv_sec;
-        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
-        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
-        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
-        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
-        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
-
-        kstat.nlink = metadata.nlinks as u64;
-        kstat.uid = metadata.uid as i32;
-        kstat.gid = metadata.gid as i32;
-        kstat.rdev = metadata.raw_dev as i64;
-        kstat.mode = metadata.mode;
-
-        match metadata.file_type {
-            FileType::File => kstat.mode.insert(ModeType::S_IFMT),
-            FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
-            FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
-            FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
-            FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
-            FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
-            FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
-            FileType::KvmDevice => todo!(),
-        }
-
-        return Ok(kstat);
+        let fd = Self::open(path, FileMode::O_RDONLY)?;
+        let ret = Self::do_fstat(fd as i32);
+        Self::close(fd)?;
+        ret
     }
 
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
@@ -782,14 +745,8 @@ impl Syscall {
     }
 
     pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let kstat = Self::do_stat(path)?;
-        if user_kstat.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        unsafe {
-            *user_kstat = kstat;
-        }
-        return Ok(0);
+        let fd = Self::open(path, FileMode::O_RDONLY)?;
+        Self::fstat(fd as i32, user_kstat)
     }
 
     pub fn mknod(

@@ -131,7 +131,7 @@ impl Syscall {
         arg2: usize,
         from_user: bool,
     ) -> Result<usize, SystemError> {
-        let mut arch_info = pcb.arch_info();
+        let mut arch_info = pcb.arch_info_irqsave();
         match option {
             ARCH_GET_FS => {
                 unsafe { arch_info.save_fsbase() };
@@ -155,19 +155,13 @@ impl Syscall {
                 arch_info.fsbase = arg2;
                 // 如果是当前进程则直接写入寄存器
                 if pcb.pid() == ProcessManager::current_pcb().pid() {
-                    // 关中断
-                    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
                     unsafe { arch_info.restore_fsbase() }
-                    drop(guard);
                 }
             }
             ARCH_SET_GS => {
                 arch_info.gsbase = arg2;
                 if pcb.pid() == ProcessManager::current_pcb().pid() {
-                    // 关中断
-                    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
                     unsafe { arch_info.restore_gsbase() }
-                    drop(guard);
                 }
             }
             _ => {
@@ -179,7 +173,7 @@ impl Syscall {
 
     #[allow(dead_code)]
     pub fn do_arch_prctl_common(_option: usize, _arg2: usize) -> Result<usize, SystemError> {
-        todo!();
+        todo!("do_arch_prctl_common not unimplemented");
     }
 }
 

@@ -1,9 +1,13 @@
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame, filesystem::procfs::procfs_register_pid,
-    ipc::signal::flush_signal_handlers, libs::rwlock::RwLock, mm::VirtAddr, process::ProcessFlags,
-    syscall::SystemError,
+    arch::interrupt::TrapFrame,
+    filesystem::procfs::procfs_register_pid,
+    ipc::signal::flush_signal_handlers,
+    libs::rwlock::RwLock,
+    mm::VirtAddr,
+    process::ProcessFlags,
+    syscall::{user_access::UserBufferWriter, SystemError},
 };
 
 use super::{
@@ -86,7 +90,7 @@ pub struct KernelCloneArgs {
 
     pub exit_signal: i32,
 
-    pub stack: VirtAddr,
+    pub stack: usize,
     // clone3用到
     pub stack_size: usize,
     pub tls: usize,
@@ -112,7 +116,7 @@ impl KernelCloneArgs {
             parent_tid: null_addr,
             set_tid: null_addr,
             exit_signal: 0,
-            stack: null_addr,
+            stack: 0,
             stack_size: 0,
             tls: 0,
             set_tid_size: 0,
@@ -288,7 +292,7 @@ impl ProcessManager {
         current_trapframe: &mut TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
-        // 不允许与不同命名空间的进程共享根目录
+        // 不允许与不同namespace的进程共享根目录
         if (clone_flags == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
             || clone_flags == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
         {
@@ -312,19 +316,19 @@ impl ProcessManager {
 
         // TODO: 处理CLONE_PARENT 与 SIGNAL_UNKILLABLE的情况
 
-        // 如果新进程使用不同的 pid 或用户名空间，
+        // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {
             if clone_flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID) {
                 return Err(SystemError::EINVAL);
             }
-            // TODO: 判断新进程与当前进程命名空间是否相同，不同则返回错误
+            // TODO: 判断新进程与当前进程namespace是否相同，不同则返回错误
         }
 
-        // 如果新进程将处于不同的时间命名空间，
+        // 如果新进程将处于不同的time namespace，
         // 则不能让它共享vm或线程组。
         if clone_flags.contains(CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM) {
-            // TODO: 判断时间命名空间，不同则返回错误
+            // TODO: 判断time namespace，不同则返回错误
         }
 
         if clone_flags.contains(CloneFlags::CLONE_PIDFD)
@@ -346,26 +350,23 @@ impl ProcessManager {
 
         // 设置clear_child_tid，在线程结束时将其置0以通知父进程
         if clone_flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
-            pcb.thread.write().clear_child_tid = clone_args.child_tid;
+            pcb.thread.write().clear_child_tid = Some(clone_args.child_tid);
         }
 
         // 设置child_tid，意味着子线程能够知道自己的id
         if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-            pcb.thread.write().set_child_tid = clone_args.child_tid;
+            pcb.thread.write().set_child_tid = Some(clone_args.child_tid);
         }
 
         // 将子进程/线程的id存储在用户态传进的地址中
         if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-            // TODO: 这里注释掉的代码是正确的，但是目前futex尚不完善
-            // 这里不注释掉futex会使用共享内存，应该是pthread的行为，尚不明确
+            let mut writer = UserBufferWriter::new(
+                clone_args.parent_tid.data() as *mut i32,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
 
-            // let mut writer = UserBufferWriter::new(
-            //     clone_args.parent_tid.data() as *mut i32,
-            //     core::mem::size_of::<i32>(),
-            //     true,
-            // )?;
-
-            // writer.copy_one_to_user(&(pcb.pid().0 as i32), 0)?;
+            writer.copy_one_to_user(&(pcb.pid().0 as i32), 0)?;
         }
 
         // 拷贝标志位

@@ -289,9 +289,8 @@ impl ProcessManager {
         // 拷贝栈帧
         unsafe {
             let usp = clone_args.stack;
-            if !usp.is_null() {
-                child_trapframe.rbp = usp.data() as u64 + 11 * core::mem::size_of::<usize>() as u64;
-                child_trapframe.rsp = usp.data() as u64;
+            if usp != 0 {
+                child_trapframe.rsp = usp as u64;
             }
             let trap_frame_ptr = trap_frame_vaddr.data() as *mut TrapFrame;
             *trap_frame_ptr = child_trapframe;

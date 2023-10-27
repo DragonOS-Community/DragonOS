@@ -1,9 +1,13 @@
-use alloc::ffi::CString;
+// 参考手册: PCIe* GbE Controllers Open Source Software Developer’s Manual
+// Refernce: PCIe* GbE Controllers Open Source Software Developer’s Manual
+
+
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
+use core::intrinsics::unlikely;
 
 use super::e1000e_driver::e1000e_driver_init;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
@@ -12,7 +16,7 @@ use crate::driver::pci::pci::{
     PCI_DEVICE_LINKEDLIST,
 };
 use crate::driver::pci::pci_irq::{
-    IrqCommonMsg, IrqMsg, IrqSpecificMsg, IrqType, PciInterrupt, IRQ,
+    IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ,
 };
 use crate::include::bindings::bindings::pt_regs;
 use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
@@ -57,6 +61,8 @@ const E1000E_RECV_VECTOR: u16 = 57;
 // napi队列中暂时存储的buffer个数
 const E1000E_RECV_NAPI: usize = 1024;
 
+
+// 收/发包的描述符结构 pp.24 Table 3-1
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct E1000ETransDesc {
@@ -68,7 +74,7 @@ struct E1000ETransDesc {
     css: u8,
     special: u8,
 }
-
+// pp.54 Table 3-12
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct E1000ERecvDesc {
@@ -92,7 +98,7 @@ pub struct E1000EBuffer {
 impl E1000EBuffer {
     pub fn new(length: usize) -> Self {
         assert!(length <= PAGE_SIZE);
-        if length == 0 {
+        if unlikely(length == 0) {
             // 在某些情况下，我们并不需要实际分配buffer，只需要提供一个占位符即可
             // we dont need to allocate dma pages for buffer in some cases
             E1000EBuffer {
@@ -153,7 +159,6 @@ impl E1000EBuffer {
 // 中断处理函数, 调用协议栈的poll函数，未来可能会用napi来替换这里
 // Interrupt handler
 unsafe extern "C" fn e1000e_irq_handler(irq_num: u64, irq_paramer: u64, regs: *mut pt_regs) {
-    // kdebug!("12345!"); // make sure we can receive interrupt
     poll_ifaces_try_lock_onetime().ok();
 }
 
@@ -253,7 +258,7 @@ impl E1000EDevice {
             let mut ctrl = volread!(general_regs, ctrl);
             // 关闭中断
             // close the interrupt
-            volwrite!(interrupt_regs, imc, 0xffffffff);
+            volwrite!(interrupt_regs, imc, E1000E_IMC_CLEAR);
             //SW RESET
             volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_RST);
             compiler_fence(Ordering::AcqRel);
@@ -263,7 +268,7 @@ impl E1000EDevice {
             volwrite!(general_regs, ctrl, ctrl);
             // 关闭中断
             // close the interrupt
-            volwrite!(interrupt_regs, imc, 0xffffffff);
+            volwrite!(interrupt_regs, imc, E1000E_IMC_CLEAR);
             let mut gcr = volread!(pcie_regs, gcr);
             gcr = gcr | (1 << 22);
             volwrite!(pcie_regs, gcr, gcr);
@@ -614,7 +619,7 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
 }
 
 // 用到的e1000e寄存器结构体
-// Table 13-3
+// pp.275, Table 13-3
 // 设备通用寄存器
 struct GeneralRegs {
     ctrl: Volatile<u32>,         //0x00000
@@ -723,6 +728,9 @@ const E1000E_IMS_RXO: u32 = 1 << 6;
 const E1000E_IMS_RXT0: u32 = 1 << 7;
 const E1000E_IMS_RXQ0: u32 = 1 << 20;
 const E1000E_IMS_OTHER: u32 = 1 << 24; // qemu use this bit to set msi-x interrupt
+
+// IMC
+const E1000E_IMC_CLEAR: u32 = 0xffffffff;
 
 // RCTL
 const E1000E_RCTL_EN: u32 = 1 << 1;

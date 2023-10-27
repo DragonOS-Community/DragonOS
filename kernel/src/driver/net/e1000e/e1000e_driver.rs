@@ -1,22 +1,38 @@
 //这个文件的绝大部分内容是copy virtio_net.rs的，考虑到所有的驱动都要用操作系统提供的协议栈，我觉得可以把这些内容抽象出来
 
-use alloc::{sync::Arc, string::String};
-use smoltcp::{phy, wire};
+use crate::{
+    driver::{
+        base::{
+            device::{
+                bus::Bus,
+                driver::{Driver, DriverError},
+                Device, DevicePrivateData, IdTable,
+            },
+            kobject::{KObjType, KObject, KObjectState},
+        },
+        net::NetDriver,
+    },
+    kdebug, kinfo,
+    libs::spinlock::SpinLock,
+    net::{generate_iface_id, NET_DRIVERS},
+    syscall::SystemError,
+    time::Instant,
+};
+use alloc::{string::String, sync::Arc};
 use core::{
     cell::UnsafeCell,
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
-use crate::{libs::spinlock::SpinLock, driver::{Driver, net::NetDriver, base::device::{DevicePrivateData, DeviceResource, driver::DriverError, IdTable, Device}}, syscall::SystemError, time::Instant, net::{generate_iface_id, NET_DRIVERS}, kinfo, kdebug};
+use smoltcp::{phy, wire};
 
-use super::e1000e::{E1000EDevice, E1000EBuffer};
-
+use super::e1000e::{E1000EBuffer, E1000EDevice};
 
 pub struct E1000ERxToken(E1000EBuffer);
-pub struct E1000ETxToken{
-    driver :E1000EDriver
+pub struct E1000ETxToken {
+    driver: E1000EDriver,
 }
-pub struct E1000EDriver{
+pub struct E1000EDriver {
     pub inner: Arc<SpinLock<E1000EDevice>>,
 }
 
@@ -50,26 +66,28 @@ impl Debug for E1000EDriverWrapper {
     }
 }
 
-pub struct E1000EInterface{
+pub struct E1000EInterface {
     driver: E1000EDriverWrapper,
     iface_id: usize,
     iface: SpinLock<smoltcp::iface::Interface>,
     name: String,
 }
-impl phy::RxToken for E1000ERxToken{
+impl phy::RxToken for E1000ERxToken {
     fn consume<R, F>(mut self, f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R {
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
         let result = f(&mut self.0.as_mut_slice());
         self.0.free_buffer();
         return result;
     }
 }
 
-impl phy::TxToken for E1000ETxToken{
+impl phy::TxToken for E1000ETxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R {
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
         let mut buffer = E1000EBuffer::new(4096);
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
@@ -78,8 +96,8 @@ impl phy::TxToken for E1000ETxToken{
     }
 }
 
-impl E1000EDriver{
-    pub fn new(device: E1000EDevice) -> Self{
+impl E1000EDriver {
+    pub fn new(device: E1000EDevice) -> Self {
         let mut iface_config = smoltcp::iface::Config::new();
 
         // todo: 随机设定这个值。
@@ -96,7 +114,7 @@ impl E1000EDriver{
     }
 }
 
-impl Clone for E1000EDriver{
+impl Clone for E1000EDriver {
     fn clone(&self) -> Self {
         return E1000EDriver {
             inner: self.inner.clone(),
@@ -104,17 +122,21 @@ impl Clone for E1000EDriver{
     }
 }
 
-impl phy::Device for E1000EDriver{
+impl phy::Device for E1000EDriver {
     type RxToken<'a> = E1000ERxToken;
     type TxToken<'a> = E1000ETxToken;
 
-    fn receive(&mut self, _timestamp: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        match self.inner.lock().e1000e_receive(){
-            Some(buffer) => {
-                Some((
-                E1000ERxToken(buffer), 
-                E1000ETxToken{driver: self.clone()}
-            ))},
+    fn receive(
+        &mut self,
+        _timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        match self.inner.lock().e1000e_receive() {
+            Some(buffer) => Some((
+                E1000ERxToken(buffer),
+                E1000ETxToken {
+                    driver: self.clone(),
+                },
+            )),
             None => {
                 return None;
             }
@@ -122,12 +144,12 @@ impl phy::Device for E1000EDriver{
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        match self.inner.lock().e1000e_can_transmit(){
-            true => Some(E1000ETxToken{driver: self.clone()}),
-            false => {
-                None
-            }
-        } 
+        match self.inner.lock().e1000e_can_transmit() {
+            true => Some(E1000ETxToken {
+                driver: self.clone(),
+            }),
+            false => None,
+        }
     }
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
@@ -144,11 +166,10 @@ impl phy::Device for E1000EDriver{
         caps.max_burst_size = Some(1);
         return caps;
     }
-
 }
 
-impl E1000EInterface{
-    pub fn new(mut driver: E1000EDriver) -> Arc<Self>{
+impl E1000EInterface {
+    pub fn new(mut driver: E1000EDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new();
 
@@ -182,41 +203,30 @@ impl Debug for E1000EInterface {
             .finish()
     }
 }
+
 impl Driver for E1000EInterface {
-    fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
-        self
-    }
-    fn probe(&self, _data: &DevicePrivateData) -> Result<(), DriverError> {
+    fn id_table(&self) -> Option<IdTable> {
         todo!()
     }
 
-    fn load(
-        &self,
-        _data: DevicePrivateData,
-        _resource: Option<DeviceResource>,
-    ) -> Result<Arc<dyn Device>, DriverError> {
+    fn add_device(&self, _device: Arc<dyn Device>) {
         todo!()
     }
 
-    fn id_table(&self) -> IdTable {
+    fn delete_device(&self, _device: &Arc<dyn Device>) {
         todo!()
     }
 
-    fn set_sys_info(&self, _sys_info: Option<Arc<dyn crate::filesystem::vfs::IndexNode>>) {
+    fn devices(&self) -> alloc::vec::Vec<Arc<dyn Device>> {
         todo!()
     }
 
-    fn sys_info(&self) -> Option<Arc<dyn crate::filesystem::vfs::IndexNode>> {
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
         todo!()
     }
 
-    fn compatible_table(&self) -> crate::driver::base::platform::CompatibleTable {
-        //TODO 要完善每个 CompatibleTable ，将来要把这个默认实现删除
-        return crate::driver::base::platform::CompatibleTable::new(vec!["unknown"]);
-    }
-
-    fn append_compatible_table(&self, _device: &crate::driver::base::platform::CompatibleTable) -> Result<(), DriverError> {
-        Err(DriverError::UnsupportedOperation)
+    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
+        todo!()
     }
 }
 
@@ -272,15 +282,73 @@ impl NetDriver for E1000EInterface {
     }
 }
 
-pub fn e1000e_driver_init(device: E1000EDevice){
+impl KObject for E1000EInterface {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn set_inode(&self, _inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+        todo!()
+    }
+
+    fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_parent(&self, _parent: Option<alloc::sync::Weak<dyn KObject>>) {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
+        todo!()
+    }
+
+    fn set_kset(&self, _kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
+        todo!()
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&self, _name: String) {
+        todo!()
+    }
+
+    fn kobj_state(
+        &self,
+    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(
+        &self,
+    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
+        todo!()
+    }
+}
+
+pub fn e1000e_driver_init(device: E1000EDevice) {
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&device.mac_address());
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
     // 将网卡的接口信息注册到全局的网卡接口信息表中
     NET_DRIVERS.write().insert(iface.nic_id(), iface.clone());
-    kinfo!(
-        "e1000e driver init successfully!\tNetDevID: [{}], MAC: [{}]",
-        iface.name(),
-        mac
-    );
+    kinfo!("e1000e driver init successfully!\tMAC: [{}]", mac);
 }

@@ -1275,7 +1275,6 @@ impl BarInfo {
             None
         }
     }
-
 }
 ///实现BarInfo的Display trait，自定义输出
 impl Display for BarInfo {

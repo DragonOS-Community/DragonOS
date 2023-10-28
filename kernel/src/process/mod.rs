@@ -253,7 +253,7 @@ impl ProcessManager {
         assert_eq!(
             CurrentIrqArch::is_irq_enabled(),
             false,
-            "interrupt must be disabled before enter ProcessManager::mark_slop()"
+            "interrupt must be disabled before enter ProcessManager::mark_stop()"
         );
 
         let pcb = ProcessManager::current_pcb();
@@ -1052,8 +1052,8 @@ impl KernelStack {
     }
 
     pub unsafe fn set_pcb(&mut self, pcb: Weak<ProcessControlBlock>) -> Result<(), SystemError> {
-        // 将一个Arc<ProcessControlBlock>放到内核栈的最低地址处
-        let p: *const ProcessControlBlock = pcb.as_ptr();
+        // 将一个Weak<ProcessControlBlock>放到内核栈的最低地址处
+        let p: *const ProcessControlBlock = Weak::into_raw(pcb);
         let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
@@ -1078,10 +1078,10 @@ impl KernelStack {
         }
 
         // 为了防止内核栈的pcb指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
-        let arc_wrapper: ManuallyDrop<Arc<ProcessControlBlock>> =
-            ManuallyDrop::new(Arc::from_raw(p));
+        let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
+            ManuallyDrop::new(Weak::from_raw(p));
 
-        let new_arc: Arc<ProcessControlBlock> = Arc::clone(&arc_wrapper);
+        let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade()?;
         return Some(new_arc);
     }
 }

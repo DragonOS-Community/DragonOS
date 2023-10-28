@@ -5,7 +5,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::{Arc, Weak}, vec::Vec};
 
 use memoffset::offset_of;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
@@ -237,13 +237,15 @@ impl ProcessControlBlock {
             panic!("current_pcb is null");
         }
         unsafe {
-            // 为了防止内核栈的pcb指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
-            let arc_wrapper: ManuallyDrop<Arc<ProcessControlBlock>> =
-                ManuallyDrop::new(Arc::from_raw(*p));
+            // 为了防止内核栈的pcb weak 指针被释放，这里需要将其包装一下
+            let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
+                ManuallyDrop::new(Weak::from_raw(*p));
 
-            let new_arc: Arc<ProcessControlBlock> = Arc::clone(&arc_wrapper);
+            let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade().unwrap();
             return new_arc;
         }
+
+       
     }
 }
 

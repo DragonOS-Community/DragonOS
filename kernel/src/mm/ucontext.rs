@@ -554,6 +554,7 @@ impl InnerAddressSpace {
 impl Drop for InnerAddressSpace {
     fn drop(&mut self) {
         unsafe {
+            kdebug!("InnerAddressSpace::drop: self={:?}", self);
             self.unmap_all();
         }
     }

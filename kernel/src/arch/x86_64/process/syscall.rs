@@ -105,6 +105,8 @@ impl Syscall {
         regs.rflags = 0x200;
         regs.rax = 1;
 
+        drop(param);
+
         // kdebug!("regs: {:?}\n", regs);
 
         // kdebug!(

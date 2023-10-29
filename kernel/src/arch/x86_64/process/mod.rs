@@ -357,6 +357,7 @@ impl ProcessManager {
         compiler_fence(Ordering::SeqCst);
 
         next_addr_space.read().user_mapper.utable.make_current();
+        drop(next_addr_space);
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 
@@ -369,8 +370,8 @@ impl ProcessManager {
         // 恢复当前的 preempt count*2
         ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev.clone());
-        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
+        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(Arc::downgrade(&prev));
+        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(Arc::downgrade(&next));
 
         // 切换tss
         TSSManager::current_tss().set_rsp(
@@ -378,7 +379,6 @@ impl ProcessManager {
             next.kernel_stack().stack_max_address().data() as u64,
         );
         // kdebug!("switch tss ok");
-
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);

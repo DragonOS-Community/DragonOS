@@ -155,16 +155,14 @@ void system_initialize()
     HPET_init();
     io_mfence();
     HPET_measure_freq();
-
+    rs_futex_init();
     io_mfence();
     cli();
     HPET_enable();
 
     io_mfence();
-    
-    kvm_init();
 
-    rs_futex_init();
+    kvm_init();
 
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行

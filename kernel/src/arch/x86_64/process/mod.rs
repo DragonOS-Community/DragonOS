@@ -81,8 +81,8 @@ pub struct ArchPCBInfo {
     cr2: usize,
     fsbase: usize,
     gsbase: usize,
-    fs: SegmentSelector,
-    gs: SegmentSelector,
+    fs: u16,
+    gs: u16,
 
     /// 浮点寄存器的状态
     fp_state: Option<FpState>,
@@ -113,8 +113,8 @@ impl ArchPCBInfo {
             cr2: 0,
             fsbase: 0,
             gsbase: 0,
-            fs: KERNEL_DS,
-            gs: KERNEL_DS,
+            fs: KERNEL_DS.bits(),
+            gs: KERNEL_DS.bits(),
             fp_state: None,
         };
 
@@ -362,22 +362,22 @@ impl ProcessManager {
         // 切换内核栈
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
-        let next_arch = SpinLockGuard::leak(next.arch_info());
-        let prev_arch = SpinLockGuard::leak(prev.arch_info());
+        let next_arch = SpinLockGuard::leak(next.arch_info()) as *mut ArchPCBInfo;
+        let prev_arch = SpinLockGuard::leak(prev.arch_info()) as *mut ArchPCBInfo;
 
-        prev_arch.rip = switch_back as usize;
+        (*prev_arch).rip = switch_back as usize;
 
         // 恢复当前的 preempt count*2
         ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(Arc::downgrade(&prev));
-        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(Arc::downgrade(&next));
 
         // 切换tss
         TSSManager::current_tss().set_rsp(
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
+        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
+        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // kdebug!("switch tss ok");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
@@ -387,7 +387,7 @@ impl ProcessManager {
 
 /// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
 #[naked]
-unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut ArchPCBInfo) {
+unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
     asm!(
         // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
         //
@@ -415,6 +415,9 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         // switch segment registers (这些寄存器只能通过接下来的switch_hook的return来切换)
         mov [rdi + {off_fs}], fs
         mov [rdi + {off_gs}], gs
+
+        // mov fs, [rsi + {off_fs}]
+        // mov gs, [rsi + {off_gs}]
 
         push rbp
         push rax
@@ -501,12 +504,12 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
     let mut arch_guard = current_pcb.arch_info_irqsave();
     arch_guard.rsp = trap_frame_vaddr.data();
 
-    arch_guard.fs = USER_DS;
-    arch_guard.gs = USER_DS;
+    arch_guard.fs = USER_DS.bits();
+    arch_guard.gs = USER_DS.bits();
 
     switch_fs_and_gs(
-        SegmentSelector::from_bits_truncate(arch_guard.fs.bits()),
-        SegmentSelector::from_bits_truncate(arch_guard.gs.bits()),
+        SegmentSelector::from_bits_truncate(arch_guard.fs),
+        SegmentSelector::from_bits_truncate(arch_guard.gs),
     );
     arch_guard.rip = new_rip.data();
 

@@ -68,8 +68,8 @@ static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 
 #[derive(Debug)]
 pub struct SwitchResult {
-    pub prev_pcb: Option<Weak<ProcessControlBlock>>,
-    pub next_pcb: Option<Weak<ProcessControlBlock>>,
+    pub prev_pcb: Option<Arc<ProcessControlBlock>>,
+    pub next_pcb: Option<Arc<ProcessControlBlock>>,
 }
 
 impl SwitchResult {
@@ -382,12 +382,8 @@ impl ProcessManager {
             .expect("next_pcb is None");
 
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
-        prev_pcb.upgrade().map(|prev_pcb| {
-            prev_pcb.arch_info.force_unlock();
-        });
-        next_pcb.upgrade().map(|next_pcb| {
-            next_pcb.arch_info.force_unlock();
-        });
+        prev_pcb.arch_info.force_unlock();
+        next_pcb.arch_info.force_unlock();
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态

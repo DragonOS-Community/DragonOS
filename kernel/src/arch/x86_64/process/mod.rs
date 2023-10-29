@@ -5,7 +5,11 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{string::String, sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
 use memoffset::offset_of;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
@@ -244,8 +248,6 @@ impl ProcessControlBlock {
             let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade().unwrap();
             return new_arc;
         }
-
-       
     }
 }
 

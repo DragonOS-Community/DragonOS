@@ -1,5 +1,6 @@
 use core::{
     hash::{Hash, Hasher},
+    hint::spin_loop,
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
     sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering},
@@ -117,6 +118,12 @@ impl ProcessManager {
 
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
+        if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
+            kerror!("unsafe__PROCESS_MANAGEMENT_INIT_DONE == false");
+            loop {
+                spin_loop();
+            }
+        }
         return ProcessControlBlock::arch_current_pcb();
     }
 

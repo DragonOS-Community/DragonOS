@@ -36,6 +36,7 @@ acpi = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/acpi-rs.git"
 intertrait = { path = "src/libs/intertrait" }
 linkme = "0.2"
 ida = { path = "src/libs/ida" }
+mini-backtrace = { git = "https://github.com/zhaoyao73/mini-backtrace.git", rev = "ba98506685" }
 
 # 构建时依赖项
 [build-dependencies]
@@ -56,3 +57,5 @@ debug = true   # Controls whether the compiler passes `-g`
 [profile.release]
 debug = false
 
+[features]
+unwind = []

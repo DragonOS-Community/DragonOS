@@ -5,8 +5,7 @@ use core::{
 
 use crate::{
     driver::{
-        uart::uart_device::{c_uart_send, UartPort},
-        video::video_refresh_manager,
+        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
     },
     syscall::SystemError,
 };
@@ -43,13 +42,12 @@ pub fn no_init_textui_putchar_window(
     if unlikely(character == '\0') {
         return Ok(());
     }
-
-    c_uart_send(UartPort::COM1.to_u16(), character as u8);
+    send_to_default_serial8250_port(&[character as u8]);
 
     // 进行换行操作
     if unlikely(character == '\n') {
         // 换行时还需要输出\r
-        c_uart_send(UartPort::COM1.to_u16(), b'\r');
+        send_to_default_serial8250_port(&[b'\r']);
         if is_put_to_window == true {
             NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);
             NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);

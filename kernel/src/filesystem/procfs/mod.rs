@@ -10,6 +10,7 @@ use alloc::{
 };
 
 use crate::{
+    arch::mm::LockedFrameAllocator,
     filesystem::vfs::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
@@ -26,6 +27,7 @@ use crate::{
 
 use super::vfs::{
     file::{FileMode, FilePrivateData},
+    syscall::ModeType,
     FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
 };
 
@@ -36,6 +38,8 @@ use super::vfs::{
 pub enum ProcFileType {
     ///展示进程状态信息
     ProcStatus = 0,
+    /// meminfo
+    ProcMeminfo = 1,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -45,6 +49,7 @@ impl From<u8> for ProcFileType {
     fn from(value: u8) -> Self {
         match value {
             0 => ProcFileType::ProcStatus,
+            1 => ProcFileType::ProcMeminfo,
             _ => ProcFileType::Default,
         }
     }
@@ -203,8 +208,34 @@ impl ProcFSInode {
         return Ok((pdata.len() * size_of::<u8>()) as i64);
     }
 
-    /// status文件读取函数
-    fn read_status(
+    /// 打开 meminfo 文件
+    fn open_meminfo(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
+        // 获取内存信息
+        let usage = LockedFrameAllocator.get_usage();
+
+        // 传入数据
+        let data: &mut Vec<u8> = &mut pdata.data;
+
+        data.append(
+            &mut format!("MemTotal:\t{} kB\n", usage.total().bytes() >> 10)
+                .as_bytes()
+                .to_owned(),
+        );
+
+        data.append(
+            &mut format!("MemFree:\t{} kB\n", usage.free().bytes() >> 10)
+                .as_bytes()
+                .to_owned(),
+        );
+
+        // 去除多余的\0
+        self.trim_string(data);
+
+        return Ok((data.len() * size_of::<u8>()) as i64);
+    }
+
+    /// proc文件系统读取函数
+    fn proc_read(
         &self,
         offset: usize,
         len: usize,
@@ -262,7 +293,7 @@ impl ProcFS {
                     mtime: TimeSpec::default(),
                     ctime: TimeSpec::default(),
                     file_type: FileType::Dir,
-                    mode: 0o777,
+                    mode: ModeType::from_bits_truncate(0o555),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -285,6 +316,24 @@ impl ProcFS {
         // 释放锁
         drop(root_guard);
 
+        // 创建meminfo文件
+        let inode = result.root_inode();
+        let binding = inode.create(
+            "meminfo",
+            FileType::File,
+            ModeType::from_bits_truncate(0o444),
+        );
+        if let Ok(meminfo) = binding {
+            let meminfo_file = meminfo
+                .as_any_ref()
+                .downcast_ref::<LockedProcFSInode>()
+                .unwrap();
+            meminfo_file.0.lock().fdata.pid = Pid::new(0);
+            meminfo_file.0.lock().fdata.ftype = ProcFileType::ProcMeminfo;
+        } else {
+            panic!("create meminfo error");
+        }
+
         return result;
     }
 
@@ -292,18 +341,26 @@ impl ProcFS {
     /// @usage 在进程中调用并创建进程对应文件
     pub fn register_pid(&self, pid: Pid) -> Result<(), SystemError> {
         // 获取当前inode
-        let proc: Arc<dyn IndexNode> = self.root_inode();
+        let inode: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
-        let _pf: Arc<dyn IndexNode> = proc.create(&pid.to_string(), FileType::Dir, 0o777)?;
+        let pid_dir: Arc<dyn IndexNode> = inode.create(
+            &pid.to_string(),
+            FileType::Dir,
+            ModeType::from_bits_truncate(0o555),
+        )?;
         // 创建相关文件
         // status文件
-        let binding: Arc<dyn IndexNode> = _pf.create("status", FileType::File, 0o777)?;
-        let _sf: &LockedProcFSInode = binding
+        let binding: Arc<dyn IndexNode> = pid_dir.create(
+            "status",
+            FileType::File,
+            ModeType::from_bits_truncate(0o444),
+        )?;
+        let status_file: &LockedProcFSInode = binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
-        _sf.0.lock().fdata.pid = pid;
-        _sf.0.lock().fdata.ftype = ProcFileType::ProcStatus;
+        status_file.0.lock().fdata.pid = pid;
+        status_file.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         //todo: 创建其他文件
 
@@ -343,6 +400,7 @@ impl IndexNode for LockedProcFSInode {
         // 根据文件类型获取相应数据
         let file_size = match inode.fdata.ftype {
             ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
+            ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
             _ => {
                 todo!()
             }
@@ -400,7 +458,8 @@ impl IndexNode for LockedProcFSInode {
 
         // 根据文件类型读取相应数据
         match inode.fdata.ftype {
-            ProcFileType::ProcStatus => return inode.read_status(offset, len, buf, private_data),
+            ProcFileType::ProcStatus => return inode.proc_read(offset, len, buf, private_data),
+            ProcFileType::ProcMeminfo => return inode.proc_read(offset, len, buf, private_data),
             ProcFileType::Default => (),
         };
 
@@ -482,7 +541,7 @@ impl IndexNode for LockedProcFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
@@ -623,7 +682,7 @@ impl IndexNode for LockedProcFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        match ino {
+        match ino.into() {
             0 => {
                 return Ok(String::from("."));
             }
@@ -636,14 +695,25 @@ impl IndexNode for LockedProcFSInode {
                 let mut key: Vec<String> = inode
                     .children
                     .keys()
-                    .filter(|k| inode.children.get(*k).unwrap().0.lock().metadata.inode_id == ino)
+                    .filter(|k| {
+                        inode
+                            .children
+                            .get(*k)
+                            .unwrap()
+                            .0
+                            .lock()
+                            .metadata
+                            .inode_id
+                            .into()
+                            == ino
+                    })
                     .cloned()
                     .collect();
 
                 match key.len() {
                         0=>{return Err(SystemError::ENOENT);}
                         1=>{return Ok(key.remove(0));}
-                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id}, to find={to_find}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                     }
             }
         }
@@ -700,10 +770,10 @@ pub fn procfs_init() -> Result<(), SystemError> {
     let mut result = None;
     INIT.call_once(|| {
         kinfo!("Initializing ProcFS...");
-        // 创建 sysfs 实例
+        // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
 
-        // sysfs 挂载
+        // procfs 挂载
         let _t = ROOT_INODE()
             .find("proc")
             .expect("Cannot find /proc")

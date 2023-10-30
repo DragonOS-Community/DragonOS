@@ -370,3 +370,8 @@ impl Into<smoltcp::time::Duration> for Duration {
         smoltcp::time::Duration::from_millis(self.millis())
     }
 }
+
+pub trait TimeArch {
+    /// Get CPU cycles (Read from register)
+    fn get_cycles() -> usize;
+}

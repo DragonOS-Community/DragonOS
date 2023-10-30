@@ -7,20 +7,26 @@ pub mod mount;
 pub mod syscall;
 mod utils;
 
-use ::core::{any::Any, fmt::Debug};
+use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::{libs::casting::DowncastArc, syscall::SystemError, time::TimeSpec};
+use crate::{
+    driver::base::{block::block_device::BlockDevice, char::CharDevice, device::DeviceNumber},
+    ipc::pipe::LockedPipeInode,
+    libs::casting::DowncastArc,
+    syscall::SystemError,
+    time::TimeSpec,
+};
 
-use self::{core::generate_inode_id, file::FileMode};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: usize = 1024;
 
-/// 定义inode号的类型为usize
-pub type InodeId = usize;
+// 定义inode号
+int_like!(InodeId, AtomicInodeId, usize, AtomicUsize);
 
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +39,24 @@ pub enum FileType {
     BlockDevice,
     /// 字符设备
     CharDevice,
+    /// kvm设备
+    KvmDevice,
     /// 管道文件
     Pipe,
     /// 符号链接
     SymLink,
     /// 套接字
     Socket,
+}
+
+#[derive(Debug, Clone)]
+pub enum SpecialNodeData {
+    /// 管道文件
+    Pipe(Arc<LockedPipeInode>),
+    /// 字符设备
+    CharDevice(Arc<dyn CharDevice>),
+    /// 块设备
+    BlockDevice(Arc<dyn BlockDevice>),
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -62,6 +80,9 @@ pub const DT_SOCK: u16 = 12;
 pub const DT_WHT: u16 = 14;
 pub const DT_MAX: u16 = 16;
 
+/// vfs容许的最大的符号链接跳转次数
+pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 8;
+
 impl FileType {
     pub fn get_file_type_num(&self) -> u16 {
         return match self {
@@ -69,6 +90,7 @@ impl FileType {
             FileType::Dir => DT_DIR,
             FileType::BlockDevice => DT_BLK,
             FileType::CharDevice => DT_CHR,
+            FileType::KvmDevice => DT_CHR,
             FileType::Pipe => DT_FIFO,
             FileType::SymLink => DT_LNK,
             FileType::Socket => DT_SOCK,
@@ -185,7 +207,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         &self,
         name: &str,
         file_type: FileType,
-        mode: u32,
+        mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-EOPNOTSUPP_OR_ENOTSUP)的返回值
         return self.create_with_data(name, file_type, mode, 0);
@@ -204,7 +226,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         &self,
         _name: &str,
         _file_type: FileType,
-        _mode: u32,
+        _mode: ModeType,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
@@ -337,6 +359,23 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
         return Ok(());
+    }
+
+    /// ## 创建一个特殊文件节点
+    /// - _filename: 文件名
+    /// - _mode: 权限信息
+    fn mknod(
+        &self,
+        _filename: &str,
+        _mode: ModeType,
+        _dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    /// ## 返回特殊文件的inode
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        None
     }
 }
 
@@ -477,7 +516,7 @@ pub struct Metadata {
     pub file_type: FileType,
 
     /// 权限
-    pub mode: u32,
+    pub mode: ModeType,
 
     /// 硬链接的数量
     pub nlinks: usize,
@@ -496,7 +535,7 @@ impl Default for Metadata {
     fn default() -> Self {
         return Self {
             dev_id: 0,
-            inode_id: 0,
+            inode_id: InodeId::new(0),
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -504,7 +543,7 @@ impl Default for Metadata {
             mtime: TimeSpec::default(),
             ctime: TimeSpec::default(),
             file_type: FileType::File,
-            mode: 0,
+            mode: ModeType::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -524,6 +563,12 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+}
+
+impl DowncastArc for dyn FileSystem {
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -551,7 +596,7 @@ pub struct Dirent {
 }
 
 impl Metadata {
-    pub fn new(file_type: FileType, mode: u32) -> Self {
+    pub fn new(file_type: FileType, mode: ModeType) -> Self {
         Metadata {
             dev_id: 0,
             inode_id: generate_inode_id(),

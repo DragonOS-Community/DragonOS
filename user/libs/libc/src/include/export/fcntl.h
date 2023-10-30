@@ -14,6 +14,8 @@
 extern  "C"  { 
 
 #endif
+#include <stdint.h>
+
 #define O_RDONLY 00000000  // Open Read-only
 #define O_WRONLY 00000001  // Open Write-only
 #define O_RDWR 00000002    // Open read/write
@@ -71,6 +73,16 @@ extern  "C"  {
  * @return int 文件描述符
  */
 int open(const char * path, int options, ...);
+
+/**
+ * @brief ioctl的接口
+ *
+ * @param fd 文件句柄
+ * @param cmd 设备相关的请求类型
+ * @param ...
+ * @return int 成功返回0
+ */
+int ioctl(int fd, int cmd, uint64_t data, ...);
 
 #if defined(__cplusplus) 
 }  /* extern "C" */ 

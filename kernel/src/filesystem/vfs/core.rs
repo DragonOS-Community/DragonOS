@@ -1,7 +1,4 @@
-use core::{
-    hint::spin_loop,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::{format, string::ToString, sync::Arc};
 
@@ -16,14 +13,13 @@ use crate::{
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::MountFS, FileSystem, FileType},
+        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
-    include::bindings::bindings::PAGE_4K_SIZE,
     kdebug, kerror, kinfo,
     syscall::SystemError,
 };
 
-use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
+use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId, MAX_PATHLEN};
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -31,8 +27,8 @@ use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId};
 /// [0]: 对应'.'目录项
 /// [1]: 对应'..'目录项
 pub fn generate_inode_id() -> InodeId {
-    static INO: AtomicUsize = AtomicUsize::new(1);
-    return INO.fetch_add(1, Ordering::SeqCst);
+    static INO: AtomicInodeId = AtomicInodeId::new(InodeId::new(1));
+    return INO.fetch_add(InodeId::new(1), Ordering::SeqCst);
 }
 
 static mut __ROOT_INODE: Option<Arc<dyn IndexNode>> = None;
@@ -59,13 +55,13 @@ pub extern "C" fn vfs_init() -> i32 {
 
     // 创建文件夹
     root_inode
-        .create("proc", FileType::Dir, 0o777)
+        .create("proc", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /proc");
     root_inode
-        .create("dev", FileType::Dir, 0o777)
+        .create("dev", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /dev");
     root_inode
-        .create("sys", FileType::Dir, 0o777)
+        .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /sys");
     kdebug!("dir in root:{:?}", root_inode.list());
 
@@ -94,7 +90,11 @@ fn do_migrate(
     let r = new_root_inode.find(mountpoint_name);
     let mountpoint = if r.is_err() {
         new_root_inode
-            .create(mountpoint_name, FileType::Dir, 0o777)
+            .create(
+                mountpoint_name,
+                FileType::Dir,
+                ModeType::from_bits_truncate(0o755),
+            )
             .expect(format!("Failed to create '/{mountpoint_name}' in migrating").as_str())
     } else {
         r.unwrap()
@@ -176,7 +176,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 /// @brief 创建文件/文件夹
 pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
     // 文件名过长
-    if path.len() > PAGE_4K_SIZE as usize {
+    if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
 
@@ -191,8 +191,11 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
             let parent_inode: Arc<dyn IndexNode> =
                 ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件夹
-            let _create_inode: Arc<dyn IndexNode> =
-                parent_inode.create(filename, FileType::Dir, 0o777)?;
+            let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
+                filename,
+                FileType::Dir,
+                ModeType::from_bits_truncate(0o755),
+            )?;
         } else {
             // 不需要创建文件，因此返回错误码
             return Err(errno);
@@ -205,7 +208,7 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 /// @brief 删除文件夹
 pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
     // 文件名过长
-    if path.len() > PAGE_4K_SIZE as usize {
+    if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
 
@@ -241,7 +244,7 @@ pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
 /// @brief 删除文件
 pub fn do_unlink_at(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
     // 文件名过长
-    if path.len() > PAGE_4K_SIZE as usize {
+    if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
 

@@ -147,7 +147,9 @@ impl<T: Copy> VolatileWritable<T> for *mut Volatile<T> {
 /// ```
 macro_rules! volread {
     ($nonnull:expr, $field:ident) => {
-        VolatileReadable::vread(core::ptr::addr_of!((*$nonnull.as_ptr()).$field))
+        crate::libs::volatile::VolatileReadable::vread(core::ptr::addr_of!(
+            (*$nonnull.as_ptr()).$field
+        ))
     };
 }
 
@@ -166,7 +168,10 @@ macro_rules! volread {
 /// ```
 macro_rules! volwrite {
     ($nonnull:expr, $field:ident, $value:expr) => {
-        VolatileWritable::vwrite(core::ptr::addr_of_mut!((*$nonnull.as_ptr()).$field), $value)
+        crate::libs::volatile::VolatileWritable::vwrite(
+            core::ptr::addr_of_mut!((*$nonnull.as_ptr()).$field),
+            $value,
+        )
     };
 }
 

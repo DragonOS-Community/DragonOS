@@ -57,7 +57,7 @@ int atoi(const char *str)
 void exit(int status)
 {
     _fini();
-    syscall_invoke(SYS_EXIT, status, 0, 0, 0, 0, 0, 0, 0);
+    syscall_invoke(SYS_EXIT, status, 0, 0, 0, 0, 0);
 }
 
 /**

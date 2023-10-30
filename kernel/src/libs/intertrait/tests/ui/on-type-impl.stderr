@@ -1,0 +1,5 @@
+error: #[cast_to] should only be on an impl of a trait
+ --> $DIR/on-type-impl.rs:6:6
+  |
+6 | impl Data {
+  |      ^^^^

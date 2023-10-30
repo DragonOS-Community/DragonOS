@@ -2,7 +2,7 @@ use core::ffi::c_void;
 
 use alloc::{string::String, vec::Vec};
 
-use super::{fork::CloneFlags, Pid, ProcessManager, ProcessState};
+use super::{abi::WaitOption, fork::CloneFlags, Pid, ProcessManager, ProcessState};
 use crate::{
     arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
@@ -61,7 +61,13 @@ impl Syscall {
             .basic_mut()
             .set_name(ProcessControlBlock::generate_name(&path, &argv));
 
-        return Self::do_execve(path, argv, envp, frame);
+        Self::do_execve(path, argv, envp, frame)?;
+
+        // 关闭设置了O_CLOEXEC的文件描述符
+        let fd_table = ProcessManager::current_pcb().fd_table();
+        fd_table.write().close_on_exec();
+
+        return Ok(());
     }
 
     pub fn wait4(
@@ -70,16 +76,19 @@ impl Syscall {
         options: i32,
         rusage: *mut c_void,
     ) -> Result<usize, SystemError> {
+        let ret = WaitOption::from_bits(options as u32);
+        let options = match ret {
+            Some(options) => options,
+            None => {
+                return Err(SystemError::EINVAL);
+            }
+        };
+
         let mut _rusage_buf =
             UserBufferReader::new::<c_void>(rusage, core::mem::size_of::<c_void>(), true)?;
 
         let mut wstatus_buf =
             UserBufferWriter::new::<i32>(wstatus, core::mem::size_of::<i32>(), true)?;
-
-        // 暂时不支持options选项
-        if options != 0 {
-            return Err(SystemError::EINVAL);
-        }
 
         let cur_pcb = ProcessManager::current_pcb();
         let rd_childen = cur_pcb.children.read();
@@ -89,15 +98,44 @@ impl Syscall {
             let child_pcb = rd_childen.get(&pid).ok_or(SystemError::ECHILD)?.clone();
             drop(rd_childen);
 
-            // 获取退出码
-            if let ProcessState::Exited(status) = child_pcb.sched_info().state() {
-                if !wstatus.is_null() {
-                    wstatus_buf.copy_one_to_user(&status, 0)?;
-                }
-                return Ok(pid.into());
+            loop {
+                // 获取退出码
+                match child_pcb.sched_info().state() {
+                    ProcessState::Runnable => {
+                        if options.contains(WaitOption::WNOHANG)
+                            || options.contains(WaitOption::WNOWAIT)
+                        {
+                            if !wstatus.is_null() {
+                                wstatus_buf.copy_one_to_user(&WaitOption::WCONTINUED.bits(), 0)?;
+                            }
+                            return Ok(0);
+                        }
+                    }
+                    ProcessState::Blocked(_) | ProcessState::Stopped => {
+                        // 指定WUNTRACED则等待暂停的进程，不指定则返回0
+                        if !options.contains(WaitOption::WUNTRACED)
+                            || options.contains(WaitOption::WNOWAIT)
+                        {
+                            if !wstatus.is_null() {
+                                wstatus_buf.copy_one_to_user(&WaitOption::WSTOPPED.bits(), 0)?;
+                            }
+                            return Ok(0);
+                        }
+                    }
+                    ProcessState::Exited(status) => {
+                        if !wstatus.is_null() {
+                            wstatus_buf.copy_one_to_user(
+                                &(status | WaitOption::WEXITED.bits() as usize),
+                                0,
+                            )?;
+                        }
+                        return Ok(pid.into());
+                    }
+                };
+
+                // 等待指定进程
+                child_pcb.wait_queue.sleep();
             }
-            // 等待指定进程
-            child_pcb.wait_queue.sleep();
         } else if pid < -1 {
             // TODO 判断是否pgid == -pid（等待指定组任意进程）
             // 暂时不支持

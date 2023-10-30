@@ -16,11 +16,11 @@
 #pragma GCC push_options
 #pragma GCC optimize ("O0")
 
-#define IRQ_NUM 24
+#define IRQ_NUM 26
 #define SMP_IRQ_NUM 10
 #define LOCAL_APIC_IRQ_NUM 50
 
-extern void (*interrupt_table[24])(void);
+extern void (*interrupt_table[26])(void);
 extern void do_IRQ(struct pt_regs *regs, ul number);
 
 
@@ -82,6 +82,8 @@ extern void (*local_apic_interrupt_table[LOCAL_APIC_IRQ_NUM])(void);
 	53	PIRQF
 	54	PIRQG
 	55	PIRQH
+	56  VIRTIO_RECV
+	57  E1000E_RECV
 	
 	
 0x80		system call

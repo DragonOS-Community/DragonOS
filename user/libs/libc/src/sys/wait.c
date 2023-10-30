@@ -22,5 +22,5 @@ pid_t wait(int *stat_loc)
  */
 pid_t waitpid(pid_t pid, int *stat_loc, int options)
 {
-    return (pid_t)syscall_invoke(SYS_WAIT4, (uint64_t)pid, (uint64_t)stat_loc, options, 0, 0, 0, 0, 0);
+    return (pid_t)syscall_invoke(SYS_WAIT4, (uint64_t)pid, (uint64_t)stat_loc, options, 0, 0, 0);
 }

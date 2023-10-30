@@ -316,7 +316,6 @@ impl ProcessManager {
         pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
 
         // 进行进程退出后的工作
-        // 这块应该是有release方法完成的，但是目前有一个引用不知道在哪未释放
         let thread = pcb.thread.write();
         kdebug!("to clear");
         if let Some(addr) = thread.set_child_tid {
@@ -325,6 +324,11 @@ impl ProcessManager {
 
         if let Some(addr) = thread.clear_child_tid {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
+        }
+
+        // 如果是vfork出来的进程，则需要处理completion
+        if thread.vfork_done.is_some() {
+            thread.vfork_done.as_ref().unwrap().complete_all();
         }
         drop(thread);
         let uvm = pcb.basic().user_vm().unwrap();
@@ -788,17 +792,6 @@ impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         // 处理线程信息
         let thread = self.thread.write();
-
-        // 将user_tid_addr置0
-        if thread.clear_child_tid.is_some() {
-            let _ =
-                unsafe { clear_user(thread.clear_child_tid.unwrap(), core::mem::size_of::<i32>()) };
-        }
-
-        // 如果是vfork出来的进程，则需要处理completion
-        if thread.vfork_done.is_some() {
-            thread.vfork_done.as_ref().unwrap().complete_all();
-        }
 
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())

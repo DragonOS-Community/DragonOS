@@ -32,8 +32,8 @@ impl FutexData {
         unsafe { FUTEX_DATA.as_ref().unwrap().data.lock() }
     }
 
-    pub fn try_remove(key:&FutexKey) -> Option<FutexHashBucket>{
-        unsafe{
+    pub fn try_remove(key: &FutexKey) -> Option<FutexHashBucket> {
+        unsafe {
             let mut guard = FUTEX_DATA.as_ref().unwrap().data.lock();
             if let Some(futex) = guard.get(key) {
                 if futex.chain.is_empty() {
@@ -294,23 +294,23 @@ impl Futex {
         let bucket_mut = match bucket {
             // 如果该pcb不在链表里面了或者该链表已经被释放，就证明是正常的Wake操作
             Some(bucket_mut) => {
-        if !bucket_mut.contains(&futex_q) {
-            // 取消定时器任务
-            if timer.is_some() {
-                timer.unwrap().cancel();
-            }
-            return Ok(0);
-        }
+                if !bucket_mut.contains(&futex_q) {
+                    // 取消定时器任务
+                    if timer.is_some() {
+                        timer.unwrap().cancel();
+                    }
+                    return Ok(0);
+                }
                 // 非正常唤醒，返回交给下层
                 bucket_mut
-            },
+            }
             None => {
                 // 取消定时器任务
                 if timer.is_some() {
                     timer.unwrap().cancel();
                 }
                 return Ok(0);
-            },
+            }
         };
 
         // 如果是超时唤醒，则返回错误
@@ -370,9 +370,11 @@ impl Futex {
         drop(bucket_mut);
         drop(binding);
 
-        match FutexData::try_remove(&key){
-            Some(_) => {kdebug!("remove success")},
-            None => {},
+        match FutexData::try_remove(&key) {
+            Some(_) => {
+                kdebug!("remove success")
+            }
+            None => {}
         }
 
         Ok(count)
@@ -436,7 +438,8 @@ impl Futex {
                 let futex_q = bucket_1_mut.chain.pop_front();
                 match futex_q {
                     Some(futex_q) => {
-                        let bucket_2_mut = futex_data_guard.get_mut(&key2).ok_or(SystemError::EINVAL)?;
+                        let bucket_2_mut =
+                            futex_data_guard.get_mut(&key2).ok_or(SystemError::EINVAL)?;
                         bucket_2_mut.chain.push_back(futex_q);
                     }
                     None => {

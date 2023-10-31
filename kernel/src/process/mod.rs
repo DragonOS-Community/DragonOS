@@ -783,9 +783,6 @@ impl ProcessControlBlock {
 
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
-        // 处理线程信息
-        let thread = self.thread.write();
-
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));

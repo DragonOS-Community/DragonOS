@@ -3,7 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::hash::{Hash, Hasher};
-use core::{cell::RefCell, intrinsics::likely, sync::atomic::AtomicU64};
+use core::{intrinsics::likely, sync::atomic::AtomicU64};
 use hashbrown::HashMap;
 
 use crate::{

@@ -128,6 +128,7 @@ impl FutexHashBucket {
     }
 }
 
+#[derive(Debug)]
 pub struct FutexObj {
     pcb: Weak<ProcessControlBlock>,
     key: FutexKey,
@@ -361,7 +362,7 @@ impl Futex {
         let bucket_mut = binding.get_mut(&key).ok_or(SystemError::EINVAL)?;
 
         // 确保后面的唤醒操作是有意义的
-        if bucket_mut.chain.len() == 0 {
+        if bucket_mut.chain.is_empty() {
             return Ok(0);
         }
         // 从队列中唤醒

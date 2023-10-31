@@ -30,6 +30,10 @@ use crate::{
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
+        futex::{
+            constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
+            futex::Futex,
+        },
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -322,6 +326,10 @@ impl ProcessManager {
         }
 
         if let Some(addr) = thread.clear_child_tid {
+            if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
+                let _ =
+                    Futex::futex_wake(addr, FutexFlag::FLAGS_MATCH_NONE, 1, FUTEX_BITSET_MATCH_ANY);
+            }
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
 

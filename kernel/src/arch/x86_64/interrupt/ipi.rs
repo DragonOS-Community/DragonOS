@@ -1,7 +1,7 @@
 use x86::apic::ApicId;
 
 use crate::{
-    driver::interrupt::apic::{apic_write_icr, x2apic_enabled},
+    driver::interrupt::apic::{CurrentApic, LocalAPIC},
     exception::ipi::{IpiKind, IpiTarget},
 };
 
@@ -53,7 +53,7 @@ impl Into<ApicId> for ArchIpiTarget {
         if let ArchIpiTarget::Specified(id) = self {
             return id;
         } else {
-            if x2apic_enabled() {
+            if CurrentApic.x2apic_enabled() {
                 return x86::apic::ApicId::X2Apic(0);
             } else {
                 return x86::apic::ApicId::XApic(0);
@@ -74,7 +74,7 @@ impl ArchIpiTarget {
 
     #[inline(always)]
     fn cpu_id_to_apic_id(cpu_id: u32) -> x86::apic::ApicId {
-        if x2apic_enabled() {
+        if CurrentApic.x2apic_enabled() {
             x86::apic::ApicId::X2Apic(cpu_id as u32)
         } else {
             x86::apic::ApicId::XApic(cpu_id as u8)
@@ -101,7 +101,7 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     let target = ArchIpiTarget::from(target);
     let shorthand: x86::apic::DestinationShorthand = target.into();
     let destination: x86::apic::ApicId = target.into();
-    let icr = if x2apic_enabled() {
+    let icr = if CurrentApic.x2apic_enabled() {
         // kdebug!("send_ipi: x2apic");
         x86::apic::Icr::for_x2apic(
             ipi_vec,
@@ -127,5 +127,5 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
         )
     };
 
-    unsafe { apic_write_icr(icr) };
+    CurrentApic.write_icr(icr);
 }

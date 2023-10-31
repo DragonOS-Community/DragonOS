@@ -1,7 +1,10 @@
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 
-use crate::{driver::acpi::AcpiManager, kdebug};
+use crate::{
+    driver::acpi::{acpi_manager, AcpiManager},
+    kdebug,
+};
 
 /// 这是一个临时的函数，用于在acpi、cpu模块被正式实现之前，让原本的C写的smp模块能正常运行
 ///
@@ -15,7 +18,7 @@ use crate::{driver::acpi::AcpiManager, kdebug};
 /// 但是由于acpi、cpu模块还没有被正式实现，所以暂时使用这个函数来代替，接下来会按照上述步骤进行编写代码
 #[no_mangle]
 unsafe extern "C" fn rs_smp_get_cpus(res: *mut X86CpuInfo) -> usize {
-    let acpi_table = AcpiManager::tables().unwrap();
+    let acpi_table = acpi_manager().tables().unwrap();
     let platform_info = acpi_table
         .platform_info()
         .expect("smp_get_cpu_topology(): failed to get platform info");

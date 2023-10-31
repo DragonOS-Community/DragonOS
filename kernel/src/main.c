@@ -147,6 +147,7 @@ void system_initialize()
 
     rs_pci_init();
 
+
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
@@ -160,7 +161,7 @@ void system_initialize()
     io_mfence();
 
     kvm_init();
-
+    while(1);
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 

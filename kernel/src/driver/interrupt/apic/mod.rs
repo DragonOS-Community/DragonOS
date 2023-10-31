@@ -11,9 +11,13 @@ use crate::{
     syscall::SystemError,
 };
 
-use self::apic_timer::ApicTimerMode;
+use self::{
+    apic_timer::ApicTimerMode,
+    xapic::{xapic_instances_mut, XApicOffset},
+};
 
 pub mod apic_timer;
+mod c_adapter;
 pub mod ioapic;
 pub mod new_timer;
 pub mod x2apic;
@@ -64,10 +68,13 @@ pub trait LocalAPIC {
     /// @param lvt 要被设置成的值
     fn set_lvt(&mut self, lvt: LVT);
 
+    /// 读取LVT寄存器
+    fn read_lvt(&self, reg: LVTRegister) -> LVT;
+
     fn mask_all_lvt(&mut self);
 
     /// 写入ICR寄存器
-    fn write_icr(icr: Icr);
+    fn write_icr(&self, icr: Icr);
 }
 
 /// @brief 所有LVT寄存器的枚举类型
@@ -472,19 +479,172 @@ pub fn apic_init_ap_core() -> Result<(), SystemError> {
     return Ok(());
 }
 
-/// 写入ICR寄存器
-pub unsafe fn apic_write_icr(icr: Icr) {
-    match LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) {
-        LocalApicEnableType::XApic => {
-            XApic::write_icr(icr);
-        }
-        LocalApicEnableType::X2Apic => {
-            X2Apic::write_icr(icr);
-        }
+#[derive(Debug)]
+pub struct CurrentApic;
+
+impl CurrentApic {
+    /// x2apic是否启用
+    pub fn x2apic_enabled(&self) -> bool {
+        return LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic;
+    }
+
+    pub(self) unsafe fn write_xapic_register(&self, reg: XApicOffset, value: u32) {
+        xapic_instances_mut()
+            .get_mut()
+            .borrow_mut()
+            .as_mut()
+            .map(|xapic| {
+                xapic.write(reg, value);
+            });
     }
 }
 
-/// x2apic是否启用
-pub fn x2apic_enabled() -> bool {
-    return LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic;
+impl LocalAPIC for CurrentApic {
+    fn support() -> bool {
+        true
+    }
+
+    fn init_current_cpu(&mut self) -> bool {
+        let cpu_id = smp_get_processor_id();
+        if X2Apic::support() && X2Apic.init_current_cpu() {
+            if cpu_id == 0 {
+                LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::X2Apic, Ordering::SeqCst);
+            }
+            kinfo!("x2APIC initialized for cpu {}", cpu_id);
+        } else {
+            todo!("init xApic for core {}", smp_get_processor_id());
+            if cpu_id == 0 {
+                LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::XApic, Ordering::SeqCst);
+            }
+        }
+        if cpu_id == 0 {
+            ioapic_init();
+        }
+        kinfo!("Apic initialized.");
+        return true;
+    }
+
+    fn send_eoi(&mut self) {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            X2Apic.send_eoi();
+        } else {
+            xapic_instances_mut()
+                .get_mut()
+                .borrow_mut()
+                .as_mut()
+                .map(|xapic| {
+                    xapic.send_eoi();
+                });
+        }
+    }
+
+    fn version(&self) -> u8 {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            return X2Apic.version();
+        } else {
+            return xapic_instances_mut()
+                .get()
+                .borrow()
+                .as_ref()
+                .map(|xapic| xapic.version())
+                .unwrap_or(0);
+        }
+    }
+
+    fn support_eoi_broadcast_suppression(&self) -> bool {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            return X2Apic.support_eoi_broadcast_suppression();
+        } else {
+            return xapic_instances_mut()
+                .get()
+                .borrow()
+                .as_ref()
+                .map(|xapic| xapic.support_eoi_broadcast_suppression())
+                .unwrap_or(false);
+        }
+    }
+
+    fn max_lvt_entry(&self) -> u8 {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            return X2Apic.max_lvt_entry();
+        } else {
+            return xapic_instances_mut()
+                .get()
+                .borrow()
+                .as_ref()
+                .map(|xapic| xapic.max_lvt_entry())
+                .unwrap_or(0);
+        }
+    }
+
+    fn id(&self) -> u32 {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            return X2Apic.id();
+        } else {
+            return xapic_instances_mut()
+                .get()
+                .borrow()
+                .as_ref()
+                .map(|xapic| xapic.id())
+                .unwrap_or(0);
+        }
+    }
+
+    fn set_lvt(&mut self, lvt: LVT) {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            X2Apic.set_lvt(lvt);
+        } else {
+            xapic_instances_mut()
+                .get_mut()
+                .borrow_mut()
+                .as_mut()
+                .map(|xapic| {
+                    xapic.set_lvt(lvt);
+                });
+        }
+    }
+
+    fn read_lvt(&self, reg: LVTRegister) -> LVT {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            return X2Apic.read_lvt(reg);
+        } else {
+            return xapic_instances_mut()
+                .get()
+                .borrow()
+                .as_ref()
+                .map(|xapic| xapic.read_lvt(reg))
+                .unwrap_or(LVT {
+                    register: reg,
+                    data: 0,
+                });
+        }
+    }
+
+    fn mask_all_lvt(&mut self) {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            X2Apic.mask_all_lvt();
+        } else {
+            xapic_instances_mut()
+                .get_mut()
+                .borrow_mut()
+                .as_mut()
+                .map(|xapic| {
+                    xapic.mask_all_lvt();
+                });
+        }
+    }
+
+    fn write_icr(&self, icr: Icr) {
+        if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+            X2Apic.write_icr(icr);
+        } else {
+            xapic_instances_mut()
+                .get_mut()
+                .borrow_mut()
+                .as_mut()
+                .map(|xapic| {
+                    xapic.write_icr(icr);
+                });
+        }
+    }
 }

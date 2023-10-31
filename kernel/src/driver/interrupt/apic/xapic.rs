@@ -1,11 +1,25 @@
-use core::ptr::{read_volatile, write_volatile};
+use core::{
+    cell::RefCell,
+    ptr::{read_volatile, write_volatile},
+};
 
 use crate::{
     libs::lazy_init::Lazy,
-    mm::{percpu::PerCpuVar, VirtAddr},
+    mm::{
+        percpu::{PerCpu, PerCpuVar},
+        VirtAddr,
+    },
 };
 
 use super::{LVTRegister, LocalAPIC, LVT};
+
+/// per-cpu的xAPIC的MMIO空间起始地址
+static mut XAPIC_INSTANCES: Option<PerCpuVar<RefCell<Option<XApic>>>> = None;
+
+#[allow(dead_code)]
+pub(super) fn xapic_instances_mut() -> &'static mut PerCpuVar<RefCell<Option<XApic>>> {
+    unsafe { XAPIC_INSTANCES.as_mut().unwrap() }
+}
 
 /// TODO：统一变量
 /// @brief local APIC 寄存器地址偏移量
@@ -13,7 +27,7 @@ use super::{LVTRegister, LocalAPIC, LVT};
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 #[repr(u32)]
-pub enum LocalApicOffset {
+pub enum XApicOffset {
     // 定义各个寄存器的地址偏移量
     LOCAL_APIC_OFFSET_Local_APIC_ID = 0x20,
     LOCAL_APIC_OFFSET_Local_APIC_Version = 0x30,
@@ -73,14 +87,27 @@ pub enum LocalApicOffset {
     LOCAL_APIC_OFFSET_Local_APIC_CLKDIV = 0x3e0,
 }
 
-impl Into<u32> for LocalApicOffset {
+impl Into<u32> for XApicOffset {
     fn into(self) -> u32 {
         self as u32
     }
 }
 
-/// per-cpu的xAPIC的MMIO空间起始地址
-static XAPIC_INSTANCES: Lazy<PerCpuVar<Option<XApic>>> = PerCpuVar::define_lazy();
+impl From<LVTRegister> for XApicOffset {
+    fn from(lvt: LVTRegister) -> Self {
+        match lvt {
+            LVTRegister::Timer => XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER,
+            LVTRegister::Thermal => XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_THERMAL,
+            LVTRegister::PerformanceMonitor => {
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_PERFORMANCE_MONITOR
+            }
+            LVTRegister::LINT0 => XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0,
+            LVTRegister::LINT1 => XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1,
+            LVTRegister::ErrorReg => XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_ERROR,
+            LVTRegister::CMCI => XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_CMCI,
+        }
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -92,15 +119,18 @@ pub struct XApic {
 impl XApic {
     /// 读取指定寄存器的值
     #[allow(dead_code)]
-    pub unsafe fn read(&self, reg: u32) -> u32 {
+    pub unsafe fn read(&self, reg: XApicOffset) -> u32 {
         read_volatile((self.map_vaddr.data() + reg as usize) as *const u32)
     }
 
     /// 将指定的值写入寄存器
     #[allow(dead_code)]
-    pub unsafe fn write(&mut self, reg: u32, value: u32) {
-        write_volatile((self.map_vaddr.data() + reg as usize) as *mut u32, value);
-        self.read(0x20); // 等待写操作完成，通过读取进行同步
+    pub unsafe fn write(&mut self, reg: XApicOffset, value: u32) {
+        write_volatile(
+            (self.map_vaddr.data() + (reg as u32) as usize) as *mut u32,
+            value,
+        );
+        self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID); // 等待写操作完成，通过读取进行同步
     }
 }
 
@@ -116,7 +146,6 @@ const X1: u32 = 0x0000000B; // 将除数设置为1，即不除频率
 const PERIODIC: u32 = 0x00020000; // 周期性模式
 const ENABLE: u32 = 0x00000100; // 单元使能
 const MASKED: u32 = 0x00010000; // 中断屏蔽
-const PCINT: u32 = 0x0340; // Performance Counter LVT
 const LEVEL: u32 = 0x00008000; // 电平触发
 const BCAST: u32 = 0x00080000; // 发送到所有APIC，包括自己
 const DELIVS: u32 = 0x00001000; // 传递状态
@@ -145,71 +174,70 @@ impl LocalAPIC for XApic {
         unsafe {
             // 设置 Spurious Interrupt Vector Register
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into(),
                 ENABLE | (T_IRQ0 + IRQ_SPURIOUS),
             );
 
             // 定时器从 lapic[TICR] 开始按总线频率反复倒计时，然后发出中断。
             // 如果需要更精确的时间保持，TICR 应该使用外部时间源进行校准。
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV.into(), X1);
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV.into(),
-                X1,
-            );
-            self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER.into(),
                 PERIODIC | (T_IRQ0 + IRQ_TIMER),
             );
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_INITIAL_COUNT_REG.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_INITIAL_COUNT_REG.into(),
                 10000000,
             );
 
             // 禁用逻辑中断线
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT0.into(),
                 MASKED,
             );
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_LINT1.into(),
                 MASKED,
             );
 
             // 禁用支持性能计数器溢出中断的机器
-            if (self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16
-                & 0xFF)
+            if (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16 & 0xFF)
                 >= 4
             {
-                self.write(PCINT, MASKED);
+                self.write(
+                    XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_PERFORMANCE_MONITOR,
+                    MASKED,
+                );
             }
 
             // 将错误中断映射到 IRQ_ERROR
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_ERROR.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_ERROR.into(),
                 T_IRQ0 + IRQ_ERROR,
             );
 
             // 清除错误状态寄存器（需要连续写入两次）
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
 
             // 确认任何未完成的中断
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
 
             // 发送 Init Level De-Assert 信号以同步仲裁ID
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
                 0,
             );
             self.write(
-                LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
                 BCAST | INIT | LEVEL,
             );
-            while self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS
-                != 0
-            {}
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
+            {
+            }
 
             // 启用 APIC 上的中断（但不在处理器上启用）
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_TPR.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_TPR.into(), 0);
         }
 
         true
@@ -218,27 +246,26 @@ impl LocalAPIC for XApic {
     /// 发送 EOI（End Of Interrupt）
     fn send_eoi(&mut self) {
         unsafe {
-            self.write(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
         }
     }
 
     /// 获取版本号
     fn version(&self) -> u8 {
         unsafe {
-            (self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) & 0xff) as u8
+            (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) & 0xff) as u8
         }
     }
 
     fn support_eoi_broadcast_suppression(&self) -> bool {
         unsafe {
-            ((self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 24) & 1)
-                == 1
+            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 24) & 1) == 1
         }
     }
 
     fn max_lvt_entry(&self) -> u8 {
         unsafe {
-            ((self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16) & 0xff)
+            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16) & 0xff)
                 as u8
                 + 1
         }
@@ -246,13 +273,23 @@ impl LocalAPIC for XApic {
 
     /// 获取ID
     fn id(&self) -> u32 {
-        unsafe { self.read(LocalApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID.into()) >> 24 }
+        unsafe { self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID.into()) >> 24 }
     }
 
     /// 设置LVT寄存器的值
     fn set_lvt(&mut self, lvt: LVT) {
         unsafe {
             self.write(lvt.register().into(), lvt.data);
+        }
+    }
+
+    fn read_lvt(&self, reg: LVTRegister) -> LVT {
+        unsafe {
+            LVT::new(
+                reg,
+                self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER.into()),
+            )
+            .unwrap()
         }
     }
 
@@ -266,7 +303,7 @@ impl LocalAPIC for XApic {
         self.set_lvt(LVT::new(LVTRegister::ErrorReg, LVT::MASKED).unwrap());
     }
 
-    fn write_icr(icr: x86::apic::Icr) {
+    fn write_icr(&self, icr: x86::apic::Icr) {
         todo!("xapic: write_icr");
     }
 }

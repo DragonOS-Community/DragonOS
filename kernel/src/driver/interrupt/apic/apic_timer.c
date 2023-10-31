@@ -13,6 +13,10 @@ static bool bsp_initialized = false;
 
 extern uint64_t rs_get_cycles();
 extern uint64_t rs_tsc_get_cpu_khz();
+extern void rs_apic_timer_install(int irq_num);
+extern void rs_apic_timer_uninstall(int irq_num);
+extern void rs_apic_timer_enable(int irq_num);
+extern void rs_apic_timer_disable(int irq_num);
 
 /**
  * @brief 初始化AP核的apic时钟
@@ -30,19 +34,12 @@ void apic_timer_ap_core_init()
 
 void apic_timer_enable(uint64_t irq_num)
 {
-    // 启动apic定时器
-    io_mfence();
-    uint64_t val = apic_timer_get_LVT();
-    io_mfence();
-    val &= (~APIC_LVT_INT_MASKED);
-    io_mfence();
-    apic_timer_write_LVT(val);
-    io_mfence();
+    rs_apic_timer_enable(irq_num);
 }
 
 void apic_timer_disable(uint64_t irq_num)
 {
-    apic_timer_stop();
+    rs_apic_timer_disable(irq_num);
 }
 
 /**
@@ -54,32 +51,14 @@ void apic_timer_disable(uint64_t irq_num)
  */
 uint64_t apic_timer_install(ul irq_num, void *arg)
 {
-    // 设置div16
-    io_mfence();
-    apic_timer_stop();
-    io_mfence();
-    apic_timer_set_div(APIC_TIMER_DIVISOR);
-    io_mfence();
 
-    // 设置初始计数
-
-    uint64_t cpu_khz = rs_tsc_get_cpu_khz();
-    // 疑惑：这里使用khz吗？
-    // 我觉得应该是hz，但是由于旧的代码是测量出initcnt的，而不是计算的
-    // 然后我发现使用hz会导致计算出来的initcnt太大，导致系统卡顿，而khz的却能跑
-    // TODO： 这里需要进一步研究
-    uint64_t init_cnt = cpu_khz * APIC_TIMER_INTERVAL / (1000 * APIC_TIMER_DIVISOR);
-    kdebug("cpu_khz: %ld, init_cnt: %ld", cpu_khz, init_cnt);
-    apic_timer_set_init_cnt(init_cnt);
-    io_mfence();
-    // 填写LVT
-    apic_timer_set_LVT(APIC_TIMER_IRQ_NUM, 1, APIC_LVT_Timer_Periodic);
-    io_mfence();
+    rs_apic_timer_install(irq_num);
+    return 0;
 }
 
 void apic_timer_uninstall(ul irq_num)
 {
-    apic_timer_write_LVT(APIC_LVT_INT_MASKED);
+    // apic_timer_write_LVT(APIC_LVT_INT_MASKED);
     io_mfence();
 }
 
@@ -125,4 +104,10 @@ void apic_timer_init()
     }
     kdebug("apic timer init done for cpu %d", rs_current_pcb_cpuid());
     spin_unlock_irqrestore(&apic_timer_init_lock, flags);
+}
+
+void c_register_apic_timer_irq()
+{
+    irq_register(APIC_TIMER_IRQ_NUM, NULL, &apic_timer_handler, 0, &apic_timer_intr_controller,
+                 "apic timer");
 }

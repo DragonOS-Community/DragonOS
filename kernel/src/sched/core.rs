@@ -51,8 +51,8 @@ impl CpuExecuting {
 pub fn get_cpu_loads(cpu_id: u32) -> u32 {
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
-    let len_cfs = cfs_scheduler.get_cfs_queue_len(cpu_id);
-    let len_rt = rt_scheduler.rt_queue_len(cpu_id);
+    let len_cfs = cfs_scheduler.get_cfs_queue_len(cpu_id as u32);
+    let len_rt = rt_scheduler.rt_queue_len(cpu_id as u32);
     // let load_rt = rt_scheduler.get_load_list_len(cpu_id);
     // kdebug!("this cpu_id {} is load rt {}", cpu_id, load_rt);
 

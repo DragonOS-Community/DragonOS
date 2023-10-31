@@ -1,76 +1,189 @@
+use core::cell::{Cell, RefCell};
+
+use crate::arch::driver::tsc::TSCManager;
+use crate::include::bindings::bindings::APIC_TIMER_IRQ_NUM;
+use crate::mm::percpu::PerCpuVar;
+use crate::smp::core::smp_get_processor_id;
 use x86::{cpuid::cpuid, time::rdtsc};
 // use x86::cpuid::CpuId
-use crate::arch::CurrentIrqArch;
 use crate::driver::interrupt::apic::xapic::XApic;
 use crate::exception::InterruptArch;
 use crate::kerror;
+use crate::{arch::CurrentIrqArch, mm::percpu::PerCpu};
 pub use drop;
-use x86::msr::{rdmsr, wrmsr};
+use x86::msr::{rdmsr, wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 
-// pub enum ApicTimerMode {
-//     OneShot {
-//         enabled: bool,
-//     },
-//     Periodic {
-//         enabled: bool,
-//     },
-//     TSCDeadline {
-//         enabled: bool,
-//     },
-// }
+use super::xapic::XApicOffset;
+use super::{CurrentApic, LVTRegister, LocalAPIC, LVT};
 
-// impl ApicTimerMode {
-//     pub fn start_timer(&self, duration: u64) {
-//         match self {
-//             ApicTimerMode::OneShot { enabled } => {
+extern "C" {
+    fn c_register_apic_timer_irq();
+}
 
-//             }
-//             ApicTimerMode::Periodic { enabled } => {
+static mut LOCAL_APIC_TIMERS: [RefCell<LocalApicTimer>; PerCpu::MAX_CPU_NUM] =
+    [const { RefCell::new(LocalApicTimer::new()) }; PerCpu::MAX_CPU_NUM];
 
-//             }
-//             ApicTimerMode::TSCDeadline { enabled } => {
+#[inline(always)]
+pub(super) fn local_apic_timer_instance(cpu_id: u32) -> core::cell::Ref<'static, LocalApicTimer> {
+    unsafe { LOCAL_APIC_TIMERS[cpu_id as usize].borrow() }
+}
 
-//             }
-//         }
-//     }
-// }
+#[inline(always)]
+pub(super) fn local_apic_timer_instance_mut(
+    cpu_id: u32,
+) -> core::cell::RefMut<'static, LocalApicTimer> {
+    unsafe { LOCAL_APIC_TIMERS[cpu_id as usize].borrow_mut() }
+}
 
+/// 初始化BSP的APIC定时器
+///
+fn init_bsp_apic_timer() {
+    assert!(smp_get_processor_id() == 0);
+    // 注册中断处理函数
+    unsafe { c_register_apic_timer_irq() };
+    let mut local_apic_timer = local_apic_timer_instance_mut(0);
+    local_apic_timer.init(
+        LocalApicTimerMode::Periodic,
+        LocalApicTimer::periodic_default_initial_count(),
+        LocalApicTimer::DIVISOR as u32,
+    )
+}
+
+fn init_ap_apic_timer() {
+    let cpu_id = smp_get_processor_id();
+    assert!(cpu_id != 0);
+
+    let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
+    local_apic_timer.init(
+        LocalApicTimerMode::Periodic,
+        LocalApicTimer::periodic_default_initial_count(),
+        LocalApicTimer::DIVISOR as u32,
+    );
+}
+
+pub(super) struct LocalApicTimerIntrController;
+
+impl LocalApicTimerIntrController {
+    pub(super) fn install(&self, irq_num: u8) {
+        if smp_get_processor_id() == 0 {
+            init_bsp_apic_timer();
+        } else {
+            init_ap_apic_timer();
+        }
+    }
+
+    pub(super) fn uninstall(&self) {
+        let cpu_id = smp_get_processor_id();
+        let local_apic_timer = local_apic_timer_instance(cpu_id);
+        local_apic_timer.stop_current();
+    }
+
+    pub(super) fn enable(&self) {
+        let cpu_id = smp_get_processor_id();
+        let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
+        local_apic_timer.start_current();
+    }
+
+    pub(super) fn disable(&self) {
+        let cpu_id = smp_get_processor_id();
+        let local_apic_timer = local_apic_timer_instance_mut(cpu_id);
+        local_apic_timer.stop_current();
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
 pub struct LocalApicTimer {
-    is_deadline_mode_enabled: bool,
-    frequency: usize,
-    reload_value: u64,
-    is_interrupt_enabled: bool,
+    mode: LocalApicTimerMode,
+    /// IntialCount
+    initial_count: u64,
+    divisor: u32,
+    /// 是否已经触发（oneshot模式）
+    triggered: bool,
+}
 
-    is_periodic_mode_enabled: bool,
-    periodic_interval: u64,
-
-    is_oneshot_mode_enabled: bool,
-    oneshot_interval: u64,
-    oneshot_triggered: bool,
+#[derive(Debug, Copy, Clone)]
+#[repr(u32)]
+enum LocalApicTimerMode {
+    Oneshot = 0,
+    Periodic = 1,
+    Deadline = 2,
 }
 
 impl LocalApicTimer {
-    const TSC_DEADLINE_MSR: u32 = 0x6E0;
+    /// 定时器中断的间隔
+    pub const INTERVAL_MS: u64 = 5;
+    pub const DIVISOR: u64 = 3;
 
     /// IoApicManager 初值为0或false
     pub const fn new() -> Self {
-        Self {
-            is_deadline_mode_enabled: false,
-            frequency: 0,
-            reload_value: 0,
-            is_interrupt_enabled: false,
-            is_periodic_mode_enabled: false,
-            periodic_interval: 0,
-            is_oneshot_mode_enabled: false,
-            oneshot_interval: 0,
-            oneshot_triggered: false,
+        LocalApicTimer {
+            mode: LocalApicTimerMode::Periodic,
+            initial_count: 0,
+            divisor: 0,
+            triggered: false,
         }
+    }
+
+    /// 周期模式下的默认初始值
+    pub fn periodic_default_initial_count() -> u64 {
+        let cpu_khz = TSCManager::cpu_khz();
+
+        // 疑惑：这里使用khz吗？
+        // 我觉得应该是hz，但是由于旧的代码是测量出initcnt的，而不是计算的
+        // 然后我发现使用hz会导致计算出来的initcnt太大，导致系统卡顿，而khz的却能跑
+        let count = cpu_khz * Self::INTERVAL_MS / (1000 * Self::DIVISOR);
+        return count;
     }
 
     /// Init this manager.
     ///
     /// At this time, it does nothing.
-    pub fn init(&mut self) {}
+    fn init(&mut self, mode: LocalApicTimerMode, initial_count: u64, divisor: u32) {
+        self.stop_current();
+        self.triggered = false;
+        match mode {
+            LocalApicTimerMode::Periodic => self.install_periodic_mode(initial_count, divisor),
+            LocalApicTimerMode::Oneshot => todo!(),
+            LocalApicTimerMode::Deadline => todo!(),
+        }
+    }
+
+    fn install_periodic_mode(&mut self, initial_count: u64, divisor: u32) {
+        self.mode = LocalApicTimerMode::Periodic;
+        self.set_divisor(divisor);
+        self.set_initial_cnt(initial_count);
+        self.setup_lvt(APIC_TIMER_IRQ_NUM as u8, true, LocalApicTimerMode::Periodic);
+    }
+
+    fn setup_lvt(&mut self, vector: u8, mask: bool, mode: LocalApicTimerMode) {
+        let mode: u32 = mode as u32;
+        let data = (mode << 17) | (vector as u32) | (if mask { 1 << 16 } else { 0 });
+        let lvt = LVT::new(LVTRegister::Timer, 0).unwrap();
+
+        CurrentApic.set_lvt(lvt);
+    }
+
+    fn set_divisor(&mut self, divisor: u32) {
+        self.divisor = divisor;
+        CurrentApic.set_timer_divisor(divisor as u32);
+    }
+
+    fn set_initial_cnt(&mut self, initial_count: u64) {
+        self.initial_count = initial_count;
+        CurrentApic.set_timer_initial_count(initial_count);
+    }
+
+    fn start_current(&mut self) {
+        let mut lvt = CurrentApic.read_lvt(LVTRegister::Timer);
+        lvt.set_mask(false);
+        CurrentApic.set_lvt(lvt);
+    }
+
+    fn stop_current(&self) {
+        let mut lvt = CurrentApic.read_lvt(LVTRegister::Timer);
+        lvt.set_mask(true);
+        CurrentApic.set_lvt(lvt);
+    }
 
     /// 检查是否支持TSC-Deadline
     ///
@@ -80,378 +193,34 @@ impl LocalApicTimer {
         let res = cpuid!(1);
         return (res.ecx & (1 << 24)) != 0;
     }
+}
 
-    fn calculate_next_reload_value(&self, ms: u64) -> (u64, bool) {
-        self.reload_value
-            .overflowing_add((self.frequency as u64 / 1000) * ms as u64)
-    }
-
-    /// 重置下一次中断的计时器截止时间
-    ///
-    /// 此函数是从中断处理程序调用的。
-    /// Set [`Self::reload_value`] += TIMER_INTERVAL
-    /// 该函数将会返回false
-    /// 当[`Self::is_deadline_mode_enabled`] 为true
-    /// 重置reload_value大于当前tsc
-    fn update_deadline_and_compare_with_current_tsc(&mut self, ms: u64) -> bool {
-        if self.is_deadline_mode_enabled {
+impl CurrentApic {
+    fn set_timer_divisor(&self, divisor: u32) {
+        if self.x2apic_enabled() {
+            unsafe { wrmsr(IA32_X2APIC_DIV_CONF, divisor.into()) };
+        } else {
             unsafe {
-                let irq_guard = CurrentIrqArch::save_and_disable_irq();
-                let (reload_value, overflowed) = self.calculate_next_reload_value(ms);
-                let old_value = self.reload_value;
-                self.reload_value = reload_value;
-                drop(irq_guard);
-                let current = rdtsc();
-                if overflowed {
-                    (old_value > current) && (self.reload_value <= current)
-                } else {
-                    self.reload_value <= current
-                }
+                self.write_xapic_register(
+                    XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV,
+                    divisor.into(),
+                )
+            };
+        }
+    }
+
+    fn set_timer_initial_count(&self, initial_count: u64) {
+        if self.x2apic_enabled() {
+            unsafe {
+                wrmsr(IA32_X2APIC_INIT_COUNT.into(), initial_count);
             }
         } else {
-            false
-        }
-    }
-
-    /// Set [`Self::reload_value`] to TSC_DEADLINE_MSR.
-    ///
-    /// 检查TSC-Deadline是否已启用，并设置新的ddl（毫秒）。
-    /// 如果未启用该模式，则返回false
-    fn write_deadline(&self) -> bool {
-        if !self.is_deadline_mode_enabled || self.frequency == 0 {
-            return false;
-        }
-        unsafe { wrmsr(Self::TSC_DEADLINE_MSR, self.reload_value) };
-        return true;
-    }
-
-    /// 启用TSC-Deadline模式。
-    ///
-    /// 检查三点：是否支持TSC截止日期模式？，
-    /// 它是否能够得到TSC的频率，以及它是否是不变的。
-    /// 之后，此函数设置寄存器以启用它。
-    /// 如果启用，则当前值将永久为零。
-    pub fn enable_deadline_mode(&mut self, vector: u16, local_apic_manager: &mut XApic) -> bool {
-        if !self.is_deadline_mode_supported() {
-            return false;
-        }
-        let is_invariant_tsc = unsafe {
-            let res = cpuid!(0x80000007);
-            (res.edx & (1 << 8)) != 0
-        };
-
-        if !is_invariant_tsc {
-            kerror!("TSC is not invariant.");
-            return false;
-        }
-
-        unsafe {
-            let irq_guard = CurrentIrqArch::save_and_disable_irq();
-
-            self.frequency = ((rdmsr(0xce) as usize >> 8) & 0xff) * 100 * 1000000;
-            /* Frequency = MSRS(0xCE)[15:8] * 100MHz
-             * 2.12 MSRS IN THE 3RD GENERATION INTEL(R) CORE(TM) PROCESSOR FAMILY
-             * (BASED ON INTEL® MICROARCHITECTURE CODE NAME IVY BRIDGE) Intel SDM Vol.4 2-198 */
-            /* TODO */
-            if self.frequency == 0 {
-                drop(irq_guard);
-                kerror!("Cannot get the frequency of TSC.");
-                return false;
-            }
-
-            local_apic_manager.write(
-                //LvtTimer,
-                0x32,
-                (0b101 << 16) | (vector as u32),
-            );
-            self.is_deadline_mode_enabled = true;
-            drop(irq_guard);
-            return true;
-        }
-    }
-
-    /// 启用Periodic模式
-    ///
-    /// interval_ms 表示触发中断的间隔时间
-    /// local_apic 是 XApic 的实例，用于读写 Local APIC 寄存器
-    pub fn enable_periodic_mode(
-        &mut self,
-        interval_ms: u64,
-        local_apic: &mut XApic,
-        vector: u16,
-    ) -> bool {
-        if self.is_periodic_mode_enabled || self.frequency == 0 {
-            return false;
-        }
-        unsafe {
-            let irq_guard = CurrentIrqArch::save_and_disable_irq();
-
-            local_apic.write(0x3e, 0b1011);
-            // TimerDivide 0x3e
-            local_apic.write(0x32, (0b001 << 16) | vector as u32);
-            /*Masked*/
-            // LvtTimer 0x32
-
-            // 设置Periodic模式的重载值
-            self.periodic_interval = (self.frequency / 1000) as u64 * interval_ms;
-            local_apic.write(
-                //TimerInitialCount,
-                0x38,
-                self.periodic_interval as u32,
-            );
-
-            self.is_periodic_mode_enabled = true;
-
-            drop(irq_guard);
-            return true;
-        }
-    }
-
-    /// 设置oneshot模式
-    ///
-    /// interval_ms 表示触发中断的间隔时间
-    /// local_apic 是 XApic 的实例，用于读写 Local APIC 寄存器
-    pub fn enable_oneshot_mode(
-        &mut self,
-        interval_ms: u64,
-        local_apic: &mut XApic,
-        vector: u32,
-    ) -> bool {
-        if self.is_oneshot_mode_enabled || self.frequency == 0 {
-            return false;
-        }
-        unsafe {
-            let irq_guard = CurrentIrqArch::save_and_disable_irq();
-
-            local_apic.write(0x3e, 0b1011);
-            // TimerDivide 0x3e
-            local_apic.write(0x32, (0b001 << 16) | vector as u32); /*Masked*/
-            // LvtTimer 0x32
-
-            // 设置单次触发模式的重载值
-            self.oneshot_interval = (self.frequency / 1000) as u64 * interval_ms;
-            self.oneshot_triggered = false;
-            self.is_oneshot_mode_enabled = true;
-
-            drop(irq_guard);
-            true
-        }
-    }
-
-    /// 启动定时器中断
-    pub fn start_interrupt_oneshot(&mut self, local_apic: &mut XApic) -> bool {
-        unsafe {
-            let irq_guard = CurrentIrqArch::save_and_disable_irq();
-            if self.is_interrupt_enabled || self.frequency == 0 {
-                drop(irq_guard);
-                return false;
-            }
-
-            if self.is_oneshot_mode_enabled {
-                let mut lvt = local_apic.read(0x32);
-                // LvtTimer 0x32
-                lvt &= !(0b111 << 16);
-                lvt |= 0b01 << 17;
-                local_apic.write(0x32, lvt);
-                // LvtTimer 0x32
-
-                // 设置单次触发模式的重载值
-                local_apic.write(
-                    //TimerInitialCount,
-                    0x38,
-                    self.oneshot_interval as u32,
-                );
-
-                self.oneshot_triggered = false;
-            }
-
-            self.is_interrupt_enabled = true;
-            drop(irq_guard);
-            true
-        }
-    }
-
-    /// 设置定时器的中断。
-    ///
-    /// 此功能调用其他计时器来计算计时器的频率。
-    /// 如果已经设置了中断，则返回false。
-    ///
-    /// *vector：用于设置计时器的IDT矢量表的索引
-    /// *local_apic:XApic，用于读取/写入本地apic。
-    /// *timer：满足timer特性的结构体。它必须提供busy_wait_ms。
-    ///
-    /// 这不会设置中断管理器，必须手动设置。
-    /// 之后要开始中断，执行[`Self:：start_interrupt`]。
-    pub fn start_interrupt_periodic<T: Timer>(
-        &mut self,
-        vector: u16,
-        local_apic: &mut XApic,
-        timer: &T,
-    ) -> bool {
-        if self.frequency != 0 {
-            return false;
-        }
-        unsafe {
-            let irq_guard = CurrentIrqArch::save_and_disable_irq();
-
-            local_apic.write(0x3e, 0b1011); //TimerDivide 0x3e
-            local_apic.write(0x32, (0b001 << 16) | vector as u32); /*LvtTimer Masked*/
-            self.reload_value = u32::MAX as u64;
-            local_apic.write(0x38, u32::MAX); //TimerInitialCount 0x38
-            timer.busy_wait_ms(50);
-            let end = local_apic.read(0x39); //TimerCurrentCount 0x39
-            let difference = self.get_difference(u32::MAX as usize, end as usize);
-            self.frequency = difference * 20;
-            drop(irq_guard);
-            return true;
-        }
-    }
-
-    /// 将寄存器设置为开始中断。
-    ///
-    /// 在调用之前确保已设置中断。
-    /// 目前，该函数将1000ms设置为间隔，是可变的
-    pub fn start_interrupt_deadline(&mut self, local_apic: &mut XApic) -> bool {
-        unsafe {
-            let irq_guard = CurrentIrqArch::save_and_disable_irq();
-            if self.is_interrupt_enabled || self.frequency == 0 {
-                drop(irq_guard);
-                return false;
-            }
-
-            if self.is_deadline_mode_enabled {
-                let mut lvt = local_apic.read(0x32); // LvtTimer寄存器0x32
-                lvt &= !(0b1 << 16);
-                local_apic.write(0x32, lvt); //LvtTimer寄存器0x32
-                self.reload_value = rdtsc();
-                self.reload_value = self
-                    .calculate_next_reload_value(10) // TIMER_INTERVAL_MS值设置为10
-                    .0;
-                self.write_deadline();
-            } else {
-                let mut lvt = local_apic.read(0x32); // LvtTimer
-                lvt &= !(0b111 << 16);
-                lvt |= 0b01 << 17;
-                local_apic.write(0x32, lvt); // LvtTimer
-                self.set_interval(10, local_apic); // TIMER_INTERVAL_MS
-            }
-            self.is_interrupt_enabled = true;
-            drop(irq_guard);
-            return true;
-        }
-    }
-
-    ///设置间隔模式的重载值
-    ///
-    ///设置[`Self:：reload_value`]并设置到本地APIC寄存器中。
-    ///如果启用了TSCDeadline模式，则此操作将无效。
-    ///此函数假定[`Self:：lock`]已锁定。
-    fn set_interval(&mut self, interval_ms: u64, local_apic: &mut XApic) -> bool {
-        if self.is_deadline_mode_enabled || self.frequency == 0 {
-            return false;
-        }
-        self.reload_value = (self.frequency / 1000) as u64 * interval_ms;
-        unsafe {
-            local_apic.write(0x38, self.reload_value as u32);
-        }
-        return true;
-    }
-}
-
-impl LocalApicTimer {
-    fn get_count(&self) -> usize {
-        if self.is_periodic_mode_enabled {
-            let current_count = false;
-            let remaining_count =
-                self.get_difference(self.periodic_interval as usize, current_count as usize);
-            remaining_count
-        } else if self.is_deadline_mode_enabled {
-            unsafe { rdtsc() as usize }
-        } else {
-            0
-        }
-    }
-
-    fn get_frequency_hz(&self) -> usize {
-        self.frequency
-    }
-
-    fn is_count_up_timer(&self) -> bool {
-        true
-    }
-
-    fn get_difference(&self, earlier: usize, later: usize) -> usize {
-        assert_eq!(self.is_deadline_mode_enabled, false);
-        if earlier <= later {
-            earlier + (self.reload_value as usize - later)
-        } else {
-            earlier - later
-        }
-    }
-
-    fn get_ending_count_value(&self, _start: usize, _difference: usize) -> usize {
-        unimplemented!()
-    }
-
-    fn get_max_counter_value(&self) -> usize {
-        u32::MAX as usize
-    }
-}
-
-// 定义了一个通用的计时器接口，用于进行定时操作，包括忙等待和等待计数器达到特定值
-pub trait Timer {
-    fn get_count(&self) -> usize;
-    fn get_frequency_hz(&self) -> usize;
-    fn is_count_up_timer(&self) -> bool;
-    fn get_difference(&self, earlier: usize, later: usize) -> usize;
-    fn get_ending_count_value(&self, start: usize, difference: usize) -> usize;
-    fn get_max_counter_value(&self) -> usize;
-
-    #[inline(always)]
-    fn busy_wait_ms(&self, ms: usize) {
-        let start = self.get_count();
-        let difference = self.get_frequency_hz() * ms / 1000;
-        if difference > self.get_max_counter_value() {
-            panic!("Cannot count more than max_counter_value");
-        }
-        let end = self.get_ending_count_value(start, difference);
-        self.wait_until(start, end);
-    }
-
-    #[inline(always)]
-    fn busy_wait_us(&self, us: usize) {
-        let start = self.get_count();
-        let difference = self.get_frequency_hz() * us / 1000000;
-        if difference > self.get_max_counter_value() {
-            panic!("Cannot count more than max_counter_value");
-        } else if difference == 0 {
-            panic!("Cannot count less than the resolution");
-        }
-        let end = self.get_ending_count_value(start, difference);
-        self.wait_until(start, end);
-    }
-
-    #[inline(always)]
-    fn wait_until(&self, start_counter_value: usize, end_counter_value: usize) {
-        use core::hint::spin_loop;
-        if self.is_count_up_timer() {
-            if start_counter_value > end_counter_value {
-                while self.get_count() >= start_counter_value {
-                    spin_loop();
-                }
-            }
-            while self.get_count() < end_counter_value {
-                spin_loop();
-            }
-        } else {
-            if start_counter_value < end_counter_value {
-                while self.get_count() <= start_counter_value {
-                    spin_loop();
-                }
-            }
-            while self.get_count() > end_counter_value {
-                spin_loop();
-            }
+            unsafe {
+                self.write_xapic_register(
+                    XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_INITIAL_COUNT_REG,
+                    initial_count as u32,
+                )
+            };
         }
     }
 }

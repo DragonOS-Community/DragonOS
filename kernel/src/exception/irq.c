@@ -90,7 +90,7 @@ Build_IRQ(0x38);
 Build_IRQ(0x39);
 
 // 初始化中断数组
-void (*interrupt_table[26])(void) = {
+void (*interrupt_table[IRQ_NUM])(void) = {
     IRQ0x20interrupt,
     IRQ0x21interrupt,
     IRQ0x22interrupt,

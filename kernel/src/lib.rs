@@ -9,6 +9,7 @@
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(drain_filter)]
+#![feature(inline_const)]
 #![feature(is_some_and)]
 #![feature(naked_functions)]
 #![feature(panic_info_message)]

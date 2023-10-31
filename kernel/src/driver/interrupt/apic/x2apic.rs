@@ -95,6 +95,10 @@ impl LocalAPIC for X2Apic {
         }
     }
 
+    fn read_lvt(&self, reg: LVTRegister) -> LVT {
+        unsafe { LVT::new(reg, (rdmsr(reg.into()) & 0xffff_ffff) as u32).unwrap() }
+    }
+
     fn mask_all_lvt(&mut self) {
         // self.set_lvt(LVT::new(LVTRegister::CMCI, LVT::MASKED).unwrap());
         let cpuid = raw_cpuid::CpuId::new();
@@ -120,7 +124,7 @@ impl LocalAPIC for X2Apic {
         kdebug!("x2apic: error masked");
     }
 
-    fn write_icr(icr: x86::apic::Icr) {
+    fn write_icr(&self, icr: x86::apic::Icr) {
         unsafe { wrmsr(0x830, ((icr.upper() as u64) << 32) | icr.lower() as u64) };
     }
 }

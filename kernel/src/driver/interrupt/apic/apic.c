@@ -19,7 +19,7 @@ extern uint32_t rs_current_pcb_pid();
 extern uint32_t rs_current_pcb_flags();
 extern void rs_apic_init_bsp();
 
-extern void rs_apic_init_ap_core_local_apic(){};
+extern void rs_apic_local_apic_edge_ack();
 
 static bool flag_support_apic = false;
 static bool flag_support_x2apic = false;
@@ -32,6 +32,8 @@ static struct acpi_IO_APIC_Structure_t *io_apic_ICS;
 
 static void __local_apic_xapic_init();
 static void __local_apic_x2apic_init();
+
+
 
 static __always_inline void __send_eoi()
 {
@@ -175,18 +177,6 @@ int apic_init()
 
     rs_apic_init_bsp();
 
-    // get RCBA address
-    io_out32(0xcf8, 0x8000f8f0);
-    uint32_t RCBA_phys = io_in32(0xcfc);
-
-    // 获取RCBA寄存器的地址
-    if (RCBA_phys > 0xfec00000 && RCBA_phys < 0xfee00000)
-        RCBA_vaddr = SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + RCBA_phys;
-    else
-    {
-        RCBA_vaddr = 0;
-        kwarn("Cannot get RCBA address. RCBA_phys=%#010lx", RCBA_phys);
-    }
     kinfo("APIC initialized.");
     // sti();
     return 0;
@@ -376,8 +366,7 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
 
 void apic_local_apic_edge_ack(ul irq_num)
 {
-    // // 向EOI寄存器写入0x00表示结束中断
-    // __send_eoi();
+    rs_apic_local_apic_edge_ack();
 }
 
 /**

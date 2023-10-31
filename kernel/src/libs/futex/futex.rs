@@ -370,12 +370,7 @@ impl Futex {
         drop(bucket_mut);
         drop(binding);
 
-        match FutexData::try_remove(&key) {
-            Some(_) => {
-                kdebug!("remove success")
-            }
-            None => {}
-        }
+        FutexData::try_remove(&key);
 
         Ok(count)
     }

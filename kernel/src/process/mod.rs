@@ -317,7 +317,6 @@ impl ProcessManager {
 
         // 进行进程退出后的工作
         let thread = pcb.thread.write();
-        kdebug!("to clear");
         if let Some(addr) = thread.set_child_tid {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
@@ -331,13 +330,7 @@ impl ProcessManager {
             thread.vfork_done.as_ref().unwrap().complete_all();
         }
         drop(thread);
-        let uvm = pcb.basic().user_vm().unwrap();
-        let weak = Arc::downgrade(&uvm);
-        drop(uvm);
-        kdebug!("before drop vm: strong count={}", Weak::strong_count(&weak));
-
         unsafe { pcb.basic_mut().set_user_vm(None) };
-        kdebug!("after drop_vm: strong count={}", Weak::strong_count(&weak));
         drop(pcb);
         ProcessManager::exit_notify();
         drop(irq_guard);

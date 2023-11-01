@@ -66,10 +66,11 @@ all: kernel
 	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds --no-relax
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
-ifneq ($(UNWIND_ENABLE), yes)
+ifeq ($(UNWIND_ENABLE), yes)
+	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 kernel ../../bin/kernel/kernel.elf
+else
 	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
 endif
-# $(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
 	@echo "Kernel Build Done."
 
 ECHO:

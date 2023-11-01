@@ -72,9 +72,10 @@ extern crate x86;
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;
-#[cfg(feature = "unwind")]
+
+#[cfg(feature = "backtrace")]
 extern crate mini_backtrace;
-use mini_backtrace::Backtrace;
+
 extern "C" {
     fn lookup_kallsyms(addr: u64, level: i32) -> i32;
 }
@@ -113,11 +114,10 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    
-    #[cfg(feature = "unwind")]
+    #[cfg(feature = "backtrace")]
     {
         unsafe {
-            let bt = Backtrace::<16>::capture();
+            let bt = mini_backtrace::Backtrace::<16>::capture();
             println!("Rust Panic Backtrace:");
             let mut level = 0;
             for frame in bt.frames {
@@ -126,7 +126,8 @@ pub fn panic(info: &PanicInfo) -> ! {
             }
         };
     }
-    
+
     println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
     ProcessManager::exit(usize::MAX);
+    unreachable!();
 }

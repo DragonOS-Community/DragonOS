@@ -310,7 +310,7 @@ impl<T: Transport + 'static> NetDriver for VirtioInterface<T> {
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
         // todo: notify!!!
-        kdebug!("Virtio Interface poll:{poll_res}");
+        // kdebug!("Virtio Interface poll:{poll_res}");
         if poll_res {
             return Ok(());
         }

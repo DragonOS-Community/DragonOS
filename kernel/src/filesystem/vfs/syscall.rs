@@ -151,7 +151,6 @@ impl Syscall {
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
-
         // 文件名过长
         if path.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -727,6 +726,13 @@ impl Syscall {
         return Ok(kstat);
     }
 
+    fn do_stat(path: &str) -> Result<PosixKstat, SystemError> {
+        let fd = Self::open(path, FileMode::O_RDONLY)?;
+        let ret = Self::do_fstat(fd as i32);
+        Self::close(fd)?;
+        ret
+    }
+
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
         let kstat = Self::do_fstat(fd)?;
         if usr_kstat.is_null() {
@@ -736,6 +742,14 @@ impl Syscall {
             *usr_kstat = kstat;
         }
         return Ok(0);
+    }
+
+    pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(path, FileMode::O_RDONLY)?;
+        Self::fstat(fd as i32, user_kstat).map_err(|e| {
+            Self::close(fd).ok();
+            e
+        })
     }
 
     pub fn mknod(
@@ -770,6 +784,15 @@ impl Syscall {
         parent_inode.mknod(filename, mode, dev_t)?;
 
         return Ok(0);
+    }
+
+    pub fn writev(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
+        // IoVecs会进行用户态检验
+        let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, false) }?;
+
+        let data = iovecs.gather();
+
+        Self::write(fd, &data)
     }
 }
 #[repr(C)]

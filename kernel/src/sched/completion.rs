@@ -97,7 +97,7 @@ impl Completion {
     }
 
     /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
-    pub fn complete_all(&mut self) {
+    pub fn complete_all(&self) {
         let mut inner = self.inner.lock_irqsave();
         inner.done = COMPLETE_ALL;
         inner.wait_queue.wakeup_all(None);

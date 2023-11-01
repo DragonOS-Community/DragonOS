@@ -5,7 +5,11 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
 use memoffset::offset_of;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
@@ -20,14 +24,16 @@ use crate::{
         VirtAddr,
     },
     process::{
-        fork::CloneFlags, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
-        SwitchResult, SWITCH_RESULT,
+        fork::{CloneFlags, KernelCloneArgs},
+        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, SwitchResult,
+        SWITCH_RESULT,
     },
     syscall::{Syscall, SystemError},
 };
 
 use self::{
     kthread::kernel_thread_bootstrap_stage1,
+    syscall::ARCH_SET_FS,
     table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
 };
 
@@ -37,6 +43,9 @@ mod c_adapter;
 pub mod kthread;
 pub mod syscall;
 pub mod table;
+
+pub const IA32_FS_BASE: u32 = 0xC000_0100;
+pub const IA32_GS_BASE: u32 = 0xC000_0101;
 
 extern "C" {
     /// 从中断返回
@@ -175,7 +184,7 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.fsbase = x86::current::segmentation::rdfsbase() as usize;
         } else {
-            self.fsbase = 0;
+            self.fsbase = x86::msr::rdmsr(IA32_FS_BASE) as usize;
         }
     }
 
@@ -183,19 +192,23 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.gsbase = x86::current::segmentation::rdgsbase() as usize;
         } else {
-            self.gsbase = 0;
+            self.gsbase = x86::msr::rdmsr(IA32_GS_BASE) as usize;
         }
     }
 
     pub unsafe fn restore_fsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrfsbase(self.fsbase as u64);
+        } else {
+            x86::msr::wrmsr(IA32_FS_BASE, self.fsbase as u64);
         }
     }
 
     pub unsafe fn restore_gsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrgsbase(self.gsbase as u64);
+        } else {
+            x86::msr::wrmsr(IA32_GS_BASE, self.gsbase as u64);
         }
     }
 
@@ -228,11 +241,11 @@ impl ProcessControlBlock {
             panic!("current_pcb is null");
         }
         unsafe {
-            // 为了防止内核栈的pcb指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
-            let arc_wrapper: ManuallyDrop<Arc<ProcessControlBlock>> =
-                ManuallyDrop::new(Arc::from_raw(*p));
+            // 为了防止内核栈的pcb weak 指针被释放，这里需要将其包装一下
+            let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
+                ManuallyDrop::new(Weak::from_raw(*p));
 
-            let new_arc: Arc<ProcessControlBlock> = Arc::clone(&arc_wrapper);
+            let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade().unwrap();
             return new_arc;
         }
     }
@@ -255,11 +268,12 @@ impl ProcessManager {
     ///
     /// 由于这个过程与具体的架构相关，所以放在这里
     pub fn copy_thread(
-        _clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
+        clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
+        let clone_flags = clone_args.flags;
         let mut child_trapframe = current_trapframe.clone();
 
         // 子进程的返回值为0
@@ -278,6 +292,10 @@ impl ProcessManager {
 
         // 拷贝栈帧
         unsafe {
+            let usp = clone_args.stack;
+            if usp != 0 {
+                child_trapframe.rsp = usp as u64;
+            }
             let trap_frame_ptr = trap_frame_vaddr.data() as *mut TrapFrame;
             *trap_frame_ptr = child_trapframe;
         }
@@ -296,13 +314,17 @@ impl ProcessManager {
         drop(current_arch_guard);
 
         // 设置返回地址（子进程开始执行的指令地址）
-
         if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
             let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
-
             new_arch_guard.rip = kthread_bootstrap_stage1_func_addr;
         } else {
             new_arch_guard.rip = ret_from_intr as usize;
+        }
+
+        // 设置tls
+        if clone_flags.contains(CloneFlags::CLONE_SETTLS) {
+            drop(new_arch_guard);
+            Syscall::do_arch_prctl_64(new_pcb, ARCH_SET_FS, clone_args.tls, true)?;
         }
 
         return Ok(());
@@ -335,28 +357,28 @@ impl ProcessManager {
         compiler_fence(Ordering::SeqCst);
 
         next_addr_space.read().user_mapper.utable.make_current();
+        drop(next_addr_space);
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
-        let next_arch = SpinLockGuard::leak(next.arch_info());
-        let prev_arch = SpinLockGuard::leak(prev.arch_info());
+        let next_arch = SpinLockGuard::leak(next.arch_info()) as *mut ArchPCBInfo;
+        let prev_arch = SpinLockGuard::leak(prev.arch_info()) as *mut ArchPCBInfo;
 
-        prev_arch.rip = switch_back as usize;
+        (*prev_arch).rip = switch_back as usize;
 
         // 恢复当前的 preempt count*2
         ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev.clone());
-        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
 
         // 切换tss
         TSSManager::current_tss().set_rsp(
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
+        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
+        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // kdebug!("switch tss ok");
-
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
@@ -365,7 +387,7 @@ impl ProcessManager {
 
 /// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
 #[naked]
-unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut ArchPCBInfo) {
+unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
     asm!(
         // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
         //
@@ -393,6 +415,9 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         // switch segment registers (这些寄存器只能通过接下来的switch_hook的return来切换)
         mov [rdi + {off_fs}], fs
         mov [rdi + {off_gs}], gs
+
+        // mov fs, [rsi + {off_fs}]
+        // mov gs, [rsi + {off_gs}]
 
         push rbp
         push rax

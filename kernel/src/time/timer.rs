@@ -72,6 +72,7 @@ impl Timer {
             expire_jiffies,
             timer_func,
             self_ref: Weak::default(),
+            triggered: false,
         })));
 
         result.0.lock().self_ref = Arc::downgrade(&result);
@@ -112,13 +113,28 @@ impl Timer {
 
     #[inline]
     fn run(&self) {
-        let r = self.0.lock().timer_func.run();
+        let mut timer = self.0.lock();
+        timer.triggered = true;
+        let r = timer.timer_func.run();
         if unlikely(r.is_err()) {
             kerror!(
                 "Failed to run timer function: {self:?} {:?}",
                 r.err().unwrap()
             );
         }
+    }
+
+    /// ## 判断定时器是否已经触发
+    pub fn timeout(&self) -> bool {
+        self.0.lock().triggered
+    }
+
+    /// ## 取消定时器任务
+    pub fn cancel(&self) -> bool {
+        TIMER_LIST
+            .lock()
+            .drain_filter(|x| Arc::<Timer>::as_ptr(&x) == self as *const Timer);
+        true
     }
 }
 
@@ -131,6 +147,8 @@ pub struct InnerTimer {
     pub timer_func: Box<dyn TimerFunction>,
     /// self_ref
     self_ref: Weak<Timer>,
+    /// 判断该计时器是否触发
+    triggered: bool,
 }
 
 #[derive(Debug)]

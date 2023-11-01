@@ -13,7 +13,7 @@
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 // 导出定义在irq.c中的中段门表
-extern void (*interrupt_table[25])(void);
+extern void (*interrupt_table[26])(void);
 extern uint32_t rs_current_pcb_preempt_count();
 extern uint32_t rs_current_pcb_pid();
 extern uint32_t rs_current_pcb_flags();
@@ -362,7 +362,7 @@ int apic_init()
     cli();
     kinfo("Initializing APIC...");
     // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
-    for (int i = 32; i <= 56; ++i)
+    for (int i = 32; i <= 57; ++i)
         set_intr_gate(i, 0, interrupt_table[i - 32]);
 
     // 设置local apic中断门
@@ -416,7 +416,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     {
         // ==========外部中断控制器========
         irq_desc_t *irq = &interrupt_desc[number - 32];
-
+        
         // 执行中断上半部处理程序
         if (irq != NULL && irq->handler != NULL)
             irq->handler(number, irq->parameter, rsp);

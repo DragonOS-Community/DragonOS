@@ -282,9 +282,11 @@ impl KernelThreadMechanism {
             // 初始化kthreadd
             let closure = KernelThreadClosure::EmptyClosure((Box::new(Self::kthread_daemon), ()));
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
-            let kthreadd_pid: Pid =
-                Self::__inner_create(&info, CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL)
-                    .expect("Failed to create kthread daemon");
+            let kthreadd_pid: Pid = Self::__inner_create(
+                &info,
+                CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
+            )
+            .expect("Failed to create kthread daemon");
 
             let pcb = ProcessManager::find(kthreadd_pid).unwrap();
             ProcessManager::wakeup(&pcb).expect("Failed to wakeup kthread daemon");

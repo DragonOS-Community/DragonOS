@@ -706,7 +706,7 @@ impl UserMappings {
     /// 请注意，在调用本函数之前，必须先确定region所在范围内没有VMA。
     fn reserve_hole(&mut self, region: &VirtRegion) {
         let prev_hole: Option<(&VirtAddr, &mut usize)> =
-            self.vm_holes.range_mut(..region.start()).next_back();
+            self.vm_holes.range_mut(..=region.start()).next_back();
 
         if let Some((prev_hole_vaddr, prev_hole_size)) = prev_hole {
             let prev_hole_end = prev_hole_vaddr.add(*prev_hole_size);
@@ -946,6 +946,8 @@ pub struct VMA {
     /// VMA所属的用户地址空间
     user_address_space: Option<Weak<AddressSpace>>,
     self_ref: Weak<LockedVMA>,
+
+    provider: Provider,
 }
 
 impl core::hash::Hash for VMA {
@@ -954,6 +956,12 @@ impl core::hash::Hash for VMA {
         self.flags.hash(state);
         self.mapped.hash(state);
     }
+}
+
+/// 描述不同类型的内存提供者或资源
+#[derive(Debug)]
+pub enum Provider {
+    Allocated, // TODO:其他
 }
 
 #[allow(dead_code)]
@@ -974,6 +982,7 @@ impl VMA {
             mapped: self.mapped,
             user_address_space: self.user_address_space.clone(),
             self_ref: self.self_ref.clone(),
+            provider: Provider::Allocated,
         };
     }
 
@@ -1019,8 +1028,15 @@ impl VMA {
     ///
     /// - `prot_flags` 要检查的标志位
     pub fn can_have_flags(&self, prot_flags: ProtFlags) -> bool {
-        return (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
+        let is_downgrade = (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
             && (self.flags.has_execute() || !prot_flags.contains(ProtFlags::PROT_EXEC));
+
+        match self.provider {
+            Provider::Allocated { .. } => true,
+
+            #[allow(unreachable_patterns)]
+            _ => is_downgrade,
+        }
     }
 
     /// 把物理地址映射到虚拟地址
@@ -1070,6 +1086,7 @@ impl VMA {
             mapped: true,
             user_address_space: None,
             self_ref: Weak::default(),
+            provider: Provider::Allocated,
         });
         return Ok(r);
     }
@@ -1118,6 +1135,7 @@ impl VMA {
             mapped: true,
             user_address_space: None,
             self_ref: Weak::default(),
+            provider: Provider::Allocated,
         });
         drop(flusher);
         // kdebug!("VMA::zeroed: flusher dropped");

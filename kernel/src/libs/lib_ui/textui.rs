@@ -907,9 +907,7 @@ impl TextuiWindow {
         // 输出制表符
         else if character == '\t' {
             if is_enable_window == true {
-                if let TextuiVline::Chromatic(vline) =
-                    &(self.vlines.borrow()[<LineId as Into<usize>>::into(self.cursor.get_y())])
-                {
+                if let TextuiVline::Chromatic(vline) = self.get_vline(self.cursor.get_y()) {
                     //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
                     let mut space_to_print =
                         8 - <LineIndex as Into<usize>>::into(vline.end_index) % 8;
@@ -977,9 +975,7 @@ impl TextuiWindow {
             send_to_default_serial8250_port(&[character as u8]);
 
             if is_enable_window == true {
-                if let TextuiVline::Chromatic(vline) =
-                    &(self.vlines.borrow()[<LineId as Into<usize>>::into(self.cursor.get_y())])
-                {
+                if let TextuiVline::Chromatic(vline) = self.get_vline(self.cursor.get_y()) {
                     if !vline.end_index.check(self.winsize.col()) {
                         self.textui_new_line(self.cursor.get_y())?;
                         self.cursor.move_newline(1, self.winsize.row());
@@ -996,8 +992,9 @@ impl TextuiWindow {
     pub fn show_cursor_window(&mut self) {}
 
     /// 得到窗口某一虚拟行的不可变引用
-    pub fn get_vline<'a>(&'a self, vline_id: LineId) -> &'a TextuiVline {
-        &(self.vlines.borrow()[<LineId as Into<usize>>::into(vline_id)])
+    pub fn get_vline(&self, vline_id: LineId) -> &'a TextuiVline {
+        let vline=&(self.vlines.borrow()[<LineId as Into<usize>>::into(vline_id)]);
+        return vline;
     }
 
     /// 得到窗口某一虚拟行的可变引用
@@ -1011,9 +1008,7 @@ impl TextuiWindow {
         vline_id: LineId,
         start_index: LineIndex,
     ) -> Result<(), SystemError> {
-        if let TextuiVline::Chromatic(vline) =
-            &mut (self.vlines.borrow_mut()[<LineId as Into<usize>>::into(vline_id)])
-        {
+        if let TextuiVline::Chromatic(vline) = self.get_mut_vline(vline_id) {
             let chars: Vec<TextuiCharChromatic> = vline.get_chars(start_index + 1, vline.end_index);
 
             if !vline.end_index.check(self.winsize.col() - 1) {
@@ -1028,7 +1023,7 @@ impl TextuiWindow {
                 } else {
                     let mut move_chars = chars.clone();
                     let mut is_empty = true;
-                    if let TextuiVline::Chromatic(next_vline) = self.get_mut_vline(vline_id + 1) {
+                    if let TextuiVline::Chromatic(next_vline) = self.get_mut_vline(vline_id+1) {
                         if !next_vline.is_empty {
                             is_empty = false;
                             let char = next_vline.get_char(LineIndex::new(0));

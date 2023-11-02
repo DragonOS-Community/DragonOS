@@ -120,7 +120,7 @@ impl ArchPCBInfo {
         };
 
         r.rsp = kstack.stack_max_address().data() - 8;
-            r.rbp = kstack.stack_max_address().data();
+        r.rbp = kstack.stack_max_address().data();
 
         return r;
     }

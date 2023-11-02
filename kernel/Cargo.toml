@@ -12,6 +12,11 @@ crate-type = ["staticlib"]
 [workspace]
 members = [ "src/libs/intertrait" ]
 
+[features]
+default = ["backtrace"]
+# 内核栈回溯
+backtrace = []
+
 # 运行时依赖项
 [dependencies]
 x86 = "0.52.0"
@@ -37,6 +42,7 @@ acpi = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/acpi-rs.git"
 intertrait = { path = "src/libs/intertrait" }
 linkme = "0.2"
 ida = { path = "src/libs/ida" }
+mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
 
 # 构建时依赖项
 [build-dependencies]
@@ -56,4 +62,3 @@ debug = true   # Controls whether the compiler passes `-g`
 # The release profile, used for `cargo build --release`
 [profile.release]
 debug = false
-

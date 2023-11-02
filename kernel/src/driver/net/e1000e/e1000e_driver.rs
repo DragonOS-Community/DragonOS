@@ -3,16 +3,12 @@
 use crate::{
     driver::{
         base::{
-            device::{
-                bus::Bus,
-                driver::{Driver, DriverError},
-                Device, DevicePrivateData, IdTable,
-            },
+            device::{bus::Bus, driver::Driver, Device, IdTable},
             kobject::{KObjType, KObject, KObjectState},
         },
         net::NetDriver,
     },
-    kdebug, kinfo,
+    kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
     syscall::SystemError,
@@ -84,7 +80,7 @@ impl phy::RxToken for E1000ERxToken {
 }
 
 impl phy::TxToken for E1000ETxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(self, _len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {

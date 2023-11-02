@@ -21,4 +21,6 @@ pub mod spinlock;
 pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;
+pub mod futex;
+pub mod rand;
 pub mod wait_queue;

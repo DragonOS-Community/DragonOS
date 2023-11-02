@@ -38,6 +38,7 @@ extern void rs_kthread_init();
 extern void rs_init_intertrait();
 extern void rs_init_before_mem_init();
 extern int rs_setup_arch();
+extern void rs_futex_init();
 extern int rs_hpet_init();
 extern int rs_hpet_enable();
 extern int rs_tsc_init();
@@ -153,6 +154,7 @@ void system_initialize()
     smp_init();
 
     io_mfence();
+    rs_futex_init();
     cli();
     rs_hpet_init();
     rs_hpet_enable();

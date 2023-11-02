@@ -36,16 +36,25 @@ pub extern "C" fn rs_current_pcb_pid() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_preempt_count() -> u32 {
+    if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {
+        return 0;
+    }
     return ProcessManager::current_pcb().preempt_count() as u32;
 }
 
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_flags() -> u32 {
+    if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {
+        return 0;
+    }
     return ProcessManager::current_pcb().flags().bits() as u32;
 }
 
 #[no_mangle]
 pub extern "C" fn rs_current_pcb_thread_rbp() -> u64 {
+    if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {
+        return 0;
+    }
     return ProcessManager::current_pcb().arch_info_irqsave().rbp() as u64;
 }
 
@@ -61,5 +70,8 @@ pub extern "C" fn rs_preempt_enable() {
 
 #[no_mangle]
 pub extern "C" fn rs_process_do_exit(exit_code: usize) -> usize {
+    if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {
+        return 0;
+    }
     ProcessManager::exit(exit_code);
 }

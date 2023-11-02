@@ -16,7 +16,7 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
 use crate::include::bindings::bindings::pt_regs;
-use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
+use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
 use crate::net::net_core::poll_ifaces_try_lock_onetime;
 use crate::{kdebug, kinfo};
 
@@ -45,8 +45,10 @@ const E1000E_DEVICE_ID: [u16; 14] = [
 // BAR0空间大小(128KB)
 const E1000E_BAR_REG_SIZE: u32 = 128 * 1024;
 // BAR0空间对齐(64bit)
+#[allow(dead_code)]
 const E1000E_BAR_REG_ALIGN: u8 = 64;
 // 单个寄存器大小(32bit, 4字节)
+#[allow(dead_code)]
 const E1000E_REG_SIZE: u8 = 4;
 
 // TxBuffer和RxBuffer的大小(DMA页)
@@ -112,11 +114,13 @@ impl E1000EBuffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_addr(&self) -> NonNull<u8> {
         assert!(self.length != 0);
         return self.buffer;
     }
 
+    #[allow(dead_code)]
     pub fn as_addr_u64(&self) -> u64 {
         assert!(self.length != 0);
         return self.buffer.as_ptr() as u64;
@@ -127,6 +131,7 @@ impl E1000EBuffer {
         return self.paddr;
     }
 
+    #[allow(dead_code)]
     pub fn as_slice(&self) -> &[u8] {
         assert!(self.length != 0);
         return unsafe { from_raw_parts(self.buffer.as_ptr(), self.length) };
@@ -154,10 +159,11 @@ impl E1000EBuffer {
 
 // 中断处理函数, 调用协议栈的poll函数，未来可能会用napi来替换这里
 // Interrupt handler
-unsafe extern "C" fn e1000e_irq_handler(irq_num: u64, irq_paramer: u64, regs: *mut pt_regs) {
+unsafe extern "C" fn e1000e_irq_handler(_irq_num: u64, _irq_paramer: u64, _regs: *mut pt_regs) {
     poll_ifaces_try_lock_onetime().ok();
 }
 
+#[allow(dead_code)]
 pub struct E1000EDevice {
     // 设备寄存器
     // device registers
@@ -194,6 +200,7 @@ pub struct E1000EDevice {
 impl E1000EDevice {
     // 从PCI标准设备进行驱动初始化
     // init the device for PCI standard device struct
+    #[allow(unused_assignments)]
     pub fn new(device: &mut PciDeviceStructureGeneralDevice) -> Result<Self, E1000EPciError> {
         // 从BAR0获取我们需要的寄存器
         // Build registers sturcts from BAR0
@@ -479,6 +486,7 @@ impl E1000EDevice {
     // 切换是否接受分组到达的中断
     // change whether the receive timer interrupt is enabled
     // Note: this method is not completely implemented and not used in the current version
+    #[allow(dead_code)]
     pub fn e1000e_intr_set(&mut self, state: bool) {
         let mut ims = unsafe { volread!(self.interrupt_regs, ims) };
         match state {
@@ -491,6 +499,7 @@ impl E1000EDevice {
     // 实现了一部分napi机制的收包函数, 现在还没有投入使用
     // This method is a partial implementation of napi (New API) techniques
     // Note: this method is not completely implemented and not used in the current version
+    #[allow(dead_code)]
     pub fn e1000e_receive2(&mut self) -> Option<E1000EBuffer> {
         // 向设备表明我们已经接受到了之前的中断
         // Tell e1000e we have received the interrupt
@@ -585,8 +594,8 @@ pub extern "C" fn rs_e1000e_init() {
 
 pub fn e1000e_init() -> () {
     match e1000e_probe() {
-        Ok(code) => kinfo!("Successfully init e1000e device!"),
-        Err(error) => kinfo!("Error occurred!"),
+        Ok(_code) => kinfo!("Successfully init e1000e device!"),
+        Err(_error) => kinfo!("Error occurred!"),
     }
 }
 
@@ -618,6 +627,7 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
 // 用到的e1000e寄存器结构体
 // pp.275, Table 13-3
 // 设备通用寄存器
+#[allow(dead_code)]
 struct GeneralRegs {
     ctrl: Volatile<u32>,         //0x00000
     ctrl_alias: Volatile<u32>,   //0x00004
@@ -630,6 +640,7 @@ struct GeneralRegs {
     mdic: Volatile<u32>,         //0x00020
 }
 // 中断控制
+#[allow(dead_code)]
 struct InterruptRegs {
     icr: Volatile<u32>, //0x000c0 ICR寄存器应当为只读寄存器，但我们需要向其中写入来清除对应位
     itr: Volatile<u32>, //0x000c4
@@ -644,6 +655,7 @@ struct ReceiveCtrlRegs {
     rctl: Volatile<u32>, //0x00100
 }
 // 发包功能控制
+#[allow(dead_code)]
 struct TransmitCtrlRegs {
     tctl: Volatile<u32>,     //0x00400
     tctl_ext: Volatile<u32>, //0x00404
@@ -652,6 +664,7 @@ struct TransmitCtrlRegs {
     tipg: Volatile<u32>,     //0x00410
 }
 // 收包功能相关
+#[allow(dead_code)]
 struct ReceiveRegs {
     rdbal0: Volatile<u32>,     //0x02800
     rdbah0: Volatile<u32>,     //0x02804
@@ -666,6 +679,7 @@ struct ReceiveRegs {
     rxdctl: Volatile<u32>,     //0x2828
 }
 // 发包功能相关
+#[allow(dead_code)]
 struct TransimitRegs {
     tdbal0: Volatile<u32>,      //0x03800
     tdbah0: Volatile<u32>,      //0x03804
@@ -689,6 +703,7 @@ struct ReceiveAddressRegs {
 struct PCIeRegs {
     gcr: Volatile<u32>, //0x05b00
 }
+#[allow(dead_code)]
 struct StatisticsRegs {}
 
 // 0x05200-0x053fc
@@ -714,15 +729,19 @@ const E1000E_CTRL_SLU: u32 = 1 << 6;
 const E1000E_CTRL_FRCSPD: u32 = 1 << 11;
 const E1000E_CTRL_FRCDPLX: u32 = 1 << 12;
 const E1000E_CTRL_RST: u32 = 1 << 26;
+#[allow(dead_code)]
 const E1000E_CTRL_RFCE: u32 = 1 << 27;
+#[allow(dead_code)]
 const E1000E_CTRL_TFCE: u32 = 1 << 28;
 const E1000E_CTRL_PHY_RST: u32 = 1 << 31;
 
 // IMS
 const E1000E_IMS_LSC: u32 = 1 << 2;
 const E1000E_IMS_RXDMT0: u32 = 1 << 4;
+#[allow(dead_code)]
 const E1000E_IMS_RXO: u32 = 1 << 6;
 const E1000E_IMS_RXT0: u32 = 1 << 7;
+#[allow(dead_code)]
 const E1000E_IMS_RXQ0: u32 = 1 << 20;
 const E1000E_IMS_OTHER: u32 = 1 << 24; // qemu use this bit to set msi-x interrupt
 

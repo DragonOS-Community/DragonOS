@@ -71,10 +71,22 @@ SECTIONS
 		_ebss = .;
 	}
 
+	eh_frame = .;
+	.eh_frame (eh_frame): AT(eh_frame - KERNEL_VMA)
+	{
+		__eh_frame_hdr_start = .;
+		*(.eh_frame_hdr)
+		__eh_frame_hdr_end = .;
+		__eh_frame_start = .;
+		*(.eh_frame)
+		*(.rela.eh_frame)
+		__eh_frame_end = .;
+	}
+
 	_end = .;
 
 	/DISCARD/ : {
-		*(.eh_frame)
+		/* *(.eh_frame) */
 		
 	}
 }

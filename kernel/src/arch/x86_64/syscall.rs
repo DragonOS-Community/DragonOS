@@ -1,15 +1,32 @@
 use core::ffi::c_void;
 
-use alloc::string::String;
-
 use crate::{
-    arch::ipc::signal::X86_64SignalArch,
+    arch::{ipc::signal::X86_64SignalArch, CurrentIrqArch},
+    exception::InterruptArch,
     include::bindings::bindings::set_system_trap_gate,
     ipc::signal_types::SignalArch,
+    libs::align::SafeForZero,
+    mm::VirtAddr,
     syscall::{Syscall, SystemError, SYS_RT_SIGRETURN},
 };
+use alloc::string::String;
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub(super) struct X86_64GSData {
+    pub(super) kaddr: VirtAddr,
+    pub(super) uaddr: VirtAddr,
+}
+
+impl X86_64GSData {
+    pub fn set_kstack(&mut self, kstack: VirtAddr) {
+        self.kaddr = kstack;
+    }
+}
+
+unsafe impl SafeForZero for X86_64GSData {}
 
 extern "C" {
     fn syscall_int();
@@ -19,12 +36,18 @@ macro_rules! syscall_return {
     ($val:expr, $regs:expr) => {{
         let ret = $val;
         $regs.rax = ret as u64;
+        unsafe {
+            CurrentIrqArch::interrupt_disable();
+        }
         return;
     }};
 }
 
 #[no_mangle]
-pub extern "C" fn syscall_handler(frame: &mut TrapFrame) -> () {
+pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
+    unsafe {
+        CurrentIrqArch::interrupt_enable();
+    }
     let syscall_num = frame.rax as usize;
     let args = [
         frame.rdi as usize,

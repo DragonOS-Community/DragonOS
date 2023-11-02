@@ -491,6 +491,9 @@ pub struct ProcessControlBlock {
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
 
+    /// 系统调用栈
+    syscall_stack: RwLock<KernelStack>,
+
     /// 与调度相关的信息
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
@@ -552,7 +555,7 @@ impl ProcessControlBlock {
         let flags = SpinLock::new(ProcessFlags::empty());
 
         let sched_info = ProcessSchedulerInfo::new(None);
-        let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
+        let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
@@ -564,6 +567,7 @@ impl ProcessControlBlock {
             preempt_count,
             flags,
             kernel_stack: RwLock::new(kstack),
+            syscall_stack: RwLock::new(KernelStack::new().unwrap()),
             worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
@@ -575,11 +579,20 @@ impl ProcessControlBlock {
             thread: RwLock::new(ThreadInfo::new()),
         };
 
+        pcb.arch_info
+            .lock()
+            .init_syscall_stack(pcb.syscall_stack.read().stack_max_address() - 8);
+
         let pcb = Arc::new(pcb);
 
         // 设置进程的arc指针到内核栈的最低地址处
         unsafe {
             pcb.kernel_stack
+                .write()
+                .set_pcb(Arc::downgrade(&pcb))
+                .unwrap();
+
+            pcb.syscall_stack
                 .write()
                 .set_pcb(Arc::downgrade(&pcb))
                 .unwrap()
@@ -756,6 +769,16 @@ impl ProcessControlBlock {
 
     pub fn sig_info(&self) -> RwLockReadGuard<ProcessSignalInfo> {
         self.sig_info.read()
+    }
+
+    pub fn try_siginfo(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sig_info.try_read() {
+                return Some(r);
+            }
+        }
+
+        return None;
     }
 
     pub fn sig_info_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
@@ -1010,7 +1033,7 @@ impl ProcessSchedulerInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KernelStack {
     stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
     /// 标记该内核栈是否可以被释放

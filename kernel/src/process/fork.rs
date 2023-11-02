@@ -340,7 +340,9 @@ impl ProcessManager {
         // TODO: 克隆前应该锁信号处理，等待克隆完成后再处理
 
         // 克隆架构相关
-        *pcb.arch_info() = current_pcb.arch_info_irqsave().clone();
+        let guard = current_pcb.arch_info_irqsave();
+        pcb.arch_info().clone_from(&guard);
+        drop(guard);
 
         // 为内核线程设置WorkerPrivate
         if current_pcb.flags().contains(ProcessFlags::KTHREAD) {

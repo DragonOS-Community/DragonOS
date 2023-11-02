@@ -16,6 +16,7 @@ use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
     arch::process::table::TSSManager,
+    driver::tty::serial::serial8250::send_to_default_serial8250_port,
     exception::InterruptArch,
     kwarn,
     libs::spinlock::SpinLockGuard,
@@ -37,15 +38,12 @@ use self::{
     table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
 };
 
-use super::{fpu::FpState, interrupt::TrapFrame, CurrentIrqArch};
+use super::{fpu::FpState, interrupt::TrapFrame, syscall::X86_64GSData, CurrentIrqArch};
 
 mod c_adapter;
 pub mod kthread;
 pub mod syscall;
 pub mod table;
-
-pub const IA32_FS_BASE: u32 = 0xC000_0100;
-pub const IA32_GS_BASE: u32 = 0xC000_0101;
 
 extern "C" {
     /// 从中断返回
@@ -66,7 +64,7 @@ static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
 };
 
 /// PCB中与架构相关的信息
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct ArchPCBInfo {
     rflags: usize,
@@ -83,7 +81,7 @@ pub struct ArchPCBInfo {
     gsbase: usize,
     fs: SegmentSelector,
     gs: SegmentSelector,
-
+    gsdata: X86_64GSData,
     /// 浮点寄存器的状态
     fp_state: Option<FpState>,
 }
@@ -99,7 +97,7 @@ impl ArchPCBInfo {
     /// ## 返回值
     ///
     /// 返回一个新的ArchPCBInfo
-    pub fn new(kstack: Option<&KernelStack>) -> Self {
+    pub fn new(kstack: &KernelStack) -> Self {
         let mut r = Self {
             rflags: 0,
             rbx: 0,
@@ -113,16 +111,17 @@ impl ArchPCBInfo {
             cr2: 0,
             fsbase: 0,
             gsbase: 0,
+            gsdata: X86_64GSData {
+                kaddr: VirtAddr::new(0),
+                uaddr: VirtAddr::new(0),
+            },
             fs: KERNEL_DS,
             gs: KERNEL_DS,
             fp_state: None,
         };
 
-        if kstack.is_some() {
-            let kstack = kstack.unwrap();
-            r.rsp = kstack.stack_max_address().data();
+        r.rsp = kstack.stack_max_address().data() - 8;
             r.rbp = kstack.stack_max_address().data();
-        }
 
         return r;
     }
@@ -184,7 +183,7 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.fsbase = x86::current::segmentation::rdfsbase() as usize;
         } else {
-            self.fsbase = x86::msr::rdmsr(IA32_FS_BASE) as usize;
+            self.fsbase = x86::msr::rdmsr(x86::msr::IA32_FS_BASE) as usize;
         }
     }
 
@@ -192,7 +191,7 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.gsbase = x86::current::segmentation::rdgsbase() as usize;
         } else {
-            self.gsbase = x86::msr::rdmsr(IA32_GS_BASE) as usize;
+            self.gsbase = x86::msr::rdmsr(x86::msr::IA32_GS_BASE) as usize;
         }
     }
 
@@ -200,7 +199,7 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrfsbase(self.fsbase as u64);
         } else {
-            x86::msr::wrmsr(IA32_FS_BASE, self.fsbase as u64);
+            x86::msr::wrmsr(x86::msr::IA32_FS_BASE, self.fsbase as u64);
         }
     }
 
@@ -208,8 +207,26 @@ impl ArchPCBInfo {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrgsbase(self.gsbase as u64);
         } else {
-            x86::msr::wrmsr(IA32_GS_BASE, self.gsbase as u64);
+            x86::msr::wrmsr(x86::msr::IA32_GS_BASE, self.gsbase as u64);
         }
+    }
+
+    pub unsafe fn store_kernel_gsbase(&self) {
+        send_to_default_serial8250_port(
+            format!(
+                "kernel gsbase: {:#x}\n",
+                &self.gsdata as *const X86_64GSData as u64
+            )
+            .as_bytes(),
+        );
+        x86::msr::wrmsr(
+            x86::msr::IA32_KERNEL_GSBASE,
+            &self.gsdata as *const X86_64GSData as u64,
+        );
+    }
+
+    pub fn init_syscall_stack(&mut self, stack: VirtAddr) {
+        self.gsdata.set_kstack(stack);
     }
 
     pub fn fsbase(&self) -> usize {
@@ -226,6 +243,34 @@ impl ArchPCBInfo {
 
     pub fn fp_state_mut(&mut self) -> &mut Option<FpState> {
         &mut self.fp_state
+    }
+
+    /// ### 克隆ArchPCBInfo,需要注意gsdata和系统调用栈也是对应clone的
+    pub fn clone_all(&self) -> Self {
+        Self {
+            rflags: self.rflags,
+            rbx: self.rbx,
+            r12: self.r12,
+            r13: self.r13,
+            r14: self.r14,
+            r15: self.r15,
+            rbp: self.rbp,
+            rsp: self.rsp,
+            rip: self.rip,
+            cr2: self.cr2,
+            fsbase: self.fsbase,
+            gsbase: self.gsbase,
+            fs: self.fs.clone(),
+            gs: self.gs.clone(),
+            gsdata: self.gsdata.clone(),
+            fp_state: self.fp_state,
+        }
+    }
+
+    pub fn clone_from(&mut self, from: &Self) {
+        let gsdata = self.gsdata.clone();
+        *self = from.clone_all();
+        self.gsdata = gsdata;
     }
 }
 
@@ -349,8 +394,7 @@ impl ProcessManager {
         next.arch_info().restore_fsbase();
 
         // 切换gsbase
-        prev.arch_info().save_gsbase();
-        next.arch_info().restore_gsbase();
+        Self::switch_gsbase(&prev, &next);
 
         // 切换地址空间
         let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
@@ -382,6 +426,15 @@ impl ProcessManager {
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
+    }
+
+    unsafe fn switch_gsbase(prev: &Arc<ProcessControlBlock>, next: &Arc<ProcessControlBlock>) {
+        asm!("swapgs", options(nostack, preserves_flags));
+        prev.arch_info().save_gsbase();
+        next.arch_info().restore_gsbase();
+        // 将下一个进程的kstack写入kernel_gsbase
+        next.arch_info().store_kernel_gsbase();
+        asm!("swapgs", options(nostack, preserves_flags));
     }
 }
 

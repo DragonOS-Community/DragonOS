@@ -374,13 +374,13 @@ pub struct X86_64SignalArch;
 
 impl SignalArch for X86_64SignalArch {
     unsafe fn do_signal(frame: &mut TrapFrame) {
+        let pcb = ProcessManager::current_pcb();
+        let siginfo = pcb.try_siginfo(5);
+
         // 检查sigpending是否为0
-        if ProcessManager::current_pcb()
-            .sig_info()
-            .sig_pending()
-            .signal()
-            .bits()
-            == 0
+        if siginfo
+            .map(|s| s.sig_pending().signal().bits() == 0)
+            .unwrap_or(true)
             || !frame.from_user()
         {
             // 若没有正在等待处理的信号，或者将要返回到的是内核态，则启用中断，然后返回

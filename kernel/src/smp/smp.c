@@ -10,7 +10,14 @@
 #include <process/preempt.h>
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
+#include "exception/trap.h"
 #include "ipi.h"
+
+/* x86-64 specific MSRs */
+#define MSR_EFER		0xc0000080 /* extended feature register */
+#define MSR_STAR		0xc0000081 /* legacy mode SYSCALL target */
+#define MSR_LSTAR		0xc0000082 /* long mode SYSCALL target */
+#define MSR_SYSCALL_MASK	0xc0000084 /* EFLAGS mask for syscall */
 
 static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
 static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
@@ -148,6 +155,8 @@ void smp_ap_start_stage2()
 
     apic_timer_ap_core_init();
 
+    smp_syscall_init();
+
     sti();
     sched();
 
@@ -184,6 +193,23 @@ static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struc
     if (user_mode(regs))
         return;
     flush_tlb();
+}
+
+void smp_syscall_init()
+{
+    uint64_t efer = rdmsr(MSR_EFER);
+    efer |= 0x1;
+    wrmsr(MSR_EFER, efer);
+
+    uint16_t syscall_base = 1 << 3;
+    uint16_t sysret_base = (4 << 3) | 3;
+    uint32_t high = ((uint32_t)sysret_base << 16) | (uint32_t)syscall_base;
+    // 初始化STAR寄存器
+    wrmsr(MSR_STAR, ((uint64_t)high) << 32);
+    
+    // 初始化LSTAR,该寄存器存储syscall指令入口rip
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_64);
+    wrmsr(MSR_SYSCALL_MASK, 0xfffffffe);
 }
 
 /**

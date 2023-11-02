@@ -16,7 +16,6 @@ use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
     arch::process::table::TSSManager,
-    driver::tty::serial::serial8250::send_to_default_serial8250_port,
     exception::InterruptArch,
     kwarn,
     libs::spinlock::SpinLockGuard,
@@ -212,13 +211,6 @@ impl ArchPCBInfo {
     }
 
     pub unsafe fn store_kernel_gsbase(&self) {
-        send_to_default_serial8250_port(
-            format!(
-                "kernel gsbase: {:#x}\n",
-                &self.gsdata as *const X86_64GSData as u64
-            )
-            .as_bytes(),
-        );
         x86::msr::wrmsr(
             x86::msr::IA32_KERNEL_GSBASE,
             &self.gsdata as *const X86_64GSData as u64,

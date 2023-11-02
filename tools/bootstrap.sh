@@ -64,6 +64,21 @@ install_ubuntu_debian_pkg()
 
 }
 
+install_archlinux_pkg()
+{
+    pkgman="pacman"
+    echo "检测到 ArchLinux"
+    echo "正在更新包管理器的列表..."
+    sudo "${pkgman}" -Sy
+    echo "正在安装所需的包..."
+    sudo "${pkgman}" -S --needed --noconfirm \
+	curl wget bridge-utils dnsmasq \
+        diffutils pkgconf which unzip util-linux dosfstools \
+        gcc make flex texinfo gmp mpfr qemu-base \
+        libmpc libssl-dev
+
+}
+
 install_osx_pkg()
 {
     echo "Detected OSX! 暂不支持Mac OSX的一键安装！"
@@ -194,7 +209,7 @@ else
 		solus "$emulator" || exit 1
 	# Arch linux
 	elif hash 2>/dev/null pacman; then
-		archLinux "$emulator" || exit 1
+		install_archlinux_pkg || exit 1
 	# FreeBSD
 	elif hash 2>/dev/null pkg; then
 		freebsd "$emulator" || exit 1

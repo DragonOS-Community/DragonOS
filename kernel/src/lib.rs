@@ -74,6 +74,13 @@ use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;
 
+#[cfg(feature = "backtrace")]
+extern crate mini_backtrace;
+
+extern "C" {
+    fn lookup_kallsyms(addr: u64, level: i32) -> i32;
+}
+
 // 声明全局的分配器
 #[cfg_attr(not(test), global_allocator)]
 pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -108,6 +115,20 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
 
+    #[cfg(feature = "backtrace")]
+    {
+        unsafe {
+            let bt = mini_backtrace::Backtrace::<16>::capture();
+            println!("Rust Panic Backtrace:");
+            let mut level = 0;
+            for frame in bt.frames {
+                lookup_kallsyms(frame as u64, level);
+                level += 1;
+            }
+        };
+    }
+
     println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
     ProcessManager::exit(usize::MAX);
+    unreachable!();
 }

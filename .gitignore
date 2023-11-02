@@ -17,6 +17,5 @@ draft
 cppcheck.xml
 /target/
 Cargo.lock
-
 .cache
 compile_commands.json

@@ -223,7 +223,6 @@ impl ProcessManager {
             unsafe { new_pcb.basic_mut().set_user_vm(Some(old_address_space)) };
             return Ok(());
         }
-
         let new_address_space = old_address_space.write().try_clone().unwrap_or_else(|e| {
             panic!(
                 "copy_mm: Failed to clone address space of current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",

@@ -26,7 +26,6 @@
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
-#include <driver/timers/HPET/HPET.h>
 #include <time/timer.h>
 
 #include <driver/interrupt/apic/apic_timer.h>
@@ -40,6 +39,9 @@ extern void rs_init_intertrait();
 extern void rs_init_before_mem_init();
 extern int rs_setup_arch();
 extern void rs_futex_init();
+extern int rs_hpet_init();
+extern int rs_hpet_enable();
+extern int rs_tsc_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -151,20 +153,15 @@ void system_initialize()
     smp_init();
 
     io_mfence();
-
-    HPET_init();
-    io_mfence();
-    HPET_measure_freq();
-
-    io_mfence();
-    cli();
-    HPET_enable();
-
-    io_mfence();
-    
-    kvm_init();
-
     rs_futex_init();
+    cli();
+    rs_hpet_init();
+    rs_hpet_enable();
+    rs_tsc_init();
+
+    io_mfence();
+
+    kvm_init();
 
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行

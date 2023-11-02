@@ -401,28 +401,28 @@ impl ProcessManager {
         compiler_fence(Ordering::SeqCst);
 
         next_addr_space.read().user_mapper.utable.make_current();
+        drop(next_addr_space);
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
-        let next_arch = SpinLockGuard::leak(next.arch_info());
-        let prev_arch = SpinLockGuard::leak(prev.arch_info());
+        let next_arch = SpinLockGuard::leak(next.arch_info()) as *mut ArchPCBInfo;
+        let prev_arch = SpinLockGuard::leak(prev.arch_info()) as *mut ArchPCBInfo;
 
-        prev_arch.rip = switch_back as usize;
+        (*prev_arch).rip = switch_back as usize;
 
         // 恢复当前的 preempt count*2
         ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev.clone());
-        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
 
         // 切换tss
         TSSManager::current_tss().set_rsp(
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
+        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
+        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // kdebug!("switch tss ok");
-
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
@@ -440,7 +440,7 @@ impl ProcessManager {
 
 /// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
 #[naked]
-unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut ArchPCBInfo) {
+unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
     asm!(
         // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
         //
@@ -468,6 +468,9 @@ unsafe extern "sysv64" fn switch_to_inner(prev: &mut ArchPCBInfo, next: &mut Arc
         // switch segment registers (这些寄存器只能通过接下来的switch_hook的return来切换)
         mov [rdi + {off_fs}], fs
         mov [rdi + {off_gs}], gs
+
+        // mov fs, [rsi + {off_fs}]
+        // mov gs, [rsi + {off_gs}]
 
         push rbp
         push rax

@@ -746,7 +746,10 @@ impl Syscall {
 
     pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
         let fd = Self::open(path, FileMode::O_RDONLY)?;
-        Self::fstat(fd as i32, user_kstat)
+        Self::fstat(fd as i32, user_kstat).map_err(|e| {
+            Self::close(fd).ok();
+            e
+        })
     }
 
     pub fn mknod(

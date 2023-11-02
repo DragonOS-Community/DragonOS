@@ -53,6 +53,11 @@ impl Syscall {
         //     argv,
         //     envp
         // );
+        // kdebug!(
+        //     "before execve: strong count: {}",
+        //     Arc::strong_count(&ProcessManager::current_pcb())
+        // );
+
         if path.is_null() {
             return Err(SystemError::EINVAL);
         }
@@ -77,6 +82,10 @@ impl Syscall {
         // 关闭设置了O_CLOEXEC的文件描述符
         let fd_table = ProcessManager::current_pcb().fd_table();
         fd_table.write().close_on_exec();
+        // kdebug!(
+        //     "after execve: strong count: {}",
+        //     Arc::strong_count(&ProcessManager::current_pcb())
+        // );
 
         return Ok(());
     }
@@ -110,8 +119,9 @@ impl Syscall {
             drop(rd_childen);
 
             loop {
+                let state = child_pcb.sched_info().state();
                 // 获取退出码
-                match child_pcb.sched_info().state() {
+                match state {
                     ProcessState::Runnable => {
                         if options.contains(WaitOption::WNOHANG)
                             || options.contains(WaitOption::WNOWAIT)
@@ -134,12 +144,15 @@ impl Syscall {
                         }
                     }
                     ProcessState::Exited(status) => {
+                        // kdebug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
                         if !wstatus.is_null() {
                             wstatus_buf.copy_one_to_user(
-                                &(status | WaitOption::WEXITED.bits() as usize),
+                                &(status as u32 | WaitOption::WEXITED.bits()),
                                 0,
                             )?;
                         }
+                        drop(child_pcb);
+                        // kdebug!("wait4: to release {pid:?}");
                         unsafe { ProcessManager::release(pid) };
                         return Ok(pid.into());
                     }

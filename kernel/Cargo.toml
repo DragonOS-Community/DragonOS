@@ -40,7 +40,7 @@ ida = { path = "src/libs/ida" }
 # 构建时依赖项
 [build-dependencies]
 bindgen = "0.61.0"
-
+cc = { version = "1.0.83", features = ["parallel"] }
 
 [dependencies.lazy_static]
 version = "1.4.0"

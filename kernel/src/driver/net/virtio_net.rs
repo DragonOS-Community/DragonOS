@@ -16,7 +16,7 @@ use crate::{
         },
         virtio::virtio_impl::HalImpl,
     },
-    kerror, kinfo,
+    kdebug, kerror, kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
     syscall::SystemError,

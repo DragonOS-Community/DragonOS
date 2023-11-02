@@ -3,7 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::hash::{Hash, Hasher};
-use core::{cell::RefCell, intrinsics::likely, sync::atomic::AtomicU64};
+use core::{intrinsics::likely, sync::atomic::AtomicU64};
 use hashbrown::HashMap;
 
 use crate::{
@@ -24,12 +24,24 @@ use super::constant::*;
 static mut FUTEX_DATA: Option<FutexData> = None;
 
 pub struct FutexData {
-    data: SpinLock<HashMap<FutexKey, RefCell<FutexHashBucket>>>,
+    data: SpinLock<HashMap<FutexKey, FutexHashBucket>>,
 }
 
 impl FutexData {
-    pub fn get_futex_map() -> SpinLockGuard<'static, HashMap<FutexKey, RefCell<FutexHashBucket>>> {
+    pub fn futex_map() -> SpinLockGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
         unsafe { FUTEX_DATA.as_ref().unwrap().data.lock() }
+    }
+
+    pub fn try_remove(key: &FutexKey) -> Option<FutexHashBucket> {
+        unsafe {
+            let mut guard = FUTEX_DATA.as_ref().unwrap().data.lock();
+            if let Some(futex) = guard.get(key) {
+                if futex.chain.is_empty() {
+                    return guard.remove(key);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -52,16 +64,14 @@ impl FutexHashBucket {
     }
 
     /// 让futex_q在该bucket上挂起
+    ///
+    /// 进入该函数前，需要关中断
     #[inline(always)]
-    pub fn sleep(&mut self, futex_q: Arc<FutexObj>) -> Result<(), SystemError> {
+    pub fn sleep_no_sched(&mut self, futex_q: Arc<FutexObj>) -> Result<(), SystemError> {
+        assert!(CurrentIrqArch::is_irq_enabled() == false);
         self.chain.push_back(futex_q);
 
-        // 关中断并且标记睡眠
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true)?;
-        drop(irq_guard);
-
-        sched();
 
         Ok(())
     }
@@ -91,6 +101,7 @@ impl FutexHashBucket {
 
                 // 唤醒
                 if futex_q.pcb.upgrade().is_some() {
+                    self.remove(futex_q.clone());
                     ProcessManager::wakeup(&futex_q.pcb.upgrade().unwrap())?;
                 }
 
@@ -113,10 +124,11 @@ impl FutexHashBucket {
 
     /// 将FutexObj从bucket中删除
     pub fn remove(&mut self, futex: Arc<FutexObj>) {
-        self.chain.drain_filter(|x| x.key == futex.key);
+        self.chain.drain_filter(|x| Arc::ptr_eq(x, &futex));
     }
 }
 
+#[derive(Debug)]
 pub struct FutexObj {
     pcb: Weak<ProcessControlBlock>,
     key: FutexKey,
@@ -194,7 +206,7 @@ impl Futex {
         };
     }
 
-    /// ### 让当前进程在指定futex上等待直到futex_writ显式唤醒
+    /// ### 让当前进程在指定futex上等待直到futex_wake显式唤醒
     pub fn futex_wait(
         uaddr: VirtAddr,
         flags: FutexFlag,
@@ -213,16 +225,16 @@ impl Futex {
             FutexAccess::FutexRead,
         )?;
 
-        let mut binding = FutexData::get_futex_map();
-        let bucket = binding.get(&key);
-        let bucket = match bucket {
+        let mut futex_map_guard = FutexData::futex_map();
+        let bucket = futex_map_guard.get_mut(&key);
+        let bucket_mut = match bucket {
             Some(bucket) => bucket,
             None => {
-                let bucket = RefCell::new(FutexHashBucket {
+                let bucket = FutexHashBucket {
                     chain: LinkedList::new(),
-                });
-                binding.insert(key.clone(), bucket);
-                binding.get(&key).unwrap()
+                };
+                futex_map_guard.insert(key.clone(), bucket);
+                futex_map_guard.get_mut(&key).unwrap()
             }
         };
 
@@ -232,9 +244,6 @@ impl Futex {
 
         // 从用户空间读取到futex的val
         let mut uval = 0;
-
-        // 对bucket上锁，避免在读之前futex值被更改
-        let mut bucket_mut = bucket.borrow_mut();
 
         // 读取
         // 这里只尝试一种方式去读取用户空间，与linux不太一致
@@ -266,22 +275,44 @@ impl Futex {
 
         let futex_q = Arc::new(FutexObj {
             pcb: Arc::downgrade(&pcb),
-            key,
+            key: key.clone(),
             bitset,
         });
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 满足条件则将当前进程在该bucket上挂起
-        bucket_mut.sleep(futex_q.clone())?;
+        bucket_mut.sleep_no_sched(futex_q.clone()).map_err(|e| {
+            kwarn!("error:{e:?}");
+            e
+        })?;
+        drop(bucket_mut);
+        drop(futex_map_guard);
+        drop(irq_guard);
+        sched();
 
         // 被唤醒后的检查
-
-        // 如果该pcb不在链表里面了，就证明是正常的Wake操作
-        if !bucket_mut.contains(&futex_q) {
-            // 取消定时器任务
-            if timer.is_some() {
-                timer.unwrap().cancel();
+        let mut futex_map_guard = FutexData::futex_map();
+        let bucket = futex_map_guard.get_mut(&key);
+        let bucket_mut = match bucket {
+            // 如果该pcb不在链表里面了或者该链表已经被释放，就证明是正常的Wake操作
+            Some(bucket_mut) => {
+                if !bucket_mut.contains(&futex_q) {
+                    // 取消定时器任务
+                    if timer.is_some() {
+                        timer.unwrap().cancel();
+                    }
+                    return Ok(0);
+                }
+                // 非正常唤醒，返回交给下层
+                bucket_mut
             }
-            return Ok(0);
-        }
+            None => {
+                // 取消定时器任务
+                if timer.is_some() {
+                    timer.unwrap().cancel();
+                }
+                return Ok(0);
+            }
+        };
 
         // 如果是超时唤醒，则返回错误
         if timer.is_some() {
@@ -327,17 +358,22 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
-        let binding = FutexData::get_futex_map();
-        let bucket = binding.get(&key).ok_or(SystemError::EINVAL)?;
-
-        let mut bucket_mut = bucket.borrow_mut();
+        let mut binding = FutexData::futex_map();
+        let bucket_mut = binding.get_mut(&key).ok_or(SystemError::EINVAL)?;
 
         // 确保后面的唤醒操作是有意义的
-        if bucket_mut.chain.len() == 0 {
+        if bucket_mut.chain.is_empty() {
             return Ok(0);
         }
         // 从队列中唤醒
-        Ok(bucket_mut.wake_up(key, Some(bitset), nr_wake)?)
+        let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
+
+        drop(bucket_mut);
+        drop(binding);
+
+        FutexData::try_remove(&key);
+
+        Ok(count)
     }
 
     /// ### 唤醒制定uaddr1上的最多nr_wake个进程，然后将uaddr1最多nr_requeue个进程移动到uaddr2绑定的futex上
@@ -375,10 +411,6 @@ impl Futex {
             return Err(SystemError::EINVAL);
         }
 
-        let binding = FutexData::get_futex_map();
-        let bucket1 = binding.get(&key1).ok_or(SystemError::EINVAL)?;
-        let bucket2 = binding.get(&key2).ok_or(SystemError::EINVAL)?;
-
         if likely(!cmpval.is_none()) {
             let uval_reader =
                 UserBufferReader::new(uaddr1.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
@@ -390,19 +422,20 @@ impl Futex {
             }
         }
 
-        // 对bucket上锁
-        let mut bucket_1_mut = bucket1.borrow_mut();
-        let mut bucket_2_mut = bucket2.borrow_mut();
-
+        let mut futex_data_guard = FutexData::futex_map();
         if !requeue_pi {
             // 唤醒nr_wake个进程
-            let ret = bucket_1_mut.wake_up(key1, None, nr_wake as u32)?;
-
+            let bucket_1_mut = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
+            let ret = bucket_1_mut.wake_up(key1.clone(), None, nr_wake as u32)?;
+            drop(bucket_1_mut);
             // 将bucket1中最多nr_requeue个任务转移到bucket2
             for _ in 0..nr_requeue {
+                let bucket_1_mut = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
                 let futex_q = bucket_1_mut.chain.pop_front();
                 match futex_q {
                     Some(futex_q) => {
+                        let bucket_2_mut =
+                            futex_data_guard.get_mut(&key2).ok_or(SystemError::EINVAL)?;
                         bucket_2_mut.chain.push_back(futex_q);
                     }
                     None => {
@@ -438,9 +471,8 @@ impl Futex {
             FutexAccess::FutexWrite,
         )?;
 
-        let binding = FutexData::get_futex_map();
-        let mut bucket1 = binding.get(&key1).ok_or(SystemError::EINVAL)?.borrow_mut();
-        let mut bucket2 = binding.get(&key2).ok_or(SystemError::EINVAL)?.borrow_mut();
+        let mut futex_data_guard = FutexData::futex_map();
+        let bucket1 = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
         let mut wake_count = 0;
 
         // 唤醒uaddr1中的进程
@@ -450,6 +482,7 @@ impl Futex {
             Ok(ret) => {
                 // 操作成功则唤醒uaddr2中的进程
                 if ret {
+                    let bucket2 = futex_data_guard.get_mut(&key2).ok_or(SystemError::EINVAL)?;
                     wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
                 }
             }

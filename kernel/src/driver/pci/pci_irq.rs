@@ -13,7 +13,7 @@ use crate::include::bindings::bindings::{
     c_irq_install, c_irq_uninstall, pt_regs, ul, EAGAIN, EINVAL,
 };
 
-use crate::libs::volatile::{volread, volwrite, Volatile, VolatileReadable, VolatileWritable};
+use crate::libs::volatile::{volread, volwrite, Volatile};
 
 /// MSIX表的一项
 #[repr(C)]

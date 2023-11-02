@@ -40,12 +40,12 @@ ARCH="x86_64"
 # 请根据自己的需要，在-d 后方加入所需的 trace 事件
 
 # 标准的trace events
-qemu_trace_std=cpu_reset,guest_errors,exec,cpu,trace:virtio*
+qemu_trace_std=cpu_reset,guest_errors,exec,cpu,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*
 # 调试usb的trace
 qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace:usb_xhci_irq_msi,trace:usb_xhci_irq_msix,trace:usb_xhci_port_reset,trace:msix_write_config,trace:usb_xhci_irq_msix,trace:usb_xhci_irq_msix_use,trace:usb_xhci_irq_msix_unuse,trace:usb_xhci_irq_msi,trace:usb_xhci_*
 qemu_accel=kvm
 if [ $(uname) == Darwin ]; then
-    qemu_accel=hvf
+    qemu_accel=hvf  
 fi
 
 QEMU=qemu-system-x86_64
@@ -62,8 +62,9 @@ QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
-#QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -nic user,model=virtio-net-pci,hostfwd=tcp::12580-:12580 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
-QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
+# QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 " 
+# E1000E
+QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 " 
 QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d -monitor ${QEMU_MONITOR} -d ${qemu_trace_std} "
 
 QEMU_ARGUMENT+="-s -S -enable-kvm -cpu ${QEMU_CPU_FEATURES} -rtc ${QEMU_RTC_CLOCK} -serial ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES}"

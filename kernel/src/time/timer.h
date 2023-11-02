@@ -1,7 +1,6 @@
 #pragma once
 
 #include <common/glib.h>
-#include <driver/timers/HPET/HPET.h>
 
 
 // 定义LONG_MAX为最大超时时间 - 允许负数

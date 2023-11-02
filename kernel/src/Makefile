@@ -43,9 +43,8 @@ main.o: main.c
 	$(CC) $(CFLAGS) -c main.c  -o main.o
 
 kernel_rust:
-	rustup default nightly
-
 	RUSTFLAGS="$(RUSTFLAGS_UNWIND)" cargo +nightly-2023-01-21 build --release --target ./arch/x86_64/x86_64-unknown-none.json
+
 all: kernel
 
 	@echo "Linking kernel..."

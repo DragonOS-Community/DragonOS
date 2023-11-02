@@ -262,45 +262,13 @@ struct apic_IO_APIC_map
  * @param number 中断向量号
  */
 void do_IRQ(struct pt_regs *rsp, ul number);
-void rs_apic_init_ap_core_local_apic();
-
-/**
- * @brief 读取RTE寄存器
- *
- * @param index 索引值
- * @return ul
- */
-ul apic_ioapic_read_rte(unsigned char index);
-
-/**
- * @brief 写入RTE寄存器
- *
- * @param index 索引值
- * @param value 要写入的值
- */
-void apic_ioapic_write_rte(unsigned char index, ul value);
-
-/**
- * @brief 初始化AP处理器的Local apic
- *
- */
-void apic_init_ap_core_local_apic();
+void rs_apic_init_ap();
 
 /**
  * @brief 初始化apic控制器
  *
  */
 int apic_init();
-
-/**
- * @brief 读取指定类型的 Interrupt Control Structure
- *
- * @param type ics的类型
- * @param ret_vaddr 对应的ICS的虚拟地址数组
- * @param total 返回数组的元素总个数
- * @return uint
- */
-uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total);
 
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num);
@@ -330,5 +298,4 @@ void apic_local_apic_edge_ack(ul irq_num); // local apic边沿触发 应答
 void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, uint8_t deliver_mode, uint8_t dest_mode,
                          uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID);
 
-uint32_t apic_get_local_apic_id();
 #pragma GCC pop_options

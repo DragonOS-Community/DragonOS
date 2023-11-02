@@ -4,6 +4,7 @@ use atomic_enum::atomic_enum;
 use x86::apic::Icr;
 
 use crate::{
+    arch::interrupt::TrapFrame,
     driver::interrupt::apic::{ioapic::ioapic_init, x2apic::X2Apic, xapic::XApic},
     kdebug, kinfo,
     libs::once::Once,
@@ -423,60 +424,6 @@ impl DeliveryStatus {
 pub enum TriggerMode {
     Edge = 0,
     Level = 1,
-}
-
-/// 初始化bsp处理器的apic
-#[no_mangle]
-pub extern "C" fn rs_apic_init_bsp() -> i32 {
-    let r = apic_init();
-    if r.is_ok() {
-        return 0;
-    } else {
-        return r.unwrap_err();
-    }
-}
-
-/// @brief 初始化apic
-pub fn apic_init() -> Result<(), i32> {
-    static INIT: Once = Once::new();
-    assert!(!INIT.is_completed());
-
-    INIT.call_once(|| {
-        kdebug!("Support xAPIC?.. {}", XApic::support());
-        kdebug!("Support x2APIC?.. {}", X2Apic::support());
-
-        if X2Apic::support() && X2Apic.init_current_cpu() {
-            LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::X2Apic, Ordering::SeqCst);
-            kinfo!("x2APIC initialized for bsp");
-        } else {
-            todo!("init xAPIC for bsp");
-            LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::XApic, Ordering::SeqCst);
-        }
-
-        ioapic_init();
-        kinfo!("Apic initialized.");
-    });
-
-    return Ok(());
-}
-
-#[no_mangle]
-pub extern "C" fn rs_apic_init_ap() -> i32 {
-    let r = apic_init_ap_core()
-        .map(|_| 0)
-        .unwrap_or_else(|e| e.to_posix_errno());
-    return r;
-}
-
-/// 初始化ap核心的local apic
-pub fn apic_init_ap_core() -> Result<(), SystemError> {
-    if X2Apic::support() && X2Apic.init_current_cpu() {
-        kinfo!("x2APIC initialized for cpu {}", smp_get_processor_id());
-    } else {
-        todo!("init xApic for ap core {}", smp_get_processor_id());
-    }
-
-    return Ok(());
 }
 
 #[derive(Debug)]

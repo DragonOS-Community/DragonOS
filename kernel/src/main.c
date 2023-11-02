@@ -163,11 +163,12 @@ void system_initialize()
     io_mfence();
 
     kvm_init();
-    while(1);
+
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 
     apic_timer_init();
+    // while(1);
     io_mfence();
     sti();
     while (1)

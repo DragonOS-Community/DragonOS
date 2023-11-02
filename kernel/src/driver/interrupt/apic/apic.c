@@ -19,7 +19,7 @@ extern uint32_t rs_current_pcb_pid();
 extern uint32_t rs_current_pcb_flags();
 extern void rs_apic_init_bsp();
 
-extern void rs_apic_local_apic_edge_ack();
+extern void rs_apic_local_apic_edge_ack(uint8_t irq_num);
 
 static bool flag_support_apic = false;
 static bool flag_support_x2apic = false;
@@ -33,7 +33,10 @@ static struct acpi_IO_APIC_Structure_t *io_apic_ICS;
 static void __local_apic_xapic_init();
 static void __local_apic_x2apic_init();
 
-
+extern int rs_ioapic_install(uint8_t vector, uint8_t dest, bool level_triggered, bool active_high, bool dest_logical);
+extern void rs_ioapic_uninstall(uint8_t irq_num);
+extern void rs_ioapic_enable(uint8_t irq_num);
+extern void rs_ioapic_disable(uint8_t irq_num);
 
 static __always_inline void __send_eoi()
 {
@@ -193,7 +196,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     {
         // ==========外部中断控制器========
         irq_desc_t *irq = &interrupt_desc[number - 32];
-        
+
         // 执行中断上半部处理程序
         if (irq != NULL && irq->handler != NULL)
             irq->handler(number, irq->parameter, rsp);
@@ -203,11 +206,11 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         if (irq->controller != NULL && irq->controller->ack != NULL)
             irq->controller->ack(number);
         else
-            __send_eoi();
+            rs_apic_local_apic_edge_ack(number);
     }
     else if (number >= 200)
     {
-        apic_local_apic_edge_ack(number);
+        rs_apic_local_apic_edge_ack(number);
 
         {
             irq_desc_t *irq = &SMP_IPI_desc[number - 200];
@@ -228,7 +231,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         if (irq->controller != NULL && irq->controller->ack != NULL)
             irq->controller->ack(number);
         else
-            __send_eoi(); // 向EOI寄存器写入0x00表示结束中断
+            rs_apic_local_apic_edge_ack(number);
     }
     else
     {
@@ -259,85 +262,39 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     }
 }
 
-/**
- * @brief 读取RTE寄存器
- * 由于RTE位宽为64位而IO window寄存器只有32位，因此需要两次读取
- * @param index 索引值
- * @return ul
- */
-ul apic_ioapic_read_rte(unsigned char index)
-{
-    // 由于处理器的乱序执行的问题，需要加入内存屏障以保证结果的正确性。
-    ul ret;
-    // 先读取高32bit
-    *apic_ioapic_map.virtual_index_addr = index + 1;
-    io_mfence();
-
-    ret = *apic_ioapic_map.virtual_data_addr;
-    ret <<= 32;
-    io_mfence();
-
-    // 读取低32bit
-    *apic_ioapic_map.virtual_index_addr = index;
-    io_mfence();
-    ret |= *apic_ioapic_map.virtual_data_addr;
-    io_mfence();
-
-    return ret;
-}
-
-/**
- * @brief 写入RTE寄存器
- *
- * @param index 索引值
- * @param value 要写入的值
- */
-void apic_ioapic_write_rte(unsigned char index, ul value)
-{
-    // // 先写入低32bit
-    // *apic_ioapic_map.virtual_index_addr = index;
-    // io_mfence();
-
-    // *apic_ioapic_map.virtual_data_addr = value & 0xffffffff;
-    // io_mfence();
-    // // 再写入高32bit
-    // value >>= 32;
-    // io_mfence();
-    // *apic_ioapic_map.virtual_index_addr = index + 1;
-    // io_mfence();
-    // *apic_ioapic_map.virtual_data_addr = value & 0xffffffff;
-    // io_mfence();
-}
-
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num)
 {
-    // ul index = 0x10 + ((irq_num - 32) << 1);
-    // ul value = apic_ioapic_read_rte(index);
-    // value &= (~0x10000UL);
-    // apic_ioapic_write_rte(index, value);
+    rs_ioapic_enable(irq_num);
 }
 
 void apic_ioapic_disable(ul irq_num)
 {
-    // ul index = 0x10 + ((irq_num - 32) << 1);
-    // ul value = apic_ioapic_read_rte(index);
-    // value |= (0x10000UL);
-    // apic_ioapic_write_rte(index, value);
+    rs_ioapic_disable(irq_num);
 }
 
 ul apic_ioapic_install(ul irq_num, void *arg)
 {
-    // struct apic_IO_APIC_RTE_entry *entry = (struct apic_IO_APIC_RTE_entry *)arg;
-    // // RTE表项值写入对应的RTE寄存器
-    // apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), *(ul *)entry);
-    // return 0;
+    struct apic_IO_APIC_RTE_entry *entry = (struct apic_IO_APIC_RTE_entry *)arg;
+    uint8_t dest = 0;
+    if (entry->dest_mode)
+    {
+        dest = entry->destination.logical.logical_dest;
+    }
+    else
+    {
+        dest = entry->destination.physical.phy_dest;
+    }
+
+    kdebug("vector=%d,dest=%d,trigger=%d,polarity=%d,dest_mode=%d", entry->vector, dest, entry->trigger_mode,
+           entry->polarity, entry->dest_mode);
+           
+    return rs_ioapic_install(entry->vector, dest, entry->trigger_mode, entry->polarity, entry->dest_mode);
 }
 
 void apic_ioapic_uninstall(ul irq_num)
 {
-    // 将对应的RTE表项设置为屏蔽状态
-    // apic_ioapic_write_rte(0x10 + ((irq_num - 32) << 1), 0x10000UL);
+    rs_ioapic_uninstall(irq_num);
 }
 
 void apic_ioapic_level_ack(ul irq_num) // 电平触发
@@ -349,13 +306,7 @@ void apic_ioapic_level_ack(ul irq_num) // 电平触发
 void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
 {
 
-    // 向EOI寄存器写入0x00表示结束中断
-    /*
-        uint *eoi = (uint *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI);
-        *eoi = 0x00;
-
-        */
-    // __send_eoi();
+    rs_apic_local_apic_edge_ack(irq_num);
 }
 
 /**
@@ -366,42 +317,7 @@ void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
 
 void apic_local_apic_edge_ack(ul irq_num)
 {
-    rs_apic_local_apic_edge_ack();
-}
-
-/**
- * @brief 读取指定类型的 Interrupt Control Structure
- *
- * @param type ics的类型
- * @param ret_vaddr 对应的ICS的虚拟地址数组
- * @param total 返回数组的元素总个数
- * @return uint
- */
-uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total)
-{
-    void *ent = (void *)(madt) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
-    struct apic_Interrupt_Controller_Structure_header_t *header =
-        (struct apic_Interrupt_Controller_Structure_header_t *)ent;
-    bool flag = false;
-
-    uint cnt = 0;
-
-    while (header->length > 2)
-    {
-        header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
-        if (header->type == type)
-        {
-            ret_vaddr[cnt++] = (ul)ent;
-            flag = true;
-        }
-        ent += header->length;
-    }
-
-    *total = cnt;
-    if (!flag)
-        return APIC_E_NOTFOUND;
-    else
-        return APIC_SUCCESS;
+    rs_apic_local_apic_edge_ack(irq_num);
 }
 
 /**
@@ -447,35 +363,5 @@ void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, u
     }
 }
 
-/**
- * @brief 获取当前处理器的local apic id
- *
- * @return uint32_t
- */
-uint32_t apic_get_local_apic_id()
-{
-    // 获取Local APIC的基础信息 （参见英特尔开发手册Vol3A 10-39）
-    //                          Table 10-6. Local APIC Register Address Map Supported by x2APIC
-
-    if (flag_support_x2apic)
-    {
-        // 获取 Local APIC ID
-        // 0x802处是x2APIC ID 位宽32bits 的 Local APIC ID register
-        uint32_t x = 0;
-        __asm__ __volatile__("movq $0x802, %%rcx    \n\t"
-                             "rdmsr  \n\t"
-                             : "=a"(x)::"memory");
-        return x;
-    }
-    else
-    {
-        // kdebug("get Local APIC ID: edx=%#010x, eax=%#010x", edx, eax);
-        // kdebug("local_apic_id=%#018lx", );
-
-        uint32_t x = *(uint32_t *)(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_ID);
-        x = ((x >> 24) & 0xff);
-        return x;
-    }
-}
 
 #pragma GCC pop_options

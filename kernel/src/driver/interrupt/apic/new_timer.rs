@@ -38,18 +38,21 @@ pub(super) fn local_apic_timer_instance_mut(
 /// 初始化BSP的APIC定时器
 ///
 fn init_bsp_apic_timer() {
+    kdebug!("init_bsp_apic_timer");
     assert!(smp_get_processor_id() == 0);
     // 注册中断处理函数
-    unsafe { c_register_apic_timer_irq() };
+    // unsafe { c_register_apic_timer_irq() };
     let mut local_apic_timer = local_apic_timer_instance_mut(0);
     local_apic_timer.init(
         LocalApicTimerMode::Periodic,
         LocalApicTimer::periodic_default_initial_count(),
         LocalApicTimer::DIVISOR as u32,
-    )
+    );
+    kdebug!("init_bsp_apic_timer done");
 }
 
 fn init_ap_apic_timer() {
+    kdebug!("init_ap_apic_timer");
     let cpu_id = smp_get_processor_id();
     assert!(cpu_id != 0);
 
@@ -59,12 +62,14 @@ fn init_ap_apic_timer() {
         LocalApicTimer::periodic_default_initial_count(),
         LocalApicTimer::DIVISOR as u32,
     );
+    kdebug!("init_ap_apic_timer done");
 }
 
 pub(super) struct LocalApicTimerIntrController;
 
 impl LocalApicTimerIntrController {
     pub(super) fn install(&self, irq_num: u8) {
+        kdebug!("LocalApicTimerIntrController::install");
         if smp_get_processor_id() == 0 {
             init_bsp_apic_timer();
         } else {
@@ -79,6 +84,7 @@ impl LocalApicTimerIntrController {
     }
 
     pub(super) fn enable(&self) {
+        kdebug!("LocalApicTimerIntrController::enable");
         let cpu_id = smp_get_processor_id();
         let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
         local_apic_timer.start_current();
@@ -149,6 +155,11 @@ impl LocalApicTimer {
     }
 
     fn install_periodic_mode(&mut self, initial_count: u64, divisor: u32) {
+        kdebug!(
+            "install_periodic_mode: initial_count = {}, divisor = {}",
+            initial_count,
+            divisor
+        );
         self.mode = LocalApicTimerMode::Periodic;
         self.set_divisor(divisor);
         self.set_initial_cnt(initial_count);
@@ -158,7 +169,7 @@ impl LocalApicTimer {
     fn setup_lvt(&mut self, vector: u8, mask: bool, mode: LocalApicTimerMode) {
         let mode: u32 = mode as u32;
         let data = (mode << 17) | (vector as u32) | (if mask { 1 << 16 } else { 0 });
-        let lvt = LVT::new(LVTRegister::Timer, 0).unwrap();
+        let lvt = LVT::new(LVTRegister::Timer, data).unwrap();
 
         CurrentApic.set_lvt(lvt);
     }

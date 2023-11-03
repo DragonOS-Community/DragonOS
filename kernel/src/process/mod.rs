@@ -599,7 +599,7 @@ impl ProcessControlBlock {
 
         pcb.arch_info
             .lock()
-            .init_syscall_stack(pcb.syscall_stack.read().stack_max_address() - 8);
+            .init_syscall_stack(&pcb.syscall_stack.read());
 
         let pcb = Arc::new(pcb);
 

@@ -50,4 +50,3 @@ void virtualization_exception();
 
 void syscall_int(); // 系统调用门
 void sys_vector_init();
-void syscall_64(); // syscall指令入口

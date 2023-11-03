@@ -330,24 +330,24 @@ ENTRY(syscall_64)
     movq %rsp, %gs:0x8
     movq %gs:0x0, %rsp
     
-    pushq $43      //USER_DS
-    pushq %gs:0x8   //rsp
-    pushq %r11     //RFLAGS
-    pushq $51         //USER_CS
-    pushq %rcx      //RIP
-    pushq $0        //error code占位
+    pushq $43       // USER_DS
+    pushq %gs:0x8   // rsp
+    pushq %r11      // RFLAGS
+    pushq $51       // USER_CS
+    pushq %rcx      // RIP
+    pushq $0        // error code占位
 
     pushq %rax
-    leaq syscall_handler(%rip), %rax //FUNC
+    leaq syscall_handler(%rip), %rax // FUNC
     xchgq %rax, (%rsp)
 
-    pushq %rax      //rax
+    pushq %rax      // rax
     
     movq %es, %rax
-    pushq %rax      //es
+    pushq %rax      // es
     movq %ds, %rax
-    pushq %rax      //ds
-    xorq	%rax,	%rax
+    pushq %rax      // ds
+    xorq %rax, %rax
 
     pushq	%rbp
 	pushq	%rdi
@@ -373,12 +373,7 @@ ENTRY(syscall_64)
 
     callq *%rdx //调用服务程序
 
-    // 进入信号处理流程
     cli
-    // 将原本要返回的栈帧的栈指针传入do_signal的第一个参数
-    // movq %rsp, %rdi
-    // callq do_signal
-
     
     // === 恢复调用现场 ===
     popq %r15
@@ -396,7 +391,7 @@ ENTRY(syscall_64)
     popq %rdi
     popq %rbp
 
-    popq %rax   //  不允许直接pop到ds
+    popq %rax           // 不允许直接pop到ds
     movq %rax, %ds
 
     popq %rax
@@ -405,11 +400,11 @@ ENTRY(syscall_64)
     popq %rax
     addq $0x10, %rsp    // 弹出变量FUNC和errcode
 
-    popq %rcx           //pop rip到rcx
+    popq %rcx           // pop rip到rcx
 
-    addq $0x8, %rsp     //弹出cs
-    popq %r11           //pop rflags到r11
-    popq %rsp           //Restore rsp
+    addq $0x8, %rsp     // 弹出cs
+    popq %r11           // pop rflags到r11
+    popq %rsp           // Restore rsp
 
     swapgs
     sysretq

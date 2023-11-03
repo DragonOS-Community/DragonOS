@@ -30,6 +30,7 @@ unsafe impl SafeForZero for X86_64GSData {}
 
 extern "C" {
     fn syscall_int();
+    fn syscall_64();
 }
 
 macro_rules! syscall_return {
@@ -78,6 +79,24 @@ pub fn arch_syscall_init() -> Result<(), SystemError> {
     // kinfo!("arch_syscall_init\n");
     unsafe { set_system_trap_gate(0x80, 0, syscall_int as *mut c_void) }; // 系统调用门
     return Ok(());
+}
+
+/// syscall指令初始化
+#[no_mangle]
+pub unsafe extern "C" fn rs_init_syscall_64() {
+    let mut efer = x86::msr::rdmsr(x86::msr::IA32_EFER);
+    efer |= 0x1;
+    x86::msr::wrmsr(x86::msr::IA32_EFER, efer);
+
+    let syscall_base = (1 as u16) << 3;
+    let sysret_base = ((4 as u16) << 3) | 3;
+    let high = (u32::from(sysret_base) << 16) | u32::from(syscall_base);
+    // 初始化STAR寄存器
+    x86::msr::wrmsr(x86::msr::IA32_STAR, u64::from(high) << 32);
+
+    // 初始化LSTAR,该寄存器存储syscall指令入口
+    x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as u64);
+    x86::msr::wrmsr(x86::msr::IA32_FMASK, 0xfffffffe);
 }
 
 /// 执行第一个用户进程的函数（只应该被调用一次）

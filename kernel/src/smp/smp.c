@@ -32,6 +32,7 @@ int num_cpu_started = 1;
 
 extern void smp_ap_start();
 extern uint64_t rs_get_idle_stack_top(uint32_t cpu_id);
+extern void rs_init_syscall_64();
 
 // 在head.S中定义的，APU启动时，要加载的页表
 // 由于内存管理模块初始化的时候，重置了页表，因此我们要把当前的页表传给APU
@@ -155,7 +156,7 @@ void smp_ap_start_stage2()
 
     apic_timer_ap_core_init();
 
-    smp_syscall_init();
+    rs_init_syscall_64();
 
     sti();
     sched();
@@ -193,23 +194,6 @@ static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struc
     if (user_mode(regs))
         return;
     flush_tlb();
-}
-
-void smp_syscall_init()
-{
-    uint64_t efer = rdmsr(MSR_EFER);
-    efer |= 0x1;
-    wrmsr(MSR_EFER, efer);
-
-    uint16_t syscall_base = 1 << 3;
-    uint16_t sysret_base = (4 << 3) | 3;
-    uint32_t high = ((uint32_t)sysret_base << 16) | (uint32_t)syscall_base;
-    // 初始化STAR寄存器
-    wrmsr(MSR_STAR, ((uint64_t)high) << 32);
-    
-    // 初始化LSTAR,该寄存器存储syscall指令入口rip
-    wrmsr(MSR_LSTAR, (uint64_t)syscall_64);
-    wrmsr(MSR_SYSCALL_MASK, 0xfffffffe);
 }
 
 /**

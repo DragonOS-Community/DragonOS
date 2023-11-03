@@ -217,8 +217,8 @@ impl ArchPCBInfo {
         );
     }
 
-    pub fn init_syscall_stack(&mut self, stack: VirtAddr) {
-        self.gsdata.set_kstack(stack);
+    pub fn init_syscall_stack(&mut self, stack: &KernelStack) {
+        self.gsdata.set_kstack(stack.stack_max_address() - 8);
     }
 
     pub fn fsbase(&self) -> usize {

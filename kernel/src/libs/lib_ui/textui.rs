@@ -784,9 +784,10 @@ impl TextuiWindow {
         }
 
         // 增加新行
+        let num = self.winsize.col();
         if let TextuiVline::Chromatic(vline) = self.get_mut_vline(new_vline_id) {
             vline.is_empty = true;
-            for i in 0..self.winsize.col() {
+            for i in 0..num {
                 if let Some(v_char) = vline.chars.get_mut(i as usize) {
                     v_char.c = None;
                     v_char.frcolor = FontColor::BLACK;
@@ -825,9 +826,10 @@ impl TextuiWindow {
         // 启用彩色字符
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             let mut line_index = LineIndex::new(0); // 操作的列号
+            let index = <LineIndex as Into<usize>>::into(self.cursor.get_x());
+
             if let TextuiVline::Chromatic(vline) = self.get_mut_vline(self.cursor.get_y()) {
                 vline.is_empty = false;
-                let index = <LineIndex as Into<usize>>::into(self.cursor.get_x());
 
                 if let Some(v_char) = vline.chars.get_mut(index) {
                     v_char.c = Some(character);
@@ -921,9 +923,9 @@ impl TextuiWindow {
                 let mut tmp = LineIndex(0);
                 if let TextuiVline::Chromatic(vline) = self.get_mut_vline(self.cursor.get_y()) {
                     vline.end_index = vline.end_index - 1;
-                    self.cursor.move_left(1);
                     tmp = vline.end_index;
                 }
+                self.cursor.move_left(1);
                 if <LineIndex as Into<i32>>::into(tmp) >= 0 {
                     if let TextuiVline::Chromatic(vline) = self.get_mut_vline(self.cursor.get_y()) {
                         if let Some(v_char) =
@@ -939,10 +941,10 @@ impl TextuiWindow {
                 // 需要向上缩一行
                 if <LineIndex as Into<i32>>::into(tmp) < 0 {
                     // 当前行为空,需要重新刷新
+                    let num = self.winsize.col();
                     if let TextuiVline::Chromatic(vline) = self.get_mut_vline(self.cursor.get_y()) {
                         vline.end_index = LineIndex::new(0);
-                        self.cursor.set_x(0);
-                        for i in 0..self.winsize.col() {
+                        for i in 0..num {
                             if let Some(v_char) = vline.chars.get_mut(i as usize) {
                                 v_char.c = None;
                                 v_char.frcolor = FontColor::BLACK;
@@ -950,6 +952,8 @@ impl TextuiWindow {
                             }
                         }
                     }
+                    self.cursor.set_x(0);
+
                     // 上缩一行
                     // self.vline_operating = self.vline_operating - 1;
                     self.cursor.move_newline(-1, self.winsize.row());
@@ -990,7 +994,7 @@ impl TextuiWindow {
 
     /// 得到窗口某一虚拟行的不可变引用
     pub fn get_vline(&self, vline_id: LineId) -> &TextuiVline {
-        let vline=&((self.vlines)[<LineId as Into<usize>>::into(vline_id)]);
+        let vline = &((self.vlines)[<LineId as Into<usize>>::into(vline_id)]);
         return vline;
     }
 
@@ -1005,10 +1009,13 @@ impl TextuiWindow {
         vline_id: LineId,
         start_index: LineIndex,
     ) -> Result<(), SystemError> {
+        let num = self.winsize.col();
+        let mut need_move_next_vline = false;
+        let mut chars: Vec<TextuiCharChromatic> = Vec::new();
         if let TextuiVline::Chromatic(vline) = self.get_mut_vline(vline_id) {
-            let chars: Vec<TextuiCharChromatic> = vline.get_chars(start_index + 1, vline.end_index);
+            chars = vline.get_chars(start_index + 1, vline.end_index);
 
-            if !vline.end_index.check(self.winsize.col() - 1) {
+            if !vline.end_index.check(num - 1) {
                 if vline.has_linefeed() {
                     vline.set_chars(chars.clone(), start_index, vline.end_index - 1);
                     vline.set_char(
@@ -1018,25 +1025,30 @@ impl TextuiWindow {
                     vline.end_index = vline.end_index - 1;
                     self.textui_refresh_vline(vline_id)?;
                 } else {
-                    let mut move_chars = chars.clone();
-                    let mut is_empty = true;
-                    if let TextuiVline::Chromatic(next_vline) = self.get_mut_vline(vline_id+1) {
-                        if !next_vline.is_empty {
-                            is_empty = false;
-                            let char = next_vline.get_char(LineIndex::new(0));
-                            move_chars.push(char);
-                        }
-                    }
-                    if !is_empty {
-                        self.chars_move_left(vline_id + 1, LineIndex::new(0))?;
-                        vline.set_chars(move_chars, start_index, vline.end_index);
-                        self.textui_refresh_vlines(vline_id, 2)?;
-                    }
+                    need_move_next_vline = true;
                 }
             } else {
                 vline.end_index = vline.end_index - 1;
-                vline.set_chars(chars, start_index, vline.end_index);
+                vline.set_chars(chars.clone(), start_index, vline.end_index);
                 self.textui_refresh_vline(vline_id)?;
+            }
+        }
+        if need_move_next_vline {
+            let mut move_chars = chars.clone();
+            let mut is_empty = true;
+            if let TextuiVline::Chromatic(next_vline) = self.get_vline(vline_id + 1) {
+                if !next_vline.is_empty {
+                    is_empty = false;
+                    let char = next_vline.get_char(LineIndex::new(0));
+                    move_chars.push(char);
+                }
+            }
+            if !is_empty {
+                self.chars_move_left(vline_id + 1, LineIndex::new(0))?;
+                if let TextuiVline::Chromatic(vline) = self.get_mut_vline(vline_id) {
+                    vline.set_chars(move_chars, start_index, vline.end_index);
+                }
+                self.textui_refresh_vlines(vline_id, 2)?;
             }
         }
         return Ok(());
@@ -1048,9 +1060,10 @@ impl TextuiWindow {
         vline_id: LineId,
         start_index: LineIndex,
     ) -> Result<(), SystemError> {
+        let num = self.winsize.col();
         if let TextuiVline::Chromatic(vline) = self.get_mut_vline(vline_id) {
             let chars: Vec<TextuiCharChromatic> = vline.get_chars(start_index, vline.end_index);
-            if !vline.end_index.check(self.winsize.col() - 1) {
+            if !vline.end_index.check(num - 1) {
                 let mut move_chars = chars.clone();
                 let char = move_chars.pop().unwrap();
                 if vline.has_linefeed() {
@@ -1101,18 +1114,26 @@ impl TextuiWindow {
         let l = char::from(75);
         let r = char::from(77);
         if character == u {
+            self.chars_move_left(self.cursor.get_y(), self.cursor.get_x())?;
+
             self.chars_move_right(self.cursor.get_y() - 1, self.cursor.get_x())?;
 
             self.cursor.move_up(1);
         } else if character == d {
+            self.chars_move_left(self.cursor.get_y(), self.cursor.get_x())?;
+
             self.chars_move_right(self.cursor.get_y() + 1, self.cursor.get_x())?;
 
             self.cursor.move_down(1);
         } else if character == l {
+            self.chars_move_left(self.cursor.get_y(), self.cursor.get_x())?;
+
             self.chars_move_right(self.cursor.get_y(), self.cursor.get_x() - 1)?;
 
             self.cursor.move_left(1);
         } else if character == r {
+            self.chars_move_left(self.cursor.get_y(), self.cursor.get_x())?;
+
             self.chars_move_right(self.cursor.get_y(), self.cursor.get_x() + 1)?;
 
             self.cursor.move_right(1);

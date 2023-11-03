@@ -591,7 +591,7 @@ pub struct TextuiWindow {
     // 位于最顶上的那一个虚拟行的行号
     top_vline: LineId,
     // 储存虚拟行的数组
-    vlines: Vec<TextuiVline>,
+    vlines: RwLock<Vec<TextuiVline>>,
     // 虚拟化数量
     vlines_num: i32,
     // 窗口flag
@@ -622,7 +622,7 @@ impl TextuiWindow {
             flags,
             vlines_used: 1,
             top_vline: LineId::new(0),
-            vlines: initial_vlines,
+            vlines: RwLock::new(initial_vlines),
             winsize: Winsize::new(
                 true_lines_num,
                 chars_num,
@@ -666,7 +666,7 @@ impl TextuiWindow {
 
         // 将此窗口的某个虚拟行的连续n个字符对象往缓存区写入
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
-            let vline = &mut (self.vlines[<LineId as Into<usize>>::into(vline_id)]);
+            let vline = &mut (self.vlines.write()[<LineId as Into<usize>>::into(vline_id)]);
             let mut i = 0;
             let mut index = start;
 
@@ -731,26 +731,26 @@ impl TextuiWindow {
         let mut end_id: LineId = new_vline_id;
         let mut is_found = false;
         for i in <LineId as Into<i32>>::into(new_vline_id)..(self.winsize.row()) {
-            if let TextuiVline::Chromatic(vline) = &self.vlines[i as usize] {
+            if let TextuiVline::Chromatic(vline) = &self.vlines.read()[i as usize] {
                 if vline.is_empty {
                     is_found = true;
                     break;
                 } else {
                     end_id = end_id + 1;
-                    move_lines.push(self.vlines[i as usize].clone());
+                    move_lines.push(self.vlines.read()[i as usize].clone());
                 }
             }
         }
         if !is_found {
             end_id = LineId::new(0);
             for i in 0..<LineId as Into<i32>>::into(new_vline_id) {
-                if let TextuiVline::Chromatic(vline) = &self.vlines[i as usize] {
+                if let TextuiVline::Chromatic(vline) = &self.vlines.read()[i as usize] {
                     if vline.is_empty {
                         is_found = true;
                         break;
                     } else {
                         end_id = end_id + 1;
-                        move_lines.push(self.vlines[i as usize].clone());
+                        move_lines.push(self.vlines.read()[i as usize].clone());
                     }
                 }
             }
@@ -760,25 +760,25 @@ impl TextuiWindow {
             for i in <LineId as Into<i32>>::into(new_vline_id + 1)
                 ..<LineId as Into<i32>>::into(end_id + 1)
             {
-                self.vlines[i as usize] = move_lines[j].clone();
+                self.vlines.write()[i as usize] = move_lines[j].clone();
                 j += 1;
             }
         } else if end_id < new_vline_id {
             for i in <LineId as Into<i32>>::into(new_vline_id + 1)..self.winsize.row() + 1 {
-                self.vlines[i as usize] = move_lines[j].clone();
+                self.vlines.write()[i as usize] = move_lines[j].clone();
                 j += 1;
             }
             for i in 0..<LineId as Into<i32>>::into(end_id + 1) {
-                self.vlines[i as usize] = move_lines[j].clone();
+                self.vlines.write()[i as usize] = move_lines[j].clone();
                 j += 1;
             }
         } else if !is_found {
             for i in <LineId as Into<i32>>::into(new_vline_id + 1)..self.winsize.row() + 1 {
-                self.vlines[i as usize] = move_lines[j].clone();
+                self.vlines.write()[i as usize] = move_lines[j].clone();
                 j += 1;
             }
             for i in 0..<LineId as Into<i32>>::into(new_vline_id) {
-                self.vlines[i as usize] = move_lines[j].clone();
+                self.vlines.write()[i as usize] = move_lines[j].clone();
                 j += 1;
             }
         }
@@ -990,13 +990,13 @@ impl TextuiWindow {
 
     /// 得到窗口某一虚拟行的不可变引用
     pub fn get_vline(&self, vline_id: LineId) -> &TextuiVline {
-        let vline=&((self.vlines)[<LineId as Into<usize>>::into(vline_id)]);
+        let vline=&((self.vlines.read())[<LineId as Into<usize>>::into(vline_id)]);
         return vline;
     }
 
     /// 得到窗口某一虚拟行的可变引用
     pub fn get_mut_vline(&mut self, vline_id: LineId) -> &mut TextuiVline {
-        &mut ((self.vlines)[<LineId as Into<usize>>::into(vline_id)])
+        &mut ((self.vlines.write())[<LineId as Into<usize>>::into(vline_id)])
     }
 
     /// 将某虚拟行的字符从start_index之后开始向左移一个字符,占据start_index位置
@@ -1129,7 +1129,7 @@ impl Default for TextuiWindow {
             flags: WindowFlag::TEXTUI_CHROMATIC,
             vlines_used: 1,
             top_vline: LineId::new(0),
-            vlines: Vec::new(),
+            vlines: RwLock::new(Vec::new()),
             winsize: Winsize::new(0, 0, 0, 0),
             cursor: Cursor::new(0, 0),
             vlines_num: 0,

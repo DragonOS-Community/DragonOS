@@ -154,9 +154,10 @@ void smp_ap_start_stage2()
     io_mfence();
     spin_unlock_no_preempt(&multi_core_starting_lock);
 
+    rs_init_syscall_64();
+    
     apic_timer_ap_core_init();
 
-    rs_init_syscall_64();
 
     sti();
     sched();

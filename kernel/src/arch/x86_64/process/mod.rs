@@ -80,6 +80,7 @@ pub struct ArchPCBInfo {
     gsbase: usize,
     fs: SegmentSelector,
     gs: SegmentSelector,
+    /// 存储PCB系统调用栈以及在syscall过程中暂存用户态rsp的结构体
     gsdata: X86_64GSData,
     /// 浮点寄存器的状态
     fp_state: Option<FpState>,
@@ -210,6 +211,7 @@ impl ArchPCBInfo {
         }
     }
 
+    /// 将gsdata写入KernelGsbase寄存器
     pub unsafe fn store_kernel_gsbase(&self) {
         x86::msr::wrmsr(
             x86::msr::IA32_KERNEL_GSBASE,
@@ -217,6 +219,7 @@ impl ArchPCBInfo {
         );
     }
 
+    /// ### 初始化系统调用栈，不得与PCB内核栈冲突(即传入的应该是一个新的栈，避免栈损坏)
     pub fn init_syscall_stack(&mut self, stack: &KernelStack) {
         self.gsdata.set_kstack(stack.stack_max_address() - 8);
     }
@@ -237,7 +240,7 @@ impl ArchPCBInfo {
         &mut self.fp_state
     }
 
-    /// ### 克隆ArchPCBInfo,需要注意gsdata和系统调用栈也是对应clone的
+    /// ### 克隆ArchPCBInfo,需要注意gsdata也是对应clone的
     pub fn clone_all(&self) -> Self {
         Self {
             rflags: self.rflags,
@@ -259,6 +262,7 @@ impl ArchPCBInfo {
         }
     }
 
+    // ### 从另一个ArchPCBInfo处clone,gsdata会被保留
     pub fn clone_from(&mut self, from: &Self) {
         let gsdata = self.gsdata.clone();
         *self = from.clone_all();

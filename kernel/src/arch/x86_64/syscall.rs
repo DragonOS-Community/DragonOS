@@ -13,6 +13,10 @@ use alloc::string::String;
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
 
+/// ### 存储PCB系统调用栈以及在syscall过程中暂存用户态rsp的结构体
+///
+/// 在syscall指令中将会从该结构体中读取系统调用栈和暂存rsp,
+/// 使用`gsbase`寄存器实现，后续如果需要使用gsbase寄存器，需要相应设置正确的偏移量
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub(super) struct X86_64GSData {
@@ -21,6 +25,7 @@ pub(super) struct X86_64GSData {
 }
 
 impl X86_64GSData {
+    /// ### 设置系统调用栈，将会在下一个调度后写入KernelGsbase
     pub fn set_kstack(&mut self, kstack: VirtAddr) {
         self.kaddr = kstack;
     }
@@ -95,6 +100,7 @@ pub extern "C" fn rs_exec_init_process(frame: &mut TrapFrame) -> usize {
     return r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize);
 }
 
+/// syscall指令初始化函数
 pub(super) unsafe fn init_syscall_64() {
     let mut efer = x86::msr::rdmsr(x86::msr::IA32_EFER);
     efer |= 0x1;

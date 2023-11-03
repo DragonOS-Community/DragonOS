@@ -597,13 +597,14 @@ impl ProcessControlBlock {
             thread: RwLock::new(ThreadInfo::new()),
         };
 
+        // 初始化系统调用栈
         pcb.arch_info
             .lock()
             .init_syscall_stack(&pcb.syscall_stack.read());
 
         let pcb = Arc::new(pcb);
 
-        // 设置进程的arc指针到内核栈的最低地址处
+        // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
             pcb.kernel_stack
                 .write()

@@ -48,7 +48,7 @@ install_ubuntu_debian_pkg()
 
     if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."
-        sudo apt install docker.io docker-compose
+        sudo apt install -y docker.io docker-compose
     elif [ -z ${dockerInstall} ]; then
 		echo "您传入--no-docker参数生效, 安装docker步骤被跳过."
 	elif [ -n "$(which docker)" ]; then
@@ -227,7 +227,7 @@ cargo install dadk || exit 1
 # 创建磁盘镜像
 bash create_hdd_image.sh
 # 编译安装GCC交叉编译工具链
-bash build_gcc_toolchain.sh
+bash build_gcc_toolchain.sh -cs
 # 编译安装grub
 bash grub_auto_install.sh
 

@@ -304,7 +304,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = socket.inner();
+        let mut socket = unsafe { socket.inner_no_preempt() };
         socket.listen(backlog)?;
         return Ok(0);
     }
@@ -319,7 +319,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = socket.inner();
+        let socket = unsafe { socket.inner_no_preempt() };
         socket.shutdown(ShutdownType::try_from(how as i32)?)?;
         return Ok(0);
     }

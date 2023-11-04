@@ -1081,6 +1081,7 @@ impl KernelStack {
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
         if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {
+            kerror!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
             return Err(SystemError::EPERM);
         }
         // 将pcb的地址放到内核栈的最低地址处
@@ -1089,6 +1090,25 @@ impl KernelStack {
         }
 
         return Ok(());
+    }
+
+    /// 清除内核栈的pcb指针
+    /// 
+    /// ## 参数
+    /// 
+    /// - `force` : 如果为true,那么，即使该内核栈的pcb指针不为null，也会被强制清除而不处理Weak指针问题
+    pub unsafe fn clear_pcb(&mut self, force: bool) {
+        let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;
+        if unlikely(unsafe { (*stack_bottom_ptr).is_null() }) {
+            return;
+        }
+
+        if !force {
+            let pcb_ptr: Weak<ProcessControlBlock> = Weak::from_raw(*stack_bottom_ptr);
+            drop(pcb_ptr);
+        }
+
+        *stack_bottom_ptr = core::ptr::null();
     }
 
     /// 返回指向当前内核栈pcb的Arc指针

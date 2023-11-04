@@ -88,6 +88,7 @@ impl phy::TxToken for E1000ETxToken {
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
         device.e1000e_transmit(buffer);
+        buffer.free_buffer();
         return result;
     }
 }

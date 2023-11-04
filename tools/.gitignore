@@ -6,3 +6,4 @@ arch/x86_64/efi/grub/*
 
 *.tar.gz
 build/*
+target/

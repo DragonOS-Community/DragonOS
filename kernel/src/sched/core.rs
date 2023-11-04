@@ -98,6 +98,24 @@ pub trait Scheduler {
 pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     // 当前进程持有锁，不切换，避免死锁
     if ProcessManager::current_pcb().preempt_count() != 0 {
+        let binding = ProcessManager::current_pcb();
+        let mut guard = binding.sched_info_upgradeable_irqsave();
+        let state = guard.state();
+        if state.is_blocked() {
+            // try to upgrade
+            for _ in 0..50 {
+                match guard.try_upgrade() {
+                    Ok(mut writer) => {
+                        // 被mark_sleep但是还在临界区的进程将其设置为Runnable
+                        writer.set_state(ProcessState::Runnable);
+                        break;
+                    }
+                    Err(s) => {
+                        guard = s;
+                    }
+                }
+            }
+        }
         return None;
     }
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

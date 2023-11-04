@@ -34,7 +34,7 @@ use crate::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::Futex,
         },
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -235,6 +235,7 @@ impl ProcessManager {
     ///
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
+    /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
         assert_eq!(
             CurrentIrqArch::is_irq_enabled(),
@@ -692,6 +693,17 @@ impl ProcessControlBlock {
         return self.sched_info.read();
     }
 
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
+        return self.sched_info.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn sched_info_upgradeable_irqsave(&self) -> RwLockUpgradableGuard<ProcessSchedulerInfo> {
+        return self.sched_info.upgradeable_read();
+    }
+
     #[inline(always)]
     pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write();
@@ -977,7 +989,7 @@ impl ProcessSchedulerInfo {
         return self.state;
     }
 
-    fn set_state(&mut self, state: ProcessState) {
+    pub fn set_state(&mut self, state: ProcessState) {
         self.state = state;
     }
 
@@ -1069,6 +1081,7 @@ impl KernelStack {
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
         if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {
+            kerror!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
             return Err(SystemError::EPERM);
         }
         // 将pcb的地址放到内核栈的最低地址处
@@ -1077,6 +1090,25 @@ impl KernelStack {
         }
 
         return Ok(());
+    }
+
+    /// 清除内核栈的pcb指针
+    ///
+    /// ## 参数
+    ///
+    /// - `force` : 如果为true,那么，即使该内核栈的pcb指针不为null，也会被强制清除而不处理Weak指针问题
+    pub unsafe fn clear_pcb(&mut self, force: bool) {
+        let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;
+        if unlikely(unsafe { (*stack_bottom_ptr).is_null() }) {
+            return;
+        }
+
+        if !force {
+            let pcb_ptr: Weak<ProcessControlBlock> = Weak::from_raw(*stack_bottom_ptr);
+            drop(pcb_ptr);
+        }
+
+        *stack_bottom_ptr = core::ptr::null();
     }
 
     /// 返回指向当前内核栈pcb的Arc指针

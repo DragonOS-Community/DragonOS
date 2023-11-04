@@ -1144,6 +1144,10 @@ impl SocketInode {
     pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
         return self.0.lock();
     }
+
+    pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
+        return self.0.lock_no_preempt();
+    }
 }
 
 impl IndexNode for SocketInode {

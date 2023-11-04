@@ -34,7 +34,7 @@ use crate::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::Futex,
         },
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -235,6 +235,7 @@ impl ProcessManager {
     ///
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
+    /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
         assert_eq!(
             CurrentIrqArch::is_irq_enabled(),
@@ -693,6 +694,16 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
+        return self.sched_info.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn sched_info_upgradeable_irqsave(&self) -> RwLockUpgradableGuard<ProcessSchedulerInfo> {
+        return self.sched_info.upgradeable_read();
+    }
+
+    #[inline(always)]
     pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write();
     }
@@ -977,7 +988,7 @@ impl ProcessSchedulerInfo {
         return self.state;
     }
 
-    fn set_state(&mut self, state: ProcessState) {
+    pub fn set_state(&mut self, state: ProcessState) {
         self.state = state;
     }
 

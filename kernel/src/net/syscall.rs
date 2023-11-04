@@ -336,7 +336,7 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         // kdebug!("accept: socket={:?}", socket);
-        let mut socket = socket.inner();
+        let mut socket = unsafe { socket.inner_no_preempt() };
         // 从socket中接收连接
         let (new_socket, remote_endpoint) = socket.accept()?;
         drop(socket);

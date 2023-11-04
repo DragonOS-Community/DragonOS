@@ -556,6 +556,9 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
     arch_guard.fs = USER_DS;
     arch_guard.gs = USER_DS;
 
+    // 将内核gs数据压进cpu
+    arch_guard.store_kernel_gsbase();
+
     switch_fs_and_gs(
         SegmentSelector::from_bits_truncate(arch_guard.fs.bits()),
         SegmentSelector::from_bits_truncate(arch_guard.gs.bits()),
@@ -597,6 +600,7 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
 ) -> ! {
     *(trapframe_vaddr as *mut TrapFrame) = trap_frame;
     asm!(
+        "swapgs",
         "mov rsp, {trapframe_vaddr}",
         "push {new_rip}",
         "ret",

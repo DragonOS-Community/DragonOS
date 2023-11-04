@@ -5,7 +5,6 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::{
     include::bindings::bindings::smp_get_total_cpu,
     kinfo,
-    libs::rwlock::RwLockReadGuard,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     smp::core::smp_get_processor_id,

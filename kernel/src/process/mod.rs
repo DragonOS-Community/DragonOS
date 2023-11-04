@@ -693,6 +693,7 @@ impl ProcessControlBlock {
         return self.sched_info.read();
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
         return self.sched_info.read_irqsave();

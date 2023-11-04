@@ -106,6 +106,7 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
             for _ in 0..50 {
                 match guard.try_upgrade() {
                     Ok(mut writer) => {
+                        // 被mark_sleep但是还在临界区的进程将其设置为Runnable
                         writer.set_state(ProcessState::Runnable);
                         break;
                     }

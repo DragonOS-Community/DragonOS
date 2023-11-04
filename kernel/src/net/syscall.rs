@@ -173,7 +173,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = socket.inner();
+        let mut socket = unsafe { socket.inner_no_preempt() };
         // kdebug!("connect to {:?}...", endpoint);
         socket.connect(endpoint)?;
         return Ok(0);
@@ -191,7 +191,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = socket.inner();
+        let mut socket = unsafe { socket.inner_no_preempt() };
         socket.bind(endpoint)?;
         return Ok(0);
     }
@@ -221,7 +221,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = socket.inner();
+        let socket = unsafe { socket.inner_no_preempt() };
         return socket.write(buf, endpoint);
     }
 
@@ -244,7 +244,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = socket.inner();
+        let socket = unsafe { socket.inner_no_preempt() };
 
         let (n, endpoint) = socket.read(buf);
         drop(socket);
@@ -275,7 +275,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = socket.inner();
+        let socket = unsafe { socket.inner_no_preempt() };
 
         let mut buf = iovs.new_buf(true);
         // 从socket中读取数据

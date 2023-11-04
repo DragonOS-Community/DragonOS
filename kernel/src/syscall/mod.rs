@@ -424,6 +424,8 @@ pub const SYS_GET_DENTS_64: usize = 217;
 #[allow(dead_code)]
 pub const SYS_SET_TID_ADDR: usize = 218;
 
+pub const SYS_EXIT_GROUP: usize = 231;
+
 pub const SYS_UNLINK_AT: usize = 263;
 
 pub const SYS_PIPE: usize = 293;
@@ -1118,6 +1120,11 @@ impl Syscall {
 
             SYS_SIGALTSTACK => {
                 kwarn!("SYS_SIGALTSTACK has not yet been implemented");
+                Ok(0)
+            }
+
+            SYS_EXIT_GROUP => {
+                kwarn!("SYS_EXIT_GROUP has not yet been implemented");
                 Ok(0)
             }
 

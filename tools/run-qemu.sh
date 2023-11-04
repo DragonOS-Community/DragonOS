@@ -51,6 +51,8 @@ fi
 QEMU=qemu-system-x86_64
 QEMU_DISK_IMAGE="../bin/disk.img"
 QEMU_MEMORY="512M"
+QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
+QEMU_SHM_OBJECT="-object memory-backend-file,size=${QEMU_MEMORY},id=${QEMU_MEMORY_BACKEND},mem-path=/dev/sdh/${QEMU_MEMORY_BACKEND},share=on "
 QEMU_SMP="2,cores=2,threads=1,sockets=1"
 QEMU_MONITOR="stdio"
 QEMU_TRACE="${qemu_trace_std}"
@@ -58,16 +60,17 @@ QEMU_CPU_FEATURES="IvyBridge,apic,x2apic,+fpu,check,+vmx,${allflags}"
 QEMU_RTC_CLOCK="clock=host,base=localtime"
 QEMU_SERIAL="file:../serial_opt.txt"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
-
+QEMU_MACHINE="-machine accel=${qemu_accel} -machine q35,memory-backend=${QEMU_MEMORY_BACKEND} "
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
-# QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 "
-QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 " 
+# QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
+QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 # E1000E
-# QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 -machine accel=${qemu_accel} -machine q35 " 
+# QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d -monitor ${QEMU_MONITOR} -d ${qemu_trace_std} "
 
-QEMU_ARGUMENT+="-s -S -enable-kvm -cpu ${QEMU_CPU_FEATURES} -rtc ${QEMU_RTC_CLOCK} -serial ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES}"
+QEMU_ARGUMENT+="-s -S -enable-kvm ${QEMU_MACHINE} -cpu ${QEMU_CPU_FEATURES} -rtc ${QEMU_RTC_CLOCK} -serial ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES}"
+QEMU_ARGUMENT+="${QEMU_SHM_OBJECT}"
 
 if [ $flag_can_run -eq 1 ]; then
   while true;do

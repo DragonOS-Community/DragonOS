@@ -38,6 +38,7 @@ mod arch;
 mod libs;
 #[macro_use]
 mod include;
+mod debug;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
 mod filesystem;
@@ -69,6 +70,8 @@ extern crate thingbuf;
 extern crate intertrait;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
+
+extern crate klog_types;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 

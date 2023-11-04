@@ -1093,9 +1093,9 @@ impl KernelStack {
     }
 
     /// 清除内核栈的pcb指针
-    /// 
+    ///
     /// ## 参数
-    /// 
+    ///
     /// - `force` : 如果为true,那么，即使该内核栈的pcb指针不为null，也会被强制清除而不处理Weak指针问题
     pub unsafe fn clear_pcb(&mut self, force: bool) {
         let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;

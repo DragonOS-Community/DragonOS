@@ -296,13 +296,11 @@ impl File {
         // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
         unsafe {
             let ptr = &mut dirent.d_name as *mut u8;
-            if self.offset > 0 {
-                // 将上一次读取到的缓冲区清0,避免这一次的数据携带上一次的脏数据
-                core::ptr::write_bytes(ptr, 0, self.readdir_subdirs_name[self.offset - 1].len())
-            }
+
             let buf: &mut [u8] =
-                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len());
-            buf.copy_from_slice(name_bytes);
+                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len() + 1);
+            buf[0..name_bytes.len()].copy_from_slice(name_bytes);
+            buf[name_bytes.len()] = 0;
         }
 
         self.offset += 1;

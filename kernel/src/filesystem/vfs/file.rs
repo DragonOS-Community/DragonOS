@@ -269,15 +269,18 @@ impl File {
 
         // 如果偏移量为0
         if self.offset == 0 {
+            // 通过list更新readdir_subdirs_name
             self.readdir_subdirs_name = inode.list()?;
             self.readdir_subdirs_name.sort();
         }
         // kdebug!("sub_entries={sub_entries:?}");
-        if self.readdir_subdirs_name.is_empty() {
+
+        // 已经读到末尾
+        if self.offset == self.readdir_subdirs_name.len() {
             self.offset = 0;
             return Ok(0);
         }
-        let name: String = self.readdir_subdirs_name.remove(0);
+        let name = &self.readdir_subdirs_name[self.offset];
         let sub_inode: Arc<dyn IndexNode> = match inode.find(&name) {
             Ok(i) => i,
             Err(e) => {
@@ -290,16 +293,21 @@ impl File {
 
         let name_bytes: &[u8] = name.as_bytes();
 
-        self.offset += 1;
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
-        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
         // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
         unsafe {
             let ptr = &mut dirent.d_name as *mut u8;
+            if self.offset > 0 {
+                // 将上一次读取到的缓冲区清0,避免这一次的数据携带上一次的脏数据
+                core::ptr::write_bytes(ptr, 0, self.readdir_subdirs_name[self.offset - 1].len())
+            }
             let buf: &mut [u8] =
                 ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len());
             buf.copy_from_slice(name_bytes);
         }
+
+        self.offset += 1;
+        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
+        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
 
         // 计算dirent结构体的大小
         let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()

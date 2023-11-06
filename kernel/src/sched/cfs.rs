@@ -146,8 +146,18 @@ impl SchedulerCFS {
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[smp_get_processor_id() as usize];
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
+        let mut queue = None;
+        for _ in 0..10{
+            if let Ok(q) = current_cpu_queue.locked_queue.try_lock(){
+                queue = Some(q);
+                break;
+            }
+        }
+        if queue.is_none(){
+            return;
+        }
+        let queue = queue.unwrap();
         // 更新进程的剩余可执行时间
-        let queue = current_cpu_queue.locked_queue.lock();
         current_cpu_queue.cpu_exec_proc_jiffies -= 1;
         // 时间片耗尽，标记需要被调度
         if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {

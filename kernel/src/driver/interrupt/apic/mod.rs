@@ -213,7 +213,7 @@ impl LVT {
         }
         return DeliveryMode::try_from(((self.data >> 8) & 0b111) as u8).ok();
     }
-    
+
     /// Get the delivery status of the interrupt
     #[allow(dead_code)]
     pub fn delivery_status(&self) -> DeliveryStatus {
@@ -295,7 +295,7 @@ impl LVT {
     }
 
     /// Check if the interrupt is masked
-    /// 
+    ///
     /// true表示屏蔽中断，false表示不屏蔽中断
     #[allow(dead_code)]
     pub fn mask(&self) -> bool {

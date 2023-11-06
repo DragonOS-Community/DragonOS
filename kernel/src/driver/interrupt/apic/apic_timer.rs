@@ -3,12 +3,12 @@ use core::cell::RefCell;
 use crate::arch::driver::tsc::TSCManager;
 use crate::include::bindings::bindings::APIC_TIMER_IRQ_NUM;
 
+use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
 use crate::syscall::SystemError;
-use x86::cpuid::cpuid;
-use crate::mm::percpu::PerCpu;
 pub use drop;
+use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 
 use super::xapic::XApicOffset;

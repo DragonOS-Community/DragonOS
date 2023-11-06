@@ -21,131 +21,10 @@ extern void rs_apic_init_bsp();
 
 extern void rs_apic_local_apic_edge_ack(uint8_t irq_num);
 
-static bool flag_support_apic = false;
-static bool flag_support_x2apic = false;
-uint8_t __apic_enable_state = APIC_XAPIC_ENABLED;
-static uint local_apic_version;
-static uint local_apic_max_LVT_entries;
-
-static struct acpi_Multiple_APIC_Description_Table_t *madt;
-static struct acpi_IO_APIC_Structure_t *io_apic_ICS;
-
-static void __local_apic_xapic_init();
-static void __local_apic_x2apic_init();
-
 extern int rs_ioapic_install(uint8_t vector, uint8_t dest, bool level_triggered, bool active_high, bool dest_logical);
 extern void rs_ioapic_uninstall(uint8_t irq_num);
 extern void rs_ioapic_enable(uint8_t irq_num);
 extern void rs_ioapic_disable(uint8_t irq_num);
-
-static __always_inline void __send_eoi()
-{
-    if (CURRENT_APIC_STATE == APIC_X2APIC_ENABLED)
-    {
-        __asm__ __volatile__("movq	$0x00,	%%rdx	\n\t"
-                             "movq	$0x00,	%%rax	\n\t"
-                             "movq 	$0x80b,	%%rcx	\n\t"
-                             "wrmsr	\n\t" ::
-                                 : "memory");
-    }
-    else
-    {
-
-        io_mfence();
-        __write4b(APIC_LOCAL_APIC_VIRT_BASE_ADDR + LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
-        io_mfence();
-    }
-}
-
-uint64_t ioapic_get_base_paddr()
-{
-    ul madt_addr;
-    acpi_iter_SDT(acpi_get_MADT, &madt_addr);
-    madt = (struct acpi_Multiple_APIC_Description_Table_t *)madt_addr;
-
-    // kdebug("MADT->local intr controller addr=%#018lx", madt->Local_Interrupt_Controller_Address);
-    // kdebug("MADT->length= %d bytes", madt->header.Length);
-    //  寻找io apic的ICS
-    void *ent = (void *)(madt_addr) + sizeof(struct acpi_Multiple_APIC_Description_Table_t);
-    struct apic_Interrupt_Controller_Structure_header_t *header =
-        (struct apic_Interrupt_Controller_Structure_header_t *)ent;
-    while (header->length > 2)
-    {
-        header = (struct apic_Interrupt_Controller_Structure_header_t *)ent;
-        if (header->type == 1)
-        {
-            struct acpi_IO_APIC_Structure_t *t = (struct acpi_IO_APIC_Structure_t *)ent;
-            // kdebug("IO apic addr = %#018lx", t->IO_APIC_Address);
-            io_apic_ICS = t;
-            break;
-        }
-
-        ent += header->length;
-    }
-    // kdebug("Global_System_Interrupt_Base=%d", io_apic_ICS->Global_System_Interrupt_Base);
-
-    return io_apic_ICS->IO_APIC_Address;
-}
-
-/**
- * @brief 当前使用x2apic来初始化local apic
- *
- */
-static void __local_apic_x2apic_init()
-{
-    __apic_enable_state = APIC_X2APIC_ENABLED;
-    uint32_t eax, edx;
-    __asm__ __volatile__("movq $0x80f, %%rcx    \n\t"
-                         "rdmsr  \n\t"
-                         "bts $8, %%rax  \n\t"
-                         //                         "bts $12, %%rax \n\t"
-                         "movq $0x80f, %%rcx    \n\t"
-                         "wrmsr  \n\t"
-                         "movq $0x80f , %%rcx   \n\t"
-                         "rdmsr \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-    if (eax & 0x100)
-        kinfo("APIC Software Enabled.");
-    if (eax & 0x1000)
-        kinfo("EOI-Broadcast Suppression Enabled.");
-
-    // 获取Local APIC Version
-    // 0x803处是 Local APIC Version register
-    __asm__ __volatile__("movq $0x803, %%rcx    \n\t"
-                         "rdmsr  \n\t"
-                         : "=a"(eax), "=d"(edx)::"memory");
-
-    local_apic_max_LVT_entries = ((eax >> 16) & 0xff) + 1;
-    local_apic_version = eax & 0xff;
-
-    kdebug("local APIC Version:%#010x,Max LVT Entry:%#010x,SVR(Suppress EOI Broadcast):%#04x\t", local_apic_version,
-           local_apic_max_LVT_entries, (eax >> 24) & 0x1);
-
-    if ((eax & 0xff) < 0x10)
-        kdebug("82489DX discrete APIC");
-    else if (((eax & 0xff) >= 0x10) && ((eax & 0xff) <= 0x15))
-        kdebug("Integrated APIC.");
-
-    // 由于尚未配置LVT对应的处理程序，因此先屏蔽所有的LVT
-    __asm__ __volatile__(             // "movq 	$0x82f,	%%rcx	\n\t" // CMCI
-                                      // "wrmsr	\n\t"
-        "movq 	$0x832,	%%rcx	\n\t" // Timer
-        "wrmsr	\n\t"
-        "movq 	$0x833,	%%rcx	\n\t" // Thermal Monitor
-        "wrmsr	\n\t"
-        "movq 	$0x834,	%%rcx	\n\t" // Performance Counter
-        "wrmsr	\n\t"
-        "movq 	$0x835,	%%rcx	\n\t" // LINT0
-        "wrmsr	\n\t"
-        "movq 	$0x836,	%%rcx	\n\t" // LINT1
-        "wrmsr	\n\t"
-        "movq 	$0x837,	%%rcx	\n\t" // Error
-        "wrmsr	\n\t"
-        :
-        : "a"(0x10000), "d"(0x00)
-        : "memory");
-    kdebug("All LVT Masked");
-}
 
 /**
  * @brief 初始化apic控制器
@@ -163,21 +42,7 @@ int apic_init()
     for (int i = 150; i < 160; ++i)
         set_intr_gate(i, 0, local_apic_interrupt_table[i - 150]);
 
-    //  屏蔽类8259A芯片
-    io_out8(0x21, 0xff);
-
-    io_out8(0xa1, 0xff);
-
-    // 写入8259A pic的EOI位
-    io_out8(0x20, 0x20);
-    io_out8(0xa0, 0x20);
-
-    kdebug("8259A Masked.");
-
-    // enable IMCR
-    io_out8(0x22, 0x70);
-    io_out8(0x23, 0x01);
-
+    // 初始化BSP的APIC
     rs_apic_init_bsp();
 
     kinfo("APIC initialized.");
@@ -203,10 +68,11 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         else
             kwarn("Intr vector [%d] does not have a handler!");
         // 向中断控制器发送应答消息
-        if (irq->controller != NULL && irq->controller->ack != NULL)
-            irq->controller->ack(number);
-        else
-            rs_apic_local_apic_edge_ack(number);
+        // if (irq->controller != NULL && irq->controller->ack != NULL)
+        //     irq->controller->ack(number);
+        // else
+        //     rs_apic_local_apic_edge_ack(number);
+        rs_apic_local_apic_edge_ack(number);
     }
     else if (number >= 200)
     {
@@ -228,10 +94,11 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         else
             kwarn("Intr vector [%d] does not have a handler!");
         // 向中断控制器发送应答消息
-        if (irq->controller != NULL && irq->controller->ack != NULL)
-            irq->controller->ack(number);
-        else
-            rs_apic_local_apic_edge_ack(number);
+        // if (irq->controller != NULL && irq->controller->ack != NULL)
+        //     irq->controller->ack(number);
+        // else
+        //     rs_apic_local_apic_edge_ack(number);
+        rs_apic_local_apic_edge_ack(number);
     }
     else
     {
@@ -286,21 +153,12 @@ ul apic_ioapic_install(ul irq_num, void *arg)
         dest = entry->destination.physical.phy_dest;
     }
 
-    kdebug("vector=%d,dest=%d,trigger=%d,polarity=%d,dest_mode=%d", entry->vector, dest, entry->trigger_mode,
-           entry->polarity, entry->dest_mode);
-           
     return rs_ioapic_install(entry->vector, dest, entry->trigger_mode, entry->polarity, entry->dest_mode);
 }
 
 void apic_ioapic_uninstall(ul irq_num)
 {
     rs_ioapic_uninstall(irq_num);
-}
-
-void apic_ioapic_level_ack(ul irq_num) // 电平触发
-{
-    __send_eoi();
-    *apic_ioapic_map.virtual_EOI_addr = irq_num;
 }
 
 void apic_ioapic_edge_ack(ul irq_num) // 边沿触发
@@ -362,6 +220,5 @@ void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, u
         entry->destination.logical.reserved1 = 0;
     }
 }
-
 
 #pragma GCC pop_options

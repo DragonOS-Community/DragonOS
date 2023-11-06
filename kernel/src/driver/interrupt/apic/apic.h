@@ -8,12 +8,6 @@
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 
-#define APIC_SUCCESS 0
-#define APIC_E_NOTFOUND 1
-
-#define APIC_IO_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + IO_APIC_MAPPING_OFFSET
-#define APIC_LOCAL_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + LOCAL_APIC_MAPPING_OFFSET
-
 // 当前apic启用状态标志
 extern uint8_t __apic_enable_state;
 #define APIC_XAPIC_ENABLED 0
@@ -243,18 +237,6 @@ struct apic_IO_APIC_RTE_entry
 #define POLARITY_HIGH 0
 #define POLARITY_LOW 1
 
-struct apic_IO_APIC_map
-{
-    // 间接访问寄存器的物理基地址
-    uint addr_phys;
-    // 索引寄存器虚拟地址
-    unsigned char *virtual_index_addr;
-    // 数据寄存器虚拟地址
-    uint *virtual_data_addr;
-    // EOI寄存器虚拟地址
-    uint *virtual_EOI_addr;
-} apic_ioapic_map;
-
 /**
  * @brief 中断服务程序
  *
@@ -275,7 +257,6 @@ void apic_ioapic_enable(ul irq_num);
 void apic_ioapic_disable(ul irq_num);
 ul apic_ioapic_install(ul irq_num, void *arg);
 void apic_ioapic_uninstall(ul irq_num);
-void apic_ioapic_level_ack(ul irq_num); // ioapic电平触发 应答
 void apic_ioapic_edge_ack(ul irq_num);  // ioapic边沿触发 应答
 
 // void apic_local_apic_level_ack(ul irq_num);// local apic电平触发 应答

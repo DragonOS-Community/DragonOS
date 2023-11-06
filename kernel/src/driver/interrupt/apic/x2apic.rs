@@ -104,27 +104,22 @@ impl LocalAPIC for X2Apic {
         let cpuid = raw_cpuid::CpuId::new();
         // cpuid.get_performance_monitoring_info();
         self.set_lvt(LVT::new(LVTRegister::Timer, LVT::MASKED).unwrap());
-        kdebug!("x2apic: timer masked");
+
         if cpuid.get_thermal_power_info().is_some() {
             self.set_lvt(LVT::new(LVTRegister::Thermal, LVT::MASKED).unwrap());
         }
-        kdebug!("x2apic: thermal masked");
+
         if cpuid.get_performance_monitoring_info().is_some() {
             self.set_lvt(LVT::new(LVTRegister::PerformanceMonitor, LVT::MASKED).unwrap());
         }
 
-        kdebug!("x2apic: performance monitor masked");
-
         self.set_lvt(LVT::new(LVTRegister::LINT0, LVT::MASKED).unwrap());
         self.set_lvt(LVT::new(LVTRegister::LINT1, LVT::MASKED).unwrap());
 
-        kdebug!("x2apic: lint masked");
         self.set_lvt(LVT::new(LVTRegister::ErrorReg, LVT::MASKED).unwrap());
-
-        kdebug!("x2apic: error masked");
     }
 
-    fn write_icr(&self, icr: x86::apic::Icr) {
+    fn write_icr(&mut self, icr: x86::apic::Icr) {
         unsafe { wrmsr(0x830, ((icr.upper() as u64) << 32) | icr.lower() as u64) };
     }
 }

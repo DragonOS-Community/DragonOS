@@ -100,6 +100,7 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     if ProcessManager::current_pcb().preempt_count() != 0 {
         return None;
     }
+
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let cfs_scheduler: &mut SchedulerCFS = __get_cfs_scheduler();
     let rt_scheduler: &mut SchedulerRT = __get_rt_scheduler();
@@ -171,8 +172,6 @@ pub extern "C" fn sched_init() {
 
 /// @brief 当时钟中断到达时，更新时间片
 /// 请注意，该函数只能被时钟中断处理程序调用
-#[allow(dead_code)]
-#[no_mangle]
 pub extern "C" fn sched_update_jiffies() {
     let policy = ProcessManager::current_pcb().sched_info().policy();
     match policy {

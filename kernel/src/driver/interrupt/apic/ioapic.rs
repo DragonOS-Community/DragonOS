@@ -1,16 +1,13 @@
 use core::ptr::NonNull;
 
+use acpi::madt::Madt;
 use bit_field::BitField;
 use bitflags::bitflags;
 
 use crate::{
-    include::bindings::bindings::ioapic_get_base_paddr,
+    driver::acpi::acpi_manager,
     kdebug, kinfo,
-    libs::{
-        once::Once,
-        spinlock::SpinLock,
-        volatile::{Volatile, VolatileWritable},
-    },
+    libs::{once::Once, spinlock::SpinLock, volatile::Volatile},
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard, MmioBuddyMemPool},
         PhysAddr, VirtAddr,
@@ -52,7 +49,35 @@ impl IoApic {
         let mut result: Option<IoApic> = None;
         INIT_STATE.call_once(|| {
             kinfo!("Initializing ioapic...");
-            let phys_base = PhysAddr::new(unsafe { ioapic_get_base_paddr() } as usize);
+
+            // get ioapic base from acpi
+
+            let madt = acpi_manager()
+                .tables()
+                .unwrap()
+                .find_table::<Madt>()
+                .expect("IoApic::new(): failed to find MADT");
+
+            let io_apic_paddr = madt
+                .entries()
+                .find(|x| {
+                    if let acpi::madt::MadtEntry::IoApic(x) = x {
+                        return true;
+                    }
+                    return false;
+                })
+                .map(|x| {
+                    if let acpi::madt::MadtEntry::IoApic(x) = x {
+                        Some(x.io_apic_address)
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+                .unwrap();
+
+            let phys_base = PhysAddr::new(io_apic_paddr as usize);
+
             let mmio_guard = mmio_pool()
                 .create_mmio(0x1000)
                 .expect("IoApic::new(): failed to create mmio");
@@ -70,13 +95,13 @@ impl IoApic {
                 phys_base,
                 mmio_guard,
             });
-            kdebug!("to mask all RTE");
+            kdebug!("IOAPIC: to mask all RTE");
             // 屏蔽所有的RTE
             let res_mut = result.as_mut().unwrap();
             for i in 0..res_mut.supported_interrupts() {
                 res_mut.write_rte(i, 0x20 + i, RedirectionEntry::DISABLED, 0);
             }
-            kdebug!("Ioapic init ok");
+            kdebug!("Ioapic init done");
         });
 
         assert!(

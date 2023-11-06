@@ -29,7 +29,7 @@ export ASFLAGS := --64
 LD_LIST := head.o
 
 
-kernel_subdirs := common driver debug arch exception smp sched syscall ktest libs time
+kernel_subdirs := common driver debug arch exception smp syscall ktest libs time
 
 
 head.o: head.S

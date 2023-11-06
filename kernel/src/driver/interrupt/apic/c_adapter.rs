@@ -1,6 +1,6 @@
 use super::{
+    apic_timer::{LocalApicTimer, LocalApicTimerIntrController},
     ioapic::{ioapic_disable, ioapic_enable, ioapic_install, ioapic_uninstall},
-    new_timer::LocalApicTimerIntrController,
     CurrentApic, LocalAPIC,
 };
 
@@ -10,17 +10,17 @@ unsafe extern "C" fn rs_apic_timer_install(irq_num: u8) {
 }
 
 #[no_mangle]
-unsafe extern "C" fn rs_apic_timer_uninstall(irq_num: u8) {
+unsafe extern "C" fn rs_apic_timer_uninstall(_irq_num: u8) {
     LocalApicTimerIntrController.uninstall();
 }
 
 #[no_mangle]
-unsafe extern "C" fn rs_apic_timer_enable(irq_num: u8) {
+unsafe extern "C" fn rs_apic_timer_enable(_irq_num: u8) {
     LocalApicTimerIntrController.enable();
 }
 
 #[no_mangle]
-unsafe extern "C" fn rs_apic_timer_disable(irq_num: u8) {
+unsafe extern "C" fn rs_apic_timer_disable(_irq_num: u8) {
     LocalApicTimerIntrController.disable();
 }
 
@@ -74,4 +74,11 @@ unsafe extern "C" fn rs_ioapic_enable(vector: u8) {
 #[no_mangle]
 unsafe extern "C" fn rs_ioapic_disable(vector: u8) {
     ioapic_disable(vector);
+}
+
+#[no_mangle]
+unsafe extern "C" fn rs_apic_timer_handle_irq(_irq_num: u8) -> i32 {
+    return LocalApicTimer::handle_irq()
+        .map(|_| 0)
+        .unwrap_or_else(|e| e.to_posix_errno());
 }

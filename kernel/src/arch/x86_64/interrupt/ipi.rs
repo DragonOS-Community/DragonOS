@@ -1,8 +1,10 @@
 use x86::apic::ApicId;
 
 use crate::{
+    arch::smp::SMP_BOOT_DATA,
     driver::interrupt::apic::{CurrentApic, LocalAPIC},
     exception::ipi::{IpiKind, IpiTarget},
+    syscall::SystemError,
 };
 
 /// IPI的种类(架构相关，指定了向量号)
@@ -128,4 +130,73 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     };
 
     CurrentApic.write_icr(icr);
+}
+
+/// 发送smp初始化IPI
+pub fn ipi_send_smp_init() -> Result<(), SystemError> {
+    let target = ArchIpiTarget::Other;
+    let icr = if CurrentApic.x2apic_enabled() {
+        x86::apic::Icr::for_x2apic(
+            0,
+            target.into(),
+            x86::apic::DestinationShorthand::AllExcludingSelf,
+            x86::apic::DeliveryMode::Init,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Deassert,
+            x86::apic::TriggerMode::Edge,
+        )
+    } else {
+        x86::apic::Icr::for_xapic(
+            0,
+            target.into(),
+            x86::apic::DestinationShorthand::AllExcludingSelf,
+            x86::apic::DeliveryMode::Init,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Deassert,
+            x86::apic::TriggerMode::Edge,
+        )
+    };
+    CurrentApic.write_icr(icr);
+    return Ok(());
+}
+
+/// 发送smp启动IPI
+///
+/// ## 参数
+///
+/// * `target_cpu` - 目标CPU
+pub fn ipi_send_smp_startup(target_cpu: u32) -> Result<(), SystemError> {
+    if target_cpu as usize >= SMP_BOOT_DATA.cpu_count() {
+        return Err(SystemError::EINVAL);
+    }
+    let target: ArchIpiTarget = IpiTarget::Specified(target_cpu as usize).into();
+
+    let icr = if CurrentApic.x2apic_enabled() {
+        x86::apic::Icr::for_x2apic(
+            0x20,
+            target.into(),
+            x86::apic::DestinationShorthand::NoShorthand,
+            x86::apic::DeliveryMode::StartUp,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Deassert,
+            x86::apic::TriggerMode::Edge,
+        )
+    } else {
+        x86::apic::Icr::for_xapic(
+            0x20,
+            target.into(),
+            x86::apic::DestinationShorthand::NoShorthand,
+            x86::apic::DeliveryMode::StartUp,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Deassert,
+            x86::apic::TriggerMode::Edge,
+        )
+    };
+
+    CurrentApic.write_icr(icr);
+    return Ok(());
 }

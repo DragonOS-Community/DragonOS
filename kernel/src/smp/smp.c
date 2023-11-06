@@ -23,6 +23,8 @@ int num_cpu_started = 1;
 
 extern void smp_ap_start();
 extern uint64_t rs_get_idle_stack_top(uint32_t cpu_id);
+extern int rs_ipi_send_smp_startup(uint32_t apic_id);
+extern void rs_ipi_send_smp_init();
 
 // 在head.S中定义的，APU启动时，要加载的页表
 // 由于内存管理模块初始化的时候，重置了页表，因此我们要把当前的页表传给APU
@@ -63,7 +65,7 @@ void smp_init()
     io_mfence();
 
     io_mfence();
-    ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x00, ICR_INIT, ICR_ALL_EXCLUDE_Self, 0x00);
+    rs_ipi_send_smp_init();
 
     kdebug("total_processor_num=%d", total_processor_num);
     // 注册接收kick_cpu功能的处理函数。（向量号200）
@@ -88,30 +90,31 @@ void smp_init()
         if (__cpu_info[i].can_boot == false)
         {
             // --total_processor_num;
-            kdebug("processor %d cannot be enabled.",  __cpu_info[i].core_id);
+            kdebug("processor %d cannot be enabled.", __cpu_info[i].core_id);
             continue;
         }
         ++core_to_start;
         // continue;
         io_mfence();
-        spin_lock(&multi_core_starting_lock);
-        rs_preempt_enable(); // 由于ap处理器的pcb与bsp的不同，因此ap处理器放锁时，bsp的自旋锁持有计数不会发生改变,需要手动恢复preempt
-                             // count
-        current_starting_cpu =  __cpu_info[i].core_id;
+        spin_lock_no_preempt(&multi_core_starting_lock);
+        current_starting_cpu = __cpu_info[i].apic_id;
         io_mfence();
         // 为每个AP处理器分配栈空间
         cpu_core_info[current_starting_cpu].stack_start = (uint64_t)rs_get_idle_stack_top(current_starting_cpu);
 
         io_mfence();
 
-        // kdebug("core %d, to send start up", current_starting_cpu);
+        kdebug("core %d, to send start up", __cpu_info[i].apic_id);
         // 连续发送两次start-up IPI
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
-                      __cpu_info[i].apic_id);
+
+        int r = rs_ipi_send_smp_startup(__cpu_info[i].apic_id);
+        if(r){
+            kerror("Failed to send startup ipi to cpu: %d", __cpu_info[i].apic_id);
+        }
         io_mfence();
-        ipi_send_IPI(DEST_PHYSICAL, IDLE, ICR_LEVEL_DE_ASSERT, EDGE_TRIGGER, 0x20, ICR_Start_up, ICR_No_Shorthand,
-                      __cpu_info[i].apic_id);
-        // kdebug("core %d, send start up ok", current_starting_cpu);
+        rs_ipi_send_smp_startup(__cpu_info[i].apic_id);
+
+        io_mfence();
     }
     io_mfence();
     while (num_cpu_started != (core_to_start + 1))
@@ -136,7 +139,7 @@ void smp_ap_start_stage2()
     io_mfence();
     ++num_cpu_started;
     io_mfence();
-    
+
     rs_apic_init_ap();
 
     // ============ 为ap处理器初始化IDLE进程 =============

@@ -1,26 +1,27 @@
 use core::sync::atomic::Ordering;
 
 use atomic_enum::atomic_enum;
-use x86::apic::Icr;
+use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
 use crate::{
-    arch::interrupt::TrapFrame,
-    driver::interrupt::apic::{ioapic::ioapic_init, x2apic::X2Apic, xapic::XApic},
+    arch::{interrupt::TrapFrame, io::PortIOArch, CurrentPortIOArch},
+    driver::interrupt::apic::{
+        ioapic::ioapic_init,
+        x2apic::X2Apic,
+        xapic::{current_xapic_instance, XApic},
+    },
     kdebug, kinfo,
     libs::once::Once,
+    mm::PhysAddr,
     smp::core::smp_get_processor_id,
     syscall::SystemError,
 };
 
-use self::{
-    apic_timer::ApicTimerMode,
-    xapic::{xapic_instances_mut, XApicOffset},
-};
+use self::{apic_timer::LocalApicTimerMode, xapic::XApicOffset};
 
 pub mod apic_timer;
 mod c_adapter;
 pub mod ioapic;
-pub mod new_timer;
 pub mod x2apic;
 pub mod xapic;
 
@@ -75,7 +76,7 @@ pub trait LocalAPIC {
     fn mask_all_lvt(&mut self);
 
     /// 写入ICR寄存器
-    fn write_icr(&self, icr: Icr);
+    fn write_icr(&mut self, icr: Icr);
 }
 
 /// @brief 所有LVT寄存器的枚举类型
@@ -156,7 +157,7 @@ impl LVT {
 
         if let LVTRegister::Timer = result.register {
             result
-                .set_timer_mode(ApicTimerMode::try_from(((data >> 17) & 0b11) as u8).ok()?)
+                .set_timer_mode(LocalApicTimerMode::try_from(((data >> 17) & 0b11) as u8).ok()?)
                 .ok()?;
         }
 
@@ -291,18 +292,18 @@ impl LVT {
     }
 
     /// 设置定时器模式
-    pub fn set_timer_mode(&mut self, mode: ApicTimerMode) -> Result<(), SystemError> {
+    pub fn set_timer_mode(&mut self, mode: LocalApicTimerMode) -> Result<(), SystemError> {
         match self.register {
             LVTRegister::Timer => {
                 self.data &= 0xFFF9_FFFF;
                 match mode {
-                    ApicTimerMode::OneShot => {
+                    LocalApicTimerMode::Oneshot => {
                         self.data |= 0b00 << 17;
                     }
-                    ApicTimerMode::Periodic => {
+                    LocalApicTimerMode::Periodic => {
                         self.data |= 0b01 << 17;
                     }
-                    ApicTimerMode::TSCDeadline => {
+                    LocalApicTimerMode::Deadline => {
                         self.data |= 0b10 << 17;
                     }
                 }
@@ -314,18 +315,18 @@ impl LVT {
         }
     }
 
-    pub fn timer_mode(&self) -> Option<ApicTimerMode> {
+    pub fn timer_mode(&self) -> Option<LocalApicTimerMode> {
         if let LVTRegister::Timer = self.register {
             let mode = (self.data >> 17) & 0b11;
             match mode {
                 0b00 => {
-                    return Some(ApicTimerMode::OneShot);
+                    return Some(LocalApicTimerMode::Oneshot);
                 }
                 0b01 => {
-                    return Some(ApicTimerMode::Periodic);
+                    return Some(LocalApicTimerMode::Periodic);
                 }
                 0b10 => {
-                    return Some(ApicTimerMode::TSCDeadline);
+                    return Some(LocalApicTimerMode::Deadline);
                 }
                 _ => {
                     return None;
@@ -436,13 +437,25 @@ impl CurrentApic {
     }
 
     pub(self) unsafe fn write_xapic_register(&self, reg: XApicOffset, value: u32) {
-        xapic_instances_mut()
-            .get_mut()
-            .borrow_mut()
-            .as_mut()
-            .map(|xapic| {
-                xapic.write(reg, value);
-            });
+        current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+            xapic.write(reg, value);
+        });
+    }
+
+    /// 屏蔽类8259A芯片
+    unsafe fn mask8259a(&self) {
+        CurrentPortIOArch::out8(0x21, 0xff);
+        CurrentPortIOArch::out8(0xa1, 0xff);
+
+        // 写入8259A pic的EOI位
+        CurrentPortIOArch::out8(0x20, 0x20);
+        CurrentPortIOArch::out8(0xa0, 0x20);
+
+        kdebug!("8259A Masked.");
+
+        // enable IMCR
+        CurrentPortIOArch::out8(0x22, 0x70);
+        CurrentPortIOArch::out8(0x23, 0x01);
     }
 }
 
@@ -453,16 +466,40 @@ impl LocalAPIC for CurrentApic {
 
     fn init_current_cpu(&mut self) -> bool {
         let cpu_id = smp_get_processor_id();
+        if cpu_id == 0 {
+            unsafe {
+                self.mask8259a();
+            }
+        }
+        kinfo!("Initializing apic for cpu {}", cpu_id);
+        kdebug!("X2Apic::support()={}", X2Apic::support());
+        kdebug!("XApic::support()={}", XApic::support());
         if X2Apic::support() && X2Apic.init_current_cpu() {
             if cpu_id == 0 {
                 LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::X2Apic, Ordering::SeqCst);
             }
             kinfo!("x2APIC initialized for cpu {}", cpu_id);
         } else {
-            todo!("init xApic for core {}", smp_get_processor_id());
+            kinfo!("x2APIC not supported or failed to initialize, fallback to xAPIC.");
             if cpu_id == 0 {
                 LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::XApic, Ordering::SeqCst);
             }
+            let apic_base =
+                PhysAddr::new(unsafe { x86::msr::rdmsr(IA32_APIC_BASE) as usize & 0xFFFF_0000 });
+            let xapic_instance = unsafe { XApic::new(apic_base) };
+
+            let mut cur = current_xapic_instance().borrow_mut();
+            if cur.is_none() {
+                *cur = Some(xapic_instance);
+            } else {
+                panic!("xapic instance already initialized.");
+            }
+
+            if let Some(xapic) = cur.as_mut() {
+                xapic.init_current_cpu();
+            }
+
+            kinfo!("xAPIC initialized for cpu {}", cpu_id);
         }
         if cpu_id == 0 {
             ioapic_init();
@@ -475,13 +512,9 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.send_eoi();
         } else {
-            xapic_instances_mut()
-                .get_mut()
-                .borrow_mut()
-                .as_mut()
-                .map(|xapic| {
-                    xapic.send_eoi();
-                });
+            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+                xapic.send_eoi();
+            });
         }
     }
 
@@ -489,8 +522,7 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             return X2Apic.version();
         } else {
-            return xapic_instances_mut()
-                .get()
+            return current_xapic_instance()
                 .borrow()
                 .as_ref()
                 .map(|xapic| xapic.version())
@@ -502,8 +534,7 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             return X2Apic.support_eoi_broadcast_suppression();
         } else {
-            return xapic_instances_mut()
-                .get()
+            return current_xapic_instance()
                 .borrow()
                 .as_ref()
                 .map(|xapic| xapic.support_eoi_broadcast_suppression())
@@ -515,8 +546,7 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             return X2Apic.max_lvt_entry();
         } else {
-            return xapic_instances_mut()
-                .get()
+            return current_xapic_instance()
                 .borrow()
                 .as_ref()
                 .map(|xapic| xapic.max_lvt_entry())
@@ -528,8 +558,7 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             return X2Apic.id();
         } else {
-            return xapic_instances_mut()
-                .get()
+            return current_xapic_instance()
                 .borrow()
                 .as_ref()
                 .map(|xapic| xapic.id())
@@ -541,13 +570,9 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.set_lvt(lvt);
         } else {
-            xapic_instances_mut()
-                .get_mut()
-                .borrow_mut()
-                .as_mut()
-                .map(|xapic| {
-                    xapic.set_lvt(lvt);
-                });
+            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+                xapic.set_lvt(lvt);
+            });
         }
     }
 
@@ -555,15 +580,11 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             return X2Apic.read_lvt(reg);
         } else {
-            return xapic_instances_mut()
-                .get()
+            return current_xapic_instance()
                 .borrow()
                 .as_ref()
                 .map(|xapic| xapic.read_lvt(reg))
-                .unwrap_or(LVT {
-                    register: reg,
-                    data: 0,
-                });
+                .expect("xapic instance not initialized.");
         }
     }
 
@@ -571,27 +592,19 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.mask_all_lvt();
         } else {
-            xapic_instances_mut()
-                .get_mut()
-                .borrow_mut()
-                .as_mut()
-                .map(|xapic| {
-                    xapic.mask_all_lvt();
-                });
+            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+                xapic.mask_all_lvt();
+            });
         }
     }
 
-    fn write_icr(&self, icr: Icr) {
+    fn write_icr(&mut self, icr: Icr) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.write_icr(icr);
         } else {
-            xapic_instances_mut()
-                .get_mut()
-                .borrow_mut()
-                .as_mut()
-                .map(|xapic| {
-                    xapic.write_icr(icr);
-                });
+            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+                xapic.write_icr(icr);
+            });
         }
     }
 }

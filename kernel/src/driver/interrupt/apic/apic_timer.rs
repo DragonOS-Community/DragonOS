@@ -2,18 +2,14 @@ use core::cell::RefCell;
 
 use crate::arch::driver::tsc::TSCManager;
 use crate::include::bindings::bindings::APIC_TIMER_IRQ_NUM;
-use crate::mm::percpu::PerCpuVar;
+
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
 use crate::syscall::SystemError;
-use x86::{cpuid::cpuid, time::rdtsc};
-// use x86::cpuid::CpuId
-use crate::driver::interrupt::apic::xapic::XApic;
-use crate::exception::InterruptArch;
-use crate::kerror;
-use crate::{arch::CurrentIrqArch, mm::percpu::PerCpu};
+use x86::cpuid::cpuid;
+use crate::mm::percpu::PerCpu;
 pub use drop;
-use x86::msr::{rdmsr, wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
+use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 
 use super::xapic::XApicOffset;
 use super::{CurrentApic, LVTRegister, LocalAPIC, LVT};
@@ -64,7 +60,7 @@ fn init_ap_apic_timer() {
 pub(super) struct LocalApicTimerIntrController;
 
 impl LocalApicTimerIntrController {
-    pub(super) fn install(&self, irq_num: u8) {
+    pub(super) fn install(&self, _irq_num: u8) {
         kdebug!("LocalApicTimerIntrController::install");
         if smp_get_processor_id() == 0 {
             init_bsp_apic_timer();
@@ -196,6 +192,7 @@ impl LocalApicTimer {
     ///
     /// 此函数调用cpuid，请避免多次调用此函数。
     /// 如果支持TSC-Deadline模式，则除非TSC为常数，否则不会启用该模式。
+    #[allow(dead_code)]
     pub fn is_deadline_mode_supported(&self) -> bool {
         let res = cpuid!(1);
         return (res.ecx & (1 << 24)) != 0;

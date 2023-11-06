@@ -4,13 +4,10 @@ use core::{
     ptr::{read_volatile, write_volatile},
 };
 
-use alloc::vec::Vec;
-
 use crate::{
-    libs::once::Once,
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
-        percpu::{PerCpu, PerCpuVar},
+        percpu::PerCpu,
         PhysAddr, VirtAddr,
     },
     smp::core::smp_get_processor_id,
@@ -176,9 +173,13 @@ impl XApic {
     }
 }
 
+#[allow(dead_code)]
 const X1: u32 = 0x0000000B; // 将除数设置为1，即不除频率
+#[allow(dead_code)]
 const PERIODIC: u32 = 0x00020000; // 周期性模式
+#[allow(dead_code)]
 const ENABLE: u32 = 0x00000100; // 单元使能
+#[allow(dead_code)]
 const MASKED: u32 = 0x00010000; // 中断屏蔽
 const LEVEL: u32 = 0x00008000; // 电平触发
 const BCAST: u32 = 0x00080000; // 发送到所有APIC，包括自己
@@ -186,12 +187,19 @@ const DELIVS: u32 = 0x00001000; // 传递状态
 const INIT: u32 = 0x00000500; // INIT/RESET
 
 //中断请求
+#[allow(dead_code)]
 const T_IRQ0: u32 = 32; // IRQ 0 对应于 T_IRQ 中断
+#[allow(dead_code)]
 const IRQ_TIMER: u32 = 0;
+#[allow(dead_code)]
 const IRQ_KBD: u32 = 1;
+#[allow(dead_code)]
 const IRQ_COM1: u32 = 4;
+#[allow(dead_code)]
 const IRQ_IDE: u32 = 14;
+#[allow(dead_code)]
 const IRQ_ERROR: u32 = 19;
+#[allow(dead_code)]
 const IRQ_SPURIOUS: u32 = 31;
 
 impl LocalAPIC for XApic {

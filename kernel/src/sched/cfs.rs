@@ -147,13 +147,13 @@ impl SchedulerCFS {
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
         let mut queue = None;
-        for _ in 0..10{
-            if let Ok(q) = current_cpu_queue.locked_queue.try_lock(){
+        for _ in 0..10 {
+            if let Ok(q) = current_cpu_queue.locked_queue.try_lock() {
                 queue = Some(q);
                 break;
             }
         }
-        if queue.is_none(){
+        if queue.is_none() {
             return;
         }
         let queue = queue.unwrap();

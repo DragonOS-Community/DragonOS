@@ -4,14 +4,13 @@ use atomic_enum::atomic_enum;
 use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
 use crate::{
-    arch::{interrupt::TrapFrame, io::PortIOArch, CurrentPortIOArch},
+    arch::{io::PortIOArch, CurrentPortIOArch},
     driver::interrupt::apic::{
         ioapic::ioapic_init,
         x2apic::X2Apic,
         xapic::{current_xapic_instance, XApic},
     },
     kdebug, kinfo,
-    libs::once::Once,
     mm::PhysAddr,
     smp::core::smp_get_processor_id,
     syscall::SystemError,
@@ -164,6 +163,8 @@ impl LVT {
         return Some(result);
     }
 
+    /// 获取LVT寄存器的原始值
+    #[allow(dead_code)]
     pub fn data(&self) -> u32 {
         return self.data;
     }
@@ -177,6 +178,8 @@ impl LVT {
         self.data |= vector as u32;
     }
 
+    /// 获取中断向量号
+    #[allow(dead_code)]
     pub fn vector(&self) -> u8 {
         return (self.data & 0xFF) as u8;
     }
@@ -203,13 +206,16 @@ impl LVT {
 
     /// 获取中断投递模式
     /// Timer、ErrorReg寄存器不支持这个功能
+    #[allow(dead_code)]
     pub fn delivery_mode(&self) -> Option<DeliveryMode> {
         if let LVTRegister::Timer | LVTRegister::ErrorReg = self.register {
             return None;
         }
         return DeliveryMode::try_from(((self.data >> 8) & 0b111) as u8).ok();
     }
-
+    
+    /// Get the delivery status of the interrupt
+    #[allow(dead_code)]
     pub fn delivery_status(&self) -> DeliveryStatus {
         return DeliveryStatus::from(self.data);
     }
@@ -230,6 +236,7 @@ impl LVT {
     /// 获取中断输入引脚的极性
     ///
     /// true表示高电平有效，false表示低电平有效
+    #[allow(dead_code)]
     pub fn interrupt_input_pin_polarity(&self) -> bool {
         return (self.data & (1 << 13)) == 0;
     }
@@ -259,6 +266,7 @@ impl LVT {
     /// 获取中断输入引脚的触发模式
     ///
     /// 只有LINT0和LINT1寄存器支持这个功能
+    #[allow(dead_code)]
     pub fn trigger_mode(&self) -> Option<TriggerMode> {
         match self.register {
             LVTRegister::LINT0 | LVTRegister::LINT1 => {
@@ -286,7 +294,10 @@ impl LVT {
         }
     }
 
-    /// 获取是否屏蔽中断
+    /// Check if the interrupt is masked
+    /// 
+    /// true表示屏蔽中断，false表示不屏蔽中断
+    #[allow(dead_code)]
     pub fn mask(&self) -> bool {
         return (self.data & (1 << 16)) != 0;
     }
@@ -315,6 +326,8 @@ impl LVT {
         }
     }
 
+    /// 获取定时器模式
+    #[allow(dead_code)]
     pub fn timer_mode(&self) -> Option<LocalApicTimerMode> {
         if let LVTRegister::Timer = self.register {
             let mode = (self.data >> 17) & 0b11;

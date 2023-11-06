@@ -9,8 +9,8 @@ use crate::{
     kdebug, kinfo,
     libs::{once::Once, spinlock::SpinLock, volatile::Volatile},
     mm::{
-        mmio_buddy::{mmio_pool, MMIOSpaceGuard, MmioBuddyMemPool},
-        PhysAddr, VirtAddr,
+        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
+        PhysAddr,
     },
     syscall::SystemError,
 };
@@ -61,7 +61,7 @@ impl IoApic {
             let io_apic_paddr = madt
                 .entries()
                 .find(|x| {
-                    if let acpi::madt::MadtEntry::IoApic(x) = x {
+                    if let acpi::madt::MadtEntry::IoApic(_x) = x {
                         return true;
                     }
                     return false;
@@ -111,6 +111,8 @@ impl IoApic {
         return result.unwrap();
     }
 
+    /// Disable all interrupts.
+    #[allow(dead_code)]
     pub fn disable_all(&mut self) {
         // Mark all interrupts edge-triggered, active high, disabled,
         // and not routed to any CPUs.
@@ -209,10 +211,14 @@ impl IoApic {
         return Ok(());
     }
 
+    /// Get the vector number for the given IRQ.
+    #[allow(dead_code)]
     pub fn irq_vector(&mut self, irq: u8) -> u8 {
         unsafe { self.read(REG_TABLE + 2 * irq).get_bits(0..8) as u8 }
     }
 
+    /// Set the vector number for the given IRQ.
+    #[allow(dead_code)]
     pub fn set_irq_vector(&mut self, irq: u8, vector: u8) {
         let mut old = unsafe { self.read(REG_TABLE + 2 * irq) };
         let old_vector = old.get_bits(0..8);
@@ -224,10 +230,13 @@ impl IoApic {
         }
     }
 
+    #[allow(dead_code)]
     pub fn id(&mut self) -> u8 {
         unsafe { self.read(REG_ID).get_bits(24..28) as u8 }
     }
-    // ics的类型
+
+    /// IO APIC Version
+    #[allow(dead_code)]
     pub fn version(&mut self) -> u8 {
         unsafe { self.read(REG_VER).get_bits(0..8) as u8 }
     }
@@ -246,6 +255,7 @@ impl IoApic {
     }
 
     /// 电平响应
+    #[allow(dead_code)]
     fn level_ack(&mut self, irq_num: u8) {
         #[repr(C)]
         struct LevelAck {
@@ -259,6 +269,8 @@ impl IoApic {
         }
     }
 
+    /// 边沿响应
+    #[allow(dead_code)]
     fn edge_ack(&mut self, _irq_num: u8) {
         CurrentApic.send_eoi();
     }

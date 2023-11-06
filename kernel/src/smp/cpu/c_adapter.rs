@@ -1,10 +1,7 @@
 use alloc::vec::Vec;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 
-use crate::{
-    driver::acpi::{acpi_manager, AcpiManager},
-    kdebug,
-};
+use crate::{driver::acpi::acpi_manager, kdebug};
 
 /// 这是一个临时的函数，用于在acpi、cpu模块被正式实现之前，让原本的C写的smp模块能正常运行
 ///

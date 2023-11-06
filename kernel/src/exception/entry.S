@@ -69,6 +69,21 @@ ENTRY(ret_from_intr)
     movq %rsp, %rdi
     callq do_signal
 
+
+__entry_ret_from_intr_before_gs_check_2:
+    push %rcx
+    addq $8, %rsp
+    movq CS(%rsp), %rcx
+    subq $8, %rsp
+    andq $0x3, %rcx
+    cmpq $0x3, %rcx
+
+    jne __entry_ret_from_intr_after_gs_check_2
+    swapgs
+
+__entry_ret_from_intr_after_gs_check_2:
+    popq %rcx
+
     // 恢复寄存器
     jmp Restore_all
 
@@ -109,7 +124,20 @@ Err_Code:
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
+__entry_err_code_before_gs_check_1:
+    pushq %rcx
+    movq CS(%rdi), %rcx
+    and $0x3, %rcx
+    cmp $0x3, %rcx
+
+    jne __entry_err_code_after_gs_check_1
+    swapgs
+
+__entry_err_code_after_gs_check_1:
+    popq %rcx
+
     callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
+
     jmp ret_from_exception
 
 
@@ -296,3 +324,87 @@ ENTRY(ignore_int)
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
+ENTRY(syscall_64)
+    // 切换用户栈和内核栈
+    swapgs
+    movq %rsp, %gs:0x8
+    movq %gs:0x0, %rsp
+    
+    pushq $43       // USER_DS
+    pushq %gs:0x8   // rsp
+    pushq %r11      // RFLAGS
+    pushq $51       // USER_CS
+    pushq %rcx      // RIP
+    pushq $0        // error code占位
+
+    pushq %rax
+    leaq syscall_handler(%rip), %rax // FUNC
+    xchgq %rax, (%rsp)
+
+    pushq %rax      // rax
+    
+    movq %es, %rax
+    pushq %rax      // es
+    movq %ds, %rax
+    pushq %rax      // ds
+    xorq %rax, %rax
+
+    pushq	%rbp
+	pushq	%rdi
+	pushq	%rsi
+	pushq	%rdx
+	pushq	%rcx
+	pushq	%rbx
+	pushq	%r8
+	pushq	%r9
+	pushq	%r10
+	pushq	%r11
+	pushq	%r12
+	pushq	%r13
+	pushq	%r14
+	pushq	%r15
+
+    cld
+
+    xorq %rsi, %rsi
+    movq FUNC(%rsp), %rdx
+
+    movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
+
+    callq *%rdx //调用服务程序
+
+    cli
+    
+    // === 恢复调用现场 ===
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbx
+    popq %rcx
+    popq %rdx
+    popq %rsi
+    popq %rdi
+    popq %rbp
+
+    popq %rax           // 不允许直接pop到ds
+    movq %rax, %ds
+
+    popq %rax
+    movq %rax, %es
+
+    popq %rax
+    addq $0x10, %rsp    // 弹出变量FUNC和errcode
+
+    popq %rcx           // pop rip到rcx
+
+    addq $0x8, %rsp     // 弹出cs
+    popq %r11           // pop rflags到r11
+    popq %rsp           // Restore rsp
+
+    swapgs
+    sysretq

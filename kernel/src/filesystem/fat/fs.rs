@@ -1716,6 +1716,8 @@ impl IndexNode for LockedFATInode {
         } else if mode.contains(ModeType::S_IFCHR) {
             nod.0.lock().metadata.file_type = FileType::CharDevice;
             unimplemented!()
+        } else {
+            return Err(SystemError::EINVAL);
         }
 
         inode

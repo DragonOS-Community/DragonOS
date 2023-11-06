@@ -131,5 +131,4 @@ pub fn panic(info: &PanicInfo) -> ! {
 
     println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
     ProcessManager::exit(usize::MAX);
-    unreachable!();
 }

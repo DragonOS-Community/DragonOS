@@ -9,7 +9,14 @@
 #include <process/preempt.h>
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
+#include "exception/trap.h"
 #include "ipi.h"
+
+/* x86-64 specific MSRs */
+#define MSR_EFER		0xc0000080 /* extended feature register */
+#define MSR_STAR		0xc0000081 /* legacy mode SYSCALL target */
+#define MSR_LSTAR		0xc0000082 /* long mode SYSCALL target */
+#define MSR_SYSCALL_MASK	0xc0000084 /* EFLAGS mask for syscall */
 
 static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
 static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
@@ -25,6 +32,7 @@ extern void smp_ap_start();
 extern uint64_t rs_get_idle_stack_top(uint32_t cpu_id);
 extern int rs_ipi_send_smp_startup(uint32_t apic_id);
 extern void rs_ipi_send_smp_init();
+extern void rs_init_syscall_64();
 
 // 在head.S中定义的，APU启动时，要加载的页表
 // 由于内存管理模块初始化的时候，重置了页表，因此我们要把当前的页表传给APU
@@ -149,7 +157,10 @@ void smp_ap_start_stage2()
     io_mfence();
     spin_unlock_no_preempt(&multi_core_starting_lock);
 
+    rs_init_syscall_64();
+    
     apic_timer_ap_core_init();
+
 
     sti();
     sched();

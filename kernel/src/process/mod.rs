@@ -34,7 +34,7 @@ use crate::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::Futex,
         },
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -235,6 +235,7 @@ impl ProcessManager {
     ///
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
+    /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
         assert_eq!(
             CurrentIrqArch::is_irq_enabled(),
@@ -509,6 +510,9 @@ pub struct ProcessControlBlock {
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
 
+    /// 系统调用栈
+    syscall_stack: RwLock<KernelStack>,
+
     /// 与调度相关的信息
     sched_info: RwLock<ProcessSchedulerInfo>,
     /// 与处理器架构相关的信息
@@ -570,7 +574,7 @@ impl ProcessControlBlock {
         let flags = SpinLock::new(ProcessFlags::empty());
 
         let sched_info = ProcessSchedulerInfo::new(None);
-        let arch_info = SpinLock::new(ArchPCBInfo::new(Some(&kstack)));
+        let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
@@ -582,6 +586,7 @@ impl ProcessControlBlock {
             preempt_count,
             flags,
             kernel_stack: RwLock::new(kstack),
+            syscall_stack: RwLock::new(KernelStack::new().unwrap()),
             worker_private: SpinLock::new(None),
             sched_info,
             arch_info,
@@ -593,11 +598,21 @@ impl ProcessControlBlock {
             thread: RwLock::new(ThreadInfo::new()),
         };
 
+        // 初始化系统调用栈
+        pcb.arch_info
+            .lock()
+            .init_syscall_stack(&pcb.syscall_stack.read());
+
         let pcb = Arc::new(pcb);
 
-        // 设置进程的arc指针到内核栈的最低地址处
+        // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
             pcb.kernel_stack
+                .write()
+                .set_pcb(Arc::downgrade(&pcb))
+                .unwrap();
+
+            pcb.syscall_stack
                 .write()
                 .set_pcb(Arc::downgrade(&pcb))
                 .unwrap()
@@ -692,6 +707,17 @@ impl ProcessControlBlock {
         return self.sched_info.read();
     }
 
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
+        return self.sched_info.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn sched_info_upgradeable_irqsave(&self) -> RwLockUpgradableGuard<ProcessSchedulerInfo> {
+        return self.sched_info.upgradeable_read();
+    }
+
     #[inline(always)]
     pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
         return self.sched_info.write();
@@ -774,6 +800,16 @@ impl ProcessControlBlock {
 
     pub fn sig_info(&self) -> RwLockReadGuard<ProcessSignalInfo> {
         self.sig_info.read()
+    }
+
+    pub fn try_siginfo(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sig_info.try_read() {
+                return Some(r);
+            }
+        }
+
+        return None;
     }
 
     pub fn sig_info_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
@@ -977,7 +1013,7 @@ impl ProcessSchedulerInfo {
         return self.state;
     }
 
-    fn set_state(&mut self, state: ProcessState) {
+    pub fn set_state(&mut self, state: ProcessState) {
         self.state = state;
     }
 
@@ -1014,7 +1050,7 @@ impl ProcessSchedulerInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KernelStack {
     stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
     /// 标记该内核栈是否可以被释放
@@ -1069,6 +1105,7 @@ impl KernelStack {
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
         if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {
+            kerror!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
             return Err(SystemError::EPERM);
         }
         // 将pcb的地址放到内核栈的最低地址处
@@ -1077,6 +1114,25 @@ impl KernelStack {
         }
 
         return Ok(());
+    }
+
+    /// 清除内核栈的pcb指针
+    ///
+    /// ## 参数
+    ///
+    /// - `force` : 如果为true,那么，即使该内核栈的pcb指针不为null，也会被强制清除而不处理Weak指针问题
+    pub unsafe fn clear_pcb(&mut self, force: bool) {
+        let stack_bottom_ptr = self.start_address().data() as *mut *const ProcessControlBlock;
+        if unlikely(unsafe { (*stack_bottom_ptr).is_null() }) {
+            return;
+        }
+
+        if !force {
+            let pcb_ptr: Weak<ProcessControlBlock> = Weak::from_raw(*stack_bottom_ptr);
+            drop(pcb_ptr);
+        }
+
+        *stack_bottom_ptr = core::ptr::null();
     }
 
     /// 返回指向当前内核栈pcb的Arc指针

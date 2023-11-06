@@ -1,12 +1,9 @@
 use ratatui::{
-    layout::Alignment,
     prelude::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
-    text::{self, Line, Span, Text},
-    widgets::{
-        Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Tabs, Wrap,
-    },
+    text::{self, Span, Text},
+    widgets::{Block, Borders, List, ListItem, Sparkline, Tabs},
     Frame,
 };
 
@@ -94,7 +91,7 @@ fn draw_memory_logging_speed_gauges(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+    let _block = Block::default().borders(Borders::ALL).title(Span::styled(
         "Logs",
         Style::default()
             .fg(Color::Magenta)
@@ -110,7 +107,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let log_list = binding
         .iter()
         .map(|log_str| {
-            let style = match log_str {
+            let _style = match log_str {
                 log if log.contains("INFO") => info_style,
                 log if log.contains("WARNING") => warning_style,
                 log if log.contains("ERROR") => error_style,
@@ -123,7 +120,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Text::from(log_str.clone()))
         })
         .collect::<Vec<ListItem>>();
-    
+
     let items_num = 5;
     let list_to_show = log_list.split_at(if log_list.len() > items_num {
         log_list.len() - items_num

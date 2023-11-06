@@ -76,6 +76,7 @@ impl SymbolCollection {
         self.symbols.push(Symbol::new(sym, name));
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.symbols.len()
     }
@@ -100,6 +101,8 @@ impl Symbol {
         &self.name
     }
 
+    /// Returns the virtual address of the symbol.
+    #[allow(dead_code)]
     pub fn vaddr(&self) -> usize {
         self.sym.st_value as usize
     }

@@ -18,7 +18,9 @@ static __MM_ALLOCATOR_LOG_CHANNEL: MMLogChannel<{ MMDebugLogManager::MAX_ALLOC_L
     MMLogChannel::new(MMDebugLogManager::MAX_ALLOC_LOG_NUM);
 
 /// 全局的内存分配器日志id分配器
-static __MM_DEBUG_LOG_IDA: ida::IdAllocator = ida::IdAllocator::new(usize::MAX);
+///
+/// id从1开始, 因为0是无效的id
+static __MM_DEBUG_LOG_IDA: ida::IdAllocator = ida::IdAllocator::new(1, usize::MAX);
 
 /// 记录内存分配器的日志
 ///

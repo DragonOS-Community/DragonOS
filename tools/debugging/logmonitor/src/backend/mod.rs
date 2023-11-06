@@ -1,6 +1,7 @@
 use std::{
+    path::PathBuf,
     sync::{mpsc, Arc, Mutex, RwLock, Weak},
-    thread::JoinHandle, path::PathBuf,
+    thread::JoinHandle,
 };
 
 use log::info;
@@ -14,8 +15,8 @@ mod monitor;
 
 #[derive(Debug)]
 pub struct AppBackend {
-    command_line_args: CommandLineArgs,
-    sender_to_frontend: mpsc::Sender<Event>,
+    _command_line_args: CommandLineArgs,
+    _sender_to_frontend: mpsc::Sender<Event>,
     data: Arc<Mutex<BackendData>>,
     main_thread: RwLock<Option<std::thread::JoinHandle<()>>>,
     /// All threads spawned by the backend.(Except the main thread)
@@ -25,8 +26,8 @@ pub struct AppBackend {
 impl AppBackend {
     pub fn new(command_line_args: CommandLineArgs, sender: mpsc::Sender<Event>) -> Arc<Self> {
         let r = Arc::new(Self {
-            command_line_args: command_line_args.clone(),
-            sender_to_frontend: sender.clone(),
+            _command_line_args: command_line_args.clone(),
+            _sender_to_frontend: sender.clone(),
             data: Arc::new(Mutex::new(BackendData::new())),
             main_thread: RwLock::new(None),
             threads: Mutex::new(Vec::new()),
@@ -69,7 +70,7 @@ impl BackendData {
 
 #[derive(Debug)]
 pub struct BackendThread {
-    sender_to_frontend: mpsc::Sender<Event>,
+    _sender_to_frontend: mpsc::Sender<Event>,
     command_line_args: CommandLineArgs,
     shared_data: Arc<Mutex<BackendData>>,
     backend_instance: Weak<AppBackend>,
@@ -84,7 +85,7 @@ impl BackendThread {
     ) -> Self {
         Self {
             command_line_args,
-            sender_to_frontend: sender,
+            _sender_to_frontend: sender,
             backend_instance,
             shared_data: backend_data,
         }

@@ -9,14 +9,16 @@ pub struct CommandLineArgs {
     pub kernel: PathBuf,
 
     /// The kernel memory file to load.
-    /// If not specified, the default value is /dev/shm/dragonos-qemu-shm.ram
     #[arg(long, value_parser=kmem_file_parser, default_value = "/dev/shm/dragonos-qemu-shm.ram")]
     pub kmem: String,
 
-    /// If set, the monitor will not start the TUI.
-    #[arg(long, default_value = "true")]
-    pub headless: bool,
-    
+    /// If set, the monitor will start the TUI.
+    #[arg(long, default_value = "false")]
+    pub tui: bool,
+
+    /// The directory to store the log files.
+    #[arg(long, default_value = "logs")]
+    pub log_dir: PathBuf,
 }
 
 /// 用于解析kmem参数的函数

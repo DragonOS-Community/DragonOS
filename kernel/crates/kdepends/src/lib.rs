@@ -5,3 +5,5 @@
 pub extern crate thingbuf;
 
 pub extern crate memoffset;
+
+pub extern crate crc;

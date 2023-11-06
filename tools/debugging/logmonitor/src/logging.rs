@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Mutex};
+use std::sync::mpsc;
 
 use log::LevelFilter;
 use simple_logger::LogBackend;
@@ -11,7 +11,7 @@ pub fn init(cmd_args: &CommandLineArgs) -> LoggingInitResult {
 
     let mut result = LoggingInitResult::new(None);
 
-    if !cmd_args.headless {
+    if cmd_args.tui {
         let channel: (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel::<String>();
         builder = builder.with_backend(Box::new(TUILoggingBackend::new(channel.0)));
         result.tui_receiver = Some(channel.1);
@@ -49,5 +49,3 @@ impl LogBackend for TUILoggingBackend {
         self.sender.send(message).ok();
     }
 }
-
-

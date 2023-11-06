@@ -29,7 +29,6 @@ pub struct EventHandler {
     receiver: mpsc::Receiver<Event>,
     /// Event handler thread.
     handler: thread::JoinHandle<()>,
-
 }
 
 impl EventHandler {

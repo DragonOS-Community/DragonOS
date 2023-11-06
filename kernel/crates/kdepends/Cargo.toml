@@ -8,6 +8,7 @@ description = "需要导出的依赖项（为保持内核依赖版本与调试�
 
 [dependencies]
 memoffset = "0.9.0"
+crc = { path = "../crc" }
 
 # 一个无锁MPSC队列
 [dependencies.thingbuf]

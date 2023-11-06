@@ -30,6 +30,6 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     Ok(())
 }
 
-pub fn handle_backend_events(backend_event: BackendEvent, app: &mut App) -> AppResult<()> {
+pub fn handle_backend_events(_backend_event: BackendEvent, _app: &mut App) -> AppResult<()> {
     return Ok(());
 }

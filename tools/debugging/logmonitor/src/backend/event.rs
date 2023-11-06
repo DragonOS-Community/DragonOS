@@ -4,6 +4,7 @@ pub enum BackendEvent {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StartUpEvent {
     started: bool,
     message: String,

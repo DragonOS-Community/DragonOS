@@ -1,5 +1,9 @@
-#[macro_use]
+#![allow(incomplete_features)]
+#![feature(generic_const_exprs)]
+
 extern crate clap;
+
+extern crate lazy_static;
 
 /// Application.
 pub mod app;
@@ -15,7 +19,7 @@ pub mod tui;
 
 pub mod backend;
 pub mod command;
+pub mod constant;
 /// Event handler.
 pub mod handler;
 pub mod logging;
-

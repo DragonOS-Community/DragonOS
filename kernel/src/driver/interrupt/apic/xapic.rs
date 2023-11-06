@@ -215,7 +215,6 @@ impl LocalAPIC for XApic {
             }
             // 设置 Spurious Interrupt Vector Register
             let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into());
-            kdebug!("xapic: spurious interrupt vector register = {:#x}", val);
 
             self.write(
                 XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into(),
@@ -237,25 +236,26 @@ impl LocalAPIC for XApic {
 
             self.mask_all_lvt();
 
-            // // 清除错误状态寄存器（需要连续写入两次）
-            // self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
-            // self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
+            // 清除错误状态寄存器（需要连续写入两次）
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
 
-            // // 确认任何未完成的中断
-            // self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            // 确认任何未完成的中断
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
 
-            // // 发送 Init Level De-Assert 信号以同步仲裁ID
-            // self.write(
-            //     XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
-            //     0,
-            // );
-            // self.write(
-            //     XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
-            //     BCAST | INIT | LEVEL,
-            // );
-            // while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
-            // {
-            // }
+            // 发送 Init Level De-Assert 信号以同步仲裁ID
+            self.write(
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
+                0,
+            );
+            self.write(
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
+                BCAST | INIT | LEVEL,
+            );
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
+            {
+                spin_loop();
+            }
         }
 
         true

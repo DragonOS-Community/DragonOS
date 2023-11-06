@@ -472,8 +472,6 @@ impl LocalAPIC for CurrentApic {
             }
         }
         kinfo!("Initializing apic for cpu {}", cpu_id);
-        kdebug!("X2Apic::support()={}", X2Apic::support());
-        kdebug!("XApic::support()={}", XApic::support());
         if X2Apic::support() && X2Apic.init_current_cpu() {
             if cpu_id == 0 {
                 LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::X2Apic, Ordering::SeqCst);

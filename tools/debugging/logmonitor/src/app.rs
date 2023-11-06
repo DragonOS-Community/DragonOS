@@ -1,6 +1,7 @@
 use std::error;
 
 use rand::{distributions::Uniform, prelude::Distribution, rngs::ThreadRng};
+use ratatui::widgets::ListState;
 
 /// Application result type.
 pub type AppResult<T> = std::result::Result<T, Box<dyn error::Error>>;
@@ -21,6 +22,11 @@ pub struct App<'a> {
     pub tabs: TabsState<'a>,
 
     pub memory_log_sparkline: Signal<RandomSignal>,
+
+    logs: Vec<String>,
+    pub stateful_logs: StatefulList<(&'a str, &'a str)>,
+
+    backend_log_receiver: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl<'a> App<'a> {
@@ -41,12 +47,34 @@ impl<'a> App<'a> {
             counter: 0,
             tabs: TabsState::new(vec!["Tab0", "Tab1", "Tab2"]),
             memory_log_sparkline: sparkline,
+            logs: Vec::new(),
+            stateful_logs: StatefulList::with_items(vec![]),
+            backend_log_receiver: None,
         }
+    }
+
+    pub fn set_backend_log_receiver(&mut self, receiver: std::sync::mpsc::Receiver<String>) {
+        self.backend_log_receiver = Some(receiver);
     }
 
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
         self.memory_log_sparkline.on_tick();
+        self.handle_logs_on_tick();
+    }
+
+    /// 当到达tick时，处理日志
+    fn handle_logs_on_tick(&mut self) {
+        let logs_to_push = self
+            .backend_log_receiver
+            .as_ref()
+            .map(|rv| rv.try_iter().collect::<Vec<String>>());
+
+        if let Some(logs) = logs_to_push {
+            for log in logs {
+                self.push_log(log);
+            }
+        }
     }
 
     /// Set running to false to quit the application.
@@ -64,6 +92,14 @@ impl<'a> App<'a> {
         if let Some(res) = self.counter.checked_sub(1) {
             self.counter = res;
         }
+    }
+
+    pub fn push_log(&mut self, log: String) {
+        self.logs.push(log);
+    }
+
+    pub fn logs(&self) -> &Vec<String> {
+        &self.logs
     }
 }
 
@@ -129,5 +165,48 @@ impl Iterator for RandomSignal {
     type Item = u64;
     fn next(&mut self) -> Option<u64> {
         Some(self.distribution.sample(&mut self.rng))
+    }
+}
+
+#[derive(Debug)]
+pub struct StatefulList<T> {
+    pub state: ListState,
+    pub items: Vec<T>,
+}
+
+impl<T> StatefulList<T> {
+    pub fn with_items(items: Vec<T>) -> StatefulList<T> {
+        StatefulList {
+            state: ListState::default(),
+            items,
+        }
+    }
+
+    pub fn next(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i >= self.items.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    pub fn previous(&mut self) {
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.items.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
     }
 }

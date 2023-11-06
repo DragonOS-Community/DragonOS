@@ -1,11 +1,12 @@
 use crate::app::AppResult;
+use crate::backend::event::BackendEvent;
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEvent};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Terminal events.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Event {
     /// Terminal tick.
     Tick,
@@ -15,6 +16,7 @@ pub enum Event {
     Mouse(MouseEvent),
     /// Terminal resize.
     Resize(u16, u16),
+    Backend(BackendEvent),
 }
 
 /// Terminal event handler.
@@ -27,6 +29,7 @@ pub struct EventHandler {
     receiver: mpsc::Receiver<Event>,
     /// Event handler thread.
     handler: thread::JoinHandle<()>,
+
 }
 
 impl EventHandler {
@@ -73,5 +76,9 @@ impl EventHandler {
     /// there is no data available and it's possible for more data to be sent.
     pub fn next(&self) -> AppResult<Event> {
         Ok(self.receiver.recv()?)
+    }
+
+    pub fn sender(&self) -> mpsc::Sender<Event> {
+        self.sender.clone()
     }
 }

@@ -5,6 +5,7 @@ use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use std::io;
 use std::panic;
+use std::sync::mpsc;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
@@ -18,6 +19,7 @@ pub struct Tui<B: Backend> {
     terminal: Terminal<B>,
     /// Terminal event handler.
     pub events: EventHandler,
+
 }
 
 impl<B: Backend> Tui<B> {

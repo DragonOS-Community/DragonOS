@@ -1,6 +1,11 @@
 #![no_std]
+#![feature(const_refs_to_cell)]
 
+extern crate alloc;
 use core::fmt::Debug;
+
+use alloc::format;
+use kdepends::{memoffset::offset_of, thingbuf::StaticThingBuf};
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -17,6 +22,8 @@ pub struct AllocatorLog {
 
     /// 日志的来源pid
     pub pid: Option<usize>,
+
+    pub checksum: u64,
 }
 
 impl AllocatorLog {
@@ -108,12 +115,58 @@ impl MMLogCycle {
     }
 }
 
-impl thingbuf::Recycle<AllocatorLog> for MMLogCycle {
+impl kdepends::thingbuf::Recycle<AllocatorLog> for MMLogCycle {
     fn new_element(&self) -> AllocatorLog {
         AllocatorLog::zeroed()
     }
 
     fn recycle(&self, element: &mut AllocatorLog) {
         *element = AllocatorLog::zeroed();
+    }
+}
+
+#[repr(C)]
+pub struct MMLogChannel<const CAP: usize> {
+    pub magic: u32,
+    pub element_size: u32,
+    pub capacity: u64,
+    pub slots_offset: u64,
+    pub buf: StaticThingBuf<AllocatorLog, CAP, MMLogCycle>,
+}
+
+impl<const CAP: usize> Debug for MMLogChannel<CAP> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MMLogChannel")
+            .field("magic", &format!("{:#x}", self.magic))
+            .field("element_size", &self.element_size)
+            .field("capacity", &self.capacity)
+            .field("slots_offset", &self.slots_offset)
+            .field(
+                "buf",
+                &format!(
+                    "StaticThingBuf<AllocatorLog, {}, MMLogCycle>",
+                    self.capacity
+                ),
+            )
+            .finish()
+    }
+}
+
+impl<const CAP: usize> MMLogChannel<CAP> {
+    pub const MM_LOG_CHANNEL_MAGIC: u32 = 0x4d4c4348;
+
+    pub const fn new(capacity: usize) -> Self {
+        let buffer = StaticThingBuf::with_recycle(MMLogCycle::new());
+        assert!(buffer.offset_of_slots() != 0);
+
+        let r = Self {
+            magic: Self::MM_LOG_CHANNEL_MAGIC,
+            element_size: core::mem::size_of::<AllocatorLog>() as u32,
+            capacity: capacity as u64,
+            slots_offset: (offset_of!(MMLogChannel<CAP>, buf) + buffer.offset_of_slots()) as u64,
+            buf: buffer,
+        };
+
+        return r;
     }
 }

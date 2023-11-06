@@ -1,10 +1,13 @@
 use ratatui::{
     layout::Alignment,
     prelude::{Constraint, Layout, Rect},
-    style::{Color, Style, Modifier},
-    text::{self, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Tabs, Gauge, Sparkline},
-    Frame, symbols,
+    style::{Color, Modifier, Style},
+    symbols,
+    text::{self, Line, Span, Text},
+    widgets::{
+        Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Tabs, Wrap,
+    },
+    Frame,
 };
 
 use crate::app::App;
@@ -50,7 +53,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         .select(app.tabs.index);
     frame.render_widget(tabs, chunks[0]);
 
-    match app.tabs.index{
+    match app.tabs.index {
         0 => draw_first_tab(frame, app, chunks[1]),
         _ => {}
     }
@@ -59,29 +62,24 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 fn draw_first_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .constraints([
-            Constraint::Length(9),
-            Constraint::Min(8),
+            Constraint::Min(1),
+            Constraint::Min(3),
             Constraint::Length(7),
         ])
         .split(area);
     draw_memory_logging_speed_gauges(f, app, chunks[0]);
     // draw_charts(f, app, chunks[1]);
-    // draw_text(f, chunks[2]);
+    draw_footer(f, app, chunks[2]);
 }
 
 /// 绘制内存日志产生数量的图表
-fn draw_memory_logging_speed_gauges(f: &mut Frame, app: &mut App, area: Rect){
+fn draw_memory_logging_speed_gauges(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Length(3)])
         .margin(1)
         .split(area);
-    let block = Block::default().borders(Borders::ALL).title("Graphs");
+    let block = Block::default().borders(Borders::ALL).title("Speed:");
     f.render_widget(block, area);
-
-    
 
     let sparkline = Sparkline::default()
         .block(Block::default().title("Memory Log Speed:"))
@@ -93,5 +91,47 @@ fn draw_memory_logging_speed_gauges(f: &mut Frame, app: &mut App, area: Rect){
             symbols::bar::THREE_LEVELS
         });
     f.render_widget(sparkline, chunks[0]);
+}
 
+fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        "Logs",
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let info_style = Style::default().fg(Color::Blue);
+    let warning_style = Style::default().fg(Color::Yellow);
+    let error_style = Style::default().fg(Color::Magenta);
+    let critical_style = Style::default().fg(Color::Red);
+
+    let binding = app.logs().clone();
+    let log_list = binding
+        .iter()
+        .map(|log_str| {
+            let style = match log_str {
+                log if log.contains("INFO") => info_style,
+                log if log.contains("WARNING") => warning_style,
+                log if log.contains("ERROR") => error_style,
+                log if log.contains("CRITICAL") => critical_style,
+                _ => Style::default().fg(Color::White),
+            };
+
+            // println!("log_str: {}", log_str);
+
+            ListItem::new(Text::from(log_str.clone()))
+        })
+        .collect::<Vec<ListItem>>();
+    
+    let items_num = 5;
+    let list_to_show = log_list.split_at(if log_list.len() > items_num {
+        log_list.len() - items_num
+    } else {
+        0
+    });
+
+    let logs =
+        List::new(list_to_show.1).block(Block::default().borders(Borders::ALL).title("List"));
+    f.render_stateful_widget(logs, area, &mut app.stateful_logs.state);
 }

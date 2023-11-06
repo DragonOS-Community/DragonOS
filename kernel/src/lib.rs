@@ -60,12 +60,10 @@ extern crate bitflags;
 extern crate elf;
 #[macro_use]
 extern crate lazy_static;
-extern crate memoffset;
 extern crate num;
 #[macro_use]
 extern crate num_derive;
 extern crate smoltcp;
-extern crate thingbuf;
 #[macro_use]
 extern crate intertrait;
 #[cfg(target_arch = "x86_64")]

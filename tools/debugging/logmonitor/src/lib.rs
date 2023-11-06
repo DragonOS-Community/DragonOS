@@ -13,11 +13,9 @@ pub mod ui;
 /// Terminal user interface.
 pub mod tui;
 
+pub mod backend;
+pub mod command;
 /// Event handler.
 pub mod handler;
+pub mod logging;
 
-pub mod monitor;
-
-pub mod command;
-
-pub mod backend;

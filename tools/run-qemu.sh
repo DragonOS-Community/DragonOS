@@ -52,7 +52,8 @@ QEMU=qemu-system-x86_64
 QEMU_DISK_IMAGE="../bin/disk.img"
 QEMU_MEMORY="512M"
 QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
-QEMU_SHM_OBJECT="-object memory-backend-file,size=${QEMU_MEMORY},id=${QEMU_MEMORY_BACKEND},mem-path=/dev/sdh/${QEMU_MEMORY_BACKEND},share=on "
+QEMU_MEMORY_BACKEND_PATH_PREFIX="/dev/shm"
+QEMU_SHM_OBJECT="-object memory-backend-file,size=${QEMU_MEMORY},id=${QEMU_MEMORY_BACKEND},mem-path=${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND},share=on "
 QEMU_SMP="2,cores=2,threads=1,sockets=1"
 QEMU_MONITOR="stdio"
 QEMU_TRACE="${qemu_trace_std}"
@@ -96,6 +97,9 @@ if [ $flag_can_run -eq 1 ]; then
       esac 
   done 
 
+# 删除共享内存
+sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}
+
 if [ ${BIOS_TYPE} == uefi ] ;then
   if [ ${ARCH} == x86_64 ] ;then
     sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
@@ -105,7 +109,8 @@ if [ ${BIOS_TYPE} == uefi ] ;then
 else
   sudo ${QEMU} ${QEMU_ARGUMENT}
 fi
-
+# 删除共享内存
+sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}
 else
   echo "不满足运行条件"
 fi

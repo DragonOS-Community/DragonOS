@@ -198,7 +198,7 @@ pub enum SystemError {
     ELIBACC = 78,
     /// 访问损坏的共享库 Accessing a corrupted shared library
     ELIBBAD = 79,
-    /// a. out中的.lib部分已损坏 .lib section in a.out corrupted
+    /// a.out中的.lib部分已损坏 .lib section in a.out corrupted
     ELIBSCN = 80,
     /// 尝试链接太多共享库 Attempting to link in too many shared libraries
     ELIBMAX = 81,

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod c_adapter;
 pub mod ipi;
 
 use core::{

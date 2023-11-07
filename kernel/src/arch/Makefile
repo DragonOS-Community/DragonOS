@@ -9,7 +9,7 @@ all:
 	@list='$(kernel_arch_subdirs)'; for subdir in $$list; do \
     		echo "make all in $$subdir";\
     		cd $$subdir;\
-    		$(MAKE) all CFLAGS="$(CFLAGS)" PIC="$(PIC)";\
+    		$(MAKE) all CFLAGS="$(CFLAGS)" ;\
     		cd ..;\
 	done
 

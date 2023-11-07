@@ -253,7 +253,7 @@ impl KernelThreadMechanism {
         // 由于当前是pid=0的idle进程,而__inner_create要求当前是kthread,所以先临时设置为kthread
         ProcessManager::current_pcb()
             .flags
-            .lock()
+            .get_mut()
             .insert(ProcessFlags::KTHREAD);
         create_info
             .set_to_mark_sleep(false)
@@ -266,7 +266,7 @@ impl KernelThreadMechanism {
 
         ProcessManager::current_pcb()
             .flags
-            .lock()
+            .get_mut()
             .remove(ProcessFlags::KTHREAD);
         drop(irq_guard);
         kinfo!("Initializing kernel thread mechanism stage1 complete");

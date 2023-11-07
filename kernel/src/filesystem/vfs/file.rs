@@ -159,7 +159,6 @@ impl File {
         if self.offset > self.inode.metadata()?.size as usize {
             return Ok(0);
         }
-
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;

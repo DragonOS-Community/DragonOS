@@ -43,4 +43,4 @@
 #include <driver/pci/pci_irq.h>
 #include <common/errno.h>
 #include <common/cpu.h>
-#include <driver/interrupt/apic/apic2rust.h>
+#include <exception/irq.h>

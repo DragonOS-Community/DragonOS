@@ -8,12 +8,6 @@
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 
-#define APIC_SUCCESS 0
-#define APIC_E_NOTFOUND 1
-
-#define APIC_IO_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + IO_APIC_MAPPING_OFFSET
-#define APIC_LOCAL_APIC_VIRT_BASE_ADDR SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE + LOCAL_APIC_MAPPING_OFFSET
-
 // 当前apic启用状态标志
 extern uint8_t __apic_enable_state;
 #define APIC_XAPIC_ENABLED 0
@@ -112,36 +106,6 @@ struct apic_LVT
         reserved_2 : 13;     // [31:19]位保留
 
 } __attribute((packed)); // 取消结构体的align
-
-/*
-    ICR
-*/
-
-struct INT_CMD_REG
-{
-    unsigned int vector : 8, // 0~7
-        deliver_mode : 3,    // 8~10
-        dest_mode : 1,       // 11
-        deliver_status : 1,  // 12
-        res_1 : 1,           // 13
-        level : 1,           // 14
-        trigger : 1,         // 15
-        res_2 : 2,           // 16~17
-        dest_shorthand : 2,  // 18~19
-        res_3 : 12;          // 20~31
-
-    union
-    {
-        struct
-        {
-            unsigned int res_4 : 24, // 32~55
-                dest_field : 8;      // 56~63
-        } apic_destination;
-
-        unsigned int x2apic_destination; // 32~63
-    } destination;
-
-} __attribute__((packed));
 
 /**
  * @brief I/O APIC 的中断定向寄存器的结构体
@@ -243,18 +207,6 @@ struct apic_IO_APIC_RTE_entry
 #define POLARITY_HIGH 0
 #define POLARITY_LOW 1
 
-struct apic_IO_APIC_map
-{
-    // 间接访问寄存器的物理基地址
-    uint addr_phys;
-    // 索引寄存器虚拟地址
-    unsigned char *virtual_index_addr;
-    // 数据寄存器虚拟地址
-    uint *virtual_data_addr;
-    // EOI寄存器虚拟地址
-    uint *virtual_EOI_addr;
-} apic_ioapic_map;
-
 /**
  * @brief 中断服务程序
  *
@@ -262,28 +214,7 @@ struct apic_IO_APIC_map
  * @param number 中断向量号
  */
 void do_IRQ(struct pt_regs *rsp, ul number);
-
-/**
- * @brief 读取RTE寄存器
- *
- * @param index 索引值
- * @return ul
- */
-ul apic_ioapic_read_rte(unsigned char index);
-
-/**
- * @brief 写入RTE寄存器
- *
- * @param index 索引值
- * @param value 要写入的值
- */
-void apic_ioapic_write_rte(unsigned char index, ul value);
-
-/**
- * @brief 初始化AP处理器的Local apic
- *
- */
-void apic_init_ap_core_local_apic();
+void rs_apic_init_ap();
 
 /**
  * @brief 初始化apic控制器
@@ -291,22 +222,11 @@ void apic_init_ap_core_local_apic();
  */
 int apic_init();
 
-/**
- * @brief 读取指定类型的 Interrupt Control Structure
- *
- * @param type ics的类型
- * @param ret_vaddr 对应的ICS的虚拟地址数组
- * @param total 返回数组的元素总个数
- * @return uint
- */
-uint apic_get_ics(const uint type, ul ret_vaddr[], uint *total);
-
 // =========== 中断控制操作接口 ============
 void apic_ioapic_enable(ul irq_num);
 void apic_ioapic_disable(ul irq_num);
 ul apic_ioapic_install(ul irq_num, void *arg);
 void apic_ioapic_uninstall(ul irq_num);
-void apic_ioapic_level_ack(ul irq_num); // ioapic电平触发 应答
 void apic_ioapic_edge_ack(ul irq_num);  // ioapic边沿触发 应答
 
 // void apic_local_apic_level_ack(ul irq_num);// local apic电平触发 应答
@@ -329,7 +249,4 @@ void apic_local_apic_edge_ack(ul irq_num); // local apic边沿触发 应答
 void apic_make_rte_entry(struct apic_IO_APIC_RTE_entry *entry, uint8_t vector, uint8_t deliver_mode, uint8_t dest_mode,
                          uint8_t deliver_status, uint8_t polarity, uint8_t irr, uint8_t trigger, uint8_t mask, uint8_t dest_apicID);
 
-uint32_t apic_get_local_apic_id();
-void apic_write_icr(uint64_t value);
-bool apic_x2apic_enabled();
 #pragma GCC pop_options

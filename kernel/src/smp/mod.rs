@@ -6,6 +6,7 @@ use crate::{
 
 pub mod c_adapter;
 pub mod core;
+pub mod cpu;
 
 pub fn kick_cpu(cpu_id: u32) -> Result<(), SystemError> {
     // todo: 增加对cpu_id的有效性检查

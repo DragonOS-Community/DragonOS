@@ -132,7 +132,7 @@ impl XApic {
 
     /// 将指定的值写入寄存器
     #[allow(dead_code)]
-    pub unsafe fn write(&mut self, reg: XApicOffset, value: u32) {
+    pub unsafe fn write(&self, reg: XApicOffset, value: u32) {
         write_volatile(
             (self.apic_vaddr.data() + (reg as u32) as usize) as *mut u32,
             value,
@@ -270,9 +270,10 @@ impl LocalAPIC for XApic {
     }
 
     /// 发送 EOI（End Of Interrupt）
-    fn send_eoi(&mut self) {
+    fn send_eoi(&self) {
         unsafe {
-            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            let s = self as *const Self as *mut Self;
+            (*s).write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
         }
     }
 
@@ -329,7 +330,7 @@ impl LocalAPIC for XApic {
         self.set_lvt(LVT::new(LVTRegister::ErrorReg, LVT::MASKED).unwrap());
     }
 
-    fn write_icr(&mut self, icr: x86::apic::Icr) {
+    fn write_icr(&self, icr: x86::apic::Icr) {
         unsafe {
             // Wait for any previous send to finish
             while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0

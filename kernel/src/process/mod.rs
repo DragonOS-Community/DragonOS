@@ -34,6 +34,7 @@ use crate::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::Futex,
         },
+        lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -505,7 +506,7 @@ pub struct ProcessControlBlock {
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
 
-    flags: SpinLock<ProcessFlags>,
+    flags: LockFreeFlags<ProcessFlags>,
     worker_private: SpinLock<Option<WorkerPrivate>>,
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
@@ -571,7 +572,7 @@ impl ProcessControlBlock {
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
-        let flags = SpinLock::new(ProcessFlags::empty());
+        let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
         let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
@@ -662,8 +663,8 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {
-        return self.flags.lock();
+    pub fn flags(&self) -> &mut ProcessFlags {
+        return self.flags.get_mut();
     }
 
     #[inline(always)]

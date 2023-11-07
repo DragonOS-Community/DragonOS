@@ -64,7 +64,7 @@ impl LocalAPIC for X2Apic {
     }
 
     /// 发送 EOI (End Of Interrupt)
-    fn send_eoi(&mut self) {
+    fn send_eoi(&self) {
         unsafe {
             wrmsr(IA32_X2APIC_EOI.into(), 0);
         }
@@ -119,7 +119,7 @@ impl LocalAPIC for X2Apic {
         self.set_lvt(LVT::new(LVTRegister::ErrorReg, LVT::MASKED).unwrap());
     }
 
-    fn write_icr(&mut self, icr: x86::apic::Icr) {
+    fn write_icr(&self, icr: x86::apic::Icr) {
         unsafe { wrmsr(0x830, ((icr.upper() as u64) << 32) | icr.lower() as u64) };
     }
 }

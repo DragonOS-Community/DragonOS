@@ -49,7 +49,7 @@ pub trait LocalAPIC {
     fn init_current_cpu(&mut self) -> bool;
 
     /// @brief 发送EOI信号（End of interrupt）
-    fn send_eoi(&mut self);
+    fn send_eoi(&self);
 
     /// @brief 获取APIC版本号
     fn version(&self) -> u8;
@@ -75,7 +75,7 @@ pub trait LocalAPIC {
     fn mask_all_lvt(&mut self);
 
     /// 写入ICR寄存器
-    fn write_icr(&mut self, icr: Icr);
+    fn write_icr(&self, icr: Icr);
 }
 
 /// @brief 所有LVT寄存器的枚举类型
@@ -519,11 +519,11 @@ impl LocalAPIC for CurrentApic {
         return true;
     }
 
-    fn send_eoi(&mut self) {
+    fn send_eoi(&self) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.send_eoi();
         } else {
-            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+            current_xapic_instance().borrow().as_ref().map(|xapic| {
                 xapic.send_eoi();
             });
         }
@@ -609,11 +609,11 @@ impl LocalAPIC for CurrentApic {
         }
     }
 
-    fn write_icr(&mut self, icr: Icr) {
+    fn write_icr(&self, icr: Icr) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.write_icr(icr);
         } else {
-            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+            current_xapic_instance().borrow().as_ref().map(|xapic| {
                 xapic.write_icr(icr);
             });
         }

@@ -5,7 +5,7 @@
 #if _INTR_8259A_
 #include <driver/interrupt/8259A/8259A.h>
 #else
-#include <driver/interrupt/apic/apic.h>
+#include <arch/x86_64/driver/apic/apic.h>
 #endif
 
 #include "gate.h"

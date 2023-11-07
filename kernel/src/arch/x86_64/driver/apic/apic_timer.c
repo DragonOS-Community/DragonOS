@@ -83,8 +83,6 @@ void apic_timer_handler(uint64_t number, uint64_t param, struct pt_regs *regs)
  */
 void apic_timer_init()
 {
-
-    uint64_t flags = 0;
     kinfo("Initializing apic timer for cpu %d", rs_current_pcb_cpuid());
     io_mfence();
     irq_register(APIC_TIMER_IRQ_NUM, NULL, &apic_timer_handler, 0, &apic_timer_intr_controller,

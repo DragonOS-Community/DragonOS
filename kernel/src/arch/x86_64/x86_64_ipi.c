@@ -1,5 +1,5 @@
 #include "x86_64_ipi.h"
-#include <driver/interrupt/apic/apic.h>
+#include <arch/x86_64/driver/apic/apic.h>
 
 int ipi_regiserIPI(uint64_t irq_num, void *arg,
                    void (*handler)(uint64_t irq_num, uint64_t param, struct pt_regs *regs),
@@ -12,4 +12,4 @@ int ipi_regiserIPI(uint64_t irq_num, void *arg,
     p->flags = 0;
     p->handler = handler;
     return 0;
-}
+} 

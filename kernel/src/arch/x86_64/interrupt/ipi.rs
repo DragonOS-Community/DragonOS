@@ -1,8 +1,10 @@
 use x86::apic::ApicId;
 
 use crate::{
-    arch::smp::SMP_BOOT_DATA,
-    driver::interrupt::apic::{CurrentApic, LocalAPIC},
+    arch::{
+        driver::apic::{CurrentApic, LocalAPIC},
+        smp::SMP_BOOT_DATA,
+    },
     exception::ipi::{IpiKind, IpiTarget},
     syscall::SystemError,
 };

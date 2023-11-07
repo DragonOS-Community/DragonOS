@@ -5,6 +5,7 @@ use core::{
 };
 
 use crate::{
+    kdebug, kerror, kinfo,
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         percpu::PerCpu,

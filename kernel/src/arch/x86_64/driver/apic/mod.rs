@@ -4,11 +4,10 @@ use atomic_enum::atomic_enum;
 use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
 use crate::{
-    arch::{io::PortIOArch, CurrentPortIOArch},
-    driver::interrupt::apic::{
-        ioapic::ioapic_init,
-        x2apic::X2Apic,
-        xapic::{current_xapic_instance, XApic},
+    arch::{
+        driver::apic::{ioapic::ioapic_init, x2apic::X2Apic, xapic::XApic},
+        io::PortIOArch,
+        CurrentPortIOArch,
     },
     kdebug, kinfo,
     mm::PhysAddr,
@@ -16,7 +15,10 @@ use crate::{
     syscall::SystemError,
 };
 
-use self::{apic_timer::LocalApicTimerMode, xapic::XApicOffset};
+use self::{
+    apic_timer::LocalApicTimerMode,
+    xapic::{current_xapic_instance, XApicOffset},
+};
 
 pub mod apic_timer;
 mod c_adapter;

@@ -3,6 +3,7 @@ use core::cell::RefCell;
 use crate::arch::driver::tsc::TSCManager;
 use crate::include::bindings::bindings::APIC_TIMER_IRQ_NUM;
 
+use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;

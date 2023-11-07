@@ -1,5 +1,5 @@
 #include "ps2_mouse.h"
-#include <driver/interrupt/apic/apic.h>
+#include <arch/x86_64/driver/apic/apic.h>
 #include <mm/mm.h>
 #include <mm/slab.h>
 #include <common/printk.h>

@@ -28,7 +28,7 @@
 #include "driver/multiboot2/multiboot2.h"
 #include <time/timer.h>
 
-#include <driver/interrupt/apic/apic_timer.h>
+#include <arch/x86_64/driver/apic/apic_timer.h>
 #include <virt/kvm/kvm.h>
 
 extern int rs_driver_init();

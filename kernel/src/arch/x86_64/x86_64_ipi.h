@@ -12,7 +12,7 @@
 #pragma once
 
 #include <common/kprint.h>
-#include <driver/interrupt/apic/apic.h>
+#include <arch/x86_64/driver/apic/apic.h>
 
 /**
  * @brief ipi中断处理注册函数

@@ -7,7 +7,11 @@ use bitflags::bitflags;
 use crate::{
     driver::acpi::acpi_manager,
     kdebug, kinfo,
-    libs::{once::Once, spinlock::SpinLock, volatile::Volatile},
+    libs::{
+        once::Once,
+        spinlock::SpinLock,
+        volatile::{volwrite, Volatile},
+    },
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,

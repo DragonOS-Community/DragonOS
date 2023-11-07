@@ -122,7 +122,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
     {
         return;
     }
-    else if (rs_current_pcb_preempt_count() < 0)
+    else if ((int32_t)rs_current_pcb_preempt_count() < 0)
         kBUG("current_pcb->preempt_count<0! pid=%d", rs_current_pcb_pid()); // should not be here
 
     // 检测当前进程是否可被调度

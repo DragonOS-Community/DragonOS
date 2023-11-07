@@ -540,7 +540,6 @@ int shell_cmd_exec(int argc, char **argv)
             waitpid(pid, &retval, 0);
         else
             printf("[1] %d\n", pid); // 输出子进程的pid
-
         free(argv);
     }
 }
@@ -654,7 +653,7 @@ int parse_command(char *buf, int *argc, char ***argv)
         if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
             ++(*argc);
     }
-
+    
     // printf("\nargc=%d\n", *argc);
 
     // 为指向每个指令的指针分配空间

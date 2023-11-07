@@ -28,7 +28,7 @@
 #include "driver/multiboot2/multiboot2.h"
 #include <time/timer.h>
 
-#include <driver/interrupt/apic/apic_timer.h>
+#include <arch/x86_64/driver/apic/apic_timer.h>
 #include <virt/kvm/kvm.h>
 
 extern int rs_driver_init();
@@ -148,6 +148,7 @@ void system_initialize()
 
     rs_pci_init();
 
+
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
@@ -167,6 +168,7 @@ void system_initialize()
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 
     apic_timer_init();
+    // while(1);
     io_mfence();
     sti();
     while (1)

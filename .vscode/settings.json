@@ -182,4 +182,8 @@
         "./kernel/Cargo.toml",
         "./tools/Cargo.toml",
     ],
+    "rust-analyzer.check.overrideCommand": [
+        "make",
+        "check"
+    ],
 }

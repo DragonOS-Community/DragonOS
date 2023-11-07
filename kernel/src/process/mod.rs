@@ -34,6 +34,7 @@ use crate::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::Futex,
         },
+        lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -187,7 +188,7 @@ impl ProcessManager {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
         if state.is_blocked() {
-            let mut writer = pcb.sched_info_mut();
+            let mut writer: RwLockWriteGuard<'_, ProcessSchedulerInfo> = pcb.sched_info_mut();
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
@@ -510,7 +511,7 @@ pub struct ProcessControlBlock {
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
 
-    flags: SpinLock<ProcessFlags>,
+    flags: LockFreeFlags<ProcessFlags>,
     worker_private: SpinLock<Option<WorkerPrivate>>,
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
@@ -576,7 +577,7 @@ impl ProcessControlBlock {
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
-        let flags = SpinLock::new(ProcessFlags::empty());
+        let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
         let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
@@ -667,8 +668,8 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {
-        return self.flags.lock();
+    pub fn flags(&self) -> &mut ProcessFlags {
+        return self.flags.get_mut();
     }
 
     #[inline(always)]
@@ -712,6 +713,17 @@ impl ProcessControlBlock {
         return self.sched_info.read();
     }
 
+    #[inline(always)]
+    pub fn try_sched_info(&self, times: u8) -> Option<RwLockReadGuard<ProcessSchedulerInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sched_info.try_read() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
     #[allow(dead_code)]
     #[inline(always)]
     pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
@@ -719,8 +731,16 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn sched_info_upgradeable_irqsave(&self) -> RwLockUpgradableGuard<ProcessSchedulerInfo> {
-        return self.sched_info.upgradeable_read();
+    pub fn sched_info_try_upgradeable_irqsave(
+        &self,
+        times: u8,
+    ) -> Option<RwLockUpgradableGuard<ProcessSchedulerInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sched_info.try_upgradeable_read_irqsave() {
+                return Some(r);
+            }
+        }
+        return None;
     }
 
     #[inline(always)]
@@ -821,8 +841,28 @@ impl ProcessControlBlock {
         self.sig_info.write()
     }
 
+    pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sig_info.try_write() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock()
+    }
+
+    pub fn try_sig_struct_irq(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
+        for _ in 0..times {
+            if let Ok(r) = self.sig_struct.try_lock_irqsave() {
+                return Some(r);
+            }
+        }
+
+        return None;
     }
 
     pub fn sig_struct_irq(&self) -> SpinLockGuard<SignalStruct> {

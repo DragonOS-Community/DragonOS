@@ -186,8 +186,4 @@
         "make",
         "check"
     ],
-    "rust-analyzer.check.overrideCommand": [
-        "make",
-        "check"
-    ],
 }

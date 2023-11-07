@@ -50,10 +50,13 @@ impl Signal {
             kwarn!("No such process.");
             return retval;
         }
+
+        let pcb = pcb.unwrap();
         // println!("Target pcb = {:?}", pcb.as_ref().unwrap());
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 发送信号
-        retval = self.send_signal(info, pcb.unwrap(), PidType::PID);
+        retval = self.send_signal(info, pcb.clone(), PidType::PID);
+
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         return retval;
     }
@@ -282,8 +285,33 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // kdebug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
-    let r = ProcessManager::wakeup_stop(&pcb);
-    if r.is_ok() {
+    let state = pcb.sched_info().state();
+    let mut wakeup_ok = true;
+    if state.is_blocked_interruptable() {
+        ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
+            wakeup_ok = false;
+            kwarn!(
+                "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
+                ProcessManager::current_pcb().pid(),
+                pcb.pid(),
+                e
+            );
+        });
+    } else if state.is_stopped() {
+        ProcessManager::wakeup_stop(&pcb).unwrap_or_else(|e| {
+            wakeup_ok = false;
+            kwarn!(
+                "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
+                ProcessManager::current_pcb().pid(),
+                pcb.pid(),
+                e
+            );
+        });
+    } else {
+        wakeup_ok = false;
+    }
+
+    if wakeup_ok {
         ProcessManager::kick(&pcb);
     } else {
         if fatal {

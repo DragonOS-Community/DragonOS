@@ -467,6 +467,11 @@ impl ProcessState {
     }
 
     #[inline(always)]
+    pub fn is_blocked_interruptable(&self) -> bool {
+        return matches!(self, ProcessState::Blocked(true));
+    }
+
+    #[inline(always)]
     pub fn is_exited(&self) -> bool {
         return matches!(self, ProcessState::Exited(_));
     }

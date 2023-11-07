@@ -8,9 +8,6 @@ lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
 
-# 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
-PIC := _INTR_APIC_
-
 # unwind/backtrace related
 UNWIND_ENABLE ?= yes
 CFLAGS_UNWIND =
@@ -22,7 +19,7 @@ ifeq ($(UNWIND_ENABLE), yes)
     RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld 
 endif
 
-CFLAGS = $(GLOBAL_CFLAGS) -fno-pie $(CFLAGS_UNWIND) -D $(PIC) -I $(shell pwd) -I $(shell pwd)/include -I $(shell pwd)/arch/x86_64/include
+CFLAGS = $(GLOBAL_CFLAGS) -fno-pie $(CFLAGS_UNWIND) -I $(shell pwd) -I $(shell pwd)/include -I $(shell pwd)/arch/x86_64/include
 
 export ASFLAGS := --64
 
@@ -77,7 +74,7 @@ ECHO:
 
 $(kernel_subdirs): ECHO
 
-	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)" kernel_root_path="$(shell pwd)"
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)"  kernel_root_path="$(shell pwd)"
 
 kernel: head.o main.o $(kernel_subdirs) kernel_rust
 	

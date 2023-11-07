@@ -8,7 +8,7 @@ ECHO:
 
 $(kernel_driver_subdirs): ECHO
 
-	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" 
 
 all: $(kernel_driver_subdirs)
 

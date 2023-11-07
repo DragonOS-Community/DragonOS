@@ -91,7 +91,6 @@ impl CFilesBuilder {
             c.define("__x86_64__", None);
         }
 
-        c.define("PIC", "_INTR_APIC_");
     }
 
     fn setup_global_include_dir(c: &mut Build) {

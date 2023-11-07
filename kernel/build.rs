@@ -90,7 +90,6 @@ impl CFilesBuilder {
             #[cfg(target_arch = "x86_64")]
             c.define("__x86_64__", None);
         }
-
     }
 
     fn setup_global_include_dir(c: &mut Build) {

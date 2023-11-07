@@ -121,6 +121,11 @@ impl ProcessManager {
         kinfo!("Process Manager initialized.");
     }
 
+    /// 判断进程管理器是否已经初始化完成
+    pub fn initialized() -> bool {
+        unsafe { __PROCESS_MANAGEMENT_INIT_DONE }
+    }
+
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
         if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
@@ -459,6 +464,11 @@ impl ProcessState {
     #[inline(always)]
     pub fn is_blocked(&self) -> bool {
         return matches!(self, ProcessState::Blocked(_));
+    }
+
+    #[inline(always)]
+    pub fn is_blocked_interruptable(&self) -> bool {
+        return matches!(self, ProcessState::Blocked(true));
     }
 
     #[inline(always)]

@@ -2,7 +2,7 @@ use core::intrinsics::unlikely;
 
 use alloc::string::String;
 
-use thingbuf::mpsc::{
+use kdepends::thingbuf::mpsc::{
     self,
     errors::{TryRecvError, TrySendError},
 };

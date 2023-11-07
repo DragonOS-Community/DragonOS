@@ -11,7 +11,7 @@ use alloc::{
     vec::Vec,
 };
 
-use memoffset::offset_of;
+use kdepends::memoffset::offset_of;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{

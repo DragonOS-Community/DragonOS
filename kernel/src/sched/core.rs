@@ -1,4 +1,7 @@
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::{
+    intrinsics::unlikely,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use alloc::{sync::Arc, vec::Vec};
 
@@ -99,7 +102,13 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     // 当前进程持有锁，不切换，避免死锁
     if ProcessManager::current_pcb().preempt_count() != 0 {
         let binding = ProcessManager::current_pcb();
-        let mut guard = binding.sched_info_upgradeable_irqsave();
+        let guard = binding.sched_info_try_upgradeable_irqsave(5);
+        if unlikely(guard.is_none()) {
+            return None;
+        }
+
+        let mut guard = guard.unwrap();
+
         let state = guard.state();
         if state.is_blocked() {
             // try to upgrade
@@ -191,10 +200,16 @@ pub extern "C" fn sched_init() {
 /// @brief 当时钟中断到达时，更新时间片
 /// 请注意，该函数只能被时钟中断处理程序调用
 pub extern "C" fn sched_update_jiffies() {
-    let policy = ProcessManager::current_pcb().sched_info().policy();
+    let binding = ProcessManager::current_pcb();
+    let guard = binding.try_sched_info(10);
+    if unlikely(guard.is_none()) {
+        return;
+    }
+    let guard = guard.unwrap();
+    let policy = guard.policy();
     match policy {
         SchedPolicy::CFS => {
-            __get_cfs_scheduler().timer_update_jiffies();
+            __get_cfs_scheduler().timer_update_jiffies(&guard);
         }
         SchedPolicy::FIFO | SchedPolicy::RR => {
             __get_rt_scheduler().timer_update_jiffies();

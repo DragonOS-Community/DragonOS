@@ -265,6 +265,20 @@ impl<T> RwLock<T> {
         return r;
     }
 
+    #[allow(dead_code)]
+    pub fn try_upgradeable_read_irqsave(&self) -> Option<RwLockUpgradableGuard<T>> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
+        let mut r = self.inner_try_upgradeable_read();
+        if r.is_none() {
+            ProcessManager::preempt_enable();
+        } else {
+            r.as_mut().unwrap().irq_guard = Some(irq_guard);
+        }
+
+        return r;
+    }
+
     fn inner_try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
         // 获得UPGRADER守卫不需要查看读者位
         // 如果获得读者锁失败,不需要撤回fetch_or的原子操作

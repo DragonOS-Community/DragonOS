@@ -182,7 +182,7 @@ impl ProcessManager {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
         if state.is_blocked() {
-            let mut writer = pcb.sched_info_mut();
+            let mut writer: RwLockWriteGuard<'_, ProcessSchedulerInfo> = pcb.sched_info_mut();
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
@@ -707,6 +707,17 @@ impl ProcessControlBlock {
         return self.sched_info.read();
     }
 
+    #[inline(always)]
+    pub fn try_sched_info(&self, times: u8) -> Option<RwLockReadGuard<ProcessSchedulerInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sched_info.try_read() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
     #[allow(dead_code)]
     #[inline(always)]
     pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
@@ -714,8 +725,16 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn sched_info_upgradeable_irqsave(&self) -> RwLockUpgradableGuard<ProcessSchedulerInfo> {
-        return self.sched_info.upgradeable_read();
+    pub fn sched_info_try_upgradeable_irqsave(
+        &self,
+        times: u8,
+    ) -> Option<RwLockUpgradableGuard<ProcessSchedulerInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sched_info.try_upgradeable_read_irqsave() {
+                return Some(r);
+            }
+        }
+        return None;
     }
 
     #[inline(always)]
@@ -816,8 +835,28 @@ impl ProcessControlBlock {
         self.sig_info.write()
     }
 
+    pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sig_info.try_write() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock()
+    }
+
+    pub fn try_sig_struct_irq(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
+        for _ in 0..times {
+            if let Ok(r) = self.sig_struct.try_lock_irqsave() {
+                return Some(r);
+            }
+        }
+
+        return None;
     }
 
     pub fn sig_struct_irq(&self) -> SpinLockGuard<SignalStruct> {

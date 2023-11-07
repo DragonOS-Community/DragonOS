@@ -48,7 +48,7 @@ impl<K: Ord, V: Clone + PartialEq + Debug> LogSet<K, V> {
                     prev, cloned_value
                 );
             }
-
+        } else {
             self.log_file
                 .as_mut()
                 .map(|f| writeln!(f, "{:?}", cloned_value).ok());

@@ -4,3 +4,6 @@ fmt:
 
 clean:
 	@cargo clean
+
+check:
+	@cargo check --all

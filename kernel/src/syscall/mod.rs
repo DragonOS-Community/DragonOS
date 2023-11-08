@@ -39,6 +39,7 @@ pub mod user_access;
 #[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Eq, Clone)]
 #[allow(dead_code, non_camel_case_types)]
 pub enum SystemError {
+    /// 操作不被允许 Operation not permitted.
     EPERM = 1,
     /// 没有指定的文件或目录 No such file or directory.
     ENOENT = 2,
@@ -335,26 +336,25 @@ pub const SYS_READ: usize = 0;
 pub const SYS_WRITE: usize = 1;
 pub const SYS_OPEN: usize = 2;
 pub const SYS_CLOSE: usize = 3;
-#[allow(dead_code)]
 pub const SYS_STAT: usize = 4;
 pub const SYS_FSTAT: usize = 5;
 
-#[allow(dead_code)]
 pub const SYS_POLL: usize = 7;
 pub const SYS_LSEEK: usize = 8;
 pub const SYS_MMAP: usize = 9;
 pub const SYS_MPROTECT: usize = 10;
+
 pub const SYS_MUNMAP: usize = 11;
 pub const SYS_BRK: usize = 12;
 pub const SYS_SIGACTION: usize = 13;
-#[allow(dead_code)]
 pub const SYS_RT_SIGPROCMASK: usize = 14;
-
 pub const SYS_RT_SIGRETURN: usize = 15;
+
 pub const SYS_IOCTL: usize = 16;
 
-#[allow(dead_code)]
 pub const SYS_WRITEV: usize = 20;
+
+pub const SYS_MADVISE: usize = 28;
 
 pub const SYS_DUP: usize = 32;
 pub const SYS_DUP2: usize = 33;
@@ -401,18 +401,17 @@ pub const SYS_MKDIR: usize = 83;
 
 pub const SYS_GETTIMEOFDAY: usize = 96;
 
-#[allow(dead_code)]
-pub const SYS_SIGALTSTACK: usize = 131;
+pub const SYS_GETPPID: usize = 110;
+pub const SYS_GETPGID: usize = 121;
 
-#[allow(dead_code)]
+pub const SYS_SIGALTSTACK: usize = 131;
+pub const SYS_MKNOD: usize = 133;
+
 pub const SYS_ARCH_PRCTL: usize = 158;
 
 pub const SYS_REBOOT: usize = 169;
 
-pub const SYS_GETPPID: usize = 110;
-pub const SYS_GETPGID: usize = 121;
-
-pub const SYS_MKNOD: usize = 133;
+pub const SYS_GETTID: usize = 186;
 
 #[allow(dead_code)]
 pub const SYS_TKILL: usize = 200;
@@ -427,6 +426,8 @@ pub const SYS_SET_TID_ADDR: usize = 218;
 pub const SYS_EXIT_GROUP: usize = 231;
 
 pub const SYS_UNLINK_AT: usize = 263;
+
+pub const SYS_ACCEPT4: usize = 288;
 
 pub const SYS_PIPE: usize = 293;
 
@@ -490,7 +491,6 @@ impl Syscall {
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
                     Self::open(path, open_flags)
                 };
-
                 res
             }
             SYS_CLOSE => {
@@ -917,6 +917,12 @@ impl Syscall {
             SYS_LISTEN => Self::listen(args[0], args[1]),
             SYS_SHUTDOWN => Self::shutdown(args[0], args[1]),
             SYS_ACCEPT => Self::accept(args[0], args[1] as *mut SockAddr, args[2] as *mut u32),
+            SYS_ACCEPT4 => Self::accept4(
+                args[0],
+                args[1] as *mut SockAddr,
+                args[2] as *mut u32,
+                args[3] as u32,
+            ),
             SYS_GETSOCKNAME => {
                 Self::getsockname(args[0], args[1] as *mut SockAddr, args[2] as *mut u32)
             }
@@ -1127,6 +1133,12 @@ impl Syscall {
                 kwarn!("SYS_EXIT_GROUP has not yet been implemented");
                 Ok(0)
             }
+
+            SYS_MADVISE => {
+                kwarn!("SYS_MADVISE has not yet been implemented");
+                Ok(0)
+            }
+            SYS_GETTID => Self::gettid().map(|tid| tid.into()),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

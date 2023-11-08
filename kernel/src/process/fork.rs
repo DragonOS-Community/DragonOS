@@ -1,7 +1,9 @@
+use core::{intrinsics::unlikely, sync::atomic::Ordering};
+
 use alloc::{string::ToString, sync::Arc};
 
 use crate::{
-    arch::interrupt::TrapFrame,
+    arch::{interrupt::TrapFrame, ipc::signal::Signal},
     filesystem::procfs::procfs_register_pid,
     ipc::signal::flush_signal_handlers,
     libs::rwlock::RwLock,
@@ -88,7 +90,8 @@ pub struct KernelCloneArgs {
     pub parent_tid: VirtAddr,
     pub set_tid: VirtAddr,
 
-    pub exit_signal: i32,
+    /// 进程退出时发送的信号
+    pub exit_signal: Signal,
 
     pub stack: usize,
     // clone3用到
@@ -115,7 +118,7 @@ impl KernelCloneArgs {
             child_tid: null_addr,
             parent_tid: null_addr,
             set_tid: null_addr,
-            exit_signal: 0,
+            exit_signal: Signal::SIGCHLD,
             stack: 0,
             stack_size: 0,
             tls: 0,
@@ -157,6 +160,8 @@ impl ProcessManager {
 
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
+        args.exit_signal = Signal::SIGCHLD;
+
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe)?;
 
         ProcessManager::add_pcb(pcb.clone());
@@ -188,7 +193,7 @@ impl ProcessManager {
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
-        *new_pcb.flags.lock() = ProcessManager::current_pcb().flags().clone();
+        *new_pcb.flags.get_mut() = ProcessManager::current_pcb().flags().clone();
         return Ok(());
     }
 
@@ -394,7 +399,13 @@ impl ProcessManager {
             )
         });
 
-        // todo: 拷贝信号相关数据
+        // 拷贝信号相关数据
+        Self::copy_sighand(&clone_flags, &current_pcb, &pcb).map_err(|e| {
+            panic!(
+                "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        })?;
 
         // 拷贝线程
         Self::copy_thread(&current_pcb, &pcb, clone_args,&current_trapframe).unwrap_or_else(|e| {
@@ -403,6 +414,50 @@ impl ProcessManager {
                 current_pcb.pid(), pcb.pid(), e
             )
         });
+
+        // 设置线程组id、组长
+        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+            pcb.thread.write().group_leader = current_pcb.thread.read().group_leader.clone();
+            unsafe {
+                let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+                (*ptr).tgid = current_pcb.tgid;
+            }
+        } else {
+            pcb.thread.write().group_leader = Arc::downgrade(&pcb);
+            unsafe {
+                let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+                (*ptr).tgid = pcb.tgid;
+            }
+        }
+
+        // CLONE_PARENT re-uses the old parent
+        if clone_flags.contains(CloneFlags::CLONE_PARENT | CloneFlags::CLONE_THREAD) {
+            *pcb.real_parent_pcb.write() = current_pcb.real_parent_pcb.read().clone();
+
+            if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+            } else {
+                let leader = current_pcb.thread.read().group_leader();
+                if unlikely(leader.is_none()) {
+                    panic!(
+                        "fork: Failed to get leader of current process, current pid: [{:?}]",
+                        current_pcb.pid()
+                    );
+                }
+
+                pcb.exit_signal.store(
+                    leader.unwrap().exit_signal.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }
+        } else {
+            // 新创建的进程，设置其父进程为当前进程
+            *pcb.real_parent_pcb.write() = Arc::downgrade(&current_pcb);
+            pcb.exit_signal
+                .store(clone_args.exit_signal, Ordering::SeqCst);
+        }
+
+        // todo: 增加线程组相关的逻辑。 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/fork.c#2437
 
         Ok(())
     }

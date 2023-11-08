@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{compiler_fence, AtomicBool, Ordering},
 };
 
-use memoffset::offset_of;
+use kdepends::memoffset::offset_of;
 
 use crate::{
     arch::process::table::TSSManager, exception::InterruptArch,

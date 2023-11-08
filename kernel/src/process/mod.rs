@@ -15,7 +15,7 @@ use hashbrown::HashMap;
 
 use crate::{
     arch::{
-        ipc::signal::{SigSet, Signal},
+        ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         sched::sched,
         CurrentIrqArch,
@@ -34,6 +34,7 @@ use crate::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::Futex,
         },
+        lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -120,6 +121,11 @@ impl ProcessManager {
         kinfo!("Process Manager initialized.");
     }
 
+    /// 判断进程管理器是否已经初始化完成
+    pub fn initialized() -> bool {
+        unsafe { __PROCESS_MANAGEMENT_INIT_DONE }
+    }
+
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
         if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
@@ -182,7 +188,7 @@ impl ProcessManager {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
         if state.is_blocked() {
-            let mut writer = pcb.sched_info_mut();
+            let mut writer: RwLockWriteGuard<'_, ProcessSchedulerInfo> = pcb.sched_info_mut();
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
@@ -302,7 +308,8 @@ impl ProcessManager {
                     parent_pcb.pid()
                 );
             }
-            // todo: 当信号机制重写后，这里需要向父进程发送SIGCHLD信号
+            // todo: 这里需要向父进程发送SIGCHLD信号
+            // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }
 
@@ -461,6 +468,11 @@ impl ProcessState {
     }
 
     #[inline(always)]
+    pub fn is_blocked_interruptable(&self) -> bool {
+        return matches!(self, ProcessState::Blocked(true));
+    }
+
+    #[inline(always)]
     pub fn is_exited(&self) -> bool {
         return matches!(self, ProcessState::Exited(_));
     }
@@ -500,12 +512,14 @@ bitflags! {
 pub struct ProcessControlBlock {
     /// 当前进程的pid
     pid: Pid,
+    /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
+    tgid: Pid,
 
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
 
-    flags: SpinLock<ProcessFlags>,
+    flags: LockFreeFlags<ProcessFlags>,
     worker_private: SpinLock<Option<WorkerPrivate>>,
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
@@ -521,9 +535,13 @@ pub struct ProcessControlBlock {
     sig_info: RwLock<ProcessSignalInfo>,
     /// 信号处理结构体
     sig_struct: SpinLock<SignalStruct>,
+    /// 退出信号S
+    exit_signal: AtomicSignal,
 
     /// 父进程指针
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// 真实父进程指针
+    real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
     children: RwLock<Vec<Pid>>,
@@ -571,7 +589,7 @@ impl ProcessControlBlock {
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
-        let flags = SpinLock::new(ProcessFlags::empty());
+        let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
         let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
@@ -582,6 +600,7 @@ impl ProcessControlBlock {
 
         let pcb = Self {
             pid,
+            tgid: pid,
             basic: basic_info,
             preempt_count,
             flags,
@@ -592,7 +611,9 @@ impl ProcessControlBlock {
             arch_info,
             sig_info: RwLock::new(ProcessSignalInfo::default()),
             sig_struct: SpinLock::new(SignalStruct::default()),
-            parent_pcb: RwLock::new(ppcb),
+            exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+            parent_pcb: RwLock::new(ppcb.clone()),
+            real_parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::INIT,
             thread: RwLock::new(ThreadInfo::new()),
@@ -662,8 +683,8 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> SpinLockGuard<ProcessFlags> {
-        return self.flags.lock();
+    pub fn flags(&self) -> &mut ProcessFlags {
+        return self.flags.get_mut();
     }
 
     #[inline(always)]
@@ -707,6 +728,17 @@ impl ProcessControlBlock {
         return self.sched_info.read();
     }
 
+    #[inline(always)]
+    pub fn try_sched_info(&self, times: u8) -> Option<RwLockReadGuard<ProcessSchedulerInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sched_info.try_read() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
     #[allow(dead_code)]
     #[inline(always)]
     pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
@@ -714,8 +746,16 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn sched_info_upgradeable_irqsave(&self) -> RwLockUpgradableGuard<ProcessSchedulerInfo> {
-        return self.sched_info.upgradeable_read();
+    pub fn sched_info_try_upgradeable_irqsave(
+        &self,
+        times: u8,
+    ) -> Option<RwLockUpgradableGuard<ProcessSchedulerInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sched_info.try_upgradeable_read_irqsave() {
+                return Some(r);
+            }
+        }
+        return None;
     }
 
     #[inline(always)]
@@ -736,6 +776,11 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn pid(&self) -> Pid {
         return self.pid;
+    }
+
+    #[inline(always)]
+    pub fn tgid(&self) -> Pid {
+        return self.tgid;
     }
 
     /// 获取文件描述符表的Arc指针
@@ -816,8 +861,28 @@ impl ProcessControlBlock {
         self.sig_info.write()
     }
 
+    pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sig_info.try_write() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock()
+    }
+
+    pub fn try_sig_struct_irq(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
+        for _ in 0..times {
+            if let Ok(r) = self.sig_struct.try_lock_irqsave() {
+                return Some(r);
+            }
+        }
+
+        return None;
     }
 
     pub fn sig_struct_irq(&self) -> SpinLockGuard<SignalStruct> {
@@ -845,6 +910,8 @@ pub struct ThreadInfo {
     set_child_tid: Option<VirtAddr>,
 
     vfork_done: Option<Arc<Completion>>,
+    /// 线程组的组长
+    group_leader: Weak<ProcessControlBlock>,
 }
 
 impl ThreadInfo {
@@ -853,7 +920,12 @@ impl ThreadInfo {
             clear_child_tid: None,
             set_child_tid: None,
             vfork_done: None,
+            group_leader: Weak::default(),
         }
+    }
+
+    pub fn group_leader(&self) -> Option<Arc<ProcessControlBlock>> {
+        return self.group_leader.upgrade();
     }
 }
 

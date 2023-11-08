@@ -1,5 +1,8 @@
+use klog_types::AllocLogItem;
+
 use crate::{
     arch::mm::LockedFrameAllocator,
+    debug::klog::mm::mm_debug_log,
     libs::align::page_align_up,
     mm::{MMArch, MemoryManagementArch, VirtAddr},
 };
@@ -81,15 +84,46 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        return self.local_alloc(layout);
+        let r = self.local_alloc(layout);
+        mm_debug_log(
+            klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
+                layout.clone(),
+                Some(r as usize),
+                None,
+            )),
+            klog_types::LogSource::Buddy,
+        );
+
+        return r;
+
         // self.local_alloc_zeroed(layout, 0)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.local_alloc_zeroed(layout)
+        let r = self.local_alloc_zeroed(layout);
+
+        mm_debug_log(
+            klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
+                layout.clone(),
+                Some(r as usize),
+                None,
+            )),
+            klog_types::LogSource::Buddy,
+        );
+
+        return r;
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        mm_debug_log(
+            klog_types::AllocatorLogType::Free(AllocLogItem::new(
+                layout.clone(),
+                Some(ptr as usize),
+                None,
+            )),
+            klog_types::LogSource::Buddy,
+        );
+
         self.local_dealloc(ptr, layout);
     }
 }

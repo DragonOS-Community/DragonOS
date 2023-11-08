@@ -1,0 +1,17 @@
+[package]
+name = "logmonitor"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+klog_types = { path = "../../../kernel/crates/klog_types" }
+crossterm = "0.26.1"
+ratatui = "0.24.0"
+clap = { version = "4.4.7", features = ["color", "error-context", "help", "std", "suggestions", "usage", "derive"] }
+rand = "0.8.5"
+goblin = "0.7.1"
+simple_logger = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/rust-simple_logger.git", "rev" = "36ab404868" }
+log = "0.4.20"
+lazy_static = "1.4.0"

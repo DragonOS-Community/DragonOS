@@ -68,7 +68,7 @@ ENTRY(ret_from_intr)
     // 将原本要返回的栈帧的栈指针传入do_signal的第一个参数
     movq %rsp, %rdi
     callq do_signal
-
+    cli
 
 __entry_ret_from_intr_before_gs_check_2:
     push %rcx
@@ -138,6 +138,7 @@ __entry_err_code_after_gs_check_1:
 
     callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
 
+__entry_err_code_to_ret_from_exception:
     jmp ret_from_exception
 
 

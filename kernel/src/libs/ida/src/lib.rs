@@ -16,9 +16,9 @@ pub struct IdAllocator {
 
 impl IdAllocator {
     /// 创建一个新的id分配器
-    pub const fn new(max_id: usize) -> Self {
+    pub const fn new(initial_id: usize, max_id: usize) -> Self {
         Self {
-            current_id: AtomicUsize::new(0),
+            current_id: AtomicUsize::new(initial_id),
             max_id,
             dead: AtomicBool::new(false),
         }

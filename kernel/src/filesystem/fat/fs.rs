@@ -1511,6 +1511,17 @@ impl IndexNode for LockedFATInode {
         }
     }
 
+    fn truncate(&self, len: usize) -> Result<(), SystemError> {
+        let guard: SpinLockGuard<FATInode> = self.0.lock();
+        let old_size = guard.metadata.size as usize;
+        if len < old_size {
+            drop(guard);
+            self.resize(len)
+        } else {
+            Ok(())
+        }
+    }
+
     fn list(&self) -> Result<Vec<String>, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fatent: &FATDirEntry = &guard.inode_type;

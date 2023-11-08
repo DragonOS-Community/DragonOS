@@ -197,7 +197,7 @@ pub trait Socket: Sync + Send + Debug {
         _optval: &[u8],
     ) -> Result<(), SystemError> {
         kwarn!("setsockopt is not implemented");
-        return Err(SystemError::ENOSYS);
+        return Ok(());
     }
 }
 

@@ -191,14 +191,6 @@ impl Syscall {
             return Err(SystemError::ENOTDIR);
         }
 
-        // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-        if mode.contains(FileMode::O_TRUNC)
-            && (mode.contains(FileMode::O_RDWR) || mode.contains(FileMode::O_WRONLY))
-            && file_type == FileType::File
-        {
-            inode.truncate(0)?;
-        }
-
         // 创建文件对象
 
         let mut file: File = File::new(inode, mode)?;
@@ -206,6 +198,14 @@ impl Syscall {
         // 打开模式为“追加”
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
+        }
+
+        // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
+        if mode.contains(FileMode::O_TRUNC)
+            && (mode.contains(FileMode::O_RDWR) || mode.contains(FileMode::O_WRONLY))
+            && file_type == FileType::File
+        {
+            file.ftruncate(0)?;
         }
         // 把文件对象存入pcb
         let r = ProcessManager::current_pcb()

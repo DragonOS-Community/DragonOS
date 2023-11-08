@@ -357,6 +357,8 @@ pub const SYS_IOCTL: usize = 16;
 #[allow(dead_code)]
 pub const SYS_WRITEV: usize = 20;
 
+pub const SYS_MADVISE: usize = 28;
+
 pub const SYS_DUP: usize = 32;
 pub const SYS_DUP2: usize = 33;
 
@@ -1125,6 +1127,11 @@ impl Syscall {
 
             SYS_EXIT_GROUP => {
                 kwarn!("SYS_EXIT_GROUP has not yet been implemented");
+                Ok(0)
+            }
+
+            SYS_MADVISE => {
+                kwarn!("SYS_MADVISE has not yet been implemented");
                 Ok(0)
             }
 

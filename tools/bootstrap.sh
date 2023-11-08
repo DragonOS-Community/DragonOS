@@ -44,11 +44,21 @@ install_ubuntu_debian_pkg()
         gnupg \
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
-        gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config
+        gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
+		musl-tools sphinx
+	
+	# 如果python3没有安装
+	if [ -z "$(which python3)" ]; then
+		echo "正在安装python3..."
+		sudo apt install -y python3 python3-pip
+	fi
 
     if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."
         sudo apt install -y docker.io docker-compose
+		sudo usermod -aG docker $USER
+		sudo newgrp docker
+		sudo systemctl restart docker
     elif [ -z ${dockerInstall} ]; then
 		echo "您传入--no-docker参数生效, 安装docker步骤被跳过."
 	elif [ -n "$(which docker)" ]; then
@@ -75,7 +85,7 @@ install_archlinux_pkg()
 	curl wget bridge-utils dnsmasq \
         diffutils pkgconf which unzip util-linux dosfstools \
         gcc make flex texinfo gmp mpfr qemu-base \
-        libmpc libssl-dev
+        libmpc libssl-dev musl
 
 }
 
@@ -161,6 +171,41 @@ rustInstall() {
 	fi
 }
 
+####################################################################################
+# 初始化DragonOS的musl交叉编译工具链
+# 主要是把musl交叉编译工具链的rcrt1.o替换为crt1.o (因为rust的rcrt1.o会使用动态链接的解释器，但是DragonOS目前尚未把它加载进来)
+#
+# 为DragonOS开发应用的时候，请使用 `cargo +nightly-2023-08-15-x86_64-unknown-linux-gnu build --target x86_64-unknown-linux-musl` 来编译
+# 	这样编译出来的应用将能二进制兼容DragonOS 
+####################################################################################
+initialize_userland_musl_toolchain()
+{
+	fork_toolchain_from="nightly-2023-08-15-x86_64-unknown-linux-gnu"
+	custom_toolchain="nightly-2023-08-15-x86_64-unknown-linux_dragonos-gnu"
+	custom_toolchain_dir="$(dirname $(rustc --print sysroot))/${custom_toolchain}"
+	# 如果目录为空
+	if [ ! -d "${custom_toolchain_dir}" ]; then
+		echo "Custom toolchain does not exist, creating..."
+		rustup toolchain install ${fork_toolchain_from}
+		rustup component add --toolchain ${fork_toolchain_from} rust-src
+		rustup target add --toolchain ${fork_toolchain_from} x86_64-unknown-linux-musl
+		cp -r $(dirname $(rustc --print sysroot))/${fork_toolchain_from} ${custom_toolchain_dir}
+		self_contained_dir=${custom_toolchain_dir}/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained
+		cp -f ${self_contained_dir}/crt1.o ${self_contained_dir}/rcrt1.o
+	else
+		echo "Custom toolchain already exists."
+	fi
+
+}
+
+
+install_python_pkg()
+{
+	echo "正在安装python依赖项..."
+	# 安装文档生成工具
+	sh -c "cd ../docs && pip3 install -r requirements.txt"
+}
+
 
 ############# 脚本开始 ##############
 # 读取参数及选项，使用 -help 参数查看详细选项
@@ -220,6 +265,11 @@ else
 fi
 
 rustInstall     # 安装rust
+
+
+#  初始化DragonOS的musl交叉编译工具链
+initialize_userland_musl_toolchain
+install_python_pkg
 
 # 安装dadk
 cargo install dadk || exit 1

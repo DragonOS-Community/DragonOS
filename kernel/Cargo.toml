@@ -41,6 +41,7 @@ ida = { path = "src/libs/ida" }
 [build-dependencies]
 bindgen = "0.61.0"
 cc = { version = "1.0.83", features = ["parallel"] }
+toml = "0.8.6"
 
 [dependencies.lazy_static]
 version = "1.4.0"
@@ -56,3 +57,8 @@ debug = true   # Controls whether the compiler passes `-g`
 [profile.release]
 debug = false
 
+[features]
+init_debug = []
+mm_debug = []
+allocator_debug = []
+net_debug = []

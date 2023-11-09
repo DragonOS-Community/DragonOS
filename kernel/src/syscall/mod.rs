@@ -415,6 +415,8 @@ pub const SYS_REBOOT: usize = 169;
 pub const SYS_GETPPID: usize = 110;
 pub const SYS_GETPGID: usize = 121;
 
+pub const SYS_GETTID: usize = 186;
+
 pub const SYS_MKNOD: usize = 133;
 
 #[allow(dead_code)]
@@ -1134,6 +1136,7 @@ impl Syscall {
                 kwarn!("SYS_MADVISE has not yet been implemented");
                 Ok(0)
             }
+            SYS_GETTID => Self::gettid().map(|tid| tid.into()),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

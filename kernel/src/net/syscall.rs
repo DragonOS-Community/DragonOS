@@ -21,6 +21,10 @@ use super::{
     Endpoint, Protocol, ShutdownType, Socket,
 };
 
+/// Flags for socket, socketpair, accept4
+const SOCK_CLOEXEC: FileMode = FileMode::O_CLOEXEC;
+const SOCK_NONBLOCK: FileMode = FileMode::O_NONBLOCK;
+
 impl Syscall {
     /// @brief sys_socket系统调用的实际执行函数
     ///
@@ -332,6 +336,50 @@ impl Syscall {
     ///
     /// @return 成功返回新的文件描述符，失败返回错误码
     pub fn accept(fd: usize, addr: *mut SockAddr, addrlen: *mut u32) -> Result<usize, SystemError> {
+        return Self::do_accept(fd, addr, addrlen, 0);
+    }
+
+    /// sys_accept4 - accept a connection on a socket
+    ///
+    ///
+    /// If flags is 0, then accept4() is the same as accept().  The
+    ///    following values can be bitwise ORed in flags to obtain different
+    ///    behavior:
+    ///
+    /// - SOCK_NONBLOCK
+    ///     Set the O_NONBLOCK file status flag on the open file
+    ///     description (see open(2)) referred to by the new file
+    ///     descriptor.  Using this flag saves extra calls to fcntl(2)
+    ///     to achieve the same result.
+    ///
+    /// - SOCK_CLOEXEC
+    ///     Set the close-on-exec (FD_CLOEXEC) flag on the new file
+    ///     descriptor.  See the description of the O_CLOEXEC flag in
+    ///     open(2) for reasons why this may be useful.
+    pub fn accept4(
+        fd: usize,
+        addr: *mut SockAddr,
+        addrlen: *mut u32,
+        mut flags: u32,
+    ) -> Result<usize, SystemError> {
+        // 如果flags不合法，返回错误
+        if (flags & (!(SOCK_CLOEXEC | SOCK_NONBLOCK)).bits()) != 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        if SOCK_NONBLOCK != FileMode::O_NONBLOCK && ((flags & SOCK_NONBLOCK.bits()) != 0) {
+            flags = (flags & !SOCK_NONBLOCK.bits()) | FileMode::O_NONBLOCK.bits();
+        }
+
+        return Self::do_accept(fd, addr, addrlen, flags);
+    }
+
+    fn do_accept(
+        fd: usize,
+        addr: *mut SockAddr,
+        addrlen: *mut u32,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
@@ -344,10 +392,19 @@ impl Syscall {
         // kdebug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
         let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
+
+        let mut file_mode = FileMode::O_RDWR;
+        if flags & FileMode::O_NONBLOCK.bits() != 0 {
+            file_mode |= FileMode::O_NONBLOCK;
+        }
+        if flags & FileMode::O_CLOEXEC.bits() != 0 {
+            file_mode |= FileMode::O_CLOEXEC;
+        }
+
         let new_fd = ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(File::new(new_socket, FileMode::O_RDWR)?, None)?;
+            .alloc_fd(File::new(new_socket, file_mode)?, None)?;
         // kdebug!("accept: new_fd={}", new_fd);
         if !addr.is_null() {
             // kdebug!("accept: write remote_endpoint to user");

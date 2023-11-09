@@ -411,12 +411,7 @@ pub const SYS_ARCH_PRCTL: usize = 158;
 
 pub const SYS_REBOOT: usize = 169;
 
-pub const SYS_GETPPID: usize = 110;
-pub const SYS_GETPGID: usize = 121;
-
 pub const SYS_GETTID: usize = 186;
-
-pub const SYS_MKNOD: usize = 133;
 
 #[allow(dead_code)]
 pub const SYS_TKILL: usize = 200;

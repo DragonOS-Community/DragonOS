@@ -198,7 +198,7 @@ impl FATFile {
             // 计算本次写入位置在磁盘上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
             // 写入磁盘
-            let w: usize = fs.partition.disk().write_at(
+            let w: usize = fs.partition.disk().write_at_bytes(
                 offset as usize,
                 end_len,
                 &buf[start..start + end_len],

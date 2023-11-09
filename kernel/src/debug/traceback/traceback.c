@@ -2,7 +2,7 @@
 #include <common/printk.h>
 #include <process/process.h>
 
-static int lookup_kallsyms(uint64_t addr, int level)
+int lookup_kallsyms(uint64_t addr, int level)
 {
     const char *str = (const char *)&kallsyms_names;
 

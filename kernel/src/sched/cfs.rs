@@ -9,9 +9,12 @@ use crate::{
     kBUG,
     libs::{
         rbtree::RBTree,
+        rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{
+        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSchedulerInfo, ProcessState,
+    },
     smp::core::smp_get_processor_id,
 };
 
@@ -142,12 +145,25 @@ impl SchedulerCFS {
     }
 
     /// @brief 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间
-    pub fn timer_update_jiffies(&mut self) {
+    pub fn timer_update_jiffies(
+        &mut self,
+        sched_info_guard: &RwLockReadGuard<'_, ProcessSchedulerInfo>,
+    ) {
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[smp_get_processor_id() as usize];
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
+        let mut queue = None;
+        for _ in 0..10 {
+            if let Ok(q) = current_cpu_queue.locked_queue.try_lock() {
+                queue = Some(q);
+                break;
+            }
+        }
+        if queue.is_none() {
+            return;
+        }
+        let queue = queue.unwrap();
         // 更新进程的剩余可执行时间
-        let queue = current_cpu_queue.locked_queue.lock();
         current_cpu_queue.cpu_exec_proc_jiffies -= 1;
         // 时间片耗尽，标记需要被调度
         if current_cpu_queue.cpu_exec_proc_jiffies <= 0 {
@@ -158,9 +174,7 @@ impl SchedulerCFS {
         drop(queue);
 
         // 更新当前进程的虚拟运行时间
-        ProcessManager::current_pcb()
-            .sched_info()
-            .increase_virtual_runtime(1);
+        sched_info_guard.increase_virtual_runtime(1);
     }
 
     /// @brief 将进程加入cpu的cfs调度队列，并且重设其虚拟运行时间为当前队列的最小值

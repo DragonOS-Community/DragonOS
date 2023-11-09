@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use core::intrinsics::unlikely;
+
 use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
@@ -26,8 +28,20 @@ pub struct WaitQueue(SpinLock<InnerWaitQueue>);
 impl WaitQueue {
     pub const INIT: WaitQueue = WaitQueue(SpinLock::new(InnerWaitQueue::INIT));
 
+    fn before_sleep_check(&self, max_preempt: usize) {
+        let pcb = ProcessManager::current_pcb();
+        if unlikely(pcb.preempt_count() > max_preempt) {
+            kwarn!(
+                "Process {:?}: Try to sleep when preempt count is {}",
+                pcb.pid(),
+                pcb.preempt_count()
+            );
+        }
+    }
+
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {
+        self.before_sleep_check(0);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -42,6 +56,7 @@ impl WaitQueue {
     where
         F: FnOnce(),
     {
+        self.before_sleep_check(0);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
@@ -50,6 +65,7 @@ impl WaitQueue {
         drop(irq_guard);
         guard.wait_list.push_back(ProcessManager::current_pcb());
         f();
+
         drop(guard);
         sched();
     }
@@ -69,6 +85,7 @@ impl WaitQueue {
     /// 由于sleep_without_schedule不会调用调度函数，因此，如果开发者忘记在执行本函数之后，手动调用调度函数，
     /// 由于时钟中断到来或者‘其他cpu kick了当前cpu’，可能会导致一些未定义的行为。
     pub unsafe fn sleep_without_schedule(&self) {
+        self.before_sleep_check(0);
         // 安全检查：确保当前处于中断禁止状态
         assert!(CurrentIrqArch::is_irq_enabled() == false);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
@@ -80,6 +97,7 @@ impl WaitQueue {
     }
 
     pub unsafe fn sleep_without_schedule_uninterruptible(&self) {
+        self.before_sleep_check(0);
         // 安全检查：确保当前处于中断禁止状态
         assert!(CurrentIrqArch::is_irq_enabled() == false);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
@@ -91,6 +109,7 @@ impl WaitQueue {
     }
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断
     pub fn sleep_uninterruptible(&self) {
+        self.before_sleep_check(0);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
@@ -105,6 +124,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
     pub fn sleep_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
+        self.before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
@@ -120,6 +140,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
     pub fn sleep_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
+        self.before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
@@ -135,6 +156,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
     pub fn sleep_uninterruptible_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
+        self.before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
@@ -150,6 +172,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
     pub fn sleep_uninterruptible_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
+        self.before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {

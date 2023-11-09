@@ -94,8 +94,6 @@ impl CFilesBuilder {
             #[cfg(target_arch = "x86_64")]
             c.define("__x86_64__", None);
         }
-
-        c.define("PIC", "_INTR_APIC_");
     }
 
     fn setup_global_include_dir(c: &mut Build) {
@@ -109,7 +107,77 @@ impl CFilesBuilder {
 
     /// 设置需要编译的文件
     fn setup_files(c: &mut Build) {
-        c.file("src/arch/x86_64/driver/hpet.c");
+        let mut files = Vec::new();
+
+        #[cfg(target_arch = "x86_64")]
+        Self::setup_files_x86_64(&mut files);
+
+        Self::set_rerun_if_files_changed(&files);
+        c.files(files.as_slice());
+    }
+
+    /// 设置x86_64架构下需要编译的C文件
+    fn setup_files_x86_64(files: &mut Vec<PathBuf>) {
+        files.push(PathBuf::from("src/arch/x86_64/driver/hpet.c"));
+        // 获取`kernel/src/arch/x86_64/driver/apic`下的所有C文件
+        files.append(&mut FileUtils::list_all_files(
+            &PathBuf::from("src/arch/x86_64/driver/apic"),
+            Some("c"),
+            true,
+        ));
+    }
+
+    /// 设置Cargo对文件更改的监听
+    fn set_rerun_if_files_changed(files: &Vec<PathBuf>) {
+        for f in files {
+            println!("cargo:rerun-if-changed={}", f.to_str().unwrap());
+        }
+    }
+}
+
+struct FileUtils;
+
+impl FileUtils {
+    /// 列出指定目录下的所有文件
+    ///
+    /// ## 参数
+    ///
+    /// - `path` - 指定的目录
+    /// - `ext_name` - 文件的扩展名，如果为None，则列出所有文件
+    /// - `recursive` - 是否递归列出所有文件
+    pub fn list_all_files(path: &PathBuf, ext_name: Option<&str>, recursive: bool) -> Vec<PathBuf> {
+        let mut queue: Vec<PathBuf> = Vec::new();
+        let mut result = Vec::new();
+        queue.push(path.clone());
+
+        while !queue.is_empty() {
+            let path = queue.pop().unwrap();
+            let d = std::fs::read_dir(path);
+            if d.is_err() {
+                continue;
+            }
+            let d = d.unwrap();
+
+            d.for_each(|ent| {
+                if let Ok(ent) = ent {
+                    if let Ok(file_type) = ent.file_type() {
+                        if file_type.is_file() {
+                            if let Some(e) = ext_name {
+                                if let Some(ext) = ent.path().extension() {
+                                    if ext == e {
+                                        result.push(ent.path());
+                                    }
+                                }
+                            }
+                        } else if file_type.is_dir() && recursive {
+                            queue.push(ent.path());
+                        }
+                    }
+                }
+            });
+        }
+
+        return result;
     }
 }
 

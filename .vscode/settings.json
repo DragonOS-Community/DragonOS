@@ -177,10 +177,13 @@
     },
     "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",
-    "rust-analyzer.cargo.target": "x86_64-unknown-none",
     "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.linkedProjects": [
         "./kernel/Cargo.toml",
-        "./kernel/src/libs/ida/Cargo.toml"
+        "./tools/Cargo.toml",
+    ],
+    "rust-analyzer.check.overrideCommand": [
+        "make",
+        "check"
     ],
 }

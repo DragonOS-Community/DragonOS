@@ -16,11 +16,11 @@
 #pragma GCC push_options
 #pragma GCC optimize ("O0")
 
-#define IRQ_NUM 25
+#define IRQ_NUM 26
 #define SMP_IRQ_NUM 10
 #define LOCAL_APIC_IRQ_NUM 50
 
-extern void (*interrupt_table[25])(void);
+extern void (*interrupt_table[IRQ_NUM])(void);
 extern void do_IRQ(struct pt_regs *regs, ul number);
 
 
@@ -83,6 +83,7 @@ extern void (*local_apic_interrupt_table[LOCAL_APIC_IRQ_NUM])(void);
 	54	PIRQG
 	55	PIRQH
 	56  VIRTIO_RECV
+	57  E1000E_RECV
 	
 	
 0x80		system call
@@ -106,6 +107,8 @@ extern void (*local_apic_interrupt_table[LOCAL_APIC_IRQ_NUM])(void);
 	200 kick cpu 功能（使得某个核心立即运行进程调度）
 
 */
+
+#define APIC_TIMER_IRQ_NUM 151
 
 typedef struct hardware_intr_type
 {

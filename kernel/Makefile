@@ -11,3 +11,7 @@ clean:
 .PHONY: fmt
 fmt:
 	cargo fmt --all $(FMT_CHECK)
+
+
+check:
+	cargo +nightly-2023-01-21 check --workspace --message-format=json --target ./src/arch/x86_64/x86_64-unknown-none.json

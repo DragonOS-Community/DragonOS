@@ -1,4 +1,4 @@
-use core::{ffi::c_void, mem::size_of};
+use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
 
 use crate::{
     arch::{
@@ -24,9 +24,10 @@ pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Eq)]
+#[derive(Eq)]
 #[repr(usize)]
 #[allow(non_camel_case_types)]
+#[atomic_enum]
 pub enum Signal {
     INVALID = 0,
     SIGHUP = 1,
@@ -322,7 +323,7 @@ impl SigContext {
         //TODO 引入线程后补上
         // let current_thread = ProcessManager::current_pcb().thread;
         let pcb = ProcessManager::current_pcb();
-        let mut archinfo_guard = pcb.arch_info();
+        let mut archinfo_guard = pcb.arch_info_irqsave();
         self.oldmask = *mask;
         self.frame = frame.clone();
         // context.trap_num = unsafe { (*current_thread).trap_num };
@@ -368,44 +369,56 @@ pub struct SigStack {
 #[no_mangle]
 unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
     X86_64SignalArch::do_signal(frame);
+    return;
 }
 
 pub struct X86_64SignalArch;
 
 impl SignalArch for X86_64SignalArch {
     unsafe fn do_signal(frame: &mut TrapFrame) {
-        // 检查sigpending是否为0
-        if ProcessManager::current_pcb()
-            .sig_info()
-            .sig_pending()
-            .signal()
-            .bits()
-            == 0
-            || !frame.from_user()
-        {
-            // 若没有正在等待处理的信号，或者将要返回到的是内核态，则启用中断，然后返回
-            CurrentIrqArch::interrupt_enable();
+        let pcb = ProcessManager::current_pcb();
+        let siginfo = pcb.try_siginfo(5);
+
+        if unlikely(siginfo.is_none()) {
             return;
         }
 
-        // 做完上面的检查后，开中断
-        CurrentIrqArch::interrupt_enable();
+        let siginfo_read_guard = siginfo.unwrap();
+
+        // 检查sigpending是否为0
+        if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.from_user() {
+            // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
+            return;
+        }
+
         let pcb = ProcessManager::current_pcb();
-        let sig_guard = pcb.sig_struct();
+
         let mut sig_number: Signal;
         let mut info: Option<SigInfo>;
         let mut sigaction: Sigaction;
-        let reader = pcb.sig_info();
-        let sig_block: SigSet = reader.sig_block().clone();
-        drop(reader);
+        let sig_block: SigSet = siginfo_read_guard.sig_block().clone();
+        drop(siginfo_read_guard);
+
+        let sig_guard = pcb.try_sig_struct_irq(5);
+        if unlikely(sig_guard.is_none()) {
+            return;
+        }
+        let siginfo_mut = pcb.try_siginfo_mut(5);
+        if unlikely(siginfo_mut.is_none()) {
+            return;
+        }
+
+        let sig_guard = sig_guard.unwrap();
+        let mut siginfo_mut_guard = siginfo_mut.unwrap();
         loop {
-            (sig_number, info) = pcb.sig_info_mut().dequeue_signal(&sig_block);
+            (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block);
             // 如果信号非法，则直接返回
             if sig_number == Signal::INVALID {
                 return;
             }
 
             sigaction = sig_guard.handlers[sig_number as usize - 1];
+
             match sigaction.action() {
                 SigactionType::SaHandler(action_type) => match action_type {
                     SaHandlerType::SigError => {
@@ -425,12 +438,14 @@ impl SignalArch for X86_64SignalArch {
             }
             // 如果当前动作是忽略这个信号，就继续循环。
         }
-        // 所有的信号都处理完了
-        let reader = pcb.sig_info();
-        let oldset = reader.sig_block().clone();
+
+        let oldset = siginfo_mut_guard.sig_block().clone();
         //避免死锁
-        drop(reader);
+        drop(siginfo_mut_guard);
         drop(sig_guard);
+
+        // 做完上面的检查后，开中断
+        CurrentIrqArch::interrupt_enable();
         let res: Result<i32, SystemError> =
             handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
         if res.is_err() {
@@ -564,7 +579,8 @@ fn setup_frame(
     let frame: *mut SigFrame = get_stack(&trap_frame, size_of::<SigFrame>());
     // kdebug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
-    let r = UserBufferWriter::new(frame, size_of::<SigFrame>(), true);
+    let r: Result<UserBufferWriter<'_>, SystemError> =
+        UserBufferWriter::new(frame, size_of::<SigFrame>(), true);
     if r.is_err() {
         // 如果地址区域位于内核空间，则直接报错
         // todo: 生成一个sigsegv

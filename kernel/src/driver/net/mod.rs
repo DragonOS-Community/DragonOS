@@ -8,6 +8,8 @@ use crate::{libs::spinlock::SpinLock, syscall::SystemError};
 
 use super::base::device::driver::Driver;
 
+mod dma;
+pub mod e1000e;
 pub mod virtio_net;
 
 pub trait NetDriver: Driver {

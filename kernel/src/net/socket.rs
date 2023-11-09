@@ -1144,6 +1144,10 @@ impl SocketInode {
     pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
         return self.0.lock();
     }
+
+    pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
+        return self.0.lock_no_preempt();
+    }
 }
 
 impl IndexNode for SocketInode {
@@ -1173,7 +1177,7 @@ impl IndexNode for SocketInode {
         buf: &mut [u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return self.0.lock().read(&mut buf[0..len]).0;
+        return self.0.lock_no_preempt().read(&mut buf[0..len]).0;
     }
 
     fn write_at(
@@ -1183,7 +1187,7 @@ impl IndexNode for SocketInode {
         buf: &[u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return self.0.lock().write(&buf[0..len], None);
+        return self.0.lock_no_preempt().write(&buf[0..len], None);
     }
 
     fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {

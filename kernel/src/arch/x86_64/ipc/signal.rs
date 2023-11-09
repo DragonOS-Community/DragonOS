@@ -24,9 +24,10 @@ pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Eq)]
+#[derive(Eq)]
 #[repr(usize)]
 #[allow(non_camel_case_types)]
+#[atomic_enum]
 pub enum Signal {
     INVALID = 0,
     SIGHUP = 1,

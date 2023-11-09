@@ -15,7 +15,7 @@ use hashbrown::HashMap;
 
 use crate::{
     arch::{
-        ipc::signal::{SigSet, Signal},
+        ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         sched::sched,
         CurrentIrqArch,
@@ -308,7 +308,8 @@ impl ProcessManager {
                     parent_pcb.pid()
                 );
             }
-            // todo: 当信号机制重写后，这里需要向父进程发送SIGCHLD信号
+            // todo: 这里需要向父进程发送SIGCHLD信号
+            // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }
 
@@ -511,6 +512,8 @@ bitflags! {
 pub struct ProcessControlBlock {
     /// 当前进程的pid
     pid: Pid,
+    /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
+    tgid: Pid,
 
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
@@ -532,9 +535,13 @@ pub struct ProcessControlBlock {
     sig_info: RwLock<ProcessSignalInfo>,
     /// 信号处理结构体
     sig_struct: SpinLock<SignalStruct>,
+    /// 退出信号S
+    exit_signal: AtomicSignal,
 
     /// 父进程指针
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// 真实父进程指针
+    real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
     children: RwLock<Vec<Pid>>,
@@ -593,6 +600,7 @@ impl ProcessControlBlock {
 
         let pcb = Self {
             pid,
+            tgid: pid,
             basic: basic_info,
             preempt_count,
             flags,
@@ -603,7 +611,9 @@ impl ProcessControlBlock {
             arch_info,
             sig_info: RwLock::new(ProcessSignalInfo::default()),
             sig_struct: SpinLock::new(SignalStruct::default()),
-            parent_pcb: RwLock::new(ppcb),
+            exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+            parent_pcb: RwLock::new(ppcb.clone()),
+            real_parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::INIT,
             thread: RwLock::new(ThreadInfo::new()),
@@ -768,6 +778,11 @@ impl ProcessControlBlock {
         return self.pid;
     }
 
+    #[inline(always)]
+    pub fn tgid(&self) -> Pid {
+        return self.tgid;
+    }
+
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
@@ -895,6 +910,8 @@ pub struct ThreadInfo {
     set_child_tid: Option<VirtAddr>,
 
     vfork_done: Option<Arc<Completion>>,
+    /// 线程组的组长
+    group_leader: Weak<ProcessControlBlock>,
 }
 
 impl ThreadInfo {
@@ -903,7 +920,12 @@ impl ThreadInfo {
             clear_child_tid: None,
             set_child_tid: None,
             vfork_done: None,
+            group_leader: Weak::default(),
         }
+    }
+
+    pub fn group_leader(&self) -> Option<Arc<ProcessControlBlock>> {
+        return self.group_leader.upgrade();
     }
 }
 

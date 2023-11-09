@@ -202,7 +202,7 @@ impl Syscall {
     /// @brief 获取当前进程的pid
     pub fn getpid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.pid());
+        return Ok(current_pcb.tgid());
     }
 
     /// @brief 获取指定进程的pgid
@@ -294,5 +294,10 @@ impl Syscall {
         let pcb = ProcessManager::current_pcb();
         pcb.thread.write().clear_child_tid = Some(VirtAddr::new(ptr));
         Ok(pcb.pid.0)
+    }
+
+    pub fn gettid() -> Result<Pid, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        Ok(pcb.pid)
     }
 }

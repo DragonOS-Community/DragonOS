@@ -9,6 +9,7 @@ use alloc::{
 use super::{
     abi::WaitOption,
     fork::{CloneFlags, KernelCloneArgs},
+    resource::{RUsage, RUsageWho},
     KernelStack, Pid, ProcessManager, ProcessState,
 };
 use crate::{
@@ -318,6 +319,18 @@ impl Syscall {
 
     pub fn getegid() -> Result<usize, SystemError> {
         // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn get_rusage(who: i32, rusage: *mut RUsage) -> Result<usize, SystemError> {
+        let who = RUsageWho::try_from(who)?;
+        let mut writer = UserBufferWriter::new(rusage, core::mem::size_of::<RUsage>(), true)?;
+        let pcb = ProcessManager::current_pcb();
+        let rusage = pcb.get_rusage(who).ok_or(SystemError::EINVAL)?;
+
+        let ubuf = writer.buffer::<RUsage>(0).unwrap();
+        ubuf.copy_from_slice(&[rusage]);
+
         return Ok(0);
     }
 }

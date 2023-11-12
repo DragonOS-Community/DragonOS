@@ -16,7 +16,7 @@ use crate::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
-    kdebug, kerror, kinfo,
+    kerror, kinfo,
     libs::spinlock::SpinLock,
     process::{ProcessControlBlock, ProcessManager},
     syscall::SystemError,
@@ -253,6 +253,7 @@ pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
 pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     // kdebug!("schedule_timeout");
     if timeout == MAX_TIMEOUT {
+        ProcessManager::mark_sleep(true).ok();
         sched();
         return Ok(MAX_TIMEOUT);
     } else if timeout < 0 {
@@ -287,7 +288,7 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
     // FIXME
     // kdebug!("rs_timer_get_first_expire,timer_jif = {:?}", TIMER_JIFFIES);
     for _ in 0..10 {
-        match TIMER_LIST.try_lock() {
+        match TIMER_LIST.try_lock_irqsave() {
             Ok(timer_list) => {
                 // kdebug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
                 if timer_list.is_empty() {
@@ -305,6 +306,9 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
 
+/// 更新系统时间片
+///
+/// todo: 这里的实现有问题，貌似把HPET的500us当成了500个jiffies，然后update_wall_time()里面也硬编码了这个500us
 pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
@@ -317,50 +321,10 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
 pub fn clock() -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst);
 }
-// ====== 重构完成后请删掉extern C ======
-#[no_mangle]
-pub extern "C" fn rs_clock() -> u64 {
-    clock()
-}
 
 // ====== 以下为给C提供的接口 ======
-#[no_mangle]
-pub extern "C" fn rs_schedule_timeout(timeout: i64) -> i64 {
-    match schedule_timeout(timeout) {
-        Ok(v) => {
-            return v;
-        }
-        Err(e) => {
-            kdebug!("rs_schedule_timeout run failed");
-            return e.to_posix_errno() as i64;
-        }
-    }
-}
 
 #[no_mangle]
 pub extern "C" fn rs_timer_init() {
     timer_init();
-}
-
-#[no_mangle]
-pub extern "C" fn rs_timer_next_n_ms_jiffies(expire_ms: u64) -> u64 {
-    return next_n_ms_timer_jiffies(expire_ms);
-}
-
-#[no_mangle]
-pub extern "C" fn rs_timer_next_n_us_jiffies(expire_us: u64) -> u64 {
-    return next_n_us_timer_jiffies(expire_us);
-}
-
-#[no_mangle]
-pub extern "C" fn rs_timer_get_first_expire() -> i64 {
-    match timer_get_first_expire() {
-        Ok(v) => return v as i64,
-        Err(_) => return 0,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rs_update_timer_jiffies(add_jiffies: u64) -> u64 {
-    return update_timer_jiffies(add_jiffies);
 }

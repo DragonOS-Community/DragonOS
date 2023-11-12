@@ -61,6 +61,7 @@ pub mod init;
 pub mod kthread;
 pub mod pid;
 pub mod process;
+pub mod resource;
 pub mod syscall;
 
 /// 系统中所有进程的pcb

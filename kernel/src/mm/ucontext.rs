@@ -162,6 +162,9 @@ impl InnerAddressSpace {
 
         let current_mapper = &mut self.user_mapper.utable;
 
+        // 拷贝空洞
+        new_guard.mappings.vm_holes = self.mappings.vm_holes.clone();
+
         for vma in self.mappings.vmas.iter() {
             // TODO: 增加对VMA是否为文件映射的判断，如果是的话，就跳过
 

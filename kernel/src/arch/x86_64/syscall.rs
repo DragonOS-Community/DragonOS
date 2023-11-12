@@ -13,6 +13,8 @@ use alloc::string::String;
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
 
+pub const SYS_PRLIMIT64: usize = 302;
+
 /// ### 存储PCB系统调用栈以及在syscall过程中暂存用户态rsp的结构体
 ///
 /// 在syscall指令中将会从该结构体中读取系统调用栈和暂存rsp,
@@ -65,7 +67,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
     ];
     mfence();
 
-    // 由于进程管理未完成重构，有些系统调用需要在这里临时处理，以后这里的特殊处理要删掉。
+    // Arch specific syscall
     match syscall_num {
         SYS_RT_SIGRETURN => {
             syscall_return!(X86_64SignalArch::sys_rt_sigreturn(frame) as usize, frame);

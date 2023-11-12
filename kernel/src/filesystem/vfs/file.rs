@@ -417,7 +417,7 @@ pub struct FileDescriptorVec {
 }
 
 impl FileDescriptorVec {
-    pub const PROCESS_MAX_FD: usize = 32;
+    pub const PROCESS_MAX_FD: usize = 1024;
 
     pub fn new() -> FileDescriptorVec {
         // 先声明一个未初始化的数组

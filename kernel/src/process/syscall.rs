@@ -9,15 +9,18 @@ use alloc::{
 use super::{
     abi::WaitOption,
     fork::{CloneFlags, KernelCloneArgs},
-    resource::{RUsage, RUsageWho},
+    resource::{RLimit64, RLimitID, RUsage, RUsageWho},
     KernelStack, Pid, ProcessManager, ProcessState,
 };
 use crate::{
-    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
+    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    filesystem::{procfs::procfs_register_pid, vfs::MAX_PATHLEN},
+    filesystem::{
+        procfs::procfs_register_pid,
+        vfs::{file::FileDescriptorVec, MAX_PATHLEN},
+    },
     include::bindings::bindings::verify_area,
-    mm::VirtAddr,
+    mm::{ucontext::UserStack, MemoryManagementArch, VirtAddr},
     process::ProcessControlBlock,
     sched::completion::Completion,
     syscall::{
@@ -332,5 +335,78 @@ impl Syscall {
         ubuf.copy_from_slice(&[rusage]);
 
         return Ok(0);
+    }
+
+    /// # 设置资源限制
+    ///
+    /// TODO: 目前暂时不支持设置资源限制，只提供读取默认值的功能
+    ///
+    /// ## 参数
+    ///
+    /// - pid: 进程号
+    /// - resource: 资源类型
+    /// - new_limit: 新的资源限制
+    /// - old_limit: 旧的资源限制
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功，0
+    /// - 如果old_limit不为NULL，则返回旧的资源限制到old_limit
+    ///
+    pub fn prlimit64(
+        _pid: Pid,
+        resource: usize,
+        new_limit: *const RLimit64,
+        old_limit: *mut RLimit64,
+    ) -> Result<usize, SystemError> {
+        let resource = RLimitID::try_from(resource)?;
+        let mut writer = None;
+
+        if new_limit.is_null() {
+            return Err(SystemError::EINVAL);
+        }
+
+        if !old_limit.is_null() {
+            writer = Some(UserBufferWriter::new(
+                old_limit,
+                core::mem::size_of::<RLimit64>(),
+                true,
+            )?);
+        }
+
+        let _reader = UserBufferReader::new(new_limit, core::mem::size_of::<RLimit64>(), true)?;
+
+        match resource {
+            RLimitID::Stack => {
+                if let Some(mut writer) = writer {
+                    let mut rlimit = writer.buffer::<RLimit64>(0).unwrap()[0];
+                    rlimit.rlim_cur = UserStack::DEFAULT_USER_STACK_SIZE as u64;
+                    rlimit.rlim_max = UserStack::DEFAULT_USER_STACK_SIZE as u64;
+                }
+                return Ok(0);
+            }
+
+            RLimitID::Nofile => {
+                if let Some(mut writer) = writer {
+                    let mut rlimit = writer.buffer::<RLimit64>(0).unwrap()[0];
+                    rlimit.rlim_cur = FileDescriptorVec::PROCESS_MAX_FD as u64;
+                    rlimit.rlim_max = FileDescriptorVec::PROCESS_MAX_FD as u64;
+                }
+                return Ok(0);
+            }
+
+            RLimitID::As | RLimitID::Rss => {
+                if let Some(mut writer) = writer {
+                    let mut rlimit = writer.buffer::<RLimit64>(0).unwrap()[0];
+                    rlimit.rlim_cur = MMArch::USER_END_VADDR.data() as u64;
+                    rlimit.rlim_max = MMArch::USER_END_VADDR.data() as u64;
+                }
+                return Ok(0);
+            }
+
+            _ => {
+                return Err(SystemError::ENOSYS);
+            }
+        }
     }
 }

@@ -4,8 +4,12 @@ use core::{
 };
 
 use crate::{
+    arch::syscall::SYS_PRLIMIT64,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    process::{fork::KernelCloneArgs, resource::RUsage},
+    process::{
+        fork::KernelCloneArgs,
+        resource::{RLimit64, RUsage},
+    },
 };
 
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -1188,6 +1192,16 @@ impl Syscall {
                 let buf = args[2] as *mut u8;
                 let bufsiz = args[3] as usize;
                 Self::readlink_at(dirfd, pathname, buf, bufsiz)
+            }
+
+            SYS_PRLIMIT64 => {
+                let pid = args[0];
+                let pid = Pid::new(pid);
+                let resource = args[1];
+                let new_limit = args[2] as *const RLimit64;
+                let old_limit = args[3] as *mut RLimit64;
+
+                Self::prlimit64(pid, resource, new_limit, old_limit)
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

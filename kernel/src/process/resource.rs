@@ -1,3 +1,5 @@
+use num_traits::FromPrimitive;
+
 use crate::{syscall::SystemError, time::TimeSpec};
 
 use super::ProcessControlBlock;
@@ -68,6 +70,69 @@ impl TryFrom<i32> for RUsageWho {
             1 => Ok(RUsageWho::RusageThread),
             _ => Err(SystemError::EINVAL),
         }
+    }
+}
+
+/// Resource limit
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct RLimit64 {
+    /// The current (soft) limit
+    pub rlim_cur: u64,
+    /// The hard limit
+    pub rlim_max: u64,
+}
+
+/// Resource limit IDs
+///
+/// ## Note
+///
+/// 有些架构中，这里[5,9]的值是不同的，我们将来需要在这里增加条件编译
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive)]
+pub enum RLimitID {
+    /// CPU time in sec
+    Cpu = 0,
+    /// Maximum file size
+    Fsize = 1,
+    /// Max data size
+    Data = 2,
+    /// Max stack size
+    Stack = 3,
+    /// Max core file size
+    Core = 4,
+    /// Max resident set size
+    Rss = 5,
+
+    /// Max number of processes
+    Nproc = 6,
+    /// Max number of open files
+    Nofile = 7,
+    /// Max locked-in-memory address space
+    Memlock = 8,
+    /// Address space limit
+    As = 9,
+    /// Max number of file locks held
+    Locks = 10,
+
+    /// Max number of pending signals
+    Sigpending = 11,
+    /// Max bytes in POSIX mqueues
+    Msgqueue = 12,
+    /// Max nice prio allowed to raise to
+    ///  0-39 for nice level 19 .. -20
+    Nice = 13,
+    /// Max realtime priority
+    Rtprio = 14,
+    /// Timeout for RT tasks in us
+    Rttime = 15,
+    Nlimits = 16,
+}
+
+impl TryFrom<usize> for RLimitID {
+    type Error = SystemError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        <Self as FromPrimitive>::from_usize(value).ok_or(SystemError::EINVAL)
     }
 }
 

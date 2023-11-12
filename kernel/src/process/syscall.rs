@@ -300,4 +300,24 @@ impl Syscall {
         let pcb = ProcessManager::current_pcb();
         Ok(pcb.pid)
     }
+
+    pub fn getuid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn getgid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn geteuid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn getegid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
 }

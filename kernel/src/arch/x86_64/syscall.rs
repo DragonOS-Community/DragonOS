@@ -13,7 +13,10 @@ use alloc::string::String;
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
 
+pub const SYS_ACCESS: usize = 21;
 pub const SYS_PRLIMIT64: usize = 302;
+pub const SYS_FACCESSAT: usize = 269;
+pub const SYS_FACCESSAT2: usize = 439;
 
 /// ### 存储PCB系统调用栈以及在syscall过程中暂存用户态rsp的结构体
 ///

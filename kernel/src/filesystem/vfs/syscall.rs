@@ -25,7 +25,8 @@ use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    utils::rsplit_path,
+    open::do_faccessat,
+    utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
@@ -804,41 +805,14 @@ impl Syscall {
         user_buf: *mut u8,
         buf_size: usize,
     ) -> Result<usize, SystemError> {
-        let mut path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
 
         if path.len() == 0 {
             return Err(SystemError::EINVAL);
         }
 
-        let mut inode = ROOT_INODE();
-        // 如果path不是绝对路径，则需要拼接
-        if path.as_bytes()[0] != b'/' {
-            // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
-            if dirfd != AtFlags::AtFdCwd.into() {
-                let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.read();
-                let file = fd_table_guard
-                    .get_file_by_fd(dirfd)
-                    .ok_or(SystemError::EBADF)?;
-
-                // drop guard 以避免无法调度的问题
-                drop(fd_table_guard);
-
-                let file_guard = file.lock();
-                // 如果dirfd不是目录，则返回错误码ENOTDIR
-                if file_guard.file_type() != FileType::Dir {
-                    return Err(SystemError::ENOTDIR);
-                }
-
-                inode = file_guard.inode();
-            } else {
-                let mut cwd = ProcessManager::current_pcb().basic().cwd();
-                cwd.push('/');
-                cwd.push_str(path.as_str());
-                path = cwd;
-            }
-        }
+        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
         let inode = inode.lookup(path.as_str())?;
         if inode.metadata()?.file_type != FileType::SymLink {
@@ -859,7 +833,25 @@ impl Syscall {
         user_buf: *mut u8,
         buf_size: usize,
     ) -> Result<usize, SystemError> {
-        return Self::readlink_at(AtFlags::AtFdCwd.into(), path, user_buf, buf_size);
+        return Self::readlink_at(AtFlags::AT_FDCWD.bits(), path, user_buf, buf_size);
+    }
+
+    pub fn access(pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
+        return do_faccessat(
+            AtFlags::AT_FDCWD.bits(),
+            pathname,
+            ModeType::from_bits_truncate(mode),
+            0,
+        );
+    }
+
+    pub fn faccessat2(
+        dirfd: i32,
+        pathname: *const u8,
+        mode: u32,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        return do_faccessat(dirfd, pathname, ModeType::from_bits_truncate(mode), flags);
     }
 }
 

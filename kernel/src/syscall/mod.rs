@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    arch::syscall::SYS_PRLIMIT64,
+    arch::syscall::{SYS_ACCESS, SYS_FACCESSAT, SYS_FACCESSAT2, SYS_PRLIMIT64},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     process::{
         fork::KernelCloneArgs,
@@ -1202,6 +1202,27 @@ impl Syscall {
                 let old_limit = args[3] as *mut RLimit64;
 
                 Self::prlimit64(pid, resource, new_limit, old_limit)
+            }
+
+            SYS_ACCESS => {
+                let pathname = args[0] as *const u8;
+                let mode = args[1] as u32;
+                Self::access(pathname, mode)
+            }
+
+            SYS_FACCESSAT => {
+                let dirfd = args[0] as i32;
+                let pathname = args[1] as *const u8;
+                let mode = args[2] as u32;
+                Self::faccessat2(dirfd, pathname, mode, 0)
+            }
+
+            SYS_FACCESSAT2 => {
+                let dirfd = args[0] as i32;
+                let pathname = args[1] as *const u8;
+                let mode = args[2] as u32;
+                let flags = args[3] as u32;
+                Self::faccessat2(dirfd, pathname, mode, flags)
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

@@ -1175,15 +1175,14 @@ impl Syscall {
                 Self::get_rusage(who, rusage)
             }
 
-            SYS_READLINK =>{
+            SYS_READLINK => {
                 let path = args[0] as *const u8;
                 let buf = args[1] as *mut u8;
                 let bufsiz = args[2] as usize;
                 Self::readlink(path, buf, bufsiz)
-
             }
 
-            SYS_READLINK_AT =>{
+            SYS_READLINK_AT => {
                 let dirfd = args[0] as i32;
                 let pathname = args[1] as *const u8;
                 let buf = args[2] as *mut u8;

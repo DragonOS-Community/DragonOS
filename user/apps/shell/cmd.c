@@ -522,9 +522,9 @@ int shell_cmd_exec(int argc, char **argv)
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
 
         char **real_argv;
-        if (argc > 2)
+        if (argc > 1)
         {
-            real_argv = &argv[2];
+            real_argv = &argv[1];
         }
         execv(file_path, real_argv);
         // printf("after execv, path=%s, argc=%d\n", file_path, argc);

@@ -5,7 +5,7 @@ use core::{
 
 use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    process::fork::KernelCloneArgs,
+    process::{fork::KernelCloneArgs, resource::RUsage},
 };
 
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -400,6 +400,7 @@ pub const SYS_CHDIR: usize = 80;
 pub const SYS_MKDIR: usize = 83;
 
 pub const SYS_GETTIMEOFDAY: usize = 96;
+pub const SYS_GETRUSAGE: usize = 98;
 
 pub const SYS_GETUID: usize = 102;
 pub const SYS_SYSLOG: usize = 103;
@@ -1164,6 +1165,11 @@ impl Syscall {
             }
             SYS_GETEUID => Self::geteuid().map(|euid| euid.into()),
             SYS_GETEGID => Self::getegid().map(|egid| egid.into()),
+            SYS_GETRUSAGE => {
+                let who = args[0] as c_int;
+                let rusage = args[1] as *mut RUsage;
+                Self::get_rusage(who, rusage)
+            }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

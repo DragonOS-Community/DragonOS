@@ -40,7 +40,7 @@ pub static mut FINISHED_BOOTING: AtomicBool = AtomicBool::new(false);
 
 /// Interval: 0.5sec Threshold: 0.0625s
 /// 系统节拍率
-pub const HZ: u64 = 1000;
+pub const HZ: u64 = 250;
 /// watchdog检查间隔
 pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
 /// 最大能接受的误差大小

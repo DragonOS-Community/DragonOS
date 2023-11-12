@@ -8,6 +8,7 @@ use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
 use crate::syscall::SystemError;
+use crate::time::clocksource::HZ;
 pub use drop;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
@@ -110,7 +111,7 @@ pub enum LocalApicTimerMode {
 
 impl LocalApicTimer {
     /// 定时器中断的间隔
-    pub const INTERVAL_MS: u64 = 5;
+    pub const INTERVAL_MS: u64 = 1000 / HZ as u64;
     pub const DIVISOR: u64 = 3;
 
     /// IoApicManager 初值为0或false

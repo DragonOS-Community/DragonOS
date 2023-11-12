@@ -401,6 +401,15 @@ pub const SYS_MKDIR: usize = 83;
 
 pub const SYS_GETTIMEOFDAY: usize = 96;
 
+pub const SYS_GETUID: usize = 102;
+pub const SYS_SYSLOG: usize = 103;
+pub const SYS_GETGID: usize = 104;
+pub const SYS_SETUID: usize = 105;
+
+pub const SYS_SETGID: usize = 106;
+pub const SYS_GETEUID: usize = 107;
+pub const SYS_GETEGID: usize = 108;
+
 pub const SYS_GETPPID: usize = 110;
 pub const SYS_GETPGID: usize = 121;
 
@@ -1139,6 +1148,22 @@ impl Syscall {
                 Ok(0)
             }
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
+            SYS_GETUID => Self::getuid().map(|uid| uid.into()),
+            SYS_SYSLOG => {
+                kwarn!("SYS_SYSLOG has not yet been implemented");
+                Ok(0)
+            }
+            SYS_GETGID => Self::getgid().map(|gid| gid.into()),
+            SYS_SETUID => {
+                kwarn!("SYS_SETUID has not yet been implemented");
+                Ok(0)
+            }
+            SYS_SETGID => {
+                kwarn!("SYS_SETGID has not yet been implemented");
+                Ok(0)
+            }
+            SYS_GETEUID => Self::geteuid().map(|euid| euid.into()),
+            SYS_GETEGID => Self::getegid().map(|egid| egid.into()),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

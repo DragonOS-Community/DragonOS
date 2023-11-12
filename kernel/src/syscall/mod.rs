@@ -399,6 +399,8 @@ pub const SYS_CHDIR: usize = 80;
 
 pub const SYS_MKDIR: usize = 83;
 
+pub const SYS_READLINK: usize = 89;
+
 pub const SYS_GETTIMEOFDAY: usize = 96;
 pub const SYS_GETRUSAGE: usize = 98;
 
@@ -436,6 +438,8 @@ pub const SYS_SET_TID_ADDR: usize = 218;
 pub const SYS_EXIT_GROUP: usize = 231;
 
 pub const SYS_UNLINK_AT: usize = 263;
+
+pub const SYS_READLINK_AT: usize = 267;
 
 pub const SYS_ACCEPT4: usize = 288;
 
@@ -1169,6 +1173,22 @@ impl Syscall {
                 let who = args[0] as c_int;
                 let rusage = args[1] as *mut RUsage;
                 Self::get_rusage(who, rusage)
+            }
+
+            SYS_READLINK =>{
+                let path = args[0] as *const u8;
+                let buf = args[1] as *mut u8;
+                let bufsiz = args[2] as usize;
+                Self::readlink(path, buf, bufsiz)
+
+            }
+
+            SYS_READLINK_AT =>{
+                let dirfd = args[0] as i32;
+                let pathname = args[1] as *const u8;
+                let buf = args[2] as *mut u8;
+                let bufsiz = args[3] as usize;
+                Self::readlink_at(dirfd, pathname, buf, bufsiz)
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

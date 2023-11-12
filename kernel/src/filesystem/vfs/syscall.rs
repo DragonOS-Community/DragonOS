@@ -14,13 +14,16 @@ use crate::{
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{user_access::UserBufferReader, Syscall, SystemError},
+    syscall::{
+        user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+        Syscall, SystemError,
+    },
     time::TimeSpec,
 };
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
-    fcntl::{FcntlCommand, FD_CLOEXEC},
+    fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     utils::rsplit_path,
     Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -794,7 +797,72 @@ impl Syscall {
 
         Self::write(fd, &data)
     }
+
+    pub fn readlink_at(
+        dirfd: i32,
+        path: *const u8,
+        user_buf: *mut u8,
+        buf_size: usize,
+    ) -> Result<usize, SystemError> {
+        let mut path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
+
+        if path.len() == 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut inode = ROOT_INODE();
+        // 如果path不是绝对路径，则需要拼接
+        if path.as_bytes()[0] != b'/' {
+            // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
+            if dirfd != AtFlags::AtFdCwd.into() {
+                let binding = ProcessManager::current_pcb().fd_table();
+                let fd_table_guard = binding.read();
+                let file = fd_table_guard
+                    .get_file_by_fd(dirfd)
+                    .ok_or(SystemError::EBADF)?;
+
+                // drop guard 以避免无法调度的问题
+                drop(fd_table_guard);
+
+                let file_guard = file.lock();
+                // 如果dirfd不是目录，则返回错误码ENOTDIR
+                if file_guard.file_type() != FileType::Dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+
+                inode = file_guard.inode();
+            } else {
+                let mut cwd = ProcessManager::current_pcb().basic().cwd();
+                cwd.push('/');
+                cwd.push_str(path.as_str());
+                path = cwd;
+            }
+        }
+
+        let inode = inode.lookup(path.as_str())?;
+        if inode.metadata()?.file_type != FileType::SymLink {
+            return Err(SystemError::EINVAL);
+        }
+
+        let ubuf = user_buf.buffer::<u8>(0).unwrap();
+
+        let mut file = File::new(inode, FileMode::O_RDONLY)?;
+
+        let len = file.read(buf_size, ubuf)?;
+
+        return Ok(len);
+    }
+
+    pub fn readlink(
+        path: *const u8,
+        user_buf: *mut u8,
+        buf_size: usize,
+    ) -> Result<usize, SystemError> {
+        return Self::readlink_at(AtFlags::AtFdCwd.into(), path, user_buf, buf_size);
+    }
 }
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {

@@ -1,6 +1,5 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering};
-use x86_64::align_up;
 
 use crate::{
     arch::CurrentIrqArch,
@@ -238,9 +237,6 @@ pub fn timekeeping_init() {
 
 /// # 使用当前时钟源增加wall time
 pub fn update_wall_time() {
-    let rsp = unsafe { crate::include::bindings::bindings::get_rsp() } as usize;
-    let _stack_use = align_up(rsp as u64, 32768) - rsp as u64;
-
     // kdebug!("enter update_wall_time, stack_use = {:}",stack_use);
     compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -267,7 +263,8 @@ pub fn update_wall_time() {
     // }
     // ================
     compiler_fence(Ordering::SeqCst);
-    // 一分钟同步一次
+
+    // !!! todo: 这里是硬编码了HPET的500us中断，需要修改
     __ADDED_USEC.fetch_add(500, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
     let mut retry = 10;
@@ -279,6 +276,7 @@ pub fn update_wall_time() {
         __ADDED_SEC.fetch_add(1, Ordering::SeqCst);
         compiler_fence(Ordering::SeqCst);
     }
+    // 一分钟同步一次
     loop {
         if (usec & !((1 << 26) - 1)) != 0 {
             if __ADDED_USEC
@@ -289,7 +287,7 @@ pub fn update_wall_time() {
                 // 同步时间
                 // 我感觉这里会出问题：多个读者不退出的话，写者就无法写入
                 // 然后这里会超时，导致在中断返回之后，会不断的进入这个中断，最终爆栈。
-                let mut timekeeper = timekeeper().0.write();
+                let mut timekeeper = timekeeper().0.write_irqsave();
                 timekeeper.xtime.tv_nsec = ktime_get_real_ns();
                 timekeeper.xtime.tv_sec = 0;
                 __ADDED_SEC.store(0, Ordering::SeqCst);

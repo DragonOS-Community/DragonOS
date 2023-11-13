@@ -10,10 +10,11 @@ use crate::{
 pub const KERNEL_CS: SegmentSelector = SegmentSelector::new(1, Ring::Ring0);
 /// kernel data segment selector
 pub const KERNEL_DS: SegmentSelector = SegmentSelector::new(2, Ring::Ring0);
-/// user code segment selector
-pub const USER_CS: SegmentSelector = SegmentSelector::new(5, Ring::Ring3);
 /// user data segment selector
-pub const USER_DS: SegmentSelector = SegmentSelector::new(6, Ring::Ring3);
+pub const USER_DS: SegmentSelector = SegmentSelector::new(5, Ring::Ring3);
+/// user code segment selector
+/// 如果改这里，记得改syscall_64里面写死的常量
+pub const USER_CS: SegmentSelector = SegmentSelector::new(6, Ring::Ring3);
 
 static mut TSS_MANAGER: TSSManager = TSSManager::new();
 

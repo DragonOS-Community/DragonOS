@@ -1,4 +1,4 @@
-SUBDIRS = kernel user
+SUBDIRS = kernel user tools
 
 # ifndef $(EMULATOR)
 ifeq ($(EMULATOR), )
@@ -156,6 +156,10 @@ fmt:
 	@echo "格式化代码" 
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C kernel
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C user
+
+log-monitor:
+	@echo "启动日志监控"
+	@sh -c "cd tools/debugging/logmonitor && cargo run --release -- --log-dir $(ROOT_PATH)/logs/ --kernel $(ROOT_PATH)/bin/kernel/kernel.elf" 
 	
 help:
 	@echo "编译:"

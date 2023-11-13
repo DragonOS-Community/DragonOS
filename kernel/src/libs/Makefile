@@ -9,7 +9,7 @@ ECHO:
 	@echo "$@"
 
 $(kernel_lib_subdirs): ECHO
-	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" 
 
 $(kernel_lib_objs): ECHO
 	$(CC) $(CFLAGS) -c $@ -o $@.o

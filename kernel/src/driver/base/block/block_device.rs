@@ -261,7 +261,7 @@ pub trait BlockDevice: Device {
                 let mut temp = Vec::new();
                 temp.resize(1usize << self.blk_size_log2(), 0);
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
-                self.write_at(range.lba_start, 1, &mut temp[..])?;
+                self.read_at(range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
                 temp[range.begin..range.end].copy_from_slice(&buf_slice);
                 self.write_at(range.lba_start, 1, &temp[..])?;
@@ -292,9 +292,10 @@ pub trait BlockDevice: Device {
             let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
             let full = multi && range.is_multi() || !multi && range.is_full();
 
+            // 读取整个block作为有效数据
             if full {
                 // 调用 BlockDevice::read_at() 直接把引用传进去，不是把整个数组move进去
-                self.read_at(range.lba_start, count, buf)?;
+                self.read_at(range.lba_start, count, buf_slice)?;
             } else {
                 // 判断块的长度不能超过最大值
                 if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {

@@ -8,16 +8,25 @@ lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
 
 
-# 控制操作系统使用的中断控制器 _INTR_8259A_ _INTR_APIC_
-PIC := _INTR_APIC_
-CFLAGS = $(GLOBAL_CFLAGS) -fno-pie -D $(PIC) -I $(shell pwd) -I $(shell pwd)/include -I $(shell pwd)/arch/x86_64/include
+# unwind/backtrace related
+UNWIND_ENABLE ?= yes
+CFLAGS_UNWIND =
+LDFLAGS_UNWIND =
+RUSTFLAGS_UNWIND =
+ifeq ($(UNWIND_ENABLE), yes)
+    CFLAGS_UNWIND = -funwind-tables
+    LDFLAGS_UNWIND = --eh-frame-hdr
+    RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld 
+endif
+
+CFLAGS = $(GLOBAL_CFLAGS) -fno-pie $(CFLAGS_UNWIND) -I $(shell pwd) -I $(shell pwd)/include -I $(shell pwd)/arch/x86_64/include
 
 export ASFLAGS := --64
 
 LD_LIST := head.o
 
 
-kernel_subdirs := common driver debug arch exception smp sched syscall ktest libs time
+kernel_subdirs := common driver debug arch exception smp syscall ktest libs time
 
 
 head.o: head.S
@@ -31,13 +40,12 @@ main.o: main.c
 	$(CC) $(CFLAGS) -c main.c  -o main.o
 
 kernel_rust:
-	rustup default nightly
-	cargo +nightly-2023-01-21 build --release --target ./arch/x86_64/x86_64-unknown-none.json
+	RUSTFLAGS="$(RUSTFLAGS_UNWIND)" cargo +nightly-2023-01-21 build --release --target ./arch/x86_64/x86_64-unknown-none.json
 
 all: kernel
 
 	@echo "Linking kernel..."
-	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds --no-relax
 # 生成kallsyms
 	current_dir=$(pwd)
 	
@@ -51,11 +59,14 @@ all: kernel
 # 重新链接
 	@echo "Re-Linking kernel..."
 	@echo $(shell find . -name "*.o")
-	$(LD) -b elf64-x86-64 -z muldefs -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds --no-relax
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
-	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64  kernel ../../bin/kernel/kernel.elf
-# $(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 -R ".comment" -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
+ifeq ($(UNWIND_ENABLE), yes)
+	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 kernel ../../bin/kernel/kernel.elf
+else
+	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
+endif
 	@echo "Kernel Build Done."
 
 ECHO:
@@ -63,7 +74,7 @@ ECHO:
 
 $(kernel_subdirs): ECHO
 
-	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)" kernel_root_path="$(shell pwd)"
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)"  kernel_root_path="$(shell pwd)"
 
 kernel: head.o main.o $(kernel_subdirs) kernel_rust
 	

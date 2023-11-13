@@ -159,7 +159,6 @@ impl File {
         if self.offset > self.inode.metadata()?.size as usize {
             return Ok(0);
         }
-
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;
@@ -269,15 +268,18 @@ impl File {
 
         // 如果偏移量为0
         if self.offset == 0 {
+            // 通过list更新readdir_subdirs_name
             self.readdir_subdirs_name = inode.list()?;
             self.readdir_subdirs_name.sort();
         }
         // kdebug!("sub_entries={sub_entries:?}");
-        if self.readdir_subdirs_name.is_empty() {
+
+        // 已经读到末尾
+        if self.offset == self.readdir_subdirs_name.len() {
             self.offset = 0;
             return Ok(0);
         }
-        let name: String = self.readdir_subdirs_name.remove(0);
+        let name = &self.readdir_subdirs_name[self.offset];
         let sub_inode: Arc<dyn IndexNode> = match inode.find(&name) {
             Ok(i) => i,
             Err(e) => {
@@ -290,16 +292,19 @@ impl File {
 
         let name_bytes: &[u8] = name.as_bytes();
 
-        self.offset += 1;
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
-        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
         // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
         unsafe {
             let ptr = &mut dirent.d_name as *mut u8;
+
             let buf: &mut [u8] =
-                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len());
-            buf.copy_from_slice(name_bytes);
+                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len() + 1);
+            buf[0..name_bytes.len()].copy_from_slice(name_bytes);
+            buf[name_bytes.len()] = 0;
         }
+
+        self.offset += 1;
+        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
+        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
 
         // 计算dirent结构体的大小
         let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()
@@ -412,7 +417,7 @@ pub struct FileDescriptorVec {
 }
 
 impl FileDescriptorVec {
-    pub const PROCESS_MAX_FD: usize = 32;
+    pub const PROCESS_MAX_FD: usize = 1024;
 
     pub fn new() -> FileDescriptorVec {
         // 先声明一个未初始化的数组

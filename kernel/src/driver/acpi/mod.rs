@@ -21,7 +21,7 @@ extern crate acpi;
 pub mod bus;
 mod c_adapter;
 pub mod glue;
-pub mod old;
+pub mod pmtmr;
 mod sysfs;
 
 static mut __ACPI_TABLE: Option<acpi::AcpiTables<AcpiHandlerImpl>> = None;

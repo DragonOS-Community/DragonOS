@@ -5,7 +5,7 @@
 #if _INTR_8259A_
 #include <driver/interrupt/8259A/8259A.h>
 #else
-#include <driver/interrupt/apic/apic.h>
+#include <arch/x86_64/driver/apic/apic.h>
 #endif
 
 #include "gate.h"
@@ -87,9 +87,10 @@ Build_IRQ(0x35);
 Build_IRQ(0x36);
 Build_IRQ(0x37);
 Build_IRQ(0x38);
+Build_IRQ(0x39);
 
 // 初始化中断数组
-void (*interrupt_table[25])(void) = {
+void (*interrupt_table[IRQ_NUM])(void) = {
     IRQ0x20interrupt,
     IRQ0x21interrupt,
     IRQ0x22interrupt,
@@ -115,6 +116,7 @@ void (*interrupt_table[25])(void) = {
     IRQ0x36interrupt,
     IRQ0x37interrupt,
     IRQ0x38interrupt,
+    IRQ0x39interrupt,
 };
 
 /**

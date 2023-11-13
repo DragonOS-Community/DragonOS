@@ -1,13 +1,28 @@
 use core::ffi::c_void;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
-use super::{abi::WaitOption, fork::CloneFlags, Pid, ProcessManager, ProcessState};
+use super::{
+    abi::WaitOption,
+    fork::{CloneFlags, KernelCloneArgs},
+    resource::{RLimit64, RLimitID, RUsage, RUsageWho},
+    KernelStack, Pid, ProcessManager, ProcessState,
+};
 use crate::{
-    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
+    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    filesystem::vfs::MAX_PATHLEN,
+    filesystem::{
+        procfs::procfs_register_pid,
+        vfs::{file::FileDescriptorVec, MAX_PATHLEN},
+    },
+    include::bindings::bindings::verify_area,
+    mm::{ucontext::UserStack, MemoryManagementArch, VirtAddr},
     process::ProcessControlBlock,
+    sched::completion::Completion,
     syscall::{
         user_access::{
             check_and_clone_cstr, check_and_clone_cstr_array, UserBufferReader, UserBufferWriter,
@@ -42,6 +57,11 @@ impl Syscall {
         //     argv,
         //     envp
         // );
+        // kdebug!(
+        //     "before execve: strong count: {}",
+        //     Arc::strong_count(&ProcessManager::current_pcb())
+        // );
+
         if path.is_null() {
             return Err(SystemError::EINVAL);
         }
@@ -66,6 +86,10 @@ impl Syscall {
         // 关闭设置了O_CLOEXEC的文件描述符
         let fd_table = ProcessManager::current_pcb().fd_table();
         fd_table.write().close_on_exec();
+        // kdebug!(
+        //     "after execve: strong count: {}",
+        //     Arc::strong_count(&ProcessManager::current_pcb())
+        // );
 
         return Ok(());
     }
@@ -95,12 +119,13 @@ impl Syscall {
 
         if pid > 0 {
             let pid = Pid(pid as usize);
-            let child_pcb = rd_childen.get(&pid).ok_or(SystemError::ECHILD)?.clone();
+            let child_pcb = ProcessManager::find(pid).ok_or(SystemError::ECHILD)?;
             drop(rd_childen);
 
             loop {
+                let state = child_pcb.sched_info().state();
                 // 获取退出码
-                match child_pcb.sched_info().state() {
+                match state {
                     ProcessState::Runnable => {
                         if options.contains(WaitOption::WNOHANG)
                             || options.contains(WaitOption::WNOWAIT)
@@ -123,12 +148,16 @@ impl Syscall {
                         }
                     }
                     ProcessState::Exited(status) => {
+                        // kdebug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
                         if !wstatus.is_null() {
                             wstatus_buf.copy_one_to_user(
-                                &(status | WaitOption::WEXITED.bits() as usize),
+                                &(status as u32 | WaitOption::WEXITED.bits()),
                                 0,
                             )?;
                         }
+                        drop(child_pcb);
+                        // kdebug!("wait4: to release {pid:?}");
+                        unsafe { ProcessManager::release(pid) };
                         return Ok(pid.into());
                     }
                 };
@@ -147,7 +176,8 @@ impl Syscall {
         } else {
             // 等待任意子进程(这两)
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            for (pid, pcb) in rd_childen.iter() {
+            for pid in rd_childen.iter() {
+                let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
                 if pcb.sched_info().state().is_exited() {
                     if !wstatus.is_null() {
                         wstatus_buf.copy_one_to_user(&0, 0)?;
@@ -176,7 +206,7 @@ impl Syscall {
     /// @brief 获取当前进程的pid
     pub fn getpid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.pid());
+        return Ok(current_pcb.tgid());
     }
 
     /// @brief 获取指定进程的pgid
@@ -199,5 +229,184 @@ impl Syscall {
     pub fn getppid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         return Ok(current_pcb.basic().ppid());
+    }
+
+    pub fn clone(
+        current_trapframe: &mut TrapFrame,
+        clone_args: KernelCloneArgs,
+    ) -> Result<usize, SystemError> {
+        let flags = clone_args.flags;
+
+        let vfork = Arc::new(Completion::new());
+
+        if flags.contains(CloneFlags::CLONE_PIDFD)
+            && flags.contains(CloneFlags::CLONE_PARENT_SETTID)
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let current_pcb = ProcessManager::current_pcb();
+        let new_kstack = KernelStack::new()?;
+        let name = current_pcb.basic().name().to_string();
+        let pcb = ProcessControlBlock::new(name, new_kstack);
+        // 克隆pcb
+        ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;
+        ProcessManager::add_pcb(pcb.clone());
+
+        // 向procfs注册进程
+        procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to register pid to procfs, pid: [{:?}]. Error: {:?}",
+                pcb.pid(),
+                e
+            )
+        });
+
+        if flags.contains(CloneFlags::CLONE_VFORK) {
+            pcb.thread.write().vfork_done = Some(vfork.clone());
+        }
+
+        if pcb.thread.read().set_child_tid.is_some() {
+            let addr = pcb.thread.read().set_child_tid.unwrap();
+            let mut writer =
+                UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
+            writer.copy_one_to_user(&(pcb.pid().data() as i32), 0)?;
+        }
+
+        ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
+                pcb.pid(),
+                e
+            )
+        });
+
+        if flags.contains(CloneFlags::CLONE_VFORK) {
+            // 等待子进程结束或者exec;
+            vfork.wait_for_completion_interruptible()?;
+        }
+
+        return Ok(pcb.pid().0);
+    }
+
+    /// 设置线程地址
+    pub fn set_tid_address(ptr: usize) -> Result<usize, SystemError> {
+        if !unsafe { verify_area(ptr as u64, core::mem::size_of::<i32>() as u64) } {
+            return Err(SystemError::EFAULT);
+        }
+
+        let pcb = ProcessManager::current_pcb();
+        pcb.thread.write().clear_child_tid = Some(VirtAddr::new(ptr));
+        Ok(pcb.pid.0)
+    }
+
+    pub fn gettid() -> Result<Pid, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        Ok(pcb.pid)
+    }
+
+    pub fn getuid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn getgid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn geteuid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn getegid() -> Result<usize, SystemError> {
+        // todo: 增加credit功能之后，需要修改
+        return Ok(0);
+    }
+
+    pub fn get_rusage(who: i32, rusage: *mut RUsage) -> Result<usize, SystemError> {
+        let who = RUsageWho::try_from(who)?;
+        let mut writer = UserBufferWriter::new(rusage, core::mem::size_of::<RUsage>(), true)?;
+        let pcb = ProcessManager::current_pcb();
+        let rusage = pcb.get_rusage(who).ok_or(SystemError::EINVAL)?;
+
+        let ubuf = writer.buffer::<RUsage>(0).unwrap();
+        ubuf.copy_from_slice(&[rusage]);
+
+        return Ok(0);
+    }
+
+    /// # 设置资源限制
+    ///
+    /// TODO: 目前暂时不支持设置资源限制，只提供读取默认值的功能
+    ///
+    /// ## 参数
+    ///
+    /// - pid: 进程号
+    /// - resource: 资源类型
+    /// - new_limit: 新的资源限制
+    /// - old_limit: 旧的资源限制
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功，0
+    /// - 如果old_limit不为NULL，则返回旧的资源限制到old_limit
+    ///
+    pub fn prlimit64(
+        _pid: Pid,
+        resource: usize,
+        new_limit: *const RLimit64,
+        old_limit: *mut RLimit64,
+    ) -> Result<usize, SystemError> {
+        let resource = RLimitID::try_from(resource)?;
+        let mut writer = None;
+
+        if new_limit.is_null() {
+            return Err(SystemError::EINVAL);
+        }
+
+        if !old_limit.is_null() {
+            writer = Some(UserBufferWriter::new(
+                old_limit,
+                core::mem::size_of::<RLimit64>(),
+                true,
+            )?);
+        }
+
+        let _reader = UserBufferReader::new(new_limit, core::mem::size_of::<RLimit64>(), true)?;
+
+        match resource {
+            RLimitID::Stack => {
+                if let Some(mut writer) = writer {
+                    let mut rlimit = writer.buffer::<RLimit64>(0).unwrap()[0];
+                    rlimit.rlim_cur = UserStack::DEFAULT_USER_STACK_SIZE as u64;
+                    rlimit.rlim_max = UserStack::DEFAULT_USER_STACK_SIZE as u64;
+                }
+                return Ok(0);
+            }
+
+            RLimitID::Nofile => {
+                if let Some(mut writer) = writer {
+                    let mut rlimit = writer.buffer::<RLimit64>(0).unwrap()[0];
+                    rlimit.rlim_cur = FileDescriptorVec::PROCESS_MAX_FD as u64;
+                    rlimit.rlim_max = FileDescriptorVec::PROCESS_MAX_FD as u64;
+                }
+                return Ok(0);
+            }
+
+            RLimitID::As | RLimitID::Rss => {
+                if let Some(mut writer) = writer {
+                    let mut rlimit = writer.buffer::<RLimit64>(0).unwrap()[0];
+                    rlimit.rlim_cur = MMArch::USER_END_VADDR.data() as u64;
+                    rlimit.rlim_max = MMArch::USER_END_VADDR.data() as u64;
+                }
+                return Ok(0);
+            }
+
+            _ => {
+                return Err(SystemError::ENOSYS);
+            }
+        }
     }
 }

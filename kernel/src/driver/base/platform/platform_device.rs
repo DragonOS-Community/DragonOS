@@ -26,7 +26,7 @@ use crate::{
 use super::{super::device::DeviceState, platform_bus, platform_bus_device, CompatibleTable};
 
 /// 平台设备id分配器
-static PLATFORM_DEVID_IDA: IdAllocator = IdAllocator::new(i32::MAX as usize);
+static PLATFORM_DEVID_IDA: IdAllocator = IdAllocator::new(0, i32::MAX as usize);
 
 #[inline(always)]
 pub fn platform_device_manager() -> &'static PlatformDeviceManager {

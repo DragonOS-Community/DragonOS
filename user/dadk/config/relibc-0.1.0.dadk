@@ -6,7 +6,7 @@
     "BuildFromSource": {
       "Git": {
         "url": "https://git.mirrors.dragonos.org/DragonOS-Community/relibc.git",
-        "revision": "f797586d73"
+        "revision": "3ef630632f"
       }
     }
   },

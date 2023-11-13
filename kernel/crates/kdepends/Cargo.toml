@@ -1,0 +1,18 @@
+[package]
+name = "kdepends"
+version = "0.1.0"
+edition = "2021"
+description = "需要导出的依赖项（为保持内核依赖版本与调试器依赖项版本相同，因此把公共依赖项写在这里）"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+memoffset = "0.9.0"
+crc = { path = "../crc" }
+
+# 一个无锁MPSC队列
+[dependencies.thingbuf]
+git = "https://git.mirrors.dragonos.org/DragonOS-Community/thingbuf.git"
+rev = "2dded730c3"
+default-features = false
+features = ["alloc", "static"]

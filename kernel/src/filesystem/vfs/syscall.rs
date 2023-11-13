@@ -14,15 +14,19 @@ use crate::{
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{user_access::UserBufferReader, Syscall, SystemError},
+    syscall::{
+        user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+        Syscall, SystemError,
+    },
     time::TimeSpec,
 };
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
-    fcntl::{FcntlCommand, FD_CLOEXEC},
+    fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    utils::rsplit_path,
+    open::do_faccessat,
+    utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
@@ -151,7 +155,6 @@ impl Syscall {
     /// @return 文件描述符编号，或者是错误码
     pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
-
         // 文件名过长
         if path.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -192,14 +195,6 @@ impl Syscall {
             return Err(SystemError::ENOTDIR);
         }
 
-        // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-        if mode.contains(FileMode::O_TRUNC)
-            && (mode.contains(FileMode::O_RDWR) || mode.contains(FileMode::O_WRONLY))
-            && file_type == FileType::File
-        {
-            inode.truncate(0)?;
-        }
-
         // 创建文件对象
 
         let mut file: File = File::new(inode, mode)?;
@@ -207,6 +202,14 @@ impl Syscall {
         // 打开模式为“追加”
         if mode.contains(FileMode::O_APPEND) {
             file.lseek(SeekFrom::SeekEnd(0))?;
+        }
+
+        // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
+        if mode.contains(FileMode::O_TRUNC)
+            && (mode.contains(FileMode::O_RDWR) || mode.contains(FileMode::O_WRONLY))
+            && file_type == FileType::File
+        {
+            file.ftruncate(0)?;
         }
         // 把文件对象存入pcb
         let r = ProcessManager::current_pcb()
@@ -727,6 +730,13 @@ impl Syscall {
         return Ok(kstat);
     }
 
+    fn do_stat(path: &str) -> Result<PosixKstat, SystemError> {
+        let fd = Self::open(path, FileMode::O_RDONLY)?;
+        let ret = Self::do_fstat(fd as i32);
+        Self::close(fd)?;
+        ret
+    }
+
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
         let kstat = Self::do_fstat(fd)?;
         if usr_kstat.is_null() {
@@ -736,6 +746,14 @@ impl Syscall {
             *usr_kstat = kstat;
         }
         return Ok(0);
+    }
+
+    pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(path, FileMode::O_RDONLY)?;
+        Self::fstat(fd as i32, user_kstat).map_err(|e| {
+            Self::close(fd).ok();
+            e
+        })
     }
 
     pub fn mknod(
@@ -771,7 +789,72 @@ impl Syscall {
 
         return Ok(0);
     }
+
+    pub fn writev(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
+        // IoVecs会进行用户态检验
+        let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, false) }?;
+
+        let data = iovecs.gather();
+
+        Self::write(fd, &data)
+    }
+
+    pub fn readlink_at(
+        dirfd: i32,
+        path: *const u8,
+        user_buf: *mut u8,
+        buf_size: usize,
+    ) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
+
+        if path.len() == 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+
+        let inode = inode.lookup(path.as_str())?;
+        if inode.metadata()?.file_type != FileType::SymLink {
+            return Err(SystemError::EINVAL);
+        }
+
+        let ubuf = user_buf.buffer::<u8>(0).unwrap();
+
+        let mut file = File::new(inode, FileMode::O_RDONLY)?;
+
+        let len = file.read(buf_size, ubuf)?;
+
+        return Ok(len);
+    }
+
+    pub fn readlink(
+        path: *const u8,
+        user_buf: *mut u8,
+        buf_size: usize,
+    ) -> Result<usize, SystemError> {
+        return Self::readlink_at(AtFlags::AT_FDCWD.bits(), path, user_buf, buf_size);
+    }
+
+    pub fn access(pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
+        return do_faccessat(
+            AtFlags::AT_FDCWD.bits(),
+            pathname,
+            ModeType::from_bits_truncate(mode),
+            0,
+        );
+    }
+
+    pub fn faccessat2(
+        dirfd: i32,
+        pathname: *const u8,
+        mode: u32,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        return do_faccessat(dirfd, pathname, ModeType::from_bits_truncate(mode), flags);
+    }
 }
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {

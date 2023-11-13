@@ -26,10 +26,9 @@
 #include "driver/keyboard/ps2_keyboard.h"
 #include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
-#include <driver/timers/HPET/HPET.h>
 #include <time/timer.h>
 
-#include <driver/interrupt/apic/apic_timer.h>
+#include <arch/x86_64/driver/apic/apic_timer.h>
 #include <virt/kvm/kvm.h>
 
 extern int rs_driver_init();
@@ -39,6 +38,10 @@ extern void rs_kthread_init();
 extern void rs_init_intertrait();
 extern void rs_init_before_mem_init();
 extern int rs_setup_arch();
+extern void rs_futex_init();
+extern int rs_hpet_init();
+extern int rs_hpet_enable();
+extern int rs_tsc_init();
 
 ul bsp_idt_size, bsp_gdt_size;
 
@@ -145,28 +148,27 @@ void system_initialize()
 
     rs_pci_init();
 
+
     // 这里必须加内存屏障，否则会出错
     io_mfence();
     smp_init();
 
     io_mfence();
-
-    HPET_init();
-    io_mfence();
-    HPET_measure_freq();
-
-    io_mfence();
+    rs_futex_init();
     cli();
-    HPET_enable();
+    rs_hpet_init();
+    rs_hpet_enable();
+    rs_tsc_init();
 
     io_mfence();
-    
+
     kvm_init();
 
     io_mfence();
     // 系统初始化到此结束，剩下的初始化功能应当放在初始内核线程中执行
 
     apic_timer_init();
+    // while(1);
     io_mfence();
     sti();
     while (1)

@@ -37,8 +37,10 @@ impl ProcessManager {
                 let stack_ptr =
                     VirtAddr::new(Self::stack_ptr().data() & (!(KernelStack::ALIGN - 1)));
                 // 初始化bsp的idle进程
-                unsafe { KernelStack::from_existed(stack_ptr) }
-                    .expect("Failed to create kernel stack struct for BSP.")
+                let mut ks = unsafe { KernelStack::from_existed(stack_ptr) }
+                    .expect("Failed to create kernel stack struct for BSP.");
+                unsafe { ks.clear_pcb(true) };
+                ks
             } else {
                 KernelStack::new().unwrap_or_else(|e| {
                     panic!("Failed to create kernel stack struct for AP {}: {:?}", i, e)

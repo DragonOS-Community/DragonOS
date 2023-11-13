@@ -223,6 +223,17 @@ impl<'a> UserBufferReader<'a> {
         return Ok(());
     }
 
+    /// 把用户空间的数据转换成指定类型的切片
+    ///
+    /// ## 参数
+    ///
+    /// - `offset`：字节偏移量
+    pub fn buffer<T>(&self, offset: usize) -> Result<&[T], SystemError> {
+        Ok(self
+            .convert_with_offset::<T>(self.buffer, offset)
+            .map_err(|_| SystemError::EINVAL)?)
+    }
+
     fn convert_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&[T], SystemError> {
         if offset >= src.len() {
             return Err(SystemError::EINVAL);

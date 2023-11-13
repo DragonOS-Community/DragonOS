@@ -9,7 +9,7 @@ use alloc::{
 use crate::{
     driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
-    include::bindings::bindings::{verify_area, AT_REMOVEDIR, PROC_MAX_FD_NUM},
+    include::bindings::bindings::{verify_area, PROC_MAX_FD_NUM},
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
@@ -25,7 +25,7 @@ use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::do_faccessat,
+    open::{do_faccessat, do_fchmodat},
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -153,15 +153,21 @@ impl Syscall {
     /// @param o_flags 打开文件的标志位
     ///
     /// @return 文件描述符编号，或者是错误码
-    pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
+    pub fn open(path: &str, mode: FileMode, follow_symlink: bool) -> Result<usize, SystemError> {
         // kdebug!("open: path: {}, mode: {:?}", path, mode);
         // 文件名过长
         if path.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup_follow_symlink(
+            path,
+            if follow_symlink {
+                VFS_MAX_FOLLOW_SYMLINK_TIMES
+            } else {
+                0
+            },
+        );
 
         let inode: Arc<dyn IndexNode> = if inode.is_err() {
             let errno = inode.unwrap_err();
@@ -457,15 +463,12 @@ impl Syscall {
     /// - `flags`：标志位
     ///
     ///
-    pub fn unlinkat(_dirfd: i32, pathname: &str, flags: u32) -> Result<usize, SystemError> {
-        // kdebug!("sys_unlink_at={path:?}");
-        if (flags & (!AT_REMOVEDIR)) != 0 {
-            return Err(SystemError::EINVAL);
-        }
+    pub fn unlinkat(dirfd: i32, pathname: &str, flags: u32) -> Result<usize, SystemError> {
+        let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
 
-        if (flags & AT_REMOVEDIR) > 0 {
+        if flags.contains(AtFlags::AT_REMOVEDIR) {
             // kdebug!("rmdir");
-            match do_remove_dir(&pathname) {
+            match do_remove_dir(dirfd, &pathname) {
                 Err(err) => {
                     kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                     return Err(err);
@@ -476,7 +479,7 @@ impl Syscall {
             }
         }
 
-        match do_unlink_at(&pathname, FileMode::from_bits_truncate(flags as u32)) {
+        match do_unlink_at(dirfd, &pathname) {
             Err(err) => {
                 kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                 return Err(err);
@@ -485,6 +488,25 @@ impl Syscall {
                 return Ok(0);
             }
         }
+    }
+
+    pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
+        if pathname.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+        let ureader = UserBufferReader::new(pathname, MAX_PATHLEN, true)?;
+
+        let buf: &[u8] = ureader.buffer(0).unwrap();
+
+        let pathname: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
+
+        let pathname: &str = pathname.to_str().map_err(|_| SystemError::EINVAL)?;
+        if pathname.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+        let pathname = pathname.trim();
+
+        return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
@@ -730,13 +752,6 @@ impl Syscall {
         return Ok(kstat);
     }
 
-    fn do_stat(path: &str) -> Result<PosixKstat, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY)?;
-        let ret = Self::do_fstat(fd as i32);
-        Self::close(fd)?;
-        ret
-    }
-
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
         let kstat = Self::do_fstat(fd)?;
         if usr_kstat.is_null() {
@@ -749,11 +764,17 @@ impl Syscall {
     }
 
     pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY)?;
-        Self::fstat(fd as i32, user_kstat).map_err(|e| {
-            Self::close(fd).ok();
-            e
-        })
+        let fd = Self::open(path, FileMode::O_RDONLY, true)?;
+        let r = Self::fstat(fd as i32, user_kstat);
+        Self::close(fd).ok();
+        return r;
+    }
+
+    pub fn lstat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(path, FileMode::O_RDONLY, false)?;
+        let r = Self::fstat(fd as i32, user_kstat);
+        Self::close(fd).ok();
+        return r;
     }
 
     pub fn mknod(
@@ -799,6 +820,20 @@ impl Syscall {
         Self::write(fd, &data)
     }
 
+    pub fn readv(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
+        // IoVecs会进行用户态检验
+        let mut iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, true) }?;
+
+        let mut data = Vec::new();
+        data.resize(iovecs.0.iter().map(|x| x.len()).sum(), 0);
+
+        let len = Self::read(fd, &mut data)?;
+
+        iovecs.scatter(&data[..len]);
+
+        return Ok(len);
+    }
+
     pub fn readlink_at(
         dirfd: i32,
         path: *const u8,
@@ -840,7 +875,7 @@ impl Syscall {
         return do_faccessat(
             AtFlags::AT_FDCWD.bits(),
             pathname,
-            ModeType::from_bits_truncate(mode),
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
             0,
         );
     }
@@ -851,7 +886,42 @@ impl Syscall {
         mode: u32,
         flags: u32,
     ) -> Result<usize, SystemError> {
-        return do_faccessat(dirfd, pathname, ModeType::from_bits_truncate(mode), flags);
+        return do_faccessat(
+            dirfd,
+            pathname,
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+            flags,
+        );
+    }
+
+    pub fn chmod(pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
+        return do_fchmodat(
+            AtFlags::AT_FDCWD.bits(),
+            pathname,
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+        );
+    }
+
+    pub fn fchmodat(dirfd: i32, pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
+        return do_fchmodat(
+            dirfd,
+            pathname,
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+        );
+    }
+
+    pub fn fchmod(fd: i32, mode: u32) -> Result<usize, SystemError> {
+        let _mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+        let _file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+
+        // fchmod没完全实现，因此不修改文件的权限
+        // todo: 实现fchmod
+        kwarn!("fchmod not fully implemented");
+        return Ok(0);
     }
 }
 

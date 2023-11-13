@@ -6,7 +6,7 @@ use crate::{
         FileType, IndexNode, Metadata, PollStatus,
     },
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
-    process::ProcessState,
+    process::{ProcessManager, ProcessState},
     syscall::SystemError,
     time::TimeSpec,
 };
@@ -94,6 +94,14 @@ impl IndexNode for LockedPipeInode {
         buf: &mut [u8],
         data: &mut FilePrivateData,
     ) -> Result<usize, crate::syscall::SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let show = if pcb.pid().data() > 3 { true } else { false };
+        if show {
+            kdebug!(
+                "locked_pipe_inode begin read_at: preempt={}",
+                ProcessManager::current_pcb().preempt_count()
+            );
+        }
         // 获取mode
         let mode: FileMode;
         if let FilePrivateData::Pipefs(pdata) = data {
@@ -128,6 +136,12 @@ impl IndexNode for LockedPipeInode {
             // 否则在读等待队列中睡眠，并释放锁
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
+                if show {
+                    kdebug!(
+                        "locked_pipe_inode begin to sleep without sched: preempt={}",
+                        ProcessManager::current_pcb().preempt_count()
+                    );
+                }
                 inode.read_wait_queue.sleep_without_schedule();
                 drop(inode);
 

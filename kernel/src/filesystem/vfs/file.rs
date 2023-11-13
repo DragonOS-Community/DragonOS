@@ -19,6 +19,7 @@ use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum FilePrivateData {
     /// 管道文件私有信息
     Pipefs(PipeFsPrivateData),
@@ -198,6 +199,7 @@ impl File {
     }
 
     /// @brief 根据inode号获取子目录项的名字
+    #[allow(dead_code)]
     pub fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         return self.inode.get_entry_name(ino);
     }
@@ -535,6 +537,7 @@ impl FileDescriptorVec {
         return Ok(());
     }
 
+    #[allow(dead_code)]
     pub fn iter(&self) -> FileDescriptorIterator {
         return FileDescriptorIterator::new(self);
     }

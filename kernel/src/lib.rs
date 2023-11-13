@@ -7,6 +7,7 @@
 #![feature(const_trait_impl)]
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
+#![feature(cstr_from_bytes_until_nul)]
 #![feature(c_void_variant)]
 #![feature(drain_filter)]
 #![feature(inline_const)]

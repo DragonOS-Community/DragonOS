@@ -55,6 +55,7 @@ use self::kthread::WorkerPrivate;
 pub mod abi;
 pub mod c_adapter;
 pub mod exec;
+pub mod exit;
 pub mod fork;
 pub mod idle;
 pub mod init;
@@ -473,6 +474,7 @@ impl ProcessState {
         return matches!(self, ProcessState::Blocked(true));
     }
 
+    /// Returns `true` if the process state is [`Exited`].
     #[inline(always)]
     pub fn is_exited(&self) -> bool {
         return matches!(self, ProcessState::Exited(_));
@@ -484,6 +486,15 @@ impl ProcessState {
     #[inline(always)]
     pub fn is_stopped(&self) -> bool {
         matches!(self, ProcessState::Stopped)
+    }
+
+    /// Returns exit code if the process state is [`Exited`].
+    #[inline(always)]
+    pub fn exit_code(&self) -> Option<usize> {
+        match self {
+            ProcessState::Exited(code) => Some(*code),
+            _ => None,
+        }
     }
 }
 
@@ -846,6 +857,10 @@ impl ProcessControlBlock {
 
     pub fn sig_info(&self) -> RwLockReadGuard<ProcessSignalInfo> {
         self.sig_info.read()
+    }
+
+    pub fn sig_info_irqsave(&self) -> RwLockReadGuard<ProcessSignalInfo> {
+        self.sig_info.read_irqsave()
     }
 
     pub fn try_siginfo(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {

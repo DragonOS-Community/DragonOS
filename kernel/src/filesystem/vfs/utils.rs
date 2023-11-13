@@ -7,6 +7,7 @@ use super::{fcntl::AtFlags, FileType, IndexNode, ROOT_INODE};
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///
 /// 举例：对于 /123/456/789/   本函数返回的第一个值为123, 第二个值为456/789
+#[allow(dead_code)]
 pub fn split_path(path: &str) -> (&str, Option<&str>) {
     let mut path_split: core::str::SplitN<&str> = path.trim_matches('/').splitn(2, "/");
     let comp = path_split.next().unwrap_or("");
@@ -30,7 +31,7 @@ pub fn rsplit_path(path: &str) -> (&str, Option<&str>) {
 ///
 /// ## 返回值
 ///
-/// 返回值为(需要lookup的inode, 剩余的path)
+/// 返回值为(需要执行lookup的inode, 剩余的path)
 pub fn user_path_at(
     pcb: &Arc<ProcessControlBlock>,
     dirfd: i32,

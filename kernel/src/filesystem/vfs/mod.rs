@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod core;
 pub mod fcntl;
 pub mod file;
@@ -50,6 +48,7 @@ pub enum FileType {
     Socket,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SpecialNodeData {
     /// 管道文件
@@ -62,6 +61,7 @@ pub enum SpecialNodeData {
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
 /// 完整含义请见 http://www.gnu.org/software/libc/manual/html_node/Directory-Entries.html
+#[allow(dead_code)]
 pub const DT_UNKNOWN: u16 = 0;
 /// 命名管道，或者FIFO
 pub const DT_FIFO: u16 = 1;
@@ -78,7 +78,9 @@ pub const DT_LNK: u16 = 10;
 // 是一个socket
 pub const DT_SOCK: u16 = 12;
 // 这个是抄Linux的，还不知道含义
+#[allow(dead_code)]
 pub const DT_WHT: u16 = 14;
+#[allow(dead_code)]
 pub const DT_MAX: u16 = 16;
 
 /// vfs容许的最大的符号链接跳转次数

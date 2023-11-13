@@ -8,13 +8,13 @@ use alloc::{
 
 use super::{
     abi::WaitOption,
+    exit::kernel_wait4,
     fork::{CloneFlags, KernelCloneArgs},
     resource::{RLimit64, RLimitID, RUsage, RUsageWho},
-    KernelStack, Pid, ProcessManager, ProcessState,
+    KernelStack, Pid, ProcessManager,
 };
 use crate::{
-    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch, MMArch},
-    exception::InterruptArch,
+    arch::{interrupt::TrapFrame, MMArch},
     filesystem::{
         procfs::procfs_register_pid,
         vfs::{file::FileDescriptorVec, MAX_PATHLEN},
@@ -24,9 +24,7 @@ use crate::{
     process::ProcessControlBlock,
     sched::completion::Completion,
     syscall::{
-        user_access::{
-            check_and_clone_cstr, check_and_clone_cstr_array, UserBufferReader, UserBufferWriter,
-        },
+        user_access::{check_and_clone_cstr, check_and_clone_cstr_array, UserBufferWriter},
         Syscall, SystemError,
     },
 };
@@ -38,11 +36,16 @@ impl Syscall {
     }
 
     pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        ProcessManager::fork(
-            frame,
-            CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
-        )
-        .map(|pid| pid.into())
+        // 由于Linux vfork需要保证子进程先运行（除非子进程调用execve或者exit），
+        // 而我们目前没有实现这个特性，所以暂时使用fork代替vfork（linux文档表示这样也是也可以的）
+        Self::fork(frame)
+
+        // 下面是以前的实现，除非我们实现了子进程先运行的特性，否则不要使用，不然会导致父进程数据损坏
+        // ProcessManager::fork(
+        //     frame,
+        //     CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
+        // )
+        // .map(|pid| pid.into())
     }
 
     pub fn execve(
@@ -100,98 +103,35 @@ impl Syscall {
         options: i32,
         rusage: *mut c_void,
     ) -> Result<usize, SystemError> {
-        let ret = WaitOption::from_bits(options as u32);
-        let options = match ret {
-            Some(options) => options,
-            None => {
-                return Err(SystemError::EINVAL);
-            }
+        let options = WaitOption::from_bits(options as u32).ok_or(SystemError::EINVAL)?;
+
+        let wstatus_buf = if wstatus.is_null() {
+            None
+        } else {
+            Some(UserBufferWriter::new(
+                wstatus,
+                core::mem::size_of::<i32>(),
+                true,
+            )?)
         };
 
-        let mut _rusage_buf =
-            UserBufferReader::new::<c_void>(rusage, core::mem::size_of::<c_void>(), true)?;
-
-        let mut wstatus_buf =
-            UserBufferWriter::new::<i32>(wstatus, core::mem::size_of::<i32>(), true)?;
-
-        let cur_pcb = ProcessManager::current_pcb();
-        let rd_childen = cur_pcb.children.read();
-
-        if pid > 0 {
-            let pid = Pid(pid as usize);
-            let child_pcb = ProcessManager::find(pid).ok_or(SystemError::ECHILD)?;
-            drop(rd_childen);
-
-            loop {
-                let state = child_pcb.sched_info().state();
-                // 获取退出码
-                match state {
-                    ProcessState::Runnable => {
-                        if options.contains(WaitOption::WNOHANG)
-                            || options.contains(WaitOption::WNOWAIT)
-                        {
-                            if !wstatus.is_null() {
-                                wstatus_buf.copy_one_to_user(&WaitOption::WCONTINUED.bits(), 0)?;
-                            }
-                            return Ok(0);
-                        }
-                    }
-                    ProcessState::Blocked(_) | ProcessState::Stopped => {
-                        // 指定WUNTRACED则等待暂停的进程，不指定则返回0
-                        if !options.contains(WaitOption::WUNTRACED)
-                            || options.contains(WaitOption::WNOWAIT)
-                        {
-                            if !wstatus.is_null() {
-                                wstatus_buf.copy_one_to_user(&WaitOption::WSTOPPED.bits(), 0)?;
-                            }
-                            return Ok(0);
-                        }
-                    }
-                    ProcessState::Exited(status) => {
-                        // kdebug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
-                        if !wstatus.is_null() {
-                            wstatus_buf.copy_one_to_user(
-                                &(status as u32 | WaitOption::WEXITED.bits()),
-                                0,
-                            )?;
-                        }
-                        drop(child_pcb);
-                        // kdebug!("wait4: to release {pid:?}");
-                        unsafe { ProcessManager::release(pid) };
-                        return Ok(pid.into());
-                    }
-                };
-
-                // 等待指定进程
-                child_pcb.wait_queue.sleep();
-            }
-        } else if pid < -1 {
-            // TODO 判断是否pgid == -pid（等待指定组任意进程）
-            // 暂时不支持
-            return Err(SystemError::EINVAL);
-        } else if pid == 0 {
-            // TODO 判断是否pgid == current_pgid（等待当前组任意进程）
-            // 暂时不支持
-            return Err(SystemError::EINVAL);
+        let mut tmp_rusage = if rusage.is_null() {
+            None
         } else {
-            // 等待任意子进程(这两)
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            for pid in rd_childen.iter() {
-                let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
-                if pcb.sched_info().state().is_exited() {
-                    if !wstatus.is_null() {
-                        wstatus_buf.copy_one_to_user(&0, 0)?;
-                    }
-                    return Ok(pid.clone().into());
-                } else {
-                    unsafe { pcb.wait_queue.sleep_without_schedule() };
-                }
-            }
-            drop(irq_guard);
-            sched();
-        }
+            Some(RUsage::default())
+        };
 
-        return Ok(0);
+        let r = kernel_wait4(pid, wstatus_buf, options, tmp_rusage.as_mut())?;
+
+        if !rusage.is_null() {
+            let mut rusage_buf = UserBufferWriter::new::<RUsage>(
+                rusage as *mut RUsage,
+                core::mem::size_of::<RUsage>(),
+                true,
+            )?;
+            rusage_buf.copy_one_to_user(&tmp_rusage.unwrap(), 0)?;
+        }
+        return Ok(r);
     }
 
     /// # 退出进程
@@ -356,15 +296,11 @@ impl Syscall {
     pub fn prlimit64(
         _pid: Pid,
         resource: usize,
-        new_limit: *const RLimit64,
+        _new_limit: *const RLimit64,
         old_limit: *mut RLimit64,
     ) -> Result<usize, SystemError> {
         let resource = RLimitID::try_from(resource)?;
         let mut writer = None;
-
-        if new_limit.is_null() {
-            return Err(SystemError::EINVAL);
-        }
 
         if !old_limit.is_null() {
             writer = Some(UserBufferWriter::new(
@@ -373,8 +309,6 @@ impl Syscall {
                 true,
             )?);
         }
-
-        let _reader = UserBufferReader::new(new_limit, core::mem::size_of::<RLimit64>(), true)?;
 
         match resource {
             RLimitID::Stack => {

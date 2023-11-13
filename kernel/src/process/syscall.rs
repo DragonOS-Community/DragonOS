@@ -32,11 +32,6 @@ use crate::{
 impl Syscall {
     pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let r = ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into());
-        kdebug!(
-            "fork: current pid: {:?}, return: {:?}\n",
-            ProcessManager::current_pcb().pid(),
-            r
-        );
         return r;
     }
 

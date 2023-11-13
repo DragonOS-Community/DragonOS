@@ -224,7 +224,7 @@ fn do_waitpid(
         }
         ProcessState::Exited(status) => {
             let pid = child_pcb.pid();
-            kdebug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
+            // kdebug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
 
             if likely(!kwo.options.contains(WaitOption::WEXITED)) {
                 return None;

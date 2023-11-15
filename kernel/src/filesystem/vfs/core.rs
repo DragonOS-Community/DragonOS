@@ -218,7 +218,7 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     }
 
     let pcb = ProcessManager::current_pcb();
-    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path.to_string())?;
+    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
 
     let inode: Result<Arc<dyn IndexNode>, SystemError> =
         inode_begin.lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES);
@@ -258,7 +258,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENAMETOOLONG);
     }
     let pcb = ProcessManager::current_pcb();
-    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path.to_string())?;
+    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
 
     let inode: Result<Arc<dyn IndexNode>, SystemError> =
         inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES);

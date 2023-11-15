@@ -35,9 +35,10 @@ pub fn rsplit_path(path: &str) -> (&str, Option<&str>) {
 pub fn user_path_at(
     pcb: &Arc<ProcessControlBlock>,
     dirfd: i32,
-    mut path: String,
+    path: &str,
 ) -> Result<(Arc<dyn IndexNode>, String), SystemError> {
     let mut inode = ROOT_INODE();
+    let ret_path;
     // 如果path不是绝对路径，则需要拼接
     if path.as_bytes()[0] != b'/' {
         // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
@@ -58,13 +59,16 @@ pub fn user_path_at(
             }
 
             inode = file_guard.inode();
+            ret_path = String::from(path);
         } else {
             let mut cwd = pcb.basic().cwd();
             cwd.push('/');
-            cwd.push_str(path.as_str());
-            path = cwd;
+            cwd.push_str(path);
+            ret_path = cwd;
         }
+    } else {
+        ret_path = String::from(path);
     }
 
-    return Ok((inode, path));
+    return Ok((inode, ret_path));
 }

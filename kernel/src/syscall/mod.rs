@@ -6,7 +6,8 @@ use core::{
 use crate::{
     arch::syscall::{
         SYS_ACCESS, SYS_CHMOD, SYS_CLOCK_GETTIME, SYS_FACCESSAT, SYS_FACCESSAT2, SYS_FCHMOD,
-        SYS_FCHMODAT, SYS_LSTAT, SYS_PRLIMIT64, SYS_READV, SYS_SYSINFO, SYS_UMASK, SYS_UNLINK,
+        SYS_FCHMODAT, SYS_LSTAT, SYS_OPENAT, SYS_PRLIMIT64, SYS_READV, SYS_SYSINFO, SYS_UMASK,
+        SYS_UNLINK,
     },
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     process::{
@@ -367,6 +368,7 @@ pub const SYS_RT_SIGRETURN: usize = 15;
 pub const SYS_IOCTL: usize = 16;
 
 pub const SYS_WRITEV: usize = 20;
+pub const SYS_PIPE: usize = 22;
 
 pub const SYS_MADVISE: usize = 28;
 
@@ -456,7 +458,7 @@ pub const SYS_READLINK_AT: usize = 267;
 
 pub const SYS_ACCEPT4: usize = 288;
 
-pub const SYS_PIPE: usize = 293;
+pub const SYS_PIPE2: usize = 293;
 
 #[allow(dead_code)]
 pub const SYS_GET_RANDOM: usize = 318;
@@ -515,8 +517,31 @@ impl Syscall {
                     let path: &str = path.unwrap();
 
                     let flags = args[1];
+                    let mode = args[2];
+
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-                    Self::open(path, open_flags, true)
+                    let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+                    Self::open(path, open_flags, mode, true)
+                };
+                res
+            }
+
+            SYS_OPENAT => {
+                let dirfd = args[0] as i32;
+                let path: &CStr = unsafe { CStr::from_ptr(args[1] as *const c_char) };
+                let flags = args[2];
+                let mode = args[3];
+
+                let path: Result<&str, core::str::Utf8Error> = path.to_str();
+                let res = if path.is_err() {
+                    Err(SystemError::EINVAL)
+                } else {
+                    let path: &str = path.unwrap();
+
+                    let open_flags: FileMode =
+                        FileMode::from_bits(flags as u32).ok_or(SystemError::EINVAL)?;
+                    let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+                    Self::openat(dirfd, path, open_flags, mode, true)
                 };
                 res
             }
@@ -725,6 +750,14 @@ impl Syscall {
 
             SYS_CLOCK => Self::clock(),
             SYS_PIPE => {
+                let pipefd: *mut i32 = args[0] as *mut c_int;
+                if pipefd.is_null() {
+                    Err(SystemError::EFAULT)
+                } else {
+                    Self::pipe2(pipefd, FileMode::empty())
+                }
+            }
+            SYS_PIPE2 => {
                 let pipefd: *mut i32 = args[0] as *mut c_int;
                 let arg1 = args[1];
                 if pipefd.is_null() {

@@ -46,45 +46,49 @@ bitflags! {
     /// 与Linux 5.19.10的uapi/asm-generic/fcntl.h相同
     /// https://opengrok.ringotek.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
     pub struct FileMode: u32{
-    /* File access modes for `open' and `fcntl'.  */
-    /// Open Read-only
-    const O_RDONLY = 0o0;
-    /// Open Write-only
-    const O_WRONLY = 0o1;
-    /// Open read/write
-    const O_RDWR = 0o2;
-    /// Mask for file access modes
-    const O_ACCMODE = 0o00000003;
+        /* File access modes for `open' and `fcntl'.  */
+        /// Open Read-only
+        const O_RDONLY = 0o0;
+        /// Open Write-only
+        const O_WRONLY = 0o1;
+        /// Open read/write
+        const O_RDWR = 0o2;
+        /// Mask for file access modes
+        const O_ACCMODE = 0o00000003;
 
-    /* Bits OR'd into the second argument to open.  */
-    /// Create file if it does not exist
-    const O_CREAT = 0o00000100;
-    /// Fail if file already exists
-    const O_EXCL = 0o00000200;
-    /// Do not assign controlling terminal
-    const O_NOCTTY = 0o00000400;
-    /// 文件存在且是普通文件，并以O_RDWR或O_WRONLY打开，则它会被清空
-    const O_TRUNC = 0o00001000;
-    /// 文件指针会被移动到文件末尾
-    const O_APPEND = 0o00002000;
-    /// 非阻塞式IO模式
-    const O_NONBLOCK = 0o00004000;
-    /// 每次write都等待物理I/O完成，但是如果写操作不影响读取刚写入的数据，则不等待文件属性更新
-    const O_DSYNC = 0o00010000;
-    /// fcntl, for BSD compatibility
-    const FASYNC = 0o00020000;
-    /* direct disk access hint */
-    const O_DIRECT = 0o00040000;
-    const O_LARGEFILE = 0o00100000;
-    /// 打开的必须是一个目录
-    const O_DIRECTORY = 0o00200000;
-    /// Do not follow symbolic links
-    const O_NOFOLLOW = 0o00400000;
-    const O_NOATIME = 0o01000000;
-    /// set close_on_exec
-    const O_CLOEXEC = 0o02000000;
-    /// 每次write都等到物理I/O完成，包括write引起的文件属性的更新
-    const O_SYNC = 0o04000000;
+        /* Bits OR'd into the second argument to open.  */
+        /// Create file if it does not exist
+        const O_CREAT = 0o00000100;
+        /// Fail if file already exists
+        const O_EXCL = 0o00000200;
+        /// Do not assign controlling terminal
+        const O_NOCTTY = 0o00000400;
+        /// 文件存在且是普通文件，并以O_RDWR或O_WRONLY打开，则它会被清空
+        const O_TRUNC = 0o00001000;
+        /// 文件指针会被移动到文件末尾
+        const O_APPEND = 0o00002000;
+        /// 非阻塞式IO模式
+        const O_NONBLOCK = 0o00004000;
+        /// 每次write都等待物理I/O完成，但是如果写操作不影响读取刚写入的数据，则不等待文件属性更新
+        const O_DSYNC = 0o00010000;
+        /// fcntl, for BSD compatibility
+        const FASYNC = 0o00020000;
+        /* direct disk access hint */
+        const O_DIRECT = 0o00040000;
+        const O_LARGEFILE = 0o00100000;
+        /// 打开的必须是一个目录
+        const O_DIRECTORY = 0o00200000;
+        /// Do not follow symbolic links
+        const O_NOFOLLOW = 0o00400000;
+        const O_NOATIME = 0o01000000;
+        /// set close_on_exec
+        const O_CLOEXEC = 0o02000000;
+        /// 每次write都等到物理I/O完成，包括write引起的文件属性的更新
+        const O_SYNC = 0o04000000;
+
+        const O_PATH = 0o10000000;
+
+        const O_PATH_FLAGS = Self::O_DIRECTORY.bits|Self::O_NOFOLLOW.bits|Self::O_CLOEXEC.bits|Self::O_PATH.bits;
     }
 }
 

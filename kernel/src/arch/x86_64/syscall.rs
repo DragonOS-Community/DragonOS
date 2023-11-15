@@ -23,6 +23,7 @@ pub const SYS_FCHMOD: usize = 91;
 pub const SYS_UMASK: usize = 95;
 pub const SYS_SYSINFO: usize = 99;
 pub const SYS_CLOCK_GETTIME: usize = 228;
+pub const SYS_OPENAT: usize = 257;
 pub const SYS_FCHMODAT: usize = 268;
 pub const SYS_FACCESSAT: usize = 269;
 pub const SYS_PRLIMIT64: usize = 302;

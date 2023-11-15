@@ -25,7 +25,7 @@ use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat},
+    open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -146,6 +146,100 @@ impl PosixKstat {
         }
     }
 }
+
+///
+///  Arguments for how openat2(2) should open the target path. If only @flags and
+///  @mode are non-zero, then openat2(2) operates very similarly to openat(2).
+///
+///  However, unlike openat(2), unknown or invalid bits in @flags result in
+///  -EINVAL rather than being silently ignored. @mode must be zero unless one of
+///  {O_CREAT, O_TMPFILE} are set.
+///
+/// ## 成员变量
+///
+/// - flags: O_* flags.
+/// - mode: O_CREAT/O_TMPFILE file mode.
+/// - resolve: RESOLVE_* flags.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct PosixOpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+impl PosixOpenHow {
+    #[allow(dead_code)]
+    pub fn new(flags: u64, mode: u64, resolve: u64) -> Self {
+        Self {
+            flags,
+            mode,
+            resolve,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OpenHow {
+    pub o_flags: FileMode,
+    pub mode: ModeType,
+    pub resolve: OpenHowResolve,
+}
+
+impl OpenHow {
+    pub fn new(mut o_flags: FileMode, mut mode: ModeType, resolve: OpenHowResolve) -> Self {
+        if !o_flags.contains(FileMode::O_CREAT) {
+            mode = ModeType::empty();
+        }
+
+        if o_flags.contains(FileMode::O_PATH) {
+            o_flags = o_flags.intersection(FileMode::O_PATH_FLAGS);
+        }
+
+        Self {
+            o_flags,
+            mode,
+            resolve,
+        }
+    }
+}
+
+impl From<PosixOpenHow> for OpenHow {
+    fn from(posix_open_how: PosixOpenHow) -> Self {
+        let o_flags = FileMode::from_bits_truncate(posix_open_how.flags as u32);
+        let mode = ModeType::from_bits_truncate(posix_open_how.mode as u32);
+        let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve as u64);
+        return Self::new(o_flags, mode, resolve);
+    }
+}
+
+bitflags! {
+    pub struct OpenHowResolve: u64{
+        /// Block mount-point crossings
+        ///     (including bind-mounts).
+        const RESOLVE_NO_XDEV = 0x01;
+
+        /// Block traversal through procfs-style
+        ///     "magic-links"
+        const RESOLVE_NO_MAGICLINKS = 0x02;
+
+        /// Block traversal through all symlinks
+        ///     (implies OEXT_NO_MAGICLINKS)
+        const RESOLVE_NO_SYMLINKS = 0x04;
+        /// Block "lexical" trickery like
+        ///     "..", symlinks, and absolute
+        const RESOLVE_BENEATH = 0x08;
+        /// Make all jumps to "/" and ".."
+        ///     be scoped inside the dirfd
+        ///     (similar to chroot(2)).
+        const RESOLVE_IN_ROOT = 0x10;
+        // Only complete if resolution can be
+        // 			completed through cached lookup. May
+        // 			return -EAGAIN if that's not
+        // 			possible.
+        const RESOLVE_CACHED = 0x20;
+    }
+}
 impl Syscall {
     /// @brief 为当前进程打开一个文件
     ///
@@ -153,78 +247,23 @@ impl Syscall {
     /// @param o_flags 打开文件的标志位
     ///
     /// @return 文件描述符编号，或者是错误码
-    pub fn open(path: &str, mode: FileMode, follow_symlink: bool) -> Result<usize, SystemError> {
-        // kdebug!("open: path: {}, mode: {:?}", path, mode);
-        // 文件名过长
-        if path.len() > MAX_PATHLEN as usize {
-            return Err(SystemError::ENAMETOOLONG);
-        }
+    pub fn open(
+        path: &str,
+        flags: FileMode,
+        mode: ModeType,
+        follow_symlink: bool,
+    ) -> Result<usize, SystemError> {
+        return do_sys_open(AtFlags::AT_FDCWD.bits(), path, flags, mode, follow_symlink);
+    }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup_follow_symlink(
-            path,
-            if follow_symlink {
-                VFS_MAX_FOLLOW_SYMLINK_TIMES
-            } else {
-                0
-            },
-        );
-
-        let inode: Arc<dyn IndexNode> = if inode.is_err() {
-            let errno = inode.unwrap_err();
-            // 文件不存在，且需要创建
-            if mode.contains(FileMode::O_CREAT)
-                && !mode.contains(FileMode::O_DIRECTORY)
-                && errno == SystemError::ENOENT
-            {
-                let (filename, parent_path) = rsplit_path(path);
-                // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> =
-                    ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-                // 创建文件
-                let inode: Arc<dyn IndexNode> = parent_inode.create(
-                    filename,
-                    FileType::File,
-                    ModeType::from_bits_truncate(0o755),
-                )?;
-                inode
-            } else {
-                // 不需要创建文件，因此返回错误码
-                return Err(errno);
-            }
-        } else {
-            inode.unwrap()
-        };
-
-        let file_type: FileType = inode.metadata()?.file_type;
-        // 如果要打开的是文件夹，而目标不是文件夹
-        if mode.contains(FileMode::O_DIRECTORY) && file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // 创建文件对象
-
-        let mut file: File = File::new(inode, mode)?;
-
-        // 打开模式为“追加”
-        if mode.contains(FileMode::O_APPEND) {
-            file.lseek(SeekFrom::SeekEnd(0))?;
-        }
-
-        // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-        if mode.contains(FileMode::O_TRUNC)
-            && (mode.contains(FileMode::O_RDWR) || mode.contains(FileMode::O_WRONLY))
-            && file_type == FileType::File
-        {
-            file.ftruncate(0)?;
-        }
-        // 把文件对象存入pcb
-        let r = ProcessManager::current_pcb()
-            .fd_table()
-            .write()
-            .alloc_fd(file, None)
-            .map(|fd| fd as usize);
-
-        return r;
+    pub fn openat(
+        dirfd: i32,
+        path: &str,
+        o_flags: FileMode,
+        mode: ModeType,
+        follow_symlink: bool,
+    ) -> Result<usize, SystemError> {
+        return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
     }
 
     /// @brief 关闭文件
@@ -764,14 +803,14 @@ impl Syscall {
     }
 
     pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, true)?;
+        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), true)?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
     }
 
     pub fn lstat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, false)?;
+        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), false)?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
@@ -847,7 +886,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
         let inode = inode.lookup(path.as_str())?;
         if inode.metadata()?.file_type != FileType::SymLink {

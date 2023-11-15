@@ -186,25 +186,28 @@ struct ConfigBuilder;
 
 impl ConfigBuilder {
     pub fn build() {
-        // 获取kernel.config所包含的模块
-        let modules = ConfigParser::parse_kernel_config();
+        // 如果存在kernel.config，才去解析
+        if fs::metadata("kernel.config").is_ok() {
+            // 获取kernel.config所包含的模块
+            let modules = ConfigParser::parse_kernel_config();
 
-        // 扫描各模块下以及其包含模块的d.config，然后将所有d.config路径添加到r中
-        let mut r = Vec::new();
-        for m in modules.iter() {
-            if m.enable() {
-                Self::dfs(m, &mut r);
+            // 扫描各模块下以及其包含模块的d.config，然后将所有d.config路径添加到r中
+            let mut r = Vec::new();
+            for m in modules.iter() {
+                if m.enable() {
+                    Self::dfs(m, &mut r);
+                }
             }
+
+            // 扫描所有d.config以获取features
+            let features = ConfigParser::parse_d_configs(&r);
+
+            // 添加feature
+            Self::build_features(&features);
+
+            // 生成最终内核编译配置文件D.config
+            Self::mk_compile_cfg(&features);
         }
-
-        // 扫描所有d.config以获取features
-        let features = ConfigParser::parse_d_configs(&r);
-
-        // 添加feature
-        Self::build_features(&features);
-
-        // 生成最终内核编译配置文件D.config
-        Self::mk_compile_cfg(&features);
     }
 
     /// 添加features

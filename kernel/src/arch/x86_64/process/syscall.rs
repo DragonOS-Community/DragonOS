@@ -22,15 +22,16 @@ impl Syscall {
         envp: Vec<String>,
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        // kdebug!(
-        //     "tmp_rs_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
+        // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let pcb = ProcessManager::current_pcb();
+        // crate::kdebug!(
+        //     "pid: {:?}  do_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
+        //     pcb.pid(),
         //     path,
         //     argv,
         //     envp
         // );
-        // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let pcb = ProcessManager::current_pcb();
 
         let mut basic_info = pcb.basic_mut();
         // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
@@ -109,7 +110,7 @@ impl Syscall {
 
         // kdebug!("regs: {:?}\n", regs);
 
-        // kdebug!(
+        // crate::kdebug!(
         //     "tmp_rs_execve: done, load_result.entry_point()={:?}",
         //     load_result.entry_point()
         // );

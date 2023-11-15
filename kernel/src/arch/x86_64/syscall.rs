@@ -7,11 +7,27 @@ use crate::{
     ipc::signal_types::SignalArch,
     libs::align::SafeForZero,
     mm::VirtAddr,
+    process::ProcessManager,
     syscall::{Syscall, SystemError, SYS_RT_SIGRETURN},
 };
 use alloc::string::String;
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
+
+pub const SYS_LSTAT: usize = 6;
+pub const SYS_READV: usize = 19;
+pub const SYS_ACCESS: usize = 21;
+pub const SYS_UNLINK: usize = 87;
+pub const SYS_CHMOD: usize = 90;
+pub const SYS_FCHMOD: usize = 91;
+pub const SYS_UMASK: usize = 95;
+pub const SYS_SYSINFO: usize = 99;
+pub const SYS_CLOCK_GETTIME: usize = 228;
+pub const SYS_OPENAT: usize = 257;
+pub const SYS_FCHMODAT: usize = 268;
+pub const SYS_FACCESSAT: usize = 269;
+pub const SYS_PRLIMIT64: usize = 302;
+pub const SYS_FACCESSAT2: usize = 439;
 
 /// ### 存储PCB系统调用栈以及在syscall过程中暂存用户态rsp的结构体
 ///
@@ -39,9 +55,15 @@ extern "C" {
 }
 
 macro_rules! syscall_return {
-    ($val:expr, $regs:expr) => {{
+    ($val:expr, $regs:expr, $show:expr) => {{
         let ret = $val;
         $regs.rax = ret as u64;
+
+        if $show {
+            let pid = ProcessManager::current_pcb().pid();
+            crate::kdebug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
+        }
+
         unsafe {
             CurrentIrqArch::interrupt_disable();
         }
@@ -64,18 +86,34 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
         frame.r9 as usize,
     ];
     mfence();
+    let pid = ProcessManager::current_pcb().pid();
+    let show = false;
+    // let show = if syscall_num != SYS_SCHED && pid.data() > 3 {
+    //     true
+    // } else {
+    //     false
+    // };
 
-    // 由于进程管理未完成重构，有些系统调用需要在这里临时处理，以后这里的特殊处理要删掉。
+    if show {
+        crate::kdebug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
+    }
+
+    // Arch specific syscall
     match syscall_num {
         SYS_RT_SIGRETURN => {
-            syscall_return!(X86_64SignalArch::sys_rt_sigreturn(frame) as usize, frame);
+            syscall_return!(
+                X86_64SignalArch::sys_rt_sigreturn(frame) as usize,
+                frame,
+                show
+            );
         }
         _ => {}
     }
     syscall_return!(
         Syscall::handle(syscall_num, &args, frame).unwrap_or_else(|e| e.to_posix_errno() as usize)
             as u64,
-        frame
+        frame,
+        show
     );
 }
 

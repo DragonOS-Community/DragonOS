@@ -30,7 +30,9 @@ pub fn softirq_init() -> Result<(), SystemError> {
     kinfo!("Initializing softirq...");
     unsafe {
         __SORTIRQ_VECTORS = Box::leak(Box::new(Softirq::new()));
-        __CPU_PENDING = Some(Box::new([VecStatus::default(); PerCpu::MAX_CPU_NUM as usize]));
+        __CPU_PENDING = Some(Box::new(
+            [VecStatus::default(); PerCpu::MAX_CPU_NUM as usize],
+        ));
         let cpu_pending = __CPU_PENDING.as_mut().unwrap();
         for i in 0..PerCpu::MAX_CPU_NUM {
             cpu_pending[i as usize] = VecStatus::default();

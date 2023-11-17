@@ -1,7 +1,5 @@
 use super::BindgenArch;
 
-
-
 pub struct X86_64BindgenArch;
 
 impl BindgenArch for X86_64BindgenArch {

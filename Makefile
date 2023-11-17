@@ -1,4 +1,4 @@
-SUBDIRS = kernel user tools
+SUBDIRS = kernel user tools build-scripts
 
 # ifndef $(EMULATOR)
 ifeq ($(EMULATOR), )
@@ -156,6 +156,7 @@ fmt:
 	@echo "格式化代码" 
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C kernel
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C user
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C build-scripts
 
 log-monitor:
 	@echo "启动日志监控"

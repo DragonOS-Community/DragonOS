@@ -12,7 +12,7 @@ crate-type = ["staticlib"]
 [workspace]
 members = [ 
     "crates/*",
-    "src/libs/intertrait" 
+    "src/libs/intertrait"
 ]
 
 [features]
@@ -50,9 +50,7 @@ kdepends = { path = "crates/kdepends" }
 
 # 构建时依赖项
 [build-dependencies]
-bindgen = "0.61.0"
-cc = { version = "1.0.83", features = ["parallel"] }
-toml = "0.8.6"
+kernel_build = { path = "../build-scripts/kernel_build" }
 
 [dependencies.lazy_static]
 version = "1.4.0"

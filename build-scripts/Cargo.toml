@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "kernel_build",
+]
+resolver = "2"

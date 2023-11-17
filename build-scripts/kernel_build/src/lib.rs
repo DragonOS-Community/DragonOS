@@ -4,6 +4,7 @@ extern crate cc;
 
 mod bindgen;
 mod cfiles;
+mod constant;
 mod kconfig;
 mod utils;
 

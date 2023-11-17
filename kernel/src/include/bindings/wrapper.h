@@ -10,7 +10,6 @@
  */
 #pragma once
 
-#include <common/blk_types.h>
 #include <common/crc16.h>
 #include <common/crc32.h>
 #include <common/crc64.h>
@@ -19,7 +18,6 @@
 #include <common/glib.h>
 #include <common/idr.h>
 #include <common/kfifo.h>
-#include <common/list.h>
 #include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
@@ -31,7 +29,6 @@
 #include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
 #include <libs/lib_ui/textui.h>
-#include <mm/mm-types.h>
 #include <mm/mm.h>
 #include <mm/mmio.h>
 #include <mm/slab.h>

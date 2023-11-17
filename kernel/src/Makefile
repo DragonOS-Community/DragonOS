@@ -26,13 +26,8 @@ export ASFLAGS := --64
 LD_LIST := ""
 
 
-kernel_subdirs := common driver debug arch exception smp syscall ktest libs time
+kernel_subdirs := common driver debug exception smp syscall ktest libs time
 
-
-main.o: main.c 
-# -fno-builtin: 不使用C语言内建函数
-# The -m64 option sets int to 32bits and long and pointer to 64 bits and generates code for AMD’s x86-64 architecture.
-	$(CC) $(CFLAGS) -c main.c  -o main.o
 
 kernel_rust:
 	RUSTFLAGS="$(RUSTFLAGS_UNWIND)" cargo +nightly-2023-01-21 build --release --target ./arch/x86_64/x86_64-unknown-none.json
@@ -40,7 +35,7 @@ kernel_rust:
 all: kernel
 
 	@echo "Linking kernel..."
-	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds --no-relax
 # 生成kallsyms
 	current_dir=$(pwd)
 	
@@ -54,7 +49,7 @@ all: kernel
 # 重新链接
 	@echo "Re-Linking kernel..."
 	@echo $(shell find . -name "*.o")
-	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds --no-relax
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
 ifeq ($(UNWIND_ENABLE), yes)
@@ -71,7 +66,7 @@ $(kernel_subdirs): ECHO
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)"  kernel_root_path="$(shell pwd)"
 
-kernel: main.o $(kernel_subdirs) kernel_rust
+kernel: $(kernel_subdirs) kernel_rust
 	
 
 

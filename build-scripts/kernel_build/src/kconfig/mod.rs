@@ -29,12 +29,12 @@ impl KConfigBuilder {
             CargoHandler::emit_features(features.as_slice());
 
             // 生成最终内核编译配置文件D.config
-            Self::mk_compile_cfg(&features);
+            Self::make_compile_cfg(&features);
         }
     }
 
     /// 生成最终编译配置文件D.config
-    fn mk_compile_cfg(features: &Vec<Feature>) {
+    fn make_compile_cfg(features: &Vec<Feature>) {
         let mut cfg_content = String::new();
         for f in features.iter() {
             if f.enable() {
@@ -62,7 +62,7 @@ impl KConfigBuilder {
         println!("{}", module.name());
 
         let path_str = module.path().as_path().to_str().unwrap().to_string();
-        let d_config_str = format!("{}d.config", path_str);
+        let d_config_str = format!("{}/d.config", path_str);
         let d_config_path = PathBuf::from(&d_config_str);
         let dcfg_content =
             fs::read_to_string(&d_config_path).expect(&format!("Failed to read {}", d_config_str));

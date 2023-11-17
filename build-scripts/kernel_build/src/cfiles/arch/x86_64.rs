@@ -31,6 +31,16 @@ impl CFilesArch for X86_64CFilesArch {
             Some("c"),
             true,
         ));
+        files.append(&mut FileUtils::list_all_files(
+            &arch_path("asm"),
+            Some("c"),
+            true,
+        ));
+        files.append(&mut FileUtils::list_all_files(
+            &arch_path("interrupt"),
+            Some("c"),
+            true,
+        ));
 
         // setup asm files
         files.push(PathBuf::from("src/arch/x86_64/asm/head.S"));

@@ -124,7 +124,6 @@
         "mm-types.h": "c",
         "vfs.h": "c",
         "current.h": "c",
-        "proc-types.h": "c",
         "traceback.h": "c",
         "bitcount.h": "c",
         "limits.h": "c",
@@ -171,7 +170,8 @@
         "cmpxchg.h": "c",
         "mman.h": "c",
         "clocksource.h": "c",
-        "ata.h": "c"
+        "ata.h": "c",
+        "barrier": "c"
     },
     "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",

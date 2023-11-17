@@ -30,6 +30,7 @@
 
 #include <arch/x86_64/driver/apic/apic_timer.h>
 #include <virt/kvm/kvm.h>
+#include <debug/bug.h>
 
 extern int rs_driver_init();
 extern void rs_softirq_init();

@@ -17,7 +17,6 @@ pub struct Partition {
     pub sectors_num: u64,        // 该分区的扇区数
     disk: Weak<dyn BlockDevice>, // 当前分区所属的磁盘
     pub partno: u16,             // 在磁盘上的分区号
-
 }
 
 /// @brief: 分区信息 - 成员函数

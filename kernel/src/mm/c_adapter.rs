@@ -7,7 +7,7 @@ use hashbrown::HashMap;
 
 use crate::{
     arch::mm::LowAddressRemapping,
-    include::bindings::bindings::{gfp_t, vm_flags_t, PAGE_U_S},
+    include::bindings::bindings::{gfp_t, PAGE_U_S},
     kerror,
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::MMArch,
@@ -140,7 +140,7 @@ pub unsafe extern "C" fn rs_unmap_at_low_addr() -> usize {
 #[no_mangle]
 unsafe extern "C" fn rs_mmio_create(
     size: u32,
-    _vm_flags: vm_flags_t,
+    _vm_flags: u64,
     res_vaddr: *mut u64,
     res_length: *mut u64,
 ) -> i32 {

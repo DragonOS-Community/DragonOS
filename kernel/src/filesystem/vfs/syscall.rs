@@ -9,7 +9,7 @@ use alloc::{
 use crate::{
     driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
-    include::bindings::bindings::{verify_area, PROC_MAX_FD_NUM},
+    include::bindings::bindings::verify_area,
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
@@ -465,7 +465,7 @@ impl Syscall {
         let dirent =
             unsafe { (buf.as_mut_ptr() as *mut Dirent).as_mut() }.ok_or(SystemError::EFAULT)?;
 
-        if fd < 0 || fd as u32 > PROC_MAX_FD_NUM {
+        if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
             return Err(SystemError::EBADF);
         }
 

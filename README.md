@@ -1,5 +1,5 @@
 <div align="center">
-  <img width=220 src="docs/_static/dragonos-logo.svg" alt="dragonos-logo"></br>
+  <img width="50%" src="docs/_static/dragonos-logo.svg" alt="dragonos-logo"></br>
   <h2>打造完全自主可控的数字化未来！</h2>
 
   ![Static Badge](https://img.shields.io/badge/%E5%AE%98%E7%BD%91-DragonOS.org-4c69e4?link=https%3A%2F%2Fdragonos.org)
@@ -11,9 +11,6 @@
 </div>
 
 # DragonOS
-
-## 打造完全自主可控的数字化未来！
-
 
 **Languages** 中文|[English](README_EN.md)
 

@@ -4,6 +4,7 @@ extern crate cc;
 
 mod bindgen;
 mod cfiles;
+mod kconfig;
 mod utils;
 
 /// 运行构建
@@ -12,4 +13,5 @@ pub fn run() {
 
     crate::bindgen::generate_bindings();
     crate::cfiles::CFilesBuilder::build();
+    crate::kconfig::KConfigBuilder::build();
 }

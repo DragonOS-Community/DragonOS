@@ -1,5 +1,7 @@
 use std::{env, path::PathBuf};
 
+use crate::kconfig::Feature;
+
 lazy_static! {
     static ref CARGO_HANDLER_DATA: CargoHandlerData = CargoHandlerData::new();
 }
@@ -41,6 +43,19 @@ impl CargoHandler {
     pub fn emit_rerun_if_files_changed(files: &[PathBuf]) {
         for f in files {
             println!("cargo:rerun-if-changed={}", f.to_str().unwrap());
+        }
+    }
+
+    /// 添加features
+    ///
+    /// ## Parameters
+    ///
+    /// - `features` - The features to be set
+    pub fn emit_features(features: &[Feature]) {
+        for f in features.iter() {
+            if f.enable() {
+                println!("cargo:rustc-cfg=feature=\"{}\"", f.name());
+            }
         }
     }
 }

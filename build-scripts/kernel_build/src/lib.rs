@@ -4,6 +4,7 @@ extern crate cc;
 
 mod bindgen;
 mod cfiles;
+mod constant;
 mod utils;
 
 /// 运行构建

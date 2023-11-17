@@ -18,8 +18,6 @@ pub struct Partition {
     disk: Weak<dyn BlockDevice>, // 当前分区所属的磁盘
     pub partno: u16,             // 在磁盘上的分区号
 
-                                 // struct block_device_request_queue *bd_queue; // 请求队列
-                                 // struct vfs_superblock_t *bd_superblock;      // 执行超级块的指针
 }
 
 /// @brief: 分区信息 - 成员函数

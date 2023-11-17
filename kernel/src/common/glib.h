@@ -11,7 +11,6 @@
 #include <common/stddef.h>
 #include <arch/arch.h>
 #include <common/compiler.h>
-#include <common/list.h>
 
 #include <asm/asm.h>
 

@@ -128,8 +128,6 @@
         "traceback.h": "c",
         "bitcount.h": "c",
         "limits.h": "c",
-        "block.h": "c",
-        "blk_types.h": "c",
         "mutex.h": "c",
         "mount.h": "c",
         "internal.h": "c",

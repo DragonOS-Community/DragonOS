@@ -34,9 +34,9 @@ impl CargoHandler {
     }
 
     /// 设置Cargo对文件更改的监听
-    /// 
+    ///
     /// ## Parameters
-    /// 
+    ///
     /// - `files` - The files to set rerun build
     pub fn emit_rerun_if_files_changed(files: &[PathBuf]) {
         for f in files {

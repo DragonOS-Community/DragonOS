@@ -15,6 +15,9 @@ pub(super) trait CFilesArch {
     fn setup_global_include_dir(&self, c: &mut Build);
     /// 设置需要编译的架构相关的文件
     fn setup_files(&self, c: &mut Build, files: &mut Vec<PathBuf>);
+
+    /// 设置架构相关的全局编译标志
+    fn setup_global_flags(&self, c: &mut Build);
 }
 
 /// 获取当前的架构;

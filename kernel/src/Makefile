@@ -23,15 +23,10 @@ CFLAGS = $(GLOBAL_CFLAGS) -fno-pie $(CFLAGS_UNWIND) -I $(shell pwd) -I $(shell p
 
 export ASFLAGS := --64
 
-LD_LIST := head.o
+LD_LIST := ""
 
 
 kernel_subdirs := common driver debug arch exception smp syscall ktest libs time
-
-
-head.o: head.S
-	$(CC) -E head.S > _head.s # 预处理
-	$(AS) $(ASFLAGS) -o head.o _head.s
 
 
 main.o: main.c 
@@ -45,7 +40,7 @@ kernel_rust:
 all: kernel
 
 	@echo "Linking kernel..."
-	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T link.lds --no-relax
 # 生成kallsyms
 	current_dir=$(pwd)
 	
@@ -59,7 +54,7 @@ all: kernel
 # 重新链接
 	@echo "Re-Linking kernel..."
 	@echo $(shell find . -name "*.o")
-	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel head.o main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel main.o $(shell find . -name "*.o") ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T link.lds --no-relax
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
 ifeq ($(UNWIND_ENABLE), yes)
@@ -76,7 +71,7 @@ $(kernel_subdirs): ECHO
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)"  kernel_root_path="$(shell pwd)"
 
-kernel: head.o main.o $(kernel_subdirs) kernel_rust
+kernel: main.o $(kernel_subdirs) kernel_rust
 	
 
 

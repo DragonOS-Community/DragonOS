@@ -2,6 +2,8 @@ use std::{fs, io::Write, path::PathBuf};
 
 use toml::Value;
 
+use crate::utils::cargo_handler::CargoHandler;
+
 /// 内核编译配置的构建器
 pub struct KConfigBuilder;
 
@@ -24,19 +26,10 @@ impl KConfigBuilder {
             let features = ConfigParser::parse_d_configs(&r);
 
             // 添加feature
-            Self::build_features(&features);
+            CargoHandler::emit_features(features.as_slice());
 
             // 生成最终内核编译配置文件D.config
             Self::mk_compile_cfg(&features);
-        }
-    }
-
-    /// 添加features
-    fn build_features(features: &Vec<Feature>) {
-        for f in features.iter() {
-            if f.enable() {
-                println!("{}", format!("cargo:rustc-cfg=feature=\"{}\"", f.name()))
-            }
         }
     }
 
@@ -180,7 +173,7 @@ impl Module {
 }
 
 /// feature
-struct Feature {
+pub struct Feature {
     /// feature标签名
     name: String,
     /// 是否启用

@@ -5,7 +5,7 @@
 #include <mm/mm.h>
 #include <mm/mmio.h>
 
-extern void rs_acpi_init(uint64_t rsdp_paddr);
+extern void rs_acpi_init(uint64_t rsdp_paddr1, uint64_t rsdp_paddr);
 
 #define acpi_get_RSDT_entry_vaddr(phys_addr) (acpi_description_header_base + (phys_addr)-acpi_RSDT_entry_phys_base) // 获取RSDT entry的虚拟地址
 // #define acpi_get_XSDT_entry_vaddr(phys_addr) (ACPI_DESCRIPTION_HEDERS_BASE + (phys_addr)-acpi_XSDT_entry_phys_base) // 获取XSDT entry的虚拟地址
@@ -137,11 +137,11 @@ void acpi_init()
     multiboot2_iter(multiboot2_get_acpi_old_RSDP, &old_acpi, &reserved);
     rsdpv1 = &(old_acpi.rsdp);
 
-    // 这里有bug：当multiboot2不存在rsdpv2的时候，会导致错误
-    // multiboot2_iter(multiboot2_get_acpi_new_RSDP, &new_acpi, &reserved);
-    // rsdpv2 = &(new_acpi.rsdp);
-    rsdpv2 = NULL;
-    rs_acpi_init((uint64_t)rsdpv1);
+    multiboot2_iter(multiboot2_get_acpi_new_RSDP, &new_acpi, &reserved);
+    rsdpv2 = &(new_acpi.rsdp);
+
+    // rsdpv1、rsdpv2，二者有一个能成功即可
+    rs_acpi_init((uint64_t)rsdpv1,(uint64_t)rsdpv2);
 
     uint64_t paddr = 0;
     // An ACPI-compatible OS must use the XSDT if present

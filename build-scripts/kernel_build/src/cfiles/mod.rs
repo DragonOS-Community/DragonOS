@@ -14,6 +14,7 @@ pub struct CFilesBuilder;
 impl CFilesBuilder {
     pub fn build() {
         let mut c = cc::Build::new();
+
         Self::setup_global_flags(&mut c);
         Self::setup_defines(&mut c);
         Self::setup_global_include_dir(&mut c);
@@ -31,6 +32,9 @@ impl CFilesBuilder {
             .flag("-Wno-unused-parameter")
             .flag("-m64")
             .flag("-O1");
+
+        // set Arch-specific flags
+        current_cfiles_arch().setup_global_flags(c);
     }
 
     fn setup_defines(c: &mut Build) {

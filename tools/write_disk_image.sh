@@ -88,7 +88,7 @@ echo $LOOP_DEVICE
 # 检测grub文件夹是否存在
 if [ -d "${GRUB_INSTALL_PATH}" ]; then
   echo "grub已安装"
-#   INSTALL_GRUB_TO_IMAGE="0"
+   INSTALL_GRUB_TO_IMAGE="0"
 else
   mkdir -p ${GRUB_INSTALL_PATH}
 fi

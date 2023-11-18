@@ -1,4 +1,5 @@
 pub mod barrier;
+pub mod bump;
 
 use alloc::vec::Vec;
 use hashbrown::HashSet;
@@ -7,7 +8,8 @@ use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::tty::serial::serial8250::send_to_default_serial8250_port;
 use crate::include::bindings::bindings::{
-    multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
+    multiboot2_get_load_base, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
+    multiboot_tag_load_base_addr_t,
 };
 use crate::libs::align::page_align_up;
 use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
@@ -55,8 +57,9 @@ static KERNEL_PML4E_NO: usize = (X86_64MMArch::PHYS_OFFSET & ((1 << 48) - 1)) >>
 
 static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = SpinLock::new(None);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct X86_64MMBootstrapInfo {
+    kernel_load_base_paddr: usize,
     kernel_code_start: usize,
     kernel_code_end: usize,
     kernel_data_end: usize,
@@ -64,16 +67,7 @@ pub struct X86_64MMBootstrapInfo {
     start_brk: usize,
 }
 
-impl Debug for X86_64MMBootstrapInfo {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(
-            f,
-            "kernel_code_start: {:x}, kernel_code_end: {:x}, kernel_data_end: {:x}, kernel_rodata_end: {:x}, start_brk: {:x}",
-            self.kernel_code_start, self.kernel_code_end, self.kernel_data_end, self.kernel_rodata_end, self.start_brk)
-    }
-}
-
-pub static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
+pub(super) static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
 
 /// @brief X86_64的内存管理架构结构体
 #[derive(Debug, Clone, Copy, Hash)]
@@ -136,14 +130,17 @@ impl MemoryManagementArch for X86_64MMArch {
         }
 
         Self::init_xd_rsvd();
+        let load_base_paddr = Self::get_load_base_paddr();
 
         let bootstrap_info = X86_64MMBootstrapInfo {
+            kernel_load_base_paddr: load_base_paddr.data(),
             kernel_code_start: _text as usize,
             kernel_code_end: _etext as usize,
             kernel_data_end: _edata as usize,
             kernel_rodata_end: _erodata as usize,
             start_brk: _end as usize,
         };
+
         unsafe {
             BOOTSTRAP_MM_INFO = Some(bootstrap_info);
         }
@@ -151,6 +148,7 @@ impl MemoryManagementArch for X86_64MMArch {
         // 初始化物理内存区域(从multiboot2中获取)
         let areas_count =
             Self::init_memory_area_from_multiboot2().expect("init memory area failed");
+
         send_to_default_serial8250_port("x86 64 init end\n\0".as_bytes());
 
         return &PHYS_MEMORY_AREAS[0..areas_count];
@@ -238,6 +236,30 @@ impl MemoryManagementArch for X86_64MMArch {
 }
 
 impl X86_64MMArch {
+    unsafe fn get_load_base_paddr() -> PhysAddr {
+        let mut mb2_lb_info: [multiboot_tag_load_base_addr_t; 512] = mem::zeroed();
+        send_to_default_serial8250_port("get_load_base_paddr begin\n\0".as_bytes());
+
+        let mut mb2_count: u32 = 0;
+        multiboot2_iter(
+            Some(multiboot2_get_load_base),
+            &mut mb2_lb_info as *mut [multiboot_tag_load_base_addr_t; 512] as usize as *mut c_void,
+            &mut mb2_count,
+        );
+
+        if mb2_count == 0 {
+            send_to_default_serial8250_port(
+                "get_load_base_paddr mb2_count == 0, default to 1MB\n\0".as_bytes(),
+            );
+            return PhysAddr::new(0x100000);
+        }
+
+        let phys = mb2_lb_info[0].load_base_addr as usize;
+        let s = format_args!("get_load_base_paddr end, phys = {:#x}\n\0", phys);
+        // send_to_default_serial8250_port();
+
+        return PhysAddr::new(phys);
+    }
     unsafe fn init_memory_area_from_multiboot2() -> Result<usize, SystemError> {
         // 这个数组用来存放内存区域的信息（从C获取）
         let mut mb2_mem_info: [multiboot_mmap_entry_t; 512] = mem::zeroed();
@@ -269,7 +291,6 @@ impl X86_64MMArch {
         }
         send_to_default_serial8250_port("init_memory_area_from_multiboot2 end\n\0".as_bytes());
         kinfo!("Total memory size: {} MB, total areas from multiboot2: {mb2_count}, valid areas: {areas_count}", total_mem_size / 1024 / 1024);
-
         return Ok(areas_count);
     }
 
@@ -286,7 +307,11 @@ impl X86_64MMArch {
 
     /// 判断XD标志位是否被保留
     pub fn is_xd_reserved() -> bool {
-        return XD_RESERVED.load(Ordering::Relaxed);
+        // return XD_RESERVED.load(Ordering::Relaxed);
+
+        // 由于暂时不支持execute disable，因此直接返回true
+        // 不支持的原因是，目前好像没有能正确的设置page-level的xd位，会触发page fault
+        return true;
     }
 }
 

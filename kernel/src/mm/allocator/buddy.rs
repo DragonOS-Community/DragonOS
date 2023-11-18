@@ -8,7 +8,7 @@ use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
 use crate::{kdebug, kwarn};
-use core::cmp::{max, min};
+use core::cmp::min;
 use core::fmt::Debug;
 use core::intrinsics::{likely, unlikely};
 

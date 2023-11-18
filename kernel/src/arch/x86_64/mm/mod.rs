@@ -255,8 +255,6 @@ impl X86_64MMArch {
         }
 
         let phys = mb2_lb_info[0].load_base_addr as usize;
-        let s = format_args!("get_load_base_paddr end, phys = {:#x}\n\0", phys);
-        // send_to_default_serial8250_port();
 
         return PhysAddr::new(phys);
     }

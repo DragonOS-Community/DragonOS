@@ -2,8 +2,7 @@ use crate::{
     kdebug,
     libs::align::{page_align_down, page_align_up},
     mm::{
-        allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
-        MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr,
+        allocator::bump::BumpAllocator, MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr,
     },
 };
 

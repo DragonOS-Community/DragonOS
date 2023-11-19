@@ -6,9 +6,9 @@
 use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
-use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
 use crate::{kdebug, kwarn};
-use core::cmp::{max, min};
+use core::cmp::min;
 use core::fmt::Debug;
 use core::intrinsics::{likely, unlikely};
 
@@ -77,15 +77,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
         let initial_free_pages = bump_allocator.usage().free();
+        let total_memory = bump_allocator.usage().total();
         kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
         kdebug!("Buddy entries: {}", Self::BUDDY_ENTRIES);
-        // 最高阶的链表页数
-        let max_order_linked_list_page_num = max(
-            1,
-            (((initial_free_pages.data() * A::PAGE_SIZE) >> (MAX_ORDER - 1)) + Self::BUDDY_ENTRIES
-                - 1)
-                / Self::BUDDY_ENTRIES,
-        );
 
         let mut free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize] =
             [PhysAddr::new(0); (MAX_ORDER - MIN_ORDER) as usize];
@@ -102,138 +96,85 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             Self::write_page(*f, page_list);
         }
 
-        // 分配最高阶的链表页
-        for _ in 1..max_order_linked_list_page_num {
-            let curr_page = bump_allocator.allocate_one().unwrap();
-            // 清空当前页
-            core::ptr::write_bytes(
-                MMArch::phys_2_virt(curr_page)?.data() as *mut u8,
-                0,
-                A::PAGE_SIZE,
-            );
-
-            let page_list: PageList<A> =
-                PageList::new(0, free_area[Self::order2index((MAX_ORDER - 1) as u8)]);
-            Self::write_page(curr_page, page_list);
-            free_area[Self::order2index((MAX_ORDER - 1) as u8)] = curr_page;
-        }
-
-        let initial_bump_offset = bump_allocator.offset();
-        let pages_to_buddy = bump_allocator.usage().free();
-        kdebug!("pages_to_buddy {:?}", pages_to_buddy);
-        // kdebug!("initial_bump_offset {:#x}", initial_bump_offset);
-        let mut paddr = initial_bump_offset;
-        let mut remain_pages = pages_to_buddy;
-        // 设置entry,这里假设了bump_allocator当前offset之后，所有的area的地址是连续的.
-        // TODO: 这里需要修改，按照area来处理
-        for i in MIN_ORDER..MAX_ORDER {
-            // kdebug!("i {i}, remain pages={}", remain_pages.data());
-            if remain_pages.data() < (1 << (i - MIN_ORDER)) {
-                break;
-            }
-
-            assert!(paddr & ((1 << i) - 1) == 0);
-
-            if likely(i != MAX_ORDER - 1) {
-                // 要填写entry
-                if paddr & (1 << i) != 0 {
-                    let page_list_paddr: PhysAddr = free_area[Self::order2index(i as u8)];
-                    let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
-
-                    A::write(
-                        Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
-                        paddr,
-                    );
-                    page_list.entry_num += 1;
-                    Self::write_page(page_list_paddr, page_list);
-
-                    paddr += 1 << i;
-                    remain_pages -= 1 << (i - MIN_ORDER);
-                };
-            } else {
-                // 往最大的阶数的链表中添加entry（注意要考虑到最大阶数的链表可能有多页）
-                // 断言剩余页面数量是MAX_ORDER-1阶的整数倍
-
-                let mut entries = (remain_pages.data() * A::PAGE_SIZE) >> i;
-                let mut page_list_paddr: PhysAddr = free_area[Self::order2index(i as u8)];
-                let block_size = 1usize << i;
-
-                if entries > Self::BUDDY_ENTRIES {
-                    // 在第一页填写一些entries
-                    let num = entries % Self::BUDDY_ENTRIES;
-                    entries -= num;
-
-                    let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
-                    for _j in 0..num {
-                        A::write(
-                            Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
-                            paddr,
-                        );
-                        page_list.entry_num += 1;
-                        paddr += block_size;
-                        remain_pages -= 1 << (i - MIN_ORDER);
-                    }
-                    page_list_paddr = page_list.next_page;
-                    Self::write_page(page_list_paddr, page_list);
-                    assert!(!page_list_paddr.is_null());
-                }
-
-                while entries > 0 {
-                    let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
-
-                    for _ in 0..Self::BUDDY_ENTRIES {
-                        A::write(
-                            Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
-                            paddr,
-                        );
-                        page_list.entry_num += 1;
-                        paddr += block_size;
-                        remain_pages -= 1 << (i - MIN_ORDER);
-                        entries -= 1;
-                        if entries == 0 {
-                            break;
-                        }
-                    }
-                    page_list_paddr = page_list.next_page;
-                    Self::write_page(page_list_paddr, page_list);
-
-                    if likely(entries > 0) {
-                        assert!(!page_list_paddr.is_null());
-                    }
-                }
-            }
-        }
-
-        let mut remain_bytes = remain_pages.data() * A::PAGE_SIZE;
-
-        assert!(remain_bytes < (1 << MAX_ORDER - 1));
-
-        for i in (MIN_ORDER..MAX_ORDER).rev() {
-            if remain_bytes >= (1 << i) {
-                assert!(paddr & ((1 << i) - 1) == 0);
-                let page_list_paddr: PhysAddr = free_area[Self::order2index(i as u8)];
-                let mut page_list: PageList<A> = Self::read_page(page_list_paddr);
-
-                A::write(
-                    Self::entry_virt_addr(page_list_paddr, page_list.entry_num),
-                    paddr,
-                );
-                page_list.entry_num += 1;
-                Self::write_page(page_list_paddr, page_list);
-
-                paddr += 1 << i;
-                remain_bytes -= 1 << i;
-            }
-        }
-
-        assert!(remain_bytes == 0);
-        assert!(paddr == initial_bump_offset + pages_to_buddy.data() * A::PAGE_SIZE);
-
-        let allocator = Self {
+        let mut allocator = Self {
             free_area,
-            total: pages_to_buddy,
+            total: PageFrameCount::new(0),
             phantom: PhantomData,
         };
+
+        let mut total_pages_to_buddy = PageFrameCount::new(0);
+        let mut res_areas = [PhysMemoryArea::default(); 128];
+        let mut offset_in_remain_area = bump_allocator
+            .remain_areas(&mut res_areas)
+            .expect("BuddyAllocator: failed to get remain areas from bump allocator");
+
+        let remain_areas = &res_areas[0..];
+
+        kdebug!("Remain areas: {:?}", &remain_areas[0..10]);
+        kdebug!("offset_in_remain_area: {:?}", offset_in_remain_area);
+
+        for area in remain_areas {
+            let mut paddr = (area.area_base_aligned() + offset_in_remain_area).data();
+            let mut remain_pages =
+                PageFrameCount::from_bytes(area.area_end_aligned().data() - paddr).unwrap();
+            total_pages_to_buddy += remain_pages;
+
+            if offset_in_remain_area != 0 {
+                offset_in_remain_area = 0;
+            }
+
+            // 先从低阶开始，尽可能地填满空闲链表
+            for i in MIN_ORDER..MAX_ORDER {
+                // kdebug!("i {i}, remain pages={}", remain_pages.data());
+                if remain_pages.data() < (1 << (i - MIN_ORDER)) {
+                    break;
+                }
+
+                assert!(paddr & ((1 << i) - 1) == 0);
+
+                if likely(i != MAX_ORDER - 1) {
+                    // 要填写entry
+                    if paddr & (1 << i) != 0 {
+                        allocator.buddy_free(PhysAddr::new(paddr), i as u8);
+
+                        paddr += 1 << i;
+                        remain_pages -= 1 << (i - MIN_ORDER);
+                    };
+                } else {
+                    // 往最大的阶数的链表中添加entry（注意要考虑到最大阶数的链表可能有多页）
+                    // 断言剩余页面数量是MAX_ORDER-1阶的整数倍
+
+                    let mut entries = (remain_pages.data() * A::PAGE_SIZE) >> i;
+                    while entries > 0 {
+                        allocator.buddy_free(PhysAddr::new(paddr), i as u8);
+                        paddr += 1 << i;
+                        remain_pages -= 1 << (i - MIN_ORDER);
+
+                        entries -= 1;
+                    }
+                }
+            }
+
+            // 然后从高往低，把剩余的页面加入链表
+            let mut remain_bytes = remain_pages.data() * A::PAGE_SIZE;
+
+            assert!(remain_bytes < (1 << MAX_ORDER - 1));
+
+            for i in (MIN_ORDER..MAX_ORDER).rev() {
+                if remain_bytes >= (1 << i) {
+                    assert!(paddr & ((1 << i) - 1) == 0);
+                    allocator.buddy_free(PhysAddr::new(paddr), i as u8);
+
+                    paddr += 1 << i;
+                    remain_bytes -= 1 << i;
+                }
+            }
+
+            assert!(remain_bytes == 0);
+        }
+
+        kdebug!("Total pages to buddy: {:?}", total_pages_to_buddy);
+        allocator.total = total_memory;
 
         Some(allocator)
     }

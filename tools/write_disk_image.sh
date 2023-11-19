@@ -62,7 +62,7 @@ if [ ! -f "${root_folder}/bin/disk.img" ]; then
         --bios) 
         case "$2" in
                 uefi)
-            sudo bash ./create_hdd_image.sh -P GPT #GPT分区
+            sudo bash ./create_hdd_image.sh -P MBR #GPT分区
             ;;
                 legacy)
             sudo bash ./create_hdd_image.sh -P MBR #MBR分区
@@ -88,7 +88,7 @@ echo $LOOP_DEVICE
 # 检测grub文件夹是否存在
 if [ -d "${GRUB_INSTALL_PATH}" ]; then
   echo "grub已安装"
-  INSTALL_GRUB_TO_IMAGE="0"
+   INSTALL_GRUB_TO_IMAGE="0"
 else
   mkdir -p ${GRUB_INSTALL_PATH}
 fi

@@ -71,7 +71,7 @@ We guarantee that all sponsorship funds and items will be used for:
 
 **Not yet**
 
-We hope that in the future, some enterprises can sponsor DragonOS and inject financial power into its development!
+- **[China YaCloud](https://yacloud.net)** Ya'an Digital Economy Operations Co., Ltd. provides cloud server support for DragonOS.
 
 ### Individual Sponsor List
 

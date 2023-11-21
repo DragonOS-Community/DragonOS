@@ -10,7 +10,7 @@ use crate::{
     kinfo,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
-    smp::core::smp_get_processor_id,
+    smp::core::smp_get_processor_id, driver::tty::serial::serial8250::send_to_default_serial8250_port,
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
@@ -192,6 +192,7 @@ pub extern "C" fn sched_init() {
     kinfo!("Initializing schedulers...");
     unsafe {
         sched_cfs_init();
+
         sched_rt_init();
     }
     kinfo!("Schedulers initialized");

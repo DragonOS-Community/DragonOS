@@ -1112,10 +1112,10 @@ impl TextuiWindow {
         vline_id: LineId,
         start_index: LineIndex,
     ) -> Result<(), SystemError> {
-        let num = self.winsize.col();
+        let chars_num = self.winsize.col();
         if let TextuiVline::Chromatic(vline) = self.get_mut_vline(vline_id) {
             let chars: Vec<TextuiCharChromatic> = vline.get_chars(start_index, vline.end_index);
-            if !vline.end_index.data() < num {
+            if !vline.end_index.data() < chars_num {
                 let mut move_chars = chars.clone();
                 let char = move_chars.pop().unwrap();
                 if vline.has_linefeed() {

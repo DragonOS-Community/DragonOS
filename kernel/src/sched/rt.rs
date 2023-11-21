@@ -1,4 +1,4 @@
-use core::sync::atomic::compiler_fence;
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
 
@@ -7,7 +7,7 @@ use crate::{
     include::bindings::bindings::MAX_CPU_NUM,
     kBUG, kdebug,
     libs::spinlock::SpinLock,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager}, driver::tty::serial::serial8250::send_to_default_serial8250_port,
 };
 
 use super::{
@@ -26,9 +26,12 @@ pub fn __get_rt_scheduler() -> &'static mut SchedulerRT {
 
 /// @brief 初始化rt调度器
 pub unsafe fn sched_rt_init() {
-    kdebug!("rt scheduler init");
+    // kdebug!("rt scheduler init");
     if RT_SCHEDULER_PTR.is_none() {
+        compiler_fence(Ordering::SeqCst);
         RT_SCHEDULER_PTR = Some(Box::new(SchedulerRT::new()));
+    send_to_default_serial8250_port("textui init failedeeeeeeeeeeeeeee.\n\0".as_bytes());
+        compiler_fence(Ordering::SeqCst);
     } else {
         kBUG!("Try to init RT Scheduler twice.");
         panic!("Try to init RT Scheduler twice.");

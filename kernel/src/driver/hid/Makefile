@@ -9,7 +9,7 @@ ECHO:
 	@echo "$@"
 
 $(kernel_driver_hid_subdirs): ECHO
-	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" PIC="$(PIC)"
+	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)" 
 
 $(kernel_driver_hid_objs): ECHO
 	$(CC) $(CFLAGS) -c $@ -o $@.o

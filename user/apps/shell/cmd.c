@@ -521,10 +521,10 @@ int shell_cmd_exec(int argc, char **argv)
         char *file_path = get_target_filepath(argv[1], &path_len);
         // printf("before execv, path=%s, argc=%d\n", file_path, argc);
 
-        char **real_argv;
-        if (argc > 2)
+        char **real_argv = NULL;
+        if (argc > 1)
         {
-            real_argv = &argv[2];
+            real_argv = &argv[1];
         }
         execv(file_path, real_argv);
         // printf("after execv, path=%s, argc=%d\n", file_path, argc);
@@ -540,7 +540,6 @@ int shell_cmd_exec(int argc, char **argv)
             waitpid(pid, &retval, 0);
         else
             printf("[1] %d\n", pid); // 输出子进程的pid
-
         free(argv);
     }
 }
@@ -586,7 +585,7 @@ out:;
  */
 int shell_cmd_reboot(int argc, char **argv)
 {
-    return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0, 0, 0);
+    return syscall_invoke(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
 }
 
 int shell_cmd_free(int argc, char **argv)
@@ -654,7 +653,7 @@ int parse_command(char *buf, int *argc, char ***argv)
         if (buf[i] != ' ' && (buf[i + 1] == ' ' || buf[i + 1] == '\0'))
             ++(*argc);
     }
-
+    
     // printf("\nargc=%d\n", *argc);
 
     // 为指向每个指令的指针分配空间

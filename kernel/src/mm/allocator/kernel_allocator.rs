@@ -1,5 +1,8 @@
+use klog_types::AllocLogItem;
+
 use crate::{
     arch::mm::LockedFrameAllocator,
+    debug::klog::mm::mm_debug_log,
     libs::align::page_align_up,
     mm::{MMArch, MemoryManagementArch, VirtAddr},
 };
@@ -81,18 +84,76 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        return self.local_alloc(layout);
+        let r = self.local_alloc(layout);
+        mm_debug_log(
+            klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
+                layout.clone(),
+                Some(r as usize),
+                None,
+            )),
+            klog_types::LogSource::Buddy,
+        );
+
+        return r;
+
         // self.local_alloc_zeroed(layout, 0)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.local_alloc_zeroed(layout)
+        let r = self.local_alloc_zeroed(layout);
+
+        mm_debug_log(
+            klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
+                layout.clone(),
+                Some(r as usize),
+                None,
+            )),
+            klog_types::LogSource::Buddy,
+        );
+
+        return r;
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        mm_debug_log(
+            klog_types::AllocatorLogType::Free(AllocLogItem::new(
+                layout.clone(),
+                Some(ptr as usize),
+                None,
+            )),
+            klog_types::LogSource::Buddy,
+        );
+
         self.local_dealloc(ptr, layout);
     }
 }
+
+/// 为内核slab分配器实现Allocator特性
+// unsafe impl Allocator for KernelAllocator {
+//     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+//         let memory = unsafe {self.local_alloc(layout)};
+//         if memory.is_null() {
+//             Err(AllocError)
+//         } else {
+//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
+//             Ok(unsafe { NonNull::new_unchecked(slice) })
+//         }
+//     }
+
+//     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+//         let memory = unsafe {self.local_alloc_zeroed(layout)};
+//         if memory.is_null() {
+//             Err(AllocError)
+//         } else {
+//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
+//             Ok(unsafe { NonNull::new_unchecked(slice) })
+//         }
+//     }
+
+//     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+//         self.local_dealloc(ptr.cast().as_ptr(), layout);
+//     }
+// }
 
 /// 内存分配错误处理函数
 #[cfg(target_os = "none")]

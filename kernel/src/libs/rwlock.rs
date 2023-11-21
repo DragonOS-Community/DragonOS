@@ -44,6 +44,7 @@ pub struct RwLock<T> {
 pub struct RwLockReadGuard<'a, T: 'a> {
     data: *const T,
     lock: &'a AtomicU32,
+    irq_guard: Option<IrqFlagsGuard>,
 }
 
 /// @brief UPGRADED是介于READER和WRITER之间的一种锁,它可以升级为WRITER,
@@ -53,6 +54,7 @@ pub struct RwLockReadGuard<'a, T: 'a> {
 pub struct RwLockUpgradableGuard<'a, T: 'a> {
     data: *const T,
     inner: &'a RwLock<T>,
+    irq_guard: Option<IrqFlagsGuard>,
 }
 
 /// @brief WRITER守卫的数据结构
@@ -144,6 +146,7 @@ impl<T> RwLock<T> {
             return Some(RwLockReadGuard {
                 data: unsafe { &*self.data.get() },
                 lock: &self.lock,
+                irq_guard: None,
             });
         }
     }
@@ -158,6 +161,19 @@ impl<T> RwLock<T> {
                 None => spin_loop(),
             }
         } //忙等待
+    }
+
+    pub fn read_irqsave(&self) -> RwLockReadGuard<T> {
+        loop {
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            match self.try_read() {
+                Some(mut guard) => {
+                    guard.irq_guard = Some(irq_guard);
+                    return guard;
+                }
+                None => spin_loop(),
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -249,6 +265,20 @@ impl<T> RwLock<T> {
         return r;
     }
 
+    #[allow(dead_code)]
+    pub fn try_upgradeable_read_irqsave(&self) -> Option<RwLockUpgradableGuard<T>> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
+        let mut r = self.inner_try_upgradeable_read();
+        if r.is_none() {
+            ProcessManager::preempt_enable();
+        } else {
+            r.as_mut().unwrap().irq_guard = Some(irq_guard);
+        }
+
+        return r;
+    }
+
     fn inner_try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
         // 获得UPGRADER守卫不需要查看读者位
         // 如果获得读者锁失败,不需要撤回fetch_or的原子操作
@@ -256,6 +286,7 @@ impl<T> RwLock<T> {
             return Some(RwLockUpgradableGuard {
                 inner: self,
                 data: unsafe { &mut *self.data.get() },
+                irq_guard: None,
             });
         } else {
             return None;
@@ -269,6 +300,21 @@ impl<T> RwLock<T> {
         loop {
             match self.try_upgradeable_read() {
                 Some(guard) => return guard,
+                None => spin_loop(),
+            }
+        }
+    }
+
+    #[inline]
+    /// @brief 获得UPGRADER守卫
+    pub fn upgradeable_read_irqsave(&self) -> RwLockUpgradableGuard<T> {
+        loop {
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            match self.try_upgradeable_read() {
+                Some(mut guard) => {
+                    guard.irq_guard = Some(irq_guard);
+                    return guard;
+                }
                 None => spin_loop(),
             }
         }
@@ -332,7 +378,7 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 尝试将UPGRADER守卫升级为WRITER守卫
-    pub fn try_upgrade(self) -> Result<RwLockWriteGuard<'rwlock, T>, Self> {
+    pub fn try_upgrade(mut self) -> Result<RwLockWriteGuard<'rwlock, T>, Self> {
         let res = self.inner.lock.compare_exchange(
             UPGRADED,
             WRITER,
@@ -343,13 +389,13 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
         if res.is_ok() {
             let inner = self.inner;
-
+            let irq_guard = self.irq_guard.take();
             mem::forget(self);
 
             Ok(RwLockWriteGuard {
                 data: unsafe { &mut *inner.data.get() },
                 inner,
-                irq_guard: None,
+                irq_guard,
             })
         } else {
             Err(self)
@@ -373,19 +419,20 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief UPGRADER降级为READER
-    pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
+    pub fn downgrade(mut self) -> RwLockReadGuard<'rwlock, T> {
         while self.inner.current_reader().is_err() {
             spin_loop();
         }
 
         let inner: &RwLock<T> = self.inner;
-
+        let irq_guard = self.irq_guard.take();
         // 自动移去UPGRADED比特位
         mem::drop(self);
 
         RwLockReadGuard {
             data: unsafe { &*inner.data.get() },
             lock: &inner.lock,
+            irq_guard,
         }
     }
 
@@ -426,26 +473,27 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 将WRITER降级为READER
-    pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
+    pub fn downgrade(mut self) -> RwLockReadGuard<'rwlock, T> {
         while self.inner.current_reader().is_err() {
             spin_loop();
         }
         //本质上来说绝对保证没有任何读者
 
         let inner = self.inner;
-
+        let irq_guard = self.irq_guard.take();
         mem::drop(self);
 
         return RwLockReadGuard {
             data: unsafe { &*inner.data.get() },
             lock: &inner.lock,
+            irq_guard,
         };
     }
 
     #[allow(dead_code)]
     #[inline]
     /// @brief 将WRITER降级为UPGRADER
-    pub fn downgrade_to_upgradeable(self) -> RwLockUpgradableGuard<'rwlock, T> {
+    pub fn downgrade_to_upgradeable(mut self) -> RwLockUpgradableGuard<'rwlock, T> {
         debug_assert_eq!(
             self.inner.lock.load(Ordering::Acquire) & (WRITER | UPGRADED),
             WRITER
@@ -455,11 +503,13 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
 
         let inner = self.inner;
 
+        let irq_guard = self.irq_guard.take();
         mem::forget(self);
 
         return RwLockUpgradableGuard {
             inner,
             data: unsafe { &*inner.data.get() },
+            irq_guard,
         };
     }
 }

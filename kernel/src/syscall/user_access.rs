@@ -172,6 +172,10 @@ impl<'a> UserBufferReader<'a> {
         });
     }
 
+    pub fn size(&self) -> usize {
+        return self.buffer.len();
+    }
+
     /// 从用户空间读取数据(到变量中)
     ///
     /// @param offset 字节偏移量
@@ -266,6 +270,10 @@ impl<'a> UserBufferWriter<'a> {
         });
     }
 
+    pub fn size(&self) -> usize {
+        return self.buffer.len();
+    }
+
     /// 从指定地址写入数据到用户空间
     ///
     /// @param data 要写入的数据地址
@@ -274,7 +282,7 @@ impl<'a> UserBufferWriter<'a> {
     ///
     pub fn copy_to_user<T: core::marker::Copy>(
         &'a mut self,
-        src: &'a [T],
+        src: &[T],
         offset: usize,
     ) -> Result<usize, SystemError> {
         let dst = Self::convert_with_offset(self.buffer, offset)?;
@@ -286,11 +294,11 @@ impl<'a> UserBufferWriter<'a> {
     ///
     /// @param data 要写入的数据地址
     /// @param offset 在UserBuffer中的字节偏移量
-    /// @return 返回写入元素的数量
+    /// @return Ok/Err
     ///
     pub fn copy_one_to_user<T: core::marker::Copy>(
         &'a mut self,
-        src: &'a T,
+        src: &T,
         offset: usize,
     ) -> Result<(), SystemError> {
         let dst = Self::convert_one_with_offset::<T>(self.buffer, offset)?;

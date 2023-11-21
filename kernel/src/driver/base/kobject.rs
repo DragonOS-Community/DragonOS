@@ -161,6 +161,20 @@ impl SysFSOps for KObjectSysFSOps {
 pub struct KObjectManager;
 
 impl KObjectManager {
+    #[allow(dead_code)]
+    pub fn init_and_add_kobj(
+        kobj: Arc<dyn KObject>,
+        join_kset: Option<Arc<KSet>>,
+    ) -> Result<(), SystemError> {
+        Self::kobj_init(&kobj);
+        Self::add_kobj(kobj, join_kset)
+    }
+
+    #[allow(dead_code)]
+    pub fn kobj_init(kobj: &Arc<dyn KObject>) {
+        kobj.set_kobj_type(Some(&DynamicKObjKType));
+    }
+
     pub fn add_kobj(
         kobj: Arc<dyn KObject>,
         join_kset: Option<Arc<KSet>>,
@@ -210,5 +224,23 @@ impl KObjectManager {
         }
 
         return Ok(());
+    }
+}
+
+/// 动态创建的kobject对象的ktype
+#[derive(Debug)]
+pub struct DynamicKObjKType;
+
+impl KObjType for DynamicKObjKType {
+    fn release(&self, kobj: Arc<dyn KObject>) {
+        kdebug!("DynamicKObjKType::release() kobj:{:?}", kobj.name());
+    }
+
+    fn sysfs_ops(&self) -> Option<&dyn SysFSOps> {
+        Some(&KObjectSysFSOps)
+    }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
     }
 }

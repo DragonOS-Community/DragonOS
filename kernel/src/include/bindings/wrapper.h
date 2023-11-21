@@ -30,7 +30,6 @@
 #include <driver/multiboot2/multiboot2.h>
 #include <exception/gate.h>
 #include <include/DragonOS/refcount.h>
-#include <include/DragonOS/signal.h>
 #include <libs/lib_ui/textui.h>
 #include <mm/mm-types.h>
 #include <mm/mm.h>
@@ -44,4 +43,4 @@
 #include <driver/pci/pci_irq.h>
 #include <common/errno.h>
 #include <common/cpu.h>
-#include <driver/interrupt/apic/apic2rust.h>
+#include <exception/irq.h>

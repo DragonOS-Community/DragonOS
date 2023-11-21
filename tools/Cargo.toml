@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "debugging/logmonitor",
+]
+
+resolver = "2"

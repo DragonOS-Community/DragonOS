@@ -92,6 +92,7 @@ pub unsafe fn textui_framwork_init() {
 
         send_to_default_serial8250_port("\ntext ui initialized\n\0".as_bytes());
         unsafe { TEXTUI_IS_INIT = true };
+
     } else {
         panic!("Try to init TEXTUI_FRAMEWORK twice!");
     }
@@ -1359,9 +1360,11 @@ pub fn textui_putstr(
     } else {
         None
     };
+    // send_to_default_serial8250_port("textui init failedcccccccccccccccc.\n\0".as_bytes());
 
     let mut guard = window.as_ref().map(|w| w.lock());
-
+    // send_to_default_serial8250_port("textui init failedeeeeeeeeeeeeeee.\n\0".as_bytes());
+    
     for character in string.chars() {
         if unsafe { TEXTUI_IS_INIT } {
             guard.as_mut().unwrap().textui_putchar_window(

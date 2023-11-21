@@ -1,4 +1,7 @@
 #!/bin/bash
+CURRENT_SHELL=$(basename $SHELL)
+source "$HOME/.$CURRENT_SHELL"rc
+
 ABS_PREFIX=/opt/dragonos-grub
 grub_dir_i386_efi=${ABS_PREFIX}/arch/i386/efi/grub
 grub_dir_i386_legacy=${ABS_PREFIX}/arch/i386/legacy/grub

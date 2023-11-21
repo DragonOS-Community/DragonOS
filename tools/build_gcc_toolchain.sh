@@ -1,3 +1,6 @@
+CURRENT_SHELL=$(basename $SHELL)
+source "$HOME/.$CURRENT_SHELL"rc
+
 # init something here
 current_path=$PATH
 current_pwd=$PWD

@@ -14,10 +14,7 @@
 #include <common/errno.h>
 #include <common/glib.h>
 #include <filesystem/vfs/VFS.h>
-#include <mm/mm-types.h>
 #include <syscall/syscall.h>
-
-#include "proc-types.h"
 
 /**
  * @brief 进程退出时执行的函数

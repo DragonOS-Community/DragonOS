@@ -45,7 +45,7 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
-		musl-tools sphinx
+		sphinx
 	
 	# 如果python3没有安装
 	if [ -z "$(which python3)" ]; then
@@ -85,7 +85,7 @@ install_archlinux_pkg()
 	curl wget bridge-utils dnsmasq \
         diffutils pkgconf which unzip util-linux dosfstools \
         gcc make flex texinfo gmp mpfr qemu-base \
-        libmpc libssl-dev musl
+        libmpc libssl-dev
 
 }
 
@@ -156,8 +156,6 @@ rustInstall() {
 		fi
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
         cargo install cargo-binutils
-        rustup toolchain install nightly
-        rustup default nightly
 		rustup toolchain install nightly-2023-01-21-x86_64-unknown-linux-gnu
 		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
@@ -165,7 +163,8 @@ rustInstall() {
         rustup component add rust-src
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
         rustup component add llvm-tools-preview
-		rustup target add x86_64-unknown-none
+		rustup target add x86_64-unknown-none --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
 		
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi
@@ -277,9 +276,11 @@ cargo install dadk || exit 1
 # 创建磁盘镜像
 bash create_hdd_image.sh
 # 编译安装GCC交叉编译工具链
-bash build_gcc_toolchain.sh -cs
+bash build_gcc_toolchain.sh -cs -kb -kg || (echo "GCC交叉编译工具链安装失败" && exit 1)
+# 编译安装musl交叉编译工具链
+bash install_musl_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
 # 编译安装grub
-bash grub_auto_install.sh
+bash grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 
 # 解决kvm权限问题
 USR=$USER

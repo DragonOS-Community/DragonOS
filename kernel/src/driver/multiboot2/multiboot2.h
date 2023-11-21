@@ -434,6 +434,8 @@ void multiboot2_iter(bool (*_fun)(const struct iter_data_t *, void *, unsigned i
  */
 bool multiboot2_get_memory(const struct iter_data_t *_iter_data, void *_data, unsigned int *count);
 
+bool multiboot2_get_load_base(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved);
+
 /**
  * @brief 获取VBE信息
  *

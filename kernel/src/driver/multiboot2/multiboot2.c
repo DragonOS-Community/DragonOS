@@ -102,6 +102,20 @@ bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, u
   return true;
 }
 
+/// @brief 获取加载基地址
+/// @param _iter_data 
+/// @param data 
+/// @param reserved 
+/// @return 
+bool multiboot2_get_load_base(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
+{
+
+  if (_iter_data->type != MULTIBOOT_TAG_TYPE_LOAD_BASE_ADDR)
+    return false;
+  *(struct multiboot_tag_load_base_addr_t *)data = *(struct multiboot_tag_load_base_addr_t *)_iter_data;
+  return true;
+}
+
 /**
  * @brief 获取帧缓冲区信息
  *

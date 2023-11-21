@@ -277,6 +277,42 @@ bitflags! {
     }
 }
 
+/// SIGCHLD si_codes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToPrimitive)]
+#[allow(dead_code)]
+pub enum SigChildCode {
+    /// child has exited
+    ///
+    /// CLD_EXITED
+    Exited = 1,
+    /// child was killed
+    ///
+    /// CLD_KILLED
+    Killed = 2,
+    /// child terminated abnormally
+    ///
+    /// CLD_DUMPED
+    Dumped = 3,
+    /// traced child has trapped
+    ///
+    /// CLD_TRAPPED
+    Trapped = 4,
+    /// child has stopped
+    ///
+    /// CLD_STOPPED
+    Stopped = 5,
+    /// stopped child has continued
+    ///
+    /// CLD_CONTINUED
+    Continued = 6,
+}
+
+impl Into<i32> for SigChildCode {
+    fn into(self) -> i32 {
+        self as i32
+    }
+}
+
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct SigFrame {

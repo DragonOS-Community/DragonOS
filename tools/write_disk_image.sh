@@ -1,15 +1,19 @@
 ###############################################
-# 该脚本用于将disk_mount目录下的文件写入到disk.img的第一个分区中，
+# 该脚本用于将disk_mount目录下的文件写入到disk-${ARCH}.img的第一个分区中，
 #       并在磁盘镜像中安装grub引导程序
 #
 # 用法：bash write_disk_image.sh --bios legacy/uefi
-# 如果之前创建的disk.img是MBR分区表，那么请这样运行它：bash write_disk_image.sh --bios legacy
-# 如果之前创建的disk.img是GPT分区表，那么请这样运行它：bash write_disk_image.sh --bios uefi
-# 通过设置ARCH为x86_64或i386，进行64/32位uefi的install，但是请记住该处的ARCH应与run-qemu.sh中的一致
+# 如果之前创建的 disk-${ARCH}.img 是MBR分区表，那么请这样运行它：bash write_disk_image.sh --bios legacy
+# 如果之前创建的 disk-${ARCH}.img 是GPT分区表，那么请这样运行它：bash write_disk_image.sh --bios uefi
+# 通过设置ARCH为x86_64/i386/riscv64，进行64/32位uefi的install，但是请记住该处的ARCH应与run-qemu.sh中的一致
 ###############################################
 
-ARCH="x86_64"
-#ARCH="i386"
+echo "ARCH=${ARCH}"
+# 给ARCH变量赋默认值
+export ARCH=${ARCH:=x86_64}
+
+DISK_NAME=disk-${ARCH}.img
+
 # 内核映像
 root_folder=$(dirname $(pwd))
 kernel="${root_folder}/bin/kernel/kernel.elf"
@@ -28,6 +32,7 @@ GRUB_ABS_PREFIX=/opt/dragonos-grub
 GRUB_PATH_I386_LEGACY_INSTALL=${GRUB_ABS_PREFIX}/arch/i386/legacy/grub/sbin/grub-install
 GRUB_PATH_I386_EFI_INSTALL=${GRUB_ABS_PREFIX}/arch/i386/efi/grub/sbin/grub-install
 GRUB_PATH_X86_64_EFI_INSTALL=${GRUB_ABS_PREFIX}/arch/x86_64/efi/grub/sbin/grub-install
+GRUB_PATH_RISCV64_EFI_INSTALL=${GRUB_ABS_PREFIX}/arch/riscv64/efi/grub/sbin/grub-install
 
 GRUB_PATH_I386_LEGACY_FILE=${GRUB_ABS_PREFIX}/arch/i386/legacy/grub/bin/grub-file
 
@@ -56,22 +61,22 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
 fi
 
 # 判断是否存在硬盘镜像文件，如果不存在，就创建一个(docker模式下，由于镜像中缺少qemu-img不会创建)
-if [ ! -f "${root_folder}/bin/disk.img" ]; then
+if [ ! -f "${root_folder}/bin/${DISK_NAME}" ]; then
     echo "创建硬盘镜像文件..."
     case "$1" in
         --bios) 
         case "$2" in
                 uefi)
-            sudo bash ./create_hdd_image.sh -P GPT #GPT分区
+            sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #GPT分区
             ;;
                 legacy)
-            sudo bash ./create_hdd_image.sh -P MBR #MBR分区
+            sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #MBR分区
             ;;
             esac       
         ;;
     *)
         # 默认创建MBR分区
-        sudo bash ./create_hdd_image.sh -P MBR #MBR分区
+        sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #MBR分区
         ;;
     esac
 fi
@@ -88,7 +93,7 @@ echo $LOOP_DEVICE
 # 检测grub文件夹是否存在
 if [ -d "${GRUB_INSTALL_PATH}" ]; then
   echo "grub已安装"
-  INSTALL_GRUB_TO_IMAGE="0"
+   INSTALL_GRUB_TO_IMAGE="0"
 else
   mkdir -p ${GRUB_INSTALL_PATH}
 fi
@@ -118,6 +123,10 @@ cfg_content='set timeout=15
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
 fi
 
+install_riscv64_efi(){
+    ${GRUB_PATH_RISCV64_EFI_INSTALL} --target=riscv64-efi --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
+}
+
 if [ "${INSTALL_GRUB_TO_IMAGE}" = "1" ];then
 
     case "$1" in
@@ -128,10 +137,20 @@ if [ "${INSTALL_GRUB_TO_IMAGE}" = "1" ];then
                         ${GRUB_PATH_I386_EFI_INSTALL} --target=i386-efi  --efi-directory=${mount_folder}  --boot-directory=${boot_folder}  --removable
                     elif [ ${ARCH} == "x86_64" ];then
                         ${GRUB_PATH_X86_64_EFI_INSTALL} --target=x86_64-efi --efi-directory=${mount_folder}  --boot-directory=${boot_folder}   --removable
+                    elif [ ${ARCH} == "riscv64" ];then
+                        install_riscv64_efi
+                    else
+                        echo "grub install: 不支持的架构"
                     fi
                 ;;
                     legacy) #传统bios
+                    if [ ${ARCH} == "x86_64" ];then
                         ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+                    elif [ ${ARCH} == "riscv64" ];then
+                        install_riscv64_efi
+                    else
+                        echo "grub install: 不支持的架构"
+                    fi      
                 ;;
             esac
             ;;

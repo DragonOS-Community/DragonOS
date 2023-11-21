@@ -9,20 +9,24 @@ use alloc::{
 use crate::{
     driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
-    include::bindings::bindings::{verify_area, AT_REMOVEDIR, PROC_MAX_FD_NUM},
+    include::bindings::bindings::verify_area,
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{user_access::UserBufferReader, Syscall, SystemError},
+    syscall::{
+        user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+        Syscall, SystemError,
+    },
     time::TimeSpec,
 };
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
-    fcntl::{FcntlCommand, FD_CLOEXEC},
+    fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    utils::rsplit_path,
+    open::{do_faccessat, do_fchmodat, do_sys_open},
+    utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
@@ -142,6 +146,100 @@ impl PosixKstat {
         }
     }
 }
+
+///
+///  Arguments for how openat2(2) should open the target path. If only @flags and
+///  @mode are non-zero, then openat2(2) operates very similarly to openat(2).
+///
+///  However, unlike openat(2), unknown or invalid bits in @flags result in
+///  -EINVAL rather than being silently ignored. @mode must be zero unless one of
+///  {O_CREAT, O_TMPFILE} are set.
+///
+/// ## 成员变量
+///
+/// - flags: O_* flags.
+/// - mode: O_CREAT/O_TMPFILE file mode.
+/// - resolve: RESOLVE_* flags.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct PosixOpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+impl PosixOpenHow {
+    #[allow(dead_code)]
+    pub fn new(flags: u64, mode: u64, resolve: u64) -> Self {
+        Self {
+            flags,
+            mode,
+            resolve,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OpenHow {
+    pub o_flags: FileMode,
+    pub mode: ModeType,
+    pub resolve: OpenHowResolve,
+}
+
+impl OpenHow {
+    pub fn new(mut o_flags: FileMode, mut mode: ModeType, resolve: OpenHowResolve) -> Self {
+        if !o_flags.contains(FileMode::O_CREAT) {
+            mode = ModeType::empty();
+        }
+
+        if o_flags.contains(FileMode::O_PATH) {
+            o_flags = o_flags.intersection(FileMode::O_PATH_FLAGS);
+        }
+
+        Self {
+            o_flags,
+            mode,
+            resolve,
+        }
+    }
+}
+
+impl From<PosixOpenHow> for OpenHow {
+    fn from(posix_open_how: PosixOpenHow) -> Self {
+        let o_flags = FileMode::from_bits_truncate(posix_open_how.flags as u32);
+        let mode = ModeType::from_bits_truncate(posix_open_how.mode as u32);
+        let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve as u64);
+        return Self::new(o_flags, mode, resolve);
+    }
+}
+
+bitflags! {
+    pub struct OpenHowResolve: u64{
+        /// Block mount-point crossings
+        ///     (including bind-mounts).
+        const RESOLVE_NO_XDEV = 0x01;
+
+        /// Block traversal through procfs-style
+        ///     "magic-links"
+        const RESOLVE_NO_MAGICLINKS = 0x02;
+
+        /// Block traversal through all symlinks
+        ///     (implies OEXT_NO_MAGICLINKS)
+        const RESOLVE_NO_SYMLINKS = 0x04;
+        /// Block "lexical" trickery like
+        ///     "..", symlinks, and absolute
+        const RESOLVE_BENEATH = 0x08;
+        /// Make all jumps to "/" and ".."
+        ///     be scoped inside the dirfd
+        ///     (similar to chroot(2)).
+        const RESOLVE_IN_ROOT = 0x10;
+        // Only complete if resolution can be
+        // 			completed through cached lookup. May
+        // 			return -EAGAIN if that's not
+        // 			possible.
+        const RESOLVE_CACHED = 0x20;
+    }
+}
 impl Syscall {
     /// @brief 为当前进程打开一个文件
     ///
@@ -149,72 +247,23 @@ impl Syscall {
     /// @param o_flags 打开文件的标志位
     ///
     /// @return 文件描述符编号，或者是错误码
-    pub fn open(path: &str, mode: FileMode) -> Result<usize, SystemError> {
-        // kdebug!("open: path: {}, mode: {:?}", path, mode);
-        // 文件名过长
-        if path.len() > MAX_PATHLEN as usize {
-            return Err(SystemError::ENAMETOOLONG);
-        }
+    pub fn open(
+        path: &str,
+        flags: FileMode,
+        mode: ModeType,
+        follow_symlink: bool,
+    ) -> Result<usize, SystemError> {
+        return do_sys_open(AtFlags::AT_FDCWD.bits(), path, flags, mode, follow_symlink);
+    }
 
-        let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
-
-        let inode: Arc<dyn IndexNode> = if inode.is_err() {
-            let errno = inode.unwrap_err();
-            // 文件不存在，且需要创建
-            if mode.contains(FileMode::O_CREAT)
-                && !mode.contains(FileMode::O_DIRECTORY)
-                && errno == SystemError::ENOENT
-            {
-                let (filename, parent_path) = rsplit_path(path);
-                // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> =
-                    ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-                // 创建文件
-                let inode: Arc<dyn IndexNode> = parent_inode.create(
-                    filename,
-                    FileType::File,
-                    ModeType::from_bits_truncate(0o755),
-                )?;
-                inode
-            } else {
-                // 不需要创建文件，因此返回错误码
-                return Err(errno);
-            }
-        } else {
-            inode.unwrap()
-        };
-
-        let file_type: FileType = inode.metadata()?.file_type;
-        // 如果要打开的是文件夹，而目标不是文件夹
-        if mode.contains(FileMode::O_DIRECTORY) && file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // 创建文件对象
-
-        let mut file: File = File::new(inode, mode)?;
-
-        // 打开模式为“追加”
-        if mode.contains(FileMode::O_APPEND) {
-            file.lseek(SeekFrom::SeekEnd(0))?;
-        }
-
-        // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-        if mode.contains(FileMode::O_TRUNC)
-            && (mode.contains(FileMode::O_RDWR) || mode.contains(FileMode::O_WRONLY))
-            && file_type == FileType::File
-        {
-            file.ftruncate(0)?;
-        }
-        // 把文件对象存入pcb
-        let r = ProcessManager::current_pcb()
-            .fd_table()
-            .write()
-            .alloc_fd(file, None)
-            .map(|fd| fd as usize);
-
-        return r;
+    pub fn openat(
+        dirfd: i32,
+        path: &str,
+        o_flags: FileMode,
+        mode: ModeType,
+        follow_symlink: bool,
+    ) -> Result<usize, SystemError> {
+        return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
     }
 
     /// @brief 关闭文件
@@ -416,7 +465,7 @@ impl Syscall {
         let dirent =
             unsafe { (buf.as_mut_ptr() as *mut Dirent).as_mut() }.ok_or(SystemError::EFAULT)?;
 
-        if fd < 0 || fd as u32 > PROC_MAX_FD_NUM {
+        if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
             return Err(SystemError::EBADF);
         }
 
@@ -453,15 +502,12 @@ impl Syscall {
     /// - `flags`：标志位
     ///
     ///
-    pub fn unlinkat(_dirfd: i32, pathname: &str, flags: u32) -> Result<usize, SystemError> {
-        // kdebug!("sys_unlink_at={path:?}");
-        if (flags & (!AT_REMOVEDIR)) != 0 {
-            return Err(SystemError::EINVAL);
-        }
+    pub fn unlinkat(dirfd: i32, pathname: &str, flags: u32) -> Result<usize, SystemError> {
+        let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
 
-        if (flags & AT_REMOVEDIR) > 0 {
+        if flags.contains(AtFlags::AT_REMOVEDIR) {
             // kdebug!("rmdir");
-            match do_remove_dir(&pathname) {
+            match do_remove_dir(dirfd, &pathname) {
                 Err(err) => {
                     kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                     return Err(err);
@@ -472,7 +518,7 @@ impl Syscall {
             }
         }
 
-        match do_unlink_at(&pathname, FileMode::from_bits_truncate(flags as u32)) {
+        match do_unlink_at(dirfd, &pathname) {
             Err(err) => {
                 kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                 return Err(err);
@@ -481,6 +527,25 @@ impl Syscall {
                 return Ok(0);
             }
         }
+    }
+
+    pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
+        if pathname.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+        let ureader = UserBufferReader::new(pathname, MAX_PATHLEN, true)?;
+
+        let buf: &[u8] = ureader.buffer(0).unwrap();
+
+        let pathname: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
+
+        let pathname: &str = pathname.to_str().map_err(|_| SystemError::EINVAL)?;
+        if pathname.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+        let pathname = pathname.trim();
+
+        return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
@@ -726,13 +791,6 @@ impl Syscall {
         return Ok(kstat);
     }
 
-    fn do_stat(path: &str) -> Result<PosixKstat, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY)?;
-        let ret = Self::do_fstat(fd as i32);
-        Self::close(fd)?;
-        ret
-    }
-
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
         let kstat = Self::do_fstat(fd)?;
         if usr_kstat.is_null() {
@@ -745,11 +803,17 @@ impl Syscall {
     }
 
     pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY)?;
-        Self::fstat(fd as i32, user_kstat).map_err(|e| {
-            Self::close(fd).ok();
-            e
-        })
+        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), true)?;
+        let r = Self::fstat(fd as i32, user_kstat);
+        Self::close(fd).ok();
+        return r;
+    }
+
+    pub fn lstat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), false)?;
+        let r = Self::fstat(fd as i32, user_kstat);
+        Self::close(fd).ok();
+        return r;
     }
 
     pub fn mknod(
@@ -794,7 +858,112 @@ impl Syscall {
 
         Self::write(fd, &data)
     }
+
+    pub fn readv(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
+        // IoVecs会进行用户态检验
+        let mut iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, true) }?;
+
+        let mut data = Vec::new();
+        data.resize(iovecs.0.iter().map(|x| x.len()).sum(), 0);
+
+        let len = Self::read(fd, &mut data)?;
+
+        iovecs.scatter(&data[..len]);
+
+        return Ok(len);
+    }
+
+    pub fn readlink_at(
+        dirfd: i32,
+        path: *const u8,
+        user_buf: *mut u8,
+        buf_size: usize,
+    ) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
+
+        if path.len() == 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
+
+        let inode = inode.lookup(path.as_str())?;
+        if inode.metadata()?.file_type != FileType::SymLink {
+            return Err(SystemError::EINVAL);
+        }
+
+        let ubuf = user_buf.buffer::<u8>(0).unwrap();
+
+        let mut file = File::new(inode, FileMode::O_RDONLY)?;
+
+        let len = file.read(buf_size, ubuf)?;
+
+        return Ok(len);
+    }
+
+    pub fn readlink(
+        path: *const u8,
+        user_buf: *mut u8,
+        buf_size: usize,
+    ) -> Result<usize, SystemError> {
+        return Self::readlink_at(AtFlags::AT_FDCWD.bits(), path, user_buf, buf_size);
+    }
+
+    pub fn access(pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
+        return do_faccessat(
+            AtFlags::AT_FDCWD.bits(),
+            pathname,
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+            0,
+        );
+    }
+
+    pub fn faccessat2(
+        dirfd: i32,
+        pathname: *const u8,
+        mode: u32,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        return do_faccessat(
+            dirfd,
+            pathname,
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+            flags,
+        );
+    }
+
+    pub fn chmod(pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
+        return do_fchmodat(
+            AtFlags::AT_FDCWD.bits(),
+            pathname,
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+        );
+    }
+
+    pub fn fchmodat(dirfd: i32, pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
+        return do_fchmodat(
+            dirfd,
+            pathname,
+            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+        );
+    }
+
+    pub fn fchmod(fd: i32, mode: u32) -> Result<usize, SystemError> {
+        let _mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+        let _file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+
+        // fchmod没完全实现，因此不修改文件的权限
+        // todo: 实现fchmod
+        kwarn!("fchmod not fully implemented");
+        return Ok(0);
+    }
 }
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {

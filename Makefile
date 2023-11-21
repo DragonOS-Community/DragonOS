@@ -1,4 +1,4 @@
-SUBDIRS = kernel user tools
+SUBDIRS = kernel user tools build-scripts
 
 # ifndef $(EMULATOR)
 ifeq ($(EMULATOR), )
@@ -18,11 +18,16 @@ ifeq ($(OS),Darwin) # Assume Mac OS X
   NPROCS:=$(shell system_profiler | awk '/Number Of CPUs/{print $4}{next;}')
 endif
 
-export ARCH=__x86_64__
+# if arch not defined, set it to x86_64
+export ARCH?=x86_64
+
+CFLAGS_DEFINE_ARCH="__$(ARCH)__"
+
+
 export ROOT_PATH=$(shell pwd)
 
 export DEBUG=DEBUG
-export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(ARCH) -D $(EMULATOR) -O1
+export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(CFLAGS_DEFINE_ARCH) -D $(EMULATOR) -O1
 
 ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
@@ -92,11 +97,12 @@ gdb:
 
 # 写入磁盘镜像
 write_diskimage:
-	bash -c "cd tools && bash grub_auto_install.sh && sudo bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+	@echo "write_diskimage arch=$(ARCH)"
+	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi:
-	bash -c "cd tools && bash grub_auto_install.sh && sudo bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH)bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
@@ -156,6 +162,7 @@ fmt:
 	@echo "格式化代码" 
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C kernel
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C user
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C build-scripts
 
 log-monitor:
 	@echo "启动日志监控"

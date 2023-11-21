@@ -300,7 +300,7 @@ ENTRY(_start64)
     // 50-100M填0，共25个页表
     mov $12800, %ecx
 .fill_pt_64_2:
-    mov $0, 0(%eax)
+    movq $0, 0(%eax)
     add $8, %eax
     loop .fill_pt_64_2
 

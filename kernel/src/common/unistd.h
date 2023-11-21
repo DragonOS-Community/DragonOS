@@ -14,20 +14,6 @@
 #include <syscall/syscall_num.h>
 
 /**
- * @brief fork当前进程
- *
- * @return pid_t
- */
-pid_t fork(void);
-
-/**
- * @brief vfork当前进程
- *
- * @return pid_t
- */
-pid_t vfork(void);
-
-/**
  * @brief  交换n字节
  *  @param src  源地址
  *  @param dest  目的地址

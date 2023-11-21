@@ -1,4 +1,4 @@
-#include"../common/asm.h"
+#include <common/asm.h>
 .code64
 //.section .text
 

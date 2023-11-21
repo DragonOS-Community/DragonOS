@@ -128,6 +128,7 @@ impl IndexNode for LockedPipeInode {
             // 否则在读等待队列中睡眠，并释放锁
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
+
                 inode.read_wait_queue.sleep_without_schedule();
                 drop(inode);
 

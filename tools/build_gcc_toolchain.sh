@@ -1,3 +1,6 @@
+CURRENT_SHELL=$(basename $SHELL)
+source "$HOME/.$CURRENT_SHELL"rc
+
 # init something here
 current_path=$PATH
 current_pwd=$PWD
@@ -107,6 +110,7 @@ cd $INSTALL_POS
 # compile binutils
 BIN_UTILS="binutils-2.38"
 BIN_UTILS_TAR="${BIN_UTILS}.tar.gz"
+
 if [[ ! -n "$(find $PREFIX/bin/ -name ${TARGET_LD})" && ! -n "$(find $PREFIX/bin/ -name ${TARGET_AS})" ]] || [ ${KEEP_BINUTILS} -ne 1 ]; then
     if [ ${KEEP_BINUTILS} -eq 1 ]; then
         echo -e "\033[35m 没有检测到 ${TARGET_LD} 或 没有检测到 ${TARGET_AS}, -kb参数无效 \033[0m"
@@ -170,7 +174,7 @@ fi
 
 
 # update PATH
-if [ -n "$(grep -F "export DragonOS_GCC=$PREFIX/bin/" "$HOME/.$(basename $SHELL)rc")" ]; then 
+if [ -n "$(grep -F "export DragonOS_GCC" "$HOME/.$(basename $SHELL)rc")" ]; then 
 	echo "[info] DragonOS_GCC has been in the "'$PATH'
 else 
 	echo 'export DragonOS_GCC='"$PREFIX"'/bin' >> "$HOME/.$(basename $SHELL)rc"

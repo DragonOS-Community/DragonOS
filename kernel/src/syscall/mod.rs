@@ -419,16 +419,21 @@ pub const SYS_TKILL: usize = 200;
 #[allow(dead_code)]
 pub const SYS_FUTEX: usize = 202;
 
+pub const SYS_EPOLL_CREATE: usize = 213;
+
 pub const SYS_GET_DENTS_64: usize = 217;
 #[allow(dead_code)]
 pub const SYS_SET_TID_ADDR: usize = 218;
 
 pub const SYS_EXIT_GROUP: usize = 231;
+pub const SYS_EPOLL_WAIT: usize = 232;
+pub const SYS_EPOLL_CTL: usize = 233;
 
 pub const SYS_UNLINK_AT: usize = 263;
 
+pub const SYS_EPOLL_PWAIT: usize = 281;
 pub const SYS_ACCEPT4: usize = 288;
-
+pub const SYS_EPOLL_CREATE1: usize = 291;
 pub const SYS_PIPE: usize = 293;
 
 #[allow(dead_code)]
@@ -1098,6 +1103,31 @@ impl Syscall {
 
                 res
             }
+
+            SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
+            SYS_EPOLL_CREATE1 => Self::epoll_create1(args[0]),
+
+            SYS_EPOLL_CTL => Self::epoll_ctl(
+                args[0] as i32,
+                args[1],
+                args[2] as i32,
+                VirtAddr::new(args[3]),
+            ),
+
+            SYS_EPOLL_WAIT => Self::epoll_wait(
+                args[0] as i32,
+                VirtAddr::new(args[1]),
+                args[2] as i32,
+                args[3] as i32,
+            ),
+
+            SYS_EPOLL_PWAIT => Self::epoll_pwait(
+                args[0] as i32,
+                VirtAddr::new(args[1]),
+                args[2] as i32,
+                args[3] as i32,
+                VirtAddr::new(args[4]),
+            ),
 
             // 目前为了适配musl-libc,以下系统调用先这样写着
             SYS_GET_RANDOM => {

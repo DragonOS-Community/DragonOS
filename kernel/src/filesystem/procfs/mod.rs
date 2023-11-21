@@ -28,7 +28,7 @@ use crate::{
 use super::vfs::{
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
-    FileSystem, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
+    FileSystem, FsInfo, IndexNode, InodeId, Metadata,
 };
 
 /// @brief 进程文件类型
@@ -487,18 +487,6 @@ impl IndexNode for LockedProcFSInode {
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        // 加锁
-        let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        return Ok(PollStatus::READ);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

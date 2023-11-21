@@ -21,7 +21,7 @@ use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
     core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-    FileType, FsInfo, IndexNode, InodeId, Metadata, PollStatus,
+    FileType, FsInfo, IndexNode, InodeId, Metadata,
 };
 
 pub mod callback;
@@ -291,11 +291,6 @@ impl IndexNode for KernFSInode {
             .for_each(|x| keys.push(x.clone()));
 
         return Ok(keys);
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        // todo: 根据inode的具体attribute，返回PollStatus
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn read_at(

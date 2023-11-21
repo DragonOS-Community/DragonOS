@@ -165,7 +165,7 @@ impl<T: Transport> phy::Device for VirtioNICDriver<T> {
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         // kdebug!("VirtioNet: transmit");
-        if self.inner.lock().can_send() {
+        if self.inner.lock_irqsave().can_send() {
             // kdebug!("VirtioNet: can send");
             return Some(VirtioNetToken::new(self.clone(), None));
         } else {

@@ -2,7 +2,7 @@
 
 #include <arch/arch.h>
 #if ARCH(I386) || ARCH(X86_64)
-#include <arch/x86_64/x86_64_ipi.h>
+#include <arch/x86_64/include/x86_64_ipi.h>
 #else
 #error "error type of arch!"
 #endif

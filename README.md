@@ -1,8 +1,16 @@
-# DragonOS
+<div align="center">
+  <img width="40%" src="docs/_static/dragonos-logo.svg" alt="dragonos-logo"></br>
+  <h2>打造完全自主可控的数字化未来！</h2>
 
-## 打造完全自主可控的数字化未来！
+  [![Static Badge](https://img.shields.io/badge/%E5%AE%98%E7%BD%91-DragonOS.org-4c69e4)](https://dragonos.org)
+  [![Static Badge](https://img.shields.io/badge/社区-dragonos.zulipchat.com-9561e8)](https://dragonos.zulipchat.com)
+
 
 --- 
+
+</div>
+
+# DragonOS
 
 **Languages** 中文|[English](README_EN.md)
 
@@ -24,9 +32,9 @@
 
 - **了解开发动态、开发任务，请访问DragonOS的zulip社群**： [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
 
-- 开源论坛  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
-
 - 软件镜像站 **[mirrors.DragonOS.org](https://mirrors.DragonOS.org)**
+- Git镜像站 **[git.mirrors.DragonOS.org](https://git.mirrors.DragonOS.org)**
+- 国内镜像站 **[mirrors.DragonOS.org.cn](https://mirrors.DragonOS.org.cn)**
 
 - 开发交流QQ群 **115763565**
 
@@ -39,8 +47,6 @@
 &emsp;&emsp;运行DragonOS的步骤非常简单，您可以参考以下几个资料，在最短15分钟内运行DragonOS！
 
 - [构建DragonOS — DragonOS dev 文档](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)
-
-- [教你在15分钟内运行DragonOS！- Bilibili](https://www.bilibili.com/video/BV1zF411w7s2?share_source=copy_web&vd_source=41ab4a1b73e6f65219a785923511517e)
 
 ## 系统特性
 
@@ -58,7 +64,7 @@
 
 &emsp;&emsp;或者是加入我们的开发交流QQ群：**115763565**
 
-&emsp;&emsp;对于正式问题的讨论，我们建议在 **[DragonOS的zulip社群](https://DragonOS.zulipchat.com)** 上的对应板块，使用正式的语言发帖讨论。亦或者是在本仓库的issue下提出问题。
+&emsp;&emsp;对于正式问题的讨论，请在 **[DragonOS的zulip社群](https://DragonOS.zulipchat.com)** 上的对应板块，使用正式的语言发帖讨论。亦或者是在本仓库的issue下提出问题。
 
 
 ## 贡献者名单
@@ -89,9 +95,7 @@
 
 ### 赞助商列表
 
-**暂无**
-
-我们期望在未来，能有企业赞助DragonOS，为它的发展注入资金动力！
+- **[中国雅云](https://yacloud.net)** 雅安数字经济运营有限公司为DragonOS提供了云服务器支持。
 
 ### 个人赞赏者列表
 

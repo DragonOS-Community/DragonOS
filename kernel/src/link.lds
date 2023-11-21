@@ -13,12 +13,13 @@ SECTIONS
 	.boot.text :
 	{
 		KEEP(*(.multiboot_header))
-		head.o(.bootstrap)
-		head.o(.bootstrap.code64)
-		head.o(.bootstrap.data)
+		*(.bootstrap)
+		*(.bootstrap.code64)
+		*(.bootstrap.data)
 		. = ALIGN(4096);
 	}
-	
+
+	. = 0x1000000;
 	. += KERNEL_VMA;
 	. = ALIGN(32768);
 	text_start_pa = .;
@@ -40,6 +41,7 @@ SECTIONS
 	{
 		_data = .;
 		*(.data)
+		*(.data.*)
 		
 		_edata = .;
 	}

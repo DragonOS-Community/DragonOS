@@ -1,7 +1,6 @@
 #pragma once
 
 #include <common/glib.h>
-#include <mm/mm-types.h>
 #include <process/process.h>
 
 extern void rs_pseudo_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size);

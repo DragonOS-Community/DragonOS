@@ -3,6 +3,8 @@ use core::{
     ptr::null_mut,
 };
 
+use num_traits::FromPrimitive;
+
 use crate::{
     syscall::{user_access::UserBufferWriter, Syscall, SystemError},
     time::{sleep::nanosleep, TimeSpec},
@@ -35,6 +37,29 @@ pub const SYS_TIMEZONE: PosixTimeZone = PosixTimeZone {
     tz_minuteswest: -480,
     tz_dsttime: 0,
 };
+
+/// The IDs of the various system clocks (for POSIX.1b interval timers):
+#[derive(Debug, Copy, Clone, PartialEq, Eq, FromPrimitive)]
+pub enum PosixClockID {
+    Realtime = 0,
+    Monotonic = 1,
+    ProcessCPUTimeID = 2,
+    ThreadCPUTimeID = 3,
+    MonotonicRaw = 4,
+    RealtimeCoarse = 5,
+    MonotonicCoarse = 6,
+    Boottime = 7,
+    RealtimeAlarm = 8,
+    BoottimeAlarm = 9,
+}
+
+impl TryFrom<i32> for PosixClockID {
+    type Error = SystemError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        <Self as FromPrimitive>::from_i32(value).ok_or(SystemError::EINVAL)
+    }
+}
 
 impl Syscall {
     /// @brief 休眠指定时间（单位：纳秒）（提供给C的接口）
@@ -104,6 +129,24 @@ impl Syscall {
         if let Some(mut tz_buf) = tz_buf {
             tz_buf.copy_one_to_user(&SYS_TIMEZONE, 0)?;
         }
+
+        return Ok(0);
+    }
+
+    pub fn clock_gettime(clock_id: c_int, tp: *mut TimeSpec) -> Result<usize, SystemError> {
+        let clock_id = PosixClockID::try_from(clock_id)?;
+        if clock_id != PosixClockID::Realtime {
+            kwarn!("clock_gettime: currently only support Realtime clock, but got {:?}. Defaultly return realtime!!!\n", clock_id);
+        }
+        if tp.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+        let mut tp_buf =
+            UserBufferWriter::new::<TimeSpec>(tp, core::mem::size_of::<TimeSpec>(), true)?;
+
+        let posix_time = do_gettimeofday();
+
+        tp_buf.copy_one_to_user(&posix_time, 0)?;
 
         return Ok(0);
     }

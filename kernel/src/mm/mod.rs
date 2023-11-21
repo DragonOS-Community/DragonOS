@@ -329,6 +329,33 @@ pub struct PhysMemoryArea {
     pub size: usize,
 }
 
+impl PhysMemoryArea {
+    pub fn new(base: PhysAddr, size: usize) -> Self {
+        Self { base, size }
+    }
+
+    /// 返回向上页面对齐的区域起始物理地址
+    pub fn area_base_aligned(&self) -> PhysAddr {
+        return PhysAddr::new(
+            (self.base.data() + (MMArch::PAGE_SIZE - 1)) & !(MMArch::PAGE_SIZE - 1),
+        );
+    }
+
+    /// 返回向下页面对齐的区域截止物理地址
+    pub fn area_end_aligned(&self) -> PhysAddr {
+        return PhysAddr::new((self.base.data() + self.size) & !(MMArch::PAGE_SIZE - 1));
+    }
+}
+
+impl Default for PhysMemoryArea {
+    fn default() -> Self {
+        Self {
+            base: PhysAddr::new(0),
+            size: 0,
+        }
+    }
+}
+
 pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// 页面大小的shift（假如页面4K，那么这个值就是12,因为2^12=4096）
     const PAGE_SHIFT: usize;

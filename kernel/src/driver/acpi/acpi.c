@@ -1,9 +1,6 @@
 #include "acpi.h"
-#include <common/printk.h>
 #include <common/kprint.h>
 #include <driver/multiboot2/multiboot2.h>
-#include <mm/mm.h>
-#include <mm/mmio.h>
 
 extern void rs_acpi_init(uint64_t rsdp_paddr1, uint64_t rsdp_paddr2);
 

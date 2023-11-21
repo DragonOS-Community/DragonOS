@@ -4,10 +4,6 @@
 
 #pragma once
 
-#include <common/glib.h>
-#include <mm/mm.h>
-
-bool acpi_use_xsdt = false;
 struct acpi_RSDP_t
 {
     unsigned char Signature[8];

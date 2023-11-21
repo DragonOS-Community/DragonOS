@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <common/glib.h>
+#include <mm/mm.h>
+
 struct acpi_RSDP_t
 {
     unsigned char Signature[8];

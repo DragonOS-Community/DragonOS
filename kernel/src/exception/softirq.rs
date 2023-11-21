@@ -10,22 +10,15 @@ use alloc::{boxed::Box, sync::Arc};
 use num_traits::FromPrimitive;
 
 use crate::{
-    arch::interrupt::{cli, sti},
-    arch::CurrentIrqArch,
-    exception::InterruptArch,
-    include::bindings::bindings::MAX_CPU_NUM,
-    kdebug, kinfo,
-    libs::rwlock::RwLock,
-    process::ProcessManager,
-    smp::core::smp_get_processor_id,
-    syscall::SystemError,
-    time::timer::clock,
+    arch::CurrentIrqArch, exception::InterruptArch, kdebug, kinfo, libs::rwlock::RwLock,
+    mm::percpu::PerCpu, process::ProcessManager, smp::core::smp_get_processor_id,
+    syscall::SystemError, time::timer::clock,
 };
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
 const MAX_SOFTIRQ_RESTART: i32 = 20;
 
-static mut __CPU_PENDING: Option<Box<[VecStatus; MAX_CPU_NUM as usize]>> = None;
+static mut __CPU_PENDING: Option<Box<[VecStatus; PerCpu::MAX_CPU_NUM]>> = None;
 static mut __SORTIRQ_VECTORS: *mut Softirq = null_mut();
 
 #[no_mangle]
@@ -37,9 +30,11 @@ pub fn softirq_init() -> Result<(), SystemError> {
     kinfo!("Initializing softirq...");
     unsafe {
         __SORTIRQ_VECTORS = Box::leak(Box::new(Softirq::new()));
-        __CPU_PENDING = Some(Box::new([VecStatus::default(); MAX_CPU_NUM as usize]));
+        __CPU_PENDING = Some(Box::new(
+            [VecStatus::default(); PerCpu::MAX_CPU_NUM as usize],
+        ));
         let cpu_pending = __CPU_PENDING.as_mut().unwrap();
-        for i in 0..MAX_CPU_NUM {
+        for i in 0..PerCpu::MAX_CPU_NUM {
             cpu_pending[i as usize] = VecStatus::default();
         }
     }
@@ -177,7 +172,7 @@ impl Softirq {
             cpu_pending(cpu_id as usize).bits = 0;
             compiler_fence(Ordering::SeqCst);
 
-            sti();
+            unsafe { CurrentIrqArch::interrupt_enable() };
             if pending != 0 {
                 for i in 0..MAX_SOFTIRQ_NUM {
                     if pending & (1 << i) == 0 {
@@ -205,7 +200,7 @@ impl Softirq {
                     }
                 }
             }
-            cli();
+            unsafe { CurrentIrqArch::interrupt_disable() };
             max_restart -= 1;
             compiler_fence(Ordering::SeqCst);
             if cpu_pending(cpu_id as usize).is_empty() {

@@ -748,6 +748,7 @@ impl TextuiWindow {
         if !self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return Ok(());
         }
+        send_to_default_serial8250_port(&[character as u8]);
 
         //进行换行操作
         if character == '\n' {
@@ -831,10 +832,6 @@ impl TextuiWindow {
                 }
             }
         } else {
-            // 输出其他字符
-
-            send_to_default_serial8250_port(&[character as u8]);
-
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =
                     &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]

@@ -335,6 +335,11 @@ impl Default for SigPending {
 }
 
 impl SigPending {
+    /// 判断是否有待处理的信号
+    pub fn has_pending(&self) -> bool {
+        return !self.signal.is_empty();
+    }
+
     pub fn signal(&self) -> SigSet {
         self.signal
     }

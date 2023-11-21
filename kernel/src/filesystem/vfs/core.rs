@@ -16,10 +16,15 @@ use crate::{
         vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
     kdebug, kerror, kinfo,
+    process::ProcessManager,
     syscall::SystemError,
 };
 
-use super::{file::FileMode, utils::rsplit_path, IndexNode, InodeId, MAX_PATHLEN};
+use super::{
+    file::FileMode,
+    utils::{rsplit_path, user_path_at},
+    IndexNode, InodeId, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+};
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -206,13 +211,17 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 }
 
 /// @brief 删除文件夹
-pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
+pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     // 文件名过长
     if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
 
-    let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+    let pcb = ProcessManager::current_pcb();
+    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
+
+    let inode: Result<Arc<dyn IndexNode>, SystemError> =
+        inode_begin.lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
     if inode.is_err() {
         let errno = inode.unwrap_err();
@@ -222,9 +231,10 @@ pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
         }
     }
 
-    let (filename, parent_path) = rsplit_path(path);
+    let (filename, parent_path) = rsplit_path(&remain_path);
     // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+    let parent_inode: Arc<dyn IndexNode> = inode_begin
+        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
@@ -242,13 +252,16 @@ pub fn do_remove_dir(path: &str) -> Result<u64, SystemError> {
 }
 
 /// @brief 删除文件
-pub fn do_unlink_at(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
+pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     // 文件名过长
     if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
     }
+    let pcb = ProcessManager::current_pcb();
+    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
 
-    let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
+    let inode: Result<Arc<dyn IndexNode>, SystemError> =
+        inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
     if inode.is_err() {
         let errno = inode.clone().unwrap_err();
@@ -264,7 +277,8 @@ pub fn do_unlink_at(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 
     let (filename, parent_path) = rsplit_path(path);
     // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+    let parent_inode: Arc<dyn IndexNode> = inode_begin
+        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);

@@ -14,7 +14,7 @@ current_CFLAGS := $(CFLAGS)
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.1.4
+MIN_DADK_VERSION = 0.1.5
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 
 # 旧版的libc安装路径

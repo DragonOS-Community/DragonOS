@@ -13,8 +13,8 @@
 - Home Page  **[DragonOS.org](https://dragonos.org)**
 - Documentation  **[docs.DragonOS.org](https://docs.dragonos.org)**
 - **To learn about development dynamics and development tasks, please visit DragonOS's zulip community:** [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
-- BBS  **[bbs.DragonOS.org](https://bbs.dragonos.org)**
 - Software mirror website **[mirrors.DragonOS.org](https://mirrors.DragonOS.org)**
+- Git mirror website **[git.mirrors.DragonOS.org](https://git.mirrors.DragonOS.org)**
 - QQ group **115763565**
 - Code search engine [code.DragonOS.org](http://code.dragonos.org)&nbsp;
 
@@ -23,8 +23,6 @@
 &emsp;&emsp;The steps to run DragonOS are very simple. You can refer to the following information to run DragonOS within 15 minutes at the fastest!
 
 - [Building DragonOS - DragonOS dev document](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)
-
-- [Teach you to run DragonOS in 15 minutes- Bilibili](https://www.bilibili.com/video/BV1zF411w7s2?share_source=copy_web&vd_source=41ab4a1b73e6f65219a785923511517e)
 
 ## DragonOS' Features
 
@@ -73,7 +71,7 @@ We guarantee that all sponsorship funds and items will be used for:
 
 **Not yet**
 
-We hope that in the future, some enterprises can sponsor DragonOS and inject financial power into its development!
+- **[China YaCloud](https://yacloud.net)** Ya'an Digital Economy Operations Co., Ltd. provides cloud server support for DragonOS.
 
 ### Individual Sponsor List
 

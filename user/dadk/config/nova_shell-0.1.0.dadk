@@ -1,12 +1,12 @@
 {
-  "name": "DragonReach",
+  "name": "NovaShell",
   "version": "0.1.0",
-  "description": "init程序",
+  "description": "NovaShell程序",
   "task_type": {
     "BuildFromSource": {
       "Git": {
-        "url" : "https://git.mirrors.dragonos.org/DragonOS-Community/DragonReach.git",
-        "revision": "4768985ade"
+        "url": "https://git.mirrors.dragonos.org/DragonOS-Community/NovaShell.git",
+        "revision": "81c6126119"
       }
     }
   },

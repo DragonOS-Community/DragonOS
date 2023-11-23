@@ -6,8 +6,6 @@ extern void rs_acpi_init(uint64_t rsdp_paddr1, uint64_t rsdp_paddr2);
 
 static struct acpi_RSDP_t *rsdpv1;
 static struct acpi_RSDP_2_t *rsdpv2;
-static struct acpi_RSDT_Structure_t *rsdt;
-static struct acpi_XSDT_Structure_t *xsdt;
 
 static struct multiboot_tag_old_acpi_t old_acpi;
 static struct multiboot_tag_new_acpi_t new_acpi;

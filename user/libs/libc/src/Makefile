@@ -7,7 +7,7 @@ CFLAGS += -I .
 
 libc_sub_dirs=math sys
 
-ifeq ($(ARCH), __x86_64__)
+ifeq ($(ARCH), x86_64)
 libc_sub_dirs += arch/x86_64
 endif
 

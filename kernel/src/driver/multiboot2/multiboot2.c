@@ -11,7 +11,7 @@ unsigned int multiboot2_boot_info_size;
 static uint8_t mbi_raw[MBI_RAW_MAX_SIZE] = {0};
 bool multiboot2_init(uint64_t mb2_info_paddr, uint32_t mb2_magic)
 {
-  uint64_t vaddr = phys_2_virt(mb2_info_paddr);
+  uint64_t vaddr = (uint64_t)phys_2_virt(mb2_info_paddr);
   if (mb2_magic != MULTIBOOT2_BOOTLOADER_MAGIC)
     return false;
   // vaddr+0 处保存了大小

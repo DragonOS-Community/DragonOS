@@ -240,7 +240,7 @@ int irq_unregister(ul irq_num)
     if (p->irq_name)
         kfree(p->irq_name);
     p->irq_name = NULL;
-    p->parameter = NULL;
+    p->parameter = (ul)NULL;
     p->flags = 0;
     p->handler = NULL;
 

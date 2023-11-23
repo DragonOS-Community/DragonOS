@@ -74,13 +74,29 @@ impl AcpiManager {
     fn map_tables(&self, rsdp_vaddr1: u64, rsdp_vaddr2: u64) -> Result<(), SystemError> {
         let rsdp_paddr1 = Self::rsdp_paddr(rsdp_vaddr1);
         let res1 = unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, rsdp_paddr1.data()) };
+        let e1;
+        match res1 {
+            // 如果rsdpv1能够获取到acpi_table，则就用该表，不用rsdpv2了
+            Ok(acpi_table) => {
+                Self::set_acpi_table(acpi_table);
+                return Ok(());
+            }
+            Err(e) => {
+                e1 = e;
+                Self::drop_rsdp_tmp_box();
+            }
+        }
+
         let rsdp_paddr2 = Self::rsdp_paddr(rsdp_vaddr2);
         let res2 = unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, rsdp_paddr2.data()) };
-
-        match (res1, res2) {
-            (Ok(acpi_table), _) | (_, Ok(acpi_table)) => Self::set_acpi_table(acpi_table),
-            (Err(e1), Err(e2)) => {
+        match res2 {
+            Ok(acpi_table) => {
+                Self::set_acpi_table(acpi_table);
+            }
+            // 如果rsdpv1和rsdpv2都无法获取到acpi_table，说明有问题，打印报错信息后进入死循环
+            Err(e2) => {
                 kerror!("acpi_init(): failed to parse acpi tables, error: (rsdpv1: {:?}) or (rsdpv2: {:?})", e1, e2);
+                Self::drop_rsdp_tmp_box();
                 loop {
                     spin_loop();
                 }
@@ -120,6 +136,12 @@ impl AcpiManager {
     fn set_acpi_table(acpi_table: AcpiTables<AcpiHandlerImpl>) {
         unsafe {
             __ACPI_TABLE = Some(acpi_table);
+        }
+    }
+
+    fn drop_rsdp_tmp_box() {
+        unsafe {
+            RSDP_TMP_BOX = None;
         }
     }
 

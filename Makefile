@@ -19,7 +19,10 @@ ifeq ($(OS),Darwin) # Assume Mac OS X
 endif
 
 # if arch not defined, set it to x86_64
-export ARCH?=x86_64
+ifeq ($(ARCH), )
+export ARCH=x86_64
+endif
+
 
 CFLAGS_DEFINE_ARCH="__$(ARCH)__"
 
@@ -27,12 +30,19 @@ CFLAGS_DEFINE_ARCH="__$(ARCH)__"
 export ROOT_PATH=$(shell pwd)
 
 export DEBUG=DEBUG
-export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(CFLAGS_DEFINE_ARCH) -D $(EMULATOR) -O1
+export GLOBAL_CFLAGS := -fno-builtin -fno-stack-protector -D $(CFLAGS_DEFINE_ARCH) -D $(EMULATOR) -O1
+
+ifeq ($(ARCH), x86_64)
+GLOBAL_CFLAGS += -mcmodel=large -m64
+else ifeq ($(ARCH), riscv64)
+GLOBAL_CFLAGS += -mcmodel=medany -march=rv64imac -mabi=lp64
+endif
 
 ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
 
+ifeq ($(ARCH), x86_64)
 
 export CC=$(DragonOS_GCC)/x86_64-elf-gcc
 export LD=ld
@@ -40,6 +50,17 @@ export AS=$(DragonOS_GCC)/x86_64-elf-as
 export NM=$(DragonOS_GCC)/x86_64-elf-nm
 export AR=$(DragonOS_GCC)/x86_64-elf-ar
 export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
+
+else ifeq ($(ARCH), riscv64)
+
+export CC=riscv64-unknown-elf-gcc
+export LD=riscv64-unknown-elf-ld
+export AS=riscv64-unknown-elf-as
+export NM=riscv64-unknown-elf-nm
+export AR=riscv64-unknown-elf-ar
+export OBJCOPY=riscv64-unknown-elf-objcopy
+
+endif
 
 # 检查是否需要进行fmt --check
 # 解析命令行参数  
@@ -60,13 +81,13 @@ all: kernel user
 kernel:
 	mkdir -p bin/kernel/
 	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
-	$(MAKE) -C ./kernel all || (sh -c "echo 内核编译失败" && exit 1)
+	$(MAKE) -C ./kernel all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 	
 .PHONY: user
 user:
 
 	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
-	$(MAKE) -C ./user all || (sh -c "echo 用户程序编译失败" && exit 1)
+	$(MAKE) -C ./user all ARCH=$(ARCH) || (sh -c "echo 用户程序编译失败" && exit 1)
 
 .PHONY: clean
 clean:

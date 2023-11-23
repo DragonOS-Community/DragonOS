@@ -10,6 +10,7 @@
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
 #include "exception/trap.h"
+#include "exception/irq.h"
 #include "ipi.h"
 
 /* x86-64 specific MSRs */
@@ -55,6 +56,7 @@ static struct X86CpuInfo __cpu_info[MAX_SUPPORTED_PROCESSOR_NUM] = {0};
 void smp_init()
 {
     spin_init(&multi_core_starting_lock); // 初始化多核启动锁
+#if ARCH(I386) || ARCH(X86_64)
     // 设置多核启动时，要加载的页表
     __APU_START_CR3 = (uint64_t)get_CR3();
 
@@ -133,6 +135,7 @@ void smp_init()
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
     rs_unmap_at_low_addr();
     kinfo("Successfully cleaned page table remapping!\n");
+#endif
     io_mfence();
 }
 
@@ -147,7 +150,7 @@ void smp_ap_start_stage2()
     io_mfence();
     ++num_cpu_started;
     io_mfence();
-
+#if ARCH(I386) || ARCH(X86_64)
     rs_apic_init_ap();
 
     // ============ 为ap处理器初始化IDLE进程 =============
@@ -160,7 +163,7 @@ void smp_ap_start_stage2()
     rs_init_syscall_64();
     
     apic_timer_ap_core_init();
-
+#endif
 
     sti();
     sched();

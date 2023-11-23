@@ -25,7 +25,7 @@ impl Syscall {
         if pcb.is_some() {
             let next_pcb = pcb.unwrap();
             let current_pcb = ProcessManager::current_pcb();
-
+            // kdebug!("sched: current_pcb: {:?}, next_pcb: {:?}\n", current_pcb, next_pcb);
             if current_pcb.pid() != next_pcb.pid() {
                 CPU_EXECUTING.set(smp_get_processor_id(), next_pcb.pid());
                 unsafe { ProcessManager::switch_process(current_pcb, next_pcb) };

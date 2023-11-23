@@ -1,6 +1,8 @@
+#include <arch/arch.h>
+#if ARCH(I386) || ARCH(X86_64)
+
 #include <common/idr.h>
 #include <mm/slab.h>
-
 /**
  * @brief 更换两个idr_layer指针
  *
@@ -1052,3 +1054,5 @@ bool ida_empty(struct ida *ida_p)
 
     return false;
 }
+
+#endif

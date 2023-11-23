@@ -8,6 +8,9 @@
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>
+#include <arch/arch.h>
+
+#if ARCH(I386) || ARCH(X86_64)
 // 导出系统调用入口函数，定义在entry.S中
 extern void syscall_int(void);
 
@@ -45,6 +48,17 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
 
     return err_code;
 }
+
+#else
+long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5, ul arg6, ul arg7){
+  while (1)
+  {
+    /* code */
+  }
+  
+}
+
+#endif
 
 /**
  * @brief 打印字符串的系统调用

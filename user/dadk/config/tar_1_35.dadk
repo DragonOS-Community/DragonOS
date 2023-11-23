@@ -6,7 +6,7 @@
   "task_type": {
     "InstallFromPrebuilt": {
       "Archive": {
-        "url": "https://mirrors.dragonos.org/pub/third_party/gnu/tar/tar-1.35-x86_64-linux-gnu.tar.xz"
+        "url": "https://mirrors.dragonos.org.cn/pub/third_party/gnu/tar/tar-1.35-x86_64-linux-gnu.tar.xz"
       }
     }
   },

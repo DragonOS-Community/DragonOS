@@ -61,8 +61,8 @@ jobs:
           
           # Create custom Rust toolchain
             fork_toolchain_from="nightly-2023-08-15-x86_64-unknown-linux-gnu"
-	          custom_toolchain="nightly-2023-08-15-x86_64-unknown-linux_dragonos-gnu"
-	          custom_toolchain_dir="$(dirname $(rustc --print sysroot))/${custom_toolchain}"
+            custom_toolchain="nightly-2023-08-15-x86_64-unknown-linux_dragonos-gnu"
+            custom_toolchain_dir="$(dirname $(rustc --print sysroot))/${custom_toolchain}"
             echo "Custom toolchain does not exist, creating..."
             rustup toolchain install ${fork_toolchain_from}
             rustup component add --toolchain ${fork_toolchain_from} rust-src
@@ -70,5 +70,5 @@ jobs:
             cp -r $(dirname $(rustc --print sysroot))/${fork_toolchain_from} ${custom_toolchain_dir}
             self_contained_dir=${custom_toolchain_dir}/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained
             cp -f ${self_contained_dir}/crt1.o ${self_contained_dir}/rcrt1.o
-	          
+
 

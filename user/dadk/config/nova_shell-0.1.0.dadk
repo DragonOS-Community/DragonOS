@@ -19,5 +19,5 @@
   },
   "install": {
     "in_dragonos_path": "/"
-  },
+  }
 }

@@ -5,7 +5,7 @@
   "task_type": {
     "BuildFromSource": {
       "Git": {
-        "url": "https://git.mirrors.dragonos.org/DragonOS-Community/NovaShell.git",
+        "url": "https://git.mirrors.dragonos.org.cn/DragonOS-Community/NovaShell.git",
         "revision": "81c6126119"
       }
     }
@@ -20,10 +20,4 @@
   "install": {
     "in_dragonos_path": "/"
   },
-  "envs": [    
-    {
-      "key": "TARGET",
-      "value": "${ROOT_PATH}/user/dadk/target/x86_64-unknown-dragonos.json"
-    }
-  ]
 }

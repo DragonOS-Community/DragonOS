@@ -9,7 +9,7 @@ pub fn current_cpu_id() -> u32 {
 }
 
 /// 重置cpu
-pub fn cpu_reset() -> ! {
+pub unsafe fn cpu_reset() -> ! {
     // 重启计算机
     unsafe { x86::io::outb(0x64, 0xfe) };
     loop {}

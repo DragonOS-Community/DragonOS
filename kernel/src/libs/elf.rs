@@ -37,7 +37,7 @@ pub struct ElfLoader;
 pub const ELF_LOADER: ElfLoader = ElfLoader::new();
 
 impl ElfLoader {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     pub const ELF_PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 
     /// 读取文件的缓冲区大小
@@ -47,19 +47,13 @@ impl ElfLoader {
         Self
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub fn probe_x86_64(
+    fn inner_probe_common(
         &self,
         param: &ExecParam,
         ehdr: &FileHeader<AnyEndian>,
     ) -> Result<(), ExecError> {
         // 只支持 64 位的 ELF 文件
         if ehdr.class != elf::file::Class::ELF64 {
-            return Err(ExecError::WrongArchitecture);
-        }
-
-        // 判断架构是否匹配
-        if ElfMachine::from(ehdr.e_machine) != ElfMachine::X86_64 {
             return Err(ExecError::WrongArchitecture);
         }
 
@@ -74,6 +68,32 @@ impl ElfLoader {
         }
 
         return Ok(());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn probe_x86_64(
+        &self,
+        param: &ExecParam,
+        ehdr: &FileHeader<AnyEndian>,
+    ) -> Result<(), ExecError> {
+        // 判断架构是否匹配
+        if ElfMachine::from(ehdr.e_machine) != ElfMachine::X86_64 {
+            return Err(ExecError::WrongArchitecture);
+        }
+        return self.inner_probe_common(param, ehdr);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn probe_riscv(
+        &self,
+        param: &ExecParam,
+        ehdr: &FileHeader<AnyEndian>,
+    ) -> Result<(), ExecError> {
+        // 判断架构是否匹配
+        if ElfMachine::from(ehdr.e_machine) != ElfMachine::RiscV {
+            return Err(ExecError::WrongArchitecture);
+        }
+        return self.inner_probe_common(param, ehdr);
     }
 
     /// 设置用户堆空间，映射[start, end)区间的虚拟地址，并把brk指针指向end
@@ -471,8 +491,11 @@ impl BinaryLoader for ElfLoader {
         #[cfg(target_arch = "x86_64")]
         return self.probe_x86_64(param, &ehdr);
 
-        #[cfg(not(target_arch = "x86_64"))]
-        unimplemented!("Unsupported architecture");
+        #[cfg(target_arch = "riscv64")]
+        return self.probe_riscv(param, &ehdr);
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        compile_error!("BinaryLoader: Unsupported architecture");
     }
 
     fn load(

@@ -480,7 +480,7 @@ impl MmioBuddyMemPool {
             return Err(SystemError::EPERM);
         }
         // 计算前导0
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         let mut size_exp: u32 = 63 - size.leading_zeros();
         // kdebug!("create_mmio: size_exp: {}", size_exp);
         // 记录最终申请的空间大小

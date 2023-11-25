@@ -5,6 +5,7 @@
 #include <process/process.h>
 #include <process/ptrace.h>
 #include <sched/sched.h>
+#include <arch/arch.h>
 
 extern void ignore_int();
 
@@ -204,9 +205,9 @@ void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 {
     cli();
     unsigned long cr2 = 0;
-
+#if ARCH(I386) || ARCH(X86_64)
     __asm__ __volatile__("movq	%%cr2,	%0" : "=r"(cr2)::"memory");
-
+#endif
     kerror("do_page_fault(14),Error code :%#018lx,RSP:%#018lx, RBP=%#018lx, RIP:%#018lx CPU:%d, pid=%d\n", error_code,
            regs->rsp, regs->rbp, regs->rip, rs_current_pcb_cpuid(), rs_current_pcb_pid());
     kerror("regs->rax = %#018lx\n", regs->rax);
@@ -308,6 +309,8 @@ void ignore_int_handler(struct pt_regs *regs, unsigned long error_code)
 
 void sys_vector_init()
 {
+
+#if ARCH(I386) || ARCH(X86_64)
     // 将idt重置为新的ignore_int入点（此前在head.S中有设置，
     // 但是那个不完整，某些版本的编译器的输出，在真机运行时会破坏进程执行环境，从而导致#GP
     for (int i = 0; i < 256; ++i)
@@ -337,4 +340,5 @@ void sys_vector_init()
     // 中断号21-31由Intel保留，不能使用
 
     // 32-255为用户自定义中断内部
+#endif
 }

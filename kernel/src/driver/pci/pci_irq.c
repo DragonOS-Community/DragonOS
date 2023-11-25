@@ -12,7 +12,7 @@ void pci_irq_enable(ul irq_num)
 void pci_irq_disable(ul irq_num)
 {
 }
-ul pci_irq_install(ul, void*)
+ul pci_irq_install(ul num , void* data)
 {
 }
 void pci_irq_uninstall(ul irq_num)

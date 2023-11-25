@@ -1,3 +1,7 @@
+#include <arch/arch.h>
+
+#if ARCH(I386) || ARCH(X86_64)
+
 #include <common/lockref.h>
 #include <common/compiler.h>
 
@@ -241,3 +245,5 @@ bool lockref_inc_not_dead(struct lockref *lock_ref)
     spin_unlock(&lock_ref->lock);
     return retval;
 }
+
+#endif

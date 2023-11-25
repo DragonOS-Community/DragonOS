@@ -41,6 +41,7 @@
  * in memory stack (0:default, fastest), or in memory heap (1:requires malloc()).
  */
 #include<arch/arch.h>
+#if ARCH(I386) || ARCH(X86_64)
 
 #if ARCH(I386) || ARCH(X86_64)
 #include <arch/x86_64/math/bitcount.h>
@@ -3153,3 +3154,7 @@ char *LZ4_slideInputBuffer(void *state)
 }
 
 #endif /* LZ4_COMMONDEFS_ONLY */
+
+#else
+
+#endif

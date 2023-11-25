@@ -20,6 +20,7 @@ use crate::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
     syscall::SystemError,
     time::TimeSpec,
@@ -212,7 +213,7 @@ impl ProcFSInode {
     /// 打开 meminfo 文件
     fn open_meminfo(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 获取内存信息
-        let usage = LockedFrameAllocator.get_usage();
+        let usage = unsafe { LockedFrameAllocator.usage() };
 
         // 传入数据
         let data: &mut Vec<u8> = &mut pdata.data;

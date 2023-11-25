@@ -7,7 +7,7 @@ use alloc::ffi::CString;
 use alloc::vec::Vec;
 
 use super::pci::{PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError};
-use crate::arch::msi::{ia64_pci_get_arch_msi_message_address, ia64_pci_get_arch_msi_message_data};
+use crate::arch::msi::{arch_msi_message_address, arch_msi_message_data};
 use crate::arch::{PciArch, TraitPciArch};
 use crate::include::bindings::bindings::{
     c_irq_install, c_irq_uninstall, pt_regs, ul, EAGAIN, EINVAL,
@@ -370,14 +370,14 @@ pub trait PciInterrupt: PciDeviceStructure {
                     }
                     //MSI中断只需配置一次PCI寄存器
                     if common_msg.irq_index == 0 {
-                        let msg_address = ia64_pci_get_arch_msi_message_address(0);
+                        let msg_address = arch_msi_message_address(0);
                         let trigger = match msg.irq_specific_message {
                             IrqSpecificMsg::Legacy => {
                                 return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
                             }
                             IrqSpecificMsg::Msi { trigger_mode, .. } => trigger_mode,
                         };
-                        let msg_data = ia64_pci_get_arch_msi_message_data(irq_num, 0, trigger);
+                        let msg_data = arch_msi_message_data(irq_num, 0, trigger);
                         //写入Message Data和Message Address
                         if address_64 {
                             PciArch::write_config(
@@ -518,14 +518,14 @@ pub trait PciInterrupt: PciDeviceStructure {
                         _ => {}
                     }
 
-                    let msg_address = ia64_pci_get_arch_msi_message_address(0);
+                    let msg_address = arch_msi_message_address(0);
                     let trigger = match msg.irq_specific_message {
                         IrqSpecificMsg::Legacy => {
                             return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
                         }
                         IrqSpecificMsg::Msi { trigger_mode, .. } => trigger_mode,
                     };
-                    let msg_data = ia64_pci_get_arch_msi_message_data(irq_num, 0, trigger);
+                    let msg_data = arch_msi_message_data(irq_num, 0, trigger);
                     //写入Message Data和Message Address
                     let pcistandardbar = self
                         .bar()

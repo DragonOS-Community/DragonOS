@@ -17,7 +17,7 @@ use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
-    kwarn,
+    kerror, kwarn,
     libs::spinlock::SpinLockGuard,
     mm::{
         percpu::{PerCpu, PerCpuVar},
@@ -275,10 +275,13 @@ impl ProcessControlBlock {
     pub fn arch_current_pcb() -> Arc<Self> {
         // 获取栈指针
         let ptr = VirtAddr::new(x86::current::registers::rsp() as usize);
+
         let stack_base = VirtAddr::new(ptr.data() & (!(KernelStack::ALIGN - 1)));
+
         // 从内核栈的最低地址处取出pcb的地址
         let p = stack_base.data() as *const *const ProcessControlBlock;
         if unlikely((unsafe { *p }).is_null()) {
+            kerror!("p={:p}", p);
             panic!("current_pcb is null");
         }
         unsafe {

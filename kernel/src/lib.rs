@@ -53,6 +53,8 @@ mod sched;
 mod smp;
 mod syscall;
 mod time;
+
+#[cfg(target_arch = "x86_64")]
 mod virt;
 
 #[macro_use]
@@ -79,7 +81,7 @@ use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;
 
-#[cfg(feature = "backtrace")]
+#[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
 extern crate mini_backtrace;
 
 extern "C" {
@@ -120,7 +122,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    #[cfg(feature = "backtrace")]
+    #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
     {
         unsafe {
             let bt = mini_backtrace::Backtrace::<16>::capture();

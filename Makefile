@@ -1,9 +1,13 @@
+# 导入环境变量
+include env.mk
+
+
+export ROOT_PATH=$(shell pwd)
+
 SUBDIRS = kernel user tools build-scripts
 
-# ifndef $(EMULATOR)
-ifeq ($(EMULATOR), )
-export EMULATOR=__NO_EMULATION__
-endif
+
+
 # todo: 增加参数，判断是否在QEMU中仿真，若是，则启用该环境变量
 # export EMULATOR=__QEMU_EMULATION__
 
@@ -18,28 +22,7 @@ ifeq ($(OS),Darwin) # Assume Mac OS X
   NPROCS:=$(shell system_profiler | awk '/Number Of CPUs/{print $4}{next;}')
 endif
 
-# if arch not defined, set it to x86_64
-export ARCH?=x86_64
 
-CFLAGS_DEFINE_ARCH="__$(ARCH)__"
-
-
-export ROOT_PATH=$(shell pwd)
-
-export DEBUG=DEBUG
-export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(CFLAGS_DEFINE_ARCH) -D $(EMULATOR) -O1
-
-ifeq ($(DEBUG), DEBUG)
-GLOBAL_CFLAGS += -g 
-endif
-
-
-export CC=$(DragonOS_GCC)/x86_64-elf-gcc
-export LD=ld
-export AS=$(DragonOS_GCC)/x86_64-elf-as
-export NM=$(DragonOS_GCC)/x86_64-elf-nm
-export AR=$(DragonOS_GCC)/x86_64-elf-ar
-export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 # 检查是否需要进行fmt --check
 # 解析命令行参数  
@@ -60,13 +43,13 @@ all: kernel user
 kernel:
 	mkdir -p bin/kernel/
 	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
-	$(MAKE) -C ./kernel all || (sh -c "echo 内核编译失败" && exit 1)
+	$(MAKE) -C ./kernel all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 	
 .PHONY: user
 user:
 
 	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
-	$(MAKE) -C ./user all || (sh -c "echo 用户程序编译失败" && exit 1)
+	$(MAKE) -C ./user all ARCH=$(ARCH) || (sh -c "echo 用户程序编译失败" && exit 1)
 
 .PHONY: clean
 clean:

@@ -5,6 +5,7 @@
 #include <exception/gate.h>
 #include <mm/slab.h>
 #include <process/process.h>
+#include <arch/x86_64/driver/apic/apic_timer.h>
 
 #include <process/preempt.h>
 #include <sched/sched.h>
@@ -12,12 +13,13 @@
 #include "exception/trap.h"
 #include "exception/irq.h"
 #include "ipi.h"
+#include <arch/arch.h>
 
 /* x86-64 specific MSRs */
-#define MSR_EFER		0xc0000080 /* extended feature register */
-#define MSR_STAR		0xc0000081 /* legacy mode SYSCALL target */
-#define MSR_LSTAR		0xc0000082 /* long mode SYSCALL target */
-#define MSR_SYSCALL_MASK	0xc0000084 /* EFLAGS mask for syscall */
+#define MSR_EFER 0xc0000080         /* extended feature register */
+#define MSR_STAR 0xc0000081         /* legacy mode SYSCALL target */
+#define MSR_LSTAR 0xc0000082        /* long mode SYSCALL target */
+#define MSR_SYSCALL_MASK 0xc0000084 /* EFLAGS mask for syscall */
 
 static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
 static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
@@ -79,7 +81,7 @@ void smp_init()
 
     kdebug("total_processor_num=%d", total_processor_num);
     // 注册接收kick_cpu功能的处理函数。（向量号200）
-    ipi_regiserIPI(KICK_CPU_IRQ_NUM, NULL, &__smp_kick_cpu_handler, NULL, NULL, "IPI kick cpu");
+    ipi_regiserIPI(KICK_CPU_IRQ_NUM, NULL, &__smp_kick_cpu_handler, (uint64_t)NULL, NULL, "IPI kick cpu");
     ipi_regiserIPI(FLUSH_TLB_IRQ_NUM, NULL, &__smp__flush_tlb_ipi_handler, NULL, NULL, "IPI flush tlb");
 
     int core_to_start = 0;
@@ -118,7 +120,8 @@ void smp_init()
         // 连续发送两次start-up IPI
 
         int r = rs_ipi_send_smp_startup(__cpu_info[i].apic_id);
-        if(r){
+        if (r)
+        {
             kerror("Failed to send startup ipi to cpu: %d", __cpu_info[i].apic_id);
         }
         io_mfence();

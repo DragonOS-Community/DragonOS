@@ -1,3 +1,6 @@
+CURRENT_SHELL=$(basename $SHELL)
+source "$HOME/.$CURRENT_SHELL"rc
+
 emulator="qemu"
 defpackman="apt-get"
 dockerInstall="true"
@@ -18,14 +21,13 @@ congratulations()
 	echo "|                                          |"
 	echo "|   你成功安装了DragonOS所需的依赖项!      |"
     echo "|                                          |"
-    echo "|   请关闭当前终端, 并重新打开一个终端     |"
+    echo "|   请[关闭]当前终端, 并[重新打开]一个终端 |"
 	echo "|   然后通过以下命令运行:                  |"
 	echo "|                                          |"
 	echo "|                make run                  |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
-
 
 ####################################
 # 当检测到ubuntu或Debian时，执行此函数 #

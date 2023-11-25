@@ -35,6 +35,7 @@ trap trap_handler SIGINT
 
 
 SHELL_RC=$(get_shell_rc_file)
+source $SHELL_RC
 
 # 下载musl交叉编译工具链
 

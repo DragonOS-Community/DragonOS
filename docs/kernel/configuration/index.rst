@@ -7,3 +7,4 @@
    :caption: 目录
 
    config
+   arch

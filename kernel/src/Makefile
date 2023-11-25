@@ -70,6 +70,12 @@ __link_riscv64_kernel:
 	@echo "Linking kernel..."
 	$(LD) -b elf64-littleriscv -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/riscv64imac-unknown-none-elf/release/libdragonos_kernel.a -T arch/riscv64/link.ld --no-relax
 	$(OBJCOPY) -I elf64-littleriscv -O elf64-littleriscv -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
+	rm kernel
+
+# 构建uboot的scr文件
+	@echo "Generating kernel scr file..."
+	@mkdir -p $(ROOT_PATH)/bin/sysroot/boot/
+	@mkimage -A riscv -T script -d arch/riscv64/boot/bootscript.cmd $(ROOT_PATH)/bin/sysroot/boot/boot.scr 
 
 
 __link_x86_64_kernel:
@@ -96,9 +102,10 @@ ifeq ($(UNWIND_ENABLE), yes)
 else
 	$(OBJCOPY) -I elf64-x86-64 -O elf64-x86-64 -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
 endif
+	rm kernel
 
 clean: 
-	cargo clean
+	@cargo clean
 	rm -rf $(GARBAGE)
 	@list='$(kernel_subdirs)'; for subdir in $$list; do \
 		echo "Clean in dir: $$subdir";\

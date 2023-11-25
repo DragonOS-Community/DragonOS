@@ -1,3 +1,5 @@
+# 导入环境变量
+include ../env.mk
 
 export ARCH ?= x86_64
 # 如果是x86_64, 则使用x86_64-unknown-none.json作为target
@@ -28,8 +30,8 @@ fmt:
 
 .PHONY: check
 check: ECHO
-	@echo "Checking kernel... ARCH=$(ARCH)"
-	exit
+# @echo "Checking kernel... ARCH=$(ARCH)"
+# @exit 1
 ifeq ($(ARCH), x86_64)
 	@cargo +nightly-2023-01-21 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 else ifeq ($(ARCH), riscv64)

@@ -1,7 +1,11 @@
 use core::ffi::c_void;
 
 use crate::{
-    arch::{ipc::signal::X86_64SignalArch, syscall::nr::SYS_RT_SIGRETURN, CurrentIrqArch},
+    arch::{
+        ipc::signal::X86_64SignalArch,
+        syscall::nr::{SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
+        CurrentIrqArch,
+    },
     exception::InterruptArch,
     include::bindings::bindings::set_system_trap_gate,
     ipc::signal_types::SignalArch,
@@ -94,6 +98,14 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
         SYS_RT_SIGRETURN => {
             syscall_return!(
                 X86_64SignalArch::sys_rt_sigreturn(frame) as usize,
+                frame,
+                show
+            );
+        }
+        SYS_ARCH_PRCTL => {
+            syscall_return!(
+                Syscall::arch_prctl(args[0], args[1])
+                    .unwrap_or_else(|e| e.to_posix_errno() as usize),
                 frame,
                 show
             );

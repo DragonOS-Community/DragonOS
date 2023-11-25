@@ -1,9 +1,13 @@
+# 导入环境变量
+include env.mk
+
+
+export ROOT_PATH=$(shell pwd)
+
 SUBDIRS = kernel user tools build-scripts
 
-# ifndef $(EMULATOR)
-ifeq ($(EMULATOR), )
-export EMULATOR=__NO_EMULATION__
-endif
+
+
 # todo: 增加参数，判断是否在QEMU中仿真，若是，则启用该环境变量
 # export EMULATOR=__QEMU_EMULATION__
 
@@ -18,49 +22,7 @@ ifeq ($(OS),Darwin) # Assume Mac OS X
   NPROCS:=$(shell system_profiler | awk '/Number Of CPUs/{print $4}{next;}')
 endif
 
-# if arch not defined, set it to x86_64
-ifeq ($(ARCH), )
-export ARCH=x86_64
-endif
 
-
-CFLAGS_DEFINE_ARCH="__$(ARCH)__"
-
-
-export ROOT_PATH=$(shell pwd)
-
-export DEBUG=DEBUG
-export GLOBAL_CFLAGS := -fno-builtin -fno-stack-protector -D $(CFLAGS_DEFINE_ARCH) -D $(EMULATOR) -O1
-
-ifeq ($(ARCH), x86_64)
-GLOBAL_CFLAGS += -mcmodel=large -m64
-else ifeq ($(ARCH), riscv64)
-GLOBAL_CFLAGS += -mcmodel=medany -march=rv64imac -mabi=lp64
-endif
-
-ifeq ($(DEBUG), DEBUG)
-GLOBAL_CFLAGS += -g 
-endif
-
-ifeq ($(ARCH), x86_64)
-
-export CC=$(DragonOS_GCC)/x86_64-elf-gcc
-export LD=ld
-export AS=$(DragonOS_GCC)/x86_64-elf-as
-export NM=$(DragonOS_GCC)/x86_64-elf-nm
-export AR=$(DragonOS_GCC)/x86_64-elf-ar
-export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
-
-else ifeq ($(ARCH), riscv64)
-
-export CC=riscv64-unknown-elf-gcc
-export LD=riscv64-unknown-elf-ld
-export AS=riscv64-unknown-elf-as
-export NM=riscv64-unknown-elf-nm
-export AR=riscv64-unknown-elf-ar
-export OBJCOPY=riscv64-unknown-elf-objcopy
-
-endif
 
 # 检查是否需要进行fmt --check
 # 解析命令行参数  

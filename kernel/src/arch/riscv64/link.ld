@@ -10,10 +10,9 @@ ENTRY(_start)
 
 SECTIONS
 {
-	KERNEL_VMA = 0xffffffc000000000;
-	//KERNEL_VMA = 0;
+	//KERNEL_VMA = 0xffffffc000000000;
+	KERNEL_VMA = 0;
 	. = 0;
-	. = 0x80200000;
 	
 	.boot.text :
 	{

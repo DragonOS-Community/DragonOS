@@ -26,6 +26,7 @@ impl CFilesArch for RiscV64CFilesArch {
     }
 
     fn setup_global_flags(&self, c: &mut cc::Build) {
+        // 在这里设置编译器，不然的话vscode的rust-analyzer会报错
         c.compiler("riscv64-unknown-elf-gcc");
         // // c.flag("-march=rv64imafdc");
         // c.no_default_flags(true);

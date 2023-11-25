@@ -16,7 +16,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::{block::SeekFrom, device::DeviceNumber},
+    driver::base::block::SeekFrom,
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
@@ -388,6 +388,7 @@ impl Syscall {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
             }
+            #[cfg(target_arch = "x86_64")]
             SYS_OPEN => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
@@ -479,7 +480,9 @@ impl Syscall {
                 Self::ioctl(fd, cmd as u32, data)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_FORK => Self::fork(frame),
+            #[cfg(target_arch = "x86_64")]
             SYS_VFORK => Self::vfork(frame),
 
             SYS_BRK => {
@@ -524,7 +527,8 @@ impl Syscall {
                 Self::chdir(r)
             }
 
-            SYS_GETDENTS | SYS_GETDENTS64 => {
+            #[allow(unreachable_patterns)]
+            SYS_GETDENTS64 | SYS_GETDENTS => {
                 let fd = args[0] as i32;
 
                 let buf_vaddr = args[1];
@@ -584,6 +588,7 @@ impl Syscall {
                 let exit_code = args[0];
                 Self::exit(exit_code)
             }
+            #[cfg(target_arch = "x86_64")]
             SYS_MKDIR => {
                 let path_ptr = args[0] as *const c_char;
                 let mode = args[1];
@@ -629,6 +634,7 @@ impl Syscall {
             }
 
             SYS_CLOCK => Self::clock(),
+            #[cfg(target_arch = "x86_64")]
             SYS_PIPE => {
                 let pipefd: *mut i32 = args[0] as *mut c_int;
                 if pipefd.is_null() {
@@ -677,6 +683,7 @@ impl Syscall {
                 }
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_UNLINK => {
                 let pathname = args[0] as *const u8;
                 Self::unlink(pathname)
@@ -708,6 +715,8 @@ impl Syscall {
                 let oldfd: i32 = args[0] as c_int;
                 Self::dup(oldfd)
             }
+
+            #[cfg(target_arch = "x86_64")]
             SYS_DUP2 => {
                 let oldfd: i32 = args[0] as c_int;
                 let newfd: i32 = args[1] as c_int;
@@ -970,12 +979,17 @@ impl Syscall {
                 res
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
                 let path = args[0];
                 let flags = args[1];
                 let dev_t = args[2];
                 let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t))
+                Self::mknod(
+                    path as *const i8,
+                    flags,
+                    crate::driver::base::device::DeviceNumber::from(dev_t),
+                )
             }
 
             SYS_CLONE => {
@@ -1023,10 +1037,9 @@ impl Syscall {
             SYS_READV => Self::readv(args[0] as i32, args[1], args[2]),
             SYS_WRITEV => Self::writev(args[0] as i32, args[1], args[2]),
 
-            SYS_ARCH_PRCTL => Self::arch_prctl(args[0], args[1]),
-
             SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
 
+            #[cfg(target_arch = "x86_64")]
             SYS_LSTAT => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
@@ -1045,6 +1058,7 @@ impl Syscall {
                 res
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_STAT => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
@@ -1073,6 +1087,7 @@ impl Syscall {
                 unimplemented!()
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_POLL => {
                 kwarn!("SYS_POLL has not yet been implemented");
                 Ok(0)
@@ -1125,6 +1140,7 @@ impl Syscall {
                 Self::get_rusage(who, rusage)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_READLINK => {
                 let path = args[0] as *const u8;
                 let buf = args[1] as *mut u8;
@@ -1150,6 +1166,7 @@ impl Syscall {
                 Self::prlimit64(pid, resource, new_limit, old_limit)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_ACCESS => {
                 let pathname = args[0] as *const u8;
                 let mode = args[1] as u32;
@@ -1187,6 +1204,7 @@ impl Syscall {
                 Self::umask(mask)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_CHMOD => {
                 let pathname = args[0] as *const u8;
                 let mode = args[1] as u32;

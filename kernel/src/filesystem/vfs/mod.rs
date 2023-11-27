@@ -3,6 +3,7 @@ pub mod fcntl;
 pub mod file;
 pub mod mount;
 pub mod open;
+pub mod select;
 pub mod syscall;
 mod utils;
 

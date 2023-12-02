@@ -7,7 +7,7 @@ use crate::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall, SystemError,
     },
-    time::{timekeep::ktime_t, TimeSpec},
+    time::{timekeep::ktime_t, TimeSpec, MSEC_PER_SEC, NSEC_PER_MSEC},
 };
 
 use super::{file::File, PollStatus};
@@ -144,6 +144,13 @@ impl PollList {
     }
 }
 
+/// 计算超时时间
+fn poll_select_set_timeout(timeout_msecs: i32) -> Option<TimeSpec> {
+    let sec: i64 = timeout_msecs as i64 / MSEC_PER_SEC as i64;
+    let nsec: i64 = NSEC_PER_MSEC as i64 * (timeout_msecs as i64 % MSEC_PER_SEC as i64);
+    return Some(TimeSpec::new(sec, nsec));
+}
+
 impl Syscall {
     /// @brief 系统调用 poll
     /// @param ufds 用户空间的 pollfd 数组
@@ -155,12 +162,11 @@ impl Syscall {
         nfds: usize,
         timeout_msecs: i32,
     ) -> Result<usize, SystemError> {
-        let end_time: Option<TimeSpec> = None;
-
-        if timeout_msecs >= 0 {
-            // TODO: 设置超时时间
-            todo!()
-        }
+        let end_time = if timeout_msecs >= 0 {
+            poll_select_set_timeout(timeout_msecs)
+        } else {
+            None
+        };
 
         let ret = Self::do_sys_poll(ufds, nfds, end_time);
 

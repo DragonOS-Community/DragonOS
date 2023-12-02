@@ -104,10 +104,12 @@ impl FileType {
 
 bitflags! {
     /// @brief inode的状态（由poll方法返回）
-    pub struct PollStatus: u8 {
-        const WRITE = 1u8 << 0;
-        const READ = 1u8 << 1;
-        const ERROR = 1u8 << 2;
+    pub struct PollStatus: u16 {
+        const WRITE = 1u16 << 0;
+        const READ = 1u16 << 1;
+        const ERROR = 1u16 << 2;
+        const HANGUP = 1u16 << 3;
+        const INVALID = 1u16 << 4;
     }
 }
 

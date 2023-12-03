@@ -11,8 +11,6 @@
 
 ### 1.1 下载DragonOS的源代码
 
-#### 1.1.1 克隆DragonOS的代码
-
 使用https克隆：
 
 ```shell

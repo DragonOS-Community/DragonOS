@@ -75,6 +75,7 @@ QEMU_RTC_CLOCK=""
 QEMU_SERIAL="-serial file:../serial_opt.txt"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
+QEMU_ARGUMENT=""
 
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
@@ -90,22 +91,27 @@ else
 
 fi
 
+if [ ${ARCH} == "riscv64" ]; then
+# 如果是riscv64架构，就不需要图形界面
+    QEMU_ARGUMENT+=" --nographic "
+    # 从控制台显示
+    QEMU_MONITOR=""
+    QEMU_SERIAL=""
+fi
+
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
 QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
-QEMU_ARGUMENT="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d ${QEMU_MONITOR} -d ${qemu_trace_std} "
+QEMU_ARGUMENT+="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d ${QEMU_MONITOR} -d ${qemu_trace_std} "
 
 QEMU_ARGUMENT+="-s ${QEMU_MACHINE} ${QEMU_CPU_FEATURES} ${QEMU_RTC_CLOCK} ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES} "
 QEMU_ARGUMENT+=" ${QEMU_SHM_OBJECT} "
 QEMU_ARGUMENT+=" ${QEMU_ACCELARATE} "
 
-# 如果是riscv64架构，就不需要图形界面
-if [ ${ARCH} == "riscv64" ]; then
-    QEMU_ARGUMENT+=" -nographic "
-fi
+
 
 # 安装riscv64的uboot
 install_riscv_uboot()
@@ -118,7 +124,7 @@ install_riscv_uboot()
         uboot_parent_path=$(dirname ${RISCV64_UBOOT_PATH}) || (echo "获取riscv u-boot 版本 ${UBOOT_VERSION} 的父目录失败" && exit 1)
 
         if [ ! -f ${uboot_tar_name} ]; then
-            wget https://mirrors.dragonos.org.cn/pub/third_party/u-boot/${uboot_tar_name} || echo "下载riscv u-boot 版本 ${UBOOT_VERSION} 失败" && exit 1
+            wget https://mirrors.dragonos.org.cn/pub/third_party/u-boot/${uboot_tar_name} || (echo "下载riscv u-boot 版本 ${UBOOT_VERSION} 失败" && exit 1)
         fi
         echo "下载完成"
         echo "正在解压u-boot到 '$uboot_parent_path'..."
@@ -140,7 +146,7 @@ if [ $flag_can_run -eq 1 ]; then
               BIOS_TYPE=uefi
             ;;
               legacy)
-              BIOS_TYPE=lagacy
+              BIOS_TYPE=legacy
               ;;
         esac;shift 2;;
         --display)

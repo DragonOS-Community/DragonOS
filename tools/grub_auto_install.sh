@@ -21,7 +21,7 @@ export OBJCOPY=objcopy
 
 
 #检测grub是否已经安装
-if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] && [ -d ${grub_dir_riscv64_efi}/bin ] ; then
+if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
 	exit 0
 fi
 #仅支持Ubuntu/Debain, Arch下的自动安装
@@ -96,20 +96,21 @@ if [ ! -d ${grub_dir_x86_64_efi}/bin ]; then
 fi
 
 # 如果不存在riscv64_efi的grub，就编译安装
-if [ ! -d ${grub_dir_riscv64_efi}/bin ]; then
-    echo "开始编译安装riscv64_efi版本的grub"
-    # 使用which命令判断，如果不存在riscv64-linux-musl交叉编译工具链，则报错
-    if [ ! -n "$(which riscv64-linux-musl-gcc)" ]; then
-        echo "riscv64-linux-musl-gcc不存在，请先安装riscv64-linux-musl交叉编译工具链"
-        exit 1
-    fi
+# riscv64目前使用DragonStub进行启动，不需要grub
+# if [ ! -d ${grub_dir_riscv64_efi}/bin ]; then
+#     echo "开始编译安装riscv64_efi版本的grub"
+#     # 使用which命令判断，如果不存在riscv64-linux-musl交叉编译工具链，则报错
+#     if [ ! -n "$(which riscv64-linux-musl-gcc)" ]; then
+#         echo "riscv64-linux-musl-gcc不存在，请先安装riscv64-linux-musl交叉编译工具链"
+#         exit 1
+#     fi
     
-    ./configure --target=riscv64 --with-platform=efi --prefix=${grub_dir_riscv64_efi} --host=x86_64-linux-gnu  --disable-werror  BUILD_CC=gcc HOST_CC=x86_64-linux-gnu-gcc  TARGET_CC=riscv64-linux-musl-gcc TARGET_OBJCOPY=riscv64-linux-musl-objcopy TARGET_STRIP=riscv64-linux-musl-strip TARGET_RANLIB=riscv64-linux-musl-ranlib TARGET_NM=riscv64-linux-musl-nm TARGET_LD=riscv64-linux-musl-ld
-    make -j $(nproc) || exit 1
-    sudo make install || exit 1
-    make clean || exit 1
-    sudo chmod -R 777 ${grub_dir_riscv64_efi}
-fi
+#     ./configure --target=riscv64 --with-platform=efi --prefix=${grub_dir_riscv64_efi} --host=x86_64-linux-gnu  --disable-werror  BUILD_CC=gcc HOST_CC=x86_64-linux-gnu-gcc  TARGET_CC=riscv64-linux-musl-gcc TARGET_OBJCOPY=riscv64-linux-musl-objcopy TARGET_STRIP=riscv64-linux-musl-strip TARGET_RANLIB=riscv64-linux-musl-ranlib TARGET_NM=riscv64-linux-musl-nm TARGET_LD=riscv64-linux-musl-ld
+#     make -j $(nproc) || exit 1
+#     sudo make install || exit 1
+#     make clean || exit 1
+#     sudo chmod -R 777 ${grub_dir_riscv64_efi}
+# fi
 
 
 cd ..

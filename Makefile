@@ -150,7 +150,20 @@ fmt:
 log-monitor:
 	@echo "启动日志监控"
 	@sh -c "cd tools/debugging/logmonitor && cargo run --release -- --log-dir $(ROOT_PATH)/logs/ --kernel $(ROOT_PATH)/bin/kernel/kernel.elf" 
-	
+
+.PHONY: update-submodules
+update-submodules:
+	@echo "更新子模块"
+	@git submodule update --init --recursive
+	@git submodule foreach git pull origin master
+
+.PHONY: update-submodules-by-mirror
+update-submodules-by-mirror:
+	@echo "从镜像更新子模块"
+	@git config --global url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf https://github.com/DragonOS-Community/
+	@$(MAKE) update-submodules
+	@git config --global --unset url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf
+
 help:
 	@echo "编译:"
 	@echo "  make all -j <n>       - 本地编译，不运行,n为要用于编译的CPU核心数"
@@ -168,3 +181,14 @@ help:
 	@echo ""
 	@echo ""
 	@echo "注: 对于上述的run, run-uefi, qemu, qemu-uefi命令可以在命令后加上-vnc后缀,来通过vnc连接到DragonOS, 默认会在5900端口运行vnc服务器。如：make run-vnc "
+	@echo ""
+	@echo "其他:"
+	@echo "  make clean            - 清理编译产生的文件"
+	@echo "  make fmt              - 格式化代码"
+	@echo "  make log-monitor      - 启动日志监控"
+	@echo "  make docs             - 生成文档"
+	@echo "  make clean-docs       - 清理文档"
+	@echo ""
+	@echo "  make update-submodules - 更新子模块"
+	@echo "  make update-submodules-by-mirror - 从镜像更新子模块"
+

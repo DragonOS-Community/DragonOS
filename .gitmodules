@@ -1,0 +1,3 @@
+[submodule "kernel/submodules/DragonStub"]
+	path = kernel/submodules/DragonStub
+	url = https://github.com/DragonOS-Community/DragonStub.git

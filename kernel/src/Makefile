@@ -28,7 +28,7 @@ CFLAGS = $(GLOBAL_CFLAGS) -fno-pie $(CFLAGS_UNWIND) -I $(shell pwd) -I $(shell p
 ifeq ($(ARCH), x86_64)
 	CFLAGS +=  -I $(shell pwd)/arch/x86_64/include
 else ifeq ($(ARCH), riscv64)
-	CFLAGS +=  -I $(shell pwd)/arch/riscv64/include
+	CFLAGS +=  -I $(shell pwd)/arch/riscv64/include -I $(shell pwd)/arch/riscv64/
 endif
 
 export ASFLAGS := --64
@@ -70,12 +70,9 @@ __link_riscv64_kernel:
 	@echo "Linking kernel..."
 	$(LD) -b elf64-littleriscv -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/riscv64imac-unknown-none-elf/release/libdragonos_kernel.a -T arch/riscv64/link.ld --no-relax
 	$(OBJCOPY) -I elf64-littleriscv -O elf64-littleriscv -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
-	rm kernel
+	@rm kernel
+	$(MAKE) __dragon_stub PAYLOAD_ELF="$(shell pwd)/../../bin/kernel/kernel.elf"
 
-# 构建uboot的scr文件
-	@echo "Generating kernel scr file..."
-	@mkdir -p $(ROOT_PATH)/bin/sysroot/boot/
-	@mkimage -A riscv -T script -d arch/riscv64/boot/bootscript.cmd $(ROOT_PATH)/bin/sysroot/boot/boot.scr 
 
 
 __link_x86_64_kernel:
@@ -89,8 +86,7 @@ __link_x86_64_kernel:
 		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)"||exit 1;\
 		cd ..;\
 	done
-	
-	
+
 # 重新链接
 	@echo "Re-Linking kernel..."
 	@echo $(shell find . -name "*.o")
@@ -104,6 +100,11 @@ else
 endif
 	rm kernel
 
+__dragon_stub:
+	@echo "Linking dragon_stub..."
+	PAYLOAD_ELF=$(PAYLOAD_ELF) TARGET_SYSROOT=$(ROOT_PATH)/bin/sysroot $(MAKE) -C $(ROOT_PATH)/../DragonStub install -j $(NPROCS)
+
+	
 clean: 
 	@cargo clean
 	rm -rf $(GARBAGE)

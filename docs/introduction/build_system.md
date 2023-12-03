@@ -11,23 +11,32 @@
 
 ### 1.1 下载DragonOS的源代码
 
-&emsp;&emsp;假设您的计算机上已经安装了git，您可以通过以下命令，获得DragonOS的最新的源代码：
+#### 1.1.1 安装git和repo工具
 
 ```shell
-git clone https://github.com/DragonOS-Community/DragonOS
-cd DragonOS
+sudo apt-get install git repo
+
+echo "export REPO_URL='https://mirrors.tuna.tsinghua.edu.cn/git/git-repo'" >> ~/.$(basename $SHELL)rc
+source ~/.$(basename $SHELL)rc
 ```
 
-:::{warning}
-DragonOS的源代码托管在Github上，但是，由于Github在国内的访问速度较慢。可能出现克隆失败的情况，这时只要重试即可。
+#### 1.1.2 克隆DragonOS的代码
 
-当然，我们建议您在github上绑定您的电脑的**ssh公钥**，
-然后通过以下命令来克隆代码，防止频繁出现git clone、pull、push失败的情况。
+使用https克隆：
 
 ```shell
-git clone git@github.com:DragonOS-Community/DragonOS.git
+curl -sSL https://git.mirrors.dragonos.org.cn/DragonOS-Community/manifest/raw/master/scripts/init.sh | bash
 ```
-:::
+
+为了方便后续的开发，我们建议您使用ssh克隆（请先配置好github的SSH Key），以避免由于网络问题导致的克隆失败：
+
+
+使用ssh克隆（请先配置好github的SSH Key）：
+
+```shell
+# 使用ssh克隆
+bash <(curl -sSL https://git.mirrors.dragonos.org.cn/DragonOS-Community/manifest/raw/master/scripts/init.sh) --use-ssh-after-clone
+```
 
 ## 2.使用一键初始化脚本进行安装（推荐）
 
@@ -35,6 +44,7 @@ git clone git@github.com:DragonOS-Community/DragonOS.git
 &emsp;&emsp;我们提供了一键初始化脚本，可以一键安装，只需要在控制台运行以下命令：
 
 ```shell
+cd DragonOS
 cd tools
 bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依赖包是安装在用户环境而非全局环境
 ```

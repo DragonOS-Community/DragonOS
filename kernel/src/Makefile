@@ -102,7 +102,8 @@ endif
 
 __dragon_stub:
 	@echo "Linking dragon_stub..."
-	PAYLOAD_ELF=$(PAYLOAD_ELF) TARGET_SYSROOT=$(ROOT_PATH)/bin/sysroot $(MAKE) -C $(ROOT_PATH)/../DragonStub install -j $(NPROCS)
+	@mkdir -p $(ROOT_PATH)/bin/sysroot
+	PAYLOAD_ELF=$(PAYLOAD_ELF) TARGET_SYSROOT=$(ROOT_PATH)/bin/sysroot $(MAKE) -C $(ROOT_PATH)/kernel/submodules/DragonStub install -j $(NPROCS)
 
 	
 clean: 

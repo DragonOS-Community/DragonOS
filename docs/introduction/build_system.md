@@ -11,21 +11,15 @@
 
 ### 1.1 下载DragonOS的源代码
 
-#### 1.1.1 安装git和repo工具
-
-```shell
-sudo apt-get install git repo
-
-echo "export REPO_URL='https://mirrors.tuna.tsinghua.edu.cn/git/git-repo'" >> ~/.$(basename $SHELL)rc
-source ~/.$(basename $SHELL)rc
-```
-
-#### 1.1.2 克隆DragonOS的代码
+#### 1.1.1 克隆DragonOS的代码
 
 使用https克隆：
 
 ```shell
-curl -sSL https://git.mirrors.dragonos.org.cn/DragonOS-Community/manifest/raw/master/scripts/init.sh | bash
+git clone https://github.com/DragonOS-Community/DragonOS.git
+cd DragonOS
+# 使用镜像源更新子模块
+make update-submodules-by-mirror
 ```
 
 为了方便后续的开发，我们建议您使用ssh克隆（请先配置好github的SSH Key），以避免由于网络问题导致的克隆失败：
@@ -35,7 +29,10 @@ curl -sSL https://git.mirrors.dragonos.org.cn/DragonOS-Community/manifest/raw/ma
 
 ```shell
 # 使用ssh克隆
-bash <(curl -sSL https://git.mirrors.dragonos.org.cn/DragonOS-Community/manifest/raw/master/scripts/init.sh) --use-ssh-after-clone
+git clone git@github.com:DragonOS-Community/DragonOS.git
+cd DragonOS
+# 使用镜像源更新子模块
+make update-submodules-by-mirror
 ```
 
 ## 2.使用一键初始化脚本进行安装（推荐）

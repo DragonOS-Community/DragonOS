@@ -1114,7 +1114,8 @@ impl Syscall {
             }
 
             SYS_MADVISE => {
-                kwarn!("SYS_MADVISE has not yet been implemented");
+                // 这个太吵了，总是打印，先注释掉
+                // kwarn!("SYS_MADVISE has not yet been implemented");
                 Ok(0)
             }
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),

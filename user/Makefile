@@ -14,7 +14,7 @@ current_CFLAGS := $(CFLAGS)
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.1.5
+MIN_DADK_VERSION = 0.1.6
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 
 # 旧版的libc安装路径
@@ -32,7 +32,7 @@ ifeq ("$(DADK_VERSION)", "")
 	@echo "\nYou can install dadk by running the following command:"
 	@echo "\n\tcargo install dadk"
 	@echo "\nOr you can install dadk from source by running the following command:"
-	@echo "\n\tcargo install --git https://github.com/DragonOS-Community/DADK.git"
+	@echo "\n\tcargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION)"
 	@echo "\n"
 	@echo "Auto installing dadk..."
 	CC=gcc AS=as AR=ar LD=ld OBJCOPY=objcopy NM=nm cargo install dadk
@@ -43,7 +43,7 @@ else
 ifneq ($(shell printf '%s\n%s' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V | head -n1), $(MIN_DADK_VERSION))
 	@echo "dadk version is too low, please update to $(MIN_DADK_VERSION) or higher version"
 	@echo "Updating dadk..."
-	CC=gcc AS=as AR=ar LD=ld OBJCOPY=objcopy NM=nm cargo install dadk || (echo "dadk update failed" && exit 1)
+	CC=gcc AS=as AR=ar LD=ld OBJCOPY=objcopy NM=nm cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) || (echo "dadk update failed" && exit 1)
 	@echo "dadk updated"
 endif
 endif

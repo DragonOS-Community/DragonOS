@@ -1,9 +1,9 @@
-use core::{arch::x86_64::_rdtsc, hint::spin_loop};
+use core::hint::spin_loop;
 
 use alloc::{boxed::Box, sync::Arc};
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::{sched::sched, CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
     include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
     process::ProcessManager,
@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
-    TimeSpec,
+    TimeArch, TimeSpec,
 };
 
 /// @brief 休眠指定时间（单位：纳秒）
@@ -29,9 +29,11 @@ pub fn nanosleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
     // 对于小于500us的时间，使用spin/rdtsc来进行定时
 
     if sleep_time.tv_nsec < 500000 {
-        let expired_tsc: u64 =
-            unsafe { _rdtsc() + (sleep_time.tv_nsec as u64 * Cpu_tsc_freq) / 1000000000 };
-        while unsafe { _rdtsc() } < expired_tsc {
+        let expired_tsc: u64 = unsafe {
+            CurrentTimeArch::get_cycles() as u64
+                + (sleep_time.tv_nsec as u64 * Cpu_tsc_freq) / 1000000000
+        };
+        while (CurrentTimeArch::get_cycles() as u64) < expired_tsc {
             spin_loop()
         }
         return Ok(TimeSpec {

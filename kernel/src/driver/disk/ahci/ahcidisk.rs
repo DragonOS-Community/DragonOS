@@ -12,12 +12,11 @@ use crate::driver::disk::ahci::HBA_PxIS_TFES;
 
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
-use crate::include::bindings::bindings::verify_area;
 
 use crate::kdebug;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
-use crate::mm::phys_2_virt;
+use crate::mm::{phys_2_virt, verify_area, VirtAddr};
 use crate::syscall::SystemError;
 use crate::{
     driver::disk::ahci::hba::{
@@ -108,11 +107,8 @@ impl AhciDisk {
 
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
-        let user_buf = if unsafe { verify_area(buf_ptr as u64, buf.len() as u64) } {
-            true
-        } else {
-            false
-        };
+
+        let user_buf = verify_area(VirtAddr::new(buf_ptr as usize), buf.len()).is_ok();
         let mut kbuf = if user_buf {
             let mut x: Vec<u8> = Vec::new();
             x.resize(buf.len(), 0);
@@ -267,11 +263,7 @@ impl AhciDisk {
 
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
-        let user_buf = if unsafe { verify_area(buf_ptr as u64, buf.len() as u64) } {
-            true
-        } else {
-            false
-        };
+        let user_buf = verify_area(VirtAddr::new(buf_ptr as usize), buf.len()).is_ok();
         let mut kbuf = if user_buf {
             let mut x: Vec<u8> = Vec::with_capacity(buf.len());
             x.resize(buf.len(), 0);

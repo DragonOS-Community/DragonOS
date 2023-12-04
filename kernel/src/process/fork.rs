@@ -154,7 +154,9 @@ impl ProcessManager {
         clone_flags: CloneFlags,
     ) -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        let new_kstack = KernelStack::new()?;
+
+        let new_kstack: KernelStack = KernelStack::new()?;
+
         let name = current_pcb.basic().name().to_string();
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
@@ -212,6 +214,7 @@ impl ProcessManager {
     /// ## Panic
     ///
     /// - 如果当前进程没有用户地址空间，则panic
+    #[inline(never)]
     fn copy_mm(
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
@@ -289,6 +292,7 @@ impl ProcessManager {
     ///
     /// ## return
     /// - 发生错误时返回Err(SystemError)
+    #[inline(never)]
     pub fn copy_process(
         current_pcb: &Arc<ProcessControlBlock>,
         pcb: &Arc<ProcessControlBlock>,

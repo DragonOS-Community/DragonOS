@@ -50,6 +50,7 @@ impl CFilesArch for X86_64CFilesArch {
 
     fn setup_global_flags(&self, c: &mut Build) {
         c.asm_flag("-m64");
+        c.flag("-mcmodel=large").flag("-m64");
     }
 }
 

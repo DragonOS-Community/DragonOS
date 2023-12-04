@@ -1,5 +1,9 @@
+#pragma once
+
+#if ARCH(I386) || ARCH(X86_64)
 #pragma GCC push_options
 #pragma GCC optimize("O1")
+
 
 #include <common/errno.h>
 #include <common/spinlock.h>
@@ -171,3 +175,5 @@ void ida_remove(struct ida *ida_p, int id);
 void ida_destroy(struct ida *ida_p);
 
 #pragma GCC pop_options
+
+#endif

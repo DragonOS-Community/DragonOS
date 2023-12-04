@@ -1,4 +1,8 @@
 
+#include <arch/arch.h>
+
+#if ARCH(I386) || ARCH(X86_64)
+
 #pragma GCC push_options
 #pragma GCC optimize("O1")
 #include "ktest.h"
@@ -591,3 +595,5 @@ int ktest_test_idr(void *arg)
 }
 
 #pragma GCC pop_options
+
+#endif

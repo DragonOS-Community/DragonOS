@@ -10,3 +10,11 @@
 #ifdef __x86_64__
 #    define AK_ARCH_X86_64 1
 #endif
+
+#ifdef __riscv
+#    define AK_ARCH_riscv 1
+#endif
+
+#ifdef __riscv64
+#    define AK_ARCH_riscv64 1
+#endif

@@ -117,9 +117,7 @@ impl ProcessManager {
         Self::init_idle();
         kdebug!("process idle init done.");
 
-        unsafe {
-            __PROCESS_MANAGEMENT_INIT_DONE = true;
-        }
+        unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         kinfo!("Process Manager initialized.");
     }
 
@@ -424,7 +422,12 @@ impl ProcessManager {
 }
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
+#[cfg(target_arch = "x86_64")]
 pub unsafe extern "sysv64" fn switch_finish_hook() {
+    ProcessManager::switch_finish_hook();
+}
+#[cfg(target_arch = "riscv64")]
+pub unsafe extern "C" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 
@@ -592,11 +595,9 @@ impl ProcessControlBlock {
         let (pid, ppid, cwd) = if is_idle {
             (Pid(0), Pid(0), "/".to_string())
         } else {
-            (
-                Self::generate_pid(),
-                ProcessManager::current_pcb().pid(),
-                ProcessManager::current_pcb().basic().cwd(),
-            )
+            let ppid = ProcessManager::current_pcb().pid();
+            let cwd = ProcessManager::current_pcb().basic().cwd();
+            (Self::generate_pid(), ppid, cwd)
         };
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
@@ -632,6 +633,7 @@ impl ProcessControlBlock {
         };
 
         // 初始化系统调用栈
+        #[cfg(target_arch = "x86_64")]
         pcb.arch_info
             .lock()
             .init_syscall_stack(&pcb.syscall_stack.read());
@@ -1227,14 +1229,14 @@ impl KernelStack {
     #[allow(dead_code)]
     pub unsafe fn pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         // 从内核栈的最低地址处取出pcb的地址
-        let p = self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock;
-        if unlikely(p.is_null()) {
+        let p = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
+        if unlikely(unsafe { (*p).is_null() }) {
             return None;
         }
 
         // 为了防止内核栈的pcb指针被释放，这里需要将其包装一下，使得Arc的drop不会被调用
         let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
-            ManuallyDrop::new(Weak::from_raw(p));
+            ManuallyDrop::new(Weak::from_raw(*p));
 
         let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade()?;
         return Some(new_arc);
@@ -1244,10 +1246,11 @@ impl KernelStack {
 impl Drop for KernelStack {
     fn drop(&mut self) {
         if !self.stack.is_none() {
-            let pcb_ptr: Weak<ProcessControlBlock> = unsafe {
-                Weak::from_raw(self.stack.as_ref().unwrap().as_ptr() as *const ProcessControlBlock)
-            };
-            drop(pcb_ptr);
+            let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
+            if unsafe { !(*ptr).is_null() } {
+                let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };
+                drop(pcb_ptr);
+            }
         }
         // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
         if !self.can_be_freed {

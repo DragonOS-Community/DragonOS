@@ -150,6 +150,7 @@ extern char _bss;
 extern char _ebss;
 extern char _end;
 
+#if ARCH(I386) || ARCH(X86_64)
 /**
  * @brief 读取CR3寄存器的值（存储了页目录的基地址）
  *
@@ -162,6 +163,8 @@ unsigned long *get_CR3()
                          : "=r"(tmp)::"memory");
     return tmp;
 }
+
+#endif
 
 /*
  *  vm_area_struct中的vm_flags的可选值

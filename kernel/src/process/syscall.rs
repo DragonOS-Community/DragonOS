@@ -19,8 +19,7 @@ use crate::{
         procfs::procfs_register_pid,
         vfs::{file::FileDescriptorVec, MAX_PATHLEN},
     },
-    include::bindings::bindings::verify_area,
-    mm::{ucontext::UserStack, MemoryManagementArch, VirtAddr},
+    mm::{ucontext::UserStack, verify_area, MemoryManagementArch, VirtAddr},
     process::ProcessControlBlock,
     sched::completion::Completion,
     syscall::{
@@ -231,9 +230,8 @@ impl Syscall {
 
     /// 设置线程地址
     pub fn set_tid_address(ptr: usize) -> Result<usize, SystemError> {
-        if !unsafe { verify_area(ptr as u64, core::mem::size_of::<i32>() as u64) } {
-            return Err(SystemError::EFAULT);
-        }
+        verify_area(VirtAddr::new(ptr), core::mem::size_of::<i32>())
+            .map_err(|_| SystemError::EFAULT)?;
 
         let pcb = ProcessManager::current_pcb();
         pcb.thread.write().clear_child_tid = Some(VirtAddr::new(ptr));

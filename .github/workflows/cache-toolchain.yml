@@ -59,7 +59,7 @@ jobs:
             rustup component add rustfmt --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
             cargo install dadk --version 0.1.6
           
-          # Create custom Rust toolchain
+
             fork_toolchain_from="nightly-2023-08-15-x86_64-unknown-linux-gnu"
             custom_toolchain="nightly-2023-08-15-x86_64-unknown-linux_dragonos-gnu"
             custom_toolchain_dir="$(dirname $(rustc --print sysroot))/${custom_toolchain}"

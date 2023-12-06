@@ -170,11 +170,14 @@ impl VideoRefreshManager {
         return self.device_buffer.read();
     }
 
-    /**
-     * @brief 初始化显示驱动
-     *
-     * @return int
-     */
+    /// 在riscv64平台下暂时不支持
+    #[cfg(target_arch = "riscv64")]
+    pub unsafe fn video_init() -> Result<(), SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// 此函数用于初始化显示驱动，为后续的图形输出做好准备。
+    #[cfg(not(target_arch = "riscv64"))]
     pub unsafe fn video_init() -> Result<(), SystemError> {
         static INIT: AtomicBool = AtomicBool::new(false);
 

@@ -10,6 +10,19 @@ use super::interrupt::TrapFrame;
 pub mod kthread;
 pub mod syscall;
 
+#[allow(dead_code)]
+#[repr(align(32768))]
+union InitProcUnion {
+    /// 用于存放idle进程的内核栈
+    idle_stack: [u8; 32768],
+}
+
+#[link_section = ".data.init_proc_union"]
+#[no_mangle]
+static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
+    idle_stack: [0; 32768],
+};
+
 pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {
     unimplemented!("RiscV64 arch_switch_to_user")
 }

@@ -124,7 +124,9 @@ impl FutexHashBucket {
 
     /// 将FutexObj从bucket中删除
     pub fn remove(&mut self, futex: Arc<FutexObj>) {
-        self.chain.drain_filter(|x| Arc::ptr_eq(x, &futex));
+        self.chain
+            .extract_if(|x| Arc::ptr_eq(x, &futex))
+            .for_each(drop);
     }
 }
 
@@ -174,7 +176,7 @@ pub struct PrivateKey {
 }
 
 impl Hash for PrivateKey {
-    fn hash<H: ~const Hasher>(&self, state: &mut H) {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         self.address.hash(state);
     }
 }
@@ -284,7 +286,6 @@ impl Futex {
             kwarn!("error:{e:?}");
             e
         })?;
-        drop(bucket_mut);
         drop(futex_map_guard);
         drop(irq_guard);
         sched();
@@ -368,7 +369,6 @@ impl Futex {
         // 从队列中唤醒
         let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
 
-        drop(bucket_mut);
         drop(binding);
 
         FutexData::try_remove(&key);
@@ -427,7 +427,6 @@ impl Futex {
             // 唤醒nr_wake个进程
             let bucket_1_mut = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
             let ret = bucket_1_mut.wake_up(key1.clone(), None, nr_wake as u32)?;
-            drop(bucket_1_mut);
             // 将bucket1中最多nr_requeue个任务转移到bucket2
             for _ in 0..nr_requeue {
                 let bucket_1_mut = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
@@ -615,7 +614,7 @@ impl Futex {
 
         let atomic_addr = AtomicU64::new(uaddr.data() as u64);
         // 这个指针是指向指针的指针
-        let ptr = atomic_addr.as_mut_ptr();
+        let ptr = atomic_addr.as_ptr();
         match op {
             FutexOP::FUTEX_OP_SET => unsafe {
                 *((*ptr) as *mut u32) = oparg;

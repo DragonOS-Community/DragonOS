@@ -22,7 +22,9 @@ export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 else ifeq ($(ARCH), riscv64)
 
 export CC=riscv64-unknown-elf-gcc
-export LD=riscv64-unknown-elf-ld
+# binutils版本需要>=2.38
+# 而ubuntu的unknown-elf的版本比较旧，所以使用了riscv64-linux-gnu-ld
+export LD=riscv64-linux-gnu-ld
 export AS=riscv64-unknown-elf-as
 export NM=riscv64-unknown-elf-nm
 export AR=riscv64-unknown-elf-ar

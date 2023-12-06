@@ -60,6 +60,13 @@ unsafe extern "C" fn rs_current_pcb_thread_rbp() -> u64 {
 }
 
 #[no_mangle]
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" fn rs_current_pcb_thread_rbp() -> u64 {
+    // 不应该实现这个函数
+    unimplemented!("rs_current_pcb_thread_rbp")
+}
+
+#[no_mangle]
 unsafe extern "C" fn rs_preempt_disable() {
     return ProcessManager::preempt_disable();
 }

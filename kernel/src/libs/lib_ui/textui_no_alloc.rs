@@ -21,12 +21,14 @@ pub static NO_ALLOC_OPERATIONS_LINE: AtomicI32 = AtomicI32::new(0);
 pub static NO_ALLOC_OPERATIONS_INDEX: AtomicI32 = AtomicI32::new(0);
 
 /// 当系统刚启动的时候，由于内存管理未初始化，而texiui需要动态内存分配。因此只能暂时暴力往屏幕（video_frame_buffer_info）输出信息
-pub fn textui_init_no_alloc() {
-    let height = video_refresh_manager().device_buffer().height();
-    let width = video_refresh_manager().device_buffer().width();
-    TRUE_LINE_NUM.store((height / TEXTUI_CHAR_HEIGHT) as i32, Ordering::SeqCst);
+pub fn textui_init_no_alloc(video_enabled: bool) {
+    if video_enabled {
+        let height = video_refresh_manager().device_buffer().height();
+        let width = video_refresh_manager().device_buffer().width();
+        TRUE_LINE_NUM.store((height / TEXTUI_CHAR_HEIGHT) as i32, Ordering::SeqCst);
 
-    CHAR_PER_LINE.store((width / TEXTUI_CHAR_WIDTH) as i32, Ordering::SeqCst);
+        CHAR_PER_LINE.store((width / TEXTUI_CHAR_WIDTH) as i32, Ordering::SeqCst);
+    }
 }
 
 pub fn no_init_textui_putchar_window(

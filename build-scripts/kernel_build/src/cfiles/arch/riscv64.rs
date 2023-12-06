@@ -17,7 +17,7 @@ impl CFilesArch for RiscV64CFilesArch {
     }
 
     fn setup_files(&self, _c: &mut cc::Build, files: &mut Vec<std::path::PathBuf>) {
-        files.push(PathBuf::from("src/arch/riscv64/boot/head.S"));
+        files.push(PathBuf::from("src/arch/riscv64/asm/head.S"));
         files.append(&mut FileUtils::list_all_files(
             &arch_path("asm"),
             Some("c"),

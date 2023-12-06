@@ -26,7 +26,7 @@ impl CFilesBuilder {
         c.flag("-fno-builtin")
             .flag("-nostdlib")
             .flag("-fno-stack-protector")
-            .flag("-fno-pie")
+            .flag("-static-pie")
             .flag("-Wno-expansion-to-defined")
             .flag("-Wno-unused-parameter")
             .flag("-O1");

@@ -10,8 +10,8 @@ ENTRY(_start)
 
 SECTIONS
 {
-	KERNEL_VMA = 0xffffffc000000000;
-	//KERNEL_VMA = 0;
+	//KERNEL_VMA = 0xffffffc000000000;
+	KERNEL_VMA = 0;
 	. = 0x1000000;
 	
 	.boot.text :
@@ -44,7 +44,8 @@ SECTIONS
 		_data = .;
 		*(.data)
 		*(.data.*)
-		
+		*(.got.plt)
+   		*(.got)
 		_edata = .;
 	}
 

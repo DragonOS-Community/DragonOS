@@ -305,7 +305,6 @@ impl Socket for RawSocket {
                     }
                 }
             }
-            drop(socket);
             drop(socket_set_guard);
             SOCKET_WAITQUEUE.sleep();
         }
@@ -370,8 +369,6 @@ impl Socket for RawSocket {
 
                     // 发送数据包
                     socket.send_slice(&buffer).unwrap();
-
-                    drop(socket);
 
                     iface.poll(&mut socket_set_guard).ok();
 
@@ -489,7 +486,6 @@ impl Socket for UdpSocket {
 
             if socket.can_recv() {
                 if let Ok((size, remote_endpoint)) = socket.recv_slice(buf) {
-                    drop(socket);
                     drop(socket_set_guard);
                     poll_ifaces();
                     return (Ok(size), Endpoint::Ip(Some(remote_endpoint)));
@@ -498,7 +494,6 @@ impl Socket for UdpSocket {
                 // 如果socket没有连接，则忙等
                 // return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
-            drop(socket);
             drop(socket_set_guard);
             SOCKET_WAITQUEUE.sleep();
         }
@@ -545,7 +540,6 @@ impl Socket for UdpSocket {
             match socket.send_slice(&buf, *remote_endpoint) {
                 Ok(()) => {
                     // kdebug!("udp write: send ok");
-                    drop(socket);
                     drop(socket_set_guard);
                     poll_ifaces();
                     return Ok(buf.len());
@@ -731,7 +725,6 @@ impl Socket for TcpSocket {
                             return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
                         };
 
-                        drop(socket);
                         drop(socket_set_guard);
                         poll_ifaces();
                         return (Ok(size), Endpoint::Ip(Some(endpoint)));
@@ -751,7 +744,6 @@ impl Socket for TcpSocket {
             } else {
                 return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
-            drop(socket);
             drop(socket_set_guard);
             SOCKET_WAITQUEUE.sleep();
         }
@@ -765,7 +757,6 @@ impl Socket for TcpSocket {
             if socket.can_send() {
                 match socket.send_slice(buf) {
                     Ok(size) => {
-                        drop(socket);
                         drop(socket_set_guard);
                         poll_ifaces();
                         return Ok(size);
@@ -825,7 +816,6 @@ impl Socket for TcpSocket {
                     // avoid deadlock
                     drop(inner_iface);
                     drop(iface);
-                    drop(socket);
                     drop(sockets);
                     loop {
                         poll_ifaces();
@@ -837,7 +827,6 @@ impl Socket for TcpSocket {
                                 return Ok(());
                             }
                             tcp::State::SynSent => {
-                                drop(socket);
                                 drop(sockets);
                                 SOCKET_WAITQUEUE.sleep();
                             }
@@ -916,7 +905,6 @@ impl Socket for TcpSocket {
             if socket.is_active() {
                 // kdebug!("tcp accept: socket.is_active()");
                 let remote_ep = socket.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
-                drop(socket);
 
                 let new_socket = {
                     // Initialize the TCP socket's buffers.
@@ -965,7 +953,6 @@ impl Socket for TcpSocket {
 
                 return Ok((new_socket, Endpoint::Ip(Some(remote_ep))));
             }
-            drop(socket);
             drop(sockets);
             SOCKET_WAITQUEUE.sleep();
         }

@@ -83,7 +83,7 @@ impl Timer {
     /// @brief 将定时器插入到定时器链表中
     pub fn activate(&self) {
         let inner_guard = self.0.lock();
-        let timer_list = &mut TIMER_LIST.lock();
+        let mut timer_list = TIMER_LIST.lock();
 
         // 链表为空，则直接插入
         if timer_list.is_empty() {
@@ -133,7 +133,8 @@ impl Timer {
     pub fn cancel(&self) -> bool {
         TIMER_LIST
             .lock()
-            .extract_if(|x| Arc::<Timer>::as_ptr(&x) == self as *const Timer);
+            .extract_if(|x| Arc::<Timer>::as_ptr(&x) == self as *const Timer)
+            .for_each(|p| drop(p));
         true
     }
 }

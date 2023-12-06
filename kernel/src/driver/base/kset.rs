@@ -123,7 +123,7 @@ impl KSet {
     #[allow(dead_code)]
     pub fn cleanup_weak(&self) {
         let mut kobjects = self.kobjects.write();
-        kobjects.extract_if(|x| x.upgrade().is_none());
+        kobjects.retain(|x| x.upgrade().is_some());
     }
 
     pub fn as_kobject(&self) -> Arc<dyn KObject> {

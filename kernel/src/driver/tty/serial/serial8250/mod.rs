@@ -478,7 +478,7 @@ impl Driver for Serial8250ISADriver {
     fn delete_device(&self, device: &Arc<dyn Device>) {
         let mut inner = self.inner.write();
 
-        inner.devices.extract_if(|d| Arc::ptr_eq(d, device));
+        inner.devices.retain(|d| !Arc::ptr_eq(d, device));
     }
 
     fn bus(&self) -> Option<Arc<dyn Bus>> {

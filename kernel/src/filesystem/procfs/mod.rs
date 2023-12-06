@@ -115,7 +115,8 @@ impl ProcFSInode {
     /// @brief 去除Vec中所有的\0,并在结尾添加\0
     #[inline]
     fn trim_string(&self, data: &mut Vec<u8>) {
-        data.extract_if(|x: &mut u8| *x == 0);
+        data.retain(|x| *x != 0);
+
         data.push(0);
     }
     // todo:其他数据获取函数实现
@@ -420,15 +421,9 @@ impl IndexNode for LockedProcFSInode {
         if let FileType::Dir = guard.metadata.file_type {
             return Ok(());
         }
-        // 获取数据信息
-        let private_data = match data {
-            FilePrivateData::Procfs(p) => p,
-            _ => {
-                panic!("ProcFS: FilePrivateData mismatch!");
-            }
-        };
-        // 释放资源
-        drop(private_data);
+        // 释放data
+        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
+
         return Ok(());
     }
 

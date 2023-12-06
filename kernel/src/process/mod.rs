@@ -915,7 +915,7 @@ impl Drop for ProcessControlBlock {
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
 
         if let Some(ppcb) = self.parent_pcb.read().upgrade() {
-            ppcb.children.write().extract_if(|pid| *pid == self.pid());
+            ppcb.children.write().retain(|pid| *pid != self.pid());
         }
     }
 }

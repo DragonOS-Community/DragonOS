@@ -659,8 +659,6 @@ impl BinaryLoader for ElfLoader {
                 return Err(ExecError::InvalidParemeter);
             }
 
-            drop(p_vaddr);
-
             // end vaddr of this segment(code+data+bss)
             let seg_end_vaddr_f = self.elf_page_align_up(VirtAddr::new(
                 (seg_to_load.p_vaddr + seg_to_load.p_filesz) as usize,
@@ -682,8 +680,6 @@ impl BinaryLoader for ElfLoader {
             {
                 end_data = Some(seg_end_vaddr_f);
             }
-
-            drop(seg_end_vaddr_f);
 
             let seg_end_vaddr = VirtAddr::new((seg_to_load.p_vaddr + seg_to_load.p_memsz) as usize);
 

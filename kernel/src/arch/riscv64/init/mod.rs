@@ -1,13 +1,14 @@
 use core::intrinsics::unreachable;
 
-use crate::{init::init_before_mem_init, kdebug};
+use crate::{
+    driver::tty::serial::serial8250::send_to_default_serial8250_port, init::init_before_mem_init,
+    kdebug,
+};
 
 #[no_mangle]
 unsafe extern "C" fn kernel_main(hartid: usize, fdt_addr: usize) -> ! {
-    crate::arch::driver::sbi::legacy::console_putchar(b'K' as u8);
     init_before_mem_init();
-    crate::arch::driver::sbi::legacy::console_putchar(b'A' as u8);
-    kdebug!("Hello, world!");
+    send_to_default_serial8250_port(&b"Hello, world! RISC-V!\n"[..]);
     loop {}
     unreachable()
 }

@@ -2,7 +2,7 @@
 ifeq ($(ARCH), )
 # ！！！！在这里设置ARCH，可选x86_64和riscv64
 # !!!!!!!如果不同时调整这里以及vscode的settings.json，那么自动补全和检查将会失效
-export ARCH?=x86_64
+export ARCH?=riscv64
 endif
 
 ifeq ($(EMULATOR), )
@@ -22,7 +22,9 @@ export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 else ifeq ($(ARCH), riscv64)
 
 export CC=riscv64-unknown-elf-gcc
-export LD=riscv64-unknown-elf-ld
+# binutils版本需要>=2.38
+# 而ubuntu的unknown-elf的版本比较旧，所以使用了riscv64-linux-gnu-ld
+export LD=riscv64-linux-gnu-ld
 export AS=riscv64-unknown-elf-as
 export NM=riscv64-unknown-elf-nm
 export AR=riscv64-unknown-elf-ar

@@ -76,7 +76,11 @@ clean-docs:
 	bash -c "cd docs && make clean && cd .."
 
 gdb:
+ifeq ($(ARCH), x86_64)
 	rust-gdb -n -x tools/.gdbinit
+else
+	gdb-multiarch -n -x tools/.gdbinit
+endif
 
 # 写入磁盘镜像
 write_diskimage:

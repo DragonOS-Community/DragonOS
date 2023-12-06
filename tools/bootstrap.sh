@@ -47,7 +47,7 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
-		sphinx gcc-riscv64-unknown-elf
+		sphinx gcc-riscv64-unknown-elf gdb-multiarch
 	
 	# 如果python3没有安装
 	if [ -z "$(which python3)" ]; then

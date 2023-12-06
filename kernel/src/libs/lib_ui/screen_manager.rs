@@ -10,12 +10,15 @@ use crate::{
     driver::{
         tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
     },
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{lib_ui::textui::textui_is_enable_put_to_window, rwlock::RwLock, spinlock::SpinLock},
     mm::VirtAddr,
     syscall::SystemError,
 };
 
-use super::textui_no_alloc::textui_init_no_alloc;
+use super::{
+    textui::{textui_disable_put_to_window, textui_enable_put_to_window},
+    textui_no_alloc::textui_init_no_alloc,
+};
 
 /// 全局的UI框架列表
 pub static SCM_FRAMEWORK_LIST: SpinLock<LinkedList<Arc<dyn ScmUiFramework>>> =
@@ -274,10 +277,14 @@ pub trait ScmUiFramework: Sync + Send + Debug {
 /// ## 调用时机
 ///
 /// 该函数在内核启动的早期进行调用。调用时，内存管理模块尚未初始化。
-pub fn scm_init() {
+pub fn scm_init(enable_put_to_window: bool) {
     SCM_DOUBLE_BUFFER_ENABLED.store(false, Ordering::SeqCst); // 禁用双缓冲
-
-    textui_init_no_alloc();
+    if enable_put_to_window {
+        textui_enable_put_to_window();
+    } else {
+        textui_disable_put_to_window();
+    }
+    textui_init_no_alloc(enable_put_to_window);
 
     send_to_default_serial8250_port("\nfinish_scm_init\n\0".as_bytes());
 }
@@ -370,7 +377,7 @@ pub fn scm_enable_double_buffer() -> Result<i32, SystemError> {
 pub fn scm_enable_put_to_window() {
     // mm之前要继续往窗口打印信息时，因为没有动态内存分配(textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
-        super::textui::ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
+        textui_enable_put_to_window();
     } else {
         let r = CURRENT_FRAMEWORK
             .write()
@@ -387,8 +394,8 @@ pub fn scm_enable_put_to_window() {
 pub fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
-        super::textui::ENABLE_PUT_TO_WINDOW.store(false, Ordering::SeqCst);
-        assert!(super::textui::ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst) == false);
+        textui_disable_put_to_window();
+        assert!(textui_is_enable_put_to_window() == false);
     } else {
         let r = CURRENT_FRAMEWORK
             .write()

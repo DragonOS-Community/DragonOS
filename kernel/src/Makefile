@@ -40,11 +40,8 @@ kernel_subdirs := common driver debug exception smp syscall ktest libs time
 
 
 kernel_rust:
-ifeq ($(ARCH), riscv64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2023-01-21 $(CARGO_ZBUILD) build --release --target riscv64imac-unknown-none-elf
-else
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2023-01-21 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
-endif
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2023-08-15 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
+
 
 all: kernel
 

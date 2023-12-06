@@ -115,7 +115,7 @@ impl ProcFSInode {
     /// @brief 去除Vec中所有的\0,并在结尾添加\0
     #[inline]
     fn trim_string(&self, data: &mut Vec<u8>) {
-        data.drain_filter(|x: &mut u8| *x == 0);
+        data.extract_if(|x: &mut u8| *x == 0);
         data.push(0);
     }
     // todo:其他数据获取函数实现

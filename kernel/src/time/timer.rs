@@ -133,7 +133,7 @@ impl Timer {
     pub fn cancel(&self) -> bool {
         TIMER_LIST
             .lock()
-            .drain_filter(|x| Arc::<Timer>::as_ptr(&x) == self as *const Timer);
+            .extract_if(|x| Arc::<Timer>::as_ptr(&x) == self as *const Timer);
         true
     }
 }

@@ -30,7 +30,7 @@ pub struct KSet {
 }
 
 impl Hash for KSet {
-    fn hash<H: ~const core::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.self_ref.as_ptr().hash(state);
         self.inner.read().name.hash(state);
     }
@@ -123,7 +123,7 @@ impl KSet {
     #[allow(dead_code)]
     pub fn cleanup_weak(&self) {
         let mut kobjects = self.kobjects.write();
-        kobjects.drain_filter(|x| x.upgrade().is_none());
+        kobjects.extract_if(|x| x.upgrade().is_none());
     }
 
     pub fn as_kobject(&self) -> Arc<dyn KObject> {

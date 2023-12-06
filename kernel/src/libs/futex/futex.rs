@@ -124,7 +124,7 @@ impl FutexHashBucket {
 
     /// 将FutexObj从bucket中删除
     pub fn remove(&mut self, futex: Arc<FutexObj>) {
-        self.chain.drain_filter(|x| Arc::ptr_eq(x, &futex));
+        self.chain.extract_if(|x| Arc::ptr_eq(x, &futex));
     }
 }
 
@@ -174,7 +174,7 @@ pub struct PrivateKey {
 }
 
 impl Hash for PrivateKey {
-    fn hash<H: ~const Hasher>(&self, state: &mut H) {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         self.address.hash(state);
     }
 }
@@ -615,7 +615,7 @@ impl Futex {
 
         let atomic_addr = AtomicU64::new(uaddr.data() as u64);
         // 这个指针是指向指针的指针
-        let ptr = atomic_addr.as_mut_ptr();
+        let ptr = atomic_addr.as_ptr();
         match op {
             FutexOP::FUTEX_OP_SET => unsafe {
                 *((*ptr) as *mut u32) = oparg;

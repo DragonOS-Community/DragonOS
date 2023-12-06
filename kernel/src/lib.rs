@@ -9,7 +9,7 @@
 #![feature(core_intrinsics)]
 #![feature(cstr_from_bytes_until_nul)]
 #![feature(c_void_variant)]
-#![feature(drain_filter)]
+#![feature(extract_if)]
 #![feature(inline_const)]
 #![feature(is_some_and)]
 #![feature(naked_functions)]
@@ -22,7 +22,6 @@
 #![feature(ptr_to_from_bits)]
 #![feature(concat_idents)]
 #![cfg_attr(target_os = "none", no_std)]
-#![feature(atomic_mut_ptr)]
 
 #[cfg(test)]
 #[macro_use]

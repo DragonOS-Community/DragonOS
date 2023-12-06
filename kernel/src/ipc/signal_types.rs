@@ -429,7 +429,7 @@ impl SigPending {
             }
             return false;
         };
-        let filter_result: Vec<SigInfo> = self.queue.q.drain_filter(filter).collect();
+        let filter_result: Vec<SigInfo> = self.queue.q.extract_if(filter).collect();
         // 回收这些siginfo
         for x in filter_result {
             drop(x)
@@ -496,7 +496,7 @@ impl SigQueue {
             return false;
         };
         // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<SigInfo> = self.q.drain_filter(filter).collect();
+        let mut filter_result: Vec<SigInfo> = self.q.extract_if(filter).collect();
         // 筛选出的结果不能大于1个
         assert!(filter_result.len() <= 1);
 

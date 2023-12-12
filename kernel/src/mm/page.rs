@@ -602,14 +602,6 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     // 清空这个页帧
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
 
-                    // 设置页表项的flags
-                    // let flags = Arch::ENTRY_FLAG_READWRITE
-                    //     | Arch::ENTRY_FLAG_DEFAULT_TABLE
-                    //     | if virt.kind() == PageTableKind::User {
-                    //         Arch::ENTRY_FLAG_USER
-                    //     } else {
-                    //         0
-                    //     };
                     let flags: PageFlags<MMArch> =
                         PageFlags::new_page_table(virt.kind() == PageTableKind::User);
 

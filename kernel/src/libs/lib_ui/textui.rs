@@ -17,7 +17,7 @@ use core::{
     intrinsics::unlikely,
     ops::{Add, AddAssign, Sub},
     panic,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 
 use super::{
@@ -390,6 +390,7 @@ impl TextuiCharChromatic {
     /// ## 参数
     /// -line_id 要放入的真实行号
     /// -index 要放入的真实列号
+    #[inline(never)]
     pub fn textui_refresh_character(
         &self,
         lineid: LineId,
@@ -406,7 +407,7 @@ impl TextuiCharChromatic {
         let mut _binding = textui_framework().metadata.read().buf_info();
 
         let mut buf = TextuiBuf::new(&mut _binding);
-
+        
         // 在缓冲区画出一个字体，每个字体有TEXTUI_CHAR_HEIGHT行，TEXTUI_CHAR_WIDTH列个像素点
         for i in 0..TEXTUI_CHAR_HEIGHT {
             let start = count;
@@ -422,6 +423,7 @@ impl TextuiCharChromatic {
             }
             count = TextuiBuf::get_index_of_next_line(start);
         }
+        // send_to_default_serial8250_port(b"ddd");
 
         return Ok(0);
     }
@@ -687,7 +689,6 @@ impl TextuiWindow {
     /// - vline_id 要刷新的虚拟行号
     /// - start 起始字符号
     /// - count 要刷新的字符数量
-
     fn textui_refresh_characters(
         &mut self,
         vline_id: LineId,
@@ -715,9 +716,11 @@ impl TextuiWindow {
             let vline = &mut (self.vlines[vline_id.data() as usize]);
             let mut i = 0;
             let mut index = start_index;
-
+            send_to_default_serial8250_port(format!("vid: {}, top:{}\n",vline_id.data(), self.top_vline.data()).as_bytes());
             while i < count {
                 if let TextuiVline::Chromatic(vline) = vline {
+                    
+
                     vline.chars[index.data() as usize]
                         .textui_refresh_character(actual_line_id, index)?;
 
@@ -877,14 +880,17 @@ impl TextuiWindow {
     }
 
     /// 真正向窗口的缓冲区上输入字符的函数(位置为window.cursor.get_y()，window.cursor.get_x())
+    #[inline(never)]
     fn true_textui_putchar_window(
         &mut self,
         character: char,
         frcolor: FontColor,
         bkcolor: FontColor,
     ) -> Result<(), SystemError> {
+        send_to_default_serial8250_port(&[b'N']);
         // 启用彩色字符
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
+            send_to_default_serial8250_port(&[b'A']);
             // if !self.cursor.get_x().check(-1, self.winsize.col() - 1) {
             //     panic!("textui window cursor x is wrong")
             // }
@@ -895,9 +901,11 @@ impl TextuiWindow {
             let cur_index = self.cursor.get_x().data() as usize;
 
             if let TextuiVline::Chromatic(vline) = self.get_mut_vline(self.cursor.get_y()) {
+                send_to_default_serial8250_port(b"B");
                 // vline.is_empty = false;
 
                 if let Some(v_char) = vline.chars.get_mut(cur_index) {
+                    send_to_default_serial8250_port(&[b'C']);
                     v_char.c = Some(character);
                     v_char.frcolor = frcolor;
                     v_char.bkcolor = bkcolor;
@@ -912,7 +920,13 @@ impl TextuiWindow {
                 if character == '\n' {
                     send_to_default_serial8250_port(&[b'\r']);
                 }
-                self.textui_new_line(self.cursor.get_y())?;
+
+                send_to_default_serial8250_port(&[b'F']);
+                self.textui_new_line(self.cursor.get_y()).map_err(|_| {
+                    send_to_default_serial8250_port(b"gggggg\n\0");
+                    SystemError::ENOMEM
+                })?;
+                send_to_default_serial8250_port(&[b'R']);
                 self.cursor.move_newline(1);
                 return Ok(());
             }
@@ -921,12 +935,16 @@ impl TextuiWindow {
             //     LineIndex::new(cur_index as i32),
             //     1,
             // )?;
+
+            send_to_default_serial8250_port(&[b'X']);
             self.textui_refresh_characters(self.cursor.get_y(), LineIndex(0), self.winsize.col())?;
+            send_to_default_serial8250_port(&[b'Y']);
             // if !end_index.check(self.winsize.col()) {
             //     self.textui_new_line(self.cursor.get_y())?;
             //     self.cursor.move_newline(1);
             // }
             self.cursor.move_right(1);
+            send_to_default_serial8250_port(&[b'Z']);
         } else {
             // todo: 支持纯文本字符
             todo!();
@@ -974,7 +992,7 @@ impl TextuiWindow {
         //     return Ok(());
         // }
         // 输出制表符
-        else if character == '\t' {
+        if character == '\t' {
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) = self.get_vline(self.cursor.get_y()) {
                     //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
@@ -1044,6 +1062,8 @@ impl TextuiWindow {
             // 输出其他字符
             send_to_default_serial8250_port(&[character as u8]);
             if is_enable_window == true {
+                // send_to_default_serial8250_port(&[b'M']);
+                send_to_default_serial8250_port(&[b'V']);
                 // if let TextuiVline::Chromatic(vline) = self.get_vline(self.cursor.get_y()) {
                 //     // 如果超过一行则换行
                 //     if vline.end_index.data() >= self.winsize.col() {
@@ -1052,10 +1072,17 @@ impl TextuiWindow {
                 //     }
                 //     return self.true_textui_putchar_window(character, frcolor, bkcolor);
                 // }
-                return self.true_textui_putchar_window(character, frcolor, bkcolor);
+                compiler_fence(Ordering::SeqCst);
+                send_to_default_serial8250_port(&[b'K']);
+                let r = self.true_textui_putchar_window(character, frcolor, bkcolor);
+                send_to_default_serial8250_port(&[b'D']);
+
+                compiler_fence(Ordering::SeqCst);
+                return r;
             }
         }
 
+        send_to_default_serial8250_port(&[b'J']);
         return Ok(());
     }
     /// 窗口闪烁显示光标
@@ -1287,8 +1314,8 @@ impl ScmUiFramework for TextUiFramework {
         let mut new_buf = textui_framework().metadata.read().buf_info();
 
         new_buf.copy_from_nonoverlapping(&old_buf);
-        kdebug!("textui change buf_info: old: {:?}", old_buf);
-        kdebug!("textui change buf_info: new: {:?}", new_buf);
+        // kdebug!("textui change buf_info: old: {:?}", old_buf);
+        // kdebug!("textui change buf_info: new: {:?}", new_buf);
 
         return Ok(0);
     }
@@ -1346,7 +1373,7 @@ pub fn textui_putchar(
     if unsafe { TEXTUI_IS_INIT } {
         return textui_framework()
             .current_window
-            .lock()
+            .lock_irqsave()
             .textui_putchar_window(
                 character,
                 fr_color,
@@ -1377,13 +1404,10 @@ pub fn textui_putstr(
     } else {
         None
     };
-    let mut guard = window.as_ref().map(|w| w.lock());
 
-    // send_to_default_serial8250_port("textui init failedeeeeeeeeeeeeeee.\n\0".as_bytes());
-
+    let mut guard = window.as_ref().map(|w| w.lock_irqsave());
     for character in string.chars() {
         if unsafe { TEXTUI_IS_INIT } {
-
             guard.as_mut().unwrap().textui_putchar_window(
                 character,
                 fr_color,
@@ -1399,7 +1423,7 @@ pub fn textui_putstr(
             )?;
         }
     }
-
+    drop(guard);
     return Ok(());
 }
 
@@ -1407,7 +1431,7 @@ pub fn textui_putstr(
 
 #[no_mangle]
 pub extern "C" fn rs_textui_init() -> i32 {
-    let r = textui_init().unwrap_or_else(|e| e.to_posix_errno());
+    let r = textui_init().unwrap_or_else(|e: SystemError| e.to_posix_errno());
     if r.is_negative() {
         send_to_default_serial8250_port("textui init failed.\n\0".as_bytes());
     }

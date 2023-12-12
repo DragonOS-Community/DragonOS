@@ -103,6 +103,10 @@ if [ -d "${GRUB_INSTALL_PATH}" ] || [ "${INSTALL_GRUB_TO_IMAGE}" = "0" ]; then
    INSTALL_GRUB_TO_IMAGE="0"
 else
     mkdir -p ${GRUB_INSTALL_PATH}
+fi
+
+
+if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     cp ${kernel} ${root_folder}/bin/disk_mount/boot/
 fi
 

@@ -42,7 +42,7 @@ pub(super) struct MMDebugLogManager;
 
 impl MMDebugLogManager {
     /// 最大的内存分配器日志数量
-    pub const MAX_ALLOC_LOG_NUM: usize = 100000;
+    pub const MAX_ALLOC_LOG_NUM: usize = 1000;
 
     /// 记录内存分配器的日志
     ///

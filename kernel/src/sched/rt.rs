@@ -4,10 +4,11 @@ use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
     arch::cpu::current_cpu_id,
+    driver::tty::serial::serial8250::send_to_default_serial8250_port,
     include::bindings::bindings::MAX_CPU_NUM,
     kBUG, kdebug,
     libs::spinlock::SpinLock,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager}, driver::tty::serial::serial8250::send_to_default_serial8250_port,
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
 };
 
 use super::{
@@ -30,7 +31,6 @@ pub unsafe fn sched_rt_init() {
     if RT_SCHEDULER_PTR.is_none() {
         compiler_fence(Ordering::SeqCst);
         RT_SCHEDULER_PTR = Some(Box::new(SchedulerRT::new()));
-    send_to_default_serial8250_port("textui init failedeeeeeeeeeeeeeee.\n\0".as_bytes());
         compiler_fence(Ordering::SeqCst);
     } else {
         kBUG!("Try to init RT Scheduler twice.");

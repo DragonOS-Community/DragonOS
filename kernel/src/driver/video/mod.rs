@@ -89,7 +89,7 @@ impl VideoRefreshManager {
      * 将帧缓存区映射到地址SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE处
      */
     fn init_frame_buffer(&self) {
-        kinfo!("Re-mapping VBE frame buffer...");
+        send_to_default_serial8250_port(b"Re-mapping VBE frame buffer...\n");
         let buf_vaddr = VirtAddr::new(
             SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize + FRAME_BUFFER_MAPPING_OFFSET as usize,
         );
@@ -104,6 +104,7 @@ impl VideoRefreshManager {
         let count = PageFrameCount::new(
             page_align_up(frame_buffer_info_graud.buf_size()) / MMArch::PAGE_SIZE,
         );
+        // send_to_default_serial8250_port(format!("paddr: {:#x}, count={count:?}\n", paddr.data()).as_bytes());
         let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
 
         let mut kernel_mapper = KernelMapper::lock();
@@ -124,7 +125,7 @@ impl VideoRefreshManager {
             }
         }
 
-        kinfo!("VBE frame buffer successfully Re-mapped!");
+        send_to_default_serial8250_port(b"VBE frame buffer successfully Re-mapped!\n");
     }
 
     /**

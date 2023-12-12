@@ -195,6 +195,7 @@ pub extern "C" fn sched_init() {
 
         sched_rt_init();
     }
+    
     kinfo!("Schedulers initialized");
 }
 

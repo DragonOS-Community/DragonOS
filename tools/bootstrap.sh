@@ -1,3 +1,6 @@
+CURRENT_SHELL=$(basename $SHELL)
+source "$HOME/.$CURRENT_SHELL"rc
+
 emulator="qemu"
 defpackman="apt-get"
 dockerInstall="true"
@@ -18,14 +21,13 @@ congratulations()
 	echo "|                                          |"
 	echo "|   你成功安装了DragonOS所需的依赖项!      |"
     echo "|                                          |"
-    echo "|   请关闭当前终端, 并重新打开一个终端     |"
+    echo "|   请[关闭]当前终端, 并[重新打开]一个终端 |"
 	echo "|   然后通过以下命令运行:                  |"
 	echo "|                                          |"
 	echo "|                make run                  |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
-
 
 ####################################
 # 当检测到ubuntu或Debian时，执行此函数 #
@@ -45,7 +47,7 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
-		sphinx
+		sphinx gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu gdb-multiarch
 	
 	# 如果python3没有安装
 	if [ -z "$(which python3)" ]; then
@@ -140,7 +142,7 @@ rustInstall() {
 		echo "Rust 还未被安装"
 		echo "请再次运行脚本，接受rustup安装"
 		echo "或通过以下方式手动安装rustc（不推荐）："
-		echo "curl -sSf https://static.rust-lang.org/rustup.sh | sh -s -- --channel=nightly"
+		echo "curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly"
 		exit
 	else
         echo "是否为Rust换源为国内镜像源？(Tuna)"
@@ -160,11 +162,20 @@ rustInstall() {
 		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-        rustup component add rust-src
-		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
-        rustup component add llvm-tools-preview
 		rustup target add x86_64-unknown-none --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
+
+		rustup toolchain install nightly-2023-01-21-riscv64gc-unknown-linux-gnu --force-non-host
+		rustup toolchain install nightly-2023-08-15-riscv64gc-unknown-linux-gnu --force-non-host
+		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
+        
+		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+		rustup component add rust-src
+        rustup component add llvm-tools-preview
+		rustup default nightly
 		
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi
@@ -263,7 +274,8 @@ else
 	fi
 fi
 
-rustInstall     # 安装rust
+# 安装rust
+rustInstall     
 
 
 #  初始化DragonOS的musl交叉编译工具链

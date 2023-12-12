@@ -105,7 +105,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
         let act: *mut UserSigaction = new_act as *mut UserSigaction;
-        let mut old_act = old_act as *mut UserSigaction;
+        let old_act = old_act as *mut UserSigaction;
         let mut new_ka: Sigaction = Default::default();
         let mut old_sigaction: Sigaction = Default::default();
         // 如果传入的，新的sigaction不为空

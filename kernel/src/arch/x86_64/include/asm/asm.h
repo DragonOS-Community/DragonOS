@@ -4,13 +4,7 @@
 #include <stdbool.h>
 #include <common/stddef.h>
 
-// 定义类型的缩写
-typedef unsigned char uchar;
-typedef unsigned short ushort;
-typedef unsigned int uint;
-typedef unsigned long ul;
-typedef unsigned long long int ull;
-typedef long long int ll;
+
 
 #define sti() __asm__ __volatile__("sti\n\t" :: \
                                        : "memory") // 开启外部中断
@@ -133,35 +127,6 @@ unsigned long *get_rbx()
         "movq %%rbx, %0\n\t"
         : "=r"(tmp)::"memory");
     return tmp;
-}
-
-// ========= MSR寄存器组操作 =============
-/**
- * @brief 向msr寄存器组的address处的寄存器写入值value
- *
- * @param address 地址
- * @param value 要写入的值
- */
-void wrmsr(uint64_t address, uint64_t value)
-{
-    __asm__ __volatile__("wrmsr    \n\t" ::"d"(value >> 32), "a"(value & 0xffffffff), "c"(address)
-                         : "memory");
-}
-
-/**
- * @brief 从msr寄存器组的address地址处读取值
- * rdmsr返回高32bits在edx，低32bits在eax
- * @param address 地址
- * @return uint64_t address处的寄存器的值
- */
-uint64_t rdmsr(uint64_t address)
-{
-    unsigned int tmp0, tmp1;
-    __asm__ __volatile__("rdmsr \n\t"
-                         : "=d"(tmp0), "=a"(tmp1)
-                         : "c"(address)
-                         : "memory");
-    return ((uint64_t)tmp0 << 32) | tmp1;
 }
 
 uint64_t get_rflags()
@@ -416,4 +381,30 @@ static __always_inline uint32_t __read4b(uint64_t vaddr)
                  : "a"(vaddr)
                  : "memory");
     return retval;
+}
+
+
+/**
+ * @brief 逐字节比较指定内存区域的值，并返回s1、s2的第一个不相等的字节i处的差值（s1[i]-s2[i])。
+ * 若两块内存区域的内容相同，则返回0
+ *
+ * @param s1 内存区域1
+ * @param s2 内存区域2
+ * @param len 要比较的内存区域长度
+ * @return int s1、s2的第一个不相等的字节i处的差值（s1[i]-s2[i])。若两块内存区域的内容相同，则返回0
+ */
+static inline int memcmp(const void *s1, const void *s2, size_t len)
+{
+    int diff;
+
+    asm("cld \n\t"  // 复位DF，确保s1、s2指针是自增的
+        "repz; cmpsb\n\t" CC_SET(nz)
+        : CC_OUT(nz)(diff), "+D"(s1), "+S"(s2)
+        : "c"(len)
+        : "memory");
+
+    if (diff)
+        diff = *(const unsigned char *)(s1 - 1) - *(const unsigned char *)(s2 - 1);
+
+    return diff;
 }

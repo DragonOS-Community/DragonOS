@@ -18,6 +18,7 @@
    :maxdepth: 1
    :caption: 内核层
 
+   kernel/configuration/index
    kernel/boot/index
    kernel/core_api/index
    kernel/locking/index
@@ -30,7 +31,6 @@
    kernel/ktest/index
    kernel/cpu_arch/index
    kernel/libs/index
-   kernel/configuration/index
 
 
 .. toctree::

@@ -625,7 +625,6 @@ impl FATDir {
                 // todo: 设置创建、访问时间
                 dot_entry.flush(&fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
 
-                drop(dot_entry);
                 // 偏移量加上一个目录项的长度
                 offset += FATRawDirEntry::DIR_ENTRY_LEN;
 

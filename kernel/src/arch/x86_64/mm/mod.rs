@@ -1,5 +1,6 @@
 pub mod barrier;
 pub mod bump;
+mod c_adapter;
 
 use alloc::vec::Vec;
 use hashbrown::HashSet;
@@ -232,6 +233,60 @@ impl MemoryManagementArch for X86_64MMArch {
         }
 
         return Ok(crate::mm::ucontext::UserMapper::new(new_umapper));
+    }
+
+    const PAGE_SIZE: usize = 1 << Self::PAGE_SHIFT;
+
+    const PAGE_OFFSET_MASK: usize = Self::PAGE_SIZE - 1;
+
+    const PAGE_MASK: usize = !(Self::PAGE_OFFSET_MASK);
+
+    const PAGE_ADDRESS_SHIFT: usize = Self::PAGE_LEVELS * Self::PAGE_ENTRY_SHIFT + Self::PAGE_SHIFT;
+
+    const PAGE_ADDRESS_SIZE: usize = 1 << Self::PAGE_ADDRESS_SHIFT;
+
+    const PAGE_ADDRESS_MASK: usize = Self::PAGE_ADDRESS_SIZE - Self::PAGE_SIZE;
+
+    const PAGE_ENTRY_SIZE: usize = 1 << (Self::PAGE_SHIFT - Self::PAGE_ENTRY_SHIFT);
+
+    const PAGE_ENTRY_NUM: usize = 1 << Self::PAGE_ENTRY_SHIFT;
+
+    const PAGE_ENTRY_MASK: usize = Self::PAGE_ENTRY_NUM - 1;
+
+    const PAGE_NEGATIVE_MASK: usize = !((Self::PAGE_ADDRESS_SIZE) - 1);
+
+    const ENTRY_ADDRESS_SIZE: usize = 1 << Self::ENTRY_ADDRESS_SHIFT;
+
+    const ENTRY_ADDRESS_MASK: usize = Self::ENTRY_ADDRESS_SIZE - Self::PAGE_SIZE;
+
+    const ENTRY_FLAGS_MASK: usize = !Self::ENTRY_ADDRESS_MASK;
+
+    unsafe fn read<T>(address: VirtAddr) -> T {
+        return core::ptr::read(address.data() as *const T);
+    }
+
+    unsafe fn write<T>(address: VirtAddr, value: T) {
+        core::ptr::write(address.data() as *mut T, value);
+    }
+
+    unsafe fn write_bytes(address: VirtAddr, value: u8, count: usize) {
+        core::ptr::write_bytes(address.data() as *mut u8, value, count);
+    }
+
+    unsafe fn phys_2_virt(phys: PhysAddr) -> Option<VirtAddr> {
+        if let Some(vaddr) = phys.data().checked_add(Self::PHYS_OFFSET) {
+            return Some(VirtAddr::new(vaddr));
+        } else {
+            return None;
+        }
+    }
+
+    unsafe fn virt_2_phys(virt: VirtAddr) -> Option<PhysAddr> {
+        if let Some(paddr) = virt.data().checked_sub(Self::PHYS_OFFSET) {
+            return Some(PhysAddr::new(paddr));
+        } else {
+            return None;
+        }
     }
 }
 
@@ -542,6 +597,7 @@ pub fn test_buddy() {
         kdebug!("release done!, allocated: {allocated}, free_count: {free_count}");
     }
 }
+
 /// 全局的页帧分配器
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
@@ -568,12 +624,6 @@ impl FrameAllocator for LockedFrameAllocator {
         } else {
             panic!("usage error");
         }
-    }
-}
-
-impl LockedFrameAllocator {
-    pub fn get_usage(&self) -> PageFrameUsage {
-        unsafe { self.usage() }
     }
 }
 

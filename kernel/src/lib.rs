@@ -7,11 +7,9 @@
 #![feature(const_trait_impl)]
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
-#![feature(cstr_from_bytes_until_nul)]
 #![feature(c_void_variant)]
-#![feature(drain_filter)]
+#![feature(extract_if)]
 #![feature(inline_const)]
-#![feature(is_some_and)]
 #![feature(naked_functions)]
 #![feature(panic_info_message)]
 #![feature(ptr_internals)]
@@ -22,7 +20,6 @@
 #![feature(ptr_to_from_bits)]
 #![feature(concat_idents)]
 #![cfg_attr(target_os = "none", no_std)]
-#![feature(atomic_mut_ptr)]
 
 #[cfg(test)]
 #[macro_use]
@@ -53,6 +50,8 @@ mod sched;
 mod smp;
 mod syscall;
 mod time;
+
+#[cfg(target_arch = "x86_64")]
 mod virt;
 
 #[macro_use]
@@ -79,7 +78,7 @@ use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
 use crate::process::ProcessManager;
 
-#[cfg(feature = "backtrace")]
+#[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
 extern crate mini_backtrace;
 
 extern "C" {
@@ -120,7 +119,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    #[cfg(feature = "backtrace")]
+    #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
     {
         unsafe {
             let bt = mini_backtrace::Backtrace::<16>::capture();

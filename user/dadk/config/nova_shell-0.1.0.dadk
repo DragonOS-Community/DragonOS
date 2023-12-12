@@ -1,0 +1,23 @@
+{
+  "name": "NovaShell",
+  "version": "0.1.0",
+  "description": "NovaShell程序",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url": "https://git.mirrors.dragonos.org.cn/DragonOS-Community/NovaShell.git",
+        "revision": "95738b235f"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  }
+}

@@ -4,6 +4,7 @@
 #include <process/ptrace.h>
 #include <exception/irq.h>
 #include <mm/mm.h>
+#include <arch/arch.h>
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -222,15 +223,52 @@ void rs_apic_init_ap();
  */
 int apic_init();
 
-// =========== 中断控制操作接口 ============
-void apic_ioapic_enable(ul irq_num);
+#if ARCH(I386) || ARCH(X86_64)
+
+    // =========== 中断控制操作接口 ============
+    void apic_ioapic_enable(ul irq_num);
 void apic_ioapic_disable(ul irq_num);
 ul apic_ioapic_install(ul irq_num, void *arg);
 void apic_ioapic_uninstall(ul irq_num);
-void apic_ioapic_edge_ack(ul irq_num);  // ioapic边沿触发 应答
+void apic_ioapic_edge_ack(ul irq_num); // ioapic边沿触发 应答
 
 // void apic_local_apic_level_ack(ul irq_num);// local apic电平触发 应答
 void apic_local_apic_edge_ack(ul irq_num); // local apic边沿触发 应答
+#else
+void apic_ioapic_enable(ul irq_num)
+{
+    while (1)
+        ;
+}
+void apic_ioapic_disable(ul irq_num)
+{
+    while (1)
+        ;
+}
+ul apic_ioapic_install(ul irq_num, void *arg)
+{
+    while (1)
+        ;
+}
+void apic_ioapic_uninstall(ul irq_num)
+{
+    while (1)
+        ;
+}
+void apic_ioapic_edge_ack(ul irq_num)
+{
+    while (1)
+        ;
+} // ioapic边沿触发 应答
+
+// void apic_local_apic_level_ack(ul irq_num);// local apic电平触发 应答
+void apic_local_apic_edge_ack(ul irq_num)
+{
+    while (1)
+        ;
+} // local apic边沿触发 应答
+
+#endif
 
 /**
  * @brief 构造RTE Entry结构体

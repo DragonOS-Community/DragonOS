@@ -8,19 +8,20 @@
 
 #ifndef __GATE_H__
 #define __GATE_H__
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 
+#if ARCH(I386) || ARCH(X86_64)
 #include <common/kprint.h>
 #include <mm/mm.h>
 
-#pragma GCC push_options
-#pragma GCC optimize("O0")
-//描述符表的结构体
+// 描述符表的结构体
 struct desc_struct
 {
     unsigned char x[8];
 };
 
-//门的结构体
+// 门的结构体
 struct gate_struct
 {
     unsigned char x[16];
@@ -28,19 +29,19 @@ struct gate_struct
 
 extern struct desc_struct GDT_Table[]; // GDT_Table是head.S中的GDT_Table
 extern struct gate_struct IDT_Table[]; // IDT_Table是head.S中的IDT_Table
-//extern unsigned int TSS64_Table[26];
+// extern unsigned int TSS64_Table[26];
 
 struct gdtr
 {
     uint16_t size;
     uint64_t gdt_vaddr;
-}__attribute__((packed));
+} __attribute__((packed));
 
 struct idtr
 {
     uint16_t size;
     uint64_t idt_vaddr;
-}__attribute__((packed));
+} __attribute__((packed));
 
 /**
  * @brief 初始化中段描述符表内的门描述符（每个16B）
@@ -54,20 +55,20 @@ void set_gate(ul *gate_selector_addr, ul attr, unsigned char ist, ul *code_addr)
 {
     ul __d0 = 0, __d1 = 0;
     ul tmp_code_addr = *code_addr;
-    __d0 = attr << 40; //设置P、DPL、Type
+    __d0 = attr << 40; // 设置P、DPL、Type
 
     __d0 |= ((ul)(ist) << 32); // 设置ist
 
-    __d0 |= 8 << 16; //设置段选择子为0x1000
+    __d0 |= 8 << 16; // 设置段选择子为0x1000
 
-    __d0 |= (0xffff & tmp_code_addr); //设置段内偏移的[15:00]
+    __d0 |= (0xffff & tmp_code_addr); // 设置段内偏移的[15:00]
 
     tmp_code_addr >>= 16;
     __d0 |= (0xffff & tmp_code_addr) << 48; // 设置段内偏移[31:16]
 
     tmp_code_addr >>= 16;
 
-    __d1 = (0xffffffff & tmp_code_addr); //设置段内偏移[63:32]
+    __d1 = (0xffffffff & tmp_code_addr); // 设置段内偏移[63:32]
 
     *gate_selector_addr = __d0;
     *(gate_selector_addr + 1) = __d1;
@@ -101,7 +102,7 @@ void set_tss_descriptor(unsigned int n, void *addr)
 {
 
     unsigned long limit = 103;
-    
+
     *(unsigned long *)(phys_2_virt(GDT_Table + n)) = (limit & 0xffff) | (((unsigned long)addr & 0xffff) << 16) | ((((unsigned long)addr >> 16) & 0xff) << 32) | ((unsigned long)0x89 << 40) | ((limit >> 16 & 0xf) << 48) | (((unsigned long)addr >> 24 & 0xff) << 56); /////89 is attribute
     *(unsigned long *)(phys_2_virt(GDT_Table + n + 1)) = (((unsigned long)addr >> 32) & 0xffffffff) | 0;
 }
@@ -127,8 +128,8 @@ void set_tss_descriptor(unsigned int n, void *addr)
 void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
 {
     _set_gate(phys_2_virt(IDT_Table + n), 0x8E, ist, addr); // p=1，DPL=0, type=E
-    
-    //set_gate((ul *)phys_2_virt(IDT_Table + n), 0x8E, ist, (ul *)(addr)); // p=1，DPL=0, type=E
+
+    // set_gate((ul *)phys_2_virt(IDT_Table + n), 0x8E, ist, (ul *)(addr)); // p=1，DPL=0, type=E
 }
 
 /**
@@ -142,7 +143,7 @@ void set_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
     // kdebug("addr=%#018lx", (ul)(addr));
 
-    //set_gate((ul *)phys_2_virt(IDT_Table + n), 0x8F, ist, (ul *)(addr)); // p=1，DPL=0, type=F
+    // set_gate((ul *)phys_2_virt(IDT_Table + n), 0x8F, ist, (ul *)(addr)); // p=1，DPL=0, type=F
     _set_gate(phys_2_virt(IDT_Table + n), 0x8F, ist, addr); // p=1，DPL=0, type=F
 }
 
@@ -157,14 +158,13 @@ void set_system_trap_gate(unsigned int n, unsigned char ist, void *addr)
 {
     // kdebug("addr=%#018lx", (ul)(addr));
 
-    //set_gate((ul *)phys_2_virt(IDT_Table + n), 0xEF, ist, (ul *)(addr)); // p=1，DPL=3, type=F
+    // set_gate((ul *)phys_2_virt(IDT_Table + n), 0xEF, ist, (ul *)(addr)); // p=1，DPL=3, type=F
     _set_gate(phys_2_virt(IDT_Table + n), 0xEF, ist, addr); // p=1，DPL=3, type=F
 }
 
-
-static inline void set_system_intr_gate(unsigned int n,unsigned char ist,void * addr)	//int3
+static inline void set_system_intr_gate(unsigned int n, unsigned char ist, void *addr) // int3
 {
-	_set_gate(phys_2_virt(IDT_Table + n) , 0xEE , ist , addr);	//P,DPL=3,TYPE=E
+    _set_gate(phys_2_virt(IDT_Table + n), 0xEE, ist, addr); // P,DPL=3,TYPE=E
 }
 /**
  * @brief 初始化TSS表的内容
@@ -186,6 +186,14 @@ void set_tss64(unsigned int *Table, unsigned long rsp0, unsigned long rsp1, unsi
     *(unsigned long *)(Table + 19) = ist6;
     *(unsigned long *)(Table + 21) = ist7;
 }
+
+#else
+void set_intr_gate(unsigned int n, unsigned char ist, void *addr)
+{
+    while (1)
+        ;
+}
 #endif
 
 #pragma GCC pop_options
+#endif

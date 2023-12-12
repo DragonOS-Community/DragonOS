@@ -148,7 +148,7 @@ impl Softirq {
     /// @param irq_num 中断向量号码   
     pub fn unregister_softirq(&self, softirq_num: SoftirqNumber) {
         // kdebug!("unregister_softirq softirq_num = {:?}", softirq_num as u64);
-        let table_guard = &mut self.table.write();
+        let mut table_guard = self.table.write();
         // 将软中断向量清空
         table_guard[softirq_num as usize] = None;
         drop(table_guard);

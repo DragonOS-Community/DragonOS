@@ -1,14 +1,16 @@
 use core::intrinsics::unreachable;
 
-use crate::{
-    driver::tty::serial::serial8250::send_to_default_serial8250_port, init::init_before_mem_init,
-    kdebug,
-};
+use crate::{init::init_before_mem_init, kinfo, mm::PhysAddr};
 
 #[no_mangle]
-unsafe extern "C" fn kernel_main(hartid: usize, fdt_addr: usize) -> ! {
+unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
+    let fdt_paddr = PhysAddr::new(fdt_paddr);
     init_before_mem_init();
-    send_to_default_serial8250_port(&b"Hello, world! RISC-V!\n"[..]);
+    kinfo!(
+        "DragonOS kernel is running on hart {}, fdt address:{:?}",
+        hartid,
+        fdt_paddr
+    );
     loop {}
     unreachable()
 }

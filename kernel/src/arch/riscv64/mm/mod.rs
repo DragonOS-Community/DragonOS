@@ -5,6 +5,7 @@ use crate::mm::{
 };
 
 pub mod bump;
+pub(super) mod init;
 
 pub type PageMapper = crate::mm::page::PageMapper<RiscV64MMArch, LockedFrameAllocator>;
 

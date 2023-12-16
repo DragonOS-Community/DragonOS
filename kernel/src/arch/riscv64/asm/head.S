@@ -25,8 +25,6 @@
 #define KERNEL_LINK_OFFSET 0x1000000
 #define KERNEL_VIRT_START (PAGE_OFFSET + KERNEL_LINK_OFFSET)
 
-// 初始临时映射的内核空间大小256M（如果内核大小超过这个值，需要修改）
-#define INITIAL_KERNEL_MEMMAP_SIZE 0x10000000
 
 // 内核入口（从DragonStub跳转到这里）
 // 参数：

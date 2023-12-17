@@ -137,9 +137,14 @@ impl SchedulerCFS {
     fn update_cpu_exec_proc_jiffies(
         _priority: SchedPriority,
         cfs_queue: &mut CFSQueue,
+        is_idle: bool,
     ) -> &mut CFSQueue {
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置分配给进程的可执行时间
-        cfs_queue.cpu_exec_proc_jiffies = 10;
+        if !is_idle {
+            cfs_queue.cpu_exec_proc_jiffies = 10;
+        } else {
+            cfs_queue.cpu_exec_proc_jiffies = 0;
+        }
 
         return cfs_queue;
     }
@@ -236,6 +241,7 @@ impl Scheduler for SchedulerCFS {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
                     proc.sched_info().priority(),
                     current_cpu_queue,
+                    Arc::ptr_eq(&proc, &current_cpu_queue.idle_pcb),
                 );
             }
 
@@ -251,6 +257,7 @@ impl Scheduler for SchedulerCFS {
                 SchedulerCFS::update_cpu_exec_proc_jiffies(
                     ProcessManager::current_pcb().sched_info().priority(),
                     current_cpu_queue,
+                    Arc::ptr_eq(&proc, &current_cpu_queue.idle_pcb),
                 );
                 // kdebug!("cpu:{:?}",current_cpu_id);
             }

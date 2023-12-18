@@ -702,12 +702,6 @@ impl Syscall {
                 Self::sigaction(sig, act, old_act, frame.from_user())
             }
 
-            SYS_RT_SIGRETURN => {
-                // 由于目前signal机制的实现，与x86_64强关联，因此暂时在arch/x86_64/syscall.rs中调用
-                // todo: 未来需要将signal机制与平台解耦
-                todo!()
-            }
-
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => Self::sched(frame.from_user()),

@@ -77,13 +77,21 @@ pub(super) fn sys_dev_kset() -> Arc<KSet> {
 
 #[inline(always)]
 #[allow(dead_code)]
-pub(super) fn sys_dev_block_kset() -> Arc<KSet> {
+pub fn sys_dev_block_kset() -> Arc<KSet> {
     unsafe { DEV_BLOCK_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
 #[inline(always)]
-pub(self) fn sys_dev_char_kset() -> Arc<KSet> {
+pub fn sys_dev_char_kset() -> Arc<KSet> {
     unsafe { DEV_CHAR_KSET_INSTANCE.as_ref().unwrap().clone() }
+}
+
+pub(self) unsafe fn set_sys_dev_block_kset(kset: Arc<KSet>) {
+    DEV_BLOCK_KSET_INSTANCE = Some(kset);
+}
+
+pub(self) unsafe fn set_sys_dev_char_kset(kset: Arc<KSet>) {
+    DEV_CHAR_KSET_INSTANCE = Some(kset);
 }
 
 /// 设备应该实现的操作

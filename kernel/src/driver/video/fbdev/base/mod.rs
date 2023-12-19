@@ -6,6 +6,8 @@ use crate::{
     syscall::SystemError,
 };
 
+pub mod fbmem;
+
 /// 帧缓冲区应该实现的接口
 pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {}
 

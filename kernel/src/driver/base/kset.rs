@@ -84,9 +84,20 @@ impl KSet {
         return Ok(kset);
     }
 
+    /// 注册一个kset
+    ///
+    /// ## 参数
+    ///
+    /// - join_kset: 如果不为None，那么这个kset会加入到join_kset中
     pub fn register(&self, join_kset: Option<Arc<KSet>>) -> Result<(), SystemError> {
         return KObjectManager::add_kobj(self.self_ref.upgrade().unwrap(), join_kset);
         // todo: 引入uevent之后，发送uevent
+    }
+
+    /// 注销一个kset
+    #[allow(dead_code)]
+    pub fn unregister(&self) {
+        KObjectManager::remove_kobj(self.self_ref.upgrade().unwrap());
     }
 
     /// 把一个kobject加入到当前kset中。

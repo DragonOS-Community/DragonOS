@@ -3,7 +3,8 @@ use alloc::{string::ToString, sync::Arc};
 use crate::{
     driver::base::{
         device::{
-            sys_dev_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
+            set_sys_dev_block_kset, set_sys_dev_char_kset, sys_dev_kset, DeviceManager,
+            DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
         },
         kobject::KObject,
         kset::KSet,
@@ -47,6 +48,8 @@ pub fn devices_init() -> Result<(), SystemError> {
         dev_block_kset
             .register(Some(dev_kset))
             .expect("register dev block kset failed");
+
+        unsafe { set_sys_dev_block_kset(dev_block_kset) };
     }
 
     // 创建 `/sys/dev/char` 目录
@@ -60,6 +63,8 @@ pub fn devices_init() -> Result<(), SystemError> {
         dev_char_kset
             .register(Some(dev_kset))
             .expect("register dev char kset failed");
+
+        unsafe { set_sys_dev_char_kset(dev_char_kset) };
     }
 
     kinfo!("devices init success");

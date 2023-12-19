@@ -111,6 +111,10 @@ impl dyn Class {
     }
 }
 
+#[inline(always)]
+pub fn class_manager() -> &'static ClassManager {
+    return &ClassManager;
+}
 pub struct ClassManager;
 
 impl ClassManager {
@@ -122,7 +126,7 @@ impl ClassManager {
     /// ## 参数
     ///
     /// - `class` - 设备类
-    pub fn class_register(class: &Arc<dyn Class>) -> Result<(), SystemError> {
+    pub fn class_register(&self, class: &Arc<dyn Class>) -> Result<(), SystemError> {
         let subsystem = class.subsystem();
         let subsys = subsystem.subsys();
         subsys.set_name(class.name().to_string());
@@ -143,7 +147,7 @@ impl ClassManager {
 
     /// 注销一个设备类
     #[allow(dead_code)]
-    pub fn class_unregister(class: &Arc<dyn Class>) {
+    pub fn class_unregister(&self, class: &Arc<dyn Class>) {
         let subsystem = class.subsystem();
         let subsys = subsystem.subsys();
         sysfs_instance().remove_groups(&(subsys.clone() as Arc<dyn KObject>), class.class_groups());

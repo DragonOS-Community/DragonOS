@@ -116,6 +116,7 @@ impl KSet {
     /// 把一个kobject从当前kset中移除。
     pub fn leave(&self, kobj: &Arc<dyn KObject>) {
         let mut kobjects = self.kobjects.write();
+        kobjects.retain(|x| x.upgrade().is_some());
         let index = kobjects.iter().position(|x| {
             if let Some(x) = x.upgrade() {
                 return Arc::ptr_eq(&x, kobj);
@@ -139,6 +140,10 @@ impl KSet {
 
     pub fn as_kobject(&self) -> Arc<dyn KObject> {
         return self.self_ref.upgrade().unwrap();
+    }
+
+    pub fn kobjects(&self) -> RwLockReadGuard<Vec<Weak<dyn KObject>>> {
+        return self.kobjects.read();
     }
 }
 

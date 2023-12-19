@@ -6,6 +6,7 @@ use crate::{
     syscall::SystemError,
 };
 
+pub mod fbcon;
 pub mod fbmem;
 
 /// 帧缓冲区应该实现的接口

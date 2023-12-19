@@ -12,6 +12,7 @@ use alloc::{
 use crate::{
     driver::{
         base::{
+            class::Class,
             device::{
                 bus::Bus, device_manager, driver::Driver, Device, DeviceKObjType, DeviceNumber,
                 DeviceState, DeviceType, IdTable,
@@ -228,7 +229,7 @@ impl Device for Serial8250ISADevices {
     }
 
     fn id_table(&self) -> IdTable {
-        return IdTable::new(self.name.to_string(), DeviceNumber::new(0));
+        return IdTable::new(self.name.to_string(), Some(DeviceNumber::new(0)));
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
@@ -249,6 +250,10 @@ impl Device for Serial8250ISADevices {
 
     fn state_synced(&self) -> bool {
         true
+    }
+
+    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+        todo!()
     }
 }
 

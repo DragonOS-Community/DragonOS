@@ -5,7 +5,7 @@ use alloc::{
 
 use crate::{
     driver::base::{
-        class::{Class, ClassManager},
+        class::{class_manager, Class},
         device::sys_dev_char_kset,
         kobject::KObject,
         subsys::SubSysPrivate,
@@ -13,25 +13,28 @@ use crate::{
     syscall::SystemError,
 };
 
+use super::fbcon::fb_console_init;
+
 /// `/sys/class/graphics` 的 class 实例
 static mut CLASS_GRAPHICS_INSTANCE: Option<Arc<GraphicsClass>> = None;
 
 /// 获取 `/sys/class/graphics` 的 class 实例
 #[inline(always)]
 #[allow(dead_code)]
-pub fn sys_class_graphics_instance() -> &'static Arc<GraphicsClass> {
-    unsafe { CLASS_GRAPHICS_INSTANCE.as_ref().unwrap() }
+pub fn sys_class_graphics_instance() -> Option<&'static Arc<GraphicsClass>> {
+    unsafe { CLASS_GRAPHICS_INSTANCE.as_ref() }
 }
 
 /// 初始化帧缓冲区子系统
 pub fn fbmem_init() -> Result<(), SystemError> {
     let graphics_class = GraphicsClass::new();
-    ClassManager::class_register(&(graphics_class.clone() as Arc<dyn Class>))?;
+    class_manager().class_register(&(graphics_class.clone() as Arc<dyn Class>))?;
 
     unsafe {
         CLASS_GRAPHICS_INSTANCE = Some(graphics_class);
     }
 
+    fb_console_init()?;
     return Ok(());
 }
 

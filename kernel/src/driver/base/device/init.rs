@@ -3,8 +3,9 @@ use alloc::{string::ToString, sync::Arc};
 use crate::{
     driver::base::{
         device::{
-            set_sys_dev_block_kset, set_sys_dev_char_kset, sys_dev_kset, DeviceManager,
-            DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
+            set_sys_dev_block_kset, set_sys_dev_char_kset, set_sys_devices_virtual_kset,
+            sys_dev_kset, sys_devices_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER,
+            DEV_KSET_INSTANCE,
         },
         kobject::KObject,
         kset::KSet,
@@ -26,6 +27,19 @@ pub fn devices_init() -> Result<(), SystemError> {
             // 初始化全局设备管理器
             DEVICE_MANAGER = Some(DeviceManager::new());
         }
+    }
+
+    // 创建 `/sys/devices/virtual` 目录
+    {
+        let devices_kset = sys_devices_kset();
+        let virtual_kset = KSet::new("virtual".to_string());
+        let parent = devices_kset.clone() as Arc<dyn KObject>;
+        virtual_kset.set_parent(Some(Arc::downgrade(&parent)));
+
+        virtual_kset
+            .register(Some(devices_kset))
+            .expect("register virtual kset failed");
+        unsafe { set_sys_devices_virtual_kset(virtual_kset) };
     }
 
     // 创建 `/sys/dev` 目录

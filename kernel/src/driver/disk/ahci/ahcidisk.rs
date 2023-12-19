@@ -2,6 +2,7 @@ use super::{_port, hba::HbaCmdTable, virt_2_phys};
 use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::SeekFrom;
+use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 
 use crate::driver::base::device::driver::Driver;
@@ -527,6 +528,10 @@ impl Device for LockedAhciDisk {
     }
 
     fn state_synced(&self) -> bool {
+        todo!()
+    }
+
+    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
         todo!()
     }
 }

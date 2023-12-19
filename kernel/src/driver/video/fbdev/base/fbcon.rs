@@ -264,7 +264,7 @@ impl Attribute for AttrRotate {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::WRITE | SysFSOpsSupport::READ
+        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbcon.c#3226
@@ -293,7 +293,7 @@ impl Attribute for AttrRotateAll {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::WRITE
+        SysFSOpsSupport::STORE
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbcon.c#3204
@@ -316,7 +316,7 @@ impl Attribute for AttrCursorBlink {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::WRITE | SysFSOpsSupport::READ
+        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbcon.c#3245

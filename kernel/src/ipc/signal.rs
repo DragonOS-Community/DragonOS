@@ -141,12 +141,7 @@ impl Signal {
     /// @param pt siginfo结构体中，pid字段代表的含义
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
         // kdebug!("complete_signal");
-        // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
-        // 将这个信号加到目标进程的sig_pending中
-        pcb.sig_info_mut()
-            .sig_pending_mut()
-            .signal_mut()
-            .insert(self.clone().into());
+
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // ===== 寻找需要wakeup的目标进程 =====
         // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
@@ -154,11 +149,17 @@ impl Signal {
 
         // let _signal = pcb.sig_struct();
 
-        let mut _target: Option<Arc<ProcessControlBlock>> = None;
+        let target_pcb: Option<Arc<ProcessControlBlock>>;
 
         // 判断目标进程是否想接收这个信号
         if self.wants_signal(pcb.clone()) {
-            _target = Some(pcb.clone());
+            // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
+            // 将这个信号加到目标进程的sig_pending中
+            pcb.sig_info_mut()
+                .sig_pending_mut()
+                .signal_mut()
+                .insert(self.clone().into());
+            target_pcb = Some(pcb.clone());
         } else if pt == PidType::PID {
             /*
              * There is just one thread and it does not need to be woken.
@@ -176,9 +177,9 @@ impl Signal {
         // TODO:引入进程组后，在这里挑选一个进程来唤醒，让它执行相应的操作。
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // TODO: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
-        if _target.is_some() {
-            let guard = pcb.sig_struct();
-            signal_wake_up(pcb.clone(), guard, *self == Signal::SIGKILL);
+        if let Some(target_pcb) = target_pcb {
+            let guard = target_pcb.sig_struct();
+            signal_wake_up(target_pcb.clone(), guard, *self == Signal::SIGKILL);
         }
     }
 
@@ -201,7 +202,9 @@ impl Signal {
             return true;
         }
 
-        if pcb.sched_info().state().is_blocked() {
+        if pcb.sched_info().state().is_blocked()
+            && (pcb.sched_info().state().is_blocked_interruptable() == false)
+        {
             return false;
         }
 
@@ -209,7 +212,6 @@ impl Signal {
 
         // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
         if pcb.sig_info().sig_pending().signal().bits() == 0 {
-            assert!(pcb.sig_info().sig_pending().queue().q.is_empty());
             return true;
         } else {
             return false;

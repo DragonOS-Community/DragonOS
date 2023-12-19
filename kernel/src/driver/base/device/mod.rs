@@ -561,10 +561,10 @@ impl DeviceManager {
         device: &Arc<dyn Device>,
         current_parent: Option<Arc<dyn Device>>,
     ) -> Result<Option<Arc<dyn KObject>>, SystemError> {
-        kdebug!("get_device_parent() device:{:?}", device.name());
+        // kdebug!("get_device_parent() device:{:?}", device.name());
         if let Some(_) = device.class() {
             let parent_kobj: Arc<dyn KObject>;
-            kdebug!("current_parent:{:?}", current_parent);
+            // kdebug!("current_parent:{:?}", current_parent);
             if current_parent.is_none() {
                 parent_kobj = sys_devices_virtual_kset() as Arc<dyn KObject>;
             } else {

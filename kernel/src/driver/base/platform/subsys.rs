@@ -30,10 +30,10 @@ pub struct PlatformBus {
 impl PlatformBus {
     pub fn new() -> Arc<Self> {
         let w: Weak<Self> = Weak::new();
-        let private = SubSysPrivate::new("platform".to_string(), w, &[]);
+        let private = SubSysPrivate::new("platform".to_string(), Some(w), None, &[]);
         let bus = Arc::new(Self { private });
         bus.subsystem()
-            .set_bus(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>)));
+            .set_bus(Some(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>))));
 
         return bus;
     }

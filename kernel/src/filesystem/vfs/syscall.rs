@@ -9,10 +9,9 @@ use alloc::{
 use crate::{
     driver::base::{block::SeekFrom, device::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
-    include::bindings::bindings::{verify_area, PROC_MAX_FD_NUM},
     kerror,
     libs::rwlock::RwLockWriteGuard,
-    mm::VirtAddr,
+    mm::{verify_area, VirtAddr},
     process::ProcessManager,
     syscall::{
         user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
@@ -465,7 +464,7 @@ impl Syscall {
         let dirent =
             unsafe { (buf.as_mut_ptr() as *mut Dirent).as_mut() }.ok_or(SystemError::EFAULT)?;
 
-        if fd < 0 || fd as u32 > PROC_MAX_FD_NUM {
+        if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
             return Err(SystemError::EBADF);
         }
 
@@ -994,12 +993,11 @@ impl IoVecs {
         _readv: bool,
     ) -> Result<Self, SystemError> {
         // 检查iov指针所在空间是否合法
-        if !verify_area(
-            iov as usize as u64,
-            (iovcnt * core::mem::size_of::<IoVec>()) as u64,
-        ) {
-            return Err(SystemError::EFAULT);
-        }
+        verify_area(
+            VirtAddr::new(iov as usize),
+            iovcnt * core::mem::size_of::<IoVec>(),
+        )
+        .map_err(|_| SystemError::EFAULT)?;
 
         // 将用户空间的IoVec转换为引用（注意：这里的引用是静态的，因为用户空间的IoVec不会被释放）
         let iovs: &[IoVec] = core::slice::from_raw_parts(iov, iovcnt);
@@ -1012,9 +1010,11 @@ impl IoVecs {
                 continue;
             }
 
-            if !verify_area(iov.iov_base as usize as u64, iov.iov_len as u64) {
-                return Err(SystemError::EFAULT);
-            }
+            verify_area(
+                VirtAddr::new(iov.iov_base as usize),
+                iovcnt * core::mem::size_of::<IoVec>(),
+            )
+            .map_err(|_| SystemError::EFAULT)?;
 
             slices.push(core::slice::from_raw_parts_mut(iov.iov_base, iov.iov_len));
         }

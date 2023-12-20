@@ -353,7 +353,7 @@ impl BusManager {
     ///
     /// todo: 增加错误处理逻辑
     pub fn register(&self, bus: Arc<dyn Bus>) -> Result<(), SystemError> {
-        bus.subsystem().set_bus(Arc::downgrade(&bus));
+        bus.subsystem().set_bus(Some(Arc::downgrade(&bus)));
 
         let subsys_kset = bus.subsystem().subsys();
         subsys_kset.set_name(bus.name());

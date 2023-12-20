@@ -495,7 +495,7 @@ impl SignalArch for X86_64SignalArch {
     }
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
-        let frame = (trap_frame.rsp as usize) as *mut SigFrame;
+        let frame = (trap_frame.rsp as usize - size_of::<u64>()) as *mut SigFrame;
 
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
         if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {

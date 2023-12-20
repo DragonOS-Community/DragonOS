@@ -1,7 +1,6 @@
 #pragma once
 
 #include <common/glib.h>
-#include <mm/mm-types.h>
 #include <process/process.h>
 
 extern void rs_pseudo_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size);
@@ -151,6 +150,7 @@ extern char _bss;
 extern char _ebss;
 extern char _end;
 
+#if ARCH(I386) || ARCH(X86_64)
 /**
  * @brief 读取CR3寄存器的值（存储了页目录的基地址）
  *
@@ -163,6 +163,8 @@ unsigned long *get_CR3()
                          : "=r"(tmp)::"memory");
     return tmp;
 }
+
+#endif
 
 /*
  *  vm_area_struct中的vm_flags的可选值

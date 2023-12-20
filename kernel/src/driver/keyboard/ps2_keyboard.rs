@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicI32;
+use core::{ffi::c_void, sync::atomic::AtomicI32};
 
 use alloc::sync::{Arc, Weak};
 
@@ -11,7 +11,7 @@ use crate::{
             Metadata, PollStatus,
         },
     },
-    include::bindings::bindings::{vfs_file_operations_t, vfs_file_t, vfs_index_node_t},
+    include::bindings::bindings::vfs_file_operations_t,
     libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
     syscall::SystemError,
     time::TimeSpec,
@@ -104,7 +104,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         let func = guard.f_ops.read.unwrap();
         let r = unsafe {
             func(
-                0 as *mut vfs_file_t,
+                0 as *mut c_void,
                 &mut buf[0..len] as *mut [u8] as *mut i8,
                 len as i64,
                 0 as *mut i64,
@@ -133,7 +133,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
             // 第一次打开，需要初始化
             let guard = self.0.write();
             let func = guard.f_ops.open.unwrap();
-            let _ = unsafe { func(0 as *mut vfs_index_node_t, 0 as *mut vfs_file_t) };
+            let _ = unsafe { func(0 as *mut c_void, 0 as *mut c_void) };
         }
         return Ok(());
     }
@@ -147,7 +147,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
             // 最后一次关闭，需要释放
             let guard = self.0.write();
             let func = guard.f_ops.close.unwrap();
-            let _ = unsafe { func(0 as *mut vfs_index_node_t, 0 as *mut vfs_file_t) };
+            let _ = unsafe { func(0 as *mut c_void, 0 as *mut c_void) };
         }
         return Ok(());
     }

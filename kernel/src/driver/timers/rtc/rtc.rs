@@ -1,7 +1,6 @@
 use crate::{
-    arch::CurrentIrqArch,
+    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     exception::InterruptArch,
-    include::bindings::bindings::{io_in8, io_out8},
     syscall::SystemError,
 };
 
@@ -63,7 +62,7 @@ impl RtcTime {
         }
 
         unsafe {
-            io_out8(0x70, 0x00);
+            CurrentPortIOArch::out8(0x70, 0x00);
         }
 
         if !is_binary
@@ -92,8 +91,8 @@ impl RtcTime {
 #[inline]
 fn read_cmos(addr: u8) -> u8 {
     unsafe {
-        io_out8(0x70, 0x80 | addr);
-        return io_in8(0x71);
+        CurrentPortIOArch::out8(0x70, 0x80 | addr);
+        return CurrentPortIOArch::in8(0x71);
     }
 }
 

@@ -7,7 +7,7 @@ CFLAGS += -I .
 
 libc_sub_dirs=math sys
 
-ifeq ($(ARCH), __x86_64__)
+ifeq ($(ARCH), x86_64)
 libc_sub_dirs += arch/x86_64
 endif
 
@@ -35,4 +35,4 @@ clean:
 libc: $(libc_objs) $(libc_sub_dirs) libc_rust
 
 libc_rust:
-	cargo +nightly-2023-01-21 build --release --target ./arch/x86_64/x86_64-unknown-none.json
+	cargo +nightly-2023-08-15 build --release --target ./arch/x86_64/x86_64-unknown-none.json

@@ -124,12 +124,9 @@
         "mm-types.h": "c",
         "vfs.h": "c",
         "current.h": "c",
-        "proc-types.h": "c",
         "traceback.h": "c",
         "bitcount.h": "c",
         "limits.h": "c",
-        "block.h": "c",
-        "blk_types.h": "c",
         "mutex.h": "c",
         "mount.h": "c",
         "internal.h": "c",
@@ -173,7 +170,9 @@
         "cmpxchg.h": "c",
         "mman.h": "c",
         "clocksource.h": "c",
-        "ata.h": "c"
+        "ata.h": "c",
+        "barrier": "c",
+        "charconv": "c"
     },
     "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",
@@ -182,8 +181,12 @@
         "./kernel/Cargo.toml",
         "./tools/Cargo.toml",
     ],
+    // "rust-analyzer.cargo.target": "riscv64imac-unknown-none-elf",
+    "rust-analyzer.cargo.target": "x86_64-unknown-none",
     "rust-analyzer.check.overrideCommand": [
         "make",
-        "check"
+        "check",
+        
     ],
+    
 }

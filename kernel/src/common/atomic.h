@@ -9,6 +9,8 @@
  *
  */
 #pragma once
+#if ARCH(I386) || ARCH(X86_64)
+
 #include <arch/x86_64/include/asm/cmpxchg.h>
 
 #define atomic_read(atomic) ((atomic)->value)               // 读取原子变量
@@ -105,3 +107,4 @@ inline long atomic_cmpxchg(atomic_t *ato, long oldval, long newval)
     bool success = arch_try_cmpxchg(&ato->value, &oldval, newval);
     return success ? oldval : newval;
 }
+#endif

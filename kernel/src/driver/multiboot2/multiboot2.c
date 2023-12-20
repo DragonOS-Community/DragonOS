@@ -11,7 +11,7 @@ unsigned int multiboot2_boot_info_size;
 static uint8_t mbi_raw[MBI_RAW_MAX_SIZE] = {0};
 bool multiboot2_init(uint64_t mb2_info_paddr, uint32_t mb2_magic)
 {
-  uint64_t vaddr = phys_2_virt(mb2_info_paddr);
+  uint64_t vaddr = (uint64_t)phys_2_virt(mb2_info_paddr);
   if (mb2_magic != MULTIBOOT2_BOOTLOADER_MAGIC)
     return false;
   // vaddr+0 处保存了大小
@@ -99,6 +99,20 @@ bool multiboot2_get_VBE_info(const struct iter_data_t *_iter_data, void *data, u
   if (_iter_data->type != MULTIBOOT_TAG_TYPE_VBE)
     return false;
   *(struct multiboot_tag_vbe_t *)data = *(struct multiboot_tag_vbe_t *)_iter_data;
+  return true;
+}
+
+/// @brief 获取加载基地址
+/// @param _iter_data 
+/// @param data 
+/// @param reserved 
+/// @return 
+bool multiboot2_get_load_base(const struct iter_data_t *_iter_data, void *data, unsigned int *reserved)
+{
+
+  if (_iter_data->type != MULTIBOOT_TAG_TYPE_LOAD_BASE_ADDR)
+    return false;
+  *(struct multiboot_tag_load_base_addr_t *)data = *(struct multiboot_tag_load_base_addr_t *)_iter_data;
   return true;
 }
 

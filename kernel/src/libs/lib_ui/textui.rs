@@ -37,7 +37,25 @@ pub const TEXTUI_CHAR_HEIGHT: u32 = 16;
 
 pub static mut TEXTUI_IS_INIT: bool = false;
 
-pub static ENABLE_PUT_TO_WINDOW: AtomicBool = AtomicBool::new(true);
+static ENABLE_PUT_TO_WINDOW: AtomicBool = AtomicBool::new(false);
+
+/// 启用将文本输出到窗口的功能。
+pub fn textui_enable_put_to_window() {
+    ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
+}
+
+/// 禁用将文本输出到窗口的功能。
+pub fn textui_disable_put_to_window() {
+    ENABLE_PUT_TO_WINDOW.store(false, Ordering::SeqCst);
+}
+
+/// 检查是否启用了将文本输出到窗口的功能。
+///
+/// # 返回
+/// 如果启用了将文本输出到窗口的功能，则返回 `true`，否则返回 `false`。
+pub fn textui_is_enable_put_to_window() -> bool {
+    ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst)
+}
 
 /// 获取TEXTUI_FRAMEWORK的可变实例
 pub fn textui_framework() -> Arc<TextUiFramework> {
@@ -748,6 +766,7 @@ impl TextuiWindow {
         if !self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return Ok(());
         }
+        send_to_default_serial8250_port(&[character as u8]);
 
         //进行换行操作
         if character == '\n' {
@@ -831,10 +850,6 @@ impl TextuiWindow {
                 }
             }
         } else {
-            // 输出其他字符
-
-            send_to_default_serial8250_port(&[character as u8]);
-
             if is_enable_window == true {
                 if let TextuiVline::Chromatic(vline) =
                     &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
@@ -907,12 +922,12 @@ impl ScmUiFramework for TextUiFramework {
     }
     // 启用ui框架的回调函数
     fn enable(&self) -> Result<i32, SystemError> {
-        ENABLE_PUT_TO_WINDOW.store(true, Ordering::SeqCst);
+        textui_enable_put_to_window();
         return Ok(0);
     }
     // 禁用ui框架的回调函数
     fn disable(&self) -> Result<i32, SystemError> {
-        ENABLE_PUT_TO_WINDOW.store(false, Ordering::SeqCst);
+        textui_disable_put_to_window();
 
         return Ok(0);
     }
@@ -989,7 +1004,7 @@ pub fn textui_putchar(
                 character,
                 fr_color,
                 bk_color,
-                ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
+                textui_is_enable_put_to_window(),
             );
     } else {
         //未初始化暴力输出
@@ -997,7 +1012,7 @@ pub fn textui_putchar(
             character,
             fr_color,
             bk_color,
-            ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
+            textui_is_enable_put_to_window(),
         );
     }
 }
@@ -1024,14 +1039,14 @@ pub fn textui_putstr(
                 character,
                 fr_color,
                 bk_color,
-                ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
+                textui_is_enable_put_to_window(),
             )?;
         } else {
             no_init_textui_putchar_window(
                 character,
                 fr_color,
                 bk_color,
-                ENABLE_PUT_TO_WINDOW.load(Ordering::SeqCst),
+                textui_is_enable_put_to_window(),
             )?;
         }
     }

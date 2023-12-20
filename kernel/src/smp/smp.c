@@ -5,18 +5,21 @@
 #include <exception/gate.h>
 #include <mm/slab.h>
 #include <process/process.h>
+#include <arch/x86_64/driver/apic/apic_timer.h>
 
 #include <process/preempt.h>
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
 #include "exception/trap.h"
+#include "exception/irq.h"
 #include "ipi.h"
+#include <arch/arch.h>
 
 /* x86-64 specific MSRs */
-#define MSR_EFER		0xc0000080 /* extended feature register */
-#define MSR_STAR		0xc0000081 /* legacy mode SYSCALL target */
-#define MSR_LSTAR		0xc0000082 /* long mode SYSCALL target */
-#define MSR_SYSCALL_MASK	0xc0000084 /* EFLAGS mask for syscall */
+#define MSR_EFER 0xc0000080         /* extended feature register */
+#define MSR_STAR 0xc0000081         /* legacy mode SYSCALL target */
+#define MSR_LSTAR 0xc0000082        /* long mode SYSCALL target */
+#define MSR_SYSCALL_MASK 0xc0000084 /* EFLAGS mask for syscall */
 
 static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
 static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
@@ -55,6 +58,7 @@ static struct X86CpuInfo __cpu_info[MAX_SUPPORTED_PROCESSOR_NUM] = {0};
 void smp_init()
 {
     spin_init(&multi_core_starting_lock); // 初始化多核启动锁
+#if ARCH(I386) || ARCH(X86_64)
     // 设置多核启动时，要加载的页表
     __APU_START_CR3 = (uint64_t)get_CR3();
 
@@ -77,7 +81,7 @@ void smp_init()
 
     kdebug("total_processor_num=%d", total_processor_num);
     // 注册接收kick_cpu功能的处理函数。（向量号200）
-    ipi_regiserIPI(KICK_CPU_IRQ_NUM, NULL, &__smp_kick_cpu_handler, NULL, NULL, "IPI kick cpu");
+    ipi_regiserIPI(KICK_CPU_IRQ_NUM, NULL, &__smp_kick_cpu_handler, (uint64_t)NULL, NULL, "IPI kick cpu");
     ipi_regiserIPI(FLUSH_TLB_IRQ_NUM, NULL, &__smp__flush_tlb_ipi_handler, NULL, NULL, "IPI flush tlb");
 
     int core_to_start = 0;
@@ -116,7 +120,8 @@ void smp_init()
         // 连续发送两次start-up IPI
 
         int r = rs_ipi_send_smp_startup(__cpu_info[i].apic_id);
-        if(r){
+        if (r)
+        {
             kerror("Failed to send startup ipi to cpu: %d", __cpu_info[i].apic_id);
         }
         io_mfence();
@@ -133,6 +138,7 @@ void smp_init()
     // 由于ap处理器初始化过程需要用到0x00处的地址，因此初始化完毕后才取消内存地址的重映射
     rs_unmap_at_low_addr();
     kinfo("Successfully cleaned page table remapping!\n");
+#endif
     io_mfence();
 }
 
@@ -147,7 +153,7 @@ void smp_ap_start_stage2()
     io_mfence();
     ++num_cpu_started;
     io_mfence();
-
+#if ARCH(I386) || ARCH(X86_64)
     rs_apic_init_ap();
 
     // ============ 为ap处理器初始化IDLE进程 =============
@@ -160,7 +166,7 @@ void smp_ap_start_stage2()
     rs_init_syscall_64();
     
     apic_timer_ap_core_init();
-
+#endif
 
     sti();
     sched();

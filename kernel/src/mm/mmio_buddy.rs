@@ -354,7 +354,7 @@ impl MmioBuddyMemPool {
             // element 只会有一个元素
             let mut element: Vec<MmioBuddyAddrRegion> = list_guard
                 .list
-                .drain_filter(|x| x.vaddr == buddy_vaddr)
+                .extract_if(|x| x.vaddr == buddy_vaddr)
                 .collect();
             if element.len() == 1 {
                 list_guard.num_free -= 1;
@@ -480,7 +480,7 @@ impl MmioBuddyMemPool {
             return Err(SystemError::EPERM);
         }
         // 计算前导0
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         let mut size_exp: u32 = 63 - size.leading_zeros();
         // kdebug!("create_mmio: size_exp: {}", size_exp);
         // 记录最终申请的空间大小

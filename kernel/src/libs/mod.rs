@@ -1,5 +1,4 @@
 pub mod align;
-pub mod atomic;
 pub mod casting;
 pub mod elf;
 pub mod ffi_convert;

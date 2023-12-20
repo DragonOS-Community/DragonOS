@@ -1,4 +1,7 @@
-use core::{fmt, ops};
+use core::{
+    fmt,
+    ops::{self, Sub},
+};
 
 use self::timekeep::ktime_get_real_ns;
 
@@ -51,6 +54,30 @@ impl TimeSpec {
             tv_sec: sec,
             tv_nsec: nsec,
         };
+    }
+}
+
+impl Sub for TimeSpec {
+    type Output = Duration;
+    fn sub(self, rhs: Self) -> Self::Output {
+        let sec = self.tv_sec.checked_sub(rhs.tv_sec).unwrap_or(0);
+        let nsec = self.tv_nsec.checked_sub(rhs.tv_nsec).unwrap_or(0);
+        Duration::from_micros((sec * 1000000 + nsec / 1000) as u64)
+    }
+}
+
+impl From<Duration> for TimeSpec {
+    fn from(dur: Duration) -> Self {
+        TimeSpec {
+            tv_sec: dur.total_micros() as i64 / 1000000,
+            tv_nsec: (dur.total_micros() as i64 % 1000000) * 1000,
+        }
+    }
+}
+
+impl Into<Duration> for TimeSpec {
+    fn into(self) -> Duration {
+        Duration::from_micros(self.tv_sec as u64 * 1000000 + self.tv_nsec as u64 / 1000)
     }
 }
 

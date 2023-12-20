@@ -73,6 +73,7 @@ impl DowncastArc for dyn KObject {
 }
 
 pub trait KObjType: Debug + Send + Sync {
+    /// 当指定的kobject被释放时，设备驱动模型会调用此方法
     fn release(&self, _kobj: Arc<dyn KObject>) {}
     fn sysfs_ops(&self) -> Option<&dyn SysFSOps>;
 
@@ -224,6 +225,26 @@ impl KObjectManager {
         }
 
         return Ok(());
+    }
+
+    /// 从sysfs中移除kobject
+    pub fn remove_kobj(kobj: Arc<dyn KObject>) {
+        let ktype = kobj.kobj_type();
+        if let Some(ktype) = ktype {
+            if let Some(groups) = ktype.attribute_groups() {
+                sysfs_instance().remove_groups(&kobj, groups);
+            }
+        }
+
+        // todo: 发送uevent: KOBJ_REMOVE
+
+        sysfs_instance().remove_dir(&kobj);
+        kobj.update_kobj_state(None, Some(KObjectState::IN_SYSFS));
+        let kset = kobj.kset();
+        if let Some(kset) = kset {
+            kset.leave(&kobj);
+        }
+        kobj.set_parent(None);
     }
 }
 

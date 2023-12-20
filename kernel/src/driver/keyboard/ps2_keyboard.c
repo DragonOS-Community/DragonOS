@@ -44,7 +44,7 @@ hardware_intr_controller ps2_keyboard_intr_controller =
  * @param filp 文件指针
  * @return long
  */
-long ps2_keyboard_open(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
+long ps2_keyboard_open(void *inode, void *filp)
 {
     ps2_keyboard_reset_buffer(&kb_buf);
     return 0;
@@ -57,7 +57,7 @@ long ps2_keyboard_open(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
  * @param filp 文件指针
  * @return long
  */
-long ps2_keyboard_close(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
+long ps2_keyboard_close(void *inode, void *filp)
 {
     ps2_keyboard_reset_buffer(&kb_buf);
     return 0;
@@ -72,7 +72,7 @@ long ps2_keyboard_close(struct vfs_index_node_t *inode, struct vfs_file_t *filp)
  * @param arg 参数
  * @return long
  */
-long ps2_keyboard_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *filp, uint64_t cmd, uint64_t arg)
+long ps2_keyboard_ioctl(void *inode, void *filp, uint64_t cmd, uint64_t arg)
 {
     switch (cmd)
     {
@@ -95,7 +95,7 @@ long ps2_keyboard_ioctl(struct vfs_index_node_t *inode, struct vfs_file_t *filp,
  * @param position 读取的位置
  * @return long 读取的字节数
  */
-long ps2_keyboard_read(struct vfs_file_t *filp, char *buf, int64_t count, long *position)
+long ps2_keyboard_read(void *filp, char *buf, int64_t count, long *position)
 {
     // 缓冲区为空则等待
     while (kfifo_empty(&kb_buf))
@@ -114,7 +114,7 @@ long ps2_keyboard_read(struct vfs_file_t *filp, char *buf, int64_t count, long *
  * @param position
  * @return long
  */
-long ps2_keyboard_write(struct vfs_file_t *filp, char *buf, int64_t count, long *position)
+long ps2_keyboard_write(void *filp, char *buf, int64_t count, long *position)
 {
     return 0;
 }

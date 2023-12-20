@@ -12,7 +12,7 @@ crate-type = ["staticlib"]
 [workspace]
 members = [ 
     "crates/*",
-    "src/libs/intertrait" 
+    "src/libs/intertrait"
 ]
 
 [features]
@@ -23,8 +23,6 @@ backtrace = []
 
 # 运行时依赖项
 [dependencies]
-x86 = "0.52.0"
-x86_64 = "0.14.10"
 bit_field = "0.10"
 bitflags = "1.3.2"
 bitfield-struct = "0.5.3"
@@ -43,15 +41,19 @@ acpi = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/acpi-rs.git"
 intertrait = { path = "src/libs/intertrait" }
 linkme = "0.2"
 ida = { path = "src/libs/ida" }
-mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
 klog_types = { path = "crates/klog_types" }
 kdepends = { path = "crates/kdepends" }
+
+# target为x86_64时，使用下面的依赖
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86 = "0.52.0"
+x86_64 = "0.14.10"
+mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
 
 
 # 构建时依赖项
 [build-dependencies]
-bindgen = "0.61.0"
-cc = { version = "1.0.83", features = ["parallel"] }
+kernel_build = { path = "../build-scripts/kernel_build" }
 
 [dependencies.lazy_static]
 version = "1.4.0"

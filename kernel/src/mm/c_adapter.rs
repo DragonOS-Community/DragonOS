@@ -6,8 +6,7 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use crate::{
-    arch::mm::LowAddressRemapping,
-    include::bindings::bindings::{gfp_t, vm_flags_t, PAGE_U_S},
+    include::bindings::bindings::{gfp_t, PAGE_U_S},
     kerror,
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::MMArch,
@@ -120,12 +119,6 @@ pub unsafe extern "C" fn kfree(vaddr: usize) -> usize {
     return 0;
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn rs_unmap_at_low_addr() -> usize {
-    LowAddressRemapping::unmap_at_low_address(true);
-    return 0;
-}
-
 /// @brief 创建一块mmio区域，并将vma绑定到initial_mm
 ///
 /// @param size mmio区域的大小（字节）
@@ -140,7 +133,7 @@ pub unsafe extern "C" fn rs_unmap_at_low_addr() -> usize {
 #[no_mangle]
 unsafe extern "C" fn rs_mmio_create(
     size: u32,
-    _vm_flags: vm_flags_t,
+    _vm_flags: u64,
     res_vaddr: *mut u64,
     res_length: *mut u64,
 ) -> i32 {

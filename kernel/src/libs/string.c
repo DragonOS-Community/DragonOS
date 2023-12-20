@@ -38,47 +38,27 @@ long strnlen(const char *src, unsigned long maxlen)
         FirstPart > SecondPart =>  1
         FirstPart < SecondPart => -1
 */
-
-int strcmp(const char *FirstPart, const char *SecondPart)
+int strcmp(const char *l, const char *r)
 {
-    register int __res;
-    __asm__ __volatile__("cld	\n\t"
-                         "1:	\n\t"
-                         "lodsb	\n\t"
-                         "scasb	\n\t"
-                         "jne	2f	\n\t"
-                         "testb	%%al,	%%al	\n\t"
-                         "jne	1b	\n\t"
-                         "xorl	%%eax,	%%eax	\n\t"
-                         "jmp	3f	\n\t"
-                         "2:	\n\t"
-                         "movl	$1,	%%eax	\n\t"
-                         "jl	3f	\n\t"
-                         "negl	%%eax	\n\t"
-                         "3:	\n\t"
-                         : "=a"(__res)
-                         : "D"(FirstPart), "S"(SecondPart)
-                         :);
-    return __res;
+    for (; *l == *r && *l; l++, r++)
+        ;
+    return *(unsigned char *)l - *(unsigned char *)r;
 }
 
-char *strncpy(char *dst, const char *src, long count)
+char *__stpncpy(char *restrict d, const char *restrict s, size_t n)
 {
-    __asm__ __volatile__("cld	\n\t"
-                         "1:	\n\t"
-                         "decq	%2	\n\t"
-                         "js	2f	\n\t"
-                         "lodsb	\n\t"
-                         "stosb	\n\t"
-                         "testb	%%al,	%%al	\n\t"
-                         "jne	1b	\n\t"
-                         "rep	\n\t"
-                         "stosb	\n\t"
-                         "2:	\n\t"
-                         :
-                         : "S"(src), "D"(dst), "c"(count)
-                         : "ax", "memory");
-    return dst;
+
+    for (; n && (*d = *s); n--, s++, d++)
+        ;
+tail:
+    memset(d, 0, n);
+    return d;
+}
+
+char *strncpy(char *restrict d, const char *restrict s, size_t n)
+{
+    __stpncpy(d, s, n);
+    return d;
 }
 
 long strncpy_from_user(char *dst, const char *src, unsigned long size)

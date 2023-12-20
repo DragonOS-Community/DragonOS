@@ -5,7 +5,19 @@ if [ ! $uid == "0" ];then
  exit
 fi
 
-LOOP_DEVICE=$(losetup -f --show -P ../bin/disk.img) \
+# 检查是否设置ARCH环境变量
+
+if [ ! ${ARCH} ];then
+ echo "请设置ARCH环境变量"
+ exit
+fi
+
+
+DISK_NAME=disk-${ARCH}.img
+
+echo "Mounting virtual disk image '${DISK_NAME}'..."
+
+LOOP_DEVICE=$(losetup -f --show -P ../bin/${DISK_NAME}) \
     || exit 1
 
 echo ${LOOP_DEVICE}p1

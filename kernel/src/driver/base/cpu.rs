@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::{
+    class::Class,
     device::{
         bus::{subsystem_manager, Bus},
         driver::Driver,
@@ -59,12 +60,11 @@ struct CpuSubSystem {
 
 impl CpuSubSystem {
     pub fn new() -> Arc<Self> {
-        let default_weak: Weak<Self> = Weak::new();
         let bus = Arc::new(Self {
-            subsys_private: SubSysPrivate::new("cpu".to_string(), default_weak, &[]),
+            subsys_private: SubSysPrivate::new("cpu".to_string(), None, None, &[]),
         });
         bus.subsystem()
-            .set_bus(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>)));
+            .set_bus(Some(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>))));
         return bus;
     }
 }
@@ -149,7 +149,7 @@ impl Device for CpuSubSystemFakeRootDevice {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new("cpu".to_string(), DeviceNumber::new(0))
+        IdTable::new("cpu".to_string(), Some(DeviceNumber::new(0)))
     }
 
     fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
@@ -178,6 +178,10 @@ impl Device for CpuSubSystemFakeRootDevice {
 
     fn state_synced(&self) -> bool {
         true
+    }
+
+    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+        todo!()
     }
 }
 

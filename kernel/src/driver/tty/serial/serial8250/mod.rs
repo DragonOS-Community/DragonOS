@@ -12,6 +12,7 @@ use alloc::{
 use crate::{
     driver::{
         base::{
+            class::Class,
             device::{
                 bus::Bus, device_manager, driver::Driver, Device, DeviceKObjType, DeviceNumber,
                 DeviceState, DeviceType, IdTable,
@@ -59,12 +60,17 @@ pub(super) fn serial8250_manager() -> &'static Serial8250Manager {
     &Serial8250Manager
 }
 
+/// 标记serial8250是否已经初始化
+static mut INITIALIZED: bool = false;
+
 #[derive(Debug)]
 pub(super) struct Serial8250Manager;
 
 impl Serial8250Manager {
     /// 初始化串口设备（在内存管理初始化之前）
     pub fn early_init(&self) -> Result<(), SystemError> {
+        // todo: riscv64: 串口设备初始化
+        #[cfg(not(target_arch = "riscv64"))]
         serial8250_pio_port_early_init()?;
         return Ok(());
     }
@@ -101,9 +107,13 @@ impl Serial8250Manager {
                 return e;
             })?;
 
-        // todo: 把驱动注册到platform总线
+        // 把驱动注册到platform总线
         platform_driver_manager()
             .register(serial8250_isa_driver.clone() as Arc<dyn PlatformDriver>)?;
+
+        unsafe {
+            INITIALIZED = true;
+        }
 
         return Ok(());
     }
@@ -219,7 +229,7 @@ impl Device for Serial8250ISADevices {
     }
 
     fn id_table(&self) -> IdTable {
-        return IdTable::new(self.name.to_string(), DeviceNumber::new(0));
+        return IdTable::new(self.name.to_string(), Some(DeviceNumber::new(0)));
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
@@ -240,6 +250,10 @@ impl Device for Serial8250ISADevices {
 
     fn state_synced(&self) -> bool {
         true
+    }
+
+    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+        todo!()
     }
 }
 
@@ -469,7 +483,7 @@ impl Driver for Serial8250ISADriver {
     fn delete_device(&self, device: &Arc<dyn Device>) {
         let mut inner = self.inner.write();
 
-        inner.devices.drain_filter(|d| Arc::ptr_eq(d, device));
+        inner.devices.retain(|d| !Arc::ptr_eq(d, device));
     }
 
     fn bus(&self) -> Option<Arc<dyn Bus>> {
@@ -539,5 +553,15 @@ impl KObject for Serial8250ISADriver {
 
 /// 临时函数，用于向默认的串口发送数据
 pub fn send_to_default_serial8250_port(s: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
     send_to_serial8250_pio_com1(s);
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        if unsafe { INITIALIZED } {
+            todo!("riscv64: send_to_default_serial8250_port")
+        } else {
+            unsafe { crate::arch::driver::sbi::console_putstr(s) };
+        }
+    }
 }

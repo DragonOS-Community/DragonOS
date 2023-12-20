@@ -28,6 +28,8 @@ use crate::{
     time::timer::{Timer, TimerFunction},
 };
 
+pub mod fbdev;
+
 static mut __MAMAGER: Option<VideoRefreshManager> = None;
 
 pub fn video_refresh_manager() -> &'static VideoRefreshManager {

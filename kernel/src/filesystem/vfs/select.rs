@@ -1,8 +1,9 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::spinlock::SpinLock,
     process::{ProcessControlBlock, ProcessManager},
+    sched::core::do_sched,
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall, SystemError,
@@ -15,7 +16,9 @@ use super::{file::File, PollStatus};
 /// @brief PollWqueues 对外的接口
 pub trait PollTable {
     /// @brief 文件的 poll() 函数内部会调用该函数使得当前进程挂载到对应的等待队列
-    fn poll_wait(&mut self, file: Arc<File>, wait_queue: Arc<WaitQueue>);
+    fn poll_wait(&self, file: Arc<File>, wait_queue: Arc<SpinLock<PollWaitQueue>>);
+    fn poll_freewait(&self);
+    fn poll_schedule_timeout(&self);
 }
 
 /// @brief 每个调用 select/poll 的进程都会维护一个 PollWqueues，用于轮询
@@ -28,14 +31,29 @@ impl PollWqueues {
 }
 
 impl PollTable for PollWqueues {
-    fn poll_wait(&mut self, file: Arc<File>, wait_queue: Arc<WaitQueue>) {
+    fn poll_wait(&self, file: Arc<File>, wait_queue: Arc<SpinLock<PollWaitQueue>>) {
         if self.0.lock().pt == false {
             return;
         }
 
-        let entry = PollTableEntry::new(file, self.0.lock().key, wait_queue, self.0.clone());
-        self.0.lock().poll_table.push(entry);
+        let entry = Arc::new(PollTableEntry::new(
+            file,
+            self.0.lock().key,
+            wait_queue,
+            self.0.clone(),
+        ));
+        self.0.lock().poll_table.push(entry.clone());
         // TODO: 将当前进程加入等待队列
+    }
+
+    /// @brief 将所有的 entry 从等待队列中删除
+    fn poll_freewait(&self) {
+        self.0.lock().poll_freewait();
+    }
+
+    /// @brief 阻塞当前进程直到被唤醒或超时
+    fn poll_schedule_timeout(&self) {
+        do_sched();
     }
 }
 
@@ -48,7 +66,7 @@ struct PollWqueuesInner {
     polling_task: Arc<ProcessControlBlock>,
     triggered: bool,
     error: Option<SystemError>,
-    poll_table: Vec<PollTableEntry>,
+    poll_table: Vec<Arc<PollTableEntry>>,
 }
 
 impl PollWqueuesInner {
@@ -63,13 +81,24 @@ impl PollWqueuesInner {
             poll_table: vec![],
         }
     }
+
+    /// @brief 将所有的 entry 从监听的等待队列中删除
+    fn poll_freewait(&mut self) {
+        for entry in self.poll_table.iter_mut() {
+            entry.wait_queue.lock().remove(entry.clone());
+        }
+    }
 }
 
 /// @brief 对应每一个 IO 监听事件
 struct PollTableEntry {
+    /// 监听的文件
     file: Arc<File>,
+    /// 监听的事件
     key: PollStatus,
-    wait_queue: Arc<WaitQueue>,
+    /// 所在的等待队列
+    wait_queue: Arc<SpinLock<PollWaitQueue>>,
+    /// 所在的 PollWqueues
     pwq: Arc<SpinLock<PollWqueuesInner>>,
 }
 
@@ -77,7 +106,7 @@ impl PollTableEntry {
     fn new(
         file: Arc<File>,
         key: PollStatus,
-        wait_queue: Arc<WaitQueue>,
+        wait_queue: Arc<SpinLock<PollWaitQueue>>,
         pwq: Arc<SpinLock<PollWqueuesInner>>,
     ) -> Self {
         Self {
@@ -86,6 +115,51 @@ impl PollTableEntry {
             wait_queue,
             pwq,
         }
+    }
+
+    /// @brief 在等待队列唤醒后的回调函数
+    fn callback(&self) {}
+}
+
+pub struct PollWaitQueue(Vec<Arc<PollTableEntry>>);
+
+impl PollWaitQueue {
+    pub fn new() -> Self {
+        Self(vec![])
+    }
+
+    /// @brief 标记当前进程为睡眠状态但不进行调度
+    pub fn wait(&mut self, entry: Arc<PollTableEntry>) {
+        self.0.push(entry);
+        ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
+            panic!("sleep error: {:?}", e);
+        });
+    }
+
+    /// @brief 唤醒等待队列中满足指定监听事件的 entry
+    pub fn wakeup(&mut self, key: PollStatus) {
+        let mut temp = vec![];
+
+        for entry in self.0.iter_mut() {
+            if entry.key & key != PollStatus::empty() {
+                temp.push(entry.clone());
+                // 唤醒对应的进程
+                ProcessManager::wakeup(&entry.pwq.lock().polling_task);
+            }
+        }
+
+        // 从等待队列中删除
+        self.0.drain_filter(|x| x.key & key != PollStatus::empty());
+        // 进行回调函数
+        for entry in temp.iter_mut() {
+            entry.callback();
+        }
+    }
+
+    /// @brief 在等待队列中删除指定元素
+    fn remove(&mut self, entry: Arc<PollTableEntry>) {
+        self.0
+            .drain_filter(|x| Arc::as_ptr(x) == Arc::as_ptr(&entry));
     }
 }
 
@@ -191,7 +265,7 @@ impl Syscall {
         drop(user_reader);
 
         let fdcount = Self::do_poll(nfds, &mut poll_list, &mut poll_wqueues, end_time)?;
-        drop(poll_wqueues);
+        poll_wqueues.poll_freewait();
 
         // 将 pollfd 从内核空间拷贝会用户空间
         let mut user_writer = UserBufferWriter::new(ufds, nfds, true)?;
@@ -245,8 +319,8 @@ impl Syscall {
                 todo!();
             };
 
-            // 阻塞进行调度，被唤醒要么是超时，要么是监听到事件发生
-            // poll_wqueues.poll_schedule_timeout(expires)?;
+            // 阻塞进行调度，被唤醒时要么是超时，要么是监听到事件发生
+            poll_wqueues.poll_schedule_timeout();
             timed_out = true;
         }
 

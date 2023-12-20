@@ -19,7 +19,28 @@ pub trait PollTable {
 }
 
 /// @brief 每个调用 select/poll 的进程都会维护一个 PollWqueues，用于轮询
-struct PollWqueues {
+struct PollWqueues(Arc<PollWqueuesInner>);
+
+impl PollWqueues {
+    fn new() -> Self {
+        Self(Arc::new(PollWqueuesInner::new()))
+    }
+}
+
+impl PollTable for PollWqueues {
+    fn poll_wait(&mut self, file: Arc<File>, wait_queue: Arc<WaitQueue>) {
+        let mut inner = self.0;
+        if inner.pt == false {
+            return;
+        }
+
+        let entry = PollTableEntry::new(file, inner.key, wait_queue, inner);
+        inner.poll_table.push(entry);
+        // TODO: 将当前进程加入等待队列
+    }
+}
+
+struct PollWqueuesInner {
     /// 是否执行挂载等待队列并阻塞
     pt: bool,
     /// 关注的事件
@@ -31,7 +52,7 @@ struct PollWqueues {
     poll_table: Vec<PollTableEntry>,
 }
 
-impl PollWqueues {
+impl PollWqueuesInner {
     /// @brief 初始化 PollWqueues 结构体，对应 Linux 的 poll_init_wait()
     fn new() -> Self {
         Self {
@@ -50,53 +71,28 @@ impl PollWqueues {
     }
 }
 
-impl PollTable for PollWqueues {
-    fn poll_wait(&mut self, file: Arc<File>, wait_queue: Arc<WaitQueue>) {
-        if self.pt == false {
-            return;
-        }
-
-        let entry = PollTableEntry::new(file, self.key, wait_queue);
-        self.poll_table.push(entry);
-        // TODO: 将当前进程加入等待队列
-    }
-}
-
-impl Drop for PollWqueues {
-    /// @brief 将 poll_table 的所有元素从对应的等待队列中移除
-    fn drop(&mut self) {
-        todo!()
-    }
-}
-
 /// @brief 对应每一个 IO 监听事件
 struct PollTableEntry {
     file: Arc<File>,
     key: PollStatus,
     wait_queue: Arc<WaitQueue>,
-    // TODO: 等待队列项
+    pwq: Arc<PollWqueuesInner>,
 }
 
 impl PollTableEntry {
-    fn new(file: Arc<File>, key: PollStatus, wait_queue: Arc<WaitQueue>) -> Self {
+    fn new(
+        file: Arc<File>,
+        key: PollStatus,
+        wait_queue: Arc<WaitQueue>,
+        pwq: Arc<PollWqueuesInner>,
+    ) -> Self {
         Self {
             file,
             key,
             wait_queue,
+            pwq,
         }
     }
-}
-
-impl Drop for PollTableEntry {
-    /// @brief 将自身从对应的等待队列中移除
-    fn drop(&mut self) {
-        todo!()
-    }
-}
-
-/// @brief 唤醒函数
-fn poll_wake() {
-    todo!()
 }
 
 /// @brief 系统调用 poll 使用的事件监视结构体

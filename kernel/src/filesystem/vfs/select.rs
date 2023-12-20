@@ -39,11 +39,11 @@ impl PollTable for PollWqueues {
         let entry = Arc::new(PollTableEntry::new(
             file,
             self.0.lock().key,
-            wait_queue,
+            wait_queue.clone(),
             self.0.clone(),
         ));
         self.0.lock().poll_table.push(entry.clone());
-        // TODO: 将当前进程加入等待队列
+        wait_queue.lock().wait(entry.clone());
     }
 
     /// @brief 将所有的 entry 从等待队列中删除
@@ -91,7 +91,7 @@ impl PollWqueuesInner {
 }
 
 /// @brief 对应每一个 IO 监听事件
-struct PollTableEntry {
+pub struct PollTableEntry {
     /// 监听的文件
     file: Arc<File>,
     /// 监听的事件

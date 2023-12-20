@@ -103,9 +103,9 @@ fn poll_wake() {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PosixPollfd {
-    fd: i32,        // 监视的文件描述符
-    events: u16,    // 关注的事件类型
-    revents: u16,   // 返回的事件类型
+    fd: i32,      // 监视的文件描述符
+    events: u16,  // 关注的事件类型
+    revents: u16, // 返回的事件类型
 }
 
 impl From<Pollfd> for PosixPollfd {
@@ -215,6 +215,8 @@ impl Syscall {
     }
 
     /// @brief 轮询监听的文件描述符
+    /// TODO: 允许忙等待机制
+    /// TODO: 处理信号
     fn do_poll(
         nfds: usize,
         poll_list: &mut PollList,
@@ -223,7 +225,6 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let mut fdcount: usize = 0; // 监听事件发生的数量
         let mut timed_out = false; // 是否已经超时
-        let mut busy_flag = PollStatus::empty(); // TODO: 设置允许忙等待标志 busy_flag
 
         // 优化无需阻塞的情景
         if end_time.is_none() || (end_time.unwrap().tv_sec == 0 && end_time.unwrap().tv_nsec == 0) {
@@ -233,36 +234,28 @@ impl Syscall {
 
         // 轮询
         loop {
-            let mut can_busy_loop = false;
             for pollfd in poll_list.entries.iter_mut() {
-                let mask = Self::do_pollfd(pollfd, poll_wqueues, &mut can_busy_loop, busy_flag)?;
+                let mask = Self::do_pollfd(pollfd, poll_wqueues)?;
                 if !mask.is_empty() {
                     fdcount += 1;
                     // 已找到目标事件，无需再进行阻塞或忙等待
                     poll_wqueues.pt = false;
-                    busy_flag = PollStatus::empty(); 
-                    can_busy_loop = false;
                 }
             }
-            
+
             // 所有的监听已经注册挂载，无需再阻塞进行挂载
             poll_wqueues.pt = false;
-            if fdcount == 0 {
-                // TODO: 有待处理信号
-                unimplemented!();
-            }
             // 有事件响应或已经超时
             if fdcount > 0 || timed_out == true {
                 break;
             }
-            // TODO: 忙等待机制
 
             // 在第一次循环结束时，即进入阻塞前，设置超时时间
             if let Some(end_time) = end_time {
                 todo!();
             };
 
-            // 阻塞进行调度
+            // 阻塞进行调度，被唤醒要么是超时，要么是监听到事件发生
             // poll_wqueues.poll_schedule_timeout(expires)?;
             timed_out = true;
         }
@@ -271,14 +264,13 @@ impl Syscall {
     }
 
     /// @brief 对 pollfd 调用对应的 poll() 方法
+    /// TODO: 允许忙等待机制
     fn do_pollfd(
         pollfd: &mut Pollfd,
-        poll_wqueues: &mut PollWqueues,
-        _can_busy_loop: &mut bool,
-        _busy_flag: PollStatus,
+        _poll_wqueues: &mut PollWqueues,
     ) -> Result<PollStatus, SystemError> {
         let fd = pollfd.fd;
-        
+
         if fd < 0 {
             return Err(SystemError::EINVAL);
         }
@@ -293,8 +285,6 @@ impl Syscall {
         // TODO: 等待队列机制
         let mask = file_guard.inode().poll()?;
         pollfd.revents = mask;
-
-        // TODO: 忙等待机制
 
         return Ok(mask);
     }

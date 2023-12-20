@@ -1,13 +1,13 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    libs::wait_queue::WaitQueue,
+    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     process::{ProcessControlBlock, ProcessManager},
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall, SystemError,
     },
-    time::{timekeep::ktime_t, TimeSpec, MSEC_PER_SEC, NSEC_PER_MSEC},
+    time::{TimeSpec, MSEC_PER_SEC, NSEC_PER_MSEC},
 };
 
 use super::{file::File, PollStatus};
@@ -19,23 +19,22 @@ pub trait PollTable {
 }
 
 /// @brief 每个调用 select/poll 的进程都会维护一个 PollWqueues，用于轮询
-struct PollWqueues(Arc<PollWqueuesInner>);
+struct PollWqueues(Arc<SpinLock<PollWqueuesInner>>);
 
 impl PollWqueues {
     fn new() -> Self {
-        Self(Arc::new(PollWqueuesInner::new()))
+        Self(Arc::new(SpinLock::new(PollWqueuesInner::new())))
     }
 }
 
 impl PollTable for PollWqueues {
     fn poll_wait(&mut self, file: Arc<File>, wait_queue: Arc<WaitQueue>) {
-        let mut inner = self.0;
-        if inner.pt == false {
+        if self.0.lock().pt == false {
             return;
         }
 
-        let entry = PollTableEntry::new(file, inner.key, wait_queue, inner);
-        inner.poll_table.push(entry);
+        let entry = PollTableEntry::new(file, self.0.lock().key, wait_queue, self.0.clone());
+        self.0.lock().poll_table.push(entry);
         // TODO: 将当前进程加入等待队列
     }
 }
@@ -64,11 +63,6 @@ impl PollWqueuesInner {
             poll_table: vec![],
         }
     }
-
-    /// @brief 在 poll 等待期间设置超时
-    fn poll_schedule_timeout(&self, expires: ktime_t) -> Result<(), SystemError> {
-        todo!()
-    }
 }
 
 /// @brief 对应每一个 IO 监听事件
@@ -76,7 +70,7 @@ struct PollTableEntry {
     file: Arc<File>,
     key: PollStatus,
     wait_queue: Arc<WaitQueue>,
-    pwq: Arc<PollWqueuesInner>,
+    pwq: Arc<SpinLock<PollWqueuesInner>>,
 }
 
 impl PollTableEntry {
@@ -84,7 +78,7 @@ impl PollTableEntry {
         file: Arc<File>,
         key: PollStatus,
         wait_queue: Arc<WaitQueue>,
-        pwq: Arc<PollWqueuesInner>,
+        pwq: Arc<SpinLock<PollWqueuesInner>>,
     ) -> Self {
         Self {
             file,
@@ -108,8 +102,8 @@ impl From<Pollfd> for PosixPollfd {
     fn from(value: Pollfd) -> Self {
         Self {
             fd: value.fd,
-            events: value.events.bits(),
-            revents: value.revents.bits(),
+            events: value.events.bits() as u16,
+            revents: value.revents.bits() as u16,
         }
     }
 }
@@ -124,8 +118,8 @@ impl From<PosixPollfd> for Pollfd {
     fn from(value: PosixPollfd) -> Self {
         Self {
             fd: value.fd,
-            events: PollStatus::from_bits_truncate(value.events),
-            revents: PollStatus::from_bits_truncate(value.revents),
+            events: PollStatus::from_bits_truncate(value.events as u8),
+            revents: PollStatus::from_bits_truncate(value.revents as u8),
         }
     }
 }
@@ -224,7 +218,7 @@ impl Syscall {
 
         // 优化无需阻塞的情景
         if end_time.is_none() || (end_time.unwrap().tv_sec == 0 && end_time.unwrap().tv_nsec == 0) {
-            poll_wqueues.pt = false;
+            poll_wqueues.0.lock().pt = false;
             timed_out = true;
         }
 
@@ -235,12 +229,12 @@ impl Syscall {
                 if !mask.is_empty() {
                     fdcount += 1;
                     // 已找到目标事件，无需再进行阻塞或忙等待
-                    poll_wqueues.pt = false;
+                    poll_wqueues.0.lock().pt = false;
                 }
             }
 
             // 所有的监听已经注册挂载，无需再阻塞进行挂载
-            poll_wqueues.pt = false;
+            poll_wqueues.0.lock().pt = false;
             // 有事件响应或已经超时
             if fdcount > 0 || timed_out == true {
                 break;

@@ -89,7 +89,7 @@ write_diskimage:
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi:
-	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH)bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."

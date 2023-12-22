@@ -221,10 +221,10 @@ pub struct FbVarScreenInfo {
     pub pixel_format: FbPixelFormat,
     /// 激活标志（参见FB_ACTIVATE_*）
     pub activate: FbActivateFlags,
-    /// 帧缓冲区的高度（像素）
-    pub height: u32,
-    /// 帧缓冲区的宽度（像素）
-    pub width: u32,
+    /// 帧缓冲区的高度（像素） None表示未知
+    pub height: Option<u32>,
+    /// 帧缓冲区的宽度（像素） None表示未知
+    pub width: Option<u32>,
     /// 像素时钟（皮秒）
     pub pixclock: u32,
     /// 左边距
@@ -249,6 +249,43 @@ pub struct FbVarScreenInfo {
     pub colorspace: V4l2Colorspace,
 }
 
+impl Default for FbVarScreenInfo {
+    fn default() -> Self {
+        Self {
+            xres: Default::default(),
+            yres: Default::default(),
+            xres_virtual: Default::default(),
+            yres_virtual: Default::default(),
+            xoffset: Default::default(),
+            yoffset: Default::default(),
+            bits_per_pixel: Default::default(),
+            color_mode: Default::default(),
+            red: Default::default(),
+            green: Default::default(),
+            blue: Default::default(),
+            transp: Default::default(),
+            pixel_format: Default::default(),
+            activate: Default::default(),
+            height: None,
+            width: None,
+            pixclock: Default::default(),
+            left_margin: Default::default(),
+            right_margin: Default::default(),
+            upper_margin: Default::default(),
+            lower_margin: Default::default(),
+            hsync_len: Default::default(),
+            vsync_len: Default::default(),
+            sync: FbSyncFlags::empty(),
+            vmode: FbVModeFlags::empty(),
+            rotate_angle: Default::default(),
+            colorspace: Default::default(),
+        }
+    }
+}
+
+/// 帧缓冲区的颜色模式
+///
+/// 默认为彩色
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FbColorMode {
@@ -258,6 +295,12 @@ pub enum FbColorMode {
     Color,
     /// FOURCC
     FourCC,
+}
+
+impl Default for FbColorMode {
+    fn default() -> Self {
+        FbColorMode::Color
+    }
 }
 
 /// `FbBitfield` 结构体用于描述颜色字段的位域。
@@ -285,6 +328,16 @@ impl FbBitfield {
             offset,
             length,
             msb_right,
+        }
+    }
+}
+
+impl Default for FbBitfield {
+    fn default() -> Self {
+        Self {
+            offset: Default::default(),
+            length: Default::default(),
+            msb_right: Default::default(),
         }
     }
 }
@@ -317,6 +370,12 @@ bitflags! {
     }
 }
 
+impl Default for FbActivateFlags {
+    fn default() -> Self {
+        FbActivateFlags::FB_ACTIVATE_NOW
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FbPixelFormat {
@@ -325,6 +384,12 @@ pub enum FbPixelFormat {
     HAM,
     /// order of pixels in each byte is reversed
     Reserved,
+}
+
+impl Default for FbPixelFormat {
+    fn default() -> Self {
+        FbPixelFormat::Standard
+    }
 }
 
 bitflags! {
@@ -415,7 +480,7 @@ pub struct FixedScreenInfo {
     // 字符串，用于标识屏幕，例如 "TT Builtin"
     pub id: [char; 16],
     // 帧缓冲区的起始物理地址
-    pub smem_start: PhysAddr,
+    pub smem_start: Option<PhysAddr>,
     // 帧缓冲区的长度
     pub smem_len: u32,
     // 屏幕类型，参考 FB_TYPE_
@@ -433,13 +498,58 @@ pub struct FixedScreenInfo {
     // 一行的大小（以字节为单位）
     pub line_length: u32,
     // 内存映射I/O的起始物理地址
-    pub mmio_start: PhysAddr,
+    pub mmio_start: Option<PhysAddr>,
     // 内存映射I/O的长度
     pub mmio_len: u32,
     // 表示驱动器拥有的特定芯片/卡片类型
-    pub accel: u32,
+    pub accel: FbAccel,
     // 表示支持的特性，参考 FB_CAP_
     pub capabilities: FbCapability,
+}
+
+impl FixedScreenInfo {
+    /// 将字符串转换为长度为16的字符数组（包含结尾的`\0`）
+    ///
+    /// ## 参数
+    ///
+    /// - `name`: 字符串,长度不超过15，超过的部分将被截断
+    ///
+    /// ## 返回
+    ///
+    /// 长度为16的字符数组
+    pub const fn name2id(name: &str) -> [char; 16] {
+        let mut id = [0 as char; 16];
+        let mut i = 0;
+
+        while i < 15 && i < name.len() {
+            id[i] = name.as_bytes()[i] as char;
+            i += 1;
+        }
+
+        id[i] = '\0';
+        return id;
+    }
+}
+
+impl Default for FixedScreenInfo {
+    fn default() -> Self {
+        Self {
+            id: Default::default(),
+            smem_start: None,
+            smem_len: Default::default(),
+            fb_type: FbType::PackedPixels,
+            type_aux: Default::default(),
+            visual: FbVisual::Mono10,
+            xpanstep: Default::default(),
+            ypanstep: Default::default(),
+            ywrapstep: Default::default(),
+            line_length: Default::default(),
+            mmio_start: None,
+            mmio_len: Default::default(),
+            accel: Default::default(),
+            capabilities: Default::default(),
+        }
+    }
 }
 
 /// 帧缓冲类型
@@ -488,6 +598,12 @@ pub enum FbCapability {
     FourCC,
 }
 
+impl Default for FbCapability {
+    fn default() -> Self {
+        FbCapability::Default
+    }
+}
+
 /// 视频模式
 #[allow(dead_code)]
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -520,4 +636,76 @@ pub struct FbVideoMode {
     pub vmode: FbVModeFlags,
     /// 标志
     pub flag: u32,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum FbAccel {
+    /// 没有硬件加速器
+    None,
+
+    AtariBlitter = 1,
+    AmigaBlitter = 2,
+    S3Trio64 = 3,
+    NCR77C32BLT = 4,
+    S3Virge = 5,
+    AtiMach64GX = 6,
+    DECTGA = 7,
+    AtiMach64CT = 8,
+    AtiMach64VT = 9,
+    AtiMach64GT = 10,
+    SunCreator = 11,
+    SunCGSix = 12,
+    SunLeo = 13,
+    IMSTwinTurbo = 14,
+    Acc3DLabsPermedia2 = 15,
+    MatroxMGA2064W = 16,
+    MatroxMGA1064SG = 17,
+    MatroxMGA2164W = 18,
+    MatroxMGA2164WAGP = 19,
+    MatroxMGAG400 = 20,
+    NV3 = 21,
+    NV4 = 22,
+    NV5 = 23,
+    NV6 = 24,
+    XGIVolariV = 25,
+    XGIVolariZ = 26,
+    Omap1610 = 27,
+    TridentTGUI = 28,
+    Trident3DImage = 29,
+    TridentBlade3D = 30,
+    TridentBladeXP = 31,
+    CirrusAlpine = 32,
+    NeoMagicNM2070 = 90,
+    NeoMagicNM2090 = 91,
+    NeoMagicNM2093 = 92,
+    NeoMagicNM2097 = 93,
+    NeoMagicNM2160 = 94,
+    NeoMagicNM2200 = 95,
+    NeoMagicNM2230 = 96,
+    NeoMagicNM2360 = 97,
+    NeoMagicNM2380 = 98,
+    PXA3XX = 99,
+
+    Savage4 = 0x80,
+    Savage3D = 0x81,
+    Savage3DMV = 0x82,
+    Savage2000 = 0x83,
+    SavageMXMV = 0x84,
+    SavageMX = 0x85,
+    SavageIXMV = 0x86,
+    SavageIX = 0x87,
+    ProSavagePM = 0x88,
+    ProSavageKM = 0x89,
+    S3Twister = 0x8a,
+    S3TwisterK = 0x8b,
+    SuperSavage = 0x8c,
+    ProSavageDDR = 0x8d,
+    ProSavageDDRK = 0x8e,
+    // Add other accelerators here
+}
+
+impl Default for FbAccel {
+    fn default() -> Self {
+        FbAccel::None
+    }
 }

@@ -1,4 +1,7 @@
-use crate::{driver::tty::tty_device::tty_init, syscall::SystemError};
+use crate::{
+    driver::{tty::tty_device::tty_init, video::fbdev::vesafb::vesa_fb_driver_init},
+    syscall::SystemError,
+};
 
 use super::{
     class::classes_init,
@@ -26,6 +29,7 @@ pub(super) fn driver_init() -> Result<(), SystemError> {
 
 fn actual_device_init() -> Result<(), SystemError> {
     tty_init()?;
+    vesa_fb_driver_init()?;
 
     return Ok(());
 }

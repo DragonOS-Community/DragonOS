@@ -37,14 +37,17 @@ pub mod syscall;
 #[derive(Debug, Clone)]
 pub struct LockedEventPoll(Arc<SpinLock<EventPoll>>);
 
+/// 内核的Epoll对象结构体，当用户创建一个Epoll时，内核就会创建一个该类型对象
+/// 它对应一个epfd
 #[derive(Debug)]
 pub struct EventPoll {
     /// epoll_wait用到的等待队列
     epoll_wq: WaitQueue,
     /// 维护所有添加进来的socket的红黑树
-    epitem_rbr: RBTree<i32, Arc<EPollItem>>,
+    ep_items: RBTree<i32, Arc<EPollItem>>,
     /// 接收就绪的描述符列表
     ready_list: LinkedList<Arc<EPollItem>>,
+    /// 是否已经关闭
     shutdown: AtomicBool,
     self_ref: Option<Weak<SpinLock<EventPoll>>>,
 }
@@ -54,7 +57,7 @@ impl EventPoll {
     pub fn new() -> Self {
         Self {
             epoll_wq: WaitQueue::INIT,
-            epitem_rbr: RBTree::new(),
+            ep_items: RBTree::new(),
             ready_list: LinkedList::new(),
             shutdown: AtomicBool::new(false),
             self_ref: None,
@@ -62,11 +65,17 @@ impl EventPoll {
     }
 }
 
+/// EpollItem表示的是Epoll所真正管理的对象
+/// 每当用户向Epoll添加描述符时都会注册一个新的EpollItem，EpollItem携带了一些被监听的描述符的必要信息
 #[derive(Debug)]
 pub struct EPollItem {
+    /// 对应的Epoll
     epoll: Weak<SpinLock<EventPoll>>,
+    /// 用户注册的事件
     event: RwLock<EPollEvent>,
+    /// 监听的描述符
     fd: i32,
+    /// 对应的文件
     file: Weak<SpinLock<File>>,
 }
 
@@ -171,7 +180,7 @@ impl IndexNode for EPollInode {
         epoll.shutdown.store(true, Ordering::SeqCst);
         epoll.ep_wake_all();
 
-        let fds = epoll.epitem_rbr.keys().cloned().collect::<Vec<_>>();
+        let fds = epoll.ep_items.keys().cloned().collect::<Vec<_>>();
 
         // 清理红黑树里面的epitems
         for fd in fds {
@@ -186,7 +195,7 @@ impl IndexNode for EPollInode {
                     .remove_epoll(&Arc::downgrade(&self.epoll.0))?;
             }
 
-            epoll.epitem_rbr.remove(&fd);
+            epoll.ep_items.remove(&fd);
         }
 
         Ok(())
@@ -235,6 +244,15 @@ impl EventPoll {
     }
 
     /// ## epoll_ctl的具体实现
+    ///
+    /// 根据不同的op对epoll文件进行增删改
+    ///
+    /// ### 参数
+    /// - epfd: 操作的epoll文件描述符
+    /// - op: 对应的操作
+    /// - fd: 操作对应的文件描述符
+    /// - epds: 从用户态传入的event，若op为EpollCtlAdd，则对应注册的监听事件，若op为EPollCtlMod，则对应更新的事件，删除操作不涉及此字段
+    /// - nonblock: 定义这次操作是否为非阻塞（有可能其他地方占有EPoll的锁）
     pub fn do_epoll_ctl(
         epfd: i32,
         op: EPollCtlOption,
@@ -300,10 +318,15 @@ impl EventPoll {
             };
 
             if op == EPollCtlOption::EpollCtlAdd {
-                // TODO: 循环检查？
+                // TODO: 循环检查是否为epoll嵌套epoll的情况，如果是则需要检测其深度
+                // 这里是需要一种检测算法的，但是目前未考虑epoll嵌套epoll的情况，所以暂时未实现
+                // Linux算法：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/eventpoll.c?r=&mo=56953&fi=2057#2133
+                if Self::is_epoll_file(&dst_file) {
+                    todo!();
+                }
             }
 
-            let ep_item = epoll_guard.epitem_rbr.get(&fd);
+            let ep_item = epoll_guard.ep_items.get(&fd);
             match op {
                 EPollCtlOption::EpollCtlAdd => {
                     // 如果已经存在，则返回错误
@@ -467,7 +490,12 @@ impl EventPoll {
         }
     }
 
-    /// ### 将已经准备好的事件拷贝到用户空间
+    /// ## 将已经准备好的事件拷贝到用户空间
+    ///
+    /// ### 参数
+    /// - epoll: 对应的epoll
+    /// - user_event: 用户空间传入的epoll_event地址，因为内存对其问题，所以这里需要直接操作地址
+    /// - max_events: 处理的最大事件数量
     fn ep_send_events(
         epoll: LockedEventPoll,
         user_event: VirtAddr,
@@ -475,7 +503,11 @@ impl EventPoll {
     ) -> Result<usize, SystemError> {
         let mut ep_guard = epoll.0.lock_irqsave();
         let mut res: usize = 0;
+
+        // 在水平触发模式下，需要将epitem再次加入队列，在下次循环再次判断是否还有事件
+        // （所以边缘触发的效率会高于水平触发，但是水平触发某些情况下能够使得更迅速地向用户反馈）
         let mut push_back = Vec::new();
+        let max_offset = user_event.data() + 12 * max_events as usize;
         while let Some(epitem) = ep_guard.ready_list.pop_front() {
             if res >= max_events as usize {
                 break;
@@ -496,7 +528,7 @@ impl EventPoll {
 
             // C标准的epoll_event大小为12字节,在内核我们不使用#[repr(packed)]来强制与C兼容，可以提高效率
             let user_addr = user_event.add(res * 12);
-            if user_addr.is_null() {
+            if user_addr.data() >= max_offset {
                 // 当前指向的地址已为空，则把epitem放回队列
                 ep_guard.ready_list.push_back(epitem.clone());
                 if res == 0 {
@@ -560,7 +592,7 @@ impl EventPoll {
             }
         }
 
-        epoll_guard.epitem_rbr.insert(epitem.fd, epitem.clone());
+        epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
 
         // 检查文件是否已经有事件发生
         let event = epitem.ep_item_poll();
@@ -593,7 +625,7 @@ impl EventPoll {
 
         file_guard.remove_epoll(epoll.self_ref.as_ref().unwrap())?;
 
-        let epitem = epoll.epitem_rbr.remove(&fd).unwrap();
+        let epitem = epoll.ep_items.remove(&fd).unwrap();
 
         epoll
             .ready_list
@@ -602,6 +634,12 @@ impl EventPoll {
         Ok(())
     }
 
+    /// ## 修改已经注册的监听事件
+    ///
+    /// ### 参数
+    /// - epoll_guard: EventPoll的锁
+    /// - epitem: 需要修改的描述符对应的epitem
+    /// - event: 新的事件
     fn ep_modify(
         epoll_guard: &mut SpinLockGuard<EventPoll>,
         epitem: Arc<EPollItem>,
@@ -659,7 +697,9 @@ impl EventPoll {
 /// 与C兼容的Epoll事件结构体
 #[derive(Copy, Clone, Default)]
 pub struct EPollEvent {
+    /// 表示触发的事件
     events: u32,
+    /// 内核态不使用该字段，该字段由用户态自由使用，在事件发生时内核将会原样返回
     data: u64,
 }
 
@@ -684,10 +724,14 @@ impl EPollEvent {
     }
 }
 
+/// ## epoll_ctl函数的参数
 #[derive(Debug, PartialEq)]
 pub enum EPollCtlOption {
+    /// 注册新的文件描述符到epfd
     EpollCtlAdd,
+    /// 将对应的文件描述符从epfd中删除
     EpollCtlDel,
+    /// 修改已经注册的文件描述符的监听事件
     EpollCtlMod,
 }
 
@@ -705,25 +749,47 @@ impl EPollCtlOption {
 bitflags! {
     #[allow(dead_code)]
     pub struct EPollEventType: u32 {
+        /// 对应的描述符有新的数据可读时会触发
         const EPOLLIN = 0x00000001;
+        /// 对应的描述符有紧急数据可读时会触发
         const EPOLLPRI = 0x00000002;
+        /// 对应的描述符可以写入数据时会触发
         const EPOLLOUT = 0x00000004;
+        /// 对应的描述符发生错误时会触发
         const EPOLLERR = 0x00000008;
+        /// 对应的描述符被挂断（连接关闭）时会触发
         const EPOLLHUP = 0x00000010;
+        /// 对应的描述符不是一个有效的文件描述符时会触发
         const EPOLLNVAL = 0x00000020;
+        /// 普通数据可读，类似于`EPOLLIN`
         const EPOLLRDNORM = 0x00000040;
+        /// 优先级带外数据可读
         const EPOLLRDBAND = 0x00000080;
+        /// 普通数据可写，类似于'EPOLLOUT'
         const EPOLLWRNORM = 0x00000100;
+        /// 优先级带外数据可写
         const EPOLLWRBAND = 0x00000200;
+        /// 通过消息队列收到消息时会触
         const EPOLLMSG = 0x00000400;
+        /// 对应的描述符被挂断（连接关闭）的一端发送了 FIN 时会触发(读关闭)
         const EPOLLRDHUP = 0x00002000;
 
+        /// 以下为额外选项
+        ///
+        /// 特定选项，用于异步 I/O，目前未实现
         const EPOLL_URING_WAKE = 1u32 << 27;
-        const EPOLLEXCLUSIVE = 1u32 << 28;    // 设置epoll为独占模式
+        /// 设置epoll为独占模式
+        const EPOLLEXCLUSIVE = 1u32 << 28;
+        ///  允许在系统挂起时唤醒 epoll，通常用于通过 eventfd 或 timerfd 唤醒 epoll,(通常与电源管理相关，未实现)
         const EPOLLWAKEUP = 1u32 << 29;
+        /// 表示只监听一次事件，之后需要重新添加
         const EPOLLONESHOT = 1u32 << 30;
+
+        /// 启用边缘触发模式(即只有下次触发事件时才会通过epoll_wait返回)，
+        /// 对应为水平触发(默认)，水平触发模式下若这次未处理完数据，那epoll还会将其加入自己的就绪队列
         const EPOLLET = 1u32 << 31;
 
+        /// 以下为组合码
         const EPOLLINOUT_BITS = Self::EPOLLIN.bits | Self::EPOLLOUT.bits;
         const EPOLLEXCLUSIVE_OK_BITS =
             Self::EPOLLINOUT_BITS.bits
@@ -739,6 +805,7 @@ bitflags! {
             | Self::EPOLLET.bits
             | Self::EPOLLEXCLUSIVE.bits;
 
+        /// 表示epoll已经被释放，但是在目前的设计中未用到
         const POLLFREE = 0x4000;
     }
 }

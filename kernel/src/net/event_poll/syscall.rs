@@ -88,19 +88,8 @@ impl Syscall {
         epoll_event: VirtAddr,
         max_events: i32,
         timespec: i32,
-        sigmask: VirtAddr,
+        mut sigmask: &mut SigSet,
     ) -> Result<usize, SystemError> {
-        if sigmask.is_null() {
-            return Self::epoll_wait(epfd, epoll_event, max_events, timespec);
-        }
-        let reader = UserBufferReader::new(
-            sigmask.as_ptr::<SigSet>(),
-            core::mem::size_of::<SigSet>(),
-            true,
-        )?;
-
-        let mut sigmask = reader.read_one_from_user::<SigSet>(0)?.clone();
-
         // 设置屏蔽的信号
         set_current_sig_blocked(&mut sigmask);
 
@@ -108,6 +97,7 @@ impl Syscall {
 
         if wait_ret.is_err() && *wait_ret.as_ref().unwrap_err() != SystemError::EINTR {
             // TODO: 恢复信号?
+            // link：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/eventpoll.c#2294
         }
         wait_ret
     }

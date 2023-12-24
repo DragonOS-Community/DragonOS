@@ -3,11 +3,6 @@
 #ifndef __ASM__
 #define __ASM__
 
-
-
-
-
-
 // 符号名
 #define SYMBOL_NAME(X)	X
 // 符号名字符串

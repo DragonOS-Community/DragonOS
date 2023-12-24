@@ -20,11 +20,15 @@ impl<T> LockFreeFlags<T> {
     }
 
     pub fn get_mut(&self) -> &mut T {
-        unsafe { &mut *self.inner.get() }
+        unsafe {
+            (self.inner.get().as_ref().unwrap() as *const T as *mut T)
+                .as_mut()
+                .unwrap()
+        }
     }
 
     pub fn get(&self) -> &T {
-        unsafe { &*self.inner.get() }
+        unsafe { self.inner.get().as_ref().unwrap() }
     }
 }
 

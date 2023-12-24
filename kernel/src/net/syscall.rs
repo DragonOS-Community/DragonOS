@@ -9,8 +9,8 @@ use crate::{
         file::{File, FileMode},
         syscall::{IoVec, IoVecs},
     },
-    include::bindings::bindings::verify_area,
     libs::spinlock::SpinLockGuard,
+    mm::{verify_area, VirtAddr},
     net::socket::{AddressFamily, SOL_SOCKET},
     process::ProcessManager,
     syscall::{Syscall, SystemError},
@@ -546,15 +546,11 @@ pub union SockAddr {
 impl SockAddr {
     /// @brief 把用户传入的SockAddr转换为Endpoint结构体
     pub fn to_endpoint(addr: *const SockAddr, len: usize) -> Result<Endpoint, SystemError> {
-        if unsafe {
-            verify_area(
-                addr as usize as u64,
-                core::mem::size_of::<SockAddr>() as u64,
-            )
-        } == false
-        {
-            return Err(SystemError::EFAULT);
-        }
+        verify_area(
+            VirtAddr::new(addr as usize),
+            core::mem::size_of::<SockAddr>(),
+        )
+        .map_err(|_| SystemError::EFAULT)?;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
         if len < addr.len()? {
@@ -618,14 +614,19 @@ impl SockAddr {
         if addr.is_null() || addr_len.is_null() {
             return Ok(0);
         }
+
         // 检查用户传入的地址是否合法
-        if !verify_area(
-            addr as usize as u64,
-            core::mem::size_of::<SockAddr>() as u64,
-        ) || !verify_area(addr_len as usize as u64, core::mem::size_of::<u32>() as u64)
-        {
-            return Err(SystemError::EFAULT);
-        }
+        verify_area(
+            VirtAddr::new(addr as usize),
+            core::mem::size_of::<SockAddr>(),
+        )
+        .map_err(|_| SystemError::EFAULT)?;
+
+        verify_area(
+            VirtAddr::new(addr_len as usize),
+            core::mem::size_of::<u32>(),
+        )
+        .map_err(|_| SystemError::EFAULT)?;
 
         let to_write = min(self.len()?, *addr_len as usize);
         if to_write > 0 {

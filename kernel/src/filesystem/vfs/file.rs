@@ -1,10 +1,4 @@
-use core::mem::MaybeUninit;
-
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     driver::{
@@ -461,28 +455,16 @@ impl Drop for File {
 #[derive(Debug)]
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
-    fds: [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD],
+    fds: Vec<Option<Arc<SpinLock<File>>>>,
 }
 
 impl FileDescriptorVec {
     pub const PROCESS_MAX_FD: usize = 1024;
 
+    #[inline(never)]
     pub fn new() -> FileDescriptorVec {
-        // 先声明一个未初始化的数组
-        let mut data: [MaybeUninit<Option<Arc<SpinLock<File>>>>;
-            FileDescriptorVec::PROCESS_MAX_FD] = unsafe { MaybeUninit::uninit().assume_init() };
-
-        // 逐个把每个元素初始化为None
-        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
-            data[i] = MaybeUninit::new(None);
-        }
-        // 由于一切都初始化完毕，因此将未初始化的类型强制转换为已经初始化的类型
-        let data: [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD] = unsafe {
-            core::mem::transmute::<
-                _,
-                [Option<Arc<SpinLock<File>>>; FileDescriptorVec::PROCESS_MAX_FD],
-            >(data)
-        };
+        let mut data = Vec::with_capacity(FileDescriptorVec::PROCESS_MAX_FD);
+        data.resize(FileDescriptorVec::PROCESS_MAX_FD, None);
 
         // 初始化文件描述符数组结构体
         return FileDescriptorVec { fds: data };

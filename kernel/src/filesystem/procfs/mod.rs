@@ -20,6 +20,7 @@ use crate::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
     syscall::SystemError,
     time::TimeSpec,
@@ -114,7 +115,8 @@ impl ProcFSInode {
     /// @brief 去除Vec中所有的\0,并在结尾添加\0
     #[inline]
     fn trim_string(&self, data: &mut Vec<u8>) {
-        data.drain_filter(|x: &mut u8| *x == 0);
+        data.retain(|x| *x != 0);
+
         data.push(0);
     }
     // todo:其他数据获取函数实现
@@ -212,7 +214,7 @@ impl ProcFSInode {
     /// 打开 meminfo 文件
     fn open_meminfo(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 获取内存信息
-        let usage = LockedFrameAllocator.get_usage();
+        let usage = unsafe { LockedFrameAllocator.usage() };
 
         // 传入数据
         let data: &mut Vec<u8> = &mut pdata.data;
@@ -419,15 +421,9 @@ impl IndexNode for LockedProcFSInode {
         if let FileType::Dir = guard.metadata.file_type {
             return Ok(());
         }
-        // 获取数据信息
-        let private_data = match data {
-            FilePrivateData::Procfs(p) => p,
-            _ => {
-                panic!("ProcFS: FilePrivateData mismatch!");
-            }
-        };
-        // 释放资源
-        drop(private_data);
+        // 释放data
+        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
+
         return Ok(());
     }
 

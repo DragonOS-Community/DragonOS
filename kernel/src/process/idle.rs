@@ -42,12 +42,12 @@ impl ProcessManager {
                 unsafe { ks.clear_pcb(true) };
                 ks
             } else {
-                KernelStack::new().unwrap_or_else(|e| {
+                KernelStack::new().unwrap_or_else(|e: crate::syscall::SystemError| {
                     panic!("Failed to create kernel stack struct for AP {}: {:?}", i, e)
                 })
             };
 
-            let idle_pcb = ProcessControlBlock::new_idle(smp_get_processor_id(), kstack);
+            let idle_pcb = ProcessControlBlock::new_idle(i as u32, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
             unsafe {
@@ -72,6 +72,9 @@ impl ProcessManager {
     fn stack_ptr() -> VirtAddr {
         #[cfg(target_arch = "x86_64")]
         return VirtAddr::new(x86::current::registers::rsp() as usize);
+
+        #[cfg(target_arch = "riscv64")]
+        unimplemented!("stack_ptr() is not implemented on RISC-V")
     }
 
     /// 获取idle进程数组的引用

@@ -1,33 +1,24 @@
 use core::ffi::c_void;
 
 use crate::{
-    arch::{ipc::signal::X86_64SignalArch, CurrentIrqArch},
+    arch::{
+        ipc::signal::X86_64SignalArch,
+        syscall::nr::{SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
+        CurrentIrqArch,
+    },
     exception::InterruptArch,
     include::bindings::bindings::set_system_trap_gate,
     ipc::signal_types::SignalArch,
     libs::align::SafeForZero,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{Syscall, SystemError, SYS_RT_SIGRETURN},
+    syscall::{Syscall, SystemError, SYS_SCHED},
 };
 use alloc::string::String;
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
 
-pub const SYS_LSTAT: usize = 6;
-pub const SYS_READV: usize = 19;
-pub const SYS_ACCESS: usize = 21;
-pub const SYS_UNLINK: usize = 87;
-pub const SYS_CHMOD: usize = 90;
-pub const SYS_FCHMOD: usize = 91;
-pub const SYS_UMASK: usize = 95;
-pub const SYS_SYSINFO: usize = 99;
-pub const SYS_CLOCK_GETTIME: usize = 228;
-pub const SYS_OPENAT: usize = 257;
-pub const SYS_FCHMODAT: usize = 268;
-pub const SYS_FACCESSAT: usize = 269;
-pub const SYS_PRLIMIT64: usize = 302;
-pub const SYS_FACCESSAT2: usize = 439;
+pub mod nr;
 
 /// ### 存储PCB系统调用栈以及在syscall过程中暂存用户态rsp的结构体
 ///
@@ -73,10 +64,14 @@ macro_rules! syscall_return {
 
 #[no_mangle]
 pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
-    unsafe {
-        CurrentIrqArch::interrupt_enable();
-    }
     let syscall_num = frame.rax as usize;
+    // 防止sys_sched由于超时无法退出导致的死锁
+    if syscall_num != SYS_SCHED {
+        unsafe {
+            CurrentIrqArch::interrupt_enable();
+        }
+    }
+
     let args = [
         frame.rdi as usize,
         frame.rsi as usize,
@@ -103,6 +98,14 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
         SYS_RT_SIGRETURN => {
             syscall_return!(
                 X86_64SignalArch::sys_rt_sigreturn(frame) as usize,
+                frame,
+                show
+            );
+        }
+        SYS_ARCH_PRCTL => {
+            syscall_return!(
+                Syscall::arch_prctl(args[0], args[1])
+                    .unwrap_or_else(|e| e.to_posix_errno() as usize),
                 frame,
                 show
             );

@@ -23,14 +23,12 @@ impl CFilesBuilder {
     }
 
     fn setup_global_flags(c: &mut Build) {
-        c.flag("-mcmodel=large")
-            .flag("-fno-builtin")
+        c.flag("-fno-builtin")
             .flag("-nostdlib")
             .flag("-fno-stack-protector")
-            .flag("-fno-pie")
+            .flag("-static-pie")
             .flag("-Wno-expansion-to-defined")
             .flag("-Wno-unused-parameter")
-            .flag("-m64")
             .flag("-O1");
 
         // set Arch-specific flags

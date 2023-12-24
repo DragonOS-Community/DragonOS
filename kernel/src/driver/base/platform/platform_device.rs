@@ -6,6 +6,7 @@ use ida::IdAllocator;
 
 use crate::{
     driver::base::{
+        class::Class,
         device::{
             bus::{Bus, BusState},
             device_manager,
@@ -287,7 +288,7 @@ impl Device for PlatformBusDevice {
     #[inline]
     #[allow(dead_code)]
     fn id_table(&self) -> IdTable {
-        IdTable::new("platform".to_string(), DeviceNumber::new(0))
+        IdTable::new("platform".to_string(), Some(DeviceNumber::new(0)))
     }
 
     fn bus(&self) -> Option<Arc<dyn Bus>> {
@@ -320,6 +321,10 @@ impl Device for PlatformBusDevice {
     }
 
     fn state_synced(&self) -> bool {
+        todo!()
+    }
+
+    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
         todo!()
     }
 }

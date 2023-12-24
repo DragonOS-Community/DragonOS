@@ -67,7 +67,7 @@ impl Hpet {
         let tm_num = hpet.timers_num();
         kinfo!("HPET has {} timers", tm_num);
         hpet_info.hpet_number = tm_num as u8;
-        drop(hpet);
+
         drop(mmio);
         if tm_num == 0 {
             return Err(SystemError::ENODEV);
@@ -118,7 +118,6 @@ impl Hpet {
 
         unsafe { regs.write_main_counter_value(0) };
 
-        drop(regs);
         drop(inner_guard);
 
         let (inner_guard, timer_reg) = unsafe { self.timer_mut(0).ok_or(SystemError::ENODEV) }?;
@@ -130,7 +129,6 @@ impl Hpet {
             volwrite!(timer_reg, config, 0x004c);
             volwrite!(timer_reg, comparator_value, ticks);
         }
-        drop(timer_reg);
         drop(inner_guard);
 
         // todo!("register irq in C");
@@ -142,7 +140,6 @@ impl Hpet {
         // 置位旧设备中断路由兼容标志位、定时器组使能标志位
         unsafe { regs.write_general_config(3) };
 
-        drop(regs);
         drop(inner_guard);
 
         kinfo!("HPET enabled");
@@ -208,7 +205,7 @@ impl Hpet {
     pub fn main_counter_value(&self) -> u64 {
         let (inner_guard, regs) = unsafe { self.hpet_regs() };
         let value = regs.main_counter_value();
-        drop(regs);
+
         drop(inner_guard);
         return value;
     }
@@ -217,7 +214,7 @@ impl Hpet {
         let (inner_guard, regs) = unsafe { self.hpet_regs() };
         let period = regs.counter_clock_period();
         kdebug!("HPET period: {}", period);
-        drop(regs);
+
         drop(inner_guard);
         return period;
     }

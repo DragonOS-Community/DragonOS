@@ -30,6 +30,9 @@ uint Cpu_max_linear_addrline_size;
 uint64_t Cpu_tsc_freq = 0;
 
 struct cpu_core_info_t cpu_core_info[MAX_CPU_NUM];
+
+#if ARCH(I386) || ARCH(X86_64)
+
 void cpu_init(void)
 {
     // 获取处理器制造商信息
@@ -100,3 +103,7 @@ void cpu_cpuid(uint32_t mop, uint32_t sop, uint32_t *eax, uint32_t *ebx, uint32_
                          : "0"(mop), "2"(sop)
                          : "memory");
 }
+
+#else
+void cpu_init(void){}
+#endif

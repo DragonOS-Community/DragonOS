@@ -1,9 +1,13 @@
+# 导入环境变量
+include env.mk
+
+
+export ROOT_PATH=$(shell pwd)
+
 SUBDIRS = kernel user tools build-scripts
 
-# ifndef $(EMULATOR)
-ifeq ($(EMULATOR), )
-export EMULATOR=__NO_EMULATION__
-endif
+
+
 # todo: 增加参数，判断是否在QEMU中仿真，若是，则启用该环境变量
 # export EMULATOR=__QEMU_EMULATION__
 
@@ -18,28 +22,7 @@ ifeq ($(OS),Darwin) # Assume Mac OS X
   NPROCS:=$(shell system_profiler | awk '/Number Of CPUs/{print $4}{next;}')
 endif
 
-# if arch not defined, set it to x86_64
-export ARCH?=x86_64
 
-CFLAGS_DEFINE_ARCH="__$(ARCH)__"
-
-
-export ROOT_PATH=$(shell pwd)
-
-export DEBUG=DEBUG
-export GLOBAL_CFLAGS := -mcmodel=large -fno-builtin -m64  -fno-stack-protector -D $(CFLAGS_DEFINE_ARCH) -D $(EMULATOR) -O1
-
-ifeq ($(DEBUG), DEBUG)
-GLOBAL_CFLAGS += -g 
-endif
-
-
-export CC=$(DragonOS_GCC)/x86_64-elf-gcc
-export LD=ld
-export AS=$(DragonOS_GCC)/x86_64-elf-as
-export NM=$(DragonOS_GCC)/x86_64-elf-nm
-export AR=$(DragonOS_GCC)/x86_64-elf-ar
-export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 # 检查是否需要进行fmt --check
 # 解析命令行参数  
@@ -60,13 +43,13 @@ all: kernel user
 kernel:
 	mkdir -p bin/kernel/
 	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
-	$(MAKE) -C ./kernel all || (sh -c "echo 内核编译失败" && exit 1)
+	$(MAKE) -C ./kernel all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 	
 .PHONY: user
 user:
 
 	@if [ -z $$DragonOS_GCC ]; then echo "\033[31m  [错误]尚未安装DragonOS交叉编译器, 请使用tools文件夹下的build_gcc_toolchain.sh脚本安装  \033[0m"; exit 1; fi
-	$(MAKE) -C ./user all || (sh -c "echo 用户程序编译失败" && exit 1)
+	$(MAKE) -C ./user all ARCH=$(ARCH) || (sh -c "echo 用户程序编译失败" && exit 1)
 
 .PHONY: clean
 clean:
@@ -93,7 +76,11 @@ clean-docs:
 	bash -c "cd docs && make clean && cd .."
 
 gdb:
+ifeq ($(ARCH), x86_64)
 	rust-gdb -n -x tools/.gdbinit
+else
+	gdb-multiarch -n -x tools/.gdbinit
+endif
 
 # 写入磁盘镜像
 write_diskimage:
@@ -102,7 +89,7 @@ write_diskimage:
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi:
-	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH)bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
@@ -167,7 +154,20 @@ fmt:
 log-monitor:
 	@echo "启动日志监控"
 	@sh -c "cd tools/debugging/logmonitor && cargo run --release -- --log-dir $(ROOT_PATH)/logs/ --kernel $(ROOT_PATH)/bin/kernel/kernel.elf" 
-	
+
+.PHONY: update-submodules
+update-submodules:
+	@echo "更新子模块"
+	@git submodule update --recursive
+	@git submodule foreach git pull origin master
+
+.PHONY: update-submodules-by-mirror
+update-submodules-by-mirror:
+	@echo "从镜像更新子模块"
+	@git config --global url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf https://github.com/DragonOS-Community/
+	@$(MAKE) update-submodules
+	@git config --global --unset url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf
+
 help:
 	@echo "编译:"
 	@echo "  make all -j <n>       - 本地编译，不运行,n为要用于编译的CPU核心数"
@@ -185,3 +185,14 @@ help:
 	@echo ""
 	@echo ""
 	@echo "注: 对于上述的run, run-uefi, qemu, qemu-uefi命令可以在命令后加上-vnc后缀,来通过vnc连接到DragonOS, 默认会在5900端口运行vnc服务器。如：make run-vnc "
+	@echo ""
+	@echo "其他:"
+	@echo "  make clean            - 清理编译产生的文件"
+	@echo "  make fmt              - 格式化代码"
+	@echo "  make log-monitor      - 启动日志监控"
+	@echo "  make docs             - 生成文档"
+	@echo "  make clean-docs       - 清理文档"
+	@echo ""
+	@echo "  make update-submodules - 更新子模块"
+	@echo "  make update-submodules-by-mirror - 从镜像更新子模块"
+

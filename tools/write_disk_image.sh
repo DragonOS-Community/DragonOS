@@ -25,7 +25,14 @@ eval set -- "${ARGS}"
 #echo formatted parameters=[$@]
 echo "开始写入磁盘镜像..."
 
+if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
+
 INSTALL_GRUB_TO_IMAGE="1"
+
+else
+INSTALL_GRUB_TO_IMAGE="0"
+fi
+
 
 # toolchain
 GRUB_ABS_PREFIX=/opt/dragonos-grub
@@ -91,14 +98,18 @@ echo $LOOP_DEVICE
 # mkdir -p ${GRUB_INSTALL_PATH}
 
 # 检测grub文件夹是否存在
-if [ -d "${GRUB_INSTALL_PATH}" ]; then
-  echo "grub已安装"
+if [ -d "${GRUB_INSTALL_PATH}" ] || [ "${INSTALL_GRUB_TO_IMAGE}" = "0" ]; then
+   echo "无需安装grub"
    INSTALL_GRUB_TO_IMAGE="0"
 else
-  mkdir -p ${GRUB_INSTALL_PATH}
+    mkdir -p ${GRUB_INSTALL_PATH}
 fi
 
-cp ${kernel} ${root_folder}/bin/disk_mount/boot
+
+if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
+    cp ${kernel} ${root_folder}/bin/disk_mount/boot/
+fi
+
 # 拷贝用户程序到磁盘镜像
 mkdir -p ${root_folder}/bin/disk_mount/bin
 mkdir -p ${root_folder}/bin/disk_mount/dev

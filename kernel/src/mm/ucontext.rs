@@ -149,6 +149,7 @@ impl InnerAddressSpace {
     /// # Returns
     ///
     /// 返回克隆后的，新的地址空间的Arc指针
+    #[inline(never)]
     pub fn try_clone(&mut self) -> Result<Arc<AddressSpace>, SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let new_addr_space = AddressSpace::new(false)?;

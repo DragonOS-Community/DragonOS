@@ -27,6 +27,7 @@ use self::{
 };
 
 use super::{
+    class::Class,
     kobject::{KObjType, KObject, KObjectManager, KObjectState},
     kset::KSet,
     swnode::software_node_notify,
@@ -65,25 +66,49 @@ static mut DEV_BLOCK_KSET_INSTANCE: Option<Arc<KSet>> = None;
 /// `/sys/dev/char` 的 kset 实例
 static mut DEV_CHAR_KSET_INSTANCE: Option<Arc<KSet>> = None;
 
+/// `/sys/devices/virtual` 的 kset 实例
+static mut DEVICES_VIRTUAL_KSET_INSTANCE: Option<Arc<KSet>> = None;
+
+/// 获取`/sys/devices`的kset实例
 #[inline(always)]
 pub(super) fn sys_devices_kset() -> Arc<KSet> {
     unsafe { DEVICES_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
+/// 获取`/sys/dev`的kset实例
 #[inline(always)]
 pub(super) fn sys_dev_kset() -> Arc<KSet> {
     unsafe { DEV_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
+/// 获取`/sys/dev/block`的kset实例
 #[inline(always)]
 #[allow(dead_code)]
-pub(super) fn sys_dev_block_kset() -> Arc<KSet> {
+pub fn sys_dev_block_kset() -> Arc<KSet> {
     unsafe { DEV_BLOCK_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
+/// 获取`/sys/dev/char`的kset实例
 #[inline(always)]
-pub(self) fn sys_dev_char_kset() -> Arc<KSet> {
+pub fn sys_dev_char_kset() -> Arc<KSet> {
     unsafe { DEV_CHAR_KSET_INSTANCE.as_ref().unwrap().clone() }
+}
+
+pub(self) unsafe fn set_sys_dev_block_kset(kset: Arc<KSet>) {
+    DEV_BLOCK_KSET_INSTANCE = Some(kset);
+}
+
+pub(self) unsafe fn set_sys_dev_char_kset(kset: Arc<KSet>) {
+    DEV_CHAR_KSET_INSTANCE = Some(kset);
+}
+
+/// 获取`/sys/devices/virtual`的kset实例
+pub fn sys_devices_virtual_kset() -> Arc<KSet> {
+    unsafe { DEVICES_VIRTUAL_KSET_INSTANCE.as_ref().unwrap().clone() }
+}
+
+pub(self) unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
+    DEVICES_VIRTUAL_KSET_INSTANCE = Some(kset);
 }
 
 /// 设备应该实现的操作
@@ -126,6 +151,14 @@ pub trait Device: KObject {
     /// （一定要传入Arc，因为bus的subsysprivate里面存储的是Device的Weak指针）
     fn set_bus(&self, bus: Option<Arc<dyn Bus>>);
 
+    /// 获取当前设备所属的类
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        return None;
+    }
+
+    /// 设置当前设备所属的类
+    fn set_class(&self, class: Option<Arc<dyn Class>>);
+
     /// 返回已经与当前设备匹配好的驱动程序
     fn driver(&self) -> Option<Arc<dyn Driver>>;
 
@@ -147,6 +180,10 @@ pub trait Device: KObject {
     /// the software state of this device by calling the driver/bus
     /// sync_state() callback.
     fn state_synced(&self) -> bool;
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
+    }
 }
 
 impl dyn Device {
@@ -252,11 +289,15 @@ pub enum DeviceType {
     Serial,
     Intc,
     PlatformDev,
+    Char,
 }
 
 /// @brief: 设备标识符类型
 #[derive(Debug, Clone, Hash, PartialOrd, PartialEq, Ord, Eq)]
-pub struct IdTable(String, DeviceNumber);
+pub struct IdTable {
+    basename: String,
+    id: Option<DeviceNumber>,
+}
 
 /// @brief: 设备标识符操作方法集
 impl IdTable {
@@ -264,25 +305,29 @@ impl IdTable {
     /// @parameter name: 设备名
     /// @parameter id: 设备id
     /// @return: 设备标识符
-    pub fn new(name: String, id: DeviceNumber) -> IdTable {
-        Self(name, id)
+    pub fn new(basename: String, id: Option<DeviceNumber>) -> IdTable {
+        return IdTable { basename, id };
     }
 
     /// @brief: 将设备标识符转换成name
     /// @parameter None
     /// @return: 设备名
     pub fn name(&self) -> String {
-        return format!("{}:{}", self.0, self.1 .0);
+        if self.id.is_none() {
+            return self.basename.clone();
+        } else {
+            return format!("{}:{}", self.basename, self.id.unwrap().data());
+        }
     }
 
     pub fn device_number(&self) -> DeviceNumber {
-        return self.1;
+        return self.id.unwrap_or(DeviceNumber::new(0));
     }
 }
 
 impl Default for IdTable {
     fn default() -> Self {
-        IdTable("unknown".to_string(), DeviceNumber::new(0))
+        IdTable::new("unknown".to_string(), None)
     }
 }
 
@@ -435,7 +480,25 @@ impl DeviceManager {
     #[inline]
     #[allow(dead_code)]
     pub fn add_device(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
-        // todo: 引入class后，在这里处理与parent相关的逻辑
+        // 在这里处理与parent相关的逻辑
+
+        let current_parent = device
+            .parent()
+            .map(|x| x.upgrade())
+            .flatten()
+            .map(|x| x.arc_any().cast::<dyn Device>().ok())
+            .flatten();
+
+        let actual_parent = self.get_device_parent(&device, current_parent)?;
+        if let Some(actual_parent) = actual_parent {
+            // kdebug!(
+            //     "device '{}' parent is '{}', strong_count: {}",
+            //     device.name().to_string(),
+            //     actual_parent.name(),
+            //     Arc::strong_count(&actual_parent)
+            // );
+            device.set_parent(Some(Arc::downgrade(&actual_parent)));
+        }
 
         KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>, None).map_err(|e| {
             kerror!("add device '{:?}' failed: {:?}", device.name(), e);
@@ -456,16 +519,83 @@ impl DeviceManager {
             self.create_sys_dev_entry(&device)?;
         }
 
-        // todo: Notify clients of device addition.This call must come
-        //  after dpm_sysfs_add() and before kobject_uevent().
-        // 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c#3491
+        // 通知客户端有关设备添加的信息。此调用必须在 dpm_sysfs_add() 之后且在 kobject_uevent() 之前执行。
+        if let Some(bus) = device.bus() {
+            bus.subsystem().bus_notifier().call_chain(
+                bus::BusNotifyEvent::AddDevice,
+                Some(&device),
+                None,
+            );
+        }
 
-        // todo: 发送uevent
+        // todo: 发送uevent: KOBJ_ADD
 
         // probe drivers for a new device
         bus_probe_device(&device);
 
+        if let Some(class) = device.class() {
+            class.subsystem().add_device_to_vec(&device)?;
+
+            for class_interface in class.subsystem().interfaces() {
+                class_interface.add_device(&device).ok();
+            }
+        }
+
         return Ok(());
+    }
+
+    /// 获取设备真实的parent kobject
+    ///
+    /// ## 参数
+    ///
+    /// - `device`: 设备
+    /// - `current_parent`: 当前的parent kobject
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(Some(kobj))`: 如果找到了真实的parent kobject，那么返回它
+    /// - `Ok(None)`: 如果没有找到真实的parent kobject，那么返回None
+    /// - `Err(e)`: 如果发生错误，那么返回错误
+    fn get_device_parent(
+        &self,
+        device: &Arc<dyn Device>,
+        current_parent: Option<Arc<dyn Device>>,
+    ) -> Result<Option<Arc<dyn KObject>>, SystemError> {
+        // kdebug!("get_device_parent() device:{:?}", device.name());
+        if let Some(_) = device.class() {
+            let parent_kobj: Arc<dyn KObject>;
+            // kdebug!("current_parent:{:?}", current_parent);
+            if current_parent.is_none() {
+                parent_kobj = sys_devices_virtual_kset() as Arc<dyn KObject>;
+            } else {
+                let cp = current_parent.unwrap();
+
+                if cp.class().is_some() {
+                    return Ok(Some(cp.clone() as Arc<dyn KObject>));
+                } else {
+                    parent_kobj = cp.clone() as Arc<dyn KObject>;
+                }
+            }
+
+            // 是否需要glue dir?
+
+            return Ok(Some(parent_kobj));
+        }
+
+        // subsystems can specify a default root directory for their devices
+        if current_parent.is_none() {
+            if let Some(bus) = device.bus() {
+                if let Some(root) = bus.root_device().map(|x| x.upgrade()).flatten() {
+                    return Ok(Some(root as Arc<dyn KObject>));
+                }
+            }
+        }
+
+        if current_parent.is_some() {
+            return Ok(Some(current_parent.unwrap().clone() as Arc<dyn KObject>));
+        }
+
+        return Ok(None);
     }
 
     /// @brief: 卸载设备
@@ -496,9 +626,32 @@ impl DeviceManager {
         software_node_notify(dev);
     }
 
-    fn add_class_symlinks(&self, _dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        // todo: 引入class后，在这里处理与class相关的逻辑
-        // https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c#3224
+    fn add_class_symlinks(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let class = dev.class();
+        if class.is_none() {
+            return Ok(());
+        }
+
+        // 定义错误处理函数，用于在添加符号链接失败时，移除已经添加的符号链接
+
+        let err_remove_subsystem = |dev_kobj: &Arc<dyn KObject>| {
+            sysfs_instance().remove_link(dev_kobj, "subsystem".to_string());
+        };
+
+        let class = class.unwrap();
+        let dev_kobj = dev.clone() as Arc<dyn KObject>;
+        let subsys_kobj = class.subsystem().subsys() as Arc<dyn KObject>;
+        sysfs_instance().create_link(Some(&dev_kobj), &subsys_kobj, "subsystem".to_string())?;
+
+        // todo: 这里需要处理class的parent逻辑, 添加device链接
+        // https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#3245
+
+        sysfs_instance()
+            .create_link(Some(&subsys_kobj), &dev_kobj, dev.name())
+            .map_err(|e| {
+                err_remove_subsystem(&dev_kobj);
+                e
+            })?;
 
         return Ok(());
     }
@@ -509,20 +662,45 @@ impl DeviceManager {
     ///
     /// - `dev`: 设备
     fn add_attrs(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        let kobj_type = dev.kobj_type();
-        if kobj_type.is_none() {
-            return Ok(());
+        // 定义错误处理函数，用于在添加属性文件失败时，移除已经添加的属性组
+        let err_remove_class_groups = |dev: &Arc<dyn Device>| {
+            if let Some(class) = dev.class() {
+                let attr_groups = class.dev_groups();
+                self.remove_groups(dev, attr_groups);
+            }
+        };
+
+        let err_remove_kobj_type_groups = |dev: &Arc<dyn Device>| {
+            if let Some(kobj_type) = dev.kobj_type() {
+                let attr_groups = kobj_type.attribute_groups().unwrap_or(&[]);
+                self.remove_groups(dev, attr_groups);
+            }
+        };
+
+        // 真正开始添加属性文件
+
+        // 添加设备类的属性文件
+        if let Some(class) = dev.class() {
+            let attr_groups = class.dev_groups();
+            self.add_groups(dev, attr_groups)?;
         }
 
-        let kobj_type = kobj_type.unwrap();
-
-        let attr_groups = kobj_type.attribute_groups();
-
-        if attr_groups.is_none() {
-            return Ok(());
+        // 添加kobj_type的属性文件
+        if let Some(kobj_type) = dev.kobj_type() {
+            self.add_groups(dev, kobj_type.attribute_groups().unwrap_or(&[]))
+                .map_err(|e| {
+                    err_remove_class_groups(dev);
+                    e
+                })?;
         }
 
-        self.add_groups(dev, attr_groups.unwrap())?;
+        // 添加设备本身的属性文件
+        self.add_groups(dev, dev.attribute_groups().unwrap_or(&[]))
+            .map_err(|e| {
+                err_remove_kobj_type_groups(dev);
+                err_remove_class_groups(dev);
+                e
+            })?;
 
         return Ok(());
     }
@@ -540,6 +718,21 @@ impl DeviceManager {
     ) -> Result<(), SystemError> {
         let kobj = dev.clone() as Arc<dyn KObject>;
         return sysfs_instance().create_groups(&kobj, attr_groups);
+    }
+
+    /// 在sysfs中，为指定的设备移除属性组，以及属性组中的属性文件
+    ///
+    /// ## 参数
+    ///
+    /// - `dev`: 设备
+    /// - `attr_groups`: 要移除的属性组
+    pub fn remove_groups(
+        &self,
+        dev: &Arc<dyn Device>,
+        attr_groups: &'static [&dyn AttributeGroup],
+    ) {
+        let kobj = dev.clone() as Arc<dyn KObject>;
+        sysfs_instance().remove_groups(&kobj, attr_groups);
     }
 
     /// 为设备在sysfs中创建属性文件

@@ -423,17 +423,8 @@ impl SigPending {
     /// @brief 从sigpending中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
     pub fn flush_by_mask(&mut self, mask: &SigSet) {
         // 定义过滤器，从sigqueue中删除mask中被置位的信号
-        let filter = |x: &mut SigInfo| {
-            if mask.contains(SigSet::from_bits_truncate(x.sig_no as u64)) {
-                return true;
-            }
-            return false;
-        };
-        let filter_result: Vec<SigInfo> = self.queue.q.drain_filter(filter).collect();
-        // 回收这些siginfo
-        for x in filter_result {
-            drop(x)
-        }
+        let filter = |x: &SigInfo| !mask.contains(SigSet::from_bits_truncate(x.sig_no as u64));
+        self.queue.q.retain(filter);
     }
 }
 
@@ -496,7 +487,7 @@ impl SigQueue {
             return false;
         };
         // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<SigInfo> = self.q.drain_filter(filter).collect();
+        let mut filter_result: Vec<SigInfo> = self.q.extract_if(filter).collect();
         // 筛选出的结果不能大于1个
         assert!(filter_result.len() <= 1);
 

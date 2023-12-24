@@ -13,6 +13,7 @@ use crate::{
     driver::net::NetDriver,
     kwarn,
     libs::{rwlock::RwLock, spinlock::SpinLock},
+    net::event_poll::EventPoll,
     syscall::SystemError,
 };
 use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
@@ -218,6 +219,22 @@ pub trait Socket: Sync + Send + Debug {
             .get_mut(&self.socket_handle())
             .unwrap()
             .remove_epoll(epoll)?;
+
+        Ok(())
+    }
+
+    fn clear_epoll(&mut self) -> Result<(), SystemError> {
+        let mut handle_map_guard = HANDLE_MAP.write_irqsave();
+        let handle_item = handle_map_guard.get_mut(&self.socket_handle()).unwrap();
+
+        for epitem in handle_item.epitems.lock_irqsave().iter() {
+            let epoll = epitem.epoll();
+            let _ = EventPoll::ep_remove(
+                &mut epoll.upgrade().unwrap().lock_irqsave(),
+                epitem.fd(),
+                None,
+            );
+        }
 
         Ok(())
     }

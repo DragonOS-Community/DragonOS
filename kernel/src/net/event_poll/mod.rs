@@ -102,9 +102,21 @@ impl EPollItem {
         &self.event
     }
 
+    pub fn file(&self) -> Weak<SpinLock<File>> {
+        self.file.clone()
+    }
+
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
     /// ## 通过epoll_item来执行绑定文件的poll方法，并获取到感兴趣的事件
     fn ep_item_poll(&self) -> EPollEventType {
-        if let Ok(events) = self.file.upgrade().unwrap().lock().poll() {
+        let file = self.file.upgrade();
+        if file.is_none() {
+            return EPollEventType::empty();
+        }
+        if let Ok(events) = file.unwrap().lock_irqsave().poll() {
             let events = events as u32 & self.event.read().events;
             return EPollEventType::from_bits_truncate(events);
         }
@@ -191,7 +203,7 @@ impl IndexNode for EPollInode {
 
             if file.is_some() {
                 file.unwrap()
-                    .lock()
+                    .lock_irqsave()
                     .remove_epoll(&Arc::downgrade(&self.epoll.0))?;
             }
 
@@ -221,7 +233,7 @@ impl EventPoll {
 
         // 创建epoll
         let epoll = LockedEventPoll(Arc::new(SpinLock::new(EventPoll::new())));
-        epoll.0.lock().self_ref = Some(Arc::downgrade(&epoll.0));
+        epoll.0.lock_irqsave().self_ref = Some(Arc::downgrade(&epoll.0));
 
         // 创建epoll的inode对象
         let epoll_inode = EPollInode::new(epoll.clone());
@@ -303,7 +315,7 @@ impl EventPoll {
         }
 
         // 从FilePrivateData获取到epoll
-        if let FilePrivateData::EPoll(epoll_data) = &ep_file.lock().private_data {
+        if let FilePrivateData::EPoll(epoll_data) = &ep_file.lock_irqsave().private_data {
             let mut epoll_guard = {
                 if nonblock {
                     // 如果设置非阻塞，则尝试获取一次锁
@@ -348,7 +360,7 @@ impl EventPoll {
                         return Err(SystemError::ENOENT);
                     }
                     // 删除
-                    Self::ep_remove(&mut epoll_guard, fd, dst_file)?;
+                    Self::ep_remove(&mut epoll_guard, fd, Some(dst_file))?;
                 }
                 EPollCtlOption::EpollCtlMod => {
                     // 不存在则返回错误
@@ -394,7 +406,7 @@ impl EventPoll {
 
         // 从epoll文件获取到epoll
         let mut epolldata = None;
-        if let FilePrivateData::EPoll(epoll_data) = &ep_file.lock().private_data {
+        if let FilePrivateData::EPoll(epoll_data) = &ep_file.lock_irqsave().private_data {
             epolldata = Some(epoll_data.clone())
         }
         if epolldata.is_some() {
@@ -568,7 +580,7 @@ impl EventPoll {
 
     // ### 查看文件是否为epoll文件
     fn is_epoll_file(file: &Arc<SpinLock<File>>) -> bool {
-        if let FilePrivateData::EPoll(_) = file.lock().private_data {
+        if let FilePrivateData::EPoll(_) = file.lock_irqsave().private_data {
             return true;
         }
         return false;
@@ -584,7 +596,7 @@ impl EventPoll {
             // TODO：现在的实现先不考虑嵌套其它类型的文件(暂时只针对socket),这里的嵌套指epoll/select/poll
         }
 
-        let test_poll = dst_file.lock().poll();
+        let test_poll = dst_file.lock_irqsave().poll();
         if test_poll.is_err() {
             if test_poll.unwrap_err() == SystemError::EOPNOTSUPP_OR_ENOTSUP {
                 // 如果目标文件不支持poll
@@ -612,24 +624,27 @@ impl EventPoll {
             return Err(SystemError::ENOSYS);
         }
 
-        dst_file.lock().add_epoll(epitem.clone())?;
+        dst_file.lock_irqsave().add_epoll(epitem.clone())?;
         Ok(())
     }
 
-    fn ep_remove(
+    pub fn ep_remove(
         epoll: &mut SpinLockGuard<EventPoll>,
         fd: i32,
-        dst_file: Arc<SpinLock<File>>,
+        dst_file: Option<Arc<SpinLock<File>>>,
     ) -> Result<(), SystemError> {
-        let mut file_guard = dst_file.lock();
+        if dst_file.is_some() {
+            let dst_file = dst_file.unwrap();
+            let mut file_guard = dst_file.lock_irqsave();
 
-        file_guard.remove_epoll(epoll.self_ref.as_ref().unwrap())?;
+            file_guard.remove_epoll(epoll.self_ref.as_ref().unwrap())?;
+        }
 
         let epitem = epoll.ep_items.remove(&fd).unwrap();
 
-        epoll
+        let _ = epoll
             .ready_list
-            .drain_filter(|item| Arc::ptr_eq(item, &epitem));
+            .extract_if(|item| Arc::ptr_eq(item, &epitem));
 
         Ok(())
     }

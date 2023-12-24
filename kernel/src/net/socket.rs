@@ -103,14 +103,14 @@ impl SocketHandleItem {
     }
 
     pub fn add_epoll(&mut self, epitem: Arc<EPollItem>) {
-        self.epitems.lock().push_back(epitem)
+        self.epitems.lock_irqsave().push_back(epitem)
     }
 
     pub fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         let is_remove = !self
             .epitems
-            .lock()
-            .drain_filter(|x| x.epoll().ptr_eq(epoll))
+            .lock_irqsave()
+            .extract_if(|x| x.epoll().ptr_eq(epoll))
             .collect::<Vec<_>>()
             .is_empty();
 
@@ -1317,10 +1317,12 @@ impl IndexNode for SocketInode {
         &self,
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<(), SystemError> {
-        let socket = self.0.lock();
+        let mut socket = self.0.lock_irqsave();
         if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
             PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
         }
+
+        let _ = socket.clear_epoll();
 
         HANDLE_MAP
             .write_irqsave()
@@ -1350,7 +1352,7 @@ impl IndexNode for SocketInode {
     }
 
     fn poll(&self) -> Result<usize, SystemError> {
-        let events = self.0.lock().poll();
+        let events = self.0.lock_irqsave().poll();
         return Ok(events.bits() as usize);
     }
 

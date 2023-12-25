@@ -347,7 +347,7 @@ impl Syscall {
         let file_guard = file.lock();
 
         // TODO: 等待队列机制
-        let mask = file_guard.inode().poll()?;
+        let mask = file_guard.inode().poll()? as PollStatus;
         pollfd.revents = mask;
 
         return Ok(mask);

@@ -182,11 +182,6 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn poll(&self) -> Result<super::PollStatus, SystemError> {
-        return self.inner_inode.poll();
-    }
-
-    #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
         return self.mount_fs.clone();
     }

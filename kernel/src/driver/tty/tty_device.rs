@@ -214,10 +214,6 @@ impl IndexNode for TtyDevice {
         return Err(SystemError::EIO);
     }
 
-    fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         return self.fs.read().upgrade().unwrap();
     }

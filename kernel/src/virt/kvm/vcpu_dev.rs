@@ -3,7 +3,7 @@ use crate::arch::KVMArch;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id, file::FileMode, make_rawdev, FilePrivateData, FileSystem, FileType,
-    IndexNode, Metadata, PollStatus,
+    IndexNode, Metadata,
 };
 use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
@@ -126,10 +126,6 @@ impl IndexNode for LockedVcpuInode {
         inode.metadata.gid = metadata.gid;
 
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// @brief io control接口

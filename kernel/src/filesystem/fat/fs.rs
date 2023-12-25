@@ -17,7 +17,7 @@ use crate::{
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
-        FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
+        FileSystem, FileType, IndexNode, InodeId, Metadata,
     },
     kerror,
     libs::{
@@ -1414,18 +1414,6 @@ impl IndexNode for LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         }
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        // 加锁
-        let inode: SpinLockGuard<FATInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn create(

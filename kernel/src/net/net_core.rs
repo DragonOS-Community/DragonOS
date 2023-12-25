@@ -226,7 +226,6 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
             smoltcp::socket::Socket::Dhcpv4(_) => {}
             smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
         }
-        drop(handle_item);
         drop(handle_guard);
         wakeup_epoll(handle, events as u32)?;
         // crate::kdebug!(

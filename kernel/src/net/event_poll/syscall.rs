@@ -1,11 +1,12 @@
-use core::ops::Add;
-
 use crate::{
     arch::ipc::signal::SigSet,
     filesystem::vfs::file::FileMode,
     ipc::signal::set_current_sig_blocked,
-    mm::{verify_area, VirtAddr},
-    syscall::{user_access::UserBufferReader, Syscall, SystemError},
+    mm::VirtAddr,
+    syscall::{
+        user_access::{UserBufferReader, UserBufferWriter},
+        Syscall, SystemError,
+    },
     time::TimeSpec,
 };
 
@@ -49,10 +50,15 @@ impl Syscall {
             timespec = Some(TimeSpec::new(sec, nsec))
         }
 
-        // 因为C中的epoll_event大小为12字节,而在rust中为16字节
-        verify_area(events, 12 * max_events as usize)?;
+        // 从用户传入的地址中拿到epoll_events
+        let mut epds_writer = UserBufferWriter::new(
+            events.as_ptr::<EPollEvent>(),
+            max_events as usize * core::mem::size_of::<EPollEvent>(),
+            true,
+        )?;
 
-        return EventPoll::do_epoll_wait(epfd, events, max_events, timespec);
+        let epoll_events = epds_writer.buffer::<EPollEvent>(0)?;
+        return EventPoll::do_epoll_wait(epfd, epoll_events, max_events, timespec);
     }
 
     pub fn epoll_ctl(epfd: i32, op: usize, fd: i32, event: VirtAddr) -> Result<usize, SystemError> {
@@ -66,18 +72,14 @@ impl Syscall {
 
             // 还是一样的问题，C标准的epoll_event大小为12字节，而内核实现的epoll_event内存对齐后为16字节
             // 这样分别拷贝其实和整体拷贝差别不大，内核使用内存对其版本甚至可能提升性能
-            let ev_reader =
-                UserBufferReader::new(event.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
-            let events = ev_reader.read_one_from_user::<u32>(0)?;
-            let event = event.add(core::mem::size_of::<u32>());
-            let data_reader =
-                UserBufferReader::new(event.as_ptr::<u64>(), core::mem::size_of::<u64>(), true)?;
-            let data = data_reader.read_one_from_user::<u64>(0)?;
+            let epds_reader = UserBufferReader::new(
+                event.as_ptr::<EPollEvent>(),
+                core::mem::size_of::<EPollEvent>(),
+                true,
+            )?;
 
-            epds = EPollEvent {
-                events: *events,
-                data: *data,
-            };
+            // 拷贝到内核
+            epds_reader.copy_one_from_user(&mut epds, 0)?;
         }
 
         return EventPoll::do_epoll_ctl(epfd, op, fd, &mut epds, false);

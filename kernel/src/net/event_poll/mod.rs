@@ -1,6 +1,5 @@
 use core::{
     fmt::Debug,
-    ops::Add,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -23,9 +22,8 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    mm::VirtAddr,
     process::ProcessManager,
-    syscall::{user_access::UserBufferWriter, SystemError},
+    syscall::SystemError,
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         TimeSpec,
@@ -384,7 +382,7 @@ impl EventPoll {
     /// ## epoll_wait的具体实现
     pub fn do_epoll_wait(
         epfd: i32,
-        epoll_event: VirtAddr,
+        epoll_event: &mut [EPollEvent],
         max_events: i32,
         timespec: Option<TimeSpec>,
     ) -> Result<usize, SystemError> {
@@ -510,7 +508,7 @@ impl EventPoll {
     /// - max_events: 处理的最大事件数量
     fn ep_send_events(
         epoll: LockedEventPoll,
-        user_event: VirtAddr,
+        user_event: &mut [EPollEvent],
         max_events: i32,
     ) -> Result<usize, SystemError> {
         let mut ep_guard = epoll.0.lock_irqsave();
@@ -519,9 +517,9 @@ impl EventPoll {
         // 在水平触发模式下，需要将epitem再次加入队列，在下次循环再次判断是否还有事件
         // （所以边缘触发的效率会高于水平触发，但是水平触发某些情况下能够使得更迅速地向用户反馈）
         let mut push_back = Vec::new();
-        let max_offset = user_event.data() + 12 * max_events as usize;
         while let Some(epitem) = ep_guard.ready_list.pop_front() {
             if res >= max_events as usize {
+                push_back.push(epitem);
                 break;
             }
             let ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
@@ -538,25 +536,26 @@ impl EventPoll {
                 data: epitem.event.read().data,
             };
 
-            // C标准的epoll_event大小为12字节,在内核我们不使用#[repr(packed)]来强制与C兼容，可以提高效率
-            let user_addr = user_event.add(res * 12);
-            if user_addr.data() >= max_offset {
-                // 当前指向的地址已为空，则把epitem放回队列
-                ep_guard.ready_list.push_back(epitem.clone());
-                if res == 0 {
-                    // 一个都未写入成功，表明用户传进的地址就是有问题的
-                    return Err(SystemError::EFAULT);
-                }
-            }
+            // 这里是需要判断下一个写入的位置是否为空指针
+
+            // TODO:这里有可能会出现事件丢失的情况
+            // 如果用户传入的数组长度小于传入的max_event，到这里时如果已经到数组最大长度，但是未到max_event
+            // 会出现的问题是我们会把这个数据写入到后面的内存中，用户无法在传入的数组中拿到事件，而且写脏数据到了后面一片内存，导致事件丢失
+            // 出现这个问题的几率比较小，首先是因为用户的使用不规范,后因为前面地址校验是按照max_event来校验的，只会在两块内存连着分配时出现，但是也是需要考虑的
+
+            // 以下的写法判断并无意义，只是记一下错误处理
+            // offset += core::mem::size_of::<EPollEvent>();
+            // if offset >= max_offset {
+            //     // 当前指向的地址已为空，则把epitem放回队列
+            //     ep_guard.ready_list.push_back(epitem.clone());
+            //     if res == 0 {
+            //         // 一个都未写入成功，表明用户传进的地址就是有问题的
+            //         return Err(SystemError::EFAULT);
+            //     }
+            // }
 
             // 拷贝到用户空间
-            // 先拷贝events字段
-            UserBufferWriter::new(user_addr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?
-                .copy_one_to_user::<u32>(&event.events, 0)?;
-            // 增加偏移量
-            let user_addr = user_addr.add(core::mem::size_of::<u32>());
-            UserBufferWriter::new(user_addr.as_ptr::<u64>(), core::mem::size_of::<u64>(), true)?
-                .copy_one_to_user::<u64>(&event.data, 0)?;
+            user_event[res] = event;
             // 记数加一
             res += 1;
 
@@ -614,8 +613,6 @@ impl EventPoll {
 
             epoll_guard.ep_wake_one();
         }
-
-        drop(epoll_guard);
 
         // TODO： 嵌套epoll？
 
@@ -711,6 +708,7 @@ impl EventPoll {
 
 /// 与C兼容的Epoll事件结构体
 #[derive(Copy, Clone, Default)]
+#[repr(packed)]
 pub struct EPollEvent {
     /// 表示触发的事件
     events: u32,

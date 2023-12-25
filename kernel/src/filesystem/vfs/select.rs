@@ -347,7 +347,7 @@ impl Syscall {
         let file_guard = file.lock();
 
         // TODO: 等待队列机制
-        let mask = file_guard.inode().poll()? as PollStatus;
+        let mask = PollStatus::from_bits_truncate(file_guard.inode().poll()? as u8);
         pollfd.revents = mask;
 
         return Ok(mask);

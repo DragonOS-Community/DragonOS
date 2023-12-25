@@ -47,7 +47,10 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
-		sphinx gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu gdb-multiarch
+		sphinx
+	# 必须分开安装，否则会出现错误
+	sudo "$1" install -y \
+		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu gdb-multiarch
 	
 	# 如果python3没有安装
 	if [ -z "$(which python3)" ]; then
@@ -60,7 +63,7 @@ install_ubuntu_debian_pkg()
         sudo apt install -y docker.io docker-compose
 		sudo usermod -aG docker $USER
 		sudo newgrp docker
-		sudo systemctl restart docker
+		# sudo systemctl restart docker
     elif [ -z ${dockerInstall} ]; then
 		echo "您传入--no-docker参数生效, 安装docker步骤被跳过."
 	elif [ -n "$(which docker)" ]; then

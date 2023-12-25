@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use system_error::SystemError;
 
 use crate::{
     libs::{
@@ -13,7 +14,6 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    syscall::SystemError,
     time::TimeSpec,
 };
 

@@ -1,6 +1,7 @@
 use core::sync::atomic::Ordering;
 
 use atomic_enum::atomic_enum;
+use system_error::SystemError;
 use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
 use crate::{
@@ -12,7 +13,6 @@ use crate::{
     kdebug, kinfo,
     mm::PhysAddr,
     smp::core::smp_get_processor_id,
-    syscall::SystemError,
 };
 
 use self::{

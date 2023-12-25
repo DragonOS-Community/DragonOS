@@ -11,7 +11,6 @@ use crate::{
     kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
-    syscall::SystemError,
     time::Instant,
 };
 use alloc::{string::String, sync::Arc};
@@ -21,6 +20,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use smoltcp::{phy, wire};
+use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
 
@@ -260,10 +260,7 @@ impl NetDriver for E1000EInterface {
         return Ok(());
     }
 
-    fn poll(
-        &self,
-        sockets: &mut smoltcp::iface::SocketSet,
-    ) -> Result<(), crate::syscall::SystemError> {
+    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         let timestamp: smoltcp::time::Instant = Instant::now().into();
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);

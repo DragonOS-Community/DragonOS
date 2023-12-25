@@ -4,9 +4,9 @@ use core::fmt::Debug;
 use crate::{
     kwarn,
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    syscall::SystemError,
 };
 use alloc::{sync::Arc, vec::Vec};
+use system_error::SystemError;
 
 /// @brief 通知链节点
 pub trait NotifierBlock<V: Clone + Copy, T>: Debug + Send + Sync {

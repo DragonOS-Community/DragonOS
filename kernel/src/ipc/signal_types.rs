@@ -1,6 +1,7 @@
 use core::{ffi::c_void, mem::size_of, sync::atomic::AtomicI64};
 
 use alloc::vec::Vec;
+use system_error::SystemError;
 
 use crate::{
     arch::{
@@ -10,7 +11,7 @@ use crate::{
     },
     mm::VirtAddr,
     process::Pid,
-    syscall::{user_access::UserBufferWriter, SystemError},
+    syscall::user_access::UserBufferWriter,
 };
 
 /// 用户态程序传入的SIG_DFL的值

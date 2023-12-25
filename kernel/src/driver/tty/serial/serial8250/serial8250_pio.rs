@@ -11,8 +11,8 @@ use crate::{
     arch::{io::PortIOArch, CurrentPortIOArch},
     driver::tty::serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
     libs::rwlock::RwLock,
-    syscall::SystemError,
 };
+use system_error::SystemError;
 
 use super::{Serial8250ISADevices, Serial8250ISADriver, Serial8250Manager, Serial8250Port};
 

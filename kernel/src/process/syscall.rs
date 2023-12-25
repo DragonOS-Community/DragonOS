@@ -5,6 +5,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use system_error::SystemError;
 
 use super::{
     abi::WaitOption,
@@ -24,7 +25,7 @@ use crate::{
     sched::completion::Completion,
     syscall::{
         user_access::{check_and_clone_cstr, check_and_clone_cstr_array, UserBufferWriter},
-        Syscall, SystemError,
+        Syscall,
     },
 };
 

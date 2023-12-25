@@ -7,9 +7,10 @@ use super::{
     },
     kobject::KObject,
 };
-use crate::{driver::base::device::device_register, syscall::SystemError};
+use crate::driver::base::device::device_register;
 use alloc::{collections::BTreeSet, string::ToString, sync::Arc, vec::Vec};
 use core::fmt::Debug;
+use system_error::SystemError;
 
 pub mod platform_device;
 pub mod platform_driver;

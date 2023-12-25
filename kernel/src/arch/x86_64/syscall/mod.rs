@@ -12,9 +12,10 @@ use crate::{
     libs::align::SafeForZero,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{Syscall, SystemError, SYS_SCHED},
+    syscall::{Syscall, SYS_SCHED},
 };
 use alloc::string::String;
+use system_error::SystemError;
 
 use super::{interrupt::TrapFrame, mm::barrier::mfence};
 

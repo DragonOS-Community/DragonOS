@@ -1,3 +1,5 @@
+use system_error::SystemError;
+
 use super::{page::PageFlags, PageTableKind, PhysAddr, VirtAddr};
 use crate::{
     arch::{
@@ -9,7 +11,6 @@ use crate::{
     mm::allocator::page_frame::PageFrameCount,
     mm::{MMArch, MemoryManagementArch},
     smp::core::smp_get_processor_id,
-    syscall::SystemError,
 };
 use core::{
     ops::Deref,

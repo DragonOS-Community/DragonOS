@@ -2,6 +2,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 use crate::{
     driver::base::{
@@ -19,7 +20,6 @@ use crate::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
-    syscall::SystemError,
 };
 
 use super::fbmem::sys_class_graphics_instance;

@@ -10,8 +10,8 @@ use crate::{
         vfs::syscall::ModeType,
     },
     libs::wait_queue::WaitQueue,
-    syscall::SystemError,
 };
+use system_error::SystemError;
 
 use super::{
     bus::BusNotifyEvent,

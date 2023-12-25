@@ -1,4 +1,5 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -10,7 +11,6 @@ use crate::{
     kerror,
     libs::spinlock::SpinLock,
     process::ProcessManager,
-    syscall::SystemError,
 };
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};

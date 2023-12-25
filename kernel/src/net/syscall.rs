@@ -3,6 +3,7 @@ use core::cmp::min;
 use alloc::{boxed::Box, sync::Arc};
 use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
+use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
@@ -13,7 +14,7 @@ use crate::{
     mm::{verify_area, VirtAddr},
     net::socket::{AddressFamily, SOL_SOCKET},
     process::ProcessManager,
-    syscall::{Syscall, SystemError},
+    syscall::Syscall,
 };
 
 use super::{

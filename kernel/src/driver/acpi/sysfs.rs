@@ -1,10 +1,3 @@
-use acpi::sdt::SdtHeader;
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
-
 use crate::{
     driver::{
         acpi::acpi_manager,
@@ -15,8 +8,14 @@ use crate::{
         vfs::syscall::ModeType,
     },
     libs::rwlock::RwLock,
-    syscall::SystemError,
 };
+use acpi::sdt::SdtHeader;
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
+use system_error::SystemError;
 
 use super::{acpi_kset, AcpiManager};
 

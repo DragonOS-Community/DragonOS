@@ -3,6 +3,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 use crate::{
     filesystem::{
@@ -17,7 +18,6 @@ use crate::{
         lib_ui::textui::{textui_putchar, FontColor},
         rwlock::RwLock,
     },
-    syscall::SystemError,
 };
 
 use super::{serial::serial_init, TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};

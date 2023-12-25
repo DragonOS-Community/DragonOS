@@ -2,15 +2,13 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
-use crate::{
-    driver::base::{
-        class::{class_manager, Class},
-        device::sys_dev_char_kset,
-        kobject::KObject,
-        subsys::SubSysPrivate,
-    },
-    syscall::SystemError,
+use crate::driver::base::{
+    class::{class_manager, Class},
+    device::sys_dev_char_kset,
+    kobject::KObject,
+    subsys::SubSysPrivate,
 };
 
 use super::fbcon::fb_console_init;

@@ -4,13 +4,13 @@ use core::{
 };
 
 use alloc::{collections::LinkedList, sync::Arc};
+use system_error::SystemError;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
     process::{Pid, ProcessControlBlock, ProcessManager},
-    syscall::SystemError,
 };
 
 use super::spinlock::SpinLock;

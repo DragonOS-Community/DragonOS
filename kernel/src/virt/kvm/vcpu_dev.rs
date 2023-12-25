@@ -10,12 +10,13 @@ use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
 use crate::{filesystem, kdebug};
-use crate::{libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 // pub const KVM_API_VERSION:u32 = 12;
 pub const KVM_RUN: u32 = 0x00;

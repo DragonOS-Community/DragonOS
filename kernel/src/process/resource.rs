@@ -1,6 +1,7 @@
 use num_traits::FromPrimitive;
+use system_error::SystemError;
 
-use crate::{syscall::SystemError, time::TimeSpec};
+use crate::time::TimeSpec;
 
 use super::ProcessControlBlock;
 

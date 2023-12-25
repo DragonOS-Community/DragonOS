@@ -9,8 +9,9 @@ use crate::{
     driver::acpi::acpi_manager,
     filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-    syscall::SystemError,
 };
+
+use system_error::SystemError;
 
 use super::{
     class::Class,

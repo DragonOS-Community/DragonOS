@@ -4,12 +4,13 @@ use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
 };
-use crate::{libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 // use uuid::{uuid, Uuid};
 use super::{DevFS, DeviceINode};
 

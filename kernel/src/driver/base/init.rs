@@ -1,4 +1,5 @@
-use crate::{driver::tty::tty_device::tty_init, syscall::SystemError};
+use crate::driver::tty::tty_device::tty_init;
+use system_error::SystemError;
 
 use super::{
     class::classes_init,

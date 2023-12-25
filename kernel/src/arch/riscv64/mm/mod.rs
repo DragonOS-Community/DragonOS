@@ -1,3 +1,5 @@
+use system_error::SystemError;
+
 use crate::mm::{
     allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage},
     page::PageFlags,
@@ -79,8 +81,7 @@ impl MemoryManagementArch for RiscV64MMArch {
         todo!()
     }
 
-    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, crate::syscall::SystemError>
-    {
+    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
         todo!()
     }
 }

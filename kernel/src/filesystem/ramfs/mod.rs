@@ -7,12 +7,12 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    syscall::SystemError,
     time::TimeSpec,
 };
 

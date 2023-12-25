@@ -1,12 +1,10 @@
 use alloc::sync::Arc;
+use system_error::SystemError;
 
-use crate::{
-    process::{
-        fork::CloneFlags,
-        kthread::{KernelThreadCreateInfo, KernelThreadMechanism},
-        Pid,
-    },
-    syscall::SystemError,
+use crate::process::{
+    fork::CloneFlags,
+    kthread::{KernelThreadCreateInfo, KernelThreadMechanism},
+    Pid,
 };
 
 impl KernelThreadMechanism {

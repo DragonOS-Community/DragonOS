@@ -1,19 +1,16 @@
+use crate::driver::base::{
+    device::{
+        bus::{bus_manager, Bus},
+        driver::Driver,
+        Device,
+    },
+    subsys::SubSysPrivate,
+};
 use alloc::{
     string::{String, ToString},
     sync::Arc,
 };
-
-use crate::{
-    driver::base::{
-        device::{
-            bus::{bus_manager, Bus},
-            driver::Driver,
-            Device,
-        },
-        subsys::SubSysPrivate,
-    },
-    syscall::SystemError,
-};
+use system_error::SystemError;
 
 use super::AcpiManager;
 

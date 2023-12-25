@@ -4,8 +4,9 @@ use core::{
 };
 
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use system_error::SystemError;
 
-use crate::{driver::net::NetDriver, kwarn, libs::rwlock::RwLock, syscall::SystemError};
+use crate::{driver::net::NetDriver, kwarn, libs::rwlock::RwLock};
 use smoltcp::wire::IpEndpoint;
 
 use self::socket::SocketMetadata;

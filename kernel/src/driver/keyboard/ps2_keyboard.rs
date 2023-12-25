@@ -13,10 +13,9 @@ use crate::{
     },
     include::bindings::bindings::vfs_file_operations_t,
     libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
-    syscall::SystemError,
     time::TimeSpec,
 };
-
+use system_error::SystemError;
 #[derive(Debug)]
 pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>, AtomicI32); // self.1 用来记录有多少个文件打开了这个inode
 

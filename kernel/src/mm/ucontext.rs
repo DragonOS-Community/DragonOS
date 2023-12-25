@@ -14,6 +14,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashSet;
+use system_error::SystemError;
 
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
@@ -24,7 +25,6 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::ProcessManager,
-    syscall::SystemError,
 };
 
 use super::{

@@ -6,6 +6,7 @@ use smoltcp::{
     socket::{raw, tcp, udp},
     wire,
 };
+use system_error::SystemError;
 
 use crate::{
     arch::rand::rand,
@@ -16,7 +17,6 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    syscall::SystemError,
 };
 
 use super::{net_core::poll_ifaces, Endpoint, Protocol, Socket, NET_DRIVERS};

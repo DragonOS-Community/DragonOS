@@ -1,6 +1,6 @@
 use alloc::{string::ToString, sync::Arc};
 
-use crate::syscall::SystemError;
+use system_error::SystemError;
 
 use super::kset::KSet;
 

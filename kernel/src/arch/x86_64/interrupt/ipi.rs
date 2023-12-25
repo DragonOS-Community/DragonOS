@@ -1,3 +1,4 @@
+use system_error::SystemError;
 use x86::apic::ApicId;
 
 use crate::{
@@ -6,7 +7,6 @@ use crate::{
         smp::SMP_BOOT_DATA,
     },
     exception::ipi::{IpiKind, IpiTarget},
-    syscall::SystemError,
 };
 
 /// IPI的种类(架构相关，指定了向量号)

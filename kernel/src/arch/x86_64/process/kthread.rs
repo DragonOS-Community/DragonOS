@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::{
@@ -12,7 +13,6 @@ use crate::{
         kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
         Pid, ProcessManager,
     },
-    syscall::SystemError,
 };
 
 impl KernelThreadMechanism {

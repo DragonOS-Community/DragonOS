@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use system_error::SystemError;
 
 use crate::{
     arch::{
@@ -47,7 +48,7 @@ use crate::{
         SchedPolicy, SchedPriority,
     },
     smp::kick_cpu,
-    syscall::{user_access::clear_user, Syscall, SystemError},
+    syscall::{user_access::clear_user, Syscall},
 };
 
 use self::kthread::WorkerPrivate;

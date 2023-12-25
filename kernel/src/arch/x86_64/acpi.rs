@@ -1,4 +1,6 @@
-use crate::{driver::acpi::acpi_manager, kinfo, mm::percpu::PerCpu, syscall::SystemError};
+use system_error::SystemError;
+
+use crate::{driver::acpi::acpi_manager, kinfo, mm::percpu::PerCpu};
 
 use super::smp::SMP_BOOT_DATA;
 

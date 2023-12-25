@@ -8,7 +8,6 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    syscall::SystemError,
 };
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};
 use alloc::{sync::Arc, vec::Vec};
@@ -18,6 +17,7 @@ use core::{
     ops::{Add, AddAssign, Sub},
     sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
+use system_error::SystemError;
 
 use super::{
     screen_manager::{

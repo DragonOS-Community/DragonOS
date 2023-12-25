@@ -7,11 +7,12 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use system_error::SystemError;
+
 use crate::{
     arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlagsGuard},
     process::ProcessManager,
-    syscall::SystemError,
 };
 
 ///RwLock读写锁

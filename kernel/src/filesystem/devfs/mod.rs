@@ -14,7 +14,6 @@ use crate::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    syscall::SystemError,
     time::TimeSpec,
 };
 use alloc::{
@@ -23,6 +22,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 const DEVFS_MAX_NAMELEN: usize = 64;
 

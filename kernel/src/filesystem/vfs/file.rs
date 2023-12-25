@@ -3,6 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -18,7 +19,6 @@ use crate::{
         socket::SocketInode,
     },
     process::ProcessManager,
-    syscall::SystemError,
 };
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};

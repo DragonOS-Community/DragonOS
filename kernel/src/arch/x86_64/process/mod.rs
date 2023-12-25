@@ -12,6 +12,7 @@ use alloc::{
 };
 
 use kdepends::memoffset::offset_of;
+use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
@@ -28,7 +29,7 @@ use crate::{
         KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, SwitchResult,
         SWITCH_RESULT,
     },
-    syscall::{Syscall, SystemError},
+    syscall::Syscall,
 };
 
 use self::{

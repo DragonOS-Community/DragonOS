@@ -9,6 +9,7 @@ use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
@@ -19,7 +20,6 @@ use crate::{
     kerror, kinfo,
     libs::spinlock::SpinLock,
     process::{ProcessControlBlock, ProcessManager},
-    syscall::SystemError,
 };
 
 use super::timekeeping::update_wall_time;

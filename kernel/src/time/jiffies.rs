@@ -2,8 +2,9 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
-use crate::{kerror, kinfo, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{kerror, kinfo, libs::spinlock::SpinLock};
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},

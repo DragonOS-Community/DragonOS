@@ -1,10 +1,11 @@
+use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::mm::PageMapper;
 use crate::arch::MMArch;
 use crate::mm::page::PageFlags;
 use crate::mm::{PageTableKind, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
-use crate::{arch::mm::LockedFrameAllocator, syscall::SystemError};
 use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
+use system_error::SystemError;
 use x86::msr;
 
 /// Check if MTRR is supported

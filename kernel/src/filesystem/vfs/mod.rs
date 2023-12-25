@@ -9,12 +9,12 @@ mod utils;
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use system_error::SystemError;
 
 use crate::{
     driver::base::{block::block_device::BlockDevice, char::CharDevice, device::DeviceNumber},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    syscall::SystemError,
     time::TimeSpec,
 };
 

@@ -23,32 +23,33 @@ backtrace = []
 
 # 运行时依赖项
 [dependencies]
+acpi = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/acpi-rs.git", rev = "fb69243dcf" }
+atomic_enum = "0.2.0"
 bit_field = "0.10"
 bitflags = "1.3.2"
 bitfield-struct = "0.5.3"
-virtio-drivers = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
-smoltcp = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/smoltcp.git", rev = "9027825", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
-# num-traits 0.2.15
-num-traits = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
+# 一个no_std的hashmap、hashset
+elf = { version = "0.7.2", default-features = false }
+hashbrown = "0.13.2"
+ida = { path = "src/libs/ida" }
+intertrait = { path = "src/libs/intertrait" }
+kdepends = { path = "crates/kdepends" }
+klog_types = { path = "crates/klog_types" }
+linkme = "0.2"
 num = { version = "0.4.0", default-features = false }
 num-derive = "0.3"
-# 一个no_std的hashmap、hashset
-hashbrown = "0.13.2"
-elf = { version = "0.7.2", default-features = false }
-atomic_enum = "0.2.0"
+num-traits = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
 raw-cpuid = "11.0.1"
-acpi = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/acpi-rs.git", rev = "fb69243dcf" }
-intertrait = { path = "src/libs/intertrait" }
-linkme = "0.2"
-ida = { path = "src/libs/ida" }
-klog_types = { path = "crates/klog_types" }
-kdepends = { path = "crates/kdepends" }
+smoltcp = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/smoltcp.git", rev = "9027825", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
+system_error = { path = "crates/system_error" }
+unified-init = { path = "crates/unified-init" }
+virtio-drivers = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
+mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
 x86 = "0.52.0"
 x86_64 = "0.14.10"
-mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
 
 
 # 构建时依赖项

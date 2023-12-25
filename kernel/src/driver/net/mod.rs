@@ -4,9 +4,9 @@ use smoltcp::{
     wire::{self, EthernetAddress},
 };
 
-use crate::{libs::spinlock::SpinLock, syscall::SystemError};
-
 use super::base::device::driver::Driver;
+use crate::libs::spinlock::SpinLock;
+use system_error::SystemError;
 
 mod dma;
 pub mod e1000e;

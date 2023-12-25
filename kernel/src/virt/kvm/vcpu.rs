@@ -1,4 +1,4 @@
-use crate::syscall::SystemError;
+use system_error::SystemError;
 
 pub trait Vcpu: Send + Sync {
     /// Virtualize the CPU

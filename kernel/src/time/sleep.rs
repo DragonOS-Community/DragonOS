@@ -1,13 +1,13 @@
 use core::hint::spin_loop;
 
 use alloc::{boxed::Box, sync::Arc};
+use system_error::SystemError;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
     include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
     process::ProcessManager,
-    syscall::SystemError,
     time::timekeeping::getnstimeofday,
 };
 

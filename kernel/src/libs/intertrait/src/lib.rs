@@ -160,6 +160,9 @@ pub fn init_caster_map() {
     unsafe { CASTER_MAP = Some(hashmap) };
 }
 
+#[cfg(not(target_os = "none"))]
+pub fn init_caster_map() {}
+
 fn cast_arc_panic<T: ?Sized + 'static>(_: Arc<dyn Any + Sync + Send>) -> Arc<T> {
     panic!("Prepend [sync] to the list of target traits for Sync + Send types")
 }

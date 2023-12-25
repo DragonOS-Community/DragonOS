@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use system_error::SystemError;
 
 use crate::{
     arch::{mm::LockedFrameAllocator, rand::rand},
@@ -6,7 +7,7 @@ use crate::{
     mm::allocator::page_frame::FrameAllocator,
 };
 
-use super::{user_access::UserBufferWriter, Syscall, SystemError};
+use super::{user_access::UserBufferWriter, Syscall};
 
 #[repr(C)]
 

@@ -2,15 +2,15 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
+use unified_init::macros::unified_init;
 
-use crate::{
-    driver::base::{
-        class::{class_manager, Class},
-        device::sys_dev_char_kset,
-        kobject::KObject,
-        subsys::SubSysPrivate,
-    },
-    syscall::SystemError,
+use crate::driver::base::{
+    class::{class_manager, Class},
+    device::sys_dev_char_kset,
+    init::SUBSYSTEM_INITIALIZER_SLICE,
+    kobject::KObject,
+    subsys::SubSysPrivate,
 };
 
 use super::fbcon::fb_console_init;
@@ -26,6 +26,7 @@ pub fn sys_class_graphics_instance() -> Option<&'static Arc<GraphicsClass>> {
 }
 
 /// 初始化帧缓冲区子系统
+#[unified_init(SUBSYSTEM_INITIALIZER_SLICE)]
 pub fn fbmem_init() -> Result<(), SystemError> {
     let graphics_class = GraphicsClass::new();
     class_manager().class_register(&(graphics_class.clone() as Arc<dyn Class>))?;

@@ -1,6 +1,7 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
@@ -8,7 +9,6 @@ use crate::{
     kwarn,
     libs::spinlock::SpinLockGuard,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
-    syscall::SystemError,
 };
 
 use super::signal_types::{

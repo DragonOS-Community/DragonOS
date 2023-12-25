@@ -17,7 +17,6 @@ use crate::{
         vfs::syscall::ModeType,
     },
     libs::rwlock::RwLock,
-    syscall::SystemError,
 };
 use alloc::{
     string::{String, ToString},
@@ -26,6 +25,7 @@ use alloc::{
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
 use intertrait::cast::CastArc;
+use system_error::SystemError;
 
 /// `/sys/bus`的kset
 static mut BUS_KSET_INSTANCE: Option<Arc<KSet>> = None;

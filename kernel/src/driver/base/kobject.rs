@@ -16,8 +16,9 @@ use crate::{
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     },
-    syscall::SystemError,
 };
+
+use system_error::SystemError;
 
 use super::kset::KSet;
 

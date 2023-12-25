@@ -21,8 +21,8 @@ use crate::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
-    syscall::SystemError,
 };
+use system_error::SystemError;
 
 use super::{super::device::DeviceState, platform_bus, platform_bus_device, CompatibleTable};
 

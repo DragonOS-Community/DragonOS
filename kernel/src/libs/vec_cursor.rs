@@ -3,8 +3,9 @@
 use core::mem::size_of;
 
 use alloc::vec::Vec;
+use system_error::SystemError;
 
-use crate::{driver::base::block::SeekFrom, syscall::SystemError};
+use crate::driver::base::block::SeekFrom;
 
 /// @brief 本模块用于为数组提供游标的功能，以简化其操作。
 #[derive(Debug)]

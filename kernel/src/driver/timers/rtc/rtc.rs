@@ -1,7 +1,8 @@
+use system_error::SystemError;
+
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     exception::InterruptArch,
-    syscall::SystemError,
 };
 
 pub struct RtcTime {

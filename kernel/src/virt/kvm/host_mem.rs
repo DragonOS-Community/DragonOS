@@ -1,8 +1,9 @@
+use system_error::SystemError;
+
 use super::{vcpu::Vcpu, vm};
 use crate::{
     kdebug,
     mm::{kernel_mapper::KernelMapper, page::PageFlags, VirtAddr},
-    syscall::SystemError,
 };
 
 /*

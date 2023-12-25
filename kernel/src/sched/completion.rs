@@ -1,7 +1,8 @@
 #![allow(dead_code)]
+use system_error::SystemError;
+
 use crate::{
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
-    syscall::SystemError,
     time::timer::schedule_timeout,
 };
 

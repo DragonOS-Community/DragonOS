@@ -1,7 +1,7 @@
 use super::vmcs::VmcsFields;
 use crate::kdebug;
-use crate::syscall::SystemError;
 use core::arch::asm;
+use system_error::SystemError;
 use x86;
 /// Enable VMX operation.
 pub fn vmxon(vmxon_pa: u64) -> Result<(), SystemError> {

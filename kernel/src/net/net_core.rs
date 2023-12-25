@@ -1,12 +1,12 @@
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 use smoltcp::{iface::SocketHandle, socket::dhcpv4, wire};
+use system_error::SystemError;
 
 use crate::{
     driver::net::NetDriver,
     kdebug, kinfo, kwarn,
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DRIVERS},
-    syscall::SystemError,
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
 };
 

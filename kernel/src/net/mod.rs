@@ -8,13 +8,13 @@ use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 use crate::{
     driver::net::NetDriver,
     kwarn,
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::event_poll::EventPoll,
-    syscall::SystemError,
 };
 use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
 

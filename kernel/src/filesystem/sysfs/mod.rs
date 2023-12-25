@@ -11,9 +11,9 @@ use crate::{
     filesystem::vfs::ROOT_INODE,
     kinfo, kwarn,
     libs::{casting::DowncastArc, once::Once},
-    syscall::SystemError,
 };
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 pub mod dir;
 pub mod file;

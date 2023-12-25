@@ -3,10 +3,9 @@ use alloc::{
     string::{String, ToString},
     sync::Arc,
 };
+use system_error::SystemError;
 
-use crate::{
-    driver::base::kobject::KObject, filesystem::kernfs::KernFSInode, syscall::SystemError,
-};
+use crate::{driver::base::kobject::KObject, filesystem::kernfs::KernFSInode};
 
 use super::SysFS;
 

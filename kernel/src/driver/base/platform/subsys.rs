@@ -4,6 +4,7 @@ use alloc::{
 };
 use intertrait::cast::CastArc;
 
+use super::{platform_device::PlatformDevice, platform_driver::PlatformDriver};
 use crate::{
     driver::{
         acpi::acpi_manager,
@@ -17,10 +18,8 @@ use crate::{
         sysfs::{Attribute, AttributeGroup},
         vfs::syscall::ModeType,
     },
-    syscall::SystemError,
 };
-
-use super::{platform_device::PlatformDevice, platform_driver::PlatformDriver};
+use system_error::SystemError;
 
 #[derive(Debug)]
 pub struct PlatformBus {

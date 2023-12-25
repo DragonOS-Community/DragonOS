@@ -7,9 +7,9 @@ use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
-use crate::syscall::SystemError;
 use crate::time::clocksource::HZ;
 pub use drop;
+use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 

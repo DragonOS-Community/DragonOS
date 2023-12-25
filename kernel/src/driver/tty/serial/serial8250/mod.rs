@@ -8,6 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -31,7 +32,6 @@ use crate::{
     },
     filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-    syscall::SystemError,
 };
 
 use self::serial8250_pio::{send_to_serial8250_pio_com1, serial8250_pio_port_early_init};

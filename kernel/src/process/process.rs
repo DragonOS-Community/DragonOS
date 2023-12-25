@@ -1,10 +1,11 @@
+use system_error::SystemError;
+
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
         ROOT_INODE,
     },
     process::{Pid, ProcessManager},
-    syscall::SystemError,
 };
 
 /// @brief 初始化pid=1的进程的stdio

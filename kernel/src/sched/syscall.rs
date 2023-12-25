@@ -1,9 +1,8 @@
+use system_error::SystemError;
+
 use crate::{
-    arch::CurrentIrqArch,
-    exception::InterruptArch,
-    process::ProcessManager,
-    smp::core::smp_get_processor_id,
-    syscall::{Syscall, SystemError},
+    arch::CurrentIrqArch, exception::InterruptArch, process::ProcessManager,
+    smp::core::smp_get_processor_id, syscall::Syscall,
 };
 
 use super::core::{do_sched, CPU_EXECUTING};

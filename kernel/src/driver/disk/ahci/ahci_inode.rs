@@ -6,13 +6,13 @@ use crate::filesystem::vfs::{
     core::generate_inode_id, make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode,
     Metadata,
 };
-use crate::syscall::SystemError;
 use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use super::ahcidisk::LockedAhciDisk;
 

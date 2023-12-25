@@ -1,6 +1,4 @@
-use alloc::sync::Arc;
-
-use crate::{libs::mutex::Mutex, syscall::SystemError};
+use system_error::SystemError;
 
 #[derive(Debug, Clone, Default)]
 pub struct RiscV64KVMArch {}

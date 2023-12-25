@@ -2,10 +2,10 @@ use crate::arch::kvm::vmx::vcpu::VmxVcpu;
 use crate::arch::MMArch;
 use crate::libs::mutex::Mutex;
 use crate::mm::MemoryManagementArch;
-use crate::syscall::SystemError;
 use crate::{arch::KVMArch, kdebug};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use system_error::SystemError;
 
 // use super::HOST_STACK_SIZE;
 use super::host_mem::{

@@ -12,6 +12,9 @@ proc-macro = true
 proc-macro2 = "1.0.71"
 quote = "1.0.33"
 syn = { version = "2.0.42", features = ["full"] }
+uuid = { version = "0.8", features = ["v4"] }
 
 [dev-dependencies]
 unified-init = { path = ".." }
+linkme = "0.2"
+system_error = { path = "../../system_error" }

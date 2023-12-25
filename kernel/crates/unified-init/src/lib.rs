@@ -3,62 +3,70 @@
 use system_error::SystemError;
 pub use unified_init_macros as macros;
 
+/// 统一初始化器
+#[derive(Debug)]
+pub struct UnifiedInitializer {
+    function: &'static UnifiedInitFunction,
+    name: &'static str,
+}
+
+impl UnifiedInitializer {
+    pub const fn new(
+        name: &'static str,
+        function: &'static UnifiedInitFunction,
+    ) -> UnifiedInitializer {
+        UnifiedInitializer { function, name }
+    }
+
+    /// 调用初始化函数
+    pub fn call(&self) -> Result<(), SystemError> {
+        (self.function)()
+    }
+
+    /// 获取初始化函数的名称
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
 pub type UnifiedInitFunction = fn() -> core::result::Result<(), SystemError>;
 
-#[cfg(test)]
-mod tests {
-    use linkme::distributed_slice;
-    use unified_init_macros::unified_init;
+/// 定义统一初始化器的分布式切片数组(私有)
+#[macro_export]
+macro_rules! define_unified_initializer_slice {
+    ($name:ident) => {
+        #[::linkme::distributed_slice]
+        static $name: [::unified_init::UnifiedInitializer] = [..];
+    };
+    () => {
+        compile_error!(
+            "define_unified_initializer_slice! requires at least one argument: slice_name"
+        );
+    };
+}
 
-    use super::*;
+/// 定义统一初始化器的分布式切片数组(公开)
+#[macro_export]
+macro_rules! define_public_unified_initializer_slice {
+    ($name:ident) => {
+        #[::linkme::distributed_slice]
+        pub static $name: [::unified_init::UnifiedInitializer] = [..];
+    };
+    () => {
+        compile_error!(
+            "define_unified_initializer_slice! requires at least one argument: slice_name"
+        );
+    };
+}
 
-    #[test]
-    fn no_element() {
-        #[distributed_slice]
-        static TEST_0: [UnifiedInitFunction] = [..];
-
-        assert_eq!(TEST_0.len(), 0);
-    }
-
-    #[test]
-    fn no_element_ne() {
-        #[distributed_slice]
-        static TEST_0_NE: [UnifiedInitFunction] = [..];
-
-        #[unified_init(TEST_0_NE)]
-        fn x() -> Result<(), SystemError> {
-            todo!()
+/// 调用指定数组中的所有初始化器
+#[macro_export]
+macro_rules! unified_init {
+    ($initializer_slice:ident) => {
+        for initializer in $initializer_slice.iter() {
+            initializer.call().unwrap_or_else(|e| {
+                kerror!("Failed to call initializer {}: {:?}", initializer.name(), e);
+            });
         }
-
-        assert_ne!(TEST_0_NE.len(), 0);
-    }
-
-    #[test]
-    fn one_element() {
-        #[distributed_slice]
-        static TEST_1: [UnifiedInitFunction] = [..];
-
-        #[unified_init(TEST_1)]
-        fn x() -> Result<(), SystemError> {
-            todo!()
-        }
-        assert_eq!(TEST_1.len(), 1);
-    }
-
-    #[test]
-    fn two_elements() {
-        #[distributed_slice]
-        static TEST_2: [UnifiedInitFunction] = [..];
-
-        #[unified_init(TEST_2)]
-        fn x() -> Result<(), SystemError> {
-            todo!()
-        }
-
-        #[unified_init(TEST_2)]
-        fn y() -> Result<(), SystemError> {
-            todo!()
-        }
-        assert_eq!(TEST_2.len(), 2);
-    }
+    };
 }

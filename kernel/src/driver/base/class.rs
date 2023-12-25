@@ -8,10 +8,7 @@ use super::{
     kset::KSet,
     subsys::SubSysPrivate,
 };
-use crate::{
-    driver::video::fbdev::base::fbmem::fbmem_init,
-    filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps},
-};
+use crate::filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps};
 use system_error::SystemError;
 
 /// `/sys/class`的kset
@@ -33,7 +30,6 @@ pub(super) fn classes_init() -> Result<(), SystemError> {
         CLASS_KSET_INSTANCE = Some(class_kset);
     }
 
-    fbmem_init()?;
     return Ok(());
 }
 

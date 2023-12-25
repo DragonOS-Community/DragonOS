@@ -11,6 +11,7 @@ use crate::driver::base::device::device_register;
 use alloc::{collections::BTreeSet, string::ToString, sync::Arc, vec::Vec};
 use core::fmt::Debug;
 use system_error::SystemError;
+use unified_init::{define_unified_initializer_slice, unified_init};
 
 pub mod platform_device;
 pub mod platform_driver;
@@ -18,6 +19,8 @@ pub mod subsys;
 
 static mut PLATFORM_BUS_DEVICE: Option<Arc<PlatformBusDevice>> = None;
 static mut PLATFORM_BUS: Option<Arc<PlatformBus>> = None;
+
+define_unified_initializer_slice!(PLATFORM_DEVICE_INITIALIZER);
 
 #[allow(dead_code)]
 #[inline(always)]
@@ -92,6 +95,8 @@ pub fn platform_bus_init() -> Result<(), SystemError> {
         return r;
     }
     unsafe { PLATFORM_BUS = Some(paltform_bus) };
+
+    unified_init!(PLATFORM_DEVICE_INITIALIZER);
 
     return r;
 }

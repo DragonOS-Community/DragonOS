@@ -1,6 +1,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
+    arch::sched::{self, sched},
     libs::spinlock::SpinLock,
     process::{ProcessControlBlock, ProcessManager},
     sched::core::do_sched,
@@ -53,7 +54,7 @@ impl PollTable for PollWqueues {
 
     /// @brief 阻塞当前进程直到被唤醒或超时
     fn poll_schedule_timeout(&self) {
-        do_sched();
+        sched();
     }
 }
 
@@ -149,7 +150,7 @@ impl PollWaitQueue {
         }
 
         // 从等待队列中删除
-        self.0.drain_filter(|x| x.key & key != PollStatus::empty());
+        self.0.extract_if(|x| x.key & key != PollStatus::empty());
         // 进行回调函数
         for entry in temp.iter_mut() {
             entry.callback();
@@ -158,8 +159,7 @@ impl PollWaitQueue {
 
     /// @brief 在等待队列中删除指定元素
     fn remove(&mut self, entry: Arc<PollTableEntry>) {
-        self.0
-            .drain_filter(|x| Arc::as_ptr(x) == Arc::as_ptr(&entry));
+        self.0.extract_if(|x| Arc::as_ptr(x) == Arc::as_ptr(&entry));
     }
 }
 

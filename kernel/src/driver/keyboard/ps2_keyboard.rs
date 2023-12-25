@@ -8,7 +8,7 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
             core::generate_inode_id, file::FileMode, syscall::ModeType, FileType, IndexNode,
-            Metadata, PollStatus,
+            Metadata,
         },
     },
     include::bindings::bindings::vfs_file_operations_t,
@@ -150,10 +150,6 @@ impl IndexNode for LockedPS2KeyBoardInode {
             let _ = unsafe { func(0 as *mut c_void, 0 as *mut c_void) };
         }
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus::READ);
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

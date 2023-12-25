@@ -17,7 +17,10 @@ use crate::{
 };
 
 use super::{
-    socket::{PosixSocketType, RawSocket, SocketInode, SocketOptions, TcpSocket, UdpSocket},
+    socket::{
+        PosixSocketType, RawSocket, SocketHandleItem, SocketInode, SocketOptions, TcpSocket,
+        UdpSocket, HANDLE_MAP,
+    },
     Endpoint, Protocol, ShutdownType, Socket,
 };
 
@@ -58,6 +61,10 @@ impl Syscall {
                 return Err(SystemError::EAFNOSUPPORT);
             }
         };
+        let handle_item = SocketHandleItem::new(&socket);
+        HANDLE_MAP
+            .write_irqsave()
+            .insert(socket.socket_handle(), handle_item);
         // kdebug!("do_socket: socket: {socket:?}");
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
         let f = File::new(socketinode, FileMode::O_RDWR)?;
@@ -248,7 +255,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = unsafe { socket.inner_no_preempt() };
+        let mut socket = unsafe { socket.inner_no_preempt() };
 
         let (n, endpoint) = socket.read(buf);
         drop(socket);
@@ -279,7 +286,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = unsafe { socket.inner_no_preempt() };
+        let mut socket = unsafe { socket.inner_no_preempt() };
 
         let mut buf = iovs.new_buf(true);
         // 从socket中读取数据
@@ -323,8 +330,8 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = unsafe { socket.inner_no_preempt() };
-        socket.shutdown(ShutdownType::try_from(how as i32)?)?;
+        let mut socket = unsafe { socket.inner_no_preempt() };
+        socket.shutdown(ShutdownType::from_bits_truncate(how as u8))?;
         return Ok(0);
     }
 

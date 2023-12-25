@@ -3,7 +3,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::vfs::{
         core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-        FileType, IndexNode, Metadata, PollStatus,
+        FileType, IndexNode, Metadata,
     },
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     process::ProcessState,
@@ -308,10 +308,6 @@ impl IndexNode for LockedPipeInode {
             .wakeup(Some(ProcessState::Blocked(true)));
         // 返回写入的字节数
         return Ok(len);
-    }
-
-    fn poll(&self) -> Result<PollStatus, crate::syscall::SystemError> {
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

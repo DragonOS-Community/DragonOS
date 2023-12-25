@@ -473,7 +473,7 @@ impl EventPoll {
                     let timespec = timespec.unwrap();
                     let handle = WakeUpHelper::new(current_pcb.clone());
                     let jiffies = next_n_us_timer_jiffies(
-                        (timespec.tv_sec * 1000000000 + timespec.tv_nsec / 1000) as u64,
+                        (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
                     );
                     let inner = Timer::new(handle, jiffies);
                     inner.activate();

@@ -85,6 +85,7 @@ impl Syscall {
         return EventPoll::do_epoll_ctl(epfd, op, fd, &mut epds, false);
     }
 
+    /// ## 在epoll_wait时屏蔽某些信号
     pub fn epoll_pwait(
         epfd: i32,
         epoll_event: VirtAddr,

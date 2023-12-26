@@ -331,7 +331,9 @@ impl EventWaitQueue {
     /// 需要注意的是，只要触发了events中的任意一件事件，进程都会被唤醒
     pub fn wakeup_any(&self, events: u64) -> usize {
         let mut ret = 0;
-        let _ = self.wait_list.lock().extract_if(|(es, pcb)| {
+
+        let mut wq_guard = self.wait_list.lock_irqsave();
+        wq_guard.retain(|(es, pcb)| {
             if *es & events > 0 {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
@@ -355,7 +357,8 @@ impl EventWaitQueue {
     /// 需要注意的是，只有满足所有事件的进程才会被唤醒
     pub fn wakeup(&self, events: u64) -> usize {
         let mut ret = 0;
-        let _ = self.wait_list.lock().extract_if(|(es, pcb)| {
+        let mut wq_guard = self.wait_list.lock_irqsave();
+        wq_guard.retain(|(es, pcb)| {
             if *es == events {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {

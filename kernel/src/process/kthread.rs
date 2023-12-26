@@ -291,7 +291,6 @@ impl KernelThreadMechanism {
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
             )
             .expect("Failed to create kthread daemon");
-
             let pcb = ProcessManager::find(kthreadd_pid).unwrap();
             ProcessManager::wakeup(&pcb).expect("Failed to wakeup kthread daemon");
             unsafe {
@@ -379,7 +378,7 @@ impl KernelThreadMechanism {
         // 忙等目标内核线程退出
         // todo: 使用completion机制优化这里
         loop {
-            if let ProcessState::Exited(code) = pcb.sched_info().state() {
+            if let ProcessState::Exited(code) = pcb.sched_info().inner_lock_read_irqsave().state() {
                 return Ok(code);
             }
             spin_loop();

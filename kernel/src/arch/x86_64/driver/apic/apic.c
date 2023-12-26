@@ -57,9 +57,10 @@ int apic_init()
  */
 void do_IRQ(struct pt_regs *rsp, ul number)
 {
-    if((rsp->cs & 0x3) == 3)
+    
+    if ((rsp->cs & 0x3) == 3)
     {
-        asm volatile("swapgs":::"memory");
+        asm volatile("swapgs" ::: "memory");
     }
     if (number < 0x80 && number >= 32) // 以0x80为界限，低于0x80的是外部中断控制器，高于0x80的是Local APIC
     {

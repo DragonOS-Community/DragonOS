@@ -98,6 +98,7 @@ impl ArchPCBInfo {
     /// ## 返回值
     ///
     /// 返回一个新的ArchPCBInfo
+    #[inline(never)]
     pub fn new(kstack: &KernelStack) -> Self {
         let mut r = Self {
             rflags: 0,
@@ -325,7 +326,7 @@ impl ProcessManager {
         child_trapframe.set_return_value(0);
 
         // 设置子进程的栈基址（开始执行中断返回流程时的栈基址）
-        let mut new_arch_guard = new_pcb.arch_info();
+        let mut new_arch_guard = unsafe { new_pcb.arch_info() };
         let kernel_stack_guard = new_pcb.kernel_stack();
 
         // 设置子进程在内核态开始执行时的rsp、rbp
@@ -385,13 +386,13 @@ impl ProcessManager {
         assert!(CurrentIrqArch::is_irq_enabled() == false);
 
         // 保存浮点寄存器
-        prev.arch_info().save_fp_state();
+        prev.arch_info_irqsave().save_fp_state();
         // 切换浮点寄存器
-        next.arch_info().restore_fp_state();
+        next.arch_info_irqsave().restore_fp_state();
 
         // 切换fsbase
-        prev.arch_info().save_fsbase();
-        next.arch_info().restore_fsbase();
+        prev.arch_info_irqsave().save_fsbase();
+        next.arch_info_irqsave().restore_fsbase();
 
         // 切换gsbase
         Self::switch_gsbase(&prev, &next);
@@ -406,8 +407,8 @@ impl ProcessManager {
         // 切换内核栈
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
-        let next_arch = SpinLockGuard::leak(next.arch_info()) as *mut ArchPCBInfo;
-        let prev_arch = SpinLockGuard::leak(prev.arch_info()) as *mut ArchPCBInfo;
+        let next_arch = SpinLockGuard::leak(next.arch_info_irqsave()) as *mut ArchPCBInfo;
+        let prev_arch = SpinLockGuard::leak(prev.arch_info_irqsave()) as *mut ArchPCBInfo;
 
         (*prev_arch).rip = switch_back as usize;
 
@@ -430,10 +431,10 @@ impl ProcessManager {
 
     unsafe fn switch_gsbase(prev: &Arc<ProcessControlBlock>, next: &Arc<ProcessControlBlock>) {
         asm!("swapgs", options(nostack, preserves_flags));
-        prev.arch_info().save_gsbase();
-        next.arch_info().restore_gsbase();
+        prev.arch_info_irqsave().save_gsbase();
+        next.arch_info_irqsave().restore_gsbase();
         // 将下一个进程的kstack写入kernel_gsbase
-        next.arch_info().store_kernel_gsbase();
+        next.arch_info_irqsave().store_kernel_gsbase();
         asm!("swapgs", options(nostack, preserves_flags));
     }
 }

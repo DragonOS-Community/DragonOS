@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
-use smoltcp::{iface::SocketHandle, socket::dhcpv4, wire};
+use smoltcp::{socket::dhcpv4, wire};
 
 use crate::{
     driver::net::NetDriver,
@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    event_poll::EPollEventType,
+    event_poll::{EPollEventType, EventPoll},
     socket::{TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
@@ -227,57 +227,17 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
             smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
         }
         drop(handle_guard);
-        wakeup_epoll(handle, events as u32)?;
+        let mut handle_guard = HANDLE_MAP.write_irqsave();
+        let handle_item = handle_guard.get_mut(&handle).unwrap();
+        EventPoll::wakeup_epoll(
+            &mut handle_item.epitems,
+            EPollEventType::from_bits_truncate(events as u32),
+        )?;
         // crate::kdebug!(
         //     "{} send_event {:?}",
         //     handle,
         //     EPollEventType::from_bits_truncate(events as u32)
         // );
-    }
-    Ok(())
-}
-
-/// ### 处理epoll
-fn wakeup_epoll(handle: SocketHandle, events: u32) -> Result<(), SystemError> {
-    let mut handle_guard = HANDLE_MAP.write_irqsave();
-    let handle_item = handle_guard.get_mut(&handle).unwrap();
-    let mut epitems_guard = handle_item.epitems.try_lock()?;
-
-    // 从events拿到epoll相关事件
-    let pollflags = EPollEventType::from_bits_truncate(events);
-
-    // 一次只取一个，因为一次也只有一个进程能拿到对应文件的🔓
-    if let Some(epitem) = epitems_guard.pop_front() {
-        let epoll = epitem.epoll().upgrade().unwrap();
-        let mut epoll_guard = epoll.try_lock()?;
-        let binding = epitem.clone();
-        let event_guard = binding.event().read();
-        let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
-
-        // 检查事件合理性以及是否有感兴趣的事件
-        if !(ep_events
-            .difference(EPollEventType::EP_PRIVATE_BITS)
-            .is_empty()
-            || pollflags.difference(ep_events).is_empty())
-        {
-            // TODO: 未处理pm相关
-
-            // 首先将就绪的epitem加入等待队列
-            epoll_guard.ep_add_ready(epitem.clone());
-
-            if epoll_guard.ep_has_waiter() {
-                if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
-                    && !pollflags.contains(EPollEventType::POLLFREE)
-                {
-                    // 避免惊群
-                    epoll_guard.ep_wake_one();
-                } else {
-                    epoll_guard.ep_wake_all();
-                }
-            }
-        }
-
-        epitems_guard.push_back(epitem);
     }
     Ok(())
 }

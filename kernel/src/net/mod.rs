@@ -229,11 +229,13 @@ pub trait Socket: Sync + Send + Debug {
 
         for epitem in handle_item.epitems.lock_irqsave().iter() {
             let epoll = epitem.epoll();
-            let _ = EventPoll::ep_remove(
-                &mut epoll.upgrade().unwrap().lock_irqsave(),
-                epitem.fd(),
-                None,
-            );
+            if epoll.upgrade().is_some() {
+                let _ = EventPoll::ep_remove(
+                    &mut epoll.upgrade().unwrap().lock_irqsave(),
+                    epitem.fd(),
+                    None,
+                );
+            }
         }
 
         Ok(())

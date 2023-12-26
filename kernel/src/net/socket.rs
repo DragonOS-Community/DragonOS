@@ -19,7 +19,7 @@ use smoltcp::{
 use crate::{
     arch::{rand::rand, sched::sched},
     driver::net::NetDriver,
-    filesystem::vfs::{syscall::ModeType, FileType, IndexNode, Metadata},
+    filesystem::vfs::{syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata},
     kerror, kwarn,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -1351,7 +1351,7 @@ impl IndexNode for SocketInode {
         return self.0.lock_no_preempt().write(&buf[0..len], None);
     }
 
-    fn poll(&self) -> Result<usize, SystemError> {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         let events = self.0.lock_irqsave().poll();
         return Ok(events.bits() as usize);
     }

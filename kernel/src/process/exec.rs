@@ -1,6 +1,7 @@
 use core::{fmt::Debug, ptr::null};
 
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use system_error::SystemError;
 
 use crate::{
     driver::base::block::SeekFrom,
@@ -13,7 +14,6 @@ use crate::{
         ucontext::{AddressSpace, UserStack},
         VirtAddr,
     },
-    syscall::SystemError,
 };
 
 /// 系统支持的所有二进制文件加载器的列表

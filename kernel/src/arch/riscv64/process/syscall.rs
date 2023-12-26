@@ -1,9 +1,7 @@
 use alloc::{string::String, vec::Vec};
+use system_error::SystemError;
 
-use crate::{
-    arch::interrupt::TrapFrame,
-    syscall::{Syscall, SystemError},
-};
+use crate::{arch::interrupt::TrapFrame, syscall::Syscall};
 
 impl Syscall {
     pub fn do_execve(

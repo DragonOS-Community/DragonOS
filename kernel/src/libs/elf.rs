@@ -6,6 +6,7 @@ use core::{
 
 use alloc::vec::Vec;
 use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader};
+use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
@@ -23,10 +24,7 @@ use crate::{
         exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
         ProcessManager,
     },
-    syscall::{
-        user_access::{clear_user, copy_to_user},
-        SystemError,
-    },
+    syscall::user_access::{clear_user, copy_to_user},
 };
 
 use super::rwlock::RwLockWriteGuard;

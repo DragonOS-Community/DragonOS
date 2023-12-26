@@ -2,18 +2,14 @@ use alloc::{string::ToString, sync::Arc};
 
 use core::fmt::Debug;
 
-use crate::{
-    driver::video::fbdev::base::fbmem::fbmem_init,
-    filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps},
-    syscall::SystemError,
-};
-
 use super::{
     device::{sys_dev_char_kset, Device, DeviceMatchName, DeviceMatcher},
     kobject::{KObjType, KObject},
     kset::KSet,
     subsys::SubSysPrivate,
 };
+use crate::filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps};
+use system_error::SystemError;
 
 /// `/sys/class`的kset
 static mut CLASS_KSET_INSTANCE: Option<Arc<KSet>> = None;
@@ -34,7 +30,6 @@ pub(super) fn classes_init() -> Result<(), SystemError> {
         CLASS_KSET_INSTANCE = Some(class_kset);
     }
 
-    fbmem_init()?;
     return Ok(());
 }
 

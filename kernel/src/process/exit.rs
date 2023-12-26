@@ -1,6 +1,7 @@
 use core::intrinsics::likely;
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::{
@@ -9,7 +10,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    syscall::{user_access::UserBufferWriter, SystemError},
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::{

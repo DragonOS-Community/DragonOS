@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 use core::{cmp::min, intrinsics::unlikely};
+use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
     kwarn,
     libs::vec_cursor::VecCursor,
-    syscall::SystemError,
 };
 use alloc::{
     string::{String, ToString},

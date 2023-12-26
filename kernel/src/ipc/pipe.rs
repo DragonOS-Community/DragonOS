@@ -8,7 +8,6 @@ use crate::{
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
     process::ProcessState,
-    syscall::SystemError,
     time::TimeSpec,
 };
 
@@ -16,6 +15,7 @@ use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 /// 我们设定pipe_buff的总大小为1024字节
 const PIPE_BUFF_SIZE: usize = 1024;
@@ -151,7 +151,7 @@ impl IndexNode for LockedPipeInode {
         len: usize,
         buf: &mut [u8],
         data: &mut FilePrivateData,
-    ) -> Result<usize, crate::syscall::SystemError> {
+    ) -> Result<usize, SystemError> {
         // 获取mode
         let mode: FileMode;
         if let FilePrivateData::Pipefs(pdata) = data {
@@ -313,7 +313,7 @@ impl IndexNode for LockedPipeInode {
         len: usize,
         buf: &[u8],
         data: &mut FilePrivateData,
-    ) -> Result<usize, crate::syscall::SystemError> {
+    ) -> Result<usize, SystemError> {
         // 获取mode
         let mode: FileMode;
         if let FilePrivateData::Pipefs(pdata) = data {

@@ -1,5 +1,7 @@
 use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
 
+use system_error::SystemError;
+
 use crate::{
     arch::{
         fpu::FpState,
@@ -16,7 +18,7 @@ use crate::{
     kerror,
     mm::MemoryManagementArch,
     process::ProcessManager,
-    syscall::{user_access::UserBufferWriter, Syscall, SystemError},
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 /// 信号处理的栈的栈指针的最小对齐数量

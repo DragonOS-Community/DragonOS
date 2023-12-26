@@ -5,6 +5,7 @@ use core::{
 };
 
 use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
+use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -12,7 +13,6 @@ use crate::{
     },
     libs::{lib_ui::textui::textui_is_enable_put_to_window, rwlock::RwLock, spinlock::SpinLock},
     mm::VirtAddr,
-    syscall::SystemError,
 };
 
 use super::{

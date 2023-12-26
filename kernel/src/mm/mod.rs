@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
+use system_error::SystemError;
 
-use crate::{arch::MMArch, include::bindings::bindings::PAGE_OFFSET, syscall::SystemError};
+use crate::{arch::MMArch, include::bindings::bindings::PAGE_OFFSET};
 
 use core::{
     cmp,

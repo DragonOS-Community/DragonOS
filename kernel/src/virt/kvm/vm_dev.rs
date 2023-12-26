@@ -11,13 +11,14 @@ use crate::virt::kvm::host_mem::KvmUserspaceMemoryRegion;
 use crate::virt::kvm::update_vm;
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use crate::virt::kvm::vm;
-use crate::{arch::KVMArch, libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::TimeSpec};
 use crate::{filesystem, kdebug};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 // pub const KVM_API_VERSION:u32 = 12;
 // pub const GUEST_STACK_SIZE:usize = 1024;

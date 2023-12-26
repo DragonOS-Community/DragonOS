@@ -14,7 +14,6 @@ use crate::kerror;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::virt_2_phys;
-use crate::syscall::SystemError;
 use crate::{
     driver::disk::ahci::{
         ahcidisk::LockedAhciDisk,
@@ -33,6 +32,7 @@ use alloc::{
     vec::Vec,
 };
 use core::sync::atomic::compiler_fence;
+use system_error::SystemError;
 
 // 仅module内可见 全局数据区  hbr_port, disks
 static LOCKED_HBA_MEM_LIST: SpinLock<Vec<&mut HbaMem>> = SpinLock::new(Vec::new());

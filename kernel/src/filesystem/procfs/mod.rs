@@ -8,6 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use crate::{
     arch::mm::LockedFrameAllocator,
@@ -22,7 +23,6 @@ use crate::{
     },
     mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
-    syscall::SystemError,
     time::TimeSpec,
 };
 

@@ -1,6 +1,7 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::{format, string::ToString, sync::Arc};
+use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -17,7 +18,6 @@ use crate::{
     },
     kdebug, kerror, kinfo,
     process::ProcessManager,
-    syscall::SystemError,
 };
 
 use super::{

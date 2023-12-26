@@ -1,8 +1,9 @@
 use super::vmcs::{VmcsFields, VmxExitReason};
 use super::vmx_asm_wrapper::{vmx_vmread, vmx_vmwrite};
 use crate::kdebug;
-use crate::{syscall::SystemError, virt::kvm::vm};
+use crate::virt::kvm::vm;
 use core::arch::asm;
+use system_error::SystemError;
 use x86::vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL;
 
 #[derive(FromPrimitive)]

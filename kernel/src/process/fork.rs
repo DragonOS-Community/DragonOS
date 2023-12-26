@@ -1,6 +1,7 @@
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
+use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
@@ -9,7 +10,7 @@ use crate::{
     libs::rwlock::RwLock,
     mm::VirtAddr,
     process::ProcessFlags,
-    syscall::{user_access::UserBufferWriter, SystemError},
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::{

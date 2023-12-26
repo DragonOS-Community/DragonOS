@@ -3,6 +3,7 @@ use core::ptr::NonNull;
 use acpi::madt::Madt;
 use bit_field::BitField;
 use bitflags::bitflags;
+use system_error::SystemError;
 
 use crate::{
     driver::acpi::acpi_manager,
@@ -16,7 +17,6 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
-    syscall::SystemError,
 };
 
 use super::{CurrentApic, LocalAPIC};

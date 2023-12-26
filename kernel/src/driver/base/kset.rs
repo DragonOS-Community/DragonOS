@@ -6,15 +6,14 @@ use alloc::{
 
 use core::hash::Hash;
 
-use crate::{
-    filesystem::kernfs::KernFSInode,
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-    syscall::SystemError,
-};
-
 use super::kobject::{
     DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,
 };
+use crate::{
+    filesystem::kernfs::KernFSInode,
+    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
+use system_error::SystemError;
 
 #[derive(Debug)]
 pub struct KSet {

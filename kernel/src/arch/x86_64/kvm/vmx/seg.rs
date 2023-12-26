@@ -22,7 +22,7 @@ use crate::arch::kvm::VmcsFields::{
 use crate::arch::kvm::VmcsFields::{
     GUEST_TR_ACCESS_RIGHTS, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_SELECTOR,
 };
-use crate::syscall::SystemError;
+use system_error::SystemError;
 
 use super::vmx_asm_wrapper::vmx_vmwrite;
 

@@ -1,4 +1,4 @@
-use crate::syscall::SystemError;
+use system_error::SystemError;
 
 use super::{acpi::early_acpi_boot_init, smp::X86_64_SMP_MANAGER};
 

@@ -1,7 +1,8 @@
+use system_error::SystemError;
+
 use crate::{
     arch::interrupt::ipi::send_ipi,
     exception::ipi::{IpiKind, IpiTarget},
-    syscall::SystemError,
 };
 
 pub mod c_adapter;

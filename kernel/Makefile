@@ -38,3 +38,7 @@ else ifeq ($(ARCH), riscv64)
 	@cargo +nightly-2023-08-15 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 endif
 
+test:
+# 测试内核库
+	@cargo +nightly-2023-08-15 test --workspace --exclude dragonos_kernel
+

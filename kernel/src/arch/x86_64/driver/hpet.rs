@@ -7,6 +7,7 @@ use core::{
 };
 
 use acpi::HpetInfo;
+use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -23,7 +24,6 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
-    syscall::SystemError,
     time::timer::{clock, timer_get_first_expire, update_timer_jiffies},
 };
 

@@ -8,11 +8,12 @@ use core::{
 
 use alloc::{boxed::Box, sync::Arc};
 use num_traits::FromPrimitive;
+use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch, exception::InterruptArch, kdebug, kinfo, libs::rwlock::RwLock,
     mm::percpu::PerCpu, process::ProcessManager, smp::core::smp_get_processor_id,
-    syscall::SystemError, time::timer::clock,
+    time::timer::clock,
 };
 
 const MAX_SOFTIRQ_NUM: u64 = 64;

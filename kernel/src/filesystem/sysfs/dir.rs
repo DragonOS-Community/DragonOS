@@ -4,6 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use crate::{
     driver::base::kobject::KObject,
@@ -11,7 +12,6 @@ use crate::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
         vfs::syscall::ModeType,
     },
-    syscall::SystemError,
 };
 
 use super::{SysFS, SysFSKernPrivateData};

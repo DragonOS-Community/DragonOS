@@ -1,16 +1,15 @@
-use core::{
-    cmp::{max, min},
-    intrinsics::unlikely,
-};
-
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch},
     driver::acpi::pmtmr::{ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC},
     exception::InterruptArch,
     kdebug, kerror, kinfo, kwarn,
-    syscall::SystemError,
     time::TimeArch,
 };
+use core::{
+    cmp::{max, min},
+    intrinsics::unlikely,
+};
+use system_error::SystemError;
 
 use super::hpet::hpet_instance;
 

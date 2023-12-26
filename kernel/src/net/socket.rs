@@ -15,6 +15,7 @@ use smoltcp::{
     },
     wire,
 };
+use system_error::SystemError;
 
 use crate::{
     arch::{rand::rand, sched::sched},
@@ -26,7 +27,6 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
-    syscall::SystemError,
 };
 
 use super::{

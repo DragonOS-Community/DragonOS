@@ -1,13 +1,14 @@
 use core::intrinsics::unlikely;
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
     kerror,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
-    syscall::{Syscall, SystemError},
+    syscall::Syscall,
 };
 
 use super::{

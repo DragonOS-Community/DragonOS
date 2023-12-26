@@ -1,12 +1,11 @@
 use alloc::sync::Arc;
 
-use crate::{
-    driver::base::device::{
-        bus::Bus,
-        driver::{driver_manager, Driver},
-    },
-    syscall::SystemError,
+use crate::driver::base::device::{
+    bus::Bus,
+    driver::{driver_manager, Driver},
 };
+
+use system_error::SystemError;
 
 use super::{platform_bus, platform_device::PlatformDevice};
 

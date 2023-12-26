@@ -8,6 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use crate::{
     arch::sched::sched,
@@ -23,7 +24,6 @@ use crate::{
         wait_queue::WaitQueue,
     },
     process::ProcessManager,
-    syscall::SystemError,
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         TimeSpec,
@@ -147,7 +147,7 @@ impl IndexNode for EPollInode {
         _len: usize,
         _buf: &mut [u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, crate::syscall::SystemError> {
+    ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
@@ -157,11 +157,11 @@ impl IndexNode for EPollInode {
         _len: usize,
         _buf: &[u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, crate::syscall::SystemError> {
+    ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, crate::syscall::SystemError> {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         // 需要实现epoll嵌套epoll时，需要实现这里
         todo!()
     }
@@ -174,7 +174,7 @@ impl IndexNode for EPollInode {
         self
     }
 
-    fn list(&self) -> Result<Vec<alloc::string::String>, crate::syscall::SystemError> {
+    fn list(&self) -> Result<Vec<alloc::string::String>, SystemError> {
         Err(SystemError::ENOSYS)
     }
 

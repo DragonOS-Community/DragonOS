@@ -7,8 +7,9 @@ use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
-use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,

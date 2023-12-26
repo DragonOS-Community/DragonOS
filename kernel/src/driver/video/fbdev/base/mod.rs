@@ -1,9 +1,9 @@
 use alloc::{string::String, sync::Arc};
+use system_error::SystemError;
 
 use crate::{
     driver::base::device::Device,
     mm::{ucontext::LockedVMA, PhysAddr},
-    syscall::SystemError,
 };
 
 pub mod fbcon;

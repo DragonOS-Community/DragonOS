@@ -10,6 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use atomic_enum::atomic_enum;
+use system_error::SystemError;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
@@ -17,7 +18,6 @@ use crate::{
     kdebug, kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
-    syscall::SystemError,
 };
 
 use super::{

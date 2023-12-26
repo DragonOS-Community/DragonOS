@@ -1,3 +1,5 @@
+use system_error::SystemError;
+
 use crate::{
     arch::ipc::signal::SigSet,
     filesystem::vfs::file::FileMode,
@@ -5,7 +7,7 @@ use crate::{
     mm::VirtAddr,
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
-        Syscall, SystemError,
+        Syscall,
     },
     time::TimeSpec,
 };

@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::CurrentIrqArch;
 use crate::exception::{InterruptArch, IrqFlagsGuard};
 use crate::process::ProcessManager;
-use crate::syscall::SystemError;
+use system_error::SystemError;
 
 /// 实现了守卫的SpinLock, 能够支持内部可变性
 ///

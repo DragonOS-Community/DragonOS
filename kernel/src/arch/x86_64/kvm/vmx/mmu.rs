@@ -3,10 +3,10 @@ use crate::{
     kdebug,
     libs::mutex::Mutex,
     mm::{page::PageFlags, syscall::ProtFlags},
-    syscall::SystemError,
     virt::kvm::host_mem::{__gfn_to_pfn, kvm_vcpu_gfn_to_memslot, PAGE_MASK, PAGE_SHIFT},
 };
 use bitfield_struct::bitfield;
+use system_error::SystemError;
 
 use super::{
     ept::check_ept_features,

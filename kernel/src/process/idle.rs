@@ -42,7 +42,7 @@ impl ProcessManager {
                 unsafe { ks.clear_pcb(true) };
                 ks
             } else {
-                KernelStack::new().unwrap_or_else(|e: crate::syscall::SystemError| {
+                KernelStack::new().unwrap_or_else(|e| {
                     panic!("Failed to create kernel stack struct for AP {}: {:?}", i, e)
                 })
             };

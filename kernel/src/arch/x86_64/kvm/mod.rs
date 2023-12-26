@@ -6,11 +6,11 @@ use crate::{
     kdebug,
     kerror,
     // libs::spinlock::{SpinLock, SpinLockGuard},
-    syscall::SystemError,
 };
 use alloc::sync::Arc;
 use core::arch::asm;
 use raw_cpuid::CpuId;
+use system_error::SystemError;
 // use crate::virt::kvm::guest_code;
 use self::vmx::mmu::{kvm_mmu_setup, kvm_vcpu_mtrr_init};
 use self::vmx::vcpu::VmxVcpu;

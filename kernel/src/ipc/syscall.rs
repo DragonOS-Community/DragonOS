@@ -3,6 +3,8 @@ use core::{
     sync::atomic::compiler_fence,
 };
 
+use system_error::SystemError;
+
 use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     filesystem::vfs::{
@@ -12,7 +14,7 @@ use crate::{
     kerror, kwarn,
     mm::VirtAddr,
     process::{Pid, ProcessManager},
-    syscall::{user_access::UserBufferWriter, Syscall, SystemError},
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 use super::{

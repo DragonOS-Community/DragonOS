@@ -3,7 +3,9 @@
 
 use core::{alloc::GlobalAlloc, fmt::Debug, ptr::Unique};
 
-use crate::{arch::MMArch, mm::MemoryManagementArch, syscall::SystemError, KERNEL_ALLOCATOR};
+use system_error::SystemError;
+
+use crate::{arch::MMArch, mm::MemoryManagementArch, KERNEL_ALLOCATOR};
 
 /// # AlignedBox
 ///

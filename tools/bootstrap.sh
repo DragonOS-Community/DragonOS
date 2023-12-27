@@ -61,9 +61,9 @@ install_ubuntu_debian_pkg()
     if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
         echo "正在安装docker..."
         sudo apt install -y docker.io docker-compose
+		sudo groupadd docker
 		sudo usermod -aG docker $USER
-		sudo newgrp docker
-		# sudo systemctl restart docker
+		sudo systemctl restart docker
     elif [ -z ${dockerInstall} ]; then
 		echo "您传入--no-docker参数生效, 安装docker步骤被跳过."
 	elif [ -n "$(which docker)" ]; then

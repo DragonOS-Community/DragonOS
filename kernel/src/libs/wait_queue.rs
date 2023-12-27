@@ -311,7 +311,7 @@ impl EventWaitQueue {
 
     pub fn sleep_unlock_spinlock<T>(&self, events: u64, to_unlock: SpinLockGuard<T>) {
         before_sleep_check(1);
-        let mut guard = self.wait_list.lock();
+        let mut guard = self.wait_list.lock_irqsave();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);

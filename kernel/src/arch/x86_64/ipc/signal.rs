@@ -384,7 +384,7 @@ impl SigContext {
     /// - `false` -> 执行失败
     pub fn restore_sigcontext(&mut self, frame: &mut TrapFrame) -> bool {
         let guard = ProcessManager::current_pcb();
-        let mut arch_info = guard.arch_info();
+        let mut arch_info = guard.arch_info_irqsave();
         (*frame) = self.frame.clone();
         // (*current_thread).trap_num = (*context).trap_num;
         *arch_info.cr2_mut() = self.cr2 as usize;

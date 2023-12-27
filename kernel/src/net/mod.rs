@@ -30,11 +30,13 @@ pub mod socket;
 pub mod syscall;
 
 lazy_static! {
-    /// @brief 所有网络接口的列表
+    /// 所有网络接口的列表
+    ///
+    /// 这个列表在中断上下文会使用到，因此需要irqsave
     pub static ref NET_DRIVERS: RwLock<BTreeMap<usize, Arc<dyn NetDriver>>> = RwLock::new(BTreeMap::new());
 }
 
-/// @brief 生成网络接口的id (全局自增)
+/// 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {
     static IFACE_ID: AtomicUsize = AtomicUsize::new(0);
     return IFACE_ID

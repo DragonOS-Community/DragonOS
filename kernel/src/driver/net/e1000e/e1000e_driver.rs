@@ -343,6 +343,8 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
     // 将网卡的接口信息注册到全局的网卡接口信息表中
-    NET_DRIVERS.write().insert(iface.nic_id(), iface.clone());
+    NET_DRIVERS
+        .write_irqsave()
+        .insert(iface.nic_id(), iface.clone());
     kinfo!("e1000e driver init successfully!\tMAC: [{}]", mac);
 }

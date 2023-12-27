@@ -159,6 +159,7 @@ impl ProcessManager {
         let new_kstack: KernelStack = KernelStack::new()?;
 
         let name = current_pcb.basic().name().to_string();
+
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
         let mut args = KernelCloneArgs::new();
@@ -166,7 +167,6 @@ impl ProcessManager {
         args.exit_signal = Signal::SIGCHLD;
 
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe)?;
-
         ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
@@ -232,7 +232,7 @@ impl ProcessManager {
             unsafe { new_pcb.basic_mut().set_user_vm(Some(old_address_space)) };
             return Ok(());
         }
-        let new_address_space = old_address_space.write().try_clone().unwrap_or_else(|e| {
+        let new_address_space = old_address_space.write_irqsave().try_clone().unwrap_or_else(|e| {
             panic!(
                 "copy_mm: Failed to clone address space of current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), new_pcb.pid(), e
@@ -242,6 +242,7 @@ impl ProcessManager {
         return Ok(());
     }
 
+    #[inline(never)]
     fn copy_files(
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
@@ -274,7 +275,8 @@ impl ProcessManager {
         }
 
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            (*new_pcb.sig_struct()).handlers = current_pcb.sig_struct().handlers.clone();
+            (*new_pcb.sig_struct_irqsave()).handlers =
+                current_pcb.sig_struct_irqsave().handlers.clone();
         }
         return Ok(());
     }
@@ -288,8 +290,8 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - clone_flags 标志位
-    /// - des_pcb 目标pcb
-    /// - src_pcb 拷贝源pcb
+    /// - current_pcb 拷贝源pcb
+    /// - pcb 目标pcb
     ///
     /// ## return
     /// - 发生错误时返回Err(SystemError)
@@ -350,7 +352,7 @@ impl ProcessManager {
 
         // 克隆架构相关
         let guard = current_pcb.arch_info_irqsave();
-        pcb.arch_info().clone_from(&guard);
+        unsafe { pcb.arch_info().clone_from(&guard) };
         drop(guard);
 
         // 为内核线程设置WorkerPrivate

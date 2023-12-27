@@ -9,7 +9,6 @@ use crate::{
     kBUG,
     libs::{
         rbtree::RBTree,
-        rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::{
@@ -150,16 +149,13 @@ impl SchedulerCFS {
     }
 
     /// @brief 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间
-    pub fn timer_update_jiffies(
-        &mut self,
-        sched_info_guard: &RwLockReadGuard<'_, ProcessSchedulerInfo>,
-    ) {
+    pub fn timer_update_jiffies(&mut self, sched_info: &ProcessSchedulerInfo) {
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[smp_get_processor_id() as usize];
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
         let mut queue = None;
         for _ in 0..10 {
-            if let Ok(q) = current_cpu_queue.locked_queue.try_lock() {
+            if let Ok(q) = current_cpu_queue.locked_queue.try_lock_irqsave() {
                 queue = Some(q);
                 break;
             }
@@ -179,13 +175,13 @@ impl SchedulerCFS {
         drop(queue);
 
         // 更新当前进程的虚拟运行时间
-        sched_info_guard.increase_virtual_runtime(1);
+        sched_info.increase_virtual_runtime(1);
     }
 
     /// @brief 将进程加入cpu的cfs调度队列，并且重设其虚拟运行时间为当前队列的最小值
     pub fn enqueue_reset_vruntime(&mut self, pcb: Arc<ProcessControlBlock>) {
         let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
-        let queue = cpu_queue.locked_queue.lock();
+        let queue = cpu_queue.locked_queue.lock_irqsave();
         if queue.len() > 0 {
             pcb.sched_info()
                 .set_virtual_runtime(CFSQueue::min_vruntime(&queue).unwrap_or(0) as isize)
@@ -202,7 +198,7 @@ impl SchedulerCFS {
     }
     /// 获取某个cpu的运行队列中的进程数
     pub fn get_cfs_queue_len(&mut self, cpu_id: u32) -> usize {
-        let queue = self.cpu_queue[cpu_id as usize].locked_queue.lock();
+        let queue = self.cpu_queue[cpu_id as usize].locked_queue.lock_irqsave();
         return CFSQueue::get_cfs_queue_size(&queue);
     }
 }
@@ -225,13 +221,17 @@ impl Scheduler for SchedulerCFS {
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果当前不是running态，或者当前进程的虚拟运行时间大于等于下一个进程的，那就需要切换。
-        if (ProcessManager::current_pcb().sched_info().state() != ProcessState::Runnable)
+        let state = ProcessManager::current_pcb()
+            .sched_info()
+            .inner_lock_read_irqsave()
+            .state();
+        if (state != ProcessState::Runnable)
             || (ProcessManager::current_pcb().sched_info().virtual_runtime()
                 >= proc.sched_info().virtual_runtime())
         {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             // 本次切换由于时间片到期引发，则再次加入就绪队列，否则交由其它功能模块进行管理
-            if ProcessManager::current_pcb().sched_info().state() == ProcessState::Runnable {
+            if state == ProcessState::Runnable {
                 sched_enqueue(ProcessManager::current_pcb(), false);
                 compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }

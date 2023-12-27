@@ -146,7 +146,7 @@ impl ProcFSInode {
         );
 
         let sched_info_guard = pcb.sched_info();
-        let state = sched_info_guard.state();
+        let state = sched_info_guard.inner_lock_read_irqsave().state();
         let cpu_id = sched_info_guard
             .on_cpu()
             .map(|cpu| cpu as i32)
@@ -154,8 +154,6 @@ impl ProcFSInode {
 
         let priority = sched_info_guard.priority();
         let vrtime = sched_info_guard.virtual_runtime();
-
-        drop(sched_info_guard);
 
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
         pdata.append(

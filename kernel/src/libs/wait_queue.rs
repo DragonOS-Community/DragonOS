@@ -184,18 +184,27 @@ impl WaitQueue {
     /// @return true 成功唤醒进程
     /// @return false 没有唤醒进程
     pub fn wakeup(&self, state: Option<ProcessState>) -> bool {
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
         // 如果队列为空，则返回
         if guard.wait_list.is_empty() {
             return false;
         }
         // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
         if let Some(state) = state {
-            if guard.wait_list.front().unwrap().sched_info().state() != state {
+            if guard
+                .wait_list
+                .front()
+                .unwrap()
+                .sched_info()
+                .inner_lock_read_irqsave()
+                .state()
+                != state
+            {
                 return false;
             }
         }
         let to_wakeup = guard.wait_list.pop_front().unwrap();
+        drop(guard);
         let res = ProcessManager::wakeup(&to_wakeup).is_ok();
         return res;
     }
@@ -215,7 +224,7 @@ impl WaitQueue {
         while let Some(to_wakeup) = guard.wait_list.pop_front() {
             let mut wake = false;
             if let Some(state) = state {
-                if to_wakeup.sched_info().state() == state {
+                if to_wakeup.sched_info().inner_lock_read_irqsave().state() == state {
                     wake = true;
                 }
             } else {
@@ -302,7 +311,7 @@ impl EventWaitQueue {
 
     pub fn sleep_unlock_spinlock<T>(&self, events: u64, to_unlock: SpinLockGuard<T>) {
         before_sleep_check(1);
-        let mut guard = self.wait_list.lock();
+        let mut guard = self.wait_list.lock_irqsave();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -322,7 +331,9 @@ impl EventWaitQueue {
     /// 需要注意的是，只要触发了events中的任意一件事件，进程都会被唤醒
     pub fn wakeup_any(&self, events: u64) -> usize {
         let mut ret = 0;
-        let _ = self.wait_list.lock().extract_if(|(es, pcb)| {
+
+        let mut wq_guard = self.wait_list.lock_irqsave();
+        wq_guard.retain(|(es, pcb)| {
             if *es & events > 0 {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
@@ -346,7 +357,8 @@ impl EventWaitQueue {
     /// 需要注意的是，只有满足所有事件的进程才会被唤醒
     pub fn wakeup(&self, events: u64) -> usize {
         let mut ret = 0;
-        let _ = self.wait_list.lock().extract_if(|(es, pcb)| {
+        let mut wq_guard = self.wait_list.lock_irqsave();
+        wq_guard.retain(|(es, pcb)| {
             if *es == events {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {

@@ -234,7 +234,9 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
     let iface = VirtioInterface::new(driver);
     let name = iface.name.clone();
     // 将网卡的接口信息注册到全局的网卡接口信息表中
-    NET_DRIVERS.write().insert(iface.nic_id(), iface.clone());
+    NET_DRIVERS
+        .write_irqsave()
+        .insert(iface.nic_id(), iface.clone());
     kinfo!(
         "Virtio-net driver init successfully!\tNetDevID: [{}], MAC: [{}]",
         name,

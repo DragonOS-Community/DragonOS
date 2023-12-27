@@ -100,7 +100,7 @@ impl Timekeeper {
     ///
     /// * 'clock' - 指定的时钟实际类型。初始为ClocksourceJiffies
     pub fn timekeeper_setup_internals(&self, clock: Arc<dyn Clocksource>) {
-        let mut timekeeper = self.0.write();
+        let mut timekeeper = self.0.write_irqsave();
         // 更新clock
         let mut clock_data = clock.clocksource_data();
         clock_data.watchdog_last = clock.read();
@@ -132,8 +132,9 @@ impl Timekeeper {
     /// # 获取当前时钟源距离上次检测走过的纳秒数
     #[allow(dead_code)]
     pub fn tk_get_ns(&self) -> u64 {
-        let timekeeper = self.0.read();
+        let timekeeper = self.0.read_irqsave();
         let clock = timekeeper.clock.clone().unwrap();
+        drop(timekeeper);
         let clock_now = clock.read();
         let clcok_data = clock.clocksource_data();
         let clock_delta = clock_now.div(clcok_data.watchdog_last).data() & clcok_data.mask.bits();
@@ -164,7 +165,7 @@ pub fn getnstimeofday() -> TimeSpec {
         tv_sec: 0,
     };
     loop {
-        match timekeeper().0.try_read() {
+        match timekeeper().0.try_read_irqsave() {
             None => continue,
             Some(tk) => {
                 _xtime = tk.xtime;
@@ -215,7 +216,7 @@ pub fn timekeeping_init() {
         .expect("clocksource_default_clock enable failed");
     timekeeper().timekeeper_setup_internals(clock);
     // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
-    let mut timekeeper = timekeeper().0.write();
+    let mut timekeeper = timekeeper().0.write_irqsave();
     timekeeper.xtime.tv_nsec = ktime_get_real_ns();
 
     // 初始化wall time到monotonic的时间
@@ -236,7 +237,7 @@ pub fn timekeeping_init() {
 }
 
 /// # 使用当前时钟源增加wall time
-pub fn update_wall_time() {
+pub fn update_wall_time(delta_us: i64) {
     // kdebug!("enter update_wall_time, stack_use = {:}",stack_use);
     compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -264,8 +265,7 @@ pub fn update_wall_time() {
     // ================
     compiler_fence(Ordering::SeqCst);
 
-    // !!! todo: 这里是硬编码了HPET的500us中断，需要修改
-    __ADDED_USEC.fetch_add(500, Ordering::SeqCst);
+    __ADDED_USEC.fetch_add(delta_us, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
     let mut retry = 10;
 

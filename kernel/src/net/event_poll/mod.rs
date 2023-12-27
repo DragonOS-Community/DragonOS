@@ -161,7 +161,7 @@ impl IndexNode for EPollInode {
         Err(SystemError::ENOSYS)
     }
 
-    fn poll(&self) -> Result<usize, SystemError> {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         // 需要实现epoll嵌套epoll时，需要实现这里
         todo!()
     }
@@ -703,6 +703,48 @@ impl EventPoll {
     /// ### 唤醒所有在epoll上等待的首个进程
     pub fn ep_wake_one(&self) {
         self.epoll_wq.wakeup(None);
+    }
+
+    /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
+    pub fn wakeup_epoll(
+        epitems: &mut SpinLock<LinkedList<Arc<EPollItem>>>,
+        pollflags: EPollEventType,
+    ) -> Result<(), SystemError> {
+        let mut epitems_guard = epitems.try_lock_irqsave()?;
+        // 一次只取一个，因为一次也只有一个进程能拿到对应文件的🔓
+        if let Some(epitem) = epitems_guard.pop_front() {
+            let epoll = epitem.epoll().upgrade().unwrap();
+            let mut epoll_guard = epoll.try_lock()?;
+            let binding = epitem.clone();
+            let event_guard = binding.event().read();
+            let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
+
+            // 检查事件合理性以及是否有感兴趣的事件
+            if !(ep_events
+                .difference(EPollEventType::EP_PRIVATE_BITS)
+                .is_empty()
+                || pollflags.difference(ep_events).is_empty())
+            {
+                // TODO: 未处理pm相关
+
+                // 首先将就绪的epitem加入等待队列
+                epoll_guard.ep_add_ready(epitem.clone());
+
+                if epoll_guard.ep_has_waiter() {
+                    if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
+                        && !pollflags.contains(EPollEventType::POLLFREE)
+                    {
+                        // 避免惊群
+                        epoll_guard.ep_wake_one();
+                    } else {
+                        epoll_guard.ep_wake_all();
+                    }
+                }
+            }
+
+            epitems_guard.push_back(epitem);
+        }
+        Ok(())
     }
 }
 

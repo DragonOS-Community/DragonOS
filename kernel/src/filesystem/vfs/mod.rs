@@ -166,7 +166,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 获取当前inode的状态。
     ///
     /// @return PollStatus结构体
-    fn poll(&self) -> Result<usize, SystemError> {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

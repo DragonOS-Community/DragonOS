@@ -3,16 +3,21 @@ use core::{
     intrinsics::unlikely,
     mem::{self, MaybeUninit},
     ptr::null_mut,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicI16, Ordering},
 };
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, kdebug, kinfo, libs::rwlock::RwLock,
-    mm::percpu::PerCpu, process::ProcessManager, smp::core::smp_get_processor_id,
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
+    kdebug, kinfo,
+    libs::rwlock::RwLock,
+    mm::percpu::{PerCpu, PerCpuVar},
+    process::ProcessManager,
+    smp::core::smp_get_processor_id,
     time::timer::clock,
 };
 
@@ -94,8 +99,12 @@ pub trait SoftirqVec: Send + Sync + Debug {
 #[derive(Debug)]
 pub struct Softirq {
     table: RwLock<[Option<Arc<dyn SoftirqVec>>; MAX_SOFTIRQ_NUM as usize]>,
+    /// 软中断嵌套层数（per cpu）
+    cpu_running_count: PerCpuVar<AtomicI16>,
 }
 impl Softirq {
+    /// 每个CPU最大嵌套的软中断数量
+    const MAX_RUNNING_PER_CPU: i16 = 3;
     fn new() -> Softirq {
         let mut data: [MaybeUninit<Option<Arc<dyn SoftirqVec>>>; MAX_SOFTIRQ_NUM as usize] =
             unsafe { MaybeUninit::uninit().assume_init() };
@@ -108,9 +117,18 @@ impl Softirq {
             mem::transmute::<_, [Option<Arc<dyn SoftirqVec>>; MAX_SOFTIRQ_NUM as usize]>(data)
         };
 
+        let mut percpu_count = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
+        percpu_count.resize_with(PerCpu::MAX_CPU_NUM as usize, || AtomicI16::new(0));
+        let cpu_running_count = PerCpuVar::new(percpu_count).unwrap();
+
         return Softirq {
             table: RwLock::new(data),
+            cpu_running_count,
         };
+    }
+
+    fn cpu_running_count(&self) -> &PerCpuVar<AtomicI16> {
+        return &self.cpu_running_count;
     }
 
     /// @brief 注册软中断向量
@@ -127,7 +145,7 @@ impl Softirq {
 
         // let self = &mut SOFTIRQ_VECTORS.lock();
         // 判断该软中断向量是否已经被注册
-        let mut table_guard = self.table.write();
+        let mut table_guard = self.table.write_irqsave();
         if table_guard[softirq_num as usize].is_some() {
             // kdebug!("register_softirq failed");
 
@@ -149,7 +167,7 @@ impl Softirq {
     /// @param irq_num 中断向量号码   
     pub fn unregister_softirq(&self, softirq_num: SoftirqNumber) {
         // kdebug!("unregister_softirq softirq_num = {:?}", softirq_num as u64);
-        let mut table_guard = self.table.write();
+        let mut table_guard = self.table.write_irqsave();
         // 将软中断向量清空
         table_guard[softirq_num as usize] = None;
         drop(table_guard);
@@ -162,8 +180,14 @@ impl Softirq {
     }
 
     pub fn do_softirq(&self) {
+        if self.cpu_running_count().get().load(Ordering::SeqCst) >= Self::MAX_RUNNING_PER_CPU {
+            // 当前CPU的软中断嵌套层数已经达到最大值，不再执行
+            return;
+        }
+        // 创建一个RunningCountGuard，当退出作用域时，会自动将cpu_running_count减1
+        let _count_guard = RunningCountGuard::new(self.cpu_running_count());
+
         // TODO pcb的flags未修改
-        // todo: 是否需要判断在当前cpu上面，该函数的嵌套层数？（防止爆栈）
         let end = clock() + 500 * 2;
         let cpu_id = smp_get_processor_id();
         let mut max_restart = MAX_SOFTIRQ_RESTART;
@@ -180,7 +204,7 @@ impl Softirq {
                         continue;
                     }
 
-                    let table_guard = self.table.read();
+                    let table_guard = self.table.read_irqsave();
                     let softirq_func = table_guard[i as usize].clone();
                     drop(table_guard);
                     if softirq_func.is_none() {
@@ -233,6 +257,27 @@ impl Softirq {
         compiler_fence(Ordering::SeqCst);
         cpu_pending(smp_get_processor_id() as usize).remove(VecStatus::from(softirq_num));
         compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// 当前CPU的软中断嵌套层数的计数器守卫
+///
+/// 当进入作用域时，会自动将cpu_running_count加1，
+/// 当退出作用域时，会自动将cpu_running_count减1
+struct RunningCountGuard<'a> {
+    cpu_running_count: &'a PerCpuVar<AtomicI16>,
+}
+
+impl<'a> RunningCountGuard<'a> {
+    fn new(cpu_running_count: &'a PerCpuVar<AtomicI16>) -> RunningCountGuard {
+        cpu_running_count.get().fetch_add(1, Ordering::SeqCst);
+        return RunningCountGuard { cpu_running_count };
+    }
+}
+
+impl<'a> Drop for RunningCountGuard<'a> {
+    fn drop(&mut self) {
+        self.cpu_running_count.get().fetch_sub(1, Ordering::SeqCst);
     }
 }
 

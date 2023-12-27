@@ -81,7 +81,7 @@ impl RTQueue {
         queue.push_front(pcb);
     }
     pub fn get_rt_queue_size(&mut self) -> usize {
-        let queue = self.locked_queue.lock();
+        let queue = self.locked_queue.lock_irqsave();
         return queue.len();
     }
 }
@@ -176,7 +176,7 @@ impl Scheduler for SchedulerRT {
         let proc: Arc<ProcessControlBlock> =
             self.pick_next_task_rt(cpu_id).expect("No RT process found");
         let priority = proc.sched_info().priority();
-        let policy = proc.sched_info().policy();
+        let policy = proc.sched_info().inner_lock_read_irqsave().policy();
         match policy {
             // 如果是fifo策略，则可以一直占有cpu直到有优先级更高的任务就绪(即使优先级相同也不行)或者主动放弃(等待资源)
             SchedPolicy::FIFO => {

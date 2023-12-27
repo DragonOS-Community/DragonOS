@@ -18,7 +18,7 @@ use crate::{
         InterruptArch,
     },
     kerror, kinfo,
-    libs::spinlock::SpinLock,
+    libs::spinlock::{SpinLock, SpinLockGuard},
     process::{ProcessControlBlock, ProcessManager},
 };
 
@@ -57,7 +57,9 @@ impl TimerFunction for WakeUpHelper {
 }
 
 #[derive(Debug)]
-pub struct Timer(SpinLock<InnerTimer>);
+pub struct Timer {
+    inner: SpinLock<InnerTimer>,
+}
 
 impl Timer {
     /// @brief 创建一个定时器（单位：ms）
@@ -68,22 +70,28 @@ impl Timer {
     ///
     /// @return 定时器结构体
     pub fn new(timer_func: Box<dyn TimerFunction>, expire_jiffies: u64) -> Arc<Self> {
-        let result: Arc<Timer> = Arc::new(Timer(SpinLock::new(InnerTimer {
-            expire_jiffies,
-            timer_func,
-            self_ref: Weak::default(),
-            triggered: false,
-        })));
+        let result: Arc<Timer> = Arc::new(Timer {
+            inner: SpinLock::new(InnerTimer {
+                expire_jiffies,
+                timer_func: Some(timer_func),
+                self_ref: Weak::default(),
+                triggered: false,
+            }),
+        });
 
-        result.0.lock().self_ref = Arc::downgrade(&result);
+        result.inner.lock().self_ref = Arc::downgrade(&result);
 
         return result;
     }
 
+    pub fn inner(&self) -> SpinLockGuard<InnerTimer> {
+        return self.inner.lock_irqsave();
+    }
+
     /// @brief 将定时器插入到定时器链表中
     pub fn activate(&self) {
-        let inner_guard = self.0.lock();
-        let mut timer_list = TIMER_LIST.lock();
+        let mut timer_list = TIMER_LIST.lock_irqsave();
+        let inner_guard = self.inner();
 
         // 链表为空，则直接插入
         if timer_list.is_empty() {
@@ -99,7 +107,7 @@ impl Timer {
         }
         let mut split_pos: usize = 0;
         for (pos, elt) in timer_list.iter().enumerate() {
-            if elt.0.lock().expire_jiffies > inner_guard.expire_jiffies {
+            if elt.inner().expire_jiffies > inner_guard.expire_jiffies {
                 split_pos = pos;
                 break;
             }
@@ -113,9 +121,11 @@ impl Timer {
 
     #[inline]
     fn run(&self) {
-        let mut timer = self.0.lock();
+        let mut timer = self.inner();
         timer.triggered = true;
-        let r = timer.timer_func.run();
+        let func = timer.timer_func.take();
+        drop(timer);
+        let r = func.map(|mut f| f.run()).unwrap_or(Ok(()));
         if unlikely(r.is_err()) {
             kerror!(
                 "Failed to run timer function: {self:?} {:?}",
@@ -126,14 +136,15 @@ impl Timer {
 
     /// ## 判断定时器是否已经触发
     pub fn timeout(&self) -> bool {
-        self.0.lock().triggered
+        self.inner().triggered
     }
 
     /// ## 取消定时器任务
     pub fn cancel(&self) -> bool {
+        let this_arc = self.inner().self_ref.upgrade().unwrap();
         TIMER_LIST
-            .lock()
-            .extract_if(|x| Arc::<Timer>::as_ptr(&x) == self as *const Timer)
+            .lock_irqsave()
+            .extract_if(|x| Arc::ptr_eq(&this_arc, x))
             .for_each(|p| drop(p));
         true
     }
@@ -145,7 +156,7 @@ pub struct InnerTimer {
     /// 定时器结束时刻
     pub expire_jiffies: u64,
     /// 定时器需要执行的函数结构体
-    pub timer_func: Box<dyn TimerFunction>,
+    pub timer_func: Option<Box<dyn TimerFunction>>,
     /// self_ref
     self_ref: Weak<Timer>,
     /// 判断该计时器是否触发
@@ -187,7 +198,7 @@ impl SoftirqVec for DoTimerSoftirq {
         // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器
         for _ in 0..TIMER_RUN_CYCLE_THRESHOLD {
             // kdebug!("DoTimerSoftirq run");
-            let timer_list = TIMER_LIST.try_lock();
+            let timer_list = TIMER_LIST.try_lock_irqsave();
             if timer_list.is_err() {
                 continue;
             }
@@ -201,7 +212,7 @@ impl SoftirqVec for DoTimerSoftirq {
             // kdebug!("to lock timer_list_front");
             let mut timer_list_front_guard = None;
             for _ in 0..10 {
-                let x = timer_list_front.0.try_lock();
+                let x = timer_list_front.inner.try_lock_irqsave();
                 if x.is_err() {
                     continue;
                 }
@@ -297,7 +308,7 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
                     return Ok(0);
                 } else {
                     // kdebug!("timer_list not empty");
-                    return Ok(timer_list.front().unwrap().0.lock().expire_jiffies);
+                    return Ok(timer_list.front().unwrap().inner().expire_jiffies);
                 }
             }
             // 加锁失败返回啥？？
@@ -310,10 +321,10 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
 /// 更新系统时间片
 ///
 /// todo: 这里的实现有问题，貌似把HPET的500us当成了500个jiffies，然后update_wall_time()里面也硬编码了这个500us
-pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
+pub fn update_timer_jiffies(add_jiffies: u64, time_us: i64) -> u64 {
     let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
-    update_wall_time();
+    update_wall_time(time_us);
 
     compiler_fence(Ordering::SeqCst);
     return prev + add_jiffies;

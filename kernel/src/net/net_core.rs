@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
-use smoltcp::{iface::SocketHandle, socket::dhcpv4, wire};
+use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    event_poll::EPollEventType,
+    event_poll::{EPollEventType, EventPoll},
     socket::{TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
@@ -41,7 +41,7 @@ pub fn net_init() -> Result<(), SystemError> {
 }
 
 fn dhcp_query() -> Result<(), SystemError> {
-    let binding = NET_DRIVERS.write();
+    let binding = NET_DRIVERS.write_irqsave();
 
     let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
 
@@ -56,13 +56,13 @@ fn dhcp_query() -> Result<(), SystemError> {
     // IMPORTANT: This should be removed in production.
     dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(10)));
 
-    let dhcp_handle = SOCKET_SET.lock().add(dhcp_socket);
+    let dhcp_handle = SOCKET_SET.lock_irqsave().add(dhcp_socket);
 
     const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
         kdebug!("DHCP try round: {}", i);
-        net_face.poll(&mut SOCKET_SET.lock()).ok();
-        let mut binding = SOCKET_SET.lock();
+        net_face.poll(&mut SOCKET_SET.lock_irqsave()).ok();
+        let mut binding = SOCKET_SET.lock_irqsave();
         let event = binding.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
 
         match event {
@@ -120,12 +120,12 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read_irqsave();
     if guard.len() == 0 {
         kwarn!("poll_ifaces: No net driver found!");
         return;
     }
-    let mut sockets = SOCKET_SET.lock();
+    let mut sockets = SOCKET_SET.lock_irqsave();
     for (_, iface) in guard.iter() {
         iface.poll(&mut sockets).ok();
     }
@@ -140,13 +140,14 @@ pub fn poll_ifaces() {
 pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     let mut i = 0;
     while i < times {
-        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> =
+            NET_DRIVERS.read_irqsave();
         if guard.len() == 0 {
             kwarn!("poll_ifaces: No net driver found!");
             // 没有网卡，返回错误
             return Err(SystemError::ENODEV);
         }
-        let sockets = SOCKET_SET.try_lock();
+        let sockets = SOCKET_SET.try_lock_irqsave();
         // 加锁失败，继续尝试
         if sockets.is_err() {
             i += 1;
@@ -171,13 +172,13 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
 /// @return 没有网卡，返回SystemError::ENODEV
 pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read();
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read_irqsave();
     if guard.len() == 0 {
         kwarn!("poll_ifaces: No net driver found!");
         // 没有网卡，返回错误
         return Err(SystemError::ENODEV);
     }
-    let mut sockets = SOCKET_SET.try_lock()?;
+    let mut sockets = SOCKET_SET.try_lock_irqsave()?;
     for (_, iface) in guard.iter() {
         iface.poll(&mut sockets).ok();
     }
@@ -227,57 +228,17 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
             smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
         }
         drop(handle_guard);
-        wakeup_epoll(handle, events as u32)?;
+        let mut handle_guard = HANDLE_MAP.write_irqsave();
+        let handle_item = handle_guard.get_mut(&handle).unwrap();
+        EventPoll::wakeup_epoll(
+            &mut handle_item.epitems,
+            EPollEventType::from_bits_truncate(events as u32),
+        )?;
         // crate::kdebug!(
         //     "{} send_event {:?}",
         //     handle,
         //     EPollEventType::from_bits_truncate(events as u32)
         // );
-    }
-    Ok(())
-}
-
-/// ### 处理epoll
-fn wakeup_epoll(handle: SocketHandle, events: u32) -> Result<(), SystemError> {
-    let mut handle_guard = HANDLE_MAP.write_irqsave();
-    let handle_item = handle_guard.get_mut(&handle).unwrap();
-    let mut epitems_guard = handle_item.epitems.try_lock()?;
-
-    // 从events拿到epoll相关事件
-    let pollflags = EPollEventType::from_bits_truncate(events);
-
-    // 一次只取一个，因为一次也只有一个进程能拿到对应文件的🔓
-    if let Some(epitem) = epitems_guard.pop_front() {
-        let epoll = epitem.epoll().upgrade().unwrap();
-        let mut epoll_guard = epoll.try_lock()?;
-        let binding = epitem.clone();
-        let event_guard = binding.event().read();
-        let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
-
-        // 检查事件合理性以及是否有感兴趣的事件
-        if !(ep_events
-            .difference(EPollEventType::EP_PRIVATE_BITS)
-            .is_empty()
-            || pollflags.difference(ep_events).is_empty())
-        {
-            // TODO: 未处理pm相关
-
-            // 首先将就绪的epitem加入等待队列
-            epoll_guard.ep_add_ready(epitem.clone());
-
-            if epoll_guard.ep_has_waiter() {
-                if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
-                    && !pollflags.contains(EPollEventType::POLLFREE)
-                {
-                    // 避免惊群
-                    epoll_guard.ep_wake_one();
-                } else {
-                    epoll_guard.ep_wake_all();
-                }
-            }
-        }
-
-        epitems_guard.push_back(epitem);
     }
     Ok(())
 }

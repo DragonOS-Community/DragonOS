@@ -20,7 +20,7 @@ use system_error::SystemError;
 use crate::{
     arch::{rand::rand, sched::sched},
     driver::net::NetDriver,
-    filesystem::vfs::{syscall::ModeType, FileType, IndexNode, Metadata},
+    filesystem::vfs::{syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata},
     kerror, kwarn,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -99,7 +99,7 @@ impl SocketHandleItem {
     }
 
     pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
-        self.shutdown_type.write()
+        self.shutdown_type.write_irqsave()
     }
 
     pub fn add_epoll(&mut self, epitem: Arc<EPollItem>) {
@@ -238,7 +238,7 @@ impl Clone for GlobalSocketHandle {
 
 impl Drop for GlobalSocketHandle {
     fn drop(&mut self) {
-        let mut socket_set_guard = SOCKET_SET.lock();
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         socket_set_guard.remove(self.0); // 删除的时候，会发送一条FINISH的信息？
         drop(socket_set_guard);
         poll_ifaces();
@@ -353,7 +353,7 @@ impl RawSocket {
 
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> =
-            GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+            GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
             SocketType::RawSocket,
@@ -376,7 +376,7 @@ impl Socket for RawSocket {
         poll_ifaces();
         loop {
             // 如何优化这里？
-            let mut socket_set_guard = SOCKET_SET.lock();
+            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
 
             match socket.recv_slice(buf) {
@@ -409,7 +409,7 @@ impl Socket for RawSocket {
     fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
         // 如果用户发送的数据包，包含IP头，则直接发送
         if self.header_included {
-            let mut socket_set_guard = SOCKET_SET.lock();
+            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
             match socket.send_slice(buf) {
                 Ok(_len) => {
@@ -423,12 +423,12 @@ impl Socket for RawSocket {
             // 如果用户发送的数据包，不包含IP头，则需要自己构造IP头
 
             if let Some(Endpoint::Ip(Some(endpoint))) = to {
-                let mut socket_set_guard = SOCKET_SET.lock();
+                let mut socket_set_guard = SOCKET_SET.lock_irqsave();
                 let socket: &mut raw::Socket =
                     socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
 
                 // 暴力解决方案：只考虑0号网卡。 TODO：考虑多网卡的情况！！！
-                let iface = NET_DRIVERS.read().get(&0).unwrap().clone();
+                let iface = NET_DRIVERS.read_irqsave().get(&0).unwrap().clone();
 
                 // 构造IP头
                 let ipv4_src_addr: Option<smoltcp::wire::Ipv4Address> =
@@ -535,7 +535,7 @@ impl UdpSocket {
 
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> =
-            GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+            GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
             SocketType::UdpSocket,
@@ -579,7 +579,7 @@ impl Socket for UdpSocket {
         loop {
             // kdebug!("Wait22 to Read");
             poll_ifaces();
-            let mut socket_set_guard = SOCKET_SET.lock();
+            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
 
             // kdebug!("Wait to Read");
@@ -616,7 +616,7 @@ impl Socket for UdpSocket {
         };
         // kdebug!("udp write: remote = {:?}", remote_endpoint);
 
-        let mut socket_set_guard = SOCKET_SET.lock();
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
         // kdebug!("is open()={}", socket.is_open());
         // kdebug!("socket endpoint={:?}", socket.endpoint());
@@ -660,14 +660,14 @@ impl Socket for UdpSocket {
     }
 
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
-        let mut sockets = SOCKET_SET.lock();
+        let mut sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get_mut::<udp::Socket>(self.handle.0);
         // kdebug!("UDP Bind to {:?}", endpoint);
         return self.do_bind(socket, endpoint);
     }
 
     fn poll(&self) -> EPollEventType {
-        let sockets = SOCKET_SET.lock();
+        let sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get::<udp::Socket>(self.handle.0);
 
         return SocketPollMethod::udp_poll(
@@ -708,7 +708,7 @@ impl Socket for UdpSocket {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let sockets = SOCKET_SET.lock();
+        let sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get::<udp::Socket>(self.handle.0);
         let listen_endpoint = socket.endpoint();
 
@@ -773,7 +773,7 @@ impl TcpSocket {
 
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> =
-            GlobalSocketHandle::new(SOCKET_SET.lock().add(socket));
+            GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
             SocketType::TcpSocket,
@@ -833,7 +833,7 @@ impl Socket for TcpSocket {
 
         loop {
             poll_ifaces();
-            let mut socket_set_guard = SOCKET_SET.lock();
+            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
 
             // 如果socket已经关闭，返回错误
@@ -898,7 +898,7 @@ impl Socket for TcpSocket {
         {
             return Err(SystemError::ENOTCONN);
         }
-        let mut socket_set_guard = SOCKET_SET.lock();
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
 
         if socket.is_open() {
@@ -923,7 +923,7 @@ impl Socket for TcpSocket {
     }
 
     fn poll(&self) -> EPollEventType {
-        let mut socket_set_guard = SOCKET_SET.lock();
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.0);
 
         return SocketPollMethod::tcp_poll(
@@ -937,7 +937,7 @@ impl Socket for TcpSocket {
     }
 
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
-        let mut sockets = SOCKET_SET.lock();
+        let mut sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
@@ -946,7 +946,7 @@ impl Socket for TcpSocket {
             PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port, self.handle.clone())?;
 
             // kdebug!("temp_port: {}", temp_port);
-            let iface: Arc<dyn NetDriver> = NET_DRIVERS.write().get(&0).unwrap().clone();
+            let iface: Arc<dyn NetDriver> = NET_DRIVERS.write_irqsave().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
             // kdebug!("to connect: {ip:?}");
 
@@ -958,7 +958,7 @@ impl Socket for TcpSocket {
                     drop(sockets);
                     loop {
                         poll_ifaces();
-                        let mut sockets = SOCKET_SET.lock();
+                        let mut sockets = SOCKET_SET.lock_irqsave();
                         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
                         match socket.state() {
@@ -1001,7 +1001,7 @@ impl Socket for TcpSocket {
         }
 
         let local_endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
-        let mut sockets = SOCKET_SET.lock();
+        let mut sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
         if socket.is_listening() {
@@ -1044,7 +1044,7 @@ impl Socket for TcpSocket {
             // kdebug!("tcp accept: poll_ifaces()");
             poll_ifaces();
 
-            let mut sockets = SOCKET_SET.lock();
+            let mut sockets = SOCKET_SET.lock_irqsave();
 
             let socket = sockets.get_mut::<tcp::Socket>(self.handle.0);
 
@@ -1126,7 +1126,7 @@ impl Socket for TcpSocket {
             self.local_endpoint.clone().map(|x| Endpoint::Ip(Some(x)));
 
         if result.is_none() {
-            let sockets = SOCKET_SET.lock();
+            let sockets = SOCKET_SET.lock_irqsave();
             let socket = sockets.get::<tcp::Socket>(self.handle.0);
             if let Some(ep) = socket.local_endpoint() {
                 result = Some(Endpoint::Ip(Some(ep)));
@@ -1136,7 +1136,7 @@ impl Socket for TcpSocket {
     }
 
     fn peer_endpoint(&self) -> Option<Endpoint> {
-        let sockets = SOCKET_SET.lock();
+        let sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get::<tcp::Socket>(self.handle.0);
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
     }
@@ -1351,7 +1351,7 @@ impl IndexNode for SocketInode {
         return self.0.lock_no_preempt().write(&buf[0..len], None);
     }
 
-    fn poll(&self) -> Result<usize, SystemError> {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         let events = self.0.lock_irqsave().poll();
         return Ok(events.bits() as usize);
     }

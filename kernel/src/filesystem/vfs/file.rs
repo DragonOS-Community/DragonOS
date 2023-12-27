@@ -11,7 +11,7 @@ use crate::{
         tty::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
-    ipc::pipe::PipeFsPrivateData,
+    ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     kerror,
     libs::spinlock::SpinLock,
     net::{
@@ -44,6 +44,14 @@ pub enum FilePrivateData {
 impl Default for FilePrivateData {
     fn default() -> Self {
         return Self::Unused;
+    }
+}
+
+impl FilePrivateData {
+    pub fn update_mode(&mut self, mode: FileMode) {
+        if let FilePrivateData::Pipefs(pdata) = self {
+            pdata.set_mode(mode);
+        }
     }
 }
 
@@ -388,6 +396,7 @@ impl File {
 
         // 直接修改文件的打开模式
         self.mode = mode;
+        self.private_data.update_mode(mode);
         return Ok(());
     }
 
@@ -418,6 +427,10 @@ impl File {
 
                 return socket.add_epoll(epitem);
             }
+            FileType::Pipe => {
+                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
+                return inode.inner().lock().add_epoll(epitem);
+            }
             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
     }
@@ -436,7 +449,7 @@ impl File {
     }
 
     pub fn poll(&self) -> Result<usize, SystemError> {
-        self.inode.poll()
+        self.inode.poll(&self.private_data)
     }
 }
 
